@@ -82,16 +82,21 @@ impl Default for NpadControllerData {
 
 /// SixAxis controller — manages per-npad six-axis sensor parameters and writes
 /// motion state into shared memory.
+///
+/// Upstream stores `std::array<NpadControllerData, NPAD_COUNT>` inline, but the
+/// entire `SixAxis` is heap-allocated via `std::make_shared<SixAxis>(...)`.
+/// In Rust we Box the array to avoid placing ~140 KB on the fiber stack during
+/// construction (fiber stacks are 512 KB, matching upstream `default_stack_size`).
 pub struct SixAxis {
     pub activation: ControllerActivation,
-    pub controller_data: [NpadControllerData; NPAD_COUNT],
+    pub controller_data: Box<[NpadControllerData; NPAD_COUNT]>,
 }
 
 impl SixAxis {
     pub fn new() -> Self {
         Self {
             activation: ControllerActivation::new(),
-            controller_data: std::array::from_fn(|_| NpadControllerData::default()),
+            controller_data: Box::new(std::array::from_fn(|_| NpadControllerData::default())),
         }
     }
 

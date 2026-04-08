@@ -15,7 +15,7 @@ use super::k_thread::KThread;
 #[derive(Clone)]
 pub struct KThreadQueue {
     // In upstream: KernelCore& m_kernel; KHardwareTimer* m_hardware_timer;
-    pub hardware_timer: Option<Arc<Mutex<KHardwareTimer>>>,
+    pub hardware_timer: Option<Arc<KHardwareTimer>>,
     pub end_wait_allowed: bool,
     pub notify_available_impl:
         Option<fn(&KThreadQueue, &mut KThread, &mut KProcess, u64, u32) -> bool>,
@@ -60,7 +60,7 @@ impl KThreadQueue {
         }
     }
 
-    pub fn set_hardware_timer(&mut self, hardware_timer: Arc<Mutex<KHardwareTimer>>) {
+    pub fn set_hardware_timer(&mut self, hardware_timer: Arc<KHardwareTimer>) {
         self.hardware_timer = Some(hardware_timer);
     }
 
@@ -102,10 +102,7 @@ impl KThreadQueue {
             let task_time = thread.get_timer_task_time();
             thread.set_timer_task_time(0);
             drop(thread_arc);
-            hardware_timer
-                .lock()
-                .unwrap()
-                .cancel_task_by_id(thread_id, task_time);
+            hardware_timer.cancel_task_by_id(thread_id, task_time);
         }
 
         // Unpark the host thread that is blocked in begin_wait.
@@ -141,10 +138,7 @@ impl KThreadQueue {
                 let task_time = thread.get_timer_task_time();
                 thread.set_timer_task_time(0);
                 drop(thread_arc);
-                hardware_timer
-                    .lock()
-                    .unwrap()
-                    .cancel_task_by_id(thread_id, task_time);
+                hardware_timer.cancel_task_by_id(thread_id, task_time);
             }
         }
 

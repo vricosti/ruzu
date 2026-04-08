@@ -226,3 +226,39 @@ pub fn create_romfs(dir: Option<VirtualDir>, ext: Option<VirtualDir>) -> Option<
     let parts = ctx.build();
     ConcatenatedVfsFile::make_concatenated_file_with_filler(0, name, parts)
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::*;
+    use crate::file_sys::vfs::vfs::VfsDirectory;
+    use crate::file_sys::vfs::vfs_vector::{make_array_file, VectorVfsDirectory};
+
+    #[test]
+    fn create_romfs_roundtrip_preserves_full_names() {
+        let etc_dir: VirtualDir = Arc::new(VectorVfsDirectory::new(
+            vec![make_array_file(vec![1, 2, 3], "GMT".to_string(), None)],
+            vec![],
+            "Etc".to_string(),
+            None,
+        ));
+        let root: VirtualDir = Arc::new(VectorVfsDirectory::new(
+            vec![make_array_file(
+                b"Etc/GMT\n".to_vec(),
+                "binaryList.txt".to_string(),
+                None,
+            )],
+            vec![etc_dir],
+            "data".to_string(),
+            None,
+        ));
+
+        let romfs = create_romfs(Some(root), None).expect("create romfs");
+        let extracted = extract_romfs(Some(romfs)).expect("extract romfs");
+
+        assert!(extracted.get_file_relative("/binaryList.txt").is_some());
+        assert!(extracted.get_subdirectory("Etc").is_some());
+        assert!(extracted.get_file_relative("/Etc/GMT").is_some());
+    }
+}

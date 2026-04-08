@@ -16,13 +16,17 @@
 
 use std::sync::{Arc, Condvar, Mutex, Weak};
 
+use common::math_util::Rectangle;
+
 use crate::hle::kernel::k_event::KEvent;
 use crate::hle::kernel::k_process::KProcess;
 use crate::hle::kernel::k_readable_event::KReadableEvent;
 use crate::hle::kernel::k_scheduler::KScheduler;
+use crate::hle::service::nvdrv::core::nvmap::NvMap;
 
 use super::binder::IBinder;
 use super::buffer_queue_core::BufferQueueCore;
+use super::buffer_slot::BufferSlot;
 use super::graphic_buffer_producer::{QueueBufferInput, QueueBufferOutput};
 use super::parcel::{InputParcel, OutputParcel};
 use super::pixel_format::PixelFormat;
@@ -30,7 +34,9 @@ use super::producer_listener::IProducerListener;
 use super::status::Status;
 use super::ui::fence::Fence;
 use super::ui::graphic_buffer::{GraphicBuffer, NvGraphicBuffer};
-use super::window::{NativeWindow, NativeWindowApi, NativeWindowScalingMode};
+use super::window::{
+    NativeWindow, NativeWindowApi, NativeWindowScalingMode, NativeWindowTransform,
+};
 
 pub struct BufferQueueProducer {
     core: Arc<BufferQueueCore>,
@@ -41,6 +47,7 @@ pub struct BufferQueueProducer {
     next_callback_ticket: Mutex<i32>,
     current_callback_ticket: Mutex<i32>,
     callback_condition: Condvar,
+    nvmap: Arc<NvMap>,
 }
 
 struct BufferWaitEventOwner {
@@ -49,7 +56,7 @@ struct BufferWaitEventOwner {
 }
 
 impl BufferQueueProducer {
-    pub fn new(core: Arc<BufferQueueCore>) -> Self {
+    pub fn new(core: Arc<BufferQueueCore>, nvmap: Arc<NvMap>) -> Self {
         let (buffer_wait_event, buffer_wait_readable_event) = Self::new_buffer_wait_event();
         Self {
             core,
@@ -60,6 +67,7 @@ impl BufferQueueProducer {
             next_callback_ticket: Mutex::new(0),
             current_callback_ticket: Mutex::new(0),
             callback_condition: Condvar::new(),
+            nvmap,
         }
     }
 
@@ -388,7 +396,19 @@ impl BufferQueueProducer {
     }
 
     pub fn queue_buffer(&self, slot: i32, input: &QueueBufferInput) -> (Status, QueueBufferOutput) {
-        match input.scaling_mode {
+        let (
+            timestamp,
+            is_auto_timestamp,
+            crop,
+            scaling_mode,
+            transform,
+            sticky_transform,
+            async_flag,
+            swap_interval,
+            fence,
+        ) = input.deflate();
+
+        match scaling_mode {
             NativeWindowScalingMode::Freeze
             | NativeWindowScalingMode::ScaleToWindow
             | NativeWindowScalingMode::ScaleCrop
@@ -402,8 +422,8 @@ impl BufferQueueProducer {
             return (Status::NoInit, QueueBufferOutput::new());
         }
 
-        let max_buffer_count = inner.get_max_buffer_count_locked(input.async_flag != 0);
-        if input.async_flag != 0
+        let max_buffer_count = inner.get_max_buffer_count_locked(async_flag);
+        if async_flag
             && inner.override_max_buffer_count != 0
             && inner.override_max_buffer_count < max_buffer_count
         {
@@ -423,28 +443,56 @@ impl BufferQueueProducer {
             );
             return (Status::BadValue, QueueBufferOutput::new());
         }
+        if !inner.slots[s].request_buffer_called {
+            log::error!(
+                "BufferQueueProducer::queue_buffer: slot {} queued without RequestBuffer",
+                slot
+            );
+            return (Status::BadValue, QueueBufferOutput::new());
+        }
+
+        let Some(graphic_buffer) = inner.slots[s].graphic_buffer.clone() else {
+            log::error!(
+                "BufferQueueProducer::queue_buffer: slot {} missing graphic buffer",
+                slot
+            );
+            return (Status::BadValue, QueueBufferOutput::new());
+        };
+        let buffer_rect =
+            Rectangle::new(0, 0, graphic_buffer.get_width() as i32, graphic_buffer.get_height() as i32);
+        match crop.intersect(&buffer_rect) {
+            Some(cropped_rect) if cropped_rect == crop => {}
+            _ => {
+                log::error!(
+                    "BufferQueueProducer::queue_buffer: crop {:?} not contained in slot {} buffer {:?}",
+                    crop,
+                    slot,
+                    buffer_rect
+                );
+                return (Status::BadValue, QueueBufferOutput::new());
+            }
+        }
 
         inner.slots[s].buffer_state = super::buffer_slot::BufferState::Queued;
-        inner.slots[s].fence = input.fence;
+        inner.slots[s].fence = fence;
         inner.frame_counter += 1;
         inner.slots[s].frame_number = inner.frame_counter;
 
-        let gb = inner.slots[s].graphic_buffer.clone();
         let frame_num = inner.frame_counter;
         let item = super::buffer_item::BufferItem {
             slot,
-            graphic_buffer: gb,
-            fence: input.fence,
-            crop: input.crop,
-            transform: input.transform,
-            scaling_mode: input.scaling_mode as u32,
-            timestamp: input.timestamp,
-            is_auto_timestamp: input.is_auto_timestamp != 0,
+            graphic_buffer: Some(graphic_buffer.clone()),
+            fence,
+            crop,
+            transform: transform & !NativeWindowTransform::INVERSE_DISPLAY,
+            scaling_mode: scaling_mode as u32,
+            timestamp,
+            is_auto_timestamp,
             frame_number: frame_num,
-            swap_interval: input.swap_interval,
-            is_droppable: inner.dequeue_buffer_cannot_block || input.async_flag != 0,
-            acquire_called: false,
-            transform_to_display_inverse: false,
+            swap_interval,
+            is_droppable: inner.dequeue_buffer_cannot_block || async_flag,
+            acquire_called: inner.slots[s].acquire_called,
+            transform_to_display_inverse: transform.contains(NativeWindowTransform::INVERSE_DISPLAY),
         };
         let mut callback_item = super::buffer_item::BufferItem {
             graphic_buffer: item.graphic_buffer.clone(),
@@ -464,7 +512,7 @@ impl BufferQueueProducer {
         let mut frame_available_listener = None;
         let mut frame_replaced_listener = None;
 
-        *self.sticky_transform.lock().unwrap() = input.sticky_transform;
+        *self.sticky_transform.lock().unwrap() = sticky_transform;
 
         if inner.queue.is_empty() {
             inner.queue.push(item);
@@ -566,13 +614,12 @@ impl BufferQueueProducer {
             NativeWindow::MinUndequeedBuffers => {
                 inner.get_min_undequeued_buffer_count_locked(false)
             }
+            NativeWindow::StickyTransform => *self.sticky_transform.lock().unwrap() as i32,
+            NativeWindow::ConsumerRunningBehind => (inner.queue.len() > 1) as i32,
             NativeWindow::ConsumerUsageBits => inner.consumer_usage_bit as i32,
-            NativeWindow::DefaultWidth => inner.default_width as i32,
-            NativeWindow::DefaultHeight => inner.default_height as i32,
-            NativeWindow::TransformHint => inner.transform_hint as i32,
             _ => {
                 log::warn!("BufferQueueProducer::query unhandled: {:?}", what);
-                0
+                return (Status::BadValue, 0);
             }
         };
 
@@ -590,6 +637,10 @@ impl BufferQueueProducer {
         if inner.is_abandoned {
             return (Status::NoInit, QueueBufferOutput::new());
         }
+        if inner.consumer_listener.is_none() {
+            log::error!("BufferQueueProducer: BufferQueue has no consumer");
+            return (Status::NoInit, QueueBufferOutput::new());
+        }
 
         if inner.connected_api != NativeWindowApi::NoConnectedApi {
             log::error!(
@@ -599,8 +650,20 @@ impl BufferQueueProducer {
             return (Status::BadValue, QueueBufferOutput::new());
         }
 
-        inner.connected_api = api;
-        inner.connected_producer_listener = listener;
+        match api {
+            NativeWindowApi::Egl
+            | NativeWindowApi::Cpu
+            | NativeWindowApi::Media
+            | NativeWindowApi::Camera => {
+                inner.connected_api = api;
+                inner.connected_producer_listener = listener;
+            }
+            _ => {
+                log::error!("BufferQueueProducer: unknown api {:?}", api);
+                return (Status::BadValue, QueueBufferOutput::new());
+            }
+        }
+
         inner.buffer_has_been_queued = false;
         inner.dequeue_buffer_cannot_block =
             inner.consumer_controlled_by_app && producer_controlled_by_app;
@@ -648,25 +711,25 @@ impl BufferQueueProducer {
         slot: i32,
         buffer: Option<Arc<NvGraphicBuffer>>,
     ) -> Status {
-        let mut inner = self.core.mutex.lock().unwrap();
-
         if slot < 0 || slot as usize >= super::buffer_queue_defs::NUM_BUFFER_SLOTS {
             return Status::BadValue;
         }
 
+        let mut inner = self.core.mutex.lock().unwrap();
         let s = slot as usize;
-        inner.free_buffer_locked(slot);
+        inner.slots[s] = BufferSlot::default();
+        inner.slots[s].graphic_buffer = Some(Arc::new(GraphicBuffer::from_optional_nv_buffer(
+            Arc::clone(&self.nvmap),
+            buffer.as_deref(),
+        )));
+        inner.slots[s].fence = Fence::no_fence();
+        inner.slots[s].frame_number = 0;
 
         if let Some(buf) = buffer {
-            inner.slots[s].graphic_buffer =
-                Some(Arc::new(GraphicBuffer::from_nv_buffer(*buf, false)));
             inner.slots[s].is_preallocated = true;
             inner.override_max_buffer_count = inner.get_preallocated_buffer_count_locked();
-
-            if inner.default_width != buf.get_width() || inner.default_height != buf.get_height() {
-                inner.default_width = buf.get_width();
-                inner.default_height = buf.get_height();
-            }
+            inner.default_width = buf.get_width();
+            inner.default_height = buf.get_height();
             inner.default_buffer_format = buf.get_format();
         }
 
@@ -878,6 +941,10 @@ impl IBinder for BufferQueueProducer {
         Some(Arc::clone(&self.buffer_wait_readable_event))
     }
 
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
     fn register_native_handle_owner(
         &self,
         process: Arc<Mutex<KProcess>>,
@@ -912,14 +979,37 @@ impl IBinder for BufferQueueProducer {
 
 #[cfg(test)]
 mod tests {
+    use common::math_util::Rectangle;
+
+    use crate::hle::service::nvdrv::core::container::Container;
+
+    use super::super::buffer_item::BufferItem;
+    use super::super::consumer_listener::IConsumerListener;
     use super::super::graphic_buffer_producer::QueueBufferInput;
     use super::super::pixel_format::PixelFormat;
     use super::*;
 
+    struct TestConsumerListener;
+
+    impl IConsumerListener for TestConsumerListener {
+        fn on_frame_available(&self, _item: &BufferItem) {}
+        fn on_frame_replaced(&self, _item: &BufferItem) {}
+        fn on_buffers_released(&self) {}
+        fn on_sideband_stream_changed(&self) {}
+    }
+
+    fn install_test_consumer(core: &Arc<BufferQueueCore>) {
+        core.mutex.lock().unwrap().consumer_listener = Some(Arc::new(TestConsumerListener));
+    }
+
+    fn test_nvmap() -> Arc<NvMap> {
+        Container::new().get_nv_map_file_handle()
+    }
+
     #[test]
     fn get_native_handle_returns_persistent_buffer_wait_event() {
         let core = BufferQueueCore::new();
-        let producer = BufferQueueProducer::new(core);
+        let producer = BufferQueueProducer::new(core, test_nvmap());
 
         let first = producer.get_native_handle(0).unwrap();
         let second = producer.get_native_handle(15).unwrap();
@@ -931,7 +1021,8 @@ mod tests {
     fn connect_sets_nonblocking_flag_from_core_and_producer_control() {
         let core = BufferQueueCore::new();
         core.mutex.lock().unwrap().consumer_controlled_by_app = true;
-        let producer = BufferQueueProducer::new(core.clone());
+        install_test_consumer(&core);
+        let producer = BufferQueueProducer::new(core.clone(), test_nvmap());
 
         let (status, _) = producer.connect(None, NativeWindowApi::Egl, true);
         assert_eq!(status, Status::NoError);
@@ -941,7 +1032,8 @@ mod tests {
     #[test]
     fn disconnect_signals_buffer_wait_event() {
         let core = BufferQueueCore::new();
-        let producer = BufferQueueProducer::new(core);
+        install_test_consumer(&core);
+        let producer = BufferQueueProducer::new(core, test_nvmap());
         let event = producer.get_native_handle(0).unwrap();
         assert!(!event.lock().unwrap().is_signaled());
 
@@ -955,7 +1047,7 @@ mod tests {
     #[test]
     fn set_preallocated_buffer_signals_wait_event_and_updates_defaults() {
         let core = BufferQueueCore::new();
-        let producer = BufferQueueProducer::new(core.clone());
+        let producer = BufferQueueProducer::new(core.clone(), test_nvmap());
         let event = producer.get_native_handle(0).unwrap();
         let buffer = Arc::new(NvGraphicBuffer::new(1280, 720, PixelFormat::Rgba8888, 0));
 
@@ -972,9 +1064,39 @@ mod tests {
     }
 
     #[test]
+    fn set_preallocated_buffer_resets_slot_and_uses_no_fence() {
+        let core = BufferQueueCore::new();
+        let producer = BufferQueueProducer::new(core.clone(), test_nvmap());
+
+        {
+            let mut inner = core.mutex.lock().unwrap();
+            inner.slots[0].request_buffer_called = true;
+            inner.slots[0].frame_number = 99;
+            inner.slots[0].is_preallocated = true;
+            inner.slots[0].fence = Fence {
+                num_fences: 1,
+                ..Fence::default()
+            };
+        }
+
+        assert_eq!(producer.set_preallocated_buffer(0, None), Status::NoError);
+
+        let inner = core.mutex.lock().unwrap();
+        let graphic_buffer = inner.slots[0].graphic_buffer.as_ref().unwrap();
+        assert_eq!(graphic_buffer.get_buffer_id(), 0);
+        assert_eq!(graphic_buffer.get_handle(), 0);
+        assert!(!inner.slots[0].request_buffer_called);
+        assert_eq!(inner.slots[0].frame_number, 0);
+        assert!(!inner.slots[0].is_preallocated);
+        assert_eq!(inner.slots[0].fence.num_fences, 0);
+        assert_eq!(inner.slots[0].fence.fences[0].id, -1);
+    }
+
+    #[test]
     fn queue_buffer_marks_core_as_having_queued_buffers() {
         let core = BufferQueueCore::new();
-        let producer = BufferQueueProducer::new(core.clone());
+        install_test_consumer(&core);
+        let producer = BufferQueueProducer::new(core.clone(), test_nvmap());
         let buffer = Arc::new(NvGraphicBuffer::new(16, 16, PixelFormat::Rgba8888, 0));
         assert_eq!(
             producer.set_preallocated_buffer(0, Some(buffer)),
@@ -985,6 +1107,8 @@ mod tests {
             producer.dequeue_buffer(false, 16, 16, PixelFormat::Rgba8888, 0);
         assert_eq!(status, Status::NoError as i32);
         assert_eq!(slot, 0);
+        let (status, _buffer) = producer.request_buffer(slot);
+        assert_eq!(status, Status::NoError);
 
         let (status, _) = producer.queue_buffer(slot, &QueueBufferInput::default());
         assert_eq!(status, Status::NoError);
@@ -992,9 +1116,74 @@ mod tests {
     }
 
     #[test]
+    fn queue_buffer_rejects_slot_without_request_buffer() {
+        let core = BufferQueueCore::new();
+        install_test_consumer(&core);
+        let producer = BufferQueueProducer::new(core.clone(), test_nvmap());
+        let buffer = Arc::new(NvGraphicBuffer::new(16, 16, PixelFormat::Rgba8888, 0));
+        assert_eq!(
+            producer.set_preallocated_buffer(0, Some(buffer)),
+            Status::NoError
+        );
+
+        let (status, slot, _fence) =
+            producer.dequeue_buffer(false, 16, 16, PixelFormat::Rgba8888, 0);
+        assert_eq!(status, Status::NoError as i32);
+
+        let (status, _) = producer.queue_buffer(slot, &QueueBufferInput::default());
+        assert_eq!(status, Status::BadValue);
+    }
+
+    #[test]
+    fn queue_buffer_rejects_crop_outside_buffer_bounds() {
+        let core = BufferQueueCore::new();
+        install_test_consumer(&core);
+        let producer = BufferQueueProducer::new(core.clone(), test_nvmap());
+        let buffer = Arc::new(NvGraphicBuffer::new(16, 16, PixelFormat::Rgba8888, 0));
+        assert_eq!(
+            producer.set_preallocated_buffer(0, Some(buffer)),
+            Status::NoError
+        );
+
+        let (status, slot, _fence) =
+            producer.dequeue_buffer(false, 16, 16, PixelFormat::Rgba8888, 0);
+        assert_eq!(status, Status::NoError as i32);
+        let (status, _buffer) = producer.request_buffer(slot);
+        assert_eq!(status, Status::NoError);
+
+        let mut input = QueueBufferInput::default();
+        input.crop = Rectangle::new(0, 0, 32, 32);
+        let (status, _) = producer.queue_buffer(slot, &input);
+        assert_eq!(status, Status::BadValue);
+    }
+
+    #[test]
+    fn query_reports_sticky_transform_and_consumer_running_behind() {
+        let core = BufferQueueCore::new();
+        let producer = BufferQueueProducer::new(core.clone(), test_nvmap());
+        *producer.sticky_transform.lock().unwrap() = NativeWindowTransform::INVERSE_DISPLAY.bits();
+        {
+            let mut inner = core.mutex.lock().unwrap();
+            inner.queue.push(BufferItem::default());
+            inner.queue.push(BufferItem::default());
+        }
+
+        let (status, sticky_transform) = producer.query(NativeWindow::StickyTransform);
+        assert_eq!(status, Status::NoError);
+        assert_eq!(
+            sticky_transform,
+            NativeWindowTransform::INVERSE_DISPLAY.bits() as i32
+        );
+
+        let (status, running_behind) = producer.query(NativeWindow::ConsumerRunningBehind);
+        assert_eq!(status, Status::NoError);
+        assert_eq!(running_behind, 1);
+    }
+
+    #[test]
     fn request_buffer_rejects_slot_not_owned_by_producer() {
         let core = BufferQueueCore::new();
-        let producer = BufferQueueProducer::new(core.clone());
+        let producer = BufferQueueProducer::new(core.clone(), test_nvmap());
         core.mutex.lock().unwrap().slots[0].graphic_buffer = Some(Arc::new(GraphicBuffer::new(
             16,
             16,
@@ -1010,7 +1199,7 @@ mod tests {
     #[test]
     fn dequeue_buffer_requires_explicit_buffer_count_for_second_dequeue() {
         let core = BufferQueueCore::new();
-        let producer = BufferQueueProducer::new(core.clone());
+        let producer = BufferQueueProducer::new(core.clone(), test_nvmap());
         assert_eq!(
             producer.set_preallocated_buffer(
                 0,
@@ -1048,7 +1237,7 @@ mod tests {
     #[test]
     fn dequeue_buffer_sets_reallocation_flag_for_empty_slot() {
         let core = BufferQueueCore::new();
-        let producer = BufferQueueProducer::new(core.clone());
+        let producer = BufferQueueProducer::new(core.clone(), test_nvmap());
         core.mutex.lock().unwrap().override_max_buffer_count = 1;
 
         let (status, slot, _) = producer.dequeue_buffer(false, 32, 32, PixelFormat::Rgba8888, 0);

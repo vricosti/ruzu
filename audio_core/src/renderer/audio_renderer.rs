@@ -5,7 +5,7 @@ use crate::Result;
 use common::ResultCode;
 use parking_lot::Mutex;
 use ruzu_core::hle::kernel::k_process::KProcess;
-use std::sync::atomic::AtomicBool;
+use ruzu_core::hle::kernel::k_transfer_memory::KTransferMemory;
 use std::sync::Arc;
 
 pub struct Renderer {
@@ -28,8 +28,9 @@ impl Renderer {
     pub fn initialize(
         &mut self,
         params: &AudioRendererParameterInternal,
+        transfer_memory: *mut KTransferMemory,
         transfer_memory_size: u64,
-        process_handle_present: bool,
+        process: *mut KProcess,
         applet_resource_user_id: u64,
         session_id: i32,
     ) -> Result {
@@ -42,8 +43,9 @@ impl Renderer {
 
         let result = self.system.lock().initialize(
             params,
+            transfer_memory,
             transfer_memory_size,
-            process_handle_present,
+            process,
             applet_resource_user_id,
             session_id,
         );
@@ -78,12 +80,22 @@ impl Renderer {
         self.system.clone()
     }
 
-    pub fn get_rendered_event(&self) -> Arc<AtomicBool> {
-        self.system.lock().get_rendered_event()
-    }
-
     pub fn set_process(&self, process: *mut KProcess) {
         self.system.lock().set_process(process);
+    }
+
+    pub fn set_rendered_readable_event(
+        &self,
+        event: std::sync::Arc<std::sync::Mutex<ruzu_core::hle::kernel::k_readable_event::KReadableEvent>>,
+    ) {
+        self.system.lock().set_rendered_readable_event(event);
+    }
+
+    pub fn set_process_arc(
+        &self,
+        process: std::sync::Arc<std::sync::Mutex<ruzu_core::hle::kernel::k_process::KProcess>>,
+    ) {
+        self.system.lock().set_process_arc(process);
     }
 
     pub fn get_process(&self) -> *mut KProcess {
@@ -171,15 +183,22 @@ mod tests {
             core.clone(),
             audio_renderer.clone(),
         )));
-        let system = Arc::new(Mutex::new(System::new(core, audio_renderer)));
+        let system = Arc::new(Mutex::new(System::new_for_tests(
+            core,
+            audio_renderer,
+        )));
         let mut renderer = Renderer::new(manager.clone(), system);
         let params = make_params();
 
-        let result = renderer.initialize(&params, 0, true, 1, 0);
+        let process = Box::into_raw(Box::new(KProcess::new()));
+        let result = renderer.initialize(&params, std::ptr::null_mut(), 0, process, 1, 0);
 
         assert!(result.is_error());
         assert!(!renderer.is_initialized());
         assert_eq!(manager.lock().get_session_count(), 0);
+        unsafe {
+            drop(Box::from_raw(process));
+        }
     }
 
     #[test]
@@ -193,13 +212,17 @@ mod tests {
             core.clone(),
             audio_renderer.clone(),
         )));
-        let system = Arc::new(Mutex::new(System::new(core, audio_renderer)));
+        let system = Arc::new(Mutex::new(System::new_for_tests(
+            core,
+            audio_renderer,
+        )));
         let mut renderer = Renderer::new(manager, system.clone());
         let params = make_params();
         let transfer_size = System::get_work_buffer_size(&params);
 
+        let process = Box::into_raw(Box::new(KProcess::new()));
         assert_eq!(
-            renderer.initialize(&params, transfer_size, true, 1, 0),
+            renderer.initialize(&params, std::ptr::null_mut(), transfer_size, process, 1, 0),
             ResultCode::SUCCESS
         );
         renderer.start();
@@ -217,6 +240,9 @@ mod tests {
 
         terminate_event.signal();
         stop_thread.join().unwrap();
+        unsafe {
+            drop(Box::from_raw(process));
+        }
 
         assert!(stop_finished.load(Ordering::SeqCst));
     }

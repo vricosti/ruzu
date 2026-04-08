@@ -303,6 +303,10 @@ impl Alarms {
         let inner = self.inner.lock().unwrap();
         (inner.get_raw_time)()
     }
+
+    pub fn get_event(&self) -> Arc<Event> {
+        Arc::clone(&self.event)
+    }
 }
 
 #[cfg(test)]

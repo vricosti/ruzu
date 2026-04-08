@@ -112,8 +112,9 @@ pub struct Applet {
 }
 
 impl Applet {
-    pub fn new(system: SystemRef, is_application: bool) -> Self {
-        let process = Process::new();
+    pub fn new(system: SystemRef, process: Process, is_application: bool) -> Self {
+        let process_id = process.get_process_id();
+        let program_id = process.get_program_id();
         let hid_registration = super::hid_registration::HidRegistration::new(system, &process);
 
         Self {
@@ -121,10 +122,10 @@ impl Applet {
             process,
             is_process_running: false,
             applet_id: AppletId::default(),
-            aruid: AppletResourceUserId::default(),
+            aruid: AppletResourceUserId { pid: process_id },
             launch_reason: AppletProcessLaunchReason::default(),
             applet_type: AppletType::default(),
-            program_id: 0,
+            program_id,
             library_applet_mode: LibraryAppletMode::default(),
             previous_program_index: -1,
             previous_screenshot_permission: ScreenshotPermission::Enable,
@@ -293,7 +294,10 @@ impl Applet {
         let was_changed = curr_activity_runnable != prev_activity_runnable;
 
         if was_changed {
-            if !curr_activity_runnable {
+            if curr_activity_runnable {
+                self.process.suspend(false);
+            } else {
+                self.process.suspend(true);
                 self.lifecycle_manager.request_resume_notification();
             }
             self.is_activity_runnable = curr_activity_runnable;
@@ -338,5 +342,27 @@ impl Applet {
     pub fn on_process_terminated_locked(&mut self, process: &mut KProcess) {
         self.is_completed = true;
         self.signal_state_changed_event(process);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Applet;
+    use crate::hle::service::os::process::Process;
+    use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn new_initializes_aruid_and_program_id_from_process() {
+        let process = Process::with_process(Arc::new(Mutex::new({
+            let mut process = crate::hle::kernel::k_process::KProcess::new();
+            process.process_id = 0x1234;
+            process.program_id = 0x0102_0304_0506_0708;
+            process
+        })));
+
+        let applet = Applet::new(crate::core::SystemRef::null(), process, false);
+
+        assert_eq!(applet.aruid.pid, 0x1234);
+        assert_eq!(applet.program_id, 0x0102_0304_0506_0708);
     }
 }

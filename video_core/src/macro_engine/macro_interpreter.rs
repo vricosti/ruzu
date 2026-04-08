@@ -44,9 +44,6 @@ pub struct MacroInterpreterImpl {
     /// Carry flag from ALU operations.
     carry_flag: bool,
 
-    /// Temporary bounded trace budget for targeted macro debugging.
-    trace_steps_remaining: u32,
-
     /// Callback for writing a GPU method register.
     /// Signature: (address, value, is_last_call)
     method_writer: Option<Box<dyn FnMut(u32, u32, bool) + Send>>,
@@ -70,7 +67,6 @@ impl MacroInterpreterImpl {
             parameters: Vec::new(),
             next_parameter_index: 0,
             carry_flag: false,
-            trace_steps_remaining: 0,
             method_writer: None,
             method_reader: None,
         }
@@ -98,7 +94,6 @@ impl MacroInterpreterImpl {
         // value of the first parameter.
         self.next_parameter_index = 1;
         self.carry_flag = false;
-        self.trace_steps_remaining = 0;
     }
 
     /// Execute a single macro instruction at the current PC.
@@ -108,24 +103,6 @@ impl MacroInterpreterImpl {
     fn step(&mut self, is_delay_slot: bool) -> bool {
         let base_address = self.pc;
         let opcode = self.get_opcode();
-        if self.trace_steps_remaining > 0 {
-            log::info!(
-                "MacroTrace pre pc=0x{:X} raw=0x{:08X} op={:?} res={:?} dst={} src_a={} src_b={} imm={} delay={} regs={:08X?} method_raw=0x{:08X} next_param={}",
-                base_address,
-                opcode.raw,
-                opcode.operation(),
-                opcode.result_operation(),
-                opcode.dst(),
-                opcode.src_a(),
-                opcode.src_b(),
-                opcode.immediate(),
-                is_delay_slot,
-                self.registers,
-                self.method_address.raw,
-                self.next_parameter_index
-            );
-            self.trace_steps_remaining -= 1;
-        }
         self.pc += 4;
 
         // Update the program counter if we were delayed
@@ -362,14 +339,6 @@ impl MacroInterpreterImpl {
     /// Port of `MacroInterpreterImpl::Send`.
     fn send(&mut self, value: u32) {
         let address = self.method_address.address();
-        if self.trace_steps_remaining > 0 {
-            log::info!(
-                "MacroTrace send addr=0x{:X} incr={} value=0x{:08X}",
-                address,
-                self.method_address.increment(),
-                value
-            );
-        }
         if let Some(ref mut writer) = self.method_writer {
             writer(address, value, true);
         }
@@ -387,13 +356,6 @@ impl MacroInterpreterImpl {
         } else {
             0
         };
-        if self.trace_steps_remaining > 0 {
-            log::info!(
-                "MacroTrace read method=0x{:X} value=0x{:08X}",
-                method,
-                value
-            );
-        }
         value
     }
 
@@ -409,13 +371,6 @@ impl MacroInterpreterImpl {
         );
         let value = self.parameters[self.next_parameter_index];
         self.next_parameter_index += 1;
-        if self.trace_steps_remaining > 0 {
-            log::info!(
-                "MacroTrace fetch_parameter idx={} value=0x{:08X}",
-                self.next_parameter_index - 1,
-                value
-            );
-        }
         value
     }
 }
@@ -429,15 +384,6 @@ impl CachedMacro for MacroInterpreterImpl {
 
         self.registers[1] = parameters[0];
         self.parameters = parameters.to_vec();
-        if self.code.len() == 26 && self.code.first().copied() == Some(0x0011_0071) {
-            self.trace_steps_remaining = 64;
-            log::info!(
-                "MacroTrace start params={:08X?} code={:08X?}",
-                self.parameters,
-                self.code
-            );
-        }
-
         // Execute the code until we hit an exit condition.
         let mut keep_executing = true;
         let mut steps: u64 = 0;
@@ -454,15 +400,6 @@ impl CachedMacro for MacroInterpreterImpl {
                 );
             }
         }
-        if steps > 100 {
-            log::info!(
-                "MacroInterpreterImpl::execute finished steps={} code_len={} first=0x{:08X}",
-                steps,
-                self.code.len(),
-                self.code.first().copied().unwrap_or(0)
-            );
-        }
-
         // Assert that the macro used all the input parameters
         assert_eq!(
             self.next_parameter_index,

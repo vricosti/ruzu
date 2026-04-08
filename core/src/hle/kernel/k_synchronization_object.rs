@@ -12,6 +12,7 @@ use super::k_class_token;
 use super::k_process::KProcess;
 use super::k_readable_event::KReadableEvent;
 use super::k_scheduler::KScheduler;
+use super::k_scoped_scheduler_lock_and_sleep::KScopedSchedulerLockAndSleep;
 use super::k_thread::KThread;
 use super::k_thread_queue::{KThreadQueue, KThreadQueueWithoutEndWait};
 use crate::hle::kernel::svc::svc_results::{
@@ -123,10 +124,11 @@ impl SynchronizationWaiters {
     }
 
     pub fn snapshot(&self, process: &KProcess) -> Vec<u64> {
-        self.handles(process)
+        let result: Vec<u64> = self.handles(process)
             .into_iter()
             .map(|handle| handle.thread_id)
-            .collect()
+            .collect();
+        result
     }
 
     pub fn handles(&self, process: &KProcess) -> Vec<SynchronizationWaitNodeHandle> {
@@ -986,69 +988,141 @@ pub fn wait(
     let mut wait_set = SynchronizationWaitSet::new();
     wait_set.begin(object_ids);
 
-    {
+    let current_thread_id = current_thread.lock().unwrap().thread_id;
+    let scheduler_lock_ptr = current_thread.lock().unwrap().scheduler_lock_ptr;
+    if scheduler_lock_ptr == 0 {
+        return RESULT_INVALID_HANDLE;
+    }
+    let scheduler_lock = unsafe {
+        &*(scheduler_lock_ptr as *const super::k_scheduler_lock::KAbstractSchedulerLock)
+    };
+    let hardware_timer = super::kernel::get_hardware_timer_arc();
+    let thread_ptr = {
+        let guard = current_thread.lock().unwrap();
+        &*guard as *const super::k_thread::KThread as usize
+    };
+
+    let result = {
+        let (mut sleep_guard, timer) = KScopedSchedulerLockAndSleep::new(
+            scheduler_lock,
+            hardware_timer.as_ref(),
+            current_thread_id,
+            thread_ptr,
+            timeout_ns,
+        );
+
         let mut process_guard = process.lock().unwrap();
 
         if !all_objects_known(&process_guard, &wait_set) {
+            sleep_guard.cancel_sleep();
             return RESULT_INVALID_HANDLE;
         }
 
         if let Some(index) = first_signaled_index(&process_guard, &wait_set) {
             *out_index = index as i32;
+            sleep_guard.cancel_sleep();
             return crate::hle::result::RESULT_SUCCESS;
         }
 
         *out_index = -1;
         if timeout_ns == 0 {
+            sleep_guard.cancel_sleep();
             return RESULT_TIMED_OUT;
         }
 
-        let current_thread_id = current_thread.lock().unwrap().thread_id;
         wait_set.bind_thread(current_thread_id);
         link_wait_set(&mut process_guard, &wait_set);
 
-        // Thread leaving RUNNABLE → remove from PQ.
-        process_guard.remove_from_priority_queue(current_thread_id);
+        // Double-check: the event may have been signaled between the first
+        // first_signaled_index check and link_wait_set (the signaling thread
+        // runs on a different OS thread in the cooperative scheduler).
+        // Upstream doesn't need this because KScopedSchedulerLock serializes
+        // both paths on the same core; in Rust the scheduler lock is a
+        // spinlock that doesn't block host-thread signal producers during
+        // the gap between the two checks.
+        if let Some(index) = first_signaled_index(&process_guard, &wait_set) {
+            *out_index = index as i32;
+            unlink_wait_set(&mut process_guard, current_thread_id, &wait_set, None);
+            sleep_guard.cancel_sleep();
+            return crate::hle::result::RESULT_SUCCESS;
+        }
+
+        let mut wait_queue = ThreadQueueImplForKSynchronizationObjectWait::queue();
+        if let Some(timer) = timer {
+            wait_queue.set_hardware_timer(timer);
+        }
 
         current_thread
             .lock()
             .unwrap()
             .begin_wait_synchronization(wait_set, timeout_ns);
-    }
 
-    scheduler.lock().unwrap().request_schedule();
+        // Preserve the upstream queue owner after BeginWait() created the wait state.
+        current_thread.lock().unwrap().wait_queue = Some(wait_queue);
 
-    let sched_ptr = {
-        let mut scheduler_guard = scheduler.lock().unwrap();
-        &mut *scheduler_guard as *mut KScheduler
+        crate::hle::result::RESULT_SUCCESS
     };
 
-    if super::kernel::get_current_thread_pointer().is_some() {
-        loop {
-            unsafe {
-                KScheduler::reschedule_current_core_raw(sched_ptr);
-            }
-
-            let state = current_thread.lock().unwrap().get_state();
-            if state != super::k_thread::ThreadState::WAITING {
-                break;
-            }
-
-            std::thread::yield_now();
-        }
-    } else {
-        loop {
-            let state = current_thread.lock().unwrap().get_state();
-            if state != super::k_thread::ThreadState::WAITING {
-                break;
-            }
-            std::thread::yield_now();
-        }
-    }
+    // Upstream: the KScopedSchedulerLockAndSleep destructor triggers
+    // EnableScheduling → RescheduleCurrentCore → ScheduleImpl → fiber switch.
+    // The WAITING thread's fiber is suspended at this point. When EndWait or
+    // CancelWait transitions it back to RUNNABLE and the scheduler picks it up,
+    // execution resumes HERE — after the fiber switch returns.
+    //
+    // No polling loop needed — the fiber switch handles everything.
 
     let thread = current_thread.lock().unwrap();
     *out_index = thread.get_synced_index();
     ResultCode::new(thread.get_wait_result())
+}
+
+fn wait_for_current_thread(
+    process: &Arc<Mutex<KProcess>>,
+    current_thread: &Arc<Mutex<KThread>>,
+    scheduler: &Arc<Mutex<KScheduler>>,
+) {
+    let scheduler = super::kernel::get_kernel_ref()
+        .and_then(|kernel| kernel.current_scheduler().cloned())
+        .or_else(|| {
+            current_thread
+                .lock()
+                .unwrap()
+                .scheduler
+                .as_ref()
+                .and_then(|scheduler| scheduler.upgrade())
+        })
+        .or_else(|| {
+            process
+                .lock()
+                .unwrap()
+                .scheduler
+                .as_ref()
+                .and_then(|scheduler| scheduler.upgrade())
+        })
+        .unwrap_or_else(|| Arc::clone(scheduler));
+
+    while current_thread.lock().unwrap().get_state() == super::k_thread::ThreadState::WAITING {
+        if super::kernel::get_current_thread_pointer().is_some() {
+            scheduler.lock().unwrap().request_schedule();
+
+            let sched_ptr = {
+                let mut scheduler_guard = scheduler.lock().unwrap();
+                &mut *scheduler_guard as *mut KScheduler
+            };
+
+            unsafe {
+                KScheduler::reschedule_current_core_raw(sched_ptr);
+            }
+
+            // Yield to give host threads (hardware timer, audio ADSP) a chance
+            // to acquire the scheduler spinlock. Without this, the guest thread
+            // continuously cycles through reschedule_current_core_raw, starving
+            // the timer thread that needs the spinlock to fire cancel_wait.
+            std::thread::yield_now();
+        } else {
+            std::thread::yield_now();
+        }
+    }
 }
 
 fn is_known_object(process: &KProcess, object_id: u64) -> bool {

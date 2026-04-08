@@ -506,6 +506,21 @@ impl<'a> RequestParser<'a> {
             self.index += 4 - (self.index & 3);
         }
     }
+
+    /// Align the current raw-data position forward to the natural alignment of `T`.
+    ///
+    /// CMIF raw input/output data is laid out with per-argument natural alignment, not
+    /// just packed word-by-word. This helper matches the upstream serialization rule used
+    /// by `cmif_serialization.h`.
+    pub fn align_for<T>(&mut self) {
+        let align_words = core::mem::align_of::<T>() / core::mem::size_of::<u32>();
+        if align_words > 1 {
+            let rem = self.index % align_words;
+            if rem != 0 {
+                self.index += align_words - rem;
+            }
+        }
+    }
 }
 
 /// Assign bits into a u32 value at position with given width.
@@ -517,10 +532,13 @@ fn assign_bits(value: u32, field: u32, position: usize, bits: usize) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::device_memory::DeviceMemory;
     use crate::hle::kernel::k_process::KProcess;
     use crate::hle::kernel::k_thread::KThread;
     use crate::hle::result::ResultCode;
     use crate::hle::service::hle_ipc::{SessionRequestHandler, SessionRequestManager};
+    use crate::memory::memory::Memory;
+    use crate::core::SystemRef;
     use std::sync::{Arc, Mutex};
 
     struct TestHandler;
@@ -562,24 +580,29 @@ mod tests {
 
     #[test]
     fn push_ipc_interface_writes_move_handle_into_response() {
+        let device_memory = Box::new(DeviceMemory::new());
+        let buffer_ptr = &device_memory.buffer as *const common::host_memory::HostMemory;
+        let memory = Arc::new(Mutex::new(unsafe {
+            Memory::new(SystemRef::null(), device_memory.as_ref() as *const _, buffer_ptr)
+        }));
+
         let process = Arc::new(Mutex::new(KProcess::new()));
-        assert_eq!(
-            process.lock().unwrap().ensure_handle_table_initialized(),
-            RESULT_SUCCESS.get_inner_value()
-        );
+        {
+            let mut process_guard = process.lock().unwrap();
+            assert_eq!(
+                process_guard.ensure_handle_table_initialized(),
+                RESULT_SUCCESS.get_inner_value()
+            );
+            process_guard.page_table.set_memory(memory.clone());
+        }
 
         let thread = Arc::new(Mutex::new(KThread::new()));
         thread.lock().unwrap().parent = Some(Arc::downgrade(&process));
 
-        let shared_memory = process.lock().unwrap().get_shared_memory();
         let tls_address = 0x4000;
-        {
-            let mut mem = shared_memory.write().unwrap();
-            mem.allocate(tls_address, 0x1000);
-        }
 
         let mut ctx =
-            HLERequestContext::new_with_thread(thread, shared_memory.clone(), tls_address);
+            HLERequestContext::new_with_thread(thread, tls_address);
         let manager = Arc::new(Mutex::new(SessionRequestManager::new()));
         ctx.set_session_request_manager(manager);
 
@@ -599,7 +622,7 @@ mod tests {
 
         assert_eq!(ctx.write_to_outgoing_command_buffer(), RESULT_SUCCESS);
 
-        let mem = shared_memory.read().unwrap();
+        let mem = memory.lock().unwrap();
         let handle_word = mem.read_32(tls_address + 12);
         assert_eq!(handle_word, handle);
         assert!(process
@@ -608,5 +631,25 @@ mod tests {
             .handle_table
             .get_object(handle)
             .is_some());
+    }
+
+    #[test]
+    fn request_parser_align_for_u64_skips_single_word_after_0x34_blob() {
+        let mut ctx = HLERequestContext::new();
+        let start = 12usize;
+        ctx.cmd_buf[start + 13] = 0;
+        ctx.cmd_buf[start + 14] = 0x0005_B000;
+        ctx.cmd_buf[start + 15] = 0;
+        ctx.cmd_buf[start + 16] = 0x51;
+        ctx.cmd_buf[start + 17] = 0;
+
+        let mut rp = RequestParser::from_buffer(&ctx);
+        rp.set_current_offset(start);
+        let _: [u8; 0x34] = rp.pop_raw();
+        assert_eq!(rp.get_current_offset(), start + 13);
+        rp.align_for::<u64>();
+        assert_eq!(rp.get_current_offset(), start + 14);
+        assert_eq!(rp.pop_u64(), 0x0005_B000);
+        assert_eq!(rp.pop_u64(), 0x51);
     }
 }

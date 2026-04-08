@@ -9,6 +9,7 @@
 use std::sync::{Arc, Mutex};
 
 use crate::hle::kernel::k_process::{KProcess, ProcessState};
+use crate::hle::kernel::svc_types::ProcessActivity;
 
 /// Process — wraps a KProcess for service-level lifecycle management.
 ///
@@ -120,11 +121,12 @@ impl Process {
     pub fn suspend(&self, suspended: bool) {
         if let Some(ref process) = self.process {
             let mut p = process.lock().unwrap();
-            if suspended {
-                p.set_suspended(true);
+            let activity = if suspended {
+                ProcessActivity::Paused
             } else {
-                p.set_suspended(false);
-            }
+                ProcessActivity::Runnable
+            };
+            let _ = p.set_activity(activity);
         }
     }
 

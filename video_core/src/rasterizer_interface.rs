@@ -9,6 +9,7 @@
 
 use std::sync::Arc;
 
+use crate::control::channel_state::ChannelState;
 use crate::query_cache::types::QueryPropertiesFlags;
 
 /// Shader loading callback stages.
@@ -179,10 +180,10 @@ pub trait RasterizerInterface {
     // ── Channel management ──────────────────────────────────────────────
 
     /// Initialize a GPU channel.
-    fn initialize_channel(&mut self, _channel_id: i32) {}
+    fn initialize_channel(&mut self, _channel: &ChannelState) {}
 
     /// Bind a GPU channel.
-    fn bind_channel(&mut self, _channel_id: i32) {}
+    fn bind_channel(&mut self, _channel: &ChannelState) {}
 
     /// Release a GPU channel.
     fn release_channel(&mut self, _channel_id: i32) {}

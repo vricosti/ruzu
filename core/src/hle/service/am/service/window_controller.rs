@@ -9,6 +9,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 use crate::hle::service::am::applet::Applet;
+use crate::hle::service::am::window_system::WindowSystem;
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
 use crate::hle::service::ipc_helpers::{RequestParser, ResponseBuilder};
 use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
@@ -25,12 +26,14 @@ use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFrame
 pub struct IWindowController {
     /// Matches upstream `std::shared_ptr<Applet> m_applet`.
     applet: Arc<Mutex<Applet>>,
+    /// Matches upstream `WindowSystem& m_window_system`.
+    window_system: Arc<Mutex<WindowSystem>>,
     handlers: BTreeMap<u32, FunctionInfo>,
     handlers_tipc: BTreeMap<u32, FunctionInfo>,
 }
 
 impl IWindowController {
-    pub fn new(applet: Arc<Mutex<Applet>>) -> Self {
+    pub fn new(applet: Arc<Mutex<Applet>>, window_system: Arc<Mutex<WindowSystem>>) -> Self {
         let handlers = build_handler_map(&[
             (
                 1,
@@ -70,6 +73,7 @@ impl IWindowController {
         ]);
         Self {
             applet,
+            window_system,
             handlers,
             handlers_tipc: BTreeMap::new(),
         }
@@ -84,8 +88,12 @@ impl IWindowController {
     /// Port of IWindowController::GetAppletResourceUserIdOfCallerApplet
     pub fn get_applet_resource_user_id_of_caller_applet(&self) -> u64 {
         log::info!("GetAppletResourceUserIdOfCallerApplet called");
-        // Caller applet ownership is still missing in the Rust port.
-        0
+        let applet = self.applet.lock().unwrap();
+        applet
+            .caller_applet
+            .upgrade()
+            .map(|caller| caller.lock().unwrap().aruid.pid)
+            .unwrap_or(0)
     }
 
     /// Port of IWindowController::AcquireForegroundRights
@@ -106,6 +114,10 @@ impl IWindowController {
     /// Port of IWindowController::SetAppletWindowVisibility
     pub fn set_applet_window_visibility(&self, visible: bool) {
         log::info!("SetAppletWindowVisibility called, visible={}", visible);
+        self.window_system
+            .lock()
+            .unwrap()
+            .request_applet_visibility_state(&self.applet, visible);
     }
 
     /// Port of IWindowController::SetAppletGpuTimeSlice

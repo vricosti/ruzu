@@ -5,16 +5,31 @@
 //! SVC handlers for transfer memory operations.
 
 use crate::core::System;
+use crate::hle::kernel::k_transfer_memory::KTransferMemory;
+use crate::hle::kernel::k_shared_memory::MemoryPermission as KernelMemoryPermission;
 use crate::hle::kernel::svc::svc_results::*;
 use crate::hle::kernel::svc::svc_types::*;
 use crate::hle::kernel::svc_common::Handle;
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
+use std::sync::{Arc, Mutex};
 
 fn is_valid_transfer_memory_permission(perm: MemoryPermission) -> bool {
     matches!(
         perm,
         MemoryPermission::None | MemoryPermission::Read | MemoryPermission::ReadWrite
     )
+}
+
+fn to_kernel_memory_permission(perm: MemoryPermission) -> KernelMemoryPermission {
+    match perm {
+        MemoryPermission::None => KernelMemoryPermission::None,
+        MemoryPermission::Read => KernelMemoryPermission::Read,
+        MemoryPermission::Write => KernelMemoryPermission::Write,
+        MemoryPermission::ReadWrite => KernelMemoryPermission::ReadWrite,
+        MemoryPermission::Execute => KernelMemoryPermission::Execute,
+        MemoryPermission::ReadExecute => KernelMemoryPermission::ReadExecute,
+        MemoryPermission::DontCare => KernelMemoryPermission::DontCare,
+    }
 }
 
 /// Creates a TransferMemory object.
@@ -79,14 +94,26 @@ pub fn create_transfer_memory(
         return ResultCode::new(lock_result);
     }
 
+    let mut transfer_memory = KTransferMemory::new();
+    let init_result =
+        transfer_memory.initialize(address, size as usize, to_kernel_memory_permission(map_perm));
+    if init_result.is_failure() {
+        process
+            .page_table
+            .unlock_for_transfer_memory(addr_kpa, size as usize);
+        return init_result;
+    }
+
     // Allocate a unique object ID for the transfer memory.
     static NEXT_TRMEM_ID: std::sync::atomic::AtomicU64 =
         std::sync::atomic::AtomicU64::new(0xD000_0000);
     let trmem_id = NEXT_TRMEM_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let transfer_memory = Arc::new(Mutex::new(transfer_memory));
 
     // Add to handle table.
     match process.handle_table.add(trmem_id) {
         Ok(h) => {
+            process.register_transfer_memory_object(trmem_id, transfer_memory);
             *out = h;
         }
         Err(_) => {
@@ -132,9 +159,12 @@ pub fn map_transfer_memory(
     let mut process = system.current_process_arc().lock().unwrap();
 
     // Get transfer memory from handle.
-    let _object_id = match process.handle_table.get_object(trmem_handle) {
+    let object_id = match process.handle_table.get_object(trmem_handle) {
         Some(id) => id,
         None => return RESULT_INVALID_HANDLE,
+    };
+    let Some(transfer_memory) = process.get_transfer_memory_by_object_id(object_id) else {
+        return RESULT_INVALID_HANDLE;
     };
 
     let addr_kpa = crate::hle::kernel::k_typed_address::KProcessAddress::new(address);
@@ -148,15 +178,12 @@ pub fn map_transfer_memory(
         return RESULT_INVALID_MEMORY_REGION;
     }
 
-    // Upstream: trmem->Map(address, size, map_perm)
-    // For now, mark the memory as mapped by setting permissions.
-    let k_perm =
-        crate::hle::kernel::k_memory_block::KMemoryPermission::from_bits_truncate(map_perm as u8);
-    let result =
-        process
-            .page_table
-            .set_memory_permission(addr_kpa, size as usize, k_perm.bits() as u32);
-    ResultCode::new(result)
+    drop(process);
+    let result = transfer_memory
+        .lock()
+        .unwrap()
+        .map(address, size as usize, to_kernel_memory_permission(map_perm));
+    result
 }
 
 /// Unmaps a transfer memory object.
@@ -185,9 +212,12 @@ pub fn unmap_transfer_memory(
     let mut process = system.current_process_arc().lock().unwrap();
 
     // Get transfer memory from handle.
-    let _object_id = match process.handle_table.get_object(trmem_handle) {
+    let object_id = match process.handle_table.get_object(trmem_handle) {
         Some(id) => id,
         None => return RESULT_INVALID_HANDLE,
+    };
+    let Some(transfer_memory) = process.get_transfer_memory_by_object_id(object_id) else {
+        return RESULT_INVALID_HANDLE;
     };
 
     let addr_kpa = crate::hle::kernel::k_typed_address::KProcessAddress::new(address);
@@ -201,10 +231,7 @@ pub fn unmap_transfer_memory(
         return RESULT_INVALID_MEMORY_REGION;
     }
 
-    // Upstream: trmem->Unmap(address, size)
-    // Unlock the transfer memory region.
-    let result = process
-        .page_table
-        .unlock_for_transfer_memory(addr_kpa, size as usize);
-    ResultCode::new(result)
+    drop(process);
+    let result = transfer_memory.lock().unwrap().unmap(address, size as usize);
+    result
 }

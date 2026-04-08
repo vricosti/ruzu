@@ -40,36 +40,48 @@ impl IApplicationDisplayService {
             stray_layer_ids: Mutex::new(BTreeSet::new()),
             display_vsync_events: Mutex::new(BTreeMap::new()),
             handlers: build_handler_map(&[
-                (100, Some(Self::get_relay_service), "GetRelayService"),
+                (100, Some(Self::get_relay_service_handler), "GetRelayService"),
                 (
                     101,
-                    Some(Self::get_system_display_service),
+                    Some(Self::get_system_display_service_handler),
                     "GetSystemDisplayService",
                 ),
                 (
                     102,
-                    Some(Self::get_manager_display_service),
+                    Some(Self::get_manager_display_service_handler),
                     "GetManagerDisplayService",
                 ),
                 (
                     103,
-                    Some(Self::get_relay_service),
+                    Some(Self::get_relay_service_handler),
                     "GetIndirectDisplayTransactionService",
                 ),
-                (1000, Some(Self::list_displays), "ListDisplays"),
-                (1010, Some(Self::open_display), "OpenDisplay"),
-                (1011, Some(Self::open_default_display), "OpenDefaultDisplay"),
-                (1020, Some(Self::close_display), "CloseDisplay"),
+                (1000, Some(Self::list_displays_handler), "ListDisplays"),
+                (1010, Some(Self::open_display_handler), "OpenDisplay"),
+                (
+                    1011,
+                    Some(Self::open_default_display_handler),
+                    "OpenDefaultDisplay",
+                ),
+                (1020, Some(Self::close_display_handler), "CloseDisplay"),
                 (1101, Some(Self::stub_ok), "SetDisplayEnabled"),
                 (
                     1102,
                     Some(Self::get_display_resolution),
                     "GetDisplayResolution",
                 ),
-                (2020, Some(Self::open_layer), "OpenLayer"),
-                (2021, Some(Self::close_layer), "CloseLayer"),
-                (2030, Some(Self::create_stray_layer), "CreateStrayLayer"),
-                (2031, Some(Self::destroy_stray_layer), "DestroyStrayLayer"),
+                (2020, Some(Self::open_layer_handler), "OpenLayer"),
+                (2021, Some(Self::close_layer_handler), "CloseLayer"),
+                (
+                    2030,
+                    Some(Self::create_stray_layer_handler),
+                    "CreateStrayLayer",
+                ),
+                (
+                    2031,
+                    Some(Self::destroy_stray_layer_handler),
+                    "DestroyStrayLayer",
+                ),
                 (
                     2101,
                     Some(Self::set_layer_scaling_mode),
@@ -106,9 +118,21 @@ impl IApplicationDisplayService {
         unsafe { &*(this as *const dyn ServiceFramework as *const Self) }
     }
 
+    pub fn get_container(&self) -> &Arc<Container> {
+        &self.container
+    }
+
+    pub fn open_display(&self, display_name: &DisplayName) -> Result<u64, ResultCode> {
+        self.container.open_display(display_name)
+    }
+
+    pub fn get_manager_display_service(&self) -> Arc<IManagerDisplayService> {
+        Arc::new(IManagerDisplayService::new(Arc::clone(&self.container)))
+    }
+
     /// cmd 100 / 103: GetRelayService / GetIndirectDisplayTransactionService
     /// Returns the real IHOSBinderDriver from the Container.
-    fn get_relay_service(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn get_relay_service_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         let svc = Self::as_self(this);
         log::info!("IApplicationDisplayService::GetRelayService called");
         let binder_driver = svc.container.get_binder_driver();
@@ -119,7 +143,7 @@ impl IApplicationDisplayService {
     }
 
     /// cmd 101: GetSystemDisplayService
-    fn get_system_display_service(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn get_system_display_service_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         let svc = Self::as_self(this);
         log::warn!("IApplicationDisplayService::GetSystemDisplayService (STUBBED)");
         let sub: Arc<dyn SessionRequestHandler> =
@@ -130,18 +154,17 @@ impl IApplicationDisplayService {
     }
 
     /// cmd 102: GetManagerDisplayService
-    fn get_manager_display_service(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn get_manager_display_service_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         let svc = Self::as_self(this);
         log::warn!("IApplicationDisplayService::GetManagerDisplayService (STUBBED)");
-        let sub: Arc<dyn SessionRequestHandler> =
-            Arc::new(IManagerDisplayService::new(Arc::clone(&svc.container)));
+        let sub: Arc<dyn SessionRequestHandler> = svc.get_manager_display_service();
         super::super::am::service::application_proxy::IApplicationProxy::push_interface_response(
             ctx, sub,
         );
     }
 
     /// cmd 1000: ListDisplays
-    fn list_displays(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn list_displays_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         log::warn!("IApplicationDisplayService::ListDisplays (STUBBED)");
         let info = DisplayInfo::default();
         let bytes = unsafe {
@@ -157,7 +180,7 @@ impl IApplicationDisplayService {
     }
 
     /// cmd 1010: OpenDisplay
-    fn open_display(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn open_display_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         let svc = Self::as_self(this);
         // Display name is 0x40 bytes inline in request data
         let mut rp = RequestParser::new(ctx);
@@ -175,7 +198,7 @@ impl IApplicationDisplayService {
             .trim_end_matches('\0');
         log::info!("IApplicationDisplayService::OpenDisplay(\"{}\")", name_str);
 
-        match svc.container.open_display(&display_name) {
+        match svc.open_display(&display_name) {
             Ok(display_id) => {
                 let mut rb = ResponseBuilder::new(ctx, 4, 0, 0);
                 rb.push_result(RESULT_SUCCESS);
@@ -189,12 +212,12 @@ impl IApplicationDisplayService {
     }
 
     /// cmd 1011: OpenDefaultDisplay
-    fn open_default_display(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn open_default_display_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         let svc = Self::as_self(this);
         log::debug!("IApplicationDisplayService::OpenDefaultDisplay called");
         let mut name: DisplayName = [0u8; 0x40];
         name[..7].copy_from_slice(b"Default");
-        match svc.container.open_display(&name) {
+        match svc.open_display(&name) {
             Ok(display_id) => {
                 let mut rb = ResponseBuilder::new(ctx, 4, 0, 0);
                 rb.push_result(RESULT_SUCCESS);
@@ -208,7 +231,7 @@ impl IApplicationDisplayService {
     }
 
     /// cmd 1020: CloseDisplay
-    fn close_display(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn close_display_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         let svc = Self::as_self(this);
         let mut rp = RequestParser::new(ctx);
         let display_id = rp.pop_u64();
@@ -233,7 +256,7 @@ impl IApplicationDisplayService {
     }
 
     /// cmd 2020: OpenLayer
-    fn open_layer(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn open_layer_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         let svc = Self::as_self(this);
         let mut rp = RequestParser::new(ctx);
 
@@ -256,7 +279,7 @@ impl IApplicationDisplayService {
         );
 
         // Open display first
-        if let Err(err) = svc.container.open_display(&display_name) {
+        if let Err(err) = svc.open_display(&display_name) {
             let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
             rb.push_result(err);
             return;
@@ -284,7 +307,7 @@ impl IApplicationDisplayService {
     }
 
     /// cmd 2021: CloseLayer
-    fn close_layer(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn close_layer_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         let svc = Self::as_self(this);
         let mut rp = RequestParser::new(ctx);
         let layer_id = rp.pop_u64();
@@ -304,7 +327,7 @@ impl IApplicationDisplayService {
     }
 
     /// cmd 2030: CreateStrayLayer
-    fn create_stray_layer(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn create_stray_layer_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         let svc = Self::as_self(this);
         let mut rp = RequestParser::new(ctx);
         let flags = rp.pop_u32();
@@ -340,7 +363,7 @@ impl IApplicationDisplayService {
     }
 
     /// cmd 2031: DestroyStrayLayer
-    fn destroy_stray_layer(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn destroy_stray_layer_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         let svc = Self::as_self(this);
         let mut rp = RequestParser::new(ctx);
         let layer_id = rp.pop_u64();

@@ -6,7 +6,7 @@
 //! The TimeManager owns all clock cores, timezone, shared memory, power state
 //! management, alarms, and context writers.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use super::alarms::Alarms;
 use super::clocks::context_writers::{
@@ -28,6 +28,7 @@ use super::time_zone::TimeZone;
 ///
 /// Corresponds to `PSC::Time::TimeManager` in upstream manager.h.
 pub struct TimeManager {
+    pub steady_clock_source_id: Arc<Mutex<super::common::ClockSourceId>>,
     pub standard_steady_clock: StandardSteadyClockCore,
     pub tick_based_steady_clock: TickBasedSteadyClockCore,
     pub standard_local_system_clock: StandardLocalSystemClockCore,
@@ -49,17 +50,29 @@ impl TimeManager {
     /// Corresponds to `TimeManager::TimeManager(Core::System&)` in upstream.
     /// The `get_ticks_ns` callback provides CoreTiming ticks in nanoseconds.
     pub fn new(get_ticks_ns: Box<dyn Fn() -> i64 + Send + Sync>) -> Self {
+        Self::new_with_shared_memory(get_ticks_ns, None, None)
+    }
+
+    pub fn new_with_shared_memory(
+        get_ticks_ns: Box<dyn Fn() -> i64 + Send + Sync>,
+        device_memory: Option<&crate::device_memory::DeviceMemory>,
+        memory_manager: Option<&mut crate::hle::kernel::k_memory_manager::KMemoryManager>,
+    ) -> Self {
         let get_ticks_ns = Arc::new(get_ticks_ns);
+        let steady_clock_source_id = Arc::new(Mutex::new([0u8; 16]));
 
         // Helper to create a steady clock time point callback from the tick source.
-        let make_time_point_cb = |ticks: Arc<Box<dyn Fn() -> i64 + Send + Sync>>| {
+        let make_time_point_cb = |
+            ticks: Arc<Box<dyn Fn() -> i64 + Send + Sync>>,
+            clock_source_id: Arc<Mutex<super::common::ClockSourceId>>,
+        | {
             Box::new(move || {
                 let ticks_ns = ticks();
                 let current_time_s = ticks_ns / 1_000_000_000;
                 Ok(
                     crate::hle::service::psc::time::common::SteadyClockTimePoint {
                         time_point: current_time_s,
-                        clock_source_id: [0u8; 16], // Will be set during initialization
+                        clock_source_id: *clock_source_id.lock().unwrap(),
                     },
                 )
             })
@@ -86,18 +99,32 @@ impl TimeManager {
 
         // System clock cores — each gets a time point callback from the tick source
         let standard_local_system_clock =
-            StandardLocalSystemClockCore::new(make_time_point_cb(Arc::clone(&get_ticks_ns)));
+            StandardLocalSystemClockCore::new(make_time_point_cb(
+                Arc::clone(&get_ticks_ns),
+                Arc::clone(&steady_clock_source_id),
+            ));
         let standard_network_system_clock =
-            StandardNetworkSystemClockCore::new(make_time_point_cb(Arc::clone(&get_ticks_ns)));
+            StandardNetworkSystemClockCore::new(make_time_point_cb(
+                Arc::clone(&get_ticks_ns),
+                Arc::clone(&steady_clock_source_id),
+            ));
         let standard_user_system_clock = StandardUserSystemClockCore::new();
         let ephemeral_network_clock =
-            EphemeralNetworkSystemClockCore::new(make_time_point_cb(Arc::clone(&get_ticks_ns)));
+            EphemeralNetworkSystemClockCore::new(make_time_point_cb(
+                Arc::clone(&get_ticks_ns),
+                Arc::clone(&steady_clock_source_id),
+            ));
 
         // TimeZone
         let time_zone = TimeZone::new();
 
         // SharedMemory
-        let shared_memory = SharedMemory::new_for_test();
+        let shared_memory = match (device_memory, memory_manager) {
+            (Some(device_memory), Some(memory_manager)) => {
+                SharedMemory::new(device_memory, memory_manager)
+            }
+            _ => SharedMemory::new_for_test(),
+        };
 
         // PowerStateRequestManager
         let power_state_request_manager = PowerStateRequestManager::new();
@@ -118,6 +145,7 @@ impl TimeManager {
             EphemeralNetworkSystemClockContextWriter::new();
 
         Self {
+            steady_clock_source_id,
             standard_steady_clock,
             tick_based_steady_clock,
             standard_local_system_clock,
@@ -137,5 +165,25 @@ impl TimeManager {
     /// Create with default (zero) tick source. Useful for testing.
     pub fn new_default() -> Self {
         Self::new(Box::new(|| 0))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::TimeManager;
+
+    #[test]
+    fn local_clock_callback_uses_updated_shared_clock_source_id() {
+        let mut manager = TimeManager::new(Box::new(|| 5_000_000_000));
+        let new_id = [0x5Au8; 16];
+        *manager.steady_clock_source_id.lock().unwrap() = new_id;
+
+        let time_point = manager
+            .standard_local_system_clock
+            .clock
+            .get_current_time_point()
+            .unwrap();
+        assert_eq!(time_point.clock_source_id, new_id);
+        assert_eq!(time_point.time_point, 5);
     }
 }

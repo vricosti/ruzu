@@ -10,7 +10,6 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::{Arc, Mutex};
 
-use crate::file_sys::registered_cache::ContentProvider;
 use crate::file_sys::vfs::vfs_types::{VirtualDir, VirtualFile};
 use crate::hle::service::filesystem::filesystem::FileSystemController;
 
@@ -21,7 +20,7 @@ use crate::hle::service::filesystem::filesystem::FileSystemController;
 /// the content provider (for update-NCA lookups) and the filesystem controller
 /// (for process registration).
 pub struct System {
-    pub content_provider: Option<Arc<Mutex<dyn ContentProvider>>>,
+    pub content_provider: Option<Arc<Mutex<crate::file_sys::registered_cache::ContentProviderUnion>>>,
     pub filesystem_controller: Option<Arc<Mutex<FileSystemController>>>,
 }
 

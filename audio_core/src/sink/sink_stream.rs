@@ -2,7 +2,7 @@ use crate::common::common::{MAX_CHANNELS, TARGET_SAMPLE_COUNT, TARGET_SAMPLE_RAT
 use crate::SharedSystem;
 use std::cmp::min;
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::sync::{Condvar, Mutex as StdMutex};
 use std::time::{Duration, Instant};
@@ -26,26 +26,93 @@ pub struct SinkBuffer {
 
 pub type SinkStreamHandle = Arc<Mutex<SinkStream>>;
 
+/// Callback to start/stop the audio backend (e.g. cubeb_stream_start/stop).
+/// Matches upstream CubebSinkStream::Start/Stop which call cubeb_stream_start/stop.
+pub type BackendStartStopFn = Box<dyn Fn(bool) + Send + Sync>;
+
+/// Shared synchronization state for wait_free_space / buffer release.
+/// This is extracted so the ADSP thread can wait without holding the
+/// SinkStream parking_lot::Mutex (which the cubeb callback also needs).
+pub struct ReleaseSync {
+    pub queued_buffers: AtomicU32,
+    pub max_queue_size: AtomicU32,
+    pub paused: AtomicBool,
+    pub cv: Condvar,
+    pub mutex: StdMutex<()>,
+}
+
+impl ReleaseSync {
+    fn new() -> Self {
+        Self {
+            queued_buffers: AtomicU32::new(0),
+            max_queue_size: AtomicU32::new(0),
+            paused: AtomicBool::new(true),
+            cv: Condvar::new(),
+            mutex: StdMutex::new(()),
+        }
+    }
+
+    /// Wait for free space in the audio buffer queue.
+    /// Matches upstream SinkStream::WaitFreeSpace.
+    /// Can be called WITHOUT holding the stream lock.
+    pub fn wait_free_space_with_stop(&self, stop_requested: &AtomicBool) {
+        let max = self.max_queue_size.load(Ordering::Acquire);
+        if max == 0 {
+            return;
+        }
+
+        let mut guard = self.mutex.lock().expect("release mutex poisoned");
+
+        while !self.paused.load(Ordering::Acquire)
+            && self.queued_buffers.load(Ordering::Acquire) >= max
+            && !stop_requested.load(Ordering::SeqCst)
+        {
+            let (new_guard, _) = self
+                .cv
+                .wait_timeout(guard, Duration::from_millis(5))
+                .expect("release condvar poisoned");
+            guard = new_guard;
+
+            if self.paused.load(Ordering::Acquire)
+                || stop_requested.load(Ordering::SeqCst)
+                || self.queued_buffers.load(Ordering::Acquire) < max
+            {
+                break;
+            }
+
+            while !self.paused.load(Ordering::Acquire)
+                && self.queued_buffers.load(Ordering::Acquire) > max + 3
+                && !stop_requested.load(Ordering::SeqCst)
+            {
+                let (new_guard, _) = self
+                    .cv
+                    .wait_timeout(guard, Duration::from_millis(5))
+                    .expect("release condvar poisoned");
+                guard = new_guard;
+            }
+        }
+    }
+}
+
 pub struct SinkStream {
     pub system: SharedSystem,
     pub stream_type: StreamType,
     pub system_channels: u32,
     pub device_channels: u32,
-    pub paused: bool,
     pub name: String,
     queue: VecDeque<SinkBuffer>,
     playing_buffer: SinkBuffer,
     samples: VecDeque<i16>,
     last_frame: [i16; MAX_CHANNELS],
-    queued_buffers: u32,
-    max_queue_size: u32,
     min_played_sample_count: u64,
     max_played_sample_count: u64,
     last_sample_count_update_time: Instant,
     system_volume: f32,
     device_volume: f32,
-    release_cv: Condvar,
-    release_mutex: StdMutex<()>,
+    /// Shared release synchronization (atomics + condvar).
+    pub release: Arc<ReleaseSync>,
+    /// Backend start/stop callback. Called with `true` to start, `false` to stop.
+    backend_ctl: Option<BackendStartStopFn>,
 }
 
 impl SinkStream {
@@ -55,7 +122,6 @@ impl SinkStream {
             stream_type,
             system_channels: 2,
             device_channels: 2,
-            paused: true,
             name: String::new(),
             queue: VecDeque::new(),
             playing_buffer: SinkBuffer {
@@ -64,30 +130,48 @@ impl SinkStream {
             },
             samples: VecDeque::new(),
             last_frame: [0; MAX_CHANNELS],
-            queued_buffers: 0,
-            max_queue_size: 0,
             min_played_sample_count: 0,
             max_played_sample_count: 0,
             last_sample_count_update_time: Instant::now(),
             system_volume: 1.0,
             device_volume: 1.0,
-            release_cv: Condvar::new(),
-            release_mutex: StdMutex::new(()),
+            release: Arc::new(ReleaseSync::new()),
+            backend_ctl: None,
         }
     }
 
     pub fn finalize(&mut self) {}
 
-    pub fn start(&mut self, _resume: bool) {
-        self.paused = false;
+    /// Set the backend start/stop callback. Called by the cubeb sink after creating
+    /// the backend stream.
+    pub fn set_backend_ctl(&mut self, ctl: BackendStartStopFn) {
+        self.backend_ctl = Some(ctl);
     }
 
+    /// Matches upstream CubebSinkStream::Start → cubeb_stream_start.
+    pub fn start(&mut self, _resume: bool) {
+        if !self.release.paused.load(Ordering::Acquire) {
+            return;
+        }
+        self.release.paused.store(false, Ordering::Release);
+        if let Some(ref ctl) = self.backend_ctl {
+            ctl(true);
+        }
+    }
+
+    /// Matches upstream CubebSinkStream::Stop → cubeb_stream_stop.
     pub fn stop(&mut self) {
+        if self.release.paused.load(Ordering::Acquire) {
+            return;
+        }
         self.signal_pause();
+        if let Some(ref ctl) = self.backend_ctl {
+            ctl(false);
+        }
     }
 
     pub fn is_paused(&self) -> bool {
-        self.paused
+        self.release.paused.load(Ordering::Acquire)
     }
 
     pub fn get_system_channels(&self) -> u32 {
@@ -119,11 +203,11 @@ impl SinkStream {
     }
 
     pub fn get_queue_size(&self) -> u32 {
-        self.queued_buffers
+        self.release.queued_buffers.load(Ordering::Acquire)
     }
 
     pub fn set_ring_size(&mut self, ring_size: u32) {
-        self.max_queue_size = ring_size;
+        self.release.max_queue_size.store(ring_size, Ordering::Release);
     }
 
     pub fn append_buffer(&mut self, mut buffer: SinkBuffer, samples: &[i16]) {
@@ -135,7 +219,7 @@ impl SinkStream {
 
         if self.stream_type == StreamType::In {
             self.queue.push_back(queued_buffer);
-            self.queued_buffers += 1;
+            self.release.queued_buffers.fetch_add(1, Ordering::Release);
             return;
         }
 
@@ -182,7 +266,7 @@ impl SinkStream {
             }
         }
         self.queue.push_back(queued_buffer);
-        self.queued_buffers += 1;
+        self.release.queued_buffers.fetch_add(1, Ordering::Release);
     }
 
     pub fn release_buffer(&mut self, num_samples: u64) -> Vec<i16> {
@@ -210,12 +294,12 @@ impl SinkStream {
     pub fn clear_queue(&mut self) {
         self.samples.clear();
         self.queue.clear();
-        self.queued_buffers = 0;
+        self.release.queued_buffers.store(0, Ordering::Release);
         self.playing_buffer = SinkBuffer {
             consumed: true,
             ..SinkBuffer::default()
         };
-        self.release_cv.notify_one();
+        self.release.cv.notify_one();
     }
 
     pub fn get_expected_played_sample_count(&self) -> u64 {
@@ -229,47 +313,11 @@ impl SinkStream {
 
     pub fn wait_free_space(&self) {
         static NOT_STOPPED: AtomicBool = AtomicBool::new(false);
-        self.wait_free_space_with_stop(&NOT_STOPPED);
+        self.release.wait_free_space_with_stop(&NOT_STOPPED);
     }
 
     pub fn wait_free_space_with_stop(&self, stop_requested: &AtomicBool) {
-        if self.max_queue_size == 0 {
-            return;
-        }
-
-        let mut guard = self
-            .release_mutex
-            .lock()
-            .expect("sink stream release mutex poisoned");
-
-        while !self.paused
-            && self.queued_buffers >= self.max_queue_size
-            && !stop_requested.load(Ordering::SeqCst)
-        {
-            let (new_guard, _) = self
-                .release_cv
-                .wait_timeout(guard, Duration::from_millis(5))
-                .expect("sink stream condvar wait poisoned");
-            guard = new_guard;
-
-            if self.paused
-                || stop_requested.load(Ordering::SeqCst)
-                || self.queued_buffers < self.max_queue_size
-            {
-                break;
-            }
-
-            while !self.paused
-                && self.queued_buffers > self.max_queue_size + 3
-                && !stop_requested.load(Ordering::SeqCst)
-            {
-                let (new_guard, _) = self
-                    .release_cv
-                    .wait_timeout(guard, Duration::from_millis(5))
-                    .expect("sink stream condvar wait poisoned");
-                guard = new_guard;
-            }
-        }
+        self.release.wait_free_space_with_stop(stop_requested);
     }
 
     pub fn process_audio_in(&mut self, input_buffer: &[i16], num_frames: usize) {
@@ -299,8 +347,8 @@ impl SinkStream {
                     return;
                 };
                 self.playing_buffer = buffer;
-                self.queued_buffers = self.queued_buffers.saturating_sub(1);
-                self.release_cv.notify_one();
+                self.release.queued_buffers.fetch_sub(1, Ordering::Release);
+                self.release.cv.notify_one();
             }
 
             let frames_available = (self.playing_buffer.frames - self.playing_buffer.frames_played)
@@ -330,8 +378,8 @@ impl SinkStream {
     pub fn process_audio_out_and_render(&mut self, output_buffer: &mut [i16], num_frames: usize) {
         if self.system.lock().is_paused() || self.system.lock().is_shutting_down() {
             if self.system.lock().is_shutting_down() {
-                self.queued_buffers = 0;
-                self.release_cv.notify_one();
+                self.release.queued_buffers.store(0, Ordering::Release);
+                self.release.cv.notify_one();
             }
             output_buffer.fill(0);
             return;
@@ -354,8 +402,8 @@ impl SinkStream {
                     break;
                 };
                 self.playing_buffer = buffer;
-                self.queued_buffers = self.queued_buffers.saturating_sub(1);
-                self.release_cv.notify_one();
+                self.release.queued_buffers.fetch_sub(1, Ordering::Release);
+                self.release.cv.notify_one();
             }
 
             let frames_available = (self.playing_buffer.frames - self.playing_buffer.frames_played)
@@ -390,8 +438,8 @@ impl SinkStream {
     }
 
     pub fn signal_pause(&mut self) {
-        self.paused = true;
-        self.release_cv.notify_one();
+        self.release.paused.store(true, Ordering::Release);
+        self.release.cv.notify_one();
     }
 }
 

@@ -45,6 +45,14 @@ pub fn arbitrate_lock(
         tag,
     );
 
+    log::trace!(
+        "svc::ArbitrateLock return thread_handle=0x{:08X}, address=0x{:X}, tag=0x{:08X}, result={:#x}",
+        thread_handle,
+        address,
+        tag,
+        result.get_inner_value()
+    );
+
     result
 }
 
@@ -68,6 +76,12 @@ pub fn arbitrate_unlock(system: &System, address: u64) -> ResultCode {
         system.current_process_arc(),
         &current_thread,
         address,
+    );
+
+    log::trace!(
+        "svc::ArbitrateUnlock return address=0x{:X}, result={:#x}",
+        address,
+        result.get_inner_value()
     );
 
     result

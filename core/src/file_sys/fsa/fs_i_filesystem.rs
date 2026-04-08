@@ -13,6 +13,7 @@ use crate::file_sys::errors;
 use crate::file_sys::fs_filesystem::{
     CreateOption, DirectoryEntryType, OpenDirectoryMode, OpenMode,
 };
+use crate::file_sys::vfs::vfs_types::FileTimeStampRaw;
 use crate::file_sys::vfs::vfs_types::{VirtualDir, VirtualFile};
 use crate::hle::service::filesystem::filesystem::VfsDirectoryServiceWrapper;
 use common::ResultCode;
@@ -185,6 +186,13 @@ impl IFileSystem {
         self.do_query_entry(query, path)
     }
 
+    /// Get a raw file timestamp.
+    ///
+    /// Corresponds to upstream `IFileSystem::GetFileTimeStampRaw`.
+    pub fn get_file_time_stamp_raw(&self, path: &str) -> Result<FileTimeStampRaw, ResultCode> {
+        self.do_get_file_time_stamp_raw(path)
+    }
+
     /// Commit provisionally (not accessible as a command).
     ///
     /// Corresponds to upstream `IFileSystem::CommitProvisionally`.
@@ -268,6 +276,10 @@ impl IFileSystem {
 
     fn do_clean_directory_recursively(&self, path: &str) -> Result<(), ResultCode> {
         self.backend.clean_directory_recursively(path)
+    }
+
+    fn do_get_file_time_stamp_raw(&self, path: &str) -> Result<FileTimeStampRaw, ResultCode> {
+        self.backend.get_file_time_stamp_raw(path)
     }
 
     fn do_query_entry(&self, _query: QueryId, _path: &str) -> Result<Vec<u8>, ResultCode> {

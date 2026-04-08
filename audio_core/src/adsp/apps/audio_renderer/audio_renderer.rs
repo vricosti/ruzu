@@ -356,7 +356,10 @@ impl AudioRenderer {
                         }
 
                         if index == 0 {
-                            stream.lock().wait_free_space_with_stop(&stop_requested);
+                            // Wait without holding the stream lock — the cubeb
+                            // callback needs the lock to consume buffers.
+                            let release = stream.lock().release.clone();
+                            release.wait_free_space_with_stop(&stop_requested);
                         }
 
                         let mut max_time = MAX_PROCESS_TIME;

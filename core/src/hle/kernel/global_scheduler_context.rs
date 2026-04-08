@@ -34,7 +34,12 @@ pub struct GlobalSchedulerContext {
     /// Dummy threads pending wakeup on lock release.
     m_woken_dummy_threads: Mutex<HashSet<u64>>,
     /// All thread pointers that are alive.
-    m_thread_list: Mutex<Vec<Arc<Mutex<KThread>>>>,
+    ///
+    /// Upstream stores intrusive `KThread*` entries and can identify a thread
+    /// without locking it. Keep the Rust owner keyed by `thread_id` so lookup
+    /// does not relock arbitrary thread mutexes while the scheduler lock is
+    /// unwinding.
+    m_thread_list: Mutex<Vec<(u64, Arc<Mutex<KThread>>)>>,
 }
 
 impl GlobalSchedulerContext {
@@ -51,18 +56,38 @@ impl GlobalSchedulerContext {
     // -- Thread list management --
 
     pub fn add_thread(&self, thread: Arc<Mutex<KThread>>) {
-        self.m_thread_list.lock().unwrap().push(thread);
+        // Matches upstream intrusive ownership: the thread list must never
+        // silently accept an invalid identifier. Callers that already hold the
+        // thread mutex must use add_thread_with_id() to avoid re-locking.
+        let thread_id = thread.lock().unwrap().get_thread_id();
+        self.m_thread_list
+            .lock()
+            .unwrap()
+            .push((thread_id, thread));
+    }
+
+    /// Add a thread when the thread_id is already known (avoids re-locking).
+    pub fn add_thread_with_id(&self, thread_id: u64, thread: Arc<Mutex<KThread>>) {
+        self.m_thread_list
+            .lock()
+            .unwrap()
+            .push((thread_id, thread));
     }
 
     pub fn remove_thread(&self, thread_id: u64) {
         self.m_thread_list
             .lock()
             .unwrap()
-            .retain(|t| t.lock().unwrap().get_thread_id() != thread_id);
+            .retain(|(id, _)| *id != thread_id);
     }
 
     pub fn get_thread_list(&self) -> Vec<Arc<Mutex<KThread>>> {
-        self.m_thread_list.lock().unwrap().clone()
+        self.m_thread_list
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(_, thread)| Arc::clone(thread))
+            .collect()
     }
 
     pub fn get_thread_by_thread_id(&self, thread_id: u64) -> Option<Arc<Mutex<KThread>>> {
@@ -70,8 +95,8 @@ impl GlobalSchedulerContext {
             .lock()
             .unwrap()
             .iter()
-            .find(|t| t.lock().unwrap().get_thread_id() == thread_id)
-            .cloned()
+            .find(|(id, _)| *id == thread_id)
+            .map(|(_, thread)| Arc::clone(thread))
     }
 
     // -- Centralized PQ state change handler --
@@ -98,6 +123,16 @@ impl GlobalSchedulerContext {
         is_dummy: bool,
         process_schedule_count: Option<std::sync::Arc<std::sync::atomic::AtomicI64>>,
     ) {
+        log::trace!(
+            "GSC::on_thread_state_changed tid={} {:?}->{:?} prio={} active_core={} affinity=0x{:x} dummy={}",
+            thread_id,
+            old_state,
+            new_state,
+            priority,
+            active_core,
+            affinity,
+            is_dummy
+        );
         if old_state == new_state {
             return;
         }
@@ -137,6 +172,11 @@ impl GlobalSchedulerContext {
             if active_core >= 0 {
                 if let Some(kernel) = super::kernel::get_kernel_ref() {
                     if let Some(core) = kernel.physical_core(active_core as usize) {
+                        log::trace!(
+                            "GSC::on_thread_state_changed tid={} interrupting core {}",
+                            thread_id,
+                            active_core
+                        );
                         core.interrupt();
                     }
                 }
@@ -313,9 +353,9 @@ impl GlobalSchedulerContext {
         for thread_id in &thread_ids {
             if let Some(thread) = thread_list
                 .iter()
-                .find(|t| t.lock().unwrap().get_thread_id() == *thread_id)
+                .find(|(id, _)| *id == *thread_id)
             {
-                thread.lock().unwrap().dummy_thread_end_wait();
+                thread.1.lock().unwrap().dummy_thread_end_wait();
             }
         }
 
@@ -338,5 +378,25 @@ impl GlobalSchedulerContext {
 impl Default for GlobalSchedulerContext {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use super::GlobalSchedulerContext;
+    use crate::hle::kernel::k_thread::KThread;
+
+    #[test]
+    fn get_thread_by_thread_id_does_not_need_thread_mutex() {
+        let gsc = GlobalSchedulerContext::new();
+        let thread = Arc::new(Mutex::new(KThread::new()));
+        thread.lock().unwrap().thread_id = 0x1234;
+        gsc.add_thread(Arc::clone(&thread));
+
+        let _held = thread.lock().unwrap();
+        let looked_up = gsc.get_thread_by_thread_id(0x1234);
+        assert!(looked_up.is_some());
     }
 }

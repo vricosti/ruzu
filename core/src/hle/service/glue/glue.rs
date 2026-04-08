@@ -35,13 +35,9 @@ use crate::hle::service::sm::sm::ServiceManager;
 /// }
 /// ```
 ///
-/// `dm_addr` / `mm_addr` are usize-encoded pointers to DeviceMemory and
-/// KMemoryManager, needed by time services for shared memory allocation.
 pub fn loop_process(
     service_manager: &Arc<Mutex<ServiceManager>>,
     system: crate::core::SystemRef,
-    dm_addr: usize,
-    mm_addr: usize,
 ) {
     let mut server_manager = ServerManager::new(system);
 
@@ -62,12 +58,10 @@ pub fn loop_process(
 
     // Create the Glue::Time::TimeManager, matching upstream constructor.
     // This makes direct calls to time:m and set:sys via ServiceManager.
-    {
-        use crate::hle::service::glue::time::manager::TimeManager;
-        let mut time_manager = TimeManager::new(service_manager.clone());
-        time_manager.initialize();
-        log::info!("Glue::LoopProcess: TimeManager initialized");
-    }
+    use crate::hle::service::glue::time::manager::TimeManager;
+    let time_manager = Arc::new(Mutex::new(TimeManager::new(service_manager.clone(), system)));
+    time_manager.lock().unwrap().initialize();
+    log::info!("Glue::LoopProcess: TimeManager initialized");
 
     // Time services — upstream creates a shared TimeManager and passes it
     // to each StaticService instance.
@@ -85,12 +79,14 @@ pub fn loop_process(
             can_write_steady_clock: false,
             can_write_uninitialized_clock: false,
         };
+        let time_manager_user = Arc::clone(&time_manager);
+        let system_user = system;
         let factory: SessionRequestHandlerFactory = Box::new(move || {
             Arc::new(GlueTimeStaticService::new(
+                system_user,
                 user_setup,
                 "time:u",
-                dm_addr as *const _,
-                mm_addr as *mut _,
+                Arc::clone(&time_manager_user),
             ))
         });
         server_manager.register_named_service("time:u", factory, 64);
@@ -105,12 +101,14 @@ pub fn loop_process(
             can_write_steady_clock: false,
             can_write_uninitialized_clock: false,
         };
+        let time_manager_admin = Arc::clone(&time_manager);
+        let system_admin = system;
         let factory: SessionRequestHandlerFactory = Box::new(move || {
             Arc::new(GlueTimeStaticService::new(
+                system_admin,
                 admin_setup,
                 "time:a",
-                dm_addr as *const _,
-                mm_addr as *mut _,
+                Arc::clone(&time_manager_admin),
             ))
         });
         server_manager.register_named_service("time:a", factory, 64);
@@ -125,12 +123,14 @@ pub fn loop_process(
             can_write_steady_clock: true,
             can_write_uninitialized_clock: false,
         };
+        let time_manager_repair = Arc::clone(&time_manager);
+        let system_repair = system;
         let factory: SessionRequestHandlerFactory = Box::new(move || {
             Arc::new(GlueTimeStaticService::new(
+                system_repair,
                 repair_setup,
                 "time:r",
-                dm_addr as *const _,
-                mm_addr as *mut _,
+                Arc::clone(&time_manager_repair),
             ))
         });
         server_manager.register_named_service("time:r", factory, 64);
@@ -146,12 +146,14 @@ pub fn loop_process(
             can_write_steady_clock: false,
             can_write_uninitialized_clock: false,
         };
+        let time_manager_psc = Arc::clone(&time_manager);
+        let system_psc = system;
         let factory: SessionRequestHandlerFactory = Box::new(move || {
             Arc::new(GlueTimeStaticService::new(
+                system_psc,
                 psc_setup,
                 "time:s",
-                dm_addr as *const _,
-                mm_addr as *mut _,
+                Arc::clone(&time_manager_psc),
             ))
         });
         server_manager.register_named_service("time:s", factory, 64);

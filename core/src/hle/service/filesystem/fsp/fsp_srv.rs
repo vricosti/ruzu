@@ -6,15 +6,18 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use crate::file_sys::errors::RESULT_TARGET_NOT_FOUND;
+use crate::file_sys::fs_save_data_types::{SaveDataAttribute, SaveDataSpaceId};
+use crate::file_sys::vfs::vfs_types::VirtualDir;
 use crate::file_sys::vfs::vfs_types::VirtualFile;
-use crate::file_sys::vfs::vfs_vector::VectorVfsFile;
+use crate::file_sys::vfs::vfs_vector::VectorVfsDirectory;
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
-use crate::hle::service::ipc_helpers::ResponseBuilder;
+use crate::hle::service::ipc_helpers::{RequestParser, ResponseBuilder};
 use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
 
 use super::fs_i_filesystem::IFileSystem;
 use super::fs_i_storage::IStorage;
+use super::fsp_types::SizeGetter;
 
 /// Port of Service::FileSystem::AccessLogVersion
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -136,6 +139,8 @@ pub struct FspSrv {
     access_log_program_index: std::sync::Mutex<u32>,
     access_log_mode: std::sync::Mutex<AccessLogMode>,
     program_id: std::sync::Mutex<u64>,
+    /// Upstream: `FileSys::VirtualFile romfs`.
+    romfs: std::sync::Mutex<Option<VirtualFile>>,
     /// Upstream: `std::shared_ptr<SaveDataController> save_data_controller`.
     save_data_controller:
         std::sync::Mutex<Option<super::super::save_data_controller::SaveDataController>>,
@@ -146,6 +151,23 @@ pub struct FspSrv {
 }
 
 impl FspSrv {
+    fn make_default_size_getter() -> SizeGetter {
+        SizeGetter {
+            get_free_size: Box::new(|| 0),
+            get_total_size: Box::new(|| 0),
+        }
+    }
+
+    fn make_empty_filesystem() -> IFileSystem {
+        let dir: VirtualDir = Arc::new(VectorVfsDirectory::new(
+            vec![],
+            vec![],
+            "empty".to_string(),
+            None,
+        ));
+        IFileSystem::new(dir, Self::make_default_size_getter())
+    }
+
     pub fn new() -> Self {
         Self {
             fsc: None,
@@ -153,6 +175,7 @@ impl FspSrv {
             access_log_program_index: std::sync::Mutex::new(0),
             access_log_mode: std::sync::Mutex::new(AccessLogMode::None),
             program_id: std::sync::Mutex::new(0),
+            romfs: std::sync::Mutex::new(None),
             save_data_controller: std::sync::Mutex::new(None),
             romfs_controller: std::sync::Mutex::new(None),
             handlers: build_handler_map(&[
@@ -167,9 +190,19 @@ impl FspSrv {
                     "OpenSdCardFileSystem",
                 ),
                 (
+                    51,
+                    Some(Self::open_save_data_file_system_handler),
+                    "OpenSaveDataFileSystem",
+                ),
+                (
                     200,
                     Some(Self::open_data_storage_by_current_process_handler),
                     "OpenDataStorageByCurrentProcess",
+                ),
+                (
+                    202,
+                    Some(Self::open_data_storage_by_data_id_handler),
+                    "OpenDataStorageByDataId",
                 ),
                 (
                     203,
@@ -265,6 +298,7 @@ impl FspSrv {
         match result {
             Some((program_id, save_data_ctrl, romfs_ctrl)) => {
                 *service.program_id.lock().unwrap() = program_id;
+                *service.romfs.lock().unwrap() = None;
                 *service.save_data_controller.lock().unwrap() = Some(save_data_ctrl);
                 *service.romfs_controller.lock().unwrap() = Some(romfs_ctrl);
                 log::info!(
@@ -290,7 +324,83 @@ impl FspSrv {
     fn open_sd_card_file_system_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         let _service = unsafe { &*(this as *const dyn ServiceFramework as *const FspSrv) };
         log::info!("FspSrv::OpenSdCardFileSystem called");
-        Self::push_interface_response(ctx, Arc::new(IFileSystem::new()));
+        Self::push_interface_response(ctx, Arc::new(Self::make_empty_filesystem()));
+    }
+
+    fn parse_save_data_space_id(raw: u8) -> Option<SaveDataSpaceId> {
+        match raw {
+            0 => Some(SaveDataSpaceId::System),
+            1 => Some(SaveDataSpaceId::User),
+            2 => Some(SaveDataSpaceId::SdSystem),
+            3 => Some(SaveDataSpaceId::Temporary),
+            4 => Some(SaveDataSpaceId::SdUser),
+            100 => Some(SaveDataSpaceId::ProperSystem),
+            101 => Some(SaveDataSpaceId::SafeMode),
+            _ => None,
+        }
+    }
+
+    fn open_save_data_file_system_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const FspSrv) };
+        let mut rp = RequestParser::new(ctx);
+
+        let Some(space_id) = Self::parse_save_data_space_id(rp.pop_u8()) else {
+            log::error!("FspSrv::OpenSaveDataFileSystem: invalid SaveDataSpaceId");
+            Self::push_error_with_null_interface(ctx, RESULT_TARGET_NOT_FOUND.raw());
+            return;
+        };
+
+        // CMIF serializes the u8 enum with padding before the following 0x40-byte struct.
+        rp.skip(1);
+
+        let attribute = {
+            let size = core::mem::size_of::<SaveDataAttribute>();
+            let words = (size + 3) / 4;
+            let start = rp.get_current_offset();
+            if start + words > crate::hle::ipc::COMMAND_BUFFER_LENGTH {
+                log::error!("FspSrv::OpenSaveDataFileSystem: request payload too small");
+                Self::push_error_with_null_interface(ctx, RESULT_TARGET_NOT_FOUND.raw());
+                return;
+            }
+
+            let mut value = core::mem::MaybeUninit::<SaveDataAttribute>::zeroed();
+            unsafe {
+                let src = ctx.command_buffer()[start..].as_ptr() as *const u8;
+                let dst = value.as_mut_ptr() as *mut u8;
+                core::ptr::copy_nonoverlapping(src, dst, size);
+                value.assume_init()
+            }
+        };
+
+        log::info!(
+            "FspSrv::OpenSaveDataFileSystem called, space={:?}, attribute={}",
+            space_id,
+            attribute.debug_info(),
+        );
+
+        let opened = service
+            .save_data_controller
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|controller| controller.open_save_data(space_id, &attribute));
+
+        let Some(dir) = opened else {
+            log::warn!(
+                "FspSrv::OpenSaveDataFileSystem: save data not found for {}",
+                attribute.debug_info(),
+            );
+            Self::push_error_with_null_interface(ctx, RESULT_TARGET_NOT_FOUND.raw());
+            return;
+        };
+
+        Self::push_interface_response(
+            ctx,
+            Arc::new(IFileSystem::new(dir, Self::make_default_size_getter())),
+        );
     }
 
     fn open_data_storage_by_current_process_handler(
@@ -307,15 +417,61 @@ impl FspSrv {
             program_id
         );
 
-        // Rust-side temporary adaptation: the upstream owner is RomFsController::OpenRomFSCurrentProcess,
-        // but the service bootstrap here still lacks a System-backed RomFsController path.
-        // Return a real IStorage session with an empty readable backend instead of a bare success.
-        let backend: VirtualFile = Arc::new(VectorVfsFile::new(
-            Vec::new(),
-            format!("{program_id:016X}.romfs"),
-            None,
-        ));
+        let backend = {
+            let mut cached_romfs = service.romfs.lock().unwrap();
+            if cached_romfs.is_none() {
+                let current_romfs = service
+                    .romfs_controller
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .and_then(|controller| controller.open_romfs_current_process());
+                if current_romfs.is_none() {
+                    log::error!("FspSrv::OpenDataStorageByCurrentProcess: no RomFS available");
+                    Self::push_error_with_null_interface(ctx, u32::MAX);
+                    return;
+                }
+                *cached_romfs = current_romfs;
+            }
+            cached_romfs.as_ref().cloned().unwrap()
+        };
+
         Self::push_interface_response(ctx, Arc::new(IStorage::new(backend)));
+    }
+
+    /// Port of upstream `FSP_SRV::OpenDataStorageByDataId`.
+    /// Opens a system data archive by title ID. Tries to synthesize
+    /// known system archives (MiiModel, NgWord, SharedFont, etc.).
+    fn open_data_storage_by_data_id_handler(
+        _this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        let mut rp = RequestParser::new(ctx);
+        let storage_id = rp.pop_raw::<u8>();
+        let _unknown = rp.pop_raw::<u32>();
+        let title_id = rp.pop_raw::<u64>();
+
+        log::info!(
+            "FspSrv::OpenDataStorageByDataId called, storage_id={}, title_id={:#x}",
+            storage_id,
+            title_id
+        );
+
+        // Try synthesizing the system archive (matches upstream fallback path)
+        if let Some(archive) = crate::file_sys::system_archive::system_archive::synthesize_system_archive(title_id) {
+            log::info!(
+                "FspSrv::OpenDataStorageByDataId: synthesized archive for title_id={:#x}",
+                title_id
+            );
+            Self::push_interface_response(ctx, Arc::new(IStorage::new(archive)));
+            return;
+        }
+
+        log::warn!(
+            "FspSrv::OpenDataStorageByDataId: no data for title_id={:#x}, returning error",
+            title_id
+        );
+        Self::push_error_with_null_interface(ctx, RESULT_TARGET_NOT_FOUND.raw());
     }
 
     fn open_patch_data_storage_by_current_process_handler(

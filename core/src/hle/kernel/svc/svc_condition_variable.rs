@@ -37,8 +37,7 @@ pub fn wait_process_wide_key_atomic(
         if offset_tick > 0 {
             let hardware_tick = system
                 .kernel()
-                .and_then(|k| k.hardware_timer())
-                .map(|ht| ht.lock().unwrap().get_tick())
+                .and_then(|_| crate::hle::kernel::kernel::get_current_hardware_tick())
                 .unwrap_or(0);
             let t = hardware_tick + offset_tick + 2;
             if t <= 0 {
@@ -68,6 +67,13 @@ pub fn wait_process_wide_key_atomic(
         timeout,
     );
 
+    log::trace!(
+        "svc::WaitProcessWideKeyAtomic return address=0x{:X}, cv_key=0x{:X}, result={:#x}",
+        address,
+        aligned_cv_key,
+        result
+    );
+
     ResultCode::new(result)
 }
 
@@ -81,9 +87,36 @@ pub fn signal_process_wide_key(system: &System, cv_key: u64, count: i32) {
 
     // Upstream: Common::AlignDown(cv_key, sizeof(u32))
     let aligned_cv_key = cv_key & !3u64;
-    system
-        .current_process_arc()
-        .lock()
-        .unwrap()
-        .signal_condition_variable(aligned_cv_key, count);
+    if let Some(current_thread) = system.current_thread() {
+        let scheduler_lock_ptr = current_thread.lock().unwrap().scheduler_lock_ptr;
+        if scheduler_lock_ptr != 0 {
+            let scheduler_lock = unsafe {
+                &*(scheduler_lock_ptr as *const crate::hle::kernel::k_scheduler_lock::KAbstractSchedulerLock)
+            };
+            let _scheduler_guard =
+                crate::hle::kernel::k_scheduler_lock::KScopedSchedulerLock::new(scheduler_lock);
+            system
+                .current_process_arc()
+                .lock()
+                .unwrap()
+                .signal_condition_variable(aligned_cv_key, count);
+        } else {
+            system
+                .current_process_arc()
+                .lock()
+                .unwrap()
+                .signal_condition_variable(aligned_cv_key, count);
+        }
+    } else {
+        system
+            .current_process_arc()
+            .lock()
+            .unwrap()
+            .signal_condition_variable(aligned_cv_key, count);
+    }
+    log::trace!(
+        "svc::SignalProcessWideKey return cv_key=0x{:X}, count={}",
+        aligned_cv_key,
+        count
+    );
 }

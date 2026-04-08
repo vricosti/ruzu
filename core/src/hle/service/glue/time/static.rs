@@ -5,7 +5,7 @@
 //! Port of zuyu/src/core/hle/service/glue/time/static.cpp
 
 use std::collections::BTreeMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
@@ -14,10 +14,10 @@ use crate::hle::service::psc::time::common::{
     ClockSnapshot, StaticServiceSetupInfo, SteadyClockTimePoint, SystemClockContext, TimeType,
 };
 use crate::hle::service::psc::time::r#static as psc_static;
-use crate::hle::service::psc::time::shared_memory::SharedMemory as PscSharedMemory;
 use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
 
 use super::file_timestamp_worker::FileTimestampWorker;
+use super::manager::TimeManager as GlueTimeManager;
 use super::standard_steady_clock_resource::StandardSteadyClockResource;
 use super::time_zone::TimeZoneService;
 use super::time_zone_binary::TimeZoneBinary;
@@ -48,14 +48,12 @@ pub mod commands {
 /// `Glue::Time::StaticService`.
 pub struct StaticService {
     pub service_name: String,
+    system: crate::core::SystemRef,
     pub setup_info: StaticServiceSetupInfo,
     wrapped_service: Mutex<psc_static::StaticService>,
     file_timestamp_worker: FileTimestampWorker,
     standard_steady_clock_resource: StandardSteadyClockResource,
     time_zone_binary: Mutex<TimeZoneBinary>,
-    /// The PSC shared memory backing the lock-free time reads.
-    /// Stored so we can hand out a KSharedMemory handle to the guest.
-    psc_shared_memory: Mutex<PscSharedMemory>,
     /// Cached handle returned by GetSharedMemoryNativeHandle.
     /// Once registered in the process handle table it does not change.
     shared_memory_handle: Mutex<Option<u32>>,
@@ -65,10 +63,10 @@ pub struct StaticService {
 
 impl StaticService {
     pub fn new(
+        system: crate::core::SystemRef,
         setup_info: StaticServiceSetupInfo,
         name: &str,
-        device_memory: *const crate::device_memory::DeviceMemory,
-        memory_manager: *mut crate::hle::kernel::k_memory_manager::KMemoryManager,
+        time_manager: Arc<Mutex<GlueTimeManager>>,
     ) -> Self {
         log::debug!("Glue::Time::StaticService::new called for '{name}'");
 
@@ -100,7 +98,7 @@ impl StaticService {
             log::error!("  -> Unknown setup_info variant");
         }
 
-        let mut time_zone_binary = TimeZoneBinary::new();
+        let mut time_zone_binary = TimeZoneBinary::new(system);
         let _ = time_zone_binary.mount();
 
         let handlers = build_handler_map(&[
@@ -125,18 +123,19 @@ impl StaticService {
             (commands::CALCULATE_SPAN_BETWEEN_STANDARD_USER_SYSTEM_CLOCKS, Some(StaticService::calculate_span_between_handler), "CalculateSpanBetweenStandardUserSystemClocks"),
         ]);
 
+        let wrapped_service = {
+            let manager = time_manager.lock().unwrap();
+            manager.make_static_service(setup_info)
+        };
+
         Self {
             service_name: name.to_string(),
+            system,
             setup_info,
-            wrapped_service: Mutex::new(psc_static::StaticService::new(setup_info)),
+            wrapped_service: Mutex::new(wrapped_service),
             file_timestamp_worker: FileTimestampWorker::new(),
             standard_steady_clock_resource: StandardSteadyClockResource::new(),
             time_zone_binary: Mutex::new(time_zone_binary),
-            psc_shared_memory: Mutex::new(if device_memory.is_null() || memory_manager.is_null() {
-                PscSharedMemory::new_for_test()
-            } else {
-                unsafe { PscSharedMemory::new(&*device_memory, &mut *memory_manager) }
-            }),
             shared_memory_handle: Mutex::new(None),
             handlers,
             handlers_tipc: BTreeMap::new(),
@@ -293,8 +292,6 @@ impl StaticService {
 
         // First call: register the KSharedMemory in the process handle table.
         let handle = (|| -> Option<u32> {
-            use std::sync::Arc;
-
             let thread = ctx.get_thread()?;
             let thread_guard = thread.lock().unwrap();
             let parent = thread_guard.parent.as_ref()?.upgrade()?;
@@ -304,33 +301,11 @@ impl StaticService {
                 std::sync::atomic::AtomicU64::new(0x3000_0000);
             let object_id = NEXT_SHMEM_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
-            // Register the KSharedMemory from PscSharedMemory so that
-            // MapSharedMemory SVC can find it and map its physical pages.
-            // The Arc wraps the already-initialized KSharedMemory.
-            let psc_shmem = service.psc_shared_memory.lock().unwrap();
-            let size = psc_shmem.get_k_shared_memory().get_size();
-            drop(psc_shmem);
-
-            // Create a new KSharedMemory for the handle table that mirrors
-            // the PSC one's size. In a full implementation, this would be
-            // the same object; for now the SVC handler will look up by
-            // object_id to find the KSharedMemory registered here.
-            let k_shmem = Arc::new({
-                let mut shmem = crate::hle::kernel::k_shared_memory::KSharedMemory::new();
-                // Copy the PSC shared memory's KSharedMemory state.
-                let psc = service.psc_shared_memory.lock().unwrap();
-                // SAFETY: We copy the fields from the PSC's KSharedMemory.
-                // The physical pages and device memory pointer are shared.
-                unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        psc.get_k_shared_memory()
-                            as *const crate::hle::kernel::k_shared_memory::KSharedMemory,
-                        &mut shmem as *mut crate::hle::kernel::k_shared_memory::KSharedMemory,
-                        1,
-                    );
-                }
-                shmem
-            });
+            let k_shmem = service
+                .wrapped_service
+                .lock()
+                .unwrap()
+                .get_shared_memory_arc()?;
 
             process.register_shared_memory_object(object_id, k_shmem);
             let handle = process.handle_table.add(object_id).ok()?;
@@ -691,10 +666,14 @@ impl StaticService {
 
     pub fn get_time_zone_service(&self) -> Result<TimeZoneService, ResultCode> {
         log::debug!("Glue::Time::StaticService::GetTimeZoneService called");
-
-        let _binary = self.time_zone_binary.lock().unwrap();
-        Ok(TimeZoneService::new(
+        let wrapped = self.wrapped_service.lock().unwrap().get_time_zone_service();
+        let mut binary = TimeZoneBinary::new(self.system);
+        let _ = binary.mount();
+        Ok(TimeZoneService::with_wrapped(
+            self.system,
             self.setup_info.can_write_timezone_device_location,
+            wrapped,
+            binary,
         ))
     }
 
@@ -867,6 +846,13 @@ mod tests {
     use super::*;
     use crate::hle::service::psc::time::common::SteadyClockTimePoint;
 
+    fn make_time_manager() -> Arc<Mutex<GlueTimeManager>> {
+        Arc::new(Mutex::new(GlueTimeManager::new(
+            Arc::new(Mutex::new(crate::hle::service::sm::sm::ServiceManager::new())),
+            crate::core::SystemRef::null(),
+        )))
+    }
+
     fn user_setup() -> StaticServiceSetupInfo {
         StaticServiceSetupInfo {
             can_write_local_clock: false,
@@ -881,10 +867,10 @@ mod tests {
     #[test]
     fn get_time_zone_service_returns_glue_service_object() {
         let service = StaticService::new(
+            crate::core::SystemRef::null(),
             user_setup(),
             "time:u",
-            std::ptr::null(),
-            std::ptr::null_mut(),
+            make_time_manager(),
         );
         let time_zone_service = service.get_time_zone_service().unwrap();
 
@@ -907,10 +893,10 @@ mod tests {
     fn delegated_correction_queries_follow_wrapped_psc_static_service() {
         // Use admin setup so we have can_write_user_clock permission
         let service = StaticService::new(
+            crate::core::SystemRef::null(),
             admin_setup(),
             "time:a",
-            std::ptr::null(),
-            std::ptr::null_mut(),
+            make_time_manager(),
         );
         {
             let mut wrapped = service.wrapped_service.lock().unwrap();
@@ -936,5 +922,30 @@ mod tests {
                 .unwrap(),
             SteadyClockTimePoint::default()
         );
+    }
+
+    #[test]
+    fn shared_memory_handle_uses_wrapped_psc_time_owner() {
+        let time_manager = make_time_manager();
+        let service = StaticService::new(
+            crate::core::SystemRef::null(),
+            user_setup(),
+            "time:u",
+            Arc::clone(&time_manager),
+        );
+
+        let expected = {
+            let manager = time_manager.lock().unwrap();
+            let psc_time = manager.psc_time.lock().unwrap();
+            psc_time.shared_memory.get_k_shared_memory_arc()
+        };
+        let actual = service
+            .wrapped_service
+            .lock()
+            .unwrap()
+            .get_shared_memory_arc()
+            .expect("wrapped PSC static service should expose shared memory");
+
+        assert!(Arc::ptr_eq(&expected, &actual));
     }
 }

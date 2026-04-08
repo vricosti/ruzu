@@ -11,6 +11,7 @@ use crate::core_timing::CoreTiming;
 use crate::cpu_manager::CpuManager;
 use crate::device_memory::DeviceMemory;
 use crate::file_sys::fs_filesystem::OpenMode;
+use crate::file_sys::romfs_factory::StorageId;
 use crate::file_sys::vfs::vfs_real::RealVfsFilesystem;
 use crate::gpu_dirty_memory_manager::GpuDirtyMemoryManager;
 use crate::hardware_properties;
@@ -22,13 +23,13 @@ use crate::hle::service::am::am_types::{AppletId, AppletType};
 use crate::hle::service::am::applet_manager::{
     AppletManager, FrontendAppletParameters, LaunchType,
 };
+use crate::hle::service::glue::glue_manager::{ARPManager, ApplicationLaunchProperty};
 use crate::hle::service::server_manager::ServerManager;
 use crate::hle::service::sm::sm::ServiceManager;
 use crate::memory::memory::Memory;
 use crate::perf_stats::{PerfStats, PerfStatsResults, SpeedLimiter};
 
 use parking_lot::Mutex;
-use std::any::Any;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
@@ -110,6 +111,107 @@ impl SystemRef {
 /// Type used for the frontend to designate a callback for System to exit the application.
 pub type ExitCallback = Box<dyn Fn() + Send>;
 
+/// Minimal bridge from `core` to a concrete `audio_core::renderer::Renderer`
+/// session owned by AudioCore.
+///
+/// Upstream `IAudioRenderer` owns `AudioCore::Renderer::Renderer` directly.
+/// Rust cannot name that concrete type from `core`, so exercised service calls
+/// go through this owner-preserving trait object.
+pub trait AudioRendererSessionInterface: Send {
+    fn get_sample_rate(&self) -> u32;
+    fn get_sample_count(&self) -> u32;
+    fn get_mix_buffer_count(&self) -> u32;
+    fn get_state(&self) -> u32;
+    fn request_update(
+        &self,
+        input: &[u8],
+        performance: &mut [u8],
+        output: &mut [u8],
+    ) -> crate::hle::result::ResultCode;
+    fn start(&self);
+    fn stop(&self);
+    fn supports_system_event(&self) -> bool;
+    fn set_process(&self, process: *mut crate::hle::kernel::k_process::KProcess);
+    fn set_rendering_time_limit(&self, rendering_time_limit: u32);
+    fn get_rendering_time_limit(&self) -> u32;
+    fn set_voice_drop_parameter(&self, voice_drop_parameter: f32);
+    fn get_voice_drop_parameter(&self) -> f32;
+    /// Pass the readable event Arc so the audio thread can signal it directly.
+    fn set_rendered_readable_event(
+        &self,
+        _event: std::sync::Arc<std::sync::Mutex<crate::hle::kernel::k_readable_event::KReadableEvent>>,
+    ) {
+    }
+    /// Pass the process Arc for thread-safe waiter notification.
+    fn set_process_arc(
+        &self,
+        _process: std::sync::Arc<std::sync::Mutex<crate::hle::kernel::k_process::KProcess>>,
+    ) {
+    }
+}
+
+/// Minimal bridge from `core` to the concrete `audio_core` crate.
+///
+/// Upstream `Core::System` owns `AudioCore::AudioCore` directly. Rust cannot do
+/// that without a crate cycle, so `System` stores a trait object that preserves
+/// the same owner boundary for exercised service calls.
+pub trait AudioCoreInterface: Send {
+    /// Mirror `AudioCore::Renderer::Manager::GetWorkBufferSize`.
+    fn get_audio_renderer_work_buffer_size(&self, params: &[u8; 0x34]) -> Option<u64>;
+
+    /// Mirror `AudioCore::Renderer::AudioDevice::ListAudioDeviceName`.
+    fn list_audio_device_name(
+        &self,
+        applet_resource_user_id: u64,
+        revision: u32,
+        out_names: &mut [[u8; 0x100]],
+    ) -> u32;
+
+    /// Mirror `AudioCore::Renderer::AudioDevice::ListAudioOutputDeviceName`.
+    fn list_audio_output_device_name(
+        &self,
+        applet_resource_user_id: u64,
+        revision: u32,
+        out_names: &mut [[u8; 0x100]],
+    ) -> u32;
+
+    /// Mirror `AudioCore::Renderer::AudioDevice::SetDeviceVolumes`.
+    fn set_audio_device_volume(
+        &self,
+        applet_resource_user_id: u64,
+        revision: u32,
+        volume: f32,
+    );
+
+    /// Mirror `AudioCore::Renderer::AudioDevice::GetDeviceVolume`.
+    fn get_audio_device_volume(
+        &self,
+        applet_resource_user_id: u64,
+        revision: u32,
+        name: &str,
+    ) -> f32;
+
+    /// Mirror `AudioCore::Sink::Sink::GetSystemChannels`.
+    fn get_audio_output_system_channels(&self) -> u32;
+
+    /// Mirror `IAudioRendererManager::OpenAudioRenderer` by creating an owned
+    /// audio renderer session backed by the real audio_core renderer owners.
+    fn open_audio_renderer(
+        &self,
+        params: &[u8; 0x34],
+        transfer_memory: *mut crate::hle::kernel::k_transfer_memory::KTransferMemory,
+        transfer_memory_size: u64,
+        process: *mut crate::hle::kernel::k_process::KProcess,
+        applet_resource_user_id: u64,
+        rendered_event: std::sync::Arc<
+            std::sync::Mutex<crate::hle::kernel::k_event::KEvent>,
+        >,
+    ) -> std::result::Result<
+        Box<dyn AudioRendererSessionInterface>,
+        crate::hle::result::ResultCode,
+    >;
+}
+
 /// The main System struct. Top-level orchestrator that owns all subsystems.
 ///
 /// In C++, this uses a Pimpl pattern (System::Impl). In Rust, we flatten
@@ -130,6 +232,10 @@ pub struct System {
 
     /// Applet manager used to register frontend-launched applets with AM.
     applet_manager: AppletManager,
+
+    /// Shared ARP manager for application launch/control properties.
+    /// Upstream: `System::GetARPManager()`.
+    arp_manager: Arc<StdMutex<ARPManager>>,
 
     /// Filesystem controller (process registrations, factory management).
     /// Upstream: `FileSystemController& GetFileSystemController()`.
@@ -159,9 +265,8 @@ pub struct System {
 
     /// AudioCore subsystem (audio sinks, ADSP, audio manager).
     /// Upstream: `std::unique_ptr<AudioCore::AudioCore> audio_core`.
-    /// Type-erased because audio_core crate depends on core (circular dep).
     /// The frontend creates the concrete AudioCore and sets it via set_audio_core().
-    audio_core: Option<Box<dyn Any + Send>>,
+    audio_core: Option<Box<dyn AudioCoreInterface>>,
 
     /// Device memory (emulated Switch DRAM).
     device_memory: Option<Box<DeviceMemory>>,
@@ -291,6 +396,7 @@ impl System {
             audio_core: None,
             service_manager: None,
             applet_manager: AppletManager::new(),
+            arp_manager: Arc::new(StdMutex::new(ARPManager::new())),
             filesystem_controller: Arc::new(StdMutex::new(
                 crate::hle::service::filesystem::filesystem::FileSystemController::new(),
             )),
@@ -548,7 +654,7 @@ impl System {
 
         // Get the appropriate loader for this file type.
         let mut loader_system = crate::loader::loader::System {
-            content_provider: None, // ContentProvider is not yet created at System level.
+            content_provider: self.content_provider.clone(),
             filesystem_controller: Some(self.filesystem_controller.clone()),
         };
         let loader = crate::loader::loader::get_loader(&mut loader_system, file, 0, 0);
@@ -564,14 +670,10 @@ impl System {
         // Create a KProcess and call the loader.
         let mut process = crate::loader::loader::KProcess::new();
 
-        // Wire the Memory bridge to the process page table BEFORE loading.
-        // Upstream: Memory is passed to KPageTableBase::InitializeForProcess
-        // which is called during KProcess::Initialize, before LoadModule.
-        // We must set it here so that initialize_for_process can pass it
-        // to the page table, and operate(Map) can call map_memory_region.
-        if let Some(ref memory) = self.memory {
-            process.page_table.set_memory(memory.clone());
-        }
+        // Create per-process Memory (matching upstream `Core::Memory::Memory m_memory`
+        // owned by KProcess). Each process gets its own Memory instance with its
+        // own current_page_table, sharing the DeviceMemory backing with System.
+        process.create_memory(self);
 
         let (result_status, load_parameters) = loader.load(&mut process, &mut loader_system);
 
@@ -600,6 +702,32 @@ impl System {
         self.load_parameters = load_parameters;
         self.current_process = Some(process);
 
+        if let Some(ref process) = self.current_process {
+            let program_id = process.get_program_id();
+            let launch = ApplicationLaunchProperty {
+                title_id: program_id,
+                version: 0,
+                base_game_storage_id: StorageId::Host as u8,
+                update_storage_id: StorageId::None as u8,
+                program_index: 0,
+                reserved: 0,
+            };
+            let control =
+                vec![0u8; std::mem::size_of::<crate::file_sys::control_metadata::RawNACP>()];
+            let result = self
+                .arp_manager
+                .lock()
+                .unwrap()
+                .register(program_id, launch, control);
+            if result != crate::hle::result::RESULT_SUCCESS {
+                log::warn!(
+                    "System::load: failed to register ARP launch property for {:016X}: {:?}",
+                    program_id,
+                    result
+                );
+            }
+        }
+
         // Phase 3: Set up GPU, audio, services (upstream: SetupForApplicationProcess)
         self.setup_for_application_process();
 
@@ -609,14 +737,21 @@ impl System {
         // (see kernel.create_new_user_process_id() above), so registration must
         // happen here instead.
         if let Some(ref process) = self.current_process {
-            // Upstream passes a RomFSFactory constructed from the app_loader,
-            // content_provider, and filesystem_controller. Content provider is
-            // not yet wired at the System level, so we pass None for now.
-            // When content_provider is available, construct RomFSFactory here.
+            let romfs_factory = self
+                .app_loader
+                .as_ref()
+                .zip(self.content_provider.as_ref())
+                .map(|(app_loader, content_provider)| {
+                    Arc::new(crate::file_sys::romfs_factory::RomFSFactory::new(
+                        app_loader.as_ref(),
+                        content_provider.clone(),
+                        self.filesystem_controller.clone(),
+                    ))
+                });
             self.filesystem_controller.lock().unwrap().register_process(
                 process.process_id,
                 process.get_program_id(),
-                None, // romfs_factory — requires content_provider
+                romfs_factory,
             );
         }
 
@@ -657,17 +792,14 @@ impl System {
             // the guest thread starts it can immediately call get_arm_interface_mut().
             // Must happen before create_and_insert_by_frontend_applet_parameters so
             // it is done before set_window_system calls process.run().
-            if let Some(core_memory) = self.memory_shared() {
+            {
                 let shared_memory = process_arc.lock().unwrap().get_shared_memory();
                 let core_timing = self.core_timing.clone();
                 process_arc.lock().unwrap().initialize_interfaces(
-                    core_memory,
                     shared_memory,
                     core_timing,
                 );
                 log::info!("ARM JIT interfaces initialized for application process");
-            } else {
-                log::warn!("Cannot initialize ARM interfaces: Memory not available");
             }
 
             // Dump the memory block layout for diagnostics.
@@ -927,6 +1059,12 @@ impl System {
         self.content_provider.as_ref()
     }
 
+    /// Get the shared ARP manager.
+    /// Upstream: `System::GetARPManager()`.
+    pub fn arp_manager(&self) -> Arc<StdMutex<ARPManager>> {
+        self.arp_manager.clone()
+    }
+
     /// Register the subsystem factory callback.
     /// The frontend calls this before load() to provide Host1x/GPU/AudioCore creation.
     /// setup_for_application_process() will call this during loading.
@@ -956,20 +1094,14 @@ impl System {
     /// Called by the frontend after System::load() since audio_core crate depends
     /// on core (circular dependency prevents core from creating AudioCore directly).
     /// Upstream: created inside SetupForApplicationProcess() (core.cpp:283).
-    pub fn set_audio_core(&mut self, audio_core: Box<dyn Any + Send>) {
+    pub fn set_audio_core(&mut self, audio_core: Box<dyn AudioCoreInterface>) {
         self.audio_core = Some(audio_core);
     }
 
-    /// Get the AudioCore subsystem (type-erased).
-    /// Callers must downcast to the concrete AudioCore type.
+    /// Get the AudioCore subsystem bridge.
     /// Upstream: `System::AudioCore()` returns `AudioCore::AudioCore&`.
-    pub fn audio_core(&self) -> Option<&(dyn Any + Send)> {
+    pub fn audio_core(&self) -> Option<&dyn AudioCoreInterface> {
         self.audio_core.as_deref()
-    }
-
-    /// Get the AudioCore subsystem mutably (type-erased).
-    pub fn audio_core_mut(&mut self) -> Option<&mut (dyn Any + Send)> {
-        self.audio_core.as_deref_mut()
     }
 
     /// Set NVDEC active state.
@@ -994,7 +1126,25 @@ impl System {
 
     /// Gets a shared reference to the Memory bridge, if initialized.
     /// Upstream: `System::Memory()`.
+    /// Get the application process's Memory bridge.
+    /// Upstream: `System::ApplicationMemory()` → `ApplicationProcess()->GetMemory()`.
+    /// Falls back to the legacy `self.memory` if no application process is set.
     pub fn memory_shared(&self) -> Option<Arc<StdMutex<Memory>>> {
+        // Try per-process Memory first (the correct upstream path)
+        if let Some(ref process) = self.current_process {
+            if let Some(mem) = process.get_memory() {
+                return Some(mem);
+            }
+        }
+        // Try via Arc<Mutex<KProcess>> current_process_arc
+        if let Some(ref process_arc) = self.current_process_arc {
+            if let Ok(process) = process_arc.lock() {
+                if let Some(mem) = process.get_memory() {
+                    return Some(mem);
+                }
+            }
+        }
+        // Fallback to legacy global Memory
         self.memory.clone()
     }
 
@@ -1025,6 +1175,16 @@ impl System {
         self.device_memory
             .as_ref()
             .expect("DeviceMemory not initialized; call System::initialize() first")
+    }
+
+    /// Raw pointers to DeviceMemory and its HostMemory buffer, for creating
+    /// per-process Memory instances.  Both pointers remain valid for the
+    /// lifetime of System (they live in `self.device_memory`).
+    pub fn device_memory_ptrs(&self) -> (*const DeviceMemory, *const common::host_memory::HostMemory) {
+        let dm = self.device_memory();
+        let dm_ptr = dm as *const DeviceMemory;
+        let buffer_ptr = &dm.buffer as *const common::host_memory::HostMemory;
+        (dm_ptr, buffer_ptr)
     }
 
     /// Gets a mutable reference to the device memory.
@@ -1468,10 +1628,8 @@ impl System {
         // Upstream: KProcess::InitializeInterfaces() (k_process.cpp:1263-1291).
         // Creates the exclusive monitor and one ARM JIT per core, owned by KProcess.
         {
-            let core_memory = self.memory_shared();
             let core_timing = self.core_timing_shared();
             process.lock().unwrap().initialize_interfaces(
-                core_memory.unwrap(),
                 shared_memory.clone(),
                 core_timing,
             );

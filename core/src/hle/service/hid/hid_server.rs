@@ -712,12 +712,37 @@ impl IHidServer {
 
     // cmd 11: ActivateTouchScreen
     fn activate_touch_screen(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let server = Self::as_self(_this);
         let mut rp = RequestParser::new(ctx);
         let aruid = rp.pop_u64();
         log::debug!("IHidServer::ActivateTouchScreen called, aruid={}", aruid);
-        // TouchScreen activation requires TouchResource/TouchScreenDriver wiring.
+
+        let rm = server.resource_manager.lock();
+        let result = if let (Some(touch_screen), Some(touch_resource), Some(touch_driver)) = (
+            rm.get_touch_screen(),
+            rm.get_touch_resource(),
+            rm.get_touch_driver(),
+        ) {
+            let mut screen = touch_screen.lock();
+            let mut resource = touch_resource.lock();
+            let mut driver = touch_driver.lock();
+
+            if !server.firmware_settings.is_device_managed() {
+                let first = screen.activate(&mut resource, &mut driver);
+                if first.is_error() {
+                    to_ipc_result(first)
+                } else {
+                    to_ipc_result(screen.activate_with_aruid(&mut resource, aruid))
+                }
+            } else {
+                to_ipc_result(screen.activate_with_aruid(&mut resource, aruid))
+            }
+        } else {
+            RESULT_SUCCESS
+        };
+
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
-        rb.push_result(RESULT_SUCCESS);
+        rb.push_result(result);
     }
 
     // cmd 21: ActivateMouse
@@ -1458,17 +1483,38 @@ impl IHidServer {
         );
 
         let rm = server.resource_manager.lock();
-        if !server.firmware_settings.is_device_managed() {
-            if let Some(ref gesture) = rm.get_gesture() {
-                // Gesture::Activate requires TouchResource reference which may not be wired.
-                // For now, skip the initial Activate() call and just do the aruid one.
-                let _ = gesture; // Suppress unused warning
+        let result = if let (Some(gesture), Some(touch_resource), Some(touch_driver)) = (
+            rm.get_gesture(),
+            rm.get_touch_resource(),
+            rm.get_touch_driver(),
+        ) {
+            let mut gesture = gesture.lock();
+            let mut resource = touch_resource.lock();
+            let mut driver = touch_driver.lock();
+
+            if !server.firmware_settings.is_device_managed() {
+                let first = gesture.activate(&mut resource, &mut driver);
+                if first.is_error() {
+                    to_ipc_result(first)
+                } else {
+                    to_ipc_result(gesture.activate_with_aruid(
+                        &mut resource,
+                        aruid,
+                        basic_gesture_id,
+                    ))
+                }
+            } else {
+                to_ipc_result(gesture.activate_with_aruid(
+                    &mut resource,
+                    aruid,
+                    basic_gesture_id,
+                ))
             }
-        }
-        // Upstream: GetResourceManager()->GetGesture()->Activate(aruid.pid, basic_gesture_id)
-        // Gesture activation with aruid requires TouchResource wiring.
+        } else {
+            RESULT_SUCCESS
+        };
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
-        rb.push_result(RESULT_SUCCESS);
+        rb.push_result(result);
     }
 
     // cmd 100: SetSupportedNpadStyleSet
@@ -1888,6 +1934,13 @@ impl IHidServer {
         } else {
             RESULT_SUCCESS
         };
+
+        log::info!(
+            "IHidServer::SetNpadHandheldActivationMode aruid={} activation_mode={:?} result=0x{:X}",
+            aruid,
+            activation_mode,
+            result.get_inner_value()
+        );
 
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(result);
@@ -3012,14 +3065,20 @@ impl IHidServer {
             aruid
         );
 
-        // Upstream validates mode before passing, then calls
-        // touch_screen->SetTouchScreenConfiguration(resource, config, aruid).
-        // TouchScreen::set_touch_screen_configuration requires a &mut TouchResource
-        // which is not directly accessible from the service handler.
-        // Accept silently matching upstream behavior.
-        let _ = server;
+        let rm = server.resource_manager.lock();
+        let result = if let (Some(touch_screen), Some(touch_resource)) =
+            (rm.get_touch_screen(), rm.get_touch_resource())
+        {
+            to_ipc_result(touch_screen.lock().set_touch_screen_configuration(
+                &mut touch_resource.lock(),
+                &touchscreen_config,
+                aruid,
+            ))
+        } else {
+            RESULT_SUCCESS
+        };
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
-        rb.push_result(RESULT_SUCCESS);
+        rb.push_result(result);
     }
 
     // cmd 1003: IsFirmwareUpdateNeededForNotification
@@ -3051,13 +3110,21 @@ impl IHidServer {
             aruid
         );
 
-        // Upstream: touch_screen->SetTouchScreenResolution(resource, width, height, aruid).
-        // TouchScreen::set_touch_screen_resolution requires a &mut TouchResource
-        // which is not directly accessible from the service handler.
-        // Accept silently matching upstream behavior.
-        let _ = server;
+        let rm = server.resource_manager.lock();
+        let result = if let (Some(touch_screen), Some(touch_resource)) =
+            (rm.get_touch_screen(), rm.get_touch_resource())
+        {
+            to_ipc_result(touch_screen.lock().set_touch_screen_resolution(
+                &mut touch_resource.lock(),
+                width,
+                height,
+                aruid,
+            ))
+        } else {
+            RESULT_SUCCESS
+        };
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
-        rb.push_result(RESULT_SUCCESS);
+        rb.push_result(result);
     }
 
     // cmd 2000: ActivateDigitizer — upstream has nullptr handler

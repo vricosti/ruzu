@@ -843,6 +843,43 @@ impl UserCallbacks for DynarmicCallbacks32 {
 
                 let code = self.mem().read_32(pc);
 
+                // One-shot detailed dump at first exception
+                static FIRST_EXCEPTION: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+                if !FIRST_EXCEPTION.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    log::error!(
+                        "=== FIRST EXCEPTION DUMP === pc={:08X} code={:08X} exception={}",
+                        pc as u32, code, exception
+                    );
+                    // Dump surrounding code
+                    let start = pc.saturating_sub(64);
+                    for offset in (0..128).step_by(4) {
+                        let addr = start + offset;
+                        let word = self.mem().read_32(addr);
+                        let marker = if addr == pc { " <-- CRASH" } else { "" };
+                        log::error!("  {:08X}: {:08X}{}", addr as u32, word, marker);
+                    }
+                    // Dump all GPRs
+                    log::error!("  GPRs: R0={:08X} R1={:08X} R2={:08X} R3={:08X}",
+                        ctx.r[0] as u32, ctx.r[1] as u32, ctx.r[2] as u32, ctx.r[3] as u32);
+                    log::error!("  GPRs: R4={:08X} R5={:08X} R6={:08X} R7={:08X}",
+                        ctx.r[4] as u32, ctx.r[5] as u32, ctx.r[6] as u32, ctx.r[7] as u32);
+                    log::error!("  GPRs: R8={:08X} R9={:08X} R10={:08X} R11={:08X} R12={:08X}",
+                        ctx.r[8] as u32, ctx.r[9] as u32, ctx.r[10] as u32, ctx.r[11] as u32, ctx.r[12] as u32);
+                    log::error!("  PC={:08X} LR={:08X} SP={:08X} CPSR={:08X}",
+                        ctx.pc as u32, ctx.lr as u32, ctx.sp as u32, ctx.pstate);
+                    // Dump NEON/VFP registers (Q0-Q15 from v[])
+                    for i in 0..16 {
+                        log::error!("  Q{:02}={:032X}", i, ctx.v[i]);
+                    }
+                    // Dump stack
+                    log::error!("  Stack dump around SP={:08X}:", ctx.sp as u32);
+                    for offset in (0..64).step_by(4) {
+                        let addr = ctx.sp + offset;
+                        let word = self.mem().read_32(addr);
+                        log::error!("    [{:08X}] = {:08X}", addr as u32, word);
+                    }
+                }
+
                 log::error!(
                     "ExceptionRaised(exception = {}, pc = {:08X}, code = {:08X}, thumb = {})",
                     exception,
@@ -850,6 +887,13 @@ impl UserCallbacks for DynarmicCallbacks32 {
                     code,
                     self.parent().is_in_thumb_mode()
                 );
+
+                // Store exception info and halt. The run loop will advance PC
+                // past unimplemented instructions (e.g. NEON/SIMD).
+                self.parent()
+                    .last_exception_address
+                    .store(pc, Ordering::Relaxed);
+                self.halt_execution(rdynarmic::halt_reason::HaltReason::EXCEPTION_RAISED);
             }
         }
     }
@@ -941,6 +985,10 @@ pub struct ArmDynarmic32 {
 
     /// Last exception address reported by dynarmic for the current halt.
     last_exception_address: Arc<AtomicU64>,
+
+    /// Cached fastmem pointer for bounded instruction tracing.
+    /// Temporary diagnostic state, not an upstream field.
+    trace_fastmem_ptr: *const u8,
 }
 
 impl ArmDynarmic32 {
@@ -993,7 +1041,6 @@ impl ArmDynarmic32 {
         {
             OptimizationFlag::NO_OPTIMIZATIONS
         } else {
-            // All safe optimizations enabled, matching upstream default.
             optimization_flags_from_mask(0x3F)
         };
 
@@ -1052,6 +1099,7 @@ impl ArmDynarmic32 {
             jit,
             cp15_uro: 0,
             last_exception_address,
+            trace_fastmem_ptr: fastmem_pointer.unwrap_or(std::ptr::null_mut()) as *const u8,
         };
 
         // NOTE: The parent pointer is NOT set here because `result` will be moved
@@ -1061,6 +1109,13 @@ impl ArmDynarmic32 {
         // This is safe because callbacks are only invoked during run_thread().
 
         result
+    }
+
+    fn trace_read_code_word(&self, vaddr: u32) -> u32 {
+        if self.trace_fastmem_ptr.is_null() {
+            return 0;
+        }
+        unsafe { (self.trace_fastmem_ptr.add(vaddr as usize) as *const u32).read_unaligned() }
     }
 
     /// Set the parent pointer so callbacks can access this ArmDynarmic32.
@@ -1129,6 +1184,7 @@ unsafe impl Send for ArmDynarmic32 {}
 impl ArmInterface for ArmDynarmic32 {
     fn run_thread(&mut self, _thread: &mut KThread) -> HaltReason {
         self.last_exception_address.store(0, Ordering::Relaxed);
+        let trace_fastmem_ptr = self.trace_fastmem_ptr;
         let jit = match self.jit.as_mut() {
             Some(jit) => jit,
             None => {
@@ -1180,7 +1236,10 @@ impl ArmInterface for ArmDynarmic32 {
                             );
                         } else {
                             last_hr = jit.step();
-                            if !last_hr.is_empty() {
+                            if !last_hr.is_empty()
+                                && last_hr
+                                    != rdynarmic::halt_reason::HaltReason::STEP
+                            {
                                 log::info!("[A32TRACE] halt while searching: {:?}", last_hr);
                                 break;
                             }
@@ -1190,16 +1249,28 @@ impl ArmInterface for ArmDynarmic32 {
                             continue;
                         }
                     }
-                    if pc < start || pc >= end || logged_steps >= trace_limit {
+                    if logged_steps >= trace_limit {
                         break;
                     }
                     let cpsr = jit.get_cpsr();
+                    let read_code_word = |vaddr: u32| -> u32 {
+                        if trace_fastmem_ptr.is_null() {
+                            return 0;
+                        }
+                        unsafe {
+                            (trace_fastmem_ptr.add(vaddr as usize) as *const u32).read_unaligned()
+                        }
+                    };
                     log::info!(
-                        "[A32TRACE] step={} search_step={} pc=0x{:08x} cpsr=0x{:08x} r0=0x{:08x} r1=0x{:08x} r2=0x{:08x} r3=0x{:08x} r4=0x{:08x} r5=0x{:08x} r6=0x{:08x} r7=0x{:08x} r8=0x{:08x} r9=0x{:08x} r10=0x{:08x} r11=0x{:08x} r12=0x{:08x} sp=0x{:08x} lr=0x{:08x}",
+                        "[A32TRACE] step={} search_step={} pc=0x{:08x} cpsr=0x{:08x} op_m1=0x{:08x} op_0=0x{:08x} op_p1=0x{:08x} op_p2=0x{:08x} r0=0x{:08x} r1=0x{:08x} r2=0x{:08x} r3=0x{:08x} r4=0x{:08x} r5=0x{:08x} r6=0x{:08x} r7=0x{:08x} r8=0x{:08x} r9=0x{:08x} r10=0x{:08x} r11=0x{:08x} r12=0x{:08x} sp=0x{:08x} lr=0x{:08x}",
                         logged_steps,
                         step,
                         pc,
                         cpsr,
+                        read_code_word(pc.saturating_sub(4)),
+                        read_code_word(pc),
+                        read_code_word(pc.saturating_add(4)),
+                        read_code_word(pc.saturating_add(8)),
                         jit.get_register(0),
                         jit.get_register(1),
                         jit.get_register(2),
@@ -1218,7 +1289,10 @@ impl ArmInterface for ArmDynarmic32 {
                     );
                     logged_steps += 1;
                     last_hr = jit.step();
-                    if !last_hr.is_empty() {
+                    if !last_hr.is_empty()
+                        && last_hr
+                            != rdynarmic::halt_reason::HaltReason::STEP
+                    {
                         log::info!("[A32TRACE] halt={:?}", last_hr);
                         break;
                     }

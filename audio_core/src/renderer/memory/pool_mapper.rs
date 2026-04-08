@@ -8,14 +8,14 @@ use common::alignment::is_4kb_aligned;
 use common::ResultCode;
 
 pub struct PoolMapper<'a> {
-    process_handle: Option<u32>,
+    process_handle: Option<usize>,
     pool_infos: Option<&'a mut [MemoryPoolInfo]>,
     pool_count: u64,
     force_map: bool,
 }
 
 impl<'a> PoolMapper<'a> {
-    pub fn new(process_handle: Option<u32>, force_map: bool) -> Self {
+    pub fn new(process_handle: Option<usize>, force_map: bool) -> Self {
         Self {
             process_handle,
             pool_infos: None,
@@ -25,7 +25,7 @@ impl<'a> PoolMapper<'a> {
     }
 
     pub fn with_pools(
-        process_handle: Option<u32>,
+        process_handle: Option<usize>,
         pool_infos: &'a mut [MemoryPoolInfo],
         pool_count: u32,
         force_map: bool,
@@ -140,7 +140,7 @@ impl<'a> PoolMapper<'a> {
         self.force_map
     }
 
-    pub fn get_process_handle(&self, pool: &MemoryPoolInfo) -> Option<u32> {
+    pub fn get_process_handle(&self, pool: &MemoryPoolInfo) -> Option<usize> {
         match pool.get_location() {
             PoolLocation::Cpu => self.process_handle,
             PoolLocation::Dsp => None,

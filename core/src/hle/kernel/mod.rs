@@ -127,3 +127,4 @@ pub mod message_buffer;
 pub mod physical_core;
 #[cfg(feature = "debug-logs")]
 pub mod physical_core_log;
+pub mod trace_format;

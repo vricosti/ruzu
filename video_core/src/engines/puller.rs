@@ -422,7 +422,7 @@ impl Puller {
     pub fn call_puller_method(&mut self, method_call: &MethodCall) {
         let trace_idx = PULLER_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
         if trace_idx < 48 {
-            log::info!(
+            log::trace!(
                 "Puller::call_puller_method method=0x{:X} arg=0x{:X} subch={} pending={}",
                 method_call.method,
                 method_call.argument,
@@ -507,7 +507,7 @@ impl Puller {
         let channel_state = unsafe { &mut *self.channel_state };
         let trace_idx = PULLER_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
         if trace_idx < 48 {
-            log::info!(
+            log::trace!(
                 "Puller::call_engine_method engine={:?} method=0x{:X} arg=0x{:X} subch={}",
                 engine,
                 method_call.method,
@@ -637,7 +637,7 @@ impl Puller {
         let engine_id = EngineID::from_raw(method_call.argument);
         if let Some(eid) = engine_id {
             self.bound_engines[method_call.subchannel as usize] = Some(eid);
-            log::info!(
+            log::trace!(
                 "Puller::process_bind_method subch={} engine={:?}",
                 method_call.subchannel,
                 eid
@@ -720,9 +720,22 @@ impl Puller {
     fn process_semaphore_trigger_method(&mut self) {
         let semaphore_op_mask = 0xF;
         let op = self.regs.semaphore_trigger() & semaphore_op_mask;
+        log::trace!(
+            "PULLER_SEMTRIG op=0x{:X} trigger=0x{:X} addr=0x{:X} payload=0x{:X}",
+            op,
+            self.regs.semaphore_trigger(),
+            self.regs.semaphore_address(),
+            self.regs.semaphore_sequence()
+        );
         if op == GpuSemaphoreOperation::WriteLong as u32 {
             let sequence_address = self.regs.semaphore_address();
             let payload = self.regs.semaphore_sequence();
+            log::trace!(
+                "Puller::SemaphoreTrigger WriteLong gpu_addr=0x{:X} payload=0x{:X} trigger=0x{:X}",
+                sequence_address,
+                payload,
+                self.regs.semaphore_trigger()
+            );
             let gpu = self.gpu as usize;
             let gpu_ticks = unsafe { &*(gpu as *const crate::gpu::Gpu) }.get_ticks();
             let memory_manager = Arc::clone(&self.memory_manager);
@@ -740,6 +753,13 @@ impl Puller {
                             gpu_addr,
                             bytes,
                             &mut |cpu_addr, data| {
+                                log::trace!(
+                                    "Puller::SemaphoreTrigger writeback gpu_addr=0x{:X} cpu_addr=0x{:X} len=0x{:X} bytes={:02X?}",
+                                    gpu_addr,
+                                    cpu_addr,
+                                    data.len(),
+                                    &data[..std::cmp::min(data.len(), 16)]
+                                );
                                 gpu.write_guest_memory(cpu_addr, data);
                             },
                         );

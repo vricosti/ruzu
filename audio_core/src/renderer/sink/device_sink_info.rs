@@ -33,7 +33,7 @@ impl DeviceSinkInfo {
         in_params: &SinkInParameter,
         _pool_mapper: &PoolMapper<'_>,
     ) {
-        let device_params = in_params.device;
+        let device_params = in_params.device();
         if self.base.in_use == in_params.in_use {
             self.base.device_parameter.downmix_enabled = device_params.downmix_enabled;
             self.base.device_parameter.downmix_coeff = device_params.downmix_coeff;

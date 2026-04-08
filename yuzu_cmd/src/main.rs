@@ -518,6 +518,16 @@ fn main() {
     // Step 9 (upstream): while (emu_window->IsOpen()) { emu_window->WaitEvent(); }
     // Main thread stays in the window event loop.
     // -----------------------------------------------------------------------
+    // Reset SIGTERM to default AFTER all signal handlers (SIGSEGV for fastmem)
+    // have been installed. This ensures `timeout` and Ctrl-C cleanly kill the
+    // process instead of being swallowed by custom handlers.
+    #[cfg(unix)]
+    unsafe {
+        // SIGTERM = 15, SIG_DFL = 0
+        extern "C" { fn signal(sig: i32, handler: usize) -> usize; }
+        signal(15, 0);
+    }
+
     log::info!("Entering main event loop");
     match &mut emu_window {
         EmuWindow::Gl(w) => {
@@ -544,4 +554,11 @@ fn main() {
     log::info!("Window closed, shutting down");
     system.pause();
     system.shutdown_main_process();
+
+    // Force-exit the process. Some background threads (CPU core idle loops,
+    // audio ADSP, CoreTiming timer) block on condvars that aren't cleanly
+    // woken during shutdown. Upstream C++ exits via main() return which calls
+    // exit() and doesn't join detached threads; Rust's implicit drop of
+    // statics + JoinHandle would hang. This matches upstream behavior.
+    std::process::exit(0);
 }

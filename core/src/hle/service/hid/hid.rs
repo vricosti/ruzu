@@ -3,11 +3,16 @@
 //! Entry point for the HID service module.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use hid_core::hid_core::HIDCore;
-use hid_core::resource_manager::ResourceManager;
+use hid_core::resource_manager::{
+    ResourceManager, DEFAULT_UPDATE_NS, MOTION_UPDATE_NS, MOUSE_KEYBOARD_UPDATE_NS,
+    NPAD_UPDATE_NS,
+};
 use hid_core::resources::hid_firmware_settings::HidFirmwareSettings;
 
+use crate::core_timing;
 use crate::hle::service::hle_ipc::{SessionRequestHandlerFactory, SessionRequestHandlerPtr};
 use crate::hle::service::server_manager::ServerManager;
 
@@ -28,6 +33,95 @@ pub fn loop_process(system: crate::core::SystemRef) {
     )));
 
     resource_manager.lock().initialize();
+
+    let core_timing = system.get().core_timing();
+    let npad_update_event = core_timing::create_event(
+        "HID::UpdatePadCallback".to_string(),
+        Box::new({
+            let resource_manager = resource_manager.clone();
+            move |_time, ns_late| {
+                resource_manager.lock().update_npad(ns_late);
+                None
+            }
+        }),
+    );
+    let default_update_event = core_timing::create_event(
+        "HID::UpdateDefaultCallback".to_string(),
+        Box::new({
+            let resource_manager = resource_manager.clone();
+            move |_time, ns_late| {
+                resource_manager.lock().update_controllers(ns_late);
+                None
+            }
+        }),
+    );
+    let mouse_keyboard_update_event = core_timing::create_event(
+        "HID::UpdateMouseKeyboardCallback".to_string(),
+        Box::new({
+            let resource_manager = resource_manager.clone();
+            move |_time, ns_late| {
+                resource_manager.lock().update_mouse_keyboard(ns_late);
+                None
+            }
+        }),
+    );
+    let motion_update_event = core_timing::create_event(
+        "HID::UpdateMotionCallback".to_string(),
+        Box::new({
+            let resource_manager = resource_manager.clone();
+            move |_time, ns_late| {
+                resource_manager.lock().update_motion(ns_late);
+                None
+            }
+        }),
+    );
+    let touch_update_event = core_timing::create_event(
+        "HID::TouchUpdateCallback".to_string(),
+        Box::new({
+            let resource_manager = resource_manager.clone();
+            move |time, _ns_late| {
+                resource_manager.lock().update_touch_screen(time);
+                None
+            }
+        }),
+    );
+
+    {
+        let mut ct = core_timing.lock().unwrap();
+        ct.schedule_looping_event(NPAD_UPDATE_NS, NPAD_UPDATE_NS, &npad_update_event, false);
+        ct.schedule_looping_event(
+            DEFAULT_UPDATE_NS,
+            DEFAULT_UPDATE_NS,
+            &default_update_event,
+            false,
+        );
+        ct.schedule_looping_event(
+            MOUSE_KEYBOARD_UPDATE_NS,
+            MOUSE_KEYBOARD_UPDATE_NS,
+            &mouse_keyboard_update_event,
+            false,
+        );
+        ct.schedule_looping_event(
+            MOTION_UPDATE_NS,
+            MOTION_UPDATE_NS,
+            &motion_update_event,
+            false,
+        );
+        ct.schedule_looping_event(
+            Duration::from_nanos(hid_core::resources::touch_screen::touch_screen_resource::GESTURE_UPDATE_PERIOD_NS),
+            Duration::from_nanos(hid_core::resources::touch_screen::touch_screen_resource::GESTURE_UPDATE_PERIOD_NS),
+            &touch_update_event,
+            false,
+        );
+    }
+
+    let _hid_update_events = [
+        npad_update_event,
+        default_update_event,
+        mouse_keyboard_update_event,
+        motion_update_event,
+        touch_update_event,
+    ];
 
     let mut server_manager = ServerManager::new(system);
 

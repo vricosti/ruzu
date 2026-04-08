@@ -7,6 +7,7 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
+use crate::core::SystemRef;
 use crate::hle::kernel::k_process::KProcess;
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
@@ -60,6 +61,7 @@ pub struct ISelfController {
 
 impl ISelfController {
     pub fn new(
+        system: SystemRef,
         applet: Arc<Mutex<crate::hle::service::am::applet::Applet>>,
         process: Option<Arc<Mutex<KProcess>>>,
     ) -> Self {
@@ -73,7 +75,7 @@ impl ISelfController {
             if let Some(process_for_display) = process_for_display {
                 applet_guard
                     .display_layer_manager
-                    .initialize(process_for_display, applet_id, mode);
+                    .initialize(system, process_for_display, applet_id, mode);
             }
         }
         let handlers = build_handler_map(&[
@@ -119,6 +121,26 @@ impl ISelfController {
                 40,
                 Some(Self::create_managed_display_layer_handler),
                 "CreateManagedDisplayLayer",
+            ),
+            (
+                41,
+                Some(Self::is_system_buffer_sharing_enabled_handler),
+                "IsSystemBufferSharingEnabled",
+            ),
+            (
+                42,
+                Some(Self::get_system_shared_layer_handle_handler),
+                "GetSystemSharedLayerHandle",
+            ),
+            (
+                43,
+                Some(Self::get_system_shared_buffer_handle_handler),
+                "GetSystemSharedBufferHandle",
+            ),
+            (
+                44,
+                Some(Self::create_managed_display_separable_layer_handler),
+                "CreateManagedDisplaySeparableLayer",
             ),
             (
                 62,
@@ -437,6 +459,91 @@ impl ISelfController {
             }
             Err(err) => {
                 log::error!("CreateManagedDisplayLayer failed: {:?}", err);
+                let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+                rb.push_result(err);
+            }
+        }
+    }
+
+    fn is_system_buffer_sharing_enabled_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const ISelfController) };
+        let mut applet = service.applet.lock().unwrap();
+        let result = applet
+            .display_layer_manager
+            .is_system_buffer_sharing_enabled();
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(result);
+    }
+
+    fn get_system_shared_buffer_handle_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const ISelfController) };
+        let mut applet = service.applet.lock().unwrap();
+        let result = applet
+            .display_layer_manager
+            .get_system_shared_layer_handle()
+            .map(|(buffer_id, _layer_id)| buffer_id);
+
+        match result {
+            Ok(buffer_id) => {
+                let mut rb = ResponseBuilder::new(ctx, 4, 0, 0);
+                rb.push_result(RESULT_SUCCESS);
+                rb.push_u64(buffer_id);
+            }
+            Err(err) => {
+                let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+                rb.push_result(err);
+            }
+        }
+    }
+
+    fn get_system_shared_layer_handle_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const ISelfController) };
+        let mut applet = service.applet.lock().unwrap();
+        let result = applet.display_layer_manager.get_system_shared_layer_handle();
+
+        match result {
+            Ok((buffer_id, layer_id)) => {
+                let mut rb = ResponseBuilder::new(ctx, 6, 0, 0);
+                rb.push_result(RESULT_SUCCESS);
+                rb.push_u64(buffer_id);
+                rb.push_u64(layer_id);
+            }
+            Err(err) => {
+                let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+                rb.push_result(err);
+            }
+        }
+    }
+
+    fn create_managed_display_separable_layer_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const ISelfController) };
+        let result = service
+            .applet
+            .lock()
+            .unwrap()
+            .display_layer_manager
+            .create_managed_display_separable_layer();
+
+        match result {
+            Ok((layer_id, recording_layer_id)) => {
+                let mut rb = ResponseBuilder::new(ctx, 6, 0, 0);
+                rb.push_result(RESULT_SUCCESS);
+                rb.push_u64(layer_id);
+                rb.push_u64(recording_layer_id);
+            }
+            Err(err) => {
                 let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
                 rb.push_result(err);
             }
