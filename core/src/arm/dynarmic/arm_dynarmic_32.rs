@@ -367,6 +367,30 @@ impl UserCallbacks for DynarmicCallbacks32 {
         }
     }
 
+    fn is_read_only_memory(&self, vaddr: u32) -> bool {
+        // Query the process page table to determine if the address is in a
+        // read-only (non-writable) mapped region. This enables the
+        // A32ConstantMemoryReads optimization to fold literal pool loads
+        // into compile-time constants.
+        //
+        // Upstream does NOT override this (returns false), but for the Switch
+        // we can safely identify RX code pages since NRO/NSO .text sections
+        // are mapped USER_READ_EXECUTE.
+        if self.process.is_null() {
+            return false;
+        }
+        let process = unsafe { &*self.process };
+        if let Some(info) = process.page_table.query_info(vaddr as usize) {
+            let perm = info.get_permission();
+            // Read-only = has read permission but NOT write permission
+            use crate::hle::kernel::k_memory_block::KMemoryPermission;
+            perm.contains(KMemoryPermission::USER_READ)
+                && !perm.contains(KMemoryPermission::USER_WRITE)
+        } else {
+            false
+        }
+    }
+
     fn call_supervisor(&mut self, svc_num: u32) {
         // Upstream: m_parent.m_svc_swi = swi;
         //           m_parent.m_jit->HaltExecution(SupervisorCall);
