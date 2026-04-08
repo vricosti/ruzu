@@ -1201,10 +1201,16 @@ impl ArmInterface for ArmDynarmic32 {
 
         jit.clear_exclusive_state();
 
-        let trace_start = parse_trace_hex_env("RUZU_A32_TRACE_RANGE_START");
-        let trace_end = parse_trace_hex_env("RUZU_A32_TRACE_RANGE_END");
-        let trace_limit = parse_trace_u32_env("RUZU_A32_TRACE_LIMIT").unwrap_or(0);
-        let trace_search_limit = parse_trace_u32_env("RUZU_A32_TRACE_SEARCH_LIMIT").unwrap_or(0);
+        // Cache trace config to avoid parsing env vars on every run_thread call
+        static TRACE_CFG: std::sync::OnceLock<(Option<u32>, Option<u32>, u32, u32)> = std::sync::OnceLock::new();
+        let &(trace_start, trace_end, trace_limit, trace_search_limit) = TRACE_CFG.get_or_init(|| {
+            (
+                parse_trace_hex_env("RUZU_A32_TRACE_RANGE_START"),
+                parse_trace_hex_env("RUZU_A32_TRACE_RANGE_END"),
+                parse_trace_u32_env("RUZU_A32_TRACE_LIMIT").unwrap_or(0),
+                parse_trace_u32_env("RUZU_A32_TRACE_SEARCH_LIMIT").unwrap_or(0),
+            )
+        });
         if let (Some(start), Some(end)) = (trace_start, trace_end) {
             let current_pc = jit.get_register(15);
             if trace_limit > 0
