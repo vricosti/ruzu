@@ -5,12 +5,14 @@
 // RomFS factory for opening patched/unpatched RomFS images.
 
 use std::sync::Arc;
+use std::sync::Mutex;
 
 use super::common_funcs::get_base_title_id_with_program_index;
 use super::content_archive::NCA;
 use super::nca_metadata::ContentRecordType;
 use super::patch_manager::PatchManager;
 use super::registered_cache::ContentProvider;
+use super::registered_cache::ContentProviderUnion;
 use super::vfs::vfs_types::VirtualFile;
 
 // ============================================================================
@@ -42,7 +44,7 @@ pub struct RomFSFactory {
     file: Option<VirtualFile>,
     packed_update_raw: Option<VirtualFile>,
     updatable: bool,
-    content_provider: Option<Arc<dyn ContentProvider>>,
+    content_provider: Option<Arc<Mutex<ContentProviderUnion>>>,
     filesystem_controller: Option<
         Arc<std::sync::Mutex<crate::hle::service::filesystem::filesystem::FileSystemController>>,
     >,
@@ -56,7 +58,7 @@ impl RomFSFactory {
     /// Reads the RomFS and updatable flag from the AppLoader.
     pub fn new(
         app_loader: &dyn crate::loader::loader::AppLoader,
-        content_provider: Arc<dyn ContentProvider>,
+        content_provider: Arc<Mutex<ContentProviderUnion>>,
         filesystem_controller: Arc<
             std::sync::Mutex<crate::hle::service::filesystem::filesystem::FileSystemController>,
         >,
@@ -84,7 +86,7 @@ impl RomFSFactory {
     pub fn new_with_file(
         file: Option<VirtualFile>,
         updatable: bool,
-        content_provider: Option<Arc<dyn ContentProvider>>,
+        content_provider: Option<Arc<Mutex<ContentProviderUnion>>>,
         filesystem_controller: Option<
             Arc<
                 std::sync::Mutex<crate::hle::service::filesystem::filesystem::FileSystemController>,
@@ -121,11 +123,11 @@ impl RomFSFactory {
         };
         let fs_ctrl = self.filesystem_controller.as_ref()?;
         let fs_ctrl_guard = fs_ctrl.lock().unwrap();
-        let content_prov = self.content_provider.as_ref()?;
+        let content_prov = self.content_provider.as_ref()?.lock().unwrap();
         let patch_manager = PatchManager::new(
             current_process_title_id,
             &fs_ctrl_guard,
-            content_prov.as_ref(),
+            &*content_prov,
         );
         Some(patch_manager.patch_romfs(
             base,
@@ -142,13 +144,13 @@ impl RomFSFactory {
         title_id: u64,
         type_: ContentRecordType,
     ) -> Option<VirtualFile> {
-        let provider = self.content_provider.as_ref()?;
+        let provider = self.content_provider.as_ref()?.lock().unwrap();
         let nca = provider.get_entry(title_id, type_)?;
         let romfs = nca.get_romfs()?;
 
         let fs_ctrl = self.filesystem_controller.as_ref()?;
         let fs_ctrl_guard = fs_ctrl.lock().unwrap();
-        let patch_manager = PatchManager::new(title_id, &fs_ctrl_guard, provider.as_ref());
+        let patch_manager = PatchManager::new(title_id, &fs_ctrl_guard, &*provider);
         Some(patch_manager.patch_romfs(romfs, type_, None, true))
     }
 
@@ -181,7 +183,7 @@ impl RomFSFactory {
         storage: StorageId,
         type_: ContentRecordType,
     ) -> Option<NCA> {
-        let provider = self.content_provider.as_ref()?;
+        let provider = self.content_provider.as_ref()?.lock().unwrap();
         match storage {
             StorageId::None => provider.get_entry(title_id, type_),
             StorageId::NandSystem => {

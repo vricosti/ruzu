@@ -158,13 +158,9 @@ impl Sink for CubebSink {
         builder.name(name.to_string()).latency(minimum_latency);
 
         if stream_type == StreamType::In {
-            builder
-                .input(self.input_device, &params)
-                .default_output(&params);
+            builder.input(self.input_device, &params);
         } else {
-            builder
-                .default_input(&params)
-                .output(self.output_device, &params);
+            builder.output(self.output_device, &params);
         }
 
         builder
@@ -173,6 +169,23 @@ impl Sink for CubebSink {
 
         match builder.init(ctx) {
             Ok(backend) => {
+                // Extract the raw cubeb_stream pointer for start/stop control.
+                // The backend is stored in CubebStream and outlives the callback.
+                let raw_ptr = backend.as_ptr() as usize;
+                handle.lock().set_backend_ctl(Box::new(move |start| {
+                    unsafe {
+                        let ptr = raw_ptr as *mut cubeb::ffi::cubeb_stream;
+                        if start {
+                            if cubeb::ffi::cubeb_stream_start(ptr) != 0 {
+                                log::error!("Error starting cubeb stream");
+                            }
+                        } else {
+                            if cubeb::ffi::cubeb_stream_stop(ptr) != 0 {
+                                log::error!("Error stopping cubeb stream");
+                            }
+                        }
+                    }
+                }));
                 self.streams.push(CubebStream {
                     name: name.to_string(),
                     stream_type,

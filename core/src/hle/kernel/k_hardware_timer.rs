@@ -10,6 +10,7 @@ use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
 use super::k_hardware_timer_base::KHardwareTimerBase;
+use super::k_scheduler_lock::KScopedSchedulerLock;
 use super::k_thread::KThread;
 use crate::core_timing::{self, CoreTiming, EventType, UnscheduleEventType};
 
@@ -18,7 +19,7 @@ use crate::core_timing::{self, CoreTiming, EventType, UnscheduleEventType};
 /// Upstream inherits from KInterruptTask and KHardwareTimerBase.
 /// It registers a CoreTiming callback to fire DoTask() at the appropriate
 /// absolute time.
-pub struct KHardwareTimer {
+struct KHardwareTimerState {
     base: KHardwareTimerBase,
     /// Absolute time in nanoseconds for the next wakeup.
     m_wakeup_time: i64,
@@ -35,20 +36,41 @@ pub struct KHardwareTimer {
     gsc: Option<Weak<Mutex<super::global_scheduler_context::GlobalSchedulerContext>>>,
 }
 
+pub struct KHardwareTimer {
+    state: Mutex<KHardwareTimerState>,
+}
+
 enum TimerTaskTarget {
     ThreadArc(Arc<Mutex<KThread>>),
     RawPtr(usize),
 }
 
+fn with_current_emu_thread_dispatch_disabled<R>(f: impl FnOnce() -> R) -> R {
+    let current_thread = super::kernel::get_current_emu_thread();
+    if let Some(thread) = current_thread.as_ref() {
+        thread.lock().unwrap().disable_dispatch();
+    }
+
+    let result = f();
+
+    if let Some(thread) = current_thread {
+        thread.lock().unwrap().enable_dispatch();
+    }
+
+    result
+}
+
 impl KHardwareTimer {
     pub fn new() -> Self {
         Self {
-            base: KHardwareTimerBase::new(),
-            m_wakeup_time: i64::MAX,
-            m_event_type: None,
-            core_timing: None,
-            thread_ptrs: HashMap::new(),
-            gsc: None,
+            state: Mutex::new(KHardwareTimerState {
+                base: KHardwareTimerBase::new(),
+                m_wakeup_time: i64::MAX,
+                m_event_type: None,
+                core_timing: None,
+                thread_ptrs: HashMap::new(),
+                gsc: None,
+            }),
         }
     }
 
@@ -56,7 +78,7 @@ impl KHardwareTimer {
         &mut self,
         gsc: Weak<Mutex<super::global_scheduler_context::GlobalSchedulerContext>>,
     ) {
-        self.gsc = Some(gsc);
+        self.state.lock().unwrap().gsc = Some(gsc);
     }
 
     /// Create the CoreTiming callback.
@@ -74,46 +96,45 @@ impl KHardwareTimer {
     ///
     /// Matches upstream constructor behavior where `this` pointer is captured
     /// in the CoreTiming callback lambda.
-    pub fn wire_callback(
-        timer: &Arc<Mutex<KHardwareTimer>>,
-        core_timing: Arc<std::sync::Mutex<CoreTiming>>,
-    ) {
+    pub fn wire_callback(timer: &Arc<KHardwareTimer>, core_timing: Arc<std::sync::Mutex<CoreTiming>>) {
         let timer_weak = Arc::downgrade(timer);
         let event_type = core_timing::create_event(
             "KHardwareTimer::Callback".to_string(),
             Box::new(move |_late, _ns| {
                 if let Some(timer) = timer_weak.upgrade() {
-                    timer.lock().unwrap().do_task();
+                    timer.do_task();
                 }
                 None
             }),
         );
-        let mut guard = timer.lock().unwrap();
-        guard.m_event_type = Some(event_type);
-        guard.core_timing = Some(core_timing);
+        let mut state = timer.state.lock().unwrap();
+        state.m_event_type = Some(event_type);
+        state.core_timing = Some(core_timing);
     }
 
     /// Unschedule the event and clean up.
     /// Matches upstream: `KHardwareTimer::Finalize()`
     pub fn finalize(&mut self) {
+        let state = self.state.get_mut().unwrap();
         if let (Some(ref core_timing), Some(ref event_type)) =
-            (&self.core_timing, &self.m_event_type)
+            (&state.core_timing, &state.m_event_type)
         {
             core_timing
                 .lock()
                 .unwrap()
                 .unschedule_event(event_type, UnscheduleEventType::NoWait);
         }
-        self.m_wakeup_time = i64::MAX;
-        self.m_event_type = None;
-        self.core_timing = None;
-        self.thread_ptrs.clear();
+        state.m_wakeup_time = i64::MAX;
+        state.m_event_type = None;
+        state.core_timing = None;
+        state.thread_ptrs.clear();
     }
 
     /// Get the current tick (global time in nanoseconds).
     /// Matches upstream: `KHardwareTimer::GetTick()`
     pub fn get_tick(&self) -> i64 {
-        if let Some(ref core_timing) = self.core_timing {
+        let state = self.state.lock().unwrap();
+        if let Some(ref core_timing) = state.core_timing {
             core_timing.lock().unwrap().get_global_time_ns().as_nanos() as i64
         } else {
             0
@@ -126,7 +147,7 @@ impl KHardwareTimer {
     /// Matches upstream: `KHardwareTimer::RegisterAbsoluteTask()`
     /// Upstream takes KTimerTask* (which is KThread via inheritance).
     /// We take thread_id + Weak<Mutex<KThread>> for resolution.
-    pub fn register_absolute_task(&mut self, thread: &Arc<Mutex<KThread>>, task_time: i64) {
+    pub fn register_absolute_task(&self, thread: &Arc<Mutex<KThread>>, task_time: i64) {
         let thread_id = {
             let mut thread_guard = thread.lock().unwrap();
             thread_guard.set_timer_task_time(task_time);
@@ -136,54 +157,65 @@ impl KHardwareTimer {
             let mut thread_guard = thread.lock().unwrap();
             (&mut *thread_guard) as *mut KThread as usize
         };
-        self.thread_ptrs.insert(thread_id, thread_ptr);
+        with_current_emu_thread_dispatch_disabled(|| {
+            let mut state = self.state.lock().unwrap();
+            state.thread_ptrs.insert(thread_id, thread_ptr);
 
-        let had_current = super::kernel::with_current_thread_fast_mut(|t| {
-            t.disable_dispatch();
-        })
-        .is_some();
-
-        if self.base.register_absolute_task_impl(thread_id, task_time) {
-            if task_time <= self.m_wakeup_time {
-                self.enable_interrupt(task_time);
+            if state.base.register_absolute_task_impl(thread_id, task_time) {
+                if task_time <= state.m_wakeup_time {
+                    self.enable_interrupt_locked(&mut state, task_time);
+                }
             }
-        }
-        if had_current {
-            super::kernel::with_current_thread_fast_mut(|t| {
-                t.enable_dispatch();
-            });
-        }
+        });
     }
 
     pub fn register_absolute_task_by_id(
-        &mut self,
+        &self,
         thread_id: u64,
         thread_ptr: usize,
         task_time: i64,
     ) {
-        self.thread_ptrs.insert(thread_id, thread_ptr);
+        log::trace!(
+            "KHardwareTimer::register_absolute_task_by_id tid={} task_time={} ptr=0x{:x}",
+            thread_id,
+            task_time,
+            thread_ptr
+        );
+        with_current_emu_thread_dispatch_disabled(|| {
+            log::trace!(
+                "KHardwareTimer::register_absolute_task_by_id tid={} before state.lock",
+                thread_id
+            );
+            let mut state = self.state.lock().unwrap();
+            log::trace!(
+                "KHardwareTimer::register_absolute_task_by_id tid={} after state.lock wakeup_time={}",
+                thread_id,
+                state.m_wakeup_time
+            );
+            state.thread_ptrs.insert(thread_id, thread_ptr);
 
-        let had_current = super::kernel::with_current_thread_fast_mut(|t| {
-            t.disable_dispatch();
-        })
-        .is_some();
-
-        if self.base.register_absolute_task_impl(thread_id, task_time) {
-            if task_time <= self.m_wakeup_time {
-                self.enable_interrupt(task_time);
+            if state.base.register_absolute_task_impl(thread_id, task_time) {
+                log::trace!(
+                    "KHardwareTimer::register_absolute_task_by_id tid={} inserted task_time={} wakeup_time={}",
+                    thread_id,
+                    task_time,
+                    state.m_wakeup_time
+                );
+                if task_time <= state.m_wakeup_time {
+                    log::trace!(
+                        "KHardwareTimer::register_absolute_task_by_id tid={} enabling interrupt for task_time={}",
+                        thread_id,
+                        task_time
+                    );
+                    self.enable_interrupt_locked(&mut state, task_time);
+                }
             }
-        }
-
-        if had_current {
-            super::kernel::with_current_thread_fast_mut(|t| {
-                t.enable_dispatch();
-            });
-        }
+        });
     }
 
     /// Cancel a task.
     /// Matches upstream: `KHardwareTimerBase::CancelTask()`
-    pub fn cancel_task(&mut self, thread: &Arc<Mutex<KThread>>) {
+    pub fn cancel_task(&self, thread: &Arc<Mutex<KThread>>) {
         let (thread_id, task_time) = {
             let thread_guard = thread.lock().unwrap();
             (
@@ -191,82 +223,121 @@ impl KHardwareTimer {
                 thread_guard.get_timer_task_time(),
             )
         };
-        let had_current = super::kernel::with_current_thread_fast_mut(|t| {
-            t.disable_dispatch();
-        })
-        .is_some();
-
-        if task_time > 0 {
-            self.base.cancel_task(thread_id, task_time);
-        }
-        thread.lock().unwrap().set_timer_task_time(0);
-        self.thread_ptrs.remove(&thread_id);
-        if had_current {
-            super::kernel::with_current_thread_fast_mut(|t| {
-                t.enable_dispatch();
-            });
-        }
+        with_current_emu_thread_dispatch_disabled(|| {
+            let mut state = self.state.lock().unwrap();
+            if task_time > 0 {
+                state.base.cancel_task(thread_id, task_time);
+            }
+            thread.lock().unwrap().set_timer_task_time(0);
+            state.thread_ptrs.remove(&thread_id);
+        });
     }
 
-    pub fn cancel_task_by_id(&mut self, thread_id: u64, task_time: i64) {
-        let had_current = super::kernel::with_current_thread_fast_mut(|t| {
-            t.disable_dispatch();
-        })
-        .is_some();
-
-        if task_time > 0 {
-            self.base.cancel_task(thread_id, task_time);
-        }
-        self.thread_ptrs.remove(&thread_id);
-
-        if had_current {
-            super::kernel::with_current_thread_fast_mut(|t| {
-                t.enable_dispatch();
-            });
-        }
+    pub fn cancel_task_by_id(&self, thread_id: u64, task_time: i64) {
+        with_current_emu_thread_dispatch_disabled(|| {
+            let mut state = self.state.lock().unwrap();
+            if task_time > 0 {
+                state.base.cancel_task(thread_id, task_time);
+            }
+            state.thread_ptrs.remove(&thread_id);
+        });
     }
 
     /// Matches upstream: `KHardwareTimer::EnableInterrupt()`
-    fn enable_interrupt(&mut self, wakeup_time: i64) {
-        self.disable_interrupt();
+    fn enable_interrupt_locked(&self, state: &mut KHardwareTimerState, wakeup_time: i64) {
+        log::trace!(
+            "KHardwareTimer::enable_interrupt_locked wakeup_time={} old_wakeup_time={}",
+            wakeup_time,
+            state.m_wakeup_time
+        );
+        self.disable_interrupt_locked(state);
 
-        self.m_wakeup_time = wakeup_time;
+        state.m_wakeup_time = wakeup_time;
         if let (Some(ref core_timing), Some(ref event_type)) =
-            (&self.core_timing, &self.m_event_type)
+            (&state.core_timing, &state.m_event_type)
         {
+            log::trace!(
+                "KHardwareTimer::enable_interrupt_locked before schedule_event wakeup_time={}",
+                wakeup_time
+            );
             core_timing.lock().unwrap().schedule_event(
                 Duration::from_nanos(wakeup_time as u64),
                 event_type,
                 true, // absolute time
             );
+            log::trace!(
+                "KHardwareTimer::enable_interrupt_locked after schedule_event wakeup_time={}",
+                wakeup_time
+            );
+        }
+    }
+
+    /// Rearm the timer from inside the timer callback.
+    ///
+    /// Upstream `DoTask()` notes that disabling the interrupt is not necessary
+    /// because CoreTiming has already popped the current event before invoking
+    /// the callback. Re-entering `unschedule_event()` from this callback can
+    /// deadlock our Rust CoreTiming implementation, so the callback path must
+    /// only update `m_wakeup_time` and schedule the next absolute event.
+    fn rearm_interrupt_after_callback_locked(
+        &self,
+        state: &mut KHardwareTimerState,
+        wakeup_time: i64,
+    ) {
+        log::trace!(
+            "KHardwareTimer::rearm_interrupt_after_callback_locked wakeup_time={} old_wakeup_time={}",
+            wakeup_time,
+            state.m_wakeup_time
+        );
+        state.m_wakeup_time = wakeup_time;
+        if let (Some(ref core_timing), Some(ref event_type)) =
+            (&state.core_timing, &state.m_event_type)
+        {
+            log::trace!(
+                "KHardwareTimer::rearm_interrupt_after_callback_locked before schedule_event wakeup_time={}",
+                wakeup_time
+            );
+            core_timing.lock().unwrap().schedule_event(
+                Duration::from_nanos(wakeup_time as u64),
+                event_type,
+                true,
+            );
+            log::trace!(
+                "KHardwareTimer::rearm_interrupt_after_callback_locked after schedule_event wakeup_time={}",
+                wakeup_time
+            );
         }
     }
 
     /// Matches upstream: `KHardwareTimer::DisableInterrupt()`
-    fn disable_interrupt(&mut self) {
+    fn disable_interrupt_locked(&self, state: &mut KHardwareTimerState) {
+        if !Self::get_interrupt_enabled_locked(state) {
+            return;
+        }
         if let (Some(ref core_timing), Some(ref event_type)) =
-            (&self.core_timing, &self.m_event_type)
+            (&state.core_timing, &state.m_event_type)
         {
             core_timing
                 .lock()
                 .unwrap()
                 .unschedule_event(event_type, UnscheduleEventType::NoWait);
         }
-        self.m_wakeup_time = i64::MAX;
+        state.m_wakeup_time = i64::MAX;
     }
 
-    fn get_interrupt_enabled(&self) -> bool {
-        self.m_wakeup_time != i64::MAX
+    fn get_interrupt_enabled_locked(state: &KHardwareTimerState) -> bool {
+        state.m_wakeup_time != i64::MAX
     }
 
     fn resolve_task_target(&self, task_id: u64) -> Option<TimerTaskTarget> {
-        if let Some(gsc) = self.gsc.as_ref().and_then(Weak::upgrade) {
+        let state = self.state.lock().unwrap();
+        if let Some(gsc) = state.gsc.as_ref().and_then(Weak::upgrade) {
             if let Some(thread) = gsc.lock().unwrap().get_thread_by_thread_id(task_id) {
                 return Some(TimerTaskTarget::ThreadArc(thread));
             }
         }
 
-        self.thread_ptrs
+        state.thread_ptrs
             .get(&task_id)
             .copied()
             .filter(|ptr| *ptr != 0)
@@ -275,56 +346,111 @@ impl KHardwareTimer {
 
     /// Called by the CoreTiming callback.
     /// Matches upstream: `KHardwareTimer::DoTask()`
-    fn do_task(&mut self) {
-        if !self.get_interrupt_enabled() {
-            return;
-        }
+    fn do_task(&self) {
+        let gsc = self
+            .state
+            .lock()
+            .unwrap()
+            .gsc
+            .as_ref()
+            .and_then(Weak::upgrade);
+        let scheduler_lock = gsc
+            .as_ref()
+            .map(|gsc| {
+                let guard = gsc.lock().unwrap();
+                std::ptr::addr_of!(guard.m_scheduler_lock)
+            })
+            .unwrap_or(std::ptr::null());
 
-        // Disable the timer interrupt while we handle this.
-        // Not necessary due to core timing already having popped this event.
-        self.m_wakeup_time = i64::MAX;
+        let _scheduler_guard = if scheduler_lock.is_null() {
+            None
+        } else {
+            Some(KScopedSchedulerLock::new(unsafe { &*scheduler_lock }))
+        };
+        let (deliveries, next_time) = {
+            let mut state = self.state.lock().unwrap();
 
-        let cur_tick = self.get_tick();
+            if !Self::get_interrupt_enabled_locked(&state) {
+                return;
+            }
 
-        let (fired_task_ids, next_time) = self.base.collect_expired_tasks(cur_tick);
-        let gsc = self.gsc.as_ref().and_then(Weak::upgrade);
+            // Disable the timer interrupt while we handle this.
+            state.m_wakeup_time = i64::MAX;
 
-        for task_id in fired_task_ids {
-            let target = if let Some(gsc) = gsc.as_ref() {
-                gsc.lock()
-                    .unwrap()
-                    .get_thread_by_thread_id(task_id)
-                    .map(TimerTaskTarget::ThreadArc)
+            let cur_tick = if let Some(ref core_timing) = state.core_timing {
+                core_timing.lock().unwrap().get_global_time_ns().as_nanos() as i64
             } else {
-                None
-            }
-            .or_else(|| {
-                self.thread_ptrs
-                    .get(&task_id)
-                    .copied()
-                    .filter(|ptr| *ptr != 0)
-                    .map(TimerTaskTarget::RawPtr)
-            });
+                0
+            };
+            let (fired_task_ids, next_time) = state.base.collect_expired_tasks(cur_tick);
+            log::trace!(
+                "KHardwareTimer::do_task cur_tick={} fired={:?} next_time={}",
+                cur_tick,
+                fired_task_ids,
+                next_time
+            );
 
+            let mut deliveries = Vec::with_capacity(fired_task_ids.len());
+            for task_id in fired_task_ids {
+                let target = if let Some(gsc) = gsc.as_ref() {
+                    gsc.lock()
+                        .unwrap()
+                        .get_thread_by_thread_id(task_id)
+                        .map(TimerTaskTarget::ThreadArc)
+                } else {
+                    None
+                }
+                .or_else(|| {
+                    state.thread_ptrs
+                        .get(&task_id)
+                        .copied()
+                        .filter(|ptr| *ptr != 0)
+                        .map(TimerTaskTarget::RawPtr)
+                });
+
+                if let Some(target) = target {
+                    deliveries.push(target);
+                }
+                state.thread_ptrs.remove(&task_id);
+            }
+
+            (deliveries, next_time)
+        };
+
+        for target in deliveries {
             match target {
-                Some(TimerTaskTarget::ThreadArc(thread)) => {
+                TimerTaskTarget::ThreadArc(thread) => {
                     let mut thread = thread.lock().unwrap();
+                    log::trace!(
+                        "KHardwareTimer::do_task delivering tid={} state={:?} active_core={} current_core={}",
+                        thread.get_thread_id(),
+                        thread.get_state(),
+                        thread.get_active_core(),
+                        thread.get_current_core()
+                    );
                     thread.set_timer_task_time(0);
                     thread.on_timer();
                 }
-                Some(TimerTaskTarget::RawPtr(thread_ptr)) => {
+                TimerTaskTarget::RawPtr(thread_ptr) => {
                     let thread = unsafe { &mut *(thread_ptr as *mut KThread) };
+                    log::trace!(
+                        "KHardwareTimer::do_task delivering raw tid={} state={:?} active_core={} current_core={}",
+                        thread.get_thread_id(),
+                        thread.get_state(),
+                        thread.get_active_core(),
+                        thread.get_current_core()
+                    );
                     thread.set_timer_task_time(0);
                     thread.on_timer();
                 }
-                None => {}
             }
-
-            self.thread_ptrs.remove(&task_id);
         }
 
-        if next_time > 0 && next_time <= self.m_wakeup_time {
-            self.enable_interrupt(next_time);
+        if next_time > 0 {
+            let mut state = self.state.lock().unwrap();
+            if next_time <= state.m_wakeup_time {
+                self.rearm_interrupt_after_callback_locked(&mut state, next_time);
+            }
         }
     }
 }
@@ -338,7 +464,9 @@ impl Default for KHardwareTimer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core_timing::CoreTiming;
     use crate::hle::kernel::global_scheduler_context::GlobalSchedulerContext;
+    use crate::hle::kernel::k_thread::ThreadState;
 
     #[test]
     fn resolve_task_target_falls_back_to_gsc_thread_lookup() {
@@ -355,5 +483,83 @@ mod tests {
             }
             _ => panic!("expected GSC-backed timer target"),
         }
+    }
+
+    #[test]
+    fn do_task_wakes_waiting_thread_via_gsc_owner() {
+        let mut timer = KHardwareTimer::new();
+        let gsc = Arc::new(Mutex::new(GlobalSchedulerContext::new()));
+        let mut core_timing = CoreTiming::new();
+        core_timing.set_multicore(true);
+        let thread = Arc::new(Mutex::new(KThread::new()));
+        {
+            let mut guard = thread.lock().unwrap();
+            guard.thread_id = 17;
+            guard.begin_wait();
+            guard.set_timer_task_time(10);
+            guard.bind_self_reference(&thread);
+        }
+        gsc.lock().unwrap().add_thread(Arc::clone(&thread));
+        timer.set_gsc(Arc::downgrade(&gsc));
+        {
+            let mut state = timer.state.lock().unwrap();
+            state.core_timing = Some(Arc::new(Mutex::new(core_timing)));
+            state.m_wakeup_time = 10;
+            state.base.register_absolute_task_impl(17, 10);
+        }
+
+        timer.do_task();
+
+        let guard = thread.lock().unwrap();
+        assert_eq!(guard.get_state(), ThreadState::RUNNABLE);
+        assert_eq!(
+            guard.wait_result,
+            crate::hle::kernel::svc::svc_results::RESULT_TIMED_OUT.get_inner_value()
+        );
+        assert_eq!(guard.get_timer_task_time(), 0);
+    }
+
+    #[test]
+    fn do_task_rearms_next_deadline_without_unscheduling_callback_event() {
+        let timer = Arc::new(KHardwareTimer::new());
+        let gsc = Arc::new(Mutex::new(GlobalSchedulerContext::new()));
+        let mut core_timing = CoreTiming::new();
+        core_timing.set_multicore(true);
+        KHardwareTimer::wire_callback(&timer, Arc::new(Mutex::new(core_timing)));
+        {
+            let mut state = timer.state.lock().unwrap();
+            state.gsc = Some(Arc::downgrade(&gsc));
+            state.m_wakeup_time = 10;
+            state.base.register_absolute_task_impl(1, 10);
+            state.base.register_absolute_task_impl(2, 20);
+        }
+
+        let waiter1 = Arc::new(Mutex::new(KThread::new()));
+        {
+            let mut guard = waiter1.lock().unwrap();
+            guard.thread_id = 1;
+            guard.begin_wait();
+            guard.set_timer_task_time(10);
+        }
+        let waiter2 = Arc::new(Mutex::new(KThread::new()));
+        {
+            let mut guard = waiter2.lock().unwrap();
+            guard.thread_id = 2;
+            guard.begin_wait();
+            guard.set_timer_task_time(20);
+        }
+        {
+            let mut gsc_guard = gsc.lock().unwrap();
+            gsc_guard.add_thread(Arc::clone(&waiter1));
+            gsc_guard.add_thread(Arc::clone(&waiter2));
+        }
+
+        timer.do_task();
+
+        let state = timer.state.lock().unwrap();
+        assert_eq!(state.m_wakeup_time, 20);
+        drop(state);
+        assert_eq!(waiter1.lock().unwrap().get_state(), ThreadState::RUNNABLE);
+        assert_eq!(waiter2.lock().unwrap().get_state(), ThreadState::WAITING);
     }
 }

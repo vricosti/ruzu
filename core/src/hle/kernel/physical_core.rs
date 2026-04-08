@@ -142,17 +142,10 @@ impl PhysicalCore {
         &self,
         jit: &mut dyn ArmInterface,
         thread_context: &mut ThreadContext,
-        _scheduler: &Arc<Mutex<KScheduler>>,
-        _process: &Arc<Mutex<KProcess>>,
+        current_thread: &Arc<Mutex<KThread>>,
     ) {
-        let runtime_guard = self.m_runtime.lock().unwrap();
-        let Some(runtime) = runtime_guard.as_ref() else {
-            return;
-        };
-
         jit.get_context(thread_context);
-        runtime
-            .m_current_thread
+        current_thread
             .lock()
             .unwrap()
             .capture_guest_context(thread_context);
@@ -164,6 +157,7 @@ impl PhysicalCore {
         thread_context: &mut ThreadContext,
         scheduler: &Arc<Mutex<KScheduler>>,
         process: &Arc<Mutex<KProcess>>,
+        current_thread: &Arc<Mutex<KThread>>,
         svc_num: u32,
         svc_count: u32,
         is_64bit: bool,
@@ -176,7 +170,9 @@ impl PhysicalCore {
             "dispatch_supervisor_call: before handoff (svc=0x{:x})",
             svc_num
         );
-        self.handoff_after_svc(jit, thread_context, scheduler, process);
+        let _ = scheduler;
+        let _ = process;
+        self.handoff_after_svc(jit, thread_context, current_thread);
         if let Some(threshold) = std::env::var("RUZU_LOG_AFTER_SVC")
             .ok()
             .and_then(|value| value.parse::<u32>().ok())
@@ -325,8 +321,10 @@ impl PhysicalCore {
                         thread_context,
                         scheduler,
                         process,
-                        svc_num,
+                        &super::kernel::get_current_thread_pointer()
+                            .expect("current thread must exist during SVC dispatch"),
                         svc_count,
+                        svc_num,
                         is_64bit,
                         &mut svc_args,
                         system,
@@ -356,7 +354,9 @@ impl PhysicalCore {
                     // cooperative port, the dispatch quantum boundary is the
                     // equivalent place to drain a pending termination request.
                     if self.drain_current_thread_termination(scheduler) {
-                        self.handoff_after_svc(jit, thread_context, scheduler, process);
+                        if let Some(current_thread) = super::kernel::get_current_thread_pointer() {
+                            self.handoff_after_svc(jit, thread_context, &current_thread);
+                        }
                     }
                 }
             }
@@ -394,6 +394,14 @@ impl PhysicalCore {
         }
     }
 
+    /// Load SVC arguments back into the current core's ARM interface.
+    /// Port of upstream `PhysicalCore::LoadSvcArguments(const KProcess&, args)`.
+    pub fn load_svc_arguments(&self, process: &mut KProcess, args: &[u64; 8]) {
+        if let Some(jit) = process.get_arm_interface_mut(self.m_core_index) {
+            jit.set_svc_arguments(args);
+        }
+    }
+
     /// Save context from current core to thread.
     /// Port of upstream `PhysicalCore::SaveContext(KThread* thread)`.
     pub fn save_context(&self, thread: &mut KThread) {
@@ -413,6 +421,14 @@ impl PhysicalCore {
                     as *mut crate::arm::arm_interface::ThreadContext)
             };
             jit.get_context(arm_ctx);
+        }
+    }
+
+    /// Save SVC arguments from the current core's ARM interface.
+    /// Port of upstream `PhysicalCore::SaveSvcArguments(KProcess&, args)`.
+    pub fn save_svc_arguments(&self, process: &KProcess, args: &mut [u64; 8]) {
+        if let Some(jit) = process.get_arm_interface(self.m_core_index) {
+            jit.get_svc_arguments(args);
         }
     }
 
@@ -800,7 +816,9 @@ mod tests {
         jit.context.r[0] = 0xAA;
         jit.context.pc = 0x200100;
 
-        physical_core.handoff_after_svc(&mut jit, &mut thread_context, &scheduler, &process);
+        let _ = scheduler;
+        let _ = process;
+        physical_core.handoff_after_svc(&mut jit, &mut thread_context, &current_thread);
 
         let thread = current_thread.lock().unwrap();
         assert_eq!(thread.thread_context.r[0], 0xAA);

@@ -121,6 +121,7 @@ impl NvMapDevice {
         let aligned_size = (params.size as u64 + page_size - 1) & !(page_size - 1);
         match self.file().create_handle(aligned_size) {
             Ok(handle) => {
+                handle.set_orig_size(params.size as u64);
                 params.handle = handle.id;
                 log::debug!("handle: {}, size: 0x{:X}", handle.id, params.size);
                 NvResult::Success
@@ -180,40 +181,19 @@ impl NvMapDevice {
             log::error!("Object failed to allocate, handle={:08X}", params.handle);
             return result;
         }
-        log::debug!(
-            "nvmap::IocAlloc result handle={} align=0x{:X} kind=0x{:X} address=0x{:X}",
-            params.handle,
-            params.align,
-            params.kind,
-            params.address
-        );
 
         let Some(process) = self.container().get_session_process(session_id) else {
             log::error!("Active session missing process for fd={}", fd);
             return NvResult::InvalidState;
         };
 
-        let before_info = {
-            let process_guard = process.lock().unwrap();
-            process_guard
-                .page_table
-                .get_base()
-                .query_info(params.address as usize)
-        };
-        if params.handle == 8 {
-            log::debug!(
-                "nvmap::IocAlloc before lock handle=8 info={:?}",
-                before_info
-            );
-        }
-
         let handle_size = {
             let inner = handle.lock_inner();
             inner.size as usize
         };
-        let (lock_result, after_info) = {
+        let lock_result = {
             let mut process_guard = process.lock().unwrap();
-            let lock_result = process_guard
+            process_guard
                 .page_table
                 .get_base_mut()
                 .lock_for_map_device_address_space(
@@ -221,20 +201,8 @@ impl NvMapDevice {
                     handle_size,
                     KMemoryPermission::NONE,
                     true,
-                );
-            let after_info = process_guard
-                .page_table
-                .get_base()
-                .query_info(params.address as usize);
-            (lock_result, after_info)
+                )
         };
-        if params.handle == 8 {
-            log::debug!(
-                "nvmap::IocAlloc after lock handle=8 result=0x{:X} info={:?}",
-                lock_result,
-                after_info
-            );
-        }
         if lock_result != 0 {
             log::error!(
                 "LockForMapDeviceAddressSpace failed: handle={:08X} result=0x{:X}",
@@ -280,7 +248,11 @@ impl NvMapDevice {
         }
 
         let handle = handle.unwrap();
-        self.file().duplicate_handle(params.id, false);
+        let result = handle.duplicate(false);
+        if result != NvResult::Success {
+            log::error!("Could not duplicate handle!");
+            return result;
+        }
         params.handle = handle.id;
         NvResult::Success
     }
@@ -304,7 +276,7 @@ impl NvMapDevice {
         match params.param {
             1 => {
                 // Size
-                params.result = handle.orig_size as u32;
+                params.result = handle.orig_size() as u32;
             }
             2 => {
                 // Alignment
@@ -338,7 +310,7 @@ impl NvMapDevice {
         NvResult::Success
     }
 
-    pub fn ioc_free(&self, params: &mut IocFreeParams, _fd: DeviceFD) -> NvResult {
+    pub fn ioc_free(&self, params: &mut IocFreeParams, fd: DeviceFD) -> NvResult {
         log::debug!("nvmap::IocFree called");
 
         if params.handle == 0 {
@@ -347,6 +319,24 @@ impl NvMapDevice {
         }
 
         if let Some(free_info) = self.file().free_handle(params.handle, false) {
+            if free_info.can_unlock {
+                let sessions = self.sessions.lock().unwrap();
+                let session_id = sessions.get(&fd).copied().unwrap_or_default();
+                drop(sessions);
+
+                if let Some(process) = self.container().get_session_process(session_id) {
+                    let unlock_result = process
+                        .lock()
+                        .unwrap()
+                        .page_table
+                        .get_base_mut()
+                        .unlock_for_device_address_space(
+                            free_info.address as usize,
+                            free_info.size as usize,
+                        );
+                    debug_assert_eq!(unlock_result, 0);
+                }
+            }
             params.address = free_info.address;
             params.size = free_info.size as u32;
             params.flags.raw = 0;
@@ -382,6 +372,10 @@ pub fn write_struct<T: Copy>(output: &mut [u8], val: &T) {
 }
 
 impl NvDevice for NvMapDevice {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
     fn ioctl1(&self, fd: DeviceFD, command: Ioctl, input: &[u8], output: &mut [u8]) -> NvResult {
         match command.group() {
             0x1 => match command.cmd() {
@@ -465,5 +459,45 @@ impl NvDevice for NvMapDevice {
     fn on_close(&self, fd: DeviceFD) {
         let mut sessions = self.sessions.lock().unwrap();
         sessions.remove(&fd);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{IocCreateParams, IocFromIdParams, NvMapDevice};
+    use crate::hle::service::nvdrv::core::container::Container;
+    use crate::hle::service::nvdrv::nvdata::NvResult;
+
+    #[test]
+    fn ioc_create_preserves_unaligned_orig_size() {
+        let container = Container::new();
+        let device = NvMapDevice::new(container.get_nv_map_file(), &container);
+        let mut params = IocCreateParams {
+            size: 0x1234,
+            handle: 0,
+        };
+
+        let result = device.ioc_create(&mut params);
+
+        assert_eq!(result, NvResult::Success);
+        let handle = container.get_nv_map_file().get_handle(params.handle).unwrap();
+        assert_eq!(handle.orig_size(), 0x1234);
+        assert_eq!(handle.lock_inner().size, 0x2000);
+    }
+
+    #[test]
+    fn ioc_from_id_propagates_duplicate_failure_for_unallocated_handle() {
+        let container = Container::new();
+        let device = NvMapDevice::new(container.get_nv_map_file(), &container);
+        let handle = container.get_nv_map_file().create_handle(0x1000).unwrap();
+        let mut params = IocFromIdParams {
+            id: handle.id,
+            handle: 0,
+        };
+
+        let result = device.ioc_from_id(&mut params);
+
+        assert_eq!(result, NvResult::BadValue);
+        assert_eq!(params.handle, 0);
     }
 }

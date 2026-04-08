@@ -7,6 +7,7 @@
 //! in a shared memory region accessible by both the kernel and userspace.
 
 use std::sync::atomic::{fence, Ordering};
+use std::sync::Arc;
 
 use super::common::{
     ClockSourceId, ContinuousAdjustmentTimePoint, SteadyClockTimePoint, SystemClockContext,
@@ -115,7 +116,7 @@ fn write_lock_free<T: Copy>(counter: &mut u32, values: &mut [T; 2], value: T) {
 pub struct SharedMemory {
     /// The kernel shared memory object backing this region.
     /// Matches upstream `Kernel::KSharedMemory& m_k_shared_memory`.
-    k_shared_memory: crate::hle::kernel::k_shared_memory::KSharedMemory,
+    k_shared_memory: Arc<crate::hle::kernel::k_shared_memory::KSharedMemory>,
     /// Cached pointer to the SharedMemoryStruct within the KSharedMemory backing.
     /// Matches upstream `SharedMemoryStruct* m_shared_memory_ptr`.
     shared_memory_ptr: *mut SharedMemoryStruct,
@@ -147,6 +148,7 @@ impl SharedMemory {
             MemoryPermission::Read,
             core::mem::size_of::<SharedMemoryStruct>(),
         );
+        let k_shared_memory = Arc::new(k_shared_memory);
         let ptr = k_shared_memory.get_pointer_mut(0) as *mut SharedMemoryStruct;
         Self {
             k_shared_memory,
@@ -160,7 +162,7 @@ impl SharedMemory {
         use crate::hle::kernel::k_shared_memory::KSharedMemory;
 
         // Use a heap allocation as fallback.
-        let k_shared_memory = KSharedMemory::new();
+        let k_shared_memory = Arc::new(KSharedMemory::new());
         // Allocate a zeroed SharedMemoryStruct on the heap.
         let boxed = Box::new(SharedMemoryStruct {
             steady_time_points: Default::default(),
@@ -180,7 +182,12 @@ impl SharedMemory {
     /// Get a reference to the underlying KSharedMemory.
     /// Matches upstream `GetKSharedMemory()`.
     pub fn get_k_shared_memory(&self) -> &crate::hle::kernel::k_shared_memory::KSharedMemory {
-        &self.k_shared_memory
+        self.k_shared_memory.as_ref()
+    }
+
+    /// Get the shared owner for the underlying KSharedMemory.
+    pub fn get_k_shared_memory_arc(&self) -> Arc<crate::hle::kernel::k_shared_memory::KSharedMemory> {
+        Arc::clone(&self.k_shared_memory)
     }
 
     /// Get a pointer to the raw shared memory struct for external mapping.
@@ -335,6 +342,14 @@ mod tests {
     #[test]
     fn shared_memory_struct_size() {
         assert_eq!(core::mem::size_of::<SharedMemoryStruct>(), 0x1000);
+    }
+
+    #[test]
+    fn new_for_test_returns_stable_shared_memory_owner() {
+        let sm = SharedMemory::new_for_test();
+        let a = sm.get_k_shared_memory_arc();
+        let b = sm.get_k_shared_memory_arc();
+        assert!(Arc::ptr_eq(&a, &b));
     }
 
     #[test]

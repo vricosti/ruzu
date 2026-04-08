@@ -94,7 +94,11 @@ impl AccU0 {
                 Some(AccU0::initialize_application_info_handler),
                 "InitializeApplicationInfo",
             ),
-            (101, None, "GetBaasAccountManagerForApplication"),
+            (
+                101,
+                Some(AccU0::get_baas_account_manager_for_application_handler),
+                "GetBaasAccountManagerForApplication",
+            ),
             (102, None, "AuthenticateApplicationAsync"),
             (103, None, "CheckNetworkServiceAvailabilityAsync"),
             (110, None, "StoreSaveDataThumbnail"),
@@ -269,6 +273,30 @@ impl AccU0 {
         let rc = svc.interface.initialize_application_info_restricted();
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(rc);
+    }
+
+    fn get_baas_account_manager_for_application_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        let svc = unsafe { &*(this as *const dyn ServiceFramework as *const AccU0) };
+        let (rc, object) = svc.interface.get_baas_account_manager_for_application();
+        let is_domain = ctx
+            .get_manager()
+            .map_or(false, |manager| manager.lock().unwrap().is_domain());
+        let move_handle = if is_domain {
+            0
+        } else {
+            ctx.create_session_for_service(object.clone()).unwrap_or(0)
+        };
+
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 1);
+        rb.push_result(rc);
+        if is_domain {
+            ctx.add_domain_object(object);
+        } else {
+            rb.push_move_objects(move_handle);
+        }
     }
 
     fn list_qualified_users_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {

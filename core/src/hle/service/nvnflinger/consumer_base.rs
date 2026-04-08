@@ -208,4 +208,25 @@ impl ConsumerBase {
             _ => false,
         }
     }
+
+    pub fn get_slot_graphic_buffer(&self, slot: i32) -> Option<Arc<GraphicBuffer>> {
+        if slot < 0 || slot >= NUM_BUFFER_SLOTS as i32 {
+            return None;
+        }
+        self.inner.lock().unwrap().slots[slot as usize]
+            .graphic_buffer
+            .clone()
+    }
+
+    #[cfg(test)]
+    pub fn set_slot_graphic_buffer_for_test(
+        &self,
+        slot: i32,
+        graphic_buffer: Option<Arc<GraphicBuffer>>,
+    ) {
+        if slot < 0 || slot >= NUM_BUFFER_SLOTS as i32 {
+            return;
+        }
+        self.inner.lock().unwrap().slots[slot as usize].graphic_buffer = graphic_buffer;
+    }
 }

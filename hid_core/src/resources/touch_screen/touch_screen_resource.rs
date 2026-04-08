@@ -8,14 +8,17 @@
 //! activation per-aruid, processes raw touch input from TouchScreenDriver,
 //! and writes into shared memory via the gesture handler.
 
+use std::sync::Arc;
+
 use common::ResultCode;
+use parking_lot::Mutex;
 
 use super::gesture_handler::GestureHandler;
 use super::touch_screen_driver::TouchScreenDriver;
 use super::touch_types::*;
 use crate::hid_result;
 use crate::hid_types::TouchScreenModeForNx;
-use crate::resources::applet_resource::ARUID_INDEX_MAX;
+use crate::resources::applet_resource::{AppletResource, HandheldConfig, ARUID_INDEX_MAX};
 
 /// Gesture update period: 4ms (1000Hz), matching upstream GestureUpdatePeriod.
 pub const GESTURE_UPDATE_PERIOD_NS: u64 = 4 * 1000 * 1000;
@@ -42,6 +45,8 @@ pub struct TouchResource {
     offset_x: f32,
     offset_y: f32,
     default_touch_screen_mode: TouchScreenModeForNx,
+    applet_resource: Option<Arc<Mutex<AppletResource>>>,
+    handheld_config: Option<Arc<Mutex<HandheldConfig>>>,
 }
 
 impl TouchResource {
@@ -64,7 +69,17 @@ impl TouchResource {
             offset_x: 0.0,
             offset_y: 0.0,
             default_touch_screen_mode: TouchScreenModeForNx::Finger,
+            applet_resource: None,
+            handheld_config: None,
         }
+    }
+
+    pub fn set_applet_resource(&mut self, applet_resource: Arc<Mutex<AppletResource>>) {
+        self.applet_resource = Some(applet_resource);
+    }
+
+    pub fn set_handheld_config(&mut self, handheld_config: Arc<Mutex<HandheldConfig>>) {
+        self.handheld_config = Some(handheld_config);
     }
 
     /// Port of TouchResource::ActivateTouch() (no-aruid version).
@@ -101,10 +116,50 @@ impl TouchResource {
     /// Port of TouchResource::ActivateTouch(u64 aruid).
     /// In upstream, this iterates over applet resource aruid data and initializes
     /// touch shared memory for the specified aruid.
-    pub fn activate_touch_with_aruid(&mut self, _aruid: u64) -> ResultCode {
-        // Upstream: locks shared_mutex, iterates AruidIndexMax entries,
-        // validates applet_data, initializes touch_screen_lifo for matching aruid.
-        // Requires AppletResource integration which is not yet wired up.
+    pub fn activate_touch_with_aruid(&mut self, aruid: u64) -> ResultCode {
+        let Some(applet_resource) = self.applet_resource.as_ref().cloned() else {
+            return ResultCode::SUCCESS;
+        };
+        let mut applet_resource = applet_resource.lock();
+
+        for aruid_index in 0..ARUID_INDEX_MAX {
+            let applet_data = applet_resource.get_aruid_data_by_index(aruid_index).clone();
+            let touch_data = &mut self.aruid_data[aruid_index];
+
+            if !applet_data.flag.is_assigned() {
+                *touch_data = TouchAruidData::default();
+                continue;
+            }
+
+            let aruid_id = applet_data.aruid;
+            if touch_data.aruid != aruid_id {
+                *touch_data = TouchAruidData::default();
+                touch_data.aruid = aruid_id;
+            }
+
+            if aruid != aruid_id {
+                continue;
+            }
+
+            let Some(touch_shared) = applet_resource
+                .get_shared_memory_format_mut(aruid_id)
+                .map(|shared| &mut shared.touch_screen)
+            else {
+                continue;
+            };
+
+            if touch_shared.touch_screen_lifo.buffer_count == 0 {
+                Self::store_previous_touch_state(
+                    &mut self.previous_touch_state,
+                    &mut touch_data.finger_map,
+                    &self.current_touch_state,
+                    applet_data.flag.enable_touchscreen(),
+                );
+                touch_shared
+                    .touch_screen_lifo
+                    .write_next_entry(self.previous_touch_state);
+            }
+        }
         ResultCode::SUCCESS
     }
 
@@ -139,12 +194,49 @@ impl TouchResource {
     /// Port of TouchResource::ActivateGesture(u64 aruid, u32 basic_gesture_id).
     pub fn activate_gesture_with_aruid(
         &mut self,
-        _aruid: u64,
-        _basic_gesture_id: u32,
+        aruid: u64,
+        basic_gesture_id: u32,
     ) -> ResultCode {
-        // Upstream: locks shared_mutex, iterates AruidIndexMax entries,
-        // validates applet_data, initializes gesture_lifo for matching aruid.
-        // Requires AppletResource integration which is not yet wired up.
+        let Some(applet_resource) = self.applet_resource.as_ref().cloned() else {
+            return ResultCode::SUCCESS;
+        };
+        let mut applet_resource = applet_resource.lock();
+
+        for aruid_index in 0..ARUID_INDEX_MAX {
+            let applet_data = applet_resource.get_aruid_data_by_index(aruid_index).clone();
+            let touch_data = &mut self.aruid_data[aruid_index];
+
+            if !applet_data.flag.is_assigned() {
+                *touch_data = TouchAruidData::default();
+                continue;
+            }
+
+            let aruid_id = applet_data.aruid;
+            if touch_data.aruid != aruid_id {
+                *touch_data = TouchAruidData::default();
+                touch_data.aruid = aruid_id;
+            }
+
+            if aruid != aruid_id {
+                continue;
+            }
+
+            let Some(gesture_shared) = applet_resource
+                .get_shared_memory_format_mut(aruid_id)
+                .map(|shared| &mut shared.gesture)
+            else {
+                continue;
+            };
+
+            if touch_data.basic_gesture_id != basic_gesture_id {
+                gesture_shared.gesture_lifo.buffer_count = 0;
+            }
+
+            if gesture_shared.gesture_lifo.buffer_count == 0 {
+                touch_data.basic_gesture_id = basic_gesture_id;
+                gesture_shared.gesture_lifo.write_next_entry(self.gesture_state);
+            }
+        }
         ResultCode::SUCCESS
     }
 
@@ -297,7 +389,16 @@ impl TouchResource {
         height: u32,
         aruid: u64,
     ) -> ResultCode {
+        let Some(applet_resource) = self.applet_resource.as_ref().cloned() else {
+            return ResultCode::SUCCESS;
+        };
+        let applet_resource = applet_resource.lock();
+
         for aruid_index in 0..ARUID_INDEX_MAX {
+            let applet_data = applet_resource.get_aruid_data_by_index(aruid_index);
+            if !applet_data.flag.is_assigned() {
+                continue;
+            }
             let data = &mut self.aruid_data[aruid_index];
             if aruid != data.aruid {
                 continue;
@@ -314,7 +415,16 @@ impl TouchResource {
         mode: TouchScreenModeForNx,
         aruid: u64,
     ) -> ResultCode {
+        let Some(applet_resource) = self.applet_resource.as_ref().cloned() else {
+            return ResultCode::SUCCESS;
+        };
+        let applet_resource = applet_resource.lock();
+
         for aruid_index in 0..ARUID_INDEX_MAX {
+            let applet_data = applet_resource.get_aruid_data_by_index(aruid_index);
+            if !applet_data.flag.is_assigned() {
+                continue;
+            }
             let data = &mut self.aruid_data[aruid_index];
             if aruid != data.aruid {
                 continue;
@@ -329,7 +439,16 @@ impl TouchResource {
         &self,
         aruid: u64,
     ) -> Result<TouchScreenModeForNx, ResultCode> {
+        let Some(applet_resource) = self.applet_resource.as_ref().cloned() else {
+            return Ok(TouchScreenModeForNx::UseSystemSetting);
+        };
+        let applet_resource = applet_resource.lock();
+
         for aruid_index in 0..ARUID_INDEX_MAX {
+            let applet_data = applet_resource.get_aruid_data_by_index(aruid_index);
+            if !applet_data.flag.is_assigned() {
+                continue;
+            }
             let data = &self.aruid_data[aruid_index];
             if aruid != data.aruid {
                 continue;
@@ -371,9 +490,72 @@ impl TouchResource {
             timestamp,
         );
 
-        // Upstream: locks shared_mutex and iterates aruid data, writing to
-        // shared memory lifos for each aruid. This requires full AppletResource
-        // integration which is not yet wired up.
+        let Some(applet_resource) = self.applet_resource.as_ref().cloned() else {
+            return;
+        };
+        let mut applet_resource = applet_resource.lock();
+
+        for aruid_index in 0..ARUID_INDEX_MAX {
+            let applet_data = applet_resource.get_aruid_data_by_index(aruid_index).clone();
+            let data = &mut self.aruid_data[aruid_index];
+
+            if !applet_data.flag.is_assigned() {
+                *data = TouchAruidData::default();
+                continue;
+            }
+
+            if data.aruid != applet_data.aruid {
+                *data = TouchAruidData::default();
+                data.aruid = applet_data.aruid;
+            }
+
+            if self.gesture_ref_counter != 0 {
+                if !applet_data.flag.enable_touchscreen() {
+                    self.gesture_state = GestureState::default();
+                }
+                if self.gesture_handler.needs_update() {
+                    self.gesture_handler
+                        .update_gesture_state(&mut self.gesture_state, timestamp);
+                    if let Some(gesture_shared) = applet_resource
+                        .get_shared_memory_format_mut(applet_data.aruid)
+                        .map(|shared| &mut shared.gesture)
+                    {
+                        gesture_shared.gesture_lifo.write_next_entry(self.gesture_state);
+                    }
+                }
+            }
+
+            if self.touch_ref_counter != 0 {
+                let mut touch_mode = data.finger_map.touch_mode;
+                if touch_mode == TouchScreenModeForNx::UseSystemSetting {
+                    touch_mode = self.default_touch_screen_mode;
+                }
+
+                if applet_resource.get_active_aruid() == applet_data.aruid
+                    && touch_mode != TouchScreenModeForNx::UseSystemSetting
+                    && self.is_initialized
+                    && is_handheld_hid_enabled
+                    && touch_driver.is_running()
+                {
+                    touch_driver.set_touch_mode(touch_mode);
+                }
+
+                if let Some(touch_shared) = applet_resource
+                    .get_shared_memory_format_mut(applet_data.aruid)
+                    .map(|shared| &mut shared.touch_screen)
+                {
+                    Self::store_previous_touch_state(
+                        &mut self.previous_touch_state,
+                        &mut data.finger_map,
+                        &self.current_touch_state,
+                        applet_data.flag.enable_touchscreen(),
+                    );
+                    touch_shared
+                        .touch_screen_lifo
+                        .write_next_entry(self.current_touch_state);
+                }
+            }
+        }
     }
 
     /// Port of TouchResource::Finalize.

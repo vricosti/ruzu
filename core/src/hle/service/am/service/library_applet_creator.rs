@@ -7,7 +7,9 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
-use crate::hle::result::{ResultCode, RESULT_SUCCESS};
+use crate::core::SystemRef;
+use crate::hle::result::{ResultCode, RESULT_SUCCESS, RESULT_UNKNOWN};
+use crate::hle::service::am::service::storage::IStorage;
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
 use crate::hle::service::ipc_helpers::{RequestParser, ResponseBuilder};
 use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
@@ -20,6 +22,7 @@ use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFrame
 /// - 11: CreateTransferMemoryStorage
 /// - 12: CreateHandleStorage
 pub struct ILibraryAppletCreator {
+    system: SystemRef,
     applet: Arc<Mutex<crate::hle::service::am::applet::Applet>>,
     window_system: Arc<Mutex<crate::hle::service::am::window_system::WindowSystem>>,
     handlers: BTreeMap<u32, FunctionInfo>,
@@ -28,6 +31,7 @@ pub struct ILibraryAppletCreator {
 
 impl ILibraryAppletCreator {
     pub fn new(
+        system: SystemRef,
         applet: Arc<Mutex<crate::hle::service::am::applet::Applet>>,
         window_system: Arc<Mutex<crate::hle::service::am::window_system::WindowSystem>>,
     ) -> Self {
@@ -44,6 +48,7 @@ impl ILibraryAppletCreator {
             (12, None, "CreateHandleStorage"),
         ]);
         Self {
+            system,
             applet,
             window_system,
             handlers,
@@ -51,23 +56,59 @@ impl ILibraryAppletCreator {
         }
     }
 
-    fn create_storage_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn push_interface_response(
+        ctx: &mut HLERequestContext,
+        object: Arc<dyn SessionRequestHandler>,
+    ) {
+        let is_domain = ctx
+            .get_manager()
+            .map_or(false, |manager| manager.lock().unwrap().is_domain());
+        let move_handle = if is_domain {
+            0
+        } else {
+            ctx.create_session_for_service(object.clone()).unwrap_or(0)
+        };
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 1);
+        rb.push_result(RESULT_SUCCESS);
+        if is_domain {
+            ctx.add_domain_object(object);
+        } else {
+            rb.push_move_objects(move_handle);
+        }
+    }
+
+    fn create_storage_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let creator =
+            unsafe { &*(this as *const dyn ServiceFramework as *const ILibraryAppletCreator) };
         let mut rp = RequestParser::new(ctx);
         let size = rp.pop_i64();
-        log::warn!("(STUBBED) CreateStorage called, size={}", size);
+        log::debug!("ILibraryAppletCreator::CreateStorage called, size={}", size);
 
-        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
-        rb.push_result(RESULT_SUCCESS);
+        if size <= 0 {
+            let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+            rb.push_result(RESULT_UNKNOWN);
+            return;
+        }
+
+        let storage = Arc::new(IStorage::new_with_system(
+            creator.system,
+            vec![0u8; size as usize],
+        ));
+        Self::push_interface_response(ctx, storage);
     }
 
     fn create_transfer_memory_storage_handler(
         _this: &dyn ServiceFramework,
         ctx: &mut HLERequestContext,
     ) {
-        log::warn!("(STUBBED) CreateTransferMemoryStorage called");
+        let mut rp = RequestParser::new(ctx);
+        let _is_writable = rp.pop_bool();
+        let size = rp.pop_i64();
+
+        log::warn!("(STUBBED) CreateTransferMemoryStorage called, size={}", size);
 
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
-        rb.push_result(RESULT_SUCCESS);
+        rb.push_result(RESULT_UNKNOWN);
     }
 }
 

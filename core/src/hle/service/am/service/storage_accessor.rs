@@ -13,6 +13,16 @@ use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
 use crate::hle::service::ipc_helpers::{RequestParser, ResponseBuilder};
 use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
 
+fn read_storage_for_out_buffer(
+    backing: &dyn LibraryAppletStorage,
+    offset: i64,
+    out_buffer_size: usize,
+) -> Result<Vec<u8>, ResultCode> {
+    let mut data = vec![0u8; out_buffer_size];
+    backing.read(offset, &mut data)?;
+    Ok(data)
+}
+
 /// IStorageAccessor service.
 ///
 /// Matches upstream `IStorageAccessor` which holds a `shared_ptr<LibraryAppletStorage>`.
@@ -79,29 +89,19 @@ impl IStorageAccessor {
             unsafe { &*(this as *const dyn ServiceFramework as *const IStorageAccessor) };
         let mut rp = RequestParser::new(ctx);
         let offset = rp.pop_i64();
-
-        let backing = accessor.backing.lock().unwrap();
-        let size = backing.get_size();
-        // Determine how much to read: from offset to end of storage, capped by output buffer size
-        let available = if offset >= 0 && (offset as i64) < size {
-            (size - offset) as usize
-        } else {
-            0
-        };
-        // We read as much as possible into a temporary buffer, then write_buffer will handle sizing
-        let read_size = available;
-        let mut data = vec![0u8; read_size];
+        let out_buffer_size = ctx.get_write_buffer_size(0);
         log::debug!(
             "IStorageAccessor::Read called, offset={} size={}",
             offset,
-            read_size
+            out_buffer_size
         );
 
-        let result = backing.read(offset, &mut data);
+        let backing = accessor.backing.lock().unwrap();
+        let result = read_storage_for_out_buffer(&*backing, offset, out_buffer_size);
         drop(backing);
 
         let rc = match result {
-            Ok(()) => {
+            Ok(data) => {
                 ctx.write_buffer(&data, 0);
                 RESULT_SUCCESS
             }
@@ -130,6 +130,27 @@ impl ServiceFramework for IStorageAccessor {
 
     fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
         &self.handlers_tipc
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::read_storage_for_out_buffer;
+    use crate::hle::service::am::am_results;
+    use crate::hle::service::am::library_applet_storage::BufferLibraryAppletStorage;
+
+    #[test]
+    fn storage_accessor_read_uses_exact_output_buffer_size() {
+        let backing = BufferLibraryAppletStorage::new(vec![1, 2, 3, 4, 5, 6, 7, 8]);
+        let data = read_storage_for_out_buffer(&backing, 2, 3).unwrap();
+        assert_eq!(data, vec![3, 4, 5]);
+    }
+
+    #[test]
+    fn storage_accessor_read_fails_when_output_buffer_exceeds_backing() {
+        let backing = BufferLibraryAppletStorage::new(vec![1, 2, 3, 4]);
+        let result = read_storage_for_out_buffer(&backing, 2, 3);
+        assert_eq!(result.unwrap_err(), am_results::RESULT_INVALID_OFFSET);
     }
 }
 

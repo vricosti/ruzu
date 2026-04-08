@@ -806,17 +806,12 @@ impl<'a> PatchManager<'a> {
 
         // Determine icon language priority from settings.
         use crate::hle::service::ns::language::{
-            convert_to_application_language, get_application_language_priority_list,
-            ApplicationLanguage, LanguageCode as NsLanguageCode,
+            convert_to_application_language, get_application_language_priority_list, ApplicationLanguage,
         };
 
         let language_index = *common::settings::values().language_index.get_value() as u32 as usize;
-        let set_language_code =
+        let language_code =
             crate::hle::service::set::settings_server::get_language_code_from_index(language_index);
-        // Both settings_types::LanguageCode and ns::language::LanguageCode are #[repr(u64)]
-        // with identical discriminant values — convert via the raw u64.
-        let language_code: NsLanguageCode =
-            unsafe { std::mem::transmute(set_language_code as u64) };
         let application_language = convert_to_application_language(language_code)
             .unwrap_or(ApplicationLanguage::AmericanEnglish);
 

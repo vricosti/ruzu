@@ -12,6 +12,7 @@ use std::sync::Arc;
 use super::friend::Module;
 use crate::hle::result::ResultCode;
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
+use crate::hle::service::ipc_helpers::{RequestParser, ResponseBuilder};
 use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
 
 /// IPC command IDs for Friend interface
@@ -35,10 +36,14 @@ pub struct Friend {
 impl Friend {
     pub fn new(system: crate::core::SystemRef, module: Arc<Module>, name: &str) -> Self {
         let handlers = build_handler_map(&[
-            (commands::CREATE_FRIEND_SERVICE, None, "CreateFriendService"),
+            (
+                commands::CREATE_FRIEND_SERVICE,
+                Some(Self::create_friend_service_handler),
+                "CreateFriendService",
+            ),
             (
                 commands::CREATE_NOTIFICATION_SERVICE,
-                None,
+                Some(Self::create_notification_service_handler),
                 "CreateNotificationService",
             ),
             (
@@ -71,6 +76,38 @@ impl Friend {
             uuid
         );
         super::friend::INotificationService::new(uuid)
+    }
+
+    fn push_interface_response(
+        ctx: &mut HLERequestContext,
+        object: Arc<dyn SessionRequestHandler>,
+    ) {
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 1);
+        rb.push_result(crate::hle::result::RESULT_SUCCESS);
+        rb.push_ipc_interface(object);
+    }
+
+    fn cast(this: &dyn ServiceFramework) -> &Self {
+        unsafe { &*(this as *const dyn ServiceFramework as *const Self) }
+    }
+
+    fn create_friend_service_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let this = Self::cast(this);
+        log::debug!("Friend({})::CreateFriendService called", this.name);
+        let service: Arc<dyn SessionRequestHandler> = Arc::new(this.create_friend_service());
+        Self::push_interface_response(ctx, service);
+    }
+
+    fn create_notification_service_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        let this = Self::cast(this);
+        let mut rp = RequestParser::new(ctx);
+        let uuid = rp.pop_u64() as u128 | ((rp.pop_u64() as u128) << 64);
+        let service: Arc<dyn SessionRequestHandler> =
+            Arc::new(this.create_notification_service(uuid));
+        Self::push_interface_response(ctx, service);
     }
 }
 

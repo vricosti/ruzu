@@ -32,6 +32,7 @@ impl SystemManager {
             return;
         }
 
+        log::info!("AudioRenderSystemManager::initialize_unsafe start");
         self.audio_renderer.lock().start();
         let systems = Arc::clone(&self.systems);
         let active = Arc::clone(&self.active);
@@ -40,9 +41,14 @@ impl SystemManager {
             thread::Builder::new()
                 .name("AudioRenderSystemManager".to_string())
                 .spawn(move || {
+                    log::info!("AudioRenderSystemManager thread started");
                     while active.load(Ordering::SeqCst) {
                         {
                             let systems = systems.lock();
+                            log::info!(
+                                "AudioRenderSystemManager loop systems={}",
+                                systems.len()
+                            );
                             for system in systems.iter() {
                                 system.lock().send_command_to_dsp();
                             }
@@ -64,6 +70,7 @@ impl SystemManager {
         if !self.active.swap(false, Ordering::SeqCst) {
             return;
         }
+        log::info!("AudioRenderSystemManager::stop");
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
@@ -84,6 +91,7 @@ impl SystemManager {
         }
 
         systems.push(system);
+        log::info!("AudioRenderSystemManager::add systems={}", systems.len());
         true
     }
 

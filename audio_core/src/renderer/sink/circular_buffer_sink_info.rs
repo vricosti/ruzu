@@ -30,7 +30,7 @@ impl CircularBufferSinkInfo {
         in_params: &SinkInParameter,
         pool_mapper: &PoolMapper<'_>,
     ) {
-        let buffer_params = in_params.circular_buffer;
+        let buffer_params = in_params.circular_buffer();
 
         if self.base.in_use == buffer_params.in_use && !self.base.buffer_unmapped {
             error_info.error_code = ResultCode::SUCCESS;

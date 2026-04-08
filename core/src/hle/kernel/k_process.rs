@@ -32,7 +32,7 @@ use super::k_thread_local_page::{KThreadLocalPage, PAGE_SIZE as THREAD_LOCAL_PAG
 use super::k_typed_address::KProcessAddress;
 use super::k_worker_task_manager::{KWorkerTaskManager, WorkerType};
 use super::svc_common::Handle;
-use super::svc_types::{CreateProcessFlag, ADDRESS_SPACE_MASK};
+use super::svc_types::{CreateProcessFlag, ProcessActivity, ADDRESS_SPACE_MASK};
 use crate::file_sys::program_metadata::{PoolPartition, ProgramAddressSpaceType, ProgramMetadata};
 use crate::hardware_properties::NUM_CPU_CORES;
 use crate::hle::kernel::svc::svc_results;
@@ -429,6 +429,7 @@ pub struct KProcess {
     pub event_objects: BTreeMap<u64, Arc<Mutex<KEvent>>>,
     pub readable_event_objects: BTreeMap<u64, Arc<Mutex<KReadableEvent>>>,
     pub shared_memory_objects: BTreeMap<u64, Arc<super::k_shared_memory::KSharedMemory>>,
+    pub transfer_memory_objects: BTreeMap<u64, Arc<Mutex<super::k_transfer_memory::KTransferMemory>>>,
     pub sync_object: SynchronizationObjectState,
     pub self_reference: Option<Weak<Mutex<KProcess>>>,
     pub scheduler: Option<Weak<Mutex<KScheduler>>>,
@@ -448,6 +449,10 @@ pub struct KProcess {
     /// callbacks hold a reference to it via `process->GetMemory()`.
     /// Here we use `Arc<RwLock<ProcessMemoryData>>` for shared access.
     pub process_memory: SharedProcessMemory,
+    /// Per-process Memory bridge — matches upstream `Core::Memory::Memory m_memory`.
+    /// Each process owns its own Memory instance with its own `current_page_table`,
+    /// sharing the backing `DeviceMemory` with all other processes via `System`.
+    pub memory: Option<Arc<Mutex<crate::memory::memory::Memory>>>,
     pub debug_page_refcounts: BTreeMap<u64, u64>,
     pub cpu_time: AtomicI64,
     pub num_process_switches: AtomicI64,
@@ -557,6 +562,7 @@ impl KProcess {
             event_objects: BTreeMap::new(),
             readable_event_objects: BTreeMap::new(),
             shared_memory_objects: BTreeMap::new(),
+            transfer_memory_objects: BTreeMap::new(),
             sync_object: SynchronizationObjectState::new(),
             self_reference: None,
             scheduler: None,
@@ -569,6 +575,7 @@ impl KProcess {
             pinned_threads: [None; NUM_CPU_CORES as usize],
             watchpoints: [DebugWatchpoint::default(); NUM_WATCHPOINTS],
             process_memory: process_memory.clone(),
+            memory: None,
             debug_page_refcounts: BTreeMap::new(),
             cpu_time: AtomicI64::new(0),
             num_process_switches: AtomicI64::new(0),
@@ -580,6 +587,37 @@ impl KProcess {
             num_ipc_receives: AtomicI64::new(0),
             address_arbiter: super::k_address_arbiter::KAddressArbiter::with_memory(process_memory),
         }
+    }
+
+    /// Create a per-process Memory instance using System's DeviceMemory.
+    /// Matches upstream `KProcess::KProcess()` which constructs `m_memory{kernel.System()}`.
+    /// Each process gets its own Memory with its own `current_page_table`.
+    pub fn create_memory(
+        &mut self,
+        system: &crate::core::System,
+    ) {
+        if self.memory.is_some() {
+            return; // already created
+        }
+        let (dm_ptr, buffer_ptr) = system.device_memory_ptrs();
+        let mut memory = unsafe {
+            crate::memory::memory::Memory::new(
+                crate::core::SystemRef::from_ref(system),
+                dm_ptr,
+                buffer_ptr,
+            )
+        };
+        memory.set_gpu_dirty_managers(system.gpu_dirty_memory_managers());
+        let memory_arc = Arc::new(Mutex::new(memory));
+        // Wire into page table so page-table-level operations can use it
+        self.page_table.get_base_mut().m_memory = Some(memory_arc.clone());
+        self.memory = Some(memory_arc);
+    }
+
+    /// Get the per-process Memory bridge.
+    /// Matches upstream `KProcess::GetMemory()`.
+    pub fn get_memory(&self) -> Option<Arc<Mutex<crate::memory::memory::Memory>>> {
+        self.memory.clone()
     }
 
     // -- Getters matching upstream --
@@ -642,12 +680,14 @@ impl KProcess {
     ///
     /// Upstream: `KProcess::InitializeInterfaces()` (k_process.cpp:1263-1291).
     /// Creates the exclusive monitor and one ARM JIT per core.
+    /// Uses the per-process Memory created by `create_memory()`.
     pub fn initialize_interfaces(
         &mut self,
-        memory: std::sync::Arc<std::sync::Mutex<crate::memory::memory::Memory>>,
         shared_memory: crate::hle::kernel::k_process::SharedProcessMemory,
         core_timing: std::sync::Arc<std::sync::Mutex<crate::core_timing::CoreTiming>>,
     ) {
+        let memory = self.memory.clone()
+            .expect("create_memory() must be called before initialize_interfaces()");
         use crate::arm::dynarmic::dynarmic_exclusive_monitor::DynarmicExclusiveMonitor;
         use crate::hardware_properties;
 
@@ -704,7 +744,7 @@ impl KProcess {
             self.arm_interfaces[i] = Some(jit);
         }
 
-        log::info!(
+        log::trace!(
             "KProcess: initialized {} ARM {} interfaces with exclusive monitor",
             hardware_properties::NUM_CPU_CORES,
             if self.is_64bit() {
@@ -887,6 +927,63 @@ impl KProcess {
         self.is_suspended = suspended;
     }
 
+    fn lock_scheduler_for_process(
+        &self,
+    ) -> Option<super::k_scheduler_lock::KScopedSchedulerLock<'static>> {
+        let scheduler_lock = {
+            let gsc = self.global_scheduler_context.as_ref()?.lock().unwrap();
+            std::ptr::addr_of!(*gsc.scheduler_lock())
+                as *const super::k_scheduler_lock::KAbstractSchedulerLock
+        };
+
+        if scheduler_lock.is_null() {
+            return None;
+        }
+
+        Some(super::k_scheduler_lock::KScopedSchedulerLock::new(unsafe {
+            &*scheduler_lock
+        }))
+    }
+
+    /// Matches upstream `KProcess::SetActivity()`.
+    pub fn set_activity(&mut self, activity: ProcessActivity) -> u32 {
+        let _scheduler_guard = self.lock_scheduler_for_process();
+
+        if self.state == ProcessState::Terminating || self.state == ProcessState::Terminated {
+            return RESULT_INVALID_STATE.get_inner_value();
+        }
+
+        let threads: Vec<Arc<Mutex<KThread>>> = self
+            .thread_list
+            .iter()
+            .filter_map(|id| self.thread_objects.get(id).cloned())
+            .collect();
+
+        if activity == ProcessActivity::Paused {
+            if self.is_suspended {
+                return RESULT_INVALID_STATE.get_inner_value();
+            }
+
+            for thread in threads {
+                thread.lock().unwrap().request_suspend(super::k_thread::SuspendType::Process);
+            }
+
+            self.set_suspended(true);
+        } else {
+            if !self.is_suspended {
+                return RESULT_INVALID_STATE.get_inner_value();
+            }
+
+            for thread in threads {
+                thread.lock().unwrap().resume(super::k_thread::SuspendType::Process);
+            }
+
+            self.set_suspended(false);
+        }
+
+        RESULT_SUCCESS.get_inner_value()
+    }
+
     pub fn is_terminated(&self) -> bool {
         self.state == ProcessState::Terminated
     }
@@ -1004,32 +1101,43 @@ impl KProcess {
         tag: u32,
         timeout: i64,
     ) -> u32 {
+        log::trace!(
+            "KProcess::wait_condition_variable enter tid={} address=0x{:X} cv_key=0x{:X} tag=0x{:08X} timeout={}",
+            current_thread.lock().unwrap().get_thread_id(),
+            address,
+            cv_key,
+            tag,
+            timeout
+        );
         let result = {
             let mut process_guard = process.lock().unwrap();
             let cond_var_ptr: *mut KConditionVariable = &mut process_guard.cond_var;
-
-            // Keep the condition variable owned by KProcess while waiting.
-            // Upstream always waits/signals against the process-owned condvar tree.
-            unsafe {
-                (*cond_var_ptr).wait(
-                    process,
-                    current_thread,
-                    address,
-                    cv_key,
-                    tag,
-                    timeout,
-                )
-            }
+            drop(process_guard);
+            unsafe { (*cond_var_ptr).wait(process, current_thread, address, cv_key, tag, timeout) }
         };
+
+        log::trace!(
+            "KProcess::wait_condition_variable return tid={} result={:#x}",
+            current_thread.lock().unwrap().get_thread_id(),
+            result.get_inner_value()
+        );
 
         result.get_inner_value()
     }
 
     pub fn signal_condition_variable(&mut self, cv_key: u64, count: i32) {
+        log::trace!(
+            "KProcess::signal_condition_variable enter cv_key=0x{:X} count={}",
+            cv_key,
+            count
+        );
         let cond_var_ptr: *mut KConditionVariable = &mut self.cond_var;
-        unsafe {
-            let _ = (*cond_var_ptr).signal(self, cv_key, count);
-        }
+        unsafe { (*cond_var_ptr).signal(self, cv_key, count); }
+        log::trace!(
+            "KProcess::signal_condition_variable return cv_key=0x{:X} count={}",
+            cv_key,
+            count
+        );
     }
 
     /// Port of upstream `KProcess::SignalAddressArbiter`.
@@ -2104,6 +2212,13 @@ impl KProcess {
         if handle_result != RESULT_SUCCESS.get_inner_value() {
             return Err(handle_result);
         }
+        log::trace!(
+            "KProcess::run enter pid={} main_thread_id={} prio={} stack_size=0x{:x}",
+            self.process_id,
+            main_thread_id,
+            priority,
+            stack_size
+        );
 
         let mut thread_reservation = KScopedResourceReservation::new(
             self.resource_limit.clone(),
@@ -2133,6 +2248,11 @@ impl KProcess {
         let tls_address = self
             .create_thread_local_region()
             .ok_or_else(|| RESULT_INVALID_STATE.get_inner_value())?;
+        log::trace!(
+            "KProcess::run tls allocated pid={} tls={:#x}",
+            self.process_id,
+            tls_address.get()
+        );
 
         // Allocate stack using find-free MapPages, matching upstream exactly.
         // Upstream KProcess::Run (k_process.cpp:938-940):
@@ -2169,6 +2289,12 @@ impl KProcess {
             log::error!("run: stack MapPages find-free failed ({:#x})", map_result);
             return Err(map_result);
         }
+        log::trace!(
+            "KProcess::run stack mapped pid={} stack=[{:#x}..{:#x})",
+            self.process_id,
+            stack_base,
+            stack_top
+        );
 
         // Zero the stack in DeviceMemory (if Memory is wired).
         if let Some(memory) = self.page_table.get_base().m_memory.as_ref() {
@@ -2207,9 +2333,20 @@ impl KProcess {
             }
             thread.thread_type = super::k_thread::ThreadType::Main;
         }
+        log::trace!(
+            "KProcess::run main thread initialized pid={} tid={} obj={}",
+            self.process_id,
+            main_thread_id,
+            main_object_id
+        );
 
         let thread_handle = {
             self.register_thread_object(main_thread.clone());
+            log::trace!(
+                "KProcess::run main thread registered pid={} tid={}",
+                self.process_id,
+                main_thread_id
+            );
 
             let thread_handle = self.handle_table.add(main_object_id)?;
             {
@@ -2227,7 +2364,7 @@ impl KProcess {
             // Don't re-initialize the scheduler — it was already initialized
             // with the kernel main thread in initialize_physical_cores.
             // Just mark the user thread as needing scheduling.
-            // (highest_priority_thread_id is set below after thread.run())
+            // (highest_priority_thread_id is set below after KThread::run_thread())
 
             thread_handle
         };
@@ -2243,22 +2380,24 @@ impl KProcess {
             if let Some(gsc) = &self.global_scheduler_context {
                 gsc.lock().unwrap().add_thread(main_thread.clone());
             }
+            log::trace!(
+                "KProcess::run about to run main thread pid={} tid={}",
+                self.process_id,
+                main_thread_id
+            );
 
-            let mut thread = main_thread.lock().unwrap();
-            let run_result = thread.run();
+            let run_result = KThread::run_thread(&main_thread);
             if run_result != RESULT_SUCCESS.get_inner_value() {
                 return Err(run_result);
             }
-            drop(thread);
+            log::trace!(
+                "KProcess::run main thread runnable pid={} tid={}",
+                self.process_id,
+                main_thread_id
+            );
 
-            // Increment running thread count (thread.run() no longer does this
-            // to avoid deadlock when called with process lock held).
-            self.increment_running_thread_count();
-
-            // thread.run() → set_state(RUNNABLE) → notify_state_transition now
-            // pushes to PQ via the GSC reference and notifies the scheduler
-            // automatically, matching upstream's KThread::Run() + KScopedSchedulerLock
-            // destructor path.
+            // KThread::run_thread() → set_state(RUNNABLE) → notify_state_transition now
+            // pushes to PQ via the GSC reference and notifies the scheduler.
         }
 
         thread_reservation.commit();
@@ -2336,6 +2475,7 @@ impl KProcess {
         self.event_objects.clear();
         self.readable_event_objects.clear();
         self.shared_memory_objects.clear();
+        self.transfer_memory_objects.clear();
 
         // Perform inherited finalization.
         // Upstream: KSynchronizationObject::Finalize();
@@ -2455,6 +2595,25 @@ impl KProcess {
         object_id: u64,
     ) -> Option<Arc<super::k_shared_memory::KSharedMemory>> {
         self.shared_memory_objects.get(&object_id).cloned()
+    }
+
+    pub fn register_transfer_memory_object(
+        &mut self,
+        object_id: u64,
+        transfer_memory: Arc<Mutex<super::k_transfer_memory::KTransferMemory>>,
+    ) {
+        self.transfer_memory_objects.insert(object_id, transfer_memory);
+    }
+
+    pub fn unregister_transfer_memory_object_by_object_id(&mut self, object_id: u64) {
+        self.transfer_memory_objects.remove(&object_id);
+    }
+
+    pub fn get_transfer_memory_by_object_id(
+        &self,
+        object_id: u64,
+    ) -> Option<Arc<Mutex<super::k_transfer_memory::KTransferMemory>>> {
+        self.transfer_memory_objects.get(&object_id).cloned()
     }
 
     /// Unregister a thread from this process.
@@ -2913,6 +3072,54 @@ mod tests {
             .and_then(Weak::upgrade)
             .is_some());
         assert!(guard.process_schedule_count.is_some());
+    }
+
+    #[test]
+    fn set_activity_pauses_and_resumes_registered_threads() {
+        let scheduler = Arc::new(Mutex::new(KScheduler::new(0)));
+        let gsc = Arc::new(Mutex::new(GlobalSchedulerContext::new()));
+        scheduler.lock().unwrap().global_scheduler_context = Some(gsc.clone());
+
+        let process = Arc::new(Mutex::new(KProcess::new()));
+        {
+            let mut process_guard = process.lock().unwrap();
+            process_guard.attach_scheduler(&scheduler);
+            process_guard.state = ProcessState::Running;
+        }
+
+        let thread = Arc::new(Mutex::new(KThread::new()));
+        {
+            let mut guard = thread.lock().unwrap();
+            guard.thread_id = 9;
+            guard.object_id = 99;
+            guard.parent = Some(Arc::downgrade(&process));
+            guard.set_state(super::super::k_thread::ThreadState::RUNNABLE);
+        }
+
+        process
+            .lock()
+            .unwrap()
+            .register_thread_object(thread.clone());
+
+        assert_eq!(
+            process.lock().unwrap().set_activity(ProcessActivity::Paused),
+            RESULT_SUCCESS.get_inner_value()
+        );
+        assert!(process.lock().unwrap().is_suspended());
+        assert!(thread
+            .lock()
+            .unwrap()
+            .is_suspend_requested_type(super::super::k_thread::SuspendType::Process));
+
+        assert_eq!(
+            process.lock().unwrap().set_activity(ProcessActivity::Runnable),
+            RESULT_SUCCESS.get_inner_value()
+        );
+        assert!(!process.lock().unwrap().is_suspended());
+        assert!(!thread
+            .lock()
+            .unwrap()
+            .is_suspend_requested_type(super::super::k_thread::SuspendType::Process));
     }
 
     #[test]

@@ -8,6 +8,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::hle::kernel::k_process::KProcess;
 use crate::hle::kernel::k_scheduler::KScheduler;
+use crate::hle::kernel::k_scheduler_lock::KScopedSchedulerLock;
 use crate::hle::kernel::k_synchronization_object::SynchronizationObjectState;
 use crate::hle::kernel::svc::svc_results::RESULT_INVALID_STATE;
 use crate::hle::result::RESULT_SUCCESS;
@@ -22,6 +23,21 @@ pub struct KReadableEvent {
 }
 
 impl KReadableEvent {
+    fn lock_scheduler() -> Option<KScopedSchedulerLock<'static>> {
+        let kernel = crate::hle::kernel::kernel::get_kernel_ref()?;
+        let scheduler_lock = {
+            let gsc = kernel.global_scheduler_context()?.lock().unwrap();
+            std::ptr::addr_of!(*gsc.scheduler_lock())
+                as *const crate::hle::kernel::k_scheduler_lock::KAbstractSchedulerLock
+        };
+
+        if scheduler_lock.is_null() {
+            return None;
+        }
+
+        Some(KScopedSchedulerLock::new(unsafe { &*scheduler_lock }))
+    }
+
     pub fn new() -> Self {
         Self {
             object_id: 0,
@@ -45,11 +61,24 @@ impl KReadableEvent {
 
     /// Signal the readable event.
     /// Matches upstream `KReadableEvent::Signal`.
+    ///
+    /// Re-notifies on every call (not just false→true transitions) because
+    /// in the cooperative scheduler, signals from host threads can fire
+    /// before waiters are linked.
     pub fn signal(&mut self, process: &mut KProcess, scheduler: &Arc<Mutex<KScheduler>>) -> u32 {
-        if !self.is_signaled {
-            self.is_signaled = true;
-            self.notify_available(process, scheduler);
-        }
+        let _scheduler_guard = Self::lock_scheduler();
+        self.is_signaled = true;
+        self.notify_available(process, scheduler);
+        RESULT_SUCCESS.get_inner_value()
+    }
+
+    /// Signal without acquiring the scheduler lock. Used by host threads
+    /// (audio ADSP, vsync conductor) where the scheduler spinlock causes
+    /// livelock because guest-fiber OS threads hold it continuously during
+    /// their wait/reschedule loops.
+    pub fn signal_from_host(&mut self, process: &mut KProcess, scheduler: &Arc<Mutex<KScheduler>>) -> u32 {
+        self.is_signaled = true;
+        self.notify_available(process, scheduler);
         RESULT_SUCCESS.get_inner_value()
     }
 
@@ -63,6 +92,7 @@ impl KReadableEvent {
     /// Reset the event (clear and return invalid state if not signaled).
     /// Matches upstream `KReadableEvent::Reset`.
     pub fn reset(&mut self) -> u32 {
+        let _scheduler_guard = Self::lock_scheduler();
         if !self.is_signaled {
             return RESULT_INVALID_STATE.get_inner_value();
         }
@@ -126,7 +156,28 @@ impl KReadableEvent {
     }
 
     /// Destroy the readable event.
-    pub fn destroy(&mut self) {}
+    pub fn destroy(&mut self) {
+        let _scheduler_guard = Self::lock_scheduler();
+
+        let Some(parent_id) = self.parent_id else {
+            return;
+        };
+
+        let Some(kernel) = crate::hle::kernel::kernel::get_kernel_ref() else {
+            return;
+        };
+        let Some(owner_process_id) = kernel.get_event_owner_process_id(parent_id) else {
+            return;
+        };
+        let Some(process_arc) = kernel.get_process_by_id(owner_process_id) else {
+            return;
+        };
+        let mut process = process_arc.lock().unwrap();
+        let Some(parent) = process.get_event_by_object_id(parent_id) else {
+            return;
+        };
+        parent.lock().unwrap().on_readable_event_destroyed();
+    }
 }
 
 impl Default for KReadableEvent {

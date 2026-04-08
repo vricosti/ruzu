@@ -3,7 +3,7 @@
 
 //! Port of zuyu/src/core/hle/service/nvnflinger/display.h
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use super::buffer_item_consumer::BufferItemConsumer;
 use super::hwc_layer::LayerBlending;
@@ -35,7 +35,7 @@ impl Drop for Layer {
 
 /// A stack of layers, searchable by consumer_id.
 pub struct LayerStack {
-    pub layers: Vec<Arc<Layer>>,
+    pub layers: Vec<Arc<Mutex<Layer>>>,
 }
 
 impl LayerStack {
@@ -43,9 +43,9 @@ impl LayerStack {
         Self { layers: Vec::new() }
     }
 
-    pub fn find_layer(&self, consumer_id: i32) -> Option<Arc<Layer>> {
+    pub fn find_layer(&self, consumer_id: i32) -> Option<Arc<Mutex<Layer>>> {
         for layer in &self.layers {
-            if layer.consumer_id == consumer_id {
+            if layer.lock().unwrap().consumer_id == consumer_id {
                 return Some(Arc::clone(layer));
             }
         }
@@ -75,5 +75,31 @@ impl Display {
             id,
             stack: LayerStack::new(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::hle::service::nvnflinger::buffer_queue_consumer::BufferQueueConsumer;
+    use crate::hle::service::nvnflinger::buffer_queue_core::BufferQueueCore;
+
+    #[test]
+    fn layer_stack_returns_mutable_shared_layer() {
+        let consumer = Arc::new(BufferQueueConsumer::new(BufferQueueCore::new()));
+        let layer = Arc::new(Mutex::new(Layer::new(
+            Arc::new(BufferItemConsumer::new(consumer)),
+            7,
+        )));
+        let mut stack = LayerStack::new();
+        stack.layers.push(Arc::clone(&layer));
+
+        let found = stack.find_layer(7).unwrap();
+        found.lock().unwrap().visible = false;
+        found.lock().unwrap().blending = LayerBlending::Coverage;
+
+        let guard = layer.lock().unwrap();
+        assert!(!guard.visible);
+        assert_eq!(guard.blending, LayerBlending::Coverage);
     }
 }

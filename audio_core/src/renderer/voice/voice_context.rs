@@ -38,6 +38,13 @@ impl VoiceContext {
         self.dsp_states.get_mut(index as usize)
     }
 
+    pub fn get_dsp_shared_state_direct(&mut self, index: u32) -> &mut VoiceState {
+        if index as usize >= self.dsp_states.len() {
+            error!("audio_core: invalid voice dsp state index {:04X}", index);
+        }
+        &mut self.dsp_states[index as usize]
+    }
+
     pub fn get_dsp_shared_state_ref(&self, index: u32) -> Option<&VoiceState> {
         if index as usize >= self.dsp_states.len() {
             error!("audio_core: invalid voice dsp state index {:04X}", index);
@@ -59,6 +66,16 @@ impl VoiceContext {
             return None;
         }
         self.channel_resources.get_mut(index as usize)
+    }
+
+    pub fn get_channel_resource_direct(&mut self, index: u32) -> &mut VoiceChannelResource {
+        if index as usize >= self.channel_resources.len() {
+            error!(
+                "audio_core: invalid voice channel resource index {:04X}",
+                index
+            );
+        }
+        &mut self.channel_resources[index as usize]
     }
 
     pub fn get_channel_resource_ref(&self, index: u32) -> Option<&VoiceChannelResource> {
@@ -96,12 +113,26 @@ impl VoiceContext {
         self.voices.get(index as usize)
     }
 
+    pub fn get_info_direct(&self, index: u32) -> &VoiceInfo {
+        if index as usize >= self.voices.len() {
+            error!("audio_core: invalid voice info index {:04X}", index);
+        }
+        &self.voices[index as usize]
+    }
+
     pub fn get_info_mut(&mut self, index: u32) -> Option<&mut VoiceInfo> {
         if index as usize >= self.voices.len() {
             error!("audio_core: invalid voice info index {:04X}", index);
             return None;
         }
         self.voices.get_mut(index as usize)
+    }
+
+    pub fn get_info_mut_direct(&mut self, index: u32) -> &mut VoiceInfo {
+        if index as usize >= self.voices.len() {
+            error!("audio_core: invalid voice info index {:04X}", index);
+        }
+        &mut self.voices[index as usize]
     }
 
     pub fn get_state(&self, index: u32) -> Option<&VoiceState> {
@@ -112,12 +143,26 @@ impl VoiceContext {
         self.cpu_states.get(index as usize)
     }
 
+    pub fn get_state_direct(&self, index: u32) -> &VoiceState {
+        if index as usize >= self.cpu_states.len() {
+            error!("audio_core: invalid voice cpu state index {:04X}", index);
+        }
+        &self.cpu_states[index as usize]
+    }
+
     pub fn get_state_mut(&mut self, index: u32) -> Option<&mut VoiceState> {
         if index as usize >= self.cpu_states.len() {
             error!("audio_core: invalid voice cpu state index {:04X}", index);
             return None;
         }
         self.cpu_states.get_mut(index as usize)
+    }
+
+    pub fn get_state_mut_direct(&mut self, index: u32) -> &mut VoiceState {
+        if index as usize >= self.cpu_states.len() {
+            error!("audio_core: invalid voice cpu state index {:04X}", index);
+        }
+        &mut self.cpu_states[index as usize]
     }
 
     pub fn sorted_voice_indices(&self) -> &[usize] {

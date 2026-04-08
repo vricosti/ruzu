@@ -6,6 +6,7 @@ use common::fixed_point::FixedPoint;
 use common::ResultCode;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
 pub enum SinkType {
     Invalid,
     DeviceSink,
@@ -19,6 +20,7 @@ impl Default for SinkType {
 }
 
 #[derive(Debug, Clone, Copy)]
+#[repr(C)]
 pub struct DeviceInParameter {
     pub name: [u8; 0x100],
     pub input_count: u32,
@@ -42,6 +44,7 @@ impl Default for DeviceInParameter {
 }
 
 #[derive(Debug, Clone, Copy)]
+#[repr(C)]
 pub struct DeviceState {
     pub upsampler_info: Option<usize>,
     pub downmix_coeff: [FixedPoint<16, 16>; 4],
@@ -59,6 +62,7 @@ impl Default for DeviceState {
 }
 
 #[derive(Debug, Clone, Copy)]
+#[repr(C)]
 pub struct CircularBufferInParameter {
     pub cpu_address: u64,
     pub size: u32,
@@ -88,6 +92,7 @@ impl Default for CircularBufferInParameter {
 }
 
 #[derive(Debug, Clone, Copy, Default)]
+#[repr(C)]
 pub struct CircularBufferState {
     pub last_pos2: u32,
     pub current_pos: i32,
@@ -96,20 +101,61 @@ pub struct CircularBufferState {
     pub address_info: AddressInfo,
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Clone, Copy)]
+#[repr(C)]
+pub union SinkSpecificInParameter {
+    pub device: DeviceInParameter,
+    pub circular_buffer: CircularBufferInParameter,
+}
+
+impl Default for SinkSpecificInParameter {
+    fn default() -> Self {
+        Self {
+            device: DeviceInParameter::default(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+#[repr(C)]
 pub struct SinkInParameter {
     pub sink_type: SinkType,
     pub in_use: bool,
     pub node_id: u32,
     pub unk08: [u8; 0x18],
-    pub device: DeviceInParameter,
-    pub circular_buffer: CircularBufferInParameter,
+    pub specific: SinkSpecificInParameter,
+}
+
+impl SinkInParameter {
+    pub fn device(self) -> DeviceInParameter {
+        unsafe { self.specific.device }
+    }
+
+    pub fn circular_buffer(self) -> CircularBufferInParameter {
+        unsafe { self.specific.circular_buffer }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default)]
+#[repr(C)]
 pub struct SinkOutStatus {
     pub write_offset: u32,
     pub unk04: [u8; 0x1C],
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::mem::size_of;
+
+    #[test]
+    fn sink_ipc_binary_layout_matches_upstream() {
+        assert_eq!(size_of::<SinkType>(), 0x1);
+        assert_eq!(size_of::<DeviceInParameter>(), 0x11C);
+        assert_eq!(size_of::<CircularBufferInParameter>(), 0x28);
+        assert_eq!(size_of::<SinkInParameter>(), 0x140);
+        assert_eq!(size_of::<SinkOutStatus>(), 0x20);
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -166,7 +212,7 @@ impl SinkInfoBase {
                 error_info.address = CpuAddr::default();
             }
             SinkType::DeviceSink => {
-                let device_params = in_params.device;
+                let device_params = in_params.device();
                 if self.in_use == in_params.in_use {
                     self.device_parameter.downmix_enabled = device_params.downmix_enabled;
                     self.device_parameter.downmix_coeff = device_params.downmix_coeff;
@@ -190,7 +236,7 @@ impl SinkInfoBase {
                 error_info.address = CpuAddr::default();
             }
             SinkType::CircularBufferSink => {
-                let buffer_params = in_params.circular_buffer;
+                let buffer_params = in_params.circular_buffer();
                 if self.in_use == buffer_params.in_use && !self.buffer_unmapped {
                     error_info.error_code = ResultCode::SUCCESS;
                     error_info.address = CpuAddr::default();

@@ -7,6 +7,7 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
+use crate::core::SystemRef;
 use crate::hle::kernel::k_process::KProcess;
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 use crate::hle::service::am::applet::Applet;
@@ -26,6 +27,8 @@ use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFrame
 /// - 20: GetApplicationFunctions
 /// - 1000: GetDebugFunctions
 pub struct IApplicationProxy {
+    /// Matches upstream `Core::System& system`.
+    system: SystemRef,
     /// Reference to the applet.
     /// Matches upstream `const std::shared_ptr<Applet> m_applet`.
     applet: Arc<Mutex<Applet>>,
@@ -42,6 +45,7 @@ impl IApplicationProxy {
     /// Create with an applet and window system reference.
     /// Matches upstream: `IApplicationProxy(Core::System&, std::shared_ptr<Applet>, Kernel::KProcess*, WindowSystem&)`
     pub fn new(
+        system: SystemRef,
         applet: Arc<Mutex<Applet>>,
         process: Option<Arc<Mutex<KProcess>>>,
         window_system: Arc<Mutex<WindowSystem>>,
@@ -94,6 +98,7 @@ impl IApplicationProxy {
             ),
         ]);
         Self {
+            system,
             applet,
             window_system,
             process,
@@ -145,6 +150,7 @@ impl IApplicationProxy {
         Self::push_interface_response(
             ctx,
             Arc::new(super::self_controller::ISelfController::new(
+                proxy.system,
                 proxy.applet.clone(),
                 proxy.process.clone(),
             )),
@@ -157,6 +163,7 @@ impl IApplicationProxy {
             ctx,
             Arc::new(super::window_controller::IWindowController::new(
                 proxy.applet.clone(),
+                proxy.window_system.clone(),
             )),
         );
     }
@@ -201,6 +208,7 @@ impl IApplicationProxy {
         Self::push_interface_response(
             ctx,
             Arc::new(super::library_applet_creator::ILibraryAppletCreator::new(
+                proxy.system,
                 proxy.applet.clone(),
                 proxy.window_system.clone(),
             )),
@@ -212,6 +220,7 @@ impl IApplicationProxy {
         Self::push_interface_response(
             ctx,
             Arc::new(super::application_functions::IApplicationFunctions::new(
+                proxy.system,
                 proxy.applet.clone(),
             )),
         );

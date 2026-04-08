@@ -192,6 +192,16 @@ impl KPageTableBase {
     pub fn is_kernel(&self) -> bool {
         self.m_is_kernel
     }
+
+    fn clear_fresh_backing_region(&self, address: usize, size: usize) {
+        if size == 0 {
+            return;
+        }
+        if let Some(memory) = &self.m_memory {
+            memory.lock().unwrap().zero_block(address as u64, size);
+        }
+    }
+
     /// Finalize the page table, releasing all resources.
     /// Port of upstream `KPageTableBase::Finalize`.
     ///
@@ -1032,9 +1042,8 @@ impl KPageTableBase {
                         Self::convert_to_memory_permission(properties.perm),
                         false,
                     );
-                }
 
-                // Upstream: if phys_addr is heap, call MemoryManager.Open(phys_addr, num_pages)
+                }
 
                 0
             }
@@ -1335,12 +1344,7 @@ impl KPageTableBase {
         // Upstream: the kernel allocates zeroed physical pages from KPageHeap.
         // In our emulator, DeviceMemory is pre-allocated and may contain stale data,
         // so we must explicitly zero the heap region after mapping.
-        if let Some(memory) = &self.m_memory {
-            memory
-                .lock()
-                .unwrap()
-                .zero_block(cur_address as u64, allocation_size);
-        }
+        self.clear_fresh_backing_region(cur_address, allocation_size);
 
         memory_reservation.commit();
 
@@ -1576,6 +1580,14 @@ impl KPageTableBase {
 
         let src_state = out_src_state.unwrap_or(KMemoryState::NORMAL);
 
+        // Build the source page group first, matching upstream
+        // `MakePageGroup(pg, src_address, num_pages)` before any permission change.
+        let mut pg = super::k_page_group::KPageGroup::new();
+        let make_pg_result = self.make_page_group(&mut pg, src, num_pages);
+        if make_pg_result != 0 {
+            return make_pg_result;
+        }
+
         // Reprotect source as KernelRead | NotMapped.
         let src_new_perm = KMemoryPermission::from_bits_truncate(
             KMemoryPermission::KERNEL_READ.bits() | KMemoryPermission::NOT_MAPPED.bits(),
@@ -1598,22 +1610,13 @@ impl KPageTableBase {
             return op_result;
         }
 
-        // Map dst using the same physical pages as src.
-        let phys_addr = crate::device_memory::dram_memory_map::BASE + src as u64;
         let dst_props = KPageProperties {
             perm: KMemoryPermission::USER_READ_WRITE,
             io: false,
             uncached: false,
             disable_merge_attributes: DisableMergeAttribute::DISABLE_HEAD,
         };
-        let op_result = self.operate(
-            dst,
-            num_pages,
-            phys_addr,
-            true,
-            dst_props,
-            OperationType::Map,
-        );
+        let op_result = self.map_page_group_impl(dst, &pg, dst_props);
         if op_result != 0 {
             // Revert source on failure.
             let revert_props = KPageProperties {
@@ -2187,6 +2190,8 @@ impl KPageTableBase {
             if op_result != 0 {
                 return (op_result, 0);
             }
+
+            self.clear_fresh_backing_region(addr, num_pages * PAGE_SIZE);
         }
 
         // Update blocks.
@@ -2251,6 +2256,8 @@ impl KPageTableBase {
         if op_result != 0 {
             return op_result;
         }
+
+        self.clear_fresh_backing_region(addr, size);
 
         // Update blocks.
         self.m_memory_block_manager.update(
@@ -2755,6 +2762,8 @@ impl KPageTableBase {
         if op != 0 {
             return op;
         }
+
+        self.clear_fresh_backing_region(addr, size);
 
         self.m_memory_block_manager.update(
             addr,
@@ -3307,6 +3316,56 @@ impl KPageTableBase {
         0
     }
 
+    /// Construct a page group from the current virtual mapping.
+    ///
+    /// Matches upstream `KPageTableBase::MakePageGroup`.
+    fn make_page_group(
+        &self,
+        pg: &mut super::k_page_group::KPageGroup,
+        addr: usize,
+        num_pages: usize,
+    ) -> u32 {
+        let size = num_pages * PAGE_SIZE;
+        if pg.is_empty() == false {
+            return svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value();
+        }
+
+        let Some(impl_pt) = self.m_impl.as_ref() else {
+            return svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value();
+        };
+
+        let mut remaining = size;
+        let mut cur_addr = addr as u64;
+
+        while remaining > 0 {
+            let Some(phys_addr) = impl_pt.get_physical_address(cur_addr) else {
+                return svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value();
+            };
+
+            let mut block_pages = 1usize;
+            while block_pages * PAGE_SIZE < remaining {
+                let next_virt = cur_addr + (block_pages * PAGE_SIZE) as u64;
+                let Some(next_phys) = impl_pt.get_physical_address(next_virt) else {
+                    break;
+                };
+                if next_phys != phys_addr + (block_pages * PAGE_SIZE) as u64 {
+                    break;
+                }
+                block_pages += 1;
+            }
+
+            if pg.add_block(phys_addr, block_pages).is_err() {
+                return svc_results::RESULT_OUT_OF_MEMORY.get_inner_value();
+            }
+
+            let block_size = block_pages * PAGE_SIZE;
+            cur_addr += block_size as u64;
+            remaining -= block_size;
+        }
+
+        0
+    }
+
     /// Map a page group into the address space with the given state and permission.
     ///
     /// Upstream: `KPageTableBase::MapPageGroup(KProcessAddress addr, const KPageGroup& pg,
@@ -3498,5 +3557,35 @@ mod tests {
             .query_info(page_table.m_address_space_start)
             .unwrap();
         assert_eq!(info.m_attribute, KMemoryAttribute::NONE);
+    }
+
+    #[test]
+    fn map_memory_updates_destination_block_state_to_stack() {
+        let mut page_table = KPageTableBase::new();
+        page_table.m_address_space_start = 0x1000_0000;
+        page_table.m_address_space_end = 0x1001_0000;
+        page_table.m_alias_region_start = 0x1000_0000;
+        page_table.m_alias_region_end = 0x1001_0000;
+        page_table.m_stack_region_start = 0x1000_0000;
+        page_table.m_stack_region_end = 0x1001_0000;
+        page_table
+            .m_memory_block_manager
+            .initialize(page_table.m_address_space_start, page_table.m_address_space_end);
+        page_table.m_memory_block_manager.update(
+            0x1000_8000,
+            2,
+            KMemoryState::NORMAL,
+            KMemoryPermission::USER_READ_WRITE,
+            KMemoryAttribute::NONE,
+            KMemoryBlockDisableMergeAttribute::NONE,
+            KMemoryBlockDisableMergeAttribute::NONE,
+        );
+
+        let result = page_table.map_memory(0x1000_4000, 0x1000_8000, 0x2000);
+        assert_eq!(result, 0);
+
+        let info = page_table.query_info(0x1000_5ff0).unwrap();
+        assert_eq!(info.m_state, KMemoryState::STACK);
+        assert_eq!(info.m_permission, KMemoryPermission::USER_READ_WRITE);
     }
 }

@@ -7,6 +7,7 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
+use crate::core::SystemRef;
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 use crate::hle::service::am::am_results;
 use crate::hle::service::am::library_applet_storage::{
@@ -22,6 +23,8 @@ use super::storage_accessor::{IStorageAccessor, ITransferStorageAccessor};
 /// - 0: Open
 /// - 1: OpenTransferStorage
 pub struct IStorage {
+    /// Matches upstream `Core::System& system`.
+    system: SystemRef,
     /// Backing storage implementation.
     /// Matches upstream `std::shared_ptr<LibraryAppletStorage> m_impl`.
     backing: Arc<Mutex<dyn LibraryAppletStorage>>,
@@ -31,6 +34,10 @@ pub struct IStorage {
 
 impl IStorage {
     pub fn new(data: Vec<u8>) -> Self {
+        Self::new_with_system(SystemRef::null(), data)
+    }
+
+    pub fn new_with_system(system: SystemRef, data: Vec<u8>) -> Self {
         let backing: Arc<Mutex<dyn LibraryAppletStorage>> =
             Arc::new(Mutex::new(BufferLibraryAppletStorage::new(data)));
         let handlers = build_handler_map(&[
@@ -42,6 +49,7 @@ impl IStorage {
             ),
         ]);
         Self {
+            system,
             backing,
             handlers,
             handlers_tipc: BTreeMap::new(),

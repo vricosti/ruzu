@@ -35,7 +35,7 @@ pub fn get_shared_container() -> Option<Arc<Container>> {
 /// Matches upstream `void VI::LoopProcess(Core::System& system, std::stop_token token)`.
 /// Creates a shared Container, then registers vi:u, vi:s, vi:m.
 pub fn loop_process(system: crate::core::SystemRef) {
-    let container = Arc::new(Container::new(system));
+    let container = Container::new(system);
     *SHARED_CONTAINER.lock().unwrap() = Some(Arc::downgrade(&container));
 
     let mut server_manager = crate::hle::service::server_manager::ServerManager::new(system);

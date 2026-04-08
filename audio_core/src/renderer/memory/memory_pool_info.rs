@@ -1,12 +1,14 @@
 use crate::common::common::CpuAddr;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u32)]
 pub enum PoolLocation {
     Cpu = 1,
     Dsp = 2,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u32)]
 pub enum MemoryPoolState {
     Invalid,
     Acquired,
@@ -18,6 +20,7 @@ pub enum MemoryPoolState {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u32)]
 pub enum MemoryPoolResultState {
     Success,
     BadParam,
@@ -137,5 +140,20 @@ impl MemoryPoolInfo {
 impl Default for MemoryPoolInfo {
     fn default() -> Self {
         Self::new(PoolLocation::Dsp)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::mem::size_of;
+
+    #[test]
+    fn memory_pool_ipc_binary_layout_matches_upstream() {
+        assert_eq!(size_of::<PoolLocation>(), 0x4);
+        assert_eq!(size_of::<MemoryPoolState>(), 0x4);
+        assert_eq!(size_of::<MemoryPoolResultState>(), 0x4);
+        assert_eq!(size_of::<MemoryPoolInParameter>(), 0x20);
+        assert_eq!(size_of::<MemoryPoolOutStatus>(), 0x10);
     }
 }

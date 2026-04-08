@@ -1,88 +1,107 @@
-// SPDX-FileCopyrightText: Copyright 2021 yuzu Emulator Project
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-FileCopyrightText: Copyright 2024 yuzu Emulator Project
+// SPDX-License-Identifier: GPL-2.0-or-later
 
 //! Port of zuyu/src/core/hle/service/nvnflinger/surface_flinger.h
 //! Port of zuyu/src/core/hle/service/nvnflinger/surface_flinger.cpp
-//!
-//! SurfaceFlinger manages displays, layers, and buffer queues.
-//! It is the compositor that collects layers and presents them.
-//! Full composition logic depends on the hardware composer and GPU infrastructure.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+use crate::core::SystemRef;
+use crate::hle::service::nvdrv::core::container::SessionId;
+use crate::hle::service::nvdrv::nvdrv::Module;
+use crate::hle::service::nvdrv::nvdrv_interface::NvdrvService;
+use crate::hle::service::sm::sm::ServiceManager;
+
+use super::binder::IBinder;
 use super::buffer_item_consumer::BufferItemConsumer;
 use super::buffer_queue_consumer::BufferQueueConsumer;
 use super::buffer_queue_core::BufferQueueCore;
 use super::buffer_queue_producer::BufferQueueProducer;
 use super::display::{Display, Layer, LayerStack};
+use super::hardware_composer::HardwareComposer;
 use super::hos_binder_driver_server::HosBinderDriverServer;
 use super::hwc_layer::LayerBlending;
 
-/// SurfaceFlinger manages the composition of layers onto displays.
 pub struct SurfaceFlinger {
-    inner: Mutex<SurfaceFlingerInner>,
+    system: SystemRef,
     server: Arc<HosBinderDriverServer>,
+    inner: Mutex<SurfaceFlingerInner>,
+    nvdrv: Arc<Module>,
+    disp_fd: i32,
+    composer: Mutex<HardwareComposer>,
 }
 
 struct SurfaceFlingerInner {
-    displays: HashMap<u64, Display>,
+    displays: Vec<Display>,
     layers: LayerStack,
     consumers: HashMap<i32, Arc<BufferQueueConsumer>>,
 }
 
 impl SurfaceFlinger {
-    pub fn new(server: Arc<HosBinderDriverServer>) -> Arc<Self> {
+    pub fn new(system: SystemRef, server: Arc<HosBinderDriverServer>) -> Arc<Self> {
+        let service_manager = system
+            .get()
+            .service_manager()
+            .expect("SurfaceFlinger requires ServiceManager");
+        let nvdrv_service = ServiceManager::get_service_blocking(&service_manager, "nvdrv:s");
+        let nvdrv = nvdrv_service
+            .as_any()
+            .downcast_ref::<NvdrvService>()
+            .expect("nvdrv:s handler must be NvdrvService")
+            .get_module();
+        let disp_fd = nvdrv.open("/dev/nvdisp_disp0", SessionId { id: 0 });
+
         Arc::new(Self {
+            system,
+            server,
             inner: Mutex::new(SurfaceFlingerInner {
-                displays: HashMap::new(),
+                displays: Vec::new(),
                 layers: LayerStack::new(),
                 consumers: HashMap::new(),
             }),
-            server,
+            nvdrv,
+            disp_fd,
+            composer: Mutex::new(HardwareComposer::new()),
         })
     }
 
     pub fn add_display(&self, display_id: u64) {
-        let mut inner = self.inner.lock().unwrap();
-        inner.displays.insert(display_id, Display::new(display_id));
+        self.inner.lock().unwrap().displays.push(Display::new(display_id));
     }
 
     pub fn remove_display(&self, display_id: u64) {
-        let mut inner = self.inner.lock().unwrap();
-        inner.displays.remove(&display_id);
-    }
-
-    /// Create a buffer queue pair and register both in the binder driver server.
-    /// Returns (consumer_binder_id, producer_binder_id).
-    pub fn create_buffer_queue(&self) -> (i32, i32) {
-        let core = BufferQueueCore::new();
-        let consumer = Arc::new(BufferQueueConsumer::new(Arc::clone(&core)));
-        let consumer_binder: Arc<dyn super::binder::IBinder> = consumer.clone();
-        let producer_binder: Arc<dyn super::binder::IBinder> =
-            Arc::new(BufferQueueProducer::new(Arc::clone(&core)));
-
-        let consumer_id = self.server.register_binder(consumer_binder);
-        let producer_id = self.server.register_binder(producer_binder);
         self.inner
             .lock()
             .unwrap()
-            .consumers
-            .insert(consumer_id, consumer);
-
-        log::info!(
-            "SurfaceFlinger::create_buffer_queue consumer_id={}, producer_id={}",
-            consumer_id,
-            producer_id
-        );
-
-        (consumer_id, producer_id)
+            .displays
+            .retain(|display| display.id != display_id);
     }
 
-    pub fn destroy_buffer_queue(&self, _consumer_id: i32, _producer_id: i32) {
-        self.inner.lock().unwrap().consumers.remove(&_consumer_id);
-        self.server.unregister_binder(_consumer_id);
-        self.server.unregister_binder(_producer_id);
+    pub fn compose_display(
+        &self,
+        out_swap_interval: &mut i32,
+        out_compose_speed_scale: &mut f32,
+        display_id: u64,
+    ) -> bool {
+        let inner = self.inner.lock().unwrap();
+        let Some(display) = Self::find_display(&inner.displays, display_id) else {
+            return false;
+        };
+        if !display.stack.has_layers() {
+            return false;
+        }
+
+        let device = self
+            .nvdrv
+            .get_disp_device(self.disp_fd)
+            .expect("nvdisp_disp0 device must be open while SurfaceFlinger lives");
+        *out_swap_interval = self
+            .composer
+            .lock()
+            .unwrap()
+            .compose_locked(out_compose_speed_scale, display, &device) as i32;
+        true
     }
 
     pub fn create_layer(&self, consumer_binder_id: i32) {
@@ -97,38 +116,33 @@ impl SurfaceFlinger {
         let Some(consumer) = consumer else {
             return;
         };
-
         let buffer_item_consumer = Arc::new(BufferItemConsumer::new(consumer));
         let _ = buffer_item_consumer.connect(false);
+
         self.inner
             .lock()
             .unwrap()
             .layers
             .layers
-            .push(Arc::new(Layer::new(
+            .push(Arc::new(Mutex::new(Layer::new(
                 buffer_item_consumer,
                 consumer_binder_id,
-            )));
+            ))));
     }
 
     pub fn destroy_layer(&self, consumer_binder_id: i32) {
-        let mut inner = self.inner.lock().unwrap();
-        inner
+        self.inner
+            .lock()
+            .unwrap()
             .layers
             .layers
-            .retain(|l| l.consumer_id != consumer_binder_id);
-        for (_, display) in inner.displays.iter_mut() {
-            display
-                .stack
-                .layers
-                .retain(|l| l.consumer_id != consumer_binder_id);
-        }
+            .retain(|layer| layer.lock().unwrap().consumer_id != consumer_binder_id);
     }
 
     pub fn add_layer_to_display_stack(&self, display_id: u64, consumer_binder_id: i32) {
         let mut inner = self.inner.lock().unwrap();
-        let layer = inner.layers.find_layer(consumer_binder_id);
-        let Some(display) = inner.displays.get_mut(&display_id) else {
+        let layer = Self::find_layer(&inner.layers, consumer_binder_id);
+        let Some(display) = Self::find_display_mut(&mut inner.displays, display_id) else {
             return;
         };
         let Some(layer) = layer else {
@@ -139,55 +153,77 @@ impl SurfaceFlinger {
 
     pub fn remove_layer_from_display_stack(&self, display_id: u64, consumer_binder_id: i32) {
         let mut inner = self.inner.lock().unwrap();
-        if let Some(display) = inner.displays.get_mut(&display_id) {
-            display
-                .stack
-                .layers
-                .retain(|l| l.consumer_id != consumer_binder_id);
-        }
+        let Some(display) = Self::find_display_mut(&mut inner.displays, display_id) else {
+            return;
+        };
+
+        self.composer
+            .lock()
+            .unwrap()
+            .remove_layer_locked(display, consumer_binder_id);
+        display
+            .stack
+            .layers
+            .retain(|layer| layer.lock().unwrap().consumer_id != consumer_binder_id);
     }
 
     pub fn set_layer_visibility(&self, consumer_binder_id: i32, visible: bool) {
-        let inner = self.inner.lock().unwrap();
-        for (_, display) in inner.displays.iter() {
-            if let Some(layer) = display.stack.find_layer(consumer_binder_id) {
-                // Layer visibility is stored in the Layer struct but requires
-                // interior mutability. In a full port, Layer would use Mutex.
-                log::debug!(
-                    "SurfaceFlinger: set visibility consumer={} visible={}",
-                    consumer_binder_id,
-                    visible
-                );
-            }
+        if let Some(layer) = Self::find_layer(&self.inner.lock().unwrap().layers, consumer_binder_id) {
+            layer.lock().unwrap().visible = visible;
         }
     }
 
     pub fn set_layer_blending(&self, consumer_binder_id: i32, blending: LayerBlending) {
-        log::debug!(
-            "SurfaceFlinger: set blending consumer={} blending={:?}",
-            consumer_binder_id,
-            blending
-        );
+        if let Some(layer) = Self::find_layer(&self.inner.lock().unwrap().layers, consumer_binder_id) {
+            layer.lock().unwrap().blending = blending;
+        }
     }
 
-    /// Compose all layers on a display. Returns true if composition occurred.
-    pub fn compose_display(
-        &self,
-        out_swap_interval: &mut i32,
-        out_compose_speed_scale: &mut f32,
-        display_id: u64,
-    ) -> bool {
-        let inner = self.inner.lock().unwrap();
-        let _display = match inner.displays.get(&display_id) {
-            Some(d) => d,
-            None => return false,
-        };
+    pub fn create_buffer_queue(&self) -> (i32, i32) {
+        let core = BufferQueueCore::new();
+        let consumer = Arc::new(BufferQueueConsumer::new(Arc::clone(&core)));
+        let producer_binder = Arc::new(BufferQueueProducer::new(
+            Arc::clone(&core),
+            self.nvdrv.get_container().get_nv_map_file_handle(),
+        ));
+        let consumer_binder: Arc<dyn IBinder> = consumer.clone();
 
-        // Composition logic: acquire buffers from each layer, compose via hardware
-        // composer, and present. Full implementation depends on GPU infrastructure.
-        *out_swap_interval = 1;
-        *out_compose_speed_scale = 1.0;
+        let consumer_binder_id = self.server.register_binder(consumer_binder);
+        let producer_binder_id = self.server.register_buffer_queue_producer(producer_binder);
+        self.inner
+            .lock()
+            .unwrap()
+            .consumers
+            .insert(consumer_binder_id, consumer);
+        (consumer_binder_id, producer_binder_id)
+    }
 
-        true
+    pub fn destroy_buffer_queue(&self, consumer_binder_id: i32, producer_binder_id: i32) {
+        self.inner
+            .lock()
+            .unwrap()
+            .consumers
+            .remove(&consumer_binder_id);
+        self.server.unregister_binder(producer_binder_id);
+        self.server.unregister_binder(consumer_binder_id);
+    }
+
+    fn find_display(displays: &[Display], display_id: u64) -> Option<&Display> {
+        displays.iter().find(|display| display.id == display_id)
+    }
+
+    fn find_display_mut(displays: &mut [Display], display_id: u64) -> Option<&mut Display> {
+        displays.iter_mut().find(|display| display.id == display_id)
+    }
+
+    fn find_layer(layers: &LayerStack, consumer_binder_id: i32) -> Option<Arc<Mutex<Layer>>> {
+        layers.find_layer(consumer_binder_id)
+    }
+}
+
+impl Drop for SurfaceFlinger {
+    fn drop(&mut self) {
+        let _ = self.nvdrv.close(self.disp_fd);
+        let _ = self.system;
     }
 }

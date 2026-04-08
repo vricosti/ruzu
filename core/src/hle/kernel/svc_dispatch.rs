@@ -22,6 +22,7 @@ use crate::hle::kernel::svc::svc_exception;
 use crate::hle::kernel::svc::svc_info;
 use crate::hle::kernel::svc::svc_ipc;
 use crate::hle::kernel::svc::svc_lock;
+use crate::hle::kernel::svc::svc_memory;
 use crate::hle::kernel::svc::svc_physical_memory;
 use crate::hle::kernel::svc::svc_port;
 use crate::hle::kernel::svc::svc_process;
@@ -30,6 +31,21 @@ use crate::hle::kernel::svc::svc_shared_memory;
 use crate::hle::kernel::svc::svc_synchronization;
 use crate::hle::kernel::svc::svc_thread;
 use crate::hle::kernel::svc::svc_tick;
+use crate::hle::kernel::svc::svc_transfer_memory;
+use crate::hle::kernel::svc::svc_types::MemoryPermission;
+
+fn decode_memory_permission(raw: u32) -> MemoryPermission {
+    match raw {
+        0 => MemoryPermission::None,
+        1 => MemoryPermission::Read,
+        2 => MemoryPermission::Write,
+        3 => MemoryPermission::ReadWrite,
+        4 => MemoryPermission::Execute,
+        5 => MemoryPermission::ReadExecute,
+        val if val == (1 << 28) => MemoryPermission::DontCare,
+        _ => MemoryPermission::DontCare,
+    }
+}
 
 fn drain_current_thread_termination(system: &System) {
     let current_thread = system.current_thread();
@@ -449,19 +465,36 @@ fn call32(system: &System, imm: u32, args: &mut SvcArgs) {
         }
         Some(SvcId::SetMemoryPermission) => {
             // IN: address=arg32[0], size=arg32[1], perm=arg32[2]; OUT: ret=arg32[0]
-            set_arg32(args, 0, STUB_SUCCESS);
+            let address = get_arg32(args, 0) as u64;
+            let size = get_arg32(args, 1) as u64;
+            let perm = get_arg32(args, 2);
+            let result = svc_memory::set_memory_permission(system, address, size, decode_memory_permission(perm));
+            set_arg32(args, 0, result.get_inner_value());
         }
         Some(SvcId::SetMemoryAttribute) => {
             // IN: address=arg32[0], size=arg32[1], mask=arg32[2], attr=arg32[3]; OUT: ret=arg32[0]
-            set_arg32(args, 0, STUB_SUCCESS);
+            let address = get_arg32(args, 0) as u64;
+            let size = get_arg32(args, 1) as u64;
+            let mask = get_arg32(args, 2);
+            let attr = get_arg32(args, 3);
+            let result = svc_memory::set_memory_attribute(system, address, size, mask, attr);
+            set_arg32(args, 0, result.get_inner_value());
         }
         Some(SvcId::MapMemory) => {
             // IN: dst=arg32[0], src=arg32[1], size=arg32[2]; OUT: ret=arg32[0]
-            set_arg32(args, 0, STUB_SUCCESS);
+            let dst = get_arg32(args, 0) as u64;
+            let src = get_arg32(args, 1) as u64;
+            let size = get_arg32(args, 2) as u64;
+            let result = svc_memory::map_memory(system, dst, src, size);
+            set_arg32(args, 0, result.get_inner_value());
         }
         Some(SvcId::UnmapMemory) => {
             // IN: dst=arg32[0], src=arg32[1], size=arg32[2]; OUT: ret=arg32[0]
-            set_arg32(args, 0, STUB_SUCCESS);
+            let dst = get_arg32(args, 0) as u64;
+            let src = get_arg32(args, 1) as u64;
+            let size = get_arg32(args, 2) as u64;
+            let result = svc_memory::unmap_memory(system, dst, src, size);
+            set_arg32(args, 0, result.get_inner_value());
         }
         Some(SvcId::QueryMemory) => {
             // IN: out_memory_info=arg32[0], address=arg32[2]; OUT: ret=arg32[0], page_info=arg32[1]
@@ -888,24 +921,72 @@ fn call32(system: &System, imm: u32, args: &mut SvcArgs) {
             }
         }
         Some(SvcId::SendSyncRequestWithUserBuffer) => {
-            set_arg32(args, 0, STUB_SUCCESS);
+            let message_buffer = get_arg32(args, 0) as u64;
+            let message_buffer_size = get_arg32(args, 1) as u64;
+            let session_handle = get_arg32(args, 2);
+            let result = svc_ipc::send_sync_request_with_user_buffer(
+                system,
+                message_buffer,
+                message_buffer_size,
+                session_handle,
+            );
+            set_arg32(args, 0, result.get_inner_value());
         }
         Some(SvcId::SendAsyncRequestWithUserBuffer) => {
-            // OUT: ret=arg32[0], event_handle=arg32[1]
-            set_arg32(args, 0, STUB_SUCCESS);
-            set_arg32(args, 1, alloc_stub_handle(system));
+            let message_buffer = get_arg32(args, 0) as u64;
+            let message_buffer_size = get_arg32(args, 1) as u64;
+            let session_handle = get_arg32(args, 2);
+            let mut out_event_handle = 0;
+            let result = svc_ipc::send_async_request_with_user_buffer(
+                system,
+                &mut out_event_handle,
+                message_buffer,
+                message_buffer_size,
+                session_handle,
+            );
+            set_arg32(args, 0, result.get_inner_value());
+            set_arg32(args, 1, out_event_handle);
         }
         Some(SvcId::ReplyAndReceiveLight) => {
             set_arg32(args, 0, STUB_SUCCESS);
         }
         Some(SvcId::ReplyAndReceive) => {
-            // OUT: ret=arg32[0], index=arg32[1]
-            set_arg32(args, 0, STUB_SUCCESS);
-            set_arg32(args, 1, 0);
+            let handles = get_arg32(args, 0) as u64;
+            let num_handles = get_arg32(args, 1) as i32;
+            let reply_target = get_arg32(args, 2);
+            let timeout_ns = ((get_arg32(args, 4) as u64) << 32 | get_arg32(args, 3) as u64) as i64;
+            let mut out_index = 0;
+            let result = svc_ipc::reply_and_receive(
+                system,
+                &mut out_index,
+                handles,
+                num_handles,
+                reply_target,
+                timeout_ns,
+            );
+            set_arg32(args, 0, result.get_inner_value());
+            set_arg32(args, 1, out_index as u32);
         }
         Some(SvcId::ReplyAndReceiveWithUserBuffer) => {
-            set_arg32(args, 0, STUB_SUCCESS);
-            set_arg32(args, 1, 0);
+            let message_buffer = get_arg32(args, 0) as u64;
+            let message_buffer_size = get_arg32(args, 1) as u64;
+            let handles = get_arg32(args, 2) as u64;
+            let num_handles = get_arg32(args, 3) as i32;
+            let reply_target = get_arg32(args, 4);
+            let timeout_ns = ((get_arg32(args, 6) as u64) << 32 | get_arg32(args, 5) as u64) as i64;
+            let mut out_index = 0;
+            let result = svc_ipc::reply_and_receive_with_user_buffer(
+                system,
+                &mut out_index,
+                message_buffer,
+                message_buffer_size,
+                handles,
+                num_handles,
+                reply_target,
+                timeout_ns,
+            );
+            set_arg32(args, 0, result.get_inner_value());
+            set_arg32(args, 1, out_index as u32);
         }
         Some(SvcId::CreateSession) => {
             // OUT: ret=arg32[0], server=arg32[1], client=arg32[2]
@@ -962,9 +1043,20 @@ fn call32(system: &System, imm: u32, args: &mut SvcArgs) {
             set_arg32(args, 0, result.get_inner_value());
         }
         Some(SvcId::CreateTransferMemory) => {
-            // OUT: ret=arg32[0], handle=arg32[1]
-            set_arg32(args, 0, STUB_SUCCESS);
-            set_arg32(args, 1, alloc_stub_handle(system));
+            // IN: address=arg32[1], size=arg32[2], perm=arg32[3]; OUT: ret=arg32[0], handle=arg32[1]
+            let address = get_arg32(args, 1) as u64;
+            let size = get_arg32(args, 2) as u64;
+            let map_perm = unsafe { std::mem::transmute(get_arg32(args, 3)) };
+            let mut handle = 0;
+            let result = svc_transfer_memory::create_transfer_memory(
+                system,
+                &mut handle,
+                address,
+                size,
+                map_perm,
+            );
+            set_arg32(args, 0, result.get_inner_value());
+            set_arg32(args, 1, handle);
         }
         Some(SvcId::CreateSharedMemory) => {
             // OUT: ret=arg32[0], handle=arg32[1]
@@ -972,10 +1064,22 @@ fn call32(system: &System, imm: u32, args: &mut SvcArgs) {
             set_arg32(args, 1, alloc_stub_handle(system));
         }
         Some(SvcId::MapTransferMemory) => {
-            set_arg32(args, 0, STUB_SUCCESS);
+            // IN: handle=arg32[1], address=arg32[2], size=arg32[3], perm=arg32[4]; OUT: ret=arg32[0]
+            let handle = get_arg32(args, 1);
+            let address = get_arg32(args, 2) as u64;
+            let size = get_arg32(args, 3) as u64;
+            let map_perm = unsafe { std::mem::transmute(get_arg32(args, 4)) };
+            let result =
+                svc_transfer_memory::map_transfer_memory(system, handle, address, size, map_perm);
+            set_arg32(args, 0, result.get_inner_value());
         }
         Some(SvcId::UnmapTransferMemory) => {
-            set_arg32(args, 0, STUB_SUCCESS);
+            // IN: handle=arg32[1], address=arg32[2], size=arg32[3]; OUT: ret=arg32[0]
+            let handle = get_arg32(args, 1);
+            let address = get_arg32(args, 2) as u64;
+            let size = get_arg32(args, 3) as u64;
+            let result = svc_transfer_memory::unmap_transfer_memory(system, handle, address, size);
+            set_arg32(args, 0, result.get_inner_value());
         }
 
         // =====================================================================
@@ -1291,16 +1395,33 @@ fn call64(system: &System, imm: u32, args: &mut SvcArgs) {
             set_arg64(args, 1, heap_base);
         }
         Some(SvcId::SetMemoryPermission) => {
-            set_arg64(args, 0, STUB_SUCCESS as u64);
+            let address = get_arg64(args, 0);
+            let size = get_arg64(args, 1);
+            let perm = get_arg64(args, 2) as u32;
+            let result = svc_memory::set_memory_permission(system, address, size, decode_memory_permission(perm));
+            set_arg64(args, 0, result.get_inner_value() as u64);
         }
         Some(SvcId::SetMemoryAttribute) => {
-            set_arg64(args, 0, STUB_SUCCESS as u64);
+            let address = get_arg64(args, 0);
+            let size = get_arg64(args, 1);
+            let mask = get_arg64(args, 2) as u32;
+            let attr = get_arg64(args, 3) as u32;
+            let result = svc_memory::set_memory_attribute(system, address, size, mask, attr);
+            set_arg64(args, 0, result.get_inner_value() as u64);
         }
         Some(SvcId::MapMemory) => {
-            set_arg64(args, 0, STUB_SUCCESS as u64);
+            let dst = get_arg64(args, 0);
+            let src = get_arg64(args, 1);
+            let size = get_arg64(args, 2);
+            let result = svc_memory::map_memory(system, dst, src, size);
+            set_arg64(args, 0, result.get_inner_value() as u64);
         }
         Some(SvcId::UnmapMemory) => {
-            set_arg64(args, 0, STUB_SUCCESS as u64);
+            let dst = get_arg64(args, 0);
+            let src = get_arg64(args, 1);
+            let size = get_arg64(args, 2);
+            let result = svc_memory::unmap_memory(system, dst, src, size);
+            set_arg64(args, 0, result.get_inner_value() as u64);
         }
         Some(SvcId::QueryMemory) => {
             let mem_info_ptr = get_arg64(args, 0);
@@ -1505,105 +1626,84 @@ fn call64(system: &System, imm: u32, args: &mut SvcArgs) {
 /// 4. Exits the SVC profile
 /// 5. Loads SVC arguments back to the physical core
 pub fn call(system: &System, imm: u32, is_64bit: bool, args: &mut SvcArgs) {
-    // Structured SVC trace — enabled by RUZU_SVC_TRACE=1
-    let trace_enabled = {
-        use std::sync::atomic::{AtomicU8, Ordering};
-        static INIT: AtomicU8 = AtomicU8::new(0); // 0=unknown, 1=off, 2=on
-        match INIT.load(Ordering::Relaxed) {
-            2 => true,
-            1 => false,
-            _ => {
-                let on = std::env::var("RUZU_SVC_TRACE").is_ok();
-                INIT.store(if on { 2 } else { 1 }, Ordering::Relaxed);
-                on
-            }
+    let mut dispatch_args = *args;
+    if let Some(kernel) = system.kernel() {
+        if let Some(process_arc) = system.current_process_arc.as_ref().cloned() {
+            let process = process_arc.lock().unwrap();
+            kernel
+                .current_physical_core()
+                .save_svc_arguments(&process, &mut dispatch_args);
         }
-    };
+    }
+
+    // Structured SVC trace — enabled by RUZU_SVC_TRACE=1
+    // Format matches zuyu trace: [  T.TTTTTT] SVC_IN  imm=0xNN core=C tid=T args=[...]
+    let trace_enabled = super::trace_format::is_svc_trace_enabled();
 
     if trace_enabled {
-        use std::sync::atomic::{AtomicU32, Ordering};
-        static SVC_SEQ: AtomicU32 = AtomicU32::new(0);
-        let seq = SVC_SEQ.fetch_add(1, Ordering::Relaxed);
-        let svc_name = SvcId::from_u32(imm).map_or("???".to_string(), |s| format!("{:?}", s));
+        let (core_id, tid) = {
+            if let Some(thread) = system.current_thread() {
+                let t = thread.lock().unwrap();
+                (t.get_current_core(), t.get_thread_id() as i64)
+            } else {
+                (-1, -1)
+            }
+        };
 
         // Log SVC entry
         eprintln!(
-            "SVC[{:04}] #{:#04x} ({}) IN  args=[{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x}]",
-            seq,
+            "[{:>10.6}] SVC_IN  imm={:#04x} core={} tid={} args=[{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x}]",
+            super::trace_format::elapsed_secs(),
             imm,
-            svc_name,
-            args[0],
-            args[1],
-            args[2],
-            args[3],
-            args[4],
-            args[5],
-            args[6],
-            args[7]
+            core_id,
+            tid,
+            dispatch_args[0],
+            dispatch_args[1],
+            dispatch_args[2],
+            dispatch_args[3],
+            dispatch_args[4],
+            dispatch_args[5],
+            dispatch_args[6],
+            dispatch_args[7]
         );
 
-        // For SendSyncRequest, dump TLS before
-        if imm == 0x21 {
-            if let Some(memory) = system.get_svc_memory() {
-                let m = memory.lock().unwrap();
-                if let Some(thread) = system.current_thread() {
-                    let tls = thread.lock().unwrap().get_tls_address().get();
-                    let mut words = [0u32; 16];
-                    for i in 0..16 {
-                        words[i] = m.read_32(tls + i as u64 * 4);
-                    }
-                    eprintln!("  TLS_REQ [{:#x}]: {:08x} {:08x} {:08x} {:08x}  {:08x} {:08x} {:08x} {:08x}  {:08x} {:08x} {:08x} {:08x}  {:08x} {:08x} {:08x} {:08x}",
-                        tls, words[0], words[1], words[2], words[3], words[4], words[5], words[6], words[7],
-                        words[8], words[9], words[10], words[11], words[12], words[13], words[14], words[15]);
-                }
-            }
-        }
-
         if is_64bit {
-            call64(system, imm, args);
+            call64(system, imm, &mut dispatch_args);
         } else {
-            call32(system, imm, args);
+            call32(system, imm, &mut dispatch_args);
         }
 
         // Log SVC exit
         eprintln!(
-            "SVC[{:04}] #{:#04x} ({}) OUT args=[{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x}]",
-            seq,
+            "[{:>10.6}] SVC_OUT imm={:#04x} args=[{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x}]",
+            super::trace_format::elapsed_secs(),
             imm,
-            svc_name,
-            args[0],
-            args[1],
-            args[2],
-            args[3],
-            args[4],
-            args[5],
-            args[6],
-            args[7]
+            dispatch_args[0],
+            dispatch_args[1],
+            dispatch_args[2],
+            dispatch_args[3],
+            dispatch_args[4],
+            dispatch_args[5],
+            dispatch_args[6],
+            dispatch_args[7]
         );
-
-        // For SendSyncRequest, dump TLS after (response)
-        if imm == 0x21 {
-            if let Some(memory) = system.get_svc_memory() {
-                let m = memory.lock().unwrap();
-                if let Some(thread) = system.current_thread() {
-                    let tls = thread.lock().unwrap().get_tls_address().get();
-                    let mut words = [0u32; 16];
-                    for i in 0..16 {
-                        words[i] = m.read_32(tls + i as u64 * 4);
-                    }
-                    eprintln!("  TLS_RSP [{:#x}]: {:08x} {:08x} {:08x} {:08x}  {:08x} {:08x} {:08x} {:08x}  {:08x} {:08x} {:08x} {:08x}  {:08x} {:08x} {:08x} {:08x}",
-                        tls, words[0], words[1], words[2], words[3], words[4], words[5], words[6], words[7],
-                        words[8], words[9], words[10], words[11], words[12], words[13], words[14], words[15]);
-                }
-            }
-        }
     } else {
         if is_64bit {
-            call64(system, imm, args);
+            call64(system, imm, &mut dispatch_args);
         } else {
-            call32(system, imm, args);
+            call32(system, imm, &mut dispatch_args);
         }
     }
+
+    if let Some(kernel) = system.kernel() {
+        if let Some(process_arc) = system.current_process_arc.as_ref().cloned() {
+            let mut process = process_arc.lock().unwrap();
+            kernel
+                .current_physical_core()
+                .load_svc_arguments(&mut process, &dispatch_args);
+        }
+    }
+    *args = dispatch_args;
 
     // Upstream reaches the equivalent behavior when the scheduler lock is
     // released after the SVC handler. In this cooperative port, drain a

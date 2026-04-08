@@ -12,6 +12,8 @@ use std::sync::Arc;
 
 use log::trace;
 
+use crate::control::channel_state::ChannelState;
+use crate::control::channel_state_cache::{ChannelInfo, ChannelSetupCaches};
 use crate::host1x::syncpoint_manager::SyncpointManager;
 use crate::query_cache::types::QueryPropertiesFlags;
 use crate::rasterizer_interface::{RasterizerDownloadArea, RasterizerInterface};
@@ -65,6 +67,7 @@ impl Default for AccelerateDMA {
 pub struct RasterizerNull {
     syncpoints: Arc<SyncpointManager>,
     accelerate_dma: AccelerateDMA,
+    channel_caches: ChannelSetupCaches<ChannelInfo>,
 }
 
 impl RasterizerNull {
@@ -72,6 +75,7 @@ impl RasterizerNull {
         Self {
             syncpoints,
             accelerate_dma: AccelerateDMA::new(),
+            channel_caches: ChannelSetupCaches::new(),
         }
     }
 
@@ -225,16 +229,16 @@ impl RasterizerInterface for RasterizerNull {
 
     // ── Channel management ──────────────────────────────────────────────
 
-    fn initialize_channel(&mut self, _channel_id: i32) {
-        trace!("RasterizerNull::initialize_channel (no-op)");
+    fn initialize_channel(&mut self, channel: &ChannelState) {
+        self.channel_caches.create_channel(channel);
     }
 
-    fn bind_channel(&mut self, _channel_id: i32) {
-        trace!("RasterizerNull::bind_channel (no-op)");
+    fn bind_channel(&mut self, channel: &ChannelState) {
+        self.channel_caches.bind_to_channel(channel.bind_id);
     }
 
-    fn release_channel(&mut self, _channel_id: i32) {
-        trace!("RasterizerNull::release_channel (no-op)");
+    fn release_channel(&mut self, channel_id: i32) {
+        self.channel_caches.erase_channel(channel_id);
     }
 }
 
@@ -377,6 +381,30 @@ mod tests {
         assert!(dma.buffer_clear(0, 0x1000, 0));
         assert!(!dma.image_to_buffer());
         assert!(!dma.buffer_to_image());
+    }
+
+    #[test]
+    fn test_channel_lifecycle_updates_channel_caches() {
+        use parking_lot::Mutex;
+
+        let sp = Arc::new(SyncpointManager::new());
+        let mut rast = RasterizerNull::new(sp);
+        let gpu = crate::gpu::Gpu::new(false, false);
+        let mut channel = ChannelState::new(9);
+        channel.memory_manager = Some(Arc::new(Mutex::new(
+            crate::memory_manager::MemoryManager::new_with_geometry(3, 32, 0x1_0000_0000, 17, 12),
+        )));
+        channel.init(&gpu, 0x1234);
+
+        rast.initialize_channel(&channel);
+        rast.bind_channel(&channel);
+
+        assert_eq!(rast.channel_caches.program_id, 0x1234);
+        assert_eq!(rast.channel_caches.gpu_memory, Some(0));
+
+        rast.release_channel(9);
+        assert_eq!(rast.channel_caches.program_id, 0);
+        assert_eq!(rast.channel_caches.gpu_memory, None);
     }
 
     #[test]

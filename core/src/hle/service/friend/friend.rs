@@ -6,7 +6,14 @@
 //!
 //! Friend Module, IFriendService, and INotificationService.
 
+use std::collections::BTreeMap;
 use std::collections::VecDeque;
+use std::sync::{Arc, Mutex};
+
+use crate::hle::result::{ResultCode, RESULT_SUCCESS};
+use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
+use crate::hle::service::ipc_helpers::{RequestParser, ResponseBuilder};
+use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
 
 /// IPC command IDs for IFriendService (selected implemented commands)
 pub mod friend_service_commands {
@@ -83,6 +90,8 @@ impl Module {
 
 /// IFriendService.
 pub struct IFriendService {
+    handlers: BTreeMap<u32, FunctionInfo>,
+    handlers_tipc: BTreeMap<u32, FunctionInfo>,
     service_context: crate::hle::service::kernel_helpers::ServiceContext,
     completion_event_handle: u32,
 }
@@ -94,9 +103,81 @@ impl IFriendService {
         let completion_event_handle =
             service_context.create_event("IFriendService:CompletionEvent".to_string());
         Self {
+            handlers: build_handler_map(&[
+                (
+                    friend_service_commands::GET_COMPLETION_EVENT,
+                    Some(Self::get_completion_event_handler),
+                    "GetCompletionEvent",
+                ),
+                (
+                    friend_service_commands::GET_FRIEND_LIST,
+                    Some(Self::get_friend_list_handler),
+                    "GetFriendList",
+                ),
+                (
+                    friend_service_commands::CHECK_FRIEND_LIST_AVAILABILITY,
+                    Some(Self::check_friend_list_availability_handler),
+                    "CheckFriendListAvailability",
+                ),
+                (
+                    friend_service_commands::GET_BLOCKED_USER_LIST_IDS,
+                    Some(Self::get_blocked_user_list_ids_handler),
+                    "GetBlockedUserListIds",
+                ),
+                (
+                    friend_service_commands::CHECK_BLOCKED_USER_LIST_AVAILABILITY,
+                    Some(Self::check_blocked_user_list_availability_handler),
+                    "CheckBlockedUserListAvailability",
+                ),
+                (
+                    friend_service_commands::DECLARE_CLOSE_ONLINE_PLAY_SESSION,
+                    Some(Self::declare_close_online_play_session_handler),
+                    "DeclareCloseOnlinePlaySession",
+                ),
+                (
+                    friend_service_commands::UPDATE_USER_PRESENCE,
+                    Some(Self::update_user_presence_handler),
+                    "UpdateUserPresence",
+                ),
+                (
+                    friend_service_commands::GET_PLAY_HISTORY_REGISTRATION_KEY,
+                    Some(Self::get_play_history_registration_key_handler),
+                    "GetPlayHistoryRegistrationKey",
+                ),
+                (
+                    friend_service_commands::GET_FRIEND_COUNT,
+                    Some(Self::get_friend_count_handler),
+                    "GetFriendCount",
+                ),
+                (
+                    friend_service_commands::GET_NEWLY_FRIEND_COUNT,
+                    Some(Self::get_newly_friend_count_handler),
+                    "GetNewlyFriendCount",
+                ),
+                (
+                    friend_service_commands::GET_RECEIVED_FRIEND_REQUEST_COUNT,
+                    Some(Self::get_received_friend_request_count_handler),
+                    "GetReceivedFriendRequestCount",
+                ),
+                (
+                    friend_service_commands::GET_PLAY_HISTORY_STATISTICS,
+                    Some(Self::get_play_history_statistics_handler),
+                    "GetPlayHistoryStatistics",
+                ),
+                (
+                    friend_service_commands::GET_RECEIVED_FRIEND_INVITATION_COUNT_CACHE,
+                    Some(Self::get_received_friend_invitation_count_cache_handler),
+                    "GetReceivedFriendInvitationCountCache",
+                ),
+            ]),
+            handlers_tipc: BTreeMap::new(),
             service_context,
             completion_event_handle,
         }
+    }
+
+    fn cast(this: &dyn ServiceFramework) -> &Self {
+        unsafe { &*(this as *const dyn ServiceFramework as *const Self) }
     }
 
     pub fn get_completion_event(&self) -> u32 {
@@ -159,13 +240,171 @@ impl IFriendService {
         log::debug!("(STUBBED) IFriendService::get_received_friend_invitation_count_cache called");
         0
     }
+
+    fn get_completion_event_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let this = Self::cast(this);
+        let mut rb = ResponseBuilder::new(ctx, 2, 1, 0);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_copy_objects(this.get_completion_event());
+    }
+
+    fn get_friend_list_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let this = Self::cast(this);
+        let mut rp = RequestParser::new(ctx);
+        let friend_offset = rp.pop_u32();
+        let uuid = rp.pop_u64() as u128 | ((rp.pop_u64() as u128) << 64);
+        rp.skip((core::mem::size_of::<SizedFriendFilter>() + 3) / 4);
+        let pid = rp.pop_u64();
+
+        let count = this.get_friend_list(friend_offset, uuid, pid);
+        let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_u32(count);
+    }
+
+    fn check_friend_list_availability_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        let this = Self::cast(this);
+        let mut rp = RequestParser::new(ctx);
+        let uuid = rp.pop_u64() as u128 | ((rp.pop_u64() as u128) << 64);
+        let available = this.check_friend_list_availability(uuid);
+        let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_bool(available);
+    }
+
+    fn get_blocked_user_list_ids_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        let this = Self::cast(this);
+        let count = this.get_blocked_user_list_ids();
+        let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_u32(count);
+    }
+
+    fn check_blocked_user_list_availability_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        let this = Self::cast(this);
+        let mut rp = RequestParser::new(ctx);
+        let uuid = rp.pop_u64() as u128 | ((rp.pop_u64() as u128) << 64);
+        let available = this.check_blocked_user_list_availability(uuid);
+        let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_bool(available);
+    }
+
+    fn declare_close_online_play_session_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        Self::cast(this).declare_close_online_play_session();
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+    }
+
+    fn update_user_presence_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        Self::cast(this).update_user_presence();
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+    }
+
+    fn get_play_history_registration_key_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        let this = Self::cast(this);
+        let mut rp = RequestParser::new(ctx);
+        let local_play = rp.pop_bool();
+        let uuid = rp.pop_u64() as u128 | ((rp.pop_u64() as u128) << 64);
+        this.get_play_history_registration_key(local_play, uuid);
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+    }
+
+    fn get_friend_count_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let count = Self::cast(this).get_friend_count();
+        let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_u32(count);
+    }
+
+    fn get_newly_friend_count_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        let count = Self::cast(this).get_newly_friend_count();
+        let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_u32(count);
+    }
+
+    fn get_received_friend_request_count_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        let count = Self::cast(this).get_received_friend_request_count();
+        let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_u32(count);
+    }
+
+    fn get_play_history_statistics_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        Self::cast(this).get_play_history_statistics();
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+    }
+
+    fn get_received_friend_invitation_count_cache_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        let count = Self::cast(this).get_received_friend_invitation_count_cache();
+        let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_u32(count);
+    }
+}
+
+impl SessionRequestHandler for IFriendService {
+    fn handle_sync_request(&self, context: &mut HLERequestContext) -> ResultCode {
+        ServiceFramework::handle_sync_request_impl(self, context)
+    }
+
+    fn service_name(&self) -> &str {
+        "IFriendService"
+    }
+}
+
+impl ServiceFramework for IFriendService {
+    fn get_service_name(&self) -> &str {
+        "IFriendService"
+    }
+
+    fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers
+    }
+
+    fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers_tipc
+    }
 }
 
 /// INotificationService.
 pub struct INotificationService {
+    handlers: BTreeMap<u32, FunctionInfo>,
+    handlers_tipc: BTreeMap<u32, FunctionInfo>,
     uuid: u128,
-    notifications: VecDeque<SizedNotificationInfo>,
-    states: NotificationStates,
+    notifications: Mutex<VecDeque<SizedNotificationInfo>>,
+    states: Mutex<NotificationStates>,
     service_context: crate::hle::service::kernel_helpers::ServiceContext,
     notification_event_handle: u32,
 }
@@ -183,12 +422,22 @@ impl INotificationService {
         let notification_event_handle =
             service_context.create_event("INotificationService:NotifyEvent".to_string());
         Self {
+            handlers: build_handler_map(&[
+                (
+                    notification_commands::GET_EVENT,
+                    Some(Self::get_event_handler),
+                    "GetEvent",
+                ),
+                (notification_commands::CLEAR, Some(Self::clear_handler), "Clear"),
+                (notification_commands::POP, Some(Self::pop_handler), "Pop"),
+            ]),
+            handlers_tipc: BTreeMap::new(),
             uuid,
-            notifications: VecDeque::new(),
-            states: NotificationStates {
+            notifications: Mutex::new(VecDeque::new()),
+            states: Mutex::new(NotificationStates {
                 has_updated_friends: false,
                 has_received_friend_request: false,
-            },
+            }),
             service_context,
             notification_event_handle,
         }
@@ -199,26 +448,76 @@ impl INotificationService {
         self.notification_event_handle
     }
 
-    pub fn clear(&mut self) {
+    pub fn clear(&self) {
         log::debug!("INotificationService::clear called");
-        self.notifications.clear();
-        self.states.has_updated_friends = false;
-        self.states.has_received_friend_request = false;
+        self.notifications.lock().unwrap().clear();
+        let mut states = self.states.lock().unwrap();
+        states.has_updated_friends = false;
+        states.has_received_friend_request = false;
     }
 
-    pub fn pop(&mut self) -> Option<SizedNotificationInfo> {
+    pub fn pop(&self) -> Option<SizedNotificationInfo> {
         log::debug!("INotificationService::pop called");
-        let notification = self.notifications.pop_front()?;
+        let notification = self.notifications.lock().unwrap().pop_front()?;
+        let mut states = self.states.lock().unwrap();
 
         match notification.notification_type {
             NotificationTypes::HasUpdatedFriendsList => {
-                self.states.has_updated_friends = false;
+                states.has_updated_friends = false;
             }
             NotificationTypes::HasReceivedFriendRequest => {
-                self.states.has_received_friend_request = false;
+                states.has_received_friend_request = false;
             }
         }
 
         Some(notification)
+    }
+
+    fn get_event_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let this = unsafe { &*(this as *const dyn ServiceFramework as *const Self) };
+        let mut rb = ResponseBuilder::new(ctx, 2, 1, 0);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_copy_objects(this.get_event());
+    }
+
+    fn clear_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let this = unsafe { &*(this as *const dyn ServiceFramework as *const Self) };
+        this.clear();
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+    }
+
+    fn pop_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let this = unsafe { &*(this as *const dyn ServiceFramework as *const Self) };
+        let notification = this.pop();
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+        if let Some(_info) = notification {
+            // Buffer return not wired yet; keep success parity and state update.
+        }
+    }
+}
+
+impl SessionRequestHandler for INotificationService {
+    fn handle_sync_request(&self, context: &mut HLERequestContext) -> ResultCode {
+        ServiceFramework::handle_sync_request_impl(self, context)
+    }
+
+    fn service_name(&self) -> &str {
+        "INotificationService"
+    }
+}
+
+impl ServiceFramework for INotificationService {
+    fn get_service_name(&self) -> &str {
+        "INotificationService"
+    }
+
+    fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers
+    }
+
+    fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers_tipc
     }
 }
