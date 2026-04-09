@@ -782,6 +782,73 @@ impl KThread {
         self.host_context = init_func.map(common::fiber::Fiber::new);
     }
 
+    /// Shared owner-local initialization for ownerless kernel threads.
+    ///
+    /// Upstream owner boundary: `KThread::InitializeThread(...)` in `k_thread.cpp`
+    /// for the `owner == nullptr` kernel-thread call sites
+    /// (`InitializeMainThread`, `InitializeIdleThread`, `InitializeHighPriorityThread`).
+    fn initialize_ownerless_kernel_thread(
+        &mut self,
+        virt_core: i32,
+        thread_id: u64,
+        object_id: u64,
+        thread_type: ThreadType,
+        priority: i32,
+        initial_state: ThreadState,
+        stack_parameters: StackParameters,
+        init_func: Option<Box<dyn FnOnce() + Send>>,
+    ) {
+        let phys_core =
+            crate::hardware_properties::VIRTUAL_TO_PHYSICAL_CORE_MAP[virt_core as usize];
+
+        self.object_id = object_id;
+        self.thread_type = thread_type;
+        self.thread_id = thread_id;
+        self.priority = priority;
+        self.base_priority = priority;
+        self.virtual_ideal_core_id = virt_core;
+        self.physical_ideal_core_id = phys_core;
+        self.virtual_affinity_mask = 1u64 << virt_core;
+        self.physical_affinity_mask
+            .set_affinity_mask(1u64 << phys_core);
+        self.tls_address = KProcessAddress::default();
+        self.parent = None;
+        self.scheduler = None;
+        self.global_scheduler_context = None;
+        self.scheduler_lock_ptr = 0;
+        self.process_schedule_count = None;
+        self.signaled = false;
+        let (termination_lock, _) = &*self.termination_wait_pair;
+        *termination_lock.lock().unwrap() = false;
+        self.termination_requested.store(false, Ordering::Relaxed);
+        self.wait_cancelled = false;
+        self.cancellable = false;
+        self.stack_top = KProcessAddress::default();
+        self.argument = 0;
+        self.core_id = phys_core;
+        self.current_core_id = phys_core;
+        self.thread_state
+            .store(initial_state.bits(), Ordering::Relaxed);
+        self.suspend_allowed_flags = ThreadState::SUSPEND_FLAG_MASK.bits() as u32;
+        self.suspend_request_flags = 0;
+        self.wait_result = RESULT_NO_SYNCHRONIZATION_OBJECT.get_inner_value();
+        self.schedule_count = -1;
+        self.last_scheduled_tick = 0;
+        self.num_kernel_waiters = 0;
+        self.resource_limit_release_hint = false;
+        self.sleep_deadline = None;
+        self.synchronization_wait.clear();
+        self.stack_parameters = stack_parameters;
+        self.initialized = true;
+
+        // No owner → use 64-bit thread context (upstream: m_parent == nullptr → 64-bit path).
+        self.reset_thread_context64(0, 0, 0);
+
+        // Initialize emulation parameters.
+        // Upstream: thread->m_host_context = std::make_shared<Common::Fiber>(std::move(init_func)).
+        self.initialize_host_context(init_func);
+    }
+
     /// Read the user-mode disable count from the thread's TLS region in guest memory.
     ///
     /// Upstream: `KThread::GetUserDisableCount()` (k_thread.cpp:552-560).
@@ -1562,43 +1629,20 @@ impl KThread {
         object_id: u64,
         init_func: Option<Box<dyn FnOnce() + Send>>,
     ) {
-        let phys_core =
-            crate::hardware_properties::VIRTUAL_TO_PHYSICAL_CORE_MAP[virt_core as usize];
+        let mut stack_parameters = StackParameters::default();
+        stack_parameters.disable_count = 1;
+        stack_parameters.is_in_exception_handler = true;
 
-        self.object_id = object_id;
-        self.thread_type = ThreadType::Main;
-        self.thread_id = thread_id;
-        self.priority = IDLE_THREAD_PRIORITY;
-        self.base_priority = IDLE_THREAD_PRIORITY;
-        self.virtual_ideal_core_id = virt_core;
-        self.physical_ideal_core_id = phys_core;
-        self.virtual_affinity_mask = 1u64 << virt_core;
-        self.physical_affinity_mask
-            .set_affinity_mask(1u64 << phys_core);
-        self.tls_address = KProcessAddress::default();
-        self.parent = None;
-        self.scheduler = None;
-        self.stack_top = KProcessAddress::default();
-        self.argument = 0;
-        self.core_id = phys_core;
-        self.current_core_id = phys_core;
-        self.thread_state
-            .store(ThreadState::RUNNABLE.bits(), Ordering::Relaxed);
-        self.suspend_allowed_flags = ThreadState::SUSPEND_FLAG_MASK.bits() as u32;
-        self.suspend_request_flags = 0;
-        self.wait_result = RESULT_NO_SYNCHRONIZATION_OBJECT.get_inner_value();
-        self.schedule_count = -1;
-        self.initialized = true;
-        self.stack_parameters = StackParameters::default();
-        self.stack_parameters.disable_count = 1;
-        self.stack_parameters.is_in_exception_handler = true;
-
-        // No owner → use 64-bit thread context (upstream: m_parent == nullptr → 64-bit path).
-        self.reset_thread_context64(0, 0, 0);
-
-        // Initialize emulation parameters.
-        // Upstream: thread->m_host_context = std::make_shared<Common::Fiber>(std::move(init_func));
-        self.initialize_host_context(init_func);
+        self.initialize_ownerless_kernel_thread(
+            virt_core,
+            thread_id,
+            object_id,
+            ThreadType::Main,
+            IDLE_THREAD_PRIORITY,
+            ThreadState::RUNNABLE,
+            stack_parameters,
+            init_func,
+        );
     }
 
     /// Initialize as a high-priority kernel thread (no process owner).
@@ -1614,55 +1658,16 @@ impl KThread {
         object_id: u64,
         init_func: Option<Box<dyn FnOnce() + Send>>,
     ) {
-        let phys_core =
-            crate::hardware_properties::VIRTUAL_TO_PHYSICAL_CORE_MAP[virt_core as usize];
-
-        self.object_id = object_id;
-        self.thread_type = ThreadType::HighPriority;
-        self.thread_id = thread_id;
-        self.priority = SVC_HIGHEST_THREAD_PRIORITY;
-        self.base_priority = SVC_HIGHEST_THREAD_PRIORITY;
-        self.virtual_ideal_core_id = virt_core;
-        self.physical_ideal_core_id = phys_core;
-        self.virtual_affinity_mask = 1u64 << virt_core;
-        self.physical_affinity_mask
-            .set_affinity_mask(1u64 << phys_core);
-        self.tls_address = KProcessAddress::default();
-        self.parent = None;
-        self.scheduler = None;
-        self.global_scheduler_context = None;
-        self.scheduler_lock_ptr = 0;
-        self.process_schedule_count = None;
-        self.signaled = false;
-        let (termination_lock, _) = &*self.termination_wait_pair;
-        *termination_lock.lock().unwrap() = false;
-        self.termination_requested.store(false, Ordering::Relaxed);
-        self.wait_cancelled = false;
-        self.cancellable = false;
-        self.stack_top = KProcessAddress::default();
-        self.argument = 0;
-        self.core_id = phys_core;
-        self.current_core_id = phys_core;
-        self.thread_state
-            .store(ThreadState::INITIALIZED.bits(), Ordering::Relaxed);
-        self.suspend_allowed_flags = ThreadState::SUSPEND_FLAG_MASK.bits() as u32;
-        self.suspend_request_flags = 0;
-        self.wait_result = RESULT_NO_SYNCHRONIZATION_OBJECT.get_inner_value();
-        self.schedule_count = -1;
-        self.last_scheduled_tick = 0;
-        self.num_kernel_waiters = 0;
-        self.resource_limit_release_hint = false;
-        self.sleep_deadline = None;
-        self.synchronization_wait.clear();
-        self.stack_parameters = StackParameters::default();
-        self.initialized = true;
-
-        // No owner → use 64-bit thread context (upstream: m_parent == nullptr → 64-bit path).
-        self.reset_thread_context64(0, 0, 0);
-
-        // Initialize emulation parameters.
-        // Upstream: thread->m_host_context = std::make_shared<Common::Fiber>(std::move(init_func));
-        self.initialize_host_context(init_func);
+        self.initialize_ownerless_kernel_thread(
+            virt_core,
+            thread_id,
+            object_id,
+            ThreadType::HighPriority,
+            SVC_HIGHEST_THREAD_PRIORITY,
+            ThreadState::INITIALIZED,
+            StackParameters::default(),
+            init_func,
+        );
     }
 
     /// Initialize as a kernel idle thread (no process owner).
@@ -1679,9 +1684,20 @@ impl KThread {
         object_id: u64,
         init_func: Option<Box<dyn FnOnce() + Send>>,
     ) {
-        // Upstream idle thread initialization is identical to main thread initialization,
-        // differing only in the init_func (IdleThreadStartFunc vs GuestActivateFunc).
-        self.initialize_kernel_main_thread(virt_core, thread_id, object_id, init_func);
+        let mut stack_parameters = StackParameters::default();
+        stack_parameters.disable_count = 1;
+        stack_parameters.is_in_exception_handler = true;
+
+        self.initialize_ownerless_kernel_thread(
+            virt_core,
+            thread_id,
+            object_id,
+            ThreadType::Main,
+            IDLE_THREAD_PRIORITY,
+            ThreadState::RUNNABLE,
+            stack_parameters,
+            init_func,
+        );
     }
 
     pub fn initialize_user_thread(

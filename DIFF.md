@@ -6975,7 +6975,8 @@
 - Fixed in this pass: shutdown-thread initialization now installs `ThreadType::HighPriority`, `priority/base_priority = 0`, and `ThreadState::INITIALIZED`, matching the upstream `InitializeThread(..., ThreadType::HighPriority, ...)` contract more closely.
 
 ### Missing items
-- Full parity for the generic upstream `InitializeThread(...)` helper is still split across several Rust init helpers (`initialize_kernel_main_thread`, `initialize_high_priority_thread`, `initialize_user_thread_with_tls`, etc.) rather than a single shared owner-local helper.
+- Fixed in this pass: the ownerless kernel-thread call sites now share a single owner-local helper in `k_thread.rs`, which is closer to the upstream `InitializeThread(...)` boundary for `InitializeMainThread`, `InitializeIdleThread`, and `InitializeHighPriorityThread`.
+- Full parity for the generic upstream `InitializeThread(...)` helper is still incomplete for the remaining user/service thread wrappers (`initialize_user_thread_with_init_func`, `initialize_service_thread`, etc.), which are not yet routed through one shared owner-local helper.
 
 ### Binary layout verification
 - PASS: no raw serialized struct layout changed in this slice.
