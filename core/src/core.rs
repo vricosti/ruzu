@@ -468,9 +468,10 @@ impl System {
             .unwrap()
             .set_multicore(self.is_multicore);
         // In C++: core_timing.Initialize([&system]() { system.RegisterHostThread(); });
-        self.core_timing.lock().unwrap().initialize(|| {
-            // Host thread registration placeholder.
-            // In full implementation, this registers the timer thread with the kernel.
+        let system_ref = SystemRef::from_ref(self);
+        self.core_timing.lock().unwrap().initialize(move || {
+            // Upstream: core_timing.Initialize([&system]() { system.RegisterHostThread(); });
+            system_ref.get().kernel().unwrap().register_host_thread();
         });
 
         // Ensure VFS exists. Upstream does this in Initialize().
