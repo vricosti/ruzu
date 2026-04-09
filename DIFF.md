@@ -6994,3 +6994,46 @@
 
 ### Binary layout verification
 - PASS: no raw serialized struct layout changed in this slice.
+
+## 2026-04-09 — `core/src/hle/kernel/kernel.rs` vs `src/core/hle/kernel/kernel.cpp`
+
+### Intentional differences
+- Rust returns `std::thread::JoinHandle<()>` from `run_host_thread_func(...)`, `run_on_host_core_process(...)`, and `run_on_host_core_thread(...)` instead of upstream `std::jthread`. This is a bounded ownership adaptation while preserving the same owner split in `kernel.rs`.
+- Rust retains host service processes in a dedicated `host_service_processes` list instead of a single upstream-style `process_list`. This is a bounded adaptation of the current Rust process ownership split while preserving the keep-alive requirement of `KProcess::Register(*this, process)`.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: Rust now has the same helper layering as upstream for host dummy-thread bootstrap: `run_on_host_core_process(...)` creates a process then delegates to `run_host_thread_func(...)`, while `run_on_host_core_thread(...)` reuses the current process and delegates to the same helper.
+
+### Missing items
+- Rust still does not mirror the full upstream `KScopedResourceReservation thread_reservation(process, ThreadCountMax)` path before creating host dummy threads.
+
+### Binary layout verification
+- PASS: host-thread owner wiring only; no raw serialized struct layout changed.
+
+## 2026-04-09 — `core/src/hle/service/server_manager.rs` vs `src/core/hle/service/server_manager.cpp`
+
+### Intentional differences
+- Rust now records upstream `StartAdditionalHostThreads(...)` requests and activates them after `KernelCore::run_server(...)` wraps the manager in `Arc<Mutex<...>>`. The additional host threads currently run a bounded park/wakeup loop instead of the full concurrent upstream `LoopProcessImpl()` on the shared manager. This divergence is temporary and documented here rather than hidden.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `start_additional_host_threads(...)` no longer stubs out the upstream call entirely. Rust now preserves the additional host-thread ownership in `server_manager.rs` and retains their `JoinHandle`s.
+
+### Missing items
+- Full upstream concurrency parity is still incomplete: additional host threads do not yet process the same `ServerManager` event loop concurrently via the true upstream `LoopProcessImpl()` model.
+
+### Binary layout verification
+- PASS: host-thread ownership only; no raw serialized struct layout changed.
+
+## 2026-04-09 — `core/src/hle/service/sockets/sockets.rs` vs `src/core/hle/service/sockets/sockets.cpp`
+
+### Intentional differences
+- Rust still registers placeholder generic services in this file for the exercised socket service names. That broader service implementation gap predates this slice.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `Sockets::loop_process(...)` now calls `start_additional_host_threads("bsdsocket", 2)`, matching the explicit upstream `sockets.cpp` callsite.
+
+### Missing items
+- Re-audit thread-count parity before the game thread after this `bsdsocket +2` gap is closed, to determine which remaining missing thread IDs come from other owners.
+
+### Binary layout verification
+- PASS: service bootstrap wiring only; no raw serialized struct layout changed.

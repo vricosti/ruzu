@@ -19,6 +19,8 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
+use std::time::Duration;
 
 use crate::core::SystemRef;
 use crate::hle::kernel::k_port::KPort;
@@ -128,6 +130,23 @@ pub struct ServerManager {
     /// Whether the server has been stopped.
     stopped: AtomicBool,
 
+    /// Additional host threads requested by upstream call sites such as
+    /// `Sockets::LoopProcess`.
+    ///
+    /// Upstream: `std::vector<std::jthread> m_threads` is populated by
+    /// `StartAdditionalHostThreads(...)`. Rust records the requested threads
+    /// here first, then activates them once the `ServerManager` has been moved
+    /// into its shared owner in `KernelCore::run_server(...)`.
+    pending_additional_host_threads: Vec<(String, usize)>,
+
+    /// Owned handles for additional host threads.
+    /// Upstream: `m_threads`.
+    host_threads: Vec<JoinHandle<()>>,
+
+    /// Shared stop flag for additional host threads.
+    /// This is a bounded Rust adaptation of upstream `std::stop_source`.
+    additional_host_thread_stop: Arc<AtomicBool>,
+
     /// Guest-thread wakeup event used to block the service thread when the
     /// current Rust port has no real MultiWait-backed kernel objects to wait on.
     guest_wakeup: Mutex<GuestWakeupState>,
@@ -156,6 +175,9 @@ impl ServerManager {
             deferral_holder: None,
             stop_requested: AtomicBool::new(false),
             stopped: AtomicBool::new(false),
+            pending_additional_host_threads: Vec::new(),
+            host_threads: Vec::new(),
+            additional_host_thread_stop: Arc::new(AtomicBool::new(false)),
             guest_wakeup: Mutex::new(GuestWakeupState::new()),
         }
     }
@@ -622,11 +644,59 @@ impl ServerManager {
             name,
             num_threads
         );
+        self.pending_additional_host_threads
+            .push((name.to_string(), num_threads));
+    }
+
+    /// Activate pending additional host threads once the manager has a shared owner.
+    ///
+    /// This is a bounded Rust adaptation of upstream `StartAdditionalHostThreads`:
+    /// the extra host threads exist with real dummy `KThread` owners, but they do
+    /// not yet run the full concurrent `LoopProcessImpl()` model on the same
+    /// `ServerManager` instance.
+    pub fn activate_additional_host_threads(manager: &Arc<Mutex<ServerManager>>) {
+        let (system, stop_flag, pending) = {
+            let mut guard = manager.lock().unwrap();
+            let pending = std::mem::take(&mut guard.pending_additional_host_threads);
+            (
+                guard.system,
+                Arc::clone(&guard.additional_host_thread_stop),
+                pending,
+            )
+        };
+
+        if system.is_null() {
+            return;
+        }
+
+        let Some(kernel) = system.get().kernel() else {
+            return;
+        };
+
+        for (name, num_threads) in pending {
+            for i in 0..num_threads {
+                let thread_name = format!("{}:{}", name, i + 1);
+                let stop = Arc::clone(&stop_flag);
+                let handle = kernel.run_on_host_core_thread(
+                    &thread_name,
+                    Box::new(move || {
+                        while !stop.load(Ordering::Acquire) {
+                            std::thread::park_timeout(Duration::from_millis(50));
+                        }
+                    }),
+                );
+                manager.lock().unwrap().host_threads.push(handle);
+            }
+        }
     }
 
     /// Request the server to stop.
     pub fn request_stop(&self) {
         self.stop_requested.store(true, Ordering::Release);
+        self.additional_host_thread_stop.store(true, Ordering::Release);
+        for handle in &self.host_threads {
+            handle.thread().unpark();
+        }
         self.signal_guest_wakeup();
     }
 
@@ -665,5 +735,17 @@ mod tests {
 
         assert!(manager.stop_requested_for_test());
         assert!(manager.wakeup_event.is_signaled());
+    }
+
+    #[test]
+    fn start_additional_host_threads_records_pending_threads() {
+        let mut manager = ServerManager::new(SystemRef::null());
+
+        manager.start_additional_host_threads("bsdsocket", 2);
+
+        assert_eq!(
+            manager.pending_additional_host_threads,
+            vec![("bsdsocket".to_string(), 2)]
+        );
     }
 }

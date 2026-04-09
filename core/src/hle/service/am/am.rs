@@ -45,7 +45,7 @@ pub fn loop_process(service_manager: &Arc<Mutex<ServiceManager>>, system: crate:
     let system_for_thread = system;
     if !system.is_null() {
         let kernel = system.get().kernel().expect("kernel must exist for AM");
-        kernel.run_on_host_core_process("am:SetWindowSystem", Box::new(move || {
+        let _ = kernel.run_on_host_core_process("am:SetWindowSystem", Box::new(move || {
             system_for_thread
                 .get()
                 .get_applet_manager()

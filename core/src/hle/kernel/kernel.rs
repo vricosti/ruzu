@@ -469,6 +469,10 @@ pub struct KernelCore {
     /// Guest service processes created by `RunOnGuestCoreProcess`.
     /// Upstream keeps them alive after `KProcess::Register(*this, process)`.
     service_processes: Mutex<Vec<Arc<Mutex<KProcess>>>>,
+
+    /// Host service processes created by `RunOnHostCoreProcess`.
+    /// Upstream keeps them alive after `KProcess::Register(*this, process)` too.
+    host_service_processes: Mutex<Vec<Arc<Mutex<KProcess>>>>,
 }
 
 // KProcess initial ID constants (matching upstream).
@@ -516,6 +520,7 @@ impl KernelCore {
             preemption_event: None,
             server_managers: Mutex::new(Vec::new()),
             service_processes: Mutex::new(Vec::new()),
+            host_service_processes: Mutex::new(Vec::new()),
         }
     }
 
@@ -683,26 +688,28 @@ impl KernelCore {
 
     /// Run a service function on a host thread with a dummy KThread for tracking.
     ///
-    /// Port of upstream `KernelCore::RunOnHostCoreProcess` (kernel.cpp:1077-1094).
-    /// Spawns an OS thread that runs the function. Used for CPU-intensive services
-    /// (audio, filesystem, etc.) that benefit from running on host hardware.
-    pub fn run_on_host_core_process(&self, name: &str, func: Box<dyn FnOnce() + Send>) {
-        let thread_name = format!("HLE:{}", name);
+    /// Shared helper for spawning a host OS thread with a dummy KThread.
+    ///
+    /// Port of upstream `RunHostThreadFunc(kernel, process, thread_name, func)`
+    /// (kernel.cpp:1044-1075).
+    ///
+    /// Creates a dummy KThread owned by `process`, registers it, then spawns
+    /// a host thread that sets the dummy as the current emulation thread and
+    /// runs `func`.
+    fn run_host_thread_func(
+        &self,
+        process: &Arc<Mutex<KProcess>>,
+        thread_name: String,
+        func: Box<dyn FnOnce() + Send>,
+    ) -> std::thread::JoinHandle<()> {
         let kernel_ptr = self as *const KernelCore as usize;
-        let process = Arc::new(Mutex::new(KProcess::new()));
-        {
-            let mut process_guard = process.lock().unwrap();
-            let rc = process_guard.initialize(&[], 0, 0, 0, 0, 0, None, false);
-            assert_eq!(rc, crate::hle::result::RESULT_SUCCESS.get_inner_value());
-            process_guard.bind_self_reference(&process);
-        }
 
         let thread = Arc::new(Mutex::new(KThread::new()));
         {
             let thread_id = self.create_new_thread_id();
             let object_id = self.create_new_object_id() as u64;
             let mut thread_guard = thread.lock().unwrap();
-            let rc = thread_guard.initialize_dummy_thread(Some(&process), thread_id, object_id);
+            let rc = thread_guard.initialize_dummy_thread(Some(process), thread_id, object_id);
             assert_eq!(rc, crate::hle::result::RESULT_SUCCESS.get_inner_value());
             thread_guard.bind_self_reference(&thread);
         }
@@ -723,7 +730,50 @@ impl KernelCore {
                     log::info!("Host service thread '{}' exited", thread_name);
                 }
             })
-            .expect("Failed to spawn host service thread");
+            .expect("Failed to spawn host service thread")
+    }
+
+    /// Port of upstream `KernelCore::RunOnHostCoreProcess` (kernel.cpp:1077-1094).
+    ///
+    /// Creates a new KProcess, then delegates to `run_host_thread_func`.
+    /// Used for CPU-intensive services (audio, filesystem, etc.) that benefit
+    /// from running on host hardware.
+    pub fn run_on_host_core_process(
+        &self,
+        name: &str,
+        func: Box<dyn FnOnce() + Send>,
+    ) -> std::thread::JoinHandle<()> {
+        let process = Arc::new(Mutex::new(KProcess::new()));
+        {
+            let mut process_guard = process.lock().unwrap();
+            let rc = process_guard.initialize(&[], 0, 0, 0, 0, 0, None, false);
+            assert_eq!(rc, crate::hle::result::RESULT_SUCCESS.get_inner_value());
+            process_guard.bind_self_reference(&process);
+        }
+
+        self.host_service_processes
+            .lock()
+            .unwrap()
+            .push(Arc::clone(&process));
+
+        self.run_host_thread_func(&process, format!("HLE:{}", name), func)
+    }
+
+    /// Port of upstream `KernelCore::RunOnHostCoreThread` (kernel.cpp:1096-1103).
+    ///
+    /// Reuses the current emulation thread's process, then delegates to
+    /// `run_host_thread_func`. Used by `ServerManager::start_additional_host_threads`.
+    pub fn run_on_host_core_thread(
+        &self,
+        name: &str,
+        func: Box<dyn FnOnce() + Send>,
+    ) -> std::thread::JoinHandle<()> {
+        let process = self
+            .get_current_emu_thread()
+            .and_then(|t| t.lock().unwrap().parent.as_ref().and_then(Weak::upgrade))
+            .expect("run_on_host_core_thread: no current process");
+
+        self.run_host_thread_func(&process, name.to_string(), func)
     }
 
     /// Wire the hardware timer to CoreTiming.
@@ -820,6 +870,7 @@ impl KernelCore {
         self.main_threads.clear();
         self.idle_threads.clear();
         self.service_processes.lock().unwrap().clear();
+        self.host_service_processes.lock().unwrap().clear();
 
         if let Some(ref container) = self.global_object_list_container {
             container.finalize();
@@ -860,6 +911,10 @@ impl KernelCore {
             }
             managers.push(Arc::clone(&manager));
         }
+
+        crate::hle::service::server_manager::ServerManager::activate_additional_host_threads(
+            &manager,
+        );
 
         manager.lock().unwrap().loop_process();
     }
@@ -928,6 +983,14 @@ impl KernelCore {
             .iter()
             .find(|process| process.lock().unwrap().get_process_id() == process_id)
             .cloned()
+            .or_else(|| {
+                self.host_service_processes
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .find(|process| process.lock().unwrap().get_process_id() == process_id)
+                    .cloned()
+            })
     }
 
     /// Rust helper for event owner lookup via the kernel process list.
@@ -948,6 +1011,18 @@ impl KernelCore {
                 process_guard
                     .get_event_by_object_id(event_object_id)
                     .map(|_| process_guard.get_process_id())
+            })
+            .or_else(|| {
+                self.host_service_processes
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .find_map(|process| {
+                        let process_guard = process.lock().unwrap();
+                        process_guard
+                            .get_event_by_object_id(event_object_id)
+                            .map(|_| process_guard.get_process_id())
+                    })
             })
     }
 
