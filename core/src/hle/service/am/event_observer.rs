@@ -48,7 +48,10 @@ impl EventObserver {
     /// Creates the event observer and starts the background processing thread.
     /// The WindowSystem pointer must remain valid for the lifetime of this
     /// EventObserver (matching upstream lifetime contract).
-    pub fn new(window_system: *const WindowSystem) -> Self {
+    pub fn new(
+        window_system: *const WindowSystem,
+        on_thread_start: Option<Box<dyn FnOnce() + Send>>,
+    ) -> Self {
         let wakeup_event = Arc::new(Event::new());
         let mut observer_state = ObserverState {
             process_holder_list: Vec::new(),
@@ -75,6 +78,9 @@ impl EventObserver {
         let thread = std::thread::Builder::new()
             .name("am:EventObserver".into())
             .spawn(move || {
+                if let Some(init_fn) = on_thread_start {
+                    init_fn();
+                }
                 Self::thread_func(shared_clone);
             })
             .expect("Failed to spawn EventObserver thread");

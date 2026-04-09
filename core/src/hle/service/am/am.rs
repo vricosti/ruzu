@@ -24,43 +24,27 @@ use super::window_system::WindowSystem;
 pub fn loop_process(service_manager: &Arc<Mutex<ServiceManager>>, system: crate::core::SystemRef) {
     let mut server_manager = ServerManager::new(system);
 
-    // Create a shared WindowSystem, matching upstream which creates it on the stack
-    // and passes references to both appletOE and appletAE.
+    // Create a shared WindowSystem, matching upstream ownership in window_system.cpp
+    // as closely as possible while preserving Rust Arc ownership.
     let window_system = Arc::new(Mutex::new(WindowSystem::new()));
     let window_system_ptr = {
         let mut guard = window_system.lock().unwrap();
         &mut *guard as *mut WindowSystem
     };
-    let event_observer = Box::new(EventObserver::new(window_system_ptr as *const WindowSystem));
+    let ws_for_event_thread = window_system.clone();
+    let system_for_event_thread = system;
+    let event_observer = Box::new(EventObserver::new(
+        window_system_ptr as *const WindowSystem,
+        Some(Box::new(move || {
+            system_for_event_thread
+                .get()
+                .get_applet_manager()
+                .set_window_system(Some(ws_for_event_thread));
+        })),
+    ));
     {
         let mut guard = window_system.lock().unwrap();
         guard.set_event_observer(event_observer);
-    }
-    // Rust still cannot call `AppletManager::set_window_system(this)` literally
-    // from `WindowSystem::SetEventObserver()` because `WindowSystem` does not yet
-    // own the upstream `System&`. Run the waiter on a real kernel-managed host
-    // thread instead of a raw OS thread so later process/bootstrap work executes
-    // with valid kernel host-thread registration.
-    let ws_for_thread = window_system.clone();
-    let system_for_thread = system;
-    if !system.is_null() {
-        let kernel = system.get().kernel().expect("kernel must exist for AM");
-        let _ = kernel.run_on_host_core_process("am:SetWindowSystem", Box::new(move || {
-            system_for_thread
-                .get()
-                .get_applet_manager()
-                .set_window_system(Some(ws_for_thread));
-        }));
-    } else {
-        std::thread::Builder::new()
-            .name("am:SetWindowSystem".to_string())
-            .spawn(move || {
-                system_for_thread
-                    .get()
-                    .get_applet_manager()
-                    .set_window_system(Some(ws_for_thread));
-            })
-            .expect("failed to spawn am:SetWindowSystem thread");
     }
 
     let ws = window_system.clone();

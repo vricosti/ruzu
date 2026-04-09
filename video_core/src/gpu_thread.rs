@@ -13,6 +13,7 @@ use std::thread::JoinHandle;
 
 use crate::control::scheduler::Scheduler;
 use crate::dma_pusher::CommandList;
+use ruzu_core::core::SystemRef;
 
 /// Device address type.
 pub type DAddr = u64;
@@ -140,6 +141,8 @@ impl SynchState {
 ///
 /// Matches upstream `VideoCommon::GPUThread::ThreadManager`.
 pub struct ThreadManager {
+    /// Upstream owner: `Core::System& system`.
+    system: SystemRef,
     is_async: bool,
     state: Arc<SynchState>,
     stop: Arc<AtomicBool>,
@@ -158,14 +161,19 @@ unsafe impl Send for ThreadManager {}
 impl ThreadManager {
     /// Creates a new thread manager.
     /// Matches upstream `ThreadManager::ThreadManager(Core::System&, bool)`.
-    pub fn new(is_async: bool) -> Self {
+    pub fn new(system: SystemRef, is_async: bool) -> Self {
         Self {
+            system,
             is_async,
             state: Arc::new(SynchState::new()),
             stop: Arc::new(AtomicBool::new(false)),
             thread: None,
             rasterizer_raw: [0, 0],
         }
+    }
+
+    pub fn set_system_ref(&mut self, system: SystemRef) {
+        self.system = system;
     }
 
     /// Get the rasterizer pointer, or None if not set.
@@ -199,6 +207,7 @@ impl ThreadManager {
 
         let state = self.state.clone();
         let stop = self.stop.clone();
+        let system = self.system;
         let gpu = gpu_ptr as usize;
         let sched = scheduler_ptr as usize;
         // Copy rasterizer fat pointer for the thread.
@@ -213,6 +222,7 @@ impl ThreadManager {
             .name("GPU".to_string())
             .spawn(move || {
                 log::info!("GPU thread started");
+                system.get().kernel().unwrap().register_host_thread();
                 let gpu_ref = unsafe { &*(gpu as *const crate::gpu::Gpu) };
                 let scheduler_ref = unsafe { &*(sched as *const Scheduler) };
 

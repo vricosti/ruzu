@@ -7003,6 +7003,7 @@
 
 ### Unintentional differences (to fix)
 - Fixed in this pass: Rust now has the same helper layering as upstream for host dummy-thread bootstrap: `run_on_host_core_process(...)` creates a process then delegates to `run_host_thread_func(...)`, while `run_on_host_core_thread(...)` reuses the current process and delegates to the same helper.
+- Fixed in this pass: `KernelCore::initialize()` now registers the current host thread through `register_host_thread()`, matching the upstream `RegisterHostThread(nullptr)` call at the end of kernel initialization.
 
 ### Missing items
 - Rust still does not mirror the full upstream `KScopedResourceReservation thread_reservation(process, ThreadCountMax)` path before creating host dummy threads.
@@ -7034,6 +7035,78 @@
 
 ### Missing items
 - Re-audit thread-count parity before the game thread after this `bsdsocket +2` gap is closed, to determine which remaining missing thread IDs come from other owners.
+
+### Binary layout verification
+- PASS: service bootstrap wiring only; no raw serialized struct layout changed.
+
+## 2026-04-09 — `core/src/core.rs` vs `src/core/core.cpp`
+
+### Intentional differences
+- Rust still flattens upstream `System::Impl` into `System`, so the `core_timing.Initialize([&system] { ... })` callback wiring lives in `core.rs` field initialization rather than inside a separate pimpl object.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `System::initialize()` no longer installs a placeholder `CoreTiming` thread-init callback. It now registers the timer thread through `kernel.register_host_thread()`, matching upstream `core.cpp` host-thread registration behavior.
+
+### Missing items
+- Re-audit the remaining `System::Impl` flattening differences in `core.rs`, especially owner boundaries that still span multiple upstream files.
+
+### Binary layout verification
+- PASS: callback wiring only; no raw serialized struct layout changed.
+
+## 2026-04-09 — `video_core/src/gpu_thread.rs` vs `src/video_core/gpu_thread.cpp`
+
+### Intentional differences
+- Rust stores upstream `Core::System& system` as `SystemRef` inside `ThreadManager`, and updates it later through `set_system_ref(...)` because `Gpu`/`ThreadManager` are constructed before the final `SystemRef` is available. This preserves owner placement in `gpu_thread.rs` while adapting to Rust construction order.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: the GPU worker thread now registers itself with the kernel via `register_host_thread()` at thread entry, matching upstream `gpu_thread.cpp` `system.RegisterHostThread()`.
+- Fixed in this pass: `ThreadManager` now owns the upstream `system` dependency explicitly instead of relying on only raw GPU/scheduler pointers.
+
+### Missing items
+- Re-audit `gpu_thread.rs` against upstream for the remaining lifecycle details around thread shutdown and priority naming.
+
+### Binary layout verification
+- PASS: thread bootstrap wiring only; no raw serialized struct layout changed.
+
+## 2026-04-09 — `core/src/hle/service/am/window_system.rs` vs `src/core/hle/service/am/window_system.cpp`
+
+### Intentional differences
+- Rust still stores only the observer owner in `WindowSystem`, without upstream `Core::System& m_system`, because the current Rust AM bootstrap passes the `WindowSystem` through `Arc<Mutex<...>>` and still routes the blocking `set_window_system(...)` wait on the already-existing `EventObserver` thread.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: the Rust-only extra host thread `am:SetWindowSystem` is gone; `WindowSystem` is no longer wired through a separate kernel-managed host process just to notify `AppletManager`.
+
+### Missing items
+- Full literal parity is still incomplete: upstream calls `AppletManager::SetWindowSystem(this)` directly inside `WindowSystem::SetEventObserver()`, while Rust currently performs the same blocking wait on the pre-existing `EventObserver` thread to avoid deadlocking AM service registration.
+
+### Binary layout verification
+- PASS: service owner wiring only; no raw serialized struct layout changed.
+
+## 2026-04-09 — `core/src/hle/service/am/am.rs` vs `src/core/hle/service/am/am.cpp`
+
+### Intentional differences
+- Rust still does not port upstream `ButtonPoller` ownership in this file. That broader AM bootstrap gap predates this slice.
+- Rust routes the blocking `AppletManager::set_window_system(...)` call through the already-existing `EventObserver` thread instead of calling it synchronously during `AM::loop_process(...)`. This is a temporary bootstrap-order adaptation to avoid reintroducing the extra `am:SetWindowSystem` host thread.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `AM::loop_process(...)` no longer spawns the Rust-only host thread `am:SetWindowSystem`.
+
+### Missing items
+- Port the remaining upstream `ButtonPoller` owner into the AM bootstrap path.
+
+## 2026-04-09 — `core/src/hle/service/am/event_observer.rs` vs `src/core/hle/service/am/event_observer.cpp`
+
+### Intentional differences
+- Rust accepts an additional thread-start callback in `EventObserver::new(...)` so the existing observer thread can perform the temporary `set_window_system(...)` bootstrap wait without introducing another host `KThread`. This is a bounded AM bootstrap adaptation, not upstream structure.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: the pre-existing `EventObserver` thread now carries the temporary `set_window_system(...)` bootstrap wait, removing the extra Rust-only `am:SetWindowSystem` thread owner.
+
+### Missing items
+- Remove the Rust-only thread-start callback once `WindowSystem::SetEventObserver()` can call `AppletManager::SetWindowSystem(this)` synchronously without deadlocking service registration.
+
+### Binary layout verification
+- PASS: AM bootstrap threading only; no raw serialized struct layout changed.
 
 ### Binary layout verification
 - PASS: service bootstrap wiring only; no raw serialized struct layout changed.

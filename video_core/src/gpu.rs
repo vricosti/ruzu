@@ -182,7 +182,7 @@ impl Gpu {
             renderer: Mutex::new(None),
             rasterizer: Mutex::new(None),
             scheduler: Mutex::new(None),
-            gpu_thread: Mutex::new(crate::gpu_thread::ThreadManager::new(is_async)),
+            gpu_thread: Mutex::new(crate::gpu_thread::ThreadManager::new(SystemRef::null(), is_async)),
             channels: Mutex::new(HashMap::new()),
             guest_memory_reader: Mutex::new(None),
             guest_memory_writer: Mutex::new(None),
@@ -192,6 +192,7 @@ impl Gpu {
 
     pub fn set_system_ref(&self, system: SystemRef) {
         *self.system.lock().unwrap() = system;
+        self.gpu_thread.lock().unwrap().set_system_ref(system);
     }
 
     /// Initialize the scheduler. Must be called after Gpu is placed at its
