@@ -186,5 +186,7 @@ pub fn loop_process(system: crate::core::SystemRef) {
         );
     }
 
+    server_manager.start_additional_host_threads("bsdsocket", 2);
+
     ServerManager::run_server(server_manager);
 }
