@@ -6,9 +6,14 @@
 //!
 //! The Conductor manages vsync timing and display composition.
 //! It maintains a VsyncManager per display and drives the composition loop.
+//!
+//! In multicore mode, the CoreTiming callback signals a thread event and a
+//! dedicated VsyncThread calls process_vsync(). In single-core mode, the
+//! callback directly calls process_vsync().
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 use crate::core::SystemRef;
@@ -20,6 +25,70 @@ use super::vsync_manager::VsyncManager;
 
 /// Frame interval in nanoseconds (60 FPS).
 pub const FRAME_NS: i64 = 1_000_000_000 / 60;
+
+/// Thread-safe event primitive matching upstream `Common::Event`.
+/// Uses a condvar + bool: Set() signals, Wait() blocks until signaled then auto-resets.
+struct ThreadEvent {
+    mutex: Mutex<bool>,
+    condvar: Condvar,
+}
+
+impl ThreadEvent {
+    fn new() -> Self {
+        Self {
+            mutex: Mutex::new(false),
+            condvar: Condvar::new(),
+        }
+    }
+
+    fn set(&self) {
+        let mut signaled = self.mutex.lock().unwrap();
+        if !*signaled {
+            *signaled = true;
+            self.condvar.notify_one();
+        }
+    }
+
+    fn wait(&self) {
+        let mut signaled = self.mutex.lock().unwrap();
+        while !*signaled {
+            signaled = self.condvar.wait(signaled).unwrap();
+        }
+        *signaled = false;
+    }
+}
+
+/// Shared state between the CoreTiming callback and the Conductor,
+/// so the callback can compute GetNextTicks without locking the full Conductor.
+struct SharedTickState {
+    swap_interval: std::sync::atomic::AtomicI32,
+    // compose_speed_scale stored as bits for atomic access
+    compose_speed_scale_bits: std::sync::atomic::AtomicU32,
+}
+
+impl SharedTickState {
+    fn new() -> Self {
+        Self {
+            swap_interval: std::sync::atomic::AtomicI32::new(1),
+            compose_speed_scale_bits: std::sync::atomic::AtomicU32::new(1.0f32.to_bits()),
+        }
+    }
+
+    fn update(&self, swap_interval: i32, compose_speed_scale: f32) {
+        self.swap_interval.store(swap_interval, Ordering::Relaxed);
+        self.compose_speed_scale_bits
+            .store(compose_speed_scale.to_bits(), Ordering::Relaxed);
+    }
+
+    fn get_next_ticks(&self) -> i64 {
+        let compose_speed_scale =
+            f32::from_bits(self.compose_speed_scale_bits.load(Ordering::Relaxed));
+        let swap_interval = self.swap_interval.load(Ordering::Relaxed);
+        let speed_scale = 1.0f32 / compose_speed_scale;
+        let effective_fps = 60.0f32 / swap_interval as f32;
+        (speed_scale * (1_000_000_000.0f32 / effective_fps)) as i64
+    }
+}
 
 /// Conductor drives display composition and vsync signaling.
 ///
@@ -38,6 +107,14 @@ pub struct Conductor {
     /// indirection to avoid circular references.
     surface_flinger: Arc<SurfaceFlinger>,
     event: Option<Arc<parking_lot::Mutex<core_timing::EventType>>>,
+    /// Shared tick state for the CoreTiming callback to compute GetNextTicks.
+    tick_state: Arc<SharedTickState>,
+    /// VsyncThread handle (multicore mode only).
+    vsync_thread: Option<std::thread::JoinHandle<()>>,
+    /// Signal for waking the VsyncThread (multicore mode only).
+    vsync_signal: Option<Arc<ThreadEvent>>,
+    /// Stop flag for the VsyncThread (multicore mode only).
+    stop_requested: Option<Arc<AtomicBool>>,
 }
 
 impl Conductor {
@@ -54,6 +131,10 @@ impl Conductor {
             system,
             surface_flinger,
             event: None,
+            tick_state: Arc::new(SharedTickState::new()),
+            vsync_thread: None,
+            vsync_signal: None,
+            stop_requested: None,
         }
     }
 
@@ -63,29 +144,113 @@ impl Conductor {
     /// Upstream does this in the constructor, but we split it because the
     /// CoreTiming callback needs a weak reference back to the Conductor.
     pub fn start(conductor: &Arc<Mutex<Self>>) {
-        let weak = Arc::downgrade(conductor);
-        let event = core_timing::create_event(
-            "ScreenComposition".to_string(),
-            Box::new(move |_time, _ns_late| {
-                if let Some(conductor) = weak.upgrade() {
-                    conductor.lock().unwrap().process_vsync();
-                }
-                // Reschedule at the next tick interval.
-                // Upstream returns GetNextTicks() but we use a fixed 60fps for now.
-                Some(Duration::from_nanos(FRAME_NS as u64))
-            }),
-        );
+        let is_multicore = conductor.lock().unwrap().system.get().is_multicore();
 
-        let system = conductor.lock().unwrap().system;
-        let core_timing = system.get().core_timing();
-        let frame_dur = Duration::from_nanos(FRAME_NS as u64);
-        core_timing
-            .lock()
-            .unwrap()
-            .schedule_looping_event(frame_dur, frame_dur, &event, false);
+        if is_multicore {
+            // Multicore mode: CoreTiming callback signals the thread event,
+            // a dedicated VsyncThread wakes and calls process_vsync().
+            let signal = Arc::new(ThreadEvent::new());
+            let stop = Arc::new(AtomicBool::new(false));
 
-        conductor.lock().unwrap().event = Some(event);
-        log::info!("Conductor: vsync timer started at {}ns interval", FRAME_NS);
+            // Create the CoreTiming event that just signals the thread event.
+            let signal_for_callback = Arc::clone(&signal);
+            let tick_state = Arc::clone(&conductor.lock().unwrap().tick_state);
+            let event = core_timing::create_event(
+                "ScreenComposition".to_string(),
+                Box::new(move |_time, _ns_late| {
+                    signal_for_callback.set();
+                    let next_ns = tick_state.get_next_ticks();
+                    Some(Duration::from_nanos(next_ns as u64))
+                }),
+            );
+
+            let system = conductor.lock().unwrap().system;
+            let core_timing = system.get().core_timing();
+            let frame_dur = Duration::from_nanos(FRAME_NS as u64);
+            core_timing
+                .lock()
+                .unwrap()
+                .schedule_looping_event(frame_dur, frame_dur, &event, false);
+
+            // Spawn the VsyncThread.
+            let signal_for_thread = Arc::clone(&signal);
+            let stop_for_thread = Arc::clone(&stop);
+            let conductor_weak = Arc::downgrade(conductor);
+            let system_for_thread = system;
+            let thread = std::thread::Builder::new()
+                .name("VSyncThread".to_string())
+                .spawn(move || {
+                    Self::vsync_thread(
+                        signal_for_thread,
+                        stop_for_thread,
+                        conductor_weak,
+                        system_for_thread,
+                    );
+                })
+                .expect("Failed to spawn VSyncThread");
+
+            let mut cond = conductor.lock().unwrap();
+            cond.event = Some(event);
+            cond.vsync_thread = Some(thread);
+            cond.vsync_signal = Some(signal);
+            cond.stop_requested = Some(stop);
+            log::info!(
+                "Conductor: vsync timer started at {}ns interval (multicore, VsyncThread)",
+                FRAME_NS
+            );
+        } else {
+            // Single-core mode: CoreTiming callback directly calls process_vsync().
+            let weak = Arc::downgrade(conductor);
+            let tick_state = Arc::clone(&conductor.lock().unwrap().tick_state);
+            let event = core_timing::create_event(
+                "ScreenComposition".to_string(),
+                Box::new(move |_time, _ns_late| {
+                    if let Some(conductor) = weak.upgrade() {
+                        conductor.lock().unwrap().process_vsync();
+                    }
+                    let next_ns = tick_state.get_next_ticks();
+                    Some(Duration::from_nanos(next_ns as u64))
+                }),
+            );
+
+            let system = conductor.lock().unwrap().system;
+            let core_timing = system.get().core_timing();
+            let frame_dur = Duration::from_nanos(FRAME_NS as u64);
+            core_timing
+                .lock()
+                .unwrap()
+                .schedule_looping_event(frame_dur, frame_dur, &event, false);
+
+            conductor.lock().unwrap().event = Some(event);
+            log::info!(
+                "Conductor: vsync timer started at {}ns interval (single-core)",
+                FRAME_NS
+            );
+        }
+    }
+
+    /// VsyncThread entry point. Waits on the signal and calls process_vsync().
+    /// Port of upstream `Conductor::VsyncThread(std::stop_token token)`.
+    fn vsync_thread(
+        signal: Arc<ThreadEvent>,
+        stop: Arc<AtomicBool>,
+        conductor: std::sync::Weak<Mutex<Self>>,
+        system: SystemRef,
+    ) {
+        while !stop.load(Ordering::Relaxed) {
+            signal.wait();
+
+            if system.get().is_shutting_down() {
+                return;
+            }
+
+            if let Some(conductor) = conductor.upgrade() {
+                conductor.lock().unwrap().process_vsync();
+            } else {
+                // Conductor was dropped, exit.
+                return;
+            }
+        }
     }
 
     pub fn link_vsync_event(&mut self, display_id: u64, event: Arc<Event>) {
@@ -112,6 +277,9 @@ impl Conductor {
             );
             manager.signal_vsync();
         }
+        // Update shared tick state so the CoreTiming callback uses current values.
+        self.tick_state
+            .update(self.swap_interval, self.compose_speed_scale);
     }
 
     /// Calculate the next tick interval in nanoseconds.
@@ -132,7 +300,19 @@ impl Drop for Conductor {
                 .lock()
                 .unwrap()
                 .unschedule_event(event, core_timing::UnscheduleEventType::NoWait);
-            log::info!("Conductor: vsync timer stopped");
         }
+
+        // Stop the VsyncThread if running (multicore mode).
+        if let Some(ref stop) = self.stop_requested {
+            stop.store(true, Ordering::Relaxed);
+        }
+        if let Some(ref signal) = self.vsync_signal {
+            signal.set(); // Wake the thread so it sees the stop flag.
+        }
+        if let Some(thread) = self.vsync_thread.take() {
+            let _ = thread.join();
+        }
+
+        log::info!("Conductor: vsync timer stopped");
     }
 }
