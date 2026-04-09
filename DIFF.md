@@ -6990,6 +6990,7 @@
 ### Unintentional differences (to fix)
 - Fixed in this pass: Rust now has a dedicated `initialize_high_priority_thread(...)` owner matching upstream `KThread::InitializeHighPriorityThread(...)`, instead of reusing `initialize_kernel_main_thread(...)` and patching `thread_type` afterward.
 - Fixed in this pass: shutdown-thread initialization now installs `ThreadType::HighPriority`, `priority/base_priority = 0`, and `ThreadState::INITIALIZED`, matching the upstream `InitializeThread(..., ThreadType::HighPriority, ...)` contract more closely.
+- Fixed in this pass: `notify_available(...)`, `end_wait(...)`, and `cancel_wait(...)` now acquire the scheduler lock in the owner file before touching wait state, matching upstream `KThread::NotifyAvailable`, `EndWait`, and `CancelWait` ordering and removing a race where Rust could observe `state=Waiting` with a cleared `wait_queue`.
 
 ### Missing items
 - Fixed in this pass: the ownerless kernel-thread call sites now share a single owner-local helper in `k_thread.rs`, which is closer to the upstream `InitializeThread(...)` boundary for `InitializeMainThread`, `InitializeIdleThread`, and `InitializeHighPriorityThread`.

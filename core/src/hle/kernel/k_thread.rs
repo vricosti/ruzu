@@ -2826,12 +2826,23 @@ impl KThread {
         self.wait_queue = None;
     }
 
+    fn lock_scheduler(&self) -> Option<KScopedSchedulerLock<'static>> {
+        if self.scheduler_lock_ptr == 0 {
+            None
+        } else {
+            Some(KScopedSchedulerLock::new(unsafe {
+                &*(self.scheduler_lock_ptr as *const super::k_scheduler_lock::KAbstractSchedulerLock)
+            }))
+        }
+    }
+
     pub fn notify_available(
         &mut self,
         process: &mut KProcess,
         signaled_object_id: u64,
         result: u32,
     ) -> bool {
+        let _scheduler_lock = self.lock_scheduler();
         let Some(wait_queue) = self.wait_queue.clone() else {
             return false;
         };
@@ -2842,6 +2853,7 @@ impl KThread {
     /// End wait with a result.
     /// Matches upstream `KThread::EndWait()`.
     pub fn end_wait(&mut self, _wait_result: u32) {
+        let _scheduler_lock = self.lock_scheduler();
         self.sleep_deadline = None;
         self.waiting_lock_info = None;
         self.clear_wait_synchronization();
@@ -2860,6 +2872,7 @@ impl KThread {
     /// Cancel wait.
     /// Matches upstream `KThread::CancelWait()`.
     pub fn cancel_wait(&mut self, _wait_result: u32, _cancel_timer_task: bool) {
+        let _scheduler_lock = self.lock_scheduler();
         self.sleep_deadline = None;
         self.waiting_lock_info = None;
         self.clear_wait_synchronization();
@@ -3909,5 +3922,22 @@ mod tests {
         assert_eq!(thread.get_state(), ThreadState::INITIALIZED);
         assert!(thread.parent.is_none());
         assert!(thread.get_host_context().is_some());
+    }
+
+    #[test]
+    fn end_wait_recursively_acquires_scheduler_lock() {
+        let scheduler_lock = super::k_scheduler_lock::KAbstractSchedulerLock::new();
+        let mut thread = KThread::new();
+        thread.scheduler_lock_ptr = (&scheduler_lock
+            as *const super::k_scheduler_lock::KAbstractSchedulerLock)
+            as usize;
+        thread.begin_wait();
+
+        let _outer = KScopedSchedulerLock::new(&scheduler_lock);
+        thread.end_wait(RESULT_SUCCESS.get_inner_value());
+
+        assert_eq!(thread.get_state(), ThreadState::RUNNABLE);
+        assert!(!thread.has_wait_queue());
+        assert_eq!(thread.get_wait_result(), RESULT_SUCCESS.get_inner_value());
     }
 }
