@@ -323,6 +323,29 @@ impl CpuManager {
         }
     }
 
+    /// Shutdown thread function entry point.
+    ///
+    /// Upstream: `CpuManager::ShutdownThreadFunction()` (cpu_manager.cpp:58-60).
+    /// Calls `ShutdownThread()`. Used as the fiber entry for shutdown threads
+    /// created by `InitializeShutdownThreads()`.
+    pub fn shutdown_thread_function(kernel: &KernelCore) {
+        let system_ref = kernel.system();
+        if system_ref.is_null() {
+            return;
+        }
+        let system = system_ref.get();
+        let core = if system.cpu_manager.is_multicore() {
+            kernel.current_physical_core_index()
+        } else {
+            0
+        };
+        let host_context = system
+            .cpu_manager
+            .core_host_context(core)
+            .expect("core host context must exist during shutdown");
+        Self::shutdown_thread(kernel, &host_context, system.cpu_manager.is_multicore());
+    }
+
     /// Shutdown thread function.
     ///
     /// Upstream: `CpuManager::ShutdownThread()` (cpu_manager.cpp:177-184).
