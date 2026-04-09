@@ -4,7 +4,12 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
 
+use crate::file_sys::nca_metadata::ContentRecordType;
+use crate::file_sys::patch_manager::PatchManager;
+use crate::file_sys::registered_cache::ContentProviderUnion;
+use crate::file_sys::romfs_factory::StorageId;
 use crate::file_sys::errors::RESULT_TARGET_NOT_FOUND;
 use crate::file_sys::fs_save_data_types::{SaveDataAttribute, SaveDataSpaceId};
 use crate::file_sys::vfs::vfs_types::VirtualDir;
@@ -135,6 +140,8 @@ pub enum AccessLogMode {
 pub struct FspSrv {
     /// Upstream: `FileSystemController& fsc`.
     fsc: Option<Arc<std::sync::Mutex<super::super::filesystem::FileSystemController>>>,
+    /// Upstream: `FileSys::ContentProviderUnion& content_provider`.
+    content_provider: Option<Arc<StdMutex<ContentProviderUnion>>>,
     current_process_id: std::sync::Mutex<u64>,
     access_log_program_index: std::sync::Mutex<u32>,
     access_log_mode: std::sync::Mutex<AccessLogMode>,
@@ -171,6 +178,7 @@ impl FspSrv {
     pub fn new() -> Self {
         Self {
             fsc: None,
+            content_provider: None,
             current_process_id: std::sync::Mutex::new(0),
             access_log_program_index: std::sync::Mutex::new(0),
             access_log_mode: std::sync::Mutex::new(AccessLogMode::None),
@@ -229,13 +237,19 @@ impl FspSrv {
         }
     }
 
-    /// Create an FspSrv with a reference to the FileSystemController.
-    /// Matches upstream `FSP_SRV(Core::System& system_)` constructor.
-    pub fn new_with_fsc(
+    /// Create an FspSrv with the upstream constructor-owned filesystem and
+    /// content provider references.
+    pub fn new_with_system(
+        system: crate::core::SystemRef,
         fsc: Arc<std::sync::Mutex<super::super::filesystem::FileSystemController>>,
     ) -> Self {
         let mut srv = Self::new();
         srv.fsc = Some(fsc);
+        srv.content_provider = if system.is_null() {
+            None
+        } else {
+            system.get().get_content_provider().cloned()
+        };
         srv
     }
 
@@ -443,19 +457,58 @@ impl FspSrv {
     /// Opens a system data archive by title ID. Tries to synthesize
     /// known system archives (MiiModel, NgWord, SharedFont, etc.).
     fn open_data_storage_by_data_id_handler(
-        _this: &dyn ServiceFramework,
+        this: &dyn ServiceFramework,
         ctx: &mut HLERequestContext,
     ) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const FspSrv) };
         let mut rp = RequestParser::new(ctx);
         let storage_id = rp.pop_raw::<u8>();
         let _unknown = rp.pop_raw::<u32>();
         let title_id = rp.pop_raw::<u64>();
 
+        let storage_id = match storage_id {
+            0 => StorageId::None,
+            1 => StorageId::Host,
+            2 => StorageId::GameCard,
+            3 => StorageId::NandSystem,
+            4 => StorageId::NandUser,
+            5 => StorageId::SdCard,
+            other => {
+                log::error!(
+                    "FspSrv::OpenDataStorageByDataId: invalid storage_id={}",
+                    other
+                );
+                Self::push_error_with_null_interface(ctx, u32::MAX);
+                return;
+            }
+        };
+
         log::info!(
             "FspSrv::OpenDataStorageByDataId called, storage_id={}, title_id={:#x}",
-            storage_id,
+            storage_id as u8,
             title_id
         );
+
+        let data = service
+            .romfs_controller
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|controller| controller.open_romfs(title_id, storage_id, ContentRecordType::Data));
+
+        if let Some(data) = data {
+            let storage = match (service.fsc.as_ref(), service.content_provider.as_ref()) {
+                (Some(fs_controller), Some(content_provider)) => {
+                    let fs_controller = fs_controller.lock().unwrap();
+                    let content_provider = content_provider.lock().unwrap();
+                    let patch_manager = PatchManager::new(title_id, &fs_controller, &*content_provider);
+                    patch_manager.patch_romfs(data, ContentRecordType::Data, None, true)
+                }
+                _ => data,
+            };
+            Self::push_interface_response(ctx, Arc::new(IStorage::new(storage)));
+            return;
+        }
 
         // Try synthesizing the system archive (matches upstream fallback path)
         if let Some(archive) = crate::file_sys::system_archive::system_archive::synthesize_system_archive(title_id) {

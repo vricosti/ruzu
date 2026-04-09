@@ -19,6 +19,7 @@ use crate::hle::kernel::k_process::SharedProcessMemory;
 use crate::hle::kernel::k_scheduler::KScheduler;
 use crate::hle::kernel::k_thread::KThread;
 use crate::hle::kernel::kernel::KernelCore;
+use crate::hle::service::apm::apm_controller::Controller as ApmController;
 use crate::hle::service::am::am_types::{AppletId, AppletType};
 use crate::hle::service::am::applet_manager::{
     AppletManager, FrontendAppletParameters, LaunchType,
@@ -233,6 +234,10 @@ pub struct System {
     /// Applet manager used to register frontend-launched applets with AM.
     applet_manager: AppletManager,
 
+    /// Shared APM controller state.
+    /// Upstream: `System::GetAPMController()`.
+    apm_controller: Arc<StdMutex<ApmController>>,
+
     /// Shared ARP manager for application launch/control properties.
     /// Upstream: `System::GetARPManager()`.
     arp_manager: Arc<StdMutex<ARPManager>>,
@@ -396,6 +401,7 @@ impl System {
             audio_core: None,
             service_manager: None,
             applet_manager: AppletManager::new(),
+            apm_controller: Arc::new(StdMutex::new(ApmController::new())),
             arp_manager: Arc::new(StdMutex::new(ARPManager::new())),
             filesystem_controller: Arc::new(StdMutex::new(
                 crate::hle::service::filesystem::filesystem::FileSystemController::new(),
@@ -1405,6 +1411,12 @@ impl System {
     /// Get the shared HLE service registry.
     pub fn service_manager(&self) -> Option<Arc<std::sync::Mutex<ServiceManager>>> {
         self.service_manager.clone()
+    }
+
+    /// Get the shared APM controller.
+    /// Upstream: `System::GetAPMController()`.
+    pub fn apm_controller(&self) -> Arc<StdMutex<ApmController>> {
+        self.apm_controller.clone()
     }
 
     pub fn get_applet_manager(&self) -> &AppletManager {

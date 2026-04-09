@@ -4,6 +4,7 @@
 
 use std::sync::Arc;
 
+use crate::file_sys::content_archive::NCA;
 use crate::file_sys::nca_metadata::ContentRecordType;
 use crate::file_sys::romfs_factory::RomFSFactory;
 use crate::file_sys::romfs_factory::StorageId;
@@ -57,8 +58,23 @@ impl RomFsController {
         )
     }
 
-    pub fn open_romfs(&self, title_id: u64) -> Option<VirtualFile> {
+    pub fn open_romfs(
+        &self,
+        title_id: u64,
+        storage_id: StorageId,
+        type_: ContentRecordType,
+    ) -> Option<VirtualFile> {
         let factory = self.factory.as_ref()?;
-        factory.open(title_id, StorageId::None, ContentRecordType::Program)
+        factory.open(title_id, storage_id, type_)
+    }
+
+    pub fn open_base_nca(
+        &self,
+        title_id: u64,
+        storage_id: StorageId,
+        type_: ContentRecordType,
+    ) -> Option<NCA> {
+        let factory = self.factory.as_ref()?;
+        factory.get_entry(title_id, storage_id, type_)
     }
 }

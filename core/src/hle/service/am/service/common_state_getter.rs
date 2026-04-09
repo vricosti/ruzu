@@ -4,6 +4,7 @@
 //! Port of zuyu/src/core/hle/service/am/service/common_state_getter.h
 //! Port of zuyu/src/core/hle/service/am/service/common_state_getter.cpp
 
+use crate::core::SystemRef;
 use crate::hle::service::am::am_types::{
     AppletId, AppletMessage, FocusState, OperationMode, SystemButtonType,
 };
@@ -72,6 +73,8 @@ use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFrame
 pub struct ICommonStateGetter {
     handlers: BTreeMap<u32, FunctionInfo>,
     handlers_tipc: BTreeMap<u32, FunctionInfo>,
+    /// Matches upstream `Core::System& system`.
+    system: SystemRef,
     /// Reference to the applet.
     /// Matches upstream `const std::shared_ptr<Applet> m_applet`.
     applet: Arc<Mutex<Applet>>,
@@ -80,7 +83,7 @@ pub struct ICommonStateGetter {
 impl ICommonStateGetter {
     /// Create with an applet reference, matching upstream constructor:
     /// `ICommonStateGetter(Core::System&, std::shared_ptr<Applet>)`
-    pub fn new(applet: Arc<Mutex<Applet>>) -> Self {
+    pub fn new(system: SystemRef, applet: Arc<Mutex<Applet>>) -> Self {
         let handlers = build_handler_map(&[
             (0, Some(Self::get_event_handle_handler), "GetEventHandle"),
             (1, Some(Self::receive_message_handler), "ReceiveMessage"),
@@ -137,6 +140,7 @@ impl ICommonStateGetter {
         Self {
             handlers,
             handlers_tipc: BTreeMap::new(),
+            system,
             applet,
         }
     }
@@ -157,6 +161,16 @@ impl ICommonStateGetter {
         } else {
             OperationMode::Handheld
         }
+    }
+
+    /// Port of ICommonStateGetter::GetPerformanceMode
+    pub fn get_performance_mode(&self) -> u32 {
+        self.system
+            .get()
+            .apm_controller()
+            .lock()
+            .unwrap()
+            .get_current_performance_mode() as u32
     }
 
     /// Port of ICommonStateGetter::IsVrModeEnabled
@@ -312,11 +326,13 @@ impl ICommonStateGetter {
 
     /// GetPerformanceMode (cmd 6): returns current performance mode.
     /// Matches upstream: `*out = system.GetAPMController().GetCurrentPerformanceMode()`
-    fn get_performance_mode_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn get_performance_mode_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let service =
+            unsafe { &*(this as *const dyn ServiceFramework as *const ICommonStateGetter) };
         log::debug!("ICommonStateGetter::GetPerformanceMode called");
         let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
         rb.push_result(RESULT_SUCCESS);
-        rb.push_u32(0); // PerformanceMode::Normal = 0
+        rb.push_u32(service.get_performance_mode());
     }
 
     /// RequestToAcquireSleepLock (cmd 10): acquires sleep lock immediately.
@@ -603,10 +619,11 @@ impl ServiceFramework for ICommonStateGetter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use common::settings_enums::ConsoleMode;
 
     #[test]
     fn exercised_common_state_handlers_are_registered() {
-        let service = ICommonStateGetter::new(Arc::new(Mutex::new(Applet::new(
+        let service = ICommonStateGetter::new(crate::core::SystemRef::null(), Arc::new(Mutex::new(Applet::new(
             crate::core::SystemRef::null(),
             crate::hle::service::os::process::Process::new(),
             false,
@@ -617,7 +634,7 @@ mod tests {
                 service
                     .handlers()
                     .get(&cmd)
-                    .and_then(|info| info.handler)
+                    .and_then(|info| info.handler_callback)
                     .is_some(),
                 "cmd {} should have a real handler",
                 cmd
@@ -627,7 +644,7 @@ mod tests {
 
     #[test]
     fn get_settings_platform_region_returns_global() {
-        let service = ICommonStateGetter::new(Arc::new(Mutex::new(Applet::new(
+        let service = ICommonStateGetter::new(crate::core::SystemRef::null(), Arc::new(Mutex::new(Applet::new(
             crate::core::SystemRef::null(),
             crate::hle::service::os::process::Process::new(),
             false,
@@ -637,7 +654,7 @@ mod tests {
 
     #[test]
     fn vr_mode_ex_handlers_toggle_vr_mode() {
-        let service = ICommonStateGetter::new(Arc::new(Mutex::new(Applet::new(
+        let service = ICommonStateGetter::new(crate::core::SystemRef::null(), Arc::new(Mutex::new(Applet::new(
             crate::core::SystemRef::null(),
             crate::hle::service::os::process::Process::new(),
             false,
@@ -647,5 +664,45 @@ mod tests {
         assert!(service.is_vr_mode_enabled());
         service.end_vr_mode_ex();
         assert!(!service.is_vr_mode_enabled());
+    }
+
+    #[test]
+    fn get_performance_mode_uses_system_apm_controller() {
+        let system = crate::core::System::new();
+        let (old_using_global, old_mode) = {
+            let values = common::settings::values();
+            (
+                values.use_docked_mode.using_global(),
+                *values.use_docked_mode.get_value(),
+            )
+        };
+        let service = ICommonStateGetter::new(
+            crate::core::SystemRef::from_ref(&system),
+            Arc::new(Mutex::new(Applet::new(
+                crate::core::SystemRef::null(),
+                crate::hle::service::os::process::Process::new(),
+                false,
+            ))),
+        );
+
+        {
+            let mut values = common::settings::values_mut();
+            values.use_docked_mode.set_global(false);
+            values.use_docked_mode.set_value(ConsoleMode::Docked);
+        }
+        assert_eq!(service.get_performance_mode(), 1);
+
+        {
+            let mut values = common::settings::values_mut();
+            values.use_docked_mode.set_value(ConsoleMode::Handheld);
+        }
+        assert_eq!(service.get_performance_mode(), 0);
+
+        {
+            let mut values = common::settings::values_mut();
+            values.use_docked_mode.set_global(false);
+            values.use_docked_mode.set_value(old_mode);
+            values.use_docked_mode.set_global(old_using_global);
+        }
     }
 }

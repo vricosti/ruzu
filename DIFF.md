@@ -218,6 +218,23 @@
 ### Intentional differences
 - Rust keeps a generic `FenceManager<F>` without the upstream cache/renderer template parameters. The new `#[cfg(test)]` accessors are test-only inspection helpers and do not affect runtime ownership.
 
+## 2026-04-09 — core/src/hle/service/audio/audio_device.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/audio/audio_device.h and /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/audio/audio_device.cpp
+
+### Intentional differences
+- Rust still creates the audio device event lazily on first `Query*Event` instead of in the constructor via upstream `ServiceContext::CreateEvent(...)`. This remains a lifecycle adaptation within the same owner file.
+- Rust currently stores the upstream audio-core owner behind the existing `AudioCoreInterface` bridge from `core.rs`: mechanical crate-boundary adaptation while keeping the HLE method ownership in `audio_device.rs`.
+
+### Unintentional differences (to fix)
+- `GetActiveAudioDeviceName{,Auto}` and `GetActiveAudioOutputDeviceName` still rely on `write_buffer()` truncation semantics instead of returning an upstream-equivalent insufficient-buffer result when the supplied out-array cannot hold one `AudioDeviceName`.
+- `QueryAudioDevice{System,Input,Output}Event` still shares one lazily-created readable event object rather than matching the exact constructor-time event lifecycle from upstream.
+
+### Missing items
+- Full upstream constructor/destructor parity for `service_context` event ownership.
+- Upstream-equivalent insufficient-buffer result handling for the single-name output commands.
+
+### Binary layout verification
+- PASS: `AudioDeviceName` remains `0x100` bytes per entry in the upstream owner crate, and `audio_device.rs` now bounds the HIPC out-array using `ctx.get_write_buffer_size(0) / 0x100` before forwarding to the backend owner.
+
 ### Unintentional differences (to fix)
 - `FenceManager` still does not own the upstream `GPU`/`Host1x` references, so `SignalSyncPoint(...)` is not yet hosted directly in this file.
 - Async flush/cache ownership remains simplified relative to upstream.
@@ -7038,6 +7055,152 @@
 
 ### Binary layout verification
 - PASS: service bootstrap wiring only; no raw serialized struct layout changed.
+
+## 2026-04-09 — `core/src/core.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/core.h` and `/home/vricosti/Dev/emulators/zuyu/src/core/core.cpp`
+
+### Intentional differences
+- Rust still flattens upstream `System::Impl` into the main `System` struct. The new `apm_controller` owner remains in `core.rs`, which is still the correct upstream ownership boundary for `System::GetAPMController()`.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `System` now owns a shared APM controller equivalent to upstream `Service::APM::Controller` and exposes it through `apm_controller()`, instead of letting the APM service loop create a disconnected controller instance.
+
+### Missing items
+- Re-audit other system-owned service controllers still created ad hoc in service loops instead of on `System`.
+
+### Binary layout verification
+- PASS: runtime owner wiring only; no raw serialized struct layout changed.
+
+## 2026-04-09 — `core/src/hle/service/apm/apm.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/hle/service/apm/apm.cpp`
+
+### Intentional differences
+- Rust still uses closure-based named-service factories instead of upstream direct `std::make_shared<APM>(...)` registration. This is a mechanical service-framework adaptation while preserving method ownership in `apm.rs`.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `loop_process(...)` now reuses the system-owned APM controller, matching upstream `system.GetAPMController()` ownership instead of creating a local controller disconnected from `Core::System`.
+
+### Missing items
+- Re-audit whether any remaining `APM`/`APM_Sys` constructor arguments still diverge from upstream ownership after the existing factory adaptation.
+
+### Binary layout verification
+- PASS: service registration wiring only; no raw serialized struct layout changed.
+
+## 2026-04-09 — `core/src/hle/service/am/service/common_state_getter.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/hle/service/am/service/common_state_getter.h` and `/home/vricosti/Dev/emulators/zuyu/src/core/hle/service/am/service/common_state_getter.cpp`
+
+### Intentional differences
+- Rust stores upstream `Core::System& system` as `SystemRef` because service objects are heap-owned trait objects rather than direct `ServiceFramework<ICommonStateGetter>` subclasses. This is a mechanical adaptation while preserving ownership in `common_state_getter.rs`.
+- The handler table still omits the same currently unported commands as the Rust file already omitted before this slice; this pass only restores the exercised `GetPerformanceMode` owner wiring.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `ICommonStateGetter` now owns `SystemRef` and `GetPerformanceMode` reads the system-owned APM controller instead of returning a hardcoded value unrelated to upstream `system.GetAPMController().GetCurrentPerformanceMode()`.
+
+### Missing items
+- Continue the parity audit for remaining stubbed commands in this file, especially `SetCpuBoostMode` forwarding and other unimplemented handlers already present upstream.
+
+### Binary layout verification
+- PASS: service owner wiring only; no raw serialized struct layout changed.
+
+## 2026-04-10 — `core/src/hle/service/filesystem/romfs_controller.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/hle/service/filesystem/romfs_controller.h` and `/home/vricosti/Dev/emulators/zuyu/src/core/hle/service/filesystem/romfs_controller.cpp`
+
+### Intentional differences
+- Rust stores the upstream shared `RomFSFactory` owner as `Option<Arc<RomFSFactory>>` because bootstrap paths still construct the controller before the factory is always available. This is a construction-order adaptation within the same owner file.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `RomFsController` now exposes the upstream `OpenRomFS(title_id, storage_id, type)` and `OpenBaseNca(title_id, storage_id, type)` owner methods instead of only the narrower current-process/program helpers.
+
+### Missing items
+- Re-audit whether any callers still bypass `romfs_controller.rs` and reach `RomFSFactory` directly where upstream goes through `RomFsController`.
+
+### Binary layout verification
+- PASS: controller-only owner wiring; no raw serialized struct layout changed.
+
+## 2026-04-10 — `core/src/file_sys/romfs_factory.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/file_sys/romfs_factory.h` and `/home/vricosti/Dev/emulators/zuyu/src/core/file_sys/romfs_factory.cpp`
+
+### Intentional differences
+- `GetEntry(...)` now remains a public owner method in Rust because `RomFsController::open_base_nca(...)` needs the same boundary as upstream. This is a direct parity move, not a new abstraction.
+- The current Rust `PatchManager::patch_romfs(...)` still works from a base RomFS file rather than the exact upstream `NCA` BKTR base-object path. That pre-existing limitation remains outside this file.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `get_entry(...)` was private, which prevented `RomFsController` from owning the upstream `OpenBaseNca(...)` lookup boundary.
+
+### Missing items
+- Re-audit storage-specific `GetEntry(...)` behavior for `Host` and `GameCard`, which still log as unimplemented in Rust.
+
+### Binary layout verification
+- PASS: factory lookup only; no raw serialized struct layout changed.
+
+## 2026-04-10 — `core/src/hle/service/filesystem/fsp/fsp_srv.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/hle/service/filesystem/fsp/fsp_srv.cpp` and `/home/vricosti/Dev/emulators/zuyu/src/core/hle/service/filesystem/fsp/fsp_srv.h`
+
+### Intentional differences
+- Rust still maps raw `u8` storage IDs into `romfs_factory::StorageId` locally because the target tree does not yet have a dedicated owner file matching upstream `FileSys::StorageId`.
+- The patched-data path still uses the existing Rust `PatchManager::patch_romfs(...)` file-based contract instead of the exact upstream `OpenBaseNca(...)` BKTR base-NCA flow. Ownership now matches upstream more closely even though the underlying patcher remains simplified.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `OpenDataStorageByDataId` no longer jumps straight to `SynthesizeSystemArchive(...)`. It now first tries the upstream owner path `romfs_controller.OpenRomFS(title_id, storage_id, Data)` and patches the resulting RomFS through `PatchManager` before falling back to synthetic system archives.
+- Fixed in this pass: `FspSrv` now owns the upstream constructor-fed `content_provider` reference instead of trying to reach nonexistent local fields during `OpenDataStorageByDataId`.
+- `OpenDataStorageByDataId` still does not consume `OpenBaseNca(...)` for exact BKTR update patching because the current Rust `PatchManager` does not yet model that upstream NCA ownership literally.
+
+### Missing items
+- Re-audit `OpenDataStorageByDataId` once `PatchManager::patch_romfs(...)` gains exact BKTR base-NCA ownership.
+- Re-audit `OpenDataStorageWithProgramIndex` against the upstream patched-RomFS path; it still remains outside this pass.
+
+### Binary layout verification
+- PASS: service/control-flow only; no raw serialized struct layout changed.
+
+## 2026-04-10 — `core/src/hle/service/filesystem/filesystem.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/hle/service/filesystem/filesystem.cpp`
+
+### Intentional differences
+- Rust still constructs `fsp-srv` through the existing `register_named_service(...)` closure-based service factory rather than upstream `ServerManager::RegisterNamedService` templates. This preserves the same owner boundary inside `filesystem.rs`.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `filesystem.rs` now constructs `FspSrv` with both `SystemRef` and `FileSystemController`, allowing the Rust owner to pass the upstream constructor-owned `content_provider` into `fsp_srv.rs`.
+
+### Missing items
+- Re-audit the remaining filesystem service constructors for any other upstream `System`-owned dependencies that are still omitted from Rust service construction.
+
+### Binary layout verification
+- PASS: service-registration wiring only; no raw serialized struct layout changed.
+
+## 2026-04-09 — `core/src/hle/service/am/service/application_proxy.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/hle/service/am/service/application_proxy.cpp`
+
+### Intentional differences
+- Rust still constructs child service objects through `push_interface_response(...)` and trait objects instead of upstream CMIF `SharedPointer` helpers. This is a mechanical IPC adaptation while preserving method ownership in `application_proxy.rs`.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `GetCommonStateGetter` now passes the upstream-equivalent `Core::System&` owner into `ICommonStateGetter` instead of constructing it without system ownership.
+
+### Missing items
+- Re-audit the remaining child-service constructors in this file for any similar missing `SystemRef`/process owner propagation.
+
+### Binary layout verification
+- PASS: child-service construction only; no raw serialized struct layout changed.
+
+## 2026-04-09 — `core/src/hle/service/am/service/library_applet_proxy.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/hle/service/am/service/library_applet_proxy.cpp`
+
+### Intentional differences
+- Rust still constructs child service objects through `push_interface_response(...)` and trait objects instead of upstream CMIF `SharedPointer` helpers. This is a mechanical IPC adaptation while preserving method ownership in `library_applet_proxy.rs`.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `GetCommonStateGetter` now passes the upstream-equivalent `Core::System&` owner into `ICommonStateGetter` instead of constructing it without system ownership.
+
+### Missing items
+- Re-audit the remaining child-service constructors in this file for any similar missing `SystemRef`/process owner propagation.
+
+### Binary layout verification
+- PASS: child-service construction only; no raw serialized struct layout changed.
+
+## 2026-04-09 — `core/src/hle/service/am/service/system_applet_proxy.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/hle/service/am/service/system_applet_proxy.cpp`
+
+### Intentional differences
+- Rust still constructs child service objects through `push_interface_response(...)` and trait objects instead of upstream CMIF `SharedPointer` helpers. This is a mechanical IPC adaptation while preserving method ownership in `system_applet_proxy.rs`.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `GetCommonStateGetter` now passes the upstream-equivalent `Core::System&` owner into `ICommonStateGetter` instead of constructing it without system ownership.
+
+### Missing items
+- Re-audit the remaining child-service constructors in this file for any similar missing `SystemRef`/process owner propagation.
+
+### Binary layout verification
+- PASS: child-service construction only; no raw serialized struct layout changed.
 
 ## 2026-04-09 — `core/src/core.rs` vs `src/core/core.cpp`
 

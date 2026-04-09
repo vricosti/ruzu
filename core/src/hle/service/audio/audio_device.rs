@@ -44,6 +44,8 @@ pub struct IAudioDevice {
 }
 
 impl IAudioDevice {
+    const AUDIO_DEVICE_NAME_SIZE: usize = 0x100;
+
     pub fn new(
         system: SystemRef,
         applet_resource_user_id: u64,
@@ -191,8 +193,16 @@ impl IAudioDevice {
         Self::make_audio_device_name("AudioTvOutput")
     }
 
-    fn list_audio_device_names(&self) -> Vec<[u8; 0x100]> {
-        let mut names = vec![[0u8; 0x100]; 4];
+    fn output_name_capacity(ctx: &HLERequestContext) -> usize {
+        ctx.get_write_buffer_size(0) / Self::AUDIO_DEVICE_NAME_SIZE
+    }
+
+    fn list_audio_device_names(&self, max_names: usize) -> Vec<[u8; 0x100]> {
+        if max_names == 0 {
+            return Vec::new();
+        }
+
+        let mut names = vec![[0u8; 0x100]; max_names];
         let count = (if self.system.is_null() {
             None
         } else {
@@ -213,8 +223,12 @@ impl IAudioDevice {
         names
     }
 
-    fn list_audio_output_device_names(&self) -> Vec<[u8; 0x100]> {
-        let mut names = vec![[0u8; 0x100]; 3];
+    fn list_audio_output_device_names(&self, max_names: usize) -> Vec<[u8; 0x100]> {
+        if max_names == 0 {
+            return Vec::new();
+        }
+
+        let mut names = vec![[0u8; 0x100]; max_names];
         let count = (if self.system.is_null() {
             None
         } else {
@@ -238,7 +252,7 @@ impl IAudioDevice {
     fn list_audio_device_name_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         log::debug!("IAudioDevice::ListAudioDeviceName");
         let svc = Self::as_self(this);
-        let names = svc.list_audio_device_names();
+        let names = svc.list_audio_device_names(Self::output_name_capacity(ctx));
         Self::write_name_array(ctx, &names);
         let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
         rb.push_result(RESULT_SUCCESS);
@@ -428,7 +442,7 @@ impl IAudioDevice {
     ) {
         log::debug!("IAudioDevice::ListAudioOutputDeviceName");
         let svc = Self::as_self(this);
-        let names = svc.list_audio_output_device_names();
+        let names = svc.list_audio_output_device_names(Self::output_name_capacity(ctx));
         Self::write_name_array(ctx, &names);
         let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
         rb.push_result(RESULT_SUCCESS);
@@ -450,12 +464,33 @@ mod tests {
     #[test]
     fn fallback_lists_keep_upstream_default_tv_name() {
         let service = IAudioDevice::new(SystemRef::null(), 0, 0x5245_5631, 0);
-        let names = service.list_audio_device_names();
+        let names = service.list_audio_device_names(1);
         assert_eq!(names.len(), 1);
         assert_eq!(
             &names[0][..14],
             &IAudioDevice::make_audio_device_name("AudioTvOutput")[..14]
         );
+    }
+
+    #[test]
+    fn list_audio_device_names_respects_out_array_capacity() {
+        let service = IAudioDevice::new(SystemRef::null(), 0, 0x5245_5631, 0);
+        let names = service.list_audio_device_names(3);
+        assert_eq!(names.len(), 1);
+
+        let output_names = service.list_audio_output_device_names(2);
+        assert_eq!(output_names.len(), 1);
+    }
+
+    #[test]
+    fn output_name_capacity_uses_real_buffer_size() {
+        let mut ctx = HLERequestContext::new();
+        ctx.buffer_b_descriptors = vec![crate::hle::ipc::BufferDescriptorABW {
+            size_bits_0_31: (IAudioDevice::AUDIO_DEVICE_NAME_SIZE * 3) as u32,
+            address_bits_0_31: 0,
+            raw_word2: 0,
+        }];
+        assert_eq!(IAudioDevice::output_name_capacity(&ctx), 3);
     }
 }
 

@@ -157,6 +157,7 @@ impl ILibraryAppletProxy {
         Self::push_interface_response(
             ctx,
             Arc::new(super::common_state_getter::ICommonStateGetter::new(
+                proxy.system,
                 proxy.applet.clone(),
             )),
         );
