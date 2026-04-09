@@ -1260,15 +1260,8 @@ impl KernelCore {
     }
 
     /// Create a new thread ID.
-    #[track_caller]
     pub fn create_new_thread_id(&self) -> u64 {
-        let id = self.next_thread_id.fetch_add(1, Ordering::Relaxed);
-        // Temporary instrumentation: log every thread ID allocation with caller info.
-        if std::env::var_os("RUZU_LOG_THREAD_ALLOC").is_some() {
-            let caller = std::panic::Location::caller();
-            log::info!("[THREAD_ALLOC] tid={} from {}:{}", id, caller.file(), caller.line());
-        }
-        id
+        self.next_thread_id.fetch_add(1, Ordering::Relaxed)
     }
 
     /// Get the memory manager.
