@@ -6964,3 +6964,32 @@
 
 ### Binary layout verification
 - PASS: no raw-serialized structs changed in this slice; only thread bootstrap field initialization was realigned.
+
+## 2026-04-09 — `core/src/hle/kernel/k_thread.rs` vs `src/core/hle/kernel/k_thread.cpp`
+
+### Intentional differences
+- Rust still represents upstream `KThreadFunction func`/`uintptr_t arg` for shutdown threads through the existing host-fiber closure owner rather than a separate guest entrypoint field, because the current Rust kernel thread bootstrap already routes these ownerless threads through `Fiber`.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: Rust now has a dedicated `initialize_high_priority_thread(...)` owner matching upstream `KThread::InitializeHighPriorityThread(...)`, instead of reusing `initialize_kernel_main_thread(...)` and patching `thread_type` afterward.
+- Fixed in this pass: shutdown-thread initialization now installs `ThreadType::HighPriority`, `priority/base_priority = 0`, and `ThreadState::INITIALIZED`, matching the upstream `InitializeThread(..., ThreadType::HighPriority, ...)` contract more closely.
+
+### Missing items
+- Full parity for the generic upstream `InitializeThread(...)` helper is still split across several Rust init helpers (`initialize_kernel_main_thread`, `initialize_high_priority_thread`, `initialize_user_thread_with_tls`, etc.) rather than a single shared owner-local helper.
+
+### Binary layout verification
+- PASS: no raw serialized struct layout changed in this slice.
+
+## 2026-04-09 — `core/src/hle/kernel/kernel.rs` vs `src/core/hle/kernel/kernel.cpp`
+
+### Intentional differences
+- Rust still constructs shutdown-thread host entrypoints through a `Box<dyn FnOnce() + Send>` closure that captures `KernelCore` by raw pointer value. This is a bounded Rust adaptation of upstream `GetShutdownThreadStartFunc()` while preserving ownership in `kernel.rs`.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `initialize_shutdown_threads()` no longer initializes shutdown threads through `initialize_kernel_main_thread()`. It now calls the dedicated high-priority thread owner, matching upstream `Impl::InitializeShutdownThreads()` more closely.
+
+### Missing items
+- The Rust kernel still lacks the full upstream `KThread::Register(kernel, thread)` ownership path for these ownerless kernel threads; registration remains expressed through the existing `register_kernel_object(...)` helper.
+
+### Binary layout verification
+- PASS: no raw serialized struct layout changed in this slice.

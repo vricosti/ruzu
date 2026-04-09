@@ -1601,6 +1601,70 @@ impl KThread {
         self.initialize_host_context(init_func);
     }
 
+    /// Initialize as a high-priority kernel thread (no process owner).
+    ///
+    /// Upstream: `KThread::InitializeHighPriorityThread(system, thread, func, arg, virt_core)`
+    /// (k_thread.cpp:289-294).
+    /// Calls `InitializeThread(thread, func, arg, {}, {}, virt_core, nullptr,
+    ///         ThreadType::HighPriority, system.GetCpuManager().GetShutdownThreadStartFunc())`.
+    pub fn initialize_high_priority_thread(
+        &mut self,
+        virt_core: i32,
+        thread_id: u64,
+        object_id: u64,
+        init_func: Option<Box<dyn FnOnce() + Send>>,
+    ) {
+        let phys_core =
+            crate::hardware_properties::VIRTUAL_TO_PHYSICAL_CORE_MAP[virt_core as usize];
+
+        self.object_id = object_id;
+        self.thread_type = ThreadType::HighPriority;
+        self.thread_id = thread_id;
+        self.priority = SVC_HIGHEST_THREAD_PRIORITY;
+        self.base_priority = SVC_HIGHEST_THREAD_PRIORITY;
+        self.virtual_ideal_core_id = virt_core;
+        self.physical_ideal_core_id = phys_core;
+        self.virtual_affinity_mask = 1u64 << virt_core;
+        self.physical_affinity_mask
+            .set_affinity_mask(1u64 << phys_core);
+        self.tls_address = KProcessAddress::default();
+        self.parent = None;
+        self.scheduler = None;
+        self.global_scheduler_context = None;
+        self.scheduler_lock_ptr = 0;
+        self.process_schedule_count = None;
+        self.signaled = false;
+        let (termination_lock, _) = &*self.termination_wait_pair;
+        *termination_lock.lock().unwrap() = false;
+        self.termination_requested.store(false, Ordering::Relaxed);
+        self.wait_cancelled = false;
+        self.cancellable = false;
+        self.stack_top = KProcessAddress::default();
+        self.argument = 0;
+        self.core_id = phys_core;
+        self.current_core_id = phys_core;
+        self.thread_state
+            .store(ThreadState::INITIALIZED.bits(), Ordering::Relaxed);
+        self.suspend_allowed_flags = ThreadState::SUSPEND_FLAG_MASK.bits() as u32;
+        self.suspend_request_flags = 0;
+        self.wait_result = RESULT_NO_SYNCHRONIZATION_OBJECT.get_inner_value();
+        self.schedule_count = -1;
+        self.last_scheduled_tick = 0;
+        self.num_kernel_waiters = 0;
+        self.resource_limit_release_hint = false;
+        self.sleep_deadline = None;
+        self.synchronization_wait.clear();
+        self.stack_parameters = StackParameters::default();
+        self.initialized = true;
+
+        // No owner → use 64-bit thread context (upstream: m_parent == nullptr → 64-bit path).
+        self.reset_thread_context64(0, 0, 0);
+
+        // Initialize emulation parameters.
+        // Upstream: thread->m_host_context = std::make_shared<Common::Fiber>(std::move(init_func));
+        self.initialize_host_context(init_func);
+    }
+
     /// Initialize as a kernel idle thread (no process owner).
     ///
     /// Upstream: `KThread::InitializeIdleThread(system, thread, virt_core)` (k_thread.cpp:284-287).
@@ -3815,5 +3879,19 @@ mod tests {
         assert_eq!(restored.r[13], 0x2222);
         assert_eq!(restored.r[14], 0x3333);
         assert_eq!(restored.r[15], 0x4444);
+    }
+
+    #[test]
+    fn initialize_high_priority_thread_matches_shutdown_thread_contract() {
+        let mut thread = KThread::new();
+
+        thread.initialize_high_priority_thread(2, 11, 22, Some(Box::new(|| {})));
+
+        assert_eq!(thread.thread_type, ThreadType::HighPriority);
+        assert_eq!(thread.priority, SVC_HIGHEST_THREAD_PRIORITY);
+        assert_eq!(thread.base_priority, SVC_HIGHEST_THREAD_PRIORITY);
+        assert_eq!(thread.get_state(), ThreadState::INITIALIZED);
+        assert!(thread.parent.is_none());
+        assert!(thread.get_host_context().is_some());
     }
 }

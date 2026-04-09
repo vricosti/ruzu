@@ -18,7 +18,7 @@ use super::super::service::server_manager::ServerManager;
 use super::k_memory_manager::KMemoryManager;
 use super::k_process::KProcess;
 use super::k_scheduler::KScheduler;
-use super::k_thread::{KThread, ThreadState, ThreadType};
+use super::k_thread::{KThread, ThreadState};
 
 use super::global_scheduler_context::GlobalSchedulerContext;
 use super::init::init_slab_setup::KSlabResourceCounts;
@@ -1223,13 +1223,12 @@ impl KernelCore {
                     crate::cpu_manager::CpuManager::shutdown_thread_function(kernel);
                 });
 
-                t.initialize_kernel_main_thread(
+                t.initialize_high_priority_thread(
                     core_id as i32,
                     thread_id,
                     object_id,
                     Some(shutdown_func),
                 );
-                t.thread_type = ThreadType::HighPriority;
                 t.bind_self_reference(&thread);
             }
             self.register_kernel_object(thread.lock().unwrap().get_object_id());
