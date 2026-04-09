@@ -581,7 +581,8 @@ pub fn register_services(
     server_manager.register_named_service(
         "fsp-srv",
         Box::new(move || -> SessionRequestHandlerPtr {
-            Arc::new(super::fsp::fsp_srv::FspSrv::new_with_fsc(
+            Arc::new(super::fsp::fsp_srv::FspSrv::new_with_system(
+                system,
                 fsc_for_closure.clone(),
             ))
         }),

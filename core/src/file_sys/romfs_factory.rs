@@ -177,7 +177,7 @@ impl RomFSFactory {
     /// filesystem_controller caches. Since FileSystemController is not yet
     /// ported, only StorageId::None (which uses content_provider directly)
     /// is fully implemented.
-    fn get_entry(
+    pub fn get_entry(
         &self,
         title_id: u64,
         storage: StorageId,
