@@ -629,6 +629,31 @@ impl CpuManager {
                             breakpoint,
                         );
                     }
+                    // Upstream: if (breakpoint || prefetch_abort) {
+                    //     thread->RequestSuspend(SuspendType::Debug); return; }
+                    // Without this, the thread re-executes the faulting PC forever.
+                    if breakpoint || prefetch_abort {
+                        if breakpoint {
+                            jit_ref.rewind_breakpoint_instruction();
+                        }
+                        {
+                            let mut tc = crate::arm::arm_interface::ThreadContext::default();
+                            jit_ref.get_context(&mut tc);
+                            log::error!(
+                                "multi_core_run_guest_thread: tid={} core={} {} at pc=0x{:08X} lr=0x{:08X} — suspending thread",
+                                current_thread_id,
+                                core_index,
+                                if prefetch_abort { "PrefetchAbort" } else { "Breakpoint" },
+                                tc.pc as u32,
+                                tc.lr as u32,
+                            );
+                        }
+                        thread_arc.lock().unwrap().request_suspend(
+                            crate::hle::kernel::k_thread::SuspendType::Debug,
+                        );
+                        Self::reschedule_current_core_raw(kernel);
+                        return;
+                    }
                     if let Some(probe_pc) = parse_hex_env_u64("RUZU_PC_PROBE") {
                         let mut tc = crate::arm::arm_interface::ThreadContext::default();
                         jit_ref.get_context(&mut tc);
