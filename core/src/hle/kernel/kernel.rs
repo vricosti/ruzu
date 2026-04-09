@@ -18,7 +18,7 @@ use super::super::service::server_manager::ServerManager;
 use super::k_memory_manager::KMemoryManager;
 use super::k_process::KProcess;
 use super::k_scheduler::KScheduler;
-use super::k_thread::{KThread, ThreadState};
+use super::k_thread::{KThread, ThreadState, ThreadType};
 
 use super::global_scheduler_context::GlobalSchedulerContext;
 use super::init::init_slab_setup::KSlabResourceCounts;
@@ -409,6 +409,9 @@ pub struct KernelCore {
     /// Upstream: `std::array<std::unique_ptr<Kernel::PhysicalCore>, NUM_CPU_CORES> cores`.
     cores: Vec<Arc<PhysicalCore>>,
 
+    /// Per-core shutdown threads.
+    /// Upstream: created in `InitializeShutdownThreads()` via `KThread::InitializeHighPriorityThread`.
+    shutdown_threads: Vec<Arc<Mutex<KThread>>>,
     /// Per-core main threads.
     /// Upstream: created in `InitializePhysicalCores()` via `KThread::InitializeMainThread`.
     main_threads: Vec<Arc<Mutex<KThread>>>,
@@ -494,6 +497,7 @@ impl KernelCore {
             schedulers: Vec::new(),
             cores: Vec::new(),
 
+            shutdown_threads: Vec::new(),
             main_threads: Vec::new(),
             idle_threads: Vec::new(),
             application_thread: None,
@@ -535,6 +539,9 @@ impl KernelCore {
         super::init::init_slab_setup::initialize_slab_resource_counts(
             &mut self.slab_resource_counts,
         );
+
+        // Initialize shutdown threads (before physical cores, matching upstream order).
+        self.initialize_shutdown_threads();
 
         // Initialize physical cores.
         self.initialize_physical_cores();
@@ -809,6 +816,7 @@ impl KernelCore {
 
         // Upstream: schedulers[core_id].reset() per core.
         self.schedulers.clear();
+        self.shutdown_threads.clear();
         self.main_threads.clear();
         self.idle_threads.clear();
         self.service_processes.lock().unwrap().clear();
@@ -1189,11 +1197,46 @@ impl KernelCore {
         &mut self.memory_manager
     }
 
-    /// Initialize physical cores and per-core schedulers.
+    /// Initialize shutdown threads (one per core).
     ///
-    /// Upstream: `Impl::InitializePhysicalCores()` (kernel.cpp:192-211).
-    /// Creates KScheduler + PhysicalCore for each core, then initializes
-    /// each scheduler with main/idle threads.
+    /// Upstream: `Impl::InitializeShutdownThreads()` (kernel.cpp:340-348).
+    /// Creates 4 high-priority kernel threads used for graceful shutdown.
+    /// Must be called before `initialize_physical_cores()` so that thread IDs
+    /// match upstream (shutdown threads get IDs 1-4, physical core threads 5-12).
+    fn initialize_shutdown_threads(&mut self) {
+        self.shutdown_threads.clear();
+
+        let kernel_ptr = self as *const KernelCore as usize;
+
+        for core_id in 0..hardware_properties::NUM_CPU_CORES {
+            let thread = Arc::new(Mutex::new(KThread::new()));
+            {
+                let thread_id = self.create_new_thread_id();
+                let object_id = self.create_new_object_id() as u64;
+                let mut t = thread.lock().unwrap();
+                t.set_current_core(core_id as i32);
+
+                // Upstream: InitializeHighPriorityThread passes GetShutdownThreadStartFunc().
+                let kp = kernel_ptr;
+                let shutdown_func: Box<dyn FnOnce() + Send> = Box::new(move || {
+                    let kernel = unsafe { &*(kp as *const KernelCore) };
+                    crate::cpu_manager::CpuManager::shutdown_thread_function(kernel);
+                });
+
+                t.initialize_kernel_main_thread(
+                    core_id as i32,
+                    thread_id,
+                    object_id,
+                    Some(shutdown_func),
+                );
+                t.thread_type = ThreadType::HighPriority;
+                t.bind_self_reference(&thread);
+            }
+            self.register_kernel_object(thread.lock().unwrap().get_object_id());
+            self.shutdown_threads.push(thread);
+        }
+    }
+
     /// Initialize physical cores and per-core schedulers.
     ///
     /// Upstream: `Impl::InitializePhysicalCores()` (kernel.cpp:192-211).
