@@ -298,3 +298,16 @@ The following upstream code is Linux-only in ruzu. The Windows code paths are no
   1. A KAutoObject trait with Open()/Close() methods
   2. KHandleTable::Add(&dyn KAutoObject) -> Handle
   3. All services push trait objects instead of pre-resolved handles
+
+  ----------------
+  No changes needed in ruzu — the default false from the trait is used, matching upstream exactly.                                                                                      
+                                                                                                                                                          
+  The is_read_only_memory callback is now properly implemented:                                                                                                                         
+                                                                                                                                                          
+  1. UserCallbacks trait in rdynarmic has is_read_only_memory(&self, vaddr: u32) -> bool with default false                                                                             
+  2. A32ConstantMemoryReads pass calls it via the is_read_only closure parameter
+  3. get_or_compile_block_with_ro() threads the callback from run()/step()/trampoline                                                                                                   
+  4. ruzu's DynarmicCallbacks32 inherits the default false, matching upstream's behavior                                                                                                
+                                                                                                                                                                                        
+  The callback is ready for a future enhancement where ruzu implements it using the process page table to identify read-only code sections (e.g., USER_READ_EXECUTE pages). That would  
+  enable constant folding for literal pool loads — an optimization upstream doesn't even use.

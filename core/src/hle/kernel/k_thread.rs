@@ -2768,10 +2768,12 @@ impl KThread {
         self.wait_result = _wait_result;
         self.apply_wait_result_to_context();
 
-        let wait_queue = self
-            .wait_queue
-            .clone()
-            .expect("KThread::end_wait requires wait_queue while waiting");
+        // Upstream: ASSERT_MSG(false, "wait_queue is nullptr!"); return;
+        // Avoid a hard crash — log and return early like upstream.
+        let Some(wait_queue) = self.wait_queue.clone() else {
+            log::error!("KThread::end_wait: wait_queue is None while state=Waiting (upstream ASSERT)");
+            return;
+        };
         wait_queue.end_wait(self, _wait_result);
     }
 
