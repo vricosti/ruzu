@@ -8,6 +8,8 @@ use std::sync::{Arc, Mutex};
 
 use crate::core::System;
 use crate::hle::kernel::k_memory_block::{KMemoryPermission, KMemoryState, PAGE_SIZE};
+use crate::hle::kernel::k_resource_limit::LimitableResource;
+use crate::hle::kernel::k_scoped_resource_reservation::KScopedResourceReservation;
 use crate::hle::kernel::k_thread::KThread;
 use crate::hle::kernel::k_typed_address::KProcessAddress;
 use crate::hle::kernel::svc::svc_results::*;
@@ -102,6 +104,22 @@ pub fn create_thread(
         );
     }
 
+    let thread_reservation_timeout = crate::hle::kernel::kernel::get_current_hardware_tick()
+        .unwrap_or(i64::MAX)
+        .saturating_add(100_000_000);
+    let mut thread_reservation = {
+        let process = current_process.lock().unwrap();
+        KScopedResourceReservation::new_with_timeout(
+            process.resource_limit.clone(),
+            LimitableResource::ThreadCountMax,
+            1,
+            thread_reservation_timeout,
+        )
+    };
+    if !thread_reservation.succeeded() {
+        return RESULT_LIMIT_REACHED;
+    }
+
     let object_id = system.kernel().unwrap().create_new_object_id() as u64;
     let thread_id = system.kernel().unwrap().create_new_thread_id();
 
@@ -149,6 +167,8 @@ pub fn create_thread(
         let current_thread = current_thread.lock().unwrap();
         new_thread.clone_fpu_status_from(&current_thread);
     }
+
+    thread_reservation.commit();
 
     let thread_tls_address = {
         let thread = thread.lock().unwrap();
@@ -544,6 +564,7 @@ mod tests {
     use super::*;
     use crate::core::System;
     use crate::hle::kernel::k_process::KProcess;
+    use crate::hle::kernel::k_resource_limit::{create_resource_limit_for_process, LimitableResource};
     use crate::hle::kernel::k_thread::ThreadState;
     use crate::hle::kernel::k_worker_task_manager::KWorkerTaskManager;
 
@@ -557,6 +578,9 @@ mod tests {
         process.allocate_code_memory(0x200000, 0x20000);
         process.initialize_handle_table();
         process.initialize_thread_local_region_base(0x240000);
+        process.resource_limit = Some(Arc::new(Mutex::new(create_resource_limit_for_process(
+            0x1_0000_0000,
+        ))));
 
         let process = Arc::new(Mutex::new(process));
         let current_thread = Arc::new(Mutex::new(KThread::new()));
@@ -690,5 +714,22 @@ mod tests {
         let thread = current_thread.lock().unwrap();
         assert_eq!(thread.get_state(), ThreadState::TERMINATED);
         assert!(thread.is_signaled());
+    }
+
+    #[test]
+    fn create_thread_returns_limit_reached_when_thread_count_reservation_fails() {
+        let system = test_system();
+        {
+            let process = system.current_process_arc();
+            let process = process.lock().unwrap();
+            let resource_limit = process.resource_limit.as_ref().unwrap().clone();
+            let mut resource_limit = resource_limit.lock().unwrap();
+            resource_limit.set_limit_value(LimitableResource::ThreadCountMax, 0).unwrap();
+        }
+
+        let mut handle = INVALID_HANDLE;
+        let result = create_thread(&system, &mut handle, 0x201000, 0x1234, 0x260000, 44, 0);
+        assert_eq!(result, RESULT_LIMIT_REACHED);
+        assert_eq!(handle, INVALID_HANDLE);
     }
 }

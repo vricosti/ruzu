@@ -166,9 +166,10 @@ impl NvMapDevice {
             }
         }
 
-        let sessions = self.sessions.lock().unwrap();
-        let session_id = sessions.get(&fd).copied().unwrap_or_default();
-        drop(sessions);
+        let session_id = {
+            let sessions = self.sessions.lock().unwrap();
+            sessions.get(&fd).copied().unwrap_or_default()
+        };
 
         let result = handle.alloc(
             params.flags,
@@ -182,10 +183,10 @@ impl NvMapDevice {
             return result;
         }
 
-        let Some(process) = self.container().get_session_process(session_id) else {
-            log::error!("Active session missing process for fd={}", fd);
-            return NvResult::InvalidState;
-        };
+        let process = self
+            .container()
+            .get_session_process(session_id)
+            .expect("nvmap::IocAlloc active session must own a process like upstream");
 
         let handle_size = {
             let inner = handle.lock_inner();
@@ -203,14 +204,7 @@ impl NvMapDevice {
                     true,
                 )
         };
-        if lock_result != 0 {
-            log::error!(
-                "LockForMapDeviceAddressSpace failed: handle={:08X} result=0x{:X}",
-                params.handle,
-                lock_result
-            );
-            return NvResult::BadValue;
-        }
+        debug_assert_eq!(lock_result, 0);
 
         NvResult::Success
     }

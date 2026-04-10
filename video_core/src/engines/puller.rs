@@ -10,7 +10,7 @@
 use crate::control::channel_state::ChannelState;
 use crate::engines::engine_interface::EngineInterface;
 use crate::engines::engine_interface::EngineTypes;
-use crate::query_cache::types::QueryPropertiesFlags;
+use crate::query_cache::types::{QueryPropertiesFlags, QueryType};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
@@ -259,6 +259,46 @@ impl PullerRegs {
         FenceAction {
             raw: self.reg_array[0x1D],
         }
+    }
+
+    pub fn acquire_mode(&self) -> u32 {
+        self.reg_array[0x100]
+    }
+
+    pub fn set_acquire_mode(&mut self, value: u32) {
+        self.reg_array[0x100] = value;
+    }
+
+    pub fn acquire_source(&self) -> u32 {
+        self.reg_array[0x101]
+    }
+
+    pub fn set_acquire_source(&mut self, value: u32) {
+        self.reg_array[0x101] = value;
+    }
+
+    pub fn acquire_active(&self) -> u32 {
+        self.reg_array[0x102]
+    }
+
+    pub fn set_acquire_active(&mut self, value: u32) {
+        self.reg_array[0x102] = value;
+    }
+
+    pub fn acquire_timeout(&self) -> u32 {
+        self.reg_array[0x103]
+    }
+
+    pub fn set_acquire_timeout(&mut self, value: u32) {
+        self.reg_array[0x103] = value;
+    }
+
+    pub fn acquire_value(&self) -> u32 {
+        self.reg_array[0x104]
+    }
+
+    pub fn set_acquire_value(&mut self, value: u32) {
+        self.reg_array[0x104] = value;
     }
 }
 
@@ -742,7 +782,7 @@ impl Puller {
             self.with_rasterizer_mut(|rasterizer| {
                 rasterizer.query(
                     sequence_address,
-                    0,
+                    QueryType::Payload as u32,
                     QueryPropertiesFlags::HAS_TIMEOUT,
                     gpu_ticks,
                     payload,
@@ -770,12 +810,18 @@ impl Puller {
             loop {
                 let word = self.read_gpu_u32(self.regs.semaphore_address());
                 let acquire_value = self.regs.semaphore_sequence();
+                self.regs.set_acquire_source(1);
+                self.regs.set_acquire_value(acquire_value);
                 let mut retry = false;
                 match op {
                     x if x == GpuSemaphoreOperation::AcquireEqual as u32 => {
+                        self.regs.set_acquire_active(1);
+                        self.regs.set_acquire_mode(0);
                         retry = word != acquire_value;
                     }
                     x if x == GpuSemaphoreOperation::AcquireGequal as u32 => {
+                        self.regs.set_acquire_active(1);
+                        self.regs.set_acquire_mode(1);
                         retry = word < acquire_value;
                     }
                     x if x == GpuSemaphoreOperation::AcquireMask as u32 => {
@@ -801,9 +847,13 @@ impl Puller {
         let value = self.regs.semaphore_acquire();
         let mut word = self.read_gpu_u32(addr);
         while word != value {
+            self.regs.set_acquire_active(1);
+            self.regs.set_acquire_value(value);
             self.with_rasterizer_mut(|rasterizer| rasterizer.release_fences(false));
             word = self.read_gpu_u32(addr);
             // TODO(kemathe73) figure out how to do the acquire_timeout
+            self.regs.set_acquire_mode(0);
+            self.regs.set_acquire_source(0);
         }
     }
 
@@ -830,7 +880,7 @@ impl Puller {
         self.with_rasterizer_mut(|rasterizer| {
             rasterizer.query(
                 sequence_address,
-                0,
+                QueryType::Payload as u32,
                 QueryPropertiesFlags::IS_A_FENCE,
                 gpu_ticks,
                 payload,
@@ -874,6 +924,8 @@ mod tests {
         syncpoints: StdArc<StdMutex<Vec<u32>>>,
         wait_for_idle_calls: StdArc<StdMutex<u32>>,
         reference_calls: StdArc<StdMutex<u32>>,
+        release_fence_calls: StdArc<StdMutex<u32>>,
+        query_calls: StdArc<StdMutex<Vec<(u64, u32, QueryPropertiesFlags, u32)>>>,
     }
 
     impl RasterizerInterface for FakeRasterizer {
@@ -884,14 +936,18 @@ mod tests {
         fn reset_counter(&mut self, _query_type: u32) {}
         fn query(
             &mut self,
-            _gpu_addr: u64,
-            _query_type: u32,
-            _flags: QueryPropertiesFlags,
+            gpu_addr: u64,
+            query_type: u32,
+            flags: QueryPropertiesFlags,
             _gpu_ticks: u64,
-            _payload: u32,
+            payload: u32,
             _subreport: u32,
             _gpu_write: Arc<dyn Fn(u64, &[u8]) + Send + Sync>,
         ) {
+            self.query_calls
+                .lock()
+                .unwrap()
+                .push((gpu_addr, query_type, flags, payload));
         }
         fn bind_graphics_uniform_buffer(
             &mut self,
@@ -910,7 +966,9 @@ mod tests {
         fn signal_reference(&mut self) {
             *self.reference_calls.lock().unwrap() += 1;
         }
-        fn release_fences(&mut self, _force: bool) {}
+        fn release_fences(&mut self, _force: bool) {
+            *self.release_fence_calls.lock().unwrap() += 1;
+        }
         fn flush_all(&mut self) {}
         fn flush_region(&mut self, _addr: u64, _size: u64) {}
         fn must_flush_region(&self, _addr: u64, _size: u64) -> bool {
@@ -976,5 +1034,45 @@ mod tests {
 
         assert_eq!(*waits.lock().unwrap(), 1);
         assert_eq!(*refs.lock().unwrap(), 1);
+    }
+
+    #[test]
+    fn semaphore_release_uses_payload_query_type() {
+        let mut puller = Puller::default();
+        let fake = Box::new(FakeRasterizer::default());
+        let queries = fake.query_calls.clone();
+        let raw: *const dyn RasterizerInterface = Box::leak(fake);
+        puller.bind_rasterizer(unsafe { &*raw });
+        puller.regs.reg_array[0x04] = 0x1;
+        puller.regs.reg_array[0x05] = 0x2345_6780;
+        puller.regs.reg_array[0x1B] = 0xDEAD_BEEF;
+
+        puller.process_semaphore_release();
+
+        let calls = queries.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, 0x1_2345_6780);
+        assert_eq!(calls[0].1, QueryType::Payload as u32);
+        assert_eq!(calls[0].2, QueryPropertiesFlags::IS_A_FENCE);
+        assert_eq!(calls[0].3, 0xDEAD_BEEF);
+    }
+
+    #[test]
+    fn semaphore_trigger_acquire_gequal_updates_acquire_registers_before_wait() {
+        let mut puller = Puller::default();
+        let fake = Box::new(FakeRasterizer::default());
+        let releases = fake.release_fence_calls.clone();
+        let raw: *const dyn RasterizerInterface = Box::leak(fake);
+        puller.bind_rasterizer(unsafe { &*raw });
+        puller.regs.reg_array[0x06] = 2;
+        puller.regs.reg_array[0x07] = GpuSemaphoreOperation::AcquireGequal as u32;
+
+        puller.process_semaphore_trigger_method();
+
+        assert_eq!(puller.regs.acquire_source(), 1);
+        assert_eq!(puller.regs.acquire_value(), 2);
+        assert_eq!(puller.regs.acquire_active(), 1);
+        assert_eq!(puller.regs.acquire_mode(), 1);
+        assert_eq!(*releases.lock().unwrap(), 1);
     }
 }
