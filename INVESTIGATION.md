@@ -1,0 +1,171 @@
+# Investigation: Why MK8D Hangs After ~4.5s
+
+## Branch: dev/claude-investigations
+## Date: 2026-04-10
+
+## Summary
+
+After all kernel/cpu_manager/jit fixes, MK8D still hangs after ~4.5s with no
+visible image and no audio output. Game thread (tid=73) keeps running ARM code
+but never makes another SVC after t=4.342461s. Worker threads (tid=84-92) are
+spawned, immediately call `WaitProcessWideKeyAtomic` with infinite timeout, and
+**never get woken up**.
+
+## Symptoms
+
+- **No frames rendered**: 0 `txn=7` (QueueBuffer) calls in 60s
+- **No audio output**: AudioRenderer's `RequestUpdate` is called repeatedly but
+  the underlying audio_core renderer never produces output that the game then
+  uses to signal "buffer ready"
+- **Worker thread starvation**: Worker threads spawned around t=1.78-1.84s never
+  make a second SVC after their initial wait
+
+## Thread State at Hang
+
+| Thread | Last activity | Status |
+|--------|--------------|--------|
+| tid=73 (game main) | 4.342461s — `SendSyncRequest(0x801f3)` | Running ARM code, no SVC |
+| tid=83 (worker) | 4.586144s — `WaitProcessWideKeyAtomic` | Blocked on condvar (∞ timeout) |
+| tid=82 (worker) | 4.339227s — `WaitProcessWideKeyAtomic` | Blocked on condvar (∞ timeout) |
+| tid=86-92 (workers) | ~1.84s — `WaitProcessWideKeyAtomic` | Blocked since 1.84s, **never woken** |
+| tid=94, 95, 96, 98, 100, 102 | ~3.3s | Blocked |
+
+## Critical Finding: Worker Condvar Keys Never Signaled
+
+Workers wait on keys in range `0x686a76e4` - `0x686a7f58` (heap-allocated
+condvar slots). Game thread tid=73 signals keys in range `0x686ab100`,
+`0x686ae100`, `0x686b7100` — completely different offsets within the same
+heap region.
+
+In zuyu, the equivalent worker tid=78 waits on `0x552880e8` and gets signaled
+by tid=75 (game) on the **same** key 18ms later.
+
+In ruzu, no signal is ever issued on the worker keys `0x686a76e4` etc.
+
+## Comparison: SVC Throughput
+
+| Metric | Zuyu (5s) | Ruzu (60s) |
+|--------|-----------|------------|
+| Total SVCs | 14,209 | 3,774 |
+| Active threads at t=4 | 8 (tid=104 dominant with 3200 SVCs) | 1 (tid=83 with 719 SVCs) |
+| MapPhysMemUnsafe (0x5f) | 3339 | 272 |
+| SignalProcessWideKey (0x1d/0x1b) | ~5500 | 686 |
+| QueueBuffer (game→display) | many | 0 |
+
+## Root Cause Hypothesis
+
+**Hypothesis A: Missing service implementation causes async event chain to break**
+
+Some service call (likely audio renderer or display vsync) returns success
+but doesn't trigger the async path that would later signal the worker condvars.
+The game's worker threads are spinning waiting for "work to do" notifications
+that should come from the service that didn't actually do its work.
+
+Strongest candidate: `audren:u IAudioRenderer::Start` — Start is called once
+at 4s but the audio thread that should signal "buffer ready" events isn't
+running real audio output.
+
+**Hypothesis B: KConditionVariable signaling is broken in Rust**
+
+The signal goes to a different Process or KConditionVariable instance than
+the wait. The signal_to_address path may be looking up the wrong process
+or wrong wait list. Could explain why signals on 0x686a... addresses don't
+wake waiters on neighboring 0x686a... addresses.
+
+**Hypothesis C: ApplyConditionVariable returns wrong waiter**
+
+In KConditionVariable::SignalImpl, the upstream code finds waiters by
+arbitration key. If the Rust implementation uses the wrong key (e.g. mutex
+addr vs condvar addr), waiters would never be found.
+
+## ROOT CAUSE FOUND: Worker Thread Core Affinity Bug
+
+The issue is that when the game creates worker threads with multi-core affinity,
+**ruzu's scheduler always puts them on core=0**, on the same core as the game
+main thread tid=73. This means all workers serialize through core=0.
+
+### Evidence
+
+In zuyu (working), worker threads are distributed across cores:
+```
+[  0.406835] SCHED core=1 from_tid=10 to_tid=78
+[  0.413762] SCHED core=0 from_tid=75 to_tid=79
+[  0.437694] SCHED core=1 from_tid=78 to_tid=80
+[  0.444036] SCHED core=1 from_tid=10 to_tid=82
+[  0.444128] SCHED core=2 from_tid=12 to_tid=83
+```
+
+In ruzu (broken), all worker threads queue on core=0:
+```
+[  1.844090] SCHED core=0 from_tid=73 to_tid=86
+[  1.844226] SCHED core=0 from_tid=86 to_tid=87
+[  1.844351] SCHED core=0 from_tid=87 to_tid=88
+[  1.844475] SCHED core=0 from_tid=88 to_tid=89
+[  1.844604] SCHED core=0 from_tid=89 to_tid=90
+[  1.844728] SCHED core=0 from_tid=90 to_tid=91
+[  1.844855] SCHED core=0 from_tid=91 to_tid=92
+```
+
+### Why This Causes the Hang
+
+1. Game creates 7 worker threads in rapid succession
+2. Each worker calls `WaitProcessWideKeyAtomic(infinite_timeout)` immediately
+3. Game expects to signal them later as work becomes available
+4. But because they're all on core=0, they only run when game thread yields
+5. By the time they call wait, the game has already moved past the signal point
+6. Workers wait forever on stale condvars
+
+In zuyu, workers run on cores 1-3 IMMEDIATELY in parallel with the game on core 0.
+The wait → signal → wake sequence happens within milliseconds.
+
+## Detailed Code Path Analysis
+
+The thread creation/scheduling code paths in ruzu vs zuyu are functionally
+equivalent for the **first** wave of worker threads (tid=77-84). Both create
+the thread with `affinity=0b0001`, then SetThreadCoreMask updates the affinity,
+and the thread starts on the right core.
+
+### The actual divergence: second wave of worker threads
+
+The game creates a SECOND wave of worker threads at ~1.82s in ruzu (tid=85-92,
+seven threads in rapid succession). For these:
+- **No SetThreadCoreMask is called** before they become RUNNABLE
+- They all default to `core_id=0, affinity=0b0001`
+- All seven queue up on core 0 sequentially behind tid=73
+
+In zuyu, the same pattern of CreateThreads happens, but the threads end up
+distributed across cores. The reason must be one of:
+1. zuyu calls SetThreadCoreMask later after StartThread (ruzu doesn't capture
+   this path because it uses the default mask)
+2. zuyu's scheduler does **migration** of newly-created threads via the
+   suggested_queue → scheduled_queue path (we have this code but it requires
+   the thread to be in the suggested_queue, which only happens if affinity
+   has multiple bits set)
+3. The game's NPDM has `process.core_mask = 0b1111` and zuyu's CreateThread
+   actually sets `affinity = process.core_mask` at creation, not just the
+   single ideal core bit
+
+### Hypothesis to verify
+
+In upstream `svc::CreateThread`, after resolving `core_id` from
+`USE_PROCESS_DEFAULT`, what affinity does the new thread end up with?
+
+Need to trace upstream's `KThread::InitializeUserThread` to confirm whether
+it really sets `m_physical_affinity_mask = 1ULL << virt_core` (single bit)
+or if it sets it to the process's core mask (multi-bit).
+
+If upstream uses single-bit, then the migration code MUST be the difference.
+But ruzu's migration code only triggers when there's a thread in the
+suggested_queue for an idle core, which requires multi-bit affinity.
+
+### Most likely actual fix
+
+The game expects that worker threads created with `core_id=USE_PROCESS_DEFAULT`
+get the **process's full core mask** as their affinity, not just the single
+ideal core bit. Both upstream and ruzu currently set single-bit, so this
+isn't a "ruzu-only" bug — but somehow zuyu still distributes the work.
+
+The remaining mystery: how does zuyu distribute identical-affinity
+single-core-bit worker threads across cores? Either:
+- zuyu calls SetCoreMask on these threads via a code path we haven't traced
+- zuyu's scheduler has additional load-balancing logic we haven't found yet
