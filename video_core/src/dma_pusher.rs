@@ -10,6 +10,8 @@ use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
+use common::settings;
+use ruzu_core::core::SystemRef;
 use crate::engines::engine_interface::EngineInterface;
 use crate::engines::engine_interface::EngineTypes;
 use crate::engines::puller::{EngineID, MethodCall, Puller};
@@ -215,6 +217,7 @@ pub struct DmaPusher {
     subchannels: [Option<[usize; 2]>; MAX_SUBCHANNELS],
     subchannel_type: [EngineTypes; MAX_SUBCHANNELS],
     gpu: *const crate::gpu::Gpu,
+    system: SystemRef,
     memory_manager: Arc<Mutex<crate::memory_manager::MemoryManager>>,
     puller: Puller,
 }
@@ -227,6 +230,7 @@ impl DmaPusher {
     /// Creates a new DmaPusher.
     pub fn new(
         gpu: *const crate::gpu::Gpu,
+        system: SystemRef,
         memory_manager: Arc<Mutex<crate::memory_manager::MemoryManager>>,
         channel_state: *mut crate::control::channel_state::ChannelState,
     ) -> Self {
@@ -241,6 +245,7 @@ impl DmaPusher {
             subchannels: [None; MAX_SUBCHANNELS],
             subchannel_type: [EngineTypes::Maxwell3D; MAX_SUBCHANNELS],
             gpu,
+            system,
             memory_manager,
             puller: Puller::new(
                 gpu,
@@ -294,8 +299,11 @@ impl DmaPusher {
         self.dma_pushbuffer_subindex = 0;
         self.dma_state.is_last_call = true;
 
-        // In the full port, this loops while system.is_powered_on().
-        while self.step() {}
+        while self.system.is_null() || self.system.get().is_powered_on() {
+            if !self.step() {
+                break;
+            }
+        }
 
         let gpu = unsafe { &*self.gpu };
         gpu.flush_commands();
@@ -403,20 +411,7 @@ impl DmaPusher {
             );
 
             let command_count = command_list_header.size() as usize;
-            let byte_len = command_count * std::mem::size_of::<CommandHeader>();
-            let mut raw = vec![0u8; byte_len];
-            let gpu = unsafe { &*self.gpu };
-            let mm = self.memory_manager.lock();
-            mm.read_block_unsafe(command_list_header.addr(), &mut raw, &|cpu_addr, dst| {
-                if !gpu.read_guest_memory(cpu_addr, dst) {
-                    log::warn!(
-                        "DmaPusher: read_guest_memory FAILED cpu_addr={:#x} len={}",
-                        cpu_addr,
-                        dst.len()
-                    );
-                }
-            });
-            drop(mm);
+            let raw = self.fetch_command_bytes(command_list_header.addr(), command_count);
 
             self.command_headers.clear();
             self.command_headers
@@ -478,20 +473,7 @@ impl DmaPusher {
             );
 
             let command_count = command_list_header.size() as usize;
-            let byte_len = command_count * std::mem::size_of::<CommandHeader>();
-            let mut raw = vec![0u8; byte_len];
-            let gpu = unsafe { &*self.gpu };
-            let mm = self.memory_manager.lock();
-            mm.read_block_unsafe(command_list_header.addr(), &mut raw, &|cpu_addr, dst| {
-                if !gpu.read_guest_memory(cpu_addr, dst) {
-                    log::warn!(
-                        "DmaPusher: read_guest_memory FAILED cpu_addr={:#x} len={}",
-                        cpu_addr,
-                        dst.len()
-                    );
-                }
-            });
-            drop(mm);
+            let raw = self.fetch_command_bytes(command_list_header.addr(), command_count);
 
             self.command_headers.clear();
             self.command_headers
@@ -502,6 +484,44 @@ impl DmaPusher {
             self.process_commands_with_engine(&commands, engine);
         }
         true
+    }
+
+    fn should_use_unsafe_read(&self) -> bool {
+        let gpu_level_high = {
+            let values = settings::values();
+            settings::is_gpu_level_high(&values)
+        };
+        if gpu_level_high {
+            if self.dma_state.method >= MACRO_REGISTERS_START {
+                return true;
+            }
+            return self.puller.bound_engines[self.dma_state.subchannel as usize]
+                == Some(EngineID::KeplerComputeB)
+                && self.dma_state.method == COMPUTE_INLINE;
+        }
+        true
+    }
+
+    fn fetch_command_bytes(&self, gpu_addr: GPUVAddr, command_count: usize) -> Vec<u8> {
+        let byte_len = command_count * std::mem::size_of::<CommandHeader>();
+        let mut raw = vec![0u8; byte_len];
+        let gpu = unsafe { &*self.gpu };
+        let mm = self.memory_manager.lock();
+        let read_cpu = |cpu_addr, dst: &mut [u8]| {
+            if !gpu.read_guest_memory(cpu_addr, dst) {
+                log::warn!(
+                    "DmaPusher: read_guest_memory FAILED cpu_addr={:#x} len={}",
+                    cpu_addr,
+                    dst.len()
+                );
+            }
+        };
+        if self.should_use_unsafe_read() {
+            mm.read_block_unsafe(gpu_addr, &mut raw, &read_cpu);
+        } else {
+            mm.read_block(gpu_addr, &mut raw, &read_cpu);
+        }
+        raw
     }
 
     fn process_commands(&mut self, commands: &[CommandHeader]) {
@@ -769,6 +789,8 @@ impl DmaPusher {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use common::settings;
+    use common::settings_enums::GpuAccuracy;
     use crate::control::channel_state::ChannelState;
 
     #[test]
@@ -778,6 +800,7 @@ mod tests {
         let channel_ptr: *mut ChannelState = &mut *channel_state;
         let mut dma = Box::new(DmaPusher::new(
             std::ptr::null(),
+            SystemRef::null(),
             memory_manager,
             channel_ptr,
         ));
@@ -786,5 +809,55 @@ mod tests {
         dma.install_self_reference();
 
         assert_eq!(dma.puller.dma_pusher_ptr_for_test(), dma_ptr);
+    }
+
+    #[test]
+    fn should_use_unsafe_read_matches_upstream_gpu_accuracy_branching() {
+        let mut channel_state = Box::new(ChannelState::new(9));
+        let memory_manager = Arc::new(Mutex::new(crate::memory_manager::MemoryManager::new(1)));
+        let channel_ptr: *mut ChannelState = &mut *channel_state;
+        let dma = DmaPusher::new(std::ptr::null(), SystemRef::null(), memory_manager, channel_ptr);
+
+        let previous_accuracy = {
+            let values = settings::values();
+            values.current_gpu_accuracy
+        };
+
+        {
+            let mut values = settings::values_mut();
+            values.current_gpu_accuracy = GpuAccuracy::High;
+        }
+        assert!(!dma.should_use_unsafe_read());
+
+        {
+            let mut values = settings::values_mut();
+            values.current_gpu_accuracy = GpuAccuracy::Normal;
+        }
+        assert!(dma.should_use_unsafe_read());
+
+        settings::values_mut().current_gpu_accuracy = previous_accuracy;
+    }
+
+    #[test]
+    fn dispatch_calls_stops_when_system_is_not_powered_on() {
+        let system = ruzu_core::core::System::new();
+        let gpu = crate::gpu::Gpu::new(false, false);
+        gpu.set_system_ref(SystemRef::from_ref(&system));
+        let mut channel_state = Box::new(ChannelState::new(11));
+        let memory_manager = Arc::new(Mutex::new(crate::memory_manager::MemoryManager::new(1)));
+        let channel_ptr: *mut ChannelState = &mut *channel_state;
+        let mut dma = DmaPusher::new(
+            &gpu as *const crate::gpu::Gpu,
+            SystemRef::from_ref(&system),
+            memory_manager,
+            channel_ptr,
+        );
+
+        dma.push(CommandList::from_prefetch(vec![CommandHeader {
+            raw: build_command_header(BufferMethods::Nop, 0, SubmissionMode::Increasing).raw,
+        }]));
+        dma.dispatch_calls();
+
+        assert_eq!(dma.dma_pushbuffer.len(), 1);
     }
 }

@@ -2854,11 +2854,10 @@ impl KThread {
     /// Matches upstream `KThread::EndWait()`.
     pub fn end_wait(&mut self, _wait_result: u32) {
         let _scheduler_lock = self.lock_scheduler();
-        self.sleep_deadline = None;
-        self.waiting_lock_info = None;
-        self.clear_wait_synchronization();
-        self.wait_result = _wait_result;
-        self.apply_wait_result_to_context();
+
+        if self.get_state() != ThreadState::WAITING {
+            return;
+        }
 
         // Upstream: ASSERT_MSG(false, "wait_queue is nullptr!"); return;
         // Avoid a hard crash — log and return early like upstream.
@@ -2867,23 +2866,28 @@ impl KThread {
             return;
         };
         wait_queue.end_wait(self, _wait_result);
+        self.sleep_deadline = None;
+        self.waiting_lock_info = None;
+        self.apply_wait_result_to_context();
     }
 
     /// Cancel wait.
     /// Matches upstream `KThread::CancelWait()`.
     pub fn cancel_wait(&mut self, _wait_result: u32, _cancel_timer_task: bool) {
         let _scheduler_lock = self.lock_scheduler();
-        self.sleep_deadline = None;
-        self.waiting_lock_info = None;
-        self.clear_wait_synchronization();
-        self.wait_result = _wait_result;
-        self.apply_wait_result_to_context();
+
+        if self.get_state() != ThreadState::WAITING {
+            return;
+        }
 
         let wait_queue = self
             .wait_queue
             .clone()
             .expect("KThread::cancel_wait requires wait_queue while waiting");
         wait_queue.cancel_wait(self, _wait_result, _cancel_timer_task);
+        self.sleep_deadline = None;
+        self.waiting_lock_info = None;
+        self.apply_wait_result_to_context();
     }
 
     /// Set the thread's activity (pause/resume).

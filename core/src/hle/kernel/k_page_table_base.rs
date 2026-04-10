@@ -1664,20 +1664,24 @@ impl KPageTableBase {
     pub fn unmap_memory(&mut self, dst: usize, src: usize, size: usize) -> u32 {
         let num_pages = size / PAGE_SIZE;
 
-        // Check source is locked/aliased.
-        let result = self.check_memory_state(
+        // Check source is locked/aliased and capture original state.
+        let (result, out_src_state, _, _, _) = self.check_memory_state_range(
             src,
             size,
             KMemoryState::FLAG_CAN_ALIAS,
             KMemoryState::FLAG_CAN_ALIAS,
-            KMemoryPermission::NONE,
-            KMemoryPermission::NONE,
+            KMemoryPermission::from_bits_truncate(0xFF),
+            KMemoryPermission::from_bits_truncate(
+                KMemoryPermission::NOT_MAPPED.bits() | KMemoryPermission::KERNEL_READ.bits(),
+            ),
             KMemoryAttribute::from_bits_truncate(0xFF),
             KMemoryAttribute::LOCKED,
+            Self::DEFAULT_MEMORY_IGNORE_ATTR,
         );
         if result != 0 {
             return result;
         }
+        let src_state = out_src_state.unwrap_or(KMemoryState::NORMAL);
 
         // Check destination is Stack.
         let result = self.check_memory_state(
@@ -1729,7 +1733,7 @@ impl KPageTableBase {
         self.m_memory_block_manager.update(
             src,
             num_pages,
-            KMemoryState::NORMAL,
+            src_state,
             KMemoryPermission::USER_READ_WRITE,
             KMemoryAttribute::NONE,
             KMemoryBlockDisableMergeAttribute::NONE,
@@ -3587,5 +3591,39 @@ mod tests {
         let info = page_table.query_info(0x1000_5ff0).unwrap();
         assert_eq!(info.m_state, KMemoryState::STACK);
         assert_eq!(info.m_permission, KMemoryPermission::USER_READ_WRITE);
+    }
+
+    #[test]
+    fn unmap_memory_restores_original_source_state() {
+        let mut page_table = KPageTableBase::new();
+        page_table.m_address_space_start = 0x1000_0000;
+        page_table.m_address_space_end = 0x1001_0000;
+        page_table.m_alias_region_start = 0x1000_0000;
+        page_table.m_alias_region_end = 0x1001_0000;
+        page_table.m_stack_region_start = 0x1000_0000;
+        page_table.m_stack_region_end = 0x1001_0000;
+        page_table
+            .m_memory_block_manager
+            .initialize(page_table.m_address_space_start, page_table.m_address_space_end);
+        page_table.m_memory_block_manager.update(
+            0x1000_8000,
+            2,
+            KMemoryState::STACK,
+            KMemoryPermission::USER_READ_WRITE,
+            KMemoryAttribute::NONE,
+            KMemoryBlockDisableMergeAttribute::NONE,
+            KMemoryBlockDisableMergeAttribute::NONE,
+        );
+
+        assert_eq!(page_table.map_memory(0x1000_4000, 0x1000_8000, 0x2000), 0);
+        assert_eq!(page_table.unmap_memory(0x1000_4000, 0x1000_8000, 0x2000), 0);
+
+        let src_info = page_table.query_info(0x1000_8ff0).unwrap();
+        let dst_info = page_table.query_info(0x1000_4ff0).unwrap();
+        assert_eq!(src_info.m_state, KMemoryState::STACK);
+        assert_eq!(src_info.m_permission, KMemoryPermission::USER_READ_WRITE);
+        assert_eq!(src_info.m_attribute, KMemoryAttribute::NONE);
+        assert_eq!(dst_info.m_state, KMemoryState::FREE);
+        assert_eq!(dst_info.m_permission, KMemoryPermission::NONE);
     }
 }

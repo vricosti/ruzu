@@ -1947,6 +1947,7 @@
 
 ### Unintentional differences (to fix)
 - Fixed in this pass: `process_query_get()` no longer passes a no-op writer callback to `rasterizer.query(...)` when a rasterizer is bound. This previously allowed report semaphore queries to "succeed" without writing their payload/timestamp back to guest-visible memory, diverging from upstream `Rasterizer*::QueryFallback(...)`.
+- Fixed in this pass: the long-query fallback path in `process_query_get()` now stamps the current GPU tick value when no rasterizer handles the query, matching upstream `StampQueryResult(payload, true)` more closely instead of always appending a zero timestamp.
 
 ### Missing items
 - Full ownership split cleanup for the Rust-only `guest_memory_reader` / `guest_memory_writer` bridges.
@@ -2215,9 +2216,12 @@
 
 ### Intentional differences
 - Rust still records dispatch calls into a local queue instead of directly calling the upstream rasterizer dispatch path from `ProcessLaunch()`.
+- Rust still does not own a literal upstream `Core::System& system` field in `KeplerCompute`. This bounded slice only ports the upstream `MemoryManager&` constructor owner directly.
 
 ### Unintentional differences (to fix)
 - Fixed in this pass: the owner file now has `bind_rasterizer()` and stores the rasterizer edge locally, matching upstream method ownership in `kepler_compute.cpp`.
+- Fixed in this pass: `KeplerCompute::call_method()` now triggers the `launch` side effect like upstream instead of only the Rust-only `Engine::write_reg()` path observing launches.
+- Fixed in this pass: `KeplerCompute` now owns `MemoryManager` at construction time, matching the upstream constructor boundary more closely instead of remaining ownerless.
 
 ### Missing items
 - Upstream `upload_state.BindRasterizer(rasterizer)` is still missing because the full `upload_state` owner path is not ported in this file yet.
@@ -2513,12 +2517,16 @@
 
 ### Intentional differences
 - Rust keeps a simplified DMA execution backend while preserving the upstream `launch_dma` trigger ownership.
+- Rust still does not own a literal upstream `Core::System& system` field in `MaxwellDMA`. This bounded slice only ports the upstream `MemoryManager&` constructor owner directly.
 
 ### Unintentional differences (to fix)
+- Fixed in this pass: `MaxwellDMA::call_method()` now triggers the `launch_dma` side effect like upstream instead of only the Rust-only `Engine::write_reg()` path observing launches.
+- Fixed in this pass: `MaxwellDMA` now owns `MemoryManager` at construction time, matching the upstream constructor boundary more closely instead of remaining fully ownerless.
 - full launch semantics, remap behavior, and acceleration paths remain simplified.
 
 ### Missing items
 - full DMA launch behavior parity
+- re-audit the constructor again once the broader `Core::System&` owner graph is ported more literally through `ChannelState`
 
 ### Binary layout verification
 - PASS: `launch_dma` remains the executable register in the engine-local `execution_mask`.
@@ -6998,6 +7006,7 @@
 - Fixed in this pass: Rust now has a dedicated `initialize_high_priority_thread(...)` owner matching upstream `KThread::InitializeHighPriorityThread(...)`, instead of reusing `initialize_kernel_main_thread(...)` and patching `thread_type` afterward.
 - Fixed in this pass: shutdown-thread initialization now installs `ThreadType::HighPriority`, `priority/base_priority = 0`, and `ThreadState::INITIALIZED`, matching the upstream `InitializeThread(..., ThreadType::HighPriority, ...)` contract more closely.
 - Fixed in this pass: `notify_available(...)`, `end_wait(...)`, and `cancel_wait(...)` now acquire the scheduler lock in the owner file before touching wait state, matching upstream `KThread::NotifyAvailable`, `EndWait`, and `CancelWait` ordering and removing a race where Rust could observe `state=Waiting` with a cleared `wait_queue`.
+- Fixed in this pass: Rust `end_wait(...)` / `cancel_wait(...)` no longer pre-clear wait-related state before delegating to the queue owner. They now follow the upstream ordering more closely: check `state == Waiting`, then delegate to `m_wait_queue`, then update the Rust-only host/context bookkeeping afterward.
 
 ### Missing items
 - Fixed in this pass: the ownerless kernel-thread call sites now share a single owner-local helper in `k_thread.rs`, which is closer to the upstream `InitializeThread(...)` boundary for `InitializeMainThread`, `InitializeIdleThread`, and `InitializeHighPriorityThread`.
@@ -7297,3 +7306,86 @@
 
 ### Binary layout verification
 - PASS: thread-creation control flow only; no raw serialized struct layout changed.
+
+## 2026-04-10 — `core/src/hle/kernel/k_page_table_base.rs` vs `src/core/hle/kernel/k_page_table_base.cpp`
+
+### Intentional differences
+- Rust still uses the simplified local `operate(...)` path without upstream `KScopedLightLock`, `KScopedPageTableUpdater`, or explicit memory-block update allocators in this owner. The page-table behavior remains file-local, but these lifecycle helpers are still structurally flatter than upstream.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `KPageTableBase::UnmapMemory(...)` now validates the source range with the upstream permission contract `KernelRead | NotMapped` plus `Locked` attribute, instead of accepting any permission.
+- Fixed in this pass: `KPageTableBase::UnmapMemory(...)` now restores the captured original source `KMemoryState` after unmapping, instead of hardcoding `KMemoryState::NORMAL`.
+- Rust still does not capture and use the upstream destination permission output from `CheckMemoryState(...)` in `UnmapMemory(...)`; the current Rust path only validates destination state/attribute and does not thread `dst_perm` through.
+
+### Missing items
+- Re-audit `MapMemory(...)`/`UnmapMemory(...)` once the upstream updater/allocator helper boundaries are ported more literally.
+- Re-audit whether the remaining flattened `operate(...)` call sites preserve the same failure-revert ordering as upstream `KScopedPageTableUpdater`.
+
+### Binary layout verification
+- PASS: page-table state transitions only; no raw serialized struct layout changed.
+
+## 2026-04-10 — `video_core/src/dma_pusher.rs` vs `src/video_core/dma_pusher.cpp`
+
+### Intentional differences
+- Rust stores upstream `Core::System& system` as `SystemRef`, which is the project-wide non-owning Rust equivalent for long-lived `System&` ownership. Tests still permit `SystemRef::null()` as a local harness adaptation; runtime callsites now pass the owning GPU `SystemRef`.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `DmaPusher::step()`/`step_with_engine()` no longer always fetch command headers through `ReadBlockUnsafe`. Rust now matches the upstream `SafeRead`/`UnsafeRead` branching:
+  - `UnsafeRead` for macro fetches
+  - `UnsafeRead` for `KeplerCompute` inline fetches
+  - `SafeRead` otherwise when GPU accuracy is High/Extreme
+  - `UnsafeRead` otherwise
+- Fixed in this pass: `DmaPusher` now owns the upstream `Core::System&` equivalent through `SystemRef`, and `dispatch_calls()` now matches the upstream `while (system.IsPoweredOn()) { if (!Step()) break; }` loop guard instead of draining purely on `step()`.
+
+### Missing items
+- Re-audit remaining `Settings::IsGPULevelHigh()` behavior together with the surrounding `MemoryManager` safe/unsafe fetch helpers once more GPU command paths are exercised.
+
+### Binary layout verification
+- PASS: command fetch control flow only; no raw serialized struct layout changed.
+
+## 2026-04-10 — `video_core/src/engines/kepler_memory.rs` vs `src/video_core/engines/kepler_memory.cpp`
+
+### Intentional differences
+- Rust still does not own a literal upstream `Core::System& system` field in `KeplerMemory`. The remaining upstream `system` dependency is still bridged locally through the existing guest-memory writer callback.
+- Rust `upload_state` still owns a copied register snapshot instead of the upstream `Upload::State(memory_manager, regs.upload)` reference boundary. This is an existing owner-local adaptation in `engine_upload.rs`.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `KeplerMemory` now owns `MemoryManager` at construction time, matching the upstream constructor boundary much more closely instead of receiving it later through a Rust-only setter.
+
+### Missing items
+- Re-audit whether `upload_state` can be made to follow the upstream live-register reference boundary more literally.
+- Re-audit whether the remaining guest-memory writer bridge can be replaced with a closer `System&` owner once the `video_core` constructor graph is less flattened.
+
+### Binary layout verification
+- PASS: engine constructor wiring only; no raw serialized struct layout changed.
+
+## 2026-04-10 — `video_core/src/control/channel_state.rs` vs `src/video_core/control/channel_state.cpp`
+
+### Intentional differences
+- Rust still constructs several engine owners with flattened `new()` plus follow-up setter wiring where upstream passes `Core::System&` and `MemoryManager&` directly through constructors. This broader constructor parity gap remains open mainly for `Maxwell3D`.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `ChannelState::Init` no longer creates `KeplerMemory` first and injects its `MemoryManager` later. It now passes the owner at construction like upstream.
+- Fixed in this pass: `ChannelState::Init` now also constructs `MaxwellDMA` with the upstream-owned `MemoryManager` instead of an ownerless `new()` path.
+- Fixed in this pass: `ChannelState::Init` now also constructs `KeplerCompute` with the upstream-owned `MemoryManager` instead of an ownerless `new()` path.
+- Fixed in this pass: `ChannelState::Init` now passes the GPU-owned `SystemRef` into `DmaPusher::new(...)`, matching the upstream `DmaPusher(system, gpu, memory_manager, *this)` constructor boundary much more closely.
+
+### Missing items
+- Re-audit `ChannelState::Init` once the remaining engine constructors are ported closer to upstream ownership.
+
+### Binary layout verification
+- PASS: channel engine wiring only; no raw serialized struct layout changed.
+
+## 2026-04-10 — `video_core/src/gpu.rs` vs `src/video_core/gpu.cpp`
+
+### Intentional differences
+- Rust stores upstream `Core::System& system` as `SystemRef` behind a mutex because `Gpu` is constructed before the concrete `System` is wired in. This remains the existing project-wide `System&` adaptation.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `Gpu` now exposes its stored `SystemRef` through an owner-local accessor so `ChannelState::Init` can pass the upstream `system` owner into `DmaPusher`, instead of reaching through a flattened or duplicated path.
+
+### Missing items
+- Re-audit broader `Gpu` constructor ordering against upstream once the remaining `video_core` engine constructors take literal owner arguments more consistently.
+
+### Binary layout verification
+- PASS: accessor-only change; no raw serialized struct layout changed.

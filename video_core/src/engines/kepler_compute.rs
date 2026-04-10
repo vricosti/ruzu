@@ -8,8 +8,13 @@
 //! recorded as a `DispatchCall`. The backend later consumes these via
 //! `take_dispatch_calls()`.
 
+use std::sync::Arc;
+
+use parking_lot::Mutex;
+
 use super::engine_interface::{EngineInterface, EngineInterfaceState};
 use super::{ClassId, Engine, PendingWrite, ENGINE_REG_COUNT};
+use crate::memory_manager::MemoryManager;
 use crate::rasterizer_interface::RasterizerInterface;
 
 // ── Register offset constants (method addresses) ────────────────────────────
@@ -143,6 +148,7 @@ pub struct DispatchCall {
 pub struct KeplerCompute {
     regs: Box<[u32; ENGINE_REG_COUNT]>,
     interface_state: EngineInterfaceState,
+    memory_manager: Arc<Mutex<MemoryManager>>,
     dispatch_calls: Vec<DispatchCall>,
     /// QMD GPU VA set on LAUNCH write, consumed by execute_pending.
     pending_launch: Option<u64>,
@@ -150,7 +156,10 @@ pub struct KeplerCompute {
 }
 
 impl KeplerCompute {
-    pub fn new() -> Self {
+    /// Corresponds to upstream `KeplerCompute(Core::System&, MemoryManager&)`.
+    /// Rust stores the upstream `MemoryManager&` owner directly here; the wider
+    /// `System&` dependency remains outside this bounded slice.
+    pub fn new(memory_manager: Arc<Mutex<MemoryManager>>) -> Self {
         Self {
             regs: Box::new([0u32; ENGINE_REG_COUNT]),
             interface_state: {
@@ -160,6 +169,7 @@ impl KeplerCompute {
                 state.execution_mask[LAUNCH as usize] = true;
                 state
             },
+            memory_manager,
             dispatch_calls: Vec::new(),
             pending_launch: None,
             rasterizer: None,
@@ -171,6 +181,11 @@ impl KeplerCompute {
         let idx = method as usize;
         if idx < ENGINE_REG_COUNT {
             self.regs[idx] = argument;
+        }
+        if method == LAUNCH {
+            let qmd_addr = self.launch_desc_address();
+            self.pending_launch = Some(qmd_addr);
+            log::debug!("KeplerCompute: LAUNCH queued, QMD @ 0x{:X}", qmd_addr);
         }
     }
 
@@ -245,7 +260,7 @@ impl KeplerCompute {
 
 impl Default for KeplerCompute {
     fn default() -> Self {
-        Self::new()
+        Self::new(Arc::new(Mutex::new(MemoryManager::new(0))))
     }
 }
 
@@ -301,18 +316,10 @@ impl Engine for KeplerCompute {
     }
 
     fn write_reg(&mut self, method: u32, value: u32) {
-        let idx = method as usize;
-        if idx < ENGINE_REG_COUNT {
-            self.regs[idx] = value;
-        }
-
-        if method == LAUNCH {
-            let qmd_addr = self.launch_desc_address();
-            self.pending_launch = Some(qmd_addr);
-            log::debug!("KeplerCompute: LAUNCH queued, QMD @ 0x{:X}", qmd_addr);
-        } else {
+        if method != LAUNCH {
             log::trace!("KeplerCompute: reg[0x{:X}] = 0x{:X}", method, value);
         }
+        self.call_method(method, value, true);
     }
 
     fn execute_pending(&mut self, read_gpu: &dyn Fn(u64, &mut [u8])) -> Vec<PendingWrite> {
@@ -362,22 +369,26 @@ impl Engine for KeplerCompute {
 mod tests {
     use super::*;
 
+    fn new_test_engine() -> KeplerCompute {
+        KeplerCompute::new(Arc::new(Mutex::new(MemoryManager::new(0))))
+    }
+
     #[test]
     fn test_class_id() {
-        let engine = KeplerCompute::new();
+        let engine = new_test_engine();
         assert_eq!(engine.class_id(), ClassId::Compute);
     }
 
     #[test]
     fn test_write_reg() {
-        let mut engine = KeplerCompute::new();
+        let mut engine = new_test_engine();
         engine.write_reg(0x100, 0xDEAD);
         assert_eq!(engine.regs[0x100], 0xDEAD);
     }
 
     #[test]
     fn test_write_reg_high_method() {
-        let mut engine = KeplerCompute::new();
+        let mut engine = new_test_engine();
         engine.write_reg(TEX_CB_INDEX, 5);
         assert_eq!(engine.regs[TEX_CB_INDEX as usize], 5);
         assert_eq!(engine.tex_cb_index(), 5);
@@ -385,14 +396,14 @@ mod tests {
 
     #[test]
     fn test_launch_desc_address() {
-        let mut engine = KeplerCompute::new();
+        let mut engine = new_test_engine();
         engine.regs[QMD_ADDRESS as usize] = 0x1234;
         assert_eq!(engine.launch_desc_address(), 0x1234 << 8);
     }
 
     #[test]
     fn test_code_address() {
-        let mut engine = KeplerCompute::new();
+        let mut engine = new_test_engine();
         engine.regs[CODE_LOC_BASE as usize] = 0x0001; // high
         engine.regs[(CODE_LOC_BASE + 1) as usize] = 0x2000; // low
         assert_eq!(engine.code_address(), 0x0001_0000_2000);
@@ -400,7 +411,7 @@ mod tests {
 
     #[test]
     fn test_tsc_address() {
-        let mut engine = KeplerCompute::new();
+        let mut engine = new_test_engine();
         engine.regs[TSC_BASE as usize] = 0x0002; // high
         engine.regs[(TSC_BASE + 1) as usize] = 0x4000; // low
         engine.regs[(TSC_BASE + 2) as usize] = 64; // limit
@@ -410,7 +421,7 @@ mod tests {
 
     #[test]
     fn test_tic_address() {
-        let mut engine = KeplerCompute::new();
+        let mut engine = new_test_engine();
         engine.regs[TIC_BASE as usize] = 0x0003; // high
         engine.regs[(TIC_BASE + 1) as usize] = 0x8000; // low
         engine.regs[(TIC_BASE + 2) as usize] = 128; // limit
@@ -500,7 +511,7 @@ mod tests {
 
     #[test]
     fn test_launch_creates_dispatch() {
-        let mut engine = KeplerCompute::new();
+        let mut engine = new_test_engine();
 
         // Set up code address.
         engine.regs[CODE_LOC_BASE as usize] = 0x0001;
@@ -555,7 +566,7 @@ mod tests {
 
     #[test]
     fn test_multiple_dispatches() {
-        let mut engine = KeplerCompute::new();
+        let mut engine = new_test_engine();
         engine.regs[QMD_ADDRESS as usize] = 0x100;
 
         let qmd_bytes = make_qmd_bytes(&[0u32; QMD_WORD_COUNT]);
@@ -581,7 +592,7 @@ mod tests {
 
     #[test]
     fn test_take_dispatch_calls_drains() {
-        let mut engine = KeplerCompute::new();
+        let mut engine = new_test_engine();
         engine.regs[QMD_ADDRESS as usize] = 0x100;
         let qmd_bytes = make_qmd_bytes(&[0u32; QMD_WORD_COUNT]);
 
@@ -603,7 +614,7 @@ mod tests {
         let syncpoints =
             std::sync::Arc::new(crate::host1x::syncpoint_manager::SyncpointManager::new());
         let rasterizer = crate::renderer_null::null_rasterizer::RasterizerNull::new(syncpoints);
-        let mut engine = KeplerCompute::new();
+        let mut engine = new_test_engine();
         assert!(engine.rasterizer.is_none());
         engine.bind_rasterizer(&rasterizer);
         assert!(engine.rasterizer.is_some());
@@ -611,7 +622,7 @@ mod tests {
 
     #[test]
     fn test_no_pending_no_dispatch() {
-        let mut engine = KeplerCompute::new();
+        let mut engine = new_test_engine();
 
         // Call execute_pending without writing LAUNCH.
         let writes = engine.execute_pending(&|_addr, _buf| {
@@ -621,5 +632,21 @@ mod tests {
 
         let dispatches = engine.take_dispatch_calls();
         assert!(dispatches.is_empty());
+    }
+
+    #[test]
+    fn test_call_method_launch_sets_pending() {
+        let mut engine = new_test_engine();
+        engine.regs[QMD_ADDRESS as usize] = 0x123;
+        assert!(engine.pending_launch.is_none());
+        engine.call_method(LAUNCH, 1, true);
+        assert_eq!(engine.pending_launch, Some(0x123 << 8));
+    }
+
+    #[test]
+    fn test_constructor_keeps_memory_manager_owner() {
+        let memory_manager = Arc::new(Mutex::new(MemoryManager::new(0)));
+        let engine = KeplerCompute::new(Arc::clone(&memory_manager));
+        assert!(Arc::ptr_eq(&engine.memory_manager, &memory_manager));
     }
 }

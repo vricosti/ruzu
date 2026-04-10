@@ -88,19 +88,24 @@ pub struct KeplerMemory {
     pub regs: Regs,
     pub upload_state: engine_upload::State,
     pub interface_state: EngineInterfaceState,
-    memory_manager: Option<Arc<Mutex<MemoryManager>>>,
+    memory_manager: Arc<Mutex<MemoryManager>>,
     rasterizer: Option<[usize; 2]>,
     guest_memory_writer: Option<Arc<dyn Fn(u64, &[u8]) + Send + Sync>>,
 }
 
 impl KeplerMemory {
     /// Create a new KeplerMemory engine.
-    pub fn new() -> Self {
+    ///
+    /// Corresponds to upstream `KeplerMemory(Core::System&, MemoryManager&)`.
+    /// Rust stores only the upstream `MemoryManager&` owner directly here; the
+    /// remaining `System&` dependency is still bridged through the guest-memory
+    /// writer callback kept local to this file.
+    pub fn new(memory_manager: Arc<Mutex<MemoryManager>>) -> Self {
         Self {
             regs: Regs::default(),
             upload_state: engine_upload::State::new(),
             interface_state: EngineInterfaceState::new(),
-            memory_manager: None,
+            memory_manager,
             rasterizer: None,
             guest_memory_writer: None,
         }
@@ -123,10 +128,6 @@ impl KeplerMemory {
         }
     }
 
-    pub fn set_memory_manager(&mut self, memory_manager: Arc<Mutex<MemoryManager>>) {
-        self.memory_manager = Some(memory_manager);
-    }
-
     pub fn set_guest_memory_writer(
         &mut self,
         guest_memory_writer: Arc<dyn Fn(u64, &[u8]) + Send + Sync>,
@@ -135,9 +136,6 @@ impl KeplerMemory {
     }
 
     fn process_upload_word(&mut self, data: u32, is_last_call: bool) {
-        let Some(memory_manager) = self.memory_manager.as_ref().cloned() else {
-            return;
-        };
         let rasterizer_raw = self.rasterizer.map(|raw| unsafe {
             std::mem::transmute::<[usize; 2], *mut dyn RasterizerInterface>(raw)
         });
@@ -147,7 +145,7 @@ impl KeplerMemory {
                 writer(addr, bytes);
             }
         };
-        let memory_manager = memory_manager.lock();
+        let memory_manager = self.memory_manager.lock();
         let mut rasterizer = rasterizer_raw.map(|ptr| unsafe { &mut *ptr });
         let mut ctx = engine_upload::FlushContext {
             rasterizer: rasterizer.as_deref_mut(),
@@ -159,9 +157,6 @@ impl KeplerMemory {
     }
 
     fn process_upload_multi(&mut self, data: &[u32]) {
-        let Some(memory_manager) = self.memory_manager.as_ref().cloned() else {
-            return;
-        };
         let rasterizer_raw = self.rasterizer.map(|raw| unsafe {
             std::mem::transmute::<[usize; 2], *mut dyn RasterizerInterface>(raw)
         });
@@ -171,7 +166,7 @@ impl KeplerMemory {
                 writer(addr, bytes);
             }
         };
-        let memory_manager = memory_manager.lock();
+        let memory_manager = self.memory_manager.lock();
         let mut rasterizer = rasterizer_raw.map(|ptr| unsafe { &mut *ptr });
         let mut ctx = engine_upload::FlushContext {
             rasterizer: rasterizer.as_deref_mut(),
@@ -251,7 +246,7 @@ impl KeplerMemory {
 
 impl Default for KeplerMemory {
     fn default() -> Self {
-        Self::new()
+        Self::new(Arc::new(Mutex::new(MemoryManager::new(0))))
     }
 }
 
@@ -309,8 +304,7 @@ mod tests {
         let writes = Arc::new(Mutex::new(Vec::<(u64, Vec<u8>)>::new()));
         let writes_ref = Arc::clone(&writes);
 
-        let mut engine = KeplerMemory::new();
-        engine.set_memory_manager(Arc::clone(&memory_manager));
+        let mut engine = KeplerMemory::new(Arc::clone(&memory_manager));
         engine.set_guest_memory_writer(Arc::new(move |addr, bytes| {
             writes_ref.lock().push((addr, bytes.to_vec()));
         }));
