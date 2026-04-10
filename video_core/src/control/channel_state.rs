@@ -9,7 +9,6 @@ use std::sync::Arc;
 
 use parking_lot::Mutex;
 
-use crate::dma_pusher::DmaPusher;
 use crate::engines::fermi_2d::Fermi2D;
 use crate::engines::kepler_compute::KeplerCompute;
 use crate::engines::kepler_memory::KeplerMemory;
@@ -114,7 +113,14 @@ impl ChannelState {
         self.fermi_2d = Some(Box::new(Fermi2D::new()));
         self.kepler_compute = Some(Box::new(KeplerCompute::new()));
         self.maxwell_dma = Some(Box::new(MaxwellDMA::new()));
-        self.kepler_memory = Some(Box::new(KeplerMemory::new()));
+        let mut kepler_memory = Box::new(KeplerMemory::new());
+        kepler_memory.set_memory_manager(Arc::clone(self.memory_manager.as_ref().unwrap()));
+        let gpu_ptr = _gpu as *const crate::gpu::Gpu as usize;
+        kepler_memory.set_guest_memory_writer(Arc::new(move |addr, data| unsafe {
+            let gpu = &*(gpu_ptr as *const crate::gpu::Gpu);
+            gpu.write_guest_memory(addr, data);
+        }));
+        self.kepler_memory = Some(kepler_memory);
 
         self.initialized = true;
         log::debug!(
@@ -145,7 +151,7 @@ impl ChannelState {
             fermi_2d.bind_rasterizer(rasterizer);
         }
         if let Some(ref mut kepler_memory) = self.kepler_memory {
-            kepler_memory.bind_rasterizer();
+            kepler_memory.bind_rasterizer(rasterizer);
         }
         if let Some(ref mut kepler_compute) = self.kepler_compute {
             kepler_compute.bind_rasterizer(rasterizer);

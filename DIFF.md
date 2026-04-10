@@ -299,7 +299,7 @@
 - Rust keeps `read_struct` / `write_struct` helpers in this file instead of upstream `WrapFixed(...)` templates. This is a mechanical IPC adaptation while preserving ioctl ownership in `devices/nvmap.rs`.
 
 ### Unintentional differences (to fix)
-- `ioc_alloc` still returns `NvResult::BadValue` on `LockForMapDeviceAddressSpace` failure instead of mirroring the upstream debug-assert-only contract exactly.
+- Fixed in this pass: `ioc_alloc` no longer returns a Rust-only `NvResult::BadValue` on `LockForMapDeviceAddressSpace` failure. It now mirrors the upstream debug-assert-only contract and assumes the active session owns a live process.
 - `ioc_free` now mirrors the upstream unlock path, but it still cannot assert as strongly as upstream because the current Rust kernel path returns a raw status code instead of `Result`.
 
 ### Missing items
@@ -2454,9 +2454,12 @@
 
 ### Unintentional differences (to fix)
 - `bound_engines` still uses `Option<EngineID>` instead of a fully initialized fixed array value model.
+- Fixed in this pass: `SemaphoreTrigger(WriteLong)` and `SemaphoreRelease` now pass `QueryType::Payload` explicitly to `rasterizer.query(...)`, matching the upstream owner call instead of relying on a raw literal.
+- Fixed in this pass: `SemaphoreTrigger` acquire paths and `SemaphoreAcquire` now update the owner-local `acquire_source`, `acquire_value`, `acquire_active`, and `acquire_mode` registers around `ReleaseFences()` waits like upstream.
 
 ### Missing items
-- none in the `ProcessBindMethod -> BindSubchannel` ownership slice
+- Re-audit `acquire_timeout` side effects if a timeout-sensitive semaphore path becomes exercised later.
+- The owner still keeps `bound_engines` as `Option<EngineID>` rather than a fully initialized fixed array model.
 
 ### Binary layout verification
 - PASS: puller register file remains word-indexed at upstream offsets.
@@ -2484,10 +2487,10 @@
 - Rust still uses the owner-local `engine_upload::State` abstraction instead of storing upstream references directly.
 
 ### Unintentional differences (to fix)
-- none in the `EngineInterface` ownership slice
+- Fixed in this pass: `KeplerMemory` no longer routes `DATA` writes through the warning-only `engine_upload::State::process_data_*()` paths without a flush context. It now owns the same effective runtime edges as upstream (`memory_manager`, `rasterizer`, guest-memory writer callback) and flushes upload completion through `FlushContext`.
 
 ### Missing items
-- full flush-context wiring for upload completion
+- Full constructor ownership parity with upstream direct references (`Core::System&`, `MemoryManager&`) instead of the current callback/raw-pointer adaptation.
 
 ### Binary layout verification
 - PASS: exec/data register ownership and execution mask placement match upstream.
@@ -2941,6 +2944,7 @@
 
 ### Unintentional differences (to fix)
 - fixed in this pass: `ChannelState::init()` now wires a `gpu_ticks_getter` bridge into `Maxwell3D`, so semaphore/query timestamp writes can use real GPU ticks instead of a stubbed zero.
+- Fixed in this pass: `ChannelState::init()` / `bind_rasterizer()` now also wire the `KeplerMemory` upload owner with the same effective runtime edges (`memory_manager`, guest writer, rasterizer) needed by upstream `KeplerMemory(memory_manager)` + `BindRasterizer(rasterizer)`.
 
 ### Missing items
 - remaining constructor/lifecycle parity for other owner-local bridges in `ChannelState::Init(...)`.
@@ -2955,6 +2959,7 @@
 
 ### Unintentional differences (to fix)
 - fixed in this pass: long query/semaphore report writes no longer force a zero timestamp when a rasterizer is present; they now source GPU ticks through the owner-local bridge.
+- fixed in this pass: `process_query_condition()` now honors the upstream `rasterizer->AccelerateConditionalRendering()` fast path before reading the compare block from guest memory.
 
 ### Missing items
 - full upstream `Core::System&` ownership instead of callback bridges.
@@ -5088,6 +5093,7 @@
 
 ### Unintentional differences (to fix)
 - fixed in this pass: `KProcess::wait_condition_variable()` / `KConditionVariable::wait()` held the process mutex while trying to acquire the global scheduler lock, creating a Rust-only AB/BA deadlock that upstream cannot hit because it has no outer process mutex.
+- fixed in this pass: `KConditionVariable::signal_to_address()` no longer runs `next_owner_thread->EndWait(result)` outside the scheduler-locked critical section. Rust now mirrors the upstream `KScopedSchedulerLock` ordering more closely on the `ArbitrateUnlock` path.
 
 ### Missing items
 - Port the upstream `Signal()` scheduler-lock ownership literally; the current Rust process-owner wrapper still bypasses that owner boundary.
@@ -6145,6 +6151,7 @@
 - Fixed in this pass: the exercised AS operations (`AllocAsEx`, `AllocateSpace`, `FreeSpace`, `Remap`, `MapBufferEx`, `UnmapBuffer`, `GetVARegions`) now all enter through one outer owner mutex, matching upstream `std::scoped_lock lock(mutex)` serialization.
 - `Allocation.mappings` now matches upstream shared ownership for fixed mappings, but dynamic mappings still are not linked into an `Allocation` owner because upstream only tracks them in `mapping_map`; this is behaviorally fine, yet the surrounding Rust container layering still differs from the exact C++ mutex-and-container setup.
 - `QueryEvent(...)` still returns `None` for all event ids and logs an error; this matches exercised behavior today but remains structurally unimplemented compared with the upstream virtual override.
+- Fixed in this pass: `AllocAsEx` no longer sanitizes or ignores non-zero `va_range_*` fields. Rust now matches upstream and applies the guest-provided range literally whenever `va_range_start != 0`.
 
 ### Missing items
 - Upstream event owner parity for `QueryEvent(...)` if future call sites exercise it.
@@ -7274,3 +7281,19 @@
 
 ### Binary layout verification
 - PASS: service bootstrap wiring only; no raw serialized struct layout changed.
+
+## 2026-04-10 — `core/src/hle/kernel/svc/svc_thread.rs` vs `src/core/hle/kernel/svc/svc_thread.cpp`
+
+### Intentional differences
+- Rust still carries the temporary fallback stack mapping helper `ensure_user_stack_mapping(...)` in this owner. Upstream trusts user mode to provide mapped stack pages; Rust keeps the compatibility stopgap local to `svc_thread.rs` until the real stack-owner bug is fully closed.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `svc::CreateThread(...)` now reserves `ThreadCountMax` through the existing Rust `KScopedResourceReservation` owner before allocating the thread object, matching the upstream `svc_thread.cpp` reservation/commit flow much more closely.
+- Rust still does not take the upstream `KScopedLightLock` on the process state lock around `InitializeUserThread(...)` because `KProcess` does not yet expose a literal `m_state_lock` owner in a reusable way.
+
+### Missing items
+- Re-audit `CreateThread` for literal parity once the fallback stack mapping stopgap is removed, especially the missing `KScopedLightLock` state-lock boundary.
+- Re-audit `StartThread` against upstream after the remaining `KThread::Run()` lifecycle differences are unwound.
+
+### Binary layout verification
+- PASS: thread-creation control flow only; no raw serialized struct layout changed.

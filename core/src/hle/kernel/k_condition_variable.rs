@@ -214,16 +214,25 @@ impl KConditionVariable {
     /// Matches upstream `KConditionVariable::SignalToAddress(KernelCore&, KProcessAddress)`.
     ///
     /// Upstream wraps the body in `KScopedSchedulerLock sl(kernel)`.
-    /// The Rust equivalent protection is provided by the process mutex
-    /// held by the caller.
     pub fn signal_to_address(
         process: &Arc<Mutex<KProcess>>,
         current_thread: &Arc<Mutex<KThread>>,
         addr: u64,
     ) -> ResultCode {
-        let current_thread_id = current_thread.lock().unwrap().get_thread_id();
+        let (current_thread_id, scheduler_lock_ptr) = {
+            let thread = current_thread.lock().unwrap();
+            (thread.get_thread_id(), thread.scheduler_lock_ptr)
+        };
+        let _scheduler_guard = if scheduler_lock_ptr == 0 {
+            None
+        } else {
+            Some(super::k_scheduler_lock::KScopedSchedulerLock::new(unsafe {
+                &*(scheduler_lock_ptr as *const super::k_scheduler_lock::KAbstractSchedulerLock)
+            }))
+        };
 
-        let (next_owner_thread, result) = {
+        let mut next_owner_thread = None;
+        let result = {
             let mut process_guard = process.lock().unwrap();
             let Some(owner_thread) = process_guard.get_thread_by_thread_id(current_thread_id)
             else {
@@ -240,25 +249,23 @@ impl KConditionVariable {
             );
 
             // If there are remaining waiters, transfer the lock info to the next owner.
-            let next_owner_thread: Option<Arc<Mutex<KThread>>> =
-                if let Some((next_owner_id, _priority, transfer_lock_info)) = next_owner_result {
-                    if let Some(lock_info) = transfer_lock_info {
-                        if let Some(next_thread) =
-                            process_guard.get_thread_by_thread_id(next_owner_id)
-                        {
-                            next_thread.lock().unwrap().add_held_lock(lock_info);
-                        }
+            next_owner_thread = if let Some((next_owner_id, _priority, transfer_lock_info)) =
+                next_owner_result
+            {
+                if let Some(lock_info) = transfer_lock_info {
+                    if let Some(next_thread) = process_guard.get_thread_by_thread_id(next_owner_id) {
+                        next_thread.lock().unwrap().add_held_lock(lock_info);
                     }
-                    if let Some(next_thread) = process_guard.get_thread_by_thread_id(next_owner_id)
-                    {
-                        next_thread.lock().unwrap().set_waiting_lock_info(None);
-                        Some(next_thread)
-                    } else {
-                        None
-                    }
+                }
+                if let Some(next_thread) = process_guard.get_thread_by_thread_id(next_owner_id) {
+                    next_thread.lock().unwrap().set_waiting_lock_info(None);
+                    Some(next_thread)
                 } else {
                     None
-                };
+                }
+            } else {
+                None
+            };
 
             // Determine the next tag.
             // Matches upstream: next_value = next_owner_thread->GetAddressKeyValue();
@@ -294,11 +301,12 @@ impl KConditionVariable {
                 next_value
             );
 
-            (next_owner_thread, result)
+            result
         };
 
         // If necessary, signal the next owner thread.
-        // Matches upstream: if (next_owner_thread != nullptr) next_owner_thread->EndWait(result);
+        // Matches upstream ordering: `next_owner_thread->EndWait(result)` still runs
+        // while the scheduler lock is held.
         if let Some(ref next_owner_thread) = next_owner_thread {
             next_owner_thread
                 .lock()

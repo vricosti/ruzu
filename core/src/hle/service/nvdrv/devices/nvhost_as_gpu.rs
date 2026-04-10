@@ -308,26 +308,11 @@ impl NvHostAsGpu {
             vm.va_range_start = (params.big_page_size as u64) << VM::VA_START_SHIFT;
         }
 
-        // Only apply custom VA ranges if all three fields look valid.
-        // The game may leave these uninitialized (stack garbage containing FP
-        // residue like -1.0 = 0xBFF0...). Upstream's max default is 1<<37;
-        // values above 1<<40 are clearly uninitialized memory.
-        const MAX_VALID_VA: u64 = 1u64 << 40;
-        if params.va_range_start != 0
-            && params.va_range_start < MAX_VALID_VA
-            && params.va_range_end > 0
-            && params.va_range_end <= MAX_VALID_VA
-            && params.va_range_split <= MAX_VALID_VA
-            && params.va_range_start < params.va_range_end
-        {
+        // Upstream applies the custom VA range literally whenever start != 0.
+        if params.va_range_start != 0 {
             vm.va_range_start = params.va_range_start;
             vm.va_range_split = params.va_range_split;
             vm.va_range_end = params.va_range_end;
-        } else if params.va_range_start != 0 {
-            log::warn!(
-                "AllocAsEx: ignoring invalid VA range start={:#x} end={:#x} split={:#x}",
-                params.va_range_start, params.va_range_end, params.va_range_split
-            );
         }
 
         let start_pages = (vm.va_range_start >> VM::PAGE_SIZE_BITS) as u32;
@@ -1101,6 +1086,27 @@ mod tests {
             .expect("test system should expose FakeGpuCore");
         let ops = fake_gpu.ops.lock().unwrap();
         assert!(ops.iter().any(|op| op == "init_address_space"));
+    }
+
+    #[test]
+    fn alloc_as_ex_applies_non_zero_va_ranges_literally() {
+        let system = System::new_for_test();
+        let module = Module::new(SystemRef::from_ref(&system));
+        let container = Container::new();
+        let gpu_as = NvHostAsGpu::new(SystemRef::from_ref(&system), &module, &container);
+
+        let mut alloc_as = IoctlAllocAsEx {
+            va_range_start: 0xBFF0_0000_0000_0000,
+            va_range_end: 0x3FF0_0000_0FF2_FB16,
+            va_range_split: 0xBFF0_0000_0000_0000,
+            ..Default::default()
+        };
+        assert_eq!(gpu_as.alloc_as_ex(&mut alloc_as), NvResult::Success);
+
+        let vm = gpu_as.vm.lock().unwrap();
+        assert_eq!(vm.va_range_start, alloc_as.va_range_start);
+        assert_eq!(vm.va_range_end, alloc_as.va_range_end);
+        assert_eq!(vm.va_range_split, alloc_as.va_range_split);
     }
 
     #[test]

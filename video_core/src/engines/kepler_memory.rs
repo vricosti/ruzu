@@ -9,8 +9,14 @@
 //!   https://github.com/envytools/envytools/blob/master/rnndb/graph/gk104_p2mf.xml
 //!   https://cgit.freedesktop.org/mesa/mesa/tree/src/gallium/drivers/nouveau/nvc0/nve4_p2mf.xml.h
 
+use std::sync::Arc;
+
+use parking_lot::Mutex;
+
 use super::engine_interface::{EngineInterface, EngineInterfaceState};
 use super::engine_upload;
+use crate::memory_manager::MemoryManager;
+use crate::rasterizer_interface::RasterizerInterface;
 
 // ── Register layout constants ───────────────────────────────────────────────
 
@@ -82,6 +88,9 @@ pub struct KeplerMemory {
     pub regs: Regs,
     pub upload_state: engine_upload::State,
     pub interface_state: EngineInterfaceState,
+    memory_manager: Option<Arc<Mutex<MemoryManager>>>,
+    rasterizer: Option<[usize; 2]>,
+    guest_memory_writer: Option<Arc<dyn Fn(u64, &[u8]) + Send + Sync>>,
 }
 
 impl KeplerMemory {
@@ -91,13 +100,19 @@ impl KeplerMemory {
             regs: Regs::default(),
             upload_state: engine_upload::State::new(),
             interface_state: EngineInterfaceState::new(),
+            memory_manager: None,
+            rasterizer: None,
+            guest_memory_writer: None,
         }
     }
 
     /// Bind a rasterizer and set up the execution mask.
     ///
     /// Corresponds to `KeplerMemory::BindRasterizer`.
-    pub fn bind_rasterizer(&mut self) {
+    pub fn bind_rasterizer(&mut self, rasterizer: &dyn RasterizerInterface) {
+        self.rasterizer = Some(unsafe {
+            std::mem::transmute::<*const dyn RasterizerInterface, [usize; 2]>(rasterizer)
+        });
         // Reset and configure execution mask
         self.interface_state.execution_mask.fill(false);
         if EXEC_REG < self.interface_state.execution_mask.len() {
@@ -106,6 +121,64 @@ impl KeplerMemory {
         if DATA_REG < self.interface_state.execution_mask.len() {
             self.interface_state.execution_mask[DATA_REG] = true;
         }
+    }
+
+    pub fn set_memory_manager(&mut self, memory_manager: Arc<Mutex<MemoryManager>>) {
+        self.memory_manager = Some(memory_manager);
+    }
+
+    pub fn set_guest_memory_writer(
+        &mut self,
+        guest_memory_writer: Arc<dyn Fn(u64, &[u8]) + Send + Sync>,
+    ) {
+        self.guest_memory_writer = Some(guest_memory_writer);
+    }
+
+    fn process_upload_word(&mut self, data: u32, is_last_call: bool) {
+        let Some(memory_manager) = self.memory_manager.as_ref().cloned() else {
+            return;
+        };
+        let rasterizer_raw = self.rasterizer.map(|raw| unsafe {
+            std::mem::transmute::<[usize; 2], *mut dyn RasterizerInterface>(raw)
+        });
+        let writer = self.guest_memory_writer.as_ref().cloned();
+        let mut write_cpu = move |addr: u64, bytes: &[u8]| {
+            if let Some(writer) = writer.as_ref() {
+                writer(addr, bytes);
+            }
+        };
+        let memory_manager = memory_manager.lock();
+        let mut rasterizer = rasterizer_raw.map(|ptr| unsafe { &mut *ptr });
+        let mut ctx = engine_upload::FlushContext {
+            rasterizer: rasterizer.as_deref_mut(),
+            memory_manager: &*memory_manager,
+            write_cpu_mem: &mut write_cpu,
+        };
+        self.upload_state
+            .process_data_word_with_ctx(data, is_last_call, &mut ctx);
+    }
+
+    fn process_upload_multi(&mut self, data: &[u32]) {
+        let Some(memory_manager) = self.memory_manager.as_ref().cloned() else {
+            return;
+        };
+        let rasterizer_raw = self.rasterizer.map(|raw| unsafe {
+            std::mem::transmute::<[usize; 2], *mut dyn RasterizerInterface>(raw)
+        });
+        let writer = self.guest_memory_writer.as_ref().cloned();
+        let mut write_cpu = move |addr: u64, bytes: &[u8]| {
+            if let Some(writer) = writer.as_ref() {
+                writer(addr, bytes);
+            }
+        };
+        let memory_manager = memory_manager.lock();
+        let mut rasterizer = rasterizer_raw.map(|ptr| unsafe { &mut *ptr });
+        let mut ctx = engine_upload::FlushContext {
+            rasterizer: rasterizer.as_deref_mut(),
+            memory_manager: &*memory_manager,
+            write_cpu_mem: &mut write_cpu,
+        };
+        self.upload_state.process_data_multi_with_ctx(data, &mut ctx);
     }
 
     /// Write a value to the register identified by method.
@@ -128,8 +201,7 @@ impl KeplerMemory {
             }
             DATA_REG => {
                 self.upload_state.regs = self.regs.upload();
-                self.upload_state
-                    .process_data_word(method_argument, is_last_call);
+                self.process_upload_word(method_argument, is_last_call);
             }
             _ => {}
         }
@@ -149,8 +221,7 @@ impl KeplerMemory {
         match method_idx {
             DATA_REG => {
                 self.upload_state.regs = self.regs.upload();
-                self.upload_state
-                    .process_data_multi(&base_start[..amount as usize]);
+                self.process_upload_multi(&base_start[..amount as usize]);
             }
             _ => {
                 for i in 0..amount {
@@ -221,5 +292,40 @@ impl EngineInterface for KeplerMemory {
 
     fn set_current_dirty(&mut self, dirty: bool) {
         self.interface_state.current_dirty = dirty;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn data_register_writes_through_memory_manager() {
+        let memory_manager = Arc::new(Mutex::new(MemoryManager::new(0)));
+        memory_manager
+            .lock()
+            .map(0x10000, 0x8000_0000, 0x1000, 0, false);
+
+        let writes = Arc::new(Mutex::new(Vec::<(u64, Vec<u8>)>::new()));
+        let writes_ref = Arc::clone(&writes);
+
+        let mut engine = KeplerMemory::new();
+        engine.set_memory_manager(Arc::clone(&memory_manager));
+        engine.set_guest_memory_writer(Arc::new(move |addr, bytes| {
+            writes_ref.lock().push((addr, bytes.to_vec()));
+        }));
+
+        engine.call_method(UPLOAD_REG_OFFSET as u32, 4, true);
+        engine.call_method((UPLOAD_REG_OFFSET + 1) as u32, 1, true);
+        engine.call_method((UPLOAD_REG_OFFSET + 2) as u32, 0, true);
+        engine.call_method((UPLOAD_REG_OFFSET + 3) as u32, 0x10000, true);
+        engine.call_method((UPLOAD_REG_OFFSET + 4) as u32, 4, true);
+        engine.call_method(EXEC_REG as u32, 1, true);
+        engine.call_method(DATA_REG as u32, 0x11223344, true);
+
+        let writes = writes.lock();
+        assert_eq!(writes.len(), 1);
+        assert_eq!(writes[0].0, 0x8000_0000);
+        assert_eq!(writes[0].1, vec![0x44, 0x33, 0x22, 0x11]);
     }
 }

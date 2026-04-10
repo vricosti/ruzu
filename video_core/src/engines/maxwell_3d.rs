@@ -3382,6 +3382,14 @@ impl Maxwell3D {
 
     /// Handle render enable / query condition. Matches upstream `ProcessQueryCondition`.
     fn process_query_condition(&mut self) {
+        let accelerated = self
+            .with_rasterizer_mut(|rasterizer| rasterizer.accelerate_conditional_rendering())
+            .unwrap_or(false);
+        if accelerated {
+            self.execute_on = true;
+            return;
+        }
+
         let override_val = self.regs[RENDER_ENABLE_OVERRIDE as usize];
         match override_val {
             0 => {
@@ -3804,6 +3812,7 @@ mod tests {
         query_writes: Vec<(u64, Vec<u8>)>,
         bound_uniforms: Vec<(usize, u32, u64, u32)>,
         disabled_uniforms: Vec<(usize, u32)>,
+        accelerate_conditional_rendering: bool,
     }
 
     struct TestRasterizer {
@@ -3906,6 +3915,9 @@ mod tests {
         fn tiled_cache_barrier(&mut self) {}
         fn flush_commands(&mut self) {}
         fn tick_frame(&mut self) {}
+        fn accelerate_conditional_rendering(&mut self) -> bool {
+            self.calls.lock().unwrap().accelerate_conditional_rendering
+        }
         fn accelerate_inline_to_memory(
             &mut self,
             _address: u64,
@@ -6391,6 +6403,22 @@ mod tests {
         engine.call_method(RENDER_ENABLE_OVERRIDE, 2, true);
         engine.call_method(RENDER_ENABLE_MODE, 0, true);
         assert!(!engine.should_execute());
+    }
+
+    #[test]
+    fn test_call_method_query_condition_uses_rasterizer_acceleration() {
+        let calls = Arc::new(Mutex::new(RasterizerCalls {
+            accelerate_conditional_rendering: true,
+            ..Default::default()
+        }));
+        let mut engine = Maxwell3D::new();
+        let rasterizer = TestRasterizer::new(Arc::clone(&calls));
+        engine.bind_rasterizer(&rasterizer);
+
+        engine.call_method(RENDER_ENABLE_OVERRIDE, 2, true);
+        engine.call_method(RENDER_ENABLE_MODE, 0, true);
+
+        assert!(engine.should_execute());
     }
 
     #[test]
