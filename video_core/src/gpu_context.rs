@@ -23,7 +23,7 @@ use crate::engines::inline_to_memory::InlineToMemory;
 use crate::engines::kepler_compute::KeplerCompute;
 use crate::engines::maxwell_3d::Maxwell3D;
 use crate::engines::maxwell_dma::MaxwellDMA;
-use crate::memory_manager::GpuMemoryManager;
+use crate::memory_manager::{GpuMemoryManager, MemoryManager};
 use crate::rasterizer::SoftwareRasterizer;
 use crate::rasterizer_interface::RasterizerInterface;
 use crate::renderer_vulkan::RasterizerVulkan;
@@ -137,12 +137,14 @@ pub struct GpuContext {
 impl GpuContext {
     /// Create a new GPU context with default engines and null backend.
     pub fn new() -> Self {
+        let compute_memory_manager = Arc::new(Mutex::new(MemoryManager::new(0)));
+        let dma_memory_manager = Arc::new(Mutex::new(MemoryManager::new(0)));
         let engines: Vec<Option<Box<dyn crate::engines::Engine>>> = vec![
             Some(Box::new(Maxwell3D::new())),      // subchannel 0
-            Some(Box::new(KeplerCompute::new())),  // subchannel 1
+            Some(Box::new(KeplerCompute::new(compute_memory_manager))), // subchannel 1
             Some(Box::new(InlineToMemory::new())), // subchannel 2
             Some(Box::new(Fermi2D::new())),        // subchannel 3
-            Some(Box::new(MaxwellDMA::new())),     // subchannel 4
+            Some(Box::new(MaxwellDMA::new(dma_memory_manager))), // subchannel 4
         ];
 
         Self {

@@ -84,6 +84,7 @@ impl ChannelState {
         // Upstream creates DmaPusher first, then the engine set.
         self.dma_pusher = Some(Box::new(crate::dma_pusher::DmaPusher::new(
             _gpu as *const crate::gpu::Gpu,
+            _gpu.system_ref(),
             Arc::clone(self.memory_manager.as_ref().unwrap()),
             self as *mut ChannelState,
         )));
@@ -111,10 +112,14 @@ impl ChannelState {
         }));
         self.maxwell_3d = Some(maxwell_3d);
         self.fermi_2d = Some(Box::new(Fermi2D::new()));
-        self.kepler_compute = Some(Box::new(KeplerCompute::new()));
-        self.maxwell_dma = Some(Box::new(MaxwellDMA::new()));
-        let mut kepler_memory = Box::new(KeplerMemory::new());
-        kepler_memory.set_memory_manager(Arc::clone(self.memory_manager.as_ref().unwrap()));
+        self.kepler_compute = Some(Box::new(KeplerCompute::new(Arc::clone(
+            self.memory_manager.as_ref().unwrap(),
+        ))));
+        self.maxwell_dma = Some(Box::new(MaxwellDMA::new(Arc::clone(
+            self.memory_manager.as_ref().unwrap(),
+        ))));
+        let mut kepler_memory =
+            Box::new(KeplerMemory::new(Arc::clone(self.memory_manager.as_ref().unwrap())));
         let gpu_ptr = _gpu as *const crate::gpu::Gpu as usize;
         kepler_memory.set_guest_memory_writer(Arc::new(move |addr, data| unsafe {
             let gpu = &*(gpu_ptr as *const crate::gpu::Gpu);

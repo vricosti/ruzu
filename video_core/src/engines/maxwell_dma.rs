@@ -6,8 +6,13 @@
 //! Handles GPU memory copy operations. Detects launch trigger writes and logs
 //! parameters; actual DMA copy is not yet implemented.
 
+use std::sync::Arc;
+
+use parking_lot::Mutex;
+
 use super::engine_interface::{EngineInterface, EngineInterfaceState};
 use super::{ClassId, Engine, PendingWrite, ENGINE_REG_COUNT};
+use crate::memory_manager::MemoryManager;
 use crate::rasterizer_interface::RasterizerInterface;
 
 // ── Register constants (method = byte_offset / 4) ──────────────────────────
@@ -27,13 +32,17 @@ const LINE_COUNT: u32 = 0x107;
 pub struct MaxwellDMA {
     regs: Box<[u32; ENGINE_REG_COUNT]>,
     interface_state: EngineInterfaceState,
+    memory_manager: Arc<Mutex<MemoryManager>>,
     /// Set when a DMA launch trigger is detected; consumed by tests / future logic.
     pub pending_launch: bool,
     rasterizer: Option<[usize; 2]>,
 }
 
 impl MaxwellDMA {
-    pub fn new() -> Self {
+    /// Corresponds to upstream `MaxwellDMA(Core::System&, MemoryManager&)`.
+    /// Rust stores the upstream `MemoryManager&` owner directly; the broader
+    /// `System&` constructor dependency remains outside this bounded slice.
+    pub fn new(memory_manager: Arc<Mutex<MemoryManager>>) -> Self {
         Self {
             regs: Box::new([0u32; ENGINE_REG_COUNT]),
             interface_state: {
@@ -41,6 +50,7 @@ impl MaxwellDMA {
                 state.execution_mask[LAUNCH_DMA as usize] = true;
                 state
             },
+            memory_manager,
             pending_launch: false,
             rasterizer: None,
         }
@@ -51,6 +61,9 @@ impl MaxwellDMA {
         let idx = method as usize;
         if idx < ENGINE_REG_COUNT {
             self.regs[idx] = argument;
+        }
+        if method == LAUNCH_DMA {
+            self.handle_launch();
         }
     }
 
@@ -166,7 +179,7 @@ impl EngineInterface for MaxwellDMA {
 
 impl Default for MaxwellDMA {
     fn default() -> Self {
-        Self::new()
+        Self::new(Arc::new(Mutex::new(MemoryManager::new(0))))
     }
 }
 
@@ -176,15 +189,8 @@ impl Engine for MaxwellDMA {
     }
 
     fn write_reg(&mut self, method: u32, value: u32) {
-        let idx = method as usize;
-        if idx < ENGINE_REG_COUNT {
-            self.regs[idx] = value;
-        }
         log::trace!("MaxwellDMA: reg[0x{:X}] = 0x{:X}", method, value);
-
-        if method == LAUNCH_DMA {
-            self.handle_launch();
-        }
+        self.call_method(method, value, true);
     }
 
     fn execute_pending(&mut self, read_gpu: &dyn Fn(u64, &mut [u8])) -> Vec<PendingWrite> {
@@ -238,9 +244,13 @@ impl Engine for MaxwellDMA {
 mod tests {
     use super::*;
 
+    fn new_test_engine() -> MaxwellDMA {
+        MaxwellDMA::new(Arc::new(Mutex::new(MemoryManager::new(0))))
+    }
+
     #[test]
     fn test_address_accessors() {
-        let mut eng = MaxwellDMA::new();
+        let mut eng = new_test_engine();
         eng.write_reg(SRC_ADDR_HIGH, 0xAB);
         eng.write_reg(SRC_ADDR_LOW, 0xCDEF_0000);
         assert_eq!(eng.src_addr(), 0xAB_CDEF_0000);
@@ -252,7 +262,7 @@ mod tests {
 
     #[test]
     fn test_pitch_and_size_accessors() {
-        let mut eng = MaxwellDMA::new();
+        let mut eng = new_test_engine();
         eng.write_reg(PITCH_IN, 5120);
         eng.write_reg(PITCH_OUT, 5120);
         eng.write_reg(LINE_LENGTH, 5120);
@@ -265,7 +275,7 @@ mod tests {
 
     #[test]
     fn test_launch_trigger_sets_pending() {
-        let mut eng = MaxwellDMA::new();
+        let mut eng = new_test_engine();
         assert!(!eng.pending_launch);
 
         eng.write_reg(SRC_ADDR_HIGH, 0);
@@ -284,7 +294,7 @@ mod tests {
 
     #[test]
     fn test_no_trigger_without_launch_method() {
-        let mut eng = MaxwellDMA::new();
+        let mut eng = new_test_engine();
         eng.write_reg(0x200, 42); // Random register
         assert!(!eng.pending_launch);
     }
@@ -294,7 +304,7 @@ mod tests {
         let syncpoints =
             std::sync::Arc::new(crate::host1x::syncpoint_manager::SyncpointManager::new());
         let rasterizer = crate::renderer_null::null_rasterizer::RasterizerNull::new(syncpoints);
-        let mut eng = MaxwellDMA::new();
+        let mut eng = new_test_engine();
         assert!(eng.rasterizer.is_none());
         eng.bind_rasterizer(&rasterizer);
         assert!(eng.rasterizer.is_some());
@@ -302,7 +312,7 @@ mod tests {
 
     #[test]
     fn test_dma_copies_lines() {
-        let mut eng = MaxwellDMA::new();
+        let mut eng = new_test_engine();
 
         // 2 lines of 8 bytes each, same pitch.
         eng.write_reg(SRC_ADDR_HIGH, 0);
@@ -334,7 +344,7 @@ mod tests {
 
     #[test]
     fn test_dma_different_pitches() {
-        let mut eng = MaxwellDMA::new();
+        let mut eng = new_test_engine();
 
         // Copy 4 bytes per line, 2 lines. pitch_in=8, pitch_out=16.
         eng.write_reg(SRC_ADDR_HIGH, 0);
@@ -370,5 +380,28 @@ mod tests {
         // Line 1: 4 bytes copied + 12 zeros.
         assert_eq!(&dst[16..20], &[5, 6, 7, 8]);
         assert_eq!(&dst[20..32], &[0; 12]);
+    }
+
+    #[test]
+    fn test_call_method_launch_trigger_sets_pending() {
+        let mut eng = new_test_engine();
+        assert!(!eng.pending_launch);
+        eng.call_method(LAUNCH_DMA, 1, true);
+        assert!(eng.pending_launch);
+    }
+
+    #[test]
+    fn test_call_multi_method_launch_trigger_sets_pending() {
+        let mut eng = new_test_engine();
+        assert!(!eng.pending_launch);
+        eng.call_multi_method(LAUNCH_DMA, &[1], 1, 1);
+        assert!(eng.pending_launch);
+    }
+
+    #[test]
+    fn test_constructor_keeps_memory_manager_owner() {
+        let memory_manager = Arc::new(Mutex::new(MemoryManager::new(0x44)));
+        let eng = MaxwellDMA::new(Arc::clone(&memory_manager));
+        assert!(Arc::ptr_eq(&eng.memory_manager, &memory_manager));
     }
 }

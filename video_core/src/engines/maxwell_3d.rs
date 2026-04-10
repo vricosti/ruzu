@@ -3359,12 +3359,17 @@ impl Maxwell3D {
                 });
 
                 if !queried {
+                    let gpu_ticks = self
+                        .gpu_ticks_getter
+                        .as_ref()
+                        .map(|getter| getter())
+                        .unwrap_or(0);
                     let data = if short_query {
                         payload.to_le_bytes().to_vec()
                     } else {
                         let mut buf = Vec::with_capacity(16);
                         buf.extend_from_slice(&(payload as u64).to_le_bytes());
-                        buf.extend_from_slice(&0u64.to_le_bytes()); // timestamp placeholder
+                        buf.extend_from_slice(&gpu_ticks.to_le_bytes());
                         buf
                     };
                     self.pending_semaphore_writes
@@ -5750,8 +5755,22 @@ mod tests {
         assert_eq!(pw.data.len(), 16);
         // First 8 bytes: payload as u64.
         assert_eq!(&pw.data[0..8], &(0x42u64).to_le_bytes());
-        // Last 8 bytes: zero timestamp.
+        // Last 8 bytes: zero timestamp when no GPU tick getter is installed.
         assert_eq!(&pw.data[8..16], &0u64.to_le_bytes());
+    }
+
+    #[test]
+    fn test_report_semaphore_long_query_uses_gpu_ticks_in_fallback() {
+        let mut engine = Maxwell3D::new();
+        engine.set_gpu_ticks_getter(Arc::new(|| 0x1122_3344_5566_7788));
+        engine.write_reg(REPORT_SEMAPHORE_BASE, 0);
+        engine.write_reg(REPORT_SEMAPHORE_BASE + 1, 0x2100);
+        engine.write_reg(REPORT_SEMAPHORE_BASE + 2, 0x7B);
+        engine.write_reg(REPORT_SEMAPHORE_TRIGGER, 0);
+
+        let pw = &engine.pending_semaphore_writes[0];
+        assert_eq!(&pw.data[0..8], &(0x7Bu64).to_le_bytes());
+        assert_eq!(&pw.data[8..16], &0x1122_3344_5566_7788u64.to_le_bytes());
     }
 
     #[test]

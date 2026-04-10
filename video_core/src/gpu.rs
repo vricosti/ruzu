@@ -195,6 +195,10 @@ impl Gpu {
         self.gpu_thread.lock().unwrap().set_system_ref(system);
     }
 
+    pub fn system_ref(&self) -> SystemRef {
+        *self.system.lock().unwrap()
+    }
+
     /// Initialize the scheduler. Must be called after Gpu is placed at its
     /// final address (the scheduler stores a raw pointer back to the Gpu).
     ///
