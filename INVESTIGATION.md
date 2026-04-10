@@ -118,6 +118,72 @@ In ruzu (broken), all worker threads queue on core=0:
 In zuyu, workers run on cores 1-3 IMMEDIATELY in parallel with the game on core 0.
 The wait → signal → wake sequence happens within milliseconds.
 
+## VERIFIED ROOT CAUSE: JIT Throughput
+
+After 5+ minute runs with thread_probe and PC sampling:
+- **0 new SVCs** from tid=73 after t=3.3s in a 5-minute run
+- **227 thread interrupts** in 30s for tid=73 (preemption working at ~7.5/sec)
+- **134 distinct PCs visited** by tid=73 during 30s of probing
+- **No deadlock**: thread is making forward progress through different
+  functions, just not making any syscalls
+- Hot PCs are in the dynamic linker / init code range (0x015D-0x0202)
+- The game is in a CPU-bound init phase that takes >>5 minutes on this
+  ruzu JIT speed
+
+### Why JIT is slow
+
+Likely candidates:
+1. NEON instruction translation overhead
+2. Many small JIT blocks instead of larger optimized chunks
+3. Memory access checks per instruction
+4. Lack of upstream optimizations (block linking, fastmem patches)
+
+### Validation
+
+This is consistent with the memory note "MK8D boots and enters main loop,
+bottleneck is JIT NEON performance".
+
+## REVISED ROOT CAUSE: NOT a deadlock — slow JIT execution
+
+After deeper investigation with thread_probe and PC_probe, the actual root
+cause is NOT a deadlock or missing service. Findings:
+
+### What is actually happening at the "hang"
+
+1. **Game thread tid=73 is alive and making progress** through the JIT
+2. PC sample distribution shows it executes through many different functions
+3. Most-sampled PC: `0x02003E58` (41 hits out of ~340 probes)
+4. The instruction at 0x02003E58 is `BHI 0x02003E2C` — a backwards branch
+   in a memory-init helper function
+5. The LR varies across many call sites (0x42598EA8, 0x43A4C2C0, 0x53CF9250,
+   0x5D859FF8, 0x60059FF8, 0x6224FC30, 0x646B629C, 0x66CE95E0, 0x68A70D84,
+   0x76470950, etc.)
+6. This means the game is calling the same memory-init helper from MANY
+   different places (likely asset/world initialization)
+
+### The hang is JIT throughput
+
+After ~4.5s, the game transitions from SVC-heavy init (servicing requests)
+to CPU-heavy init (asset/data structure setup). During this CPU-heavy phase:
+- Few SVCs are issued (SVC count drops to ~0)
+- The game thread runs ARM code at JIT-limited speed
+- ruzu's JIT is significantly slower than upstream's, so this phase takes
+  forever
+- The game appears "hung" but is actually doing legitimate work
+
+### Why no rendering / no audio
+
+The game hasn't yet reached the point where it submits its first frame
+because it's still in initialization. With faster JIT throughput, the game
+would eventually progress to rendering — it just needs much more wall-clock
+time than zuyu.
+
+### Worker thread observations remain valid but not the root cause
+
+The worker thread tid=86-92 condvar wait pattern is real, but not blocking
+forward progress. tid=73 keeps running on core 0 doing CPU work. The workers
+are just sitting idle waiting for work that hasn't been queued yet.
+
 ## Detailed Code Path Analysis
 
 The thread creation/scheduling code paths in ruzu vs zuyu are functionally
