@@ -253,7 +253,8 @@ impl KConditionVariable {
                 next_owner_result
             {
                 if let Some(lock_info) = transfer_lock_info {
-                    if let Some(next_thread) = process_guard.get_thread_by_thread_id(next_owner_id) {
+                    if let Some(next_thread) = process_guard.get_thread_by_thread_id(next_owner_id)
+                    {
                         next_thread.lock().unwrap().add_held_lock(lock_info);
                     }
                 }
@@ -469,7 +470,9 @@ impl KConditionVariable {
             "KConditionVariable::signal begin cv_key=0x{:X} count={} first_waiter={:?}",
             cv_key,
             count,
-            self.waiting_threads.nfind_key(cv_key).map(|key| key.thread_id)
+            self.waiting_threads
+                .nfind_key(cv_key)
+                .map(|key| key.thread_id)
         );
 
         // Iterate the tree, finding threads with matching cv_key.
@@ -597,8 +600,9 @@ impl KConditionVariable {
         if scheduler_lock_ptr == 0 {
             return RESULT_INVALID_STATE;
         }
-        let scheduler_lock =
-            unsafe { &*(scheduler_lock_ptr as *const super::k_scheduler_lock::KAbstractSchedulerLock) };
+        let scheduler_lock = unsafe {
+            &*(scheduler_lock_ptr as *const super::k_scheduler_lock::KAbstractSchedulerLock)
+        };
         let hardware_timer = super::kernel::get_hardware_timer_arc();
         let mut wait_queue = ThreadQueueImplForKConditionVariableWaitConditionVariable::queue();
         let thread_ptr = {
@@ -613,13 +617,14 @@ impl KConditionVariable {
             key
         );
 
-        let (mut sleep_guard, timer) = super::k_scoped_scheduler_lock_and_sleep::KScopedSchedulerLockAndSleep::new(
-            scheduler_lock,
-            hardware_timer.as_ref(),
-            current_thread_id,
-            thread_ptr,
-            timeout,
-        );
+        let (mut sleep_guard, timer) =
+            super::k_scoped_scheduler_lock_and_sleep::KScopedSchedulerLockAndSleep::new(
+                scheduler_lock,
+                hardware_timer.as_ref(),
+                current_thread_id,
+                thread_ptr,
+                timeout,
+            );
         log::trace!(
             "KConditionVariable::wait_locked tid={} after scoped_sleep_lock",
             current_thread_id
@@ -645,7 +650,9 @@ impl KConditionVariable {
         key: u64,
         value: u32,
         timeout: i64,
-        sleep_guard: &mut super::k_scoped_scheduler_lock_and_sleep::KScopedSchedulerLockAndSleep<'_>,
+        sleep_guard: &mut super::k_scoped_scheduler_lock_and_sleep::KScopedSchedulerLockAndSleep<
+            '_,
+        >,
         timer: Option<Arc<super::k_hardware_timer::KHardwareTimer>>,
     ) -> ResultCode {
         let current_thread_id = current_thread.lock().unwrap().get_thread_id();
@@ -982,7 +989,10 @@ impl ConditionVariableThreadTree {
     fn remove_from_bucket(&mut self, cv_key: u64, priority: i32, thread_id: u64) {
         let bucket_key = (cv_key, priority);
         let should_remove_bucket = if let Some(thread_ids) = self.ordered.get_mut(&bucket_key) {
-            if let Some(position) = thread_ids.iter().position(|existing| *existing == thread_id) {
+            if let Some(position) = thread_ids
+                .iter()
+                .position(|existing| *existing == thread_id)
+            {
                 thread_ids.remove(position);
             }
             thread_ids.is_empty()
@@ -1131,11 +1141,13 @@ mod tests {
         });
 
         assert_eq!(
-            tree.nfind_key(0x1000).map(|key| (key.cv_key, key.thread_id)),
+            tree.nfind_key(0x1000)
+                .map(|key| (key.cv_key, key.thread_id)),
             Some((0x2000, 42))
         );
         assert_eq!(
-            tree.nfind_key(0x2000).map(|key| (key.cv_key, key.thread_id)),
+            tree.nfind_key(0x2000)
+                .map(|key| (key.cv_key, key.thread_id)),
             Some((0x2000, 42))
         );
         assert_eq!(tree.bucket_count(), 1);
@@ -1161,14 +1173,16 @@ mod tests {
         assert_eq!(tree.by_thread_id.len(), 2);
         assert_eq!(tree.ordered_thread_ids(), vec![41, 42]);
         assert_eq!(
-            tree.nfind_key(0x3000).map(|key| (key.cv_key, key.priority, key.thread_id)),
+            tree.nfind_key(0x3000)
+                .map(|key| (key.cv_key, key.priority, key.thread_id)),
             Some((0x3000, 10, 41))
         );
 
         tree.erase_by_thread_id(41);
         assert_eq!(tree.ordered_thread_ids(), vec![42]);
         assert_eq!(
-            tree.nfind_key(0x3000).map(|key| (key.cv_key, key.priority, key.thread_id)),
+            tree.nfind_key(0x3000)
+                .map(|key| (key.cv_key, key.priority, key.thread_id)),
             Some((0x3000, 10, 42))
         );
     }

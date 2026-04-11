@@ -44,12 +44,13 @@ impl IManagerRootService {
     pub fn create_display_service(
         &self,
         policy: Policy,
-    ) -> Result<Arc<super::application_display_service::IApplicationDisplayService>, ResultCode> {
+    ) -> Result<Arc<super::application_display_service::IApplicationDisplayService>, ResultCode>
+    {
         service_creator::get_application_display_service(Permission::Manager, policy)?;
         Ok(Arc::new(
-            super::application_display_service::IApplicationDisplayService::new(
-                Arc::clone(&self.container),
-            ),
+            super::application_display_service::IApplicationDisplayService::new(Arc::clone(
+                &self.container,
+            )),
         ))
     }
 

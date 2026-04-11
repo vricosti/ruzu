@@ -201,7 +201,10 @@ impl ISystemDisplayService {
         rb.push_result(RESULT_SUCCESS);
     }
 
-    fn get_shared_buffer_memory_handle_id(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn get_shared_buffer_memory_handle_id(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         let svc = Self::as_self(this);
         let mut rp = RequestParser::new(ctx);
         let buffer_id = rp.pop_u64();

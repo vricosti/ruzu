@@ -246,18 +246,13 @@ impl SteadyClock {
         match service.get_current_time_point() {
             Ok(time_point) => {
                 let words = (core::mem::size_of::<SteadyClockTimePoint>() / 4) as u32;
-                let mut rb = crate::hle::service::ipc_helpers::ResponseBuilder::new(
-                    ctx,
-                    2 + words,
-                    0,
-                    0,
-                );
+                let mut rb =
+                    crate::hle::service::ipc_helpers::ResponseBuilder::new(ctx, 2 + words, 0, 0);
                 rb.push_result(RESULT_SUCCESS);
                 rb.push_raw(&time_point);
             }
             Err(rc) => {
-                let mut rb =
-                    crate::hle::service::ipc_helpers::ResponseBuilder::new(ctx, 2, 0, 0);
+                let mut rb = crate::hle::service::ipc_helpers::ResponseBuilder::new(ctx, 2, 0, 0);
                 rb.push_result(rc);
             }
         }
@@ -267,14 +262,12 @@ impl SteadyClock {
         let service = unsafe { &*(this as *const dyn ServiceFramework as *const Self) };
         match service.get_test_offset() {
             Ok(offset) => {
-                let mut rb =
-                    crate::hle::service::ipc_helpers::ResponseBuilder::new(ctx, 4, 0, 0);
+                let mut rb = crate::hle::service::ipc_helpers::ResponseBuilder::new(ctx, 4, 0, 0);
                 rb.push_result(RESULT_SUCCESS);
                 rb.push_i64(offset);
             }
             Err(rc) => {
-                let mut rb =
-                    crate::hle::service::ipc_helpers::ResponseBuilder::new(ctx, 2, 0, 0);
+                let mut rb = crate::hle::service::ipc_helpers::ResponseBuilder::new(ctx, 2, 0, 0);
                 rb.push_result(rc);
             }
         }
@@ -292,14 +285,12 @@ impl SteadyClock {
         let service = unsafe { &*(this as *const dyn ServiceFramework as *const Self) };
         match service.get_rtc_value() {
             Ok(value) => {
-                let mut rb =
-                    crate::hle::service::ipc_helpers::ResponseBuilder::new(ctx, 4, 0, 0);
+                let mut rb = crate::hle::service::ipc_helpers::ResponseBuilder::new(ctx, 4, 0, 0);
                 rb.push_result(RESULT_SUCCESS);
                 rb.push_i64(value);
             }
             Err(rc) => {
-                let mut rb =
-                    crate::hle::service::ipc_helpers::ResponseBuilder::new(ctx, 2, 0, 0);
+                let mut rb = crate::hle::service::ipc_helpers::ResponseBuilder::new(ctx, 2, 0, 0);
                 rb.push_result(rc);
             }
         }
@@ -309,14 +300,12 @@ impl SteadyClock {
         let service = unsafe { &*(this as *const dyn ServiceFramework as *const Self) };
         match service.is_rtc_reset_detected() {
             Ok(detected) => {
-                let mut rb =
-                    crate::hle::service::ipc_helpers::ResponseBuilder::new(ctx, 3, 0, 0);
+                let mut rb = crate::hle::service::ipc_helpers::ResponseBuilder::new(ctx, 3, 0, 0);
                 rb.push_result(RESULT_SUCCESS);
                 rb.push_u32(if detected { 1 } else { 0 });
             }
             Err(rc) => {
-                let mut rb =
-                    crate::hle::service::ipc_helpers::ResponseBuilder::new(ctx, 2, 0, 0);
+                let mut rb = crate::hle::service::ipc_helpers::ResponseBuilder::new(ctx, 2, 0, 0);
                 rb.push_result(rc);
             }
         }
@@ -326,14 +315,12 @@ impl SteadyClock {
         let service = unsafe { &*(this as *const dyn ServiceFramework as *const Self) };
         match service.get_setup_result_value() {
             Ok(result) => {
-                let mut rb =
-                    crate::hle::service::ipc_helpers::ResponseBuilder::new(ctx, 3, 0, 0);
+                let mut rb = crate::hle::service::ipc_helpers::ResponseBuilder::new(ctx, 3, 0, 0);
                 rb.push_result(RESULT_SUCCESS);
                 rb.push_u32(result.get_inner_value());
             }
             Err(rc) => {
-                let mut rb =
-                    crate::hle::service::ipc_helpers::ResponseBuilder::new(ctx, 2, 0, 0);
+                let mut rb = crate::hle::service::ipc_helpers::ResponseBuilder::new(ctx, 2, 0, 0);
                 rb.push_result(rc);
             }
         }
@@ -343,14 +330,12 @@ impl SteadyClock {
         let service = unsafe { &*(this as *const dyn ServiceFramework as *const Self) };
         match service.get_internal_offset() {
             Ok(offset) => {
-                let mut rb =
-                    crate::hle::service::ipc_helpers::ResponseBuilder::new(ctx, 4, 0, 0);
+                let mut rb = crate::hle::service::ipc_helpers::ResponseBuilder::new(ctx, 4, 0, 0);
                 rb.push_result(RESULT_SUCCESS);
                 rb.push_i64(offset);
             }
             Err(rc) => {
-                let mut rb =
-                    crate::hle::service::ipc_helpers::ResponseBuilder::new(ctx, 2, 0, 0);
+                let mut rb = crate::hle::service::ipc_helpers::ResponseBuilder::new(ctx, 2, 0, 0);
                 rb.push_result(rc);
             }
         }

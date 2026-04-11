@@ -1042,7 +1042,6 @@ impl KPageTableBase {
                         Self::convert_to_memory_permission(properties.perm),
                         false,
                     );
-
                 }
 
                 0
@@ -2979,51 +2978,611 @@ impl KPageTableBase {
 
     // -- IPC Setup/Cleanup --
 
+    fn get_ipc_test_state_and_attr_mask(
+        dst_state: KMemoryState,
+    ) -> Option<(KMemoryState, KMemoryAttribute)> {
+        match dst_state {
+            s if s == KMemoryState::IPC => Some((
+                KMemoryState::FLAG_CAN_USE_IPC,
+                KMemoryAttribute::UNCACHED
+                    | KMemoryAttribute::DEVICE_SHARED
+                    | KMemoryAttribute::LOCKED,
+            )),
+            s if s == KMemoryState::NON_SECURE_IPC => Some((
+                KMemoryState::FLAG_CAN_USE_NON_SECURE_IPC,
+                KMemoryAttribute::UNCACHED | KMemoryAttribute::LOCKED,
+            )),
+            s if s == KMemoryState::NON_DEVICE_IPC => Some((
+                KMemoryState::FLAG_CAN_USE_NON_DEVICE_IPC,
+                KMemoryAttribute::UNCACHED | KMemoryAttribute::LOCKED,
+            )),
+            _ => None,
+        }
+    }
+
+    fn get_ipc_source_permission(test_perm: KMemoryPermission) -> KMemoryPermission {
+        if test_perm == KMemoryPermission::USER_READ_WRITE {
+            KMemoryPermission::KERNEL_READ_WRITE | KMemoryPermission::NOT_MAPPED
+        } else {
+            KMemoryPermission::USER_READ
+        }
+    }
+
+    fn get_ipc_aligned_extents(address: usize, size: usize) -> (usize, usize, usize, usize) {
+        let aligned_start = address & !(PAGE_SIZE - 1);
+        let aligned_end = (address + size).next_multiple_of(PAGE_SIZE);
+        let mapping_start = address.next_multiple_of(PAGE_SIZE);
+        let mapping_end = (address + size) & !(PAGE_SIZE - 1);
+        (aligned_start, aligned_end, mapping_start, mapping_end)
+    }
+
+    fn reprotect_ipc_range(&mut self, address: usize, size: usize) -> u32 {
+        if size == 0 {
+            return crate::hle::result::RESULT_SUCCESS.get_inner_value();
+        }
+
+        let end = address + size;
+        let mut current = address;
+        while current < end {
+            let Some(info) = self.query_info(current) else {
+                return svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value();
+            };
+
+            let chunk_size = std::cmp::min(info.m_size, end - current);
+            debug_assert!(chunk_size % PAGE_SIZE == 0);
+
+            let props = KPageProperties {
+                perm: info.m_permission,
+                io: false,
+                uncached: false,
+                disable_merge_attributes: DisableMergeAttribute::NONE,
+            };
+            let rc = self.operate(
+                current,
+                chunk_size / PAGE_SIZE,
+                0,
+                false,
+                props,
+                OperationType::ChangePermissions,
+            );
+            if rc != crate::hle::result::RESULT_SUCCESS.get_inner_value() {
+                return rc;
+            }
+
+            current += chunk_size;
+        }
+
+        crate::hle::result::RESULT_SUCCESS.get_inner_value()
+    }
+
+    fn with_memory_page_table<T, F>(
+        memory: &Arc<Mutex<Memory>>,
+        page_table: *mut common::page_table::PageTable,
+        f: F,
+    ) -> T
+    where
+        F: FnOnce(&mut Memory) -> T,
+    {
+        let mut memory = memory.lock().unwrap();
+        let old_page_table = memory.current_page_table_raw();
+        memory.set_current_page_table(page_table);
+        let result = f(&mut memory);
+        memory.set_current_page_table(old_page_table);
+        result
+    }
+
+    fn read_block_from_page_table(
+        memory: &Arc<Mutex<Memory>>,
+        page_table: *mut common::page_table::PageTable,
+        src_addr: usize,
+        size: usize,
+    ) -> Vec<u8> {
+        let mut bytes = vec![0u8; size];
+        Self::with_memory_page_table(memory, page_table, |memory| {
+            let _ = memory.read_block(src_addr as u64, &mut bytes);
+        });
+        bytes
+    }
+
+    fn write_block_to_page_table(
+        memory: &Arc<Mutex<Memory>>,
+        page_table: *mut common::page_table::PageTable,
+        dst_addr: usize,
+        bytes: &[u8],
+    ) {
+        Self::with_memory_page_table(memory, page_table, |memory| {
+            let _ = memory.write_block(dst_addr as u64, bytes);
+        });
+    }
+
+    fn build_ipc_partial_page(
+        fill_value: u8,
+        send: bool,
+        dst_copy_offset: usize,
+        src: &[u8],
+    ) -> Vec<u8> {
+        let mut page = vec![fill_value; PAGE_SIZE];
+        if send && !src.is_empty() {
+            let copy_end = dst_copy_offset + src.len();
+            debug_assert!(copy_end <= PAGE_SIZE);
+            page[dst_copy_offset..copy_end].copy_from_slice(src);
+        }
+        page
+    }
+
     /// Matches upstream `KPageTableBase::SetupForIpcClient`.
     pub fn setup_for_ipc_client(
         &mut self,
-        _addr: usize,
-        _size: usize,
-        _test_perm: KMemoryPermission,
-        _dst_state: KMemoryState,
+        addr: usize,
+        size: usize,
+        test_perm: KMemoryPermission,
+        dst_state: KMemoryState,
     ) -> u32 {
-        // Full IPC client setup: locks pages, creates mapping for server.
-        // In our emulator, IPC buffers are directly accessible.
-        0
+        if size == 0 {
+            return crate::hle::result::RESULT_SUCCESS.get_inner_value();
+        }
+        if !self.contains_range(addr, size) {
+            return svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value();
+        }
+
+        let Some((test_state, test_attr_mask)) = Self::get_ipc_test_state_and_attr_mask(dst_state)
+        else {
+            return svc_results::RESULT_INVALID_COMBINATION.get_inner_value();
+        };
+
+        let src_perm = Self::get_ipc_source_permission(test_perm);
+        let (aligned_start, aligned_end, mapping_start, mapping_end) =
+            Self::get_ipc_aligned_extents(addr, size);
+        let aligned_size = aligned_end - aligned_start;
+        let mapping_size = mapping_end.saturating_sub(mapping_start);
+
+        let rc = self.check_memory_state(
+            aligned_start,
+            aligned_size,
+            test_state,
+            test_state,
+            test_perm,
+            test_perm,
+            test_attr_mask,
+            KMemoryAttribute::NONE,
+        );
+        if rc != crate::hle::result::RESULT_SUCCESS.get_inner_value() {
+            return rc;
+        }
+
+        if mapping_size == 0 {
+            return crate::hle::result::RESULT_SUCCESS.get_inner_value();
+        }
+
+        self.m_memory_block_manager.update_lock(
+            mapping_start,
+            mapping_size / PAGE_SIZE,
+            src_perm,
+            |block, new_perm, is_first, is_last| block.lock_for_ipc(new_perm, is_first, is_last),
+        );
+
+        self.reprotect_ipc_range(mapping_start, mapping_size)
+    }
+
+    /// Matches upstream `KPageTableBase::SetupForIpc`.
+    pub fn setup_for_ipc(
+        &mut self,
+        out_dst_addr: &mut usize,
+        size: usize,
+        src_addr: usize,
+        src_page_table: &mut KPageTableBase,
+        test_perm: KMemoryPermission,
+        dst_state: KMemoryState,
+        send: bool,
+    ) -> u32 {
+        let client_rc = src_page_table.setup_for_ipc_client(src_addr, size, test_perm, dst_state);
+        if client_rc != crate::hle::result::RESULT_SUCCESS.get_inner_value() {
+            return client_rc;
+        }
+
+        let server_rc = self.setup_for_ipc_server(
+            out_dst_addr,
+            size,
+            src_addr,
+            test_perm,
+            dst_state,
+            src_page_table,
+            send,
+        );
+        if server_rc != crate::hle::result::RESULT_SUCCESS.get_inner_value() {
+            let _ = src_page_table.cleanup_for_ipc_client(src_addr, size, dst_state);
+            return server_rc;
+        }
+
+        // The current Rust backend still falls back to the source address when
+        // the page-table backend cannot materialize a distinct alias mapping.
+        // Keep that adaptation in the page-table owner, not in KServerSession.
+        if size > 0 && *out_dst_addr == 0 {
+            *out_dst_addr = src_addr;
+        }
+
+        crate::hle::result::RESULT_SUCCESS.get_inner_value()
     }
 
     /// Matches upstream `KPageTableBase::SetupForIpcServer`.
     pub fn setup_for_ipc_server(
         &mut self,
-        _out_addr: &mut usize,
-        _size: usize,
-        _src_addr: usize,
-        _test_perm: KMemoryPermission,
-        _dst_state: KMemoryState,
-        _src_table: &mut KPageTableBase,
-        _send: bool,
+        out_addr: &mut usize,
+        size: usize,
+        src_addr: usize,
+        test_perm: KMemoryPermission,
+        dst_state: KMemoryState,
+        src_table: &mut KPageTableBase,
+        send: bool,
     ) -> u32 {
-        0
+        let region_size = self
+            .m_alias_region_end
+            .saturating_sub(self.m_alias_region_start);
+        if size >= region_size {
+            return svc_results::RESULT_OUT_OF_ADDRESS_SPACE.get_inner_value();
+        }
+
+        let (aligned_src_start, aligned_src_end, mapping_src_start, mapping_src_end) =
+            Self::get_ipc_aligned_extents(src_addr, size);
+        let aligned_src_size = aligned_src_end.saturating_sub(aligned_src_start);
+        let mapping_src_size = mapping_src_end.saturating_sub(mapping_src_start);
+
+        if aligned_src_size == 0 {
+            *out_addr = 0;
+            return crate::hle::result::RESULT_SUCCESS.get_inner_value();
+        }
+
+        let dst_addr = self.find_free_area(
+            self.m_alias_region_start,
+            region_size / PAGE_SIZE,
+            aligned_src_size / PAGE_SIZE,
+            PAGE_SIZE,
+            aligned_src_start & (PAGE_SIZE - 1),
+            self.get_num_guard_pages(),
+        );
+        if dst_addr == 0 {
+            return svc_results::RESULT_OUT_OF_ADDRESS_SPACE.get_inner_value();
+        }
+        if !self.can_contain_k(dst_addr, aligned_src_size, dst_state) {
+            return svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value();
+        }
+
+        let unmapped_size = aligned_src_size.saturating_sub(mapping_src_size);
+        if unmapped_size > 0 {
+            let Some(resource_limit) = &self.m_resource_limit else {
+                return svc_results::RESULT_LIMIT_REACHED.get_inner_value();
+            };
+            if !resource_limit
+                .lock()
+                .unwrap()
+                .reserve(LimitableResource::PhysicalMemoryMax, unmapped_size as i64)
+            {
+                return svc_results::RESULT_LIMIT_REACHED.get_inner_value();
+            }
+        }
+
+        let map_properties = KPageProperties {
+            perm: test_perm,
+            io: false,
+            uncached: false,
+            disable_merge_attributes: DisableMergeAttribute::DISABLE_HEAD,
+        };
+
+        let memory = self.m_memory.clone().or_else(|| src_table.m_memory.clone());
+        let dst_page_table = self
+            .m_impl
+            .as_deref_mut()
+            .map(|pt| pt as *mut common::page_table::PageTable)
+            .unwrap_or(std::ptr::null_mut());
+        let src_page_table = src_table
+            .m_impl
+            .as_deref_mut()
+            .map(|pt| pt as *mut common::page_table::PageTable)
+            .unwrap_or(std::ptr::null_mut());
+        let fill_value = self.m_ipc_fill_value as u8;
+
+        let mut mapped_pages = 0usize;
+        let mut cur_mapped_addr = dst_addr;
+
+        if aligned_src_start < mapping_src_start {
+            let partial_phys = crate::device_memory::dram_memory_map::BASE + cur_mapped_addr as u64;
+            let rc = self.operate(
+                cur_mapped_addr,
+                1,
+                partial_phys,
+                true,
+                map_properties,
+                OperationType::Map,
+            );
+            if rc != crate::hle::result::RESULT_SUCCESS.get_inner_value() {
+                if unmapped_size > 0 {
+                    if let Some(resource_limit) = &self.m_resource_limit {
+                        resource_limit
+                            .lock()
+                            .unwrap()
+                            .release(LimitableResource::PhysicalMemoryMax, unmapped_size as i64);
+                    }
+                }
+                return rc;
+            }
+            mapped_pages += 1;
+
+            if let Some(memory) = &memory {
+                let partial_offset = src_addr - aligned_src_start;
+                let copy_size = if src_addr + size < mapping_src_start {
+                    size
+                } else {
+                    mapping_src_start - src_addr
+                };
+                let src_bytes = if send && copy_size > 0 {
+                    Self::read_block_from_page_table(memory, src_page_table, src_addr, copy_size)
+                } else {
+                    Vec::new()
+                };
+                let page_bytes =
+                    Self::build_ipc_partial_page(fill_value, send, partial_offset, &src_bytes);
+                Self::write_block_to_page_table(
+                    memory,
+                    dst_page_table,
+                    cur_mapped_addr,
+                    &page_bytes,
+                );
+            }
+
+            cur_mapped_addr += PAGE_SIZE;
+        }
+
+        for src_page in (mapping_src_start..mapping_src_end).step_by(PAGE_SIZE) {
+            let phys_addr = src_table
+                .m_impl
+                .as_ref()
+                .and_then(|impl_pt| impl_pt.get_physical_address(src_page as u64))
+                .unwrap_or(crate::device_memory::dram_memory_map::BASE + src_page as u64);
+            let rc = self.operate(
+                cur_mapped_addr,
+                1,
+                phys_addr,
+                true,
+                map_properties,
+                OperationType::Map,
+            );
+            if rc != crate::hle::result::RESULT_SUCCESS.get_inner_value() {
+                if mapped_pages > 0 {
+                    let unmap_props = KPageProperties {
+                        perm: KMemoryPermission::NONE,
+                        io: false,
+                        uncached: false,
+                        disable_merge_attributes: DisableMergeAttribute::NONE,
+                    };
+                    let _ = self.operate(
+                        dst_addr,
+                        mapped_pages,
+                        0,
+                        false,
+                        unmap_props,
+                        OperationType::Unmap,
+                    );
+                }
+                if unmapped_size > 0 {
+                    if let Some(resource_limit) = &self.m_resource_limit {
+                        resource_limit
+                            .lock()
+                            .unwrap()
+                            .release(LimitableResource::PhysicalMemoryMax, unmapped_size as i64);
+                    }
+                }
+                return rc;
+            }
+            mapped_pages += 1;
+            cur_mapped_addr += PAGE_SIZE;
+        }
+
+        if mapping_src_end < aligned_src_end
+            && (aligned_src_start < mapping_src_end || aligned_src_start == mapping_src_start)
+        {
+            let partial_phys = crate::device_memory::dram_memory_map::BASE + cur_mapped_addr as u64;
+            let rc = self.operate(
+                cur_mapped_addr,
+                1,
+                partial_phys,
+                true,
+                map_properties,
+                OperationType::Map,
+            );
+            if rc != crate::hle::result::RESULT_SUCCESS.get_inner_value() {
+                if mapped_pages > 0 {
+                    let unmap_props = KPageProperties {
+                        perm: KMemoryPermission::NONE,
+                        io: false,
+                        uncached: false,
+                        disable_merge_attributes: DisableMergeAttribute::NONE,
+                    };
+                    let _ = self.operate(
+                        dst_addr,
+                        mapped_pages,
+                        0,
+                        false,
+                        unmap_props,
+                        OperationType::Unmap,
+                    );
+                }
+                if unmapped_size > 0 {
+                    if let Some(resource_limit) = &self.m_resource_limit {
+                        resource_limit
+                            .lock()
+                            .unwrap()
+                            .release(LimitableResource::PhysicalMemoryMax, unmapped_size as i64);
+                    }
+                }
+                return rc;
+            }
+            mapped_pages += 1;
+
+            if let Some(memory) = &memory {
+                let copy_size = src_addr + size - mapping_src_end;
+                let src_bytes = if send && copy_size > 0 {
+                    Self::read_block_from_page_table(
+                        memory,
+                        src_page_table,
+                        mapping_src_end,
+                        copy_size,
+                    )
+                } else {
+                    Vec::new()
+                };
+                let page_bytes = Self::build_ipc_partial_page(fill_value, send, 0, &src_bytes);
+                Self::write_block_to_page_table(
+                    memory,
+                    dst_page_table,
+                    cur_mapped_addr,
+                    &page_bytes,
+                );
+            }
+        }
+
+        self.m_memory_block_manager.update(
+            dst_addr,
+            aligned_src_size / PAGE_SIZE,
+            dst_state,
+            test_perm,
+            KMemoryAttribute::NONE,
+            KMemoryBlockDisableMergeAttribute::NORMAL,
+            KMemoryBlockDisableMergeAttribute::NONE,
+        );
+        self.m_mapped_ipc_server_memory = self
+            .m_mapped_ipc_server_memory
+            .saturating_add(unmapped_size);
+
+        *out_addr = dst_addr + (src_addr - aligned_src_start);
+        crate::hle::result::RESULT_SUCCESS.get_inner_value()
     }
 
     /// Matches upstream `KPageTableBase::CleanupForIpcServer`.
     pub fn cleanup_for_ipc_server(
         &mut self,
-        _addr: usize,
-        _size: usize,
-        _dst_state: KMemoryState,
+        addr: usize,
+        size: usize,
+        dst_state: KMemoryState,
     ) -> u32 {
-        0
+        if size == 0 {
+            return crate::hle::result::RESULT_SUCCESS.get_inner_value();
+        }
+        if !self.contains_range(addr, size) {
+            return svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value();
+        }
+
+        let rc = self.check_memory_state(
+            addr,
+            size,
+            KMemoryState::MASK,
+            dst_state,
+            KMemoryPermission::USER_READ,
+            KMemoryPermission::USER_READ,
+            KMemoryAttribute::from_bits_truncate(0xFF),
+            KMemoryAttribute::NONE,
+        );
+        if rc != crate::hle::result::RESULT_SUCCESS.get_inner_value() {
+            return rc;
+        }
+
+        let (aligned_start, aligned_end, mapping_start, mapping_end) =
+            Self::get_ipc_aligned_extents(addr, size);
+        let aligned_size = aligned_end.saturating_sub(aligned_start);
+        let mapping_size = mapping_end.saturating_sub(mapping_start);
+
+        if aligned_size > 0 {
+            let unmap_props = KPageProperties {
+                perm: KMemoryPermission::NONE,
+                io: false,
+                uncached: false,
+                disable_merge_attributes: DisableMergeAttribute::NONE,
+            };
+            let rc = self.operate(
+                aligned_start,
+                aligned_size / PAGE_SIZE,
+                0,
+                false,
+                unmap_props,
+                OperationType::Unmap,
+            );
+            if rc != crate::hle::result::RESULT_SUCCESS.get_inner_value() {
+                return rc;
+            }
+
+            self.m_memory_block_manager.update(
+                aligned_start,
+                aligned_size / PAGE_SIZE,
+                KMemoryState::NONE,
+                KMemoryPermission::NONE,
+                KMemoryAttribute::NONE,
+                KMemoryBlockDisableMergeAttribute::NONE,
+                KMemoryBlockDisableMergeAttribute::NORMAL,
+            );
+        }
+
+        let unmapped_size = aligned_size.saturating_sub(mapping_size);
+        if unmapped_size > 0 {
+            if let Some(resource_limit) = &self.m_resource_limit {
+                resource_limit
+                    .lock()
+                    .unwrap()
+                    .release(LimitableResource::PhysicalMemoryMax, unmapped_size as i64);
+            }
+            self.m_mapped_ipc_server_memory = self
+                .m_mapped_ipc_server_memory
+                .saturating_sub(unmapped_size);
+        }
+
+        crate::hle::result::RESULT_SUCCESS.get_inner_value()
     }
 
     /// Matches upstream `KPageTableBase::CleanupForIpcClient`.
     pub fn cleanup_for_ipc_client(
         &mut self,
-        _addr: usize,
-        _size: usize,
-        _dst_state: KMemoryState,
+        addr: usize,
+        size: usize,
+        dst_state: KMemoryState,
     ) -> u32 {
-        0
+        if size == 0 {
+            return crate::hle::result::RESULT_SUCCESS.get_inner_value();
+        }
+        if !self.contains_range(addr, size) {
+            return svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value();
+        }
+
+        let Some((test_state, test_attr_mask)) = Self::get_ipc_test_state_and_attr_mask(dst_state)
+        else {
+            return svc_results::RESULT_INVALID_COMBINATION.get_inner_value();
+        };
+
+        let (_, _, mapping_start, mapping_end) = Self::get_ipc_aligned_extents(addr, size);
+        let mapping_size = mapping_end.saturating_sub(mapping_start);
+        if mapping_size == 0 {
+            return crate::hle::result::RESULT_SUCCESS.get_inner_value();
+        }
+
+        let rc = self.check_memory_state(
+            mapping_start,
+            mapping_size,
+            test_state,
+            test_state,
+            KMemoryPermission::NONE,
+            KMemoryPermission::NONE,
+            test_attr_mask | KMemoryAttribute::IPC_LOCKED,
+            KMemoryAttribute::IPC_LOCKED,
+        );
+        if rc != crate::hle::result::RESULT_SUCCESS.get_inner_value() {
+            return rc;
+        }
+
+        self.m_memory_block_manager.update_lock(
+            mapping_start,
+            mapping_size / PAGE_SIZE,
+            KMemoryPermission::NONE,
+            |block, new_perm, is_first, is_last| block.unlock_for_ipc(new_perm, is_first, is_last),
+        );
+
+        self.reprotect_ipc_range(mapping_start, mapping_size)
     }
 
     // -- Code Locking --
@@ -3505,6 +4064,7 @@ impl Default for KPageTableBase {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hle::kernel::k_resource_limit::create_resource_limit_for_process;
     use crate::hle::kernel::svc::svc_results;
 
     #[test]
@@ -3572,9 +4132,10 @@ mod tests {
         page_table.m_alias_region_end = 0x1001_0000;
         page_table.m_stack_region_start = 0x1000_0000;
         page_table.m_stack_region_end = 0x1001_0000;
-        page_table
-            .m_memory_block_manager
-            .initialize(page_table.m_address_space_start, page_table.m_address_space_end);
+        page_table.m_memory_block_manager.initialize(
+            page_table.m_address_space_start,
+            page_table.m_address_space_end,
+        );
         page_table.m_memory_block_manager.update(
             0x1000_8000,
             2,
@@ -3602,9 +4163,10 @@ mod tests {
         page_table.m_alias_region_end = 0x1001_0000;
         page_table.m_stack_region_start = 0x1000_0000;
         page_table.m_stack_region_end = 0x1001_0000;
-        page_table
-            .m_memory_block_manager
-            .initialize(page_table.m_address_space_start, page_table.m_address_space_end);
+        page_table.m_memory_block_manager.initialize(
+            page_table.m_address_space_start,
+            page_table.m_address_space_end,
+        );
         page_table.m_memory_block_manager.update(
             0x1000_8000,
             2,
@@ -3625,5 +4187,133 @@ mod tests {
         assert_eq!(src_info.m_attribute, KMemoryAttribute::NONE);
         assert_eq!(dst_info.m_state, KMemoryState::FREE);
         assert_eq!(dst_info.m_permission, KMemoryPermission::NONE);
+    }
+
+    #[test]
+    fn setup_and_cleanup_for_ipc_client_lock_and_unlock_aligned_interior() {
+        let mut page_table = KPageTableBase::new();
+        page_table.m_address_space_start = 0x1000_0000;
+        page_table.m_address_space_end = 0x1001_0000;
+        page_table.m_memory_block_manager.initialize(
+            page_table.m_address_space_start,
+            page_table.m_address_space_end,
+        );
+        page_table.m_memory_block_manager.update(
+            0x1000_0000,
+            4,
+            KMemoryState::NORMAL,
+            KMemoryPermission::USER_READ_WRITE,
+            KMemoryAttribute::NONE,
+            KMemoryBlockDisableMergeAttribute::NONE,
+            KMemoryBlockDisableMergeAttribute::NONE,
+        );
+
+        let addr = 0x1000_0080;
+        let size = PAGE_SIZE + 0x100;
+
+        assert_eq!(
+            page_table.setup_for_ipc_client(
+                addr,
+                size,
+                KMemoryPermission::USER_READ_WRITE,
+                KMemoryState::IPC,
+            ),
+            0
+        );
+        let locked = page_table.query_info(0x1000_1000).unwrap();
+        assert!(locked.m_attribute.contains(KMemoryAttribute::IPC_LOCKED));
+        assert_eq!(
+            locked.m_permission,
+            KMemoryPermission::KERNEL_READ_WRITE | KMemoryPermission::NOT_MAPPED
+        );
+
+        assert_eq!(
+            page_table.cleanup_for_ipc_client(addr, size, KMemoryState::IPC),
+            0
+        );
+        let unlocked = page_table.query_info(0x1000_1000).unwrap();
+        assert!(!unlocked.m_attribute.contains(KMemoryAttribute::IPC_LOCKED));
+        assert_eq!(unlocked.m_permission, KMemoryPermission::USER_READ_WRITE);
+    }
+
+    #[test]
+    fn setup_and_cleanup_for_ipc_server_account_partial_page_backend_cost() {
+        let mut dst = KPageTableBase::new();
+        dst.m_address_space_start = 0x1000_0000;
+        dst.m_address_space_end = 0x1002_0000;
+        dst.m_alias_region_start = 0x1000_0000;
+        dst.m_alias_region_end = 0x1002_0000;
+        dst.m_resource_limit = Some(Arc::new(Mutex::new(create_resource_limit_for_process(
+            0x10_0000,
+        ))));
+        dst.m_memory_block_manager
+            .initialize(dst.m_address_space_start, dst.m_address_space_end);
+
+        let mut src = KPageTableBase::new();
+        src.m_address_space_start = 0x2000_0000;
+        src.m_address_space_end = 0x2002_0000;
+        src.m_memory_block_manager
+            .initialize(src.m_address_space_start, src.m_address_space_end);
+
+        let mut out_addr = 0usize;
+        let src_addr = 0x2000_0080usize;
+        let size = PAGE_SIZE + 0x100;
+        let partial_backend_cost = (src_addr & (PAGE_SIZE - 1))
+            + ((src_addr + size).next_multiple_of(PAGE_SIZE) - (src_addr + size));
+
+        assert_eq!(
+            dst.setup_for_ipc_server(
+                &mut out_addr,
+                size,
+                src_addr,
+                KMemoryPermission::USER_READ,
+                KMemoryState::IPC,
+                &mut src,
+                true,
+            ),
+            0
+        );
+        assert_ne!(out_addr, 0);
+        assert_eq!(dst.m_mapped_ipc_server_memory, partial_backend_cost);
+        assert_eq!(
+            dst.m_resource_limit
+                .as_ref()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .get_current_value(LimitableResource::PhysicalMemoryMax),
+            partial_backend_cost as i64
+        );
+
+        assert_eq!(
+            dst.cleanup_for_ipc_server(out_addr, size, KMemoryState::IPC),
+            0
+        );
+        assert_eq!(dst.m_mapped_ipc_server_memory, 0);
+        assert_eq!(
+            dst.m_resource_limit
+                .as_ref()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .get_current_value(LimitableResource::PhysicalMemoryMax),
+            0
+        );
+    }
+
+    #[test]
+    fn build_ipc_partial_page_fills_and_overlays_start_fragment() {
+        let page = KPageTableBase::build_ipc_partial_page(b'Y', true, 0x80, &[1, 2, 3, 4]);
+        assert_eq!(page.len(), PAGE_SIZE);
+        assert!(page[..0x80].iter().all(|b| *b == b'Y'));
+        assert_eq!(&page[0x80..0x84], &[1, 2, 3, 4]);
+        assert!(page[0x84..].iter().all(|b| *b == b'Y'));
+    }
+
+    #[test]
+    fn build_ipc_partial_page_non_send_fills_entire_page() {
+        let page = KPageTableBase::build_ipc_partial_page(b'Y', false, 0, &[1, 2, 3, 4]);
+        assert_eq!(page.len(), PAGE_SIZE);
+        assert!(page.iter().all(|b| *b == b'Y'));
     }
 }

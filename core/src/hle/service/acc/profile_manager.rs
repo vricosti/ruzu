@@ -147,8 +147,8 @@ impl ProfileManager {
             manager.write_user_save_file();
         }
 
-        let current = (*common::settings::values().current_user.get_value() as usize)
-            .clamp(0, MAX_USERS - 1);
+        let current =
+            (*common::settings::values().current_user.get_value() as usize).clamp(0, MAX_USERS - 1);
         let current = if manager.user_exists_index(current) {
             current
         } else {
@@ -463,7 +463,11 @@ impl ProfileManager {
         }
         self.profiles[index] = ProfileInfo::default();
         self.profiles.sort_by_key(|profile| profile.user_uuid == 0);
-        self.user_count = self.profiles.iter().filter(|profile| profile.user_uuid != 0).count();
+        self.user_count = self
+            .profiles
+            .iter()
+            .filter(|profile| profile.user_uuid != 0)
+            .count();
         self.is_save_needed = true;
         true
     }
@@ -498,7 +502,10 @@ mod tests {
 
         let mut expected_name = [0u8; PROFILE_USERNAME_SIZE];
         expected_name[..4].copy_from_slice(b"yuzu");
-        assert_eq!(manager.get_profile_base(Some(0)).unwrap().username, expected_name);
+        assert_eq!(
+            manager.get_profile_base(Some(0)).unwrap().username,
+            expected_name
+        );
 
         let user_bytes = user.to_le_bytes();
         assert_ne!(user_bytes, UUID::new().uuid);

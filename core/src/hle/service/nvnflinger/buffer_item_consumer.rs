@@ -122,7 +122,8 @@ mod tests {
         let bic = BufferItemConsumer::new(consumer);
 
         let expected = Arc::new(GraphicBuffer::new(1280, 720, PixelFormat::Rgba8888, 0));
-        bic.base.set_slot_graphic_buffer_for_test(3, Some(Arc::clone(&expected)));
+        bic.base
+            .set_slot_graphic_buffer_for_test(3, Some(Arc::clone(&expected)));
 
         let mut item = BufferItem::default();
         item.slot = 3;

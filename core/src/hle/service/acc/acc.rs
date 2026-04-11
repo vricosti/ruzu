@@ -8,11 +8,11 @@
 
 use super::profile_manager::{ProfileBase, ProfileManager, UserData, UserIdArray, MAX_USERS};
 use crate::file_sys::romfs_factory::StorageId;
+use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 use crate::hle::service::acc::errors::{
     RESULT_APPLICATION_INFO_ALREADY_INITIALIZED, RESULT_INVALID_APPLICATION,
 };
 use crate::hle::service::glue::glue_manager::ApplicationLaunchProperty;
-use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 use crate::hle::service::hle_ipc::{
     HLERequestContext, SessionRequestHandler, SessionRequestHandlerPtr,
 };
@@ -235,9 +235,7 @@ impl Interface {
         }
 
         let Some(launch_property) = launch_property else {
-            log::error!(
-                "Account::InitializeApplicationInfoBase: ARP returned no launch property"
-            );
+            log::error!("Account::InitializeApplicationInfoBase: ARP returned no launch property");
             return RESULT_INVALID_APPLICATION;
         };
 
@@ -322,7 +320,11 @@ impl EnsureTokenIdCacheAsyncInterface {
     fn new() -> Self {
         let handlers = build_handler_map(&[
             (0, Some(Self::unknown0_handler), "Unknown0"),
-            (1, Some(Self::load_id_token_cache_handler), "LoadIdTokenCache"),
+            (
+                1,
+                Some(Self::load_id_token_cache_handler),
+                "LoadIdTokenCache",
+            ),
             (2, Some(Self::unknown2_handler), "Unknown2"),
             (3, Some(Self::unknown3_handler), "Unknown3"),
             (100, Some(Self::cancel_handler), "Cancel"),
@@ -340,8 +342,9 @@ impl EnsureTokenIdCacheAsyncInterface {
     }
 
     fn load_id_token_cache_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
-        let svc =
-            unsafe { &*(this as *const dyn ServiceFramework as *const EnsureTokenIdCacheAsyncInterface) };
+        let svc = unsafe {
+            &*(this as *const dyn ServiceFramework as *const EnsureTokenIdCacheAsyncInterface)
+        };
         svc.load_id_token_cache(ctx);
     }
 
@@ -401,28 +404,35 @@ struct IManagerForApplication {
 }
 
 impl IManagerForApplication {
-    fn new(
-        _system: crate::core::SystemRef,
-        profile_manager: Arc<Mutex<ProfileManager>>,
-    ) -> Self {
+    fn new(_system: crate::core::SystemRef, profile_manager: Arc<Mutex<ProfileManager>>) -> Self {
         let handlers = build_handler_map(&[
-            (0, Some(Self::check_availability_handler), "CheckAvailability"),
+            (
+                0,
+                Some(Self::check_availability_handler),
+                "CheckAvailability",
+            ),
             (1, Some(Self::get_account_id_handler), "GetAccountId"),
             (
                 2,
                 Some(Self::ensure_id_token_cache_async_handler),
                 "EnsureIdTokenCacheAsync",
             ),
-            (3, Some(Self::load_id_token_cache_handler), "LoadIdTokenCache"),
+            (
+                3,
+                Some(Self::load_id_token_cache_handler),
+                "LoadIdTokenCache",
+            ),
             (
                 130,
-                Some(
-                    Self::get_nintendo_account_user_resource_cache_for_application_handler,
-                ),
+                Some(Self::get_nintendo_account_user_resource_cache_for_application_handler),
                 "GetNintendoAccountUserResourceCacheForApplication",
             ),
             (150, None, "CreateAuthorizationRequest"),
-            (160, Some(Self::store_open_context_handler), "StoreOpenContext"),
+            (
+                160,
+                Some(Self::store_open_context_handler),
+                "StoreOpenContext",
+            ),
             (170, None, "LoadNetworkServiceLicenseKindAsync"),
         ]);
         Self {
@@ -440,7 +450,8 @@ impl IManagerForApplication {
     }
 
     fn get_account_id_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
-        let svc = unsafe { &*(this as *const dyn ServiceFramework as *const IManagerForApplication) };
+        let svc =
+            unsafe { &*(this as *const dyn ServiceFramework as *const IManagerForApplication) };
         let pm = svc.profile_manager.lock().unwrap();
         let hash =
             common::uuid::UUID::from_bytes(pm.get_last_opened_user().to_le_bytes()).hash_value();
@@ -453,12 +464,14 @@ impl IManagerForApplication {
         this: &dyn ServiceFramework,
         ctx: &mut HLERequestContext,
     ) {
-        let svc = unsafe { &*(this as *const dyn ServiceFramework as *const IManagerForApplication) };
+        let svc =
+            unsafe { &*(this as *const dyn ServiceFramework as *const IManagerForApplication) };
         push_interface_response(ctx, svc.ensure_token_id.clone());
     }
 
     fn load_id_token_cache_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
-        let svc = unsafe { &*(this as *const dyn ServiceFramework as *const IManagerForApplication) };
+        let svc =
+            unsafe { &*(this as *const dyn ServiceFramework as *const IManagerForApplication) };
         svc.ensure_token_id.load_id_token_cache(ctx);
     }
 
@@ -466,7 +479,8 @@ impl IManagerForApplication {
         this: &dyn ServiceFramework,
         ctx: &mut HLERequestContext,
     ) {
-        let svc = unsafe { &*(this as *const dyn ServiceFramework as *const IManagerForApplication) };
+        let svc =
+            unsafe { &*(this as *const dyn ServiceFramework as *const IManagerForApplication) };
         ctx.write_buffer(&vec![0u8; 0x68], 0);
         if ctx.can_write_buffer(1) {
             ctx.write_buffer(&vec![0u8; ctx.get_write_buffer_size(1)], 1);
@@ -481,7 +495,8 @@ impl IManagerForApplication {
     }
 
     fn store_open_context_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
-        let svc = unsafe { &*(this as *const dyn ServiceFramework as *const IManagerForApplication) };
+        let svc =
+            unsafe { &*(this as *const dyn ServiceFramework as *const IManagerForApplication) };
         svc.profile_manager.lock().unwrap().store_opened_users();
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
@@ -864,22 +879,18 @@ mod tests {
         let mut system = crate::core::System::new();
         let program_id = 0x0100_1520_0002_2000;
         system.set_runtime_program_id(program_id);
-        system
-            .arp_manager()
-            .lock()
-            .unwrap()
-            .register(
-                program_id,
-                ApplicationLaunchProperty {
-                    title_id: program_id,
-                    version: 0,
-                    base_game_storage_id: StorageId::Host as u8,
-                    update_storage_id: StorageId::None as u8,
-                    program_index: 0,
-                    reserved: 0,
-                },
-                vec![0; 0x4000],
-            );
+        system.arp_manager().lock().unwrap().register(
+            program_id,
+            ApplicationLaunchProperty {
+                title_id: program_id,
+                version: 0,
+                base_game_storage_id: StorageId::Host as u8,
+                update_storage_id: StorageId::None as u8,
+                program_index: 0,
+                reserved: 0,
+            },
+            vec![0; 0x4000],
+        );
 
         let mut interface = make_interface(crate::core::SystemRef::from_ref(&system));
         let result = interface.initialize_application_info();
@@ -900,22 +911,18 @@ mod tests {
         let mut system = crate::core::System::new();
         let program_id = 0x0100_1520_0002_2000;
         system.set_runtime_program_id(program_id);
-        system
-            .arp_manager()
-            .lock()
-            .unwrap()
-            .register(
-                program_id,
-                ApplicationLaunchProperty {
-                    title_id: program_id,
-                    version: 0,
-                    base_game_storage_id: StorageId::Host as u8,
-                    update_storage_id: StorageId::None as u8,
-                    program_index: 0,
-                    reserved: 0,
-                },
-                vec![0; 0x4000],
-            );
+        system.arp_manager().lock().unwrap().register(
+            program_id,
+            ApplicationLaunchProperty {
+                title_id: program_id,
+                version: 0,
+                base_game_storage_id: StorageId::Host as u8,
+                update_storage_id: StorageId::None as u8,
+                program_index: 0,
+                reserved: 0,
+            },
+            vec![0; 0x4000],
+        );
 
         let mut interface = make_interface(crate::core::SystemRef::from_ref(&system));
         assert_eq!(interface.initialize_application_info(), RESULT_SUCCESS);

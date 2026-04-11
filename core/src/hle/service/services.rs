@@ -86,9 +86,7 @@ impl crate::hle::service::hle_ipc::SessionRequestHandler for GenericStubService 
                 rb.push_result(crate::hle::result::RESULT_SUCCESS);
                 ctx.add_domain_object(stub_obj);
             } else {
-                let move_handle = ctx
-                    .create_session_for_service(stub_obj)
-                    .unwrap_or(0);
+                let move_handle = ctx.create_session_for_service(stub_obj).unwrap_or(0);
                 let mut rb = crate::hle::service::ipc_helpers::ResponseBuilder::new(ctx, 2, 0, 1);
                 rb.push_result(crate::hle::result::RESULT_SUCCESS);
                 rb.push_move_objects(move_handle);

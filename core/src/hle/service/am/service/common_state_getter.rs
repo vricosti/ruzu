@@ -15,8 +15,8 @@ use std::sync::{Arc, Mutex};
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
 use crate::hle::service::ipc_helpers::{RequestParser, ResponseBuilder};
-use crate::hle::service::set::settings_types::PlatformRegion;
 use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
+use crate::hle::service::set::settings_types::PlatformRegion;
 
 /// IPC command table for ICommonStateGetter:
 /// - 0: GetEventHandle
@@ -623,11 +623,14 @@ mod tests {
 
     #[test]
     fn exercised_common_state_handlers_are_registered() {
-        let service = ICommonStateGetter::new(crate::core::SystemRef::null(), Arc::new(Mutex::new(Applet::new(
+        let service = ICommonStateGetter::new(
             crate::core::SystemRef::null(),
-            crate::hle::service::os::process::Process::new(),
-            false,
-        ))));
+            Arc::new(Mutex::new(Applet::new(
+                crate::core::SystemRef::null(),
+                crate::hle::service::os::process::Process::new(),
+                false,
+            ))),
+        );
 
         for cmd in [31u32, 32, 52, 53, 54, 300] {
             assert!(
@@ -644,21 +647,30 @@ mod tests {
 
     #[test]
     fn get_settings_platform_region_returns_global() {
-        let service = ICommonStateGetter::new(crate::core::SystemRef::null(), Arc::new(Mutex::new(Applet::new(
+        let service = ICommonStateGetter::new(
             crate::core::SystemRef::null(),
-            crate::hle::service::os::process::Process::new(),
-            false,
-        ))));
-        assert_eq!(service.get_settings_platform_region(), PlatformRegion::Global);
+            Arc::new(Mutex::new(Applet::new(
+                crate::core::SystemRef::null(),
+                crate::hle::service::os::process::Process::new(),
+                false,
+            ))),
+        );
+        assert_eq!(
+            service.get_settings_platform_region(),
+            PlatformRegion::Global
+        );
     }
 
     #[test]
     fn vr_mode_ex_handlers_toggle_vr_mode() {
-        let service = ICommonStateGetter::new(crate::core::SystemRef::null(), Arc::new(Mutex::new(Applet::new(
+        let service = ICommonStateGetter::new(
             crate::core::SystemRef::null(),
-            crate::hle::service::os::process::Process::new(),
-            false,
-        ))));
+            Arc::new(Mutex::new(Applet::new(
+                crate::core::SystemRef::null(),
+                crate::hle::service::os::process::Process::new(),
+                false,
+            ))),
+        );
         assert!(!service.is_vr_mode_enabled());
         service.begin_vr_mode_ex();
         assert!(service.is_vr_mode_enabled());

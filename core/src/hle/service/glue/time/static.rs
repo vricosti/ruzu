@@ -848,7 +848,9 @@ mod tests {
 
     fn make_time_manager() -> Arc<Mutex<GlueTimeManager>> {
         Arc::new(Mutex::new(GlueTimeManager::new(
-            Arc::new(Mutex::new(crate::hle::service::sm::sm::ServiceManager::new())),
+            Arc::new(Mutex::new(
+                crate::hle::service::sm::sm::ServiceManager::new(),
+            )),
             crate::core::SystemRef::null(),
         )))
     }

@@ -9,6 +9,8 @@
 
 use std::collections::VecDeque;
 
+use super::k_synchronization_object::SynchronizationObjectState;
+
 /// The server port object.
 ///
 /// Matches upstream `KServerPort` class (k_server_port.h):
@@ -28,6 +30,8 @@ pub struct KServerPort {
     /// Pending light session list (KLightServerSession IDs).
     /// Upstream: `LightSessionList m_light_session_list`.
     pub light_session_list: VecDeque<u64>,
+    /// Waiter state inherited from upstream `KSynchronizationObject`.
+    pub sync_object: SynchronizationObjectState,
     // Note: upstream has `KPort* m_parent` for back-navigation.
     // Omitted because KPort owns KServerPort inline.
 }
@@ -37,6 +41,7 @@ impl KServerPort {
         Self {
             session_list: VecDeque::new(),
             light_session_list: VecDeque::new(),
+            sync_object: SynchronizationObjectState::new(),
         }
     }
 
@@ -46,6 +51,7 @@ impl KServerPort {
     /// We omit the parent pointer since KPort owns us inline.
     pub fn initialize(&mut self) {
         // Nothing to do beyond construction — lists are already empty.
+        self.sync_object = SynchronizationObjectState::new();
     }
 
     /// Enqueue a session.

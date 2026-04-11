@@ -40,7 +40,11 @@ impl IApplicationDisplayService {
             stray_layer_ids: Mutex::new(BTreeSet::new()),
             display_vsync_events: Mutex::new(BTreeMap::new()),
             handlers: build_handler_map(&[
-                (100, Some(Self::get_relay_service_handler), "GetRelayService"),
+                (
+                    100,
+                    Some(Self::get_relay_service_handler),
+                    "GetRelayService",
+                ),
                 (
                     101,
                     Some(Self::get_system_display_service_handler),
@@ -143,7 +147,10 @@ impl IApplicationDisplayService {
     }
 
     /// cmd 101: GetSystemDisplayService
-    fn get_system_display_service_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn get_system_display_service_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         let svc = Self::as_self(this);
         log::warn!("IApplicationDisplayService::GetSystemDisplayService (STUBBED)");
         let sub: Arc<dyn SessionRequestHandler> =
@@ -154,7 +161,10 @@ impl IApplicationDisplayService {
     }
 
     /// cmd 102: GetManagerDisplayService
-    fn get_manager_display_service_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn get_manager_display_service_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         let svc = Self::as_self(this);
         log::warn!("IApplicationDisplayService::GetManagerDisplayService (STUBBED)");
         let sub: Arc<dyn SessionRequestHandler> = svc.get_manager_display_service();

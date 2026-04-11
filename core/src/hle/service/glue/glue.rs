@@ -35,10 +35,7 @@ use crate::hle::service::sm::sm::ServiceManager;
 /// }
 /// ```
 ///
-pub fn loop_process(
-    service_manager: &Arc<Mutex<ServiceManager>>,
-    system: crate::core::SystemRef,
-) {
+pub fn loop_process(service_manager: &Arc<Mutex<ServiceManager>>, system: crate::core::SystemRef) {
     let mut server_manager = ServerManager::new(system);
 
     // ARP — stub until real implementations
@@ -59,7 +56,10 @@ pub fn loop_process(
     // Create the Glue::Time::TimeManager, matching upstream constructor.
     // This makes direct calls to time:m and set:sys via ServiceManager.
     use crate::hle::service::glue::time::manager::TimeManager;
-    let time_manager = Arc::new(Mutex::new(TimeManager::new(service_manager.clone(), system)));
+    let time_manager = Arc::new(Mutex::new(TimeManager::new(
+        service_manager.clone(),
+        system,
+    )));
     time_manager.lock().unwrap().initialize();
     log::info!("Glue::LoopProcess: TimeManager initialized");
 

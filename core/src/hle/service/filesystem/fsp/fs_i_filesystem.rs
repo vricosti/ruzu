@@ -134,7 +134,10 @@ impl IFileSystem {
         Ok(path.as_str().to_string())
     }
 
-    fn push_interface_response(ctx: &mut HLERequestContext, object: Arc<dyn SessionRequestHandler>) {
+    fn push_interface_response(
+        ctx: &mut HLERequestContext,
+        object: Arc<dyn SessionRequestHandler>,
+    ) {
         let is_domain = ctx
             .get_manager()
             .map_or(false, |manager| manager.lock().unwrap().is_domain());
@@ -329,7 +332,11 @@ impl IFileSystem {
             }
         };
 
-        log::debug!("IFileSystem::OpenFile called. file={}, mode={}", path, mode_raw);
+        log::debug!(
+            "IFileSystem::OpenFile called. file={}, mode={}",
+            path,
+            mode_raw
+        );
 
         let mode = OpenMode::from_bits_truncate(mode_raw);
         match service.backend.open_file(&path, mode) {
@@ -397,7 +404,10 @@ impl IFileSystem {
             }
         };
 
-        log::debug!("IFileSystem::CleanDirectoryRecursively called. directory={}", path);
+        log::debug!(
+            "IFileSystem::CleanDirectoryRecursively called. directory={}",
+            path
+        );
 
         match service.backend.clean_directory_recursively(&path) {
             Ok(()) => Self::push_result_only(ctx, RESULT_SUCCESS),

@@ -7,8 +7,7 @@ use std::time::Duration;
 
 use hid_core::hid_core::HIDCore;
 use hid_core::resource_manager::{
-    ResourceManager, DEFAULT_UPDATE_NS, MOTION_UPDATE_NS, MOUSE_KEYBOARD_UPDATE_NS,
-    NPAD_UPDATE_NS,
+    ResourceManager, DEFAULT_UPDATE_NS, MOTION_UPDATE_NS, MOUSE_KEYBOARD_UPDATE_NS, NPAD_UPDATE_NS,
 };
 use hid_core::resources::hid_firmware_settings::HidFirmwareSettings;
 
@@ -108,8 +107,12 @@ pub fn loop_process(system: crate::core::SystemRef) {
             false,
         );
         ct.schedule_looping_event(
-            Duration::from_nanos(hid_core::resources::touch_screen::touch_screen_resource::GESTURE_UPDATE_PERIOD_NS),
-            Duration::from_nanos(hid_core::resources::touch_screen::touch_screen_resource::GESTURE_UPDATE_PERIOD_NS),
+            Duration::from_nanos(
+                hid_core::resources::touch_screen::touch_screen_resource::GESTURE_UPDATE_PERIOD_NS,
+            ),
+            Duration::from_nanos(
+                hid_core::resources::touch_screen::touch_screen_resource::GESTURE_UPDATE_PERIOD_NS,
+            ),
             &touch_update_event,
             false,
         );

@@ -200,17 +200,12 @@ fn build_increment_with_wfi_command_list(fence: NvFence) -> GpuCommandList {
     result
 }
 
-fn command_list_headers_as_bytes_mut(
-    headers: &mut [GpuCommandListHeader],
-) -> &mut [u8] {
+fn command_list_headers_as_bytes_mut(headers: &mut [GpuCommandListHeader]) -> &mut [u8] {
     let byte_len = std::mem::size_of_val(headers);
     unsafe { std::slice::from_raw_parts_mut(headers.as_mut_ptr().cast::<u8>(), byte_len) }
 }
 
-fn copy_command_list_headers_from_bytes(
-    dest: &mut [GpuCommandListHeader],
-    src: &[u8],
-) {
+fn copy_command_list_headers_from_bytes(dest: &mut [GpuCommandListHeader], src: &[u8]) {
     let byte_len = std::mem::size_of_val(dest);
     command_list_headers_as_bytes_mut(dest).copy_from_slice(&src[..byte_len]);
 }
@@ -452,13 +447,15 @@ impl NvHostGpu {
         let mut command_lists = vec![GpuCommandListHeader::default(); command_count];
         if kickoff {
             let Some(memory) = self.system.get().get_svc_memory() else {
-                log::error!("nvhost_gpu::SubmitGPFIFOBase1 kickoff path without application memory");
+                log::error!(
+                    "nvhost_gpu::SubmitGPFIFOBase1 kickoff path without application memory"
+                );
                 return NvResult::InvalidState;
             };
-            memory
-                .lock()
-                .unwrap()
-                .read_block(params.address, command_list_headers_as_bytes_mut(&mut command_lists));
+            memory.lock().unwrap().read_block(
+                params.address,
+                command_list_headers_as_bytes_mut(&mut command_lists),
+            );
         } else {
             copy_command_list_headers_from_bytes(&mut command_lists, commands);
         }

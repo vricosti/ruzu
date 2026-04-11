@@ -177,6 +177,30 @@ impl KHandleTable {
         Ok(encode_handle(index as u16, linear_id))
     }
 
+    /// Register an object into a previously reserved handle slot.
+    ///
+    /// Matches the ownership of upstream `KHandleTable::Register(handle, object)`.
+    /// The slot must have been allocated via `reserve()` and still be empty.
+    pub fn register(&mut self, handle: Handle, object_id: u64) -> bool {
+        let (index, linear_id, reserved) = decode_handle(handle);
+        if reserved != 0 || handle == 0 || linear_id == 0 {
+            return false;
+        }
+        if index as usize >= self.table_size as usize {
+            return false;
+        }
+        if self.objects[index as usize] != 0 {
+            return false;
+        }
+        let stored_linear_id = unsafe { self.entry_infos[index as usize].linear_id };
+        if stored_linear_id != linear_id {
+            return false;
+        }
+
+        self.objects[index as usize] = object_id;
+        true
+    }
+
     /// Remove a handle from the table.
     pub fn remove(&mut self, handle: Handle) -> bool {
         let (index, _linear_id, _reserved) = decode_handle(handle);

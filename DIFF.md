@@ -1071,6 +1071,72 @@
 ### Binary layout verification
 - PASS: no raw byte layout affected in this pass.
 
+## 2026-04-11 — core/src/hle/service/os/event.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/os/event.h and /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/os/event.cpp
+
+### Intentional differences
+- Rust still stores a service-layer `Condvar` plus an optional `KReadableEvent` bridge instead of upstream owning `KEvent*` directly. This is a mechanical adaptation to the current split between service-layer `Event` and kernel objects.
+
+### Unintentional differences (to fix)
+- The Rust file still materializes the kernel bridge lazily from callers such as `ServerManager` instead of constructing the upstream `KEvent` eagerly in the owning service file.
+
+### Missing items
+- Full literal `KEvent` ownership in service owners that currently create `Event::new()` and attach the kernel bridge later.
+
+### Binary layout verification
+- PASS: runtime-only wrapper, no raw serialized structs.
+
+## 2026-04-11 — core/src/hle/service/os/multi_wait_holder.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/os/multi_wait_holder.h and /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/os/multi_wait_holder.cpp
+
+### Intentional differences
+- Rust keeps a tagged `WaitableHandle` enum with `Arc` owners instead of upstream raw `KSynchronizationObject*`. This is the current mechanical adaptation to Rust object ownership while preserving file ownership in `multi_wait_holder.rs`.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: server-port holders can now represent "object id not yet registered in the eventual service process" with `Option<u64>` instead of forcing an always-valid id too early.
+- The holder still resolves signaled state through owner `Arc<Mutex<...>>` instead of a literal upstream `GetNativeHandle()` pointer.
+
+### Missing items
+- Full typed waitable ownership without the current `WaitableHandle` enum bridge.
+
+### Binary layout verification
+- PASS: linkage/runtime state only; no raw serialized structs.
+
+## 2026-04-11 — core/src/hle/service/os/multi_wait.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/os/multi_wait.h and /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/os/multi_wait.cpp
+
+### Intentional differences
+- Rust still keeps a local polling fallback when there is no current emulation thread/process/scheduler context or when a holder still lacks a kernel object id. This is a temporary adaptation for tests and incompletely kernel-backed wait owners.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: the active runtime path now routes `wait_any(kernel)` / `try_wait_any(kernel)` through `KSynchronizationObject::wait(...)` when the waited holders are kernel-backed, instead of always using the old local polling loop.
+- The fallback local wait loop still exists and therefore the file is not yet a literal upstream-only `WaitAny(kernel)` implementation.
+
+### Missing items
+- Remove the local fallback once every runtime holder and caller is fully kernel-backed.
+
+### Binary layout verification
+- PASS: service-layer wait container only; no raw serialized structs.
+
+## 2026-04-11 — core/src/hle/service/server_manager.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/server_manager.h and /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/server_manager.cpp
+
+### Intentional differences
+- Rust still uses `Vec<Port>` / `Vec<Session>` plus boxed holders instead of upstream intrusive lists and holder inheritance. This preserves file ownership but not literal container shape.
+- `ServerManager` still keeps the historical test/null-system fallback path in `wait_and_process_impl()` when no kernel-backed wait context exists. Runtime no longer uses that path during normal service execution.
+- `Event` participation in `MultiWait` still goes through a lazily attached `KReadableEvent` bridge rather than upstream owning `KEvent*` directly from construction.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `RegisterNamedService(...)` now mirrors upstream ownership much more closely. Rust no longer just registers into `ServiceManager`; it also tracks the returned server port as a waited `Port` and links it into the deferred/multi-wait path.
+- Fixed in this pass: `ManageNamedPort(...)` no longer registers the server-port waitable against whichever process happened to be current at creation time. Rust now defers both server-port and named client-port process registration until the actual service-process thread exists in `loop_process()`.
+- Fixed in this pass: the active event loop now goes through `MultiWait::wait_any(kernel)` when kernel-backed holders are available, rather than the older guest-thread yield/poll split.
+- `OnPortEvent` still reconstructs service managers and session linkage through the current Rust `SessionRequestManager` / `HLERequestContext` machinery instead of the full upstream IPC/session request flow.
+- `RegisterNamedService(...)` still rebuilds the per-accept handler through `ServiceManager::get_service(name)` because the Rust `ServiceManager` stores a move-only factory; upstream keeps the original factory directly on `Port`.
+
+### Missing items
+- Full literal upstream `WaitSignaled()` / `Process(MultiWaitHolder*)` split, with no remaining null-system/local fallback.
+- Full literal `Port` ownership of the original handler factory for `RegisterNamedService(...)`.
+- Remove the remaining null-system/local polling fallback once every service waitable and test harness path is fully kernel-backed.
+
+### Binary layout verification
+- PASS: service manager control-flow and ownership only; no raw serialized structs.
+
 ## 2026-03-28 — `core/src/hle/kernel/k_scheduler.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/k_scheduler.cpp`
 
 ### Intentional differences
@@ -4746,10 +4812,18 @@
 ### Unintentional differences (to fix)
 - fixed in this pass: `MapMemory` no longer assumes `phys_addr = DRAM_BASE + src_address`. It now reconstructs the true source page backing through a Rust `make_page_group(...)` helper and remaps the destination through `map_page_group_impl(...)`, matching upstream `MakePageGroup(pg, src_address, num_pages)` plus `MapPageGroupImpl(...)`.
 - fixed in this pass: `MapMemory` now builds the source `KPageGroup` before changing source permissions, matching the upstream `MakePageGroup(...)` then `Operate(... ChangePermissions ...)` ordering.
+- fixed in this pass: `k_page_table_base.rs` now owns the upstream `SetupForIpc(...)` orchestration again instead of leaving `k_server_session.rs` to call the server half directly. Rust now performs the client-half setup, server-half setup, and client cleanup on server-setup failure from the page-table owner boundary.
+- fixed in this pass: `SetupForIpcClient(...)`, `SetupForIpcServer(...)`, `CleanupForIpcServer(...)`, and `CleanupForIpcClient(...)` are no longer pure stubs. Rust now performs upstream-shaped range validation, aligned extent calculation, IPC lock/unlock block-manager updates, alias-region allocation, alias mapping/unmapping, and `PhysicalMemoryMax` accounting from `k_page_table_base.rs`.
+- fixed in this pass: the fallback `out_dst_addr = src_addr` adaptation is now centralized in `SetupForIpc(...)`, not open-coded from `k_server_session.rs`.
+- fixed in this pass: `SetupForIpcServer(...)` now materializes dedicated partial start/end pages and initializes them with the upstream-shaped fill/copy behavior instead of mapping the whole source boundary pages directly. Rust now fills uncopied bytes with `m_ipc_fill_value` and only copies the leading/trailing payload fragments for those partial pages.
 - still wrong: `make_page_group(...)` currently walks the Rust `PageTable` one page at a time through `get_physical_address(...)` instead of using upstream traversal helpers and block-info manager ownership. Behavior is closer to upstream, but the internal structure is still simplified.
+- still wrong: the dedicated partial IPC pages are still backed by the current Rust DRAM/alias mapping path rather than literal upstream `KMemoryManager::AllocateAndOpenContinuous(...)` page objects plus `MemoryManager().Close(...)` reference handling. The observable fill/copy behavior is closer to upstream, but the physical-page ownership model is still simplified.
+- still wrong: the current Rust backend still does not model upstream `KScopedLightLockPair`, `KScopedPageTableUpdater`, `KMemoryBlockManagerUpdateAllocator`, or `CleanupForIpcClientOnServerSetupFailure(...)` literally. The flow is now in the right owner, but rollback/update internals are still simplified.
 
 ### Missing items
-- Re-audit `UnmapMemory` against upstream allocator/update ordering. This pass targeted the source-page selection bug in `MapMemory`.
+- Literal partial-page backing ownership via `KMemoryManager::AllocateAndOpenContinuous(...)` / `Close(...)`
+- Literal `CleanupForIpcClientOnServerSetupFailure(...)`
+- Re-audit `UnmapMemory` against upstream allocator/update ordering. This pass targeted the IPC backend setup/cleanup path.
 
 ### Binary layout verification
 - PASS: page-table remap behavior only; no guest-visible struct layout changed.
@@ -7492,3 +7566,475 @@
 
 ### Binary layout verification
 - PASS: accessor-only change; no raw serialized struct layout changed.
+
+## 2026-04-11 — `core/src/hle/kernel/k_process.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/k_process.h/.cpp`
+
+### Intentional differences
+- Rust still stores session ownership in per-process `BTreeMap<object_id, Arc<Mutex<KSession>>>` tables rather than upstream intrusive kernel object containers. The lookup responsibility remains owner-local in `k_process.rs`.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `KProcess` can now resolve a server-session endpoint by the owning session object id through `get_server_session_by_object_id(...)`, which is the owner-local lookup needed for `KSynchronizationObject` parity on session waitables.
+
+### Missing items
+- Re-audit `KProcess` object tables once `KServerPort` and the remaining kernel IPC objects become true waitable objects instead of service-layer approximations.
+
+### Binary layout verification
+- PASS: process object lookup only; no raw serialized struct layout changed.
+
+## 2026-04-11 — `core/src/hle/kernel/kernel.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/kernel.cpp`
+
+### Intentional differences
+- Rust still performs owner lookups by scanning `current_process_arc`, `service_processes`, and `host_service_processes` instead of an upstream unified kernel process container. The helper remains in `kernel.rs`, which is the correct owner for the kernel-wide lookup responsibility.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `kernel.rs` now exposes `get_session_owner_process_id(...)`, mirroring the existing event-owner lookup pattern so session waitables can resolve their owning process through the kernel process list.
+
+### Missing items
+- Re-audit these owner-lookup helpers once service processes and the frontend application process are registered through a more literal upstream kernel object path.
+
+### Binary layout verification
+- PASS: lookup helper only; no raw serialized struct layout changed.
+
+## 2026-04-11 — `core/src/hle/kernel/k_server_session.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/k_server_session.h/.cpp`
+
+### Intentional differences
+- Rust now queues real `KSessionRequest` owners, but it still uses `Arc<Mutex<KSessionRequest>>` in a `VecDeque` instead of the upstream intrusive request list and auto-object/slab lifecycle.
+- Rust still stores the upstream parent-client-closed state as a local `client_closed` flag on `KServerSession` instead of a literal inline `KSession*` parent pointer. This preserves the upstream local-read behavior without re-entering the Rust process registries from wait code.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `KServerSession` now owns `SynchronizationObjectState`, so it can participate in `KSynchronizationObject` wait linkage like upstream instead of being invisible to kernel waiters.
+- Fixed in this pass: `KServerSession::IsSignaled()` now matches the upstream contract much more closely:
+  - signaled if the client side is closed
+  - otherwise signaled only when requests are pending and no request is currently being handled
+- Fixed in this pass: `KServerSession::IsSignaled()` no longer performs kernel-wide owner-process/session lookup, removing the deadlock-prone lock re-entry that the previous Rust adaptation introduced.
+- Fixed in this pass: `KServerSession::OnRequest()` / `OnClientClosed()` now have `*_with_process(...)` variants so callers that already hold the owner process can notify waiters without re-entering the kernel process registry.
+- Fixed in this pass: `KServerSession::OnRequest()` now only notifies waiters on the empty-to-non-empty transition, matching the upstream wakeup edge instead of treating every enqueue identically.
+- Fixed in this pass: `KServerSession::OnClientClosed()` now wakes waiters with `ResultSessionClosed` after cleanup instead of silently clearing pending requests.
+- Fixed in this pass: `KServerSession` now queues and activates real `KSessionRequest` owners instead of synthetic request ids, so `receive_request()` / `send_reply()` track the correct owner file.
+- Fixed in this pass: `KServerSession::ReceiveRequest()` now records the current server process on the active `KSessionRequest` owner, which was previously done ad hoc in `svc_ipc.rs`.
+- Fixed in this pass: `KServerSession::SendReply()` / `CleanupRequests()` now finalize owned `KSessionRequest`s instead of only dropping ids or clearing pointers.
+- Fixed in this pass: `KServerSession::SendReply()` now signals the async request event through the owned request state, which is the Rust counterpart to upstream signaling `request->GetEvent()` on completion.
+
+### Missing items
+- Port the remaining literal upstream `SendReply`, `ReceiveRequest`, and request cleanup ordering once the message-buffer transport and thread/event wakeup lifecycle move out of the current HLE approximation.
+- Re-audit `OnClientClosed()` once async request events and full request cleanup are ported.
+- Migrate remaining callsites away from the fallback registry-based `notify_available(...)` helper so waiter wakeups never need the kernel-wide owner lookup path.
+- Rust waiter wakeups are still scoped through a single owner `KProcess`, while upstream waitable notification is object-centric and process-agnostic; cross-process waiters on server sessions still need a more literal ownership model.
+
+### Binary layout verification
+- PASS: synchronization-state and wait behavior only; no raw serialized struct layout changed.
+
+## 2026-04-11 — `core/src/hle/kernel/k_session.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/k_session.h/.cpp`
+
+### Intentional differences
+- Rust still owns `KServerSession` / `KClientSession` through `Arc<Mutex<...>>` endpoints instead of literal inline C++ subobjects, because the Rust port still relies on shared endpoint ownership across typed object registries.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `KSession::on_client_closed()` now propagates the client-closed signal into the owned `KServerSession`, which is the Rust counterpart to upstream `KServerSession::IsSignaled()` reading `m_parent->IsClientClosed()` from its inline parent session.
+- Fixed in this pass: `KSession` now has `on_request_with_process(...)` / `on_client_closed_with_process(...)` entry points so callers holding the owner process can preserve sane lock ordering while waking server-session waiters.
+- Fixed in this pass: `KSession::on_request(...)` / `on_request_with_process(...)` now forward real `KSessionRequest` owners instead of synthetic request ids, bringing request ownership back to the upstream file boundary.
+- Fixed in this pass: `KSession::on_server_closed()` now matches upstream state ordering more closely by only transitioning from `Normal` and by propagating the close to the owned `KClientSession`.
+
+### Missing items
+- Port the remaining upstream parent/back-pointer relationships and close/finalize ordering more literally once the Rust session object model is no longer split across separate endpoint `Arc`s.
+
+### Binary layout verification
+- PASS: session close semantics only; no raw serialized struct layout changed.
+
+## 2026-04-11 — `core/src/hle/kernel/k_session_request.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/k_session_request.h/.cpp`
+
+### Intentional differences
+- Rust still stores dynamic mappings in a `Vec<Mapping>` instead of allocating an upstream `KPageBuffer` page and reinterpreting it as a mapping array.
+- Rust still stores thread/event/server references as ids/options instead of upstream raw `KThread*`, `KEvent*`, and `KProcess*` auto-object references.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `Mapping::state` is now typed as `KMemoryState` instead of a raw `u32`, restoring the upstream owner-local contract for mapping memory state.
+- Fixed in this pass: `SessionMappings::Finalize()` now resets the send/receive/exchange counters instead of only clearing dynamic storage.
+- Fixed in this pass: `PushSend(...)`, `PushReceive(...)`, and `PushExchange(...)` now enforce the upstream ordering invariants with debug assertions (`send` before `recv`, `recv` before `exchange`).
+- Fixed in this pass: `KSessionRequest::Initialize(...)` now captures the current thread id in the owner file instead of leaving thread ownership entirely absent.
+- Fixed in this pass: `KSessionRequest::Initialize(...)` now also captures the client process id in the owner file, which is the current Rust adaptation needed for owner-local async event signaling on reply.
+
+### Missing items
+- Port the literal upstream slab allocation / `Create(kernel)` lifecycle for `KSessionRequest`.
+- Port `KPageBuffer`-backed dynamic mapping storage literally.
+- Port the real object reference ownership for thread/event/server process and the matching finalize/close behavior.
+
+### Binary layout verification
+- PASS: no raw serialized IPC payload layout changed in this pass; request-owner runtime state only.
+
+## 2026-04-11 — `core/src/hle/kernel/k_synchronization_object.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/k_synchronization_object.cpp`
+
+### Intentional differences
+- Rust `WaitableObject` remains a Rust enum wrapper over per-process object-table lookups instead of upstream virtual `KSynchronizationObject*` pointers. This is still the project-wide adaptation for waitable resolution.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `KSynchronizationObject` can now resolve server-session waitables through `KProcess::get_server_session_by_object_id(...)`.
+- Fixed in this pass: `WaitableObject` now supports `ServerSession`, including `is_signaled`, `link_waiter`, `unlink_waiter`, waiter snapshot, and unlink-all behavior.
+
+### Missing items
+- `KServerPort` is still not a real waitable object here, so the full upstream `ServerManager` `MultiWait` graph remains incomplete.
+- `MultiWait::WaitAny(kernel)` is still not wired to these waitables; `ServerManager` continues to use its hybrid fallback path until the remaining holder/port parity is ported.
+
+### Binary layout verification
+- PASS: waitable resolution only; no raw serialized struct layout changed.
+
+## 2026-04-11 — core/src/hle/kernel/k_server_session.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/k_server_session.h and /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/k_server_session.cpp
+
+### Intentional differences
+- Rust now keeps the `server_message` / `server_buffer_size` / `server_message_paddr` boundary on `KServerSession::{send_reply_with_message,receive_request_with_message}`. The zero-argument `send_reply()` / `receive_request()` helpers remain as narrow HLE convenience wrappers equivalent to upstream `SendReplyHLE()` / `ReceiveRequestHLE()`.
+- Rust now ports a bounded transport subset in `k_server_session.rs` for the active IPC paths: it validates headers, computes the raw-data end offset, copies the raw message block through the current Rust process-memory bridge, translates special-header process-id/copy-handle/move-handle data through the current handle tables, handles pointer descriptors via a Rust-local `ReceiveList` helper, and records/cleans up map-alias buffers through the current Rust `KProcessPageTable` IPC wrappers. This is still an adaptation to the current page-table backend, not yet a literal upstream physical-memory transport.
+- Rust now also moves the HLE `ReceiveRequest(..., out_context, manager)` ownership into `receive_request_hle(...)`, so `svc_ipc.rs` no longer constructs the request context by re-reading `current_request` state itself.
+- Rust models upstream `ReplyAsyncError(...)` as an owner-local helper that writes the minimal async result payload through the Rust process memory bridge instead of a raw `GetPointer<u32>` linear pointer. This keeps the behavior in `k_server_session.rs` while adapting to the current memory backend.
+- Rust models upstream `CleanupServerHandles(...)` by reading the current server message through the current process memory/TLS view instead of the upstream `DeviceMemory`/physical-address pointer split. This preserves owner placement and handle cleanup behavior under the current Rust IPC memory adaptation.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `receive_request_with_message(...)` no longer always ignores the supplied transport arguments. For descriptor-free request messages, Rust now validates and copies the raw request block into the server message buffer/TLS from `k_server_session.rs`.
+- Fixed in this pass: `send_reply_with_message(...)` no longer always ignores the supplied transport arguments. For descriptor-free reply messages, Rust now validates and copies the raw reply block from the server message buffer/TLS into the client message buffer/TLS from `k_server_session.rs`.
+- Fixed in this pass: special-header process-id/copy-handle/move-handle translation for that bounded transport subset now lives in `k_server_session.rs` instead of being skipped entirely when transport arguments are used.
+- Fixed in this pass: the bounded transport subset now also handles pointer descriptors in `k_server_session.rs`, including receive-list buffer selection for the current Rust memory model.
+- Fixed in this pass: the bounded transport subset now also records receive-side map-alias descriptors in `KSessionRequest` and applies reply-side receive/exchange mapping copies from `k_server_session.rs`.
+- Fixed in this pass: receive-side transport failures now return the upstream-shaped server result (`ResultNotFound` or `ResultReceiveListBroken`) after replying the real transport error to the client, instead of leaking the raw transport error back to the server side.
+- Fixed in this pass: receive-side transport now rejects client -> server move handles up front, matching upstream `ReceiveMessage(...)` validation instead of accepting an invalid source special header.
+- Fixed in this pass: receive-side transport failure now performs owner-local cleanup of partially translated destination special data and recorded IPC mappings instead of leaking server-side handles/mappings when `ReceiveMessage(...)` aborts after translation starts.
+- Fixed in this pass: `receive_request_with_message(...)` now installs `current_request` before transport and clears it again on failure through the owner-local failure path, matching the upstream `ReceiveRequest(...)` ordering instead of only setting it after a successful transport.
+- Fixed in this pass: receive-side failure now restores the original destination header/special-header words when the receive list is not broken, matching the upstream `ReceiveMessage(...)` cleanup contract more literally.
+- Fixed in this pass: receive-side `recv_list_broken` tracking is now updated step-by-step at the same stage boundaries as upstream (`special`, `pointer`, `map-alias`, `raw`) instead of being precomputed once from a global derived condition.
+- Fixed in this pass: reply-side transport now validates the destination message header size and the destination receive-list offset ordering before copying, matching the upstream `SendMessage(...)` preconditions instead of accepting malformed destination buffers.
+- Fixed in this pass: reply-side transport failure now performs upstream-shaped owner-local cleanup of partially translated special data and already-recorded IPC mappings instead of leaking destination handles/mappings when `SendMessage(...)` aborts after translation starts.
+- Fixed in this pass: that owner-local special-data cleanup is now also applied on late reply-send cleanup failures after the destination message has already been written, so Rust no longer leaves translated destination handles behind if post-send mapping teardown fails.
+- Fixed in this pass: reply-side receive/exchange mapping transport no longer copies the entire mapped range unconditionally. `k_server_session.rs` now follows upstream `ProcessSendMessageReceiveMapping(...)` more closely by copying only the unaligned leading/trailing boundary fragments and leaving the aligned middle to the established IPC mapping setup/teardown path.
+- Fixed in this pass: closed non-HLE `SendReply(...)` now always runs `CleanupMap(...)`, matching upstream cleanup ordering instead of skipping mapping teardown when `CleanupServerHandles(...)` fails first.
+- Fixed in this pass: `CleanupRequests()` async completion now selects `cleanup_result` on cleanup failure and `ResultSessionClosed` on cleanup success, matching upstream `ReplyAsyncError(...)` result selection instead of always forcing `SessionClosed`.
+- Fixed in this pass: closed non-HLE `SendReply(...)` no longer leaks cleanup failures back to the server-side caller. Rust now matches upstream result selection: client observes the cleanup failure, while the server-side return value falls back to `Success` unless the closed cleanup path was entirely successful (`ResultSessionClosed`).
+- Fixed in this pass: synchronous replies now wake the waiting client thread through `KThread::end_wait(...)`, which is the missing upstream-shaped post-reply behavior for non-async requests.
+- Fixed in this pass: async error replies now write `SetAsyncResult(...)` into the client message buffer and unlock the client IPC user buffer before signaling the completion event, matching the upstream `ReplyAsyncError(...)` / `UnlockForIpcUserBuffer(...)` ordering more closely.
+- Fixed in this pass: `CleanupRequests()` no longer silently finalizes requests. Rust now wakes synchronous waiters with `ResultSessionClosed` and completes async requests with an async error reply before finalization, matching upstream cleanup behavior much more closely.
+- Fixed in this pass: `send_reply_with_message(...)` now re-notifies the server session when queued requests remain after clearing `current_request`, matching the upstream `m_current_request = nullptr; if (!m_request_list.empty()) NotifyAvailable();` ordering.
+- Fixed in this pass: `receive_request_with_message(...)` now finalizes an extracted-but-dead request and re-notifies the next queued request instead of just returning `SessionClosed` after dropping the popped request on the floor.
+- Fixed in this pass: Rust now centralizes the upstream “clear current request, then notify if queued work remains” ordering in a single owner-local helper, so `SendReply(...)` and receive-failure cleanup stop drifting independently.
+- Fixed in this pass: `KServerSession` now owns the upstream `CleanupServerMap` / `CleanupClientMap` / `CleanupMap` chain. Closed non-HLE replies and `CleanupRequests()` no longer skip mapping teardown entirely; they route through owner-local mapping cleanup before request finalization.
+- Fixed in this pass: `KServerSession` now owns the upstream `CleanupServerHandles(...)` branch for closed non-HLE replies, so move handles in the server reply buffer are no longer leaked on that path.
+- Fixed in this pass: receive-side transport no longer pre-copies the full source message block before special/pointer/map-alias validation. `receive_request_with_message(...)` now assembles the destination message incrementally like upstream, so raw payload words are not spuriously overwritten on early failure when the receive list is still intact.
+- Fixed in this pass: reply-side transport no longer pre-copies the full server reply block before special/pointer/map-alias processing. `send_reply_with_message(...)` now assembles the destination message incrementally like upstream, so early special-data failures no longer leak raw payload words into the client buffer before transport succeeds.
+- Fixed in this pass: `ProcessReceiveMessageMapAliasDescriptors(...)` now performs the missing owner-local cleanup for the current unrecorded mapping when `push_send` / `push_receive` / `push_exchange` fails after `setup_for_ipc_server(...)`, matching the upstream helper’s `ON_RESULT_FAILURE` cleanup more closely.
+- Fixed in this pass: `KServerSession` no longer bypasses the upstream `KProcessPageTable::SetupForIpc(...)` owner boundary. Map-alias receive now routes through the process page-table wrapper instead of calling the server-half setup method directly and patching `dst_address` locally.
+- `KServerSession` still stores requests in `VecDeque<Arc<Mutex<KSessionRequest>>>` rather than the upstream intrusive list and light-lock lifecycle.
+
+### Missing items
+- Remaining backend-exact `SendMessage` / `ReceiveMessage` details in `k_server_session.rs` are now downstream of the current Rust page-table backend's remaining exactness gaps: map-alias transport still depends on simplified partial-page IPC materialization/rollback in `KPageTableBase`, not on missing ownership in `k_server_session.rs`.
+
+### Binary layout verification
+- PASS: runtime-only kernel owner; no raw-serialized structs were added or reordered in this slice.
+
+## 2026-04-11 — `core/src/hle/kernel/message_buffer.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/message_buffer.h`
+
+### Intentional differences
+- Rust exposes `get_async_result()` / `set_async_result()` over the existing mutable word-slice view instead of a raw pointer-backed C++ buffer wrapper. This is a mechanical API adaptation while keeping the helper ownership in `message_buffer.rs`.
+
+### Unintentional differences (to fix)
+- `MessageBuffer` still lacks the broader upstream helper surface used by the full IPC transport path. Rust now has the basic async-result, handle, and process-id helpers, but the remaining descriptor/message-copy helpers are still not all surfaced as one-to-one owner methods.
+
+### Missing items
+- Remaining upstream `MessageBuffer` helper methods needed by the literal `SendMessage` / `ReceiveMessage` path.
+
+### Binary layout verification
+- PASS: helper-only owner over caller-provided `u32` storage; no Rust-owned serialized struct layout changed.
+
+## 2026-04-11 — `core/src/hle/kernel/k_process_page_table.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/k_process_page_table.h/.cpp`
+
+### Intentional differences
+- Rust still delegates through the wrapped `KPageTableBase` using safe typed-address wrappers instead of the upstream raw pointer/reference surface. This is a mechanical adaptation of the same ownership boundary.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `KProcessPageTable` now exposes `cleanup_for_ipc_server(...)` and `cleanup_for_ipc_client(...)`, restoring the upstream wrapper owner for the IPC cleanup chain instead of forcing `KServerSession` to reach past the process page-table layer.
+- Fixed in this pass: `KProcessPageTable` now exposes the missing `setup_for_ipc(...)` wrapper, so IPC alias setup is routed through the same owner boundary as upstream instead of having `KServerSession` call `setup_for_ipc_server(...)` directly and apply a local fallback address adaptation.
+- Fixed in this pass: the wrapper now delegates into non-stub `KPageTableBase` IPC setup/cleanup behavior, so both the surface and the immediate backend are no longer simultaneously stubbed.
+
+### Missing items
+- The wrapper surface is now correct. Remaining differences are downstream in `KPageTableBase`, especially partial-page IPC materialization and rollback exactness.
+
+### Binary layout verification
+- PASS: method-surface change only; no serialized layout impact.
+
+## 2026-04-11 — core/src/hle/kernel/svc/svc_ipc.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/svc/svc_ipc.cpp
+
+### Intentional differences
+- Rust `ReplyAndReceive{,WithUserBuffer}` now forwards `message` / `buffer_size` / `message_paddr` through `KServerSession`, matching upstream ownership more closely even though the lower-level message transport remains simplified.
+- Rust `SendSyncRequestImpl(...)` now delegates HLE receive-context construction to `KServerSession::receive_request_hle(...)`, matching upstream ownership more closely than the earlier `svc_ipc.rs`-local reconstruction of `request_message_address` and manager state.
+
+### Unintentional differences (to fix)
+- `svc_ipc.rs` still performs user-buffer lock/unlock and higher-level HLE completion directly; upstream pushes more transport work into `KServerSession` and lower message-buffer helpers.
+
+### Missing items
+- Full `ReplyAndReceive{,WithUserBuffer}` transport parity after `KServerSession::{SendReply,ReceiveRequest}` gain the literal message-buffer path.
+
+### Binary layout verification
+- PASS: SVC/IPC dispatch file only; no raw-serialized structs were added or reordered in this slice.
+
+## 2026-04-11 — `core/src/hle/kernel/k_handle_table.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/k_handle_table.h/.cpp`
+
+### Intentional differences
+- Rust stores opaque `u64` object ids instead of upstream `KAutoObject*`, but the handle-table ownership boundary remains local to `k_handle_table.rs`.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `KHandleTable` now has the missing `register(handle, object_id)` path, so callers can follow the upstream `Reserve -> Create -> Register -> Unreserve on failure` ordering instead of always using `add(...)`.
+
+### Missing items
+- Re-audit remaining SVC owners that still use `add(...)` where upstream reserves first.
+- Close/reference-count semantics are still weaker than upstream because the table stores object ids rather than retaining raw auto-object references.
+
+### Binary layout verification
+- PASS: handle encoding/layout unchanged; only registration semantics changed.
+
+## 2026-04-11 — `core/src/hle/kernel/k_client_port.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/k_client_port.h/.cpp`
+
+### Intentional differences
+- Rust still omits the literal upstream `KPort* m_parent` back-pointer, so `CreateSession(...)` cannot enqueue directly on the parent port from inside `KClientPort`. The caller performs the final `KPort::EnqueueSession(...)` step immediately after `create_session(...)` returns.
+- Rust still returns object ids instead of raw `KClientSession*` / `KLightClientSession*` pointers because the kernel object model is still id-backed.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `CreateSession(...)` now reserves `SessionCountMax`, performs the upstream CAS session-count update, updates `peak_sessions`, allocates/registers a real `KSession`, and returns the created session object ids instead of being a stub.
+
+### Missing items
+- Port `CreateLightSession(...)` literally; the light-session path is still not implemented.
+- Port the upstream parent-pointer lifecycle (`IsLight()`, `IsServerClosed()`, `Destroy()`, `OnSessionFinalized()->NotifyAvailable()`) more literally once `KClientPort` regains a parent owner reference.
+- Re-audit `KSession::Finalize()` / port-close interactions so `OnSessionFinalized()` is triggered at the exact upstream lifecycle point.
+
+### Binary layout verification
+- PASS: no raw serialized struct layout involved; only kernel object/session lifecycle changed.
+
+## 2026-04-11 — `core/src/hle/kernel/k_client_session.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/k_client_session.h/.cpp`
+
+### Intentional differences
+- Rust now creates a real `KSessionRequest` owner for sync requests, but it still approximates the upstream slab/auto-object lifecycle with `Arc<Mutex<KSessionRequest>>`.
+- `KClientSession` still carries an optional `request_manager` field for older direct HLE helper paths, even though the active SVC sync-request flow no longer relies on it.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `KClientSession` now owns real `send_sync_request(...)` / `send_sync_request_with_process(...)` request creation in the correct file instead of leaving sync dispatch as synthetic ids in `svc_ipc.rs`.
+- Fixed in this pass: `KClientSession` now also owns real `send_async_request(...)` / `send_async_request_with_process(...)` request creation in the correct file instead of leaving async dispatch as a stub in `svc_ipc.rs`.
+
+### Missing items
+- Port the literal upstream `KSessionRequest` allocation/initialization flow for sync and async requests.
+- Remove the remaining client-side `request_manager` shortcut once all helper/session creation paths use the server-side owner chain.
+
+### Binary layout verification
+- PASS: endpoint/runtime behavior only; no raw serialized struct layout changed.
+
+## 2026-04-11 — `core/src/hle/kernel/svc/svc_port.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/svc/svc_port.cpp`
+
+### Intentional differences
+- `ConnectToPort(...)` currently rejects light ports because `KLightSession` / `KClientPort::CreateLightSession(...)` are not yet ported.
+- `ConnectToNamedPort(...)` now resolves the named client-port object id through `KObjectName`, then uses a Rust `KernelCore` helper to find the owning `KPort` in the kernel process registries. This is still less literal than upstream `KObjectName::Find<KClientPort>(kernel, name)` because Rust does not yet expose a typed global auto-object lookup.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `ConnectToNamedPort(...)` no longer fabricates an HLE-only session; it now reserves a handle, creates a real kernel session through `k_client_port.rs`, enqueues the matching server session on the port, and registers the reserved client-session handle.
+- Fixed in this pass: `ConnectToNamedPort(...)` no longer depends on the Rust `ServiceManager` map to retrieve the named port after the `KObjectName` lookup; it now resolves the object id through `KernelCore` back to the owning client port.
+- Fixed in this pass: `CreatePort(...)` now creates a real `KPort`, registers client/server port object ids in the owner `KProcess`, and returns resolvable handles instead of placeholder unresolved object ids.
+- Fixed in this pass: `ConnectToPort(...)` now resolves the real client-port object, reserves a handle, creates a session through `k_client_port.rs`, enqueues the matching server session on the port, and registers the reserved client-session handle.
+- Fixed in this pass: `ManageNamedPort(...)` now creates/registers a real named client-port object id and stores a real server-port handle instead of only publishing a name with no resolvable port object behind it.
+
+### Missing items
+- Rewire `ConnectToNamedPort(...)` to the literal upstream `KObjectName::Find<KClientPort>` typed auto-object lookup once Rust has a global typed kernel-object graph instead of process-registry scans.
+- Port the `ManageNamedPort(max_sessions == 0)` close/delete lifecycle more literally across all owning processes; the current delete path only unregisters the current process's client-port object if present.
+- Port the light-port/light-session path.
+
+### Binary layout verification
+- PASS: SVC ABI unchanged; only kernel object creation/registration semantics changed.
+
+## 2026-04-11 — `core/src/hle/kernel/svc/svc_ipc.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/svc/svc_ipc.cpp`
+
+### Intentional differences
+- Rust still completes HLE requests directly inside `svc_ipc.rs` with `HLERequestContext` and `complete_sync_request(...)` because the full upstream message-buffer translation and `KSessionRequest` lifecycle are not ported yet.
+- `send_sync_request_impl(...)` still constructs the HLE response directly after `ReceiveRequest()` instead of routing through the full upstream `ReplyAndReceive` / message-buffer machinery.
+- `ReplyAndReceive{,WithUserBuffer}(...)` now uses the real kernel wait and server-session owner chain, but it still keeps the message buffer transport simplified inside `svc_ipc.rs` because `KServerSession::{send_reply,receive_request}` do not yet own the literal upstream message-buffer and physical-address flow.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `SendSyncRequestImpl(...)` no longer dispatches from `KClientSession::request_manager()`, which was the wrong owner boundary.
+- Fixed in this pass: the active sync-request path now:
+  - resolves the real client session from the handle table
+  - enqueues the request through `KClientSession -> KSession -> KServerSession`
+  - receives it from the server-session side
+  - pulls the handler manager from `KServerSession`
+  - sends the reply back through `KServerSession::send_reply()`
+- Fixed in this pass: `SendSyncRequestImpl(...)` now reads the effective message address from the active `KSessionRequest` owner after `ReceiveRequest()`, instead of treating the SVC argument as the only runtime owner of the incoming command buffer.
+- Fixed in this pass: `ReplyAndReceive(...)` no longer returns the old unconditional timeout stub. It now copies the user handle array from guest memory, resolves it through the owner process handle table, replies through the real `KServerSession`, waits through `KSynchronizationObject::wait(...)`, and retries only on `ResultNotFound` from `KServerSession::receive_request()`.
+- Fixed in this pass: `ReplyAndReceive{,WithUserBuffer}(...)` now applies the same positive-timeout conversion rule as upstream (`current_tick + timeout_ns + 2`, saturating to `i64::MAX`) instead of passing raw nanoseconds directly into the kernel wait path.
+- Fixed in this pass: `SendAsyncRequestWithUserBuffer(...)` no longer returns a placeholder handle from a fake event-id counter. It now reserves `EventCountMax`, creates/registers a real `KEvent` plus readable end, installs the readable handle in the current process, and queues the async request through `KClientSession::send_async_request_with_process(...)`.
+- The file still skips the literal upstream `KSessionRequest` object and message-buffer translation path, so this is closer ownership parity, not full behavioral parity.
+
+### Missing items
+- Port `KSessionRequest` and the literal message-buffer/physical-address flow used by upstream `SendSyncRequestImpl`.
+- Port the literal `message`, `buffer_size`, and `message_paddr` transport through `KServerSession::{send_reply,receive_request}` so `ReplyAndReceiveWithUserBuffer(...)` no longer only locks/unlocks the buffer in `svc_ipc.rs`.
+- Re-audit `SendAsyncRequestWithUserBuffer(...)` once `KEvent` ownership/lifecycle is fully literal and `KSessionRequest` stores real event references instead of object ids.
+- Re-audit `ReplyAndReceive{,WithUserBuffer}` against the same owner chain once the session-request transport is literal end-to-end.
+
+### Binary layout verification
+- PASS: SVC ABI unchanged; only runtime request ownership and wait/reply control flow changed.
+
+## 2026-04-11 — `core/src/hle/kernel/kernel.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/kernel.cpp`
+
+### Intentional differences
+- Rust currently adds small kernel-registry bridge helpers such as client-port lookup by object id because named ports are still stored in per-process Rust registries rather than a literal upstream typed auto-object graph.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `KernelCore` can now resolve a named client-port object id back to the owning `KPort`, which is the missing owner-side bridge needed for `ConnectToNamedPort(...)` to follow the `KObjectName` path instead of bypassing it through `ServiceManager`.
+
+### Missing items
+- Replace these process-registry bridge helpers with literal typed kernel-object lookup once the Rust kernel object graph is global and typed like upstream.
+
+### Binary layout verification
+- PASS: kernel lookup helpers only; no raw serialized struct layout changed.
+
+## 2026-04-11 — `core/src/hle/service/ipc_helpers.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/hle/service/ipc_helpers.h`
+
+### Intentional differences
+- Rust still represents outgoing kernel auto-objects with `KAutoObjectRef` instead of raw `KAutoObject*`, because the kernel object graph is still stored in typed Rust maps rather than a literal C++ auto-object hierarchy.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `ResponseBuilder` can now queue move objects by kernel object id through `push_move_object_id(...)` instead of forcing service owners to pre-resolve ad hoc handle values.
+
+### Missing items
+- Re-audit move-object close semantics once kernel auto-object ownership is ported more literally. Upstream `PushMoveObjects(...)` ultimately transfers ownership of the object pointer, while Rust still resolves object ids through process handle tables at command-buffer write time.
+
+### Binary layout verification
+- PASS: IPC builder metadata only; no raw serialized struct layout changed.
+
+## 2026-04-11 — `core/src/hle/service/hle_ipc.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/hle/service/hle_ipc.cpp`
+
+### Intentional differences
+- Rust still stores deferred IPC object references as `KAutoObjectRef::{Handle,ObjectId}` instead of upstream raw `KAutoObject*`, because kernel auto-objects are not yet exposed uniformly across the Rust kernel.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: outgoing move/copy objects no longer treat `ObjectId` as a fake pre-resolved handle value.
+- Fixed in this pass: handle translation now happens in `write_to_outgoing_command_buffer()` through the owner process handle table, matching the upstream ownership point much more closely.
+
+### Missing items
+- Re-audit handle-table cleanup / close behavior for move objects once the literal kernel auto-object lifecycle is ported. Rust currently allocates a handle from `object_id` but does not yet mirror the full upstream `object->Close()` semantics.
+
+### Binary layout verification
+- PASS: IPC command-buffer serialization layout unchanged; only object-handle translation semantics changed.
+
+## 2026-04-11 — `core/src/hle/service/sm/sm.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/hle/service/sm/sm.cpp`
+
+### Intentional differences
+- Rust `ServiceManager` still stores whole `Arc<Mutex<KPort>>` owners in `service_ports` instead of upstream `KClientPort*`, because the Rust kernel object model still owns the combined `KPort` directly.
+- For HLE services, `SM::GetServiceImpl(...)` now creates the real client/server session pair through `KClientPort::CreateSession(...)`, but still directly registers the created `server_session` with the parent `ServerManager` in the same request path. Upstream reaches the handler through the service-thread port accept path; that accept leg is still not fully literal in Rust.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `ServiceManager::register_service_with_port(...)` now returns the created `KPort` owner so `SM::RegisterServiceImpl(...)` can expose the server endpoint through IPC, instead of discarding it.
+- Fixed in this pass: guest `RegisterService` no longer replies with `push_move_objects(0)`; it now creates a real kernel object id for the server-port endpoint and returns it through deferred move-object handle translation.
+- Fixed in this pass: `ServiceManager::RegisterService` now initializes ports with `SERVER_SESSION_COUNT_MAX`, matching the upstream constant placement/behavior instead of using the guest-supplied `max_session_count` directly.
+- Fixed in this pass: `SM::new(...)` and `loop_process(...)` now keep `SystemRef` in the `SM` owner so `RegisterServiceImpl(...)` can allocate/register server-port object ids in the same file that owns the upstream behavior.
+- Fixed in this pass: `GetServiceImpl(...)` no longer fabricates an HLE-only session through `ctx.create_session_for_service(...)`; it now resolves the real client port, creates a real kernel session via `k_client_port.rs`, and returns the created client-session object through move-object translation.
+- Fixed in this pass: `GetServiceImpl(...)` now branches correctly between HLE-backed services (attach `SessionRequestManager` + register the new `server_session` with the parent `ServerManager`) and guest-registered services (no fabricated HLE handler path).
+
+### Missing items
+- `ServiceManager` still lacks the exact upstream split between stored `KClientPort*` service ports and separately returned `KServerPort*` server endpoints.
+- The service-thread side still does not accept these service-port sessions through a literal upstream `KServerPort` event -> `AcceptSession()` -> `RegisterSession(...)` chain; HLE services still use direct `register_session(...)` in `GetServiceImpl(...)`.
+- Re-audit teardown and unregister paths once client/server port registries are ported more literally.
+
+### Binary layout verification
+- PASS: service IPC payload layout unchanged; only returned move-object ownership changed.
+
+## 2026-04-11 — `core/src/hle/kernel/svc/svc_session.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/svc/svc_session.cpp`
+
+### Intentional differences
+- Rust still does not implement upstream handle-table `Reserve/Unreserve/Register` literally; it uses direct `handle_table.add(object_id)` registration through the existing Rust handle table.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `AcceptSession` no longer fabricates a brand-new `KSession` unrelated to the port queue.
+- Fixed in this pass: `AcceptSession` now resolves the `KServerPort` owner from the process object registry, dequeues the already-enqueued server-session object id from that port, and registers that accepted session in the handle table.
+
+### Missing items
+- `CreateSession` still uses synthetic object id allocation instead of the literal upstream typed object creation/registration flow.
+- `AcceptSession` still returns `RESULT_INVALID_STATE` when the queue is empty instead of the upstream `ResultNotFound`.
+- The light-session path is still not ported through real `KLightServerSession` / `KLightClientSession` object registries.
+
+### Binary layout verification
+- PASS: SVC ABI unchanged; only kernel object resolution/registration semantics changed.
+
+## 2026-04-11 — `core/src/hle/service/os/multi_wait_holder.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/hle/service/os/multi_wait_holder.h/.cpp`
+
+### Intentional differences
+- Rust still models upstream native kernel handles as a `WaitableHandle` enum containing owner `Arc`s, because kernel auto-objects are not yet exposed uniformly as raw `KSynchronizationObject*`.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `MultiWaitHolder` can now wrap `KServerSession` waitables, which is the missing owner-local shape needed for `ServerManager::Session : MultiWaitHolder(server_session)` parity.
+- Fixed in this pass: `MultiWaitHolder` can now also wrap managed `KServerPort` waitables through the owning `Arc<Mutex<KPort>>`, which is the missing owner-local shape needed for `ServerManager::Port : MultiWaitHolder(server_port)` parity.
+
+### Missing items
+- Converge this temporary `Arc<Mutex<KPort>>` server-port owner on a more literal raw `KServerPort` kernel-object handle once the Rust kernel object graph exposes typed waitables globally.
+- Eventually converge on a single waitable kernel-object owner once `KClientPort/KServerPort` are ported more literally.
+
+### Binary layout verification
+- PASS: service-layer holder metadata only; no raw serialized struct layout changed.
+
+## 2026-04-11 — `core/src/hle/service/server_manager.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/hle/service/server_manager.h/.cpp`
+
+### Intentional differences
+- Rust `Session` still stores `Box<MultiWaitHolder>` instead of inheriting from `MultiWaitHolder`, because Rust has no direct intrusive base-class equivalent. Ownership remains file-local and traceable in `server_manager.rs`.
+- Rust `WaitAndProcessImpl()` still uses a hybrid fallback after `try_wait_any()` rather than a literal upstream `WaitSignaled() -> m_multi_wait.WaitAny(kernel)` path. This remains temporary until `KServerPort`, `KClientPort`, and the rest of the kernel waitable graph are ported.
+- Rust `Port` currently owns the full `Arc<Mutex<KPort>>` and waits on that owner rather than a raw `KServerPort*`, because the Rust kernel object model still stores the combined `KPort` directly.
+- Rust keeps a weak self-reference on `ServerManager` so `OnPortEvent(...)` can pass the parent server manager into `SessionRequestManager`, instead of upstream's direct `*this` reference. This preserves the ownership edge without inventing a second owner.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `Session` now owns a real `MultiWaitHolder(server_session)` equivalent instead of existing only as an index into a side vector.
+- Fixed in this pass: `register_session()` now links the session holder into the deferred list, matching the upstream ownership edge where sessions themselves are waited objects.
+- Fixed in this pass: `WaitAndProcessImpl()` now dispatches selected holders through a `UserDataTag`-based `process_holder(...)` path instead of manually polling only sessions.
+- Fixed in this pass: selected holders are now unlinked before processing, matching the upstream `WaitSignaled()` contract more closely and avoiding stale `MultiWait` linkage.
+- Fixed in this pass: deferred-session completion now re-links the session holder itself, instead of keeping session readiness outside the `MultiWaitHolder` ownership model.
+- Fixed in this pass: `ServerManager` now owns real managed `Port` waitables instead of a `managed_ports` name->factory map with no waited kernel port behind it.
+- Fixed in this pass: `ManageNamedPort(...)` now creates a real `KPort`, registers the named client-port object in `KObjectName`, and links a waited `Port` holder into the deferred list.
+- Fixed in this pass: `process_holder(...)` now dispatches real port events to `on_port_event(...)`, and `on_port_event(...)` now accepts the pending server session from the `KServerPort`, installs the handler factory, registers the session, and re-links the port.
+- Fixed in this pass: `OnPortEvent(...)` now constructs `SessionRequestManager` with the parent `ServerManager` owner when the manager has been bound into its shared runtime owner, matching upstream ownership much more closely.
+
+### Missing items
+- Replace the remaining hybrid host-thread/guest-thread fallback with a true kernel-backed `WaitAny(kernel)` path once ports and client sessions are real waitables.
+- Re-audit destruction/teardown ordering once ports and sessions are both owned through waitable holders.
+
+### Binary layout verification
+- PASS: event-loop ownership only; no raw serialized struct layout changed.
+
+## 2026-04-11 — `core/src/hle/kernel/k_server_port.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/k_server_port.h/.cpp`
+
+### Intentional differences
+- Rust still omits the literal upstream `KPort* m_parent` back-pointer and still stores pending sessions as `VecDeque<u64>` ids instead of intrusive `KServerSession` / `KLightServerSession` lists.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `KServerPort` now owns `SynchronizationObjectState`, so the server-port endpoint can participate in kernel wait linkage instead of being invisible to `KSynchronizationObject`.
+
+### Missing items
+- Port the upstream parent pointer / lifecycle ownership literally enough that `Destroy()`, `CleanupSessions()`, and enqueue wakeups can notify waiters through the real parent/object identity.
+- Port the first-enqueue wakeup edge (`NotifyAvailable()`) and close semantics more literally once `KPort` object identity is wired.
+
+### Binary layout verification
+- PASS: waiter-state addition only; no raw serialized struct layout changed.
+
+## 2026-04-11 — `core/src/hle/kernel/k_process.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/k_process.h/.cpp`
+
+### Intentional differences
+- Rust still uses per-process typed object maps instead of upstream kernel auto-object tables. The lookup ownership remains local to `k_process.rs`.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `KProcess` now owns a typed `server_port_objects` registry and exposes `register_server_port_object(...)` / `get_server_port_by_object_id(...)`, which is the next prerequisite for real `KServerPort` waitables.
+
+### Missing items
+- Add the matching client-port and full port-object registries needed for literal `CreatePort`, `ConnectToPort`, and `SM::RegisterService` parity.
+
+### Binary layout verification
+- PASS: process lookup tables only; no raw serialized struct layout changed.
+
+## 2026-04-11 — `core/src/hle/kernel/k_synchronization_object.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/k_synchronization_object.cpp` (server-port waitable follow-up)
+
+### Intentional differences
+- Rust `WaitableObject` is still an enum adapter over typed registries rather than raw upstream `KSynchronizationObject*` pointers.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `WaitableObject` now supports `ServerPort`, including `is_signaled`, waiter link/unlink, waiter snapshot, and unlink-all behavior through the owning `KPort`.
+
+### Missing items
+- Re-audit wakeup propagation once `KServerPort::EnqueueSession()` gains literal upstream `NotifyAvailable()` behavior.
+- `KClientPort` and `KServerPort` are still not fully integrated into `svc_port` / `SM::RegisterService`, so object resolution is only a kernel prerequisite at this point.
+
+### Binary layout verification
+- PASS: waitable resolution only; no raw serialized struct layout changed.

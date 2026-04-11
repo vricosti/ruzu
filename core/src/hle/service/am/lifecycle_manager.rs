@@ -583,18 +583,10 @@ impl LifecycleManager {
         let Some(readable_event) = readable_event else {
             return;
         };
-        let Some(process) = self
-            .event_owner_process
-            .as_ref()
-            .and_then(Weak::upgrade)
-        else {
+        let Some(process) = self.event_owner_process.as_ref().and_then(Weak::upgrade) else {
             return;
         };
-        let Some(scheduler) = self
-            .event_owner_scheduler
-            .as_ref()
-            .and_then(Weak::upgrade)
-        else {
+        let Some(scheduler) = self.event_owner_scheduler.as_ref().and_then(Weak::upgrade) else {
             return;
         };
 

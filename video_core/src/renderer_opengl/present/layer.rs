@@ -210,9 +210,12 @@ impl Layer {
             if !LOGGED.swap(true, Ordering::Relaxed) {
                 log::info!(
                     "LoadFBToScreenInfo: addr={:#x} offset={} {}x{} stride={} fmt={}",
-                    framebuffer.address, framebuffer.offset,
-                    framebuffer.width, framebuffer.height,
-                    framebuffer.stride, framebuffer.pixel_format.0,
+                    framebuffer.address,
+                    framebuffer.offset,
+                    framebuffer.width,
+                    framebuffer.height,
+                    framebuffer.stride,
+                    framebuffer.pixel_format.0,
                 );
             }
 
@@ -264,7 +267,8 @@ impl Layer {
                 gl::TextureSubImage2D(
                     self.framebuffer_texture.resource,
                     0, // level
-                    0, 0, // x, y offset
+                    0,
+                    0, // x, y offset
                     framebuffer.width as i32,
                     framebuffer.height as i32,
                     self.framebuffer_texture.gl_format,

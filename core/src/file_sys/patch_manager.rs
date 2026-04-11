@@ -806,7 +806,8 @@ impl<'a> PatchManager<'a> {
 
         // Determine icon language priority from settings.
         use crate::hle::service::ns::language::{
-            convert_to_application_language, get_application_language_priority_list, ApplicationLanguage,
+            convert_to_application_language, get_application_language_priority_list,
+            ApplicationLanguage,
         };
 
         let language_index = *common::settings::values().language_index.get_value() as u32 as usize;

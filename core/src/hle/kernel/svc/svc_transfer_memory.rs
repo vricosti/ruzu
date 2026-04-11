@@ -5,8 +5,8 @@
 //! SVC handlers for transfer memory operations.
 
 use crate::core::System;
-use crate::hle::kernel::k_transfer_memory::KTransferMemory;
 use crate::hle::kernel::k_shared_memory::MemoryPermission as KernelMemoryPermission;
+use crate::hle::kernel::k_transfer_memory::KTransferMemory;
 use crate::hle::kernel::svc::svc_results::*;
 use crate::hle::kernel::svc::svc_types::*;
 use crate::hle::kernel::svc_common::Handle;
@@ -95,8 +95,11 @@ pub fn create_transfer_memory(
     }
 
     let mut transfer_memory = KTransferMemory::new();
-    let init_result =
-        transfer_memory.initialize(address, size as usize, to_kernel_memory_permission(map_perm));
+    let init_result = transfer_memory.initialize(
+        address,
+        size as usize,
+        to_kernel_memory_permission(map_perm),
+    );
     if init_result.is_failure() {
         process
             .page_table
@@ -179,10 +182,11 @@ pub fn map_transfer_memory(
     }
 
     drop(process);
-    let result = transfer_memory
-        .lock()
-        .unwrap()
-        .map(address, size as usize, to_kernel_memory_permission(map_perm));
+    let result = transfer_memory.lock().unwrap().map(
+        address,
+        size as usize,
+        to_kernel_memory_permission(map_perm),
+    );
     result
 }
 
@@ -232,6 +236,9 @@ pub fn unmap_transfer_memory(
     }
 
     drop(process);
-    let result = transfer_memory.lock().unwrap().unmap(address, size as usize);
+    let result = transfer_memory
+        .lock()
+        .unwrap()
+        .unmap(address, size as usize);
     result
 }

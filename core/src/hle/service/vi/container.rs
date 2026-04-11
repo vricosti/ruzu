@@ -94,11 +94,8 @@ impl Container {
                 .downcast_ref::<crate::hle::service::nvdrv::nvdrv_interface::NvdrvService>()
                 .expect("Container::new: nvdrv:s is not NvdrvService")
                 .get_module();
-            let shared_buffer_manager = Arc::new(SharedBufferManager::new(
-                system,
-                weak_self.clone(),
-                nvdrv,
-            ));
+            let shared_buffer_manager =
+                Arc::new(SharedBufferManager::new(system, weak_self.clone(), nvdrv));
 
             for &id in &display_ids {
                 surface_flinger.add_display(id);

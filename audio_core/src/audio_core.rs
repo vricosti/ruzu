@@ -1,15 +1,15 @@
 use crate::adsp::ADSP;
+use crate::audio_manager::AudioManager;
 use crate::audio_render_manager::Manager as AudioRenderManager;
 use crate::common::audio_renderer_parameter::AudioRendererParameterInternal;
-use crate::audio_manager::AudioManager;
 use crate::renderer::audio_device::AudioDevice;
 use crate::renderer::{Renderer, System as RendererSystem};
 use crate::sink::sink::{new_sink_handle, SinkHandle};
 use crate::sink::sink_details::create_sink_from_id;
 use crate::SharedSystem;
 use parking_lot::Mutex;
-use std::sync::Mutex as StdMutex;
 use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
 
 pub struct AudioCore {
     system: SharedSystem,
@@ -100,7 +100,11 @@ impl ruzu_core::core::AudioRendererSessionInterface for AudioRendererSession {
     }
 
     fn get_mix_buffer_count(&self) -> u32 {
-        self.renderer.lock().get_system().lock().get_mix_buffer_count()
+        self.renderer
+            .lock()
+            .get_system()
+            .lock()
+            .get_mix_buffer_count()
     }
 
     fn get_state(&self) -> u32 {
@@ -113,7 +117,10 @@ impl ruzu_core::core::AudioRendererSessionInterface for AudioRendererSession {
         performance: &mut [u8],
         output: &mut [u8],
     ) -> ruzu_core::hle::result::ResultCode {
-        let result = self.renderer.lock().request_update(input, performance, output);
+        let result = self
+            .renderer
+            .lock()
+            .request_update(input, performance, output);
         ruzu_core::hle::result::ResultCode::new(result.raw())
     }
 
@@ -126,7 +133,11 @@ impl ruzu_core::core::AudioRendererSessionInterface for AudioRendererSession {
     }
 
     fn supports_system_event(&self) -> bool {
-        self.renderer.lock().get_system().lock().get_execution_mode()
+        self.renderer
+            .lock()
+            .get_system()
+            .lock()
+            .get_execution_mode()
             != crate::common::audio_renderer_parameter::ExecutionMode::Manual
     }
 
@@ -168,20 +179,18 @@ impl ruzu_core::core::AudioRendererSessionInterface for AudioRendererSession {
 
     fn set_rendered_readable_event(
         &self,
-        event: std::sync::Arc<std::sync::Mutex<ruzu_core::hle::kernel::k_readable_event::KReadableEvent>>,
+        event: std::sync::Arc<
+            std::sync::Mutex<ruzu_core::hle::kernel::k_readable_event::KReadableEvent>,
+        >,
     ) {
-        self.renderer
-            .lock()
-            .set_rendered_readable_event(event);
+        self.renderer.lock().set_rendered_readable_event(event);
     }
 
     fn set_process_arc(
         &self,
         process: std::sync::Arc<std::sync::Mutex<ruzu_core::hle::kernel::k_process::KProcess>>,
     ) {
-        self.renderer
-            .lock()
-            .set_process_arc(process);
+        self.renderer.lock().set_process_arc(process);
     }
 }
 
@@ -200,7 +209,8 @@ impl ruzu_core::core::AudioCoreInterface for AudioCore {
         out_names: &mut [[u8; 0x100]],
     ) -> u32 {
         let device = AudioDevice::new(self.get_output_sink(), applet_resource_user_id, revision);
-        let mut names = vec![crate::renderer::audio_device::AudioDeviceName::new(); out_names.len()];
+        let mut names =
+            vec![crate::renderer::audio_device::AudioDeviceName::new(); out_names.len()];
         let count = device.list_audio_device_name(&mut names) as usize;
         for (dst, src) in out_names.iter_mut().zip(names.iter()).take(count) {
             *dst = src.name;
@@ -215,7 +225,8 @@ impl ruzu_core::core::AudioCoreInterface for AudioCore {
         out_names: &mut [[u8; 0x100]],
     ) -> u32 {
         let device = AudioDevice::new(self.get_output_sink(), applet_resource_user_id, revision);
-        let mut names = vec![crate::renderer::audio_device::AudioDeviceName::new(); out_names.len()];
+        let mut names =
+            vec![crate::renderer::audio_device::AudioDeviceName::new(); out_names.len()];
         let count = device.list_audio_output_device_name(&mut names) as usize;
         for (dst, src) in out_names.iter_mut().zip(names.iter()).take(count) {
             *dst = src.name;
@@ -223,12 +234,7 @@ impl ruzu_core::core::AudioCoreInterface for AudioCore {
         count as u32
     }
 
-    fn set_audio_device_volume(
-        &self,
-        applet_resource_user_id: u64,
-        revision: u32,
-        volume: f32,
-    ) {
+    fn set_audio_device_volume(&self, applet_resource_user_id: u64, revision: u32, volume: f32) {
         let device = AudioDevice::new(self.get_output_sink(), applet_resource_user_id, revision);
         device.set_device_volumes(volume);
     }
@@ -258,8 +264,7 @@ impl ruzu_core::core::AudioCoreInterface for AudioCore {
     ) -> std::result::Result<
         Box<dyn ruzu_core::core::AudioRendererSessionInterface>,
         ruzu_core::hle::result::ResultCode,
-    >
-    {
+    > {
         let parsed = unsafe {
             core::ptr::read_unaligned(params.as_ptr() as *const AudioRendererParameterInternal)
         };
@@ -288,7 +293,9 @@ impl ruzu_core::core::AudioCoreInterface for AudioCore {
             session_id,
         );
         if result.is_error() {
-            self.audio_render_manager.lock().release_session_id(session_id);
+            self.audio_render_manager
+                .lock()
+                .release_session_id(session_id);
             return Err(ruzu_core::hle::result::ResultCode::new(result.raw()));
         }
 
@@ -305,7 +312,8 @@ mod tests {
     use std::sync::Arc;
 
     fn make_audio_core() -> AudioCore {
-        let system: SharedSystem = Arc::new(parking_lot::Mutex::new(ruzu_core::core::System::new()));
+        let system: SharedSystem =
+            Arc::new(parking_lot::Mutex::new(ruzu_core::core::System::new()));
         AudioCore::new(system)
     }
 
@@ -332,7 +340,8 @@ mod tests {
         };
 
         let raw = unsafe {
-            *(core::ptr::addr_of!(params) as *const [u8; core::mem::size_of::<AudioRendererParameterInternal>()])
+            *(core::ptr::addr_of!(params)
+                as *const [u8; core::mem::size_of::<AudioRendererParameterInternal>()])
         };
 
         assert_eq!(
@@ -374,9 +383,7 @@ mod tests {
                 RendererSystem::get_work_buffer_size(&params),
                 process,
                 1,
-                Arc::new(StdMutex::new(
-                    ruzu_core::hle::kernel::k_event::KEvent::new(),
-                )),
+                Arc::new(StdMutex::new(ruzu_core::hle::kernel::k_event::KEvent::new())),
             )
             .expect("audio renderer session should initialize");
 

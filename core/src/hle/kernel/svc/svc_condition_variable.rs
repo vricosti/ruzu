@@ -91,7 +91,8 @@ pub fn signal_process_wide_key(system: &System, cv_key: u64, count: i32) {
         let scheduler_lock_ptr = current_thread.lock().unwrap().scheduler_lock_ptr;
         if scheduler_lock_ptr != 0 {
             let scheduler_lock = unsafe {
-                &*(scheduler_lock_ptr as *const crate::hle::kernel::k_scheduler_lock::KAbstractSchedulerLock)
+                &*(scheduler_lock_ptr
+                    as *const crate::hle::kernel::k_scheduler_lock::KAbstractSchedulerLock)
             };
             let _scheduler_guard =
                 crate::hle::kernel::k_scheduler_lock::KScopedSchedulerLock::new(scheduler_lock);

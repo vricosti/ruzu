@@ -286,9 +286,42 @@ impl<'a> MessageBuffer<'a> {
         lo | (hi << 32)
     }
 
+    pub fn get_process_id(&self, index: usize) -> u64 {
+        self.get64(index)
+    }
+
+    pub fn get_handle(&self, index: usize) -> Handle {
+        self.buffer[index] as Handle
+    }
+
     pub fn set_null(&mut self) {
         let hdr = MessageHeader::default();
         self.set_message_header(&hdr);
+    }
+
+    pub fn get_async_result(&self) -> crate::hle::result::ResultCode {
+        let hdr = MessageHeader::from_raw([self.buffer[0], self.buffer[1]]);
+        let null = MessageHeader::default();
+        if hdr.get_data() != null.get_data() {
+            return crate::hle::result::RESULT_SUCCESS;
+        }
+        crate::hle::result::ResultCode::new(self.buffer[MessageHeader::DATA_SIZE / 4])
+    }
+
+    pub fn set_async_result(&mut self, res: crate::hle::result::ResultCode) {
+        let index = self.set_message_header(&MessageHeader::default());
+        self.buffer[index] = res.get_inner_value();
+    }
+
+    pub fn set_handle(&mut self, index: usize, handle: Handle) -> usize {
+        self.buffer[index] = handle;
+        index + 1
+    }
+
+    pub fn set_process_id(&mut self, index: usize, process_id: u64) -> usize {
+        self.buffer[index] = process_id as u32;
+        self.buffer[index + 1] = (process_id >> 32) as u32;
+        index + 2
     }
 
     pub fn set_message_header(&mut self, hdr: &MessageHeader) -> usize {
@@ -347,5 +380,52 @@ impl<'a> MessageBuffer<'a> {
         }
 
         msg_size
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::hle::result::{ResultCode, RESULT_INVALID_STATE, RESULT_SUCCESS};
+
+    #[test]
+    fn async_result_round_trip_uses_null_header() {
+        let mut words = [0u32; MESSAGE_BUFFER_SIZE];
+        let mut message = MessageBuffer::new(&mut words);
+        message.set_async_result(RESULT_INVALID_STATE);
+
+        assert_eq!(words[0], 0);
+        assert_eq!(words[1], 0);
+        assert_eq!(
+            message.get_async_result().get_inner_value(),
+            RESULT_INVALID_STATE.get_inner_value()
+        );
+    }
+
+    #[test]
+    fn non_null_header_async_result_reads_success() {
+        let mut words = [0u32; MESSAGE_BUFFER_SIZE];
+        let mut message = MessageBuffer::new(&mut words);
+        let header = MessageHeader::new(5, false, 0, 0, 0, 0, 0, ReceiveListCountType::None as u32);
+        message.set_message_header(&header);
+        words[2] = ResultCode::new(0xDEAD_BEEF).get_inner_value();
+
+        assert_eq!(message.get_async_result(), RESULT_SUCCESS);
+    }
+
+    #[test]
+    fn set_and_get_handle_and_process_id_match_upstream_layout() {
+        let mut words = [0u32; MESSAGE_BUFFER_SIZE];
+        let mut message = MessageBuffer::new(&mut words);
+
+        let next = message.set_handle(3, 0x1234_5678);
+        assert_eq!(next, 4);
+        let next = message.set_process_id(next, 0x1122_3344_5566_7788);
+        assert_eq!(next, 6);
+
+        assert_eq!(message.get_handle(3), 0x1234_5678);
+        assert_eq!(message.get_process_id(4), 0x1122_3344_5566_7788);
+        assert_eq!(words[4], 0x5566_7788);
+        assert_eq!(words[5], 0x1122_3344);
     }
 }

@@ -39,17 +39,20 @@ impl HidRegistration {
     pub fn new(system: SystemRef, process: &Process) -> Self {
         let pid = process.get_process_id();
         let resource_manager = if !system.is_null() {
-            system.get().service_manager().map(|service_manager| {
-                let handler = crate::hle::service::sm::sm::ServiceManager::get_service_blocking(
-                    &service_manager,
-                    "hid",
-                );
-                handler
-                    .as_any()
-                    .downcast_ref::<crate::hle::service::hid::hid_server::IHidServer>()
-                    .map(|hid_server| hid_server.get_resource_manager())
-            })
-            .flatten()
+            system
+                .get()
+                .service_manager()
+                .map(|service_manager| {
+                    let handler = crate::hle::service::sm::sm::ServiceManager::get_service_blocking(
+                        &service_manager,
+                        "hid",
+                    );
+                    handler
+                        .as_any()
+                        .downcast_ref::<crate::hle::service::hid::hid_server::IHidServer>()
+                        .map(|hid_server| hid_server.get_resource_manager())
+                })
+                .flatten()
         } else {
             None
         };

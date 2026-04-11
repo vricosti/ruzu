@@ -99,7 +99,8 @@ impl IAudioRendererManager {
         };
         let transfer_memory_handle = ctx.get_copy_handle(0);
         let process_handle = ctx.get_copy_handle(1);
-        let transfer_memory = Self::resolve_transfer_memory_handle(&owner_process, transfer_memory_handle);
+        let transfer_memory =
+            Self::resolve_transfer_memory_handle(&owner_process, transfer_memory_handle);
         let process = Self::resolve_process_handle(&owner_process, process_handle);
 
         let Some(transfer_memory) = transfer_memory else {

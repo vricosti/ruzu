@@ -159,7 +159,10 @@ impl SystemClock {
             return Err(check);
         }
         let context = self.state.lock().unwrap().context;
-        log::debug!("SystemClock::GetSystemClockContext: offset={}", context.offset);
+        log::debug!(
+            "SystemClock::GetSystemClockContext: offset={}",
+            context.offset
+        );
         Ok(context)
     }
 

@@ -524,7 +524,9 @@ fn main() {
     #[cfg(unix)]
     unsafe {
         // SIGTERM = 15, SIG_DFL = 0
-        extern "C" { fn signal(sig: i32, handler: usize) -> usize; }
+        extern "C" {
+            fn signal(sig: i32, handler: usize) -> usize;
+        }
         signal(15, 0);
     }
 

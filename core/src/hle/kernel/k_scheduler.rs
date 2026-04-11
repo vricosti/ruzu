@@ -452,11 +452,17 @@ impl KScheduler {
             let prev = (*sched).state.highest_priority_thread_id;
             if pq_top != prev {
                 (*sched).state.highest_priority_thread_id = pq_top;
-                (*sched).state.needs_scheduling.store(true, Ordering::Relaxed);
+                (*sched)
+                    .state
+                    .needs_scheduling
+                    .store(true, Ordering::Relaxed);
             }
             // Also check if current thread is no longer the highest — need reschedule.
             if pq_top.is_some() && pq_top != (*sched).current_thread_id {
-                (*sched).state.needs_scheduling.store(true, Ordering::Relaxed);
+                (*sched)
+                    .state
+                    .needs_scheduling
+                    .store(true, Ordering::Relaxed);
             }
         }
 
@@ -496,7 +502,10 @@ impl KScheduler {
             }
         }
 
-        (*sched).state.needs_scheduling.store(true, Ordering::SeqCst);
+        (*sched)
+            .state
+            .needs_scheduling
+            .store(true, Ordering::SeqCst);
         (*sched).reschedule_current_core_impl();
     }
 
@@ -517,16 +526,14 @@ impl KScheduler {
             std::thread::current().name().unwrap_or("?"),
         );
         let sched_ptr = self as *mut KScheduler as usize;
-        self.switch_fiber = Some(Fiber::new(Box::new(move || {
-            loop {
-                let sched = unsafe { &mut *(sched_ptr as *mut KScheduler) };
-                log::trace!(
-                    "KScheduler::switch_fiber entry core={} host={}",
-                    sched.core_id,
-                    std::thread::current().name().unwrap_or("?"),
-                );
-                sched.schedule_impl_fiber_loop();
-            }
+        self.switch_fiber = Some(Fiber::new(Box::new(move || loop {
+            let sched = unsafe { &mut *(sched_ptr as *mut KScheduler) };
+            log::trace!(
+                "KScheduler::switch_fiber entry core={} host={}",
+                sched.core_id,
+                std::thread::current().name().unwrap_or("?"),
+            );
+            sched.schedule_impl_fiber_loop();
         })));
     }
 
@@ -870,18 +877,27 @@ impl KScheduler {
             use std::sync::atomic::{AtomicU32, Ordering as AO};
             static UC: AtomicU32 = AtomicU32::new(0);
             if UC.fetch_add(1, AO::Relaxed) < 20 || cores_needing_scheduling != 0 {
-                log::info!("update_highest_prio: cores_needing=0x{:x} idle=0x{:x} tops={:?}", cores_needing_scheduling, idle_cores, top_threads);
+                log::info!(
+                    "update_highest_prio: cores_needing=0x{:x} idle=0x{:x} tops={:?}",
+                    cores_needing_scheduling,
+                    idle_cores,
+                    top_threads
+                );
             }
         }
 
         while idle_cores != 0 {
             let core_id = idle_cores.trailing_zeros() as usize;
-            if let Some(mut suggested_id) = gsc.m_priority_queue.get_suggested_front(core_id as i32) {
-                let mut migration_candidates = [0i32; crate::hardware_properties::NUM_CPU_CORES as usize];
+            if let Some(mut suggested_id) = gsc.m_priority_queue.get_suggested_front(core_id as i32)
+            {
+                let mut migration_candidates =
+                    [0i32; crate::hardware_properties::NUM_CPU_CORES as usize];
                 let mut num_candidates = 0usize;
 
                 loop {
-                    let Some(suggested_props) = gsc.m_priority_queue.get_thread_props(suggested_id).cloned() else {
+                    let Some(suggested_props) =
+                        gsc.m_priority_queue.get_thread_props(suggested_id).cloned()
+                    else {
                         break;
                     };
                     let suggested_core = suggested_props.active_core;
@@ -893,7 +909,9 @@ impl KScheduler {
 
                     if top_on_suggested_core != Some(suggested_id) {
                         if let Some(top_thread_id) = top_on_suggested_core {
-                            if let Some(top_props) = gsc.m_priority_queue.get_thread_props(top_thread_id) {
+                            if let Some(top_props) =
+                                gsc.m_priority_queue.get_thread_props(top_thread_id)
+                            {
                                 if top_props.priority
                                     < super::global_scheduler_context::HIGHEST_CORE_MIGRATION_ALLOWED_PRIORITY
                                 {
@@ -945,8 +963,10 @@ impl KScheduler {
                         let Some(candidate_thread_id) = top_threads[candidate_core as usize] else {
                             continue;
                         };
-                        let Some(candidate_props) =
-                            gsc.m_priority_queue.get_thread_props(candidate_thread_id).cloned()
+                        let Some(candidate_props) = gsc
+                            .m_priority_queue
+                            .get_thread_props(candidate_thread_id)
+                            .cloned()
                         else {
                             continue;
                         };
@@ -962,7 +982,9 @@ impl KScheduler {
                         top_threads[candidate_core as usize] = Some(next_on_candidate_core);
                         if (candidate_core as usize) < schedulers.len() {
                             let (mask, _prev_id) = schedulers[candidate_core as usize]
-                                .update_highest_priority_thread(top_threads[candidate_core as usize]);
+                                .update_highest_priority_thread(
+                                    top_threads[candidate_core as usize],
+                                );
                             cores_needing_scheduling |= mask;
                         }
 
@@ -1461,7 +1483,9 @@ impl KScheduler {
                 gsc.lock().unwrap().get_thread_by_thread_id(id)
             })
         };
-        let target_id = target.as_ref().map(|thread| thread.lock().unwrap().get_thread_id());
+        let target_id = target
+            .as_ref()
+            .map(|thread| thread.lock().unwrap().get_thread_id());
         if self.core_id == 0 || self.core_id == 1 {
             log::trace!(
                 "schedule_impl_fiber: core={} cur={:?} highest={:?} target={:?} interrupted={}",
@@ -1500,7 +1524,10 @@ impl KScheduler {
                 if sys_ref.is_null() {
                     return None;
                 }
-                sys_ref.get().get_cpu_manager().core_host_context(self.core_id as usize)
+                sys_ref
+                    .get()
+                    .get_cpu_manager()
+                    .core_host_context(self.core_id as usize)
             });
 
         // Upstream always yields to the switch fiber when highest != current,

@@ -7,9 +7,9 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, Weak};
 
 use crate::hle::kernel::k_event::KEvent;
-use crate::hle::kernel::kernel::KernelCore;
 use crate::hle::kernel::k_process::KProcess;
 use crate::hle::kernel::k_readable_event::KReadableEvent;
+use crate::hle::kernel::kernel::KernelCore;
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
 use crate::hle::service::ipc_helpers::{RequestParser, ResponseBuilder};
@@ -118,12 +118,7 @@ impl IAudioRenderer {
     pub(crate) fn create_rendered_event(
         kernel: &KernelCore,
         owner_process: &Arc<Mutex<KProcess>>,
-    ) -> (
-        u64,
-        u64,
-        Arc<Mutex<KEvent>>,
-        Arc<Mutex<KReadableEvent>>,
-    ) {
+    ) -> (u64, u64, Arc<Mutex<KEvent>>, Arc<Mutex<KReadableEvent>>) {
         let rendered_event_object_id = kernel.create_new_object_id() as u64;
         let rendered_readable_event_object_id = kernel.create_new_object_id() as u64;
 
@@ -211,11 +206,11 @@ impl IAudioRenderer {
         };
         let mut output = vec![0u8; ctx.get_write_buffer_size(0)];
         let mut performance = vec![0u8; ctx.get_write_buffer_size(1)];
-        let result = svc
-            .renderer
-            .lock()
-            .unwrap()
-            .request_update(&input, &mut performance, &mut output);
+        let result =
+            svc.renderer
+                .lock()
+                .unwrap()
+                .request_update(&input, &mut performance, &mut output);
         log::info!(
             "IAudioRenderer::RequestUpdate buffers input={} output={} performance={} result=0x{:08X}",
             input.len(),

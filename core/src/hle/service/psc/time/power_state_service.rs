@@ -9,9 +9,9 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
+use super::power_state_request_manager::PowerStateRequestManager;
 use crate::core::SystemRef;
 use crate::hle::kernel::k_readable_event::KReadableEvent;
-use super::power_state_request_manager::PowerStateRequestManager;
 use crate::hle::result::ResultCode;
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
 use crate::hle::service::ipc_helpers::ResponseBuilder;
@@ -42,7 +42,10 @@ pub struct PowerStateRequestHandler {
 }
 
 impl PowerStateRequestHandler {
-    pub fn new(system: SystemRef, power_state_request_manager: Arc<PowerStateRequestManager>) -> Self {
+    pub fn new(
+        system: SystemRef,
+        power_state_request_manager: Arc<PowerStateRequestManager>,
+    ) -> Self {
         let handlers = build_handler_map(&[
             (
                 commands::GET_POWER_STATE_REQUEST_EVENT_READABLE_HANDLE,

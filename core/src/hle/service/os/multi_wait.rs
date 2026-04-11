@@ -7,6 +7,10 @@
 //! MultiWait — waits on multiple synchronization objects.
 //! Upstream wraps svcWaitSynchronization/KSynchronizationObject::Wait.
 
+use crate::hle::kernel::k_synchronization_object;
+use crate::hle::kernel::kernel::KernelCore;
+use crate::hle::result::RESULT_SUCCESS;
+
 use super::multi_wait_holder::MultiWaitHolder;
 
 /// MultiWait — manages a list of MultiWaitHolders to wait on.
@@ -67,9 +71,94 @@ impl MultiWait {
     /// WaitAny — block until any holder is signaled, return the signaled holder.
     /// Port of upstream `MultiWait::WaitAny()`.
     /// Upstream calls svcWaitSynchronization on all holder handles.
-    pub fn wait_any(&self) -> Option<*mut MultiWaitHolder> {
-        // Check if any holder is already signaled.
-        for &holder in &self.holders {
+    pub fn wait_any(&self, kernel: &KernelCore) -> Option<*mut MultiWaitHolder> {
+        self.timed_wait_impl(kernel, -1)
+    }
+
+    /// TryWaitAny — non-blocking check, return the first signaled holder if any.
+    /// Port of upstream `MultiWait::TryWaitAny()`.
+    pub fn try_wait_any(&self, kernel: &KernelCore) -> Option<*mut MultiWaitHolder> {
+        self.timed_wait_impl(kernel, 0)
+    }
+
+    fn timed_wait_impl(
+        &self,
+        kernel: &KernelCore,
+        timeout_ns: i64,
+    ) -> Option<*mut MultiWaitHolder> {
+        let holders = self.holders_snapshot();
+        if holders.is_empty() {
+            return None;
+        }
+
+        let current_thread = match kernel.get_current_emu_thread() {
+            Some(thread) => thread,
+            None => return self.local_timed_wait(&holders, timeout_ns),
+        };
+        let process = match current_thread
+            .lock()
+            .unwrap()
+            .parent
+            .as_ref()
+            .and_then(|parent| parent.upgrade())
+        {
+            Some(process) => process,
+            None => return self.local_timed_wait(&holders, timeout_ns),
+        };
+        let scheduler = kernel
+            .current_scheduler()
+            .cloned()
+            .or_else(|| {
+                current_thread
+                    .lock()
+                    .unwrap()
+                    .scheduler
+                    .as_ref()
+                    .and_then(|scheduler| scheduler.upgrade())
+            })
+            .or_else(|| {
+                process
+                    .lock()
+                    .unwrap()
+                    .scheduler
+                    .as_ref()
+                    .and_then(|scheduler| scheduler.upgrade())
+            });
+        let Some(scheduler) = scheduler else {
+            return self.local_timed_wait(&holders, timeout_ns);
+        };
+
+        let mut object_ids = Vec::with_capacity(holders.len());
+        for holder in &holders {
+            let Some(object_id) = (unsafe { &**holder }).object_id() else {
+                return self.local_timed_wait(&holders, timeout_ns);
+            };
+            object_ids.push(object_id);
+        }
+
+        let mut out_index = -1;
+        let result = k_synchronization_object::wait(
+            &process,
+            &current_thread,
+            &scheduler,
+            &mut out_index,
+            object_ids,
+            timeout_ns,
+        );
+
+        if result == RESULT_SUCCESS && out_index >= 0 {
+            holders.get(out_index as usize).copied()
+        } else {
+            None
+        }
+    }
+
+    fn local_timed_wait(
+        &self,
+        holders: &[*mut MultiWaitHolder],
+        timeout_ns: i64,
+    ) -> Option<*mut MultiWaitHolder> {
+        for &holder in holders {
             unsafe {
                 if (*holder).is_signaled() {
                     return Some(holder);
@@ -77,12 +166,12 @@ impl MultiWait {
             }
         }
 
-        // If no holder is signaled, block-wait.
-        // Upstream: svcWaitSynchronization(handles, count, timeout).
-        // We poll with a short sleep to avoid busy-waiting.
+        if timeout_ns == 0 {
+            return None;
+        }
+
         loop {
-            let holders = self.holders_snapshot();
-            for &holder in &holders {
+            for &holder in holders {
                 unsafe {
                     if (*holder).is_signaled() {
                         return Some(holder);
@@ -91,19 +180,6 @@ impl MultiWait {
             }
             std::thread::sleep(std::time::Duration::from_micros(100));
         }
-    }
-
-    /// TryWaitAny — non-blocking check, return the first signaled holder if any.
-    /// Port of upstream `MultiWait::TryWaitAny()`.
-    pub fn try_wait_any(&self) -> Option<*mut MultiWaitHolder> {
-        for &holder in &self.holders {
-            unsafe {
-                if (*holder).is_signaled() {
-                    return Some(holder);
-                }
-            }
-        }
-        None
     }
 }
 

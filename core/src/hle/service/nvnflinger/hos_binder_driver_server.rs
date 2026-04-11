@@ -154,10 +154,12 @@ mod tests {
     #[test]
     fn unregister_binder_clears_buffer_queue_producer_marker() {
         let server = HosBinderDriverServer::new();
-        let producer = Arc::new(crate::hle::service::nvnflinger::buffer_queue_producer::BufferQueueProducer::new(
-            crate::hle::service::nvnflinger::buffer_queue_core::BufferQueueCore::new(),
-            Arc::new(crate::hle::service::nvdrv::core::nvmap::NvMap::new()),
-        ));
+        let producer = Arc::new(
+            crate::hle::service::nvnflinger::buffer_queue_producer::BufferQueueProducer::new(
+                crate::hle::service::nvnflinger::buffer_queue_core::BufferQueueCore::new(),
+                Arc::new(crate::hle::service::nvdrv::core::nvmap::NvMap::new()),
+            ),
+        );
 
         let id = server.register_buffer_queue_producer(producer);
         assert!(server.try_get_buffer_queue_producer(id).is_some());

@@ -10,6 +10,14 @@
 
 use std::sync::atomic::{AtomicI32, Ordering};
 
+use super::k_process::KProcess;
+use super::k_resource_limit::LimitableResource;
+use super::k_scoped_resource_reservation::KScopedResourceReservation;
+use super::k_session::KSession;
+use super::kernel::KernelCore;
+use super::svc::svc_results::{RESULT_LIMIT_REACHED, RESULT_OUT_OF_SESSIONS};
+use crate::hle::result::ResultCode;
+
 /// The client port object.
 ///
 /// Matches upstream `KClientPort` class (k_client_port.h):
@@ -81,15 +89,31 @@ impl KClientPort {
 
     /// Create a new session via this client port.
     /// Port of upstream `KClientPort::CreateSession`.
-    /// Full implementation requires KSession slab allocation and parent port enqueueing.
-    /// The atomic session count management is implemented here.
-    pub fn create_session(&self) -> u32 {
+    ///
+    /// Because the Rust `KClientPort` omits upstream's `m_parent` back-pointer,
+    /// the caller still performs the final `KPort::EnqueueSession(...)` step
+    /// after this method returns the created object ids.
+    pub fn create_session(
+        &self,
+        process: &mut KProcess,
+        kernel: &KernelCore,
+        port_name: usize,
+    ) -> Result<(u64, u64), ResultCode> {
+        let mut session_reservation = KScopedResourceReservation::new(
+            process.resource_limit.clone(),
+            LimitableResource::SessionCountMax,
+            1,
+        );
+        if !session_reservation.succeeded() {
+            return Err(RESULT_LIMIT_REACHED);
+        }
+
         // Atomically increment the number of sessions (CAS pattern matching upstream).
         let max = self.max_sessions;
-        loop {
+        let new_sessions = loop {
             let cur_sessions = self.num_sessions.load(Ordering::Acquire);
             if cur_sessions >= max {
-                return 1; // ResultOutOfSessions
+                return Err(RESULT_OUT_OF_SESSIONS);
             }
             let new_sessions = cur_sessions + 1;
             if self
@@ -102,30 +126,50 @@ impl KClientPort {
                 )
                 .is_ok()
             {
-                // Atomically update peak tracking.
-                loop {
-                    let peak = self.peak_sessions.load(Ordering::Acquire);
-                    if peak >= new_sessions {
-                        break;
-                    }
-                    if self
-                        .peak_sessions
-                        .compare_exchange_weak(
-                            peak,
-                            new_sessions,
-                            Ordering::Relaxed,
-                            Ordering::Relaxed,
-                        )
-                        .is_ok()
-                    {
-                        break;
-                    }
-                }
+                break new_sessions;
+            }
+        };
+
+        // Atomically update peak tracking.
+        loop {
+            let peak = self.peak_sessions.load(Ordering::Acquire);
+            if peak >= new_sessions {
+                break;
+            }
+            if self
+                .peak_sessions
+                .compare_exchange_weak(peak, new_sessions, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+            {
                 break;
             }
         }
-        // Session object creation and parent port enqueueing require KSession slab allocation.
-        0 // ResultSuccess
+
+        let session_object_id = kernel.create_new_object_id() as u64;
+        let client_session_object_id = kernel.create_new_object_id() as u64;
+
+        let session = std::sync::Arc::new(std::sync::Mutex::new(KSession::new()));
+        {
+            let mut session_guard = session.lock().unwrap();
+            session_guard.initialize(None, port_name);
+            session_guard
+                .get_client_session()
+                .lock()
+                .unwrap()
+                .initialize(session_object_id);
+            session_guard
+                .get_server_session()
+                .lock()
+                .unwrap()
+                .initialize(session_object_id);
+        }
+
+        process.register_session_object(session_object_id, session.clone());
+        let client_session = session.lock().unwrap().get_client_session().clone();
+        process.register_client_session_object(client_session_object_id, client_session);
+
+        session_reservation.commit();
+        Ok((session_object_id, client_session_object_id))
     }
 
     /// Destroy the client port.
@@ -139,5 +183,40 @@ impl KClientPort {
 impl Default for KClientPort {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::System;
+
+    #[test]
+    fn create_session_allocates_and_registers_session_objects() {
+        let mut system = System::new_for_test();
+        let process = std::sync::Arc::new(std::sync::Mutex::new(KProcess::new()));
+        {
+            let mut process_guard = process.lock().unwrap();
+            process_guard.process_id = 1;
+            process_guard.initialize_handle_table();
+        }
+        system.set_current_process_arc(process.clone());
+
+        let kernel = system.kernel().unwrap();
+        let mut port = KPort::new();
+        port.initialize(4, false, 0x44);
+
+        let (session_object_id, client_session_object_id) = port
+            .client
+            .create_session(&mut process.lock().unwrap(), kernel, port.get_name())
+            .unwrap();
+
+        let process_guard = process.lock().unwrap();
+        assert!(process_guard
+            .get_session_by_object_id(session_object_id)
+            .is_some());
+        assert!(process_guard
+            .get_client_session_by_object_id(client_session_object_id)
+            .is_some());
     }
 }

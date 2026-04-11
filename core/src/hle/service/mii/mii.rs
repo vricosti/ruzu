@@ -136,12 +136,8 @@ impl IDatabaseService {
         rb.push_raw(&(false as u8));
     }
 
-    fn set_interface_version_handler(
-        this: &dyn ServiceFramework,
-        ctx: &mut HLERequestContext,
-    ) {
-        let service =
-            unsafe { &*(this as *const dyn ServiceFramework as *const IDatabaseService) };
+    fn set_interface_version_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const IDatabaseService) };
         let mut rp = RequestParser::new(ctx);
         let version = rp.pop_raw::<u32>();
         log::debug!(
@@ -235,12 +231,8 @@ impl IStaticService {
         }
     }
 
-    fn get_database_service_handler(
-        this: &dyn ServiceFramework,
-        ctx: &mut HLERequestContext,
-    ) {
-        let service =
-            unsafe { &*(this as *const dyn ServiceFramework as *const IStaticService) };
+    fn get_database_service_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const IStaticService) };
         log::info!(
             "IStaticService::GetDatabaseService called, is_system={}",
             service.is_system

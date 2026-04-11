@@ -212,7 +212,11 @@ fn ensure_user_stack_mapping(
     }
 
     let probe_addr = stack_top.saturating_sub(0x10);
-    let shared_probe = process.process_memory.read().unwrap().read_bytes(probe_addr, 0x10);
+    let shared_probe = process
+        .process_memory
+        .read()
+        .unwrap()
+        .read_bytes(probe_addr, 0x10);
     let memory_probe = process
         .page_table
         .get_base()
@@ -369,9 +373,9 @@ pub fn sleep_thread(system: &System, ns: i64) {
             current_thread_id,
             timeout
         );
-        let Some(result) =
-            crate::hle::kernel::kernel::with_current_thread_fast_mut(|thread| thread.sleep(timeout))
-        else {
+        let Some(result) = crate::hle::kernel::kernel::with_current_thread_fast_mut(|thread| {
+            thread.sleep(timeout)
+        }) else {
             log::warn!("svc::SleepThread(sleep): current thread cache missing");
             return;
         };
@@ -385,7 +389,11 @@ pub fn sleep_thread(system: &System, ns: i64) {
             return;
         }
 
-        log::trace!("svc::SleepThread(sleep): tid={} ns={} -> wait armed", current_thread_id, ns);
+        log::trace!(
+            "svc::SleepThread(sleep): tid={} ns={} -> wait armed",
+            current_thread_id,
+            ns
+        );
         return;
     }
 
@@ -564,7 +572,9 @@ mod tests {
     use super::*;
     use crate::core::System;
     use crate::hle::kernel::k_process::KProcess;
-    use crate::hle::kernel::k_resource_limit::{create_resource_limit_for_process, LimitableResource};
+    use crate::hle::kernel::k_resource_limit::{
+        create_resource_limit_for_process, LimitableResource,
+    };
     use crate::hle::kernel::k_thread::ThreadState;
     use crate::hle::kernel::k_worker_task_manager::KWorkerTaskManager;
 
@@ -724,7 +734,9 @@ mod tests {
             let process = process.lock().unwrap();
             let resource_limit = process.resource_limit.as_ref().unwrap().clone();
             let mut resource_limit = resource_limit.lock().unwrap();
-            resource_limit.set_limit_value(LimitableResource::ThreadCountMax, 0).unwrap();
+            resource_limit
+                .set_limit_value(LimitableResource::ThreadCountMax, 0)
+                .unwrap();
         }
 
         let mut handle = INVALID_HANDLE;

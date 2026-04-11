@@ -225,6 +225,19 @@ impl<'a> ResponseBuilder<'a> {
             .push(KAutoObjectRef::Handle(handle));
     }
 
+    /// Push a move object by kernel object id.
+    ///
+    /// Matches the upstream ownership model more closely than pre-resolving a
+    /// handle in the service implementation: the response stores the object,
+    /// and the final handle translation happens when writing the outgoing IPC
+    /// buffer.
+    pub fn push_move_object_id(&mut self, object_id: u64) {
+        use super::hle_ipc::KAutoObjectRef;
+        self.context
+            .outgoing_move_objects
+            .push(KAutoObjectRef::ObjectId(object_id));
+    }
+
     /// Push an IPC interface (service object) as a move handle or domain object.
     ///
     /// Matches upstream `ResponseBuilder::PushIpcInterface<T>(shared_ptr<T>)`.
@@ -532,13 +545,13 @@ fn assign_bits(value: u32, field: u32, position: usize, bits: usize) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::SystemRef;
     use crate::device_memory::DeviceMemory;
     use crate::hle::kernel::k_process::KProcess;
     use crate::hle::kernel::k_thread::KThread;
     use crate::hle::result::ResultCode;
     use crate::hle::service::hle_ipc::{SessionRequestHandler, SessionRequestManager};
     use crate::memory::memory::Memory;
-    use crate::core::SystemRef;
     use std::sync::{Arc, Mutex};
 
     struct TestHandler;
@@ -583,7 +596,11 @@ mod tests {
         let device_memory = Box::new(DeviceMemory::new());
         let buffer_ptr = &device_memory.buffer as *const common::host_memory::HostMemory;
         let memory = Arc::new(Mutex::new(unsafe {
-            Memory::new(SystemRef::null(), device_memory.as_ref() as *const _, buffer_ptr)
+            Memory::new(
+                SystemRef::null(),
+                device_memory.as_ref() as *const _,
+                buffer_ptr,
+            )
         }));
 
         let process = Arc::new(Mutex::new(KProcess::new()));
@@ -601,8 +618,7 @@ mod tests {
 
         let tls_address = 0x4000;
 
-        let mut ctx =
-            HLERequestContext::new_with_thread(thread, tls_address);
+        let mut ctx = HLERequestContext::new_with_thread(thread, tls_address);
         let manager = Arc::new(Mutex::new(SessionRequestManager::new()));
         ctx.set_session_request_manager(manager);
 

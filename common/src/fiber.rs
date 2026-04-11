@@ -115,13 +115,17 @@ impl Fiber {
     /// Create a new fiber with the given entry point function.
     /// Matches upstream `Fiber::Fiber(std::function<void()>&& entry_point_func)`.
     pub fn new(entry_point_func: Box<dyn FnOnce() + Send>) -> Arc<Self> {
-        let stack = FixedSizeStack::new(DEFAULT_STACK_SIZE).expect("failed to allocate fiber stack");
+        let stack =
+            FixedSizeStack::new(DEFAULT_STACK_SIZE).expect("failed to allocate fiber stack");
         let rewind_stack =
             FixedSizeStack::new(DEFAULT_STACK_SIZE).expect("failed to allocate rewind stack");
 
         let mut imp = FiberImpl::new_empty();
         imp.context = Some(context_to_raw(unsafe {
-            Context::new(&stack, Self::fiber_start_func as extern "C" fn(Transfer) -> !)
+            Context::new(
+                &stack,
+                Self::fiber_start_func as extern "C" fn(Transfer) -> !,
+            )
         }));
         imp.stack = Some(stack);
         imp.rewind_stack = Some(rewind_stack);
@@ -627,12 +631,7 @@ mod tests {
         let worker = Fiber::new(Box::new(move || {
             for _ in 0..2 {
                 *counter_clone.lock().unwrap() += 1;
-                let self_fiber = worker_slot_clone
-                    .lock()
-                    .unwrap()
-                    .as_ref()
-                    .unwrap()
-                    .clone();
+                let self_fiber = worker_slot_clone.lock().unwrap().as_ref().unwrap().clone();
                 Fiber::yield_to(Arc::downgrade(&self_fiber), &thread_fiber_clone);
             }
         }));

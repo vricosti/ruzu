@@ -173,7 +173,8 @@ impl KeplerMemory {
             memory_manager: &*memory_manager,
             write_cpu_mem: &mut write_cpu,
         };
-        self.upload_state.process_data_multi_with_ctx(data, &mut ctx);
+        self.upload_state
+            .process_data_multi_with_ctx(data, &mut ctx);
     }
 
     /// Write a value to the register identified by method.

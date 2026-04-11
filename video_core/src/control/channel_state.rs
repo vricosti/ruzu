@@ -118,8 +118,9 @@ impl ChannelState {
         self.maxwell_dma = Some(Box::new(MaxwellDMA::new(Arc::clone(
             self.memory_manager.as_ref().unwrap(),
         ))));
-        let mut kepler_memory =
-            Box::new(KeplerMemory::new(Arc::clone(self.memory_manager.as_ref().unwrap())));
+        let mut kepler_memory = Box::new(KeplerMemory::new(Arc::clone(
+            self.memory_manager.as_ref().unwrap(),
+        )));
         let gpu_ptr = _gpu as *const crate::gpu::Gpu as usize;
         kepler_memory.set_guest_memory_writer(Arc::new(move |addr, data| unsafe {
             let gpu = &*(gpu_ptr as *const crate::gpu::Gpu);

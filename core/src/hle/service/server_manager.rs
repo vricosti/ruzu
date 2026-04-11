@@ -16,9 +16,8 @@
 //! → hle_ipc::complete_sync_request() synchronously. The ServerManager event
 //! loop handles session lifecycle, port management, and deferred requests.
 
-use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -28,7 +27,6 @@ use crate::hle::kernel::k_process::KProcess;
 use crate::hle::kernel::k_readable_event::KReadableEvent;
 use crate::hle::kernel::k_scheduler::KScheduler;
 use crate::hle::kernel::k_server_session::KServerSession;
-use crate::hle::kernel::k_synchronization_object;
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 use crate::hle::service::hle_ipc::{
     self, HLERequestContext, SessionRequestHandlerFactory, SessionRequestHandlerPtr,
@@ -53,6 +51,7 @@ enum UserDataTag {
 /// Matches upstream `Service::Session` (server_manager.cpp).
 /// Upstream also stores an HLERequestContext for in-flight requests.
 struct Session {
+    holder: Box<MultiWaitHolder>,
     server_session: Arc<Mutex<KServerSession>>,
     manager: Arc<Mutex<SessionRequestManager>>,
     /// Stored context for in-flight requests.
@@ -60,21 +59,66 @@ struct Session {
     context: Option<HLERequestContext>,
 }
 
-struct GuestWakeupState {
-    readable_event: Option<Arc<Mutex<KReadableEvent>>>,
-    object_id: Option<u64>,
-    process: Option<std::sync::Weak<Mutex<KProcess>>>,
-    scheduler: Option<std::sync::Weak<Mutex<KScheduler>>>,
+impl Session {
+    fn new(
+        server_session: Arc<Mutex<KServerSession>>,
+        manager: Arc<Mutex<SessionRequestManager>>,
+    ) -> Self {
+        let mut holder = Box::new(MultiWaitHolder::from_server_session(server_session.clone()));
+        holder.set_user_data(UserDataTag::Session as usize);
+        Self {
+            holder,
+            server_session,
+            manager,
+            context: None,
+        }
+    }
+
+    fn holder_ptr(&self) -> *const MultiWaitHolder {
+        &*self.holder as *const MultiWaitHolder
+    }
 }
 
-impl GuestWakeupState {
-    fn new() -> Self {
+/// Port wrapper pairing a waited server port with its handler factory.
+///
+/// Matches upstream `Service::Port` ownership in `server_manager.cpp`.
+struct Port {
+    holder: Box<MultiWaitHolder>,
+    port: Arc<Mutex<KPort>>,
+    server_port_object_id: Option<u64>,
+    named_client_port_object_id: Option<u64>,
+    registered_in_process: bool,
+    handler_factory: SessionRequestHandlerFactory,
+}
+
+impl Port {
+    fn new(
+        port: Arc<Mutex<KPort>>,
+        server_port_object_id: Option<u64>,
+        named_client_port_object_id: Option<u64>,
+        handler_factory: SessionRequestHandlerFactory,
+    ) -> Self {
+        let mut holder = Box::new(MultiWaitHolder::from_server_port(
+            port.clone(),
+            server_port_object_id,
+        ));
+        holder.set_user_data(UserDataTag::Port as usize);
         Self {
-            readable_event: None,
-            object_id: None,
-            process: None,
-            scheduler: None,
+            holder,
+            port,
+            server_port_object_id,
+            named_client_port_object_id,
+            registered_in_process: false,
+            handler_factory,
         }
+    }
+
+    fn holder_ptr(&self) -> *const MultiWaitHolder {
+        &*self.holder as *const MultiWaitHolder
+    }
+
+    fn create_handler(&self) -> SessionRequestHandlerPtr {
+        (self.handler_factory)()
     }
 }
 
@@ -90,8 +134,8 @@ pub struct ServerManager {
     /// Service name for thread identification.
     name: String,
 
-    /// Locally managed named ports (not registered with SM).
-    managed_ports: HashMap<String, SessionRequestHandlerFactory>,
+    /// Active managed server ports.
+    ports: Vec<Port>,
 
     /// Active sessions.
     sessions: Vec<Session>,
@@ -147,9 +191,9 @@ pub struct ServerManager {
     /// This is a bounded Rust adaptation of upstream `std::stop_source`.
     additional_host_thread_stop: Arc<AtomicBool>,
 
-    /// Guest-thread wakeup event used to block the service thread when the
-    /// current Rust port has no real MultiWait-backed kernel objects to wait on.
-    guest_wakeup: Mutex<GuestWakeupState>,
+    /// Shared self-owner used where upstream passes `*this` into
+    /// `SessionRequestManager(server_manager)`.
+    self_reference: Option<Weak<Mutex<ServerManager>>>,
 }
 
 impl ServerManager {
@@ -164,7 +208,7 @@ impl ServerManager {
         Self {
             system,
             name: String::new(),
-            managed_ports: HashMap::new(),
+            ports: Vec::new(),
             sessions: Vec::new(),
             wakeup_event,
             deferral_event: None,
@@ -178,8 +222,12 @@ impl ServerManager {
             pending_additional_host_threads: Vec::new(),
             host_threads: Vec::new(),
             additional_host_thread_stop: Arc::new(AtomicBool::new(false)),
-            guest_wakeup: Mutex::new(GuestWakeupState::new()),
+            self_reference: None,
         }
+    }
+
+    pub fn bind_self_reference(&mut self, manager: &Arc<Mutex<ServerManager>>) {
+        self.self_reference = Some(Arc::downgrade(manager));
     }
 
     /// Get the service manager from System.
@@ -206,12 +254,9 @@ impl ServerManager {
         manager: Arc<Mutex<SessionRequestManager>>,
     ) -> ResultCode {
         log::debug!("ServerManager({}): register_session", self.name);
-        self.sessions.push(Session {
-            server_session,
-            manager,
-            context: None,
-        });
-        self.signal_guest_wakeup();
+        let mut session = Session::new(server_session, manager);
+        self.link_to_deferred_list_holder(&mut session.holder);
+        self.sessions.push(session);
         RESULT_SUCCESS
     }
 
@@ -231,22 +276,47 @@ impl ServerManager {
             Some(sm) => sm,
             None => return RESULT_SUCCESS,
         };
-        let result = sm.lock().unwrap().register_service(
+
+        let port = match sm.lock().unwrap().register_service_with_port(
             service_name.to_string(),
             max_sessions,
             handler_factory,
-        );
+        ) {
+            Ok(port) => port,
+            Err(result) => {
+                log::warn!(
+                    "ServerManager({}): failed to register '{}': {:#x}",
+                    self.name,
+                    service_name,
+                    result.get_inner_value()
+                );
+                return result;
+            }
+        };
 
-        if result.is_error() {
-            log::warn!(
-                "ServerManager({}): failed to register '{}': {:#x}",
-                self.name,
-                service_name,
-                result.get_inner_value()
-            );
-        }
+        let server_port_object_id = (!self.system.is_null())
+            .then(|| self.system.get().kernel())
+            .flatten()
+            .map(|kernel| {
+                let object_id = kernel.create_new_object_id() as u64;
+                kernel.register_kernel_object(object_id);
+                object_id
+            });
 
-        result
+        let sm_for_handler = Arc::clone(&sm);
+        let service_name_owned = service_name.to_string();
+        let handler_factory: SessionRequestHandlerFactory = Box::new(move || {
+            sm_for_handler
+                .lock()
+                .unwrap()
+                .get_service(&service_name_owned)
+                .expect("registered service must resolve to a handler")
+        });
+        let mut server = Port::new(port, server_port_object_id, None, handler_factory);
+        self.link_to_deferred_list_holder(&mut server.holder);
+        self.ports.push(server);
+
+        RESULT_SUCCESS
     }
 
     /// Registers a named service with a shared handler instance.
@@ -269,21 +339,76 @@ impl ServerManager {
         handler_factory: SessionRequestHandlerFactory,
         max_sessions: u32,
     ) -> ResultCode {
-        let mut port = KPort::new();
-        port.initialize(max_sessions as i32, false, 0);
+        let Some(kernel) = (!self.system.is_null())
+            .then(|| self.system.get().kernel())
+            .flatten()
+        else {
+            return RESULT_SUCCESS;
+        };
 
-        if !self.system.is_null() {
-            if let Some(kernel) = self.system.get().kernel() {
-                if let Some(gd) = kernel.object_name_global_data() {
-                    let _ = gd.new_from_name(0, port_name);
-                }
+        let port = Arc::new(Mutex::new(KPort::new()));
+        port.lock()
+            .unwrap()
+            .initialize(max_sessions as i32, false, 0);
+
+        let client_port_object_id = kernel.create_new_object_id() as u64;
+        kernel.register_kernel_object(client_port_object_id);
+
+        if let Some(gd) = kernel.object_name_global_data() {
+            if gd
+                .new_from_name(client_port_object_id as usize, port_name)
+                .is_err()
+            {
+                kernel.unregister_kernel_object(client_port_object_id);
+                return crate::hle::kernel::svc::svc_results::RESULT_INVALID_STATE;
             }
         }
 
-        self.managed_ports
-            .insert(port_name.to_string(), handler_factory);
+        let server_port_object_id = kernel.create_new_object_id() as u64;
+        kernel.register_kernel_object(server_port_object_id);
 
+        let mut server = Port::new(
+            port,
+            Some(server_port_object_id),
+            Some(client_port_object_id),
+            handler_factory,
+        );
+        self.link_to_deferred_list_holder(&mut server.holder);
+        self.ports.push(server);
         RESULT_SUCCESS
+    }
+
+    fn ensure_kernel_port_registrations(&mut self) {
+        if self.system.is_null() {
+            return;
+        }
+
+        let Some(current_thread) = self.system.get().current_thread() else {
+            return;
+        };
+        let Some(process) = current_thread
+            .lock()
+            .unwrap()
+            .parent
+            .as_ref()
+            .and_then(|parent| parent.upgrade())
+        else {
+            return;
+        };
+
+        let mut process = process.lock().unwrap();
+        for port in &mut self.ports {
+            if port.registered_in_process {
+                continue;
+            }
+            if let Some(server_port_object_id) = port.server_port_object_id {
+                process.register_server_port_object(server_port_object_id, Arc::clone(&port.port));
+            }
+            if let Some(client_port_object_id) = port.named_client_port_object_id {
+                process.register_client_port_object(client_port_object_id, Arc::clone(&port.port));
+            }
+            port.registered_in_process = true;
+        }
     }
 
     /// Manages deferral events.
@@ -306,21 +431,37 @@ impl ServerManager {
     fn link_to_deferred_list_holder(&self, holder: &mut MultiWaitHolder) {
         let mut deferred_list = self.deferred_list.lock().unwrap();
         holder.link_to_multi_wait(&mut *deferred_list as *mut MultiWait);
-        self.signal_guest_wakeup();
+        self.signal_wakeup_event();
+    }
+
+    /// Link a holder pointer to the deferred list and wake the event loop.
+    ///
+    /// This mirrors upstream `LinkToDeferredList(MultiWaitHolder*)` when the
+    /// caller only has a stable holder pointer and cannot keep a Rust borrow of
+    /// the owning `Session`/`Port` across the deferred-list lock.
+    fn link_holder_ptr_to_deferred_list(&self, holder: *mut MultiWaitHolder) {
+        let mut deferred_list = self.deferred_list.lock().unwrap();
+        unsafe {
+            (*holder).link_to_multi_wait(&mut *deferred_list as *mut MultiWait);
+        }
+        self.signal_wakeup_event();
     }
 
     /// Move all items from the deferred list to the main multi-wait.
     /// Port of upstream `ServerManager::LinkDeferred`.
     fn link_deferred(&mut self) {
-        // In upstream, this atomically moves holders from m_deferred_list to
-        // m_multi_wait under the deferred_list_mutex. Our polling model checks
-        // all sessions directly, so this is a no-op. The structural slot is
-        // preserved for future kernel-level wait integration.
+        let mut deferred_list = self.deferred_list.lock().unwrap();
+        self.multi_wait.move_all(&mut deferred_list);
     }
 
     /// Main loop for processing server events.
     /// Port of upstream `ServerManager::LoopProcess`.
     pub fn loop_process(&mut self) -> ResultCode {
+        self.ensure_kernel_event_bridge(&self.wakeup_event);
+        if let Some(event) = self.deferral_event.as_ref() {
+            self.ensure_kernel_event_bridge(event);
+        }
+        self.ensure_kernel_port_registrations();
         log::info!("ServerManager({}): entering event loop", self.name);
         while !self.stop_requested.load(Ordering::Relaxed) {
             self.wait_and_process_impl();
@@ -333,61 +474,21 @@ impl ServerManager {
     /// Wait for a signaled event and process it.
     /// Port of upstream `ServerManager::WaitAndProcessImpl`.
     fn wait_and_process_impl(&mut self) -> bool {
-        // Link any deferred items into the main wait list.
+        self.ensure_kernel_port_registrations();
         self.link_deferred();
-
-        // Check if stop was requested.
         if self.stop_requested.load(Ordering::Relaxed) {
             return false;
         }
 
-        // Check if any session has a pending request.
-        for i in 0..self.sessions.len() {
-            let is_signaled = self.sessions[i]
-                .server_session
-                .lock()
-                .unwrap()
-                .is_signaled();
-            if is_signaled {
-                self.on_session_event(i);
-                return true;
-            }
-        }
-
-        // Check deferral event.
-        if let Some(ref event) = self.deferral_event {
-            if event.is_signaled() {
-                event.clear();
-                self.clear_guest_wakeup_signal();
-                self.on_deferral_event();
-                return true;
-            }
-        }
-
-        // Check wakeup event.
-        if self.wakeup_event.is_signaled() {
-            self.wakeup_event.clear();
-            self.clear_guest_wakeup_signal();
-            return true;
-        }
-
-        // No events signaled.
-        // Upstream blocks in MultiWait::WaitAny(m_system.Kernel()). Rust still
-        // lacks real kernel-backed MultiWait integration, so split the fallback:
-        // guest core service threads can still block through the guest wakeup
-        // event, but host service threads must never enter guest wait/schedule
-        // primitives or they can end up running guest fibers on the host OS
-        // thread.
         if !self.system.is_null() {
             if let Some(kernel) = self.system.get().kernel() {
-                if kernel.is_current_thread_guest_core() {
-                    if self.wait_guest_thread() {
-                        return false;
+                if let Some(selected) = self.multi_wait.wait_any(kernel) {
+                    unsafe {
+                        (*selected).unlink_from_multi_wait();
                     }
-                } else {
-                    self.wakeup_event.wait_timeout(Duration::from_millis(100));
-                    return false;
+                    return self.process_holder(selected);
                 }
+                return false;
             }
         }
 
@@ -395,32 +496,110 @@ impl ServerManager {
         // Keep the historical fallback here instead of blocking on guest wait
         // primitives when there is no real kernel-backed service thread to
         // suspend.
+        if !self.system.is_null() {
+            if let Some(kernel) = self.system.get().kernel() {
+                if let Some(selected) = self.multi_wait.try_wait_any(kernel) {
+                    unsafe {
+                        (*selected).unlink_from_multi_wait();
+                    }
+                    return self.process_holder(selected);
+                }
+            }
+        }
         std::thread::yield_now();
         false
     }
 
-    fn ensure_guest_wakeup_event(&self) -> Option<u64> {
-        if self.system.is_null() {
-            return None;
+    fn process_holder(&mut self, selected: *mut MultiWaitHolder) -> bool {
+        let selected = selected as *const MultiWaitHolder;
+
+        if self
+            .wakeup_holder
+            .as_ref()
+            .is_some_and(|holder| std::ptr::eq(&**holder as *const MultiWaitHolder, selected))
+        {
+            self.wakeup_event.clear();
+            unsafe {
+                (*selected.cast_mut()).link_to_multi_wait(&mut self.multi_wait as *mut MultiWait);
+            }
+            return true;
         }
 
-        let current_thread = self.system.get().current_thread()?;
+        if self
+            .deferral_holder
+            .as_ref()
+            .is_some_and(|holder| std::ptr::eq(&**holder as *const MultiWaitHolder, selected))
+        {
+            if let Some(ref event) = self.deferral_event {
+                event.clear();
+            }
+            self.on_deferral_event();
+            return true;
+        }
+
+        if let Some(port_index) = self
+            .ports
+            .iter()
+            .position(|port| std::ptr::eq(port.holder_ptr(), selected))
+        {
+            self.on_port_event(port_index);
+            return true;
+        }
+
+        if let Some(session_index) = self
+            .sessions
+            .iter()
+            .position(|session| std::ptr::eq(session.holder_ptr(), selected))
+        {
+            self.on_session_event(session_index);
+            return true;
+        }
+
+        false
+    }
+
+    fn signal_wakeup_event(&self) {
+        self.wakeup_event.signal();
+    }
+
+    fn ensure_kernel_event_bridge(&self, event: &Arc<Event>) {
+        if event.kernel_object_id().is_some() || self.system.is_null() {
+            return;
+        }
+
+        let Some(current_thread) = self.system.get().current_thread() else {
+            return;
+        };
         let (process, scheduler) = {
             let thread_guard = current_thread.lock().unwrap();
-            let process = thread_guard.parent.as_ref().and_then(|w| w.upgrade())?;
-            let scheduler = thread_guard.scheduler.as_ref().and_then(|w| w.upgrade())?;
+            let process = thread_guard
+                .parent
+                .as_ref()
+                .and_then(|parent| parent.upgrade());
+            let scheduler = thread_guard
+                .scheduler
+                .as_ref()
+                .and_then(|scheduler| scheduler.upgrade())
+                .or_else(|| {
+                    process.as_ref().and_then(|process| {
+                        process
+                            .lock()
+                            .unwrap()
+                            .scheduler
+                            .as_ref()
+                            .and_then(|scheduler| scheduler.upgrade())
+                    })
+                });
+            let (Some(process), Some(scheduler)) = (process, scheduler) else {
+                return;
+            };
             (process, scheduler)
         };
 
-        let mut guest_wakeup = self.guest_wakeup.lock().unwrap();
-        guest_wakeup.process = Some(Arc::downgrade(&process));
-        guest_wakeup.scheduler = Some(Arc::downgrade(&scheduler));
+        let Some(kernel) = self.system.get().kernel() else {
+            return;
+        };
 
-        if let Some(object_id) = guest_wakeup.object_id {
-            return Some(object_id);
-        }
-
-        let kernel = self.system.get().kernel()?;
         let object_id = kernel.create_new_object_id() as u64;
         let mut readable_event = KReadableEvent::new();
         readable_event.initialize(0, object_id);
@@ -431,94 +610,62 @@ impl ServerManager {
             .unwrap()
             .register_readable_event_object(object_id, Arc::clone(&readable_event));
         kernel.register_kernel_object(object_id);
-
-        guest_wakeup.readable_event = Some(readable_event);
-        guest_wakeup.object_id = Some(object_id);
-        Some(object_id)
+        event.attach_kernel_event(readable_event, process, scheduler);
     }
 
-    fn signal_guest_wakeup(&self) {
-        self.wakeup_event.signal();
+    /// Handle a server-port event (incoming connection).
+    /// Port of upstream `ServerManager::OnPortEvent`.
+    fn on_port_event(&mut self, port_index: usize) {
+        if port_index >= self.ports.len() {
+            return;
+        }
 
-        let (readable_event, process, scheduler) = {
-            let guest_wakeup = self.guest_wakeup.lock().unwrap();
-            let readable_event = guest_wakeup.readable_event.as_ref().cloned();
-            let process = guest_wakeup.process.as_ref().and_then(|w| w.upgrade());
-            let scheduler = guest_wakeup.scheduler.as_ref().and_then(|w| w.upgrade());
-            (readable_event, process, scheduler)
+        let handler = self.ports[port_index].create_handler();
+        let server_session_object_id = {
+            let mut port_guard = self.ports[port_index].port.lock().unwrap();
+            let Some(server_session_object_id) = port_guard.server.accept_session() else {
+                let holder_ptr = self.ports[port_index].holder_ptr() as *mut MultiWaitHolder;
+                self.link_holder_ptr_to_deferred_list(holder_ptr);
+                return;
+            };
+            server_session_object_id
         };
 
-        let (Some(readable_event), Some(process), Some(scheduler)) =
-            (readable_event, process, scheduler)
+        let Some(kernel) = (!self.system.is_null())
+            .then(|| self.system.get().kernel())
+            .flatten()
         else {
             return;
         };
-
-        let mut process = process.lock().unwrap();
-        let _ = readable_event
-            .lock()
-            .unwrap()
-            .signal(&mut process, &scheduler);
-    }
-
-    fn clear_guest_wakeup_signal(&self) {
-        let readable_event = {
-            let guest_wakeup = self.guest_wakeup.lock().unwrap();
-            guest_wakeup.readable_event.as_ref().cloned()
+        let Some(owner_process_id) = kernel.get_session_owner_process_id(server_session_object_id)
+        else {
+            return;
+        };
+        let Some(process_arc) = kernel.get_process_by_id(owner_process_id) else {
+            return;
         };
 
-        if let Some(readable_event) = readable_event {
-            let _ = readable_event.lock().unwrap().reset();
-        }
-    }
-
-    fn wait_guest_thread(&self) -> bool {
-        if self.system.is_null() {
-            return false;
-        }
-
-        let Some(thread) = self.system.get().current_thread() else {
-            return false;
+        let server_session = {
+            let process = process_arc.lock().unwrap();
+            match process.get_server_session_by_object_id(server_session_object_id) {
+                Some(server_session) => server_session,
+                None => return,
+            }
         };
 
-        let Some(object_id) = self.ensure_guest_wakeup_event() else {
-            return false;
-        };
+        let manager = self
+            .self_reference
+            .as_ref()
+            .and_then(Weak::upgrade)
+            .map(SessionRequestManager::new_with_server_manager)
+            .map(|manager| Arc::new(Mutex::new(manager)))
+            .unwrap_or_else(|| Arc::new(Mutex::new(SessionRequestManager::new())));
+        manager.lock().unwrap().set_session_handler(handler);
+        server_session.lock().unwrap().set_manager(manager.clone());
+        let _ = self.register_session(server_session, manager);
 
-        let (process, scheduler) = {
-            let guest_wakeup = self.guest_wakeup.lock().unwrap();
-            let process = guest_wakeup.process.as_ref().and_then(|w| w.upgrade());
-            let scheduler = guest_wakeup.scheduler.as_ref().and_then(|w| w.upgrade());
-            let (Some(process), Some(scheduler)) = (process, scheduler) else {
-                return false;
-            };
-            (process, scheduler)
-        };
-
-        let mut out_index = -1;
-        let result = k_synchronization_object::wait(
-            &process,
-            &thread,
-            &scheduler,
-            &mut out_index,
-            vec![object_id],
-            -1,
-        );
-
-        if result != RESULT_SUCCESS {
-            return false;
-        }
-
-        let sched_ptr = {
-            let mut scheduler_guard = scheduler.lock().unwrap();
-            &mut *scheduler_guard as *mut KScheduler
-        };
-
-        unsafe {
-            KScheduler::schedule_raw_if_needed(sched_ptr);
-        }
-
-        true
+        let holder_ptr = self.ports[port_index].holder_ptr() as *mut MultiWaitHolder;
+        self.link_holder_ptr_to_deferred_list(holder_ptr);
     }
 
     /// Handle a session event (incoming IPC request).
@@ -551,6 +698,13 @@ impl ServerManager {
             self.name,
             deferred.len()
         );
+        let deferral_holder_ptr = self
+            .deferral_holder
+            .as_deref_mut()
+            .map(|holder| holder as *mut MultiWaitHolder);
+        if let Some(deferral_holder_ptr) = deferral_holder_ptr {
+            self.link_holder_ptr_to_deferred_list(deferral_holder_ptr);
+        }
         for session_index in deferred {
             if session_index < self.sessions.len() {
                 self.complete_sync_request(session_index);
@@ -645,6 +799,22 @@ impl ServerManager {
             session_index,
             result.get_inner_value()
         );
+
+        if session_index < self.sessions.len() {
+            let holder_ptr = {
+                let holder = &mut *self.sessions[session_index].holder as *mut MultiWaitHolder;
+                unsafe {
+                    if (*holder).is_linked() {
+                        std::ptr::null_mut()
+                    } else {
+                        holder
+                    }
+                }
+            };
+            if !holder_ptr.is_null() {
+                self.link_holder_ptr_to_deferred_list(holder_ptr);
+            }
+        }
     }
 
     /// Starts additional host threads for processing.
@@ -705,11 +875,12 @@ impl ServerManager {
     /// Request the server to stop.
     pub fn request_stop(&self) {
         self.stop_requested.store(true, Ordering::Release);
-        self.additional_host_thread_stop.store(true, Ordering::Release);
+        self.additional_host_thread_stop
+            .store(true, Ordering::Release);
         for handle in &self.host_threads {
             handle.thread().unpark();
         }
-        self.signal_guest_wakeup();
+        self.signal_wakeup_event();
     }
 
     #[cfg(test)]

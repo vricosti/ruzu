@@ -10,12 +10,12 @@ use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
-use common::settings;
-use ruzu_core::core::SystemRef;
 use crate::engines::engine_interface::EngineInterface;
 use crate::engines::engine_interface::EngineTypes;
 use crate::engines::puller::{EngineID, MethodCall, Puller};
+use common::settings;
 use parking_lot::Mutex;
+use ruzu_core::core::SystemRef;
 
 /// GPU virtual address type.
 pub type GPUVAddr = u64;
@@ -789,9 +789,9 @@ impl DmaPusher {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::control::channel_state::ChannelState;
     use common::settings;
     use common::settings_enums::GpuAccuracy;
-    use crate::control::channel_state::ChannelState;
 
     #[test]
     fn install_self_reference_uses_stable_boxed_address() {
@@ -816,7 +816,12 @@ mod tests {
         let mut channel_state = Box::new(ChannelState::new(9));
         let memory_manager = Arc::new(Mutex::new(crate::memory_manager::MemoryManager::new(1)));
         let channel_ptr: *mut ChannelState = &mut *channel_state;
-        let dma = DmaPusher::new(std::ptr::null(), SystemRef::null(), memory_manager, channel_ptr);
+        let dma = DmaPusher::new(
+            std::ptr::null(),
+            SystemRef::null(),
+            memory_manager,
+            channel_ptr,
+        );
 
         let previous_accuracy = {
             let values = settings::values();

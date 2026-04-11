@@ -124,11 +124,8 @@ impl RomFSFactory {
         let fs_ctrl = self.filesystem_controller.as_ref()?;
         let fs_ctrl_guard = fs_ctrl.lock().unwrap();
         let content_prov = self.content_provider.as_ref()?.lock().unwrap();
-        let patch_manager = PatchManager::new(
-            current_process_title_id,
-            &fs_ctrl_guard,
-            &*content_prov,
-        );
+        let patch_manager =
+            PatchManager::new(current_process_title_id, &fs_ctrl_guard, &*content_prov);
         Some(patch_manager.patch_romfs(
             base,
             ContentRecordType::Program,

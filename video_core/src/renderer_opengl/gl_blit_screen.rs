@@ -92,7 +92,13 @@ impl BlitScreen {
 
         self.create_window_adapt();
         if let Some(ref window_adapt) = self.window_adapt {
-            window_adapt.draw_to_framebuffer(&mut self.layers, framebuffers, layout, invert_y, device_memory);
+            window_adapt.draw_to_framebuffer(
+                &mut self.layers,
+                framebuffers,
+                layout,
+                invert_y,
+                device_memory,
+            );
         }
     }
 

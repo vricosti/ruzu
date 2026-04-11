@@ -76,7 +76,11 @@ impl KReadableEvent {
     /// (audio ADSP, vsync conductor) where the scheduler spinlock causes
     /// livelock because guest-fiber OS threads hold it continuously during
     /// their wait/reschedule loops.
-    pub fn signal_from_host(&mut self, process: &mut KProcess, scheduler: &Arc<Mutex<KScheduler>>) -> u32 {
+    pub fn signal_from_host(
+        &mut self,
+        process: &mut KProcess,
+        scheduler: &Arc<Mutex<KScheduler>>,
+    ) -> u32 {
         self.is_signaled = true;
         self.notify_available(process, scheduler);
         RESULT_SUCCESS.get_inner_value()

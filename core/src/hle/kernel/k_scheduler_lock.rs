@@ -41,9 +41,8 @@ fn default_disable_scheduling() {
 /// triggers `ScheduleImpl()` → fiber switch. This is the mechanism that
 /// suspends a WAITING thread after `KScopedSchedulerLockAndSleep` drops.
 fn default_enable_scheduling(cores_needing_scheduling: u64) {
-    let dispatch_count = super::kernel::with_current_thread_fast_mut(|t| {
-        t.get_disable_dispatch_count()
-    });
+    let dispatch_count =
+        super::kernel::with_current_thread_fast_mut(|t| t.get_disable_dispatch_count());
 
     match dispatch_count {
         Some(count) if count > 1 => {

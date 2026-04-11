@@ -118,7 +118,11 @@ pub struct Conductor {
 }
 
 impl Conductor {
-    pub fn new(system: SystemRef, display_ids: &[u64], surface_flinger: Arc<SurfaceFlinger>) -> Self {
+    pub fn new(
+        system: SystemRef,
+        display_ids: &[u64],
+        surface_flinger: Arc<SurfaceFlinger>,
+    ) -> Self {
         let mut vsync_managers = HashMap::new();
         for &id in display_ids {
             vsync_managers.insert(id, VsyncManager::new());

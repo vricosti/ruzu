@@ -6,11 +6,11 @@
 
 use std::sync::{Arc, Mutex, Weak};
 
+use crate::core::SystemRef;
 use crate::hle::kernel::k_process::KProcess;
 use crate::hle::kernel::k_readable_event::KReadableEvent;
 use crate::hle::service::hle_ipc::{HLERequestContext, Handle};
 use crate::hle::service::os::process::Process;
-use crate::core::SystemRef;
 
 use super::am_types::*;
 use super::applet_data_broker::AppletDataBroker;

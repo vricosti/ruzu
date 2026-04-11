@@ -10,6 +10,7 @@ use std::sync::{Arc, Mutex};
 
 use super::k_client_session::KClientSession;
 use super::k_server_session::KServerSession;
+use super::k_session_request::KSessionRequest;
 
 /// Session state.
 /// Matches upstream `KSession::State` (k_session.h).
@@ -88,8 +89,21 @@ impl KSession {
 
     /// Forward a request to the server session.
     /// Matches upstream `KSession::OnRequest(KSessionRequest*)`.
-    pub fn on_request(&self, request_id: u64) -> u32 {
-        self.server.lock().unwrap().on_request(request_id)
+    pub fn on_request(&self, request: Arc<Mutex<KSessionRequest>>) -> u32 {
+        self.server.lock().unwrap().on_request(request)
+    }
+
+    /// Forward a request to the server session when the owner process is
+    /// already held by the caller.
+    pub fn on_request_with_process(
+        &self,
+        process: &mut super::k_process::KProcess,
+        request: Arc<Mutex<KSessionRequest>>,
+    ) -> u32 {
+        self.server
+            .lock()
+            .unwrap()
+            .on_request_with_process(process, request)
     }
 
     fn set_state(&self, state: SessionState) {
@@ -116,11 +130,25 @@ impl KSession {
 
     /// Called when the server side is closed.
     pub fn on_server_closed(&mut self) {
-        self.set_state(SessionState::ServerClosed);
+        if self.get_state() == SessionState::Normal {
+            self.set_state(SessionState::ServerClosed);
+            self.client.lock().unwrap().on_server_closed();
+        }
     }
 
     /// Called when the client side is closed.
     pub fn on_client_closed(&mut self) {
+        self.server.lock().unwrap().on_client_closed();
+        self.set_state(SessionState::ClientClosed);
+    }
+
+    /// Called when the client side is closed, with the owning process already
+    /// held by the caller.
+    pub fn on_client_closed_with_process(&mut self, process: &mut super::k_process::KProcess) {
+        self.server
+            .lock()
+            .unwrap()
+            .on_client_closed_with_process(process);
         self.set_state(SessionState::ClientClosed);
     }
 
@@ -168,5 +196,16 @@ mod tests {
         // Both endpoints are accessible
         let _server = session.get_server_session().lock().unwrap();
         let _client = session.get_client_session().lock().unwrap();
+    }
+
+    #[test]
+    fn test_on_server_closed_only_transitions_from_normal() {
+        let mut session = KSession::new();
+        session.initialize(None, 0);
+        session.on_server_closed();
+        assert!(session.is_server_closed());
+
+        session.on_server_closed();
+        assert!(session.is_server_closed());
     }
 }

@@ -474,7 +474,10 @@ mod tests {
         let result = device.ioc_create(&mut params);
 
         assert_eq!(result, NvResult::Success);
-        let handle = container.get_nv_map_file().get_handle(params.handle).unwrap();
+        let handle = container
+            .get_nv_map_file()
+            .get_handle(params.handle)
+            .unwrap();
         assert_eq!(handle.orig_size(), 0x1234);
         assert_eq!(handle.lock_inner().size, 0x2000);
     }

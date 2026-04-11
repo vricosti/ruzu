@@ -32,7 +32,10 @@ pub struct TimeManager {
 
 impl TimeManager {
     /// Matches upstream `TimeManager::TimeManager(Core::System& system)`.
-    pub fn new(service_manager: Arc<Mutex<ServiceManager>>, _system: crate::core::SystemRef) -> Self {
+    pub fn new(
+        service_manager: Arc<Mutex<ServiceManager>>,
+        _system: crate::core::SystemRef,
+    ) -> Self {
         let time_m_handler = ServiceManager::get_service_blocking(&service_manager, "time:m");
         let time_m = time_m_handler
             .as_any()
@@ -107,10 +110,8 @@ impl TimeManager {
                 i64::from(accuracy_minutes) * 60 * 1_000_000_000,
             )
         };
-        let _ = time_m.setup_standard_network_system_clock_core(
-            network_clock_context,
-            network_accuracy_ns,
-        );
+        let _ = time_m
+            .setup_standard_network_system_clock_core(network_clock_context, network_accuracy_ns);
 
         let (automatic_correction_enabled, automatic_correction_time_point) = {
             let inner = set_sys.inner.lock().unwrap();
@@ -149,13 +150,17 @@ impl TimeManager {
                 inner.get_external_steady_clock_source_id(),
                 inner.get_external_steady_clock_internal_offset(),
                 inner
-                    .get_settings_item_value_i32("time", "standard_steady_clock_test_offset_minutes")
+                    .get_settings_item_value_i32(
+                        "time",
+                        "standard_steady_clock_test_offset_minutes",
+                    )
                     .unwrap_or(0),
             )
         };
 
         let external_internal_offset_ns = external_internal_offset_s * 1_000_000_000;
-        let standard_steady_clock_test_offset_ns = i64::from(test_offset_minutes) * 60 * 1_000_000_000;
+        let standard_steady_clock_test_offset_ns =
+            i64::from(test_offset_minutes) * 60 * 1_000_000_000;
 
         let reset_detected = self.steady_clock_resource.get_reset_detected();
         let mut candidate_source_id = external_clock_source_id;
@@ -189,7 +194,11 @@ impl TimeManager {
         set_sys: &SystemSettingsService,
         time_m: &TimeServiceManager,
     ) {
-        let raw_name = set_sys.inner.lock().unwrap().get_device_time_zone_location_name();
+        let raw_name = set_sys
+            .inner
+            .lock()
+            .unwrap()
+            .get_device_time_zone_location_name();
         let name = get_time_zone_string(&self.time_zone_binary, raw_name);
 
         if name != raw_name {
@@ -274,14 +283,18 @@ fn get_time_zone_string(
 
     let mut configured_name = [0u8; 0x24];
     let configured_bytes = configured_zone.as_bytes();
-    let copy_len = configured_bytes.len().min(configured_name.len().saturating_sub(1));
+    let copy_len = configured_bytes
+        .len()
+        .min(configured_name.len().saturating_sub(1));
     configured_name[..copy_len].copy_from_slice(&configured_bytes[..copy_len]);
 
     if !time_zone_binary.is_valid(&configured_name) {
         let fallback_zone = common::time_zone::find_system_time_zone();
         configured_name = [0u8; 0x24];
         let fallback_bytes = fallback_zone.as_bytes();
-        let copy_len = fallback_bytes.len().min(configured_name.len().saturating_sub(1));
+        let copy_len = fallback_bytes
+            .len()
+            .min(configured_name.len().saturating_sub(1));
         configured_name[..copy_len].copy_from_slice(&fallback_bytes[..copy_len]);
     }
     configured_name

@@ -208,17 +208,17 @@ impl IAudioDevice {
         } else {
             self.system.get().audio_core()
         })
-            .map(|audio_core| {
-                audio_core.list_audio_device_name(
-                    self.applet_resource_user_id,
-                    self.revision,
-                    &mut names,
-                ) as usize
-            })
-            .unwrap_or_else(|| {
-                names[0] = Self::default_active_device_name();
-                1
-            });
+        .map(|audio_core| {
+            audio_core.list_audio_device_name(
+                self.applet_resource_user_id,
+                self.revision,
+                &mut names,
+            ) as usize
+        })
+        .unwrap_or_else(|| {
+            names[0] = Self::default_active_device_name();
+            1
+        });
         names.truncate(count);
         names
     }
@@ -234,17 +234,17 @@ impl IAudioDevice {
         } else {
             self.system.get().audio_core()
         })
-            .map(|audio_core| {
-                audio_core.list_audio_output_device_name(
-                    self.applet_resource_user_id,
-                    self.revision,
-                    &mut names,
-                ) as usize
-            })
-            .unwrap_or_else(|| {
-                names[0] = Self::default_active_device_name();
-                1
-            });
+        .map(|audio_core| {
+            audio_core.list_audio_output_device_name(
+                self.applet_resource_user_id,
+                self.revision,
+                &mut names,
+            ) as usize
+        })
+        .unwrap_or_else(|| {
+            names[0] = Self::default_active_device_name();
+            1
+        });
         names.truncate(count);
         names
     }
@@ -359,7 +359,10 @@ impl IAudioDevice {
         rb.push_u32(active_channel_count);
     }
 
-    fn list_audio_device_name_auto_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn list_audio_device_name_auto_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         log::debug!("IAudioDevice::ListAudioDeviceNameAuto");
         Self::list_audio_device_name_handler(this, ctx);
     }

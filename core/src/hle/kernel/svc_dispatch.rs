@@ -468,7 +468,12 @@ fn call32(system: &System, imm: u32, args: &mut SvcArgs) {
             let address = get_arg32(args, 0) as u64;
             let size = get_arg32(args, 1) as u64;
             let perm = get_arg32(args, 2);
-            let result = svc_memory::set_memory_permission(system, address, size, decode_memory_permission(perm));
+            let result = svc_memory::set_memory_permission(
+                system,
+                address,
+                size,
+                decode_memory_permission(perm),
+            );
             set_arg32(args, 0, result.get_inner_value());
         }
         Some(SvcId::SetMemoryAttribute) => {
@@ -1398,7 +1403,12 @@ fn call64(system: &System, imm: u32, args: &mut SvcArgs) {
             let address = get_arg64(args, 0);
             let size = get_arg64(args, 1);
             let perm = get_arg64(args, 2) as u32;
-            let result = svc_memory::set_memory_permission(system, address, size, decode_memory_permission(perm));
+            let result = svc_memory::set_memory_permission(
+                system,
+                address,
+                size,
+                decode_memory_permission(perm),
+            );
             set_arg64(args, 0, result.get_inner_value() as u64);
         }
         Some(SvcId::SetMemoryAttribute) => {
