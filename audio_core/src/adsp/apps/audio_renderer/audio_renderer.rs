@@ -154,6 +154,23 @@ impl AudioRenderer {
         self.post_dsp_clear_command_buffer();
     }
 
+    /// Wait for ADSP response with a timeout. Returns true if response received.
+    pub fn wait_with_timeout(&mut self, timeout: std::time::Duration) -> bool {
+        let start = std::time::Instant::now();
+        loop {
+            if let Some(message) = self.mailbox.try_receive(Direction::Host) {
+                if message == Message::RenderResponse as u32 {
+                    self.post_dsp_clear_command_buffer();
+                }
+                return true;
+            }
+            if start.elapsed() >= timeout {
+                return false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+
     pub fn send(&self, direction: Direction, message: u32) {
         self.mailbox.send(direction, message);
     }
