@@ -671,9 +671,10 @@ impl CpuManager {
                                 tc.lr as u32,
                             );
                         }
-                        thread_arc.lock().unwrap().request_suspend(
-                            crate::hle::kernel::k_thread::SuspendType::Debug,
-                        );
+                        thread_arc
+                            .lock()
+                            .unwrap()
+                            .request_suspend(crate::hle::kernel::k_thread::SuspendType::Debug);
                         Self::reschedule_current_core_raw(kernel);
                         return;
                     }

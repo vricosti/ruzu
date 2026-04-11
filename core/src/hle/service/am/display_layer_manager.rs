@@ -12,8 +12,8 @@ use crate::hle::kernel::k_process::KProcess;
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 use crate::hle::service::vi::application_display_service::IApplicationDisplayService;
 use crate::hle::service::vi::manager_display_service::IManagerDisplayService;
-use crate::hle::service::vi::vi_results;
 use crate::hle::service::vi::manager_root_service::IManagerRootService;
+use crate::hle::service::vi::vi_results;
 use crate::hle::service::vi::vi_types::Policy;
 
 use super::am_types::{AppletId, LibraryAppletMode};
@@ -132,8 +132,11 @@ impl DisplayLayerManager {
         };
 
         let display_id = display_service.open_display(&Self::default_display_name())?;
-        let layer_id =
-            manager_display_service.create_managed_layer(0, display_id, process.lock().unwrap().get_process_id())?;
+        let layer_id = manager_display_service.create_managed_layer(
+            0,
+            display_id,
+            process.lock().unwrap().get_process_id(),
+        )?;
         manager_display_service.set_layer_visibility(self.visible, layer_id)?;
         self.managed_display_layers.insert(layer_id);
         Ok(layer_id)
@@ -164,8 +167,7 @@ impl DisplayLayerManager {
         let manager_display_service = self.manager_display_service.as_ref().unwrap();
         let process = self.process.as_ref().unwrap();
 
-        let Ok(display_id) = display_service.open_display(&Self::default_display_name())
-        else {
+        let Ok(display_id) = display_service.open_display(&Self::default_display_name()) else {
             return vi_results::RESULT_OPERATION_FAILED;
         };
 
@@ -180,7 +182,8 @@ impl DisplayLayerManager {
         self.system_shared_buffer_id = buffer_id;
         self.system_shared_layer_id = layer_id;
         self.buffer_sharing_enabled = true;
-        let _ = manager_display_service.set_layer_visibility(self.visible, self.system_shared_layer_id);
+        let _ =
+            manager_display_service.set_layer_visibility(self.visible, self.system_shared_layer_id);
         RESULT_SUCCESS
     }
 

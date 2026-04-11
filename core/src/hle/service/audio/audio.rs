@@ -60,7 +60,9 @@ pub fn loop_process(system: crate::core::SystemRef) {
     server_manager.register_named_service(
         "audren:u",
         Box::new(move || -> SessionRequestHandlerPtr {
-            std::sync::Arc::new(super::audio_renderer_manager::IAudioRendererManager::new(system))
+            std::sync::Arc::new(super::audio_renderer_manager::IAudioRendererManager::new(
+                system,
+            ))
         }),
         16,
     );

@@ -6,8 +6,8 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 use crate::hle::kernel::k_process::KProcess;
+use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
 use crate::hle::service::ipc_helpers::{RequestParser, ResponseBuilder};
 use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
@@ -137,15 +137,14 @@ impl IManagerDisplayService {
         display_id: u64,
         enable_blending: bool,
     ) -> Result<(u64, u64), ResultCode> {
-        self.container
-            .get_shared_buffer_manager()
-            .create_session(owner_process, display_id, enable_blending)
+        self.container.get_shared_buffer_manager().create_session(
+            owner_process,
+            display_id,
+            enable_blending,
+        )
     }
 
-    pub fn destroy_shared_layer_session(
-        &self,
-        owner_process: &Arc<std::sync::Mutex<KProcess>>,
-    ) {
+    pub fn destroy_shared_layer_session(&self, owner_process: &Arc<std::sync::Mutex<KProcess>>) {
         self.container
             .get_shared_buffer_manager()
             .destroy_session(owner_process);

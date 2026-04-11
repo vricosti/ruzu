@@ -17,6 +17,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 
+use crate::core::SystemRef;
 use crate::hle::kernel::k_port::KPort;
 use crate::hle::kernel::svc::svc_results::RESULT_INVALID_STATE;
 use crate::hle::result::{ErrorModule, ResultCode, RESULT_SUCCESS};
@@ -124,25 +125,42 @@ impl ServiceManager {
         max_sessions: u32,
         handler: SessionRequestHandlerFactory,
     ) -> ResultCode {
+        match self.register_service_with_port(name, max_sessions, handler) {
+            Ok(_) => RESULT_SUCCESS,
+            Err(result) => result,
+        }
+    }
+
+    /// Registers a service and returns the created `KPort` owner.
+    ///
+    /// This keeps the upstream ownership boundary in `sm.rs`: the service
+    /// manager creates the port, stores it internally, and also exposes the
+    /// created server endpoint to callers that need to return it through IPC.
+    pub fn register_service_with_port(
+        &mut self,
+        name: String,
+        _max_sessions: u32,
+        handler: SessionRequestHandlerFactory,
+    ) -> Result<Arc<Mutex<KPort>>, ResultCode> {
         let validate_result = validate_service_name(&name);
         if validate_result.is_error() {
-            return validate_result;
+            return Err(validate_result);
         }
 
         if self.registered_services.contains_key(&name) {
             log::error!("Service is already registered! service={}", name);
-            return RESULT_ALREADY_REGISTERED;
+            return Err(RESULT_ALREADY_REGISTERED);
         }
 
         // Create and initialize a KPort (matching upstream).
         let mut port = KPort::new();
-        port.initialize(max_sessions as i32, false, 0);
+        port.initialize(SERVER_SESSION_COUNT_MAX as i32, false, 0);
+        let port = Arc::new(Mutex::new(port));
 
         // Store the port and handler factory.
         // Upstream stores &port->GetClientPort() in service_ports; we store
         // the whole KPort since we own it (no slab allocator yet).
-        self.service_ports
-            .insert(name.clone(), Arc::new(Mutex::new(port)));
+        self.service_ports.insert(name.clone(), Arc::clone(&port));
         self.registered_services.insert(name, handler);
 
         // Signal deferral event so waiting GetService requests can retry.
@@ -151,7 +169,7 @@ impl ServiceManager {
             log::debug!("ServiceManager: deferral event signaled after registration");
         }
 
-        RESULT_SUCCESS
+        Ok(port)
     }
 
     /// Unregisters a service.
@@ -249,6 +267,7 @@ fn validate_service_name(name: &str) -> ResultCode {
 /// Corresponds to upstream `Service::SM::SM : ServiceFramework<SM>`.
 /// Constructor: `SM(ServiceManager& service_manager_, Core::System& system_)`.
 pub struct Sm {
+    system: SystemRef,
     service_manager: Arc<Mutex<ServiceManager>>,
     handlers: BTreeMap<u32, FunctionInfo>,
     handlers_tipc: BTreeMap<u32, FunctionInfo>,
@@ -258,7 +277,7 @@ impl Sm {
     /// Creates a new SM service.
     ///
     /// Matches upstream `SM::SM(ServiceManager& service_manager_, Core::System& system_)`.
-    pub fn new(service_manager: Arc<Mutex<ServiceManager>>) -> Self {
+    pub fn new(service_manager: Arc<Mutex<ServiceManager>>, system: SystemRef) -> Self {
         // Matches upstream handler registration:
         // RegisterHandlers({{0, &SM::Initialize, "Initialize"}, ...})
         // RegisterHandlersTipc({{0, &SM::Initialize, "Initialize"}, ...})
@@ -286,6 +305,7 @@ impl Sm {
         ]);
 
         Self {
+            system,
             service_manager,
             handlers,
             handlers_tipc,
@@ -344,7 +364,7 @@ impl Sm {
     ///
     /// Matches upstream `SM::GetServiceCmif(HLERequestContext& ctx)`.
     fn get_service_cmif(&self, ctx: &mut HLERequestContext) {
-        let (result, session_handle) = self.get_service_impl(ctx);
+        let (result, client_session_object_id) = self.get_service_impl(ctx);
         if ctx.get_is_deferred() {
             return;
         }
@@ -358,7 +378,7 @@ impl Sm {
                 crate::hle::service::ipc_helpers::ResponseBuilderFlags::AlwaysMoveHandles,
             );
             rb.push_result(result);
-            rb.push_move_objects(session_handle.unwrap_or(0));
+            rb.push_move_object_id(client_session_object_id.unwrap_or(0));
         } else {
             let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
             rb.push_result(result);
@@ -369,7 +389,7 @@ impl Sm {
     ///
     /// Matches upstream `SM::GetServiceTipc(HLERequestContext& ctx)`.
     fn get_service_tipc(&self, ctx: &mut HLERequestContext) {
-        let (result, session_handle) = self.get_service_impl(ctx);
+        let (result, client_session_object_id) = self.get_service_impl(ctx);
         if ctx.get_is_deferred() {
             return;
         }
@@ -382,8 +402,8 @@ impl Sm {
             crate::hle::service::ipc_helpers::ResponseBuilderFlags::AlwaysMoveHandles,
         );
         rb.push_result(result);
-        rb.push_move_objects(if result.is_success() {
-            session_handle.unwrap_or(0)
+        rb.push_move_object_id(if result.is_success() {
+            client_session_object_id.unwrap_or(0)
         } else {
             0
         });
@@ -406,7 +426,7 @@ impl Sm {
     /// Internal implementation for GetService.
     ///
     /// Matches upstream `SM::GetServiceImpl(KClientSession**, HLERequestContext&)`.
-    fn get_service_impl(&self, ctx: &mut HLERequestContext) -> (ResultCode, Option<u32>) {
+    fn get_service_impl(&self, ctx: &mut HLERequestContext) -> (ResultCode, Option<u64>) {
         if let Some(manager) = ctx.get_manager() {
             if !manager.lock().unwrap().get_is_initialized_for_sm() {
                 log::warn!("  GetService: client not initialized for SM");
@@ -418,8 +438,17 @@ impl Sm {
         let name = Self::pop_service_name(&mut rp);
         log::info!("  GetService: looking up \"{}\"", name);
 
-        let sm = self.service_manager.lock().unwrap();
-        match sm.get_service_port(&name) {
+        let (port, handler, parent_server_manager) = {
+            let sm = self.service_manager.lock().unwrap();
+            let port_result = sm.get_service_port(&name);
+            let handler = sm.get_service(&name);
+            let parent_server_manager = ctx
+                .get_manager()
+                .and_then(|manager| manager.lock().unwrap().get_server_manager().cloned());
+            (port_result, handler, parent_server_manager)
+        };
+
+        match port {
             Err(e) if e == RESULT_INVALID_SERVICE_NAME => {
                 log::error!("Invalid service name '{}'", name);
                 (RESULT_INVALID_SERVICE_NAME, None)
@@ -430,24 +459,101 @@ impl Sm {
                 ctx.set_is_deferred();
                 (RESULT_NOT_REGISTERED, None)
             }
-            Ok(_port) => {
-                // Create a session for the service handler.
-                // Matches upstream: client_port->CreateSession(&session)
-                let handler = sm.get_service(&name);
-                drop(sm); // Release ServiceManager lock before accessing process
+            Ok(port) => {
+                let Some(owner_process) = ctx.owner_process_arc() else {
+                    log::error!("  GetService(\"{}\"): missing owner process", name);
+                    return (RESULT_INVALID_STATE, None);
+                };
+
+                let kernel = self.system.get().kernel().expect("kernel not initialized");
+                let mut process = owner_process.lock().unwrap();
+                if process.ensure_handle_table_initialized() != RESULT_SUCCESS.get_inner_value() {
+                    log::error!("  GetService(\"{}\"): handle table init failed", name);
+                    return (RESULT_INVALID_STATE, None);
+                }
+
+                let (server_session_object_id, client_session_object_id, server_session) = {
+                    let mut port_guard = port.lock().unwrap();
+                    if port_guard.is_light() {
+                        log::error!("  GetService(\"{}\"): light ports not yet ported", name);
+                        return (RESULT_INVALID_STATE, None);
+                    }
+
+                    let (server_session_object_id, client_session_object_id) = match port_guard
+                        .client
+                        .create_session(&mut process, kernel, port_guard.get_name())
+                    {
+                        Ok(ids) => ids,
+                        Err(result) => {
+                            log::error!(
+                                "  GetService(\"{}\"): create_session failed {:#x}",
+                                name,
+                                result.get_inner_value()
+                            );
+                            return (result, None);
+                        }
+                    };
+
+                    let server_session = process
+                        .get_server_session_by_object_id(server_session_object_id)
+                        .expect("created server session must be registered");
+                    let enqueue_result = port_guard.enqueue_session(server_session_object_id);
+                    if enqueue_result.is_error() {
+                        process.unregister_client_session_object_by_object_id(
+                            client_session_object_id,
+                        );
+                        process.unregister_session_object_by_object_id(server_session_object_id);
+                        return (enqueue_result, None);
+                    }
+
+                    (
+                        server_session_object_id,
+                        client_session_object_id,
+                        server_session,
+                    )
+                };
 
                 if let Some(handler) = handler {
-                    if let Some(handle) = ctx.create_session_for_service(handler) {
-                        log::info!("  GetService(\"{}\") -> handle={:#x}", name, handle);
-                        (RESULT_SUCCESS, Some(handle))
+                    let manager = if let Some(parent_server_manager) = parent_server_manager {
+                        Arc::new(Mutex::new(
+                            crate::hle::service::hle_ipc::SessionRequestManager::new_with_server_manager(
+                                parent_server_manager,
+                            ),
+                        ))
                     } else {
-                        log::error!("  GetService(\"{}\"): failed to create session", name);
-                        (RESULT_INVALID_STATE, None)
+                        Arc::new(Mutex::new(
+                            crate::hle::service::hle_ipc::SessionRequestManager::new(),
+                        ))
+                    };
+                    manager.lock().unwrap().set_session_handler(handler);
+
+                    if let Some(client_session) =
+                        process.get_client_session_by_object_id(client_session_object_id)
+                    {
+                        client_session
+                            .lock()
+                            .unwrap()
+                            .initialize_with_manager(server_session_object_id, manager.clone());
                     }
-                } else {
-                    log::error!("  GetService(\"{}\"): service handler not found", name);
-                    (RESULT_INVALID_STATE, None)
+                    server_session.lock().unwrap().set_manager(manager.clone());
+
+                    if let Some(parent_server_manager) = ctx
+                        .get_manager()
+                        .and_then(|manager| manager.lock().unwrap().get_server_manager().cloned())
+                    {
+                        let _ = parent_server_manager
+                            .lock()
+                            .unwrap()
+                            .register_session(server_session, manager);
+                    }
                 }
+
+                log::info!(
+                    "  GetService(\"{}\") -> client_session_object_id={:#x}",
+                    name,
+                    client_session_object_id
+                );
+                (RESULT_SUCCESS, Some(client_session_object_id))
             }
         }
     }
@@ -498,28 +604,44 @@ impl Sm {
             // Upstream passes nullptr as handler factory for guest-registered services.
             let factory: SessionRequestHandlerFactory =
                 Box::new(|| -> SessionRequestHandlerPtr { panic!("null factory called") });
-            sm.register_service(name, max_session_count, factory)
+            sm.register_service_with_port(name.clone(), max_session_count, factory)
         };
 
-        if result.is_error() {
-            log::error!(
-                "failed to register service with error_code={:08X}",
-                result.get_inner_value()
-            );
-            let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
-            rb.push_result(result);
-            return;
-        }
+        let port = match result {
+            Ok(port) => port,
+            Err(result) => {
+                log::error!(
+                    "failed to register service with error_code={:08X}",
+                    result.get_inner_value()
+                );
+                let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+                rb.push_result(result);
+                return;
+            }
+        };
 
-        // Upstream creates a KPort via ServiceManager::RegisterService, which returns a
-        // KServerPort*. That server port is then pushed as a move handle:
-        //   IPC::ResponseBuilder rb{ctx, 2, 0, 1, IPC::ResponseBuilder::Flags::AlwaysMoveHandles};
-        //   rb.Push(ResultSuccess);
-        //   rb.PushMoveObjects(server_port);
-        //
-        // Blocked on KPort integration: ServiceManager::register_service needs to return a
-        // KServerPort handle that can be pushed via PushMoveObjects. Until KPort is wired,
-        // push 0 as a placeholder handle so the IPC response structure matches upstream.
+        let Some(owner_process) = ctx.owner_process_arc() else {
+            log::error!("SM::RegisterService: owner process missing for service registration");
+            let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+            rb.push_result(RESULT_INVALID_STATE);
+            return;
+        };
+
+        let kernel = self.system.get().kernel().expect("kernel not initialized");
+        let server_port_object_id = kernel.create_new_object_id() as u64;
+        {
+            let mut process = owner_process.lock().unwrap();
+            if process.ensure_handle_table_initialized() != RESULT_SUCCESS.get_inner_value() {
+                let mut sm = self.service_manager.lock().unwrap();
+                sm.unregister_service(&name);
+                let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+                rb.push_result(RESULT_INVALID_STATE);
+                return;
+            }
+            process.register_server_port_object(server_port_object_id, port);
+        }
+        kernel.register_kernel_object(server_port_object_id);
+
         let mut rb = ResponseBuilder::new_with_flags(
             ctx,
             2,
@@ -528,7 +650,7 @@ impl Sm {
             crate::hle::service::ipc_helpers::ResponseBuilderFlags::AlwaysMoveHandles,
         );
         rb.push_result(RESULT_SUCCESS);
-        rb.push_move_objects(0); // placeholder: should be server_port handle from KPort
+        rb.push_move_object_id(server_port_object_id);
     }
 
     /// SM::UnregisterService.
@@ -617,7 +739,7 @@ pub fn loop_process(service_manager: &Arc<Mutex<ServiceManager>>, system: crate:
     // Register the "sm:" named port.
     // Upstream: ManageNamedPort creates a KPort and registers it via
     // KObjectName::NewFromName so ConnectToNamedPort can find it.
-    let sm_service = Arc::new(Sm::new(service_manager.clone()));
+    let sm_service = Arc::new(Sm::new(service_manager.clone(), system));
     let sm_clone = sm_service.clone();
     let factory: SessionRequestHandlerFactory = Box::new(move || sm_clone.clone());
     server_manager.manage_named_port("sm:", factory, 64);

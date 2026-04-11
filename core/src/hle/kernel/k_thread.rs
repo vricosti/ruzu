@@ -26,8 +26,9 @@ use crate::arm::arm_interface::ThreadContext as ArmThreadContext;
 use crate::core::SystemRef;
 use crate::hardware_properties::NUM_CPU_CORES;
 use crate::hle::kernel::svc::svc_results::{
-    RESULT_CANCELLED, RESULT_INVALID_COMBINATION, RESULT_INVALID_STATE, RESULT_NO_SYNCHRONIZATION_OBJECT,
-    RESULT_OUT_OF_RESOURCE, RESULT_TERMINATION_REQUESTED, RESULT_TIMED_OUT,
+    RESULT_CANCELLED, RESULT_INVALID_COMBINATION, RESULT_INVALID_STATE,
+    RESULT_NO_SYNCHRONIZATION_OBJECT, RESULT_OUT_OF_RESOURCE, RESULT_TERMINATION_REQUESTED,
+    RESULT_TIMED_OUT,
 };
 use crate::hle::result::RESULT_SUCCESS;
 // RBEntry kept for structural parity with upstream m_condvar_arbiter_tree_node.
@@ -2110,10 +2111,9 @@ impl KThread {
                 return RESULT_TERMINATION_REQUESTED.get_inner_value();
             }
 
-            let current_termination_requested = super::kernel::with_current_thread_fast_mut(|t| {
-                t.is_termination_requested()
-            })
-            .unwrap_or(false);
+            let current_termination_requested =
+                super::kernel::with_current_thread_fast_mut(|t| t.is_termination_requested())
+                    .unwrap_or(false);
             if current_termination_requested {
                 return RESULT_TERMINATION_REQUESTED.get_inner_value();
             }
@@ -2173,10 +2173,9 @@ impl KThread {
                 None
             };
 
-            let current_termination_requested = super::kernel::with_current_thread_fast_mut(|t| {
-                t.is_termination_requested()
-            })
-            .unwrap_or(false);
+            let current_termination_requested =
+                super::kernel::with_current_thread_fast_mut(|t| t.is_termination_requested())
+                    .unwrap_or(false);
             if current_termination_requested {
                 return RESULT_TERMINATION_REQUESTED.get_inner_value();
             }
@@ -2192,10 +2191,9 @@ impl KThread {
                     return RESULT_INVALID_STATE.get_inner_value();
                 }
 
-                let current_suspended = super::kernel::with_current_thread_fast_mut(|t| {
-                    t.is_suspended()
-                })
-                .unwrap_or(false);
+                let current_suspended =
+                    super::kernel::with_current_thread_fast_mut(|t| t.is_suspended())
+                        .unwrap_or(false);
                 if current_suspended {
                     super::kernel::with_current_thread_fast_mut(|t| t.update_state());
                     continue;
@@ -2668,10 +2666,11 @@ impl KThread {
         // Fallback only when no global scheduler context owner exists.
         if !notified_gsc {
             if let Some(scheduler) = self.scheduler.as_ref().and_then(Weak::upgrade) {
-                scheduler
-                    .lock()
-                    .unwrap()
-                    .on_thread_state_changed(self.thread_id, old_base, new_base);
+                scheduler.lock().unwrap().on_thread_state_changed(
+                    self.thread_id,
+                    old_base,
+                    new_base,
+                );
             }
         }
     }
@@ -2831,7 +2830,8 @@ impl KThread {
             None
         } else {
             Some(KScopedSchedulerLock::new(unsafe {
-                &*(self.scheduler_lock_ptr as *const super::k_scheduler_lock::KAbstractSchedulerLock)
+                &*(self.scheduler_lock_ptr
+                    as *const super::k_scheduler_lock::KAbstractSchedulerLock)
             }))
         }
     }
@@ -2862,7 +2862,9 @@ impl KThread {
         // Upstream: ASSERT_MSG(false, "wait_queue is nullptr!"); return;
         // Avoid a hard crash — log and return early like upstream.
         let Some(wait_queue) = self.wait_queue.clone() else {
-            log::error!("KThread::end_wait: wait_queue is None while state=Waiting (upstream ASSERT)");
+            log::error!(
+                "KThread::end_wait: wait_queue is None while state=Waiting (upstream ASSERT)"
+            );
             return;
         };
         wait_queue.end_wait(self, _wait_result);
@@ -3033,7 +3035,10 @@ impl KThread {
                 }
 
                 if self.get_state() == ThreadState::RUNNABLE {
-                    if let Some(gsc) = self.global_scheduler_context.as_ref().and_then(Weak::upgrade)
+                    if let Some(gsc) = self
+                        .global_scheduler_context
+                        .as_ref()
+                        .and_then(Weak::upgrade)
                     {
                         gsc.lock().unwrap().on_thread_affinity_changed(
                             self.thread_id,
@@ -3932,9 +3937,8 @@ mod tests {
     fn end_wait_recursively_acquires_scheduler_lock() {
         let scheduler_lock = super::k_scheduler_lock::KAbstractSchedulerLock::new();
         let mut thread = KThread::new();
-        thread.scheduler_lock_ptr = (&scheduler_lock
-            as *const super::k_scheduler_lock::KAbstractSchedulerLock)
-            as usize;
+        thread.scheduler_lock_ptr =
+            (&scheduler_lock as *const super::k_scheduler_lock::KAbstractSchedulerLock) as usize;
         thread.begin_wait();
 
         let _outer = KScopedSchedulerLock::new(&scheduler_lock);

@@ -9,8 +9,8 @@ use crate::gpu_core::{
     BlendMode as GpuBlendMode, BufferTransformFlags as GpuBufferTransformFlags,
     FramebufferConfig as GpuFramebufferConfig, RectI as GpuRectI,
 };
-use crate::hle::service::nvdrv::core::nvmap::NvMap;
 use crate::hle::service::nvdrv::core::container::SessionId;
+use crate::hle::service::nvdrv::core::nvmap::NvMap;
 use crate::hle::service::nvdrv::devices::nvdevice::NvDevice;
 use crate::hle::service::nvdrv::nvdata::{DeviceFD, Ioctl, NvResult};
 use crate::hle::service::nvnflinger::hwc_layer::{HwcLayer, LayerBlending};

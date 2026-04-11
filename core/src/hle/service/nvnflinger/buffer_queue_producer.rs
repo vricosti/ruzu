@@ -458,8 +458,12 @@ impl BufferQueueProducer {
             );
             return (Status::BadValue, QueueBufferOutput::new());
         };
-        let buffer_rect =
-            Rectangle::new(0, 0, graphic_buffer.get_width() as i32, graphic_buffer.get_height() as i32);
+        let buffer_rect = Rectangle::new(
+            0,
+            0,
+            graphic_buffer.get_width() as i32,
+            graphic_buffer.get_height() as i32,
+        );
         match crop.intersect(&buffer_rect) {
             Some(cropped_rect) if cropped_rect == crop => {}
             _ => {
@@ -492,7 +496,8 @@ impl BufferQueueProducer {
             swap_interval,
             is_droppable: inner.dequeue_buffer_cannot_block || async_flag,
             acquire_called: inner.slots[s].acquire_called,
-            transform_to_display_inverse: transform.contains(NativeWindowTransform::INVERSE_DISPLAY),
+            transform_to_display_inverse: transform
+                .contains(NativeWindowTransform::INVERSE_DISPLAY),
         };
         let mut callback_item = super::buffer_item::BufferItem {
             graphic_buffer: item.graphic_buffer.clone(),

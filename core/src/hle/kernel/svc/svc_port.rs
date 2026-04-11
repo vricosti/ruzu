@@ -4,12 +4,10 @@
 //!
 //! SVC handlers for port operations (ConnectToNamedPort, CreatePort, ConnectToPort, ManageNamedPort).
 //!
-//! ConnectToNamedPort is fully implemented via the HLE service manager.
-//!
-//! CreatePort, ConnectToPort, and ManageNamedPort require typed object registries
-//! on KProcess for KPort/KClientPort/KServerPort (similar to how sessions and events
-//! are registered). These registries do not yet exist. The SVC logic documents exactly
-//! what upstream does and where the dependency gap is.
+//! CreatePort / ConnectToPort / ManageNamedPort / ConnectToNamedPort now use
+//! real port object registries instead of placeholder handles, but named-port
+//! lookup still resolves the `KObjectName` object id through `KernelCore`'s
+//! process registries rather than a literal typed auto-object lookup.
 
 use std::sync::{Arc, Mutex};
 
@@ -82,13 +80,6 @@ fn read_port_name(system: &System, user_name: u64) -> Result<String, ResultCode>
     Ok(String::from_utf8_lossy(&name[..len]).to_string())
 }
 
-/// Connects to a named port.
-///
-/// Upstream: Reads port name, finds KClientPort via KObjectName, reserves a handle,
-/// creates a session, and registers it in the handle table.
-///
-/// The Rust implementation uses the HLE service manager for service resolution,
-/// which provides equivalent behavior for HLE services.
 pub fn connect_to_named_port(system: &System, out: &mut Handle, user_name: u64) -> ResultCode {
     let name = match read_port_name(system, user_name) {
         Ok(n) => n,
@@ -101,77 +92,96 @@ pub fn connect_to_named_port(system: &System, out: &mut Handle, user_name: u64) 
     let kernel = system.kernel().expect("kernel not initialized");
     let service_manager = system.service_manager().unwrap();
 
-    // Try KObjectName first (upstream path), then fall back to ServiceManager.
-    let session_handler = if let Some(gd) = kernel.object_name_global_data() {
-        if let Some(_obj_id) = gd.find(&name) {
-            // Object found in kernel namespace — get handler from service manager.
-            service_manager.lock().unwrap().get_service(&name)
-        } else {
-            // Not in kernel namespace — try service manager directly.
-            service_manager.lock().unwrap().get_service(&name)
-        }
-    } else {
-        service_manager.lock().unwrap().get_service(&name)
+    let Some(object_name_data) = kernel.object_name_global_data() else {
+        log::error!("  ConnectToNamedPort: kernel object name registry unavailable");
+        return RESULT_NOT_FOUND;
     };
 
-    let Some(session_handler) = session_handler else {
+    let Some(named_object_id) = object_name_data.find(&name).map(|id| id as u64) else {
         log::error!("  ConnectToNamedPort: service \"{}\" not found", name);
         return RESULT_NOT_FOUND;
     };
-    log::info!(
-        "  ConnectToNamedPort: found service handler for \"{}\"",
-        name
-    );
 
-    let session_object_id = system.kernel().unwrap().create_new_object_id() as u64;
-    let client_session_object_id = system.kernel().unwrap().create_new_object_id() as u64;
+    let Some(port) = kernel.get_client_port_by_object_id(named_object_id) else {
+        log::error!(
+            "  ConnectToNamedPort: named object \"{}\" does not resolve to a client port",
+            name
+        );
+        return RESULT_NOT_FOUND;
+    };
 
-    let request_manager = Arc::new(Mutex::new(SessionRequestManager::new()));
-    request_manager
-        .lock()
-        .unwrap()
-        .set_session_handler(session_handler);
-
-    let session = Arc::new(Mutex::new(KSession::new()));
-    session.lock().unwrap().initialize(None, 0);
-
-    let client_session = Arc::new(Mutex::new(KClientSession::new()));
-    client_session
-        .lock()
-        .unwrap()
-        .initialize_with_manager(session_object_id, request_manager);
-
+    let handler = service_manager.lock().unwrap().get_service(&name);
     let mut process = system.current_process_arc().lock().unwrap();
-    process.register_session_object(session_object_id, session);
-    process.register_client_session_object(client_session_object_id, client_session);
+    let reserved_handle = match process.handle_table.reserve() {
+        Ok(handle) => handle,
+        Err(_) => return RESULT_OUT_OF_HANDLES,
+    };
 
-    match process.handle_table.add(client_session_object_id) {
-        Ok(handle) => {
-            *out = handle;
-            log::info!(
-                "  ConnectToNamedPort(\"{}\") -> success, handle={:#x}",
-                name,
-                handle
+    let (server_session_object_id, client_session_object_id) = {
+        let mut port_guard = port.lock().unwrap();
+        if port_guard.is_light() {
+            process.handle_table.unreserve(reserved_handle);
+            log::warn!(
+                "  ConnectToNamedPort(\"{}\"): light ports not yet ported",
+                name
             );
-            RESULT_SUCCESS
+            return RESULT_INVALID_HANDLE;
         }
-        Err(_) => {
-            log::error!("  ConnectToNamedPort(\"{}\"): out of handles", name);
-            RESULT_OUT_OF_HANDLES
+
+        let (server_session_object_id, client_session_object_id) = match port_guard
+            .client
+            .create_session(&mut process, kernel, port_guard.get_name())
+        {
+            Ok(ids) => ids,
+            Err(result) => {
+                process.handle_table.unreserve(reserved_handle);
+                return result;
+            }
+        };
+
+        let enqueue_result = port_guard.enqueue_session(server_session_object_id);
+        if enqueue_result.is_error() {
+            process.handle_table.unreserve(reserved_handle);
+            process.unregister_client_session_object_by_object_id(client_session_object_id);
+            process.unregister_session_object_by_object_id(server_session_object_id);
+            return enqueue_result;
+        }
+
+        (server_session_object_id, client_session_object_id)
+    };
+
+    if let Some(handler) = handler {
+        let manager = Arc::new(Mutex::new(SessionRequestManager::new()));
+        manager.lock().unwrap().set_session_handler(handler);
+        if let Some(client_session) =
+            process.get_client_session_by_object_id(client_session_object_id)
+        {
+            client_session
+                .lock()
+                .unwrap()
+                .initialize_with_manager(server_session_object_id, manager);
         }
     }
+
+    if !process
+        .handle_table
+        .register(reserved_handle, client_session_object_id)
+    {
+        process.handle_table.unreserve(reserved_handle);
+        process.unregister_client_session_object_by_object_id(client_session_object_id);
+        process.unregister_session_object_by_object_id(server_session_object_id);
+        return RESULT_OUT_OF_HANDLES;
+    }
+
+    *out = reserved_handle;
+    log::info!(
+        "  ConnectToNamedPort(\"{}\") -> success, handle={:#x}",
+        name,
+        reserved_handle
+    );
+    RESULT_SUCCESS
 }
 
-/// Creates a port.
-///
-/// Upstream: Creates KPort, initializes it, registers it, adds server and client
-/// ports to the handle table.
-///
-/// Requires typed registries on KProcess for KPort/KServerPort/KClientPort objects.
-/// These registries do not yet exist. Upstream types needed:
-///   - KPort (exists in Rust)
-///   - KProcess needs: register_port_object, register_server_port_object, register_client_port_object
-///   - KHandleTable needs: ability to resolve typed objects
 pub fn create_port(
     system: &System,
     out_server: &mut Handle,
@@ -187,25 +197,29 @@ pub fn create_port(
 
     let kernel = system.kernel().expect("kernel not initialized");
 
-    // Create a new port.
-    let mut port = KPort::new();
-    port.initialize(max_sessions, is_light, name as usize);
-
-    // Upstream: KPort::Register(kernel, port)
-    // Upstream: handle_table.Add(out_client, &port.GetClientPort())
-    // Upstream: handle_table.Add(out_server, &port.GetServerPort())
+    let port = Arc::new(Mutex::new(KPort::new()));
+    port.lock()
+        .unwrap()
+        .initialize(max_sessions, is_light, name as usize);
 
     let client_port_object_id = kernel.create_new_object_id() as u64;
     let server_port_object_id = kernel.create_new_object_id() as u64;
 
     let mut process = system.current_process_arc().lock().unwrap();
-
-    // KProcess needs register_client_port_object / register_server_port_object.
-    // Without these, the created port handles cannot be resolved by ConnectToPort.
+    process.register_client_port_object(client_port_object_id, port.clone());
+    process.register_server_port_object(server_port_object_id, port);
+    kernel.register_kernel_object(client_port_object_id);
+    kernel.register_kernel_object(server_port_object_id);
 
     match process.handle_table.add(client_port_object_id) {
         Ok(handle) => *out_client = handle,
-        Err(_) => return RESULT_OUT_OF_HANDLES,
+        Err(_) => {
+            process.unregister_client_port_object_by_object_id(client_port_object_id);
+            process.unregister_server_port_object_by_object_id(server_port_object_id);
+            kernel.unregister_kernel_object(client_port_object_id);
+            kernel.unregister_kernel_object(server_port_object_id);
+            return RESULT_OUT_OF_HANDLES;
+        }
     }
 
     match process.handle_table.add(server_port_object_id) {
@@ -213,55 +227,78 @@ pub fn create_port(
         Err(_) => {
             // Clean up on failure — upstream: ON_RESULT_FAILURE { handle_table.Remove(*out_client); }
             process.handle_table.remove(*out_client);
+            process.unregister_client_port_object_by_object_id(client_port_object_id);
+            process.unregister_server_port_object_by_object_id(server_port_object_id);
+            kernel.unregister_kernel_object(client_port_object_id);
+            kernel.unregister_kernel_object(server_port_object_id);
             return RESULT_OUT_OF_HANDLES;
         }
     }
 
-    log::warn!(
-        "svc::CreatePort: KProcess lacks port object registries. \
-         Server handle=0x{:08X}, client handle=0x{:08X} created but objects cannot be resolved. \
-         Upstream needs: register_port_object, register_server_port_object, register_client_port_object",
-        *out_server, *out_client
-    );
-
     RESULT_SUCCESS
 }
 
-/// Connects to a port via its handle.
-///
-/// Upstream: Gets KClientPort from handle table, reserves a handle, creates a session
-/// (light or normal), registers in handle table.
-///
-/// Requires typed registry for KClientPort on KProcess.
-/// Upstream type: KClientPort, method: CreateSession / CreateLightSession
 pub fn connect_to_port(system: &System, out: &mut Handle, port: Handle) -> ResultCode {
     log::debug!("svc::ConnectToPort called, port_handle=0x{:08X}", port);
 
-    let process = system.current_process_arc().lock().unwrap();
-    let Some(_object_id) = process.handle_table.get_object(port) else {
+    let kernel = system.kernel().expect("kernel not initialized");
+    let mut process = system.current_process_arc().lock().unwrap();
+    let Some(object_id) = process.handle_table.get_object(port) else {
         return RESULT_INVALID_HANDLE;
     };
 
-    // Upstream:
-    //   KScopedAutoObject client_port = handle_table.GetObject<KClientPort>(port);
-    //   R_UNLESS(client_port.IsNotNull(), ResultInvalidHandle);
-    //   R_TRY(handle_table.Reserve(out));
-    //   ON_RESULT_FAILURE { handle_table.Unreserve(*out); };
-    //   if (client_port->IsLight()) {
-    //       R_TRY(client_port->CreateLightSession(&session));
-    //   } else {
-    //       R_TRY(client_port->CreateSession(&session));
-    //   }
-    //   handle_table.Register(*out, session);
-    //   session->Close();
+    let Some(port) = process.get_client_port_by_object_id(object_id) else {
+        return RESULT_INVALID_HANDLE;
+    };
 
-    // KProcess needs: get_client_port_by_object_id(object_id) -> Option<Arc<Mutex<KClientPort>>>
-    log::warn!(
-        "svc::ConnectToPort: KProcess lacks client_port registry \
-         (needs get_client_port_by_object_id). \
-         Upstream type: KClientPort, methods: CreateSession / CreateLightSession"
-    );
-    RESULT_INVALID_HANDLE
+    let reserved_handle = match process.handle_table.reserve() {
+        Ok(handle) => handle,
+        Err(_) => return RESULT_OUT_OF_HANDLES,
+    };
+
+    let (server_session_object_id, client_session_object_id) = {
+        let mut port_guard = port.lock().unwrap();
+        if port_guard.is_light() {
+            process.handle_table.unreserve(reserved_handle);
+            log::warn!("svc::ConnectToPort: light-session path not yet ported");
+            return RESULT_INVALID_HANDLE;
+        }
+
+        let port_name = port_guard.get_name();
+        let (server_session_object_id, client_session_object_id) = match port_guard
+            .client
+            .create_session(&mut process, kernel, port_name)
+        {
+            Ok(ids) => ids,
+            Err(result) => {
+                process.handle_table.unreserve(reserved_handle);
+                return result;
+            }
+        };
+
+        let enqueue_result = port_guard.enqueue_session(server_session_object_id);
+        if enqueue_result.is_error() {
+            process.handle_table.unreserve(reserved_handle);
+            process.unregister_client_session_object_by_object_id(client_session_object_id);
+            process.unregister_session_object_by_object_id(server_session_object_id);
+            return enqueue_result;
+        }
+
+        (server_session_object_id, client_session_object_id)
+    };
+
+    if !process
+        .handle_table
+        .register(reserved_handle, client_session_object_id)
+    {
+        process.handle_table.unreserve(reserved_handle);
+        process.unregister_client_session_object_by_object_id(client_session_object_id);
+        process.unregister_session_object_by_object_id(server_session_object_id);
+        return RESULT_OUT_OF_HANDLES;
+    }
+
+    *out = reserved_handle;
+    RESULT_SUCCESS
 }
 
 /// Manages a named port (create or destroy).
@@ -287,16 +324,16 @@ pub fn manage_named_port(
 
     if max_sessions > 0 {
         let kernel = system.kernel().expect("kernel not initialized");
-
-        // Create a new port.
-        let mut port = KPort::new();
-        port.initialize(max_sessions, false, 0);
-
-        // Upstream: KPort::Register(kernel, port)
+        let port = Arc::new(Mutex::new(KPort::new()));
+        port.lock().unwrap().initialize(max_sessions, false, 0);
         let server_port_object_id = kernel.create_new_object_id() as u64;
         let client_port_object_id = kernel.create_new_object_id() as u64;
 
         let mut process = system.current_process_arc().lock().unwrap();
+        process.register_server_port_object(server_port_object_id, port.clone());
+        process.register_client_port_object(client_port_object_id, port);
+        kernel.register_kernel_object(server_port_object_id);
+        kernel.register_kernel_object(client_port_object_id);
 
         // Add server to handle table.
         match process.handle_table.add(server_port_object_id) {
@@ -314,6 +351,10 @@ pub fn manage_named_port(
                 // Name already exists — clean up server handle.
                 // Upstream: ON_RESULT_FAILURE { handle_table.Remove(*out_server_handle); }
                 process.handle_table.remove(*out_server_handle);
+                process.unregister_server_port_object_by_object_id(server_port_object_id);
+                process.unregister_client_port_object_by_object_id(client_port_object_id);
+                kernel.unregister_kernel_object(server_port_object_id);
+                kernel.unregister_kernel_object(client_port_object_id);
                 return RESULT_INVALID_STATE;
             }
         }
@@ -339,6 +380,10 @@ pub fn manage_named_port(
                 if object_name_data.delete(obj, &name).is_err() {
                     return RESULT_NOT_FOUND;
                 }
+                let object_id = obj as u64;
+                let mut process = system.current_process_arc().lock().unwrap();
+                process.unregister_client_port_object_by_object_id(object_id);
+                kernel.unregister_kernel_object(object_id);
             } else {
                 return RESULT_NOT_FOUND;
             }
@@ -347,5 +392,142 @@ pub fn manage_named_port(
         log::info!("svc::ManageNamedPort(delete): name=\"{}\"", name);
 
         RESULT_SUCCESS
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::hle::kernel::k_process::KProcess;
+    use crate::hle::kernel::k_thread::KThread;
+
+    fn test_system() -> System {
+        let mut system = System::new_for_test();
+
+        let process = Arc::new(Mutex::new(KProcess::new()));
+        {
+            let mut process_guard = process.lock().unwrap();
+            process_guard.process_id = 1;
+            process_guard.initialize_handle_table();
+        }
+
+        let current_thread = Arc::new(Mutex::new(KThread::new()));
+        {
+            let mut thread = current_thread.lock().unwrap();
+            thread.thread_id = 1;
+            thread.object_id = 1;
+        }
+        process
+            .lock()
+            .unwrap()
+            .register_thread_object(current_thread);
+
+        let scheduler = Arc::new(Mutex::new(
+            crate::hle::kernel::k_scheduler::KScheduler::new(0),
+        ));
+        scheduler.lock().unwrap().initialize(1, 0, 0);
+        let shared_memory = process.lock().unwrap().get_shared_memory();
+
+        system.set_current_process_arc(process);
+        system.set_scheduler_arc(scheduler);
+        system.set_shared_process_memory(shared_memory);
+        system.set_runtime_program_id(1);
+        system.set_runtime_64bit(false);
+        system
+    }
+
+    #[test]
+    fn create_port_registers_resolvable_client_and_server_handles() {
+        let system = test_system();
+        let mut server = 0;
+        let mut client = 0;
+
+        assert_eq!(
+            create_port(&system, &mut server, &mut client, 4, false, 0),
+            RESULT_SUCCESS
+        );
+
+        let process = system.current_process_arc().lock().unwrap();
+        let server_object_id = process.handle_table.get_object(server).unwrap();
+        let client_object_id = process.handle_table.get_object(client).unwrap();
+        assert!(process
+            .get_server_port_by_object_id(server_object_id)
+            .is_some());
+        assert!(process
+            .get_client_port_by_object_id(client_object_id)
+            .is_some());
+    }
+
+    #[test]
+    fn connect_to_port_creates_client_session_and_enqueues_server_session() {
+        let system = test_system();
+        let mut server = 0;
+        let mut client = 0;
+
+        assert_eq!(
+            create_port(&system, &mut server, &mut client, 4, false, 0x55),
+            RESULT_SUCCESS
+        );
+
+        let mut session_handle = 0;
+        assert_eq!(
+            connect_to_port(&system, &mut session_handle, client),
+            RESULT_SUCCESS
+        );
+
+        let process = system.current_process_arc().lock().unwrap();
+        let client_session_object_id = process.handle_table.get_object(session_handle).unwrap();
+        let client_session = process
+            .get_client_session_by_object_id(client_session_object_id)
+            .unwrap();
+        let server_session_object_id = client_session.lock().unwrap().get_parent_id().unwrap();
+
+        let server_port_object_id = process.handle_table.get_object(server).unwrap();
+        let port = process
+            .get_server_port_by_object_id(server_port_object_id)
+            .unwrap();
+        assert_eq!(
+            port.lock().unwrap().server.accept_session(),
+            Some(server_session_object_id)
+        );
+    }
+
+    #[test]
+    fn connect_to_named_port_resolves_named_client_port_via_kernel_object_name() {
+        let system = test_system();
+        let kernel = system.kernel().unwrap();
+        let port = Arc::new(Mutex::new(KPort::new()));
+        port.lock().unwrap().initialize(4, false, 0);
+
+        let client_port_object_id = 0x1234_u64;
+        {
+            let mut process = system.current_process_arc().lock().unwrap();
+            process.register_client_port_object(client_port_object_id, port);
+        }
+        kernel.register_kernel_object(client_port_object_id);
+        kernel
+            .object_name_global_data()
+            .unwrap()
+            .new_from_name(client_port_object_id as usize, "sm:")
+            .unwrap();
+
+        let name_addr = 0x5000;
+        system
+            .shared_process_memory()
+            .write()
+            .unwrap()
+            .write_block(name_addr, b"sm:\0");
+
+        let mut handle = 0;
+        assert_eq!(
+            connect_to_named_port(&system, &mut handle, name_addr),
+            RESULT_SUCCESS
+        );
+
+        let process = system.current_process_arc().lock().unwrap();
+        let client_session_object_id = process.handle_table.get_object(handle).unwrap();
+        assert!(process
+            .get_client_session_by_object_id(client_session_object_id)
+            .is_some());
     }
 }

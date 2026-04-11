@@ -6,10 +6,10 @@
 //!
 //! TimeZoneBinary: mount and read operations for timezone data from the system archive.
 
-use crate::file_sys::romfs;
 use crate::file_sys::nca_metadata::ContentRecordType;
-use crate::file_sys::system_archive::system_archive;
 use crate::file_sys::registered_cache::ContentProvider;
+use crate::file_sys::romfs;
+use crate::file_sys::system_archive::system_archive;
 use crate::file_sys::vfs::vfs_types::VirtualDir;
 use crate::hle::result::{ResultCode, RESULT_SUCCESS, RESULT_UNKNOWN};
 use crate::hle::service::psc::time::common::{LocationName, RuleVersion};
@@ -101,7 +101,8 @@ impl TimeZoneBinary {
         }
 
         if self.time_zone_binary_romfs.is_none() {
-            if let Some(romfs_file) = system_archive::synthesize_system_archive(TIME_ZONE_BINARY_ID) {
+            if let Some(romfs_file) = system_archive::synthesize_system_archive(TIME_ZONE_BINARY_ID)
+            {
                 self.time_zone_binary_romfs = romfs::extract_romfs(Some(romfs_file));
             }
         }
@@ -155,7 +156,9 @@ impl TimeZoneBinary {
         let Some(path) = self.get_time_zone_path(name) else {
             return false;
         };
-        romfs.get_file_relative(&path).is_some_and(|file| file.get_size() != 0)
+        romfs
+            .get_file_relative(&path)
+            .is_some_and(|file| file.get_size() != 0)
     }
 
     /// Get the total number of timezone locations.
@@ -210,7 +213,9 @@ impl TimeZoneBinary {
         index: u32,
     ) -> Result<Vec<LocationName>, ResultCode> {
         let path = self.get_list_path().ok_or(self.mount_result)?;
-        let data = self.read(self.time_zone_scratch_space.len(), &path)?.to_vec();
+        let data = self
+            .read(self.time_zone_scratch_space.len(), &path)?
+            .to_vec();
         let text = std::str::from_utf8(&data).map_err(|_| RESULT_FAILED)?;
         let mut names = Vec::new();
         for line in text.lines() {

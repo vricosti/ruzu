@@ -6,12 +6,12 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 
+use crate::file_sys::errors::RESULT_TARGET_NOT_FOUND;
+use crate::file_sys::fs_save_data_types::{SaveDataAttribute, SaveDataSpaceId};
 use crate::file_sys::nca_metadata::ContentRecordType;
 use crate::file_sys::patch_manager::PatchManager;
 use crate::file_sys::registered_cache::ContentProviderUnion;
 use crate::file_sys::romfs_factory::StorageId;
-use crate::file_sys::errors::RESULT_TARGET_NOT_FOUND;
-use crate::file_sys::fs_save_data_types::{SaveDataAttribute, SaveDataSpaceId};
 use crate::file_sys::vfs::vfs_types::VirtualDir;
 use crate::file_sys::vfs::vfs_types::VirtualFile;
 use crate::file_sys::vfs::vfs_vector::VectorVfsDirectory;
@@ -494,14 +494,17 @@ impl FspSrv {
             .lock()
             .unwrap()
             .as_ref()
-            .and_then(|controller| controller.open_romfs(title_id, storage_id, ContentRecordType::Data));
+            .and_then(|controller| {
+                controller.open_romfs(title_id, storage_id, ContentRecordType::Data)
+            });
 
         if let Some(data) = data {
             let storage = match (service.fsc.as_ref(), service.content_provider.as_ref()) {
                 (Some(fs_controller), Some(content_provider)) => {
                     let fs_controller = fs_controller.lock().unwrap();
                     let content_provider = content_provider.lock().unwrap();
-                    let patch_manager = PatchManager::new(title_id, &fs_controller, &*content_provider);
+                    let patch_manager =
+                        PatchManager::new(title_id, &fs_controller, &*content_provider);
                     patch_manager.patch_romfs(data, ContentRecordType::Data, None, true)
                 }
                 _ => data,
@@ -511,7 +514,9 @@ impl FspSrv {
         }
 
         // Try synthesizing the system archive (matches upstream fallback path)
-        if let Some(archive) = crate::file_sys::system_archive::system_archive::synthesize_system_archive(title_id) {
+        if let Some(archive) =
+            crate::file_sys::system_archive::system_archive::synthesize_system_archive(title_id)
+        {
             log::info!(
                 "FspSrv::OpenDataStorageByDataId: synthesized archive for title_id={:#x}",
                 title_id

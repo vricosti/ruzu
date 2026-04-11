@@ -75,7 +75,9 @@ fn collect_time_zone_names(dir: &Path, prefix: &str, out_names: &mut Vec<String>
         return;
     };
 
-    let mut children: Vec<PathBuf> = entries.filter_map(|entry| entry.ok().map(|e| e.path())).collect();
+    let mut children: Vec<PathBuf> = entries
+        .filter_map(|entry| entry.ok().map(|e| e.path()))
+        .collect();
     children.sort();
 
     for child in children {
@@ -103,7 +105,9 @@ fn build_directory_from_host(path: &Path, name: &str, allow_nested: bool) -> Opt
     let Ok(entries) = fs::read_dir(path) else {
         return None;
     };
-    let mut children: Vec<PathBuf> = entries.filter_map(|entry| entry.ok().map(|e| e.path())).collect();
+    let mut children: Vec<PathBuf> = entries
+        .filter_map(|entry| entry.ok().map(|e| e.path()))
+        .collect();
     children.sort();
 
     for child in children {
@@ -177,7 +181,9 @@ pub fn time_zone_binary() -> Option<VirtualDir> {
     let Ok(entries) = fs::read_dir(host_root) else {
         return None;
     };
-    let mut children: Vec<PathBuf> = entries.filter_map(|entry| entry.ok().map(|e| e.path())).collect();
+    let mut children: Vec<PathBuf> = entries
+        .filter_map(|entry| entry.ok().map(|e| e.path()))
+        .collect();
     children.sort();
 
     for child in children {

@@ -381,9 +381,7 @@ pub fn convert_to_application_language(language_code: LanguageCode) -> Option<Ap
         LanguageCode::Pt => Some(ApplicationLanguage::Portuguese),
         LanguageCode::Ru => Some(ApplicationLanguage::Russian),
         LanguageCode::Ko => Some(ApplicationLanguage::Korean),
-        LanguageCode::ZhTw | LanguageCode::ZhHant => {
-            Some(ApplicationLanguage::TraditionalChinese)
-        }
+        LanguageCode::ZhTw | LanguageCode::ZhHant => Some(ApplicationLanguage::TraditionalChinese),
         LanguageCode::ZhCn | LanguageCode::ZhHans => Some(ApplicationLanguage::SimplifiedChinese),
         LanguageCode::PtBr => Some(ApplicationLanguage::BrazilianPortuguese),
         _ => None,

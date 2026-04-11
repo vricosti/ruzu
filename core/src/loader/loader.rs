@@ -20,7 +20,8 @@ use crate::hle::service::filesystem::filesystem::FileSystemController;
 /// the content provider (for update-NCA lookups) and the filesystem controller
 /// (for process registration).
 pub struct System {
-    pub content_provider: Option<Arc<Mutex<crate::file_sys::registered_cache::ContentProviderUnion>>>,
+    pub content_provider:
+        Option<Arc<Mutex<crate::file_sys::registered_cache::ContentProviderUnion>>>,
     pub filesystem_controller: Option<Arc<Mutex<FileSystemController>>>,
 }
 

@@ -207,7 +207,9 @@ impl SinkStream {
     }
 
     pub fn set_ring_size(&mut self, ring_size: u32) {
-        self.release.max_queue_size.store(ring_size, Ordering::Release);
+        self.release
+            .max_queue_size
+            .store(ring_size, Ordering::Release);
     }
 
     pub fn append_buffer(&mut self, mut buffer: SinkBuffer, samples: &[i16]) {

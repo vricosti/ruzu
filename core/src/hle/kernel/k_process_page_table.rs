@@ -320,6 +320,85 @@ impl KProcessPageTable {
             .unlock_for_ipc_user_buffer(addr.get() as usize, size)
     }
 
+    pub fn setup_for_ipc_client(
+        &mut self,
+        addr: KProcessAddress,
+        size: usize,
+        test_perm: KMemoryPermission,
+        dst_state: super::k_memory_block::KMemoryState,
+    ) -> u32 {
+        self.base
+            .setup_for_ipc_client(addr.get() as usize, size, test_perm, dst_state)
+    }
+
+    pub fn setup_for_ipc(
+        &mut self,
+        out_addr: &mut KProcessAddress,
+        size: usize,
+        src_addr: KProcessAddress,
+        src_page_table: &mut KProcessPageTable,
+        test_perm: KMemoryPermission,
+        dst_state: super::k_memory_block::KMemoryState,
+        send: bool,
+    ) -> u32 {
+        let mut out = out_addr.get() as usize;
+        let rc = self.base.setup_for_ipc(
+            &mut out,
+            size,
+            src_addr.get() as usize,
+            &mut src_page_table.base,
+            test_perm,
+            dst_state,
+            send,
+        );
+        *out_addr = KProcessAddress::new(out as u64);
+        rc
+    }
+
+    pub fn setup_for_ipc_server(
+        &mut self,
+        out_addr: &mut KProcessAddress,
+        size: usize,
+        src_addr: KProcessAddress,
+        test_perm: KMemoryPermission,
+        dst_state: super::k_memory_block::KMemoryState,
+        src_table: &mut KProcessPageTable,
+        send: bool,
+    ) -> u32 {
+        let mut out = out_addr.get() as usize;
+        let rc = self.base.setup_for_ipc_server(
+            &mut out,
+            size,
+            src_addr.get() as usize,
+            test_perm,
+            dst_state,
+            &mut src_table.base,
+            send,
+        );
+        *out_addr = KProcessAddress::new(out as u64);
+        rc
+    }
+
+    pub fn cleanup_for_ipc_server(
+        &mut self,
+        addr: KProcessAddress,
+        size: usize,
+        dst_state: super::k_memory_block::KMemoryState,
+    ) -> u32 {
+        self.base
+            .cleanup_for_ipc_server(addr.get() as usize, size, dst_state)
+    }
+
+    pub fn cleanup_for_ipc_client(
+        &mut self,
+        addr: KProcessAddress,
+        size: usize,
+        dst_state: super::k_memory_block::KMemoryState,
+    ) -> u32 {
+        self.base
+            .cleanup_for_ipc_client(addr.get() as usize, size, dst_state)
+    }
+
     // -- Code memory mapping --
 
     /// Map code memory: copies src pages to dst, reprotects src.

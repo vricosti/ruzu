@@ -4,7 +4,6 @@
 ///   [  T.TTTTTT] SCHED core=C from_tid=F to_tid=T
 ///   [  T.TTTTTT] SVC_IN  imm=0xNN core=C tid=T args=[...]
 ///   [  T.TTTTTT] SVC_OUT imm=0xNN args=[...]
-
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::OnceLock;
 use std::time::Instant;

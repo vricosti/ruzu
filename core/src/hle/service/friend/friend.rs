@@ -275,10 +275,7 @@ impl IFriendService {
         rb.push_bool(available);
     }
 
-    fn get_blocked_user_list_ids_handler(
-        this: &dyn ServiceFramework,
-        ctx: &mut HLERequestContext,
-    ) {
+    fn get_blocked_user_list_ids_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         let this = Self::cast(this);
         let count = this.get_blocked_user_list_ids();
         let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
@@ -334,10 +331,7 @@ impl IFriendService {
         rb.push_u32(count);
     }
 
-    fn get_newly_friend_count_handler(
-        this: &dyn ServiceFramework,
-        ctx: &mut HLERequestContext,
-    ) {
+    fn get_newly_friend_count_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         let count = Self::cast(this).get_newly_friend_count();
         let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
         rb.push_result(RESULT_SUCCESS);
@@ -428,7 +422,11 @@ impl INotificationService {
                     Some(Self::get_event_handler),
                     "GetEvent",
                 ),
-                (notification_commands::CLEAR, Some(Self::clear_handler), "Clear"),
+                (
+                    notification_commands::CLEAR,
+                    Some(Self::clear_handler),
+                    "Clear",
+                ),
                 (notification_commands::POP, Some(Self::pop_handler), "Pop"),
             ]),
             handlers_tipc: BTreeMap::new(),

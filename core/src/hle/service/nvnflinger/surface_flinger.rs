@@ -67,7 +67,11 @@ impl SurfaceFlinger {
     }
 
     pub fn add_display(&self, display_id: u64) {
-        self.inner.lock().unwrap().displays.push(Display::new(display_id));
+        self.inner
+            .lock()
+            .unwrap()
+            .displays
+            .push(Display::new(display_id));
     }
 
     pub fn remove_display(&self, display_id: u64) {
@@ -96,11 +100,11 @@ impl SurfaceFlinger {
             .nvdrv
             .get_disp_device(self.disp_fd)
             .expect("nvdisp_disp0 device must be open while SurfaceFlinger lives");
-        *out_swap_interval = self
-            .composer
-            .lock()
-            .unwrap()
-            .compose_locked(out_compose_speed_scale, display, &device) as i32;
+        *out_swap_interval =
+            self.composer
+                .lock()
+                .unwrap()
+                .compose_locked(out_compose_speed_scale, display, &device) as i32;
         true
     }
 
@@ -168,13 +172,17 @@ impl SurfaceFlinger {
     }
 
     pub fn set_layer_visibility(&self, consumer_binder_id: i32, visible: bool) {
-        if let Some(layer) = Self::find_layer(&self.inner.lock().unwrap().layers, consumer_binder_id) {
+        if let Some(layer) =
+            Self::find_layer(&self.inner.lock().unwrap().layers, consumer_binder_id)
+        {
             layer.lock().unwrap().visible = visible;
         }
     }
 
     pub fn set_layer_blending(&self, consumer_binder_id: i32, blending: LayerBlending) {
-        if let Some(layer) = Self::find_layer(&self.inner.lock().unwrap().layers, consumer_binder_id) {
+        if let Some(layer) =
+            Self::find_layer(&self.inner.lock().unwrap().layers, consumer_binder_id)
+        {
             layer.lock().unwrap().blending = blending;
         }
     }

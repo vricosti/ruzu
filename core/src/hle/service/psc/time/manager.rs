@@ -62,28 +62,27 @@ impl TimeManager {
         let steady_clock_source_id = Arc::new(Mutex::new([0u8; 16]));
 
         // Helper to create a steady clock time point callback from the tick source.
-        let make_time_point_cb = |
-            ticks: Arc<Box<dyn Fn() -> i64 + Send + Sync>>,
-            clock_source_id: Arc<Mutex<super::common::ClockSourceId>>,
-        | {
-            Box::new(move || {
-                let ticks_ns = ticks();
-                let current_time_s = ticks_ns / 1_000_000_000;
-                Ok(
-                    crate::hle::service::psc::time::common::SteadyClockTimePoint {
-                        time_point: current_time_s,
-                        clock_source_id: *clock_source_id.lock().unwrap(),
-                    },
-                )
-            })
-                as Box<
-                    dyn Fn() -> Result<
-                            crate::hle::service::psc::time::common::SteadyClockTimePoint,
-                            crate::hle::result::ResultCode,
-                        > + Send
-                        + Sync,
-                >
-        };
+        let make_time_point_cb =
+            |ticks: Arc<Box<dyn Fn() -> i64 + Send + Sync>>,
+             clock_source_id: Arc<Mutex<super::common::ClockSourceId>>| {
+                Box::new(move || {
+                    let ticks_ns = ticks();
+                    let current_time_s = ticks_ns / 1_000_000_000;
+                    Ok(
+                        crate::hle::service::psc::time::common::SteadyClockTimePoint {
+                            time_point: current_time_s,
+                            clock_source_id: *clock_source_id.lock().unwrap(),
+                        },
+                    )
+                })
+                    as Box<
+                        dyn Fn() -> Result<
+                                crate::hle::service::psc::time::common::SteadyClockTimePoint,
+                                crate::hle::result::ResultCode,
+                            > + Send
+                            + Sync,
+                    >
+            };
 
         // StandardSteadyClockCore
         let standard_steady_clock = StandardSteadyClockCore::new({
@@ -98,22 +97,20 @@ impl TimeManager {
         });
 
         // System clock cores — each gets a time point callback from the tick source
-        let standard_local_system_clock =
-            StandardLocalSystemClockCore::new(make_time_point_cb(
-                Arc::clone(&get_ticks_ns),
-                Arc::clone(&steady_clock_source_id),
-            ));
+        let standard_local_system_clock = StandardLocalSystemClockCore::new(make_time_point_cb(
+            Arc::clone(&get_ticks_ns),
+            Arc::clone(&steady_clock_source_id),
+        ));
         let standard_network_system_clock =
             StandardNetworkSystemClockCore::new(make_time_point_cb(
                 Arc::clone(&get_ticks_ns),
                 Arc::clone(&steady_clock_source_id),
             ));
         let standard_user_system_clock = StandardUserSystemClockCore::new();
-        let ephemeral_network_clock =
-            EphemeralNetworkSystemClockCore::new(make_time_point_cb(
-                Arc::clone(&get_ticks_ns),
-                Arc::clone(&steady_clock_source_id),
-            ));
+        let ephemeral_network_clock = EphemeralNetworkSystemClockCore::new(make_time_point_cb(
+            Arc::clone(&get_ticks_ns),
+            Arc::clone(&steady_clock_source_id),
+        ));
 
         // TimeZone
         let time_zone = TimeZone::new();

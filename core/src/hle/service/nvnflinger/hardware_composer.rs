@@ -104,15 +104,17 @@ impl HardwareComposer {
                     stride: graphic_buffer.get_stride(),
                     z_index: 0,
                     blending: layer_guard.blending,
-                    transform: super::buffer_transform_flags::BufferTransformFlags::from_bits_retain(
-                        item.transform.bits(),
-                    ),
+                    transform:
+                        super::buffer_transform_flags::BufferTransformFlags::from_bits_retain(
+                            item.transform.bits(),
+                        ),
                     crop_rect: item.crop,
                     acquire_fence: item.fence,
                 });
             }
 
-            let item_swap_interval = normalize_swap_interval(Some(out_speed_scale), item.swap_interval);
+            let item_swap_interval =
+                normalize_swap_interval(Some(out_speed_scale), item.swap_interval);
             swap_interval = Some(match swap_interval {
                 Some(current) => current.min(item_swap_interval),
                 None => item_swap_interval,
@@ -136,7 +138,8 @@ impl HardwareComposer {
                 continue;
             };
 
-            layer.lock()
+            layer
+                .lock()
                 .unwrap()
                 .buffer_item_consumer
                 .release_buffer(&framebuffer.item, &Fence::no_fence());
@@ -156,19 +159,23 @@ impl HardwareComposer {
         }
 
         if let Some(layer) = display.stack.find_layer(consumer_id) {
-            layer.lock()
+            layer
+                .lock()
                 .unwrap()
                 .buffer_item_consumer
                 .release_buffer(&framebuffer.item, &Fence::no_fence());
         }
     }
 
-    fn try_acquire_framebuffer_locked(layer: &Arc<Mutex<Layer>>, framebuffer: &mut Framebuffer) -> bool {
-        let status = layer
-            .lock()
-            .unwrap()
-            .buffer_item_consumer
-            .acquire_buffer(&mut framebuffer.item, 0, false);
+    fn try_acquire_framebuffer_locked(
+        layer: &Arc<Mutex<Layer>>,
+        framebuffer: &mut Framebuffer,
+    ) -> bool {
+        let status = layer.lock().unwrap().buffer_item_consumer.acquire_buffer(
+            &mut framebuffer.item,
+            0,
+            false,
+        );
         if status != super::status::Status::NoError {
             return false;
         }

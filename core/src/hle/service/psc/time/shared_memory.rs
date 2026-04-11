@@ -186,7 +186,9 @@ impl SharedMemory {
     }
 
     /// Get the shared owner for the underlying KSharedMemory.
-    pub fn get_k_shared_memory_arc(&self) -> Arc<crate::hle::kernel::k_shared_memory::KSharedMemory> {
+    pub fn get_k_shared_memory_arc(
+        &self,
+    ) -> Arc<crate::hle::kernel::k_shared_memory::KSharedMemory> {
         Arc::clone(&self.k_shared_memory)
     }
 

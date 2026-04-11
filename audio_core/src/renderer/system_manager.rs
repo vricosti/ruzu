@@ -45,10 +45,7 @@ impl SystemManager {
                     while active.load(Ordering::SeqCst) {
                         {
                             let systems = systems.lock();
-                            log::info!(
-                                "AudioRenderSystemManager loop systems={}",
-                                systems.len()
-                            );
+                            log::info!("AudioRenderSystemManager loop systems={}", systems.len());
                             for system in systems.iter() {
                                 system.lock().send_command_to_dsp();
                             }

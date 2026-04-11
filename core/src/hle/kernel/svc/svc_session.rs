@@ -97,37 +97,26 @@ pub fn accept_session(system: &System, out: &mut Handle, port_handle: Handle) ->
     let mut process = process_arc.lock().unwrap();
 
     // Get the server port object from the handle table.
-    let _object_id = match process.handle_table.get_object(port_handle) {
+    let object_id = match process.handle_table.get_object(port_handle) {
         Some(id) => id,
         None => {
             return RESULT_INVALID_HANDLE;
         }
     };
 
-    // Upstream: Accept a session from the server port.
-    // port->AcceptSession() returns a KServerSession or KLightServerSession.
-    // For now, create a new session and accept it.
-    let session = std::sync::Arc::new(std::sync::Mutex::new(
-        crate::hle::kernel::k_session::KSession::new(),
-    ));
-    {
-        let mut s = session.lock().unwrap();
-        s.initialize(None, 0);
-    }
+    let port = match process.get_server_port_by_object_id(object_id) {
+        Some(port) => port,
+        None => return RESULT_INVALID_HANDLE,
+    };
 
-    // Allocate a unique object ID for the accepted session.
-    static NEXT_ACCEPT_OBJ_ID: std::sync::atomic::AtomicU64 =
-        std::sync::atomic::AtomicU64::new(0xA000_0000);
-    let server_object_id = NEXT_ACCEPT_OBJ_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let Some(server_session_object_id) = port.lock().unwrap().server.accept_session() else {
+        return RESULT_INVALID_STATE;
+    };
 
-    // Add the server session to the handle table.
-    let handle = match process.handle_table.add(server_object_id) {
+    let handle = match process.handle_table.add(server_session_object_id) {
         Ok(h) => h,
         Err(_) => return RESULT_OUT_OF_HANDLES,
     };
-
-    // Store the session.
-    process.session_objects.insert(server_object_id, session);
 
     *out = handle;
     RESULT_SUCCESS

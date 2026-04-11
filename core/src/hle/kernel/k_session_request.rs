@@ -4,6 +4,7 @@
 //!
 //! KSessionRequest: represents an IPC request in flight, with buffer mappings.
 
+use super::k_memory_block::KMemoryState;
 use super::k_typed_address::KProcessAddress;
 
 /// Number of statically allocated mapping slots.
@@ -11,12 +12,23 @@ const NUM_STATIC_MAPPINGS: usize = 8;
 
 /// A single buffer mapping entry.
 /// Matches upstream `KSessionRequest::SessionMappings::Mapping`.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct Mapping {
     pub client_address: KProcessAddress,
     pub server_address: KProcessAddress,
     pub size: usize,
-    pub state: u32, // KMemoryState
+    pub state: KMemoryState,
+}
+
+impl Default for Mapping {
+    fn default() -> Self {
+        Self {
+            client_address: KProcessAddress::new(0),
+            server_address: KProcessAddress::new(0),
+            size: 0,
+            state: KMemoryState::NONE,
+        }
+    }
 }
 
 impl Mapping {
@@ -25,7 +37,7 @@ impl Mapping {
         client: KProcessAddress,
         server: KProcessAddress,
         size: usize,
-        state: u32,
+        state: KMemoryState,
     ) {
         self.client_address = client;
         self.server_address = server;
@@ -61,6 +73,9 @@ impl SessionMappings {
 
     pub fn finalize(&mut self) {
         self.dynamic_mappings.clear();
+        self.num_send = 0;
+        self.num_recv = 0;
+        self.num_exch = 0;
     }
 
     pub fn get_send_count(&self) -> usize {
@@ -81,8 +96,10 @@ impl SessionMappings {
         client: KProcessAddress,
         server: KProcessAddress,
         size: usize,
-        state: u32,
+        state: KMemoryState,
     ) -> u32 {
+        debug_assert_eq!(self.num_recv, 0);
+        debug_assert_eq!(self.num_exch, 0);
         let index = self.num_send as usize;
         self.num_send += 1;
         self.push_map(client, server, size, state, index)
@@ -94,8 +111,9 @@ impl SessionMappings {
         client: KProcessAddress,
         server: KProcessAddress,
         size: usize,
-        state: u32,
+        state: KMemoryState,
     ) -> u32 {
+        debug_assert_eq!(self.num_exch, 0);
         let index = (self.num_send + self.num_recv) as usize;
         self.num_recv += 1;
         self.push_map(client, server, size, state, index)
@@ -107,7 +125,7 @@ impl SessionMappings {
         client: KProcessAddress,
         server: KProcessAddress,
         size: usize,
-        state: u32,
+        state: KMemoryState,
     ) -> u32 {
         let index = (self.num_send + self.num_recv + self.num_exch) as usize;
         self.num_exch += 1;
@@ -119,7 +137,7 @@ impl SessionMappings {
         client: KProcessAddress,
         server: KProcessAddress,
         size: usize,
-        state: u32,
+        state: KMemoryState,
         index: usize,
     ) -> u32 {
         if index < NUM_STATIC_MAPPINGS {
@@ -167,6 +185,7 @@ impl Default for SessionMappings {
 pub struct KSessionRequest {
     pub mappings: SessionMappings,
     pub thread_id: Option<u64>,
+    pub client_process_id: Option<u64>,
     pub server_process_id: Option<u64>,
     pub event_id: Option<u64>,
     pub address: usize,
@@ -178,6 +197,7 @@ impl KSessionRequest {
         Self {
             mappings: SessionMappings::new(),
             thread_id: None,
+            client_process_id: None,
             server_process_id: None,
             event_id: None,
             address: 0,
@@ -188,6 +208,15 @@ impl KSessionRequest {
     /// Initialize the request.
     pub fn initialize(&mut self, event_id: Option<u64>, address: usize, size: usize) {
         self.mappings.initialize();
+        let current_thread = super::kernel::get_current_thread_pointer();
+        self.thread_id = current_thread
+            .as_ref()
+            .map(|thread| thread.lock().unwrap().thread_id);
+        self.client_process_id = current_thread
+            .as_ref()
+            .and_then(|thread| thread.lock().unwrap().parent.as_ref()?.upgrade())
+            .map(|process| process.lock().unwrap().process_id);
+        self.server_process_id = None;
         self.event_id = event_id;
         self.address = address;
         self.size = size;
@@ -213,6 +242,10 @@ impl KSessionRequest {
         self.server_process_id
     }
 
+    pub fn get_client_process_id(&self) -> Option<u64> {
+        self.client_process_id
+    }
+
     pub fn set_server_process(&mut self, process_id: u64) {
         self.server_process_id = Some(process_id);
     }
@@ -231,6 +264,7 @@ impl KSessionRequest {
         // Upstream: Close thread, event, and server process references.
         // Reference-counted handles are cleared here.
         self.thread_id = None;
+        self.client_process_id = None;
         self.event_id = None;
         self.server_process_id = None;
     }

@@ -1504,11 +1504,7 @@ impl IHidServer {
                     ))
                 }
             } else {
-                to_ipc_result(gesture.activate_with_aruid(
-                    &mut resource,
-                    aruid,
-                    basic_gesture_id,
-                ))
+                to_ipc_result(gesture.activate_with_aruid(&mut resource, aruid, basic_gesture_id))
             }
         } else {
             RESULT_SUCCESS

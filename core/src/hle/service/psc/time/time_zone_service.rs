@@ -149,10 +149,7 @@ impl TimeZoneService {
         }
     }
 
-    pub fn from_time_zone(
-        can_write_timezone_device_location: bool,
-        time_zone: &TimeZone,
-    ) -> Self {
+    pub fn from_time_zone(can_write_timezone_device_location: bool, time_zone: &TimeZone) -> Self {
         Self::with_time_zone(can_write_timezone_device_location, time_zone.snapshot())
     }
 

@@ -45,8 +45,7 @@ impl ILockAccessor {
             (4, Some(Self::is_locked_handler), "IsLocked"),
         ]);
 
-        let event_object_id =
-            NEXT_LOCK_ACCESSOR_EVENT_OBJECT_ID.fetch_add(1, Ordering::Relaxed);
+        let event_object_id = NEXT_LOCK_ACCESSOR_EVENT_OBJECT_ID.fetch_add(1, Ordering::Relaxed);
         let readable_event_object_id =
             NEXT_LOCK_ACCESSOR_EVENT_OBJECT_ID.fetch_add(1, Ordering::Relaxed);
 

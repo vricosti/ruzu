@@ -288,7 +288,8 @@ impl IApplicationFunctions {
         }
 
         let read_only = IReadOnlyApplicationControlDataInterface::new(self.system);
-        let application_language = read_only.get_application_desired_language(supported_languages)?;
+        let application_language =
+            read_only.get_application_desired_language(supported_languages)?;
         read_only.convert_application_language_to_language_code(application_language)
     }
 
@@ -349,7 +350,10 @@ impl IApplicationFunctions {
         rb.push_result(RESULT_SUCCESS);
     }
 
-    fn push_interface_response(ctx: &mut HLERequestContext, object: Arc<dyn SessionRequestHandler>) {
+    fn push_interface_response(
+        ctx: &mut HLERequestContext,
+        object: Arc<dyn SessionRequestHandler>,
+    ) {
         let is_domain = ctx
             .get_manager()
             .map_or(false, |manager| manager.lock().unwrap().is_domain());
@@ -368,8 +372,14 @@ impl IApplicationFunctions {
     }
 
     /// Port of IApplicationFunctions::PopLaunchParameter.
-    fn pop_launch_parameter(&self, launch_parameter_kind: LaunchParameterKind) -> Result<Vec<u8>, ResultCode> {
-        log::info!("PopLaunchParameter called, kind={:?}", launch_parameter_kind);
+    fn pop_launch_parameter(
+        &self,
+        launch_parameter_kind: LaunchParameterKind,
+    ) -> Result<Vec<u8>, ResultCode> {
+        log::info!(
+            "PopLaunchParameter called, kind={:?}",
+            launch_parameter_kind
+        );
 
         let mut applet = self.applet.lock().unwrap();
         let channel = if launch_parameter_kind == LaunchParameterKind::UserChannel {
@@ -480,7 +490,9 @@ impl IApplicationFunctions {
 
         log::info!(
             "GetDisplayVersion: returning '{}'",
-            std::str::from_utf8(&version_bytes).unwrap_or("?").trim_end_matches('\0')
+            std::str::from_utf8(&version_bytes)
+                .unwrap_or("?")
+                .trim_end_matches('\0')
         );
 
         // Response: header (2 words) + 16 bytes = 4 u32 words = 2 u64

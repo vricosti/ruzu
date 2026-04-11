@@ -4,8 +4,8 @@
 
 use std::collections::BTreeMap;
 
-use crate::file_sys::vfs::vfs_types::VirtualFile;
 use crate::file_sys::errors;
+use crate::file_sys::vfs::vfs_types::VirtualFile;
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
 use crate::hle::service::ipc_helpers::{RequestParser, ResponseBuilder};
@@ -74,7 +74,9 @@ impl IStorage {
         }
 
         let mut data = vec![0u8; length as usize];
-        let bytes_read = storage.backend.read(&mut data, length as usize, offset as usize);
+        let bytes_read = storage
+            .backend
+            .read(&mut data, length as usize, offset as usize);
         if bytes_read != length as usize {
             log::warn!(
                 "IStorage::Read short read, offset=0x{:X}, requested={}, read={}, backend_size={}",

@@ -9,10 +9,12 @@ use std::sync::{Arc, Mutex, Weak};
 
 use super::k_auto_object::{KAutoObjectBase, KAutoObjectWithList, TypeObj};
 use super::k_class_token;
+use super::k_port::KPort;
 use super::k_process::KProcess;
 use super::k_readable_event::KReadableEvent;
 use super::k_scheduler::KScheduler;
 use super::k_scoped_scheduler_lock_and_sleep::KScopedSchedulerLockAndSleep;
+use super::k_server_session::KServerSession;
 use super::k_thread::KThread;
 use super::k_thread_queue::{KThreadQueue, KThreadQueueWithoutEndWait};
 use crate::hle::kernel::svc::svc_results::{
@@ -124,7 +126,8 @@ impl SynchronizationWaiters {
     }
 
     pub fn snapshot(&self, process: &KProcess) -> Vec<u64> {
-        let result: Vec<u64> = self.handles(process)
+        let result: Vec<u64> = self
+            .handles(process)
             .into_iter()
             .map(|handle| handle.thread_id)
             .collect();
@@ -328,6 +331,8 @@ impl SynchronizationWaitSet {
 
 enum WaitableObject {
     ReadableEvent(Arc<Mutex<KReadableEvent>>),
+    ServerPort(Arc<Mutex<KPort>>),
+    ServerSession(Arc<Mutex<KServerSession>>),
     Thread(Arc<Mutex<KThread>>),
     Process,
 }
@@ -336,6 +341,8 @@ impl WaitableObject {
     fn is_signaled(&self, process: &KProcess) -> bool {
         match self {
             Self::ReadableEvent(event) => event.lock().unwrap().is_signaled(),
+            Self::ServerPort(port) => port.lock().unwrap().server.is_signaled(),
+            Self::ServerSession(session) => session.lock().unwrap().is_signaled(),
             Self::Thread(thread) => thread.lock().unwrap().is_signaled(),
             Self::Process => process.is_signaled(),
         }
@@ -346,6 +353,17 @@ impl WaitableObject {
             Self::ReadableEvent(event) => {
                 event.lock().unwrap().sync_object.link_waiter(process, node)
             }
+            Self::ServerPort(port) => port
+                .lock()
+                .unwrap()
+                .server
+                .sync_object
+                .link_waiter(process, node),
+            Self::ServerSession(session) => session
+                .lock()
+                .unwrap()
+                .sync_object
+                .link_waiter(process, node),
             Self::Thread(thread) => thread
                 .lock()
                 .unwrap()
@@ -368,6 +386,17 @@ impl WaitableObject {
                 .unwrap()
                 .sync_object
                 .unlink_waiter(process, thread_id, object_id, wait_index),
+            Self::ServerPort(port) => port
+                .lock()
+                .unwrap()
+                .server
+                .sync_object
+                .unlink_waiter(process, thread_id, object_id, wait_index),
+            Self::ServerSession(session) => session
+                .lock()
+                .unwrap()
+                .sync_object
+                .unlink_waiter(process, thread_id, object_id, wait_index),
             Self::Thread(thread) => thread
                 .lock()
                 .unwrap()
@@ -382,6 +411,15 @@ impl WaitableObject {
             Self::ReadableEvent(event) => {
                 event.lock().unwrap().sync_object.waiter_snapshot(process)
             }
+            Self::ServerPort(port) => port
+                .lock()
+                .unwrap()
+                .server
+                .sync_object
+                .waiter_snapshot(process),
+            Self::ServerSession(session) => {
+                session.lock().unwrap().sync_object.waiter_snapshot(process)
+            }
             Self::Thread(thread) => thread.lock().unwrap().sync_object.waiter_snapshot(process),
             Self::Process => process.sync_object.waiter_snapshot(process),
         }
@@ -395,6 +433,17 @@ impl WaitableObject {
     ) {
         match self {
             Self::ReadableEvent(event) => event
+                .lock()
+                .unwrap()
+                .sync_object
+                .unlink_all_waiters_for_thread(process, thread_id, object_id),
+            Self::ServerPort(port) => port
+                .lock()
+                .unwrap()
+                .server
+                .sync_object
+                .unlink_all_waiters_for_thread(process, thread_id, object_id),
+            Self::ServerSession(session) => session
                 .lock()
                 .unwrap()
                 .sync_object
@@ -993,9 +1042,8 @@ pub fn wait(
     if scheduler_lock_ptr == 0 {
         return RESULT_INVALID_HANDLE;
     }
-    let scheduler_lock = unsafe {
-        &*(scheduler_lock_ptr as *const super::k_scheduler_lock::KAbstractSchedulerLock)
-    };
+    let scheduler_lock =
+        unsafe { &*(scheduler_lock_ptr as *const super::k_scheduler_lock::KAbstractSchedulerLock) };
     let hardware_timer = super::kernel::get_hardware_timer_arc();
     let thread_ptr = {
         let guard = current_thread.lock().unwrap();
@@ -1136,8 +1184,14 @@ fn waiter_thread_ids(process: &KProcess, object_id: u64) -> Vec<u64> {
 }
 
 fn resolve_waitable_object(process: &KProcess, object_id: u64) -> Option<WaitableObject> {
+    if let Some(port) = process.get_server_port_by_object_id(object_id) {
+        return Some(WaitableObject::ServerPort(port));
+    }
     if let Some(event) = process.get_readable_event_by_object_id(object_id) {
         return Some(WaitableObject::ReadableEvent(event));
+    }
+    if let Some(session) = process.get_server_session_by_object_id(object_id) {
+        return Some(WaitableObject::ServerSession(session));
     }
     if let Some(thread) = process.get_thread_by_object_id(object_id) {
         return Some(WaitableObject::Thread(thread));
@@ -1154,6 +1208,7 @@ mod tests {
     use crate::hle::kernel::k_process::KProcess;
     use crate::hle::kernel::k_readable_event::KReadableEvent;
     use crate::hle::kernel::k_scheduler::KScheduler;
+    use crate::hle::kernel::k_session::KSession;
     use crate::hle::kernel::k_thread::KThread;
     use crate::hle::kernel::svc::svc_results::RESULT_TIMED_OUT;
     use crate::hle::result::RESULT_SUCCESS;
@@ -1280,6 +1335,109 @@ mod tests {
             },
         );
         assert!(process.sync_object.waiters_are_empty());
+    }
+
+    #[test]
+    fn helper_resolves_server_session_waiters() {
+        let mut process = KProcess::new();
+        process.process_id = 55;
+
+        let session = Arc::new(Mutex::new(KSession::new()));
+        session
+            .lock()
+            .unwrap()
+            .server
+            .lock()
+            .unwrap()
+            .initialize(0x1000);
+        process.register_session_object(0x1000, Arc::clone(&session));
+
+        let waiter = Arc::new(Mutex::new(KThread::new()));
+        {
+            let mut waiter_guard = waiter.lock().unwrap();
+            waiter_guard.thread_id = 99;
+            waiter_guard.object_id = 88;
+            waiter_guard.synchronization_wait.begin(vec![0x1000]);
+            waiter_guard.synchronization_wait.bind_thread(99);
+        }
+        process.register_thread_object(waiter);
+
+        assert!(!is_object_signaled(&process, 0x1000));
+        let request = Arc::new(Mutex::new(
+            crate::hle::kernel::k_session_request::KSessionRequest::new(),
+        ));
+        session
+            .lock()
+            .unwrap()
+            .on_request_with_process(&mut process, request);
+        assert!(is_object_signaled(&process, 0x1000));
+
+        link_waiter(
+            &mut process,
+            SynchronizationWaitNode {
+                object_id: 0x1000,
+                handle: SynchronizationWaitNodeHandle {
+                    thread_id: 99,
+                    wait_index: 0,
+                },
+            },
+        );
+
+        assert_eq!(
+            session
+                .lock()
+                .unwrap()
+                .server
+                .lock()
+                .unwrap()
+                .sync_object
+                .waiter_snapshot(&process),
+            vec![99]
+        );
+    }
+
+    #[test]
+    fn helper_resolves_server_port_waiters() {
+        let mut process = KProcess::new();
+        process.process_id = 55;
+
+        let port = Arc::new(Mutex::new(KPort::new()));
+        port.lock().unwrap().initialize(64, false, 0);
+        process.register_server_port_object(0x2000, Arc::clone(&port));
+
+        let waiter = Arc::new(Mutex::new(KThread::new()));
+        {
+            let mut waiter_guard = waiter.lock().unwrap();
+            waiter_guard.thread_id = 100;
+            waiter_guard.object_id = 89;
+            waiter_guard.synchronization_wait.begin(vec![0x2000]);
+            waiter_guard.synchronization_wait.bind_thread(100);
+        }
+        process.register_thread_object(waiter);
+
+        assert!(!is_object_signaled(&process, 0x2000));
+        port.lock().unwrap().enqueue_session(1).unwrap();
+        assert!(is_object_signaled(&process, 0x2000));
+
+        link_waiter(
+            &mut process,
+            SynchronizationWaitNode {
+                object_id: 0x2000,
+                handle: SynchronizationWaitNodeHandle {
+                    thread_id: 100,
+                    wait_index: 0,
+                },
+            },
+        );
+
+        assert_eq!(
+            port.lock()
+                .unwrap()
+                .server
+                .sync_object
+                .waiter_snapshot(&process),
+            vec![100]
+        );
     }
 
     #[test]

@@ -202,7 +202,9 @@ pub fn map_memory(system: &System, dst_addr: u64, src_addr: u64, size: u64) -> R
     let mut process = system.current_process_arc().lock().unwrap();
     let dst_kpa = crate::hle::kernel::k_typed_address::KProcessAddress::new(dst_addr);
     let src_kpa = crate::hle::kernel::k_typed_address::KProcessAddress::new(src_addr);
-    let r = process.page_table.map_memory(dst_kpa, src_kpa, size as usize);
+    let r = process
+        .page_table
+        .map_memory(dst_kpa, src_kpa, size as usize);
     if r != RESULT_SUCCESS.get_inner_value() {
         log::error!(
             "svc::MapMemory failed, dst_addr=0x{:X}, src_addr=0x{:X}, size=0x{:X}, result=0x{:08X}",

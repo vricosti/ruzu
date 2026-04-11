@@ -16,13 +16,15 @@ use crate::hle::kernel::k_readable_event::KReadableEvent;
 use crate::hle::kernel::k_scheduler::KScheduler;
 use crate::hle::kernel::k_typed_address::KProcessAddress;
 use crate::hle::service::nvdrv::core::container::SessionId;
-use crate::hle::service::nvdrv::devices::nvmap::{IocAllocParams, IocCreateParams, IocFreeParams};
 use crate::hle::service::nvdrv::devices::nvmap::NvMapDevice;
-use crate::hle::service::nvdrv::nvdrv::Module;
+use crate::hle::service::nvdrv::devices::nvmap::{IocAllocParams, IocCreateParams, IocFreeParams};
 use crate::hle::service::nvdrv::nvdata::DeviceFD;
+use crate::hle::service::nvdrv::nvdrv::Module;
 use crate::hle::service::nvnflinger::binder::IBinder;
 use crate::hle::service::nvnflinger::buffer_queue_producer::BufferQueueProducer;
-use crate::hle::service::nvnflinger::graphic_buffer_producer::{QueueBufferInput, QueueBufferOutput};
+use crate::hle::service::nvnflinger::graphic_buffer_producer::{
+    QueueBufferInput, QueueBufferOutput,
+};
 use crate::hle::service::nvnflinger::pixel_format::PixelFormat;
 use crate::hle::service::nvnflinger::status::Status;
 use crate::hle::service::nvnflinger::ui::fence::Fence;
@@ -137,7 +139,8 @@ impl SharedBufferManager {
     }
 
     fn allocate_shared_buffer_memory(&self) -> Result<KPageGroup, crate::hle::result::ResultCode> {
-        let system_ptr = self.system.get() as *const crate::core::System as *mut crate::core::System;
+        let system_ptr =
+            self.system.get() as *const crate::core::System as *mut crate::core::System;
         let device_memory: *const crate::device_memory::DeviceMemory =
             unsafe { (*system_ptr).device_memory() as *const crate::device_memory::DeviceMemory };
         let kernel = unsafe {
@@ -242,7 +245,10 @@ impl SharedBufferManager {
 
         let map_address = {
             let pg = inner.buffer_page_group.as_ref().unwrap();
-            self.map_shared_buffer_into_process_address_space(pg, &mut owner_process.lock().unwrap())?
+            self.map_shared_buffer_into_process_address_space(
+                pg,
+                &mut owner_process.lock().unwrap(),
+            )?
         };
 
         let session_id = self.nvdrv.get_container().open_session(owner_process);
@@ -256,7 +262,8 @@ impl SharedBufferManager {
             size: SHARED_BUFFER_SIZE,
             handle: 0,
         };
-        if nvmap.ioc_create(&mut create_params) != crate::hle::service::nvdrv::nvdata::NvResult::Success
+        if nvmap.ioc_create(&mut create_params)
+            != crate::hle::service::nvdrv::nvdata::NvResult::Success
         {
             return Err(vi_results::RESULT_OPERATION_FAILED);
         }

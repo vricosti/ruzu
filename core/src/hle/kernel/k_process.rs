@@ -17,6 +17,7 @@ use super::k_event::KEvent;
 use super::k_handle_table::KHandleTable;
 use super::k_handle_table::MAX_TABLE_SIZE;
 use super::k_memory_block::{KMemoryPermission, KMemoryState, PAGE_SIZE};
+use super::k_port::KPort;
 use super::k_process_page_table::KProcessPageTable;
 use super::k_readable_event::KReadableEvent;
 use super::k_resource_limit::{KResourceLimit, LimitableResource};
@@ -426,10 +427,13 @@ pub struct KProcess {
     thread_objects_by_thread_id: BTreeMap<u64, Arc<Mutex<KThread>>>,
     pub session_objects: BTreeMap<u64, Arc<Mutex<KSession>>>,
     pub client_session_objects: BTreeMap<u64, Arc<Mutex<KClientSession>>>,
+    pub client_port_objects: BTreeMap<u64, Arc<Mutex<KPort>>>,
+    pub server_port_objects: BTreeMap<u64, Arc<Mutex<KPort>>>,
     pub event_objects: BTreeMap<u64, Arc<Mutex<KEvent>>>,
     pub readable_event_objects: BTreeMap<u64, Arc<Mutex<KReadableEvent>>>,
     pub shared_memory_objects: BTreeMap<u64, Arc<super::k_shared_memory::KSharedMemory>>,
-    pub transfer_memory_objects: BTreeMap<u64, Arc<Mutex<super::k_transfer_memory::KTransferMemory>>>,
+    pub transfer_memory_objects:
+        BTreeMap<u64, Arc<Mutex<super::k_transfer_memory::KTransferMemory>>>,
     pub sync_object: SynchronizationObjectState,
     pub self_reference: Option<Weak<Mutex<KProcess>>>,
     pub scheduler: Option<Weak<Mutex<KScheduler>>>,
@@ -559,6 +563,8 @@ impl KProcess {
             thread_objects_by_thread_id: BTreeMap::new(),
             session_objects: BTreeMap::new(),
             client_session_objects: BTreeMap::new(),
+            client_port_objects: BTreeMap::new(),
+            server_port_objects: BTreeMap::new(),
             event_objects: BTreeMap::new(),
             readable_event_objects: BTreeMap::new(),
             shared_memory_objects: BTreeMap::new(),
@@ -592,10 +598,7 @@ impl KProcess {
     /// Create a per-process Memory instance using System's DeviceMemory.
     /// Matches upstream `KProcess::KProcess()` which constructs `m_memory{kernel.System()}`.
     /// Each process gets its own Memory with its own `current_page_table`.
-    pub fn create_memory(
-        &mut self,
-        system: &crate::core::System,
-    ) {
+    pub fn create_memory(&mut self, system: &crate::core::System) {
         if self.memory.is_some() {
             return; // already created
         }
@@ -686,7 +689,9 @@ impl KProcess {
         shared_memory: crate::hle::kernel::k_process::SharedProcessMemory,
         core_timing: std::sync::Arc<std::sync::Mutex<crate::core_timing::CoreTiming>>,
     ) {
-        let memory = self.memory.clone()
+        let memory = self
+            .memory
+            .clone()
             .expect("create_memory() must be called before initialize_interfaces()");
         use crate::arm::dynarmic::dynarmic_exclusive_monitor::DynarmicExclusiveMonitor;
         use crate::hardware_properties;
@@ -965,7 +970,10 @@ impl KProcess {
             }
 
             for thread in threads {
-                thread.lock().unwrap().request_suspend(super::k_thread::SuspendType::Process);
+                thread
+                    .lock()
+                    .unwrap()
+                    .request_suspend(super::k_thread::SuspendType::Process);
             }
 
             self.set_suspended(true);
@@ -975,7 +983,10 @@ impl KProcess {
             }
 
             for thread in threads {
-                thread.lock().unwrap().resume(super::k_thread::SuspendType::Process);
+                thread
+                    .lock()
+                    .unwrap()
+                    .resume(super::k_thread::SuspendType::Process);
             }
 
             self.set_suspended(false);
@@ -1132,7 +1143,9 @@ impl KProcess {
             count
         );
         let cond_var_ptr: *mut KConditionVariable = &mut self.cond_var;
-        unsafe { (*cond_var_ptr).signal(self, cv_key, count); }
+        unsafe {
+            (*cond_var_ptr).signal(self, cv_key, count);
+        }
         log::trace!(
             "KProcess::signal_condition_variable return cv_key=0x{:X} count={}",
             cv_key,
@@ -2472,6 +2485,8 @@ impl KProcess {
         self.thread_objects_by_thread_id.clear();
         self.session_objects.clear();
         self.client_session_objects.clear();
+        self.client_port_objects.clear();
+        self.server_port_objects.clear();
         self.event_objects.clear();
         self.readable_event_objects.clear();
         self.shared_memory_objects.clear();
@@ -2534,6 +2549,15 @@ impl KProcess {
         self.session_objects.get(&object_id).cloned()
     }
 
+    pub fn get_server_session_by_object_id(
+        &self,
+        object_id: u64,
+    ) -> Option<Arc<Mutex<super::k_server_session::KServerSession>>> {
+        self.session_objects
+            .get(&object_id)
+            .map(|session| session.lock().unwrap().get_server_session().clone())
+    }
+
     pub fn register_client_session_object(
         &mut self,
         object_id: u64,
@@ -2552,6 +2576,30 @@ impl KProcess {
         object_id: u64,
     ) -> Option<Arc<Mutex<KClientSession>>> {
         self.client_session_objects.get(&object_id).cloned()
+    }
+
+    pub fn register_client_port_object(&mut self, object_id: u64, port: Arc<Mutex<KPort>>) {
+        self.client_port_objects.insert(object_id, port);
+    }
+
+    pub fn unregister_client_port_object_by_object_id(&mut self, object_id: u64) {
+        self.client_port_objects.remove(&object_id);
+    }
+
+    pub fn get_client_port_by_object_id(&self, object_id: u64) -> Option<Arc<Mutex<KPort>>> {
+        self.client_port_objects.get(&object_id).cloned()
+    }
+
+    pub fn register_server_port_object(&mut self, object_id: u64, port: Arc<Mutex<KPort>>) {
+        self.server_port_objects.insert(object_id, port);
+    }
+
+    pub fn unregister_server_port_object_by_object_id(&mut self, object_id: u64) {
+        self.server_port_objects.remove(&object_id);
+    }
+
+    pub fn get_server_port_by_object_id(&self, object_id: u64) -> Option<Arc<Mutex<KPort>>> {
+        self.server_port_objects.get(&object_id).cloned()
     }
 
     pub fn unregister_event_object_by_object_id(&mut self, object_id: u64) {
@@ -2602,7 +2650,8 @@ impl KProcess {
         object_id: u64,
         transfer_memory: Arc<Mutex<super::k_transfer_memory::KTransferMemory>>,
     ) {
-        self.transfer_memory_objects.insert(object_id, transfer_memory);
+        self.transfer_memory_objects
+            .insert(object_id, transfer_memory);
     }
 
     pub fn unregister_transfer_memory_object_by_object_id(&mut self, object_id: u64) {
@@ -3102,7 +3151,10 @@ mod tests {
             .register_thread_object(thread.clone());
 
         assert_eq!(
-            process.lock().unwrap().set_activity(ProcessActivity::Paused),
+            process
+                .lock()
+                .unwrap()
+                .set_activity(ProcessActivity::Paused),
             RESULT_SUCCESS.get_inner_value()
         );
         assert!(process.lock().unwrap().is_suspended());
@@ -3112,7 +3164,10 @@ mod tests {
             .is_suspend_requested_type(super::super::k_thread::SuspendType::Process));
 
         assert_eq!(
-            process.lock().unwrap().set_activity(ProcessActivity::Runnable),
+            process
+                .lock()
+                .unwrap()
+                .set_activity(ProcessActivity::Runnable),
             RESULT_SUCCESS.get_inner_value()
         );
         assert!(!process.lock().unwrap().is_suspended());

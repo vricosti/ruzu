@@ -9,7 +9,9 @@
 use std::ptr::NonNull;
 use std::sync::{Arc, Mutex};
 
+use crate::hle::kernel::k_port::KPort;
 use crate::hle::kernel::k_process::KProcess;
+use crate::hle::kernel::k_server_session::KServerSession;
 
 use super::event::Event;
 use super::multi_wait::MultiWait;
@@ -18,6 +20,11 @@ enum WaitableHandle {
     None,
     Event(Arc<Event>),
     Process(Arc<Mutex<KProcess>>),
+    ServerPort {
+        port: Arc<Mutex<KPort>>,
+        object_id: Option<u64>,
+    },
+    ServerSession(Arc<Mutex<KServerSession>>),
 }
 
 /// MultiWaitHolder — holds a native synchronization object handle.
@@ -64,6 +71,27 @@ impl MultiWaitHolder {
         }
     }
 
+    /// Create a holder wrapping a server-port synchronization object.
+    pub fn from_server_port(server_port: Arc<Mutex<KPort>>, object_id: Option<u64>) -> Self {
+        Self {
+            user_data: 0,
+            multi_wait: None,
+            native_handle: WaitableHandle::ServerPort {
+                port: server_port,
+                object_id,
+            },
+        }
+    }
+
+    /// Create a holder wrapping a server-session synchronization object.
+    pub fn from_server_session(server_session: Arc<Mutex<KServerSession>>) -> Self {
+        Self {
+            user_data: 0,
+            multi_wait: None,
+            native_handle: WaitableHandle::ServerSession(server_session),
+        }
+    }
+
     /// Set user data associated with this holder.
     pub fn set_user_data(&mut self, data: usize) {
         self.user_data = data;
@@ -80,6 +108,22 @@ impl MultiWaitHolder {
             WaitableHandle::None => false,
             WaitableHandle::Event(event) => event.is_signaled(),
             WaitableHandle::Process(process) => process.lock().unwrap().is_signaled(),
+            WaitableHandle::ServerPort { port, .. } => port.lock().unwrap().server.is_signaled(),
+            WaitableHandle::ServerSession(server_session) => {
+                server_session.lock().unwrap().is_signaled()
+            }
+        }
+    }
+
+    pub fn object_id(&self) -> Option<u64> {
+        match &self.native_handle {
+            WaitableHandle::None => None,
+            WaitableHandle::Event(event) => event.kernel_object_id(),
+            WaitableHandle::Process(process) => Some(process.lock().unwrap().get_process_id()),
+            WaitableHandle::ServerPort { object_id, .. } => *object_id,
+            WaitableHandle::ServerSession(server_session) => {
+                server_session.lock().unwrap().get_parent_id()
+            }
         }
     }
 

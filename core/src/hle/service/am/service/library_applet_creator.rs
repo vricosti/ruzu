@@ -105,7 +105,10 @@ impl ILibraryAppletCreator {
         let _is_writable = rp.pop_bool();
         let size = rp.pop_i64();
 
-        log::warn!("(STUBBED) CreateTransferMemoryStorage called, size={}", size);
+        log::warn!(
+            "(STUBBED) CreateTransferMemoryStorage called, size={}",
+            size
+        );
 
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_UNKNOWN);

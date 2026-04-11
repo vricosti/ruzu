@@ -19,11 +19,11 @@ use crate::hle::kernel::k_process::SharedProcessMemory;
 use crate::hle::kernel::k_scheduler::KScheduler;
 use crate::hle::kernel::k_thread::KThread;
 use crate::hle::kernel::kernel::KernelCore;
-use crate::hle::service::apm::apm_controller::Controller as ApmController;
 use crate::hle::service::am::am_types::{AppletId, AppletType};
 use crate::hle::service::am::applet_manager::{
     AppletManager, FrontendAppletParameters, LaunchType,
 };
+use crate::hle::service::apm::apm_controller::Controller as ApmController;
 use crate::hle::service::glue::glue_manager::{ARPManager, ApplicationLaunchProperty};
 use crate::hle::service::server_manager::ServerManager;
 use crate::hle::service::sm::sm::ServiceManager;
@@ -140,7 +140,9 @@ pub trait AudioRendererSessionInterface: Send {
     /// Pass the readable event Arc so the audio thread can signal it directly.
     fn set_rendered_readable_event(
         &self,
-        _event: std::sync::Arc<std::sync::Mutex<crate::hle::kernel::k_readable_event::KReadableEvent>>,
+        _event: std::sync::Arc<
+            std::sync::Mutex<crate::hle::kernel::k_readable_event::KReadableEvent>,
+        >,
     ) {
     }
     /// Pass the process Arc for thread-safe waiter notification.
@@ -177,12 +179,7 @@ pub trait AudioCoreInterface: Send {
     ) -> u32;
 
     /// Mirror `AudioCore::Renderer::AudioDevice::SetDeviceVolumes`.
-    fn set_audio_device_volume(
-        &self,
-        applet_resource_user_id: u64,
-        revision: u32,
-        volume: f32,
-    );
+    fn set_audio_device_volume(&self, applet_resource_user_id: u64, revision: u32, volume: f32);
 
     /// Mirror `AudioCore::Renderer::AudioDevice::GetDeviceVolume`.
     fn get_audio_device_volume(
@@ -204,13 +201,8 @@ pub trait AudioCoreInterface: Send {
         transfer_memory_size: u64,
         process: *mut crate::hle::kernel::k_process::KProcess,
         applet_resource_user_id: u64,
-        rendered_event: std::sync::Arc<
-            std::sync::Mutex<crate::hle::kernel::k_event::KEvent>,
-        >,
-    ) -> std::result::Result<
-        Box<dyn AudioRendererSessionInterface>,
-        crate::hle::result::ResultCode,
-    >;
+        rendered_event: std::sync::Arc<std::sync::Mutex<crate::hle::kernel::k_event::KEvent>>,
+    ) -> std::result::Result<Box<dyn AudioRendererSessionInterface>, crate::hle::result::ResultCode>;
 }
 
 /// The main System struct. Top-level orchestrator that owns all subsystems.
@@ -802,10 +794,10 @@ impl System {
             {
                 let shared_memory = process_arc.lock().unwrap().get_shared_memory();
                 let core_timing = self.core_timing.clone();
-                process_arc.lock().unwrap().initialize_interfaces(
-                    shared_memory,
-                    core_timing,
-                );
+                process_arc
+                    .lock()
+                    .unwrap()
+                    .initialize_interfaces(shared_memory, core_timing);
                 log::info!("ARM JIT interfaces initialized for application process");
             }
 
@@ -1187,7 +1179,9 @@ impl System {
     /// Raw pointers to DeviceMemory and its HostMemory buffer, for creating
     /// per-process Memory instances.  Both pointers remain valid for the
     /// lifetime of System (they live in `self.device_memory`).
-    pub fn device_memory_ptrs(&self) -> (*const DeviceMemory, *const common::host_memory::HostMemory) {
+    pub fn device_memory_ptrs(
+        &self,
+    ) -> (*const DeviceMemory, *const common::host_memory::HostMemory) {
         let dm = self.device_memory();
         let dm_ptr = dm as *const DeviceMemory;
         let buffer_ptr = &dm.buffer as *const common::host_memory::HostMemory;
@@ -1642,10 +1636,10 @@ impl System {
         // Creates the exclusive monitor and one ARM JIT per core, owned by KProcess.
         {
             let core_timing = self.core_timing_shared();
-            process.lock().unwrap().initialize_interfaces(
-                shared_memory.clone(),
-                core_timing,
-            );
+            process
+                .lock()
+                .unwrap()
+                .initialize_interfaces(shared_memory.clone(), core_timing);
         }
 
         // Get core 0's ARM interface from the process for the main execution loop.

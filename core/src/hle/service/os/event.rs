@@ -84,6 +84,14 @@ impl Event {
         }
     }
 
+    pub fn kernel_object_id(&self) -> Option<u64> {
+        self.kernel_bridge
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|bridge| bridge.readable_event.lock().unwrap().object_id)
+    }
+
     /// Signal the event. Wakes all waiters.
     /// Port of upstream `Event::Signal()` → `m_event->Signal()`.
     pub fn signal(&self) {

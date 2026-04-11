@@ -220,11 +220,7 @@ impl System {
             (&self.rendered_readable_event, &self.process_arc)
         {
             let mut process = process_arc.lock().unwrap();
-            let Some(scheduler) = process
-                .scheduler
-                .as_ref()
-                .and_then(|s| s.upgrade())
-            else {
+            let Some(scheduler) = process.scheduler.as_ref().and_then(|s| s.upgrade()) else {
                 return;
             };
             // Hold the process lock during signal_from_host so that
@@ -373,10 +369,10 @@ impl System {
         self.set_process(process);
         let transfer_memory_source_address = unsafe { (*transfer_memory).get_source_address() };
         if let Some(memory) = self.core.lock().get_svc_memory() {
-            memory
-                .lock()
-                .unwrap()
-                .zero_block(transfer_memory_source_address, transfer_memory_size as usize);
+            memory.lock().unwrap().zero_block(
+                transfer_memory_source_address,
+                transfer_memory_size as usize,
+            );
         }
         self.drop_voice_enabled =
             params.voice_drop_enabled != 0 && params.execution_mode == ExecutionMode::Auto;
@@ -427,8 +423,9 @@ impl System {
         } else {
             self.performance_manager = PerformanceManager::new();
         }
-        let command_workbuffer_size = transfer_memory_size
-            .saturating_sub(Self::get_pre_command_workbuffer_size(&self.behavior, params));
+        let command_workbuffer_size = transfer_memory_size.saturating_sub(
+            Self::get_pre_command_workbuffer_size(&self.behavior, params),
+        );
         self.command_workbuffer = vec![0u8; command_workbuffer_size as usize];
         self.command_workbuffer_pool = MemoryPoolInfo::new(PoolLocation::Dsp);
         let pool_mapper = PoolMapper::new(None, false);
@@ -1156,8 +1153,7 @@ mod tests {
         )))
     }
 
-    fn make_kernel_rendered_event(
-    ) -> (
+    fn make_kernel_rendered_event() -> (
         Arc<StdMutex<KEvent>>,
         Box<KProcess>,
         Arc<StdMutex<KScheduler>>,
@@ -1624,7 +1620,10 @@ mod tests {
         let readable_event = process
             .get_readable_event_by_object_id(readable_event_object_id)
             .unwrap();
-        readable_event.lock().unwrap().signal(&mut process, &_scheduler);
+        readable_event
+            .lock()
+            .unwrap()
+            .signal(&mut process, &_scheduler);
 
         let mut input = Vec::new();
         let header = UpdateDataHeader {

@@ -23,12 +23,11 @@ pub struct KEvent {
 }
 
 impl KEvent {
-    fn lock_scheduler_for_process(
-        process: &KProcess,
-    ) -> Option<KScopedSchedulerLock<'static>> {
+    fn lock_scheduler_for_process(process: &KProcess) -> Option<KScopedSchedulerLock<'static>> {
         let scheduler_lock = {
             let gsc = process.global_scheduler_context.as_ref()?.lock().unwrap();
-            std::ptr::addr_of!(*gsc.scheduler_lock()) as *const super::k_scheduler_lock::KAbstractSchedulerLock
+            std::ptr::addr_of!(*gsc.scheduler_lock())
+                as *const super::k_scheduler_lock::KAbstractSchedulerLock
         };
 
         if scheduler_lock.is_null() {
@@ -121,7 +120,8 @@ mod tests {
     #[test]
     fn signal_clear_signal_roundtrip_uses_same_readable_event() {
         let mut process = KProcess::new();
-        process.global_scheduler_context = Some(Arc::new(Mutex::new(GlobalSchedulerContext::new())));
+        process.global_scheduler_context =
+            Some(Arc::new(Mutex::new(GlobalSchedulerContext::new())));
         let scheduler = Arc::new(Mutex::new(KScheduler::new(0)));
 
         let readable_id = 123;
@@ -130,17 +130,25 @@ mod tests {
         let mut event = KEvent::new();
         event.initialize(1, readable_id);
 
-        let readable = Arc::new(Mutex::new(super::super::k_readable_event::KReadableEvent::new()));
+        let readable = Arc::new(Mutex::new(
+            super::super::k_readable_event::KReadableEvent::new(),
+        ));
         readable.lock().unwrap().initialize(event_id, readable_id);
         process.register_readable_event_object(readable_id, Arc::clone(&readable));
 
-        assert_eq!(event.signal(&mut process, &scheduler), RESULT_SUCCESS.get_inner_value());
+        assert_eq!(
+            event.signal(&mut process, &scheduler),
+            RESULT_SUCCESS.get_inner_value()
+        );
         assert!(readable.lock().unwrap().is_signaled());
 
         assert_eq!(event.clear(&process), RESULT_SUCCESS.get_inner_value());
         assert!(!readable.lock().unwrap().is_signaled());
 
-        assert_eq!(event.signal(&mut process, &scheduler), RESULT_SUCCESS.get_inner_value());
+        assert_eq!(
+            event.signal(&mut process, &scheduler),
+            RESULT_SUCCESS.get_inner_value()
+        );
         assert!(readable.lock().unwrap().is_signaled());
     }
 }

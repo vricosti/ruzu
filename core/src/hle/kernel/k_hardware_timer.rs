@@ -96,7 +96,10 @@ impl KHardwareTimer {
     ///
     /// Matches upstream constructor behavior where `this` pointer is captured
     /// in the CoreTiming callback lambda.
-    pub fn wire_callback(timer: &Arc<KHardwareTimer>, core_timing: Arc<std::sync::Mutex<CoreTiming>>) {
+    pub fn wire_callback(
+        timer: &Arc<KHardwareTimer>,
+        core_timing: Arc<std::sync::Mutex<CoreTiming>>,
+    ) {
         let timer_weak = Arc::downgrade(timer);
         let event_type = core_timing::create_event(
             "KHardwareTimer::Callback".to_string(),
@@ -169,12 +172,7 @@ impl KHardwareTimer {
         });
     }
 
-    pub fn register_absolute_task_by_id(
-        &self,
-        thread_id: u64,
-        thread_ptr: usize,
-        task_time: i64,
-    ) {
+    pub fn register_absolute_task_by_id(&self, thread_id: u64, thread_ptr: usize, task_time: i64) {
         log::trace!(
             "KHardwareTimer::register_absolute_task_by_id tid={} task_time={} ptr=0x{:x}",
             thread_id,
@@ -337,7 +335,8 @@ impl KHardwareTimer {
             }
         }
 
-        state.thread_ptrs
+        state
+            .thread_ptrs
             .get(&task_id)
             .copied()
             .filter(|ptr| *ptr != 0)
@@ -401,7 +400,8 @@ impl KHardwareTimer {
                     None
                 }
                 .or_else(|| {
-                    state.thread_ptrs
+                    state
+                        .thread_ptrs
                         .get(&task_id)
                         .copied()
                         .filter(|ptr| *ptr != 0)

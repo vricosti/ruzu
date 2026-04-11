@@ -32,16 +32,12 @@ pub enum KAutoObjectRef {
 }
 
 impl KAutoObjectRef {
-    /// Resolve to a handle value. For ObjectId, would call handle_table.Add();
-    /// for Handle, returns the value directly.
-    pub fn resolve(&self) -> u32 {
+    /// Returns the pre-resolved handle value when this reference already owns
+    /// a handle.
+    pub fn as_handle(&self) -> Option<u32> {
         match self {
-            KAutoObjectRef::ObjectId(id) => {
-                // In a full implementation, this would call handle_table.Add(*id).
-                // For now, treat the object ID as the handle value.
-                *id as u32
-            }
-            KAutoObjectRef::Handle(h) => *h,
+            KAutoObjectRef::ObjectId(_) => None,
+            KAutoObjectRef::Handle(h) => Some(*h),
         }
     }
 }
@@ -216,7 +212,10 @@ impl SessionRequestManager {
             };
             log::error!(
                 "Session handler is invalid! is_domain={} object_id={} dom_cmd={} handler_count={}",
-                is_dom, obj_id, cmd, self.domain_handler_count()
+                is_dom,
+                obj_id,
+                cmd,
+                self.domain_handler_count()
             );
             return PreparedSyncRequest::StubSuccess;
         }
@@ -1254,9 +1253,9 @@ impl HLERequestContext {
 
         // Translate outgoing copy objects to handles.
         // Upstream: handle_table.Add(object) for each, writes handle to cmd_buf.
-        for obj_ref in &self.outgoing_copy_objects {
+        for obj_ref in self.outgoing_copy_objects.clone() {
             if current_offset < ipc::COMMAND_BUFFER_LENGTH {
-                let handle = obj_ref.resolve();
+                let handle = self.resolve_ipc_object_handle(obj_ref).unwrap_or(0);
                 self.cmd_buf[current_offset] = handle;
                 current_offset += 1;
             }
@@ -1264,9 +1263,9 @@ impl HLERequestContext {
 
         // Translate outgoing move objects to handles.
         // Upstream: handle_table.Add(object) + object->Close() for each.
-        for obj_ref in &self.outgoing_move_objects {
+        for obj_ref in self.outgoing_move_objects.clone() {
             if current_offset < ipc::COMMAND_BUFFER_LENGTH {
-                let handle = obj_ref.resolve();
+                let handle = self.resolve_ipc_object_handle(obj_ref).unwrap_or(0);
                 self.cmd_buf[current_offset] = handle;
                 current_offset += 1;
             }
@@ -1317,6 +1316,23 @@ impl HLERequestContext {
         }
 
         RESULT_SUCCESS
+    }
+
+    fn resolve_ipc_object_handle(&self, obj_ref: KAutoObjectRef) -> Option<u32> {
+        if let Some(handle) = obj_ref.as_handle() {
+            return Some(handle);
+        }
+
+        let KAutoObjectRef::ObjectId(object_id) = obj_ref else {
+            return None;
+        };
+
+        let process = self.owner_process_arc()?;
+        let mut process = process.lock().unwrap();
+        if process.ensure_handle_table_initialized() != RESULT_SUCCESS.get_inner_value() {
+            return None;
+        }
+        process.handle_table.add(object_id).ok()
     }
 
     /// Returns a description of the current IPC command for debugging.
@@ -1398,11 +1414,19 @@ mod tests {
         let device_memory = Box::new(DeviceMemory::new());
         let buffer_ptr = &device_memory.buffer as *const common::host_memory::HostMemory;
         let memory = Arc::new(Mutex::new(unsafe {
-            Memory::new(SystemRef::null(), device_memory.as_ref() as *const _, buffer_ptr)
+            Memory::new(
+                SystemRef::null(),
+                device_memory.as_ref() as *const _,
+                buffer_ptr,
+            )
         }));
 
         let process = Arc::new(Mutex::new(KProcess::new()));
-        process.lock().unwrap().page_table.set_memory(memory.clone());
+        process
+            .lock()
+            .unwrap()
+            .page_table
+            .set_memory(memory.clone());
 
         let thread = Arc::new(Mutex::new(KThread::new()));
         thread.lock().unwrap().parent = Some(Arc::downgrade(&process));
@@ -1418,11 +1442,19 @@ mod tests {
         let device_memory = Box::new(DeviceMemory::new());
         let buffer_ptr = &device_memory.buffer as *const common::host_memory::HostMemory;
         let memory = Arc::new(Mutex::new(unsafe {
-            Memory::new(SystemRef::null(), device_memory.as_ref() as *const _, buffer_ptr)
+            Memory::new(
+                SystemRef::null(),
+                device_memory.as_ref() as *const _,
+                buffer_ptr,
+            )
         }));
 
         let process = Arc::new(Mutex::new(KProcess::new()));
-        process.lock().unwrap().page_table.set_memory(memory.clone());
+        process
+            .lock()
+            .unwrap()
+            .page_table
+            .set_memory(memory.clone());
 
         memory.lock().unwrap().write_8(0x3000, 0x7a);
 
@@ -1439,14 +1471,25 @@ mod tests {
         let device_memory = Box::new(DeviceMemory::new());
         let buffer_ptr = &device_memory.buffer as *const common::host_memory::HostMemory;
         let memory = Arc::new(Mutex::new(unsafe {
-            Memory::new(SystemRef::null(), device_memory.as_ref() as *const _, buffer_ptr)
+            Memory::new(
+                SystemRef::null(),
+                device_memory.as_ref() as *const _,
+                buffer_ptr,
+            )
         }));
 
         let process = Arc::new(Mutex::new(KProcess::new()));
-        process.lock().unwrap().page_table.set_memory(memory.clone());
+        process
+            .lock()
+            .unwrap()
+            .page_table
+            .set_memory(memory.clone());
 
         let tls_address = 0x3000u64;
-        memory.lock().unwrap().write_32(tls_address + 16, 0xdead_beef);
+        memory
+            .lock()
+            .unwrap()
+            .write_32(tls_address + 16, 0xdead_beef);
 
         let thread = Arc::new(Mutex::new(KThread::new()));
         thread.lock().unwrap().parent = Some(Arc::downgrade(&process));

@@ -192,11 +192,7 @@ impl TouchResource {
     }
 
     /// Port of TouchResource::ActivateGesture(u64 aruid, u32 basic_gesture_id).
-    pub fn activate_gesture_with_aruid(
-        &mut self,
-        aruid: u64,
-        basic_gesture_id: u32,
-    ) -> ResultCode {
+    pub fn activate_gesture_with_aruid(&mut self, aruid: u64, basic_gesture_id: u32) -> ResultCode {
         let Some(applet_resource) = self.applet_resource.as_ref().cloned() else {
             return ResultCode::SUCCESS;
         };
@@ -234,7 +230,9 @@ impl TouchResource {
 
             if gesture_shared.gesture_lifo.buffer_count == 0 {
                 touch_data.basic_gesture_id = basic_gesture_id;
-                gesture_shared.gesture_lifo.write_next_entry(self.gesture_state);
+                gesture_shared
+                    .gesture_lifo
+                    .write_next_entry(self.gesture_state);
             }
         }
         ResultCode::SUCCESS
@@ -520,7 +518,9 @@ impl TouchResource {
                         .get_shared_memory_format_mut(applet_data.aruid)
                         .map(|shared| &mut shared.gesture)
                     {
-                        gesture_shared.gesture_lifo.write_next_entry(self.gesture_state);
+                        gesture_shared
+                            .gesture_lifo
+                            .write_next_entry(self.gesture_state);
                     }
                 }
             }

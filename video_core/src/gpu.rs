@@ -17,8 +17,8 @@ use common::settings;
 use ruzu_core::core::SystemRef;
 use ruzu_core::gpu_core::{
     BlendMode as CoreBlendMode, BufferTransformFlags as CoreBufferTransformFlags,
-    FramebufferConfig as CoreFramebufferConfig, GpuChannelHandle, GpuCommandList,
-    GpuCoreInterface, GpuMemoryManagerHandle, RectI as CoreRectI,
+    FramebufferConfig as CoreFramebufferConfig, GpuChannelHandle, GpuCommandList, GpuCoreInterface,
+    GpuMemoryManagerHandle, RectI as CoreRectI,
 };
 use ruzu_core::hle::service::nvdrv::nvdata::NvFence;
 
@@ -182,7 +182,10 @@ impl Gpu {
             renderer: Mutex::new(None),
             rasterizer: Mutex::new(None),
             scheduler: Mutex::new(None),
-            gpu_thread: Mutex::new(crate::gpu_thread::ThreadManager::new(SystemRef::null(), is_async)),
+            gpu_thread: Mutex::new(crate::gpu_thread::ThreadManager::new(
+                SystemRef::null(),
+                is_async,
+            )),
             channels: Mutex::new(HashMap::new()),
             guest_memory_reader: Mutex::new(None),
             guest_memory_writer: Mutex::new(None),

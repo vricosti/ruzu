@@ -466,9 +466,8 @@ impl TimeZoneService {
         match service.load_location_name_list(index) {
             Ok(names) => {
                 let byte_len = core::mem::size_of_val(names.as_slice());
-                let bytes = unsafe {
-                    core::slice::from_raw_parts(names.as_ptr() as *const u8, byte_len)
-                };
+                let bytes =
+                    unsafe { core::slice::from_raw_parts(names.as_ptr() as *const u8, byte_len) };
                 ctx.write_buffer(bytes, 0);
                 let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
                 rb.push_result(RESULT_SUCCESS);
@@ -608,10 +607,9 @@ impl TimeZoneService {
         let location_name = Self::pop_location_name(&mut rp);
         let binary = ctx.read_buffer(0);
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
-        rb.push_result(service.set_device_location_name_with_time_zone_rule(
-            &location_name,
-            &binary,
-        ));
+        rb.push_result(
+            service.set_device_location_name_with_time_zone_rule(&location_name, &binary),
+        );
     }
 
     fn parse_time_zone_binary_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
@@ -657,10 +655,7 @@ impl TimeZoneService {
             Ok((count, out_times)) => {
                 let byte_len = (count as usize).min(out_times.len()) * core::mem::size_of::<i64>();
                 let bytes = unsafe {
-                    core::slice::from_raw_parts(
-                        out_times.as_ptr() as *const u8,
-                        byte_len,
-                    )
+                    core::slice::from_raw_parts(out_times.as_ptr() as *const u8, byte_len)
                 };
                 ctx.write_buffer(bytes, 0);
                 let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
@@ -685,10 +680,7 @@ impl TimeZoneService {
             Ok((count, out_times)) => {
                 let byte_len = (count as usize).min(out_times.len()) * core::mem::size_of::<i64>();
                 let bytes = unsafe {
-                    core::slice::from_raw_parts(
-                        out_times.as_ptr() as *const u8,
-                        byte_len,
-                    )
+                    core::slice::from_raw_parts(out_times.as_ptr() as *const u8, byte_len)
                 };
                 ctx.write_buffer(bytes, 0);
                 let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);

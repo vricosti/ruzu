@@ -868,11 +868,14 @@ impl UserCallbacks for DynarmicCallbacks32 {
                 let code = self.mem().read_32(pc);
 
                 // One-shot detailed dump at first exception
-                static FIRST_EXCEPTION: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+                static FIRST_EXCEPTION: std::sync::atomic::AtomicBool =
+                    std::sync::atomic::AtomicBool::new(false);
                 if !FIRST_EXCEPTION.swap(true, std::sync::atomic::Ordering::Relaxed) {
                     log::error!(
                         "=== FIRST EXCEPTION DUMP === pc={:08X} code={:08X} exception={}",
-                        pc as u32, code, exception
+                        pc as u32,
+                        code,
+                        exception
                     );
                     // Dump surrounding code
                     let start = pc.saturating_sub(64);
@@ -883,14 +886,35 @@ impl UserCallbacks for DynarmicCallbacks32 {
                         log::error!("  {:08X}: {:08X}{}", addr as u32, word, marker);
                     }
                     // Dump all GPRs
-                    log::error!("  GPRs: R0={:08X} R1={:08X} R2={:08X} R3={:08X}",
-                        ctx.r[0] as u32, ctx.r[1] as u32, ctx.r[2] as u32, ctx.r[3] as u32);
-                    log::error!("  GPRs: R4={:08X} R5={:08X} R6={:08X} R7={:08X}",
-                        ctx.r[4] as u32, ctx.r[5] as u32, ctx.r[6] as u32, ctx.r[7] as u32);
-                    log::error!("  GPRs: R8={:08X} R9={:08X} R10={:08X} R11={:08X} R12={:08X}",
-                        ctx.r[8] as u32, ctx.r[9] as u32, ctx.r[10] as u32, ctx.r[11] as u32, ctx.r[12] as u32);
-                    log::error!("  PC={:08X} LR={:08X} SP={:08X} CPSR={:08X}",
-                        ctx.pc as u32, ctx.lr as u32, ctx.sp as u32, ctx.pstate);
+                    log::error!(
+                        "  GPRs: R0={:08X} R1={:08X} R2={:08X} R3={:08X}",
+                        ctx.r[0] as u32,
+                        ctx.r[1] as u32,
+                        ctx.r[2] as u32,
+                        ctx.r[3] as u32
+                    );
+                    log::error!(
+                        "  GPRs: R4={:08X} R5={:08X} R6={:08X} R7={:08X}",
+                        ctx.r[4] as u32,
+                        ctx.r[5] as u32,
+                        ctx.r[6] as u32,
+                        ctx.r[7] as u32
+                    );
+                    log::error!(
+                        "  GPRs: R8={:08X} R9={:08X} R10={:08X} R11={:08X} R12={:08X}",
+                        ctx.r[8] as u32,
+                        ctx.r[9] as u32,
+                        ctx.r[10] as u32,
+                        ctx.r[11] as u32,
+                        ctx.r[12] as u32
+                    );
+                    log::error!(
+                        "  PC={:08X} LR={:08X} SP={:08X} CPSR={:08X}",
+                        ctx.pc as u32,
+                        ctx.lr as u32,
+                        ctx.sp as u32,
+                        ctx.pstate
+                    );
                     // Dump NEON/VFP registers (Q0-Q15 from v[])
                     for i in 0..16 {
                         log::error!("  Q{:02}={:032X}", i, ctx.v[i]);
@@ -1226,15 +1250,17 @@ impl ArmInterface for ArmDynarmic32 {
         jit.clear_exclusive_state();
 
         // Cache trace config to avoid parsing env vars on every run_thread call
-        static TRACE_CFG: std::sync::OnceLock<(Option<u32>, Option<u32>, u32, u32)> = std::sync::OnceLock::new();
-        let &(trace_start, trace_end, trace_limit, trace_search_limit) = TRACE_CFG.get_or_init(|| {
-            (
-                parse_trace_hex_env("RUZU_A32_TRACE_RANGE_START"),
-                parse_trace_hex_env("RUZU_A32_TRACE_RANGE_END"),
-                parse_trace_u32_env("RUZU_A32_TRACE_LIMIT").unwrap_or(0),
-                parse_trace_u32_env("RUZU_A32_TRACE_SEARCH_LIMIT").unwrap_or(0),
-            )
-        });
+        static TRACE_CFG: std::sync::OnceLock<(Option<u32>, Option<u32>, u32, u32)> =
+            std::sync::OnceLock::new();
+        let &(trace_start, trace_end, trace_limit, trace_search_limit) =
+            TRACE_CFG.get_or_init(|| {
+                (
+                    parse_trace_hex_env("RUZU_A32_TRACE_RANGE_START"),
+                    parse_trace_hex_env("RUZU_A32_TRACE_RANGE_END"),
+                    parse_trace_u32_env("RUZU_A32_TRACE_LIMIT").unwrap_or(0),
+                    parse_trace_u32_env("RUZU_A32_TRACE_SEARCH_LIMIT").unwrap_or(0),
+                )
+            });
         if let (Some(start), Some(end)) = (trace_start, trace_end) {
             let current_pc = jit.get_register(15);
             if trace_limit > 0
@@ -1273,8 +1299,7 @@ impl ArmInterface for ArmDynarmic32 {
                         } else {
                             last_hr = jit.step();
                             if !last_hr.is_empty()
-                                && last_hr
-                                    != rdynarmic::halt_reason::HaltReason::STEP
+                                && last_hr != rdynarmic::halt_reason::HaltReason::STEP
                             {
                                 log::info!("[A32TRACE] halt while searching: {:?}", last_hr);
                                 break;
@@ -1325,10 +1350,7 @@ impl ArmInterface for ArmDynarmic32 {
                     );
                     logged_steps += 1;
                     last_hr = jit.step();
-                    if !last_hr.is_empty()
-                        && last_hr
-                            != rdynarmic::halt_reason::HaltReason::STEP
-                    {
+                    if !last_hr.is_empty() && last_hr != rdynarmic::halt_reason::HaltReason::STEP {
                         log::info!("[A32TRACE] halt={:?}", last_hr);
                         break;
                     }

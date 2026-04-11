@@ -86,7 +86,9 @@ impl Renderer {
 
     pub fn set_rendered_readable_event(
         &self,
-        event: std::sync::Arc<std::sync::Mutex<ruzu_core::hle::kernel::k_readable_event::KReadableEvent>>,
+        event: std::sync::Arc<
+            std::sync::Mutex<ruzu_core::hle::kernel::k_readable_event::KReadableEvent>,
+        >,
     ) {
         self.system.lock().set_rendered_readable_event(event);
     }
@@ -183,10 +185,7 @@ mod tests {
             core.clone(),
             audio_renderer.clone(),
         )));
-        let system = Arc::new(Mutex::new(System::new_for_tests(
-            core,
-            audio_renderer,
-        )));
+        let system = Arc::new(Mutex::new(System::new_for_tests(core, audio_renderer)));
         let mut renderer = Renderer::new(manager.clone(), system);
         let params = make_params();
 
@@ -212,10 +211,7 @@ mod tests {
             core.clone(),
             audio_renderer.clone(),
         )));
-        let system = Arc::new(Mutex::new(System::new_for_tests(
-            core,
-            audio_renderer,
-        )));
+        let system = Arc::new(Mutex::new(System::new_for_tests(core, audio_renderer)));
         let mut renderer = Renderer::new(manager, system.clone());
         let params = make_params();
         let transfer_size = System::get_work_buffer_size(&params);

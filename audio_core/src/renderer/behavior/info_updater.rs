@@ -280,7 +280,8 @@ impl<'a> InfoUpdater<'a> {
             }
 
             for (channel, state) in voice_states.into_iter().enumerate() {
-                let target = voice_context.get_state_mut_direct(in_param.channel_resource_ids[channel]);
+                let target =
+                    voice_context.get_state_mut_direct(in_param.channel_resource_ids[channel]);
                 *target = state;
             }
             new_voice_count = new_voice_count.saturating_add(channel_count);

@@ -16,6 +16,7 @@ use std::sync::{Arc, Mutex, Weak};
 
 use super::super::service::server_manager::ServerManager;
 use super::k_memory_manager::KMemoryManager;
+use super::k_port::KPort;
 use super::k_process::KProcess;
 use super::k_scheduler::KScheduler;
 use super::k_thread::{KThread, ThreadState};
@@ -175,7 +176,9 @@ fn real_update_highest_priority_threads() -> u64 {
 fn enqueue_pending_active_core_updates(migrations: Vec<(u64, i32)>) {
     let mut pending = PENDING_ACTIVE_CORE_UPDATES.lock().unwrap();
     for (thread_id, new_core) in migrations {
-        if let Some(existing) = pending.iter_mut().find(|(pending_tid, _)| *pending_tid == thread_id)
+        if let Some(existing) = pending
+            .iter_mut()
+            .find(|(pending_tid, _)| *pending_tid == thread_id)
         {
             existing.1 = new_core;
         } else {
@@ -223,8 +226,9 @@ fn apply_pending_active_core_updates() {
     if !still_pending.is_empty() {
         let mut pending = PENDING_ACTIVE_CORE_UPDATES.lock().unwrap();
         for (thread_id, new_core) in still_pending {
-            if let Some(existing) =
-                pending.iter_mut().find(|(pending_tid, _)| *pending_tid == thread_id)
+            if let Some(existing) = pending
+                .iter_mut()
+                .find(|(pending_tid, _)| *pending_tid == thread_id)
             {
                 existing.1 = new_core;
             } else {
@@ -906,6 +910,7 @@ impl KernelCore {
     /// Port of upstream `KernelCore::RunServer`.
     pub fn run_server(&self, server_manager: ServerManager) {
         let manager = Arc::new(Mutex::new(server_manager));
+        manager.lock().unwrap().bind_self_reference(&manager);
 
         {
             let mut managers = self.server_managers.lock().unwrap();
@@ -1000,7 +1005,10 @@ impl KernelCore {
     pub fn get_event_owner_process_id(&self, event_object_id: u64) -> Option<u64> {
         if let Some(process) = self.system_ref.get().current_process_arc.as_ref().cloned() {
             let process_guard = process.lock().unwrap();
-            if process_guard.get_event_by_object_id(event_object_id).is_some() {
+            if process_guard
+                .get_event_by_object_id(event_object_id)
+                .is_some()
+            {
                 return Some(process_guard.get_process_id());
             }
         }
@@ -1025,6 +1033,83 @@ impl KernelCore {
                         process_guard
                             .get_event_by_object_id(event_object_id)
                             .map(|_| process_guard.get_process_id())
+                    })
+            })
+    }
+
+    /// Rust helper for server-session owner lookup via the kernel process list.
+    pub fn get_session_owner_process_id(&self, session_object_id: u64) -> Option<u64> {
+        if let Some(process) = self.system_ref.get().current_process_arc.as_ref().cloned() {
+            let process_guard = process.lock().unwrap();
+            if process_guard
+                .get_server_session_by_object_id(session_object_id)
+                .is_some()
+            {
+                return Some(process_guard.get_process_id());
+            }
+        }
+
+        self.service_processes
+            .lock()
+            .unwrap()
+            .iter()
+            .find_map(|process| {
+                let process_guard = process.lock().unwrap();
+                process_guard
+                    .get_server_session_by_object_id(session_object_id)
+                    .map(|_| process_guard.get_process_id())
+            })
+            .or_else(|| {
+                self.host_service_processes
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .find_map(|process| {
+                        let process_guard = process.lock().unwrap();
+                        process_guard
+                            .get_server_session_by_object_id(session_object_id)
+                            .map(|_| process_guard.get_process_id())
+                    })
+            })
+    }
+
+    /// Rust helper for named client-port lookup via the kernel process list.
+    ///
+    /// This is the Rust counterpart to upstream `KObjectName::Find<KClientPort>(kernel, name)`.
+    /// `KObjectName` already stores the named client-port object id; this helper
+    /// resolves that object id back to the owning `KPort` by scanning the kernel
+    /// process registries that currently own client-port objects.
+    pub fn get_client_port_by_object_id(
+        &self,
+        client_port_object_id: u64,
+    ) -> Option<Arc<Mutex<KPort>>> {
+        if let Some(process) = self.system_ref.get().current_process_arc.as_ref().cloned() {
+            let process_guard = process.lock().unwrap();
+            if let Some(port) = process_guard.get_client_port_by_object_id(client_port_object_id) {
+                return Some(port);
+            }
+        }
+
+        self.service_processes
+            .lock()
+            .unwrap()
+            .iter()
+            .find_map(|process| {
+                process
+                    .lock()
+                    .unwrap()
+                    .get_client_port_by_object_id(client_port_object_id)
+            })
+            .or_else(|| {
+                self.host_service_processes
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .find_map(|process| {
+                        process
+                            .lock()
+                            .unwrap()
+                            .get_client_port_by_object_id(client_port_object_id)
                     })
             })
     }

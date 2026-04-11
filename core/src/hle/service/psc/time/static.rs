@@ -13,16 +13,16 @@ use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
 use crate::hle::service::ipc_helpers::{RequestParser, ResponseBuilder};
 use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
 
+use super::clocks::steady_clock_core::SteadyClockCoreImpl;
 use super::common::{
     get_span_between_time_points, ClockSnapshot, StaticServiceSetupInfo, SteadyClockTimePoint,
     SystemClockContext, TimeType,
 };
-use super::manager::TimeManager;
-use super::clocks::steady_clock_core::SteadyClockCoreImpl;
 use super::errors::{
     RESULT_CLOCK_MISMATCH, RESULT_CLOCK_UNINITIALIZED, RESULT_NOT_IMPLEMENTED,
     RESULT_PERMISSION_DENIED, RESULT_TIME_NOT_FOUND,
 };
+use super::manager::TimeManager;
 use super::steady_clock::SteadyClock;
 use super::system_clock::SystemClock;
 use super::time_zone::TimeZone;
@@ -316,7 +316,11 @@ impl StaticService {
                 .clock
                 .get_context()
                 .unwrap_or_default();
-            let current_time = time.standard_local_system_clock.clock.get_current_time().unwrap_or(0);
+            let current_time = time
+                .standard_local_system_clock
+                .clock
+                .get_current_time()
+                .unwrap_or(0);
             return SystemClock::with_state(
                 self.setup_info.can_write_local_clock,
                 self.setup_info.can_write_uninitialized_clock,
@@ -344,7 +348,11 @@ impl StaticService {
                 .clock
                 .get_context()
                 .unwrap_or_default();
-            let current_time = time.ephemeral_network_clock.clock.get_current_time().unwrap_or(0);
+            let current_time = time
+                .ephemeral_network_clock
+                .clock
+                .get_current_time()
+                .unwrap_or(0);
             return SystemClock::with_state(
                 self.setup_info.can_write_network_clock,
                 self.setup_info.can_write_uninitialized_clock,

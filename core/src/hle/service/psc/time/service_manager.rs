@@ -10,8 +10,8 @@ use std::sync::{Arc, Mutex};
 
 use crate::core::SystemRef;
 use crate::device_memory::DeviceMemory;
-use crate::hle::kernel::k_readable_event::KReadableEvent;
 use crate::hle::kernel::k_memory_manager::KMemoryManager;
+use crate::hle::kernel::k_readable_event::KReadableEvent;
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
 use crate::hle::service::ipc_helpers::{RequestParser, ResponseBuilder};
@@ -179,8 +179,15 @@ impl TimeServiceManager {
         Arc::clone(&self.time)
     }
 
-    pub fn get_static_service(&self, setup_info: StaticServiceSetupInfo, _name: &str) -> Arc<StaticService> {
-        Arc::new(StaticService::with_time_manager(setup_info, Arc::clone(&self.time)))
+    pub fn get_static_service(
+        &self,
+        setup_info: StaticServiceSetupInfo,
+        _name: &str,
+    ) -> Arc<StaticService> {
+        Arc::new(StaticService::with_time_manager(
+            setup_info,
+            Arc::clone(&self.time),
+        ))
     }
 
     pub fn get_static_service_as_user(&self) -> Arc<StaticService> {
@@ -275,7 +282,8 @@ impl TimeServiceManager {
         time_value: i64,
     ) -> ResultCode {
         let mut time = self.time.lock().unwrap();
-        time.standard_local_system_clock.initialize(context, time_value);
+        time.standard_local_system_clock
+            .initialize(context, time_value);
         let context = time
             .standard_local_system_clock
             .clock
@@ -314,8 +322,11 @@ impl TimeServiceManager {
         let local = std::ptr::addr_of_mut!(time.standard_local_system_clock);
         let network = std::ptr::addr_of!(time.standard_network_system_clock);
         let rc = unsafe {
-            time.standard_user_system_clock
-                .set_automatic_correction(automatic_correction, &mut *local, &*network)
+            time.standard_user_system_clock.set_automatic_correction(
+                automatic_correction,
+                &mut *local,
+                &*network,
+            )
         };
         if rc.is_error() {
             return rc;
@@ -392,7 +403,8 @@ impl TimeServiceManager {
         let move_handle = if is_domain {
             0
         } else {
-            ctx.create_session_for_service(sub_service.clone()).unwrap_or(0)
+            ctx.create_session_for_service(sub_service.clone())
+                .unwrap_or(0)
         };
 
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 1);
@@ -404,7 +416,10 @@ impl TimeServiceManager {
         }
     }
 
-    fn get_static_service_as_user_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn get_static_service_as_user_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         let service = Self::as_self(this);
         Self::push_static_service(ctx, service.get_static_service_as_user());
     }
@@ -493,8 +508,7 @@ impl TimeServiceManager {
         let mut rp = RequestParser::new(ctx);
         let automatic_correction = rp.pop_bool();
         let time_point = rp.pop_raw::<SteadyClockTimePoint>();
-        let rc =
-            service.setup_standard_user_system_clock_core(automatic_correction, time_point);
+        let rc = service.setup_standard_user_system_clock_core(automatic_correction, time_point);
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(rc);
     }
@@ -652,11 +666,8 @@ impl TimeServiceManager {
             let time = service.time.lock().unwrap();
             time.alarms.get_event()
         };
-        match service.get_or_create_event_handle(
-            ctx,
-            &event,
-            &service.closest_alarm_readable_event,
-        ) {
+        match service.get_or_create_event_handle(ctx, &event, &service.closest_alarm_readable_event)
+        {
             Some(handle) => {
                 let mut rb = ResponseBuilder::new(ctx, 2, 1, 0);
                 rb.push_result(RESULT_SUCCESS);
@@ -735,7 +746,8 @@ mod tests {
 
     #[test]
     fn setup_standard_local_system_clock_core_updates_shared_memory_in_time_m_owner() {
-        let service = TimeServiceManager::new(SystemRef::null(), std::ptr::null(), std::ptr::null_mut());
+        let service =
+            TimeServiceManager::new(SystemRef::null(), std::ptr::null(), std::ptr::null_mut());
         let context = SystemClockContext {
             offset: 123,
             steady_time_point: SteadyClockTimePoint {
@@ -756,7 +768,8 @@ mod tests {
 
     #[test]
     fn setup_standard_user_system_clock_core_updates_automatic_correction_in_shared_memory() {
-        let service = TimeServiceManager::new(SystemRef::null(), std::ptr::null(), std::ptr::null_mut());
+        let service =
+            TimeServiceManager::new(SystemRef::null(), std::ptr::null(), std::ptr::null_mut());
         let time_point = SteadyClockTimePoint {
             time_point: 42,
             clock_source_id: [0x22; 16],
@@ -774,7 +787,8 @@ mod tests {
 
     #[test]
     fn exercised_event_handlers_are_registered() {
-        let service = TimeServiceManager::new(SystemRef::null(), std::ptr::null(), std::ptr::null_mut());
+        let service =
+            TimeServiceManager::new(SystemRef::null(), std::ptr::null(), std::ptr::null_mut());
         let handlers = ServiceFramework::handlers(&service);
         for cmd in [50u32, 51, 52, 60, 200] {
             let info = handlers.get(&cmd).expect("missing handler");

@@ -73,9 +73,12 @@ impl ISelfController {
                 .clone()
                 .or_else(|| applet_guard.process.get_process());
             if let Some(process_for_display) = process_for_display {
-                applet_guard
-                    .display_layer_manager
-                    .initialize(system, process_for_display, applet_id, mode);
+                applet_guard.display_layer_manager.initialize(
+                    system,
+                    process_for_display,
+                    applet_id,
+                    mode,
+                );
             }
         }
         let handlers = build_handler_map(&[
@@ -508,7 +511,9 @@ impl ISelfController {
     ) {
         let service = unsafe { &*(this as *const dyn ServiceFramework as *const ISelfController) };
         let mut applet = service.applet.lock().unwrap();
-        let result = applet.display_layer_manager.get_system_shared_layer_handle();
+        let result = applet
+            .display_layer_manager
+            .get_system_shared_layer_handle();
 
         match result {
             Ok((buffer_id, layer_id)) => {

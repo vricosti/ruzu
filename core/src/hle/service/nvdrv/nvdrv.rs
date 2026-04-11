@@ -118,12 +118,10 @@ impl Module {
                 self.gpu_files.lock().unwrap().insert(fd, Arc::clone(&gpu));
                 gpu
             }
-            "/dev/nvhost-ctrl-gpu" => {
-                Arc::new(NvHostCtrlGpu::new(
-                    self.system,
-                    Arc::clone(&self.events_interface),
-                ))
-            }
+            "/dev/nvhost-ctrl-gpu" => Arc::new(NvHostCtrlGpu::new(
+                self.system,
+                Arc::clone(&self.events_interface),
+            )),
             "/dev/nvmap" => {
                 let nvmap = Arc::new(NvMapDevice::new(
                     self.container.get_nv_map_file(),
@@ -136,8 +134,14 @@ impl Module {
                 nvmap
             }
             "/dev/nvdisp_disp0" => {
-                let disp = Arc::new(NvDispDisp0::new(self.system, self.container.get_nv_map_file()));
-                self.disp_files.lock().unwrap().insert(fd, Arc::clone(&disp));
+                let disp = Arc::new(NvDispDisp0::new(
+                    self.system,
+                    self.container.get_nv_map_file(),
+                ));
+                self.disp_files
+                    .lock()
+                    .unwrap()
+                    .insert(fd, Arc::clone(&disp));
                 disp
             }
             "/dev/nvhost-ctrl" => Arc::new(NvHostCtrl::new(
