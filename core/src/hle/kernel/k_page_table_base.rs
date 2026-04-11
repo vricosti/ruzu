@@ -3190,7 +3190,27 @@ impl KPageTableBase {
             send,
         );
         if server_rc != crate::hle::result::RESULT_SUCCESS.get_inner_value() {
-            let _ = src_page_table.cleanup_for_ipc_client(src_addr, size, dst_state);
+            // Upstream `KPageTableBase::SetupForIpc` uses ON_RESULT_FAILURE:
+            // ```
+            // src_page_table.CleanupForIpcClientOnServerSetupFailure(
+            //     updater.GetPageList(), src_map_start, src_map_size, src_perm);
+            // ```
+            // where `src_map_start`/`src_map_size` are the mapping-aligned extents
+            // and `src_perm` is the post-setup permission derived from `test_perm`.
+            // This restores block permissions only; IPC-locking has not happened
+            // yet at this point, so `cleanup_for_ipc_client` (which expects
+            // `IPC_LOCKED`) would be the wrong rollback path here.
+            let (_, _, mapping_src_start, mapping_src_end) =
+                Self::get_ipc_aligned_extents(src_addr, size);
+            let mapping_src_size = mapping_src_end.saturating_sub(mapping_src_start);
+            if mapping_src_size > 0 {
+                let src_perm = Self::get_ipc_source_permission(test_perm);
+                src_page_table.cleanup_for_ipc_client_on_server_setup_failure(
+                    mapping_src_start,
+                    mapping_src_size,
+                    src_perm,
+                );
+            }
             return server_rc;
         }
 
@@ -3583,6 +3603,130 @@ impl KPageTableBase {
         );
 
         self.reprotect_ipc_range(mapping_start, mapping_size)
+    }
+
+    /// Matches upstream `KPageTableBase::CleanupForIpcClientOnServerSetupFailure`
+    /// (k_page_table_base.cpp:5033-5109).
+    ///
+    /// Rollback helper: when the server side of an IPC setup fails after the
+    /// client side has already mapped + permissioned its source pages, this
+    /// walks the affected block range and restores each block's protection to
+    /// `prot_perm` via `OperationType::ChangePermissions`. Unlike upstream,
+    /// the PageLinkedList argument is omitted — Rust's `operate` path does
+    /// not thread a PageLinkedList because there are no guest page table
+    /// entries to free (see comment on `operate`).
+    ///
+    /// Caller contract: the page table lock is held, and `address`/`size`
+    /// are page-aligned and non-empty.
+    pub fn cleanup_for_ipc_client_on_server_setup_failure(
+        &mut self,
+        address: usize,
+        size: usize,
+        prot_perm: KMemoryPermission,
+    ) {
+        debug_assert!(address % PAGE_SIZE == 0);
+        debug_assert!(size % PAGE_SIZE == 0);
+
+        let src_map_start = address;
+        let src_map_end = address + size;
+        let src_map_last = src_map_end - 1;
+
+        debug_assert!(src_map_end > src_map_start);
+
+        // Snapshot the block range so we can both peek ahead (for the tail
+        // merge-attribute calculation, upstream `auto next_it = it; ++next_it`)
+        // and call `operate` mutably on `self` without holding a borrow on
+        // `m_memory_block_manager`.
+        let infos: Vec<KMemoryInfo> = self
+            .m_memory_block_manager
+            .find_iterator(address)
+            .map(|block| block.get_memory_info())
+            .collect();
+
+        for (i, info) in infos.iter().enumerate() {
+            let cur_start = if info.get_address() >= src_map_start {
+                info.get_address()
+            } else {
+                src_map_start
+            };
+            let cur_end = if src_map_last <= info.get_last_address() {
+                src_map_end
+            } else {
+                info.get_end_address()
+            };
+
+            // If we can, fix the protections on the block.
+            let needs_fix = (info.get_ipc_lock_count() == 0
+                && (info.get_permission() & KMemoryPermission::IPC_LOCK_CHANGE_MASK) != prot_perm)
+                || (info.get_ipc_lock_count() != 0
+                    && (info.get_original_permission() & KMemoryPermission::IPC_LOCK_CHANGE_MASK)
+                        != prot_perm);
+
+            if needs_fix {
+                // Check if we actually need to fix the protections on the block.
+                let should_operate = cur_end == src_map_end
+                    || info.get_address() <= src_map_start
+                    || (info.get_permission() & KMemoryPermission::IPC_LOCK_CHANGE_MASK)
+                        != prot_perm;
+
+                if should_operate {
+                    let start_nc = if info.get_address() == src_map_start {
+                        (info.get_disable_merge_attribute()
+                            & (KMemoryBlockDisableMergeAttribute::LOCKED
+                                | KMemoryBlockDisableMergeAttribute::IPC_LEFT))
+                            .is_empty()
+                    } else {
+                        info.get_address() <= src_map_start
+                    };
+
+                    let head_body_attr = if start_nc {
+                        DisableMergeAttribute::ENABLE_HEAD_AND_BODY
+                    } else {
+                        DisableMergeAttribute::NONE
+                    };
+
+                    let tail_attr = if cur_end == src_map_end
+                        && info.get_end_address() == src_map_end
+                    {
+                        // Upstream: if (next_it != end) lock_count +=
+                        //     next_it->GetIpcDisableMergeCount() - next_it->GetIpcLockCount();
+                        let next_contribution = infos.get(i + 1).map_or(0i32, |next| {
+                            next.get_ipc_disable_merge_count() as i32
+                                - next.get_ipc_lock_count() as i32
+                        });
+                        let lock_count = info.get_ipc_lock_count() as i32 + next_contribution;
+                        if lock_count == 0 {
+                            DisableMergeAttribute::ENABLE_TAIL
+                        } else {
+                            DisableMergeAttribute::NONE
+                        }
+                    } else {
+                        DisableMergeAttribute::NONE
+                    };
+
+                    let properties = KPageProperties {
+                        perm: info.get_permission(),
+                        io: false,
+                        uncached: false,
+                        disable_merge_attributes: head_body_attr | tail_attr,
+                    };
+
+                    let _ = self.operate(
+                        cur_start,
+                        (cur_end - cur_start) / PAGE_SIZE,
+                        0,
+                        false,
+                        properties,
+                        OperationType::ChangePermissions,
+                    );
+                }
+            }
+
+            // If we're past the end of the region, we're done.
+            if src_map_last <= info.get_last_address() {
+                break;
+            }
+        }
     }
 
     // -- Code Locking --
