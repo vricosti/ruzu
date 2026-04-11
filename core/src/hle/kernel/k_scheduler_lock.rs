@@ -52,45 +52,21 @@ fn default_enable_scheduling(cores_needing_scheduling: u64) {
             });
         }
         Some(1) => {
-            // Outermost unlock — must reschedule like upstream.
-            // Upstream: scheduler->RescheduleOtherCores(cores);
-            //           scheduler->RescheduleCurrentCore();
-            // RescheduleCurrentCore: EnableDispatch + if needs_scheduling { RescheduleCurrentCoreImpl }
-            super::kernel::with_current_thread_fast_mut(|t| {
-                t.enable_dispatch();
-            });
-
-            // Trigger RescheduleCurrentCoreImpl via the current scheduler.
+            // Outermost unlock — port upstream
+            // `KScheduler::EnableScheduling(kernel, cores_needing_scheduling)`
+            // literally enough to preserve the no-scheduler/host-thread path.
             if let Some(kernel) = super::kernel::get_kernel_ref() {
-                if let Some(scheduler_arc) = kernel.current_scheduler() {
-                    // Interrupt other cores that need rescheduling.
-                    if cores_needing_scheduling != 0 {
-                        for core_id in 0..crate::hardware_properties::NUM_CPU_CORES as usize {
-                            if cores_needing_scheduling & (1u64 << core_id) != 0 {
-                                if let Some(core) = kernel.physical_core(core_id) {
-                                    core.interrupt();
-                                }
-                            }
-                        }
-                    }
-
-                    let needs = {
-                        let sched = scheduler_arc.lock().unwrap();
-                        sched.needs_scheduling()
-                    };
-                    if needs {
-                        // Do the fiber switch — this is the key upstream behavior.
-                        // Get a raw pointer to avoid holding the Mutex across the yield.
-                        let sched_ptr = {
-                            let guard = scheduler_arc.lock().unwrap();
-                            &*guard as *const super::k_scheduler::KScheduler
-                                as *mut super::k_scheduler::KScheduler
-                        };
-                        unsafe {
-                            (*sched_ptr).reschedule_current_core_impl();
-                        }
-                    }
-                }
+                let scheduler_arc = kernel.current_scheduler().cloned();
+                super::k_scheduler::KScheduler::enable_scheduling_with_scheduler(
+                    cores_needing_scheduling,
+                    scheduler_arc.as_ref(),
+                    kernel.is_phantom_mode_for_single_core(),
+                );
+            } else {
+                // No kernel available in local test harnesses.
+                super::kernel::with_current_thread_fast_mut(|t| {
+                    t.enable_dispatch();
+                });
             }
         }
         _ => {

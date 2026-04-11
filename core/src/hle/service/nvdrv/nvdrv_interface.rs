@@ -44,6 +44,11 @@ pub struct NvdrvInterface {
 }
 
 impl NvdrvInterface {
+    fn should_trace_lifecycle() -> bool {
+        std::env::var_os("RUZU_NVDRV_TRACE")
+            .is_some_and(|value| value != std::ffi::OsStr::new("0"))
+    }
+
     fn should_trace_ioctl_payload(command: Ioctl) -> bool {
         matches!(
             command.raw,
@@ -88,6 +93,15 @@ impl NvdrvInterface {
 
     /// Port of NVDRV::Open
     pub fn open(&mut self, device_name: &str) -> (DeviceFD, NvResult) {
+        if Self::should_trace_lifecycle() {
+            log::info!(
+                "NVDRV::Open state self_ptr={:p} service_session_id={} initialized={} device={}",
+                self,
+                self.session_id.id,
+                self.is_initialized,
+                device_name
+            );
+        }
         if !self.is_initialized {
             log::error!("NvServices is not initialized!");
             return (0, NvResult::NotInitialized);
@@ -121,6 +135,16 @@ impl NvdrvInterface {
         input: &[u8],
         output: &mut [u8],
     ) -> NvResult {
+        if Self::should_trace_lifecycle() {
+            log::info!(
+                "NVDRV::Ioctl1 state self_ptr={:p} service_session_id={} initialized={} fd={} ioctl=0x{:08X}",
+                self,
+                self.session_id.id,
+                self.is_initialized,
+                fd,
+                command.raw
+            );
+        }
         log::trace!("Ioctl1 called fd={}, ioctl=0x{:08X}", fd, command.raw);
         if !self.is_initialized {
             log::error!("NvServices is not initialized!");
@@ -164,6 +188,16 @@ impl NvdrvInterface {
         inline_input: &[u8],
         output: &mut [u8],
     ) -> NvResult {
+        if Self::should_trace_lifecycle() {
+            log::info!(
+                "NVDRV::Ioctl2 state self_ptr={:p} service_session_id={} initialized={} fd={} ioctl=0x{:08X}",
+                self,
+                self.session_id.id,
+                self.is_initialized,
+                fd,
+                command.raw
+            );
+        }
         log::trace!("Ioctl2 called fd={}, ioctl=0x{:08X}", fd, command.raw);
         if !self.is_initialized {
             log::error!("NvServices is not initialized!");
@@ -209,6 +243,16 @@ impl NvdrvInterface {
         output: &mut [u8],
         inline_output: &mut [u8],
     ) -> NvResult {
+        if Self::should_trace_lifecycle() {
+            log::info!(
+                "NVDRV::Ioctl3 state self_ptr={:p} service_session_id={} initialized={} fd={} ioctl=0x{:08X}",
+                self,
+                self.session_id.id,
+                self.is_initialized,
+                fd,
+                command.raw
+            );
+        }
         log::trace!("Ioctl3 called fd={}, ioctl=0x{:08X}", fd, command.raw);
         if !self.is_initialized {
             log::error!("NvServices is not initialized!");
@@ -247,6 +291,15 @@ impl NvdrvInterface {
 
     /// Port of NVDRV::Close
     pub fn close(&mut self, fd: DeviceFD) -> NvResult {
+        if Self::should_trace_lifecycle() {
+            log::info!(
+                "NVDRV::Close state self_ptr={:p} service_session_id={} initialized={} fd={}",
+                self,
+                self.session_id.id,
+                self.is_initialized,
+                fd
+            );
+        }
         log::debug!("Close called");
         if !self.is_initialized {
             log::error!("NvServices is not initialized!");
@@ -259,6 +312,16 @@ impl NvdrvInterface {
     /// Port of NVDRV::Initialize
     pub fn initialize(&mut self, process: &Arc<Mutex<KProcess>>) -> NvResult {
         log::warn!("(STUBBED) Initialize called");
+        if Self::should_trace_lifecycle() {
+            let process_id = process.lock().unwrap().process_id;
+            log::info!(
+                "NVDRV::Initialize begin self_ptr={:p} service_session_id={} initialized={} process_id={}",
+                self,
+                self.session_id.id,
+                self.is_initialized,
+                process_id
+            );
+        }
         if self.is_initialized {
             return NvResult::Success;
         }
@@ -266,6 +329,14 @@ impl NvdrvInterface {
         let container = self.nvdrv.get_container();
         self.session_id = container.open_session(process);
         self.is_initialized = true;
+        if Self::should_trace_lifecycle() {
+            log::info!(
+                "NVDRV::Initialize end self_ptr={:p} service_session_id={} initialized={}",
+                self,
+                self.session_id.id,
+                self.is_initialized
+            );
+        }
         NvResult::Success
     }
 
@@ -278,6 +349,16 @@ impl NvdrvInterface {
         NvResult,
         Option<Arc<Mutex<crate::hle::kernel::k_readable_event::KReadableEvent>>>,
     ) {
+        if Self::should_trace_lifecycle() {
+            log::info!(
+                "NVDRV::QueryEvent state self_ptr={:p} service_session_id={} initialized={} fd={} event_id={}",
+                self,
+                self.session_id.id,
+                self.is_initialized,
+                fd,
+                event_id
+            );
+        }
         if !self.is_initialized {
             log::error!("NvServices is not initialized!");
             return (NvResult::NotInitialized, None);
@@ -337,6 +418,11 @@ pub struct NvdrvService {
 }
 
 impl NvdrvService {
+    fn should_trace_lifecycle() -> bool {
+        std::env::var_os("RUZU_NVDRV_TRACE")
+            .is_some_and(|value| value != std::ffi::OsStr::new("0"))
+    }
+
     pub fn new(nvdrv: Arc<Module>, name: &str) -> Self {
         Self {
             name: name.to_string(),
@@ -382,6 +468,13 @@ impl NvdrvService {
 
     fn open_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         let service = unsafe { &*(this as *const dyn ServiceFramework as *const NvdrvService) };
+        if Self::should_trace_lifecycle() {
+            log::info!(
+                "NVDRV::open_handler service_ptr={:p} name={}",
+                service,
+                service.name
+            );
+        }
         let device_name_bytes = ctx.read_buffer(0);
         let end = device_name_bytes
             .iter()
@@ -399,6 +492,13 @@ impl NvdrvService {
 
     fn ioctl1_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         let service = unsafe { &*(this as *const dyn ServiceFramework as *const NvdrvService) };
+        if Self::should_trace_lifecycle() {
+            log::info!(
+                "NVDRV::ioctl1_handler service_ptr={:p} name={}",
+                service,
+                service.name
+            );
+        }
         let mut rp = RequestParser::new(ctx);
         let fd = rp.pop_i32();
         let command = rp.pop_raw::<Ioctl>();
@@ -516,6 +616,13 @@ impl NvdrvService {
 
     fn ioctl2_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         let service = unsafe { &*(this as *const dyn ServiceFramework as *const NvdrvService) };
+        if Self::should_trace_lifecycle() {
+            log::info!(
+                "NVDRV::ioctl2_handler service_ptr={:p} name={}",
+                service,
+                service.name
+            );
+        }
         let mut rp = RequestParser::new(ctx);
         let fd = rp.pop_i32();
         let command = rp.pop_raw::<Ioctl>();
@@ -551,6 +658,13 @@ impl NvdrvService {
 
     fn ioctl3_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         let service = unsafe { &*(this as *const dyn ServiceFramework as *const NvdrvService) };
+        if Self::should_trace_lifecycle() {
+            log::info!(
+                "NVDRV::ioctl3_handler service_ptr={:p} name={}",
+                service,
+                service.name
+            );
+        }
         let mut rp = RequestParser::new(ctx);
         let fd = rp.pop_i32();
         let command = rp.pop_raw::<Ioctl>();
@@ -587,6 +701,13 @@ impl NvdrvService {
 
     fn close_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         let service = unsafe { &*(this as *const dyn ServiceFramework as *const NvdrvService) };
+        if Self::should_trace_lifecycle() {
+            log::info!(
+                "NVDRV::close_handler service_ptr={:p} name={}",
+                service,
+                service.name
+            );
+        }
         let mut rp = RequestParser::new(ctx);
         let fd = rp.pop_i32();
         let nv_result = service.interface.lock().unwrap().close(fd);
@@ -595,6 +716,13 @@ impl NvdrvService {
 
     fn initialize_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         let service = unsafe { &*(this as *const dyn ServiceFramework as *const NvdrvService) };
+        if Self::should_trace_lifecycle() {
+            log::info!(
+                "NVDRV::initialize_handler service_ptr={:p} name={}",
+                service,
+                service.name
+            );
+        }
         let mut rp = RequestParser::new(ctx);
         let process_handle = ctx.get_copy_handle(0);
         let _transfer_memory_handle = ctx.get_copy_handle(1);
@@ -647,6 +775,13 @@ impl NvdrvService {
 
     fn query_event_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         let service = unsafe { &*(this as *const dyn ServiceFramework as *const NvdrvService) };
+        if Self::should_trace_lifecycle() {
+            log::info!(
+                "NVDRV::query_event_handler service_ptr={:p} name={}",
+                service,
+                service.name
+            );
+        }
         let mut rp = RequestParser::new(ctx);
         let fd = rp.pop_i32();
         let event_id = rp.pop_u32();

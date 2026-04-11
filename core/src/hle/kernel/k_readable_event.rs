@@ -86,6 +86,150 @@ impl KReadableEvent {
         RESULT_SUCCESS.get_inner_value()
     }
 
+    /// Host-thread signal entrypoint for callers that only own the `Arc<Mutex<Self>>`.
+    ///
+    /// Rust must not hold the `KReadableEvent` mutex across waiter wakeup, because the
+    /// synchronization wait queue cleanup can re-enter `unlink_waiter()` on the same
+    /// signaled event. Upstream relies on the scheduler lock instead of a per-object mutex,
+    /// so this split lock scope is the Rust-local adaptation needed to preserve behavior
+    /// without deadlocking.
+    pub fn signal_from_host_arc(
+        readable_event: &Arc<Mutex<KReadableEvent>>,
+        process_arc: &Arc<Mutex<KProcess>>,
+        scheduler: &Arc<Mutex<KScheduler>>,
+    ) -> u32 {
+        let trace_boot = std::env::var_os("RUZU_APPLET_BOOT_TRACE")
+            .is_some_and(|value| value != std::ffi::OsStr::new("0"));
+        let object_id = {
+            let mut event = readable_event.lock().unwrap();
+            event.is_signaled = true;
+            event.object_id
+        };
+
+        let waiter_thread_ids = loop {
+            let mut process = process_arc.lock().unwrap();
+            let Ok(event) = readable_event.try_lock() else {
+                drop(process);
+                std::thread::yield_now();
+                continue;
+            };
+            let waiter_thread_ids = event.sync_object.waiter_snapshot(&process);
+            drop(event);
+            drop(process);
+            break waiter_thread_ids;
+        };
+        if trace_boot {
+            log::info!(
+                "KReadableEvent::signal_from_host_arc: object_id={} snapshot_waiters={}",
+                object_id,
+                waiter_thread_ids.len()
+            );
+        }
+
+        let mut woke_any = false;
+        let mut unlink_thread_ids = Vec::new();
+        let mut woke_thread_ids = Vec::new();
+
+        for waiter_thread_id in waiter_thread_ids {
+            if trace_boot {
+                log::info!(
+                    "KReadableEvent::signal_from_host_arc: object_id={} visiting waiter_thread_id={}",
+                    object_id,
+                    waiter_thread_id
+                );
+            }
+
+            let waiter_thread = {
+                let process = process_arc.lock().unwrap();
+                let Some(waiter_thread) = process.get_thread_by_thread_id(waiter_thread_id) else {
+                    unlink_thread_ids.push(waiter_thread_id);
+                    continue;
+                };
+                waiter_thread
+            };
+
+            loop {
+                let mut waiter_thread_guard = waiter_thread.lock().unwrap();
+                let Ok(mut process) = process_arc.try_lock() else {
+                    drop(waiter_thread_guard);
+                    std::thread::yield_now();
+                    continue;
+                };
+
+                if trace_boot {
+                    log::info!(
+                        "KReadableEvent::signal_from_host_arc: object_id={} waiter_thread_id={} thread+process locked",
+                        object_id,
+                        waiter_thread_id
+                    );
+                }
+
+                if waiter_thread_guard.notify_available(
+                    &mut process,
+                    object_id,
+                    RESULT_SUCCESS.get_inner_value(),
+                ) {
+                    unlink_thread_ids.push(waiter_thread_id);
+                    woke_thread_ids.push(waiter_thread_id);
+                    woke_any = true;
+                } else if waiter_thread_guard.get_state()
+                    != super::k_thread::ThreadState::WAITING
+                {
+                    unlink_thread_ids.push(waiter_thread_id);
+                }
+                break;
+            }
+        }
+
+        {
+            let process = process_arc.lock().unwrap();
+            for thread_id in &woke_thread_ids {
+                process.push_back_to_priority_queue(*thread_id);
+            }
+        }
+
+        if trace_boot {
+            log::info!(
+                "KReadableEvent::signal_from_host_arc: object_id={} woke_any={} unlink={}",
+                object_id,
+                woke_any,
+                unlink_thread_ids.len()
+            );
+        }
+
+        loop {
+            let mut event = readable_event.lock().unwrap();
+            let Ok(mut process) = process_arc.try_lock() else {
+                drop(event);
+                std::thread::yield_now();
+                continue;
+            };
+            for thread_id in &unlink_thread_ids {
+                event.unlink_waiter(&mut process, *thread_id);
+            }
+            break;
+        }
+        if trace_boot {
+            log::info!(
+                "KReadableEvent::signal_from_host_arc: object_id={} unlink_complete",
+                object_id
+            );
+        }
+
+        if woke_any {
+            if let Ok(scheduler) = scheduler.try_lock() {
+                scheduler.request_schedule();
+            } else {
+                log::trace!(
+                    "KReadableEvent::signal_from_host_arc: scheduler busy, deferring request_schedule for object_id={}",
+                    object_id
+                );
+            }
+        }
+
+        RESULT_SUCCESS.get_inner_value()
+    }
+
     /// Clear the readable event.
     /// Matches upstream `KReadableEvent::Clear`.
     pub fn clear(&mut self) -> u32 {
@@ -155,7 +299,14 @@ impl KReadableEvent {
         }
 
         if outcome.woke_any {
-            scheduler.lock().unwrap().request_schedule();
+            if let Ok(scheduler) = scheduler.try_lock() {
+                scheduler.request_schedule();
+            } else {
+                log::trace!(
+                    "KReadableEvent::notify_available: scheduler busy, deferring request_schedule for object_id={}",
+                    self.object_id
+                );
+            }
         }
     }
 

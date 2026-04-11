@@ -7,6 +7,8 @@
 //! MultiWait — waits on multiple synchronization objects.
 //! Upstream wraps svcWaitSynchronization/KSynchronizationObject::Wait.
 
+use std::ffi::OsStr;
+
 use crate::hle::kernel::k_synchronization_object;
 use crate::hle::kernel::kernel::KernelCore;
 use crate::hle::result::RESULT_SUCCESS;
@@ -26,6 +28,10 @@ unsafe impl Send for MultiWait {}
 unsafe impl Sync for MultiWait {}
 
 impl MultiWait {
+    fn boot_trace_enabled() -> bool {
+        std::env::var_os("RUZU_APPLET_BOOT_TRACE").is_some_and(|value| value != OsStr::new("0"))
+    }
+
     pub fn new() -> Self {
         Self {
             holders: Vec::new(),
@@ -48,17 +54,18 @@ impl MultiWait {
 
     /// Port of upstream `MultiWait::MoveAll`.
     ///
-    /// IMPORTANT: callers must NOT pass an `other` that was created via
-    /// `std::mem::take()` from another `MultiWait` field. Each holder stores a
-    /// raw pointer to the `MultiWait` it belongs to, and `mem::take` moves the
-    /// holders Vec into a new MultiWait at a different memory location, which
-    /// makes those raw pointers stale. `unlink_from_multi_wait` then no-ops
-    /// (because it points to the old, now-empty location), and this loop spins
-    /// forever. Always pass `&mut field` from the same struct as `self`.
+    /// Rust move-aware adaptation of upstream intrusive-list splicing.
+    ///
+    /// Upstream can splice holders without repairing owner pointers because
+    /// the intrusive node lives in a stable pointee. Rust service owners can
+    /// move `MultiWait` values, so this method drains `other.holders`
+    /// directly and rewrites each holder backlink instead of relying on the
+    /// previous `holder.multi_wait` owner pointer still being valid.
     pub fn move_all(&mut self, other: &mut MultiWait) {
-        while let Some(holder) = other.holders.first().copied() {
+        let moved: Vec<*mut MultiWaitHolder> = other.holders.drain(..).collect();
+        for holder in moved {
             unsafe {
-                (*holder).unlink_from_multi_wait();
+                (*holder).reset_multi_wait_linkage_for_owner_move();
                 (*holder).link_to_multi_wait(self as *mut MultiWait);
             }
         }
@@ -81,11 +88,22 @@ impl MultiWait {
         self.timed_wait_impl(kernel, 0)
     }
 
+    /// Rust-only helper for host-side service threads that must avoid the
+    /// kernel-backed wait path entirely.
+    ///
+    /// This performs the same non-blocking signaled scan as the local fallback
+    /// path without consulting `KernelCore` or `WaitSynchronization`.
+    pub fn try_wait_any_local(&self) -> Option<*mut MultiWaitHolder> {
+        let holders = self.holders_snapshot();
+        self.local_try_wait_any(&holders)
+    }
+
     fn timed_wait_impl(
         &self,
         kernel: &KernelCore,
         timeout_ns: i64,
     ) -> Option<*mut MultiWaitHolder> {
+        let trace_boot = Self::boot_trace_enabled();
         let holders = self.holders_snapshot();
         if holders.is_empty() {
             return None;
@@ -93,7 +111,12 @@ impl MultiWait {
 
         let current_thread = match kernel.get_current_emu_thread() {
             Some(thread) => thread,
-            None => return self.local_timed_wait(&holders, timeout_ns),
+            None => {
+                if trace_boot {
+                    log::info!("MultiWait::timed_wait_impl: falling back local (no current_emu_thread)");
+                }
+                return self.local_timed_wait(&holders, timeout_ns);
+            }
         };
         let process = match current_thread
             .lock()
@@ -103,7 +126,12 @@ impl MultiWait {
             .and_then(|parent| parent.upgrade())
         {
             Some(process) => process,
-            None => return self.local_timed_wait(&holders, timeout_ns),
+            None => {
+                if trace_boot {
+                    log::info!("MultiWait::timed_wait_impl: falling back local (no process)");
+                }
+                return self.local_timed_wait(&holders, timeout_ns);
+            }
         };
         let scheduler = kernel
             .current_scheduler()
@@ -125,12 +153,20 @@ impl MultiWait {
                     .and_then(|scheduler| scheduler.upgrade())
             });
         let Some(scheduler) = scheduler else {
+            if trace_boot {
+                log::info!("MultiWait::timed_wait_impl: falling back local (no scheduler)");
+            }
             return self.local_timed_wait(&holders, timeout_ns);
         };
 
         let mut object_ids = Vec::with_capacity(holders.len());
         for holder in &holders {
             let Some(object_id) = (unsafe { &**holder }).object_id() else {
+                if trace_boot {
+                    log::info!(
+                        "MultiWait::timed_wait_impl: falling back local (holder missing object_id)"
+                    );
+                }
                 return self.local_timed_wait(&holders, timeout_ns);
             };
             object_ids.push(object_id);
@@ -158,12 +194,8 @@ impl MultiWait {
         holders: &[*mut MultiWaitHolder],
         timeout_ns: i64,
     ) -> Option<*mut MultiWaitHolder> {
-        for &holder in holders {
-            unsafe {
-                if (*holder).is_signaled() {
-                    return Some(holder);
-                }
-            }
+        if let Some(holder) = self.local_try_wait_any(holders) {
+            return Some(holder);
         }
 
         if timeout_ns == 0 {
@@ -171,15 +203,22 @@ impl MultiWait {
         }
 
         loop {
-            for &holder in holders {
-                unsafe {
-                    if (*holder).is_signaled() {
-                        return Some(holder);
-                    }
-                }
+            if let Some(holder) = self.local_try_wait_any(holders) {
+                return Some(holder);
             }
             std::thread::sleep(std::time::Duration::from_micros(100));
         }
+    }
+
+    fn local_try_wait_any(&self, holders: &[*mut MultiWaitHolder]) -> Option<*mut MultiWaitHolder> {
+        for &holder in holders {
+            unsafe {
+                if (*holder).is_signaled() {
+                    return Some(holder);
+                }
+            }
+        }
+        None
     }
 }
 

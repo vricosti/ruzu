@@ -30,11 +30,24 @@ fn ipc_timeout_tick_from_ns(current_tick: i64, timeout_ns: i64) -> i64 {
     }
 }
 
+fn should_trace_sync_handle(session_handle: Handle) -> bool {
+    std::env::var("RUZU_LOG_SVC_SYNC_HANDLE")
+        .ok()
+        .and_then(|value| {
+            let trimmed = value.trim_start_matches("0x").trim_start_matches("0X");
+            u32::from_str_radix(trimmed, 16)
+                .ok()
+                .or_else(|| value.parse::<u32>().ok())
+        })
+        .is_some_and(|target| target == session_handle)
+}
+
 fn send_sync_request_impl(
     system: &System,
     session_handle: Handle,
     message_address: u64,
 ) -> ResultCode {
+    let trace_sync = should_trace_sync_handle(session_handle);
     let (client_session, session_object_id) = {
         let process = system.current_process_arc().lock().unwrap();
         let Some(object_id) = process.handle_table.get_object(session_handle) else {
@@ -56,35 +69,74 @@ fn send_sync_request_impl(
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         (client_session, object_id)
     };
+    if trace_sync {
+        log::info!("svc::SendSyncRequest stage=resolved_client_session");
+    }
 
     let (request_manager, mut context, request_message_address) = {
-        let mut process = system.current_process_arc().lock().unwrap();
-        let send_result = client_session
-            .lock()
-            .unwrap()
-            .send_sync_request_with_process(&mut process, message_address as usize, 0);
-        if send_result != 0 {
-            return ResultCode::new(send_result);
+        let (server_session, manager) = {
+            let mut process = system.current_process_arc().lock().unwrap();
+            if trace_sync {
+                log::info!("svc::SendSyncRequest stage=enqueue_request");
+            }
+            let send_result = client_session
+                .lock()
+                .unwrap()
+                .send_sync_request_with_process(&mut process, message_address as usize, 0);
+            if send_result != 0 {
+                return ResultCode::new(send_result);
+            }
+
+            let parent_id = match client_session.lock().unwrap().get_parent_id() {
+                Some(parent_id) => parent_id,
+                None => {
+                    if trace_sync {
+                        log::info!("svc::SendSyncRequest stage=missing_parent_id");
+                    }
+                    return RESULT_INVALID_HANDLE;
+                }
+            };
+            let Some(parent_session) = process.get_session_by_object_id(parent_id) else {
+                if trace_sync {
+                    log::info!(
+                        "svc::SendSyncRequest stage=missing_parent_session parent_id={:#x}",
+                        parent_id
+                    );
+                }
+                return RESULT_INVALID_HANDLE;
+            };
+            let server_session = parent_session.lock().unwrap().get_server_session().clone();
+            let manager = match server_session.lock().unwrap().get_manager().cloned() {
+                Some(manager) => manager,
+                None => {
+                    if trace_sync {
+                        log::info!(
+                            "svc::SendSyncRequest stage=missing_server_manager parent_id={:#x}",
+                            parent_id
+                        );
+                    }
+                    return RESULT_INVALID_HANDLE;
+                }
+            };
+            (server_session, manager)
+        };
+        if trace_sync {
+            log::info!("svc::SendSyncRequest stage=receive_request_hle_begin");
         }
 
-        let parent_id = match client_session.lock().unwrap().get_parent_id() {
-            Some(parent_id) => parent_id,
-            None => return RESULT_INVALID_HANDLE,
-        };
-        let Some(parent_session) = process.get_session_by_object_id(parent_id) else {
-            return RESULT_INVALID_HANDLE;
-        };
-        let server_session = parent_session.lock().unwrap().get_server_session().clone();
-        let manager = match server_session.lock().unwrap().get_manager().cloned() {
-            Some(manager) => manager,
-            None => return RESULT_INVALID_HANDLE,
-        };
+        // Do not hold the owner `KProcess` lock across `receive_request_hle()`.
+        // That path resolves the request client thread through kernel process
+        // lookup, which would re-enter the same process mutex and deadlock on
+        // the first synchronous IPC to services like "sm:".
         let receive_result = {
             let mut server_session = server_session.lock().unwrap();
             server_session.receive_request_hle(Arc::clone(&manager))
         };
         match receive_result {
             Ok((context, manager, request_message_address)) => {
+                if trace_sync {
+                    log::info!("svc::SendSyncRequest stage=receive_request_hle_end");
+                }
                 (manager, context, request_message_address)
             }
             Err(_) => return RESULT_INVALID_HANDLE,
@@ -113,7 +165,13 @@ fn send_sync_request_impl(
         context.get_command(),
     );
 
+    if trace_sync {
+        log::info!("svc::SendSyncRequest stage=complete_sync_request_begin");
+    }
     let result = complete_sync_request(&request_manager, &mut context);
+    if trace_sync {
+        log::info!("svc::SendSyncRequest stage=complete_sync_request_end result={:#x}", result.get_inner_value());
+    }
     context.write_to_outgoing_command_buffer();
 
     if let Some(parent_session) = system
@@ -129,7 +187,13 @@ fn send_sync_request_impl(
         )
     {
         let server_session = parent_session.lock().unwrap().get_server_session().clone();
+        if trace_sync {
+            log::info!("svc::SendSyncRequest stage=send_reply_begin");
+        }
         let _ = server_session.lock().unwrap().send_reply();
+        if trace_sync {
+            log::info!("svc::SendSyncRequest stage=send_reply_end");
+        }
     }
 
     if result == crate::hle::service::ipc_helpers::RESULT_SESSION_CLOSED {

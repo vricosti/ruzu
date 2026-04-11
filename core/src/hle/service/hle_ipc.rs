@@ -295,9 +295,28 @@ pub fn complete_sync_request(
         guard.prepare_sync_request(context)
     };
 
+    let trace_dispatch = std::env::var_os("RUZU_HLE_DISPATCH_TRACE").is_some();
+
     let result = match dispatch {
         PreparedSyncRequest::Session(handler) | PreparedSyncRequest::Domain(handler) => {
-            handler.handle_sync_request(context)
+            if trace_dispatch {
+                log::warn!(
+                    "HLE dispatch enter service={} cmd={} tipc={}",
+                    handler.service_name(),
+                    context.get_command(),
+                    context.is_tipc()
+                );
+            }
+            let result = handler.handle_sync_request(context);
+            if trace_dispatch {
+                log::warn!(
+                    "HLE dispatch leave service={} cmd={} result={:#x}",
+                    handler.service_name(),
+                    context.get_command(),
+                    result.get_inner_value()
+                );
+            }
+            result
         }
         PreparedSyncRequest::CloseVirtualHandle(index) => {
             manager.lock().unwrap().close_domain_handler(index);

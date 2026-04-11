@@ -796,12 +796,17 @@ pub fn loop_process(system: crate::core::SystemRef) {
     use crate::hle::service::server_manager::ServerManager;
     use std::sync::Arc;
 
+    let trace_boot = std::env::var_os("RUZU_APPLET_BOOT_TRACE")
+        .is_some_and(|value| value != std::ffi::OsStr::new("0"));
     log::debug!("Account::LoopProcess - registering acc:u0, acc:u1, acc:su, acc:aa");
 
     let module = Arc::new(Module);
     let profile_manager = Arc::new(std::sync::Mutex::new(
         super::profile_manager::ProfileManager::new(),
     ));
+    if trace_boot {
+        log::info!("ACC::loop_process: profile manager ready");
+    }
 
     let mut server_manager = ServerManager::new(system);
 
@@ -817,6 +822,9 @@ pub fn loop_process(system: crate::core::SystemRef) {
             64,
         );
     }
+    if trace_boot {
+        log::info!("ACC::loop_process: registered acc:aa");
+    }
 
     // acc:su -> ACC_SU
     {
@@ -829,6 +837,9 @@ pub fn loop_process(system: crate::core::SystemRef) {
             }),
             64,
         );
+    }
+    if trace_boot {
+        log::info!("ACC::loop_process: registered acc:su");
     }
 
     // acc:u0 -> ACC_U0
@@ -843,6 +854,9 @@ pub fn loop_process(system: crate::core::SystemRef) {
             64,
         );
     }
+    if trace_boot {
+        log::info!("ACC::loop_process: registered acc:u0");
+    }
 
     // acc:u1 -> ACC_U1
     {
@@ -855,6 +869,9 @@ pub fn loop_process(system: crate::core::SystemRef) {
             }),
             64,
         );
+    }
+    if trace_boot {
+        log::info!("ACC::loop_process: registered acc:u1");
     }
 
     ServerManager::run_server(server_manager);

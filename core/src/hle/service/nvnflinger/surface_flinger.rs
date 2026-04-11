@@ -44,7 +44,8 @@ impl SurfaceFlinger {
             .get()
             .service_manager()
             .expect("SurfaceFlinger requires ServiceManager");
-        let nvdrv_service = ServiceManager::get_service_blocking(&service_manager, "nvdrv:s");
+        let nvdrv_service =
+            ServiceManager::get_service_blocking(&service_manager, system, "nvdrv:s");
         let nvdrv = nvdrv_service
             .as_any()
             .downcast_ref::<NvdrvService>()

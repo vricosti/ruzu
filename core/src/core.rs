@@ -838,6 +838,15 @@ impl System {
             // Extract program_id in a separate binding so the MutexGuard<KProcess>
             // is dropped before calling create_and_insert_by_frontend_applet_parameters.
             let app_program_id = process_arc.lock().unwrap().get_program_id();
+            let trace_boot = std::env::var_os("RUZU_APPLET_BOOT_TRACE")
+                .is_some_and(|value| value != std::ffi::OsStr::new("0"));
+            if trace_boot {
+                log::info!(
+                    "System::load: queueing frontend applet parameters program_id={:016X} main_tid={}",
+                    app_program_id,
+                    app_thread_id
+                );
+            }
 
             // Upstream: CreateAndInsertByFrontendAppletParameters stores process +
             // params and notifies the CV. SetWindowSystem (running on the
@@ -863,6 +872,9 @@ impl System {
                         init_func: guest_thread_func,
                     },
                 );
+            if trace_boot {
+                log::info!("System::load: frontend applet parameters queued");
+            }
 
             self.current_process_arc = Some(process_arc);
         }

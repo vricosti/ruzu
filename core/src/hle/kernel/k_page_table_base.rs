@@ -3685,24 +3685,23 @@ impl KPageTableBase {
                         DisableMergeAttribute::NONE
                     };
 
-                    let tail_attr = if cur_end == src_map_end
-                        && info.get_end_address() == src_map_end
-                    {
-                        // Upstream: if (next_it != end) lock_count +=
-                        //     next_it->GetIpcDisableMergeCount() - next_it->GetIpcLockCount();
-                        let next_contribution = infos.get(i + 1).map_or(0i32, |next| {
-                            next.get_ipc_disable_merge_count() as i32
-                                - next.get_ipc_lock_count() as i32
-                        });
-                        let lock_count = info.get_ipc_lock_count() as i32 + next_contribution;
-                        if lock_count == 0 {
-                            DisableMergeAttribute::ENABLE_TAIL
+                    let tail_attr =
+                        if cur_end == src_map_end && info.get_end_address() == src_map_end {
+                            // Upstream: if (next_it != end) lock_count +=
+                            //     next_it->GetIpcDisableMergeCount() - next_it->GetIpcLockCount();
+                            let next_contribution = infos.get(i + 1).map_or(0i32, |next| {
+                                next.get_ipc_disable_merge_count() as i32
+                                    - next.get_ipc_lock_count() as i32
+                            });
+                            let lock_count = info.get_ipc_lock_count() as i32 + next_contribution;
+                            if lock_count == 0 {
+                                DisableMergeAttribute::ENABLE_TAIL
+                            } else {
+                                DisableMergeAttribute::NONE
+                            }
                         } else {
                             DisableMergeAttribute::NONE
-                        }
-                    } else {
-                        DisableMergeAttribute::NONE
-                    };
+                        };
 
                     let properties = KPageProperties {
                         perm: info.get_permission(),
