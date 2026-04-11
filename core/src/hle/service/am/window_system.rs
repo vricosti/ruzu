@@ -25,6 +25,9 @@ pub enum ButtonPressDuration {
 /// Manages the foreground/background state of applets and dispatches
 /// lifecycle events. Mirrors upstream window_system.h fields.
 pub struct WindowSystem {
+    /// Upstream: `Core::System& m_system`
+    system: crate::core::SystemRef,
+
     /// Event observer — upstream: EventObserver* m_event_observer
     /// Owned here so its lifetime is tied to WindowSystem, not to the
     /// loop_process stack frame (which returns as soon as the service
@@ -57,8 +60,9 @@ struct WindowSystemInner {
 }
 
 impl WindowSystem {
-    pub fn new() -> Self {
+    pub fn new(system: crate::core::SystemRef) -> Self {
         Self {
+            system,
             event_observer: None,
             lock: Mutex::new(WindowSystemInner {
                 home_menu_foreground_locked: false,
@@ -72,7 +76,11 @@ impl WindowSystem {
     }
 
     /// Upstream: void SetEventObserver(EventObserver* event_observer)
-    /// Takes ownership of the EventObserver so it outlives loop_process.
+    ///
+    /// Rust only stores the observer here. The blocking
+    /// `AppletManager::set_window_system(...)` call is performed by `am.rs`
+    /// after AM service registration so `loop_process()` does not deadlock
+    /// before `appletOE` / `appletAE` are published.
     pub fn set_event_observer(&mut self, observer: Box<EventObserver>) {
         self.event_observer = Some(observer);
     }
@@ -458,6 +466,20 @@ impl WindowSystem {
         drop(a);
         for child in &children {
             self.update_applet_state_locked(inner, child, is_foreground);
+        }
+    }
+}
+
+impl Drop for WindowSystem {
+    fn drop(&mut self) {
+        if !self.system.is_null() {
+            // The `None` branch in `AppletManager::set_window_system(...)` is
+            // intentionally non-blocking; Drop must never wait for pending
+            // frontend process parameters here.
+            self.system
+                .get()
+                .get_applet_manager()
+                .set_window_system(None::<Arc<Mutex<WindowSystem>>>);
         }
     }
 }

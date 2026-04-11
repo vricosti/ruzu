@@ -26,22 +26,13 @@ pub fn loop_process(service_manager: &Arc<Mutex<ServiceManager>>, system: crate:
 
     // Create a shared WindowSystem, matching upstream ownership in window_system.cpp
     // as closely as possible while preserving Rust Arc ownership.
-    let window_system = Arc::new(Mutex::new(WindowSystem::new()));
+    let window_system = Arc::new(Mutex::new(WindowSystem::new(system)));
     let window_system_ptr = {
         let mut guard = window_system.lock().unwrap();
         &mut *guard as *mut WindowSystem
     };
-    let ws_for_event_thread = window_system.clone();
-    let system_for_event_thread = system;
-    let event_observer = Box::new(EventObserver::new(
-        window_system_ptr as *const WindowSystem,
-        Some(Box::new(move || {
-            system_for_event_thread
-                .get()
-                .get_applet_manager()
-                .set_window_system(Some(ws_for_event_thread));
-        })),
-    ));
+    let event_observer = Box::new(EventObserver::new(window_system_ptr as *const WindowSystem));
+
     {
         let mut guard = window_system.lock().unwrap();
         guard.set_event_observer(event_observer);
@@ -70,6 +61,18 @@ pub fn loop_process(service_manager: &Arc<Mutex<ServiceManager>>, system: crate:
         )
     });
     server_manager.register_named_service("appletAE", factory_ae, 64);
+
+    // Upstream reaches `AppletManager::SetWindowSystem(this)` from
+    // `EventObserver -> WindowSystem::SetEventObserver()`. Rust keeps the same
+    // owners but performs the blocking call here, after both AM services are
+    // published and outside the `WindowSystem` mutex, to avoid deadlocking
+    // service registration before the frontend provides the pending process.
+    // This is also the Rust owner for the upstream blocking wait until the
+    // frontend has provided `CreateAndInsertByFrontendAppletParameters`.
+    system
+        .get()
+        .get_applet_manager()
+        .set_window_system(Some(window_system.clone()));
 
     ServerManager::run_server(server_manager);
 }

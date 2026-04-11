@@ -43,6 +43,14 @@ impl MultiWait {
     }
 
     /// Port of upstream `MultiWait::MoveAll`.
+    ///
+    /// IMPORTANT: callers must NOT pass an `other` that was created via
+    /// `std::mem::take()` from another `MultiWait` field. Each holder stores a
+    /// raw pointer to the `MultiWait` it belongs to, and `mem::take` moves the
+    /// holders Vec into a new MultiWait at a different memory location, which
+    /// makes those raw pointers stale. `unlink_from_multi_wait` then no-ops
+    /// (because it points to the old, now-empty location), and this loop spins
+    /// forever. Always pass `&mut field` from the same struct as `self`.
     pub fn move_all(&mut self, other: &mut MultiWait) {
         while let Some(holder) = other.holders.first().copied() {
             unsafe {

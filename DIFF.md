@@ -7288,6 +7288,109 @@
 ### Binary layout verification
 - PASS: AM bootstrap threading only; no raw serialized struct layout changed.
 
+## 2026-04-10 — `core/src/hle/service/server_manager.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/hle/service/server_manager.h` and `/home/vricosti/Dev/emulators/zuyu/src/core/hle/service/server_manager.cpp`
+
+### Intentional differences
+- Rust still uses a bounded fallback for `StartAdditionalHostThreads(...)`: the extra host threads exist with real dummy `KThread` owners, but they still do not execute the full upstream concurrent `LoopProcessImpl()` model on the shared `ServerManager`.
+- Rust still gates the guest-kernel wait path on `KernelCore::is_current_thread_guest_core()` to avoid the current fiber hijack on host service threads. Upstream host service threads block directly in `WaitAny(...)`; this remains a temporary behavioral workaround, not parity.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: the host-thread fallback wait path no longer clears the sticky wakeup event immediately before `wait_timeout(...)`. That clear introduced a lost-wakeup race not present in upstream `WaitAny(...)`.
+
+### Missing items
+- Port the real concurrent `LoopProcessImpl()` model for additional host threads.
+- Remove the `is_current_thread_guest_core()` workaround once host service threads can safely participate in guest wait/schedule primitives without stealing guest fibers.
+
+### Binary layout verification
+- PASS: event-loop/wait control flow only; no raw serialized struct layout changed.
+
+## 2026-04-10 — `core/src/hle/service/am/event_observer.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/hle/service/am/event_observer.cpp`
+
+### Intentional differences
+- Rust `EventObserver::new(...)` still does not itself complete the full upstream
+  `m_window_system.SetEventObserver(this) -> AppletManager::SetWindowSystem(this)`
+  chain inline during construction. The observer is still owned by
+  `WindowSystem`, but the blocking `AppletManager::set_window_system(...)` call
+  is ordered by `am.rs` after AM service registration to avoid deadlocking
+  `loop_process()` before `appletOE` / `appletAE` are published.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `wait_signaled()` no longer clears the sticky wakeup event immediately before `wait_timeout(...)`. That clear could erase a concurrent signal and introduce a lost-wakeup window not present in upstream `WaitAny(...)`.
+- Fixed in this pass: the extra Rust-only `am:SetWindowSystem` helper thread was removed.
+- Fixed in this pass: `EventObserver::new(...)` no longer carries the temporary startup callback; AM bootstrap is back on the upstream `WindowSystem::set_event_observer() -> AppletManager::set_window_system(...)` callsite.
+
+### Missing items
+- none for this owner in the AM bootstrap path
+
+### Binary layout verification
+- PASS: event-thread lifecycle only; no raw serialized struct layout changed.
+
+## 2026-04-10 — `core/src/hle/service/am/am.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/hle/service/am/am.cpp`
+
+### Intentional differences
+- Rust still does not port upstream `ButtonPoller` ownership in this file.
+- Rust performs the blocking `AppletManager::set_window_system(...)` call after
+  registering `appletOE` / `appletAE`, instead of reaching it inline from
+  `WindowSystem::set_event_observer()`. The owners now match upstream, but the
+  call ordering remains adapted so AM service publication cannot deadlock on the
+  frontend-pending-process wait.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `AM::loop_process(...)` no longer spawns the Rust-only host thread `am:SetWindowSystem`.
+- Fixed in this pass: `AM::loop_process(...)` no longer routes `set_window_system(...)` through the `EventObserver` bootstrap callback.
+
+### Missing items
+- Port the remaining upstream `ButtonPoller` owner into the AM bootstrap path.
+
+### Binary layout verification
+- PASS: service bootstrap threading only; no raw serialized struct layout changed.
+
+## 2026-04-10 — `core/src/hle/service/am/applet_manager.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/hle/service/am/applet_manager.cpp`
+
+### Intentional differences
+- none in this slice
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `set_window_system(...)` no longer waits forever for `pending_process` during shutdown. The wait now polls the condition variable with a timeout and exits once `System::is_shutting_down()` becomes true, preventing shutdown deadlock of the temporary helper thread.
+
+### Missing items
+- none for this bootstrap callsite; broader `AppletManager` parity remains tracked in earlier entries.
+
+### Binary layout verification
+- PASS: condition-variable wait logic only; no raw serialized struct layout changed.
+
+## 2026-04-10 — `core/src/hle/service/am/window_system.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/hle/service/am/window_system.cpp`
+
+### Intentional differences
+- Rust stores `SystemRef` and owns the `EventObserver` by value in this owner, replacing upstream raw references/pointers with Rust lifetime-safe ownership.
+- `WindowSystem::set_event_observer()` is a pure observer setter in Rust. The
+  blocking `AppletManager::set_window_system(Some(owner))` call is ordered by
+  `am.rs` after AM service registration, rather than inline under the
+  `WindowSystem` mutex, to avoid deadlocking service publication.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `Drop for WindowSystem` now mirrors upstream destructor behavior by calling `AppletManager::set_window_system(None)`.
+
+### Missing items
+- Port the remaining upstream `ButtonPoller` owner into the AM bootstrap path.
+
+### Binary layout verification
+- PASS: service bootstrap ownership only; no raw serialized struct layout changed.
+
+## 2026-04-10 — `core/src/hle/kernel/kernel.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/kernel.cpp`
+
+### Intentional differences
+- Rust exposes `is_current_thread_guest_core()` as a local helper derived from host-thread IDs. Upstream has no direct helper with this name; this is a temporary scheduling workaround used by the Rust `ServerManager` fallback path.
+
+### Unintentional differences (to fix)
+- none in this bounded helper-only slice
+
+### Missing items
+- Remove the helper once the host-service-thread wait path no longer needs the current fiber-hijack workaround.
+
+### Binary layout verification
+- PASS: helper-only change; no raw serialized struct layout changed.
+
 ### Binary layout verification
 - PASS: service bootstrap wiring only; no raw serialized struct layout changed.
 

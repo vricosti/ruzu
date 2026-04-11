@@ -1070,6 +1070,17 @@ impl KernelCore {
         self.schedulers.get(core_id as usize)
     }
 
+    /// Temporary workaround for the current fiber-return-to-originating-thread
+    /// behavior: returns true only for the `NUM_CPU_CORES` dedicated guest
+    /// core OS threads and false for HLE host service threads, the main
+    /// thread, etc.
+    ///
+    /// TODO: remove this once host service waits no longer need the
+    /// guest-core/host-thread split workaround in `ServerManager`.
+    pub fn is_current_thread_guest_core(&self) -> bool {
+        self.get_current_host_thread_id() < hardware_properties::NUM_CPU_CORES
+    }
+
     /// Get the physical core index for the calling host thread.
     /// Upstream: `KernelCore::CurrentPhysicalCoreIndex()` (kernel.cpp:940-946).
     pub fn current_physical_core_index(&self) -> usize {

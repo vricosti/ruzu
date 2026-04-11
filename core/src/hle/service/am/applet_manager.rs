@@ -393,10 +393,17 @@ impl AppletManager {
 
         // Block until CreateAndInsertByFrontendAppletParameters has been called.
         // Upstream: `m_cv.wait(lk, [&] { return m_pending_process != nullptr; })`
-        inner = self
-            .cv
-            .wait_while(inner, |inner| inner.pending_process.is_none())
-            .unwrap();
+        while inner.pending_process.is_none() {
+            let (next_inner, _timeout) = self
+                .cv
+                .wait_timeout(inner, std::time::Duration::from_millis(100))
+                .unwrap();
+            inner = next_inner;
+
+            if !self.system.is_null() && self.system.get().is_shutting_down() {
+                return;
+            }
+        }
 
         let window_system = inner.window_system.clone().unwrap();
         let process = inner.pending_process.take().unwrap();
@@ -569,5 +576,34 @@ impl AppletManager {
         if let Some(ws) = inner.window_system.clone() {
             ws.lock().unwrap().on_operation_mode_changed();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    #[test]
+    fn set_window_system_returns_during_shutdown_without_pending_process() {
+        let system = crate::core::System::new();
+        let mut manager = AppletManager::new();
+        manager.set_system(crate::core::SystemRef::from_ref(&system));
+        let manager = Arc::new(manager);
+        let window_system = Arc::new(Mutex::new(WindowSystem::new(
+            crate::core::SystemRef::from_ref(&system),
+        )));
+
+        let manager_for_thread = Arc::clone(&manager);
+        let window_system_for_thread = Arc::clone(&window_system);
+        let waiter = std::thread::spawn(move || {
+            manager_for_thread.set_window_system(Some(window_system_for_thread));
+        });
+
+        std::thread::sleep(Duration::from_millis(150));
+        system.set_shutting_down(true);
+
+        waiter.join().unwrap();
     }
 }
