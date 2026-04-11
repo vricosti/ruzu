@@ -372,17 +372,29 @@ impl ServerManager {
         }
 
         // No events signaled.
-        // Upstream blocks in MultiWait::WaitAny(m_system.Kernel()), which yields
-        // the current guest service thread until another waitable becomes
-        // signaled. Our service-layer polling path cannot block on kernel
-        // objects yet, so explicitly yield the current guest thread back to the
-        // scheduler instead of sleeping the core OS thread.
-        if self.wait_guest_thread() {
-            return false;
+        // Upstream blocks in MultiWait::WaitAny(m_system.Kernel()). Rust still
+        // lacks real kernel-backed MultiWait integration, so split the fallback:
+        // guest core service threads can still block through the guest wakeup
+        // event, but host service threads must never enter guest wait/schedule
+        // primitives or they can end up running guest fibers on the host OS
+        // thread.
+        if !self.system.is_null() {
+            if let Some(kernel) = self.system.get().kernel() {
+                if kernel.is_current_thread_guest_core() {
+                    if self.wait_guest_thread() {
+                        return false;
+                    }
+                } else {
+                    self.wakeup_event.wait_timeout(Duration::from_millis(100));
+                    return false;
+                }
+            }
         }
 
-        // No current guest thread (tests / host-thread fallback). Avoid a hot
-        // busy-loop, but do not force a 100 µs sleep on the guest-core path.
+        // No current guest thread / null system (tests and local harnesses).
+        // Keep the historical fallback here instead of blocking on guest wait
+        // primitives when there is no real kernel-backed service thread to
+        // suspend.
         std::thread::yield_now();
         false
     }

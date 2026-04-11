@@ -48,10 +48,7 @@ impl EventObserver {
     /// Creates the event observer and starts the background processing thread.
     /// The WindowSystem pointer must remain valid for the lifetime of this
     /// EventObserver (matching upstream lifetime contract).
-    pub fn new(
-        window_system: *const WindowSystem,
-        on_thread_start: Option<Box<dyn FnOnce() + Send>>,
-    ) -> Self {
+    pub fn new(window_system: *const WindowSystem) -> Self {
         let wakeup_event = Arc::new(Event::new());
         let mut observer_state = ObserverState {
             process_holder_list: Vec::new(),
@@ -78,9 +75,6 @@ impl EventObserver {
         let thread = std::thread::Builder::new()
             .name("am:EventObserver".into())
             .spawn(move || {
-                if let Some(init_fn) = on_thread_start {
-                    init_fn();
-                }
                 Self::thread_func(shared_clone);
             })
             .expect("Failed to spawn EventObserver thread");
@@ -134,9 +128,21 @@ impl EventObserver {
 
     fn link_deferred(shared: &SharedState) {
         let mut state = shared.state.lock().unwrap();
-        let mut deferred = std::mem::take(&mut state.deferred_wait_list);
-        state.multi_wait.move_all(&mut deferred);
-        state.deferred_wait_list = deferred;
+        // Upstream: m_multi_wait.MoveAll(std::addressof(m_deferred_wait_list));
+        //
+        // CRITICAL: We must NOT use std::mem::take() to swap the deferred list
+        // out of `state` and back, because each holder stores a raw pointer to
+        // the MultiWait it belongs to. Moving the MultiWait to a different
+        // memory location invalidates those pointers and makes
+        // `unlink_from_multi_wait` a no-op, causing `move_all`'s while-loop to
+        // spin forever and burn 100% CPU on the EventObserver thread.
+        //
+        // Split-borrow the two fields so the holder pointers stay valid
+        // relative to `state.deferred_wait_list`.
+        let state_ref = &mut *state;
+        state_ref
+            .multi_wait
+            .move_all(&mut state_ref.deferred_wait_list);
     }
 
     fn wait_signaled(shared: &SharedState) -> Option<*mut MultiWaitHolder> {
@@ -166,7 +172,13 @@ impl EventObserver {
                 return Some(holder);
             }
 
-            std::thread::sleep(std::time::Duration::from_micros(100));
+            // Block on the wakeup event with a long timeout instead of a 100µs
+            // sleep loop. Do not clear before waiting: Event signal is sticky,
+            // and clearing here would create a lost-wakeup race if another
+            // thread signals between the last poll above and this wait.
+            shared
+                .wakeup_event
+                .wait_timeout(std::time::Duration::from_millis(100));
         }
     }
 

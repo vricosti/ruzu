@@ -118,6 +118,91 @@ In ruzu (broken), all worker threads queue on core=0:
 In zuyu, workers run on cores 1-3 IMMEDIATELY in parallel with the game on core 0.
 The wait → signal → wake sequence happens within milliseconds.
 
+## REAL ROOT CAUSE: Spinning host service threads (now partially fixed)
+
+After deeper investigation with `ps -eLo pid,lwp,%cpu,comm`, the actual
+problem was discovered: **HLE host service threads were spinning at 100%
+CPU each**, consuming all host CPU and starving the actual emulation cores.
+
+### Evidence (before fix)
+
+```
+Total process CPU: 864%
+am:EventObserve  100%   (was busy-spinning)
+HLE:Loader        97%
+HLE:ldn           97%
+HLE:audio         97%
+HLE:nvservices    96%
+HLE:FS            95%
+HLE:vi            94%
+HLE:bsdsocket     94%
+HLE:jit           94%
+CPUCore_0          4%   <-- the actual game emulation
+```
+
+8 HLE service threads × 95% CPU = 760% CPU wasted on spin loops.
+Meanwhile CPUCore_0 (the JIT thread that actually runs the game)
+got only 4% CPU due to host scheduler contention.
+
+### The bugs
+
+1. **`ServerManager::wait_and_process_impl`** at line 386 was calling
+   `std::thread::yield_now()` when no events were ready. This is
+   *not* a sleep — it returns immediately on most platforms, creating
+   a tight 100% CPU spin loop. Fixed by using `wakeup_event.wait_timeout`
+   with proper signal clearing.
+
+2. **`EventObserver::wait_signaled`** at line 178 was calling
+   `std::thread::sleep(Duration::from_micros(100))` between holder
+   polls = 10,000 iterations/sec on a single thread. Fixed by using
+   `wakeup_event.wait_timeout` with proper signal clearing.
+
+3. **AM `set_window_system` was hijacking the EventObserver thread**:
+   the previous fix had moved the `set_window_system` blocking wait
+   onto the EventObserver thread via an `on_thread_start` callback.
+   When `set_window_system → process.run` made the game's main thread
+   runnable, fiber scheduling caused the EventObserver OS thread to
+   end up running the game's JIT (fibers run on whatever OS thread
+   calls the scheduler). Fixed by spawning a dedicated `am:SetWindowSystem`
+   OS thread for that wait.
+
+### Result of fixes
+
+- Total process CPU: **864% → 123%** (7× reduction)
+- HLE service threads now correctly idle at 0% CPU
+- Game progresses further (last SVC moved from t=4.5s to t=6.2s)
+
+### Remaining problem
+
+`am:EventObserver` thread still spikes to 99.9% CPU **but it's no longer
+spinning in event_observer.rs code**. Diagnostic logging confirmed
+`wait_signaled` is only called ~3 times in 5 seconds, blocking properly
+on the wakeup_event condvar.
+
+The CPU is being consumed by **fiber-scheduled JIT execution running on
+the EventObserver OS thread**. This is a deeper architectural issue:
+ruzu's fibers run on whatever OS thread happens to call into the
+scheduler, not on dedicated `CPUCore_X` threads. When the EventObserver
+thread (or any AM service thread) calls into kernel code, it can end up
+running a guest thread fiber, which makes that OS thread the de facto
+JIT execution thread.
+
+This explains why CPUCore_0 only shows 19% CPU — most of the JIT work
+runs on the EventObserver thread instead. The thread name is misleading
+because pthread names don't change with fiber context.
+
+### Next investigation
+
+The fiber/scheduler architecture needs review. Fibers should ideally
+only run on dedicated CPUCore_X threads, not on service threads. This
+likely requires:
+- A real cross-thread scheduler that wakes up CPUCore_X threads when a
+  KThread becomes runnable
+- Service threads should NEVER call into the scheduler in a way that
+  causes them to switch to a guest fiber
+- Or alternatively, host service threads should never block on guest
+  kernel APIs that require fiber switching
+
 ## VERIFIED ROOT CAUSE: JIT Throughput
 
 After 5+ minute runs with thread_probe and PC sampling:
