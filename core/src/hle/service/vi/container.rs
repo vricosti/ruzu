@@ -80,7 +80,8 @@ impl Container {
                 .get()
                 .service_manager()
                 .expect("Container::new: missing ServiceManager");
-            let binder_driver = ServiceManager::get_service_blocking(&service_manager, "dispdrv");
+            let binder_driver =
+                ServiceManager::get_service_blocking(&service_manager, system, "dispdrv");
             let binder_driver_impl = binder_driver
                 .as_any()
                 .downcast_ref::<IHosBinderDriver>()
@@ -88,7 +89,8 @@ impl Container {
             let server = Arc::clone(binder_driver_impl.get_server());
             let surface_flinger = binder_driver_impl.get_surface_flinger();
 
-            let nvdrv = ServiceManager::get_service_blocking(&service_manager, "nvdrv:s");
+            let nvdrv =
+                ServiceManager::get_service_blocking(&service_manager, system, "nvdrv:s");
             let nvdrv = nvdrv
                 .as_any()
                 .downcast_ref::<crate::hle::service::nvdrv::nvdrv_interface::NvdrvService>()

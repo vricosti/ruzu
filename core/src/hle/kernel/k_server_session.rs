@@ -1532,22 +1532,7 @@ impl KServerSession {
     fn resolve_request_client_thread(
         request: &Arc<Mutex<KSessionRequest>>,
     ) -> Option<Arc<Mutex<crate::hle::kernel::k_thread::KThread>>> {
-        let (client_process_id, thread_id) = {
-            let request_guard = request.lock().unwrap();
-            (
-                request_guard.get_client_process_id(),
-                request_guard.get_thread_id(),
-            )
-        };
-        let (Some(client_process_id), Some(thread_id)) = (client_process_id, thread_id) else {
-            return None;
-        };
-        let kernel = crate::hle::kernel::kernel::get_kernel_ref()?;
-        let process = kernel.get_process_by_id(client_process_id)?;
-        {
-            let process = process.lock().unwrap();
-            process.get_thread_by_thread_id(thread_id)
-        }
+        request.lock().unwrap().get_thread()
     }
 
     fn reply_async_error(
@@ -1695,11 +1680,18 @@ impl KServerSession {
         _server_message_paddr: u64,
         is_hle: bool,
     ) -> u32 {
+        let trace_reply = is_hle && std::env::var_os("RUZU_LOG_SYNC_REPLY").is_some();
         let Some(request) = self.current_request.take() else {
             return RESULT_INVALID_STATE.get_inner_value();
         };
+        if trace_reply {
+            log::info!("KServerSession::send_reply_with_message stage=took_current_request");
+        }
         if self.current_request.is_none() {
             self.clear_current_request_and_notify();
+        }
+        if trace_reply {
+            log::info!("KServerSession::send_reply_with_message stage=cleared_current_request");
         }
 
         let client_thread = Self::resolve_request_client_thread(&request);
@@ -1712,6 +1704,16 @@ impl KServerSession {
                 request.get_size(),
             )
         };
+        if trace_reply {
+            log::info!(
+                "KServerSession::send_reply_with_message stage=resolved_request client_thread={} event_id={:?} client_process_id={:?} addr={:#x} size={:#x}",
+                client_thread.is_some(),
+                event_id,
+                client_process_id,
+                client_message,
+                client_buffer_size
+            );
+        }
         let closed = client_thread.is_none() || self.client_closed;
 
         let mut result = crate::hle::result::RESULT_SUCCESS.get_inner_value();
@@ -1744,6 +1746,14 @@ impl KServerSession {
         } else {
             result = crate::hle::result::RESULT_SUCCESS.get_inner_value();
         }
+        if trace_reply {
+            log::info!(
+                "KServerSession::send_reply_with_message stage=selected_results closed={} client_result={:#x} result={:#x}",
+                closed,
+                client_result,
+                result
+            );
+        }
 
         if let Some(event_id) = event_id {
             if let Some(client_process_id) = client_process_id {
@@ -1768,6 +1778,11 @@ impl KServerSession {
                                 .cloned()
                                 .or_else(|| kernel.scheduler(0).cloned())
                             {
+                                if trace_reply {
+                                    log::info!(
+                                        "KServerSession::send_reply_with_message stage=signal_async_event"
+                                    );
+                                }
                                 let _ = event.lock().unwrap().signal(&mut process, &scheduler);
                             }
                         }
@@ -1775,9 +1790,32 @@ impl KServerSession {
                 }
             }
         } else if let Some(client_thread) = &client_thread {
+            if trace_reply {
+                log::info!("KServerSession::send_reply_with_message stage=before_lock_client_thread");
+            }
             let mut client_thread = client_thread.lock().unwrap();
-            if !client_thread.is_termination_requested() {
+            if trace_reply {
+                log::info!(
+                    "KServerSession::send_reply_with_message stage=locked_client_thread state={:?}",
+                    client_thread.get_state()
+                );
+            }
+            if !client_thread.is_termination_requested()
+                && client_thread.get_state() == crate::hle::kernel::k_thread::ThreadState::WAITING
+            {
+                if trace_reply {
+                    log::info!("KServerSession::send_reply_with_message stage=before_end_wait");
+                }
                 client_thread.end_wait(client_result);
+                if trace_reply {
+                    log::info!("KServerSession::send_reply_with_message stage=after_end_wait");
+                }
+            } else if trace_reply {
+                log::info!(
+                    "KServerSession::send_reply_with_message stage=skip_end_wait state={:?} termination_requested={}",
+                    client_thread.get_state(),
+                    client_thread.is_termination_requested()
+                );
             }
         }
 
@@ -1786,6 +1824,9 @@ impl KServerSession {
             request.clear_thread();
             request.clear_event();
             request.finalize();
+        }
+        if trace_reply {
+            log::info!("KServerSession::send_reply_with_message stage=finalized_request");
         }
 
         result
@@ -1862,16 +1903,28 @@ impl KServerSession {
         &mut self,
         manager: Arc<Mutex<SessionRequestManager>>,
     ) -> Result<(HLERequestContext, Arc<Mutex<SessionRequestManager>>, u64), u32> {
-        let result = self.receive_request_with_message(0, 0, 0);
-        if result != 0 {
-            return Err(result);
+        if self.client_closed {
+            return Err(RESULT_SESSION_CLOSED.get_inner_value());
+        }
+        if self.current_request.is_some() {
+            return Err(RESULT_NOT_FOUND.get_inner_value());
         }
 
-        let current_request = self
-            .get_current_request()
-            .ok_or(RESULT_NOT_FOUND.get_inner_value())?;
-        let client_thread = Self::resolve_request_client_thread(&current_request)
-            .ok_or(RESULT_SESSION_CLOSED.get_inner_value())?;
+        let Some(current_request) = self.request_list.pop_front() else {
+            return Err(RESULT_NOT_FOUND.get_inner_value());
+        };
+        let Some(client_thread) = Self::resolve_request_client_thread(&current_request) else {
+            {
+                let mut request = current_request.lock().unwrap();
+                request.finalize();
+            }
+            if !self.request_list.is_empty() {
+                self.notify_available(crate::hle::result::RESULT_SUCCESS.get_inner_value());
+            }
+            return Err(RESULT_SESSION_CLOSED.get_inner_value());
+        };
+
+        self.current_request = Some(Arc::clone(&current_request));
         let request_message_address = {
             let request = current_request.lock().unwrap();
             let request_address = request.get_address() as u64;
@@ -2337,6 +2390,71 @@ mod tests {
             crate::hle::ipc::CommandType::Request as u32
         );
         assert_eq!(context.command_buffer()[6], 0x1111_2222);
+    }
+
+    #[test]
+    fn receive_request_hle_ignores_zero_request_size_for_tls_backed_sync_ipc() {
+        let mut system = crate::core::System::new_for_test();
+        let mut process = crate::hle::kernel::k_process::KProcess::new();
+        process.process_id = 9;
+        process.initialize_handle_table();
+        process.create_memory(&system);
+        process.allocate_code_memory(0x200000, 0x40000);
+        let process = Arc::new(Mutex::new(process));
+
+        let thread = Arc::new(Mutex::new(crate::hle::kernel::k_thread::KThread::new()));
+        {
+            let mut thread_guard = thread.lock().unwrap();
+            thread_guard.thread_id = 7;
+            thread_guard.object_id = 8;
+            thread_guard.parent = Some(Arc::downgrade(&process));
+            thread_guard.tls_address =
+                crate::hle::kernel::k_typed_address::KProcessAddress::new(0x2395000);
+        }
+        process
+            .lock()
+            .unwrap()
+            .register_thread_object(Arc::clone(&thread));
+
+        system.set_current_process_arc(Arc::clone(&process));
+
+        let mut request_words = [0u32; crate::hle::ipc::COMMAND_BUFFER_LENGTH];
+        let mut raw_high = 0u32;
+        raw_high |= 4;
+        request_words[0] = crate::hle::ipc::CommandType::Request as u32;
+        request_words[1] = raw_high;
+        request_words[4] = 0x4943_4653;
+        request_words[6] = 0x3333_4444;
+        let request_bytes: Vec<u8> = request_words
+            .iter()
+            .flat_map(|word| word.to_le_bytes())
+            .collect();
+        process
+            .lock()
+            .unwrap()
+            .write_block(0x2395200, &request_bytes);
+
+        let mut server = KServerSession::new();
+        server.initialize(0x1000);
+        let request = Arc::new(Mutex::new(KSessionRequest::new()));
+        {
+            let mut request_guard = request.lock().unwrap();
+            request_guard.thread_id = Some(7);
+            request_guard.client_process_id = Some(9);
+            request_guard.address = 0x2395200;
+            request_guard.size = 0;
+        }
+        server.request_list.push_back(request);
+
+        let manager = Arc::new(Mutex::new(SessionRequestManager::new()));
+        let (context, _, request_message_address) =
+            server.receive_request_hle(Arc::clone(&manager)).unwrap();
+        assert_eq!(request_message_address, 0x2395200);
+        assert_eq!(
+            context.command_buffer()[0],
+            crate::hle::ipc::CommandType::Request as u32
+        );
+        assert_eq!(context.command_buffer()[6], 0x3333_4444);
     }
 
     #[test]

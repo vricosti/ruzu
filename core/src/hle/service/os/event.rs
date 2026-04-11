@@ -95,6 +95,8 @@ impl Event {
     /// Signal the event. Wakes all waiters.
     /// Port of upstream `Event::Signal()` → `m_event->Signal()`.
     pub fn signal(&self) {
+        let trace_boot = std::env::var_os("RUZU_APPLET_BOOT_TRACE")
+            .is_some_and(|value| value != std::ffi::OsStr::new("0"));
         {
             let mut signaled = self.signaled.lock().unwrap();
             *signaled = true;
@@ -105,16 +107,27 @@ impl Event {
         // Bridge to kernel: signal the KReadableEvent to wake WaitSynchronization.
         if let Some(ref bridge) = *self.kernel_bridge.lock().unwrap() {
             let readable_object_id = bridge.readable_event.lock().unwrap().object_id;
+            if trace_boot {
+                log::info!(
+                    "Service::Event::signal: bridging readable_object_id={} begin",
+                    readable_object_id
+                );
+            }
             log::trace!(
                 "Service::Event::signal bridging readable_object_id={}",
                 readable_object_id
             );
-            let mut process = bridge.process.lock().unwrap();
-            bridge
-                .readable_event
-                .lock()
-                .unwrap()
-                .signal(&mut process, &bridge.scheduler);
+            KReadableEvent::signal_from_host_arc(
+                &bridge.readable_event,
+                &bridge.process,
+                &bridge.scheduler,
+            );
+            if trace_boot {
+                log::info!(
+                    "Service::Event::signal: bridge signal complete readable_object_id={}",
+                    readable_object_id
+                );
+            }
         }
     }
 

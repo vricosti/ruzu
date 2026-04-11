@@ -78,6 +78,7 @@ impl DisplayLayerManager {
         if let Some(service_manager) = system.get().service_manager() {
             let manager_root = crate::hle::service::sm::sm::ServiceManager::get_service_blocking(
                 &service_manager,
+                system,
                 "vi:m",
             );
             let manager_root = manager_root

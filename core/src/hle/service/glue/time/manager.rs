@@ -21,6 +21,7 @@ use crate::hle::service::sm::sm::ServiceManager;
 
 /// TimeManager corresponds to upstream `Glue::Time::TimeManager`.
 pub struct TimeManager {
+    system: crate::core::SystemRef,
     pub worker: TimeWorker,
     pub file_timestamp_worker: FileTimestampWorker,
     pub steady_clock_resource: StandardSteadyClockResource,
@@ -34,19 +35,21 @@ impl TimeManager {
     /// Matches upstream `TimeManager::TimeManager(Core::System& system)`.
     pub fn new(
         service_manager: Arc<Mutex<ServiceManager>>,
-        _system: crate::core::SystemRef,
+        system: crate::core::SystemRef,
     ) -> Self {
-        let time_m_handler = ServiceManager::get_service_blocking(&service_manager, "time:m");
+        let time_m_handler =
+            ServiceManager::get_service_blocking(&service_manager, system, "time:m");
         let time_m = time_m_handler
             .as_any()
             .downcast_ref::<TimeServiceManager>()
             .expect("time:m is not a PSC::Time::ServiceManager");
 
         Self {
+            system,
             worker: TimeWorker::new(),
             file_timestamp_worker: FileTimestampWorker::new(),
             steady_clock_resource: StandardSteadyClockResource::new(),
-            time_zone_binary: TimeZoneBinary::new(_system),
+            time_zone_binary: TimeZoneBinary::new(system),
             psc_time: time_m.shared_time(),
             time_sm: time_m.get_static_service_as_service_manager(),
             service_manager,
@@ -60,14 +63,21 @@ impl TimeManager {
     pub fn initialize(&mut self) {
         log::info!("Glue::Time::TimeManager: starting initialization");
 
-        let set_sys_handler =
-            ServiceManager::get_service_blocking(&self.service_manager, "set:sys");
+        let set_sys_handler = ServiceManager::get_service_blocking(
+            &self.service_manager,
+            self.system,
+            "set:sys",
+        );
         let set_sys = set_sys_handler
             .as_any()
             .downcast_ref::<SystemSettingsService>()
             .expect("set:sys is not an ISystemSettingsServer");
 
-        let time_m_handler = ServiceManager::get_service_blocking(&self.service_manager, "time:m");
+        let time_m_handler = ServiceManager::get_service_blocking(
+            &self.service_manager,
+            self.system,
+            "time:m",
+        );
         let time_m = time_m_handler
             .as_any()
             .downcast_ref::<TimeServiceManager>()

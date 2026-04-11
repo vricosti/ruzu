@@ -95,6 +95,60 @@ impl KEvent {
         result
     }
 
+    /// Rust helper for signaling a shared `KEvent` through the current owner process.
+    ///
+    /// Upstream stores the readable event inline and signals it directly. Rust stores
+    /// the owner `KEvent` and readable event in per-process object maps, so the hot path
+    /// resolves the readable end from the owner process and signals it without holding
+    /// the `KEvent` mutex across waiter wakeup.
+    pub fn signal_arc(
+        event: &Arc<Mutex<KEvent>>,
+        process: &Arc<Mutex<KProcess>>,
+        scheduler: &Arc<Mutex<KScheduler>>,
+    ) -> u32 {
+        let readable_event_id = {
+            let event = event.lock().unwrap();
+            if event.readable_event_destroyed {
+                return RESULT_SUCCESS.get_inner_value();
+            }
+            event.readable_event_id
+        };
+
+        let readable_event = {
+            let process = process.lock().unwrap();
+            let Some(readable_event) = process.get_readable_event_by_object_id(readable_event_id)
+            else {
+                return RESULT_SUCCESS.get_inner_value();
+            };
+            readable_event
+        };
+
+        super::k_readable_event::KReadableEvent::signal_from_host_arc(
+            &readable_event,
+            process,
+            scheduler,
+        )
+    }
+
+    /// Rust helper for clearing a shared `KEvent` through the current owner process.
+    pub fn clear_arc(event: &Arc<Mutex<KEvent>>, process: &Arc<Mutex<KProcess>>) -> u32 {
+        let readable_event_id = {
+            let event = event.lock().unwrap();
+            if event.readable_event_destroyed {
+                return RESULT_SUCCESS.get_inner_value();
+            }
+            event.readable_event_id
+        };
+
+        let process = process.lock().unwrap();
+        let Some(readable_event) = process.get_readable_event_by_object_id(readable_event_id)
+        else {
+            return RESULT_SUCCESS.get_inner_value();
+        };
+        let result = readable_event.lock().unwrap().clear();
+        result
+    }
+
     /// Called when the readable event is destroyed.
     pub fn on_readable_event_destroyed(&mut self) {
         self.readable_event_destroyed = true;

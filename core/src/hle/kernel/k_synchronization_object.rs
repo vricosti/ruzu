@@ -982,22 +982,45 @@ pub fn process_waiter_snapshot(
     waiter_thread_ids: &[u64],
     result: u32,
 ) -> NotifyWaitersOutcome {
+    let trace_boot = std::env::var_os("RUZU_APPLET_BOOT_TRACE")
+        .is_some_and(|value| value != std::ffi::OsStr::new("0"));
     let mut woke_any = false;
     let mut unlink_thread_ids = Vec::new();
 
     let mut woke_thread_ids = Vec::new();
 
     for waiter_thread_id in waiter_thread_ids.iter().copied() {
+        if trace_boot {
+            log::info!(
+                "process_waiter_snapshot: object_id={} visiting waiter_thread_id={}",
+                signaled_object_id,
+                waiter_thread_id
+            );
+        }
         let Some(waiter_thread) = process.get_thread_by_thread_id(waiter_thread_id) else {
             unlink_thread_ids.push(waiter_thread_id);
             continue;
         };
 
         let mut waiter_thread = waiter_thread.lock().unwrap();
+        if trace_boot {
+            log::info!(
+                "process_waiter_snapshot: object_id={} waiter_thread_id={} thread_locked",
+                signaled_object_id,
+                waiter_thread_id
+            );
+        }
         if waiter_thread.notify_available(process, signaled_object_id, result) {
             unlink_thread_ids.push(waiter_thread_id);
             woke_thread_ids.push(waiter_thread_id);
             woke_any = true;
+            if trace_boot {
+                log::info!(
+                    "process_waiter_snapshot: object_id={} waiter_thread_id={} woke",
+                    signaled_object_id,
+                    waiter_thread_id
+                );
+            }
         } else if waiter_thread.get_state() != super::k_thread::ThreadState::WAITING {
             unlink_thread_ids.push(waiter_thread_id);
         }
@@ -1005,6 +1028,13 @@ pub fn process_waiter_snapshot(
 
     // Push woken threads to PQ after thread locks are released.
     for thread_id in woke_thread_ids {
+        if trace_boot {
+            log::info!(
+                "process_waiter_snapshot: object_id={} pushing waiter_thread_id={} to PQ",
+                signaled_object_id,
+                thread_id
+            );
+        }
         process.push_back_to_priority_queue(thread_id);
     }
 

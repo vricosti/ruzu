@@ -6,6 +6,7 @@
 //! and method signatures from upstream.
 
 use std::collections::BTreeMap;
+use std::ffi::OsStr;
 use std::sync::atomic::{AtomicI64, AtomicU16};
 use std::sync::{Arc, Mutex, RwLock, Weak};
 
@@ -470,6 +471,10 @@ pub struct KProcess {
 
 /// Initial process ID range.
 impl KProcess {
+    fn boot_trace_enabled() -> bool {
+        std::env::var_os("RUZU_APPLET_BOOT_TRACE").is_some_and(|value| value != OsStr::new("0"))
+    }
+
     pub const INITIAL_PROCESS_ID_MIN: u64 = 1;
     pub const INITIAL_PROCESS_ID_MAX: u64 = 0x50;
     pub const PROCESS_ID_MIN: u64 = Self::INITIAL_PROCESS_ID_MAX + 1;
@@ -2216,6 +2221,7 @@ impl KProcess {
         init_func: Option<Box<dyn FnOnce() + Send>>,
     ) -> Result<(Arc<Mutex<KThread>>, Handle, u64, u64), u32> {
         use super::k_scoped_resource_reservation::KScopedResourceReservation;
+        let trace_boot = Self::boot_trace_enabled();
         let state = self.state;
         if state != ProcessState::Created && state != ProcessState::CreatedAttached {
             return Err(RESULT_INVALID_STATE.get_inner_value());
@@ -2224,6 +2230,16 @@ impl KProcess {
         let handle_result = self.ensure_handle_table_initialized();
         if handle_result != RESULT_SUCCESS.get_inner_value() {
             return Err(handle_result);
+        }
+        if trace_boot {
+            log::info!(
+                "KProcess::run: enter pid={} state={:?} prio={} stack_size=0x{:x} main_tid={}",
+                self.process_id,
+                state,
+                priority,
+                stack_size,
+                main_thread_id
+            );
         }
         log::trace!(
             "KProcess::run enter pid={} main_thread_id={} prio={} stack_size=0x{:x}",
@@ -2261,6 +2277,13 @@ impl KProcess {
         let tls_address = self
             .create_thread_local_region()
             .ok_or_else(|| RESULT_INVALID_STATE.get_inner_value())?;
+        if trace_boot {
+            log::info!(
+                "KProcess::run: tls allocated pid={} tls={:#x}",
+                self.process_id,
+                tls_address.get()
+            );
+        }
         log::trace!(
             "KProcess::run tls allocated pid={} tls={:#x}",
             self.process_id,
@@ -2301,6 +2324,14 @@ impl KProcess {
         if map_result != RESULT_SUCCESS.get_inner_value() {
             log::error!("run: stack MapPages find-free failed ({:#x})", map_result);
             return Err(map_result);
+        }
+        if trace_boot {
+            log::info!(
+                "KProcess::run: stack mapped pid={} stack=[{:#x}..{:#x})",
+                self.process_id,
+                stack_base,
+                stack_top
+            );
         }
         log::trace!(
             "KProcess::run stack mapped pid={} stack=[{:#x}..{:#x})",
@@ -2346,6 +2377,14 @@ impl KProcess {
             }
             thread.thread_type = super::k_thread::ThreadType::Main;
         }
+        if trace_boot {
+            log::info!(
+                "KProcess::run: main thread initialized pid={} tid={} obj={}",
+                self.process_id,
+                main_thread_id,
+                main_object_id
+            );
+        }
         log::trace!(
             "KProcess::run main thread initialized pid={} tid={} obj={}",
             self.process_id,
@@ -2381,6 +2420,14 @@ impl KProcess {
 
             thread_handle
         };
+        if trace_boot {
+            log::info!(
+                "KProcess::run: handle registered pid={} tid={} handle={}",
+                self.process_id,
+                main_thread_id,
+                thread_handle
+            );
+        }
 
         {
             // Upstream: KThread::InitializeUserThread() calls
@@ -2393,6 +2440,13 @@ impl KProcess {
             if let Some(gsc) = &self.global_scheduler_context {
                 gsc.lock().unwrap().add_thread(main_thread.clone());
             }
+            if trace_boot {
+                log::info!(
+                    "KProcess::run: about to mark runnable pid={} tid={}",
+                    self.process_id,
+                    main_thread_id
+                );
+            }
             log::trace!(
                 "KProcess::run about to run main thread pid={} tid={}",
                 self.process_id,
@@ -2402,6 +2456,13 @@ impl KProcess {
             let run_result = KThread::run_thread(&main_thread);
             if run_result != RESULT_SUCCESS.get_inner_value() {
                 return Err(run_result);
+            }
+            if trace_boot {
+                log::info!(
+                    "KProcess::run: main thread runnable pid={} tid={}",
+                    self.process_id,
+                    main_thread_id
+                );
             }
             log::trace!(
                 "KProcess::run main thread runnable pid={} tid={}",
@@ -2415,6 +2476,9 @@ impl KProcess {
 
         thread_reservation.commit();
         stack_memory_reservation.commit();
+        if trace_boot {
+            log::info!("KProcess::run: reservations committed pid={}", self.process_id);
+        }
 
         Ok((main_thread, thread_handle, stack_base, stack_top))
     }

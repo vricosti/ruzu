@@ -11,6 +11,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::hle::kernel::k_port::KPort;
 use crate::hle::kernel::k_process::KProcess;
+use crate::hle::kernel::k_readable_event::KReadableEvent;
 use crate::hle::kernel::k_server_session::KServerSession;
 
 use super::event::Event;
@@ -19,6 +20,7 @@ use super::multi_wait::MultiWait;
 enum WaitableHandle {
     None,
     Event(Arc<Event>),
+    ReadableEvent(Arc<Mutex<KReadableEvent>>),
     Process(Arc<Mutex<KProcess>>),
     ServerPort {
         port: Arc<Mutex<KPort>>,
@@ -59,6 +61,15 @@ impl MultiWaitHolder {
             user_data: 0,
             multi_wait: None,
             native_handle: WaitableHandle::Event(event),
+        }
+    }
+
+    /// Create a holder wrapping a kernel readable event directly.
+    pub fn from_readable_event(readable_event: Arc<Mutex<KReadableEvent>>) -> Self {
+        Self {
+            user_data: 0,
+            multi_wait: None,
+            native_handle: WaitableHandle::ReadableEvent(readable_event),
         }
     }
 
@@ -107,6 +118,7 @@ impl MultiWaitHolder {
         match &self.native_handle {
             WaitableHandle::None => false,
             WaitableHandle::Event(event) => event.is_signaled(),
+            WaitableHandle::ReadableEvent(event) => event.lock().unwrap().is_signaled(),
             WaitableHandle::Process(process) => process.lock().unwrap().is_signaled(),
             WaitableHandle::ServerPort { port, .. } => port.lock().unwrap().server.is_signaled(),
             WaitableHandle::ServerSession(server_session) => {
@@ -119,6 +131,7 @@ impl MultiWaitHolder {
         match &self.native_handle {
             WaitableHandle::None => None,
             WaitableHandle::Event(event) => event.kernel_object_id(),
+            WaitableHandle::ReadableEvent(event) => Some(event.lock().unwrap().object_id),
             WaitableHandle::Process(process) => Some(process.lock().unwrap().get_process_id()),
             WaitableHandle::ServerPort { object_id, .. } => *object_id,
             WaitableHandle::ServerSession(server_session) => {
@@ -152,6 +165,17 @@ impl MultiWaitHolder {
     /// Check if currently linked.
     pub fn is_linked(&self) -> bool {
         self.multi_wait.is_some()
+    }
+
+    /// Clear the stored intrusive-owner pointer without touching the old list.
+    ///
+    /// Rust-specific ownership repair for move-sensitive service owners such as
+    /// `ServerManager`: upstream stores the manager behind a stable pointee
+    /// (`unique_ptr`), while Rust can move the owner struct into an `Arc`,
+    /// invalidating the raw `MultiWait*` kept here. Callers must rebuild the
+    /// destination list explicitly after resetting this linkage.
+    pub fn reset_multi_wait_linkage_for_owner_move(&mut self) {
+        self.multi_wait = None;
     }
 }
 

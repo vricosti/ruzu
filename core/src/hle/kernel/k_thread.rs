@@ -2842,12 +2842,37 @@ impl KThread {
         signaled_object_id: u64,
         result: u32,
     ) -> bool {
+        let trace_boot = std::env::var_os("RUZU_APPLET_BOOT_TRACE")
+            .is_some_and(|value| value != std::ffi::OsStr::new("0"));
+        if trace_boot {
+            log::info!(
+                "KThread::notify_available: thread_id={} signaled_object_id={} state={:?} wait_queue_present={}",
+                self.thread_id,
+                signaled_object_id,
+                self.get_state(),
+                self.wait_queue.is_some()
+            );
+        }
         let _scheduler_lock = self.lock_scheduler();
+        if trace_boot {
+            log::info!(
+                "KThread::notify_available: thread_id={} scheduler_locked",
+                self.thread_id
+            );
+        }
         let Some(wait_queue) = self.wait_queue.clone() else {
             return false;
         };
 
-        wait_queue.notify_available(self, process, signaled_object_id, result)
+        let notified = wait_queue.notify_available(self, process, signaled_object_id, result);
+        if trace_boot {
+            log::info!(
+                "KThread::notify_available: thread_id={} notified={}",
+                self.thread_id,
+                notified
+            );
+        }
+        notified
     }
 
     /// End wait with a result.

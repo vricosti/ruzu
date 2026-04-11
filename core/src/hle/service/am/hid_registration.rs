@@ -45,6 +45,7 @@ impl HidRegistration {
                 .map(|service_manager| {
                     let handler = crate::hle::service::sm::sm::ServiceManager::get_service_blocking(
                         &service_manager,
+                        system,
                         "hid",
                     );
                     handler

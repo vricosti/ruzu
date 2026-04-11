@@ -1107,6 +1107,7 @@
 
 ### Unintentional differences (to fix)
 - Fixed in this pass: the active runtime path now routes `wait_any(kernel)` / `try_wait_any(kernel)` through `KSynchronizationObject::wait(...)` when the waited holders are kernel-backed, instead of always using the old local polling loop.
+- Fixed in this pass: host-side `ServerManager` fallback no longer accidentally re-enters the kernel-backed `try_wait_any(kernel)` path through `MultiWait`. `try_wait_any_local()` now performs the intended pure local signaled scan for host service threads.
 - The fallback local wait loop still exists and therefore the file is not yet a literal upstream-only `WaitAny(kernel)` implementation.
 
 ### Missing items
@@ -1126,8 +1127,11 @@
 - Fixed in this pass: `RegisterNamedService(...)` now mirrors upstream ownership much more closely. Rust no longer just registers into `ServiceManager`; it also tracks the returned server port as a waited `Port` and links it into the deferred/multi-wait path.
 - Fixed in this pass: `ManageNamedPort(...)` no longer registers the server-port waitable against whichever process happened to be current at creation time. Rust now defers both server-port and named client-port process registration until the actual service-process thread exists in `loop_process()`.
 - Fixed in this pass: the active event loop now goes through `MultiWait::wait_any(kernel)` when kernel-backed holders are available, rather than the older guest-thread yield/poll split.
+- Fixed in this pass: `loop_process()` now links the permanent wakeup holder before entering the event loop, matching upstream's always-present wake waitable and avoiding the empty-wait immediate-return spin.
+- Fixed in this pass: `OnSessionEvent` / `CompleteSyncRequest` now keep `HLERequestContext` ownership on `Session` like upstream, call `receive_request_hle(...)` on session arrival, and call `send_reply()` after HLE dispatch instead of reconstructing a synthetic context later and leaving the server session reply step out entirely.
 - `OnPortEvent` still reconstructs service managers and session linkage through the current Rust `SessionRequestManager` / `HLERequestContext` machinery instead of the full upstream IPC/session request flow.
 - `RegisterNamedService(...)` still rebuilds the per-accept handler through `ServiceManager::get_service(name)` because the Rust `ServiceManager` stores a move-only factory; upstream keeps the original factory directly on `Port`.
+- Host service threads still use a Rust-local `try_wait_any_local() + wakeup_event.wait_timeout(100ms)` fallback instead of the literal upstream `WaitSignaled() -> m_multi_wait.WaitAny(m_system.Kernel())` path.
 
 ### Missing items
 - Full literal upstream `WaitSignaled()` / `Process(MultiWaitHolder*)` split, with no remaining null-system/local fallback.
@@ -7678,6 +7682,65 @@
 ### Binary layout verification
 - PASS: waitable resolution only; no raw serialized struct layout changed.
 
+## 2026-04-11 — `core/src/hle/service/os/multi_wait_holder.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/hle/service/os/multi_wait_holder.h/.cpp` (move-linkage follow-up)
+
+### Intentional differences
+- Rust still stores a raw `MultiWait*` backlink inside `MultiWaitHolder` because it mirrors upstream intrusive wait-list ownership. Unlike upstream, moving the Rust owner struct can invalidate that backlink, so Rust keeps a local `reset_multi_wait_linkage_for_owner_move()` repair hook in the same owner file.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `MultiWaitHolder` now exposes an explicit owner-move repair path instead of silently keeping stale `MultiWait*` backlinks after `ServerManager` is moved into `Arc<Mutex<_>>`.
+
+### Missing items
+- Remove this Rust-only repair path once the service owner reaches a more literal upstream stable-pointee lifetime or otherwise stops moving after holders are linked.
+
+### Binary layout verification
+- PASS: service-layer intrusive linkage only; no raw serialized struct layout changed.
+
+## 2026-04-11 — `core/src/hle/service/os/multi_wait.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/hle/service/os/multi_wait.cpp` (move-aware move_all follow-up)
+
+### Intentional differences
+- Upstream `MoveAll()` can rely on stable intrusive-list owner pointers. Rust service owners can move `MultiWait` fields, so `move_all(...)` now drains `other.holders` directly and rewrites each holder backlink instead of trusting the previous owner pointer to still be valid.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `move_all(...)` no longer depends on `holder.unlink_from_multi_wait()` succeeding against the old owner address. This removes the Rust-specific infinite-loop hazard when deferred holders were linked before their owning `ServerManager` reached its final address.
+
+### Missing items
+- Remove this move-aware adaptation once service owners no longer move after holders are linked, or once the intrusive wait-list owner model is ported more literally.
+
+### Binary layout verification
+- PASS: service-layer wait-list ownership only; no raw serialized struct layout changed.
+
+## 2026-04-11 — `core/src/hle/kernel/k_scheduler_lock.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/k_scheduler_lock.h`
+
+### Intentional differences
+- Rust still uses callback wiring inside `KAbstractSchedulerLock` instead of the upstream template parameter `SchedulerType`, because Rust does not model the same header-level circular dependency pattern. The callback owner remains `k_scheduler_lock.rs`.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: the outermost `Unlock()` path now delegates to `KScheduler::enable_scheduling_with_scheduler(...)`, preserving the upstream `CurrentScheduler()==nullptr || IsPhantomModeForSingleCore()` behavior.
+- Fixed in this pass: host threads with `disable_dispatch_count == 1` no longer fall through a Rust no-op when no current scheduler exists. They now take the upstream-shaped `RescheduleCores(...)` + `RescheduleCurrentHLEThread(...)` path, which blocks waiting dummy threads instead of burning CPU in user-space.
+
+### Missing items
+- Re-audit the remaining host-thread scheduler/wait path against upstream once temporary diagnostic instrumentation is removed, especially around `RescheduleCurrentHLEThread(...)` and dummy-thread wakeup registration.
+
+### Binary layout verification
+- PASS: scheduler-lock control flow only; no raw serialized struct layout changed.
+
+## 2026-04-11 — `core/src/hle/service/server_manager.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/hle/service/server_manager.h/.cpp` (owner-move linkage follow-up)
+
+### Intentional differences
+- Upstream constructs `ServerManager` behind a stable pointee (`unique_ptr`), so linked `MultiWaitHolder` backlinks remain valid. Rust still moves `ServerManager` into `Arc<Mutex<_>>` in `KernelCore::run_server(...)`, so `server_manager.rs` now rebuilds `m_deferred_list` / `m_multi_wait` linkage after that move in the same owner file.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: pre-linked port/deferral holders no longer keep stale backlinks to the pre-`Arc` `deferred_list` address. `bind_self_reference(...)` now clears and rebuilds wait-list linkage once the manager reaches its final shared owner, which avoids spinning on invalid intrusive-list ownership before the event loop can block correctly.
+- Fixed in this pass: `OnPortEvent(...)` no longer always recreates a fresh HLE handler/manager for an accepted session. If the server session already carries a manager from the current Rust `GetService(...)` bridge, `ServerManager` now reuses that existing manager instead of replacing stateful service owners such as `nvdrv` with a second uninitialized instance.
+
+### Missing items
+- Eliminate this Rust-only relink pass once `ServerManager` no longer moves after holders are linked, or once construction is made literal enough that holders are only linked after the final owner exists.
+- Replace the remaining hybrid host-thread/guest-thread fallback with a true kernel-backed `WaitAny(kernel)` path once the host-thread wait model is fully ported.
+
+### Binary layout verification
+- PASS: event-loop linkage/ownership only; no raw serialized struct layout changed.
+
 ## 2026-04-11 — core/src/hle/kernel/k_server_session.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/k_server_session.h and /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/k_server_session.cpp
 
 ### Intentional differences
@@ -8038,3 +8101,192 @@
 
 ### Binary layout verification
 - PASS: waitable resolution only; no raw serialized struct layout changed.
+
+## 2026-04-11 — `core/src/hle/service/sm/sm.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/hle/service/sm/sm.h/.cpp` (blocking GetService sleep semantics)
+
+### Intentional differences
+- Rust keeps `ServiceManager::get_service_blocking(...)` as an associated helper taking `Arc<Mutex<ServiceManager>>` and `SystemRef`, because the Rust service manager is shared through `Arc<Mutex<_>>` rather than stored as an inline object with direct `kernel` access.
+- On non-guest host threads, Rust still falls back to `std::thread::sleep(100ms)`. Upstream only has the kernel-backed `Svc::SleepThread(...)` path because its service waits always run under the kernel thread model.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: guest-thread blocking service lookup no longer uses `std::thread::sleep(100ms)`.
+- Fixed in this pass: `get_service_blocking(...)` now uses `svc::SleepThread(system, 100ms)` when called from a guest core thread, matching upstream `ServiceManager::GetService(..., true)` behavior closely enough to avoid blocking the shared guest-core scheduler.
+
+### Missing items
+- Re-audit all remaining service wait loops to ensure guest-thread paths use kernel sleep semantics instead of host-thread blocking sleeps.
+
+### Binary layout verification
+- PASS: service lookup/control-flow only; no raw serialized struct layout changed.
+
+## 2026-04-11 — `core/src/hle/service/am/hid_registration.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/hle/service/am/hid_registration.h/.cpp` (blocking HID lookup follow-up)
+
+### Intentional differences
+- Rust still stores the HID resource manager directly instead of keeping the upstream `IHidServer` shared_ptr member, because the current Rust HID server exposes the `ResourceManager` owner as the useful long-lived dependency.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: construction no longer risks deadlocking AM bootstrap by calling a host-thread sleep loop while running on a guest-core service thread.
+- `HidRegistration::new(...)` now reaches `"hid"` through the corrected `ServiceManager::get_service_blocking(...)` guest-thread sleep path.
+
+### Missing items
+- Re-audit whether storing `IHidServer` itself is needed for stricter ownership parity once the HID service lifetime is ported more literally.
+
+### Binary layout verification
+- PASS: service lookup/lifecycle only; no raw serialized struct layout changed.
+
+## 2026-04-11 — `core/src/hle/service/am/display_layer_manager.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/hle/service/am/display_layer_manager.cpp` (blocking VI lookup follow-up)
+
+### Intentional differences
+- Rust still resolves `vi:m` through the shared Rust `ServiceManager` helper instead of upstream's inline `system.ServiceManager().GetService<...>()` template call.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `DisplayLayerManager::initialize(...)` now reaches the blocking `"vi:m"` lookup through the corrected guest-thread-aware `get_service_blocking(...)` path.
+
+### Missing items
+- This file still remains structurally less literal than upstream around VI object ownership and TODO display-layer behavior; the wait fix only corrects the service lookup path.
+
+### Binary layout verification
+- PASS: service lookup only; no raw serialized struct layout changed.
+
+## 2026-04-11 — `core/src/hle/service/nvnflinger/surface_flinger.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/hle/service/nvnflinger/surface_flinger.h/.cpp` (blocking NVDRV lookup follow-up)
+
+### Intentional differences
+- Rust still resolves `"nvdrv:s"` through the shared Rust `ServiceManager` helper rather than the upstream inline template helper call.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `SurfaceFlinger::new(...)` now inherits the corrected guest-thread-aware blocking lookup semantics for `"nvdrv:s"` through `get_service_blocking(...)`.
+
+### Missing items
+- Re-audit later whether `SurfaceFlinger` construction still happens on a host thread in all paths; if not, every blocking dependency here must continue using guest-thread-safe waits.
+
+### Binary layout verification
+- PASS: service lookup only; no raw serialized struct layout changed.
+
+## 2026-04-11 — `core/src/hle/service/vi/container.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/hle/service/vi/container.cpp` (blocking dispdrv/nvdrv lookup follow-up)
+
+### Intentional differences
+- Rust still resolves `"dispdrv"` and `"nvdrv:s"` through the shared Rust `ServiceManager` helper instead of upstream's direct template calls on `system.ServiceManager()`.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `Container::new(...)` now inherits the corrected guest-thread-aware blocking semantics for both `"dispdrv"` and `"nvdrv:s"` through `get_service_blocking(...)`.
+
+### Missing items
+- Re-audit container construction/lifetime against upstream once the remaining VI/nvnflinger ownership gaps are closed; this slice only corrected the blocking wait semantics.
+
+### Binary layout verification
+- PASS: service lookup only; no raw serialized struct layout changed.
+
+## 2026-04-11 — `core/src/hle/service/glue/time/manager.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/hle/service/glue/time/manager.h/.cpp` (blocking service lookup follow-up)
+
+### Intentional differences
+- Rust `TimeManager` now stores `SystemRef` explicitly so its owner file can call the corrected `ServiceManager::get_service_blocking(...)`; upstream already keeps `Core::System&` in the owning object.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: blocking lookups for `"time:m"` and `"set:sys"` now inherit the corrected guest-thread-aware sleep semantics instead of unconditionally sleeping the host OS thread.
+
+### Missing items
+- The rest of `TimeManager` still has previously documented structural differences from upstream; this slice only corrects the blocking service lookup semantics.
+
+### Binary layout verification
+- PASS: service lookup/owner wiring only; no raw serialized struct layout changed.
+
+## 2026-04-11 — `core/src/hle/kernel/svc/svc_ipc.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/svc/svc_ipc.cpp` (sync IPC deadlock follow-up)
+
+### Intentional differences
+- Rust still routes synchronous HLE service dispatch through the local `send_sync_request_impl(...)` owner helper rather than the full upstream `SendSyncRequest(...) -> ReceiveRequestHLE() -> SendReplyHLE()` kernel object flow.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `send_sync_request_impl(...)` no longer holds the current-process mutex across `KServerSession::receive_request_hle(...)`.
+- Fixed in this pass: the first synchronous guest IPC to `"sm:"` no longer deadlocks by re-entering the same `KProcess` mutex through `resolve_request_client_thread()`.
+
+### Missing items
+- Re-audit the rest of the synchronous IPC path for similar process/session lock re-entry now that `receive_request_hle(...)` is called outside the process lock.
+- The broader remaining differences in this file are the already-documented transport / user-buffer ownership gaps, not this deadlock.
+
+### Binary layout verification
+- PASS: IPC control-flow/locking only; no raw serialized struct layout changed.
+
+## 2026-04-11 — `core/src/hle/kernel/k_session_request.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/k_session_request.h/.cpp` (request initialization lock-order follow-up)
+
+### Intentional differences
+- Rust still stores process/event identities as ids on `KSessionRequest` instead of upstream intrusive auto-object references.
+- Rust now stores the client thread as `Weak<Mutex<KThread>>` rather than the upstream intrusive `KThread*`, but the owner now lives on `KSessionRequest` itself instead of being rediscovered through kernel process registries.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: request initialization on the hot `send_sync_request_with_process(...)` / `send_async_request_with_process(...)` paths no longer re-enters the owning process mutex through `current_thread.parent.upgrade().lock()`.
+- Added `initialize_with_process(...)` so callers that already hold `KProcess` can preserve the same request metadata without deadlocking on self-reentry.
+- Fixed in this pass: `KSessionRequest` now keeps the client thread owner directly, matching upstream ownership more closely and removing the need for later `kernel -> process -> thread table` rediscovery on the hot reply path.
+
+### Missing items
+- Re-audit the remaining non-`_with_process` initialization paths once the Rust request owner is ported more literally to upstream object/event/process references.
+
+### Binary layout verification
+- PASS: request metadata only; no raw serialized struct layout changed.
+
+## 2026-04-11 — `core/src/hle/kernel/k_client_session.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/k_client_session.cpp` (request enqueue lock-order follow-up)
+
+### Intentional differences
+- Rust still exposes `send_sync_request_with_process(...)` / `send_async_request_with_process(...)` helpers so the active caller can reuse the already-held `KProcess`.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: the `_with_process(...)` helpers now initialize `KSessionRequest` through `initialize_with_process(...)` instead of the generic initializer that re-entered the same process mutex.
+- This removes the deadlock on the first synchronous guest IPC enqueue path to `"sm:"`.
+
+### Missing items
+- Re-audit the broader enqueue/send path once the Rust session/request ownership is ported closer to the upstream slab/auto-object model.
+
+### Binary layout verification
+- PASS: request enqueue/locking only; no raw serialized struct layout changed.
+
+## 2026-04-11 — `core/src/hle/kernel/svc/svc_port.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/svc/svc_port.cpp` (named-port session identity follow-up)
+
+### Intentional differences
+- Rust still resolves `KObjectName` through the current kernel object-id registries instead of a literal typed `KObjectName::Find<KClientPort>(...)` auto-object lookup.
+- Rust still attaches an HLE `SessionRequestManager` directly during named-port session creation for HLE-backed services, because the current `ManageNamedPort` / accept path is not yet literal enough to own the first `"sm:"` request without that bridge.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `ConnectToNamedPort(...)` / `ConnectToPort(...)` no longer treat the first value returned by `KClientPort::create_session(...)` as a server-session object id.
+- Fixed in this pass: `KClientSession::initialize_with_manager(...)` now receives the parent `KSession` object id on these paths, matching the upstream `m_parent` ownership semantics instead of wiring the server endpoint id into `parent_id`.
+- Fixed in this pass: `ConnectToNamedPort(...)` now also attaches the created `SessionRequestManager` to the parent `KServerSession`, not just the `KClientSession`, so `SendSyncRequest` can resolve the server-side manager on the first `"sm:"` IPC.
+
+### Missing items
+- Remove the Rust-only direct HLE manager attachment on `ConnectToNamedPort(...)` once the named-port accept path is literal enough to own the first request.
+- Re-audit `ConnectToPort(...)` / `ConnectToNamedPort(...)` once the named-port owner path is fully literal around `KObjectName`.
+
+### Binary layout verification
+- PASS: session identity/ownership only; no raw serialized struct layout changed.
+
+## 2026-04-11 — `core/src/hle/service/sm/sm.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/hle/service/sm/sm.h/.cpp` (GetService session identity follow-up)
+
+### Intentional differences
+- Rust still resolves service ports through the current Rust `ServiceManager` / kernel registry bridge instead of the literal upstream typed auto-object model.
+- Rust still pre-attaches an HLE `SessionRequestManager` on the `GetService(...)` path because the current service-port accept path is not yet literal enough to own the first request for every HLE service.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `GetServiceImpl(...)` no longer mislabels the returned parent `KSession` object id as a server-session object id.
+- Fixed in this pass: the created `KClientSession` now stores the parent session object id in `initialize_with_manager(...)`, matching the ownership semantics expected by `SendSyncRequest`.
+
+### Missing items
+- Remove the Rust-only direct HLE manager attachment on `GetService(...)` once the service-port accept path is literal enough to own the first request.
+- The broader remaining differences are the Rust service-port lookup bridge and the still non-literal server accept/dispatch path.
+
+### Binary layout verification
+- PASS: service session identity/ownership only; no raw serialized struct layout changed.
+
+## 2026-04-11 — `core/src/hle/kernel/k_server_session.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/k_server_session.h/.cpp` (HLE receive-path follow-up)
+
+### Intentional differences
+- Rust still stores queued requests as `Arc<Mutex<KSessionRequest>>` and managers as `Arc<Mutex<SessionRequestManager>>` instead of upstream intrusive/slab auto-objects and `weak_ptr`.
+- Rust still drives synchronous HLE service dispatch through the local `svc::SendSyncRequest` shortcut instead of the literal upstream wait/schedule path. On that shortcut, the client thread may remain `RUNNABLE`, so `send_reply()` now skips `EndWait` unless the client thread is actually `WAITING`.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `receive_request_hle(...)` no longer routes HLE sync IPC through `receive_request_with_message(0, 0, 0)` and the raw transport path.
+- Fixed in this pass: the first `"sm:"` `SendSyncRequest` no longer interprets a TLS-backed request with `size == 0` as an empty raw message and panics in `parse_message_headers(...)`.
+- Rust now matches upstream `ReceiveRequest(..., out_context, manager)` more closely on this path: pop queued request, set `current_request`, resolve the client thread, derive the effective command-buffer address, and populate `HLERequestContext` directly from guest memory.
+- Fixed in this pass: `send_reply()` / `send_reply_with_message(...)` no longer resolve the request client thread by walking `kernel -> process -> thread table`. They now use the thread owner stored directly on `KSessionRequest`, matching upstream `request->GetThread()` ownership more closely and avoiding a second hot-path lock/relookup hazard on the first `"sm:"` reply.
+
+### Missing items
+- Re-audit the remaining non-HLE `ReceiveMessage(...)` / `SendMessage(...)` exactness separately; this slice only corrects the HLE receive path.
+- Remove the `RUNNABLE` `send_reply()` guard once the synchronous HLE IPC path is ported closer to upstream and the client thread truly enters `BeginWait(...)` before reply.
+
+### Binary layout verification
+- PASS: HLE request-context flow only; no raw serialized struct layout changed.

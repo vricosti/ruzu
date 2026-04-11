@@ -18,7 +18,10 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 
 use crate::core::SystemRef;
+use crate::hle::kernel::k_event::KEvent;
 use crate::hle::kernel::k_port::KPort;
+use crate::hle::kernel::k_process::KProcess;
+use crate::hle::kernel::k_scheduler::KScheduler;
 use crate::hle::kernel::svc::svc_results::RESULT_INVALID_STATE;
 use crate::hle::result::{ErrorModule, ResultCode, RESULT_SUCCESS};
 use crate::hle::service::hle_ipc::{
@@ -68,7 +71,7 @@ pub struct ServiceManager {
 
     /// Deferral event for service registration.
     /// Upstream: `Kernel::KEvent* deferral_event{}`.
-    deferral_event: Option<Arc<crate::hle::service::os::event::Event>>,
+    deferral_event: Option<Arc<Mutex<KEvent>>>,
 }
 
 impl ServiceManager {
@@ -102,9 +105,13 @@ impl ServiceManager {
     /// Matches upstream `ServiceManager::SetDeferralEvent(Kernel::KEvent*)`.
     pub fn set_deferral_event(
         &mut self,
-        event: Option<Arc<crate::hle::service::os::event::Event>>,
+        event: Option<Arc<Mutex<KEvent>>>,
     ) {
         self.deferral_event = event;
+    }
+
+    pub fn deferral_event_clone(&self) -> Option<Arc<Mutex<KEvent>>> {
+        self.deferral_event.clone()
     }
 
     /// Registers a service.
@@ -142,6 +149,8 @@ impl ServiceManager {
         _max_sessions: u32,
         handler: SessionRequestHandlerFactory,
     ) -> Result<Arc<Mutex<KPort>>, ResultCode> {
+        let trace_boot = std::env::var_os("RUZU_APPLET_BOOT_TRACE")
+            .is_some_and(|value| value != std::ffi::OsStr::new("0"));
         let validate_result = validate_service_name(&name);
         if validate_result.is_error() {
             return Err(validate_result);
@@ -162,11 +171,8 @@ impl ServiceManager {
         // the whole KPort since we own it (no slab allocator yet).
         self.service_ports.insert(name.clone(), Arc::clone(&port));
         self.registered_services.insert(name, handler);
-
-        // Signal deferral event so waiting GetService requests can retry.
-        if let Some(ref event) = self.deferral_event {
-            event.signal();
-            log::debug!("ServiceManager: deferral event signaled after registration");
+        if trace_boot {
+            log::info!("ServiceManager::register_service_with_port: inserted service metadata");
         }
 
         Ok(port)
@@ -223,13 +229,25 @@ impl ServiceManager {
     /// every 100ms until the service appears.
     pub fn get_service_blocking(
         sm: &Arc<std::sync::Mutex<Self>>,
+        system: crate::core::SystemRef,
         name: &str,
     ) -> SessionRequestHandlerPtr {
+        const BLOCKING_POLL_NS: i64 = 100_000_000;
         loop {
             if let Some(handler) = sm.lock().unwrap().get_service(name) {
                 return handler;
             }
-            std::thread::sleep(std::time::Duration::from_millis(100));
+
+            if !system.is_null()
+                && system
+                    .get()
+                    .kernel()
+                    .is_some_and(|kernel| kernel.is_current_thread_guest_core())
+            {
+                crate::hle::kernel::svc::svc_thread::sleep_thread(system.get(), BLOCKING_POLL_NS);
+            } else {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
         }
     }
 }
@@ -274,6 +292,32 @@ pub struct Sm {
 }
 
 impl Sm {
+    fn current_process_and_scheduler(&self) -> Option<(Arc<Mutex<KProcess>>, Arc<Mutex<KScheduler>>)> {
+        let current_thread = self.system.get().current_thread()?;
+        let thread_guard = current_thread.lock().unwrap();
+        let process = thread_guard.parent.as_ref().and_then(|parent| parent.upgrade())?;
+        let scheduler = thread_guard
+            .scheduler
+            .as_ref()
+            .and_then(|scheduler| scheduler.upgrade())
+            .or_else(|| {
+                process
+                    .lock()
+                    .unwrap()
+                    .scheduler
+                    .as_ref()
+                    .and_then(|scheduler| scheduler.upgrade())
+            })?;
+        Some((process, scheduler))
+    }
+
+    fn signal_deferral_event(&self, event: &Arc<Mutex<KEvent>>) {
+        let Some((process, scheduler)) = self.current_process_and_scheduler() else {
+            return;
+        };
+        KEvent::signal_arc(event, &process, &scheduler);
+    }
+
     /// Creates a new SM service.
     ///
     /// Matches upstream `SM::SM(ServiceManager& service_manager_, Core::System& system_)`.
@@ -472,14 +516,14 @@ impl Sm {
                     return (RESULT_INVALID_STATE, None);
                 }
 
-                let (server_session_object_id, client_session_object_id, server_session) = {
+                let (session_object_id, client_session_object_id, server_session) = {
                     let mut port_guard = port.lock().unwrap();
                     if port_guard.is_light() {
                         log::error!("  GetService(\"{}\"): light ports not yet ported", name);
                         return (RESULT_INVALID_STATE, None);
                     }
 
-                    let (server_session_object_id, client_session_object_id) = match port_guard
+                    let (session_object_id, client_session_object_id) = match port_guard
                         .client
                         .create_session(&mut process, kernel, port_guard.get_name())
                     {
@@ -495,22 +539,18 @@ impl Sm {
                     };
 
                     let server_session = process
-                        .get_server_session_by_object_id(server_session_object_id)
+                        .get_server_session_by_object_id(session_object_id)
                         .expect("created server session must be registered");
-                    let enqueue_result = port_guard.enqueue_session(server_session_object_id);
+                    let enqueue_result = port_guard.enqueue_session(session_object_id);
                     if enqueue_result.is_error() {
                         process.unregister_client_session_object_by_object_id(
                             client_session_object_id,
                         );
-                        process.unregister_session_object_by_object_id(server_session_object_id);
+                        process.unregister_session_object_by_object_id(session_object_id);
                         return (enqueue_result, None);
                     }
 
-                    (
-                        server_session_object_id,
-                        client_session_object_id,
-                        server_session,
-                    )
+                    (session_object_id, client_session_object_id, server_session)
                 };
 
                 if let Some(handler) = handler {
@@ -533,7 +573,7 @@ impl Sm {
                         client_session
                             .lock()
                             .unwrap()
-                            .initialize_with_manager(server_session_object_id, manager.clone());
+                            .initialize_with_manager(session_object_id, manager.clone());
                     }
                     server_session.lock().unwrap().set_manager(manager.clone());
 
@@ -599,13 +639,23 @@ impl Sm {
             is_light
         );
 
-        let result = {
+        let (result, deferral_event) = {
             let mut sm = self.service_manager.lock().unwrap();
             // Upstream passes nullptr as handler factory for guest-registered services.
             let factory: SessionRequestHandlerFactory =
                 Box::new(|| -> SessionRequestHandlerPtr { panic!("null factory called") });
-            sm.register_service_with_port(name.clone(), max_session_count, factory)
+            let result = sm.register_service_with_port(name.clone(), max_session_count, factory);
+            let deferral_event = sm.deferral_event_clone();
+            (result, deferral_event)
         };
+        if let Some(event) = deferral_event {
+            if std::env::var_os("RUZU_APPLET_BOOT_TRACE")
+                .is_some_and(|value| value != std::ffi::OsStr::new("0"))
+            {
+                log::info!("SM::RegisterServiceImpl: signaling deferral event after unlock");
+            }
+            self.signal_deferral_event(&event);
+        }
 
         let port = match result {
             Ok(port) => port,
@@ -725,12 +775,17 @@ impl ServiceFramework for Sm {
 /// }
 /// ```
 pub fn loop_process(service_manager: &Arc<Mutex<ServiceManager>>, system: crate::core::SystemRef) {
+    let trace_boot = std::env::var_os("RUZU_APPLET_BOOT_TRACE")
+        .is_some_and(|value| value != std::ffi::OsStr::new("0"));
     let mut server_manager = ServerManager::new(system);
 
     // Manage deferral event.
     // Upstream: server_manager->ManageDeferral(&deferral_event);
     //           service_manager.SetDeferralEvent(deferral_event);
     let (_result, deferral_event) = server_manager.manage_deferral();
+    if trace_boot {
+        log::info!("SM::loop_process: deferral event managed");
+    }
     service_manager
         .lock()
         .unwrap()
@@ -743,16 +798,32 @@ pub fn loop_process(service_manager: &Arc<Mutex<ServiceManager>>, system: crate:
     let sm_clone = sm_service.clone();
     let factory: SessionRequestHandlerFactory = Box::new(move || sm_clone.clone());
     server_manager.manage_named_port("sm:", factory, 64);
+    if trace_boot {
+        log::info!("SM::loop_process: managed named port sm:");
+    }
 
     // Also register in ServiceManager so get_service("sm:") works
     // for internal HLE lookups (ConnectToNamedPort also checks ServiceManager).
     {
         let sm_clone2 = sm_service.clone();
         let factory2: SessionRequestHandlerFactory = Box::new(move || sm_clone2.clone());
-        service_manager
-            .lock()
-            .unwrap()
-            .register_service("sm:".to_string(), 64, factory2);
+        let deferral_event = {
+            let mut sm = service_manager.lock().unwrap();
+            let result = sm.register_service("sm:".to_string(), 64, factory2);
+            if result.is_error() {
+                log::error!(
+                    "SM::loop_process: failed to register sm: in ServiceManager: 0x{:08X}",
+                    result.get_inner_value()
+                );
+            }
+            sm.deferral_event_clone()
+        };
+        if let Some(event) = deferral_event {
+            sm_service.signal_deferral_event(&event);
+        }
+    }
+    if trace_boot {
+        log::info!("SM::loop_process: registered sm: in ServiceManager");
     }
 
     // Upstream: ServerManager::RunServer(std::move(server_manager));

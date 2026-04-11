@@ -12,9 +12,7 @@
 use std::sync::{Arc, Mutex};
 
 use crate::core::System;
-use crate::hle::kernel::k_client_session::KClientSession;
 use crate::hle::kernel::k_port::KPort;
-use crate::hle::kernel::k_session::KSession;
 use crate::hle::kernel::svc::svc_results::*;
 use crate::hle::kernel::svc_common::{Handle, INVALID_HANDLE};
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
@@ -117,7 +115,7 @@ pub fn connect_to_named_port(system: &System, out: &mut Handle, user_name: u64) 
         Err(_) => return RESULT_OUT_OF_HANDLES,
     };
 
-    let (server_session_object_id, client_session_object_id) = {
+    let (session_object_id, client_session_object_id, server_session) = {
         let mut port_guard = port.lock().unwrap();
         if port_guard.is_light() {
             process.handle_table.unreserve(reserved_handle);
@@ -128,7 +126,7 @@ pub fn connect_to_named_port(system: &System, out: &mut Handle, user_name: u64) 
             return RESULT_INVALID_HANDLE;
         }
 
-        let (server_session_object_id, client_session_object_id) = match port_guard
+        let (session_object_id, client_session_object_id) = match port_guard
             .client
             .create_session(&mut process, kernel, port_guard.get_name())
         {
@@ -139,15 +137,19 @@ pub fn connect_to_named_port(system: &System, out: &mut Handle, user_name: u64) 
             }
         };
 
-        let enqueue_result = port_guard.enqueue_session(server_session_object_id);
+        let server_session = process
+            .get_server_session_by_object_id(session_object_id)
+            .expect("created server session must be registered");
+
+        let enqueue_result = port_guard.enqueue_session(session_object_id);
         if enqueue_result.is_error() {
             process.handle_table.unreserve(reserved_handle);
             process.unregister_client_session_object_by_object_id(client_session_object_id);
-            process.unregister_session_object_by_object_id(server_session_object_id);
+            process.unregister_session_object_by_object_id(session_object_id);
             return enqueue_result;
         }
 
-        (server_session_object_id, client_session_object_id)
+        (session_object_id, client_session_object_id, server_session)
     };
 
     if let Some(handler) = handler {
@@ -159,8 +161,9 @@ pub fn connect_to_named_port(system: &System, out: &mut Handle, user_name: u64) 
             client_session
                 .lock()
                 .unwrap()
-                .initialize_with_manager(server_session_object_id, manager);
+                .initialize_with_manager(session_object_id, manager.clone());
         }
+        server_session.lock().unwrap().set_manager(manager.clone());
     }
 
     if !process
@@ -169,7 +172,7 @@ pub fn connect_to_named_port(system: &System, out: &mut Handle, user_name: u64) 
     {
         process.handle_table.unreserve(reserved_handle);
         process.unregister_client_session_object_by_object_id(client_session_object_id);
-        process.unregister_session_object_by_object_id(server_session_object_id);
+        process.unregister_session_object_by_object_id(session_object_id);
         return RESULT_OUT_OF_HANDLES;
     }
 
@@ -256,7 +259,7 @@ pub fn connect_to_port(system: &System, out: &mut Handle, port: Handle) -> Resul
         Err(_) => return RESULT_OUT_OF_HANDLES,
     };
 
-    let (server_session_object_id, client_session_object_id) = {
+    let (session_object_id, client_session_object_id) = {
         let mut port_guard = port.lock().unwrap();
         if port_guard.is_light() {
             process.handle_table.unreserve(reserved_handle);
@@ -265,7 +268,7 @@ pub fn connect_to_port(system: &System, out: &mut Handle, port: Handle) -> Resul
         }
 
         let port_name = port_guard.get_name();
-        let (server_session_object_id, client_session_object_id) = match port_guard
+        let (session_object_id, client_session_object_id) = match port_guard
             .client
             .create_session(&mut process, kernel, port_name)
         {
@@ -276,15 +279,15 @@ pub fn connect_to_port(system: &System, out: &mut Handle, port: Handle) -> Resul
             }
         };
 
-        let enqueue_result = port_guard.enqueue_session(server_session_object_id);
+        let enqueue_result = port_guard.enqueue_session(session_object_id);
         if enqueue_result.is_error() {
             process.handle_table.unreserve(reserved_handle);
             process.unregister_client_session_object_by_object_id(client_session_object_id);
-            process.unregister_session_object_by_object_id(server_session_object_id);
+            process.unregister_session_object_by_object_id(session_object_id);
             return enqueue_result;
         }
 
-        (server_session_object_id, client_session_object_id)
+        (session_object_id, client_session_object_id)
     };
 
     if !process
@@ -293,7 +296,7 @@ pub fn connect_to_port(system: &System, out: &mut Handle, port: Handle) -> Resul
     {
         process.handle_table.unreserve(reserved_handle);
         process.unregister_client_session_object_by_object_id(client_session_object_id);
-        process.unregister_session_object_by_object_id(server_session_object_id);
+        process.unregister_session_object_by_object_id(session_object_id);
         return RESULT_OUT_OF_HANDLES;
     }
 
@@ -529,5 +532,32 @@ mod tests {
         assert!(process
             .get_client_session_by_object_id(client_session_object_id)
             .is_some());
+    }
+
+    #[test]
+    fn connect_to_named_port_attaches_manager_to_server_session_for_hle_service() {
+        let system = test_system();
+        let name_addr = 0x5000;
+        system
+            .shared_process_memory()
+            .write()
+            .unwrap()
+            .write_block(name_addr, b"sm:\0");
+
+        let mut handle = 0;
+        assert_eq!(
+            connect_to_named_port(&system, &mut handle, name_addr),
+            RESULT_SUCCESS
+        );
+
+        let process = system.current_process_arc().lock().unwrap();
+        let client_session_object_id = process.handle_table.get_object(handle).unwrap();
+        let client_session = process
+            .get_client_session_by_object_id(client_session_object_id)
+            .unwrap();
+        let parent_id = client_session.lock().unwrap().get_parent_id().unwrap();
+        let parent_session = process.get_session_by_object_id(parent_id).unwrap();
+        let server_session = parent_session.lock().unwrap().get_server_session().clone();
+        assert!(server_session.lock().unwrap().get_manager().is_some());
     }
 }

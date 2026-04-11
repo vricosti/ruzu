@@ -93,7 +93,10 @@ impl KClientSession {
             return 1;
         };
         let request = Arc::new(Mutex::new(KSessionRequest::new()));
-        request.lock().unwrap().initialize(None, address, size);
+        request
+            .lock()
+            .unwrap()
+            .initialize_with_process(process, None, address, size);
         let result = {
             let session = parent_session.lock().unwrap();
             session.on_request_with_process(process, request)
@@ -139,7 +142,7 @@ impl KClientSession {
         request
             .lock()
             .unwrap()
-            .initialize(Some(event_id), address, size);
+            .initialize_with_process(process, Some(event_id), address, size);
         let session = parent_session.lock().unwrap();
         session.on_request_with_process(process, request)
     }
