@@ -230,6 +230,7 @@ impl CoreTiming {
                                 *evt_time,
                                 std::time::Duration::from_nanos(ns_late.max(0) as u64),
                             );
+                            drop(et);
 
                             if *reschedule_time != 0 {
                                 let mut ct = ct_clone.lock().unwrap();
@@ -237,11 +238,23 @@ impl CoreTiming {
                                     Some(dur) => dur.as_nanos() as i64,
                                     None => *reschedule_time,
                                 };
-                                let fire_time = if *evt_time < ct.pause_end_time {
-                                    ct.pause_end_time + next_time
-                                } else {
-                                    evt_time + next_time
-                                };
+                                // Clamp the reschedule base to `now` so that a
+                                // lagging looping event cannot drift an
+                                // unbounded catch-up burst forward through the
+                                // event queue. Without this, a looping event
+                                // whose scheduled time is far behind wall
+                                // time gets popped and rescheduled every
+                                // CoreTiming iteration (~1 ms), each time
+                                // advancing `fire_time` by `next_time`, so in
+                                // a few seconds of real time the event ends
+                                // up scheduled tens of seconds in the future
+                                // and effectively stops firing. Upstream
+                                // yuzu's timer thread uses wall time as the
+                                // reschedule base for the same reason.
+                                let now_ns = ct.get_global_time_ns().as_nanos() as i64;
+                                let base = std::cmp::max(*evt_time, now_ns);
+                                let base = std::cmp::max(base, ct.pause_end_time);
+                                let fire_time = base + next_time;
                                 let fifo_id = ct.event_fifo_id;
                                 ct.event_fifo_id += 1;
                                 ct.event_queue.push(TimingEvent {
@@ -255,9 +268,9 @@ impl CoreTiming {
 
                         if due_events.is_empty() {
                             // Check if there's a future event to wait for.
-                            let (next_time, queue_len) = {
+                            let next_time = {
                                 let ct = ct_clone.lock().unwrap();
-                                (ct.event_queue.peek().map(|e| e.time), ct.event_queue.len())
+                                ct.event_queue.peek().map(|e| e.time)
                             };
                             if let Some(next_ns) = next_time {
                                 let now_ns =

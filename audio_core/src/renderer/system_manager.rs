@@ -42,7 +42,19 @@ impl SystemManager {
                 .name("AudioRenderSystemManager".to_string())
                 .spawn(move || {
                     log::info!("AudioRenderSystemManager thread started");
+                    // Target one audio frame per iteration (20 ms ≈ 50 Hz).
+                    // Upstream achieves this implicitly because cubeb consumes
+                    // buffers at the audio device rate and the DSP main loop
+                    // blocks inside `wait_free_space_with_stop` until space
+                    // frees up. In Rust, when the sink isn't fully started
+                    // (sink paused or max_queue_size==0), that wait returns
+                    // instantly and the loop spins thousands of times per
+                    // second, which starves the game's WaitSynchronization on
+                    // the rendered event. Pace the whole loop here instead.
+                    const AUDIO_FRAME: std::time::Duration =
+                        std::time::Duration::from_millis(20);
                     while active.load(Ordering::SeqCst) {
+                        let loop_start = std::time::Instant::now();
                         {
                             let systems = systems.lock();
                             log::info!("AudioRenderSystemManager loop systems={}", systems.len());
@@ -56,7 +68,11 @@ impl SystemManager {
                             renderer.signal();
                             renderer.wait();
                         }
-                        std::thread::yield_now();
+
+                        let elapsed = loop_start.elapsed();
+                        if elapsed < AUDIO_FRAME {
+                            std::thread::sleep(AUDIO_FRAME - elapsed);
+                        }
                     }
                 })
                 .expect("failed to spawn audio render system manager thread"),
