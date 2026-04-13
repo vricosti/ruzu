@@ -8,6 +8,7 @@
 
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::Arc;
 
 /// GPU virtual address type.
 pub type GPUVAddr = u64;
@@ -18,43 +19,52 @@ pub const MAGIC_NUMBER: [u8; 8] = *b"yuzucach";
 /// Instruction size in bytes.
 const INST_SIZE: usize = 8;
 
-/// Shader stage enumeration (matching shader_recompiler).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ShaderStage {
-    VertexA,
-    VertexB,
-    TessellationControl,
-    TessellationEval,
-    Geometry,
-    Fragment,
-    Compute,
-}
+/// `TryFindSize` block fetch granularity. Upstream
+/// `GenericEnvironment::TryFindSize` reads 0x1000 bytes per iteration.
+const TRY_FIND_SIZE_BLOCK_BYTES: usize = 0x1000;
 
-/// Texture type enumeration (matching shader_recompiler).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum TextureType {
-    Color1D,
-    Color2D,
-    Color2DRect,
-    Color3D,
-    ColorCube,
-    ColorArray1D,
-    ColorArray2D,
-    Buffer,
-    ColorArrayCube,
-}
+/// `TryFindSize` upper bound. Upstream caps the search at 0x100000 bytes.
+const TRY_FIND_SIZE_MAX_BYTES: usize = 0x100000;
 
-/// Texture pixel format (matching shader_recompiler).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct TexturePixelFormat(pub u32);
+/// Maxwell self-branch sentinel A. Marks the tail of a shader.
+/// Upstream: `GenericEnvironment::TryFindSize` line 251.
+const SELF_BRANCH_A: u64 = 0xE2400FFFFF87000F;
 
-/// Replace constant types for HLE macro state.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum ReplaceConstant {
-    BaseVertex,
-    BaseInstance,
-    DrawId,
-}
+/// Maxwell self-branch sentinel B. Marks the tail of a shader.
+/// Upstream: `GenericEnvironment::TryFindSize` line 252.
+const SELF_BRANCH_B: u64 = 0xE2400FFFFF07000F;
+
+/// GPU memory reader callback shape: read `bytes.len()` bytes starting at
+/// the given GPU virtual address.
+///
+/// Rust adaptation of upstream's `Tegra::MemoryManager*` member field on
+/// `GenericEnvironment`. The Rust port doesn't have a single, persistent
+/// `MemoryManager` reference reachable from every video_core component
+/// yet, so the reader is injected as an `Arc<dyn Fn>` callback by the
+/// owner that does have access (e.g. `RasterizerOpenGL` via the
+/// `gpu_read` callback already plumbed through `render_draw_calls`).
+///
+/// `Send + Sync` so it can be cloned across threads / fibers safely.
+pub type GpuMemoryReader = Arc<dyn Fn(GPUVAddr, &mut [u8]) + Send + Sync>;
+
+/// Shader stage enumeration.
+///
+/// Re-exported from `shader_recompiler::stage::Stage`, which itself
+/// matches upstream `Shader::Stage` exactly. The previous local copy
+/// was deleted as part of the cross-crate type-unification pass.
+pub use shader_recompiler::stage::Stage as ShaderStage;
+
+// `TextureType`, `TexturePixelFormat`, and `ReplaceConstant` are the
+// upstream-faithful types from `shader_recompiler::shader_info`, matching
+// the upstream `Shader::TextureType`, `Shader::TexturePixelFormat`, and
+// `Shader::ReplaceConstant` declarations. Re-exported here so existing
+// consumers of `shader_environment::TextureType` etc. continue to resolve.
+//
+// The previous local copies had variant-ordering / discriminant mismatches
+// compared to upstream (e.g. ReplaceConstant had BaseVertex=0 vs upstream
+// BaseInstance=0). Deleted and replaced with re-exports as part of the
+// cross-crate type-unification pass.
+pub use shader_recompiler::shader_info::{ReplaceConstant, TexturePixelFormat, TextureType};
 
 /// Make a constant buffer key from index and offset.
 pub fn make_cbuf_key(index: u32, offset: u32) -> u64 {
@@ -65,6 +75,12 @@ pub fn make_cbuf_key(index: u32, offset: u32) -> u64 {
 ///
 /// Provides instruction reading, constant buffer access, and texture info
 /// lookup from GPU memory.
+///
+/// Upstream: `VideoCommon::GenericEnvironment` (`shader_environment.h:29`),
+/// which holds a `Tegra::MemoryManager*` and uses
+/// `gpu_memory->Read<u64>` / `gpu_memory->ReadBlock` to fetch shader bytes.
+/// The Rust port replaces that pointer with the [`GpuMemoryReader`]
+/// callback set via [`GenericEnvironment::with_gpu_read`].
 pub struct GenericEnvironment {
     pub program_base: GPUVAddr,
     pub start_address: u32,
@@ -91,7 +107,13 @@ pub struct GenericEnvironment {
     pub has_unbound_instructions: bool,
     pub has_hle_engine_state: bool,
     pub is_proprietary_driver: bool,
-    // In the full port: gpu_memory: &MemoryManager,
+
+    /// GPU memory reader. Rust adaptation of upstream's
+    /// `Tegra::MemoryManager*` field. `None` means no reader has been
+    /// installed yet — methods that need to fetch GPU memory will return
+    /// the documented "no data" value (0 from `read_instruction`,
+    /// `None` from `analyze`) instead of panicking.
+    gpu_read: Option<GpuMemoryReader>,
 }
 
 impl GenericEnvironment {
@@ -118,7 +140,28 @@ impl GenericEnvironment {
             has_unbound_instructions: false,
             has_hle_engine_state: false,
             is_proprietary_driver: false,
+            gpu_read: None,
         }
+    }
+
+    /// Set the GPU memory reader.
+    ///
+    /// Rust adaptation of upstream's
+    /// `GenericEnvironment::GenericEnvironment(Tegra::MemoryManager& gpu_memory_, ...)`
+    /// constructor: stores the reader so subsequent `read_instruction`,
+    /// `set_cached_size`, `analyze`, and `calculate_hash` calls can fetch
+    /// shader bytes from guest GPU memory.
+    pub fn with_gpu_read(mut self, reader: GpuMemoryReader) -> Self {
+        self.gpu_read = Some(reader);
+        self
+    }
+
+    /// Set program base / start address. Mirrors the upstream constructor's
+    /// `program_base_` and `start_address_` parameters.
+    pub fn with_program(mut self, program_base: GPUVAddr, start_address: u32) -> Self {
+        self.program_base = program_base;
+        self.start_address = start_address;
+        self
     }
 
     pub fn texture_bound_buffer(&self) -> u32 {
@@ -138,6 +181,9 @@ impl GenericEnvironment {
     }
 
     /// Read an instruction at the given address.
+    ///
+    /// Port of upstream `GenericEnvironment::ReadInstruction`
+    /// (`shader_environment.cpp:141`).
     pub fn read_instruction(&mut self, address: u32) -> u64 {
         self.read_lowest = self.read_lowest.min(address);
         self.read_highest = self.read_highest.max(address);
@@ -146,30 +192,89 @@ impl GenericEnvironment {
             return self.code[((address - self.cached_lowest) / INST_SIZE as u32) as usize];
         }
         self.has_unbound_instructions = true;
-        // NOTE: Full implementation reads from gpu_memory.read::<u64>(program_base + address).
-        // Without GPU memory integration, we return 0 (NOP instruction).
-        log::warn!(
-            "GenericEnvironment::read_instruction: GPU memory not integrated, returning 0 for address 0x{:X}",
-            address
-        );
-        0
+        // Upstream: `gpu_memory->Read<u64>(program_base + address);`
+        // We use the injected reader. With no reader installed, this slot
+        // is unreachable through the normal pipeline-build path (the cache
+        // gates pipeline creation on `has_gpu_memory_reader`).
+        let Some(reader) = self.gpu_read.as_ref() else {
+            return 0;
+        };
+        let mut buf = [0u8; INST_SIZE];
+        reader(self.program_base + address as u64, &mut buf);
+        u64::from_le_bytes(buf)
     }
 
-    /// Try to analyze the shader and return its hash.
+    /// Try to analyze the shader and return its CityHash64 hash.
+    ///
+    /// Port of upstream `GenericEnvironment::Analyze` (cpp:152).
     pub fn analyze(&mut self) -> Option<u64> {
-        // NOTE: Full implementation calls TryFindSize() to scan GPU memory for self-branch
-        // sentinel instructions (SELF_BRANCH_A / SELF_BRANCH_B), then hashes the code
-        // block with CityHash64. Without GPU memory integration we cannot do this.
-        log::warn!("GenericEnvironment::analyze: GPU memory not integrated, cannot compute hash");
+        let size = self.try_find_size()?;
+        self.cached_lowest = self.start_address;
+        self.cached_highest = self.start_address + size as u32;
+        let bytes = self.code_bytes(size as usize);
+        Some(common::cityhash::city_hash64(bytes))
+    }
+
+    /// Walk GPU memory in `BLOCK_SIZE` chunks looking for the
+    /// SELF_BRANCH_A / SELF_BRANCH_B sentinels that mark the shader's
+    /// tail. Returns the byte offset of the sentinel, or `None` if no
+    /// sentinel is found within `MAXIMUM_SIZE` bytes.
+    ///
+    /// Port of upstream `GenericEnvironment::TryFindSize`
+    /// (`shader_environment.cpp:247`).
+    fn try_find_size(&mut self) -> Option<u64> {
+        let reader = self.gpu_read.as_ref()?.clone();
+        let mut guest_addr = self.program_base + self.start_address as u64;
+        let mut offset: usize = 0;
+        let mut size: usize = TRY_FIND_SIZE_BLOCK_BYTES;
+        while size <= TRY_FIND_SIZE_MAX_BYTES {
+            self.code.resize(size / INST_SIZE, 0);
+
+            // Read the next BLOCK_SIZE chunk into `code` at `offset`.
+            let words_offset = offset / INST_SIZE;
+            let words_in_block = TRY_FIND_SIZE_BLOCK_BYTES / INST_SIZE;
+            let mut block_bytes = [0u8; TRY_FIND_SIZE_BLOCK_BYTES];
+            reader(guest_addr, &mut block_bytes);
+            for i in 0..words_in_block {
+                let chunk: [u8; 8] = block_bytes[i * 8..(i + 1) * 8]
+                    .try_into()
+                    .expect("8-byte chunk");
+                self.code[words_offset + i] = u64::from_le_bytes(chunk);
+            }
+
+            // Scan this block for the self-branch sentinels. Match upstream
+            // exactly: byte index in [0, BLOCK_SIZE) stepping by INST_SIZE.
+            for index in (0..TRY_FIND_SIZE_BLOCK_BYTES).step_by(INST_SIZE) {
+                let inst = self.code[words_offset + index / INST_SIZE];
+                if inst == SELF_BRANCH_A || inst == SELF_BRANCH_B {
+                    return Some((offset + index) as u64);
+                }
+            }
+
+            guest_addr += TRY_FIND_SIZE_BLOCK_BYTES as u64;
+            size += TRY_FIND_SIZE_BLOCK_BYTES;
+            offset += TRY_FIND_SIZE_BLOCK_BYTES;
+        }
         None
     }
 
-    /// Set the cached code size.
+    /// Set the cached code size and fetch the bytes from GPU memory.
+    ///
+    /// Port of upstream `GenericEnvironment::SetCachedSize` (cpp:162).
     pub fn set_cached_size(&mut self, size_bytes: usize) {
         self.cached_lowest = self.start_address;
         self.cached_highest = self.start_address + size_bytes as u32;
         self.code.resize(self.cached_size_words(), 0);
-        // In full port: read code block from GPU memory
+        // Upstream: `gpu_memory->ReadBlock(program_base + cached_lowest,
+        //                                  code.data(), code.size() * sizeof(u64));`
+        if let Some(reader) = self.gpu_read.as_ref() {
+            let bytes_to_read = self.code.len() * INST_SIZE;
+            let mut buf = vec![0u8; bytes_to_read];
+            reader(self.program_base + self.cached_lowest as u64, &mut buf);
+            for (i, chunk) in buf.chunks_exact(8).enumerate() {
+                self.code[i] = u64::from_le_bytes(chunk.try_into().expect("8 bytes"));
+            }
+        }
     }
 
     pub fn cached_size_words(&self) -> usize {
@@ -188,16 +293,31 @@ impl GenericEnvironment {
         !self.has_unbound_instructions
     }
 
+    /// Hash the slice of GPU memory actually touched by translation.
+    ///
+    /// Port of upstream `GenericEnvironment::CalculateHash` (cpp:185).
     pub fn calculate_hash(&self) -> u64 {
-        // NOTE: Full implementation reads ReadSizeBytes() from GPU memory at
-        // program_base + read_lowest, then hashes it with CityHash64.
-        // Without GPU memory integration we return 0.
-        log::warn!("GenericEnvironment::calculate_hash: GPU memory not integrated, returning 0");
-        0
+        let Some(reader) = self.gpu_read.as_ref() else {
+            return 0;
+        };
+        let size = self.read_size_bytes();
+        let mut buf = vec![0u8; size];
+        reader(self.program_base + self.read_lowest as u64, &mut buf);
+        common::cityhash::city_hash64(&buf)
     }
 
     pub fn has_hle_macro_state(&self) -> bool {
         self.has_hle_engine_state
+    }
+
+    /// Helper for `analyze`: borrow the first `size` bytes of `code` as a
+    /// byte slice. The recompiler stores instructions as `Vec<u64>` and
+    /// CityHash64 wants `&[u8]`, so we reinterpret in place rather than
+    /// re-fetch the bytes from GPU memory.
+    fn code_bytes(&self, size: usize) -> &[u8] {
+        let total_bytes = self.code.len() * INST_SIZE;
+        let len = size.min(total_bytes);
+        unsafe { std::slice::from_raw_parts(self.code.as_ptr() as *const u8, len) }
     }
 }
 
@@ -344,19 +464,24 @@ impl FileEnvironment {
         };
         file.read_exact(code_bytes).unwrap_or(());
 
+        // Deserialization mappings use the upstream-faithful discriminant
+        // values from `shader_recompiler::shader_info` (#[repr(u32)]):
+        //   TextureType:     Color1D=0, ColorArray1D=1, Color2D=2, ...
+        //   ReplaceConstant: BaseInstance=0, BaseVertex=1, DrawID=2
+        //   TexturePixelFormat: 103-variant enum, discriminant = variant index
         for _ in 0..num_texture_types {
             let key = read_u32(file);
             let type_raw = read_u32(file);
             let texture_type = match type_raw {
                 0 => TextureType::Color1D,
-                1 => TextureType::Color2D,
-                2 => TextureType::Color2DRect,
-                3 => TextureType::Color3D,
-                4 => TextureType::ColorCube,
-                5 => TextureType::ColorArray1D,
-                6 => TextureType::ColorArray2D,
+                1 => TextureType::ColorArray1D,
+                2 => TextureType::Color2D,
+                3 => TextureType::ColorArray2D,
+                4 => TextureType::Color3D,
+                5 => TextureType::ColorCube,
+                6 => TextureType::ColorArrayCube,
                 7 => TextureType::Buffer,
-                8 => TextureType::ColorArrayCube,
+                8 => TextureType::Color2DRect,
                 _ => TextureType::Color2D,
             };
             self.texture_types.insert(key, texture_type);
@@ -364,8 +489,16 @@ impl FileEnvironment {
         for _ in 0..num_texture_pixel_formats {
             let key = read_u32(file);
             let fmt_raw = read_u32(file);
-            self.texture_pixel_formats
-                .insert(key, TexturePixelFormat(fmt_raw));
+            // SAFETY: TexturePixelFormat is #[repr(u32)] with 102
+            // contiguous discriminants starting at 0. If the raw value
+            // is out of range, we fall back to A8B8G8R8Unorm (0).
+            let fmt = if fmt_raw < 102 {
+                unsafe { std::mem::transmute::<u32, TexturePixelFormat>(fmt_raw) }
+            } else {
+                log::warn!("TexturePixelFormat out of range: {}", fmt_raw);
+                TexturePixelFormat::A8B8G8R8Unorm
+            };
+            self.texture_pixel_formats.insert(key, fmt);
         }
         for _ in 0..num_cbuf_values {
             let key = read_u64(file);
@@ -376,9 +509,9 @@ impl FileEnvironment {
             let key = read_u64(file);
             let rc_raw = read_u32(file);
             let rc = match rc_raw {
-                0 => ReplaceConstant::BaseVertex,
-                1 => ReplaceConstant::BaseInstance,
-                _ => ReplaceConstant::DrawId,
+                0 => ReplaceConstant::BaseInstance,
+                1 => ReplaceConstant::BaseVertex,
+                _ => ReplaceConstant::DrawID,
             };
             self.cbuf_replacements.insert(key, rc);
         }
@@ -524,7 +657,7 @@ fn serialize_generic_environment(
     }
     for (&key, &fmt) in &env.texture_pixel_formats {
         file.write_all(&key.to_le_bytes())?;
-        file.write_all(&fmt.0.to_le_bytes())?;
+        file.write_all(&(fmt as u32).to_le_bytes())?;
     }
     for (&key, &val) in &env.cbuf_values {
         file.write_all(&key.to_le_bytes())?;
@@ -639,4 +772,149 @@ fn deserialize_file_env_from(env: &mut FileEnvironment, file: &mut std::fs::File
     // Delegate to the existing deserialize method
     env.deserialize(file);
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    /// Build a 64 KiB GPU-memory mock with a Maxwell self-branch sentinel
+    /// at byte offset `sentinel_offset` (relative to the program base) and
+    /// return a `(reader, log)` pair. The log records every read so tests
+    /// can assert that walking matches upstream's block stride.
+    fn make_mock_gpu_with_sentinel(
+        program_base: u64,
+        sentinel_offset: usize,
+        sentinel_value: u64,
+    ) -> (GpuMemoryReader, Arc<Mutex<Vec<(u64, usize)>>>) {
+        let mut backing = vec![0u8; 64 * 1024];
+        backing[sentinel_offset..sentinel_offset + 8]
+            .copy_from_slice(&sentinel_value.to_le_bytes());
+        let backing = Arc::new(backing);
+        let log: Arc<Mutex<Vec<(u64, usize)>>> = Arc::new(Mutex::new(Vec::new()));
+        let log_clone = Arc::clone(&log);
+        let reader: GpuMemoryReader = Arc::new(move |gpu_addr, dst| {
+            log_clone.lock().unwrap().push((gpu_addr, dst.len()));
+            let offset = (gpu_addr - program_base) as usize;
+            let end = (offset + dst.len()).min(backing.len());
+            if offset < backing.len() {
+                let n = end - offset;
+                dst[..n].copy_from_slice(&backing[offset..end]);
+            }
+        });
+        (reader, log)
+    }
+
+    #[test]
+    fn try_find_size_finds_self_branch_a_in_first_block() {
+        let program_base: u64 = 0x1_0000_0000;
+        let sentinel_offset = 0x80; // bytes from start_address
+        let (reader, log) =
+            make_mock_gpu_with_sentinel(program_base, sentinel_offset, SELF_BRANCH_A);
+        let mut env = GenericEnvironment::new()
+            .with_gpu_read(reader)
+            .with_program(program_base, 0);
+
+        let size = env.try_find_size().expect("sentinel must be found");
+        assert_eq!(size as usize, sentinel_offset);
+
+        // Exactly one BLOCK_SIZE read at the program base.
+        let log = log.lock().unwrap();
+        assert_eq!(log.len(), 1);
+        assert_eq!(log[0], (program_base, TRY_FIND_SIZE_BLOCK_BYTES));
+    }
+
+    #[test]
+    fn try_find_size_finds_self_branch_b_across_multiple_blocks() {
+        let program_base: u64 = 0x2_0000_0000;
+        // Sentinel in the third block.
+        let sentinel_offset = TRY_FIND_SIZE_BLOCK_BYTES * 2 + 0x40;
+        let (reader, log) =
+            make_mock_gpu_with_sentinel(program_base, sentinel_offset, SELF_BRANCH_B);
+        let mut env = GenericEnvironment::new()
+            .with_gpu_read(reader)
+            .with_program(program_base, 0);
+
+        let size = env.try_find_size().expect("sentinel must be found");
+        assert_eq!(size as usize, sentinel_offset);
+
+        // Three reads, each BLOCK_SIZE, advancing by BLOCK_SIZE.
+        let log = log.lock().unwrap();
+        assert_eq!(log.len(), 3);
+        for (i, entry) in log.iter().enumerate() {
+            assert_eq!(
+                *entry,
+                (
+                    program_base + (i * TRY_FIND_SIZE_BLOCK_BYTES) as u64,
+                    TRY_FIND_SIZE_BLOCK_BYTES
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn try_find_size_returns_none_when_no_sentinel_within_max() {
+        // Backing memory contains no sentinel anywhere; capping at MAXIMUM_SIZE.
+        let program_base: u64 = 0x3_0000_0000;
+        let backing = Arc::new(vec![0u8; TRY_FIND_SIZE_MAX_BYTES + TRY_FIND_SIZE_BLOCK_BYTES]);
+        let reader: GpuMemoryReader = Arc::new(move |gpu_addr, dst| {
+            let offset = (gpu_addr - program_base) as usize;
+            let end = (offset + dst.len()).min(backing.len());
+            if offset < backing.len() {
+                let n = end - offset;
+                dst[..n].copy_from_slice(&backing[offset..end]);
+            }
+        });
+        let mut env = GenericEnvironment::new()
+            .with_gpu_read(reader)
+            .with_program(program_base, 0);
+
+        assert!(env.try_find_size().is_none());
+    }
+
+    #[test]
+    fn analyze_returns_cityhash_of_shader_bytes() {
+        let program_base: u64 = 0x4_0000_0000;
+        let sentinel_offset = 0x40;
+        let (reader, _log) =
+            make_mock_gpu_with_sentinel(program_base, sentinel_offset, SELF_BRANCH_A);
+
+        // Analyze should return Some(hash) and seed cached_lowest/highest.
+        let mut env = GenericEnvironment::new()
+            .with_gpu_read(reader)
+            .with_program(program_base, 0);
+        let hash = env.analyze().expect("analyze must succeed");
+        assert_ne!(hash, 0);
+        assert_eq!(env.cached_lowest, 0);
+        assert_eq!(env.cached_highest, sentinel_offset as u32);
+    }
+
+    #[test]
+    fn read_instruction_falls_back_to_gpu_memory_outside_cache() {
+        let program_base: u64 = 0x5_0000_0000;
+        let target_addr: u32 = 0x200;
+        let target_value: u64 = 0xDEAD_BEEF_CAFE_BABE;
+        // Backing with the target value at offset target_addr.
+        let mut backing = vec![0u8; 0x1000];
+        backing[target_addr as usize..target_addr as usize + 8]
+            .copy_from_slice(&target_value.to_le_bytes());
+        let backing = Arc::new(backing);
+        let reader: GpuMemoryReader = Arc::new(move |gpu_addr, dst| {
+            let offset = (gpu_addr - program_base) as usize;
+            let end = (offset + dst.len()).min(backing.len());
+            if offset < backing.len() {
+                dst[..end - offset].copy_from_slice(&backing[offset..end]);
+            }
+        });
+        let mut env = GenericEnvironment::new()
+            .with_gpu_read(reader)
+            .with_program(program_base, 0);
+
+        // No SetCachedSize was called, so the address misses the cache and
+        // must be served from the reader.
+        let value = env.read_instruction(target_addr);
+        assert_eq!(value, target_value);
+        assert!(env.has_unbound_instructions);
+    }
 }

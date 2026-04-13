@@ -81,6 +81,19 @@ pub trait RendererBase: Send {
     /// Upstream passes `device_memory` in the constructor; in Rust we set it
     /// post-construction since the GPU creates the renderer before memory is wired.
     fn set_device_memory_reader(&mut self, _reader: DeviceMemoryReader) {}
+
+    /// Install a *GPU virtual address* reader on the renderer's shader cache.
+    ///
+    /// Unlike `set_device_memory_reader` (which takes raw guest CPU/device
+    /// addresses), this reader's first argument is a **GPU virtual address**
+    /// — i.e. it has already been resolved through `MemoryManager`'s page
+    /// table. The OpenGL renderer forwards this into its shader cache so
+    /// the recompiler can fetch Maxwell shader bytecode at the addresses
+    /// reported by `Maxwell3D::shader_program_addresses`.
+    ///
+    /// Default impl is a no-op for renderers that do not yet have a
+    /// shader cache (Null, current Vulkan stub).
+    fn set_shader_cache_gpu_reader(&mut self, _reader: DeviceMemoryReader) {}
 }
 
 /// Concrete base renderer data, shared by all renderer implementations.

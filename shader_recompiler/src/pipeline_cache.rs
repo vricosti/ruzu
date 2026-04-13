@@ -11,7 +11,7 @@
 
 use std::collections::HashMap;
 
-use super::backend::{self, Profile};
+use super::backend;
 use super::frontend::control_flow;
 use super::frontend::maxwell_opcodes;
 use super::frontend::structured_control_flow;
@@ -20,6 +20,7 @@ use super::ir::basic_block::Block;
 use super::ir::program::{Program, ShaderInfo};
 use super::ir::types::ShaderStage;
 use super::ir_opt;
+use super::profile::Profile;
 use super::runtime_info::RuntimeInfo;
 
 /// Key for looking up a cached shader.
@@ -36,6 +37,17 @@ pub struct ShaderKey {
 pub struct CompiledShader {
     /// SPIR-V words ready for VkShaderModule creation.
     pub spirv_words: Vec<u32>,
+    /// Shader resource usage information.
+    pub info: ShaderInfo,
+    /// Shader stage.
+    pub stage: ShaderStage,
+}
+
+/// A compiled shader emitted as GLSL source for the OpenGL backend.
+#[derive(Debug, Clone)]
+pub struct CompiledGlslShader {
+    /// GLSL source ready for `glShaderSource` / `glCompileShader`.
+    pub source: String,
     /// Shader resource usage information.
     pub info: ShaderInfo,
     /// Shader stage.
@@ -170,6 +182,49 @@ pub fn compile_shader(
     }
 }
 
+/// Compile a Maxwell shader binary to GLSL source for the OpenGL backend.
+///
+/// Mirrors [`compile_shader`] but invokes the GLSL emitter instead of the
+/// SPIR-V emitter, returning a [`CompiledGlslShader`] whose `source` field
+/// can be fed directly into `glShaderSource` / `glCompileShader`.
+pub fn compile_shader_glsl(
+    code: &[u64],
+    stage: ShaderStage,
+    profile: &Profile,
+    runtime_info: &RuntimeInfo,
+) -> CompiledGlslShader {
+    log::debug!(
+        "Compiling {:?} shader to GLSL ({} instructions)",
+        stage,
+        code.len()
+    );
+
+    let cfg_blocks = control_flow::build_cfg(code);
+    let syntax_list = structured_control_flow::structure_cfg(&cfg_blocks);
+
+    let mut program = Program::new(stage);
+    program.syntax_list = syntax_list;
+    program.blocks.push(Block::new());
+    {
+        let mut tv = TranslatorVisitor::new(&mut program, 0);
+        for &insn in code {
+            tv.translate_instruction(insn);
+        }
+    }
+
+    ir_opt::optimize(&mut program);
+
+    let mut bindings = backend::bindings::Bindings::default();
+    let source = backend::glsl::emit_glsl(profile, runtime_info, &program, &mut bindings);
+    log::debug!("  GLSL: {} bytes", source.len());
+
+    CompiledGlslShader {
+        source,
+        info: program.info,
+        stage,
+    }
+}
+
 /// Hash Maxwell instruction code for cache lookup.
 fn hash_code(code: &[u64]) -> u64 {
     // FNV-1a hash
@@ -215,9 +270,22 @@ mod tests {
         let profile = Profile::default();
         let code: Vec<u64> = vec![];
         let runtime_info = RuntimeInfo::default();
-        let compiled = compile_shader(&code, ShaderStage::Vertex, &profile, &runtime_info);
+        let compiled = compile_shader(&code, ShaderStage::VertexB, &profile, &runtime_info);
         assert!(!compiled.spirv_words.is_empty()); // Should produce valid SPIR-V header at minimum
-        assert_eq!(compiled.stage, ShaderStage::Vertex);
+        assert_eq!(compiled.stage, ShaderStage::VertexB);
+    }
+
+    #[test]
+    fn test_compile_shader_glsl_emits_source() {
+        let profile = Profile::default();
+        let code: Vec<u64> = vec![];
+        let runtime_info = RuntimeInfo::default();
+        let compiled = compile_shader_glsl(&code, ShaderStage::VertexB, &profile, &runtime_info);
+        assert!(
+            !compiled.source.is_empty(),
+            "GLSL emitter should produce a non-empty source string for an empty shader"
+        );
+        assert_eq!(compiled.stage, ShaderStage::VertexB);
     }
 
     #[test]

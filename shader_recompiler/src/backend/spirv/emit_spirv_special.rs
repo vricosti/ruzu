@@ -49,7 +49,7 @@ pub fn emit_end_primitive(_ctx: &mut SpirvEmitContext, _stream: u32) {
 ///
 /// Matches upstream `EmitDemoteToHelperInvocation(EmitContext&)`.
 pub fn emit_demote_to_helper_invocation(ctx: &mut SpirvEmitContext) {
-    if ctx.profile.support_demote_to_helper {
+    if ctx.profile.support_demote_to_helper_invocation {
         ctx.builder.demote_to_helper_invocation().unwrap();
     } else {
         ctx.builder.kill().unwrap();

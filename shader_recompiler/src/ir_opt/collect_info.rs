@@ -6,7 +6,8 @@
 //! Matches zuyu's `collect_shader_info_pass.cpp`.
 //!
 //! Scans all instructions to determine which constant buffers, textures,
-//! generic attributes, and storage buffers are used. Populates `ShaderInfo`.
+//! generic attributes, and storage buffers are used. Populates `Info`
+//! via `VaryingState` for loads/stores (upstream-faithful pattern).
 
 use crate::ir::opcodes::Opcode;
 use crate::ir::program::{CbufDescriptor, Program, StorageDescriptor, TexDescriptor};
@@ -14,9 +15,6 @@ use crate::ir::value::Value;
 
 /// Collect shader resource usage information.
 pub fn collect_shader_info_pass(program: &mut Program) {
-    let mut loads_generics: u32 = 0;
-    let mut stores_generics: u32 = 0;
-    let mut stores_position = false;
     let mut uses_local_memory = false;
 
     let mut cbuf_set = std::collections::BTreeSet::<u32>::new();
@@ -37,23 +35,17 @@ pub fn collect_shader_info_pass(program: &mut Program) {
                     }
                 }
 
-                // Attribute loads
+                // Attribute loads → VaryingState
                 Opcode::GetAttribute | Opcode::GetAttributeU32 => {
                     if let Some(Value::Attribute(attr)) = inst.args.first() {
-                        if attr.is_generic() {
-                            loads_generics |= 1 << attr.generic_index();
-                        }
+                        program.info.loads.set(attr.0 as usize, true);
                     }
                 }
 
-                // Attribute stores
+                // Attribute stores → VaryingState
                 Opcode::SetAttribute => {
                     if let Some(Value::Attribute(attr)) = inst.args.first() {
-                        if attr.is_position() {
-                            stores_position = true;
-                        } else if attr.is_generic() {
-                            stores_generics |= 1 << attr.generic_index();
-                        }
+                        program.info.stores.set(attr.0 as usize, true);
                     }
                 }
 
@@ -86,29 +78,33 @@ pub fn collect_shader_info_pass(program: &mut Program) {
         }
     }
 
-    // Populate shader info
-    program.info.loads_generics = loads_generics;
-    program.info.stores_generics = stores_generics;
-    program.info.stores_position = stores_position;
-
     program.info.constant_buffer_descriptors = cbuf_set
         .into_iter()
-        .map(|index| CbufDescriptor {
-            index,
-            size: 0x10000,
-        })
+        .map(|index| CbufDescriptor { index, count: 1 })
         .collect();
 
     program.info.texture_descriptors = tex_set
         .into_iter()
         .map(|index| TexDescriptor {
-            index,
-            texture_type: 2,
+            cbuf_index: index,
+            texture_type: crate::shader_info::TextureType::Color2D,
             is_depth: false,
+            is_multisample: false,
+            has_secondary: false,
+            cbuf_offset: 0,
+            shift_left: 0,
+            secondary_cbuf_index: 0,
+            secondary_cbuf_offset: 0,
+            secondary_shift_left: 0,
+            count: 1,
+            size_shift: 0,
         })
         .collect();
 
-    if uses_local_memory && program.info.local_memory_size == 0 {
-        program.info.local_memory_size = 0x1000; // Default 4KB local memory
+    if uses_local_memory {
+        program.info.uses_local_memory = true;
+        if program.local_memory_size == 0 {
+            program.local_memory_size = 0x1000;
+        }
     }
 }

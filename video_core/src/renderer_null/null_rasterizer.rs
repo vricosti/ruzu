@@ -88,7 +88,11 @@ impl RasterizerNull {
 impl RasterizerInterface for RasterizerNull {
     // ── Drawing (all no-ops) ────────────────────────────────────────────
 
-    fn draw(&mut self, _is_indexed: bool, _instance_count: u32) {
+    fn draw(
+        &mut self,
+        _draw_state: &crate::engines::draw_manager::DrawState,
+        _instance_count: u32,
+    ) {
         trace!("RasterizerNull::draw (no-op)");
     }
 
@@ -251,8 +255,9 @@ mod tests {
         let sp = Arc::new(SyncpointManager::new());
         let mut rast = RasterizerNull::new(sp);
 
-        rast.draw(false, 1);
-        rast.draw(true, 4);
+        let ds = crate::engines::draw_manager::DrawState::default();
+        rast.draw(&ds, 1);
+        rast.draw(&ds, 4);
         rast.draw_texture();
         rast.clear(1);
         rast.dispatch_compute();
@@ -413,7 +418,8 @@ mod tests {
         let mut rast: Box<dyn RasterizerInterface> = Box::new(RasterizerNull::new(sp));
 
         // Should work through the trait object
-        rast.draw(false, 1);
+        let ds = crate::engines::draw_manager::DrawState::default();
+        rast.draw(&ds, 1);
         rast.clear(1);
         rast.flush_all();
         rast.tick_frame();

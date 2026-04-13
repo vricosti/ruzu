@@ -28,52 +28,11 @@ pub enum PrimitiveTopologyControl {
     UseSeparateState = 1,
 }
 
-/// Primitive topology (draw mode).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-#[repr(u32)]
-pub enum PrimitiveTopology {
-    #[default]
-    Points = 0x0001,
-    Lines = 0x0002,
-    LineLoop = 0x0003,
-    LineStrip = 0x0004,
-    Triangles = 0x0005,
-    TriangleStrip = 0x0006,
-    TriangleFan = 0x0007,
-    Quads = 0x0008,
-    QuadStrip = 0x0009,
-    Polygon = 0x000A,
-    LinesAdjacency = 0x000B,
-    LineStripAdjacency = 0x000C,
-    TrianglesAdjacency = 0x000D,
-    TriangleStripAdjacency = 0x000E,
-    Patches = 0x000F,
-}
-
-impl PrimitiveTopology {
-    /// Convert a raw u32 value to a PrimitiveTopology.
-    /// Unknown values default to Points.
-    pub fn from_raw(value: u32) -> Self {
-        match value {
-            0x0001 => Self::Points,
-            0x0002 => Self::Lines,
-            0x0003 => Self::LineLoop,
-            0x0004 => Self::LineStrip,
-            0x0005 => Self::Triangles,
-            0x0006 => Self::TriangleStrip,
-            0x0007 => Self::TriangleFan,
-            0x0008 => Self::Quads,
-            0x0009 => Self::QuadStrip,
-            0x000A => Self::Polygon,
-            0x000B => Self::LinesAdjacency,
-            0x000C => Self::LineStripAdjacency,
-            0x000D => Self::TrianglesAdjacency,
-            0x000E => Self::TriangleStripAdjacency,
-            0x000F => Self::Patches,
-            _ => Self::Points,
-        }
-    }
-}
+// `PrimitiveTopology` is the upstream-faithful enum from
+// `engines::maxwell_3d` (matching `Maxwell3D::Regs::PrimitiveTopology`).
+// Re-exported here so existing imports of
+// `engines::draw_manager::PrimitiveTopology` continue to resolve.
+pub use crate::engines::maxwell_3d::PrimitiveTopology;
 
 /// Topology override values.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -86,15 +45,9 @@ pub enum PrimitiveTopologyOverride {
     LineStrip = 3,
 }
 
-/// Index buffer format.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-#[repr(u32)]
-pub enum IndexFormat {
-    #[default]
-    UnsignedByte = 0,
-    UnsignedShort = 1,
-    UnsignedInt = 2,
-}
+// `IndexFormat` is the upstream-faithful enum from
+// `engines::maxwell_3d` (matching `Maxwell3D::Regs::IndexFormat`).
+pub use crate::engines::maxwell_3d::IndexFormat;
 
 /// Vertex buffer register state.
 #[derive(Debug, Clone, Copy, Default)]
@@ -185,6 +138,13 @@ pub trait Maxwell3DAccess {
 
     /// Get a mutable reference to the rasterizer, if bound.
     fn rasterizer_mut(&mut self) -> Option<&mut dyn RasterizerInterface>;
+
+    /// Snapshot per-stage shader program GPU virtual addresses.
+    /// Disabled stages report `0`. Default impl returns all zeros for tests
+    /// and stub access types that do not yet plumb shader-program registers.
+    fn shader_program_addresses(&self) -> [u64; 6] {
+        [0; 6]
+    }
 }
 
 // ── DrawManager ─────────────────────────────────────────────────────────────
@@ -211,6 +171,20 @@ pub struct DrawState {
     pub base_instance: u32,
     pub instance_count: u32,
     pub inline_index_draw_indexes: Vec<u8>,
+    /// Per-stage Maxwell shader program GPU virtual addresses, captured at
+    /// draw-trigger time. Stage `i` is disabled when `shader_program_addresses[i] == 0`.
+    ///
+    /// Upstream rasterizers reach the same data via
+    /// `maxwell3d->regs.program_region.Address() + maxwell3d->regs.pipelines[i].offset`
+    /// directly off their Maxwell3D pointer. The Rust port has no Maxwell3D
+    /// reference inside the rasterizer, so `DrawManager::process_draw`
+    /// snapshots the addresses into `DrawState` before invoking
+    /// `RasterizerInterface::draw`.
+    pub shader_program_addresses: [u64; 6],
+    /// GPU virtual address of the index buffer start.
+    pub index_buffer_gpu_addr: u64,
+    /// GPU virtual address of the index buffer end (start + limit).
+    pub index_buffer_gpu_addr_end: u64,
 }
 
 /// State for draw-texture operations.
@@ -600,8 +574,22 @@ impl DrawManager {
         self.update_topology(maxwell3d);
 
         if maxwell3d.should_execute() {
+            // `draw_state.draw_indexed` is already kept in sync with the
+            // Maxwell3D register file by the caller chains that lead into
+            // `process_draw` (draw_index_small, draw_index_array, etc.).
+            // We ensure it matches the argument before handing the state
+            // reference to the rasterizer so the rasterizer never sees a
+            // stale value.
+            self.draw_state.draw_indexed = draw_indexed;
+            self.draw_state.instance_count = instance_count;
+            // Snapshot per-stage shader program addresses now, while we
+            // still hold the immutable Maxwell3D borrow. The rasterizer
+            // consumes them via `DrawState::shader_program_addresses` to
+            // build a `GraphicsPipelineKey` without needing a Maxwell3D
+            // back-reference of its own.
+            self.draw_state.shader_program_addresses = maxwell3d.shader_program_addresses();
             if let Some(rasterizer) = maxwell3d.rasterizer_mut() {
-                rasterizer.draw(draw_indexed, instance_count);
+                rasterizer.draw(&self.draw_state, instance_count);
             }
         }
     }

@@ -24,7 +24,7 @@ pub fn translate_program(_instructions: &[u64], stage: crate::ir::types::ShaderS
 /// `JoinTextureInfo`/`JoinStorageInfo` pass invocation.
 pub fn merge_dual_vertex_programs(_vertex_a: &mut Program, _vertex_b: &mut Program) -> Program {
     log::warn!("MergeDualVertexPrograms not yet implemented — returning empty program");
-    Program::new(crate::ir::types::ShaderStage::Vertex)
+    Program::new(crate::ir::types::ShaderStage::VertexB)
 }
 
 /// Convert legacy (fixed-function) varyings to generic attributes.
@@ -42,5 +42,5 @@ pub fn convert_legacy_to_generic(
 /// Not yet implemented: requires generating a full passthrough GS IR program.
 pub fn generate_geometry_passthrough(_source_program: &mut Program) -> Program {
     log::warn!("GenerateGeometryPassthrough not yet implemented — returning empty program");
-    Program::new(crate::ir::types::ShaderStage::Vertex)
+    Program::new(crate::ir::types::ShaderStage::VertexB)
 }

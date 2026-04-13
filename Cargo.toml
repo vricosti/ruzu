@@ -77,3 +77,6 @@ serde_json = "1"
 tempfile = "3"
 openssl = "0.10"
 context = "3.0"
+
+[profile.release]
+debug = 1

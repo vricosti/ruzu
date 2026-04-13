@@ -33,3 +33,37 @@
                                                                                                                                            
   Estimated 600–1200 lines of mechanical signature threading across k_page_table_base.rs and k_memory_block_manager.rs. Compiles differently,
    behaves identically.
+   ---
+   ● The investigation has narrowed the root cause to two distinct bugs:                                                                        
+                                                                                                                                             
+  Bug 1 (confirmed): CoreTiming preemption event stops firing after ~2 seconds. The timer thread keeps ticking but the preemption callback   
+  stops being called. This causes signal_interrupt to stop, which causes the JIT to never exit run(), which causes the game to freeze. The   
+  watchdog thread workaround proves the JIT is otherwise healthy — with forced 5ms halts, the game makes forward progress through different  
+  code regions.                                                                                                                              
+                                                                                                                                             
+  Bug 2 (to investigate): what causes the preemption event to stop being collected. The event queue has 8 events with times ~50μs overdue,   
+  but the preemption callback stops firing. A likely candidate is event starvation or an Arc/Weak reference issue specific to how the
+  preemption event is stored.                                                                                                                
+                                                                  
+  This is deep kernel/scheduler infrastructure debugging that explains the original "game appears stuck" symptom completely. The game isn't  
+  slow — it's FROZEN because the preemption timer breaks after 2 seconds of operation.
+  -----
+  ● The condvar implementation is correct — I verified signals DO match waits when the same key is used. The game's 7 worker threads           
+  (tid=84-90) wait on keys in the 0x686A range, but those keys are NEVER signaled because the main thread stalls before reaching its       
+  work-dispatch code.                                                                                                                        
+                                                                                                                                           
+  Each fix advances the main thread further through its init sequence:                                                                       
+  - Fix 1 (CheckHalt): 0 → 3254 SVCs                                                                                                       
+  - Fix 2+3 (Vsync+ThreadEvent): same but unblocked scheduler
+  - Fix 4 (Audio): 3254 → 3606 SVCs (+352 new)               
+                                                                                                                                             
+  But the game still stalls at 3606 in a user-space spin waiting for another service event. This is the Nth event in a chain — we've fixed   
+  vsync and audio, but there are likely more (nvnflinger buffer ready, time service, applet state transitions, etc.).                        
+                                                                                                                                             
+  Rather than chasing events one by one, I should commit the 4 fixes and update the investigation notes. These are real bugs with real fixes:
+                                                                                                                                           
+  1. JIT CheckHalt (rdynarmic) — PopRSBHint/FastDispatchHint didn't check halt_reason                                                        
+  2. ThreadEvent ordering (common) — SeqCst + always notify                                                                                
+  3. VsyncThread (conductor) — sleep-based workaround for condvar lost-wakeup                                                                
+  4. Audio SystemManager (system_manager) — non-blocking ADSP signal 
+                                                                                                                                             

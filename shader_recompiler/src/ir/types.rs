@@ -139,28 +139,13 @@ impl Type {
 }
 
 /// Shader stage.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum ShaderStage {
-    Vertex,
-    TessellationControl,
-    TessellationEval,
-    Geometry,
-    Fragment,
-    Compute,
-}
-
-impl fmt::Display for ShaderStage {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            ShaderStage::Vertex => write!(f, "vertex"),
-            ShaderStage::TessellationControl => write!(f, "tess_control"),
-            ShaderStage::TessellationEval => write!(f, "tess_eval"),
-            ShaderStage::Geometry => write!(f, "geometry"),
-            ShaderStage::Fragment => write!(f, "fragment"),
-            ShaderStage::Compute => write!(f, "compute"),
-        }
-    }
-}
+///
+/// Re-exported from `crate::stage::Stage` so the recompiler has a single
+/// `ShaderStage` type that matches upstream `Shader::Stage` exactly
+/// (7 variants, with `VertexA` and `VertexB` distinct as upstream
+/// `shader_recompiler/stage.h`). The previous 6-variant Rust-port
+/// `enum ShaderStage` was deleted as part of the type unification pass.
+pub use crate::stage::Stage as ShaderStage;
 
 /// Floating-point rounding mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]

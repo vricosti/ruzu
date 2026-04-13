@@ -272,6 +272,33 @@ impl Gpu {
         *self.guest_memory_reader.lock().unwrap() = Some(reader);
     }
 
+    /// Resolve a GPU virtual address to host memory via the *bound channel's*
+    /// `MemoryManager`, using `cpu_reader` for the underlying CPU/device-side
+    /// reads. Returns `false` when no channel is bound or the bound channel
+    /// has no memory manager. Used by the OpenGL shader cache to fault in
+    /// Maxwell shader bytecode.
+    pub fn read_gpu_memory(
+        &self,
+        gpu_va: u64,
+        dst: &mut [u8],
+        cpu_reader: &dyn Fn(u64, &mut [u8]),
+    ) -> bool {
+        let bound = *self.bound_channel.lock().unwrap();
+        if bound < 0 {
+            return false;
+        }
+        let channel = match self.channels.lock().unwrap().get(&bound).cloned() {
+            Some(c) => c,
+            None => return false,
+        };
+        let channel = channel.lock();
+        let Some(mm) = channel.memory_manager.as_ref() else {
+            return false;
+        };
+        mm.lock().read_block(gpu_va, dst, cpu_reader);
+        true
+    }
+
     pub fn read_guest_memory(&self, addr: u64, output: &mut [u8]) -> bool {
         let Some(reader) = self.guest_memory_reader.lock().unwrap().clone() else {
             return false;
@@ -771,7 +798,12 @@ mod tests {
     }
 
     impl RasterizerInterface for FakeRasterizer {
-        fn draw(&mut self, _is_indexed: bool, _instance_count: u32) {}
+        fn draw(
+            &mut self,
+            _draw_state: &crate::engines::draw_manager::DrawState,
+            _instance_count: u32,
+        ) {
+        }
         fn draw_texture(&mut self) {}
         fn clear(&mut self, _layer_count: u32) {}
         fn dispatch_compute(&mut self) {}

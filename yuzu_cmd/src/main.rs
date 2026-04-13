@@ -387,6 +387,48 @@ fn main() {
                         .set_invalidate_gpu_cache_callback(Arc::new(move || unsafe {
                             (&*(gpu_ptr as *const video_core::gpu::Gpu)).invalidate_gpu_cache();
                         }));
+                    // Install the GPU virtual address reader on the OpenGL
+                    // shader cache. The closure walks the same SystemRef
+                    // path that `set_guest_memory_reader` uses (below) for
+                    // the CPU side, and resolves GPU VAs through the bound
+                    // channel's `MemoryManager` via `Gpu::read_gpu_memory`.
+                    let system_ref_gpu = ruzu_core::core::SystemRef::from_ref(&system);
+                    renderer.rasterizer_mut().set_gpu_memory_reader(Arc::new(
+                        move |gpu_va, dst: &mut [u8]| {
+                            let cpu_reader = |addr: u64, out: &mut [u8]| {
+                                let sys = system_ref_gpu.get();
+                                if let Some(memory) = sys.memory_shared() {
+                                    let m = memory.lock().unwrap();
+                                    if m.read_block(addr, out) {
+                                        return;
+                                    }
+                                }
+                                // Fallback: direct DeviceMemory access for
+                                // addresses not in the process page table
+                                // (e.g. nvmap-only mappings).
+                                let sys = system_ref_gpu.get();
+                                let dm = sys.device_memory();
+                                let base =
+                                    ruzu_core::device_memory::dram_memory_map::BASE;
+                                if addr >= base {
+                                    let offset = (addr - base) as usize;
+                                    let backing = dm.buffer.backing_base_pointer();
+                                    unsafe {
+                                        std::ptr::copy_nonoverlapping(
+                                            backing.add(offset),
+                                            out.as_mut_ptr(),
+                                            out.len(),
+                                        );
+                                    }
+                                }
+                            };
+                            unsafe {
+                                let gpu_ref =
+                                    &*(gpu_ptr as *const video_core::gpu::Gpu);
+                                gpu_ref.read_gpu_memory(gpu_va, dst, &cpu_reader);
+                            }
+                        },
+                    ));
                     Box::new(renderer)
                 }
                 "vulkan" => {

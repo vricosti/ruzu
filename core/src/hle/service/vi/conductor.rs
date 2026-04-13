@@ -162,6 +162,11 @@ impl Conductor {
             let event = core_timing::create_event(
                 "ScreenComposition".to_string(),
                 Box::new(move |_time, _ns_late| {
+                    static SC_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                    let sc = SC_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if sc < 3 {
+                        log::info!("[SC_CB] #{} signal_ptr={:p}", sc, &*signal_for_callback);
+                    }
                     signal_for_callback.set();
                     let next_ns = tick_state.get_next_ticks();
                     Some(Duration::from_nanos(next_ns as u64))
@@ -241,25 +246,52 @@ impl Conductor {
         conductor: std::sync::Weak<Mutex<Self>>,
         system: SystemRef,
     ) {
+        static VT_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        log::info!("[VSYNC_THREAD] started signal_ptr={:p}", &*signal);
         while !stop.load(Ordering::Relaxed) {
-            signal.wait();
+            // Upstream uses signal.wait() but the ThreadEvent has a lost-wakeup
+            // issue. Use direct sleep at the vsync interval as a workaround
+            // until the root cause is found.
+            std::thread::sleep(std::time::Duration::from_nanos(FRAME_NS as u64));
+
+            let vt = VT_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if vt < 10 || vt % 60 == 0 {
+                log::info!("[VSYNC_THREAD] woke #{}", vt);
+            }
 
             if system.get().is_shutting_down() {
+                log::info!("[VSYNC_THREAD] shutting down");
                 return;
             }
 
             if let Some(conductor) = conductor.upgrade() {
-                conductor.lock().unwrap().process_vsync();
+                match conductor.try_lock() {
+                    Ok(mut guard) => guard.process_vsync(),
+                    Err(_) => {
+                        if vt < 10 || vt % 300 == 0 {
+                            log::warn!("[VSYNC_THREAD] #{} conductor LOCKED by another thread, skipping", vt);
+                        }
+                    }
+                }
             } else {
-                // Conductor was dropped, exit.
+                log::error!("[VSYNC_THREAD] conductor DROPPED at wake #{}, exiting!", vt);
                 return;
             }
         }
+        log::info!("[VSYNC_THREAD] stop requested");
     }
 
     pub fn link_vsync_event(&mut self, display_id: u64, event: Arc<Event>) {
         if let Some(manager) = self.vsync_managers.get_mut(&display_id) {
+            let count = manager.event_count() + 1;
             manager.link_vsync_event(event);
+            log::info!("Conductor::link_vsync_event: display_id={} linked (total={})", display_id, count);
+        } else {
+            log::error!(
+                "Conductor::link_vsync_event: display_id={} NOT FOUND! Available: {:?}",
+                display_id,
+                self.vsync_managers.keys().collect::<Vec<_>>()
+            );
         }
     }
 
@@ -272,6 +304,12 @@ impl Conductor {
     /// Process a vsync tick: compose each display, then signal vsync events.
     /// Port of upstream `Conductor::ProcessVsync`.
     fn process_vsync(&mut self) {
+        static VSYNC_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let vc = VSYNC_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if vc % 300 == 0 {
+            let total_events: usize = self.vsync_managers.values().map(|m| m.event_count()).sum();
+            log::info!("[VSYNC] tick#{} total_linked_events={}", vc, total_events);
+        }
         for (&display_id, manager) in self.vsync_managers.iter() {
             // Upstream: m_container.ComposeOnDisplay(&m_swap_interval, &m_compose_speed_scale, display_id);
             self.surface_flinger.compose_display(

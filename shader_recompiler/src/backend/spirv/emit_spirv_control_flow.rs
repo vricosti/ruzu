@@ -12,7 +12,7 @@ use super::spirv_emit_context::SpirvEmitContext;
 /// If the profile supports `OpDemoteToHelperInvocation`, use it directly.
 /// Otherwise, fall back to a conditional `OpKill` pattern.
 pub fn emit_demote_to_helper_invocation(ctx: &mut SpirvEmitContext) {
-    if ctx.profile.support_demote_to_helper {
+    if ctx.profile.support_demote_to_helper_invocation {
         ctx.builder.demote_to_helper_invocation().unwrap();
     } else {
         // Fallback: conditional kill

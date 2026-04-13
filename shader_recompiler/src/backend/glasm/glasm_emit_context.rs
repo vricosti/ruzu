@@ -61,7 +61,7 @@ impl<'a> EmitContext<'a> {
 
         // Set stage names matching upstream
         match program.stage {
-            ir::types::ShaderStage::Vertex => {
+            ir::types::ShaderStage::VertexB => {
                 ctx.stage_name = "vertex";
                 ctx.attrib_name = "vertex";
             }
@@ -84,6 +84,12 @@ impl<'a> EmitContext<'a> {
             ir::types::ShaderStage::Compute => {
                 ctx.stage_name = "invocation";
                 ctx.attrib_name = "invocation";
+            }
+            ir::types::ShaderStage::VertexA => {
+                // Upstream merges VertexA into VertexB during translation
+                // (`MergeDualVertexPrograms`). The backend should never see
+                // VertexA reaching emission.
+                unreachable!("VertexA must be merged into VertexB before GLASM emission");
             }
         }
 

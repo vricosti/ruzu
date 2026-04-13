@@ -56,8 +56,8 @@ mod tests {
 
     #[test]
     fn test_ir_program_construction() {
-        let mut program = Program::new(ShaderStage::Vertex);
-        assert_eq!(program.stage, ShaderStage::Vertex);
+        let mut program = Program::new(ShaderStage::VertexB);
+        assert_eq!(program.stage, ShaderStage::VertexB);
         assert_eq!(program.num_blocks(), 0);
 
         program.blocks.push(Block::new());
@@ -81,7 +81,7 @@ mod tests {
 
     #[test]
     fn test_ir_emitter_integer_ops() {
-        let mut program = Program::new(ShaderStage::Vertex);
+        let mut program = Program::new(ShaderStage::VertexB);
         program.blocks.push(Block::new());
 
         {

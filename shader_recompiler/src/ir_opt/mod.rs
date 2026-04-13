@@ -49,7 +49,7 @@ mod tests {
     use crate::ir::value::{Attribute, Value};
 
     fn make_test_program() -> Program {
-        let mut program = Program::new(ShaderStage::Vertex);
+        let mut program = Program::new(ShaderStage::VertexB);
         program.blocks.push(Block::new());
         program
     }
@@ -245,8 +245,10 @@ mod tests {
 
         collect_info::collect_shader_info_pass(&mut program);
 
-        assert!(program.info.loads_generics & (1 << 3) != 0);
-        assert!(program.info.stores_position);
+        // Generic3 component 0 → VaryingState bit at Generic0X + 3*4 = 44
+        assert!(program.info.loads.generic_any(3));
+        // PositionX → VaryingState bit at PositionX(28)
+        assert!(program.info.stores.any_component(Attribute::POSITION_X.0 as usize));
     }
 
     // ── Full Optimization Pipeline ───────────────────────────────────

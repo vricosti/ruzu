@@ -67,7 +67,7 @@ use crate::engines::maxwell_3d::{
 use crate::engines::Framebuffer;
 use crate::rasterizer_interface::{RasterizerDownloadArea, RasterizerInterface};
 use crate::syncpoint::SyncpointManager;
-use shader_recompiler::{BackendProfile as Profile, PipelineCache};
+use shader_recompiler::{PipelineCache, Profile};
 
 use buffer_cache::BufferCache;
 use descriptor_pool::DescriptorPool;
@@ -775,10 +775,14 @@ impl RasterizerVulkan {
 }
 
 impl RasterizerInterface for RasterizerVulkan {
-    fn draw(&mut self, is_indexed: bool, instance_count: u32) {
+    fn draw(
+        &mut self,
+        draw_state: &crate::engines::draw_manager::DrawState,
+        instance_count: u32,
+    ) {
         debug!(
             "RasterizerVulkan::draw indexed={} instances={}",
-            is_indexed, instance_count
+            draw_state.draw_indexed, instance_count
         );
         // Actual draw dispatch is done through render_draw_calls() which
         // calls self.draw(draw_call, read_gpu) with full DrawCall context.

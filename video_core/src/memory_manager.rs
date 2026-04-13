@@ -1589,7 +1589,12 @@ mod tests {
     }
 
     impl RasterizerInterface for TestRasterizer {
-        fn draw(&mut self, _is_indexed: bool, _instance_count: u32) {}
+        fn draw(
+            &mut self,
+            _draw_state: &crate::engines::draw_manager::DrawState,
+            _instance_count: u32,
+        ) {
+        }
         fn draw_texture(&mut self) {}
         fn clear(&mut self, _layer_count: u32) {}
         fn dispatch_compute(&mut self) {}

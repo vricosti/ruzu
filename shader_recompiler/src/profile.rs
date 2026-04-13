@@ -117,7 +117,7 @@ impl Default for Profile {
             support_viewport_index_layer_non_geometry: false,
             support_viewport_mask: false,
             support_typeless_image_loads: false,
-            support_demote_to_helper_invocation: false,
+            support_demote_to_helper_invocation: true,
             support_int64_atomics: false,
             support_derivative_control: false,
             support_geometry_shader_passthrough: false,
