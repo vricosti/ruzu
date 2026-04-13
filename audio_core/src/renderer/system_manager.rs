@@ -57,22 +57,15 @@ impl SystemManager {
                         let loop_start = std::time::Instant::now();
                         {
                             let systems = systems.lock();
-                            log::info!("AudioRenderSystemManager loop systems={}", systems.len());
                             for system in systems.iter() {
                                 system.lock().send_command_to_dsp();
                             }
                         }
 
-                        // Signal ADSP to render, but don't block waiting for
-                        // a response. The ADSP thread may be stuck on sink
-                        // free-space wait when the audio output isn't consuming.
-                        // Skipping the blocking wait keeps the 20ms signal loop
-                        // alive so signal_rendered_event fires continuously,
-                        // matching the upstream behavior where the game gets
-                        // audio-ready events at the frame rate regardless of
-                        // actual audio throughput.
-                        {
-                            let mut renderer = audio_renderer.lock();
+                        // Signal ADSP but don't block on response. Use try_lock
+                        // to avoid deadlocking with the ADSP thread which may
+                        // hold the renderer lock during command processing.
+                        if let Some(mut renderer) = audio_renderer.try_lock() {
                             renderer.signal();
                         }
 
