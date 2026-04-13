@@ -80,6 +80,15 @@ impl GraphicsPipelineKey {
 pub struct GraphicsPipeline {
     pub key: GraphicsPipelineKey,
 
+    /// Per-stage GLSL source produced by the recompiler. Stages with no
+    /// shader (and the placeholder pipeline created when no GPU memory
+    /// reader is installed) leave the corresponding entry as `None`.
+    ///
+    /// Gap (4) consumes these strings to call `glCreateShader` /
+    /// `glShaderSource` / `glCompileShader` / `glLinkProgram` and fill
+    /// `source_programs` with the resulting GL handles.
+    pub glsl_sources: [Option<String>; NUM_STAGES],
+
     /// Source program handles per stage (GLSL or SPIR-V).
     pub source_programs: [u32; NUM_STAGES],
     /// Assembly program handles per stage (GLASM).
@@ -112,11 +121,30 @@ pub struct GraphicsPipeline {
     built_condvar: Condvar,
     built_fence: gl::types::GLsync,
     is_built: bool,
+
+    /// GL program pipeline object that aggregates the per-stage separable
+    /// programs in `source_programs`. `0` means uninitialised.
+    ///
+    /// Created lazily in `build_from_sources` and bound by `configure()`
+    /// (gap 5). Mirrors upstream `OpenGL::ProgramManager::BindGraphicsPipeline`'s
+    /// per-pipeline `OGLPipeline` object.
+    program_pipeline: u32,
 }
 
 // SAFETY: The GL sync handle is only accessed while the built_mutex is held.
 unsafe impl Send for GraphicsPipeline {}
 unsafe impl Sync for GraphicsPipeline {}
+
+impl Drop for GraphicsPipeline {
+    fn drop(&mut self) {
+        // Release any per-stage program handles created via
+        // `build_from_sources`. Safe to call without a current GL context
+        // because all entries are zero in that case.
+        if self.has_gl_programs() {
+            self.delete_gl_programs();
+        }
+    }
+}
 
 impl GraphicsPipeline {
     /// Create a new graphics pipeline.
@@ -125,6 +153,7 @@ impl GraphicsPipeline {
     pub fn new(key: GraphicsPipelineKey) -> Self {
         Self {
             key,
+            glsl_sources: Default::default(),
             source_programs: [0; NUM_STAGES],
             assembly_programs: [0; NUM_STAGES],
             enabled_stages_mask: 0,
@@ -143,6 +172,7 @@ impl GraphicsPipeline {
             built_condvar: Condvar::new(),
             built_fence: std::ptr::null(),
             is_built: true,
+            program_pipeline: 0,
         }
     }
 
@@ -160,19 +190,23 @@ impl GraphicsPipeline {
     pub fn configure(&mut self, _is_indexed: bool) {
         self.wait_for_build();
 
-        // Bind programs for each enabled stage
-        for stage in 0..NUM_STAGES {
-            if (self.enabled_stages_mask & (1 << stage)) == 0 {
-                continue;
-            }
-            if self.source_programs[stage] != 0 {
-                // Bind source program
-                // In the full implementation, this would be part of a program pipeline
+        // Gap (5): bind the per-pipeline program-pipeline object so the
+        // next `glDraw*` call uses the per-stage separable programs that
+        // `build_from_sources` (gap 4) compiled and aggregated. Mirrors
+        // upstream `OpenGL::ProgramManager::BindGraphicsPipeline`.
+        if self.program_pipeline != 0 {
+            unsafe {
+                // Detach any monolithic program first — separable programs
+                // and a bound monolithic program are mutually exclusive.
+                gl::UseProgram(0);
+                gl::BindProgramPipeline(self.program_pipeline);
             }
         }
 
         self.configure_transform_feedback();
-        // Full implementation requires buffer_cache and texture_cache
+        // Full implementation also requires buffer_cache / texture_cache
+        // bindings (uniform/storage/texture/image descriptors); those are
+        // separate gaps.
     }
 
     /// Configure transform feedback if active.
@@ -192,6 +226,87 @@ impl GraphicsPipeline {
     /// Returns whether local memory is used.
     pub fn uses_local_memory(&self) -> bool {
         self.uses_local_memory
+    }
+
+    /// Whether any compiled GL program has been attached to this pipeline.
+    pub fn has_gl_programs(&self) -> bool {
+        self.source_programs.iter().any(|h| *h != 0)
+    }
+
+    /// Compile and link the staged GLSL sources into per-stage separable
+    /// GL program objects.
+    ///
+    /// Mirrors what upstream `GraphicsPipeline`'s constructor does once
+    /// `EmitGLSL` has produced source strings: a `glCreateShader` /
+    /// `glShaderSource` / `glCompileShader` for each enabled stage,
+    /// followed by `glLinkProgram` (with `GL_PROGRAM_SEPARABLE`) to
+    /// produce a separable single-stage program. The resulting GL
+    /// handles land in `source_programs[stage_index]`, ready for
+    /// `configure()` (gap 5) to bind via `glUseProgramStages`.
+    ///
+    /// Returns `Ok(())` on full success, or `Err(stage_index, message)`
+    /// for the first stage that failed to compile or link. On error the
+    /// already-allocated handles are deleted so the pipeline ends up in
+    /// the same "no GL programs attached" state as a placeholder.
+    ///
+    /// Safety: must be called with a current OpenGL context. The cache
+    /// never invokes this directly — `RasterizerOpenGL::draw` calls it
+    /// lazily on first use, where a GL context is guaranteed.
+    pub fn build_from_sources(&mut self) -> Result<(), (usize, String)> {
+        // Already built — nothing to do.
+        if self.has_gl_programs() {
+            return Ok(());
+        }
+
+        for (stage_index, source) in self.glsl_sources.iter().enumerate() {
+            let Some(source) = source else { continue };
+            if source.is_empty() {
+                continue;
+            }
+            match unsafe { compile_link_separable(stage_index, source) } {
+                Ok(program) => {
+                    self.source_programs[stage_index] = program;
+                    self.enabled_stages_mask |= 1 << stage_index;
+                }
+                Err(msg) => {
+                    // Roll back any handles we already created.
+                    self.delete_gl_programs();
+                    return Err((stage_index, msg));
+                }
+            }
+        }
+
+        // Aggregate the per-stage separable programs into a single
+        // program-pipeline object. Mirrors upstream's `OGLPipeline` setup.
+        unsafe {
+            gl::GenProgramPipelines(1, &mut self.program_pipeline);
+            for stage_index in 0..NUM_STAGES {
+                let prog = self.source_programs[stage_index];
+                if prog == 0 {
+                    continue;
+                }
+                gl::UseProgramStages(self.program_pipeline, stage_bit(stage_index), prog);
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Delete every per-stage program handle this pipeline owns and the
+    /// program-pipeline object aggregating them.
+    /// Called both on `build_from_sources` rollback and on drop.
+    fn delete_gl_programs(&mut self) {
+        if self.program_pipeline != 0 {
+            unsafe { gl::DeleteProgramPipelines(1, &self.program_pipeline) };
+            self.program_pipeline = 0;
+        }
+        for handle in self.source_programs.iter_mut() {
+            if *handle != 0 {
+                unsafe { gl::DeleteProgram(*handle) };
+                *handle = 0;
+            }
+        }
+        self.enabled_stages_mask = 0;
     }
 
     /// Returns whether the pipeline has finished building.
@@ -270,6 +385,114 @@ impl GraphicsPipeline {
             .unwrap();
         self.is_built = true;
     }
+}
+
+/// Map a `glsl_sources` slot index to the corresponding
+/// `glUseProgramStages` stage bit. Mirrors upstream's per-stage bit
+/// constants used to assemble program pipelines.
+fn stage_bit(stage_index: usize) -> u32 {
+    match stage_index {
+        0 => gl::VERTEX_SHADER_BIT,
+        1 => gl::TESS_CONTROL_SHADER_BIT,
+        2 => gl::TESS_EVALUATION_SHADER_BIT,
+        3 => gl::GEOMETRY_SHADER_BIT,
+        4 => gl::FRAGMENT_SHADER_BIT,
+        _ => 0,
+    }
+}
+
+/// Compile a GLSL source for `stage_index` and link it into a separable
+/// single-stage GL program.
+///
+/// Returns the linked program handle on success, or a descriptive error
+/// string. Mirrors the upstream pattern of producing one separable
+/// program per shader stage and binding them via a program-pipeline
+/// object at draw time (`glUseProgramStages`).
+///
+/// Safety: caller must hold a current OpenGL context.
+unsafe fn compile_link_separable(stage_index: usize, source: &str) -> Result<u32, String> {
+    let stage_enum = gl_stage(stage_index);
+
+    // Compile the shader.
+    let shader = gl::CreateShader(stage_enum);
+    if shader == 0 {
+        return Err(format!("glCreateShader returned 0 for stage {}", stage_index));
+    }
+    let c_src = match std::ffi::CString::new(source) {
+        Ok(s) => s,
+        Err(_) => {
+            gl::DeleteShader(shader);
+            return Err("GLSL source contained interior NUL".into());
+        }
+    };
+    let src_ptr = c_src.as_ptr();
+    gl::ShaderSource(shader, 1, &src_ptr, std::ptr::null());
+    gl::CompileShader(shader);
+    let mut status: gl::types::GLint = 0;
+    gl::GetShaderiv(shader, gl::COMPILE_STATUS, &mut status);
+    if status == 0 {
+        let msg = gl_info_log_shader(shader);
+        gl::DeleteShader(shader);
+        return Err(format!("compile failed: {}", msg));
+    }
+
+    // Link as a separable program (single shader attached, then linked).
+    let program = gl::CreateProgram();
+    if program == 0 {
+        gl::DeleteShader(shader);
+        return Err(format!("glCreateProgram returned 0 for stage {}", stage_index));
+    }
+    gl::ProgramParameteri(program, gl::PROGRAM_SEPARABLE, gl::TRUE as gl::types::GLint);
+    gl::AttachShader(program, shader);
+    gl::LinkProgram(program);
+    gl::DetachShader(program, shader);
+    gl::DeleteShader(shader);
+
+    let mut link_status: gl::types::GLint = 0;
+    gl::GetProgramiv(program, gl::LINK_STATUS, &mut link_status);
+    if link_status == 0 {
+        let msg = gl_info_log_program(program);
+        gl::DeleteProgram(program);
+        return Err(format!("link failed: {}", msg));
+    }
+
+    Ok(program)
+}
+
+/// Read the shader info log into a Rust `String`. Used by error paths in
+/// `compile_link_separable`.
+unsafe fn gl_info_log_shader(shader: u32) -> String {
+    let mut len: gl::types::GLint = 0;
+    gl::GetShaderiv(shader, gl::INFO_LOG_LENGTH, &mut len);
+    if len <= 0 {
+        return String::new();
+    }
+    let mut buf = vec![0u8; len as usize];
+    gl::GetShaderInfoLog(
+        shader,
+        len,
+        std::ptr::null_mut(),
+        buf.as_mut_ptr() as *mut _,
+    );
+    String::from_utf8_lossy(&buf).into_owned()
+}
+
+/// Read the program info log into a Rust `String`. Used by error paths in
+/// `compile_link_separable`.
+unsafe fn gl_info_log_program(program: u32) -> String {
+    let mut len: gl::types::GLint = 0;
+    gl::GetProgramiv(program, gl::INFO_LOG_LENGTH, &mut len);
+    if len <= 0 {
+        return String::new();
+    }
+    let mut buf = vec![0u8; len as usize];
+    gl::GetProgramInfoLog(
+        program,
+        len,
+        std::ptr::null_mut(),
+        buf.as_mut_ptr() as *mut _,
+    );
+    String::from_utf8_lossy(&buf).into_owned()
 }
 
 /// Helper: map a stage index to the corresponding GL shader stage enum.

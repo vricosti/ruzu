@@ -81,7 +81,7 @@ impl<'a> EmitContext<'a> {
         ctx.header.push_str("#version 460 core\n");
 
         match program.stage {
-            ir::types::ShaderStage::Vertex => {
+            ir::types::ShaderStage::VertexB => {
                 ctx.stage_name = "vertex";
             }
             ir::types::ShaderStage::TessellationControl => {
@@ -98,6 +98,9 @@ impl<'a> EmitContext<'a> {
             }
             ir::types::ShaderStage::Compute => {
                 ctx.stage_name = "compute";
+            }
+            ir::types::ShaderStage::VertexA => {
+                unreachable!("VertexA must be merged into VertexB before GLSL emission");
             }
         }
 

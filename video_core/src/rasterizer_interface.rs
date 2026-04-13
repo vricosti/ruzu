@@ -10,6 +10,7 @@
 use std::sync::Arc;
 
 use crate::control::channel_state::ChannelState;
+use crate::engines::draw_manager::DrawState;
 use crate::query_cache::types::QueryPropertiesFlags;
 
 /// Shader loading callback stages.
@@ -40,7 +41,15 @@ pub trait RasterizerInterface {
     // ── Drawing ─────────────────────────────────────────────────────────
 
     /// Dispatch a draw invocation.
-    fn draw(&mut self, is_indexed: bool, instance_count: u32);
+    ///
+    /// `draw_state` is a live reference to the Maxwell3D draw state captured
+    /// by `DrawManager` at the moment the draw was triggered: topology,
+    /// indexed vs non-indexed, vertex/index buffer bindings, base
+    /// vertex/instance, and per-primitive counts. Upstream reaches this state
+    /// via `maxwell3d->draw_manager->GetDrawState()` inside the rasterizer;
+    /// we plumb it through the call instead so the trait doesn't need to
+    /// carry a Maxwell3D reference.
+    fn draw(&mut self, draw_state: &DrawState, instance_count: u32);
 
     /// Dispatch an indirect draw invocation.
     fn draw_indirect(&mut self) {}

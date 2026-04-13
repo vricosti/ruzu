@@ -98,37 +98,35 @@ impl Event {
     }
 
     pub fn is_set_peek(&self) -> bool {
-        self.is_set.load(Ordering::Relaxed)
+        self.is_set.load(Ordering::SeqCst)
     }
 
     pub fn set(&self) {
         let _lk = self.mutex.lock().unwrap();
-        if !self.is_set.load(Ordering::Relaxed) {
-            self.is_set.store(true, Ordering::Relaxed);
-            self.condvar.notify_one();
-        }
+        self.is_set.store(true, Ordering::SeqCst);
+        self.condvar.notify_one();
     }
 
     pub fn wait(&self) {
         let lk = self.mutex.lock().unwrap();
         let _lk = self
             .condvar
-            .wait_while(lk, |_| !self.is_set.load(Ordering::Relaxed))
+            .wait_while(lk, |_| !self.is_set.load(Ordering::SeqCst))
             .unwrap();
-        self.is_set.store(false, Ordering::Relaxed);
+        self.is_set.store(false, Ordering::SeqCst);
     }
 
     pub fn wait_for(&self, duration: Duration) -> bool {
         let lk = self.mutex.lock().unwrap();
         let result = self
             .condvar
-            .wait_timeout_while(lk, duration, |_| !self.is_set.load(Ordering::Relaxed));
+            .wait_timeout_while(lk, duration, |_| !self.is_set.load(Ordering::SeqCst));
         match result {
             Ok((_guard, timeout_result)) => {
                 if timeout_result.timed_out() {
                     return false;
                 }
-                self.is_set.store(false, Ordering::Relaxed);
+                self.is_set.store(false, Ordering::SeqCst);
                 true
             }
             Err(_) => false,
@@ -137,11 +135,11 @@ impl Event {
 
     pub fn reset(&self) {
         let _lk = self.mutex.lock().unwrap();
-        self.is_set.store(false, Ordering::Relaxed);
+        self.is_set.store(false, Ordering::SeqCst);
     }
 
     pub fn is_set(&self) -> bool {
-        self.is_set.load(Ordering::Relaxed)
+        self.is_set.load(Ordering::SeqCst)
     }
 }
 

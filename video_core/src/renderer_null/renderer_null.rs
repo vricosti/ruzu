@@ -194,7 +194,8 @@ mod tests {
         let mut renderer = RendererNull::new(sp);
 
         // Should be able to access the rasterizer and call methods
-        renderer.rasterizer_mut().draw(false, 1);
+        let ds = crate::engines::draw_manager::DrawState::default();
+        renderer.rasterizer_mut().draw(&ds, 1);
         renderer.rasterizer_mut().flush_all();
         assert!(!renderer.rasterizer().must_flush_region(0, 0));
     }

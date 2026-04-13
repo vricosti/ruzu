@@ -338,6 +338,13 @@ pub struct Info {
 
     pub constant_buffer_mask: u32,
     pub constant_buffer_used_sizes: [u32; Self::MAX_CBUFS],
+
+    // The previous Rust-port-only compatibility fields
+    // (loads_generics, stores_generics, loads_position, stores_position,
+    // local_memory_size, shared_memory_size) have been removed. The
+    // translator and backends now use `VaryingState`-based loads/stores
+    // and `Program::local_memory_size` / `Program::shared_memory_size`
+    // matching upstream.
     pub nvn_buffer_base: u32,
     pub nvn_buffer_used: u16,
 

@@ -43,18 +43,11 @@ impl Stage {
     }
 }
 
-impl From<super::ir::types::ShaderStage> for Stage {
-    fn from(stage: super::ir::types::ShaderStage) -> Self {
-        match stage {
-            super::ir::types::ShaderStage::Vertex => Stage::VertexB,
-            super::ir::types::ShaderStage::TessellationControl => Stage::TessellationControl,
-            super::ir::types::ShaderStage::TessellationEval => Stage::TessellationEval,
-            super::ir::types::ShaderStage::Geometry => Stage::Geometry,
-            super::ir::types::ShaderStage::Fragment => Stage::Fragment,
-            super::ir::types::ShaderStage::Compute => Stage::Compute,
-        }
-    }
-}
+// Note: there used to be a `From<ir::types::ShaderStage> for Stage` impl
+// here that translated the simplified 6-variant `ShaderStage` into the
+// upstream 7-variant `Stage`. Both are now the same type
+// (`ir::types::ShaderStage` is a re-export of `Stage`), so the conversion
+// is the identity and the impl was removed.
 
 impl fmt::Display for Stage {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {

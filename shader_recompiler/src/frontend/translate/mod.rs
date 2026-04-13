@@ -11,6 +11,7 @@
 //! Each submodule corresponds 1:1 to an upstream `impl/*.cpp` file.
 
 // Instruction translation modules (1:1 with upstream impl/*.cpp files)
+use crate::ir::program::ShaderInfoExt;
 pub mod atomic_operations_global_memory;
 pub mod atomic_operations_shared_memory;
 pub mod attribute_memory_to_physical;
@@ -647,7 +648,7 @@ impl<'a> TranslatorVisitor<'a> {
             // Kill
             MaxwellOpcode::KIL => {
                 self.ir.demote_to_helper_invocation();
-                self.ir.program.info.uses_demote = true;
+                self.ir.program.info.uses_demote_to_helper_invocation = true;
             }
 
             // Memory barrier

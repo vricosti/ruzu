@@ -141,7 +141,7 @@ impl GraphicsPipelineCache {
         let runtime_info = RuntimeInfo::default();
         let compiled = self
             .shader_cache
-            .get_or_compile(&code, ShaderStage::Vertex, &runtime_info);
+            .get_or_compile(&code, ShaderStage::VertexB, &runtime_info);
         Some(compiled.clone())
     }
 

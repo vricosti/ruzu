@@ -6,6 +6,7 @@
 //! Handles the LDC instruction for loading from constant buffers with
 //! various addressing modes.
 
+use crate::ir::program::ShaderInfoExt;
 use super::{field, sfield, TranslatorVisitor};
 use crate::ir::value::Value;
 

@@ -1466,14 +1466,13 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
         self.synchronize_buffer(buffer_id, device_addr, size);
 
         let offset = self.slot_buffers[buffer_id].offset(device_addr);
+        let gpu_handle = self.slot_buffers[buffer_id].gpu_handle;
         if let Some(ref mut rt) = self.runtime {
-            rt.bind_index_buffer(buffer_id, offset, size);
+            rt.bind_index_buffer(buffer_id, gpu_handle, offset, size);
         }
     }
 
     fn bind_host_vertex_buffers(&mut self) {
-        // Upstream: iterates vertex buffers, synchronizes, collects host bindings, then
-        // calls runtime.BindVertexBuffers. Runtime not yet available.
         let Some(ref cs) = self.channel_state else {
             return;
         };
@@ -1481,6 +1480,7 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
         drop(cs);
 
         let mut host_bindings = HostBindings::default();
+        let mut gpu_handles = Vec::new();
         for (index, binding) in bindings.iter().enumerate() {
             if !binding.buffer_id.is_valid() || binding.buffer_id == NULL_BUFFER_ID {
                 continue;
@@ -1492,12 +1492,13 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
             host_bindings.buffer_ids.push(binding.buffer_id);
             host_bindings.offsets.push(offset as u64);
             host_bindings.sizes.push(binding.size as u64);
-            host_bindings.strides.push(0); // Stride comes from engine state — not yet available.
+            host_bindings.strides.push(0);
             host_bindings.min_index = host_bindings.min_index.min(index as u32);
             host_bindings.max_index = host_bindings.max_index.max(index as u32);
+            gpu_handles.push(self.slot_buffers[binding.buffer_id].gpu_handle);
         }
         if let Some(ref mut rt) = self.runtime {
-            rt.bind_vertex_buffers(&host_bindings);
+            rt.bind_vertex_buffers(&host_bindings, &gpu_handles);
         }
     }
 
@@ -2602,9 +2603,26 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
         let overlap = self.resolve_overlaps(device_addr, wanted_size);
         let size = (overlap.end - overlap.begin) as u32;
 
-        let new_buffer_id = self
-            .slot_buffers
-            .insert(BufferBase::new(overlap.begin, size as u64));
+        let mut new_buffer = BufferBase::new(overlap.begin, size as u64);
+
+        // Allocate a GPU buffer object for this buffer. Upstream does this
+        // inside `Buffer::Buffer(runtime, ...)` (the backend-specific
+        // constructor). The Rust port allocates on `BufferBase` directly
+        // because the slot vector is not parameterised by backend type.
+        unsafe {
+            gl::CreateBuffers(1, &mut new_buffer.gpu_handle);
+            if new_buffer.gpu_handle != 0 {
+                // GL_DYNAMIC_STORAGE_BIT allows glBufferSubData / glNamedBufferSubData.
+                gl::NamedBufferStorage(
+                    new_buffer.gpu_handle,
+                    size as isize,
+                    std::ptr::null(),
+                    gl::DYNAMIC_STORAGE_BIT | gl::MAP_WRITE_BIT | gl::MAP_PERSISTENT_BIT,
+                );
+            }
+        }
+
+        let new_buffer_id = self.slot_buffers.insert(new_buffer);
         if let Some(ref mut rt) = self.runtime {
             rt.clear_buffer(new_buffer_id, 0, size as u64, 0);
         }
@@ -2750,7 +2768,6 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
         }
         for copy in copies {
             let device_addr = self.slot_buffers[_buffer_id].cpu_addr() + copy.dst_offset;
-            // Ensure immediate buffer is large enough.
             if self.immediate_buffer_alloc.len() < largest_copy as usize {
                 self.immediate_buffer_alloc.resize(largest_copy as usize, 0);
             }
@@ -2759,8 +2776,8 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
                     if let Some(ptr) = dm.get_pointer(device_addr) {
                         let upload_span =
                             unsafe { std::slice::from_raw_parts(ptr, copy.size as usize) };
-                        // TODO: buffer.ImmediateUpload(copy.dst_offset, upload_span)
-                        let _ = upload_span;
+                        self.slot_buffers[_buffer_id]
+                            .immediate_upload(copy.dst_offset, upload_span);
                         continue;
                     }
                 }
@@ -2768,7 +2785,10 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
                     device_addr,
                     &mut self.immediate_buffer_alloc[..copy.size as usize],
                 );
-                // TODO: buffer.ImmediateUpload(copy.dst_offset, &immediate_buffer_alloc[..copy.size])
+                self.slot_buffers[_buffer_id].immediate_upload(
+                    copy.dst_offset,
+                    &self.immediate_buffer_alloc[..copy.size as usize],
+                );
             }
         }
     }

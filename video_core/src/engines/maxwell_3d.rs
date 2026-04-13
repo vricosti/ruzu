@@ -222,6 +222,12 @@ const PIPELINE_BASE: u32 = reg_index!(0x2000);
 const PIPELINE_STRIDE: u32 = 0x10;
 const NUM_SHADER_PROGRAMS: usize = 6;
 
+/// Shader program region: GPU virtual base of the shared shader code region.
+/// Two consecutive u32 registers — high then low — at byte offset 0x1608.
+/// Upstream: `Maxwell3D::Regs::ProgramRegion` (`address_high`, `address_low`).
+const PROGRAM_REGION_HIGH: u32 = reg_index!(0x1608);
+const PROGRAM_REGION_LOW: u32 = reg_index!(0x160C);
+
 // ── Color write mask registers ────────────────────────────────────────────
 
 /// If nonzero, all RTs share color_mask[0].
@@ -390,9 +396,15 @@ const RT_FORMAT_R11G11B10_FLOAT: u32 = reg_index!(0x00E0);
 // ── Draw state types ────────────────────────────────────────────────────────
 
 /// GPU primitive topology.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// Port of upstream `Maxwell3D::Regs::PrimitiveTopology`
+/// (`maxwell_3d.h:871`). The discriminant values match upstream exactly
+/// (Points = 0x0, …, Patches = 0xE) — they are the raw register values
+/// the GPU writes into the topology field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 #[repr(u32)]
 pub enum PrimitiveTopology {
+    #[default]
     Points = 0,
     Lines = 1,
     LineLoop = 2,
@@ -440,9 +452,12 @@ impl PrimitiveTopology {
 }
 
 /// Index buffer element format.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// Port of upstream `Maxwell3D::Regs::IndexFormat` (`maxwell_3d.h:932`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 #[repr(u32)]
 pub enum IndexFormat {
+    #[default]
     UnsignedByte = 0,
     UnsignedShort = 1,
     UnsignedInt = 2,
@@ -2438,6 +2453,36 @@ impl Maxwell3D {
         (self.regs[base] & 1) != 0
     }
 
+    /// GPU virtual base address of the shader program region.
+    ///
+    /// Upstream: `Maxwell3D::Regs::ProgramRegion::Address()` —
+    /// `(address_high << 32) | address_low`.
+    pub fn program_region_address(&self) -> u64 {
+        let high = self.regs[PROGRAM_REGION_HIGH as usize] as u64;
+        let low = self.regs[PROGRAM_REGION_LOW as usize] as u64;
+        (high << 32) | low
+    }
+
+    /// Snapshot the GPU virtual address of the entry point for each of the
+    /// 6 Maxwell shader stages. Disabled stages report `0`.
+    ///
+    /// Upstream rasterizers compute these inline as
+    /// `regs.program_region.Address() + regs.pipelines[i].offset`. The Rust
+    /// port snapshots them into `DrawState` so the rasterizer doesn't need
+    /// a Maxwell3D back-reference.
+    pub fn shader_program_addresses(&self) -> [u64; 6] {
+        let base = self.program_region_address();
+        let mut out = [0u64; 6];
+        for i in 0..6u32 {
+            if !self.is_shader_stage_enabled(i) {
+                continue;
+            }
+            let info = self.shader_stage_info(i);
+            out[i as usize] = base + info.offset as u64;
+        }
+        out
+    }
+
     // ── Color mask accessors ─────────────────────────────────────────────
 
     /// Read color write mask for render target `rt` (0..7).
@@ -2634,6 +2679,7 @@ impl Maxwell3D {
                     draw.vertex_streams.len(),
                 );
                 self.draw_calls.push(draw);
+                self.dispatch_draw_to_rasterizer(false, 1);
             }
             DrawMode::Instance => {
                 // Upstream DrawManager::DrawEnd does nothing for instance mode unless forced
@@ -2652,8 +2698,65 @@ impl Maxwell3D {
                     draw.index_buffer_count,
                 );
                 self.draw_calls.push(draw);
+                self.dispatch_draw_to_rasterizer(true, 1);
                 self.draw_mode = DrawMode::General;
             }
+        }
+    }
+
+    /// Build a `DrawState` snapshot from the current Maxwell3D registers
+    /// and forward it to the bound rasterizer via the upstream-parity
+    /// `RasterizerInterface::draw` entry point.
+    ///
+    /// Mirrors the `DrawManager::ProcessDraw → rasterizer->Draw` path that
+    /// upstream takes inside `Maxwell3D` when a draw method is hit. The
+    /// legacy `draw_calls` queue is preserved alongside this call so the
+    /// software rasterizer (still consumed by `GpuContext::flush_entries`)
+    /// keeps working until the OpenGL pipeline cache produces real GL
+    /// programs (gaps 4–5).
+    fn dispatch_draw_to_rasterizer(&mut self, is_indexed: bool, instance_count: u32) {
+        let draw_state = self.build_draw_state(is_indexed, instance_count);
+        let _ = self.with_rasterizer_mut(|rasterizer| {
+            rasterizer.draw(&draw_state, instance_count);
+        });
+    }
+
+    /// Build a `DrawState` reflecting the current Maxwell3D register file.
+    fn build_draw_state(
+        &self,
+        is_indexed: bool,
+        instance_count: u32,
+    ) -> crate::engines::draw_manager::DrawState {
+        use crate::engines::draw_manager as dm;
+        crate::engines::draw_manager::DrawState {
+            topology: self.current_topology,
+            draw_mode: match self.draw_mode {
+                DrawMode::General => dm::DrawMode::General,
+                DrawMode::Instance => dm::DrawMode::Instance,
+                DrawMode::InlineIndex => dm::DrawMode::InlineIndex,
+            },
+            draw_indexed: is_indexed,
+            base_index: self.base_vertex() as u32,
+            vertex_buffer: dm::VertexBuffer {
+                first: self.regs[VB_FIRST as usize],
+                count: self.regs[VB_COUNT as usize],
+            },
+            index_buffer: dm::IndexBuffer {
+                first: self.index_buffer_first(),
+                count: self.index_buffer_count(),
+                format: self.index_buffer_format(),
+            },
+            base_instance: self.base_instance(),
+            instance_count,
+            inline_index_draw_indexes: Vec::new(),
+            shader_program_addresses: self.shader_program_addresses(),
+            index_buffer_gpu_addr: self.index_buffer_addr(),
+            index_buffer_gpu_addr_end: {
+                let base = IB_BASE as usize;
+                let high = self.regs[base + IB_OFF_LIMIT_HIGH as usize] as u64;
+                let low = self.regs[base + IB_OFF_LIMIT_LOW as usize] as u64;
+                (high << 32) | low
+            },
         }
     }
 
@@ -2668,6 +2771,7 @@ impl Maxwell3D {
             count,
         );
         self.draw_calls.push(draw);
+        self.dispatch_draw_to_rasterizer(false, count);
         self.instance_count = 0;
         self.draw_mode = DrawMode::General;
     }
@@ -3096,6 +3200,7 @@ impl Maxwell3D {
         draw.index_buffer_first = params.first;
         draw.index_buffer_count = params.count;
         self.draw_calls.push(draw);
+        self.dispatch_draw_to_rasterizer(true, 1);
     }
 
     /// Handle `vertex_array_instance_{first,subsequent}` immediate instanced draws.
@@ -3115,6 +3220,10 @@ impl Maxwell3D {
         draw.base_instance = self.instance_count.saturating_sub(1);
         self.instance_count += 1;
         self.draw_calls.push(draw);
+        // Note: instance_count was just incremented; the dispatch reflects
+        // the *current* (post-increment) instance count, mirroring how
+        // upstream `DrawManager::DrawIndex` reads the live register state.
+        self.dispatch_draw_to_rasterizer(false, self.instance_count);
     }
 
     /// Handle draw-texture trigger.
@@ -3818,6 +3927,8 @@ mod tests {
         bound_uniforms: Vec<(usize, u32, u64, u32)>,
         disabled_uniforms: Vec<(usize, u32)>,
         accelerate_conditional_rendering: bool,
+        /// (instance_count, draw_indexed, shader_program_addresses) per `draw` call.
+        draws: Vec<(u32, bool, [u64; 6])>,
     }
 
     struct TestRasterizer {
@@ -3831,7 +3942,17 @@ mod tests {
     }
 
     impl RasterizerInterface for TestRasterizer {
-        fn draw(&mut self, _is_indexed: bool, _instance_count: u32) {}
+        fn draw(
+            &mut self,
+            draw_state: &crate::engines::draw_manager::DrawState,
+            instance_count: u32,
+        ) {
+            self.calls.lock().unwrap().draws.push((
+                instance_count,
+                draw_state.draw_indexed,
+                draw_state.shader_program_addresses,
+            ));
+        }
         fn draw_texture(&mut self) {
             self.calls.lock().unwrap().draw_texture += 1;
         }
@@ -6525,6 +6646,48 @@ mod tests {
         engine.call_method(DRAW_TEXTURE_SRC_Y0, 0x1234, true);
 
         assert_eq!(calls.lock().unwrap().draw_texture, 1);
+    }
+
+    #[test]
+    fn test_draw_end_dispatches_draw_state_to_rasterizer_with_program_addresses() {
+        let mut engine = Maxwell3D::new();
+        let calls = Arc::new(Mutex::new(RasterizerCalls::default()));
+        let rasterizer = TestRasterizer::new(calls.clone());
+        engine.bind_rasterizer(&rasterizer);
+
+        // Configure shader_program_region = 0x1_0000_0000 and enable
+        // VertexB (slot 1) at offset 0x100 plus Fragment (slot 5) at 0x500.
+        engine.write_reg(PROGRAM_REGION_HIGH, 1); // high = 1 → base = 0x1_0000_0000
+        engine.write_reg(PROGRAM_REGION_LOW, 0);
+
+        let vb_base = PIPELINE_BASE + 1 * PIPELINE_STRIDE;
+        engine.write_reg(vb_base, 1 | (1 << 4));
+        engine.write_reg(vb_base + 1, 0x100);
+
+        let frag_base = PIPELINE_BASE + 5 * PIPELINE_STRIDE;
+        engine.write_reg(frag_base, 1 | (5 << 4));
+        engine.write_reg(frag_base + 1, 0x500);
+
+        // Trigger a non-indexed draw via DRAW_BEGIN/DRAW_END.
+        engine.write_reg(DRAW_BEGIN, 4); // Triangles
+        engine.write_reg(DRAW_END, 0);
+
+        let calls = calls.lock().unwrap();
+        assert_eq!(
+            calls.draws.len(),
+            1,
+            "DRAW_END should trigger exactly one rasterizer.draw call"
+        );
+        let (instance_count, indexed, addrs) = calls.draws[0];
+        assert_eq!(instance_count, 1);
+        assert!(!indexed);
+        // Slots 0/2/3/4 disabled (zero); 1 = VertexB at base+0x100; 5 = Fragment at base+0x500.
+        assert_eq!(addrs[0], 0);
+        assert_eq!(addrs[1], 0x1_0000_0100);
+        assert_eq!(addrs[2], 0);
+        assert_eq!(addrs[3], 0);
+        assert_eq!(addrs[4], 0);
+        assert_eq!(addrs[5], 0x1_0000_0500);
     }
 
     #[test]

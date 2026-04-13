@@ -5,6 +5,7 @@
 //!
 //! Implements TLDS (texture load swizzled, compact dual-destination encoding).
 
+use crate::ir::program::ShaderInfoExt;
 use super::{field, TranslatorVisitor};
 use crate::ir::types::TextureInstInfo;
 use crate::ir::value::Value;
@@ -27,7 +28,7 @@ pub fn tlds(tv: &mut TranslatorVisitor, insn: u64) {
         ..Default::default()
     };
 
-    tv.ir.program.info.register_texture(tex_index, 1, false);
+    tv.ir.program.info.register_texture(tex_index, crate::shader_info::TextureType::ColorArray1D, false);
 
     let coord_x = tv.x(src_reg);
     let coord_y = tv.x(src_reg + 1);

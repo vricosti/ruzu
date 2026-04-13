@@ -402,6 +402,13 @@ impl RendererBase for RendererOpenGL {
         self.device_memory = Some(reader);
     }
 
+    fn set_shader_cache_gpu_reader(&mut self, reader: crate::renderer_base::DeviceMemoryReader) {
+        // The trait's `DeviceMemoryReader` and the shader cache's
+        // `GpuMemoryReader` are the same `Arc<dyn Fn(u64, &mut [u8]) +
+        // Send + Sync>` shape, so we can hand it straight through.
+        self.rasterizer.set_gpu_memory_reader(reader);
+    }
+
     fn get_applet_capture_buffer(&self) -> Vec<u8> {
         // Port of `RendererOpenGL::GetAppletCaptureBuffer()`.
         // Full implementation reads from capture_framebuffer via glReadPixels,

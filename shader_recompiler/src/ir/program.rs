@@ -10,6 +10,8 @@ use super::basic_block::Block;
 use super::types::{OutputTopology, ShaderStage};
 use super::value::Value;
 
+use crate::shader_info;
+
 /// Abstract syntax tree node for structured control flow.
 ///
 /// Matches zuyu's `AbstractSyntaxNode` from `abstract_syntax_list.h`.
@@ -43,119 +45,77 @@ pub enum SyntaxNode {
     Unreachable,
 }
 
-/// Constant buffer descriptor used by the shader.
-#[derive(Debug, Clone)]
-pub struct CbufDescriptor {
-    /// Constant buffer index (0..17).
-    pub index: u32,
-    /// Byte size accessed.
-    pub size: u32,
-}
-
-/// Texture descriptor used by the shader.
-#[derive(Debug, Clone)]
-pub struct TexDescriptor {
-    /// Descriptor index in the texture pool.
-    pub index: u32,
-    /// Texture type (1D, 2D, 3D, etc.).
-    pub texture_type: u8,
-    /// Whether this is a depth texture.
-    pub is_depth: bool,
-}
-
-/// Storage buffer descriptor.
-#[derive(Debug, Clone)]
-pub struct StorageDescriptor {
-    /// Constant buffer index where the SSBO address is stored.
-    pub cbuf_index: u32,
-    /// Byte offset within the constant buffer.
-    pub cbuf_offset: u32,
-    /// Whether writes to this buffer are observed.
-    pub is_written: bool,
-}
-
 /// Shader metadata collected during translation.
 ///
-/// Matches zuyu's `Info` / `ShaderInfo` from `shader_info.h`.
-#[derive(Debug, Clone, Default)]
-pub struct ShaderInfo {
-    /// Constant buffer descriptors referenced by the shader.
-    pub constant_buffer_descriptors: Vec<CbufDescriptor>,
-    /// Texture descriptors referenced by the shader.
-    pub texture_descriptors: Vec<TexDescriptor>,
-    /// Storage buffer descriptors referenced by the shader.
-    pub storage_buffer_descriptors: Vec<StorageDescriptor>,
-    /// Bitmask of which generic input attributes are used (bits 0..31).
-    pub loads_generics: u32,
-    /// Bitmask of which generic output attributes are written (bits 0..31).
-    pub stores_generics: u32,
-    /// Whether the shader reads vertex ID.
-    pub loads_vertex_id: bool,
-    /// Whether the shader reads instance ID.
-    pub loads_instance_id: bool,
-    /// Whether the shader reads front-facing.
-    pub loads_front_face: bool,
-    /// Whether the shader reads point coord.
-    pub loads_point_coord: bool,
-    /// Whether the shader reads position (fragment).
-    pub loads_position: bool,
-    /// Whether the shader writes position (vertex).
-    pub stores_position: bool,
-    /// Whether the shader writes point size.
-    pub stores_point_size: bool,
-    /// Whether the shader writes clip distances.
-    pub stores_clip_distance: bool,
-    /// Whether the shader writes layer.
-    pub stores_layer: bool,
-    /// Whether the shader writes viewport index.
-    pub stores_viewport_index: bool,
-    /// Whether the shader writes frag depth.
-    pub stores_frag_depth: bool,
-    /// Whether the shader writes sample mask.
-    pub stores_sample_mask: bool,
-    /// Whether the shader uses discard/kill.
-    pub uses_demote: bool,
-    /// Local memory size in bytes.
-    pub local_memory_size: u32,
-    /// Shared memory size in bytes.
-    pub shared_memory_size: u32,
-    /// Whether the shader reads WorkgroupId.
-    pub uses_workgroup_id: bool,
-    /// Whether the shader reads LocalInvocationId.
-    pub uses_local_invocation_id: bool,
-    /// Whether the shader reads InvocationId.
-    pub uses_invocation_id: bool,
-    /// Whether the shader reads InvocationInfo (tessellation patch vertex count).
-    pub uses_invocation_info: bool,
-    /// Whether the shader reads SampleId.
-    pub uses_sample_id: bool,
-    /// Whether the shader reads IsHelperInvocation.
-    pub uses_is_helper_invocation: bool,
+/// Now a type alias for the upstream-faithful `shader_info::Info`
+/// struct. The previous simplified `ShaderInfo` with separate
+/// descriptor types and boolean fields was deleted as part of the
+/// cross-crate type-unification pass. The upstream `Info` carries all
+/// the same data via `VaryingState` bitmasks and the full descriptor
+/// types (`ConstantBufferDescriptor`, `TextureDescriptor`, etc.).
+///
+/// Convenience methods (`register_cbuf`, `register_texture`) that the
+/// IR emitter depends on are provided as a trait impl below.
+pub type ShaderInfo = shader_info::Info;
+
+/// Re-export the upstream descriptor types under the names the rest of
+/// the recompiler already expects. Code that used the old simplified
+/// `CbufDescriptor` / `TexDescriptor` / `StorageDescriptor` should
+/// migrate to these names.
+pub type CbufDescriptor = shader_info::ConstantBufferDescriptor;
+pub type TexDescriptor = shader_info::TextureDescriptor;
+pub type StorageDescriptor = shader_info::StorageBufferDescriptor;
+
+/// Convenience helpers on `ShaderInfo` (= `shader_info::Info`) used
+/// by the IR emitter to register resource accesses incrementally.
+pub trait ShaderInfoExt {
+    fn register_cbuf(&mut self, index: u32);
+    fn register_texture(
+        &mut self,
+        index: u32,
+        texture_type: shader_info::TextureType,
+        is_depth: bool,
+    );
 }
 
-impl ShaderInfo {
-    /// Register use of a constant buffer.
-    pub fn register_cbuf(&mut self, index: u32) {
+impl ShaderInfoExt for ShaderInfo {
+    fn register_cbuf(&mut self, index: u32) {
         if !self
             .constant_buffer_descriptors
             .iter()
             .any(|d| d.index == index)
         {
-            self.constant_buffer_descriptors.push(CbufDescriptor {
-                index,
-                size: 0x10000,
-            });
+            self.constant_buffer_descriptors
+                .push(shader_info::ConstantBufferDescriptor { index, count: 1 });
         }
     }
 
-    /// Register use of a texture.
-    pub fn register_texture(&mut self, index: u32, texture_type: u8, is_depth: bool) {
-        if !self.texture_descriptors.iter().any(|d| d.index == index) {
-            self.texture_descriptors.push(TexDescriptor {
-                index,
-                texture_type,
-                is_depth,
-            });
+    fn register_texture(
+        &mut self,
+        index: u32,
+        texture_type: shader_info::TextureType,
+        is_depth: bool,
+    ) {
+        if !self
+            .texture_descriptors
+            .iter()
+            .any(|d| d.cbuf_index == index)
+        {
+            self.texture_descriptors
+                .push(shader_info::TextureDescriptor {
+                    texture_type,
+                    is_depth,
+                    is_multisample: false,
+                    has_secondary: false,
+                    cbuf_index: index,
+                    cbuf_offset: 0,
+                    shift_left: 0,
+                    secondary_cbuf_index: 0,
+                    secondary_cbuf_offset: 0,
+                    secondary_shift_left: 0,
+                    count: 1,
+                    size_shift: 0,
+                });
         }
     }
 }
@@ -173,6 +133,12 @@ pub struct Program {
     pub info: ShaderInfo,
     /// Shader stage.
     pub stage: ShaderStage,
+    /// Local memory size in bytes.
+    /// Upstream: `IR::Program::local_memory_size`.
+    pub local_memory_size: u32,
+    /// Shared memory size in bytes (compute shaders).
+    /// Upstream: `IR::Program::shared_memory_size`.
+    pub shared_memory_size: u32,
     /// Workgroup size (compute shaders).
     pub workgroup_size: [u32; 3],
     /// Output topology (geometry shaders).
@@ -194,6 +160,8 @@ impl Program {
             post_order_blocks: Vec::new(),
             info: ShaderInfo::default(),
             stage,
+            local_memory_size: 0,
+            shared_memory_size: 0,
             workgroup_size: [1, 1, 1],
             output_topology: OutputTopology::TriangleStrip,
             output_vertices: 0,

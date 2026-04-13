@@ -48,7 +48,10 @@ pub mod stage;
 pub mod varying_state;
 
 // Re-export public API
-pub use backend::Profile as BackendProfile;
 pub use ir::types::ShaderStage;
-pub use pipeline_cache::{compile_shader, CompiledShader, PipelineCache, ShaderKey};
+pub use profile::Profile;
+pub use pipeline_cache::{
+    compile_shader, compile_shader_glsl, CompiledGlslShader, CompiledShader, PipelineCache,
+    ShaderKey,
+};
 pub use runtime_info::RuntimeInfo;

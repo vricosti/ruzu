@@ -479,15 +479,21 @@ pub trait BufferCacheRuntime {
 
     /// Bind an index buffer for draw calls.
     ///
-    /// Upstream: `Runtime::BindIndexBuffer(buffer, offset, size)`
-    fn bind_index_buffer(&mut self, buffer: BufferId, offset: u32, size: u32);
+    /// Upstream: `Runtime::BindIndexBuffer(buffer, offset, size)`.
+    /// `gpu_handle` is the backend buffer name (GL buffer name / Vulkan
+    /// buffer handle) extracted from the slot vector by the caller. Upstream
+    /// receives the whole `Buffer&` object; the Rust port passes the handle
+    /// separately because `BufferBase` is backend-agnostic.
+    fn bind_index_buffer(&mut self, buffer: BufferId, gpu_handle: u32, offset: u32, size: u32);
 
     // -- Vertex buffer binding --
 
     /// Bind vertex buffers collected in `HostBindings`.
     ///
-    /// Upstream: `Runtime::BindVertexBuffers(host_bindings)`
-    fn bind_vertex_buffers(&mut self, bindings: &HostBindings);
+    /// Upstream: `Runtime::BindVertexBuffers(host_bindings)`.
+    /// `gpu_handles` provides the per-binding GPU buffer names in the same
+    /// order as `bindings.buffer_ids`.
+    fn bind_vertex_buffers(&mut self, bindings: &HostBindings, gpu_handles: &[u32]);
 
     // -- Uniform buffer binding (graphics) --
 

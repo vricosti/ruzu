@@ -15,44 +15,18 @@ pub mod glsl;
 pub mod spirv;
 
 use crate::ir;
+use crate::profile::Profile;
 use crate::runtime_info::RuntimeInfo;
-
-/// GPU/driver capability profile.
-#[derive(Debug, Clone)]
-pub struct Profile {
-    pub spirv_version: u32,
-    pub unified_descriptor_binding: bool,
-    pub support_fp16: bool,
-    pub support_fp64: bool,
-    pub support_int8: bool,
-    pub support_int16: bool,
-    pub support_int64: bool,
-    pub support_subgroup: bool,
-    pub support_demote_to_helper: bool,
-    pub has_broken_fp_clamp: bool,
-}
-
-impl Default for Profile {
-    fn default() -> Self {
-        Self {
-            spirv_version: 0x00010500, // SPIR-V 1.5
-            unified_descriptor_binding: false,
-            support_fp16: false,
-            support_fp64: false,
-            support_int8: false,
-            support_int16: false,
-            support_int64: false,
-            support_subgroup: true,
-            support_demote_to_helper: true,
-            has_broken_fp_clamp: false,
-        }
-    }
-}
 
 /// Emit SPIR-V binary from an IR program.
 ///
 /// Returns the SPIR-V words ready to be loaded into a VkShaderModule.
 /// Delegates to `spirv::emit_spirv::emit_spirv`.
+///
+/// `profile` is the upstream-faithful `Shader::Profile` (in
+/// `crate::profile`). The previous duplicate `backend::Profile` was
+/// removed when the SPIR-V and GLSL backends were unified onto a
+/// single Profile type.
 pub fn emit_spirv(
     program: &ir::Program,
     profile: &Profile,
@@ -72,7 +46,7 @@ mod tests {
 
     #[test]
     fn test_emit_empty_vertex_shader() {
-        let mut program = ir::Program::new(ShaderStage::Vertex);
+        let mut program = ir::Program::new(ShaderStage::VertexB);
         program.blocks.push(Block::new());
 
         let profile = Profile::default();
@@ -97,7 +71,7 @@ mod tests {
 
     #[test]
     fn test_emit_vertex_with_arithmetic() {
-        let mut program = ir::Program::new(ShaderStage::Vertex);
+        let mut program = ir::Program::new(ShaderStage::VertexB);
         program.blocks.push(Block::new());
 
         {
@@ -118,7 +92,7 @@ mod tests {
     #[test]
     fn test_emit_fragment_with_output() {
         let mut program = ir::Program::new(ShaderStage::Fragment);
-        program.info.stores_generics = 0; // Fragment doesn't store generics
+        // Fragment doesn't store generics (VaryingState defaults to all-zero).
         program.blocks.push(Block::new());
 
         {
@@ -135,13 +109,13 @@ mod tests {
 
     #[test]
     fn test_emit_with_cbuf_descriptors() {
-        let mut program = ir::Program::new(ShaderStage::Vertex);
+        let mut program = ir::Program::new(ShaderStage::VertexB);
         program
             .info
             .constant_buffer_descriptors
             .push(crate::ir::program::CbufDescriptor {
                 index: 0,
-                size: 0x10000,
+                count: 1,
             });
         program.blocks.push(Block::new());
 
@@ -160,9 +134,7 @@ mod tests {
     #[test]
     fn test_profile_default() {
         let profile = Profile::default();
-        assert_eq!(profile.spirv_version, 0x00010500);
-        assert!(!profile.support_fp16);
-        assert!(profile.support_subgroup);
-        assert!(profile.support_demote_to_helper);
+        assert_eq!(profile.supported_spirv, 0x00010000);
+        assert!(profile.support_demote_to_helper_invocation);
     }
 }

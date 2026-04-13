@@ -5,6 +5,7 @@
 //!
 //! Implements TXQ and TXQ_b (texture query — dimensions, texture type, etc.).
 
+use crate::ir::program::ShaderInfoExt;
 use super::{field, TranslatorVisitor};
 use crate::frontend::maxwell_opcodes::MaxwellOpcode;
 use crate::ir::types::TextureInstInfo;
@@ -26,7 +27,7 @@ pub fn txq(tv: &mut TranslatorVisitor, insn: u64, _opcode: MaxwellOpcode) {
         ..Default::default()
     };
 
-    tv.ir.program.info.register_texture(tex_index, 1, false);
+    tv.ir.program.info.register_texture(tex_index, crate::shader_info::TextureType::ColorArray1D, false);
 
     let lod = tv.x(src_reg);
     let handle = Value::ImmU32(tex_index);

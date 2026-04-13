@@ -323,6 +323,180 @@ impl BufferCacheRuntime {
     }
 }
 
+use crate::buffer_cache::buffer_cache_base::{
+    self as base, BufferCopy, BufferId, HostBindings, StagingBufferRef,
+};
+
+impl base::BufferCacheRuntime for BufferCacheRuntime {
+    fn tick_frame(&mut self) {}
+
+    fn can_report_memory_usage(&self) -> bool {
+        true
+    }
+
+    fn get_device_local_memory(&self) -> u64 {
+        self.device_access_memory
+    }
+
+    fn get_device_memory_usage(&self) -> u64 {
+        self.get_device_memory_usage()
+    }
+
+    fn get_storage_buffer_alignment(&self) -> u32 {
+        // GL_SHADER_STORAGE_BUFFER_OFFSET_ALIGNMENT
+        let mut alignment: i32 = 256;
+        unsafe {
+            gl::GetIntegerv(
+                gl::SHADER_STORAGE_BUFFER_OFFSET_ALIGNMENT,
+                &mut alignment,
+            );
+        }
+        alignment.max(1) as u32
+    }
+
+    fn finish(&mut self) {
+        self.finish();
+    }
+
+    fn upload_staging_buffer(&mut self, size: u64) -> StagingBufferRef {
+        StagingBufferRef {
+            buffer: BufferId::invalid(),
+            offset: 0,
+            mapped_span: vec![0u8; size as usize],
+        }
+    }
+
+    fn download_staging_buffer(&mut self, size: u64, _deferred: bool) -> StagingBufferRef {
+        StagingBufferRef {
+            buffer: BufferId::invalid(),
+            offset: 0,
+            mapped_span: vec![0u8; size as usize],
+        }
+    }
+
+    fn free_deferred_staging_buffer(&mut self, _buffer: &mut StagingBufferRef) {}
+
+    fn can_reorder_upload(&self, _buffer_id: BufferId, _copies: &[BufferCopy]) -> bool {
+        false
+    }
+
+    fn pre_copy_barrier(&mut self) {
+        self.pre_copy_barrier();
+    }
+
+    fn post_copy_barrier(&mut self) {
+        self.post_copy_barrier();
+    }
+
+    fn copy_buffer(
+        &mut self,
+        _dst: BufferId,
+        _src: BufferId,
+        _copies: &[BufferCopy],
+        _barrier: bool,
+        _can_reorder: bool,
+    ) {
+        // Full impl: glCopyBufferSubData per copy.
+    }
+
+    fn clear_buffer(&mut self, _buffer: BufferId, _offset: u32, _size: u64, _value: u32) {
+        // Full impl: glClearBufferSubData.
+    }
+
+    /// Port of upstream `BufferCacheRuntime::BindIndexBuffer`
+    /// (`gl_buffer_cache.cpp:215`).
+    fn bind_index_buffer(&mut self, _buffer: BufferId, gpu_handle: u32, offset: u32, _size: u32) {
+        self.index_buffer_offset = offset;
+        if gpu_handle != 0 {
+            unsafe {
+                gl::BindBuffer(gl::ELEMENT_ARRAY_BUFFER, gpu_handle);
+            }
+        }
+    }
+
+    /// Port of upstream `BufferCacheRuntime::BindVertexBuffers`
+    /// (`gl_buffer_cache.cpp:242`).
+    fn bind_vertex_buffers(&mut self, bindings: &HostBindings, gpu_handles: &[u32]) {
+        let count = gpu_handles.len() as i32;
+        if count == 0 {
+            return;
+        }
+        let offsets: Vec<isize> = bindings
+            .offsets
+            .iter()
+            .map(|&o| o as isize)
+            .collect();
+        let strides: Vec<i32> = bindings
+            .strides
+            .iter()
+            .map(|&s| s as i32)
+            .collect();
+        unsafe {
+            gl::BindVertexBuffers(
+                bindings.min_index as u32,
+                count,
+                gpu_handles.as_ptr(),
+                offsets.as_ptr(),
+                strides.as_ptr(),
+            );
+        }
+    }
+
+    fn bind_uniform_buffer(
+        &mut self,
+        _stage: usize,
+        binding_index: u32,
+        _buffer: BufferId,
+        _offset: u32,
+        _size: u32,
+    ) {
+        log::trace!("GL bind_uniform_buffer binding={}", binding_index);
+    }
+
+    fn bind_storage_buffer(
+        &mut self,
+        _stage: usize,
+        binding_index: u32,
+        _buffer: BufferId,
+        _offset: u32,
+        _size: u32,
+        _is_written: bool,
+    ) {
+        log::trace!("GL bind_storage_buffer binding={}", binding_index);
+    }
+
+    fn bind_texture_buffer(&mut self, _buffer: BufferId, _offset: u32, _size: u32, _format: u32) {}
+    fn bind_image_buffer(&mut self, _buffer: BufferId, _offset: u32, _size: u32, _format: u32) {}
+    fn bind_transform_feedback_buffers(&mut self, _bindings: &HostBindings) {}
+
+    fn bind_compute_uniform_buffer(
+        &mut self,
+        _binding: u32,
+        _buffer: BufferId,
+        _offset: u32,
+        _size: u32,
+    ) {
+    }
+
+    fn bind_compute_storage_buffer(
+        &mut self,
+        _binding: u32,
+        _buffer: BufferId,
+        _offset: u32,
+        _size: u32,
+        _is_written: bool,
+    ) {
+    }
+
+    fn has_fast_buffer_sub_data(&self) -> bool {
+        self.has_fast_buffer_sub_data
+    }
+
+    fn supports_non_zero_uniform_offset(&self) -> bool {
+        !self.use_assembly_shaders
+    }
+}
+
 /// Buffer cache parameters matching upstream `BufferCacheParams`.
 pub struct BufferCacheParams;
 

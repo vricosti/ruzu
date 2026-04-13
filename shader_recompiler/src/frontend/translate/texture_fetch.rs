@@ -5,6 +5,7 @@
 //!
 //! Implements TEX and TEX_b (texture fetch with implicit/explicit LOD).
 
+use crate::ir::program::ShaderInfoExt;
 use super::{bit, field, TranslatorVisitor};
 use crate::frontend::maxwell_opcodes::MaxwellOpcode;
 use crate::ir::types::TextureInstInfo;
@@ -33,7 +34,7 @@ pub fn tex(tv: &mut TranslatorVisitor, insn: u64, _opcode: MaxwellOpcode) {
     tv.ir
         .program
         .info
-        .register_texture(tex_index, dim as u8, false);
+        .register_texture(tex_index, crate::shader_info::TextureType::Color2D, false);
 
     // Build coordinate vector from source registers
     let coord_x = tv.f(src_reg);

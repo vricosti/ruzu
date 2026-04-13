@@ -11,9 +11,9 @@ use rspirv::dr::{Builder, Operand};
 use rspirv::spirv;
 use std::collections::HashMap;
 
-use crate::backend::Profile;
 use crate::ir;
 use crate::ir::types::ShaderStage;
+use crate::profile::Profile;
 use crate::runtime_info::RuntimeInfo;
 
 /// SPIR-V emission context.
@@ -99,22 +99,35 @@ impl SpirvEmitContext {
         builder.set_version(1, 5);
         builder.capability(spirv::Capability::Shader);
 
-        if profile.support_fp64 {
+        // Upstream gates Float16/Float64/Int* capabilities on
+        // `program.info.uses_fp16/fp64/int8/int16/int64` — the program-
+        // info flags populated during translation.
+        if program.info.uses_fp16 {
+            builder.capability(spirv::Capability::Float16);
+        }
+        if program.info.uses_fp64 {
             builder.capability(spirv::Capability::Float64);
         }
-        if profile.support_int16 {
+        if program.info.uses_int8 && profile.support_int8 {
+            builder.capability(spirv::Capability::Int8);
+        }
+        if program.info.uses_int16 && profile.support_int16 {
             builder.capability(spirv::Capability::Int16);
         }
-        if profile.support_int64 {
+        if program.info.uses_int64 && profile.support_int64 {
             builder.capability(spirv::Capability::Int64);
         }
-        if profile.support_subgroup {
+        // Upstream gates subgroup capabilities on individual usage flags.
+        if program.info.uses_subgroup_vote
+            || program.info.uses_subgroup_mask
+            || program.info.uses_subgroup_shuffles
+        {
             builder.capability(spirv::Capability::GroupNonUniform);
             builder.capability(spirv::Capability::GroupNonUniformBallot);
             builder.capability(spirv::Capability::GroupNonUniformShuffle);
             builder.capability(spirv::Capability::GroupNonUniformVote);
         }
-        if profile.support_demote_to_helper {
+        if profile.support_demote_to_helper_invocation {
             builder.capability(spirv::Capability::DemoteToHelperInvocation);
         }
         builder.capability(spirv::Capability::ImageQuery);
@@ -233,31 +246,11 @@ impl SpirvEmitContext {
     pub fn define_global_variables(&mut self, program: &ir::Program) {
         let info = &program.info;
 
-        // Input variables
+        // Input variables — upstream reads `info.loads` VaryingState.
         match self.stage {
-            ShaderStage::Vertex => {
+            ShaderStage::VertexB | ShaderStage::Fragment => {
                 for i in 0..32u32 {
-                    if info.loads_generics & (1 << i) != 0 {
-                        let vec4_ptr = self.builder.type_pointer(
-                            None,
-                            spirv::StorageClass::Input,
-                            self.f32_vec4_type,
-                        );
-                        let var =
-                            self.builder
-                                .variable(vec4_ptr, None, spirv::StorageClass::Input, None);
-                        self.builder.decorate(
-                            var,
-                            spirv::Decoration::Location,
-                            vec![Operand::LiteralBit32(i)],
-                        );
-                        self.input_vars.insert(i, var);
-                    }
-                }
-            }
-            ShaderStage::Fragment => {
-                for i in 0..32u32 {
-                    if info.loads_generics & (1 << i) != 0 {
+                    if info.loads.generic_any(i as usize) {
                         let vec4_ptr = self.builder.type_pointer(
                             None,
                             spirv::StorageClass::Input,
@@ -278,10 +271,12 @@ impl SpirvEmitContext {
             _ => {}
         }
 
-        // Output variables
+        // Output variables — upstream reads `info.stores` VaryingState.
+        use crate::ir::value::Attribute;
         match self.stage {
-            ShaderStage::Vertex => {
-                if info.stores_position {
+            ShaderStage::VertexB => {
+                // Position: check any_component of PositionX base.
+                if info.stores.any_component(Attribute::POSITION_X.0 as usize) {
                     let vec4_ptr = self.builder.type_pointer(
                         None,
                         spirv::StorageClass::Output,
@@ -295,10 +290,10 @@ impl SpirvEmitContext {
                         spirv::Decoration::BuiltIn,
                         vec![Operand::BuiltIn(spirv::BuiltIn::Position)],
                     );
-                    self.output_vars.insert(0xFFFF_0000, var); // Special key for gl_Position
+                    self.output_vars.insert(0xFFFF_0000, var);
                 }
                 for i in 0..32u32 {
-                    if info.stores_generics & (1 << i) != 0 {
+                    if info.stores.generic_any(i as usize) {
                         let vec4_ptr = self.builder.type_pointer(
                             None,
                             spirv::StorageClass::Output,
@@ -408,10 +403,10 @@ impl SpirvEmitContext {
             self.builder.decorate(
                 var,
                 spirv::Decoration::Binding,
-                vec![Operand::LiteralBit32(desc.index)],
+                vec![Operand::LiteralBit32(desc.cbuf_index)],
             );
 
-            self.texture_vars.insert(desc.index, var);
+            self.texture_vars.insert(desc.cbuf_index, var);
         }
 
         // System value input variables
@@ -555,12 +550,15 @@ impl SpirvEmitContext {
 
         // Entry point
         let exec_model = match self.stage {
-            ShaderStage::Vertex => spirv::ExecutionModel::Vertex,
+            ShaderStage::VertexB => spirv::ExecutionModel::Vertex,
             ShaderStage::Fragment => spirv::ExecutionModel::Fragment,
             ShaderStage::Compute => spirv::ExecutionModel::GLCompute,
             ShaderStage::Geometry => spirv::ExecutionModel::Geometry,
             ShaderStage::TessellationControl => spirv::ExecutionModel::TessellationControl,
             ShaderStage::TessellationEval => spirv::ExecutionModel::TessellationEvaluation,
+            ShaderStage::VertexA => {
+                unreachable!("VertexA must be merged into VertexB before SPIR-V emission")
+            }
         };
 
         self.builder
