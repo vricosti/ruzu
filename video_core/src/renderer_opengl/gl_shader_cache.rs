@@ -426,7 +426,10 @@ mod tests {
         // inserts it, and returns a live reference.
         {
             let pipeline = cache.current_graphics_pipeline();
-            assert!(pipeline.is_some(), "placeholder pipeline should be returned");
+            assert!(
+                pipeline.is_some(),
+                "placeholder pipeline should be returned"
+            );
         }
 
         assert_eq!(cache.graphics_pipeline_count(), 1);
@@ -463,7 +466,9 @@ mod tests {
         cache.set_pending_program_addresses(addrs);
 
         // Slow path will run on the first call and pick up the new addresses.
-        cache.current_graphics_pipeline().expect("placeholder pipeline");
+        cache
+            .current_graphics_pipeline()
+            .expect("placeholder pipeline");
         assert_eq!(cache.graphics_pipeline_count(), 1);
 
         // Both the cached current_pipeline key and the build_graphics_key
@@ -533,7 +538,9 @@ mod tests {
 
         // Same addresses again — must hit the cache, not grow it.
         cache.set_pending_program_addresses([0x1000, 0, 0, 0, 0, 0]);
-        cache.current_graphics_pipeline().expect("first pipeline (cached)");
+        cache
+            .current_graphics_pipeline()
+            .expect("first pipeline (cached)");
         assert_eq!(cache.graphics_pipeline_count(), 1);
 
         // Different addresses — must create a second cache entry.

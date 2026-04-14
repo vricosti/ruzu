@@ -388,7 +388,7 @@ impl MacroEngine {
             macro_cached[rebased_method..].to_vec()
         };
         let hash = hash_macro_code(&code_for_compile);
-        if method == 0x14F {
+        if method == 0x14F || std::env::var_os("RUZU_TRACE_MACRO_FLOW").is_some() {
             log::info!(
                 "MacroEngine::execute method=0x{:X} code_len={} hash=0x{:016X} mid_method={:?}",
                 method,
@@ -402,7 +402,7 @@ impl MacroEngine {
 
         let hle_program = self.hle_macros.get_hle_program(hash);
         let has_hle = hle_program.is_some();
-        if method == 0x14F {
+        if method == 0x14F || std::env::var_os("RUZU_TRACE_MACRO_FLOW").is_some() {
             log::info!(
                 "MacroEngine::execute method=0x{:X} has_hle={}",
                 method,

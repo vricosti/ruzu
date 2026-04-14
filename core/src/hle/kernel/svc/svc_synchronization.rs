@@ -11,6 +11,10 @@ use crate::hle::kernel::svc::svc_results::*;
 use crate::hle::kernel::svc_common::{Handle, ARGUMENT_HANDLE_COUNT_MAX};
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 
+fn should_trace_wait_sync() -> bool {
+    std::env::var_os("RUZU_TRACE_WAIT_SYNC").is_some()
+}
+
 fn synchronization_timeout_tick_from_ns(current_tick: i64, timeout_ns: i64) -> i64 {
     debug_assert!(timeout_ns > 0);
 
@@ -135,6 +139,18 @@ pub fn wait_synchronization(
         object_ids.push(object_id);
         object_kinds.push(kind);
     }
+    if should_trace_wait_sync() {
+        let process_id = process.get_process_id();
+        log::info!(
+            "WaitSynchronization pid={} tid={} handles={:?} object_ids={:?} kinds={:?} timeout_ns={}",
+            process_id,
+            current_thread_id,
+            handles,
+            object_ids,
+            object_kinds,
+            timeout_ns
+        );
+    }
     log::trace!(
         "  WaitSynchronization handles={:?} object_ids={:?} kinds={:?} timeout_ns={}",
         handles,
@@ -161,6 +177,16 @@ pub fn wait_synchronization(
         object_ids,
         timeout,
     );
+    if should_trace_wait_sync() {
+        let process = process_arc.lock().unwrap();
+        log::info!(
+            "WaitSynchronization return pid={} tid={} result=0x{:08X} out_index={}",
+            process.get_process_id(),
+            current_thread_id,
+            result.get_inner_value(),
+            *out_index
+        );
+    }
     log::trace!(
         "  WaitSynchronization result={:?} out_index={}",
         result,

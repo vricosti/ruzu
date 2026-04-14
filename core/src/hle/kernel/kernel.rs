@@ -352,15 +352,6 @@ pub fn get_current_hardware_tick() -> Option<i64> {
         if let Ok(core_timing) = core_timing.try_lock() {
             return Some(core_timing.get_global_time_ns().as_nanos() as i64);
         }
-
-        if kernel.is_multicore() {
-            return Some(
-                std::time::SystemTime::now()
-                    .duration_since(std::time::SystemTime::UNIX_EPOCH)
-                    .unwrap_or(std::time::Duration::ZERO)
-                    .as_nanos() as i64,
-            );
-        }
     }
 
     kernel.hardware_timer().map(|timer| timer.get_tick())
@@ -466,6 +457,13 @@ pub struct KernelCore {
     /// Upstream: `std::shared_ptr<Core::Timing::EventType> preemption_event`.
     preemption_event: Option<Arc<parking_lot::Mutex<crate::core_timing::EventType>>>,
 
+    /// Dedicated preemption thread that fires every 10ms independently of
+    /// CoreTiming. Works around the CoreTiming event-starvation bug where
+    /// looping events stop being collected from the priority queue after
+    /// the initial burst.
+    preemption_thread: Mutex<Option<std::thread::JoinHandle<()>>>,
+    preemption_stop: Arc<std::sync::atomic::AtomicBool>,
+
     /// Active service server managers.
     /// Upstream: `Impl::server_managers`.
     server_managers: Mutex<Vec<Arc<Mutex<ServerManager>>>>,
@@ -522,6 +520,8 @@ impl KernelCore {
             core_timing: None,
             system_ref: crate::core::SystemRef::null(),
             preemption_event: None,
+            preemption_thread: Mutex::new(None),
+            preemption_stop: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             server_managers: Mutex::new(Vec::new()),
             service_processes: Mutex::new(Vec::new()),
             host_service_processes: Mutex::new(Vec::new()),
@@ -815,6 +815,35 @@ impl KernelCore {
                 .unwrap()
                 .schedule_looping_event(interval, interval, event, false);
             log::info!("KernelCore: preemption event scheduled (10ms interval)");
+        }
+
+        // Also start a dedicated preemption thread that fires independently
+        // of CoreTiming. This works around the CoreTiming event-starvation
+        // bug where looping events stop being collected after the initial
+        // burst, causing the JIT to run unpreempted forever.
+        let stop = Arc::clone(&self.preemption_stop);
+        let kernel_ptr_val = KERNEL_PTR.load(Ordering::Acquire);
+        if !kernel_ptr_val.is_null() {
+            let thread = std::thread::Builder::new()
+                .name("PreemptionThread".to_string())
+                .spawn(move || {
+                    while !stop.load(Ordering::Relaxed) {
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                        let kp = KERNEL_PTR.load(Ordering::Acquire);
+                        if kp.is_null() {
+                            break;
+                        }
+                        let kernel = unsafe { &*kp };
+                        for core_id in 0..hardware_properties::NUM_CPU_CORES as usize {
+                            if let Some(core) = kernel.physical_core(core_id) {
+                                core.interrupt();
+                            }
+                        }
+                    }
+                })
+                .expect("failed to spawn preemption thread");
+            *self.preemption_thread.lock().unwrap() = Some(thread);
+            log::info!("KernelCore: dedicated preemption thread started (10ms interval)");
         }
     }
 

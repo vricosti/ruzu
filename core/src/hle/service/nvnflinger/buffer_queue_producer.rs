@@ -14,7 +14,8 @@
 //! The struct and method signatures are fully ported; method bodies that
 //! require complex interactions with other subsystems use todo!().
 
-use std::sync::{Arc, Condvar, Mutex, Weak};
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 
 use common::math_util::Rectangle;
 
@@ -22,7 +23,9 @@ use crate::hle::kernel::k_event::KEvent;
 use crate::hle::kernel::k_process::KProcess;
 use crate::hle::kernel::k_readable_event::KReadableEvent;
 use crate::hle::kernel::k_scheduler::KScheduler;
+use crate::hle::service::kernel_helpers::ServiceContext;
 use crate::hle::service::nvdrv::core::nvmap::NvMap;
+use crate::hle::service::os::event::Event;
 
 use super::binder::IBinder;
 use super::buffer_queue_core::BufferQueueCore;
@@ -38,11 +41,26 @@ use super::window::{
     NativeWindow, NativeWindowApi, NativeWindowScalingMode, NativeWindowTransform,
 };
 
+static BQP_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
+
+fn should_trace_bqp() -> bool {
+    std::env::var_os("RUZU_TRACE_BQP").is_some()
+}
+
+fn trace_bqp(args: std::fmt::Arguments<'_>) {
+    if !should_trace_bqp() {
+        return;
+    }
+    let count = BQP_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
+    if count < 96 {
+        log::info!("{}", args);
+    }
+}
+
 pub struct BufferQueueProducer {
+    service_context: Arc<Mutex<ServiceContext>>,
     core: Arc<BufferQueueCore>,
-    buffer_wait_event: Arc<Mutex<KEvent>>,
-    buffer_wait_readable_event: Arc<Mutex<KReadableEvent>>,
-    buffer_wait_event_owner: Mutex<Option<BufferWaitEventOwner>>,
+    buffer_wait_event_handle: u32,
     sticky_transform: Mutex<u32>,
     next_callback_ticket: Mutex<i32>,
     current_callback_ticket: Mutex<i32>,
@@ -50,19 +68,20 @@ pub struct BufferQueueProducer {
     nvmap: Arc<NvMap>,
 }
 
-struct BufferWaitEventOwner {
-    process: Weak<Mutex<KProcess>>,
-    scheduler: Weak<Mutex<KScheduler>>,
-}
-
 impl BufferQueueProducer {
-    pub fn new(core: Arc<BufferQueueCore>, nvmap: Arc<NvMap>) -> Self {
-        let (buffer_wait_event, buffer_wait_readable_event) = Self::new_buffer_wait_event();
+    pub fn new(
+        service_context: Arc<Mutex<ServiceContext>>,
+        core: Arc<BufferQueueCore>,
+        nvmap: Arc<NvMap>,
+    ) -> Self {
+        let buffer_wait_event_handle = service_context
+            .lock()
+            .unwrap()
+            .create_event("BufferQueue:WaitEvent".to_string());
         Self {
+            service_context,
             core,
-            buffer_wait_event,
-            buffer_wait_readable_event,
-            buffer_wait_event_owner: Mutex::new(None),
+            buffer_wait_event_handle,
             sticky_transform: Mutex::new(0),
             next_callback_ticket: Mutex::new(0),
             current_callback_ticket: Mutex::new(0),
@@ -71,37 +90,16 @@ impl BufferQueueProducer {
         }
     }
 
-    fn new_buffer_wait_event() -> (Arc<Mutex<KEvent>>, Arc<Mutex<KReadableEvent>>) {
-        static NEXT_EVENT_ID: std::sync::atomic::AtomicU64 =
-            std::sync::atomic::AtomicU64::new(0x2100_0000);
-
-        let event_object_id = NEXT_EVENT_ID.fetch_add(2, std::sync::atomic::Ordering::Relaxed);
-        let readable_object_id = event_object_id + 1;
-        let event = Arc::new(Mutex::new(KEvent::new()));
-        let readable_event = Arc::new(Mutex::new(KReadableEvent::new()));
-        readable_event
+    fn buffer_wait_event(&self) -> Arc<Event> {
+        self.service_context
             .lock()
             .unwrap()
-            .initialize(event_object_id, readable_object_id);
-        event.lock().unwrap().initialize(0, readable_object_id);
-        (event, readable_event)
+            .get_event(self.buffer_wait_event_handle)
+            .expect("BufferQueueProducer must keep its wait event alive")
     }
 
     fn signal_buffer_wait_event(&self) {
-        let owner = self.buffer_wait_event_owner.lock().unwrap();
-        let maybe_process = owner.as_ref().and_then(|owner| owner.process.upgrade());
-        let maybe_scheduler = owner.as_ref().and_then(|owner| owner.scheduler.upgrade());
-        drop(owner);
-
-        if let (Some(process), Some(scheduler)) = (maybe_process, maybe_scheduler) {
-            let mut process = process.lock().unwrap();
-            self.buffer_wait_event
-                .lock()
-                .unwrap()
-                .signal(&mut process, &scheduler);
-        } else {
-            self.buffer_wait_readable_event.lock().unwrap().is_signaled = true;
-        }
+        self.buffer_wait_event().signal();
     }
 
     fn wait_for_free_slot_then_relock<'a>(
@@ -204,6 +202,7 @@ impl BufferQueueProducer {
     }
 
     pub fn request_buffer(&self, slot: i32) -> (Status, Option<Arc<GraphicBuffer>>) {
+        trace_bqp(format_args!("BQP::request_buffer slot={}", slot));
         let mut inner = self.core.mutex.lock().unwrap();
         if inner.is_abandoned {
             log::error!("BufferQueueProducer: BufferQueue has been abandoned");
@@ -224,10 +223,28 @@ impl BufferQueueProducer {
         }
         inner.slots[slot as usize].request_buffer_called = true;
         let buf = inner.slots[slot as usize].graphic_buffer.clone();
+        if let Some(graphic_buffer) = buf.as_ref() {
+            trace_bqp(format_args!(
+                "BQP::request_buffer -> magic=0x{:08X} w={} h={} stride={} fmt={:?} usage=0x{:X} buffer_id={} ext_fmt={:?} handle={} offset={}",
+                graphic_buffer.buffer.magic,
+                graphic_buffer.get_width(),
+                graphic_buffer.get_height(),
+                graphic_buffer.get_stride(),
+                graphic_buffer.get_format(),
+                graphic_buffer.get_usage(),
+                graphic_buffer.get_buffer_id(),
+                graphic_buffer.get_external_format(),
+                graphic_buffer.get_handle(),
+                graphic_buffer.get_offset()
+            ));
+        } else {
+            trace_bqp(format_args!("BQP::request_buffer -> None"));
+        }
         (Status::NoError, buf)
     }
 
     pub fn set_buffer_count(&self, buffer_count: i32) -> Status {
+        trace_bqp(format_args!("BQP::set_buffer_count count={}", buffer_count));
         log::debug!(
             "BufferQueueProducer::set_buffer_count count={}",
             buffer_count
@@ -296,6 +313,10 @@ impl BufferQueueProducer {
         mut format: PixelFormat,
         mut usage: u32,
     ) -> (i32, i32, Fence) {
+        trace_bqp(format_args!(
+            "BQP::dequeue_buffer async={} w={} h={} format={:?} usage=0x{:X}",
+            async_flag, width, height, format, usage
+        ));
         if (width != 0 && height == 0) || (width == 0 && height != 0) {
             log::error!(
                 "BufferQueueProducer: invalid size: w={} h={}",
@@ -392,10 +413,15 @@ impl BufferQueueProducer {
             out_slot,
             return_flags
         );
+        trace_bqp(format_args!(
+            "BQP::dequeue_buffer -> slot={} flags={}",
+            out_slot, return_flags
+        ));
         (return_flags, out_slot, out_fence)
     }
 
     pub fn queue_buffer(&self, slot: i32, input: &QueueBufferInput) -> (Status, QueueBufferOutput) {
+        trace_bqp(format_args!("BQP::queue_buffer slot={}", slot));
         let (
             timestamp,
             is_auto_timestamp,
@@ -586,6 +612,11 @@ impl BufferQueueProducer {
             slot,
             self.core.mutex.lock().unwrap().frame_counter
         );
+        trace_bqp(format_args!(
+            "BQP::queue_buffer -> status={:?} slot={}",
+            Status::NoError,
+            slot
+        ));
         (Status::NoError, output)
     }
 
@@ -637,6 +668,10 @@ impl BufferQueueProducer {
         api: NativeWindowApi,
         producer_controlled_by_app: bool,
     ) -> (Status, QueueBufferOutput) {
+        trace_bqp(format_args!(
+            "BQP::connect api={:?} producer_controlled_by_app={}",
+            api, producer_controlled_by_app
+        ));
         let mut inner = self.core.mutex.lock().unwrap();
 
         if inner.is_abandoned {
@@ -716,6 +751,27 @@ impl BufferQueueProducer {
         slot: i32,
         buffer: Option<Arc<NvGraphicBuffer>>,
     ) -> Status {
+        if let Some(buf) = buffer.as_ref() {
+            trace_bqp(format_args!(
+                "BQP::set_preallocated_buffer slot={} magic=0x{:08X} w={} h={} stride={} fmt={:?} usage=0x{:X} buffer_id={} ext_fmt={:?} handle={} offset={}",
+                slot,
+                buf.magic,
+                buf.get_width(),
+                buf.get_height(),
+                buf.get_stride(),
+                buf.get_format(),
+                buf.get_usage(),
+                buf.get_buffer_id(),
+                buf.get_external_format(),
+                buf.get_handle(),
+                buf.get_offset()
+            ));
+        } else {
+            trace_bqp(format_args!(
+                "BQP::set_preallocated_buffer slot={} None",
+                slot
+            ));
+        }
         if slot < 0 || slot as usize >= super::buffer_queue_defs::NUM_BUFFER_SLOTS {
             return Status::BadValue;
         }
@@ -943,7 +999,7 @@ impl IBinder for BufferQueueProducer {
     }
 
     fn get_native_handle(&self, _type_id: u32) -> Option<Arc<Mutex<KReadableEvent>>> {
-        Some(Arc::clone(&self.buffer_wait_readable_event))
+        self.buffer_wait_event().readable_event()
     }
 
     fn as_any(&self) -> &dyn std::any::Any {
@@ -955,30 +1011,50 @@ impl IBinder for BufferQueueProducer {
         process: Arc<Mutex<KProcess>>,
         scheduler: Arc<Mutex<KScheduler>>,
     ) {
-        {
-            let mut process_guard = process.lock().unwrap();
-            let event_object_id = self
-                .buffer_wait_readable_event
-                .lock()
-                .unwrap()
-                .get_parent_id()
-                .unwrap_or(0);
-            let readable_object_id = self.buffer_wait_readable_event.lock().unwrap().object_id;
+        let event = self.buffer_wait_event();
+        if event.readable_event().is_none() {
+            let Some(kernel) = crate::hle::kernel::kernel::get_kernel_ref() else {
+                return;
+            };
+            let event_object_id = kernel.create_new_object_id() as u64;
+            let readable_event_object_id = kernel.create_new_object_id() as u64;
+            let owner_process_id = process.lock().unwrap().get_process_id();
+            let signaled = event.is_signaled();
 
-            self.buffer_wait_event.lock().unwrap().owner_process_id =
-                Some(process_guard.process_id);
-            process_guard
-                .register_event_object(event_object_id, Arc::clone(&self.buffer_wait_event));
-            process_guard.register_readable_event_object(
-                readable_object_id,
-                Arc::clone(&self.buffer_wait_readable_event),
+            let mut event_owner = KEvent::new();
+            let mut readable_event = KReadableEvent::new();
+            event_owner.initialize(owner_process_id, readable_event_object_id);
+            readable_event.initialize(event_object_id, readable_event_object_id);
+            if signaled {
+                readable_event.is_signaled = true;
+            }
+
+            let event_owner = Arc::new(Mutex::new(event_owner));
+            let readable_event = Arc::new(Mutex::new(readable_event));
+            {
+                let mut process_guard = process.lock().unwrap();
+                process_guard.register_event_object(event_object_id, Arc::clone(&event_owner));
+                process_guard.register_readable_event_object(
+                    readable_event_object_id,
+                    Arc::clone(&readable_event),
+                );
+            }
+            event.attach_kernel_event_owner(
+                event_owner,
+                readable_event,
+                Arc::clone(&process),
+                Arc::clone(&scheduler),
             );
         }
+    }
+}
 
-        *self.buffer_wait_event_owner.lock().unwrap() = Some(BufferWaitEventOwner {
-            process: Arc::downgrade(&process),
-            scheduler: Arc::downgrade(&scheduler),
-        });
+impl Drop for BufferQueueProducer {
+    fn drop(&mut self) {
+        self.service_context
+            .lock()
+            .unwrap()
+            .close_event(self.buffer_wait_event_handle);
     }
 }
 
@@ -986,6 +1062,7 @@ impl IBinder for BufferQueueProducer {
 mod tests {
     use common::math_util::Rectangle;
 
+    use crate::hle::service::kernel_helpers::ServiceContext;
     use crate::hle::service::nvdrv::core::container::Container;
 
     use super::super::buffer_item::BufferItem;
@@ -1011,10 +1088,19 @@ mod tests {
         Container::new().get_nv_map_file_handle()
     }
 
+    fn test_service_context() -> Arc<Mutex<ServiceContext>> {
+        Arc::new(Mutex::new(ServiceContext::new(
+            "BufferQueueProducerTest".to_string(),
+        )))
+    }
+
     #[test]
     fn get_native_handle_returns_persistent_buffer_wait_event() {
         let core = BufferQueueCore::new();
-        let producer = BufferQueueProducer::new(core, test_nvmap());
+        let process = Arc::new(Mutex::new(KProcess::new()));
+        let scheduler = Arc::new(Mutex::new(KScheduler::new(0)));
+        let producer = BufferQueueProducer::new(test_service_context(), core, test_nvmap());
+        producer.register_native_handle_owner(process, scheduler);
 
         let first = producer.get_native_handle(0).unwrap();
         let second = producer.get_native_handle(15).unwrap();
@@ -1027,7 +1113,7 @@ mod tests {
         let core = BufferQueueCore::new();
         core.mutex.lock().unwrap().consumer_controlled_by_app = true;
         install_test_consumer(&core);
-        let producer = BufferQueueProducer::new(core.clone(), test_nvmap());
+        let producer = BufferQueueProducer::new(test_service_context(), core.clone(), test_nvmap());
 
         let (status, _) = producer.connect(None, NativeWindowApi::Egl, true);
         assert_eq!(status, Status::NoError);
@@ -1038,21 +1124,27 @@ mod tests {
     fn disconnect_signals_buffer_wait_event() {
         let core = BufferQueueCore::new();
         install_test_consumer(&core);
-        let producer = BufferQueueProducer::new(core, test_nvmap());
+        let process = Arc::new(Mutex::new(KProcess::new()));
+        let scheduler = Arc::new(Mutex::new(KScheduler::new(0)));
+        let producer = BufferQueueProducer::new(test_service_context(), core, test_nvmap());
+        producer.register_native_handle_owner(process, scheduler);
         let event = producer.get_native_handle(0).unwrap();
-        assert!(!event.lock().unwrap().is_signaled());
+        assert!(!event.lock().unwrap().is_signaled);
 
         let (status, _) = producer.connect(None, NativeWindowApi::Egl, false);
         assert_eq!(status, Status::NoError);
         assert_eq!(producer.disconnect(NativeWindowApi::Egl), Status::NoError);
 
-        assert!(event.lock().unwrap().is_signaled());
+        assert!(event.lock().unwrap().is_signaled);
     }
 
     #[test]
     fn set_preallocated_buffer_signals_wait_event_and_updates_defaults() {
         let core = BufferQueueCore::new();
-        let producer = BufferQueueProducer::new(core.clone(), test_nvmap());
+        let process = Arc::new(Mutex::new(KProcess::new()));
+        let scheduler = Arc::new(Mutex::new(KScheduler::new(0)));
+        let producer = BufferQueueProducer::new(test_service_context(), core.clone(), test_nvmap());
+        producer.register_native_handle_owner(process, scheduler);
         let event = producer.get_native_handle(0).unwrap();
         let buffer = Arc::new(NvGraphicBuffer::new(1280, 720, PixelFormat::Rgba8888, 0));
 
@@ -1060,7 +1152,7 @@ mod tests {
             producer.set_preallocated_buffer(0, Some(buffer)),
             Status::NoError
         );
-        assert!(event.lock().unwrap().is_signaled());
+        assert!(event.lock().unwrap().is_signaled);
 
         let inner = core.mutex.lock().unwrap();
         assert_eq!(inner.default_width, 1280);
@@ -1071,7 +1163,7 @@ mod tests {
     #[test]
     fn set_preallocated_buffer_resets_slot_and_uses_no_fence() {
         let core = BufferQueueCore::new();
-        let producer = BufferQueueProducer::new(core.clone(), test_nvmap());
+        let producer = BufferQueueProducer::new(test_service_context(), core.clone(), test_nvmap());
 
         {
             let mut inner = core.mutex.lock().unwrap();
@@ -1101,7 +1193,7 @@ mod tests {
     fn queue_buffer_marks_core_as_having_queued_buffers() {
         let core = BufferQueueCore::new();
         install_test_consumer(&core);
-        let producer = BufferQueueProducer::new(core.clone(), test_nvmap());
+        let producer = BufferQueueProducer::new(test_service_context(), core.clone(), test_nvmap());
         let buffer = Arc::new(NvGraphicBuffer::new(16, 16, PixelFormat::Rgba8888, 0));
         assert_eq!(
             producer.set_preallocated_buffer(0, Some(buffer)),
@@ -1124,7 +1216,7 @@ mod tests {
     fn queue_buffer_rejects_slot_without_request_buffer() {
         let core = BufferQueueCore::new();
         install_test_consumer(&core);
-        let producer = BufferQueueProducer::new(core.clone(), test_nvmap());
+        let producer = BufferQueueProducer::new(test_service_context(), core.clone(), test_nvmap());
         let buffer = Arc::new(NvGraphicBuffer::new(16, 16, PixelFormat::Rgba8888, 0));
         assert_eq!(
             producer.set_preallocated_buffer(0, Some(buffer)),
@@ -1143,7 +1235,7 @@ mod tests {
     fn queue_buffer_rejects_crop_outside_buffer_bounds() {
         let core = BufferQueueCore::new();
         install_test_consumer(&core);
-        let producer = BufferQueueProducer::new(core.clone(), test_nvmap());
+        let producer = BufferQueueProducer::new(test_service_context(), core.clone(), test_nvmap());
         let buffer = Arc::new(NvGraphicBuffer::new(16, 16, PixelFormat::Rgba8888, 0));
         assert_eq!(
             producer.set_preallocated_buffer(0, Some(buffer)),
@@ -1165,7 +1257,7 @@ mod tests {
     #[test]
     fn query_reports_sticky_transform_and_consumer_running_behind() {
         let core = BufferQueueCore::new();
-        let producer = BufferQueueProducer::new(core.clone(), test_nvmap());
+        let producer = BufferQueueProducer::new(test_service_context(), core.clone(), test_nvmap());
         *producer.sticky_transform.lock().unwrap() = NativeWindowTransform::INVERSE_DISPLAY.bits();
         {
             let mut inner = core.mutex.lock().unwrap();
@@ -1188,7 +1280,7 @@ mod tests {
     #[test]
     fn request_buffer_rejects_slot_not_owned_by_producer() {
         let core = BufferQueueCore::new();
-        let producer = BufferQueueProducer::new(core.clone(), test_nvmap());
+        let producer = BufferQueueProducer::new(test_service_context(), core.clone(), test_nvmap());
         core.mutex.lock().unwrap().slots[0].graphic_buffer = Some(Arc::new(GraphicBuffer::new(
             16,
             16,
@@ -1204,7 +1296,7 @@ mod tests {
     #[test]
     fn dequeue_buffer_requires_explicit_buffer_count_for_second_dequeue() {
         let core = BufferQueueCore::new();
-        let producer = BufferQueueProducer::new(core.clone(), test_nvmap());
+        let producer = BufferQueueProducer::new(test_service_context(), core.clone(), test_nvmap());
         assert_eq!(
             producer.set_preallocated_buffer(
                 0,
@@ -1242,7 +1334,7 @@ mod tests {
     #[test]
     fn dequeue_buffer_sets_reallocation_flag_for_empty_slot() {
         let core = BufferQueueCore::new();
-        let producer = BufferQueueProducer::new(core.clone(), test_nvmap());
+        let producer = BufferQueueProducer::new(test_service_context(), core.clone(), test_nvmap());
         core.mutex.lock().unwrap().override_max_buffer_count = 1;
 
         let (status, slot, _) = producer.dequeue_buffer(false, 32, 32, PixelFormat::Rgba8888, 0);

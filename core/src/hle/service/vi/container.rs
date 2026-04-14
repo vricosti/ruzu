@@ -89,8 +89,7 @@ impl Container {
             let server = Arc::clone(binder_driver_impl.get_server());
             let surface_flinger = binder_driver_impl.get_surface_flinger();
 
-            let nvdrv =
-                ServiceManager::get_service_blocking(&service_manager, system, "nvdrv:s");
+            let nvdrv = ServiceManager::get_service_blocking(&service_manager, system, "nvdrv:s");
             let nvdrv = nvdrv
                 .as_any()
                 .downcast_ref::<crate::hle::service::nvdrv::nvdrv_interface::NvdrvService>()

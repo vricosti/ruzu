@@ -5,13 +5,10 @@
 //! Port of zuyu/src/core/hle/service/am/lifecycle_manager.cpp
 
 use std::collections::VecDeque;
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::Arc;
 
-use crate::hle::kernel::k_process::KProcess;
-use crate::hle::kernel::k_readable_event::KReadableEvent;
-use crate::hle::kernel::k_scheduler::KScheduler;
-use crate::hle::kernel::k_thread::KThread;
 use crate::hle::service::hle_ipc::{HLERequestContext, Handle};
+use crate::hle::service::os::event::Event;
 
 use super::am_types::{AppletMessage, FocusState};
 
@@ -45,16 +42,8 @@ pub enum SuspendMode {
 
 pub struct LifecycleManager {
     // Matches upstream: Event m_system_event, Event m_operation_mode_changed_system_event
-    system_event: Option<Arc<Mutex<KReadableEvent>>>,
-    pub system_event_handle: u32,
-    operation_mode_changed_system_event: Option<Arc<Mutex<KReadableEvent>>>,
-    pub operation_mode_changed_system_event_handle: u32,
-    event_owner_process: Option<Weak<Mutex<KProcess>>>,
-    event_owner_scheduler: Option<Weak<Mutex<KScheduler>>>,
-
-    // Cached signal state for SignalSystemEventIfNeeded
-    system_event_signaled: bool,
-    operation_mode_changed_system_event_signaled: bool,
+    system_event: Arc<Event>,
+    operation_mode_changed_system_event: Arc<Event>,
 
     unordered_messages: VecDeque<AppletMessage>,
 
@@ -93,14 +82,8 @@ pub struct LifecycleManager {
 impl LifecycleManager {
     pub fn new(is_application: bool) -> Self {
         Self {
-            system_event: None,
-            system_event_handle: 0,
-            operation_mode_changed_system_event: None,
-            operation_mode_changed_system_event_handle: 0,
-            event_owner_process: None,
-            event_owner_scheduler: None,
-            system_event_signaled: false,
-            operation_mode_changed_system_event_signaled: false,
+            system_event: Arc::new(Event::new()),
+            operation_mode_changed_system_event: Arc::new(Event::new()),
             unordered_messages: VecDeque::new(),
             is_application,
             focus_state_changed_notification_enabled: true,
@@ -133,41 +116,15 @@ impl LifecycleManager {
         }
     }
 
-    /// Returns the system event handle for GetEventHandle.
-    /// Matches upstream `Event& GetSystemEvent()`.
-    pub fn get_system_event_handle(&self) -> u32 {
-        self.system_event_handle
-    }
-
-    /// Returns the operation mode changed event handle.
-    /// Matches upstream `Event& GetOperationModeChangedSystemEvent()`.
-    pub fn get_operation_mode_changed_system_event_handle(&self) -> u32 {
-        self.operation_mode_changed_system_event_handle
-    }
-
     pub fn ensure_system_event(&mut self, ctx: &HLERequestContext) -> Option<Handle> {
-        let signaled = self.should_signal_system_event();
-        self.bind_event_owner(ctx);
-        Self::ensure_event(
-            ctx,
-            &mut self.system_event,
-            &mut self.system_event_handle,
-            signaled,
-        )
+        self.system_event.copy_handle(ctx)
     }
 
     pub fn ensure_operation_mode_changed_system_event(
         &mut self,
         ctx: &HLERequestContext,
     ) -> Option<Handle> {
-        let signaled = self.operation_mode_changed_system_event_signaled;
-        self.bind_event_owner(ctx);
-        Self::ensure_event(
-            ctx,
-            &mut self.operation_mode_changed_system_event,
-            &mut self.operation_mode_changed_system_event_handle,
-            signaled,
-        )
+        self.operation_mode_changed_system_event.copy_handle(ctx)
     }
 
     pub fn is_application(&self) -> bool {
@@ -217,8 +174,7 @@ impl LifecycleManager {
         if self.performance_mode_changed_notification_enabled {
             self.has_performance_mode_changed = true;
         }
-        self.operation_mode_changed_system_event_signaled = true;
-        self.signal_readable_event_if_possible(self.operation_mode_changed_system_event.as_ref());
+        self.operation_mode_changed_system_event.signal();
         self.signal_system_event_if_needed();
     }
 
@@ -365,13 +321,11 @@ impl LifecycleManager {
 
         if applet_message_available != self.should_signal_system_event() {
             if !applet_message_available {
-                self.system_event_signaled = true;
                 self.applet_message_available = true;
-                self.signal_readable_event_if_possible(self.system_event.as_ref());
+                self.system_event.signal();
             } else {
-                self.system_event_signaled = false;
                 self.applet_message_available = false;
-                self.clear_readable_event_if_possible(self.system_event.as_ref());
+                self.system_event.clear();
             }
         }
     }
@@ -535,74 +489,33 @@ impl LifecycleManager {
             || self.has_album_screen_shot_taken
             || self.has_album_recording_saved
     }
+}
 
-    fn ensure_event(
-        ctx: &HLERequestContext,
-        readable_event: &mut Option<Arc<Mutex<KReadableEvent>>>,
-        handle: &mut Handle,
-        signaled: bool,
-    ) -> Option<Handle> {
-        if *handle != 0 {
-            return Some(*handle);
-        }
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-        let (new_handle, new_event) = ctx.create_readable_event(signaled)?;
-        *readable_event = Some(new_event);
-        *handle = new_handle;
-        Some(new_handle)
+    #[test]
+    fn request_exit_signals_then_pop_clears_system_event() {
+        let mut lifecycle = LifecycleManager::new(true);
+        assert!(!lifecycle.system_event.is_signaled());
+
+        lifecycle.request_exit();
+        assert!(lifecycle.system_event.is_signaled());
+
+        let mut message = AppletMessage::None;
+        assert!(lifecycle.pop_message(&mut message));
+        assert_eq!(message, AppletMessage::Exit);
+        assert!(!lifecycle.system_event.is_signaled());
     }
 
-    fn bind_event_owner(&mut self, ctx: &HLERequestContext) {
-        if self.event_owner_process.is_some() && self.event_owner_scheduler.is_some() {
-            return;
-        }
+    #[test]
+    fn operation_mode_change_signals_operation_mode_event() {
+        let mut lifecycle = LifecycleManager::new(true);
+        assert!(!lifecycle.operation_mode_changed_system_event.is_signaled());
 
-        let Some(thread) = ctx.get_thread() else {
-            return;
-        };
-        let Some((process, scheduler)) = Self::event_owner_from_thread(&thread) else {
-            return;
-        };
-        self.event_owner_process = Some(Arc::downgrade(&process));
-        self.event_owner_scheduler = Some(Arc::downgrade(&scheduler));
-    }
+        lifecycle.on_operation_and_performance_mode_changed();
 
-    fn event_owner_from_thread(
-        thread: &Arc<Mutex<KThread>>,
-    ) -> Option<(Arc<Mutex<KProcess>>, Arc<Mutex<KScheduler>>)> {
-        let thread_guard = thread.lock().unwrap();
-        let parent = thread_guard.parent.as_ref()?.upgrade()?;
-        let scheduler = parent.lock().unwrap().scheduler.as_ref()?.upgrade()?;
-        Some((parent, scheduler))
-    }
-
-    fn signal_readable_event_if_possible(
-        &self,
-        readable_event: Option<&Arc<Mutex<KReadableEvent>>>,
-    ) {
-        let Some(readable_event) = readable_event else {
-            return;
-        };
-        let Some(process) = self.event_owner_process.as_ref().and_then(Weak::upgrade) else {
-            return;
-        };
-        let Some(scheduler) = self.event_owner_scheduler.as_ref().and_then(Weak::upgrade) else {
-            return;
-        };
-
-        readable_event
-            .lock()
-            .unwrap()
-            .signal(&mut process.lock().unwrap(), &scheduler);
-    }
-
-    fn clear_readable_event_if_possible(
-        &self,
-        readable_event: Option<&Arc<Mutex<KReadableEvent>>>,
-    ) {
-        let Some(readable_event) = readable_event else {
-            return;
-        };
-        readable_event.lock().unwrap().clear();
+        assert!(lifecycle.operation_mode_changed_system_event.is_signaled());
     }
 }

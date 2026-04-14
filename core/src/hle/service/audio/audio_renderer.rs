@@ -14,6 +14,7 @@ use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
 use crate::hle::service::ipc_helpers::{RequestParser, ResponseBuilder};
 use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// IPC command table for IAudioRenderer:
 ///
@@ -42,6 +43,23 @@ pub struct IAudioRenderer {
     rendered_readable_event_object_id: u64,
     rendered_event: Arc<Mutex<KEvent>>,
     rendered_readable_event: Arc<Mutex<KReadableEvent>>,
+}
+
+static AUDIO_UPDATE_TRACE_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+fn should_trace_audio_update_decoded() -> bool {
+    std::env::var_os("RUZU_TRACE_AUDIO_UPDATE_DECODED").is_some()
+        && AUDIO_UPDATE_TRACE_COUNT.fetch_add(1, Ordering::Relaxed) < 64
+}
+
+fn read_le_u32(data: &[u8], offset: usize) -> Option<u32> {
+    let bytes = data.get(offset..offset + 4)?;
+    Some(u32::from_le_bytes(bytes.try_into().ok()?))
+}
+
+fn read_le_u64(data: &[u8], offset: usize) -> Option<u64> {
+    let bytes = data.get(offset..offset + 8)?;
+    Some(u64::from_le_bytes(bytes.try_into().ok()?))
 }
 
 impl IAudioRenderer {
@@ -141,6 +159,14 @@ impl IAudioRenderer {
             );
         }
 
+        if std::env::var_os("RUZU_TRACE_AUDIO_EVENT").is_some() {
+            log::info!(
+                "IAudioRenderer::create_rendered_event event_object_id={} readable_event_object_id={}",
+                rendered_event_object_id,
+                rendered_readable_event_object_id
+            );
+        }
+
         (
             rendered_event_object_id,
             rendered_readable_event_object_id,
@@ -187,12 +213,20 @@ impl IAudioRenderer {
 
     /// Port of upstream `IAudioRenderer::RequestUpdate` → delegates to RequestUpdateAuto.
     fn request_update_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
-        log::info!("IAudioRenderer::RequestUpdate");
+        log::info!(
+            "IAudioRenderer::RequestUpdate tid={:?}",
+            crate::hle::kernel::kernel::get_current_thread_pointer()
+                .map(|thread| thread.lock().unwrap().get_thread_id())
+        );
         Self::request_update_impl(this, ctx);
     }
 
     fn request_update_auto_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
-        log::info!("IAudioRenderer::RequestUpdateAuto");
+        log::info!(
+            "IAudioRenderer::RequestUpdateAuto tid={:?}",
+            crate::hle::kernel::kernel::get_current_thread_pointer()
+                .map(|thread| thread.lock().unwrap().get_thread_id())
+        );
         Self::request_update_impl(this, ctx);
     }
 
@@ -227,6 +261,42 @@ impl IAudioRenderer {
             log::info!(
                 "IAudioRenderer::RequestUpdate output_preview={:08X?}",
                 preview_words
+            );
+        }
+        if should_trace_audio_update_decoded() && output.len() >= 0x30 {
+            let behaviour_size = read_le_u32(&output, 0x04).unwrap_or(0);
+            let memory_pool_size = read_le_u32(&output, 0x08).unwrap_or(0);
+            let voices_size = read_le_u32(&output, 0x0C).unwrap_or(0);
+            let effects_size = read_le_u32(&output, 0x14).unwrap_or(0);
+            let sinks_size = read_le_u32(&output, 0x1C).unwrap_or(0);
+            let performance_size = read_le_u32(&output, 0x20).unwrap_or(0);
+            let render_info_size = read_le_u32(&output, 0x28).unwrap_or(0);
+            let total_size = read_le_u32(&output, 0x3C).unwrap_or(0);
+
+            let behavior_offset = 0x40usize
+                .saturating_add(memory_pool_size as usize)
+                .saturating_add(voices_size as usize)
+                .saturating_add(effects_size as usize)
+                .saturating_add(sinks_size as usize)
+                .saturating_add(performance_size as usize);
+            let render_info_offset = behavior_offset.saturating_add(behaviour_size as usize);
+            let error_count = read_le_u32(&output, behavior_offset.saturating_add(0xA0));
+            let frames_elapsed = read_le_u64(&output, render_info_offset);
+
+            log::info!(
+                "IAudioRenderer::RequestUpdate decoded total_size=0x{:X} behavior_size=0x{:X} memory_pool_size=0x{:X} voices_size=0x{:X} effects_size=0x{:X} sinks_size=0x{:X} perf_size=0x{:X} render_info_size=0x{:X} behavior_offset=0x{:X} render_info_offset=0x{:X} error_count={:?} frames_elapsed={:?}",
+                total_size,
+                behaviour_size,
+                memory_pool_size,
+                voices_size,
+                effects_size,
+                sinks_size,
+                performance_size,
+                render_info_size,
+                behavior_offset,
+                render_info_offset,
+                error_count,
+                frames_elapsed
             );
         }
         if result.is_success() {
@@ -283,6 +353,14 @@ impl IAudioRenderer {
             rb.push_result(RESULT_SUCCESS);
             return;
         };
+
+        if std::env::var_os("RUZU_TRACE_AUDIO_EVENT").is_some() {
+            log::info!(
+                "IAudioRenderer::QuerySystemEvent readable_event_object_id={} copy_handle=0x{:08X}",
+                svc.rendered_readable_event_object_id,
+                handle
+            );
+        }
 
         let mut rb = ResponseBuilder::new(ctx, 2, 1, 0);
         rb.push_result(RESULT_SUCCESS);

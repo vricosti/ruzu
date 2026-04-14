@@ -5,8 +5,8 @@
 //!
 //! Implements TEXS (texture fetch swizzled, compact dual-destination encoding).
 
-use crate::ir::program::ShaderInfoExt;
 use super::{field, TranslatorVisitor};
+use crate::ir::program::ShaderInfoExt;
 use crate::ir::types::TextureInstInfo;
 use crate::ir::value::Value;
 
@@ -30,7 +30,11 @@ pub fn texs(tv: &mut TranslatorVisitor, insn: u64) {
         ..Default::default()
     };
 
-    tv.ir.program.info.register_texture(tex_index, crate::shader_info::TextureType::ColorArray1D, false);
+    tv.ir.program.info.register_texture(
+        tex_index,
+        crate::shader_info::TextureType::ColorArray1D,
+        false,
+    );
 
     let coord_x = tv.f(src_reg);
     let coord_y = tv.f(src_reg + 1);

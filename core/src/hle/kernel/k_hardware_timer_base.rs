@@ -6,7 +6,7 @@
 //! of timer tasks. Upstream uses an intrusive red-black tree of KTimerTask
 //! and a KSpinLock.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Mutex;
 
 /// Placeholder for a timer task identifier.
@@ -20,6 +20,9 @@ pub struct KHardwareTimerBase {
     m_lock: Mutex<()>,
     /// Maps task_time -> task_id. Upstream uses an intrusive rbtree.
     m_task_tree: BTreeMap<i64, Vec<TimerTaskId>>,
+    /// Current scheduled time per task. Upstream stores this on the intrusive
+    /// KTimerTask node itself, which guarantees a single live entry per task.
+    m_task_times: HashMap<TimerTaskId, i64>,
     m_next_task: Option<(i64, TimerTaskId)>,
 }
 
@@ -28,6 +31,7 @@ impl KHardwareTimerBase {
         Self {
             m_lock: Mutex::new(()),
             m_task_tree: BTreeMap::new(),
+            m_task_times: HashMap::new(),
             m_next_task: None,
         }
     }
@@ -103,11 +107,16 @@ impl KHardwareTimerBase {
     pub fn register_absolute_task_impl(&mut self, task_id: TimerTaskId, task_time: i64) -> bool {
         assert!(task_time > 0);
 
+        if let Some(old_time) = self.m_task_times.get(&task_id).copied() {
+            self.remove_task_from_tree(task_id, old_time);
+        }
+
         // Insert into tree.
         self.m_task_tree
             .entry(task_time)
             .or_insert_with(Vec::new)
             .push(task_id);
+        self.m_task_times.insert(task_id, task_time);
 
         // Update next task if relevant.
         if let Some((next_time, _)) = self.m_next_task {
@@ -126,6 +135,7 @@ impl KHardwareTimerBase {
                 self.m_task_tree.remove(&task_time);
             }
         }
+        self.m_task_times.remove(&task_id);
 
         // Update next task.
         if let Some((_, next_id)) = self.m_next_task {
@@ -143,5 +153,26 @@ impl KHardwareTimerBase {
 impl Default for KHardwareTimerBase {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn register_absolute_task_replaces_existing_entry_for_same_task() {
+        let mut timer = KHardwareTimerBase::new();
+
+        assert!(timer.register_absolute_task_impl(100, 50));
+        assert!(timer.register_absolute_task_impl(100, 150));
+
+        let (expired, next) = timer.collect_expired_tasks(100);
+        assert!(expired.is_empty());
+        assert_eq!(next, 150);
+
+        let (expired, next) = timer.collect_expired_tasks(200);
+        assert_eq!(expired, vec![100]);
+        assert_eq!(next, 0);
     }
 }

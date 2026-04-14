@@ -469,7 +469,11 @@ impl RendererBase for RendererOpenGL {
         // This matches upstream's ReadRasterizer() returning a raw pointer.
         // Cast through a trait reference to create a wide pointer.
         let trait_ref: &dyn RasterizerInterface = &self.rasterizer;
-        trait_ref as *const dyn RasterizerInterface as *mut dyn RasterizerInterface
+        let ptr = trait_ref as *const dyn RasterizerInterface as *mut dyn RasterizerInterface;
+        if std::env::var_os("RUZU_TRACE_RASTERIZER_BIND").is_some() {
+            log::info!("RendererOpenGL::read_rasterizer rasterizer_ptr={:p}", ptr);
+        }
+        ptr
     }
 
     fn get_device_vendor(&self) -> String {

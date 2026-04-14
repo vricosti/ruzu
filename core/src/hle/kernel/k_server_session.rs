@@ -1791,7 +1791,9 @@ impl KServerSession {
             }
         } else if let Some(client_thread) = &client_thread {
             if trace_reply {
-                log::info!("KServerSession::send_reply_with_message stage=before_lock_client_thread");
+                log::info!(
+                    "KServerSession::send_reply_with_message stage=before_lock_client_thread"
+                );
             }
             let mut client_thread = client_thread.lock().unwrap();
             if trace_reply {

@@ -6,6 +6,7 @@
 //! priority queue of threads and the scheduler lock.
 
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::hardware_properties;
@@ -13,6 +14,25 @@ use crate::hardware_properties;
 use super::k_priority_queue::KPriorityQueue;
 use super::k_scheduler_lock::KAbstractSchedulerLock;
 use super::k_thread::{KThread, ThreadState, ThreadType};
+
+static TRACE_GSC_STATE_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+fn should_trace_sched_state(thread_id: u64) -> bool {
+    if std::env::var_os("RUZU_TRACE_SCHED_STATE").is_none() {
+        return false;
+    }
+    matches!(thread_id, 73 | 92 | 94 | 96 | 98 | 100)
+}
+
+fn trace_sched_state(args: std::fmt::Arguments<'_>) {
+    if std::env::var_os("RUZU_TRACE_SCHED_STATE").is_none() {
+        return;
+    }
+    let idx = TRACE_GSC_STATE_COUNT.fetch_add(1, Ordering::Relaxed);
+    if idx < 1024 {
+        log::info!("{}", args);
+    }
+}
 
 /// Priority at or above which core migration is allowed.
 pub const HIGHEST_CORE_MIGRATION_ALLOWED_PRIORITY: i32 = 2;
@@ -117,6 +137,22 @@ impl GlobalSchedulerContext {
         is_dummy: bool,
         process_schedule_count: Option<std::sync::Arc<std::sync::atomic::AtomicI64>>,
     ) {
+        if should_trace_sched_state(thread_id) {
+            trace_sched_state(format_args!(
+                "GSC::on_thread_state_changed tid={} {:?}->{:?} prio={} active_core={} affinity=0x{:x} dummy={} sched_count={}",
+                thread_id,
+                old_state,
+                new_state,
+                priority,
+                active_core,
+                affinity,
+                is_dummy,
+                process_schedule_count
+                    .as_ref()
+                    .map(|c| c.load(std::sync::atomic::Ordering::Relaxed))
+                    .unwrap_or(-1),
+            ));
+        }
         log::trace!(
             "GSC::on_thread_state_changed tid={} {:?}->{:?} prio={} active_core={} affinity=0x{:x} dummy={}",
             thread_id,
@@ -142,6 +178,19 @@ impl GlobalSchedulerContext {
             if is_dummy {
                 self.unregister_dummy_thread_for_wakeup(thread_id);
             }
+            if should_trace_sched_state(thread_id) {
+                trace_sched_state(format_args!(
+                    "GSC::pq remove tid={} prio={} core={} dummy={} top0={:?} top1={:?} top2={:?} top3={:?}",
+                    thread_id,
+                    priority,
+                    active_core,
+                    is_dummy,
+                    self.m_priority_queue.get_scheduled_front(0),
+                    self.m_priority_queue.get_scheduled_front(1),
+                    self.m_priority_queue.get_scheduled_front(2),
+                    self.m_priority_queue.get_scheduled_front(3),
+                ));
+            }
         } else if new_state == ThreadState::RUNNABLE {
             // Was not runnable, now is — add to PQ.
             self.m_priority_queue.push_back(
@@ -158,6 +207,20 @@ impl GlobalSchedulerContext {
 
             if is_dummy {
                 self.register_dummy_thread_for_wakeup(thread_id);
+            }
+
+            if should_trace_sched_state(thread_id) {
+                trace_sched_state(format_args!(
+                    "GSC::pq push tid={} prio={} core={} dummy={} top0={:?} top1={:?} top2={:?} top3={:?}",
+                    thread_id,
+                    priority,
+                    active_core,
+                    is_dummy,
+                    self.m_priority_queue.get_scheduled_front(0),
+                    self.m_priority_queue.get_scheduled_front(1),
+                    self.m_priority_queue.get_scheduled_front(2),
+                    self.m_priority_queue.get_scheduled_front(3),
+                ));
             }
 
             // Wake the target core from idle so it picks up the new thread.

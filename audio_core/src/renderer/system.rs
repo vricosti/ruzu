@@ -196,13 +196,34 @@ impl System {
     /// Matches upstream `adsp_rendered_event->Clear()` at the end of Update().
     fn clear_rendered_event(&self) {
         if let Some(ref readable_event) = self.rendered_readable_event {
+            if std::env::var_os("RUZU_TRACE_AUDIO_EVENT").is_some() {
+                let object_id = readable_event.lock().unwrap().object_id;
+                log::info!(
+                    "audio_core::System::clear_rendered_event session_id={} readable_event_object_id={}",
+                    self.session_id,
+                    object_id
+                );
+            }
             readable_event.lock().unwrap().clear();
         }
     }
 
     fn signal_rendered_event(&self) {
-        if !self.rendered_event.lock().unwrap().is_initialized() {
+        let rendered_event_initialized = self.rendered_event.lock().unwrap().is_initialized();
+        if !rendered_event_initialized {
             return;
+        }
+
+        if std::env::var_os("RUZU_TRACE_AUDIO_EVENT").is_some() {
+            let readable_event_object_id = self
+                .rendered_readable_event
+                .as_ref()
+                .map(|event| event.lock().unwrap().object_id);
+            log::info!(
+                "audio_core::System::signal_rendered_event session_id={} readable_event_object_id={:?}",
+                self.session_id,
+                readable_event_object_id
+            );
         }
 
         // Signal the readable event directly using the stored Arc references.
@@ -344,6 +365,22 @@ impl System {
         applet_resource_user_id: u64,
         session_id: i32,
     ) -> Result {
+        log::info!(
+            "audio_core::renderer::System::initialize revision=0x{:08X} sample_rate={} sample_count={} mixes={} sub_mixes={} voices={} sinks={} effects={} perf_frames={} exec_mode={:?} splitter_infos={} splitter_destinations={} external_context_size=0x{:X}",
+            params.revision,
+            params.sample_rate,
+            params.sample_count,
+            params.mixes,
+            params.sub_mixes,
+            params.voices,
+            params.sinks,
+            params.effects,
+            params.perf_frames,
+            params.execution_mode,
+            params.splitter_infos,
+            params.splitter_destinations,
+            params.external_context_size
+        );
         if !check_valid_revision(params.revision) {
             return RESULT_INVALID_REVISION;
         }

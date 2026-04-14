@@ -1,4 +1,4 @@
-use crate::common::common::{CpuAddr, MAX_CHANNELS};
+use crate::common::common::{CpuAddr, MAX_CHANNELS, TARGET_SAMPLE_COUNT};
 use crate::renderer::command::util::write_copy;
 use crate::sink::sink_stream::{SinkBuffer, SinkStreamHandle};
 use std::fmt::Write;
@@ -43,18 +43,10 @@ impl DeviceSinkPayload {
         if self.inputs.iter().take(input_count).any(|&input| input < 0) {
             return;
         }
-        let max_input = self
-            .inputs
-            .iter()
-            .take(input_count)
-            .copied()
-            .max()
-            .unwrap_or(0) as usize;
-        let planar_buffer_count = max_input.saturating_add(1).max(1);
-        let sample_count = self.sample_count as usize;
-        let frames = (sample_count / planar_buffer_count).max(1);
-        let src =
-            unsafe { std::slice::from_raw_parts(self.sample_buffer as *const i32, sample_count) };
+        let frames = TARGET_SAMPLE_COUNT as usize;
+        let src = unsafe {
+            std::slice::from_raw_parts(self.sample_buffer as *const i32, self.sample_count as usize)
+        };
         let mut samples = Vec::with_capacity(frames.saturating_mul(input_count));
         for frame in 0..frames {
             for &input in self.inputs.iter().take(input_count) {
@@ -120,18 +112,13 @@ pub fn process_device_command(
     {
         return;
     }
-    let max_input = payload
-        .inputs
-        .iter()
-        .take(input_count)
-        .copied()
-        .max()
-        .unwrap_or(0) as usize;
-    let planar_buffer_count = max_input.saturating_add(1).max(1);
-    let sample_count = payload.sample_count as usize;
-    let frames = (sample_count / planar_buffer_count).max(1);
-    let src =
-        unsafe { std::slice::from_raw_parts(payload.sample_buffer as *const i32, sample_count) };
+    let frames = TARGET_SAMPLE_COUNT as usize;
+    let src = unsafe {
+        std::slice::from_raw_parts(
+            payload.sample_buffer as *const i32,
+            payload.sample_count as usize,
+        )
+    };
     let mut samples = Vec::with_capacity(frames.saturating_mul(input_count));
     for frame in 0..frames {
         for &input in payload.inputs.iter().take(input_count) {
@@ -185,6 +172,14 @@ pub fn dump_device_command(payload: &DeviceSinkPayload, dump: &mut String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sink::sink_stream::{SinkStream, StreamType};
+    use crate::SharedSystem;
+    use parking_lot::Mutex;
+    use std::sync::Arc;
+
+    fn make_system() -> SharedSystem {
+        Arc::new(Mutex::new(ruzu_core::core::System::new()))
+    }
 
     #[test]
     fn verify_rejects_negative_input_indices() {
@@ -196,5 +191,29 @@ mod tests {
 
         assert!(!payload.verify());
         assert!(!verify_device_command(&payload));
+    }
+
+    #[test]
+    fn process_uses_target_sample_count_frames() {
+        let system = make_system();
+        let stream = Arc::new(Mutex::new(SinkStream::new(system, StreamType::Render)));
+        let samples = vec![123i32; (TARGET_SAMPLE_COUNT as usize) * 4];
+        let payload = DeviceSinkPayload {
+            session_id: 0,
+            sample_buffer: samples.as_ptr() as CpuAddr,
+            sample_count: samples.len() as u64,
+            input_count: 2,
+            inputs: [0, 1, 0, 0, 0, 0],
+            ..unsafe { std::mem::zeroed() }
+        };
+
+        payload.process(&stream, 2);
+
+        let stream = stream.lock();
+        assert_eq!(stream.queue.len(), 1);
+        assert_eq!(
+            stream.queue.front().unwrap().frames,
+            TARGET_SAMPLE_COUNT as u64
+        );
     }
 }

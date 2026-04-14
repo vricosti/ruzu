@@ -5,9 +5,9 @@
 //!
 //! Implements TEX and TEX_b (texture fetch with implicit/explicit LOD).
 
-use crate::ir::program::ShaderInfoExt;
 use super::{bit, field, TranslatorVisitor};
 use crate::frontend::maxwell_opcodes::MaxwellOpcode;
+use crate::ir::program::ShaderInfoExt;
 use crate::ir::types::TextureInstInfo;
 use crate::ir::value::Value;
 

@@ -145,11 +145,11 @@ impl KeplerMemory {
                 writer(addr, bytes);
             }
         };
-        let memory_manager = self.memory_manager.lock();
+        let memory_manager = Arc::clone(&self.memory_manager);
         let mut rasterizer = rasterizer_raw.map(|ptr| unsafe { &mut *ptr });
         let mut ctx = engine_upload::FlushContext {
             rasterizer: rasterizer.as_deref_mut(),
-            memory_manager: &*memory_manager,
+            memory_manager,
             write_cpu_mem: &mut write_cpu,
         };
         self.upload_state
@@ -166,11 +166,11 @@ impl KeplerMemory {
                 writer(addr, bytes);
             }
         };
-        let memory_manager = self.memory_manager.lock();
+        let memory_manager = Arc::clone(&self.memory_manager);
         let mut rasterizer = rasterizer_raw.map(|ptr| unsafe { &mut *ptr });
         let mut ctx = engine_upload::FlushContext {
             rasterizer: rasterizer.as_deref_mut(),
-            memory_manager: &*memory_manager,
+            memory_manager,
             write_cpu_mem: &mut write_cpu,
         };
         self.upload_state

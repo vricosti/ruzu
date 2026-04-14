@@ -55,7 +55,7 @@ pub const SHARED_FONT_MEM_SIZE: u64 = 0x1100000;
 const EMPTY_REGION: FontRegion = FontRegion { offset: 0, size: 0 };
 const MAX_ELEMENT_COUNT: usize = 6;
 
-const SHARED_FONTS: [(FontArchives, &[u8]); 6] = [
+const SHARED_FONTS: [(FontArchives, &[u8]); 7] = [
     (FontArchives::Standard, &font_standard::FONT_STANDARD),
     (
         FontArchives::ChineseSimple,
@@ -70,6 +70,10 @@ const SHARED_FONTS: [(FontArchives, &[u8]); 6] = [
         &font_chinese_traditional::FONT_CHINESE_TRADITIONAL,
     ),
     (FontArchives::Korean, &font_korean::FONT_KOREAN),
+    (
+        FontArchives::Extension,
+        &font_nintendo_extended::FONT_NINTENDO_EXTENDED,
+    ),
     (
         FontArchives::Extension,
         &font_nintendo_extended::FONT_NINTENDO_EXTENDED,
@@ -137,7 +141,7 @@ pub struct IPlatformServiceManager {
     service_name: &'static str,
     shared_font_bytes: Vec<u8>,
     shared_font_regions: Vec<FontRegion>,
-    shared_memory_handle: Mutex<Option<u32>>,
+    shared_memory: Mutex<Option<(u64, Arc<KSharedMemory>)>>,
     handlers: BTreeMap<u32, FunctionInfo>,
     handlers_tipc: BTreeMap<u32, FunctionInfo>,
 }
@@ -150,7 +154,7 @@ impl IPlatformServiceManager {
             service_name,
             shared_font_bytes,
             shared_font_regions,
-            shared_memory_handle: Mutex::new(None),
+            shared_memory: Mutex::new(None),
             handlers: build_handler_map(&[
                 (0, Some(Self::request_load), "RequestLoad"),
                 (1, Some(Self::get_load_state), "GetLoadState"),
@@ -191,7 +195,10 @@ impl IPlatformServiceManager {
             .unwrap_or(EMPTY_REGION)
     }
 
-    fn create_shared_memory_handle(&self, ctx: &HLERequestContext) -> Option<u32> {
+    fn create_shared_memory_object(
+        &self,
+        ctx: &HLERequestContext,
+    ) -> Option<(u64, Arc<KSharedMemory>)> {
         let thread = ctx.get_thread()?;
         let parent = thread.lock().unwrap().parent.as_ref()?.upgrade()?;
 
@@ -227,15 +234,7 @@ impl IPlatformServiceManager {
         }
 
         let object_id = kernel.create_new_object_id() as u64;
-        let shmem = Arc::new(shmem);
-
-        let handle = {
-            let mut process = parent.lock().unwrap();
-            process.register_shared_memory_object(object_id, shmem);
-            process.handle_table.add(object_id).ok()?
-        };
-
-        Some(handle)
+        Some((object_id, Arc::new(shmem)))
     }
 
     fn request_load(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
@@ -277,17 +276,22 @@ impl IPlatformServiceManager {
 
     fn get_shared_memory_native_handle(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         let service = Self::as_self(this);
+        let handle = (|| -> Option<u32> {
+            let thread = ctx.get_thread()?;
+            let parent = thread.lock().unwrap().parent.as_ref()?.upgrade()?;
 
-        if let Some(handle) = *service.shared_memory_handle.lock().unwrap() {
-            let mut rb = ResponseBuilder::new(ctx, 2, 1, 0);
-            rb.push_result(RESULT_SUCCESS);
-            rb.push_copy_objects(handle);
-            return;
-        }
+            let (object_id, shared_memory) = {
+                let mut cached = service.shared_memory.lock().unwrap();
+                if cached.is_none() {
+                    *cached = service.create_shared_memory_object(ctx);
+                }
+                cached.as_ref()?.clone()
+            };
 
-        let handle = service.create_shared_memory_handle(ctx);
-        let mut cached = service.shared_memory_handle.lock().unwrap();
-        *cached = handle;
+            let mut process = parent.lock().unwrap();
+            process.register_shared_memory_object(object_id, shared_memory);
+            process.handle_table.add(object_id).ok()
+        })();
 
         let mut rb = ResponseBuilder::new(ctx, 2, 1, 0);
         rb.push_result(RESULT_SUCCESS);
@@ -321,7 +325,7 @@ impl IPlatformServiceManager {
 
         let mut rb = ResponseBuilder::new(ctx, 4, 0, 0);
         rb.push_result(RESULT_SUCCESS);
-        rb.push_u32(1);
+        rb.push_bool(true);
         rb.push_u32(max_size as u32);
     }
 }
@@ -355,9 +359,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn shared_font_blob_builds_six_regions() {
+    fn shared_font_blob_builds_seven_regions() {
         let (_blob, regions) = build_shared_font_blob();
-        assert_eq!(regions.len(), MAX_ELEMENT_COUNT);
+        assert_eq!(regions.len(), SHARED_FONTS.len());
         assert!(regions.iter().all(|region| region.size > 0));
     }
 

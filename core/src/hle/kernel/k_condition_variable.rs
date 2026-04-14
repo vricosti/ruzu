@@ -11,6 +11,7 @@
 //! pattern does not map directly to Rust ownership.
 
 use std::collections::{BTreeMap, HashMap};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -28,6 +29,18 @@ use crate::hle::kernel::svc::svc_results::{
 use crate::hle::kernel::svc_common::Handle;
 use crate::hle::kernel::svc_common::{HANDLE_WAIT_MASK, INVALID_HANDLE};
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
+
+static TRACE_KCV_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+fn trace_kcv(args: std::fmt::Arguments<'_>) {
+    if std::env::var_os("RUZU_TRACE_KCV").is_none() {
+        return;
+    }
+    let idx = TRACE_KCV_COUNT.fetch_add(1, Ordering::Relaxed);
+    if idx < 256 {
+        log::info!("{}", args);
+    }
+}
 
 fn deadline_from_timeout_tick(timeout_tick: i64, current_tick: Option<i64>) -> Option<Instant> {
     if timeout_tick <= 0 {
@@ -464,7 +477,24 @@ impl KConditionVariable {
     ///
     /// The caller must already hold the process lock (passes `&mut KProcess`).
     /// Upstream wraps the body in `KScopedSchedulerLock sl(m_kernel)`.
-    pub fn signal(&mut self, process_guard: &mut KProcess, cv_key: u64, count: i32) -> ResultCode {
+    ///
+    /// Rust accepts the current thread's scheduler-lock owner pointer so this
+    /// file, not the SVC wrapper, owns the scheduler-lock scope like upstream.
+    pub fn signal(
+        &mut self,
+        process_guard: &mut KProcess,
+        scheduler_lock_ptr: u64,
+        cv_key: u64,
+        count: i32,
+    ) -> ResultCode {
+        let _scheduler_guard = if scheduler_lock_ptr == 0 {
+            None
+        } else {
+            Some(super::k_scheduler_lock::KScopedSchedulerLock::new(unsafe {
+                &*(scheduler_lock_ptr as *const super::k_scheduler_lock::KAbstractSchedulerLock)
+            }))
+        };
+
         let mut num_waiters = 0i32;
         log::trace!(
             "KConditionVariable::signal begin cv_key=0x{:X} count={} first_waiter={:?}",
@@ -506,6 +536,12 @@ impl KConditionVariable {
             // Signal the thread.
             // Matches upstream: this->SignalImpl(target_thread);
             self.signal_impl(process_guard, &waiting_thread);
+            trace_kcv(format_args!(
+                "KCV::signal cv_key=0x{:X} woke_tid={} remaining_first={:?}",
+                cv_key,
+                waiting_thread_id,
+                self.waiting_threads.nfind_key(cv_key).map(|k| k.thread_id)
+            ));
             log::trace!(
                 "KConditionVariable::signal woke waiter tid={} cv_key=0x{:X}",
                 waiting_thread_id,
@@ -763,6 +799,15 @@ impl KConditionVariable {
         Self::begin_wait_condition_variable(current_thread, wait_queue, addr, key, value, timeout);
         let thread_key = current_thread.lock().unwrap().condition_variable_tree_key();
         self.waiting_threads.insert(thread_key);
+        trace_kcv(format_args!(
+            "KCV::wait enqueue tid={} addr=0x{:X} key=0x{:X} tag=0x{:08X} timeout={} bucket_count={}",
+            current_thread_id,
+            addr,
+            key,
+            value,
+            timeout,
+            self.waiting_threads.bucket_count()
+        ));
         log::trace!(
             "KConditionVariable::wait_locked enqueued tid={} addr=0x{:X} key=0x{:X} tag=0x{:08X} timeout={}",
             current_thread_id,
@@ -1296,7 +1341,7 @@ mod tests {
             assert_eq!(process_guard.cond_var.waiting_thread_ids(), vec![2]);
         }
 
-        process.lock().unwrap().signal_condition_variable(key, 1);
+        process.lock().unwrap().signal_condition_variable(0, key, 1);
 
         let result = wait_handle.join().unwrap();
         assert_eq!(result, RESULT_SUCCESS.get_inner_value());
@@ -1390,7 +1435,7 @@ mod tests {
             process_for_signal
                 .lock()
                 .unwrap()
-                .signal_condition_variable(key, 1);
+                .signal_condition_variable(0, key, 1);
         });
 
         let result = KProcess::wait_condition_variable(&process, &owner, address, key, 0x1111, -1);
@@ -1416,7 +1461,7 @@ mod tests {
             process_for_signal
                 .lock()
                 .unwrap()
-                .signal_condition_variable(key, 1);
+                .signal_condition_variable(0, key, 1);
         });
 
         let result = KProcess::wait_condition_variable(&process, &owner, address, key, 0x2222, -1);

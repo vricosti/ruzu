@@ -173,6 +173,14 @@ impl KHardwareTimer {
     }
 
     pub fn register_absolute_task_by_id(&self, thread_id: u64, thread_ptr: usize, task_time: i64) {
+        if std::env::var_os("RUZU_TRACE_WAIT_SYNC").is_some() {
+            log::info!(
+                "KHardwareTimer::register_absolute_task_by_id tid={} task_time={} now_tick={}",
+                thread_id,
+                task_time,
+                self.get_tick()
+            );
+        }
         log::trace!(
             "KHardwareTimer::register_absolute_task_by_id tid={} task_time={} ptr=0x{:x}",
             thread_id,

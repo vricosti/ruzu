@@ -147,13 +147,6 @@ impl ILibraryAppletProxy {
     fn get_common_state_getter_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         let proxy =
             unsafe { &*(this as *const dyn ServiceFramework as *const ILibraryAppletProxy) };
-        {
-            let mut applet = proxy.applet.lock().unwrap();
-            let _ = applet.lifecycle_manager.ensure_system_event(ctx);
-            let _ = applet
-                .lifecycle_manager
-                .ensure_operation_mode_changed_system_event(ctx);
-        }
         Self::push_interface_response(
             ctx,
             Arc::new(super::common_state_getter::ICommonStateGetter::new(

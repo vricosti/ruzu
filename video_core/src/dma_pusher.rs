@@ -17,6 +17,13 @@ use common::settings;
 use parking_lot::Mutex;
 use ruzu_core::core::SystemRef;
 
+static DMA_FLOW_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
+static DMA_FLOW_DISPATCH_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
+
+fn should_trace_dma_flow() -> bool {
+    std::env::var_os("RUZU_TRACE_DMA_FLOW").is_some()
+}
+
 /// GPU virtual address type.
 pub type GPUVAddr = u64;
 
@@ -369,6 +376,19 @@ impl DmaPusher {
             return false;
         }
 
+        if should_trace_dma_flow() {
+            let trace_idx = DMA_FLOW_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
+            if trace_idx < 64 {
+                log::info!(
+                    "DmaPusher::step begin queue_len={} subindex={} method_count={} dma_get=0x{:X}",
+                    self.dma_pushbuffer.len(),
+                    self.dma_pushbuffer_subindex,
+                    self.dma_state.method_count,
+                    self.dma_state.dma_get
+                );
+            }
+        }
+
         let command_list = match self.dma_pushbuffer.front() {
             Some(cl) => cl,
             None => return false,
@@ -383,16 +403,40 @@ impl DmaPusher {
         if !command_list.prefetch_command_list.is_empty() {
             // Prefetched command list from nvdrv (synchronization etc.).
             let commands: Vec<CommandHeader> = command_list.prefetch_command_list.clone();
+            if should_trace_dma_flow() {
+                let trace_idx = DMA_FLOW_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
+                if trace_idx < 64 {
+                    log::info!(
+                        "DmaPusher::step prefetch count={} queue_len={}",
+                        commands.len(),
+                        self.dma_pushbuffer.len()
+                    );
+                }
+            }
             self.process_commands(&commands);
             self.dma_pushbuffer.pop_front();
         } else {
             let command_list_header = command_list.command_lists[self.dma_pushbuffer_subindex];
-            log::trace!(
-                "DmaPusher::step command_list addr=0x{:X} size={} non_main={}",
-                command_list_header.addr(),
-                command_list_header.size(),
-                command_list_header.is_non_main()
-            );
+            if should_trace_dma_flow() {
+                let trace_idx = DMA_FLOW_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
+                if trace_idx < 64 {
+                    log::info!(
+                        "DmaPusher::step command_list addr=0x{:X} size={} non_main={} queue_len={} subindex={}",
+                        command_list_header.addr(),
+                        command_list_header.size(),
+                        command_list_header.is_non_main(),
+                        self.dma_pushbuffer.len(),
+                        self.dma_pushbuffer_subindex
+                    );
+                }
+            } else {
+                log::trace!(
+                    "DmaPusher::step command_list addr=0x{:X} size={} non_main={}",
+                    command_list_header.addr(),
+                    command_list_header.size(),
+                    command_list_header.is_non_main()
+                );
+            }
             self.dma_pushbuffer_subindex += 1;
             self.dma_state.dma_get = command_list_header.addr();
 
@@ -420,12 +464,24 @@ impl DmaPusher {
                 }));
             let non_zero = self.command_headers.iter().filter(|h| h.raw != 0).count();
             if non_zero > 0 {
-                log::trace!(
-                    "DmaPusher::step {} commands ({} non-zero) first={:#010x}",
-                    self.command_headers.len(),
-                    non_zero,
-                    self.command_headers.first().map_or(0, |h| h.raw),
-                );
+                if should_trace_dma_flow() {
+                    let trace_idx = DMA_FLOW_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
+                    if trace_idx < 64 {
+                        log::info!(
+                            "DmaPusher::step fetched count={} non_zero={} first=0x{:08X}",
+                            self.command_headers.len(),
+                            non_zero,
+                            self.command_headers.first().map_or(0, |h| h.raw),
+                        );
+                    }
+                } else {
+                    log::trace!(
+                        "DmaPusher::step {} commands ({} non-zero) first={:#010x}",
+                        self.command_headers.len(),
+                        non_zero,
+                        self.command_headers.first().map_or(0, |h| h.raw),
+                    );
+                }
             }
             self.process_commands(&self.command_headers.clone());
         }
@@ -529,6 +585,22 @@ impl DmaPusher {
         let mut total_dispatches = 0u64;
         while index < commands.len() {
             total_dispatches += 1;
+            if should_trace_dma_flow() {
+                let trace_idx = DMA_FLOW_DISPATCH_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
+                if trace_idx < 96 {
+                    let command_header = commands[index];
+                    log::info!(
+                        "DmaPusher::process_commands index={} total={} raw=0x{:08X} method_count={} method=0x{:X} subch={} mode={:?}",
+                        index,
+                        total_dispatches,
+                        command_header.raw,
+                        self.dma_state.method_count,
+                        self.dma_state.method,
+                        self.dma_state.subchannel,
+                        command_header.mode()
+                    );
+                }
+            }
             if total_dispatches % 100_000 == 0 {
                 log::warn!(
                     "DmaPusher::process_commands heartbeat: {} dispatches, index={}/{}",

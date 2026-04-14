@@ -248,7 +248,10 @@ mod tests {
         // Generic3 component 0 → VaryingState bit at Generic0X + 3*4 = 44
         assert!(program.info.loads.generic_any(3));
         // PositionX → VaryingState bit at PositionX(28)
-        assert!(program.info.stores.any_component(Attribute::POSITION_X.0 as usize));
+        assert!(program
+            .info
+            .stores
+            .any_component(Attribute::POSITION_X.0 as usize));
     }
 
     // ── Full Optimization Pipeline ───────────────────────────────────

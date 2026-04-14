@@ -93,6 +93,11 @@ unsafe impl Send for NvMapDevice {}
 unsafe impl Sync for NvMapDevice {}
 
 impl NvMapDevice {
+    fn should_trace_alloc_loop() -> bool {
+        std::env::var_os("RUZU_TRACE_NVMAP_LOOP")
+            .is_some_and(|value| value != std::ffi::OsStr::new("0"))
+    }
+
     pub fn new(file: &nvmap_core::NvMap, container: &Container) -> Self {
         Self {
             file: file as *const _,
@@ -123,6 +128,14 @@ impl NvMapDevice {
             Ok(handle) => {
                 handle.set_orig_size(params.size as u64);
                 params.handle = handle.id;
+                if Self::should_trace_alloc_loop() {
+                    log::info!(
+                        "nvmap::IocCreate size=0x{:X} aligned=0x{:X} handle=0x{:X}",
+                        params.size,
+                        aligned_size,
+                        params.handle
+                    );
+                }
                 log::debug!("handle: {}, size: 0x{:X}", handle.id, params.size);
                 NvResult::Success
             }
@@ -135,6 +148,18 @@ impl NvMapDevice {
 
     pub fn ioc_alloc(&self, params: &mut IocAllocParams, fd: DeviceFD) -> NvResult {
         log::debug!("nvmap::IocAlloc called, addr={:X}", params.address);
+        if Self::should_trace_alloc_loop() {
+            log::info!(
+                "nvmap::IocAlloc begin fd={} handle=0x{:X} heap_mask=0x{:X} flags=0x{:X} align=0x{:X} kind=0x{:X} addr=0x{:X}",
+                fd,
+                params.handle,
+                params.heap_mask,
+                params.flags.raw,
+                params.align,
+                params.kind,
+                params.address
+            );
+        }
 
         if params.handle == 0 {
             log::error!("Handle is 0");
@@ -205,6 +230,17 @@ impl NvMapDevice {
                 )
         };
         debug_assert_eq!(lock_result, 0);
+        if Self::should_trace_alloc_loop() {
+            let inner = handle.lock_inner();
+            log::info!(
+                "nvmap::IocAlloc end fd={} handle=0x{:X} result={} alloc_addr=0x{:X} size=0x{:X}",
+                fd,
+                params.handle,
+                result as u32,
+                inner.address,
+                inner.size
+            );
+        }
 
         NvResult::Success
     }

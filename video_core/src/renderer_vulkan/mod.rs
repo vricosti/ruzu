@@ -775,11 +775,7 @@ impl RasterizerVulkan {
 }
 
 impl RasterizerInterface for RasterizerVulkan {
-    fn draw(
-        &mut self,
-        draw_state: &crate::engines::draw_manager::DrawState,
-        instance_count: u32,
-    ) {
+    fn draw(&mut self, draw_state: &crate::engines::draw_manager::DrawState, instance_count: u32) {
         debug!(
             "RasterizerVulkan::draw indexed={} instances={}",
             draw_state.draw_indexed, instance_count

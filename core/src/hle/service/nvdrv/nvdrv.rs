@@ -162,6 +162,17 @@ impl Module {
         let mut files = self.open_files.lock().unwrap();
         files.insert(fd, device);
 
+        if std::env::var_os("RUZU_NVDRV_TRACE")
+            .is_some_and(|value| value != std::ffi::OsStr::new("0"))
+        {
+            log::info!(
+                "Module::open device_name={} session_id={} -> fd={}",
+                device_name,
+                session_id.id,
+                fd
+            );
+        }
+
         fd
     }
 

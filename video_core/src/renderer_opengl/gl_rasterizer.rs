@@ -167,9 +167,7 @@ impl crate::buffer_cache::buffer_cache_base::EngineState for DrawStateEngineAdap
         crate::buffer_cache::buffer_cache_base::ConstBufferInfo::default()
     }
 
-    fn get_compute_launch_info(
-        &self,
-    ) -> crate::buffer_cache::buffer_cache_base::ComputeLaunchInfo {
+    fn get_compute_launch_info(&self) -> crate::buffer_cache::buffer_cache_base::ComputeLaunchInfo {
         crate::buffer_cache::buffer_cache_base::ComputeLaunchInfo {
             const_buffer_enable_mask: 0,
             const_buffer_config: Vec::new(),
@@ -252,12 +250,13 @@ pub struct RasterizerOpenGL {
     /// Per-channel GPU memory manager, extracted from `ChannelState` in
     /// `bind_channel`. Used to build the `GpuMemoryAccess` adapter for the
     /// buffer cache.
-    channel_memory_manager:
-        Option<Arc<parking_lot::Mutex<crate::memory_manager::MemoryManager>>>,
+    channel_memory_manager: Option<Arc<parking_lot::Mutex<crate::memory_manager::MemoryManager>>>,
     /// CPU/device memory reader callback, set via the shader cache's
     /// `set_gpu_memory_reader` path. Re-used for the buffer cache's
     /// `DeviceMemoryAccess` and for `GpuMemoryAccess::read_u32/u64`.
     cpu_memory_reader: Option<crate::shader_environment::GpuMemoryReader>,
+    /// Guest memory writer used for inline-to-memory acceleration writes.
+    guest_memory_writer: Option<Arc<dyn Fn(u64, &[u8]) + Send + Sync>>,
     /// Transient (placeholder) Vertex Array Object that we bind before
     /// every `glDraw*` call to satisfy the GL core-profile requirement that
     /// "a VAO must be bound for any draw command". Until the buffer cache
@@ -313,6 +312,7 @@ impl RasterizerOpenGL {
             invalidate_gpu_cache_callback: None,
             channel_memory_manager: None,
             cpu_memory_reader: None,
+            guest_memory_writer: None,
             transient_vao,
         }
     }
@@ -334,6 +334,7 @@ impl RasterizerOpenGL {
             invalidate_gpu_cache_callback: None,
             channel_memory_manager: None,
             cpu_memory_reader: None,
+            guest_memory_writer: None,
             transient_vao: 0,
         }
     }
@@ -352,12 +353,14 @@ impl RasterizerOpenGL {
     /// slice. With the reader installed, `current_graphics_pipeline` will
     /// invoke `shader_recompiler::compile_shader_glsl` for each enabled
     /// stage on first lookup, instead of returning a placeholder pipeline.
-    pub fn set_gpu_memory_reader(
-        &mut self,
-        reader: crate::shader_environment::GpuMemoryReader,
-    ) {
+    pub fn set_gpu_memory_reader(&mut self, reader: crate::shader_environment::GpuMemoryReader) {
         self.cpu_memory_reader = Some(Arc::clone(&reader));
         self.gl_shader_cache.set_gpu_memory_reader(reader);
+    }
+
+    /// Install the guest memory writer used by inline-to-memory acceleration.
+    pub fn set_guest_memory_writer(&mut self, writer: Arc<dyn Fn(u64, &[u8]) + Send + Sync>) {
+        self.guest_memory_writer = Some(writer);
     }
 
     /// Process draw calls and produce a framebuffer.
@@ -444,9 +447,7 @@ impl RasterizerInterface for RasterizerOpenGL {
         // separable per-stage programs here. Failures are logged once and
         // leave the pipeline in its placeholder state so we don't retry
         // every frame.
-        if !pipeline.has_gl_programs()
-            && pipeline.glsl_sources.iter().any(|s| s.is_some())
-        {
+        if !pipeline.has_gl_programs() && pipeline.glsl_sources.iter().any(|s| s.is_some()) {
             if let Err((stage_index, msg)) = pipeline.build_from_sources() {
                 log::warn!(
                     "RasterizerOpenGL::draw: pipeline build failed at stage {}: {}",
@@ -462,9 +463,10 @@ impl RasterizerInterface for RasterizerOpenGL {
 
         // Install the engine-state adapter so buffer cache update calls can
         // read the current draw's index/vertex buffer state from DrawState.
-        self.buffer_cache.set_engine_state(Box::new(DrawStateEngineAdapter {
-            draw_state: draw_state.clone(),
-        }));
+        self.buffer_cache
+            .set_engine_state(Box::new(DrawStateEngineAdapter {
+                draw_state: draw_state.clone(),
+            }));
         // Buffer cache: refresh and bind host vertex/index buffers.
         // Mirrors upstream `RasterizerOpenGL::PrepareDraw`.
         self.buffer_cache.update_graphics_buffers(is_indexed);
@@ -605,15 +607,38 @@ impl RasterizerInterface for RasterizerOpenGL {
     }
 
     fn signal_sync_point(&mut self, id: u32) {
+        if std::env::var_os("RUZU_TRACE_SYNCPOINT").is_some() {
+            log::info!(
+                "GLRasterizer::signal_sync_point id={} queued_commands={}",
+                id,
+                self.num_queued_commands
+            );
+        }
         let should_flush = self.num_queued_commands != 0;
         let syncpoints = Arc::clone(&self.syncpoints);
         let should_flush_now = self.fence_manager.signal_sync_point(
             id,
             {
                 let syncpoints = Arc::clone(&syncpoints);
-                move |value| syncpoints.increment_guest(value)
+                move |value| {
+                    if std::env::var_os("RUZU_TRACE_SYNCPOINT").is_some() {
+                        log::info!(
+                            "GLRasterizer::signal_sync_point increment_guest id={}",
+                            value
+                        );
+                    }
+                    syncpoints.increment_guest(value)
+                }
             },
-            move |value| syncpoints.increment_host(value),
+            move |value| {
+                if std::env::var_os("RUZU_TRACE_SYNCPOINT").is_some() {
+                    log::info!(
+                        "GLRasterizer::signal_sync_point increment_host id={}",
+                        value
+                    );
+                }
+                syncpoints.increment_host(value)
+            },
             |is_stubbed| self.fence_backend.create_fence(is_stubbed),
             |fence| self.fence_backend.queue_fence(fence),
             || false,
@@ -622,6 +647,13 @@ impl RasterizerInterface for RasterizerOpenGL {
             move || should_flush,
             || {},
         );
+        if std::env::var_os("RUZU_TRACE_SYNCPOINT").is_some() {
+            log::info!(
+                "GLRasterizer::signal_sync_point id={} should_flush_now={}",
+                id,
+                should_flush_now
+            );
+        }
         if should_flush_now {
             self.flush_commands();
         }
@@ -775,22 +807,83 @@ impl RasterizerInterface for RasterizerOpenGL {
         false
     }
 
-    fn accelerate_inline_to_memory(&mut self, _address: u64, _copy_size: usize, _memory: &[u8]) {}
+    fn accelerate_inline_to_memory(&mut self, address: u64, copy_size: usize, memory: &[u8]) {
+        if std::env::var_os("RUZU_TRACE_INLINE_TO_MEMORY").is_some() {
+            log::info!(
+                "RasterizerOpenGL::accelerate_inline_to_memory enter gpu=0x{:X} size={} has_mm={}",
+                address,
+                copy_size,
+                self.channel_memory_manager.is_some()
+            );
+        }
+        let Some(mm) = self.channel_memory_manager.as_ref().cloned() else {
+            if std::env::var_os("RUZU_TRACE_INLINE_TO_MEMORY").is_some() {
+                log::info!(
+                    "RasterizerOpenGL::accelerate_inline_to_memory missing_channel_memory_manager gpu=0x{:X} size={}",
+                    address,
+                    copy_size
+                );
+            }
+            return;
+        };
+        let mut write_cpu = {
+            let writer = self.guest_memory_writer.as_ref().cloned();
+            move |cpu_addr: u64, data: &[u8]| {
+                if let Some(writer) = writer.as_ref() {
+                    writer(cpu_addr, data);
+                }
+            }
+        };
+        let mm = mm.lock();
+        let cpu_addr = mm.gpu_to_cpu_address(address);
+        if std::env::var_os("RUZU_TRACE_INLINE_TO_MEMORY").is_some() {
+            log::info!(
+                "RasterizerOpenGL::accelerate_inline_to_memory gpu=0x{:X} cpu={:?} size={} first=0x{:02X}",
+                address,
+                cpu_addr,
+                copy_size,
+                memory.first().copied().unwrap_or(0)
+            );
+        }
+        if cpu_addr.is_none() {
+            mm.write_block(address, &memory[..copy_size], &mut write_cpu);
+            if std::env::var_os("RUZU_TRACE_INLINE_TO_MEMORY").is_some() {
+                log::info!(
+                    "RasterizerOpenGL::accelerate_inline_to_memory fallback_write_block gpu=0x{:X} size={}",
+                    address,
+                    copy_size
+                );
+            }
+            return;
+        }
+        mm.write_block_unsafe(address, &memory[..copy_size], &mut write_cpu);
+        let cpu_addr = cpu_addr.unwrap();
+        if !self
+            .buffer_cache
+            .inline_memory(cpu_addr, copy_size, &memory[..copy_size])
+        {
+            self.buffer_cache.write_memory(cpu_addr, copy_size as u64);
+        }
+        self.texture_cache.write_memory(cpu_addr, copy_size);
+        self.shader_cache.invalidate_region(cpu_addr, copy_size);
+        self.query_cache.invalidate_region(cpu_addr, copy_size);
+        if std::env::var_os("RUZU_TRACE_INLINE_TO_MEMORY").is_some() {
+            log::info!(
+                "RasterizerOpenGL::accelerate_inline_to_memory complete cpu=0x{:X} size={}",
+                cpu_addr,
+                copy_size
+            );
+        }
+    }
 
-    fn initialize_channel(
-        &mut self,
-        _channel: &crate::control::channel_state::ChannelState,
-    ) {
+    fn initialize_channel(&mut self, _channel: &crate::control::channel_state::ChannelState) {
         // Upstream `RasterizerOpenGL` inherits from `ChannelSetupCaches`
         // which allocates per-channel state for the buffer/texture/shader
         // caches. The Rust port initialises the buffer cache's channel
         // state lazily on first `bind_channel` instead.
     }
 
-    fn bind_channel(
-        &mut self,
-        channel: &crate::control::channel_state::ChannelState,
-    ) {
+    fn bind_channel(&mut self, channel: &crate::control::channel_state::ChannelState) {
         if self.buffer_cache.channel_state.is_none() {
             self.buffer_cache.channel_state = Some(Box::default());
         }
@@ -803,13 +896,15 @@ impl RasterizerInterface for RasterizerOpenGL {
             // called before bind_channel), install GPU + device memory
             // access on the buffer cache now.
             if let Some(ref cpu_reader) = self.cpu_memory_reader {
-                self.buffer_cache.set_gpu_memory(Box::new(GpuMemoryAccessAdapter {
-                    mm: Arc::clone(mm),
-                    cpu_reader: Arc::clone(cpu_reader),
-                }));
-                self.buffer_cache.set_device_memory(Box::new(DeviceMemoryAccessAdapter {
-                    cpu_reader: Arc::clone(cpu_reader),
-                }));
+                self.buffer_cache
+                    .set_gpu_memory(Box::new(GpuMemoryAccessAdapter {
+                        mm: Arc::clone(mm),
+                        cpu_reader: Arc::clone(cpu_reader),
+                    }));
+                self.buffer_cache
+                    .set_device_memory(Box::new(DeviceMemoryAccessAdapter {
+                        cpu_reader: Arc::clone(cpu_reader),
+                    }));
             }
         }
     }

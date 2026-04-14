@@ -52,6 +52,10 @@ fn deadline_from_timeout_tick(timeout_tick: i64, current_tick: Option<i64>) -> O
     )
 }
 
+fn should_trace_wait_debug() -> bool {
+    std::env::var_os("RUZU_TRACE_WAIT_SYNC").is_some()
+}
+
 // ---------------------------------------------------------------------------
 // Enums matching upstream k_thread.h
 // ---------------------------------------------------------------------------
@@ -1434,8 +1438,17 @@ impl KThread {
         self.set_wait_reason_for_debugging(ThreadWaitReasonForDebugging::Synchronization);
 
         if timeout > 0 {
-            self.sleep_deadline =
-                deadline_from_timeout_tick(timeout, super::kernel::get_current_hardware_tick());
+            let current_tick = super::kernel::get_current_hardware_tick();
+            self.sleep_deadline = deadline_from_timeout_tick(timeout, current_tick);
+            if should_trace_wait_debug() {
+                log::info!(
+                    "KThread::begin_wait_synchronization tid={} timeout_tick={} current_tick={:?} deadline={:?}",
+                    self.thread_id,
+                    timeout,
+                    current_tick,
+                    self.sleep_deadline
+                );
+            }
         } else {
             self.sleep_deadline = None;
         }
@@ -3000,6 +3013,15 @@ impl KThread {
             );
             self.begin_wait_with_queue(wait_queue.base);
             self.set_wait_reason_for_debugging(ThreadWaitReasonForDebugging::Sleep);
+            if should_trace_wait_debug() {
+                log::info!(
+                    "KThread::sleep tid={} timeout_tick={} current_tick={:?} deadline={:?}",
+                    self.thread_id,
+                    timeout,
+                    current_tick,
+                    self.sleep_deadline
+                );
+            }
             log::trace!("KThread::sleep tid={} wait armed", self.thread_id);
         }
 
@@ -3180,6 +3202,17 @@ impl KThread {
 
     /// OnTimer callback.
     pub fn on_timer(&mut self) {
+        if should_trace_wait_debug() {
+            log::info!(
+                "KThread::on_timer tid={} state={:?} wait_queue={} wait_reason={:?} sleep_deadline={:?} wait_result=0x{:x}",
+                self.thread_id,
+                self.get_state(),
+                self.wait_queue.is_some(),
+                self.get_wait_reason_for_debugging(),
+                self.sleep_deadline,
+                self.wait_result
+            );
+        }
         log::trace!(
             "KThread::on_timer tid={} state={:?} active_core={} current_core={} wait_queue={}",
             self.thread_id,
