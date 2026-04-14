@@ -443,6 +443,10 @@ impl HostMemory {
         self.backing_base
     }
 
+    pub fn backing_size(&self) -> usize {
+        self.backing_size
+    }
+
     pub fn virtual_base_pointer(&self) -> *mut u8 {
         self.virtual_base
     }

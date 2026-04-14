@@ -625,11 +625,22 @@ impl Memory {
 
     /// Zero a block of guest memory.
     /// Matches upstream `Memory::ZeroBlock` (via WalkBlock pattern).
+    ///
+    /// For pages backed by HostMemory, batches contiguous physical runs and
+    /// calls `HostMemory::clear_backing_region`, which uses `madvise(MADV_REMOVE)`
+    /// on Linux — a single syscall reclaims the backing pages lazily instead of
+    /// memset'ing every byte. This matches upstream's
+    /// `DeviceMemory().buffer.ClearBackingRegion` path and avoids the O(size)
+    /// memset that was ~26% of ruzu's CPU during MK8D boot.
     pub fn zero_block(&self, dest_addr: u64, size: usize) -> bool {
         if !self.address_space_contains(dest_addr, size) {
             log::error!("Unmapped ZeroBlock @ {:#018x} size={:#x}", dest_addr, size);
             return false;
         }
+
+        let buffer = unsafe { &*self.buffer };
+        let backing_base = buffer.backing_base_pointer() as usize;
+        let backing_size = buffer.backing_size();
 
         let mut remaining = size;
         let mut vaddr = dest_addr;
@@ -637,21 +648,48 @@ impl Memory {
 
         while remaining > 0 {
             let page_offset = (vaddr & PAGE_MASK) as usize;
-            let copy_amount = ((PAGE_SIZE as usize) - page_offset).min(remaining);
+            let first_chunk = ((PAGE_SIZE as usize) - page_offset).min(remaining);
 
-            let ptr = self.get_pointer_impl(vaddr);
-            if ptr.is_null() {
+            let first_ptr = self.get_pointer_impl(vaddr);
+            if first_ptr.is_null() {
                 log::error!("Unmapped ZeroBlock @ {:#018x}", vaddr);
                 user_accessible = false;
+                vaddr += first_chunk as u64;
+                remaining -= first_chunk;
+                continue;
+            }
+
+            // Extend the run as long as following pages are contiguous in host
+            // memory (ptr advances exactly by the chunk size each step).
+            let mut run = first_chunk;
+            let mut cur_vaddr = vaddr + first_chunk as u64;
+            let mut expected_ptr = first_ptr as usize + first_chunk;
+            while run < remaining {
+                let chunk = (PAGE_SIZE as usize).min(remaining - run);
+                let p = self.get_pointer_impl(cur_vaddr);
+                if p.is_null() || (p as usize) != expected_ptr {
+                    break;
+                }
+                run += chunk;
+                cur_vaddr += chunk as u64;
+                expected_ptr += chunk;
+            }
+
+            self.handle_rasterizer_write(vaddr, run);
+
+            let phys_off = (first_ptr as usize).wrapping_sub(backing_base);
+            if phys_off < backing_size && phys_off + run <= backing_size {
+                buffer.clear_backing_region(phys_off, run, 0);
             } else {
-                self.handle_rasterizer_write(vaddr, copy_amount);
+                // Not in the HostMemory backing buffer (debug/rasterizer paths):
+                // fall back to memset.
                 unsafe {
-                    std::ptr::write_bytes(ptr, 0, copy_amount);
+                    std::ptr::write_bytes(first_ptr, 0, run);
                 }
             }
 
-            vaddr += copy_amount as u64;
-            remaining -= copy_amount;
+            vaddr += run as u64;
+            remaining -= run;
         }
         user_accessible
     }

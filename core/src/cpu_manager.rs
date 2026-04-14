@@ -419,6 +419,49 @@ impl CpuManager {
             }
         }
 
+        // Cache the owner process and per-core JIT pointers once, outside the
+        // inner loop. Upstream reads these via raw pointers (no locking);
+        // previously ruzu locked the process Mutex every inner-loop iteration,
+        // serializing all 4 CPU cores on a single Mutex and collapsing guest
+        // emulation onto one host thread.
+        //
+        // Safety: the Arc<Mutex<KProcess>> keeps the process alive as long as
+        // this guest thread exists. `arm_interfaces` entries are populated once
+        // during process init and never change afterwards, so holding raw
+        // pointers into them is sound for the thread's lifetime.
+        let (parent_arc, is_64bit, cached_jits): (
+            _,
+            bool,
+            [Option<*mut Box<dyn crate::arm::arm_interface::ArmInterface>>;
+                hardware_properties::NUM_CPU_CORES as usize],
+        ) = {
+            let parent_weak = {
+                let thread = thread_arc.lock().unwrap();
+                match thread.parent.as_ref() {
+                    Some(p) => p.clone(),
+                    None => return,
+                }
+            };
+            let parent_arc = match parent_weak.upgrade() {
+                Some(p) => p,
+                None => return,
+            };
+            let mut process = parent_arc.lock().unwrap();
+            let is_64bit = process.is_64bit();
+            let mut jits: [Option<*mut Box<dyn crate::arm::arm_interface::ArmInterface>>;
+                hardware_properties::NUM_CPU_CORES as usize] =
+                [const { None }; hardware_properties::NUM_CPU_CORES as usize];
+            for i in 0..hardware_properties::NUM_CPU_CORES as usize {
+                if let Some(jit) = process.get_arm_interface_mut(i) {
+                    jits[i] = Some(jit as *mut _
+                        as *mut Box<dyn crate::arm::arm_interface::ArmInterface>);
+                }
+            }
+            drop(process);
+            (parent_arc, is_64bit, jits)
+        };
+        let _parent_arc_keepalive = parent_arc;
+
         loop {
             Self::shutdown_if_requested(kernel);
             let mut physical_core = kernel.current_physical_core();
@@ -428,7 +471,13 @@ impl CpuManager {
                 Self::handle_interrupt(kernel);
             }
             while !physical_core.is_interrupted() {
-                Self::run_guest_thread_once(kernel, physical_core, &thread_arc);
+                Self::run_guest_thread_once(
+                    kernel,
+                    physical_core,
+                    &thread_arc,
+                    is_64bit,
+                    &cached_jits,
+                );
                 // Upstream: physical_core = &kernel.CurrentPhysicalCore();
                 physical_core = kernel.current_physical_core();
             }
@@ -446,44 +495,28 @@ impl CpuManager {
     /// Upstream: `PhysicalCore::RunThread(KThread*)` (physical_core.cpp:22-146).
     /// Gets the ARM interface from thread->GetOwnerProcess()->GetArmInterface(core_index),
     /// then runs the JIT until an interrupt, SVC, or halt.
+    ///
+    /// `cached_jits` is populated once by the caller (multi_core_run_guest_thread)
+    /// to avoid locking the process Mutex on every inner-loop iteration, which
+    /// was serializing all 4 guest cores onto one host thread.
     fn run_guest_thread_once(
         kernel: &KernelCore,
         physical_core: &super::hle::kernel::physical_core::PhysicalCore,
         thread_arc: &Arc<Mutex<super::hle::kernel::k_thread::KThread>>,
+        is_64bit: bool,
+        cached_jits: &[Option<*mut Box<dyn crate::arm::arm_interface::ArmInterface>>;
+             hardware_properties::NUM_CPU_CORES as usize],
     ) {
         use crate::arm::arm_interface::KThread as OpaqueKThread;
-        let thread = thread_arc.lock().unwrap();
-        // Get the owner process to access the ARM JIT interface.
-        let parent_weak = match thread.parent.as_ref() {
-            Some(p) => p.clone(),
-            None => {
-                drop(thread);
-                physical_core.idle();
-                return;
-            }
-        };
-        drop(thread);
-
-        let parent_arc = match parent_weak.upgrade() {
-            Some(p) => p,
-            None => return,
-        };
 
         let core_index = physical_core.core_index();
-
-        // Get the ARM interface from the process for this core.
-        // Upstream: auto* interface = process->GetArmInterface(m_core_index);
-        let mut process = parent_arc.lock().unwrap();
-        let is_64bit = process.is_64bit();
-        let jit = match process.get_arm_interface_mut(core_index) {
-            Some(j) => j as *mut _ as *mut Box<dyn crate::arm::arm_interface::ArmInterface>,
+        let jit = match cached_jits.get(core_index).copied().flatten() {
+            Some(j) => j,
             None => {
-                drop(process);
                 physical_core.idle();
                 return;
             }
         };
-        drop(process);
         let scheduler = match kernel.current_scheduler() {
             Some(scheduler) => scheduler.clone(),
             None => return,
@@ -852,7 +885,42 @@ impl CpuManager {
                     Some(thread) => thread,
                     None => return,
                 };
-                Self::run_guest_thread_once(kernel, physical_core, &thread_arc);
+                // Single-core path: one host thread, no contention. Fetch the
+                // JIT per-iteration (matches upstream's RunThread) — the
+                // multi-core caching optimization above is unnecessary here.
+                let (is_64bit, cached_jits) = {
+                    let parent_weak = {
+                        let thread = thread_arc.lock().unwrap();
+                        match thread.parent.as_ref() {
+                            Some(p) => p.clone(),
+                            None => return,
+                        }
+                    };
+                    let parent_arc = match parent_weak.upgrade() {
+                        Some(p) => p,
+                        None => return,
+                    };
+                    let mut process = parent_arc.lock().unwrap();
+                    let is_64bit = process.is_64bit();
+                    let mut jits: [Option<
+                        *mut Box<dyn crate::arm::arm_interface::ArmInterface>,
+                    >; hardware_properties::NUM_CPU_CORES as usize] =
+                        [const { None }; hardware_properties::NUM_CPU_CORES as usize];
+                    for i in 0..hardware_properties::NUM_CPU_CORES as usize {
+                        if let Some(jit) = process.get_arm_interface_mut(i) {
+                            jits[i] = Some(jit as *mut _
+                                as *mut Box<dyn crate::arm::arm_interface::ArmInterface>);
+                        }
+                    }
+                    (is_64bit, jits)
+                };
+                Self::run_guest_thread_once(
+                    kernel,
+                    physical_core,
+                    &thread_arc,
+                    is_64bit,
+                    &cached_jits,
+                );
             }
 
             // Upstream: kernel.SetIsPhantomModeForSingleCore(true);
