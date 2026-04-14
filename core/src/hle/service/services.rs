@@ -540,20 +540,27 @@ impl Services {
         let mut server_manager = ServerManager::new(system);
         // psc:c, psc:m as stubs
         register_stub_services(&mut server_manager, &["psc:c", "psc:m"]);
-        // time:m — real PSC::Time::ServiceManager
-        server_manager.register_named_service(
-            "time:m",
+        // time:m — real PSC::Time::ServiceManager.
+        // NOTE: the factory MUST return the same instance on every call; each session
+        // shares the underlying TimeManager so that setup calls from Glue are visible
+        // to later IPC clients (e.g. time:u SystemClock reading the user clock's
+        // initialized flag). Matches upstream, which registers one TimeServiceManager
+        // and hands out references to it.
+        let time_sm: Arc<dyn crate::hle::service::hle_ipc::SessionRequestHandler> =
+            Arc::new(super::psc::time::service_manager::TimeServiceManager::new(
+                system,
+                dm_addr as *const _,
+                mm_addr as *mut _,
+            ));
+        let time_sm_factory = {
+            let shared = Arc::clone(&time_sm);
             Box::new(
                 move || -> Arc<dyn crate::hle::service::hle_ipc::SessionRequestHandler> {
-                    Arc::new(super::psc::time::service_manager::TimeServiceManager::new(
-                        system,
-                        dm_addr as *const _,
-                        mm_addr as *mut _,
-                    ))
+                    Arc::clone(&shared)
                 },
-            ),
-            64,
-        );
+            )
+        };
+        server_manager.register_named_service("time:m", time_sm_factory, 64);
         // time:su, time:al as stubs for now
         register_stub_services(&mut server_manager, &["time:su", "time:al"]);
         ServerManager::run_server(server_manager);

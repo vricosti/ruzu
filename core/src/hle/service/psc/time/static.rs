@@ -24,7 +24,7 @@ use super::errors::{
 };
 use super::manager::TimeManager;
 use super::steady_clock::SteadyClock;
-use super::system_clock::SystemClock;
+use super::system_clock::{SystemClock, SystemClockKind, TimeManagerBackend};
 use super::time_zone::TimeZone;
 use super::time_zone_service::TimeZoneService;
 
@@ -196,27 +196,11 @@ impl StaticService {
     pub fn get_standard_user_system_clock(&self) -> SystemClock {
         log::debug!("PSC::Time::StaticService::GetStandardUserSystemClock called");
         if let Some(shared_time) = &self.shared_time {
-            let mut time = shared_time.lock().unwrap();
-            let local = std::ptr::addr_of_mut!(time.standard_local_system_clock);
-            let network = std::ptr::addr_of!(time.standard_network_system_clock);
-            if let Ok(context) = unsafe {
-                time.standard_user_system_clock
-                    .get_context(&mut *local, &*network)
-            } {
-                let initialized = time.standard_local_system_clock.clock.is_initialized();
-                let current_time = time
-                    .standard_local_system_clock
-                    .clock
-                    .get_current_time()
-                    .unwrap_or(0);
-                return SystemClock::with_state(
-                    self.setup_info.can_write_user_clock,
-                    self.setup_info.can_write_uninitialized_clock,
-                    initialized,
-                    context,
-                    current_time,
-                );
-            }
+            return SystemClock::with_backend(
+                self.setup_info.can_write_user_clock,
+                self.setup_info.can_write_uninitialized_clock,
+                Arc::new(TimeManagerBackend::new(Arc::clone(shared_time), SystemClockKind::User)),
+            );
         }
         SystemClock::new(
             self.setup_info.can_write_user_clock,
@@ -231,23 +215,13 @@ impl StaticService {
     pub fn get_standard_network_system_clock(&self) -> SystemClock {
         log::debug!("PSC::Time::StaticService::GetStandardNetworkSystemClock called");
         if let Some(shared_time) = &self.shared_time {
-            let time = shared_time.lock().unwrap();
-            let context = time
-                .standard_network_system_clock
-                .clock
-                .get_context()
-                .unwrap_or_default();
-            let current_time = time
-                .standard_network_system_clock
-                .clock
-                .get_current_time()
-                .unwrap_or(0);
-            return SystemClock::with_state(
+            return SystemClock::with_backend(
                 self.setup_info.can_write_network_clock,
                 self.setup_info.can_write_uninitialized_clock,
-                time.standard_network_system_clock.clock.is_initialized(),
-                context,
-                current_time,
+                Arc::new(TimeManagerBackend::new(
+                    Arc::clone(shared_time),
+                    SystemClockKind::Network,
+                )),
             );
         }
         SystemClock::new(
@@ -310,23 +284,13 @@ impl StaticService {
     pub fn get_standard_local_system_clock(&self) -> SystemClock {
         log::debug!("PSC::Time::StaticService::GetStandardLocalSystemClock called");
         if let Some(shared_time) = &self.shared_time {
-            let time = shared_time.lock().unwrap();
-            let context = time
-                .standard_local_system_clock
-                .clock
-                .get_context()
-                .unwrap_or_default();
-            let current_time = time
-                .standard_local_system_clock
-                .clock
-                .get_current_time()
-                .unwrap_or(0);
-            return SystemClock::with_state(
+            return SystemClock::with_backend(
                 self.setup_info.can_write_local_clock,
                 self.setup_info.can_write_uninitialized_clock,
-                time.standard_local_system_clock.clock.is_initialized(),
-                context,
-                current_time,
+                Arc::new(TimeManagerBackend::new(
+                    Arc::clone(shared_time),
+                    SystemClockKind::Local,
+                )),
             );
         }
         SystemClock::new(
@@ -342,23 +306,13 @@ impl StaticService {
     pub fn get_ephemeral_network_system_clock(&self) -> SystemClock {
         log::debug!("PSC::Time::StaticService::GetEphemeralNetworkSystemClock called");
         if let Some(shared_time) = &self.shared_time {
-            let time = shared_time.lock().unwrap();
-            let context = time
-                .ephemeral_network_clock
-                .clock
-                .get_context()
-                .unwrap_or_default();
-            let current_time = time
-                .ephemeral_network_clock
-                .clock
-                .get_current_time()
-                .unwrap_or(0);
-            return SystemClock::with_state(
+            return SystemClock::with_backend(
                 self.setup_info.can_write_network_clock,
                 self.setup_info.can_write_uninitialized_clock,
-                time.ephemeral_network_clock.clock.is_initialized(),
-                context,
-                current_time,
+                Arc::new(TimeManagerBackend::new(
+                    Arc::clone(shared_time),
+                    SystemClockKind::EphemeralNetwork,
+                )),
             );
         }
         SystemClock::new(
