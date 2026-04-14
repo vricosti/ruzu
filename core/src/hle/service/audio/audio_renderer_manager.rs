@@ -85,6 +85,28 @@ impl IAudioRendererManager {
         log::info!("IAudioRendererManager::OpenAudioRenderer");
         let mut rp = RequestParser::new(ctx);
         let params: AudioRendererParameterBlob = rp.pop_raw();
+        let revision = u32::from_le_bytes([
+            params.bytes[0x30],
+            params.bytes[0x31],
+            params.bytes[0x32],
+            params.bytes[0x33],
+        ]);
+        log::info!(
+            "IAudioRendererManager::OpenAudioRenderer params revision=0x{:08X} sample_rate={} sample_count={} mixes={} sub_mixes={} voices={} sinks={} effects={} perf_frames={} exec_mode={} splitter_infos={} splitter_destinations={} external_context_size=0x{:X}",
+            revision,
+            u32::from_le_bytes([params.bytes[0x00], params.bytes[0x01], params.bytes[0x02], params.bytes[0x03]]),
+            u32::from_le_bytes([params.bytes[0x04], params.bytes[0x05], params.bytes[0x06], params.bytes[0x07]]),
+            u32::from_le_bytes([params.bytes[0x08], params.bytes[0x09], params.bytes[0x0A], params.bytes[0x0B]]),
+            u32::from_le_bytes([params.bytes[0x0C], params.bytes[0x0D], params.bytes[0x0E], params.bytes[0x0F]]),
+            u32::from_le_bytes([params.bytes[0x10], params.bytes[0x11], params.bytes[0x12], params.bytes[0x13]]),
+            u32::from_le_bytes([params.bytes[0x14], params.bytes[0x15], params.bytes[0x16], params.bytes[0x17]]),
+            u32::from_le_bytes([params.bytes[0x18], params.bytes[0x19], params.bytes[0x1A], params.bytes[0x1B]]),
+            u32::from_le_bytes([params.bytes[0x1C], params.bytes[0x1D], params.bytes[0x1E], params.bytes[0x1F]]),
+            params.bytes[0x23],
+            u32::from_le_bytes([params.bytes[0x24], params.bytes[0x25], params.bytes[0x26], params.bytes[0x27]]),
+            i32::from_le_bytes([params.bytes[0x28], params.bytes[0x29], params.bytes[0x2A], params.bytes[0x2B]]),
+            u32::from_le_bytes([params.bytes[0x2C], params.bytes[0x2D], params.bytes[0x2E], params.bytes[0x2F]])
+        );
         rp.align_for::<u64>();
         let transfer_memory_size = rp.pop_u64();
         let applet_resource_user_id = rp.pop_u64();
@@ -244,13 +266,18 @@ impl IAudioRendererManager {
     /// Port of upstream `IAudioRendererManager::GetAudioDeviceService`.
     /// Upstream creates `IAudioDevice(system, aruid, REV1_magic, num_audio_devices++)`.
     fn get_audio_device_service_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
-        log::debug!("IAudioRendererManager::GetAudioDeviceService");
+        log::info!("IAudioRendererManager::GetAudioDeviceService");
         let svc = unsafe { &*(this as *const dyn ServiceFramework as *const Self) };
         let mut rp = RequestParser::new(ctx);
         let applet_resource_user_id = rp.pop_u64();
         let device_num = svc
             .num_audio_devices
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        log::info!(
+            "IAudioRendererManager::GetAudioDeviceService aruid={} revision=0x52455631 device_num={}",
+            applet_resource_user_id,
+            device_num
+        );
         let device = Arc::new(super::audio_device::IAudioDevice::new(
             svc.system,
             applet_resource_user_id,
@@ -268,7 +295,7 @@ impl IAudioRendererManager {
         this: &dyn ServiceFramework,
         ctx: &mut HLERequestContext,
     ) {
-        log::debug!("IAudioRendererManager::GetAudioDeviceServiceWithRevisionInfo");
+        log::info!("IAudioRendererManager::GetAudioDeviceServiceWithRevisionInfo");
         let svc = unsafe { &*(this as *const dyn ServiceFramework as *const Self) };
         let mut rp = RequestParser::new(ctx);
         let revision = rp.pop_u32();
@@ -277,6 +304,12 @@ impl IAudioRendererManager {
         let device_num = svc
             .num_audio_devices
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        log::info!(
+            "IAudioRendererManager::GetAudioDeviceServiceWithRevisionInfo aruid={} revision=0x{:08X} device_num={}",
+            applet_resource_user_id,
+            revision,
+            device_num
+        );
         let device = Arc::new(super::audio_device::IAudioDevice::new(
             svc.system,
             applet_resource_user_id,

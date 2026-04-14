@@ -172,9 +172,7 @@ impl KReadableEvent {
                     unlink_thread_ids.push(waiter_thread_id);
                     woke_thread_ids.push(waiter_thread_id);
                     woke_any = true;
-                } else if waiter_thread_guard.get_state()
-                    != super::k_thread::ThreadState::WAITING
-                {
+                } else if waiter_thread_guard.get_state() != super::k_thread::ThreadState::WAITING {
                     unlink_thread_ids.push(waiter_thread_id);
                 }
                 break;

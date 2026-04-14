@@ -4,7 +4,14 @@ use crate::sink::sink_stream::{SinkStream, SinkStreamHandle, StreamType};
 use crate::SharedSystem;
 use cubeb::{Context, DeviceState, DeviceType, SampleFormat, StreamParamsBuilder};
 use log::{error, info, warn};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
+
+static CUBEB_CALLBACK_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
+
+fn should_trace_cubeb_callback() -> bool {
+    std::env::var_os("RUZU_TRACE_CUBEB_CALLBACK").is_some()
+}
 
 struct CubebStream {
     name: String,
@@ -27,6 +34,52 @@ pub struct CubebSink {
 // The C++ upstream also shares these across threads freely.
 unsafe impl Send for CubebSink {}
 unsafe impl Sync for CubebSink {}
+
+fn should_trace_cubeb_state() -> bool {
+    std::env::var_os("RUZU_TRACE_CUBEB_STATE").is_some()
+}
+
+fn process_stream_callback(
+    stream_handle: &SinkStreamHandle,
+    stream_type: StreamType,
+    device_channels: u32,
+    input: &[i16],
+    output: &mut [i16],
+) -> isize {
+    let num_channels = device_channels as usize;
+    let frame_size = num_channels.max(1);
+    let num_frames = if frame_size > 0 {
+        output.len() / frame_size
+    } else {
+        output.len()
+    };
+
+    let mut stream = stream_handle.lock();
+    let queue_before = stream.get_queue_size();
+    if stream_type == StreamType::In {
+        stream.process_audio_in(input, num_frames);
+    } else {
+        stream.process_audio_out_and_render(output, num_frames);
+    }
+    let queue_after = stream.get_queue_size();
+
+    if should_trace_cubeb_callback() {
+        let count = CUBEB_CALLBACK_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
+        if count < 32 {
+            log::info!(
+                "CubebSink callback type={:?} frames={} samples={} queue_before={} queue_after={} paused={}",
+                stream_type,
+                num_frames,
+                output.len(),
+                queue_before,
+                queue_after,
+                stream.is_paused()
+            );
+        }
+    }
+
+    num_frames as isize
+}
 
 impl CubebSink {
     pub fn new(target_device_name: &str) -> Self {
@@ -132,27 +185,26 @@ impl Sink for CubebSink {
         let device_channels = self.device_channels;
         let st = stream_type;
 
-        let data_callback = move |_: &[i16], output: &mut [i16]| {
-            let num_channels = device_channels as usize;
-            let frame_size = num_channels.max(1);
-            let num_frames = if frame_size > 0 {
-                output.len() / frame_size
-            } else {
-                output.len()
-            };
-
-            let mut stream = stream_handle.lock();
-            if st == StreamType::In {
-                // For input streams, the `output` buffer here actually contains
-                // captured input data from cubeb. Process it as audio in.
-                stream.process_audio_in(output, num_frames);
-            } else {
-                stream.process_audio_out_and_render(output, num_frames);
-            }
-            output.len() as isize
+        let data_callback = move |input: &[i16], output: &mut [i16]| -> isize {
+            process_stream_callback(&stream_handle, st, device_channels, input, output)
         };
 
-        let state_callback = |_: cubeb::State| {};
+        let callback_name = name.to_string();
+        let callback_type = stream_type;
+        let state_stream_handle = handle.clone();
+        let state_callback = move |state: cubeb::State| {
+            if should_trace_cubeb_state() {
+                log::info!(
+                    "CubebSink state name={} type={:?} state={:?}",
+                    callback_name,
+                    callback_type,
+                    state
+                );
+            }
+            if state == cubeb::State::Drained {
+                state_stream_handle.lock().signal_pause();
+            }
+        };
 
         let mut builder = cubeb::StreamBuilder::<i16>::new();
         builder.name(name.to_string()).latency(minimum_latency);
@@ -172,8 +224,18 @@ impl Sink for CubebSink {
                 // Extract the raw cubeb_stream pointer for start/stop control.
                 // The backend is stored in CubebStream and outlives the callback.
                 let raw_ptr = backend.as_ptr() as usize;
+                let ctl_name = name.to_string();
+                let ctl_type = stream_type;
                 handle.lock().set_backend_ctl(Box::new(move |start| unsafe {
                     let ptr = raw_ptr as *mut cubeb::ffi::cubeb_stream;
+                    if should_trace_cubeb_state() {
+                        log::info!(
+                            "CubebSink backend_ctl name={} type={:?} start={}",
+                            ctl_name,
+                            ctl_type,
+                            start
+                        );
+                    }
                     if start {
                         if cubeb::ffi::cubeb_stream_start(ptr) != 0 {
                             log::error!("Error starting cubeb stream");
@@ -234,6 +296,41 @@ impl Sink for CubebSink {
 
     fn get_system_channels(&self) -> u32 {
         self.system_channels
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sink::sink_stream::{SinkBuffer, StreamType};
+    use parking_lot::Mutex;
+
+    fn make_system() -> SharedSystem {
+        Arc::new(Mutex::new(ruzu_core::core::System::new()))
+    }
+
+    #[test]
+    fn cubeb_callback_returns_frame_count_not_sample_count() {
+        let system = make_system();
+        let mut stream = SinkStream::new(system, StreamType::Out);
+        stream.device_channels = 2;
+        stream.system_channels = 2;
+        stream.append_buffer(
+            SinkBuffer {
+                frames: 2,
+                frames_played: 0,
+                tag: 1,
+                consumed: false,
+            },
+            &[1, 2, 3, 4],
+        );
+        let handle = Arc::new(parking_lot::Mutex::new(stream));
+        let mut output = [0i16; 4];
+
+        let written = process_stream_callback(&handle, StreamType::Out, 2, &[], &mut output);
+
+        assert_eq!(written, 2);
+        assert_eq!(output, [1, 2, 3, 4]);
     }
 }
 

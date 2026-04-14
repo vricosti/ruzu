@@ -19,6 +19,16 @@ use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 
 const FALLBACK_USER_THREAD_STACK_SIZE: u64 = 0x100000;
 
+fn should_trace_sleep_debug() -> bool {
+    std::env::var_os("RUZU_TRACE_SLEEP").is_some()
+}
+
+fn should_trace_sleep_backtrace_once(tid: u64) -> bool {
+    static DID_TRACE_TID73: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+    tid == 73 && !DID_TRACE_TID73.swap(true, std::sync::atomic::Ordering::Relaxed)
+}
+
 fn is_valid_virtual_core_id(core_id: i32) -> bool {
     (0..4).contains(&core_id)
 }
@@ -353,6 +363,45 @@ pub fn sleep_thread(system: &System, ns: i64) {
             log::warn!("svc::SleepThread(sleep): current thread missing");
             return;
         };
+        if should_trace_sleep_debug() {
+            if let Some(current_thread) = system.current_thread() {
+                let core_index = current_thread.lock().unwrap().get_current_core().max(0) as usize;
+                let process = system.current_process_arc().lock().unwrap();
+                if let Some(cpu) = process.get_arm_interface(core_index) {
+                    let mut ctx = crate::arm::arm_interface::ThreadContext::default();
+                    cpu.get_context(&mut ctx);
+                    log::info!(
+                        "svc::SleepThread(sleep) ctx: tid={} pc=0x{:08X} lr=0x{:08X} sp=0x{:08X}",
+                        current_thread_id,
+                        ctx.pc,
+                        ctx.lr,
+                        ctx.sp,
+                    );
+                    if should_trace_sleep_backtrace_once(current_thread_id) {
+                        let bt = crate::arm::debug::get_backtrace_from_context(&process, &ctx);
+                        for (index, entry) in bt.iter().take(12).enumerate() {
+                            log::info!(
+                                "svc::SleepThread(sleep) bt[{}]: tid={} module={} addr=0x{:X} orig=0x{:X} off=0x{:X} symbol={}",
+                                index,
+                                current_thread_id,
+                                entry.module,
+                                entry.address,
+                                entry.original_address,
+                                entry.offset,
+                                entry.name,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        if should_trace_sleep_debug() {
+            log::info!(
+                "svc::SleepThread(sleep) tid={} ns={} stage=begin",
+                current_thread_id,
+                ns
+            );
+        }
         log::trace!(
             "svc::SleepThread(sleep): tid={} before get_current_hardware_tick",
             current_thread_id
@@ -362,12 +411,21 @@ pub fn sleep_thread(system: &System, ns: i64) {
             .kernel()
             .and_then(|_| crate::hle::kernel::kernel::get_current_hardware_tick())
             .unwrap_or(i64::MAX);
+        let timeout = sleep_timeout_tick_from_ns(current_tick, ns);
+        if should_trace_sleep_debug() {
+            log::info!(
+                "svc::SleepThread(sleep) tid={} ns={} current_tick={} timeout_tick={}",
+                current_thread_id,
+                ns,
+                current_tick,
+                timeout
+            );
+        }
         log::trace!(
             "svc::SleepThread(sleep): tid={} current_tick={}",
             current_thread_id,
             current_tick
         );
-        let timeout = sleep_timeout_tick_from_ns(current_tick, ns);
         log::trace!(
             "svc::SleepThread(sleep): tid={} timeout_tick={} before thread.sleep",
             current_thread_id,
@@ -387,6 +445,13 @@ pub fn sleep_thread(system: &System, ns: i64) {
         if result != RESULT_SUCCESS.get_inner_value() {
             log::warn!("svc::SleepThread(sleep) failed: {:#x}", result);
             return;
+        }
+        if should_trace_sleep_debug() {
+            log::info!(
+                "svc::SleepThread(sleep) tid={} ns={} stage=armed",
+                current_thread_id,
+                ns
+            );
         }
 
         log::trace!(

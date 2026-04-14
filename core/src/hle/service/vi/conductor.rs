@@ -26,6 +26,10 @@ use super::vsync_manager::VsyncManager;
 /// Frame interval in nanoseconds (60 FPS).
 pub const FRAME_NS: i64 = 1_000_000_000 / 60;
 
+fn should_trace_vsync_debug() -> bool {
+    std::env::var_os("RUZU_TRACE_VSYNC").is_some()
+}
+
 /// Thread-safe event primitive matching upstream `Common::Event`.
 /// Uses a condvar + bool: Set() signals, Wait() blocks until signaled then auto-resets.
 struct ThreadEvent {
@@ -162,7 +166,8 @@ impl Conductor {
             let event = core_timing::create_event(
                 "ScreenComposition".to_string(),
                 Box::new(move |_time, _ns_late| {
-                    static SC_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                    static SC_COUNT: std::sync::atomic::AtomicU64 =
+                        std::sync::atomic::AtomicU64::new(0);
                     let sc = SC_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     if sc < 3 {
                         log::info!("[SC_CB] #{} signal_ptr={:p}", sc, &*signal_for_callback);
@@ -249,10 +254,7 @@ impl Conductor {
         static VT_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         log::info!("[VSYNC_THREAD] started signal_ptr={:p}", &*signal);
         while !stop.load(Ordering::Relaxed) {
-            // Upstream uses signal.wait() but the ThreadEvent has a lost-wakeup
-            // issue. Use direct sleep at the vsync interval as a workaround
-            // until the root cause is found.
-            std::thread::sleep(std::time::Duration::from_nanos(FRAME_NS as u64));
+            signal.wait();
 
             let vt = VT_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             if vt < 10 || vt % 60 == 0 {
@@ -265,14 +267,7 @@ impl Conductor {
             }
 
             if let Some(conductor) = conductor.upgrade() {
-                match conductor.try_lock() {
-                    Ok(mut guard) => guard.process_vsync(),
-                    Err(_) => {
-                        if vt < 10 || vt % 300 == 0 {
-                            log::warn!("[VSYNC_THREAD] #{} conductor LOCKED by another thread, skipping", vt);
-                        }
-                    }
-                }
+                conductor.lock().unwrap().process_vsync();
             } else {
                 log::error!("[VSYNC_THREAD] conductor DROPPED at wake #{}, exiting!", vt);
                 return;
@@ -285,7 +280,11 @@ impl Conductor {
         if let Some(manager) = self.vsync_managers.get_mut(&display_id) {
             let count = manager.event_count() + 1;
             manager.link_vsync_event(event);
-            log::info!("Conductor::link_vsync_event: display_id={} linked (total={})", display_id, count);
+            log::info!(
+                "Conductor::link_vsync_event: display_id={} linked (total={})",
+                display_id,
+                count
+            );
         } else {
             log::error!(
                 "Conductor::link_vsync_event: display_id={} NOT FOUND! Available: {:?}",
@@ -306,7 +305,7 @@ impl Conductor {
     fn process_vsync(&mut self) {
         static VSYNC_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let vc = VSYNC_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if vc % 300 == 0 {
+        if vc % 300 == 0 || (should_trace_vsync_debug() && vc % 60 == 0) {
             let total_events: usize = self.vsync_managers.values().map(|m| m.event_count()).sum();
             log::info!("[VSYNC] tick#{} total_linked_events={}", vc, total_events);
         }

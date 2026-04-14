@@ -857,7 +857,10 @@ mod tests {
     fn try_find_size_returns_none_when_no_sentinel_within_max() {
         // Backing memory contains no sentinel anywhere; capping at MAXIMUM_SIZE.
         let program_base: u64 = 0x3_0000_0000;
-        let backing = Arc::new(vec![0u8; TRY_FIND_SIZE_MAX_BYTES + TRY_FIND_SIZE_BLOCK_BYTES]);
+        let backing = Arc::new(vec![
+            0u8;
+            TRY_FIND_SIZE_MAX_BYTES + TRY_FIND_SIZE_BLOCK_BYTES
+        ]);
         let reader: GpuMemoryReader = Arc::new(move |gpu_addr, dst| {
             let offset = (gpu_addr - program_base) as usize;
             let end = (offset + dst.len()).min(backing.len());

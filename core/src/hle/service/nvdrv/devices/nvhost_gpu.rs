@@ -235,6 +235,25 @@ unsafe impl Send for NvHostGpu {}
 unsafe impl Sync for NvHostGpu {}
 
 impl NvHostGpu {
+    fn should_trace_init_path() -> bool {
+        std::env::var_os("RUZU_TRACE_NVHOST_GPU_INIT")
+            .is_some_and(|value| value != std::ffi::OsStr::new("0"))
+    }
+
+    fn trace_command_list_headers(label: &str, headers: &[GpuCommandListHeader]) {
+        if !Self::should_trace_init_path() {
+            return;
+        }
+        for (index, header) in headers.iter().take(8).enumerate() {
+            log::info!(
+                "nvhost_gpu::{} header[{}] raw=0x{:016X}",
+                label,
+                index,
+                header.raw
+            );
+        }
+    }
+
     pub fn new(
         system: SystemRef,
         events_interface: Arc<EventInterface>,
@@ -279,6 +298,9 @@ impl NvHostGpu {
 
     pub fn set_nvmap_fd(&self, params: &mut IoctlSetNvmapFD) -> NvResult {
         log::debug!("nvhost_gpu::SetNVMAPfd called, fd={}", params.nvmap_fd);
+        if Self::should_trace_init_path() {
+            log::info!("nvhost_gpu::SetNVMAPfd fd={}", params.nvmap_fd);
+        }
         *self.nvmap_fd.lock().unwrap() = params.nvmap_fd;
         NvResult::Success
     }
@@ -286,6 +308,9 @@ impl NvHostGpu {
     pub fn set_client_data(&self, params: &mut IoctlClientData) -> NvResult {
         log::debug!("nvhost_gpu::SetClientData called");
         *self.user_data.lock().unwrap() = params.data;
+        if Self::should_trace_init_path() {
+            log::info!("nvhost_gpu::SetClientData data=0x{:X}", params.data);
+        }
         NvResult::Success
     }
 
@@ -312,6 +337,14 @@ impl NvHostGpu {
             params.size,
             params.mem
         );
+        if Self::should_trace_init_path() {
+            log::info!(
+                "nvhost_gpu::SetErrorNotifier offset=0x{:X} size=0x{:X} mem=0x{:X}",
+                params.offset,
+                params.size,
+                params.mem
+            );
+        }
         NvResult::Success
     }
 
@@ -321,6 +354,12 @@ impl NvHostGpu {
             "nvhost_gpu::SetChannelPriority (STUBBED) called, priority={:X}",
             params.priority
         );
+        if Self::should_trace_init_path() {
+            log::info!(
+                "nvhost_gpu::SetChannelPriority priority=0x{:X}",
+                params.priority
+            );
+        }
         NvResult::Success
     }
 
@@ -350,6 +389,15 @@ impl NvHostGpu {
         params.fence_out = self
             .syncpoint_manager()
             .get_syncpoint_fence(channel_syncpoint);
+        if Self::should_trace_init_path() {
+            log::info!(
+                "nvhost_gpu::AllocGPFIFOEx2 program_id=0x{:X} channel_syncpoint={} fence_out={{id={}, value={}}}",
+                program_id,
+                channel_syncpoint,
+                params.fence_out.id,
+                params.fence_out.value
+            );
+        }
         NvResult::Success
     }
 
@@ -360,6 +408,14 @@ impl NvHostGpu {
             params.flags
         );
         params.obj_id = 0x0;
+        if Self::should_trace_init_path() {
+            log::info!(
+                "nvhost_gpu::AllocateObjectContext class_num=0x{:X} flags=0x{:X} obj_id=0x{:X}",
+                params.class_num,
+                params.flags,
+                params.obj_id
+            );
+        }
         NvResult::Success
     }
 
@@ -374,6 +430,16 @@ impl NvHostGpu {
             params.num_entries,
             params.flags
         );
+        if Self::should_trace_init_path() {
+            log::info!(
+                "nvhost_gpu::SubmitGPFIFOImpl begin address=0x{:X} num_entries={} flags=0x{:X} fence_in={{id={}, value={}}}",
+                params.address,
+                params.num_entries,
+                params.flags,
+                params.fence.id,
+                params.fence.value
+            );
+        }
 
         let gpu = self
             .system
@@ -416,6 +482,15 @@ impl NvHostGpu {
         }
 
         params.flags = 0;
+        if Self::should_trace_init_path() {
+            log::info!(
+                "nvhost_gpu::SubmitGPFIFOImpl end bind_id={} channel_syncpoint={} fence_out={{id={}, value={}}}",
+                bind_id,
+                channel_syncpoint,
+                params.fence.id,
+                params.fence.value
+            );
+        }
         NvResult::Success
     }
 
@@ -435,6 +510,15 @@ impl NvHostGpu {
             params.address,
             commands.len()
         );
+        if Self::should_trace_init_path() {
+            log::info!(
+                "nvhost_gpu::SubmitGPFIFOBase1 kickoff={} num_entries={} address=0x{:X} input_len=0x{:X}",
+                kickoff,
+                params.num_entries,
+                params.address,
+                commands.len()
+            );
+        }
         if command_count > available_entries {
             log::error!(
                 "nvhost_gpu::SubmitGPFIFOBase1 invalid size num_entries={} available_entries={}",
@@ -459,6 +543,7 @@ impl NvHostGpu {
         } else {
             copy_command_list_headers_from_bytes(&mut command_lists, commands);
         }
+        Self::trace_command_list_headers("SubmitGPFIFOBase1", &command_lists);
 
         self.submit_gpfifo_impl(
             params,
@@ -479,6 +564,14 @@ impl NvHostGpu {
             params.address,
             commands.len()
         );
+        if Self::should_trace_init_path() {
+            log::info!(
+                "nvhost_gpu::SubmitGPFIFOBase2 num_entries={} address=0x{:X} inline_len=0x{:X}",
+                params.num_entries,
+                params.address,
+                commands.len()
+            );
+        }
         if command_count > available_entries {
             log::error!(
                 "nvhost_gpu::SubmitGPFIFOBase2 invalid size num_entries={} available_entries={}",
@@ -490,6 +583,7 @@ impl NvHostGpu {
 
         let mut command_lists = vec![GpuCommandListHeader::default(); command_count];
         copy_command_list_headers_from_bytes(&mut command_lists, commands);
+        Self::trace_command_list_headers("SubmitGPFIFOBase2", &command_lists);
         self.submit_gpfifo_impl(
             params,
             GpuCommandList {
@@ -505,6 +599,13 @@ impl NvHostGpu {
             params.unknown
         );
         params.value = 0;
+        if Self::should_trace_init_path() {
+            log::info!(
+                "nvhost_gpu::GetWaitbase unknown=0x{:X} value=0x{:X}",
+                params.unknown,
+                params.value
+            );
+        }
         NvResult::Success
     }
 

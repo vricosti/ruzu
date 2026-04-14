@@ -14,6 +14,17 @@ use crate::query_cache::types::{QueryPropertiesFlags, QueryType};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
+static PULLER_ENGINE_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
+static PULLER_SEMAPHORE_WRITEBACK_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
+
+fn should_trace_dma_flow() -> bool {
+    std::env::var_os("RUZU_TRACE_DMA_FLOW").is_some()
+}
+
+fn should_trace_semaphore_writeback() -> bool {
+    std::env::var_os("RUZU_TRACE_SEMAPHORE_WRITEBACK").is_some()
+}
+
 /// GPU virtual address type.
 pub type GPUVAddr = u64;
 
@@ -461,7 +472,15 @@ impl Puller {
     /// Corresponds to `Puller::CallPullerMethod`.
     pub fn call_puller_method(&mut self, method_call: &MethodCall) {
         let trace_idx = PULLER_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
-        if trace_idx < 48 {
+        if should_trace_dma_flow() && trace_idx < 96 {
+            log::info!(
+                "Puller::call_puller_method method=0x{:X} arg=0x{:X} subch={} pending={}",
+                method_call.method,
+                method_call.argument,
+                method_call.subchannel,
+                method_call.method_count
+            );
+        } else if trace_idx < 48 {
             log::trace!(
                 "Puller::call_puller_method method=0x{:X} arg=0x{:X} subch={} pending={}",
                 method_call.method,
@@ -545,8 +564,16 @@ impl Puller {
         };
 
         let channel_state = unsafe { &mut *self.channel_state };
-        let trace_idx = PULLER_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
-        if trace_idx < 48 {
+        let trace_idx = PULLER_ENGINE_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
+        if should_trace_dma_flow() && trace_idx < 96 {
+            log::info!(
+                "Puller::call_engine_method engine={:?} method=0x{:X} arg=0x{:X} subch={}",
+                engine,
+                method_call.method,
+                method_call.argument,
+                method_call.subchannel
+            );
+        } else if trace_idx < 48 {
             log::trace!(
                 "Puller::call_engine_method engine={:?} method=0x{:X} arg=0x{:X} subch={}",
                 engine,
@@ -669,19 +696,35 @@ impl Puller {
     ///
     /// Corresponds to `Puller::ProcessBindMethod`.
     fn process_bind_method(&mut self, method_call: &MethodCall) {
-        log::debug!(
-            "Binding subchannel {} to engine {}",
-            method_call.subchannel,
-            method_call.argument
-        );
+        if should_trace_dma_flow() {
+            log::info!(
+                "Puller::process_bind_method subch={} raw_engine=0x{:X}",
+                method_call.subchannel,
+                method_call.argument
+            );
+        } else {
+            log::debug!(
+                "Binding subchannel {} to engine {}",
+                method_call.subchannel,
+                method_call.argument
+            );
+        }
         let engine_id = EngineID::from_raw(method_call.argument);
         if let Some(eid) = engine_id {
             self.bound_engines[method_call.subchannel as usize] = Some(eid);
-            log::trace!(
-                "Puller::process_bind_method subch={} engine={:?}",
-                method_call.subchannel,
-                eid
-            );
+            if should_trace_dma_flow() {
+                log::info!(
+                    "Puller::process_bind_method bound subch={} engine={:?}",
+                    method_call.subchannel,
+                    eid
+                );
+            } else {
+                log::trace!(
+                    "Puller::process_bind_method subch={} engine={:?}",
+                    method_call.subchannel,
+                    eid
+                );
+            }
             let channel_state = unsafe { &mut *self.channel_state };
             let dma_pusher = unsafe { self.dma_pusher.as_mut() };
             if let Some(dma_pusher) = dma_pusher {
@@ -743,6 +786,13 @@ impl Puller {
     /// Corresponds to `Puller::ProcessFenceActionMethod`.
     fn process_fence_action_method(&mut self) {
         let action = self.regs.fence_action();
+        if should_trace_dma_flow() || std::env::var_os("RUZU_TRACE_GPU_SUBMIT").is_some() {
+            log::info!(
+                "Puller::process_fence_action_method op={:?} syncpoint_id={}",
+                action.op(),
+                action.syncpoint_id()
+            );
+        }
         match action.op() {
             FenceOperation::Acquire => {
                 self.with_rasterizer_mut(|rasterizer| rasterizer.release_fences(false));
@@ -760,13 +810,23 @@ impl Puller {
     fn process_semaphore_trigger_method(&mut self) {
         let semaphore_op_mask = 0xF;
         let op = self.regs.semaphore_trigger() & semaphore_op_mask;
-        log::trace!(
-            "PULLER_SEMTRIG op=0x{:X} trigger=0x{:X} addr=0x{:X} payload=0x{:X}",
-            op,
-            self.regs.semaphore_trigger(),
-            self.regs.semaphore_address(),
-            self.regs.semaphore_sequence()
-        );
+        if should_trace_dma_flow() {
+            log::info!(
+                "Puller::process_semaphore_trigger_method op=0x{:X} trigger=0x{:X} addr=0x{:X} payload=0x{:X}",
+                op,
+                self.regs.semaphore_trigger(),
+                self.regs.semaphore_address(),
+                self.regs.semaphore_sequence()
+            );
+        } else {
+            log::trace!(
+                "PULLER_SEMTRIG op=0x{:X} trigger=0x{:X} addr=0x{:X} payload=0x{:X}",
+                op,
+                self.regs.semaphore_trigger(),
+                self.regs.semaphore_address(),
+                self.regs.semaphore_sequence()
+            );
+        }
         if op == GpuSemaphoreOperation::WriteLong as u32 {
             let sequence_address = self.regs.semaphore_address();
             let payload = self.regs.semaphore_sequence();
@@ -793,6 +853,19 @@ impl Puller {
                             gpu_addr,
                             bytes,
                             &mut |cpu_addr, data| {
+                                if should_trace_semaphore_writeback()
+                                    && PULLER_SEMAPHORE_WRITEBACK_TRACE_COUNT
+                                        .fetch_add(1, Ordering::Relaxed)
+                                        < 8
+                                {
+                                    log::info!(
+                                        "Puller::SemaphoreTrigger writeback gpu_addr=0x{:X} cpu_addr=0x{:X} len=0x{:X} bytes={:02X?}",
+                                        gpu_addr,
+                                        cpu_addr,
+                                        data.len(),
+                                        &data[..std::cmp::min(data.len(), 16)]
+                                    );
+                                }
                                 log::trace!(
                                     "Puller::SemaphoreTrigger writeback gpu_addr=0x{:X} cpu_addr=0x{:X} len=0x{:X} bytes={:02X?}",
                                     gpu_addr,

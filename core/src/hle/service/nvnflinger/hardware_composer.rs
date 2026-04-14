@@ -12,9 +12,16 @@ use super::display::{Display, Layer};
 use super::hwc_layer::HwcLayer;
 use super::ui::fence::Fence;
 use crate::hle::service::nvdrv::devices::nvdisp_disp0::NvDispDisp0;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 type ConsumerId = i32;
 type ReleaseFrameNumber = u64;
+
+static HWC_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
+
+fn should_trace_hwc() -> bool {
+    std::env::var_os("RUZU_TRACE_HWC").is_some()
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CacheStatus {
@@ -76,6 +83,18 @@ impl HardwareComposer {
         for layer in &display.stack.layers {
             let consumer_id = layer.lock().unwrap().consumer_id;
             let result = self.cache_framebuffer_locked(layer, consumer_id);
+
+            if should_trace_hwc() {
+                let count = HWC_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
+                if count < 64 {
+                    log::info!(
+                        "HWC::compose layer={} cache_result={:?} frame_number={}",
+                        consumer_id,
+                        result,
+                        self.frame_number
+                    );
+                }
+            }
 
             if result == CacheStatus::NoBufferAvailable {
                 continue;
@@ -171,11 +190,24 @@ impl HardwareComposer {
         layer: &Arc<Mutex<Layer>>,
         framebuffer: &mut Framebuffer,
     ) -> bool {
+        let consumer_id = layer.lock().unwrap().consumer_id;
         let status = layer.lock().unwrap().buffer_item_consumer.acquire_buffer(
             &mut framebuffer.item,
             0,
             false,
         );
+        if should_trace_hwc() {
+            let count = HWC_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
+            if count < 64 {
+                log::info!(
+                    "HWC::try_acquire layer={} status={:?} slot={} frame={}",
+                    consumer_id,
+                    status,
+                    framebuffer.item.slot,
+                    framebuffer.item.frame_number
+                );
+            }
+        }
         if status != super::status::Status::NoError {
             return false;
         }

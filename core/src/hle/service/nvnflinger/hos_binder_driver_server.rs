@@ -123,6 +123,7 @@ mod tests {
 
     use super::HosBinderDriverServer;
     use crate::hle::kernel::k_readable_event::KReadableEvent;
+    use crate::hle::service::kernel_helpers::ServiceContext;
     use crate::hle::service::nvnflinger::binder::IBinder;
 
     struct DummyBinder;
@@ -156,6 +157,9 @@ mod tests {
         let server = HosBinderDriverServer::new();
         let producer = Arc::new(
             crate::hle::service::nvnflinger::buffer_queue_producer::BufferQueueProducer::new(
+                Arc::new(Mutex::new(ServiceContext::new(
+                    "HosBinderDriverServerTest".to_string(),
+                ))),
                 crate::hle::service::nvnflinger::buffer_queue_core::BufferQueueCore::new(),
                 Arc::new(crate::hle::service::nvdrv::core::nvmap::NvMap::new()),
             ),

@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use crate::core::SystemRef;
+use crate::hle::service::kernel_helpers::ServiceContext;
 use crate::hle::service::nvdrv::core::container::SessionId;
 use crate::hle::service::nvdrv::nvdrv::Module;
 use crate::hle::service::nvdrv::nvdrv_interface::NvdrvService;
@@ -27,6 +28,7 @@ pub struct SurfaceFlinger {
     system: SystemRef,
     server: Arc<HosBinderDriverServer>,
     inner: Mutex<SurfaceFlingerInner>,
+    service_context: Arc<Mutex<ServiceContext>>,
     nvdrv: Arc<Module>,
     disp_fd: i32,
     composer: Mutex<HardwareComposer>,
@@ -61,6 +63,9 @@ impl SurfaceFlinger {
                 layers: LayerStack::new(),
                 consumers: HashMap::new(),
             }),
+            service_context: Arc::new(Mutex::new(ServiceContext::new(
+                "SurfaceFlinger".to_string(),
+            ))),
             nvdrv,
             disp_fd,
             composer: Mutex::new(HardwareComposer::new()),
@@ -192,6 +197,7 @@ impl SurfaceFlinger {
         let core = BufferQueueCore::new();
         let consumer = Arc::new(BufferQueueConsumer::new(Arc::clone(&core)));
         let producer_binder = Arc::new(BufferQueueProducer::new(
+            Arc::clone(&self.service_context),
             Arc::clone(&core),
             self.nvdrv.get_container().get_nv_map_file_handle(),
         ));

@@ -12,6 +12,7 @@ use std::sync::{Arc, Mutex};
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
 use crate::hle::service::ipc_helpers::{RequestParser, ResponseBuilder};
+use crate::hle::service::kernel_helpers::ServiceContext;
 use crate::hle::service::nvnflinger::parcel::OutputParcel;
 use crate::hle::service::os::event::Event;
 use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
@@ -24,6 +25,7 @@ use super::vi_types::*;
 
 pub struct IApplicationDisplayService {
     container: Arc<Container>,
+    service_context: Mutex<ServiceContext>,
     open_layer_ids: Mutex<BTreeSet<u64>>,
     stray_layer_ids: Mutex<BTreeSet<u64>>,
     /// Vsync events per display. Upstream: `std::map<u64, Event> m_display_vsync_events`.
@@ -36,6 +38,9 @@ impl IApplicationDisplayService {
     pub fn new(container: Arc<Container>) -> Self {
         Self {
             container,
+            service_context: Mutex::new(ServiceContext::new(
+                "IApplicationDisplayService".to_string(),
+            )),
             open_layer_ids: Mutex::new(BTreeSet::new()),
             stray_layer_ids: Mutex::new(BTreeSet::new()),
             display_vsync_events: Mutex::new(BTreeMap::new()),
@@ -458,9 +463,8 @@ impl IApplicationDisplayService {
     /// cmd 5202: GetDisplayVsyncEvent
     ///
     /// Port of upstream `IApplicationDisplayService::GetDisplayVsyncEvent`.
-    /// Creates a Service::Event bridged to a KReadableEvent. The event is linked
-    /// to the Conductor so it gets signaled on every vsync tick (~60Hz).
-    /// The game calls WaitSynchronization on the returned handle to sleep until vsync.
+    /// The owner is a service-layer `Event` stored in this service's `ServiceContext`.
+    /// The IPC-facing readable handle is materialized lazily from that owner.
     fn get_display_vsync_event(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         let svc = Self::as_self(this);
         let mut rp = RequestParser::new(ctx);
@@ -484,28 +488,16 @@ impl IApplicationDisplayService {
             }
         }
 
-        // Create a KReadableEvent in the process handle table (NOT pre-signaled).
-        // The Conductor will signal it periodically via the Service::Event bridge.
-        let Some((handle, readable_event)) = ctx.create_readable_event(false) else {
-            log::error!("GetDisplayVsyncEvent: failed to create KReadableEvent");
-            let mut rb = ResponseBuilder::new(ctx, 2, 1, 0);
-            rb.push_result(RESULT_SUCCESS);
-            rb.push_copy_objects(0);
-            return;
+        let event = {
+            let mut service_context = svc.service_context.lock().unwrap();
+            let event_handle = service_context.create_event(format!(
+                "IApplicationDisplayService:DisplayVsyncEvent:{}",
+                display_id
+            ));
+            service_context
+                .get_event(event_handle)
+                .expect("ServiceContext::create_event must store the created event")
         };
-
-        // Get process and scheduler arcs for the kernel bridge.
-        let system = svc.container.system();
-        let process_arc = system.get().current_process_arc().clone();
-        let scheduler_arc = system.get().scheduler_arc();
-
-        // Create a Service::Event with kernel bridge — when the Conductor calls
-        // event.signal(), it also signals the KReadableEvent, waking WaitSynchronization.
-        let event = Arc::new(Event::new_with_kernel_event(
-            readable_event,
-            process_arc,
-            scheduler_arc,
-        ));
 
         // Link the event to the Conductor for this display.
         svc.container
@@ -515,7 +507,17 @@ impl IApplicationDisplayService {
         svc.display_vsync_events
             .lock()
             .unwrap()
-            .insert(display_id, event);
+            .insert(display_id, Arc::clone(&event));
+
+        let Some(handle) = event.copy_handle(ctx) else {
+            log::error!("GetDisplayVsyncEvent: failed to materialize readable event handle");
+            svc.container.unlink_vsync_event(display_id, &event);
+            svc.display_vsync_events.lock().unwrap().remove(&display_id);
+            let mut rb = ResponseBuilder::new(ctx, 2, 1, 0);
+            rb.push_result(RESULT_SUCCESS);
+            rb.push_copy_objects(0);
+            return;
+        };
 
         log::info!(
             "GetDisplayVsyncEvent: created vsync event handle={:#x} for display_id={}",

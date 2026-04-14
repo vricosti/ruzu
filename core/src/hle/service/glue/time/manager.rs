@@ -63,21 +63,15 @@ impl TimeManager {
     pub fn initialize(&mut self) {
         log::info!("Glue::Time::TimeManager: starting initialization");
 
-        let set_sys_handler = ServiceManager::get_service_blocking(
-            &self.service_manager,
-            self.system,
-            "set:sys",
-        );
+        let set_sys_handler =
+            ServiceManager::get_service_blocking(&self.service_manager, self.system, "set:sys");
         let set_sys = set_sys_handler
             .as_any()
             .downcast_ref::<SystemSettingsService>()
             .expect("set:sys is not an ISystemSettingsServer");
 
-        let time_m_handler = ServiceManager::get_service_blocking(
-            &self.service_manager,
-            self.system,
-            "time:m",
-        );
+        let time_m_handler =
+            ServiceManager::get_service_blocking(&self.service_manager, self.system, "time:m");
         let time_m = time_m_handler
             .as_any()
             .downcast_ref::<TimeServiceManager>()

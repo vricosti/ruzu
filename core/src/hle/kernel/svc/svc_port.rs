@@ -126,16 +126,17 @@ pub fn connect_to_named_port(system: &System, out: &mut Handle, user_name: u64) 
             return RESULT_INVALID_HANDLE;
         }
 
-        let (session_object_id, client_session_object_id) = match port_guard
-            .client
-            .create_session(&mut process, kernel, port_guard.get_name())
-        {
-            Ok(ids) => ids,
-            Err(result) => {
-                process.handle_table.unreserve(reserved_handle);
-                return result;
-            }
-        };
+        let (session_object_id, client_session_object_id) =
+            match port_guard
+                .client
+                .create_session(&mut process, kernel, port_guard.get_name())
+            {
+                Ok(ids) => ids,
+                Err(result) => {
+                    process.handle_table.unreserve(reserved_handle);
+                    return result;
+                }
+            };
 
         let server_session = process
             .get_server_session_by_object_id(session_object_id)
@@ -268,16 +269,17 @@ pub fn connect_to_port(system: &System, out: &mut Handle, port: Handle) -> Resul
         }
 
         let port_name = port_guard.get_name();
-        let (session_object_id, client_session_object_id) = match port_guard
-            .client
-            .create_session(&mut process, kernel, port_name)
-        {
-            Ok(ids) => ids,
-            Err(result) => {
-                process.handle_table.unreserve(reserved_handle);
-                return result;
-            }
-        };
+        let (session_object_id, client_session_object_id) =
+            match port_guard
+                .client
+                .create_session(&mut process, kernel, port_name)
+            {
+                Ok(ids) => ids,
+                Err(result) => {
+                    process.handle_table.unreserve(reserved_handle);
+                    return result;
+                }
+            };
 
         let enqueue_result = port_guard.enqueue_session(session_object_id);
         if enqueue_result.is_error() {

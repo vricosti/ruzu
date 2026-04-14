@@ -3,9 +3,9 @@
 
 //! Port of zuyu/src/shader_recompiler/frontend/maxwell/translate/impl/integer_shift_left.cpp
 
-use crate::ir::program::ShaderInfoExt;
 use super::{bit, field, TranslatorVisitor};
 use crate::frontend::maxwell_opcodes::{MaxwellOpcode, SrcType};
+use crate::ir::program::ShaderInfoExt;
 use crate::ir::value::Value;
 
 /// Core SHL logic, matching upstream's `SHL(TranslatorVisitor& v, u64 insn, const IR::U32& unsafe_shift)`.

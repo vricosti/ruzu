@@ -174,6 +174,22 @@ unsafe impl Send for NvHostCtrl {}
 unsafe impl Sync for NvHostCtrl {}
 
 impl NvHostCtrl {
+    fn should_trace_event_wait() -> bool {
+        std::env::var_os("RUZU_TRACE_NVHOST_CTRL_WAIT").is_some()
+    }
+
+    fn trace_ioctl(command: Ioctl, stage: &str) {
+        if Self::should_trace_event_wait() {
+            log::info!(
+                "nvhost_ctrl::ioctl stage={} raw=0x{:08X} group=0x{:X} cmd=0x{:X}",
+                stage,
+                command.raw,
+                command.group(),
+                command.cmd()
+            );
+        }
+    }
+
     fn bytes_to_cstr(bytes: &[u8]) -> String {
         let len = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
         String::from_utf8_lossy(&bytes[..len]).into_owned()
@@ -332,6 +348,16 @@ impl NvHostCtrl {
         params: &mut IocCtrlEventWaitParams,
         is_allocation: bool,
     ) -> NvResult {
+        if Self::should_trace_event_wait() {
+            log::info!(
+                "nvhost_ctrl::IocCtrlEventWait begin syncpt_id={} threshold={} timeout={} is_allocation={} value_raw_in=0x{:08X}",
+                params.fence.id,
+                params.fence.value,
+                params.timeout,
+                is_allocation,
+                params.value.raw
+            );
+        }
         log::debug!(
             "nvhost_ctrl::IocCtrlEventWait syncpt_id={}, threshold={}, timeout={}, is_allocation={}",
             params.fence.id,
@@ -356,17 +382,38 @@ impl NvHostCtrl {
             } else {
                 params.value.raw = self.syncpoint_manager().read_syncpoint_min_value(fence_id);
             }
+            if Self::should_trace_event_wait() {
+                log::info!(
+                    "nvhost_ctrl::IocCtrlEventWait zero-threshold syncpt_id={} value_raw_out=0x{:08X}",
+                    fence_id,
+                    params.value.raw
+                );
+            }
             return NvResult::Success;
         }
 
         if self.syncpoint_manager().is_fence_signalled(&params.fence) {
             params.value.raw = self.syncpoint_manager().read_syncpoint_min_value(fence_id);
+            if Self::should_trace_event_wait() {
+                log::info!(
+                    "nvhost_ctrl::IocCtrlEventWait signalled-immediate syncpt_id={} value_raw_out=0x{:08X}",
+                    fence_id,
+                    params.value.raw
+                );
+            }
             return NvResult::Success;
         }
 
         let new_value = self.syncpoint_manager().update_min(fence_id);
         if self.syncpoint_manager().is_fence_signalled(&params.fence) {
             params.value.raw = new_value;
+            if Self::should_trace_event_wait() {
+                log::info!(
+                    "nvhost_ctrl::IocCtrlEventWait signalled-after-update syncpt_id={} value_raw_out=0x{:08X}",
+                    fence_id,
+                    params.value.raw
+                );
+            }
             return NvResult::Success;
         }
 
@@ -391,8 +438,25 @@ impl NvHostCtrl {
                     events[slot as usize].fails = 0;
                     self.syncpoint_manager().wait_host(fence_id, target_value);
                     params.value.raw = target_value;
+                    if Self::should_trace_event_wait() {
+                        log::info!(
+                            "nvhost_ctrl::IocCtrlEventWait timeout=0 fallback-success slot={} syncpt_id={} target={} value_raw_out=0x{:08X}",
+                            slot,
+                            fence_id,
+                            target_value,
+                            params.value.raw
+                        );
+                    }
                     NvResult::Success
                 } else {
+                    if Self::should_trace_event_wait() {
+                        log::info!(
+                            "nvhost_ctrl::IocCtrlEventWait timeout=0 returning-timeout slot={} syncpt_id={} target={}",
+                            slot,
+                            fence_id,
+                            target_value
+                        );
+                    }
                     NvResult::Timeout
                 }
             } else {
@@ -407,6 +471,15 @@ impl NvHostCtrl {
                     events[slot as usize].fails = 0;
                     self.syncpoint_manager().wait_host(fence_id, target_value);
                     params.value.raw = target_value;
+                    if Self::should_trace_event_wait() {
+                        log::info!(
+                            "nvhost_ctrl::IocCtrlEventWait wait-fallback-success slot={} syncpt_id={} target={} value_raw_out=0x{:08X}",
+                            slot,
+                            fence_id,
+                            target_value,
+                            params.value.raw
+                        );
+                    }
                     NvResult::Success
                 } else {
                     let event = &mut events[slot as usize];
@@ -447,6 +520,16 @@ impl NvHostCtrl {
                                 .store(EventState::Signalled as u32, Ordering::Release);
                         }),
                     );
+
+                    if Self::should_trace_event_wait() {
+                        log::info!(
+                            "nvhost_ctrl::IocCtrlEventWait armed slot={} syncpt_id={} target={} value_raw_out=0x{:08X}",
+                            slot,
+                            fence_id,
+                            target_value,
+                            params.value.raw
+                        );
+                    }
 
                     NvResult::Timeout
                 }
@@ -638,6 +721,7 @@ mod tests {
 
 impl NvDevice for NvHostCtrl {
     fn ioctl1(&self, _fd: DeviceFD, command: Ioctl, input: &[u8], output: &mut [u8]) -> NvResult {
+        Self::trace_ioctl(command, "ioctl1");
         match command.group() {
             0x0 => match command.cmd() {
                 0x1b => {
@@ -702,6 +786,7 @@ impl NvDevice for NvHostCtrl {
         _inline_input: &[u8],
         _output: &mut [u8],
     ) -> NvResult {
+        Self::trace_ioctl(command, "ioctl2");
         log::error!("Unimplemented ioctl={:08X}", command.raw);
         NvResult::NotImplemented
     }

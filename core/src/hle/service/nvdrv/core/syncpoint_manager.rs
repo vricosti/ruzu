@@ -206,6 +206,15 @@ impl SyncpointManager {
             .host1x_core()
             .map(|host1x| host1x.get_host_syncpoint_value(id))
             .unwrap_or_else(|| syncpoint.counter_min.load(Ordering::Relaxed));
+        if std::env::var_os("RUZU_TRACE_SYNCPOINT").is_some() {
+            log::info!(
+                "NvdrvSyncpointManager::update_min id={} old_min={} max={} host_value={}",
+                id,
+                syncpoint.counter_min.load(Ordering::Relaxed),
+                syncpoint.counter_max.load(Ordering::Relaxed),
+                host_value
+            );
+        }
         syncpoint.counter_min.store(host_value, Ordering::Relaxed);
         host_value
     }
@@ -251,6 +260,13 @@ impl SyncpointManager {
         expected_value: u32,
         action: Box<dyn FnOnce() + Send>,
     ) -> Option<u64> {
+        if std::env::var_os("RUZU_TRACE_SYNCPOINT").is_some() {
+            log::info!(
+                "NvdrvSyncpointManager::register_host_action id={} expected={}",
+                id,
+                expected_value
+            );
+        }
         self.system
             .get()
             .host1x_core()
@@ -264,6 +280,13 @@ impl SyncpointManager {
     }
 
     pub fn wait_host(&self, id: u32, expected_value: u32) {
+        if std::env::var_os("RUZU_TRACE_SYNCPOINT").is_some() {
+            log::info!(
+                "NvdrvSyncpointManager::wait_host id={} expected={}",
+                id,
+                expected_value
+            );
+        }
         if let Some(host1x) = self.system.get().host1x_core() {
             host1x.wait_host(id, expected_value);
         }

@@ -103,10 +103,7 @@ impl ServiceManager {
     /// Sets the deferral event.
     ///
     /// Matches upstream `ServiceManager::SetDeferralEvent(Kernel::KEvent*)`.
-    pub fn set_deferral_event(
-        &mut self,
-        event: Option<Arc<Mutex<KEvent>>>,
-    ) {
+    pub fn set_deferral_event(&mut self, event: Option<Arc<Mutex<KEvent>>>) {
         self.deferral_event = event;
     }
 
@@ -292,10 +289,15 @@ pub struct Sm {
 }
 
 impl Sm {
-    fn current_process_and_scheduler(&self) -> Option<(Arc<Mutex<KProcess>>, Arc<Mutex<KScheduler>>)> {
+    fn current_process_and_scheduler(
+        &self,
+    ) -> Option<(Arc<Mutex<KProcess>>, Arc<Mutex<KScheduler>>)> {
         let current_thread = self.system.get().current_thread()?;
         let thread_guard = current_thread.lock().unwrap();
-        let process = thread_guard.parent.as_ref().and_then(|parent| parent.upgrade())?;
+        let process = thread_guard
+            .parent
+            .as_ref()
+            .and_then(|parent| parent.upgrade())?;
         let scheduler = thread_guard
             .scheduler
             .as_ref()

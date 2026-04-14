@@ -6,9 +6,9 @@
 //! Implements TLD4 and TLD4_b (texture gather — returns one component from
 //! a 2x2 footprint of texels).
 
-use crate::ir::program::ShaderInfoExt;
 use super::{field, TranslatorVisitor};
 use crate::frontend::maxwell_opcodes::MaxwellOpcode;
+use crate::ir::program::ShaderInfoExt;
 use crate::ir::types::TextureInstInfo;
 use crate::ir::value::Value;
 
@@ -30,7 +30,11 @@ pub fn tld4(tv: &mut TranslatorVisitor, insn: u64, _opcode: MaxwellOpcode) {
         ..Default::default()
     };
 
-    tv.ir.program.info.register_texture(tex_index, crate::shader_info::TextureType::ColorArray1D, false);
+    tv.ir.program.info.register_texture(
+        tex_index,
+        crate::shader_info::TextureType::ColorArray1D,
+        false,
+    );
 
     let coord_x = tv.f(src_reg);
     let coord_y = tv.f(src_reg + 1);

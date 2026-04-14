@@ -113,7 +113,9 @@ impl MultiWait {
             Some(thread) => thread,
             None => {
                 if trace_boot {
-                    log::info!("MultiWait::timed_wait_impl: falling back local (no current_emu_thread)");
+                    log::info!(
+                        "MultiWait::timed_wait_impl: falling back local (no current_emu_thread)"
+                    );
                 }
                 return self.local_timed_wait(&holders, timeout_ns);
             }

@@ -416,7 +416,10 @@ unsafe fn compile_link_separable(stage_index: usize, source: &str) -> Result<u32
     // Compile the shader.
     let shader = gl::CreateShader(stage_enum);
     if shader == 0 {
-        return Err(format!("glCreateShader returned 0 for stage {}", stage_index));
+        return Err(format!(
+            "glCreateShader returned 0 for stage {}",
+            stage_index
+        ));
     }
     let c_src = match std::ffi::CString::new(source) {
         Ok(s) => s,
@@ -440,7 +443,10 @@ unsafe fn compile_link_separable(stage_index: usize, source: &str) -> Result<u32
     let program = gl::CreateProgram();
     if program == 0 {
         gl::DeleteShader(shader);
-        return Err(format!("glCreateProgram returned 0 for stage {}", stage_index));
+        return Err(format!(
+            "glCreateProgram returned 0 for stage {}",
+            stage_index
+        ));
     }
     gl::ProgramParameteri(program, gl::PROGRAM_SEPARABLE, gl::TRUE as gl::types::GLint);
     gl::AttachShader(program, shader);

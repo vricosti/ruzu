@@ -346,10 +346,7 @@ impl base::BufferCacheRuntime for BufferCacheRuntime {
         // GL_SHADER_STORAGE_BUFFER_OFFSET_ALIGNMENT
         let mut alignment: i32 = 256;
         unsafe {
-            gl::GetIntegerv(
-                gl::SHADER_STORAGE_BUFFER_OFFSET_ALIGNMENT,
-                &mut alignment,
-            );
+            gl::GetIntegerv(gl::SHADER_STORAGE_BUFFER_OFFSET_ALIGNMENT, &mut alignment);
         }
         alignment.max(1) as u32
     }
@@ -421,16 +418,8 @@ impl base::BufferCacheRuntime for BufferCacheRuntime {
         if count == 0 {
             return;
         }
-        let offsets: Vec<isize> = bindings
-            .offsets
-            .iter()
-            .map(|&o| o as isize)
-            .collect();
-        let strides: Vec<i32> = bindings
-            .strides
-            .iter()
-            .map(|&s| s as i32)
-            .collect();
+        let offsets: Vec<isize> = bindings.offsets.iter().map(|&o| o as isize).collect();
+        let strides: Vec<i32> = bindings.strides.iter().map(|&s| s as i32).collect();
         unsafe {
             gl::BindVertexBuffers(
                 bindings.min_index as u32,

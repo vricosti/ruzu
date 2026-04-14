@@ -8,9 +8,10 @@
 //! an `upload::State` that accumulates data words and flushes them to
 //! GPU virtual memory when the transfer completes.
 
-use crate::memory_manager::MemoryManager;
 use crate::rasterizer_interface::RasterizerInterface;
 use crate::textures::decoders;
+use parking_lot::Mutex;
+use std::sync::Arc;
 
 /// GPU virtual address type.
 pub type GPUVAddr = u64;
@@ -70,7 +71,7 @@ impl DestRegisters {
 /// is needed, avoiding lifetime issues from storing references.
 pub struct FlushContext<'a> {
     pub rasterizer: Option<&'a mut dyn RasterizerInterface>,
-    pub memory_manager: &'a MemoryManager,
+    pub memory_manager: Arc<Mutex<crate::memory_manager::MemoryManager>>,
     pub write_cpu_mem: &'a mut dyn FnMut(u64, &[u8]),
 }
 
@@ -217,6 +218,22 @@ impl State {
     ///   - Block-linear: compute BPP shift, read GPU memory, swizzle subrect, write back.
     fn process_data_bytes(&mut self, read_buffer: &[u8], ctx: &mut FlushContext<'_>) {
         let address = self.regs.dest.address();
+        if std::env::var_os("RUZU_TRACE_DMA_FLOW").is_some() {
+            log::info!(
+                "engine_upload::State::process_data_bytes target=0x{:X} bytes={} linear={} line_length={} line_count={} pitch={} width={} height={} depth={} x={} y={}",
+                address,
+                read_buffer.len(),
+                self.is_linear,
+                self.regs.line_length_in,
+                self.regs.line_count,
+                self.regs.dest.pitch,
+                self.regs.dest.width,
+                self.regs.dest.height,
+                self.regs.dest.depth,
+                self.regs.dest.x,
+                self.regs.dest.y
+            );
+        }
         if self.is_linear {
             // Linear copy: iterate lines, call rasterizer->AccelerateInlineToMemory
             // for each line. Upstream:
@@ -231,6 +248,15 @@ impl State {
                 let end = start + self.regs.line_length_in as usize;
                 if end <= read_buffer.len() {
                     if let Some(ref mut rast) = ctx.rasterizer {
+                        if std::env::var_os("RUZU_TRACE_INLINE_TO_MEMORY").is_some() {
+                            let ptr = *rast as *mut dyn RasterizerInterface;
+                            log::info!(
+                                "engine_upload::State::process_data_bytes calling_rasterizer ptr={:p} dest=0x{:X} size={}",
+                                ptr,
+                                dest_line,
+                                self.regs.line_length_in
+                            );
+                        }
                         rast.accelerate_inline_to_memory(
                             dest_line,
                             self.regs.line_length_in as usize,
@@ -238,7 +264,7 @@ impl State {
                         );
                     } else {
                         // No rasterizer — fall back to direct memory write.
-                        ctx.memory_manager.write_block(
+                        ctx.memory_manager.lock().write_block(
                             dest_line,
                             &read_buffer[start..end],
                             ctx.write_cpu_mem,
@@ -284,6 +310,7 @@ impl State {
             // swizzle_subrect overwrites the relevant parts.
             let read_cpu = |_addr: u64, _dst: &mut [u8]| {};
             ctx.memory_manager
+                .lock()
                 .read_block(address, &mut self.tmp_buffer, &read_cpu);
 
             // Swizzle the upload data into the tiled buffer.
@@ -305,6 +332,7 @@ impl State {
 
             // Write the swizzled buffer back to GPU memory.
             ctx.memory_manager
+                .lock()
                 .write_block(address, &self.tmp_buffer, ctx.write_cpu_mem);
         }
     }

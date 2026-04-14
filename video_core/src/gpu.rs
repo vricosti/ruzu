@@ -221,6 +221,9 @@ impl Gpu {
         // Extract rasterizer from renderer.
         // Upstream: rasterizer = renderer->ReadRasterizer();
         let rasterizer_ptr = renderer.read_rasterizer();
+        if std::env::var_os("RUZU_TRACE_RASTERIZER_BIND").is_some() {
+            log::info!("Gpu::bind_renderer rasterizer_ptr={:p}", rasterizer_ptr);
+        }
         *self.rasterizer.lock().unwrap() = Some(unsafe { std::mem::transmute(rasterizer_ptr) });
         // Upstream also does:
         // host1x.MemoryManager().BindInterface(rasterizer);
@@ -511,6 +514,14 @@ impl Gpu {
     /// Push GPU command entries to be processed.
     /// Matches upstream `GPU::Impl::PushGPUEntries(s32, CommandList&&)`.
     pub fn push_gpu_entries(&self, channel: i32, entries: CommandList) {
+        if std::env::var_os("RUZU_TRACE_GPU_SUBMIT").is_some() {
+            log::info!(
+                "Gpu::push_gpu_entries channel={} lists={} prefetch={}",
+                channel,
+                entries.command_lists.len(),
+                entries.prefetch_command_list.len()
+            );
+        }
         self.gpu_thread
             .lock()
             .unwrap()

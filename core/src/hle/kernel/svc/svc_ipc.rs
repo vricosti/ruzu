@@ -19,6 +19,10 @@ use crate::hle::kernel::svc_common::{Handle, INVALID_HANDLE};
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 use crate::hle::service::hle_ipc::{complete_sync_request, HLERequestContext};
 
+fn should_trace_reply_receive_debug() -> bool {
+    std::env::var_os("RUZU_TRACE_REPLY_RECV").is_some()
+}
+
 fn ipc_timeout_tick_from_ns(current_tick: i64, timeout_ns: i64) -> i64 {
     debug_assert!(timeout_ns > 0);
 
@@ -170,7 +174,10 @@ fn send_sync_request_impl(
     }
     let result = complete_sync_request(&request_manager, &mut context);
     if trace_sync {
-        log::info!("svc::SendSyncRequest stage=complete_sync_request_end result={:#x}", result.get_inner_value());
+        log::info!(
+            "svc::SendSyncRequest stage=complete_sync_request_end result={:#x}",
+            result.get_inner_value()
+        );
     }
     context.write_to_outgoing_command_buffer();
 
@@ -691,17 +698,37 @@ pub fn reply_and_receive(
     reply_target: Handle,
     timeout_ns: i64,
 ) -> ResultCode {
+    let current_thread_id = system.current_thread_id();
+    if should_trace_reply_receive_debug() {
+        log::info!(
+            "svc::ReplyAndReceive tid={:?} handles=0x{:X} num_handles={} reply_target=0x{:X} timeout_ns={}",
+            current_thread_id,
+            handles,
+            num_handles,
+            reply_target,
+            timeout_ns
+        );
+    }
     let timeout = if timeout_ns > 0 {
         let current_tick = system
             .kernel()
             .and_then(|_| crate::hle::kernel::kernel::get_current_hardware_tick())
             .unwrap_or(i64::MAX);
-        ipc_timeout_tick_from_ns(current_tick, timeout_ns)
+        let timeout_tick = ipc_timeout_tick_from_ns(current_tick, timeout_ns);
+        if should_trace_reply_receive_debug() {
+            log::info!(
+                "svc::ReplyAndReceive tid={:?} current_tick={} timeout_tick={}",
+                current_thread_id,
+                current_tick,
+                timeout_tick
+            );
+        }
+        timeout_tick
     } else {
         timeout_ns
     };
 
-    reply_and_receive_impl(
+    let result = reply_and_receive_impl(
         system,
         out_index,
         0,
@@ -710,7 +737,16 @@ pub fn reply_and_receive(
         num_handles,
         reply_target,
         timeout,
-    )
+    );
+    if should_trace_reply_receive_debug() {
+        log::info!(
+            "svc::ReplyAndReceive tid={:?} result=0x{:08X} out_index={}",
+            current_thread_id,
+            result.get_inner_value(),
+            *out_index
+        );
+    }
+    result
 }
 
 /// Replies and receives with a user-provided message buffer.
@@ -741,6 +777,20 @@ pub fn reply_and_receive_with_user_buffer(
         return RESULT_INVALID_CURRENT_MEMORY;
     }
 
+    let current_thread_id = system.current_thread_id();
+    if should_trace_reply_receive_debug() {
+        log::info!(
+            "svc::ReplyAndReceiveWithUserBuffer tid={:?} message=0x{:X} buffer_size=0x{:X} handles=0x{:X} num_handles={} reply_target=0x{:X} timeout_ns={}",
+            current_thread_id,
+            message,
+            buffer_size,
+            handles,
+            num_handles,
+            reply_target,
+            timeout_ns
+        );
+    }
+
     // Lock the message buffer.
     {
         let mut process = system.current_process_arc().lock().unwrap();
@@ -760,7 +810,16 @@ pub fn reply_and_receive_with_user_buffer(
             .kernel()
             .and_then(|_| crate::hle::kernel::kernel::get_current_hardware_tick())
             .unwrap_or(i64::MAX);
-        ipc_timeout_tick_from_ns(current_tick, timeout_ns)
+        let timeout_tick = ipc_timeout_tick_from_ns(current_tick, timeout_ns);
+        if should_trace_reply_receive_debug() {
+            log::info!(
+                "svc::ReplyAndReceiveWithUserBuffer tid={:?} current_tick={} timeout_tick={}",
+                current_thread_id,
+                current_tick,
+                timeout_tick
+            );
+        }
+        timeout_tick
     } else {
         timeout_ns
     };
@@ -776,6 +835,14 @@ pub fn reply_and_receive_with_user_buffer(
         reply_target,
         timeout,
     );
+    if should_trace_reply_receive_debug() {
+        log::info!(
+            "svc::ReplyAndReceiveWithUserBuffer tid={:?} result=0x{:08X} out_index={}",
+            current_thread_id,
+            result.get_inner_value(),
+            *out_index
+        );
+    }
 
     // Unlock the message buffer.
     {

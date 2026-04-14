@@ -45,8 +45,7 @@ pub struct NvdrvInterface {
 
 impl NvdrvInterface {
     fn should_trace_lifecycle() -> bool {
-        std::env::var_os("RUZU_NVDRV_TRACE")
-            .is_some_and(|value| value != std::ffi::OsStr::new("0"))
+        std::env::var_os("RUZU_NVDRV_TRACE").is_some_and(|value| value != std::ffi::OsStr::new("0"))
     }
 
     fn should_trace_ioctl_payload(command: Ioctl) -> bool {
@@ -364,7 +363,28 @@ impl NvdrvInterface {
             return (NvResult::NotInitialized, None);
         }
 
-        self.nvdrv.query_event(fd, event_id)
+        let result = self.nvdrv.query_event(fd, event_id);
+        if Self::should_trace_lifecycle() {
+            if let (nv_result, Some(event)) = &result {
+                let object_id = event.lock().unwrap().object_id;
+                log::info!(
+                    "NVDRV::QueryEvent result fd={} event_id={} nv_result={:?} readable_event_object_id={}",
+                    fd,
+                    event_id,
+                    nv_result,
+                    object_id
+                );
+            } else {
+                log::info!(
+                    "NVDRV::QueryEvent result fd={} event_id={} nv_result={:?} readable_event_object_id=<none>",
+                    fd,
+                    event_id,
+                    result.0
+                );
+            }
+        }
+
+        result
     }
 
     pub fn register_query_event_owner(
@@ -419,8 +439,7 @@ pub struct NvdrvService {
 
 impl NvdrvService {
     fn should_trace_lifecycle() -> bool {
-        std::env::var_os("RUZU_NVDRV_TRACE")
-            .is_some_and(|value| value != std::ffi::OsStr::new("0"))
+        std::env::var_os("RUZU_NVDRV_TRACE").is_some_and(|value| value != std::ffi::OsStr::new("0"))
     }
 
     pub fn new(nvdrv: Arc<Module>, name: &str) -> Self {

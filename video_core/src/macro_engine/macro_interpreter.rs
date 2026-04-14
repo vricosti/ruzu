@@ -10,6 +10,9 @@ use super::macro_engine::{
     AluOperation, BranchCondition, CachedMacro, MethodAddress, Opcode, Operation, ResultOperation,
     NUM_MACRO_REGISTERS,
 };
+use std::sync::atomic::{AtomicU32, Ordering};
+
+static MACRO_14F_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
 
 // ── MacroInterpreterImpl ─────────────────────────────────────────────────────
 
@@ -51,6 +54,9 @@ pub struct MacroInterpreterImpl {
     /// Callback for reading a GPU method register.
     /// Signature: (method) -> value
     method_reader: Option<Box<dyn Fn(u32) -> u32 + Send>>,
+
+    /// Current macro method being executed.
+    current_method: u32,
 }
 
 impl MacroInterpreterImpl {
@@ -69,6 +75,7 @@ impl MacroInterpreterImpl {
             carry_flag: false,
             method_writer: None,
             method_reader: None,
+            current_method: 0,
         }
     }
 
@@ -339,6 +346,22 @@ impl MacroInterpreterImpl {
     /// Port of `MacroInterpreterImpl::Send`.
     fn send(&mut self, value: u32) {
         let address = self.method_address.address();
+        let trace_macro_14f =
+            self.current_method == 0x14F && std::env::var_os("RUZU_TRACE_MACRO_14F").is_some();
+        let trace_macro_flow = std::env::var_os("RUZU_TRACE_MACRO_FLOW").is_some();
+        if trace_macro_14f || trace_macro_flow {
+            let idx = MACRO_14F_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
+            if idx < 128 {
+                log::info!(
+                    "MacroInterpreterImpl::send method=0x{:X} write#{} addr=0x{:X} value=0x{:08X} increment=0x{:X}",
+                    self.current_method,
+                    idx,
+                    address,
+                    value,
+                    self.method_address.increment()
+                );
+            }
+        }
         if let Some(ref mut writer) = self.method_writer {
             writer(address, value, true);
         }
@@ -379,8 +402,9 @@ impl CachedMacro for MacroInterpreterImpl {
     /// Execute the macro with the given parameters.
     ///
     /// Port of `MacroInterpreterImpl::Execute`.
-    fn execute(&mut self, parameters: &[u32], _method: u32) {
+    fn execute(&mut self, parameters: &[u32], method: u32) {
         self.reset();
+        self.current_method = method;
 
         self.registers[1] = parameters[0];
         self.parameters = parameters.to_vec();

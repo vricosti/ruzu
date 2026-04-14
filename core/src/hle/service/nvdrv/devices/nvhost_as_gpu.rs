@@ -193,6 +193,11 @@ unsafe impl Send for NvHostAsGpu {}
 unsafe impl Sync for NvHostAsGpu {}
 
 impl NvHostAsGpu {
+    fn should_trace_map_loop() -> bool {
+        std::env::var_os("RUZU_TRACE_NVHOST_AS_MAP")
+            .is_some_and(|value| value != std::ffi::OsStr::new("0"))
+    }
+
     pub fn new(system: SystemRef, module: &Module, container: &Container) -> Self {
         Self {
             system,
@@ -557,6 +562,17 @@ impl NvHostAsGpu {
             params.handle,
             params.offset
         );
+        if Self::should_trace_map_loop() {
+            log::info!(
+                "nvhost_as_gpu::MapBufferEx begin flags=0x{:X} handle=0x{:X} buffer_offset=0x{:X} mapping_size=0x{:X} offset=0x{:X} kind=0x{:X}",
+                params.flags,
+                params.handle,
+                params.buffer_offset,
+                params.mapping_size,
+                params.offset,
+                params.kind
+            );
+        }
 
         let _owner_guard = self.mutex.lock().unwrap();
         let mut vm = self.vm.lock().unwrap();
@@ -600,6 +616,15 @@ impl NvHostAsGpu {
                 params.mapping_size,
                 mapping.big_page
             );
+            if Self::should_trace_map_loop() {
+                log::info!(
+                    "nvhost_as_gpu::MapBufferEx remap gpu=0x{:X} dev=0x{:X} size=0x{:X} big_page={}",
+                    gpu_address,
+                    device_address,
+                    params.mapping_size,
+                    mapping.big_page
+                );
+            }
             return NvResult::Success;
         }
 
@@ -663,6 +688,7 @@ impl NvHostAsGpu {
                 sparse_alloc,
             });
             alloc.mappings.push(Arc::clone(&mapping));
+            let alloc_big_pages = alloc.big_pages;
             drop(alloc_map);
             self.mapping_map.lock().unwrap().insert(offset, mapping);
             log::debug!(
@@ -673,6 +699,16 @@ impl NvHostAsGpu {
                 size,
                 use_big_pages
             );
+            if Self::should_trace_map_loop() {
+                log::info!(
+                    "nvhost_as_gpu::MapBufferEx fixed gpu=0x{:X} dev=0x{:X} size=0x{:X} use_big_pages={} alloc_big_pages={}",
+                    offset,
+                    device_address,
+                    size,
+                    use_big_pages,
+                    alloc_big_pages
+                );
+            }
             return NvResult::Success;
         }
 
@@ -730,6 +766,16 @@ impl NvHostAsGpu {
             size,
             big_page
         );
+        if Self::should_trace_map_loop() {
+            log::info!(
+                "nvhost_as_gpu::MapBufferEx alloc gpu=0x{:X} dev=0x{:X} size=0x{:X} aligned=0x{:X} big_page={}",
+                params.offset,
+                device_address,
+                size,
+                aligned_size,
+                big_page
+            );
+        }
         NvResult::Success
     }
 

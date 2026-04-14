@@ -113,10 +113,7 @@ mod tests {
         program
             .info
             .constant_buffer_descriptors
-            .push(crate::ir::program::CbufDescriptor {
-                index: 0,
-                count: 1,
-            });
+            .push(crate::ir::program::CbufDescriptor { index: 0, count: 1 });
         program.blocks.push(Block::new());
 
         {

@@ -14,6 +14,10 @@ use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
+fn should_trace_adsp_audio() -> bool {
+    std::env::var_os("RUZU_TRACE_ADSP_AUDIO").is_some()
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(non_camel_case_types)]
 #[repr(u32)]
@@ -143,7 +147,13 @@ impl AudioRenderer {
     }
 
     pub fn wait(&mut self) {
+        if should_trace_adsp_audio() {
+            log::info!("ADSP::AudioRenderer host wait begin");
+        }
         let message = self.mailbox.receive(Direction::Host);
+        if should_trace_adsp_audio() {
+            log::info!("ADSP::AudioRenderer host wait end message={}", message);
+        }
         if message != Message::RenderResponse as u32 {
             error!(
                 "Did not receive the expected render response from the AudioRenderer: expected {}, got {}",
@@ -317,8 +327,16 @@ impl AudioRenderer {
                     mailbox.send(Direction::Host, Message::MapUnmap_ShutdownResponse as u32);
                 }
                 message if message == Message::Render as u32 => {
+                    if should_trace_adsp_audio() {
+                        log::info!("ADSP::AudioRenderer dsp main received Render");
+                    }
                     if system.lock().is_shutting_down() {
                         thread::sleep(Duration::from_millis(5));
+                        if should_trace_adsp_audio() {
+                            log::info!(
+                                "ADSP::AudioRenderer dsp main sending RenderResponse (shutdown)"
+                            );
+                        }
                         mailbox.send(Direction::Host, Message::RenderResponse as u32);
                         continue;
                     }
@@ -346,6 +364,20 @@ impl AudioRenderer {
                         let Some(stream) = stream else {
                             continue;
                         };
+
+                        if should_trace_adsp_audio() && index == 0 {
+                            let stream_guard = stream.lock();
+                            log::info!(
+                                "ADSP::AudioRenderer pre-process session={} buffer=0x{:X} size={} remaining={} reset={} queue={} paused={}",
+                                index,
+                                buffer_state.buffer,
+                                buffer_state.size,
+                                buffer_state.remaining_command_count,
+                                buffer_state.reset_buffer,
+                                stream_guard.get_queue_size(),
+                                stream_guard.is_paused()
+                            );
+                        }
 
                         {
                             let mut shared = shared.lock();
@@ -376,7 +408,31 @@ impl AudioRenderer {
                             // Wait without holding the stream lock — the cubeb
                             // callback needs the lock to consume buffers.
                             let release = stream.lock().release.clone();
+                            if should_trace_adsp_audio() {
+                                let queued = release.queued_buffers.load(Ordering::Acquire);
+                                let max = release.max_queue_size.load(Ordering::Acquire);
+                                let paused = release.paused.load(Ordering::Acquire);
+                                log::info!(
+                                    "ADSP::AudioRenderer wait_free_space begin session={} queued={} max={} paused={}",
+                                    index,
+                                    queued,
+                                    max,
+                                    paused
+                                );
+                            }
                             release.wait_free_space_with_stop(&stop_requested);
+                            if should_trace_adsp_audio() {
+                                let queued = release.queued_buffers.load(Ordering::Acquire);
+                                let max = release.max_queue_size.load(Ordering::Acquire);
+                                let paused = release.paused.load(Ordering::Acquire);
+                                log::info!(
+                                    "ADSP::AudioRenderer wait_free_space end session={} queued={} max={} paused={}",
+                                    index,
+                                    queued,
+                                    max,
+                                    paused
+                                );
+                            }
                         }
 
                         let mut max_time = MAX_PROCESS_TIME;
@@ -410,8 +466,22 @@ impl AudioRenderer {
                             .as_micros() as u64;
                         buffer.remaining_command_count = processor.get_remaining_command_count();
                         buffer.render_time_taken_us = end_time.saturating_sub(start_time);
+                        if should_trace_adsp_audio() && index == 0 {
+                            let stream_guard = stream.lock();
+                            log::info!(
+                                "ADSP::AudioRenderer post-process session={} remaining={} render_time_us={} queue={} paused={}",
+                                index,
+                                buffer.remaining_command_count,
+                                buffer.render_time_taken_us,
+                                stream_guard.get_queue_size(),
+                                stream_guard.is_paused()
+                            );
+                        }
                     }
 
+                    if should_trace_adsp_audio() {
+                        log::info!("ADSP::AudioRenderer dsp main sending RenderResponse");
+                    }
                     mailbox.send(Direction::Host, Message::RenderResponse as u32);
                 }
                 _ => {

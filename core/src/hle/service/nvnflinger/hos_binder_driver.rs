@@ -8,6 +8,7 @@
 //! It delegates to HosBinderDriverServer for actual binder management.
 
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use crate::hle::result::{ResultCode, RESULT_SUCCESS, RESULT_UNKNOWN};
@@ -17,6 +18,18 @@ use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFrame
 
 use super::hos_binder_driver_server::HosBinderDriverServer;
 use super::surface_flinger::SurfaceFlinger;
+
+static TRACE_BINDER_TXN_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+fn trace_binder_txn(args: std::fmt::Arguments<'_>) {
+    if std::env::var_os("RUZU_TRACE_BINDER_TXN").is_none() {
+        return;
+    }
+    let idx = TRACE_BINDER_TXN_COUNT.fetch_add(1, Ordering::Relaxed);
+    if idx < 192 {
+        log::info!("{}", args);
+    }
+}
 
 /// The IHOSBinderDriver service provides the display driver binder interface.
 ///
@@ -81,15 +94,24 @@ impl IHosBinderDriver {
         let write_size = ctx.get_write_buffer_size(0);
         let mut parcel_reply = vec![0u8; write_size];
 
+        trace_binder_txn(format_args!(
+            "IHOSBinderDriver::TransactParcel id={} txn={} flags={} in_len={} out_len={}",
+            id,
+            transaction_id,
+            flags,
+            parcel_data.len(),
+            write_size
+        ));
+
         if let Some(binder) = svc.server.try_get_binder(id) {
             binder.transact(transaction_id, &parcel_data, &mut parcel_reply, flags);
-            log::info!(
-                "TransactParcel response: id={} txn={} reply_len={} first_bytes=[{:02x?}]",
+            trace_binder_txn(format_args!(
+                "IHOSBinderDriver::TransactParcel reply id={} txn={} reply_len={} first_bytes=[{:02x?}]",
                 id,
                 transaction_id,
                 parcel_reply.len(),
                 &parcel_reply[..parcel_reply.len().min(32)]
-            );
+            ));
         } else {
             log::warn!("TransactParcel: binder id={} not found", id);
         }
@@ -142,13 +164,6 @@ impl IHosBinderDriver {
             return;
         };
 
-        let Some(readable_event) = binder.get_native_handle(type_id) else {
-            let mut rb = ResponseBuilder::new(ctx, 2, 1, 0);
-            rb.push_result(RESULT_SUCCESS);
-            rb.push_copy_objects(0);
-            return;
-        };
-
         if let Some(thread) = ctx.get_thread() {
             let thread_guard = thread.lock().unwrap();
             if let (Some(parent), Some(scheduler)) = (
@@ -165,9 +180,33 @@ impl IHosBinderDriver {
             }
         }
 
+        let Some(readable_event) = binder.get_native_handle(type_id) else {
+            let mut rb = ResponseBuilder::new(ctx, 2, 1, 0);
+            rb.push_result(RESULT_SUCCESS);
+            rb.push_copy_objects(0);
+            return;
+        };
+
+        if std::env::var_os("RUZU_TRACE_BINDER_HANDLE").is_some() {
+            log::info!(
+                "IHOSBinderDriver::GetNativeHandle result id={} type_id={} object_id={}",
+                id,
+                type_id,
+                readable_event.lock().unwrap().object_id
+            );
+        }
+
         let handle = ctx
             .copy_handle_for_readable_event(readable_event)
             .unwrap_or(0);
+        if std::env::var_os("RUZU_TRACE_BINDER_HANDLE").is_some() {
+            log::info!(
+                "IHOSBinderDriver::GetNativeHandle copy id={} type_id={} handle=0x{:08X}",
+                id,
+                type_id,
+                handle
+            );
+        }
         let mut rb = ResponseBuilder::new(ctx, 2, 1, 0);
         rb.push_result(RESULT_SUCCESS);
         rb.push_copy_objects(handle);

@@ -570,10 +570,10 @@ impl ServerManager {
         let readable_event_object_id = kernel.create_new_object_id() as u64;
 
         let event = Arc::new(Mutex::new(KEvent::new()));
-        event
-            .lock()
-            .unwrap()
-            .initialize(process.lock().unwrap().get_process_id(), readable_event_object_id);
+        event.lock().unwrap().initialize(
+            process.lock().unwrap().get_process_id(),
+            readable_event_object_id,
+        );
 
         let readable_event = Arc::new(Mutex::new(KReadableEvent::new()));
         readable_event

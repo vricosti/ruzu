@@ -1141,7 +1141,7 @@ impl KProcess {
         result.get_inner_value()
     }
 
-    pub fn signal_condition_variable(&mut self, cv_key: u64, count: i32) {
+    pub fn signal_condition_variable(&mut self, scheduler_lock_ptr: u64, cv_key: u64, count: i32) {
         log::trace!(
             "KProcess::signal_condition_variable enter cv_key=0x{:X} count={}",
             cv_key,
@@ -1149,7 +1149,7 @@ impl KProcess {
         );
         let cond_var_ptr: *mut KConditionVariable = &mut self.cond_var;
         unsafe {
-            (*cond_var_ptr).signal(self, cv_key, count);
+            (*cond_var_ptr).signal(self, scheduler_lock_ptr, cv_key, count);
         }
         log::trace!(
             "KProcess::signal_condition_variable return cv_key=0x{:X} count={}",
@@ -2477,7 +2477,10 @@ impl KProcess {
         thread_reservation.commit();
         stack_memory_reservation.commit();
         if trace_boot {
-            log::info!("KProcess::run: reservations committed pid={}", self.process_id);
+            log::info!(
+                "KProcess::run: reservations committed pid={}",
+                self.process_id
+            );
         }
 
         Ok((main_thread, thread_handle, stack_base, stack_top))

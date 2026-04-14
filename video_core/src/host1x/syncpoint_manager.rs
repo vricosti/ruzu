@@ -192,6 +192,13 @@ impl SyncpointManager {
         expected_value: u32,
         action: Box<dyn FnOnce() + Send>,
     ) -> Option<ActionHandle> {
+        if std::env::var_os("RUZU_TRACE_SYNCPOINT").is_some() {
+            log::info!(
+                "Host1xSyncpointManager::register_host_action id={} expected={}",
+                syncpoint_id,
+                expected_value
+            );
+        }
         self.register_action(
             &self.syncpoints_host[syncpoint_id as usize],
             syncpoint_id as usize,
@@ -212,6 +219,13 @@ impl SyncpointManager {
     }
 
     pub fn increment_guest(&self, syncpoint_id: u32) {
+        if std::env::var_os("RUZU_TRACE_SYNCPOINT").is_some() {
+            log::info!(
+                "Host1xSyncpointManager::increment_guest id={} before={}",
+                syncpoint_id,
+                self.syncpoints_guest[syncpoint_id as usize].load(Ordering::Acquire)
+            );
+        }
         self.increment(
             &self.syncpoints_guest[syncpoint_id as usize],
             syncpoint_id as usize,
@@ -220,6 +234,13 @@ impl SyncpointManager {
     }
 
     pub fn increment_host(&self, syncpoint_id: u32) {
+        if std::env::var_os("RUZU_TRACE_SYNCPOINT").is_some() {
+            log::info!(
+                "Host1xSyncpointManager::increment_host id={} before={}",
+                syncpoint_id,
+                self.syncpoints_host[syncpoint_id as usize].load(Ordering::Acquire)
+            );
+        }
         self.increment(
             &self.syncpoints_host[syncpoint_id as usize],
             syncpoint_id as usize,
@@ -236,6 +257,14 @@ impl SyncpointManager {
     }
 
     pub fn wait_host(&self, syncpoint_id: u32, expected_value: u32) {
+        if std::env::var_os("RUZU_TRACE_SYNCPOINT").is_some() {
+            log::info!(
+                "Host1xSyncpointManager::wait_host id={} expected={} current={}",
+                syncpoint_id,
+                expected_value,
+                self.syncpoints_host[syncpoint_id as usize].load(Ordering::Acquire)
+            );
+        }
         self.wait(
             &self.syncpoints_host[syncpoint_id as usize],
             &self.wait_host_cv,

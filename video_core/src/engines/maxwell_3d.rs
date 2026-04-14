@@ -9,6 +9,7 @@
 //! Register writes are stored in a flat array and side-effect methods (clear,
 //! draw begin/end) are triggered on specific register writes.
 
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
 use parking_lot::Mutex;
@@ -27,6 +28,12 @@ use crate::rasterizer_interface::RasterizerInterface;
 struct Maxwell3DPtr(*mut Maxwell3D);
 
 unsafe impl Send for Maxwell3DPtr {}
+
+static MAXWELL3D_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
+
+fn should_trace_dma_flow() -> bool {
+    std::env::var_os("RUZU_TRACE_DMA_FLOW").is_some()
+}
 
 impl Maxwell3DPtr {
     unsafe fn call_method(self, address: u32, value: u32) {
@@ -1912,6 +1919,10 @@ impl Maxwell3D {
     }
 
     pub fn bind_rasterizer(&mut self, rasterizer: &dyn RasterizerInterface) {
+        if std::env::var_os("RUZU_TRACE_RASTERIZER_BIND").is_some() {
+            let ptr = rasterizer as *const dyn RasterizerInterface;
+            log::info!("Maxwell3D::bind_rasterizer rasterizer_ptr={:p}", ptr);
+        }
         self.rasterizer = Some(unsafe {
             std::mem::transmute::<*const dyn RasterizerInterface, [usize; 2]>(rasterizer)
         });
@@ -2040,6 +2051,19 @@ impl Maxwell3D {
     }
 
     fn process_inline_upload_word(&mut self, data: u32, is_last_call: bool) {
+        if should_trace_dma_flow() {
+            let trace_idx = MAXWELL3D_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
+            if trace_idx < 160 {
+                log::info!(
+                    "Maxwell3D::process_inline_upload_word data=0x{:X} last={} target=0x{:X} size={} linear={}",
+                    data,
+                    is_last_call,
+                    self.upload_registers().dest.address(),
+                    self.upload_registers().line_length_in * self.upload_registers().line_count,
+                    self.launch_dma_is_linear()
+                );
+            }
+        }
         self.upload_state.regs = self.upload_registers();
         let Some(memory_manager) = self.memory_manager.as_ref().cloned() else {
             return;
@@ -2053,11 +2077,10 @@ impl Maxwell3D {
                 writer(addr, bytes);
             }
         };
-        let memory_manager = memory_manager.lock();
         let mut rasterizer = rasterizer_raw.map(|ptr| unsafe { &mut *ptr });
         let mut ctx = engine_upload::FlushContext {
             rasterizer: rasterizer.as_deref_mut(),
-            memory_manager: &*memory_manager,
+            memory_manager,
             write_cpu_mem: &mut write_cpu,
         };
         self.upload_state
@@ -2065,6 +2088,19 @@ impl Maxwell3D {
     }
 
     fn process_inline_upload_multi(&mut self, data: &[u32]) {
+        if should_trace_dma_flow() {
+            let trace_idx = MAXWELL3D_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
+            if trace_idx < 160 {
+                log::info!(
+                    "Maxwell3D::process_inline_upload_multi words={} first=0x{:X} target=0x{:X} size={} linear={}",
+                    data.len(),
+                    data.first().copied().unwrap_or(0),
+                    self.upload_registers().dest.address(),
+                    self.upload_registers().line_length_in * self.upload_registers().line_count,
+                    self.launch_dma_is_linear()
+                );
+            }
+        }
         self.upload_state.regs = self.upload_registers();
         let Some(memory_manager) = self.memory_manager.as_ref().cloned() else {
             return;
@@ -2072,17 +2108,25 @@ impl Maxwell3D {
         let rasterizer_raw = self.rasterizer.map(|raw| unsafe {
             std::mem::transmute::<[usize; 2], *mut dyn RasterizerInterface>(raw)
         });
+        if std::env::var_os("RUZU_TRACE_INLINE_TO_MEMORY").is_some() {
+            log::info!(
+                "Maxwell3D::process_inline_upload_multi rasterizer_present={} rasterizer_ptr={:?} target=0x{:X} words={}",
+                rasterizer_raw.is_some(),
+                rasterizer_raw.map(|ptr| ptr as *mut ()),
+                self.upload_registers().dest.address(),
+                data.len()
+            );
+        }
         let writer = self.guest_memory_writer.as_ref().cloned();
         let mut write_cpu = move |addr: u64, bytes: &[u8]| {
             if let Some(writer) = writer.as_ref() {
                 writer(addr, bytes);
             }
         };
-        let memory_manager = memory_manager.lock();
         let mut rasterizer = rasterizer_raw.map(|ptr| unsafe { &mut *ptr });
         let mut ctx = engine_upload::FlushContext {
             rasterizer: rasterizer.as_deref_mut(),
-            memory_manager: &*memory_manager,
+            memory_manager,
             write_cpu_mem: &mut write_cpu,
         };
         self.upload_state
@@ -3058,6 +3102,26 @@ impl Maxwell3D {
         nonshadow_argument: u32,
         is_last_call: bool,
     ) {
+        if should_trace_dma_flow() {
+            match method {
+                WAIT_FOR_IDLE
+                | REPORT_SEMAPHORE_QUERY
+                | SYNC_INFO
+                | LAUNCH_DMA
+                | FRAGMENT_BARRIER
+                | INVALIDATE_TEXTURE_DATA_CACHE
+                | TILED_CACHE_BARRIER => {
+                    log::info!(
+                        "Maxwell3D::process_method_call method=0x{:X} arg=0x{:X} nonshadow=0x{:X} last={}",
+                        method,
+                        argument,
+                        nonshadow_argument,
+                        is_last_call
+                    );
+                }
+                _ => {}
+            }
+        }
         match method {
             WAIT_FOR_IDLE => {
                 let _ = self.with_rasterizer_mut(|rasterizer| rasterizer.wait_for_idle());
@@ -3575,6 +3639,9 @@ impl Maxwell3D {
     /// Handle sync point. Matches upstream `ProcessSyncPoint`.
     fn process_sync_point(&mut self) {
         let sync_point = self.regs[SYNC_INFO as usize] & 0xFFFF;
+        if std::env::var_os("RUZU_TRACE_GPU_SUBMIT").is_some() {
+            log::info!("Maxwell3D::process_sync_point sync_point={}", sync_point);
+        }
         log::debug!("Maxwell3D: sync_point {}", sync_point);
         let _ = self.with_rasterizer_mut(|rasterizer| rasterizer.signal_sync_point(sync_point));
     }
@@ -3618,7 +3685,19 @@ impl Maxwell3D {
         let entry = ((method - MACRO_REGISTERS_START) >> 1) % 128;
         let params = std::mem::take(&mut self.macro_params);
         let macro_method = self.macro_positions[entry as usize];
-        if macro_method == 0x14F {
+        if should_trace_dma_flow() {
+            let trace_idx = MAXWELL3D_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
+            if trace_idx < 128 {
+                log::info!(
+                    "Maxwell3D::call_macro_method entry={} macro_start=0x{:X} param_count={} params={:08X?} dirty={}",
+                    entry,
+                    macro_method,
+                    params.len(),
+                    params,
+                    self.current_macro_dirty
+                );
+            }
+        } else if macro_method == 0x14F {
             log::info!(
                 "Maxwell3D::call_macro_method trace entry={} macro_start=0x{:X} params={:08X?} addrs={:X?} segments={:X?} dirty={}",
                 entry,
@@ -3783,6 +3862,17 @@ impl EngineInterface for Maxwell3D {
     /// Write a single value to the register identified by `method`.
     /// Matches upstream `Maxwell3D::CallMethod`.
     fn call_method(&mut self, method: u32, method_argument: u32, is_last_call: bool) {
+        if should_trace_dma_flow() {
+            let trace_idx = MAXWELL3D_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
+            if trace_idx < 96 {
+                log::info!(
+                    "Maxwell3D::call_method method=0x{:X} arg=0x{:X} last={}",
+                    method,
+                    method_argument,
+                    is_last_call
+                );
+            }
+        }
         // It is an error to write to a register other than the current macro's
         // ARG register before it has finished execution.
         if self.executing_macro != 0 {
@@ -3927,6 +4017,7 @@ mod tests {
         bound_uniforms: Vec<(usize, u32, u64, u32)>,
         disabled_uniforms: Vec<(usize, u32)>,
         accelerate_conditional_rendering: bool,
+        inline_to_memory: Vec<(u64, usize, Vec<u8>)>,
         /// (instance_count, draw_indexed, shader_program_addresses) per `draw` call.
         draws: Vec<(u32, bool, [u64; 6])>,
     }
@@ -4044,12 +4135,12 @@ mod tests {
         fn accelerate_conditional_rendering(&mut self) -> bool {
             self.calls.lock().unwrap().accelerate_conditional_rendering
         }
-        fn accelerate_inline_to_memory(
-            &mut self,
-            _address: u64,
-            _copy_size: usize,
-            _memory: &[u8],
-        ) {
+        fn accelerate_inline_to_memory(&mut self, address: u64, copy_size: usize, memory: &[u8]) {
+            self.calls
+                .lock()
+                .unwrap()
+                .inline_to_memory
+                .push((address, copy_size, memory.to_vec()));
         }
     }
 
@@ -6445,6 +6536,40 @@ mod tests {
         assert_eq!(engine.regs[UPLOAD_REGS_BASE + 3], 0x5566);
         assert_eq!(engine.regs[LAUNCH_DMA as usize], 0x1011);
         assert_eq!(zero_memory.len(), 8);
+    }
+
+    #[test]
+    fn test_process_inline_upload_multi_calls_bound_rasterizer() {
+        let calls = Arc::new(Mutex::new(RasterizerCalls::default()));
+        let rasterizer = TestRasterizer::new(Arc::clone(&calls));
+        let memory_manager = Arc::new(parking_lot::Mutex::new(
+            crate::memory_manager::MemoryManager::new_with_geometry(1, 32, 0x1_0000_0000, 16, 12),
+        ));
+
+        let mut engine = Maxwell3D::new();
+        engine.set_memory_manager(Arc::clone(&memory_manager));
+        engine.bind_rasterizer(&rasterizer);
+        engine.regs[UPLOAD_REGS_BASE as usize] = 8;
+        engine.regs[(UPLOAD_REGS_BASE + 1) as usize] = 1;
+        engine.regs[(UPLOAD_REGS_BASE + 2) as usize] = 0;
+        engine.regs[(UPLOAD_REGS_BASE + 3) as usize] = 0x2000;
+        engine.regs[(UPLOAD_REGS_BASE + 4) as usize] = 8;
+        engine.regs[LAUNCH_DMA as usize] = 0x1011;
+        engine.upload_state.regs = engine.upload_registers();
+        engine
+            .upload_state
+            .process_exec(engine.launch_dma_is_linear());
+
+        engine.process_inline_upload_multi(&[0x1122_3344, 0x5566_7788]);
+
+        assert_eq!(
+            calls.lock().unwrap().inline_to_memory,
+            vec![(
+                0x2000,
+                8,
+                vec![0x44, 0x33, 0x22, 0x11, 0x88, 0x77, 0x66, 0x55]
+            )]
+        );
     }
 
     #[test]
