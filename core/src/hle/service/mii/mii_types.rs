@@ -250,14 +250,13 @@ impl HairFlip {
     pub const MAX: HairFlip = HairFlip::Right;
 }
 
-#[repr(u8)]
+#[repr(transparent)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub enum CommonColor {
-    // For simplicity common colors aren't listed
-    Max = 99,
-}
+pub struct CommonColor(pub u8);
 
 impl CommonColor {
+    #[allow(non_upper_case_globals)]
+    pub const Max: CommonColor = CommonColor(99);
     pub const COUNT: usize = 100;
 }
 
