@@ -683,7 +683,18 @@ impl NvDevice for NvHostGpu {
                         &[]
                     };
                     let r = self.submit_gpfifo_base1(&mut params, var_data, false);
+                    // Match upstream `WrapFixedVariable`: copy both the fixed struct
+                    // AND the trailing variable-length gpfifo entries to the output
+                    // buffer. The server doesn't modify the variable data, so it
+                    // must be echoed back from input for the game's runtime to read
+                    // the submitted entries from the output buffer.
                     write_struct(output, &params);
+                    if output.len() > fixed_size && !var_data.is_empty() {
+                        let max_var = output.len() - fixed_size;
+                        let copy_len = var_data.len().min(max_var);
+                        output[fixed_size..fixed_size + copy_len]
+                            .copy_from_slice(&var_data[..copy_len]);
+                    }
                     r
                 }
                 0x1b => {
@@ -696,6 +707,12 @@ impl NvDevice for NvHostGpu {
                     };
                     let r = self.submit_gpfifo_base1(&mut params, var_data, true);
                     write_struct(output, &params);
+                    if output.len() > fixed_size && !var_data.is_empty() {
+                        let max_var = output.len() - fixed_size;
+                        let copy_len = var_data.len().min(max_var);
+                        output[fixed_size..fixed_size + copy_len]
+                            .copy_from_slice(&var_data[..copy_len]);
+                    }
                     r
                 }
                 0x9 => {
