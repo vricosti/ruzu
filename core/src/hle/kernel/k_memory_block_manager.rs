@@ -482,73 +482,60 @@ impl KMemoryBlockManager {
     ///
     /// Upstream: KMemoryBlockManager::CoalesceForUpdate.
     fn coalesce_for_update(&mut self, address: usize, num_pages: usize) {
-        let update_end = address + num_pages * PAGE_SIZE;
-
-        // Determine the range of blocks to consider for merging.
-        // We need to include the block before `address` and the block at `update_end`.
-        let start_key = {
-            let mut sk = address;
-            // Find the block that ends at `address` (the predecessor).
-            for (&k, block) in self.memory_block_tree.range(..address).rev() {
-                if block.get_end_address() == address {
-                    sk = k;
-                }
-                break;
-            }
-            sk
-        };
-
-        // Collect all keys in the coalesce range.
-        let end_key = {
-            // Include the block at update_end (the successor) if it exists.
-            let mut ek = update_end;
-            if let Some((&k, _)) = self.memory_block_tree.range(update_end..).next() {
-                if k == update_end {
-                    // Include this block's end for coalescing.
-                    ek = k + 1; // just past start to include it in range
-                }
-            }
-            ek
-        };
-
-        // Collect keys for merging candidates (from start_key to end_key inclusive).
-        let keys: Vec<usize> = self
-            .memory_block_tree
-            .range(start_key..=end_key)
-            .map(|(&k, _)| k)
-            .collect();
-
-        if keys.len() < 2 {
+        if self.memory_block_tree.is_empty() {
             return;
         }
 
-        // Attempt to merge consecutive blocks.
-        let mut i = 0;
-        while i < keys.len() - 1 {
-            let cur_key = keys[i];
-            let next_key = keys[i + 1];
+        let update_end = address + num_pages * PAGE_SIZE;
+
+        let mut current_key = self
+            .memory_block_tree
+            .range(..=address)
+            .rev()
+            .find(|(_, block)| block.get_address() <= address && address < block.get_end_address())
+            .map(|(&key, _)| key)
+            .unwrap_or(address);
+
+        if address != self.m_start_address {
+            if let Some((&prev_key, _)) = self.memory_block_tree.range(..current_key).next_back() {
+                current_key = prev_key;
+            }
+        }
+
+        loop {
+            let next_key = match self
+                .memory_block_tree
+                .range((
+                    std::ops::Bound::Excluded(current_key),
+                    std::ops::Bound::Unbounded,
+                ))
+                .next()
+                .map(|(&key, _)| key)
+            {
+                Some(key) => key,
+                None => break,
+            };
 
             let can_merge = {
-                let cur = self.memory_block_tree.get(&cur_key);
+                let cur = self.memory_block_tree.get(&current_key);
                 let next = self.memory_block_tree.get(&next_key);
-                match (cur, next) {
-                    (Some(c), Some(n)) => c.can_merge_with(n),
-                    _ => false,
-                }
+                matches!((cur, next), (Some(c), Some(n)) if c.can_merge_with(n))
             };
 
             if can_merge {
                 let next_block = self.memory_block_tree.remove(&next_key).unwrap();
-                let cur_block = self.memory_block_tree.get_mut(&cur_key).unwrap();
+                let cur_block = self.memory_block_tree.get_mut(&current_key).unwrap();
                 cur_block.add(&next_block);
-                // Don't advance i — try to merge the extended block with the next one.
-                // But we need to update our keys list.
-                // Since we consumed next_key, skip it.
-                i += 1; // advance past the merged key
-                        // Try merging cur with the new next (if any).
-                        // We handle this by just continuing the loop with updated i.
             } else {
-                i += 1;
+                current_key = next_key;
+            }
+
+            let current_end = match self.memory_block_tree.get(&current_key) {
+                Some(block) => block.get_end_address(),
+                None => break,
+            };
+            if update_end < current_end {
+                break;
             }
         }
     }
@@ -680,6 +667,32 @@ mod tests {
 
         let b = mgr.find_block(0x200000).unwrap();
         assert_eq!(b.get_size(), 0x20000);
+    }
+
+    #[test]
+    fn test_coalesce_for_update_merges_past_first_right_neighbor() {
+        let mut mgr = KMemoryBlockManager::new();
+        mgr.initialize(0x40000000, 0x4000).unwrap();
+
+        mgr.split_at(0x40001000);
+        mgr.split_at(0x40002000);
+        mgr.split_at(0x40003000);
+        assert_eq!(mgr.block_count(), 4);
+
+        mgr.update(
+            0x40001000,
+            1,
+            KMemoryState::FREE,
+            KMemoryPermission::NONE,
+            KMemoryAttribute::NONE,
+            KMemoryBlockDisableMergeAttribute::NONE,
+            KMemoryBlockDisableMergeAttribute::NONE,
+        );
+
+        assert_eq!(mgr.block_count(), 1);
+        let block = mgr.find_block(0x40000000).unwrap();
+        assert_eq!(block.get_address(), 0x40000000);
+        assert_eq!(block.get_size(), 0x4000);
     }
 
     #[test]
