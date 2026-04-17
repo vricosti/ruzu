@@ -224,6 +224,25 @@ impl KHandleTable {
         }
     }
 
+    /// Whether any remaining valid handle still references the given object.
+    pub fn contains_object_id(&self, object_id: u64) -> bool {
+        if object_id == 0 {
+            return false;
+        }
+
+        for index in 0..self.table_size as usize {
+            if self.objects[index] == object_id {
+                let linear_id = unsafe { self.entry_infos[index].linear_id };
+                let handle = encode_handle(index as u16, linear_id);
+                if self.is_valid_handle(handle) {
+                    return true;
+                }
+            }
+        }
+
+        false
+    }
+
     /// Finalize the handle table (close all entries).
     /// Port of upstream `KHandleTable::Finalize`.
     pub fn finalize(&mut self) -> u32 {
@@ -294,5 +313,21 @@ mod tests {
         assert!(table.remove(handle));
         assert_eq!(table.get_count(), 0);
         assert_eq!(table.get_object(handle), None);
+    }
+
+    #[test]
+    fn contains_object_id_tracks_remaining_live_handles() {
+        let mut table = KHandleTable::new();
+        assert_eq!(table.initialize(16), 0);
+
+        let first = table.add(0xDEAD).unwrap();
+        let second = table.add(0xDEAD).unwrap();
+        assert!(table.contains_object_id(0xDEAD));
+
+        assert!(table.remove(first));
+        assert!(table.contains_object_id(0xDEAD));
+
+        assert!(table.remove(second));
+        assert!(!table.contains_object_id(0xDEAD));
     }
 }

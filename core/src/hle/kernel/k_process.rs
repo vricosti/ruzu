@@ -2557,7 +2557,11 @@ impl KProcess {
         self.event_objects.clear();
         self.readable_event_objects.clear();
         self.shared_memory_objects.clear();
-        self.transfer_memory_objects.clear();
+        let transfer_memory_object_ids: Vec<u64> =
+            self.transfer_memory_objects.keys().copied().collect();
+        for object_id in transfer_memory_object_ids {
+            self.unregister_transfer_memory_object_by_object_id(object_id);
+        }
 
         // Perform inherited finalization.
         // Upstream: KSynchronizationObject::Finalize();
@@ -2722,7 +2726,11 @@ impl KProcess {
     }
 
     pub fn unregister_transfer_memory_object_by_object_id(&mut self, object_id: u64) {
-        self.transfer_memory_objects.remove(&object_id);
+        if let Some(transfer_memory) = self.transfer_memory_objects.remove(&object_id) {
+            let mut transfer_memory = transfer_memory.lock().unwrap();
+            transfer_memory.finalize(&mut self.page_table);
+            transfer_memory.post_destroy(self);
+        }
     }
 
     pub fn get_transfer_memory_by_object_id(
@@ -2730,6 +2738,26 @@ impl KProcess {
         object_id: u64,
     ) -> Option<Arc<Mutex<super::k_transfer_memory::KTransferMemory>>> {
         self.transfer_memory_objects.get(&object_id).cloned()
+    }
+
+    /// Remove a handle and release any Rust-side owner registry entry that no
+    /// longer has remaining live handles.
+    pub fn remove_handle(&mut self, handle: Handle) -> bool {
+        let Some(object_id) = self.handle_table.get_object(handle) else {
+            return false;
+        };
+
+        if !self.handle_table.remove(handle) {
+            return false;
+        }
+
+        if !self.handle_table.contains_object_id(object_id)
+            && self.transfer_memory_objects.contains_key(&object_id)
+        {
+            self.unregister_transfer_memory_object_by_object_id(object_id);
+        }
+
+        true
     }
 
     /// Unregister a thread from this process.

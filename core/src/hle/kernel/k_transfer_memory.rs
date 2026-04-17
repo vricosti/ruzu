@@ -7,13 +7,19 @@
 
 use super::k_memory_block::PAGE_SIZE;
 use super::k_page_group::KPageGroup;
+use super::k_process::KProcess;
+use super::k_process_page_table::KProcessPageTable;
+use super::k_resource_limit::LimitableResource;
 use super::k_shared_memory::MemoryPermission;
+use super::k_typed_address::KProcessAddress;
 use crate::hle::result::ResultCode;
+use std::sync::{Arc, Mutex, Weak};
 
 /// KTransferMemory: allows transferring a memory region from one process
 /// to another. Upstream inherits from KAutoObjectWithSlabHeapAndContainer.
 pub struct KTransferMemory {
     m_page_group: Option<KPageGroup>,
+    m_owner: Option<Weak<Mutex<KProcess>>>,
     m_address: u64,
     m_owner_perm: MemoryPermission,
     m_is_initialized: bool,
@@ -24,6 +30,7 @@ impl KTransferMemory {
     pub fn new() -> Self {
         Self {
             m_page_group: None,
+            m_owner: None,
             m_address: 0,
             m_owner_perm: MemoryPermission::None,
             m_is_initialized: false,
@@ -35,6 +42,7 @@ impl KTransferMemory {
     /// Port of upstream `KTransferMemory::Initialize`.
     pub fn initialize(
         &mut self,
+        owner: &Arc<Mutex<KProcess>>,
         address: u64,
         size: usize,
         owner_perm: MemoryPermission,
@@ -50,6 +58,7 @@ impl KTransferMemory {
         // In the host-emulated model, memory locking is a no-op.
 
         self.m_page_group = Some(pg);
+        self.m_owner = Some(Arc::downgrade(owner));
         self.m_address = address;
         self.m_owner_perm = owner_perm;
         self.m_is_initialized = true;
@@ -59,10 +68,18 @@ impl KTransferMemory {
 
     /// Finalize and release the transfer memory.
     /// Port of upstream `KTransferMemory::Finalize`.
-    pub fn finalize(&mut self) {
+    pub fn finalize(&mut self, owner_page_table: &mut KProcessPageTable) {
         if let Some(ref mut pg) = self.m_page_group {
             if !self.m_is_mapped {
-                // Upstream: m_owner->GetPageTable().UnlockForTransferMemory(...)
+                let size = pg.get_num_pages() * PAGE_SIZE;
+                if size > 0 {
+                    let result = owner_page_table
+                        .unlock_for_transfer_memory(KProcessAddress::new(self.m_address), size);
+                    debug_assert_eq!(
+                        result, 0,
+                        "KTransferMemory::finalize unlock_for_transfer_memory failed: 0x{result:X}"
+                    );
+                }
             }
             pg.close();
             pg.finalize();
@@ -74,8 +91,26 @@ impl KTransferMemory {
         self.m_is_initialized
     }
 
+    pub fn get_owner(&self) -> Option<Arc<Mutex<KProcess>>> {
+        self.m_owner.as_ref().and_then(Weak::upgrade)
+    }
+
     pub fn get_source_address(&self) -> u64 {
         self.m_address
+    }
+
+    /// Get the size of the transfer memory's source region.
+    /// Always reports the page-group's size, regardless of map state.
+    pub fn get_source_size(&self) -> usize {
+        if let Some(ref pg) = self.m_page_group {
+            return pg.get_num_pages() * PAGE_SIZE;
+        }
+        0
+    }
+
+    /// Whether the transfer memory has been mapped into a target process.
+    pub fn is_mapped(&self) -> bool {
+        self.m_is_mapped
     }
 
     /// Get the size of the transfer memory region.
@@ -141,11 +176,14 @@ impl KTransferMemory {
         ResultCode::new(0) // ResultSuccess
     }
 
-    /// Post-destroy: release resource limit, close owner.
+    /// Post-destroy: release resource limit and owner reference bookkeeping.
     /// Port of upstream `KTransferMemory::PostDestroy`.
-    pub fn post_destroy(_arg: usize) {
-        // Upstream: owner->GetResourceLimit()->Release(TransferMemoryCountMax, 1); owner->Close();
-        // Resource limit release is handled by the object system.
+    pub fn post_destroy(&self, owner: &mut KProcess) {
+        if let Some(ref rl) = owner.resource_limit {
+            rl.lock()
+                .unwrap()
+                .release(LimitableResource::TransferMemoryCountMax, 1);
+        }
     }
 }
 

@@ -34,8 +34,7 @@ pub fn close_handle(system: &System, handle: Handle) -> ResultCode {
         .current_process_arc()
         .lock()
         .unwrap()
-        .handle_table
-        .remove(handle)
+        .remove_handle(handle)
     {
         RESULT_SUCCESS
     } else {
@@ -259,6 +258,8 @@ mod tests {
     use crate::hle::kernel::k_worker_task_manager::KWorkerTaskManager;
     use crate::hle::kernel::svc::svc_event;
     use crate::hle::kernel::svc::svc_thread;
+    use crate::hle::kernel::svc::svc_transfer_memory;
+    use crate::hle::kernel::svc::svc_types::MemoryPermission;
     use std::sync::atomic::Ordering;
     use std::sync::{Arc, Mutex};
 
@@ -345,6 +346,117 @@ mod tests {
             RESULT_SUCCESS
         );
         assert_eq!(out_index, 0);
+    }
+
+    #[test]
+    fn close_handle_recoalesces_transfer_memory_split_heap_region() {
+        let system = test_system();
+        let (heap_base, heap_size) = {
+            let mut process = system.current_process_arc().lock().unwrap();
+            let (result, heap_base) = process.set_heap_size(0x200000);
+            assert_eq!(result, RESULT_SUCCESS.get_inner_value());
+
+            let info = process
+                .page_table
+                .query_info(heap_base.get() as usize)
+                .expect("heap base must query after SetHeapSize");
+            (heap_base.get(), info.get_size())
+        };
+
+        let transfer_addr = heap_base + 0x10000;
+        let transfer_size = 0x20000u64;
+        let mut handle = 0;
+        assert_eq!(
+            svc_transfer_memory::create_transfer_memory(
+                &system,
+                &mut handle,
+                transfer_addr,
+                transfer_size,
+                MemoryPermission::ReadWrite,
+            ),
+            RESULT_SUCCESS
+        );
+
+        let transfer_object_id = {
+            let process = system.current_process_arc().lock().unwrap();
+            let object_id = process
+                .handle_table
+                .get_object(handle)
+                .expect("CreateTransferMemory must return a live handle");
+
+            let split_info = process
+                .page_table
+                .query_info(heap_base as usize)
+                .expect("heap query should succeed while transfer memory is locked");
+            assert_eq!(split_info.get_size(), 0x10000);
+            assert!(process
+                .get_transfer_memory_by_object_id(object_id)
+                .is_some());
+            object_id
+        };
+
+        assert_eq!(close_handle(&system, handle), RESULT_SUCCESS);
+
+        let process = system.current_process_arc().lock().unwrap();
+        let merged_info = process
+            .page_table
+            .query_info(heap_base as usize)
+            .expect("heap query should succeed after transfer memory handle close");
+        assert_eq!(merged_info.get_size(), heap_size);
+        assert!(process
+            .get_transfer_memory_by_object_id(transfer_object_id)
+            .is_none());
+    }
+
+    #[test]
+    fn close_handle_runs_transfer_memory_post_destroy_resource_release() {
+        let system = test_system();
+        let heap_base = {
+            let mut process = system.current_process_arc().lock().unwrap();
+            let (result, heap_base) = process.set_heap_size(0x200000);
+            assert_eq!(result, RESULT_SUCCESS.get_inner_value());
+            heap_base.get()
+        };
+
+        let mut handle = 0;
+        assert_eq!(
+            svc_transfer_memory::create_transfer_memory(
+                &system,
+                &mut handle,
+                heap_base + 0x10000,
+                0x20000,
+                MemoryPermission::ReadWrite,
+            ),
+            RESULT_SUCCESS
+        );
+
+        {
+            let process = system.current_process_arc().lock().unwrap();
+            let current = process
+                .resource_limit
+                .as_ref()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .get_current_value(
+                    crate::hle::kernel::k_resource_limit::LimitableResource::TransferMemoryCountMax,
+                );
+            assert_eq!(current, 1);
+        }
+
+        assert_eq!(close_handle(&system, handle), RESULT_SUCCESS);
+
+        let process = system.current_process_arc().lock().unwrap();
+        let current = process
+            .resource_limit
+            .as_ref()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .get_current_value(
+                crate::hle::kernel::k_resource_limit::LimitableResource::TransferMemoryCountMax,
+            );
+        assert_eq!(current, 0);
     }
 
     #[test]
