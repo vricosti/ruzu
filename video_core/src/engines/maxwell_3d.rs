@@ -3437,7 +3437,11 @@ impl Maxwell3D {
         self.regs[CB_CONFIG_BASE as usize + 1] = parameters[0];
         self.regs[CB_CONFIG_BASE as usize + 2] = parameters[1];
         self.regs[CB_CONFIG_BASE as usize + 3] = 0;
-        let zeroes = vec![0u32; parameters[2] as usize];
+        // Upstream passes `parameters[2] * 4` as the u32-count amount to
+        // ProcessCBMultiData (macro_hle.cpp:457). `parameters[2]` is a vec4
+        // (16-byte) entry count; multiply by 4 to get u32 count.
+        let u32_count = (parameters[2] as usize).saturating_mul(4);
+        let zeroes = vec![0u32; u32_count];
         self.process_cb_multi_data(&zeroes);
     }
 
@@ -6484,12 +6488,15 @@ mod tests {
     #[test]
     fn test_hle_clear_const_buffer_sets_cb_and_resets_offset() {
         let mut engine = Maxwell3D::new();
+        // parameters[2] is the vec4 count upstream (macro_hle.cpp:457 passes
+        // parameters[2] * 4 as the u32-count amount). parameters[2]=4 means
+        // 4 vec4 entries = 16 u32 = 64 bytes written.
         engine.hle_clear_const_buffer(0x5F00, &[0x12, 0x3456, 4]);
 
         assert_eq!(engine.regs[CB_CONFIG_BASE as usize], 0x5F00);
         assert_eq!(engine.regs[(CB_CONFIG_BASE + 1) as usize], 0x12);
         assert_eq!(engine.regs[(CB_CONFIG_BASE + 2) as usize], 0x3456);
-        assert_eq!(engine.regs[(CB_CONFIG_BASE + 3) as usize], 16);
+        assert_eq!(engine.regs[(CB_CONFIG_BASE + 3) as usize], 64);
     }
 
     #[test]
