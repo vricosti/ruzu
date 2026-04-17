@@ -43,6 +43,8 @@ pub fn create_transfer_memory(
     size: u64,
     map_perm: MemoryPermission,
 ) -> ResultCode {
+    let current_process = system.current_process_arc().clone();
+
     // Validate the size.
     if address % PAGE_SIZE != 0 {
         return RESULT_INVALID_ADDRESS;
@@ -62,18 +64,14 @@ pub fn create_transfer_memory(
         return RESULT_INVALID_NEW_MEMORY_PERMISSION;
     }
 
-    let mut process = system.current_process_arc().lock().unwrap();
+    let mut process = current_process.lock().unwrap();
 
     // Upstream: Reserve transfer memory from resource limit.
     if let Some(ref rl) = process.resource_limit {
-        let rl_guard = rl.lock().unwrap();
-        let current = rl_guard.get_current_value(
+        if !rl.lock().unwrap().reserve(
             crate::hle::kernel::k_resource_limit::LimitableResource::TransferMemoryCountMax,
-        );
-        let limit = rl_guard.get_limit_value(
-            crate::hle::kernel::k_resource_limit::LimitableResource::TransferMemoryCountMax,
-        );
-        if current >= limit {
+            1,
+        ) {
             return RESULT_LIMIT_REACHED;
         }
     }
@@ -96,6 +94,7 @@ pub fn create_transfer_memory(
 
     let mut transfer_memory = KTransferMemory::new();
     let init_result = transfer_memory.initialize(
+        &current_process,
         address,
         size as usize,
         to_kernel_memory_permission(map_perm),
@@ -104,6 +103,12 @@ pub fn create_transfer_memory(
         process
             .page_table
             .unlock_for_transfer_memory(addr_kpa, size as usize);
+        if let Some(ref rl) = process.resource_limit {
+            rl.lock().unwrap().release(
+                crate::hle::kernel::k_resource_limit::LimitableResource::TransferMemoryCountMax,
+                1,
+            );
+        }
         return init_result;
     }
 
@@ -124,6 +129,12 @@ pub fn create_transfer_memory(
             process
                 .page_table
                 .unlock_for_transfer_memory(addr_kpa, size as usize);
+            if let Some(ref rl) = process.resource_limit {
+                rl.lock().unwrap().release(
+                    crate::hle::kernel::k_resource_limit::LimitableResource::TransferMemoryCountMax,
+                    1,
+                );
+            }
             *out = 0;
             return RESULT_OUT_OF_HANDLES;
         }
