@@ -1163,7 +1163,7 @@ impl CoreData {
         if (self.data.hair_type() as u8) > HairType::MAX_U8 {
             return ValidationResult::InvalidHairType;
         }
-        if (self.data.hair_color() as u8) > CommonColor::Max as u8 {
+        if (self.data.hair_color() as u8) > CommonColor::Max.0 {
             return ValidationResult::InvalidHairColor;
         }
         if self.get_hair_flip() > HairFlip::MAX {
@@ -1172,7 +1172,7 @@ impl CoreData {
         if self.get_eye_type() > EyeType::MAX {
             return ValidationResult::InvalidEyeType;
         }
-        if (self.data.eye_color() as u8) > CommonColor::Max as u8 {
+        if (self.data.eye_color() as u8) > CommonColor::Max.0 {
             return ValidationResult::InvalidEyeColor;
         }
         if self.get_eye_scale() > MAX_EYE_SCALE {
@@ -1193,7 +1193,7 @@ impl CoreData {
         if self.get_eyebrow_type() > EyebrowType::MAX {
             return ValidationResult::InvalidEyebrowType;
         }
-        if (self.data.eyebrow_color() as u8) > CommonColor::Max as u8 {
+        if (self.data.eyebrow_color() as u8) > CommonColor::Max.0 {
             return ValidationResult::InvalidEyebrowColor;
         }
         if self.get_eyebrow_scale() > MAX_EYEBROW_SCALE {
@@ -1223,7 +1223,7 @@ impl CoreData {
         if self.get_mouth_type() > MouthType::MAX {
             return ValidationResult::InvalidMouthType;
         }
-        if (self.data.mouth_color() as u8) > CommonColor::Max as u8 {
+        if (self.data.mouth_color() as u8) > CommonColor::Max.0 {
             return ValidationResult::InvalidMouthColor;
         }
         if self.get_mouth_scale() > MAX_MOUTH_SCALE {
@@ -1235,7 +1235,7 @@ impl CoreData {
         if self.get_mouth_y() > MAX_MOUTH_Y {
             return ValidationResult::InvalidMouthY;
         }
-        if (self.data.beard_color() as u8) > CommonColor::Max as u8 {
+        if (self.data.beard_color() as u8) > CommonColor::Max.0 {
             return ValidationResult::InvalidBeardColor;
         }
         if self.get_beard_type() > BeardType::MAX {
@@ -1253,7 +1253,7 @@ impl CoreData {
         if (self.data.glasses_type() as u8) > GlassType::MAX {
             return ValidationResult::InvalidGlassType;
         }
-        if (self.data.glasses_color() as u8) > CommonColor::Max as u8 {
+        if (self.data.glasses_color() as u8) > CommonColor::Max.0 {
             return ValidationResult::InvalidGlassColor;
         }
         if self.get_glass_scale() > MAX_GLASS_SCALE {
