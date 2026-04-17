@@ -834,15 +834,22 @@ impl NvHostAsGpu {
         };
 
         params.buf_size = 2 * std::mem::size_of::<VaRegion>() as u32;
+        // Match upstream's u32 overflow semantics: the shift happens on u32
+        // (VaType) and silently truncates; the Switch game's nnSdk runtime
+        // is compiled assuming this overflow (big-page region offset reads as
+        // 0 when start * page_size exceeds u32). Performing the math in u64
+        // and returning the "correct" value breaks the game's branch.
         params.regions[0] = VaRegion {
-            offset: (small_page_allocator.get_va_start() as u64) << VM::PAGE_SIZE_BITS,
+            offset: (small_page_allocator.get_va_start()
+                .wrapping_shl(VM::PAGE_SIZE_BITS)) as u64,
             page_size: VM::YUZU_PAGESIZE,
             _pad0: 0,
             pages: (small_page_allocator.get_va_limit() - small_page_allocator.get_va_start())
                 as u64,
         };
         params.regions[1] = VaRegion {
-            offset: (big_page_allocator.get_va_start() as u64) << vm.big_page_size_bits,
+            offset: (big_page_allocator.get_va_start()
+                .wrapping_shl(vm.big_page_size_bits)) as u64,
             page_size: vm.big_page_size,
             _pad0: 0,
             pages: (big_page_allocator.get_va_limit() - big_page_allocator.get_va_start()) as u64,
