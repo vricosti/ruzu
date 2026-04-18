@@ -133,23 +133,35 @@ fn watched_ranges() -> &'static [(u64, u64)] {
 
 #[inline(always)]
 fn watch_write(cb: &DynarmicCallbacks32, vaddr: u64, size: u64, value: u128) {
+    // Same filter semantics as watch_read: either filter alone is enough;
+    // when both set, both must match. Lets us log writes from a PC window
+    // regardless of address (useful for tracing helper function writes).
     let ranges = watched_ranges();
-    if ranges.is_empty() {
+    let pc_range = watched_pc_range();
+    let has_addr_filter = !ranges.is_empty();
+    let has_pc_filter = pc_range.is_some();
+    if !has_addr_filter && !has_pc_filter {
         return;
     }
-    let end = vaddr.saturating_add(size);
-    let hits = ranges.iter().any(|(s, e)| vaddr < *e && end > *s);
-    if !hits {
-        return;
+    if has_addr_filter {
+        let end = vaddr.saturating_add(size);
+        let hits = ranges.iter().any(|(s, e)| vaddr < *e && end > *s);
+        if !hits {
+            return;
+        }
     }
     let pc_ptr = cb.jit_pc_ptr;
     let pc = pc_ptr
         .map(|p| unsafe { p.read_volatile() })
         .unwrap_or(0);
+    if let Some((pc_lo, pc_hi)) = pc_range {
+        let pc_u64 = pc as u64;
+        if pc_u64 < pc_lo || pc_u64 >= pc_hi {
+            return;
+        }
+    }
     // reg[14] (LR) sits 1 u32 before reg[15] (PC) in A32JitState's contiguous
-    // [u32; 16] array. Reading LR at the moment of the write gives the caller's
-    // return address: caller = (LR & ~1) - 4 for ARM, -2 for Thumb (LR has bit
-    // 0 set in Thumb mode). Used to trace which callsite invoked a helper.
+    // [u32; 16] array.
     let lr = pc_ptr
         .map(|p| unsafe { p.offset(-1).read_volatile() })
         .unwrap_or(0);
