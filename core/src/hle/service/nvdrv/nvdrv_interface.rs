@@ -59,6 +59,8 @@ impl NvdrvInterface {
                 | 0xC040_4108
                 | 0xC018_4102
                 | 0xC028_4106
+                | 0xC028_4808
+                | 0xC010_480B
                 | 0xC008_0101
                 | 0xC008_0103
                 | 0xC008_010E
@@ -117,12 +119,14 @@ impl NvdrvInterface {
         } else {
             NvResult::FileOperationFailed
         };
-        log::trace!(
-            "NVDRV::Open device_name={} -> fd={} nv_result={:?}",
-            device_name,
-            fd,
-            result
-        );
+        if Self::should_trace_lifecycle() {
+            log::info!(
+                "NVDRV::Open device_name={} -> fd={} nv_result={:?}",
+                device_name,
+                fd,
+                result
+            );
+        }
         (fd, result)
     }
 
@@ -174,6 +178,15 @@ impl NvdrvInterface {
                 output.len(),
                 Self::format_prefix_hex(output, 0x40)
             );
+            if std::env::var_os("RUZU_IOCTL_PAYLOAD_DUMP").is_some() {
+                log::info!(
+                    "IOCTL1_OUTPUT fd={} ioctl=0x{:08X} len=0x{:X} bytes=[{}]",
+                    fd,
+                    command.raw,
+                    output.len(),
+                    Self::format_prefix_hex(output, 0x40)
+                );
+            }
         }
         nv_result
     }
@@ -531,6 +544,12 @@ impl NvdrvService {
             input.len(),
             write_size
         );
+        // Stash the ioctl number into IPC_TRACE_CURRENT so the IPC_REPLY hex-dump
+        // can attribute this reply to the specific nvdrv ioctl (not just "cmd=1").
+        super::super::hle_ipc::IPC_TRACE_CURRENT.with(|c| {
+            let mut slot = c.borrow_mut();
+            slot.2 = command.raw;
+        });
         let nv_result = service
             .interface
             .lock()
@@ -656,6 +675,10 @@ impl NvdrvService {
             inline_input.len(),
             output.len()
         );
+        super::super::hle_ipc::IPC_TRACE_CURRENT.with(|c| {
+            let mut slot = c.borrow_mut();
+            slot.2 = command.raw;
+        });
         let nv_result = service.interface.lock().unwrap().ioctl2(
             fd,
             command,
@@ -698,6 +721,10 @@ impl NvdrvService {
             output.len(),
             inline_output.len()
         );
+        super::super::hle_ipc::IPC_TRACE_CURRENT.with(|c| {
+            let mut slot = c.borrow_mut();
+            slot.2 = command.raw;
+        });
         let nv_result = service.interface.lock().unwrap().ioctl3(
             fd,
             command,

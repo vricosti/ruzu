@@ -17,8 +17,10 @@ use crate::hle::ipc;
 // Temporary investigation: per-thread slot holding the service name + cmd of the
 // current IPC dispatch, so the IPC_REPLY hex-dump in
 // write_to_outgoing_command_buffer can attribute each reply to (service, cmd).
+// The third element is an optional ioctl number (non-zero means nvdrv Ioctl1/2/3).
 thread_local! {
-    pub(crate) static IPC_TRACE_CURRENT: RefCell<(String, u32)> = RefCell::new((String::new(), 0));
+    pub(crate) static IPC_TRACE_CURRENT: RefCell<(String, u32, u32)> =
+        RefCell::new((String::new(), 0, 0));
 }
 use crate::hle::kernel::k_readable_event::KReadableEvent;
 
@@ -344,7 +346,7 @@ pub fn complete_sync_request(
                 );
             }
             IPC_TRACE_CURRENT.with(|c| {
-                *c.borrow_mut() = (handler.service_name().to_string(), context.get_command());
+                *c.borrow_mut() = (handler.service_name().to_string(), context.get_command(), 0);
             });
             let result = handler.handle_sync_request(context);
             if trace_dispatch {
@@ -360,7 +362,7 @@ pub fn complete_sync_request(
         PreparedSyncRequest::CloseVirtualHandle(index) => {
             manager.lock().unwrap().close_domain_handler(index);
             IPC_TRACE_CURRENT.with(|c| {
-                *c.borrow_mut() = ("__close_virtual_handle__".to_string(), index as u32);
+                *c.borrow_mut() = ("__close_virtual_handle__".to_string(), index as u32, 0);
             });
             let mut rb = super::ipc_helpers::ResponseBuilder::new(context, 2, 0, 0);
             rb.push_result(RESULT_SUCCESS);
@@ -372,7 +374,7 @@ pub fn complete_sync_request(
         }
         PreparedSyncRequest::StubSuccess => {
             IPC_TRACE_CURRENT.with(|c| {
-                *c.borrow_mut() = ("__stub_success__".to_string(), context.get_command());
+                *c.borrow_mut() = ("__stub_success__".to_string(), context.get_command(), 0);
             });
             let mut rb = super::ipc_helpers::ResponseBuilder::new(context, 2, 0, 0);
             rb.push_result(RESULT_SUCCESS);
@@ -825,7 +827,7 @@ impl HLERequestContext {
         process.register_readable_event_object(object_id, readable_event);
         let handle = process.handle_table.add(object_id).ok();
         if std::env::var_os("RUZU_TRACE_EVENTS").is_some() {
-            let (svc, cmd) = IPC_TRACE_CURRENT.with(|c| c.borrow().clone());
+            let (svc, cmd, _ioctl) = IPC_TRACE_CURRENT.with(|c| c.borrow().clone());
             log::info!(
                 "EVENT_HANDOUT object_id={} handle={:?} svc={} cmd={}",
                 object_id,
@@ -1403,15 +1405,27 @@ impl HLERequestContext {
                     use std::fmt::Write;
                     let _ = write!(hex, "{:08x} ", self.cmd_buf[i]);
                 }
-                let (svc, cmd) = IPC_TRACE_CURRENT.with(|c| c.borrow().clone());
-                log::warn!(
-                    "IPC_REPLY seq={} service={} cmd={} words={} payload={}",
-                    seq,
-                    if svc.is_empty() { "?" } else { svc.as_str() },
-                    cmd,
-                    write_words,
-                    hex.trim_end(),
-                );
+                let (svc, cmd, ioctl) = IPC_TRACE_CURRENT.with(|c| c.borrow().clone());
+                if ioctl != 0 {
+                    log::warn!(
+                        "IPC_REPLY seq={} service={} cmd={} ioctl=0x{:08X} words={} payload={}",
+                        seq,
+                        if svc.is_empty() { "?" } else { svc.as_str() },
+                        cmd,
+                        ioctl,
+                        write_words,
+                        hex.trim_end(),
+                    );
+                } else {
+                    log::warn!(
+                        "IPC_REPLY seq={} service={} cmd={} words={} payload={}",
+                        seq,
+                        if svc.is_empty() { "?" } else { svc.as_str() },
+                        cmd,
+                        write_words,
+                        hex.trim_end(),
+                    );
+                }
             }
         }
 
