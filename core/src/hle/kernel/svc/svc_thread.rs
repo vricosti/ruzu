@@ -173,6 +173,18 @@ pub fn create_thread(
             return ResultCode::new(result);
         }
 
+        // Cache the owning process raw pointer for scheduler-lock-protected
+        // paths (matches upstream's `KProcess*` access from KThread). The
+        // `KProcess` is pinned by the Arc so the pointer stays valid for the
+        // thread's lifetime.
+        let parent_ptr = {
+            let mut process_guard = current_process.lock().unwrap();
+            (&mut *process_guard)
+                as *mut crate::hle::kernel::k_process::KProcess
+                as usize
+        };
+        new_thread.set_parent_raw_ptr(parent_ptr);
+
         let current_thread = system.current_thread().expect("current thread must exist");
         let current_thread = current_thread.lock().unwrap();
         new_thread.clone_fpu_status_from(&current_thread);
@@ -371,11 +383,19 @@ pub fn sleep_thread(system: &System, ns: i64) {
                     let mut ctx = crate::arm::arm_interface::ThreadContext::default();
                     cpu.get_context(&mut ctx);
                     log::info!(
-                        "svc::SleepThread(sleep) ctx: tid={} pc=0x{:08X} lr=0x{:08X} sp=0x{:08X}",
+                        "svc::SleepThread(sleep) ctx: tid={} pc=0x{:08X} lr=0x{:08X} sp=0x{:08X} r0=0x{:08X} r1=0x{:08X} r2=0x{:08X} r3=0x{:08X} r4=0x{:08X} r5=0x{:08X} r6=0x{:08X} r7=0x{:08X}",
                         current_thread_id,
                         ctx.pc,
                         ctx.lr,
                         ctx.sp,
+                        ctx.r[0] as u32,
+                        ctx.r[1] as u32,
+                        ctx.r[2] as u32,
+                        ctx.r[3] as u32,
+                        ctx.r[4] as u32,
+                        ctx.r[5] as u32,
+                        ctx.r[6] as u32,
+                        ctx.r[7] as u32,
                     );
                     if should_trace_sleep_backtrace_once(current_thread_id) {
                         let bt = crate::arm::debug::get_backtrace_from_context(&process, &ctx);

@@ -442,6 +442,13 @@ pub struct WaitingLockRef {
     pub address_key: KProcessAddress,
     /// Whether it's a kernel address key.
     pub is_kernel_address_key: bool,
+    /// Raw pointer to the owner `KThread`. Matches upstream's `KThread*`.
+    /// Valid while this wait is active: the owner is kept alive by the
+    /// parent process's thread list, and `Mutex<KThread>` never relocates
+    /// its inner value. Used by `cancel_wait` paths running under the
+    /// scheduler lock, where upstream dereferences the `KThread*` directly
+    /// without any per-object mutex. 0 means "no pointer available".
+    pub owner_thread_ptr: usize,
 }
 
 // ---------------------------------------------------------------------------
@@ -471,6 +478,11 @@ pub struct KThread {
     pub address_key: KProcessAddress,
     // parent process — Weak reference matching upstream raw pointer + ref counting
     pub parent: Option<Weak<Mutex<KProcess>>>,
+    /// Raw `*mut KProcess` cached at parenting time so scheduler-lock-protected
+    /// code paths can access process fields (cond_var tree, etc.) without
+    /// re-acquiring the KProcess mutex. Matches upstream's raw-pointer access
+    /// to the owning process. 0 means "no pointer set"; fall back to the Weak.
+    pub parent_raw_ptr: usize,
     pub scheduler: Option<Weak<Mutex<KScheduler>>>,
     /// Direct reference to the GlobalSchedulerContext for PQ updates.
     /// Matches upstream's access via `KernelCore&` in `KScheduler::OnThreadStateChanged`.
@@ -621,6 +633,7 @@ impl KThread {
             cpu_time: AtomicI64::new(0),
             address_key: KProcessAddress::default(),
             parent: None,
+            parent_raw_ptr: 0,
             scheduler: None,
             global_scheduler_context: None,
             scheduler_lock_ptr: 0,
@@ -818,6 +831,7 @@ impl KThread {
             .set_affinity_mask(1u64 << phys_core);
         self.tls_address = KProcessAddress::default();
         self.parent = None;
+        self.parent_raw_ptr = 0;
         self.scheduler = None;
         self.global_scheduler_context = None;
         self.scheduler_lock_ptr = 0;
@@ -2663,6 +2677,12 @@ impl KThread {
             let affinity = self.physical_affinity_mask.get_affinity_mask();
             let is_dummy = self.thread_type == ThreadType::Dummy;
 
+            if std::env::var_os("RUZU_TRACE_CT_FIRE").is_some() {
+                log::info!(
+                    "notify_state_transition tid={} {:?}->{:?} before_gsc_lock",
+                    thread_id, old_base, new_base
+                );
+            }
             gsc_arc.lock().unwrap().on_thread_state_changed(
                 thread_id,
                 old_base,
@@ -2673,6 +2693,12 @@ impl KThread {
                 is_dummy,
                 self.process_schedule_count.clone(),
             );
+            if std::env::var_os("RUZU_TRACE_CT_FIRE").is_some() {
+                log::info!(
+                    "notify_state_transition tid={} {:?}->{:?} after_gsc",
+                    thread_id, old_base, new_base
+                );
+            }
             notified_gsc = true;
         }
 
@@ -3221,11 +3247,27 @@ impl KThread {
             self.get_current_core(),
             self.wait_queue.is_some()
         );
+        let ct_trace = std::env::var_os("RUZU_TRACE_CT_FIRE").is_some();
+        if ct_trace {
+            log::info!(
+                "on_timer tid={} state={:?} has_wait_queue={} reason={:?}",
+                self.thread_id,
+                self.get_state(),
+                self.wait_queue.is_some(),
+                self.get_wait_reason_for_debugging()
+            );
+        }
         if self.get_state() == ThreadState::WAITING {
             self.synced_index = -1;
             self.wait_result = RESULT_TIMED_OUT.get_inner_value();
             if let Some(wait_queue) = self.wait_queue.clone() {
+                if ct_trace {
+                    log::info!("on_timer tid={} before_cancel_wait", self.thread_id);
+                }
                 wait_queue.cancel_wait(self, RESULT_TIMED_OUT.get_inner_value(), false);
+                if ct_trace {
+                    log::info!("on_timer tid={} after_cancel_wait", self.thread_id);
+                }
             }
             log::trace!(
                 "KThread::on_timer tid={} post-cancel state={:?} wait_result=0x{:x}",
@@ -3322,15 +3364,23 @@ impl KThread {
     }
 
     /// Set the waiting lock info (which lock this thread is blocked on).
-    /// Replaces the old `set_waiting_lock_owner_thread_id`.
     /// Pass `None` to clear (thread is no longer waiting on a lock).
-    pub fn set_waiting_lock_owner_thread_id(&mut self, owner_thread_id: Option<u64>) {
+    /// `owner_thread_ptr` is an optional raw `*mut KThread` pointer to the
+    /// owner; when supplied, `cancel_wait` paths running under the scheduler
+    /// lock can dereference it directly (matching upstream's `KThread*`)
+    /// instead of locking a Rust-only per-thread mutex.
+    pub fn set_waiting_lock_owner_thread_id(
+        &mut self,
+        owner_thread_id: Option<u64>,
+        owner_thread_ptr: usize,
+    ) {
         match owner_thread_id {
             Some(id) => {
                 self.waiting_lock_info = Some(WaitingLockRef {
                     owner_thread_id: id,
                     address_key: self.address_key,
                     is_kernel_address_key: self.is_kernel_address_key,
+                    owner_thread_ptr,
                 });
             }
             None => {
@@ -3348,9 +3398,37 @@ impl KThread {
         process.get_thread_by_thread_id(lock_ref.owner_thread_id)
     }
 
+    /// Get the lock owner thread as a raw `*mut KThread`, matching upstream's
+    /// `KThread* KThread::GetLockOwner()`. Callers must already be serialized
+    /// by the scheduler lock (upstream's invariant). Returns `None` if no
+    /// pointer was stored.
+    pub fn get_lock_owner_raw(&self) -> Option<*mut KThread> {
+        let ptr = self.waiting_lock_info.as_ref()?.owner_thread_ptr;
+        if ptr == 0 {
+            None
+        } else {
+            Some(ptr as *mut KThread)
+        }
+    }
+
     /// Get the lock owner thread ID (without looking up the thread).
     pub fn get_lock_owner_thread_id(&self) -> Option<u64> {
         self.waiting_lock_info.as_ref().map(|r| r.owner_thread_id)
+    }
+
+    /// Raw pointer to the owning `KProcess`, cached at parenting time so
+    /// scheduler-lock-protected paths can read/write process fields without
+    /// re-acquiring the process mutex (matches upstream's raw-pointer access).
+    pub fn get_parent_raw_ptr(&self) -> Option<*mut KProcess> {
+        if self.parent_raw_ptr == 0 {
+            None
+        } else {
+            Some(self.parent_raw_ptr as *mut KProcess)
+        }
+    }
+
+    pub fn set_parent_raw_ptr(&mut self, ptr: usize) {
+        self.parent_raw_ptr = ptr;
     }
 
     pub fn has_wait_queue(&self) -> bool {
