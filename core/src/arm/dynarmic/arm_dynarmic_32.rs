@@ -142,13 +142,20 @@ fn watch_write(cb: &DynarmicCallbacks32, vaddr: u64, size: u64, value: u128) {
     if !hits {
         return;
     }
-    let pc = cb
-        .jit_pc_ptr
+    let pc_ptr = cb.jit_pc_ptr;
+    let pc = pc_ptr
         .map(|p| unsafe { p.read_volatile() })
         .unwrap_or(0);
+    // reg[14] (LR) sits 1 u32 before reg[15] (PC) in A32JitState's contiguous
+    // [u32; 16] array. Reading LR at the moment of the write gives the caller's
+    // return address: caller = (LR & ~1) - 4 for ARM, -2 for Thumb (LR has bit
+    // 0 set in Thumb mode). Used to trace which callsite invoked a helper.
+    let lr = pc_ptr
+        .map(|p| unsafe { p.offset(-1).read_volatile() })
+        .unwrap_or(0);
     eprintln!(
-        "[WATCH_WRITE] pc=0x{:08X} vaddr=0x{:X} size={} value=0x{:032X}",
-        pc, vaddr, size, value
+        "[WATCH_WRITE] pc=0x{:08X} lr=0x{:08X} vaddr=0x{:X} size={} value=0x{:032X}",
+        pc, lr, vaddr, size, value
     );
 }
 
