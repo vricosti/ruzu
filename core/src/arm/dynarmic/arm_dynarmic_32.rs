@@ -489,7 +489,27 @@ impl UserCallbacks for DynarmicCallbacks32 {
     }
 
     fn exclusive_write_32(&mut self, vaddr: u64, value: u32, expected: u32) -> bool {
-        self.check_memory_access(vaddr, 4) && self.mem().write_exclusive_32(vaddr, value, expected)
+        if !self.check_memory_access(vaddr, 4) {
+            return false;
+        }
+        let ok = self.mem().write_exclusive_32(vaddr, value, expected);
+        // Same PC-range filter as watch_read / watch_write. Reports STLEX
+        // attempts (write_exclusive_32) so we can distinguish "lock never
+        // tried" from "lock always fails exclusive-check".
+        if let Some((pc_lo, pc_hi)) = watched_pc_range() {
+            let pc = self
+                .jit_pc_ptr
+                .map(|p| unsafe { p.read_volatile() })
+                .unwrap_or(0);
+            let pc_u64 = pc as u64;
+            if pc_u64 >= pc_lo && pc_u64 < pc_hi {
+                eprintln!(
+                    "[STLEX      ] pc=0x{:08X} vaddr=0x{:X} value=0x{:08X} expected=0x{:08X} ok={}",
+                    pc, vaddr, value, expected, ok
+                );
+            }
+        }
+        ok
     }
 
     fn exclusive_write_64(&mut self, vaddr: u64, value: u64, expected: u64) -> bool {
