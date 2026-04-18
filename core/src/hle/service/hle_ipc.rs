@@ -9,9 +9,17 @@
 //! - SessionRequestManager: manages domain state and handler dispatch
 //! - HLERequestContext: in-flight IPC request context
 
+use std::cell::RefCell;
 use std::sync::{Arc, Mutex, Weak};
 
 use crate::hle::ipc;
+
+// Temporary investigation: per-thread slot holding the service name + cmd of the
+// current IPC dispatch, so the IPC_REPLY hex-dump in
+// write_to_outgoing_command_buffer can attribute each reply to (service, cmd).
+thread_local! {
+    pub(crate) static IPC_TRACE_CURRENT: RefCell<(String, u32)> = RefCell::new((String::new(), 0));
+}
 use crate::hle::kernel::k_readable_event::KReadableEvent;
 
 /// Reference to a kernel object for IPC handle translation.
@@ -173,11 +181,14 @@ impl SessionRequestManager {
     }
 
     pub fn append_domain_handler(&mut self, handler: SessionRequestHandlerPtr) {
-        log::debug!(
-            "AppendDomainHandler: index={} handler={}",
-            self.domain_handlers.len() + 1,
-            handler.service_name()
-        );
+        let trace = std::env::var_os("RUZU_DOMAIN_TRACE").is_some();
+        let name = handler.service_name().to_string();
+        let next_index = self.domain_handlers.len() + 1;
+        if trace {
+            log::info!("DOMAIN_SLOT append index={} handler={}", next_index, name);
+        } else {
+            log::debug!("AppendDomainHandler: index={} handler={}", next_index, name);
+        }
         self.domain_handlers.push(Some(handler));
     }
 
@@ -224,10 +235,19 @@ impl SessionRequestManager {
             let domain_message_header = context.get_domain_message_header().unwrap();
             let object_id = domain_message_header.object_id() as usize;
             let command = domain_message_header.command();
+            let trace_dom = std::env::var_os("RUZU_DOMAIN_TRACE").is_some();
 
             match command {
                 ipc::DomainCommandType::SendMessage => {
                     if object_id > self.domain_handler_count() {
+                        if trace_dom {
+                            log::info!(
+                                "DOMAIN_SLOT stub_oor object_id={} handler_count={} cmd={} reason=out_of_range",
+                                object_id,
+                                self.domain_handler_count(),
+                                context.get_command()
+                            );
+                        }
                         log::error!(
                             "object_id {} is too big! This probably means a recent service call \
                              needed to return a new interface!",
@@ -236,6 +256,14 @@ impl SessionRequestManager {
                         return PreparedSyncRequest::StubSuccess;
                     }
                     if let Some(Some(handler)) = self.domain_handlers.get(object_id - 1) {
+                        if trace_dom {
+                            log::info!(
+                                "DOMAIN_SLOT dispatch object_id={} handler={} cmd={}",
+                                object_id,
+                                handler.service_name(),
+                                context.get_command()
+                            );
+                        }
                         log::debug!(
                             "HandleDomainSyncRequest: object_id={} cmd={} handler={}",
                             object_id,
@@ -243,6 +271,14 @@ impl SessionRequestManager {
                             handler.service_name()
                         );
                         return PreparedSyncRequest::Domain(handler.clone());
+                    }
+                    if trace_dom {
+                        log::info!(
+                            "DOMAIN_SLOT stub_null object_id={} handler_count={} cmd={} reason=null_slot",
+                            object_id,
+                            self.domain_handler_count(),
+                            context.get_command()
+                        );
                     }
                     log::error!("Domain handler at index {} is null", object_id - 1);
                     return PreparedSyncRequest::StubSuccess;
@@ -307,6 +343,9 @@ pub fn complete_sync_request(
                     context.is_tipc()
                 );
             }
+            IPC_TRACE_CURRENT.with(|c| {
+                *c.borrow_mut() = (handler.service_name().to_string(), context.get_command());
+            });
             let result = handler.handle_sync_request(context);
             if trace_dispatch {
                 log::warn!(
@@ -320,13 +359,24 @@ pub fn complete_sync_request(
         }
         PreparedSyncRequest::CloseVirtualHandle(index) => {
             manager.lock().unwrap().close_domain_handler(index);
+            IPC_TRACE_CURRENT.with(|c| {
+                *c.borrow_mut() = ("__close_virtual_handle__".to_string(), index as u32);
+            });
             let mut rb = super::ipc_helpers::ResponseBuilder::new(context, 2, 0, 0);
             rb.push_result(RESULT_SUCCESS);
+            // These branches bypass ServiceFrameworkBase::handle_sync_request_impl, so
+            // the buffer write-back must happen explicitly here. Matches upstream behavior
+            // where these paths eventually flow through SendReplyHLE which copies cmd_buf.
+            context.write_to_outgoing_command_buffer();
             RESULT_SUCCESS
         }
         PreparedSyncRequest::StubSuccess => {
+            IPC_TRACE_CURRENT.with(|c| {
+                *c.borrow_mut() = ("__stub_success__".to_string(), context.get_command());
+            });
             let mut rb = super::ipc_helpers::ResponseBuilder::new(context, 2, 0, 0);
             rb.push_result(RESULT_SUCCESS);
+            context.write_to_outgoing_command_buffer();
             RESULT_SUCCESS
         }
     };
@@ -773,7 +823,18 @@ impl HLERequestContext {
 
         let object_id = readable_event.lock().unwrap().object_id;
         process.register_readable_event_object(object_id, readable_event);
-        process.handle_table.add(object_id).ok()
+        let handle = process.handle_table.add(object_id).ok();
+        if std::env::var_os("RUZU_TRACE_EVENTS").is_some() {
+            let (svc, cmd) = IPC_TRACE_CURRENT.with(|c| c.borrow().clone());
+            log::info!(
+                "EVENT_HANDOUT object_id={} handle={:?} svc={} cmd={}",
+                object_id,
+                handle,
+                svc,
+                cmd
+            );
+        }
+        handle
     }
 
     pub fn owner_process_arc(
@@ -1327,6 +1388,33 @@ impl HLERequestContext {
         // Write the command buffer back to guest TLS memory.
         // Matches upstream: memory.WriteBlock(thread->GetTlsAddress(), cmd_buf.data(), write_size * sizeof(u32))
         let write_words = (self.write_size as usize).min(ipc::COMMAND_BUFFER_LENGTH);
+
+        // Temporary investigation hook: bounded hex-dump of IPC reply buffer so ruzu/zuyu
+        // traces can be diffed to find the first divergent IPC response. Enabled via
+        // RUZU_IPC_REPLY_DUMP env var. Bounded to first 4000 replies.
+        if std::env::var_os("RUZU_IPC_REPLY_DUMP").is_some() {
+            use std::sync::atomic::{AtomicUsize, Ordering};
+            static SEQ: AtomicUsize = AtomicUsize::new(0);
+            let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+            if seq < 4000 {
+                let n = write_words.min(16);
+                let mut hex = String::with_capacity(n * 9);
+                for i in 0..n {
+                    use std::fmt::Write;
+                    let _ = write!(hex, "{:08x} ", self.cmd_buf[i]);
+                }
+                let (svc, cmd) = IPC_TRACE_CURRENT.with(|c| c.borrow().clone());
+                log::warn!(
+                    "IPC_REPLY seq={} service={} cmd={} words={} payload={}",
+                    seq,
+                    if svc.is_empty() { "?" } else { svc.as_str() },
+                    cmd,
+                    write_words,
+                    hex.trim_end(),
+                );
+            }
+        }
+
         if let Some(ref memory) = self.memory {
             let m = memory.lock().unwrap();
             for i in 0..write_words {

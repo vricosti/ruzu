@@ -89,12 +89,13 @@ impl ThreadQueueImplForKConditionVariableWaitForAddress {
 
     /// Upstream CancelWait: removes waiter from owner, then delegates to
     /// base KThreadQueue::CancelWait (which sets RUNNABLE + clears queue).
+    /// Upstream: `waiting_thread->GetLockOwner()->RemoveWaiter(waiting_thread)`.
+    /// Callers hold the scheduler lock, so the raw owner pointer stored in
+    /// `WaitingLockRef` is safe to dereference (matching upstream's KThread*).
     fn cancel_wait(waiting_thread: &mut KThread) {
-        if let Some(owner_thread) = waiting_thread.get_lock_owner() {
-            owner_thread
-                .lock()
-                .unwrap()
-                .remove_waiter_by_thread_id(waiting_thread.thread_id);
+        if let Some(owner_ptr) = waiting_thread.get_lock_owner_raw() {
+            let owner = unsafe { &mut *owner_ptr };
+            owner.remove_waiter_by_thread_id(waiting_thread.thread_id);
         }
     }
 }
@@ -111,16 +112,34 @@ impl ThreadQueueImplForKConditionVariableWaitConditionVariable {
 
     fn cancel_wait(waiting_thread: &mut KThread) {
         // Remove the thread as a waiter from its owner.
-        if let Some(owner_thread) = waiting_thread.get_lock_owner() {
-            owner_thread
-                .lock()
-                .unwrap()
-                .remove_waiter_by_thread_id(waiting_thread.thread_id);
+        // Upstream: `waiting_thread->GetLockOwner()->RemoveWaiter(...)` via
+        // raw KThread*; we use the stored raw pointer for the same reason.
+        if let Some(owner_ptr) = waiting_thread.get_lock_owner_raw() {
+            let owner = unsafe { &mut *owner_ptr };
+            owner.remove_waiter_by_thread_id(waiting_thread.thread_id);
         }
 
         // If the thread is waiting on a condvar, remove it from the tree.
+        // Upstream: `m_tree->erase(m_tree->iterator_to(*waiting_thread))`, where
+        // `m_tree` is a pointer captured when the wait began. The Rust port stores
+        // the cond_var tree on `KProcess`; accessing it through `parent.lock()`
+        // here reintroduces the lock-ordering bug that would deadlock CoreTiming's
+        // timer thread against guest fibers. Use a raw pointer stashed by
+        // `set_parent_raw_ptr()` at thread construction, so this runs without
+        // re-acquiring the process mutex, matching upstream's raw-pointer access
+        // under the scheduler lock.
         if waiting_thread.is_waiting_for_condition_variable() {
-            if let Some(parent) = waiting_thread
+            if let Some(trace) = std::env::var_os("RUZU_TRACE_CT_FIRE") {
+                let _ = trace;
+                log::info!(
+                    "ThreadQueueImpl CV cancel_wait tid={} before_parent",
+                    waiting_thread.thread_id
+                );
+            }
+            if let Some(parent_ptr) = waiting_thread.get_parent_raw_ptr() {
+                let parent = unsafe { &mut *parent_ptr };
+                parent.remove_condition_variable_waiter(waiting_thread.thread_id);
+            } else if let Some(parent) = waiting_thread
                 .parent
                 .as_ref()
                 .and_then(|parent| parent.upgrade())
@@ -429,8 +448,19 @@ impl KConditionVariable {
         // Matches upstream: cur_thread->SetUserAddressKey(addr, value);
         //                   owner_thread->AddWaiter(cur_thread);
         process_guard.remove_from_priority_queue(current_thread_id);
-        let owner_thread_id = owner_thread.lock().unwrap().get_thread_id();
-        Self::begin_wait_for_address(current_thread, owner_thread_id, addr, value);
+        let (owner_thread_id, owner_thread_ptr) = {
+            let mut og = owner_thread.lock().unwrap();
+            let id = og.get_thread_id();
+            let ptr = (&mut *og) as *mut KThread as usize;
+            (id, ptr)
+        };
+        Self::begin_wait_for_address(
+            current_thread,
+            owner_thread_id,
+            owner_thread_ptr,
+            addr,
+            value,
+        );
         {
             let ct = current_thread.lock().unwrap();
             let priority = ct.get_priority();
@@ -889,11 +919,16 @@ impl KConditionVariable {
                         wt_is_kernel,
                     );
 
-                    let owner_id = owner_thread.lock().unwrap().get_thread_id();
+                    let (owner_id, owner_ptr) = {
+                        let mut og = owner_thread.lock().unwrap();
+                        let id = og.get_thread_id();
+                        let ptr = (&mut *og) as *mut KThread as usize;
+                        (id, ptr)
+                    };
                     waiting_thread
                         .lock()
                         .unwrap()
-                        .set_waiting_lock_owner_thread_id(Some(owner_id));
+                        .set_waiting_lock_owner_thread_id(Some(owner_id), owner_ptr);
                 } else {
                     // The lock was tagged with a thread that doesn't exist.
                     // Matches upstream: thread->EndWait(ResultInvalidState);
@@ -945,12 +980,14 @@ impl KConditionVariable {
     fn begin_wait_for_address(
         current_thread: &Arc<Mutex<KThread>>,
         owner_thread_id: u64,
+        owner_thread_ptr: usize,
         addr: u64,
         value: u32,
     ) {
         let mut current_thread = current_thread.lock().unwrap();
         current_thread.set_user_address_key(KProcessAddress::new(addr), value);
-        current_thread.set_waiting_lock_owner_thread_id(Some(owner_thread_id));
+        current_thread
+            .set_waiting_lock_owner_thread_id(Some(owner_thread_id), owner_thread_ptr);
         current_thread
             .begin_wait_with_queue(ThreadQueueImplForKConditionVariableWaitForAddress::queue());
         current_thread.set_wait_reason_for_debugging(ThreadWaitReasonForDebugging::ConditionVar);
@@ -971,7 +1008,7 @@ impl KConditionVariable {
     ) {
         let mut current_thread = current_thread.lock().unwrap();
         current_thread.set_condition_variable(KProcessAddress::new(addr), key, value);
-        current_thread.set_waiting_lock_owner_thread_id(None);
+        current_thread.set_waiting_lock_owner_thread_id(None, 0);
         current_thread.begin_wait_with_queue(wait_queue);
         current_thread.set_wait_reason_for_debugging(ThreadWaitReasonForDebugging::ConditionVar);
         if timeout > 0 {
@@ -1247,14 +1284,15 @@ mod tests {
             let is_kernel = wt.get_is_kernel_address_key();
             let priority = wt.get_priority();
             drop(wt);
-            owner
-                .lock()
-                .unwrap()
-                .add_waiter(2, priority, addr_key, is_kernel);
+            let owner_ptr = {
+                let mut og = owner.lock().unwrap();
+                og.add_waiter(2, priority, addr_key, is_kernel);
+                (&mut *og) as *mut KThread as usize
+            };
             waiter
                 .lock()
                 .unwrap()
-                .set_waiting_lock_owner_thread_id(Some(1));
+                .set_waiting_lock_owner_thread_id(Some(1), owner_ptr);
         }
 
         let result = KConditionVariable::signal_to_address(&process, &owner, address);

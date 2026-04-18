@@ -68,6 +68,9 @@ impl KReadableEvent {
     pub fn signal(&mut self, process: &mut KProcess, scheduler: &Arc<Mutex<KScheduler>>) -> u32 {
         let _scheduler_guard = Self::lock_scheduler();
         self.is_signaled = true;
+        if std::env::var_os("RUZU_TRACE_EVENTS").is_some() {
+            log::info!("EVENT_SIGNAL object_id={} via=signal", self.object_id);
+        }
         self.notify_available(process, scheduler);
         RESULT_SUCCESS.get_inner_value()
     }
@@ -82,6 +85,12 @@ impl KReadableEvent {
         scheduler: &Arc<Mutex<KScheduler>>,
     ) -> u32 {
         self.is_signaled = true;
+        if std::env::var_os("RUZU_TRACE_EVENTS").is_some() {
+            log::info!(
+                "EVENT_SIGNAL object_id={} via=signal_from_host",
+                self.object_id
+            );
+        }
         self.notify_available(process, scheduler);
         RESULT_SUCCESS.get_inner_value()
     }
@@ -105,6 +114,9 @@ impl KReadableEvent {
             event.is_signaled = true;
             event.object_id
         };
+        if std::env::var_os("RUZU_TRACE_EVENTS").is_some() {
+            log::info!("EVENT_SIGNAL object_id={}", object_id);
+        }
 
         let waiter_thread_ids = loop {
             let mut process = process_arc.lock().unwrap();

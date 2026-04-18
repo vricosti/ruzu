@@ -692,7 +692,7 @@ impl KProcess {
     pub fn initialize_interfaces(
         &mut self,
         shared_memory: crate::hle::kernel::k_process::SharedProcessMemory,
-        core_timing: std::sync::Arc<std::sync::Mutex<crate::core_timing::CoreTiming>>,
+        core_timing: std::sync::Arc<crate::core_timing::CoreTiming>,
     ) {
         let memory = self
             .memory
@@ -2376,6 +2376,11 @@ impl KProcess {
                 return Err(result);
             }
             thread.thread_type = super::k_thread::ThreadType::Main;
+            // Cache the owning process raw pointer for scheduler-lock-protected
+            // paths that avoid re-locking the process mutex (matches upstream's
+            // `KProcess*` access from KThread). Using `&mut *self` gives us the
+            // same pinned address as the Arc's inner `KProcess` storage.
+            thread.set_parent_raw_ptr(self as *mut KProcess as usize);
         }
         if trace_boot {
             log::info!(
