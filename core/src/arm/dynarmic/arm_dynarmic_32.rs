@@ -97,6 +97,119 @@ fn parse_trace_u32_env(name: &str) -> Option<u32> {
 
 /// JIT callbacks for ARM32.
 ///
+/// Memory watchpoint helper. Reads `RUZU_WATCH_ADDR` (comma-separated hex u64
+/// addresses, optionally suffixed `:size` for range; default size = 8 bytes).
+/// On every write that overlaps any watched range, logs PC + value to stderr.
+///
+/// Example: `RUZU_WATCH_ADDR=0xE88960,0xEF4F28:16,0x41800230:4`.
+///
+/// Lookup is gated on a `OnceLock` to avoid re-parsing per access.
+fn watched_ranges() -> &'static [(u64, u64)] {
+    use std::sync::OnceLock;
+    static RANGES: OnceLock<Vec<(u64, u64)>> = OnceLock::new();
+    RANGES.get_or_init(|| {
+        let raw = std::env::var("RUZU_WATCH_ADDR").unwrap_or_default();
+        let mut out = Vec::new();
+        for tok in raw.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
+            let (addr_s, size) = match tok.split_once(':') {
+                Some((a, s)) => (a, s.parse::<u64>().unwrap_or(8)),
+                None => (tok, 8u64),
+            };
+            let addr = if let Some(stripped) = addr_s
+                .strip_prefix("0x")
+                .or_else(|| addr_s.strip_prefix("0X"))
+            {
+                u64::from_str_radix(stripped, 16).unwrap_or(0)
+            } else {
+                addr_s.parse::<u64>().unwrap_or(0)
+            };
+            if addr != 0 {
+                out.push((addr, addr.saturating_add(size)));
+            }
+        }
+        out
+    })
+}
+
+#[inline(always)]
+fn watch_write(cb: &DynarmicCallbacks32, vaddr: u64, size: u64, value: u128) {
+    let ranges = watched_ranges();
+    if ranges.is_empty() {
+        return;
+    }
+    let end = vaddr.saturating_add(size);
+    let hits = ranges.iter().any(|(s, e)| vaddr < *e && end > *s);
+    if !hits {
+        return;
+    }
+    let pc = cb
+        .jit_pc_ptr
+        .map(|p| unsafe { p.read_volatile() })
+        .unwrap_or(0);
+    eprintln!(
+        "[WATCH_WRITE] pc=0x{:08X} vaddr=0x{:X} size={} value=0x{:032X}",
+        pc, vaddr, size, value
+    );
+}
+
+#[inline(always)]
+fn watch_read(cb: &DynarmicCallbacks32, vaddr: u64, size: u64, value: u128) {
+    let ranges = watched_ranges();
+    let pc_range = watched_pc_range();
+    let has_addr_filter = !ranges.is_empty();
+    let has_pc_filter = pc_range.is_some();
+    if !has_addr_filter && !has_pc_filter {
+        return;
+    }
+    if has_addr_filter {
+        let end = vaddr.saturating_add(size);
+        let hits = ranges.iter().any(|(s, e)| vaddr < *e && end > *s);
+        if !hits {
+            return;
+        }
+    }
+    let pc = cb
+        .jit_pc_ptr
+        .map(|p| unsafe { p.read_volatile() })
+        .unwrap_or(0);
+    if let Some((pc_lo, pc_hi)) = pc_range {
+        let pc_u64 = pc as u64;
+        if pc_u64 < pc_lo || pc_u64 >= pc_hi {
+            return;
+        }
+    }
+    eprintln!(
+        "[WATCH_READ ] pc=0x{:08X} vaddr=0x{:X} size={} value=0x{:032X}",
+        pc, vaddr, size, value
+    );
+}
+
+/// PC-range filter from `RUZU_WATCH_PC=0xLO-0xHI` (inclusive..exclusive).
+/// Returns None when unset; pairs with `watch_read` / `watch_write` to
+/// limit log output to guest code within a specific PC window.
+fn watched_pc_range() -> Option<(u64, u64)> {
+    use std::sync::OnceLock;
+    static RANGE: OnceLock<Option<(u64, u64)>> = OnceLock::new();
+    *RANGE.get_or_init(|| {
+        let raw = std::env::var("RUZU_WATCH_PC").ok()?;
+        let (a, b) = raw.split_once('-')?;
+        let parse = |s: &str| -> Option<u64> {
+            let s = s.trim();
+            let stripped = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X"));
+            match stripped {
+                Some(hex) => u64::from_str_radix(hex, 16).ok(),
+                None => s.parse::<u64>().ok(),
+            }
+        };
+        let lo = parse(a)?;
+        let hi = parse(b)?;
+        if hi <= lo {
+            return None;
+        }
+        Some((lo, hi))
+    })
+}
+
 /// Corresponds to upstream `DynarmicCallbacks32`.
 ///
 /// Upstream fields: `m_parent`, `m_memory`, `m_process`, `m_debugger_enabled`,
@@ -254,17 +367,23 @@ impl UserCallbacks for DynarmicCallbacks32 {
 
     fn memory_read_16(&self, vaddr: u64) -> u16 {
         self.check_memory_access(vaddr, 2);
-        self.mem().read_16(vaddr)
+        let v = self.mem().read_16(vaddr);
+        watch_read(self, vaddr, 2, v as u128);
+        v
     }
 
     fn memory_read_32(&self, vaddr: u64) -> u32 {
         self.check_memory_access(vaddr, 4);
-        self.mem().read_32(vaddr)
+        let v = self.mem().read_32(vaddr);
+        watch_read(self, vaddr, 4, v as u128);
+        v
     }
 
     fn memory_read_64(&self, vaddr: u64) -> u64 {
         self.check_memory_access(vaddr, 8);
-        self.mem().read_64(vaddr)
+        let v = self.mem().read_64(vaddr);
+        watch_read(self, vaddr, 8, v as u128);
+        v
     }
 
     fn memory_read_128(&self, vaddr: u64) -> (u64, u64) {
@@ -274,30 +393,40 @@ impl UserCallbacks for DynarmicCallbacks32 {
     }
 
     fn memory_write_8(&mut self, vaddr: u64, value: u8) {
+        watch_write(self, vaddr, 1, value as u128);
         if self.check_memory_access(vaddr, 1) {
             self.mem().write_8(vaddr, value);
         }
     }
 
     fn memory_write_16(&mut self, vaddr: u64, value: u16) {
+        watch_write(self, vaddr, 2, value as u128);
         if self.check_memory_access(vaddr, 2) {
             self.mem().write_16(vaddr, value);
         }
     }
 
     fn memory_write_32(&mut self, vaddr: u64, value: u32) {
+        watch_write(self, vaddr, 4, value as u128);
         if self.check_memory_access(vaddr, 4) {
             self.mem().write_32(vaddr, value);
         }
     }
 
     fn memory_write_64(&mut self, vaddr: u64, value: u64) {
+        watch_write(self, vaddr, 8, value as u128);
         if self.check_memory_access(vaddr, 8) {
             self.mem().write_64(vaddr, value);
         }
     }
 
     fn memory_write_128(&mut self, vaddr: u64, value_lo: u64, value_hi: u64) {
+        watch_write(
+            self,
+            vaddr,
+            16,
+            ((value_hi as u128) << 64) | (value_lo as u128),
+        );
         if self.check_memory_access(vaddr, 16) {
             let m = self.mem();
             m.write_64(vaddr, value_lo);
@@ -306,10 +435,15 @@ impl UserCallbacks for DynarmicCallbacks32 {
     }
 
     fn exclusive_read_8(&self, vaddr: u64) -> u8 {
-        self.memory_read_8(vaddr)
+        // memory_read_8 doesn't currently watch — add inline.
+        self.check_memory_access(vaddr, 1);
+        let v = self.mem().read_8(vaddr);
+        watch_read(self, vaddr, 1, v as u128);
+        v
     }
 
     fn exclusive_read_16(&self, vaddr: u64) -> u16 {
+        // memory_read_16 already watches; just delegate.
         self.memory_read_16(vaddr)
     }
 
@@ -322,7 +456,9 @@ impl UserCallbacks for DynarmicCallbacks32 {
     }
 
     fn exclusive_read_128(&self, vaddr: u64) -> (u64, u64) {
-        self.memory_read_128(vaddr)
+        let (lo, hi) = self.memory_read_128(vaddr);
+        watch_read(self, vaddr, 16, ((hi as u128) << 64) | (lo as u128));
+        (lo, hi)
     }
 
     fn exclusive_write_8(&mut self, vaddr: u64, value: u8, expected: u8) -> bool {
@@ -957,11 +1093,7 @@ impl UserCallbacks for DynarmicCallbacks32 {
         // Matches upstream: amortized_ticks = max(ticks / NUM_CPU_CORES, 1)
         let amortized_ticks =
             std::cmp::max(ticks / crate::hardware_properties::NUM_CPU_CORES as u64, 1);
-        self.parent()
-            .core_timing
-            .lock()
-            .unwrap()
-            .add_ticks(amortized_ticks);
+        self.parent().core_timing.add_ticks(amortized_ticks);
     }
 
     /// Matches upstream `DynarmicCallbacks32::GetTicksRemaining`:
@@ -971,14 +1103,13 @@ impl UserCallbacks for DynarmicCallbacks32 {
         if self.parent().base.uses_wall_clock {
             return u64::MAX;
         }
-        let ct = self.parent().core_timing.lock().unwrap();
-        std::cmp::max(ct.get_downcount(), 0) as u64
+        std::cmp::max(self.parent().core_timing.get_downcount(), 0) as u64
     }
 
     /// Matches upstream `DynarmicCallbacks32::GetCNTPCT`.
     /// Returns the current system counter value from CoreTiming.
     fn get_cntpct(&self) -> u64 {
-        self.parent().core_timing.lock().unwrap().get_clock_ticks()
+        self.parent().core_timing.get_clock_ticks()
     }
 
     fn set_pc_ptr(&mut self, ptr: *const u32) {
@@ -1012,7 +1143,7 @@ pub struct ArmDynarmic32 {
     /// Core timing reference for tick management.
     /// Upstream: accessed via `m_system.CoreTiming()`.
     /// Stored here so callbacks can access it via `parent().core_timing`.
-    core_timing: Arc<std::sync::Mutex<crate::core_timing::CoreTiming>>,
+    core_timing: Arc<crate::core_timing::CoreTiming>,
 
     /// Shared atomic pointer used by callbacks to reach back to this ArmDynarmic32.
     /// The callbacks store a clone of this Arc. After JIT creation, the parent sets
@@ -1050,7 +1181,7 @@ impl ArmDynarmic32 {
         exclusive_monitor: *mut crate::arm::dynarmic::dynarmic_exclusive_monitor::DynarmicExclusiveMonitor,
         core_index: usize,
         shared_memory: SharedProcessMemory,
-        core_timing: Arc<std::sync::Mutex<crate::core_timing::CoreTiming>>,
+        core_timing: Arc<crate::core_timing::CoreTiming>,
         core_memory: Option<Arc<std::sync::Mutex<Memory>>>,
     ) -> Self {
         // Get fastmem pointer from core_memory before moving it into callbacks.
