@@ -10,6 +10,7 @@ use super::k_process::KProcess;
 use super::k_scheduler::KScheduler;
 use super::k_scheduler_lock::KScopedSchedulerLock;
 use crate::hle::result::RESULT_SUCCESS;
+use super::k_process::ProcessLock;
 
 /// The kernel event object.
 /// Matches upstream `KEvent` class (k_event.h).
@@ -63,7 +64,7 @@ impl KEvent {
 
     /// Signal the event.
     /// Matches upstream `KEvent::Signal`.
-    pub fn signal(&mut self, process: &mut KProcess, scheduler: &Arc<Mutex<KScheduler>>) -> u32 {
+    pub fn signal(&mut self, process: &KProcess) -> u32 {
         let _scheduler_guard = Self::lock_scheduler_for_process(process);
 
         if self.readable_event_destroyed {
@@ -74,7 +75,7 @@ impl KEvent {
         else {
             return RESULT_SUCCESS.get_inner_value();
         };
-        let result = readable_event.lock().unwrap().signal(process, scheduler);
+        let result = readable_event.lock().unwrap().signal();
         result
     }
 
@@ -98,13 +99,14 @@ impl KEvent {
     /// Rust helper for signaling a shared `KEvent` through the current owner process.
     ///
     /// Upstream stores the readable event inline and signals it directly. Rust stores
-    /// the owner `KEvent` and readable event in per-process object maps, so the hot path
-    /// resolves the readable end from the owner process and signals it without holding
-    /// the `KEvent` mutex across waiter wakeup.
+    /// the owner `KEvent` and readable event in per-process object maps, so this
+    /// helper resolves the readable end from the owner process and signals it.
+    /// After the sync-object refactor the signal path only needs the scheduler
+    /// lock (acquired inside `signal`), not the `KProcess` Mutex.
     pub fn signal_arc(
         event: &Arc<Mutex<KEvent>>,
-        process: &Arc<Mutex<KProcess>>,
-        scheduler: &Arc<Mutex<KScheduler>>,
+        process: &Arc<ProcessLock>,
+        _scheduler: &Arc<Mutex<KScheduler>>,
     ) -> u32 {
         let readable_event_id = {
             let event = event.lock().unwrap();
@@ -123,15 +125,12 @@ impl KEvent {
             readable_event
         };
 
-        super::k_readable_event::KReadableEvent::signal_from_host_arc(
-            &readable_event,
-            process,
-            scheduler,
-        )
+        let result = readable_event.lock().unwrap().signal_from_host();
+        result
     }
 
     /// Rust helper for clearing a shared `KEvent` through the current owner process.
-    pub fn clear_arc(event: &Arc<Mutex<KEvent>>, process: &Arc<Mutex<KProcess>>) -> u32 {
+    pub fn clear_arc(event: &Arc<Mutex<KEvent>>, process: &Arc<ProcessLock>) -> u32 {
         let readable_event_id = {
             let event = event.lock().unwrap();
             if event.readable_event_destroyed {

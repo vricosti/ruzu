@@ -12,6 +12,7 @@ use crate::hle::kernel::k_readable_event::KReadableEvent;
 use crate::hle::kernel::svc::svc_results::*;
 use crate::hle::kernel::svc_common::Handle;
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
+use super::super::k_process::ProcessLock;
 
 /// Signals an event.
 pub fn signal_event(system: &System, event_handle: Handle) -> ResultCode {
@@ -28,8 +29,7 @@ pub fn signal_event(system: &System, event_handle: Handle) -> ResultCode {
         return RESULT_INVALID_HANDLE;
     };
 
-    let scheduler = system.scheduler_arc().clone();
-    let result = event.lock().unwrap().signal(&mut process, &scheduler);
+    let result = event.lock().unwrap().signal(&process);
     ResultCode::new(result)
 }
 
@@ -115,7 +115,7 @@ mod tests {
     fn test_system() -> System {
         let mut system = System::new_for_test();
 
-        let process = Arc::new(Mutex::new(KProcess::new()));
+        let process = Arc::new(ProcessLock::from_value(KProcess::new()));
         {
             let mut process_guard = process.lock().unwrap();
             process_guard.process_id = 1;

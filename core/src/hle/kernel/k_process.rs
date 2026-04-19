@@ -10,6 +10,13 @@ use std::ffi::OsStr;
 use std::sync::atomic::{AtomicI64, AtomicU16};
 use std::sync::{Arc, Mutex, RwLock, Weak};
 
+/// Type alias for the Mutex wrapping a `KProcess`.
+/// Uses `TrackedMutex` so the SIGUSR1 dumper can enumerate lock holders.
+/// Production callers hand around `Arc<ProcessLock>`; the API is
+/// `.lock() -> LockResult<...>` / `.try_lock() -> TryLockResult<...>`
+/// exactly like `std::sync::Mutex`.
+pub type ProcessLock = super::tracked_mutex::TrackedMutex<KProcess>;
+
 use super::code_set::CodeSet;
 use super::k_capabilities::KCapabilities;
 use super::k_client_session::KClientSession;
@@ -436,7 +443,7 @@ pub struct KProcess {
     pub transfer_memory_objects:
         BTreeMap<u64, Arc<Mutex<super::k_transfer_memory::KTransferMemory>>>,
     pub sync_object: SynchronizationObjectState,
-    pub self_reference: Option<Weak<Mutex<KProcess>>>,
+    pub self_reference: Option<Weak<ProcessLock>>,
     pub scheduler: Option<Weak<Mutex<KScheduler>>>,
     // Shared memory list — stubbed
     pub is_suspended: bool,
@@ -489,7 +496,7 @@ impl KProcess {
     /// This preserves lifecycle ownership in `k_process.rs` while allowing
     /// callers to perform the final current-thread exit after dropping the
     /// process mutex.
-    pub fn exit_with_current_thread(process: &Arc<Mutex<KProcess>>) {
+    pub fn exit_with_current_thread(process: &Arc<ProcessLock>) {
         let current_thread = {
             let process_guard = process.lock().unwrap();
             let current_thread_id = process_guard
@@ -1032,24 +1039,6 @@ impl KProcess {
         self.is_signaled
     }
 
-    pub fn link_waiter(&mut self, thread_id: u64) {
-        let mut waiters = std::mem::take(&mut self.sync_object.waiters);
-        waiters.link(
-            self,
-            super::k_synchronization_object::SynchronizationWaitNodeHandle {
-                thread_id,
-                wait_index: 0,
-            },
-        );
-        self.sync_object.waiters = waiters;
-    }
-
-    pub fn unlink_waiter(&mut self, thread_id: u64) {
-        let mut waiters = std::mem::take(&mut self.sync_object.waiters);
-        waiters.unlink(self, thread_id, 0);
-        self.sync_object.waiters = waiters;
-    }
-
     pub fn get_process_local_region_address(&self) -> KProcessAddress {
         self.plr_address
     }
@@ -1105,12 +1094,12 @@ impl KProcess {
         self.refresh_registered_thread_scheduler_state();
     }
 
-    pub fn bind_self_reference(&mut self, process: &Arc<Mutex<KProcess>>) {
+    pub fn bind_self_reference(&mut self, process: &Arc<ProcessLock>) {
         self.self_reference = Some(Arc::downgrade(process));
     }
 
     pub fn wait_condition_variable(
-        process: &Arc<Mutex<KProcess>>,
+        process: &Arc<ProcessLock>,
         current_thread: &Arc<Mutex<KThread>>,
         address: u64,
         cv_key: u64,
@@ -1146,6 +1135,16 @@ impl KProcess {
             "KProcess::signal_condition_variable enter cv_key=0x{:X} count={}",
             cv_key,
             count
+        );
+        // Mark this thread as holding the process Mutex from this site
+        // (actual Mutex was already acquired by the caller — we're just
+        // labelling the current holder for SIGUSR1 diagnostics).
+        let tid = super::kernel::get_current_thread_pointer()
+            .and_then(|t| t.lock().ok().map(|g| g.get_thread_id()))
+            .unwrap_or(0);
+        let _holder_guard = super::kernel::ProcessLockTracker::new(
+            tid,
+            0x5369_4356, // 'SigCV'
         );
         let cond_var_ptr: *mut KConditionVariable = &mut self.cond_var;
         unsafe {
@@ -2934,11 +2933,15 @@ impl KProcess {
         if self.state != new_state {
             self.state = new_state;
             self.is_signaled = true;
-            k_synchronization_object::notify_available(
-                self,
-                self.process_id,
-                crate::hle::result::RESULT_SUCCESS.get_inner_value(),
-            );
+            // Upstream: KSynchronizationObject::NotifyAvailable(ResultSuccess)
+            // walks the waiter list under scheduler lock, no KProcess needed.
+            unsafe {
+                k_synchronization_object::notify_waiters_on_state(
+                    &self.sync_object,
+                    self.process_id,
+                    crate::hle::result::RESULT_SUCCESS.get_inner_value(),
+                );
+            }
         }
     }
 
@@ -2988,7 +2991,7 @@ mod tests {
 
     #[test]
     fn run_bootstraps_process_owned_main_thread() {
-        let process = Arc::new(Mutex::new(KProcess::new()));
+        let process = Arc::new(ProcessLock::from_value(KProcess::new()));
         let scheduler = Arc::new(Mutex::new(KScheduler::new(0)));
 
         {
@@ -3130,7 +3133,7 @@ mod tests {
 
     #[test]
     fn exit_excludes_scheduler_current_thread_from_start_termination() {
-        let process = Arc::new(Mutex::new(KProcess::new()));
+        let process = Arc::new(ProcessLock::from_value(KProcess::new()));
         let scheduler = Arc::new(Mutex::new(KScheduler::new(0)));
         scheduler.lock().unwrap().set_scheduler_current_thread_id(1);
 
@@ -3167,7 +3170,7 @@ mod tests {
 
     #[test]
     fn register_thread_object_binds_thread_self_reference() {
-        let process = Arc::new(Mutex::new(KProcess::new()));
+        let process = Arc::new(ProcessLock::from_value(KProcess::new()));
         let thread = Arc::new(Mutex::new(KThread::new()));
         {
             let mut guard = thread.lock().unwrap();
@@ -3192,7 +3195,7 @@ mod tests {
 
     #[test]
     fn register_thread_object_inherits_scheduler_state_from_process() {
-        let process = Arc::new(Mutex::new(KProcess::new()));
+        let process = Arc::new(ProcessLock::from_value(KProcess::new()));
         let scheduler = Arc::new(Mutex::new(KScheduler::new(0)));
         let gsc = Arc::new(Mutex::new(GlobalSchedulerContext::new()));
         scheduler.lock().unwrap().global_scheduler_context = Some(gsc.clone());
@@ -3229,7 +3232,7 @@ mod tests {
         let gsc = Arc::new(Mutex::new(GlobalSchedulerContext::new()));
         scheduler.lock().unwrap().global_scheduler_context = Some(gsc.clone());
 
-        let process = Arc::new(Mutex::new(KProcess::new()));
+        let process = Arc::new(ProcessLock::from_value(KProcess::new()));
         {
             let mut process_guard = process.lock().unwrap();
             process_guard.attach_scheduler(&scheduler);
@@ -3279,7 +3282,7 @@ mod tests {
 
     #[test]
     fn attach_scheduler_backfills_existing_registered_threads() {
-        let process = Arc::new(Mutex::new(KProcess::new()));
+        let process = Arc::new(ProcessLock::from_value(KProcess::new()));
         let thread = Arc::new(Mutex::new(KThread::new()));
         {
             let mut guard = thread.lock().unwrap();
@@ -3308,7 +3311,7 @@ mod tests {
 
     #[test]
     fn exit_with_current_thread_also_exits_scheduler_current_thread() {
-        let process = Arc::new(Mutex::new(KProcess::new()));
+        let process = Arc::new(ProcessLock::from_value(KProcess::new()));
         let scheduler = Arc::new(Mutex::new(KScheduler::new(0)));
         scheduler.lock().unwrap().set_scheduler_current_thread_id(1);
 
@@ -3349,7 +3352,7 @@ mod tests {
 
     #[test]
     fn start_termination_synchronously_finishes_initialized_children() {
-        let process = Arc::new(Mutex::new(KProcess::new()));
+        let process = Arc::new(ProcessLock::from_value(KProcess::new()));
         let current = Arc::new(Mutex::new(KThread::new()));
         {
             let mut guard = current.lock().unwrap();

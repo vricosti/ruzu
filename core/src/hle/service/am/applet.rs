@@ -203,17 +203,10 @@ impl Applet {
     }
 
     fn signal_persistent_readable_event(
-        process: &mut KProcess,
+        _process: &mut KProcess,
         readable_event: &Arc<Mutex<KReadableEvent>>,
     ) {
-        let Some(scheduler) = process
-            .scheduler
-            .as_ref()
-            .and_then(|scheduler| scheduler.upgrade())
-        else {
-            return;
-        };
-        readable_event.lock().unwrap().signal(process, &scheduler);
+        readable_event.lock().unwrap().signal();
     }
 
     pub fn ensure_sleep_lock_event(&mut self, ctx: &HLERequestContext) -> Option<Handle> {

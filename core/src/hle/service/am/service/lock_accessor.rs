@@ -14,6 +14,7 @@ use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
 use crate::hle::service::ipc_helpers::{RequestParser, ResponseBuilder};
 use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
+use crate::hle::kernel::k_process::ProcessLock;
 
 /// IPC command table for ILockAccessor:
 /// - 1: TryLock
@@ -23,7 +24,7 @@ use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFrame
 pub struct ILockAccessor {
     /// Matches upstream `bool m_is_locked`.
     is_locked: Mutex<bool>,
-    owner_process: Weak<Mutex<KProcess>>,
+    owner_process: Weak<ProcessLock>,
     event_object_id: u64,
     readable_event_object_id: u64,
     event: Arc<Mutex<KEvent>>,
@@ -33,7 +34,7 @@ pub struct ILockAccessor {
 }
 
 impl ILockAccessor {
-    pub fn new(owner_process: Arc<Mutex<KProcess>>) -> Self {
+    pub fn new(owner_process: Arc<ProcessLock>) -> Self {
         use std::sync::atomic::{AtomicU64, Ordering};
 
         static NEXT_LOCK_ACCESSOR_EVENT_OBJECT_ID: AtomicU64 = AtomicU64::new(0x2300_0000);
@@ -133,17 +134,8 @@ impl ILockAccessor {
         }
 
         if let Some(owner_process) = accessor.owner_process.upgrade() {
-            let mut process = owner_process.lock().unwrap();
-            let scheduler = process.scheduler.as_ref().and_then(|weak| weak.upgrade());
-            if let Some(scheduler) = scheduler {
-                accessor
-                    .event
-                    .lock()
-                    .unwrap()
-                    .signal(&mut process, &scheduler);
-            } else {
-                accessor.readable_event.lock().unwrap().is_signaled = true;
-            }
+            let process = owner_process.lock().unwrap();
+            accessor.event.lock().unwrap().signal(&process);
         }
 
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
@@ -203,7 +195,7 @@ mod tests {
 
     #[test]
     fn constructor_creates_persistent_signaled_readable_event() {
-        let owner_process = Arc::new(Mutex::new(KProcess::new()));
+        let owner_process = Arc::new(ProcessLock::from_value(KProcess::new()));
         owner_process
             .lock()
             .unwrap()

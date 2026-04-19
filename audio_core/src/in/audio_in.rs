@@ -5,11 +5,15 @@ use crate::Result;
 use common::ResultCode;
 use parking_lot::Mutex;
 use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
 
 pub struct In {
     system: Mutex<System>,
     buffer_event: SharedAudioEvent,
     release_session: Arc<dyn Fn(usize) + Send + Sync>,
+    readable_event:
+        StdMutex<Option<Arc<StdMutex<ruzu_core::hle::kernel::k_readable_event::KReadableEvent>>>>,
+    process_arc: StdMutex<Option<Arc<ruzu_core::hle::kernel::k_process::ProcessLock>>>,
 }
 
 impl In {
@@ -22,7 +26,24 @@ impl In {
             system: Mutex::new(system),
             buffer_event,
             release_session,
+            readable_event: StdMutex::new(None),
+            process_arc: StdMutex::new(None),
         }
+    }
+
+    fn signal_readable_event_if_needed(&self) {
+        if !self.buffer_event.load(std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
+
+        let readable_event = self.readable_event.lock().unwrap().clone();
+        let Some(readable_event) = readable_event else {
+            return;
+        };
+
+        // Upstream parity: KReadableEvent::Signal only needs the scheduler
+        // lock. No KProcess Mutex in the signal path.
+        readable_event.lock().unwrap().signal_from_host();
     }
 
     pub fn free(&self) {
@@ -61,10 +82,16 @@ impl In {
             system.release_buffers();
             system.register_buffers();
         }
+        drop(system);
+        self.signal_readable_event_if_needed();
     }
 
     pub fn flush_audio_in_buffers(&self) -> bool {
-        self.system.lock().flush_audio_in_buffers()
+        let flushed = self.system.lock().flush_audio_in_buffers();
+        if flushed {
+            self.signal_readable_event_if_needed();
+        }
+        flushed
     }
     pub fn get_released_buffers(&self, tags: &mut [u64]) -> u32 {
         self.system.lock().get_released_buffers(tags)
@@ -86,5 +113,19 @@ impl In {
     }
     pub fn get_played_sample_count(&self) -> u64 {
         self.system.lock().get_played_sample_count()
+    }
+
+    pub fn set_buffer_readable_event(
+        &self,
+        event: Arc<StdMutex<ruzu_core::hle::kernel::k_readable_event::KReadableEvent>>,
+    ) {
+        *self.readable_event.lock().unwrap() = Some(event);
+    }
+
+    pub fn set_process_arc(
+        &self,
+        process: Arc<ruzu_core::hle::kernel::k_process::ProcessLock>,
+    ) {
+        *self.process_arc.lock().unwrap() = Some(process);
     }
 }

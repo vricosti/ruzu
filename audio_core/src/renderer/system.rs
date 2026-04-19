@@ -23,7 +23,7 @@ use crate::{Result, SharedSystem};
 use common::ResultCode;
 use parking_lot::{Condvar, Mutex};
 use ruzu_core::hle::kernel::k_event::KEvent;
-use ruzu_core::hle::kernel::k_process::KProcess;
+use ruzu_core::hle::kernel::k_process::{KProcess, ProcessLock};
 use ruzu_core::hle::kernel::k_readable_event::KReadableEvent;
 use ruzu_core::hle::kernel::k_transfer_memory::KTransferMemory;
 use std::mem::{size_of, size_of_val};
@@ -81,7 +81,7 @@ pub struct System {
     /// Process Arc for safe signal_rendered_event access. The raw process_ptr
     /// bypasses Mutex synchronization, causing data races when the audio thread
     /// reads waiter state that the game thread writes under Mutex protection.
-    process_arc: Option<Arc<StdMutex<KProcess>>>,
+    process_arc: Option<Arc<ProcessLock>>,
     terminate_event: Arc<TerminateEvent>,
     behavior: BehaviorInfo,
     voice_context: VoiceContext,
@@ -227,52 +227,21 @@ impl System {
         }
 
         // Signal the readable event directly using the stored Arc references.
-        // IMPORTANT: we must NOT hold the process Mutex when calling signal(),
-        // because signal() acquires the scheduler lock internally, and the
-        // game thread's WaitSynchronization holds scheduler_lock → process.lock()
-        // (the opposite order). Holding process.lock() → scheduler_lock here
-        // would deadlock.
-        //
-        // Instead, extract the scheduler Arc under the process lock, drop the
-        // process lock, then call signal() with a raw process reference.
-        // The scheduler lock inside signal() provides the synchronization
-        // needed for notify_available to see linked waiters.
-        if let (Some(ref readable_event), Some(ref process_arc)) =
-            (&self.rendered_readable_event, &self.process_arc)
-        {
-            let mut process = process_arc.lock().unwrap();
-            let Some(scheduler) = process.scheduler.as_ref().and_then(|s| s.upgrade()) else {
-                return;
-            };
-            // Hold the process lock during signal_from_host so that
-            // notify_available → waiter_snapshot sees waiters linked by
-            // the game thread under the same Mutex.
-            readable_event
-                .lock()
-                .unwrap()
-                .signal_from_host(&mut process, &scheduler);
+        // Upstream parity: `KReadableEvent::Signal` walks waiters under the
+        // scheduler lock; no KProcess Mutex is needed in the signal path.
+        if let Some(ref readable_event) = self.rendered_readable_event {
+            readable_event.lock().unwrap().signal_from_host();
             return;
         }
 
-        // Fallback: signal through KEvent with raw process pointer.
-        let process_ptr = self.process.as_ptr() as *mut KProcess;
+        // Fallback: signal through KEvent (also scheduler-lock-only).
+        let process_ptr = self.process.as_ptr() as *const KProcess;
         if process_ptr.is_null() {
             return;
         }
         unsafe {
-            let process = &mut *process_ptr;
-            let Some(scheduler) = process
-                .scheduler
-                .as_ref()
-                .and_then(|scheduler| scheduler.upgrade())
-            else {
-                return;
-            };
-            let _ = self
-                .rendered_event
-                .lock()
-                .unwrap()
-                .signal(process, &scheduler);
+            let process = &*process_ptr;
+            let _ = self.rendered_event.lock().unwrap().signal(process);
         }
     }
 
@@ -1019,7 +988,7 @@ impl System {
         self.rendered_readable_event = Some(event);
     }
 
-    pub fn set_process_arc(&mut self, process: Arc<StdMutex<KProcess>>) {
+    pub fn set_process_arc(&mut self, process: Arc<ProcessLock>) {
         self.process_arc = Some(process);
     }
 
@@ -1139,8 +1108,6 @@ impl System {
         self.core
             .lock()
             .core_timing()
-            .lock()
-            .unwrap()
             .get_global_time_ns()
             .as_nanos() as u64
     }
