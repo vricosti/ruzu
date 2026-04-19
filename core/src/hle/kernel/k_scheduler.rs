@@ -558,10 +558,22 @@ impl KScheduler {
             // Unload the current thread
             self.unload(cur_thread);
 
-            // Yield to the switch fiber
+            // Upstream (k_scheduler.cpp KScheduler::PreemptSingleCore):
+            //   Common::Fiber::YieldTo(thread->GetHostContext(), *m_switch_fiber);
+            // raw pointers, no mutex held across yield.
+            //
+            // Ruzu equivalent: clone the Arc<Fiber> out of the KThread
+            // guard so the guard drops at the end of the assignment
+            // statement, BEFORE `Fiber::yield_to` runs. Holding the KThread
+            // Mutex across the yield would hand control to another fiber
+            // while cur_thread's guard is alive, deadlocking any other
+            // host-thread path that tries to lock the same KThread (e.g.,
+            // handle_interrupt's `thread.get_thread_id()` or scheduler
+            // fiber operations).
             if let Some(ref switch_fiber) = &self.switch_fiber {
-                if let Some(ref host_ctx) = cur_thread.lock().unwrap().host_context {
-                    Fiber::yield_to(Arc::downgrade(host_ctx), switch_fiber);
+                let host_ctx = cur_thread.lock().unwrap().host_context.clone();
+                if let Some(host_ctx) = host_ctx {
+                    Fiber::yield_to(Arc::downgrade(&host_ctx), switch_fiber);
                 }
             }
 
