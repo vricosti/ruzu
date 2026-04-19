@@ -15,7 +15,23 @@ use std::sync::{Arc, Mutex, RwLock, Weak};
 /// Production callers hand around `Arc<ProcessLock>`; the API is
 /// `.lock() -> LockResult<...>` / `.try_lock() -> TryLockResult<...>`
 /// exactly like `std::sync::Mutex`.
-pub type ProcessLock = super::tracked_mutex::TrackedMutex<KProcess>;
+// Step 5 of the upstream-faithful sync refactor: KProcess storage moves
+// from a sleeping `TrackedMutex<KProcess>` to a `SyncCell<KProcess>`
+// (UnsafeCell + scheduler-spin-lock contract). The type alias name
+// `ProcessLock` is preserved so all `Arc<ProcessLock>` field/parameter
+// declarations across ~35 files compile unchanged.
+//
+// `SyncCell::lock` / `try_lock` / `lock_with` are API-compatible shims
+// (see sync_cell.rs); they return guards that deref to `&mut KProcess`
+// without doing any real locking — serialization is the scheduler
+// spin-lock's job. Callers that previously held the parking_lot Mutex
+// across a fiber yield no longer can: the underlying lock is gone.
+//
+// This is INTENTIONAL intermediate breakage. Any caller that was relying
+// on the parking_lot Mutex's mutual-exclusion semantics (rather than the
+// scheduler spin-lock) will silently race until later refactor steps
+// add `KScopedSchedulerLock` coverage at those sites.
+pub type ProcessLock = super::sync_cell::KProcessCell;
 
 use super::code_set::CodeSet;
 use super::k_capabilities::KCapabilities;
