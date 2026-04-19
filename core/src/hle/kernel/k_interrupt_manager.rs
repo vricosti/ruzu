@@ -29,55 +29,85 @@ pub fn handle_interrupt(kernel: &KernelCore, core_id: i32) {
     let current_thread = super::kernel::get_current_emu_thread();
 
     if let Some(ref thread_arc) = current_thread {
-        let thread = thread_arc.lock().unwrap();
+        // Snapshot KThread fields and drop the guard before taking
+        // scheduler lock + KProcess lock. Enforces lock order
+        // scheduler → process → thread, matching upstream.
+        let snapshot = {
+            let thread = thread_arc.lock().unwrap();
+            let parent_arc = thread.parent.as_ref().and_then(|w| w.upgrade());
+            parent_arc.map(|p| {
+                (
+                    p,
+                    thread.get_user_disable_count(),
+                    thread.get_thread_id(),
+                    thread.get_current_core(),
+                    thread.is_termination_requested(),
+                    thread.scheduler_lock_ptr,
+                )
+            })
+        };
 
-        // Check if we need to pin the current thread.
-        // Upstream: if (auto* process = GetCurrentProcessPointer(kernel); process) {
-        if let Some(parent_weak) = thread.parent.as_ref() {
-            if let Some(parent_arc) = parent_weak.upgrade() {
-                let user_disable_count = thread.get_user_disable_count();
-                let thread_id = thread.get_thread_id();
-                let thread_core = thread.get_current_core();
-                let is_termination_requested = thread.is_termination_requested();
-
-                if user_disable_count != 0 {
+        if let Some((
+            parent_arc,
+            user_disable_count,
+            thread_id,
+            thread_core,
+            is_termination_requested,
+            scheduler_lock_ptr,
+        )) = snapshot
+        {
+            if user_disable_count != 0 {
+                let already_pinned = {
                     let process = parent_arc.lock().unwrap();
-                    let already_pinned = process.get_pinned_thread(core_id).is_some();
-                    drop(process);
+                    process.get_pinned_thread(core_id).is_some()
+                };
 
-                    if !already_pinned {
-                        // Upstream: KScopedSchedulerLock sl{kernel};
-                        // The scheduler lock provides atomicity for pin operations.
-                        // Since we can't access the GSC's scheduler lock from here
-                        // without kernel reference, we perform the pin directly.
-                        // The scheduler lock is already held by the interrupt context
-                        // in the upstream model.
+                if !already_pinned {
+                    // Upstream: `KScopedSchedulerLock sl{kernel};` wraps
+                    // the pin operation in k_interrupt_manager.cpp. We
+                    // take the matching guard via the current thread's
+                    // `scheduler_lock_ptr` (populated at thread init to
+                    // `&GlobalSchedulerContext::m_scheduler_lock`).
+                    //
+                    // The scheduler lock is reentrant for the current
+                    // host thread (see `KAbstractSchedulerLock::lock`).
+                    //
+                    // SAFETY: `scheduler_lock_ptr` is the address of a
+                    // `KAbstractSchedulerLock` stored in the GSC, which
+                    // outlives every KThread belonging to that kernel.
+                    let _sl = if scheduler_lock_ptr != 0 {
+                        Some(super::k_scheduler_lock::KScopedSchedulerLock::new(
+                            unsafe {
+                                &*(scheduler_lock_ptr
+                                    as *const super::k_scheduler_lock::KAbstractSchedulerLock)
+                            },
+                        ))
+                    } else {
+                        None
+                    };
 
-                        // Pin the current thread.
-                        // Upstream: process->PinCurrentThread();
-                        {
-                            let mut process = parent_arc.lock().unwrap();
-                            process.pin_current_thread(
-                                core_id,
-                                thread_id,
-                                is_termination_requested,
-                            );
-                        }
-
-                        // Upstream: cur_thread->Pin(core_id)
-                        drop(thread);
-                        {
-                            let mut thread = thread_arc.lock().unwrap();
-                            thread.pin(thread_core);
-                        }
-
-                        // Set the interrupt flag for the thread.
-                        // Upstream: GetCurrentThread(kernel).SetInterruptFlag();
-                        {
-                            let thread = thread_arc.lock().unwrap();
-                            thread.set_interrupt_flag();
-                        }
+                    // Upstream: process->PinCurrentThread();
+                    {
+                        let mut process = parent_arc.lock().unwrap();
+                        process.pin_current_thread(
+                            core_id,
+                            thread_id,
+                            is_termination_requested,
+                        );
                     }
+
+                    // Upstream: cur_thread->Pin(core_id)
+                    {
+                        let mut thread = thread_arc.lock().unwrap();
+                        thread.pin(thread_core);
+                    }
+
+                    // Upstream: GetCurrentThread(kernel).SetInterruptFlag();
+                    {
+                        let thread = thread_arc.lock().unwrap();
+                        thread.set_interrupt_flag();
+                    }
+                    // `_sl` drops here, releasing the scheduler lock.
                 }
             }
         }
