@@ -312,16 +312,49 @@ pub fn set_current_emu_thread(thread: Option<&Arc<Mutex<KThread>>>) {
     });
 }
 
-pub fn get_current_thread_id_fast() -> Option<u64> {
-    let thread_id = CURRENT_THREAD_ID.with(|cell| cell.get());
-    if thread_id == 0 {
-        None
-    } else {
-        Some(thread_id)
+/// Ensure the current host thread has a `CURRENT_THREAD` populated —
+/// either a real emu thread set by `set_current_emu_thread`, or the
+/// lazily-created per-host-thread dummy KThread. After this returns,
+/// `CURRENT_THREAD_ID` is non-zero and `CURRENT_THREAD_PTR` is non-null,
+/// matching upstream's invariant that `GetCurrentThreadPointer(kernel)`
+/// is total.
+///
+/// Returns `false` only when the kernel itself has not been initialized
+/// (`KERNEL_PTR` is null, e.g., in unit tests with no kernel).
+fn ensure_current_thread_populated() -> bool {
+    if CURRENT_THREAD_ID.with(|cell| cell.get()) != 0 {
+        return true;
     }
+    // get_current_emu_thread lazily creates the dummy and calls
+    // set_current_emu_thread, which populates all three thread-local
+    // fields (CURRENT_THREAD / _ID / _PTR).
+    get_current_emu_thread().is_some()
+}
+
+pub fn get_current_thread_id_fast() -> Option<u64> {
+    // Upstream totality: GetCurrentThreadPointer is always valid during
+    // CPU execution. Populate lazily via the dummy-thread fallback if
+    // the thread-local hasn't been set yet on this host thread.
+    let thread_id = CURRENT_THREAD_ID.with(|cell| cell.get());
+    if thread_id != 0 {
+        return Some(thread_id);
+    }
+    if !ensure_current_thread_populated() {
+        return None;
+    }
+    let id = CURRENT_THREAD_ID.with(|cell| cell.get());
+    if id == 0 { None } else { Some(id) }
 }
 
 pub fn with_current_thread_fast_mut<R>(f: impl FnOnce(&mut KThread) -> R) -> Option<R> {
+    // Same totality semantics as get_current_thread_id_fast.
+    let ptr = CURRENT_THREAD_PTR.with(|cell| cell.get());
+    if !ptr.is_null() {
+        return Some(unsafe { f(&mut *ptr) });
+    }
+    if !ensure_current_thread_populated() {
+        return None;
+    }
     CURRENT_THREAD_PTR.with(|cell| {
         let ptr = cell.get();
         if ptr.is_null() {
