@@ -10,6 +10,7 @@ use crate::hle::kernel::k_synchronization_object;
 use crate::hle::kernel::svc::svc_results::*;
 use crate::hle::kernel::svc_common::{Handle, ARGUMENT_HANDLE_COUNT_MAX};
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
+use super::super::k_process::ProcessLock;
 
 fn should_trace_wait_sync() -> bool {
     std::env::var_os("RUZU_TRACE_WAIT_SYNC").is_some()
@@ -217,21 +218,37 @@ pub fn cancel_synchronization(system: &System, handle: Handle) -> ResultCode {
 /// Upstream: Lock scheduler, check if current thread is pinned on the current core,
 /// clear interrupt flag, unpin.
 pub fn synchronize_preemption_state(system: &System) {
-    // Lock the scheduler.
-    let binding = system.scheduler_arc();
-    let scheduler = binding.lock().unwrap();
+    // Upstream: `KScopedSchedulerLock sl{kernel};`
+    //
+    // Match by taking the abstract scheduler spin-lock via the current
+    // thread's scheduler_lock_ptr. The existing `system.scheduler_arc()`
+    // is a `Mutex<KScheduler>` — the wrong primitive; the spin-lock is
+    // what serializes cross-core kernel-object access.
+    let current_thread = match crate::hle::kernel::kernel::get_current_emu_thread() {
+        Some(t) => t,
+        None => return,
+    };
+    let (current_thread_id, scheduler_lock_ptr) = {
+        let t = current_thread.lock().unwrap();
+        (t.get_thread_id(), t.scheduler_lock_ptr)
+    };
+    let _sl = if scheduler_lock_ptr != 0 {
+        Some(crate::hle::kernel::k_scheduler_lock::KScopedSchedulerLock::new(
+            // SAFETY: scheduler_lock_ptr is the address of the GSC's
+            // KAbstractSchedulerLock, which outlives all kernel threads.
+            unsafe {
+                &*(scheduler_lock_ptr
+                    as *const crate::hle::kernel::k_scheduler_lock::KAbstractSchedulerLock)
+            },
+        ))
+    } else {
+        None
+    };
 
-    // Get the current core ID and current thread.
     let core_id = match system.kernel() {
         Some(k) => k.current_physical_core_index() as i32,
         None => return,
     };
-
-    let current_thread_id = match scheduler.get_scheduler_current_thread_id() {
-        Some(id) => id,
-        None => return,
-    };
-    drop(scheduler);
 
     let mut process = system.current_process_arc().lock().unwrap();
 
@@ -275,7 +292,7 @@ mod tests {
         process.allocate_code_memory(0x200000, 0x1000);
         process.initialize_thread_local_region_base(0x240000);
 
-        let process = Arc::new(Mutex::new(process));
+        let process = Arc::new(ProcessLock::from_value(process));
         let current_thread = Arc::new(Mutex::new(KThread::new()));
         {
             let mut thread = current_thread.lock().unwrap();
