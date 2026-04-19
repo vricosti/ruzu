@@ -39,6 +39,9 @@
 //! (`KProcessCell::new(...)` matches upstream's `KProcess` construction).
 
 use std::cell::UnsafeCell;
+use std::marker::PhantomData;
+use std::ops::{Deref, DerefMut};
+use std::sync::{LockResult, TryLockResult};
 
 use super::k_scheduler_lock::KScopedSchedulerLock;
 
@@ -139,6 +142,97 @@ impl<T> SyncCell<T> {
     #[inline]
     pub fn as_ptr(&self) -> *mut T {
         self.inner.get()
+    }
+
+    // ----- API-compatibility shim with `TrackedMutex<T>` / `Mutex<T>` -----
+    //
+    // These methods exist purely so that the atomic type swap
+    // (`Arc<TrackedMutex<KProcess>>` → `Arc<SyncCell<KProcess>>`) doesn't
+    // require touching ~313 `.lock().unwrap()` call sites in the same
+    // commit. The methods return guards that do **no** runtime locking;
+    // they assume the scheduler spin-lock provides serialization
+    // externally (matching upstream's raw-reference access model).
+    //
+    // Until every caller is also wrapped in `KScopedSchedulerLock`,
+    // these guards are a contract — broken contracts are UB. Step 5
+    // (this commit) accepts that intermediate breakage; later steps
+    // tighten coverage.
+
+    /// API-compat with `Mutex::lock`. Returns a guard that derefs to
+    /// `&mut T` via the underlying UnsafeCell.
+    ///
+    /// Semantics: assumes the scheduler spin-lock is held by the caller.
+    /// No actual locking happens here.
+    #[inline]
+    pub fn lock(&self) -> LockResult<SyncCellGuard<'_, T>> {
+        Ok(SyncCellGuard {
+            ptr: self.inner.get(),
+            _marker: PhantomData,
+        })
+    }
+
+    /// API-compat with `TrackedMutex::lock_with`. The `_site_id` is
+    /// unused under the new model (the dump infrastructure rooted in
+    /// per-Mutex tracking goes away once `TrackedMutex` is retired).
+    /// Kept so call sites that opt into site labels keep compiling.
+    #[inline]
+    pub fn lock_with(&self, _site_id: u64) -> LockResult<SyncCellGuard<'_, T>> {
+        self.lock()
+    }
+
+    /// API-compat with `Mutex::try_lock`. Always succeeds — there is no
+    /// actual lock to contend on.
+    #[inline]
+    pub fn try_lock(&self) -> TryLockResult<SyncCellGuard<'_, T>> {
+        Ok(SyncCellGuard {
+            ptr: self.inner.get(),
+            _marker: PhantomData,
+        })
+    }
+
+    /// API-compat with `TrackedMutex::from_value`. Equivalent to `new`.
+    #[inline]
+    pub fn from_value(value: T) -> Self {
+        Self::new(value)
+    }
+}
+
+/// Guard returned by `SyncCell::lock` / `try_lock` / `lock_with`.
+///
+/// Holds no actual lock — see `SyncCell::lock` docs. Exists to
+/// preserve the `.lock().unwrap()` syntactic shape of `Mutex` /
+/// `TrackedMutex` call sites without runtime overhead.
+pub struct SyncCellGuard<'a, T: ?Sized + 'a> {
+    ptr: *mut T,
+    _marker: PhantomData<&'a mut T>,
+}
+
+// SAFETY: the guard is logically a `&mut T` whose validity is gated on
+// the scheduler spin-lock (caller's contract). `T: Send` is required for
+// the same reason `Arc<SyncCell<T>>` requires it: the underlying value
+// can be observed from any host thread under the spin-lock.
+unsafe impl<T: ?Sized + Send> Send for SyncCellGuard<'_, T> {}
+unsafe impl<T: ?Sized + Sync> Sync for SyncCellGuard<'_, T> {}
+
+impl<T: ?Sized> Deref for SyncCellGuard<'_, T> {
+    type Target = T;
+    #[inline]
+    fn deref(&self) -> &T {
+        // SAFETY: the guard contract assumes the scheduler spin-lock is
+        // held; under that contract, no concurrent mutation can occur
+        // through any other access path (`with`, `get_mut_unchecked`,
+        // another `SyncCellGuard`).
+        unsafe { &*self.ptr }
+    }
+}
+
+impl<T: ?Sized> DerefMut for SyncCellGuard<'_, T> {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut T {
+        // SAFETY: see Deref. `&mut self` ensures no other reference
+        // exists through this guard; the scheduler spin-lock contract
+        // ensures none through any other guard.
+        unsafe { &mut *self.ptr }
     }
 }
 
