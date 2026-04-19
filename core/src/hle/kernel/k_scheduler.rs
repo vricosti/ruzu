@@ -15,6 +15,7 @@ use super::k_priority_queue::KPriorityQueue;
 use super::k_process::KProcess;
 use super::k_thread::KThread;
 use super::k_thread::ThreadState;
+use super::k_process::ProcessLock;
 
 /// Scheduling state held per-core.
 /// Matches upstream `KScheduler::SchedulingState` (k_scheduler.h).
@@ -137,7 +138,7 @@ mod tests {
 
     #[test]
     fn scan_runnable_threads_respects_core_affinity() {
-        let process = Arc::new(Mutex::new(KProcess::new()));
+        let process = Arc::new(ProcessLock::from_value(KProcess::new()));
         let scheduler = KScheduler::new(0);
 
         let local = Arc::new(Mutex::new(KThread::new()));
@@ -214,7 +215,7 @@ pub struct KScheduler {
     pub global_scheduler_context:
         Option<Arc<Mutex<super::global_scheduler_context::GlobalSchedulerContext>>>,
     pub physical_cores: Vec<Arc<super::physical_core::PhysicalCore>>,
-    pub core_timing: Option<Arc<std::sync::Mutex<crate::core_timing::CoreTiming>>>,
+    pub core_timing: Option<Arc<crate::core_timing::CoreTiming>>,
 
     // Fiber fields for host-thread switching
     /// Upstream: `std::shared_ptr<Common::Fiber> m_switch_fiber`
@@ -266,7 +267,7 @@ impl KScheduler {
 
     fn exit_thread_if_termination_requested(
         &self,
-        process: &Arc<Mutex<KProcess>>,
+        process: &Arc<ProcessLock>,
         thread_id: u64,
     ) -> bool {
         let thread = {
@@ -1081,7 +1082,7 @@ impl KScheduler {
     /// Matches upstream `KScheduler::YieldWithoutCoreMigration(kernel)`.
     pub fn yield_without_core_migration(
         &mut self,
-        process: &Arc<Mutex<KProcess>>,
+        process: &Arc<ProcessLock>,
         current_thread_id: u64,
     ) {
         // Cooperative runtime approximation of a thread observing its pending
@@ -1148,7 +1149,7 @@ impl KScheduler {
     /// Yield with core migration.
     pub fn yield_with_core_migration(
         &mut self,
-        process: &Arc<Mutex<KProcess>>,
+        process: &Arc<ProcessLock>,
         current_thread_id: u64,
     ) {
         // Single-core bring-up: match upstream control flow entry point, but keep the same
@@ -1157,7 +1158,7 @@ impl KScheduler {
     }
 
     /// Yield to any thread.
-    pub fn yield_to_any_thread(&mut self, process: &Arc<Mutex<KProcess>>, current_thread_id: u64) {
+    pub fn yield_to_any_thread(&mut self, process: &Arc<ProcessLock>, current_thread_id: u64) {
         // Single-core bring-up: preserve the SVC ownership in KScheduler while deferring
         // real inter-core migration until the full priority queue exists.
         self.yield_without_core_migration(process, current_thread_id);
@@ -1227,7 +1228,7 @@ impl KScheduler {
         self.state.needs_scheduling.load(Ordering::Relaxed)
     }
 
-    pub fn wake_expired_sleeping_threads(&mut self, process: &Arc<Mutex<KProcess>>) -> bool {
+    pub fn wake_expired_sleeping_threads(&mut self, process: &Arc<ProcessLock>) -> bool {
         let now = Instant::now();
         let mut process = process.lock().unwrap();
         let mut woke_any = false;
@@ -1266,7 +1267,7 @@ impl KScheduler {
 
     pub fn wake_signaled_synchronization_threads(
         &mut self,
-        process: &Arc<Mutex<KProcess>>,
+        process: &Arc<ProcessLock>,
     ) -> bool {
         let mut process = process.lock().unwrap();
         let mut woke_any = false;
@@ -1283,7 +1284,20 @@ impl KScheduler {
                 continue;
             }
 
-            let Some(synced_index) = thread.check_synchronization_ready(&process) else {
+            // Re-check whether any object in the thread's wait context became
+            // signaled (the polling hook used by the scheduler when it wakes
+            // up between timer ticks). Matches upstream sync-ready check.
+            let Some(synced_index) = thread
+                .sync_wait_context
+                .object_ids()
+                .iter()
+                .position(|&oid| {
+                    crate::hle::kernel::k_synchronization_object::is_object_signaled(
+                        &process, oid,
+                    )
+                })
+                .map(|i| i as i32)
+            else {
                 continue;
             };
 
@@ -1308,7 +1322,7 @@ impl KScheduler {
         woke_any
     }
 
-    fn next_sleep_deadline(&self, process: &Arc<Mutex<KProcess>>) -> Option<Instant> {
+    fn next_sleep_deadline(&self, process: &Arc<ProcessLock>) -> Option<Instant> {
         let process = process.lock().unwrap();
         let mut next_deadline = None;
 
@@ -1333,7 +1347,7 @@ impl KScheduler {
 
     pub fn wait_for_next_runnable_thread(
         &mut self,
-        process: &Arc<Mutex<KProcess>>,
+        process: &Arc<ProcessLock>,
         current_thread_id: u64,
     ) -> u64 {
         loop {
@@ -1368,7 +1382,7 @@ impl KScheduler {
     /// Fallback: scan for the highest-priority RUNNABLE thread.
     /// Used when PQ is empty (threads woken via timer/cancel_wait that
     /// bypass PQ). Returns the thread_id and pushes it to PQ for future use.
-    fn scan_runnable_threads(&self, process: &Arc<Mutex<KProcess>>) -> Option<u64> {
+    fn scan_runnable_threads(&self, process: &Arc<ProcessLock>) -> Option<u64> {
         let process = process.lock().unwrap();
         let mut best_id = None;
         let mut best_priority = i32::MAX;
@@ -1403,7 +1417,7 @@ impl KScheduler {
     /// Select the next thread using the priority queue.
     /// This is the upstream-matching dispatch path: O(1) lookup of the
     /// highest priority RUNNABLE thread for our core.
-    fn select_next_thread_from_pq(&mut self, process: &Arc<Mutex<KProcess>>) -> Option<u64> {
+    fn select_next_thread_from_pq(&mut self, process: &Arc<ProcessLock>) -> Option<u64> {
         let process_guard = process.lock().unwrap();
         let gsc = process_guard.global_scheduler_context.as_ref()?;
         let gsc_guard = gsc.lock().unwrap();
@@ -1691,7 +1705,7 @@ impl KScheduler {
         // Update CPU time tracking.
         let prev_tick = self.last_context_switch_time;
         let cur_tick = if let Some(ref ct) = self.core_timing {
-            ct.lock().unwrap().get_global_time_ns().as_nanos() as i64
+            ct.get_global_time_ns().as_nanos() as i64
         } else {
             prev_tick + 1
         };
@@ -1759,7 +1773,7 @@ impl KScheduler {
 
     pub fn wait_for_next_thread(
         &mut self,
-        process: &Arc<Mutex<KProcess>>,
+        process: &Arc<ProcessLock>,
         current_thread_id: u64,
     ) -> Option<Arc<Mutex<KThread>>> {
         if self.exit_thread_if_termination_requested(process, current_thread_id) {
@@ -1777,7 +1791,7 @@ impl KScheduler {
     #[cfg(test)]
     pub fn select_next_thread_id(
         &mut self,
-        process: &Arc<Mutex<KProcess>>,
+        process: &Arc<ProcessLock>,
         current_thread_id: u64,
     ) -> Option<u64> {
         if self.exit_thread_if_termination_requested(process, current_thread_id) {

@@ -17,7 +17,7 @@ use super::k_scheduler_lock::KScopedSchedulerLock;
 use super::k_scoped_scheduler_lock_and_sleep::KScopedSchedulerLockAndSleep;
 use super::k_synchronization_object;
 use super::k_synchronization_object::SynchronizationObjectState;
-use super::k_synchronization_object::SynchronizationWaitSet;
+use super::k_synchronization_object::SynchronizationWaitContext;
 use super::k_thread_queue::KThreadQueue;
 use super::k_thread_queue::KThreadQueueWithoutEndWait;
 use super::k_typed_address::{KProcessAddress, KVirtualAddress};
@@ -34,8 +34,9 @@ use crate::hle::result::RESULT_SUCCESS;
 // RBEntry kept for structural parity with upstream m_condvar_arbiter_tree_node.
 // Currently unused: we use BTreeSet externally instead of an intrusive tree.
 use common::tree::RBEntry;
+use super::k_process::ProcessLock;
 
-fn deadline_from_timeout_tick(timeout_tick: i64, current_tick: Option<i64>) -> Option<Instant> {
+pub(crate) fn deadline_from_timeout_tick(timeout_tick: i64, current_tick: Option<i64>) -> Option<Instant> {
     if timeout_tick <= 0 {
         return None;
     }
@@ -477,7 +478,7 @@ pub struct KThread {
     pub cpu_time: AtomicI64,
     pub address_key: KProcessAddress,
     // parent process — Weak reference matching upstream raw pointer + ref counting
-    pub parent: Option<Weak<Mutex<KProcess>>>,
+    pub parent: Option<Weak<ProcessLock>>,
     /// Raw `*mut KProcess` cached at parenting time so scheduler-lock-protected
     /// code paths can access process fields (cond_var tree, etc.) without
     /// re-acquiring the KProcess mutex. Matches upstream's raw-pointer access
@@ -572,7 +573,7 @@ pub struct KThread {
     /// the hardware timer. Set by KHardwareTimer::RegisterAbsoluteTask,
     /// cleared to 0 when the task fires or is cancelled.
     pub timer_task_time: i64,
-    pub synchronization_wait: SynchronizationWaitSet,
+    pub sync_wait_context: SynchronizationWaitContext,
     pub sync_object: SynchronizationObjectState,
 }
 
@@ -688,7 +689,7 @@ impl KThread {
             native_execution_parameters: NativeExecutionParameters::default(),
             sleep_deadline: None,
             timer_task_time: 0,
-            synchronization_wait: SynchronizationWaitSet::new(),
+            sync_wait_context: SynchronizationWaitContext::new(),
             sync_object: SynchronizationObjectState::new(),
         }
     }
@@ -856,7 +857,7 @@ impl KThread {
         self.num_kernel_waiters = 0;
         self.resource_limit_release_hint = false;
         self.sleep_deadline = None;
-        self.synchronization_wait.clear();
+        self.sync_wait_context.clear();
         self.stack_parameters = stack_parameters;
         self.initialized = true;
 
@@ -1441,39 +1442,7 @@ impl KThread {
     }
 
     pub fn is_waiting_on_synchronization(&self) -> bool {
-        self.synchronization_wait.is_active()
-    }
-
-    pub fn begin_wait_synchronization(&mut self, wait_set: SynchronizationWaitSet, timeout: i64) {
-        self.synchronization_wait = wait_set;
-        self.synced_index = -1;
-        self.wait_result = RESULT_SUCCESS.get_inner_value();
-        self.set_cancellable();
-        self.set_wait_reason_for_debugging(ThreadWaitReasonForDebugging::Synchronization);
-
-        if timeout > 0 {
-            let current_tick = super::kernel::get_current_hardware_tick();
-            self.sleep_deadline = deadline_from_timeout_tick(timeout, current_tick);
-            if should_trace_wait_debug() {
-                log::info!(
-                    "KThread::begin_wait_synchronization tid={} timeout_tick={} current_tick={:?} deadline={:?}",
-                    self.thread_id,
-                    timeout,
-                    current_tick,
-                    self.sleep_deadline
-                );
-            }
-        } else {
-            self.sleep_deadline = None;
-        }
-
-        self.begin_wait_with_queue(
-            k_synchronization_object::ThreadQueueImplForKSynchronizationObjectWait::queue(),
-        );
-    }
-
-    pub fn check_synchronization_ready(&self, process: &KProcess) -> Option<i32> {
-        k_synchronization_object::check_wait_ready(process, self)
+        self.sync_wait_context.is_active()
     }
 
     pub fn complete_synchronization_wait(&mut self, synced_index: i32, result: u32) {
@@ -1481,43 +1450,27 @@ impl KThread {
         self.end_wait(result);
     }
 
-    pub fn link_waiter(&mut self, process: &mut KProcess, thread_id: u64) {
-        self.sync_object.link_waiter(
-            process,
-            super::k_synchronization_object::SynchronizationWaitNode {
-                object_id: self.object_id,
-                handle: super::k_synchronization_object::SynchronizationWaitNodeHandle {
-                    thread_id,
-                    wait_index: 0,
-                },
-            },
-        );
-    }
-
-    pub fn unlink_waiter(&mut self, process: &mut KProcess, thread_id: u64) {
-        self.sync_object
-            .unlink_waiter(process, thread_id, self.object_id, 0);
-    }
-
+    /// Cancel any outstanding synchronization wait: unlink every node this
+    /// thread has linked into sync-object lists and drop the wait context.
+    /// Mirrors the cancel_wait branch of
+    /// `ThreadQueueImplForKSynchronizationObjectWait` in upstream.
     pub(crate) fn clear_wait_synchronization(&mut self) {
-        if !self.synchronization_wait.is_active() {
+        if !self.sync_wait_context.is_active() {
             self.clear_cancellable();
             return;
         }
-
-        if let Some(parent) = self.parent.as_ref().and_then(Weak::upgrade) {
-            let mut process_guard = parent.lock().unwrap();
-            k_synchronization_object::clear_wait_set(
-                Some(&mut process_guard),
-                self.thread_id,
-                &mut self.synchronization_wait,
-            );
-        } else {
-            k_synchronization_object::clear_wait_set(
-                None,
-                self.thread_id,
-                &mut self.synchronization_wait,
-            );
+        unsafe {
+            let ctx = &mut self.sync_wait_context;
+            for i in 0..ctx.nodes.len() {
+                let state_ptr = ctx.object_states[i];
+                if state_ptr.is_null() {
+                    continue;
+                }
+                let node_ptr =
+                    &mut ctx.nodes[i] as *mut k_synchronization_object::ThreadListNode;
+                (*state_ptr).unlink_node(node_ptr);
+            }
+            ctx.clear();
         }
         self.clear_cancellable();
     }
@@ -1557,7 +1510,7 @@ impl KThread {
         stack_top: u64,
         virt_core: i32,
         tls_address: u64,
-        owner: &Arc<Mutex<KProcess>>,
+        owner: &Arc<ProcessLock>,
         thread_id: u64,
         object_id: u64,
         is_64bit: bool,
@@ -1584,7 +1537,7 @@ impl KThread {
         stack_top: u64,
         virt_core: i32,
         tls_address: u64,
-        owner: &Arc<Mutex<KProcess>>,
+        owner: &Arc<ProcessLock>,
         thread_id: u64,
         object_id: u64,
         is_64bit: bool,
@@ -1624,7 +1577,7 @@ impl KThread {
         self.schedule_count = -1;
         self.initialized = true;
         self.sleep_deadline = None;
-        self.synchronization_wait.clear();
+        self.sync_wait_context.clear();
         self.stack_parameters.disable_count = 1;
         self.stack_parameters.is_in_exception_handler = true;
 
@@ -1735,7 +1688,7 @@ impl KThread {
         stack_top: u64,
         prio: i32,
         virt_core: i32,
-        owner: &Arc<Mutex<KProcess>>,
+        owner: &Arc<ProcessLock>,
         thread_id: u64,
         object_id: u64,
         is_64bit: bool,
@@ -1764,7 +1717,7 @@ impl KThread {
         stack_top: u64,
         prio: i32,
         virt_core: i32,
-        owner: &Arc<Mutex<KProcess>>,
+        owner: &Arc<ProcessLock>,
         thread_id: u64,
         object_id: u64,
         is_64bit: bool,
@@ -1814,7 +1767,7 @@ impl KThread {
         stack_top: u64,
         prio: i32,
         virt_core: i32,
-        owner: Weak<Mutex<KProcess>>,
+        owner: Weak<ProcessLock>,
         scheduler: Option<Weak<Mutex<KScheduler>>>,
         global_scheduler_context: Option<
             Weak<Mutex<super::global_scheduler_context::GlobalSchedulerContext>>,
@@ -1869,7 +1822,7 @@ impl KThread {
         self.num_kernel_waiters = 0;
         self.resource_limit_release_hint = false;
         self.sleep_deadline = None;
-        self.synchronization_wait.clear();
+        self.sync_wait_context.clear();
         self.stack_top = KProcessAddress::new(stack_top);
         self.argument = arg as usize;
         self.stack_parameters = StackParameters::default();
@@ -1899,7 +1852,7 @@ impl KThread {
     /// owner in kernel code paths.
     pub fn initialize_dummy_thread(
         &mut self,
-        owner: Option<&Arc<Mutex<KProcess>>>,
+        owner: Option<&Arc<ProcessLock>>,
         thread_id: u64,
         object_id: u64,
     ) -> u32 {
@@ -1968,7 +1921,7 @@ impl KThread {
         func: Box<dyn FnOnce() + Send>,
         priority: i32,
         core: i32,
-        owner: &Arc<Mutex<KProcess>>,
+        owner: &Arc<ProcessLock>,
         thread_id: u64,
         object_id: u64,
     ) {
@@ -2340,18 +2293,14 @@ impl KThread {
         }
 
         // Notify any waiters (matches KSynchronizationObject::NotifyAvailable).
-        if let Some(parent) = self.parent.as_ref().and_then(Weak::upgrade) {
-            let mut process = parent.lock().unwrap();
-            let waiter_snapshot = self.sync_object.waiter_snapshot(&process);
-            let outcome = k_synchronization_object::process_waiter_snapshot(
-                &mut process,
+        // Upstream: scheduler lock serializes; waiter nodes live on waiters'
+        // stacks. Walk the thread's sync_object list and wake each waiter.
+        unsafe {
+            k_synchronization_object::notify_waiters_on_state(
+                &self.sync_object,
                 self.object_id,
-                &waiter_snapshot,
                 RESULT_SUCCESS.get_inner_value(),
             );
-            for waiter_thread_id in outcome.unlink_thread_ids {
-                self.unlink_waiter(&mut process, waiter_thread_id);
-            }
         }
 
         // Upstream: this->Close() — decrements reference count.
@@ -2680,7 +2629,9 @@ impl KThread {
             if std::env::var_os("RUZU_TRACE_CT_FIRE").is_some() {
                 log::info!(
                     "notify_state_transition tid={} {:?}->{:?} before_gsc_lock",
-                    thread_id, old_base, new_base
+                    thread_id,
+                    old_base,
+                    new_base
                 );
             }
             gsc_arc.lock().unwrap().on_thread_state_changed(
@@ -2696,7 +2647,9 @@ impl KThread {
             if std::env::var_os("RUZU_TRACE_CT_FIRE").is_some() {
                 log::info!(
                     "notify_state_transition tid={} {:?}->{:?} after_gsc",
-                    thread_id, old_base, new_base
+                    thread_id,
+                    old_base,
+                    new_base
                 );
             }
             notified_gsc = true;
@@ -2875,43 +2828,15 @@ impl KThread {
         }
     }
 
-    pub fn notify_available(
-        &mut self,
-        process: &mut KProcess,
-        signaled_object_id: u64,
-        result: u32,
-    ) -> bool {
-        let trace_boot = std::env::var_os("RUZU_APPLET_BOOT_TRACE")
-            .is_some_and(|value| value != std::ffi::OsStr::new("0"));
-        if trace_boot {
-            log::info!(
-                "KThread::notify_available: thread_id={} signaled_object_id={} state={:?} wait_queue_present={}",
-                self.thread_id,
-                signaled_object_id,
-                self.get_state(),
-                self.wait_queue.is_some()
-            );
-        }
+    /// Mirrors upstream `KThread::NotifyAvailable`. Delegates to the thread's
+    /// wait_queue `NotifyAvailable` under scheduler lock. Only touches `self`
+    /// and its `sync_wait_context` — never the process.
+    pub fn notify_available(&mut self, signaled_object_id: u64, result: u32) -> bool {
         let _scheduler_lock = self.lock_scheduler();
-        if trace_boot {
-            log::info!(
-                "KThread::notify_available: thread_id={} scheduler_locked",
-                self.thread_id
-            );
-        }
         let Some(wait_queue) = self.wait_queue.clone() else {
             return false;
         };
-
-        let notified = wait_queue.notify_available(self, process, signaled_object_id, result);
-        if trace_boot {
-            log::info!(
-                "KThread::notify_available: thread_id={} notified={}",
-                self.thread_id,
-                notified
-            );
-        }
-        notified
+        wait_queue.notify_available(self, signaled_object_id, result)
     }
 
     /// End wait with a result.
@@ -3625,7 +3550,7 @@ mod tests {
 
     #[test]
     fn test_run_marks_thread_runnable_and_increments_parent_running_count() {
-        let process = Arc::new(Mutex::new(KProcess::new()));
+        let process = Arc::new(ProcessLock::from_value(KProcess::new()));
         let mut thread = KThread::new();
         thread.parent = Some(Arc::downgrade(&process));
         thread.thread_type = ThreadType::User;
@@ -3646,7 +3571,7 @@ mod tests {
 
     #[test]
     fn test_run_thread_marks_thread_runnable_and_increments_parent_running_count() {
-        let process = Arc::new(Mutex::new(KProcess::new()));
+        let process = Arc::new(ProcessLock::from_value(KProcess::new()));
         let thread = Arc::new(Mutex::new(KThread::new()));
         {
             let mut thread_guard = thread.lock().unwrap();
@@ -3670,7 +3595,7 @@ mod tests {
 
     #[test]
     fn test_state_transition_requests_schedule_via_parent_process() {
-        let process = Arc::new(Mutex::new(KProcess::new()));
+        let process = Arc::new(ProcessLock::from_value(KProcess::new()));
         let scheduler = Arc::new(Mutex::new(KScheduler::new(0)));
         process.lock().unwrap().attach_scheduler(&scheduler);
 
@@ -3693,7 +3618,7 @@ mod tests {
 
     #[test]
     fn test_priority_change_requests_schedule_via_parent_process() {
-        let process = Arc::new(Mutex::new(KProcess::new()));
+        let process = Arc::new(ProcessLock::from_value(KProcess::new()));
         let scheduler = Arc::new(Mutex::new(KScheduler::new(0)));
         process.lock().unwrap().attach_scheduler(&scheduler);
 
@@ -3782,7 +3707,7 @@ mod tests {
 
     #[test]
     fn initialize_service_thread_registers_with_global_scheduler_context() {
-        let process = Arc::new(Mutex::new(KProcess::new()));
+        let process = Arc::new(ProcessLock::from_value(KProcess::new()));
         let scheduler = Arc::new(Mutex::new(KScheduler::new(3)));
         let gsc = Arc::new(Mutex::new(GlobalSchedulerContext::new()));
         {
@@ -3813,7 +3738,7 @@ mod tests {
 
     #[test]
     fn initialize_main_thread_inherits_scheduler_context_from_owner() {
-        let process = Arc::new(Mutex::new(KProcess::new()));
+        let process = Arc::new(ProcessLock::from_value(KProcess::new()));
         let scheduler = Arc::new(Mutex::new(KScheduler::new(0)));
         let gsc = Arc::new(Mutex::new(GlobalSchedulerContext::new()));
         {
@@ -3869,7 +3794,7 @@ mod tests {
 
     #[test]
     fn test_finalize_unregisters_thread_object_from_owner_process() {
-        let process = Arc::new(Mutex::new(KProcess::new()));
+        let process = Arc::new(ProcessLock::from_value(KProcess::new()));
         let thread = Arc::new(Mutex::new(KThread::new()));
 
         {
@@ -3946,7 +3871,7 @@ mod tests {
 
     #[test]
     fn test_core_mask_change_requests_schedule_via_thread_scheduler() {
-        let process = Arc::new(Mutex::new(KProcess::new()));
+        let process = Arc::new(ProcessLock::from_value(KProcess::new()));
         let scheduler = Arc::new(Mutex::new(KScheduler::new(0)));
         process.lock().unwrap().attach_scheduler(&scheduler);
 
@@ -3992,7 +3917,7 @@ mod tests {
 
     #[test]
     fn test_activity_change_requests_schedule_via_thread_scheduler() {
-        let process = Arc::new(Mutex::new(KProcess::new()));
+        let process = Arc::new(ProcessLock::from_value(KProcess::new()));
         let scheduler = Arc::new(Mutex::new(KScheduler::new(0)));
         process.lock().unwrap().attach_scheduler(&scheduler);
 

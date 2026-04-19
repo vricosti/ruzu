@@ -23,6 +23,7 @@ use crate::hle::kernel::svc::svc_results::{
 use crate::hle::kernel::svc_common::INVALID_HANDLE;
 use crate::hle::result::ResultCode;
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestManager};
+use super::k_process::ProcessLock;
 
 const POINTER_TRANSFER_BUFFER_ALIGNMENT: usize = 0x10;
 
@@ -1320,7 +1321,7 @@ impl KServerSession {
 
     fn resolve_request_server_process(
         request: &Arc<Mutex<KSessionRequest>>,
-    ) -> Option<Arc<Mutex<crate::hle::kernel::k_process::KProcess>>> {
+    ) -> Option<Arc<ProcessLock>> {
         let server_process_id = request.lock().unwrap().get_server_process_id()?;
         let kernel = crate::hle::kernel::kernel::get_kernel_ref()?;
         kernel.get_process_by_id(server_process_id)
@@ -1328,7 +1329,7 @@ impl KServerSession {
 
     fn resolve_request_client_process(
         request: &Arc<Mutex<KSessionRequest>>,
-    ) -> Option<Arc<Mutex<crate::hle::kernel::k_process::KProcess>>> {
+    ) -> Option<Arc<ProcessLock>> {
         let client_process_id = request.lock().unwrap().get_client_process_id()?;
         let kernel = crate::hle::kernel::kernel::get_kernel_ref()?;
         kernel.get_process_by_id(client_process_id)
@@ -1490,13 +1491,7 @@ impl KServerSession {
                             client_buffer_size,
                         );
                         if let Some(event) = process.get_event_by_object_id(event_id) {
-                            if let Some(scheduler) = kernel
-                                .current_scheduler()
-                                .cloned()
-                                .or_else(|| kernel.scheduler(0).cloned())
-                            {
-                                let _ = event.lock().unwrap().signal(&mut process, &scheduler);
-                            }
+                            let _ = event.lock().unwrap().signal(&process);
                         }
                     }
                 }
@@ -1582,7 +1577,7 @@ impl KServerSession {
         self.current_request = None;
         self.client_closed = false;
         self.request_list.clear();
-        self.sync_object.clear_waiters();
+        debug_assert!(self.sync_object.is_empty());
     }
 
     /// Set the session request manager.
@@ -1625,11 +1620,11 @@ impl KServerSession {
     /// process is already known by the caller.
     pub fn on_client_closed_with_process(
         &mut self,
-        process: &mut crate::hle::kernel::k_process::KProcess,
+        _process: &mut crate::hle::kernel::k_process::KProcess,
     ) {
         self.client_closed = true;
         self.cleanup_requests();
-        self.notify_available_in_process(process, RESULT_SESSION_CLOSED.get_inner_value());
+        self.notify_available(RESULT_SESSION_CLOSED.get_inner_value());
     }
 
     /// Enqueue a request.
@@ -1652,16 +1647,13 @@ impl KServerSession {
     /// already known by the caller.
     pub fn on_request_with_process(
         &mut self,
-        process: &mut crate::hle::kernel::k_process::KProcess,
+        _process: &mut crate::hle::kernel::k_process::KProcess,
         request: Arc<Mutex<KSessionRequest>>,
     ) -> u32 {
         let was_empty = self.request_list.is_empty();
         self.request_list.push_back(request);
         if was_empty {
-            self.notify_available_in_process(
-                process,
-                crate::hle::result::RESULT_SUCCESS.get_inner_value(),
-            );
+            self.notify_available(crate::hle::result::RESULT_SUCCESS.get_inner_value());
         }
         0 // ResultSuccess
     }
@@ -1773,18 +1765,12 @@ impl KServerSession {
                             client_buffer_size,
                         );
                         if let Some(event) = process.get_event_by_object_id(event_id) {
-                            if let Some(scheduler) = kernel
-                                .current_scheduler()
-                                .cloned()
-                                .or_else(|| kernel.scheduler(0).cloned())
-                            {
-                                if trace_reply {
-                                    log::info!(
-                                        "KServerSession::send_reply_with_message stage=signal_async_event"
-                                    );
-                                }
-                                let _ = event.lock().unwrap().signal(&mut process, &scheduler);
+                            if trace_reply {
+                                log::info!(
+                                    "KServerSession::send_reply_with_message stage=signal_async_event"
+                                );
                             }
+                            let _ = event.lock().unwrap().signal(&process);
                         }
                     }
                 }
@@ -1968,82 +1954,20 @@ impl KServerSession {
         self.request_list.clear();
     }
 
-    pub fn link_waiter(
-        &mut self,
-        process: &mut crate::hle::kernel::k_process::KProcess,
-        thread_id: u64,
-    ) {
+    /// Walk the waiter list and wake every thread waiting on this session.
+    /// Mirrors upstream `KSynchronizationObject::NotifyAvailable`. Caller must
+    /// hold the scheduler lock (the convention for every signal-style entry).
+    fn notify_available(&self, result: u32) -> bool {
         let Some(object_id) = self.parent_id else {
-            return;
+            return false;
         };
-        self.sync_object.link_waiter(
-            process,
-            crate::hle::kernel::k_synchronization_object::SynchronizationWaitNode {
+        unsafe {
+            k_synchronization_object::notify_waiters_on_state(
+                &self.sync_object,
                 object_id,
-                handle:
-                    crate::hle::kernel::k_synchronization_object::SynchronizationWaitNodeHandle {
-                        thread_id,
-                        wait_index: 0,
-                    },
-            },
-        );
-    }
-
-    pub fn unlink_waiter(
-        &mut self,
-        process: &mut crate::hle::kernel::k_process::KProcess,
-        thread_id: u64,
-    ) {
-        let Some(object_id) = self.parent_id else {
-            return;
-        };
-        self.sync_object
-            .unlink_waiter(process, thread_id, object_id, 0);
-    }
-
-    /// Fallback waiter notification path for callers that do not already have
-    /// the owner `KProcess`.
-    ///
-    /// Callers should migrate to `notify_available_in_process(...)` through the
-    /// public `*_with_process(...)` entry points. This variant re-enters the
-    /// kernel registry to rediscover the owner process and is unsafe under a
-    /// held process lock.
-    fn notify_available(&mut self, result: u32) -> bool {
-        let Some(object_id) = self.parent_id else {
-            return false;
-        };
-        let Some(kernel) = crate::hle::kernel::kernel::get_kernel_ref() else {
-            return false;
-        };
-        let Some(owner_process_id) = kernel.get_session_owner_process_id(object_id) else {
-            return false;
-        };
-        let Some(process_arc) = kernel.get_process_by_id(owner_process_id) else {
-            return false;
-        };
-        let mut process = process_arc.lock().unwrap();
-        self.notify_available_in_process(&mut process, result)
-    }
-
-    fn notify_available_in_process(
-        &mut self,
-        process: &mut crate::hle::kernel::k_process::KProcess,
-        result: u32,
-    ) -> bool {
-        let Some(object_id) = self.parent_id else {
-            return false;
-        };
-        let waiter_snapshot = self.sync_object.waiter_snapshot(&process);
-        let outcome = k_synchronization_object::process_waiter_snapshot(
-            process,
-            object_id,
-            &waiter_snapshot,
-            result,
-        );
-        for thread_id in outcome.unlink_thread_ids {
-            self.unlink_waiter(process, thread_id);
+                result,
+            )
         }
-        outcome.woke_any
     }
 
     /// Destroy the server session.
@@ -2156,7 +2080,7 @@ mod tests {
 
         let mut system = crate::core::System::new_for_test();
         system.set_scheduler_arc(Arc::clone(&scheduler));
-        system.set_current_process_arc(Arc::new(Mutex::new(process)));
+        system.set_current_process_arc(Arc::new(ProcessLock::from_value(process)));
 
         let mut server = KServerSession::new();
         server.initialize(0x1000);
@@ -2199,7 +2123,7 @@ mod tests {
         process.register_event_object(event_id, Arc::clone(&event));
         process.register_readable_event_object(readable_id, Arc::clone(&readable));
 
-        let process = Arc::new(Mutex::new(process));
+        let process = Arc::new(ProcessLock::from_value(process));
         setup_system.set_scheduler_arc(Arc::clone(&scheduler));
         setup_system.set_current_process_arc(Arc::clone(&process));
 
@@ -2335,7 +2259,7 @@ mod tests {
         process.initialize_handle_table();
         process.create_memory(&system);
         process.allocate_code_memory(0x200000, 0x40000);
-        let process = Arc::new(Mutex::new(process));
+        let process = Arc::new(ProcessLock::from_value(process));
 
         let thread = Arc::new(Mutex::new(crate::hle::kernel::k_thread::KThread::new()));
         {
@@ -2402,7 +2326,7 @@ mod tests {
         process.initialize_handle_table();
         process.create_memory(&system);
         process.allocate_code_memory(0x200000, 0x40000);
-        let process = Arc::new(Mutex::new(process));
+        let process = Arc::new(ProcessLock::from_value(process));
 
         let thread = Arc::new(Mutex::new(crate::hle::kernel::k_thread::KThread::new()));
         {
@@ -2463,7 +2387,7 @@ mod tests {
     fn send_reply_with_message_ends_sync_client_wait() {
         let mut process = crate::hle::kernel::k_process::KProcess::new();
         process.process_id = 9;
-        let process = Arc::new(Mutex::new(process));
+        let process = Arc::new(ProcessLock::from_value(process));
 
         let client_thread = Arc::new(Mutex::new(crate::hle::kernel::k_thread::KThread::new()));
         {
@@ -2516,7 +2440,7 @@ mod tests {
         process.register_thread_object(Arc::clone(&waiter));
         process.register_session_object(0x1000, Arc::new(Mutex::new(KSession::new())));
 
-        let process = Arc::new(Mutex::new(process));
+        let process = Arc::new(ProcessLock::from_value(process));
 
         let client_thread = Arc::new(Mutex::new(crate::hle::kernel::k_thread::KThread::new()));
         {
@@ -2594,7 +2518,7 @@ mod tests {
     fn cleanup_requests_ends_sync_client_wait_with_session_closed() {
         let mut process = crate::hle::kernel::k_process::KProcess::new();
         process.process_id = 9;
-        let process = Arc::new(Mutex::new(process));
+        let process = Arc::new(ProcessLock::from_value(process));
 
         let client_thread = Arc::new(Mutex::new(crate::hle::kernel::k_thread::KThread::new()));
         {
@@ -2668,7 +2592,7 @@ mod tests {
             thread.tls_address = KProcessAddress::new(0x4000);
         }
 
-        let process = Arc::new(Mutex::new(process));
+        let process = Arc::new(ProcessLock::from_value(process));
         {
             thread.lock().unwrap().parent = Some(Arc::downgrade(&process));
             process

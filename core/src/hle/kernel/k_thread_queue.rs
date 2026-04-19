@@ -7,7 +7,6 @@
 use std::sync::{Arc, Mutex};
 
 use super::k_hardware_timer::KHardwareTimer;
-use super::k_process::KProcess;
 use super::k_thread::KThread;
 
 /// Base KThreadQueue holding a reference to the kernel and an optional hardware timer.
@@ -18,7 +17,7 @@ pub struct KThreadQueue {
     pub hardware_timer: Option<Arc<KHardwareTimer>>,
     pub end_wait_allowed: bool,
     pub notify_available_impl:
-        Option<fn(&KThreadQueue, &mut KThread, &mut KProcess, u64, u32) -> bool>,
+        Option<fn(&KThreadQueue, &mut KThread, u64, u32) -> bool>,
     pub cancel_wait_impl: Option<fn(&mut KThread)>,
 }
 
@@ -34,7 +33,7 @@ impl KThreadQueue {
 
     pub const fn with_callbacks(
         notify_available_impl: Option<
-            fn(&KThreadQueue, &mut KThread, &mut KProcess, u64, u32) -> bool,
+            fn(&KThreadQueue, &mut KThread, u64, u32) -> bool,
         >,
         cancel_wait_impl: Option<fn(&mut KThread)>,
     ) -> Self {
@@ -48,7 +47,7 @@ impl KThreadQueue {
 
     pub const fn without_end_wait(
         notify_available_impl: Option<
-            fn(&KThreadQueue, &mut KThread, &mut KProcess, u64, u32) -> bool,
+            fn(&KThreadQueue, &mut KThread, u64, u32) -> bool,
         >,
         cancel_wait_impl: Option<fn(&mut KThread)>,
     ) -> Self {
@@ -69,7 +68,6 @@ impl KThreadQueue {
     pub fn notify_available(
         &self,
         thread: &mut KThread,
-        process: &mut KProcess,
         signaled_object_id: u64,
         wait_result: u32,
     ) -> bool {
@@ -78,7 +76,7 @@ impl KThreadQueue {
         }
 
         if let Some(notify_impl) = self.notify_available_impl {
-            notify_impl(self, thread, process, signaled_object_id, wait_result)
+            notify_impl(self, thread, signaled_object_id, wait_result)
         } else {
             // Base KThreadQueue::NotifyAvailable is UNREACHABLE in upstream.
             // If we reach here, a queue was used without a notify_available impl.
@@ -167,7 +165,7 @@ impl KThreadQueueWithoutEndWait {
 
     pub const fn with_callbacks(
         notify_available_impl: Option<
-            fn(&KThreadQueue, &mut KThread, &mut KProcess, u64, u32) -> bool,
+            fn(&KThreadQueue, &mut KThread, u64, u32) -> bool,
         >,
         cancel_wait_impl: Option<fn(&mut KThread)>,
     ) -> Self {

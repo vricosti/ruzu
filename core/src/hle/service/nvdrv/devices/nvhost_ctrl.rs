@@ -18,6 +18,7 @@ use crate::hle::service::nvdrv::devices::nvdevice::NvDevice;
 use crate::hle::service::nvdrv::devices::nvmap::{read_struct, write_struct};
 use crate::hle::service::nvdrv::nvdata::*;
 use crate::hle::service::nvdrv::nvdrv::EventInterface;
+use crate::hle::kernel::k_process::ProcessLock;
 
 /// Union for SyncpointEventValue bit fields.
 #[repr(C)]
@@ -60,7 +61,7 @@ struct InternalEvent {
 }
 
 struct QueriedEventOwner {
-    process: Weak<Mutex<KProcess>>,
+    process: Weak<ProcessLock>,
     scheduler: Weak<Mutex<KScheduler>>,
 }
 
@@ -263,15 +264,11 @@ impl NvHostCtrl {
             )
         };
 
-        let (Some((process, scheduler)), Some(readable_event)) = owner_and_event else {
+        let (Some((_process, _scheduler)), Some(readable_event)) = owner_and_event else {
             return;
         };
 
-        let mut process = process.lock().unwrap();
-        readable_event
-            .lock()
-            .unwrap()
-            .signal(&mut process, &scheduler);
+        readable_event.lock().unwrap().signal();
     }
 
     fn free_event_locked(
@@ -839,7 +836,7 @@ impl NvDevice for NvHostCtrl {
     fn register_query_event_owner(
         &self,
         event_id: u32,
-        process: Arc<Mutex<KProcess>>,
+        process: Arc<ProcessLock>,
         scheduler: Arc<Mutex<KScheduler>>,
     ) {
         let desired_event = SyncpointEventValue { raw: event_id };
