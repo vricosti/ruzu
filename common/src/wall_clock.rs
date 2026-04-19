@@ -49,40 +49,43 @@ pub trait WallClock: Send + Sync {
 // Static conversion functions matching the C++ static methods
 
 /// Convert nanoseconds to CNTPCT ticks.
+///
+/// Upstream uses `std::ratio<CNTFRQ, std::nano::den>` which simplifies at
+/// compile time; use u128 intermediate here to avoid u64 overflow for large
+/// nanosecond inputs (19.2M * 1e9 overflows u64 near ~15 minutes of uptime).
 #[inline]
 pub fn ns_to_cntpct(ns: u64) -> u64 {
-    // CNTFRQ / NS_PER_SEC simplified: 19_200_000 / 1_000_000_000 = 24/1250
-    ns * CNTFRQ / NS_PER_SEC
+    ((ns as u128) * CNTFRQ as u128 / NS_PER_SEC as u128) as u64
 }
 
 /// Convert nanoseconds to GPU ticks.
 #[inline]
 pub fn ns_to_gpu_tick(ns: u64) -> u64 {
-    ns * GPU_TICK_FREQ / NS_PER_SEC
+    ((ns as u128) * GPU_TICK_FREQ as u128 / NS_PER_SEC as u128) as u64
 }
 
 /// Convert CPU ticks to nanoseconds.
 #[inline]
 pub fn cpu_tick_to_ns(cpu_tick: u64) -> u64 {
-    cpu_tick * NS_PER_SEC / CPU_TICK_FREQ
+    ((cpu_tick as u128) * NS_PER_SEC as u128 / CPU_TICK_FREQ as u128) as u64
 }
 
 /// Convert CPU ticks to microseconds.
 #[inline]
 pub fn cpu_tick_to_us(cpu_tick: u64) -> u64 {
-    cpu_tick * US_PER_SEC / CPU_TICK_FREQ
+    ((cpu_tick as u128) * US_PER_SEC as u128 / CPU_TICK_FREQ as u128) as u64
 }
 
 /// Convert CPU ticks to CNTPCT ticks.
 #[inline]
 pub fn cpu_tick_to_cntpct(cpu_tick: u64) -> u64 {
-    cpu_tick * CNTFRQ / CPU_TICK_FREQ
+    ((cpu_tick as u128) * CNTFRQ as u128 / CPU_TICK_FREQ as u128) as u64
 }
 
 /// Convert CPU ticks to GPU ticks.
 #[inline]
 pub fn cpu_tick_to_gpu_tick(cpu_tick: u64) -> u64 {
-    cpu_tick * GPU_TICK_FREQ / CPU_TICK_FREQ
+    ((cpu_tick as u128) * GPU_TICK_FREQ as u128 / CPU_TICK_FREQ as u128) as u64
 }
 
 /// Standard wall clock implementation using std::time.
@@ -123,18 +126,38 @@ impl WallClock for StandardWallClock {
     }
 
     fn get_cntpct(&self) -> i64 {
-        let uptime = self.get_uptime();
-        (uptime as u64 * CNTFRQ / NS_PER_SEC) as i64
+        // Upstream uses `std::ratio<CNTFRQ, std::nano::den>` which simplifies
+        // the fraction at compile time (19.2M/1e9 -> 12/625), avoiding u64
+        // overflow on large uptime values. Use u128 intermediate to match.
+        let uptime = self.get_uptime() as u64;
+        ((uptime as u128 * CNTFRQ as u128) / NS_PER_SEC as u128) as i64
     }
 
     fn get_gpu_tick(&self) -> i64 {
-        let uptime = self.get_uptime();
-        (uptime as u64 * GPU_TICK_FREQ / NS_PER_SEC) as i64
+        let uptime = self.get_uptime() as u64;
+        ((uptime as u128 * GPU_TICK_FREQ as u128) / NS_PER_SEC as u128) as i64
     }
 
     fn get_uptime(&self) -> i64 {
-        // Use monotonic clock for uptime (like steady_clock in C++)
-        self._start.elapsed().as_nanos() as i64
+        // Match upstream: zuyu's StandardWallClock::GetUptime returns
+        // `std::chrono::steady_clock::now().time_since_epoch().count()` in
+        // nanoseconds. On Linux `steady_clock` is CLOCK_MONOTONIC, which
+        // measures ns since an implementation-defined epoch (typically host
+        // boot on Linux). Rust's `std::time::Instant` is CLOCK_MONOTONIC
+        // under the hood but hides the absolute epoch behind a relative
+        // `elapsed()` API. Reading `CLOCK_MONOTONIC` directly preserves the
+        // upstream epoch so guest-visible CNTPCT (derived from `get_uptime`)
+        // has matching magnitude to zuyu's.
+        #[cfg(unix)]
+        {
+            let mut ts: libc::timespec = unsafe { std::mem::zeroed() };
+            unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
+            (ts.tv_sec as i64) * 1_000_000_000 + (ts.tv_nsec as i64)
+        }
+        #[cfg(not(unix))]
+        {
+            self._start.elapsed().as_nanos() as i64
+        }
     }
 
     fn is_native(&self) -> bool {
@@ -143,11 +166,30 @@ impl WallClock for StandardWallClock {
 }
 
 /// Creates the optimal clock for the current platform.
-/// On platforms without a native high-precision timer, falls back to StandardWallClock.
+///
+/// Mirrors upstream `Common::CreateOptimalClock`:
+/// - On x86_64, use RDTSC-backed `NativeClock` iff the TSC is invariant and
+///   runs at >= 1 GHz (nanosecond resolution). Otherwise fall back to
+///   `StandardWallClock` (std::time-based).
+/// - On aarch64, use CNTVCT_EL0-backed `NativeClock`.
+/// - Otherwise, `StandardWallClock`.
 pub fn create_optimal_clock() -> Box<dyn WallClock> {
-    // For now, always use the standard wall clock.
-    // Native clocks (x86_64 RDTSC, ARM64 CNTVCT_EL0) can be added later.
-    Box::new(StandardWallClock::new())
+    #[cfg(target_arch = "x86_64")]
+    {
+        let caps = crate::x64::cpu_detect::get_cpu_caps();
+        if caps.invariant_tsc && caps.tsc_frequency >= NS_PER_SEC {
+            return Box::new(crate::x64::native_clock::NativeClock::new(caps.tsc_frequency));
+        }
+        return Box::new(StandardWallClock::new());
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        return Box::new(crate::arm64::native_clock::NativeClock::new());
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    {
+        Box::new(StandardWallClock::new())
+    }
 }
 
 /// Creates a standard wall clock (non-native).
