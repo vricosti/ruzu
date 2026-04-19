@@ -190,7 +190,7 @@ mod tests {
         process.register_readable_event_object(readable_id, Arc::clone(&readable));
 
         assert_eq!(
-            event.signal(&mut process, &scheduler),
+            event.signal(&process),
             RESULT_SUCCESS.get_inner_value()
         );
         assert!(readable.lock().unwrap().is_signaled());
@@ -199,7 +199,7 @@ mod tests {
         assert!(!readable.lock().unwrap().is_signaled());
 
         assert_eq!(
-            event.signal(&mut process, &scheduler),
+            event.signal(&process),
             RESULT_SUCCESS.get_inner_value()
         );
         assert!(readable.lock().unwrap().is_signaled());

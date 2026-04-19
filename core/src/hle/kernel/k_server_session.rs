@@ -2015,28 +2015,10 @@ mod tests {
         assert!(server.is_signaled());
     }
 
-    #[test]
-    fn link_waiter_uses_parent_session_object_id() {
-        let mut process = KProcess::new();
-        let mut server = KServerSession::new();
-        server.initialize(0x1000);
-
-        let waiter = Arc::new(Mutex::new(crate::hle::kernel::k_thread::KThread::new()));
-        {
-            let mut waiter = waiter.lock().unwrap();
-            waiter.thread_id = 7;
-            waiter.object_id = 8;
-            waiter.synchronization_wait.begin(vec![0x1000]);
-            waiter.synchronization_wait.bind_thread(7);
-        }
-        process.register_thread_object(waiter);
-
-        let session = Arc::new(Mutex::new(KSession::new()));
-        process.register_session_object(0x1000, session);
-
-        server.link_waiter(&mut process, 7);
-        assert_eq!(server.sync_object.waiter_snapshot(&process), vec![7]);
-    }
+    // `link_waiter_uses_parent_session_object_id` removed: the handle-indirect
+    // `link_waiter(&mut KProcess, thread_id)` API was deleted as part of the
+    // upstream-faithful sync-object refactor. The new intrusive-list path is
+    // exercised by the KSynchronizationObject unit tests.
 
     #[test]
     fn cleanup_requests_finalizes_pending_and_current_requests() {
@@ -2212,22 +2194,13 @@ mod tests {
 
     #[test]
     fn receive_request_with_message_finalizes_dead_request_and_notifies_next() {
-        let mut process = KProcess::new();
-        let waiter = Arc::new(Mutex::new(crate::hle::kernel::k_thread::KThread::new()));
-        {
-            let mut waiter_guard = waiter.lock().unwrap();
-            waiter_guard.thread_id = 11;
-            waiter_guard.object_id = 12;
-            waiter_guard.synchronization_wait.begin(vec![0x1000]);
-            waiter_guard.synchronization_wait.bind_thread(11);
-            waiter_guard.begin_wait();
-        }
-        process.register_thread_object(Arc::clone(&waiter));
-        process.register_session_object(0x1000, Arc::new(Mutex::new(KSession::new())));
-
+        // The waiter-wake assertion this test used to cover is now the
+        // responsibility of the KSynchronizationObject intrusive-list path
+        // (exercised by unit tests in k_synchronization_object and by the
+        // MK8D integration boot). Here we keep the dead-request cleanup
+        // assertion, which is server-local behavior.
         let mut server = KServerSession::new();
         server.initialize(0x1000);
-        server.link_waiter(&mut process, 11);
 
         let dead_request = Arc::new(Mutex::new(KSessionRequest::new()));
         {
@@ -2245,10 +2218,6 @@ mod tests {
             RESULT_SESSION_CLOSED.get_inner_value()
         );
         assert_eq!(dead_request.lock().unwrap().get_thread_id(), None);
-        assert_eq!(
-            waiter.lock().unwrap().get_wait_result(),
-            crate::hle::result::RESULT_SUCCESS.get_inner_value()
-        );
     }
 
     #[test]
@@ -2423,96 +2392,15 @@ mod tests {
         );
     }
 
-    #[test]
-    fn send_reply_with_message_notifies_next_waiting_server_request() {
-        let mut process = crate::hle::kernel::k_process::KProcess::new();
-        process.process_id = 9;
-
-        let waiter = Arc::new(Mutex::new(crate::hle::kernel::k_thread::KThread::new()));
-        {
-            let mut waiter_guard = waiter.lock().unwrap();
-            waiter_guard.thread_id = 11;
-            waiter_guard.object_id = 12;
-            waiter_guard.synchronization_wait.begin(vec![0x1000]);
-            waiter_guard.synchronization_wait.bind_thread(11);
-            waiter_guard.begin_wait();
-        }
-        process.register_thread_object(Arc::clone(&waiter));
-        process.register_session_object(0x1000, Arc::new(Mutex::new(KSession::new())));
-
-        let process = Arc::new(ProcessLock::from_value(process));
-
-        let client_thread = Arc::new(Mutex::new(crate::hle::kernel::k_thread::KThread::new()));
-        {
-            let mut thread_guard = client_thread.lock().unwrap();
-            thread_guard.thread_id = 7;
-            thread_guard.object_id = 8;
-            thread_guard.parent = Some(Arc::downgrade(&process));
-            thread_guard.begin_wait();
-        }
-        process
-            .lock()
-            .unwrap()
-            .register_thread_object(Arc::clone(&client_thread));
-
-        let mut system = crate::core::System::new_for_test();
-        system.set_current_process_arc(Arc::clone(&process));
-
-        let mut server = KServerSession::new();
-        server.initialize(0x1000);
-        {
-            let mut process = process.lock().unwrap();
-            server.link_waiter(&mut process, 11);
-        }
-
-        let current = Arc::new(Mutex::new(KSessionRequest::new()));
-        {
-            let mut request_guard = current.lock().unwrap();
-            request_guard.thread_id = Some(7);
-            request_guard.client_process_id = Some(9);
-        }
-        let pending = Arc::new(Mutex::new(KSessionRequest::new()));
-        server.current_request = Some(current);
-        server.request_list.push_back(pending);
-
-        assert_eq!(server.send_reply_with_message(0x2000, 0x100, 0, false), 0);
-        assert_eq!(
-            waiter.lock().unwrap().get_wait_result(),
-            crate::hle::result::RESULT_SUCCESS.get_inner_value()
-        );
-    }
-
-    #[test]
-    fn clear_current_request_and_notify_is_shared_by_receive_failure_path() {
-        let mut process = KProcess::new();
-        let waiter = Arc::new(Mutex::new(crate::hle::kernel::k_thread::KThread::new()));
-        {
-            let mut waiter_guard = waiter.lock().unwrap();
-            waiter_guard.thread_id = 11;
-            waiter_guard.object_id = 12;
-            waiter_guard.synchronization_wait.begin(vec![0x1000]);
-            waiter_guard.synchronization_wait.bind_thread(11);
-            waiter_guard.begin_wait();
-        }
-        process.register_thread_object(Arc::clone(&waiter));
-        process.register_session_object(0x1000, Arc::new(Mutex::new(KSession::new())));
-
-        let mut server = KServerSession::new();
-        server.initialize(0x1000);
-        server.current_request = Some(Arc::new(Mutex::new(KSessionRequest::new())));
-        server.link_waiter(&mut process, 11);
-        server
-            .request_list
-            .push_back(Arc::new(Mutex::new(KSessionRequest::new())));
-
-        server.clear_current_request_and_notify();
-
-        assert!(server.current_request.is_none());
-        assert_eq!(
-            waiter.lock().unwrap().get_wait_result(),
-            crate::hle::result::RESULT_SUCCESS.get_inner_value()
-        );
-    }
+    // Prior tests `send_reply_with_message_notifies_next_waiting_server_request`
+    // and `clear_current_request_and_notify_is_shared_by_receive_failure_path`
+    // were removed: they asserted that `server.link_waiter(&mut process, ...)`
+    // routed the wake-up to a registered waiter thread. The link_waiter API
+    // was deleted in the sync-object refactor — waiter storage is now on an
+    // intrusive list populated by `wait()` through fiber-suspended stack
+    // allocation, which can't be driven from a standalone unit test. The
+    // wake-up path is covered by MK8D integration and the raw-pointer list
+    // unit tests in k_synchronization_object.
 
     #[test]
     fn cleanup_requests_ends_sync_client_wait_with_session_closed() {
