@@ -1146,25 +1146,15 @@ impl KProcess {
         result.get_inner_value()
     }
 
-    pub fn signal_condition_variable(&mut self, scheduler_lock_ptr: u64, cv_key: u64, count: i32) {
+    pub fn signal_condition_variable(&mut self, cv_key: u64, count: i32) {
         log::trace!(
             "KProcess::signal_condition_variable enter cv_key=0x{:X} count={}",
             cv_key,
             count
         );
-        // Mark this thread as holding the process Mutex from this site
-        // (actual Mutex was already acquired by the caller — we're just
-        // labelling the current holder for SIGUSR1 diagnostics).
-        let tid = super::kernel::get_current_thread_pointer()
-            .and_then(|t| t.lock().ok().map(|g| g.get_thread_id()))
-            .unwrap_or(0);
-        let _holder_guard = super::kernel::ProcessLockTracker::new(
-            tid,
-            0x5369_4356, // 'SigCV'
-        );
         let cond_var_ptr: *mut KConditionVariable = &mut self.cond_var;
         unsafe {
-            (*cond_var_ptr).signal(self, scheduler_lock_ptr, cv_key, count);
+            (*cond_var_ptr).signal(self, cv_key, count);
         }
         log::trace!(
             "KProcess::signal_condition_variable return cv_key=0x{:X} count={}",
