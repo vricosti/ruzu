@@ -170,11 +170,18 @@ pub fn wait_for_address(
         timeout_ns
     };
 
-    let result = system
-        .current_process_arc()
-        .lock()
-        .unwrap()
-        .wait_address_arbiter(address, to_k_arb_type(arb_type), value, timeout);
+    let process_arc = system.current_process_arc().clone();
+    let Some(current_thread) = system.current_thread() else {
+        return RESULT_INVALID_HANDLE;
+    };
+    let result = crate::hle::kernel::k_process::KProcess::wait_address_arbiter(
+        &process_arc,
+        &current_thread,
+        address,
+        to_k_arb_type(arb_type),
+        value,
+        timeout,
+    );
     ResultCode::new(result)
 }
 

@@ -619,7 +619,7 @@ impl KProcess {
             num_ipc_messages: AtomicI64::new(0),
             num_ipc_replies: AtomicI64::new(0),
             num_ipc_receives: AtomicI64::new(0),
-            address_arbiter: super::k_address_arbiter::KAddressArbiter::with_memory(process_memory),
+            address_arbiter: super::k_address_arbiter::KAddressArbiter::new(),
         }
     }
 
@@ -1164,6 +1164,11 @@ impl KProcess {
     }
 
     /// Port of upstream `KProcess::SignalAddressArbiter`.
+    ///
+    /// Caller already holds the process lock; we forward through a raw
+    /// `*mut KAddressArbiter` pointer so the arbiter can call back into
+    /// `&mut KProcess` for thread lookup under the scheduler lock, mirroring
+    /// how `signal_condition_variable` forwards to `KConditionVariable::signal`.
     pub fn signal_address_arbiter(
         &mut self,
         address: u64,
@@ -1171,22 +1176,44 @@ impl KProcess {
         value: i32,
         count: i32,
     ) -> u32 {
-        self.address_arbiter
-            .signal_to_address(address, signal_type, value, count)
-            .get_inner_value()
+        let arbiter_ptr: *mut super::k_address_arbiter::KAddressArbiter =
+            &mut self.address_arbiter;
+        // SAFETY: arbiter_ptr is a field of `self`; `&mut self` guarantees
+        // exclusive access while we hold it. The arbiter never stores this
+        // pointer long-term — it uses it only to call methods that take
+        // `&mut self` + `&mut KProcess` together via the unsafe re-borrow.
+        unsafe {
+            (*arbiter_ptr)
+                .signal_to_address(self, address, signal_type, value, count)
+                .get_inner_value()
+        }
     }
 
     /// Port of upstream `KProcess::WaitAddressArbiter`.
     pub fn wait_address_arbiter(
-        &mut self,
+        process: &Arc<ProcessLock>,
+        current_thread: &Arc<super::k_thread::KThreadLock>,
         address: u64,
         arb_type: super::k_address_arbiter::ArbitrationType,
         value: i32,
         timeout: i64,
     ) -> u32 {
-        self.address_arbiter
-            .wait_for_address(address, arb_type, value, timeout)
-            .get_inner_value()
+        // The wait path must not hold `process.lock()` across the fiber-wait
+        // (same deadlock shape as condvar::wait_for_address). Forward the
+        // Arc<ProcessLock> so the arbiter can manage the scheduler-lock
+        // scope and drop it before the fiber-wait begins.
+        let arbiter_ptr: *mut super::k_address_arbiter::KAddressArbiter = {
+            let mut p = process.lock().unwrap();
+            &mut p.address_arbiter
+        };
+        // SAFETY: The arbiter lives inside the process Arc; the pointer is
+        // valid for as long as `process` outlives this call. The arbiter's
+        // internal critical sections reacquire `process.lock()` themselves.
+        unsafe {
+            (*arbiter_ptr)
+                .wait_for_address(process, current_thread, address, arb_type, value, timeout)
+                .get_inner_value()
+        }
     }
 
     pub fn before_update_condition_variable_priority(&mut self, thread_id: u64) {
