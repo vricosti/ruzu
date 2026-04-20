@@ -25,19 +25,12 @@ pub struct KReadableEvent {
 }
 
 impl KReadableEvent {
+    /// Acquire the kernel scheduler lock. Matches upstream pattern where
+    /// `KReadableEvent::Signal` / `Reset` open `KScopedSchedulerLock sl(kernel)`.
+    /// Resolves through the kernel singleton; no GSC mutex round-trip.
     fn lock_scheduler() -> Option<KScopedSchedulerLock<'static>> {
-        let kernel = crate::hle::kernel::kernel::get_kernel_ref()?;
-        let scheduler_lock = {
-            let gsc = kernel.global_scheduler_context()?.lock().unwrap();
-            std::ptr::addr_of!(*gsc.scheduler_lock())
-                as *const crate::hle::kernel::k_scheduler_lock::KAbstractSchedulerLock
-        };
-
-        if scheduler_lock.is_null() {
-            return None;
-        }
-
-        Some(KScopedSchedulerLock::new(unsafe { &*scheduler_lock }))
+        let scheduler_lock = crate::hle::kernel::kernel::scheduler_lock()?;
+        Some(KScopedSchedulerLock::new(scheduler_lock))
     }
 
     pub fn new() -> Self {

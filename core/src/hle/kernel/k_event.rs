@@ -24,18 +24,13 @@ pub struct KEvent {
 }
 
 impl KEvent {
-    fn lock_scheduler_for_process(process: &KProcess) -> Option<KScopedSchedulerLock<'static>> {
-        let scheduler_lock = {
-            let gsc = process.global_scheduler_context.as_ref()?.lock().unwrap();
-            std::ptr::addr_of!(*gsc.scheduler_lock())
-                as *const super::k_scheduler_lock::KAbstractSchedulerLock
-        };
-
-        if scheduler_lock.is_null() {
-            return None;
-        }
-
-        Some(KScopedSchedulerLock::new(unsafe { &*scheduler_lock }))
+    /// Acquire the kernel scheduler lock. Matches upstream pattern where
+    /// `KEvent::Signal` / `Clear` open `KScopedSchedulerLock sl(kernel)`
+    /// at entry. Resolves through the kernel singleton; no GSC mutex
+    /// round-trip needed.
+    fn lock_scheduler_for_process(_process: &KProcess) -> Option<KScopedSchedulerLock<'static>> {
+        let scheduler_lock = super::kernel::scheduler_lock()?;
+        Some(KScopedSchedulerLock::new(scheduler_lock))
     }
 
     pub fn new() -> Self {
