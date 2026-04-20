@@ -146,6 +146,10 @@ impl PhysicalCore {
         current_thread: &Arc<KThreadLock>,
     ) {
         jit.get_context(thread_context);
+        // Stash the PC so the SIGUSR1 dumper can report where the guest was
+        // last seen on this core. Updated cheaply at every SVC return — good
+        // enough to identify where a post-SVC guest-code spin begins.
+        super::kernel::record_guest_pc(self.m_core_index, thread_context.pc);
         current_thread
             .lock()
             .unwrap()
