@@ -1120,12 +1120,6 @@ mod tests {
         scheduler.lock().unwrap().initialize(1, 0, 0);
         {
             let mut process_guard = process.lock().unwrap();
-            let _kcv_holder = super::kernel::ProcessLockTracker::new(
-                super::kernel::get_current_thread_pointer()
-                    .and_then(|t| t.lock().ok().map(|g| g.get_thread_id()))
-                    .unwrap_or(0),
-                0x4B43_5631, // 'KCV1' — covers all remaining k_condition_variable process.lock() sites
-            );
             process_guard.attach_scheduler(&scheduler);
             process_guard.bind_self_reference(&process);
             process_guard.initialize_handle_table();
@@ -1154,12 +1148,6 @@ mod tests {
 
         let owner_handle = {
             let mut process_guard = process.lock().unwrap();
-            let _kcv_holder = super::kernel::ProcessLockTracker::new(
-                super::kernel::get_current_thread_pointer()
-                    .and_then(|t| t.lock().ok().map(|g| g.get_thread_id()))
-                    .unwrap_or(0),
-                0x4B43_5631, // 'KCV1' — covers all remaining k_condition_variable process.lock() sites
-            );
             process_guard.register_thread_object(owner.clone());
             process_guard.register_thread_object(waiter.clone());
             process_guard.handle_table.add(10).unwrap()
@@ -1419,12 +1407,6 @@ mod tests {
         scheduler.lock().unwrap().initialize(1, 0, 0);
         {
             let mut process_guard = process.lock().unwrap();
-            let _kcv_holder = super::kernel::ProcessLockTracker::new(
-                super::kernel::get_current_thread_pointer()
-                    .and_then(|t| t.lock().ok().map(|g| g.get_thread_id()))
-                    .unwrap_or(0),
-                0x4B43_5631, // 'KCV1' — covers all remaining k_condition_variable process.lock() sites
-            );
             process_guard.attach_scheduler(&scheduler);
             process_guard.bind_self_reference(&process);
             process_guard.initialize_handle_table();
@@ -1455,12 +1437,6 @@ mod tests {
 
         {
             let mut process_guard = process.lock().unwrap();
-            let _kcv_holder = super::kernel::ProcessLockTracker::new(
-                super::kernel::get_current_thread_pointer()
-                    .and_then(|t| t.lock().ok().map(|g| g.get_thread_id()))
-                    .unwrap_or(0),
-                0x4B43_5631, // 'KCV1' — covers all remaining k_condition_variable process.lock() sites
-            );
             process_guard.register_thread_object(waiter_a.clone());
             process_guard.register_thread_object(waiter_b.clone());
         }
@@ -1468,12 +1444,6 @@ mod tests {
         let key = 0x1c00;
         {
             let mut process_guard = process.lock().unwrap();
-            let _kcv_holder = super::kernel::ProcessLockTracker::new(
-                super::kernel::get_current_thread_pointer()
-                    .and_then(|t| t.lock().ok().map(|g| g.get_thread_id()))
-                    .unwrap_or(0),
-                0x4B43_5631, // 'KCV1' — covers all remaining k_condition_variable process.lock() sites
-            );
             let mut cond_var = std::mem::take(&mut process_guard.cond_var);
             cond_var.wait_locked(&mut process_guard, &waiter_a, 0x1800, key, 0x1111, -1);
             cond_var.wait_locked(&mut process_guard, &waiter_b, 0x1810, key, 0x2222, -1);

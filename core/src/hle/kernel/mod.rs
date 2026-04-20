@@ -129,4 +129,3 @@ pub mod physical_core;
 pub mod physical_core_log;
 pub mod sync_cell;
 pub mod trace_format;
-pub mod tracked_mutex;

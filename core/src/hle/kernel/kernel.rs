@@ -100,31 +100,6 @@ pub fn scheduler_lock() -> Option<&'static super::k_scheduler_lock::KAbstractSch
 /// thread so the dump runs outside signal context (where Rust's Mutex is unsafe).
 static DUMP_REQUESTED: AtomicBool = AtomicBool::new(false);
 
-/// Tid currently holding the KProcess Mutex. Set by `track_process_lock_*`
-/// helpers at strategic SVC/scheduler call sites; used by the SIGUSR1 dumper
-/// to identify the lock holder when the Mutex is contended.
-/// 0 = not held (or holder not tracked at this site).
-pub static PROCESS_LOCK_HOLDER_TID: AtomicU64 = AtomicU64::new(0);
-/// PC of the code site that last acquired the Mutex (for localization).
-pub static PROCESS_LOCK_HOLDER_SITE: std::sync::atomic::AtomicU32 =
-    std::sync::atomic::AtomicU32::new(0);
-
-/// RAII guard for the tracked lock.  On Drop it clears the holder.
-pub struct ProcessLockTracker(u64, u32);
-impl ProcessLockTracker {
-    pub fn new(tid: u64, site: u32) -> Self {
-        PROCESS_LOCK_HOLDER_TID.store(tid, Ordering::Release);
-        PROCESS_LOCK_HOLDER_SITE.store(site, Ordering::Release);
-        Self(tid, site)
-    }
-}
-impl Drop for ProcessLockTracker {
-    fn drop(&mut self) {
-        PROCESS_LOCK_HOLDER_TID.store(0, Ordering::Release);
-        PROCESS_LOCK_HOLDER_SITE.store(0, Ordering::Release);
-    }
-}
-
 /// Per-core SVC-entry tracker.  Each entry is packed as (tid:u32, svc:u32).
 /// Updated by `svc_dispatch::call` at entry; cleared at exit.  Used by the
 /// SIGUSR1 dumper to identify which thread/svc is currently executing on each
@@ -210,32 +185,6 @@ fn install_sigusr1_handler() {
 fn dump_thread_state(kernel: &KernelCore) {
     eprintln!("=========================================");
     eprintln!("[DUMP] === ruzu kernel thread dump ===");
-
-    // Holder info (if anyone acquired the Mutex via a tracked site).
-    let holder_tid = PROCESS_LOCK_HOLDER_TID.load(Ordering::Acquire);
-    let holder_site = PROCESS_LOCK_HOLDER_SITE.load(Ordering::Acquire);
-    eprintln!(
-        "[DUMP] PROCESS_LOCK_HOLDER tid={} site=0x{:X} (0 = unheld or untracked call-site)",
-        holder_tid, holder_site,
-    );
-
-    // Global TrackedMutex registry — every TrackedMutex::lock() records its
-    // holder here via RAII. This enumerates ALL held instances (including the
-    // KProcess Mutex).
-    super::tracked_mutex::dump_registry();
-    // Also print the current process's Mutex address so the registry entry
-    // can be matched against it.
-    {
-        let sys = kernel.system();
-        if !sys.is_null() {
-            if let Some(p) = sys.get().current_process_arc.as_ref() {
-                eprintln!(
-                    "[DUMP] current_process_arc Mutex addr=0x{:X}",
-                    Arc::as_ptr(p) as *const () as usize,
-                );
-            }
-        }
-    }
 
     // Per-core running thread + interrupt flag + in-progress SVC.
     for core_id in 0..hardware_properties::NUM_CPU_CORES as usize {

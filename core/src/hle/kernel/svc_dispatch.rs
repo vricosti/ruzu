@@ -34,7 +34,6 @@ use crate::hle::kernel::svc::svc_thread;
 use crate::hle::kernel::svc::svc_tick;
 use crate::hle::kernel::svc::svc_transfer_memory;
 use crate::hle::kernel::svc::svc_types::MemoryPermission;
-use super::k_process::ProcessLock;
 
 fn decode_memory_permission(raw: u32) -> MemoryPermission {
     match raw {
@@ -417,12 +416,6 @@ fn query_memory_info(system: &System, query_addr: u64) -> (u64, u64, u32, u32) {
     use crate::hle::kernel::k_memory_block::KMemoryPermission;
 
     let process = system.current_process_arc().lock().unwrap();
-    let tid_tracker = system
-        .current_thread()
-        .and_then(|t| t.lock().ok().map(|g| g.get_thread_id()))
-        .unwrap_or(0);
-    let _holder_guard =
-        super::kernel::ProcessLockTracker::new(tid_tracker, 0x5179_4D65); // 'QyMe'
 
     if let Some(info) = process.page_table.query_info(query_addr as usize) {
         let svc_state = info.get_svc_state();
