@@ -151,6 +151,33 @@ pub fn wait_synchronization(
             timeout_ns
         );
     }
+    // Narrow diagnostic for the MK8D freeze choke point: tid=73 (game main)
+    // and tid=102 (audio renderer) both stall in WaitSynchronization from
+    // nnSdk PC 0x1D50400. Log their handles + object kinds + timeout every
+    // time so we can see which event they're waiting on and whether the
+    // timeout is finite. Sampled once per tid to avoid flooding.
+    if matches!(current_thread_id, 73 | 102) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static TID73_COUNT: AtomicUsize = AtomicUsize::new(0);
+        static TID102_COUNT: AtomicUsize = AtomicUsize::new(0);
+        let cnt = if current_thread_id == 73 {
+            TID73_COUNT.fetch_add(1, Ordering::Relaxed)
+        } else {
+            TID102_COUNT.fetch_add(1, Ordering::Relaxed)
+        };
+        // First 16 calls verbose, then every 256th call.
+        if cnt < 16 || cnt.is_power_of_two() {
+            log::info!(
+                "[WAIT_SYNC_DBG] tid={} call#{} handles={:?} object_ids={:?} kinds={:?} timeout_ns={}",
+                current_thread_id,
+                cnt,
+                handles,
+                object_ids,
+                object_kinds,
+                timeout_ns,
+            );
+        }
+    }
     log::trace!(
         "  WaitSynchronization handles={:?} object_ids={:?} kinds={:?} timeout_ns={}",
         handles,
