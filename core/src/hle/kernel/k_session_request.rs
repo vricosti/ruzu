@@ -7,6 +7,7 @@
 use std::sync::{Arc, Mutex, Weak};
 
 use super::k_memory_block::KMemoryState;
+use super::k_thread::KThreadLock;
 use super::k_typed_address::KProcessAddress;
 
 /// Number of statically allocated mapping slots.
@@ -186,7 +187,7 @@ impl Default for SessionMappings {
 /// Matches upstream `KSessionRequest` class (k_session_request.h).
 pub struct KSessionRequest {
     pub mappings: SessionMappings,
-    pub thread: Option<Weak<Mutex<super::k_thread::KThread>>>,
+    pub thread: Option<Weak<KThreadLock>>,
     pub thread_id: Option<u64>,
     pub client_process_id: Option<u64>,
     pub server_process_id: Option<u64>,
@@ -211,7 +212,7 @@ impl KSessionRequest {
 
     fn initialize_impl(
         &mut self,
-        thread: Option<Arc<Mutex<super::k_thread::KThread>>>,
+        thread: Option<Arc<KThreadLock>>,
         thread_id: Option<u64>,
         client_process_id: Option<u64>,
         event_id: Option<u64>,
@@ -272,7 +273,7 @@ impl KSessionRequest {
         );
     }
 
-    pub fn get_thread(&self) -> Option<Arc<Mutex<super::k_thread::KThread>>> {
+    pub fn get_thread(&self) -> Option<Arc<KThreadLock>> {
         self.thread.as_ref()?.upgrade()
     }
 

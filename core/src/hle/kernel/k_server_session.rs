@@ -12,6 +12,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::hle::kernel::k_memory_block::{KMemoryPermission, KMemoryState, PAGE_SIZE};
 use crate::hle::kernel::k_session_request::KSessionRequest;
+use crate::hle::kernel::k_thread::KThreadLock;
 use crate::hle::kernel::k_synchronization_object;
 use crate::hle::kernel::k_synchronization_object::SynchronizationObjectState;
 use crate::hle::kernel::k_typed_address::KProcessAddress;
@@ -1526,7 +1527,7 @@ impl KServerSession {
 
     fn resolve_request_client_thread(
         request: &Arc<Mutex<KSessionRequest>>,
-    ) -> Option<Arc<Mutex<crate::hle::kernel::k_thread::KThread>>> {
+    ) -> Option<Arc<KThreadLock>> {
         request.lock().unwrap().get_thread()
     }
 
@@ -2230,7 +2231,7 @@ mod tests {
         process.allocate_code_memory(0x200000, 0x40000);
         let process = Arc::new(ProcessLock::from_value(process));
 
-        let thread = Arc::new(Mutex::new(crate::hle::kernel::k_thread::KThread::new()));
+        let thread = Arc::new(KThreadLock::new(crate::hle::kernel::k_thread::KThread::new()));
         {
             let mut thread_guard = thread.lock().unwrap();
             thread_guard.thread_id = 7;
@@ -2297,7 +2298,7 @@ mod tests {
         process.allocate_code_memory(0x200000, 0x40000);
         let process = Arc::new(ProcessLock::from_value(process));
 
-        let thread = Arc::new(Mutex::new(crate::hle::kernel::k_thread::KThread::new()));
+        let thread = Arc::new(KThreadLock::new(crate::hle::kernel::k_thread::KThread::new()));
         {
             let mut thread_guard = thread.lock().unwrap();
             thread_guard.thread_id = 7;
@@ -2358,7 +2359,7 @@ mod tests {
         process.process_id = 9;
         let process = Arc::new(ProcessLock::from_value(process));
 
-        let client_thread = Arc::new(Mutex::new(crate::hle::kernel::k_thread::KThread::new()));
+        let client_thread = Arc::new(KThreadLock::new(crate::hle::kernel::k_thread::KThread::new()));
         {
             let mut thread_guard = client_thread.lock().unwrap();
             thread_guard.thread_id = 7;
@@ -2408,7 +2409,7 @@ mod tests {
         process.process_id = 9;
         let process = Arc::new(ProcessLock::from_value(process));
 
-        let client_thread = Arc::new(Mutex::new(crate::hle::kernel::k_thread::KThread::new()));
+        let client_thread = Arc::new(KThreadLock::new(crate::hle::kernel::k_thread::KThread::new()));
         {
             let mut thread_guard = client_thread.lock().unwrap();
             thread_guard.thread_id = 7;
@@ -2472,7 +2473,7 @@ mod tests {
         let copy_handle = process.handle_table.add(0x1111).unwrap();
         let move_handle = process.handle_table.add(0x2222).unwrap();
 
-        let thread = Arc::new(Mutex::new(crate::hle::kernel::k_thread::KThread::new()));
+        let thread = Arc::new(KThreadLock::new(crate::hle::kernel::k_thread::KThread::new()));
         {
             let mut thread = thread.lock().unwrap();
             thread.thread_id = 3;
@@ -2527,7 +2528,7 @@ mod tests {
         client_process.process_id = 7;
         let client_process = Arc::new(Mutex::new(client_process));
 
-        let client_thread = Arc::new(Mutex::new(crate::hle::kernel::k_thread::KThread::new()));
+        let client_thread = Arc::new(KThreadLock::new(crate::hle::kernel::k_thread::KThread::new()));
         {
             let mut thread = client_thread.lock().unwrap();
             thread.thread_id = 3;
@@ -2544,7 +2545,7 @@ mod tests {
         server_process.process_id = 8;
         let server_process = Arc::new(Mutex::new(server_process));
 
-        let server_thread = Arc::new(Mutex::new(crate::hle::kernel::k_thread::KThread::new()));
+        let server_thread = Arc::new(KThreadLock::new(crate::hle::kernel::k_thread::KThread::new()));
         {
             let mut thread = server_thread.lock().unwrap();
             thread.thread_id = 5;
@@ -2618,7 +2619,7 @@ mod tests {
         client_process.process_id = 7;
         let client_process = Arc::new(Mutex::new(client_process));
 
-        let client_thread = Arc::new(Mutex::new(crate::hle::kernel::k_thread::KThread::new()));
+        let client_thread = Arc::new(KThreadLock::new(crate::hle::kernel::k_thread::KThread::new()));
         {
             let mut thread = client_thread.lock().unwrap();
             thread.thread_id = 3;
@@ -2636,7 +2637,7 @@ mod tests {
         server_process.process_id = 8;
         let server_process = Arc::new(Mutex::new(server_process));
 
-        let server_thread = Arc::new(Mutex::new(crate::hle::kernel::k_thread::KThread::new()));
+        let server_thread = Arc::new(KThreadLock::new(crate::hle::kernel::k_thread::KThread::new()));
         {
             let mut thread = server_thread.lock().unwrap();
             thread.thread_id = 5;
@@ -2713,7 +2714,7 @@ mod tests {
         let copy_handle = client_process.handle_table.add(copied_object_id).unwrap();
         let client_process = Arc::new(Mutex::new(client_process));
 
-        let client_thread = Arc::new(Mutex::new(crate::hle::kernel::k_thread::KThread::new()));
+        let client_thread = Arc::new(KThreadLock::new(crate::hle::kernel::k_thread::KThread::new()));
         {
             let mut thread = client_thread.lock().unwrap();
             thread.thread_id = 3;
@@ -2731,7 +2732,7 @@ mod tests {
         assert_eq!(server_process.initialize_handle_table(), 0);
         let server_process = Arc::new(Mutex::new(server_process));
 
-        let server_thread = Arc::new(Mutex::new(crate::hle::kernel::k_thread::KThread::new()));
+        let server_thread = Arc::new(KThreadLock::new(crate::hle::kernel::k_thread::KThread::new()));
         {
             let mut thread = server_thread.lock().unwrap();
             thread.thread_id = 5;
@@ -2820,7 +2821,7 @@ mod tests {
         assert_eq!(client_process.initialize_handle_table(), 0);
         let client_process = Arc::new(Mutex::new(client_process));
 
-        let client_thread = Arc::new(Mutex::new(crate::hle::kernel::k_thread::KThread::new()));
+        let client_thread = Arc::new(KThreadLock::new(crate::hle::kernel::k_thread::KThread::new()));
         {
             let mut thread = client_thread.lock().unwrap();
             thread.thread_id = 3;
@@ -2841,7 +2842,7 @@ mod tests {
         let move_handle = server_process.handle_table.add(moved_object_id).unwrap();
         let server_process = Arc::new(Mutex::new(server_process));
 
-        let server_thread = Arc::new(Mutex::new(crate::hle::kernel::k_thread::KThread::new()));
+        let server_thread = Arc::new(KThreadLock::new(crate::hle::kernel::k_thread::KThread::new()));
         {
             let mut thread = server_thread.lock().unwrap();
             thread.thread_id = 5;
@@ -2932,7 +2933,7 @@ mod tests {
         client_process.process_id = 7;
         let client_process = Arc::new(Mutex::new(client_process));
 
-        let client_thread = Arc::new(Mutex::new(crate::hle::kernel::k_thread::KThread::new()));
+        let client_thread = Arc::new(KThreadLock::new(crate::hle::kernel::k_thread::KThread::new()));
         {
             let mut thread = client_thread.lock().unwrap();
             thread.thread_id = 3;
@@ -2953,7 +2954,7 @@ mod tests {
         server_process.process_id = 8;
         let server_process = Arc::new(Mutex::new(server_process));
 
-        let server_thread = Arc::new(Mutex::new(crate::hle::kernel::k_thread::KThread::new()));
+        let server_thread = Arc::new(KThreadLock::new(crate::hle::kernel::k_thread::KThread::new()));
         {
             let mut thread = server_thread.lock().unwrap();
             thread.thread_id = 5;
@@ -3025,7 +3026,7 @@ mod tests {
         client_process.process_id = 7;
         let client_process = Arc::new(Mutex::new(client_process));
 
-        let client_thread = Arc::new(Mutex::new(crate::hle::kernel::k_thread::KThread::new()));
+        let client_thread = Arc::new(KThreadLock::new(crate::hle::kernel::k_thread::KThread::new()));
         {
             let mut thread = client_thread.lock().unwrap();
             thread.thread_id = 3;
@@ -3043,7 +3044,7 @@ mod tests {
         server_process.process_id = 8;
         let server_process = Arc::new(Mutex::new(server_process));
 
-        let server_thread = Arc::new(Mutex::new(crate::hle::kernel::k_thread::KThread::new()));
+        let server_thread = Arc::new(KThreadLock::new(crate::hle::kernel::k_thread::KThread::new()));
         {
             let mut thread = server_thread.lock().unwrap();
             thread.thread_id = 5;
@@ -3119,7 +3120,7 @@ mod tests {
         client_process.process_id = 7;
         let client_process = Arc::new(Mutex::new(client_process));
 
-        let client_thread = Arc::new(Mutex::new(crate::hle::kernel::k_thread::KThread::new()));
+        let client_thread = Arc::new(KThreadLock::new(crate::hle::kernel::k_thread::KThread::new()));
         {
             let mut thread = client_thread.lock().unwrap();
             thread.thread_id = 3;
@@ -3137,7 +3138,7 @@ mod tests {
         server_process.process_id = 8;
         let server_process = Arc::new(Mutex::new(server_process));
 
-        let server_thread = Arc::new(Mutex::new(crate::hle::kernel::k_thread::KThread::new()));
+        let server_thread = Arc::new(KThreadLock::new(crate::hle::kernel::k_thread::KThread::new()));
         {
             let mut thread = server_thread.lock().unwrap();
             thread.thread_id = 5;
@@ -3216,7 +3217,7 @@ mod tests {
         client_process.process_id = 7;
         let client_process = Arc::new(Mutex::new(client_process));
 
-        let client_thread = Arc::new(Mutex::new(crate::hle::kernel::k_thread::KThread::new()));
+        let client_thread = Arc::new(KThreadLock::new(crate::hle::kernel::k_thread::KThread::new()));
         {
             let mut thread = client_thread.lock().unwrap();
             thread.thread_id = 3;
@@ -3234,7 +3235,7 @@ mod tests {
         server_process.process_id = 8;
         let server_process = Arc::new(Mutex::new(server_process));
 
-        let server_thread = Arc::new(Mutex::new(crate::hle::kernel::k_thread::KThread::new()));
+        let server_thread = Arc::new(KThreadLock::new(crate::hle::kernel::k_thread::KThread::new()));
         {
             let mut thread = server_thread.lock().unwrap();
             thread.thread_id = 5;
@@ -3314,7 +3315,7 @@ mod tests {
         assert_eq!(client_process.initialize_handle_table(), 0);
         let client_process = Arc::new(Mutex::new(client_process));
 
-        let client_thread = Arc::new(Mutex::new(crate::hle::kernel::k_thread::KThread::new()));
+        let client_thread = Arc::new(KThreadLock::new(crate::hle::kernel::k_thread::KThread::new()));
         {
             let mut thread = client_thread.lock().unwrap();
             thread.thread_id = 3;
@@ -3336,7 +3337,7 @@ mod tests {
         let invalid_handle = 0x1234u32;
         let server_process = Arc::new(Mutex::new(server_process));
 
-        let server_thread = Arc::new(Mutex::new(crate::hle::kernel::k_thread::KThread::new()));
+        let server_thread = Arc::new(KThreadLock::new(crate::hle::kernel::k_thread::KThread::new()));
         {
             let mut thread = server_thread.lock().unwrap();
             thread.thread_id = 5;
@@ -3583,7 +3584,7 @@ mod tests {
         client_process.process_id = 7;
         let client_process = Arc::new(Mutex::new(client_process));
 
-        let client_thread = Arc::new(Mutex::new(crate::hle::kernel::k_thread::KThread::new()));
+        let client_thread = Arc::new(KThreadLock::new(crate::hle::kernel::k_thread::KThread::new()));
         {
             let mut thread = client_thread.lock().unwrap();
             thread.thread_id = 3;
@@ -3600,7 +3601,7 @@ mod tests {
         server_process.process_id = 8;
         let server_process = Arc::new(Mutex::new(server_process));
 
-        let server_thread = Arc::new(Mutex::new(crate::hle::kernel::k_thread::KThread::new()));
+        let server_thread = Arc::new(KThreadLock::new(crate::hle::kernel::k_thread::KThread::new()));
         {
             let mut thread = server_thread.lock().unwrap();
             thread.thread_id = 5;
@@ -3661,7 +3662,7 @@ mod tests {
         client_process.process_id = 7;
         let client_process = Arc::new(Mutex::new(client_process));
 
-        let client_thread = Arc::new(Mutex::new(crate::hle::kernel::k_thread::KThread::new()));
+        let client_thread = Arc::new(KThreadLock::new(crate::hle::kernel::k_thread::KThread::new()));
         {
             let mut thread = client_thread.lock().unwrap();
             thread.thread_id = 3;
@@ -3679,7 +3680,7 @@ mod tests {
         server_process.process_id = 8;
         let server_process = Arc::new(Mutex::new(server_process));
 
-        let server_thread = Arc::new(Mutex::new(crate::hle::kernel::k_thread::KThread::new()));
+        let server_thread = Arc::new(KThreadLock::new(crate::hle::kernel::k_thread::KThread::new()));
         {
             let mut thread = server_thread.lock().unwrap();
             thread.thread_id = 5;
@@ -3732,7 +3733,7 @@ mod tests {
         client_process.process_id = 7;
         let client_process = Arc::new(Mutex::new(client_process));
 
-        let client_thread = Arc::new(Mutex::new(crate::hle::kernel::k_thread::KThread::new()));
+        let client_thread = Arc::new(KThreadLock::new(crate::hle::kernel::k_thread::KThread::new()));
         {
             let mut thread = client_thread.lock().unwrap();
             thread.thread_id = 3;
@@ -3749,7 +3750,7 @@ mod tests {
         server_process.process_id = 8;
         let server_process = Arc::new(Mutex::new(server_process));
 
-        let server_thread = Arc::new(Mutex::new(crate::hle::kernel::k_thread::KThread::new()));
+        let server_thread = Arc::new(KThreadLock::new(crate::hle::kernel::k_thread::KThread::new()));
         {
             let mut thread = server_thread.lock().unwrap();
             thread.thread_id = 5;
@@ -3821,7 +3822,7 @@ mod tests {
         let move_handle = client_process.handle_table.add(0xABCD).unwrap();
         let client_process = Arc::new(Mutex::new(client_process));
 
-        let client_thread = Arc::new(Mutex::new(crate::hle::kernel::k_thread::KThread::new()));
+        let client_thread = Arc::new(KThreadLock::new(crate::hle::kernel::k_thread::KThread::new()));
         {
             let mut thread = client_thread.lock().unwrap();
             thread.thread_id = 3;
@@ -3838,7 +3839,7 @@ mod tests {
         server_process.process_id = 8;
         let server_process = Arc::new(Mutex::new(server_process));
 
-        let server_thread = Arc::new(Mutex::new(crate::hle::kernel::k_thread::KThread::new()));
+        let server_thread = Arc::new(KThreadLock::new(crate::hle::kernel::k_thread::KThread::new()));
         {
             let mut thread = server_thread.lock().unwrap();
             thread.thread_id = 5;
@@ -3909,7 +3910,7 @@ mod tests {
         let invalid_handle = 0x1234u32;
         let client_process = Arc::new(Mutex::new(client_process));
 
-        let client_thread = Arc::new(Mutex::new(crate::hle::kernel::k_thread::KThread::new()));
+        let client_thread = Arc::new(KThreadLock::new(crate::hle::kernel::k_thread::KThread::new()));
         {
             let mut thread = client_thread.lock().unwrap();
             thread.thread_id = 3;
@@ -3927,7 +3928,7 @@ mod tests {
         assert_eq!(server_process.initialize_handle_table(), 0);
         let server_process = Arc::new(Mutex::new(server_process));
 
-        let server_thread = Arc::new(Mutex::new(crate::hle::kernel::k_thread::KThread::new()));
+        let server_thread = Arc::new(KThreadLock::new(crate::hle::kernel::k_thread::KThread::new()));
         {
             let mut thread = server_thread.lock().unwrap();
             thread.thread_id = 5;
@@ -4004,7 +4005,7 @@ mod tests {
         let move_handle = client_process.handle_table.add(0xABCD).unwrap();
         let client_process = Arc::new(Mutex::new(client_process));
 
-        let client_thread = Arc::new(Mutex::new(crate::hle::kernel::k_thread::KThread::new()));
+        let client_thread = Arc::new(KThreadLock::new(crate::hle::kernel::k_thread::KThread::new()));
         {
             let mut thread = client_thread.lock().unwrap();
             thread.thread_id = 3;
@@ -4021,7 +4022,7 @@ mod tests {
         server_process.process_id = 8;
         let server_process = Arc::new(Mutex::new(server_process));
 
-        let server_thread = Arc::new(Mutex::new(crate::hle::kernel::k_thread::KThread::new()));
+        let server_thread = Arc::new(KThreadLock::new(crate::hle::kernel::k_thread::KThread::new()));
         {
             let mut thread = server_thread.lock().unwrap();
             thread.thread_id = 5;
@@ -4130,7 +4131,7 @@ mod tests {
         let invalid_handle = 0x1234u32;
         let client_process = Arc::new(Mutex::new(client_process));
 
-        let client_thread = Arc::new(Mutex::new(crate::hle::kernel::k_thread::KThread::new()));
+        let client_thread = Arc::new(KThreadLock::new(crate::hle::kernel::k_thread::KThread::new()));
         {
             let mut thread = client_thread.lock().unwrap();
             thread.thread_id = 3;
@@ -4148,7 +4149,7 @@ mod tests {
         assert_eq!(server_process.initialize_handle_table(), 0);
         let server_process = Arc::new(Mutex::new(server_process));
 
-        let server_thread = Arc::new(Mutex::new(crate::hle::kernel::k_thread::KThread::new()));
+        let server_thread = Arc::new(KThreadLock::new(crate::hle::kernel::k_thread::KThread::new()));
         {
             let mut thread = server_thread.lock().unwrap();
             thread.thread_id = 5;
@@ -4249,7 +4250,7 @@ mod tests {
         assert_eq!(client_process.initialize_handle_table(), 0);
         let client_process = Arc::new(Mutex::new(client_process));
 
-        let client_thread = Arc::new(Mutex::new(crate::hle::kernel::k_thread::KThread::new()));
+        let client_thread = Arc::new(KThreadLock::new(crate::hle::kernel::k_thread::KThread::new()));
         {
             let mut thread = client_thread.lock().unwrap();
             thread.thread_id = 3;
@@ -4270,7 +4271,7 @@ mod tests {
         let invalid_handle = 0x1234u32;
         let server_process = Arc::new(Mutex::new(server_process));
 
-        let server_thread = Arc::new(Mutex::new(crate::hle::kernel::k_thread::KThread::new()));
+        let server_thread = Arc::new(KThreadLock::new(crate::hle::kernel::k_thread::KThread::new()));
         {
             let mut thread = server_thread.lock().unwrap();
             thread.thread_id = 5;

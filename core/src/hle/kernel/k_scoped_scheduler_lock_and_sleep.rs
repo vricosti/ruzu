@@ -120,7 +120,7 @@ mod tests {
     #[test]
     fn test_cancel_sleep() {
         let lock = KAbstractSchedulerLock::new();
-        let thread = Arc::new(Mutex::new(KThread::new()));
+        let thread = Arc::new(KThreadLock::new(KThread::new()));
         let thread_ptr = {
             let mut thread = thread.lock().unwrap();
             (&mut *thread) as *mut KThread as usize

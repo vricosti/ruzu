@@ -210,7 +210,7 @@ mod tests {
         let scheduler = Arc::new(Mutex::new(KScheduler::new(0)));
         scheduler.lock().unwrap().set_scheduler_current_thread_id(1);
 
-        let current_thread = Arc::new(Mutex::new(KThread::new()));
+        let current_thread = Arc::new(KThreadLock::new(KThread::new()));
         {
             let mut thread = current_thread.lock().unwrap();
             thread.thread_id = 1;

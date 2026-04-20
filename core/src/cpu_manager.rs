@@ -13,6 +13,7 @@ use common::thread::Barrier;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use crate::hle::kernel::k_process::ProcessLock;
+use crate::hle::kernel::k_thread::KThreadLock;
 
 /// Per-core data held by the CPU manager.
 /// Matches upstream `CpuManager::CoreData`.
@@ -504,7 +505,7 @@ impl CpuManager {
     fn run_guest_thread_once(
         kernel: &KernelCore,
         physical_core: &super::hle::kernel::physical_core::PhysicalCore,
-        thread_arc: &Arc<Mutex<super::hle::kernel::k_thread::KThread>>,
+        thread_arc: &Arc<KThreadLock>,
         is_64bit: bool,
         cached_jits: &[Option<*mut Box<dyn crate::arm::arm_interface::ArmInterface>>;
              hardware_properties::NUM_CPU_CORES as usize],
@@ -526,7 +527,7 @@ impl CpuManager {
 
         // Safety: The JIT is owned by the process which lives as long as the thread.
         // We hold the raw pointer only for the duration of this call.
-        // The thread_arc Mutex<KThread> is cast to OpaqueKThread for the JIT interface.
+        // The thread_arc KThreadLock is cast to OpaqueKThread for the JIT interface.
         let thread_ptr = {
             let mut t = thread_arc.lock().unwrap();
             &mut *t as *mut super::hle::kernel::k_thread::KThread

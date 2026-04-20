@@ -14,6 +14,7 @@ use common::fiber::Fiber;
 use super::k_priority_queue::KPriorityQueue;
 use super::k_process::KProcess;
 use super::k_thread::KThread;
+use super::k_thread::KThreadLock;
 use super::k_thread::ThreadState;
 use super::k_process::ProcessLock;
 
@@ -51,7 +52,7 @@ mod tests {
 
     #[test]
     fn thread_context_guard_stays_locked_until_explicit_unlock() {
-        let thread = Arc::new(Mutex::new(KThread::new()));
+        let thread = Arc::new(KThreadLock::new(KThread::new()));
 
         assert!(KScheduler::try_lock_thread_context(&thread));
         assert!(thread.lock().unwrap().context_guard.try_lock().is_none());
@@ -62,7 +63,7 @@ mod tests {
 
     #[test]
     fn schedule_impl_fiber_keeps_idle_handoff_when_highest_is_none() {
-        let current_thread = Arc::new(Mutex::new(KThread::new()));
+        let current_thread = Arc::new(KThreadLock::new(KThread::new()));
         current_thread.lock().unwrap().thread_id = 42;
 
         let mut scheduler = KScheduler::new(0);
@@ -80,10 +81,10 @@ mod tests {
 
     #[test]
     fn switch_thread_impl_uses_idle_thread_without_gsc_membership() {
-        let current_thread = Arc::new(Mutex::new(KThread::new()));
+        let current_thread = Arc::new(KThreadLock::new(KThread::new()));
         current_thread.lock().unwrap().thread_id = 42;
 
-        let idle_thread = Arc::new(Mutex::new(KThread::new()));
+        let idle_thread = Arc::new(KThreadLock::new(KThread::new()));
         idle_thread.lock().unwrap().thread_id = 7;
 
         let mut scheduler = KScheduler::new(0);
@@ -141,7 +142,7 @@ mod tests {
         let process = Arc::new(ProcessLock::from_value(KProcess::new()));
         let scheduler = KScheduler::new(0);
 
-        let local = Arc::new(Mutex::new(KThread::new()));
+        let local = Arc::new(KThreadLock::new(KThread::new()));
         {
             let mut guard = local.lock().unwrap();
             guard.thread_id = 17;
@@ -152,7 +153,7 @@ mod tests {
             guard.set_state(ThreadState::RUNNABLE);
         }
 
-        let foreign = Arc::new(Mutex::new(KThread::new()));
+        let foreign = Arc::new(KThreadLock::new(KThread::new()));
         {
             let mut guard = foreign.lock().unwrap();
             guard.thread_id = 2;
@@ -175,7 +176,7 @@ mod tests {
     #[test]
     fn enable_scheduling_defers_switch_for_nested_non_runnable_current_thread() {
         let scheduler = Arc::new(Mutex::new(KScheduler::new(0)));
-        let current_thread = Arc::new(Mutex::new(KThread::new()));
+        let current_thread = Arc::new(KThreadLock::new(KThread::new()));
         {
             let mut thread = current_thread.lock().unwrap();
             thread.thread_id = 99;
@@ -206,9 +207,9 @@ pub struct KScheduler {
     pub core_id: i32,
     pub last_context_switch_time: i64,
     pub idle_thread_id: Option<u64>,
-    pub idle_thread: Option<Weak<Mutex<KThread>>>,
+    pub idle_thread: Option<Weak<KThreadLock>>,
     pub current_thread_id: Option<u64>,
-    pub current_thread: Option<Weak<Mutex<KThread>>>,
+    pub current_thread: Option<Weak<KThreadLock>>,
     pub yielded_thread_id: Option<u64>,
 
     // Kernel references — upstream stores KernelCore& m_kernel
@@ -220,13 +221,13 @@ pub struct KScheduler {
     // Fiber fields for host-thread switching
     /// Upstream: `std::shared_ptr<Common::Fiber> m_switch_fiber`
     pub switch_fiber: Option<Arc<Fiber>>,
-    pub switch_cur_thread: Option<Weak<Mutex<KThread>>>,
-    pub switch_highest_priority_thread: Option<Weak<Mutex<KThread>>>,
+    pub switch_cur_thread: Option<Weak<KThreadLock>>,
+    pub switch_highest_priority_thread: Option<Weak<KThreadLock>>,
     pub switch_from_schedule: bool,
 }
 
 impl KScheduler {
-    fn resolve_thread_for_switch(&self, next_thread_id: u64) -> Option<Arc<Mutex<KThread>>> {
+    fn resolve_thread_for_switch(&self, next_thread_id: u64) -> Option<Arc<KThreadLock>> {
         if self.idle_thread_id == Some(next_thread_id) {
             if let Some(idle_thread) = self.idle_thread.as_ref().and_then(Weak::upgrade) {
                 return Some(idle_thread);
@@ -238,7 +239,7 @@ impl KScheduler {
             .and_then(|gsc| gsc.lock().unwrap().get_thread_by_thread_id(next_thread_id))
     }
 
-    fn try_lock_thread_context(thread: &Arc<Mutex<KThread>>) -> bool {
+    fn try_lock_thread_context(thread: &Arc<KThreadLock>) -> bool {
         let thread_guard = thread.lock().unwrap();
         let Some(context_guard) = thread_guard.context_guard.try_lock() else {
             return false;
@@ -250,18 +251,18 @@ impl KScheduler {
         true
     }
 
-    fn unlock_thread_context(thread: &Arc<Mutex<KThread>>) {
+    fn unlock_thread_context(thread: &Arc<KThreadLock>) {
         let thread_guard = thread.lock().unwrap();
         unsafe {
             thread_guard.context_guard.force_unlock();
         }
     }
 
-    pub(crate) fn lock_thread_context_for_runtime(thread: &Arc<Mutex<KThread>>) -> bool {
+    pub(crate) fn lock_thread_context_for_runtime(thread: &Arc<KThreadLock>) -> bool {
         Self::try_lock_thread_context(thread)
     }
 
-    pub(crate) fn unlock_thread_context_for_runtime(thread: &Arc<Mutex<KThread>>) {
+    pub(crate) fn unlock_thread_context_for_runtime(thread: &Arc<KThreadLock>) {
         Self::unlock_thread_context(thread);
     }
 
@@ -327,8 +328,8 @@ impl KScheduler {
     /// returns a valid thread with a host context for fiber switching.
     pub fn initialize_with_threads(
         &mut self,
-        main_thread: &Arc<Mutex<KThread>>,
-        idle_thread: &Arc<Mutex<KThread>>,
+        main_thread: &Arc<KThreadLock>,
+        idle_thread: &Arc<KThreadLock>,
         core_id: i32,
     ) {
         self.core_id = core_id;
@@ -372,7 +373,7 @@ impl KScheduler {
 
     /// Get the scheduler's current thread (Arc).
     /// Upstream: `KScheduler::GetSchedulerCurrentThread()`.
-    pub fn get_scheduler_current_thread(&self) -> Option<Arc<Mutex<KThread>>> {
+    pub fn get_scheduler_current_thread(&self) -> Option<Arc<KThreadLock>> {
         self.current_thread.as_ref().and_then(Weak::upgrade)
     }
 
@@ -583,13 +584,13 @@ impl KScheduler {
 
     /// Called when a thread first starts executing on this core.
     /// Matches upstream `KScheduler::OnThreadStart()`.
-    pub fn on_thread_start(&self, current_thread: &Arc<Mutex<KThread>>) {
+    pub fn on_thread_start(&self, current_thread: &Arc<KThreadLock>) {
         current_thread.lock().unwrap().enable_dispatch();
     }
 
     /// Unload a thread's context (save guest state).
     /// Matches upstream `KScheduler::Unload(KThread*)`.
-    pub fn unload(&self, thread: &Arc<Mutex<KThread>>) {
+    pub fn unload(&self, thread: &Arc<KThreadLock>) {
         // Upstream: m_kernel.PhysicalCore(m_core_id).SaveContext(thread)
         if let Some(core) = self.physical_cores.get(self.core_id as usize) {
             core.save_context(&mut thread.lock().unwrap());
@@ -608,7 +609,7 @@ impl KScheduler {
     /// Reload a thread's context (restore guest state).
     /// Matches upstream `KScheduler::Reload(KThread*)`.
     /// Upstream: `m_kernel.PhysicalCore(m_core_id).LoadContext(thread)`.
-    pub fn reload(&self, thread: &Arc<Mutex<KThread>>) {
+    pub fn reload(&self, thread: &Arc<KThreadLock>) {
         // Inline PhysicalCore::LoadContext since the scheduler doesn't hold
         // a reference to the kernel's physical cores.
         let thread_guard = thread.lock().unwrap();
@@ -747,7 +748,7 @@ impl KScheduler {
 
     /// Matches upstream `KScheduler::DisableScheduling(kernel)`.
     /// Increments the current thread's disable_dispatch_count.
-    pub fn disable_scheduling(current_thread: &Arc<Mutex<KThread>>) {
+    pub fn disable_scheduling(current_thread: &Arc<KThreadLock>) {
         let mut t = current_thread.lock().unwrap();
         debug_assert!(t.get_disable_dispatch_count() >= 0);
         t.disable_dispatch();
@@ -1184,7 +1185,7 @@ impl KScheduler {
         self.state.needs_scheduling.store(false, Ordering::Relaxed);
     }
 
-    pub fn set_scheduler_current_thread(&mut self, thread: &Arc<Mutex<KThread>>) {
+    pub fn set_scheduler_current_thread(&mut self, thread: &Arc<KThreadLock>) {
         let thread_id = thread.lock().unwrap().get_thread_id();
         self.current_thread_id = Some(thread_id);
         self.current_thread = Some(Arc::downgrade(thread));
@@ -1758,7 +1759,7 @@ impl KScheduler {
 
     /// Matches upstream `KScheduler::Unload(KThread*)`.
     /// Saves guest context and unlocks the thread's context guard.
-    pub fn unload_thread(&self, thread: &Arc<Mutex<KThread>>) {
+    pub fn unload_thread(&self, thread: &Arc<KThreadLock>) {
         // Upstream: m_kernel.PhysicalCore(m_core_id).SaveContext(thread)
         if let Some(core) = self.physical_cores.get(self.core_id as usize) {
             core.save_context(&mut thread.lock().unwrap());
@@ -1776,7 +1777,7 @@ impl KScheduler {
 
     /// Matches upstream `KScheduler::Reload(KThread*)`.
     /// Restores guest context.
-    pub fn reload_thread(&self, thread: &Arc<Mutex<KThread>>) {
+    pub fn reload_thread(&self, thread: &Arc<KThreadLock>) {
         // Upstream: m_kernel.PhysicalCore(m_core_id).LoadContext(thread)
         if let Some(core) = self.physical_cores.get(self.core_id as usize) {
             core.load_context(&thread.lock().unwrap());
@@ -1787,7 +1788,7 @@ impl KScheduler {
         &mut self,
         process: &Arc<ProcessLock>,
         current_thread_id: u64,
-    ) -> Option<Arc<Mutex<KThread>>> {
+    ) -> Option<Arc<KThreadLock>> {
         if self.exit_thread_if_termination_requested(process, current_thread_id) {
             self.request_schedule();
         }

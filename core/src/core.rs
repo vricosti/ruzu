@@ -17,7 +17,7 @@ use crate::gpu_dirty_memory_manager::GpuDirtyMemoryManager;
 use crate::hardware_properties;
 use crate::hle::kernel::k_process::SharedProcessMemory;
 use crate::hle::kernel::k_scheduler::KScheduler;
-use crate::hle::kernel::k_thread::KThread;
+use crate::hle::kernel::k_thread::{KThread, KThreadLock};
 use crate::hle::kernel::kernel::KernelCore;
 use crate::hle::service::am::am_types::{AppletId, AppletType};
 use crate::hle::service::am::applet_manager::{
@@ -1629,7 +1629,7 @@ impl System {
     /// past the GPU barrier. This ensures exclusive access to kernel state.
     pub fn register_application_thread(
         &self,
-        main_thread: Arc<StdMutex<crate::hle::kernel::k_thread::KThread>>,
+        main_thread: Arc<KThreadLock>,
     ) {
         let thread_id = main_thread.lock().unwrap().get_thread_id();
         log::info!(
@@ -1842,7 +1842,7 @@ impl System {
 
     /// Get the current thread Arc.
     /// Matches upstream `GetCurrentThread(kernel)`.
-    pub fn current_thread(&self) -> Option<Arc<StdMutex<KThread>>> {
+    pub fn current_thread(&self) -> Option<Arc<KThreadLock>> {
         crate::hle::kernel::kernel::get_current_thread_pointer()
     }
 

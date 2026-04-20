@@ -36,6 +36,20 @@ use crate::hle::result::RESULT_SUCCESS;
 use common::tree::RBEntry;
 use super::k_process::ProcessLock;
 
+// Step 5b of the upstream-faithful sync refactor: KThread storage moves
+// from `Arc<KThreadLock>` to `Arc<KThreadLock>` where
+// `KThreadLock = SyncCell<KThread>` (UnsafeCell + scheduler-spin-lock
+// contract). The type alias name `KThreadLock` lets every
+// `Arc<KThreadLock>` field/parameter declaration compile in place of the
+// previous `Arc<KThreadLock>`.
+//
+// `SyncCell::lock` / `try_lock` / `lock_with` / `from_value` are
+// API-compatible shims with `Mutex<T>` (see sync_cell.rs); they return
+// guards that deref to `&mut KThread` without doing any real locking —
+// serialization is the scheduler spin-lock's job. Mirrors step 5a's
+// ProcessLock swap: `pub type ProcessLock = SyncCell<KProcess>`.
+pub type KThreadLock = super::sync_cell::KThreadCell;
+
 pub(crate) fn deadline_from_timeout_tick(timeout_tick: i64, current_tick: Option<i64>) -> Option<Instant> {
     if timeout_tick <= 0 {
         return None;
@@ -445,7 +459,7 @@ pub struct WaitingLockRef {
     pub is_kernel_address_key: bool,
     /// Raw pointer to the owner `KThread`. Matches upstream's `KThread*`.
     /// Valid while this wait is active: the owner is kept alive by the
-    /// parent process's thread list, and `Mutex<KThread>` never relocates
+    /// parent process's thread list, and `KThreadLock` never relocates
     /// its inner value. Used by `cancel_wait` paths running under the
     /// scheduler lock, where upstream dereferences the `KThread*` directly
     /// without any per-object mutex. 0 means "no pointer available".
@@ -464,7 +478,7 @@ pub struct WaitingLockRef {
 pub struct KThread {
     // -- Core KThread fields --
     pub object_id: u64,
-    pub self_reference: Option<Weak<Mutex<KThread>>>,
+    pub self_reference: Option<Weak<KThreadLock>>,
     pub thread_context: ThreadContext,
     pub condvar_arbiter_tree_node: RBEntry,
     pub priority: i32,
@@ -704,7 +718,7 @@ impl KThread {
         self.object_id
     }
 
-    pub fn bind_self_reference(&mut self, thread: &Arc<Mutex<KThread>>) {
+    pub fn bind_self_reference(&mut self, thread: &Arc<KThreadLock>) {
         self.self_reference = Some(Arc::downgrade(thread));
     }
 
@@ -1917,7 +1931,7 @@ impl KThread {
     pub fn initialize_service_thread(
         &mut self,
         system: SystemRef,
-        thread_ref: &Arc<Mutex<KThread>>,
+        thread_ref: &Arc<KThreadLock>,
         func: Box<dyn FnOnce() + Send>,
         priority: i32,
         core: i32,
@@ -2139,7 +2153,7 @@ impl KThread {
     /// an outer object mutex. Keep the Rust runtime path as close as possible by
     /// taking the thread lock only for the actual state mutation, then dropping
     /// it before `KScopedSchedulerLock` unwinds.
-    pub fn run_thread(thread: &Arc<Mutex<KThread>>) -> u32 {
+    pub fn run_thread(thread: &Arc<KThreadLock>) -> u32 {
         loop {
             let scheduler_lock_ptr = {
                 let thread = thread.lock().unwrap();
@@ -2304,7 +2318,7 @@ impl KThread {
         }
 
         // Upstream: this->Close() — decrements reference count.
-        // Reference counting is not yet implemented; the Arc<Mutex<KThread>>
+        // Reference counting is not yet implemented; the Arc<KThreadLock>
         // will be dropped when all references are released.
     }
 
@@ -2403,7 +2417,7 @@ impl KThread {
     ///
     /// Our `&mut self` variant cannot block safely because callers commonly
     /// hold the thread mutex while invoking it. Use `terminate_thread()` when
-    /// a caller owns `Arc<Mutex<KThread>>` and needs upstream-style waiting.
+    /// a caller owns `Arc<KThreadLock>` and needs upstream-style waiting.
     pub fn terminate(&mut self) -> u32 {
         // Request termination.
         let new_state = self.request_terminate();
@@ -2434,7 +2448,7 @@ impl KThread {
     ///
     /// This variant can safely wait for `FinishTermination()` because it drops
     /// the thread mutex before blocking on the termination condition variable.
-    pub fn terminate_thread(thread: &Arc<Mutex<KThread>>) -> u32 {
+    pub fn terminate_thread(thread: &Arc<KThreadLock>) -> u32 {
         let wait_pair = {
             let mut guard = thread.lock().unwrap();
             let new_state = guard.request_terminate();
@@ -3316,7 +3330,7 @@ impl KThread {
 
     /// Get the lock owner thread.
     /// Matches upstream `KThread::GetLockOwner()` (k_thread.cpp:732-734).
-    pub fn get_lock_owner(&self) -> Option<Arc<Mutex<KThread>>> {
+    pub fn get_lock_owner(&self) -> Option<Arc<KThreadLock>> {
         let lock_ref = self.waiting_lock_info.as_ref()?;
         let parent = self.parent.as_ref()?.upgrade()?;
         let process = parent.lock().unwrap();
@@ -3402,14 +3416,14 @@ impl Default for KThread {
 /// (or RescheduleCurrentHLEThread for phantom/single-core mode).
 /// Otherwise just decrements.
 pub struct KScopedDisableDispatch {
-    thread: Arc<Mutex<KThread>>,
+    thread: Arc<KThreadLock>,
 }
 
 impl KScopedDisableDispatch {
     /// Create a new scoped disable dispatch guard.
     /// Upstream takes `KernelCore&` and uses `GetCurrentThread(kernel)`.
     /// We take the thread directly.
-    pub fn new(thread: &Arc<Mutex<KThread>>) -> Self {
+    pub fn new(thread: &Arc<KThreadLock>) -> Self {
         thread.lock().unwrap().disable_dispatch();
         Self {
             thread: thread.clone(),
@@ -3572,7 +3586,7 @@ mod tests {
     #[test]
     fn test_run_thread_marks_thread_runnable_and_increments_parent_running_count() {
         let process = Arc::new(ProcessLock::from_value(KProcess::new()));
-        let thread = Arc::new(Mutex::new(KThread::new()));
+        let thread = Arc::new(KThreadLock::new(KThread::new()));
         {
             let mut thread_guard = thread.lock().unwrap();
             thread_guard.parent = Some(Arc::downgrade(&process));
@@ -3716,7 +3730,7 @@ mod tests {
             process_guard.global_scheduler_context = Some(gsc.clone());
         }
 
-        let thread = Arc::new(Mutex::new(KThread::new()));
+        let thread = Arc::new(KThreadLock::new(KThread::new()));
         {
             let mut thread_guard = thread.lock().unwrap();
             thread_guard.initialize_service_thread(
@@ -3795,7 +3809,7 @@ mod tests {
     #[test]
     fn test_finalize_unregisters_thread_object_from_owner_process() {
         let process = Arc::new(ProcessLock::from_value(KProcess::new()));
-        let thread = Arc::new(Mutex::new(KThread::new()));
+        let thread = Arc::new(KThreadLock::new(KThread::new()));
 
         {
             let mut guard = thread.lock().unwrap();
@@ -3821,7 +3835,7 @@ mod tests {
         use std::thread;
         use std::time::Duration;
 
-        let target = Arc::new(Mutex::new(KThread::new()));
+        let target = Arc::new(KThreadLock::new(KThread::new()));
         {
             let mut guard = target.lock().unwrap();
             guard.object_id = 44;

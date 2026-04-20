@@ -13,7 +13,7 @@ use crate::hardware_properties;
 
 use super::k_priority_queue::KPriorityQueue;
 use super::k_scheduler_lock::KAbstractSchedulerLock;
-use super::k_thread::{KThread, ThreadState, ThreadType};
+use super::k_thread::{KThread, KThreadLock, ThreadState, ThreadType};
 
 static TRACE_GSC_STATE_COUNT: AtomicUsize = AtomicUsize::new(0);
 
@@ -59,7 +59,7 @@ pub struct GlobalSchedulerContext {
     /// without locking it. Keep the Rust owner keyed by `thread_id` so lookup
     /// does not relock arbitrary thread mutexes while the scheduler lock is
     /// unwinding.
-    m_thread_list: Mutex<Vec<(u64, Arc<Mutex<KThread>>)>>,
+    m_thread_list: Mutex<Vec<(u64, Arc<KThreadLock>)>>,
 }
 
 impl GlobalSchedulerContext {
@@ -75,7 +75,7 @@ impl GlobalSchedulerContext {
 
     // -- Thread list management --
 
-    pub fn add_thread(&self, thread: Arc<Mutex<KThread>>) {
+    pub fn add_thread(&self, thread: Arc<KThreadLock>) {
         // Matches upstream intrusive ownership: the thread list must never
         // silently accept an invalid identifier. Callers that already hold the
         // thread mutex must use add_thread_with_id() to avoid re-locking.
@@ -84,7 +84,7 @@ impl GlobalSchedulerContext {
     }
 
     /// Add a thread when the thread_id is already known (avoids re-locking).
-    pub fn add_thread_with_id(&self, thread_id: u64, thread: Arc<Mutex<KThread>>) {
+    pub fn add_thread_with_id(&self, thread_id: u64, thread: Arc<KThreadLock>) {
         self.m_thread_list.lock().unwrap().push((thread_id, thread));
     }
 
@@ -95,7 +95,7 @@ impl GlobalSchedulerContext {
             .retain(|(id, _)| *id != thread_id);
     }
 
-    pub fn get_thread_list(&self) -> Vec<Arc<Mutex<KThread>>> {
+    pub fn get_thread_list(&self) -> Vec<Arc<KThreadLock>> {
         self.m_thread_list
             .lock()
             .unwrap()
@@ -104,7 +104,7 @@ impl GlobalSchedulerContext {
             .collect()
     }
 
-    pub fn get_thread_by_thread_id(&self, thread_id: u64) -> Option<Arc<Mutex<KThread>>> {
+    pub fn get_thread_by_thread_id(&self, thread_id: u64) -> Option<Arc<KThreadLock>> {
         self.m_thread_list
             .lock()
             .unwrap()
@@ -444,7 +444,7 @@ mod tests {
     #[test]
     fn get_thread_by_thread_id_does_not_need_thread_mutex() {
         let gsc = GlobalSchedulerContext::new();
-        let thread = Arc::new(Mutex::new(KThread::new()));
+        let thread = Arc::new(KThreadLock::new(KThread::new()));
         thread.lock().unwrap().thread_id = 0x1234;
         gsc.add_thread(Arc::clone(&thread));
 

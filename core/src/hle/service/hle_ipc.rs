@@ -23,6 +23,7 @@ thread_local! {
         RefCell::new((String::new(), 0, 0));
 }
 use crate::hle::kernel::k_readable_event::KReadableEvent;
+use crate::hle::kernel::k_thread::KThreadLock;
 
 /// Reference to a kernel object for IPC handle translation.
 ///
@@ -397,7 +398,7 @@ pub struct HLERequestContext {
     pub cmd_buf: [u32; ipc::COMMAND_BUFFER_LENGTH],
 
     /// The requesting thread. Matches upstream `KThread* thread`.
-    thread: Option<Arc<std::sync::Mutex<crate::hle::kernel::k_thread::KThread>>>,
+    thread: Option<Arc<KThreadLock>>,
     /// Guest memory bridge. Matches upstream `Core::Memory::Memory& memory`.
     memory: Option<Arc<std::sync::Mutex<crate::memory::memory::Memory>>>,
     /// TLS address for command buffer read/write.
@@ -441,7 +442,7 @@ pub struct HLERequestContext {
 
 impl HLERequestContext {
     fn owner_process_memory(
-        thread: &Arc<std::sync::Mutex<crate::hle::kernel::k_thread::KThread>>,
+        thread: &Arc<KThreadLock>,
     ) -> Option<Arc<std::sync::Mutex<crate::memory::memory::Memory>>> {
         let parent = {
             let thread_guard = thread.lock().unwrap();
@@ -456,7 +457,7 @@ impl HLERequestContext {
     ///
     /// Upstream: `HLERequestContext(KernelCore&, Memory&, KServerSession*, KThread*)`
     pub fn new_with_thread(
-        thread: Arc<std::sync::Mutex<crate::hle::kernel::k_thread::KThread>>,
+        thread: Arc<KThreadLock>,
         tls_address: u64,
     ) -> Self {
         let memory = Self::owner_process_memory(&thread);
@@ -537,7 +538,7 @@ impl HLERequestContext {
     /// Matches upstream ownership where `HLERequestContext` carries `KThread* thread`.
     pub fn get_thread(
         &self,
-    ) -> Option<Arc<std::sync::Mutex<crate::hle::kernel::k_thread::KThread>>> {
+    ) -> Option<Arc<KThreadLock>> {
         self.thread.clone()
     }
 
@@ -1510,7 +1511,7 @@ mod tests {
         let process = Arc::new(ProcessLock::from_value(KProcess::new()));
         process.lock().unwrap().process_id = 0x51;
 
-        let thread = Arc::new(Mutex::new(KThread::new()));
+        let thread = Arc::new(KThreadLock::new(KThread::new()));
         thread.lock().unwrap().parent = Some(Arc::downgrade(&process));
 
         let tls_address = 0x2000;
@@ -1546,7 +1547,7 @@ mod tests {
             .page_table
             .set_memory(memory.clone());
 
-        let thread = Arc::new(Mutex::new(KThread::new()));
+        let thread = Arc::new(KThreadLock::new(KThread::new()));
         thread.lock().unwrap().parent = Some(Arc::downgrade(&process));
 
         let ctx = HLERequestContext::new_with_thread(thread, 0x2000);
@@ -1576,7 +1577,7 @@ mod tests {
 
         memory.lock().unwrap().write_8(0x3000, 0x7a);
 
-        let thread = Arc::new(Mutex::new(KThread::new()));
+        let thread = Arc::new(KThreadLock::new(KThread::new()));
         thread.lock().unwrap().parent = Some(Arc::downgrade(&process));
 
         let ctx = HLERequestContext::new_with_thread(thread, 0x2000);
@@ -1609,7 +1610,7 @@ mod tests {
             .unwrap()
             .write_32(tls_address + 16, 0xdead_beef);
 
-        let thread = Arc::new(Mutex::new(KThread::new()));
+        let thread = Arc::new(KThreadLock::new(KThread::new()));
         thread.lock().unwrap().parent = Some(Arc::downgrade(&process));
 
         let mut ctx = HLERequestContext::new_with_thread(thread, tls_address);
@@ -1691,7 +1692,7 @@ mod tests {
             .page_table
             .set_memory(memory.clone());
 
-        let thread = Arc::new(Mutex::new(KThread::new()));
+        let thread = Arc::new(KThreadLock::new(KThread::new()));
         thread.lock().unwrap().parent = Some(Arc::downgrade(&process));
 
         let tls_address = 0x3000u64;

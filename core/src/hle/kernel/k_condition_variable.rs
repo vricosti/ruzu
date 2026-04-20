@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 use crate::hle::kernel::k_process::KProcess;
 use crate::hle::kernel::k_scheduler::KScheduler;
 use crate::hle::kernel::k_thread::{
-    ConditionVariableThreadKey, KThread, ThreadWaitReasonForDebugging,
+    ConditionVariableThreadKey, KThread, KThreadLock, ThreadWaitReasonForDebugging,
 };
 use crate::hle::kernel::k_thread_queue::KThreadQueue;
 use crate::hle::kernel::k_typed_address::KProcessAddress;
@@ -249,7 +249,7 @@ impl KConditionVariable {
     /// Upstream wraps the body in `KScopedSchedulerLock sl(kernel)`.
     pub fn signal_to_address(
         process: &Arc<ProcessLock>,
-        current_thread: &Arc<Mutex<KThread>>,
+        current_thread: &Arc<KThreadLock>,
         addr: u64,
     ) -> ResultCode {
         let (current_thread_id, scheduler_lock_ptr) = {
@@ -363,7 +363,7 @@ impl KConditionVariable {
 
     pub(crate) fn wait_for_current_thread(
         process: &Arc<ProcessLock>,
-        current_thread: &Arc<Mutex<KThread>>,
+        current_thread: &Arc<KThreadLock>,
     ) {
         let scheduler = super::kernel::get_kernel_ref()
             .and_then(|kernel| kernel.current_scheduler().cloned())
@@ -411,7 +411,7 @@ impl KConditionVariable {
     /// Upstream wraps the body in `KScopedSchedulerLock sl(kernel)`.
     pub fn wait_for_address(
         process: &Arc<ProcessLock>,
-        current_thread: &Arc<Mutex<KThread>>,
+        current_thread: &Arc<KThreadLock>,
         handle: Handle,
         addr: u64,
         value: u32,
@@ -614,7 +614,7 @@ impl KConditionVariable {
     pub fn wait(
         &mut self,
         process: &Arc<ProcessLock>,
-        current_thread: &Arc<Mutex<KThread>>,
+        current_thread: &Arc<KThreadLock>,
         addr: u64,
         key: u64,
         value: u32,
@@ -676,7 +676,7 @@ impl KConditionVariable {
     pub fn wait_locked(
         &mut self,
         process_guard: &mut KProcess,
-        current_thread: &Arc<Mutex<KThread>>,
+        current_thread: &Arc<KThreadLock>,
         addr: u64,
         key: u64,
         value: u32,
@@ -732,7 +732,7 @@ impl KConditionVariable {
     pub(crate) fn wait_locked_after_sleep_guard(
         &mut self,
         process_guard: &mut KProcess,
-        current_thread: &Arc<Mutex<KThread>>,
+        current_thread: &Arc<KThreadLock>,
         addr: u64,
         key: u64,
         value: u32,
@@ -877,7 +877,7 @@ impl KConditionVariable {
     /// Uses UpdateLockAtomic to atomically update the lock tag, then either
     /// wakes the thread (if nobody held the lock) or adds it as a waiter on
     /// the previous lock owner.
-    fn signal_impl(&mut self, process_guard: &mut KProcess, waiting_thread: &Arc<Mutex<KThread>>) {
+    fn signal_impl(&mut self, process_guard: &mut KProcess, waiting_thread: &Arc<KThreadLock>) {
         // Update the tag.
         // Matches upstream: KProcessAddress address = thread->GetAddressKey();
         //                   u32 own_tag = thread->GetAddressKeyValue();
@@ -999,7 +999,7 @@ impl KConditionVariable {
     ///   owner_thread->AddWaiter(cur_thread);
     ///   cur_thread->BeginWait(&wait_queue);
     fn begin_wait_for_address(
-        current_thread: &Arc<Mutex<KThread>>,
+        current_thread: &Arc<KThreadLock>,
         owner_thread_id: u64,
         owner_thread_ptr: usize,
         addr: u64,
@@ -1019,7 +1019,7 @@ impl KConditionVariable {
     ///   m_tree.insert(*cur_thread);
     ///   cur_thread->BeginWait(&wait_queue);
     fn begin_wait_condition_variable(
-        current_thread: &Arc<Mutex<KThread>>,
+        current_thread: &Arc<KThreadLock>,
         wait_queue: KThreadQueue,
         addr: u64,
         key: u64,
@@ -1122,8 +1122,8 @@ mod tests {
 
     fn setup_threads() -> (
         Arc<ProcessLock>,
-        Arc<Mutex<KThread>>,
-        Arc<Mutex<KThread>>,
+        Arc<KThreadLock>,
+        Arc<KThreadLock>,
         Handle,
         u64,
     ) {
@@ -1144,7 +1144,7 @@ mod tests {
             process_guard.allocate_code_memory(0x1000, 0x4000);
         }
 
-        let owner = Arc::new(Mutex::new(KThread::new()));
+        let owner = Arc::new(KThreadLock::new(KThread::new()));
         {
             let mut owner_guard = owner.lock().unwrap();
             owner_guard.object_id = 10;
@@ -1154,7 +1154,7 @@ mod tests {
             owner_guard.set_state(ThreadState::RUNNABLE);
         }
 
-        let waiter = Arc::new(Mutex::new(KThread::new()));
+        let waiter = Arc::new(KThreadLock::new(KThread::new()));
         {
             let mut waiter_guard = waiter.lock().unwrap();
             waiter_guard.object_id = 11;
@@ -1443,7 +1443,7 @@ mod tests {
             process_guard.allocate_code_memory(0x1000, 0x4000);
         }
 
-        let waiter_a = Arc::new(Mutex::new(KThread::new()));
+        let waiter_a = Arc::new(KThreadLock::new(KThread::new()));
         {
             let mut waiter_a_guard = waiter_a.lock().unwrap();
             waiter_a_guard.object_id = 11;
@@ -1454,7 +1454,7 @@ mod tests {
             waiter_a_guard.set_base_priority(20);
         }
 
-        let waiter_b = Arc::new(Mutex::new(KThread::new()));
+        let waiter_b = Arc::new(KThreadLock::new(KThread::new()));
         {
             let mut waiter_b_guard = waiter_b.lock().unwrap();
             waiter_b_guard.object_id = 12;

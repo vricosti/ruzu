@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use super::k_hardware_timer_base::KHardwareTimerBase;
 use super::k_scheduler_lock::KScopedSchedulerLock;
-use super::k_thread::KThread;
+use super::k_thread::{KThread, KThreadLock};
 use crate::core_timing::{self, CoreTiming, EventType, UnscheduleEventType};
 
 /// The kernel hardware timer.
@@ -41,7 +41,7 @@ pub struct KHardwareTimer {
 }
 
 enum TimerTaskTarget {
-    ThreadArc(Arc<Mutex<KThread>>),
+    ThreadArc(Arc<KThreadLock>),
     RawPtr(usize),
 }
 
@@ -143,8 +143,8 @@ impl KHardwareTimer {
     ///
     /// Matches upstream: `KHardwareTimer::RegisterAbsoluteTask()`
     /// Upstream takes KTimerTask* (which is KThread via inheritance).
-    /// We take thread_id + Weak<Mutex<KThread>> for resolution.
-    pub fn register_absolute_task(&self, thread: &Arc<Mutex<KThread>>, task_time: i64) {
+    /// We take thread_id + Weak<KThreadLock> for resolution.
+    pub fn register_absolute_task(&self, thread: &Arc<KThreadLock>, task_time: i64) {
         let thread_id = {
             let mut thread_guard = thread.lock().unwrap();
             thread_guard.set_timer_task_time(task_time);
@@ -215,7 +215,7 @@ impl KHardwareTimer {
 
     /// Cancel a task.
     /// Matches upstream: `KHardwareTimerBase::CancelTask()`
-    pub fn cancel_task(&self, thread: &Arc<Mutex<KThread>>) {
+    pub fn cancel_task(&self, thread: &Arc<KThreadLock>) {
         let (thread_id, task_time) = {
             let thread_guard = thread.lock().unwrap();
             (
@@ -511,7 +511,7 @@ mod tests {
     fn resolve_task_target_falls_back_to_gsc_thread_lookup() {
         let mut timer = KHardwareTimer::new();
         let gsc = Arc::new(Mutex::new(GlobalSchedulerContext::new()));
-        let thread = Arc::new(Mutex::new(KThread::new()));
+        let thread = Arc::new(KThreadLock::new(KThread::new()));
         thread.lock().unwrap().thread_id = 17;
         gsc.lock().unwrap().add_thread(Arc::clone(&thread));
         timer.set_gsc(Arc::downgrade(&gsc));
@@ -530,7 +530,7 @@ mod tests {
         let gsc = Arc::new(Mutex::new(GlobalSchedulerContext::new()));
         let mut core_timing = CoreTiming::new();
         core_timing.set_multicore(true);
-        let thread = Arc::new(Mutex::new(KThread::new()));
+        let thread = Arc::new(KThreadLock::new(KThread::new()));
         {
             let mut guard = thread.lock().unwrap();
             guard.thread_id = 17;
@@ -573,14 +573,14 @@ mod tests {
             state.base.register_absolute_task_impl(2, 20);
         }
 
-        let waiter1 = Arc::new(Mutex::new(KThread::new()));
+        let waiter1 = Arc::new(KThreadLock::new(KThread::new()));
         {
             let mut guard = waiter1.lock().unwrap();
             guard.thread_id = 1;
             guard.begin_wait();
             guard.set_timer_task_time(10);
         }
-        let waiter2 = Arc::new(Mutex::new(KThread::new()));
+        let waiter2 = Arc::new(KThreadLock::new(KThread::new()));
         {
             let mut guard = waiter2.lock().unwrap();
             guard.thread_id = 2;
