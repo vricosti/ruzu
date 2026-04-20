@@ -47,6 +47,20 @@ std::thread_local! {
 static KERNEL_PTR: std::sync::atomic::AtomicPtr<KernelCore> =
     std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
 
+// Raw pointer to the GSC's `m_scheduler_lock` field. Cached at kernel
+// initialization so any site can open a `KScopedSchedulerLock` without
+// depending on a per-thread scheduler_lock_ptr cache.
+//
+// Upstream assumes `KScheduler::GetSchedulerLock(kernel)` is always valid
+// once the kernel is constructed. Ruzu's previous scheme cached the pointer
+// on `KThread::scheduler_lock_ptr`, which is zero until the thread is
+// attached — forcing condvar/arbiter entry points to silently no-op the
+// scheduler lock. Cache it on the kernel singleton so the "always valid"
+// assumption actually holds.
+static SCHEDULER_LOCK_PTR:
+    std::sync::atomic::AtomicPtr<super::k_scheduler_lock::KAbstractSchedulerLock> =
+    std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
+
 /// Deferred `KThread::SetActiveCore()` updates that could not be applied
 /// immediately because the target thread mutex was still held.
 ///
@@ -60,6 +74,21 @@ static PENDING_ACTIVE_CORE_UPDATES: Mutex<Vec<(u64, i32)>> = Mutex::new(Vec::new
 /// Public accessor for KERNEL_PTR — used by GSC to interrupt cores on thread state changes.
 pub fn get_kernel_ref() -> Option<&'static KernelCore> {
     let ptr = KERNEL_PTR.load(Ordering::Acquire);
+    if ptr.is_null() {
+        None
+    } else {
+        Some(unsafe { &*ptr })
+    }
+}
+
+/// Returns the kernel's global `KAbstractSchedulerLock`, if the kernel has
+/// been initialized. Matches upstream `KScheduler::GetSchedulerLock(kernel)`.
+///
+/// Safe to call from any site (SVC handlers, HLE threads, hardware timer
+/// callbacks). Returns `None` only before `KernelCore::initialize()` has
+/// run — i.e., unit-test harness entry paths before a kernel exists.
+pub fn scheduler_lock() -> Option<&'static super::k_scheduler_lock::KAbstractSchedulerLock> {
+    let ptr = SCHEDULER_LOCK_PTR.load(Ordering::Acquire);
     if ptr.is_null() {
         None
     } else {
@@ -877,6 +906,18 @@ impl KernelCore {
 
         self.global_object_list_container = Some(KAutoObjectWithListContainer::new());
         self.global_scheduler_context = Some(Arc::new(Mutex::new(GlobalSchedulerContext::new())));
+
+        // Cache the GSC's `m_scheduler_lock` raw pointer so any site can
+        // acquire `KScopedSchedulerLock` via `kernel::scheduler_lock()`.
+        // The GSC sits behind an Arc held by the kernel for its entire
+        // lifetime — the address of `m_scheduler_lock` is stable.
+        if let Some(ref gsc_arc) = self.global_scheduler_context {
+            let gsc_guard = gsc_arc.lock().unwrap();
+            let sl_ptr = &gsc_guard.m_scheduler_lock
+                as *const super::k_scheduler_lock::KAbstractSchedulerLock
+                as *mut super::k_scheduler_lock::KAbstractSchedulerLock;
+            SCHEDULER_LOCK_PTR.store(sl_ptr, Ordering::Release);
+        }
 
         self.is_phantom_mode_for_singlecore
             .store(false, Ordering::Relaxed);

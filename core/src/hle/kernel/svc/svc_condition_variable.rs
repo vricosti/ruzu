@@ -201,15 +201,11 @@ pub fn signal_process_wide_key(system: &System, cv_key: u64, count: i32) {
 
     // Upstream: Common::AlignDown(cv_key, sizeof(u32))
     let aligned_cv_key = cv_key & !3u64;
-    let scheduler_lock_ptr = system
-        .current_thread()
-        .map(|current_thread| current_thread.lock().unwrap().scheduler_lock_ptr)
-        .unwrap_or(0) as u64;
     system
         .current_process_arc()
         .lock()
         .unwrap()
-        .signal_condition_variable(scheduler_lock_ptr, aligned_cv_key, count);
+        .signal_condition_variable(aligned_cv_key, count);
     log::trace!(
         "svc::SignalProcessWideKey return cv_key=0x{:X}, count={}",
         aligned_cv_key,

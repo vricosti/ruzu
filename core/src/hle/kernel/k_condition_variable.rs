@@ -252,31 +252,19 @@ impl KConditionVariable {
         current_thread: &Arc<KThreadLock>,
         addr: u64,
     ) -> ResultCode {
-        let (current_thread_id, scheduler_lock_ptr) = {
-            let thread = current_thread.lock().unwrap();
-            (thread.get_thread_id(), thread.scheduler_lock_ptr)
-        };
-        let _scheduler_guard = if scheduler_lock_ptr == 0 {
-            None
-        } else {
-            Some(super::k_scheduler_lock::KScopedSchedulerLock::new(unsafe {
-                &*(scheduler_lock_ptr as *const super::k_scheduler_lock::KAbstractSchedulerLock)
-            }))
-        };
+        let current_thread_id = current_thread.lock().unwrap().get_thread_id();
+
+        // Upstream opens `KScopedSchedulerLock sl(kernel)` at entry. The
+        // kernel's scheduler_lock is a singleton — always valid once the
+        // kernel is initialized. No per-thread fallback.
+        let scheduler_lock = super::kernel::scheduler_lock()
+            .expect("scheduler_lock must exist — kernel not initialized?");
+        let _scheduler_guard =
+            super::k_scheduler_lock::KScopedSchedulerLock::new(scheduler_lock);
 
         let mut next_owner_thread = None;
         let result = {
             let mut process_guard = process.lock().unwrap();
-            let _kcv_holder = super::kernel::ProcessLockTracker::new(
-                super::kernel::get_current_thread_pointer()
-                    .and_then(|t| t.lock().ok().map(|g| g.get_thread_id()))
-                    .unwrap_or(0),
-                0x4B43_5631, // 'KCV1' — covers all remaining k_condition_variable process.lock() sites
-            );
-            let _holder_guard = super::kernel::ProcessLockTracker::new(
-                current_thread_id,
-                0x5161_4444, // 'SigA' — signal_to_address
-            );
             let Some(owner_thread) = process_guard.get_thread_by_thread_id(current_thread_id)
             else {
                 return RESULT_INVALID_HANDLE;
@@ -418,90 +406,105 @@ impl KConditionVariable {
     ) -> ResultCode {
         let current_thread_id = current_thread.lock().unwrap().get_thread_id();
 
-        let mut process_guard = process.lock().unwrap();
-        let _holder_guard = super::kernel::ProcessLockTracker::new(
-            current_thread_id,
-            0x5761_4444, // 'WaitA' — wait_for_address
-        );
+        // Upstream's `KScopedSchedulerLock sl(kernel)` scope covers ONLY
+        // the "set up the wait" phase — it drops BEFORE the fiber-wait
+        // begins. Holding it across `wait_for_current_thread` would
+        // deadlock: another thread needs the same scheduler lock to fire
+        // EndWait and wake us.
+        let setup_result: Result<(), ResultCode> = (|| {
+            let scheduler_lock = super::kernel::scheduler_lock()
+                .expect("scheduler_lock must exist — kernel not initialized?");
+            let _scheduler_guard =
+                super::k_scheduler_lock::KScopedSchedulerLock::new(scheduler_lock);
 
-        // Check if the thread should terminate.
-        if current_thread.lock().unwrap().is_termination_requested() {
-            return RESULT_TERMINATION_REQUESTED;
-        }
+            let mut process_guard = process.lock().unwrap();
 
-        // Read the tag from userspace.
-        // Matches upstream: ReadFromUser(kernel, &test_tag, addr)
-        let Some(test_tag) = read_from_user(&process_guard, addr) else {
-            return RESULT_INVALID_CURRENT_MEMORY;
-        };
+            // Check if the thread should terminate.
+            if current_thread.lock().unwrap().is_termination_requested() {
+                return Err(RESULT_TERMINATION_REQUESTED);
+            }
 
-        // If the tag isn't the handle (with wait mask), we're done.
-        // Matches upstream: R_SUCCEED_IF(test_tag != (handle | HandleWaitMask))
-        if test_tag != (handle | HANDLE_WAIT_MASK) {
-            log::trace!(
-                "KConditionVariable::wait_for_address no_wait tid={} handle=0x{:08X} addr=0x{:X} value=0x{:08X} test_tag=0x{:08X}",
-                current_thread_id,
-                handle,
+            // Read the tag from userspace.
+            // Matches upstream: ReadFromUser(kernel, &test_tag, addr)
+            let Some(test_tag) = read_from_user(&process_guard, addr) else {
+                return Err(RESULT_INVALID_CURRENT_MEMORY);
+            };
+
+            // If the tag isn't the handle (with wait mask), we're done.
+            // Matches upstream: R_SUCCEED_IF(test_tag != (handle | HandleWaitMask))
+            if test_tag != (handle | HANDLE_WAIT_MASK) {
+                log::trace!(
+                    "KConditionVariable::wait_for_address no_wait tid={} handle=0x{:08X} addr=0x{:X} value=0x{:08X} test_tag=0x{:08X}",
+                    current_thread_id,
+                    handle,
+                    addr,
+                    value,
+                    test_tag
+                );
+                return Err(RESULT_SUCCESS);
+            }
+
+            // Get the lock owner thread.
+            // Matches upstream: GetCurrentProcess(kernel).GetHandleTable()
+            //                      .GetObjectWithoutPseudoHandle<KThread>(handle)
+            let Some(owner_object_id) = process_guard.handle_table.get_object(handle) else {
+                return Err(RESULT_INVALID_HANDLE);
+            };
+            let Some(owner_thread) = process_guard.get_thread_by_object_id(owner_object_id) else {
+                return Err(RESULT_INVALID_HANDLE);
+            };
+
+            // Update the lock: set address key on current thread and add as waiter.
+            // Matches upstream: cur_thread->SetUserAddressKey(addr, value);
+            //                   owner_thread->AddWaiter(cur_thread);
+            process_guard.remove_from_priority_queue(current_thread_id);
+            let (owner_thread_id, owner_thread_ptr) = {
+                let mut og = owner_thread.lock().unwrap();
+                let id = og.get_thread_id();
+                let ptr = (&mut *og) as *mut KThread as usize;
+                (id, ptr)
+            };
+            Self::begin_wait_for_address(
+                current_thread,
+                owner_thread_id,
+                owner_thread_ptr,
                 addr,
                 value,
-                test_tag
             );
-            return RESULT_SUCCESS;
-        }
+            {
+                let ct = current_thread.lock().unwrap();
+                let priority = ct.get_priority();
+                let address_key = ct.get_address_key();
+                let is_kernel = ct.get_is_kernel_address_key();
+                drop(ct);
+                owner_thread.lock().unwrap().add_waiter(
+                    current_thread_id,
+                    priority,
+                    address_key,
+                    is_kernel,
+                );
+            }
 
-        // Get the lock owner thread.
-        // Matches upstream: GetCurrentProcess(kernel).GetHandleTable()
-        //                      .GetObjectWithoutPseudoHandle<KThread>(handle)
-        let Some(owner_object_id) = process_guard.handle_table.get_object(handle) else {
-            return RESULT_INVALID_HANDLE;
-        };
-        let Some(owner_thread) = process_guard.get_thread_by_object_id(owner_object_id) else {
-            return RESULT_INVALID_HANDLE;
-        };
-
-        // Update the lock: set address key on current thread and add as waiter.
-        // Matches upstream: cur_thread->SetUserAddressKey(addr, value);
-        //                   owner_thread->AddWaiter(cur_thread);
-        process_guard.remove_from_priority_queue(current_thread_id);
-        let (owner_thread_id, owner_thread_ptr) = {
-            let mut og = owner_thread.lock().unwrap();
-            let id = og.get_thread_id();
-            let ptr = (&mut *og) as *mut KThread as usize;
-            (id, ptr)
-        };
-        Self::begin_wait_for_address(
-            current_thread,
-            owner_thread_id,
-            owner_thread_ptr,
-            addr,
-            value,
-        );
-        {
-            let ct = current_thread.lock().unwrap();
-            let priority = ct.get_priority();
-            let address_key = ct.get_address_key();
-            let is_kernel = ct.get_is_kernel_address_key();
-            drop(ct);
-            owner_thread.lock().unwrap().add_waiter(
+            log::trace!(
+                "KConditionVariable::wait_for_address sleep tid={} owner_tid={} handle=0x{:08X} addr=0x{:X} value=0x{:08X}",
                 current_thread_id,
-                priority,
-                address_key,
-                is_kernel,
+                owner_thread_id,
+                handle,
+                addr,
+                value
             );
+
+            // Upstream calls owner_thread->Close() here to release the handle
+            // reference. In Rust, Arc reference counting handles this automatically.
+            drop(process_guard);
+
+            Ok(())
+        })();
+
+        // Scheduler lock dropped — now wait for the wake-up without holding it.
+        if let Err(early_return) = setup_result {
+            return early_return;
         }
-
-        log::trace!(
-            "KConditionVariable::wait_for_address sleep tid={} owner_tid={} handle=0x{:08X} addr=0x{:X} value=0x{:08X}",
-            current_thread_id,
-            owner_thread_id,
-            handle,
-            addr,
-            value
-        );
-
-        // Upstream calls owner_thread->Close() here to release the handle
-        // reference. In Rust, Arc reference counting handles this automatically.
-        drop(process_guard);
 
         Self::wait_for_current_thread(process, current_thread);
         let wait_result = current_thread.lock().unwrap().get_wait_result();
@@ -521,24 +524,18 @@ impl KConditionVariable {
     /// Matches upstream `KConditionVariable::Signal(u64 cv_key, s32 count)`.
     ///
     /// The caller must already hold the process lock (passes `&mut KProcess`).
-    /// Upstream wraps the body in `KScopedSchedulerLock sl(m_kernel)`.
-    ///
-    /// Rust accepts the current thread's scheduler-lock owner pointer so this
-    /// file, not the SVC wrapper, owns the scheduler-lock scope like upstream.
+    /// Upstream wraps the body in `KScopedSchedulerLock sl(m_kernel)` — we do
+    /// the same via `kernel::scheduler_lock()`.
     pub fn signal(
         &mut self,
         process_guard: &mut KProcess,
-        scheduler_lock_ptr: u64,
         cv_key: u64,
         count: i32,
     ) -> ResultCode {
-        let _scheduler_guard = if scheduler_lock_ptr == 0 {
-            None
-        } else {
-            Some(super::k_scheduler_lock::KScopedSchedulerLock::new(unsafe {
-                &*(scheduler_lock_ptr as *const super::k_scheduler_lock::KAbstractSchedulerLock)
-            }))
-        };
+        let scheduler_lock = super::kernel::scheduler_lock()
+            .expect("scheduler_lock must exist — kernel not initialized?");
+        let _scheduler_guard =
+            super::k_scheduler_lock::KScopedSchedulerLock::new(scheduler_lock);
 
         let mut num_waiters = 0i32;
         log::trace!(
@@ -621,13 +618,10 @@ impl KConditionVariable {
         timeout: i64,
     ) -> ResultCode {
         let current_thread_id = current_thread.lock().unwrap().get_thread_id();
-        let scheduler_lock_ptr = current_thread.lock().unwrap().scheduler_lock_ptr;
-        if scheduler_lock_ptr == 0 {
-            return RESULT_INVALID_STATE;
-        }
-        let scheduler_lock = unsafe {
-            &*(scheduler_lock_ptr as *const super::k_scheduler_lock::KAbstractSchedulerLock)
-        };
+        // Upstream opens `KScopedSchedulerLockAndSleep slp(kernel, ...)` at
+        // entry, which internally acquires the kernel's scheduler lock.
+        let scheduler_lock = super::kernel::scheduler_lock()
+            .expect("scheduler_lock must exist — kernel not initialized?");
         let hardware_timer = super::kernel::get_hardware_timer_arc();
         let thread_ptr = {
             let guard = current_thread.lock().unwrap();
@@ -644,12 +638,6 @@ impl KConditionVariable {
                     timeout,
                 );
             let mut process_guard = process.lock().unwrap();
-            let _kcv_holder = super::kernel::ProcessLockTracker::new(
-                super::kernel::get_current_thread_pointer()
-                    .and_then(|t| t.lock().ok().map(|g| g.get_thread_id()))
-                    .unwrap_or(0),
-                0x4B43_5631, // 'KCV1' — covers all remaining k_condition_variable process.lock() sites
-            );
             self.wait_locked_after_sleep_guard(
                 &mut process_guard,
                 current_thread,
@@ -1411,7 +1399,7 @@ mod tests {
             assert_eq!(process_guard.cond_var.waiting_thread_ids(), vec![2]);
         }
 
-        process.lock().unwrap().signal_condition_variable(0, key, 1);
+        process.lock().unwrap().signal_condition_variable(key, 1);
 
         let result = wait_handle.join().unwrap();
         assert_eq!(result, RESULT_SUCCESS.get_inner_value());
@@ -1523,7 +1511,7 @@ mod tests {
             process_for_signal
                 .lock()
                 .unwrap()
-                .signal_condition_variable(0, key, 1);
+                .signal_condition_variable(key, 1);
         });
 
         let result = KProcess::wait_condition_variable(&process, &owner, address, key, 0x1111, -1);
@@ -1549,7 +1537,7 @@ mod tests {
             process_for_signal
                 .lock()
                 .unwrap()
-                .signal_condition_variable(0, key, 1);
+                .signal_condition_variable(key, 1);
         });
 
         let result = KProcess::wait_condition_variable(&process, &owner, address, key, 0x2222, -1);
