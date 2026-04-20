@@ -2832,14 +2832,8 @@ impl KThread {
     }
 
     fn lock_scheduler(&self) -> Option<KScopedSchedulerLock<'static>> {
-        if self.scheduler_lock_ptr == 0 {
-            None
-        } else {
-            Some(KScopedSchedulerLock::new(unsafe {
-                &*(self.scheduler_lock_ptr
-                    as *const super::k_scheduler_lock::KAbstractSchedulerLock)
-            }))
-        }
+        let scheduler_lock = super::kernel::scheduler_lock()?;
+        Some(KScopedSchedulerLock::new(scheduler_lock))
     }
 
     /// Mirrors upstream `KThread::NotifyAvailable`. Delegates to the thread's
@@ -2945,14 +2939,11 @@ impl KThread {
         self.sleep_deadline = deadline_from_timeout_tick(timeout, current_tick);
         let hardware_timer = super::kernel::get_hardware_timer_arc();
         let mut wait_queue = KThreadQueueWithoutEndWait::new();
-        if self.scheduler_lock_ptr == 0 {
+        let Some(scheduler_lock) = super::kernel::scheduler_lock() else {
             return RESULT_INVALID_STATE.get_inner_value();
-        }
-        let scheduler_lock_ptr =
-            self.scheduler_lock_ptr as *const super::k_scheduler_lock::KAbstractSchedulerLock;
+        };
 
         {
-            let scheduler_lock = unsafe { &*scheduler_lock_ptr };
             let thread_ptr = self as *mut KThread as usize;
             let (mut sleep_guard, timer) = KScopedSchedulerLockAndSleep::new(
                 scheduler_lock,
