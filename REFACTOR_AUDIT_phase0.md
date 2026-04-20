@@ -127,3 +127,58 @@ rooted there, not in the lock changes themselves.
 
 **Do NOT attempt Phases 1/2 from the original plan** (wrap SVC bodies,
 HLE migration). Both proven to regress when applied incrementally.
+
+## Progress — 2026-04-20
+
+### Landed
+
+1. ✅ **Step 1 (current-thread accessor totality)** — `ae42dfc` made
+   `get_current_thread_id_fast` / `with_current_thread_fast_mut` total.
+2. ✅ **Step 3 (atomic type swaps)** — `d0f45e4` (`ProcessLock =
+   SyncCell<KProcess>`) + `3514834` (`KThreadLock = SyncCell<KThread>`).
+   Both are "zero call-site changes" — SyncCell exposes API-compatible
+   `.lock()` / `.try_lock()` / `.lock_with()` / `.from_value()` shims.
+3. ✅ **SIGUSR1 investigation overlay** — `ee5bbd3` squash-merged the
+   TrackedMutex-based debugger while preserving the SyncCell direction
+   (ProcessLock stays `sync_cell::KProcessCell`; TrackedMutex unused).
+4. ✅ **Step 2 — condvar + svc_lock**: `a28cbe4` landed
+   `kernel::scheduler_lock()` singleton accessor, ripped out the
+   "scheduler_lock_ptr == 0 → silently no-op" fallback across
+   `k_condition_variable.rs`, and tightened `wait_for_address` to drop
+   the scheduler lock BEFORE the fiber-wait begins (holding it across
+   the wait deadlocks EndWait on the signaling thread — discovered by
+   direct MK8D boot regression during this step). Subsystem B
+   (svc_lock) is naturally covered because `ArbitrateLock` /
+   `ArbitrateUnlock` just forward into condvar.
+
+### Still pending
+
+5. ⏳ **Step 2 — address arbiter** — `k_address_arbiter.rs` is a full
+   rewrite, not a small scope change. Current Rust impl uses a
+   `HashMap<u64, parking_lot::Condvar>` and blocks host threads
+   directly via `cv.wait_timeout(...)`. Upstream uses the
+   scheduler-lock + intrusive tree + `BeginWait` / `EndWait` pattern
+   (see `zuyu/src/core/hle/kernel/k_address_arbiter.cpp`). MK8D boot
+   doesn't exercise the arbiter path heavily at current progress, so
+   this is lower priority than subsystem D below.
+6. ⏳ **Step 2 — wait-sync path (`svc_synchronization.rs`)** — mirror
+   the same "kernel::scheduler_lock() + drop lock before fiber-wait"
+   pattern used for condvar.
+7. ⏳ **Step 4 — cleanup** — remove now-dead `TrackedMutex` module +
+   `ProcessLockTracker` (except sites that still reference them for
+   SIGUSR1 diagnostics outside the refactored subsystems).
+
+### MK8D boot progression
+
+Measured in 90s isolated-dir run (RequestUpdate cycles / VSYNC):
+
+| Branch tip | RU | VSYNC | Notes |
+|---|---:|---:|---|
+| pre-refactor (65593b9 main) | ~1377 | — | clock fix baseline, 54 s run |
+| step 5b (`3514834`) | 882 | 36 | SyncCell for both Process + Thread; no scheduler lock coverage added yet |
+| step 6.0 initial attempt | 0 | 16 | held scheduler lock across fiber-wait → deadlock at boot |
+| step 6.1 (`a28cbe4`) | 266 | 23 | condvar fixed; arbiter/sync still missing coverage |
+
+Throughput regression is expected per the refactor's intermediate-
+breakage contract. Final regression-hunting happens only after all
+subsystems are converted (per user directive 2026-04-20).
