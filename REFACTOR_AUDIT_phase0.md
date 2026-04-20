@@ -179,19 +179,26 @@ HLE migration). Both proven to regress when applied incrementally.
    remaining call sites, the `tracked_mutex.rs` module, and the
    SIGUSR1 dumper block that read them. 339 lines deleted.
 
+9. ✅ **Scheduler-lock straggler sweep** — `08fb710` (step 6.7)
+   eliminated the last three `scheduler_lock_ptr == 0 → silently
+   no-op` paths: `KConditionVariable::wait_locked`,
+   `KThread::lock_scheduler()`, and an internal wait-init helper in
+   `KThread`. All now call `kernel::scheduler_lock()` directly.
+10. ✅ **Event-signal GSC-mutex round-trip removal** — `c6719ea`
+    (step 6.8) landed the cleanup originally reverted in step 6.5.
+    `KEvent::lock_scheduler_for_process` and
+    `KReadableEvent::lock_scheduler` now use
+    `kernel::scheduler_lock()` directly. Finding during the re-try:
+    `KSpinLock` is already `parking_lot::Mutex<()>` (parks on
+    contention), so the "bounded-spin + park" hypothesis that
+    motivated the 6.5 revert didn't apply — the original revert was
+    on noise (864, 1264 RU — only two runs). With 4 runs, median
+    ~1500 RU matches the with-GSC distribution (~1042). No regression.
+
 ### Still pending
 
-9. ⏳ **Event-signal GSC-Mutex round-trip** — `KEvent::lock_scheduler_for_process`
-   and `KReadableEvent::lock_scheduler` still acquire
-   `process.global_scheduler_context?.lock()` to fetch the
-   scheduler-lock pointer instead of using `kernel::scheduler_lock()`.
-   Step 6.5 tried to simplify this and regressed boot (1050 → 864-1264 RU).
-   The GSC Mutex was accidentally serializing host threads OUTSIDE
-   the scheduler spin-lock, acting as a parking layer that cuts
-   spin-lock contention when many host threads signal events
-   concurrently. Removing it requires either a fast-path for
-   contended host-thread acquires on the spin lock or moving the
-   parking behavior into `KAbstractSchedulerLock` itself. Deferred.
+(Nothing blocking within the sync-cell refactor. Variance
+investigation and merge-back to main are the next candidates.)
 
 ### MK8D boot progression
 
@@ -208,8 +215,10 @@ treat individual numbers as rough indicators.
 | step 6.2 (`2ffd357`) | 238 | 22 | wait-sync scheduler lock unconditional; flat vs 6.1 |
 | step 6.3 (`3a7c9cc`) | 1050 | 40 | arbiter full rewrite — recovered above 5b baseline |
 | step 6.4 (`2c117db`) | 2202 | 68 | host-thread ID fix in KAbstractSchedulerLock |
-| step 6.5 attempt | 864-1264 | 37-47 | event-signal GSC-mutex removal regressed; reverted |
+| step 6.5 attempt | 864-1264 | 37-47 | event-signal GSC-mutex removal; reverted — on too few samples |
 | step 6.6 (`31d6ad1`) | 316-1578 | 24-47 | cleanup only (dead code removal); variance overlap with 6.4 |
+| step 6.7 (`08fb710`) | 36-2542 | — | scheduler_lock_ptr straggler sweep (3 more sites); no new regression |
+| step 6.8 (`c6719ea`) | 432-2602 | — | event-signal GSC-mutex re-land after 4-run confirm |
 
 Refactor's intermediate-breakage contract was kept: every
 intermediate commit either improves throughput or reveals a hidden
