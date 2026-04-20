@@ -671,13 +671,10 @@ impl KConditionVariable {
         timeout: i64,
     ) -> ResultCode {
         let current_thread_id = current_thread.lock().unwrap().get_thread_id();
-        let scheduler_lock_ptr = current_thread.lock().unwrap().scheduler_lock_ptr;
-        if scheduler_lock_ptr == 0 {
-            return RESULT_INVALID_STATE;
-        }
-        let scheduler_lock = unsafe {
-            &*(scheduler_lock_ptr as *const super::k_scheduler_lock::KAbstractSchedulerLock)
-        };
+        // Upstream: `KScopedSchedulerLockAndSleep slp(kernel, ...)` — kernel
+        // singleton's scheduler_lock, not a per-thread cache.
+        let scheduler_lock = super::kernel::scheduler_lock()
+            .expect("scheduler_lock must exist — kernel not initialized?");
         let hardware_timer = super::kernel::get_hardware_timer_arc();
         let mut wait_queue = ThreadQueueImplForKConditionVariableWaitConditionVariable::queue();
         let thread_ptr = {
