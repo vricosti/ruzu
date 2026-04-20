@@ -597,6 +597,16 @@ impl CpuManager {
                             );
                         }
                     }
+                    // Record the guest PC at SVC entry for the SIGUSR1
+                    // dumper. Cheap — get_context is an in-process register
+                    // copy, not a syscall. This is the multi-core SVC path
+                    // that bypasses PhysicalCore::handoff_after_svc, so the
+                    // PC recording has to live here.
+                    {
+                        let mut tc_pc = crate::arm::arm_interface::ThreadContext::default();
+                        jit_ref.get_context(&mut tc_pc);
+                        crate::hle::kernel::kernel::record_guest_pc(core_index, tc_pc.pc);
+                    }
                     let system_ref = kernel.system();
                     if !system_ref.is_null() {
                         let system = system_ref.get();

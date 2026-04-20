@@ -112,11 +112,36 @@ pub static SVC_IN_PROGRESS: [std::sync::atomic::AtomicU64;
     std::sync::atomic::AtomicU64::new(0),
 ];
 
+/// Per-core last known guest PC. Updated by `PhysicalCore::handoff_after_svc`
+/// at every SVC return (cheapest hook that already touches the thread context
+/// where the PC lives). The value lags the JIT's current PC by however many
+/// guest instructions have executed since the last SVC — fine for
+/// post-freeze diagnostics where the spin has no SVCs at all and we want the
+/// PC at which the spin started.
+pub static GUEST_PC: [std::sync::atomic::AtomicU64;
+    hardware_properties::NUM_CPU_CORES as usize] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+
 #[inline]
 pub fn mark_svc_enter(core_id: usize, tid: u64, svc: u32) {
     if core_id >= SVC_IN_PROGRESS.len() { return; }
     let packed = ((tid & 0xFFFF_FFFF) << 32) | (svc as u64 & 0xFFFF_FFFF);
     SVC_IN_PROGRESS[core_id].store(packed, Ordering::Release);
+}
+
+/// Record the guest PC observed after an SVC returns. Called from
+/// `PhysicalCore::handoff_after_svc` once `jit.get_context()` has populated
+/// the ThreadContext for this core.
+#[inline]
+pub fn record_guest_pc(core_id: usize, pc: u64) {
+    if core_id >= GUEST_PC.len() {
+        return;
+    }
+    GUEST_PC[core_id].store(pc, Ordering::Release);
 }
 
 #[inline]
@@ -186,16 +211,17 @@ fn dump_thread_state(kernel: &KernelCore) {
     eprintln!("=========================================");
     eprintln!("[DUMP] === ruzu kernel thread dump ===");
 
-    // Per-core running thread + interrupt flag + in-progress SVC.
+    // Per-core running thread + interrupt flag + in-progress SVC + last guest PC.
     for core_id in 0..hardware_properties::NUM_CPU_CORES as usize {
         if let Some(core) = kernel.physical_core(core_id) {
             let interrupted = core.is_interrupted();
             let packed = SVC_IN_PROGRESS[core_id].load(Ordering::Acquire);
             let svc_tid = (packed >> 32) as u32;
             let svc_num = (packed & 0xFFFF_FFFF) as u32;
+            let last_pc = GUEST_PC[core_id].load(Ordering::Acquire);
             eprintln!(
-                "[DUMP] core={} is_interrupted={} in_svc={{tid={}, imm=0x{:X}}}",
-                core_id, interrupted, svc_tid, svc_num,
+                "[DUMP] core={} is_interrupted={} in_svc={{tid={}, imm=0x{:X}}} last_guest_pc=0x{:X}",
+                core_id, interrupted, svc_tid, svc_num, last_pc,
             );
         }
     }
