@@ -52,7 +52,7 @@ use super::k_session::KSession;
 use super::k_synchronization_object;
 use super::k_synchronization_object::SynchronizationObjectState;
 use super::k_system_resource::KSecureSystemResource;
-use super::k_thread::KThread;
+use super::k_thread::{KThread, KThreadLock};
 use super::k_thread_local_page::{KThreadLocalPage, PAGE_SIZE as THREAD_LOCAL_PAGE_SIZE};
 use super::k_typed_address::KProcessAddress;
 use super::k_worker_task_manager::{KWorkerTaskManager, WorkerType};
@@ -444,11 +444,11 @@ pub struct KProcess {
     pub exception_thread_id: Option<u64>,
     // Thread list — stubbed as Vec of thread ids
     pub thread_list: Vec<u64>,
-    pub thread_objects: BTreeMap<u64, Arc<Mutex<KThread>>>,
-    /// Reverse lookup: thread_id → Arc<Mutex<KThread>>.
+    pub thread_objects: BTreeMap<u64, Arc<KThreadLock>>,
+    /// Reverse lookup: thread_id → Arc<KThreadLock>.
     /// Avoids locking all threads to find one by thread_id (prevents deadlocks
     /// when called while already holding a thread lock).
-    thread_objects_by_thread_id: BTreeMap<u64, Arc<Mutex<KThread>>>,
+    thread_objects_by_thread_id: BTreeMap<u64, Arc<KThreadLock>>,
     pub session_objects: BTreeMap<u64, Arc<Mutex<KSession>>>,
     pub client_session_objects: BTreeMap<u64, Arc<Mutex<KClientSession>>>,
     pub client_port_objects: BTreeMap<u64, Arc<Mutex<KPort>>>,
@@ -986,7 +986,7 @@ impl KProcess {
             return RESULT_INVALID_STATE.get_inner_value();
         }
 
-        let threads: Vec<Arc<Mutex<KThread>>> = self
+        let threads: Vec<Arc<KThreadLock>> = self
             .thread_list
             .iter()
             .filter_map(|id| self.thread_objects.get(id).cloned())
@@ -1116,7 +1116,7 @@ impl KProcess {
 
     pub fn wait_condition_variable(
         process: &Arc<ProcessLock>,
-        current_thread: &Arc<Mutex<KThread>>,
+        current_thread: &Arc<KThreadLock>,
         address: u64,
         cv_key: u64,
         tag: u32,
@@ -2185,7 +2185,7 @@ impl KProcess {
     /// use blocking `KThread::terminate_thread()` when the target is already in
     /// a state that can complete immediately without needing guest execution.
     fn terminate_children(&mut self, thread_to_not_terminate_id: Option<u64>) -> u32 {
-        let children: Vec<Arc<Mutex<KThread>>> = self.thread_objects.values().cloned().collect();
+        let children: Vec<Arc<KThreadLock>> = self.thread_objects.values().cloned().collect();
 
         for child in &children {
             let mut guard = child.lock().unwrap();
@@ -2234,7 +2234,7 @@ impl KProcess {
         main_object_id: u64,
         is_64bit: bool,
         init_func: Option<Box<dyn FnOnce() + Send>>,
-    ) -> Result<(Arc<Mutex<KThread>>, Handle, u64, u64), u32> {
+    ) -> Result<(Arc<KThreadLock>, Handle, u64, u64), u32> {
         use super::k_scoped_resource_reservation::KScopedResourceReservation;
         let trace_boot = Self::boot_trace_enabled();
         let state = self.state;
@@ -2366,7 +2366,7 @@ impl KProcess {
             .saturating_sub(self.main_thread_stack_size + self.code_size);
         self.page_table.set_max_heap_size(max_heap);
 
-        let main_thread = Arc::new(Mutex::new(KThread::new()));
+        let main_thread = Arc::new(KThreadLock::new(KThread::new()));
         {
             let mut thread = main_thread.lock().unwrap();
             let result = thread.initialize_user_thread_with_tls(
@@ -2593,7 +2593,7 @@ impl KProcess {
         self.thread_list.push(thread_id);
     }
 
-    pub fn register_thread_object(&mut self, thread: Arc<Mutex<KThread>>) {
+    pub fn register_thread_object(&mut self, thread: Arc<KThreadLock>) {
         let (thread_id, object_id) = {
             let mut thread_guard = thread.lock().unwrap();
             // Preserve upstream-style self ownership so KThread::Exit can queue
@@ -2616,11 +2616,11 @@ impl KProcess {
         }
     }
 
-    pub fn get_thread_by_object_id(&self, object_id: u64) -> Option<Arc<Mutex<KThread>>> {
+    pub fn get_thread_by_object_id(&self, object_id: u64) -> Option<Arc<KThreadLock>> {
         self.thread_objects.get(&object_id).cloned()
     }
 
-    pub fn get_thread_by_thread_id(&self, thread_id: u64) -> Option<Arc<Mutex<KThread>>> {
+    pub fn get_thread_by_thread_id(&self, thread_id: u64) -> Option<Arc<KThreadLock>> {
         self.thread_objects_by_thread_id.get(&thread_id).cloned()
     }
 
@@ -3153,7 +3153,7 @@ mod tests {
         let scheduler = Arc::new(Mutex::new(KScheduler::new(0)));
         scheduler.lock().unwrap().set_scheduler_current_thread_id(1);
 
-        let current = Arc::new(Mutex::new(KThread::new()));
+        let current = Arc::new(KThreadLock::new(KThread::new()));
         {
             let mut guard = current.lock().unwrap();
             guard.thread_id = 1;
@@ -3162,7 +3162,7 @@ mod tests {
             guard.set_state(super::super::k_thread::ThreadState::RUNNABLE);
         }
 
-        let other = Arc::new(Mutex::new(KThread::new()));
+        let other = Arc::new(KThreadLock::new(KThread::new()));
         {
             let mut guard = other.lock().unwrap();
             guard.thread_id = 2;
@@ -3187,7 +3187,7 @@ mod tests {
     #[test]
     fn register_thread_object_binds_thread_self_reference() {
         let process = Arc::new(ProcessLock::from_value(KProcess::new()));
-        let thread = Arc::new(Mutex::new(KThread::new()));
+        let thread = Arc::new(KThreadLock::new(KThread::new()));
         {
             let mut guard = thread.lock().unwrap();
             guard.thread_id = 3;
@@ -3220,7 +3220,7 @@ mod tests {
             process_guard.attach_scheduler(&scheduler);
         }
 
-        let thread = Arc::new(Mutex::new(KThread::new()));
+        let thread = Arc::new(KThreadLock::new(KThread::new()));
         {
             let mut guard = thread.lock().unwrap();
             guard.thread_id = 3;
@@ -3255,7 +3255,7 @@ mod tests {
             process_guard.state = ProcessState::Running;
         }
 
-        let thread = Arc::new(Mutex::new(KThread::new()));
+        let thread = Arc::new(KThreadLock::new(KThread::new()));
         {
             let mut guard = thread.lock().unwrap();
             guard.thread_id = 9;
@@ -3299,7 +3299,7 @@ mod tests {
     #[test]
     fn attach_scheduler_backfills_existing_registered_threads() {
         let process = Arc::new(ProcessLock::from_value(KProcess::new()));
-        let thread = Arc::new(Mutex::new(KThread::new()));
+        let thread = Arc::new(KThreadLock::new(KThread::new()));
         {
             let mut guard = thread.lock().unwrap();
             guard.thread_id = 7;
@@ -3331,7 +3331,7 @@ mod tests {
         let scheduler = Arc::new(Mutex::new(KScheduler::new(0)));
         scheduler.lock().unwrap().set_scheduler_current_thread_id(1);
 
-        let current = Arc::new(Mutex::new(KThread::new()));
+        let current = Arc::new(KThreadLock::new(KThread::new()));
         {
             let mut guard = current.lock().unwrap();
             guard.thread_id = 1;
@@ -3340,7 +3340,7 @@ mod tests {
             guard.set_state(super::super::k_thread::ThreadState::RUNNABLE);
         }
 
-        let other = Arc::new(Mutex::new(KThread::new()));
+        let other = Arc::new(KThreadLock::new(KThread::new()));
         {
             let mut guard = other.lock().unwrap();
             guard.thread_id = 2;
@@ -3369,7 +3369,7 @@ mod tests {
     #[test]
     fn start_termination_synchronously_finishes_initialized_children() {
         let process = Arc::new(ProcessLock::from_value(KProcess::new()));
-        let current = Arc::new(Mutex::new(KThread::new()));
+        let current = Arc::new(KThreadLock::new(KThread::new()));
         {
             let mut guard = current.lock().unwrap();
             guard.thread_id = 1;
@@ -3378,7 +3378,7 @@ mod tests {
             guard.set_state(super::super::k_thread::ThreadState::RUNNABLE);
         }
 
-        let initialized_child = Arc::new(Mutex::new(KThread::new()));
+        let initialized_child = Arc::new(KThreadLock::new(KThread::new()));
         {
             let mut guard = initialized_child.lock().unwrap();
             guard.thread_id = 2;

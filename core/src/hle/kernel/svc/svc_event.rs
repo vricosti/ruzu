@@ -122,7 +122,7 @@ mod tests {
             process_guard.initialize_handle_table();
         }
 
-        let current_thread = Arc::new(Mutex::new(KThread::new()));
+        let current_thread = Arc::new(KThreadLock::new(KThread::new()));
         {
             let mut thread = current_thread.lock().unwrap();
             thread.thread_id = 1;

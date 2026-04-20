@@ -614,7 +614,7 @@ mod tests {
             process_guard.page_table.set_memory(memory.clone());
         }
 
-        let thread = Arc::new(Mutex::new(KThread::new()));
+        let thread = Arc::new(KThreadLock::new(KThread::new()));
         thread.lock().unwrap().parent = Some(Arc::downgrade(&process));
 
         let tls_address = 0x4000;

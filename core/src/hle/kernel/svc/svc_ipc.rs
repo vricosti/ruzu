@@ -358,7 +358,7 @@ mod tests {
         process.allocate_code_memory(0x200000, 0x60000);
 
         let process = Arc::new(ProcessLock::from_value(process));
-        let current_thread = Arc::new(Mutex::new(KThread::new()));
+        let current_thread = Arc::new(KThreadLock::new(KThread::new()));
         {
             let mut thread = current_thread.lock().unwrap();
             thread.thread_id = 1;

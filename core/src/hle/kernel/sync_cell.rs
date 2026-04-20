@@ -8,7 +8,7 @@
 //! raw references (`KThread*`, `KProcess&`). No per-object sleeping mutex.
 //!
 //! The Rust port originally wrapped these objects in
-//! `std::sync::Mutex<KThread>` / `TrackedMutex<KProcess>`. Combined with
+//! `KThreadLock` / `TrackedMutex<KProcess>`. Combined with
 //! cooperative fibers (which can yield while holding a sleeping mutex),
 //! this creates the entire class of AB-BA / self-lock deadlocks documented
 //! in `project_mk8d_arbitrate_unlock_deadlock.md` and
@@ -241,7 +241,7 @@ impl<T: ?Sized> DerefMut for SyncCellGuard<'_, T> {
 pub type KProcessCell = SyncCell<super::k_process::KProcess>;
 
 /// Concrete alias for `KThread` storage. Will replace
-/// `Arc<std::sync::Mutex<KThread>>` in Phase 3 of the lock refactor.
+/// `Arc<KThreadLock>` in Phase 3 of the lock refactor.
 pub type KThreadCell = SyncCell<super::k_thread::KThread>;
 
 #[cfg(test)]

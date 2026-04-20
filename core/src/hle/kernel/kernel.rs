@@ -19,7 +19,7 @@ use super::k_memory_manager::KMemoryManager;
 use super::k_port::KPort;
 use super::k_process::KProcess;
 use super::k_scheduler::KScheduler;
-use super::k_thread::{KThread, ThreadState};
+use super::k_thread::{KThread, KThreadLock, ThreadState};
 
 use super::global_scheduler_context::GlobalSchedulerContext;
 use super::init::init_slab_setup::KSlabResourceCounts;
@@ -51,7 +51,7 @@ static KERNEL_PTR: std::sync::atomic::AtomicPtr<KernelCore> =
 /// immediately because the target thread mutex was still held.
 ///
 /// Upstream applies active-core migration while still under the scheduler lock.
-/// Rust cannot safely block on a `Mutex<KThread>` there, so preserve the
+/// Rust cannot safely block on a `KThreadLock` there, so preserve the
 /// migration request here and retry it from later scheduler callbacks until it
 /// succeeds. Dropping the migration outright leaves a runnable thread tagged to
 /// the wrong core and can strand all guest cores in idle.
@@ -548,19 +548,19 @@ fn apply_pending_active_core_updates() {
 // Upstream: `static inline thread_local KThread* current_thread{nullptr}` in KernelCore::Impl.
 // Each physical core host thread (and any other host thread) stores its own current KThread.
 std::thread_local! {
-    static CURRENT_THREAD: RefCell<Option<Weak<Mutex<KThread>>>> = RefCell::new(None);
+    static CURRENT_THREAD: RefCell<Option<Weak<KThreadLock>>> = RefCell::new(None);
     static CURRENT_THREAD_ID: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static CURRENT_THREAD_PTR: std::cell::Cell<*mut KThread> = const { std::cell::Cell::new(std::ptr::null_mut()) };
-    static HOST_DUMMY_THREAD: RefCell<Option<Arc<Mutex<KThread>>>> = const { RefCell::new(None) };
+    static HOST_DUMMY_THREAD: RefCell<Option<Arc<KThreadLock>>> = const { RefCell::new(None) };
 }
 
-fn get_or_create_host_dummy_thread(kernel: &KernelCore) -> Arc<Mutex<KThread>> {
+fn get_or_create_host_dummy_thread(kernel: &KernelCore) -> Arc<KThreadLock> {
     HOST_DUMMY_THREAD.with(|cell| {
         if let Some(thread) = cell.borrow().as_ref() {
             return Arc::clone(thread);
         }
 
-        let thread = Arc::new(Mutex::new(KThread::new()));
+        let thread = Arc::new(KThreadLock::new(KThread::new()));
         {
             let thread_id = kernel.create_new_thread_id();
             let object_id = kernel.create_new_object_id() as u64;
@@ -577,7 +577,7 @@ fn get_or_create_host_dummy_thread(kernel: &KernelCore) -> Arc<Mutex<KThread>> {
 
 /// Get the current emulation thread for the calling host thread.
 /// Upstream: `KernelCore::Impl::GetCurrentEmuThread()`.
-pub fn get_current_emu_thread() -> Option<Arc<Mutex<KThread>>> {
+pub fn get_current_emu_thread() -> Option<Arc<KThreadLock>> {
     let current = CURRENT_THREAD.with(|cell| cell.borrow().as_ref().and_then(Weak::upgrade));
     if current.is_some() {
         return current;
@@ -596,7 +596,7 @@ pub fn get_current_emu_thread() -> Option<Arc<Mutex<KThread>>> {
 
 /// Set the current emulation thread for the calling host thread.
 /// Upstream: `KernelCore::Impl::SetCurrentEmuThread(KThread*)`.
-pub fn set_current_emu_thread(thread: Option<&Arc<Mutex<KThread>>>) {
+pub fn set_current_emu_thread(thread: Option<&Arc<KThreadLock>>) {
     CURRENT_THREAD.with(|cell| {
         *cell.borrow_mut() = thread.map(Arc::downgrade);
     });
@@ -674,7 +674,7 @@ pub fn with_current_thread_fast_mut<R>(f: impl FnOnce(&mut KThread) -> R) -> Opt
 /// Get the current thread pointer for the calling host thread.
 /// Upstream: `GetCurrentThreadPointer(kernel)`.
 /// Returns None if no thread is set.
-pub fn get_current_thread_pointer() -> Option<Arc<Mutex<KThread>>> {
+pub fn get_current_thread_pointer() -> Option<Arc<KThreadLock>> {
     get_current_emu_thread()
 }
 
@@ -743,17 +743,17 @@ pub struct KernelCore {
 
     /// Per-core shutdown threads.
     /// Upstream: created in `InitializeShutdownThreads()` via `KThread::InitializeHighPriorityThread`.
-    shutdown_threads: Vec<Arc<Mutex<KThread>>>,
+    shutdown_threads: Vec<Arc<KThreadLock>>,
     /// Per-core main threads.
     /// Upstream: created in `InitializePhysicalCores()` via `KThread::InitializeMainThread`.
-    main_threads: Vec<Arc<Mutex<KThread>>>,
+    main_threads: Vec<Arc<KThreadLock>>,
     /// Per-core idle threads.
     /// Upstream: created in `InitializePhysicalCores()` via `KThread::InitializeIdleThread`.
-    idle_threads: Vec<Arc<Mutex<KThread>>>,
+    idle_threads: Vec<Arc<KThreadLock>>,
 
     /// The application's main thread (created by KProcess::run).
     /// Used to set as the current thread when entering guest dispatch.
-    application_thread: Option<Arc<Mutex<KThread>>>,
+    application_thread: Option<Arc<KThreadLock>>,
 
     // -- Slab resource counts --
     slab_resource_counts: KSlabResourceCounts,
@@ -964,7 +964,7 @@ impl KernelCore {
             .push(Arc::clone(&process));
 
         // Create the service thread.
-        let thread = Arc::new(Mutex::new(super::k_thread::KThread::new()));
+        let thread = Arc::new(KThreadLock::new(super::k_thread::KThread::new()));
         let thread_id = self.create_new_thread_id();
         let object_id = self.create_new_object_id() as u64;
 
@@ -1048,7 +1048,7 @@ impl KernelCore {
     ) -> std::thread::JoinHandle<()> {
         let kernel_ptr = self as *const KernelCore as usize;
 
-        let thread = Arc::new(Mutex::new(KThread::new()));
+        let thread = Arc::new(KThreadLock::new(KThread::new()));
         {
             let thread_id = self.create_new_thread_id();
             let object_id = self.create_new_object_id() as u64;
@@ -1203,12 +1203,12 @@ impl KernelCore {
     }
 
     /// Set the application's main thread.
-    pub fn set_application_thread(&mut self, thread: Arc<Mutex<KThread>>) {
+    pub fn set_application_thread(&mut self, thread: Arc<KThreadLock>) {
         self.application_thread = Some(thread);
     }
 
     /// Get the application's main thread.
-    pub fn get_application_thread(&self) -> Option<Arc<Mutex<KThread>>> {
+    pub fn get_application_thread(&self) -> Option<Arc<KThreadLock>> {
         self.application_thread.clone()
     }
 
@@ -1314,7 +1314,7 @@ impl KernelCore {
             return;
         };
 
-        let threads: Vec<Arc<Mutex<KThread>>> = {
+        let threads: Vec<Arc<KThreadLock>> = {
             let process_guard = process.lock().unwrap();
             process_guard.thread_objects.values().cloned().collect()
         };
@@ -1580,7 +1580,7 @@ impl KernelCore {
     /// Upstream: `KernelCore::RegisterHostThread(existing_thread)` (kernel.cpp:1036).
     pub fn register_host_thread_with_existing(
         &self,
-        existing_thread: Option<&Arc<Mutex<KThread>>>,
+        existing_thread: Option<&Arc<KThreadLock>>,
     ) {
         HOST_THREAD_ID.with(|id| {
             if id.get() == u32::MAX {
@@ -1639,14 +1639,14 @@ impl KernelCore {
     /// Get the current emulation thread for the calling host thread.
     /// Matches upstream `KernelCore::GetCurrentEmuThread()`.
     /// Delegates to the thread-local `get_current_emu_thread()` free function.
-    pub fn get_current_emu_thread(&self) -> Option<Arc<Mutex<KThread>>> {
+    pub fn get_current_emu_thread(&self) -> Option<Arc<KThreadLock>> {
         get_current_emu_thread()
     }
 
     /// Set the current emulation thread for the calling host thread.
     /// Matches upstream `KernelCore::SetCurrentEmuThread(KThread*)`.
     /// Delegates to the thread-local `set_current_emu_thread()` free function.
-    pub fn set_current_emu_thread(&self, thread: Option<&Arc<Mutex<KThread>>>) {
+    pub fn set_current_emu_thread(&self, thread: Option<&Arc<KThreadLock>>) {
         set_current_emu_thread(thread);
     }
 
@@ -1755,7 +1755,7 @@ impl KernelCore {
         let kernel_ptr = self as *const KernelCore as usize;
 
         for core_id in 0..hardware_properties::NUM_CPU_CORES {
-            let thread = Arc::new(Mutex::new(KThread::new()));
+            let thread = Arc::new(KThreadLock::new(KThread::new()));
             {
                 let thread_id = self.create_new_thread_id();
                 let object_id = self.create_new_object_id() as u64;
@@ -1821,7 +1821,7 @@ impl KernelCore {
             //
             // Upstream passes system.GetCpuManager().GetGuestActivateFunc() as the
             // fiber entry point. GuestActivate calls scheduler->Activate().
-            let main_thread = Arc::new(Mutex::new(KThread::new()));
+            let main_thread = Arc::new(KThreadLock::new(KThread::new()));
             {
                 let thread_id = self.create_new_thread_id();
                 let object_id = self.create_new_object_id() as u64;
@@ -1857,7 +1857,7 @@ impl KernelCore {
             // Upstream passes system.GetCpuManager().GetIdleThreadStartFunc() as the
             // fiber entry point. IdleThreadFunction dispatches to MultiCoreRunIdleThread
             // or SingleCoreRunIdleThread.
-            let idle_thread = Arc::new(Mutex::new(KThread::new()));
+            let idle_thread = Arc::new(KThreadLock::new(KThread::new()));
             {
                 let thread_id = self.create_new_thread_id();
                 let object_id = self.create_new_object_id() as u64;
@@ -1969,7 +1969,7 @@ mod tests {
         let mut kernel = KernelCore::new();
         kernel.initialize();
 
-        let thread = Arc::new(Mutex::new(KThread::new()));
+        let thread = Arc::new(KThreadLock::new(KThread::new()));
         {
             let thread_id = kernel.create_new_thread_id();
             let object_id = kernel.create_new_object_id() as u64;

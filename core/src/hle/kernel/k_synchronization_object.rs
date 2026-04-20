@@ -22,7 +22,7 @@ use super::k_readable_event::KReadableEvent;
 use super::k_scheduler::KScheduler;
 use super::k_scoped_scheduler_lock_and_sleep::KScopedSchedulerLockAndSleep;
 use super::k_server_session::KServerSession;
-use super::k_thread::KThread;
+use super::k_thread::{KThread, KThreadLock};
 use super::k_thread_queue::{KThreadQueue, KThreadQueueWithoutEndWait};
 use crate::hle::kernel::svc::svc_results::{
     RESULT_CANCELLED, RESULT_INVALID_HANDLE, RESULT_TERMINATION_REQUESTED, RESULT_TIMED_OUT,
@@ -38,12 +38,12 @@ pub const ARGUMENT_HANDLE_COUNT_MAX: usize = 64;
 ///
 /// Each node is stored in a per-wait buffer owned by `KThread::wait_nodes`
 /// (allocated by `wait()` before linking, cleared on wake). The signal path
-/// dereferences `thread` as `Weak<Mutex<KThread>>` and upgrades under the
+/// dereferences `thread` as `Weak<KThreadLock>` and upgrades under the
 /// scheduler lock.
 pub struct ThreadListNode {
     pub next: *mut ThreadListNode,
     /// Weak ref to the waiter. Upgraded on signal to call notify_available.
-    pub thread: Weak<Mutex<KThread>>,
+    pub thread: Weak<KThreadLock>,
     /// Object id this node is linked into — used to compute the synced_index
     /// in the queue callback when the thread is notified.
     pub object_id: u64,
@@ -62,7 +62,7 @@ impl ThreadListNode {
 }
 
 // Safety: raw next pointer and object_id are only read/written under the
-// scheduler lock; Weak<Mutex<KThread>> is Send+Sync. Nodes are otherwise
+// scheduler lock; Weak<KThreadLock> is Send+Sync. Nodes are otherwise
 // owned by a single waiter thread.
 unsafe impl Send for ThreadListNode {}
 unsafe impl Sync for ThreadListNode {}
@@ -145,7 +145,7 @@ impl SynchronizationObjectState {
     ///
     /// # Safety
     /// Caller must hold the scheduler lock.
-    pub unsafe fn waiter_snapshot(&self) -> Vec<Arc<Mutex<KThread>>> {
+    pub unsafe fn waiter_snapshot(&self) -> Vec<Arc<KThreadLock>> {
         let mut v = Vec::new();
         let mut cur = self.head;
         while !cur.is_null() {
@@ -313,7 +313,7 @@ enum WaitableObject {
     ReadableEvent(Arc<Mutex<KReadableEvent>>),
     ServerPort(Arc<Mutex<KPort>>),
     ServerSession(Arc<Mutex<KServerSession>>),
-    Thread(Arc<Mutex<KThread>>),
+    Thread(Arc<KThreadLock>),
     Process,
 }
 
@@ -428,7 +428,7 @@ impl KSynchronizationObject {
     ///
     /// # Safety
     /// Call under scheduler lock only.
-    pub unsafe fn get_waiting_threads_for_debugging(&self) -> Vec<Arc<Mutex<KThread>>> {
+    pub unsafe fn get_waiting_threads_for_debugging(&self) -> Vec<Arc<KThreadLock>> {
         self.sync_object.waiter_snapshot()
     }
 }
@@ -492,7 +492,7 @@ pub unsafe fn notify_waiters_on_state(
 /// - The fiber switch driven by `KScopedSchedulerLockAndSleep` matches upstream.
 pub fn wait(
     process: &Arc<ProcessLock>,
-    current_thread: &Arc<Mutex<KThread>>,
+    current_thread: &Arc<KThreadLock>,
     _scheduler: &Arc<Mutex<KScheduler>>,
     out_index: &mut i32,
     object_ids: Vec<u64>,

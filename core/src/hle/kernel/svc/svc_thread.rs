@@ -10,7 +10,7 @@ use crate::core::System;
 use crate::hle::kernel::k_memory_block::{KMemoryPermission, KMemoryState, PAGE_SIZE};
 use crate::hle::kernel::k_resource_limit::LimitableResource;
 use crate::hle::kernel::k_scoped_resource_reservation::KScopedResourceReservation;
-use crate::hle::kernel::k_thread::KThread;
+use crate::hle::kernel::k_thread::{KThread, KThreadLock};
 use crate::hle::kernel::k_typed_address::KProcessAddress;
 use crate::hle::kernel::svc::svc_results::*;
 use crate::hle::kernel::svc::svc_types::*;
@@ -50,7 +50,7 @@ fn sleep_timeout_tick_from_ns(current_tick: i64, ns: i64) -> i64 {
     }
 }
 
-fn resolve_thread_handle(system: &System, handle: Handle) -> Option<Arc<Mutex<KThread>>> {
+fn resolve_thread_handle(system: &System, handle: Handle) -> Option<Arc<KThreadLock>> {
     if handle == PseudoHandle::CurrentThread as Handle {
         return system.current_thread();
     }
@@ -60,7 +60,7 @@ fn resolve_thread_handle(system: &System, handle: Handle) -> Option<Arc<Mutex<KT
     process.get_thread_by_object_id(object_id)
 }
 
-fn resolve_current_thread(system: &System) -> Option<Arc<Mutex<KThread>>> {
+fn resolve_current_thread(system: &System) -> Option<Arc<KThreadLock>> {
     system.current_thread()
 }
 
@@ -155,7 +155,7 @@ pub fn create_thread(
         }))
     };
 
-    let thread = Arc::new(Mutex::new(KThread::new()));
+    let thread = Arc::new(KThreadLock::new(KThread::new()));
     {
         let mut new_thread = thread.lock().unwrap();
         let result = new_thread.initialize_user_thread_with_init_func(
@@ -677,7 +677,7 @@ mod tests {
         ))));
 
         let process = Arc::new(ProcessLock::from_value(process));
-        let current_thread = Arc::new(Mutex::new(KThread::new()));
+        let current_thread = Arc::new(KThreadLock::new(KThread::new()));
         let scheduler = Arc::new(Mutex::new(
             crate::hle::kernel::k_scheduler::KScheduler::new(0),
         ));

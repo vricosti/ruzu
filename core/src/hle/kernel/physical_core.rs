@@ -16,7 +16,7 @@ use crate::hle::kernel::svc_dispatch::{self, SvcArgs};
 
 #[cfg(feature = "debug-logs")]
 use super::physical_core_log;
-use super::{k_process::KProcess, k_scheduler::KScheduler, k_thread::KThread};
+use super::{k_process::KProcess, k_scheduler::KScheduler, k_thread::{KThread, KThreadLock}};
 use super::k_process::ProcessLock;
 
 pub enum PhysicalCoreExecutionControl {
@@ -51,7 +51,7 @@ unsafe impl Send for PhysicalCoreState {}
 unsafe impl Sync for PhysicalCoreState {}
 
 struct PhysicalCoreRuntime {
-    m_current_thread: Arc<Mutex<KThread>>,
+    m_current_thread: Arc<KThreadLock>,
 }
 
 pub enum PhysicalCoreExecutionEvent {
@@ -128,7 +128,7 @@ impl PhysicalCore {
 
     pub fn initialize_guest_runtime(
         &self,
-        main_thread: Arc<Mutex<KThread>>,
+        main_thread: Arc<KThreadLock>,
         jit: &mut dyn ArmInterface,
         thread_context: &mut ThreadContext,
     ) {
@@ -143,7 +143,7 @@ impl PhysicalCore {
         &self,
         jit: &mut dyn ArmInterface,
         thread_context: &mut ThreadContext,
-        current_thread: &Arc<Mutex<KThread>>,
+        current_thread: &Arc<KThreadLock>,
     ) {
         jit.get_context(thread_context);
         current_thread
@@ -158,7 +158,7 @@ impl PhysicalCore {
         thread_context: &mut ThreadContext,
         scheduler: &Arc<Mutex<KScheduler>>,
         process: &Arc<ProcessLock>,
-        current_thread: &Arc<Mutex<KThread>>,
+        current_thread: &Arc<KThreadLock>,
         svc_num: u32,
         svc_count: u32,
         is_64bit: bool,
@@ -572,7 +572,7 @@ impl PhysicalCore {
         &self,
         jit: &mut dyn ArmInterface,
         thread_context: &mut ThreadContext,
-        thread: &Arc<Mutex<KThread>>,
+        thread: &Arc<KThreadLock>,
     ) {
         let thread = thread.lock().unwrap();
         thread.restore_guest_context(thread_context);
@@ -665,7 +665,7 @@ mod tests {
         PhysicalCore,
         Arc<ProcessLock>,
         Arc<Mutex<KScheduler>>,
-        Arc<Mutex<KThread>>,
+        Arc<KThreadLock>,
         System,
     ) {
         let mut system = System::new_for_test();
@@ -679,8 +679,8 @@ mod tests {
         process.initialize_thread_local_region_base(0x240000);
 
         let process = Arc::new(ProcessLock::from_value(process));
-        let current_thread = Arc::new(Mutex::new(KThread::new()));
-        let other_thread = Arc::new(Mutex::new(KThread::new()));
+        let current_thread = Arc::new(KThreadLock::new(KThread::new()));
+        let other_thread = Arc::new(KThreadLock::new(KThread::new()));
         let scheduler = Arc::new(Mutex::new(KScheduler::new(0)));
         {
             let mut thread = current_thread.lock().unwrap();
@@ -783,7 +783,7 @@ mod tests {
         process.initialize_thread_local_region_base(0x240000);
 
         let process = Arc::new(ProcessLock::from_value(process));
-        let current_thread = Arc::new(Mutex::new(KThread::new()));
+        let current_thread = Arc::new(KThreadLock::new(KThread::new()));
         let scheduler = Arc::new(Mutex::new(KScheduler::new(0)));
         {
             let mut thread = current_thread.lock().unwrap();

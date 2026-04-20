@@ -1891,7 +1891,7 @@ mod tests {
         process.initialize_thread_local_region_base(0x240000);
 
         let process = Arc::new(ProcessLock::from_value(process));
-        let current_thread = Arc::new(Mutex::new(KThread::new()));
+        let current_thread = Arc::new(KThreadLock::new(KThread::new()));
         let scheduler = Arc::new(Mutex::new(KScheduler::new(0)));
         {
             let mut thread = current_thread.lock().unwrap();
