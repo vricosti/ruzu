@@ -5,6 +5,10 @@
 //!
 //! OpenGL query cache — manages GPU occlusion/primitives queries.
 
+use std::sync::Arc;
+
+use crate::query_cache::types::QueryPropertiesFlags;
+
 /// Number of query types.
 pub const NUM_QUERY_TYPES: usize = 3;
 
@@ -34,6 +38,8 @@ pub fn get_target(query_type: QueryType) -> u32 {
 pub struct QueryCache {
     /// Per-type pool of reusable query objects.
     query_pools: [Vec<u32>; NUM_QUERY_TYPES],
+    channel_memory_manager: Option<Arc<parking_lot::Mutex<crate::memory_manager::MemoryManager>>>,
+    gpu_ticks_getter: Option<Arc<dyn Fn() -> u64 + Send + Sync>>,
 }
 
 impl QueryCache {
@@ -43,6 +49,8 @@ impl QueryCache {
     pub fn new() -> Self {
         Self {
             query_pools: [Vec::new(), Vec::new(), Vec::new()],
+            channel_memory_manager: None,
+            gpu_ticks_getter: None,
         }
     }
 
@@ -66,6 +74,69 @@ impl QueryCache {
     /// Corresponds to `QueryCache::Reserve()`.
     pub fn reserve(&mut self, query_type: QueryType, query: u32) {
         self.query_pools[query_type as usize].push(query);
+    }
+
+    pub fn set_memory_manager(
+        &mut self,
+        memory_manager: Arc<parking_lot::Mutex<crate::memory_manager::MemoryManager>>,
+    ) {
+        self.channel_memory_manager = Some(memory_manager);
+    }
+
+    pub fn set_gpu_ticks_getter(&mut self, getter: Arc<dyn Fn() -> u64 + Send + Sync>) {
+        self.gpu_ticks_getter = Some(getter);
+    }
+
+    pub fn reset_counter(&mut self, _query_type: u32) {}
+
+    pub fn invalidate_region(&mut self, _addr: u64, _size: usize) {}
+
+    pub fn flush_region(&mut self, _addr: u64, _size: usize) {}
+
+    pub fn commit_async_flushes(&mut self) {}
+
+    pub fn has_uncommitted_flushes(&self) -> bool {
+        false
+    }
+
+    pub fn should_wait_async_flushes(&self) -> bool {
+        false
+    }
+
+    pub fn pop_async_flushes(&mut self) {}
+
+    pub fn query(
+        &mut self,
+        gpu_addr: u64,
+        flags: QueryPropertiesFlags,
+        payload: u32,
+        signal_fence: impl FnOnce(Box<dyn FnOnce() + Send>),
+        sync_operation: impl FnOnce(Box<dyn FnOnce() + Send>),
+    ) {
+        let Some(memory_manager) = self.channel_memory_manager.as_ref().cloned() else {
+            return;
+        };
+        let has_timeout = flags.contains(QueryPropertiesFlags::HAS_TIMEOUT);
+        let is_fence = flags.contains(QueryPropertiesFlags::IS_A_FENCE);
+        let gpu_ticks_getter = self.gpu_ticks_getter.as_ref().cloned();
+        let operation = Box::new(move || {
+            let mm = memory_manager.lock();
+            if has_timeout {
+                let gpu_ticks = gpu_ticks_getter
+                    .as_ref()
+                    .map(|getter| getter())
+                    .unwrap_or(0);
+                mm.write_block_unsafe_owned(gpu_addr + 8, &gpu_ticks.to_le_bytes());
+                mm.write_block_unsafe_owned(gpu_addr, &(payload as u64).to_le_bytes());
+            } else {
+                mm.write_block_unsafe_owned(gpu_addr, &payload.to_le_bytes());
+            }
+        });
+        if is_fence {
+            signal_fence(operation);
+        } else {
+            sync_operation(operation);
+        }
     }
 }
 

@@ -5,6 +5,7 @@
 //! SVC handlers for process memory operations.
 
 use crate::core::System;
+use crate::hle::kernel::k_process::ProcessLock;
 use crate::hle::kernel::svc::svc_results::*;
 use crate::hle::kernel::svc::svc_types::*;
 use crate::hle::kernel::svc_common::{Handle, PseudoHandle};
@@ -371,7 +372,7 @@ pub fn unmap_process_code_memory(
 fn resolve_process_handle(
     system: &System,
     handle: Handle,
-) -> Option<std::sync::Arc<std::sync::Mutex<crate::hle::kernel::k_process::KProcess>>> {
+) -> Option<std::sync::Arc<crate::hle::kernel::k_process::ProcessLock>> {
     if handle == PseudoHandle::CurrentProcess as Handle || handle == 0 {
         return Some(system.current_process_arc().clone());
     }

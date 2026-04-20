@@ -10,6 +10,7 @@ use crate::hle::kernel::svc::svc_results::*;
 use crate::hle::kernel::svc::svc_types::*;
 use crate::hle::kernel::svc_common::{Handle, PseudoHandle};
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
+use super::super::k_process::ProcessLock;
 
 /// Exits the current process.
 pub fn exit_process(system: &System) {
@@ -205,7 +206,7 @@ mod tests {
     fn test_system() -> System {
         let mut system = System::new_for_test();
 
-        let process = Arc::new(Mutex::new(KProcess::new()));
+        let process = Arc::new(ProcessLock::from_value(KProcess::new()));
         let scheduler = Arc::new(Mutex::new(KScheduler::new(0)));
         scheduler.lock().unwrap().set_scheduler_current_thread_id(1);
 

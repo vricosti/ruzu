@@ -666,6 +666,13 @@ impl DmaPusher {
             }
             index += 1;
         }
+        if std::env::var_os("RUZU_TRACE_DMA_COUNT").is_some() {
+            log::info!(
+                "DmaPusher::process_commands DONE headers={} dispatches={}",
+                commands.len(),
+                total_dispatches
+            );
+        }
     }
 
     /// Process a span of command headers, dispatching to an engine.

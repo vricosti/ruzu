@@ -238,6 +238,78 @@
 
 ### Unintentional differences (to fix)
 - `FenceManager` still does not own the upstream `GPU`/`Host1x` references, so `SignalSyncPoint(...)` is not yet hosted directly in this file.
+
+## 2026-04-17 — core/src/hle/kernel/k_transfer_memory.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/k_transfer_memory.h and /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/k_transfer_memory.cpp
+
+### Intentional differences
+- Rust stores upstream `m_owner` as `Weak<Mutex<KProcess>>` instead of a raw `KProcess*`: narrow ownership adaptation to the current Rust kernel object model.
+- Rust `KTransferMemory::finalize(...)` still takes `&mut KProcessPageTable` explicitly instead of reading `m_owner->GetPageTable()` directly. This avoids re-locking the process while `KProcess` already owns the registry teardown path.
+
+### Unintentional differences (to fix)
+- `Initialize(...)` still does not perform the upstream owner `Open()` bookkeeping, and `post_destroy(...)` therefore still cannot mirror `owner->Close()` literally.
+
+### Missing items
+- Full upstream owner refcount parity (`owner->Open()` / `owner->Close()`).
+
+### Binary layout verification
+- PASS: runtime-only object; no raw-serialized struct layout changed in this slice.
+
+## 2026-04-17 — core/src/hle/kernel/k_process.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/k_process.h and /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/k_process.cpp
+
+### Intentional differences
+- Rust adds `remove_handle(...)` as an owner-local adaptation because `KHandleTable` stores opaque object IDs and `KProcess` owns the side registries that keep Rust kernel objects alive. This keeps the handle-removal adaptation out of SVC owners.
+- Rust finalizes transfer-memory registry entries during `KProcess` teardown by iterating `transfer_memory_objects` and calling the object-local `finalize(...)` + `post_destroy(...)` path before dropping the registry entries.
+
+### Unintentional differences (to fix)
+- The transfer-memory registry remains a Rust-only side map; upstream uses `KAutoObject` refcounting directly through `KHandleTable`.
+
+### Missing items
+- Broader line-by-line parity audit for remaining Rust-only object registries that stand in for upstream `KAutoObject` ownership.
+
+### Binary layout verification
+- PASS: runtime-only process object; no raw-serialized struct layout changed in this slice.
+
+## 2026-04-17 — core/src/hle/kernel/svc/svc_transfer_memory.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/svc/svc_transfer_memory.cpp
+
+### Intentional differences
+- Rust now reserves/releases `TransferMemoryCountMax` around `CreateTransferMemory`, matching the upstream object lifecycle more closely even though the actual object lifetime is still backed by Rust side registries plus opaque handle-table object IDs.
+
+### Unintentional differences (to fix)
+- `CreateTransferMemory` still initializes `KTransferMemory` from the current-process `Arc<Mutex<KProcess>>` rather than via the upstream implicit `GetCurrentProcessPointer(m_kernel)` path inside the kernel object constructor/initializer.
+
+### Missing items
+- Broader line-by-line audit of failure unwinding against the upstream auto-object allocation path.
+
+### Binary layout verification
+- PASS: SVC handler file; no raw-serialized structs affected.
+
+## 2026-04-17 — core/src/hle/kernel/k_handle_table.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/k_handle_table.h and /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/k_handle_table.cpp
+
+### Intentional differences
+- Rust adds `contains_object_id(...)` as a helper to preserve upstream-like close semantics while the table stores opaque object IDs instead of refcounted `KAutoObject*`. This prevents the Rust adaptation from destroying a transfer-memory object while another live handle still references the same object ID.
+
+### Unintentional differences (to fix)
+- `KHandleTable` still does not own object `Open()`/`Close()` semantics directly; that lifecycle remains split between the table and the Rust side registries.
+
+### Missing items
+- Full upstream auto-object refcount parity in `Add(...)`, `Register(...)`, `Remove(...)`, and `Finalize()`.
+
+### Binary layout verification
+- PASS: handle encoding/layout unchanged; helper-only addition.
+
+## 2026-04-17 — core/src/hle/kernel/svc/svc_synchronization.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/svc/svc_synchronization.cpp
+
+### Intentional differences
+- `CloseHandle(...)` now delegates to `KProcess::remove_handle(...)` instead of directly calling `handle_table.remove(...)`. This is the narrow Rust adaptation needed to keep registry-backed object cleanup in the process owner rather than in the SVC file.
+
+### Unintentional differences (to fix)
+- `CloseHandle(...)` still depends on the broader Rust `KProcess::remove_handle(...)` adaptation because the current handle table does not own upstream-equivalent object refcounts.
+
+### Missing items
+- None in this specific owner beyond the broader handle-table/object-lifetime parity gap already tracked in `k_handle_table.rs` and `k_process.rs`.
+
+### Binary layout verification
+- PASS: SVC handler file; no raw-serialized structs affected.
 - Async flush/cache ownership remains simplified relative to upstream.
 
 ### Missing items
@@ -2158,14 +2230,16 @@
 
 ### Unintentional differences (to fix)
 - Fixed in this pass: `Query(..., IsAFence, ...)` now defers the guest write behind `signal_fence(...)` instead of writing immediately and signaling an empty fence.
+- Fixed in this pass: non-fence fallback queries now queue their guest writes through `sync_operation(...)` instead of writing eagerly, which is closer to upstream `query_cache.Query(...)` timing.
 - timestamped fallback queries still write `ticks=0` instead of upstream `gpu.GetTicks()`.
 
 ### Missing items
 - full `QueryCache` / `QueryFallback` split
+- full `query_cache.Query(...)` / `SyncOperation(...)` ownership remains unported; the current Rust fix is an owner-local timing bridge in `gl_rasterizer.rs`, not full query-cache parity
 - upstream GPU tick sourcing in query fallback writes
 
 ### Binary layout verification
-- PASS: no raw struct layout; fence ordering covered by `query_fence_defers_guest_write_until_release`
+- PASS: no raw struct layout; fence/query ordering covered by `query_fence_defers_guest_write_until_release`, `query_non_fence_defers_guest_write_until_next_fence_release_and_preserves_payload`, and `query_has_timeout_defers_guest_write_until_next_fence_release_and_preserves_payload`
 
 ## 2026-03-29 — video_core/src/renderer_vulkan/mod.rs vs video_core/renderer_vulkan/vk_rasterizer.cpp
 
@@ -6589,18 +6663,19 @@
 ### Intentional differences
 - Rust still owns `SurfaceFlinger` directly instead of upstream `Container&`, to avoid a Rust reference cycle between `Container` and `Conductor`. The owner/file boundary remains the same and `process_vsync()` still delegates composition from this file.
 - Rust uses an explicit `Arc<(Mutex<bool>, Condvar)>` plus `JoinHandle<()>` for the multicore wake thread instead of upstream `Common::Event` plus `std::jthread`. This preserves the same owner responsibilities and lifecycle ordering inside this file.
+- Rust still routes composition through the direct `SurfaceFlinger` owner kept in this file instead of literally calling back through `Container::ComposeOnDisplay(...)`, because the Rust VI port avoids the upstream `Container&` cycle by storing `SurfaceFlinger` directly.
 
 ### Unintentional differences (to fix)
 - Fixed in this pass: multicore `ScreenComposition` callbacks no longer call `process_vsync()` directly. They now signal a dedicated `VSyncThread`, matching upstream execution ownership more closely.
 - Fixed in this pass: `get_next_ticks()` no longer returns a fixed 60 FPS interval. It now follows the upstream `use_multi_core` / `use_speed_limit` / `speed_limit` / `use_video_framerate` inputs plus `compose_speed_scale`.
 - Fixed in this pass: `VsyncThread()` no longer uses the Rust-only `sleep(FRAME_NS)` pacing workaround or `try_lock()` skip path. It now follows the upstream `m_signal.Wait(); ProcessVsync();` sequencing.
-- The Rust port still does not call back through `Container::ComposeOnDisplay(...)` literally; it composes through the direct `SurfaceFlinger` owner kept in this file.
+- Fixed in this pass: the multicore callback-side `SharedTickState` path now uses the same upstream `GetNextTicks()` settings and NVDEC logic as the direct owner method. It no longer drops `Settings::values.*` and `System::GetNVDECActive()` in the callback reschedule path.
 
 ### Missing items
 - No additional missing methods remain in the exercised `Conductor` owner path.
 
 ### Binary layout verification
-- PASS: no shared raw payload structs are serialized in this file.
+- PASS: no shared raw payload structs are serialized in this file. Added focused cadence tests for multicore speed-limit, unlocked-speed, and NVDEC video-framerate behavior.
 
 ## 2026-04-05 — `core/src/hle/service/audio/audio_renderer_manager.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/hle/service/audio/audio_renderer_manager.cpp`
 
@@ -8610,3 +8685,1304 @@
 
 ### Binary layout verification
 - PASS: no raw byte layout contract in this owner.
+
+## 2026-04-15 — `core/src/hle/service/mii/types/store_data.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/hle/service/mii/types/store_data.{h,cpp}`
+
+### Intentional differences
+- Rust still stores `create_id` as raw `[u8; 16]` bytes instead of upstream `Common::UUID` to preserve the packed 0x44 on-disk layout without extra alignment padding.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: Rust now exposes the upstream getter surface needed by `CharInfo::SetFromStoreData`, including `get_create_id()` and typed color getters, instead of forcing callers to reach through raw fields or `_raw` color helpers.
+- Fixed in this pass: `BuildWithCharInfo(...)` and `Restore()` now live in the correct owner file and match upstream ownership, including the current upstream stub result `ResultNotUpdated`.
+- Fixed in this pass: `IsValid()` now performs the upstream data/device checksum validation in the correct owner file instead of returning `NoErrors` after only `core_data` validation.
+- Fixed in this pass: the named setter surface and owner-local equality method now live in `store_data.rs` instead of leaving callsites to talk directly to `core_data` or rely on a raw-byte `PartialEq`.
+
+### Missing items
+
+### Binary layout verification
+- PASS: `StoreData` still asserts to 0x44 and this slice only added getters.
+
+## 2026-04-15 — `core/src/hle/service/mii/types/char_info.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/hle/service/mii/types/char_info.{h,cpp}`
+
+### Intentional differences
+- Rust still represents the upstream enum-typed fields as raw `u8` storage inside the packed IPC struct, then casts enum getters from `StoreData` while copying. This preserves the wire layout while avoiding Rust enum padding risks in the raw struct.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: Rust now ports `CharInfo::SetFromStoreData` in the correct owner file instead of relying on zeroed `CharInfo` placeholders.
+- Fixed in this pass: the eyebrow Y offset adjustment (`+ 3`) is now applied exactly like upstream during `SetFromStoreData`.
+- Fixed in this pass: `Verify()` is now ported in the correct owner file, including the upstream oddity where invalid `mouth_y` returns `ValidationResult::InvalidMoleY`.
+- Fixed in this pass: the upstream getter surface now lives in the correct owner file instead of forcing callsites to read raw packed fields directly.
+
+### Missing items
+- equality is still primarily derived structurally in Rust; `equals(...)` now exists owner-locally, but the exact upstream operator audit is still not fully literal.
+
+### Binary layout verification
+- PASS: `CharInfo` layout itself is unchanged; the new setter only populates existing fields.
+
+## 2026-04-15 — `core/src/hle/service/mii/types/core_data.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/hle/service/mii/types/core_data.{h,cpp}`
+
+### Intentional differences
+- Rust still represents the upstream bitfield owner through explicit packed-word helpers rather than C++ template bitfields. This preserves ownership in `core_data.rs` while keeping the same storage contract.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `BuildFromCharInfo(...)` now lives in the correct owner file and follows the upstream field-copy/order contract, including the eyebrow-Y `- 3` adjustment.
+
+### Missing items
+- A full audit of the remaining conversion helpers in this owner against upstream still remains incomplete.
+
+### Binary layout verification
+- PASS: `StoreDataBitFields` and `CoreData` layout assertions remain unchanged; this slice only ports owner-local field writes.
+
+## 2026-04-15 — `core/src/hle/service/mii/mii_manager.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/hle/service/mii/mii_manager.{h,cpp}`
+
+### Intentional differences
+- Rust still exposes `Vec`-backed collection helpers instead of the upstream overload set that fills output spans directly. This keeps ownership in `mii_manager.rs`; the IPC layer still performs the final HIPC buffer write.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `build_default()` and `build_random()` now return real `CharInfo` values via `StoreData -> CharInfo::SetFromStoreData`, matching upstream ownership more closely. They no longer leak `StoreData` as the public result type of the manager helper.
+- Fixed in this pass: `Append(...)` now lives in the correct owner file and follows the upstream `DatabaseManager::Append -> IsModified -> SaveDatabase` tail.
+- Fixed in this pass: `Initialize(...)` now matches the upstream tail more closely by ignoring `MountSaveData()` / `DatabaseManager::Initialize(...)` results and always returning `ResultSuccess`.
+
+### Missing items
+- the main remaining structural difference is still the `Vec`-backed transport surface instead of literal upstream span-filling overloads
+
+### Binary layout verification
+- PASS: control-flow/ownership slice only; no raw struct layout changed here.
+
+## 2026-04-15 — `core/src/hle/service/mii/mii.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/hle/service/mii/mii.cpp`
+
+### Intentional differences
+- Rust uses manual `RequestParser` / `ResponseBuilder` handling plus raw HIPC buffer writes instead of upstream CMIF `Out<T>` / `OutArray<T>` wrappers.
+- `IDatabaseService` stores per-session `DatabaseSessionMetadata` behind `Mutex<...>` instead of a plain mutable member, which is the current Rust adaptation for shared handler ownership.
+- Rust still keeps a local `SystemSettingsService::new()` fallback when no `ServiceManager` exists (for null-system harnesses). Upstream always constructs this owner with a live typed `set:sys` dependency.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `GetCount`, `Get`, `Get1`, and `UpdateLatest` now route through `MiiManager` + `DatabaseSessionMetadata` instead of the earlier synthetic DB shortcut.
+- Fixed in this pass: `BuildDefault` no longer returns a zeroed placeholder; it now returns a valid upstream-shaped default Mii and rejects out-of-range indices with `ResultInvalidArgument`.
+- Fixed in this pass: `BuildRandom` now consumes and validates the real IPC `age/gender/race` arguments instead of forcing `All/All/All`.
+
+### Missing items
+- Commands `18` (`Import`) and `19` (`Export`) are now registered as explicit null handlers like upstream `nullptr`; the remaining missing work is only their broader service-framework exactness if null-handler reporting is ever tightened.
+
+### Binary layout verification
+- PASS: this slice writes real `CharInfo` / `CharInfoElement` payload sizes (`0x58` / `0x5c`) sourced from the `MiiManager`/database owner path.
+
+## 2026-04-15 — `core/src/hle/service/mii/mii_database.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/hle/service/mii/mii_database.{h,cpp}`
+
+### Intentional differences
+- Rust returns `Option<u32>` from `get_index_by_creator_id(...)` instead of upstream `bool + out_index`, while keeping the same ownership and search behavior in this owner.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `NintendoFigurineDatabase::GetCount(const DatabaseSessionMetadata&)` now lives in the correct owner file, and `mii_database_manager.rs` delegates to it instead of owning the metadata-sensitive special-Mii filtering locally.
+
+### Missing items
+- none in this owner beyond broader database API audit already tracked elsewhere
+
+### Binary layout verification
+- PASS: `NintendoFigurineDatabase` asserts to upstream size `0x1A98` and is serialized by raw byte copy.
+
+## 2026-04-15 — `core/src/hle/service/mii/mii_database_manager.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/hle/service/mii/mii_database_manager.{h,cpp}`
+
+### Intentional differences
+- Rust now uses the local `common::fs::file::IOFile` plus `common::fs::fs` helpers as the upstream-shaped file owner path. The remaining difference is only that this Rust `IOFile` is itself an adaptation of upstream `Common::FS::IOFile`.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `FindIndex(s32&, create_id, is_special)` now has a direct owner-local Rust counterpart via `find_index_signed(&mut i32, ...)`, and `MiiManager` now routes through that out-parameter shape instead of depending only on a convenience wrapper.
+- Fixed in this pass: `FindMoveIndex(...)`, `Move(...)`, `AddOrReplace(...)`, and `Delete(...)` now live in the correct owner file and follow the upstream metadata/update-counter ownership.
+- Fixed in this pass: `DestroyFile(DatabaseSessionMetadata&)` and `Format(DatabaseSessionMetadata&)` now mutate `update_counter`/`metadata.update_counter` in the correct owner file instead of using the earlier metadata-less shortcuts.
+- Fixed in this pass: `Append(...)` now lives in the correct owner file and follows the upstream `Verify -> type check -> BuildWithCharInfo loop -> Restore -> AddOrReplace` flow.
+- Fixed in this pass: `DeleteFile()` now matches upstream ownership more closely by returning `ResultUnknown` on FS removal failure and by no longer cleaning in-memory database state or reset flags on success.
+- Fixed in this pass: `Initialize(...)` now matches upstream result behavior more closely on size/read corruption by setting `is_database_broken`, cleaning the database, and returning `ResultUnknown` instead of `ResultSuccess`.
+- Fixed in this pass: `Initialize(...)` now derives file-size metadata from the already-open file handle instead of doing a second path-based metadata lookup, which is closer to upstream `IOFile` ownership.
+- Fixed in this pass: `is_test_db` is now wired from the service layer before `Initialize(...)`, so `MountSaveData()` selects the upstream `...0031` test-db path from the real `mii/is_db_test_mode_enabled` setting instead of only supporting manual owner-local toggles.
+- Fixed in this pass: `mount_save_data()`, `initialize()`, `save_database()`, and `delete_file()` now use the existing Rust `IOFile`/filesystem owner path instead of ad-hoc `std::fs::File` operations.
+
+### Missing items
+- only the deeper `common::fs::file::IOFile` backend exactness remains outside this owner; `mii_database_manager.rs` no longer owns ad-hoc `std::fs` file flow
+
+### Binary layout verification
+- PASS: `save_database()` / `initialize()` serialize and deserialize the full upstream `NintendoFigurineDatabase` blob size directly.
+
+## 2026-04-15 — `core/src/hle/service/mii/mii_manager.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/hle/service/mii/mii_manager.{h,cpp}` (database-session slice)
+
+### Intentional differences
+- Rust currently exposes `get_char_info_elements(...)` / `get_char_infos(...)` vectors instead of the upstream overload set that fills output spans directly. This keeps ownership in `mii_manager.rs` without forcing raw HIPC buffers into the owner file.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `UpdateLatest(...)` now uses the upstream `CharInfo::Verify()` gate when interface version 1 is supported.
+- Fixed in this pass: `FindIndex(...)` and `GetIndex(...)` now live in the correct owner file and follow the upstream `DatabaseManager::FindIndex(...)` tail, including `-1` fallback and `ResultInvalidCharInfo` / `ResultNotFound` behavior.
+- Fixed in this pass: `Move(...)`, `AddOrReplace(...)`, and `Delete(...)` now live in the correct owner file and follow the upstream `DatabaseManager -> IsModified -> SaveDatabase` tail.
+
+### Missing items
+- the main remaining structural difference is still the `Vec`-backed transport surface instead of literal upstream span-filling overloads
+
+### Binary layout verification
+- PASS: owner/control-flow slice only; no raw struct layout changed here.
+
+## 2026-04-15 — `core/src/hle/service/mii/mii.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/hle/service/mii/mii.cpp` (DatabaseSessionMetadata + persisted DB)
+
+### Intentional differences
+- Rust stores per-session `DatabaseSessionMetadata` behind `Mutex<DatabaseSessionMetadata>` inside `IDatabaseService` instead of a plain mutable member, which is the current Rust adaptation for shared handler ownership.
+- Rust still keeps a local `SystemSettingsService::new()` fallback when no `ServiceManager` exists, which is only a harness adaptation. Runtime ownership now stores the typed `set:sys` dependency directly in `IDatabaseService`.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `IDatabaseService` no longer owns the temporary `default_database_mii` seed; `GetCount`, `Get`, `Get1`, and `SetInterfaceVersion` now route through `MiiManager` + `DatabaseSessionMetadata`.
+- Fixed in this pass: `IDatabaseService` now initializes and reloads the real `MiiDatabase.dat` owner path instead of faking a one-entry database.
+- Fixed in this pass: commands `11` (`FindIndex`) and `21` (`GetIndex`) are now exposed and routed through the correct `MiiManager` owner chain.
+- Fixed in this pass: commands `12` (`Move`), `13` (`AddOrReplace`), and `14` (`Delete`) are now exposed and routed through the correct owner chain, including the upstream-visible `is_system` permission gate and `Move` index-range validation.
+- Fixed in this pass: command `26` (`Append`) is now exposed and routed to the correct owner chain.
+- Fixed in this pass: `UpdateLatest` now returns the real `MiiManager::update_latest(...)` result instead of forcing `ResultSuccess` and echoing the input `CharInfo` on failure.
+
+### Missing items
+- literal CMIF wiring for the remaining unported command surface
+
+### Binary layout verification
+- PASS: `Get` / `Get1` still write upstream `CharInfo` and `CharInfoElement` payload sizes, now sourced from the persisted database owner.
+
+## 2026-04-15 — `core/src/hle/service/mii/types/store_data.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/hle/service/mii/types/store_data.{h,cpp}` (StoreDataElement slice)
+
+### Intentional differences
+- Rust stores `create_id` as `[u8; 16]` instead of upstream `Common::UUID`; this preserves packing while using a slightly different API surface.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `StoreDataElement` now exists in the correct owner file with upstream size `0x48`.
+- Fixed in this pass: the owner-local equality surface now lives in `store_data.rs` via `equals(...)`, and `PartialEq` routes through that owner method instead of a raw-byte compare.
+
+### Missing items
+- no concrete missing owner-local method remains from the upstream `StoreData` public surface after this audit; the remaining adaptation is the raw `[u8; 16]` layout-preserving UUID representation
+
+### Binary layout verification
+- PASS: `StoreDataElement` now asserts to `0x48`; `StoreData` still asserts to `0x44`.
+
+## 2026-04-15 — `core/src/hle/service/mii/mii_manager.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/hle/service/mii/mii_manager.{h,cpp}` (StoreData overload slice)
+
+### Intentional differences
+- Rust still exposes `Vec`-backed `get_*_limited(...)` helpers instead of the upstream overload set that fills `std::span` out-buffers directly. This keeps the owner logic in `mii_manager.rs`; the IPC layer still performs the final HIPC buffer write.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `UpdateLatest(StoreData...)` now lives in the correct owner file and follows the upstream `IsValid -> FindIndex -> Get -> type check -> ResultNotUpdated` flow.
+- Fixed in this pass: the store-data overloads of `Get(...)` now live in the correct owner file.
+- Fixed in this pass: `BuildBase(...)` now lives in the correct owner file.
+- Fixed in this pass: upstream-shaped `BuildDefault(...)` helper boundaries for `StoreDataElement` and `StoreData` are now represented owner-locally instead of keeping all default-store generation inline in `get_*`.
+- Fixed in this pass: this owner now enforces upstream-style `ResultInvalidArgumentSize` behavior through capacity-aware `get_*_limited(...)` and `build_default_*` helpers before the IPC layer writes any buffer.
+
+### Missing items
+- literal `std::span`-shaped `Get(...)` API surface; Rust still uses `Vec` as the transport container even though the size-failure behavior is now owner-local
+
+### Binary layout verification
+- PASS: owner/control-flow slice only; no raw struct layout changed here.
+
+## 2026-04-15 — `core/src/hle/service/mii/mii.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/hle/service/mii/mii.cpp` (Get2/Get3/UpdateLatest1 slice)
+
+### Intentional differences
+- Rust uses manual `RequestParser` / `ResponseBuilder` handling plus raw buffer writes in place of upstream CMIF `OutArray<...>` serialization. This is the existing IPC adaptation for this owner file.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: commands `8` (`Get2`), `9` (`Get3`), and `10` (`UpdateLatest1`) now exist in the correct owner file and route through `MiiManager`.
+- Fixed in this pass: `UpdateLatest1` no longer serializes a fallback `StoreData` payload on error; it now returns only the `ResultCode`, matching upstream CMIF `Out<StoreData>` behavior more closely.
+- Fixed in this pass: commands `3` (`Get`), `4` (`Get1`), `8` (`Get2`), and `9` (`Get3`) now derive `max_count` from the real HIPC write-buffer size, route through owner-local capacity-checked `MiiManager` helpers, and return `ResultInvalidArgumentSize` before writing on overflow.
+
+### Missing items
+- none in this slice beyond the general manual IPC adaptation and the separately audited test-mode command owner
+
+### Binary layout verification
+- PASS: `Get2` writes `StoreDataElement` with asserted size `0x48`; `Get3` writes `StoreData` with asserted size `0x44`.
+
+## 2026-04-15 — `core/src/hle/service/mii/mii_manager.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/hle/service/mii/mii_manager.{h,cpp}` (broken-db lifecycle slice)
+
+### Intentional differences
+- Rust still returns plain `ResultCode` values and uses `Mutex`-guarded session metadata in place of upstream references; this is the existing mechanical adaptation for the owner file.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `IsBrokenWithClearFlag(...)` now lives on the correct owner flow and matches the upstream tail more closely by clearing the flag, formatting the database, and saving it before returning.
+- Fixed in this pass: `DestroyFile(...)` now sets `is_broken_with_clear_flag` before delegating to `DatabaseManager`, like upstream.
+- Fixed in this pass: `Format(...)` now follows the upstream `Format -> IsModified -> SaveDatabase` tail instead of returning the raw `DatabaseManager::Format(...)` result directly.
+
+### Missing items
+- none in this lifecycle slice beyond the shared `DatabaseManager` exactness tracked separately
+
+### Binary layout verification
+- PASS: lifecycle-only slice; no raw struct layout changed here.
+
+## 2026-04-15 — `core/src/hle/service/mii/mii.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/hle/service/mii/mii.cpp` (test-mode DB command slice)
+
+### Intentional differences
+- Rust acquires `set:sys` through `ServiceManager::get_service_blocking(...)` and converts it to the typed `SystemSettingsService` owner at construction time. This preserves upstream ownership after construction, even though the acquisition path still reflects the Rust service framework.
+- Rust still keeps a local `SystemSettingsService::new()` fallback when no `ServiceManager` exists, which is a harness-only adaptation absent upstream.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: commands `15` (`DestroyFile`), `16` (`DeleteFile`), and `17` (`Format`) now exist in the correct owner file.
+- Fixed in this pass: those commands now gate on `set:sys` setting `mii/is_db_test_mode_enabled` instead of remaining absent.
+- Fixed in this pass: `IDatabaseService::new(...)` now reads `mii/is_db_test_mode_enabled` before manager initialization and forwards it into the `MiiManager`/`DatabaseManager` owner chain so the database mount path can match upstream test-db selection.
+- Fixed in this pass: `IsBrokenDatabaseWithClearFlag` now respects the upstream `is_system` permission gate instead of always returning success.
+- Fixed in this pass: `IDatabaseService` no longer stores `SystemRef` just to re-fetch `set:sys`; it now caches the typed `SystemSettingsService` dependency at construction time like upstream `m_set_sys`.
+
+### Missing items
+- none in this command slice beyond the broader `SystemRef`/typed-dependency adaptation above
+
+### Binary layout verification
+- PASS: control-flow/service-dispatch slice only; no raw struct layout changed here.
+
+## 2026-04-15 — `core/src/hle/service/mii/types/store_data.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/hle/service/mii/types/store_data.{h,cpp}` (BuildWithCoreData slice)
+
+### Intentional differences
+- Rust still stores `create_id` as packed raw bytes instead of upstream `Common::UUID`, preserving layout while using a slightly different API surface.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `BuildWithCoreData(...)` now lives in the correct owner file and follows the upstream `core_data copy -> MakeCreateId -> SetChecksum` flow.
+
+### Missing items
+- broader getter/setter surface parity still needs line-by-line audit beyond the already ported build/validate/equality slices
+
+### Binary layout verification
+- PASS: `StoreData` remains asserted to upstream size `0x44`.
+
+## 2026-04-15 — `core/src/hle/service/mii/mii_manager.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/hle/service/mii/mii_manager.{h,cpp}` (core-data conversion slice)
+
+### Intentional differences
+- Rust returns owned values directly instead of upstream `Out<T>` references; this is the mechanical Rust adaptation for the owner file.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `ConvertCoreDataToCharInfo(...)` now lives in the correct owner file and follows the upstream `IsValid -> BuildWithCoreData -> font-region check -> SetFromStoreData` flow.
+- Fixed in this pass: `ConvertCharInfoToCoreData(...)` now lives in the correct owner file and follows the upstream `Verify -> BuildFromCharInfo -> font-region check` flow.
+
+### Missing items
+- none in this conversion slice beyond the general owned-value adaptation above
+
+### Binary layout verification
+- PASS: conversion/control-flow slice only; no raw struct layout changed here.
+
+## 2026-04-15 — `core/src/hle/service/mii/mii.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/hle/service/mii/mii.cpp` (core-data convert command slice)
+
+### Intentional differences
+- Rust still uses manual `RequestParser` / `ResponseBuilder` handling in place of upstream CMIF `Out<T>` wrappers.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: commands `24` (`ConvertCoreDataToCharInfo`) and `25` (`ConvertCharInfoToCoreData`) now exist in the correct owner file and route through `MiiManager`.
+- Fixed in this pass: commands `24/25` no longer serialize explicit fallback payloads on error; they now return only the `ResultCode`, matching upstream CMIF `Out<T>` behavior more closely.
+
+### Missing items
+- none in this command slice beyond the general manual CMIF adaptation
+
+### Binary layout verification
+- PASS: command `24` writes upstream `CharInfo` size; command `25` writes upstream `CoreData` size from the owner-local type.
+
+## 2026-04-15 — `core/src/hle/service/mii/types/ver3_store_data.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/hle/service/mii/types/ver3_store_data.{h,cpp}`
+
+### Intentional differences
+- Rust represents `Ver3StoreData` as a raw `[u8; 0x60]` plus owner-local bitfield helpers instead of a literal packed union/bitfield struct. This keeps the exact outer binary size while making the packed C++ fields mechanically addressable in Rust.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `NfpStoreDataExtension::SetFromStoreData(...)` now lives in the correct owner file.
+- Fixed in this pass: `BuildToStoreData(...)` now lives in the correct owner file and follows the upstream field/table mapping flow, including the upstream `eyebrow_y - 3` adjustment.
+- Fixed in this pass: `BuildFromStoreData(...)` now lives in the correct owner file and follows the upstream writeback flow, including the upstream field-mapping oddities such as sourcing `eye_aspect` from `GetEyebrowAspect()`.
+- Fixed in this pass: `IsValid()` now lives in the correct owner file and mirrors the upstream range checks.
+
+### Missing items
+- more literal representation of upstream `u16_be` / packed union field names if the file is ever rewritten for closer line-by-line visual parity
+
+### Binary layout verification
+- PASS: `Ver3StoreData` remains asserted to upstream size `0x60`.
+- PASS: `NfpStoreDataExtension` remains asserted to upstream size `0x8`.
+
+## 2026-04-15 — `core/src/hle/service/mii/mii_manager.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/hle/service/mii/mii_manager.{h,cpp}` (Ver3 convert slice)
+
+### Intentional differences
+- Rust still returns `ResultCode` directly and constructs temporary owner-local `StoreData`/`CharInfo` values instead of using upstream `Out<T>` references. This is the existing mechanical adaptation for this owner.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `ConvertV3ToCharInfo(...)` now lives in the correct owner file and follows the upstream `IsValid -> BuildToStoreData -> font-region check -> SetFromStoreData` flow.
+
+### Missing items
+- none in this specific conversion owner beyond the general owned-value adaptation above
+
+### Binary layout verification
+- PASS: conversion/control-flow slice only; no raw struct layout changed here.
+
+## 2026-04-15 — `core/src/hle/service/mii/mii.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/hle/service/mii/mii.cpp` (Ver3 convert command slice)
+
+### Intentional differences
+- Rust still uses manual `RequestParser` / `ResponseBuilder` handling in place of upstream CMIF `Out<T>` wrappers.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: command `23` (`Convert`) now exists in the correct owner file and routes through `MiiManager::convert_v3_to_char_info(...)`.
+- Fixed in this pass: command `23` no longer serializes an explicit fallback `CharInfo` payload on error; it now returns only the `ResultCode`, matching upstream CMIF `Out<CharInfo>` behavior more closely.
+
+### Missing items
+- none in this command owner beyond the general manual CMIF adaptation
+
+### Binary layout verification
+- PASS: command `23` writes upstream `CharInfo` size from the owner-local type.
+
+## 2026-04-15 — `core/src/hle/service/cmif_serialization.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/hle/service/cmif_serialization.h`
+
+### Intentional differences
+- Rust now owns the CMIF argument/layout machinery in this file (`ArgumentType`, `ArgumentTraits`, `UnwrapArg`, `ArgumentDescriptor`, `RequestLayout`, layout/count helpers, `CmifRequest`, `CmifResponse`, `write_out_array_bytes`), but it is still implemented as a runtime helper layer instead of the upstream compile-time template metaprogramming (`D<&Method>`, recursive `ReadInArgument` / `WriteOutArgument`, `CmifReplyWrapImpl(...)`).
+- Rust uses the dedicated wrapper [cmif_types.rs](/home/vricosti/Dev/emulators/ruzu/core/src/hle/service/cmif_types.rs) `OutInterface<T>` where upstream uses the alias `Out<SharedPointer<T>>`. This is a stable-Rust adaptation that preserves CMIF ownership and allows framework-local argument classification without conflicting trait impls.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: there was no owner-local CMIF helper layer here, so service owners like `mii.rs` were still manually constructing `RequestParser`/`ResponseBuilder` flows for every command.
+- Fixed in this pass: the helper layer now also owns the exercised `Out<SharedPointer<T>>` reply path via `CmifResponse::push_interface(...)`, instead of leaving move-interface marshalling in `mii.rs`.
+- Fixed in this pass: upstream layout/count ownership (`GetInRawDataSize`, `GetOutRawDataSize`, `GetArgumentTypeCount`, `GetReplyInLayout`, `GetReplyOutLayout`) now lives in the correct framework owner instead of being absent entirely.
+
+### Missing items
+- Upstream automatic tuple-driven argument unwrap/classification is still not literal; the current layout code consumes runtime `ArgumentDescriptor` slices rather than compile-time method signatures.
+- Upstream recursive `ReadInArgument(...)`, `WriteOutArgument(...)`, and `CmifReplyWrapImpl(...)` are still not ported.
+- The current helper layer still only covers the exercised scalar/raw-data, out-buffer, and out-interface reply patterns used by `mii.rs`.
+
+### Binary layout verification
+- PASS: this helper layer does not define wire structs; it delegates raw object layout to owner-local types and writes through the existing HIPC buffer path.
+
+## 2026-04-15 — `core/src/hle/service/cmif_types.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/hle/service/cmif_types.h`
+
+### Intentional differences
+- Rust represents the CMIF wrapper surface with raw-pointer/slice-backed structs (`Out<T>`, `InCopyHandle<T>`, `OutCopyHandle<T>`, `OutMoveHandle<T>`, `Buffer<T, A>`, `InLargeData<T, A>`, `OutLargeData<T, A>`) instead of literal C++ implicit-conversion classes. This keeps the ownership and pointer semantics in the correct file while adapting to Rust syntax.
+- Rust represents upstream `using OutInterface = Out<SharedPointer<T>>` as the dedicated wrapper `OutInterface<T>`. This is a stable-Rust adaptation so the framework can classify out-interface arguments without conflicting blanket trait impls.
+- `InBuffer`/`OutBuffer`/`InArray`/`OutArray` alias the generic `Buffer<T, A>` directly with caller-supplied combined attrs, instead of spelling `BufferAttr_In | A` / `BufferAttr_Out | A` in the alias type. This is a stable-Rust const-generics limitation, not an ownership change.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `cmif_types.rs` previously claimed to own `Buffer`, `InBuffer`, `OutBuffer`, `InLargeData`, and `OutLargeData`, but those wrappers were not actually implemented.
+- Fixed in this pass: `InCopyHandle`, `OutCopyHandle`, and `OutMoveHandle` now match upstream generic ownership more closely instead of using a Rust-only untyped handle container shape.
+
+### Missing items
+- The implicit-conversion ergonomics of the upstream wrapper classes are still not literal; Rust callers construct wrappers explicitly.
+- No framework consumer yet uses the new wrapper surface to drive automatic CMIF dispatch.
+
+### Binary layout verification
+- PASS: `ClientProcessId` remains `#[repr(C)]` with a single `u64`, matching upstream wire expectations.
+- PASS: the newly added wrapper types are pointer/slice holders only and are not themselves serialized as raw payload structs.
+
+## 2026-04-15 — `core/src/hle/service/service.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/hle/service/service.h`
+
+### Intentional differences
+- Rust still uses the existing trait-object `ServiceFramework` dispatch instead of the upstream CRTP `ServiceFramework<Self>` plus template member-pointer erasure. This is the existing framework adaptation.
+- Upstream `FunctionInfoTyped<T>` still has no literal Rust counterpart; Rust keeps the erased `FunctionInfo` plus callback function pointer shape.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `service.rs` now owns an upstream-shaped `FunctionInfo::new(...)` constructor plus `build_handler_map_from_infos(...)`, so the framework can build handler tables from real `FunctionInfo` entries rather than only from the Rust-only tuple helper.
+
+### Missing items
+- Literal `D<&Method>` / `C<&Method>` wrapper generation is still not ported.
+- `ServiceFrameworkBase` / `FunctionInfoTyped<T>` split is still not represented literally; Rust still uses a single trait-based dispatch owner.
+
+### Binary layout verification
+- PASS: framework-dispatch slice only; no raw serialized payload structs changed here.
+
+## 2026-04-15 — `core/src/hle/service/mii/mii.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/hle/service/mii/mii.cpp` (CMIF helper slice)
+
+### Intentional differences
+- `IDatabaseService` now routes its command marshalling through the local `cmif_serialization.rs` helper layer (`CmifRequest`, `CmifResponse`, `write_out_array_bytes`) instead of writing `RequestParser` / `ResponseBuilder` sequences inline. This is the Rust counterpart to upstream CMIF wrapper ownership, but it is still a reduced runtime helper layer rather than the literal template-generated `D<&Method>` dispatch.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `IDatabaseService` no longer manually owns CMIF request/response marshalling for commands `0-17`, `20-26`; that owner-local serialization boilerplate now lives in `cmif_serialization.rs`.
+- Fixed in this pass: `Get2` / `Get3` now use the same owner-local out-buffer helper path as `Get` / `Get1`, instead of mixing direct `ctx.write_buffer(...)` calls with manual response building.
+- Fixed in this pass: `IsBrokenDatabaseWithClearFlag` now serializes its `bool` out-parameter through the CMIF helper layer instead of manually pushing a raw `u8`.
+- Fixed in this pass: `IStaticService::GetDatabaseService` no longer uses a direct `ResponseBuilder` path for move-object emission; that exercised `Out<SharedPointer<T>>` marshalling now also lives in `cmif_serialization.rs`.
+
+### Missing items
+- `mii.rs` still depends on the reduced local CMIF helper layer, not the full upstream template-generated wrapper semantics.
+
+### Binary layout verification
+- PASS: command result/data word counts are unchanged; this slice only moved marshalling ownership out of the service owner without changing `CharInfo`, `StoreData`, `StoreDataElement`, `CoreData`, or `Ver3StoreData` payload sizes.
+
+## 2026-04-15 — `core/src/hle/service/cmif_serialization.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/hle/service/cmif_serialization.h` (scalar request helper slice)
+
+### Intentional differences
+- Rust still exposes a runtime helper facade (`CmifRequest`) over `RequestParser` instead of the upstream template-generated `ReadInArgument(...)` recursion. Ownership remains in the correct framework file.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: the local CMIF helper layer did not own aligned scalar reads, so active owners still had to fall back to direct `RequestParser` calls for `u32`, `u64`, and alignment-sensitive decoding.
+
+### Missing items
+- Full upstream recursive request-argument deserialization is still not ported; `CmifRequest::{u32,u64,align_for}` is only the narrow helper surface needed by currently exercised owners.
+
+### Binary layout verification
+- PASS: helper-only change; no raw payload structs changed.
+
+## 2026-04-15 — `core/src/hle/service/audio/audio_renderer_manager.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/hle/service/audio/audio_renderer_manager.h/.cpp` (CMIF ownership slice)
+
+### Intentional differences
+- Rust still materializes `IAudioRenderer` through the existing `audio_core()` bridge and explicit kernel-object registration rather than the literal upstream `std::make_unique<Manager>` / constructor-owned event lifecycle. Ownership remains in `audio_renderer_manager.rs`.
+- Rust still uses `AudioRendererParameterBlob` plus owner-local logging/byte extraction instead of the literal upstream typed `AudioRendererParameterInternal` structure. This is the current crate-boundary adaptation for the exercised request payload.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `OpenAudioRenderer`, `GetWorkBufferSize`, `GetAudioDeviceService`, and `GetAudioDeviceServiceWithRevisionInfo` no longer own direct `RequestParser` / `ResponseBuilder` marshalling; that exercised CMIF serialization path now lives in `cmif_serialization.rs`.
+
+### Missing items
+- Upstream session-limit / session-id management via `AudioCore::Renderer::Manager` still is not represented literally in this owner; Rust still delegates session creation through the broader `audio_core()` bridge.
+- `OpenAudioRendererForManualExecution` remains a null handler, matching upstream registration but still unimplemented.
+
+### Binary layout verification
+- PASS: `AudioRendererParameterBlob` remains `0x34`, matching the upstream request payload size used by this owner.
+
+## 2026-04-16 — `core/src/hle/service/cmif_serialization.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/hle/service/cmif_serialization.h` (audio-device scalar/copy helper slice)
+
+### Intentional differences
+- Rust still routes request/reply marshalling through the reduced runtime helper layer instead of upstream template recursion. Ownership remains in the framework owner file.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: the helper layer still lacked exercised scalar `f32` request parsing and reply/copy-handle writers, so active audio service owners had to keep direct `RequestParser` / `ResponseBuilder` usage for those paths.
+
+### Missing items
+- Full recursive `ReadInArgument(...)` / `WriteOutArgument(...)` / `CmifReplyWrapImpl(...)` parity is still not ported.
+
+### Binary layout verification
+- PASS: helper-only change; no raw payload structs changed.
+
+## 2026-04-16 — `core/src/hle/service/audio/audio_device.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/hle/service/audio/audio_device.h/.cpp` (CMIF ownership slice)
+
+### Intentional differences
+- Rust still reaches the backend through the existing `AudioCoreInterface` bridge instead of owning a literal upstream `std::unique_ptr<AudioDevice> impl`.
+- Single-name output commands still write directly through `ctx.write_buffer(...)`; the current local CMIF helper layer only owns result/raw/copy-handle marshalling, not typed out-array wrappers.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `IAudioDevice` no longer owns direct `RequestParser` / `ResponseBuilder` marshalling for its exercised commands. `ListAudioDeviceName`, `Set/GetAudioDeviceOutputVolume`, `GetActiveAudioDeviceName`, `QueryAudioDevice{System,Input,Output}Event`, `GetActiveChannelCount`, `GetActiveAudioDeviceNameAuto`, `GetActiveAudioOutputDeviceName`, and `ListAudioOutputDeviceName` now route their exercised CMIF result/raw/copy-handle serialization through `cmif_serialization.rs`.
+
+### Missing items
+- Exact upstream insufficient-buffer result handling for empty/undersized input and output name arrays is still not literal.
+- The constructor/destructor event lifecycle is still adapted through Rust `ServiceContext` + `Event` ownership, not a literal upstream `Kernel::KEvent*` close path.
+
+### Binary layout verification
+- PASS: audio-device names are still serialized as packed `0x100`-byte entries, matching upstream `AudioDevice::AudioDeviceName`.
+
+## 2026-04-16 — `core/src/hle/service/audio/audio_renderer.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/hle/service/audio/audio_renderer.h/.cpp` (CMIF ownership slice)
+
+### Intentional differences
+- Rust still owns the renderer backend through `Box<dyn AudioRendererSessionInterface>` plus explicit kernel-event registration, instead of the literal upstream `Manager&`, `Renderer`, and `ServiceContext` ownership shape.
+- `RequestUpdate{,Auto}` still uses direct HIPC buffer reads plus backend delegation rather than literal upstream typed `InBuffer` / `OutBuffer` wrapper dispatch.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: the exercised scalar/result/copy-handle CMIF marshalling no longer lives directly in `audio_renderer.rs`. `GetSampleRate`, `GetSampleCount`, `GetMixBufferCount`, `GetState`, `RequestUpdate{,Auto}` reply emission, `Start`, `Stop`, `QuerySystemEvent`, `SetRenderingTimeLimit`, `GetRenderingTimeLimit`, `SetVoiceDropParameter`, and `GetVoiceDropParameter` now route through `cmif_serialization.rs`.
+
+### Missing items
+- Literal upstream constructor/destructor ownership (`service_context`, `manager`, `process_handle->Open()/Close()`, `impl->Initialize()/Finalize()`) is still not represented in this file.
+- Exact typed CMIF buffer wrapper dispatch for `RequestUpdate` / `RequestUpdateAuto` is still not ported.
+
+### Binary layout verification
+- PASS: no raw serialized payload struct layout changed in this slice; only CMIF request/reply ownership moved out of the service owner.
+
+## 2026-04-16 — `core/src/hle/service/audio/audio_out_manager.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/hle/service/audio/audio_out_manager.h/.cpp` (CMIF ownership slice)
+
+### Intentional differences
+- Rust still exposes the existing stub backend and creates `IAudioOut` directly, instead of the literal upstream `AudioCore::AudioOut::Manager` ownership/session-id path.
+- `OpenAudioOut{,Auto}` still ignores the upstream typed input array / parameter / process-handle decode and returns the current fixed stub output. This behavioral gap predates this CMIF-ownership slice.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `IAudioOutManager` no longer owns direct `ResponseBuilder` marshalling for `ListAudioOuts`, `OpenAudioOut`, `ListAudioOutsAuto`, and `OpenAudioOutAuto`. Exercised CMIF result/raw/interface serialization now routes through `cmif_serialization.rs`.
+
+### Missing items
+- Literal upstream request decoding (`InArray<AudioDeviceName>`, `AudioOutParameter`, `InCopyHandle<KProcess>`, `ClientAppletResourceUserId`) is still not ported in this owner.
+- Literal upstream `AudioOut::Manager` lifecycle (`LinkToManager`, `AcquireSessionId`, session table ownership, backend initialize path) is still not represented here.
+
+### Binary layout verification
+- PASS: this slice only moved CMIF reply ownership; no raw audio parameter struct layout changed.
+
+## 2026-04-16 — `core/src/hle/service/audio/audio_out.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/hle/service/audio/audio_out.h/.cpp` (CMIF ownership slice)
+
+### Intentional differences
+- Rust still exposes the current stub backend with a lazily created readable event, instead of the literal upstream `AudioCore::AudioOut::Out`, `ServiceContext`, `KEvent*`, `KProcess*`, and destructor-owned lifecycle.
+- `AppendAudioOutBuffer{,Auto}`, `GetReleasedAudioOutBuffers{,Auto}`, buffer accounting, playback state, and volume are still stubbed; this slice only moves active CMIF marshalling ownership.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `IAudioOut` no longer owns direct `ResponseBuilder` marshalling for `GetAudioOutState`, `Start`, `Stop`, `RegisterBufferEvent`, `GetReleasedAudioOutBuffers{,Auto}`, `ContainsAudioOutBuffer`, `AppendAudioOutBuffer{,Auto}`, `GetAudioOutBufferCount`, `GetAudioOutPlayedSampleCount`, `FlushAudioOutBuffers`, `SetAudioOutVolume`, and `GetAudioOutVolume`. Exercised result/raw/copy-handle serialization now routes through `cmif_serialization.rs`.
+- Fixed in this pass: `SetAudioOutVolume` now consumes its scalar `f32` input through `CmifRequest` instead of ignoring the incoming request payload entirely.
+
+### Missing items
+- Literal upstream constructor/destructor ownership (`ServiceContext`, event close path, process open/close, `impl->Free()`) is still not represented in this owner.
+- Literal upstream typed buffer/request semantics (`InArray<AudioOutBuffer>`, `OutArray<u64>`, real released-buffer count) are still not ported.
+
+### Binary layout verification
+- PASS: this slice only moved CMIF request/reply ownership; no raw `AudioOutBuffer` or audio parameter layout changed.
+
+## 2026-04-16 — `core/src/hle/service/cmif_serialization.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/hle/service/cmif_serialization.h` (audio-out scalar helper slice)
+
+### Intentional differences
+- Rust still uses a reduced runtime CMIF helper layer instead of the upstream template-generated serializer recursion.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: the helper layer still lacked `u64` reply emission, forcing active owners to fall back or fail when moving `GetAudioOutPlayedSampleCount` onto `CmifResponse`.
+
+### Missing items
+- Full recursive `WriteOutArgument(...)` / `CmifReplyWrapImpl(...)` parity is still not ported.
+
+### Binary layout verification
+- PASS: helper-only change; no raw payload structs changed.
+
+## 2026-04-16 — `core/src/hle/service/audio/audio_in_manager.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/hle/service/audio/audio_in_manager.h/.cpp` (CMIF ownership slice)
+
+### Intentional differences
+- Rust still exposes the current stub backend and does not own the literal upstream `AudioCore::AudioIn::Manager` lifecycle/session-id path.
+- `OpenAudioIn{,Auto,ProtocolSpecified}` still ignores the upstream typed input arrays / parameter / process-handle / protocol decode and returns the current fixed stub output. This behavioral gap predates this CMIF-ownership slice.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `IAudioInManager` no longer owns direct `ResponseBuilder` marshalling for `ListAudioIns`, `OpenAudioIn`, `ListAudioInsAuto`, `OpenAudioInAuto`, `ListAudioInsAutoFiltered`, and `OpenAudioInProtocolSpecified`. Exercised CMIF result/raw serialization now routes through `cmif_serialization.rs`.
+
+### Missing items
+- Literal upstream request decoding (`InArray<AudioDeviceName>`, `AudioInParameter`, `InCopyHandle<KProcess>`, `ClientAppletResourceUserId`, `Protocol`) is still not ported in this owner.
+- Literal upstream `AudioIn::Manager` lifecycle (`LinkToManager`, `AcquireSessionId`, session table ownership, backend open path) is still not represented here.
+
+### Binary layout verification
+- PASS: this slice only moved CMIF reply ownership; no raw audio parameter struct layout changed.
+
+## 2026-04-16 — `core/src/core.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/core.h` and `/home/vricosti/Dev/emulators/zuyu/src/core/core.cpp` (AudioIn bridge slice)
+
+### Intentional differences
+- Rust still uses crate-boundary bridge traits in `core.rs` because `core` cannot directly own `audio_core` concrete types without recreating a crate cycle absent from the C++ build.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: the `AudioCoreInterface` bridge no longer stops at renderer/audio-device ownership. It now also owns the exercised `AudioIn` manager/session bridge needed by `audin:u`.
+
+### Missing items
+- `AudioOut` still does not have a corresponding behavioral bridge slice; the broader audio service tree still mixes bridged and stubbed owners.
+
+### Binary layout verification
+- PASS: the new bridge payloads use explicit fixed-size raw blobs (`0x8` for `AudioInParameter`, `0x100` for device names, `0x28` for `AudioInBuffer`) matching the upstream wire-visible layouts they represent.
+
+## 2026-04-16 — `audio_core/src/audio_core.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/audio_core/audio_core.cpp` (AudioIn bridge slice)
+
+### Intentional differences
+- Rust still exposes `AudioIn` through the `AudioCoreInterface` bridge instead of direct ownership from `core`, due the crate boundary between `core` and `audio_core`.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `AudioCore` now owns a real `AudioInManager` backend and can open real `AudioIn` sessions instead of leaving `audin:u` permanently stubbed.
+- Fixed in this pass: `AudioCore` now returns the opened `AudioIn` session, output parameter block, and output device name through an owner-local bridge result instead of forcing the service layer to synthesize them.
+
+### Missing items
+- The `AudioIn` bridge still does not consume or use the process handle in the backend the way upstream constructor ownership does; process refcount/lifecycle remains owned by the service layer adaptation.
+
+### Binary layout verification
+- PASS: `AudioInParameter` is decoded from a raw `0x8` blob with `read_unaligned`, and the returned parameter fields mirror upstream `AudioInParameterInternal` field order.
+
+## 2026-04-16 — `audio_core/src/in/audio_in.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/audio_core/in/audio_in.cpp/.h` (buffer-event bridge slice)
+
+### Intentional differences
+- Rust adds an optional kernel-readable-event bridge to the `AudioIn` owner so host-thread buffer release can wake HLE waiters across the crate boundary. Upstream does not need this adaptation because `core` and `audio_core` coexist in one C++ object graph.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `AudioIn` no longer drops the backend-side buffer-release signal on the floor when used through HLE services; it can now signal the kernel readable event path from the real backend release/flush flow.
+
+### Missing items
+- The bridge is still Rust-local and callback-based, not a literal upstream `KernelHelpers::ServiceContext` event owner inside `audio_core`.
+
+### Binary layout verification
+- PASS: helper-only/event-bridge change; no raw `AudioInBuffer` or parameter layout changed.
+
+## 2026-04-16 — `core/src/hle/service/audio/audio.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/hle/service/audio/audio.cpp` (audin owner wiring slice)
+
+### Intentional differences
+- None beyond the existing Rust service-factory adaptation.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `audin:u` is now constructed with `SystemRef`, matching the upstream ownership requirement for `IAudioInManager(system)` instead of a system-less stub owner.
+
+### Missing items
+- `audout:u` still uses the older no-system stub owner.
+
+### Binary layout verification
+- PASS: registration-only change.
+
+## 2026-04-16 — `core/src/hle/service/audio/audio_in_manager.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/hle/service/audio/audio_in_manager.h/.cpp` (behavioral owner slice)
+
+### Intentional differences
+- Rust still decodes the typed request payload through fixed-size raw blobs plus HIPC buffer helpers instead of literal upstream generated `InArray`/`OutArray` wrappers.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `IAudioInManager` no longer fabricates a fixed stub output. It now:
+  - stores `SystemRef`
+  - validates/resolves the incoming process handle
+  - decodes `AudioInParameter` and `Protocol`
+  - reads the input name buffer
+  - calls the real `AudioCoreInterface` `AudioIn` bridge
+  - creates a real `IAudioIn` sub-session
+  - returns real output parameters and output device name
+
+### Missing items
+- Literal upstream typed request wrapper generation is still missing.
+- Non-happy-path exactness around invalid/empty name buffers is still simplified relative to the literal C++ `InArray` wrapper semantics.
+
+### Binary layout verification
+- PASS: manager request decode uses fixed-size raw blobs matching upstream wire-visible sizes (`AudioInParameter` `0x8`, `Protocol` `0x8`, output name `0x100`).
+
+## 2026-04-16 — `core/src/hle/service/audio/audio_in.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/hle/service/audio/audio_in.h/.cpp` (behavioral owner slice)
+
+### Intentional differences
+- Rust still owns the backend through `Box<dyn AudioInSessionInterface>` plus explicit kernel event registration, instead of a literal upstream `std::shared_ptr<AudioCore::AudioIn::In> impl`, `ServiceContext`, and `KProcess*` close path.
+- Request buffer decoding still uses raw HIPC buffer reads instead of literal generated `InArray<AudioInBuffer>` wrappers.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `IAudioIn` is no longer a behavioral stub. It now:
+  - owns a real backend session
+  - exposes real state/start/stop paths
+  - appends real `AudioInBuffer` payloads
+  - returns real released-buffer tags/count
+  - checks real buffer membership/count
+  - forwards real gain and flush operations
+  - owns a real kernel event/readable-event pair for `RegisterBufferEvent`
+
+### Missing items
+- Literal upstream process `Open()/Close()` refcount ownership is still not represented because Rust `KProcess` does not expose the same object-refcount API on this path.
+- Exact typed `OutArray<u64>` wrapper semantics are still adapted through `write_out_array_bytes(...)`.
+
+### Binary layout verification
+- PASS: `AudioInBuffer` decode uses a fixed `0x28` raw blob, matching the upstream wire-visible struct size.
+
+## 2026-04-16 — `core/src/core.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/core.h` and `/home/vricosti/Dev/emulators/zuyu/src/core/core.cpp` (AudioIn wrapper follow-up)
+
+### Intentional differences
+- Rust still keeps the `core -> audio_core` crate-boundary bridge in this owner because `core` cannot directly own `audio_core::in::In` without recreating a crate cycle absent from upstream.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: the AudioIn bridge no longer exposes raw `[u8; 0x28]` / `[u8; 0x8]` blobs at the service boundary. `core.rs` now owns explicit wire structs:
+  - `AudioInBufferWire`
+  - `AudioInParameterWire`
+- Fixed in this pass: the service layer no longer stores `Box<dyn AudioInSessionInterface>` directly. `core.rs` now owns a concrete `AudioInSession` wrapper, which is the narrow Rust counterpart to upstream concrete session ownership.
+
+### Missing items
+- The bridge is still an adaptation and not a literal upstream concrete member layout in `core`, because the real owner remains in `audio_core`.
+
+### Binary layout verification
+- PASS: `AudioInBufferWire` is `repr(C)` `0x28` and `AudioInParameterWire` is `repr(C)` `0x8`, matching upstream `AudioInBuffer` and `AudioInParameter`.
+
+## 2026-04-16 — `audio_core/src/audio_core.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/audio_core/audio_core.cpp` (AudioIn typed-bridge follow-up)
+
+### Intentional differences
+- Rust still returns the opened AudioIn owner through the `core` bridge instead of direct cross-crate concrete ownership.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: the AudioIn bridge no longer reparses raw byte blobs inside `audio_core.rs`. `open_audio_input(...)` now consumes typed `AudioInParameterWire` and forwards a concrete `AudioInSession` wrapper in the bridge result.
+
+### Missing items
+- The process-handle side of upstream `IAudioIn` constructor ownership is still adapted in the service layer, not in this backend owner.
+
+### Binary layout verification
+- PASS: the typed bridge preserves upstream field order for `AudioInParameter` and the returned parameter block fields.
+
+## 2026-04-16 — `core/src/hle/service/audio/audio_in_manager.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/hle/service/audio/audio_in_manager.h/.cpp` (typed-request follow-up)
+
+### Intentional differences
+- Rust still uses `HLERequestContext` buffer helpers instead of literal generated `InArray<AudioDeviceName>` / `OutArray<AudioDeviceName>` CMIF wrappers.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: the request path no longer decodes `AudioInParameter` as an anonymous fixed-size blob. This owner now uses explicit upstream-shaped wire types:
+  - `AudioInParameterWire`
+  - `AudioDeviceNameWire`
+  - `Protocol`
+- Fixed in this pass: `open_audio_in_impl(...)` now forwards the typed `AudioInParameterWire` through the `core` bridge instead of rewrapping raw bytes.
+
+### Missing items
+- Input and output device-name buffers are still read/written through `ctx.read_buffer(...)` and `write_out_array_bytes(...)`, so literal generated `InArray` / `OutArray` wrapper parity is still not complete.
+- Empty/undersized buffer semantics are still only approximated through `can_read_buffer()` / `get_write_buffer_size()` checks, not through literal upstream wrapper behavior.
+
+### Binary layout verification
+- PASS: `AudioDeviceNameWire` is `repr(C)` `0x100`, and `AudioInParameterWire` remains `repr(C)` `0x8`, matching upstream wire-visible layouts.
+
+## 2026-04-16 — `core/src/hle/service/audio/audio_in.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/hle/service/audio/audio_in.h/.cpp` (session-wrapper follow-up)
+
+### Intentional differences
+- Rust still cannot store a literal upstream `std::shared_ptr<AudioCore::AudioIn::In>` in this file because the concrete backend owner lives in another crate. The local `AudioInSession` wrapper is the narrow adaptation used to preserve service ownership here.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `IAudioIn` no longer stores `Box<dyn AudioInSessionInterface>` directly. It now stores the concrete owner-local wrapper `AudioInSession`.
+- Fixed in this pass: `AppendAudioInBuffer{,Auto}` no longer forwards a raw `[u8; 0x28]` blob into the backend bridge. This owner now decodes an explicit `AudioInBufferWire` and passes that typed payload through the wrapper.
+
+### Missing items
+- Request buffer decode still uses `ctx.read_buffer(...)` instead of a literal generated `InArray<AudioInBuffer>` wrapper.
+- The wrapper still delegates to a trait object internally, so this is narrower ownership parity, not full literal concrete-member parity.
+
+### Binary layout verification
+- PASS: `AudioInBufferWire` decode remains `0x28` and field-aligned with upstream `AudioInBuffer`.
+
+## 2026-04-16 — `core/src/hle/service/cmif_serialization.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/hle/service/cmif_serialization.h` (typed array helper follow-up)
+
+### Intentional differences
+- Rust still does not have the upstream generated recursive `ReadInArgument(...)` / `WriteOutArgument(...)` wrapper path, so these typed array owners are reconstructed from copied HIPC buffers instead of zero-copy CMIF template machinery.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: this file now owns reusable typed array backing helpers:
+  - `CmifInArrayBuffer<T, A>`
+  - `CmifOutArrayBuffer<T, A>`
+- Fixed in this pass: active audio owners no longer have to decode typed arrays manually from raw buffer bytes in-file.
+
+### Missing items
+- Full literal generated CMIF wrapper dispatch is still not ported; these helpers are a runtime reconstruction layer, not the final upstream template machinery.
+
+### Binary layout verification
+- PASS: helper-only change; typed buffer reconstruction preserves caller-provided element sizes and alignments.
+
+## 2026-04-16 — `core/src/core.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/core.h` and `/home/vricosti/Dev/emulators/zuyu/src/core/core.cpp` (AudioIn concrete-bridge follow-up)
+
+### Intentional differences
+- Rust still uses a crate-boundary bridge because `core` cannot directly name `audio_core::in::In`.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `AudioInSession` no longer stores or delegates through `Box<dyn AudioInSessionInterface>`.
+- Fixed in this pass: `core.rs` now owns a concrete callback-table bridge:
+  - `AudioInSessionImpl` trait for compile-time implementation
+  - `AudioInSession` concrete wrapper with explicit callback pointers and Arc-backed lifetime management
+
+### Missing items
+- This is still a bridge, not a literal upstream concrete-member ownership graph, because the concrete backend type still lives in `audio_core`.
+- The bridge uses explicit callback pointers and raw Arc handles, which is a Rust adaptation absent from upstream.
+
+### Binary layout verification
+- PASS: `AudioInBufferWire` and `AudioInParameterWire` remain `repr(C)` and unchanged at `0x28` / `0x8`.
+
+## 2026-04-16 — `audio_core/src/audio_core.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/audio_core/audio_core.cpp` (AudioIn concrete-bridge follow-up)
+
+### Intentional differences
+- Rust still returns AudioIn through the `core` bridge rather than direct cross-crate concrete ownership.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `audio_core.rs` now implements the compile-time `AudioInSessionImpl` bridge contract instead of returning a boxed session trait object.
+- Fixed in this pass: `OpenAudioInput` now returns the concrete `core::AudioInSession::from_arc(...)` bridge owner.
+
+### Missing items
+- Backend ownership still differs from upstream because the service layer, not this file, owns the process/event side of the HLE object graph.
+
+### Binary layout verification
+- PASS: no wire layout changes beyond the already-audited AudioIn parameter structs.
+
+## 2026-04-16 — `core/src/hle/service/audio/audio_in_manager.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/hle/service/audio/audio_in_manager.h/.cpp` (typed `InArray`/`OutArray` follow-up)
+
+### Intentional differences
+- Handler dispatch is still manual Rust `ServiceFramework` callback registration, not upstream `D<&Method>` generation.
+- Buffer wrappers are reconstructed from copied HIPC buffers through `CmifInArrayBuffer` / `CmifOutArrayBuffer`, not zero-copy generated CMIF spans.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: the owner-local logic now uses typed CMIF-style wrappers:
+  - `OutArray<AudioDeviceNameWire, A>` in `list_audio_ins_auto_filtered(...)`
+  - `InArray<AudioDeviceNameWire, A>` and `OutArray<AudioDeviceNameWire, A>` in `open_audio_in_protocol_specified(...)`
+- Fixed in this pass: the earlier direct `ctx.read_buffer(...)` / `write_out_array_bytes(...)` device-name path is gone from this owner's core logic.
+
+### Missing items
+- `Out<AudioInParameterInternal>` is still serialized manually through `CmifResponse::push_raw(...)`, not through a literal generated `Out<T>` wrapper.
+- Invalid/empty buffer result behavior is still somewhat simplified relative to the exact upstream `InArray`/`OutArray` wrapper semantics.
+
+### Binary layout verification
+- PASS: `AudioDeviceNameWire` remains `0x100`, `AudioInParameterWire` remains `0x8`, and `AudioInParameterInternalWire` is `0x10`, matching upstream visible layouts.
+
+## 2026-04-16 — `core/src/hle/service/audio/audio_in.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/hle/service/audio/audio_in.h/.cpp` (typed `InArray`/`OutArray` follow-up)
+
+### Intentional differences
+- Rust still keeps explicit kernel event object bookkeeping in this owner instead of upstream `ServiceContext`/`KEvent*` destruction paths.
+- The backend is still reached through the concrete `AudioInSession` bridge rather than a literal `std::shared_ptr<AudioCore::AudioIn::In>`.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: owner-local logic now uses typed CMIF-style wrappers:
+  - `InArray<AudioInBufferWire, A>` in `append_audio_in_buffer{,_auto}(...)`
+  - `OutArray<u64, A>` in `get_released_audio_in_buffers{,_auto}(...)`
+- Fixed in this pass: the earlier direct `ctx.read_buffer(...)` decode path is gone from the core append/release logic in this owner.
+
+### Missing items
+- `RegisterBufferEvent`, scalar `Out<bool>`, `Out<u32>`, and `Out<f32>` paths still use the reduced runtime CMIF layer rather than literal generated wrappers.
+- The service still does not model upstream `KProcess::Open()/Close()` object refcount ownership literally.
+
+### Binary layout verification
+- PASS: `AudioInBufferWire` remains `0x28`; the typed `OutArray<u64>` path writes native `u64` entries with the upstream element width.
+
+## 2026-04-17 — `common/src/bounded_threadsafe_queue.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/common/bounded_threadsafe_queue.h`
+
+### Intentional differences
+- Rust uses a runtime-selected power-of-two capacity and heap-allocated slot storage (`Box<[UnsafeCell<MaybeUninit<T>>]>`) instead of the upstream compile-time template capacity and inline `std::array<T, Capacity>`. This preserves the same owner file and ring-buffer semantics while fitting current Rust call sites that construct queues with runtime `new(capacity)`.
+- Rust uses `Condvar` + `Mutex<()>` instead of `condition_variable_any` + `mutex`: mechanical synchronization adaptation with the same producer/consumer ownership split.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: the earlier `VecDeque`-backed queue is gone. `BoundedSPSCQueue` now owns atomic read/write indices and fixed-capacity ring-buffer storage, matching upstream structure much more closely.
+- Fixed in this pass: `BoundedMPSCQueue::emplace_wait(...)` now truly blocks on full capacity instead of inheriting effectively unbounded behavior from `VecDeque`.
+- Fixed in this pass: external owners can now wake blocked `pop_wait_with_stop(...)` callers through `notify_all()`, which restores the stop/wakeup path needed by `gpu_thread.rs`.
+
+### Missing items
+- The queue still uses explicit `store(..., Ordering::SeqCst)` updates rather than the upstream operator syntax; behavior is stronger-or-equal, but the exact atomic ordering mix has not been reduced to the minimum upstream set.
+- Full owner audit for `BoundedMPMCQueue` against the upstream header remains broader than the GPU-thread path exercised here.
+
+### Binary layout verification
+- PASS: runtime-only queue owner; no raw serialized struct layouts are involved.
+
+## 2026-04-17 — `video_core/src/gpu_thread.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/gpu_thread.h` and `/home/vricosti/Dev/emulators/zuyu/src/video_core/gpu_thread.cpp`
+
+### Intentional differences
+- Rust stores upstream `Core::System& system` as `SystemRef` and updates it later through `set_system_ref(...)` because `Gpu`/`ThreadManager` are constructed before the final `SystemRef` is available. This keeps ownership in `gpu_thread.rs` while adapting to Rust construction order.
+- Rust still uses `JoinHandle` plus an explicit `AtomicBool stop` instead of upstream `std::jthread`/`std::stop_token`.
+- Temporary diagnostic divergence in this pass: GPU thread priority is currently `High` instead of upstream `Critical` to isolate the runtime impact of the bounded-queue slice on sync/async MK8D progress before keeping or reverting that parity change.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `SynchState::queue` now uses the bounded `Common` queue owner instead of a local `Mutex<VecDeque<_>>`.
+- Fixed in this pass: `PushCommand(...)` now routes through blocking `EmplaceWait(...)` semantics on a bounded queue, matching upstream back-pressure behavior.
+- Fixed in this pass: the GPU worker thread now explicitly sets the thread name and `Critical` priority at thread entry, matching upstream `RunThread(...)`.
+- Fixed in this pass: `signaled_fence.store(...)` now uses `SeqCst`, matching the stronger default upstream store semantics instead of the earlier weaker `Release`.
+- Fixed in this pass: stop now wakes the bounded queue wait path directly, instead of only notifying a local `queue_cv` that no longer exists upstream-style.
+
+### Missing items
+- `flush_region(...)` is still behaviorally incomplete in async mode: the upstream `RequestFlush -> TickGPU -> WaitForSyncOperation` path remains only documented in comments here.
+- The Rust thread bootstrap still uses `Builder::name(\"GPU\")` plus direct context `make_current()/done_current()` calls, rather than upstream `MicroProfileOnThreadCreate/SCOPE_EXIT` and `context.Acquire()` ownership.
+- `last_fence` remains an `AtomicU64` in Rust instead of the upstream plain `u64` protected by `write_lock`.
+- The temporary thread-priority downgrade must be removed or kept only after measurement; upstream parity is still `Critical`.
+
+### Binary layout verification
+- PASS: command structs remain runtime-only owner types; no raw serialized layout changes were introduced in this pass.
+
+## 2026-04-17 — `video_core/src/fence_manager.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/fence_manager.h`
+
+### Intentional differences
+- Rust ports the upstream CRTP/template owner as a generic `FenceManager<F>` plus callback parameters instead of a traits class with direct member access. This preserves file ownership while adapting to Rust.
+- The upstream async-release thread path (`HAS_ASYNC_CHECK`, `jthread`, `ReleaseThreadFunc`) is still structurally reduced here; the currently exercised OpenGL owner uses the synchronous release path.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `try_release_pending_fences(...)` no longer bypasses the waiter path for stubbed fences. Upstream still reaches `PopAsyncFlushes()` after the signaled check path; Rust now does too.
+- Fixed in this pass: `signal_ordering(...)` now has explicit owner-local coverage proving the upstream order "release pending fences, then accumulate buffer flushes".
+
+### Missing items
+- The full upstream private-owner split (`ShouldWait`, `ShouldFlush`, `PopAsyncFlushes`, `CommitAsyncFlushes`) still lives as callback parameters here instead of direct member methods on the manager owner.
+- The literal upstream async fence release thread behavior remains unported in this generic owner.
+
+### Binary layout verification
+- PASS: runtime owner only; no raw serialized layout is involved in this slice.
+
+## 2026-04-17 — `video_core/src/renderer_opengl/gl_rasterizer.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_rasterizer.h/.cpp`
+
+### Intentional differences
+- Rust uses owner-local helper methods plus raw self-pointers in closures to adapt the upstream direct member access pattern used by `fence_manager`. This keeps the logic in `gl_rasterizer.rs` without redesigning ownership.
+- Locking uses Rust `ReentrantMutex`/guard pairs plus raw self-pointer closures instead of upstream `std::scoped_lock`, but preserves the same owner ordering (`buffer_cache`, `texture_cache`, then query-cache operation).
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `signal_fence`, `signal_sync_point`, `signal_reference`, and `release_fences` no longer pass placeholder `false` / no-op cache closures into `FenceManager`. They now route through real cache/query owner behavior.
+- Fixed in this pass: `signal_reference()` now accumulates buffer-cache flushes like upstream `SignalOrdering()`.
+- Fixed in this pass: `release_fences(false)` now pops committed async flushes even for stubbed fences, matching the upstream fence-manager path exercised by this owner.
+
+### Missing items
+- Broader `RasterizerOpenGL` parity remains incomplete outside this slice; many draw/cache/backend paths are still partially ported.
+- The OpenGL owner still depends on the reduced Rust `FenceManager` callback model rather than the upstream typed traits/member model.
+
+### Binary layout verification
+- PASS: no serialized layout changes in this slice; only owner control-flow and cache-callback wiring changed.
+
+## 2026-04-17 — `video_core/src/buffer_cache/buffer_cache.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/buffer_cache/buffer_cache.h` and `/home/vricosti/Dev/emulators/zuyu/src/video_core/buffer_cache/buffer_cache.cpp`
+
+### Intentional differences
+- Added `#[cfg(test)]` owner-local helpers to seed async-flush state from external module tests without breaking field privacy. These helpers do not exist upstream and are test-only.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: the owner mutex is now `parking_lot::ReentrantMutex<()>`, matching the upstream `std::recursive_mutex` ownership semantics instead of the earlier non-reentrant Rust `Mutex<()>`.
+- Fixed in this pass: owner-local tests now cover same-thread reentry on `buffer_cache.mutex`, which is an upstream contract relied on by the OpenGL rasterizer path.
+
+### Missing items
+- Broader buffer-cache parity remains outside this test-only support change.
+
+### Binary layout verification
+- PASS: test-only helper additions do not change runtime object layout or serialized payloads.
+
+## 2026-04-17 — `video_core/src/texture_cache/texture_cache_base.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/texture_cache_base.h`
+
+### Intentional differences
+- `AsyncDecodeContext::mutex` remains a plain Rust `Mutex<()>` because it corresponds to a distinct owner-local synchronization site, not the main cache-owner recursive mutex field.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `TextureCacheBase::mutex` is now `parking_lot::ReentrantMutex<()>`, matching the upstream owner field `std::recursive_mutex mutex`.
+- Fixed in this pass: owner-local tests now cover same-thread reentry on `TextureCacheBase::mutex`.
+
+### Missing items
+- Broader `TextureCacheBase` parity remains incomplete outside this mutex-ownership slice.
+
+### Binary layout verification
+- PASS: mutex owner change does not affect any raw serialized payload layout in this file.
+
+## 2026-04-17 — `video_core/src/renderer_opengl/gl_resource_manager.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_resource_manager.h/.cpp`
+
+### Intentional differences
+- This Rust owner is still incomplete overall; only the `OGLSync` slice was tightened in this pass.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `OGLSync` now exists in its upstream owner file instead of being duplicated ad hoc in `gl_fence_manager.rs`.
+- Fixed in this pass: `OGLSync::is_signaled()` now matches upstream behavior by using `glClientWaitSync(handle, 0, 0)` as a non-blocking poll, instead of the earlier `glGetSynciv(GL_SYNC_STATUS)` path.
+
+### Missing items
+- Broader `gl_resource_manager` parity remains incomplete outside the `OGLSync` slice.
+
+### Binary layout verification
+- PASS: RAII owner change only; no serialized layout change.
+
+## 2026-04-17 — `video_core/src/renderer_opengl/gl_fence_manager.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_fence_manager.h/.cpp`
+
+### Intentional differences
+- Rust still represents upstream `std::shared_ptr<GLInnerFence>` as `Arc<Mutex<GLInnerFence>>`. This preserves shared ownership semantics while adapting mutation of the wrapped sync object to Rust.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `GLInnerFence` no longer owns a duplicate raw `GLsync` implementation; it now delegates to `OGLSync` in the correct upstream owner.
+- Fixed in this pass: `GLInnerFence::is_signaled()` now inherits the upstream non-blocking poll semantics through `OGLSync::is_signaled()`.
+
+### Missing items
+- The `Arc<Mutex<...>>` adaptation is still structurally heavier than upstream `shared_ptr`, and the exact ownership graph remains a Rust adaptation.
+
+### Binary layout verification
+- PASS: runtime owner only; no serialized layout is involved.
+
+## 2026-04-17 — `video_core/src/renderer_base.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_base.h/.cpp`
+
+### Intentional differences
+- Rust still uses post-construction setter hooks for renderer dependencies because renderer creation/lifetime is not yet constructor-identical to upstream.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `RendererBase` can now carry the rasterizer-side guest-memory writer and GPU tick getter owner chain instead of forcing query callsites to thread them through `RasterizerInterface::query(...)`.
+
+### Missing items
+- Full upstream constructor-time dependency ownership instead of Rust setter-based injection.
+
+### Binary layout verification
+- PASS: trait/owner wiring only; no raw struct layout involved.
+
+## 2026-04-17 — `video_core/src/gpu.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/gpu.h/.cpp`
+
+### Intentional differences
+- Rust still injects renderer dependencies through callbacks rather than the upstream direct constructor references.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `Gpu::bind_renderer()` now propagates the GPU tick getter into the renderer chain, and `set_guest_memory_writer()` now propagates the active guest-memory writer into the bound renderer owner.
+
+### Missing items
+- Broader renderer/GPU constructor ownership parity remains incomplete.
+
+### Binary layout verification
+- PASS: runtime owner wiring only; no guest-visible raw layout changed.
+
+## 2026-04-17 — `video_core/src/rasterizer_interface.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/rasterizer_interface.h`
+
+### Intentional differences
+- Rust still models the interface as a trait-object boundary instead of the upstream concrete virtual class hierarchy.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `RasterizerInterface::query(...)` no longer carries Rust-only `gpu_ticks` and `gpu_write` parameters through the interface; those responsibilities now belong to the rasterizer owners, which is closer to upstream.
+
+### Missing items
+- Full upstream concrete-owner wiring without the Rust trait-object adaptation.
+
+### Binary layout verification
+- PASS: interface-only file; no raw struct layout involved.
+
+## 2026-04-17 — `video_core/src/query_cache_top.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/query_cache.h`
+
+### Intentional differences
+- Rust still uses `QueryCacheLegacy` instead of the exact backend-specific upstream query-cache types because `gl_query_cache.rs` and the full streamer/runtime stack remain incomplete.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: fallback query write timing now lives in the query-cache owner instead of `gl_rasterizer.rs`.
+- Fixed in this pass: timestamped fallback writes now source ticks from the rasterizer-installed GPU tick getter at execution time instead of from an upstream-foreign engine-supplied query argument.
+
+### Missing items
+- Full `QueryCache::Query(...)` / streamer / cached-query ownership.
+- OpenGL-specific overlapping-region invalidation/flush ownership in `gl_query_cache.rs`.
+
+### Binary layout verification
+- PASS: no guest-visible raw struct layout added in this owner slice.
+
+## 2026-04-17 — `video_core/src/renderer_opengl/gl_rasterizer.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_rasterizer.cpp`
+
+### Intentional differences
+- Rust still routes the query path through `QueryCacheLegacy` rather than the exact upstream OpenGL `QueryCache` type.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `RasterizerOpenGL::query(...)` no longer owns the Rust-only guest-write callback bridge or engine-supplied `gpu_ticks`; it now delegates query timing/writes to the query-cache owner and sources timestamps from its installed GPU tick getter.
+
+### Missing items
+- Full OpenGL `query_cache.Query(...)` ownership through `gl_query_cache.rs`.
+- Upstream GPU-memory/device-memory ownership instead of the Rust callback bridge stored on the rasterizer.
+
+### Binary layout verification
+- PASS: no raw struct layout; query ordering/timestamp behavior is covered by targeted tests.
+
+## 2026-04-17 — `video_core/src/renderer_null/null_rasterizer.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_null/null_rasterizer.h/.cpp`
+
+### Intentional differences
+- Rust still injects the guest-memory writer and GPU tick getter through setter hooks rather than upstream constructor ownership.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `RasterizerNull::query(...)` no longer depends on Rust-only `gpu_ticks` and `gpu_write` interface parameters; it now sources both from rasterizer-owned callbacks, which is closer to upstream ownership.
+
+### Missing items
+- Constructor-time dependency ownership parity.
+
+### Binary layout verification
+- PASS: no raw struct layout; query behavior is covered by targeted tests.
+
+## 2026-04-17 — `video_core/src/renderer_null/renderer_null.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_null/renderer_null.h/.cpp`
+
+### Intentional differences
+- Rust still forwards dependency installation through `RendererBase` setter hooks.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `RendererNull` now forwards the guest-memory writer and GPU tick getter into `RasterizerNull`, aligning the renderer-to-rasterizer owner path with the rest of the Rust renderer chain.
+
+### Missing items
+- Upstream constructor-time dependency ownership.
+
+### Binary layout verification
+- PASS: renderer owner file only; no raw struct layout involved.
+
+## 2026-04-17 — `video_core/src/renderer_opengl/mod.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/renderer_opengl.h/.cpp`
+
+### Intentional differences
+- Rust still wires renderer dependencies post-construction instead of the upstream constructor signature.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `RendererOpenGL` now forwards the guest-memory writer and GPU tick getter into `RasterizerOpenGL`, so the OpenGL query path no longer depends on upstream-foreign engine-supplied query arguments.
+
+### Missing items
+- Constructor-time dependency ownership parity.
+
+### Binary layout verification
+- PASS: renderer owner file only; no raw struct layout involved.
+
+## 2026-04-17 — `video_core/src/engines/maxwell_3d.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/engines/maxwell_3d.cpp`
+
+### Intentional differences
+- Rust still keeps the existing fallback path that writes query results directly when no rasterizer is bound.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: the rasterizer query callsite no longer forwards Rust-only `gpu_ticks` and guest-write callback arguments; those responsibilities now live behind the rasterizer/query-cache owners.
+
+### Missing items
+- Broader query/report owner parity around the remaining fallback path.
+
+### Binary layout verification
+- PASS: engine owner file only; no raw struct layout involved.
+
+## 2026-04-17 — `video_core/src/memory_manager.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/memory_manager.h/.cpp`
+
+### Intentional differences
+- Rust still uses a stored guest-memory writer closure as the adaptation layer from video-core writes into core guest memory.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: the active OpenGL query/inline-writeback path no longer requires the rasterizer to own a Rust-only guest-memory callback; `MemoryManager` now owns the write bridge for the bound channel path.
+
+### Missing items
+- Literal upstream typed device-memory ownership instead of the Rust closure bridge.
+
+### Binary layout verification
+- PASS: no raw struct layout changed in this slice.
+
+## 2026-04-17 — `video_core/src/control/channel_state.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/control/channel_state.cpp`
+
+### Intentional differences
+- Rust still injects the guest-memory write bridge from the `Gpu` service boundary rather than constructor-initializing every owner with a typed core memory service.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: the channel now installs the same guest-memory writer on the bound `MemoryManager`, so OpenGL query/writeback no longer depends on rasterizer-local callback state.
+
+### Missing items
+- Broader constructor-time dependency ownership parity.
+
+### Binary layout verification
+- PASS: owner/plumbing file only; no raw struct layout involved.
+
+## 2026-04-17 — `video_core/src/renderer_opengl/gl_query_cache.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_query_cache.h/.cpp`
+
+### Intentional differences
+- Rust still keeps a reduced active-path port instead of the full upstream cached-query/counter-stream stack.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: the active OpenGL query owner is now `gl_query_cache.rs` rather than `query_cache_top.rs`.
+- Fixed in this pass: fallback query writes and timeout timestamps now route through the bound channel `MemoryManager`, which is closer to upstream `gpu_memory->Write<...>()` ownership than the old rasterizer-owned callback.
+
+### Missing items
+- Full `QueryCacheLegacy<QueryCache, CachedQuery, CounterStream, HostCounter>` behavior from upstream `query_cache.h`.
+- Real OpenGL query object/cached-query streamer behavior instead of the reduced active-path owner methods.
+
+### Binary layout verification
+- PASS: no raw struct layout involved; targeted query tests cover write ordering and payload shape.
+
+## 2026-04-17 — `video_core/src/renderer_opengl/gl_rasterizer.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_rasterizer.cpp`
+
+### Intentional differences
+- Rust still keeps the reduced callback-based `signal_fence` / `sync_operation` wiring instead of the literal upstream typed owner stack.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `RasterizerOpenGL::query(...)` no longer owns guest-memory writeback or explicit GPU-tick plumbing for the active OpenGL path; it delegates to `gl_query_cache.rs`.
+- Fixed in this pass: `accelerate_inline_to_memory(...)` now writes through the bound `MemoryManager` owner instead of a rasterizer-local writer closure.
+- Fixed in this pass: binding a channel now also binds its `MemoryManager` into the OpenGL query owner.
+
+### Missing items
+- Full upstream `Query(...)` / `QueryFallback(...)` split for every query type.
+- Broader `gl_rasterizer.cpp` parity outside this query/writeback owner slice.
+
+### Binary layout verification
+- PASS: no raw struct layout involved; targeted OpenGL query tests pass after switching to CPU-address writeback through `MemoryManager`.
+
+## 2026-04-17 — `video_core/src/renderer_opengl/mod.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/renderer_opengl.h/.cpp`
+
+### Intentional differences
+- Rust still installs dependencies through `RendererBase` setters rather than the upstream constructor shape.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `RendererOpenGL::set_guest_memory_writer(...)` no longer pretends the rasterizer owns this path; active OpenGL writeback now goes through the channel `MemoryManager`.
+
+### Missing items
+- Constructor-time dependency ownership parity.
+
+### Binary layout verification
+- PASS: renderer owner file only; no raw struct layout involved.
+
+## 2026-04-17 — `video_core/src/engines/puller.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/engines/puller.cpp`
+
+### Intentional differences
+- Rust still carries local tracing helpers around semaphore writeback investigation.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `Puller` no longer constructs a Rust-only guest-write callback and tick payload for rasterizer queries; semaphore query/release now call the slimmer rasterizer interface that matches upstream ownership more closely.
+
+### Missing items
+- Broader semaphore/query owner parity outside this interface cleanup.
+
+### Binary layout verification
+- PASS: engine owner file only; no raw struct layout involved.
+
+## 2026-04-17 — `core/src/hle/kernel/k_memory_block_manager.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/k_memory_block_manager.cpp`
+
+### Intentional differences
+- Rust uses a `BTreeMap`-backed manager instead of upstream intrusive red-black tree nodes and slab-allocator free paths. This is still the existing container adaptation for the owner file.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `KMemoryBlockManager::CoalesceForUpdate` now follows the upstream iterator walk instead of coalescing over a precomputed key snapshot. The old Rust logic could stop after the first right-neighbor merge and leave a still-mergeable tail block behind.
+
+### Missing items
+- Full allocator/slab ownership parity for block split/free operations.
+- Broader line-by-line audit of the remaining update helpers beyond the corrected `CoalesceForUpdate` walk.
+
+### Binary layout verification
+- PASS: no raw serialized struct layout changed in this slice; added regression test covers the coalesce ordering contract.
+
+## 2026-04-18 — `core/src/hle/service/filesystem/filesystem.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/hle/service/filesystem/filesystem.cpp`
+
+### Intentional differences
+- Rust routes upstream `system.RegisterContentProvider(...)` through `System::set_content_provider(...)` plus `FileSystemController::set_content_provider(...)` because the Rust owner graph stores the shared `ContentProviderUnion` behind `Arc<Mutex<_>>` instead of a literal `System&` member on the controller.
+- Rust still stores the passed `vfs` on `FileSystemController` after `create_factories(vfs, overwrite)` returns because other existing Rust owners, notably `create_save_data_factory()`, still depend on an internal VFS reference. The factory entry path and overwrite semantics now match upstream even though the retained field is an extra Rust adaptation.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `FileSystemController::create_factories()` now instantiates `SDMCFactory` from `SDMCDir` and `SDMCDir/atmosphere/contents` instead of leaving SD content ownership missing.
+- Fixed in this pass: `FileSystemController::create_factories()` now installs the upstream `SysNAND`, `UserNAND`, and `SDMC` content-provider slots into the shared `ContentProviderUnion`.
+- Fixed in this pass: `FileSystemController::create_factories(vfs, overwrite)` now ports the upstream overwrite-clear path by dropping BIS/SDMC factories and clearing the shared provider slots before recreation.
+
+### Missing items
+- None in this slice.
+
+### Binary layout verification
+- PASS: owner/plumbing file only; no raw struct layout involved. Added regression tests cover BIS/SDMC factory creation, shared content-provider slot registration, and overwrite-driven factory recreation.
+
+## 2026-04-18 — `core/src/file_sys/registered_cache.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/file_sys/registered_cache.h`
+
+### Intentional differences
+- Rust adds a `#[cfg(test)]` `ContentProviderUnion::has_slot(...)` helper for filesystem-owner regression tests. This is test-only surface and does not affect runtime ownership.
+
+### Unintentional differences (to fix)
+- None in this slice.
+
+### Missing items
+- None added by this slice.
+
+### Binary layout verification
+- PASS: test-only helper on an owner container; no raw serialized layout changed.
+
+## 2026-04-18 — `core/src/core.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/core.cpp`
+
+### Intentional differences
+- Rust forwards `System::set_content_provider(...)` into `FileSystemController::set_content_provider(...)` instead of passing a literal `System&` into `FileSystemController::CreateFactories(...)`. This preserves the upstream ownership edge while adapting to the Rust `Arc<Mutex<ContentProviderUnion>>` owner graph.
+
+### Unintentional differences (to fix)
+- None in this slice.
+
+### Missing items
+- `FileSystemController` still does not own the literal upstream `system` reference; the provider link remains an explicit setter edge in Rust.
+
+### Binary layout verification
+- PASS: owner-plumbing change only; no raw struct layout involved.
+
+## 2026-04-18 — `core/src/hle/service/services.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/hle/service/service.cpp`
+
+### Intentional differences
+- Rust guards the `create_factories(vfs, false)` call behind `system.get().get_filesystem()` because the Rust `SystemRef` access path returns `Option<&Arc<RealVfsFilesystem>>` instead of a guaranteed reference from a literal `Core::System&`.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: the services bootstrap path now calls the upstream-shaped `FileSystemController::create_factories(vfs, false)` entry instead of the older reduced no-argument Rust helper.
+
+### Missing items
+- None in this slice.
+
+### Binary layout verification
+- PASS: coordinator-only change; no raw serialized layout involved.
+
+## 2026-04-18 — `core/src/core_timing.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/core_timing.cpp`
+
+### Intentional differences
+- Rust still adapts the upstream `boost::heap::fibonacci_heap` plus handle-update model to a `BinaryHeap<TimingEvent>` because stable Rust does not offer an equivalent mutable heap-handle API. Behavioral parity in the reschedule path is restored even though the container differs.
+- Rust still adapts upstream direct member access to interior locking (`Mutex<CoreTimingState>`, `Mutex<Option<JoinHandle<()>>>`, atomics) because `CoreTiming` is now shared as `Arc<CoreTiming>` rather than owned by value through a C++ `System::Impl`.
+- Rust still spawns a plain `std::thread::JoinHandle` from `initialize()` instead of upstream `std::jthread` ownership.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: the multicore timer thread no longer uses non-interruptible `sleep(wait_time)` while waiting for the next event. It now matches upstream interruptible wait behavior, so newly scheduled earlier events can wake the timing thread immediately.
+- Fixed in this pass: the multicore looping-event path no longer reschedules from `max(evt_time, now_ns)`. It now matches upstream and reschedules from `evt_time + next_schedule_time`, with pause compensation only.
+- Fixed in this pass: the multicore timer-thread path no longer duplicates due-event popping, callback firing, and looping-event reschedule logic outside `advance()`. The timer thread now follows upstream `ThreadLoop()` ownership and calls `advance()` as the single due-event owner.
+- Fixed in this pass: the multicore timer thread is no longer owned by an outer `Arc<std::sync::Mutex<CoreTiming>>` wrapper. `CoreTiming::initialize(...)` now owns thread startup directly, which matches upstream `Initialize()` ownership much more closely.
+
+### Missing items
+- Rust still does not match upstream literal field ownership exactly because `CoreTiming` mutates shared state through interior locks instead of plain member access on `*this`.
+- Rust still uses `std::thread::JoinHandle` plus explicit shutdown atomics instead of upstream `std::jthread`.
+
+### Binary layout verification
+- PASS: timing-owner logic only; no raw serialized layout involved. Added focused regression tests for looping reschedule cadence and wake-on-earlier-event behavior.
+
+## 2026-04-18 — `core/src/core.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/core.cpp` (CoreTiming owner follow-up)
+
+### Intentional differences
+- Rust stores `core_timing` as `Arc<CoreTiming>` instead of a by-value member inside a hidden `System::Impl`, because the Rust system graph shares this owner across kernel, dynarmic, and service code without a literal pimpl layer.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `System::initialize()` now calls `core_timing.initialize(...)` directly, so the timer-thread startup callback is owned by `CoreTiming` like upstream instead of a Rust-only external `start_timer_thread(...)` helper.
+
+### Missing items
+- Rust still flattens upstream `System::Impl` into `System`, so the `core_timing.Initialize([&system] { ... })` callback wiring remains in `core.rs` rather than a separate pimpl object.
+
+### Binary layout verification
+- PASS: owner-plumbing change only; no raw struct layout involved.
+
+## 2026-04-18 — `common/src/fs/path_util.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/common/fs/path_util.cpp`
+
+### Intentional differences
+- Rust now has a compatibility fallback to the legacy `~/.local/share/yuzu` data root when `~/.local/share/ruzu` exists but its NAND is empty and the legacy yuzu NAND is populated. This divergence is intentional for renamed-fork data compatibility and has no upstream C++ equivalent.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: data-backed paths such as `NANDDir`, `LoadDir`, `DumpDir`, `KeysDir`, and `SDMCDir` no longer blindly point at an empty ruzu data root when a populated legacy yuzu NAND is available on the same machine.
+
+### Missing items
+- No broader migration helper exists yet for importing legacy yuzu data into the ruzu root; this slice only provides runtime path fallback.
+- No per-subdirectory selection exists beyond the current data-root compatibility check.
+
+### Binary layout verification
+- PASS: path-management file only; no raw struct layout involved. Added regression test covers legacy-yuzu fallback selection when the ruzu NAND is empty.
+
+## 2026-04-19 — `core/src/hle/kernel/svc/svc_ipc.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/svc/svc_ipc.cpp` (SVC trace follow-up)
+
+### Intentional differences
+- Rust now emits `TLS_REQ` / `TLS_RSP` trace lines from `SendSyncRequestImpl(...)` when `RUZU_SVC_TRACE=1` is enabled. Upstream `svc_ipc.cpp` has no equivalent runtime trace hook; this is intentional diagnostic instrumentation in the correct SVC owner file so the existing `svc_diff.py` tooling can identify the first divergent synchronous IPC command by payload instead of only by register arguments.
+- The trace helper reads TLS words through the current thread owner’s page-table memory (`parent.page_table.get_base().m_memory`), matching the same memory source used by `HLERequestContext::new_with_thread(...)`. This is a Rust-specific tracing adaptation; upstream has no equivalent helper.
+- `TLS_RSP` tracing now formats `HLERequestContext::command_buffer()` directly instead of rereading guest TLS after partial write-back. This matches the upstream-style response-buffer view used by the paired zuyu instrumentation and avoids false diffs from stale guest words beyond `write_size`.
+
+### Unintentional differences (to fix)
+- None in this slice.
+
+### Missing items
+- Rust SVC tracing still does not emit `TLS_REQ` / `TLS_RSP` for `SendSyncRequestLight` or `SendSyncRequestWithUserBuffer`; only the active `SendSyncRequest` path is covered.
+
+### Binary layout verification
+- PASS: tracing-only addition; no kernel object or IPC payload layout changed. Added a focused regression test for the trace word formatting to match the existing zuyu-compatible byte grouping.
+
+## 2026-04-19 — `core/src/hle/service/hle_ipc.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/hle/service/hle_ipc.cpp`
+
+### Intentional differences
+- Rust still exposes `complete_sync_request(...)` as a free function wrapping `SessionRequestManager::prepare_sync_request(...)` instead of the literal upstream `SessionRequestManager::CompleteSyncRequest(...)` member. This remains a structural Rust adaptation, but the active domain-close behavior now matches upstream.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `PreparedSyncRequest::CloseVirtualHandle` no longer writes the response buffer back to TLS explicitly. Upstream `HandleDomainSyncRequest(...)` builds the response but does not perform write-back on this branch, and zuyu’s trace leaves the incoming TLS bytes unchanged for the close-virtual-handle command.
+
+### Missing items
+- The Rust-only `StubSuccess` fallback still performs an explicit TLS write-back in `complete_sync_request(...)`; this branch has not yet been re-audited against upstream runtime behavior.
+
+### Binary layout verification
+- PASS: no struct layout changed. Added a focused regression test proving domain `CloseVirtualHandle` preserves the incoming TLS words while still closing the targeted domain slot.

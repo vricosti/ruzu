@@ -37,6 +37,7 @@ use crate::hle::service::os::event::Event;
 use crate::hle::service::os::multi_wait::MultiWait;
 use crate::hle::service::os::multi_wait_holder::MultiWaitHolder;
 use crate::hle::service::sm::sm::ServiceManager;
+use crate::hle::kernel::k_process::ProcessLock;
 
 /// Tag for MultiWaitHolder user data, matching upstream `UserDataTag`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -216,7 +217,7 @@ impl ServerManager {
             .is_some_and(|value| value != std::ffi::OsStr::new("0"))
     }
 
-    fn current_process(&self) -> Option<Arc<Mutex<KProcess>>> {
+    fn current_process(&self) -> Option<Arc<ProcessLock>> {
         let current_thread = self.system.get().current_thread()?;
         let thread_guard = current_thread.lock().unwrap();
         thread_guard.parent.as_ref().and_then(Weak::upgrade)
@@ -224,7 +225,7 @@ impl ServerManager {
 
     fn current_process_and_scheduler(
         &self,
-    ) -> Option<(Arc<Mutex<KProcess>>, Arc<Mutex<KScheduler>>)> {
+    ) -> Option<(Arc<ProcessLock>, Arc<Mutex<KScheduler>>)> {
         let current_thread = self.system.get().current_thread()?;
         let thread_guard = current_thread.lock().unwrap();
         let process = thread_guard.parent.as_ref().and_then(Weak::upgrade)?;
@@ -1042,16 +1043,9 @@ impl ServerManager {
             return;
         }
 
-        // Write response back.
-        let write_result = context.write_to_outgoing_command_buffer();
-        if write_result != RESULT_SUCCESS {
-            log::warn!(
-                "ServerManager({}): session {} write_to_outgoing_command_buffer failed ({:#x})",
-                self.name,
-                session_index,
-                write_result.get_inner_value()
-            );
-        }
+        // Write-back is performed inside ServiceFrameworkBase::handle_sync_request_impl
+        // (or explicitly in the CloseVirtualHandle / StubSuccess branches), matching
+        // upstream server_manager.cpp:385 which only calls SendReplyHLE here.
 
         let reply_result = self.sessions[session_index]
             .server_session

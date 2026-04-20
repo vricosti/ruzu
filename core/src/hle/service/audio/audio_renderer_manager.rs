@@ -10,9 +10,10 @@ use crate::hle::kernel::k_process::KProcess;
 use crate::hle::kernel::k_transfer_memory::KTransferMemory;
 use crate::hle::kernel::svc_common::PseudoHandle;
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
+use crate::hle::service::cmif_serialization::{CmifRequest, CmifResponse};
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
-use crate::hle::service::ipc_helpers::{RequestParser, ResponseBuilder};
 use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
+use crate::hle::kernel::k_process::ProcessLock;
 
 /// IPC command table for IAudioRendererManager ("audren:u"):
 ///
@@ -83,8 +84,8 @@ impl IAudioRendererManager {
     fn open_audio_renderer_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         let svc = Self::as_self(this);
         log::info!("IAudioRendererManager::OpenAudioRenderer");
-        let mut rp = RequestParser::new(ctx);
-        let params: AudioRendererParameterBlob = rp.pop_raw();
+        let mut request = CmifRequest::new(ctx);
+        let params: AudioRendererParameterBlob = request.raw();
         let revision = u32::from_le_bytes([
             params.bytes[0x30],
             params.bytes[0x31],
@@ -107,16 +108,18 @@ impl IAudioRendererManager {
             i32::from_le_bytes([params.bytes[0x28], params.bytes[0x29], params.bytes[0x2A], params.bytes[0x2B]]),
             u32::from_le_bytes([params.bytes[0x2C], params.bytes[0x2D], params.bytes[0x2E], params.bytes[0x2F]])
         );
-        rp.align_for::<u64>();
-        let transfer_memory_size = rp.pop_u64();
-        let applet_resource_user_id = rp.pop_u64();
+        request.align_for::<u64>();
+        let transfer_memory_size = request.u64();
+        let applet_resource_user_id = request.u64();
         let Some(owner_process) = ctx.owner_process_arc() else {
             log::error!("IAudioRendererManager::OpenAudioRenderer missing owner process");
-            let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
-            rb.push_result(ResultCode::from_module_description(
-                crate::hle::result::ErrorModule::Audio,
-                crate::hle::service::audio::errors::RESULT_INVALID_HANDLE.1,
-            ));
+            CmifResponse::result_only(
+                ctx,
+                ResultCode::from_module_description(
+                    crate::hle::result::ErrorModule::Audio,
+                    crate::hle::service::audio::errors::RESULT_INVALID_HANDLE.1,
+                ),
+            );
             return;
         };
         let transfer_memory_handle = ctx.get_copy_handle(0);
@@ -130,11 +133,13 @@ impl IAudioRendererManager {
                 "IAudioRendererManager::OpenAudioRenderer invalid transfer memory handle {:#x}",
                 transfer_memory_handle
             );
-            let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
-            rb.push_result(ResultCode::from_module_description(
-                crate::hle::result::ErrorModule::Audio,
-                crate::hle::service::audio::errors::RESULT_INVALID_HANDLE.1,
-            ));
+            CmifResponse::result_only(
+                ctx,
+                ResultCode::from_module_description(
+                    crate::hle::result::ErrorModule::Audio,
+                    crate::hle::service::audio::errors::RESULT_INVALID_HANDLE.1,
+                ),
+            );
             return;
         };
 
@@ -143,11 +148,13 @@ impl IAudioRendererManager {
                 "IAudioRendererManager::OpenAudioRenderer invalid process handle {:#x}",
                 process_handle
             );
-            let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
-            rb.push_result(ResultCode::from_module_description(
-                crate::hle::result::ErrorModule::Audio,
-                crate::hle::service::audio::errors::RESULT_INVALID_HANDLE.1,
-            ));
+            CmifResponse::result_only(
+                ctx,
+                ResultCode::from_module_description(
+                    crate::hle::result::ErrorModule::Audio,
+                    crate::hle::service::audio::errors::RESULT_INVALID_HANDLE.1,
+                ),
+            );
             return;
         };
 
@@ -203,8 +210,7 @@ impl IAudioRendererManager {
                 );
                 owner.unregister_event_object_by_object_id(rendered_event_object_id);
             }
-            let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
-            rb.push_result(err);
+            CmifResponse::result_only(ctx, err);
             return;
         };
 
@@ -218,13 +224,13 @@ impl IAudioRendererManager {
             rendered_event,
             rendered_readable_event,
         ));
-        let mut rb = ResponseBuilder::new(ctx, 2, 0, 1);
-        rb.push_result(RESULT_SUCCESS);
-        rb.push_ipc_interface(renderer);
+        let mut response = CmifResponse::new(ctx, 2, 0, 1);
+        response.push_result(RESULT_SUCCESS);
+        response.push_interface(renderer);
     }
 
     fn resolve_transfer_memory_handle(
-        owner_process: &Arc<std::sync::Mutex<KProcess>>,
+        owner_process: &Arc<ProcessLock>,
         handle: u32,
     ) -> Option<*mut KTransferMemory> {
         let process_guard = owner_process.lock().unwrap();
@@ -235,7 +241,7 @@ impl IAudioRendererManager {
     }
 
     fn resolve_process_handle(
-        owner_process: &Arc<std::sync::Mutex<KProcess>>,
+        owner_process: &Arc<ProcessLock>,
         handle: u32,
     ) -> Option<*mut KProcess> {
         let mut process_guard = owner_process.lock().unwrap();
@@ -250,17 +256,17 @@ impl IAudioRendererManager {
     fn get_work_buffer_size_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         let svc = unsafe { &*(this as *const dyn ServiceFramework as *const Self) };
         log::debug!("IAudioRendererManager::GetWorkBufferSize");
-        let mut rp = RequestParser::new(ctx);
-        let params: AudioRendererParameterBlob = rp.pop_raw();
+        let mut request = CmifRequest::new(ctx);
+        let params: AudioRendererParameterBlob = request.raw();
         let size = svc
             .system
             .get()
             .audio_core()
             .and_then(|audio_core| audio_core.get_audio_renderer_work_buffer_size(&params.bytes))
             .unwrap_or(0x4000);
-        let mut rb = ResponseBuilder::new(ctx, 4, 0, 0);
-        rb.push_result(RESULT_SUCCESS);
-        rb.push_u64(size);
+        let mut response = CmifResponse::new(ctx, 4, 0, 0);
+        response.push_result(RESULT_SUCCESS);
+        response.push_raw(&size);
     }
 
     /// Port of upstream `IAudioRendererManager::GetAudioDeviceService`.
@@ -268,8 +274,8 @@ impl IAudioRendererManager {
     fn get_audio_device_service_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         log::info!("IAudioRendererManager::GetAudioDeviceService");
         let svc = unsafe { &*(this as *const dyn ServiceFramework as *const Self) };
-        let mut rp = RequestParser::new(ctx);
-        let applet_resource_user_id = rp.pop_u64();
+        let mut request = CmifRequest::new(ctx);
+        let applet_resource_user_id = request.u64();
         let device_num = svc
             .num_audio_devices
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -284,9 +290,9 @@ impl IAudioRendererManager {
             0x52455631,
             device_num,
         )); // 'REV1'
-        let mut rb = ResponseBuilder::new(ctx, 2, 0, 1);
-        rb.push_result(RESULT_SUCCESS);
-        rb.push_ipc_interface(device);
+        let mut response = CmifResponse::new(ctx, 2, 0, 1);
+        response.push_result(RESULT_SUCCESS);
+        response.push_interface(device);
     }
 
     /// Port of upstream `IAudioRendererManager::GetAudioDeviceServiceWithRevisionInfo`.
@@ -297,10 +303,10 @@ impl IAudioRendererManager {
     ) {
         log::info!("IAudioRendererManager::GetAudioDeviceServiceWithRevisionInfo");
         let svc = unsafe { &*(this as *const dyn ServiceFramework as *const Self) };
-        let mut rp = RequestParser::new(ctx);
-        let revision = rp.pop_u32();
-        rp.align_for::<u64>();
-        let applet_resource_user_id = rp.pop_u64();
+        let mut request = CmifRequest::new(ctx);
+        let revision = request.u32();
+        request.align_for::<u64>();
+        let applet_resource_user_id = request.u64();
         let device_num = svc
             .num_audio_devices
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -316,9 +322,9 @@ impl IAudioRendererManager {
             revision,
             device_num,
         ));
-        let mut rb = ResponseBuilder::new(ctx, 2, 0, 1);
-        rb.push_result(RESULT_SUCCESS);
-        rb.push_ipc_interface(device);
+        let mut response = CmifResponse::new(ctx, 2, 0, 1);
+        response.push_result(RESULT_SUCCESS);
+        response.push_interface(device);
     }
 }
 
@@ -339,5 +345,26 @@ impl ServiceFramework for IAudioRendererManager {
 
     fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
         &self.handlers_tipc
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn audio_renderer_parameter_blob_size_matches_upstream() {
+        assert_eq!(std::mem::size_of::<AudioRendererParameterBlob>(), 0x34);
+    }
+
+    #[test]
+    fn service_registers_upstream_command_ids() {
+        let service = IAudioRendererManager::new(SystemRef::null());
+        assert!(service.handlers.contains_key(&0));
+        assert!(service.handlers.contains_key(&1));
+        assert!(service.handlers.contains_key(&2));
+        assert!(service.handlers.contains_key(&3));
+        assert!(service.handlers.contains_key(&4));
+        assert!(service.handlers[&3].handler_callback.is_none());
     }
 }

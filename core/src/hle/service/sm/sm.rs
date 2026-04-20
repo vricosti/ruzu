@@ -34,6 +34,7 @@ use crate::hle::service::service::{
     build_handler_map, FunctionInfo, ServiceFramework, SERVER_SESSION_COUNT_MAX,
 };
 use crate::hle::service::sm::sm_controller::Controller;
+use crate::hle::kernel::k_process::ProcessLock;
 
 // --- SM result codes (matching upstream sm.cpp) ---
 
@@ -291,7 +292,7 @@ pub struct Sm {
 impl Sm {
     fn current_process_and_scheduler(
         &self,
-    ) -> Option<(Arc<Mutex<KProcess>>, Arc<Mutex<KScheduler>>)> {
+    ) -> Option<(Arc<ProcessLock>, Arc<Mutex<KScheduler>>)> {
         let current_thread = self.system.get().current_thread()?;
         let thread_guard = current_thread.lock().unwrap();
         let process = thread_guard

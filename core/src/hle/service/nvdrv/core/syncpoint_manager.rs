@@ -155,7 +155,16 @@ impl SyncpointManager {
     }
 
     pub fn is_fence_signalled(&self, fence: &NvFence) -> bool {
-        self.has_syncpoint_expired(fence.id as u32, fence.value)
+        let result = self.has_syncpoint_expired(fence.id as u32, fence.value);
+        if std::env::var_os("RUZU_TRACE_SYNCPOINT").is_some() {
+            log::info!(
+                "NvdrvSyncpointManager::is_fence_signalled id={} value={} -> {}",
+                fence.id,
+                fence.value,
+                result
+            );
+        }
+        result
     }
 
     /// Atomically increments the maximum value of a syncpoint by the given amount.
@@ -169,7 +178,16 @@ impl SyncpointManager {
             return 0;
         }
 
-        syncpoint.counter_max.fetch_add(amount, Ordering::Relaxed) + amount
+        let new_max = syncpoint.counter_max.fetch_add(amount, Ordering::Relaxed) + amount;
+        if std::env::var_os("RUZU_TRACE_SYNCPOINT").is_some() {
+            log::info!(
+                "NvdrvSyncpointManager::increment_syncpoint_max_ext id={} amount={} new_max={}",
+                id,
+                amount,
+                new_max
+            );
+        }
+        new_max
     }
 
     /// Returns the minimum value of the syncpoint.
@@ -182,7 +200,15 @@ impl SyncpointManager {
             return 0;
         }
 
-        syncpoint.counter_min.load(Ordering::Relaxed)
+        let value = syncpoint.counter_min.load(Ordering::Relaxed);
+        if std::env::var_os("RUZU_TRACE_SYNCPOINT").is_some() {
+            log::info!(
+                "NvdrvSyncpointManager::read_syncpoint_min_value id={} -> {}",
+                id,
+                value
+            );
+        }
+        value
     }
 
     /// Synchronises the minimum value of the syncpoint with the GPU.

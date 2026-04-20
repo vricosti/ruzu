@@ -7,8 +7,8 @@ use std::sync::Mutex;
 
 use crate::core::SystemRef;
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
+use crate::hle::service::cmif_serialization::{write_out_array_bytes, CmifRequest, CmifResponse};
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
-use crate::hle::service::ipc_helpers::{RequestParser, ResponseBuilder};
 use crate::hle::service::kernel_helpers::ServiceContext;
 use crate::hle::service::os::event::Event;
 use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
@@ -164,12 +164,12 @@ impl IAudioDevice {
         svc.event().copy_handle(ctx)
     }
 
-    fn write_name_array(ctx: &mut HLERequestContext, names: &[[u8; 0x100]]) {
+    fn name_array_bytes(names: &[[u8; 0x100]]) -> Vec<u8> {
         let mut bytes = Vec::with_capacity(names.len() * 0x100);
         for name in names {
             bytes.extend_from_slice(name);
         }
-        ctx.write_buffer(&bytes, 0);
+        bytes
     }
 
     fn write_single_name(ctx: &mut HLERequestContext, name: &[u8; 0x100]) {
@@ -258,10 +258,11 @@ impl IAudioDevice {
         log::debug!("IAudioDevice::ListAudioDeviceName");
         let svc = Self::as_self(this);
         let names = svc.list_audio_device_names(Self::output_name_capacity(ctx));
-        Self::write_name_array(ctx, &names);
-        let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
-        rb.push_result(RESULT_SUCCESS);
-        rb.push_u32(names.len() as u32);
+        let bytes = Self::name_array_bytes(&names);
+        write_out_array_bytes(ctx, 0, &bytes);
+        let mut response = CmifResponse::new(ctx, 3, 0, 0);
+        response.push_result(RESULT_SUCCESS);
+        response.push_u32(names.len() as u32);
     }
 
     fn set_audio_device_output_volume_handler(
@@ -270,8 +271,8 @@ impl IAudioDevice {
     ) {
         log::debug!("IAudioDevice::SetAudioDeviceOutputVolume");
         let svc = Self::as_self(this);
-        let mut rp = RequestParser::new(ctx);
-        let volume = rp.pop_f32();
+        let mut request = CmifRequest::new(ctx);
+        let volume = request.f32();
         let device_name = Self::read_first_name(ctx);
         if device_name == "AudioTvOutput" {
             if let Some(audio_core) = (!svc.system.is_null())
@@ -285,8 +286,8 @@ impl IAudioDevice {
                 );
             }
         }
-        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
-        rb.push_result(RESULT_SUCCESS);
+        let mut response = CmifResponse::new(ctx, 2, 0, 0);
+        response.push_result(RESULT_SUCCESS);
     }
 
     fn get_audio_device_output_volume_handler(
@@ -311,9 +312,9 @@ impl IAudioDevice {
         } else {
             1.0
         };
-        let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
-        rb.push_result(RESULT_SUCCESS);
-        rb.push_f32(volume);
+        let mut response = CmifResponse::new(ctx, 3, 0, 0);
+        response.push_result(RESULT_SUCCESS);
+        response.push_f32(volume);
     }
 
     fn get_active_audio_device_name_handler(
@@ -322,8 +323,8 @@ impl IAudioDevice {
     ) {
         log::debug!("IAudioDevice::GetActiveAudioDeviceName");
         Self::write_single_name(ctx, &Self::default_active_device_name());
-        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
-        rb.push_result(RESULT_SUCCESS);
+        let mut response = CmifResponse::new(ctx, 2, 0, 0);
+        response.push_result(RESULT_SUCCESS);
     }
 
     /// Port of upstream `IAudioDevice::QueryAudioDeviceSystemEvent`.
@@ -340,13 +341,13 @@ impl IAudioDevice {
                 "IAudioDevice::QueryAudioDeviceSystemEvent handle={:#x}",
                 handle
             );
-            let mut rb = ResponseBuilder::new(ctx, 2, 1, 0);
-            rb.push_result(RESULT_SUCCESS);
-            rb.push_copy_objects(handle);
+            let mut response = CmifResponse::new(ctx, 2, 1, 0);
+            response.push_result(RESULT_SUCCESS);
+            response.push_copy_objects(handle);
         } else {
             log::error!("IAudioDevice::QueryAudioDeviceSystemEvent failed to create event");
-            let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
-            rb.push_result(RESULT_SUCCESS);
+            let mut response = CmifResponse::new(ctx, 2, 0, 0);
+            response.push_result(RESULT_SUCCESS);
         }
     }
 
@@ -361,9 +362,9 @@ impl IAudioDevice {
         } else {
             2
         };
-        let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
-        rb.push_result(RESULT_SUCCESS);
-        rb.push_u32(active_channel_count);
+        let mut response = CmifResponse::new(ctx, 3, 0, 0);
+        response.push_result(RESULT_SUCCESS);
+        response.push_u32(active_channel_count);
     }
 
     fn list_audio_device_name_auto_handler(
@@ -396,8 +397,8 @@ impl IAudioDevice {
     ) {
         log::info!("IAudioDevice::GetActiveAudioDeviceNameAuto");
         Self::write_single_name(ctx, &Self::default_active_device_name());
-        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
-        rb.push_result(RESULT_SUCCESS);
+        let mut response = CmifResponse::new(ctx, 2, 0, 0);
+        response.push_result(RESULT_SUCCESS);
     }
 
     /// Port of upstream `IAudioDevice::QueryAudioDeviceInputEvent`.
@@ -408,13 +409,13 @@ impl IAudioDevice {
     ) {
         log::info!("IAudioDevice::QueryAudioDeviceInputEvent");
         if let Some(handle) = Self::copy_event_handle(this, ctx) {
-            let mut rb = ResponseBuilder::new(ctx, 2, 1, 0);
-            rb.push_result(RESULT_SUCCESS);
-            rb.push_copy_objects(handle);
+            let mut response = CmifResponse::new(ctx, 2, 1, 0);
+            response.push_result(RESULT_SUCCESS);
+            response.push_copy_objects(handle);
         } else {
             log::error!("IAudioDevice::QueryAudioDeviceInputEvent failed to create event");
-            let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
-            rb.push_result(RESULT_SUCCESS);
+            let mut response = CmifResponse::new(ctx, 2, 0, 0);
+            response.push_result(RESULT_SUCCESS);
         }
     }
 
@@ -426,13 +427,13 @@ impl IAudioDevice {
     ) {
         log::info!("IAudioDevice::QueryAudioDeviceOutputEvent");
         if let Some(handle) = Self::copy_event_handle(this, ctx) {
-            let mut rb = ResponseBuilder::new(ctx, 2, 1, 0);
-            rb.push_result(RESULT_SUCCESS);
-            rb.push_copy_objects(handle);
+            let mut response = CmifResponse::new(ctx, 2, 1, 0);
+            response.push_result(RESULT_SUCCESS);
+            response.push_copy_objects(handle);
         } else {
             log::error!("IAudioDevice::QueryAudioDeviceOutputEvent failed to create event");
-            let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
-            rb.push_result(RESULT_SUCCESS);
+            let mut response = CmifResponse::new(ctx, 2, 0, 0);
+            response.push_result(RESULT_SUCCESS);
         }
     }
 
@@ -442,8 +443,8 @@ impl IAudioDevice {
     ) {
         log::info!("IAudioDevice::GetActiveAudioOutputDeviceName");
         Self::write_single_name(ctx, &Self::default_active_device_name());
-        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
-        rb.push_result(RESULT_SUCCESS);
+        let mut response = CmifResponse::new(ctx, 2, 0, 0);
+        response.push_result(RESULT_SUCCESS);
     }
 
     fn list_audio_output_device_name_handler(
@@ -453,10 +454,11 @@ impl IAudioDevice {
         log::info!("IAudioDevice::ListAudioOutputDeviceName");
         let svc = Self::as_self(this);
         let names = svc.list_audio_output_device_names(Self::output_name_capacity(ctx));
-        Self::write_name_array(ctx, &names);
-        let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
-        rb.push_result(RESULT_SUCCESS);
-        rb.push_u32(names.len() as u32);
+        let bytes = Self::name_array_bytes(&names);
+        write_out_array_bytes(ctx, 0, &bytes);
+        let mut response = CmifResponse::new(ctx, 3, 0, 0);
+        response.push_result(RESULT_SUCCESS);
+        response.push_u32(names.len() as u32);
     }
 }
 
@@ -514,6 +516,14 @@ mod tests {
             .expect("IAudioDevice constructor must create event");
 
         assert!(event.is_signaled());
+    }
+
+    #[test]
+    fn service_registers_upstream_command_ids() {
+        let service = IAudioDevice::new(SystemRef::null(), 0, 0x5245_5631, 0);
+        for cmd in [0_u32, 1, 2, 3, 4, 5, 6, 7, 8, 10, 11, 12, 13, 14] {
+            assert!(service.handlers.contains_key(&cmd));
+        }
     }
 }
 

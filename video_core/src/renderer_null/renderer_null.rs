@@ -129,6 +129,14 @@ impl RendererBase for RendererNull {
     fn is_screenshot_pending(&self) -> bool {
         self.base_data.is_screenshot_pending()
     }
+
+    fn set_guest_memory_writer(&mut self, writer: crate::renderer_base::GuestMemoryWriter) {
+        self.rasterizer.set_guest_memory_writer(writer);
+    }
+
+    fn set_gpu_ticks_getter(&mut self, getter: crate::renderer_base::GpuTicksGetter) {
+        self.rasterizer.set_gpu_ticks_getter(getter);
+    }
 }
 
 #[cfg(test)]

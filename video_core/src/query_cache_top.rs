@@ -9,6 +9,8 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
 
+use crate::query_cache::types::QueryPropertiesFlags;
+
 /// Query types supported by the GPU.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(usize)]
@@ -147,6 +149,36 @@ impl QueryCacheLegacy {
     /// Reset a counter type.
     pub fn reset_counter(&mut self, query_type: QueryType) {
         self.streams[query_type as usize].reset();
+    }
+
+    /// Rust owner-local bridge for the upstream `QueryCache::Query(...)` / `CounterReport(...)`
+    /// timing split used by the rasterizer query path.
+    pub fn query(
+        &mut self,
+        gpu_addr: u64,
+        flags: QueryPropertiesFlags,
+        payload: u32,
+        gpu_ticks_getter: std::sync::Arc<dyn Fn() -> u64 + Send + Sync>,
+        guest_memory_writer: std::sync::Arc<dyn Fn(u64, &[u8]) + Send + Sync>,
+        signal_fence: impl FnOnce(Box<dyn FnOnce() + Send>),
+        sync_operation: impl FnOnce(Box<dyn FnOnce() + Send>),
+    ) {
+        let has_timeout = flags.contains(QueryPropertiesFlags::HAS_TIMEOUT);
+        let is_fence = flags.contains(QueryPropertiesFlags::IS_A_FENCE);
+        let operation = Box::new(move || {
+            if has_timeout {
+                let gpu_ticks = gpu_ticks_getter();
+                guest_memory_writer(gpu_addr + 8, &gpu_ticks.to_le_bytes());
+                guest_memory_writer(gpu_addr, &(payload as u64).to_le_bytes());
+            } else {
+                guest_memory_writer(gpu_addr, &payload.to_le_bytes());
+            }
+        });
+        if is_fence {
+            signal_fence(operation);
+        } else {
+            sync_operation(operation);
+        }
     }
 
     /// Disable all active streams.

@@ -409,6 +409,16 @@ impl RendererBase for RendererOpenGL {
         self.rasterizer.set_gpu_memory_reader(reader);
     }
 
+    fn set_guest_memory_writer(&mut self, writer: crate::renderer_base::GuestMemoryWriter) {
+        let _ = writer;
+        // Upstream OpenGL query/inline writeback goes through the bound channel
+        // memory manager rather than a renderer-owned guest-memory callback.
+    }
+
+    fn set_gpu_ticks_getter(&mut self, getter: crate::renderer_base::GpuTicksGetter) {
+        self.rasterizer.set_gpu_ticks_getter(getter);
+    }
+
     fn get_applet_capture_buffer(&self) -> Vec<u8> {
         // Port of `RendererOpenGL::GetAppletCaptureBuffer()`.
         // Full implementation reads from capture_framebuffer via glReadPixels,

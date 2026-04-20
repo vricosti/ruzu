@@ -837,3 +837,17 @@ impl Default for DefaultMii {
         unsafe { std::mem::zeroed() }
     }
 }
+
+#[derive(Debug, Clone, Copy, Default)]
+#[repr(C)]
+pub struct DatabaseSessionMetadata {
+    pub interface_version: u32,
+    pub magic: u32,
+    pub update_counter: u64,
+}
+
+impl DatabaseSessionMetadata {
+    pub fn is_interface_version_supported(&self, version: u32) -> bool {
+        version <= self.interface_version
+    }
+}

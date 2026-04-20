@@ -6,8 +6,8 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
+use crate::hle::service::cmif_serialization::{write_out_array_bytes, CmifResponse};
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
-use crate::hle::service::ipc_helpers::ResponseBuilder;
 use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
 
 /// IPC command table for IAudioOutManager ("audout:u"):
@@ -46,57 +46,71 @@ impl IAudioOutManager {
     }
 
     /// Write the default audio output device name to the output buffer.
-    fn write_audio_out_name(ctx: &mut HLERequestContext) {
+    fn audio_out_name_bytes() -> &'static [u8] {
         // Upstream returns "AudioTvOutput" as the default device name.
         // The name is written as a null-terminated UTF-8 string.
-        let name = b"AudioTvOutput\0";
-        ctx.write_buffer(name, 0);
+        b"AudioTvOutput\0"
     }
 
     fn list_audio_outs_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         log::debug!("IAudioOutManager::ListAudioOuts (STUBBED)");
-        Self::write_audio_out_name(ctx);
-        let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
-        rb.push_result(RESULT_SUCCESS);
-        rb.push_u32(1); // one audio out device
+        write_out_array_bytes(ctx, 0, Self::audio_out_name_bytes());
+        let mut response = CmifResponse::new(ctx, 3, 0, 0);
+        response.push_result(RESULT_SUCCESS);
+        response.push_u32(1); // one audio out device
     }
 
     /// Port of upstream `IAudioOutManager::OpenAudioOut`.
     /// Creates an IAudioOut sub-session.
     fn open_audio_out_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         log::info!("IAudioOutManager::OpenAudioOut");
-        Self::write_audio_out_name(ctx);
+        write_out_array_bytes(ctx, 0, Self::audio_out_name_bytes());
         let audio_out = Arc::new(super::audio_out::IAudioOut::new());
-        let mut rb = ResponseBuilder::new(ctx, 6, 0, 0);
-        rb.push_result(RESULT_SUCCESS);
-        rb.push_u32(48000); // sample rate
-        rb.push_u32(2); // channel count
-        rb.push_u32(2); // pcm format (Int16)
-        rb.push_u32(0); // state (Stopped)
-        rb.push_ipc_interface(audio_out);
+        let mut response = CmifResponse::new(ctx, 6, 0, 0);
+        response.push_result(RESULT_SUCCESS);
+        response.push_u32(48000); // sample rate
+        response.push_u32(2); // channel count
+        response.push_u32(2); // pcm format (Int16)
+        response.push_u32(0); // state (Stopped)
+        response.push_interface(audio_out);
     }
 
     fn list_audio_outs_auto_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         log::debug!("IAudioOutManager::ListAudioOutsAuto (STUBBED)");
-        Self::write_audio_out_name(ctx);
-        let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
-        rb.push_result(RESULT_SUCCESS);
-        rb.push_u32(1); // one audio out device
+        write_out_array_bytes(ctx, 0, Self::audio_out_name_bytes());
+        let mut response = CmifResponse::new(ctx, 3, 0, 0);
+        response.push_result(RESULT_SUCCESS);
+        response.push_u32(1); // one audio out device
     }
 
     /// Port of upstream `IAudioOutManager::OpenAudioOutAuto`.
     /// Creates an IAudioOut sub-session.
     fn open_audio_out_auto_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         log::info!("IAudioOutManager::OpenAudioOutAuto");
-        Self::write_audio_out_name(ctx);
+        write_out_array_bytes(ctx, 0, Self::audio_out_name_bytes());
         let audio_out = Arc::new(super::audio_out::IAudioOut::new());
-        let mut rb = ResponseBuilder::new(ctx, 6, 0, 0);
-        rb.push_result(RESULT_SUCCESS);
-        rb.push_u32(48000); // sample rate
-        rb.push_u32(2); // channel count
-        rb.push_u32(2); // pcm format (Int16)
-        rb.push_u32(0); // state (Stopped)
-        rb.push_ipc_interface(audio_out);
+        let mut response = CmifResponse::new(ctx, 6, 0, 0);
+        response.push_result(RESULT_SUCCESS);
+        response.push_u32(48000); // sample rate
+        response.push_u32(2); // channel count
+        response.push_u32(2); // pcm format (Int16)
+        response.push_u32(0); // state (Stopped)
+        response.push_interface(audio_out);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn audio_out_manager_registers_upstream_command_ids() {
+        let service = IAudioOutManager::new();
+
+        for cmd in [0_u32, 1, 2, 3] {
+            assert!(service.handlers.contains_key(&cmd));
+            assert!(service.handlers[&cmd].handler_callback.is_some());
+        }
     }
 }
 

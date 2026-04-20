@@ -15,6 +15,7 @@ use crate::hle::service::am::window_system::WindowSystem;
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
 use crate::hle::service::ipc_helpers::ResponseBuilder;
 use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
+use crate::hle::kernel::k_process::ProcessLock;
 
 /// IPC command table for IAllSystemAppletProxiesService ("appletAE"):
 /// - 100: OpenSystemAppletProxy
@@ -71,7 +72,7 @@ impl IAllSystemAppletProxiesService {
             .get_by_applet_resource_user_id(pid)
     }
 
-    fn get_process_from_context(ctx: &HLERequestContext) -> Option<Arc<Mutex<KProcess>>> {
+    fn get_process_from_context(ctx: &HLERequestContext) -> Option<Arc<ProcessLock>> {
         ctx.get_thread().and_then(|thread| {
             thread
                 .lock()

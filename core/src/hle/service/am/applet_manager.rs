@@ -14,6 +14,7 @@ use super::window_system::WindowSystem;
 use crate::core::SystemRef;
 use crate::hle::kernel::k_process::KProcess;
 use crate::hle::service::os::process::Process;
+use crate::hle::kernel::k_process::ProcessLock;
 
 // ---------------------------------------------------------------------------
 // Upstream anonymous-namespace constant and struct
@@ -353,7 +354,7 @@ struct AppletManagerInner {
     /// Upstream: `WindowSystem* m_window_system`
     window_system: Option<Arc<Mutex<WindowSystem>>>,
     /// Upstream: `std::unique_ptr<Process> m_pending_process`
-    pending_process: Option<Arc<Mutex<KProcess>>>,
+    pending_process: Option<Arc<ProcessLock>>,
     /// Upstream: `FrontendAppletParameters m_pending_parameters`
     pending_parameters: Option<FrontendAppletParameters>,
     /// Rust-specific: run parameters needed to call KProcess::run() from set_window_system.
@@ -550,7 +551,7 @@ impl AppletManager {
     /// Upstream: `void CreateAndInsertByFrontendAppletParameters(std::unique_ptr<Process>, params)`
     pub fn create_and_insert_by_frontend_applet_parameters(
         &self,
-        process: Arc<Mutex<KProcess>>,
+        process: Arc<ProcessLock>,
         params: FrontendAppletParameters,
         run_params: PendingRunParameters,
     ) {

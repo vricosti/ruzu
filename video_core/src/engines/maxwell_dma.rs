@@ -118,6 +118,17 @@ impl MaxwellDMA {
     // ── Launch handling ────────────────────────────────────────────────
 
     fn handle_launch(&mut self) {
+        if std::env::var_os("RUZU_TRACE_ENGINE_LAUNCH").is_some() {
+            log::info!(
+                "MaxwellDMA::LAUNCH src=0x{:X} dst=0x{:X} pitch_in={} pitch_out={} {}x{}",
+                self.src_addr(),
+                self.dst_addr(),
+                self.pitch_in(),
+                self.pitch_out(),
+                self.line_length(),
+                self.line_count(),
+            );
+        }
         log::debug!(
             "MaxwellDMA: LAUNCH src=0x{:X} dst=0x{:X} pitch_in={} pitch_out={} {}x{}",
             self.src_addr(),

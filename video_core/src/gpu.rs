@@ -233,6 +233,16 @@ impl Gpu {
             renderer.get_device_vendor()
         );
         *self.renderer.lock().unwrap() = Some(renderer);
+        if let Some(ref mut renderer) = *self.renderer.lock().unwrap() {
+            let gpu_ptr = self as *const Self as usize;
+            renderer.set_gpu_ticks_getter(Arc::new(move || unsafe {
+                let gpu = &*(gpu_ptr as *const Self);
+                gpu.get_ticks()
+            }));
+            if let Some(writer) = self.guest_memory_writer.lock().unwrap().clone() {
+                renderer.set_guest_memory_writer(writer);
+            }
+        }
     }
 
     /// Bind a GPU channel by its bind ID.
@@ -313,13 +323,39 @@ impl Gpu {
     /// Set the guest memory writer callback.
     pub fn set_guest_memory_writer(&self, writer: Arc<dyn Fn(u64, &[u8]) + Send + Sync>) {
         *self.guest_memory_writer.lock().unwrap() = Some(writer);
+        if let Some(ref mut renderer) = *self.renderer.lock().unwrap() {
+            renderer.set_guest_memory_writer(
+                self.guest_memory_writer
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .cloned()
+                    .expect("guest_memory_writer just stored"),
+            );
+        }
     }
 
     /// Write guest memory at the given CPU/device address.
     pub fn write_guest_memory(&self, addr: u64, data: &[u8]) {
         let Some(writer) = self.guest_memory_writer.lock().unwrap().clone() else {
+            if std::env::var_os("RUZU_TRACE_GUEST_WRITE").is_some() {
+                log::info!(
+                    "GPU_WRITE DROPPED addr=0x{:X} size={} (no writer set)",
+                    addr,
+                    data.len()
+                );
+            }
             return;
         };
+        if std::env::var_os("RUZU_TRACE_GUEST_WRITE").is_some() {
+            let head: Vec<String> = data.iter().take(16).map(|b| format!("{:02x}", b)).collect();
+            log::info!(
+                "GPU_WRITE addr=0x{:X} size={} head={}",
+                addr,
+                data.len(),
+                head.join("")
+            );
+        }
         writer(addr, data);
     }
 
@@ -450,7 +486,7 @@ impl Gpu {
             return 0;
         }
 
-        let mut gpu_tick = system.get().core_timing().lock().unwrap().get_gpu_ticks();
+        let mut gpu_tick = system.get().core_timing().get_gpu_ticks();
         if *settings::values().use_fast_gpu_time.get_value() {
             gpu_tick /= 256;
         }
@@ -824,10 +860,8 @@ mod tests {
             _gpu_addr: u64,
             _query_type: u32,
             _flags: crate::query_cache::types::QueryPropertiesFlags,
-            _gpu_ticks: u64,
             _payload: u32,
             _subreport: u32,
-            _gpu_write: Arc<dyn Fn(u64, &[u8]) + Send + Sync>,
         ) {
         }
         fn bind_graphics_uniform_buffer(

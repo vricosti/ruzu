@@ -13,6 +13,7 @@ use super::nvmap::NvMap;
 use super::syncpoint_manager::SyncpointManager;
 use crate::core::SystemRef;
 use crate::hle::kernel::k_process::KProcess;
+use crate::hle::kernel::k_process::ProcessLock;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SessionId {
@@ -22,7 +23,7 @@ pub struct SessionId {
 pub struct Session {
     pub id: SessionId,
     /// Matches upstream `Kernel::KProcess* process`.
-    pub process: Option<Weak<Mutex<KProcess>>>,
+    pub process: Option<Weak<ProcessLock>>,
     /// Process identity used for session reuse. This mirrors the upstream
     /// pointer-identity comparison in a Rust-friendly form.
     pub process_identity: usize,
@@ -33,7 +34,7 @@ pub struct Session {
 }
 
 impl Session {
-    pub fn new(id: SessionId, process: &std::sync::Arc<Mutex<KProcess>>) -> Self {
+    pub fn new(id: SessionId, process: &std::sync::Arc<ProcessLock>) -> Self {
         let process_identity = std::sync::Arc::as_ptr(process) as usize;
         Self {
             id,
@@ -98,7 +99,7 @@ impl Container {
     /// Matches upstream `Container::OpenSession(KProcess* process)` for the
     /// session reuse and ownership checks. ASID/SMMU registration and heap
     /// preallocation remain unimplemented here.
-    pub fn open_session(&self, process: &std::sync::Arc<Mutex<KProcess>>) -> SessionId {
+    pub fn open_session(&self, process: &std::sync::Arc<ProcessLock>) -> SessionId {
         let mut inner = self.inner.lock().unwrap();
         let process_identity = std::sync::Arc::as_ptr(process) as usize;
 
@@ -188,7 +189,7 @@ impl Container {
     pub fn get_session_process(
         &self,
         session_id: SessionId,
-    ) -> Option<std::sync::Arc<Mutex<KProcess>>> {
+    ) -> Option<std::sync::Arc<ProcessLock>> {
         let inner = self.inner.lock().unwrap();
         let session = inner.sessions.get(session_id.id)?;
         if !session.is_active {
@@ -224,7 +225,7 @@ mod tests {
     #[test]
     fn open_session_reuses_active_session_for_same_process() {
         let container = Container::new();
-        let process = Arc::new(Mutex::new(KProcess::new()));
+        let process = Arc::new(ProcessLock::from_value(KProcess::new()));
 
         let first = container.open_session(&process);
         let second = container.open_session(&process);

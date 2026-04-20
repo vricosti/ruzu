@@ -199,7 +199,10 @@ impl StaticService {
             return SystemClock::with_backend(
                 self.setup_info.can_write_user_clock,
                 self.setup_info.can_write_uninitialized_clock,
-                Arc::new(TimeManagerBackend::new(Arc::clone(shared_time), SystemClockKind::User)),
+                Arc::new(TimeManagerBackend::new(
+                    Arc::clone(shared_time),
+                    SystemClockKind::User,
+                )),
             );
         }
         SystemClock::new(

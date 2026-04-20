@@ -17,6 +17,7 @@ use crate::hle::kernel::svc_dispatch::{self, SvcArgs};
 #[cfg(feature = "debug-logs")]
 use super::physical_core_log;
 use super::{k_process::KProcess, k_scheduler::KScheduler, k_thread::KThread};
+use super::k_process::ProcessLock;
 
 pub enum PhysicalCoreExecutionControl {
     Continue,
@@ -156,7 +157,7 @@ impl PhysicalCore {
         jit: &mut dyn ArmInterface,
         thread_context: &mut ThreadContext,
         scheduler: &Arc<Mutex<KScheduler>>,
-        process: &Arc<Mutex<KProcess>>,
+        process: &Arc<ProcessLock>,
         current_thread: &Arc<Mutex<KThread>>,
         svc_num: u32,
         svc_count: u32,
@@ -209,7 +210,7 @@ impl PhysicalCore {
         thread: &mut OpaqueKThread,
         thread_context: &mut ThreadContext,
         scheduler: &Arc<Mutex<KScheduler>>,
-        process: &Arc<Mutex<KProcess>>,
+        process: &Arc<ProcessLock>,
         is_64bit: bool,
         system: &System,
         mut on_supervisor_call: FSvc,
@@ -662,7 +663,7 @@ mod tests {
 
     fn test_context() -> (
         PhysicalCore,
-        Arc<Mutex<KProcess>>,
+        Arc<ProcessLock>,
         Arc<Mutex<KScheduler>>,
         Arc<Mutex<KThread>>,
         System,
@@ -677,7 +678,7 @@ mod tests {
         process.initialize_handle_table();
         process.initialize_thread_local_region_base(0x240000);
 
-        let process = Arc::new(Mutex::new(process));
+        let process = Arc::new(ProcessLock::from_value(process));
         let current_thread = Arc::new(Mutex::new(KThread::new()));
         let other_thread = Arc::new(Mutex::new(KThread::new()));
         let scheduler = Arc::new(Mutex::new(KScheduler::new(0)));
@@ -781,7 +782,7 @@ mod tests {
         process.initialize_handle_table();
         process.initialize_thread_local_region_base(0x240000);
 
-        let process = Arc::new(Mutex::new(process));
+        let process = Arc::new(ProcessLock::from_value(process));
         let current_thread = Arc::new(Mutex::new(KThread::new()));
         let scheduler = Arc::new(Mutex::new(KScheduler::new(0)));
         {

@@ -19,6 +19,7 @@ use crate::hle::service::mii::mii_types::{
     MAX_NOSE_SCALE, MAX_NOSE_Y, MAX_REGION_MOVE, MAX_TYPE,
 };
 use crate::hle::service::mii::mii_util;
+use crate::hle::service::mii::types::char_info::CharInfo;
 use crate::hle::service::mii::types::raw_data;
 
 /// StoreDataBitFields: 7 packed u32 words containing all the Mii parameters.
@@ -687,6 +688,60 @@ impl CoreData {
         self.set_mole_scale(4);
         self.set_mole_x(2);
         self.set_mole_y(20);
+    }
+
+    /// Matches upstream `CoreData::BuildFromCharInfo`.
+    pub fn build_from_char_info(&mut self, char_info: &CharInfo) {
+        self.name = char_info.name;
+        self.set_font_region(unsafe { core::mem::transmute(char_info.font_region) });
+        self.set_favorite_color(unsafe { core::mem::transmute(char_info.favorite_color) });
+        self.set_gender(unsafe { core::mem::transmute(char_info.gender) });
+        self.set_height(char_info.height);
+        self.set_build(char_info.build);
+        self.set_type(char_info.type_val);
+        self.set_region_move(char_info.region_move);
+        self.set_faceline_type(unsafe { core::mem::transmute(char_info.faceline_type) });
+        self.set_faceline_color(unsafe { core::mem::transmute(char_info.faceline_color) });
+        self.set_faceline_wrinkle(unsafe { core::mem::transmute(char_info.faceline_wrinkle) });
+        self.set_faceline_make(unsafe { core::mem::transmute(char_info.faceline_make) });
+        self.set_hair_type(unsafe { core::mem::transmute(char_info.hair_type) });
+        self.set_hair_color(char_info.hair_color as u32);
+        self.set_hair_flip(unsafe { core::mem::transmute(char_info.hair_flip) });
+        self.set_eye_type(unsafe { core::mem::transmute(char_info.eye_type) });
+        self.set_eye_color(char_info.eye_color as u32);
+        self.set_eye_scale(char_info.eye_scale);
+        self.set_eye_aspect(char_info.eye_aspect);
+        self.set_eye_rotate(char_info.eye_rotate);
+        self.set_eye_x(char_info.eye_x);
+        self.set_eye_y(char_info.eye_y);
+        self.set_eyebrow_type(unsafe { core::mem::transmute(char_info.eyebrow_type) });
+        self.set_eyebrow_color(char_info.eyebrow_color as u32);
+        self.set_eyebrow_scale(char_info.eyebrow_scale);
+        self.set_eyebrow_aspect(char_info.eyebrow_aspect);
+        self.set_eyebrow_rotate(char_info.eyebrow_rotate);
+        self.set_eyebrow_x(char_info.eyebrow_x);
+        self.set_eyebrow_y(char_info.eyebrow_y.wrapping_sub(3));
+        self.set_nose_type(unsafe { core::mem::transmute(char_info.nose_type) });
+        self.set_nose_scale(char_info.nose_scale);
+        self.set_nose_y(char_info.nose_y);
+        self.set_mouth_type(unsafe { core::mem::transmute(char_info.mouth_type) });
+        self.set_mouth_color(char_info.mouth_color as u32);
+        self.set_mouth_scale(char_info.mouth_scale);
+        self.set_mouth_aspect(char_info.mouth_aspect);
+        self.set_mouth_y(char_info.mouth_y);
+        self.set_beard_color(char_info.beard_color as u32);
+        self.set_beard_type_enum(unsafe { core::mem::transmute(char_info.beard_type) });
+        self.set_mustache_type_enum(unsafe { core::mem::transmute(char_info.mustache_type) });
+        self.set_mustache_scale(char_info.mustache_scale);
+        self.set_mustache_y(char_info.mustache_y);
+        self.set_glass_type(unsafe { core::mem::transmute(char_info.glass_type) });
+        self.set_glass_color(char_info.glass_color as u32);
+        self.set_glass_scale(char_info.glass_scale);
+        self.set_glass_y(char_info.glass_y);
+        self.set_mole_type_enum(unsafe { core::mem::transmute(char_info.mole_type) });
+        self.set_mole_scale(char_info.mole_scale);
+        self.set_mole_x(char_info.mole_x);
+        self.set_mole_y(char_info.mole_y);
     }
 
     // --- Setters matching upstream CoreData setters ---

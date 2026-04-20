@@ -145,6 +145,8 @@ pub struct RasterizerVulkan {
 
     // Draw counter for periodic flush (zuyu: 7 draws → dispatch, 4096 → flush)
     draw_counter: u32,
+    guest_memory_writer: Option<crate::renderer_base::GuestMemoryWriter>,
+    gpu_ticks_getter: Option<crate::renderer_base::GpuTicksGetter>,
 }
 
 // Raw pointers are only used for mapped memory
@@ -277,6 +279,8 @@ impl RasterizerVulkan {
             readback_mapped,
             readback_size,
             draw_counter: 0,
+            guest_memory_writer: None,
+            gpu_ticks_getter: None,
         })
     }
 
@@ -804,13 +808,19 @@ impl RasterizerInterface for RasterizerVulkan {
         gpu_addr: u64,
         _query_type: u32,
         flags: QueryPropertiesFlags,
-        gpu_ticks: u64,
         payload: u32,
         _subreport: u32,
-        gpu_write: Arc<dyn Fn(u64, &[u8]) + Send + Sync>,
     ) {
+        let Some(gpu_write) = self.guest_memory_writer.as_ref().cloned() else {
+            return;
+        };
         let has_timeout = flags.contains(QueryPropertiesFlags::HAS_TIMEOUT);
         if has_timeout {
+            let gpu_ticks = self
+                .gpu_ticks_getter
+                .as_ref()
+                .map(|getter| getter())
+                .unwrap_or(0);
             gpu_write(gpu_addr + 8, &gpu_ticks.to_le_bytes());
             gpu_write(gpu_addr, &(payload as u64).to_le_bytes());
         } else {

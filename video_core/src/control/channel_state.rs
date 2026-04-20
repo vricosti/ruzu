@@ -106,6 +106,15 @@ impl ChannelState {
             gpu.write_guest_memory(addr, data);
         }));
         let gpu_ptr = _gpu as *const crate::gpu::Gpu as usize;
+        self.memory_manager
+            .as_ref()
+            .expect("memory_manager set before channel init")
+            .lock()
+            .set_guest_memory_writer(Arc::new(move |addr, data| unsafe {
+                let gpu = &*(gpu_ptr as *const crate::gpu::Gpu);
+                gpu.write_guest_memory(addr, data);
+            }));
+        let gpu_ptr = _gpu as *const crate::gpu::Gpu as usize;
         maxwell_3d.set_gpu_ticks_getter(Arc::new(move || unsafe {
             let gpu = &*(gpu_ptr as *const crate::gpu::Gpu);
             gpu.get_ticks()

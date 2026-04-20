@@ -10,18 +10,19 @@ use std::sync::{Arc, Mutex};
 
 use crate::hle::kernel::k_process::{KProcess, ProcessState};
 use crate::hle::kernel::svc_types::ProcessActivity;
+use crate::hle::kernel::k_process::ProcessLock;
 
 /// Process — wraps a KProcess for service-level lifecycle management.
 ///
 /// Upstream stores a `KProcess*` and `System&`. We store an optional
-/// `Arc<Mutex<KProcess>>` reference.
+/// `Arc<ProcessLock>` reference.
 pub struct Process {
     main_thread_priority: i32,
     main_thread_stack_size: u64,
     process_started: bool,
     /// Reference to the kernel process object.
     /// Upstream: `KProcess* m_process`.
-    process: Option<Arc<Mutex<KProcess>>>,
+    process: Option<Arc<ProcessLock>>,
 }
 
 impl Process {
@@ -35,7 +36,7 @@ impl Process {
     }
 
     /// Create with a KProcess reference.
-    pub fn with_process(process: Arc<Mutex<KProcess>>) -> Self {
+    pub fn with_process(process: Arc<ProcessLock>) -> Self {
         Self {
             main_thread_priority: 0,
             main_thread_stack_size: 0,
@@ -45,7 +46,7 @@ impl Process {
     }
 
     /// Set the process reference.
-    pub fn set_process(&mut self, process: Arc<Mutex<KProcess>>) {
+    pub fn set_process(&mut self, process: Arc<ProcessLock>) {
         self.process = Some(process);
     }
 
@@ -138,12 +139,12 @@ impl Process {
     }
 
     /// Get a clone of the KProcess reference.
-    pub fn get_process(&self) -> Option<Arc<Mutex<KProcess>>> {
+    pub fn get_process(&self) -> Option<Arc<ProcessLock>> {
         self.process.clone()
     }
 
     /// Upstream: `Kernel::KProcess* GetHandle() const`.
-    pub fn get_handle(&self) -> Option<Arc<Mutex<KProcess>>> {
+    pub fn get_handle(&self) -> Option<Arc<ProcessLock>> {
         self.process.clone()
     }
 }

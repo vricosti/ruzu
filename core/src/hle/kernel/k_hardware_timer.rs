@@ -446,7 +446,10 @@ impl KHardwareTimer {
                     }
                     let mut thread = thread.lock().unwrap();
                     if trace {
-                        log::info!("KHardwareTimer::do_task after_thread_lock tid={}", thread.get_thread_id());
+                        log::info!(
+                            "KHardwareTimer::do_task after_thread_lock tid={}",
+                            thread.get_thread_id()
+                        );
                     }
                     log::trace!(
                         "KHardwareTimer::do_task delivering tid={} state={:?} active_core={} current_core={}",

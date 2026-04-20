@@ -115,7 +115,7 @@ impl NvMapDevice {
     }
 
     pub fn ioc_create(&self, params: &mut IocCreateParams) -> NvResult {
-        log::debug!("nvmap::IocCreate called, size=0x{:08X}", params.size);
+        log::info!("nvmap::IocCreate called, size=0x{:08X}", params.size);
 
         if params.size == 0 {
             log::error!("Failed to create Object");
@@ -147,7 +147,11 @@ impl NvMapDevice {
     }
 
     pub fn ioc_alloc(&self, params: &mut IocAllocParams, fd: DeviceFD) -> NvResult {
-        log::debug!("nvmap::IocAlloc called, addr={:X}", params.address);
+        log::info!(
+            "nvmap::IocAlloc called, handle=0x{:X} addr=0x{:X}",
+            params.handle,
+            params.address
+        );
         if Self::should_trace_alloc_loop() {
             log::info!(
                 "nvmap::IocAlloc begin fd={} handle=0x{:X} heap_mask=0x{:X} flags=0x{:X} align=0x{:X} kind=0x{:X} addr=0x{:X}",
@@ -246,34 +250,39 @@ impl NvMapDevice {
     }
 
     pub fn ioc_get_id(&self, params: &mut IocGetIdParams) -> NvResult {
-        log::debug!("nvmap::IocGetId called");
+        log::info!("nvmap::IocGetId called, handle=0x{:X}", params.handle);
 
         if params.handle == 0 {
-            log::error!("Error!");
+            log::error!("nvmap::IocGetId handle=0 invalid");
             return NvResult::BadValue;
         }
 
         let handle = self.file().get_handle(params.handle);
         if handle.is_none() {
-            log::error!("Error!");
+            log::error!(
+                "nvmap::IocGetId handle 0x{:X} not registered",
+                params.handle
+            );
             return NvResult::AccessDenied;
         }
 
-        params.id = handle.unwrap().id;
+        let id = handle.unwrap().id;
+        params.id = id;
+        log::info!("nvmap::IocGetId handle=0x{:X} -> id={}", params.handle, id);
         NvResult::Success
     }
 
     pub fn ioc_from_id(&self, params: &mut IocFromIdParams) -> NvResult {
-        log::debug!("nvmap::IocFromId called, id:{}", params.id);
+        log::info!("nvmap::IocFromId called, id:{}", params.id);
 
         if params.id == 0 {
-            log::error!("Zero Id is invalid!");
+            log::error!("nvmap::IocFromId Zero Id is invalid!");
             return NvResult::BadValue;
         }
 
         let handle = self.file().get_handle(params.id);
         if handle.is_none() {
-            log::error!("Unregistered handle!");
+            log::error!("nvmap::IocFromId Unregistered handle id={}", params.id);
             return NvResult::BadValue;
         }
 

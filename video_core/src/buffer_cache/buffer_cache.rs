@@ -19,7 +19,7 @@ use common::lru_cache::LeastRecentlyUsedCache;
 use common::range_sets::RangeSet;
 use common::slot_vector::{SlotId, SlotVector};
 use common::types::VAddr;
-use parking_lot::Mutex;
+use parking_lot::ReentrantMutex;
 
 use crate::delayed_destruction_ring::DelayedDestructionRing;
 
@@ -74,7 +74,7 @@ const AS_BITS: u32 = 34;
 /// `P` is the backend policy (see `BufferCacheParams` trait).
 pub struct BufferCache<P: BufferCacheParams, DT: DeviceTracker> {
     /// Recursive mutex for external synchronization.
-    pub mutex: Mutex<()>,
+    pub mutex: ReentrantMutex<()>,
 
     // -- Channel state (upstream inherits from ChannelSetupCaches) --
     pub channel_state: Option<Box<BufferCacheChannelInfo>>,
@@ -182,7 +182,7 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
         let _null_id = slot_buffers.insert(BufferBase::null(super::buffer_base::NullBufferParams));
 
         Self {
-            mutex: Mutex::new(()),
+            mutex: ReentrantMutex::new(()),
             channel_state: None,
             runtime: None,
             gpu_memory: None,
@@ -1110,6 +1110,17 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
     /// Upstream: `BufferCache<P>::PopAsyncFlushes` delegates to PopAsyncBuffers.
     pub fn pop_async_flushes(&mut self) {
         self.pop_async_buffers();
+    }
+
+    #[cfg(test)]
+    pub fn test_add_uncommitted_gpu_modified_range(&mut self, addr: u64, size: usize) {
+        self.uncommitted_gpu_modified_ranges.add(addr, size);
+    }
+
+    #[cfg(test)]
+    pub fn test_push_committed_async_flush_ranges(&mut self) {
+        self.committed_gpu_modified_ranges
+            .push_back(RangeSet::new());
     }
 
     /// Pop completed asynchronous buffers.
@@ -3279,6 +3290,14 @@ mod tests {
         let cache = BufferCache::<TestParams, DummyTracker>::new(&tracker);
         assert!(!cache.has_uncommitted_flushes());
         assert!(!cache.should_wait_async_flushes());
+    }
+
+    #[test]
+    fn test_buffer_cache_mutex_is_reentrant() {
+        let tracker = DummyTracker;
+        let cache = BufferCache::<TestParams, DummyTracker>::new(&tracker);
+        let _lock_a = cache.mutex.lock();
+        let _lock_b = cache.mutex.lock();
     }
 
     #[test]

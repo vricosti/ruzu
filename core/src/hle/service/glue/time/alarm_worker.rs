@@ -37,7 +37,7 @@ pub struct AlarmWorker {
     time_manager: Option<Arc<Mutex<TimeManager>>>,
     /// Reference to CoreTiming for scheduling.
     /// Upstream: `m_system.CoreTiming()`.
-    core_timing: Option<Arc<std::sync::Mutex<CoreTiming>>>,
+    core_timing: Option<Arc<CoreTiming>>,
 }
 
 impl AlarmWorker {
@@ -53,10 +53,7 @@ impl AlarmWorker {
     }
 
     /// Create with all references.
-    pub fn with_refs(
-        time_manager: Arc<Mutex<TimeManager>>,
-        core_timing: Arc<Mutex<CoreTiming>>,
-    ) -> Self {
+    pub fn with_refs(time_manager: Arc<Mutex<TimeManager>>, core_timing: Arc<CoreTiming>) -> Self {
         Self {
             initialized: false,
             timer_event: Arc::new(Event::new()),
@@ -73,7 +70,7 @@ impl AlarmWorker {
     }
 
     /// Set the core timing reference.
-    pub fn set_core_timing(&mut self, core_timing: Arc<Mutex<CoreTiming>>) {
+    pub fn set_core_timing(&mut self, core_timing: Arc<CoreTiming>) {
         self.core_timing = Some(core_timing);
     }
 
@@ -134,16 +131,14 @@ impl AlarmWorker {
     /// Unschedule the CoreTiming timer event.
     fn unschedule_timer(&self) {
         if let (Some(ref ct), Some(ref evt)) = (&self.core_timing, &self.timer_timing_event) {
-            ct.lock()
-                .unwrap()
-                .unschedule_event(evt, UnscheduleEventType::NoWait);
+            ct.unschedule_event(evt, UnscheduleEventType::NoWait);
         }
     }
 
     /// Schedule the CoreTiming timer event at the given duration from now.
     fn schedule_timer(&self, duration: Duration) {
         if let (Some(ref ct), Some(ref evt)) = (&self.core_timing, &self.timer_timing_event) {
-            ct.lock().unwrap().schedule_event(duration, evt, false);
+            ct.schedule_event(duration, evt, false);
         }
     }
 

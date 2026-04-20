@@ -17,6 +17,7 @@ use crate::hle::service::vi::vi_results;
 use crate::hle::service::vi::vi_types::Policy;
 
 use super::am_types::{AppletId, LibraryAppletMode};
+use crate::hle::kernel::k_process::ProcessLock;
 
 /// Port of DisplayLayerManager
 ///
@@ -25,7 +26,7 @@ use super::am_types::{AppletId, LibraryAppletMode};
 pub struct DisplayLayerManager {
     display_service: Option<Arc<IApplicationDisplayService>>,
     manager_display_service: Option<Arc<IManagerDisplayService>>,
-    process: Option<Arc<Mutex<KProcess>>>,
+    process: Option<Arc<ProcessLock>>,
     managed_display_layers: BTreeSet<u64>,
     managed_display_recording_layers: BTreeSet<u64>,
     system_shared_buffer_id: u64,
@@ -68,7 +69,7 @@ impl DisplayLayerManager {
     pub fn initialize(
         &mut self,
         system: SystemRef,
-        process: Arc<Mutex<KProcess>>,
+        process: Arc<ProcessLock>,
         applet_id: AppletId,
         mode: LibraryAppletMode,
     ) {

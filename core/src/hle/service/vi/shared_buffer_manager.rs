@@ -32,6 +32,7 @@ use crate::hle::service::nvnflinger::ui::graphic_buffer::NvGraphicBuffer;
 use crate::hle::service::nvnflinger::window::NativeWindowTransform;
 use crate::hle::service::vi::container::Container;
 use crate::hle::service::vi::vi_results;
+use crate::hle::kernel::k_process::ProcessLock;
 
 #[derive(Debug, Clone, Copy, Default)]
 #[repr(C)]
@@ -226,7 +227,7 @@ impl SharedBufferManager {
 
     pub fn create_session(
         &self,
-        owner_process: &Arc<Mutex<KProcess>>,
+        owner_process: &Arc<ProcessLock>,
         display_id: u64,
         enable_blending: bool,
     ) -> Result<(u64, u64), crate::hle::result::ResultCode> {
@@ -305,7 +306,7 @@ impl SharedBufferManager {
         Ok((inner.buffer_id, layer_id))
     }
 
-    pub fn destroy_session(&self, owner_process: &Arc<Mutex<KProcess>>) {
+    pub fn destroy_session(&self, owner_process: &Arc<ProcessLock>) {
         let aruid = owner_process.lock().unwrap().get_process_id();
         let mut inner = self.inner.lock().unwrap();
         let Some(session) = inner.sessions.remove(&aruid) else {

@@ -7,8 +7,6 @@
 //! Abstract interface for GPU rasterizer backends. Each renderer
 //! (Null, OpenGL, Vulkan) provides its own implementation.
 
-use std::sync::Arc;
-
 use crate::control::channel_state::ChannelState;
 use crate::engines::draw_manager::DrawState;
 use crate::query_cache::types::QueryPropertiesFlags;
@@ -76,10 +74,8 @@ pub trait RasterizerInterface {
         gpu_addr: u64,
         query_type: u32,
         flags: QueryPropertiesFlags,
-        gpu_ticks: u64,
         payload: u32,
         subreport: u32,
-        gpu_write: Arc<dyn Fn(u64, &[u8]) + Send + Sync>,
     );
 
     // ── Uniform buffers ─────────────────────────────────────────────────

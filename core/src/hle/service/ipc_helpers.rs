@@ -13,6 +13,7 @@
 use crate::hle::ipc;
 use crate::hle::result::{ErrorModule, ResultCode, RESULT_SUCCESS};
 use crate::hle::service::hle_ipc::HLERequestContext;
+use crate::hle::kernel::k_process::ProcessLock;
 
 /// Result code indicating a session has been closed.
 pub const RESULT_SESSION_CLOSED: ResultCode =
@@ -603,7 +604,7 @@ mod tests {
             )
         }));
 
-        let process = Arc::new(Mutex::new(KProcess::new()));
+        let process = Arc::new(ProcessLock::from_value(KProcess::new()));
         {
             let mut process_guard = process.lock().unwrap();
             assert_eq!(

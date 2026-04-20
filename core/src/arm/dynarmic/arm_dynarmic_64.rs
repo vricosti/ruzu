@@ -74,7 +74,7 @@ struct DynarmicCallbacks64 {
     uses_wall_clock: bool,
     /// Core timing reference for tick management.
     /// Matches upstream `m_parent.m_system.CoreTiming()`.
-    core_timing: Arc<std::sync::Mutex<crate::core_timing::CoreTiming>>,
+    core_timing: Arc<crate::core_timing::CoreTiming>,
     /// Last exception address reported by dynarmic.
     last_exception_address: Arc<AtomicU64>,
     /// Shared exclusive monitor backing Dynarmic's global monitor state.
@@ -94,7 +94,7 @@ impl DynarmicCallbacks64 {
         core_memory: Option<Arc<std::sync::Mutex<Memory>>>,
         svc: Arc<AtomicU32>,
         uses_wall_clock: bool,
-        core_timing: Arc<std::sync::Mutex<crate::core_timing::CoreTiming>>,
+        core_timing: Arc<crate::core_timing::CoreTiming>,
         last_exception_address: Arc<AtomicU64>,
         exclusive_monitor: *mut crate::arm::dynarmic::dynarmic_exclusive_monitor::DynarmicExclusiveMonitor,
         core_index: usize,
@@ -416,7 +416,7 @@ impl UserCallbacks for DynarmicCallbacks64 {
 
     /// Matches upstream `DynarmicCallbacks64::GetCNTPCT`.
     fn get_cntpct(&self) -> u64 {
-        self.core_timing.lock().unwrap().get_clock_ticks()
+        self.core_timing.get_clock_ticks()
     }
 
     /// Matches upstream `DynarmicCallbacks64::AddTicks`:
@@ -427,7 +427,7 @@ impl UserCallbacks for DynarmicCallbacks64 {
         }
         let amortized_ticks =
             std::cmp::max(ticks / crate::hardware_properties::NUM_CPU_CORES as u64, 1);
-        self.core_timing.lock().unwrap().add_ticks(amortized_ticks);
+        self.core_timing.add_ticks(amortized_ticks);
     }
 
     /// Matches upstream `DynarmicCallbacks64::GetTicksRemaining`:
@@ -436,8 +436,7 @@ impl UserCallbacks for DynarmicCallbacks64 {
         if self.uses_wall_clock {
             return u64::MAX;
         }
-        let ct = self.core_timing.lock().unwrap();
-        std::cmp::max(ct.get_downcount(), 0) as u64
+        std::cmp::max(self.core_timing.get_downcount(), 0) as u64
     }
 }
 
@@ -497,7 +496,7 @@ impl ArmDynarmic64 {
         exclusive_monitor: *mut crate::arm::dynarmic::dynarmic_exclusive_monitor::DynarmicExclusiveMonitor,
         core_index: usize,
         shared_memory: SharedProcessMemory,
-        core_timing: Arc<std::sync::Mutex<crate::core_timing::CoreTiming>>,
+        core_timing: Arc<crate::core_timing::CoreTiming>,
         core_memory: Option<Arc<std::sync::Mutex<Memory>>>,
     ) -> Self {
         // Create JIT callbacks with shared memory reference

@@ -201,7 +201,9 @@ impl CoreTiming {
                             if std::env::var_os("RUZU_TRACE_CT_FIRE").is_some() {
                                 log::info!(
                                     "CT_LOOP next_ns={} now_ns={} wait_ns={}",
-                                    next_ns, now_ns, wait_time
+                                    next_ns,
+                                    now_ns,
+                                    wait_time
                                 );
                             }
                             if wait_time > 0 {

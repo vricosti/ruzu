@@ -43,6 +43,8 @@ impl Default for RendererSettings {
 /// Upstream: `Tegra::MaxwellDeviceMemoryManager& device_memory`.
 /// In Rust, we use a shared callback since Memory is behind locks.
 pub type DeviceMemoryReader = std::sync::Arc<dyn Fn(u64, &mut [u8]) + Send + Sync>;
+pub type GuestMemoryWriter = std::sync::Arc<dyn Fn(u64, &[u8]) + Send + Sync>;
+pub type GpuTicksGetter = std::sync::Arc<dyn Fn() -> u64 + Send + Sync>;
 
 /// Abstract renderer base trait.
 ///
@@ -94,6 +96,12 @@ pub trait RendererBase: Send {
     /// Default impl is a no-op for renderers that do not yet have a
     /// shader cache (Null, current Vulkan stub).
     fn set_shader_cache_gpu_reader(&mut self, _reader: DeviceMemoryReader) {}
+
+    /// Install the guest memory writer used by rasterizer-side query/semaphore writes.
+    fn set_guest_memory_writer(&mut self, _writer: GuestMemoryWriter) {}
+
+    /// Install the GPU tick getter used by rasterizer-side timestamped query writes.
+    fn set_gpu_ticks_getter(&mut self, _getter: GpuTicksGetter) {}
 }
 
 /// Concrete base renderer data, shared by all renderer implementations.

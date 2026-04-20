@@ -836,47 +836,13 @@ impl Puller {
                 payload,
                 self.regs.semaphore_trigger()
             );
-            let gpu = self.gpu as usize;
-            let gpu_ticks = unsafe { &*(gpu as *const crate::gpu::Gpu) }.get_ticks();
-            let memory_manager = Arc::clone(&self.memory_manager);
             self.with_rasterizer_mut(|rasterizer| {
                 rasterizer.query(
                     sequence_address,
                     QueryType::Payload as u32,
                     QueryPropertiesFlags::HAS_TIMEOUT,
-                    gpu_ticks,
                     payload,
                     0,
-                    Arc::new(move |gpu_addr, bytes| {
-                        let gpu = unsafe { &*(gpu as *const crate::gpu::Gpu) };
-                        memory_manager.lock().write_block_unsafe(
-                            gpu_addr,
-                            bytes,
-                            &mut |cpu_addr, data| {
-                                if should_trace_semaphore_writeback()
-                                    && PULLER_SEMAPHORE_WRITEBACK_TRACE_COUNT
-                                        .fetch_add(1, Ordering::Relaxed)
-                                        < 8
-                                {
-                                    log::info!(
-                                        "Puller::SemaphoreTrigger writeback gpu_addr=0x{:X} cpu_addr=0x{:X} len=0x{:X} bytes={:02X?}",
-                                        gpu_addr,
-                                        cpu_addr,
-                                        data.len(),
-                                        &data[..std::cmp::min(data.len(), 16)]
-                                    );
-                                }
-                                log::trace!(
-                                    "Puller::SemaphoreTrigger writeback gpu_addr=0x{:X} cpu_addr=0x{:X} len=0x{:X} bytes={:02X?}",
-                                    gpu_addr,
-                                    cpu_addr,
-                                    data.len(),
-                                    &data[..std::cmp::min(data.len(), 16)]
-                                );
-                                gpu.write_guest_memory(cpu_addr, data);
-                            },
-                        );
-                    }),
                 )
             });
         } else {
@@ -947,27 +913,13 @@ impl Puller {
             self.write_gpu_u32(sequence_address, payload);
             return;
         }
-        let gpu = self.gpu as usize;
-        let gpu_ticks = unsafe { &*(gpu as *const crate::gpu::Gpu) }.get_ticks();
-        let memory_manager = Arc::clone(&self.memory_manager);
         self.with_rasterizer_mut(|rasterizer| {
             rasterizer.query(
                 sequence_address,
                 QueryType::Payload as u32,
                 QueryPropertiesFlags::IS_A_FENCE,
-                gpu_ticks,
                 payload,
                 0,
-                Arc::new(move |gpu_addr, bytes| {
-                    let gpu = unsafe { &*(gpu as *const crate::gpu::Gpu) };
-                    memory_manager.lock().write_block_unsafe(
-                        gpu_addr,
-                        bytes,
-                        &mut |cpu_addr, data| {
-                            gpu.write_guest_memory(cpu_addr, data);
-                        },
-                    );
-                }),
             )
         });
     }
@@ -1017,10 +969,8 @@ mod tests {
             gpu_addr: u64,
             query_type: u32,
             flags: QueryPropertiesFlags,
-            _gpu_ticks: u64,
             payload: u32,
             _subreport: u32,
-            _gpu_write: Arc<dyn Fn(u64, &[u8]) + Send + Sync>,
         ) {
             self.query_calls
                 .lock()

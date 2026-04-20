@@ -31,6 +31,7 @@ use super::k_worker_task_manager::KWorkerTaskManager;
 use super::physical_core::PhysicalCore;
 use crate::core_timing::CoreTiming;
 use crate::hardware_properties;
+use super::k_process::ProcessLock;
 
 // Thread-local host thread ID.
 // Upstream: `static inline thread_local u8 host_thread_id = UINT8_MAX` in KernelCore::Impl.
@@ -64,6 +65,311 @@ pub fn get_kernel_ref() -> Option<&'static KernelCore> {
     } else {
         Some(unsafe { &*ptr })
     }
+}
+
+/// SIGUSR1 flag set by the async-signal-safe handler; polled by the preemption
+/// thread so the dump runs outside signal context (where Rust's Mutex is unsafe).
+static DUMP_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+/// Tid currently holding the KProcess Mutex. Set by `track_process_lock_*`
+/// helpers at strategic SVC/scheduler call sites; used by the SIGUSR1 dumper
+/// to identify the lock holder when the Mutex is contended.
+/// 0 = not held (or holder not tracked at this site).
+pub static PROCESS_LOCK_HOLDER_TID: AtomicU64 = AtomicU64::new(0);
+/// PC of the code site that last acquired the Mutex (for localization).
+pub static PROCESS_LOCK_HOLDER_SITE: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(0);
+
+/// RAII guard for the tracked lock.  On Drop it clears the holder.
+pub struct ProcessLockTracker(u64, u32);
+impl ProcessLockTracker {
+    pub fn new(tid: u64, site: u32) -> Self {
+        PROCESS_LOCK_HOLDER_TID.store(tid, Ordering::Release);
+        PROCESS_LOCK_HOLDER_SITE.store(site, Ordering::Release);
+        Self(tid, site)
+    }
+}
+impl Drop for ProcessLockTracker {
+    fn drop(&mut self) {
+        PROCESS_LOCK_HOLDER_TID.store(0, Ordering::Release);
+        PROCESS_LOCK_HOLDER_SITE.store(0, Ordering::Release);
+    }
+}
+
+/// Per-core SVC-entry tracker.  Each entry is packed as (tid:u32, svc:u32).
+/// Updated by `svc_dispatch::call` at entry; cleared at exit.  Used by the
+/// SIGUSR1 dumper to identify which thread/svc is currently executing on each
+/// core.
+pub static SVC_IN_PROGRESS: [std::sync::atomic::AtomicU64;
+    hardware_properties::NUM_CPU_CORES as usize] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+
+#[inline]
+pub fn mark_svc_enter(core_id: usize, tid: u64, svc: u32) {
+    if core_id >= SVC_IN_PROGRESS.len() { return; }
+    let packed = ((tid & 0xFFFF_FFFF) << 32) | (svc as u64 & 0xFFFF_FFFF);
+    SVC_IN_PROGRESS[core_id].store(packed, Ordering::Release);
+}
+
+#[inline]
+pub fn mark_svc_exit(core_id: usize) {
+    if core_id >= SVC_IN_PROGRESS.len() { return; }
+    SVC_IN_PROGRESS[core_id].store(0, Ordering::Release);
+}
+
+extern "C" fn sigusr1_handler(_signum: libc::c_int) {
+    // Only async-signal-safe code here.
+    DUMP_REQUESTED.store(true, Ordering::Relaxed);
+}
+
+extern "C" fn sigurg_handler(_signum: libc::c_int) {
+    // Async-signal-safe: use libc::backtrace + libc::backtrace_symbols_fd.
+    // glibc documents these as thread-safe and signal-safe.
+    const MAX_FRAMES: usize = 32;
+    let mut frames: [*mut libc::c_void; MAX_FRAMES] = [std::ptr::null_mut(); MAX_FRAMES];
+    // Use raw libc symbols via direct FFI — neither is in the libc crate by default on all
+    // platforms, so declare them here.
+    extern "C" {
+        fn backtrace(buffer: *mut *mut libc::c_void, size: libc::c_int) -> libc::c_int;
+        fn backtrace_symbols_fd(
+            buffer: *const *mut libc::c_void,
+            size: libc::c_int,
+            fd: libc::c_int,
+        );
+    }
+    unsafe {
+        let n = backtrace(frames.as_mut_ptr(), MAX_FRAMES as libc::c_int);
+        // Write marker + backtrace to stderr.
+        let marker = b"[SIGURG] --- backtrace ---\n";
+        let _ = libc::write(2, marker.as_ptr() as *const _, marker.len());
+        backtrace_symbols_fd(frames.as_ptr(), n, 2);
+    }
+}
+
+fn install_sigusr1_handler() {
+    unsafe {
+        let mut sa: libc::sigaction = std::mem::zeroed();
+        sa.sa_sigaction = sigusr1_handler as usize;
+        libc::sigemptyset(&mut sa.sa_mask);
+        sa.sa_flags = libc::SA_RESTART;
+        let _ = libc::sigaction(libc::SIGUSR1, &sa, std::ptr::null_mut());
+
+        // Also install SIGURG handler for per-thread backtrace dump.
+        let mut sa2: libc::sigaction = std::mem::zeroed();
+        sa2.sa_sigaction = sigurg_handler as usize;
+        libc::sigemptyset(&mut sa2.sa_mask);
+        // Don't set SA_RESTART — we want the blocked futex to return EINTR so
+        // the signal handler runs. After the handler the thread returns to the
+        // same wait.
+        sa2.sa_flags = 0;
+        let _ = libc::sigaction(libc::SIGURG, &sa2, std::ptr::null_mut());
+    }
+    eprintln!(
+        "[SIGUSR1] handler installed for pid={}: send `kill -USR1 <pid>` to dump thread state",
+        std::process::id(),
+    );
+}
+
+/// Dump all per-core and per-thread state to stderr.
+/// Called from the preemption thread once DUMP_REQUESTED is set.
+/// The preemption thread is a normal host thread (not a fiber) so locking is
+/// safe.
+fn dump_thread_state(kernel: &KernelCore) {
+    eprintln!("=========================================");
+    eprintln!("[DUMP] === ruzu kernel thread dump ===");
+
+    // Holder info (if anyone acquired the Mutex via a tracked site).
+    let holder_tid = PROCESS_LOCK_HOLDER_TID.load(Ordering::Acquire);
+    let holder_site = PROCESS_LOCK_HOLDER_SITE.load(Ordering::Acquire);
+    eprintln!(
+        "[DUMP] PROCESS_LOCK_HOLDER tid={} site=0x{:X} (0 = unheld or untracked call-site)",
+        holder_tid, holder_site,
+    );
+
+    // Global TrackedMutex registry — every TrackedMutex::lock() records its
+    // holder here via RAII. This enumerates ALL held instances (including the
+    // KProcess Mutex).
+    super::tracked_mutex::dump_registry();
+    // Also print the current process's Mutex address so the registry entry
+    // can be matched against it.
+    {
+        let sys = kernel.system();
+        if !sys.is_null() {
+            if let Some(p) = sys.get().current_process_arc.as_ref() {
+                eprintln!(
+                    "[DUMP] current_process_arc Mutex addr=0x{:X}",
+                    Arc::as_ptr(p) as *const () as usize,
+                );
+            }
+        }
+    }
+
+    // Per-core running thread + interrupt flag + in-progress SVC.
+    for core_id in 0..hardware_properties::NUM_CPU_CORES as usize {
+        if let Some(core) = kernel.physical_core(core_id) {
+            let interrupted = core.is_interrupted();
+            let packed = SVC_IN_PROGRESS[core_id].load(Ordering::Acquire);
+            let svc_tid = (packed >> 32) as u32;
+            let svc_num = (packed & 0xFFFF_FFFF) as u32;
+            eprintln!(
+                "[DUMP] core={} is_interrupted={} in_svc={{tid={}, imm=0x{:X}}}",
+                core_id, interrupted, svc_tid, svc_num,
+            );
+        }
+    }
+
+    // Walk the application process (if any) and dump each thread.
+    let system = kernel.system();
+    if system.is_null() {
+        eprintln!("[DUMP] no system ref — skipping thread walk");
+        eprintln!("=========================================");
+        DUMP_REQUESTED.store(false, Ordering::Relaxed);
+        return;
+    }
+    let Some(process_arc) = system.get().current_process_arc.as_ref().cloned() else {
+        eprintln!("[DUMP] no current process");
+        eprintln!("=========================================");
+        DUMP_REQUESTED.store(false, Ordering::Relaxed);
+        return;
+    };
+
+    // Attempt the process lock with multi-second polling so a briefly-held
+    // Mutex passes; if still contended after the timeout, it's a real hold.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    let mut acquired = None;
+    let mut poll_count = 0u64;
+    while std::time::Instant::now() < deadline {
+        match process_arc.try_lock() {
+            Ok(guard) => {
+                acquired = Some(guard);
+                break;
+            }
+            Err(_) => {
+                poll_count += 1;
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        }
+    }
+    let thread_ids: Vec<u64> = match acquired {
+        Some(guard) => {
+            eprintln!(
+                "[DUMP] process threads: {} (process.lock() acquired after {} polls)",
+                guard.thread_list.len(),
+                poll_count,
+            );
+            guard.thread_list.clone()
+        }
+        None => {
+            eprintln!(
+                "[DUMP] process.lock() is CONTENDED after 3s poll ({} tries) — \
+                 Mutex held continuously by some thread.",
+                poll_count,
+            );
+            // Send SIGURG to every CPUCore_* and HLE:* host thread. Each will
+            // invoke the SIGURG handler (libc::backtrace -> fd 2) which prints
+            // its Rust stack. glibc backtrace is async-signal-safe.
+            eprintln!("[DUMP] Triggering SIGURG backtrace on every worker thread...");
+            if let Ok(entries) = std::fs::read_dir("/proc/self/task") {
+                for ent in entries.flatten() {
+                    let Ok(tid_str) = ent.file_name().into_string() else { continue; };
+                    let comm = std::fs::read_to_string(format!("/proc/self/task/{}/comm", tid_str))
+                        .unwrap_or_default()
+                        .trim().to_string();
+                    if comm.starts_with("CPUCore_") || comm.starts_with("HLE:")
+                        || comm == "CoreTiming" {
+                        let tid: i32 = tid_str.parse().unwrap_or(-1);
+                        if tid > 0 {
+                            eprintln!("[DUMP] SIGURG -> host_tid={} comm={}", tid, comm);
+                            unsafe { libc::syscall(libc::SYS_tgkill, std::process::id() as i32, tid, libc::SIGURG); }
+                            // Sleep briefly so each thread's output doesn't
+                            // interleave chaotically.
+                            std::thread::sleep(std::time::Duration::from_millis(30));
+                        }
+                    }
+                }
+            }
+            eprintln!("[DUMP] Host threads currently blocked in futex:");
+            if let Ok(entries) = std::fs::read_dir("/proc/self/task") {
+                for ent in entries.flatten() {
+                    let Ok(tid_str) = ent.file_name().into_string() else { continue; };
+                    let comm = std::fs::read_to_string(format!("/proc/self/task/{}/comm", tid_str))
+                        .unwrap_or_default()
+                        .trim().to_string();
+                    // Only interesting threads.
+                    if !(comm.starts_with("CPUCore_") || comm == "CoreTiming"
+                         || comm.starts_with("DSP_") || comm.starts_with("HLE:")
+                         || comm == "yuzu-cmd") {
+                        continue;
+                    }
+                    let wchan = std::fs::read_to_string(format!("/proc/self/task/{}/wchan", tid_str))
+                        .unwrap_or_default()
+                        .trim().to_string();
+                    let state = std::fs::read_to_string(format!("/proc/self/task/{}/stat", tid_str))
+                        .ok()
+                        .and_then(|s| s.split_whitespace().nth(2).map(|x| x.to_string()))
+                        .unwrap_or_default();
+                    let stack = std::fs::read_to_string(format!("/proc/self/task/{}/stack", tid_str))
+                        .unwrap_or_else(|_| "<stack unavailable>".into());
+                    eprintln!("[DUMP]   host_tid={} comm={} state={} wchan={}",
+                              tid_str, comm, state, wchan);
+                    for line in stack.lines().take(6) {
+                        eprintln!("[DUMP]     {}", line.trim());
+                    }
+                }
+            }
+            eprintln!("=========================================");
+            DUMP_REQUESTED.store(false, Ordering::Relaxed);
+            return;
+        }
+    };
+
+    // Walk each thread. try_lock() again on each thread to avoid blocking.
+    for tid in thread_ids {
+        let thread_arc_opt = match process_arc.try_lock() {
+            Ok(guard) => guard.thread_objects.get(&tid).cloned(),
+            Err(_) => None,
+        };
+        let thread_arc = match thread_arc_opt {
+            Some(a) => a,
+            None => {
+                eprintln!("[DUMP]   tid={} <process-lock-contended>", tid);
+                continue;
+            }
+        };
+        let try_result = thread_arc.try_lock();
+        if let Ok(t) = try_result {
+            let state = t.get_state();
+            let priority = t.get_priority();
+            let current_core = t.get_current_core();
+            let wait_reason = t.get_wait_reason_for_debugging();
+            let addr_key = t.get_address_key();
+            let addr_key_val = t.get_address_key_value();
+            let cv_key = t.get_condition_variable_key();
+            let waiting_lock = t.get_waiting_lock_info().is_some();
+            let pc = t.thread_context.pc as u32;
+            let lr = t.thread_context.lr as u32;
+            let sp = t.thread_context.sp as u32;
+            eprintln!(
+                "[DUMP]   tid={} state={:?} prio={} core={} wait={:?} \
+                 addr_key=0x{:X} addr_key_val=0x{:X} cv_key=0x{:X} \
+                 waiting_lock={} pc=0x{:08X} lr=0x{:08X} sp=0x{:08X}",
+                tid, state, priority, current_core, wait_reason,
+                addr_key.get(), addr_key_val, cv_key, waiting_lock,
+                pc, lr, sp,
+            );
+        } else {
+            eprintln!(
+                "[DUMP]   tid={} <thread-lock-contended — held by someone>",
+                tid,
+            );
+        }
+    }
+    eprintln!("=========================================");
+    DUMP_REQUESTED.store(false, Ordering::Relaxed);
 }
 
 /// Real scheduler callbacks that access the kernel via KERNEL_PTR.
@@ -382,9 +688,7 @@ pub fn get_current_hardware_tick() -> Option<i64> {
 
     let kernel = unsafe { &*kernel_ptr };
     if let Some(core_timing) = kernel.core_timing() {
-        if let Ok(core_timing) = core_timing.try_lock() {
-            return Some(core_timing.get_global_time_ns().as_nanos() as i64);
-        }
+        return Some(core_timing.get_global_time_ns().as_nanos() as i64);
     }
 
     kernel.hardware_timer().map(|timer| timer.get_tick())
@@ -478,7 +782,7 @@ pub struct KernelCore {
     /// Upstream: accessed via `system.CoreTiming()` through `System& system` reference.
     /// Stored here so fiber closures (guest_activate, idle thread) can access it
     /// without needing a System reference.
-    core_timing: Option<Arc<Mutex<CoreTiming>>>,
+    core_timing: Option<Arc<CoreTiming>>,
 
     /// Reference to the owning System.
     /// Upstream: `Core::System& system` stored in KernelCore::Impl.
@@ -503,11 +807,11 @@ pub struct KernelCore {
 
     /// Guest service processes created by `RunOnGuestCoreProcess`.
     /// Upstream keeps them alive after `KProcess::Register(*this, process)`.
-    service_processes: Mutex<Vec<Arc<Mutex<KProcess>>>>,
+    service_processes: Mutex<Vec<Arc<ProcessLock>>>,
 
     /// Host service processes created by `RunOnHostCoreProcess`.
     /// Upstream keeps them alive after `KProcess::Register(*this, process)` too.
-    host_service_processes: Mutex<Vec<Arc<Mutex<KProcess>>>>,
+    host_service_processes: Mutex<Vec<Arc<ProcessLock>>>,
 }
 
 // KProcess initial ID constants (matching upstream).
@@ -652,7 +956,7 @@ impl KernelCore {
         const SERVICE_THREAD_CORE: i32 = 3;
 
         // Create a service process for tracking.
-        let process = Arc::new(Mutex::new(super::k_process::KProcess::new()));
+        let process = Arc::new(ProcessLock::from_value(super::k_process::KProcess::new()));
         // Minimal init — service processes don't need page tables or user memory.
         self.service_processes
             .lock()
@@ -738,7 +1042,7 @@ impl KernelCore {
     /// runs `func`.
     fn run_host_thread_func(
         &self,
-        process: &Arc<Mutex<KProcess>>,
+        process: &Arc<ProcessLock>,
         thread_name: String,
         func: Box<dyn FnOnce() + Send>,
     ) -> std::thread::JoinHandle<()> {
@@ -783,7 +1087,7 @@ impl KernelCore {
         name: &str,
         func: Box<dyn FnOnce() + Send>,
     ) -> std::thread::JoinHandle<()> {
-        let process = Arc::new(Mutex::new(KProcess::new()));
+        let process = Arc::new(ProcessLock::from_value(KProcess::new()));
         {
             let mut process_guard = process.lock().unwrap();
             let rc = process_guard.initialize(&[], 0, 0, 0, 0, 0, None, false);
@@ -818,7 +1122,7 @@ impl KernelCore {
 
     /// Wire the hardware timer to CoreTiming.
     /// Must be called after initialize() when System has CoreTiming available.
-    pub fn wire_hardware_timer(&self, core_timing: Arc<std::sync::Mutex<CoreTiming>>) {
+    pub fn wire_hardware_timer(&self, core_timing: Arc<CoreTiming>) {
         if let Some(ref timer) = self.hardware_timer {
             KHardwareTimer::wire_callback(timer, core_timing);
         }
@@ -827,26 +1131,23 @@ impl KernelCore {
     /// Store a reference to CoreTiming so that fiber closures (guest_activate,
     /// idle thread) can access it without needing a System reference.
     /// Must be called after System creates CoreTiming and before CPU threads start.
-    pub fn set_core_timing(&mut self, core_timing: Arc<Mutex<CoreTiming>>) {
+    pub fn set_core_timing(&mut self, core_timing: Arc<CoreTiming>) {
         self.core_timing = Some(core_timing);
     }
 
     /// Get the CoreTiming reference.
     /// Upstream: accessed via `system.CoreTiming()`.
-    pub fn core_timing(&self) -> Option<&Arc<Mutex<CoreTiming>>> {
+    pub fn core_timing(&self) -> Option<&Arc<CoreTiming>> {
         self.core_timing.as_ref()
     }
 
     /// Schedule the preemption timer event (10ms interval).
     /// Matches upstream `InitializePreemption(kernel)` in kernel.cpp.
     /// Must be called after set_core_timing().
-    pub fn schedule_preemption_event(&self, core_timing: &Arc<std::sync::Mutex<CoreTiming>>) {
+    pub fn schedule_preemption_event(&self, core_timing: &Arc<CoreTiming>) {
         if let Some(ref event) = self.preemption_event {
             let interval = std::time::Duration::from_millis(10);
-            core_timing
-                .lock()
-                .unwrap()
-                .schedule_looping_event(interval, interval, event, false);
+            core_timing.schedule_looping_event(interval, interval, event, false);
             log::info!("KernelCore: preemption event scheduled (10ms interval)");
         }
 
@@ -854,6 +1155,12 @@ impl KernelCore {
         // of CoreTiming. This works around the CoreTiming event-starvation
         // bug where looping events stop being collected after the initial
         // burst, causing the JIT to run unpreempted forever.
+        //
+        // The same thread also services SIGUSR1 dump requests — the signal
+        // handler sets DUMP_REQUESTED; this thread polls it every 10ms and
+        // runs `dump_thread_state` outside signal context.
+        install_sigusr1_handler();
+
         let stop = Arc::clone(&self.preemption_stop);
         let kernel_ptr_val = KERNEL_PTR.load(Ordering::Acquire);
         if !kernel_ptr_val.is_null() {
@@ -871,6 +1178,9 @@ impl KernelCore {
                             if let Some(core) = kernel.physical_core(core_id) {
                                 core.interrupt();
                             }
+                        }
+                        if DUMP_REQUESTED.load(Ordering::Relaxed) {
+                            dump_thread_state(kernel);
                         }
                     }
                 })
@@ -1040,7 +1350,7 @@ impl KernelCore {
     /// Rust helper for owner lookups that upstream performs through the kernel
     /// process list. Returns the frontend application process or a guest
     /// service process with the matching process id.
-    pub fn get_process_by_id(&self, process_id: u64) -> Option<Arc<Mutex<KProcess>>> {
+    pub fn get_process_by_id(&self, process_id: u64) -> Option<Arc<ProcessLock>> {
         if let Some(process) = self.system_ref.get().current_process_arc.as_ref().cloned() {
             if process.lock().unwrap().get_process_id() == process_id {
                 return Some(process);

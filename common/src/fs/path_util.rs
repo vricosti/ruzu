@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
-use log::{debug, error, info};
+use log::{error, info};
 
 use super::fs;
 use super::fs_paths::*;
@@ -68,6 +68,18 @@ struct PathManager {
     ruzu_paths: HashMap<RuzuPath, PathBuf>,
 }
 
+fn has_populated_system_registered(root: &Path) -> bool {
+    let registered = root.join(NAND_DIR).join("system/Contents/registered");
+    let Ok(entries) = std::fs::read_dir(&registered) else {
+        return false;
+    };
+    entries.flatten().next().is_some()
+}
+
+fn should_use_legacy_yuzu_root(primary_root: &Path, legacy_root: &Path) -> bool {
+    !has_populated_system_registered(primary_root) && has_populated_system_registered(legacy_root)
+}
+
 impl PathManager {
     fn new() -> Self {
         let mut manager = Self {
@@ -92,15 +104,18 @@ impl PathManager {
         let ruzu_path;
         let ruzu_path_cache;
         let ruzu_path_config;
+        let data_root;
 
         if let Some(override_path) = ruzu_path_override {
             ruzu_path = override_path;
             ruzu_path_cache = ruzu_path.join(CACHE_DIR);
             ruzu_path_config = ruzu_path.join(CONFIG_DIR);
+            data_root = ruzu_path.clone();
         } else {
             // Use XDG directories on Unix, or a reasonable default
             let data_dir = get_data_directory("XDG_DATA_HOME");
             let candidate = data_dir.join(RUZU_DIR);
+            let legacy_candidate = data_dir.join(LEGACY_YUZU_DIR);
 
             if fs::exists(&candidate) && fs::is_dir(&candidate) {
                 ruzu_path = candidate;
@@ -111,24 +126,34 @@ impl PathManager {
                 ruzu_path_cache = get_data_directory("XDG_CACHE_HOME").join(RUZU_DIR);
                 ruzu_path_config = get_data_directory("XDG_CONFIG_HOME").join(RUZU_DIR);
             }
+
+            data_root = if should_use_legacy_yuzu_root(&ruzu_path, &legacy_candidate) {
+                info!(
+                    "Using legacy yuzu data root at {} because ruzu NAND is empty",
+                    path_to_utf8_string(&legacy_candidate)
+                );
+                legacy_candidate
+            } else {
+                ruzu_path.clone()
+            };
         }
 
         self.generate_ruzu_path(RuzuPath::RuzuDir, &ruzu_path);
-        self.generate_ruzu_path(RuzuPath::AmiiboDir, &ruzu_path.join(AMIIBO_DIR));
+        self.generate_ruzu_path(RuzuPath::AmiiboDir, &data_root.join(AMIIBO_DIR));
         self.generate_ruzu_path(RuzuPath::CacheDir, &ruzu_path_cache);
         self.generate_ruzu_path(RuzuPath::ConfigDir, &ruzu_path_config);
         self.generate_ruzu_path(RuzuPath::CrashDumpsDir, &ruzu_path.join(CRASH_DUMPS_DIR));
-        self.generate_ruzu_path(RuzuPath::DumpDir, &ruzu_path.join(DUMP_DIR));
-        self.generate_ruzu_path(RuzuPath::KeysDir, &ruzu_path.join(KEYS_DIR));
-        self.generate_ruzu_path(RuzuPath::LoadDir, &ruzu_path.join(LOAD_DIR));
+        self.generate_ruzu_path(RuzuPath::DumpDir, &data_root.join(DUMP_DIR));
+        self.generate_ruzu_path(RuzuPath::KeysDir, &data_root.join(KEYS_DIR));
+        self.generate_ruzu_path(RuzuPath::LoadDir, &data_root.join(LOAD_DIR));
         self.generate_ruzu_path(RuzuPath::LogDir, &ruzu_path.join(LOG_DIR));
-        self.generate_ruzu_path(RuzuPath::NANDDir, &ruzu_path.join(NAND_DIR));
-        self.generate_ruzu_path(RuzuPath::PlayTimeDir, &ruzu_path.join(PLAY_TIME_DIR));
-        self.generate_ruzu_path(RuzuPath::ScreenshotsDir, &ruzu_path.join(SCREENSHOTS_DIR));
-        self.generate_ruzu_path(RuzuPath::SDMCDir, &ruzu_path.join(SDMC_DIR));
-        self.generate_ruzu_path(RuzuPath::ShaderDir, &ruzu_path.join(SHADER_DIR));
-        self.generate_ruzu_path(RuzuPath::TASDir, &ruzu_path.join(TAS_DIR));
-        self.generate_ruzu_path(RuzuPath::IconsDir, &ruzu_path.join(ICONS_DIR));
+        self.generate_ruzu_path(RuzuPath::NANDDir, &data_root.join(NAND_DIR));
+        self.generate_ruzu_path(RuzuPath::PlayTimeDir, &data_root.join(PLAY_TIME_DIR));
+        self.generate_ruzu_path(RuzuPath::ScreenshotsDir, &data_root.join(SCREENSHOTS_DIR));
+        self.generate_ruzu_path(RuzuPath::SDMCDir, &data_root.join(SDMC_DIR));
+        self.generate_ruzu_path(RuzuPath::ShaderDir, &data_root.join(SHADER_DIR));
+        self.generate_ruzu_path(RuzuPath::TASDir, &data_root.join(TAS_DIR));
+        self.generate_ruzu_path(RuzuPath::IconsDir, &data_root.join(ICONS_DIR));
     }
 
     fn generate_ruzu_path(&mut self, ruzu_path: RuzuPath, new_path: &Path) {
@@ -531,6 +556,7 @@ fn normalize_path(path: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     #[test]
     fn test_validate_path() {
@@ -637,5 +663,30 @@ mod tests {
         assert_eq!(get_extension_from_filename("file.txt"), "txt");
         assert_eq!(get_extension_from_filename("file"), "");
         assert_eq!(get_extension_from_filename("archive.tar.gz"), "gz");
+    }
+
+    #[test]
+    fn test_legacy_yuzu_root_selected_when_ruzu_nand_is_empty() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let base = std::env::temp_dir().join(format!("ruzu-path-util-{unique}"));
+        let primary = base.join("ruzu");
+        let legacy = base.join("yuzu");
+
+        fs::create_dir_all(primary.join("nand")).unwrap();
+        fs::create_dir_all(legacy.join("nand/system/Contents/registered")).unwrap();
+        fs::write(
+            legacy
+                .join("nand/system/Contents/registered")
+                .join("dummy.nca"),
+            b"x",
+        )
+        .unwrap();
+
+        assert!(should_use_legacy_yuzu_root(&primary, &legacy));
+
+        let _ = fs::remove_dir_all(base);
     }
 }

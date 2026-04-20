@@ -16,6 +16,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
+use common::settings;
+
 use crate::core::SystemRef;
 use crate::core_timing;
 use crate::hle::service::nvnflinger::surface_flinger::SurfaceFlinger;
@@ -84,14 +86,48 @@ impl SharedTickState {
             .store(compose_speed_scale.to_bits(), Ordering::Relaxed);
     }
 
-    fn get_next_ticks(&self) -> i64 {
+    fn get_next_ticks(&self, system: SystemRef) -> i64 {
         let compose_speed_scale =
             f32::from_bits(self.compose_speed_scale_bits.load(Ordering::Relaxed));
         let swap_interval = self.swap_interval.load(Ordering::Relaxed);
-        let speed_scale = 1.0f32 / compose_speed_scale;
-        let effective_fps = 60.0f32 / swap_interval as f32;
-        (speed_scale * (1_000_000_000.0f32 / effective_fps)) as i64
+        compute_next_ticks(
+            swap_interval,
+            compose_speed_scale,
+            *settings::values().use_multi_core.get_value(),
+            *settings::values().use_speed_limit.get_value(),
+            *settings::values().speed_limit.get_value(),
+            system.get().get_nvdec_active(),
+            *settings::values().use_video_framerate.get_value(),
+        )
     }
+}
+
+fn compute_next_ticks(
+    swap_interval: i32,
+    compose_speed_scale: f32,
+    use_multi_core: bool,
+    use_speed_limit: bool,
+    speed_limit: u16,
+    nvdec_active: bool,
+    use_video_framerate: bool,
+) -> i64 {
+    let mut speed_scale = 1.0f32;
+    if use_multi_core {
+        if use_speed_limit {
+            speed_scale = 100.0f32 / speed_limit as f32;
+        } else {
+            speed_scale = 0.01f32;
+        }
+    }
+
+    speed_scale /= compose_speed_scale;
+
+    if nvdec_active && use_video_framerate {
+        speed_scale = 1.0f32;
+    }
+
+    let effective_fps = 60.0f32 / swap_interval as f32;
+    (speed_scale * (1_000_000_000.0f32 / effective_fps)) as i64
 }
 
 /// Conductor drives display composition and vsync signaling.
@@ -163,6 +199,7 @@ impl Conductor {
             // Create the CoreTiming event that just signals the thread event.
             let signal_for_callback = Arc::clone(&signal);
             let tick_state = Arc::clone(&conductor.lock().unwrap().tick_state);
+            let system_for_callback = conductor.lock().unwrap().system;
             let event = core_timing::create_event(
                 "ScreenComposition".to_string(),
                 Box::new(move |_time, _ns_late| {
@@ -173,7 +210,7 @@ impl Conductor {
                         log::info!("[SC_CB] #{} signal_ptr={:p}", sc, &*signal_for_callback);
                     }
                     signal_for_callback.set();
-                    let next_ns = tick_state.get_next_ticks();
+                    let next_ns = tick_state.get_next_ticks(system_for_callback);
                     Some(Duration::from_nanos(next_ns as u64))
                 }),
             );
@@ -181,10 +218,7 @@ impl Conductor {
             let system = conductor.lock().unwrap().system;
             let core_timing = system.get().core_timing();
             let frame_dur = Duration::from_nanos(FRAME_NS as u64);
-            core_timing
-                .lock()
-                .unwrap()
-                .schedule_looping_event(frame_dur, frame_dur, &event, false);
+            core_timing.schedule_looping_event(frame_dur, frame_dur, &event, false);
 
             // Spawn the VsyncThread.
             let signal_for_thread = Arc::clone(&signal);
@@ -216,13 +250,14 @@ impl Conductor {
             // Single-core mode: CoreTiming callback directly calls process_vsync().
             let weak = Arc::downgrade(conductor);
             let tick_state = Arc::clone(&conductor.lock().unwrap().tick_state);
+            let system_for_callback = conductor.lock().unwrap().system;
             let event = core_timing::create_event(
                 "ScreenComposition".to_string(),
                 Box::new(move |_time, _ns_late| {
                     if let Some(conductor) = weak.upgrade() {
                         conductor.lock().unwrap().process_vsync();
                     }
-                    let next_ns = tick_state.get_next_ticks();
+                    let next_ns = tick_state.get_next_ticks(system_for_callback);
                     Some(Duration::from_nanos(next_ns as u64))
                 }),
             );
@@ -230,10 +265,7 @@ impl Conductor {
             let system = conductor.lock().unwrap().system;
             let core_timing = system.get().core_timing();
             let frame_dur = Duration::from_nanos(FRAME_NS as u64);
-            core_timing
-                .lock()
-                .unwrap()
-                .schedule_looping_event(frame_dur, frame_dur, &event, false);
+            core_timing.schedule_looping_event(frame_dur, frame_dur, &event, false);
 
             conductor.lock().unwrap().event = Some(event);
             log::info!(
@@ -326,9 +358,15 @@ impl Conductor {
     /// Calculate the next tick interval in nanoseconds.
     /// Port of upstream `Conductor::GetNextTicks`.
     pub fn get_next_ticks(&self) -> i64 {
-        let speed_scale = 1.0f32 / self.compose_speed_scale;
-        let effective_fps = 60.0f32 / self.swap_interval as f32;
-        (speed_scale * (1_000_000_000.0f32 / effective_fps)) as i64
+        compute_next_ticks(
+            self.swap_interval,
+            self.compose_speed_scale,
+            *settings::values().use_multi_core.get_value(),
+            *settings::values().use_speed_limit.get_value(),
+            *settings::values().speed_limit.get_value(),
+            self.system.get().get_nvdec_active(),
+            *settings::values().use_video_framerate.get_value(),
+        )
     }
 }
 
@@ -337,10 +375,7 @@ impl Drop for Conductor {
         // Unschedule the CoreTiming event.
         if let Some(ref event) = self.event {
             let core_timing = self.system.get().core_timing();
-            core_timing
-                .lock()
-                .unwrap()
-                .unschedule_event(event, core_timing::UnscheduleEventType::NoWait);
+            core_timing.unschedule_event(event, core_timing::UnscheduleEventType::NoWait);
         }
 
         // Stop the VsyncThread if running (multicore mode).
@@ -355,5 +390,28 @@ impl Drop for Conductor {
         }
 
         log::info!("Conductor: vsync timer stopped");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{compute_next_ticks, FRAME_NS};
+
+    #[test]
+    fn get_next_ticks_matches_60hz_at_default_multicore_speed_limit() {
+        let ticks = compute_next_ticks(1, 1.0, true, true, 100, false, false);
+        assert_eq!(ticks, FRAME_NS);
+    }
+
+    #[test]
+    fn get_next_ticks_uses_unlocked_multicore_rate_when_speed_limit_disabled() {
+        let ticks = compute_next_ticks(1, 1.0, true, false, 100, false, false);
+        assert_eq!(ticks, FRAME_NS / 100);
+    }
+
+    #[test]
+    fn get_next_ticks_overrides_compose_scale_for_nvdec_video_rate() {
+        let ticks = compute_next_ticks(2, 0.05, true, true, 100, true, true);
+        assert_eq!(ticks, FRAME_NS * 2);
     }
 }
