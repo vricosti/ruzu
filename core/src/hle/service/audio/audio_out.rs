@@ -7,8 +7,8 @@ use std::sync::{Arc, Mutex};
 
 use crate::hle::kernel::k_readable_event::KReadableEvent;
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
+use crate::hle::service::cmif_serialization::{write_out_array_bytes, CmifRequest, CmifResponse};
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
-use crate::hle::service::ipc_helpers::ResponseBuilder;
 use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
 
 /// IPC command table for IAudioOut:
@@ -112,27 +112,27 @@ impl IAudioOut {
 
     fn get_audio_out_state_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         log::debug!("IAudioOut::GetAudioOutState (STUBBED)");
-        let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
-        rb.push_result(RESULT_SUCCESS);
-        rb.push_u32(0); // Stopped state
+        let mut response = CmifResponse::new(ctx, 3, 0, 0);
+        response.push_result(RESULT_SUCCESS);
+        response.push_u32(0); // Stopped state
     }
 
     fn start_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         log::debug!("IAudioOut::Start (STUBBED)");
-        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
-        rb.push_result(RESULT_SUCCESS);
+        let mut response = CmifResponse::new(ctx, 2, 0, 0);
+        response.push_result(RESULT_SUCCESS);
     }
 
     fn stop_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         log::debug!("IAudioOut::Stop (STUBBED)");
-        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
-        rb.push_result(RESULT_SUCCESS);
+        let mut response = CmifResponse::new(ctx, 2, 0, 0);
+        response.push_result(RESULT_SUCCESS);
     }
 
     fn append_audio_out_buffer_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         log::debug!("IAudioOut::AppendAudioOutBuffer (STUBBED)");
-        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
-        rb.push_result(RESULT_SUCCESS);
+        let mut response = CmifResponse::new(ctx, 2, 0, 0);
+        response.push_result(RESULT_SUCCESS);
     }
 
     fn as_self(this: &dyn ServiceFramework) -> &Self {
@@ -148,9 +148,9 @@ impl IAudioOut {
 
         if let Some(ref readable) = *event_guard {
             if let Some(handle) = ctx.copy_handle_for_readable_event(Arc::clone(readable)) {
-                let mut rb = ResponseBuilder::new(ctx, 2, 1, 0);
-                rb.push_result(RESULT_SUCCESS);
-                rb.push_copy_objects(handle);
+                let mut response = CmifResponse::new(ctx, 2, 1, 0);
+                response.push_result(RESULT_SUCCESS);
+                response.push_copy_objects(handle);
                 return;
             }
         }
@@ -163,14 +163,14 @@ impl IAudioOut {
             );
             *event_guard = Some(readable_event);
             drop(event_guard);
-            let mut rb = ResponseBuilder::new(ctx, 2, 1, 0);
-            rb.push_result(RESULT_SUCCESS);
-            rb.push_copy_objects(handle);
+            let mut response = CmifResponse::new(ctx, 2, 1, 0);
+            response.push_result(RESULT_SUCCESS);
+            response.push_copy_objects(handle);
         } else {
             log::error!("IAudioOut::RegisterBufferEvent failed to create event");
             drop(event_guard);
-            let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
-            rb.push_result(RESULT_SUCCESS);
+            let mut response = CmifResponse::new(ctx, 2, 0, 0);
+            response.push_result(RESULT_SUCCESS);
         }
     }
 
@@ -179,11 +179,10 @@ impl IAudioOut {
         ctx: &mut HLERequestContext,
     ) {
         log::debug!("IAudioOut::GetReleasedAudioOutBuffers (STUBBED)");
-        // Write empty buffer (no released buffers)
-        ctx.write_buffer(&[], 0);
-        let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
-        rb.push_result(RESULT_SUCCESS);
-        rb.push_u32(0); // count
+        write_out_array_bytes(ctx, 0, &[]);
+        let mut response = CmifResponse::new(ctx, 3, 0, 0);
+        response.push_result(RESULT_SUCCESS);
+        response.push_u32(0); // count
     }
 
     fn contains_audio_out_buffer_handler(
@@ -191,9 +190,9 @@ impl IAudioOut {
         ctx: &mut HLERequestContext,
     ) {
         log::debug!("IAudioOut::ContainsAudioOutBuffer (STUBBED)");
-        let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
-        rb.push_result(RESULT_SUCCESS);
-        rb.push_bool(false);
+        let mut response = CmifResponse::new(ctx, 3, 0, 0);
+        response.push_result(RESULT_SUCCESS);
+        response.push_bool(false);
     }
 
     fn append_audio_out_buffer_auto_handler(
@@ -201,8 +200,8 @@ impl IAudioOut {
         ctx: &mut HLERequestContext,
     ) {
         log::debug!("IAudioOut::AppendAudioOutBufferAuto (STUBBED)");
-        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
-        rb.push_result(RESULT_SUCCESS);
+        let mut response = CmifResponse::new(ctx, 2, 0, 0);
+        response.push_result(RESULT_SUCCESS);
     }
 
     fn get_released_audio_out_buffers_auto_handler(
@@ -210,10 +209,10 @@ impl IAudioOut {
         ctx: &mut HLERequestContext,
     ) {
         log::debug!("IAudioOut::GetReleasedAudioOutBuffersAuto (STUBBED)");
-        ctx.write_buffer(&[], 0);
-        let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
-        rb.push_result(RESULT_SUCCESS);
-        rb.push_u32(0); // count
+        write_out_array_bytes(ctx, 0, &[]);
+        let mut response = CmifResponse::new(ctx, 3, 0, 0);
+        response.push_result(RESULT_SUCCESS);
+        response.push_u32(0); // count
     }
 
     fn get_audio_out_buffer_count_handler(
@@ -221,9 +220,9 @@ impl IAudioOut {
         ctx: &mut HLERequestContext,
     ) {
         log::debug!("IAudioOut::GetAudioOutBufferCount (STUBBED)");
-        let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
-        rb.push_result(RESULT_SUCCESS);
-        rb.push_u32(0);
+        let mut response = CmifResponse::new(ctx, 3, 0, 0);
+        response.push_result(RESULT_SUCCESS);
+        response.push_u32(0);
     }
 
     fn get_audio_out_played_sample_count_handler(
@@ -231,29 +230,46 @@ impl IAudioOut {
         ctx: &mut HLERequestContext,
     ) {
         log::debug!("IAudioOut::GetAudioOutPlayedSampleCount (STUBBED)");
-        let mut rb = ResponseBuilder::new(ctx, 4, 0, 0);
-        rb.push_result(RESULT_SUCCESS);
-        rb.push_u64(0);
+        let mut response = CmifResponse::new(ctx, 4, 0, 0);
+        response.push_result(RESULT_SUCCESS);
+        response.push_u64(0);
     }
 
     fn flush_audio_out_buffers_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         log::debug!("IAudioOut::FlushAudioOutBuffers (STUBBED)");
-        let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
-        rb.push_result(RESULT_SUCCESS);
-        rb.push_bool(true);
+        let mut response = CmifResponse::new(ctx, 3, 0, 0);
+        response.push_result(RESULT_SUCCESS);
+        response.push_bool(true);
     }
 
     fn set_audio_out_volume_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         log::debug!("IAudioOut::SetAudioOutVolume (STUBBED)");
-        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
-        rb.push_result(RESULT_SUCCESS);
+        let mut request = CmifRequest::new(ctx);
+        let _volume = request.f32();
+        let mut response = CmifResponse::new(ctx, 2, 0, 0);
+        response.push_result(RESULT_SUCCESS);
     }
 
     fn get_audio_out_volume_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         log::debug!("IAudioOut::GetAudioOutVolume (STUBBED)");
-        let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
-        rb.push_result(RESULT_SUCCESS);
-        rb.push_f32(1.0);
+        let mut response = CmifResponse::new(ctx, 3, 0, 0);
+        response.push_result(RESULT_SUCCESS);
+        response.push_f32(1.0);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn audio_out_registers_upstream_command_ids() {
+        let service = IAudioOut::new();
+
+        for cmd in [0_u32, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13] {
+            assert!(service.handlers.contains_key(&cmd));
+            assert!(service.handlers[&cmd].handler_callback.is_some());
+        }
     }
 }
 

@@ -7,6 +7,7 @@
 
 use std::sync::Arc;
 
+use super::gl_resource_manager::OGLSync;
 use crate::fence_manager::FenceBase;
 
 /// An OpenGL sync fence.
@@ -15,8 +16,8 @@ use crate::fence_manager::FenceBase;
 pub struct GLInnerFence {
     /// Whether this fence is stubbed (no actual GL sync).
     pub is_stubbed: bool,
-    /// GL sync object handle.
-    sync_object: gl::types::GLsync,
+    /// GL sync object wrapper.
+    sync_object: OGLSync,
 }
 
 impl GLInnerFence {
@@ -26,7 +27,7 @@ impl GLInnerFence {
     pub fn new(is_stubbed: bool) -> Self {
         Self {
             is_stubbed,
-            sync_object: std::ptr::null(),
+            sync_object: OGLSync::new(),
         }
     }
 
@@ -37,10 +38,8 @@ impl GLInnerFence {
         if self.is_stubbed {
             return;
         }
-        assert!(self.sync_object.is_null());
-        unsafe {
-            self.sync_object = gl::FenceSync(gl::SYNC_GPU_COMMANDS_COMPLETE, 0);
-        }
+        assert!(self.sync_object.handle.is_null());
+        self.sync_object.create();
     }
 
     /// Check if the fence has been signaled.
@@ -50,18 +49,8 @@ impl GLInnerFence {
         if self.is_stubbed {
             return true;
         }
-        assert!(!self.sync_object.is_null());
-        let mut status: gl::types::GLint = 0;
-        unsafe {
-            gl::GetSynciv(
-                self.sync_object,
-                gl::SYNC_STATUS,
-                1,
-                std::ptr::null_mut(),
-                &mut status,
-            );
-        }
-        status as u32 == gl::SIGNALED
+        assert!(!self.sync_object.handle.is_null());
+        self.sync_object.is_signaled()
     }
 
     /// Wait for the fence to be signaled.
@@ -71,19 +60,9 @@ impl GLInnerFence {
         if self.is_stubbed {
             return;
         }
-        assert!(!self.sync_object.is_null());
+        assert!(!self.sync_object.handle.is_null());
         unsafe {
-            gl::ClientWaitSync(self.sync_object, 0, gl::TIMEOUT_IGNORED);
-        }
-    }
-}
-
-impl Drop for GLInnerFence {
-    fn drop(&mut self) {
-        if !self.sync_object.is_null() {
-            unsafe {
-                gl::DeleteSync(self.sync_object);
-            }
+            gl::ClientWaitSync(self.sync_object.handle, 0, gl::TIMEOUT_IGNORED);
         }
     }
 }
@@ -139,5 +118,18 @@ impl FenceManagerOpenGL {
     /// Corresponds to `FenceManagerOpenGL::WaitFence()`.
     pub fn wait_fence(&self, fence: &Fence) {
         fence.lock().unwrap().wait();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::GLInnerFence;
+
+    #[test]
+    fn stubbed_fence_is_immediately_signaled_and_noop() {
+        let mut fence = GLInnerFence::new(true);
+        fence.queue();
+        assert!(fence.is_signaled());
+        fence.wait();
     }
 }

@@ -12,6 +12,7 @@ use common::fiber::Fiber;
 use common::thread::Barrier;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use crate::hle::kernel::k_process::ProcessLock;
 
 /// Per-core data held by the CPU manager.
 /// Matches upstream `CpuManager::CoreData`.
@@ -294,7 +295,7 @@ impl CpuManager {
     /// Upstream: `CpuManager::GuestThreadFunction()` (cpu_manager.cpp:42-48).
     pub fn guest_thread_function(
         kernel: &KernelCore,
-        core_timing: &Arc<Mutex<CoreTiming>>,
+        core_timing: &Arc<CoreTiming>,
         current_core: &AtomicUsize,
         idle_count: &mut usize,
         is_multicore: bool,
@@ -311,7 +312,7 @@ impl CpuManager {
     /// Upstream: `CpuManager::IdleThreadFunction()` (cpu_manager.cpp:50-56).
     pub fn idle_thread_function(
         kernel: &KernelCore,
-        core_timing: &Arc<Mutex<CoreTiming>>,
+        core_timing: &Arc<CoreTiming>,
         current_core: &AtomicUsize,
         idle_count: &mut usize,
         is_multicore: bool,
@@ -425,7 +426,7 @@ impl CpuManager {
         // serializing all 4 CPU cores on a single Mutex and collapsing guest
         // emulation onto one host thread.
         //
-        // Safety: the Arc<Mutex<KProcess>> keeps the process alive as long as
+        // Safety: the Arc<ProcessLock> keeps the process alive as long as
         // this guest thread exists. `arm_interfaces` entries are populated once
         // during process init and never change afterwards, so holding raw
         // pointers into them is sound for the thread's lifetime.
@@ -453,8 +454,9 @@ impl CpuManager {
                 [const { None }; hardware_properties::NUM_CPU_CORES as usize];
             for i in 0..hardware_properties::NUM_CPU_CORES as usize {
                 if let Some(jit) = process.get_arm_interface_mut(i) {
-                    jits[i] = Some(jit as *mut _
-                        as *mut Box<dyn crate::arm::arm_interface::ArmInterface>);
+                    jits[i] = Some(
+                        jit as *mut _ as *mut Box<dyn crate::arm::arm_interface::ArmInterface>,
+                    );
                 }
             }
             drop(process);
@@ -865,7 +867,7 @@ impl CpuManager {
     /// for the current guest thread (obtained from the scheduler).
     fn single_core_run_guest_thread(
         kernel: &KernelCore,
-        core_timing: &Arc<Mutex<CoreTiming>>,
+        core_timing: &Arc<CoreTiming>,
         current_core: &AtomicUsize,
         idle_count: &mut usize,
     ) {
@@ -902,14 +904,15 @@ impl CpuManager {
                     };
                     let mut process = parent_arc.lock().unwrap();
                     let is_64bit = process.is_64bit();
-                    let mut jits: [Option<
-                        *mut Box<dyn crate::arm::arm_interface::ArmInterface>,
-                    >; hardware_properties::NUM_CPU_CORES as usize] =
+                    let mut jits: [Option<*mut Box<dyn crate::arm::arm_interface::ArmInterface>>;
+                        hardware_properties::NUM_CPU_CORES as usize] =
                         [const { None }; hardware_properties::NUM_CPU_CORES as usize];
                     for i in 0..hardware_properties::NUM_CPU_CORES as usize {
                         if let Some(jit) = process.get_arm_interface_mut(i) {
-                            jits[i] = Some(jit as *mut _
-                                as *mut Box<dyn crate::arm::arm_interface::ArmInterface>);
+                            jits[i] = Some(
+                                jit as *mut _
+                                    as *mut Box<dyn crate::arm::arm_interface::ArmInterface>,
+                            );
                         }
                     }
                     (is_64bit, jits)
@@ -925,7 +928,7 @@ impl CpuManager {
 
             // Upstream: kernel.SetIsPhantomModeForSingleCore(true);
             kernel.set_is_phantom_mode_for_single_core(true);
-            let _ = core_timing.lock().unwrap().advance();
+            let _ = core_timing.advance();
             kernel.set_is_phantom_mode_for_single_core(false);
 
             Self::preempt_single_core_inner(kernel, core_timing, current_core, idle_count, true);
@@ -939,7 +942,7 @@ impl CpuManager {
     /// Upstream: `CpuManager::SingleCoreRunIdleThread()` (cpu_manager.cpp:133-143).
     fn single_core_run_idle_thread(
         kernel: &KernelCore,
-        core_timing: &Arc<Mutex<CoreTiming>>,
+        core_timing: &Arc<CoreTiming>,
         current_core: &AtomicUsize,
         idle_count: &mut usize,
     ) {
@@ -952,7 +955,7 @@ impl CpuManager {
         loop {
             Self::shutdown_if_requested(kernel);
             Self::preempt_single_core_inner(kernel, core_timing, current_core, idle_count, false);
-            core_timing.lock().unwrap().add_ticks(1000);
+            core_timing.add_ticks(1000);
             *idle_count += 1;
             Self::handle_interrupt(kernel);
             Self::shutdown_if_requested(kernel);
@@ -970,24 +973,24 @@ impl CpuManager {
     /// This is the public API called from System::run_main_loop.
     pub fn preempt_single_core(
         &mut self,
-        core_timing: &Arc<Mutex<CoreTiming>>,
+        core_timing: &Arc<CoreTiming>,
         from_running_environment: bool,
     ) {
         // Without kernel access, delegate to the inner version using stored state.
         // This path is used by the legacy System::run_main_loop path.
         if self.idle_count >= 4 || from_running_environment {
             if !from_running_environment {
-                core_timing.lock().unwrap().idle();
+                core_timing.idle();
                 self.idle_count = 0;
             }
-            let _ = core_timing.lock().unwrap().advance();
+            let _ = core_timing.advance();
         }
 
         let next_core = (self.current_core.load(Ordering::Relaxed) + 1)
             % hardware_properties::NUM_CPU_CORES as usize;
         self.current_core.store(next_core, Ordering::Relaxed);
 
-        core_timing.lock().unwrap().reset_ticks();
+        core_timing.reset_ticks();
     }
 
     /// Inner preemption with full kernel access.
@@ -995,25 +998,25 @@ impl CpuManager {
     /// Upstream: `CpuManager::PreemptSingleCore(bool)` (cpu_manager.cpp:145-166).
     fn preempt_single_core_inner(
         kernel: &KernelCore,
-        core_timing: &Arc<Mutex<CoreTiming>>,
+        core_timing: &Arc<CoreTiming>,
         current_core: &AtomicUsize,
         idle_count: &mut usize,
         from_running_environment: bool,
     ) {
         if *idle_count >= 4 || from_running_environment {
             if !from_running_environment {
-                core_timing.lock().unwrap().idle();
+                core_timing.idle();
                 *idle_count = 0;
             }
             kernel.set_is_phantom_mode_for_single_core(true);
-            let _ = core_timing.lock().unwrap().advance();
+            let _ = core_timing.advance();
             kernel.set_is_phantom_mode_for_single_core(false);
         }
 
         let next_core = (current_core.load(Ordering::Relaxed) + 1)
             % hardware_properties::NUM_CPU_CORES as usize;
         current_core.store(next_core, Ordering::Relaxed);
-        core_timing.lock().unwrap().reset_ticks();
+        core_timing.reset_ticks();
 
         // Upstream: kernel.Scheduler(current_core).PreemptSingleCore();
         if let Some(scheduler) = kernel.scheduler(next_core) {

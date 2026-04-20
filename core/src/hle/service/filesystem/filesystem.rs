@@ -10,8 +10,12 @@ use common::ResultCode;
 
 use crate::file_sys::errors;
 use crate::file_sys::fs_filesystem::{DirectoryEntryType, OpenMode};
+use crate::file_sys::registered_cache::{
+    ContentProvider, ContentProviderUnion, ContentProviderUnionSlot,
+};
 use crate::file_sys::romfs_factory::RomFSFactory;
 use crate::file_sys::savedata_factory::SaveDataFactory;
+use crate::file_sys::sdmc_factory::SdmcFactory;
 use crate::file_sys::vfs::vfs_offset::OffsetVfsFile;
 use crate::file_sys::vfs::vfs_types::{FileTimeStampRaw, VirtualDir, VirtualFile};
 use crate::hle::result::RESULT_SUCCESS;
@@ -64,7 +68,11 @@ pub struct FileSystemController {
     /// Virtual filesystem reference for creating factories.
     /// Upstream: `Core::System::GetFilesystem()`.
     vfs: Option<Arc<crate::file_sys::vfs::vfs_real::RealVfsFilesystem>>,
-    // sdmc_factory: Option<SDMCFactory>,
+    /// SDMC factory for SD card content and mod roots.
+    /// Upstream: `std::unique_ptr<FileSys::SDMCFactory> sdmc_factory`.
+    sdmc_factory: Option<SdmcFactory>,
+    /// Shared content provider union owned by System.
+    content_provider: Option<Arc<Mutex<ContentProviderUnion>>>,
     // gamecard: Option<XCI>,
     // gamecard_registered: Option<RegisteredCache>,
     // gamecard_placeholder: Option<PlaceholderCache>,
@@ -76,12 +84,18 @@ impl FileSystemController {
             registrations: Mutex::new(BTreeMap::new()),
             bis_factory: None,
             vfs: None,
+            sdmc_factory: None,
+            content_provider: None,
         }
     }
 
     /// Set the virtual filesystem reference.
     pub fn set_filesystem(&mut self, vfs: Arc<crate::file_sys::vfs::vfs_real::RealVfsFilesystem>) {
         self.vfs = Some(vfs);
+    }
+
+    pub fn set_content_provider(&mut self, provider: Arc<Mutex<ContentProviderUnion>>) {
+        self.content_provider = Some(provider);
     }
 
     /// Set the BIS factory (called during system initialization).
@@ -121,6 +135,20 @@ impl FileSystemController {
         &self,
     ) -> Option<crate::file_sys::vfs::vfs_types::VirtualDir> {
         self.bis_factory.as_ref()?.get_user_nand_content_directory()
+    }
+
+    /// Get the SDMC RegisteredCache.
+    /// Upstream: `FileSystemController::GetSDMCContents()`.
+    pub fn get_sdmc_contents(&self) -> Option<&crate::file_sys::registered_cache::RegisteredCache> {
+        self.sdmc_factory.as_ref()?.get_sdmc_contents()
+    }
+
+    /// Get the SDMC content directory.
+    /// Upstream: `FileSystemController::GetSDMCContentDirectory()`.
+    pub fn get_sdmc_content_directory(
+        &self,
+    ) -> Option<crate::file_sys::vfs::vfs_types::VirtualDir> {
+        self.sdmc_factory.as_ref()?.get_sdmc_content_directory()
     }
 
     /// Port of upstream `FileSystemController::RegisterProcess` (filesystem.cpp:298-311).
@@ -224,10 +252,11 @@ impl FileSystemController {
     /// Upstream: `FileSystemController::GetSDMCModificationLoadRoot`.
     pub fn get_sdmc_modification_load_root(
         &self,
-        _title_id: u64,
+        title_id: u64,
     ) -> Option<crate::file_sys::vfs::vfs_types::VirtualDir> {
-        // Upstream delegates to sdmc_factory which is not yet ported.
-        None
+        self.sdmc_factory
+            .as_ref()?
+            .get_sdmc_modification_load_root(title_id)
     }
 
     /// Get modification dump root for a given title.
@@ -252,17 +281,248 @@ impl FileSystemController {
         self.bis_factory.as_ref()?.get_bcat_directory(title_id)
     }
 
-    pub fn create_factories(&mut self) {
-        // Upstream creates SDMCFactory and BISFactory using the VfsFilesystem.
-        // BISFactory is created via set_bis_factory(); SDMCFactory is not yet ported.
-        if self.bis_factory.is_none() {
-            log::warn!("FileSystemController::create_factories: BISFactory not yet set");
+    /// Port of upstream `FileSystemController::CreateFactories` (filesystem.cpp:685-713).
+    pub fn create_factories(
+        &mut self,
+        vfs: Arc<crate::file_sys::vfs::vfs_real::RealVfsFilesystem>,
+        overwrite: bool,
+    ) {
+        use common::fs::fs_util::path_to_utf8_string;
+        use common::fs::path_util::{get_ruzu_path, get_ruzu_path_string, RuzuPath};
+
+        self.vfs = Some(vfs.clone());
+
+        if overwrite {
+            self.bis_factory = None;
+            self.sdmc_factory = None;
+            if let Some(provider) = self.content_provider.as_ref() {
+                let mut provider = provider.lock().unwrap();
+                provider.clear_slot(ContentProviderUnionSlot::SysNAND);
+                provider.clear_slot(ContentProviderUnionSlot::UserNAND);
+                provider.clear_slot(ContentProviderUnionSlot::SDMC);
+            }
         }
-        // SDMCFactory creation would go here once ported.
+
+        if self.bis_factory.is_none() {
+            let nand_directory: VirtualDir =
+                Arc::new(crate::file_sys::vfs::vfs_real::RealVfsDirectory::new(
+                    vfs.clone(),
+                    get_ruzu_path_string(RuzuPath::NANDDir),
+                    OpenMode::READ_WRITE,
+                ));
+            let load_directory: VirtualDir =
+                Arc::new(crate::file_sys::vfs::vfs_real::RealVfsDirectory::new(
+                    vfs.clone(),
+                    get_ruzu_path_string(RuzuPath::LoadDir),
+                    OpenMode::READ,
+                ));
+            let dump_directory: VirtualDir =
+                Arc::new(crate::file_sys::vfs::vfs_real::RealVfsDirectory::new(
+                    vfs.clone(),
+                    get_ruzu_path_string(RuzuPath::DumpDir),
+                    OpenMode::READ_WRITE,
+                ));
+
+            self.bis_factory = Some(crate::file_sys::bis_factory::BisFactory::new(
+                nand_directory,
+                load_directory,
+                dump_directory,
+            ));
+        }
+
+        if self.sdmc_factory.is_none() {
+            let sdmc_dir_path = get_ruzu_path(RuzuPath::SDMCDir);
+            let sdmc_load_dir_path = sdmc_dir_path.join("atmosphere/contents");
+            let sd_directory: VirtualDir =
+                Arc::new(crate::file_sys::vfs::vfs_real::RealVfsDirectory::new(
+                    vfs.clone(),
+                    path_to_utf8_string(&sdmc_dir_path),
+                    OpenMode::READ_WRITE,
+                ));
+            let sd_load_directory: VirtualDir =
+                Arc::new(crate::file_sys::vfs::vfs_real::RealVfsDirectory::new(
+                    vfs.clone(),
+                    path_to_utf8_string(&sdmc_load_dir_path),
+                    OpenMode::READ,
+                ));
+            self.sdmc_factory = Some(SdmcFactory::new(sd_directory, sd_load_directory));
+        }
+
+        if let Some(provider) = self.content_provider.as_ref() {
+            let mut provider = provider.lock().unwrap();
+            if let Some(cache) = self
+                .bis_factory
+                .as_ref()
+                .and_then(|factory| factory.get_system_nand_contents())
+            {
+                unsafe {
+                    provider.set_slot(
+                        ContentProviderUnionSlot::SysNAND,
+                        (cache as *const dyn ContentProvider).cast_mut(),
+                    );
+                }
+            }
+            if let Some(cache) = self
+                .bis_factory
+                .as_ref()
+                .and_then(|factory| factory.get_user_nand_contents())
+            {
+                unsafe {
+                    provider.set_slot(
+                        ContentProviderUnionSlot::UserNAND,
+                        (cache as *const dyn ContentProvider).cast_mut(),
+                    );
+                }
+            }
+            if let Some(cache) = self
+                .sdmc_factory
+                .as_ref()
+                .and_then(|factory| factory.get_sdmc_contents())
+            {
+                unsafe {
+                    provider.set_slot(
+                        ContentProviderUnionSlot::SDMC,
+                        (cache as *const dyn ContentProvider).cast_mut(),
+                    );
+                }
+            }
+        }
     }
 
     pub fn reset(&mut self) {
         self.registrations.lock().unwrap().clear();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::FileSystemController;
+    use crate::file_sys::registered_cache::{ContentProviderUnion, ContentProviderUnionSlot};
+    use common::fs::path_util::{get_ruzu_path, set_ruzu_path, RuzuPath};
+    use std::fs;
+    use std::sync::{Arc, Mutex};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn create_factories_initializes_bis_factory_from_ruzu_paths() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let base = std::env::temp_dir().join(format!("ruzu-fsc-bis-{unique}"));
+        let nand = base.join("nand");
+        let load = base.join("load");
+        let dump = base.join("dump");
+        let sdmc = base.join("sdmc");
+
+        fs::create_dir_all(nand.join("system/Contents/registered")).unwrap();
+        fs::create_dir_all(nand.join("system/Contents/placehld")).unwrap();
+        fs::create_dir_all(nand.join("user/Contents/registered")).unwrap();
+        fs::create_dir_all(nand.join("user/Contents/placehld")).unwrap();
+        fs::create_dir_all(&load).unwrap();
+        fs::create_dir_all(&dump).unwrap();
+        fs::create_dir_all(sdmc.join("Nintendo/Contents/registered")).unwrap();
+        fs::create_dir_all(sdmc.join("Nintendo/Contents/placehld")).unwrap();
+        fs::create_dir_all(sdmc.join("atmosphere/contents")).unwrap();
+
+        let old_nand = get_ruzu_path(RuzuPath::NANDDir);
+        let old_load = get_ruzu_path(RuzuPath::LoadDir);
+        let old_dump = get_ruzu_path(RuzuPath::DumpDir);
+        let old_sdmc = get_ruzu_path(RuzuPath::SDMCDir);
+
+        set_ruzu_path(RuzuPath::NANDDir, &nand);
+        set_ruzu_path(RuzuPath::LoadDir, &load);
+        set_ruzu_path(RuzuPath::DumpDir, &dump);
+        set_ruzu_path(RuzuPath::SDMCDir, &sdmc);
+
+        let mut controller = FileSystemController::new();
+        let vfs = crate::file_sys::vfs::vfs_real::RealVfsFilesystem::new();
+        let provider = Arc::new(Mutex::new(ContentProviderUnion::new()));
+        controller.set_content_provider(provider.clone());
+        controller.create_factories(vfs, false);
+
+        assert!(controller.get_system_nand_contents().is_some());
+        assert!(controller.get_user_nand_contents().is_some());
+        assert!(controller.get_sdmc_contents().is_some());
+        assert!(controller.get_system_nand_content_directory().is_some());
+        assert!(controller.get_user_nand_content_directory().is_some());
+        assert!(controller.get_sdmc_content_directory().is_some());
+        let provider = provider.lock().unwrap();
+        assert!(provider.has_slot(ContentProviderUnionSlot::SysNAND));
+        assert!(provider.has_slot(ContentProviderUnionSlot::UserNAND));
+        assert!(provider.has_slot(ContentProviderUnionSlot::SDMC));
+
+        set_ruzu_path(RuzuPath::NANDDir, &old_nand);
+        set_ruzu_path(RuzuPath::LoadDir, &old_load);
+        set_ruzu_path(RuzuPath::DumpDir, &old_dump);
+        set_ruzu_path(RuzuPath::SDMCDir, &old_sdmc);
+
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn create_factories_overwrite_recreates_factories_and_slots() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let base = std::env::temp_dir().join(format!("ruzu-fsc-overwrite-{unique}"));
+        let nand = base.join("nand");
+        let load = base.join("load");
+        let dump = base.join("dump");
+        let sdmc = base.join("sdmc");
+
+        fs::create_dir_all(nand.join("system/Contents/registered")).unwrap();
+        fs::create_dir_all(nand.join("system/Contents/placehld")).unwrap();
+        fs::create_dir_all(nand.join("user/Contents/registered")).unwrap();
+        fs::create_dir_all(nand.join("user/Contents/placehld")).unwrap();
+        fs::create_dir_all(&load).unwrap();
+        fs::create_dir_all(&dump).unwrap();
+        fs::create_dir_all(sdmc.join("Nintendo/Contents/registered")).unwrap();
+        fs::create_dir_all(sdmc.join("Nintendo/Contents/placehld")).unwrap();
+        fs::create_dir_all(sdmc.join("atmosphere/contents")).unwrap();
+
+        let old_nand = get_ruzu_path(RuzuPath::NANDDir);
+        let old_load = get_ruzu_path(RuzuPath::LoadDir);
+        let old_dump = get_ruzu_path(RuzuPath::DumpDir);
+        let old_sdmc = get_ruzu_path(RuzuPath::SDMCDir);
+
+        set_ruzu_path(RuzuPath::NANDDir, &nand);
+        set_ruzu_path(RuzuPath::LoadDir, &load);
+        set_ruzu_path(RuzuPath::DumpDir, &dump);
+        set_ruzu_path(RuzuPath::SDMCDir, &sdmc);
+
+        let mut controller = FileSystemController::new();
+        let vfs = crate::file_sys::vfs::vfs_real::RealVfsFilesystem::new();
+        let provider = Arc::new(Mutex::new(ContentProviderUnion::new()));
+        controller.set_content_provider(provider.clone());
+        controller.create_factories(vfs.clone(), false);
+
+        let first_sys = controller.get_system_nand_contents().unwrap() as *const _ as usize;
+        let first_user = controller.get_user_nand_contents().unwrap() as *const _ as usize;
+        let first_sdmc = controller.get_sdmc_contents().unwrap() as *const _ as usize;
+
+        controller.create_factories(vfs, true);
+
+        let second_sys = controller.get_system_nand_contents().unwrap() as *const _ as usize;
+        let second_user = controller.get_user_nand_contents().unwrap() as *const _ as usize;
+        let second_sdmc = controller.get_sdmc_contents().unwrap() as *const _ as usize;
+
+        assert_ne!(first_sys, second_sys);
+        assert_ne!(first_user, second_user);
+        assert_ne!(first_sdmc, second_sdmc);
+
+        let provider = provider.lock().unwrap();
+        assert!(provider.has_slot(ContentProviderUnionSlot::SysNAND));
+        assert!(provider.has_slot(ContentProviderUnionSlot::UserNAND));
+        assert!(provider.has_slot(ContentProviderUnionSlot::SDMC));
+
+        set_ruzu_path(RuzuPath::NANDDir, &old_nand);
+        set_ruzu_path(RuzuPath::LoadDir, &old_load);
+        set_ruzu_path(RuzuPath::DumpDir, &old_dump);
+        set_ruzu_path(RuzuPath::SDMCDir, &old_sdmc);
+
+        let _ = fs::remove_dir_all(base);
     }
 }
 

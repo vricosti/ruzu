@@ -34,6 +34,20 @@ pub struct FunctionInfo {
     pub name: &'static str,
 }
 
+impl FunctionInfo {
+    pub const fn new(
+        expected_header: u32,
+        handler_callback: Option<fn(&dyn ServiceFramework, &mut HLERequestContext)>,
+        name: &'static str,
+    ) -> Self {
+        Self {
+            expected_header,
+            handler_callback,
+            name,
+        }
+    }
+}
+
 /// Trait that corresponds to upstream `ServiceFramework<Self>`.
 ///
 /// Services implement this trait to register CMIF/TIPC handlers and dispatch IPC requests.
@@ -189,7 +203,8 @@ pub trait ServiceFramework: SessionRequestHandler {
             }
         }
 
-        // Write response back.
+        // Write response back. Matches upstream `ServiceFrameworkBase::HandleSyncRequest`
+        // (service.cpp:148): the service handler is the sole writer of the outgoing buffer.
         ctx.write_to_outgoing_command_buffer();
 
         result
@@ -204,16 +219,18 @@ pub fn build_handler_map(
         &'static str,
     )],
 ) -> BTreeMap<u32, FunctionInfo> {
+    let infos: Vec<FunctionInfo> = functions
+        .iter()
+        .map(|&(id, callback, name)| FunctionInfo::new(id, callback, name))
+        .collect();
+    build_handler_map_from_infos(&infos)
+}
+
+/// Helper to build a handler map from upstream-shaped `FunctionInfo` entries.
+pub fn build_handler_map_from_infos(functions: &[FunctionInfo]) -> BTreeMap<u32, FunctionInfo> {
     let mut map = BTreeMap::new();
-    for &(id, callback, name) in functions {
-        map.insert(
-            id,
-            FunctionInfo {
-                expected_header: id,
-                handler_callback: callback,
-                name,
-            },
-        );
+    for info in functions {
+        map.insert(info.expected_header, info.clone());
     }
     map
 }
@@ -235,5 +252,17 @@ mod tests {
         assert!(map.contains_key(&1));
         assert_eq!(map[&0].name, "Initialize");
         assert_eq!(map[&1].name, "GetService");
+    }
+
+    #[test]
+    fn test_build_handler_map_from_infos() {
+        let infos = [
+            FunctionInfo::new(3, None, "Get"),
+            FunctionInfo::new(4, None, "Get1"),
+        ];
+        let map = build_handler_map_from_infos(&infos);
+        assert_eq!(map.len(), 2);
+        assert_eq!(map[&3].expected_header, 3);
+        assert_eq!(map[&4].name, "Get1");
     }
 }

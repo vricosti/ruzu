@@ -13,6 +13,7 @@
 //! - The main `call` entry point
 
 use crate::core::System;
+use crate::hardware_properties;
 use crate::hle::kernel::svc::svc_activity;
 use crate::hle::kernel::svc::svc_address_arbiter;
 use crate::hle::kernel::svc::svc_condition_variable;
@@ -33,6 +34,7 @@ use crate::hle::kernel::svc::svc_thread;
 use crate::hle::kernel::svc::svc_tick;
 use crate::hle::kernel::svc::svc_transfer_memory;
 use crate::hle::kernel::svc::svc_types::MemoryPermission;
+use super::k_process::ProcessLock;
 
 fn decode_memory_permission(raw: u32) -> MemoryPermission {
     match raw {
@@ -415,6 +417,12 @@ fn query_memory_info(system: &System, query_addr: u64) -> (u64, u64, u32, u32) {
     use crate::hle::kernel::k_memory_block::KMemoryPermission;
 
     let process = system.current_process_arc().lock().unwrap();
+    let tid_tracker = system
+        .current_thread()
+        .and_then(|t| t.lock().ok().map(|g| g.get_thread_id()))
+        .unwrap_or(0);
+    let _holder_guard =
+        super::kernel::ProcessLockTracker::new(tid_tracker, 0x5179_4D65); // 'QyMe'
 
     if let Some(info) = process.page_table.query_info(query_addr as usize) {
         let svc_state = info.get_svc_state();
@@ -506,6 +514,10 @@ fn call32(system: &System, imm: u32, args: &mut SvcArgs) {
             let mem_info_ptr = get_arg32(args, 0) as u64;
             let query_addr = get_arg32(args, 2) as u64;
             let (base, size, state, perm) = query_memory_info(system, query_addr);
+            log::info!(
+                "  QueryMemory(info_ptr={:#x}, addr={:#x}) -> base={:#x} size={:#x} state={} perm={}",
+                mem_info_ptr, query_addr, base, size, state, perm
+            );
             // Write MemoryInfo structure to guest memory.
             // Upstream: current_memory.WriteBlock(out_memory_info, &svc_mem_info, sizeof(...))
             {
@@ -1637,6 +1649,35 @@ fn call64(system: &System, imm: u32, args: &mut SvcArgs) {
 /// 5. Loads SVC arguments back to the physical core
 pub fn call(system: &System, imm: u32, is_64bit: bool, args: &mut SvcArgs) {
     let mut dispatch_args = *args;
+
+    // Per-core SVC-in-progress tracker for the SIGUSR1 dumper.
+    let svc_track_core = {
+        let core_id = if let Some(kernel) = system.kernel() {
+            kernel.current_physical_core_index() as usize
+        } else {
+            usize::MAX
+        };
+        let tid = system
+            .current_thread()
+            .and_then(|t| t.lock().ok().map(|g| g.get_thread_id()))
+            .unwrap_or(0);
+        if core_id < hardware_properties::NUM_CPU_CORES as usize {
+            super::kernel::mark_svc_enter(core_id, tid, imm);
+            core_id
+        } else {
+            usize::MAX
+        }
+    };
+    struct SvcExitGuard(usize);
+    impl Drop for SvcExitGuard {
+        fn drop(&mut self) {
+            if self.0 < hardware_properties::NUM_CPU_CORES as usize {
+                super::kernel::mark_svc_exit(self.0);
+            }
+        }
+    }
+    let _svc_exit_guard = SvcExitGuard(svc_track_core);
+
     if let Some(kernel) = system.kernel() {
         if let Some(process_arc) = system.current_process_arc.as_ref().cloned() {
             let process = process_arc.lock().unwrap();
@@ -1715,10 +1756,118 @@ pub fn call(system: &System, imm: u32, is_64bit: bool, args: &mut SvcArgs) {
     }
     *args = dispatch_args;
 
+    // Memory snapshot hook (RUZU_DUMP_AT_SVC=N) — runs unconditionally.
+    {
+        let tid: i64 = system
+            .current_thread()
+            .map(|t| t.lock().unwrap().get_thread_id() as i64)
+            .unwrap_or(-1);
+        maybe_dump_process_memory(system, tid);
+    }
+
     // Upstream reaches the equivalent behavior when the scheduler lock is
     // released after the SVC handler. In this cooperative port, drain a
     // pending current-thread termination once per SVC return path.
     drain_current_thread_termination(system);
+}
+
+/// Per-tid SVC counter for the memory snapshot hook (RUZU_DUMP_AT_SVC=N).
+static SVC_COUNTER_TID73: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn maybe_dump_process_memory(system: &System, tid: i64) {
+    // Only count SVCs on the game's main thread (tid=73 in current MK8D run).
+    if tid != 73 {
+        return;
+    }
+    let target = match std::env::var("RUZU_DUMP_AT_SVC") {
+        Ok(v) => match v.parse::<u64>() {
+            Ok(n) => n,
+            Err(_) => return,
+        },
+        Err(_) => return,
+    };
+    let count = SVC_COUNTER_TID73.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+    if count != target {
+        return;
+    }
+
+    let path = std::env::var("RUZU_DUMP_PATH")
+        .unwrap_or_else(|_| format!("/tmp/ruzu-mem-svc{}.bin", target));
+    eprintln!(
+        "[DUMP] writing process memory snapshot at SVC #{} to {}",
+        target, path
+    );
+
+    let memory = match system.memory_shared() {
+        Some(m) => m,
+        None => {
+            eprintln!("[DUMP] no shared memory; skipping");
+            return;
+        }
+    };
+    let process_arc = match system.current_process_arc.as_ref().cloned() {
+        Some(p) => p,
+        None => {
+            eprintln!("[DUMP] no current process; skipping");
+            return;
+        }
+    };
+
+    use std::io::Write;
+    let mut file = match std::fs::File::create(&path) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("[DUMP] failed to create {}: {}", path, e);
+            return;
+        }
+    };
+
+    // Walk every memory block and dump (addr, size, state, perm, bytes).
+    let process = process_arc.lock().unwrap();
+    let pt = &process.page_table;
+    let mut total_bytes = 0u64;
+    let mut block_count = 0u32;
+    for block in pt.iter_blocks() {
+        let info: super::k_memory_block::KMemoryInfo = block.get_memory_info();
+        // Skip free regions (no point dumping unmapped space).
+        if info.m_state == super::k_memory_block::KMemoryState::FREE {
+            continue;
+        }
+        let addr = info.m_address;
+        let size = info.m_size;
+        if size == 0 {
+            continue;
+        }
+        // Header: addr (u64), size (u64), state (u32), perm (u32) = 24 bytes
+        let mut hdr = [0u8; 24];
+        hdr[0..8].copy_from_slice(&(addr as u64).to_le_bytes());
+        hdr[8..16].copy_from_slice(&(size as u64).to_le_bytes());
+        hdr[16..20].copy_from_slice(&info.m_state.bits().to_le_bytes());
+        hdr[20..24].copy_from_slice(&(info.m_permission.bits() as u32).to_le_bytes());
+        if file.write_all(&hdr).is_err() {
+            break;
+        }
+        // Read the block contents in 4KB chunks.
+        let mem = memory.lock().unwrap();
+        let mut buf = vec![0u8; 4096];
+        let mut off = 0usize;
+        while off < size {
+            let chunk = std::cmp::min(4096, size - off);
+            buf.resize(chunk, 0);
+            let _ = mem.read_block((addr + off) as u64, &mut buf);
+            if file.write_all(&buf).is_err() {
+                break;
+            }
+            off += chunk;
+        }
+        drop(mem);
+        total_bytes += size as u64;
+        block_count += 1;
+    }
+    eprintln!(
+        "[DUMP] complete: {} blocks, {} bytes",
+        block_count, total_bytes
+    );
 }
 
 #[cfg(test)]
@@ -1741,7 +1890,7 @@ mod tests {
         process.initialize_handle_table();
         process.initialize_thread_local_region_base(0x240000);
 
-        let process = Arc::new(Mutex::new(process));
+        let process = Arc::new(ProcessLock::from_value(process));
         let current_thread = Arc::new(Mutex::new(KThread::new()));
         let scheduler = Arc::new(Mutex::new(KScheduler::new(0)));
         {

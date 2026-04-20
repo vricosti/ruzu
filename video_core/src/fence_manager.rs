@@ -87,19 +87,16 @@ impl<F: FenceBase> FenceManager<F> {
     {
         let delay_fence = settings::is_gpu_level_high(&settings::values());
         let mut func = Some(func);
-        self.try_release_pending_fences(false, |fence, force_wait| {
-            if should_wait_async_flushes() {
-                if force_wait {
-                    pop_async_flushes();
-                    return true;
-                }
+        // Upstream gate: skip release only when ShouldWait() && !IsFenceSignaled(f).
+        // Stubbed fences report signaled=true, so they release even when
+        // should_wait_async_flushes() is true.
+        self.try_release_pending_fences(false, |fence, _force_wait| {
+            let is_signaled = fence.is_stubbed() || is_fence_signaled(fence);
+            if should_wait_async_flushes() && !is_signaled {
                 return false;
             }
-            let signaled = fence.is_stubbed() || is_fence_signaled(fence);
-            if signaled {
-                pop_async_flushes();
-            }
-            signaled
+            pop_async_flushes();
+            true
         });
 
         let should_flush = should_flush();
@@ -180,31 +177,28 @@ impl<F: FenceBase> FenceManager<F> {
         FW: FnMut(&F),
         FPF: FnMut(),
     {
+        // Upstream: TryReleasePendingFences<force_wait>. Single gate:
+        //   if ShouldWait() && !IsFenceSignaled(f):
+        //       if force_wait: WaitFence(f)
+        //       else: return  (don't release)
+        //   PopAsyncFlushes(); run ops
         if !force {
-            self.try_release_pending_fences(false, |fence, should_wait| {
-                if should_wait_async_flushes() {
-                    if should_wait {
-                        wait_fence(fence);
-                        pop_async_flushes();
-                        return true;
-                    }
+            self.try_release_pending_fences(false, |fence, _force_wait| {
+                let is_signaled = fence.is_stubbed() || is_fence_signaled(fence);
+                if should_wait_async_flushes() && !is_signaled {
                     return false;
                 }
-                let signaled = fence.is_stubbed() || is_fence_signaled(fence);
-                if signaled {
-                    pop_async_flushes();
-                }
-                signaled
+                pop_async_flushes();
+                true
             });
             return;
         }
-        self.try_release_pending_fences(true, |fence, _| {
-            if should_wait_async_flushes() {
+        self.try_release_pending_fences(true, |fence, _force_wait| {
+            let is_signaled = fence.is_stubbed() || is_fence_signaled(fence);
+            if should_wait_async_flushes() && !is_signaled {
                 wait_fence(fence);
-                pop_async_flushes();
-                return true;
             }
-            wait_fence(fence);
+            pop_async_flushes();
             true
         });
     }
@@ -227,19 +221,15 @@ impl<F: FenceBase> FenceManager<F> {
         FPF: FnMut(),
         FAF: FnMut(),
     {
-        self.try_release_pending_fences(false, |fence, should_wait| {
-            if should_wait_async_flushes() {
-                if should_wait {
-                    pop_async_flushes();
-                    return true;
-                }
+        // See signal_fence for the gate semantics — identical to upstream
+        // TryReleasePendingFences<false>().
+        self.try_release_pending_fences(false, |fence, _force_wait| {
+            let is_signaled = fence.is_stubbed() || is_fence_signaled(fence);
+            if should_wait_async_flushes() && !is_signaled {
                 return false;
             }
-            let signaled = fence.is_stubbed() || is_fence_signaled(fence);
-            if signaled {
-                pop_async_flushes();
-            }
-            signaled
+            pop_async_flushes();
+            true
         });
         accumulate_flushes();
     }
@@ -251,24 +241,44 @@ impl<F: FenceBase> FenceManager<F> {
     where
         FW: FnMut(&F, bool) -> bool,
     {
+        let trace = std::env::var_os("RUZU_TRACE_SYNCPOINT").is_some();
+        if trace {
+            log::info!(
+                "FenceManager::try_release_pending_fences force_wait={} queue_len={}",
+                force_wait,
+                self.fences.len()
+            );
+        }
         while !self.fences.is_empty() {
             let should_release = {
                 let current_fence = self.fences.front().unwrap();
-                if current_fence.is_stubbed() {
-                    true
-                } else {
-                    fence_waiter(current_fence, force_wait)
-                }
+                fence_waiter(current_fence, force_wait)
             };
+            if trace {
+                log::info!(
+                    "FenceManager::try_release_pending_fences: should_release={}",
+                    should_release
+                );
+            }
             if !should_release {
                 return;
             }
             let current_fence = self.fences.pop_front().unwrap();
 
             if let Some(operations) = self.pending_operations.pop_front() {
+                if trace {
+                    log::info!(
+                        "FenceManager::try_release_pending_fences: running {} ops",
+                        operations.len()
+                    );
+                }
                 for op in operations {
                     op();
                 }
+            } else if trace {
+                log::info!(
+                    "FenceManager::try_release_pending_fences: no pending ops batch for fence",
+                );
             }
 
             let _lock = self.ring_guard.lock().unwrap();
@@ -425,5 +435,22 @@ mod tests {
         assert_eq!(host.load(Ordering::Relaxed), 7);
 
         settings::values_mut().current_gpu_accuracy = previous_gpu_accuracy;
+    }
+
+    #[test]
+    fn stubbed_fence_still_runs_async_flush_waiter_path() {
+        let mut manager = FenceManager::<TestFence>::new();
+        let popped = Arc::new(AtomicBool::new(false));
+
+        manager.fences.push_back(TestFence { stubbed: true });
+        manager.pending_operations.push_back(VecDeque::new());
+
+        manager.wait_pending_fences(false, || false, |_| true, |_| {}, {
+            let popped = Arc::clone(&popped);
+            move || popped.store(true, Ordering::Relaxed)
+        });
+
+        assert!(popped.load(Ordering::Relaxed));
+        assert_eq!(manager.queued_fence_count(), 0);
     }
 }

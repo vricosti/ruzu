@@ -14,6 +14,7 @@ use crate::hle::service::am::window_system::WindowSystem;
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
 use crate::hle::service::ipc_helpers::ResponseBuilder;
 use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
+use crate::hle::kernel::k_process::ProcessLock;
 
 /// IPC command table for IApplicationProxyService ("appletOE"):
 /// - 0: OpenApplicationProxy
@@ -94,7 +95,7 @@ impl IApplicationProxyService {
                     .as_ref()
                     .and_then(|p| p.upgrade())
             })
-            .map(|process| process as Arc<Mutex<KProcess>>);
+            .map(|process| process as Arc<ProcessLock>);
         let proxy = Arc::new(super::application_proxy::IApplicationProxy::new(
             service.system,
             applet,

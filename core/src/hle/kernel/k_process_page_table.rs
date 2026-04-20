@@ -216,6 +216,11 @@ impl KProcessPageTable {
         self.base.m_memory_block_manager.dump_blocks();
     }
 
+    /// Iterate over all memory blocks (for diagnostics / snapshotting).
+    pub fn iter_blocks(&self) -> impl Iterator<Item = &super::k_memory_block::KMemoryBlock> {
+        self.base.m_memory_block_manager.iter()
+    }
+
     pub fn contains(&self, addr: KProcessAddress, size: usize) -> bool {
         self.base.contains_range(addr.get() as usize, size)
     }

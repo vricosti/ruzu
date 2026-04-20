@@ -86,27 +86,31 @@ pub fn loop_process(system: crate::core::SystemRef) {
     );
 
     {
-        let mut ct = core_timing.lock().unwrap();
-        ct.schedule_looping_event(NPAD_UPDATE_NS, NPAD_UPDATE_NS, &npad_update_event, false);
-        ct.schedule_looping_event(
+        core_timing.schedule_looping_event(
+            NPAD_UPDATE_NS,
+            NPAD_UPDATE_NS,
+            &npad_update_event,
+            false,
+        );
+        core_timing.schedule_looping_event(
             DEFAULT_UPDATE_NS,
             DEFAULT_UPDATE_NS,
             &default_update_event,
             false,
         );
-        ct.schedule_looping_event(
+        core_timing.schedule_looping_event(
             MOUSE_KEYBOARD_UPDATE_NS,
             MOUSE_KEYBOARD_UPDATE_NS,
             &mouse_keyboard_update_event,
             false,
         );
-        ct.schedule_looping_event(
+        core_timing.schedule_looping_event(
             MOTION_UPDATE_NS,
             MOTION_UPDATE_NS,
             &motion_update_event,
             false,
         );
-        ct.schedule_looping_event(
+        core_timing.schedule_looping_event(
             Duration::from_nanos(
                 hid_core::resources::touch_screen::touch_screen_resource::GESTURE_UPDATE_PERIOD_NS,
             ),

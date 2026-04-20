@@ -5,6 +5,7 @@
 use crate::arm::arm_interface::ThreadContext;
 use crate::hle::kernel::k_process::KProcess;
 use std::sync::{Arc, Mutex};
+use super::k_process::ProcessLock;
 
 /// State for the instruction ring buffer used to capture the last N instructions
 /// before an abort handler is entered.
@@ -91,7 +92,7 @@ impl InstructionRingBuffer {
 
 /// Dump module memory regions for comparison with zuyu.
 /// Called after SetHeapSize (SVC ~#89).
-pub fn dump_module_memory(process: &Arc<Mutex<KProcess>>) {
+pub fn dump_module_memory(process: &Arc<ProcessLock>) {
     let proc = process.lock().unwrap();
     for (label, addr) in [
         ("sdk_module_desc(0x22c8000)", 0x22c8000u64),

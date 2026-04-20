@@ -13,6 +13,7 @@ use crate::hle::kernel::k_process::KProcess;
 use crate::hle::kernel::k_readable_event::KReadableEvent;
 use crate::hle::kernel::k_scheduler::KScheduler;
 use crate::hle::service::hle_ipc::{HLERequestContext, Handle};
+use crate::hle::kernel::k_process::ProcessLock;
 
 /// Bridge from a service-layer Event to a kernel KReadableEvent.
 ///
@@ -23,7 +24,7 @@ use crate::hle::service::hle_ipc::{HLERequestContext, Handle};
 struct KernelEventBridge {
     event: Arc<Mutex<KEvent>>,
     readable_event: Arc<Mutex<KReadableEvent>>,
-    process: Arc<Mutex<KProcess>>,
+    process: Arc<ProcessLock>,
     scheduler: Arc<Mutex<KScheduler>>,
 }
 
@@ -54,7 +55,7 @@ impl Event {
     pub fn new_with_kernel_event(
         event: Arc<Mutex<KEvent>>,
         readable_event: Arc<Mutex<KReadableEvent>>,
-        process: Arc<Mutex<KProcess>>,
+        process: Arc<ProcessLock>,
         scheduler: Arc<Mutex<KScheduler>>,
     ) -> Self {
         Self {
@@ -77,7 +78,7 @@ impl Event {
         &self,
         event: Arc<Mutex<KEvent>>,
         readable_event: Arc<Mutex<KReadableEvent>>,
-        process: Arc<Mutex<KProcess>>,
+        process: Arc<ProcessLock>,
         scheduler: Arc<Mutex<KScheduler>>,
     ) {
         let mut bridge = self.kernel_bridge.lock().unwrap();
@@ -97,7 +98,7 @@ impl Event {
     pub fn attach_kernel_event(
         &self,
         readable_event: Arc<Mutex<KReadableEvent>>,
-        process: Arc<Mutex<KProcess>>,
+        process: Arc<ProcessLock>,
         scheduler: Arc<Mutex<KScheduler>>,
     ) {
         let owner_process_id = process.lock().unwrap().get_process_id();
@@ -275,7 +276,7 @@ mod tests {
         readable.lock().unwrap().initialize(1, 2);
         process.register_readable_event_object(2, Arc::clone(&readable));
 
-        let process = Arc::new(Mutex::new(process));
+        let process = Arc::new(ProcessLock::from_value(process));
         let scheduler = Arc::new(Mutex::new(KScheduler::new(0)));
         let event_owner = Arc::new(Mutex::new(crate::hle::kernel::k_event::KEvent::new()));
         event_owner.lock().unwrap().initialize(1, 2);

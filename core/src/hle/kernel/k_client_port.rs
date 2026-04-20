@@ -17,6 +17,7 @@ use super::k_session::KSession;
 use super::kernel::KernelCore;
 use super::svc::svc_results::{RESULT_LIMIT_REACHED, RESULT_OUT_OF_SESSIONS};
 use crate::hle::result::ResultCode;
+use super::k_process::ProcessLock;
 
 /// The client port object.
 ///
@@ -194,7 +195,7 @@ mod tests {
     #[test]
     fn create_session_allocates_and_registers_session_objects() {
         let mut system = System::new_for_test();
-        let process = std::sync::Arc::new(std::sync::Mutex::new(KProcess::new()));
+        let process = std::sync::Arc::new(ProcessLock::from_value(KProcess::new()));
         {
             let mut process_guard = process.lock().unwrap();
             process_guard.process_id = 1;

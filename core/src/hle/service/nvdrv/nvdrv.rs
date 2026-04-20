@@ -24,6 +24,7 @@ use crate::core::SystemRef;
 use crate::hle::kernel::k_process::KProcess;
 use crate::hle::kernel::k_readable_event::KReadableEvent;
 use crate::hle::kernel::k_scheduler::KScheduler;
+use crate::hle::kernel::k_process::ProcessLock;
 
 /// EventInterface manages kernel event creation and destruction for nvdrv.
 ///
@@ -295,7 +296,7 @@ impl Module {
         &self,
         fd: DeviceFD,
         event_id: u32,
-        process: Arc<Mutex<KProcess>>,
+        process: Arc<ProcessLock>,
         scheduler: Arc<Mutex<KScheduler>>,
     ) {
         if fd < 0 {

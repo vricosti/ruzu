@@ -16,12 +16,13 @@ use crate::hle::kernel::k_server_session::KServerSession;
 
 use super::event::Event;
 use super::multi_wait::MultiWait;
+use crate::hle::kernel::k_process::ProcessLock;
 
 enum WaitableHandle {
     None,
     Event(Arc<Event>),
     ReadableEvent(Arc<Mutex<KReadableEvent>>),
-    Process(Arc<Mutex<KProcess>>),
+    Process(Arc<ProcessLock>),
     ServerPort {
         port: Arc<Mutex<KPort>>,
         object_id: Option<u64>,
@@ -74,7 +75,7 @@ impl MultiWaitHolder {
     }
 
     /// Create a holder wrapping a process synchronization object.
-    pub fn from_process(process: Arc<Mutex<KProcess>>) -> Self {
+    pub fn from_process(process: Arc<ProcessLock>) -> Self {
         Self {
             user_data: 0,
             multi_wait: None,

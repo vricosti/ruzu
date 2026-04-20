@@ -18,6 +18,60 @@ use crate::hle::kernel::svc::svc_results::*;
 use crate::hle::kernel::svc::svc_types::*;
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 
+fn should_trace_sync_debug() -> bool {
+    std::env::var_os("RUZU_TRACE_SYNC").is_some()
+}
+
+fn should_trace_sync_backtrace_once(tid: u64) -> bool {
+    static DID_TRACE_TID73: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+    tid == 73 && !DID_TRACE_TID73.swap(true, std::sync::atomic::Ordering::Relaxed)
+}
+
+fn log_sync_context(system: &System, label: &str) {
+    let Some(current_thread_id) = system.current_thread_id() else {
+        return;
+    };
+    let Some(current_thread) = system.current_thread() else {
+        return;
+    };
+    let core_index = current_thread.lock().unwrap().get_current_core().max(0) as usize;
+    let process = system.current_process_arc().lock().unwrap();
+    let Some(cpu) = process.get_arm_interface(core_index) else {
+        return;
+    };
+    let mut ctx = crate::arm::arm_interface::ThreadContext::default();
+    cpu.get_context(&mut ctx);
+    log::info!(
+        "svc::{} ctx tid={} pc=0x{:08X} lr=0x{:08X} sp=0x{:08X} r0=0x{:08X} r1=0x{:08X} r2=0x{:08X} r3=0x{:08X}",
+        label,
+        current_thread_id,
+        ctx.pc,
+        ctx.lr,
+        ctx.sp,
+        ctx.r[0] as u32,
+        ctx.r[1] as u32,
+        ctx.r[2] as u32,
+        ctx.r[3] as u32,
+    );
+    if should_trace_sync_backtrace_once(current_thread_id) {
+        let bt = crate::arm::debug::get_backtrace_from_context(&process, &ctx);
+        for (index, entry) in bt.iter().take(12).enumerate() {
+            log::info!(
+                "svc::{} bt[{}]: tid={} module={} addr=0x{:X} orig=0x{:X} off=0x{:X} symbol={}",
+                label,
+                index,
+                current_thread_id,
+                entry.module,
+                entry.address,
+                entry.original_address,
+                entry.offset,
+                entry.name,
+            );
+        }
+    }
+}
+
 fn is_valid_signal_type(signal_type: SignalType) -> bool {
     matches!(
         signal_type,
@@ -71,6 +125,17 @@ pub fn wait_for_address(
         value,
         timeout_ns
     );
+    if should_trace_sync_debug() {
+        log::info!(
+            "svc::WaitForAddress tid={:?} address=0x{:X} arb_type={:?} value=0x{:X} timeout_ns={}",
+            system.current_thread_id(),
+            address,
+            arb_type,
+            value,
+            timeout_ns
+        );
+        log_sync_context(system, "WaitForAddress");
+    }
 
     // Validate input.
     if is_kernel_address(address as usize) {
@@ -128,6 +193,17 @@ pub fn signal_to_address(
         value,
         count
     );
+    if should_trace_sync_debug() {
+        log::info!(
+            "svc::SignalToAddress tid={:?} address=0x{:X} signal_type={:?} value=0x{:X} count=0x{:X}",
+            system.current_thread_id(),
+            address,
+            signal_type,
+            value,
+            count
+        );
+        log_sync_context(system, "SignalToAddress");
+    }
 
     // Validate input.
     if is_kernel_address(address as usize) {

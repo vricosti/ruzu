@@ -29,6 +29,7 @@ use crate::hle::kernel::svc::svc_results::{
 use crate::hle::kernel::svc_common::Handle;
 use crate::hle::kernel::svc_common::{HANDLE_WAIT_MASK, INVALID_HANDLE};
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
+use super::k_process::ProcessLock;
 
 static TRACE_KCV_COUNT: AtomicUsize = AtomicUsize::new(0);
 
@@ -247,7 +248,7 @@ impl KConditionVariable {
     ///
     /// Upstream wraps the body in `KScopedSchedulerLock sl(kernel)`.
     pub fn signal_to_address(
-        process: &Arc<Mutex<KProcess>>,
+        process: &Arc<ProcessLock>,
         current_thread: &Arc<Mutex<KThread>>,
         addr: u64,
     ) -> ResultCode {
@@ -266,6 +267,16 @@ impl KConditionVariable {
         let mut next_owner_thread = None;
         let result = {
             let mut process_guard = process.lock().unwrap();
+            let _kcv_holder = super::kernel::ProcessLockTracker::new(
+                super::kernel::get_current_thread_pointer()
+                    .and_then(|t| t.lock().ok().map(|g| g.get_thread_id()))
+                    .unwrap_or(0),
+                0x4B43_5631, // 'KCV1' — covers all remaining k_condition_variable process.lock() sites
+            );
+            let _holder_guard = super::kernel::ProcessLockTracker::new(
+                current_thread_id,
+                0x5161_4444, // 'SigA' — signal_to_address
+            );
             let Some(owner_thread) = process_guard.get_thread_by_thread_id(current_thread_id)
             else {
                 return RESULT_INVALID_HANDLE;
@@ -351,7 +362,7 @@ impl KConditionVariable {
     }
 
     pub(crate) fn wait_for_current_thread(
-        process: &Arc<Mutex<KProcess>>,
+        process: &Arc<ProcessLock>,
         current_thread: &Arc<Mutex<KThread>>,
     ) {
         let scheduler = super::kernel::get_kernel_ref()
@@ -399,7 +410,7 @@ impl KConditionVariable {
     ///
     /// Upstream wraps the body in `KScopedSchedulerLock sl(kernel)`.
     pub fn wait_for_address(
-        process: &Arc<Mutex<KProcess>>,
+        process: &Arc<ProcessLock>,
         current_thread: &Arc<Mutex<KThread>>,
         handle: Handle,
         addr: u64,
@@ -408,6 +419,10 @@ impl KConditionVariable {
         let current_thread_id = current_thread.lock().unwrap().get_thread_id();
 
         let mut process_guard = process.lock().unwrap();
+        let _holder_guard = super::kernel::ProcessLockTracker::new(
+            current_thread_id,
+            0x5761_4444, // 'WaitA' — wait_for_address
+        );
 
         // Check if the thread should terminate.
         if current_thread.lock().unwrap().is_termination_requested() {
@@ -598,7 +613,7 @@ impl KConditionVariable {
     /// Matches upstream `KConditionVariable::Wait(KProcessAddress addr, u64 key, u32 value, s64 timeout)`.
     pub fn wait(
         &mut self,
-        process: &Arc<Mutex<KProcess>>,
+        process: &Arc<ProcessLock>,
         current_thread: &Arc<Mutex<KThread>>,
         addr: u64,
         key: u64,
@@ -629,6 +644,12 @@ impl KConditionVariable {
                     timeout,
                 );
             let mut process_guard = process.lock().unwrap();
+            let _kcv_holder = super::kernel::ProcessLockTracker::new(
+                super::kernel::get_current_thread_pointer()
+                    .and_then(|t| t.lock().ok().map(|g| g.get_thread_id()))
+                    .unwrap_or(0),
+                0x4B43_5631, // 'KCV1' — covers all remaining k_condition_variable process.lock() sites
+            );
             self.wait_locked_after_sleep_guard(
                 &mut process_guard,
                 current_thread,
@@ -986,8 +1007,7 @@ impl KConditionVariable {
     ) {
         let mut current_thread = current_thread.lock().unwrap();
         current_thread.set_user_address_key(KProcessAddress::new(addr), value);
-        current_thread
-            .set_waiting_lock_owner_thread_id(Some(owner_thread_id), owner_thread_ptr);
+        current_thread.set_waiting_lock_owner_thread_id(Some(owner_thread_id), owner_thread_ptr);
         current_thread
             .begin_wait_with_queue(ThreadQueueImplForKConditionVariableWaitForAddress::queue());
         current_thread.set_wait_reason_for_debugging(ThreadWaitReasonForDebugging::ConditionVar);
@@ -1101,17 +1121,23 @@ mod tests {
     use crate::hle::kernel::k_thread::{ConditionVariableTreeState, ThreadState};
 
     fn setup_threads() -> (
-        Arc<Mutex<KProcess>>,
+        Arc<ProcessLock>,
         Arc<Mutex<KThread>>,
         Arc<Mutex<KThread>>,
         Handle,
         u64,
     ) {
-        let process = Arc::new(Mutex::new(KProcess::new()));
+        let process = Arc::new(ProcessLock::from_value(KProcess::new()));
         let scheduler = Arc::new(Mutex::new(KScheduler::new(0)));
         scheduler.lock().unwrap().initialize(1, 0, 0);
         {
             let mut process_guard = process.lock().unwrap();
+            let _kcv_holder = super::kernel::ProcessLockTracker::new(
+                super::kernel::get_current_thread_pointer()
+                    .and_then(|t| t.lock().ok().map(|g| g.get_thread_id()))
+                    .unwrap_or(0),
+                0x4B43_5631, // 'KCV1' — covers all remaining k_condition_variable process.lock() sites
+            );
             process_guard.attach_scheduler(&scheduler);
             process_guard.bind_self_reference(&process);
             process_guard.initialize_handle_table();
@@ -1140,6 +1166,12 @@ mod tests {
 
         let owner_handle = {
             let mut process_guard = process.lock().unwrap();
+            let _kcv_holder = super::kernel::ProcessLockTracker::new(
+                super::kernel::get_current_thread_pointer()
+                    .and_then(|t| t.lock().ok().map(|g| g.get_thread_id()))
+                    .unwrap_or(0),
+                0x4B43_5631, // 'KCV1' — covers all remaining k_condition_variable process.lock() sites
+            );
             process_guard.register_thread_object(owner.clone());
             process_guard.register_thread_object(waiter.clone());
             process_guard.handle_table.add(10).unwrap()
@@ -1394,11 +1426,17 @@ mod tests {
 
     #[test]
     fn condition_variable_waiters_reorder_on_priority_change() {
-        let process = Arc::new(Mutex::new(KProcess::new()));
+        let process = Arc::new(ProcessLock::from_value(KProcess::new()));
         let scheduler = Arc::new(Mutex::new(KScheduler::new(0)));
         scheduler.lock().unwrap().initialize(1, 0, 0);
         {
             let mut process_guard = process.lock().unwrap();
+            let _kcv_holder = super::kernel::ProcessLockTracker::new(
+                super::kernel::get_current_thread_pointer()
+                    .and_then(|t| t.lock().ok().map(|g| g.get_thread_id()))
+                    .unwrap_or(0),
+                0x4B43_5631, // 'KCV1' — covers all remaining k_condition_variable process.lock() sites
+            );
             process_guard.attach_scheduler(&scheduler);
             process_guard.bind_self_reference(&process);
             process_guard.initialize_handle_table();
@@ -1429,6 +1467,12 @@ mod tests {
 
         {
             let mut process_guard = process.lock().unwrap();
+            let _kcv_holder = super::kernel::ProcessLockTracker::new(
+                super::kernel::get_current_thread_pointer()
+                    .and_then(|t| t.lock().ok().map(|g| g.get_thread_id()))
+                    .unwrap_or(0),
+                0x4B43_5631, // 'KCV1' — covers all remaining k_condition_variable process.lock() sites
+            );
             process_guard.register_thread_object(waiter_a.clone());
             process_guard.register_thread_object(waiter_b.clone());
         }
@@ -1436,6 +1480,12 @@ mod tests {
         let key = 0x1c00;
         {
             let mut process_guard = process.lock().unwrap();
+            let _kcv_holder = super::kernel::ProcessLockTracker::new(
+                super::kernel::get_current_thread_pointer()
+                    .and_then(|t| t.lock().ok().map(|g| g.get_thread_id()))
+                    .unwrap_or(0),
+                0x4B43_5631, // 'KCV1' — covers all remaining k_condition_variable process.lock() sites
+            );
             let mut cond_var = std::mem::take(&mut process_guard.cond_var);
             cond_var.wait_locked(&mut process_guard, &waiter_a, 0x1800, key, 0x1111, -1);
             cond_var.wait_locked(&mut process_guard, &waiter_b, 0x1810, key, 0x2222, -1);

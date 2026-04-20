@@ -102,6 +102,28 @@ impl IStorageAccessor {
 
         let rc = match result {
             Ok(data) => {
+                // Temporary investigation: bounded hex-dump of the B-buffer so ruzu/zuyu
+                // reads can be diffed. Gated by RUZU_ISTORAGE_READ_DUMP. First 4000 calls.
+                if std::env::var_os("RUZU_ISTORAGE_READ_DUMP").is_some() {
+                    use std::sync::atomic::{AtomicUsize, Ordering};
+                    static SEQ: AtomicUsize = AtomicUsize::new(0);
+                    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+                    if seq < 4000 {
+                        let n = data.len().min(64);
+                        let mut hex = String::with_capacity(n * 3);
+                        for b in &data[..n] {
+                            use std::fmt::Write;
+                            let _ = write!(hex, "{:02x} ", b);
+                        }
+                        log::warn!(
+                            "ISTORAGE_READ seq={} offset={} size={} bytes={}",
+                            seq,
+                            offset,
+                            data.len(),
+                            hex.trim_end(),
+                        );
+                    }
+                }
                 ctx.write_buffer(&data, 0);
                 RESULT_SUCCESS
             }

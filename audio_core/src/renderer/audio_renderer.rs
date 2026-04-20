@@ -95,7 +95,7 @@ impl Renderer {
 
     pub fn set_process_arc(
         &self,
-        process: std::sync::Arc<std::sync::Mutex<ruzu_core::hle::kernel::k_process::KProcess>>,
+        process: std::sync::Arc<ruzu_core::hle::kernel::k_process::ProcessLock>,
     ) {
         self.system.lock().set_process_arc(process);
     }

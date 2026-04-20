@@ -3489,23 +3489,6 @@ impl Maxwell3D {
                     flags |= QueryPropertiesFlags::IS_A_FENCE;
                 }
                 let mut queried = false;
-                let gpu_write: Arc<dyn Fn(u64, &[u8]) + Send + Sync> = {
-                    let memory_manager = self.memory_manager.as_ref().cloned();
-                    let guest_memory_writer = self.guest_memory_writer.as_ref().cloned();
-                    Arc::new(move |gpu_addr: u64, bytes: &[u8]| {
-                        let Some(memory_manager) = memory_manager.as_ref() else {
-                            return;
-                        };
-                        let Some(guest_memory_writer) = guest_memory_writer.as_ref() else {
-                            return;
-                        };
-                        memory_manager.lock().write_block_unsafe(
-                            gpu_addr,
-                            bytes,
-                            &mut |cpu_addr, data| guest_memory_writer(cpu_addr, data),
-                        );
-                    })
-                };
 
                 log::debug!(
                     "Maxwell3D: query_get {:?} va=0x{:X} payload=0x{:X} short={} type={} subreport={}",
@@ -3517,22 +3500,9 @@ impl Maxwell3D {
                     subreport,
                 );
 
-                let gpu_ticks = self
-                    .gpu_ticks_getter
-                    .as_ref()
-                    .map(|getter| getter())
-                    .unwrap_or(0);
                 let _ = self.with_rasterizer_mut(|rasterizer| {
                     queried = true;
-                    rasterizer.query(
-                        gpu_va,
-                        query_type,
-                        flags,
-                        gpu_ticks,
-                        payload,
-                        subreport,
-                        Arc::clone(&gpu_write),
-                    );
+                    rasterizer.query(gpu_va, query_type, flags, payload, subreport);
                 });
 
                 if !queried {
@@ -4061,20 +4031,17 @@ mod tests {
             gpu_addr: u64,
             _query_type: u32,
             flags: QueryPropertiesFlags,
-            gpu_ticks: u64,
             payload: u32,
             _subreport: u32,
-            gpu_write: Arc<dyn Fn(u64, &[u8]) + Send + Sync>,
         ) {
             let bytes = if flags.contains(QueryPropertiesFlags::HAS_TIMEOUT) {
                 let mut buf = Vec::with_capacity(16);
                 buf.extend_from_slice(&(payload as u64).to_le_bytes());
-                buf.extend_from_slice(&gpu_ticks.to_le_bytes());
+                buf.extend_from_slice(&0u64.to_le_bytes());
                 buf
             } else {
                 payload.to_le_bytes().to_vec()
             };
-            gpu_write(gpu_addr, &bytes);
             self.calls
                 .lock()
                 .unwrap()

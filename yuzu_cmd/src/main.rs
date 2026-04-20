@@ -318,7 +318,7 @@ fn main() {
             .get_filesystem_controller()
             .lock()
             .unwrap()
-            .create_factories();
+            .create_factories(system.get_filesystem().unwrap().clone(), false);
         // Note: get_filesystem_controller() returns Arc clone, lock it.
         system.clear_user_channel();
     }
@@ -424,31 +424,6 @@ fn main() {
                             unsafe {
                                 let gpu_ref = &*(gpu_ptr as *const video_core::gpu::Gpu);
                                 gpu_ref.read_gpu_memory(gpu_va, dst, &cpu_reader);
-                            }
-                        },
-                    ));
-                    let system_ref_gpu_writer = ruzu_core::core::SystemRef::from_ref(&system);
-                    renderer.rasterizer_mut().set_guest_memory_writer(Arc::new(
-                        move |addr, data: &[u8]| {
-                            let sys = system_ref_gpu_writer.get();
-                            if let Some(memory) = sys.memory_shared() {
-                                let m = memory.lock().unwrap();
-                                if m.write_block(addr, data) {
-                                    return;
-                                }
-                            }
-                            let dm = sys.device_memory();
-                            let base = ruzu_core::device_memory::dram_memory_map::BASE;
-                            if addr >= base {
-                                let offset = (addr - base) as usize;
-                                let backing = dm.buffer.backing_base_pointer();
-                                unsafe {
-                                    std::ptr::copy_nonoverlapping(
-                                        data.as_ptr(),
-                                        backing.add(offset),
-                                        data.len(),
-                                    );
-                                }
                             }
                         },
                     ));

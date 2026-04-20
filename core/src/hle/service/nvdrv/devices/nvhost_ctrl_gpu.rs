@@ -270,8 +270,6 @@ impl NvHostCtrlGpu {
             .system
             .get()
             .core_timing()
-            .lock()
-            .unwrap()
             .get_global_time_ns()
             .as_nanos() as u64;
         NvResult::Success
@@ -424,7 +422,7 @@ mod tests {
     #[test]
     fn get_gpu_time_uses_core_timing() {
         let system = System::new();
-        system.core_timing().lock().unwrap().add_ticks(1234);
+        system.core_timing().add_ticks(1234);
 
         let events = Arc::new(EventInterface::new(SystemRef::from_ref(&system)));
         let ctrl_gpu = NvHostCtrlGpu::new(SystemRef::from_ref(&system), events);

@@ -68,6 +68,8 @@ pub struct RasterizerNull {
     syncpoints: Arc<SyncpointManager>,
     accelerate_dma: AccelerateDMA,
     channel_caches: ChannelSetupCaches<ChannelInfo>,
+    guest_memory_writer: Option<crate::renderer_base::GuestMemoryWriter>,
+    gpu_ticks_getter: Option<crate::renderer_base::GpuTicksGetter>,
 }
 
 impl RasterizerNull {
@@ -76,12 +78,22 @@ impl RasterizerNull {
             syncpoints,
             accelerate_dma: AccelerateDMA::new(),
             channel_caches: ChannelSetupCaches::new(),
+            guest_memory_writer: None,
+            gpu_ticks_getter: None,
         }
     }
 
     /// Access the DMA accelerator.
     pub fn access_accelerate_dma(&self) -> &AccelerateDMA {
         &self.accelerate_dma
+    }
+
+    pub fn set_guest_memory_writer(&mut self, writer: crate::renderer_base::GuestMemoryWriter) {
+        self.guest_memory_writer = Some(writer);
+    }
+
+    pub fn set_gpu_ticks_getter(&mut self, getter: crate::renderer_base::GpuTicksGetter) {
+        self.gpu_ticks_getter = Some(getter);
     }
 }
 
@@ -122,13 +134,19 @@ impl RasterizerInterface for RasterizerNull {
         gpu_addr: u64,
         _query_type: u32,
         flags: QueryPropertiesFlags,
-        gpu_ticks: u64,
         payload: u32,
         _subreport: u32,
-        gpu_write: Arc<dyn Fn(u64, &[u8]) + Send + Sync>,
     ) {
+        let Some(gpu_write) = self.guest_memory_writer.as_ref().cloned() else {
+            return;
+        };
         let has_timeout = flags.contains(QueryPropertiesFlags::HAS_TIMEOUT);
         if has_timeout {
+            let gpu_ticks = self
+                .gpu_ticks_getter
+                .as_ref()
+                .map(|getter| getter())
+                .unwrap_or(0);
             gpu_write(gpu_addr + 8, &gpu_ticks.to_le_bytes());
             gpu_write(gpu_addr, &(payload as u64).to_le_bytes());
         } else {
@@ -298,17 +316,10 @@ mod tests {
 
         let written = Arc::new(std::sync::Mutex::new(Vec::new()));
         let written_cb = Arc::clone(&written);
-        rast.query(
-            0x1000,
-            0,
-            QueryPropertiesFlags::empty(),
-            0,
-            42,
-            0,
-            Arc::new(move |addr, data| {
-                written_cb.lock().unwrap().push((addr, data.to_vec()));
-            }),
-        );
+        rast.set_guest_memory_writer(Arc::new(move |addr, data| {
+            written_cb.lock().unwrap().push((addr, data.to_vec()));
+        }));
+        rast.query(0x1000, 0, QueryPropertiesFlags::empty(), 42, 0);
 
         let w = written.lock().unwrap();
         assert_eq!(w.len(), 1);
@@ -323,17 +334,11 @@ mod tests {
 
         let written = Arc::new(std::sync::Mutex::new(Vec::new()));
         let written_cb = Arc::clone(&written);
-        rast.query(
-            0x2000,
-            0,
-            QueryPropertiesFlags::HAS_TIMEOUT,
-            0x1234_5678_9ABC_DEF0,
-            99,
-            0,
-            Arc::new(move |addr, data| {
-                written_cb.lock().unwrap().push((addr, data.to_vec()));
-            }),
-        );
+        rast.set_guest_memory_writer(Arc::new(move |addr, data| {
+            written_cb.lock().unwrap().push((addr, data.to_vec()));
+        }));
+        rast.set_gpu_ticks_getter(Arc::new(|| 0x1234_5678_9ABC_DEF0));
+        rast.query(0x2000, 0, QueryPropertiesFlags::HAS_TIMEOUT, 99, 0);
 
         let w = written.lock().unwrap();
         assert_eq!(w.len(), 2);
@@ -350,17 +355,10 @@ mod tests {
 
         let written = Arc::new(std::sync::Mutex::new(Vec::new()));
         let written_cb = Arc::clone(&written);
-        rast.query(
-            0x3000,
-            2,
-            QueryPropertiesFlags::empty(),
-            0,
-            0xDEAD_BEEF,
-            0,
-            Arc::new(move |addr, data| {
-                written_cb.lock().unwrap().push((addr, data.to_vec()));
-            }),
-        );
+        rast.set_guest_memory_writer(Arc::new(move |addr, data| {
+            written_cb.lock().unwrap().push((addr, data.to_vec()));
+        }));
+        rast.query(0x3000, 2, QueryPropertiesFlags::empty(), 0xDEAD_BEEF, 0);
 
         let w = written.lock().unwrap();
         assert_eq!(w.len(), 1);

@@ -124,6 +124,16 @@ impl State {
         self.copy_size = self.regs.line_length_in * self.regs.line_count;
         self.inner_buffer.resize(self.copy_size as usize, 0);
         self.is_linear = is_linear;
+        if std::env::var_os("RUZU_TRACE_UPLOAD_EXEC").is_some() {
+            log::info!(
+                "engine_upload::process_exec line_length_in={} line_count={} copy_size={} linear={} dest=0x{:X}",
+                self.regs.line_length_in,
+                self.regs.line_count,
+                self.copy_size,
+                is_linear,
+                self.regs.dest.address()
+            );
+        }
     }
 
     /// Append a single data word to the transfer buffer (without flush context).
@@ -218,6 +228,16 @@ impl State {
     ///   - Block-linear: compute BPP shift, read GPU memory, swizzle subrect, write back.
     fn process_data_bytes(&mut self, read_buffer: &[u8], ctx: &mut FlushContext<'_>) {
         let address = self.regs.dest.address();
+        if std::env::var_os("RUZU_TRACE_UPLOAD_BYTES").is_some() {
+            log::info!(
+                "engine_upload::process_data_bytes target=0x{:X} bytes={} linear={} line_length={} line_count={}",
+                address,
+                read_buffer.len(),
+                self.is_linear,
+                self.regs.line_length_in,
+                self.regs.line_count,
+            );
+        }
         if std::env::var_os("RUZU_TRACE_DMA_FLOW").is_some() {
             log::info!(
                 "engine_upload::State::process_data_bytes target=0x{:X} bytes={} linear={} line_length={} line_count={} pitch={} width={} height={} depth={} x={} y={}",

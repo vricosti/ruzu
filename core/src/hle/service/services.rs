@@ -160,7 +160,9 @@ impl Services {
         // Upstream: system.GetFileSystemController().CreateFactories(*system.GetFilesystem(), false);
         {
             let mut fsc = filesystem_controller.lock().unwrap();
-            fsc.create_factories();
+            if let Some(vfs) = system.get().get_filesystem().cloned() {
+                fsc.create_factories(vfs, false);
+            }
         }
 
         // ── Host core processes (upstream: .detach()) ──

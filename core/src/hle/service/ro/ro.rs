@@ -18,6 +18,7 @@ use crate::hle::kernel::k_process::KProcess;
 use crate::hle::result::ResultCode;
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
 use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
+use crate::hle::kernel::k_process::ProcessLock;
 
 // Convenience definitions — matches upstream ro.cpp.
 const MAX_SESSIONS: usize = 0x3;
@@ -79,7 +80,7 @@ struct ProcessContext {
     nro_infos: Vec<NroInfo>,
     nrr_infos: Vec<NrrInfo>,
     /// Upstream: `Kernel::KProcess* m_process`.
-    process: Option<Arc<Mutex<KProcess>>>,
+    process: Option<Arc<ProcessLock>>,
     process_id: u64,
     in_use: bool,
 }
@@ -102,7 +103,7 @@ impl ProcessContext {
     /// Initialize the context for a process.
     ///
     /// Corresponds to `ProcessContext::Initialize` in upstream.
-    fn initialize(&mut self, process: Option<Arc<Mutex<KProcess>>>, process_id: u64) {
+    fn initialize(&mut self, process: Option<Arc<ProcessLock>>, process_id: u64) {
         assert!(!self.in_use);
 
         self.nro_in_use = [false; MAX_NRO_INFOS];
@@ -139,7 +140,7 @@ impl ProcessContext {
         self.in_use = false;
     }
 
-    fn get_process(&self) -> Option<&Arc<Mutex<KProcess>>> {
+    fn get_process(&self) -> Option<&Arc<ProcessLock>> {
         self.process.as_ref()
     }
 
@@ -421,7 +422,7 @@ impl RoContext {
     /// Corresponds to `RoContext::RegisterProcess` in upstream.
     pub fn register_process(
         &mut self,
-        process: Option<Arc<Mutex<KProcess>>>,
+        process: Option<Arc<ProcessLock>>,
         process_id: u64,
     ) -> Result<usize, ResultCode> {
         // Check if a process context already exists.
@@ -732,7 +733,7 @@ impl RoContext {
 
     fn allocate_context(
         &mut self,
-        process: Option<Arc<Mutex<KProcess>>>,
+        process: Option<Arc<ProcessLock>>,
         process_id: u64,
     ) -> usize {
         for i in 0..MAX_SESSIONS {

@@ -11,6 +11,7 @@ use std::sync::{Arc, Mutex};
 use crate::hle::kernel::k_process::KProcess;
 use crate::hle::kernel::k_readable_event::KReadableEvent;
 use crate::hle::kernel::k_scheduler::KScheduler;
+use crate::hle::kernel::k_process::ProcessLock;
 
 /// The IBinder trait corresponds to the C++ IBinder abstract class.
 ///
@@ -26,7 +27,7 @@ pub trait IBinder: Send + Sync {
     /// the copied handle so later event signaling can wake WaitSynchronization waiters.
     fn register_native_handle_owner(
         &self,
-        _process: Arc<Mutex<KProcess>>,
+        _process: Arc<ProcessLock>,
         _scheduler: Arc<Mutex<KScheduler>>,
     ) {
     }

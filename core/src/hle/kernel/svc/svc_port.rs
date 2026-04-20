@@ -17,6 +17,7 @@ use crate::hle::kernel::svc::svc_results::*;
 use crate::hle::kernel::svc_common::{Handle, INVALID_HANDLE};
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 use crate::hle::service::hle_ipc::SessionRequestManager;
+use super::super::k_process::ProcessLock;
 
 const PORT_NAME_MAX_LENGTH: usize = 12;
 
@@ -409,7 +410,7 @@ mod tests {
     fn test_system() -> System {
         let mut system = System::new_for_test();
 
-        let process = Arc::new(Mutex::new(KProcess::new()));
+        let process = Arc::new(ProcessLock::from_value(KProcess::new()));
         {
             let mut process_guard = process.lock().unwrap();
             process_guard.process_id = 1;

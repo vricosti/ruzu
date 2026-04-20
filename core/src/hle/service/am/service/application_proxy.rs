@@ -15,6 +15,7 @@ use crate::hle::service::am::window_system::WindowSystem;
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
 use crate::hle::service::ipc_helpers::ResponseBuilder;
 use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
+use crate::hle::kernel::k_process::ProcessLock;
 
 /// IPC command table for IApplicationProxy:
 /// - 0: GetCommonStateGetter
@@ -36,7 +37,7 @@ pub struct IApplicationProxy {
     /// Matches upstream `WindowSystem& m_window_system`.
     window_system: Arc<Mutex<WindowSystem>>,
     /// Matches upstream `Kernel::KProcess* m_process`.
-    process: Option<Arc<Mutex<KProcess>>>,
+    process: Option<Arc<ProcessLock>>,
     handlers: BTreeMap<u32, FunctionInfo>,
     handlers_tipc: BTreeMap<u32, FunctionInfo>,
 }
@@ -47,7 +48,7 @@ impl IApplicationProxy {
     pub fn new(
         system: SystemRef,
         applet: Arc<Mutex<Applet>>,
-        process: Option<Arc<Mutex<KProcess>>>,
+        process: Option<Arc<ProcessLock>>,
         window_system: Arc<Mutex<WindowSystem>>,
     ) -> Self {
         let handlers = build_handler_map(&[

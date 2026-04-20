@@ -14,12 +14,13 @@ use super::k_shared_memory::MemoryPermission;
 use super::k_typed_address::KProcessAddress;
 use crate::hle::result::ResultCode;
 use std::sync::{Arc, Mutex, Weak};
+use super::k_process::ProcessLock;
 
 /// KTransferMemory: allows transferring a memory region from one process
 /// to another. Upstream inherits from KAutoObjectWithSlabHeapAndContainer.
 pub struct KTransferMemory {
     m_page_group: Option<KPageGroup>,
-    m_owner: Option<Weak<Mutex<KProcess>>>,
+    m_owner: Option<Weak<ProcessLock>>,
     m_address: u64,
     m_owner_perm: MemoryPermission,
     m_is_initialized: bool,
@@ -42,7 +43,7 @@ impl KTransferMemory {
     /// Port of upstream `KTransferMemory::Initialize`.
     pub fn initialize(
         &mut self,
-        owner: &Arc<Mutex<KProcess>>,
+        owner: &Arc<ProcessLock>,
         address: u64,
         size: usize,
         owner_perm: MemoryPermission,
@@ -91,7 +92,7 @@ impl KTransferMemory {
         self.m_is_initialized
     }
 
-    pub fn get_owner(&self) -> Option<Arc<Mutex<KProcess>>> {
+    pub fn get_owner(&self) -> Option<Arc<ProcessLock>> {
         self.m_owner.as_ref().and_then(Weak::upgrade)
     }
 

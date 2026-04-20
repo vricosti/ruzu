@@ -16,6 +16,7 @@ use crate::hle::kernel::svc::svc_results::*;
 use crate::hle::kernel::svc::svc_types::*;
 use crate::hle::kernel::svc_common::{Handle, PseudoHandle, INVALID_HANDLE};
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
+use super::super::k_process::ProcessLock;
 
 const FALLBACK_USER_THREAD_STACK_SIZE: u64 = 0x100000;
 
@@ -179,9 +180,7 @@ pub fn create_thread(
         // thread's lifetime.
         let parent_ptr = {
             let mut process_guard = current_process.lock().unwrap();
-            (&mut *process_guard)
-                as *mut crate::hle::kernel::k_process::KProcess
-                as usize
+            (&mut *process_guard) as *mut crate::hle::kernel::k_process::KProcess as usize
         };
         new_thread.set_parent_raw_ptr(parent_ptr);
 
@@ -677,7 +676,7 @@ mod tests {
             0x1_0000_0000,
         ))));
 
-        let process = Arc::new(Mutex::new(process));
+        let process = Arc::new(ProcessLock::from_value(process));
         let current_thread = Arc::new(Mutex::new(KThread::new()));
         let scheduler = Arc::new(Mutex::new(
             crate::hle::kernel::k_scheduler::KScheduler::new(0),

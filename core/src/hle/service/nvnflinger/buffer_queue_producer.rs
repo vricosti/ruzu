@@ -40,6 +40,7 @@ use super::ui::graphic_buffer::{GraphicBuffer, NvGraphicBuffer};
 use super::window::{
     NativeWindow, NativeWindowApi, NativeWindowScalingMode, NativeWindowTransform,
 };
+use crate::hle::kernel::k_process::ProcessLock;
 
 static BQP_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
 
@@ -1008,7 +1009,7 @@ impl IBinder for BufferQueueProducer {
 
     fn register_native_handle_owner(
         &self,
-        process: Arc<Mutex<KProcess>>,
+        process: Arc<ProcessLock>,
         scheduler: Arc<Mutex<KScheduler>>,
     ) {
         let event = self.buffer_wait_event();
@@ -1097,7 +1098,7 @@ mod tests {
     #[test]
     fn get_native_handle_returns_persistent_buffer_wait_event() {
         let core = BufferQueueCore::new();
-        let process = Arc::new(Mutex::new(KProcess::new()));
+        let process = Arc::new(ProcessLock::from_value(KProcess::new()));
         let scheduler = Arc::new(Mutex::new(KScheduler::new(0)));
         let producer = BufferQueueProducer::new(test_service_context(), core, test_nvmap());
         producer.register_native_handle_owner(process, scheduler);
@@ -1124,7 +1125,7 @@ mod tests {
     fn disconnect_signals_buffer_wait_event() {
         let core = BufferQueueCore::new();
         install_test_consumer(&core);
-        let process = Arc::new(Mutex::new(KProcess::new()));
+        let process = Arc::new(ProcessLock::from_value(KProcess::new()));
         let scheduler = Arc::new(Mutex::new(KScheduler::new(0)));
         let producer = BufferQueueProducer::new(test_service_context(), core, test_nvmap());
         producer.register_native_handle_owner(process, scheduler);
@@ -1141,7 +1142,7 @@ mod tests {
     #[test]
     fn set_preallocated_buffer_signals_wait_event_and_updates_defaults() {
         let core = BufferQueueCore::new();
-        let process = Arc::new(Mutex::new(KProcess::new()));
+        let process = Arc::new(ProcessLock::from_value(KProcess::new()));
         let scheduler = Arc::new(Mutex::new(KScheduler::new(0)));
         let producer = BufferQueueProducer::new(test_service_context(), core.clone(), test_nvmap());
         producer.register_native_handle_owner(process, scheduler);

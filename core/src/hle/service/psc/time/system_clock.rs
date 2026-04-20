@@ -41,7 +41,9 @@ impl SystemClockBackend for TimeManagerBackend {
             SystemClockKind::User => time.standard_user_system_clock.is_initialized(),
             SystemClockKind::Network => time.standard_network_system_clock.clock.is_initialized(),
             SystemClockKind::Local => time.standard_local_system_clock.clock.is_initialized(),
-            SystemClockKind::EphemeralNetwork => time.ephemeral_network_clock.clock.is_initialized(),
+            SystemClockKind::EphemeralNetwork => {
+                time.ephemeral_network_clock.clock.is_initialized()
+            }
         }
     }
 
@@ -55,9 +57,13 @@ impl SystemClockBackend for TimeManagerBackend {
                 let local = std::ptr::addr_of_mut!(time.standard_local_system_clock);
                 let network = std::ptr::addr_of!(time.standard_network_system_clock);
                 let context = unsafe {
-                    time.standard_user_system_clock.get_context(&mut *local, &*network)
+                    time.standard_user_system_clock
+                        .get_context(&mut *local, &*network)
                 }?;
-                let tp = time.standard_local_system_clock.clock.get_current_time_point()?;
+                let tp = time
+                    .standard_local_system_clock
+                    .clock
+                    .get_current_time_point()?;
                 if !context.steady_time_point.id_matches(&tp) {
                     return Err(super::errors::RESULT_CLOCK_MISMATCH);
                 }
@@ -77,7 +83,10 @@ impl SystemClockBackend for TimeManagerBackend {
             SystemClockKind::User => {
                 let local = std::ptr::addr_of_mut!(time.standard_local_system_clock);
                 let network = std::ptr::addr_of!(time.standard_network_system_clock);
-                unsafe { time.standard_user_system_clock.get_context(&mut *local, &*network) }
+                unsafe {
+                    time.standard_user_system_clock
+                        .get_context(&mut *local, &*network)
+                }
             }
             SystemClockKind::Network => time.standard_network_system_clock.clock.get_context(),
             SystemClockKind::Local => time.standard_local_system_clock.clock.get_context(),
@@ -89,15 +98,18 @@ impl SystemClockBackend for TimeManagerBackend {
         let mut time = self.time_manager.lock().unwrap();
         match self.kind {
             SystemClockKind::User => RESULT_PERMISSION_DENIED,
-            SystemClockKind::Network => {
-                time.standard_network_system_clock.clock.set_current_time(time_value)
-            }
-            SystemClockKind::Local => {
-                time.standard_local_system_clock.clock.set_current_time(time_value)
-            }
-            SystemClockKind::EphemeralNetwork => {
-                time.ephemeral_network_clock.clock.set_current_time(time_value)
-            }
+            SystemClockKind::Network => time
+                .standard_network_system_clock
+                .clock
+                .set_current_time(time_value),
+            SystemClockKind::Local => time
+                .standard_local_system_clock
+                .clock
+                .set_current_time(time_value),
+            SystemClockKind::EphemeralNetwork => time
+                .ephemeral_network_clock
+                .clock
+                .set_current_time(time_value),
         }
     }
 
@@ -105,15 +117,18 @@ impl SystemClockBackend for TimeManagerBackend {
         let mut time = self.time_manager.lock().unwrap();
         match self.kind {
             SystemClockKind::User => RESULT_PERMISSION_DENIED,
-            SystemClockKind::Network => {
-                time.standard_network_system_clock.clock.set_context_and_write(context)
-            }
-            SystemClockKind::Local => {
-                time.standard_local_system_clock.clock.set_context_and_write(context)
-            }
-            SystemClockKind::EphemeralNetwork => {
-                time.ephemeral_network_clock.clock.set_context_and_write(context)
-            }
+            SystemClockKind::Network => time
+                .standard_network_system_clock
+                .clock
+                .set_context_and_write(context),
+            SystemClockKind::Local => time
+                .standard_local_system_clock
+                .clock
+                .set_context_and_write(context),
+            SystemClockKind::EphemeralNetwork => time
+                .ephemeral_network_clock
+                .clock
+                .set_context_and_write(context),
         }
     }
 }

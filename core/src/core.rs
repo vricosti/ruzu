@@ -34,6 +34,7 @@ use parking_lot::Mutex;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
+use crate::hle::kernel::k_process::ProcessLock;
 
 /// Enumeration representing the return values of the System Initialize and Load process.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -148,9 +149,301 @@ pub trait AudioRendererSessionInterface: Send {
     /// Pass the process Arc for thread-safe waiter notification.
     fn set_process_arc(
         &self,
-        _process: std::sync::Arc<std::sync::Mutex<crate::hle::kernel::k_process::KProcess>>,
+        _process: std::sync::Arc<crate::hle::kernel::k_process::ProcessLock>,
     ) {
     }
+}
+
+/// Raw `AudioInBuffer` wire payload.
+///
+/// Mirrors `AudioCore::AudioIn::AudioInBuffer` layout from upstream
+/// `audio_core/in/audio_in_system.h`.
+#[derive(Debug, Clone, Copy, Default)]
+#[repr(C)]
+pub struct AudioInBufferWire {
+    pub next: u64,
+    pub samples: u64,
+    pub capacity: u64,
+    pub size: u64,
+    pub offset: u64,
+}
+
+/// Raw `AudioInParameter` wire payload.
+///
+/// Mirrors `AudioCore::AudioIn::AudioInParameter` layout from upstream
+/// `audio_core/in/audio_in_system.h`.
+#[derive(Debug, Clone, Copy, Default)]
+#[repr(C)]
+pub struct AudioInParameterWire {
+    pub sample_rate: i32,
+    pub channel_count: u16,
+    pub reserved: u16,
+}
+
+/// Minimal bridge contract from `core` to an owned `audio_core::in::In` session.
+///
+/// Upstream `IAudioIn` owns `AudioCore::AudioIn::In` directly. Rust cannot
+/// name that concrete type from `core`, so exercised service calls go through
+/// a concrete owner-local wrapper with an explicit callback table.
+pub trait AudioInSessionImpl: Send + Sync + 'static {
+    fn get_state(&self) -> u32;
+    fn start(&self) -> crate::hle::result::ResultCode;
+    fn stop(&self) -> crate::hle::result::ResultCode;
+    fn append_buffer(
+        &self,
+        buffer: AudioInBufferWire,
+        buffer_client_ptr: u64,
+    ) -> crate::hle::result::ResultCode;
+    fn get_released_buffers(&self, out_tags: &mut [u64]) -> u32;
+    fn contains_buffer(&self, buffer_client_ptr: u64) -> bool;
+    fn get_buffer_count(&self) -> u32;
+    fn set_device_gain(&self, gain: f32);
+    fn get_device_gain(&self) -> f32;
+    fn flush_audio_in_buffers(&self) -> bool;
+    fn set_buffer_readable_event(
+        &self,
+        _event: std::sync::Arc<
+            std::sync::Mutex<crate::hle::kernel::k_readable_event::KReadableEvent>,
+        >,
+    ) {
+    }
+    fn set_process_arc(
+        &self,
+        _process: std::sync::Arc<crate::hle::kernel::k_process::ProcessLock>,
+    ) {
+    }
+}
+
+/// Concrete owner-local session wrapper used by `IAudioIn`.
+pub struct AudioInSession {
+    ptr: *const (),
+    clone_fn: unsafe fn(*const ()) -> *const (),
+    drop_fn: unsafe fn(*const ()),
+    get_state_fn: unsafe fn(*const ()) -> u32,
+    start_fn: unsafe fn(*const ()) -> crate::hle::result::ResultCode,
+    stop_fn: unsafe fn(*const ()) -> crate::hle::result::ResultCode,
+    append_buffer_fn:
+        unsafe fn(*const (), AudioInBufferWire, u64) -> crate::hle::result::ResultCode,
+    get_released_buffers_fn: unsafe fn(*const (), &mut [u64]) -> u32,
+    contains_buffer_fn: unsafe fn(*const (), u64) -> bool,
+    get_buffer_count_fn: unsafe fn(*const ()) -> u32,
+    set_device_gain_fn: unsafe fn(*const (), f32),
+    get_device_gain_fn: unsafe fn(*const ()) -> f32,
+    flush_audio_in_buffers_fn: unsafe fn(*const ()) -> bool,
+    set_buffer_readable_event_fn: unsafe fn(
+        *const (),
+        std::sync::Arc<std::sync::Mutex<crate::hle::kernel::k_readable_event::KReadableEvent>>,
+    ),
+    set_process_arc_fn: unsafe fn(
+        *const (),
+        std::sync::Arc<crate::hle::kernel::k_process::ProcessLock>,
+    ),
+}
+
+impl AudioInSession {
+    pub fn from_arc<T: AudioInSessionImpl>(inner: std::sync::Arc<T>) -> Self {
+        Self {
+            ptr: std::sync::Arc::into_raw(inner) as *const (),
+            clone_fn: clone_audio_in_session_arc::<T>,
+            drop_fn: drop_audio_in_session_arc::<T>,
+            get_state_fn: get_audio_in_session_state::<T>,
+            start_fn: start_audio_in_session::<T>,
+            stop_fn: stop_audio_in_session::<T>,
+            append_buffer_fn: append_audio_in_session_buffer::<T>,
+            get_released_buffers_fn: get_audio_in_session_released_buffers::<T>,
+            contains_buffer_fn: contains_audio_in_session_buffer::<T>,
+            get_buffer_count_fn: get_audio_in_session_buffer_count::<T>,
+            set_device_gain_fn: set_audio_in_session_device_gain::<T>,
+            get_device_gain_fn: get_audio_in_session_device_gain::<T>,
+            flush_audio_in_buffers_fn: flush_audio_in_session_buffers::<T>,
+            set_buffer_readable_event_fn: set_audio_in_session_buffer_readable_event::<T>,
+            set_process_arc_fn: set_audio_in_session_process_arc::<T>,
+        }
+    }
+
+    pub fn get_state(&self) -> u32 {
+        unsafe { (self.get_state_fn)(self.ptr) }
+    }
+
+    pub fn start(&self) -> crate::hle::result::ResultCode {
+        unsafe { (self.start_fn)(self.ptr) }
+    }
+
+    pub fn stop(&self) -> crate::hle::result::ResultCode {
+        unsafe { (self.stop_fn)(self.ptr) }
+    }
+
+    pub fn append_buffer(
+        &self,
+        buffer: AudioInBufferWire,
+        buffer_client_ptr: u64,
+    ) -> crate::hle::result::ResultCode {
+        unsafe { (self.append_buffer_fn)(self.ptr, buffer, buffer_client_ptr) }
+    }
+
+    pub fn get_released_buffers(&self, out_tags: &mut [u64]) -> u32 {
+        unsafe { (self.get_released_buffers_fn)(self.ptr, out_tags) }
+    }
+
+    pub fn contains_buffer(&self, buffer_client_ptr: u64) -> bool {
+        unsafe { (self.contains_buffer_fn)(self.ptr, buffer_client_ptr) }
+    }
+
+    pub fn get_buffer_count(&self) -> u32 {
+        unsafe { (self.get_buffer_count_fn)(self.ptr) }
+    }
+
+    pub fn set_device_gain(&self, gain: f32) {
+        unsafe { (self.set_device_gain_fn)(self.ptr, gain) }
+    }
+
+    pub fn get_device_gain(&self) -> f32 {
+        unsafe { (self.get_device_gain_fn)(self.ptr) }
+    }
+
+    pub fn flush_audio_in_buffers(&self) -> bool {
+        unsafe { (self.flush_audio_in_buffers_fn)(self.ptr) }
+    }
+
+    pub fn set_buffer_readable_event(
+        &self,
+        event: std::sync::Arc<
+            std::sync::Mutex<crate::hle::kernel::k_readable_event::KReadableEvent>,
+        >,
+    ) {
+        unsafe { (self.set_buffer_readable_event_fn)(self.ptr, event) }
+    }
+
+    pub fn set_process_arc(
+        &self,
+        process: std::sync::Arc<crate::hle::kernel::k_process::ProcessLock>,
+    ) {
+        unsafe { (self.set_process_arc_fn)(self.ptr, process) }
+    }
+}
+
+impl Clone for AudioInSession {
+    fn clone(&self) -> Self {
+        Self {
+            ptr: unsafe { (self.clone_fn)(self.ptr) },
+            clone_fn: self.clone_fn,
+            drop_fn: self.drop_fn,
+            get_state_fn: self.get_state_fn,
+            start_fn: self.start_fn,
+            stop_fn: self.stop_fn,
+            append_buffer_fn: self.append_buffer_fn,
+            get_released_buffers_fn: self.get_released_buffers_fn,
+            contains_buffer_fn: self.contains_buffer_fn,
+            get_buffer_count_fn: self.get_buffer_count_fn,
+            set_device_gain_fn: self.set_device_gain_fn,
+            get_device_gain_fn: self.get_device_gain_fn,
+            flush_audio_in_buffers_fn: self.flush_audio_in_buffers_fn,
+            set_buffer_readable_event_fn: self.set_buffer_readable_event_fn,
+            set_process_arc_fn: self.set_process_arc_fn,
+        }
+    }
+}
+
+impl Drop for AudioInSession {
+    fn drop(&mut self) {
+        unsafe { (self.drop_fn)(self.ptr) }
+    }
+}
+
+unsafe impl Send for AudioInSession {}
+unsafe impl Sync for AudioInSession {}
+
+unsafe fn clone_audio_in_session_arc<T: AudioInSessionImpl>(ptr: *const ()) -> *const () {
+    let arc = std::sync::Arc::from_raw(ptr as *const T);
+    let cloned = std::sync::Arc::clone(&arc);
+    let _ = std::sync::Arc::into_raw(arc);
+    std::sync::Arc::into_raw(cloned) as *const ()
+}
+
+unsafe fn drop_audio_in_session_arc<T: AudioInSessionImpl>(ptr: *const ()) {
+    drop(std::sync::Arc::from_raw(ptr as *const T));
+}
+
+unsafe fn get_audio_in_session_ref<T: AudioInSessionImpl>(ptr: *const ()) -> &'static T {
+    &*(ptr as *const T)
+}
+
+unsafe fn get_audio_in_session_state<T: AudioInSessionImpl>(ptr: *const ()) -> u32 {
+    get_audio_in_session_ref::<T>(ptr).get_state()
+}
+
+unsafe fn start_audio_in_session<T: AudioInSessionImpl>(
+    ptr: *const (),
+) -> crate::hle::result::ResultCode {
+    get_audio_in_session_ref::<T>(ptr).start()
+}
+
+unsafe fn stop_audio_in_session<T: AudioInSessionImpl>(
+    ptr: *const (),
+) -> crate::hle::result::ResultCode {
+    get_audio_in_session_ref::<T>(ptr).stop()
+}
+
+unsafe fn append_audio_in_session_buffer<T: AudioInSessionImpl>(
+    ptr: *const (),
+    buffer: AudioInBufferWire,
+    buffer_client_ptr: u64,
+) -> crate::hle::result::ResultCode {
+    get_audio_in_session_ref::<T>(ptr).append_buffer(buffer, buffer_client_ptr)
+}
+
+unsafe fn get_audio_in_session_released_buffers<T: AudioInSessionImpl>(
+    ptr: *const (),
+    out_tags: &mut [u64],
+) -> u32 {
+    get_audio_in_session_ref::<T>(ptr).get_released_buffers(out_tags)
+}
+
+unsafe fn contains_audio_in_session_buffer<T: AudioInSessionImpl>(
+    ptr: *const (),
+    buffer_client_ptr: u64,
+) -> bool {
+    get_audio_in_session_ref::<T>(ptr).contains_buffer(buffer_client_ptr)
+}
+
+unsafe fn get_audio_in_session_buffer_count<T: AudioInSessionImpl>(ptr: *const ()) -> u32 {
+    get_audio_in_session_ref::<T>(ptr).get_buffer_count()
+}
+
+unsafe fn set_audio_in_session_device_gain<T: AudioInSessionImpl>(ptr: *const (), gain: f32) {
+    get_audio_in_session_ref::<T>(ptr).set_device_gain(gain);
+}
+
+unsafe fn get_audio_in_session_device_gain<T: AudioInSessionImpl>(ptr: *const ()) -> f32 {
+    get_audio_in_session_ref::<T>(ptr).get_device_gain()
+}
+
+unsafe fn flush_audio_in_session_buffers<T: AudioInSessionImpl>(ptr: *const ()) -> bool {
+    get_audio_in_session_ref::<T>(ptr).flush_audio_in_buffers()
+}
+
+unsafe fn set_audio_in_session_buffer_readable_event<T: AudioInSessionImpl>(
+    ptr: *const (),
+    event: std::sync::Arc<std::sync::Mutex<crate::hle::kernel::k_readable_event::KReadableEvent>>,
+) {
+    get_audio_in_session_ref::<T>(ptr).set_buffer_readable_event(event);
+}
+
+unsafe fn set_audio_in_session_process_arc<T: AudioInSessionImpl>(
+    ptr: *const (),
+    process: std::sync::Arc<crate::hle::kernel::k_process::ProcessLock>,
+) {
+    get_audio_in_session_ref::<T>(ptr).set_process_arc(process);
+}
+
+/// Result payload for `IAudioInManager::OpenAudioIn*`.
+pub struct AudioInOpenResponse {
+    pub session: AudioInSession,
+    pub sample_rate: u32,
+    pub channel_count: u32,
+    pub sample_format: u32,
+    pub state: u32,
+    pub name: [u8; 0x100],
 }
 
 /// Minimal bridge from `core` to the concrete `audio_core` crate.
@@ -192,6 +485,18 @@ pub trait AudioCoreInterface: Send {
     /// Mirror `AudioCore::Sink::Sink::GetSystemChannels`.
     fn get_audio_output_system_channels(&self) -> u32;
 
+    /// Mirror `AudioCore::AudioIn::Manager::GetDeviceNames`.
+    fn list_audio_input_device_name(&self, out_names: &mut [[u8; 0x100]], filter: bool) -> u32;
+
+    /// Mirror `IAudioInManager::OpenAudioInProtocolSpecified`.
+    fn open_audio_input(
+        &self,
+        name: &[u8; 0x100],
+        protocol: [u32; 2],
+        params: AudioInParameterWire,
+        applet_resource_user_id: u64,
+    ) -> std::result::Result<AudioInOpenResponse, crate::hle::result::ResultCode>;
+
     /// Mirror `IAudioRendererManager::OpenAudioRenderer` by creating an owned
     /// audio renderer session backed by the real audio_core renderer owners.
     fn open_audio_renderer(
@@ -212,7 +517,7 @@ pub trait AudioCoreInterface: Send {
 pub struct System {
     // ── Core subsystems ──
     /// The core timing system (event scheduling).
-    pub core_timing: Arc<StdMutex<CoreTiming>>,
+    pub core_timing: Arc<CoreTiming>,
 
     /// The CPU manager (thread dispatch).
     pub cpu_manager: CpuManager,
@@ -356,7 +661,7 @@ pub struct System {
     /// The current application process, wrapped for shared access.
     /// Set by the frontend after `System::load()` returns.
     /// Upstream: `system.CurrentProcess()`.
-    pub(crate) current_process_arc: Option<Arc<StdMutex<crate::hle::kernel::k_process::KProcess>>>,
+    pub(crate) current_process_arc: Option<Arc<ProcessLock>>,
 
     /// The cooperative scheduler for the main core.
     /// Upstream has per-core schedulers in the kernel; here we use one.
@@ -384,7 +689,7 @@ impl System {
     /// Creates a new System instance.
     pub fn new() -> Self {
         Self {
-            core_timing: Arc::new(StdMutex::new(CoreTiming::new())),
+            core_timing: Arc::new(CoreTiming::new()),
             cpu_manager: CpuManager::new(),
             kernel: None,
             telemetry_session: None,
@@ -461,13 +766,10 @@ impl System {
         // In C++: is_multicore = Settings::values.use_multi_core.GetValue()
         self.is_multicore = *common::settings::values().use_multi_core.get_value();
 
-        self.core_timing
-            .lock()
-            .unwrap()
-            .set_multicore(self.is_multicore);
+        self.core_timing.set_multicore(self.is_multicore);
         // In C++: core_timing.Initialize([&system]() { system.RegisterHostThread(); });
         let system_ref = SystemRef::from_ref(self);
-        self.core_timing.lock().unwrap().initialize(move || {
+        self.core_timing.initialize(move || {
             // Upstream: core_timing.Initialize([&system]() { system.RegisterHostThread(); });
             system_ref.get().kernel().unwrap().register_host_thread();
         });
@@ -548,13 +850,13 @@ impl System {
             .unwrap()
             .wire_hardware_timer(self.core_timing.clone());
 
-        // Schedule preemption event (10ms interval) and start timer thread.
+        // Schedule preemption event (10ms interval). The timer thread is now
+        // spawned from CoreTiming::initialize(), matching upstream ownership.
         // Upstream: InitializePreemption in kernel.cpp schedules a looping event.
         self.kernel
             .as_ref()
             .unwrap()
             .schedule_preemption_event(&self.core_timing);
-        CoreTiming::start_timer_thread(self.core_timing.clone());
 
         // Upstream: cpu_manager.Initialize() — creates barrier and spawns per-core
         // host threads that wait on the GPU barrier before yielding to guest fibers.
@@ -766,7 +1068,7 @@ impl System {
             let stack_size = lp.main_thread_stack_size as usize;
 
             // Wrap in Arc<Mutex<>> — run() needs self_reference for thread creation.
-            let process_arc = Arc::new(StdMutex::new(process));
+            let process_arc = Arc::new(ProcessLock::from_value(process));
             process_arc
                 .lock()
                 .unwrap()
@@ -893,7 +1195,7 @@ impl System {
         if let Some(ref kernel) = self.kernel {
             kernel.suspend_emulation(false);
         }
-        self.core_timing.lock().unwrap().sync_pause(false);
+        self.core_timing.sync_pause(false);
         self.is_paused.store(false, Ordering::Relaxed);
 
         log::info!("System: running");
@@ -904,7 +1206,7 @@ impl System {
     pub fn pause(&mut self) {
         let _lk = self.suspend_guard.lock();
 
-        self.core_timing.lock().unwrap().sync_pause(true);
+        self.core_timing.sync_pause(true);
         if let Some(ref kernel) = self.kernel {
             kernel.suspend_emulation(true);
         }
@@ -924,8 +1226,8 @@ impl System {
 
         // Log last frame performance stats if game was loaded
         if let Some(ref perf_stats) = self.perf_stats {
-            let perf_results = perf_stats
-                .get_and_reset_stats(self.core_timing.lock().unwrap().get_global_time_us());
+            let perf_results =
+                perf_stats.get_and_reset_stats(self.core_timing.get_global_time_us());
             log::info!(
                 "Shutdown stats: speed={:.1}%, fps={:.1}, frametime={:.3}ms",
                 perf_results.emulation_speed * 100.0,
@@ -938,7 +1240,7 @@ impl System {
         self.exit_locked = false;
         self.exit_requested = false;
 
-        self.core_timing.lock().unwrap().sync_pause(false);
+        self.core_timing.sync_pause(false);
         if let Some(ref kernel) = self.kernel {
             kernel.suspend_emulation(true);
             kernel.close_services();
@@ -949,7 +1251,7 @@ impl System {
         // Upstream: telemetry_session.reset();
         self.telemetry_session = None;
 
-        self.core_timing.lock().unwrap().clear_pending_events();
+        self.core_timing.clear_pending_events();
 
         // Upstream: app_loader.reset();
         self.app_loader = None;
@@ -987,14 +1289,14 @@ impl System {
     pub fn stall_application(&mut self) -> parking_lot::MutexGuard<'_, ()> {
         let lk = self.suspend_guard.lock();
         // In C++: kernel.SuspendEmulation(true);
-        self.core_timing.lock().unwrap().sync_pause(true);
+        self.core_timing.sync_pause(true);
         lk
     }
 
     /// Unstall the application (resume if not paused).
     pub fn unstall_application(&mut self) {
         if !self.is_paused() {
-            self.core_timing.lock().unwrap().sync_pause(false);
+            self.core_timing.sync_pause(false);
             // In C++: kernel.SuspendEmulation(false);
         }
     }
@@ -1059,6 +1361,10 @@ impl System {
         &mut self,
         provider: Arc<StdMutex<crate::file_sys::registered_cache::ContentProviderUnion>>,
     ) {
+        self.filesystem_controller
+            .lock()
+            .unwrap()
+            .set_content_provider(provider.clone());
         self.content_provider = Some(provider);
     }
 
@@ -1126,12 +1432,12 @@ impl System {
     }
 
     /// Gets a reference to the core timing instance.
-    pub fn core_timing(&self) -> Arc<StdMutex<CoreTiming>> {
+    pub fn core_timing(&self) -> Arc<CoreTiming> {
         self.core_timing.clone()
     }
 
     /// Gets a shared reference to the core timing instance.
-    pub fn core_timing_shared(&self) -> Arc<StdMutex<CoreTiming>> {
+    pub fn core_timing_shared(&self) -> Arc<CoreTiming> {
         self.core_timing.clone()
     }
 
@@ -1147,7 +1453,7 @@ impl System {
                 return Some(mem);
             }
         }
-        // Try via Arc<Mutex<KProcess>> current_process_arc
+        // Try via Arc<ProcessLock> current_process_arc
         if let Some(ref process_arc) = self.current_process_arc {
             if let Ok(process) = process_arc.lock() {
                 if let Some(mem) = process.get_memory() {
@@ -1225,9 +1531,7 @@ impl System {
     /// Gets and resets performance statistics.
     pub fn get_and_reset_perf_stats(&self) -> PerfStatsResults {
         match &self.perf_stats {
-            Some(stats) => {
-                stats.get_and_reset_stats(self.core_timing.lock().unwrap().get_global_time_us())
-            }
+            Some(stats) => stats.get_and_reset_stats(self.core_timing.get_global_time_us()),
             None => PerfStatsResults::default(),
         }
     }
@@ -1311,7 +1615,7 @@ impl System {
     /// Returns the current CoreTiming tick count.
     /// Upstream: `system.CoreTiming().GetClockTicks()`.
     pub fn get_core_timing_ticks(&self) -> u64 {
-        self.core_timing.lock().unwrap().get_clock_ticks()
+        self.core_timing.get_clock_ticks()
     }
 
     /// Registers the application main thread with the kernel and global scheduler.
@@ -1457,7 +1761,7 @@ impl System {
     /// Set the Arc-wrapped current process for SVC dispatch.
     pub fn set_current_process_arc(
         &mut self,
-        p: Arc<StdMutex<crate::hle::kernel::k_process::KProcess>>,
+        p: Arc<ProcessLock>,
     ) {
         self.current_process_arc = Some(p);
     }
@@ -1490,7 +1794,7 @@ impl System {
 
     /// Get the current process Arc. Panics if not set.
     /// Upstream: `Kernel::GetCurrentProcess(kernel)`.
-    pub fn current_process_arc(&self) -> &Arc<StdMutex<crate::hle::kernel::k_process::KProcess>> {
+    pub fn current_process_arc(&self) -> &Arc<ProcessLock> {
         self.current_process_arc
             .as_ref()
             .expect("current_process_arc not set; call set_current_process_arc() first")
@@ -1623,7 +1927,7 @@ impl System {
             .cloned()
             .expect("loader must provide process launch parameters");
 
-        let process = Arc::new(StdMutex::new(process));
+        let process = Arc::new(ProcessLock::from_value(process));
         process.lock().unwrap().bind_self_reference(&process);
         let scheduler = Arc::new(StdMutex::new(
             crate::hle::kernel::k_scheduler::KScheduler::new(0),
@@ -1752,7 +2056,7 @@ impl System {
                     // Upstream SingleCoreRunGuestThread: advance simulated
                     // time, then preempt to the next core.
                     let core_timing = self.core_timing_shared();
-                    core_timing.lock().unwrap().advance();
+                    core_timing.advance();
                     self.get_cpu_manager_mut()
                         .preempt_single_core(&core_timing, true);
                     continue;

@@ -13,6 +13,7 @@ use crate::hle::service::ipc_helpers::{RequestParser, ResponseBuilder};
 use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
 
 use super::container::Container;
+use crate::hle::kernel::k_process::ProcessLock;
 
 pub struct IManagerDisplayService {
     container: Arc<Container>,
@@ -133,7 +134,7 @@ impl IManagerDisplayService {
 
     pub fn create_shared_layer_session(
         &self,
-        owner_process: &Arc<std::sync::Mutex<KProcess>>,
+        owner_process: &Arc<ProcessLock>,
         display_id: u64,
         enable_blending: bool,
     ) -> Result<(u64, u64), ResultCode> {
@@ -144,7 +145,7 @@ impl IManagerDisplayService {
         )
     }
 
-    pub fn destroy_shared_layer_session(&self, owner_process: &Arc<std::sync::Mutex<KProcess>>) {
+    pub fn destroy_shared_layer_session(&self, owner_process: &Arc<ProcessLock>) {
         self.container
             .get_shared_buffer_manager()
             .destroy_session(owner_process);

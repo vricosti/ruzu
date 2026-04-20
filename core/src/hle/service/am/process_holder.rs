@@ -10,6 +10,7 @@ use crate::hle::kernel::k_process::KProcess;
 use crate::hle::service::os::multi_wait_holder::MultiWaitHolder;
 
 use super::applet::Applet;
+use crate::hle::kernel::k_process::ProcessLock;
 
 /// Port of ProcessHolder
 ///
@@ -25,7 +26,7 @@ pub struct ProcessHolder {
     applet: Arc<Mutex<Applet>>,
     /// The Process this holder is observing.
     /// Upstream: `Process& m_process`, whose `GetHandle()` returns `KProcess*`.
-    process: Arc<Mutex<KProcess>>,
+    process: Arc<ProcessLock>,
     /// MultiWaitHolder base for synchronization.
     /// Upstream initializes this with `process.GetHandle()`.
     multi_wait_holder: MultiWaitHolder,
@@ -36,7 +37,7 @@ impl ProcessHolder {
     ///
     /// Upstream: `ProcessHolder::ProcessHolder(Applet& applet, Process& process)`
     /// initializes `MultiWaitHolder(process.GetHandle())`.
-    pub fn new(applet: Arc<Mutex<Applet>>, process: Arc<Mutex<KProcess>>) -> Self {
+    pub fn new(applet: Arc<Mutex<Applet>>, process: Arc<ProcessLock>) -> Self {
         Self {
             applet,
             multi_wait_holder: MultiWaitHolder::from_process(process.clone()),
@@ -50,7 +51,7 @@ impl ProcessHolder {
     }
 
     /// Get a reference to the process.
-    pub fn get_process(&self) -> &Arc<Mutex<KProcess>> {
+    pub fn get_process(&self) -> &Arc<ProcessLock> {
         &self.process
     }
 

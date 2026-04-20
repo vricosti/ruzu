@@ -1,25 +1,49 @@
 //! Port of zuyu/src/common/bounded_threadsafe_queue.h
-//! Status: COMPLET
-//! Derniere synchro: 2026-03-05
 
-use std::collections::VecDeque;
+use std::cell::UnsafeCell;
+use std::mem::MaybeUninit;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Condvar, Mutex};
 
 /// Default capacity matching the C++ `detail::DefaultCapacity`.
 pub const DEFAULT_CAPACITY: usize = 0x1000;
 
+/// Cache-line-aligned wrapper mirroring upstream's `alignas(128)` on the
+/// SPSC read/write indices. Prevents false sharing between producer and
+/// consumer cores bouncing the same cache line.
+#[repr(align(128))]
+struct CacheAligned<T>(T);
+
+impl<T> std::ops::Deref for CacheAligned<T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        &self.0
+    }
+}
+
+impl<T> std::ops::DerefMut for CacheAligned<T> {
+    fn deref_mut(&mut self) -> &mut T {
+        &mut self.0
+    }
+}
+
 /// Bounded SPSC queue with blocking operations.
 ///
-/// Mirrors the C++ `Common::SPSCQueue<T, Capacity>` from
-/// `bounded_threadsafe_queue.h`. Uses separate mutexes + condvars for the
-/// producer and consumer sides to minimize contention, matching the C++
-/// design. The capacity is fixed at construction time.
+/// Mirrors the upstream fixed-capacity ring-buffer ownership:
+/// atomic read/write indices plus separate producer/consumer wait objects.
 pub struct BoundedSPSCQueue<T> {
     capacity: usize,
-    data: Mutex<VecDeque<T>>,
+    read_index: CacheAligned<AtomicUsize>,
+    write_index: CacheAligned<AtomicUsize>,
+    data: Box<[UnsafeCell<MaybeUninit<T>>]>,
     producer_cv: Condvar,
+    producer_cv_mutex: Mutex<()>,
     consumer_cv: Condvar,
+    consumer_cv_mutex: Mutex<()>,
 }
+
+unsafe impl<T: Send> Send for BoundedSPSCQueue<T> {}
+unsafe impl<T: Send> Sync for BoundedSPSCQueue<T> {}
 
 impl<T> BoundedSPSCQueue<T> {
     /// Create a new bounded SPSC queue with the given capacity.
@@ -28,11 +52,19 @@ impl<T> BoundedSPSCQueue<T> {
             capacity > 0 && (capacity & (capacity - 1)) == 0,
             "Capacity must be a power of two."
         );
+        let mut data = Vec::with_capacity(capacity);
+        for _ in 0..capacity {
+            data.push(UnsafeCell::new(MaybeUninit::uninit()));
+        }
         Self {
             capacity,
-            data: Mutex::new(VecDeque::with_capacity(capacity)),
+            read_index: CacheAligned(AtomicUsize::new(0)),
+            write_index: CacheAligned(AtomicUsize::new(0)),
+            data: data.into_boxed_slice(),
             producer_cv: Condvar::new(),
+            producer_cv_mutex: Mutex::new(()),
             consumer_cv: Condvar::new(),
+            consumer_cv_mutex: Mutex::new(()),
         }
     }
 
@@ -43,48 +75,51 @@ impl<T> BoundedSPSCQueue<T> {
 
     /// Try to emplace (push) a value. Returns `false` if the queue is full.
     pub fn try_emplace(&self, value: T) -> bool {
-        let mut data = self.data.lock().unwrap();
-        if data.len() >= self.capacity {
+        let write_index = self.write_index.load(Ordering::Relaxed);
+        if (write_index - self.read_index.load(Ordering::Acquire)) == self.capacity {
             return false;
         }
-        data.push_back(value);
-        drop(data);
-        self.consumer_cv.notify_one();
+        self.write_at(write_index, value);
         true
     }
 
     /// Push a value, blocking until space is available.
     pub fn emplace_wait(&self, value: T) {
-        let mut data = self.data.lock().unwrap();
-        while data.len() >= self.capacity {
-            data = self.producer_cv.wait(data).unwrap();
+        let write_index = self.write_index.load(Ordering::Relaxed);
+        if (write_index - self.read_index.load(Ordering::Acquire)) == self.capacity {
+            let lock = self.producer_cv_mutex.lock().unwrap();
+            let _guard = self
+                .producer_cv
+                .wait_while(lock, |_| {
+                    (write_index - self.read_index.load(Ordering::Acquire)) == self.capacity
+                })
+                .unwrap();
         }
-        data.push_back(value);
-        drop(data);
-        self.consumer_cv.notify_one();
+        self.write_at(write_index, value);
     }
 
     /// Try to pop a value. Returns `None` if the queue is empty.
     pub fn try_pop(&self) -> Option<T> {
-        let mut data = self.data.lock().unwrap();
-        let result = data.pop_front();
-        if result.is_some() {
-            drop(data);
-            self.producer_cv.notify_one();
+        let read_index = self.read_index.load(Ordering::Relaxed);
+        if read_index == self.write_index.load(Ordering::Acquire) {
+            return None;
         }
-        result
+        Some(self.read_at(read_index))
     }
 
     /// Pop a value, blocking until one is available.
     pub fn pop_wait(&self) -> T {
-        let mut data = self.data.lock().unwrap();
-        while data.is_empty() {
-            data = self.consumer_cv.wait(data).unwrap();
+        let read_index = self.read_index.load(Ordering::Relaxed);
+        if read_index == self.write_index.load(Ordering::Acquire) {
+            let lock = self.consumer_cv_mutex.lock().unwrap();
+            let _guard = self
+                .consumer_cv
+                .wait_while(lock, |_| {
+                    read_index == self.write_index.load(Ordering::Acquire)
+                })
+                .unwrap();
         }
-        let value = data.pop_front().unwrap();
-        drop(data);
-        self.producer_cv.notify_one();
-        value
+        self.read_at(read_index)
     }
 
     /// Pop a value, blocking until one is available or `should_stop` returns true.
@@ -92,17 +127,58 @@ impl<T> BoundedSPSCQueue<T> {
     where
         F: Fn() -> bool,
     {
-        let mut data = self.data.lock().unwrap();
-        while data.is_empty() {
-            if should_stop() {
+        let read_index = self.read_index.load(Ordering::Relaxed);
+        if read_index == self.write_index.load(Ordering::Acquire) {
+            let lock = self.consumer_cv_mutex.lock().unwrap();
+            let _guard = self
+                .consumer_cv
+                .wait_while(lock, |_| {
+                    !should_stop() && read_index == self.write_index.load(Ordering::Acquire)
+                })
+                .unwrap();
+            if should_stop() && read_index == self.write_index.load(Ordering::Acquire) {
                 return None;
             }
-            data = self.consumer_cv.wait(data).unwrap();
         }
-        let value = data.pop_front().unwrap();
-        drop(data);
+        Some(self.read_at(read_index))
+    }
+
+    /// Wake any producer/consumer waiters.
+    pub fn notify_all(&self) {
+        self.producer_cv.notify_all();
+        self.consumer_cv.notify_all();
+    }
+
+    fn write_at(&self, write_index: usize, value: T) {
+        let pos = write_index % self.capacity;
+        unsafe {
+            (*self.data[pos].get()).write(value);
+        }
+        self.write_index.store(write_index + 1, Ordering::SeqCst);
+        let _lock = self.consumer_cv_mutex.lock().unwrap();
+        self.consumer_cv.notify_one();
+    }
+
+    fn read_at(&self, read_index: usize) -> T {
+        let pos = read_index % self.capacity;
+        let value = unsafe { (*self.data[pos].get()).assume_init_read() };
+        self.read_index.store(read_index + 1, Ordering::SeqCst);
+        let _lock = self.producer_cv_mutex.lock().unwrap();
         self.producer_cv.notify_one();
-        Some(value)
+        value
+    }
+}
+
+impl<T> Drop for BoundedSPSCQueue<T> {
+    fn drop(&mut self) {
+        let read_index = *self.read_index.get_mut();
+        let write_index = *self.write_index.get_mut();
+        for index in read_index..write_index {
+            let pos = index % self.capacity;
+            unsafe {
+                (*self.data[pos].get()).assume_init_drop();
+            }
+        }
     }
 }
 
@@ -149,6 +225,10 @@ impl<T> BoundedMPSCQueue<T> {
         F: Fn() -> bool,
     {
         self.inner.pop_wait_with_stop(should_stop)
+    }
+
+    pub fn notify_all(&self) {
+        self.inner.notify_all();
     }
 }
 
@@ -206,6 +286,7 @@ impl<T> BoundedMPMCQueue<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
 
     #[test]
@@ -215,11 +296,11 @@ mod tests {
         assert!(q.try_emplace(2));
         assert!(q.try_emplace(3));
         assert!(q.try_emplace(4));
-        assert!(!q.try_emplace(5)); // full
+        assert!(!q.try_emplace(5));
 
         assert_eq!(q.try_pop(), Some(1));
         assert_eq!(q.try_pop(), Some(2));
-        assert!(q.try_emplace(5)); // space freed
+        assert!(q.try_emplace(5));
     }
 
     #[test]
@@ -262,5 +343,22 @@ mod tests {
             values.push(v);
         }
         assert_eq!(values.len(), 8);
+    }
+
+    #[test]
+    fn test_pop_wait_with_stop_wakes_after_notify_all() {
+        let q = Arc::new(BoundedMPSCQueue::<u32>::new(4));
+        let stop = Arc::new(AtomicBool::new(false));
+
+        let q2 = q.clone();
+        let stop2 = stop.clone();
+        let handle =
+            std::thread::spawn(move || q2.pop_wait_with_stop(|| stop2.load(Ordering::Relaxed)));
+
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        stop.store(true, Ordering::Relaxed);
+        q.notify_all();
+
+        assert_eq!(handle.join().unwrap(), None);
     }
 }

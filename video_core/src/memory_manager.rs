@@ -1387,6 +1387,7 @@ fn pte_kind_from_u32(raw: u32) -> PteKind {
 pub struct MemoryManager {
     id: usize,
     inner: GpuMemoryManager,
+    guest_memory_writer: Option<std::sync::Arc<dyn Fn(u64, &[u8]) + Send + Sync>>,
 }
 
 impl MemoryManager {
@@ -1411,6 +1412,7 @@ impl MemoryManager {
                 big_page_bits,
                 page_bits,
             ),
+            guest_memory_writer: None,
         }
     }
 
@@ -1468,6 +1470,33 @@ impl MemoryManager {
         write_cpu: &mut dyn FnMut(u64, &[u8]),
     ) {
         self.inner.write_block_cached(gpu_dest, input, write_cpu);
+    }
+
+    pub fn set_guest_memory_writer(
+        &mut self,
+        writer: std::sync::Arc<dyn Fn(u64, &[u8]) + Send + Sync>,
+    ) {
+        self.guest_memory_writer = Some(writer);
+    }
+
+    pub fn write_block_owned(&self, gpu_dest: u64, input: &[u8]) {
+        let Some(writer) = self.guest_memory_writer.as_ref().cloned() else {
+            return;
+        };
+        self.inner
+            .write_block(gpu_dest, input, &mut |cpu_addr, data| {
+                writer(cpu_addr, data)
+            });
+    }
+
+    pub fn write_block_unsafe_owned(&self, gpu_dest: u64, input: &[u8]) {
+        let Some(writer) = self.guest_memory_writer.as_ref().cloned() else {
+            return;
+        };
+        self.inner
+            .write_block_unsafe(gpu_dest, input, &mut |cpu_addr, data| {
+                writer(cpu_addr, data)
+            });
     }
 
     pub fn flush_region(&mut self, gpu_addr: u64, size: u64) {
@@ -1604,10 +1633,8 @@ mod tests {
             _gpu_addr: u64,
             _query_type: u32,
             _flags: crate::query_cache::types::QueryPropertiesFlags,
-            _gpu_ticks: u64,
             _payload: u32,
             _subreport: u32,
-            _gpu_write: Arc<dyn Fn(u64, &[u8]) + Send + Sync>,
         ) {
         }
         fn bind_graphics_uniform_buffer(

@@ -86,6 +86,22 @@ impl IStorage {
                 backend_size
             );
         }
+        if std::env::var_os("RUZU_ISTORAGE_READ_DUMP").is_some() {
+            use std::fmt::Write;
+            let n = data.len().min(64);
+            let mut hex = String::new();
+            for b in &data[..n] {
+                let _ = write!(hex, "{:02x}", b);
+            }
+            log::warn!(
+                "IStorage::Read offset=0x{:X} length={} backend_size={} first{}B={}",
+                offset,
+                length,
+                backend_size,
+                n,
+                hex
+            );
+        }
         ctx.write_buffer(&data, 0);
 
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);

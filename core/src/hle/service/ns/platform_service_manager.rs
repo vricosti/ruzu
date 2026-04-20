@@ -239,7 +239,8 @@ impl IPlatformServiceManager {
 
     fn request_load(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         let mut rp = RequestParser::new(ctx);
-        let _ = rp.pop_u32();
+        let font_id = rp.pop_u32();
+        log::info!("pl:u RequestLoad font_id={}", font_id);
 
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
@@ -247,7 +248,8 @@ impl IPlatformServiceManager {
 
     fn get_load_state(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         let mut rp = RequestParser::new(ctx);
-        let _ = rp.pop_u32();
+        let font_id = rp.pop_u32();
+        log::info!("pl:u GetLoadState font_id={} -> Loaded", font_id);
 
         let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
         rb.push_result(RESULT_SUCCESS);
@@ -258,24 +260,33 @@ impl IPlatformServiceManager {
         let service = Self::as_self(this);
         let mut rp = RequestParser::new(ctx);
         let font_id = rp.pop_u32() as usize;
+        let size = service.get_shared_font_region(font_id).size;
+        log::info!("pl:u GetSize font_id={} -> size=0x{:x}", font_id, size);
 
         let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
         rb.push_result(RESULT_SUCCESS);
-        rb.push_u32(service.get_shared_font_region(font_id).size);
+        rb.push_u32(size);
     }
 
     fn get_shared_memory_address_offset(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         let service = Self::as_self(this);
         let mut rp = RequestParser::new(ctx);
         let font_id = rp.pop_u32() as usize;
+        let offset = service.get_shared_font_region(font_id).offset;
+        log::info!(
+            "pl:u GetSharedMemoryAddressOffset font_id={} -> offset=0x{:x}",
+            font_id,
+            offset
+        );
 
         let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
         rb.push_result(RESULT_SUCCESS);
-        rb.push_u32(service.get_shared_font_region(font_id).offset);
+        rb.push_u32(offset);
     }
 
     fn get_shared_memory_native_handle(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         let service = Self::as_self(this);
+        log::info!("pl:u GetSharedMemoryNativeHandle begin");
         let handle = (|| -> Option<u32> {
             let thread = ctx.get_thread()?;
             let parent = thread.lock().unwrap().parent.as_ref()?.upgrade()?;
@@ -283,15 +294,31 @@ impl IPlatformServiceManager {
             let (object_id, shared_memory) = {
                 let mut cached = service.shared_memory.lock().unwrap();
                 if cached.is_none() {
+                    log::info!("pl:u GetSharedMemoryNativeHandle creating shared memory");
                     *cached = service.create_shared_memory_object(ctx);
+                    if cached.is_none() {
+                        log::error!("pl:u GetSharedMemoryNativeHandle create_shared_memory_object returned None");
+                    }
                 }
                 cached.as_ref()?.clone()
             };
 
             let mut process = parent.lock().unwrap();
             process.register_shared_memory_object(object_id, shared_memory);
-            process.handle_table.add(object_id).ok()
+            let h = process.handle_table.add(object_id).ok();
+            if h.is_none() {
+                log::error!(
+                    "pl:u GetSharedMemoryNativeHandle handle_table.add failed for object_id=0x{:x}",
+                    object_id
+                );
+            }
+            h
         })();
+
+        log::info!(
+            "pl:u GetSharedMemoryNativeHandle -> handle=0x{:x}",
+            handle.unwrap_or(0)
+        );
 
         let mut rb = ResponseBuilder::new(ctx, 2, 1, 0);
         rb.push_result(RESULT_SUCCESS);
@@ -304,7 +331,11 @@ impl IPlatformServiceManager {
     ) {
         let service = Self::as_self(this);
         let mut rp = RequestParser::new(ctx);
-        let _language_code = rp.pop_u64();
+        let language_code = rp.pop_u64();
+        log::info!(
+            "pl:u GetSharedFontInOrderOfPriority language_code=0x{:x}",
+            language_code
+        );
 
         let max_size = service.shared_font_regions.len().min(MAX_ELEMENT_COUNT);
 

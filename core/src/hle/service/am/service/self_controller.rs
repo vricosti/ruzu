@@ -13,6 +13,7 @@ use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
 use crate::hle::service::ipc_helpers::{RequestParser, ResponseBuilder};
 use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
+use crate::hle::kernel::k_process::ProcessLock;
 
 /// IPC command table for ISelfController:
 /// - 0: Exit
@@ -54,7 +55,7 @@ pub struct ISelfController {
     /// Matches upstream `const std::shared_ptr<Applet> m_applet`.
     applet: Arc<Mutex<crate::hle::service::am::applet::Applet>>,
     /// Matches upstream `Kernel::KProcess* m_process`.
-    process: Option<Arc<Mutex<KProcess>>>,
+    process: Option<Arc<ProcessLock>>,
     handlers: BTreeMap<u32, FunctionInfo>,
     handlers_tipc: BTreeMap<u32, FunctionInfo>,
 }
@@ -63,7 +64,7 @@ impl ISelfController {
     pub fn new(
         system: SystemRef,
         applet: Arc<Mutex<crate::hle::service::am::applet::Applet>>,
-        process: Option<Arc<Mutex<KProcess>>>,
+        process: Option<Arc<ProcessLock>>,
     ) -> Self {
         {
             let mut applet_guard = applet.lock().unwrap();

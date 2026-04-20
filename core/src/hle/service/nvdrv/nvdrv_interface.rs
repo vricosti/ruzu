@@ -18,6 +18,7 @@ use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
 use crate::hle::service::ipc_helpers::{RequestParser, ResponseBuilder};
 use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
+use crate::hle::kernel::k_process::ProcessLock;
 
 /// IPC command table for NVDRV:
 /// - 0: Open
@@ -322,7 +323,7 @@ impl NvdrvInterface {
     }
 
     /// Port of NVDRV::Initialize
-    pub fn initialize(&mut self, process: &Arc<Mutex<KProcess>>) -> NvResult {
+    pub fn initialize(&mut self, process: &Arc<ProcessLock>) -> NvResult {
         log::warn!("(STUBBED) Initialize called");
         if Self::should_trace_lifecycle() {
             let process_id = process.lock().unwrap().process_id;
@@ -404,7 +405,7 @@ impl NvdrvInterface {
         &self,
         fd: DeviceFD,
         event_id: u32,
-        process: Arc<Mutex<KProcess>>,
+        process: Arc<ProcessLock>,
         scheduler: Arc<Mutex<KScheduler>>,
     ) {
         self.nvdrv
@@ -789,7 +790,7 @@ impl NvdrvService {
     fn resolve_process_from_handle(
         ctx: &HLERequestContext,
         process_handle: u32,
-    ) -> Option<Arc<Mutex<KProcess>>> {
+    ) -> Option<Arc<ProcessLock>> {
         let thread = ctx.get_thread()?;
         let parent = {
             let thread_guard = thread.lock().unwrap();

@@ -151,9 +151,7 @@ fn watch_write(cb: &DynarmicCallbacks32, vaddr: u64, size: u64, value: u128) {
         }
     }
     let pc_ptr = cb.jit_pc_ptr;
-    let pc = pc_ptr
-        .map(|p| unsafe { p.read_volatile() })
-        .unwrap_or(0);
+    let pc = pc_ptr.map(|p| unsafe { p.read_volatile() }).unwrap_or(0);
     if let Some((pc_lo, pc_hi)) = pc_range {
         let pc_u64 = pc as u64;
         if pc_u64 < pc_lo || pc_u64 >= pc_hi {

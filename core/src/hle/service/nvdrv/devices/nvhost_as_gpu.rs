@@ -840,7 +840,8 @@ impl NvHostAsGpu {
         // 0 when start * page_size exceeds u32). Performing the math in u64
         // and returning the "correct" value breaks the game's branch.
         params.regions[0] = VaRegion {
-            offset: (small_page_allocator.get_va_start()
+            offset: (small_page_allocator
+                .get_va_start()
                 .wrapping_shl(VM::PAGE_SIZE_BITS)) as u64,
             page_size: VM::YUZU_PAGESIZE,
             _pad0: 0,
@@ -848,7 +849,8 @@ impl NvHostAsGpu {
                 as u64,
         };
         params.regions[1] = VaRegion {
-            offset: (big_page_allocator.get_va_start()
+            offset: (big_page_allocator
+                .get_va_start()
                 .wrapping_shl(vm.big_page_size_bits)) as u64,
             page_size: vm.big_page_size,
             _pad0: 0,

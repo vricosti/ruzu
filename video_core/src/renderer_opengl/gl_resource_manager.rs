@@ -74,6 +74,50 @@ impl Drop for OGLBuffer {
     }
 }
 
+/// RAII wrapper for an OpenGL sync object.
+pub struct OGLSync {
+    pub handle: gl::types::GLsync,
+}
+
+impl OGLSync {
+    pub fn new() -> Self {
+        Self {
+            handle: std::ptr::null(),
+        }
+    }
+
+    pub fn create(&mut self) {
+        if !self.handle.is_null() {
+            return;
+        }
+        unsafe {
+            self.handle = gl::FenceSync(gl::SYNC_GPU_COMMANDS_COMPLETE, 0);
+        }
+    }
+
+    pub fn release(&mut self) {
+        if self.handle.is_null() {
+            return;
+        }
+        unsafe {
+            gl::DeleteSync(self.handle);
+        }
+        self.handle = std::ptr::null();
+    }
+
+    pub fn is_signaled(&self) -> bool {
+        let sync_status = unsafe { gl::ClientWaitSync(self.handle, 0, 0) };
+        assert_ne!(sync_status, gl::WAIT_FAILED);
+        sync_status != gl::TIMEOUT_EXPIRED
+    }
+}
+
+impl Drop for OGLSync {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
 /// RAII wrapper for an OpenGL framebuffer object.
 pub struct OGLFramebuffer {
     pub handle: gl::types::GLuint,

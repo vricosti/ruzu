@@ -25,8 +25,8 @@ pub fn loop_process(system: crate::core::SystemRef) {
 
     server_manager.register_named_service(
         "audin:u",
-        Box::new(|| -> SessionRequestHandlerPtr {
-            std::sync::Arc::new(super::audio_in_manager::IAudioInManager::new())
+        Box::new(move || -> SessionRequestHandlerPtr {
+            std::sync::Arc::new(super::audio_in_manager::IAudioInManager::new(system))
         }),
         16,
     );

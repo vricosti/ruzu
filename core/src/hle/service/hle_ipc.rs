@@ -53,6 +53,7 @@ impl KAutoObjectRef {
 }
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 use crate::hle::service::sm::sm::ServiceManager;
+use crate::hle::kernel::k_process::ProcessLock;
 
 /// Handle type alias matching upstream `Kernel::Handle`.
 pub type Handle = u32;
@@ -366,10 +367,6 @@ pub fn complete_sync_request(
             });
             let mut rb = super::ipc_helpers::ResponseBuilder::new(context, 2, 0, 0);
             rb.push_result(RESULT_SUCCESS);
-            // These branches bypass ServiceFrameworkBase::handle_sync_request_impl, so
-            // the buffer write-back must happen explicitly here. Matches upstream behavior
-            // where these paths eventually flow through SendReplyHLE which copies cmd_buf.
-            context.write_to_outgoing_command_buffer();
             RESULT_SUCCESS
         }
         PreparedSyncRequest::StubSuccess => {
@@ -841,7 +838,7 @@ impl HLERequestContext {
 
     pub fn owner_process_arc(
         &self,
-    ) -> Option<Arc<std::sync::Mutex<crate::hle::kernel::k_process::KProcess>>> {
+    ) -> Option<Arc<crate::hle::kernel::k_process::ProcessLock>> {
         let thread = self.thread.as_ref()?;
         let thread_guard = thread.lock().unwrap();
         thread_guard.parent.as_ref()?.upgrade()
@@ -1510,7 +1507,7 @@ mod tests {
 
     #[test]
     fn test_send_current_pid_uses_requesting_thread_process_id() {
-        let process = Arc::new(Mutex::new(KProcess::new()));
+        let process = Arc::new(ProcessLock::from_value(KProcess::new()));
         process.lock().unwrap().process_id = 0x51;
 
         let thread = Arc::new(Mutex::new(KThread::new()));
@@ -1542,7 +1539,7 @@ mod tests {
             )
         }));
 
-        let process = Arc::new(Mutex::new(KProcess::new()));
+        let process = Arc::new(ProcessLock::from_value(KProcess::new()));
         process
             .lock()
             .unwrap()
@@ -1570,7 +1567,7 @@ mod tests {
             )
         }));
 
-        let process = Arc::new(Mutex::new(KProcess::new()));
+        let process = Arc::new(ProcessLock::from_value(KProcess::new()));
         process
             .lock()
             .unwrap()
@@ -1599,7 +1596,7 @@ mod tests {
             )
         }));
 
-        let process = Arc::new(Mutex::new(KProcess::new()));
+        let process = Arc::new(ProcessLock::from_value(KProcess::new()));
         process
             .lock()
             .unwrap()
@@ -1661,5 +1658,87 @@ mod tests {
         assert_eq!(ctx.buffer_descriptor_c()[1].size(), 0x40);
         assert_eq!(ctx.buffer_descriptor_c()[2].address(), 0x0007_5555_6666);
         assert_eq!(ctx.buffer_descriptor_c()[2].size(), 0x50);
+    }
+
+    struct DummyHandler;
+
+    impl SessionRequestHandler for DummyHandler {
+        fn handle_sync_request(&self, _context: &mut HLERequestContext) -> ResultCode {
+            RESULT_SUCCESS
+        }
+
+        fn service_name(&self) -> &str {
+            "DummyHandler"
+        }
+    }
+
+    #[test]
+    fn close_virtual_handle_does_not_write_back_tls() {
+        let device_memory = Box::new(DeviceMemory::new());
+        let buffer_ptr = &device_memory.buffer as *const common::host_memory::HostMemory;
+        let memory = Arc::new(Mutex::new(unsafe {
+            Memory::new(
+                SystemRef::null(),
+                device_memory.as_ref() as *const _,
+                buffer_ptr,
+            )
+        }));
+
+        let process = Arc::new(ProcessLock::from_value(KProcess::new()));
+        process
+            .lock()
+            .unwrap()
+            .page_table
+            .set_memory(memory.clone());
+
+        let thread = Arc::new(Mutex::new(KThread::new()));
+        thread.lock().unwrap().parent = Some(Arc::downgrade(&process));
+
+        let tls_address = 0x3000u64;
+        let request_words = [
+            0x0000_0004u32,
+            0x0000_0008,
+            0,
+            0,
+            0x0000_0002,
+            0x0000_0002,
+            0,
+            0,
+            0x4f43_4653,
+            0,
+            0x0007_d402,
+            0,
+            0,
+            0,
+            0,
+            0,
+        ];
+        {
+            let mem = memory.lock().unwrap();
+            for (i, word) in request_words.iter().copied().enumerate() {
+                mem.write_32(tls_address + (i as u64 * 4), word);
+            }
+        }
+
+        let manager = Arc::new(Mutex::new(SessionRequestManager::new()));
+        {
+            let mut guard = manager.lock().unwrap();
+            guard.set_session_handler(Arc::new(DummyHandler));
+            guard.convert_to_domain();
+            guard.append_domain_handler(Arc::new(DummyHandler));
+            guard.append_domain_handler(Arc::new(DummyHandler));
+        }
+
+        let mut ctx = HLERequestContext::new_with_thread(thread, tls_address);
+        ctx.set_session_request_manager(manager.clone());
+        ctx.populate_from_incoming_command_buffer(&request_words);
+
+        assert_eq!(complete_sync_request(&manager, &mut ctx), RESULT_SUCCESS);
+
+        let mem = memory.lock().unwrap();
+        for (i, word) in request_words.iter().copied().enumerate() {
+            assert_eq!(mem.read_32(tls_address + (i as u64 * 4)), word);
+        }
+        assert!(manager.lock().unwrap().domain_handler(1).is_none());
     }
 }

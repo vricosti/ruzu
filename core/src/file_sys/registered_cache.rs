@@ -862,6 +862,11 @@ impl ContentProviderUnion {
     pub fn clear_slot(&mut self, slot: ContentProviderUnionSlot) {
         self.providers.remove(&slot);
     }
+
+    #[cfg(test)]
+    pub fn has_slot(&self, slot: ContentProviderUnionSlot) -> bool {
+        self.providers.contains_key(&slot)
+    }
 }
 
 impl ContentProvider for ContentProviderUnion {

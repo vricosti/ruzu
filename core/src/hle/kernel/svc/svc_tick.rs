@@ -13,5 +13,5 @@ pub fn get_system_tick(system: &System) -> i64 {
     log::trace!("svc::GetSystemTick called");
 
     // Upstream: return static_cast<int64_t>(system.CoreTiming().GetClockTicks());
-    system.core_timing().lock().unwrap().get_clock_ticks() as i64
+    system.core_timing().get_clock_ticks() as i64
 }

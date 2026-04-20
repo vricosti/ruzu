@@ -13,6 +13,8 @@ use std::thread::JoinHandle;
 
 use crate::control::scheduler::Scheduler;
 use crate::dma_pusher::CommandList;
+use common::bounded_threadsafe_queue::BoundedMPSCQueue;
+use common::thread::{set_current_thread_name, set_current_thread_priority, ThreadPriority};
 use ruzu_core::core::SystemRef;
 
 /// Device address type.
@@ -84,13 +86,10 @@ impl Default for CommandDataContainer {
 
 /// Synchronization state for the GPU thread.
 ///
-/// Upstream uses `Common::MPSCQueue<CommandDataContainer>` (bounded SPSC + mutex).
-/// We use `Mutex<VecDeque>` + Condvar for equivalent blocking semantics.
+/// Upstream uses `Common::MPSCQueue<CommandDataContainer>`.
 pub struct SynchState {
     pub write_lock: Mutex<()>,
-    pub queue: Mutex<std::collections::VecDeque<CommandDataContainer>>,
-    /// Condvar to wake the GPU thread when a command is enqueued.
-    pub queue_cv: Condvar,
+    pub queue: BoundedMPSCQueue<CommandDataContainer>,
     pub last_fence: AtomicU64,
     pub signaled_fence: AtomicU64,
     /// Condvar to notify callers that a blocking command has completed.
@@ -101,8 +100,7 @@ impl SynchState {
     pub fn new() -> Self {
         Self {
             write_lock: Mutex::new(()),
-            queue: Mutex::new(std::collections::VecDeque::new()),
-            queue_cv: Condvar::new(),
+            queue: BoundedMPSCQueue::with_default_capacity(),
             last_fence: AtomicU64::new(0),
             signaled_fence: AtomicU64::new(0),
             cv: Condvar::new(),
@@ -112,24 +110,18 @@ impl SynchState {
     /// Pop a command from the queue, blocking until one is available or stop is requested.
     /// Matches upstream `state.queue.PopWait(next, stop_token)`.
     pub fn pop_wait(&self, stop: &AtomicBool) -> Option<CommandDataContainer> {
-        let mut queue = self.queue.lock().unwrap();
-        loop {
-            if stop.load(Ordering::Relaxed) {
-                return None;
-            }
-            if let Some(cmd) = queue.pop_front() {
-                return Some(cmd);
-            }
-            queue = self.queue_cv.wait(queue).unwrap();
-        }
+        self.queue
+            .pop_wait_with_stop(|| stop.load(Ordering::Relaxed))
     }
 
     /// Push a command to the queue and wake the consumer.
     /// Matches upstream `state.queue.EmplaceWait(...)`.
     pub fn emplace(&self, cmd: CommandDataContainer) {
-        let mut queue = self.queue.lock().unwrap();
-        queue.push_back(cmd);
-        self.queue_cv.notify_one();
+        self.queue.emplace_wait(cmd);
+    }
+
+    pub fn notify_all(&self) {
+        self.queue.notify_all();
     }
 }
 
@@ -221,7 +213,8 @@ impl ThreadManager {
         let handle = std::thread::Builder::new()
             .name("GPU".to_string())
             .spawn(move || {
-                log::info!("GPU thread started");
+                set_current_thread_name("GPU");
+                set_current_thread_priority(ThreadPriority::Critical);
                 system.get().kernel().unwrap().register_host_thread();
                 let gpu_ref = unsafe { &*(gpu as *const crate::gpu::Gpu) };
                 let scheduler_ref = unsafe { &*(sched as *const Scheduler) };
@@ -242,7 +235,6 @@ impl ThreadManager {
                         unsafe { std::mem::transmute(ctx_raw) };
                     unsafe { &mut *context }.done_current();
                 }
-                log::info!("GPU thread exiting");
             })
             .expect("Failed to spawn GPU thread");
 
@@ -352,8 +344,7 @@ impl ThreadManager {
     /// Request the GPU thread to stop.
     pub fn request_stop(&self) {
         self.stop.store(true, Ordering::Relaxed);
-        // Wake the thread if it's waiting on the queue
-        self.state.queue_cv.notify_all();
+        self.state.notify_all();
     }
 }
 
@@ -417,7 +408,7 @@ fn run_thread(
         }
 
         // Signal fence completion.
-        state.signaled_fence.store(next.fence, Ordering::Release);
+        state.signaled_fence.store(next.fence, Ordering::SeqCst);
         if next.block {
             let _lock = state.write_lock.lock().unwrap();
             state.cv.notify_all();

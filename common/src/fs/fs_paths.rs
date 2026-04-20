@@ -6,6 +6,7 @@
 
 // ruzu data directories
 pub const RUZU_DIR: &str = "ruzu";
+pub const LEGACY_YUZU_DIR: &str = "yuzu";
 pub const PORTABLE_DIR: &str = "user";
 
 // Sub-directories contained within a ruzu data directory

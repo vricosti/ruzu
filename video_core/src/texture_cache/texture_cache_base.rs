@@ -17,6 +17,8 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 
+use parking_lot::ReentrantMutex;
+
 use common::slot_vector::SlotVector;
 
 use super::descriptor_table::DescriptorTable;
@@ -217,7 +219,7 @@ pub struct TextureCacheBase {
     pub unswizzle_data_buffer: Vec<u8>,
 
     // Mutex
-    pub mutex: std::sync::Mutex<()>,
+    pub mutex: ReentrantMutex<()>,
 }
 
 impl TextureCacheBase {
@@ -256,7 +258,7 @@ impl TextureCacheBase {
             image_allocs_table: HashMap::new(),
             swizzle_data_buffer: vec![0u8; 8 * 1024 * 1024], // 8 MiB
             unswizzle_data_buffer: vec![0u8; 1 * 1024 * 1024], // 1 MiB
-            mutex: std::sync::Mutex::new(()),
+            mutex: ReentrantMutex::new(()),
         }
     }
 
@@ -379,5 +381,17 @@ impl TextureCacheBase {
             func(page);
             page += 1;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::TextureCacheBase;
+
+    #[test]
+    fn texture_cache_mutex_is_reentrant() {
+        let cache = TextureCacheBase::new();
+        let _lock_a = cache.mutex.lock();
+        let _lock_b = cache.mutex.lock();
     }
 }

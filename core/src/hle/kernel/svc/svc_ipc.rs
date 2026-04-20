@@ -16,8 +16,10 @@ use crate::hle::kernel::k_synchronization_object;
 use crate::hle::kernel::svc::svc_results::*;
 use crate::hle::kernel::svc::svc_types::*;
 use crate::hle::kernel::svc_common::{Handle, INVALID_HANDLE};
+use crate::hle::kernel::trace_format;
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 use crate::hle::service::hle_ipc::{complete_sync_request, HLERequestContext};
+use super::super::k_process::ProcessLock;
 
 fn should_trace_reply_receive_debug() -> bool {
     std::env::var_os("RUZU_TRACE_REPLY_RECV").is_some()
@@ -46,11 +48,106 @@ fn should_trace_sync_handle(session_handle: Handle) -> bool {
         .is_some_and(|target| target == session_handle)
 }
 
+fn format_ipc_trace_words(system: &System, message_address: u64, words: usize) -> Option<String> {
+    if message_address == 0 || words == 0 {
+        return None;
+    }
+
+    let memory = {
+        let thread = system.current_thread()?;
+        let parent = {
+            let thread_guard = thread.lock().unwrap();
+            thread_guard.parent.as_ref()?.clone()
+        }
+        .upgrade()?;
+        let process = parent.lock().unwrap();
+        process.page_table.get_base().m_memory.clone()?
+    };
+    let mem = memory.lock().unwrap();
+    let mut formatted = String::with_capacity(words * 9);
+    for i in 0..words {
+        let word = mem.read_32(message_address + (i as u64 * 4));
+        use std::fmt::Write;
+        let _ = write!(formatted, "{:08x} ", word.swap_bytes());
+    }
+    Some(formatted.trim_end().to_string())
+}
+
+fn format_ipc_trace_slice(words: &[u32]) -> Option<String> {
+    if words.is_empty() {
+        return None;
+    }
+
+    let mut formatted = String::with_capacity(words.len() * 9);
+    for word in words {
+        use std::fmt::Write;
+        let _ = write!(formatted, "{:08x} ", word.swap_bytes());
+    }
+    Some(formatted.trim_end().to_string())
+}
+
+fn trace_ipc_buffer(system: &System, label: &str, message_address: u64) {
+    if !trace_format::is_svc_trace_enabled() {
+        return;
+    }
+
+    let Some(payload) = format_ipc_trace_words(system, message_address, 16) else {
+        return;
+    };
+    eprintln!(
+        "[{:>10.6}] {} [0x{:x}]: {}",
+        trace_format::elapsed_secs(),
+        label,
+        message_address,
+        payload
+    );
+}
+
+/// TLS_RSP_BUF: response bytes as staged in the HLERequestContext command buffer
+/// *before* guest-memory writeback. Useful for inspecting what a handler intended
+/// to send regardless of partial-writeback behavior.
+fn trace_ipc_response_buffer(context: &HLERequestContext, message_address: u64) {
+    if !trace_format::is_svc_trace_enabled() {
+        return;
+    }
+
+    let words = &context.command_buffer()[..16];
+    let Some(payload) = format_ipc_trace_slice(words) else {
+        return;
+    };
+    eprintln!(
+        "[{:>10.6}] TLS_RSP_BUF [0x{:x}]: {}",
+        trace_format::elapsed_secs(),
+        message_address,
+        payload
+    );
+}
+
+/// TLS_RSP_TLS: response bytes as observed in guest TLS *after* writeback. This
+/// matches what the client thread will actually read back from its message
+/// buffer and is what zuyu's single-label `TLS_RSP` trace captures.
+fn trace_ipc_response_tls(system: &System, message_address: u64) {
+    if !trace_format::is_svc_trace_enabled() {
+        return;
+    }
+
+    let Some(payload) = format_ipc_trace_words(system, message_address, 16) else {
+        return;
+    };
+    eprintln!(
+        "[{:>10.6}] TLS_RSP_TLS [0x{:x}]: {}",
+        trace_format::elapsed_secs(),
+        message_address,
+        payload
+    );
+}
+
 fn send_sync_request_impl(
     system: &System,
     session_handle: Handle,
     message_address: u64,
 ) -> ResultCode {
+    trace_ipc_buffer(system, "TLS_REQ", message_address);
     let trace_sync = should_trace_sync_handle(session_handle);
     let (client_session, session_object_id) = {
         let process = system.current_process_arc().lock().unwrap();
@@ -179,7 +276,15 @@ fn send_sync_request_impl(
             result.get_inner_value()
         );
     }
-    context.write_to_outgoing_command_buffer();
+    // Write-back is performed inside ServiceFrameworkBase::handle_sync_request_impl,
+    // matching upstream where only service.cpp:148 calls WriteToOutgoingCommandBuffer.
+    // The remaining Rust-only explicit write-back is the `StubSuccess` fallback in
+    // `complete_sync_request`.
+    //
+    // Emit both response views so `scripts/svc_diff.py` can pick whichever one
+    // lines up with the zuyu reference trace for a given investigation pass.
+    trace_ipc_response_buffer(&context, message_address);
+    trace_ipc_response_tls(system, message_address);
 
     if let Some(parent_session) = system
         .current_process_arc()
@@ -252,7 +357,7 @@ mod tests {
         process.initialize_handle_table();
         process.allocate_code_memory(0x200000, 0x60000);
 
-        let process = Arc::new(Mutex::new(process));
+        let process = Arc::new(ProcessLock::from_value(process));
         let current_thread = Arc::new(Mutex::new(KThread::new()));
         {
             let mut thread = current_thread.lock().unwrap();
@@ -350,6 +455,22 @@ mod tests {
         mem.write_32(base + 0x14, 0);
         mem.write_32(base + 0x18, 3);
         mem.write_32(base + 0x1C, 0);
+    }
+
+    #[test]
+    fn format_ipc_trace_words_matches_zuyu_grouping() {
+        let system = test_system();
+        let tls_base = get_tls_base(&system);
+        {
+            let mut mem = system.shared_process_memory().write().unwrap();
+            mem.write_32(tls_base, 0x0111_0004);
+            mem.write_32(tls_base + 4, 0x0000_0c0b);
+            mem.write_32(tls_base + 8, 0x4000_a078);
+            mem.write_32(tls_base + 12, 0);
+        }
+
+        let formatted = format_ipc_trace_words(&system, tls_base, 4).unwrap();
+        assert_eq!(formatted, "04001101 0b0c0000 78a00040 00000000");
     }
 
     #[test]

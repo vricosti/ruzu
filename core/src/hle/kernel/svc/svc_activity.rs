@@ -9,6 +9,7 @@ use crate::hle::kernel::svc::svc_results::*;
 use crate::hle::kernel::svc::svc_types::*;
 use crate::hle::kernel::svc_common::Handle;
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
+use super::super::k_process::ProcessLock;
 
 /// Sets the thread activity.
 ///
@@ -89,7 +90,7 @@ mod tests {
         process.initialize_handle_table();
         process.initialize_thread_local_region_base(0x240000);
 
-        let process = Arc::new(Mutex::new(process));
+        let process = Arc::new(ProcessLock::from_value(process));
         let current_thread = Arc::new(Mutex::new(KThread::new()));
         let scheduler = Arc::new(Mutex::new(
             crate::hle::kernel::k_scheduler::KScheduler::new(0),
