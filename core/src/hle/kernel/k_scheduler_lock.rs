@@ -14,6 +14,49 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::k_spin_lock::KAlignedSpinLock;
 
+/// Counter for synthetic host-thread IDs. Reserved range: `>= 2^63` so it
+/// never collides with guest KThread IDs (those are allocated starting at
+/// small positive values by the kernel thread-id allocator).
+static NEXT_HOST_SCHED_ID: AtomicU64 = AtomicU64::new(1u64 << 63);
+
+std::thread_local! {
+    /// Per-OS-thread synthetic scheduler ID, allocated lazily on first
+    /// `current_sched_thread_id()` call from a host thread. Stays stable
+    /// for the thread's lifetime.
+    static HOST_SCHED_ID: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Returns a unique thread identifier for scheduler-lock ownership.
+///
+/// On guest (emu) threads: returns the guest KThread ID via the
+/// `get_current_thread_id_fast` thread-local cache (matching upstream's
+/// `KThread*` comparison).
+///
+/// On host threads (audio HLE, SDL, CoreTiming, event-signal callers,
+/// etc.): returns a synthetic ID from a reserved `>= 2^63` range,
+/// allocated lazily per OS thread. Each host thread gets a unique ID so
+/// `is_locked_by_current_thread()` works correctly for them too.
+///
+/// This fixes a classic false positive where multiple host threads all
+/// landed in the same fallback branch (`m_lock_count > 0`) and each
+/// incorrectly believed it owned the scheduler lock, bypassing the
+/// spin-lock acquire and racing on the owner's state.
+fn current_sched_thread_id() -> u64 {
+    if let Some(id) = super::kernel::get_current_thread_id_fast() {
+        return id;
+    }
+    HOST_SCHED_ID.with(|cell| {
+        let existing = cell.get();
+        if existing != 0 {
+            existing
+        } else {
+            let id = NEXT_HOST_SCHED_ID.fetch_add(1, Ordering::Relaxed);
+            cell.set(id);
+            id
+        }
+    })
+}
+
 /// Callbacks matching upstream SchedulerType template parameter static methods.
 /// Set during initialization to break the KScheduler <-> GlobalSchedulerContext cycle.
 pub struct SchedulerCallbacks {
@@ -135,23 +178,18 @@ impl KAbstractSchedulerLock {
     }
 
     /// Check if the lock is held by the current thread.
-    /// Upstream: compares m_owner_thread with GetCurrentThreadPointer(m_kernel).
-    /// Uses the thread-local current thread's ID to compare against the stored owner.
+    /// Upstream: compares `m_owner_thread` with `GetCurrentThreadPointer(m_kernel)`.
+    ///
+    /// Ruzu uses the guest KThread ID for guest threads and a synthetic ID
+    /// for host threads (see `current_sched_thread_id()`). Both are
+    /// compared against the atomic `m_owner_thread` — never reads
+    /// `m_lock_count` (which is `Cell<i32>` and only safe on the owner).
     pub fn is_locked_by_current_thread(&self) -> bool {
         let owner = self.m_owner_thread.load(Ordering::Relaxed);
         if owner == 0 {
             return false;
         }
-        // Compare against the thread-local current thread id cache.
-        // Upstream compares a thread-local KThread* directly and does not
-        // relock the current thread object here.
-        if let Some(current_id) = super::kernel::get_current_thread_id_fast() {
-            owner == current_id
-        } else if let Some(current_thread) = super::kernel::get_current_emu_thread() {
-            owner == current_thread.lock().unwrap().get_thread_id()
-        } else {
-            self.m_lock_count.get() > 0
-        }
+        owner == current_sched_thread_id()
     }
 
     /// Lock the scheduler lock.
@@ -185,15 +223,11 @@ impl KAbstractSchedulerLock {
             debug_assert!(self.m_lock_count.get() == 0);
             debug_assert!(self.m_owner_thread.load(Ordering::Relaxed) == 0);
 
-            // Upstream: m_owner_thread = GetCurrentThreadPointer(m_kernel)
-            // Store the current thread's ID as owner marker.
-            let owner_id = super::kernel::get_current_thread_id_fast()
-                .or_else(|| {
-                    super::kernel::get_current_emu_thread()
-                        .map(|thread| thread.lock().unwrap().get_thread_id())
-                })
-                .unwrap_or(1);
-            self.m_owner_thread.store(owner_id, Ordering::Relaxed);
+            // Upstream: m_owner_thread = GetCurrentThreadPointer(m_kernel).
+            // Use `current_sched_thread_id()` — returns the guest tid or a
+            // unique per-OS-thread synthetic ID for host threads.
+            self.m_owner_thread
+                .store(current_sched_thread_id(), Ordering::Relaxed);
         }
 
         self.m_lock_count.set(self.m_lock_count.get() + 1);
