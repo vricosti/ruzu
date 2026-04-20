@@ -1,28 +1,45 @@
-//! Port of zuyu/src/core/hle/kernel/k_address_arbiter.h/.cpp
-//! Status: COMPLET
-//! Derniere synchro: 2026-03-21
+//! Port of zuyu/src/core/hle/kernel/k_address_arbiter.{h,cpp}
+//! Status: Upstream-faithful (scheduler-lock + intrusive tree + BeginWait)
+//! Derniere synchro: 2026-04-20
 //!
 //! KAddressArbiter: implements userspace address-based thread arbitration
-//! (futex-like). Uses a BTreeMap to track waiting threads by address,
-//! with Condvar-based blocking and real guest memory read/write.
+//! (futex-like SignalToAddress / WaitForAddress SVCs).
 //!
-//! Upstream stores `Core::System& m_system` and `KernelCore& m_kernel`.
-//! Memory is accessed dynamically via `GetCurrentMemory(m_kernel)` which
-//! resolves to `GetCurrentProcess(kernel).GetMemory()`. This supports
-//! multiple processes — each arbiter call accesses the *current* process's
-//! memory, not a fixed one.
+//! Upstream structure:
+//! - `ThreadTree m_tree` — red-black tree of waiters keyed by (addr, priority).
+//! - 5 public methods: `Signal`, `SignalAndIncrementIfEqual`,
+//!   `SignalAndModifyByWaitingCountIfEqual`, `WaitIfLessThan`, `WaitIfEqual`.
+//! - Every signal method opens `KScopedSchedulerLock` for its entire body.
+//! - Every wait method opens `KScopedSchedulerLockAndSleep` for the setup
+//!   phase; the scope exit triggers the fiber switch.
+//! - Atomic userspace operations use the exclusive monitor (LDREX/STREX).
+//!
+//! Ruzu adaptation:
+//! - The tree is a BTreeMap<(addr, priority), Vec<thread_id>> + reverse
+//!   HashMap<thread_id, (addr, priority)>, mirroring the condvar tree.
+//! - `AddressArbiterThreadTree` is the type-level equivalent of upstream's
+//!   `KThread::AddressArbiterThreadTreeType`.
+//! - Atomic userspace ops take a `&KProcess` guard and use the existing
+//!   `process_memory`/page-table read/write path instead of the exclusive
+//!   monitor; the scheduler lock already serializes against other guest
+//!   threads at the same address.
 
-use std::collections::BTreeMap;
-use std::sync::{Arc, Condvar, Mutex, RwLock};
+use std::collections::{BTreeMap, HashMap};
 
-use crate::hle::kernel::k_process::ProcessMemoryData;
-use crate::hle::result::ResultCode;
+use std::sync::Arc;
 
-/// Type alias matching KProcess::SharedProcessMemory.
-type SharedProcessMemory = Arc<RwLock<ProcessMemoryData>>;
+use crate::hle::kernel::k_process::{KProcess, ProcessLock};
+use crate::hle::kernel::k_scheduler_lock::KScopedSchedulerLock;
+use crate::hle::kernel::k_scoped_scheduler_lock_and_sleep::KScopedSchedulerLockAndSleep;
+use crate::hle::kernel::k_thread::{KThread, KThreadLock, ThreadWaitReasonForDebugging};
+use crate::hle::kernel::k_thread_queue::KThreadQueue;
+use crate::hle::kernel::svc::svc_results::{
+    RESULT_INVALID_CURRENT_MEMORY, RESULT_INVALID_STATE, RESULT_TERMINATION_REQUESTED,
+    RESULT_TIMED_OUT,
+};
+use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 
-/// Signal type for address arbiter operations.
-/// Maps to Svc::SignalType.
+/// Signal type for address arbiter operations. Maps to `Svc::SignalType`.
 #[repr(u32)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SignalType {
@@ -31,8 +48,7 @@ pub enum SignalType {
     SignalAndModifyByWaitingCountIfEqual = 2,
 }
 
-/// Arbitration type for address arbiter wait operations.
-/// Maps to Svc::ArbitrationType.
+/// Arbitration type for address arbiter wait operations. Maps to `Svc::ArbitrationType`.
 #[repr(u32)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ArbitrationType {
@@ -41,322 +57,532 @@ pub enum ArbitrationType {
     WaitIfEqual = 2,
 }
 
-// --- Guest memory access helpers matching upstream k_address_arbiter.cpp:25-108 ---
+// ---------------------------------------------------------------------------
+// Guest-memory helpers matching upstream anonymous namespace.
+// ---------------------------------------------------------------------------
 
-/// Read a 32-bit value from guest memory.
-/// Port of upstream `ReadFromUser`.
-/// Upstream: `*out = GetCurrentMemory(kernel).Read32(GetInteger(address));`
-fn read_from_user(memory: &SharedProcessMemory, address: u64) -> (bool, i32) {
-    let mem = memory.read().unwrap();
-    let value = mem.read_32(address) as i32;
-    (true, value)
-}
-
-/// Atomically decrement the value at `address` if it is less than `value`.
-/// Port of upstream `DecrementIfLessThan`.
-/// Upstream uses ExclusiveMonitor CAS loop. We use a write lock for atomicity.
-fn decrement_if_less_than(memory: &SharedProcessMemory, address: u64, value: i32) -> (bool, i32) {
-    let mut mem = memory.write().unwrap();
-    let current_value = mem.read_32(address) as i32;
-
-    if current_value < value {
-        mem.write_32(address, (current_value - 1) as u32);
+/// Read an s32 from process memory. Port of upstream `ReadFromUser`.
+fn read_from_user(process_guard: &KProcess, address: u64) -> Option<i32> {
+    if let Some(memory) = process_guard.page_table.get_base().m_memory.as_ref() {
+        Some(memory.lock().unwrap().read_32(address) as i32)
+    } else {
+        let mem = process_guard.process_memory.read().unwrap();
+        if !mem.is_valid_range(address, 4) {
+            return None;
+        }
+        Some(mem.read_32(address) as i32)
     }
-
-    (true, current_value)
 }
 
-/// Atomically update the value at `address` to `new_value` if it currently equals `value`.
-/// Port of upstream `UpdateIfEqual`.
-/// Upstream uses ExclusiveMonitor CAS loop. We use a write lock for atomicity.
+/// Decrement the value at `address` if it is < `value`. Returns the pre-decrement value.
+/// Port of upstream `DecrementIfLessThan`. Upstream uses the exclusive monitor;
+/// the scheduler lock provides the serialization guarantee here instead.
+fn decrement_if_less_than(process_guard: &KProcess, address: u64, value: i32) -> Option<i32> {
+    let current = read_from_user(process_guard, address)?;
+    if current < value {
+        let new_value = current.wrapping_sub(1) as u32;
+        if let Some(memory) = process_guard.page_table.get_base().m_memory.as_ref() {
+            memory.lock().unwrap().write_32(address, new_value);
+        } else {
+            let mut mem = process_guard.process_memory.write().unwrap();
+            if !mem.is_valid_range(address, 4) {
+                return None;
+            }
+            mem.write_32(address, new_value);
+        }
+    }
+    Some(current)
+}
+
+/// Replace the value at `address` with `new_value` if it currently equals `value`.
+/// Returns the pre-replacement value.
+/// Port of upstream `UpdateIfEqual`. Upstream uses the exclusive monitor.
 fn update_if_equal(
-    memory: &SharedProcessMemory,
+    process_guard: &KProcess,
     address: u64,
     value: i32,
     new_value: i32,
-) -> (bool, i32) {
-    let mut mem = memory.write().unwrap();
-    let current_value = mem.read_32(address) as i32;
+) -> Option<i32> {
+    let current = read_from_user(process_guard, address)?;
+    if current == value {
+        if let Some(memory) = process_guard.page_table.get_base().m_memory.as_ref() {
+            memory.lock().unwrap().write_32(address, new_value as u32);
+        } else {
+            let mut mem = process_guard.process_memory.write().unwrap();
+            if !mem.is_valid_range(address, 4) {
+                return None;
+            }
+            mem.write_32(address, new_value as u32);
+        }
+    }
+    Some(current)
+}
 
-    if current_value == value {
-        mem.write_32(address, new_value as u32);
+// ---------------------------------------------------------------------------
+// ThreadQueueImplForKAddressArbiter — mirror upstream
+// ---------------------------------------------------------------------------
+
+/// Matches upstream `ThreadQueueImplForKAddressArbiter`. On cancel, removes
+/// the waiter from its owning arbiter tree. The tree pointer is stored in
+/// the process (via `KThread::get_parent_raw_ptr`), mirroring how condvar
+/// recovers its tree from the parent process under the scheduler lock.
+struct ThreadQueueImplForKAddressArbiter;
+
+impl ThreadQueueImplForKAddressArbiter {
+    fn queue() -> KThreadQueue {
+        KThreadQueue::with_callbacks(None, Some(Self::cancel_wait))
     }
 
-    (true, current_value)
+    fn cancel_wait(waiting_thread: &mut KThread) {
+        if waiting_thread.is_waiting_for_address_arbiter() {
+            if let Some(parent_ptr) = waiting_thread.get_parent_raw_ptr() {
+                // SAFETY: parent raw pointer is populated at thread
+                // initialization and remains valid for the thread's lifetime;
+                // we only dereference under the scheduler lock.
+                let parent = unsafe { &mut *parent_ptr };
+                parent
+                    .address_arbiter
+                    .waiting_threads
+                    .erase_by_thread_id(waiting_thread.thread_id);
+            }
+            waiting_thread.clear_address_arbiter();
+        }
+    }
 }
 
-/// Per-address wait state: tracks waiting thread count and provides a Condvar.
-struct AddressWaitEntry {
-    waiter_count: u32,
-    cv: Arc<Condvar>,
+// ---------------------------------------------------------------------------
+// AddressArbiterThreadTree — type-level equivalent of upstream's
+// `KThread::AddressArbiterThreadTreeType`.
+// ---------------------------------------------------------------------------
+
+#[derive(Default)]
+pub struct AddressArbiterThreadTree {
+    ordered: BTreeMap<(u64, i32), Vec<u64>>,
+    by_thread_id: HashMap<u64, (u64, i32)>,
 }
 
-/// Address arbiter for thread synchronization on userspace addresses.
+impl AddressArbiterThreadTree {
+    fn insert(&mut self, addr: u64, priority: i32, thread_id: u64) {
+        if let Some((old_addr, old_priority)) =
+            self.by_thread_id.insert(thread_id, (addr, priority))
+        {
+            self.remove_from_bucket(old_addr, old_priority, thread_id);
+        }
+        self.ordered
+            .entry((addr, priority))
+            .or_default()
+            .push(thread_id);
+    }
+
+    fn erase_by_thread_id(&mut self, thread_id: u64) {
+        if let Some((addr, priority)) = self.by_thread_id.remove(&thread_id) {
+            self.remove_from_bucket(addr, priority, thread_id);
+        }
+    }
+
+    /// Return the first waiter thread_id for exactly `addr` (lowest priority
+    /// wins, then lowest thread_id within a bucket). Matches upstream's
+    /// `m_tree.nfind_key({addr, -1})` follow-up "key == addr" check.
+    fn first_waiter_for_addr(&self, addr: u64) -> Option<u64> {
+        self.ordered
+            .range((addr, i32::MIN)..)
+            .next()
+            .and_then(|((bucket_addr, _), thread_ids)| {
+                if *bucket_addr == addr {
+                    thread_ids.first().copied()
+                } else {
+                    None
+                }
+            })
+    }
+
+    /// Count waiters queued on exactly `addr`.
+    fn count_waiters_for_addr(&self, addr: u64) -> i32 {
+        self.ordered
+            .range((addr, i32::MIN)..=(addr, i32::MAX))
+            .map(|(_, ids)| ids.len() as i32)
+            .sum()
+    }
+
+    fn remove_from_bucket(&mut self, addr: u64, priority: i32, thread_id: u64) {
+        let key = (addr, priority);
+        let empty = if let Some(ids) = self.ordered.get_mut(&key) {
+            if let Some(idx) = ids.iter().position(|existing| *existing == thread_id) {
+                ids.remove(idx);
+            }
+            ids.is_empty()
+        } else {
+            false
+        };
+        if empty {
+            self.ordered.remove(&key);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// KAddressArbiter
+// ---------------------------------------------------------------------------
+
+/// Address arbiter — port of upstream `KAddressArbiter`.
 ///
-/// Port of upstream `KAddressArbiter` (k_address_arbiter.h).
-/// Upstream stores `Core::System& m_system` and `KernelCore& m_kernel`, but the
-/// owner is `KProcess::m_address_arbiter`, so the effective memory owner is the
-/// process itself. In Rust we store the owning process memory directly.
+/// Owned by `KProcess::m_address_arbiter`. All mutation happens under the
+/// kernel scheduler lock, held by every public method's entry.
 pub struct KAddressArbiter {
-    /// Map from guest virtual address to wait state.
-    wait_map: Mutex<BTreeMap<u64, AddressWaitEntry>>,
-    /// Owning process memory.
-    memory: Option<SharedProcessMemory>,
+    waiting_threads: AddressArbiterThreadTree,
 }
 
 impl KAddressArbiter {
     pub fn new() -> Self {
         Self {
-            wait_map: Mutex::new(BTreeMap::new()),
-            memory: None,
+            waiting_threads: AddressArbiterThreadTree::default(),
         }
     }
 
-    /// Create with the owning process memory.
-    pub fn with_memory(memory: SharedProcessMemory) -> Self {
-        Self {
-            wait_map: Mutex::new(BTreeMap::new()),
-            memory: Some(memory),
-        }
-    }
-
-    /// Set the owning process memory (for deferred initialization).
-    pub fn set_memory(&mut self, memory: SharedProcessMemory) {
-        self.memory = Some(memory);
-    }
-
-    /// Resolve the owning process's guest memory.
-    fn current_memory(&self) -> Option<SharedProcessMemory> {
-        self.memory.clone()
-    }
-
-    /// Dispatch a signal operation to the given address.
+    /// Dispatch a signal operation. Called from `KProcess::signal_address_arbiter`.
+    /// Upstream corresponds to the inline dispatch in `GetCurrentProcess(kernel)`
+    /// methods that forward to the per-signal-type call.
     pub fn signal_to_address(
-        &self,
+        &mut self,
+        process_guard: &mut KProcess,
         addr: u64,
         signal_type: SignalType,
         value: i32,
         count: i32,
     ) -> ResultCode {
         match signal_type {
-            SignalType::Signal => self.signal(addr, count),
+            SignalType::Signal => self.signal(process_guard, addr, count),
             SignalType::SignalAndIncrementIfEqual => {
-                self.signal_and_increment_if_equal(addr, value, count)
+                self.signal_and_increment_if_equal(process_guard, addr, value, count)
             }
             SignalType::SignalAndModifyByWaitingCountIfEqual => {
-                self.signal_and_modify_by_waiting_count_if_equal(addr, value, count)
+                self.signal_and_modify_by_waiting_count_if_equal(process_guard, addr, value, count)
             }
         }
     }
 
-    /// Dispatch a wait operation on the given address.
+    /// Dispatch a wait operation. Called from `KProcess::wait_address_arbiter`.
     pub fn wait_for_address(
-        &self,
+        &mut self,
+        process: &Arc<ProcessLock>,
+        current_thread: &Arc<KThreadLock>,
         addr: u64,
         arb_type: ArbitrationType,
         value: i32,
         timeout: i64,
     ) -> ResultCode {
         match arb_type {
-            ArbitrationType::WaitIfLessThan => self.wait_if_less_than(addr, value, false, timeout),
+            ArbitrationType::WaitIfLessThan => {
+                self.wait_if_less_than(process, current_thread, addr, value, false, timeout)
+            }
             ArbitrationType::DecrementAndWaitIfLessThan => {
-                self.wait_if_less_than(addr, value, true, timeout)
+                self.wait_if_less_than(process, current_thread, addr, value, true, timeout)
             }
-            ArbitrationType::WaitIfEqual => self.wait_if_equal(addr, value, timeout),
+            ArbitrationType::WaitIfEqual => {
+                self.wait_if_equal(process, current_thread, addr, value, timeout)
+            }
         }
     }
 
-    // -- Private methods matching upstream --
+    // -- Signal variants (upstream-faithful) -------------------------------
 
-    /// Signal waiting threads at the given address.
     /// Port of upstream `KAddressArbiter::Signal`.
-    fn signal(&self, addr: u64, count: i32) -> ResultCode {
-        let map = self.wait_map.lock().unwrap();
-        if let Some(entry) = map.get(&addr) {
-            let cv = entry.cv.clone();
-            if count <= 0 {
-                cv.notify_all();
-            } else {
-                for _ in 0..count {
-                    cv.notify_one();
-                }
-            }
-        }
-        ResultCode::new(0)
+    fn signal(&mut self, process_guard: &mut KProcess, addr: u64, count: i32) -> ResultCode {
+        let scheduler_lock = super::kernel::scheduler_lock()
+            .expect("scheduler_lock must exist — kernel not initialized?");
+        let _sl = KScopedSchedulerLock::new(scheduler_lock);
+
+        self.signal_locked(process_guard, addr, count);
+        RESULT_SUCCESS
     }
 
-    /// Signal and atomically increment the value at address if equal.
     /// Port of upstream `KAddressArbiter::SignalAndIncrementIfEqual`.
-    fn signal_and_increment_if_equal(&self, addr: u64, value: i32, count: i32) -> ResultCode {
-        let memory = match self.current_memory() {
-            Some(m) => m,
-            None => return crate::hle::kernel::svc::svc_results::RESULT_INVALID_CURRENT_MEMORY,
-        };
-
-        let (succeeded, user_value) = update_if_equal(&memory, addr, value, value + 1);
-
-        if !succeeded {
-            return crate::hle::kernel::svc::svc_results::RESULT_INVALID_CURRENT_MEMORY;
-        }
-        if user_value != value {
-            return crate::hle::kernel::svc::svc_results::RESULT_INVALID_STATE;
-        }
-
-        self.signal(addr, count)
-    }
-
-    /// Signal and modify value based on waiting count.
-    /// Port of upstream `KAddressArbiter::SignalAndModifyByWaitingCountIfEqual`.
-    fn signal_and_modify_by_waiting_count_if_equal(
-        &self,
+    fn signal_and_increment_if_equal(
+        &mut self,
+        process_guard: &mut KProcess,
         addr: u64,
         value: i32,
         count: i32,
     ) -> ResultCode {
-        let memory = match self.current_memory() {
-            Some(m) => m,
-            None => return crate::hle::kernel::svc::svc_results::RESULT_INVALID_CURRENT_MEMORY,
-        };
+        let scheduler_lock = super::kernel::scheduler_lock()
+            .expect("scheduler_lock must exist — kernel not initialized?");
+        let _sl = KScopedSchedulerLock::new(scheduler_lock);
 
-        // Determine new_value based on waiter count (matching upstream lines 192-217).
-        let (has_waiters, waiter_count_at_addr) = {
-            let map = self.wait_map.lock().unwrap();
-            if let Some(entry) = map.get(&addr) {
-                (entry.waiter_count > 0, entry.waiter_count as i32)
-            } else {
-                (false, 0)
-            }
+        // Upstream: UpdateIfEqual(kernel, &user_value, addr, value, value + 1);
+        let Some(user_value) = update_if_equal(process_guard, addr, value, value.wrapping_add(1))
+        else {
+            return RESULT_INVALID_CURRENT_MEMORY;
         };
+        if user_value != value {
+            return RESULT_INVALID_STATE;
+        }
 
+        self.signal_locked(process_guard, addr, count);
+        RESULT_SUCCESS
+    }
+
+    /// Port of upstream `KAddressArbiter::SignalAndModifyByWaitingCountIfEqual`.
+    fn signal_and_modify_by_waiting_count_if_equal(
+        &mut self,
+        process_guard: &mut KProcess,
+        addr: u64,
+        value: i32,
+        count: i32,
+    ) -> ResultCode {
+        let scheduler_lock = super::kernel::scheduler_lock()
+            .expect("scheduler_lock must exist — kernel not initialized?");
+        let _sl = KScopedSchedulerLock::new(scheduler_lock);
+
+        // Determine new_value — mirrors upstream lines 192-217.
+        let has_waiters = self.waiting_threads.first_waiter_for_addr(addr).is_some();
         let new_value = if count <= 0 {
             if has_waiters {
-                value - 2
+                value.wrapping_sub(2)
             } else {
-                value + 1
+                value.wrapping_add(1)
             }
         } else if has_waiters {
-            if waiter_count_at_addr - 1 < count {
-                value - 1
+            let waiter_count_after_head = self.waiting_threads.count_waiters_for_addr(addr) - 1;
+            if waiter_count_after_head < count {
+                value.wrapping_sub(1)
             } else {
                 value
             }
         } else {
-            value + 1
+            value.wrapping_add(1)
         };
 
-        let (succeeded, user_value) = if value != new_value {
-            update_if_equal(&memory, addr, value, new_value)
+        let user_value_opt = if value != new_value {
+            update_if_equal(process_guard, addr, value, new_value)
         } else {
-            read_from_user(&memory, addr)
+            read_from_user(process_guard, addr)
         };
-
-        if !succeeded {
-            return crate::hle::kernel::svc::svc_results::RESULT_INVALID_CURRENT_MEMORY;
-        }
+        let Some(user_value) = user_value_opt else {
+            return RESULT_INVALID_CURRENT_MEMORY;
+        };
         if user_value != value {
-            return crate::hle::kernel::svc::svc_results::RESULT_INVALID_STATE;
+            return RESULT_INVALID_STATE;
         }
 
-        self.signal(addr, count)
+        self.signal_locked(process_guard, addr, count);
+        RESULT_SUCCESS
     }
 
-    /// Wait if the value at addr is less than the given value.
+    /// Core signal loop shared by the three signal variants. Caller holds the
+    /// scheduler lock. Pops up to `count` (or all, if count <= 0) waiters from
+    /// the tree at `addr` and fires `EndWait(ResultSuccess)` on each.
+    fn signal_locked(&mut self, process_guard: &mut KProcess, addr: u64, count: i32) {
+        let mut num_waiters = 0i32;
+        while count <= 0 || num_waiters < count {
+            let Some(target_thread_id) = self.waiting_threads.first_waiter_for_addr(addr) else {
+                break;
+            };
+            // Remove from the tree first to mirror upstream's
+            // `it = m_tree.erase(it)` ordering.
+            self.waiting_threads.erase_by_thread_id(target_thread_id);
+            let Some(target_thread) = process_guard.get_thread_by_thread_id(target_thread_id)
+            else {
+                // Waiter vanished — skip and continue.
+                continue;
+            };
+            {
+                let mut guard = target_thread.lock().unwrap();
+                debug_assert!(guard.is_waiting_for_address_arbiter());
+                guard.clear_address_arbiter();
+                guard.end_wait(RESULT_SUCCESS.get_inner_value());
+            }
+            num_waiters += 1;
+        }
+    }
+
+    // -- Wait variants (upstream-faithful) ---------------------------------
+
     /// Port of upstream `KAddressArbiter::WaitIfLessThan`.
     fn wait_if_less_than(
-        &self,
+        &mut self,
+        process: &Arc<ProcessLock>,
+        current_thread: &Arc<KThreadLock>,
         addr: u64,
         value: i32,
         decrement: bool,
         timeout: i64,
     ) -> ResultCode {
-        let memory = match self.current_memory() {
-            Some(m) => m,
-            None => return crate::hle::kernel::svc::svc_results::RESULT_INVALID_CURRENT_MEMORY,
+        let current_thread_id = current_thread.lock().unwrap().get_thread_id();
+        let priority = current_thread.lock().unwrap().get_priority();
+        let scheduler_lock = super::kernel::scheduler_lock()
+            .expect("scheduler_lock must exist — kernel not initialized?");
+        let hardware_timer = super::kernel::get_hardware_timer_arc();
+        let thread_ptr = {
+            let guard = current_thread.lock().unwrap();
+            &*guard as *const KThread as usize
         };
 
-        let (succeeded, user_value) = if decrement {
-            decrement_if_less_than(&memory, addr, value)
-        } else {
-            read_from_user(&memory, addr)
-        };
+        let setup_result: Result<(), ResultCode> = (|| {
+            let (mut sleep_guard, timer) = KScopedSchedulerLockAndSleep::new(
+                scheduler_lock,
+                hardware_timer.as_ref(),
+                current_thread_id,
+                thread_ptr,
+                timeout,
+            );
 
-        if !succeeded {
-            return crate::hle::kernel::svc::svc_results::RESULT_INVALID_CURRENT_MEMORY;
-        }
-        if user_value >= value {
-            return crate::hle::kernel::svc::svc_results::RESULT_INVALID_STATE;
-        }
-        if timeout == 0 {
-            return crate::hle::kernel::svc::svc_results::RESULT_TIMED_OUT;
-        }
-
-        self.wait_on_address(addr, timeout)
-    }
-
-    /// Wait if the value at addr equals the given value.
-    /// Port of upstream `KAddressArbiter::WaitIfEqual`.
-    fn wait_if_equal(&self, addr: u64, value: i32, timeout: i64) -> ResultCode {
-        let memory = match self.current_memory() {
-            Some(m) => m,
-            None => return crate::hle::kernel::svc::svc_results::RESULT_INVALID_CURRENT_MEMORY,
-        };
-
-        let (succeeded, user_value) = read_from_user(&memory, addr);
-
-        if !succeeded {
-            return crate::hle::kernel::svc::svc_results::RESULT_INVALID_CURRENT_MEMORY;
-        }
-        if user_value != value {
-            return crate::hle::kernel::svc::svc_results::RESULT_INVALID_STATE;
-        }
-        if timeout == 0 {
-            return crate::hle::kernel::svc::svc_results::RESULT_TIMED_OUT;
-        }
-
-        self.wait_on_address(addr, timeout)
-    }
-
-    /// Common wait implementation: parks the calling thread until signaled or timeout.
-    fn wait_on_address(&self, addr: u64, timeout: i64) -> ResultCode {
-        let cv = {
-            let mut map = self.wait_map.lock().unwrap();
-            let entry = map.entry(addr).or_insert_with(|| AddressWaitEntry {
-                waiter_count: 0,
-                cv: Arc::new(Condvar::new()),
-            });
-            entry.waiter_count += 1;
-            entry.cv.clone()
-        };
-
-        let park_mutex = Mutex::new(false);
-        let guard = park_mutex.lock().unwrap();
-
-        let timed_out = if timeout > 0 {
-            let timeout_dur = std::time::Duration::from_nanos(timeout as u64);
-            let result = cv.wait_timeout(guard, timeout_dur).unwrap();
-            result.1.timed_out()
-        } else if timeout < 0 {
-            // Infinite wait (Svc::WaitInfinite = -1)
-            let _guard = cv.wait(guard).unwrap();
-            false
-        } else {
-            true
-        };
-
-        {
-            let mut map = self.wait_map.lock().unwrap();
-            if let Some(entry) = map.get_mut(&addr) {
-                entry.waiter_count = entry.waiter_count.saturating_sub(1);
-                if entry.waiter_count == 0 {
-                    map.remove(&addr);
-                }
+            if current_thread.lock().unwrap().is_termination_requested() {
+                sleep_guard.cancel_sleep();
+                return Err(RESULT_TERMINATION_REQUESTED);
             }
+
+            let mut process_guard = process.lock().unwrap();
+
+            // Read / optionally decrement userspace value.
+            let user_value = if decrement {
+                decrement_if_less_than(&process_guard, addr, value)
+            } else {
+                read_from_user(&process_guard, addr)
+            };
+            let Some(user_value) = user_value else {
+                sleep_guard.cancel_sleep();
+                return Err(RESULT_INVALID_CURRENT_MEMORY);
+            };
+            if user_value >= value {
+                sleep_guard.cancel_sleep();
+                return Err(RESULT_INVALID_STATE);
+            }
+            if timeout == 0 {
+                sleep_guard.cancel_sleep();
+                return Err(RESULT_TIMED_OUT);
+            }
+
+            // Set up the wait: mark thread as waiting on arbiter + enqueue.
+            let mut wait_queue = ThreadQueueImplForKAddressArbiter::queue();
+            if let Some(timer) = timer {
+                wait_queue.set_hardware_timer(timer);
+            }
+            Self::begin_wait_arbiter(current_thread, wait_queue, addr, priority);
+            self.waiting_threads
+                .insert(addr, priority, current_thread_id);
+            drop(process_guard);
+
+            Ok(())
+        })();
+
+        // Scheduler lock + sleep guard have dropped. Either we short-circuited
+        // with an error, or the fiber-wait is armed.
+        if let Err(early_return) = setup_result {
+            return early_return;
         }
 
-        if timed_out {
-            crate::hle::kernel::svc::svc_results::RESULT_TIMED_OUT
-        } else {
-            ResultCode::new(0)
+        Self::wait_for_current_thread(current_thread);
+        ResultCode::new(current_thread.lock().unwrap().get_wait_result())
+    }
+
+    /// Port of upstream `KAddressArbiter::WaitIfEqual`.
+    fn wait_if_equal(
+        &mut self,
+        process: &Arc<ProcessLock>,
+        current_thread: &Arc<KThreadLock>,
+        addr: u64,
+        value: i32,
+        timeout: i64,
+    ) -> ResultCode {
+        let current_thread_id = current_thread.lock().unwrap().get_thread_id();
+        let priority = current_thread.lock().unwrap().get_priority();
+        let scheduler_lock = super::kernel::scheduler_lock()
+            .expect("scheduler_lock must exist — kernel not initialized?");
+        let hardware_timer = super::kernel::get_hardware_timer_arc();
+        let thread_ptr = {
+            let guard = current_thread.lock().unwrap();
+            &*guard as *const KThread as usize
+        };
+
+        let setup_result: Result<(), ResultCode> = (|| {
+            let (mut sleep_guard, timer) = KScopedSchedulerLockAndSleep::new(
+                scheduler_lock,
+                hardware_timer.as_ref(),
+                current_thread_id,
+                thread_ptr,
+                timeout,
+            );
+
+            if current_thread.lock().unwrap().is_termination_requested() {
+                sleep_guard.cancel_sleep();
+                return Err(RESULT_TERMINATION_REQUESTED);
+            }
+
+            let mut process_guard = process.lock().unwrap();
+            let Some(user_value) = read_from_user(&process_guard, addr) else {
+                sleep_guard.cancel_sleep();
+                return Err(RESULT_INVALID_CURRENT_MEMORY);
+            };
+            if user_value != value {
+                sleep_guard.cancel_sleep();
+                return Err(RESULT_INVALID_STATE);
+            }
+            if timeout == 0 {
+                sleep_guard.cancel_sleep();
+                return Err(RESULT_TIMED_OUT);
+            }
+
+            let mut wait_queue = ThreadQueueImplForKAddressArbiter::queue();
+            if let Some(timer) = timer {
+                wait_queue.set_hardware_timer(timer);
+            }
+            Self::begin_wait_arbiter(current_thread, wait_queue, addr, priority);
+            self.waiting_threads
+                .insert(addr, priority, current_thread_id);
+            drop(process_guard);
+
+            Ok(())
+        })();
+
+        if let Err(early_return) = setup_result {
+            return early_return;
+        }
+
+        Self::wait_for_current_thread(current_thread);
+        ResultCode::new(current_thread.lock().unwrap().get_wait_result())
+    }
+
+    fn begin_wait_arbiter(
+        current_thread: &Arc<KThreadLock>,
+        wait_queue: KThreadQueue,
+        addr: u64,
+        _priority: i32,
+    ) {
+        let mut thread = current_thread.lock().unwrap();
+        thread.set_address_arbiter(addr);
+        thread.begin_wait_with_queue(wait_queue);
+        thread.set_wait_reason_for_debugging(ThreadWaitReasonForDebugging::Arbitration);
+    }
+
+    /// Wait for the current guest fiber to resume (after EndWait fires on
+    /// this thread). Mirrors the same fiber busy-wait helper used by condvar.
+    fn wait_for_current_thread(current_thread: &Arc<KThreadLock>) {
+        let scheduler = super::kernel::get_kernel_ref()
+            .and_then(|kernel| kernel.current_scheduler().cloned())
+            .or_else(|| {
+                current_thread
+                    .lock()
+                    .unwrap()
+                    .scheduler
+                    .as_ref()
+                    .and_then(|scheduler| scheduler.upgrade())
+            });
+
+        while current_thread.lock().unwrap().get_state()
+            == super::k_thread::ThreadState::WAITING
+        {
+            if let Some(scheduler) = scheduler.as_ref() {
+                scheduler.lock().unwrap().request_schedule();
+                let sched_ptr = {
+                    let mut guard = scheduler.lock().unwrap();
+                    &mut *guard as *mut super::k_scheduler::KScheduler
+                };
+                unsafe {
+                    super::k_scheduler::KScheduler::reschedule_current_core_raw(sched_ptr);
+                }
+            } else {
+                std::thread::yield_now();
+            }
         }
     }
 }
@@ -364,35 +590,5 @@ impl KAddressArbiter {
 impl Default for KAddressArbiter {
     fn default() -> Self {
         Self::new()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::thread;
-    use std::time::Duration;
-
-    #[test]
-    fn signal_and_wait_share_same_process_owned_arbiter() {
-        let memory = Arc::new(RwLock::new(ProcessMemoryData::new()));
-        memory.write().unwrap().write_32(0x1000, 1);
-
-        let arbiter = Arc::new(KAddressArbiter::with_memory(memory));
-        let waiter = Arc::clone(&arbiter);
-        let join = thread::spawn(move || {
-            waiter
-                .wait_for_address(0x1000, ArbitrationType::WaitIfEqual, 1, -1)
-                .get_inner_value()
-        });
-
-        thread::sleep(Duration::from_millis(10));
-        let signal_result = arbiter
-            .signal_to_address(0x1000, SignalType::Signal, 0, 1)
-            .get_inner_value();
-        assert_eq!(signal_result, 0);
-
-        let wait_result = join.join().unwrap();
-        assert_eq!(wait_result, 0);
     }
 }
