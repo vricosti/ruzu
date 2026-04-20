@@ -151,26 +151,53 @@ HLE migration). Both proven to regress when applied incrementally.
    (svc_lock) is naturally covered because `ArbitrateLock` /
    `ArbitrateUnlock` just forward into condvar.
 
+5. ✅ **Step 2 — wait-sync path (`svc_synchronization.rs`)** —
+   `2ffd357` made `KSynchronizationObject::wait` open
+   `KScopedSchedulerLockAndSleep` via `kernel::scheduler_lock()`
+   unconditionally (dropped the `scheduler_lock_ptr == 0 →
+   RESULT_INVALID_HANDLE` fallback). Same tactical pattern as condvar.
+   `synchronize_preemption_state` cleaned up alongside.
+6. ✅ **Step 2 — address arbiter** — `3a7c9cc` replaced the
+   `HashMap<u64, parking_lot::Condvar>` host-thread-blocking arbiter
+   with upstream's intrusive tree + scheduler-lock + `BeginWait`/
+   `EndWait` pattern. `AddressArbiterThreadTree` mirrors
+   `ConditionVariableThreadTree`. All 5 public methods (`Signal`,
+   `SignalAndIncrementIfEqual`, `SignalAndModify…`, `WaitIfLessThan`,
+   `WaitIfEqual`) match upstream's scope. `KProcess::wait_address_arbiter`
+   became a static method taking `&Arc<ProcessLock>` + `&Arc<KThreadLock>`
+   so the wait path can drop the process lock before the fiber-wait.
+7. ✅ **Scheduler-lock host-thread ownership** — `2c117db` fixed the
+   `is_locked_by_current_thread()` false-positive fallback
+   (`m_lock_count > 0`) that made every un-tagged host thread believe
+   it owned the lock when any thread did. Introduced
+   `current_sched_thread_id()` which returns the guest tid or a
+   unique per-OS-thread synthetic ID allocated from a reserved
+   `>= 2^63` range. Both `lock()` and `is_locked_by_current_thread()`
+   use this accessor.
+8. ✅ **Step 4 — cleanup** — `31d6ad1` removed the `ProcessLockTracker`
+   RAII guard + `PROCESS_LOCK_HOLDER_{TID,SITE}` statics, the 6
+   remaining call sites, the `tracked_mutex.rs` module, and the
+   SIGUSR1 dumper block that read them. 339 lines deleted.
+
 ### Still pending
 
-5. ⏳ **Step 2 — address arbiter** — `k_address_arbiter.rs` is a full
-   rewrite, not a small scope change. Current Rust impl uses a
-   `HashMap<u64, parking_lot::Condvar>` and blocks host threads
-   directly via `cv.wait_timeout(...)`. Upstream uses the
-   scheduler-lock + intrusive tree + `BeginWait` / `EndWait` pattern
-   (see `zuyu/src/core/hle/kernel/k_address_arbiter.cpp`). MK8D boot
-   doesn't exercise the arbiter path heavily at current progress, so
-   this is lower priority than subsystem D below.
-6. ⏳ **Step 2 — wait-sync path (`svc_synchronization.rs`)** — mirror
-   the same "kernel::scheduler_lock() + drop lock before fiber-wait"
-   pattern used for condvar.
-7. ⏳ **Step 4 — cleanup** — remove now-dead `TrackedMutex` module +
-   `ProcessLockTracker` (except sites that still reference them for
-   SIGUSR1 diagnostics outside the refactored subsystems).
+9. ⏳ **Event-signal GSC-Mutex round-trip** — `KEvent::lock_scheduler_for_process`
+   and `KReadableEvent::lock_scheduler` still acquire
+   `process.global_scheduler_context?.lock()` to fetch the
+   scheduler-lock pointer instead of using `kernel::scheduler_lock()`.
+   Step 6.5 tried to simplify this and regressed boot (1050 → 864-1264 RU).
+   The GSC Mutex was accidentally serializing host threads OUTSIDE
+   the scheduler spin-lock, acting as a parking layer that cuts
+   spin-lock contention when many host threads signal events
+   concurrently. Removing it requires either a fast-path for
+   contended host-thread acquires on the spin lock or moving the
+   parking behavior into `KAbstractSchedulerLock` itself. Deferred.
 
 ### MK8D boot progression
 
-Measured in 90s isolated-dir run (RequestUpdate cycles / VSYNC):
+Measured in 90s isolated-dir run (RequestUpdate cycles / VSYNC).
+Run-to-run variance is high (~300-2200 RU on post-6.4 commits), so
+treat individual numbers as rough indicators.
 
 | Branch tip | RU | VSYNC | Notes |
 |---|---:|---:|---|
@@ -178,7 +205,12 @@ Measured in 90s isolated-dir run (RequestUpdate cycles / VSYNC):
 | step 5b (`3514834`) | 882 | 36 | SyncCell for both Process + Thread; no scheduler lock coverage added yet |
 | step 6.0 initial attempt | 0 | 16 | held scheduler lock across fiber-wait → deadlock at boot |
 | step 6.1 (`a28cbe4`) | 266 | 23 | condvar fixed; arbiter/sync still missing coverage |
+| step 6.2 (`2ffd357`) | 238 | 22 | wait-sync scheduler lock unconditional; flat vs 6.1 |
+| step 6.3 (`3a7c9cc`) | 1050 | 40 | arbiter full rewrite — recovered above 5b baseline |
+| step 6.4 (`2c117db`) | 2202 | 68 | host-thread ID fix in KAbstractSchedulerLock |
+| step 6.5 attempt | 864-1264 | 37-47 | event-signal GSC-mutex removal regressed; reverted |
+| step 6.6 (`31d6ad1`) | 316-1578 | 24-47 | cleanup only (dead code removal); variance overlap with 6.4 |
 
-Throughput regression is expected per the refactor's intermediate-
-breakage contract. Final regression-hunting happens only after all
-subsystems are converted (per user directive 2026-04-20).
+Refactor's intermediate-breakage contract was kept: every
+intermediate commit either improves throughput or reveals a hidden
+bug (like the 6.0 deadlock and the 6.4 ownership false-positive).
