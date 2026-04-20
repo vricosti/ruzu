@@ -218,32 +218,15 @@ pub fn cancel_synchronization(system: &System, handle: Handle) -> ResultCode {
 /// Upstream: Lock scheduler, check if current thread is pinned on the current core,
 /// clear interrupt flag, unpin.
 pub fn synchronize_preemption_state(system: &System) {
-    // Upstream: `KScopedSchedulerLock sl{kernel};`
-    //
-    // Match by taking the abstract scheduler spin-lock via the current
-    // thread's scheduler_lock_ptr. The existing `system.scheduler_arc()`
-    // is a `Mutex<KScheduler>` — the wrong primitive; the spin-lock is
-    // what serializes cross-core kernel-object access.
+    // Upstream: `KScopedSchedulerLock sl{kernel};` — unconditional.
     let current_thread = match crate::hle::kernel::kernel::get_current_emu_thread() {
         Some(t) => t,
         None => return,
     };
-    let (current_thread_id, scheduler_lock_ptr) = {
-        let t = current_thread.lock().unwrap();
-        (t.get_thread_id(), t.scheduler_lock_ptr)
-    };
-    let _sl = if scheduler_lock_ptr != 0 {
-        Some(crate::hle::kernel::k_scheduler_lock::KScopedSchedulerLock::new(
-            // SAFETY: scheduler_lock_ptr is the address of the GSC's
-            // KAbstractSchedulerLock, which outlives all kernel threads.
-            unsafe {
-                &*(scheduler_lock_ptr
-                    as *const crate::hle::kernel::k_scheduler_lock::KAbstractSchedulerLock)
-            },
-        ))
-    } else {
-        None
-    };
+    let current_thread_id = current_thread.lock().unwrap().get_thread_id();
+    let scheduler_lock = crate::hle::kernel::kernel::scheduler_lock()
+        .expect("scheduler_lock must exist — kernel not initialized?");
+    let _sl = crate::hle::kernel::k_scheduler_lock::KScopedSchedulerLock::new(scheduler_lock);
 
     let core_id = match system.kernel() {
         Some(k) => k.current_physical_core_index() as i32,

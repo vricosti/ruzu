@@ -511,12 +511,12 @@ pub fn wait(
     }
 
     let current_thread_id = current_thread.lock().unwrap().thread_id;
-    let scheduler_lock_ptr = current_thread.lock().unwrap().scheduler_lock_ptr;
-    if scheduler_lock_ptr == 0 {
-        return RESULT_INVALID_HANDLE;
-    }
-    let scheduler_lock =
-        unsafe { &*(scheduler_lock_ptr as *const super::k_scheduler_lock::KAbstractSchedulerLock) };
+    // Upstream's `KSynchronizationObject::Wait` opens
+    // `KScopedSchedulerLockAndSleep slp(kernel, ...)` unconditionally.
+    // Use the kernel singleton's scheduler_lock so the lock scope matches
+    // upstream even at lifecycle points where the per-thread cache was zero.
+    let scheduler_lock = super::kernel::scheduler_lock()
+        .expect("scheduler_lock must exist — kernel not initialized?");
     let hardware_timer = super::kernel::get_hardware_timer_arc();
     let thread_ptr = {
         let guard = current_thread.lock().unwrap();
