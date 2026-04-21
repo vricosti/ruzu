@@ -311,7 +311,7 @@ fn dump_thread_state(kernel: &KernelCore) {
             // are 4 bytes; Thumb insns are 2 or 4. We print raw little-endian
             // u32s starting 8 bytes before the PC.
             for pc in &pcs_to_dump {
-                const WORDS_BEFORE: u64 = 16; // 64 bytes before PC
+                const WORDS_BEFORE: u64 = 32; // 128 bytes before PC (catches BNE-72 target + loop preamble)
                 const WORDS_AFTER: u64 = 16;  // 64 bytes after PC
                 const TOTAL: usize = (WORDS_BEFORE + WORDS_AFTER + 1) as usize;
                 let start = pc.saturating_sub(WORDS_BEFORE * 4);
