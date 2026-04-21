@@ -126,6 +126,20 @@ pub static GUEST_PC: [std::sync::atomic::AtomicU64;
     std::sync::atomic::AtomicU64::new(0),
 ];
 
+/// Per-core last known guest LR (link register). When a guest thread calls
+/// an nnSdk SVC stub like `svc 0x18; bx lr`, LR points back into the caller
+/// — usually the game's code that invoked WaitSynchronization or similar.
+/// Essential for identifying the actual hot spot in a spin loop where the
+/// game only ever calls one kind of SVC (the SVC address drowns out the
+/// real work PC).
+pub static GUEST_LR: [std::sync::atomic::AtomicU64;
+    hardware_properties::NUM_CPU_CORES as usize] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+
 #[inline]
 pub fn mark_svc_enter(core_id: usize, tid: u64, svc: u32) {
     if core_id >= SVC_IN_PROGRESS.len() { return; }
@@ -142,6 +156,18 @@ pub fn record_guest_pc(core_id: usize, pc: u64) {
         return;
     }
     GUEST_PC[core_id].store(pc, Ordering::Release);
+}
+
+/// Record the guest PC + LR observed after an SVC / Halt. LR typically
+/// points into the game code that called the nnSdk SVC stub, which is
+/// more diagnostic than PC (which sits in the stub itself).
+#[inline]
+pub fn record_guest_pc_lr(core_id: usize, pc: u64, lr: u64) {
+    if core_id >= GUEST_PC.len() {
+        return;
+    }
+    GUEST_PC[core_id].store(pc, Ordering::Release);
+    GUEST_LR[core_id].store(lr, Ordering::Release);
 }
 
 #[inline]
@@ -212,6 +238,7 @@ fn dump_thread_state(kernel: &KernelCore) {
     eprintln!("[DUMP] === ruzu kernel thread dump ===");
 
     // Per-core running thread + interrupt flag + in-progress SVC + last guest PC.
+    let mut pcs_to_dump: Vec<u64> = Vec::new();
     for core_id in 0..hardware_properties::NUM_CPU_CORES as usize {
         if let Some(core) = kernel.physical_core(core_id) {
             let interrupted = core.is_interrupted();
@@ -219,10 +246,24 @@ fn dump_thread_state(kernel: &KernelCore) {
             let svc_tid = (packed >> 32) as u32;
             let svc_num = (packed & 0xFFFF_FFFF) as u32;
             let last_pc = GUEST_PC[core_id].load(Ordering::Acquire);
+            let last_lr = GUEST_LR[core_id].load(Ordering::Acquire);
             eprintln!(
-                "[DUMP] core={} is_interrupted={} in_svc={{tid={}, imm=0x{:X}}} last_guest_pc=0x{:X}",
-                core_id, interrupted, svc_tid, svc_num, last_pc,
+                "[DUMP] core={} is_interrupted={} in_svc={{tid={}, imm=0x{:X}}} last_guest_pc=0x{:X} last_guest_lr=0x{:X}",
+                core_id, interrupted, svc_tid, svc_num, last_pc, last_lr,
             );
+            if last_pc != 0 && !pcs_to_dump.contains(&last_pc) {
+                pcs_to_dump.push(last_pc);
+            }
+            // LR usually points AFTER the `BL <stub>` call in the caller
+            // (i.e., into game code). Subtract 4 to get the `BL` itself
+            // and its surrounding context — where the spin actually
+            // happens.
+            if last_lr != 0 && last_lr != last_pc {
+                let caller_pc = last_lr.saturating_sub(4);
+                if !pcs_to_dump.contains(&caller_pc) {
+                    pcs_to_dump.push(caller_pc);
+                }
+            }
         }
     }
 
@@ -265,6 +306,55 @@ fn dump_thread_state(kernel: &KernelCore) {
                 guard.thread_list.len(),
                 poll_count,
             );
+            // Dump 32 bytes (8 ARM32 insns) around each interesting PC so the
+            // SIGUSR1 operator can see exactly what's spinning. ARM32 insns
+            // are 4 bytes; Thumb insns are 2 or 4. We print raw little-endian
+            // u32s starting 8 bytes before the PC.
+            for pc in &pcs_to_dump {
+                const WORDS_BEFORE: u64 = 16; // 64 bytes before PC
+                const WORDS_AFTER: u64 = 16;  // 64 bytes after PC
+                const TOTAL: usize = (WORDS_BEFORE + WORDS_AFTER + 1) as usize;
+                let start = pc.saturating_sub(WORDS_BEFORE * 4);
+                // Prefer the page_table's guest memory (virtual addresses
+                // mapped by the loader). Fall back to process_memory if
+                // not wired.
+                let words: Option<Vec<u32>> = if let Some(memory) =
+                    guard.page_table.get_base().m_memory.as_ref()
+                {
+                    let m = memory.lock().unwrap();
+                    let mut w = vec![0u32; TOTAL];
+                    for (i, slot) in w.iter_mut().enumerate() {
+                        *slot = m.read_32(start + (i as u64) * 4);
+                    }
+                    Some(w)
+                } else {
+                    let mem = guard.process_memory.read().unwrap();
+                    let len = (TOTAL as u64) * 4;
+                    if !mem.is_valid_range(start, len as usize) {
+                        None
+                    } else {
+                        let mut w = vec![0u32; TOTAL];
+                        for (i, slot) in w.iter_mut().enumerate() {
+                            *slot = mem.read_32(start + (i as u64) * 4);
+                        }
+                        Some(w)
+                    }
+                };
+                match words {
+                    Some(w) => {
+                        eprint!("[DUMP]   pc=0x{:X} insns:", pc);
+                        for (i, insn) in w.iter().enumerate() {
+                            if i as u64 == WORDS_BEFORE {
+                                eprint!(" [{:08X}]", insn);
+                            } else {
+                                eprint!(" {:08X}", insn);
+                            }
+                        }
+                        eprintln!();
+                    }
+                    None => eprintln!("[DUMP]   pc=0x{:X}: memory range not mapped", pc),
+                }
+            }
             guard.thread_list.clone()
         }
         None => {
