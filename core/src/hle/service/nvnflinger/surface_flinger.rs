@@ -73,19 +73,23 @@ impl SurfaceFlinger {
     }
 
     pub fn add_display(&self, display_id: u64) {
-        self.inner
-            .lock()
-            .unwrap()
-            .displays
-            .push(Display::new(display_id));
+        let mut inner = self.inner.lock().unwrap();
+        log::info!(
+            "[SF_ADD_DISPLAY] display_id={} existing_displays={:?}",
+            display_id,
+            inner.displays.iter().map(|d| (d.id, d.stack.layers.len())).collect::<Vec<_>>()
+        );
+        inner.displays.push(Display::new(display_id));
     }
 
     pub fn remove_display(&self, display_id: u64) {
-        self.inner
-            .lock()
-            .unwrap()
-            .displays
-            .retain(|display| display.id != display_id);
+        let mut inner = self.inner.lock().unwrap();
+        log::info!(
+            "[SF_REMOVE_DISPLAY] display_id={} existing_displays={:?}",
+            display_id,
+            inner.displays.iter().map(|d| (d.id, d.stack.layers.len())).collect::<Vec<_>>()
+        );
+        inner.displays.retain(|display| display.id != display_id);
     }
 
     pub fn compose_display(
@@ -94,12 +98,34 @@ impl SurfaceFlinger {
         out_compose_speed_scale: &mut f32,
         display_id: u64,
     ) -> bool {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COMPOSE_COUNT: AtomicU64 = AtomicU64::new(0);
+        static NO_DISPLAY: AtomicU64 = AtomicU64::new(0);
+        static NO_LAYERS: AtomicU64 = AtomicU64::new(0);
+        let n = COMPOSE_COUNT.fetch_add(1, Ordering::Relaxed);
         let inner = self.inner.lock().unwrap();
         let Some(display) = Self::find_display(&inner.displays, display_id) else {
+            let c = NO_DISPLAY.fetch_add(1, Ordering::Relaxed);
+            if c < 8 || c.is_power_of_two() {
+                log::info!("[SF_COMPOSE] #{} NO_DISPLAY display_id={}", n, display_id);
+            }
             return false;
         };
         if !display.stack.has_layers() {
+            let c = NO_LAYERS.fetch_add(1, Ordering::Relaxed);
+            if c < 8 || c.is_power_of_two() {
+                log::info!(
+                    "[SF_COMPOSE] #{} NO_LAYERS display_id={} display_layers_count={}",
+                    n, display_id, display.stack.layers.len()
+                );
+            }
             return false;
+        }
+        if n < 8 || n.is_power_of_two() {
+            log::info!(
+                "[SF_COMPOSE] #{} COMPOSING display_id={} layers={}",
+                n, display_id, display.stack.layers.len()
+            );
         }
 
         let device = self
@@ -153,11 +179,25 @@ impl SurfaceFlinger {
         let mut inner = self.inner.lock().unwrap();
         let layer = Self::find_layer(&inner.layers, consumer_binder_id);
         let Some(display) = Self::find_display_mut(&mut inner.displays, display_id) else {
+            log::info!(
+                "[SF_ADD_LAYER] NO_DISPLAY display_id={} consumer_id={}",
+                display_id, consumer_binder_id
+            );
             return;
         };
         let Some(layer) = layer else {
+            log::info!(
+                "[SF_ADD_LAYER] NO_LAYER display_id={} consumer_id={}",
+                display_id, consumer_binder_id
+            );
             return;
         };
+        log::info!(
+            "[SF_ADD_LAYER] SUCCESS display_id={} consumer_id={} stack_len_after_push={}",
+            display_id,
+            consumer_binder_id,
+            display.stack.layers.len() + 1,
+        );
         display.stack.layers.push(layer);
     }
 
