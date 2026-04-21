@@ -1146,7 +1146,16 @@ impl UserCallbacks for DynarmicCallbacks32 {
     /// Matches upstream `DynarmicCallbacks32::GetCNTPCT`.
     /// Returns the current system counter value from CoreTiming.
     fn get_cntpct(&self) -> u64 {
-        self.parent().core_timing.get_clock_ticks()
+        let v = self.parent().core_timing.get_clock_ticks();
+        {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static COUNT: AtomicU64 = AtomicU64::new(0);
+            let n = COUNT.fetch_add(1, Ordering::Relaxed);
+            if n < 8 || n.is_power_of_two() {
+                log::info!("[A32_CNTPCT] call#{} value=0x{:X} (= {} dec)", n, v, v);
+            }
+        }
+        v
     }
 
     fn set_pc_ptr(&mut self, ptr: *const u32) {
