@@ -196,6 +196,12 @@ impl BufferQueueProducer {
             let too_many_buffers = inner.queue.len() > max_buffer_count as usize;
             try_again = (*found == BufferQueueCore::INVALID_BUFFER_SLOT) || too_many_buffers;
             if try_again {
+                log::info!(
+                    "[BQP_DEQUEUE_BLOCK] found={} too_many={} max_count={} dequeued={} acquired={} queue_len={} cannot_block={} override={}",
+                    *found, too_many_buffers, max_buffer_count, dequeued_count, acquired_count,
+                    inner.queue.len(), inner.dequeue_buffer_cannot_block,
+                    inner.override_max_buffer_count,
+                );
                 if inner.dequeue_buffer_cannot_block
                     && acquired_count <= inner.max_acquired_buffer_count
                 {
@@ -252,10 +258,7 @@ impl BufferQueueProducer {
 
     pub fn set_buffer_count(&self, buffer_count: i32) -> Status {
         trace_bqp(format_args!("BQP::set_buffer_count count={}", buffer_count));
-        log::debug!(
-            "BufferQueueProducer::set_buffer_count count={}",
-            buffer_count
-        );
+        log::info!("[BQP_SET_COUNT] buffer_count={}", buffer_count);
         let mut inner = self.core.mutex.lock().unwrap();
         inner.wait_while_allocating_locked();
 
