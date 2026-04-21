@@ -163,16 +163,10 @@ impl Module {
         let mut files = self.open_files.lock().unwrap();
         files.insert(fd, device);
 
-        if std::env::var_os("RUZU_NVDRV_TRACE")
-            .is_some_and(|value| value != std::ffi::OsStr::new("0"))
-        {
-            log::info!(
-                "Module::open device_name={} session_id={} -> fd={}",
-                device_name,
-                session_id.id,
-                fd
-            );
-        }
+        log::info!(
+            "[NVDRV_OPEN] fd={} device={} session_id={}",
+            fd, device_name, session_id.id
+        );
 
         fd
     }
@@ -187,6 +181,26 @@ impl Module {
         if fd < 0 {
             log::error!("Invalid DeviceFD={}!", fd);
             return NvResult::InvalidState;
+        }
+        {
+            use std::collections::HashMap;
+            use std::sync::{Mutex, OnceLock};
+            // Per (fd, cmd, group) counter. First occurrence always logs;
+            // subsequent ones log at power-of-two increments per combo.
+            static COMBO_COUNTS: OnceLock<Mutex<HashMap<(i32, u32, u8), u64>>> = OnceLock::new();
+            let counts = COMBO_COUNTS.get_or_init(|| Mutex::new(HashMap::new()));
+            let key = (fd, command.cmd(), command.group());
+            let mut map = counts.lock().unwrap();
+            let n = map.entry(key).or_insert(0);
+            let current = *n;
+            *n += 1;
+            drop(map);
+            if current == 0 || current.is_power_of_two() {
+                log::info!(
+                    "[NVDRV_IOCTL1] fd={} cmd=0x{:X} group=0x{:X} n={}",
+                    fd, command.cmd(), command.group(), current
+                );
+            }
         }
         let files = self.open_files.lock().unwrap();
         if let Some(device) = files.get(&fd) {
