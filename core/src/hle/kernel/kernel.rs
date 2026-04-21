@@ -279,6 +279,20 @@ fn dump_thread_state(kernel: &KernelCore) {
             }
         }
     }
+    // RUZU_DUMP_REGION=0x22C0000:24576 dumps a contiguous u32 range as raw
+    // hex (no per-PC context windows) — useful for whole-vtable snapshots.
+    let region_dumps: Vec<(u64, u64)> = std::env::var("RUZU_DUMP_REGION")
+        .ok()
+        .iter()
+        .flat_map(|raw| raw.split(',').map(|s| s.trim().to_string()).collect::<Vec<_>>())
+        .filter_map(|tok| {
+            let (a, n) = tok.split_once(':')?;
+            let a = a.trim_start_matches("0x").trim_start_matches("0X");
+            let addr = u64::from_str_radix(a, 16).ok()?;
+            let bytes: u64 = n.parse().ok()?;
+            Some((addr, bytes))
+        })
+        .collect();
     // Walk the application process (if any) and dump each thread.
     let system = kernel.system();
     if system.is_null() {
@@ -365,6 +379,38 @@ fn dump_thread_state(kernel: &KernelCore) {
                         eprintln!();
                     }
                     None => eprintln!("[DUMP]   pc=0x{:X}: memory range not mapped", pc),
+                }
+            }
+            // RUZU_DUMP_REGION raw u32 dumps — 8 words per line.
+            for (start, bytes) in &region_dumps {
+                let nwords = (bytes / 4) as usize;
+                eprintln!(
+                    "[DUMP] === REGION 0x{:X}..0x{:X} ({} u32 words) ===",
+                    start, start + bytes, nwords
+                );
+                let mut all_words: Vec<u32> = Vec::with_capacity(nwords);
+                if let Some(memory) = guard.page_table.get_base().m_memory.as_ref() {
+                    let m = memory.lock().unwrap();
+                    for i in 0..nwords {
+                        all_words.push(m.read_32(start + (i as u64) * 4));
+                    }
+                } else {
+                    let mem = guard.process_memory.read().unwrap();
+                    if !mem.is_valid_range(*start, *bytes as usize) {
+                        eprintln!("[DUMP]   region not mapped");
+                        continue;
+                    }
+                    for i in 0..nwords {
+                        all_words.push(mem.read_32(start + (i as u64) * 4));
+                    }
+                }
+                for chunk_idx in 0..nwords.div_ceil(8) {
+                    let off = chunk_idx * 8;
+                    eprint!("[DUMP] 0x{:08X}:", start + (off as u64) * 4);
+                    for w in &all_words[off..(off + 8).min(nwords)] {
+                        eprint!(" {:08X}", w);
+                    }
+                    eprintln!();
                 }
             }
             guard.thread_list.clone()
