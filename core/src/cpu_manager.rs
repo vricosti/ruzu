@@ -656,6 +656,15 @@ impl CpuManager {
                 crate::hle::kernel::physical_core::PhysicalCoreExecutionEvent::Halted(
                     halt_reason,
                 ) => {
+                    // Refresh the SIGUSR1-dumper PC snapshot. Halts fire on
+                    // preemption interrupts (~10ms), so even a guest-code
+                    // spin loop with no SVCs gets its PC surfaced via
+                    // `kernel::GUEST_PC[core_index]` after each preempt.
+                    {
+                        let mut tc_pc = crate::arm::arm_interface::ThreadContext::default();
+                        jit_ref.get_context(&mut tc_pc);
+                        crate::hle::kernel::kernel::record_guest_pc(core_index, tc_pc.pc);
+                    }
                     let current_thread_id = thread_arc.lock().unwrap().get_thread_id();
                     let interrupt = halt_reason.contains(HaltReason::BREAK_LOOP);
                     let data_abort = halt_reason.contains(HaltReason::DATA_ABORT);
