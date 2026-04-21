@@ -300,7 +300,13 @@ impl Module {
         };
         drop(files);
 
-        match device.query_event(event_id) {
+        let result = device.query_event(event_id);
+        let object_id = result.as_ref().map(|e| e.lock().unwrap().object_id);
+        log::info!(
+            "[NVDRV_QUERY_EVENT] fd={} event_id={} object_id={:?}",
+            fd, event_id, object_id
+        );
+        match result {
             Some(event) => (NvResult::Success, Some(event)),
             None => (NvResult::BadParameter, None),
         }

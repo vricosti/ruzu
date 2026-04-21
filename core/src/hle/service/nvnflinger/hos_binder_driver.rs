@@ -89,6 +89,23 @@ impl IHosBinderDriver {
             transaction_id,
             flags
         );
+        {
+            use std::collections::HashMap;
+            use std::sync::{Mutex, OnceLock};
+            static COMBO_COUNTS: OnceLock<Mutex<HashMap<(i32, u32), u64>>> = OnceLock::new();
+            let counts = COMBO_COUNTS.get_or_init(|| Mutex::new(HashMap::new()));
+            let mut map = counts.lock().unwrap();
+            let n = map.entry((id, transaction_id)).or_insert(0);
+            let current = *n;
+            *n += 1;
+            drop(map);
+            if current == 0 || current.is_power_of_two() {
+                log::info!(
+                    "[BINDER_TXN] id={} txn={} n={}",
+                    id, transaction_id, current
+                );
+            }
+        }
 
         let parcel_data = ctx.read_buffer(0);
         let write_size = ctx.get_write_buffer_size(0);
