@@ -149,6 +149,14 @@ impl BufferQueueConsumer {
     }
 
     pub fn release_buffer(&self, slot: i32, frame_number: u64, release_fence: &Fence) -> Status {
+        {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static COUNT: AtomicU64 = AtomicU64::new(0);
+            let n = COUNT.fetch_add(1, Ordering::Relaxed);
+            if n < 16 || n.is_power_of_two() {
+                log::info!("[BQC_RELEASE] #{} slot={} frame_number={}", n, slot, frame_number);
+            }
+        }
         if slot < 0 || slot >= NUM_BUFFER_SLOTS as i32 {
             log::error!("BufferQueueConsumer: slot {} out of range", slot);
             return Status::BadValue;

@@ -100,6 +100,12 @@ impl BufferQueueProducer {
     }
 
     fn signal_buffer_wait_event(&self) {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNT: AtomicU64 = AtomicU64::new(0);
+        let n = COUNT.fetch_add(1, Ordering::Relaxed);
+        if n < 16 || n.is_power_of_two() {
+            log::info!("[BQP_SIGNAL] #{} signal_buffer_wait_event fired", n);
+        }
         self.buffer_wait_event().signal();
     }
 
@@ -318,6 +324,14 @@ impl BufferQueueProducer {
             "BQP::dequeue_buffer async={} w={} h={} format={:?} usage=0x{:X}",
             async_flag, width, height, format, usage
         ));
+        {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static COUNT: AtomicU64 = AtomicU64::new(0);
+            let n = COUNT.fetch_add(1, Ordering::Relaxed);
+            if n < 16 || n.is_power_of_two() {
+                log::info!("[BQP_DEQUEUE] #{} dequeue_buffer entry async={}", n, async_flag);
+            }
+        }
         if (width != 0 && height == 0) || (width == 0 && height != 0) {
             log::error!(
                 "BufferQueueProducer: invalid size: w={} h={}",
@@ -418,11 +432,23 @@ impl BufferQueueProducer {
             "BQP::dequeue_buffer -> slot={} flags={}",
             out_slot, return_flags
         ));
+        log::info!(
+            "[BQP_DEQUEUE_RET] slot={} flags=0x{:X}",
+            out_slot, return_flags
+        );
         (return_flags, out_slot, out_fence)
     }
 
     pub fn queue_buffer(&self, slot: i32, input: &QueueBufferInput) -> (Status, QueueBufferOutput) {
         trace_bqp(format_args!("BQP::queue_buffer slot={}", slot));
+        {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static COUNT: AtomicU64 = AtomicU64::new(0);
+            let n = COUNT.fetch_add(1, Ordering::Relaxed);
+            if n < 16 || n.is_power_of_two() {
+                log::info!("[BQP_QUEUE] #{} queue_buffer slot={}", n, slot);
+            }
+        }
         let (
             timestamp,
             is_auto_timestamp,
