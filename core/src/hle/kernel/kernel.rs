@@ -266,7 +266,19 @@ fn dump_thread_state(kernel: &KernelCore) {
             }
         }
     }
-
+    // Allow operator to inject extra addresses via RUZU_DUMP_ADDRS=0xAAA,0xBBB
+    // — the SIGUSR1 dumper will print memory around each. Useful for
+    // inspecting known init-write PCs or state-handler targets.
+    if let Ok(raw) = std::env::var("RUZU_DUMP_ADDRS") {
+        for s in raw.split(',') {
+            let s = s.trim().trim_start_matches("0x").trim_start_matches("0X");
+            if let Ok(addr) = u64::from_str_radix(s, 16) {
+                if addr != 0 && !pcs_to_dump.contains(&addr) {
+                    pcs_to_dump.push(addr);
+                }
+            }
+        }
+    }
     // Walk the application process (if any) and dump each thread.
     let system = kernel.system();
     if system.is_null() {
