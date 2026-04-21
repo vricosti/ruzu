@@ -597,15 +597,17 @@ impl CpuManager {
                             );
                         }
                     }
-                    // Record the guest PC at SVC entry for the SIGUSR1
-                    // dumper. Cheap — get_context is an in-process register
-                    // copy, not a syscall. This is the multi-core SVC path
-                    // that bypasses PhysicalCore::handoff_after_svc, so the
-                    // PC recording has to live here.
+                    // Record guest PC + LR at SVC entry for SIGUSR1 dumper.
+                    // LR points back into the caller (usually the game's
+                    // code that invoked the nnSdk SVC stub), which is more
+                    // diagnostic than PC when a spin loop calls the same
+                    // SVC millions of times.
                     {
                         let mut tc_pc = crate::arm::arm_interface::ThreadContext::default();
                         jit_ref.get_context(&mut tc_pc);
-                        crate::hle::kernel::kernel::record_guest_pc(core_index, tc_pc.pc);
+                        crate::hle::kernel::kernel::record_guest_pc_lr(
+                            core_index, tc_pc.pc, tc_pc.lr,
+                        );
                     }
                     let system_ref = kernel.system();
                     if !system_ref.is_null() {
@@ -656,14 +658,17 @@ impl CpuManager {
                 crate::hle::kernel::physical_core::PhysicalCoreExecutionEvent::Halted(
                     halt_reason,
                 ) => {
-                    // Refresh the SIGUSR1-dumper PC snapshot. Halts fire on
-                    // preemption interrupts (~10ms), so even a guest-code
-                    // spin loop with no SVCs gets its PC surfaced via
-                    // `kernel::GUEST_PC[core_index]` after each preempt.
+                    // Refresh the SIGUSR1-dumper PC+LR snapshot. Halts fire
+                    // on preemption interrupts (~10ms), so even a guest-code
+                    // spin loop with no SVCs gets its PC/LR surfaced via
+                    // `kernel::{GUEST_PC,GUEST_LR}[core_index]` after each
+                    // preempt.
                     {
                         let mut tc_pc = crate::arm::arm_interface::ThreadContext::default();
                         jit_ref.get_context(&mut tc_pc);
-                        crate::hle::kernel::kernel::record_guest_pc(core_index, tc_pc.pc);
+                        crate::hle::kernel::kernel::record_guest_pc_lr(
+                            core_index, tc_pc.pc, tc_pc.lr,
+                        );
                     }
                     let current_thread_id = thread_arc.lock().unwrap().get_thread_id();
                     let interrupt = halt_reason.contains(HaltReason::BREAK_LOOP);
