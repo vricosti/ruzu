@@ -1,11 +1,11 @@
 // SPDX-FileCopyrightText: 2014 Citra Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-//! yuzu-cmd: SDL2 command-line emulator frontend.
+//! ruzu-cmd: SDL2 command-line emulator frontend.
 //!
-//! Port of `yuzu_cmd/yuzu.cpp`.
+//! Port of upstream `yuzu_cmd/yuzu.cpp`.
 //!
-//! This binary is the SDL2-based command-line frontend for the yuzu Nintendo
+//! This binary is the SDL2-based command-line frontend for the ruzu Nintendo
 //! Switch emulator. It parses command-line arguments, loads an SDL2
 //! configuration, picks the correct renderer backend (OpenGL, Vulkan, or
 //! Null), initialises the emulator core, and runs the main event loop.
@@ -37,13 +37,13 @@ use sdl_config::SdlConfig;
 // CLI argument definitions
 // ---------------------------------------------------------------------------
 
-/// yuzu-cmd — SDL2 command-line Nintendo Switch emulator frontend.
+/// ruzu-cmd — SDL2 command-line Nintendo Switch emulator frontend.
 ///
 /// Maps to the `getopt_long` option table in C++ `main()`.
 #[derive(Parser, Debug)]
-#[command(name = "yuzu-cmd")]
+#[command(name = "ruzu-cmd")]
 #[command(version)]
-#[command(about = "yuzu Nintendo Switch emulator (SDL2 CLI frontend)")]
+#[command(about = "ruzu Nintendo Switch emulator (SDL2 CLI frontend)")]
 struct Args {
     /// Load the specified configuration file.
     ///

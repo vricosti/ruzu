@@ -1017,6 +1017,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "ruzu_cmd"
+version = "0.1.0"
+dependencies = [
+ "ash",
+ "audio_core",
+ "clap",
+ "common",
+ "core",
+ "env_logger",
+ "frontend_common",
+ "gl",
+ "input_common",
+ "log",
+ "parking_lot",
+ "raw-window-handle 0.6.2",
+ "rdynarmic",
+ "sdl2",
+ "video_core",
+]
+
+[[package]]
 name = "rxbyak"
 version = "0.1.0"
 dependencies = [
@@ -1498,27 +1519,6 @@ name = "xml-rs"
 version = "0.8.28"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3ae8337f8a065cfc972643663ea4279e04e7256de865aa66fe25cec5fb912d3f"
-
-[[package]]
-name = "yuzu_cmd"
-version = "0.1.0"
-dependencies = [
- "ash",
- "audio_core",
- "clap",
- "common",
- "core",
- "env_logger",
- "frontend_common",
- "gl",
- "input_common",
- "log",
- "parking_lot",
- "raw-window-handle 0.6.2",
- "rdynarmic",
- "sdl2",
- "video_core",
-]
 
 [[package]]
 name = "zerocopy"

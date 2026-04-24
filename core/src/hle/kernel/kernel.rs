@@ -603,7 +603,7 @@ fn dump_thread_state(kernel: &KernelCore) {
                     // Only interesting threads.
                     if !(comm.starts_with("CPUCore_") || comm == "CoreTiming"
                          || comm.starts_with("DSP_") || comm.starts_with("HLE:")
-                         || comm == "yuzu-cmd") {
+                         || comm == "ruzu-cmd") {
                         continue;
                     }
                     let wchan = std::fs::read_to_string(format!("/proc/self/task/{}/wchan", tid_str))
