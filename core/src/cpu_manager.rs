@@ -597,16 +597,18 @@ impl CpuManager {
                             );
                         }
                     }
-                    // Record guest PC + LR at SVC entry for SIGUSR1 dumper.
-                    // LR points back into the caller (usually the game's
-                    // code that invoked the nnSdk SVC stub), which is more
-                    // diagnostic than PC when a spin loop calls the same
-                    // SVC millions of times.
+                    // Record guest PC + LR + SP at SVC entry for SIGUSR1
+                    // dumper. LR points back into the caller (usually the
+                    // game's code that invoked the nnSdk SVC stub), which
+                    // is more diagnostic than PC when a spin loop calls the
+                    // same SVC millions of times. SP lets the dumper walk
+                    // stack frames above the stub to find the game-level
+                    // loop caller.
                     {
                         let mut tc_pc = crate::arm::arm_interface::ThreadContext::default();
                         jit_ref.get_context(&mut tc_pc);
-                        crate::hle::kernel::kernel::record_guest_pc_lr(
-                            core_index, tc_pc.pc, tc_pc.lr,
+                        crate::hle::kernel::kernel::record_guest_full(
+                            core_index, tc_pc.pc, tc_pc.lr, tc_pc.sp, &tc_pc.r,
                         );
                     }
                     let system_ref = kernel.system();
@@ -658,16 +660,16 @@ impl CpuManager {
                 crate::hle::kernel::physical_core::PhysicalCoreExecutionEvent::Halted(
                     halt_reason,
                 ) => {
-                    // Refresh the SIGUSR1-dumper PC+LR snapshot. Halts fire
-                    // on preemption interrupts (~10ms), so even a guest-code
-                    // spin loop with no SVCs gets its PC/LR surfaced via
-                    // `kernel::{GUEST_PC,GUEST_LR}[core_index]` after each
-                    // preempt.
+                    // Refresh the SIGUSR1-dumper PC+LR+SP snapshot. Halts
+                    // fire on preemption interrupts (~10ms), so even a
+                    // guest-code spin loop with no SVCs gets its PC/LR/SP
+                    // surfaced via `kernel::{GUEST_PC,GUEST_LR,GUEST_SP}
+                    // [core_index]` after each preempt.
                     {
                         let mut tc_pc = crate::arm::arm_interface::ThreadContext::default();
                         jit_ref.get_context(&mut tc_pc);
-                        crate::hle::kernel::kernel::record_guest_pc_lr(
-                            core_index, tc_pc.pc, tc_pc.lr,
+                        crate::hle::kernel::kernel::record_guest_full(
+                            core_index, tc_pc.pc, tc_pc.lr, tc_pc.sp, &tc_pc.r,
                         );
                     }
                     let current_thread_id = thread_arc.lock().unwrap().get_thread_id();
