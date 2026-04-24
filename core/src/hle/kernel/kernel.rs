@@ -355,6 +355,30 @@ fn dump_thread_state(kernel: &KernelCore) {
             }
         }
     }
+    // RUZU_POKE_ADDR=0x40037000:4:1 (addr:size_bytes:value_hex) — write a
+    // test value into guest memory on SIGUSR1. Experimental harness for
+    // empirically unblocking the MK8D wedge. Size must be 4 (u32 write).
+    let pokes: Vec<(u64, u32)> = std::env::var("RUZU_POKE_ADDR")
+        .ok()
+        .iter()
+        .flat_map(|raw| raw.split(',').map(|s| s.trim().to_string()).collect::<Vec<_>>())
+        .filter_map(|tok| {
+            let parts: Vec<&str> = tok.split(':').collect();
+            if parts.len() != 3 {
+                return None;
+            }
+            let a = parts[0].trim_start_matches("0x").trim_start_matches("0X");
+            let addr = u64::from_str_radix(a, 16).ok()?;
+            let size: u64 = parts[1].parse().ok()?;
+            if size != 4 {
+                return None;
+            }
+            let v = parts[2].trim_start_matches("0x").trim_start_matches("0X");
+            let value = u32::from_str_radix(v, 16).ok()?;
+            Some((addr, value))
+        })
+        .collect();
+
     // RUZU_DUMP_REGION=0x22C0000:24576 dumps a contiguous u32 range as raw
     // hex (no per-PC context windows) — useful for whole-vtable snapshots.
     let region_dumps: Vec<(u64, u64)> = std::env::var("RUZU_DUMP_REGION")
@@ -520,6 +544,22 @@ fn dump_thread_state(kernel: &KernelCore) {
                         eprint!(" {:08X}", w);
                     }
                     eprintln!();
+                }
+            }
+            // RUZU_POKE_ADDR — experimental write into guest memory to test
+            // whether a missing HLE signal is the root cause of a spin.
+            for (addr, value) in &pokes {
+                if let Some(memory) = guard.page_table.get_base().m_memory.as_ref() {
+                    let m = memory.lock().unwrap();
+                    let old = m.read_32(*addr);
+                    m.write_32(*addr, *value);
+                    let readback = m.read_32(*addr);
+                    eprintln!(
+                        "[POKE] addr=0x{:X} old=0x{:08X} wrote=0x{:08X} readback=0x{:08X}",
+                        addr, old, value, readback
+                    );
+                } else {
+                    eprintln!("[POKE] addr=0x{:X}: no page_table memory — skipping", addr);
                 }
             }
             guard.thread_list.clone()
