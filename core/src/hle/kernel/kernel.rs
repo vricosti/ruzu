@@ -140,6 +140,30 @@ pub static GUEST_LR: [std::sync::atomic::AtomicU64;
     std::sync::atomic::AtomicU64::new(0),
 ];
 
+/// Per-core last known guest SP. Lets the SIGUSR1 dumper walk a few stack
+/// frames above the current SVC/halt — the nnSdk SVC stub caller sits right
+/// above and its caller (the game-level function driving the loop) is
+/// typically within 1-2 frames up.
+pub static GUEST_SP: [std::sync::atomic::AtomicU64;
+    hardware_properties::NUM_CPU_CORES as usize] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+
+/// Per-core snapshot of ARM32 general-purpose registers r0..r11 (12 words).
+/// r12 is IP (intra-call scratch), r13 is SP (in GUEST_SP), r14 is LR
+/// (in GUEST_LR), r15 is PC (in GUEST_PC). We skip r12 because it's
+/// volatile; interesting values live in r4..r11 (callee-saved) and r0..r3
+/// (arg regs at call site). Updated alongside GUEST_{PC,LR,SP}.
+pub static GUEST_REGS: [[std::sync::atomic::AtomicU32; 12];
+    hardware_properties::NUM_CPU_CORES as usize] = {
+    const NEW: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    const ROW: [std::sync::atomic::AtomicU32; 12] = [NEW; 12];
+    [ROW, ROW, ROW, ROW]
+};
+
 #[inline]
 pub fn mark_svc_enter(core_id: usize, tid: u64, svc: u32) {
     if core_id >= SVC_IN_PROGRESS.len() { return; }
@@ -168,6 +192,35 @@ pub fn record_guest_pc_lr(core_id: usize, pc: u64, lr: u64) {
     }
     GUEST_PC[core_id].store(pc, Ordering::Release);
     GUEST_LR[core_id].store(lr, Ordering::Release);
+}
+
+/// Record the guest PC + LR + SP observed after an SVC / Halt.
+#[inline]
+pub fn record_guest_pc_lr_sp(core_id: usize, pc: u64, lr: u64, sp: u64) {
+    if core_id >= GUEST_PC.len() {
+        return;
+    }
+    GUEST_PC[core_id].store(pc, Ordering::Release);
+    GUEST_LR[core_id].store(lr, Ordering::Release);
+    GUEST_SP[core_id].store(sp, Ordering::Release);
+}
+
+/// Record the guest PC + LR + SP + r0..r11 observed after an SVC / Halt.
+/// Used by the SIGUSR1 dumper to see live register values during a spin
+/// loop (e.g., the `r8` object pointer and `r10` target count that drive
+/// the loop at game PC 0x015DFE30).
+#[inline]
+pub fn record_guest_full(core_id: usize, pc: u64, lr: u64, sp: u64, regs: &[u64]) {
+    if core_id >= GUEST_PC.len() {
+        return;
+    }
+    GUEST_PC[core_id].store(pc, Ordering::Release);
+    GUEST_LR[core_id].store(lr, Ordering::Release);
+    GUEST_SP[core_id].store(sp, Ordering::Release);
+    for (i, slot) in GUEST_REGS[core_id].iter().enumerate() {
+        let v = regs.get(i).copied().unwrap_or(0) as u32;
+        slot.store(v, Ordering::Release);
+    }
 }
 
 #[inline]
@@ -239,6 +292,7 @@ fn dump_thread_state(kernel: &KernelCore) {
 
     // Per-core running thread + interrupt flag + in-progress SVC + last guest PC.
     let mut pcs_to_dump: Vec<u64> = Vec::new();
+    let mut stacks_to_dump: Vec<(usize, u64)> = Vec::new();
     for core_id in 0..hardware_properties::NUM_CPU_CORES as usize {
         if let Some(core) = kernel.physical_core(core_id) {
             let interrupted = core.is_interrupted();
@@ -247,10 +301,32 @@ fn dump_thread_state(kernel: &KernelCore) {
             let svc_num = (packed & 0xFFFF_FFFF) as u32;
             let last_pc = GUEST_PC[core_id].load(Ordering::Acquire);
             let last_lr = GUEST_LR[core_id].load(Ordering::Acquire);
+            let last_sp = GUEST_SP[core_id].load(Ordering::Acquire);
             eprintln!(
-                "[DUMP] core={} is_interrupted={} in_svc={{tid={}, imm=0x{:X}}} last_guest_pc=0x{:X} last_guest_lr=0x{:X}",
-                core_id, interrupted, svc_tid, svc_num, last_pc, last_lr,
+                "[DUMP] core={} is_interrupted={} in_svc={{tid={}, imm=0x{:X}}} last_guest_pc=0x{:X} last_guest_lr=0x{:X} last_guest_sp=0x{:X}",
+                core_id, interrupted, svc_tid, svc_num, last_pc, last_lr, last_sp,
             );
+            // r0..r11 snapshot — surfaces live values of object pointers
+            // (r4..r11 are callee-saved; spin-loop base pointer typically
+            // lives in one of them) and arg regs at the SVC call site.
+            let regs: [u32; 12] = std::array::from_fn(|i| {
+                GUEST_REGS[core_id][i].load(Ordering::Acquire)
+            });
+            eprintln!(
+                "[DUMP]        regs r0-r3:  {:08X} {:08X} {:08X} {:08X}",
+                regs[0], regs[1], regs[2], regs[3],
+            );
+            eprintln!(
+                "[DUMP]        regs r4-r7:  {:08X} {:08X} {:08X} {:08X}",
+                regs[4], regs[5], regs[6], regs[7],
+            );
+            eprintln!(
+                "[DUMP]        regs r8-r11: {:08X} {:08X} {:08X} {:08X}",
+                regs[8], regs[9], regs[10], regs[11],
+            );
+            if last_sp != 0 {
+                stacks_to_dump.push((core_id, last_sp));
+            }
             if last_pc != 0 && !pcs_to_dump.contains(&last_pc) {
                 pcs_to_dump.push(last_pc);
             }
@@ -380,6 +456,39 @@ fn dump_thread_state(kernel: &KernelCore) {
                     }
                     None => eprintln!("[DUMP]   pc=0x{:X}: memory range not mapped", pc),
                 }
+            }
+            // Per-core guest stack dump — 128 words (512 bytes) starting at SP.
+            // The nnSdk SVC wrapper (e.g., `0x1D314F4`) is only one frame up
+            // from the SVC stub; its caller's LR sits a few words deeper in
+            // the stack. Walking these words reveals the game-level function
+            // driving the spin loop. See `project_mk8d_post_rng_wedge_2026_04_24.md`.
+            for (core_id, sp) in &stacks_to_dump {
+                const STACK_WORDS: usize = 128;
+                let mut stack_words: Vec<u32> = Vec::with_capacity(STACK_WORDS);
+                if let Some(memory) = guard.page_table.get_base().m_memory.as_ref() {
+                    let m = memory.lock().unwrap();
+                    for i in 0..STACK_WORDS {
+                        stack_words.push(m.read_32(sp + (i as u64) * 4));
+                    }
+                } else {
+                    let mem = guard.process_memory.read().unwrap();
+                    let len = (STACK_WORDS as u64) * 4;
+                    if !mem.is_valid_range(*sp, len as usize) {
+                        eprintln!("[DUMP]   core={} sp=0x{:X}: stack not mapped", core_id, sp);
+                        continue;
+                    }
+                    for i in 0..STACK_WORDS {
+                        stack_words.push(mem.read_32(sp + (i as u64) * 4));
+                    }
+                }
+                eprint!("[DUMP]   core={} stack@0x{:X}:", core_id, sp);
+                for (i, w) in stack_words.iter().enumerate() {
+                    if i > 0 && (i & 7) == 0 {
+                        eprint!("\n[DUMP]        +0x{:02X}:", i * 4);
+                    }
+                    eprint!(" {:08X}", w);
+                }
+                eprintln!();
             }
             // RUZU_DUMP_REGION raw u32 dumps — 8 words per line.
             for (start, bytes) in &region_dumps {
