@@ -10,6 +10,7 @@
 //!   - spl_types.h
 
 pub mod csrng;
+mod mt19937;
 pub mod spl;
 pub mod spl_module;
 pub mod spl_results;

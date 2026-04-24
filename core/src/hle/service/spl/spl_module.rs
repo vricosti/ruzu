@@ -7,7 +7,9 @@
 //! Module::Interface — SPL general service interface with GetConfig implementation.
 
 use std::collections::BTreeMap;
+use std::sync::Mutex;
 
+use super::mt19937::Mt19937;
 use super::spl_results;
 use super::spl_types::ConfigItem;
 use crate::hle::result::ResultCode;
@@ -38,11 +40,17 @@ pub mod commands {
 /// Module::Interface — SPL general interface.
 ///
 /// Corresponds to `Module::Interface` in upstream spl_module.h / spl_module.cpp.
+///
+/// Upstream owns a `std::mt19937 rng` member that advances across
+/// `GenerateRandomBytes` calls. We mirror that with a persistent
+/// `Mutex<Mt19937>`; resetting the state from the seed on each call — as
+/// the original port did — caused consecutive RNG calls to return
+/// identical byte sequences, which broke MK8D's PRNG-seeded boot.
 pub struct ModuleInterface {
     name: String,
     handlers: BTreeMap<u32, FunctionInfo>,
     handlers_tipc: BTreeMap<u32, FunctionInfo>,
-    rng_seed: u32,
+    rng: Mutex<Mt19937>,
 }
 
 impl ModuleInterface {
@@ -68,7 +76,7 @@ impl ModuleInterface {
             name: name.to_string(),
             handlers,
             handlers_tipc: BTreeMap::new(),
-            rng_seed: seed,
+            rng: Mutex::new(Mt19937::new(seed)),
         }
     }
 
@@ -148,18 +156,17 @@ impl ModuleInterface {
     /// GenerateRandomBytes (cmd 7).
     ///
     /// Corresponds to `Module::Interface::GenerateRandomBytes` in upstream.
+    /// Upstream draws one 32-bit value per byte from a persistent
+    /// `std::mt19937` through `std::uniform_int_distribution<u16>(0, 0xFF)`.
+    /// We match the persistence and take one MT output per byte; the byte
+    /// selection isn't bit-exact with libstdc++'s rejection-sampling impl,
+    /// but MT19937 outputs are uniformly distributed across all 32 bits,
+    /// so any byte slice of the output is uniform in [0, 0xFF].
     pub fn generate_random_bytes(&self, buf: &mut [u8]) {
         log::debug!("GenerateRandomBytes called, size={}", buf.len());
-        // Use a simple LCG seeded from our rng_seed, matching upstream's
-        // use of std::mt19937 with uniform_int_distribution<u16>.
-        // For proper emulation this should use a real PRNG.
-        let mut state = self.rng_seed as u64;
+        let mut rng = self.rng.lock().unwrap();
         for byte in buf.iter_mut() {
-            // Simple xorshift64
-            state ^= state << 13;
-            state ^= state >> 7;
-            state ^= state << 17;
-            *byte = (state & 0xFF) as u8;
+            *byte = (rng.next_u32() & 0xFF) as u8;
         }
     }
 

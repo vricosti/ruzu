@@ -9,7 +9,9 @@
 //! This is a Module::Interface variant with only GenerateRandomBytes (cmd 0).
 
 use std::collections::BTreeMap;
+use std::sync::Mutex;
 
+use super::mt19937::Mt19937;
 use crate::hle::result::ResultCode;
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
 use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
@@ -23,12 +25,14 @@ pub mod commands {
 
 /// CSRNG — IRandomInterface service.
 ///
-/// Corresponds to `CSRNG` in upstream csrng.h / csrng.cpp.
-/// This is a Module::Interface with only the GenerateRandomBytes handler.
+/// Corresponds to `CSRNG` in upstream csrng.h / csrng.cpp. This is a
+/// `Module::Interface` with only the `GenerateRandomBytes` handler.
+/// Upstream inherits the `std::mt19937 rng` member from `Module::Interface`;
+/// we mirror that with a persistent `Mutex<Mt19937>` per-instance.
 pub struct Csrng {
     handlers: BTreeMap<u32, FunctionInfo>,
     handlers_tipc: BTreeMap<u32, FunctionInfo>,
-    rng_seed: u32,
+    rng: Mutex<Mt19937>,
 }
 
 impl Csrng {
@@ -45,7 +49,7 @@ impl Csrng {
         Self {
             handlers,
             handlers_tipc: BTreeMap::new(),
-            rng_seed: seed,
+            rng: Mutex::new(Mt19937::new(seed)),
         }
     }
 
@@ -54,15 +58,9 @@ impl Csrng {
     /// Corresponds to `Module::Interface::GenerateRandomBytes` in upstream.
     pub fn generate_random_bytes(&self, buf: &mut [u8]) {
         log::debug!("CSRNG::generate_random_bytes called, size={}", buf.len());
-        // Use a simple PRNG. For proper emulation, this should use a
-        // cryptographic RNG. Upstream uses std::mt19937 with
-        // uniform_int_distribution<u16>.
-        let mut state = self.rng_seed as u64;
+        let mut rng = self.rng.lock().unwrap();
         for byte in buf.iter_mut() {
-            state ^= state << 13;
-            state ^= state >> 7;
-            state ^= state << 17;
-            *byte = (state & 0xFF) as u8;
+            *byte = (rng.next_u32() & 0xFF) as u8;
         }
     }
 }
