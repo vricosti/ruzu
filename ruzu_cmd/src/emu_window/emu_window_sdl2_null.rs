@@ -39,7 +39,7 @@ impl EmuWindowSdl2Null {
     pub fn new(fullscreen: bool) -> Self {
         let mut base = EmuWindowSdl2::new();
 
-        let window_title = b"yuzu-cmd (Null)\0";
+        let window_title = b"ruzu-cmd (Null)\0";
         // No OpenGL/Vulkan flags — plain resizable window.
         let window_flags = sdl::SDL_WindowFlags::SDL_WINDOW_RESIZABLE as u32
             | sdl::SDL_WindowFlags::SDL_WINDOW_ALLOW_HIGHDPI as u32;
@@ -78,7 +78,7 @@ impl EmuWindowSdl2Null {
         base.on_minimal_client_area_change_request(256, 256);
         unsafe { sdl::SDL_PumpEvents() };
 
-        log::info!("yuzu-cmd | Null window initialized");
+        log::info!("ruzu-cmd | Null window initialized");
 
         EmuWindowSdl2Null { base }
     }

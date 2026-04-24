@@ -9,7 +9,7 @@ LOGFILE="/tmp/mk8d-bench-${LABEL}.log"
 ROM="/home/vricosti/Games/Emulators/Switch/common/roms/Mario Kart 8 Deluxe [NSP]/Mario Kart 8 Deluxe [0100152000022000][v0].nsp"
 
 # Clean any leftover processes
-pkill -9 yuzu-cmd 2>/dev/null
+pkill -9 ruzu-cmd 2>/dev/null
 sleep 1
 
 rm -f "$LOGFILE"
@@ -18,14 +18,14 @@ env XDG_DATA_HOME=/tmp/ruzu-data \
     XDG_CACHE_HOME=/tmp/ruzu-cache \
     XDG_CONFIG_HOME=/tmp/ruzu-config \
     RUST_LOG=info \
-    cargo run --bin yuzu-cmd -- -g "$ROM" > "$LOGFILE" 2>&1 &
+    cargo run --bin ruzu-cmd -- -g "$ROM" > "$LOGFILE" 2>&1 &
 CARGO_PID=$!
 
 # Give it duration seconds to run
 sleep "$DURATION"
 
-# Kill the yuzu-cmd process spawned by cargo run
-pkill -9 yuzu-cmd 2>/dev/null
+# Kill the ruzu-cmd process spawned by cargo run
+pkill -9 ruzu-cmd 2>/dev/null
 sleep 2
 wait $CARGO_PID 2>/dev/null
 

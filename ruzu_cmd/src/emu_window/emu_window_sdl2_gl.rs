@@ -180,7 +180,7 @@ impl EmuWindowSdl2Gl {
             sdl::SDL_GL_SetSwapInterval(0);
         }
 
-        let window_title = b"yuzu-cmd (OpenGL)\0";
+        let window_title = b"ruzu-cmd (OpenGL)\0";
         let window_flags = sdl::SDL_WindowFlags::SDL_WINDOW_OPENGL as u32
             | sdl::SDL_WindowFlags::SDL_WINDOW_RESIZABLE as u32
             | sdl::SDL_WindowFlags::SDL_WINDOW_ALLOW_HIGHDPI as u32;
@@ -275,7 +275,7 @@ impl EmuWindowSdl2Gl {
             sdl::SDL_GL_SwapWindow(render_window);
         }
 
-        log::info!("yuzu-cmd | OpenGL window initialized");
+        log::info!("ruzu-cmd | OpenGL window initialized");
 
         instance
     }

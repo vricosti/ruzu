@@ -183,7 +183,7 @@ impl EmuWindowSdl2 {
         // Update window title every ~2 seconds.
         let current_time = unsafe { sdl::SDL_GetTicks() };
         if current_time > self.last_time + 2000 {
-            let title = b"yuzu-cmd\0";
+            let title = b"ruzu-cmd\0";
             unsafe {
                 sdl::SDL_SetWindowTitle(self.render_window, title.as_ptr() as *const _);
             }

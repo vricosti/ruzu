@@ -47,7 +47,7 @@ impl EmuWindowSdl2Vk {
     pub fn new(fullscreen: bool) -> Self {
         let mut base = EmuWindowSdl2::new();
 
-        let window_title = b"yuzu-cmd (Vulkan)\0";
+        let window_title = b"ruzu-cmd (Vulkan)\0";
         let window_flags = sdl::SDL_WindowFlags::SDL_WINDOW_RESIZABLE as u32
             | sdl::SDL_WindowFlags::SDL_WINDOW_ALLOW_HIGHDPI as u32;
 
@@ -107,7 +107,7 @@ impl EmuWindowSdl2Vk {
         base.on_minimal_client_area_change_request(256, 256);
         unsafe { sdl::SDL_PumpEvents() };
 
-        log::info!("yuzu-cmd | Vulkan window initialized");
+        log::info!("ruzu-cmd | Vulkan window initialized");
 
         EmuWindowSdl2Vk { base }
     }

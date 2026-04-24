@@ -12,7 +12,7 @@ members = [
     "web_service",
     "frontend_common",
     "dedicated_room",
-    "yuzu_cmd",
+    "ruzu_cmd",
 ]
 resolver = "2"
 
