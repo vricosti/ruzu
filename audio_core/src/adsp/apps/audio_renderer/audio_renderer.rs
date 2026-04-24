@@ -328,7 +328,24 @@ impl AudioRenderer {
                     if should_trace_adsp_audio() {
                         log::info!("ADSP::AudioRenderer dsp main received Render");
                     }
+                    // Per-step timing profile. Enabled by `RUZU_PROFILE_ADSP=1`.
+                    // Measures where each Render iteration spends its ~24ms.
+                    let profile = std::env::var_os("RUZU_PROFILE_ADSP").is_some();
+                    let prof_iter_start = std::time::Instant::now();
+                    let mut prof_shutdown_check_us = 0u128;
+                    let mut prof_timing_lock_us = 0u128;
+                    let mut prof_applet_id_lock_us = 0u128;
+                    let mut prof_stream_lookup_us = 0u128;
+                    let mut prof_init_shared_lock_us = 0u128;
+                    let mut prof_wait_free_us = 0u128;
+                    let mut prof_process_us = 0u128;
+                    let mut prof_end_time_lock_us = 0u128;
+                    let mut prof_post_process_stream_lock_us = 0u128;
+                    let mut prof_send_response_us = 0u128;
+
+                    let t = std::time::Instant::now();
                     if system.lock().is_shutting_down() {
+                        if profile { prof_shutdown_check_us = t.elapsed().as_micros(); }
                         thread::sleep(Duration::from_millis(5));
                         if should_trace_adsp_audio() {
                             log::info!(
@@ -338,19 +355,26 @@ impl AudioRenderer {
                         mailbox.send(Direction::Host, Message::RenderResponse as u32);
                         continue;
                     }
+                    if profile { prof_shutdown_check_us = t.elapsed().as_micros(); }
 
                     let mut buffers_reset = [false; MAX_RENDERER_SESSIONS];
                     let mut render_times_taken = [0u64; MAX_RENDERER_SESSIONS];
+                    let t = std::time::Instant::now();
                     let start_time =
                         system.lock().core_timing().get_global_time_us().as_micros() as u64;
+                    if profile { prof_timing_lock_us = t.elapsed().as_micros(); }
+                    let t = std::time::Instant::now();
                     let session0_applet_resource_user_id =
                         shared.lock().command_buffers[0].applet_resource_user_id;
+                    if profile { prof_applet_id_lock_us = t.elapsed().as_micros(); }
 
                     for index in 0..MAX_RENDERER_SESSIONS {
+                        let t = std::time::Instant::now();
                         let (stream, buffer_state) = {
                             let shared = shared.lock();
                             (shared.streams[index].clone(), shared.command_buffers[index])
                         };
+                        if profile { prof_stream_lookup_us += t.elapsed().as_micros(); }
                         if buffer_state.buffer == 0 {
                             continue;
                         }
@@ -372,6 +396,7 @@ impl AudioRenderer {
                             );
                         }
 
+                        let t = std::time::Instant::now();
                         {
                             let mut shared = shared.lock();
                             let RendererShared {
@@ -391,12 +416,14 @@ impl AudioRenderer {
                                 );
                             }
                         }
+                        if profile { prof_init_shared_lock_us += t.elapsed().as_micros(); }
 
                         if buffer_state.reset_buffer && !buffers_reset[index] {
                             stream.lock().clear_queue();
                             buffers_reset[index] = true;
                         }
 
+                        let t = std::time::Instant::now();
                         if index == 0 {
                             // Wait without holding the stream lock — the cubeb
                             // callback needs the lock to consume buffers.
@@ -414,6 +441,7 @@ impl AudioRenderer {
                                 );
                             }
                             release.wait_free_space_with_stop(&stop_requested);
+                            if profile { prof_wait_free_us += t.elapsed().as_micros(); }
                             if should_trace_adsp_audio() {
                                 let queued = release.queued_buffers.load(Ordering::Acquire);
                                 let max = release.max_queue_size.load(Ordering::Acquire);
@@ -440,6 +468,7 @@ impl AudioRenderer {
                         }
                         max_time = max_time.min(buffer_state.time_limit);
 
+                        let t_process = std::time::Instant::now();
                         let mut shared = shared.lock();
                         let RendererShared {
                             command_buffers,
@@ -450,10 +479,18 @@ impl AudioRenderer {
                         let buffer = &mut command_buffers[index];
                         processor.set_process_time_max(max_time);
                         render_times_taken[index] = processor.process(index as u32);
+                        if profile { prof_process_us += t_process.elapsed().as_micros(); }
+                        let t = std::time::Instant::now();
                         let end_time =
                             system.lock().core_timing().get_global_time_us().as_micros() as u64;
+                        if profile { prof_end_time_lock_us += t.elapsed().as_micros(); }
                         buffer.remaining_command_count = processor.get_remaining_command_count();
                         buffer.render_time_taken_us = end_time.saturating_sub(start_time);
+                        if profile {
+                            let t = std::time::Instant::now();
+                            let _guard = stream.lock();
+                            prof_post_process_stream_lock_us += t.elapsed().as_micros();
+                        }
                         if should_trace_adsp_audio() && index == 0 {
                             let stream_guard = stream.lock();
                             log::info!(
@@ -470,7 +507,38 @@ impl AudioRenderer {
                     if should_trace_adsp_audio() {
                         log::info!("ADSP::AudioRenderer dsp main sending RenderResponse");
                     }
+                    let t_send = std::time::Instant::now();
                     mailbox.send(Direction::Host, Message::RenderResponse as u32);
+                    if profile {
+                        prof_send_response_us = t_send.elapsed().as_micros();
+                        let total_us = prof_iter_start.elapsed().as_micros();
+                        let counted = prof_shutdown_check_us
+                            + prof_timing_lock_us
+                            + prof_applet_id_lock_us
+                            + prof_stream_lookup_us
+                            + prof_init_shared_lock_us
+                            + prof_wait_free_us
+                            + prof_process_us
+                            + prof_end_time_lock_us
+                            + prof_post_process_stream_lock_us
+                            + prof_send_response_us;
+                        let other = total_us.saturating_sub(counted);
+                        log::info!(
+                            "PROFILE_ADSP total_us={} shutdown={} timing_lock={} applet_id={} stream_lookup={} init_shared={} wait_free={} process={} end_time_lock={} post_stream_lock={} send={} other={}",
+                            total_us,
+                            prof_shutdown_check_us,
+                            prof_timing_lock_us,
+                            prof_applet_id_lock_us,
+                            prof_stream_lookup_us,
+                            prof_init_shared_lock_us,
+                            prof_wait_free_us,
+                            prof_process_us,
+                            prof_end_time_lock_us,
+                            prof_post_process_stream_lock_us,
+                            prof_send_response_us,
+                            other,
+                        );
+                    }
                 }
                 _ => {
                     warn!("ADSP AudioRenderer received an invalid message, msg={message:02X}!");

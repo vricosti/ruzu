@@ -42,18 +42,38 @@ impl SystemManager {
                 .name("AudioRenderSystemManager".to_string())
                 .spawn(move || {
                     log::info!("AudioRenderSystemManager thread started");
+                    let profile = std::env::var_os("RUZU_PROFILE_SYSMGR").is_some();
                     while active.load(Ordering::SeqCst) {
+                        let t_iter = std::time::Instant::now();
+                        let t = std::time::Instant::now();
                         {
                             let systems = systems.lock();
                             for system in systems.iter() {
                                 system.lock().send_command_to_dsp();
                             }
                         }
+                        let t_sendcmds = t.elapsed().as_micros();
 
+                        let t = std::time::Instant::now();
+                        let t_renderlock;
+                        let t_signal;
+                        let t_wait;
                         {
                             let mut renderer = audio_renderer.lock();
+                            t_renderlock = t.elapsed().as_micros();
+                            let t_s = std::time::Instant::now();
                             renderer.signal();
+                            t_signal = t_s.elapsed().as_micros();
+                            let t_w = std::time::Instant::now();
                             renderer.wait();
+                            t_wait = t_w.elapsed().as_micros();
+                        }
+                        if profile {
+                            let total = t_iter.elapsed().as_micros();
+                            log::info!(
+                                "PROFILE_SYSMGR total_us={} send_cmds_us={} render_lock_us={} signal_us={} wait_us={}",
+                                total, t_sendcmds, t_renderlock, t_signal, t_wait
+                            );
                         }
                     }
                 })
