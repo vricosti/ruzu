@@ -210,6 +210,14 @@ impl System {
 
     fn signal_rendered_event(&self) {
         let rendered_event_initialized = self.rendered_event.lock().unwrap().is_initialized();
+        if std::env::var_os("RUZU_TRACE_AUDIO_EVENT").is_some() {
+            log::info!(
+                "signal_rendered_event: initialized={} readable_event_present={} session_id={}",
+                rendered_event_initialized,
+                self.rendered_readable_event.is_some(),
+                self.session_id,
+            );
+        }
         if !rendered_event_initialized {
             return;
         }
@@ -373,6 +381,23 @@ impl System {
         self.applet_resource_user_id = applet_resource_user_id;
         self.session_id = session_id;
         self.set_process(process);
+        // Wire the global guest-memory accessor used by decode.rs to translate
+        // wave-buffer guest VAs to host bytes. Upstream zuyu carries
+        // `Kernel::KProcess*` through CommandListProcessor::Initialize and uses
+        // `process.GetMemory()`. We get the same Memory directly here at audio
+        // System init — it's the application process whose memory the decode
+        // pipeline needs to read. `system.memory_shared()` returns None at this
+        // point because it queries `current_process` which isn't set yet.
+        if !process.is_null() {
+            let mem_opt = unsafe { (*process).get_memory() };
+            if let Some(mem) = mem_opt {
+                crate::init_guest_memory_accessor(mem);
+            } else {
+                log::warn!(
+                    "audio_core::System::initialize: process.get_memory() returned None"
+                );
+            }
+        }
         let transfer_memory_source_address = unsafe { (*transfer_memory).get_source_address() };
         if let Some(memory) = self.core.lock().get_svc_memory() {
             memory.lock().unwrap().zero_block(
@@ -774,12 +799,11 @@ impl System {
         }
 
         self.terminate_event.reset();
-        let _ = self.core.lock().is_shutting_down();
         let remaining_command_count = self
             .audio_renderer
             .lock()
             .get_remain_command_count(self.session_id);
-        log::info!(
+        log::trace!(
             "audio_core::renderer::System::send_command_to_dsp session_id={} remaining={} reset={}",
             self.session_id,
             remaining_command_count,
@@ -893,6 +917,7 @@ impl System {
                 render_channels,
                 &self.depop_buffer,
                 &self.depop_buffer_pool,
+                self.mix_buffer_count,
             );
             generator.generate_voice_commands();
         }
@@ -926,6 +951,7 @@ impl System {
                 render_channels,
                 &self.depop_buffer,
                 &self.depop_buffer_pool,
+                self.mix_buffer_count,
             );
             generator.generate_submix_commands();
             generator.generate_final_mix_commands();

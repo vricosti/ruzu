@@ -54,6 +54,12 @@ pub struct CommandGenerator<'a> {
     render_channels: i8,
     depop_buffer: &'a [i32],
     depop_buffer_pool: &'a MemoryPoolInfo,
+    /// Mix buffer count (= params.mixes), distinct from
+    /// `command_list_header.buffer_count` which equals
+    /// mix_buffer_count + voice_channels. Voice scratch slots live
+    /// at indices [mix_buffer_count..buffer_count]. Upstream zuyu's
+    /// equivalent is `render_context.mix_buffer_count`.
+    mix_buffer_count: i16,
 }
 
 impl<'a> CommandGenerator<'a> {
@@ -75,6 +81,7 @@ impl<'a> CommandGenerator<'a> {
         render_channels: i8,
         depop_buffer: &'a [i32],
         depop_buffer_pool: &'a MemoryPoolInfo,
+        mix_buffer_count: i16,
     ) -> Self {
         Self {
             command_buffer,
@@ -92,6 +99,7 @@ impl<'a> CommandGenerator<'a> {
             upsampler_manager,
             session_id,
             render_channels,
+            mix_buffer_count,
             depop_buffer,
             depop_buffer_pool,
         }
@@ -139,16 +147,60 @@ impl<'a> CommandGenerator<'a> {
         let _ = self
             .command_buffer
             .generate_clear_mix_command(u32::MAX, mix_buffer_count);
+        let cmd_after_clear = self.command_buffer.count();
         self.generate_voice_commands();
+        let cmd_after_voice = self.command_buffer.count();
         self.generate_submix_commands();
         self.generate_final_mix_commands();
         self.generate_sink_commands();
         self.command_list_header.command_count = self.command_buffer.count();
+        if std::env::var_os("RUZU_TRACE_CMDGEN").is_some() {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static COUNT: AtomicU64 = AtomicU64::new(0);
+            let c = COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+            if c <= 10 || c % 100 == 0 {
+                let voice_count = self.voice_context.get_count();
+                let active_count = self.voice_context.get_active_count();
+                log::info!(
+                    "command_generator::generate #{} total_cmds={} after_clear={} after_voice={} voice_total={} voice_active={}",
+                    c,
+                    self.command_list_header.command_count,
+                    cmd_after_clear,
+                    cmd_after_voice,
+                    voice_count,
+                    active_count,
+                );
+            }
+        }
     }
 
     pub fn generate_voice_commands(&mut self) {
         self.voice_context.sort_info();
         let sorted_indices = self.voice_context.sorted_voice_indices().to_vec();
+        if std::env::var_os("RUZU_TRACE_CMDGEN").is_some() {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static COUNT: AtomicU64 = AtomicU64::new(0);
+            let c = COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+            if c <= 5 || c % 200 == 0 {
+                let mut in_use = 0u32;
+                let mut skipped = 0u32;
+                for vidx in &sorted_indices {
+                    if let Some(v) = self.voice_context.infos_mut().get(*vidx) {
+                        if v.in_use {
+                            in_use += 1;
+                            if v.should_skip() {
+                                skipped += 1;
+                            }
+                        }
+                    }
+                }
+                let active = self.voice_context.get_active_count();
+                log::info!(
+                    "generate_voice_commands #{} sorted={} in_use={} skipped={} active_after_update={}",
+                    c, sorted_indices.len(), in_use, skipped, active
+                );
+            }
+        }
 
         for voice_index in sorted_indices {
             let Some(voice) = self
@@ -183,16 +235,36 @@ impl<'a> CommandGenerator<'a> {
                 let Some(resource_id) = voice.channel_resource_ids.get(channel).copied() else {
                     continue;
                 };
-                let Some((depop_commands, data_command, voice_state)) = self
-                    .voice_context
-                    .get_dsp_shared_state_ref(resource_id)
+                let dsp_state = self.voice_context.get_dsp_shared_state_ref(resource_id);
+                if dsp_state.is_none() && std::env::var_os("RUZU_TRACE_CMDGEN").is_some() {
+                    log::warn!(
+                        "build_data_source: NO dsp_shared_state for resource_id={}",
+                        resource_id
+                    );
+                }
+                let Some((depop_commands, data_command, voice_state)) = dsp_state
                     .and_then(|voice_state_ref| {
+                        // Upstream zuyu passes `render_context.mix_buffer_count`
+                        // (the count of MIX buffers, not the total buffer_count
+                        // which also includes voice_channels). Voice scratch
+                        // slots live at indices [mix_buffer_count..buffer_count].
+                        // Passing the larger buffer_count produced output_index
+                        // values past the end of mix_buffers, causing
+                        // mix_buffer_range to bail and decode_from_wave_buffers
+                        // to never run. See voice_info.cpp::GenerateAdpcmVersion1Command call.
                         let data_command = self.build_data_source_command(
                             &voice,
                             voice_state_ref,
                             channel as i8,
-                            self.command_list_header.buffer_count,
-                        )?;
+                            self.mix_buffer_count,
+                        );
+                        if data_command.is_none() && std::env::var_os("RUZU_TRACE_CMDGEN").is_some() {
+                            log::warn!(
+                                "build_data_source: NO data_command for voice node_id={} channel={} sample_format={:?}",
+                                voice.node_id, channel, voice.sample_format
+                            );
+                        }
+                        let data_command = data_command?;
                         let depop_commands =
                             self.build_voice_depop_prepare_commands(&voice, voice_state_ref);
                         Some((depop_commands, data_command, *voice_state_ref))
@@ -200,6 +272,17 @@ impl<'a> CommandGenerator<'a> {
                 else {
                     continue;
                 };
+                if std::env::var_os("RUZU_TRACE_CMDGEN").is_some() {
+                    use std::sync::atomic::{AtomicU64, Ordering};
+                    static SEEN: AtomicU64 = AtomicU64::new(0);
+                    let s = SEEN.fetch_add(1, Ordering::Relaxed) + 1;
+                    if s <= 5 {
+                        log::info!(
+                            "voice_data_path: voice_node_id={} channel={} was_playing={} has_connection={}",
+                            voice.node_id, channel, voice.was_playing, voice.has_any_connection()
+                        );
+                    }
+                }
                 for (command, enabled) in depop_commands {
                     let _ = self.command_buffer.push_with_enabled(
                         Command::DepopPrepare(command),
@@ -209,6 +292,27 @@ impl<'a> CommandGenerator<'a> {
                 }
                 if !voice.was_playing {
                     let _ = self.command_buffer.push(data_command, node_id);
+                    if std::env::var_os("RUZU_TRACE_CMDGEN").is_some() {
+                        use std::sync::atomic::{AtomicU64, Ordering};
+                        static PUSHED: AtomicU64 = AtomicU64::new(0);
+                        let n = PUSHED.fetch_add(1, Ordering::Relaxed) + 1;
+                        if n <= 10 || n % 100 == 0 {
+                            log::info!(
+                                "data_source_push #{} voice={} channel={} fmt={:?}",
+                                n, voice.node_id, channel, voice.sample_format
+                            );
+                        }
+                    }
+                } else if std::env::var_os("RUZU_TRACE_CMDGEN").is_some() {
+                    use std::sync::atomic::{AtomicU64, Ordering};
+                    static SKIP: AtomicU64 = AtomicU64::new(0);
+                    let n = SKIP.fetch_add(1, Ordering::Relaxed) + 1;
+                    if n <= 10 || n % 500 == 0 {
+                        log::info!(
+                            "data_source_SKIP #{} voice={} channel={} (was_playing=true)",
+                            n, voice.node_id, channel
+                        );
+                    }
                 }
 
                 if voice.has_any_connection() {
@@ -1760,6 +1864,7 @@ mod tests {
             2,
             depop_buffer,
             depop_buffer_pool,
+            17,
         )
     }
 

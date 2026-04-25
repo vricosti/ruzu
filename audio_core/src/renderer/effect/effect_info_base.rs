@@ -510,28 +510,23 @@ impl EffectInfoBase {
 
     pub(crate) fn apply_common_settings(
         &mut self,
-        is_new: bool,
+        _is_new: bool,
         enabled: bool,
         mix_id: i32,
         process_order: i32,
     ) {
+        // Match upstream zuyu's per-effect Update() — only mirror the
+        // shared param fields. Upstream does NOT touch usage_state or
+        // out_status here. usage_state is only set by:
+        //   - per-effect-type update_v1/v2 with `if buffer_unmapped || is_new { usage_state = New }`
+        //   - update_for_command_generation: `Enabled` when `enabled`, else `Disabled`
+        // Setting usage_state=Disabled here (the prior ruzu bug) made
+        // store_status emit OutStatus::Removed for all effects, which the
+        // game's audio worker likely interprets as "no effects active" and
+        // skips the post-update Flush+Signal cleanup branch.
         self.enabled = enabled;
         self.mix_id = mix_id;
         self.process_order = process_order;
-        self.usage_state = if is_new {
-            UsageState::New
-        } else if enabled {
-            UsageState::Enabled
-        } else {
-            UsageState::Disabled
-        };
-        self.out_status = if is_new {
-            OutStatus::New
-        } else if enabled {
-            OutStatus::Used
-        } else {
-            OutStatus::Initialized
-        };
     }
 
     pub(crate) fn is_channel_count_valid(channel_count: i32) -> bool {

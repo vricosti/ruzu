@@ -484,6 +484,17 @@ impl ruzu_core::core::AudioCoreInterface for AudioCore {
             ));
         }
 
+        // Wire up the audio_core guest memory accessor used by decode.rs
+        // to translate guest VA wave-buffer addresses to host bytes.
+        // Guarded by OnceLock; safe to call repeatedly.
+        if let Some(mem) = self.system.lock().memory_shared() {
+            crate::init_guest_memory_accessor(mem);
+        } else {
+            log::warn!(
+                "audio_core::open_audio_renderer: system.memory_shared() returned None"
+            );
+        }
+
         let renderer_system = Arc::new(Mutex::new(RendererSystem::new(
             self.system.clone(),
             self.adsp.audio_renderer(),

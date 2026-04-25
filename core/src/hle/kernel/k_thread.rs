@@ -1461,7 +1461,28 @@ impl KThread {
 
     pub fn complete_synchronization_wait(&mut self, synced_index: i32, result: u32) {
         self.synced_index = synced_index;
-        self.end_wait(result);
+        // Upstream's `ThreadQueueImplForKSynchronizationObjectWait::NotifyAvailable`
+        // calls `KThreadQueue::EndWait` (the BASE class, not the panicking
+        // `KThreadQueueWithoutEndWait::EndWait`). Sync object wait queues are
+        // KThreadQueueWithoutEndWait, so going through the regular `end_wait`
+        // path (KThread::end_wait → wait_queue.end_wait) would hit the
+        // "should never be called" assertion. We replicate the upstream
+        // notify-available flow inline: clear cancellable + base_end_wait.
+        let _scheduler_lock = self.lock_scheduler();
+        if self.get_state() != ThreadState::WAITING {
+            return;
+        }
+        let Some(wait_queue) = self.wait_queue.clone() else {
+            log::error!(
+                "complete_synchronization_wait: wait_queue is None while state=Waiting"
+            );
+            return;
+        };
+        self.clear_cancellable();
+        wait_queue.base_end_wait(self, result);
+        self.sleep_deadline = None;
+        self.waiting_lock_info = None;
+        self.apply_wait_result_to_context();
     }
 
     /// Cancel any outstanding synchronization wait: unlink every node this
@@ -3190,6 +3211,7 @@ impl KThread {
         if self.get_state() == ThreadState::WAITING {
             self.synced_index = -1;
             self.wait_result = RESULT_TIMED_OUT.get_inner_value();
+            crate::hle::kernel::sleep_timing::observe_wake(self.thread_id);
             if let Some(wait_queue) = self.wait_queue.clone() {
                 if ct_trace {
                     log::info!("on_timer tid={} before_cancel_wait", self.thread_id);
