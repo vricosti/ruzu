@@ -253,15 +253,45 @@ impl IAudioRenderer {
             performance.len(),
             result.get_inner_value()
         );
-        if std::env::var_os("RUZU_LOG_AUDIO_UPDATE_BYTES").is_some() && !output.is_empty() {
-            let preview_words: Vec<u32> = output
+        // RUZU_DUMP_AUDIO_UPDATE=N: write the full output buffer of call N to
+        // /tmp/ruzu-audio-update-N.bin for byte-diff against zuyu.
+        if let Ok(target_str) = std::env::var("RUZU_DUMP_AUDIO_UPDATE") {
+            if let Ok(target) = target_str.parse::<u64>() {
+                use std::sync::atomic::{AtomicU64, Ordering};
+                static COUNT: AtomicU64 = AtomicU64::new(0);
+                let n = COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+                if n == target {
+                    let path = format!("/tmp/ruzu-audio-update-{}.bin", target);
+                    if let Err(e) = std::fs::write(&path, &output) {
+                        log::error!("RUZU_DUMP_AUDIO_UPDATE: failed to write {}: {}", path, e);
+                    } else {
+                        log::info!("RUZU_DUMP_AUDIO_UPDATE: wrote {} bytes to {}", output.len(), path);
+                    }
+                }
+            }
+        }
+        if std::env::var_os("RUZU_LOG_AUDIO_UPDATE_BYTES").is_some() && output.len() >= 0x1A00 {
+            let words: Vec<u32> = output
                 .chunks_exact(4)
-                .take(8)
+                .take(0x680)
                 .map(|chunk| u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
                 .collect();
             log::info!(
-                "IAudioRenderer::RequestUpdate output_preview={:08X?}",
-                preview_words
+                "IAudioRenderer::RequestUpdate header_w0_15=[{:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X}]",
+                words[0], words[1], words[2], words[3], words[4], words[5], words[6], words[7],
+                words[8], words[9], words[10], words[11], words[12], words[13], words[14], words[15]
+            );
+            log::info!(
+                "IAudioRenderer::RequestUpdate mempool_w16_31=[{:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X}]",
+                words[16], words[17], words[18], words[19], words[20], words[21], words[22], words[23],
+                words[24], words[25], words[26], words[27], words[28], words[29], words[30], words[31]
+            );
+            // Voices section starts at 0x40 + memory_pool_size (0x18E0) = 0x1920 → word index 0x648
+            let v0 = 0x648usize;
+            log::info!(
+                "IAudioRenderer::RequestUpdate voices_first16=[{:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X}]",
+                words[v0], words[v0+1], words[v0+2], words[v0+3], words[v0+4], words[v0+5], words[v0+6], words[v0+7],
+                words[v0+8], words[v0+9], words[v0+10], words[v0+11], words[v0+12], words[v0+13], words[v0+14], words[v0+15]
             );
         }
         if should_trace_audio_update_decoded() && output.len() >= 0x30 {
