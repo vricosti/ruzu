@@ -127,11 +127,56 @@ pub fn process_adpcm_data_source_version1_command(
     sample_count: usize,
     target_sample_rate: u32,
 ) {
+    let trace_decode = std::env::var_os("RUZU_TRACE_DECODE").is_some();
+    if trace_decode {
+        log::info!(
+            "process_adpcm_v1 ENTER output_index={} sample_count={} target_rate={} voice_state_addr=0x{:X} data_addr=0x{:X} data_size={} mix_buffers_len={}",
+            payload.output_index,
+            sample_count,
+            target_sample_rate,
+            payload.voice_state,
+            payload.data_address,
+            payload.data_size,
+            mix_buffers.len(),
+        );
+        for (i, wb) in payload.wave_buffers.iter().enumerate() {
+            log::info!(
+                "  wave_buffer[{}] buffer=0x{:X} buffer_size={} start_offset={} end_offset={} looping={}",
+                i, wb.buffer, wb.buffer_size, wb.start_offset, wb.end_offset, wb.looping
+            );
+        }
+    }
+    // SAFETY: bail out early if the wave buffer addresses look like unmapped
+    // guest virtual addresses (high heap area 0x80000000+) that would segfault
+    // when dereferenced as host pointers. Tracking issue: ruzu's audio_core
+    // memory pool translation isn't fully wired up yet.
+    if std::env::var_os("RUZU_AUDIO_DECODE_SKIP_UNMAPPED").is_some() {
+        for wb in &payload.wave_buffers {
+            if wb.buffer != 0 && wb.buffer >= 0x10_0000_0000 {
+                if trace_decode {
+                    log::warn!("process_adpcm_v1 SKIP: wave buffer at 0x{:X} looks unmapped", wb.buffer);
+                }
+                return;
+            }
+        }
+        if payload.data_address != 0 && payload.data_address >= 0x10_0000_0000 {
+            if trace_decode {
+                log::warn!("process_adpcm_v1 SKIP: data_address 0x{:X} looks unmapped", payload.data_address);
+            }
+            return;
+        }
+    }
     let Some(output_range) = mix_buffer_range(mix_buffers, payload.output_index, sample_count)
     else {
+        if trace_decode {
+            log::warn!("process_adpcm_v1 BAIL: mix_buffer_range returned None (output_index={} sample_count={} mix_buffers_len={})", payload.output_index, sample_count, mix_buffers.len());
+        }
         return;
     };
     let Some(voice_state) = read_voice_state_mut(payload.voice_state) else {
+        if trace_decode {
+            log::warn!("process_adpcm_v1 BAIL: read_voice_state_mut returned None (voice_state_addr=0x{:X})", payload.voice_state);
+        }
         return;
     };
 

@@ -70,11 +70,23 @@ impl CommandListProcessor {
             return false;
         };
 
-        self.system = Some(system);
+        self.system = Some(system.clone());
         self.process = ProcessHandle::from_ptr(process);
         // Stub: previously extracted MemoryManager from KProcess.
         // With ruzu_kernel removed, memory handle is left as null.
         self.memory = MemoryHandle::default();
+        // Set the global guest memory accessor used by the decode path
+        // to translate guest virtual wave-buffer addresses to host bytes.
+        // See `audio_core/src/lib.rs::GUEST_MEMORY_ACCESSOR`.
+        if crate::GUEST_MEMORY_ACCESSOR.get().is_none() {
+            if let Some(mem) = system.lock().memory_shared() {
+                if crate::GUEST_MEMORY_ACCESSOR.set(mem).is_ok() {
+                    log::info!("audio_core: GUEST_MEMORY_ACCESSOR initialized");
+                }
+            } else {
+                log::warn!("audio_core: system.memory_shared() returned None, GUEST_MEMORY_ACCESSOR not set");
+            }
+        }
         self.stream = Some(stream);
         self.header = header;
         self.commands = buffer.saturating_add(COMMAND_LIST_HEADER_SIZE);
@@ -239,6 +251,27 @@ impl CommandListProcessor {
     }
 
     fn process_command(&mut self, header: &CommandHeader, payload_addr: CpuAddr) {
+        if std::env::var_os("RUZU_TRACE_DSPCMD").is_some() {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static COUNTS: [AtomicU64; 32] = [
+                AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
+                AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
+                AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
+                AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
+                AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
+                AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
+                AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
+                AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
+            ];
+            let cmd_type = (header.type_ as u8 as usize) & 31;
+            let n = COUNTS[cmd_type].fetch_add(1, Ordering::Relaxed) + 1;
+            if n == 1 || n % 5000 == 0 {
+                log::info!(
+                    "DSPCMD type={} count={} (process #{})",
+                    header.type_ as u8, n, self.processed_command_count + 1
+                );
+            }
+        }
         process_command(self, header, payload_addr);
     }
 

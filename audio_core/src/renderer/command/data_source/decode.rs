@@ -81,6 +81,24 @@ pub fn read_voice_state_mut(addr: CpuAddr) -> Option<&'static mut VoiceState> {
 }
 
 pub fn decode_from_wave_buffers(args: DecodeFromWaveBuffersArgs<'_>) {
+    // RUZU_TRACE_DECODE: count + log entry into decode pipeline.
+    // Used to diagnose "audio worker runs but voices never play" wedge.
+    if std::env::var_os("RUZU_TRACE_DECODE").is_some() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNT: AtomicU64 = AtomicU64::new(0);
+        let c = COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+        if c <= 10 || c % 1000 == 0 {
+            log::info!(
+                "decode_from_wave_buffers #{} sample_count={} src_rate={} tgt_rate={} pitch={} wb_count={}",
+                c,
+                args.sample_count,
+                args.source_sample_rate,
+                args.target_sample_rate,
+                args.pitch,
+                args.wave_buffers.len(),
+            );
+        }
+    }
     let voice_state = args.voice_state;
     let mut remaining_sample_count = args.sample_count.min(args.output.len() as u32);
     let mut fraction = voice_state.fraction;
@@ -173,24 +191,49 @@ pub fn decode_from_wave_buffers(args: DecodeFromWaveBuffersArgs<'_>) {
                 adpcm_context: None,
             };
 
-            let samples_decoded = match args.sample_format {
-                SampleFormat::PcmInt16 => {
-                    decode_pcm_i16(&mut temp_buffer[temp_buffer_pos..], &decode_arg)
-                }
-                SampleFormat::PcmFloat => {
-                    decode_pcm_f32(&mut temp_buffer[temp_buffer_pos..], &decode_arg)
-                }
-                SampleFormat::Adpcm => {
-                    match read_adpcm_coefficients(args.data_address, args.data_size) {
-                        Some(coefficients) => {
-                            decode_arg.coefficients = coefficients;
-                            decode_arg.adpcm_context = Some(&mut voice_state.adpcm_context);
-                            decode_adpcm(&mut temp_buffer[temp_buffer_pos..], &mut decode_arg)
-                        }
-                        None => 0,
+            // Workaround for ruzu audio memory-pool translation gap:
+            // wave buffer addresses are guest virtual addrs (e.g. 0x80?????)
+            // that aren't mapped in the host process. Reading them segfaults.
+            // Until audio_core's MemoryPoolInfo translation is wired up
+            // properly (matching upstream zuyu's `memory.ReadBlockUnsafe`),
+            // gate the actual decode behind RUZU_AUDIO_REAL_DECODE. Default:
+            // skip the read but pretend we decoded `samples_to_read` samples
+            // so voice_state.played_sample_count increments — letting the
+            // game's audio worker see voice progress and unwedge the boot.
+            // Workaround for incomplete audio_core memory pool translation:
+            // when wave_buffer addresses are guest VAs (< 4GB) AND the
+            // GUEST_MEMORY_ACCESSOR isn't set up yet, skip real decode
+            // (would read 0s) and fake samples_decoded so the loop progresses.
+            // RUZU_AUDIO_REAL_DECODE=1 forces real decode regardless.
+            let real_decode = std::env::var_os("RUZU_AUDIO_REAL_DECODE").is_some();
+            let buffer_is_guest = decode_arg.buffer != 0 && decode_arg.buffer < 0x1_0000_0000;
+            let translation_unavailable = crate::GUEST_MEMORY_ACCESSOR.get().is_none();
+            let samples_decoded = if !real_decode
+                && buffer_is_guest
+                && translation_unavailable
+            {
+                let avail = (TEMP_BUFFER_SIZE - temp_buffer_pos) as u32;
+                decode_arg.samples_to_read.min(avail)
+            } else {
+                match args.sample_format {
+                    SampleFormat::PcmInt16 => {
+                        decode_pcm_i16(&mut temp_buffer[temp_buffer_pos..], &decode_arg)
                     }
+                    SampleFormat::PcmFloat => {
+                        decode_pcm_f32(&mut temp_buffer[temp_buffer_pos..], &decode_arg)
+                    }
+                    SampleFormat::Adpcm => {
+                        match read_adpcm_coefficients(args.data_address, args.data_size) {
+                            Some(coefficients) => {
+                                decode_arg.coefficients = coefficients;
+                                decode_arg.adpcm_context = Some(&mut voice_state.adpcm_context);
+                                decode_adpcm(&mut temp_buffer[temp_buffer_pos..], &mut decode_arg)
+                            }
+                            None => 0,
+                        }
+                    }
+                    _ => 0,
                 }
-                _ => 0,
             };
 
             played_sample_count = played_sample_count.saturating_add(samples_decoded as u64);
@@ -292,6 +335,22 @@ fn load_adpcm_context(target: &mut AdpcmContext, wavebuffer: &WaveBufferVersion2
     {
         return;
     }
+    // Same guest VA detection as read_adpcm_coefficients.
+    if wavebuffer.context < 0x1_0000_0000 {
+        let mut buf = [0u8; std::mem::size_of::<AdpcmContext>()];
+        if !crate::guest_read_block(wavebuffer.context as u64, &mut buf) {
+            return;
+        }
+        // SAFETY: AdpcmContext is repr(C) plain-old-data; bytewise copy.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                buf.as_ptr(),
+                target as *mut AdpcmContext as *mut u8,
+                std::mem::size_of::<AdpcmContext>(),
+            );
+        }
+        return;
+    }
     unsafe {
         *target = *(wavebuffer.context as *const AdpcmContext);
     }
@@ -301,24 +360,61 @@ fn read_adpcm_coefficients(data_address: CpuAddr, data_size: u64) -> Option<[i16
     if data_address == 0 || data_size < std::mem::size_of::<[i16; 16]>() as u64 {
         return None;
     }
+    // Guest 32-bit addresses fit in 4GB; host pointers on x86_64 Linux are
+    // typically much higher (0x55... or 0x7f... range). Use the guest memory
+    // accessor for low addresses to translate guest VA → host bytes.
+    if data_address < 0x1_0000_0000 {
+        let mut buf = [0u8; std::mem::size_of::<[i16; 16]>()];
+        if !crate::guest_read_block(data_address as u64, &mut buf) {
+            return None;
+        }
+        // SAFETY: [i16; 16] is plain-old-data; bytewise copy via from_le_bytes.
+        let mut out = [0i16; 16];
+        for (i, chunk) in buf.chunks_exact(2).enumerate() {
+            out[i] = i16::from_le_bytes([chunk[0], chunk[1]]);
+        }
+        return Some(out);
+    }
     Some(unsafe { *(data_address as *const [i16; 16]) })
 }
 
 fn decode_pcm_i16(output: &mut [i16], req: &DecodeArg<'_>) -> u32 {
+    let buffer_is_guest = req.buffer != 0 && req.buffer < 0x1_0000_0000;
     decode_pcm(
         output,
         req,
-        |addr, sample_index| unsafe { *((addr as *const i16).add(sample_index)) },
+        |addr, sample_index| {
+            if buffer_is_guest {
+                let mut buf = [0u8; 2];
+                let byte_offset = (sample_index * std::mem::size_of::<i16>()) as u64;
+                if !crate::guest_read_block(addr as u64 + byte_offset, &mut buf) {
+                    return 0;
+                }
+                i16::from_le_bytes(buf)
+            } else {
+                unsafe { *((addr as *const i16).add(sample_index)) }
+            }
+        },
         std::mem::size_of::<i16>(),
     )
 }
 
 fn decode_pcm_f32(output: &mut [i16], req: &DecodeArg<'_>) -> u32 {
+    let buffer_is_guest = req.buffer != 0 && req.buffer < 0x1_0000_0000;
     decode_pcm(
         output,
         req,
         |addr, sample_index| {
-            let sample = unsafe { *((addr as *const f32).add(sample_index)) };
+            let sample = if buffer_is_guest {
+                let mut buf = [0u8; 4];
+                let byte_offset = (sample_index * std::mem::size_of::<f32>()) as u64;
+                if !crate::guest_read_block(addr as u64 + byte_offset, &mut buf) {
+                    return 0;
+                }
+                f32::from_le_bytes(buf)
+            } else {
+                unsafe { *((addr as *const f32).add(sample_index)) }
+            };
             (sample * i16::MAX as f32).clamp(i16::MIN as f32, i16::MAX as f32) as i16
         },
         std::mem::size_of::<f32>(),
@@ -413,11 +509,18 @@ fn decode_adpcm(output: &mut [i16], req: &mut DecodeArg<'_>) -> u32 {
     }
 
     let size = ((samples_to_process / 8).max(1) * ADPCM_SAMPLES_PER_FRAME) as usize;
-    let wavebuffer = unsafe {
-        std::slice::from_raw_parts(
-            (req.buffer + (position_in_frame / 2) as usize) as *const u8,
-            size.min(req.buffer_size as usize),
-        )
+    let read_size = size.min(req.buffer_size as usize);
+    let read_addr = req.buffer + (position_in_frame / 2) as usize;
+    let buffer_is_guest = req.buffer != 0 && req.buffer < 0x1_0000_0000;
+    let mut guest_backing: Vec<u8> = Vec::new();
+    let wavebuffer: &[u8] = if buffer_is_guest {
+        guest_backing.resize(read_size, 0);
+        if !crate::guest_read_block(read_addr as u64, &mut guest_backing) {
+            return 0;
+        }
+        &guest_backing
+    } else {
+        unsafe { std::slice::from_raw_parts(read_addr as *const u8, read_size) }
     };
 
     let mut header = context.header;
