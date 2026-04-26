@@ -7,7 +7,14 @@
 //! shader compilation, pipeline caching, buffer/texture management,
 //! command batching, and GPU state tracking.
 
+use std::sync::Arc;
+
 use ash::vk;
+
+use super::fence_manager::{Fence as VkFence, FenceManager as VkFenceBackend};
+use super::query_cache::QueryCache;
+use crate::fence_manager::FenceManager;
+use crate::query_cache::types::QueryPropertiesFlags;
 
 // ---------------------------------------------------------------------------
 // Constants (from vk_rasterizer.h private section)
@@ -120,6 +127,27 @@ pub struct RasterizerVulkan {
 
     /// The DMA accelerator instance.
     accelerate_dma: AccelerateDma,
+
+    /// Port of `RasterizerVulkan::query_cache` — Vulkan-specific query cache.
+    /// Stores GPU query write-back closures and runs them when fences signal.
+    query_cache: QueryCache,
+
+    /// Port of `RasterizerVulkan::fence_manager` — generic fence manager that
+    /// holds the queue of pending fences and their associated callbacks.
+    fence_manager: FenceManager<VkFence>,
+
+    /// Port of the Vulkan-specific fence backend (`InnerFence` create/queue/wait).
+    fence_backend: VkFenceBackend,
+
+    /// Channel-bound GPU device memory manager. Used by `query_cache` to
+    /// translate query GPU addresses to guest CPU addresses for write-back.
+    /// Mirrors `gl_rasterizer::channel_memory_manager`.
+    channel_memory_manager:
+        Option<Arc<parking_lot::Mutex<crate::memory_manager::MemoryManager>>>,
+
+    /// Port of `RasterizerVulkan::num_queued_commands` — used by
+    /// `signal_fence` to decide whether a flush is needed.
+    num_queued_commands: u32,
 }
 
 /// How many draws before FlushWork triggers a scheduler Flush.
@@ -143,7 +171,33 @@ impl RasterizerVulkan {
             image_view_indices: Vec::with_capacity(MAX_IMAGE_VIEWS),
             sampler_handles: Vec::with_capacity(MAX_TEXTURES),
             accelerate_dma: AccelerateDma::new(),
+            query_cache: QueryCache::new(),
+            fence_manager: FenceManager::new(),
+            fence_backend: VkFenceBackend::new(),
+            channel_memory_manager: None,
+            num_queued_commands: 0,
         }
+    }
+
+    /// Wire the channel-bound GPU device memory manager into the query
+    /// cache. Mirrors `gl_rasterizer::set_channel_memory_manager`. Without
+    /// this wiring the query write-back closure has no way to translate
+    /// the GPU virtual address to a guest CPU address and the result write
+    /// is silently dropped.
+    pub fn set_channel_memory_manager(
+        &mut self,
+        memory_manager: Arc<parking_lot::Mutex<crate::memory_manager::MemoryManager>>,
+    ) {
+        self.query_cache
+            .set_memory_manager(Arc::clone(&memory_manager));
+        self.channel_memory_manager = Some(memory_manager);
+    }
+
+    /// Wire the GPU tick counter source into the query cache. Used for
+    /// queries with `HAS_TIMEOUT` to write a host timestamp alongside the
+    /// payload. Mirrors `gl_rasterizer::set_gpu_ticks_getter`.
+    pub fn set_gpu_ticks_getter(&mut self, getter: Arc<dyn Fn() -> u64 + Send + Sync>) {
+        self.query_cache.set_gpu_ticks_getter(getter);
     }
 
     /// Port of `RasterizerVulkan::Draw`.
@@ -190,15 +244,30 @@ impl RasterizerVulkan {
     }
 
     /// Port of `RasterizerVulkan::Query`.
+    ///
+    /// Delegates to `query_cache.query` and provides the rasterizer-side
+    /// `signal_fence` / `sync_operation` callbacks so the result write-back
+    /// closure can be enqueued onto the fence release queue (for fence
+    /// queries) or executed inline against the fence manager's
+    /// uncommitted-operations buffer (for sync queries).
+    ///
+    /// Mirrors `gl_rasterizer::query`.
     pub fn query(
         &mut self,
-        _gpu_addr: u64,
+        gpu_addr: u64,
         _query_type: u32,
-        _flags: crate::query_cache::types::QueryPropertiesFlags,
-        _payload: u32,
+        flags: QueryPropertiesFlags,
+        payload: u32,
         _subreport: u32,
     ) {
-        // Delegates to query_cache.Query
+        let this = self as *mut Self;
+        self.query_cache.query(
+            gpu_addr,
+            flags,
+            payload,
+            move |func| unsafe { (*this).signal_fence(func) },
+            move |func| unsafe { (*this).sync_operation(func) },
+        );
     }
 
     /// Port of `RasterizerVulkan::BindGraphicsUniformBuffer`.
@@ -275,13 +344,85 @@ impl RasterizerVulkan {
     }
 
     /// Port of `RasterizerVulkan::SignalFence`.
-    pub fn signal_fence(&mut self, _func: Box<dyn FnOnce() + Send>) {
-        // Delegates to fence_manager.SignalFence
+    ///
+    /// Hands `func` to `FenceManager::signal_fence`, providing the Vulkan
+    /// backend's create/queue/is-signaled callbacks plus the rasterizer's
+    /// async-flush bookkeeping. After the call, if a flush is needed,
+    /// commit pending GPU work and invalidate caches that span the
+    /// finished window. Mirrors `gl_rasterizer::signal_fence`.
+    pub fn signal_fence(&mut self, func: Box<dyn FnOnce() + Send>) {
+        let this = self as *mut Self;
+        let should_flush_now = self.fence_manager.signal_fence(
+            func,
+            move |is_stubbed| unsafe { (*this).fence_backend.create_fence(is_stubbed) },
+            move |fence| unsafe {
+                let tick = (*this).current_scheduler_tick();
+                (*this).fence_backend.queue_fence(fence, tick)
+            },
+            move || unsafe { (*this).should_wait_async_flushes() },
+            move |fence| unsafe {
+                let tick = (*this).known_gpu_tick();
+                (*this).fence_backend.is_fence_signaled(fence, tick)
+            },
+            move || unsafe { (*this).pop_async_flushes() },
+            move || unsafe { (*this).num_queued_commands != 0 || (*this).should_flush_async() },
+            move || unsafe { (*this).commit_async_flushes() },
+        );
+        if should_flush_now {
+            self.flush_commands();
+        }
+        self.invalidate_gpu_cache();
     }
 
     /// Port of `RasterizerVulkan::SyncOperation`.
-    pub fn sync_operation(&mut self, _func: Box<dyn FnOnce() + Send>) {
-        // Delegates to fence_manager.SyncOperation
+    ///
+    /// Adds `func` to the fence manager's pending uncommitted-operations
+    /// queue so it runs at the next fence release. Mirrors
+    /// `gl_rasterizer::sync_operation`.
+    pub fn sync_operation(&mut self, func: Box<dyn FnOnce() + Send>) {
+        self.fence_manager.sync_operation(func);
+    }
+
+    // ---------------------------------------------------------------------
+    // Async-flush + scheduler bookkeeping helpers used by `signal_fence`.
+    //
+    // These mirror the gl_rasterizer helpers structurally. Buffer/texture
+    // cache integration is not yet ported on the Vulkan side, so the
+    // helpers consult the query cache only — same return values you'd get
+    // if the (unported) caches all reported "no async work outstanding".
+    // ---------------------------------------------------------------------
+
+    fn should_wait_async_flushes(&self) -> bool {
+        self.query_cache.should_wait_async_flushes()
+    }
+
+    fn should_flush_async(&self) -> bool {
+        self.query_cache.has_uncommitted_flushes()
+    }
+
+    fn pop_async_flushes(&mut self) {
+        self.query_cache.pop_async_flushes();
+    }
+
+    fn commit_async_flushes(&mut self) {
+        self.query_cache.commit_async_flushes();
+    }
+
+    /// Returns the current scheduler tick. The full Vulkan scheduler is
+    /// not yet ported — we feed `0`, which makes `InnerFence::queue` a
+    /// no-op (matches the `is_stubbed` fast path the OpenGL side uses
+    /// when no flush is needed).
+    fn current_scheduler_tick(&self) -> u64 {
+        0
+    }
+
+    /// Returns the most recent GPU-completed tick. Without a scheduler,
+    /// returning `0` causes `InnerFence::is_signaled` to compare against
+    /// the same `wait_tick = 0` produced by `queue` — i.e. fences are
+    /// reported signaled immediately, which is correct as long as the
+    /// scheduler isn't actually deferring work.
+    fn known_gpu_tick(&self) -> u64 {
+        0
     }
 
     /// Port of `RasterizerVulkan::SignalSyncPoint`.
@@ -324,8 +465,16 @@ impl RasterizerVulkan {
     }
 
     /// Port of `RasterizerVulkan::FlushCommands`.
+    ///
+    /// Upstream flushes the Vulkan scheduler command buffer when there
+    /// are queued draws/queries. The scheduler isn't ported yet, so we
+    /// only reset `num_queued_commands` so `signal_fence`'s
+    /// `should_flush` predicate doesn't loop.
     pub fn flush_commands(&mut self) {
-        // Flushes the scheduler command buffer
+        if self.num_queued_commands == 0 {
+            return;
+        }
+        self.num_queued_commands = 0;
     }
 
     /// Port of `RasterizerVulkan::TickFrame`.
