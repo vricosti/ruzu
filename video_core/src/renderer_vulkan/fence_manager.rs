@@ -83,6 +83,12 @@ impl InnerFence {
 /// Port of `Fence` type alias (`std::shared_ptr<InnerFence>`).
 pub type Fence = Arc<std::sync::Mutex<InnerFence>>;
 
+impl crate::fence_manager::FenceBase for Fence {
+    fn is_stubbed(&self) -> bool {
+        self.lock().unwrap().is_stubbed
+    }
+}
+
 // ---------------------------------------------------------------------------
 // FenceManager
 // ---------------------------------------------------------------------------

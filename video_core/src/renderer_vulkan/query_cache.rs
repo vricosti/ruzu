@@ -10,7 +10,11 @@
 //! internal state including query pool banks, streamers, and host conditional
 //! rendering state.
 
+use std::sync::Arc;
+
 use ash::vk;
+
+use crate::query_cache::types::QueryPropertiesFlags;
 
 // ---------------------------------------------------------------------------
 // Constants (from vk_query_cache.cpp)
@@ -174,12 +178,22 @@ impl QueryCacheRuntime {
 /// by the Vulkan-specific runtime type.
 pub struct QueryCache {
     pub runtime: QueryCacheRuntime,
+    /// Channel-bound GPU device memory manager. Used to translate the
+    /// query's GPU virtual address to the underlying CPU/guest address
+    /// when writing the query result back. Mirrors the wiring in
+    /// `gl_query_cache::QueryCache`.
+    channel_memory_manager: Option<Arc<parking_lot::Mutex<crate::memory_manager::MemoryManager>>>,
+    /// Source of the GPU tick counter for queries with timestamps.
+    /// Mirrors `gl_query_cache::QueryCache::gpu_ticks_getter`.
+    gpu_ticks_getter: Option<Arc<dyn Fn() -> u64 + Send + Sync>>,
 }
 
 impl QueryCache {
     pub fn new() -> Self {
         QueryCache {
             runtime: QueryCacheRuntime::new(),
+            channel_memory_manager: None,
+            gpu_ticks_getter: None,
         }
     }
 
@@ -195,6 +209,77 @@ impl QueryCache {
     /// Enables or disables a query counter type.
     pub fn counter_enable(&mut self, _query_type: u32, _enable: bool) {
         // Base class handles counter enable/disable
+    }
+
+    /// Wire the channel-bound GPU device memory manager. The query result
+    /// callback uses this manager to translate the query's GPU VA into a
+    /// guest CPU address and write the value back through the
+    /// `guest_memory_writer` registered on the manager.
+    pub fn set_memory_manager(
+        &mut self,
+        memory_manager: Arc<parking_lot::Mutex<crate::memory_manager::MemoryManager>>,
+    ) {
+        self.channel_memory_manager = Some(memory_manager);
+    }
+
+    /// Wire the GPU tick getter used for timestamped queries.
+    pub fn set_gpu_ticks_getter(&mut self, getter: Arc<dyn Fn() -> u64 + Send + Sync>) {
+        self.gpu_ticks_getter = Some(getter);
+    }
+
+    pub fn reset_counter(&mut self, _query_type: u32) {}
+    pub fn invalidate_region(&mut self, _addr: u64, _size: usize) {}
+    pub fn flush_region(&mut self, _addr: u64, _size: usize) {}
+    pub fn commit_async_flushes(&mut self) {}
+    pub fn has_uncommitted_flushes(&self) -> bool {
+        false
+    }
+    pub fn should_wait_async_flushes(&self) -> bool {
+        false
+    }
+    pub fn pop_async_flushes(&mut self) {}
+
+    /// Port of upstream `RasterizerVulkan::Query` →
+    /// `QueryCacheBase<Vulkan>::CounterReport`. Captures a write-back
+    /// closure and enqueues it via the rasterizer-provided `signal_fence`
+    /// (for fence queries) or `sync_operation` (for synchronous queries).
+    /// The closure runs on the GPU fence release thread once the host GPU
+    /// finishes the corresponding work, and writes the query result to
+    /// the guest memory address that the game polls.
+    ///
+    /// Mirrors `gl_query_cache::QueryCache::query`.
+    pub fn query(
+        &mut self,
+        gpu_addr: u64,
+        flags: QueryPropertiesFlags,
+        payload: u32,
+        signal_fence: impl FnOnce(Box<dyn FnOnce() + Send>),
+        sync_operation: impl FnOnce(Box<dyn FnOnce() + Send>),
+    ) {
+        let Some(memory_manager) = self.channel_memory_manager.as_ref().cloned() else {
+            return;
+        };
+        let has_timeout = flags.contains(QueryPropertiesFlags::HAS_TIMEOUT);
+        let is_fence = flags.contains(QueryPropertiesFlags::IS_A_FENCE);
+        let gpu_ticks_getter = self.gpu_ticks_getter.as_ref().cloned();
+        let operation = Box::new(move || {
+            let mm = memory_manager.lock();
+            if has_timeout {
+                let gpu_ticks = gpu_ticks_getter
+                    .as_ref()
+                    .map(|getter| getter())
+                    .unwrap_or(0);
+                mm.write_block_unsafe_owned(gpu_addr + 8, &gpu_ticks.to_le_bytes());
+                mm.write_block_unsafe_owned(gpu_addr, &(payload as u64).to_le_bytes());
+            } else {
+                mm.write_block_unsafe_owned(gpu_addr, &payload.to_le_bytes());
+            }
+        });
+        if is_fence {
+            signal_fence(operation);
+        } else {
+            sync_operation(operation);
+        }
     }
 }
 
