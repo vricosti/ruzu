@@ -219,11 +219,39 @@ fn watch_read(cb: &DynarmicCallbacks32, vaddr: u64, size: u64, value: u128) {
         "[WATCH_READ ] pc=0x{:08X} lr=0x{:08X} vaddr=0x{:X} size={} value=0x{:032X}",
         pc, lr, vaddr, size, value
     );
+    maybe_dump_code_once(cb);
+    maybe_dump_stack_once(cb, pc_ptr);
 }
 
-/// One-shot guest-code dump triggered the first time watch_read fires.
+/// One-shot stack dump on the first watch_read hit. Prints 16 32-bit words
+/// starting at SP. Useful for identifying the caller chain when LR has been
+/// clobbered by intermediate scratch use.
+fn maybe_dump_stack_once(cb: &DynarmicCallbacks32, pc_ptr: Option<*const u32>) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static FIRED: AtomicBool = AtomicBool::new(false);
+    if std::env::var_os("RUZU_DUMP_STACK").is_none() {
+        return;
+    }
+    let Some(p) = pc_ptr else { return };
+    let sp = unsafe { p.offset(-2).read_volatile() };
+    if FIRED.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let mem = cb.mem();
+    let mut hex = String::with_capacity(16 * 9);
+    for i in 0..16u64 {
+        let w = mem.read_32(sp as u64 + i * 4);
+        use std::fmt::Write;
+        let _ = write!(hex, "{:08x} ", w);
+    }
+    eprintln!("[STACK_DUMP] sp=0x{:08X} words={}", sp, hex.trim());
+}
+
+/// One-shot guest-code dump triggered when watch_read/watch_write fires.
 /// `RUZU_DUMP_CODE=0xPC:LEN` reads LEN bytes of guest memory starting at PC
 /// and prints them as hex; an offline disassembler (e.g. capstone) decodes.
+/// Retries until the read returns non-zero bytes, so the dump waits for the
+/// target page to be loaded into guest memory.
 fn maybe_dump_code_once(cb: &DynarmicCallbacks32) {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::OnceLock;
@@ -237,13 +265,19 @@ fn maybe_dump_code_once(cb: &DynarmicCallbacks32) {
         Some((addr, len))
     });
     let Some((addr, len)) = spec else { return };
-    if FIRED.swap(true, Ordering::SeqCst) {
+    if FIRED.load(Ordering::Relaxed) {
         return;
     }
     let mem = cb.mem();
     let mut bytes = Vec::with_capacity(len as usize);
     for i in 0..len {
         bytes.push(mem.read_8(addr + i));
+    }
+    if bytes.iter().take(16).all(|&b| b == 0) {
+        return;
+    }
+    if FIRED.swap(true, Ordering::SeqCst) {
+        return;
     }
     let mut hex = String::with_capacity(bytes.len() * 2);
     for b in &bytes {
