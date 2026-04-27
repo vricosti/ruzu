@@ -1230,9 +1230,26 @@ impl HLERequestContext {
         let buffer_c_offset = index + header.data_size() as usize;
 
         if !header.is_tipc() {
-            // Padding to align to 16 bytes (4 words).
+            // Upstream IPC::RequestParser::AlignWithPadding (ipc_helpers.h) zero-fills
+            // the alignment padding directly in guest TLS via Skip(n, set_to_null=true).
+            // Ruzu parses a local cmd_buf copy, so we mirror the side effect into TLS.
             if index & 3 != 0 {
-                index += 4 - (index & 3);
+                let pad_count = 4 - (index & 3);
+                if incoming {
+                    for i in 0..pad_count {
+                        let target = index + i;
+                        if target < ipc::COMMAND_BUFFER_LENGTH {
+                            self.cmd_buf[target] = 0;
+                        }
+                    }
+                    if let Some(ref memory) = self.memory {
+                        let m = memory.lock().unwrap();
+                        for i in 0..pad_count {
+                            m.write_32(self.tls_address + ((index + i) as u64 * 4), 0);
+                        }
+                    }
+                }
+                index += pad_count;
             }
 
             // Domain message header check.
