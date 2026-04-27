@@ -374,6 +374,7 @@ pub fn sleep_thread(system: &System, ns: i64) {
             log::warn!("svc::SleepThread(sleep): current thread missing");
             return;
         };
+        crate::hle::kernel::sleep_timing::record_sleep_start(current_thread_id, ns);
         if should_trace_sleep_debug() {
             if let Some(current_thread) = system.current_thread() {
                 let core_index = current_thread.lock().unwrap().get_current_core().max(0) as usize;
