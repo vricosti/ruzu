@@ -508,6 +508,77 @@ pub trait AudioCoreInterface: Send {
         applet_resource_user_id: u64,
         rendered_event: std::sync::Arc<std::sync::Mutex<crate::hle::kernel::k_event::KEvent>>,
     ) -> std::result::Result<Box<dyn AudioRendererSessionInterface>, crate::hle::result::ResultCode>;
+
+    /// Mirror `IHardwareOpusDecoderManager::OpenHardwareOpusDecoder*` by
+    /// constructing a per-session Opus decoder backed by the real
+    /// `audio_core::opus::OpusDecoder`. The bool selects packet frame size:
+    /// `false` = 20 ms (legacy), `true` = 120 ms (large).
+    fn open_opus_decoder(
+        &self,
+        sample_rate: u32,
+        channel_count: u32,
+        use_large_frame_size: bool,
+        transfer_memory_size: u64,
+    ) -> std::result::Result<Box<dyn OpusDecoderInterface>, crate::hle::result::ResultCode>;
+
+    /// Mirror `IHardwareOpusDecoderManager::OpenHardwareOpusDecoderForMultiStream*`.
+    fn open_opus_decoder_for_multi_stream(
+        &self,
+        sample_rate: u32,
+        channel_count: u32,
+        total_stream_count: u32,
+        stereo_stream_count: u32,
+        use_large_frame_size: bool,
+        mappings: &[u8; 256],
+        transfer_memory_size: u64,
+    ) -> std::result::Result<Box<dyn OpusDecoderInterface>, crate::hle::result::ResultCode>;
+
+    /// Mirror `IHardwareOpusDecoderManager::GetWorkBufferSize*`.
+    fn get_opus_work_buffer_size(
+        &self,
+        sample_rate: u32,
+        channel_count: u32,
+        use_large_frame_size: bool,
+    ) -> u32;
+
+    /// Mirror `IHardwareOpusDecoderManager::GetWorkBufferSizeForMultiStream*`.
+    fn get_opus_work_buffer_size_for_multi_stream(
+        &self,
+        sample_rate: u32,
+        channel_count: u32,
+        total_stream_count: u32,
+        stereo_stream_count: u32,
+        use_large_frame_size: bool,
+    ) -> u32;
+}
+
+/// Per-session Opus decoder owned by `IHardwareOpusDecoder`.
+///
+/// Mirror of upstream `AudioCore::OpusDecoder::OpusDecoder` (the impl
+/// instance held by `IHardwareOpusDecoder::impl`). Constructed via
+/// `AudioCoreInterface::open_opus_decoder*` and dispatched-to from
+/// the IPC service handlers.
+pub trait OpusDecoderInterface: Send {
+    /// Mirror `OpusDecoder::DecodeInterleaved`. Returns
+    /// `(consumed_input_bytes, decoded_sample_count, time_taken_us)`.
+    /// `output` is filled with PCM bytes for the decoded sample count.
+    fn decode_interleaved(
+        &mut self,
+        input: &[u8],
+        output: &mut [u8],
+        reset: bool,
+    ) -> std::result::Result<(u32, u32, u64), crate::hle::result::ResultCode>;
+
+    /// Mirror `OpusDecoder::DecodeInterleavedForMultiStream`.
+    fn decode_interleaved_for_multi_stream(
+        &mut self,
+        input: &[u8],
+        output: &mut [u8],
+        reset: bool,
+    ) -> std::result::Result<(u32, u32, u64), crate::hle::result::ResultCode>;
+
+    /// Mirror `OpusDecoder::SetContext`.
+    fn set_context(&mut self, context: &[u8]) -> crate::hle::result::ResultCode;
 }
 
 /// The main System struct. Top-level orchestrator that owns all subsystems.

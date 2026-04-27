@@ -69,9 +69,9 @@ pub fn loop_process(system: crate::core::SystemRef) {
 
     server_manager.register_named_service(
         "hwopus",
-        Box::new(|| -> SessionRequestHandlerPtr {
+        Box::new(move || -> SessionRequestHandlerPtr {
             std::sync::Arc::new(
-                super::hardware_opus_decoder_manager::IHardwareOpusDecoderManager::new(),
+                super::hardware_opus_decoder_manager::IHardwareOpusDecoderManager::new(system),
             )
         }),
         16,
