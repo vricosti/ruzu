@@ -518,6 +518,163 @@ impl ruzu_core::core::AudioCoreInterface for AudioCore {
 
         Ok(Box::new(AudioRendererSession::new(renderer)))
     }
+
+    fn open_opus_decoder(
+        &self,
+        sample_rate: u32,
+        channel_count: u32,
+        use_large_frame_size: bool,
+        transfer_memory_size: u64,
+    ) -> std::result::Result<
+        Box<dyn ruzu_core::core::OpusDecoderInterface>,
+        ruzu_core::hle::result::ResultCode,
+    > {
+        let mut decoder =
+            crate::opus::OpusDecoder::new(crate::opus::HardwareOpus::new());
+        let params = crate::opus::OpusParametersEx {
+            sample_rate,
+            channel_count,
+            use_large_frame_size,
+            padding: [0; 7],
+        };
+        let rc = decoder.initialize(&params, transfer_memory_size);
+        if rc.is_error() {
+            return Err(ruzu_core::hle::result::ResultCode::new(rc.raw()));
+        }
+        Ok(Box::new(OpusDecoderSession {
+            inner: parking_lot::Mutex::new(decoder),
+        }))
+    }
+
+    fn open_opus_decoder_for_multi_stream(
+        &self,
+        sample_rate: u32,
+        channel_count: u32,
+        total_stream_count: u32,
+        stereo_stream_count: u32,
+        use_large_frame_size: bool,
+        mappings: &[u8; 256],
+        transfer_memory_size: u64,
+    ) -> std::result::Result<
+        Box<dyn ruzu_core::core::OpusDecoderInterface>,
+        ruzu_core::hle::result::ResultCode,
+    > {
+        let mut decoder =
+            crate::opus::OpusDecoder::new(crate::opus::HardwareOpus::new());
+        let mut params = crate::opus::OpusMultiStreamParametersEx::default();
+        params.sample_rate = sample_rate;
+        params.channel_count = channel_count;
+        params.total_stream_count = total_stream_count;
+        params.stereo_stream_count = stereo_stream_count;
+        params.use_large_frame_size = use_large_frame_size;
+        params.mappings[..mappings.len()].copy_from_slice(mappings);
+        let rc = decoder.initialize_multi_stream(&params, transfer_memory_size);
+        if rc.is_error() {
+            return Err(ruzu_core::hle::result::ResultCode::new(rc.raw()));
+        }
+        Ok(Box::new(OpusDecoderSession {
+            inner: parking_lot::Mutex::new(decoder),
+        }))
+    }
+
+    fn get_opus_work_buffer_size(
+        &self,
+        sample_rate: u32,
+        channel_count: u32,
+        use_large_frame_size: bool,
+    ) -> u32 {
+        let manager = crate::opus::OpusDecoderManager::new();
+        let params = crate::opus::OpusParametersEx {
+            sample_rate,
+            channel_count,
+            use_large_frame_size,
+            padding: [0; 7],
+        };
+        let mut size: u32 = 0;
+        let _ = manager.get_work_buffer_size_ex(&params, &mut size);
+        size
+    }
+
+    fn get_opus_work_buffer_size_for_multi_stream(
+        &self,
+        sample_rate: u32,
+        channel_count: u32,
+        total_stream_count: u32,
+        stereo_stream_count: u32,
+        use_large_frame_size: bool,
+    ) -> u32 {
+        let manager = crate::opus::OpusDecoderManager::new();
+        let mut params = crate::opus::OpusMultiStreamParametersEx::default();
+        params.sample_rate = sample_rate;
+        params.channel_count = channel_count;
+        params.total_stream_count = total_stream_count;
+        params.stereo_stream_count = stereo_stream_count;
+        params.use_large_frame_size = use_large_frame_size;
+        let mut size: u32 = 0;
+        let _ = manager.get_work_buffer_size_for_multi_stream_ex(&params, &mut size);
+        size
+    }
+}
+
+/// Per-session Opus decoder adapter implementing `OpusDecoderInterface`.
+/// Wraps `audio_core::opus::OpusDecoder` (the audio_core-private type) so
+/// the HLE service in `core` can dispatch via the trait without depending
+/// on `audio_core` directly (which would create a crate cycle).
+struct OpusDecoderSession {
+    inner: parking_lot::Mutex<crate::opus::OpusDecoder>,
+}
+
+impl ruzu_core::core::OpusDecoderInterface for OpusDecoderSession {
+    fn decode_interleaved(
+        &mut self,
+        input: &[u8],
+        output: &mut [u8],
+        reset: bool,
+    ) -> std::result::Result<(u32, u32, u64), ruzu_core::hle::result::ResultCode> {
+        let mut data_size: u32 = 0;
+        let mut sample_count: u32 = 0;
+        let mut time_taken: u64 = 0;
+        let rc = self.inner.lock().decode_interleaved(
+            &mut data_size,
+            Some(&mut time_taken),
+            &mut sample_count,
+            input,
+            output,
+            reset,
+        );
+        if rc.is_error() {
+            return Err(ruzu_core::hle::result::ResultCode::new(rc.raw()));
+        }
+        Ok((data_size, sample_count, time_taken))
+    }
+
+    fn decode_interleaved_for_multi_stream(
+        &mut self,
+        input: &[u8],
+        output: &mut [u8],
+        reset: bool,
+    ) -> std::result::Result<(u32, u32, u64), ruzu_core::hle::result::ResultCode> {
+        let mut data_size: u32 = 0;
+        let mut sample_count: u32 = 0;
+        let mut time_taken: u64 = 0;
+        let rc = self.inner.lock().decode_interleaved_for_multi_stream(
+            &mut data_size,
+            Some(&mut time_taken),
+            &mut sample_count,
+            input,
+            output,
+            reset,
+        );
+        if rc.is_error() {
+            return Err(ruzu_core::hle::result::ResultCode::new(rc.raw()));
+        }
+        Ok((data_size, sample_count, time_taken))
+    }
+
+    fn set_context(&mut self, context: &[u8]) -> ruzu_core::hle::result::ResultCode {
+        let rc = self.inner.lock().set_context(context);
+        ruzu_core::hle::result::ResultCode::new(rc.raw())
+    }
 }
 
 #[cfg(test)]
