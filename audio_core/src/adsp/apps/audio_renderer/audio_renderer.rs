@@ -512,32 +512,35 @@ impl AudioRenderer {
                     if profile {
                         prof_send_response_us = t_send.elapsed().as_micros();
                         let total_us = prof_iter_start.elapsed().as_micros();
-                        let counted = prof_shutdown_check_us
-                            + prof_timing_lock_us
-                            + prof_applet_id_lock_us
-                            + prof_stream_lookup_us
-                            + prof_init_shared_lock_us
-                            + prof_wait_free_us
-                            + prof_process_us
-                            + prof_end_time_lock_us
-                            + prof_post_process_stream_lock_us
-                            + prof_send_response_us;
-                        let other = total_us.saturating_sub(counted);
-                        log::info!(
-                            "PROFILE_ADSP total_us={} shutdown={} timing_lock={} applet_id={} stream_lookup={} init_shared={} wait_free={} process={} end_time_lock={} post_stream_lock={} send={} other={}",
-                            total_us,
-                            prof_shutdown_check_us,
-                            prof_timing_lock_us,
-                            prof_applet_id_lock_us,
-                            prof_stream_lookup_us,
-                            prof_init_shared_lock_us,
-                            prof_wait_free_us,
-                            prof_process_us,
-                            prof_end_time_lock_us,
-                            prof_post_process_stream_lock_us,
-                            prof_send_response_us,
-                            other,
-                        );
+                        // Only log meaningful iterations — no-work Render calls spam the log.
+                        if total_us >= 500 {
+                            let counted = prof_shutdown_check_us
+                                + prof_timing_lock_us
+                                + prof_applet_id_lock_us
+                                + prof_stream_lookup_us
+                                + prof_init_shared_lock_us
+                                + prof_wait_free_us
+                                + prof_process_us
+                                + prof_end_time_lock_us
+                                + prof_post_process_stream_lock_us
+                                + prof_send_response_us;
+                            let other = total_us.saturating_sub(counted);
+                            log::info!(
+                                "PROFILE_ADSP total_us={} shutdown={} timing_lock={} applet_id={} stream_lookup={} init_shared={} wait_free={} process={} end_time_lock={} post_stream_lock={} send={} other={}",
+                                total_us,
+                                prof_shutdown_check_us,
+                                prof_timing_lock_us,
+                                prof_applet_id_lock_us,
+                                prof_stream_lookup_us,
+                                prof_init_shared_lock_us,
+                                prof_wait_free_us,
+                                prof_process_us,
+                                prof_end_time_lock_us,
+                                prof_post_process_stream_lock_us,
+                                prof_send_response_us,
+                                other,
+                            );
+                        }
                     }
                 }
                 _ => {

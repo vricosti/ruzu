@@ -480,6 +480,28 @@ impl NvHostGpu {
                 gpu.push_gpu_entries(bind_id, build_increment_with_wfi_command_list(params.fence));
             }
         }
+        // [SP_TRACE] log MAX vs MIN of the channel syncpoint after each
+        // submit. If MAX advances but MIN doesn't catch up, the GPU is
+        // dropping syncpoint-increment commands and game waits stall.
+        {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static COUNT: AtomicU64 = AtomicU64::new(0);
+            let n = COUNT.fetch_add(1, Ordering::Relaxed);
+            if n < 16 || n.is_power_of_two() {
+                let min_v = self
+                    .syncpoint_manager()
+                    .read_syncpoint_min_value(channel_syncpoint);
+                let max_v = self
+                    .syncpoint_manager()
+                    .read_syncpoint_max_value(channel_syncpoint);
+                log::info!(
+                    "[SP_TRACE] submit#{} sp_id={} min={} max={} pending={} (out fence value={})",
+                    n, channel_syncpoint, min_v, max_v,
+                    max_v.wrapping_sub(min_v),
+                    params.fence.value,
+                );
+            }
+        }
 
         params.flags = 0;
         if Self::should_trace_init_path() {

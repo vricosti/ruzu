@@ -77,6 +77,25 @@ pub fn wait_synchronization(
         num_handles,
         timeout_ns
     );
+    // Env-gated: log every WaitSync's actual handle values + caller tid.
+    // Useful for identifying wedge-targeted handles (e.g. tid=73 polling
+    // handle 0x000D01E8 with timeout=0).
+    if std::env::var_os("RUZU_TRACE_WAITSYNC").is_some() && num_handles > 0 {
+        let tid = system.current_thread_id().unwrap_or(0);
+        // Quick peek: read first handle without holding any lock.
+        let process_arc = system.current_process_arc();
+        let process = process_arc.lock().unwrap();
+        let h0 = if let Some(memory) = process.page_table.get_base().m_memory.as_ref() {
+            memory.lock().unwrap().read_32(user_handles)
+        } else {
+            0
+        };
+        drop(process);
+        log::info!(
+            "WaitSync tid={} num={} timeout={} handle[0]=0x{:X}",
+            tid, num_handles, timeout_ns, h0
+        );
+    }
 
     // Ensure number of handles is valid.
     if !(0..=ARGUMENT_HANDLE_COUNT_MAX).contains(&num_handles) {

@@ -431,9 +431,41 @@ impl NvDevice for NvMapDevice {
                     result
                 }
                 0x4 => {
+                    if std::env::var_os("RUZU_TRACE_IOCALLOC").is_some() {
+                        let mut ih = String::new();
+                        for (i, b) in input.iter().enumerate().take(48) {
+                            if i > 0 && (i & 3) == 0 { ih.push(' '); }
+                            use std::fmt::Write;
+                            let _ = write!(ih, "{:02x}", b);
+                        }
+                        eprintln!("[IOCALLOC_IN] len=0x{:x} bytes={}", input.len(), ih);
+                    }
                     let mut params: IocAllocParams = read_struct(input);
+                    if std::env::var_os("RUZU_TRACE_IOCALLOC").is_some() {
+                        eprintln!(
+                            "[IOCALLOC_PARSED] handle=0x{:x} heap_mask=0x{:x} flags=0x{:x} align=0x{:x} kind=0x{:x} address=0x{:x}",
+                            params.handle, params.heap_mask, params.flags.raw,
+                            params.align, params.kind, params.address
+                        );
+                    }
                     let result = self.ioc_alloc(&mut params, fd);
+                    if std::env::var_os("RUZU_TRACE_IOCALLOC").is_some() {
+                        eprintln!(
+                            "[IOCALLOC_POST] handle=0x{:x} heap_mask=0x{:x} flags=0x{:x} align=0x{:x} kind=0x{:x} address=0x{:x} result={}",
+                            params.handle, params.heap_mask, params.flags.raw,
+                            params.align, params.kind, params.address, result as u32
+                        );
+                    }
                     write_struct(output, &params);
+                    if std::env::var_os("RUZU_TRACE_IOCALLOC").is_some() {
+                        let mut oh = String::new();
+                        for (i, b) in output.iter().enumerate().take(48) {
+                            if i > 0 && (i & 3) == 0 { oh.push(' '); }
+                            use std::fmt::Write;
+                            let _ = write!(oh, "{:02x}", b);
+                        }
+                        eprintln!("[IOCALLOC_OUT] len=0x{:x} bytes={}", output.len(), oh);
+                    }
                     result
                 }
                 0x5 => {

@@ -20,13 +20,18 @@ fn should_trace_cv_backtrace_once(tid: u64) -> bool {
         std::sync::atomic::AtomicBool::new(false);
     static DID_TRACE_TID99: std::sync::atomic::AtomicBool =
         std::sync::atomic::AtomicBool::new(false);
-    static DID_TRACE_TID73_SIGNAL: std::sync::atomic::AtomicBool =
-        std::sync::atomic::AtomicBool::new(false);
+    static TID73_SIGNAL_COUNT: std::sync::atomic::AtomicU64 =
+        std::sync::atomic::AtomicU64::new(0);
     match tid {
         96 => !DID_TRACE_TID96.swap(true, std::sync::atomic::Ordering::Relaxed),
         98 => !DID_TRACE_TID98.swap(true, std::sync::atomic::Ordering::Relaxed),
         99 => !DID_TRACE_TID99.swap(true, std::sync::atomic::Ordering::Relaxed),
-        73 => !DID_TRACE_TID73_SIGNAL.swap(true, std::sync::atomic::Ordering::Relaxed),
+        73 => {
+            let n = TID73_SIGNAL_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            // Post-MiiFix stall lands around ~198 signals. Capture the tail
+            // window to see the last game PC before tid=73 goes silent.
+            (190..=200).contains(&n)
+        }
         _ => false,
     }
 }
@@ -187,6 +192,41 @@ pub fn signal_process_wide_key(system: &System, cv_key: u64, count: i32) {
                                 entry.offset,
                                 entry.name,
                             );
+                        }
+                        // Dump general-purpose registers r0..r12.
+                        let regs = ctx.r;
+                        log::info!(
+                            "svc::SignalProcessWideKey regs tid={} r0=0x{:08X} r1=0x{:08X} r2=0x{:08X} r3=0x{:08X} r4=0x{:08X} r5=0x{:08X} r6=0x{:08X} r7=0x{:08X} r8=0x{:08X} r9=0x{:08X} r10=0x{:08X} r11=0x{:08X} r12=0x{:08X}",
+                            current_thread_id,
+                            regs[0] as u32, regs[1] as u32, regs[2] as u32, regs[3] as u32,
+                            regs[4] as u32, regs[5] as u32, regs[6] as u32, regs[7] as u32,
+                            regs[8] as u32, regs[9] as u32, regs[10] as u32, regs[11] as u32,
+                            regs[12] as u32,
+                        );
+                        // Dump 20 ARM32 insns around LR (the BL return site — LR-4 is the BL itself).
+                        if let Some(memory) = process.page_table.get_base().m_memory.as_ref() {
+                            let m = memory.lock().unwrap();
+                            let start = ctx.lr.saturating_sub(4 * 4);
+                            let mut disasm = String::new();
+                            for offset in 0..20u64 {
+                                let addr = start + offset * 4;
+                                let word = m.read_32(addr);
+                                disasm.push_str(&format!(" {:08X}:{:08X}", addr as u32, word));
+                            }
+                            log::info!(
+                                "svc::SignalProcessWideKey insns tid={} lr=0x{:08X}:{}",
+                                current_thread_id, ctx.lr, disasm
+                            );
+                            // Dump vtable lookup if R5 is non-null.
+                            let r5 = regs[5] as u32;
+                            if r5 != 0 {
+                                let vtable_ptr = m.read_32(r5 as u64);
+                                let vmethod0 = m.read_32(vtable_ptr as u64);
+                                log::info!(
+                                    "svc::SignalProcessWideKey vtable tid={} r5=0x{:08X} *r5=vtable=0x{:08X} vtable[0]=0x{:08X}",
+                                    current_thread_id, r5, vtable_ptr, vmethod0
+                                );
+                            }
                         }
                     }
                 }

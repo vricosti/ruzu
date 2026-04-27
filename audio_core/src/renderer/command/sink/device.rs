@@ -55,7 +55,11 @@ impl DeviceSinkPayload {
                 samples.push(sample.clamp(i16::MIN as i32, i16::MAX as i32) as i16);
             }
         }
+        let profile = std::env::var_os("RUZU_PROFILE_DEVICE_SINK").is_some();
+        let t_lock = std::time::Instant::now();
         let mut stream = stream.lock();
+        let lock_us = t_lock.elapsed().as_micros();
+        let t_work = std::time::Instant::now();
         stream.set_system_channels(input_count as u32);
         stream.append_buffer(
             SinkBuffer {
@@ -68,6 +72,15 @@ impl DeviceSinkPayload {
         );
         if stream.is_paused() {
             stream.start(false);
+        }
+        if profile {
+            let work_us = t_work.elapsed().as_micros();
+            if lock_us > 1000 || work_us > 1000 {
+                log::info!(
+                    "PROFILE_DEVICE_SINK lock_us={} work_us={} frames={} input_count={}",
+                    lock_us, work_us, frames, input_count
+                );
+            }
         }
     }
 
@@ -127,7 +140,11 @@ pub fn process_device_command(
             samples.push(sample.clamp(i16::MIN as i32, i16::MAX as i32) as i16);
         }
     }
+    let profile = std::env::var_os("RUZU_PROFILE_DEVICE_SINK").is_some();
+    let t_lock = std::time::Instant::now();
     let mut stream = stream.lock();
+    let lock_us = t_lock.elapsed().as_micros();
+    let t_work = std::time::Instant::now();
     stream.set_system_channels(input_count as u32);
     stream.append_buffer(
         SinkBuffer {
@@ -140,6 +157,15 @@ pub fn process_device_command(
     );
     if stream.is_paused() {
         stream.start(false);
+    }
+    if profile {
+        let work_us = t_work.elapsed().as_micros();
+        if lock_us > 1000 || work_us > 1000 {
+            log::info!(
+                "PROFILE_DEVICE_SINK lock_us={} work_us={} frames={} input_count={}",
+                lock_us, work_us, frames, input_count
+            );
+        }
     }
 }
 

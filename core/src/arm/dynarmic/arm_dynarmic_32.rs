@@ -138,15 +138,16 @@ fn watch_write(cb: &DynarmicCallbacks32, vaddr: u64, size: u64, value: u128) {
     // regardless of address (useful for tracing helper function writes).
     let ranges = watched_ranges();
     let pc_range = watched_pc_range();
+    let pc_trace = rdynarmic::jit::PC_TRACE_ACTIVE.load(std::sync::atomic::Ordering::Relaxed);
     let has_addr_filter = !ranges.is_empty();
     let has_pc_filter = pc_range.is_some();
-    if !has_addr_filter && !has_pc_filter {
+    if !has_addr_filter && !has_pc_filter && !pc_trace {
         return;
     }
     if has_addr_filter {
         let end = vaddr.saturating_add(size);
         let hits = ranges.iter().any(|(s, e)| vaddr < *e && end > *s);
-        if !hits {
+        if !hits && !pc_trace {
             return;
         }
     }
@@ -155,7 +156,9 @@ fn watch_write(cb: &DynarmicCallbacks32, vaddr: u64, size: u64, value: u128) {
     if let Some((pc_lo, pc_hi)) = pc_range {
         let pc_u64 = pc as u64;
         if pc_u64 < pc_lo || pc_u64 >= pc_hi {
-            return;
+            if !pc_trace {
+                return;
+            }
         }
     }
     // reg[14] (LR) sits 1 u32 before reg[15] (PC) in A32JitState's contiguous
@@ -163,9 +166,16 @@ fn watch_write(cb: &DynarmicCallbacks32, vaddr: u64, size: u64, value: u128) {
     let lr = pc_ptr
         .map(|p| unsafe { p.offset(-1).read_volatile() })
         .unwrap_or(0);
+    // Include core_index so we can distinguish writes by different JIT
+    // instances (one per physical core). Useful when PC_TRACE_ACTIVE is on
+    // to see if a non-main core is writing during the window.
+    let core = cb.parent.load(std::sync::atomic::Ordering::Relaxed);
+    let core_id = if core.is_null() { -1i32 } else {
+        unsafe { (*core).core_index() as i32 }
+    };
     eprintln!(
-        "[WATCH_WRITE] pc=0x{:08X} lr=0x{:08X} vaddr=0x{:X} size={} value=0x{:032X}",
-        pc, lr, vaddr, size, value
+        "[WATCH_WRITE] core={} pc=0x{:08X} lr=0x{:08X} vaddr=0x{:X} size={} value=0x{:032X}",
+        core_id, pc, lr, vaddr, size, value
     );
 }
 
@@ -173,15 +183,19 @@ fn watch_write(cb: &DynarmicCallbacks32, vaddr: u64, size: u64, value: u128) {
 fn watch_read(cb: &DynarmicCallbacks32, vaddr: u64, size: u64, value: u128) {
     let ranges = watched_ranges();
     let pc_range = watched_pc_range();
+    // PC_TRACE_ACTIVE gates a full-stream log during the SVC-window set by
+    // RUZU_TRACE_PC_WINDOW. When true, every guest memory read is logged
+    // (addr, value, pc) without needing an explicit RUZU_WATCH_ADDR.
+    let pc_trace = rdynarmic::jit::PC_TRACE_ACTIVE.load(std::sync::atomic::Ordering::Relaxed);
     let has_addr_filter = !ranges.is_empty();
     let has_pc_filter = pc_range.is_some();
-    if !has_addr_filter && !has_pc_filter {
+    if !has_addr_filter && !has_pc_filter && !pc_trace {
         return;
     }
     if has_addr_filter {
         let end = vaddr.saturating_add(size);
         let hits = ranges.iter().any(|(s, e)| vaddr < *e && end > *s);
-        if !hits {
+        if !hits && !pc_trace {
             return;
         }
     }
@@ -192,7 +206,9 @@ fn watch_read(cb: &DynarmicCallbacks32, vaddr: u64, size: u64, value: u128) {
     if let Some((pc_lo, pc_hi)) = pc_range {
         let pc_u64 = pc as u64;
         if pc_u64 < pc_lo || pc_u64 >= pc_hi {
-            return;
+            if !pc_trace {
+                return;
+            }
         }
     }
     eprintln!(
@@ -1155,6 +1171,15 @@ impl UserCallbacks for DynarmicCallbacks32 {
                 log::info!("[A32_CNTPCT] call#{} value=0x{:X} (= {} dec)", n, v, v);
             }
         }
+        // PC-window hook: log every CNTPCT read while RUZU_TRACE_PC_WINDOW is
+        // active. Matched by zuyu's CNTPCT hook to compare clock-branch paths.
+        if rdynarmic::jit::PC_TRACE_ACTIVE.load(std::sync::atomic::Ordering::Relaxed) {
+            let pc = self
+                .jit_pc_ptr
+                .map(|p| unsafe { p.read_volatile() })
+                .unwrap_or(0);
+            eprintln!("[TRACE_CNTPCT] pc=0x{:08X} value=0x{:016X}", pc, v);
+        }
         v
     }
 
@@ -1217,6 +1242,11 @@ pub struct ArmDynarmic32 {
 }
 
 impl ArmDynarmic32 {
+    #[inline]
+    pub fn core_index(&self) -> usize {
+        self.core_index
+    }
+
     /// Create a new ARM32 dynarmic backend.
     ///
     /// Corresponds to upstream `ArmDynarmic32::ArmDynarmic32`.

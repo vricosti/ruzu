@@ -190,6 +190,12 @@ impl SyncpointManager {
         new_max
     }
 
+    /// Returns the maximum (predicted) value of the syncpoint.
+    pub fn read_syncpoint_max_value(&self, id: u32) -> u32 {
+        let syncpoints = self.syncpoints.lock().unwrap();
+        syncpoints[id as usize].counter_max.load(Ordering::Relaxed)
+    }
+
     /// Returns the minimum value of the syncpoint.
     pub fn read_syncpoint_min_value(&self, id: u32) -> u32 {
         let syncpoints = self.syncpoints.lock().unwrap();

@@ -70,10 +70,14 @@ impl SystemManager {
                         }
                         if profile {
                             let total = t_iter.elapsed().as_micros();
-                            log::info!(
-                                "PROFILE_SYSMGR total_us={} send_cmds_us={} render_lock_us={} signal_us={} wait_us={}",
-                                total, t_sendcmds, t_renderlock, t_signal, t_wait
-                            );
+                            // Filter out empty iterations (wait returns instantly) so slow
+                            // rendering cycles stand out in the log.
+                            if total >= 500 {
+                                log::info!(
+                                    "PROFILE_SYSMGR total_us={} send_cmds_us={} render_lock_us={} signal_us={} wait_us={}",
+                                    total, t_sendcmds, t_renderlock, t_signal, t_wait
+                                );
+                            }
                         }
                     }
                 })
