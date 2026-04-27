@@ -177,15 +177,17 @@ impl ChannelType {
 
 /// Main Host1x subsystem.
 ///
-/// Port of `Tegra::Host1x::Host1x`.
+/// Port of `Tegra::Host1x::Host1x`. The `devices` map mirrors upstream's
+/// `std::unordered_map<s32, std::unique_ptr<CDmaPusher>>` — channel ioctls
+/// look up the per-fd `CDmaPusher` and forward command lists to it.
 pub struct Host1x {
     syncpoint_manager: Arc<SyncpointManager>,
     frame_queue: Arc<FrameQueue>,
+    devices: Mutex<HashMap<i32, Arc<crate::cdma_pusher::CDmaPusher>>>,
     // Upstream fields not yet wired:
     // - memory_manager: MaxwellDeviceMemoryManager — requires Core::System::DeviceMemory
     // - gmmu_manager: MemoryManager — requires Core::System and device memory manager
     // - allocator: FlatAllocator<u32, 0, 32> — requires Common::FlatAllocator port
-    // - devices: HashMap<i32, Box<dyn CDmaPusher>> — requires CDmaPusher trait + Nvdec/Vic integration
 }
 
 impl Host1x {
@@ -193,6 +195,7 @@ impl Host1x {
         Self {
             syncpoint_manager: Arc::new(SyncpointManager::new()),
             frame_queue: Arc::new(FrameQueue::new()),
+            devices: Mutex::new(HashMap::new()),
         }
     }
 
@@ -206,47 +209,65 @@ impl Host1x {
 
     /// Start a device (NvDec, VIC, etc.) on the given file descriptor.
     ///
-    /// Port of `Host1x::StartDevice`.
-    pub fn start_device(&mut self, fd: i32, channel_type: ChannelType, _syncpt: u32) {
-        match channel_type {
+    /// Port of `Host1x::StartDevice`. Constructs a `CDmaPusher` for the channel
+    /// (with a `NullProcessor` subclass hook for now — Nvdec/Vic concrete
+    /// processors will be plugged in once their device emulation lands)
+    /// and stores it in `devices` keyed by fd.
+    pub fn start_device(&self, fd: i32, channel_type: ChannelType, _syncpt: u32) {
+        use crate::cdma_pusher::{CDmaPusher, ChClassId};
+        let class_id = match channel_type {
             ChannelType::NvDec => {
-                // Upstream: devices[fd] = make_unique<Nvdec>(*this, fd, syncpt, frame_queue);
-                // Requires CDmaPusher trait and Nvdec CDmaPusher constructor to be wired.
-                // For now, just open the frame queue so video frames can be queued.
+                // Upstream stores Nvdec(this, fd, syncpt, frame_queue); the CDmaPusher
+                // base class reads the class_id arg. NvDec class is 0xF0.
                 self.frame_queue.open(fd);
-                log::info!("Started NvDec device fd={}", fd);
+                ChClassId::NvDec
             }
             ChannelType::Vic => {
-                // Upstream: devices[fd] = make_unique<Vic>(*this, fd, syncpt, frame_queue);
-                // Requires CDmaPusher trait and Vic CDmaPusher constructor to be wired.
-                log::info!("Started VIC device fd={}", fd);
+                // Upstream Vic(this, fd, syncpt, frame_queue); class 0x5D.
+                ChClassId::GraphicsVic
             }
+            ChannelType::NvJpg => ChClassId::NvJpg,
             _ => {
                 error!(
                     "Unimplemented host1x device {:?} ({})",
                     channel_type, channel_type as u32
                 );
+                return;
             }
-        }
+        };
+        let pusher = Arc::new(CDmaPusher::new(self.syncpoint_manager.clone(), class_id as i32));
+        self.devices.lock().unwrap().insert(fd, pusher);
+        log::info!("Started {:?} device fd={}", channel_type, fd);
     }
 
     /// Stop a device on the given file descriptor.
     ///
     /// Port of `Host1x::StopDevice`.
-    pub fn stop_device(&mut self, fd: i32, _channel_type: ChannelType) {
-        // Upstream: devices.erase(fd);
-        // Once the devices map is wired, this will remove the CDmaPusher entry.
-        let _ = fd;
+    pub fn stop_device(&self, fd: i32, _channel_type: ChannelType) {
+        // Upstream: devices.erase(fd); also closes the FrameQueue entry.
+        self.devices.lock().unwrap().remove(&fd);
+        self.frame_queue.close(fd);
     }
 
     /// Push command entries to a device.
     ///
-    /// Port of `Host1x::PushEntries`.
-    pub fn push_entries(&mut self, _fd: i32, _entries: Vec<u32>) {
-        // Stubbed — requires looking up the device by fd in the devices map and calling
-        // CDmaPusher::PushEntries on it.
-        // Upstream: Host1x::PushEntries() in video_core/host1x/host1x.cpp
-        log::warn!("Host1x::push_entries: not yet implemented (requires CDmaPusher integration)");
+    /// Port of `Host1x::PushEntries`. Looks up the per-fd `CDmaPusher` and
+    /// forwards the command headers; mirrors upstream's `devices.find(fd)
+    /// ->second->PushEntries(...)`.
+    pub fn push_entries(&self, fd: i32, entries: Vec<u32>) {
+        use crate::cdma_pusher::ChCommandHeader;
+        let pusher = match self.devices.lock().unwrap().get(&fd) {
+            Some(p) => p.clone(),
+            None => {
+                log::warn!("Host1x::push_entries: no device for fd={}", fd);
+                return;
+            }
+        };
+        let headers: Vec<ChCommandHeader> = entries
+            .into_iter()
+            .map(|raw| ChCommandHeader { raw })
+            .collect();
+        pusher.push_entries(headers);
     }
 }
 
