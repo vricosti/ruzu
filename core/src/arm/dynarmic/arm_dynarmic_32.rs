@@ -300,6 +300,89 @@ fn maybe_dump_code_once(cb: &DynarmicCallbacks32) {
     drop(mem);
     maybe_scan_bl(cb);
     maybe_scan_word(cb);
+    maybe_scan_movw_movt(cb);
+}
+
+/// Scan guest memory for ARM32 `MOVW Rd, #lo; MOVT Rd, #hi` pairs that
+/// compute a target 32-bit immediate. The MOVT must hit the same Rd as a
+/// preceding MOVW within `MAX_DISTANCE_INSNS` instructions.
+///
+/// `RUZU_FIND_MOVW_MOVT=0xVALUE:0xRANGE_START:0xRANGE_LEN` prints each hit
+/// as `[MOVW_HIT] movw_pc=0x... movt_pc=0x... rd=N value=0x...`.
+fn maybe_scan_movw_movt(cb: &DynarmicCallbacks32) {
+    use std::sync::OnceLock;
+    static SPEC: OnceLock<Option<(u32, u64, u64)>> = OnceLock::new();
+    let spec = *SPEC.get_or_init(|| {
+        let raw = std::env::var("RUZU_FIND_MOVW_MOVT").ok()?;
+        let parts: Vec<&str> = raw.split(':').collect();
+        if parts.len() != 3 {
+            return None;
+        }
+        let value = u32::from_str_radix(parts[0].trim_start_matches("0x"), 16).ok()?;
+        let start = u64::from_str_radix(parts[1].trim_start_matches("0x"), 16).ok()?;
+        let len = u64::from_str_radix(parts[2].trim_start_matches("0x"), 16)
+            .ok()
+            .or_else(|| parts[2].parse::<u64>().ok())?;
+        Some((value, start, len))
+    });
+    let Some((value, start, len)) = spec else { return };
+    let target_lo = (value & 0xFFFF) as u32;
+    let target_hi = ((value >> 16) & 0xFFFF) as u32;
+    let mem = cb.mem();
+    let end = start + len;
+    const MAX_DISTANCE_BYTES: u64 = 32; // search up to 8 instructions ahead
+    let mut pc = start;
+    let mut hits = 0;
+    while pc + 4 <= end {
+        let insn = (mem.read_8(pc) as u32)
+            | ((mem.read_8(pc + 1) as u32) << 8)
+            | ((mem.read_8(pc + 2) as u32) << 16)
+            | ((mem.read_8(pc + 3) as u32) << 24);
+        // ARMv7 MOVW: cccc 0011 0000 imm4 Rd imm12
+        // Match cond=any, op=0x03000000 mask 0x0FF00000.
+        if (insn & 0x0FF00000) == 0x03000000 {
+            let imm4 = (insn >> 16) & 0xF;
+            let imm12 = insn & 0xFFF;
+            let imm16 = (imm4 << 12) | imm12;
+            let rd = ((insn >> 12) & 0xF) as u8;
+            if imm16 == target_lo {
+                // Look ahead for MOVT to same Rd
+                let mut q = pc + 4;
+                let q_end = (pc + MAX_DISTANCE_BYTES).min(end);
+                while q + 4 <= q_end {
+                    let qi = (mem.read_8(q) as u32)
+                        | ((mem.read_8(q + 1) as u32) << 8)
+                        | ((mem.read_8(q + 2) as u32) << 16)
+                        | ((mem.read_8(q + 3) as u32) << 24);
+                    // ARMv7 MOVT: cccc 0011 0100 imm4 Rd imm12 — op mask 0x03400000.
+                    if (qi & 0x0FF00000) == 0x03400000 {
+                        let q_rd = ((qi >> 12) & 0xF) as u8;
+                        if q_rd == rd {
+                            let q_imm16 = (((qi >> 16) & 0xF) << 12) | (qi & 0xFFF);
+                            if q_imm16 == target_hi {
+                                eprintln!(
+                                    "[MOVW_HIT] movw_pc=0x{:08X} movt_pc=0x{:08X} rd=r{} value=0x{:08X}",
+                                    pc, q, rd, value
+                                );
+                                hits += 1;
+                                if hits > 64 {
+                                    eprintln!("[MOVW_HIT] (more hits suppressed)");
+                                    return;
+                                }
+                            }
+                            break; // first MOVT to same Rd ends the search
+                        }
+                    }
+                    q += 4;
+                }
+            }
+        }
+        pc += 4;
+    }
+    eprintln!(
+        "[MOVW_HIT] scan done: {} hits for value 0x{:08X} in [0x{:X}..0x{:X}]",
+        hits, value, start, end
+    );
 }
 
 /// Scan guest memory for a 4-byte LE word equal to a target value.
