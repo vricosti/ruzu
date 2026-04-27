@@ -84,15 +84,37 @@ impl IHardwareOpusDecoder {
         }
     }
 
-    /// Common decode stub: returns consumed=0, samples=0, with empty output buffer.
+    /// Decode stub returning silent PCM (zeros) at a plausible sample count.
+    ///
+    /// The real decode is in `audio_core/src/opus/decoder.rs::decode_interleaved`
+    /// but isn't yet wired through `AudioCoreInterface` (would require adding
+    /// `OpusDecoderInterface` trait + AudioCore methods + per-session decoder
+    /// state; ~700 lines across 4 files). Until then, this silent-decode stub
+    /// reports:
+    ///   consumed_size = entire input packet
+    ///   sample_count  = 960 samples (one 20ms frame at 48 kHz)
+    ///   output_buffer = zero-filled PCM (silence)
+    ///
+    /// Strictly better than the previous `consumed=0, samples=0` stub: games
+    /// that gate progress on "decoder produced data" advance instead of
+    /// looping forever on an empty stream.
     fn decode_stub(ctx: &mut HLERequestContext, name: &str, has_perf: bool) {
-        log::debug!("IHardwareOpusDecoder::{} (STUBBED)", name);
-        ctx.write_buffer(&[], 0);
+        log::debug!("IHardwareOpusDecoder::{} (silent-decode)", name);
+        let opus_data = ctx.read_buffer(0);
+        let consumed = opus_data.len() as u32;
+        // 1 frame of stereo 16-bit silence at 48 kHz: 960 samples × 4 bytes.
+        // Cap at the output buffer's actual capacity.
+        const STEREO_FRAME_SAMPLES: u32 = 960;
+        const STEREO_FRAME_BYTES: usize = STEREO_FRAME_SAMPLES as usize * 4;
+        let out_cap = ctx.get_write_buffer_size(0);
+        let out_size = out_cap.min(STEREO_FRAME_BYTES);
+        let zeros = vec![0u8; out_size];
+        ctx.write_buffer(&zeros, 0);
         let data_words = if has_perf { 5 } else { 4 };
         let mut rb = ResponseBuilder::new(ctx, data_words, 0, 0);
         rb.push_result(RESULT_SUCCESS);
-        rb.push_u32(0); // consumed size
-        rb.push_u32(0); // sample count
+        rb.push_u32(consumed); // consumed size
+        rb.push_u32(STEREO_FRAME_SAMPLES); // sample count
         if has_perf {
             rb.push_u64(0); // time taken (ns)
         }
