@@ -178,6 +178,7 @@ fn watch_write(cb: &DynarmicCallbacks32, vaddr: u64, size: u64, value: u128) {
         core_id, pc, lr, vaddr, size, value
     );
     maybe_dump_code_once(cb);
+    maybe_dump_instance_at_pc(cb, pc_ptr, pc);
 }
 
 #[inline(always)]
@@ -221,6 +222,73 @@ fn watch_read(cb: &DynarmicCallbacks32, vaddr: u64, size: u64, value: u128) {
     );
     maybe_dump_code_once(cb);
     maybe_dump_stack_once(cb, pc_ptr);
+    maybe_dump_instance_at_pc(cb, pc_ptr, pc);
+}
+
+/// Capture all 16 GPRs when current PC matches a target.
+/// `RUZU_DUMP_INSTANCE_AT_PC=0xPC` enables it. Bounded to 200 hits.
+/// Reads r0..r15 from the JIT state via pc_ptr.offset(-15..0).
+fn maybe_dump_instance_at_pc(cb: &DynarmicCallbacks32, pc_ptr: Option<*const u32>, pc: u32) {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::OnceLock;
+    static TARGET: OnceLock<Option<u32>> = OnceLock::new();
+    static HITS: AtomicU32 = AtomicU32::new(0);
+    let target = *TARGET.get_or_init(|| {
+        std::env::var("RUZU_DUMP_INSTANCE_AT_PC")
+            .ok()
+            .and_then(|s| u32::from_str_radix(s.trim_start_matches("0x"), 16).ok())
+    });
+    let Some(t) = target else { return };
+    if pc != t {
+        return;
+    }
+    let n = HITS.fetch_add(1, Ordering::Relaxed);
+    if n >= 200 {
+        return;
+    }
+    let Some(p) = pc_ptr else { return };
+    let mut r = [0u32; 16];
+    for i in 0..16 {
+        let off = (i as isize) - 15;
+        r[i] = unsafe { p.offset(off).read_volatile() };
+    }
+    let mem = cb.mem();
+    let star_r0 = if r[0] != 0 { mem.read_32(r[0] as u64) } else { 0 };
+    let star_r1 = if r[1] != 0 { mem.read_32(r[1] as u64) } else { 0 };
+    let star_r8 = if r[8] != 0 { mem.read_32(r[8] as u64) } else { 0 };
+    eprintln!(
+        "[INSTANCE] pc=0x{:08X} hit#{} r0=0x{:08X} r1=0x{:08X} r2=0x{:08X} r3=0x{:08X} r4=0x{:08X} r5=0x{:08X} r6=0x{:08X} r7=0x{:08X} r8=0x{:08X} sb=0x{:08X} sl=0x{:08X} fp=0x{:08X} ip=0x{:08X} sp=0x{:08X} lr=0x{:08X} *r0=0x{:08X} *r1=0x{:08X} *r8=0x{:08X}",
+        pc, n,
+        r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7],
+        r[8], r[9], r[10], r[11], r[12], r[13], r[14],
+        star_r0, star_r1, star_r8
+    );
+    // Dump 32 bytes of struct content at r5 (this), r6 (*this/sub-obj),
+    // r1 (poll target page) — captures heap state at the moment of the wedge.
+    // Also dump 32 stack words starting at sp to walk the call chain.
+    if n < 5 {
+        for (label, addr) in [("r5", r[5]), ("r6", r[6]), ("r1", r[1])] {
+            if addr == 0 || addr < 0x1000 {
+                continue;
+            }
+            let mut hex = String::new();
+            for i in 0..32u64 {
+                use std::fmt::Write;
+                let _ = write!(hex, "{:02x}", mem.read_8(addr as u64 + i));
+            }
+            eprintln!("[INSTANCE_MEM] hit#{} {}=0x{:08X} bytes={}", n, label, addr, hex);
+        }
+        let sp = r[13];
+        if sp != 0 {
+            let mut words = String::new();
+            for i in 0..32u64 {
+                use std::fmt::Write;
+                let w = mem.read_32(sp as u64 + i * 4);
+                let _ = write!(words, "{:08x} ", w);
+            }
+            eprintln!("[INSTANCE_STACK] hit#{} sp=0x{:08X} words={}", n, sp, words.trim());
+        }
+    }
 }
 
 /// One-shot stack dump on the first watch_read hit. Prints 16 32-bit words
