@@ -52,19 +52,26 @@ impl ReleaseSync {
         }
     }
 
-    /// Wait for free space in the audio buffer queue.
     /// Matches upstream SinkStream::WaitFreeSpace.
-    /// Can be called WITHOUT holding the stream lock.
     pub fn wait_free_space_with_stop(&self, stop_requested: &AtomicBool) {
         let max = self.max_queue_size.load(Ordering::Acquire);
         if max == 0 {
             return;
         }
 
-        let mut guard = self.mutex.lock().expect("release mutex poisoned");
+        let guard = self.mutex.lock().expect("release mutex poisoned");
+
+        let (mut guard, _) = self
+            .cv
+            .wait_timeout_while(guard, Duration::from_millis(5), |_| {
+                !self.paused.load(Ordering::Acquire)
+                    && self.queued_buffers.load(Ordering::Acquire) >= max
+                    && !stop_requested.load(Ordering::SeqCst)
+            })
+            .expect("release condvar poisoned");
 
         while !self.paused.load(Ordering::Acquire)
-            && self.queued_buffers.load(Ordering::Acquire) >= max
+            && self.queued_buffers.load(Ordering::Acquire) > max + 3
             && !stop_requested.load(Ordering::SeqCst)
         {
             let (new_guard, _) = self
@@ -72,25 +79,8 @@ impl ReleaseSync {
                 .wait_timeout(guard, Duration::from_millis(5))
                 .expect("release condvar poisoned");
             guard = new_guard;
-
-            if self.paused.load(Ordering::Acquire)
-                || stop_requested.load(Ordering::SeqCst)
-                || self.queued_buffers.load(Ordering::Acquire) < max
-            {
-                break;
-            }
-
-            while !self.paused.load(Ordering::Acquire)
-                && self.queued_buffers.load(Ordering::Acquire) > max + 3
-                && !stop_requested.load(Ordering::SeqCst)
-            {
-                let (new_guard, _) = self
-                    .cv
-                    .wait_timeout(guard, Duration::from_millis(5))
-                    .expect("release condvar poisoned");
-                guard = new_guard;
-            }
         }
+        drop(guard);
     }
 }
 
@@ -323,7 +313,11 @@ impl SinkStream {
     }
 
     pub fn process_audio_in(&mut self, input_buffer: &[i16], num_frames: usize) {
-        if self.system.lock().is_paused() || self.system.lock().is_shutting_down() {
+        let (paused, shutting_down) = {
+            let sys = self.system.lock();
+            (sys.is_paused(), sys.is_shutting_down())
+        };
+        if paused || shutting_down {
             return;
         }
 
@@ -378,8 +372,12 @@ impl SinkStream {
     }
 
     pub fn process_audio_out_and_render(&mut self, output_buffer: &mut [i16], num_frames: usize) {
-        if self.system.lock().is_paused() || self.system.lock().is_shutting_down() {
-            if self.system.lock().is_shutting_down() {
+        let (paused, shutting_down) = {
+            let sys = self.system.lock();
+            (sys.is_paused(), sys.is_shutting_down())
+        };
+        if paused || shutting_down {
+            if shutting_down {
                 self.release.queued_buffers.store(0, Ordering::Release);
                 self.release.cv.notify_one();
             }
