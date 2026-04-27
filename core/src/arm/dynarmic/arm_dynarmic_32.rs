@@ -199,8 +199,8 @@ fn watch_read(cb: &DynarmicCallbacks32, vaddr: u64, size: u64, value: u128) {
             return;
         }
     }
-    let pc = cb
-        .jit_pc_ptr
+    let pc_ptr = cb.jit_pc_ptr;
+    let pc = pc_ptr
         .map(|p| unsafe { p.read_volatile() })
         .unwrap_or(0);
     if let Some((pc_lo, pc_hi)) = pc_range {
@@ -211,9 +211,12 @@ fn watch_read(cb: &DynarmicCallbacks32, vaddr: u64, size: u64, value: u128) {
             }
         }
     }
+    let lr = pc_ptr
+        .map(|p| unsafe { p.offset(-1).read_volatile() })
+        .unwrap_or(0);
     eprintln!(
-        "[WATCH_READ ] pc=0x{:08X} vaddr=0x{:X} size={} value=0x{:032X}",
-        pc, vaddr, size, value
+        "[WATCH_READ ] pc=0x{:08X} lr=0x{:08X} vaddr=0x{:X} size={} value=0x{:032X}",
+        pc, lr, vaddr, size, value
     );
 }
 
