@@ -299,6 +299,57 @@ fn maybe_dump_code_once(cb: &DynarmicCallbacks32) {
     }
     drop(mem);
     maybe_scan_bl(cb);
+    maybe_scan_word(cb);
+}
+
+/// Scan guest memory for a 4-byte LE word equal to a target value.
+/// `RUZU_FIND_WORD=0xVALUE:0xRANGE_START:0xRANGE_LEN` prints every hit as
+/// `[WORD_HIT] addr=0x... val=0x... ctx=<16 bytes around>`. Used to locate
+/// vtable slots / function pointer storage that hold a known address.
+fn maybe_scan_word(cb: &DynarmicCallbacks32) {
+    use std::sync::OnceLock;
+    static SPEC: OnceLock<Option<(u32, u64, u64)>> = OnceLock::new();
+    let spec = *SPEC.get_or_init(|| {
+        let raw = std::env::var("RUZU_FIND_WORD").ok()?;
+        let parts: Vec<&str> = raw.split(':').collect();
+        if parts.len() != 3 {
+            return None;
+        }
+        let value = u32::from_str_radix(parts[0].trim_start_matches("0x"), 16).ok()?;
+        let start = u64::from_str_radix(parts[1].trim_start_matches("0x"), 16).ok()?;
+        let len = u64::from_str_radix(parts[2].trim_start_matches("0x"), 16)
+            .ok()
+            .or_else(|| parts[2].parse::<u64>().ok())?;
+        Some((value, start, len))
+    });
+    let Some((value, start, len)) = spec else { return };
+    let mem = cb.mem();
+    let end = start + len;
+    let mut addr = start;
+    let mut hits = 0;
+    while addr + 4 <= end {
+        let w = mem.read_32(addr);
+        if w == value {
+            // Print the 16 bytes around the hit (8 before, 8 after) for context
+            let ctx_start = addr.saturating_sub(8);
+            let mut ctx = String::with_capacity(48);
+            for i in 0..16u64 {
+                use std::fmt::Write;
+                let _ = write!(ctx, "{:02x}", mem.read_8(ctx_start + i));
+                if i == 7 {
+                    ctx.push('|');
+                }
+            }
+            eprintln!("[WORD_HIT] addr=0x{:08X} val=0x{:08X} ctx=[{}]", addr, value, ctx);
+            hits += 1;
+            if hits > 64 {
+                eprintln!("[WORD_HIT] (more hits suppressed)");
+                break;
+            }
+        }
+        addr += 4;
+    }
+    eprintln!("[WORD_HIT] scan done: {} hits in [0x{:X}..0x{:X}]", hits, start, end);
 }
 
 /// Scan guest memory for ARM BL instructions targeting a specific PC.
@@ -331,10 +382,10 @@ fn maybe_scan_bl(cb: &DynarmicCallbacks32) {
         let w1 = mem.read_8(pc + 1);
         let w2 = mem.read_8(pc + 2);
         let w3 = mem.read_8(pc + 3);
-        // ARM BL is 0xEB______ in big-endian instruction order; LE byte order
-        // means the high byte is at offset+3.
-        if w3 == 0xEB {
-            // 24-bit signed immediate
+        // ARM BL is 0xEB______ and unconditional B is 0xEA______ (tail call).
+        // Conditional BL/B (cccc 1010/1011) also possible; cover all conds
+        // by checking high nibble == 1010 or 1011 (mask 0x0F).
+        if (w3 & 0x0F) == 0x0A || (w3 & 0x0F) == 0x0B {
             let imm24 = (w0 as u32) | ((w1 as u32) << 8) | ((w2 as u32) << 16);
             let signed = if imm24 & 0x800000 != 0 {
                 imm24 as i32 | (-(0x1_000_000_i32))
@@ -343,9 +394,12 @@ fn maybe_scan_bl(cb: &DynarmicCallbacks32) {
             };
             let computed_target = (pc as i64 + 8 + (signed as i64) * 4) as u64;
             if computed_target == target {
-                eprintln!("[BL_HIT] pc=0x{:08X} target=0x{:08X}", pc, target);
+                let cond = (w3 >> 4) & 0xF;
+                let kind = if w3 & 0x01 != 0 { "BL" } else { "B " };
+                eprintln!("[BL_HIT] pc=0x{:08X} target=0x{:08X} kind={} cond=0x{:X}",
+                    pc, target, kind, cond);
                 hits += 1;
-                if hits > 32 {
+                if hits > 64 {
                     eprintln!("[BL_HIT] (more hits suppressed)");
                     break;
                 }
