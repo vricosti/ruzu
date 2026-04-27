@@ -916,7 +916,7 @@ impl NvDevice for NvHostAsGpu {
                     r
                 }
                 0x14 => {
-                    // Remap: variable-length entries
+                    // Upstream WrapVariable<IoctlRemapEntry> echoes parsed entries back to output.
                     let entry_size = std::mem::size_of::<IoctlRemapEntry>();
                     let num_entries = input.len() / entry_size;
                     let mut entries = Vec::with_capacity(num_entries);
@@ -927,7 +927,15 @@ impl NvDevice for NvHostAsGpu {
                             entries.push(read_struct::<IoctlRemapEntry>(&input[start..end]));
                         }
                     }
-                    self.remap(&entries)
+                    let r = self.remap(&entries);
+                    for (i, entry) in entries.iter().enumerate() {
+                        let start = i * entry_size;
+                        let end = start + entry_size;
+                        if end <= output.len() {
+                            write_struct(&mut output[start..end], entry);
+                        }
+                    }
+                    r
                 }
                 _ => {
                     log::error!("Unimplemented ioctl={:08X}", command.raw);
