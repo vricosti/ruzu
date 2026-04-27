@@ -25,11 +25,24 @@ impl AudioCallback for SDLCallback {
             output.len()
         };
 
+        let profile = std::env::var_os("RUZU_PROFILE_SDL2_CB").is_some();
+        let t_lock = std::time::Instant::now();
         let mut stream = self.stream_handle.lock();
+        let lock_us = t_lock.elapsed().as_micros();
+        let t_work = std::time::Instant::now();
         if self.stream_type == StreamType::In {
             stream.process_audio_in(output, num_frames);
         } else {
             stream.process_audio_out_and_render(output, num_frames);
+        }
+        if profile {
+            let work_us = t_work.elapsed().as_micros();
+            if lock_us > 1000 || work_us > 1000 {
+                log::info!(
+                    "PROFILE_SDL2_CB lock_us={} work_us={} frames={}",
+                    lock_us, work_us, num_frames
+                );
+            }
         }
     }
 }

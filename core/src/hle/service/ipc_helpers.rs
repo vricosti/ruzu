@@ -185,6 +185,21 @@ impl<'a> ResponseBuilder<'a> {
         ctx.write_size += index as u32;
         ctx.domain_offset = (index as u32) + raw_data_size / (core::mem::size_of::<u32>() as u32);
 
+        if std::env::var_os("RUZU_TRACE_RB").is_some() {
+            eprintln!(
+                "[RB] N={} hc={} mv={} tipc={} domain={} raw_data_size={} index={} write_size={} data_payload_offset={}",
+                normal_params_size,
+                num_handles_to_copy,
+                num_objects_to_move,
+                is_tipc,
+                is_domain,
+                raw_data_size,
+                index,
+                ctx.write_size,
+                ctx.data_payload_offset
+            );
+        }
+
         Self {
             context: ctx,
             index,

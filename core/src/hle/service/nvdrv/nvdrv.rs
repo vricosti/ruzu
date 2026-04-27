@@ -203,14 +203,35 @@ impl Module {
             }
         }
         let files = self.open_files.lock().unwrap();
-        if let Some(device) = files.get(&fd) {
+        let result = if let Some(device) = files.get(&fd) {
             let device = Arc::clone(device);
             drop(files);
             device.ioctl1(fd, command, input, output)
         } else {
             log::error!("Could not find DeviceFD={}!", fd);
             NvResult::NotImplemented
+        };
+        if std::env::var_os("RUZU_TRACE_IOCTL_FP").is_some() {
+            // Show up to 64 bytes so we see full MapBufferEx (40B) / SubmitGPFIFO fence tails.
+            let n = output.len().min(64);
+            let mut hex = String::new();
+            for (i, b) in output.iter().enumerate().take(n) {
+                if i > 0 && (i & 3) == 0 {
+                    hex.push(' ');
+                }
+                use std::fmt::Write;
+                let _ = write!(hex, "{:02x}", b);
+            }
+            eprintln!(
+                "[IOCTL_FP] fd={} ioctl=0x{:08X} out_sz=0x{:x} nv_result=0x{:x} head={}",
+                fd,
+                command.raw,
+                output.len(),
+                result as u32,
+                hex
+            );
         }
+        result
     }
 
     pub fn ioctl2(

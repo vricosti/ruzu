@@ -1684,16 +1684,36 @@ pub fn call(system: &System, imm: u32, is_64bit: bool, args: &mut SvcArgs) {
     // Format matches zuyu trace: [  T.TTTTTT] SVC_IN  imm=0xNN core=C tid=T args=[...]
     let trace_enabled = super::trace_format::is_svc_trace_enabled();
 
-    if trace_enabled {
-        let (core_id, tid) = {
-            if let Some(thread) = system.current_thread() {
-                let t = thread.lock().unwrap();
-                (t.get_current_core(), t.get_thread_id() as i64)
-            } else {
-                (-1, -1)
-            }
-        };
+    // Always compute tid so the PC-window tracker works even when
+    // RUZU_SVC_TRACE is off.
+    let (core_id, tid) = {
+        if let Some(thread) = system.current_thread() {
+            let t = thread.lock().unwrap();
+            (t.get_current_core(), t.get_thread_id() as i64)
+        } else {
+            (-1, -1)
+        }
+    };
 
+    // PC-window SVC counter. By default counts on tid=73 (main game thread);
+    // RUZU_TRACE_PC_TID=N overrides to count a different thread (e.g. tid=102
+    // for the audio worker). Increment on every SVC entry and deactivate the
+    // PC trace when we enter the closing SVC (count == end).
+    let svc_count_here: u64 = if tid == pc_trace_target_tid() {
+        use std::sync::atomic::Ordering;
+        let n = SVC_MAIN_COUNT.fetch_add(1, Ordering::SeqCst) + 1;
+        if let Some((_start, end)) = pc_trace_window() {
+            if n == end {
+                pc_trace_active_set(false);
+                eprintln!("[TRACE_PC] ---- window end at SVC #{} entry ----", n);
+            }
+        }
+        n
+    } else {
+        0
+    };
+
+    if trace_enabled {
         // Log SVC entry
         eprintln!(
             "[{:>10.6}] SVC_IN  imm={:#04x} core={} tid={} args=[{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x}]",
@@ -1710,6 +1730,10 @@ pub fn call(system: &System, imm: u32, is_64bit: bool, args: &mut SvcArgs) {
             dispatch_args[6],
             dispatch_args[7]
         );
+
+        if svc_trace_full_regs_enabled() {
+            dump_svc_full_regs(system, imm, tid, "REGS_IN ");
+        }
 
         if is_64bit {
             call64(system, imm, &mut dispatch_args);
@@ -1731,11 +1755,27 @@ pub fn call(system: &System, imm: u32, is_64bit: bool, args: &mut SvcArgs) {
             dispatch_args[6],
             dispatch_args[7]
         );
+
+        if svc_trace_full_regs_enabled() {
+            dump_svc_full_regs(system, imm, tid, "REGS_OUT");
+        }
     } else {
         if is_64bit {
             call64(system, imm, &mut dispatch_args);
         } else {
             call32(system, imm, &mut dispatch_args);
+        }
+    }
+
+    // After the handler returns, if we just finished SVC #start on the
+    // target thread (default 73, see RUZU_TRACE_PC_TID), activate PC tracing
+    // so the next block boundaries get logged.
+    if tid == pc_trace_target_tid() {
+        if let Some((start, _end)) = pc_trace_window() {
+            if svc_count_here == start {
+                eprintln!("[TRACE_PC] ---- window start after SVC #{} exit (tid={}) ----", svc_count_here, tid);
+                pc_trace_active_set(true);
+            }
         }
     }
 
@@ -1766,6 +1806,102 @@ pub fn call(system: &System, imm: u32, is_64bit: bool, args: &mut SvcArgs) {
 
 /// Per-tid SVC counter for the memory snapshot hook (RUZU_DUMP_AT_SVC=N).
 static SVC_COUNTER_TID73: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Global SVC counter on the main thread (tid=73). Always increments on every
+/// SVC entry from tid=73 regardless of env-var state. Used to drive the
+/// PC-window trace (`RUZU_TRACE_PC_WINDOW=start,end`) that samples guest PCs
+/// between SVC #start exit and SVC #end entry.
+static SVC_MAIN_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Access the shared PC_TRACE_ACTIVE flag that rdynarmic's block-lookup
+/// trampoline checks. Exported by rdynarmic::jit::PC_TRACE_ACTIVE.
+fn pc_trace_active_set(v: bool) {
+    rdynarmic::jit::PC_TRACE_ACTIVE.store(v, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Parse `RUZU_TRACE_PC_TID=<tid>` once. Defaults to 73 (main game thread).
+/// Set to e.g. 102 to PC-trace the audio worker thread instead.
+fn pc_trace_target_tid() -> i64 {
+    use std::sync::OnceLock;
+    static TID: OnceLock<i64> = OnceLock::new();
+    *TID.get_or_init(|| {
+        std::env::var("RUZU_TRACE_PC_TID")
+            .ok()
+            .and_then(|v| v.parse::<i64>().ok())
+            .unwrap_or(73)
+    })
+}
+
+/// Parse `RUZU_TRACE_PC_WINDOW=<start>,<end>` once. `start` is the SVC index
+/// whose EXIT activates tracing; `end` is the SVC index whose ENTRY
+/// deactivates it. Both are 1-based on the target thread (see
+/// `RUZU_TRACE_PC_TID`).
+fn pc_trace_window() -> Option<(u64, u64)> {
+    use std::sync::OnceLock;
+    static WINDOW: OnceLock<Option<(u64, u64)>> = OnceLock::new();
+    *WINDOW.get_or_init(|| {
+        let raw = std::env::var("RUZU_TRACE_PC_WINDOW").ok()?;
+        let (a, b) = raw.split_once(',')?;
+        let start = a.trim().parse::<u64>().ok()?;
+        let end = b.trim().parse::<u64>().ok()?;
+        if end <= start {
+            return None;
+        }
+        Some((start, end))
+    })
+}
+
+/// Cached decision for `RUZU_SVC_TRACE_REGS=1` — dumps full r0..r14 + CPSR
+/// (ARM32) / x0..x30 + PSTATE (ARM64) alongside each SVC_IN/OUT trace line.
+/// Gated on `RUZU_SVC_TRACE_REGS` only (not `RUZU_SVC_TRACE`) because the
+/// extra lines would break existing diff tooling that expects SVC_IN/OUT only.
+fn svc_trace_full_regs_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("RUZU_SVC_TRACE_REGS").is_some())
+}
+
+/// Dump all 16 ARM32 GPRs + CPSR (or 31 ARM64 GPRs + PSTATE) from the current
+/// core's JIT. Env-gated on `RUZU_SVC_TRACE_REGS` — used to pinpoint
+/// divergences invisible in the r0-r7 SVC args, especially in callee-saved
+/// registers (r4-r11) the game carries across SVC boundaries.
+///
+/// `label` is "REGS_IN" or "REGS_OUT" to pair with the SVC_IN/OUT line.
+fn dump_svc_full_regs(system: &System, imm: u32, tid: i64, label: &str) {
+    use crate::arm::arm_interface::ThreadContext;
+    let kernel = match system.kernel() {
+        Some(k) => k,
+        None => return,
+    };
+    let core_index = kernel.current_physical_core_index() as usize;
+    let process_arc = match system.current_process_arc.as_ref().cloned() {
+        Some(p) => p,
+        None => return,
+    };
+    let process = process_arc.lock().unwrap();
+    let jit = match process.get_arm_interface(core_index) {
+        Some(j) => j,
+        None => return,
+    };
+    let mut ctx = ThreadContext::default();
+    jit.get_context(&mut ctx);
+    // For ARM32, ctx.r[0..16] hold r0..r15; ctx.pstate holds CPSR.
+    // For ARM64, ctx.r[0..29] hold x0..x28, plus fp/lr/sp/pc fields.
+    // We print both shapes identically — callers read whichever slice matches
+    // their guest bitness.
+    eprintln!(
+        "[{:>10.6}] {} imm={:#04x} tid={} r0={:#010x} r1={:#010x} r2={:#010x} r3={:#010x} r4={:#010x} r5={:#010x} r6={:#010x} r7={:#010x} r8={:#010x} r9={:#010x} r10={:#010x} r11={:#010x} r12={:#010x} sp={:#010x} lr={:#010x} pc={:#010x} cpsr={:#010x}",
+        super::trace_format::elapsed_secs(),
+        label,
+        imm,
+        tid,
+        ctx.r[0] as u32, ctx.r[1] as u32, ctx.r[2] as u32, ctx.r[3] as u32,
+        ctx.r[4] as u32, ctx.r[5] as u32, ctx.r[6] as u32, ctx.r[7] as u32,
+        ctx.r[8] as u32, ctx.r[9] as u32, ctx.r[10] as u32, ctx.r[11] as u32,
+        ctx.r[12] as u32, ctx.r[13] as u32, ctx.r[14] as u32, ctx.r[15] as u32,
+        ctx.pstate,
+    );
+}
 
 fn maybe_dump_process_memory(system: &System, tid: i64) {
     // Only count SVCs on the game's main thread (tid=73 in current MK8D run).

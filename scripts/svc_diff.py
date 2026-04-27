@@ -14,7 +14,7 @@ Compares ruzu tid=73 vs zuyu tid=75 and prints the first point where a field dif
 
 Usage:
   python3 scripts/svc_diff.py /tmp/mk8d-buf2.log traces/zuyu_full_5s_trace.log \
-      [--limit N] [--rsp {tls,buf}] [--no-rsp-gate]
+      [--limit N] [--rsp {tls,buf}] [--no-rsp-gate] [--semantic-only]
 
 --rsp selects which ruzu response view is compared against zuyu's TLS_RSP:
   tls (default): compare ruzu TLS_RSP_TLS (guest memory after writeback)
@@ -24,6 +24,14 @@ Usage:
 comparison to the range the handler actually writes. Without the gate, tail
 bytes beyond write_size produce false-positive diffs because zuyu's reference
 trace captures 16 words of TLS regardless of how much the handler wrote.
+
+--semantic-only ignores raw SVC arg differences and only stops on:
+  - imm mismatch
+  - TLS_REQ mismatch
+  - TLS_RSP mismatch (selected response view)
+  - OUT_BUF mismatch
+This is useful once allocator / VA drift makes arg tuples noisy but you still
+want the first guest-visible IPC divergence.
 
 Zuyu's trace currently only has TLS_REQ/TLS_RSP (not OUT_BUF). To diff OUT_BUFs,
 add matching instrumentation to upstream `src/core/hle/service/hle_ipc.cpp` that
@@ -227,7 +235,7 @@ def parse_zuyu(path, target_tid=75):
                     "args": am.group(1) if am else "",
                     "tls_req": None,
                     "tls_rsp": None,
-                    "out_buf": None,  # zuyu trace doesn't capture OUT_BUF yet
+                    "out_buf": None,  # populated from OUT_BUF lines (ZUYU_TRACE_OUT_BUF)
                 }
                 svcs.append(cur)
             elif cur is None:
@@ -260,6 +268,14 @@ def parse_zuyu(path, target_tid=75):
                     )
                     grouped = " ".join(bytes_hex[i : i + 8] for i in range(0, len(bytes_hex), 8))
                     cur["tls_rsp"] = (int(m.group(1), 16), grouped)
+            elif "OUT_BUF" in line:
+                m = OUT_BUF_RE.search(line)
+                if m:
+                    cur["out_buf"] = (
+                        int(m.group(1), 16),
+                        int(m.group(2), 16),
+                        m.group(3).strip(),
+                    )
     return svcs
 
 
@@ -271,6 +287,7 @@ def main():
     limit = 3000
     rsp_view = "tls"
     rsp_gate = True
+    semantic_only = False
     args_iter = iter(range(3, len(sys.argv)))
     for idx in args_iter:
         arg = sys.argv[idx]
@@ -285,6 +302,8 @@ def main():
             next(args_iter, None)
         elif arg == "--no-rsp-gate":
             rsp_gate = False
+        elif arg == "--semantic-only":
+            semantic_only = True
     rsp_key = f"tls_rsp_{rsp_view}"
     rsp_label = f"TLS_RSP_{rsp_view.upper()}"
 
@@ -293,7 +312,8 @@ def main():
     gate_note = "effective write_size gate ON" if rsp_gate else "gate OFF (--no-rsp-gate)"
     print(
         f"ruzu tid=73: {len(ruzu)} svcs, zuyu tid=75: {len(zuyu)} svcs "
-        f"(response view: ruzu {rsp_label} vs zuyu TLS_RSP; {gate_note})"
+        f"(response view: ruzu {rsp_label} vs zuyu TLS_RSP; {gate_note}; "
+        f"{'semantic-only' if semantic_only else 'args+tls'})"
     )
     n = min(len(ruzu), len(zuyu))
     suppressed_tail = 0
@@ -305,6 +325,8 @@ def main():
             print(f"  zuyu args: {z['args']}")
             return
         if r["args"] != z["args"]:
+            if semantic_only:
+                continue
             # Skip scratch-register-only differences in arg 7
             r_args = r["args"].split(",")
             z_args = z["args"].split(",")
@@ -357,6 +379,25 @@ def main():
         r_rsp = r.get(rsp_key)
         if r_rsp and z["tls_rsp"]:
             if compare_with_mask(rsp_label, r_rsp[1], z["tls_rsp"][1], response_compare_mask):
+                return
+        r_ob = r.get("out_buf")
+        z_ob = z.get("out_buf")
+        if r_ob and z_ob:
+            r_addr, r_size, r_hex = r_ob
+            z_addr, z_size, z_hex = z_ob
+            # Addresses may differ across runs due to allocator ordering;
+            # only compare content bytes + size.
+            if r_size != z_size:
+                print(f"\n[SVC #{i+1}] OUT_BUF SIZE DIFFERS "
+                      f"(imm=0x{r['imm']:02x}): ruzu=0x{r_size:x} zuyu=0x{z_size:x}")
+                print(f"  ruzu @0x{r_addr:x}: {r_hex}")
+                print(f"  zuyu @0x{z_addr:x}: {z_hex}")
+                return
+            if r_hex != z_hex:
+                print(f"\n[SVC #{i+1}] OUT_BUF DIFFERS "
+                      f"(imm=0x{r['imm']:02x}, size=0x{r_size:x}):")
+                print(f"  ruzu @0x{r_addr:x}: {r_hex}")
+                print(f"  zuyu @0x{z_addr:x}: {z_hex}")
                 return
     print(f"\nNo divergence found in first {n} SVCs (at args/tls level).")
     if rsp_gate and suppressed_tail:
