@@ -7,8 +7,8 @@
 //! See https://envytools.readthedocs.io/en/latest/hw/fifo/dma-pusher.html
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 
 use crate::engines::engine_interface::EngineInterface;
 use crate::engines::engine_interface::EngineTypes;
@@ -22,6 +22,37 @@ static DMA_FLOW_DISPATCH_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
 
 fn should_trace_dma_flow() -> bool {
     std::env::var_os("RUZU_TRACE_DMA_FLOW").is_some()
+}
+
+/// Per-submit method-dispatch trace gate. `RUZU_TRACE_PULLER_SUBMITS=N` logs
+/// every dispatch_method/dispatch_multi_method call for the first N submits
+/// crossing `Scheduler::push`. Used to find missing GPU-method dispatches in
+/// the wedge between MK8D's 2nd and 3rd SubmitGPFIFO ioctls.
+pub static CURRENT_SUBMIT_INDEX: AtomicU64 = AtomicU64::new(0);
+
+/// Index of the submit currently being dispatched by `Scheduler::push`, or
+/// `i64::MIN` when no traced submit is active. Set/cleared around
+/// `dma_pusher.dispatch_calls()` so `current_submit_traced()` reads the
+/// correct index for the in-flight method dispatches.
+pub static ACTIVE_SUBMIT_IDX: std::sync::atomic::AtomicI64 =
+    std::sync::atomic::AtomicI64::new(i64::MIN);
+
+pub fn puller_trace_submits_limit() -> Option<u64> {
+    static V: OnceLock<Option<u64>> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("RUZU_TRACE_PULLER_SUBMITS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+    })
+}
+
+pub fn current_submit_traced() -> Option<u64> {
+    let v = ACTIVE_SUBMIT_IDX.load(Ordering::Relaxed);
+    if v < 0 {
+        None
+    } else {
+        Some(v as u64)
+    }
 }
 
 /// GPU virtual address type.
@@ -295,6 +326,10 @@ impl DmaPusher {
     /// Push a command list into the DMA pushbuffer queue.
     pub fn push(&mut self, entries: CommandList) {
         self.dma_pushbuffer.push_back(entries);
+    }
+
+    pub fn dma_pushbuffer_len(&self) -> usize {
+        self.dma_pushbuffer.len()
     }
 
     /// Dispatch all pending command lists. Matches upstream `DmaPusher::DispatchCalls`.
@@ -765,6 +800,16 @@ impl DmaPusher {
                     self.dma_state.method_count
                 );
             }
+            if let Some(s) = current_submit_traced() {
+                log::info!(
+                    "[PULLER_TRACE] s#{} puller m=0x{:X} arg=0x{:08X} subch={} pending={}",
+                    s,
+                    self.dma_state.method,
+                    argument,
+                    self.dma_state.subchannel,
+                    self.dma_state.method_count,
+                );
+            }
             self.puller.call_method(&MethodCall::new(
                 self.dma_state.method,
                 argument,
@@ -784,6 +829,15 @@ impl DmaPusher {
                     self.dma_state.subchannel
                 );
             }
+            if let Some(s) = current_submit_traced() {
+                log::warn!(
+                    "[PULLER_TRACE] s#{} unbound m=0x{:X} arg=0x{:08X} subch={}",
+                    s,
+                    self.dma_state.method,
+                    argument,
+                    self.dma_state.subchannel,
+                );
+            }
             return;
         };
         let subchannel: *mut dyn EngineInterface = unsafe { std::mem::transmute(raw) };
@@ -798,6 +852,12 @@ impl DmaPusher {
                     self.dma_state.subchannel
                 );
             }
+            if let Some(s) = current_submit_traced() {
+                log::info!(
+                    "[PULLER_TRACE] s#{} sink m=0x{:X} arg=0x{:08X} subch={}",
+                    s, self.dma_state.method, argument, self.dma_state.subchannel,
+                );
+            }
             subchannel.push_method_sink(self.dma_state.method, argument);
             return;
         }
@@ -809,6 +869,16 @@ impl DmaPusher {
                 argument,
                 self.dma_state.subchannel,
                 self.dma_state.dma_get.wrapping_add(self.dma_state.dma_word_offset)
+            );
+        }
+        if let Some(s) = current_submit_traced() {
+            log::info!(
+                "[PULLER_TRACE] s#{} engine m=0x{:X} arg=0x{:08X} subch={} pending={}",
+                s,
+                self.dma_state.method,
+                argument,
+                self.dma_state.subchannel,
+                self.dma_state.method_count,
             );
         }
         subchannel.consume_sink();
@@ -833,6 +903,20 @@ impl DmaPusher {
                 args.len(),
                 self.dma_state.method_count,
                 preview
+            );
+        }
+        if let Some(s) = current_submit_traced() {
+            let preview: Vec<String> =
+                args.iter().take(8).map(|v| format!("{:08X}", v)).collect();
+            log::info!(
+                "[PULLER_TRACE] s#{} multi {} m=0x{:X} subch={} count={} pending={} args[0..]={:?}",
+                s,
+                if self.dma_state.method < NON_PULLER_METHODS { "puller" } else { "engine" },
+                self.dma_state.method,
+                self.dma_state.subchannel,
+                args.len(),
+                self.dma_state.method_count,
+                preview,
             );
         }
         if self.dma_state.method < NON_PULLER_METHODS {
