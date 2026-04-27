@@ -248,43 +248,112 @@ fn maybe_dump_stack_once(cb: &DynarmicCallbacks32, pc_ptr: Option<*const u32>) {
 }
 
 /// One-shot guest-code dump triggered when watch_read/watch_write fires.
-/// `RUZU_DUMP_CODE=0xPC:LEN` reads LEN bytes of guest memory starting at PC
-/// and prints them as hex; an offline disassembler (e.g. capstone) decodes.
-/// Retries until the read returns non-zero bytes, so the dump waits for the
-/// target page to be loaded into guest memory.
+/// `RUZU_DUMP_CODE=0xPC1:LEN1[,0xPC2:LEN2,...]` reads LENn bytes of guest
+/// memory starting at PCn and prints them as hex. Retries until any one
+/// region's first 16 bytes are non-zero, then dumps ALL configured regions.
 fn maybe_dump_code_once(cb: &DynarmicCallbacks32) {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::OnceLock;
     static FIRED: AtomicBool = AtomicBool::new(false);
-    static SPEC: OnceLock<Option<(u64, u64)>> = OnceLock::new();
-    let spec = *SPEC.get_or_init(|| {
-        let raw = std::env::var("RUZU_DUMP_CODE").ok()?;
-        let (a, l) = raw.split_once(':')?;
-        let addr = u64::from_str_radix(a.trim_start_matches("0x"), 16).ok()?;
-        let len = l.parse::<u64>().ok()?;
-        Some((addr, len))
+    static SPECS: OnceLock<Vec<(u64, u64)>> = OnceLock::new();
+    let specs = SPECS.get_or_init(|| {
+        let raw = std::env::var("RUZU_DUMP_CODE").unwrap_or_default();
+        let mut out = Vec::new();
+        for token in raw.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
+            if let Some((a, l)) = token.split_once(':') {
+                if let (Ok(addr), Ok(len)) = (
+                    u64::from_str_radix(a.trim_start_matches("0x"), 16),
+                    l.parse::<u64>(),
+                ) {
+                    out.push((addr, len));
+                }
+            }
+        }
+        out
     });
-    let Some((addr, len)) = spec else { return };
+    if specs.is_empty() {
+        return;
+    }
     if FIRED.load(Ordering::Relaxed) {
         return;
     }
     let mem = cb.mem();
-    let mut bytes = Vec::with_capacity(len as usize);
-    for i in 0..len {
-        bytes.push(mem.read_8(addr + i));
-    }
-    if bytes.iter().take(16).all(|&b| b == 0) {
+    // Wait until at least ANY region's bytes are populated (some pages may
+    // be heap fill/zeroed; pick the first non-zero region as the trigger).
+    let any_populated = specs
+        .iter()
+        .any(|&(a, _)| (0..16u64).any(|i| mem.read_8(a + i) != 0));
+    if !any_populated {
         return;
     }
     if FIRED.swap(true, Ordering::SeqCst) {
         return;
     }
-    let mut hex = String::with_capacity(bytes.len() * 2);
-    for b in &bytes {
-        use std::fmt::Write;
-        let _ = write!(hex, "{:02x}", b);
+    for &(addr, len) in specs {
+        let mut hex = String::with_capacity(len as usize * 2);
+        for i in 0..len {
+            use std::fmt::Write;
+            let _ = write!(hex, "{:02x}", mem.read_8(addr + i));
+        }
+        eprintln!("[CODE_DUMP] addr=0x{:08X} len={} bytes={}", addr, len, hex);
     }
-    eprintln!("[CODE_DUMP] addr=0x{:08X} len={} bytes={}", addr, len, hex);
+    drop(mem);
+    maybe_scan_bl(cb);
+}
+
+/// Scan guest memory for ARM BL instructions targeting a specific PC.
+/// `RUZU_FIND_BL=0xTARGET:0xRANGE_START:0xRANGE_LEN` scans RANGE_LEN bytes
+/// from RANGE_START for any 4-byte ARM word `0xEB______` whose decoded
+/// offset reaches TARGET. Prints all hits as `[BL_HIT] pc=0x... target=0x...`.
+fn maybe_scan_bl(cb: &DynarmicCallbacks32) {
+    use std::sync::OnceLock;
+    static SPEC: OnceLock<Option<(u64, u64, u64)>> = OnceLock::new();
+    let spec = *SPEC.get_or_init(|| {
+        let raw = std::env::var("RUZU_FIND_BL").ok()?;
+        let parts: Vec<&str> = raw.split(':').collect();
+        if parts.len() != 3 {
+            return None;
+        }
+        let target = u64::from_str_radix(parts[0].trim_start_matches("0x"), 16).ok()?;
+        let start = u64::from_str_radix(parts[1].trim_start_matches("0x"), 16).ok()?;
+        let len = u64::from_str_radix(parts[2].trim_start_matches("0x"), 16)
+            .ok()
+            .or_else(|| parts[2].parse::<u64>().ok())?;
+        Some((target, start, len))
+    });
+    let Some((target, start, len)) = spec else { return };
+    let mem = cb.mem();
+    let end = start + len;
+    let mut pc = start;
+    let mut hits = 0;
+    while pc + 4 <= end {
+        let w0 = mem.read_8(pc);
+        let w1 = mem.read_8(pc + 1);
+        let w2 = mem.read_8(pc + 2);
+        let w3 = mem.read_8(pc + 3);
+        // ARM BL is 0xEB______ in big-endian instruction order; LE byte order
+        // means the high byte is at offset+3.
+        if w3 == 0xEB {
+            // 24-bit signed immediate
+            let imm24 = (w0 as u32) | ((w1 as u32) << 8) | ((w2 as u32) << 16);
+            let signed = if imm24 & 0x800000 != 0 {
+                imm24 as i32 | (-(0x1_000_000_i32))
+            } else {
+                imm24 as i32
+            };
+            let computed_target = (pc as i64 + 8 + (signed as i64) * 4) as u64;
+            if computed_target == target {
+                eprintln!("[BL_HIT] pc=0x{:08X} target=0x{:08X}", pc, target);
+                hits += 1;
+                if hits > 32 {
+                    eprintln!("[BL_HIT] (more hits suppressed)");
+                    break;
+                }
+            }
+        }
+        pc += 4;
+    }
+    eprintln!("[BL_HIT] scan done: {} hits in [0x{:X}..0x{:X}]", hits, start, end);
 }
 
 /// PC-range filter from `RUZU_WATCH_PC=0xLO-0xHI` (inclusive..exclusive).
