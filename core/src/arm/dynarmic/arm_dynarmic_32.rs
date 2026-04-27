@@ -177,6 +177,7 @@ fn watch_write(cb: &DynarmicCallbacks32, vaddr: u64, size: u64, value: u128) {
         "[WATCH_WRITE] core={} pc=0x{:08X} lr=0x{:08X} vaddr=0x{:X} size={} value=0x{:032X}",
         core_id, pc, lr, vaddr, size, value
     );
+    maybe_dump_code_once(cb);
 }
 
 #[inline(always)]
@@ -218,6 +219,38 @@ fn watch_read(cb: &DynarmicCallbacks32, vaddr: u64, size: u64, value: u128) {
         "[WATCH_READ ] pc=0x{:08X} lr=0x{:08X} vaddr=0x{:X} size={} value=0x{:032X}",
         pc, lr, vaddr, size, value
     );
+}
+
+/// One-shot guest-code dump triggered the first time watch_read fires.
+/// `RUZU_DUMP_CODE=0xPC:LEN` reads LEN bytes of guest memory starting at PC
+/// and prints them as hex; an offline disassembler (e.g. capstone) decodes.
+fn maybe_dump_code_once(cb: &DynarmicCallbacks32) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::OnceLock;
+    static FIRED: AtomicBool = AtomicBool::new(false);
+    static SPEC: OnceLock<Option<(u64, u64)>> = OnceLock::new();
+    let spec = *SPEC.get_or_init(|| {
+        let raw = std::env::var("RUZU_DUMP_CODE").ok()?;
+        let (a, l) = raw.split_once(':')?;
+        let addr = u64::from_str_radix(a.trim_start_matches("0x"), 16).ok()?;
+        let len = l.parse::<u64>().ok()?;
+        Some((addr, len))
+    });
+    let Some((addr, len)) = spec else { return };
+    if FIRED.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let mem = cb.mem();
+    let mut bytes = Vec::with_capacity(len as usize);
+    for i in 0..len {
+        bytes.push(mem.read_8(addr + i));
+    }
+    let mut hex = String::with_capacity(bytes.len() * 2);
+    for b in &bytes {
+        use std::fmt::Write;
+        let _ = write!(hex, "{:02x}", b);
+    }
+    eprintln!("[CODE_DUMP] addr=0x{:08X} len={} bytes={}", addr, len, hex);
 }
 
 /// PC-range filter from `RUZU_WATCH_PC=0xLO-0xHI` (inclusive..exclusive).
