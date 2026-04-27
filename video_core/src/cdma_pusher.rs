@@ -6,7 +6,10 @@
 //! CDMA (Channel DMA) command processing for Host1x channels (NvDec, Vic, etc.).
 
 use std::collections::VecDeque;
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Mutex};
+
+use crate::host1x::control::{Control, Method as ControlMethod};
+use crate::host1x::syncpoint_manager::SyncpointManager;
 
 /// CDMA submission modes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -81,6 +84,8 @@ impl ChClassId {
 }
 
 /// Channel command header (32-bit bitfield).
+///
+/// Upstream: `union ChCommandHeader { u32 raw; BitField<0,16,u32> value; ... }`.
 #[derive(Debug, Clone, Copy, Default)]
 #[repr(C)]
 pub struct ChCommandHeader {
@@ -112,7 +117,8 @@ pub struct ChCommand {
     pub arguments: Vec<u32>,
 }
 
-/// THI (Tegra Host Interface) register layout.
+/// THI (Tegra Host Interface) register layout. Matches upstream's
+/// `ThiRegisters` (0x20 u32 entries).
 pub const THI_NUM_REGS: usize = 0x20;
 
 /// THI register offsets as method indices.
@@ -144,107 +150,251 @@ impl ThiRegisters {
     }
 }
 
-/// The CDmaPusher processes Host1x channel commands in a dedicated thread.
+/// Per-device subclass hook for `ChClassId::*` cases other than `Control`.
 ///
-/// Subclasses override `process_method` for device-specific handling (NvDec, Vic).
+/// Upstream `CDmaPusher` is abstract with a virtual `ProcessMethod`; ruzu
+/// passes a trait object instead so concrete devices (NvDec, Vic, NvJpg)
+/// implement their own dispatch.
+pub trait ProcessMethodHook: Send {
+    fn process_method(&mut self, method: u32, arg: u32);
+}
+
+/// No-op processor for devices that haven't been ported yet.
+///
+/// Used by `Host1x::start_device` when wiring NvDec / Vic with placeholder
+/// behavior — `IncSyncpt` and the `Control` host-processor path still run,
+/// matching the parts of upstream that don't depend on subclass logic.
+pub struct NullProcessor;
+
+impl ProcessMethodHook for NullProcessor {
+    fn process_method(&mut self, method: u32, arg: u32) {
+        log::trace!(
+            "CDmaPusher::NullProcessor::process_method method=0x{:X} arg=0x{:X}",
+            method,
+            arg
+        );
+    }
+}
+
+/// State carried across the CDMA command stream.
+///
+/// Mirrors the four locals (`count`, `method_offset`, `mask`, `incrementing`)
+/// in upstream's `CDmaPusher::ProcessEntries` outer scope. They persist across
+/// `push_entries` calls since the parser is stateful (a single command list
+/// can leave the parser mid-Mask or mid-Incrementing run).
+#[derive(Default)]
+struct ParserState {
+    count: u32,
+    method_offset: u32,
+    mask: u32,
+    incrementing: bool,
+}
+
+/// CDMA command pusher for a Host1x channel.
+///
+/// Upstream: `Tegra::CDmaPusher`. Concrete device pushers (NvDec, Vic) are
+/// constructed via `new_with_processor` passing a `ProcessMethodHook`
+/// implementation.
+///
+/// Synchronous semantics: upstream spawns a worker thread per pusher that
+/// drains a queue. Ruzu processes commands inline in `push_entries` for now,
+/// which is equivalent for stateless decoders since the parser state is
+/// preserved across calls. If a CDMA workload depends on async timing
+/// (e.g., concurrent push from multiple threads), this can be revisited
+/// — none of the current devices do.
 pub struct CDmaPusher {
-    command_lists: Arc<Mutex<VecDeque<Vec<ChCommandHeader>>>>,
-    command_cv: Arc<Condvar>,
-    thi_regs: ThiRegisters,
-    current_class: ChClassId,
-    // In the full port:
-    // host1x: &Host1x,
-    // memory_manager: &MemoryManager,
-    // host_processor: Box<dyn Control>,
-    // thread: Option<JoinHandle<()>>,
+    syncpoint_manager: Arc<SyncpointManager>,
+    host_processor: Mutex<Control>,
+    process_method: Mutex<Box<dyn ProcessMethodHook>>,
+    current_class: Mutex<ChClassId>,
+    thi_regs: Mutex<ThiRegisters>,
+    state: Mutex<ParserState>,
+    /// Pending command lists. Held only when commands queue up across calls.
+    /// Currently unused (commands are drained inline in `push_entries`); kept
+    /// for future async-thread parity with upstream.
+    _command_lists: Arc<Mutex<VecDeque<Vec<ChCommandHeader>>>>,
 }
 
 impl CDmaPusher {
-    /// Creates a new CDmaPusher for the given class ID.
-    pub fn new(id: i32) -> Self {
+    /// Construct a CDmaPusher with a no-op subclass processor (used by
+    /// host1x device shims that don't yet implement device-specific methods).
+    ///
+    /// Mirrors upstream `CDmaPusher::CDmaPusher(Host1x&, s32 id)` — the `Host1x&`
+    /// reference is reduced here to its only used field, the syncpoint manager,
+    /// to avoid an `Arc<Host1x>` ↔ `Arc<CDmaPusher>` reference cycle when Host1x
+    /// stores its devices. (memory_manager / GMMU is unused until guest memory
+    /// gather support lands.)
+    pub fn new(syncpoint_manager: Arc<SyncpointManager>, id: i32) -> Self {
+        Self::new_with_processor(syncpoint_manager, id, Box::new(NullProcessor))
+    }
+
+    /// Construct a CDmaPusher with a custom subclass processor.
+    pub fn new_with_processor(
+        syncpoint_manager: Arc<SyncpointManager>,
+        id: i32,
+        process_method: Box<dyn ProcessMethodHook>,
+    ) -> Self {
+        let host_processor = Control::new(syncpoint_manager.clone());
         Self {
-            command_lists: Arc::new(Mutex::new(VecDeque::new())),
-            command_cv: Arc::new(Condvar::new()),
-            thi_regs: ThiRegisters::default(),
-            current_class: ChClassId::from_u32(id as u32),
+            syncpoint_manager,
+            host_processor: Mutex::new(host_processor),
+            process_method: Mutex::new(process_method),
+            current_class: Mutex::new(ChClassId::from_u32(id as u32)),
+            thi_regs: Mutex::new(ThiRegisters::default()),
+            state: Mutex::new(ParserState::default()),
+            _command_lists: Arc::new(Mutex::new(VecDeque::new())),
         }
     }
 
     /// Push command entries for processing.
-    pub fn push_entries(&self, entries: Vec<ChCommandHeader>) {
-        let mut lists = self.command_lists.lock().unwrap();
-        lists.push_back(entries);
-        self.command_cv.notify_one();
-    }
-
-    /// Process the command entries (runs on the CDMA thread).
     ///
-    /// In the full port, this runs in a dedicated thread with stop token support.
-    pub fn process_entries(&mut self) {
-        // NOTE: Full implementation spawns a dedicated thread that drains the command_lists
-        // queue and calls execute_command for each entry. Requires Host1x integration.
-        // Stubbed until Host1x and threading integration is complete.
-        log::warn!("CdmaPusher::process_entries: Host1x integration not available, skipping");
+    /// Upstream: `CDmaPusher::PushEntries` enqueues; the worker thread later
+    /// drains. Ruzu drains inline for simplicity, preserving parser state
+    /// across calls.
+    pub fn push_entries(&self, entries: Vec<ChCommandHeader>) {
+        let mut state = self.state.lock().unwrap();
+        for value in entries {
+            self.step_one(&mut state, value);
+        }
     }
 
-    /// Execute a single command based on current class state.
-    fn execute_command(&mut self, method: u32, arg: u32) {
-        match self.current_class {
-            ChClassId::Control => {
-                // NOTE: Full implementation calls host_processor.process_method(method, arg).
-                // Stubbed until host_processor (Host1x HostProcessor) is integrated.
-                log::warn!(
-                    "CdmaPusher::execute_command: Control class not integrated, ignoring method 0x{:X} arg 0x{:X}",
-                    method, arg
+    /// Process one command header. Mirrors the body of upstream's
+    /// `for (const auto value : command_list)` loop.
+    fn step_one(&self, state: &mut ParserState, value: ChCommandHeader) {
+        if state.mask != 0 {
+            let lbs = state.mask.trailing_zeros();
+            state.mask &= !(1u32 << lbs);
+            self.execute_command(state.method_offset + lbs, value.raw);
+            return;
+        }
+        if state.count != 0 {
+            state.count -= 1;
+            self.execute_command(state.method_offset, value.raw);
+            if state.incrementing {
+                state.method_offset = state.method_offset.wrapping_add(1);
+            }
+            return;
+        }
+        let mode = match value.submission_mode() {
+            Some(m) => m,
+            None => {
+                log::error!(
+                    "CDmaPusher: bad submission mode in header 0x{:08X}",
+                    value.raw
+                );
+                return;
+            }
+        };
+        let header_value = value.value();
+        let header_method_offset = value.method_offset();
+        match mode {
+            ChSubmissionMode::SetClass => {
+                state.mask = header_value & 0x3F;
+                state.method_offset = header_method_offset;
+                let class = ChClassId::from_u32((header_value >> 6) & 0x3FF);
+                *self.current_class.lock().unwrap() = class;
+            }
+            ChSubmissionMode::Incrementing | ChSubmissionMode::NonIncrementing => {
+                state.count = header_value;
+                state.method_offset = header_method_offset;
+                state.incrementing = mode == ChSubmissionMode::Incrementing;
+            }
+            ChSubmissionMode::Mask => {
+                state.mask = header_value;
+                state.method_offset = header_method_offset;
+            }
+            ChSubmissionMode::Immediate => {
+                let data = header_value & 0xFFF;
+                state.method_offset = header_method_offset;
+                self.execute_command(state.method_offset, data);
+            }
+            ChSubmissionMode::Restart | ChSubmissionMode::Gather => {
+                log::error!(
+                    "CDmaPusher: ChSubmissionMode {:?} is not implemented",
+                    mode
                 );
             }
+        }
+    }
+
+    /// Invoke command-class devices to execute the command based on the
+    /// current state. Mirrors upstream `CDmaPusher::ExecuteCommand`.
+    fn execute_command(&self, method: u32, arg: u32) {
+        let class = *self.current_class.lock().unwrap();
+        match class {
+            ChClassId::Control => {
+                log::trace!(
+                    "CDmaPusher: Class {:?} method 0x{:X} arg 0x{:X}",
+                    class,
+                    method,
+                    arg
+                );
+                if let Some(m) = ControlMethod::from_u32(method) {
+                    self.host_processor.lock().unwrap().process_method(m, arg);
+                }
+            }
             _ => {
-                self.thi_regs.reg_array[method as usize] = arg;
+                {
+                    let mut regs = self.thi_regs.lock().unwrap();
+                    if (method as usize) < THI_NUM_REGS {
+                        regs.reg_array[method as usize] = arg;
+                    }
+                }
                 match method {
                     0 => {
                         // ThiMethod::IncSyncpt
                         let syncpoint_id = arg & 0xFF;
                         let _cond = (arg >> 8) & 0xFF;
                         log::trace!(
-                            "Class {:?} IncSyncpt syncpt {} cond {}",
-                            self.current_class,
+                            "CDmaPusher: Class {:?} IncSyncpt syncpt {} cond {}",
+                            class,
                             syncpoint_id,
                             _cond
                         );
-                        // NOTE: Full implementation calls
-                        //   syncpoint_manager.increment_guest(syncpoint_id)
-                        //   syncpoint_manager.increment_host(syncpoint_id)
-                        // Stubbed until Host1x syncpoint_manager is integrated.
-                        log::warn!(
-                            "CdmaPusher: IncSyncpt syncpt {} not forwarded — Host1x not integrated",
-                            syncpoint_id
-                        );
+                        self.syncpoint_manager.increment_guest(syncpoint_id);
+                        self.syncpoint_manager.increment_host(syncpoint_id);
                     }
                     17 => {
-                        // ThiMethod::SetMethod1
-                        let method_0 = self.thi_regs.method_0();
+                        // ThiMethod::SetMethod1 — dispatch to subclass via method_0.
+                        let method_0 = self.thi_regs.lock().unwrap().method_0();
                         log::trace!(
-                            "Class {:?} method 0x{:X} arg 0x{:X}",
-                            self.current_class,
+                            "CDmaPusher: Class {:?} method 0x{:X} arg 0x{:X}",
+                            class,
                             method_0,
                             arg
                         );
-                        self.process_method(method_0, arg);
+                        self.process_method.lock().unwrap().process_method(method_0, arg);
                     }
                     _ => {}
                 }
             }
         }
     }
+}
 
-    /// Device-specific method processing. Override in subclasses.
-    fn process_method(&mut self, _method: u32, _arg: u32) {
-        // NOTE: This is a virtual dispatch point in C++ (pure virtual in the base class).
-        // Device-specific implementations (VIC, NVDEC, etc.) override this.
-        // The base implementation is unreachable in the full port.
-        log::warn!(
-            "CdmaPusher::process_method: no device-specific handler for method 0x{:X}, ignoring",
-            _method
-        );
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn inc_syncpt_advances_host1x_syncpoint() {
+        let sm = Arc::new(SyncpointManager::new());
+        let pusher = CDmaPusher::new(sm.clone(), ChClassId::NvDec as i32);
+
+        let initial = sm.get_host_syncpoint_value(3);
+        pusher.execute_command(0, 3); // IncSyncpt syncpt_id=3
+        let after = sm.get_host_syncpoint_value(3);
+        assert_eq!(after, initial + 1);
+    }
+
+    #[test]
+    fn control_class_load_then_wait_does_not_block_when_satisfied() {
+        let sm = Arc::new(SyncpointManager::new());
+        let pusher = CDmaPusher::new(sm.clone(), ChClassId::Control as i32);
+
+        // Pre-increment host syncpoint so WaitSyncpt32 returns immediately.
+        sm.increment_host(0);
+        pusher.execute_command(ControlMethod::LoadSyncptPayload32 as u32, 1);
+        pusher.execute_command(ControlMethod::WaitSyncpt32 as u32, 0);
     }
 }
