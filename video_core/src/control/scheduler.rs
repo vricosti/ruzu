@@ -81,7 +81,32 @@ impl Scheduler {
             .as_mut()
             .expect("Scheduler::push: dma_pusher not initialized");
         dma_pusher.push(entries);
+
+        let traced_idx = if let Some(limit) =
+            crate::dma_pusher::puller_trace_submits_limit()
+        {
+            let idx = crate::dma_pusher::CURRENT_SUBMIT_INDEX
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if idx < limit {
+                let lists = dma_pusher.dma_pushbuffer_len();
+                log::info!(
+                    "[PULLER_TRACE] === SUBMIT #{} channel={} bind_id={} pending_lists={} ===",
+                    idx, channel, bind_id, lists,
+                );
+                crate::dma_pusher::ACTIVE_SUBMIT_IDX
+                    .store(idx as i64, std::sync::atomic::Ordering::SeqCst);
+                Some(idx)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         dma_pusher.dispatch_calls();
+        if traced_idx.is_some() {
+            crate::dma_pusher::ACTIVE_SUBMIT_IDX
+                .store(i64::MIN, std::sync::atomic::Ordering::SeqCst);
+        }
     }
 
     /// Register a channel with the scheduler.
