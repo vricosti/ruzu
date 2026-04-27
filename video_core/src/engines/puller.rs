@@ -836,6 +836,13 @@ impl Puller {
                 payload,
                 self.regs.semaphore_trigger()
             );
+            if std::env::var_os("RUZU_TRACE_SEM_RELEASE").is_some() {
+                let cpu = self.memory_manager.lock().gpu_to_cpu_address(sequence_address);
+                log::info!(
+                    "[SEM_RELEASE] gpu_va=0x{:X} -> cpu={:?} payload=0x{:X} trigger=0x{:X}",
+                    sequence_address, cpu, payload, self.regs.semaphore_trigger(),
+                );
+            }
             self.with_rasterizer_mut(|rasterizer| {
                 rasterizer.query(
                     sequence_address,
