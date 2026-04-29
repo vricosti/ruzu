@@ -8,9 +8,9 @@
 
 use std::sync::{Arc, Mutex};
 
+use crate::hle::kernel::k_process::ProcessLock;
 use crate::hle::kernel::k_process::{KProcess, ProcessState};
 use crate::hle::kernel::svc_types::ProcessActivity;
-use crate::hle::kernel::k_process::ProcessLock;
 
 /// Process — wraps a KProcess for service-level lifecycle management.
 ///

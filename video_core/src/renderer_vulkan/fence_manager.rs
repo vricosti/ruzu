@@ -60,7 +60,7 @@ impl InnerFence {
     /// Port of `InnerFence::Wait`.
     ///
     /// Blocks until the GPU completes the tick this fence is waiting on.
-    pub fn wait(&self, _known_gpu_tick: u64) {
+    pub fn wait(&self) {
         if self.is_stubbed {
             return;
         }
@@ -86,6 +86,10 @@ pub type Fence = Arc<std::sync::Mutex<InnerFence>>;
 impl crate::fence_manager::FenceBase for Fence {
     fn is_stubbed(&self) -> bool {
         self.lock().unwrap().is_stubbed
+    }
+
+    fn wait_for_fence(&self) {
+        self.lock().unwrap().wait();
     }
 }
 
@@ -127,9 +131,9 @@ impl FenceManager {
     }
 
     /// Port of `FenceManager::WaitFence`.
-    pub fn wait_fence(&self, fence: &Fence, known_gpu_tick: u64) {
+    pub fn wait_fence(&self, fence: &Fence) {
         let inner = fence.lock().unwrap();
-        inner.wait(known_gpu_tick);
+        inner.wait();
     }
 }
 

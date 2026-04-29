@@ -80,11 +80,7 @@ impl<T> SyncCell<T> {
     ///
     /// Returns whatever `f` returns.
     #[inline]
-    pub fn with<R>(
-        &self,
-        _guard: &KScopedSchedulerLock<'_>,
-        f: impl FnOnce(&mut T) -> R,
-    ) -> R {
+    pub fn with<R>(&self, _guard: &KScopedSchedulerLock<'_>, f: impl FnOnce(&mut T) -> R) -> R {
         // SAFETY: `_guard`'s existence proves the scheduler spin-lock is
         // held (it was constructed by locking and cannot be forged without
         // unsafe). Therefore no other host thread can be accessing this
@@ -251,7 +247,12 @@ mod tests {
     #[test]
     fn sync_cell_test_access_returns_inner_mut() {
         let cell = SyncCell::new(0u64);
-        let doubled = unsafe { cell.test_access(|n| { *n = 42; *n * 2 }) };
+        let doubled = unsafe {
+            cell.test_access(|n| {
+                *n = 42;
+                *n * 2
+            })
+        };
         assert_eq!(doubled, 84);
         let observed = unsafe { cell.test_access(|n| *n) };
         assert_eq!(observed, 42);

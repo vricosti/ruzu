@@ -23,6 +23,7 @@
 //! | `-v` / `--version`   | handled by clap          |
 
 use clap::Parser;
+use std::ffi::OsStr;
 
 pub mod emu_window;
 pub mod sdl_config;
@@ -252,6 +253,33 @@ fn main() {
         common::settings::values_mut()
             .current_user
             .set_value(clamped);
+    }
+
+    // Investigation-only frontend override. Upstream normally sources these
+    // from Config, but ruzu-cmd's SDL Config plumbing is not fully ported yet.
+    if std::env::var_os("RUZU_RNG_SEED_ENABLED").is_some_and(|value| value != OsStr::new("0")) {
+        common::settings::values_mut()
+            .rng_seed_enabled
+            .set_value(true);
+    }
+    if let Some(seed_text) = std::env::var_os("RUZU_RNG_SEED") {
+        let seed_text = seed_text.to_string_lossy();
+        let seed_text = seed_text
+            .strip_prefix("0x")
+            .or_else(|| seed_text.strip_prefix("0X"))
+            .unwrap_or(&seed_text);
+        match u32::from_str_radix(seed_text, 16).or_else(|_| seed_text.parse::<u32>()) {
+            Ok(seed) => {
+                let mut values = common::settings::values_mut();
+                values.rng_seed_enabled.set_value(true);
+                values.rng_seed.set_value(seed);
+                log::info!("Using investigation RNG seed override: 0x{seed:08X}");
+            }
+            Err(err) => {
+                log::error!("Invalid RUZU_RNG_SEED value: {seed_text} ({err})");
+                std::process::exit(1);
+            }
+        }
     }
 
     // Log configuration settings.

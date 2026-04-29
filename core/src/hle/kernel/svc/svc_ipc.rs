@@ -6,6 +6,7 @@
 
 use std::sync::{Arc, Mutex};
 
+use super::super::k_process::ProcessLock;
 use crate::core::System;
 use crate::hle::ipc;
 use crate::hle::kernel::k_event::KEvent;
@@ -19,7 +20,6 @@ use crate::hle::kernel::svc_common::{Handle, INVALID_HANDLE};
 use crate::hle::kernel::trace_format;
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 use crate::hle::service::hle_ipc::{complete_sync_request, HLERequestContext};
-use super::super::k_process::ProcessLock;
 
 fn should_trace_reply_receive_debug() -> bool {
     std::env::var_os("RUZU_TRACE_REPLY_RECV").is_some()

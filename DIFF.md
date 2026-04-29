@@ -319,6 +319,36 @@
 ### Binary layout verification
 - PASS: runtime-only generic manager; no raw-serialized structs are defined here.
 
+## 2026-04-27 — core/src/hle/kernel/k_process.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/k_process.h and /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/k_process.cpp
+
+### Intentional differences
+- Rust keeps the upstream-local `GenerateRandom(...)` helper as file-local code in `k_process.rs`, but implements `std::mt19937` directly instead of relying on the C++ standard library engine type. This preserves method ownership and initialization order in the correct owner file.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `entropy` is no longer generated in `KProcess::new()`. Upstream leaves `m_entropy` zero-initialized until `KProcess::Initialize(...)`, and Rust now does the same.
+- Fixed in this pass: `KProcess::initialize()` no longer hashes high-resolution wall-clock nanoseconds. It now reads `Settings::values.rng_seed_enabled` / `rng_seed` and seeds the local MT19937 helper from `rng_seed` or `time(nullptr)`-style epoch seconds, matching upstream source selection.
+- Fixed in this pass: local verification against a host-side `std::uniform_int_distribution<u64>(std::mt19937)` run shows that the Rust `generate_random_with_seed(...)` output matches the C++ distribution output for a fixed seed on this platform.
+
+### Missing items
+- No known remaining parity differences in the `m_entropy` initialization path from upstream `KProcess::Initialize(...)` for this platform.
+
+### Binary layout verification
+- PASS: runtime-only process object change; no raw-serialized struct layout changed in this slice.
+
+## 2026-04-27 — ruzu_cmd/src/main.rs vs /home/vricosti/Dev/emulators/zuyu/src/yuzu_cmd/yuzu.cpp
+
+### Intentional differences
+- Added `RUZU_RNG_SEED_ENABLED` / `RUZU_RNG_SEED` frontend overrides in `main.rs`. This is a temporary investigation hook because `SdlConfig` still does not populate `Settings::values` from the config file, so the upstream `rng_seed_enabled` / `rng_seed` settings cannot yet be driven through normal config ownership in `ruzu-cmd`.
+
+### Unintentional differences (to fix)
+- `SdlConfig` still does not load system settings into `Settings::values`, so upstream config-driven RNG seed selection is not available through the normal frontend path.
+
+### Missing items
+- Full upstream `Config` / `SdlConfig` settings load path so `rng_seed_enabled` and `rng_seed` come from the SDL config file instead of temporary environment overrides.
+
+### Binary layout verification
+- PASS: frontend-only startup override; no raw-serialized struct layout involved.
+
 ## 2026-03-30 — core/src/hle/kernel/k_condition_variable.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/k_condition_variable.cpp and /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/k_condition_variable.h
 
 ### Intentional differences
@@ -2369,10 +2399,12 @@
 - Fixed in this pass: the owner file now has `bind_rasterizer()` and stores the rasterizer edge locally, matching upstream method ownership in `kepler_compute.cpp`.
 - Fixed in this pass: `KeplerCompute::call_method()` now triggers the `launch` side effect like upstream instead of only the Rust-only `Engine::write_reg()` path observing launches.
 - Fixed in this pass: `KeplerCompute` now owns `MemoryManager` at construction time, matching the upstream constructor boundary more closely instead of remaining ownerless.
+- Fixed in this pass: the owner file now preserves an owner-local decoded `launch_description` equivalent again. `execute_pending()` stores the most recent decoded QMD into `launch_description`, which restores the upstream state boundary that later readers consume directly from `KeplerCompute`.
 
 ### Missing items
 - Upstream `upload_state.BindRasterizer(rasterizer)` is still missing because the full `upload_state` owner path is not ported in this file yet.
 - `ProcessLaunch()` still does not call the bound rasterizer directly.
+- Rust still stores the reduced decoded `QueueMetaData` shape instead of the literal upstream `LaunchParams` raw bitfield struct. That preserves the active fields currently consumed by Rust owners, but it is not yet literal structure parity.
 
 ### Binary layout verification
 - PASS: no guest-visible binary layout in this owner file.
@@ -9661,15 +9693,17 @@
 ## 2026-04-17 — `video_core/src/query_cache_top.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/query_cache.h`
 
 ### Intentional differences
-- Rust still uses `QueryCacheLegacy` instead of the exact backend-specific upstream query-cache types because `gl_query_cache.rs` and the full streamer/runtime stack remain incomplete.
+- Rust still adapts the upstream C++ template ownership into Rust generics and handle traits (`CounterHandle`, `HostCounterBase<H>`, `CachedQueryBase<H>`, `CounterStreamBase<H>`, `QueryCacheLegacy<Q, H>`) instead of literal inheritance/template syntax. The owner boundaries now match `query_cache.h`, but the implementation model remains Rust-specific.
+- `QueryCacheLegacy` still stores async jobs in an `Arc<parking_lot::Mutex<HashMap<...>>>` so deferred backend closures can mutate the queue safely. Upstream uses direct slot-vector ownership.
 
 ### Unintentional differences (to fix)
-- Fixed in this pass: fallback query write timing now lives in the query-cache owner instead of `gl_rasterizer.rs`.
-- Fixed in this pass: timestamped fallback writes now source ticks from the rasterizer-installed GPU tick getter at execution time instead of from an upstream-foreign engine-supplied query argument.
+- Fixed in this pass: `QueryType` and `NumQueryTypes` now live in `query_cache_top.rs`, matching upstream constant/type placement instead of being duplicated in `gl_query_cache.rs`.
+- Fixed in this pass: the shared legacy owners now exist in `query_cache_top.rs`. `CounterStreamBase` owns current/last stream state and reset/enable/disable/slice ordering, `HostCounterBase` owns dependency depth/base-result collapse, `CachedQueryBase` owns mapped-query address/timestamp/async-job binding state, and `QueryCacheLegacy` owns cached-query pages plus async flush queues.
 
 ### Missing items
-- Full `QueryCache::Query(...)` / streamer / cached-query ownership.
-- OpenGL-specific overlapping-region invalidation/flush ownership in `gl_query_cache.rs`.
+- Full shared streamer/runtime stack from upstream `query_cache/query_cache.h`, `query_stream.h`, and related files.
+- Literal `host_ptr`-based cached-query flush path shared across backends.
+- Slot-vector based async job storage and the full upstream `PopAsyncFlushes()` owner semantics.
 
 ### Binary layout verification
 - PASS: no guest-visible raw struct layout added in this owner slice.
@@ -9986,3 +10020,709 @@
 
 ### Binary layout verification
 - PASS: no struct layout changed. Added a focused regression test proving domain `CloseVirtualHandle` preserves the incoming TLS words while still closing the targeted domain slot.
+
+## 2026-04-28 — `video_core/src/fence_manager.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/fence_manager.h`
+
+### Intentional differences
+- Rust still adapts upstream CRTP/template ownership to a generic `FenceManager<F>` plus callback parameters, because Rust has no direct equivalent to the C++ trait-template mix used by `FenceManager<Traits>`.
+- Rust still uses `Arc<Mutex<...>>`, `Condvar`, `AtomicBool`, and `JoinHandle` instead of upstream direct members plus `std::jthread`/`std::stop_token`. This is an implementation adaptation, but the async release-thread owner now matches the upstream file.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: the async release thread now executes the upstream `PopAsyncFlushes()` step before delayed fence callbacks. Previously the Rust thread waited on the fence and ran deferred operations directly, which let query/fence guest write-backs remain pending and left the MK8D poll byte unwritten.
+- Fixed in this pass: async fences now carry pre-release operations separately from deferred callbacks, so the same flush/pop ordering is preserved in both the synchronous `TryReleasePendingFences()` path and the asynchronous `ReleaseThreadFunc(...)` path.
+
+### Missing items
+- Rust `wait_pending_fences(force=true)` on the async path still uses a polling wait on the shared queue instead of the upstream “signal a fence, then wait on a local condition variable until its callback fires” ownership. Behavioral parity is good enough for current users but the lifecycle is still not literal upstream.
+- Rust still does not mirror upstream thread naming / profiling hooks (`MicroProfileOnThreadCreate`, `SetCurrentThreadPriority`) inside the async release thread.
+
+### Binary layout verification
+- PASS: owner/lifecycle change only; no raw serialized struct layout involved. Added focused regressions for delayed async callback execution and preserved flush-before-callback ordering.
+
+## 2026-04-28 — `video_core/src/renderer_opengl/gl_rasterizer.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_rasterizer.cpp`
+
+### Intentional differences
+- Rust still owns the OpenGL rasterizer as a single `RasterizerOpenGL` Rust struct with callback closures instead of upstream member-template instantiations. This preserves file ownership even though the callback plumbing is more explicit.
+- Rust captures `self` for async-capable fence-manager callbacks by storing the raw pointer as `usize` and reconstructing it inside the closure. This is a Rust-specific adaptation to satisfy `Send` on closures that may now cross the async fence-release thread boundary.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: the OpenGL rasterizer now passes `FenceManager::new(false)`, matching upstream `HAS_ASYNC_CHECK == false` behavior for the GL fence traits. The earlier Rust default constructor no longer hid this owner decision.
+- Fixed in this pass: `signal_fence`, `signal_sync_point`, and `signal_reference` now pass `Send`-safe `pop_async_flushes` closures into the generic fence manager so the new pre-release operation path can preserve upstream ordering without violating Rust thread-safety requirements.
+
+### Missing items
+- Rust still keeps broader OpenGL ownership differences already documented elsewhere in this file, including the conservative `must_flush_region` behavior and other not-yet-ported cache/runtime details outside this fence slice.
+
+### Binary layout verification
+- PASS: callback-plumbing change only; no serialized layout involved.
+
+## 2026-04-28 — `video_core/src/renderer_vulkan/vk_rasterizer.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_vulkan/vk_rasterizer.cpp`
+
+### Intentional differences
+- Rust still uses a reduced Vulkan rasterizer owner compared with upstream; many buffer/texture/runtime integrations remain intentionally stubbed or conservative while the file structure is preserved.
+- Rust captures `self` for the async fence-manager `pop_async_flushes` closure through a `usize`-encoded raw pointer so the closure can satisfy `Send` and run on the async fence release thread. This is a Rust-only implementation adaptation.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: the Vulkan rasterizer now constructs the generic fence manager with `FenceManager::new(true)`, restoring the upstream async-fence owner decision for Vulkan.
+- Fixed in this pass: `signal_fence` now passes a `Send`-safe `pop_async_flushes` closure so deferred query/fence write-back callbacks can execute from the generic async release thread in upstream order.
+
+### Missing items
+- Rust still has larger structural gaps in Vulkan ownership outside this slice, including the duplicate owner state between `renderer_vulkan/mod.rs` and `vk_rasterizer.rs` and the many stubbed rasterizer methods already tracked elsewhere in `DIFF.md`.
+
+### Binary layout verification
+- PASS: callback/lifecycle change only; no raw serialized layout involved.
+
+## 2026-04-28 — `video_core/src/gpu.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/gpu.cpp`
+
+### Intentional differences
+- This pass only updated a Rust unit test to follow the already-ported `System::core_timing()` owner API. Upstream `gpu.cpp` has no direct equivalent test harness.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: the `get_ticks_uses_core_timing_and_fast_gpu_time_setting` test no longer references the removed pre-refactor `system.core_timing.lock()` access path and now exercises the real current `CoreTiming` owner API.
+
+### Missing items
+- No new runtime parity gaps were introduced or closed in `gpu.rs` itself during this pass; broader `video_core/gpu.cpp` parity gaps remain documented in earlier entries.
+
+### Binary layout verification
+- PASS: test-only change; no runtime struct layout involved.
+
+## 2026-04-28 — `video_core/src/renderer_opengl/gl_rasterizer.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_rasterizer.cpp`
+
+### Intentional differences
+- Rust still keeps the broader OpenGL rasterizer as a reduced port with composed helper objects instead of the literal upstream GL runtime/cache graph. This is an existing structural adaptation outside the query slice.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `RasterizerOpenGL::query(...)` no longer routes every report-semantic query through `gl_query_cache`. Upstream first maps Maxwell query types with `MaxwellToVideoCoreQuery(...)`, then only mapped query types use `query_cache.Query(...)`; unmapped types go through `QueryFallback(...)`.
+- Fixed in this pass: OpenGL fallback queries now match upstream payload handling. Non-`Payload` query types force `payload = 1`, `HasTimeout` writes the 64-bit payload plus timestamp, and non-fence fallback queries execute immediately instead of being spuriously deferred through the fence manager.
+- Fixed in this pass: `reset_counter(...)` now follows the same mapped-query ownership split as upstream instead of being a stub.
+- Fixed in this pass: the rasterizer now pushes `num_queued_commands != 0` into the OpenGL query owner before mapped query/reset/flush/invalidate operations, restoring the upstream `AnyCommandQueued()` decision point for the GL host-query lifecycle as closely as the current Rust owner graph allows.
+- Fixed in this pass: mapped query writeback now invalidates non-query caches through `on_cache_invalidation(...)` after deferred writes, matching the upstream `InvalidateRegion(..., CacheType::NoQueryCache)` effect more closely.
+- Fixed in this pass: the mapped-query type translation now returns `video_core/src/query_cache_top.rs::QueryType`, matching upstream type ownership instead of using an OpenGL-local duplicate enum.
+
+### Missing items
+- Rust still lacks the upstream `QueryFallback(...)` helper as a separately named owner-local method; the fallback logic is still inlined inside `query(...)`.
+- The wider OpenGL rasterizer file remains structurally incomplete versus upstream, including many sync/draw/cache paths already tracked elsewhere in `DIFF.md`.
+
+### Binary layout verification
+- PASS: behavior/order change only; no raw serialized struct layout involved. Added focused regressions for immediate fallback writes, timeout payload layout, and non-payload fence fallback payload forcing.
+
+## 2026-04-28 — `video_core/src/renderer_opengl/gl_query_cache.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_query_cache.cpp` and `/home/vricosti/Dev/emulators/zuyu/src/video_core/query_cache.h`
+
+### Intentional differences
+- Rust still uses integer GL query handles plus Rust `Arc<Mutex<...>>` handles instead of the literal upstream `OGLQuery` RAII wrapper and `std::shared_ptr` graph. The file owner boundaries now match upstream, but the handle model is still Rust-specific.
+- Rust writes the synchronous `CachedQuery::flush(false)` result back through the channel `MemoryManager` guest-writer path instead of upstream direct `host_ptr` memcpy because the literal device-memory host pointer owner is not yet available in this crate graph.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: the active mapped-query owner is now `gl_query_cache.rs` again. The file now owns OpenGL query caching state, per-type counter streams, cached-query registration, async flush queues, and the guest-memory writeback path instead of delegating the active behavior to the generic Rust `query_cache_top.rs` stub.
+- Fixed in this pass: `QueryCache::new()` now enables the three upstream counter streams, matching the upstream constructor/`EnableCounters()` responsibility.
+- Fixed in this pass: `query(...)` now reuses or registers cached queries by CPU page/address, slices the current counter stream, binds the previous counter to the cached query, allocates async job ids, commits flush batches, and executes the deferred guest-memory writeback from this owner file.
+- Fixed in this pass: the host query lifecycle is closer to upstream. `HostCounter::end_query(...)` now performs the upstream `glFlush()` safeguard when no commands are queued before calling `glEndQuery(...)`, dependency collapse keeps the same depth-threshold/base-result behavior, and `CachedQuery::flush(false)` now performs immediate guest writeback like upstream `CachedQueryBase::Flush(false)`.
+- Fixed in this pass: region flushing/removal now iterates only the overlapping page range, marks async jobs collected with the flushed value, clears the query's async job id before removal, and keeps the cached-query overlap semantics aligned with upstream `FlushAndRemoveRegion(...)` more closely.
+- Fixed in this pass: `gl_query_cache.rs` now consumes the shared `query_cache_top.rs` owners instead of carrying owner-local `QueryType`, `CounterStream`, `AsyncJob`, `HostCounterBase`, and `CachedQueryBase` reconstructions.
+
+### Missing items
+- The async writeback path is still behaviorally reduced. It now invalidates the non-query caches after deferred guest writes and preserves immediate sync flush behavior, but it still relies on simplified collected-value/job bookkeeping instead of the full upstream host-counter dependency graph and measured GL query results for every query type/path.
+- `AnyCommandQueued()` is still fed into `gl_query_cache.rs` through explicit `RasterizerOpenGL` state bridging (`set_commands_queued(...)`) instead of a literal backend-owner call from `QueryCache` into `RasterizerOpenGL`.
+- Region invalidation ownership is still not literal upstream because Rust uses `RasterizerOpenGL::on_cache_invalidation(...)` as the `NoQueryCache` invalidation bridge rather than a typed `InvalidateRegion(..., CacheType::NoQueryCache)` API.
+- `HostCounter` still has no literal destructor owner that returns the GL query object to the pool on drop; the pool reserve behavior remains explicit Rust-side state management rather than upstream RAII.
+
+### Binary layout verification
+- PASS: no raw struct-copy contract involved in this slice. Added focused regressions for shared counter-stream rotation, deep-dependency collapse, async flush queue collection, empty-batch commit behavior, synchronous immediate query writeback, and overlapping-page flush removal. The file remains a partial parity port.
+
+## 2026-04-28 — `video_core/src/query_cache/query_stream.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/query_cache/query_stream.h`
+
+### Intentional differences
+- Rust uses a trait plus an explicit shared base struct (`StreamerInterface` + `StreamerInterfaceBase`) instead of literal C++ inheritance. This is the direct Rust adaptation of upstream `StreamerInterface`, while preserving the owner file and the shared-state boundary.
+- `SimpleStreamer::free(...)` no longer takes the upstream lock literally. Upstream needs the mutex because callers may only have shared ownership; Rust already requires `&mut self`, so the owner method stays in this file but the extra lock is not needed to preserve behavior.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: the shared streamer owner is now named and shaped after upstream `StreamerInterface` instead of the reduced Rust-only `StreamerOps` / `StreamerState` split.
+- Fixed in this pass: the non-virtual/shared members (`id`, `dependence_mask`, `dependent_mask`, `amend_value`, `accumulation_value`) now live in the shared base owner in this file, matching upstream state ownership instead of being spread across a Rust convenience struct.
+- Fixed in this pass: `MakeDependent` ownership now lives on the shared interface owner in this file, and `GetDependentMask()` still preserves the upstream behavior of returning `dependence_mask`.
+- Fixed in this pass: `SimpleStreamer<Q>` now owns the slot pool, free list, and slot reuse behavior directly as the generic streamer owner corresponding to upstream `SimpleStreamer<QueryType>`.
+
+### Missing items
+- Rust still uses `VecDeque<Q>` slot storage with replacement by index rather than the literal C++ placement-new reuse model on `std::deque<QueryType>`.
+- No concrete backend streamer in this file yet exercises `StartCounter` / `PauseCounter` / `ResetCounter` / `CloseCounter`; those owners remain provided by backend/shared streamers elsewhere.
+
+### Binary layout verification
+- PASS: no raw guest-visible struct serialization in this file. Added focused regressions for dependency-mask ownership and slot reuse behavior.
+
+## 2026-04-28 — `video_core/src/query_cache/query_cache.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/query_cache/query_cache.h`
+
+### Intentional differences
+- Rust adapts the upstream template/runtime ownership into explicit generics and a runtime callback trait (`SyncValuesRuntime`) instead of literal `Traits::RuntimeType&` template wiring. The shared owner boundary remains in this file.
+- Rust bridges upstream concrete owner references with local traits (`QueryCacheRuntimeHandle`, `DeviceMemoryWriter`) so this shared owner file can bind partial backends and focused tests without moving the owner logic elsewhere.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `GuestStreamer` and `StubStreamer` now live as shared generic owners in `query_cache.rs`, matching upstream file/method ownership instead of reduced Rust-only stubs.
+- Fixed in this pass: `GuestStreamer::sync_writes()` now owns the upstream `SyncValuesStruct` collection behavior and forwards the assembled batch through a runtime-owned hook from this shared file, instead of discarding the batch locally.
+- Fixed in this pass: `QueryCacheBaseImpl` now owns raw streamer registration (`*mut dyn StreamerInterface`) plus streamer-mask iteration in this file, which is structurally much closer to the upstream inner owner than the earlier reduced flush-only placeholder.
+- Fixed in this pass: `QueryCacheBaseImpl` now owns the shared owner links for `owner`, `rasterizer`, `device_memory`, and `runtime` from this file instead of leaving those paths implicit in `query_cache_base.rs`.
+- Fixed in this pass: `QueryCacheBaseImpl` now owns `ObtainQuery`/`free_query_location` style lookup helpers in this file rather than relying on ad hoc external owner logic.
+- Fixed in this pass: focused regressions now exist for guest sync writeback batching, stub-value override behavior, and streamer-mask iteration from this owner file.
+
+### Missing items
+- `QueryCacheBaseImpl` still does not literally own the upstream constructor shape `QueryCacheBaseImpl(owner, rasterizer, device_memory, runtime, gpu)`; Rust currently binds those links after construction rather than through the constructor, and `gpu` is still missing entirely.
+- `GuestStreamer::sync_writes()` still forwards a whole `Vec<SyncValuesStruct>` into a Rust runtime callback instead of calling the literal upstream `runtime.SyncValues<SyncValuesStruct>(...)` owner path.
+- The larger `CounterReport(...)` path from upstream `query_cache.h` is still not rebound to this shared owner stack yet, including the concrete `gpu_memory`, `gpu.GetTicks()`, fence-vs-sync dispatch, and rewrite-cache insertion behavior.
+
+### Binary layout verification
+- PASS: `SyncValuesStruct` remains a simple runtime payload with deterministic field ownership and no raw guest-side memcpy contract added in this pass.
+
+## 2026-04-28 — `video_core/src/query_cache/query_cache_base.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/query_cache/query_cache_base.h`
+
+### Intentional differences
+- `QueryCacheBase` remains a reduced Rust port in this file; the C++ `ChannelSetupCaches<ChannelInfo>` inheritance and constructor-time owner injection are still adapted into a plain Rust struct with explicit `bind_*` helpers.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: the shared trait owner referenced by `QueryCacheTraits::get_streamer(...)` is now `StreamerInterface`, matching the upstream owner concept instead of the reduced Rust-only `StreamerOps` trait.
+- Fixed in this pass: `NotifyWFI()` now uses the shared impl-owned streamer registry plus runtime-owned barrier hooks instead of logging away the barrier path.
+- Fixed in this pass: `NotifySegment()` now owns the upstream close/pause/resume ordering in this file instead of remaining a pure stub.
+- Fixed in this pass: `CommitAsyncFlushes()` now schedules the upstream-shaped unregister callback through the bound rasterizer sync-operation owner instead of only warning.
+- Fixed in this pass: `SemiFlushQueryDirty()` now performs shared owner-driven device-memory writeback when the final value is already synced, instead of always warning.
+- Fixed in this pass: `RequestGuestHostSync()` now calls the bound rasterizer release-fence owner path from this file.
+- Fixed in this pass: `UnregisterPending()` now removes matching cached entries and frees the registered streamer slot through the shared impl owner rather than clearing the queue blindly.
+
+### Missing items
+- `QueryCacheBase` is still structurally incomplete versus upstream: it does not yet own the literal constructor graph with `gpu`, `rasterizer`, `device_memory`, and `runtime` refs; the Rust `bind_*` staging remains an adaptation.
+- `CounterReport(...)` is still stubbed in this file and does not yet execute the upstream write-counter / fence / rewrite-cache path.
+- `AccelerateHostConditionalRendering()` is still stubbed in this file and does not yet own the upstream Maxwell register lookup and runtime compare path.
+- `BindToChannel()` still restores only the runtime `Bind3DEngine` side effect and not the full upstream `ChannelSetupCaches` owner behavior.
+
+### Binary layout verification
+- PASS: trait/type-owner change only; no guest-visible raw layout change in this file.
+
+## 2026-04-28 — `video_core/src/query_cache/query_cache.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/query_cache/query_cache.h` (shared owner follow-up)
+
+### Intentional differences
+- Rust still uses trait-object owner bridges for upstream concrete references (`runtime`, `device_memory`, `gpu_memory`, `gpu`, render-enable state) because the shared query-cache owners are not constructed through the same template/inheritance graph as C++. This keeps ownership in the matching file, but the storage form is still a Rust adaptation.
+- Rust still binds these owners after `QueryCacheBaseImpl::new()` instead of constructing `QueryCacheBaseImpl(owner, rasterizer, device_memory, runtime, gpu)` literally in one step.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: the shared runtime owner contract now includes the upstream host-conditional-rendering hooks (`EndHostConditionalRendering`, `HostConditionalRenderingCompareValue`, `HostConditionalRenderingCompareValues`) instead of stopping at barriers/pause/resume.
+- Fixed in this pass: the shared inner owner now also owns upstream-equivalent `gpu_memory`, `gpu`, and render-condition state sources from this file, so `CounterReport(...)` and `AccelerateHostConditionalRendering()` no longer need to stay structurally blocked in the base file.
+
+### Missing items
+- `QueryCacheBaseImpl` still does not literally populate `streamers[i]` from `runtime.GetStreamerInterface(static_cast<QueryType>(i))` inside its constructor. Rust registration is still explicit owner setup after construction.
+- The shared runtime owner trait still uses a reduced `bind_3d_engine(&mut self)` signature instead of the literal upstream `Bind3DEngine(Maxwell3D*)` ownership edge.
+- No backend runtime in-tree yet implements the full shared owner trait directly from this file; the active coverage is still through focused tests and partial backend-local runtime files.
+
+### Binary layout verification
+- PASS: owner-graph change only; no raw guest-visible struct layout involved.
+
+## 2026-04-28 — `video_core/src/query_cache/query_cache_base.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/query_cache/query_cache_base.h` (shared owner follow-up)
+
+### Intentional differences
+- Rust `QueryCacheBase` still does not literally inherit `ChannelSetupCaches<ChannelInfo>`; it keeps explicit owner bindings (`bind_runtime`, `bind_gpu_memory`, `bind_gpu`, `bind_render_condition_source`) as a Rust adaptation until the full channel/cache graph is reattached.
+- Rust conditional-rendering state currently comes from an explicit `RenderConditionStateSource` owner bridge rather than direct `maxwell3d->regs` access through the inherited channel cache base.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `CounterReport(...)` is no longer stubbed. The file now owns the upstream-shaped GPU-VA translation, streamer fallback-to-payload behavior, fence-vs-sync dispatch, low-accuracy payload fast-path, timestamp writeback, rewrite marking, and cached-query insertion/removal ordering.
+- Fixed in this pass: `AccelerateHostConditionalRendering()` is no longer stubbed. The file now owns the upstream lookup path over translated addresses, cached-query lookup, `qc_dirty` propagation, and runtime compare/termination dispatch by `ComparisonMode`.
+- Fixed in this pass: focused regressions now cover both the low-accuracy `CounterReport` fast path and the host-conditional-rendering runtime dispatch decisions from this owner file.
+
+### Missing items
+- `BindToChannel()` still only restores the reduced `runtime.bind_3d_engine()` side effect; it does not yet mirror the full upstream `ChannelSetupCaches<ChannelInfo>::BindToChannel(id)` owner path.
+- `AccelerateHostConditionalRendering()` still depends on externally supplied render-condition state instead of reading the live Maxwell3D register block through the literal inherited owner graph.
+- The upstream `LookupData` path still assumes `gpu_memory->GpuToCpuAddress` and channel-bound `maxwell3d` are always wired through the channel cache; Rust still allows those owners to be absent and returns `false`.
+
+### Binary layout verification
+- PASS: behavior/order change only; no raw serialized payload layout changed. Added focused regressions for conditional-rendering compare-value dispatch and forced-override termination.
+
+## 2026-04-28 — `video_core/src/renderer_vulkan/query_cache.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_vulkan/vk_query_cache.h` and `/home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_vulkan/vk_query_cache.cpp`
+
+### Intentional differences
+- Rust still keeps `QueryCacheRuntime` as a reduced direct struct rather than the literal upstream PIMPL (`QueryCacheRuntimeImpl`) with real streamers, resolve passes, descriptor queues, and device-owned conditional-rendering resources.
+- The shared query-cache owner currently calls a reduced `bind_3d_engine(&mut self)` contract instead of the literal upstream `Bind3DEngine(Maxwell3D*)`. This remains a structural Rust adaptation until the channel/cache graph is wired end-to-end.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: the Vulkan runtime now implements the shared `QueryCacheRuntimeHandle` contract directly from this owner file, so the restored shared query-cache owner can call the Vulkan runtime’s conditional-rendering and lifecycle hooks through the right file boundary instead of leaving them unreachable from the shared owner stack.
+- Fixed in this pass: added a focused regression proving the shared runtime-trait bridge routes conditional-rendering hooks through this owner file.
+
+### Missing items
+- `HostConditionalRenderingCompareValue` and `HostConditionalRenderingCompareValues` remain reduced stubs here; they still do not resolve query values or start actual host conditional rendering as upstream does.
+- `GetStreamerInterface(...)` and the full upstream streamer graph remain unported in this owner file.
+- `Bind3DEngine(Maxwell3D*)` still does not store the actual engine owner needed by upstream `View3DRegs(...)`.
+
+### Binary layout verification
+- PASS: owner-trait wiring only; no raw guest-visible struct layout changed.
+
+## 2026-04-28 — `video_core/src/engines/maxwell_3d.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/engines/maxwell_3d.cpp`
+
+### Intentional differences
+- Rust still computes conditional-rendering fallback decisions directly in `Maxwell3D` rather than sharing a literal `maxwell3d->regs` pointer with the query-cache owner through upstream inheritance. The new render-condition-state trait is an owner bridge, not a full structural replacement.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `Maxwell3D` now exposes the upstream `render_enable_override`, `render_enable.mode`, and `render_enable.Address()` state through the shared query-cache render-condition owner contract, so the shared query-cache owner no longer has to remain stubbed for lack of Maxwell state access.
+
+### Missing items
+- The shared query-cache owner is not yet wired to a live `Maxwell3D` instance through the real channel/cache ownership path, so this new owner surface is currently verified through focused shared-owner tests rather than end-to-end runtime use.
+- Rust still does not share the literal upstream register/view ownership model between `Maxwell3D` and query-cache runtimes.
+
+### Binary layout verification
+- PASS: owner-surface change only; no raw serialized payload layout changed.
+
+## 2026-04-28 — `video_core/src/query_cache_top.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/query_cache.h` (channel-cache owner follow-up)
+
+### Intentional differences
+- Rust still models upstream `QueryCacheLegacy : ChannelSetupCaches<ChannelInfo>` as composition (`channel_caches: ChannelSetupCaches<ChannelInfo>`) instead of literal inheritance. This keeps the owner boundary in the matching file without inventing a catch-all elsewhere.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `QueryCacheLegacy` now owns a real `ChannelSetupCaches<ChannelInfo>` member in the shared owner file, instead of leaving channel ownership entirely outside the legacy query-cache owner.
+- Fixed in this pass: `QueryCacheLegacy` now exposes `create_channel`, `bind_to_channel`, and `erase_channel` in the matching shared owner file, mirroring the upstream owner edge that backends consume through inherited `CreateChannel/BindToChannel/EraseChannel`.
+
+### Missing items
+- `QueryCacheLegacy` still does not literally construct with upstream-owned `RasterizerInterface&` and `MaxwellDeviceMemoryManager&` in this file; those concrete owner refs remain stored in the backend leaves instead.
+- `ChannelSetupCaches<ChannelInfo>` is still reduced in Rust and does not yet hold literal live engine/memory references equivalent to upstream `ChannelInfo`.
+
+### Binary layout verification
+- PASS: owner-graph change only; no guest-visible raw layout involved.
+
+## 2026-04-28 — `video_core/src/renderer_opengl/gl_query_cache.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_query_cache.h` and `/home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_query_cache.cpp` (channel wiring follow-up)
+
+### Intentional differences
+- Rust still keeps `channel_memory_manager` as an explicit `Arc<Mutex<MemoryManager>>` field on the OpenGL leaf instead of reaching it exclusively through inherited base-class pointers. This remains necessary because the shared `ChannelInfo` Rust port still stores reduced channel references.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: the OpenGL query cache now owns `create_channel`, `bind_to_channel`, and `erase_channel` entry points in the matching leaf file, instead of relying only on the Rust-only `set_memory_manager(...)` shortcut.
+- Fixed in this pass: `bind_to_channel(...)` now delegates through the shared `QueryCacheLegacy` channel-cache owner before wiring the active memory manager, which is materially closer to upstream `query_cache.BindToChannel(channel_id)` ordering.
+- Fixed in this pass: added a focused regression proving the OpenGL leaf binds its channel memory manager through the restored legacy channel-cache owner path.
+
+### Missing items
+- The OpenGL leaf still does not consume live engine pointers from the restored channel-cache owner; it still pulls the `MemoryManager` `Arc` directly from `ChannelState`.
+- The Rust `set_memory_manager(...)` helper still exists as a compatibility shortcut for tests and older callers; upstream does not expose this separate owner path.
+
+### Binary layout verification
+- PASS: owner/wiring change only; no raw serialized query layout changed.
+
+## 2026-04-28 — `video_core/src/renderer_opengl/gl_rasterizer.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_rasterizer.cpp` (query-cache channel follow-up)
+
+### Intentional differences
+- Rust `RasterizerOpenGL::initialize_channel` still does not yet create the full upstream channel state for texture, buffer, and shader caches in this owner method. This slice only reattached the query-cache edge here.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `initialize_channel(...)` now calls `query_cache.create_channel(channel)` from the matching rasterizer owner method, matching the upstream `query_cache.CreateChannel(channel)` edge that was previously missing.
+- Fixed in this pass: `bind_channel(...)` now calls `query_cache.bind_to_channel(channel)` instead of only pushing a memory-manager shortcut, which is closer to upstream `query_cache.BindToChannel(channel_id)` ownership and ordering.
+- Fixed in this pass: `release_channel(...)` now calls `query_cache.erase_channel(channel_id)` and drops the active channel memory manager from this owner file, restoring the upstream `query_cache.EraseChannel(channel_id)` edge that was missing.
+
+### Missing items
+- The surrounding texture/buffer/shader cache `CreateChannel/BindToChannel/EraseChannel` owner edges in this file remain structurally reduced compared with upstream.
+
+### Binary layout verification
+- PASS: control-flow/owner change only; no guest-visible raw layout changed.
+
+## 2026-04-28 — `video_core/src/control/channel_state_cache.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/control/channel_state_cache.h`
+
+### Intentional differences
+- Rust still models upstream live C++ references through safe/adapted Rust carriers. `gpu_memory` is stored as `Option<Arc<Mutex<MemoryManager>>>`, while the engine references are still reduced placeholders instead of literal `Maxwell3D&` / `KeplerCompute&`.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `ChannelInfo::from_channel_state(...)` now carries the channel-bound `MemoryManager` reference and its real ID instead of hard-coded `0` placeholders for the GPU-memory owner.
+- Fixed in this pass: `ChannelSetupCaches<P>` now exposes `current_channel_state()` from the matching owner file so backend leaves can consume the currently bound channel payload through the cache owner instead of bypassing it.
+- Fixed in this pass: `ChannelCacheAccessor` now exposes the channel-bound GPU-memory owner reference, which lets query-cache leaves consume the restored channel owner path.
+- Fixed in this pass: focused coverage now verifies that a bound `ChannelSetupCaches<ChannelInfo>` exposes the real memory-manager ID through the current channel payload.
+
+### Missing items
+- `ChannelInfo` still does not carry literal live `Maxwell3D` and `KeplerCompute` references as upstream does.
+- `ChannelSetupCaches<P>` still stores reduced `usize` placeholders for `maxwell3d` / `kepler_compute` / `gpu_memory` in its current-state fields instead of literal engine / memory owner pointers.
+
+### Binary layout verification
+- PASS: owner/reference change only; no guest-visible raw serialization contract.
+
+## 2026-04-28 — `video_core/src/renderer_opengl/gl_query_cache.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_query_cache.h` and `/home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_query_cache.cpp` (bind owner follow-up)
+
+### Intentional differences
+- Rust still keeps `channel_memory_manager` cached on the OpenGL leaf for convenience of guest writeback closures, whereas upstream reaches the memory manager directly through the inherited base-owner state.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `bind_to_channel(...)` now takes `channel_id` and resolves the active `MemoryManager` from the restored `ChannelSetupCaches<ChannelInfo>` owner, instead of requiring the whole `ChannelState` object to be passed into the query-cache leaf.
+
+### Missing items
+- The OpenGL leaf still caches the resolved `MemoryManager` locally after binding instead of reading it directly from inherited owner state on demand.
+- `set_memory_manager(...)` still exists as a compatibility helper outside the literal upstream owner graph.
+
+### Binary layout verification
+- PASS: owner wiring only; no guest-visible raw layout changed.
+
+## 2026-04-28 — `video_core/src/renderer_vulkan/query_cache.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_vulkan/vk_query_cache.h` and `/home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_vulkan/vk_query_cache.cpp` (channel owner follow-up)
+
+### Intentional differences
+- Rust still keeps `QueryCache` as a concrete local struct instead of the literal upstream alias `using QueryCache = QueryCacheBase<QueryCacheParams>`. The restored channel owner is therefore attached directly on this local leaf as an intermediate parity step.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: the Vulkan query-cache leaf now owns `ChannelSetupCaches<ChannelInfo>` directly, so the channel-bound query owner state no longer depends only on the rasterizer-side `set_memory_manager(...)` shortcut.
+- Fixed in this pass: the Vulkan query-cache leaf now exposes `create_channel`, `bind_to_channel`, and `erase_channel` from its matching owner file.
+- Fixed in this pass: `bind_to_channel(...)` now resolves the active `MemoryManager` through the restored channel-cache owner rather than requiring an out-of-band channel object at bind time.
+- Fixed in this pass: added a focused regression proving the Vulkan query-cache leaf binds and clears its channel memory manager through the channel-cache owner.
+
+### Missing items
+- The Vulkan rasterizer still does not call `query_cache.create_channel/bind_to_channel/erase_channel` through a literal upstream channel-management sequence.
+- The Vulkan leaf still caches the resolved `MemoryManager` locally after binding instead of reading it directly from inherited base-owner state on demand.
+- The file still remains structurally farther from upstream than OpenGL because the real owner should be `QueryCacheBase<QueryCacheParams>`, not a reduced local wrapper.
+
+### Binary layout verification
+- PASS: owner/wiring change only; no raw guest-visible struct layout changed.
+
+## 2026-04-28 — `video_core/src/renderer_vulkan/vk_rasterizer.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_vulkan/vk_rasterizer.cpp` (query-cache channel follow-up)
+
+### Intentional differences
+- Rust `RasterizerVulkan` still lacks the full upstream channel sequence for texture, buffer, and pipeline caches. This slice only reattached the query-cache owner edge in the matching rasterizer file.
+- Rust still keeps `set_channel_memory_manager(...)` as a reduced compatibility helper for legacy callers; upstream channel ownership is driven by `InitializeChannel/BindChannel`.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `initialize_channel(...)` now calls `query_cache.create_channel(channel)` from the Vulkan rasterizer owner file instead of leaving channel initialization stubbed.
+- Fixed in this pass: `bind_channel(...)` now calls `query_cache.bind_to_channel(channel.bind_id)` and updates the active channel memory manager, which is structurally closer to upstream `query_cache.BindToChannel(channel_id)`.
+- Fixed in this pass: `release_channel(...)` now calls `query_cache.erase_channel(channel_id)` and clears the active channel memory manager.
+- Fixed in this pass: added a focused regression proving the Vulkan rasterizer channel methods drive the query-cache owner state.
+
+### Missing items
+- The full upstream `CreateChannel/BindToChannel/EraseChannel` sequence for texture, buffer, and pipeline caches is still missing here.
+- This owner file still does not participate in a literal `ChannelSetupCaches<ChannelInfo>` inheritance graph.
+- `set_channel_memory_manager(...)` still exists as a reduced non-upstream helper path.
+
+### Binary layout verification
+- PASS: owner/wiring change only; no guest-visible raw layout changed.
+
+## 2026-04-28 — `video_core/src/renderer_vulkan/query_cache.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_vulkan/vk_query_cache.h` and `/home/vricosti/Dev/emulators/zuyu/src/video_core/query_cache/query_cache.h` (BindToChannel follow-up)
+
+### Intentional differences
+- Rust still represents upstream `Vulkan::QueryCache` as a local concrete struct instead of the literal alias `VideoCommon::QueryCacheBase<QueryCacheParams>`, so the restored `BindToChannel` edge is attached directly on this reduced leaf.
+- Rust still records `Bind3DEngine` as a boolean lifecycle edge inside `QueryCacheRuntime` because the current Rust channel owner graph does not yet carry a live `Maxwell3D*` equivalent into this file.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `bind_to_channel(...)` now restores the upstream `QueryCacheBase<Traits>::BindToChannel` ordering edge by calling `runtime.bind_3d_engine()` immediately after the shared `ChannelSetupCaches<ChannelInfo>::bind_to_channel(...)`.
+- Fixed in this pass: removed the Vulkan-local `set_memory_manager(...)` shortcut path from this owner slice; the active channel memory manager now comes from the channel-cache owner path rather than a parallel reduced helper.
+- Fixed in this pass: focused coverage now verifies both the bound memory manager and the restored `Bind3DEngine` lifecycle edge from this owner file.
+
+### Missing items
+- `bind_to_channel(...)` still cannot pass a literal live `Maxwell3D` reference into `runtime.bind_3d_engine(...)` because `ChannelInfo` still lacks upstream-equivalent engine owners.
+- `QueryCacheRuntime` still lacks the real upstream `QueryCacheRuntimeImpl`, query-pool banks, streamer interfaces, and conditional-rendering machinery from `vk_query_cache.cpp`.
+- The file still remains structurally farther from upstream than the C++ alias-based owner graph because `QueryCacheBase<QueryCacheParams>` is not yet the literal owning type here.
+
+### Binary layout verification
+- PASS: owner/lifecycle change only; no guest-visible raw layout changed.
+
+## 2026-04-28 — `video_core/src/renderer_vulkan/texture_cache.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_vulkan/vk_texture_cache.h` and `/home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/texture_cache.h` (active runtime channel-owner follow-up)
+
+### Intentional differences
+- Rust still keeps the active Vulkan texture cache as a reduced runtime leaf instead of the literal upstream `VideoCommon::TextureCache<TextureCacheParams>` owner stack. The restored channel methods live in the matching file, but the surrounding generic texture-cache inheritance graph is still structurally reduced.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: the active Vulkan texture-cache leaf now owns `create_channel(...)`, `bind_to_channel(...)`, and `erase_channel(...)` in the matching file instead of leaving those owner edges absent from the active runtime path.
+- Fixed in this pass: the active Vulkan texture-cache leaf now carries `ChannelSetupCaches<ChannelInfo>` state so the rasterizer can drive the same high-level lifecycle edges upstream calls from `InitializeChannel/BindChannel/ReleaseChannel`.
+
+### Missing items
+- The active Vulkan texture-cache leaf still does not literally inherit `ChannelSetupCaches<TextureCacheChannelInfo>` through the shared `TextureCache<P>` owner graph.
+- The active Vulkan texture-cache leaf still lacks the upstream mutex/lock ownership that surrounds `CreateChannel/BindToChannel/EraseChannel` in `vk_rasterizer.cpp`.
+- The active runtime leaf still is not wired to the full upstream image/view/framebuffer/channel bookkeeping in `texture_cache.h`.
+
+### Binary layout verification
+- PASS: owner/lifecycle change only; no guest-visible raw layout changed.
+
+## 2026-04-28 — `video_core/src/renderer_vulkan/buffer_cache.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_vulkan/vk_buffer_cache.h` and `/home/vricosti/Dev/emulators/zuyu/src/video_core/buffer_cache/buffer_cache_base.h` (active runtime channel-owner follow-up)
+
+### Intentional differences
+- Rust still keeps the active Vulkan buffer cache as a reduced runtime leaf instead of the literal upstream `VideoCommon::BufferCache<BufferCacheParams>` owner stack. The restored channel methods live in the matching file, but the shared base-owner graph is still separate.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: the active Vulkan buffer-cache leaf now owns `create_channel(...)`, `bind_to_channel(...)`, and `erase_channel(...)` in the matching file instead of leaving those owner edges absent from the active runtime path.
+- Fixed in this pass: the active Vulkan buffer-cache leaf now carries `ChannelSetupCaches<ChannelInfo>` state so the rasterizer can drive the same high-level lifecycle edges upstream calls from `InitializeChannel/BindChannel/ReleaseChannel`.
+
+### Missing items
+- The active Vulkan buffer-cache leaf still does not literally inherit `ChannelSetupCaches<BufferCacheChannelInfo>` through the shared `BufferCache<P>` owner graph.
+- The active Vulkan buffer-cache leaf still lacks the upstream mutex/lock ownership that surrounds `CreateChannel/BindToChannel/EraseChannel` in `vk_rasterizer.cpp`.
+- The active runtime leaf still does not expose the broader upstream channel-bound state carried by `BufferCacheChannelInfo`.
+
+### Binary layout verification
+- PASS: owner/lifecycle change only; no guest-visible raw layout changed.
+
+## 2026-04-28 — `video_core/src/renderer_vulkan/graphics_pipeline.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_vulkan/vk_graphics_pipeline.h` and `/home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_vulkan/vk_pipeline_cache.h` (active runtime ownership follow-up)
+
+### Intentional differences
+- Rust still keeps this file as a reduced compilation leaf rather than a literal upstream `GraphicsPipeline` implementation. The matching cache owner now lives in `pipeline_cache.rs`, which is closer to upstream ownership than the earlier Rust split.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: the active runtime no longer routes pipeline channel lifecycle through this file. `graphics_pipeline.rs` is back to being only the graphics compilation/cache leaf, which is closer to the upstream ownership split than the temporary channel-owner detour.
+- Fixed in this pass: the active runtime no longer calls this file directly from `renderer_vulkan/mod.rs` for the top-level pipeline owner boundary. That call now goes through `pipeline_cache.rs`.
+- Fixed in this pass: this file no longer owns the graphics pipeline cache map. Owned compiled pipelines now live in `renderer_vulkan/pipeline_cache.rs`, matching the upstream `PipelineCache` ownership of `graphics_cache` and `current_pipeline` more closely.
+- Fixed in this pass: this file now owns the local `GraphicsPipeline` transition graph pieces again (`AddTransition`, `Next`, `IsBuilt`) instead of leaving that ownership absent from the matching `vk_graphics_pipeline` owner file.
+
+### Missing items
+- This file still is not the literal upstream graphics-pipeline implementation; it remains a reduced Rust build leaf without the full upstream `GraphicsPipeline` interaction surface.
+- The file still lacks the literal upstream constructor/runtime dependencies that flow through `PipelineCache::CreateGraphicsPipeline(...)`, including scheduler, render-pass cache, descriptor pool, guest descriptor queue, texture/buffer cache references, and worker-thread ownership.
+- This file still does not own the literal upstream `transitions` pointer graph; Rust currently stores only `transition_keys` and re-resolves cache entries through `PipelineCache` instead of storing peer `GraphicsPipeline*` equivalents directly in this owner.
+
+### Binary layout verification
+- PASS: owner/lifecycle change only; no guest-visible raw layout changed.
+
+## 2026-04-28 — `video_core/src/renderer_vulkan/pipeline_cache.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_vulkan/vk_pipeline_cache.h` (inactive owner follow-up)
+
+### Intentional differences
+- Rust still keeps this file as a reduced pipeline-cache owner compared with the full upstream `PipelineCache`. It now owns the active runtime draw/pipeline entry boundary, `graphics_cache`, `graphics_key`, and `current_pipeline`, but it still delegates concrete graphics compilation work to the reduced `graphics_pipeline.rs` leaf.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: this matching owner file now also exposes `create_channel(...)`, `bind_to_channel(...)`, and `erase_channel(...)` through `ChannelSetupCaches<ChannelInfo>`, so the file no longer lacks the upstream channel-owner surface entirely.
+- Fixed in this pass: the active runtime now routes its top-level graphics-pipeline lookup through `PipelineCache::current_graphics_pipeline(...)` in this matching owner file instead of calling `graphics_pipeline.rs` directly from `renderer_vulkan/mod.rs`.
+- Fixed in this pass: this file now owns a `GraphicsPipelineCache` leaf internally, which restores the upstream owner boundary that `CurrentGraphicsPipeline()` belongs to `PipelineCache`, not to the rasterizer.
+- Fixed in this pass: this file now owns the compiled graphics pipeline map and current-pipeline tracking instead of leaving that ownership in `graphics_pipeline.rs`.
+- Fixed in this pass: `CurrentGraphicsPipeline()` is no longer just a thin leaf forwarder; it now performs owner-local key generation, current-pipeline fast-path selection, slow-path insertion into `graphics_cache`, and owner-local `BuiltPipeline(...)` gating.
+- Fixed in this pass: `CACHE_VERSION` now matches upstream `11`, and Vulkan driver pipeline cache serialization/loading now owns the upstream magic header `yuzuvkch` in this file instead of using a reduced version-only format.
+- Fixed in this pass: `CurrentGraphicsPipeline()` and `CurrentGraphicsPipelineSlowPath()` now use the upstream-shaped transition ownership flow again. The Rust owner now consults `GraphicsPipeline::next(...)`, records `add_transition(...)` on slow-path insertion, and no longer lacks the local `Next(...)` / `AddTransition(...)` graph entirely.
+- Fixed in this pass: Vulkan driver pipeline cache loading no longer returns `None` for invalid cache blobs or recreates the empty cache at the caller boundary. The Rust owner now recreates an empty `vk::PipelineCache` directly inside `load_vulkan_pipeline_cache(...)`, matching the upstream lifecycle more closely.
+- Fixed in this pass: `BuiltPipeline(...)` no longer returns every unbuilt pipeline unconditionally when async shaders are enabled. The Rust owner now mirrors the upstream gating policy as closely as the active owner path allows: depth usage blocks async fallback, while very small draws still allow the unbuilt pipeline to proceed.
+- Fixed in this pass: `ComputePipelineCacheKey::hash_value()` now uses upstream-shaped `CityHash64` over the raw key bytes instead of relying on a reduced derived hash path.
+- Fixed in this pass: `compute_cache` now uses `ComputePipelineCacheKey -> ComputePipeline` ownership in this file, which matches the upstream `unordered_map<ComputePipelineCacheKey, unique_ptr<ComputePipeline>>` boundary more closely than the earlier reduced `u64 -> vk::Pipeline` storage.
+
+### Missing items
+- The file still does not own the literal upstream `PipelineCache` behavior beyond the reduced local skeleton already present.
+- `CurrentGraphicsPipeline()` still lacks the real `RefreshStages(...)` / `graphics_key.state.Refresh(...)` owner path.
+- `CurrentGraphicsPipelineSlowPath()` is still reduced; it does not call a literal upstream `CreateGraphicsPipeline()` graph with environments, pools, serialization thread, and disk cache serialization.
+- `BuiltPipeline(...)` still does not read the literal upstream engine-owner state (`maxwell3d->regs.zeta_enable` and `draw_manager->GetDrawState()`). Rust currently uses the active `DrawCall` path (`depth_stencil`, `vertex_count`, `index_buffer_count`) as the closest local equivalent.
+- `CurrentComputePipeline()` remains stubbed.
+- The file still lacks the upstream constructor graph and dependencies (`scheduler`, `descriptor_pool`, `guest_descriptor_queue`, `render_pass_cache`, `buffer_cache`, `texture_cache`, `shader_notify`, worker threads, dynamic features).
+
+### Binary layout verification
+- PASS: `ComputePipelineCacheKey` now keeps the upstream-shaped 24-byte / 8-byte-aligned raw layout, and its hash is computed over the full raw object representation.
+
+## 2026-04-28 — `video_core/src/renderer_vulkan/mod.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_vulkan/vk_rasterizer.h` and `/home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_vulkan/vk_rasterizer.cpp` (full cache channel-order follow-up)
+
+### Intentional differences
+- Rust `renderer_vulkan/mod.rs` remains a structurally divergent active runtime owner compared with upstream `vk_rasterizer.h/.cpp`. This pass only restored the missing texture/buffer/pipeline cache lifecycle edges in the currently used file; it did not collapse the duplicated Vulkan rasterizer architecture.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: the active runtime `initialize_channel(...)` now mirrors the upstream channel owner order more closely by calling `CreateChannel` on the rasterizer owner, then the active texture-cache, buffer-cache, graphics-pipeline owner, query-cache owner, and finally `state_tracker.setup_tables(...)`.
+- Fixed in this pass: the active runtime `bind_channel(...)` now mirrors the upstream channel owner order more closely by calling `BindToChannel` on the rasterizer owner, then the active texture-cache, buffer-cache, graphics-pipeline owner, query-cache owner, and finally `state_tracker.change_channel(...)` / `invalidate_state()`.
+- Fixed in this pass: the active runtime `release_channel(...)` now mirrors the upstream channel owner order more closely by calling `EraseChannel` on the rasterizer owner, then the active texture-cache, buffer-cache, graphics-pipeline owner, and query-cache owner.
+- Fixed in this pass: the active runtime no longer uses `graphics_pipeline.rs` as the channel-lifecycle owner. The runtime field split is now:
+  - `pipeline_cache.rs` for channel lifecycle and pipeline-cache ownership edges
+  - `graphics_pipeline.rs` for graphics-pipeline compilation/cache only
+- Fixed in this pass: the active runtime draw path no longer calls `graphics_pipeline.rs` directly. The top-level pipeline owner call now goes through `pipeline_cache.rs`, matching upstream ownership more closely.
+
+### Missing items
+- The active runtime now talks to `pipeline_cache.rs` for both channel lifecycle and top-level graphics-pipeline lookup, but the internal implementation still forwards to `graphics_pipeline.rs` instead of a literal unified upstream `PipelineCache`.
+- The active runtime still lacks the upstream lock ownership around the texture-cache and buffer-cache channel sequence.
+- The active runtime still remains structurally separate from `renderer_vulkan/vk_rasterizer.rs`, whereas upstream has one `RasterizerVulkan` owner.
+
+### Binary layout verification
+- PASS: owner/lifecycle change only; no guest-visible raw layout changed.
+
+## 2026-04-29 — `video_core/src/shader_cache.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/shader_cache.h` and `/home/vricosti/Dev/emulators/zuyu/src/video_core/shader_cache.cpp`
+
+### Intentional differences
+- Rust still keeps this file as a reduced shared shader-cache owner. This pass restores upstream owner state and channel ownership surfaces, but it does not yet restore the full `RefreshStages(...)`, `ComputeShader()`, and environment-building behavior.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: the shared owner now contains `ChannelSetupCaches<ChannelInfo>` again instead of remaining completely detached from upstream channel ownership.
+- Fixed in this pass: `shader_infos` and `last_shaders_valid` now live in this matching shared owner file instead of remaining absent entirely.
+- Fixed in this pass: the shared `CreateChannel`, `BindToChannel`, and `EraseChannel` owner edges now exist in this file again, which is the upstream ownership boundary for these channel-state dependencies.
+- Fixed in this pass: this owner now carries the upstream `device_memory` dependency surface again and routes the local `UnmarkMemory` equivalent through `device_memory.UpdatePagesCachedCount(...)` instead of leaving that owner edge absent.
+- Fixed in this pass: the matching owner file now has explicit Rust counterparts for the upstream helper boundaries `Register`, `InvalidatePageEntries`, `RemoveEntryFromInvalidationCache`, `UnmarkMemory`, `RemoveShadersFromStorage`, and `NewEntry` instead of flattening that logic into larger local loops.
+- Fixed in this pass: `MakeShaderInfo(...)` now exists in this matching owner file and uses the upstream-shaped `analyze()` fast path with `calculate_hash()` / `read_size_bytes()` fallback before registering the shader in the cache.
+
+### Missing items
+- `RefreshStages(...)` is still missing.
+- `ComputeShader()` is still missing.
+- `GetGraphicsEnvironments(...)` is still missing.
+- The current `shader_infos` storage is still reduced Rust pointer-slot state (`Option<usize>`) instead of literal upstream `const ShaderInfo*`.
+- `TryGet(...)` now exists, but the full upstream cache lifecycle still remains incomplete until `MakeShaderInfo(...)` and the stage-refresh callers are ported.
+
+### Binary layout verification
+- PASS: owner/state restoration only; no guest-visible serialized layout changed.
+
+## 2026-04-29 — `video_core/src/host1x/gpu_device_memory_manager.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/host1x/gpu_device_memory_manager.h` and `/home/vricosti/Dev/emulators/zuyu/src/video_core/host1x/gpu_device_memory_manager.cpp`
+
+### Intentional differences
+- Rust still keeps this file as a placeholder surface over the unported core-backed device-memory manager. The new method parity in this pass preserves ownership and call sites, but not the real backend behavior.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: the owner file now exposes `update_pages_cached_count(...)`, which is required by upstream `ShaderCache` ownership and should not live in unrelated files.
+- Fixed in this pass: the placeholder owner now has a local `Default` construction path so matching Rust owners can carry this dependency in the same file boundary as upstream.
+
+### Missing items
+- The file still does not wrap the real `Core::DeviceMemoryManager<MaxwellDeviceTraits>` backend.
+- `read_*`, `write_*`, `get_pointer*`, and `update_pages_cached_count(...)` remain behavioral stubs.
+
+### Binary layout verification
+- PASS: API-surface restoration only; no guest-visible raw layout changed.
+
+## 2026-04-28 — `video_core/src/renderer_vulkan/vk_rasterizer.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_vulkan/vk_rasterizer.cpp` (reduced helper removal follow-up)
+
+### Intentional differences
+- Rust `RasterizerVulkan` still only wires the query-cache channel edge from this file. The upstream channel sequence for texture cache, buffer cache, pipeline cache, and state tracker still remains unported here because those owners are not yet all available with matching Rust APIs.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: removed the reduced `set_channel_memory_manager(...)` helper from the Vulkan rasterizer owner file. Upstream drives query-cache memory ownership only through `InitializeChannel/BindChannel/ReleaseChannel`, and the Rust file now relies on that owner path too.
+- Fixed in this pass: the Vulkan rasterizer regression no longer reaches into private query-cache fields; test visibility now goes through the matching query-cache owner file instead of bypassing ownership boundaries.
+
+### Missing items
+- `InitializeChannel/BindChannel/ReleaseChannel` still do not drive the full upstream sequence for texture cache, buffer cache, pipeline cache, `ChangeChannel`, and `InvalidateState`.
+- The rasterizer still does not inherit `ChannelSetupCaches<ChannelInfo>` literally as upstream does.
+
+### Binary layout verification
+- PASS: owner/test-access change only; no guest-visible raw layout changed.
+
+## 2026-04-28 — `video_core/src/renderer_opengl/gl_query_cache.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_query_cache.h` and `/home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_query_cache.cpp` (helper removal follow-up)
+
+### Intentional differences
+- Rust still caches the bound `MemoryManager` on the OpenGL leaf because the current shared `ChannelInfo` Rust port does not yet expose literal upstream engine/device-memory references through inherited owner state.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: removed the non-upstream `set_memory_manager(...)` shortcut from the OpenGL query-cache leaf. The active owner path is now only `create_channel(...)`, `bind_to_channel(...)`, and `erase_channel(...)`.
+- Fixed in this pass: `erase_channel(...)` now clears the locally cached channel memory manager, which prevents stale channel ownership from surviving after the upstream-equivalent `EraseChannel(channel_id)` edge.
+- Fixed in this pass: the focused channel-binding regression now verifies both successful bind and cleanup through the matching owner file.
+
+### Missing items
+- The OpenGL query-cache leaf still retains a local cached `MemoryManager` field instead of reaching the memory owner purely through inherited base-owner state at use time.
+- The OpenGL leaf still does not literally inherit the upstream `QueryCacheLegacy<QueryCache, CachedQuery, CounterStream, HostCounter>` graph; it consumes a reduced shared Rust owner stack.
+
+### Binary layout verification
+- PASS: owner cleanup only; no guest-visible raw layout changed.
+
+## 2026-04-28 — `video_core/src/control/channel_state_cache.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/control/channel_state_cache.h` and `/home/vricosti/Dev/emulators/zuyu/src/video_core/control/channel_state_cache.inc` (live engine-reference follow-up)
+
+### Intentional differences
+- Rust still stores upstream live engine references as raw pointer addresses (`usize`) inside `ChannelInfo` and `ChannelSetupCaches<P>` current-state fields, instead of literal C++ references/pointers. This preserves the owner boundary and the live-address semantics without making the shared cache owner non-`Send`.
+- Rust still keeps the actual `MemoryManager` owner available separately through `gpu_memory_arc()` because backend leaves need an `Arc<Mutex<MemoryManager>>` for safe writeback closures.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `ChannelInfo::from_channel_state(...)` no longer fills `maxwell3d` / `kepler_compute` with hard-coded placeholder `0` values; it now captures the live engine addresses from the owning `ChannelState`.
+- Fixed in this pass: `ChannelSetupCaches<P>::bind_to_channel(...)` now propagates those live engine addresses into the current bound-channel state instead of keeping reduced placeholder engine slots.
+- Fixed in this pass: added focused regression coverage proving `ChannelInfo` captures nonzero live engine addresses when the channel owns initialized engines.
+
+### Missing items
+- `ChannelInfo` still does not expose literal typed `Maxwell3D&` / `KeplerCompute&` references as upstream does; the Rust owner graph still uses raw addresses to remain thread-safe.
+- `ChannelSetupCaches<P>::gpu_memory` current-state field still tracks the memory-manager ID rather than a literal live `MemoryManager*` pointer as in upstream.
+- The broader shared owner graph still does not let `QueryCacheBase` itself inherit and consume `ChannelSetupCaches<ChannelInfo>` literally.
+
+### Binary layout verification
+- PASS: owner/reference-state change only; no guest-visible raw layout changed.
+
+## 2026-04-28 — `video_core/src/query_cache/query_cache_base.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/query_cache/query_cache_base.h` and `/home/vricosti/Dev/emulators/zuyu/src/video_core/query_cache/query_cache.h` (shared channel owner follow-up)
+
+### Intentional differences
+- Rust still models upstream `QueryCacheBase<Traits> : ChannelSetupCaches<ChannelInfo>` as composition via `channel_caches: ChannelSetupCaches<ChannelInfo>` instead of literal inheritance. The owner now lives in the matching shared file, but Rust keeps the inheritance adaptation explicit.
+- `new_bound(...)` still binds external shared owners (`runtime`, `gpu`, `device_memory`) separately, instead of constructing the full upstream C++ owner graph in one constructor call.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `QueryCacheBase` now owns `ChannelSetupCaches<ChannelInfo>` in the shared owner file instead of leaving channel ownership entirely outside the shared query-cache base.
+- Fixed in this pass: `create_channel(...)`, `bind_to_channel(...)`, and `erase_channel(...)` now belong to the shared query-cache base owner and delegate through the restored shared `ChannelSetupCaches<ChannelInfo>` path.
+- Fixed in this pass: the shared `bind_to_channel(...)` test now reflects the upstream precondition that a channel must already exist before binding.
+
+### Missing items
+- `QueryCacheBase` still does not expose the full inherited owner surface directly as upstream does; backends still reach some state through explicit `.channel_caches` composition.
+- The shared `bind_to_channel(...)` path still cannot pass a literal typed `Maxwell3D&` from `ChannelSetupCaches` into the runtime; it only triggers the runtime lifecycle hook.
+- The constructor still does not mirror the exact upstream `QueryCacheBase(gpu, rasterizer, device_memory, runtime)` ownership and initialization order.
+
+### Binary layout verification
+- PASS: owner-graph change only; no guest-visible raw layout changed.
+
+## 2026-04-28 — `video_core/src/renderer_vulkan/query_cache.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_vulkan/vk_query_cache.h` and `/home/vricosti/Dev/emulators/zuyu/src/video_core/query_cache/query_cache_base.h` (base-owner follow-up)
+
+### Intentional differences
+- Rust still keeps `renderer_vulkan::query_cache::QueryCache` as a local wrapper instead of the literal upstream alias `using QueryCache = VideoCommon::QueryCacheBase<QueryCacheParams>`.
+- The Vulkan leaf still performs an explicit `runtime.bind_3d_engine()` after `base.bind_to_channel(...)` because the runtime pointer stored inside `QueryCacheBase` cannot safely point at a sibling field before the whole Rust object is fully stable in memory.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: the Vulkan leaf no longer owns a duplicate `channel_caches` field; it now delegates channel ownership through the shared `QueryCacheBase` owner.
+- Fixed in this pass: `create_channel(...)`, `bind_to_channel(...)`, and `erase_channel(...)` now forward through `base`, so the shared query-cache owner graph is active on the Vulkan path too.
+- Fixed in this pass: focused Vulkan tests now validate program ID and bound memory-manager state through `base.channel_caches`, not through a duplicated leaf owner.
+
+### Missing items
+- The Vulkan leaf still is not the literal upstream alias to `QueryCacheBase<QueryCacheParams>`.
+- The Vulkan leaf still keeps its own cached `channel_memory_manager` writeback handle instead of driving guest writeback entirely through the shared base owner.
+- Runtime binding still is not fully shared-owner-driven because of the current self-referential Rust layout limitation between `base` and `runtime`.
+
+### Binary layout verification
+- PASS: shared-owner move only; no guest-visible raw layout changed.
+
+## 2026-04-28 — `video_core/src/renderer_vulkan/state_tracker.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_vulkan/vk_state_tracker.h` and `/home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_vulkan/vk_state_tracker.cpp` (channel-owner follow-up)
+
+### Intentional differences
+- Rust still keeps backend-local dirty flags inside `StateTracker` instead of switching `flags` to a live `maxwell3d->dirty.flags` pointer per channel. The current Rust `Maxwell3D` owner does not yet expose upstream-equivalent `dirty.flags` / `dirty.tables`.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: restored the upstream method owners `setup_tables(...)` and `change_channel(...)` to `state_tracker.rs` instead of leaving channel-state sequencing entirely outside the matching owner file.
+- Fixed in this pass: added focused regression coverage proving the state-tracker owner records the bound channel on both `setup_tables(...)` and `change_channel(...)`.
+
+### Missing items
+- `SetupTables(...)` still does not populate `channel_state.maxwell_3d->dirty.tables` because the upstream `dirty.tables` storage is still missing from the Rust `Maxwell3D` owner.
+- `ChangeChannel(...)` still cannot repoint `flags` at per-channel `maxwell3d->dirty.flags`; it only tracks the active channel boundary.
+
+### Binary layout verification
+- PASS: owner/lifecycle change only; no guest-visible raw layout changed.
+
+## 2026-04-28 — `video_core/src/renderer_vulkan/vk_rasterizer.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_vulkan/vk_rasterizer.h` and `/home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_vulkan/vk_rasterizer.cpp` (channel/state-tracker follow-up)
+
+### Intentional differences
+- Rust still lacks the full upstream channel sequence for texture cache, buffer cache, and pipeline cache in this owner. This pass only restored the rasterizer-owned `ChannelSetupCaches<ChannelInfo>` edge and the state-tracker/query-cache calls that already have matching Rust owners.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `RasterizerVulkan` in the matching owner file now owns `ChannelSetupCaches<ChannelInfo>` instead of leaving the protected upstream base-owner entirely absent.
+- Fixed in this pass: `initialize_channel(...)` now mirrors the upstream owner order for the Rust-owned subset: `CreateChannel(channel)` then `query_cache.create_channel(channel)` then `state_tracker.setup_tables(channel)`.
+- Fixed in this pass: `bind_channel(...)` now mirrors the upstream owner order for the Rust-owned subset: `BindToChannel(channel_id)`, `query_cache.bind_to_channel(channel_id)`, `state_tracker.change_channel(channel)`, and `state_tracker.invalidate_state()`.
+- Fixed in this pass: `release_channel(...)` now mirrors the upstream owner order for the Rust-owned subset by calling both `EraseChannel(channel_id)` and `query_cache.erase_channel(channel_id)`.
+- Fixed in this pass: the focused regression now checks both the restored rasterizer channel owner and the state-tracker channel edge.
+
+### Missing items
+- The full upstream `InitializeChannel/BindChannel/ReleaseChannel` sequence for texture cache, buffer cache, and pipeline cache is still unported in this file.
+- This owner still is not wired into the active runtime Vulkan renderer path; the current runtime owner remains `renderer_vulkan/mod.rs`.
+
+### Binary layout verification
+- PASS: owner/lifecycle change only; no guest-visible raw layout changed.
+
+## 2026-04-28 — `video_core/src/renderer_vulkan/mod.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_vulkan/vk_rasterizer.h` and `/home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_vulkan/vk_rasterizer.cpp` (active runtime channel-owner follow-up)
+
+### Intentional differences
+- Rust `renderer_vulkan/mod.rs` remains a structurally divergent active runtime owner compared with upstream `vk_rasterizer.h/.cpp`. This pass only reattached the upstream channel/state-tracker lifecycle in the active owner; it did not collapse the duplicated Vulkan rasterizer architecture.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: the active runtime `RasterizerVulkan` now owns `ChannelSetupCaches<ChannelInfo>` instead of having no rasterizer-level channel owner at all.
+- Fixed in this pass: the active runtime owner now implements `initialize_channel(...)`, `bind_channel(...)`, and `release_channel(...)` in the matching file.
+- Fixed in this pass: `bind_channel(...)` now restores the upstream `ChangeChannel(channel)` then `InvalidateState()` sequence through the real Vulkan `StateTracker` owner.
+
+### Missing items
+- The active runtime owner still does not drive texture cache, buffer cache, pipeline cache, and query cache through the full upstream channel-management sequence.
+- The active runtime owner still remains structurally separate from `renderer_vulkan/vk_rasterizer.rs`, whereas upstream has a single `RasterizerVulkan` owner.
+- The active runtime `query(...)` path still bypasses the Vulkan query-cache owner graph and writes directly through `guest_memory_writer`, which is upstream-inaccurate.
+
+### Binary layout verification
+- PASS: owner/lifecycle change only; no guest-visible raw layout changed.
+
+## 2026-04-28 — `video_core/src/renderer_vulkan/mod.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_vulkan/vk_rasterizer.h` and `/home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_vulkan/vk_rasterizer.cpp` (active runtime query-owner follow-up)
+
+### Intentional differences
+- Rust still keeps the active runtime Vulkan owner in `renderer_vulkan/mod.rs` structurally separate from the secondary owner in `renderer_vulkan/vk_rasterizer.rs`, while upstream has a single `RasterizerVulkan` owner. This pass only repaired the active runtime query-owner boundary inside the currently used file.
+- Rust still exposes a lightweight `set_gpu_ticks_getter(...)` compatibility hook on the active runtime owner instead of wiring that source through the exact upstream constructor graph. The active query owner now lives in the correct file, but the surrounding renderer-base plumbing is still reduced.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: the active runtime owner no longer owns a local direct guest-memory query writeback path. `reset_counter(...)` and `query(...)` now delegate to `renderer_vulkan/query_cache.rs`, matching upstream `RasterizerVulkan::ResetCounter(...)` and `RasterizerVulkan::Query(...)` ownership more closely.
+- Fixed in this pass: the active runtime `reset_counter(...)` owner now mirrors the upstream `ZPassPixelCount64` gate instead of forwarding every query type blindly.
+- Fixed in this pass: `initialize_channel(...)`, `bind_channel(...)`, and `release_channel(...)` in the active runtime owner now drive `query_cache.create_channel(...)`, `query_cache.bind_to_channel(...)`, and `query_cache.erase_channel(...)` in the same matching owner file instead of leaving the active query-cache owner disconnected.
+- Fixed in this pass: removed the Rust-only `guest_memory_writer` / local timestamp writeback shortcut from the active runtime Vulkan owner.
+
+### Missing items
+- The active runtime owner still does not drive the full upstream channel-management sequence for texture cache, buffer cache, and pipeline cache.
+- The active runtime owner still lacks the full upstream `SignalFence`/`ReleaseFences` async fence-thread behavior; its `signal_fence(...)` path still forces `finish()` and executes inline.
+- The active runtime Vulkan owner still is not wired through the same renderer-base installation path as OpenGL/Null, so `set_gpu_ticks_getter(...)` is not yet proven end-to-end at runtime.
+
+### Binary layout verification
+- PASS: owner/lifecycle change only; no guest-visible raw layout changed.
+
+## 2026-04-28 — `video_core/src/renderer_vulkan/query_cache.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_vulkan/vk_query_cache.h`, `/home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_vulkan/vk_query_cache.cpp`, and `/home/vricosti/Dev/emulators/zuyu/src/video_core/query_cache/query_cache_base.h` (active runtime query delegation follow-up)
+
+### Intentional differences
+- Rust still keeps this file as a local wrapper around `QueryCacheBase` instead of the literal upstream alias `using QueryCache = VideoCommon::QueryCacheBase<QueryCacheParams>`.
+- Rust still uses the bound channel `MemoryManager` guest-writer bridge for query writeback, rather than the full upstream Vulkan host-query/result-buffer machinery.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: the active runtime Vulkan owner now consumes this query-cache owner for `ResetCounter(...)`, `Query(...)`, and channel lifecycle edges instead of bypassing it.
+- Fixed in this pass: added focused regression coverage for the two active writeback contracts in this owner:
+  - synchronous query writeback through `sync_operation(...)`
+  - deferred fence writeback through `signal_fence(...)`
+
+### Missing items
+- `reset_counter(...)`, `invalidate_region(...)`, `flush_region(...)`, and the async flush queue methods remain reduced local stubs instead of the full upstream Vulkan query-cache behavior.
+- `QueryCacheRuntime` still does not implement the real upstream host conditional-rendering, streamer-interface, and sync-buffer owner graph.
+- The file still is not the literal upstream alias to `QueryCacheBase<QueryCacheParams>`.
+
+### Binary layout verification
+- PASS: owner/lifecycle change only; no guest-visible raw layout changed.

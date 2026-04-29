@@ -8,6 +8,7 @@ use std::sync::{Arc, Mutex, Weak};
 
 use crate::hle::kernel::k_event::KEvent;
 use crate::hle::kernel::k_process::KProcess;
+use crate::hle::kernel::k_process::ProcessLock;
 use crate::hle::kernel::k_readable_event::KReadableEvent;
 use crate::hle::kernel::kernel::KernelCore;
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
@@ -15,7 +16,6 @@ use crate::hle::service::cmif_serialization::{write_out_array_bytes, CmifRequest
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
 use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use crate::hle::kernel::k_process::ProcessLock;
 
 /// IPC command table for IAudioRenderer:
 ///
@@ -265,7 +265,11 @@ impl IAudioRenderer {
                     if let Err(e) = std::fs::write(&path, &output) {
                         log::error!("RUZU_DUMP_AUDIO_UPDATE: failed to write {}: {}", path, e);
                     } else {
-                        log::info!("RUZU_DUMP_AUDIO_UPDATE: wrote {} bytes to {}", output.len(), path);
+                        log::info!(
+                            "RUZU_DUMP_AUDIO_UPDATE: wrote {} bytes to {}",
+                            output.len(),
+                            path
+                        );
                     }
                 }
             }

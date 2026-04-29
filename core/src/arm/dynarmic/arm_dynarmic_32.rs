@@ -170,7 +170,9 @@ fn watch_write(cb: &DynarmicCallbacks32, vaddr: u64, size: u64, value: u128) {
     // instances (one per physical core). Useful when PC_TRACE_ACTIVE is on
     // to see if a non-main core is writing during the window.
     let core = cb.parent.load(std::sync::atomic::Ordering::Relaxed);
-    let core_id = if core.is_null() { -1i32 } else {
+    let core_id = if core.is_null() {
+        -1i32
+    } else {
         unsafe { (*core).core_index() as i32 }
     };
     eprintln!(
@@ -202,9 +204,7 @@ fn watch_read(cb: &DynarmicCallbacks32, vaddr: u64, size: u64, value: u128) {
         }
     }
     let pc_ptr = cb.jit_pc_ptr;
-    let pc = pc_ptr
-        .map(|p| unsafe { p.read_volatile() })
-        .unwrap_or(0);
+    let pc = pc_ptr.map(|p| unsafe { p.read_volatile() }).unwrap_or(0);
     if let Some((pc_lo, pc_hi)) = pc_range {
         let pc_u64 = pc as u64;
         if pc_u64 < pc_lo || pc_u64 >= pc_hi {
@@ -253,9 +253,21 @@ fn maybe_dump_instance_at_pc(cb: &DynarmicCallbacks32, pc_ptr: Option<*const u32
         r[i] = unsafe { p.offset(off).read_volatile() };
     }
     let mem = cb.mem();
-    let star_r0 = if r[0] != 0 { mem.read_32(r[0] as u64) } else { 0 };
-    let star_r1 = if r[1] != 0 { mem.read_32(r[1] as u64) } else { 0 };
-    let star_r8 = if r[8] != 0 { mem.read_32(r[8] as u64) } else { 0 };
+    let star_r0 = if r[0] != 0 {
+        mem.read_32(r[0] as u64)
+    } else {
+        0
+    };
+    let star_r1 = if r[1] != 0 {
+        mem.read_32(r[1] as u64)
+    } else {
+        0
+    };
+    let star_r8 = if r[8] != 0 {
+        mem.read_32(r[8] as u64)
+    } else {
+        0
+    };
     eprintln!(
         "[INSTANCE] pc=0x{:08X} hit#{} r0=0x{:08X} r1=0x{:08X} r2=0x{:08X} r3=0x{:08X} r4=0x{:08X} r5=0x{:08X} r6=0x{:08X} r7=0x{:08X} r8=0x{:08X} sb=0x{:08X} sl=0x{:08X} fp=0x{:08X} ip=0x{:08X} sp=0x{:08X} lr=0x{:08X} *r0=0x{:08X} *r1=0x{:08X} *r8=0x{:08X}",
         pc, n,
@@ -276,7 +288,10 @@ fn maybe_dump_instance_at_pc(cb: &DynarmicCallbacks32, pc_ptr: Option<*const u32
                 use std::fmt::Write;
                 let _ = write!(hex, "{:02x}", mem.read_8(addr as u64 + i));
             }
-            eprintln!("[INSTANCE_MEM] hit#{} {}=0x{:08X} bytes={}", n, label, addr, hex);
+            eprintln!(
+                "[INSTANCE_MEM] hit#{} {}=0x{:08X} bytes={}",
+                n, label, addr, hex
+            );
         }
         let sp = r[13];
         if sp != 0 {
@@ -286,7 +301,12 @@ fn maybe_dump_instance_at_pc(cb: &DynarmicCallbacks32, pc_ptr: Option<*const u32
                 let w = mem.read_32(sp as u64 + i * 4);
                 let _ = write!(words, "{:08x} ", w);
             }
-            eprintln!("[INSTANCE_STACK] hit#{} sp=0x{:08X} words={}", n, sp, words.trim());
+            eprintln!(
+                "[INSTANCE_STACK] hit#{} sp=0x{:08X} words={}",
+                n,
+                sp,
+                words.trim()
+            );
         }
     }
 }
@@ -393,7 +413,9 @@ fn maybe_scan_movw_movt(cb: &DynarmicCallbacks32) {
             .or_else(|| parts[2].parse::<u64>().ok())?;
         Some((value, start, len))
     });
-    let Some((value, start, len)) = spec else { return };
+    let Some((value, start, len)) = spec else {
+        return;
+    };
     let target_lo = (value & 0xFFFF) as u32;
     let target_hi = ((value >> 16) & 0xFFFF) as u32;
     let mem = cb.mem();
@@ -473,7 +495,9 @@ fn maybe_scan_word(cb: &DynarmicCallbacks32) {
             .or_else(|| parts[2].parse::<u64>().ok())?;
         Some((value, start, len))
     });
-    let Some((value, start, len)) = spec else { return };
+    let Some((value, start, len)) = spec else {
+        return;
+    };
     let mem = cb.mem();
     let end = start + len;
     let mut addr = start;
@@ -491,7 +515,10 @@ fn maybe_scan_word(cb: &DynarmicCallbacks32) {
                     ctx.push('|');
                 }
             }
-            eprintln!("[WORD_HIT] addr=0x{:08X} val=0x{:08X} ctx=[{}]", addr, value, ctx);
+            eprintln!(
+                "[WORD_HIT] addr=0x{:08X} val=0x{:08X} ctx=[{}]",
+                addr, value, ctx
+            );
             hits += 1;
             if hits > 64 {
                 eprintln!("[WORD_HIT] (more hits suppressed)");
@@ -500,7 +527,10 @@ fn maybe_scan_word(cb: &DynarmicCallbacks32) {
         }
         addr += 4;
     }
-    eprintln!("[WORD_HIT] scan done: {} hits in [0x{:X}..0x{:X}]", hits, start, end);
+    eprintln!(
+        "[WORD_HIT] scan done: {} hits in [0x{:X}..0x{:X}]",
+        hits, start, end
+    );
 }
 
 /// Scan guest memory for ARM BL instructions targeting a specific PC.
@@ -523,7 +553,9 @@ fn maybe_scan_bl(cb: &DynarmicCallbacks32) {
             .or_else(|| parts[2].parse::<u64>().ok())?;
         Some((target, start, len))
     });
-    let Some((target, start, len)) = spec else { return };
+    let Some((target, start, len)) = spec else {
+        return;
+    };
     let mem = cb.mem();
     let end = start + len;
     let mut pc = start;
@@ -547,8 +579,10 @@ fn maybe_scan_bl(cb: &DynarmicCallbacks32) {
             if computed_target == target {
                 let cond = (w3 >> 4) & 0xF;
                 let kind = if w3 & 0x01 != 0 { "BL" } else { "B " };
-                eprintln!("[BL_HIT] pc=0x{:08X} target=0x{:08X} kind={} cond=0x{:X}",
-                    pc, target, kind, cond);
+                eprintln!(
+                    "[BL_HIT] pc=0x{:08X} target=0x{:08X} kind={} cond=0x{:X}",
+                    pc, target, kind, cond
+                );
                 hits += 1;
                 if hits > 64 {
                     eprintln!("[BL_HIT] (more hits suppressed)");
@@ -558,7 +592,10 @@ fn maybe_scan_bl(cb: &DynarmicCallbacks32) {
         }
         pc += 4;
     }
-    eprintln!("[BL_HIT] scan done: {} hits in [0x{:X}..0x{:X}]", hits, start, end);
+    eprintln!(
+        "[BL_HIT] scan done: {} hits in [0x{:X}..0x{:X}]",
+        hits, start, end
+    );
 }
 
 /// PC-range filter from `RUZU_WATCH_PC=0xLO-0xHI` (inclusive..exclusive).

@@ -299,7 +299,10 @@ impl<'a> CommandGenerator<'a> {
                         if n <= 10 || n % 100 == 0 {
                             log::info!(
                                 "data_source_push #{} voice={} channel={} fmt={:?}",
-                                n, voice.node_id, channel, voice.sample_format
+                                n,
+                                voice.node_id,
+                                channel,
+                                voice.sample_format
                             );
                         }
                     }
@@ -310,7 +313,9 @@ impl<'a> CommandGenerator<'a> {
                     if n <= 10 || n % 500 == 0 {
                         log::info!(
                             "data_source_SKIP #{} voice={} channel={} (was_playing=true)",
-                            n, voice.node_id, channel
+                            n,
+                            voice.node_id,
+                            channel
                         );
                     }
                 }

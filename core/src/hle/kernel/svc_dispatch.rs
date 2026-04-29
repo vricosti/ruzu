@@ -1773,7 +1773,10 @@ pub fn call(system: &System, imm: u32, is_64bit: bool, args: &mut SvcArgs) {
     if tid == pc_trace_target_tid() {
         if let Some((start, _end)) = pc_trace_window() {
             if svc_count_here == start {
-                eprintln!("[TRACE_PC] ---- window start after SVC #{} exit (tid={}) ----", svc_count_here, tid);
+                eprintln!(
+                    "[TRACE_PC] ---- window start after SVC #{} exit (tid={}) ----",
+                    svc_count_here, tid
+                );
                 pc_trace_active_set(true);
             }
         }

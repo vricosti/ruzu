@@ -10,6 +10,7 @@ use std::sync::Weak;
 use std::sync::{Arc, Mutex};
 
 use crate::hle::kernel::k_process::KProcess;
+use crate::hle::kernel::k_process::ProcessLock;
 use crate::hle::kernel::k_readable_event::KReadableEvent;
 use crate::hle::kernel::k_scheduler::KScheduler;
 use crate::hle::service::nvdrv::core::container::SessionId;
@@ -18,7 +19,6 @@ use crate::hle::service::nvdrv::devices::nvdevice::NvDevice;
 use crate::hle::service::nvdrv::devices::nvmap::{read_struct, write_struct};
 use crate::hle::service::nvdrv::nvdata::*;
 use crate::hle::service::nvdrv::nvdrv::EventInterface;
-use crate::hle::kernel::k_process::ProcessLock;
 
 /// Union for SyncpointEventValue bit fields.
 #[repr(C)]

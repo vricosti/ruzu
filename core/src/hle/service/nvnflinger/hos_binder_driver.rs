@@ -102,7 +102,9 @@ impl IHosBinderDriver {
             if current == 0 || current.is_power_of_two() {
                 log::info!(
                     "[BINDER_TXN] id={} txn={} n={}",
-                    id, transaction_id, current
+                    id,
+                    transaction_id,
+                    current
                 );
             }
         }

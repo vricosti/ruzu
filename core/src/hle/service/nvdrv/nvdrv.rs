@@ -22,9 +22,9 @@ use super::devices::nvmap::NvMapDevice;
 use super::nvdata::*;
 use crate::core::SystemRef;
 use crate::hle::kernel::k_process::KProcess;
+use crate::hle::kernel::k_process::ProcessLock;
 use crate::hle::kernel::k_readable_event::KReadableEvent;
 use crate::hle::kernel::k_scheduler::KScheduler;
-use crate::hle::kernel::k_process::ProcessLock;
 
 /// EventInterface manages kernel event creation and destruction for nvdrv.
 ///
@@ -165,7 +165,9 @@ impl Module {
 
         log::info!(
             "[NVDRV_OPEN] fd={} device={} session_id={}",
-            fd, device_name, session_id.id
+            fd,
+            device_name,
+            session_id.id
         );
 
         fd
@@ -198,7 +200,10 @@ impl Module {
             if current == 0 || current.is_power_of_two() {
                 log::info!(
                     "[NVDRV_IOCTL1] fd={} cmd=0x{:X} group=0x{:X} n={}",
-                    fd, command.cmd(), command.group(), current
+                    fd,
+                    command.cmd(),
+                    command.group(),
+                    current
                 );
             }
         }
@@ -325,7 +330,9 @@ impl Module {
         let object_id = result.as_ref().map(|e| e.lock().unwrap().object_id);
         log::info!(
             "[NVDRV_QUERY_EVENT] fd={} event_id={} object_id={:?}",
-            fd, event_id, object_id
+            fd,
+            event_id,
+            object_id
         );
         match result {
             Some(event) => (NvResult::Success, Some(event)),

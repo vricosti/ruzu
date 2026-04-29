@@ -434,7 +434,9 @@ impl NvDevice for NvMapDevice {
                     if std::env::var_os("RUZU_TRACE_IOCALLOC").is_some() {
                         let mut ih = String::new();
                         for (i, b) in input.iter().enumerate().take(48) {
-                            if i > 0 && (i & 3) == 0 { ih.push(' '); }
+                            if i > 0 && (i & 3) == 0 {
+                                ih.push(' ');
+                            }
                             use std::fmt::Write;
                             let _ = write!(ih, "{:02x}", b);
                         }
@@ -460,7 +462,9 @@ impl NvDevice for NvMapDevice {
                     if std::env::var_os("RUZU_TRACE_IOCALLOC").is_some() {
                         let mut oh = String::new();
                         for (i, b) in output.iter().enumerate().take(48) {
-                            if i > 0 && (i & 3) == 0 { oh.push(' '); }
+                            if i > 0 && (i & 3) == 0 {
+                                oh.push(' ');
+                            }
                             use std::fmt::Write;
                             let _ = write!(oh, "{:02x}", b);
                         }

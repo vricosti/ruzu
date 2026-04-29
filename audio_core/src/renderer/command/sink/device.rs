@@ -78,7 +78,10 @@ impl DeviceSinkPayload {
             if lock_us > 1000 || work_us > 1000 {
                 log::info!(
                     "PROFILE_DEVICE_SINK lock_us={} work_us={} frames={} input_count={}",
-                    lock_us, work_us, frames, input_count
+                    lock_us,
+                    work_us,
+                    frames,
+                    input_count
                 );
             }
         }
@@ -163,7 +166,10 @@ pub fn process_device_command(
         if lock_us > 1000 || work_us > 1000 {
             log::info!(
                 "PROFILE_DEVICE_SINK lock_us={} work_us={} frames={} input_count={}",
-                lock_us, work_us, frames, input_count
+                lock_us,
+                work_us,
+                frames,
+                input_count
             );
         }
     }

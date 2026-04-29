@@ -6,11 +6,11 @@
 use std::sync::{Arc, Mutex};
 
 use crate::hle::kernel::k_process::KProcess;
+use crate::hle::kernel::k_process::ProcessLock;
 use crate::hle::kernel::k_readable_event::KReadableEvent;
 use crate::hle::kernel::k_scheduler::KScheduler;
 use crate::hle::service::nvdrv::core::container::SessionId;
 use crate::hle::service::nvdrv::nvdata::{DeviceFD, Ioctl, NvResult};
-use crate::hle::kernel::k_process::ProcessLock;
 
 /// Represents an abstract nvidia device node. It is to be subclassed by concrete device nodes to
 /// implement the ioctl interface.

@@ -8,13 +8,13 @@
 use super::k_memory_block::PAGE_SIZE;
 use super::k_page_group::KPageGroup;
 use super::k_process::KProcess;
+use super::k_process::ProcessLock;
 use super::k_process_page_table::KProcessPageTable;
 use super::k_resource_limit::LimitableResource;
 use super::k_shared_memory::MemoryPermission;
 use super::k_typed_address::KProcessAddress;
 use crate::hle::result::ResultCode;
 use std::sync::{Arc, Mutex, Weak};
-use super::k_process::ProcessLock;
 
 /// KTransferMemory: allows transferring a memory region from one process
 /// to another. Upstream inherits from KAutoObjectWithSlabHeapAndContainer.

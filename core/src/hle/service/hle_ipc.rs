@@ -52,9 +52,9 @@ impl KAutoObjectRef {
         }
     }
 }
+use crate::hle::kernel::k_process::ProcessLock;
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 use crate::hle::service::sm::sm::ServiceManager;
-use crate::hle::kernel::k_process::ProcessLock;
 
 /// Handle type alias matching upstream `Kernel::Handle`.
 pub type Handle = u32;
@@ -340,8 +340,14 @@ pub fn complete_sync_request(
     let result = match dispatch {
         PreparedSyncRequest::Session(handler) | PreparedSyncRequest::Domain(handler) => {
             if trace_dispatch {
+                let tid = context
+                    .thread
+                    .as_ref()
+                    .map(|t| t.lock().unwrap().get_thread_id())
+                    .unwrap_or(0);
                 log::warn!(
-                    "HLE dispatch enter service={} cmd={} tipc={}",
+                    "HLE dispatch enter tid={} service={} cmd={} tipc={}",
+                    tid,
                     handler.service_name(),
                     context.get_command(),
                     context.is_tipc()
@@ -456,10 +462,7 @@ impl HLERequestContext {
     /// Create a context with thread/memory access, matching upstream constructor.
     ///
     /// Upstream: `HLERequestContext(KernelCore&, Memory&, KServerSession*, KThread*)`
-    pub fn new_with_thread(
-        thread: Arc<KThreadLock>,
-        tls_address: u64,
-    ) -> Self {
+    pub fn new_with_thread(thread: Arc<KThreadLock>, tls_address: u64) -> Self {
         let memory = Self::owner_process_memory(&thread);
         Self {
             cmd_buf: [0u32; ipc::COMMAND_BUFFER_LENGTH],
@@ -536,9 +539,7 @@ impl HLERequestContext {
     /// Returns the requesting thread.
     ///
     /// Matches upstream ownership where `HLERequestContext` carries `KThread* thread`.
-    pub fn get_thread(
-        &self,
-    ) -> Option<Arc<KThreadLock>> {
+    pub fn get_thread(&self) -> Option<Arc<KThreadLock>> {
         self.thread.clone()
     }
 
@@ -837,9 +838,7 @@ impl HLERequestContext {
         handle
     }
 
-    pub fn owner_process_arc(
-        &self,
-    ) -> Option<Arc<crate::hle::kernel::k_process::ProcessLock>> {
+    pub fn owner_process_arc(&self) -> Option<Arc<crate::hle::kernel::k_process::ProcessLock>> {
         let thread = self.thread.as_ref()?;
         let thread_guard = thread.lock().unwrap();
         thread_guard.parent.as_ref()?.upgrade()

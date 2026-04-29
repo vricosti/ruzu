@@ -64,6 +64,84 @@ use crate::hle::kernel::svc::svc_results;
 use crate::hle::kernel::svc::svc_results::RESULT_INVALID_STATE;
 use crate::hle::result::RESULT_SUCCESS;
 
+const MT19937_STATE_WORDS: usize = 624;
+const MT19937_PERIOD: usize = 397;
+const MT19937_MATRIX_A: u32 = 0x9908_B0DF;
+const MT19937_UPPER_MASK: u32 = 0x8000_0000;
+const MT19937_LOWER_MASK: u32 = 0x7FFF_FFFF;
+
+struct Mt19937 {
+    state: [u32; MT19937_STATE_WORDS],
+    index: usize,
+}
+
+impl Mt19937 {
+    fn new(seed: u32) -> Self {
+        let mut state = [0u32; MT19937_STATE_WORDS];
+        state[0] = seed;
+        for i in 1..MT19937_STATE_WORDS {
+            let prev = state[i - 1];
+            state[i] = 1_812_433_253u32
+                .wrapping_mul(prev ^ (prev >> 30))
+                .wrapping_add(i as u32);
+        }
+        Self {
+            state,
+            index: MT19937_STATE_WORDS,
+        }
+    }
+
+    fn next_u32(&mut self) -> u32 {
+        if self.index >= MT19937_STATE_WORDS {
+            self.twist();
+        }
+
+        let mut y = self.state[self.index];
+        self.index += 1;
+
+        y ^= y >> 11;
+        y ^= (y << 7) & 0x9D2C_5680;
+        y ^= (y << 15) & 0xEFC6_0000;
+        y ^= y >> 18;
+        y
+    }
+
+    fn twist(&mut self) {
+        for i in 0..MT19937_STATE_WORDS {
+            let x = (self.state[i] & MT19937_UPPER_MASK)
+                | (self.state[(i + 1) % MT19937_STATE_WORDS] & MT19937_LOWER_MASK);
+            let mut x_a = x >> 1;
+            if x & 1 != 0 {
+                x_a ^= MT19937_MATRIX_A;
+            }
+            self.state[i] = self.state[(i + MT19937_PERIOD) % MT19937_STATE_WORDS] ^ x_a;
+        }
+        self.index = 0;
+    }
+}
+
+fn generate_random_with_seed(seed: u32, out_random: &mut [u64]) {
+    let mut rng = Mt19937::new(seed);
+    for value in out_random.iter_mut() {
+        *value = ((rng.next_u32() as u64) << 32) | (rng.next_u32() as u64);
+    }
+}
+
+fn generate_random(out_random: &mut [u64]) {
+    let settings = common::settings::values();
+    let seed = if *settings.rng_seed_enabled.get_value() {
+        *settings.rng_seed.get_value()
+    } else {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as u32
+    };
+    drop(settings);
+
+    generate_random_with_seed(seed, out_random);
+}
+
 // ---------------------------------------------------------------------------
 // SharedProcessMemory — shared guest memory backing
 // ---------------------------------------------------------------------------
@@ -547,24 +625,7 @@ impl KProcess {
             state: ProcessState::default(),
             cond_var: KConditionVariable::new(),
             global_scheduler_context: None,
-            entropy: {
-                // Upstream: KProcess initializes entropy with random values
-                // from KSystemControl::GenerateRandomRange. We use std random.
-                use std::collections::hash_map::DefaultHasher;
-                use std::hash::{Hash, Hasher};
-                let mut e = [0u64; 4];
-                for (i, val) in e.iter_mut().enumerate() {
-                    let mut hasher = DefaultHasher::new();
-                    (i as u64).hash(&mut hasher);
-                    std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_nanos()
-                        .hash(&mut hasher);
-                    *val = hasher.finish();
-                }
-                e
-            },
+            entropy: [0u64; 4],
             is_signaled: false,
             is_initialized: false,
             is_application: false,
@@ -1176,8 +1237,7 @@ impl KProcess {
         value: i32,
         count: i32,
     ) -> u32 {
-        let arbiter_ptr: *mut super::k_address_arbiter::KAddressArbiter =
-            &mut self.address_arbiter;
+        let arbiter_ptr: *mut super::k_address_arbiter::KAddressArbiter = &mut self.address_arbiter;
         // SAFETY: arbiter_ptr is a field of `self`; `&mut self` guarantees
         // exclusive access while we hold it. The arbiter never stores this
         // pointer long-term — it uses it only to call methods that take
@@ -1872,21 +1932,8 @@ impl KProcess {
             self.max_process_memory = self.page_table.get_heap_region_size();
         }
 
-        // Generate random entropy.
-        {
-            use std::collections::hash_map::DefaultHasher;
-            use std::hash::{Hash, Hasher};
-            for (i, val) in self.entropy.iter_mut().enumerate() {
-                let mut hasher = DefaultHasher::new();
-                (i as u64).hash(&mut hasher);
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_nanos()
-                    .hash(&mut hasher);
-                *val = hasher.finish();
-            }
-        }
+        // Upstream: GenerateRandom(m_entropy);
+        generate_random(&mut self.entropy);
 
         // Clear remaining fields.
         self.num_running_threads
@@ -3432,5 +3479,66 @@ mod tests {
             super::super::k_thread::ThreadState::TERMINATED
         );
         assert!(!current.lock().unwrap().is_termination_requested());
+    }
+
+    #[test]
+    fn mt19937_matches_reference_sequence() {
+        let mut rng = Mt19937::new(5489);
+        assert_eq!(rng.next_u32(), 3_499_211_612);
+        assert_eq!(rng.next_u32(), 581_869_302);
+        assert_eq!(rng.next_u32(), 3_890_346_734);
+        assert_eq!(rng.next_u32(), 3_586_334_585);
+        assert_eq!(rng.next_u32(), 545_404_204);
+    }
+
+    #[test]
+    fn generate_random_with_seed_matches_local_cpp_mt19937_distribution() {
+        let mut entropy = [0u64; 4];
+        generate_random_with_seed(0x1234_5678, &mut entropy);
+        assert_eq!(
+            entropy,
+            [
+                0xC697_9343_0962_D2FA,
+                0xA73A_24A4_E118_A180,
+                0xB547_5ABB_6461_3C7C,
+                0x6F32_F4DB_F27B_F199,
+            ]
+        );
+    }
+
+    #[test]
+    fn initialize_uses_seeded_random_entropy_setting() {
+        static SETTINGS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = SETTINGS_LOCK.lock().unwrap();
+
+        let (old_enabled, old_seed) = {
+            let values = common::settings::values();
+            (
+                *values.rng_seed_enabled.get_value(),
+                *values.rng_seed.get_value(),
+            )
+        };
+
+        {
+            let mut values = common::settings::values_mut();
+            values.rng_seed_enabled.set_value(true);
+            values.rng_seed.set_value(0x1234_5678);
+        }
+
+        let mut first = KProcess::new();
+        let mut second = KProcess::new();
+        let result_first = first.initialize(b"test", 0, 0, 0, 0, 0, None, false);
+        let result_second = second.initialize(b"test", 0, 0, 0, 0, 0, None, false);
+
+        {
+            let mut values = common::settings::values_mut();
+            values.rng_seed_enabled.set_value(old_enabled);
+            values.rng_seed.set_value(old_seed);
+        }
+
+        assert_eq!(result_first, RESULT_SUCCESS.get_inner_value());
+        assert_eq!(result_second, RESULT_SUCCESS.get_inner_value());
+        assert_eq!(first.entropy, second.entropy);
+        assert_ne!(first.entropy, [0u64; 4]);
     }
 }

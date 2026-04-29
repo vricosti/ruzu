@@ -235,7 +235,10 @@ impl Host1x {
                 return;
             }
         };
-        let pusher = Arc::new(CDmaPusher::new(self.syncpoint_manager.clone(), class_id as i32));
+        let pusher = Arc::new(CDmaPusher::new(
+            self.syncpoint_manager.clone(),
+            class_id as i32,
+        ));
         self.devices.lock().unwrap().insert(fd, pusher);
         log::info!("Started {:?} device fd={}", channel_type, fd);
     }

@@ -208,10 +208,7 @@ pub fn decode_from_wave_buffers(args: DecodeFromWaveBuffersArgs<'_>) {
             let real_decode = std::env::var_os("RUZU_AUDIO_REAL_DECODE").is_some();
             let buffer_is_guest = decode_arg.buffer != 0 && decode_arg.buffer < 0x1_0000_0000;
             let translation_unavailable = crate::GUEST_MEMORY_ACCESSOR.get().is_none();
-            let samples_decoded = if !real_decode
-                && buffer_is_guest
-                && translation_unavailable
-            {
+            let samples_decoded = if !real_decode && buffer_is_guest && translation_unavailable {
                 let avail = (TEMP_BUFFER_SIZE - temp_buffer_pos) as u32;
                 decode_arg.samples_to_read.min(avail)
             } else {

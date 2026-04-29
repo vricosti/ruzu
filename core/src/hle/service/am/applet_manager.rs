@@ -13,8 +13,8 @@ use super::applet_data_broker::AppletDataBroker;
 use super::window_system::WindowSystem;
 use crate::core::SystemRef;
 use crate::hle::kernel::k_process::KProcess;
-use crate::hle::service::os::process::Process;
 use crate::hle::kernel::k_process::ProcessLock;
+use crate::hle::service::os::process::Process;
 
 // ---------------------------------------------------------------------------
 // Upstream anonymous-namespace constant and struct

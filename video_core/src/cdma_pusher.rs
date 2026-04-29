@@ -309,10 +309,7 @@ impl CDmaPusher {
                 self.execute_command(state.method_offset, data);
             }
             ChSubmissionMode::Restart | ChSubmissionMode::Gather => {
-                log::error!(
-                    "CDmaPusher: ChSubmissionMode {:?} is not implemented",
-                    mode
-                );
+                log::error!("CDmaPusher: ChSubmissionMode {:?} is not implemented", mode);
             }
         }
     }
@@ -363,7 +360,10 @@ impl CDmaPusher {
                             method_0,
                             arg
                         );
-                        self.process_method.lock().unwrap().process_method(method_0, arg);
+                        self.process_method
+                            .lock()
+                            .unwrap()
+                            .process_method(method_0, arg);
                     }
                     _ => {}
                 }

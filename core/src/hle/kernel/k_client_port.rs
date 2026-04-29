@@ -11,13 +11,13 @@
 use std::sync::atomic::{AtomicI32, Ordering};
 
 use super::k_process::KProcess;
+use super::k_process::ProcessLock;
 use super::k_resource_limit::LimitableResource;
 use super::k_scoped_resource_reservation::KScopedResourceReservation;
 use super::k_session::KSession;
 use super::kernel::KernelCore;
 use super::svc::svc_results::{RESULT_LIMIT_REACHED, RESULT_OUT_OF_SESSIONS};
 use crate::hle::result::ResultCode;
-use super::k_process::ProcessLock;
 
 /// The client port object.
 ///

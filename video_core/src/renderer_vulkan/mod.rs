@@ -20,7 +20,7 @@
 //! - [`BufferCache`] — vertex/index/uniform buffer management
 //! - [`TextureCache`] — image/view/sampler/framebuffer management
 
-use crate::query_cache::types::QueryPropertiesFlags;
+use crate::query_cache::types::{QueryPropertiesFlags, QueryType};
 
 pub mod blit_image;
 pub mod blit_screen;
@@ -61,17 +61,19 @@ use ash::vk;
 use log::{debug, info, trace, warn};
 use thiserror::Error;
 
+use crate::control::channel_state_cache::{ChannelInfo, ChannelSetupCaches};
 use crate::engines::maxwell_3d::{
     BlendEquation, BlendFactor, ComparisonOp, CullFace, DrawCall, FrontFace, PrimitiveTopology,
 };
 use crate::engines::Framebuffer;
 use crate::rasterizer_interface::{RasterizerDownloadArea, RasterizerInterface};
 use crate::syncpoint::SyncpointManager;
-use shader_recompiler::{PipelineCache, Profile};
+use shader_recompiler::{PipelineCache as ShaderPipelineCache, Profile};
 
 use buffer_cache::BufferCache;
 use descriptor_pool::DescriptorPool;
-use graphics_pipeline::GraphicsPipelineCache;
+use pipeline_cache::PipelineCache as VulkanPipelineCache;
+use query_cache::QueryCache as VulkanQueryCache;
 use render_pass_cache::RenderPassCache;
 use scheduler::Scheduler;
 use staging_buffer_pool::StagingBufferPool;
@@ -111,6 +113,7 @@ pub struct RasterizerVulkan {
     instance: ash::Instance,
     physical_device: vk::PhysicalDevice,
     syncpoints: Arc<SyncpointManager>,
+    channel_caches: ChannelSetupCaches<ChannelInfo>,
 
     // Sub-components (matching zuyu's architecture)
     scheduler: Scheduler,
@@ -119,9 +122,10 @@ pub struct RasterizerVulkan {
     descriptor_pool: DescriptorPool,
     desc_queue: UpdateDescriptorQueue,
     render_pass_cache: RenderPassCache,
-    pipeline_cache: GraphicsPipelineCache,
+    pipeline_cache: VulkanPipelineCache,
     buffer_cache: BufferCache,
     texture_cache: TextureCache,
+    query_cache: VulkanQueryCache,
 
     // Default render pass for the offscreen framebuffer
     default_render_pass: vk::RenderPass,
@@ -145,8 +149,6 @@ pub struct RasterizerVulkan {
 
     // Draw counter for periodic flush (zuyu: 7 draws → dispatch, 4096 → flush)
     draw_counter: u32,
-    guest_memory_writer: Option<crate::renderer_base::GuestMemoryWriter>,
-    gpu_ticks_getter: Option<crate::renderer_base::GpuTicksGetter>,
 }
 
 // Raw pointers are only used for mapped memory
@@ -210,10 +212,10 @@ impl RasterizerVulkan {
 
         // Create shader recompiler pipeline cache
         let profile = Profile::default();
-        let shader_cache = PipelineCache::new(profile);
+        let shader_cache = ShaderPipelineCache::new(profile);
 
-        // Create graphics pipeline cache
-        let pipeline_cache = GraphicsPipelineCache::new(device.clone(), shader_cache);
+        // Create pipeline cache owner
+        let pipeline_cache = VulkanPipelineCache::new(device.clone(), false, false, shader_cache);
 
         // Create buffer cache
         let buffer_cache = BufferCache::new(device.clone(), instance.clone(), physical_device)
@@ -221,6 +223,9 @@ impl RasterizerVulkan {
 
         // Create texture cache
         let texture_cache = TextureCache::new(device.clone(), instance.clone(), physical_device);
+
+        // Create query cache
+        let query_cache = VulkanQueryCache::new();
 
         // Create default render pass
         let default_render_pass = create_default_render_pass(&device)?;
@@ -255,6 +260,7 @@ impl RasterizerVulkan {
             instance,
             physical_device,
             syncpoints,
+            channel_caches: ChannelSetupCaches::new(),
             scheduler,
             state_tracker,
             staging_pool,
@@ -264,6 +270,7 @@ impl RasterizerVulkan {
             pipeline_cache,
             buffer_cache,
             texture_cache,
+            query_cache,
             default_render_pass,
             offscreen_image,
             offscreen_memory,
@@ -279,9 +286,17 @@ impl RasterizerVulkan {
             readback_mapped,
             readback_size,
             draw_counter: 0,
-            guest_memory_writer: None,
-            gpu_ticks_getter: None,
         })
+    }
+
+    /// Wire the GPU tick source into the Vulkan query-cache owner.
+    ///
+    /// Port of the Vulkan rasterizer-side query-cache wiring edge. The active
+    /// runtime Vulkan owner still lacks the full upstream `RendererBase`
+    /// plumbing, but the query-cache ownership belongs here rather than in a
+    /// local query shortcut.
+    pub fn set_gpu_ticks_getter(&mut self, getter: crate::renderer_base::GpuTicksGetter) {
+        self.query_cache.set_gpu_ticks_getter(getter);
     }
 
     /// Main draw entry point — process a single draw call.
@@ -295,7 +310,7 @@ impl RasterizerVulkan {
         // 2. Compile or lookup cached pipeline
         let pipeline_result =
             self.pipeline_cache
-                .get_or_compile(draw, self.default_render_pass, read_gpu);
+                .current_graphics_pipeline(draw, self.default_render_pass, read_gpu);
         let (pipeline, pipeline_layout) = match pipeline_result {
             Some((gp, _fixed_state)) => (gp.pipeline, gp.pipeline_layout),
             None => {
@@ -801,7 +816,16 @@ impl RasterizerInterface for RasterizerVulkan {
         debug!("RasterizerVulkan::dispatch_compute");
     }
 
-    fn reset_counter(&mut self, _query_type: u32) {}
+    fn reset_counter(&mut self, query_type: u32) {
+        if query_type != QueryType::ZPassPixelCount64 as u32 {
+            debug!(
+                "RasterizerVulkan::reset_counter unimplemented counter reset={}",
+                query_type
+            );
+            return;
+        }
+        self.query_cache.reset_counter(query_type);
+    }
 
     fn query(
         &mut self,
@@ -811,21 +835,14 @@ impl RasterizerInterface for RasterizerVulkan {
         payload: u32,
         _subreport: u32,
     ) {
-        let Some(gpu_write) = self.guest_memory_writer.as_ref().cloned() else {
-            return;
-        };
-        let has_timeout = flags.contains(QueryPropertiesFlags::HAS_TIMEOUT);
-        if has_timeout {
-            let gpu_ticks = self
-                .gpu_ticks_getter
-                .as_ref()
-                .map(|getter| getter())
-                .unwrap_or(0);
-            gpu_write(gpu_addr + 8, &gpu_ticks.to_le_bytes());
-            gpu_write(gpu_addr, &(payload as u64).to_le_bytes());
-        } else {
-            gpu_write(gpu_addr, &payload.to_le_bytes());
-        }
+        let this = self as *mut Self;
+        self.query_cache.query(
+            gpu_addr,
+            flags,
+            payload,
+            move |func| unsafe { (*this).signal_fence(func) },
+            move |func| unsafe { (*this).sync_operation(func) },
+        );
     }
 
     fn bind_graphics_uniform_buffer(
@@ -912,6 +929,33 @@ impl RasterizerInterface for RasterizerVulkan {
         self.state_tracker.invalidate_command_buffer_state();
         self.staging_pool.new_frame();
         self.descriptor_pool.reset_pools();
+    }
+
+    fn initialize_channel(&mut self, channel: &crate::control::channel_state::ChannelState) {
+        self.channel_caches.create_channel(channel);
+        self.texture_cache.create_channel(channel);
+        self.buffer_cache.create_channel(channel);
+        self.pipeline_cache.create_channel(channel);
+        self.query_cache.create_channel(channel);
+        self.state_tracker.setup_tables(channel);
+    }
+
+    fn bind_channel(&mut self, channel: &crate::control::channel_state::ChannelState) {
+        self.channel_caches.bind_to_channel(channel.bind_id);
+        self.texture_cache.bind_to_channel(channel.bind_id);
+        self.buffer_cache.bind_to_channel(channel.bind_id);
+        self.pipeline_cache.bind_to_channel(channel.bind_id);
+        self.query_cache.bind_to_channel(channel.bind_id);
+        self.state_tracker.change_channel(channel);
+        self.state_tracker.invalidate_state();
+    }
+
+    fn release_channel(&mut self, channel_id: i32) {
+        self.channel_caches.erase_channel(channel_id);
+        self.texture_cache.erase_channel(channel_id);
+        self.buffer_cache.erase_channel(channel_id);
+        self.pipeline_cache.erase_channel(channel_id);
+        self.query_cache.erase_channel(channel_id);
     }
 
     fn accelerate_surface_copy(&mut self) -> bool {

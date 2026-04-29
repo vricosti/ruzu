@@ -77,7 +77,11 @@ impl SurfaceFlinger {
         log::info!(
             "[SF_ADD_DISPLAY] display_id={} existing_displays={:?}",
             display_id,
-            inner.displays.iter().map(|d| (d.id, d.stack.layers.len())).collect::<Vec<_>>()
+            inner
+                .displays
+                .iter()
+                .map(|d| (d.id, d.stack.layers.len()))
+                .collect::<Vec<_>>()
         );
         inner.displays.push(Display::new(display_id));
     }
@@ -87,7 +91,11 @@ impl SurfaceFlinger {
         log::info!(
             "[SF_REMOVE_DISPLAY] display_id={} existing_displays={:?}",
             display_id,
-            inner.displays.iter().map(|d| (d.id, d.stack.layers.len())).collect::<Vec<_>>()
+            inner
+                .displays
+                .iter()
+                .map(|d| (d.id, d.stack.layers.len()))
+                .collect::<Vec<_>>()
         );
         inner.displays.retain(|display| display.id != display_id);
     }
@@ -116,7 +124,9 @@ impl SurfaceFlinger {
             if c < 8 || c.is_power_of_two() {
                 log::info!(
                     "[SF_COMPOSE] #{} NO_LAYERS display_id={} display_layers_count={}",
-                    n, display_id, display.stack.layers.len()
+                    n,
+                    display_id,
+                    display.stack.layers.len()
                 );
             }
             return false;
@@ -124,7 +134,9 @@ impl SurfaceFlinger {
         if n < 8 || n.is_power_of_two() {
             log::info!(
                 "[SF_COMPOSE] #{} COMPOSING display_id={} layers={}",
-                n, display_id, display.stack.layers.len()
+                n,
+                display_id,
+                display.stack.layers.len()
             );
         }
 
@@ -181,14 +193,16 @@ impl SurfaceFlinger {
         let Some(display) = Self::find_display_mut(&mut inner.displays, display_id) else {
             log::info!(
                 "[SF_ADD_LAYER] NO_DISPLAY display_id={} consumer_id={}",
-                display_id, consumer_binder_id
+                display_id,
+                consumer_binder_id
             );
             return;
         };
         let Some(layer) = layer else {
             log::info!(
                 "[SF_ADD_LAYER] NO_LAYER display_id={} consumer_id={}",
-                display_id, consumer_binder_id
+                display_id,
+                consumer_binder_id
             );
             return;
         };

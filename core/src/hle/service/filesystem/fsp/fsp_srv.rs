@@ -499,8 +499,8 @@ impl FspSrv {
             title_id,
             storage_id as u8,
         );
-        let nca = controller
-            .and_then(|c| c.open_base_nca(title_id, storage_id, ContentRecordType::Data));
+        let nca =
+            controller.and_then(|c| c.open_base_nca(title_id, storage_id, ContentRecordType::Data));
         log::info!(
             "FspSrv::OpenDataStorageByDataId trace: nca_present={}",
             nca.is_some()

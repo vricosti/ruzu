@@ -8,6 +8,7 @@ use std::sync::{Arc, Mutex, Weak};
 use crate::core::{AudioInBufferWire, AudioInSession};
 use crate::hle::kernel::k_event::KEvent;
 use crate::hle::kernel::k_process::KProcess;
+use crate::hle::kernel::k_process::ProcessLock;
 use crate::hle::kernel::k_readable_event::KReadableEvent;
 use crate::hle::kernel::kernel::KernelCore;
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
@@ -17,7 +18,6 @@ use crate::hle::service::cmif_serialization::{
 use crate::hle::service::cmif_types::{buffer_attr, InArray, OutArray};
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
 use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
-use crate::hle::kernel::k_process::ProcessLock;
 
 /// IPC command table for IAudioIn:
 ///

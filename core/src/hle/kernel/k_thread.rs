@@ -33,8 +33,8 @@ use crate::hle::kernel::svc::svc_results::{
 use crate::hle::result::RESULT_SUCCESS;
 // RBEntry kept for structural parity with upstream m_condvar_arbiter_tree_node.
 // Currently unused: we use BTreeSet externally instead of an intrusive tree.
-use common::tree::RBEntry;
 use super::k_process::ProcessLock;
+use common::tree::RBEntry;
 
 // Step 5b of the upstream-faithful sync refactor: KThread storage moves
 // from `Arc<KThreadLock>` to `Arc<KThreadLock>` where
@@ -50,7 +50,10 @@ use super::k_process::ProcessLock;
 // ProcessLock swap: `pub type ProcessLock = SyncCell<KProcess>`.
 pub type KThreadLock = super::sync_cell::KThreadCell;
 
-pub(crate) fn deadline_from_timeout_tick(timeout_tick: i64, current_tick: Option<i64>) -> Option<Instant> {
+pub(crate) fn deadline_from_timeout_tick(
+    timeout_tick: i64,
+    current_tick: Option<i64>,
+) -> Option<Instant> {
     if timeout_tick <= 0 {
         return None;
     }
@@ -1473,9 +1476,7 @@ impl KThread {
             return;
         }
         let Some(wait_queue) = self.wait_queue.clone() else {
-            log::error!(
-                "complete_synchronization_wait: wait_queue is None while state=Waiting"
-            );
+            log::error!("complete_synchronization_wait: wait_queue is None while state=Waiting");
             return;
         };
         self.clear_cancellable();
@@ -1501,8 +1502,7 @@ impl KThread {
                 if state_ptr.is_null() {
                     continue;
                 }
-                let node_ptr =
-                    &mut ctx.nodes[i] as *mut k_synchronization_object::ThreadListNode;
+                let node_ptr = &mut ctx.nodes[i] as *mut k_synchronization_object::ThreadListNode;
                 (*state_ptr).unlink_node(node_ptr);
             }
             ctx.clear();

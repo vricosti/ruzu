@@ -13,10 +13,10 @@ use common::fiber::Fiber;
 
 use super::k_priority_queue::KPriorityQueue;
 use super::k_process::KProcess;
+use super::k_process::ProcessLock;
 use super::k_thread::KThread;
 use super::k_thread::KThreadLock;
 use super::k_thread::ThreadState;
-use super::k_process::ProcessLock;
 
 /// Scheduling state held per-core.
 /// Matches upstream `KScheduler::SchedulingState` (k_scheduler.h).
@@ -1278,10 +1278,7 @@ impl KScheduler {
         woke_any
     }
 
-    pub fn wake_signaled_synchronization_threads(
-        &mut self,
-        process: &Arc<ProcessLock>,
-    ) -> bool {
+    pub fn wake_signaled_synchronization_threads(&mut self, process: &Arc<ProcessLock>) -> bool {
         let mut process = process.lock().unwrap();
         let mut woke_any = false;
         let mut woke_ids = Vec::new();
@@ -1305,9 +1302,7 @@ impl KScheduler {
                 .object_ids()
                 .iter()
                 .position(|&oid| {
-                    crate::hle::kernel::k_synchronization_object::is_object_signaled(
-                        &process, oid,
-                    )
+                    crate::hle::kernel::k_synchronization_object::is_object_signaled(&process, oid)
                 })
                 .map(|i| i as i32)
             else {

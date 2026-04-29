@@ -7,10 +7,10 @@
 use std::sync::{Arc, Mutex};
 
 use super::k_process::KProcess;
+use super::k_process::ProcessLock;
 use super::k_scheduler::KScheduler;
 use super::k_scheduler_lock::KScopedSchedulerLock;
 use crate::hle::result::RESULT_SUCCESS;
-use super::k_process::ProcessLock;
 
 /// The kernel event object.
 /// Matches upstream `KEvent` class (k_event.h).
@@ -184,19 +184,13 @@ mod tests {
         readable.lock().unwrap().initialize(event_id, readable_id);
         process.register_readable_event_object(readable_id, Arc::clone(&readable));
 
-        assert_eq!(
-            event.signal(&process),
-            RESULT_SUCCESS.get_inner_value()
-        );
+        assert_eq!(event.signal(&process), RESULT_SUCCESS.get_inner_value());
         assert!(readable.lock().unwrap().is_signaled());
 
         assert_eq!(event.clear(&process), RESULT_SUCCESS.get_inner_value());
         assert!(!readable.lock().unwrap().is_signaled());
 
-        assert_eq!(
-            event.signal(&process),
-            RESULT_SUCCESS.get_inner_value()
-        );
+        assert_eq!(event.signal(&process), RESULT_SUCCESS.get_inner_value());
         assert!(readable.lock().unwrap().is_signaled());
     }
 }

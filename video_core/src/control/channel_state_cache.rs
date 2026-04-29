@@ -13,10 +13,12 @@
 //! expressed as a generic struct with an `impl<P>` block.
 
 use std::collections::{HashMap, VecDeque};
+use std::sync::Arc;
 
 use parking_lot::Mutex;
 
 use super::channel_state::ChannelState;
+use crate::memory_manager::MemoryManager;
 
 // ---------------------------------------------------------------------------
 // ChannelInfo — non-generic, corresponds to VideoCommon::ChannelInfo
@@ -25,18 +27,25 @@ use super::channel_state::ChannelState;
 /// Snapshot of a channel's key references, taken at channel creation time.
 ///
 /// Corresponds to `VideoCommon::ChannelInfo` (channel_state_cache.h).
-/// The C++ version holds raw references; here we store indices / IDs that
-/// can be resolved through the owning `ChannelState`.
+/// The C++ version holds live references; here we preserve the same owner
+/// boundary by storing channel-bound references in forms the Rust runtime can
+/// safely carry across backend owners.
 pub struct ChannelInfo {
-    /// Index into the owning `ChannelState`'s Maxwell3D engine.
+    /// Channel-bound 3D engine reference.
+    ///
     /// Upstream: `Tegra::Engines::Maxwell3D& maxwell3d`.
-    pub maxwell3d_index: usize,
-    /// Index into the owning `ChannelState`'s KeplerCompute engine.
+    pub maxwell3d: usize,
+    /// Channel-bound compute engine reference.
+    ///
     /// Upstream: `Tegra::Engines::KeplerCompute& kepler_compute`.
-    pub kepler_compute_index: usize,
+    pub kepler_compute: usize,
     /// Index into the owning `ChannelState`'s GPU memory manager.
     /// Upstream: `Tegra::MemoryManager& gpu_memory`.
     pub gpu_memory_index: usize,
+    /// Channel-bound GPU memory manager reference.
+    ///
+    /// Upstream: `Tegra::MemoryManager& gpu_memory`.
+    pub gpu_memory: Option<Arc<Mutex<MemoryManager>>>,
     /// Program ID copied from the channel state.
     pub program_id: u64,
 }
@@ -49,10 +58,24 @@ impl ChannelInfo {
         // Upstream dereferences the unique_ptrs; we capture indices/IDs for
         // later resolution.  When real engine types exist these will hold
         // proper references or Arc handles.
+        let gpu_memory = channel_state.memory_manager.as_ref().map(Arc::clone);
+        let gpu_memory_index = gpu_memory
+            .as_ref()
+            .map(|memory_manager| memory_manager.lock().get_id())
+            .unwrap_or(0);
         Self {
-            maxwell3d_index: 0,      // placeholder
-            kepler_compute_index: 0, // placeholder
-            gpu_memory_index: 0,     // placeholder
+            maxwell3d: channel_state
+                .maxwell_3d
+                .as_ref()
+                .map(|engine| (&**engine as *const _) as usize)
+                .unwrap_or(0),
+            kepler_compute: channel_state
+                .kepler_compute
+                .as_ref()
+                .map(|engine| (&**engine as *const _) as usize)
+                .unwrap_or(0),
+            gpu_memory_index,
+            gpu_memory,
             program_id: channel_state.program_id,
         }
     }
@@ -97,11 +120,11 @@ pub struct ChannelSetupCaches<P> {
     current_channel_id: usize,
     current_address_space: usize,
 
-    /// Cached Maxwell3D index for the currently bound channel.
+    /// Cached Maxwell3D owner for the currently bound channel.
     pub maxwell3d: Option<usize>,
-    /// Cached KeplerCompute index for the currently bound channel.
+    /// Cached KeplerCompute owner for the currently bound channel.
     pub kepler_compute: Option<usize>,
-    /// Cached GPU memory ID for the currently bound channel.
+    /// Cached GPU memory owner for the currently bound channel.
     pub gpu_memory: Option<usize>,
     /// Program ID of the currently bound channel.
     pub program_id: u64,
@@ -268,6 +291,11 @@ impl<P> ChannelSetupCaches<P> {
         self.address_spaces.get(&id).map(|r| r.storage_id)
     }
 
+    pub fn current_channel_state(&self) -> Option<&P> {
+        let channel_state = self.channel_state?;
+        self.channel_storage.get(channel_state)
+    }
+
     /// Hook called when a new GPU address space is registered.
     ///
     /// Corresponds to `ChannelSetupCaches<P>::OnGPUASRegister`.
@@ -303,6 +331,7 @@ pub trait ChannelCacheAccessor {
     fn maxwell3d_ref(&self) -> usize;
     fn kepler_compute_ref(&self) -> usize;
     fn gpu_memory_ref(&self) -> usize;
+    fn gpu_memory_arc(&self) -> Option<Arc<Mutex<MemoryManager>>>;
     fn program_id_val(&self) -> u64;
 }
 
@@ -318,15 +347,19 @@ impl FromChannelState for ChannelInfo {
 
 impl ChannelCacheAccessor for ChannelInfo {
     fn maxwell3d_ref(&self) -> usize {
-        self.maxwell3d_index
+        self.maxwell3d
     }
 
     fn kepler_compute_ref(&self) -> usize {
-        self.kepler_compute_index
+        self.kepler_compute
     }
 
     fn gpu_memory_ref(&self) -> usize {
         self.gpu_memory_index
+    }
+
+    fn gpu_memory_arc(&self) -> Option<Arc<Mutex<MemoryManager>>> {
+        self.gpu_memory.as_ref().map(Arc::clone)
     }
 
     fn program_id_val(&self) -> u64 {
@@ -389,5 +422,32 @@ mod tests {
 
         assert_eq!(caches.program_id, 0xABCD);
         assert!(caches.channel_state.is_some());
+        let bound = caches
+            .current_channel_state()
+            .and_then(ChannelCacheAccessor::gpu_memory_arc)
+            .expect("bound gpu memory");
+        assert_eq!(bound.lock().get_id(), 42);
+    }
+
+    #[test]
+    fn test_channel_info_captures_live_engine_addresses() {
+        use crate::engines::kepler_compute::KeplerCompute;
+        use crate::engines::maxwell_3d::Maxwell3D;
+        use crate::memory_manager::MemoryManager;
+        use parking_lot::Mutex;
+        use std::sync::Arc;
+
+        let mm = Arc::new(Mutex::new(MemoryManager::new(77)));
+        let mut cs = ChannelState::new(11);
+        cs.program_id = 0xCAFE;
+        cs.memory_manager = Some(Arc::clone(&mm));
+        cs.maxwell_3d = Some(Box::new(Maxwell3D::new()));
+        cs.kepler_compute = Some(Box::new(KeplerCompute::new(Arc::clone(&mm))));
+
+        let info = ChannelInfo::from_channel_state(&cs);
+        assert_ne!(info.maxwell3d, 0);
+        assert_ne!(info.kepler_compute, 0);
+        assert_eq!(info.gpu_memory_index, 77);
+        assert_eq!(info.program_id, 0xCAFE);
     }
 }

@@ -9,12 +9,12 @@ use std::sync::{Arc, Mutex, Weak};
 
 use crate::hle::kernel::k_event::KEvent;
 use crate::hle::kernel::k_process::KProcess;
+use crate::hle::kernel::k_process::ProcessLock;
 use crate::hle::kernel::k_readable_event::KReadableEvent;
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
 use crate::hle::service::ipc_helpers::{RequestParser, ResponseBuilder};
 use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
-use crate::hle::kernel::k_process::ProcessLock;
 
 /// IPC command table for ILockAccessor:
 /// - 1: TryLock

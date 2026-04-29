@@ -30,11 +30,11 @@ use crate::hle::service::sm::sm::ServiceManager;
 use crate::memory::memory::Memory;
 use crate::perf_stats::{PerfStats, PerfStatsResults, SpeedLimiter};
 
+use crate::hle::kernel::k_process::ProcessLock;
 use parking_lot::Mutex;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
-use crate::hle::kernel::k_process::ProcessLock;
 
 /// Enumeration representing the return values of the System Initialize and Load process.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -234,10 +234,8 @@ pub struct AudioInSession {
         *const (),
         std::sync::Arc<std::sync::Mutex<crate::hle::kernel::k_readable_event::KReadableEvent>>,
     ),
-    set_process_arc_fn: unsafe fn(
-        *const (),
-        std::sync::Arc<crate::hle::kernel::k_process::ProcessLock>,
-    ),
+    set_process_arc_fn:
+        unsafe fn(*const (), std::sync::Arc<crate::hle::kernel::k_process::ProcessLock>),
 }
 
 impl AudioInSession {
@@ -1698,10 +1696,7 @@ impl System {
     /// # Safety
     /// Must only be called during process setup, before CPU threads are released
     /// past the GPU barrier. This ensures exclusive access to kernel state.
-    pub fn register_application_thread(
-        &self,
-        main_thread: Arc<KThreadLock>,
-    ) {
+    pub fn register_application_thread(&self, main_thread: Arc<KThreadLock>) {
         let thread_id = main_thread.lock().unwrap().get_thread_id();
         log::info!(
             "register_application_thread: called, thread_id={}",
@@ -1830,10 +1825,7 @@ impl System {
     // ── Runtime SVC state setters ──
 
     /// Set the Arc-wrapped current process for SVC dispatch.
-    pub fn set_current_process_arc(
-        &mut self,
-        p: Arc<ProcessLock>,
-    ) {
+    pub fn set_current_process_arc(&mut self, p: Arc<ProcessLock>) {
         self.current_process_arc = Some(p);
     }
 

@@ -76,12 +76,10 @@ pub fn handle_interrupt(kernel: &KernelCore, core_id: i32) {
                     // `KAbstractSchedulerLock` stored in the GSC, which
                     // outlives every KThread belonging to that kernel.
                     let _sl = if scheduler_lock_ptr != 0 {
-                        Some(super::k_scheduler_lock::KScopedSchedulerLock::new(
-                            unsafe {
-                                &*(scheduler_lock_ptr
-                                    as *const super::k_scheduler_lock::KAbstractSchedulerLock)
-                            },
-                        ))
+                        Some(super::k_scheduler_lock::KScopedSchedulerLock::new(unsafe {
+                            &*(scheduler_lock_ptr
+                                as *const super::k_scheduler_lock::KAbstractSchedulerLock)
+                        }))
                     } else {
                         None
                     };
@@ -89,11 +87,7 @@ pub fn handle_interrupt(kernel: &KernelCore, core_id: i32) {
                     // Upstream: process->PinCurrentThread();
                     {
                         let mut process = parent_arc.lock().unwrap();
-                        process.pin_current_thread(
-                            core_id,
-                            thread_id,
-                            is_termination_requested,
-                        );
+                        process.pin_current_thread(core_id, thread_id, is_termination_requested);
                     }
 
                     // Upstream: cur_thread->Pin(core_id)

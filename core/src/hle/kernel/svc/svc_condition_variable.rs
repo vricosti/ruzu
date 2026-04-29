@@ -20,20 +20,159 @@ fn should_trace_cv_backtrace_once(tid: u64) -> bool {
         std::sync::atomic::AtomicBool::new(false);
     static DID_TRACE_TID99: std::sync::atomic::AtomicBool =
         std::sync::atomic::AtomicBool::new(false);
-    static TID73_SIGNAL_COUNT: std::sync::atomic::AtomicU64 =
-        std::sync::atomic::AtomicU64::new(0);
     match tid {
         96 => !DID_TRACE_TID96.swap(true, std::sync::atomic::Ordering::Relaxed),
         98 => !DID_TRACE_TID98.swap(true, std::sync::atomic::Ordering::Relaxed),
         99 => !DID_TRACE_TID99.swap(true, std::sync::atomic::Ordering::Relaxed),
-        73 => {
-            let n = TID73_SIGNAL_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            // Post-MiiFix stall lands around ~198 signals. Capture the tail
-            // window to see the last game PC before tid=73 goes silent.
-            (190..=200).contains(&n)
-        }
         _ => false,
     }
+}
+
+/// Backtrace gate for `SignalProcessWideKey`. When `RUZU_TRACE_CV_BT_HEAP=1`,
+/// log a backtrace for every signal whose cv_key lives in the heap region
+/// (>= 0x40000000). The first ~50 such signals from tid=73 are the
+/// chain-wakeup call sites — analyzing those identifies the predicate
+/// that gates the producer-side "wake worker" path.
+///
+/// `RUZU_TRACE_CV_BT_AT=0xCV_KEY` captures backtrace+stack for a specific
+/// cv_key (max 5 hits). Used to identify the call site of producer-thread
+/// signals that hit no-waiter cv_keys (e.g., 0x22C17A4 in MK8D).
+fn should_trace_cv_backtrace_for_signal(tid: u64, cv_key: u64) -> bool {
+    if std::env::var_os("RUZU_TRACE_CV_BT_HEAP").is_some() && tid == 73 && cv_key >= 0x4000_0000 {
+        static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        return n < 50;
+    }
+    if let Ok(spec) = std::env::var("RUZU_TRACE_CV_BT_AT") {
+        if let Ok(target_cv) = u64::from_str_radix(spec.trim_start_matches("0x"), 16) {
+            if cv_key == target_cv {
+                static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let _ = tid;
+                return n < 5;
+            }
+        }
+    }
+    false
+}
+
+/// One-shot literal-pool scan triggered on the first SignalProcessWideKey.
+/// Reads `RUZU_FIND_WORD_AT_SIGNAL=0xVALUE:0xSTART:0xLEN` and scans guest
+/// memory for any 4-byte word equal to VALUE within [START..START+LEN).
+/// Used to find code/data that references a known guest address (e.g., a
+/// .data cv_key that has signals but no waiters — finding load sites of
+/// that address identifies the missing waiter's code path).
+fn maybe_scan_word_at_signal(system: &System) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::OnceLock;
+    static FIRED: AtomicBool = AtomicBool::new(false);
+    static SPEC: OnceLock<Option<(u32, u64, u64)>> = OnceLock::new();
+    let spec = *SPEC.get_or_init(|| {
+        let raw = std::env::var("RUZU_FIND_WORD_AT_SIGNAL").ok()?;
+        let parts: Vec<&str> = raw.split(':').collect();
+        if parts.len() != 3 {
+            return None;
+        }
+        let value = u32::from_str_radix(parts[0].trim_start_matches("0x"), 16).ok()?;
+        let start = u64::from_str_radix(parts[1].trim_start_matches("0x"), 16).ok()?;
+        let len = u64::from_str_radix(parts[2].trim_start_matches("0x"), 16).ok()?;
+        Some((value, start, len))
+    });
+    let Some((value, start, len)) = spec else {
+        return;
+    };
+    if FIRED.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let process = system.current_process_arc();
+    let process = process.lock().unwrap();
+    let Some(memory) = process.page_table.get_base().m_memory.as_ref() else {
+        eprintln!("[FIND_WORD_AT_SIGNAL] no memory");
+        return;
+    };
+    let m = memory.lock().unwrap();
+    let end = start + len;
+    let mut addr = start;
+    let mut hits = 0u32;
+    while addr + 4 <= end {
+        let w = m.read_32(addr);
+        if w == value {
+            let ctx_start = addr.saturating_sub(8);
+            let mut ctx = String::with_capacity(48);
+            for i in 0..16u64 {
+                use std::fmt::Write;
+                let _ = write!(ctx, "{:02x}", m.read_8(ctx_start + i));
+                if i == 7 {
+                    ctx.push('|');
+                }
+            }
+            eprintln!(
+                "[WORD_HIT] addr=0x{:08X} val=0x{:08X} ctx=[{}]",
+                addr, value, ctx
+            );
+            hits += 1;
+            if hits > 64 {
+                eprintln!("[WORD_HIT] (more hits suppressed)");
+                break;
+            }
+        }
+        addr += 4;
+    }
+    eprintln!(
+        "[WORD_HIT] scan done: {} hits in [0x{:X}..0x{:X}] for value=0x{:08X}",
+        hits, start, end, value
+    );
+    // Also scan for ARM32 MOVW + MOVT pairs that materialize the same value.
+    let target_lo = value & 0xFFFF;
+    let target_hi = (value >> 16) & 0xFFFF;
+    let mut pc = start;
+    let mut movw_hits = 0u32;
+    while pc + 4 <= end {
+        let insn = (m.read_8(pc) as u32)
+            | ((m.read_8(pc + 1) as u32) << 8)
+            | ((m.read_8(pc + 2) as u32) << 16)
+            | ((m.read_8(pc + 3) as u32) << 24);
+        if (insn & 0x0FF00000) == 0x03000000 {
+            let imm4 = (insn >> 16) & 0xF;
+            let imm12 = insn & 0xFFF;
+            let imm16 = (imm4 << 12) | imm12;
+            let rd = ((insn >> 12) & 0xF) as u8;
+            if imm16 == target_lo {
+                let mut q = pc + 4;
+                let q_end = (pc + 32).min(end);
+                while q + 4 <= q_end {
+                    let qi = (m.read_8(q) as u32)
+                        | ((m.read_8(q + 1) as u32) << 8)
+                        | ((m.read_8(q + 2) as u32) << 16)
+                        | ((m.read_8(q + 3) as u32) << 24);
+                    if (qi & 0x0FF00000) == 0x03400000 {
+                        let q_rd = ((qi >> 12) & 0xF) as u8;
+                        if q_rd == rd {
+                            let q_imm16 = (((qi >> 16) & 0xF) << 12) | (qi & 0xFFF);
+                            if q_imm16 == target_hi {
+                                eprintln!(
+                                    "[MOVW_HIT] movw_pc=0x{:08X} movt_pc=0x{:08X} rd=r{} value=0x{:08X}",
+                                    pc, q, rd, value
+                                );
+                                movw_hits += 1;
+                                if movw_hits > 64 {
+                                    eprintln!("[MOVW_HIT] (more hits suppressed)");
+                                    break;
+                                }
+                            }
+                            break;
+                        }
+                    }
+                    q += 4;
+                }
+            }
+        }
+        pc += 4;
+    }
+    eprintln!(
+        "[MOVW_HIT] scan done: {} hits in [0x{:X}..0x{:X}] for value=0x{:08X}",
+        movw_hits, start, end, value
+    );
 }
 
 /// Wait process wide key atomic.
@@ -44,6 +183,7 @@ pub fn wait_process_wide_key_atomic(
     tag: u32,
     timeout_ns: i64,
 ) -> ResultCode {
+    maybe_dump_mem_at_wait(system, cv_key);
     if should_trace_cv_debug() {
         log::info!(
             "svc::WaitProcessWideKeyAtomic tid={:?} address=0x{:X} cv_key=0x{:X} tag=0x{:08X} timeout_ns={}",
@@ -67,7 +207,9 @@ pub fn wait_process_wide_key_atomic(
                         ctx.lr,
                         ctx.sp
                     );
-                    if should_trace_cv_backtrace_once(current_thread_id) {
+                    if should_trace_cv_backtrace_once(current_thread_id)
+                        || should_trace_cv_backtrace_for_signal(current_thread_id, cv_key)
+                    {
                         let bt = crate::arm::debug::get_backtrace_from_context(&process, &ctx);
                         for (index, entry) in bt.iter().take(12).enumerate() {
                             log::info!(
@@ -79,6 +221,38 @@ pub fn wait_process_wide_key_atomic(
                                 entry.original_address,
                                 entry.offset,
                                 entry.name,
+                            );
+                        }
+                        // Stack dump (48 words) for manual return-address walking.
+                        if let Some(memory) = process.page_table.get_base().m_memory.as_ref() {
+                            let m = memory.lock().unwrap();
+                            let sp = ctx.sp;
+                            let mut stack = String::new();
+                            for offset in 0..48u64 {
+                                use std::fmt::Write;
+                                let addr = sp.saturating_add(offset * 4);
+                                let _ = write!(stack, " {:08X}", m.read_32(addr));
+                            }
+                            log::info!(
+                                "svc::WaitProcessWideKeyAtomic stack tid={} sp=0x{:08X}:{}",
+                                current_thread_id,
+                                sp,
+                                stack
+                            );
+                            // Also dump 20 ARM32 insns around LR for caller context.
+                            let start = ctx.lr.saturating_sub(4 * 4);
+                            let mut disasm = String::new();
+                            for i in 0..20u64 {
+                                use std::fmt::Write;
+                                let addr = start + i * 4;
+                                let word = m.read_32(addr);
+                                let _ = write!(disasm, " {:08X}:{:08X}", addr as u32, word);
+                            }
+                            log::info!(
+                                "svc::WaitProcessWideKeyAtomic insns tid={} lr=0x{:08X}:{}",
+                                current_thread_id,
+                                ctx.lr,
+                                disasm
                             );
                         }
                     }
@@ -155,8 +329,134 @@ pub fn wait_process_wide_key_atomic(
     ResultCode::new(result)
 }
 
+/// One-shot memory dump triggered at first WaitProcessWideKeyAtomic where
+/// the cv_key matches `RUZU_DUMP_MEM_AT_WAIT_CV=0xCV_KEY`.
+/// `RUZU_DUMP_MEM_AT_FIRST_SIGNAL=0xADDR:LEN[,0xADDR2:LEN2,...]` reads LEN
+/// bytes starting at each ADDR via the canonical memory backing (independent
+/// of fastmem) and prints as hex grouped in 16-byte rows.
+fn maybe_dump_mem_at_wait(system: &System, cv_key: u64) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::OnceLock;
+    static FIRED: AtomicBool = AtomicBool::new(false);
+    static TARGET_CV: OnceLock<Option<u64>> = OnceLock::new();
+    let target = *TARGET_CV.get_or_init(|| {
+        std::env::var("RUZU_DUMP_MEM_AT_WAIT_CV")
+            .ok()
+            .and_then(|s| u64::from_str_radix(s.trim_start_matches("0x"), 16).ok())
+    });
+    let Some(t) = target else {
+        return;
+    };
+    if cv_key != t {
+        return;
+    }
+    if FIRED.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    static SPECS: OnceLock<Vec<(u64, u64)>> = OnceLock::new();
+    let specs = SPECS.get_or_init(|| {
+        let raw = std::env::var("RUZU_DUMP_MEM_AT_FIRST_SIGNAL").unwrap_or_default();
+        let mut out = Vec::new();
+        for tok in raw.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
+            if let Some((a, l)) = tok.split_once(':') {
+                if let (Ok(addr), Ok(len)) = (
+                    u64::from_str_radix(a.trim_start_matches("0x"), 16),
+                    u64::from_str_radix(l.trim_start_matches("0x"), 16)
+                        .or_else(|_| l.parse::<u64>()),
+                ) {
+                    out.push((addr, len));
+                }
+            }
+        }
+        out
+    });
+    let process = system.current_process_arc();
+    let process = process.lock().unwrap();
+    let Some(memory) = process.page_table.get_base().m_memory.as_ref() else {
+        return;
+    };
+    let m = memory.lock().unwrap();
+    eprintln!(
+        "[MEM_DUMP] triggered at WaitProcessWideKeyAtomic(cv_key=0x{:X})",
+        t
+    );
+    for &(start, len) in specs {
+        eprintln!("[MEM_DUMP] addr=0x{:08X} len={}", start, len);
+        let mut row = String::new();
+        for i in 0..len {
+            use std::fmt::Write;
+            if i % 16 == 0 {
+                if !row.is_empty() {
+                    eprintln!("  0x{:08X}: {}", start + i - 16, row);
+                    row.clear();
+                }
+            }
+            let _ = write!(row, "{:02x} ", m.read_8(start + i));
+        }
+        if !row.is_empty() {
+            let last_addr = start + len - (len % 16).max(1);
+            eprintln!("  0x{:08X}: {}", last_addr, row);
+        }
+    }
+}
+
+fn maybe_dump_mem_at_first_signal(system: &System) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::OnceLock;
+    static FIRED: AtomicBool = AtomicBool::new(false);
+    static SPECS: OnceLock<Vec<(u64, u64)>> = OnceLock::new();
+    let specs = SPECS.get_or_init(|| {
+        let raw = std::env::var("RUZU_DUMP_MEM_AT_FIRST_SIGNAL").unwrap_or_default();
+        let mut out = Vec::new();
+        for tok in raw.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
+            if let Some((a, l)) = tok.split_once(':') {
+                if let (Ok(addr), Ok(len)) = (
+                    u64::from_str_radix(a.trim_start_matches("0x"), 16),
+                    u64::from_str_radix(l.trim_start_matches("0x"), 16)
+                        .or_else(|_| l.parse::<u64>()),
+                ) {
+                    out.push((addr, len));
+                }
+            }
+        }
+        out
+    });
+    if specs.is_empty() {
+        return;
+    }
+    if FIRED.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let process = system.current_process_arc();
+    let process = process.lock().unwrap();
+    let Some(memory) = process.page_table.get_base().m_memory.as_ref() else {
+        return;
+    };
+    let m = memory.lock().unwrap();
+    for &(start, len) in specs {
+        eprintln!("[MEM_DUMP] addr=0x{:08X} len={}", start, len);
+        let mut row = String::new();
+        for i in 0..len {
+            use std::fmt::Write;
+            if i % 16 == 0 {
+                if !row.is_empty() {
+                    eprintln!("  0x{:08X}: {}", start + i - 16, row);
+                    row.clear();
+                }
+            }
+            let _ = write!(row, "{:02x} ", m.read_8(start + i));
+        }
+        if !row.is_empty() {
+            let last_addr = start + len - (len % 16).max(1);
+            eprintln!("  0x{:08X}: {}", last_addr, row);
+        }
+    }
+}
+
 /// Signal process wide key.
 pub fn signal_process_wide_key(system: &System, cv_key: u64, count: i32) {
+    maybe_scan_word_at_signal(system);
+    maybe_dump_mem_at_first_signal(system);
     if should_trace_cv_debug() {
         log::info!(
             "svc::SignalProcessWideKey tid={:?} cv_key=0x{:X} count={}",
@@ -165,7 +465,9 @@ pub fn signal_process_wide_key(system: &System, cv_key: u64, count: i32) {
             count
         );
         if let Some(current_thread_id) = system.current_thread_id() {
-            if should_trace_cv_backtrace_once(current_thread_id) {
+            if should_trace_cv_backtrace_once(current_thread_id)
+                || should_trace_cv_backtrace_for_signal(current_thread_id, cv_key)
+            {
                 if let Some(current_thread) = system.current_thread() {
                     let core_index =
                         current_thread.lock().unwrap().get_current_core().max(0) as usize;
@@ -215,7 +517,27 @@ pub fn signal_process_wide_key(system: &System, cv_key: u64, count: i32) {
                             }
                             log::info!(
                                 "svc::SignalProcessWideKey insns tid={} lr=0x{:08X}:{}",
-                                current_thread_id, ctx.lr, disasm
+                                current_thread_id,
+                                ctx.lr,
+                                disasm
+                            );
+                            // Dump 48 stack words from SP — used to manually
+                            // walk return addresses past the bt unwinder's
+                            // 2-frame limit. Each word is 4 bytes; we want
+                            // to see candidate LRs for the actual game-code
+                            // caller of the libnn signal wrapper.
+                            let sp = ctx.sp;
+                            let mut stack = String::new();
+                            for offset in 0..48u64 {
+                                let addr = sp.saturating_add(offset * 4);
+                                let word = m.read_32(addr);
+                                stack.push_str(&format!(" {:08X}", word));
+                            }
+                            log::info!(
+                                "svc::SignalProcessWideKey stack tid={} sp=0x{:08X}:{}",
+                                current_thread_id,
+                                sp,
+                                stack
                             );
                             // Dump vtable lookup if R5 is non-null.
                             let r5 = regs[5] as u32;

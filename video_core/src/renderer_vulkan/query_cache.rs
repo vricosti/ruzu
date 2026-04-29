@@ -14,6 +14,10 @@ use std::sync::Arc;
 
 use ash::vk;
 
+use crate::control::channel_state::ChannelState;
+use crate::control::channel_state_cache::ChannelCacheAccessor;
+use crate::query_cache::query_cache::QueryCacheRuntimeHandle;
+use crate::query_cache::query_cache_base::{LookupData, QueryCacheBase};
 use crate::query_cache::types::QueryPropertiesFlags;
 
 // ---------------------------------------------------------------------------
@@ -48,6 +52,12 @@ pub struct QueryCacheRuntime {
     host_conditional_rendering_active: bool,
     /// Whether host conditional rendering is currently paused.
     host_conditional_rendering_paused: bool,
+    /// Whether a 3D engine has been bound through the query-cache owner path.
+    ///
+    /// Upstream binds a live `Maxwell3D*` here. The current Rust owner graph
+    /// does not yet carry that engine reference, but the lifecycle edge still
+    /// belongs to this runtime owner.
+    bound_3d_engine: bool,
 }
 
 impl QueryCacheRuntime {
@@ -65,6 +75,7 @@ impl QueryCacheRuntime {
         QueryCacheRuntime {
             host_conditional_rendering_active: false,
             host_conditional_rendering_paused: false,
+            bound_3d_engine: false,
         }
     }
 
@@ -159,11 +170,52 @@ impl QueryCacheRuntime {
     /// accessing register state during query operations.
     pub fn bind_3d_engine(&mut self) {
         // Stores reference to maxwell3d for ViewRegs access
+        self.bound_3d_engine = true;
     }
 
     /// Returns whether host conditional rendering is currently active.
     pub fn is_host_conditional_rendering_active(&self) -> bool {
         self.host_conditional_rendering_active
+    }
+
+    pub fn is_3d_engine_bound(&self) -> bool {
+        self.bound_3d_engine
+    }
+}
+
+impl QueryCacheRuntimeHandle for QueryCacheRuntime {
+    fn bind_3d_engine(&mut self) {
+        QueryCacheRuntime::bind_3d_engine(self);
+    }
+
+    fn end_host_conditional_rendering(&mut self) {
+        QueryCacheRuntime::end_host_conditional_rendering(self);
+    }
+
+    fn pause_host_conditional_rendering(&mut self) {
+        QueryCacheRuntime::pause_host_conditional_rendering(self);
+    }
+
+    fn resume_host_conditional_rendering(&mut self) {
+        QueryCacheRuntime::resume_host_conditional_rendering(self);
+    }
+
+    fn host_conditional_rendering_compare_value(
+        &mut self,
+        _object_1: LookupData,
+        qc_dirty: bool,
+    ) -> bool {
+        QueryCacheRuntime::host_conditional_rendering_compare_value(self, qc_dirty)
+    }
+
+    fn host_conditional_rendering_compare_values(
+        &mut self,
+        _object_1: LookupData,
+        _object_2: LookupData,
+        qc_dirty: bool,
+        equal_check: bool,
+    ) -> bool {
+        QueryCacheRuntime::host_conditional_rendering_compare_values(self, qc_dirty, equal_check)
     }
 }
 
@@ -177,6 +229,7 @@ impl QueryCacheRuntime {
 /// The generic QueryCacheBase provides the main cache logic, parameterized
 /// by the Vulkan-specific runtime type.
 pub struct QueryCache {
+    pub base: QueryCacheBase,
     pub runtime: QueryCacheRuntime,
     /// Channel-bound GPU device memory manager. Used to translate the
     /// query's GPU virtual address to the underlying CPU/guest address
@@ -191,10 +244,30 @@ pub struct QueryCache {
 impl QueryCache {
     pub fn new() -> Self {
         QueryCache {
+            base: QueryCacheBase::new(),
             runtime: QueryCacheRuntime::new(),
             channel_memory_manager: None,
             gpu_ticks_getter: None,
         }
+    }
+
+    pub fn create_channel(&mut self, channel: &ChannelState) {
+        self.base.create_channel(channel);
+    }
+
+    pub fn bind_to_channel(&mut self, channel_id: i32) {
+        self.base.bind_to_channel(channel_id);
+        self.runtime.bind_3d_engine();
+        self.channel_memory_manager = self
+            .base
+            .channel_caches
+            .current_channel_state()
+            .and_then(ChannelCacheAccessor::gpu_memory_arc);
+    }
+
+    pub fn erase_channel(&mut self, channel_id: i32) {
+        self.base.erase_channel(channel_id);
+        self.channel_memory_manager = None;
     }
 
     /// Port of `QueryCache::NotifySegment`.
@@ -209,17 +282,6 @@ impl QueryCache {
     /// Enables or disables a query counter type.
     pub fn counter_enable(&mut self, _query_type: u32, _enable: bool) {
         // Base class handles counter enable/disable
-    }
-
-    /// Wire the channel-bound GPU device memory manager. The query result
-    /// callback uses this manager to translate the query's GPU VA into a
-    /// guest CPU address and write the value back through the
-    /// `guest_memory_writer` registered on the manager.
-    pub fn set_memory_manager(
-        &mut self,
-        memory_manager: Arc<parking_lot::Mutex<crate::memory_manager::MemoryManager>>,
-    ) {
-        self.channel_memory_manager = Some(memory_manager);
     }
 
     /// Wire the GPU tick getter used for timestamped queries.
@@ -281,11 +343,27 @@ impl QueryCache {
             sync_operation(operation);
         }
     }
+
+    #[cfg(test)]
+    pub fn bound_memory_manager_for_test(
+        &self,
+    ) -> Option<&Arc<parking_lot::Mutex<crate::memory_manager::MemoryManager>>> {
+        self.channel_memory_manager.as_ref()
+    }
+
+    #[cfg(test)]
+    pub fn has_bound_memory_manager_for_test(&self) -> bool {
+        self.channel_memory_manager.is_some()
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::query_cache::query_cache::QueryCacheRuntimeHandle;
+    use crate::query_cache::query_cache_base::LookupData;
+    use parking_lot::Mutex as ParkingMutex;
+    use std::sync::Arc;
 
     #[test]
     fn query_cache_runtime_state() {
@@ -299,5 +377,134 @@ mod tests {
     fn constants() {
         assert_eq!(SAMPLES_QUERY_BANK_SIZE, 256);
         assert_eq!(SAMPLES_QUERY_SIZE, 8);
+    }
+
+    #[test]
+    fn runtime_trait_bridge_routes_conditional_rendering_hooks() {
+        let mut rt = QueryCacheRuntime::new();
+        let handle: &mut dyn QueryCacheRuntimeHandle = &mut rt;
+
+        assert!(!handle.host_conditional_rendering_compare_value(
+            LookupData {
+                address: 0x1000,
+                found_query: None,
+            },
+            false,
+        ));
+        assert!(!handle.host_conditional_rendering_compare_values(
+            LookupData {
+                address: 0x1000,
+                found_query: None,
+            },
+            LookupData {
+                address: 0x2000,
+                found_query: None,
+            },
+            false,
+            true,
+        ));
+        handle.end_host_conditional_rendering();
+        assert!(!rt.is_host_conditional_rendering_active());
+    }
+
+    #[test]
+    fn bind_to_channel_wires_memory_manager_from_channel_cache_owner() {
+        let mut cache = QueryCache::new();
+        let mm = Arc::new(ParkingMutex::new(
+            crate::memory_manager::MemoryManager::new(33),
+        ));
+        let mut channel = ChannelState::new(8);
+        channel.program_id = 0x3344;
+        channel.memory_manager = Some(Arc::clone(&mm));
+
+        cache.create_channel(&channel);
+        cache.bind_to_channel(channel.bind_id);
+
+        let bound = cache
+            .bound_memory_manager_for_test()
+            .expect("bound channel memory manager");
+        assert!(Arc::ptr_eq(bound, &mm));
+        assert_eq!(cache.base.channel_caches.program_id, 0x3344);
+        assert!(cache.runtime.is_3d_engine_bound());
+
+        cache.erase_channel(channel.bind_id);
+        assert!(!cache.has_bound_memory_manager_for_test());
+    }
+
+    #[test]
+    fn query_sync_operation_writes_payload_and_timestamp_through_bound_memory_manager() {
+        let mut cache = QueryCache::new();
+        let writes = Arc::new(ParkingMutex::new(Vec::<(u64, Vec<u8>)>::new()));
+        let writes_clone = Arc::clone(&writes);
+
+        let mut mm = crate::memory_manager::MemoryManager::new(0);
+        mm.map(0x5038_50000, 0x5510_6000, 0x1000, 0, false);
+        mm.set_guest_memory_writer(Arc::new(move |addr, data| {
+            writes_clone.lock().push((addr, data.to_vec()));
+        }));
+        let mm = Arc::new(ParkingMutex::new(mm));
+
+        let mut channel = ChannelState::new(9);
+        channel.memory_manager = Some(Arc::clone(&mm));
+        cache.create_channel(&channel);
+        cache.bind_to_channel(channel.bind_id);
+        cache.set_gpu_ticks_getter(Arc::new(|| 0x1122_3344_5566_7788));
+
+        cache.query(
+            0x5038_50000,
+            QueryPropertiesFlags::HAS_TIMEOUT,
+            0xAABB_CCDD,
+            |_func| panic!("fence path should not be used"),
+            |func| func(),
+        );
+
+        let writes = writes.lock();
+        assert_eq!(writes.len(), 2);
+        assert_eq!(writes[0].0, 0x5510_6008);
+        assert_eq!(writes[0].1, 0x1122_3344_5566_7788u64.to_le_bytes());
+        assert_eq!(writes[1].0, 0x5510_6000);
+        assert_eq!(writes[1].1, (0xAABB_CCDDu64).to_le_bytes());
+    }
+
+    #[test]
+    fn query_fence_operation_defers_writeback_to_signal_fence_callback() {
+        let mut cache = QueryCache::new();
+        let writes = Arc::new(ParkingMutex::new(Vec::<(u64, Vec<u8>)>::new()));
+        let writes_clone = Arc::clone(&writes);
+
+        let mut mm = crate::memory_manager::MemoryManager::new(0);
+        mm.map(0x5038_50000, 0x5510_6000, 0x1000, 0, false);
+        mm.set_guest_memory_writer(Arc::new(move |addr, data| {
+            writes_clone.lock().push((addr, data.to_vec()));
+        }));
+        let mm = Arc::new(ParkingMutex::new(mm));
+
+        let mut channel = ChannelState::new(10);
+        channel.memory_manager = Some(Arc::clone(&mm));
+        cache.create_channel(&channel);
+        cache.bind_to_channel(channel.bind_id);
+
+        let deferred = Arc::new(ParkingMutex::new(None::<Box<dyn FnOnce() + Send>>));
+        let deferred_clone = Arc::clone(&deferred);
+
+        cache.query(
+            0x5038_50000,
+            QueryPropertiesFlags::IS_A_FENCE,
+            0x1234_5678,
+            move |func| {
+                *deferred_clone.lock() = Some(func);
+            },
+            |_func| panic!("sync path should not be used"),
+        );
+
+        assert!(writes.lock().is_empty());
+
+        let func = deferred.lock().take().expect("fence callback queued");
+        func();
+
+        let writes = writes.lock();
+        assert_eq!(writes.len(), 1);
+        assert_eq!(writes[0].0, 0x5510_6000);
+        assert_eq!(writes[0].1, 0x1234_5678u32.to_le_bytes());
     }
 }
