@@ -154,14 +154,20 @@ pub fn process_adpcm_data_source_version1_command(
         for wb in &payload.wave_buffers {
             if wb.buffer != 0 && wb.buffer >= 0x10_0000_0000 {
                 if trace_decode {
-                    log::warn!("process_adpcm_v1 SKIP: wave buffer at 0x{:X} looks unmapped", wb.buffer);
+                    log::warn!(
+                        "process_adpcm_v1 SKIP: wave buffer at 0x{:X} looks unmapped",
+                        wb.buffer
+                    );
                 }
                 return;
             }
         }
         if payload.data_address != 0 && payload.data_address >= 0x10_0000_0000 {
             if trace_decode {
-                log::warn!("process_adpcm_v1 SKIP: data_address 0x{:X} looks unmapped", payload.data_address);
+                log::warn!(
+                    "process_adpcm_v1 SKIP: data_address 0x{:X} looks unmapped",
+                    payload.data_address
+                );
             }
             return;
         }

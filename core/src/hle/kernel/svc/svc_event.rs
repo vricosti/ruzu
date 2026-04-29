@@ -6,13 +6,13 @@
 
 use std::sync::{Arc, Mutex};
 
+use super::super::k_process::ProcessLock;
 use crate::core::System;
 use crate::hle::kernel::k_event::KEvent;
 use crate::hle::kernel::k_readable_event::KReadableEvent;
 use crate::hle::kernel::svc::svc_results::*;
 use crate::hle::kernel::svc_common::Handle;
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
-use super::super::k_process::ProcessLock;
 
 /// Signals an event.
 pub fn signal_event(system: &System, event_handle: Handle) -> ResultCode {

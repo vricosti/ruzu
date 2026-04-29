@@ -490,9 +490,7 @@ impl ruzu_core::core::AudioCoreInterface for AudioCore {
         if let Some(mem) = self.system.lock().memory_shared() {
             crate::init_guest_memory_accessor(mem);
         } else {
-            log::warn!(
-                "audio_core::open_audio_renderer: system.memory_shared() returned None"
-            );
+            log::warn!("audio_core::open_audio_renderer: system.memory_shared() returned None");
         }
 
         let renderer_system = Arc::new(Mutex::new(RendererSystem::new(
@@ -529,8 +527,7 @@ impl ruzu_core::core::AudioCoreInterface for AudioCore {
         Box<dyn ruzu_core::core::OpusDecoderInterface>,
         ruzu_core::hle::result::ResultCode,
     > {
-        let mut decoder =
-            crate::opus::OpusDecoder::new(crate::opus::HardwareOpus::new());
+        let mut decoder = crate::opus::OpusDecoder::new(crate::opus::HardwareOpus::new());
         let params = crate::opus::OpusParametersEx {
             sample_rate,
             channel_count,
@@ -559,8 +556,7 @@ impl ruzu_core::core::AudioCoreInterface for AudioCore {
         Box<dyn ruzu_core::core::OpusDecoderInterface>,
         ruzu_core::hle::result::ResultCode,
     > {
-        let mut decoder =
-            crate::opus::OpusDecoder::new(crate::opus::HardwareOpus::new());
+        let mut decoder = crate::opus::OpusDecoder::new(crate::opus::HardwareOpus::new());
         let mut params = crate::opus::OpusMultiStreamParametersEx::default();
         params.sample_rate = sample_rate;
         params.channel_count = channel_count;

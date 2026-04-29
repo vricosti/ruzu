@@ -178,7 +178,9 @@ pub fn create_optimal_clock() -> Box<dyn WallClock> {
     {
         let caps = crate::x64::cpu_detect::get_cpu_caps();
         if caps.invariant_tsc && caps.tsc_frequency >= NS_PER_SEC {
-            return Box::new(crate::x64::native_clock::NativeClock::new(caps.tsc_frequency));
+            return Box::new(crate::x64::native_clock::NativeClock::new(
+                caps.tsc_frequency,
+            ));
         }
         return Box::new(StandardWallClock::new());
     }

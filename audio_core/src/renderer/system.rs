@@ -393,9 +393,7 @@ impl System {
             if let Some(mem) = mem_opt {
                 crate::init_guest_memory_accessor(mem);
             } else {
-                log::warn!(
-                    "audio_core::System::initialize: process.get_memory() returned None"
-                );
+                log::warn!("audio_core::System::initialize: process.get_memory() returned None");
             }
         }
         let transfer_memory_source_address = unsafe { (*transfer_memory).get_source_address() };

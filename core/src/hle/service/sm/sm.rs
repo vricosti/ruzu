@@ -21,6 +21,7 @@ use crate::core::SystemRef;
 use crate::hle::kernel::k_event::KEvent;
 use crate::hle::kernel::k_port::KPort;
 use crate::hle::kernel::k_process::KProcess;
+use crate::hle::kernel::k_process::ProcessLock;
 use crate::hle::kernel::k_scheduler::KScheduler;
 use crate::hle::kernel::svc::svc_results::RESULT_INVALID_STATE;
 use crate::hle::result::{ErrorModule, ResultCode, RESULT_SUCCESS};
@@ -34,7 +35,6 @@ use crate::hle::service::service::{
     build_handler_map, FunctionInfo, ServiceFramework, SERVER_SESSION_COUNT_MAX,
 };
 use crate::hle::service::sm::sm_controller::Controller;
-use crate::hle::kernel::k_process::ProcessLock;
 
 // --- SM result codes (matching upstream sm.cpp) ---
 
@@ -290,9 +290,7 @@ pub struct Sm {
 }
 
 impl Sm {
-    fn current_process_and_scheduler(
-        &self,
-    ) -> Option<(Arc<ProcessLock>, Arc<Mutex<KScheduler>>)> {
+    fn current_process_and_scheduler(&self) -> Option<(Arc<ProcessLock>, Arc<Mutex<KScheduler>>)> {
         let current_thread = self.system.get().current_thread()?;
         let thread_guard = current_thread.lock().unwrap();
         let process = thread_guard

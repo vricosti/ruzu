@@ -25,6 +25,7 @@ use crate::core::SystemRef;
 use crate::hle::kernel::k_event::KEvent;
 use crate::hle::kernel::k_port::KPort;
 use crate::hle::kernel::k_process::KProcess;
+use crate::hle::kernel::k_process::ProcessLock;
 use crate::hle::kernel::k_readable_event::KReadableEvent;
 use crate::hle::kernel::k_scheduler::KScheduler;
 use crate::hle::kernel::k_server_session::KServerSession;
@@ -37,7 +38,6 @@ use crate::hle::service::os::event::Event;
 use crate::hle::service::os::multi_wait::MultiWait;
 use crate::hle::service::os::multi_wait_holder::MultiWaitHolder;
 use crate::hle::service::sm::sm::ServiceManager;
-use crate::hle::kernel::k_process::ProcessLock;
 
 /// Tag for MultiWaitHolder user data, matching upstream `UserDataTag`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -223,9 +223,7 @@ impl ServerManager {
         thread_guard.parent.as_ref().and_then(Weak::upgrade)
     }
 
-    fn current_process_and_scheduler(
-        &self,
-    ) -> Option<(Arc<ProcessLock>, Arc<Mutex<KScheduler>>)> {
+    fn current_process_and_scheduler(&self) -> Option<(Arc<ProcessLock>, Arc<Mutex<KScheduler>>)> {
         let current_thread = self.system.get().current_thread()?;
         let thread_guard = current_thread.lock().unwrap();
         let process = thread_guard.parent.as_ref().and_then(Weak::upgrade)?;

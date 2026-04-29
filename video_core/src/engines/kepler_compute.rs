@@ -50,7 +50,7 @@ pub struct QmdConstBuffer {
 }
 
 /// Parsed Queue Meta Data (QMD) descriptor — 256-byte structure at a GPU VA.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct QueueMetaData {
     pub grid_dim_x: u32,
     pub grid_dim_y: u32,
@@ -149,6 +149,8 @@ pub struct KeplerCompute {
     regs: Box<[u32; ENGINE_REG_COUNT]>,
     interface_state: EngineInterfaceState,
     memory_manager: Arc<Mutex<MemoryManager>>,
+    /// Port of upstream owner-local `launch_description`.
+    pub launch_description: QueueMetaData,
     dispatch_calls: Vec<DispatchCall>,
     /// QMD GPU VA set on LAUNCH write, consumed by execute_pending.
     pending_launch: Option<u64>,
@@ -170,6 +172,7 @@ impl KeplerCompute {
                 state
             },
             memory_manager,
+            launch_description: QueueMetaData::default(),
             dispatch_calls: Vec::new(),
             pending_launch: None,
             rasterizer: None,
@@ -256,6 +259,11 @@ impl KeplerCompute {
     pub fn take_dispatch_calls(&mut self) -> Vec<DispatchCall> {
         std::mem::take(&mut self.dispatch_calls)
     }
+
+    /// Port of reading upstream `launch_description`.
+    pub fn launch_description(&self) -> &QueueMetaData {
+        &self.launch_description
+    }
 }
 
 impl Default for KeplerCompute {
@@ -335,6 +343,8 @@ impl Engine for KeplerCompute {
             }
 
             let qmd = QueueMetaData::from_words(&words);
+
+            self.launch_description = qmd.clone();
 
             let dispatch = DispatchCall {
                 qmd,
@@ -562,6 +572,9 @@ mod tests {
         assert_eq!(d.qmd.grid_dim_z, 2);
         assert_eq!(d.qmd.block_dim_x, 128);
         assert_eq!(d.qmd.program_start, 0x200);
+        assert_eq!(engine.launch_description.program_start, 0x200);
+        assert_eq!(engine.launch_description.grid_dim_x, 8);
+        assert_eq!(engine.launch_description.block_dim_x, 128);
     }
 
     #[test]

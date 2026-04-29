@@ -3,107 +3,25 @@
 
 //! Port of zuyu/src/video_core/query_cache/query_stream.h
 //!
-//! Defines `StreamerInterface` (the base trait/struct for all query streamers)
-//! and `SimpleStreamer<Q>` (a generic streamer backed by a slot-based query pool).
+//! Defines `StreamerInterface`, the shared non-virtual streamer state and
+//! interface, plus `SimpleStreamer<Q>`, the slot-backed generic streamer owner.
 
 use std::collections::VecDeque;
 use std::sync::Mutex;
 
 use super::query_base::{QueryBase, VAddr};
 
-/// Base interface for query streamers.
-///
-/// Maps to C++ `StreamerInterface`. In the C++ code this is an abstract base class
-/// with virtual methods. In Rust we use a trait for the pure-virtual parts and a
-/// concrete struct for the shared state.
-pub trait StreamerOps {
-    /// Retrieve a query by ID. Returns `None` if the ID is invalid.
-    fn get_query(&self, id: usize) -> Option<&QueryBase>;
-
-    /// Retrieve a mutable query by ID.
-    fn get_query_mut(&mut self, id: usize) -> Option<&mut QueryBase>;
-
-    /// Start counting for this streamer.
-    fn start_counter(&mut self) {
-        // Default: do nothing
-    }
-
-    /// Pause counting.
-    fn pause_counter(&mut self) {
-        // Default: do nothing
-    }
-
-    /// Reset the counter.
-    fn reset_counter(&mut self) {
-        // Default: do nothing
-    }
-
-    /// Close the counter.
-    fn close_counter(&mut self) {
-        // Default: do nothing
-    }
-
-    /// Returns true if there are pending sync operations.
-    fn has_pending_sync(&self) -> bool {
-        false
-    }
-
-    /// Pre-sync writes.
-    fn presync_writes(&mut self) {
-        // Default: do nothing
-    }
-
-    /// Sync writes to the host.
-    fn sync_writes(&mut self) {
-        // Default: do nothing
-    }
-
-    /// Write a counter value at the given address.
-    fn write_counter(
-        &mut self,
-        address: VAddr,
-        has_timestamp: bool,
-        value: u32,
-        subreport: Option<u32>,
-    ) -> usize;
-
-    /// Returns true if there are unsynced queries.
-    fn has_unsynced_queries(&self) -> bool {
-        false
-    }
-
-    /// Push unsynced queries for flushing.
-    fn push_unsynced_queries(&mut self) {
-        // Default: do nothing
-    }
-
-    /// Pop unsynced queries after flushing.
-    fn pop_unsynced_queries(&mut self) {
-        // Default: do nothing
-    }
-
-    /// Free a query by ID.
-    fn free(&mut self, query_id: usize);
-}
-
-/// Shared state for all streamer types, corresponding to the non-virtual
-/// members of C++ `StreamerInterface`.
+/// Shared non-virtual state for C++ `StreamerInterface`.
 #[derive(Debug)]
-pub struct StreamerState {
-    /// The streamer's unique ID.
+pub struct StreamerInterfaceBase {
     pub id: usize,
-    /// Bitmask of streamers this one depends on.
     pub dependence_mask: u64,
-    /// Bitmask of streamers that depend on this one.
     pub dependent_mask: u64,
-    /// Amendment value applied to query results.
     pub amend_value: u64,
-    /// Accumulated value for this streamer.
     pub accumulation_value: u64,
 }
 
-impl StreamerState {
-    /// Create a new streamer state with the given ID.
+impl StreamerInterfaceBase {
     pub fn new(id: usize) -> Self {
         Self {
             id,
@@ -113,115 +31,210 @@ impl StreamerState {
             accumulation_value: 0,
         }
     }
+}
 
-    /// Get this streamer's ID.
-    pub fn get_id(&self) -> usize {
-        self.id
+/// Base interface for all query streamers.
+///
+/// Maps to C++ `StreamerInterface`. Rust uses a trait for the virtual surface
+/// and `StreamerInterfaceBase` for the shared state that lives in the base
+/// class in C++.
+pub trait StreamerInterface {
+    fn get_query(&self, id: usize) -> Option<&QueryBase>;
+    fn get_query_mut(&mut self, id: usize) -> Option<&mut QueryBase>;
+    fn write_counter(
+        &mut self,
+        address: VAddr,
+        has_timestamp: bool,
+        value: u32,
+        subreport: Option<u32>,
+    ) -> usize;
+    fn free(&mut self, query_id: usize);
+    fn base(&self) -> &StreamerInterfaceBase;
+    fn base_mut(&mut self) -> &mut StreamerInterfaceBase;
+
+    fn start_counter(&mut self) {}
+    fn pause_counter(&mut self) {}
+    fn reset_counter(&mut self) {}
+    fn close_counter(&mut self) {}
+    fn has_pending_sync(&self) -> bool {
+        false
+    }
+    fn presync_writes(&mut self) {}
+    fn sync_writes(&mut self) {}
+    fn has_unsynced_queries(&self) -> bool {
+        false
+    }
+    fn push_unsynced_queries(&mut self) {}
+    fn pop_unsynced_queries(&mut self) {}
+
+    fn get_id(&self) -> usize {
+        self.base().id
     }
 
-    /// Get the dependence mask.
-    pub fn get_dependence_mask(&self) -> u64 {
-        self.dependence_mask
+    fn get_dependence_mask(&self) -> u64 {
+        self.base().dependence_mask
     }
 
-    /// Get the dependent mask.
-    ///
-    /// NOTE: upstream C++ `GetDependentMask()` returns `dependence_mask` (likely a bug),
-    /// preserved here for parity.
-    pub fn get_dependent_mask(&self) -> u64 {
-        self.dependence_mask
+    fn get_dependent_mask(&self) -> u64 {
+        // Upstream returns dependence_mask here. Preserve the same behavior.
+        self.base().dependence_mask
     }
 
-    /// Get the amend value.
-    pub fn get_amend_value(&self) -> u64 {
-        self.amend_value
+    fn get_amend_value(&self) -> u64 {
+        self.base().amend_value
     }
 
-    /// Set the accumulation value.
-    pub fn set_accumulation_value(&mut self, new_value: u64) {
-        self.accumulation_value = new_value;
+    fn set_accumulation_value(&mut self, new_value: u64) {
+        self.base_mut().accumulation_value = new_value;
     }
 
-    /// Register a dependency on another streamer.
-    ///
-    /// Maps to C++ `StreamerInterface::MakeDependent`.
-    pub fn make_dependent(&mut self, other_id: usize, other_dependent_mask: &mut u64) {
-        self.dependence_mask |= 1u64 << other_id;
-        *other_dependent_mask |= 1u64 << self.id;
+    fn make_dependent(&mut self, depend_on: &mut dyn StreamerInterface) {
+        let depend_on_id = depend_on.get_id();
+        self.base_mut().dependence_mask |= 1u64 << depend_on_id;
+        depend_on.base_mut().dependent_mask |= 1u64 << self.get_id();
     }
 }
 
-/// A simple slot-based streamer that stores queries in a `VecDeque` and
-/// recycles freed slot indices.
+/// Generic slot-backed streamer owner.
 ///
-/// Maps to C++ `SimpleStreamer<QueryType>`. The type parameter `Q` must
-/// be constructible and convertible to/from `QueryBase`.
+/// Maps to C++ `SimpleStreamer<QueryType>`.
 pub struct SimpleStreamer<Q> {
-    /// Shared streamer state.
-    pub state: StreamerState,
-    /// Guard for thread-safe slot allocation/release.
-    guard: Mutex<()>,
-    /// Query storage indexed by slot ID.
+    pub base: StreamerInterfaceBase,
+    pub guard: Mutex<()>,
     pub slot_queries: VecDeque<Q>,
-    /// Recycled slot indices available for reuse.
-    old_queries: VecDeque<usize>,
+    pub old_queries: VecDeque<usize>,
 }
 
 impl<Q> SimpleStreamer<Q> {
-    /// Create a new simple streamer with the given ID.
     pub fn new(id: usize) -> Self {
         Self {
-            state: StreamerState::new(id),
+            base: StreamerInterfaceBase::new(id),
             guard: Mutex::new(()),
             slot_queries: VecDeque::new(),
             old_queries: VecDeque::new(),
         }
     }
 
-    /// Allocate a new query slot, recycling old slots when available.
-    ///
-    /// Maps to C++ `SimpleStreamer::BuildQuery`.
     pub fn build_query(&mut self, query: Q) -> usize {
         let _lock = self.guard.lock().unwrap();
-        if let Some(reuse_id) = self.old_queries.pop_front() {
-            self.slot_queries[reuse_id] = query;
-            reuse_id
-        } else {
-            let new_id = self.slot_queries.len();
-            self.slot_queries.push_back(query);
-            new_id
+        if let Some(new_id) = self.old_queries.pop_front() {
+            self.slot_queries[new_id] = query;
+            return new_id;
         }
+        let new_id = self.slot_queries.len();
+        self.slot_queries.push_back(query);
+        new_id
     }
 
-    /// Release a query slot for recycling.
-    ///
-    /// Maps to C++ `SimpleStreamer::ReleaseQuery`.
     pub fn release_query(&mut self, query_id: usize) {
-        assert!(
-            query_id < self.slot_queries.len(),
+        if query_id < self.slot_queries.len() {
+            self.old_queries.push_back(query_id);
+            return;
+        }
+        unreachable!(
             "SimpleStreamer::release_query: query_id {} out of bounds (len {})",
             query_id,
             self.slot_queries.len()
         );
-        self.old_queries.push_back(query_id);
     }
 
-    /// Free a query (thread-safe wrapper around `release_query`).
-    ///
-    /// Maps to C++ `SimpleStreamer::Free`.
     pub fn free(&mut self, query_id: usize) {
-        // Note: upstream locks guard here, but &mut self already guarantees
-        // exclusive access in Rust.
+        // Upstream locks here because callers may only hold shared ownership.
+        // Rust already requires `&mut self`, so preserve the owner method but
+        // avoid a second borrow through the held mutex guard.
         self.release_query(query_id);
     }
 
-    /// Get a reference to a query by slot ID.
     pub fn get_query(&self, query_id: usize) -> Option<&Q> {
         self.slot_queries.get(query_id)
     }
 
-    /// Get a mutable reference to a query by slot ID.
     pub fn get_query_mut(&mut self, query_id: usize) -> Option<&mut Q> {
         self.slot_queries.get_mut(query_id)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct DummyStreamer {
+        simple: SimpleStreamer<DummyQuery>,
+    }
+
+    #[derive(Clone)]
+    struct DummyQuery {
+        base: QueryBase,
+    }
+
+    impl DummyStreamer {
+        fn new(id: usize) -> Self {
+            Self {
+                simple: SimpleStreamer::new(id),
+            }
+        }
+    }
+
+    impl StreamerInterface for DummyStreamer {
+        fn get_query(&self, id: usize) -> Option<&QueryBase> {
+            self.simple.get_query(id).map(|query| &query.base)
+        }
+
+        fn get_query_mut(&mut self, id: usize) -> Option<&mut QueryBase> {
+            self.simple.get_query_mut(id).map(|query| &mut query.base)
+        }
+
+        fn write_counter(
+            &mut self,
+            address: VAddr,
+            has_timestamp: bool,
+            value: u32,
+            _subreport: Option<u32>,
+        ) -> usize {
+            let mut flags = super::super::query_base::QueryFlagBits::empty();
+            if has_timestamp {
+                flags |= super::super::query_base::QueryFlagBits::HAS_TIMESTAMP;
+            }
+            self.simple.build_query(DummyQuery {
+                base: QueryBase::with_params(address, flags, value as u64),
+            })
+        }
+
+        fn free(&mut self, query_id: usize) {
+            self.simple.free(query_id);
+        }
+
+        fn base(&self) -> &StreamerInterfaceBase {
+            &self.simple.base
+        }
+
+        fn base_mut(&mut self) -> &mut StreamerInterfaceBase {
+            &mut self.simple.base
+        }
+    }
+
+    #[test]
+    fn make_dependent_updates_masks_and_preserves_upstream_getter_bug() {
+        let mut a = DummyStreamer::new(3);
+        let mut b = DummyStreamer::new(5);
+        a.make_dependent(&mut b);
+
+        assert_eq!(a.get_dependence_mask(), 1u64 << 5);
+        assert_eq!(a.get_dependent_mask(), 1u64 << 5);
+        assert_eq!(b.base().dependent_mask, 1u64 << 3);
+    }
+
+    #[test]
+    fn simple_streamer_reuses_released_slot_ids() {
+        let mut streamer = DummyStreamer::new(0);
+        let first = streamer.write_counter(0x1000, false, 1, None);
+        let second = streamer.write_counter(0x2000, false, 2, None);
+        streamer.free(first);
+        let reused = streamer.write_counter(0x3000, true, 3, None);
+
+        assert_eq!(first, 0);
+        assert_eq!(second, 1);
+        assert_eq!(reused, first);
+        assert_eq!(streamer.get_query(reused).unwrap().guest_address, 0x3000);
     }
 }

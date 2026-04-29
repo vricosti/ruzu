@@ -26,12 +26,12 @@ use super::init::init_slab_setup::KSlabResourceCounts;
 use super::k_auto_object_container::KAutoObjectWithListContainer;
 use super::k_hardware_timer::KHardwareTimer;
 use super::k_object_name::KObjectNameGlobalData;
+use super::k_process::ProcessLock;
 use super::k_thread::SuspendType;
 use super::k_worker_task_manager::KWorkerTaskManager;
 use super::physical_core::PhysicalCore;
 use crate::core_timing::CoreTiming;
 use crate::hardware_properties;
-use super::k_process::ProcessLock;
 
 // Thread-local host thread ID.
 // Upstream: `static inline thread_local u8 host_thread_id = UINT8_MAX` in KernelCore::Impl.
@@ -57,9 +57,9 @@ static KERNEL_PTR: std::sync::atomic::AtomicPtr<KernelCore> =
 // attached — forcing condvar/arbiter entry points to silently no-op the
 // scheduler lock. Cache it on the kernel singleton so the "always valid"
 // assumption actually holds.
-static SCHEDULER_LOCK_PTR:
-    std::sync::atomic::AtomicPtr<super::k_scheduler_lock::KAbstractSchedulerLock> =
-    std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
+static SCHEDULER_LOCK_PTR: std::sync::atomic::AtomicPtr<
+    super::k_scheduler_lock::KAbstractSchedulerLock,
+> = std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
 
 /// Deferred `KThread::SetActiveCore()` updates that could not be applied
 /// immediately because the target thread mutex was still held.
@@ -118,8 +118,7 @@ pub static SVC_IN_PROGRESS: [std::sync::atomic::AtomicU64;
 /// guest instructions have executed since the last SVC — fine for
 /// post-freeze diagnostics where the spin has no SVCs at all and we want the
 /// PC at which the spin started.
-pub static GUEST_PC: [std::sync::atomic::AtomicU64;
-    hardware_properties::NUM_CPU_CORES as usize] = [
+pub static GUEST_PC: [std::sync::atomic::AtomicU64; hardware_properties::NUM_CPU_CORES as usize] = [
     std::sync::atomic::AtomicU64::new(0),
     std::sync::atomic::AtomicU64::new(0),
     std::sync::atomic::AtomicU64::new(0),
@@ -132,8 +131,7 @@ pub static GUEST_PC: [std::sync::atomic::AtomicU64;
 /// Essential for identifying the actual hot spot in a spin loop where the
 /// game only ever calls one kind of SVC (the SVC address drowns out the
 /// real work PC).
-pub static GUEST_LR: [std::sync::atomic::AtomicU64;
-    hardware_properties::NUM_CPU_CORES as usize] = [
+pub static GUEST_LR: [std::sync::atomic::AtomicU64; hardware_properties::NUM_CPU_CORES as usize] = [
     std::sync::atomic::AtomicU64::new(0),
     std::sync::atomic::AtomicU64::new(0),
     std::sync::atomic::AtomicU64::new(0),
@@ -144,8 +142,7 @@ pub static GUEST_LR: [std::sync::atomic::AtomicU64;
 /// frames above the current SVC/halt — the nnSdk SVC stub caller sits right
 /// above and its caller (the game-level function driving the loop) is
 /// typically within 1-2 frames up.
-pub static GUEST_SP: [std::sync::atomic::AtomicU64;
-    hardware_properties::NUM_CPU_CORES as usize] = [
+pub static GUEST_SP: [std::sync::atomic::AtomicU64; hardware_properties::NUM_CPU_CORES as usize] = [
     std::sync::atomic::AtomicU64::new(0),
     std::sync::atomic::AtomicU64::new(0),
     std::sync::atomic::AtomicU64::new(0),
@@ -166,7 +163,9 @@ pub static GUEST_REGS: [[std::sync::atomic::AtomicU32; 12];
 
 #[inline]
 pub fn mark_svc_enter(core_id: usize, tid: u64, svc: u32) {
-    if core_id >= SVC_IN_PROGRESS.len() { return; }
+    if core_id >= SVC_IN_PROGRESS.len() {
+        return;
+    }
     let packed = ((tid & 0xFFFF_FFFF) << 32) | (svc as u64 & 0xFFFF_FFFF);
     SVC_IN_PROGRESS[core_id].store(packed, Ordering::Release);
 }
@@ -225,7 +224,9 @@ pub fn record_guest_full(core_id: usize, pc: u64, lr: u64, sp: u64, regs: &[u64]
 
 #[inline]
 pub fn mark_svc_exit(core_id: usize) {
-    if core_id >= SVC_IN_PROGRESS.len() { return; }
+    if core_id >= SVC_IN_PROGRESS.len() {
+        return;
+    }
     SVC_IN_PROGRESS[core_id].store(0, Ordering::Release);
 }
 
@@ -309,9 +310,8 @@ fn dump_thread_state(kernel: &KernelCore) {
             // r0..r11 snapshot — surfaces live values of object pointers
             // (r4..r11 are callee-saved; spin-loop base pointer typically
             // lives in one of them) and arg regs at the SVC call site.
-            let regs: [u32; 12] = std::array::from_fn(|i| {
-                GUEST_REGS[core_id][i].load(Ordering::Acquire)
-            });
+            let regs: [u32; 12] =
+                std::array::from_fn(|i| GUEST_REGS[core_id][i].load(Ordering::Acquire));
             eprintln!(
                 "[DUMP]        regs r0-r3:  {:08X} {:08X} {:08X} {:08X}",
                 regs[0], regs[1], regs[2], regs[3],
@@ -361,7 +361,11 @@ fn dump_thread_state(kernel: &KernelCore) {
     let pokes: Vec<(u64, u32)> = std::env::var("RUZU_POKE_ADDR")
         .ok()
         .iter()
-        .flat_map(|raw| raw.split(',').map(|s| s.trim().to_string()).collect::<Vec<_>>())
+        .flat_map(|raw| {
+            raw.split(',')
+                .map(|s| s.trim().to_string())
+                .collect::<Vec<_>>()
+        })
         .filter_map(|tok| {
             let parts: Vec<&str> = tok.split(':').collect();
             if parts.len() != 3 {
@@ -384,7 +388,11 @@ fn dump_thread_state(kernel: &KernelCore) {
     let region_dumps: Vec<(u64, u64)> = std::env::var("RUZU_DUMP_REGION")
         .ok()
         .iter()
-        .flat_map(|raw| raw.split(',').map(|s| s.trim().to_string()).collect::<Vec<_>>())
+        .flat_map(|raw| {
+            raw.split(',')
+                .map(|s| s.trim().to_string())
+                .collect::<Vec<_>>()
+        })
         .filter_map(|tok| {
             let (a, n) = tok.split_once(':')?;
             let a = a.trim_start_matches("0x").trim_start_matches("0X");
@@ -438,34 +446,33 @@ fn dump_thread_state(kernel: &KernelCore) {
             // u32s starting 8 bytes before the PC.
             for pc in &pcs_to_dump {
                 const WORDS_BEFORE: u64 = 32; // 128 bytes before PC (catches BNE-72 target + loop preamble)
-                const WORDS_AFTER: u64 = 16;  // 64 bytes after PC
+                const WORDS_AFTER: u64 = 16; // 64 bytes after PC
                 const TOTAL: usize = (WORDS_BEFORE + WORDS_AFTER + 1) as usize;
                 let start = pc.saturating_sub(WORDS_BEFORE * 4);
                 // Prefer the page_table's guest memory (virtual addresses
                 // mapped by the loader). Fall back to process_memory if
                 // not wired.
-                let words: Option<Vec<u32>> = if let Some(memory) =
-                    guard.page_table.get_base().m_memory.as_ref()
-                {
-                    let m = memory.lock().unwrap();
-                    let mut w = vec![0u32; TOTAL];
-                    for (i, slot) in w.iter_mut().enumerate() {
-                        *slot = m.read_32(start + (i as u64) * 4);
-                    }
-                    Some(w)
-                } else {
-                    let mem = guard.process_memory.read().unwrap();
-                    let len = (TOTAL as u64) * 4;
-                    if !mem.is_valid_range(start, len as usize) {
-                        None
-                    } else {
+                let words: Option<Vec<u32>> =
+                    if let Some(memory) = guard.page_table.get_base().m_memory.as_ref() {
+                        let m = memory.lock().unwrap();
                         let mut w = vec![0u32; TOTAL];
                         for (i, slot) in w.iter_mut().enumerate() {
-                            *slot = mem.read_32(start + (i as u64) * 4);
+                            *slot = m.read_32(start + (i as u64) * 4);
                         }
                         Some(w)
-                    }
-                };
+                    } else {
+                        let mem = guard.process_memory.read().unwrap();
+                        let len = (TOTAL as u64) * 4;
+                        if !mem.is_valid_range(start, len as usize) {
+                            None
+                        } else {
+                            let mut w = vec![0u32; TOTAL];
+                            for (i, slot) in w.iter_mut().enumerate() {
+                                *slot = mem.read_32(start + (i as u64) * 4);
+                            }
+                            Some(w)
+                        }
+                    };
                 match words {
                     Some(w) => {
                         eprint!("[DUMP]   pc=0x{:X} insns:", pc);
@@ -519,7 +526,9 @@ fn dump_thread_state(kernel: &KernelCore) {
                 let nwords = (bytes / 4) as usize;
                 eprintln!(
                     "[DUMP] === REGION 0x{:X}..0x{:X} ({} u32 words) ===",
-                    start, start + bytes, nwords
+                    start,
+                    start + bytes,
+                    nwords
                 );
                 let mut all_words: Vec<u32> = Vec::with_capacity(nwords);
                 if let Some(memory) = guard.page_table.get_base().m_memory.as_ref() {
@@ -576,16 +585,28 @@ fn dump_thread_state(kernel: &KernelCore) {
             eprintln!("[DUMP] Triggering SIGURG backtrace on every worker thread...");
             if let Ok(entries) = std::fs::read_dir("/proc/self/task") {
                 for ent in entries.flatten() {
-                    let Ok(tid_str) = ent.file_name().into_string() else { continue; };
+                    let Ok(tid_str) = ent.file_name().into_string() else {
+                        continue;
+                    };
                     let comm = std::fs::read_to_string(format!("/proc/self/task/{}/comm", tid_str))
                         .unwrap_or_default()
-                        .trim().to_string();
-                    if comm.starts_with("CPUCore_") || comm.starts_with("HLE:")
-                        || comm == "CoreTiming" {
+                        .trim()
+                        .to_string();
+                    if comm.starts_with("CPUCore_")
+                        || comm.starts_with("HLE:")
+                        || comm == "CoreTiming"
+                    {
                         let tid: i32 = tid_str.parse().unwrap_or(-1);
                         if tid > 0 {
                             eprintln!("[DUMP] SIGURG -> host_tid={} comm={}", tid, comm);
-                            unsafe { libc::syscall(libc::SYS_tgkill, std::process::id() as i32, tid, libc::SIGURG); }
+                            unsafe {
+                                libc::syscall(
+                                    libc::SYS_tgkill,
+                                    std::process::id() as i32,
+                                    tid,
+                                    libc::SIGURG,
+                                );
+                            }
                             // Sleep briefly so each thread's output doesn't
                             // interleave chaotically.
                             std::thread::sleep(std::time::Duration::from_millis(30));
@@ -596,27 +617,39 @@ fn dump_thread_state(kernel: &KernelCore) {
             eprintln!("[DUMP] Host threads currently blocked in futex:");
             if let Ok(entries) = std::fs::read_dir("/proc/self/task") {
                 for ent in entries.flatten() {
-                    let Ok(tid_str) = ent.file_name().into_string() else { continue; };
+                    let Ok(tid_str) = ent.file_name().into_string() else {
+                        continue;
+                    };
                     let comm = std::fs::read_to_string(format!("/proc/self/task/{}/comm", tid_str))
                         .unwrap_or_default()
-                        .trim().to_string();
+                        .trim()
+                        .to_string();
                     // Only interesting threads.
-                    if !(comm.starts_with("CPUCore_") || comm == "CoreTiming"
-                         || comm.starts_with("DSP_") || comm.starts_with("HLE:")
-                         || comm == "ruzu-cmd") {
+                    if !(comm.starts_with("CPUCore_")
+                        || comm == "CoreTiming"
+                        || comm.starts_with("DSP_")
+                        || comm.starts_with("HLE:")
+                        || comm == "ruzu-cmd")
+                    {
                         continue;
                     }
-                    let wchan = std::fs::read_to_string(format!("/proc/self/task/{}/wchan", tid_str))
-                        .unwrap_or_default()
-                        .trim().to_string();
-                    let state = std::fs::read_to_string(format!("/proc/self/task/{}/stat", tid_str))
-                        .ok()
-                        .and_then(|s| s.split_whitespace().nth(2).map(|x| x.to_string()))
-                        .unwrap_or_default();
-                    let stack = std::fs::read_to_string(format!("/proc/self/task/{}/stack", tid_str))
-                        .unwrap_or_else(|_| "<stack unavailable>".into());
-                    eprintln!("[DUMP]   host_tid={} comm={} state={} wchan={}",
-                              tid_str, comm, state, wchan);
+                    let wchan =
+                        std::fs::read_to_string(format!("/proc/self/task/{}/wchan", tid_str))
+                            .unwrap_or_default()
+                            .trim()
+                            .to_string();
+                    let state =
+                        std::fs::read_to_string(format!("/proc/self/task/{}/stat", tid_str))
+                            .ok()
+                            .and_then(|s| s.split_whitespace().nth(2).map(|x| x.to_string()))
+                            .unwrap_or_default();
+                    let stack =
+                        std::fs::read_to_string(format!("/proc/self/task/{}/stack", tid_str))
+                            .unwrap_or_else(|_| "<stack unavailable>".into());
+                    eprintln!(
+                        "[DUMP]   host_tid={} comm={} state={} wchan={}",
+                        tid_str, comm, state, wchan
+                    );
                     for line in stack.lines().take(6) {
                         eprintln!("[DUMP]     {}", line.trim());
                     }
@@ -658,9 +691,18 @@ fn dump_thread_state(kernel: &KernelCore) {
                 "[DUMP]   tid={} state={:?} prio={} core={} wait={:?} \
                  addr_key=0x{:X} addr_key_val=0x{:X} cv_key=0x{:X} \
                  waiting_lock={} pc=0x{:08X} lr=0x{:08X} sp=0x{:08X}",
-                tid, state, priority, current_core, wait_reason,
-                addr_key.get(), addr_key_val, cv_key, waiting_lock,
-                pc, lr, sp,
+                tid,
+                state,
+                priority,
+                current_core,
+                wait_reason,
+                addr_key.get(),
+                addr_key_val,
+                cv_key,
+                waiting_lock,
+                pc,
+                lr,
+                sp,
             );
         } else {
             eprintln!(
@@ -950,7 +992,11 @@ pub fn get_current_thread_id_fast() -> Option<u64> {
         return None;
     }
     let id = CURRENT_THREAD_ID.with(|cell| cell.get());
-    if id == 0 { None } else { Some(id) }
+    if id == 0 {
+        None
+    } else {
+        Some(id)
+    }
 }
 
 pub fn with_current_thread_fast_mut<R>(f: impl FnOnce(&mut KThread) -> R) -> Option<R> {
@@ -1891,10 +1937,7 @@ impl KernelCore {
 
     /// Register a host thread (non-core) by allocating the next host thread ID.
     /// Upstream: `KernelCore::RegisterHostThread(existing_thread)` (kernel.cpp:1036).
-    pub fn register_host_thread_with_existing(
-        &self,
-        existing_thread: Option<&Arc<KThreadLock>>,
-    ) {
+    pub fn register_host_thread_with_existing(&self, existing_thread: Option<&Arc<KThreadLock>>) {
         HOST_THREAD_ID.with(|id| {
             if id.get() == u32::MAX {
                 let new_id = self.next_host_thread_id.fetch_add(1, Ordering::Relaxed);

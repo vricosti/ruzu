@@ -568,9 +568,7 @@ impl KAddressArbiter {
                     .and_then(|scheduler| scheduler.upgrade())
             });
 
-        while current_thread.lock().unwrap().get_state()
-            == super::k_thread::ThreadState::WAITING
-        {
+        while current_thread.lock().unwrap().get_state() == super::k_thread::ThreadState::WAITING {
             if let Some(scheduler) = scheduler.as_ref() {
                 scheduler.lock().unwrap().request_schedule();
                 let sched_ptr = {

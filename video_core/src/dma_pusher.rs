@@ -855,7 +855,10 @@ impl DmaPusher {
             if let Some(s) = current_submit_traced() {
                 log::info!(
                     "[PULLER_TRACE] s#{} sink m=0x{:X} arg=0x{:08X} subch={}",
-                    s, self.dma_state.method, argument, self.dma_state.subchannel,
+                    s,
+                    self.dma_state.method,
+                    argument,
+                    self.dma_state.subchannel,
                 );
             }
             subchannel.push_method_sink(self.dma_state.method, argument);
@@ -906,12 +909,15 @@ impl DmaPusher {
             );
         }
         if let Some(s) = current_submit_traced() {
-            let preview: Vec<String> =
-                args.iter().take(8).map(|v| format!("{:08X}", v)).collect();
+            let preview: Vec<String> = args.iter().take(8).map(|v| format!("{:08X}", v)).collect();
             log::info!(
                 "[PULLER_TRACE] s#{} multi {} m=0x{:X} subch={} count={} pending={} args[0..]={:?}",
                 s,
-                if self.dma_state.method < NON_PULLER_METHODS { "puller" } else { "engine" },
+                if self.dma_state.method < NON_PULLER_METHODS {
+                    "puller"
+                } else {
+                    "engine"
+                },
                 self.dma_state.method,
                 self.dma_state.subchannel,
                 args.len(),

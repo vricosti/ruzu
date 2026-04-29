@@ -11,6 +11,9 @@ use std::collections::HashMap;
 use ash::vk;
 use log::trace;
 
+use crate::control::channel_state::ChannelState;
+use crate::control::channel_state_cache::{ChannelInfo, ChannelSetupCaches};
+
 /// A cached GPU texture (VkImage + VkImageView + VkSampler).
 pub struct CachedTexture {
     pub image: vk::Image,
@@ -50,6 +53,7 @@ pub struct TextureCache {
     device: ash::Device,
     instance: ash::Instance,
     physical_device: vk::PhysicalDevice,
+    channel_caches: ChannelSetupCaches<ChannelInfo>,
 
     /// Cached textures by TIC (texture image control) index.
     textures: HashMap<u32, CachedTexture>,
@@ -68,9 +72,25 @@ impl TextureCache {
             device,
             instance,
             physical_device,
+            channel_caches: ChannelSetupCaches::new(),
             textures: HashMap::new(),
             framebuffers: HashMap::new(),
         }
+    }
+
+    /// Port of the Vulkan texture-cache owner `CreateChannel` edge.
+    pub fn create_channel(&mut self, channel: &ChannelState) {
+        self.channel_caches.create_channel(channel);
+    }
+
+    /// Port of the Vulkan texture-cache owner `BindToChannel` edge.
+    pub fn bind_to_channel(&mut self, channel_id: i32) {
+        self.channel_caches.bind_to_channel(channel_id);
+    }
+
+    /// Port of the Vulkan texture-cache owner `EraseChannel` edge.
+    pub fn erase_channel(&mut self, channel_id: i32) {
+        self.channel_caches.erase_channel(channel_id);
     }
 
     /// Get or create a framebuffer for the given render target configuration.

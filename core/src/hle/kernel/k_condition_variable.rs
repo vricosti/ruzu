@@ -15,6 +15,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use super::k_process::ProcessLock;
 use crate::hle::kernel::k_process::KProcess;
 use crate::hle::kernel::k_scheduler::KScheduler;
 use crate::hle::kernel::k_thread::{
@@ -29,7 +30,6 @@ use crate::hle::kernel::svc::svc_results::{
 use crate::hle::kernel::svc_common::Handle;
 use crate::hle::kernel::svc_common::{HANDLE_WAIT_MASK, INVALID_HANDLE};
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
-use super::k_process::ProcessLock;
 
 static TRACE_KCV_COUNT: AtomicUsize = AtomicUsize::new(0);
 
@@ -259,8 +259,7 @@ impl KConditionVariable {
         // kernel is initialized. No per-thread fallback.
         let scheduler_lock = super::kernel::scheduler_lock()
             .expect("scheduler_lock must exist — kernel not initialized?");
-        let _scheduler_guard =
-            super::k_scheduler_lock::KScopedSchedulerLock::new(scheduler_lock);
+        let _scheduler_guard = super::k_scheduler_lock::KScopedSchedulerLock::new(scheduler_lock);
 
         let mut next_owner_thread = None;
         let result = {
@@ -526,16 +525,10 @@ impl KConditionVariable {
     /// The caller must already hold the process lock (passes `&mut KProcess`).
     /// Upstream wraps the body in `KScopedSchedulerLock sl(m_kernel)` — we do
     /// the same via `kernel::scheduler_lock()`.
-    pub fn signal(
-        &mut self,
-        process_guard: &mut KProcess,
-        cv_key: u64,
-        count: i32,
-    ) -> ResultCode {
+    pub fn signal(&mut self, process_guard: &mut KProcess, cv_key: u64, count: i32) -> ResultCode {
         let scheduler_lock = super::kernel::scheduler_lock()
             .expect("scheduler_lock must exist — kernel not initialized?");
-        let _scheduler_guard =
-            super::k_scheduler_lock::KScopedSchedulerLock::new(scheduler_lock);
+        let _scheduler_guard = super::k_scheduler_lock::KScopedSchedulerLock::new(scheduler_lock);
 
         let mut num_waiters = 0i32;
         log::trace!(

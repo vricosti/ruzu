@@ -14,10 +14,14 @@ use crate::arm::arm_interface::{
 use crate::core::System;
 use crate::hle::kernel::svc_dispatch::{self, SvcArgs};
 
+use super::k_process::ProcessLock;
 #[cfg(feature = "debug-logs")]
 use super::physical_core_log;
-use super::{k_process::KProcess, k_scheduler::KScheduler, k_thread::{KThread, KThreadLock}};
-use super::k_process::ProcessLock;
+use super::{
+    k_process::KProcess,
+    k_scheduler::KScheduler,
+    k_thread::{KThread, KThreadLock},
+};
 
 pub enum PhysicalCoreExecutionControl {
     Continue,

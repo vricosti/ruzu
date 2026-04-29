@@ -27,6 +27,7 @@ use crate::engines::Framebuffer;
 use crate::fence_manager::FenceManager;
 use crate::host1x::syncpoint_manager::SyncpointManager;
 use crate::query_cache::types::QueryPropertiesFlags;
+use crate::query_cache_top::QueryType as VideoQueryType;
 use crate::rasterizer::SoftwareRasterizer;
 use crate::rasterizer_interface::{RasterizerDownloadArea, RasterizerInterface};
 use crate::shader_cache::ShaderCache;
@@ -34,6 +35,23 @@ use crate::texture_cache::texture_cache_base::TextureCacheBase;
 
 struct OpenGLDeviceTracker;
 static OPENGL_DEVICE_TRACKER: OpenGLDeviceTracker = OpenGLDeviceTracker;
+
+fn maxwell_to_video_core_query(query_type: u32) -> Option<VideoQueryType> {
+    match query_type {
+        x if x == crate::query_cache::types::QueryType::PrimitivesGenerated as u32
+            || x == crate::query_cache::types::QueryType::VtgPrimitivesOut as u32 =>
+        {
+            Some(VideoQueryType::PrimitivesGenerated)
+        }
+        x if x == crate::query_cache::types::QueryType::ZPassPixelCount64 as u32 => {
+            Some(VideoQueryType::SamplesPassed)
+        }
+        x if x == crate::query_cache::types::QueryType::StreamingPrimitivesSucceeded as u32 => {
+            Some(VideoQueryType::TfbPrimitivesWritten)
+        }
+        _ => None,
+    }
+}
 
 /// Adapter that implements `GpuMemoryAccess` for the buffer cache by
 /// delegating to the channel's `MemoryManager`.
@@ -300,7 +318,7 @@ impl RasterizerOpenGL {
         Self {
             syncpoints,
             fence_backend: FenceManagerOpenGL::new(),
-            fence_manager: FenceManager::new(),
+            fence_manager: FenceManager::new(false),
             frame_count: 0,
             num_queued_commands: 0,
             has_written_global_memory: false,
@@ -322,7 +340,7 @@ impl RasterizerOpenGL {
         Self {
             syncpoints,
             fence_backend: FenceManagerOpenGL::new(),
-            fence_manager: FenceManager::new(),
+            fence_manager: FenceManager::new(false),
             frame_count: 0,
             num_queued_commands: 0,
             has_written_global_memory: false,
@@ -606,23 +624,100 @@ impl RasterizerInterface for RasterizerOpenGL {
         debug!("RasterizerOpenGL::dispatch_compute");
     }
 
-    fn reset_counter(&mut self, _query_type: u32) {}
+    fn reset_counter(&mut self, query_type: u32) {
+        let Some(mapped_query_type) = maxwell_to_video_core_query(query_type) else {
+            return;
+        };
+        self.query_cache
+            .set_commands_queued(self.num_queued_commands != 0);
+        self.query_cache.reset_counter(mapped_query_type as u32);
+    }
 
     fn query(
         &mut self,
         gpu_addr: u64,
-        _query_type: u32,
+        query_type: u32,
         flags: QueryPropertiesFlags,
-        payload: u32,
+        mut payload: u32,
         _subreport: u32,
     ) {
+        if std::env::var_os("RUZU_TRACE_GL_QUERY").is_some() {
+            log::info!(
+                "RasterizerOpenGL::query gpu=0x{:X} type={} flags=0x{:X} payload=0x{:X} has_mm={}",
+                gpu_addr,
+                query_type,
+                flags.bits(),
+                payload,
+                self.channel_memory_manager.is_some()
+            );
+        }
+        let Some(mapped_query_type) = maxwell_to_video_core_query(query_type) else {
+            if query_type != crate::query_cache::types::QueryType::Payload as u32 {
+                payload = 1;
+            }
+            let Some(mm) = self.channel_memory_manager.as_ref().cloned() else {
+                if std::env::var_os("RUZU_TRACE_GL_QUERY").is_some() {
+                    log::info!(
+                        "RasterizerOpenGL::query fallback drop gpu=0x{:X} type={} flags=0x{:X} payload=0x{:X}",
+                        gpu_addr,
+                        query_type,
+                        flags.bits(),
+                        payload
+                    );
+                }
+                return;
+            };
+            let has_timeout = flags.contains(QueryPropertiesFlags::HAS_TIMEOUT);
+            let is_fence = flags.contains(QueryPropertiesFlags::IS_A_FENCE);
+            let gpu_ticks_getter = self.gpu_ticks_getter.as_ref().cloned();
+            let operation = Box::new(move || {
+                let mm = mm.lock();
+                if has_timeout {
+                    let gpu_ticks = gpu_ticks_getter
+                        .as_ref()
+                        .map(|getter| getter())
+                        .unwrap_or(0);
+                    mm.write_block_unsafe_owned(gpu_addr + 8, &gpu_ticks.to_le_bytes());
+                    mm.write_block_unsafe_owned(gpu_addr, &(payload as u64).to_le_bytes());
+                } else {
+                    mm.write_block_unsafe_owned(gpu_addr, &payload.to_le_bytes());
+                }
+            });
+            if is_fence {
+                self.signal_fence(operation);
+            } else {
+                operation();
+            }
+            return;
+        };
+
+        if std::env::var_os("RUZU_TRACE_GL_QUERY").is_some() {
+            log::info!(
+                "RasterizerOpenGL::query mapped gpu=0x{:X} mapped_type={:?} flags=0x{:X}",
+                gpu_addr,
+                mapped_query_type,
+                flags.bits()
+            );
+        }
+
         let this = self as *mut Self;
+        let this_for_invalidate = this as usize;
+        let timestamp = flags.contains(QueryPropertiesFlags::HAS_TIMEOUT).then(|| {
+            self.gpu_ticks_getter
+                .as_ref()
+                .map(|getter| getter())
+                .unwrap_or(0)
+        });
+        self.query_cache
+            .set_commands_queued(self.num_queued_commands != 0);
         self.query_cache.query(
             gpu_addr,
-            flags,
-            payload,
-            move |func| unsafe { (*this).signal_fence(func) },
+            mapped_query_type,
+            timestamp,
             move |func| unsafe { (*this).sync_operation(func) },
+            move |addr, size| unsafe {
+                (*(this_for_invalidate as *mut Self)).on_cache_invalidation(addr, size)
+            },
         );
     }
 
@@ -639,13 +734,14 @@ impl RasterizerInterface for RasterizerOpenGL {
 
     fn signal_fence(&mut self, func: Box<dyn FnOnce() + Send>) {
         let this = self as *mut Self;
+        let this_for_pop = this as usize;
         let should_flush_now = self.fence_manager.signal_fence(
             func,
             move |is_stubbed| unsafe { (*this).fence_backend.create_fence(is_stubbed) },
             move |fence| unsafe { (*this).fence_backend.queue_fence(fence) },
             move || unsafe { (*this).should_wait_async_flushes() },
             move |fence| unsafe { (*this).fence_backend.is_fence_signaled(fence) },
-            move || unsafe { (*this).pop_async_flushes() },
+            move || unsafe { (*(this_for_pop as *mut Self)).pop_async_flushes() },
             move || unsafe { (*this).num_queued_commands != 0 || (*this).should_flush_async() },
             move || unsafe { (*this).commit_async_flushes() },
         );
@@ -668,6 +764,7 @@ impl RasterizerInterface for RasterizerOpenGL {
             );
         }
         let this = self as *mut Self;
+        let this_for_pop = this as usize;
         let syncpoints = Arc::clone(&self.syncpoints);
         let should_flush_now = self.fence_manager.signal_sync_point(
             id,
@@ -696,7 +793,7 @@ impl RasterizerInterface for RasterizerOpenGL {
             move |fence| unsafe { (*this).fence_backend.queue_fence(fence) },
             move || unsafe { (*this).should_wait_async_flushes() },
             move |fence| unsafe { (*this).fence_backend.is_fence_signaled(fence) },
-            move || unsafe { (*this).pop_async_flushes() },
+            move || unsafe { (*(this_for_pop as *mut Self)).pop_async_flushes() },
             move || unsafe { (*this).num_queued_commands != 0 || (*this).should_flush_async() },
             move || unsafe { (*this).commit_async_flushes() },
         );
@@ -715,20 +812,18 @@ impl RasterizerInterface for RasterizerOpenGL {
 
     fn signal_reference(&mut self) {
         let this = self as *mut Self;
+        let this_for_pop = this as usize;
         self.fence_manager.signal_ordering(
             move || unsafe { (*this).should_wait_async_flushes() },
             move |fence| unsafe { (*this).fence_backend.is_fence_signaled(fence) },
-            move || unsafe { (*this).pop_async_flushes() },
+            move || unsafe { (*(this_for_pop as *mut Self)).pop_async_flushes() },
             move || unsafe { (*this).accumulate_buffer_flushes() },
         );
     }
 
     fn release_fences(&mut self, force: bool) {
         if std::env::var_os("RUZU_TRACE_SYNCPOINT").is_some() {
-            log::info!(
-                "GLRasterizer::release_fences force={}",
-                force,
-            );
+            log::info!("GLRasterizer::release_fences force={}", force,);
         }
         let this = self as *mut Self;
         self.fence_manager.wait_pending_fences(
@@ -752,6 +847,8 @@ impl RasterizerInterface for RasterizerOpenGL {
         }
         self.texture_cache.download_memory(addr, size as usize);
         self.buffer_cache.download_memory(addr, size);
+        self.query_cache
+            .set_commands_queued(self.num_queued_commands != 0);
         self.query_cache.flush_region(addr, size as usize);
     }
 
@@ -778,6 +875,8 @@ impl RasterizerInterface for RasterizerOpenGL {
         self.texture_cache.write_memory(addr, size as usize);
         self.buffer_cache.write_memory(addr, size);
         self.shader_cache.invalidate_region(addr, size as usize);
+        self.query_cache
+            .set_commands_queued(self.num_queued_commands != 0);
         self.query_cache.invalidate_region(addr, size as usize);
     }
 
@@ -929,22 +1028,29 @@ impl RasterizerInterface for RasterizerOpenGL {
         }
     }
 
-    fn initialize_channel(&mut self, _channel: &crate::control::channel_state::ChannelState) {
-        // Upstream `RasterizerOpenGL` inherits from `ChannelSetupCaches`
-        // which allocates per-channel state for the buffer/texture/shader
-        // caches. The Rust port initialises the buffer cache's channel
-        // state lazily on first `bind_channel` instead.
+    fn initialize_channel(&mut self, channel: &crate::control::channel_state::ChannelState) {
+        self.query_cache.create_channel(channel);
+        // Upstream `RasterizerOpenGL` also creates per-channel state for the
+        // texture, buffer, and shader caches here. Those owners are still
+        // partially reduced in Rust.
     }
 
     fn bind_channel(&mut self, channel: &crate::control::channel_state::ChannelState) {
         if self.buffer_cache.channel_state.is_none() {
             self.buffer_cache.channel_state = Some(Box::default());
         }
+        self.query_cache.bind_to_channel(channel.bind_id);
         // Extract the channel's MemoryManager and store it so subsequent
         // draws can build GpuMemoryAccess adapters.
         if let Some(ref mm) = channel.memory_manager {
+            if std::env::var_os("RUZU_TRACE_GL_QUERY").is_some() {
+                log::info!(
+                    "RasterizerOpenGL::bind_channel channel_id={} memory_manager={:p}",
+                    channel.bind_id,
+                    Arc::as_ptr(mm)
+                );
+            }
             self.channel_memory_manager = Some(Arc::clone(mm));
-            self.query_cache.set_memory_manager(Arc::clone(mm));
 
             // If we already have the CPU reader (set_gpu_memory_reader was
             // called before bind_channel), install GPU + device memory
@@ -961,6 +1067,11 @@ impl RasterizerInterface for RasterizerOpenGL {
                     }));
             }
         }
+    }
+
+    fn release_channel(&mut self, channel_id: i32) {
+        self.query_cache.erase_channel(channel_id);
+        self.channel_memory_manager = None;
     }
 }
 
@@ -981,8 +1092,12 @@ mod tests {
             writes.lock().unwrap().push((addr, data.to_vec()));
         }));
         let mm = Arc::new(parking_lot::Mutex::new(mm));
+        let mut channel = crate::control::channel_state::ChannelState::new(1);
+        channel.program_id = 0xCAFE;
+        channel.memory_manager = Some(Arc::clone(&mm));
         rast.channel_memory_manager = Some(Arc::clone(&mm));
-        rast.query_cache.set_memory_manager(mm);
+        rast.query_cache.create_channel(&channel);
+        rast.query_cache.bind_to_channel(channel.bind_id);
     }
 
     #[test]
@@ -1087,19 +1202,20 @@ mod tests {
     }
 
     #[test]
-    fn query_non_fence_defers_guest_write_until_next_fence_release_and_preserves_payload() {
+    fn query_non_fence_payload_fallback_writes_immediately_and_preserves_payload() {
         let syncpoints = Arc::new(SyncpointManager::new());
         let mut rast = RasterizerOpenGL::new_for_test(syncpoints);
         let writes = Arc::new(std::sync::Mutex::new(Vec::<(u64, Vec<u8>)>::new()));
         install_query_memory_manager(&mut rast, Arc::clone(&writes));
         rast.set_gpu_ticks_getter(Arc::new(|| 0));
 
-        rast.query(0x3000, 3, QueryPropertiesFlags::empty(), 0xCAFE_BABE, 0);
-
-        assert!(writes.lock().unwrap().is_empty());
-
-        rast.signal_fence(Box::new(|| {}));
-        rast.release_fences(true);
+        rast.query(
+            0x3000,
+            crate::query_cache::types::QueryType::Payload as u32,
+            QueryPropertiesFlags::empty(),
+            0xCAFE_BABE,
+            0,
+        );
 
         let writes = writes.lock().unwrap();
         assert_eq!(writes.len(), 1);
@@ -1108,19 +1224,20 @@ mod tests {
     }
 
     #[test]
-    fn query_has_timeout_defers_guest_write_until_next_fence_release_and_preserves_payload() {
+    fn query_has_timeout_payload_fallback_writes_immediately_and_preserves_payload() {
         let syncpoints = Arc::new(SyncpointManager::new());
         let mut rast = RasterizerOpenGL::new_for_test(syncpoints);
         let writes = Arc::new(std::sync::Mutex::new(Vec::<(u64, Vec<u8>)>::new()));
         install_query_memory_manager(&mut rast, Arc::clone(&writes));
         rast.set_gpu_ticks_getter(Arc::new(|| 0x0123_4567_89AB_CDEF));
 
-        rast.query(0x4000, 7, QueryPropertiesFlags::HAS_TIMEOUT, 0xABCD_EF01, 0);
-
-        assert!(writes.lock().unwrap().is_empty());
-
-        rast.signal_fence(Box::new(|| {}));
-        rast.release_fences(true);
+        rast.query(
+            0x4000,
+            crate::query_cache::types::QueryType::Payload as u32,
+            QueryPropertiesFlags::HAS_TIMEOUT,
+            0xABCD_EF01,
+            0,
+        );
 
         let writes = writes.lock().unwrap();
         assert_eq!(writes.len(), 2);
@@ -1128,6 +1245,31 @@ mod tests {
         assert_eq!(writes[0].1, 0x0123_4567_89AB_CDEFu64.to_le_bytes().to_vec());
         assert_eq!(writes[1].0, 0x9000_4000);
         assert_eq!(writes[1].1, 0xABCD_EF01u64.to_le_bytes().to_vec());
+    }
+
+    #[test]
+    fn query_fallback_non_payload_fence_writes_one_after_release() {
+        let syncpoints = Arc::new(SyncpointManager::new());
+        let mut rast = RasterizerOpenGL::new_for_test(syncpoints);
+        let writes = Arc::new(std::sync::Mutex::new(Vec::<(u64, Vec<u8>)>::new()));
+        install_query_memory_manager(&mut rast, Arc::clone(&writes));
+
+        rast.query(
+            0x5000,
+            crate::query_cache::types::QueryType::VerticesGenerated as u32,
+            QueryPropertiesFlags::IS_A_FENCE,
+            0xDEAD_BEEF,
+            0,
+        );
+
+        assert!(writes.lock().unwrap().is_empty());
+
+        rast.release_fences(true);
+
+        let writes = writes.lock().unwrap();
+        assert_eq!(writes.len(), 1);
+        assert_eq!(writes[0].0, 0x9000_5000);
+        assert_eq!(writes[0].1, 1u32.to_le_bytes().to_vec());
     }
 
     #[test]

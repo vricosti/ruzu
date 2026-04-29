@@ -4,13 +4,13 @@
 //!
 //! SVC handlers for process operations (ExitProcess, GetProcessId, GetProcessList, etc.).
 
+use super::super::k_process::ProcessLock;
 use crate::core::System;
 use crate::hle::kernel::k_process::KProcess;
 use crate::hle::kernel::svc::svc_results::*;
 use crate::hle::kernel::svc::svc_types::*;
 use crate::hle::kernel::svc_common::{Handle, PseudoHandle};
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
-use super::super::k_process::ProcessLock;
 
 /// Exits the current process.
 pub fn exit_process(system: &System) {

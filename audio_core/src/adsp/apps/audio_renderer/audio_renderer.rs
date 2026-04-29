@@ -345,7 +345,9 @@ impl AudioRenderer {
 
                     let t = std::time::Instant::now();
                     if system.lock().is_shutting_down() {
-                        if profile { prof_shutdown_check_us = t.elapsed().as_micros(); }
+                        if profile {
+                            prof_shutdown_check_us = t.elapsed().as_micros();
+                        }
                         thread::sleep(Duration::from_millis(5));
                         if should_trace_adsp_audio() {
                             log::info!(
@@ -355,18 +357,24 @@ impl AudioRenderer {
                         mailbox.send(Direction::Host, Message::RenderResponse as u32);
                         continue;
                     }
-                    if profile { prof_shutdown_check_us = t.elapsed().as_micros(); }
+                    if profile {
+                        prof_shutdown_check_us = t.elapsed().as_micros();
+                    }
 
                     let mut buffers_reset = [false; MAX_RENDERER_SESSIONS];
                     let mut render_times_taken = [0u64; MAX_RENDERER_SESSIONS];
                     let t = std::time::Instant::now();
                     let start_time =
                         system.lock().core_timing().get_global_time_us().as_micros() as u64;
-                    if profile { prof_timing_lock_us = t.elapsed().as_micros(); }
+                    if profile {
+                        prof_timing_lock_us = t.elapsed().as_micros();
+                    }
                     let t = std::time::Instant::now();
                     let session0_applet_resource_user_id =
                         shared.lock().command_buffers[0].applet_resource_user_id;
-                    if profile { prof_applet_id_lock_us = t.elapsed().as_micros(); }
+                    if profile {
+                        prof_applet_id_lock_us = t.elapsed().as_micros();
+                    }
 
                     for index in 0..MAX_RENDERER_SESSIONS {
                         let t = std::time::Instant::now();
@@ -374,7 +382,9 @@ impl AudioRenderer {
                             let shared = shared.lock();
                             (shared.streams[index].clone(), shared.command_buffers[index])
                         };
-                        if profile { prof_stream_lookup_us += t.elapsed().as_micros(); }
+                        if profile {
+                            prof_stream_lookup_us += t.elapsed().as_micros();
+                        }
                         if buffer_state.buffer == 0 {
                             continue;
                         }
@@ -416,7 +426,9 @@ impl AudioRenderer {
                                 );
                             }
                         }
-                        if profile { prof_init_shared_lock_us += t.elapsed().as_micros(); }
+                        if profile {
+                            prof_init_shared_lock_us += t.elapsed().as_micros();
+                        }
 
                         if buffer_state.reset_buffer && !buffers_reset[index] {
                             stream.lock().clear_queue();
@@ -441,7 +453,9 @@ impl AudioRenderer {
                                 );
                             }
                             release.wait_free_space_with_stop(&stop_requested);
-                            if profile { prof_wait_free_us += t.elapsed().as_micros(); }
+                            if profile {
+                                prof_wait_free_us += t.elapsed().as_micros();
+                            }
                             if should_trace_adsp_audio() {
                                 let queued = release.queued_buffers.load(Ordering::Acquire);
                                 let max = release.max_queue_size.load(Ordering::Acquire);
@@ -479,11 +493,15 @@ impl AudioRenderer {
                         let buffer = &mut command_buffers[index];
                         processor.set_process_time_max(max_time);
                         render_times_taken[index] = processor.process(index as u32);
-                        if profile { prof_process_us += t_process.elapsed().as_micros(); }
+                        if profile {
+                            prof_process_us += t_process.elapsed().as_micros();
+                        }
                         let t = std::time::Instant::now();
                         let end_time =
                             system.lock().core_timing().get_global_time_us().as_micros() as u64;
-                        if profile { prof_end_time_lock_us += t.elapsed().as_micros(); }
+                        if profile {
+                            prof_end_time_lock_us += t.elapsed().as_micros();
+                        }
                         buffer.remaining_command_count = processor.get_remaining_command_count();
                         buffer.render_time_taken_us = end_time.saturating_sub(start_time);
                         if profile {

@@ -11,13 +11,13 @@
 
 use std::sync::{Arc, Mutex};
 
+use super::super::k_process::ProcessLock;
 use crate::core::System;
 use crate::hle::kernel::k_port::KPort;
 use crate::hle::kernel::svc::svc_results::*;
 use crate::hle::kernel::svc_common::{Handle, INVALID_HANDLE};
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 use crate::hle::service::hle_ipc::SessionRequestManager;
-use super::super::k_process::ProcessLock;
 
 const PORT_NAME_MAX_LENGTH: usize = 12;
 

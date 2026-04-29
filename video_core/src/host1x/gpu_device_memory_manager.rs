@@ -27,6 +27,12 @@ pub struct MaxwellDeviceMemoryManager {
     // which depends on Core::System providing DeviceMemory access.
 }
 
+impl Default for MaxwellDeviceMemoryManager {
+    fn default() -> Self {
+        Self {}
+    }
+}
+
 impl MaxwellDeviceMemoryManager {
     /// Read a value of type T from a device address.
     ///
@@ -84,6 +90,11 @@ impl MaxwellDeviceMemoryManager {
     pub fn get_pointer_mut(&self, _addr: DAddr) -> *mut u8 {
         log::warn!("MaxwellDeviceMemoryManager::get_pointer_mut: not yet implemented");
         std::ptr::null_mut()
+    }
+
+    /// Port of `MaxwellDeviceMemoryManager::UpdatePagesCachedCount`.
+    pub fn update_pages_cached_count(&self, _addr: DAddr, _size: usize, _delta: i32) {
+        log::warn!("MaxwellDeviceMemoryManager::update_pages_cached_count: not yet implemented");
     }
 }
 

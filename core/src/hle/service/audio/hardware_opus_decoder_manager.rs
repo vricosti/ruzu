@@ -160,10 +160,7 @@ impl IHardwareOpusDecoderManager {
     /// or return the error result.
     fn finish_open(
         ctx: &mut HLERequestContext,
-        result: std::result::Result<
-            Box<dyn crate::core::OpusDecoderInterface>,
-            ResultCode,
-        >,
+        result: std::result::Result<Box<dyn crate::core::OpusDecoderInterface>, ResultCode>,
     ) {
         match result {
             Ok(decoder) => {
@@ -210,10 +207,7 @@ impl IHardwareOpusDecoderManager {
     }
 
     /// Mirror upstream `GetWorkBufferSize` (cmd 1).
-    fn get_work_buffer_size_handler(
-        this: &dyn ServiceFramework,
-        ctx: &mut HLERequestContext,
-    ) {
+    fn get_work_buffer_size_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         let svc = Self::as_self(this);
         let mut request = CmifRequest::new(ctx);
         let params: OpusParameters = request.raw();
@@ -340,10 +334,7 @@ impl IHardwareOpusDecoderManager {
     }
 
     /// Mirror upstream `GetWorkBufferSizeEx` (cmd 5).
-    fn get_work_buffer_size_ex_handler(
-        this: &dyn ServiceFramework,
-        ctx: &mut HLERequestContext,
-    ) {
+    fn get_work_buffer_size_ex_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         let svc = Self::as_self(this);
         let mut request = CmifRequest::new(ctx);
         let params: OpusParametersEx = request.raw();
@@ -459,13 +450,11 @@ impl IHardwareOpusDecoderManager {
 fn read_multi_stream_params(ctx: &HLERequestContext) -> OpusMultiStreamParameters {
     let raw = ctx.read_buffer(0);
     let mut out = OpusMultiStreamParameters::default();
-    let copy = raw.len().min(std::mem::size_of::<OpusMultiStreamParameters>());
+    let copy = raw
+        .len()
+        .min(std::mem::size_of::<OpusMultiStreamParameters>());
     unsafe {
-        std::ptr::copy_nonoverlapping(
-            raw.as_ptr(),
-            &mut out as *mut _ as *mut u8,
-            copy,
-        );
+        std::ptr::copy_nonoverlapping(raw.as_ptr(), &mut out as *mut _ as *mut u8, copy);
     }
     out
 }
@@ -475,13 +464,11 @@ fn read_multi_stream_params(ctx: &HLERequestContext) -> OpusMultiStreamParameter
 fn read_multi_stream_params_ex(ctx: &HLERequestContext) -> OpusMultiStreamParametersEx {
     let raw = ctx.read_buffer(0);
     let mut out = OpusMultiStreamParametersEx::default();
-    let copy = raw.len().min(std::mem::size_of::<OpusMultiStreamParametersEx>());
+    let copy = raw
+        .len()
+        .min(std::mem::size_of::<OpusMultiStreamParametersEx>());
     unsafe {
-        std::ptr::copy_nonoverlapping(
-            raw.as_ptr(),
-            &mut out as *mut _ as *mut u8,
-            copy,
-        );
+        std::ptr::copy_nonoverlapping(raw.as_ptr(), &mut out as *mut _ as *mut u8, copy);
     }
     out
 }

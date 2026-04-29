@@ -1,15 +1,15 @@
 // SPDX-FileCopyrightText: 2025 ruzu contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! Graphics pipeline compilation and caching.
+//! Graphics pipeline compilation helpers.
 //!
-//! Ref: zuyu `vk_graphics_pipeline.h` — caches compiled VkPipelines keyed by
-//! shader hashes + FixedPipelineState, avoiding redundant pipeline creation.
-
-use std::collections::HashMap;
+//! Ref: zuyu `vk_graphics_pipeline.h` and `vk_pipeline_cache.h` — this file is
+//! the reduced compilation leaf, while `pipeline_cache.rs` owns the matching
+//! top-level pipeline-cache state and lookup flow.
 
 use ash::vk;
 use log::{debug, warn};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::engines::maxwell_3d::{DrawCall, ShaderStageType};
 use crate::shader;
@@ -26,22 +26,63 @@ pub struct GraphicsPipelineKey {
     pub fixed_state: FixedPipelineState,
 }
 
-/// A compiled and cached Vulkan graphics pipeline.
+/// A compiled Vulkan graphics pipeline.
 pub struct GraphicsPipeline {
+    device: ash::Device,
+    key: GraphicsPipelineKey,
+    transition_keys: Vec<GraphicsPipelineKey>,
     pub pipeline: vk::Pipeline,
     pub pipeline_layout: vk::PipelineLayout,
     pub descriptor_set_layout: vk::DescriptorSetLayout,
     pub vs_module: vk::ShaderModule,
     pub fs_module: vk::ShaderModule,
+    is_built: AtomicBool,
 }
 
-/// Cache of compiled graphics pipelines.
+impl Drop for GraphicsPipeline {
+    fn drop(&mut self) {
+        unsafe {
+            self.device.destroy_pipeline(self.pipeline, None);
+            self.device
+                .destroy_pipeline_layout(self.pipeline_layout, None);
+            self.device
+                .destroy_descriptor_set_layout(self.descriptor_set_layout, None);
+            self.device.destroy_shader_module(self.vs_module, None);
+            self.device.destroy_shader_module(self.fs_module, None);
+        }
+    }
+}
+
+impl GraphicsPipeline {
+    /// Port of `GraphicsPipeline::AddTransition`.
+    pub fn add_transition(&mut self, transition_key: GraphicsPipelineKey) {
+        self.transition_keys.push(transition_key);
+    }
+
+    /// Port of `GraphicsPipeline::Next`.
+    pub fn next<'a>(
+        &'a self,
+        current_key: &GraphicsPipelineKey,
+    ) -> Option<&'a GraphicsPipelineKey> {
+        if &self.key == current_key {
+            return Some(&self.key);
+        }
+        self.transition_keys.iter().find(|key| *key == current_key)
+    }
+
+    /// Port of `GraphicsPipeline::IsBuilt`.
+    pub fn is_built(&self) -> bool {
+        self.is_built.load(Ordering::Relaxed)
+    }
+}
+
+/// Reduced graphics pipeline compilation leaf.
 ///
-/// Ref: zuyu GraphicsPipelineCache — caches VkPipeline objects by
-/// shader hash + fixed pipeline state to avoid per-draw compilation.
+/// Ref: zuyu `CreateGraphicsPipeline(...)` helpers — `PipelineCache` owns the
+/// lookup/cache state, while this file provides key construction and the
+/// concrete compile/build path.
 pub struct GraphicsPipelineCache {
     device: ash::Device,
-    cache: HashMap<GraphicsPipelineKey, GraphicsPipeline>,
     shader_cache: PipelineCache,
 }
 
@@ -49,25 +90,19 @@ impl GraphicsPipelineCache {
     pub fn new(device: ash::Device, shader_cache: PipelineCache) -> Self {
         Self {
             device,
-            cache: HashMap::new(),
             shader_cache,
         }
     }
 
-    /// Get or compile a graphics pipeline for the given draw call.
-    ///
-    /// Returns the pipeline handle and layout, or None if compilation fails.
-    pub fn get_or_compile(
+    /// Build the current graphics pipeline cache key for a draw.
+    pub fn make_key(
         &mut self,
         draw: &DrawCall,
-        render_pass: vk::RenderPass,
         read_gpu: &dyn Fn(u64, &mut [u8]),
-    ) -> Option<(&GraphicsPipeline, FixedPipelineState)> {
-        // Build the fixed state key
+    ) -> Option<(GraphicsPipelineKey, FixedPipelineState)> {
         let mut fixed_state = FixedPipelineState::default();
         fixed_state.refresh(draw);
 
-        // Compile shaders to get hashes
         let vs_compiled = self.compile_vertex_shader(draw, read_gpu)?;
         let fs_compiled = self.compile_fragment_shader(draw, read_gpu);
 
@@ -81,10 +116,23 @@ impl GraphicsPipelineCache {
             shader_hashes: [vs_hash, fs_hash],
             fixed_state: fixed_state.clone(),
         };
+        Some((key, fixed_state))
+    }
 
-        if self.cache.contains_key(&key) {
-            return Some((self.cache.get(&key).unwrap(), fixed_state));
-        }
+    /// Build a graphics pipeline for the given draw/key pair.
+    ///
+    /// Returns an owned pipeline object for insertion into the matching
+    /// `PipelineCache` owner.
+    pub fn build_pipeline_keyed(
+        &mut self,
+        draw: &DrawCall,
+        render_pass: vk::RenderPass,
+        read_gpu: &dyn Fn(u64, &mut [u8]),
+        key: &GraphicsPipelineKey,
+        _fixed_state: &FixedPipelineState,
+    ) -> Option<GraphicsPipeline> {
+        let vs_compiled = self.compile_vertex_shader(draw, read_gpu)?;
+        let fs_compiled = self.compile_fragment_shader(draw, read_gpu);
 
         // Create shader modules
         let vs_module = self.create_shader_module(&vs_compiled.spirv_words)?;
@@ -107,19 +155,20 @@ impl GraphicsPipelineCache {
 
         debug!(
             "GraphicsPipelineCache: compiled new pipeline (vs_hash=0x{:016X}, fs_hash=0x{:016X})",
-            vs_hash, fs_hash
+            key.shader_hashes[0], key.shader_hashes[1]
         );
 
-        let gp = GraphicsPipeline {
+        Some(GraphicsPipeline {
+            device: self.device.clone(),
+            key: key.clone(),
+            transition_keys: Vec::new(),
             pipeline,
             pipeline_layout,
             descriptor_set_layout,
             vs_module,
             fs_module,
-        };
-
-        self.cache.insert(key.clone(), gp);
-        Some((self.cache.get(&key).unwrap(), fixed_state))
+            is_built: AtomicBool::new(true),
+        })
     }
 
     fn compile_vertex_shader(
@@ -327,22 +376,6 @@ impl GraphicsPipelineCache {
     }
 }
 
-impl Drop for GraphicsPipelineCache {
-    fn drop(&mut self) {
-        unsafe {
-            for (_, gp) in self.cache.drain() {
-                self.device.destroy_pipeline(gp.pipeline, None);
-                self.device
-                    .destroy_pipeline_layout(gp.pipeline_layout, None);
-                self.device
-                    .destroy_descriptor_set_layout(gp.descriptor_set_layout, None);
-                self.device.destroy_shader_module(gp.vs_module, None);
-                self.device.destroy_shader_module(gp.fs_module, None);
-            }
-        }
-    }
-}
-
 fn hash_spirv(words: &[u32]) -> u64 {
     // FNV-1a hash
     let mut hash: u64 = 0xcbf29ce484222325;
@@ -359,6 +392,28 @@ fn hash_spirv(words: &[u32]) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::mem::ManuallyDrop;
+
+    unsafe extern "system" fn dummy_vk_function() {}
+
+    fn make_test_pipeline(key: GraphicsPipelineKey) -> ManuallyDrop<GraphicsPipeline> {
+        // Test-only placeholder. These methods do not touch the Vulkan device,
+        // and `ManuallyDrop` avoids running the real destruction path.
+        let instance_fn =
+            vk::InstanceFnV1_0::load(|_| dummy_vk_function as *const () as *const std::ffi::c_void);
+        let device = unsafe { ash::Device::load(&instance_fn, vk::Device::null()) };
+        ManuallyDrop::new(GraphicsPipeline {
+            device,
+            key,
+            transition_keys: Vec::new(),
+            pipeline: vk::Pipeline::null(),
+            pipeline_layout: vk::PipelineLayout::null(),
+            descriptor_set_layout: vk::DescriptorSetLayout::null(),
+            vs_module: vk::ShaderModule::null(),
+            fs_module: vk::ShaderModule::null(),
+            is_built: AtomicBool::new(true),
+        })
+    }
 
     #[test]
     fn test_hash_spirv_deterministic() {
@@ -384,5 +439,24 @@ mod tests {
             fixed_state: FixedPipelineState::default(),
         };
         assert_eq!(key_a, key_b);
+    }
+
+    #[test]
+    fn test_transition_graph_returns_self_and_added_transition() {
+        let key_a = GraphicsPipelineKey {
+            shader_hashes: [123, 456],
+            fixed_state: FixedPipelineState::default(),
+        };
+        let key_b = GraphicsPipelineKey {
+            shader_hashes: [789, 321],
+            fixed_state: FixedPipelineState::default(),
+        };
+
+        let mut pipeline = make_test_pipeline(key_a.clone());
+        pipeline.add_transition(key_b.clone());
+
+        assert_eq!(pipeline.next(&key_a), Some(&key_a));
+        assert_eq!(pipeline.next(&key_b), Some(&key_b));
+        assert!(pipeline.is_built());
     }
 }

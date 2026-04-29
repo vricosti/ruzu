@@ -124,6 +124,10 @@ mod tests {
         }
         // Well over 1000 distinct values — zero collisions in a random u32
         // stream of ~1250 is near-certain for a proper PRNG.
-        assert!(seen.len() > N * 2, "suspiciously many collisions: {}", seen.len());
+        assert!(
+            seen.len() > N * 2,
+            "suspiciously many collisions: {}",
+            seen.len()
+        );
     }
 }

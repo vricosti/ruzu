@@ -12,6 +12,7 @@ use crate::core::SystemRef;
 use crate::hle::kernel::k_memory_block::{KMemoryPermission, KMemoryState, PAGE_SIZE};
 use crate::hle::kernel::k_page_group::KPageGroup;
 use crate::hle::kernel::k_process::KProcess;
+use crate::hle::kernel::k_process::ProcessLock;
 use crate::hle::kernel::k_readable_event::KReadableEvent;
 use crate::hle::kernel::k_scheduler::KScheduler;
 use crate::hle::kernel::k_typed_address::KProcessAddress;
@@ -32,7 +33,6 @@ use crate::hle::service::nvnflinger::ui::graphic_buffer::NvGraphicBuffer;
 use crate::hle::service::nvnflinger::window::NativeWindowTransform;
 use crate::hle::service::vi::container::Container;
 use crate::hle::service::vi::vi_results;
-use crate::hle::kernel::k_process::ProcessLock;
 
 #[derive(Debug, Clone, Copy, Default)]
 #[repr(C)]

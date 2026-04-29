@@ -76,6 +76,10 @@ impl FenceBase for Fence {
     fn is_stubbed(&self) -> bool {
         self.lock().unwrap().is_stubbed
     }
+
+    fn wait_for_fence(&self) {
+        self.lock().unwrap().wait();
+    }
 }
 
 unsafe impl Send for GLInnerFence {}

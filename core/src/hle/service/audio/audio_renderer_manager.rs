@@ -7,13 +7,13 @@ use std::sync::Arc;
 
 use crate::core::SystemRef;
 use crate::hle::kernel::k_process::KProcess;
+use crate::hle::kernel::k_process::ProcessLock;
 use crate::hle::kernel::k_transfer_memory::KTransferMemory;
 use crate::hle::kernel::svc_common::PseudoHandle;
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 use crate::hle::service::cmif_serialization::{CmifRequest, CmifResponse};
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
 use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
-use crate::hle::kernel::k_process::ProcessLock;
 
 /// IPC command table for IAudioRendererManager ("audren:u"):
 ///

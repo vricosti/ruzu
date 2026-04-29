@@ -5,12 +5,12 @@
 //! SVC handlers for synchronization operations (CloseHandle, ResetSignal,
 //! WaitSynchronization, CancelSynchronization, SynchronizePreemptionState).
 
+use super::super::k_process::ProcessLock;
 use crate::core::System;
 use crate::hle::kernel::k_synchronization_object;
 use crate::hle::kernel::svc::svc_results::*;
 use crate::hle::kernel::svc_common::{Handle, ARGUMENT_HANDLE_COUNT_MAX};
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
-use super::super::k_process::ProcessLock;
 
 fn should_trace_wait_sync() -> bool {
     std::env::var_os("RUZU_TRACE_WAIT_SYNC").is_some()
@@ -93,7 +93,10 @@ pub fn wait_synchronization(
         drop(process);
         log::info!(
             "WaitSync tid={} num={} timeout={} handle[0]=0x{:X}",
-            tid, num_handles, timeout_ns, h0
+            tid,
+            num_handles,
+            timeout_ns,
+            h0
         );
     }
 

@@ -12,6 +12,8 @@ use ash::vk;
 use log::{debug, trace};
 
 use super::staging_buffer_pool::StagingBufferPool;
+use crate::control::channel_state::ChannelState;
+use crate::control::channel_state_cache::{ChannelInfo, ChannelSetupCaches};
 
 /// A cached GPU buffer backed by VkBuffer + VkDeviceMemory.
 pub struct CachedBuffer {
@@ -28,6 +30,7 @@ pub struct BufferCache {
     device: ash::Device,
     instance: ash::Instance,
     physical_device: vk::PhysicalDevice,
+    channel_caches: ChannelSetupCaches<ChannelInfo>,
 
     /// Cached buffers by GPU VA.
     cache: HashMap<u64, CachedBuffer>,
@@ -72,10 +75,26 @@ impl BufferCache {
             device,
             instance,
             physical_device,
+            channel_caches: ChannelSetupCaches::new(),
             cache: HashMap::new(),
             null_buffer,
             null_memory,
         })
+    }
+
+    /// Port of the Vulkan buffer-cache owner `CreateChannel` edge.
+    pub fn create_channel(&mut self, channel: &ChannelState) {
+        self.channel_caches.create_channel(channel);
+    }
+
+    /// Port of the Vulkan buffer-cache owner `BindToChannel` edge.
+    pub fn bind_to_channel(&mut self, channel_id: i32) {
+        self.channel_caches.bind_to_channel(channel_id);
+    }
+
+    /// Port of the Vulkan buffer-cache owner `EraseChannel` edge.
+    pub fn erase_channel(&mut self, channel_id: i32) {
+        self.channel_caches.erase_channel(channel_id);
     }
 
     /// Get or upload a GPU buffer from guest memory.

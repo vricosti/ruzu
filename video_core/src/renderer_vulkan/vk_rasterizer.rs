@@ -13,6 +13,8 @@ use ash::vk;
 
 use super::fence_manager::{Fence as VkFence, FenceManager as VkFenceBackend};
 use super::query_cache::QueryCache;
+use super::state_tracker::StateTracker;
+use crate::control::channel_state_cache::{ChannelCacheAccessor, ChannelInfo, ChannelSetupCaches};
 use crate::fence_manager::FenceManager;
 use crate::query_cache::types::QueryPropertiesFlags;
 
@@ -128,9 +130,15 @@ pub struct RasterizerVulkan {
     /// The DMA accelerator instance.
     accelerate_dma: AccelerateDma,
 
+    /// Port of the protected `ChannelSetupCaches<ChannelInfo>` base owner.
+    channel_caches: ChannelSetupCaches<ChannelInfo>,
+
     /// Port of `RasterizerVulkan::query_cache` — Vulkan-specific query cache.
     /// Stores GPU query write-back closures and runs them when fences signal.
     query_cache: QueryCache,
+
+    /// Port of `RasterizerVulkan::state_tracker`.
+    state_tracker: StateTracker,
 
     /// Port of `RasterizerVulkan::fence_manager` — generic fence manager that
     /// holds the queue of pending fences and their associated callbacks.
@@ -142,8 +150,7 @@ pub struct RasterizerVulkan {
     /// Channel-bound GPU device memory manager. Used by `query_cache` to
     /// translate query GPU addresses to guest CPU addresses for write-back.
     /// Mirrors `gl_rasterizer::channel_memory_manager`.
-    channel_memory_manager:
-        Option<Arc<parking_lot::Mutex<crate::memory_manager::MemoryManager>>>,
+    channel_memory_manager: Option<Arc<parking_lot::Mutex<crate::memory_manager::MemoryManager>>>,
 
     /// Port of `RasterizerVulkan::num_queued_commands` — used by
     /// `signal_fence` to decide whether a flush is needed.
@@ -171,26 +178,14 @@ impl RasterizerVulkan {
             image_view_indices: Vec::with_capacity(MAX_IMAGE_VIEWS),
             sampler_handles: Vec::with_capacity(MAX_TEXTURES),
             accelerate_dma: AccelerateDma::new(),
+            channel_caches: ChannelSetupCaches::new(),
             query_cache: QueryCache::new(),
-            fence_manager: FenceManager::new(),
+            state_tracker: StateTracker::new(),
+            fence_manager: FenceManager::new(true),
             fence_backend: VkFenceBackend::new(),
             channel_memory_manager: None,
             num_queued_commands: 0,
         }
-    }
-
-    /// Wire the channel-bound GPU device memory manager into the query
-    /// cache. Mirrors `gl_rasterizer::set_channel_memory_manager`. Without
-    /// this wiring the query write-back closure has no way to translate
-    /// the GPU virtual address to a guest CPU address and the result write
-    /// is silently dropped.
-    pub fn set_channel_memory_manager(
-        &mut self,
-        memory_manager: Arc<parking_lot::Mutex<crate::memory_manager::MemoryManager>>,
-    ) {
-        self.query_cache
-            .set_memory_manager(Arc::clone(&memory_manager));
-        self.channel_memory_manager = Some(memory_manager);
     }
 
     /// Wire the GPU tick counter source into the query cache. Used for
@@ -352,6 +347,7 @@ impl RasterizerVulkan {
     /// finished window. Mirrors `gl_rasterizer::signal_fence`.
     pub fn signal_fence(&mut self, func: Box<dyn FnOnce() + Send>) {
         let this = self as *mut Self;
+        let this_for_pop = this as usize;
         let should_flush_now = self.fence_manager.signal_fence(
             func,
             move |is_stubbed| unsafe { (*this).fence_backend.create_fence(is_stubbed) },
@@ -364,7 +360,7 @@ impl RasterizerVulkan {
                 let tick = (*this).known_gpu_tick();
                 (*this).fence_backend.is_fence_signaled(fence, tick)
             },
-            move || unsafe { (*this).pop_async_flushes() },
+            move || unsafe { (*(this_for_pop as *mut Self)).pop_async_flushes() },
             move || unsafe { (*this).num_queued_commands != 0 || (*this).should_flush_async() },
             move || unsafe { (*this).commit_async_flushes() },
         );
@@ -511,18 +507,29 @@ impl RasterizerVulkan {
     }
 
     /// Port of `RasterizerVulkan::InitializeChannel`.
-    pub fn initialize_channel(&mut self) {
-        // Base class ChannelSetupCaches handles channel initialization
+    pub fn initialize_channel(&mut self, channel: &crate::control::channel_state::ChannelState) {
+        self.channel_caches.create_channel(channel);
+        self.query_cache.create_channel(channel);
+        self.state_tracker.setup_tables(channel);
     }
 
     /// Port of `RasterizerVulkan::BindChannel`.
-    pub fn bind_channel(&mut self) {
-        // Base class ChannelSetupCaches handles channel binding
+    pub fn bind_channel(&mut self, channel: &crate::control::channel_state::ChannelState) {
+        self.channel_caches.bind_to_channel(channel.bind_id);
+        self.query_cache.bind_to_channel(channel.bind_id);
+        self.state_tracker.change_channel(channel);
+        self.state_tracker.invalidate_state();
+        self.channel_memory_manager = self
+            .channel_caches
+            .current_channel_state()
+            .and_then(ChannelCacheAccessor::gpu_memory_arc);
     }
 
     /// Port of `RasterizerVulkan::ReleaseChannel`.
-    pub fn release_channel(&mut self, _channel_id: i32) {
-        // Releases channel resources from all caches
+    pub fn release_channel(&mut self, channel_id: i32) {
+        self.channel_caches.erase_channel(channel_id);
+        self.query_cache.erase_channel(channel_id);
+        self.channel_memory_manager = None;
     }
 
     /// Port of `RasterizerVulkan::AccelerateDisplay`.
@@ -706,6 +713,10 @@ fn make_draw_params(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::control::channel_state::ChannelState;
+    use crate::memory_manager::MemoryManager;
+    use parking_lot::Mutex;
+    use std::sync::Arc;
 
     #[test]
     fn constants() {
@@ -757,5 +768,37 @@ mod tests {
             rasterizer.flush_work();
         }
         assert_eq!(rasterizer.draw_counter, 0);
+    }
+
+    #[test]
+    fn channel_methods_drive_query_cache_owner() {
+        let mut rasterizer = RasterizerVulkan::new();
+        let mm = Arc::new(Mutex::new(MemoryManager::new(77)));
+        let mut channel = ChannelState::new(6);
+        channel.program_id = 0x4455;
+        channel.memory_manager = Some(Arc::clone(&mm));
+
+        rasterizer.initialize_channel(&channel);
+        rasterizer.bind_channel(&channel);
+
+        let bound = rasterizer
+            .query_cache
+            .bound_memory_manager_for_test()
+            .expect("bound query cache memory manager");
+        assert!(Arc::ptr_eq(bound, &mm));
+        assert_eq!(rasterizer.channel_caches.program_id, 0x4455);
+        assert_eq!(
+            rasterizer.query_cache.base.channel_caches.program_id,
+            0x4455
+        );
+        assert!(rasterizer.query_cache.runtime.is_3d_engine_bound());
+        assert_eq!(
+            rasterizer.state_tracker.bound_channel_id_for_test(),
+            Some(6)
+        );
+
+        rasterizer.release_channel(channel.bind_id);
+        assert!(!rasterizer.query_cache.has_bound_memory_manager_for_test());
+        assert!(rasterizer.channel_caches.current_channel_state().is_none());
     }
 }

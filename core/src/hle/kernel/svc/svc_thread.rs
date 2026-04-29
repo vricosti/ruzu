@@ -6,6 +6,7 @@
 
 use std::sync::{Arc, Mutex};
 
+use super::super::k_process::ProcessLock;
 use crate::core::System;
 use crate::hle::kernel::k_memory_block::{KMemoryPermission, KMemoryState, PAGE_SIZE};
 use crate::hle::kernel::k_resource_limit::LimitableResource;
@@ -16,7 +17,6 @@ use crate::hle::kernel::svc::svc_results::*;
 use crate::hle::kernel::svc::svc_types::*;
 use crate::hle::kernel::svc_common::{Handle, PseudoHandle, INVALID_HANDLE};
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
-use super::super::k_process::ProcessLock;
 
 const FALLBACK_USER_THREAD_STACK_SIZE: u64 = 0x100000;
 
@@ -83,6 +83,31 @@ pub fn create_thread(
         priority,
         core_id
     );
+    // Dump first 32 bytes of the thread's `arg` context — useful to identify
+    // singleton thread contexts (like game-side audio/main-loop orchestrators
+    // whose `arg` lands in .data instead of heap). Logged at info level when
+    // RUZU_TRACE_THREAD_ARG=1.
+    if std::env::var_os("RUZU_TRACE_THREAD_ARG").is_some() {
+        let process = system.current_process_arc();
+        let process = process.lock().unwrap();
+        if let Some(memory) = process.page_table.get_base().m_memory.as_ref() {
+            let m = memory.lock().unwrap();
+            let mut bytes = String::with_capacity(64);
+            for i in 0..32u64 {
+                use std::fmt::Write;
+                let _ = write!(bytes, "{:02x}", m.read_8(arg + i));
+                if i % 4 == 3 {
+                    bytes.push(' ');
+                }
+            }
+            log::info!(
+                "svc::CreateThread arg=0x{:08X} prio={} bytes=[{}]",
+                arg,
+                priority,
+                bytes.trim()
+            );
+        }
+    }
 
     let current_process = system.current_process_arc().clone();
 

@@ -2,10 +2,10 @@
 // Extract these into a separate file so the main module stays clean and committable.
 // To disable all debug tracing, comment out the `use` in physical_core.rs.
 
+use super::k_process::ProcessLock;
 use crate::arm::arm_interface::ThreadContext;
 use crate::hle::kernel::k_process::KProcess;
 use std::sync::{Arc, Mutex};
-use super::k_process::ProcessLock;
 
 /// State for the instruction ring buffer used to capture the last N instructions
 /// before an abort handler is entered.

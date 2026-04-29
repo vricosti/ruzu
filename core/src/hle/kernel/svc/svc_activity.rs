@@ -4,12 +4,12 @@
 //!
 //! SVC handlers for thread and process activity.
 
+use super::super::k_process::ProcessLock;
 use crate::core::System;
 use crate::hle::kernel::svc::svc_results::*;
 use crate::hle::kernel::svc::svc_types::*;
 use crate::hle::kernel::svc_common::Handle;
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
-use super::super::k_process::ProcessLock;
 
 /// Sets the thread activity.
 ///

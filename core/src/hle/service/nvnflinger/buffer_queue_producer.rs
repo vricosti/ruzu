@@ -332,7 +332,11 @@ impl BufferQueueProducer {
             static COUNT: AtomicU64 = AtomicU64::new(0);
             let n = COUNT.fetch_add(1, Ordering::Relaxed);
             if n < 16 || n.is_power_of_two() {
-                log::info!("[BQP_DEQUEUE] #{} dequeue_buffer entry async={}", n, async_flag);
+                log::info!(
+                    "[BQP_DEQUEUE] #{} dequeue_buffer entry async={}",
+                    n,
+                    async_flag
+                );
             }
         }
         if (width != 0 && height == 0) || (width == 0 && height != 0) {
@@ -437,7 +441,8 @@ impl BufferQueueProducer {
         ));
         log::info!(
             "[BQP_DEQUEUE_RET] slot={} flags=0x{:X}",
-            out_slot, return_flags
+            out_slot,
+            return_flags
         );
         (return_flags, out_slot, out_fence)
     }

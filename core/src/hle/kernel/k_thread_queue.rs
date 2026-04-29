@@ -16,8 +16,7 @@ pub struct KThreadQueue {
     // In upstream: KernelCore& m_kernel; KHardwareTimer* m_hardware_timer;
     pub hardware_timer: Option<Arc<KHardwareTimer>>,
     pub end_wait_allowed: bool,
-    pub notify_available_impl:
-        Option<fn(&KThreadQueue, &mut KThread, u64, u32) -> bool>,
+    pub notify_available_impl: Option<fn(&KThreadQueue, &mut KThread, u64, u32) -> bool>,
     pub cancel_wait_impl: Option<fn(&mut KThread)>,
 }
 
@@ -32,9 +31,7 @@ impl KThreadQueue {
     }
 
     pub const fn with_callbacks(
-        notify_available_impl: Option<
-            fn(&KThreadQueue, &mut KThread, u64, u32) -> bool,
-        >,
+        notify_available_impl: Option<fn(&KThreadQueue, &mut KThread, u64, u32) -> bool>,
         cancel_wait_impl: Option<fn(&mut KThread)>,
     ) -> Self {
         Self {
@@ -46,9 +43,7 @@ impl KThreadQueue {
     }
 
     pub const fn without_end_wait(
-        notify_available_impl: Option<
-            fn(&KThreadQueue, &mut KThread, u64, u32) -> bool,
-        >,
+        notify_available_impl: Option<fn(&KThreadQueue, &mut KThread, u64, u32) -> bool>,
         cancel_wait_impl: Option<fn(&mut KThread)>,
     ) -> Self {
         Self {
@@ -164,9 +159,7 @@ impl KThreadQueueWithoutEndWait {
     }
 
     pub const fn with_callbacks(
-        notify_available_impl: Option<
-            fn(&KThreadQueue, &mut KThread, u64, u32) -> bool,
-        >,
+        notify_available_impl: Option<fn(&KThreadQueue, &mut KThread, u64, u32) -> bool>,
         cancel_wait_impl: Option<fn(&mut KThread)>,
     ) -> Self {
         Self {

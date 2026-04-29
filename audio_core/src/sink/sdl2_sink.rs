@@ -40,7 +40,9 @@ impl AudioCallback for SDLCallback {
             if lock_us > 1000 || work_us > 1000 {
                 log::info!(
                     "PROFILE_SDL2_CB lock_us={} work_us={} frames={}",
-                    lock_us, work_us, num_frames
+                    lock_us,
+                    work_us,
+                    num_frames
                 );
             }
         }

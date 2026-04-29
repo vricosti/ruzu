@@ -7,13 +7,13 @@
 use crate::core_timing::CoreTiming;
 use crate::hardware_properties;
 use crate::hle::kernel::k_interrupt_manager;
+use crate::hle::kernel::k_process::ProcessLock;
+use crate::hle::kernel::k_thread::KThreadLock;
 use crate::hle::kernel::kernel::KernelCore;
 use common::fiber::Fiber;
 use common::thread::Barrier;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use crate::hle::kernel::k_process::ProcessLock;
-use crate::hle::kernel::k_thread::KThreadLock;
 
 /// Per-core data held by the CPU manager.
 /// Matches upstream `CpuManager::CoreData`.

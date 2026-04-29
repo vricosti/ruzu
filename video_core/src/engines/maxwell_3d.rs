@@ -21,6 +21,8 @@ use crate::descriptor_table::{TicTable, TscTable};
 use crate::macro_engine::macro_engine::{get_macro_engine, MacroEngine};
 use crate::macro_engine::macro_interpreter::MacroInterpreterImpl;
 use crate::memory_manager::MemoryManager;
+use crate::query_cache::query_cache::{RenderConditionState, RenderConditionStateSource};
+use crate::query_cache::types::ComparisonMode;
 use crate::query_cache::types::QueryPropertiesFlags;
 use crate::rasterizer_interface::RasterizerInterface;
 
@@ -2960,6 +2962,26 @@ impl Maxwell3D {
         } else {
             self.cb_bindings[stage][slot] = ConstBufferBinding::default();
             log::trace!("Maxwell3D: CB_BIND stage={} slot={} disabled", stage, slot);
+        }
+    }
+}
+
+impl RenderConditionStateSource for Maxwell3D {
+    fn render_condition_state(&self) -> RenderConditionState {
+        let comparison_mode = match self.regs[RENDER_ENABLE_MODE as usize] {
+            0 => ComparisonMode::False,
+            1 => ComparisonMode::True,
+            2 => ComparisonMode::Conditional,
+            3 => ComparisonMode::IfEqual,
+            4 => ComparisonMode::IfNotEqual,
+            _ => ComparisonMode::False,
+        };
+        let address = ((self.regs[RENDER_ENABLE_BASE as usize] as u64) << 32)
+            | self.regs[(RENDER_ENABLE_BASE + 1) as usize] as u64;
+        RenderConditionState {
+            override_mode: self.regs[RENDER_ENABLE_OVERRIDE as usize],
+            comparison_mode,
+            address,
         }
     }
 }
@@ -6017,7 +6039,7 @@ mod tests {
     }
 
     #[test]
-    fn test_report_semaphore_query_writes_through_rasterizer_callback() {
+    fn test_report_semaphore_query_forwards_to_rasterizer_without_engine_side_write() {
         let calls = Arc::new(Mutex::new(RasterizerCalls::default()));
         let mut rasterizer = TestRasterizer::new(Arc::clone(&calls));
         let memory_manager = Arc::new(parking_lot::Mutex::new(
@@ -6050,9 +6072,7 @@ mod tests {
         drop(calls);
 
         let writes = writes.lock().unwrap();
-        assert_eq!(writes.len(), 1);
-        assert_eq!(writes[0].0, 0x8000);
-        assert_eq!(writes[0].1, 0x1122_3344u32.to_le_bytes().to_vec());
+        assert!(writes.is_empty());
         assert!(engine.pending_semaphore_writes.is_empty());
 
         let _ = &mut rasterizer;

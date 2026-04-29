@@ -122,10 +122,7 @@ impl In {
         *self.readable_event.lock().unwrap() = Some(event);
     }
 
-    pub fn set_process_arc(
-        &self,
-        process: Arc<ruzu_core::hle::kernel::k_process::ProcessLock>,
-    ) {
+    pub fn set_process_arc(&self, process: Arc<ruzu_core::hle::kernel::k_process::ProcessLock>) {
         *self.process_arc.lock().unwrap() = Some(process);
     }
 }

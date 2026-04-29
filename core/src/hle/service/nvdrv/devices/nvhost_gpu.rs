@@ -496,7 +496,10 @@ impl NvHostGpu {
                     .read_syncpoint_max_value(channel_syncpoint);
                 log::info!(
                     "[SP_TRACE] submit#{} sp_id={} min={} max={} pending={} (out fence value={})",
-                    n, channel_syncpoint, min_v, max_v,
+                    n,
+                    channel_syncpoint,
+                    min_v,
+                    max_v,
                     max_v.wrapping_sub(min_v),
                     params.fence.value,
                 );

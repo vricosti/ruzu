@@ -356,6 +356,18 @@ impl Gpu {
                 head.join("")
             );
         }
+        if std::env::var_os("RUZU_TRACE_GUEST_WRITE_40037000").is_some()
+            && addr <= 0x4003_7000
+            && addr.saturating_add(data.len() as u64) > 0x4003_7000
+        {
+            let head: Vec<String> = data.iter().take(16).map(|b| format!("{:02x}", b)).collect();
+            log::info!(
+                "GPU_WRITE_40037000 hit addr=0x{:X} size={} head={}",
+                addr,
+                data.len(),
+                head.join("")
+            );
+        }
         writer(addr, data);
     }
 
@@ -1009,8 +1021,8 @@ mod tests {
             .unwrap();
 
         let system = ruzu_core::core::System::new();
-        system.core_timing.lock().unwrap().add_ticks(512);
-        let base_gpu_ticks = system.core_timing.lock().unwrap().get_gpu_ticks();
+        system.core_timing().add_ticks(512);
+        let base_gpu_ticks = system.core_timing().get_gpu_ticks();
 
         let gpu = Gpu::new(false, false);
         gpu.set_system_ref(ruzu_core::core::SystemRef::from_ref(&system));

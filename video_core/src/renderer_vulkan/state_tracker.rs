@@ -7,6 +7,7 @@
 //! Touch*() methods atomically read-and-clear flags to avoid
 //! redundant Vulkan dynamic state commands.
 
+use crate::control::channel_state::ChannelState;
 use crate::engines::maxwell_3d::PrimitiveTopology;
 
 // ---------------------------------------------------------------------------
@@ -110,6 +111,7 @@ pub struct StateTracker {
     flags: DirtyFlags,
     invalidation_flags: DirtyFlags,
     current_topology: Option<PrimitiveTopology>,
+    bound_channel_id: Option<i32>,
     two_sided_stencil: bool,
     front: StencilProperties,
     back: StencilProperties,
@@ -132,6 +134,7 @@ impl StateTracker {
             flags,
             invalidation_flags,
             current_topology: None,
+            bound_channel_id: None,
             two_sided_stencil: false,
             front: StencilProperties::default(),
             back: StencilProperties::default(),
@@ -157,6 +160,32 @@ impl StateTracker {
         }
         self.current_topology = None;
         self.stencil_reset = true;
+    }
+
+    /// Port of `StateTracker::SetupTables`.
+    ///
+    /// Upstream installs dirty-flag lookup tables into
+    /// `channel_state.maxwell_3d->dirty.tables`. The current Rust
+    /// `Maxwell3D` owner does not yet expose the upstream `dirty.tables`
+    /// storage, so this owner currently preserves only the method boundary
+    /// and channel association.
+    pub fn setup_tables(&mut self, channel_state: &ChannelState) {
+        self.bound_channel_id = Some(channel_state.bind_id);
+    }
+
+    /// Port of `StateTracker::ChangeChannel`.
+    ///
+    /// Upstream switches `flags` to point at the bound channel's live
+    /// `maxwell_3d->dirty.flags`. The current Rust port still keeps
+    /// backend-local dirty flags in this owner, so the channel switch is
+    /// reduced to tracking the active channel boundary.
+    pub fn change_channel(&mut self, channel_state: &ChannelState) {
+        self.bound_channel_id = Some(channel_state.bind_id);
+    }
+
+    #[cfg(test)]
+    pub fn bound_channel_id_for_test(&self) -> Option<i32> {
+        self.bound_channel_id
     }
 
     /// Port of `StateTracker::InvalidateViewports`.
@@ -417,6 +446,7 @@ impl Default for StateTracker {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::control::channel_state::ChannelState;
 
     #[test]
     fn test_new_all_dirty() {
@@ -487,5 +517,17 @@ mod tests {
         let mut tracker = StateTracker::new();
         assert!(tracker.touch_blend_constants());
         assert!(!tracker.touch_blend_constants());
+    }
+
+    #[test]
+    fn setup_and_change_channel_track_bound_channel_owner() {
+        let mut tracker = StateTracker::new();
+        let channel = ChannelState::new(9);
+
+        tracker.setup_tables(&channel);
+        assert_eq!(tracker.bound_channel_id_for_test(), Some(9));
+
+        tracker.change_channel(&channel);
+        assert_eq!(tracker.bound_channel_id_for_test(), Some(9));
     }
 }

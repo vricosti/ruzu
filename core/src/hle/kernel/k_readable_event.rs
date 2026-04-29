@@ -8,12 +8,12 @@
 
 use std::sync::{Arc, Mutex};
 
+use super::k_process::ProcessLock;
 use crate::hle::kernel::k_scheduler::KScheduler;
 use crate::hle::kernel::k_scheduler_lock::KScopedSchedulerLock;
 use crate::hle::kernel::k_synchronization_object::SynchronizationObjectState;
 use crate::hle::kernel::svc::svc_results::RESULT_INVALID_STATE;
 use crate::hle::result::RESULT_SUCCESS;
-use super::k_process::ProcessLock;
 
 /// The readable event object.
 /// Matches upstream `KReadableEvent` class (k_readable_event.h).

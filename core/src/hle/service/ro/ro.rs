@@ -15,10 +15,10 @@ use super::ro_nro_utils;
 use super::ro_results;
 use super::ro_types::{ModuleId, NroHeader, NrrHeader, NrrKind};
 use crate::hle::kernel::k_process::KProcess;
+use crate::hle::kernel::k_process::ProcessLock;
 use crate::hle::result::ResultCode;
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
 use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
-use crate::hle::kernel::k_process::ProcessLock;
 
 // Convenience definitions — matches upstream ro.cpp.
 const MAX_SESSIONS: usize = 0x3;
@@ -731,11 +731,7 @@ impl RoContext {
         None
     }
 
-    fn allocate_context(
-        &mut self,
-        process: Option<Arc<ProcessLock>>,
-        process_id: u64,
-    ) -> usize {
+    fn allocate_context(&mut self, process: Option<Arc<ProcessLock>>, process_id: u64) -> usize {
         for i in 0..MAX_SESSIONS {
             if self.process_contexts[i].is_free() {
                 self.process_contexts[i].initialize(process, process_id);
