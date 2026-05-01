@@ -243,7 +243,12 @@ impl RasterizerInterface for RasterizerNull {
     // ── Acceleration ────────────────────────────────────────────────────
 
     /// Pretend surface copy succeeded.
-    fn accelerate_surface_copy(&mut self) -> bool {
+    fn accelerate_surface_copy(
+        &mut self,
+        _src: &crate::engines::fermi_2d::Surface,
+        _dst: &crate::engines::fermi_2d::Surface,
+        _copy_config: &crate::engines::fermi_2d::Config,
+    ) -> bool {
         true
     }
 
@@ -284,7 +289,11 @@ mod tests {
         rast.tick_frame();
         assert!(!rast.must_flush_region(0, 0));
         assert!(!rast.on_cpu_write(0, 0));
-        assert!(rast.accelerate_surface_copy());
+        assert!(rast.accelerate_surface_copy(
+            &crate::engines::fermi_2d::Surface::default(),
+            &crate::engines::fermi_2d::Surface::default(),
+            &crate::engines::fermi_2d::Config::default(),
+        ));
     }
 
     #[test]

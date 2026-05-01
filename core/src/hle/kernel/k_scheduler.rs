@@ -1359,7 +1359,11 @@ impl KScheduler {
         current_thread_id: u64,
     ) -> u64 {
         loop {
-            self.wake_expired_sleeping_threads(process);
+            // Upstream does not have the scheduler proactively deliver sleep
+            // timer expirations by polling thread-local deadlines here.
+            // Sleep wakeups are owned by KHardwareTimer::DoTask()/thread.OnTimer().
+            // Keep the synchronization-object polling fallback for now, but do
+            // not synthesize sleep wakeups from the scheduler loop.
             self.wake_signaled_synchronization_threads(process);
 
             // PQ-based selection (O(1) for highest priority thread).

@@ -5,6 +5,12 @@
 //!
 //! Dirty flag indices and setup for Maxwell3D state tracking.
 
+use crate::engines::maxwell_3d::{
+    PIPELINE_BASE, RT_BASE, RT_CONTROL, RT_STRIDE, SURFACE_CLIP_BASE, TEX_HEADER_POOL_BASE,
+    TEX_SAMPLER_POOL_BASE, VERTEX_STREAM_BASE, VERTEX_STREAM_LIMIT_BASE, VERTEX_STREAM_STRIDE,
+    ZETA_BASE, ZETA_ENABLE, ZETA_SIZE_BASE,
+};
+
 /// Dirty flag indices matching upstream `VideoCommon::Dirty` enum.
 pub mod flags {
     pub const NULL_ENTRY: u8 = 0;
@@ -67,16 +73,157 @@ pub fn fill_block_both(
 /// depend on the Maxwell3D register layout which is defined in the engines module.
 /// This is a stub that will be filled in once the engine register definitions are ported.
 pub fn setup_dirty_flags(tables: &mut DirtyTables) {
-    // NOTE: Full implementation calls:
-    //   SetupDirtyVertexBuffers(tables)  — marks VERTEX_BUFFERS / VERTEX_BUFFER0..31
-    //   SetupIndexBuffer(tables)          — marks INDEX_BUFFER range
-    //   SetupDirtyDescriptors(tables)     — marks DESCRIPTORS range
-    //   SetupDirtyRenderTargets(tables)   — marks RENDER_TARGETS, COLOR_BUFFER0..7, ZETA_BUFFER
-    //   SetupDirtyShaders(tables)         — marks SHADERS range
-    // Each sub-function iterates over Maxwell3D::Regs offsets and calls fill_block_both.
-    // Stubbed until the Maxwell3D register layout (Regs struct offsets) is ported.
-    let _ = tables;
-    log::warn!(
-        "setup_dirty_flags: Maxwell3D register layout not ported, dirty table not configured"
+    setup_dirty_vertex_buffers(tables);
+    setup_index_buffer(tables);
+    setup_dirty_descriptors(tables);
+    setup_dirty_render_targets(tables);
+    setup_dirty_shaders(tables);
+}
+
+fn setup_dirty_vertex_buffers(tables: &mut DirtyTables) {
+    const NUM_VERTEX_ARRAYS: usize = 32;
+    const NUM_VERTEX_STREAM_WORDS: usize = 4;
+    const NUM_VERTEX_STREAM_LIMIT_WORDS: usize = 2;
+    const NUM_ARRAY_WORDS_DIRTY: usize = 3;
+
+    for i in 0..NUM_VERTEX_ARRAYS {
+        let array_offset = VERTEX_STREAM_BASE as usize
+            + i * NUM_VERTEX_STREAM_WORDS * VERTEX_STREAM_STRIDE as usize / 4;
+        let limit_offset = VERTEX_STREAM_LIMIT_BASE as usize + i * NUM_VERTEX_STREAM_LIMIT_WORDS;
+        let per_buffer = flags::VERTEX_BUFFER0 + i as u8;
+        fill_block_both(
+            tables,
+            array_offset,
+            NUM_ARRAY_WORDS_DIRTY,
+            per_buffer,
+            flags::VERTEX_BUFFERS,
+        );
+        fill_block_both(
+            tables,
+            limit_offset,
+            NUM_VERTEX_STREAM_LIMIT_WORDS,
+            per_buffer,
+            flags::VERTEX_BUFFERS,
+        );
+    }
+}
+
+fn setup_index_buffer(tables: &mut DirtyTables) {
+    const INDEX_BUFFER_WORDS: usize = 7;
+    fill_block(
+        &mut tables[0],
+        crate::engines::maxwell_3d::IB_BASE as usize,
+        INDEX_BUFFER_WORDS,
+        flags::INDEX_BUFFER,
     );
+}
+
+fn setup_dirty_descriptors(tables: &mut DirtyTables) {
+    const DESCRIPTOR_POOL_WORDS: usize = 3;
+    fill_block(
+        &mut tables[0],
+        TEX_HEADER_POOL_BASE as usize,
+        DESCRIPTOR_POOL_WORDS,
+        flags::DESCRIPTORS,
+    );
+    fill_block(
+        &mut tables[0],
+        TEX_SAMPLER_POOL_BASE as usize,
+        DESCRIPTOR_POOL_WORDS,
+        flags::DESCRIPTORS,
+    );
+}
+
+fn setup_dirty_render_targets(tables: &mut DirtyTables) {
+    const NUM_RENDER_TARGETS: usize = 8;
+    const RENDER_TARGET_WORDS: usize = 0x40 / 4;
+    const SURFACE_CLIP_WORDS: usize = 0x8 / 4;
+    const ZETA_WORDS: usize = 0x14 / 4;
+    const ZETA_SIZE_WORDS: usize = 0xC / 4;
+
+    let rt_begin = RT_BASE as usize;
+    let rt_num = RENDER_TARGET_WORDS * NUM_RENDER_TARGETS;
+    for rt in 0..NUM_RENDER_TARGETS {
+        fill_block(
+            &mut tables[0],
+            rt_begin + rt * RT_STRIDE as usize,
+            RENDER_TARGET_WORDS,
+            flags::COLOR_BUFFER0 + rt as u8,
+        );
+    }
+    fill_block(&mut tables[1], rt_begin, rt_num, flags::RENDER_TARGETS);
+    fill_block(
+        &mut tables[0],
+        SURFACE_CLIP_BASE as usize,
+        SURFACE_CLIP_WORDS,
+        flags::RENDER_TARGETS,
+    );
+
+    tables[0][RT_CONTROL as usize] = flags::RENDER_TARGETS;
+    tables[1][RT_CONTROL as usize] = flags::RENDER_TARGET_CONTROL;
+
+    tables[0][ZETA_ENABLE as usize] = flags::ZETA_BUFFER;
+    tables[1][ZETA_ENABLE as usize] = flags::RENDER_TARGETS;
+    fill_block(
+        &mut tables[0],
+        ZETA_SIZE_BASE as usize,
+        ZETA_SIZE_WORDS,
+        flags::ZETA_BUFFER,
+    );
+    fill_block(
+        &mut tables[1],
+        ZETA_SIZE_BASE as usize,
+        ZETA_SIZE_WORDS,
+        flags::RENDER_TARGETS,
+    );
+    fill_block(
+        &mut tables[0],
+        ZETA_BASE as usize,
+        ZETA_WORDS,
+        flags::ZETA_BUFFER,
+    );
+    fill_block(
+        &mut tables[1],
+        ZETA_BASE as usize,
+        ZETA_WORDS,
+        flags::RENDER_TARGETS,
+    );
+}
+
+fn setup_dirty_shaders(tables: &mut DirtyTables) {
+    const MAX_SHADER_PROGRAMS: usize = 6;
+    const PIPELINE_WORDS: usize = 0x40 / 4;
+    fill_block(
+        &mut tables[0],
+        PIPELINE_BASE as usize,
+        PIPELINE_WORDS * MAX_SHADER_PROGRAMS,
+        flags::SHADERS,
+    );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn setup_dirty_flags_marks_core_upstream_ranges() {
+        let mut tables = [
+            vec![flags::NULL_ENTRY; 0xE00],
+            vec![flags::NULL_ENTRY; 0xE00],
+        ];
+        setup_dirty_flags(&mut tables);
+
+        assert_eq!(
+            tables[0][crate::engines::maxwell_3d::IB_BASE as usize],
+            flags::INDEX_BUFFER
+        );
+        assert_eq!(tables[0][TEX_HEADER_POOL_BASE as usize], flags::DESCRIPTORS);
+        assert_eq!(tables[0][RT_BASE as usize], flags::COLOR_BUFFER0);
+        assert_eq!(tables[1][RT_BASE as usize], flags::RENDER_TARGETS);
+        assert_eq!(tables[0][RT_CONTROL as usize], flags::RENDER_TARGETS);
+        assert_eq!(tables[1][RT_CONTROL as usize], flags::RENDER_TARGET_CONTROL);
+        assert_eq!(tables[0][ZETA_BASE as usize], flags::ZETA_BUFFER);
+        assert_eq!(tables[1][ZETA_BASE as usize], flags::RENDER_TARGETS);
+        assert_eq!(tables[0][PIPELINE_BASE as usize], flags::SHADERS);
+    }
 }

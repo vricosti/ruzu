@@ -476,9 +476,7 @@ pub fn sleep_thread(system: &System, ns: i64) {
             current_thread_id,
             timeout
         );
-        let Some(result) = crate::hle::kernel::kernel::with_current_thread_fast_mut(|thread| {
-            thread.sleep(timeout)
-        }) else {
+        let Some(result) = crate::hle::kernel::k_thread::sleep_current_thread(timeout) else {
             log::warn!("svc::SleepThread(sleep): current thread cache missing");
             return;
         };

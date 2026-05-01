@@ -504,16 +504,10 @@ impl RasterizerInterface for RasterizerOpenGL {
     /// every `Draw` — a single pipeline key may be drawn with multiple
     /// topologies in successive calls.
     fn draw(&mut self, draw_state: &DrawState, instance_count: u32) {
-        // Hand the per-stage shader program addresses snapshotted by
-        // `DrawManager::process_draw` to the GL shader cache so that
-        // `current_graphics_pipeline` can build a real, Maxwell-derived
-        // `GraphicsPipelineKey` instead of always reusing the default key.
-        // Upstream `RasterizerOpenGL` reaches the same data via its
-        // Maxwell3D back-pointer; Rust threads it through `DrawState`.
-        self.gl_shader_cache
-            .set_pending_program_addresses(draw_state.shader_program_addresses);
-
-        let Some(pipeline) = self.gl_shader_cache.current_graphics_pipeline() else {
+        let Some(pipeline) = self
+            .gl_shader_cache
+            .current_graphics_pipeline_with_shared_cache(&mut self.shader_cache)
+        else {
             // No pipeline yet — either async compilation is in flight or
             // there is nothing to draw. Upstream silently skips in this case.
             debug!("RasterizerOpenGL::draw skipped — no graphics pipeline available");
@@ -963,7 +957,12 @@ impl RasterizerInterface for RasterizerOpenGL {
         self.buffer_cache.tick_frame();
     }
 
-    fn accelerate_surface_copy(&mut self) -> bool {
+    fn accelerate_surface_copy(
+        &mut self,
+        _src: &crate::engines::fermi_2d::Surface,
+        _dst: &crate::engines::fermi_2d::Surface,
+        _copy_config: &crate::engines::fermi_2d::Config,
+    ) -> bool {
         false
     }
 

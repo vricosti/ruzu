@@ -1387,6 +1387,7 @@ fn pte_kind_from_u32(raw: u32) -> PteKind {
 pub struct MemoryManager {
     id: usize,
     inner: GpuMemoryManager,
+    guest_memory_reader: Option<std::sync::Arc<dyn Fn(u64, &mut [u8]) + Send + Sync>>,
     guest_memory_writer: Option<std::sync::Arc<dyn Fn(u64, &[u8]) + Send + Sync>>,
 }
 
@@ -1412,6 +1413,7 @@ impl MemoryManager {
                 big_page_bits,
                 page_bits,
             ),
+            guest_memory_reader: None,
             guest_memory_writer: None,
         }
     }
@@ -1472,11 +1474,30 @@ impl MemoryManager {
         self.inner.write_block_cached(gpu_dest, input, write_cpu);
     }
 
+    pub fn flush_caching(&self) {
+        self.inner.flush_caching();
+    }
+
+    pub fn set_guest_memory_reader(
+        &mut self,
+        reader: std::sync::Arc<dyn Fn(u64, &mut [u8]) + Send + Sync>,
+    ) {
+        self.guest_memory_reader = Some(reader);
+    }
+
     pub fn set_guest_memory_writer(
         &mut self,
         writer: std::sync::Arc<dyn Fn(u64, &[u8]) + Send + Sync>,
     ) {
         self.guest_memory_writer = Some(writer);
+    }
+
+    pub fn read_block_owned(&self, gpu_src: u64, output: &mut [u8]) -> bool {
+        let Some(reader) = self.guest_memory_reader.as_ref().cloned() else {
+            return false;
+        };
+        self.inner.read_block(gpu_src, output, &*reader);
+        true
     }
 
     pub fn write_block_owned(&self, gpu_dest: u64, input: &[u8]) {

@@ -9,6 +9,7 @@
 
 use crate::control::channel_state::ChannelState;
 use crate::engines::draw_manager::DrawState;
+use crate::engines::fermi_2d::{Config as Fermi2DConfig, Surface as Fermi2DSurface};
 use crate::query_cache::types::QueryPropertiesFlags;
 
 /// Shader loading callback stages.
@@ -170,7 +171,12 @@ pub trait RasterizerInterface {
     }
 
     /// Attempt to use a faster method to perform a surface copy.
-    fn accelerate_surface_copy(&mut self) -> bool {
+    fn accelerate_surface_copy(
+        &mut self,
+        _src: &Fermi2DSurface,
+        _dst: &Fermi2DSurface,
+        _copy_config: &Fermi2DConfig,
+    ) -> bool {
         false
     }
 

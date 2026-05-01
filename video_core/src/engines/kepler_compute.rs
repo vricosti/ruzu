@@ -52,6 +52,7 @@ pub struct QmdConstBuffer {
 /// Parsed Queue Meta Data (QMD) descriptor — 256-byte structure at a GPU VA.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct QueueMetaData {
+    pub linked_tsc: bool,
     pub grid_dim_x: u32,
     pub grid_dim_y: u32,
     pub grid_dim_z: u32,
@@ -63,6 +64,7 @@ pub struct QueueMetaData {
     pub const_buffer_enable_mask: u32,
     pub const_buffers: [QmdConstBuffer; 8],
     pub local_pos_alloc: u32,
+    pub local_crs_alloc: u32,
     pub gpr_alloc: u32,
 }
 
@@ -71,6 +73,9 @@ impl QueueMetaData {
     pub fn from_words(w: &[u32; QMD_WORD_COUNT]) -> Self {
         // Word 0x08: program_start (full word).
         let program_start = w[0x08];
+
+        // Word 0x0B: linked_tsc in bit [30].
+        let linked_tsc = ((w[0x0B] >> 30) & 1) != 0;
 
         // Word 0x0C: grid_dim_x in bits [30:0].
         let grid_dim_x = w[0x0C] & 0x7FFF_FFFF;
@@ -113,7 +118,11 @@ impl QueueMetaData {
         // Word 0x2E: gpr_alloc in bits [28:24].
         let gpr_alloc = (w[0x2E] >> 24) & 0x1F;
 
+        // Word 0x2F: local_crs_alloc in bits [19:0].
+        let local_crs_alloc = w[0x2F] & 0xFFFFF;
+
         Self {
+            linked_tsc,
             grid_dim_x,
             grid_dim_y,
             grid_dim_z,
@@ -125,6 +134,7 @@ impl QueueMetaData {
             const_buffer_enable_mask,
             const_buffers,
             local_pos_alloc,
+            local_crs_alloc,
             gpr_alloc,
         }
     }
@@ -487,6 +497,17 @@ mod tests {
         // Unused CB should be zero.
         assert_eq!(qmd.const_buffers[1].address, 0);
         assert_eq!(qmd.const_buffers[1].size, 0);
+    }
+
+    #[test]
+    fn test_qmd_from_words_linked_tsc_and_local_crs_alloc() {
+        let mut w = [0u32; QMD_WORD_COUNT];
+        w[0x0B] = 1 << 30;
+        w[0x2F] = 0x54321;
+
+        let qmd = QueueMetaData::from_words(&w);
+        assert!(qmd.linked_tsc);
+        assert_eq!(qmd.local_crs_alloc, 0x54321);
     }
 
     #[test]

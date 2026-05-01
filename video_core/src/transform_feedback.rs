@@ -9,7 +9,7 @@
 pub const NUM_TRANSFORM_FEEDBACK_BUFFERS: usize = 4;
 
 /// Layout for a single transform feedback buffer.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub struct TransformFeedbackLayout {
     pub stream: u32,
     pub varying_count: u32,
@@ -17,12 +17,20 @@ pub struct TransformFeedbackLayout {
 }
 
 /// Stream-out layout for a single varying component.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub struct StreamOutLayout {
     raw: u32,
 }
 
 impl StreamOutLayout {
+    pub fn from_raw(raw: u32) -> Self {
+        Self { raw }
+    }
+
+    pub fn raw(&self) -> u32 {
+        self.raw
+    }
+
     pub fn attribute0(&self) -> u32 {
         self.raw & 0xFF
     }
@@ -38,7 +46,7 @@ impl StreamOutLayout {
 }
 
 /// Complete transform feedback state.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct TransformFeedbackState {
     pub layouts: [TransformFeedbackLayout; NUM_TRANSFORM_FEEDBACK_BUFFERS],
     pub varyings: [[StreamOutLayout; 32]; NUM_TRANSFORM_FEEDBACK_BUFFERS],

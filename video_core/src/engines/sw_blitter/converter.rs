@@ -150,7 +150,7 @@ pub const RGB_TO_SRGB_LUT: [f32; 256] = [
 /// Trait for pixel format converters.
 ///
 /// Corresponds to the C++ `Converter` base class.
-pub trait Converter {
+pub trait Converter: Send {
     /// Convert native-format pixel data to f32x4 intermediate representation.
     fn convert_to(&self, input: &[u8], output: &mut [f32]);
 
@@ -534,7 +534,7 @@ impl Converter for GenericConverter {
 ///
 /// Corresponds to the C++ `ConverterFactory` class.
 pub struct ConverterFactory {
-    cache: HashMap<u32, Box<dyn Converter>>,
+    cache: HashMap<u32, Box<dyn Converter + Send>>,
 }
 
 impl ConverterFactory {

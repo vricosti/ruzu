@@ -958,7 +958,12 @@ impl RasterizerInterface for RasterizerVulkan {
         self.query_cache.erase_channel(channel_id);
     }
 
-    fn accelerate_surface_copy(&mut self) -> bool {
+    fn accelerate_surface_copy(
+        &mut self,
+        _src: &crate::engines::fermi_2d::Surface,
+        _dst: &crate::engines::fermi_2d::Surface,
+        _copy_config: &crate::engines::fermi_2d::Config,
+    ) -> bool {
         false
     }
 

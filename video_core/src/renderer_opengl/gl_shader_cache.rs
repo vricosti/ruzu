@@ -13,10 +13,11 @@ use shader_recompiler::profile::Profile as ShaderProfile;
 use shader_recompiler::runtime_info::RuntimeInfo;
 use shader_recompiler::{compile_shader_glsl, CompiledGlslShader, ShaderStage};
 
+use crate::shader_cache::{GraphicsEnvironments, ShaderCache as SharedShaderCache};
 use crate::shader_environment::{GenericEnvironment, GpuMemoryReader};
 
 use super::gl_compute_pipeline::{ComputePipeline, ComputePipelineKey};
-use super::gl_graphics_pipeline::{GraphicsPipeline, GraphicsPipelineKey, NUM_STAGES};
+use super::gl_graphics_pipeline::{GraphicsPipeline, GraphicsPipelineKey};
 
 /// Cache version for serialized pipeline data.
 pub const CACHE_VERSION: u32 = 10;
@@ -173,13 +174,53 @@ impl ShaderCache {
         if let Some(prev) = self.current_pipeline {
             if prev == key && self.graphics_cache.contains_key(&key) {
                 let pipeline = self.graphics_cache.get_mut(&key).unwrap();
-                if use_async && !pipeline.is_built() {
-                    return None;
-                }
-                return Some(pipeline);
+                return Self::built_pipeline(use_async, None, pipeline);
             }
         }
         self.current_graphics_pipeline_slow_path()
+    }
+
+    /// Shared-owner runtime path matching upstream `OpenGL::ShaderCache`'s
+    /// inherited `VideoCommon::ShaderCache` usage more closely than the local
+    /// address-only fallback.
+    pub fn current_graphics_pipeline_with_shared_cache(
+        &mut self,
+        shared_cache: &mut SharedShaderCache,
+    ) -> Option<&mut GraphicsPipeline> {
+        if !shared_cache.refresh_stages(&mut self.graphics_key.unique_hashes) {
+            self.current_pipeline = None;
+            return None;
+        }
+
+        let maxwell3d = shared_cache.current_maxwell3d()?;
+        self.graphics_key.raw = 0;
+        self.graphics_key.set_early_z(maxwell3d.mandated_early_z());
+        self.graphics_key
+            .set_gs_input_topology(maxwell3d.draw_manager_topology() as u32);
+        self.graphics_key
+            .set_tessellation_primitive(maxwell3d.tessellation_domain_type());
+        self.graphics_key
+            .set_tessellation_spacing(maxwell3d.tessellation_spacing());
+        self.graphics_key
+            .set_tessellation_clockwise(maxwell3d.tessellation_clockwise());
+        self.graphics_key
+            .set_xfb_enabled(maxwell3d.transform_feedback_enabled());
+        self.graphics_key
+            .set_app_stage(maxwell3d.engine_state() as u32);
+        if self.graphics_key.xfb_enabled() {
+            self.graphics_key.xfb_state = maxwell3d.transform_feedback_state();
+        }
+
+        let key = self.graphics_key;
+        self.current_pipeline = Some(key);
+        let maxwell3d = shared_cache.current_maxwell3d();
+
+        if self.graphics_cache.contains_key(&key) {
+            let pipeline = self.graphics_cache.get_mut(&key).unwrap();
+            return Self::built_pipeline(self.use_asynchronous_shaders, maxwell3d, pipeline);
+        }
+
+        self.current_graphics_pipeline_slow_path_with_shared_cache(shared_cache)
     }
 
     /// Get the current compute pipeline.
@@ -213,10 +254,7 @@ impl ShaderCache {
         // Cache hit: return the existing pipeline, gated by async-build state.
         if self.graphics_cache.contains_key(&key) {
             let pipeline = self.graphics_cache.get_mut(&key).unwrap();
-            if self.use_asynchronous_shaders && !pipeline.is_built() {
-                return None;
-            }
-            return Some(pipeline);
+            return Self::built_pipeline(self.use_asynchronous_shaders, None, pipeline);
         }
 
         // Cache miss: create a pipeline, insert it, and return a reference
@@ -228,26 +266,34 @@ impl ShaderCache {
         );
         self.graphics_cache.insert(key, pipeline);
         let inserted = self.graphics_cache.get_mut(&key).expect("just inserted");
-        if self.use_asynchronous_shaders && !inserted.is_built() {
-            return None;
+        Self::built_pipeline(self.use_asynchronous_shaders, None, inserted)
+    }
+
+    fn current_graphics_pipeline_slow_path_with_shared_cache(
+        &mut self,
+        shared_cache: &mut SharedShaderCache,
+    ) -> Option<&mut GraphicsPipeline> {
+        let key = self.graphics_key;
+        self.current_pipeline = Some(key);
+        let maxwell3d = shared_cache.current_maxwell3d();
+
+        if self.graphics_cache.contains_key(&key) {
+            let pipeline = self.graphics_cache.get_mut(&key).unwrap();
+            return Self::built_pipeline(self.use_asynchronous_shaders, maxwell3d, pipeline);
         }
-        Some(inserted)
+
+        let pipeline = self.create_graphics_pipeline_with_shared_cache(shared_cache)?;
+        self.graphics_cache.insert(key, pipeline);
+        let inserted = self.graphics_cache.get_mut(&key).expect("just inserted");
+        Self::built_pipeline(self.use_asynchronous_shaders, maxwell3d, inserted)
     }
 
     /// Build a `GraphicsPipelineKey` describing the current Maxwell3D state.
     ///
-    /// Upstream reads `Tegra::Engines::Maxwell3D::regs` and hashes the active
-    /// shader program bytecode, tessellation state, transform feedback
-    /// state, and polygon-mode flags. Without GPU-memory access yet, we
-    /// populate `unique_hashes` with the per-stage shader program *addresses*
-    /// supplied via `set_pending_program_addresses`. Two pipelines whose
-    /// shaders live at the same six GPU addresses will collapse onto the
-    /// same cache entry — which is the correct behaviour for as long as
-    /// the addresses are stable per-shader.
-    ///
-    /// Tessellation, XFB, polygon-mode, and topology contributions to the
-    /// key are still left as defaults; they become real once the rest of
-    /// Maxwell3D state is plumbed through.
+    /// Reduced local fallback path for non-shared callers. The active runtime
+    /// path uses `current_graphics_pipeline_with_shared_cache(...)`, which now
+    /// mirrors the upstream owner by reading Maxwell state from the shared
+    /// `VideoCommon::ShaderCache` channel owner.
     fn build_graphics_key(&self) -> GraphicsPipelineKey {
         GraphicsPipelineKey {
             unique_hashes: self.pending_program_addresses,
@@ -257,13 +303,27 @@ impl ShaderCache {
 
     /// Check if a pipeline is built (or if async shaders should return None).
     fn built_pipeline<'a>(
-        &self,
+        use_asynchronous_shaders: bool,
+        maxwell3d: Option<&crate::engines::maxwell_3d::Maxwell3D>,
         pipeline: &'a mut GraphicsPipeline,
     ) -> Option<&'a mut GraphicsPipeline> {
-        if self.use_asynchronous_shaders && !pipeline.is_built() {
+        if pipeline.is_built() {
+            return Some(pipeline);
+        }
+        if !use_asynchronous_shaders {
+            return Some(pipeline);
+        }
+        let Some(maxwell3d) = maxwell3d else {
+            return None;
+        };
+        if maxwell3d.zeta_enable() {
             return None;
         }
-        Some(pipeline)
+        let draw_state = maxwell3d.draw_manager_state();
+        if draw_state.index_buffer.count <= 6 || draw_state.vertex_buffer.count <= 6 {
+            return Some(pipeline);
+        }
+        None
     }
 
     /// Create a new graphics pipeline from the current engine state.
@@ -324,8 +384,8 @@ impl ShaderCache {
             // the same type, so the assignment is direct.
             let mut env = GenericEnvironment::new()
                 .with_gpu_read(Arc::clone(reader))
-                .with_program(address, 0);
-            env.stage = stage;
+                .with_program(address, 0)
+                .with_stage(stage);
 
             // Find the shader's tail with the upstream sentinel scan.
             let Some(_hash) = env.analyze() else {
@@ -341,14 +401,57 @@ impl ShaderCache {
             // and including the block containing the sentinel; the prefix
             // up to `cached_highest` is the actual shader body the
             // recompiler should consume.
-            let words = (env.cached_highest as usize) / std::mem::size_of::<u64>();
-            let code_slice = &env.code[..words.min(env.code.len())];
+            let code_slice = env.cached_code_slice();
             let compiled = self.compile_stage_glsl(code_slice, stage);
             log::debug!(
                 "gl_shader_cache: compiled {:?} stage to {} bytes of GLSL",
                 stage,
                 compiled.source.len()
             );
+            pipeline.glsl_sources[gl_slot] = Some(compiled.source);
+        }
+
+        Some(pipeline)
+    }
+
+    fn create_graphics_pipeline_with_shared_cache(
+        &mut self,
+        shared_cache: &SharedShaderCache,
+    ) -> Option<GraphicsPipeline> {
+        let mut environments = GraphicsEnvironments::default();
+        shared_cache.get_graphics_environments(&mut environments, &self.graphics_key.unique_hashes);
+        self.create_graphics_pipeline_from_environments(&mut environments)
+    }
+
+    fn create_graphics_pipeline_from_environments(
+        &mut self,
+        environments: &mut GraphicsEnvironments,
+    ) -> Option<GraphicsPipeline> {
+        let mut pipeline = GraphicsPipeline::new(self.graphics_key);
+
+        const STAGE_LAYOUT: &[(usize, ShaderStage, usize)] = &[
+            (1, ShaderStage::VertexB, 0),
+            (2, ShaderStage::TessellationControl, 1),
+            (3, ShaderStage::TessellationEval, 2),
+            (4, ShaderStage::Geometry, 3),
+            (5, ShaderStage::Fragment, 4),
+        ];
+
+        for &(slot, stage, gl_slot) in STAGE_LAYOUT {
+            if self.graphics_key.unique_hashes[slot] == 0 {
+                continue;
+            }
+
+            let env = environments.envs[slot].generic_environment_mut();
+            if env.cached_code_slice().is_empty() && env.analyze().is_none() {
+                log::warn!(
+                    "gl_shader_cache: shared environment analyze failed for stage {:?}",
+                    stage
+                );
+                continue;
+            }
+
+            let compiled = self.compile_stage_glsl(env.cached_code_slice(), stage);
             pipeline.glsl_sources[gl_slot] = Some(compiled.source);
         }
 
@@ -402,6 +505,43 @@ impl ShaderCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+
+    use crate::control::channel_state::ChannelState;
+    use crate::engines::engine_interface::EngineInterface;
+    use crate::engines::maxwell_3d::{EngineHint, Maxwell3D, PrimitiveTopology};
+    use crate::memory_manager::MemoryManager;
+    use crate::renderer_opengl::gl_graphics_pipeline::NUM_STAGES;
+    use parking_lot::Mutex as ParkingLotMutex;
+
+    fn make_cpu_reader(
+        cpu_base: u64,
+        backing: Arc<Vec<u8>>,
+    ) -> Arc<dyn Fn(u64, &mut [u8]) + Send + Sync> {
+        Arc::new(move |cpu_addr, dst| {
+            if cpu_addr < cpu_base {
+                return;
+            }
+            let offset = (cpu_addr - cpu_base) as usize;
+            if offset >= backing.len() {
+                return;
+            }
+            let n = (offset + dst.len()).min(backing.len()) - offset;
+            dst[..n].copy_from_slice(&backing[offset..offset + n]);
+        })
+    }
+
+    fn make_maxwell_for_built_pipeline(
+        vertex_count: u32,
+        index_count: u32,
+        zeta_enable: bool,
+    ) -> Maxwell3D {
+        let mut maxwell = Maxwell3D::new();
+        <Maxwell3D as EngineInterface>::call_method(&mut maxwell, 0x583, vertex_count, true);
+        <Maxwell3D as EngineInterface>::call_method(&mut maxwell, 0x5F8, index_count, true);
+        <Maxwell3D as EngineInterface>::call_method(&mut maxwell, 0x54E, zeta_enable as u32, true);
+        maxwell
+    }
 
     #[test]
     fn shader_cache_creation() {
@@ -547,6 +687,143 @@ mod tests {
         cache.set_pending_program_addresses([0x2000, 0, 0, 0, 0, 0]);
         cache.current_graphics_pipeline().expect("second pipeline");
         assert_eq!(cache.graphics_pipeline_count(), 2);
+    }
+
+    #[test]
+    fn create_graphics_pipeline_from_shared_environments_emits_glsl_for_vertex_stage() {
+        let vertex_addr: u64 = 0x20_0000_0000;
+        const SELF_BRANCH_A: u64 = 0xE2400FFFFF87000F;
+        let backing = {
+            let mut v = vec![0u8; 0x1000];
+            v[0x80..0x88].copy_from_slice(&SELF_BRANCH_A.to_le_bytes());
+            Arc::new(v)
+        };
+        let reader: GpuMemoryReader = Arc::new(move |gpu_addr, dst| {
+            if gpu_addr < vertex_addr {
+                return;
+            }
+            let offset = (gpu_addr - vertex_addr) as usize;
+            if offset >= backing.len() {
+                return;
+            }
+            let n = (offset + dst.len()).min(backing.len()) - offset;
+            dst[..n].copy_from_slice(&backing[offset..offset + n]);
+        });
+
+        let mut cache = ShaderCache::new();
+        cache.graphics_key.unique_hashes[1] = 0x1234;
+
+        let mut environments = GraphicsEnvironments::default();
+        *environments.envs[1].generic_environment_mut() = GenericEnvironment::new()
+            .with_gpu_read(reader)
+            .with_program(vertex_addr, 0)
+            .with_stage(ShaderStage::VertexB);
+
+        let pipeline = cache
+            .create_graphics_pipeline_from_environments(&mut environments)
+            .expect("pipeline must be created");
+        let vertex_glsl = pipeline.glsl_sources[0]
+            .as_ref()
+            .expect("vertex GLSL must be populated");
+        assert!(!vertex_glsl.is_empty());
+    }
+
+    #[test]
+    fn shared_cache_path_populates_live_graphics_key_fields_from_maxwell() {
+        let gpu_base = 0x1_0000_0000;
+        let cpu_base = 0x4000;
+        let mut backing = vec![0u8; 0x2000];
+        backing[0x180..0x188].copy_from_slice(&0xE2400FFFFF87000Fu64.to_le_bytes());
+        let backing = Arc::new(backing);
+
+        let memory_manager = Arc::new(ParkingLotMutex::new(MemoryManager::new(0)));
+        memory_manager
+            .lock()
+            .map(gpu_base, cpu_base, 0x2000, 0, false);
+
+        let mut maxwell = Maxwell3D::new();
+        maxwell.set_memory_manager(Arc::clone(&memory_manager));
+        maxwell.set_guest_memory_reader(make_cpu_reader(cpu_base, Arc::clone(&backing)));
+        <Maxwell3D as EngineInterface>::call_method(&mut maxwell, 0x582, 1, true);
+        <Maxwell3D as EngineInterface>::call_method(&mut maxwell, 0x583, 0, true);
+        <Maxwell3D as EngineInterface>::call_method(&mut maxwell, 0x810, 1 | (1 << 4), true);
+        <Maxwell3D as EngineInterface>::call_method(&mut maxwell, 0x811, 0x100, true);
+        <Maxwell3D as EngineInterface>::call_method(&mut maxwell, 0x84, 1, true);
+        <Maxwell3D as EngineInterface>::call_method(
+            &mut maxwell,
+            0xC8,
+            0x2 | (1 << 4) | (2 << 8),
+            true,
+        );
+        <Maxwell3D as EngineInterface>::call_method(&mut maxwell, 0x1C0, 3, true);
+        <Maxwell3D as EngineInterface>::call_method(&mut maxwell, 0x1C1, 5, true);
+        <Maxwell3D as EngineInterface>::call_method(&mut maxwell, 0x1C2, 0x20, true);
+        <Maxwell3D as EngineInterface>::call_method(&mut maxwell, 0x1D1, 1, true);
+        <Maxwell3D as EngineInterface>::call_method(&mut maxwell, 0xA00, 0x0403_0201, true);
+        <Maxwell3D as EngineInterface>::call_method(
+            &mut maxwell,
+            0x586,
+            PrimitiveTopology::TriangleStrip as u32,
+            true,
+        );
+        <Maxwell3D as EngineInterface>::call_method(&mut maxwell, 0x652, 1, true);
+        <Maxwell3D as EngineInterface>::call_method(&mut maxwell, 0x65C, 2, true);
+        maxwell.set_engine_state(EngineHint::OnHleMacro);
+
+        let mut channel = ChannelState::new(7);
+        channel.program_id = 0x1234;
+        channel.memory_manager = Some(Arc::clone(&memory_manager));
+        channel.maxwell_3d = Some(Box::new(maxwell));
+        channel.kepler_compute = Some(Box::default());
+
+        let mut shared_cache = SharedShaderCache::new();
+        shared_cache.create_channel(&channel);
+        shared_cache.bind_to_channel(7);
+
+        let mut cache = ShaderCache::new();
+        let pipeline = cache
+            .current_graphics_pipeline_with_shared_cache(&mut shared_cache)
+            .expect("shared path should build a pipeline");
+
+        assert_eq!(
+            pipeline.key.unique_hashes[1],
+            shared_cache.shader_info_slots()[1]
+                .map(|ptr| unsafe { &*ptr }.unique_hash)
+                .unwrap()
+        );
+        assert!(pipeline.key.early_z());
+        assert!(pipeline.key.xfb_enabled());
+        assert_eq!(
+            (pipeline.key.raw >> 2) & 0xF,
+            PrimitiveTopology::Lines as u32
+        );
+        assert_eq!((pipeline.key.raw >> 6) & 0x3, 2);
+        assert_eq!((pipeline.key.raw >> 8) & 0x3, 1);
+        assert_eq!((pipeline.key.raw >> 10) & 0x1, 1);
+        assert_eq!(
+            (pipeline.key.raw >> 11) & 0x7,
+            EngineHint::OnHleMacro as u32
+        );
+        assert_eq!(pipeline.key.xfb_state.layouts[0].stream, 3);
+        assert_eq!(pipeline.key.xfb_state.layouts[0].varying_count, 5);
+        assert_eq!(pipeline.key.xfb_state.layouts[0].stride, 0x20);
+        assert_eq!(pipeline.key.xfb_state.varyings[0][0].raw(), 0x0403_0201);
+    }
+
+    #[test]
+    fn built_pipeline_async_shared_path_blocks_when_depth_is_enabled() {
+        let maxwell = make_maxwell_for_built_pipeline(64, 64, true);
+        let mut pipeline = GraphicsPipeline::new(GraphicsPipelineKey::default());
+        pipeline.set_built_for_test(false);
+        assert!(ShaderCache::built_pipeline(true, Some(&maxwell), &mut pipeline).is_none());
+    }
+
+    #[test]
+    fn built_pipeline_async_shared_path_allows_small_draws() {
+        let maxwell = make_maxwell_for_built_pipeline(4, 64, false);
+        let mut pipeline = GraphicsPipeline::new(GraphicsPipelineKey::default());
+        pipeline.set_built_for_test(false);
+        assert!(ShaderCache::built_pipeline(true, Some(&maxwell), &mut pipeline).is_some());
     }
 
     #[test]

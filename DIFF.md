@@ -2692,6 +2692,115 @@
 ### Binary layout verification
 - PASS: trigger method remains executable through the upstream-owned `execution_mask`.
 
+## 2026-04-30 — `video_core/src/engines/fermi_2d.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/engines/fermi_2d.h` and `/home/vricosti/Dev/emulators/zuyu/src/video_core/engines/fermi_2d.cpp` (CallMethod owner follow-up)
+
+### Intentional differences
+- Rust still keeps a simplified software blit backend in this owner file instead of the upstream `SoftwareBlitEngine` plus `AccelerateSurfaceCopy(...)` path.
+- Rust still adapts the upstream rasterizer edge through a stored trait-object handle rather than a literal `RasterizerInterface*` owner field.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: the blit trigger side effect now lives in `Fermi2D::call_method(...)`, the same owner boundary as upstream `Fermi2D::CallMethod`, instead of being split with a Rust-only `Engine::write_reg()` bypass.
+- Fixed in this pass: `Engine::write_reg()` now routes through `CallMethod` ownership instead of writing `regs[]` directly and duplicating the trigger logic.
+
+### Missing items
+- `CallMethod()` still does not implement the wider upstream `Blit()` behavior beyond setting the pending software blit path.
+- `Blit()` still does not consult the bound rasterizer for `AccelerateSurfaceCopy(...)` before falling back to software, unlike upstream.
+
+### Binary layout verification
+- PASS: owner/control-flow change only; no guest-visible binary payload layout changed.
+
+## 2026-04-30 — `video_core/src/engines/fermi_2d.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/engines/fermi_2d.h` and `/home/vricosti/Dev/emulators/zuyu/src/video_core/engines/fermi_2d.cpp` (CallMultiMethod last-call follow-up)
+
+### Intentional differences
+- Rust still uses a simplified software blit backend in this owner file instead of the upstream `SoftwareBlitEngine` plus accelerated surface-copy path.
+- The regression for `is_last_call` propagation uses a `#[cfg(test)]` owner-local trace vector because `Fermi2D` does not otherwise expose that control-flow detail.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `Fermi2D::call_multi_method(...)` now propagates the upstream `methods_pending - i <= 1` last-call rule instead of passing `false` for every element.
+
+### Missing items
+- `Blit()` is still behaviorally reduced versus upstream and still does not consult `AccelerateSurfaceCopy(...)`.
+- the wider register layout in this file is still reduced to the subset needed by the current software blit path.
+
+### Binary layout verification
+- PASS: call-order/control-flow change only; no guest-visible binary payload layout changed.
+
+## 2026-04-30 — `video_core/src/rasterizer_interface.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/rasterizer_interface.h` (Fermi2D surface-copy signature follow-up)
+
+### Intentional differences
+- Rust still uses `u32` query type arguments and other existing adaptation layers elsewhere in the trait; this slice only restores the owner surface for Fermi2D accelerated copies.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `RasterizerInterface::accelerate_surface_copy(...)` now takes upstream-shaped Fermi2D owner arguments (`src`, `dst`, `copy_config`) instead of the reduced no-argument stub surface.
+
+### Missing items
+- The Rust trait still does not expose the full upstream `AccessAccelerateDMA()` owner surface in the same shape.
+
+### Binary layout verification
+- PASS: trait-surface change only; no guest-visible binary payload layout changed.
+
+## 2026-04-30 — `video_core/src/engines/fermi_2d.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/engines/fermi_2d.h` and `/home/vricosti/Dev/emulators/zuyu/src/video_core/engines/fermi_2d.cpp` (surface-copy owner follow-up)
+
+### Intentional differences
+- Rust still carries a reduced `Surface` / `Config` representation that only covers the active software-blit path and the restored rasterizer hook, not the entire upstream register union.
+- Rust still performs software fallback through `execute_pending(...)` because this tree models engine-side writes via `PendingWrite` rather than an in-place `MemoryManager` + `SoftwareBlitEngine` owner graph.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: the owner file now exposes upstream-shaped local `Surface` and `Config` types instead of bypassing them entirely.
+- Fixed in this pass: `execute_pending(...)` now attempts the upstream rasterizer edge `AccelerateSurfaceCopy(src, dst, copy_config)` before falling back to the local software copy path.
+
+### Missing items
+- `Surface` and `Config` are still only partial ports of the upstream owner types.
+- `Blit()` behavior is still reduced: operation/filter/origin/layout decoding is not yet populated from the full register file.
+- the file still lacks the upstream `SoftwareBlitEngine` owner and `MemoryManager::FlushCaching()` edge.
+
+### Binary layout verification
+- PASS: owner/helper additions only; no guest-visible binary payload layout changed.
+
+## 2026-04-30 — `video_core/src/renderer_null/null_rasterizer.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_null/null_rasterizer.h` and `/home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_null/null_rasterizer.cpp`
+
+### Intentional differences
+- Rust still uses the broader local trait adaptation around guest-memory writer/ticks callbacks.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `accelerate_surface_copy(...)` now matches the upstream owner signature and still returns `true`, preserving the null backend behavior with the correct interface.
+
+### Missing items
+- none specific to this slice beyond the wider renderer-base adaptation already documented elsewhere.
+
+### Binary layout verification
+- PASS: method-signature change only; no guest-visible binary payload layout changed.
+
+## 2026-04-30 — `video_core/src/renderer_opengl/gl_rasterizer.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_rasterizer.h` and `/home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_rasterizer.cpp` (surface-copy signature follow-up)
+
+### Intentional differences
+- Rust still returns `false` here because the backend does not yet own the upstream texture-cache `BlitImage(dst, src, copy_config)` path.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `accelerate_surface_copy(...)` now matches the upstream owner signature instead of the reduced no-argument stub.
+
+### Missing items
+- actual `texture_cache.BlitImage(dst, src, copy_config)` delegation
+
+### Binary layout verification
+- PASS: method-signature change only; no guest-visible binary payload layout changed.
+
+## 2026-04-30 — `video_core/src/renderer_vulkan/mod.rs` and `video_core/src/renderer_vulkan/vk_rasterizer.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_vulkan/vk_rasterizer.h` and `/home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_vulkan/vk_rasterizer.cpp` (surface-copy signature follow-up)
+
+### Intentional differences
+- Rust still keeps the active Vulkan owner split across `mod.rs` and `vk_rasterizer.rs`, unlike the single upstream `RasterizerVulkan` owner.
+- Rust still returns `false` for accelerated surface copies because the upstream texture-cache `BlitImage(dst, src, copy_config)` path is not yet ported here.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: both active Vulkan owner surfaces now expose the upstream `accelerate_surface_copy(src, dst, copy_config)` signature instead of the reduced no-argument stub.
+
+### Missing items
+- actual delegation to the Vulkan texture-cache blit path
+- further owner unification between `mod.rs` and `vk_rasterizer.rs`
+
+### Binary layout verification
+- PASS: method-signature change only; no guest-visible binary payload layout changed.
+
 ## 2026-03-29 — video_core/src/engines/maxwell_dma.rs vs video_core/engines/maxwell_dma.cpp
 
 ### Intentional differences
@@ -8528,6 +8637,39 @@
 ### Binary layout verification
 - PASS: synchronization/lifecycle only; no guest-facing binary layout changed.
 
+## 2026-04-30 — core/src/hle/kernel/k_condition_variable.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/k_condition_variable.cpp and /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/k_condition_variable.h
+
+### Intentional differences
+- Rust still threads the process owner through `Arc<Mutex<KProcess>>` and raw-pointer reborrows where upstream uses direct object ownership under kernel scheduler locks. This remains the borrow/lifetime adaptation for the matching owner file.
+- Rust still keeps an external wait tree helper in `k_condition_variable.rs` instead of upstream intrusive tree nodes embedded in `KThread`. Ownership still matches the upstream file even though the data structure differs.
+- Rust still keeps a monitor-less fallback in `UpdateLockAtomic(...)` for bare-process unit tests that construct `KProcess::new()` without `initialize_interfaces()`. The runtime path now uses the process-owned exclusive monitor like upstream; the fallback exists only because the local test harness does not initialize full ARM process interfaces in every focused test.
+
+### Unintentional differences (to fix)
+- fixed in this pass: `WaitForAddress()` and `Wait()` no longer call the Rust-only post-setup `wait_for_current_thread(...)` shim after the owner-local wait setup. The owner now returns through the same immediate `GetWaitResult()` shape as upstream instead of re-entering an extra scheduler polling loop from this file.
+- fixed in this pass: `UpdateLockAtomic(...)` now uses the process-owned exclusive monitor CAS loop (`exclusive_read32` / `exclusive_write32`) when the process interfaces are initialized, matching the active upstream runtime path much more closely.
+- still wrong: the remaining guest wait lifecycle depends on the Rust scheduler/fiber machinery to resume the current guest thread after `BeginWait(...)`, so further parity work may still be needed outside this file if the MK8D plateau persists.
+
+### Missing items
+- Literal intrusive `ConditionVariableThreadTreeType` ownership on `KThread`.
+
+### Binary layout verification
+- PASS: synchronization/lifecycle only; no guest-facing binary layout changed.
+
+## 2026-04-30 — core/src/hle/kernel/k_thread.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/k_thread.cpp and /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/k_thread.h
+
+### Intentional differences
+- Rust still represents the upstream intrusive `KTimerTask` / wait-queue ownership through explicit thread fields and queue objects because the Rust thread object does not embed the same inheritance graph. The owner file remains `k_thread.rs`.
+
+### Unintentional differences (to fix)
+- fixed in this pass: the direct queue-cancel paths in `OnTimer()` and the waiting-termination branch previously bypassed the Rust-side post-wait cleanup that `cancel_wait()` performs (`sleep_deadline`, `waiting_lock_info`, context/result propagation). Upstream uses the same thread object state after `m_wait_queue->CancelWait(...)`; the Rust port now finalizes that transition on every direct cancel path too.
+
+### Missing items
+- Re-audit whether any other direct queue-owner paths in `k_thread.rs` still bypass the same post-wait cleanup.
+- Full intrusive `KTimerTask` parity remains incomplete.
+
+### Binary layout verification
+- PASS: thread wait lifecycle only; no raw serialized struct layout changed.
+
 ## 2026-04-13 — core/src/hle/kernel/k_process.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/k_process.cpp
 
 ### Intentional differences
@@ -10579,6 +10721,75 @@
 
 ## 2026-04-28 — `video_core/src/control/channel_state_cache.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/control/channel_state_cache.h` and `/home/vricosti/Dev/emulators/zuyu/src/video_core/control/channel_state_cache.inc` (live engine-reference follow-up)
 
+## 2026-04-29 — `video_core/src/engines/kepler_compute.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/engines/kepler_compute.h` and `/home/vricosti/Dev/emulators/zuyu/src/video_core/engines/kepler_compute.cpp` (launch-parameter follow-up)
+
+### Intentional differences
+- Rust still stores a reduced decoded `QueueMetaData` owner instead of the literal upstream raw `LaunchParams` bitfield struct. This pass only restored the active fields needed by the shared shader-environment owner path.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: the matching owner file now carries `linked_tsc`, matching upstream `LaunchParams` word `0x0B` bit `30`.
+- Fixed in this pass: the matching owner file now carries `local_crs_alloc`, matching upstream `LaunchParams` word `0x2F` bits `0..19`.
+- Fixed in this pass: the decoded QMD path now exposes the `local_pos_alloc + local_crs_alloc` split that upstream `ComputeEnvironment` consumes.
+
+### Missing items
+- Rust still does not expose the literal upstream `LaunchParams` raw layout or its bitfield helpers.
+- The file still keeps the reduced dispatch queue path instead of the literal upstream rasterizer launch flow from `ProcessLaunch()`.
+
+### Binary layout verification
+- FAIL: Rust `QueueMetaData` is still not the literal upstream raw `LaunchParams` layout.
+
+## 2026-04-29 — `video_core/src/engines/maxwell_3d.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/engines/maxwell_3d.h` and `/home/vricosti/Dev/emulators/zuyu/src/video_core/engines/maxwell_3d.cpp` (shader-environment bridge follow-up)
+
+### Intentional differences
+- Rust exposes small owner-local bridge accessors (`viewport_transform_state`, `bindless_texture_const_buffer_slot`, `sampler_binding`, `make_gpu_memory_reader`) so the shared shader-environment owner can stay in its matching file without pulling logic back into `shader_cache.rs`.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: the matching owner file now restores the upstream constant placement for `viewport_scale_offset_enabled` and `bindless_texture_const_buffer_slot`, which the shared shader-environment owner now reads through this file.
+
+### Missing items
+- The upstream replace-table / HLE macro state is still not exposed to the shared shader-environment owner in a form that permits a literal `GetReplaceConstBuffer(...)` port.
+- The Rust GPU-memory bridge remains callback-based instead of the literal upstream `MemoryManager*` owner graph.
+
+### Binary layout verification
+- PASS: register-owner constant placement only; no guest-visible raw layout changed in this slice.
+
+## 2026-04-29 — `video_core/src/shader_environment.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/shader_environment.h` and `/home/vricosti/Dev/emulators/zuyu/src/video_core/shader_environment.cpp`
+
+### Intentional differences
+- Rust still uses snapshot-based `GraphicsEnvironment` / `ComputeEnvironment` owners plus an injected `GpuMemoryReader` callback instead of literal live `Maxwell3D*`, `KeplerCompute*`, and `MemoryManager*` storage.
+- The constructor-side tests were kept focused on constructor mapping and owner-local CB reads, because the active Rust `Maxwell3D` test path still has unrelated macro-engine side effects outside this owner slice.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: the matching owner file now restores owner-local `GraphicsEnvironment::from_maxwell3d(...)` and `ComputeEnvironment::from_kepler_compute(...)` constructors instead of reconstructing that state inside `shader_cache.rs`.
+- Fixed in this pass: `read_cbuf_value`, `read_texture_type`, `read_texture_pixel_format`, `is_texture_pixel_format_integer`, and `read_viewport_transform_state` now live in the matching owner file again.
+- Fixed in this pass: the compute owner now consumes `local_crs_alloc` like upstream when calculating local memory size.
+
+### Missing items
+- `GraphicsEnvironment::from_maxwell3d(...)` still does not read the real upstream SPH block, set `initial_offset = sizeof(sph)`, or carry `gp_passthrough_mask`.
+- `GraphicsEnvironment::get_replace_const_buffer(...)` is still stubbed to `None`; the upstream HLE macro / replace-table owner graph is not fully exposed yet.
+- `ComputeEnvironment` still stores copied const-buffer state and `linked_tsc` instead of the literal upstream `launch_description` owner pointer path.
+- `FileEnvironment` remains structurally reduced versus upstream in several stage-specific fields and still uses placeholder SPH serialization.
+
+### Binary layout verification
+- FAIL: environment owners are still snapshot-based Rust adaptations, not literal upstream object layout.
+
+## 2026-04-29 — `video_core/src/shader_cache.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/shader_cache.h` and `/home/vricosti/Dev/emulators/zuyu/src/video_core/shader_cache.cpp` (environment-owner follow-up)
+
+### Intentional differences
+- Rust still resolves the bound engine owners through raw addresses stored in `ChannelInfo`, because the upstream live-reference graph is not fully reproduced yet.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `RefreshStages(...)`, `ComputeShader()`, and `GetGraphicsEnvironments(...)` no longer reconstruct stage environments locally. They now use the matching owner constructors in `shader_environment.rs`.
+- Fixed in this pass: the borrow-sensitive Rust implementation now snapshots channel/engine state before mutating `shader_infos`, which preserves the upstream owner file while avoiding Rust-only aliasing failures.
+
+### Missing items
+- `RefreshStages(...)` still remains behaviorally reduced versus upstream in its stage-refresh details because the underlying `GraphicsEnvironment` owner is still incomplete.
+- `ComputeShader()` and `GetGraphicsEnvironments(...)` still inherit the reduced environment behavior and snapshot ownership from `shader_environment.rs`.
+- The current raw-pointer bridge through `ChannelInfo` is still not literal upstream channel ownership.
+
+### Binary layout verification
+- PASS: cache-owner wiring only; no guest-visible serialized layout changed in this slice.
+
 ### Intentional differences
 - Rust still stores upstream live engine references as raw pointer addresses (`usize`) inside `ChannelInfo` and `ChannelSetupCaches<P>` current-state fields, instead of literal C++ references/pointers. This preserves the owner boundary and the live-address semantics without making the shared cache owner non-`Send`.
 - Rust still keeps the actual `MemoryManager` owner available separately through `gpu_memory_arc()` because backend leaves need an `Arc<Mutex<MemoryManager>>` for safe writeback closures.
@@ -10726,3 +10937,1562 @@
 
 ### Binary layout verification
 - PASS: owner/lifecycle change only; no guest-visible raw layout changed.
+
+## 2026-04-29 — `shader_recompiler/src/environment.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/shader_recompiler/environment.h`
+
+### Intentional differences
+- Rust keeps `Shader::Environment` as a trait instead of an abstract base class. This is the direct Rust analogue of the upstream virtual interface and preserves owner boundaries.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: the mutating virtuals now use `&mut self`, matching the upstream non-`const` owner contract instead of an incorrect immutable Rust surface.
+- Fixed in this pass: the trait still exposes the upstream protected-field getters (`SPH`, `GpPassthroughMask`, `ShaderStage`, `StartAddress`, `IsProprietaryDriver`) as owner methods, but now the concrete video-core environments can implement the full contract directly from the matching file.
+
+### Missing items
+- The Rust recompiler frontend still does not consume this trait end-to-end in the same places upstream does because large parts of `shader_recompiler/frontend/maxwell/*` remain structurally reduced or stubbed.
+
+### Binary layout verification
+- PASS: abstract trait boundary only; no raw serialized layout changed.
+
+## 2026-04-29 — `video_core/src/shader_environment.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/shader_environment.h` and `/home/vricosti/Dev/emulators/zuyu/src/video_core/shader_environment.cpp` (environment-trait owner follow-up)
+
+### Intentional differences
+- Rust still uses an injected `GpuMemoryReader` callback instead of a literal stored `Tegra::MemoryManager*`. This is the current Rust adaptation for upstream `gpu_memory` ownership and remains local to the matching owner file.
+- `DumpImpl(...)` now writes through Rust filesystem helpers (`common::fs::path_util`) and `std::fs` instead of the upstream `Common::FS` API. Ownership remains in `shader_environment.rs`.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `GraphicsEnvironment`, `ComputeEnvironment`, and `FileEnvironment` now implement the shared `shader_recompiler::environment::Environment` owner contract directly from `shader_environment.rs`, instead of leaving the upstream virtual surface absent.
+- Fixed in this pass: `FileEnvironment` now owns the missing upstream methods `ReadCbufValue(...)`, `ReadTextureType(...)`, `ReadTexturePixelFormat(...)`, `IsTexturePixelFormatInteger(...)`, `ReadViewportTransformState(...)`, `GetReplaceConstBuffer(...)`, and `Dump(...)` in the matching file.
+- Fixed in this pass: the Rust file now owns the upstream shader-dump helper path again (`DumpImpl(...)` plus `GenericEnvironment::dump(...)` / `FileEnvironment::dump(...)`) instead of leaving dump ownership unimplemented.
+- Fixed in this pass: the concrete trait surface now exposes the restored upstream-owned fields `sph`, `gp_passthrough_mask`, `stage`, `start_address`, and `is_proprietary_driver` from the matching owner types.
+
+### Missing items
+- `GenericEnvironment` still is not the literal trait/base owner because the Rust `shader_recompiler::Environment` is a trait rather than an inheritable struct; the concrete owner types implement it directly.
+- `FileEnvironment::read_instruction(...)`, `read_cbuf_value(...)`, `read_texture_type(...)`, and `read_texture_pixel_format(...)` currently panic on uncached reads instead of raising the upstream `Shader::LogicError` type because the Rust recompiler exception model is still reduced.
+- `SerializePipeline(...)` / `LoadPipelines(...)` still use reduced Rust I/O error handling and callback plumbing instead of the full upstream exception + `stop_token` contract.
+- The environment owners still inherit the broader reduced semantics noted in earlier entries: injected/snapshot memory ownership, no literal live engine/member-pointer graph, and remaining serializer/runtime differences outside this pass.
+
+### Binary layout verification
+- PASS: serialized `ProgramHeader`/geometry passthrough payload handling remains unchanged in this pass; only method-surface ownership and dump wiring changed.
+
+## 2026-04-29 — `video_core/src/shader_environment.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/shader_environment.h` and `/home/vricosti/Dev/emulators/zuyu/src/video_core/shader_environment.cpp` (live-owner read follow-up)
+
+### Intentional differences
+- Rust still keeps snapshot fallback state in `GraphicsEnvironment` and `ComputeEnvironment` for construction/test paths where no live engine owner is attached. Upstream reads only through live owners because it always stores engine pointers.
+- Rust still adapts GPU memory access through the injected `GpuMemoryReader` callback instead of a literal `Tegra::MemoryManager*`.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: the live `GraphicsEnvironment::read_cbuf_value(...)` regression test now uses the real Maxwell owner layout for `ProcessCBBind`: raw CB bind config is written to method `0x904` before triggering `0x901`, matching the engine register layout instead of incorrectly treating the trigger write as the config payload.
+- Fixed in this pass: the live `ComputeEnvironment::read_cbuf_value(...)` regression test now uses a GPU-addressed reader, matching the owner contract in this file. The previous CPU-addressed test callback was validating the wrong address space and was not a real parity failure.
+- Fixed in this pass: both focused regressions now pass and prove that post-construction live-owner reads observe later `Maxwell3D` / `KeplerCompute` state instead of stale snapshots.
+
+### Missing items
+- `GraphicsEnvironment` and `ComputeEnvironment` still preserve snapshot fallback fields (`const_buffers`, `tic_address`, `tic_limit`, `viewport_transform_state`, etc.) instead of relying exclusively on live engine owners the way upstream does.
+- `GraphicsEnvironment::from_maxwell3d(...)` and `ComputeEnvironment::from_kepler_compute(...)` still serialize some owner state into local copies at construction time, so the file is not yet literal upstream pointer-only environment ownership.
+- `GraphicsEnvironment` still lacks a literal upstream member-pointer graph for engine/memory ownership; it stores raw engine pointers plus the Rust reader callback.
+
+### Binary layout verification
+- PASS: test-only and owner-read-path follow-up; no serialized payload or raw layout changed.
+
+## 2026-04-29 — `video_core/src/shader_environment.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/shader_environment.h` and `/home/vricosti/Dev/emulators/zuyu/src/video_core/shader_environment.cpp` (live-owner constructor cleanup follow-up)
+
+### Intentional differences
+- Rust still uses an injected `GpuMemoryReader` callback instead of a literal stored `Tegra::MemoryManager*`.
+- Rust still preserves fallback snapshot state for detached/test construction paths where no live `Maxwell3D` / `KeplerCompute` owner is attached. Upstream always reads through live engine pointers.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `GraphicsEnvironment::from_maxwell3d(...)` no longer seeds duplicate snapshot copies of live Maxwell-owned state (`const_buffers`, texture-header pool state, sampler-binding state, viewport-transform state, bindless texture slot) on the live-owner path. The constructor now leaves those Rust-only fallbacks untouched and uses the live owner for the upstream-owned runtime fields.
+- Fixed in this pass: `ComputeEnvironment::from_kepler_compute(...)` no longer seeds duplicate snapshot copies of live QMD/Kepler-owned texture/cbuf state (`const_buffer_enable_mask`, `const_buffers`, `tic_address`, `tic_limit`, `linked_tsc`) on the live-owner path.
+- Fixed in this pass: `GraphicsEnvironment` no longer keeps the now-unused fallback members `bindless_texture_const_buffer_slot` and a duplicate `viewport_transform_state` field separate from `GenericEnvironment::viewport_transform_state`.
+
+### Missing items
+- `GraphicsEnvironment` still retains Rust-only fallback snapshots for detached paths (`const_buffers`, `tex_header_pool_addr`, `tex_header_pool_limit`, `sampler_binding`) instead of relying exclusively on the live `Maxwell3D*` owner the way upstream does.
+- `ComputeEnvironment` still retains Rust-only fallback snapshots for detached paths (`const_buffer_enable_mask`, `const_buffers`, `tic_address`, `tic_limit`, `linked_tsc`) instead of relying exclusively on the live `KeplerCompute*` owner the way upstream does.
+- The file still does not own a literal upstream `Tegra::MemoryManager*` member graph; guest memory access remains callback-driven.
+
+### Binary layout verification
+- PASS: owner-field cleanup only; no serialized payload or raw guest-visible layout changed.
+
+## 2026-04-29 — `video_core/src/shader_environment.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/shader_environment.h` and `/home/vricosti/Dev/emulators/zuyu/src/video_core/shader_environment.cpp` (owner-surface tightening follow-up)
+
+### Intentional differences
+- Rust still exposes `GenericEnvironment` state through the concrete environment structs because the Rust `shader_recompiler::Environment` is a trait rather than an inheritable C++ base class.
+- Rust still preserves detached-path fallback snapshots for tests and reduced callers where no live engine pointer is attached.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: the raw engine pointers and fallback snapshot members on `GraphicsEnvironment` and `ComputeEnvironment` are no longer public owner surface. They are now private to `shader_environment.rs`, which is closer to the upstream private-member ownership model.
+- Fixed in this pass: the `compute_environment_from_kepler_compute_includes_local_crs_alloc` regression no longer asserts the removed Rust-only snapshot field `linked_tsc`; it now stays focused on the upstream constructor-owned outputs (`local_memory_size`, `shared_memory_size`, `workgroup_size`).
+
+### Missing items
+- `GraphicsEnvironment` and `ComputeEnvironment` still keep Rust-only fallback snapshot members at all; upstream keeps only live owner pointers plus shared base state.
+- The concrete environment structs still expose `base` publicly, which is a Rust adaptation convenience rather than literal upstream private inheritance layout.
+- Memory ownership is still callback-driven instead of a literal stored `Tegra::MemoryManager*`.
+
+### Binary layout verification
+- PASS: owner-surface/privacy cleanup only; no serialized payload or guest-visible raw layout changed.
+
+## 2026-04-29 — `video_core/src/shader_environment.rs` and `video_core/src/shader_cache.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/shader_environment.h` and `/home/vricosti/Dev/emulators/zuyu/src/video_core/shader_environment.cpp` (base-owner access tightening follow-up)
+
+### Intentional differences
+- Rust still uses explicit owner-local forwarding methods (`generic_environment()`, `generic_environment_mut()`, `set_cached_size(...)`) as the closest equivalent to upstream private inheritance from `GenericEnvironment`. This keeps the base owner reachable without leaving it as public struct surface.
+- Rust still returns `Vec<&GenericEnvironment>` from `ShaderCache` serialization helpers because the Rust port lacks literal pointer-based inheritance and uses borrowed base-owner views instead.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `GraphicsEnvironment::base` and `ComputeEnvironment::base` are no longer public owner surface. `shader_cache.rs` now reaches the shared base owner only through explicit methods in the matching owner file, which is closer to upstream private inheritance.
+- Fixed in this pass: `ShaderCache::refresh_stages(...)`, `compute_shader(...)`, and `get_graphics_environments(...)` no longer mutate the environment base by direct field access from another file. The base-owner calls now stay routed through `shader_environment.rs`.
+- Fixed in this pass: `GraphicsEnvironments::span()` no longer builds its result from direct foreign-file field access to `env.base`; it now uses owner-local base accessors from `shader_environment.rs`.
+
+### Missing items
+- `shader_environment.rs` still preserves Rust-only fallback snapshots for detached/test paths, while upstream stores only live engine pointers plus shared base state.
+- `shader_environment.rs` still uses the injected `GpuMemoryReader` callback instead of a literal stored `Tegra::MemoryManager*`.
+- The Rust adaptation still exposes explicit base-owner access methods; literal upstream private inheritance is not representable directly.
+
+### Binary layout verification
+- PASS: this pass only changed owner-surface access and call routing; no serialized payload or raw guest-visible layout changed.
+
+## 2026-04-29 — `video_core/src/shader_environment.rs`, `video_core/src/shader_cache.rs`, and `video_core/src/renderer_opengl/gl_shader_cache.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/shader_environment.h`, `/home/vricosti/Dev/emulators/zuyu/src/video_core/shader_environment.cpp`, `/home/vricosti/Dev/emulators/zuyu/src/video_core/shader_cache.h`, `/home/vricosti/Dev/emulators/zuyu/src/video_core/shader_cache.cpp`, `/home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_shader_cache.h`, and `/home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_shader_cache.cpp` (generic-owner surface tightening follow-up)
+
+### Intentional differences
+- Rust still uses explicit owner-local helpers (`with_stage(...)`, `cached_code_slice()`, `generic_environment[_mut]()`) instead of literal C++ inheritance/member access. This is the direct Rust adaptation for keeping owner boundaries inside the matching file.
+- `gl_shader_cache.rs` still builds a reduced direct `GenericEnvironment` for its GLSL path instead of calling the full upstream `CreateGraphicsPipeline(..., std::span<Shader::Environment* const>)` owner graph, because the surrounding OpenGL pipeline cache remains structurally reduced.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `GenericEnvironment` no longer exposes its internal owner state (`stage`, cached code range, code storage, memory-size/state fields) as public struct surface across the crate. The upstream file keeps these as base-class-owned members, not foreign-file data.
+- Fixed in this pass: `renderer_opengl/gl_shader_cache.rs` no longer reaches into `GenericEnvironment` internals directly (`env.stage`, `env.cached_highest`, `env.code`). The needed behavior now routes through owner-local helpers in `shader_environment.rs`.
+- Fixed in this pass: reduced OpenGL callers that construct `GenericEnvironment` directly now use explicit owner-local builder/accessor methods instead of raw field mutation.
+
+### Missing items
+- `gl_shader_cache.rs` still uses a reduced direct `GenericEnvironment` compilation path rather than the literal upstream `GraphicsEnvironment` / `GraphicsEnvironments::Span()` pipeline-owner path.
+- `shader_cache.rs` still lacks the upstream slow-path CFG walk in `MakeShaderInfo(...)` when `Analyze()` fails; Rust still falls back directly to `calculate_hash()` / `read_size_bytes()` without first driving the control-flow traversal.
+- `shader_environment.rs` still preserves Rust-only fallback snapshot fields and callback-driven memory ownership.
+
+### Binary layout verification
+- PASS: this pass only tightened owner-surface visibility and access routing; no serialized payload or guest-visible raw layout changed.
+
+## 2026-04-29 — `video_core/src/shader_cache.rs` and `video_core/src/shader_environment.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/shader_cache.cpp`, `/home/vricosti/Dev/emulators/zuyu/src/video_core/shader_environment.h`, and `/home/vricosti/Dev/emulators/zuyu/src/video_core/shader_environment.cpp` (slow-path CFG walk follow-up)
+
+### Intentional differences
+- Rust still drives the slow path through an owner-local CFG walk helper inside `shader_cache.rs` instead of constructing the literal upstream `Shader::ObjectPool<Shader::Maxwell::Flow::Block>` plus `Shader::Maxwell::Flow::CFG` objects. Ownership is restored to the matching file, but the exact helper stack remains a Rust adaptation.
+- Rust uses `shader_recompiler::frontend::instruction::Instruction` / `decode_opcode(...)` directly instead of the upstream `Shader::Maxwell::Instruction` union and `Flow::CFG` owner types. This remains local to `shader_cache.rs`.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `ShaderCache::MakeShaderInfo(...)` no longer falls straight from failed `Analyze()` into `calculate_hash()` / `read_size_bytes()` with no control-flow traversal. The Rust slow path now walks Maxwell control flow first so `read_lowest` / `read_highest` reflect reachable shader instructions more like upstream.
+- Fixed in this pass: `shader_environment.rs` now exposes the missing upstream-shaped `start_address()` base-owner accessor so the matching `shader_cache.rs` slow path can start traversal from the same owner state as upstream `env.StartAddress()`.
+- Fixed in this pass: added a focused regression proving the slow path follows a branch target before hashing, instead of only relying on the trivial analyzed/sentinel path.
+
+### Missing items
+- The Rust slow path still is not literal upstream `Shader::Maxwell::Flow::CFG`: it does not model the full block graph, `ObjectPool<Block>`, indirect-branch table tracking, or the exact `AnalyzeEXIT(...)` / `AnalyzeBRX(...)` behavior from upstream control-flow ownership.
+- The Rust branch-disposition logic is still a reduced approximation of upstream predicate/flow-test handling. It distinguishes always/never/conditional cases and tracks the main stack tokens, but it is not yet a line-for-line port of `shader_recompiler/frontend/maxwell/control_flow.cpp`.
+- `shader_environment.rs` still uses callback-driven memory ownership instead of a literal stored `Tegra::MemoryManager*`.
+
+### Binary layout verification
+- PASS: this pass only changed owner-local traversal and accessors; no serialized payload or guest-visible raw layout changed.
+
+## 2026-04-29 — `video_core/src/shader_environment.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/shader_environment.h` and `/home/vricosti/Dev/emulators/zuyu/src/video_core/shader_environment.cpp` (file-environment owner-surface tightening follow-up)
+
+### Intentional differences
+- Rust still keeps `FileEnvironment` as a concrete struct with trait implementation rather than a literal C++ final class with inheritance syntax. The owner file remains the same, and the public surface now tracks the upstream shape more closely.
+- Deserialization and serialization helpers still operate with Rust file I/O and local helper functions instead of the exact upstream exception-bearing stream code.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `FileEnvironment` no longer exposes its stored code, texture caches, constant-buffer caches, stage, read range, and serialized metadata as public struct surface across the crate. That state is now private to `shader_environment.rs`, which is closer to upstream private-member ownership.
+- Fixed in this pass: the focused `file_environment_implements_shader_environment_trait` regression still passes after the owner-surface tightening, confirming the file keeps its upstream-facing behavior while reducing cross-file access.
+
+### Missing items
+- `FileEnvironment` still uses Rust-local deserialization tables and panic-based uncached reads instead of the exact upstream exception model.
+- `LoadPipelines(...)` still uses reduced Rust callback/control-flow ownership (`deserialize_file_env_from`, no literal `stop_token` loop behavior).
+- `shader_environment.rs` still retains the earlier callback-driven memory ownership and detached fallback snapshots noted in previous entries.
+
+### Binary layout verification
+- PASS: this pass changed visibility only; serialized field order and guest-visible payload layout were unchanged.
+
+## 2026-04-29 — `video_core/src/shader_environment.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/shader_environment.h` and `/home/vricosti/Dev/emulators/zuyu/src/video_core/shader_environment.cpp` (`ReadTextureInfo(...)` owner restoration follow-up)
+
+### Intentional differences
+- Rust still uses the injected `GpuMemoryReader` callback as the closest available replacement for upstream `Tegra::MemoryManager*`. That keeps guest-memory reads in the matching owner file, but the stored owner type still differs.
+- The detached/test paths still exist in Rust, so the owner can operate without a live engine/memory graph; upstream always reads through a live owner graph.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: the texture-descriptor fetch path no longer lives in a free helper. The upstream protected owner `GenericEnvironment::ReadTextureInfo(...)` is now matched by the owner-local `GenericEnvironment::read_texture_info(...)`, and all graphics/compute callers route through that method.
+- Fixed in this pass: `GraphicsEnvironment::read_texture_type(...)`, `GraphicsEnvironment::read_texture_pixel_format(...)`, `ComputeEnvironment::read_texture_type(...)`, and `ComputeEnvironment::read_texture_pixel_format(...)` now use the base-owner method instead of bypassing it through a file-level helper.
+
+### Missing items
+- `GenericEnvironment` still does not store a literal upstream `Tegra::MemoryManager*`; guest-memory reads remain callback-driven.
+- Detached/test construction still relies on Rust-only fallback owner state, so the file is not yet literal upstream pointer-only ownership.
+
+### Binary layout verification
+- PASS: owner-location change only; no serialized payload or raw guest-visible layout changed.
+
+## 2026-04-29 — `video_core/src/shader_environment.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/shader_environment.h` and `/home/vricosti/Dev/emulators/zuyu/src/video_core/shader_environment.cpp` (detached fallback owner consolidation follow-up)
+
+### Intentional differences
+- Rust still preserves detached/test fallback state that upstream does not have. This remains necessary until all call sites can supply a live engine/memory owner graph.
+- The detached fallback is now grouped into owner-local snapshot structs rather than spread across the live environment structs. This is a Rust adaptation for reducing structural drift while keeping the reduced callers working.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `GraphicsEnvironment` no longer carries detached const-buffer / TIC-pool / sampler snapshot fields as top-level owner state. Those values now live in the private `GraphicsEnvironmentDetachedState` helper inside the matching file.
+- Fixed in this pass: `ComputeEnvironment` no longer carries detached const-buffer / TIC / linked-TSC snapshot fields as top-level owner state. Those values now live in the private `ComputeEnvironmentDetachedState` helper inside the matching file.
+- Fixed in this pass: detached-path tests no longer reach into scattered owner fields directly; they now use owner-local setters in `shader_environment.rs`, which is closer to upstream private-member ownership.
+
+### Missing items
+- The detached fallback structs still exist at all; upstream `GraphicsEnvironment` and `ComputeEnvironment` keep only live engine-owner pointers plus shared base state.
+- `shader_environment.rs` still uses callback-driven memory ownership instead of a literal stored `Tegra::MemoryManager*`.
+- `GraphicsEnvironment::get_replace_const_buffer(...)` and the texture/cbuf read paths are still split between live-owner and detached-owner branches, while upstream only has the live-owner path.
+
+### Binary layout verification
+- PASS: owner-state reshaping only; no serialized payload or guest-visible raw layout changed.
+
+## 2026-04-29 — `video_core/src/shader_environment.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/shader_environment.h` and `/home/vricosti/Dev/emulators/zuyu/src/video_core/shader_environment.cpp` (pipeline-cache lifecycle parity follow-up)
+
+### Intentional differences
+- Rust still uses file-API results/closures instead of literal C++ stream exceptions plus `Common::UniqueFunction`. The owner file now matches the upstream control-flow boundaries more closely, but the transport remains a Rust adaptation.
+- Rust uses a `Fn() -> bool` stop hook as the closest replacement for upstream `std::stop_token`.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `serialize_pipeline(...)` now follows the upstream write lifecycle more closely. It writes the header only for a new file and deletes the cache file on any write failure instead of leaving a partial cache behind.
+- Fixed in this pass: `load_pipelines(...)` now matches the upstream entry-dispatch rule and chooses the callback by `envs.front().ShaderStage()` rather than a reduced “any compute stage anywhere in the vector” check.
+- Fixed in this pass: `load_pipelines(...)` now owns the stop hook in the matching owner file and no longer depends on the removed Rust-only `deserialize_file_env_from(...)` helper.
+- Fixed in this pass: `FileEnvironment::deserialize(...)` now maps `ShaderStage` discriminants using the upstream `Shader::Stage` order (`VertexB` first, `Compute = 5`, `VertexA = 6`) instead of the stale Rust-side order.
+- Fixed in this pass: the focused Rust cache-loading regression now consumes the serialized key from the callback, which matches the upstream contract that `load_compute` / `load_graphics` continue parsing the entry from the same file stream position.
+
+### Missing items
+- `FileEnvironment::deserialize(...)` still uses Rust-local enum decode tables and panic/log-based fallbacks instead of the exact upstream stream-exception behavior.
+- `load_pipelines(...)` still uses boxed Rust closures rather than literal upstream `Common::UniqueFunction` owner types.
+- `shader_environment.rs` still retains the earlier callback-driven memory ownership and detached fallback state documented in prior entries.
+
+### Binary layout verification
+- PASS: serialized field order for `GenericEnvironment::Serialize(...)` / `FileEnvironment::Deserialize(...)` was rechecked against upstream and kept byte-for-byte aligned in this pass. The focused compute pipeline cache roundtrip now completes without the previous bogus next-entry allocation.
+
+## 2026-04-29 — `video_core/src/shader_environment.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/shader_environment.h` and `/home/vricosti/Dev/emulators/zuyu/src/video_core/shader_environment.cpp` (pipeline-cache stream-failure parity follow-up)
+
+### Intentional differences
+- Rust still models the upstream stream-exception path with `std::io::Result` propagation instead of literal `std::ifstream::exceptions(failbit)`. The owner file now fails and unwinds at the same boundary, but the language mechanism differs.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `FileEnvironment::deserialize(...)` no longer swallows `read_exact` failures. Short reads now propagate out to `load_pipelines(...)`, which matches the upstream “stream failure aborts load and deletes corrupt cache” behavior much more closely.
+- Fixed in this pass: `load_pipelines(...)` now propagates per-environment deserialization failure through the matching owner loop instead of continuing with zero-filled/default state.
+- Fixed in this pass: added a focused truncated-cache regression proving the corrupt file is deleted when entry deserialization fails partway through.
+- Fixed in this pass: `FileEnvironment::deserialize(...)` no longer hand-remaps serialized enum values through Rust-local fallback tables. It now takes the raw `u32` discriminants and range-checks them before transmuting to the upstream-backed `#[repr(u32)]` enums, which is closer to upstream raw enum stream reads.
+
+### Missing items
+- The Rust port still range-checks serialized enum discriminants and turns invalid values into `InvalidData`, while upstream reads directly into enum objects with no explicit validation branch.
+
+### Binary layout verification
+- PASS: this pass only changed failure propagation. The serialized field order and per-entry payload layout remained unchanged.
+
+## 2026-04-29 — `video_core/src/shader_environment.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/shader_environment.h` and `/home/vricosti/Dev/emulators/zuyu/src/video_core/shader_environment.cpp` (live-owner path hardening follow-up)
+
+### Intentional differences
+- Rust still uses the injected `GpuMemoryReader` callback instead of a literal stored upstream `Tegra::MemoryManager*`.
+- Rust still keeps detached fallback state for unit tests behind `#[cfg(test)]`. Upstream has no detached path at all.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: the runtime `GraphicsEnvironment` read paths no longer branch through detached fallback state. `read_cbuf_value(...)`, `read_texture_type(...)`, `read_texture_pixel_format(...)`, and `read_viewport_transform_state(...)` now require the live upstream owner pointer in non-test builds.
+- Fixed in this pass: the runtime `ComputeEnvironment` read paths no longer branch through detached fallback state. `read_cbuf_value(...)`, `read_texture_type(...)`, and `read_texture_pixel_format(...)` now require the live upstream owner pointer in non-test builds.
+- Fixed in this pass: the old Rust-only dual-path ownership is now constrained to `#[cfg(test)]` helpers instead of remaining part of the normal compiled runtime surface.
+- Fixed in this pass: the focused detached texture-format regression still runs, but only through the explicit test-only fallback path, so the runtime owner graph is stricter than before.
+
+### Missing items
+- `GraphicsEnvironment` and `ComputeEnvironment` still keep test-only detached fallback structs at all; upstream keeps only live owner pointers plus shared base state.
+- `shader_environment.rs` still stores callback-based memory access instead of a literal upstream `Tegra::MemoryManager*`.
+- `FileEnvironment::deserialize(...)` still range-checks enum discriminants instead of doing literal unchecked raw enum-object reads from the stream.
+
+### Binary layout verification
+- PASS: this pass only changed runtime/test ownership branching. Serialized payload order and raw cache-entry layout were unchanged.
+
+## 2026-04-29 — `video_core/src/shader_environment.rs`, `video_core/src/shader_cache.rs`, and `video_core/src/engines/maxwell_3d.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/shader_environment.h`, `/home/vricosti/Dev/emulators/zuyu/src/video_core/shader_environment.cpp`, `/home/vricosti/Dev/emulators/zuyu/src/video_core/shader_cache.cpp`, and `/home/vricosti/Dev/emulators/zuyu/src/video_core/engines/maxwell_3d.h` (live memory-owner routing follow-up)
+
+### Intentional differences
+- Rust still cannot store and thread a literal upstream `Tegra::MemoryManager*` through the whole owner graph. The current closest adaptation keeps the owner in `Maxwell3D`, exposes owner-local accessors there, and routes shader-environment reads through `MemoryManager::read_block(...)` plus the existing CPU callback bridge.
+- Rust still uses explicit owner-local bridge methods on `Maxwell3D` (`memory_manager()` and `guest_memory_reader()`) instead of upstream direct member access, because there is no C++-style friend/private inheritance surface in Rust.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `GraphicsEnvironment::from_maxwell3d(...)` no longer reads the SPH header through the raw callback path when a `MemoryManager` owner is present. The constructor now routes shader-header fetches through the same base-owner memory path as upstream `gpu_memory->ReadBlock(...)`.
+- Fixed in this pass: live graphics constant-buffer reads no longer bypass the mapped GPU-memory owner. `GraphicsEnvironment::read_cbuf_value(...)` now reads through the base owner instead of calling the raw callback on GPU virtual addresses.
+- Fixed in this pass: live compute constant-buffer reads no longer bypass the mapped GPU-memory owner. `ComputeEnvironment::read_cbuf_value(...)` now uses the same base-owner memory path.
+- Fixed in this pass: `shader_cache.rs` graphics-owner construction no longer injects a precomposed free GPU reader into `GraphicsEnvironment::from_maxwell3d(...)`. The matching owner file now resolves memory ownership from `Maxwell3D`, which is closer to upstream constructor ownership.
+
+### Missing items
+- `shader_environment.rs` still stores `GpuMemoryReader` in `GenericEnvironment` and still falls back to the callback transport internally. Upstream stores only `Tegra::MemoryManager*` and does not need a second callback owner.
+- `shader_environment.rs` still keeps `gpu_memory: Option<_>` / `gpu_read: Option<_>` nullable owner state for reduced/test construction. Upstream constructors always install the live owner graph.
+- `shader_cache.rs` still gates graphics environment creation on both `memory_manager()` and `guest_memory_reader()` being present, while upstream only depends on the concrete `MemoryManager&` owner path.
+- `maxwell_3d.rs` still exposes `make_gpu_memory_reader()` for older reduced callers elsewhere in the tree. That compatibility bridge is still structurally below literal upstream parity.
+
+### Binary layout verification
+- PASS: this pass only changed owner routing for memory reads and constructor behavior. No guest-visible struct layout or serialized cache payload layout changed.
+
+## 2026-04-29 — `video_core/src/shader_environment.rs` and `video_core/src/shader_cache.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/shader_environment.h`, `/home/vricosti/Dev/emulators/zuyu/src/video_core/shader_environment.cpp`, and `/home/vricosti/Dev/emulators/zuyu/src/video_core/shader_cache.cpp` (compute owner-memory parity follow-up)
+
+### Intentional differences
+- Rust still cannot make `ComputeEnvironment` consume only a literal upstream `Tegra::MemoryManager*`, because the current Rust `MemoryManager` port still needs the extra CPU callback transport to complete `ReadBlock(...)`.
+- The current Rust channel owner still obtains the compute-side CPU callback from the shared channel graph rather than from a literal upstream `KeplerCompute` member, because `KeplerCompute` does not yet store that adaptation owner itself.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `ComputeEnvironment::from_kepler_compute(...)` no longer builds a reduced reader-only environment. It now installs both the mapped `MemoryManager` owner and the CPU callback transport, matching the graphics-owner path more closely.
+- Fixed in this pass: `ShaderCache::compute_shader()` no longer feeds `ComputeEnvironment` through the Maxwell-only `make_gpu_memory_reader()` compatibility path. It now passes the current channel GPU-memory owner plus the raw guest-memory callback separately, which is closer to upstream owner routing.
+- Fixed in this pass: the focused compute regressions were updated to exercise mapped GPU-memory reads through `MemoryManager::read_block(...)` instead of the old direct GPU-address callback shortcut.
+
+### Missing items
+- `ShaderCache::current_guest_memory_reader()` is still a Rust adaptation helper. Upstream does not need this extra retrieval surface because the memory owner graph is literal there.
+- `KeplerCompute` still does not expose/store the callback transport directly, so the compute environment still depends on channel-level wiring that is structurally broader than upstream.
+- `shader_environment.rs` still keeps the callback-based fallback transport inside `GenericEnvironment`; the file is closer to upstream owner behavior, but not yet literal pointer-only ownership.
+
+### Binary layout verification
+- PASS: this pass changed only owner wiring and test setup. No serialized payload or raw guest-visible struct layout changed.
+
+## 2026-04-29 — `video_core/src/renderer_opengl/gl_shader_cache.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_shader_cache.h` and `/home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_shader_cache.cpp` (shared shader-owner integration follow-up)
+
+### Intentional differences
+- Rust still keeps the old local fallback path based on `pending_program_addresses` plus `GpuMemoryReader` for reduced tests and pre-channel-runtime callers. Upstream has no such fallback because `OpenGL::ShaderCache` directly inherits the shared `VideoCommon::ShaderCache` owner.
+- Rust still uses composition (`SharedShaderCache` passed into `current_graphics_pipeline_with_shared_cache(...)`) instead of literal inheritance. This preserves the upstream owner boundary while fitting the existing Rust split.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: the active runtime path no longer rebuilds graphics shader environments locally with `GenericEnvironment::new().with_gpu_read(...).with_program(...)`. `gl_shader_cache.rs` now consumes shared `RefreshStages(...)` and `GetGraphicsEnvironments(...)` ownership from `shader_cache.rs`, which matches the upstream owner graph much more closely.
+- Fixed in this pass: the OpenGL leaf now compiles stage sources from shared `GraphicsEnvironments` instead of bypassing the shared shader cache owner on every miss.
+- Fixed in this pass: added a focused regression proving the OpenGL leaf can build a graphics pipeline from shared environments rather than only from the reduced local address-reader path.
+
+### Missing items
+- `current_graphics_pipeline_with_shared_cache(...)` still only consumes `graphics_key.unique_hashes`; the rest of `GraphicsPipelineKey` (`early_z`, topology, tessellation, XFB, app stage) is still defaulted instead of being populated from live Maxwell state like upstream `CurrentGraphicsPipeline()`.
+- `create_graphics_pipeline_with_shared_cache(...)` still uses the reduced Rust `compile_shader_glsl(...)` bridge over `cached_code_slice()` rather than the full upstream `TranslateProgram(...)` / `EmitGLSL` / `EmitGLASM` / `EmitSPIRV` owner graph in this file.
+- The runtime shared-owner path still does not serialize newly built graphics pipelines to disk the way upstream `CreateGraphicsPipeline()` does after `GetGraphicsEnvironments(...)`.
+- The reduced local fallback path (`set_pending_program_addresses`, `set_gpu_memory_reader`, `create_graphics_pipeline()`) still exists and remains structurally below literal upstream parity.
+
+### Binary layout verification
+- PASS: this pass changed pipeline-owner control flow only; no serialized payload or guest-visible raw layout changed.
+
+## 2026-04-29 — `video_core/src/renderer_opengl/gl_rasterizer.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_rasterizer.h` and `/home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_rasterizer.cpp` (shared OpenGL shader-cache call-edge follow-up)
+
+### Intentional differences
+- Rust still keeps separate composed `shader_cache` and `gl_shader_cache` fields, while upstream `OpenGL::ShaderCache` inherits the shared owner directly. The new call edge uses the shared owner explicitly to narrow that split without redesigning the architecture in this slice.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: the active draw path no longer feeds the OpenGL shader cache primarily through `set_pending_program_addresses(...)` and the local address-only key path. `RasterizerOpenGL::draw(...)` now calls `current_graphics_pipeline_with_shared_cache(&mut self.shader_cache)`, which is closer to upstream `ShaderCache::CurrentGraphicsPipeline()` ownership.
+
+### Missing items
+- `draw(...)` still consumes a Rust `DrawState` snapshot rather than reading live `maxwell3d->draw_manager->GetDrawState()` through a stored engine owner, so the surrounding `RasterizerOpenGL` ownership is still structurally reduced.
+- The OpenGL rasterizer still does not own the full upstream `PrepareDraw(...)` / `SyncState()` / cache-lock lifecycle around the shader cache and graphics pipeline.
+
+### Binary layout verification
+- PASS: control-flow owner change only; no guest-visible struct or serialized layout changed.
+
+## 2026-04-29 — `video_core/src/renderer_opengl/gl_graphics_pipeline.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_graphics_pipeline.h` (GraphicsPipelineKey structural parity follow-up)
+
+### Intentional differences
+- Rust still models the C++ key bitfields through a packed `raw: u32` plus helper methods instead of literal `BitField<>` member objects. The owner file still keeps the constants and size logic in the matching file.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `GraphicsPipelineKey` now carries `xfb_state` again, matching the upstream key structure instead of the earlier reduced Rust struct that omitted transform-feedback state entirely.
+- Fixed in this pass: `GraphicsPipelineKey::size()` once again has a real larger full-key path when `xfb_enabled` is set, because the XFB payload is present in the owner struct instead of only in comments/tests.
+
+### Missing items
+- The owner still lacks helper surfaces matching upstream bitfield access for `gs_input_topology`, `tessellation_primitive`, `tessellation_spacing`, `tessellation_clockwise`, and `app_stage`; runtime code still treats `raw` mostly as an opaque word.
+- `GraphicsPipelineKey` is still not populated from live OpenGL shader-cache state for most of those fields; only the structure is closer in this pass.
+
+### Binary layout verification
+- PASS: the focused `pipeline_key_size_varies_by_xfb` regression was rerun after reintroducing `xfb_state`, and the key once again expands to full struct size under the XFB-enabled path.
+
+## 2026-04-29 — `video_core/src/transform_feedback.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/transform_feedback.h` and `/home/vricosti/Dev/emulators/zuyu/src/video_core/transform_feedback.cpp` (GraphicsPipelineKey dependency parity follow-up)
+
+### Intentional differences
+- Rust still uses derives on the transform-feedback structs to satisfy `GraphicsPipelineKey` ownership (`Clone`, `Copy`, `Hash`, etc.) instead of inheriting trivial-copy semantics from the C++ language model.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `TransformFeedbackLayout`, `StreamOutLayout`, and `TransformFeedbackState` now derive the comparison/hash/copy traits needed for key ownership in the matching subsystem files, which is the Rust-side equivalent of upstream trivially comparable/copyable key payloads.
+
+### Missing items
+- `transform_feedback.rs` still does not expose explicit binary-layout assertions against the upstream C++ types, so the file is closer structurally but not yet fully verified at the raw-layout level.
+
+### Binary layout verification
+- PASS: this pass changed trait surface only; the field order in the transform-feedback state structs stayed unchanged.
+
+## 2026-04-29 — `video_core/src/renderer_opengl/gl_shader_cache.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_shader_cache.h` and `/home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_shader_cache.cpp` (live GraphicsPipelineKey population follow-up)
+
+### Intentional differences
+- Rust still uses explicit composition (`current_graphics_pipeline_with_shared_cache(&mut SharedShaderCache)`) instead of literal inheritance from the shared shader-cache owner. The live key population still happens in the matching OpenGL owner file.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: the active shared-owner runtime path no longer leaves `GraphicsPipelineKey` fields at defaults after `RefreshStages(...)`. It now mirrors the upstream `CurrentGraphicsPipeline()` owner flow by resetting `graphics_key.raw` and populating:
+  - `early_z`
+  - `gs_input_topology`
+  - `tessellation_primitive`
+  - `tessellation_spacing`
+  - `tessellation_clockwise`
+  - `xfb_enabled`
+  - `app_stage`
+- Fixed in this pass: when XFB is enabled, the active shared-owner path now populates `graphics_key.xfb_state` from live Maxwell register state instead of leaving the struct at its default value.
+- Fixed in this pass: added a focused regression covering the shared-owner runtime path, including mandated early-Z, live topology, tessellation params, XFB enable/state, and engine hint propagation.
+
+### Missing items
+- `current_graphics_pipeline_with_shared_cache(...)` still reads `current_topology()` from the Rust `Maxwell3D` draw-state snapshot instead of a literal upstream `draw_manager->GetDrawState().topology` owner edge.
+- the active path still does not populate the rest of the upstream OpenGL key/compile inputs beyond those fields, including the fuller `CreateGraphicsPipeline()` runtime graph and disk-serialization edge.
+- the reduced local fallback path (`pending_program_addresses` / `GpuMemoryReader`) still exists for non-shared callers and tests.
+
+### Binary layout verification
+- PASS: `GraphicsPipelineKey` field ordering was unchanged in this pass. The focused runtime test now exercises the newly populated bitfield word and XFB payload together.
+
+## 2026-04-29 — `video_core/src/engines/maxwell_3d.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/engines/maxwell_3d.h` (OpenGL shader-key owner accessors follow-up)
+
+### Intentional differences
+- Rust still exposes owner-local accessor methods for register-backed state instead of direct public `regs` field access. This is the closest Rust equivalent while keeping the behavior in the matching file.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `EngineHint` now has explicit upstream-matching discriminants (`None = 0`, `OnHleMacro = 1`) instead of relying on implicit enum ordering.
+- Fixed in this pass: the matching owner file now exposes the exact register-backed read surfaces needed by upstream `OpenGL::ShaderCache::CurrentGraphicsPipeline()`:
+  - `current_topology()`
+  - `mandated_early_z()`
+  - `tessellation_domain_type()`
+  - `tessellation_spacing()`
+  - `tessellation_clockwise()`
+  - `transform_feedback_enabled()`
+  - `transform_feedback_state()`
+- Fixed in this pass: `transform_feedback_state()` now reconstructs the upstream `SetXfbState(..., regs)` inputs from `regs.transform_feedback.controls` and `regs.stream_out_layout` in the matching engine owner file.
+
+### Missing items
+- the Rust file still reconstructs transform-feedback register views manually from the flat `regs` array instead of storing literal nested upstream `Regs::TransformFeedback` / `Regs::StreamOutLayout` typed subobjects.
+- the OpenGL runtime still consumes `current_topology` from the cached `Maxwell3D` draw-state member, not from a literal upstream `DrawManager` owner graph.
+
+### Binary layout verification
+- PASS: this pass added register-read accessors only. No guest-visible struct layout changed.
+
+## 2026-04-29 — `video_core/src/renderer_opengl/gl_graphics_pipeline.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_graphics_pipeline.h` (GraphicsPipelineKey bitfield helper follow-up)
+
+### Intentional differences
+- Rust still models the C++ `BitField<>` members through an explicit packed `raw: u32` plus owner-local helper methods, instead of literal `BitField<>` objects.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: the matching owner file now carries explicit setter helpers for all upstream `GraphicsPipelineKey` packed members used by `CurrentGraphicsPipeline()`:
+  - `set_xfb_enabled(...)`
+  - `set_early_z(...)`
+  - `set_gs_input_topology(...)`
+  - `set_tessellation_primitive(...)`
+  - `set_tessellation_spacing(...)`
+  - `set_tessellation_clockwise(...)`
+  - `set_app_stage(...)`
+- Fixed in this pass: the OpenGL shader-cache owner no longer mutates `raw` ad hoc; it now updates the packed key through the matching owner-local bitfield helper surface.
+
+### Missing items
+- the file still does not expose full getter coverage matching every upstream bitfield surface; the new helpers cover the active runtime path only.
+- the hash still uses the Rust-side FNV-style implementation instead of upstream `CityHash64`, so full literal parity of key hashing remains unfinished in this file.
+
+### Binary layout verification
+- PASS: this pass added helper methods only. `GraphicsPipelineKey` field order and `size()` behavior were unchanged.
+
+## 2026-04-29 — `video_core/src/shader_cache.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/shader_cache.h` and `/home/vricosti/Dev/emulators/zuyu/src/video_core/shader_cache.cpp` (shared owner live-engine accessor follow-up)
+
+### Intentional differences
+- Rust still needs an explicit accessor method to surface the currently bound `Maxwell3D` owner to backend leaves, because there is no literal C++ inheritance relationship between the shared owner and the OpenGL leaf.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `current_maxwell3d()` is now available to the active backend owner path, so the OpenGL shader-cache leaf can read the live shared-channel `Maxwell3D` owner instead of staying on the reduced address-only key path.
+
+### Missing items
+- the active backend still consumes the shared owner through explicit method calls instead of literal inherited member access.
+- other live-engine/shared-owner accessor surfaces are still private or reduced where backend leaves still rely on local compatibility paths.
+
+### Binary layout verification
+- PASS: accessor-surface change only; no data layout changed.
+
+## 2026-04-29 — `video_core/src/transform_feedback.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/transform_feedback.h` and `/home/vricosti/Dev/emulators/zuyu/src/video_core/transform_feedback.cpp` (stream-out raw-value helper follow-up)
+
+### Intentional differences
+- Rust still wraps upstream `Regs::StreamOutLayout` in a dedicated Rust struct with helper methods rather than reusing the exact C++ nested register type.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `StreamOutLayout` now exposes `from_raw(...)` and `raw()` so matching engine owners can reconstruct and verify the upstream raw register payload without bypassing the transform-feedback owner file.
+
+### Missing items
+- there are still no explicit `repr(C)`/size assertions against the upstream nested `StreamOutLayout` register type in this file.
+
+### Binary layout verification
+- PASS: `StreamOutLayout` still stores exactly one `u32`; this pass only added owner-local conversion/access helpers.
+
+## 2026-04-29 — `video_core/src/engines/draw_manager.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/engines/draw_manager.h` and `/home/vricosti/Dev/emulators/zuyu/src/video_core/engines/draw_manager.cpp` (topology-resolution owner follow-up)
+
+### Intentional differences
+- Rust still uses a `Maxwell3DAccess` trait instead of a literal stored `Maxwell3D*`. The topology-resolution logic remains in the matching owner file despite that adaptation.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: the `UpdateTopology()` decision tree now also exists as the pure owner-local helper `resolve_draw_topology(...)`, so other owners no longer need to reconstruct the topology-override rules outside `draw_manager.rs`.
+- Fixed in this pass: `PrimitiveTopologyControl` and `PrimitiveTopologyOverride` now expose raw-value decoding helpers in the matching owner file, which is the Rust-side equivalent of upstream enum reads from `regs`.
+
+### Missing items
+- `DrawManager` is still not literally owned by `Maxwell3D` in the active runtime graph, so other files still reach draw-state behavior through Rust owner bridges instead of a live `maxwell3d->draw_manager` member.
+- `DrawManager::ProcessMethodCall()` is still not the active dispatch owner in the Rust `Maxwell3D` method path; the engine file still duplicates parts of that upstream control flow.
+
+### Binary layout verification
+- PASS: this pass only changed enums and helper logic; no shared payload layout changed.
+
+## 2026-04-29 — `video_core/src/engines/maxwell_3d.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/engines/maxwell_3d.h` (draw-manager topology bridge follow-up)
+
+### Intentional differences
+- Rust still has no literal `draw_manager` member on `Maxwell3D`; the new accessor is an owner bridge over the reduced Rust engine graph.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: the OpenGL-facing topology read no longer goes straight through the cached `current_topology` field. `draw_manager_topology()` now resolves the topology through the matching `draw_manager.rs` owner logic, including `primitive_topology_control` and `topology_override`.
+- Fixed in this pass: the matching owner file now carries the missing upstream register constant for `primitive_topology_control` (`0x1948`), so the bridge reads the same register source as upstream.
+
+### Missing items
+- `Maxwell3D` still does not literally own and update a live `DrawManager` object, so this bridge is still a parity approximation over the reduced Rust runtime graph.
+- Other upstream `draw_manager`-owned state surfaces are still reconstructed locally in `Maxwell3D`, especially around draw dispatch and deferred instance handling.
+
+### Binary layout verification
+- PASS: added register constant and accessor only; no guest-visible struct layout changed.
+
+## 2026-04-29 — `video_core/src/renderer_opengl/gl_shader_cache.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_shader_cache.h` and `/home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_shader_cache.cpp` (draw-manager topology parity follow-up)
+
+### Intentional differences
+- Rust still reaches the shared engine owner through `SharedShaderCache::current_maxwell3d()` and explicit method calls rather than literal inherited/member access from the OpenGL shader-cache class.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: the active shared-owner runtime path no longer packs `gs_input_topology` from `Maxwell3D::current_topology()`. It now uses the resolved draw-manager topology owner bridge, which matches upstream `maxwell3d->draw_manager->GetDrawState().topology` more closely.
+- Fixed in this pass: the focused shared-path regression now covers the topology-override case (`primitive_topology_control = UseSeparateState`, `topology_override = Lines`) instead of only the raw `draw.begin` topology.
+
+### Missing items
+- the active path still does not read topology from a literal live `DrawManager` member because the Rust engine graph still lacks that upstream owner relationship.
+- `BuiltPipeline(...)` is still structurally reduced versus upstream; it still does not use the live `DrawManager::GetDrawState()` counts for the async shader gating path.
+- the fuller upstream `CurrentGraphicsPipeline()` owner graph still has remaining gaps outside topology, including the real worker/context path and full compile/pipeline creation ownership.
+
+### Binary layout verification
+- PASS: this pass changed only key-population source selection and tests. `GraphicsPipelineKey` layout was unchanged.
+
+## 2026-04-30 — `video_core/src/renderer_opengl/gl_shader_cache.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_shader_cache.h` and `/home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_shader_cache.cpp` (`BuiltPipeline(...)` async gating follow-up)
+
+### Intentional differences
+- Rust still passes the active engine owner into `built_pipeline(...)` explicitly (`Option<&Maxwell3D>`) instead of reading a literal `maxwell3d` member captured by the C++ class. The logic still lives in the matching OpenGL owner file.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `BuiltPipeline(...)` no longer returns `None` for every unbuilt async pipeline. It now follows the upstream gating shape more closely:
+  - return the pipeline immediately if already built
+  - return the pipeline immediately if async shaders are disabled
+  - return `None` when `zeta_enable` is active
+  - otherwise allow the unbuilt pipeline for small draws (`index_buffer.count <= 6 || vertex_buffer.count <= 6`)
+- Fixed in this pass: the shared-owner cache-hit and slow-path cache-miss now both pass the live `Maxwell3D` owner into the `BuiltPipeline(...)` gate instead of falling back to the reduced no-engine path.
+- Fixed in this pass: added focused regressions for the two verified upstream gate branches:
+  - depth-enabled unbuilt async pipeline blocks
+  - small-draw unbuilt async pipeline is allowed
+
+### Missing items
+- the large non-depth async branch is still not fully validated by a focused regression on this tree because the Rust runtime still lacks a literal live `draw_manager->GetDrawState()` owner path; the current `Maxwell3D` bridge is a best-effort snapshot.
+- the local non-shared fallback path still passes `None` for the engine owner and therefore remains structurally reduced versus the shared runtime path.
+
+### Binary layout verification
+- PASS: this pass changed only owner logic and tests; no guest-visible payload layout changed.
+
+## 2026-04-30 — `video_core/src/engines/maxwell_3d.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/engines/maxwell_3d.h` (`BuiltPipeline(...)` owner-surface follow-up)
+
+### Intentional differences
+- Rust still exposes owner-local accessors instead of literal public `regs` subobject access. The added surfaces stay in the matching engine owner file.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: the matching owner file now exposes `zeta_enable()` for the OpenGL `BuiltPipeline(...)` parity path.
+- Fixed in this pass: the matching owner file now exposes `draw_manager_state()`, which returns the closest available Rust-side equivalent of upstream `draw_manager->GetDrawState()` for async shader gating.
+
+### Missing items
+- `draw_manager_state()` is still a snapshot reconstructed from current `Maxwell3D` state, not a literal live `DrawManager` member state object.
+- because of that structural gap, the exact large-draw async gating path is still less directly auditable than upstream.
+
+### Binary layout verification
+- PASS: this pass added owner accessors only; no shared layout changed.
+
+## 2026-04-30 — `video_core/src/renderer_opengl/gl_graphics_pipeline.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_graphics_pipeline.h` (test-surface follow-up)
+
+### Intentional differences
+- Rust adds a `#[cfg(test)]` helper `set_built_for_test(...)` to exercise `BuiltPipeline(...)` parity branches without needing a live GL fence owner.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: the matching owner file now exposes the minimal test-only surface needed to verify unbuilt async pipeline gating in the OpenGL shader-cache owner.
+
+### Missing items
+- the real runtime still uses the reduced Rust GL build/fence model rather than the literal upstream thread-worker / fence ownership graph.
+
+### Binary layout verification
+- PASS: test-only method addition; no layout change.
+
+## 2026-04-30 — `video_core/src/engines/maxwell_3d.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/engines/maxwell_3d.h` and `/home/vricosti/Dev/emulators/zuyu/src/video_core/engines/maxwell_3d.cpp` (live DrawManager owner follow-up)
+
+### Intentional differences
+- Rust still uses a local `DrawManager` value plus the `draw_manager::Maxwell3DAccess` trait instead of a literal upstream `std::unique_ptr<DrawManager>` holding a raw `Maxwell3D*`. Ownership is now in the matching engine owner file, but the pointer model is adapted to Rust borrowing rules.
+- Rust still stores rasterizer ownership through the existing raw-fat-pointer bridge (`Option<[usize; 2]>`) instead of the literal upstream raw pointer member.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `Maxwell3D` now owns a live `draw_manager` member again, matching the upstream owner boundary more closely than the earlier reconstructed snapshot accessors.
+- Fixed in this pass: the active owner path now synchronizes live `DrawManager::State` in and out of `Maxwell3D` through `with_draw_manager(...)`, so `draw_manager_state()` and `draw_manager_topology()` read live owner state rather than a purely reconstructed fallback.
+- Fixed in this pass: `Maxwell3D` now implements the matching `draw_manager::Maxwell3DAccess` surface, which restores the upstream `DrawManager -> Maxwell3D` register/rasterizer access edge in the matching engine owner file.
+- Fixed in this pass: `DrawManager::DrawBegin()` on the live path now reads topology from the `DRAW_BEGIN` register payload (`regs.draw.topology` equivalent) instead of the stale cached `current_topology` field.
+
+### Missing items
+- `ProcessMethodCall(...)` still does not use the exact upstream split where the default arm delegates wholesale to `draw_manager->ProcessMethodCall(method, argument)`. The Rust engine file still duplicates part of that draw-method dispatch directly.
+- `set_dirty_flag(...)` still reduces upstream `dirty.flags[index] = true` to `interface_state.current_dirty = true`; there is still no literal `dirty.flags` owner on `Maxwell3D`.
+- the active runtime still keeps older local draw-side helpers in `maxwell_3d.rs` (`handle_draw_begin`, `handle_draw_end`, `draw_index_small`, etc.) alongside the live `DrawManager` owner, so ownership is improved but not fully de-duplicated yet.
+
+### Binary layout verification
+- PASS: owner/lifecycle change only; no guest-visible struct layout changed.
+
+## 2026-04-30 — `video_core/src/engines/draw_manager.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/engines/draw_manager.h` and `/home/vricosti/Dev/emulators/zuyu/src/video_core/engines/draw_manager.cpp` (live owner integration follow-up)
+
+### Intentional differences
+- Rust still adapts the upstream `Maxwell3D*` back-reference into the `Maxwell3DAccess` trait. The draw-control logic remains in the matching owner file.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: the live engine owner now actually drives `DrawManager::draw_begin(...)`, `draw_end(...)`, `draw_index_small(...)`, and `draw_array_instanced(...)` through the matching owner file with a live `Maxwell3DAccess` implementation behind them.
+- Fixed in this pass: `DrawManager::State` now participates in the active runtime graph instead of being only a reduced compatibility surface for backend consumers.
+
+### Missing items
+- `DrawManager::process_method_call(...)` is still stubbed and still not the active default dispatch owner, whereas upstream uses it directly from `Maxwell3D::ProcessMethodCall(...)`.
+- `DrawTexture()` is still stubbed in this file and remains structurally behind upstream.
+- the file still relies on a reduced dirty-flag bridge (`set_dirty_flag`) instead of the literal upstream `maxwell3d->dirty.flags[...]` owner graph.
+
+### Binary layout verification
+- PASS: no shared binary payload layout changed in this pass; only owner/lifecycle behavior moved closer to upstream.
+
+## 2026-04-30 — `video_core/src/engines/maxwell_3d.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/engines/maxwell_3d.h` and `/home/vricosti/Dev/emulators/zuyu/src/video_core/engines/maxwell_3d.cpp` (draw-method default-owner follow-up)
+
+### Intentional differences
+- Rust still uses the `DrawManager` value plus `draw_manager::Maxwell3DAccess` trait instead of the literal upstream raw-pointer relationship. That adaptation remains necessary to preserve borrow safety while keeping the method ownership in the matching files.
+- `clear_surface` still stays on the explicit `Maxwell3D` path in Rust. Upstream routes `MAXWELL3D_REG_INDEX(clear_surface)` through `DrawManager::ProcessMethodCall(...)`, but the Rust tree still has a richer local `handle_clear_surface(...)` implementation that has not yet been ported back into `draw_manager.rs`.
+- Rust now keeps a temporary compatibility hook from `DrawManager::process_draw(...)` back into `Maxwell3D::draw_calls`. Upstream has no such hook; it exists only because the Rust tree still has software/test consumers of the legacy local draw queue.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: the default arm of `Maxwell3D::process_method_call(...)` now delegates to `draw_manager.process_method_call(method, argument, this)` instead of duplicating draw-method dispatch in `maxwell_3d.rs`.
+- Fixed in this pass: the duplicated local draw-method dispatcher (`process_draw_method_call(...)`) was removed from `maxwell_3d.rs`, so draw ownership now lives primarily in the matching upstream owner file.
+- Fixed in this pass: `Maxwell3D` now exposes the missing live register decode surface needed by `DrawManager::ProcessMethodCall(...)` (`inline_index_2x16`, `inline_index_4x8`, and `vertex_array_instance_*` packed arguments).
+
+### Missing items
+- `ProcessMethodCall(...)` is still not a literal upstream split because `clear_surface` remains explicit in `maxwell_3d.rs`.
+- the compatibility `on_process_draw(...)` hook should be removed once the Rust tree no longer depends on the legacy `draw_calls` queue.
+- `set_dirty_flag(...)` still reduces upstream `dirty.flags[index] = true` to `interface_state.current_dirty = true`; there is still no literal `dirty.flags` owner graph on `Maxwell3D`.
+
+### Binary layout verification
+- PASS: method ownership/lifecycle change only; no guest-visible struct layout changed.
+
+## 2026-04-30 — `video_core/src/engines/draw_manager.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/engines/draw_manager.h` and `/home/vricosti/Dev/emulators/zuyu/src/video_core/engines/draw_manager.cpp` (draw-method default-owner follow-up)
+
+### Intentional differences
+- Rust still adapts the upstream `Maxwell3D*` back-reference into the `Maxwell3DAccess` trait.
+- `DrawTexture()` remains structurally reduced: it now lives in the right owner file and triggers `rasterizer.draw_texture()`, but it still does not populate `draw_texture_state` from the upstream register block (`draw_texture`, `window_origin`, `surface_clip`).
+- Rust still carries the temporary `on_process_draw(...)` compatibility hook in the trait so the matching owner can preserve the legacy local draw queue during the transition.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `DrawManager::process_method_call(...)` is no longer stubbed; it now owns the draw-method switch matching upstream `DrawManager::ProcessMethodCall(...)` for begin/end, packed inline indices, small index draws, instanced array draws, and draw-texture trigger routing.
+- Fixed in this pass: `process_draw(...)` no longer clobbers `draw_state.instance_count` with the submitted draw count. Upstream leaves `draw_state.instance_count` under `DrawManager` ownership, and that ordering matters for the `vertex_array_instance_subsequent` progression.
+
+### Missing items
+- `DrawTexture()` is still incomplete versus upstream because `draw_texture_state` register derivation is missing.
+- `clear_surface` is still not reached through `DrawManager::process_method_call(...)` on the active Rust runtime path.
+- the file still depends on the reduced dirty-flag bridge instead of a literal `maxwell3d->dirty.flags[...]` owner.
+
+### Binary layout verification
+- PASS: no shared binary payload layout changed; this pass only moved method ownership and fixed owner-local ordering.
+
+## 2026-04-30 — `video_core/src/engines/maxwell_3d.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/engines/maxwell_3d.h` and `/home/vricosti/Dev/emulators/zuyu/src/video_core/engines/maxwell_3d.cpp` (draw-texture register owner follow-up)
+
+### Intentional differences
+- Rust still exposes the upstream `regs.draw_texture`, `regs.window_origin`, and `regs.surface_clip` reads through the `draw_manager::Maxwell3DAccess` trait instead of a literal raw `Maxwell3D*` back-reference. The register ownership remains in the matching engine owner file.
+- `clear_surface` still remains on the explicit `Maxwell3D` path in this tree because the local `handle_clear_surface(...)` behavior is richer than the current upstream-shaped `DrawManager::Clear(1)` split.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `DRAW_TEXTURE_SRC_Y0` was incorrectly placed on the Rust tree and could clobber unrelated `draw_texture` fields. It now matches the upstream `draw_texture.src_y0` register position.
+- Fixed in this pass: `Maxwell3D` now exposes the missing `draw_texture`, `window_origin`, and `surface_clip.height` register surface to the matching `DrawManager` owner instead of forcing `DrawTexture()` to stay stubbed.
+
+### Missing items
+- the engine owner still does not provide a literal upstream typed nested `Regs::DrawTexture` / `Regs::SurfaceClip` / `Regs::WindowOrigin` storage layout; it still reconstructs these reads from the flat `regs[]` register array.
+- `set_dirty_flag(...)` is still reduced to `interface_state.current_dirty = true`.
+- `clear_surface` is still not routed through the active `DrawManager::process_method_call(...)` path.
+
+### Binary layout verification
+- PASS: register constant / owner-surface change only; no guest-visible serialized payload layout changed.
+
+## 2026-04-30 — `video_core/src/engines/draw_manager.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/engines/draw_manager.h` and `/home/vricosti/Dev/emulators/zuyu/src/video_core/engines/draw_manager.cpp` (draw-texture parity follow-up)
+
+### Intentional differences
+- Rust still adapts the upstream `Maxwell3D*` dependency through the `Maxwell3DAccess` trait.
+- the file still depends on the reduced dirty-flag bridge instead of the literal upstream `maxwell3d->dirty.flags[...]` owner.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `DrawManager::DrawTexture()` is no longer stubbed. It now populates `draw_texture_state` from live `draw_texture`, `window_origin`, and `surface_clip.height` state before calling `rasterizer.draw_texture()`, matching the upstream owner flow.
+- Fixed in this pass: the active runtime now has a focused regression covering the full upstream `DrawTexture()` coordinate derivation path, including lower-left window origin handling.
+
+### Missing items
+- `clear_surface` is still not owned by `DrawManager::process_method_call(...)` on the active Rust runtime path.
+- the temporary `on_process_draw(...)` compatibility hook is still present.
+
+### Binary layout verification
+- PASS: `DrawTextureState` / owner logic only; no shared binary payload layout changed.
+
+## 2026-04-30 — `video_core/src/engines/maxwell_3d.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/engines/maxwell_3d.h` and `/home/vricosti/Dev/emulators/zuyu/src/video_core/engines/maxwell_3d.cpp` (clear-surface owner reroute follow-up)
+
+### Intentional differences
+- Rust still keeps the richer local `handle_clear_surface(...)` software/framebuffer behavior in the engine owner file. Upstream `DrawManager::Clear(1)` only reaches `rasterizer->Clear(layer_count)`.
+- That richer behavior is now reached through a temporary `draw_manager::Maxwell3DAccess::on_clear_surface_compat(...)` hook rather than from the old explicit `process_method_call(...)` `CLEAR_SURFACE` arm.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: the active `EngineInterface::call_method(...)` path no longer special-cases `CLEAR_SURFACE` directly in `Maxwell3D::process_method_call(...)`; ownership is routed back through the matching `DrawManager` owner file.
+- Fixed in this pass: the legacy local `process_method(...)` path also routes `CLEAR_SURFACE` through `DrawManager::clear(...)` instead of calling `handle_clear_surface(...)` directly.
+
+### Missing items
+- the temporary `on_clear_surface_compat(...)` hook should go away once the richer local framebuffer-clear path is either ported into the matching upstream owner graph or removed in favor of the literal runtime path.
+- `set_dirty_flag(...)` is still reduced to `interface_state.current_dirty = true`.
+- the engine owner still reconstructs register subviews from flat `regs[]` storage instead of owning literal nested upstream register structs.
+
+### Binary layout verification
+- PASS: owner/lifecycle change only; no guest-visible struct or payload layout changed.
+
+## 2026-04-30 — `video_core/src/engines/draw_manager.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/engines/draw_manager.h` and `/home/vricosti/Dev/emulators/zuyu/src/video_core/engines/draw_manager.cpp` (clear-surface owner reroute follow-up)
+
+### Intentional differences
+- Rust `DrawManager::clear(...)` now includes a temporary compatibility callback after `rasterizer.clear(layer_count)` so the existing local framebuffer clear path still runs on this tree. Upstream has no equivalent callback.
+- Rust still adapts the upstream `Maxwell3D*` dependency through `Maxwell3DAccess`.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `CLEAR_SURFACE` is again owned by `DrawManager::process_method_call(...)` on the active runtime path, matching the upstream method boundary.
+
+### Missing items
+- `DrawManager::clear(...)` still is not literal upstream because of the temporary compatibility callback.
+- the file still depends on the reduced dirty-flag bridge instead of the literal `maxwell3d->dirty.flags[...]` owner.
+- the temporary `on_process_draw(...)` compatibility hook is still present.
+
+### Binary layout verification
+- PASS: method ownership/lifecycle change only; no shared binary payload layout changed.
+
+## 2026-04-30 — `video_core/src/engines/maxwell_3d.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/engines/maxwell_3d.h` and `/home/vricosti/Dev/emulators/zuyu/src/video_core/engines/maxwell_3d.cpp` (clear-surface owner cleanup follow-up)
+
+### Intentional differences
+- Rust still reconstructs render-target and clear-color register subviews from the flat `regs[]` array instead of storing the literal nested upstream register structs.
+- Rust still exposes that register surface through the `draw_manager::Maxwell3DAccess` trait instead of a raw `Maxwell3D*`.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: the old local `handle_clear_surface(...)` implementation was removed from `maxwell_3d.rs`; the active local framebuffer clear behavior now lives in the matching owner file `draw_manager.rs`.
+- Fixed in this pass: the temporary `on_clear_surface_compat(...)` callback bridge was removed after moving the local clear behavior into `DrawManager::clear(...)`.
+
+### Missing items
+- `set_dirty_flag(...)` is still reduced to `interface_state.current_dirty = true`.
+- the engine owner still does not store literal upstream typed nested `Regs::RenderTarget`, `Regs::SurfaceClip`, or `Regs::ClearColor` layouts.
+- the temporary `on_process_draw(...)` compatibility hook is still present.
+
+### Binary layout verification
+- PASS: owner/method cleanup only; no guest-visible struct or payload layout changed.
+
+## 2026-04-30 — `video_core/src/engines/draw_manager.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/engines/draw_manager.h` and `/home/vricosti/Dev/emulators/zuyu/src/video_core/engines/draw_manager.cpp` (clear-surface behavior owner cleanup follow-up)
+
+### Intentional differences
+- `DrawManager::clear(...)` now owns an additional Rust-only local framebuffer fill path after the upstream-shaped `rasterizer.clear(layer_count)` call. Upstream has no such path in this file; it exists because this tree still exposes framebuffer-producing engine tests and software consumers.
+- Rust still adapts the upstream engine pointer through `Maxwell3DAccess`.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: the local clear-color formatting and framebuffer fill behavior now lives in `draw_manager.rs` instead of `maxwell_3d.rs`, so ownership is aligned with the upstream `Clear()` method boundary.
+- Fixed in this pass: `DrawManager::clear(...)` no longer relies on the temporary engine callback hook.
+
+### Missing items
+- `DrawManager::clear(...)` is still not literal upstream because it carries the extra local framebuffer production path.
+- the file still depends on the reduced dirty-flag bridge instead of the literal `maxwell3d->dirty.flags[...]` owner.
+- the temporary `on_process_draw(...)` compatibility hook is still present.
+
+### Binary layout verification
+- PASS: owner-local helper move only; no shared binary payload layout changed.
+
+## 2026-04-30 — `video_core/src/engines/draw_manager.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/engines/draw_manager.h` and `/home/vricosti/Dev/emulators/zuyu/src/video_core/engines/draw_manager.cpp` (draw-call compatibility queue owner follow-up)
+
+### Intentional differences
+- Rust `DrawManager` now owns a temporary `compat_draw_calls` queue used only by the software-facing compatibility path. Upstream has no such queue; it exists because this tree still drains recorded draw calls from `GpuContext`.
+- Rust still adapts the upstream `Maxwell3D*` dependency through `Maxwell3DAccess`, and the temporary `build_compat_draw_call(...)` bridge remains on that trait until the software-facing draw-call path is removed or ported behind the active rasterizer owner graph.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: the old non-upstream `on_process_draw(...)` callback was removed from the active draw path. `DrawManager::process_draw(...)` now owns the compatibility queue directly instead of asking `Maxwell3D` to own it.
+
+### Missing items
+- `DrawManager::process_draw(...)` still has the temporary `build_compat_draw_call(...)` bridge, which upstream does not have.
+- `DrawManager::clear(...)` is still not literal upstream because it carries the extra local framebuffer production path.
+- the file still depends on the reduced dirty-flag bridge instead of the literal `maxwell3d->dirty.flags[...]` owner.
+
+### Binary layout verification
+- PASS: owner/lifecycle change only; no shared binary payload layout changed.
+
+## 2026-04-30 — `video_core/src/engines/maxwell_3d.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/engines/maxwell_3d.h` and `/home/vricosti/Dev/emulators/zuyu/src/video_core/engines/maxwell_3d.cpp` (draw-call compatibility queue owner follow-up)
+
+### Intentional differences
+- Rust still keeps a software-facing draw-call compatibility path that upstream does not expose. The compatibility builder now returns draw snapshots into `DrawManager` instead of keeping a `draw_calls` owner field inside `Maxwell3D`.
+- Rust still retains the older local `handle_draw_begin(...)` / `handle_draw_end(...)` helpers for legacy tests and call paths, but they now publish compatibility draws through `DrawManager`.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `Maxwell3D` no longer owns the temporary `draw_calls` queue field.
+- Fixed in this pass: the non-upstream `on_process_draw(...)` owner hook was removed from `impl draw_manager::Maxwell3DAccess for Maxwell3D`.
+
+### Missing items
+- `Maxwell3D` still contains reduced local draw-state mirrors (`current_topology`, `draw_mode`, `instance_count`, `inline_index_data`) that upstream keeps under `DrawManager`.
+- the engine owner still reconstructs register subviews from flat `regs[]` storage instead of owning literal nested upstream register structs.
+- `set_dirty_flag(...)` is still reduced to `interface_state.current_dirty = true`.
+
+### Binary layout verification
+- PASS: owner/state move only; no guest-visible struct or payload layout changed.
+
+## 2026-04-30 — `video_core/src/engines/maxwell_3d.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/engines/maxwell_3d.h` and `/home/vricosti/Dev/emulators/zuyu/src/video_core/engines/maxwell_3d.cpp` (legacy draw-method dispatch owner follow-up)
+
+### Intentional differences
+- Rust still keeps `handle_draw_begin(...)`, `handle_draw_end(...)`, and `flush_deferred_draw(...)` as local wrapper methods because this tree still has legacy tests and helper paths that call them directly. They are now only wrappers around the matching `DrawManager` owner methods.
+- Rust still keeps reduced local draw-state mirrors (`current_topology`, `draw_mode`, `instance_count`, `inline_index_data`, `draw_indexed`) so legacy callers and tests can observe the same state without yet storing only a `DrawManager` owner pointer graph.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: the legacy `process_method(...)` path no longer maintains a second local draw dispatcher for draw methods. Draw-related method writes now route through `DrawManager::process_method_call(...)`, which matches the upstream `ProcessMethodCall(...)->draw_manager->ProcessMethodCall(...)` ownership split more closely.
+- Fixed in this pass: the macro-flush deferred-draw path now calls `DrawManager::draw_deferred(...)` directly instead of reimplementing the instanced-flush logic in `Maxwell3D`.
+- Fixed in this pass: `handle_draw_begin(...)` and `handle_draw_end(...)` are no longer independent local state machines; they now forward to the matching `DrawManager` owner methods.
+
+### Missing items
+- `Maxwell3D` still stores reduced local draw-state mirrors that upstream keeps only under `DrawManager`.
+- the engine owner still reconstructs register subviews from flat `regs[]` storage instead of owning literal nested upstream register structs.
+- `set_dirty_flag(...)` is still reduced to `interface_state.current_dirty = true`.
+
+### Binary layout verification
+- PASS: owner/dispatch reroute only; no guest-visible struct or payload layout changed.
+
+## 2026-04-30 — `video_core/src/engines/draw_manager.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/engines/draw_manager.h` and `/home/vricosti/Dev/emulators/zuyu/src/video_core/engines/draw_manager.cpp` (legacy draw-method dispatch owner follow-up)
+
+### Intentional differences
+- Rust `DrawManager` still carries the temporary `compat_draw_calls` queue and `build_compat_draw_call(...)` bridge, which upstream does not have.
+- Rust still adapts the upstream `Maxwell3D*` dependency through `Maxwell3DAccess`.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: the legacy local `Maxwell3D::process_method(...)` path now routes draw methods through `DrawManager::process_method_call(...)`, so the matching owner file again owns the draw-method dispatch logic for both active and legacy callers.
+
+### Missing items
+- `DrawManager` still has the temporary software-facing `compat_draw_calls` queue and `build_compat_draw_call(...)` bridge.
+- `DrawManager::clear(...)` is still not literal upstream because it carries the extra local framebuffer production path.
+- the file still depends on the reduced dirty-flag bridge instead of the literal `maxwell3d->dirty.flags[...]` owner.
+
+### Binary layout verification
+- PASS: owner/dispatch reroute only; no shared binary payload layout changed.
+
+## 2026-04-30 — `video_core/src/engines/maxwell_3d.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/engines/maxwell_3d.h` and `/home/vricosti/Dev/emulators/zuyu/src/video_core/engines/maxwell_3d.cpp` (draw-state source-of-truth follow-up)
+
+### Intentional differences
+- Rust still keeps reduced legacy mirror fields (`current_topology`, `draw_indexed`, `draw_mode`, `instance_count`, `inline_index_data`) on `Maxwell3D`, but this pass stops using them as the active source of truth. The live draw state now remains owned by `DrawManager`, and the old fields remain only as temporary compatibility storage to unwind later.
+- Rust still adapts the upstream `std::unique_ptr<DrawManager>` owner graph through `with_draw_manager(...)` and the `Maxwell3DAccess` trait rather than a raw `Maxwell3D*`.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `with_draw_manager(...)` no longer copies draw-state ownership back from `DrawManager` into `Maxwell3D` after every call. This aligns the active owner boundary with upstream, where `DrawManager::State draw_state` is owned by `DrawManager`.
+- Fixed in this pass: compatibility builders (`build_draw_state(...)`, `build_draw_call(...)`, and `current_topology()`) now read the active draw state from `DrawManager` instead of treating the local `Maxwell3D` mirrors as canonical.
+- Fixed in this pass: the old local test expectation that inline-index draws reset `draw_mode` to `General` was wrong. Upstream `DrawManager::DrawEnd()` does not perform that reset for the `InlineIndex` branch, so the Rust regression was updated to match upstream behavior.
+
+### Missing items
+- `Maxwell3D` still stores the reduced legacy mirror fields even though they are no longer the active source of truth.
+- `dispatch_draw_to_rasterizer(...)` / `build_draw_state(...)` remain compatibility-only paths and are still not part of the literal upstream owner graph.
+- the engine owner still reconstructs register subviews from flat `regs[]` storage instead of owning literal nested upstream register structs.
+- `set_dirty_flag(...)` is still reduced to `interface_state.current_dirty = true`.
+
+### Binary layout verification
+- PASS: owner/state-source change only; no guest-visible struct or payload layout changed.
+
+## 2026-04-30 — `video_core/src/engines/maxwell_3d.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/engines/maxwell_3d.h` and `/home/vricosti/Dev/emulators/zuyu/src/video_core/engines/maxwell_3d.cpp` (draw-state mirror removal follow-up)
+
+### Intentional differences
+- Rust still keeps temporary compatibility methods (`build_draw_call(...)`, `take_draw_calls()`, and the `build_compat_draw_call(...)` trait hook) because this tree still exposes a software-facing recorded-draw path that upstream does not surface through `Maxwell3D`.
+- Rust still adapts the upstream `DrawManager*` / `RasterizerInterface*` graph through `with_draw_manager(...)` and `Maxwell3DAccess`.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: the stale local draw-state mirror fields were removed from `Maxwell3D` entirely (`current_topology`, `draw_indexed`, `draw_mode`, `instance_count`, `inline_index_data`). The active draw state is now owned only by `DrawManager`, which matches upstream structure more closely.
+- Fixed in this pass: the dead local `DrawMode` enum in `maxwell_3d.rs` was removed after the owner boundary moved back to `draw_manager.rs`.
+
+### Missing items
+- `build_draw_call(...)` and the compatibility draw queue are still Rust-only owner bridges that upstream does not have.
+- `dispatch_draw_to_rasterizer(...)`, `build_draw_state(...)`, and the software-facing recorded-draw path are still reduced compatibility surfaces rather than literal upstream flow.
+- the engine owner still reconstructs register subviews from flat `regs[]` storage instead of owning literal nested upstream register structs.
+- `set_dirty_flag(...)` is still reduced to `interface_state.current_dirty = true`.
+
+### Binary layout verification
+- PASS: local owner-field removal only; no guest-visible struct or payload layout changed.
+
+## 2026-04-30 — `video_core/src/engines/draw_manager.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/engines/draw_manager.h` and `/home/vricosti/Dev/emulators/zuyu/src/video_core/engines/draw_manager.cpp` (compat draw-call builder owner follow-up)
+
+### Intentional differences
+- Rust still carries a temporary software-facing compatibility `DrawCall` queue that upstream does not have. This tree still drains recorded draws through `GpuContext`, so the queue remains as debt.
+- Rust still adapts the upstream `Maxwell3D*` dependency through `Maxwell3DAccess`, so the compatibility builder reads state through trait methods instead of direct member access.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: the temporary compatibility `DrawCall` builder now lives in `draw_manager.rs`, the matching owner file for draw-trigger behavior, instead of `maxwell_3d.rs`.
+- Fixed in this pass: `DrawManager::process_draw(...)` now builds the compatibility draw snapshot directly from its owned `DrawState` plus register-backed `Maxwell3DAccess` reads, instead of calling back into `Maxwell3D` for the whole builder.
+
+### Missing items
+- `DrawManager` still has the temporary software-facing `compat_draw_calls` queue, which upstream does not have.
+- `DrawManager::clear(...)` is still not literal upstream because it carries the extra local framebuffer production path.
+- the file still depends on the reduced dirty-flag bridge instead of the literal `maxwell3d->dirty.flags[...]` owner.
+
+### Binary layout verification
+- PASS: owner/helper move only; no shared binary payload layout changed.
+
+## 2026-04-30 — `video_core/src/engines/maxwell_3d.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/engines/maxwell_3d.h` and `/home/vricosti/Dev/emulators/zuyu/src/video_core/engines/maxwell_3d.cpp` (compat draw-call builder owner follow-up)
+
+### Intentional differences
+- Rust still exposes a software-facing recorded-draw path that upstream does not have, so `Maxwell3D` must still implement compatibility read surfaces on `Maxwell3DAccess`.
+- Rust still reconstructs many register-backed views from flat `regs[]` storage rather than storing the literal upstream nested register structs.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: the temporary compatibility `DrawCall` builder helpers were removed from `maxwell_3d.rs` (`dispatch_draw_to_rasterizer(...)`, `build_draw_state(...)`, `build_draw_call(...)`, and the `build_compat_draw_call(...)` trait implementation).
+- Fixed in this pass: `Maxwell3D` now exposes only the register/state reads needed by the owner-local builder in `draw_manager.rs`, which aligns ownership more closely with upstream `DrawManager`.
+
+### Missing items
+- `Maxwell3D` still provides reduced compatibility read surfaces on `Maxwell3DAccess` for the non-upstream recorded-draw path.
+- the engine owner still reconstructs register subviews from flat `regs[]` storage instead of owning literal nested upstream register structs.
+- `set_dirty_flag(...)` is still reduced to `interface_state.current_dirty = true`.
+
+### Binary layout verification
+- PASS: owner/helper removal only; no guest-visible struct or payload layout changed.
+
+## 2026-04-30 — `video_core/src/engines/maxwell_3d.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/engines/maxwell_3d.h` and `/home/vricosti/Dev/emulators/zuyu/src/video_core/engines/maxwell_3d.cpp` (dirty-state owner follow-up)
+
+### Intentional differences
+- Rust still keeps `interface_state.current_dirty` as a reduced execution-path bridge because the DMA pusher and legacy engine interface flow are not yet wired directly through the upstream `dirty.tables[method] -> dirty.flags[...]` path.
+- Rust still stores `dirty.tables` using the shared `dirty_flags.rs` helper types and stub population, because the full register-range table setup is not yet completely ported.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `Maxwell3D` now owns a real local `DirtyState` with `flags` and `tables`, matching the upstream owner boundary instead of relying only on the coarse `current_dirty` boolean.
+- Fixed in this pass: `set_dirty_flag(...)` now marks the specific dirty flag in `Maxwell3D::dirty.flags[...]` in addition to the coarse bridge bit, matching upstream `dirty.flags[index] = true` more closely.
+- Fixed in this pass: `Maxwell3D::new()` now initializes the local dirty flags as dirty at boot, matching upstream `dirty.flags.flip()`.
+
+### Missing items
+- `dirty_flags::setup_dirty_flags(...)` is still stubbed, so `dirty.tables` ownership is present but not yet behaviorally complete.
+- the DMA/register write path still does not route method dirtiness through `dirty.tables[method]`.
+- the engine owner still reconstructs register subviews from flat `regs[]` storage instead of owning literal nested upstream register structs.
+
+### Binary layout verification
+- PASS: owner-state addition only; no guest-visible struct or payload layout changed.
+
+## 2026-04-30 — `video_core/src/engines/maxwell_3d.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/engines/maxwell_3d.h` and `/home/vricosti/Dev/emulators/zuyu/src/video_core/engines/maxwell_3d.cpp` (dirty-table write-path follow-up)
+
+### Intentional differences
+- Rust still uses the reduced `dirty_flags.rs` table-population helper, so many entries still collapse to `NULL_ENTRY` until the full register-range setup is ported.
+- Rust still keeps `interface_state.current_dirty` as the coarse DMA/macro bridge because that upstream-facing write-dirtiness path is not yet fully rewired around the restored `dirty.tables`.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `process_dirty_registers(...)` now follows the upstream owner logic shape again: if the register value changed, it writes `regs[method]` and marks `dirty.flags[table[method]]` for each installed dirty table.
+- Fixed in this pass: the restored local `dirty.tables` are now consumed on the active single-write path instead of existing only as owner placeholders.
+
+### Missing items
+- `dirty_flags::setup_dirty_flags(...)` is still stubbed, so the restored table-driven path is structurally correct but still behaviorally incomplete.
+- the legacy `process_method(...)` compatibility path still writes `regs[]` directly instead of routing through `process_dirty_registers(...)`.
+- the DMA/register write path still keeps the coarse `current_dirty` bridge for macro parameter dirtiness.
+
+### Binary layout verification
+- PASS: control-flow/state-marking change only; no guest-visible struct or payload layout changed.
+
+## 2026-04-30 — `video_core/src/engines/fermi_2d.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/engines/fermi_2d.h` and `/home/vricosti/Dev/emulators/zuyu/src/video_core/engines/fermi_2d.cpp` (pixels_from_memory decode follow-up)
+
+### Intentional differences
+- Rust still reconstructs the upstream `Regs` sub-views from flat `regs[]` words and local register constants instead of owning a literal `union Regs` layout. This keeps file ownership correct but not binary-identical at the struct-definition level.
+- Rust uses a local `bytes_per_pixel_from_render_target_format(...)` helper in this file because the upstream `PixelFormatFromRenderTargetFormat(...)` owner path is still not ported as a shared Rust helper.
+- Rust still logs the upstream `UNIMPLEMENTED_IF_MSG(...)` conditions in `handle_blit()` instead of asserting/stubbing them, because the active runtime still keeps a reduced software fallback path.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: the source and destination `Surface` register offsets now match the upstream `Surface` layout (`format`, `linear`, block dimensions, `depth`, `layer`, `pitch`, `width`, `height`, address high/low). The earlier Rust constants were shifted and decoded the wrong words.
+- Fixed in this pass: `Fermi2D::new()` now initializes `regs.src.depth` and `regs.dst.depth` to `1`, matching the upstream constructor behavior.
+- Fixed in this pass: the `pixels_from_memory` block is now decoded in the matching owner file, including `sample_mode.origin`, `sample_mode.filter`, `dst_x0`, `dst_y0`, `dst_width`, `dst_height`, `du_dx`, `dv_dy`, `src_x0`, and `src_y0`.
+- Fixed in this pass: the active blit path now follows the upstream `Blit()` control-flow shape:
+  - compute `delegate_to_gpu`
+  - adjust corner-origin source coordinates
+  - build `Config`
+  - perform the pitch-alignment fixup on the source surface and source rectangle
+  - then call `accelerate_surface_copy(...)`
+
+### Missing items
+- `execute_pending(...)` still does not mirror upstream `Blit()` literally:
+  - no `memory_manager.FlushCaching()`
+  - no `SoftwareBlitEngine::Blit(src, regs.dst, config)` owner path
+  - the local software fallback still copies raw pitched rows and ignores the richer `Config`
+- `Surface` still does not preserve the literal upstream union layout for block dimensions (`repr(C)` plus packed bitfield word); it stores decoded `block_width/block_height/block_depth` fields only.
+- `Operation`, `CpuIndexWrap`, `SectorPromotion`, and the rest of the upstream register/file state are still only partially represented in the Rust owner.
+
+### Binary layout verification
+- FAIL: `Surface` is not a byte-for-byte Rust mirror of the upstream C++ struct yet; this pass fixed register decoding semantics, not the literal in-memory struct layout.
+
+## 2026-04-30 — `video_core/src/dirty_flags.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/dirty_flags.h` and `/home/vricosti/Dev/emulators/zuyu/src/video_core/dirty_flags.cpp`
+
+### Intentional differences
+- Rust uses `Vec<u8>` tables instead of upstream `std::array<u8, Maxwell3D::Regs::NUM_REGS>`, because the surrounding Rust owner graph stores dirty tables dynamically.
+- The port references register offsets through Rust constants exported from `maxwell_3d.rs` instead of the upstream `OFF/NUM` macros over the C++ `Regs` layout.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `setup_dirty_flags(...)` is no longer stubbed. It now ports the upstream helper split:
+  - `setup_dirty_vertex_buffers(...)`
+  - `setup_index_buffer(...)`
+  - `setup_dirty_descriptors(...)`
+  - `setup_dirty_render_targets(...)`
+  - `setup_dirty_shaders(...)`
+- Fixed in this pass: the restored `dirty.tables` owner in `Maxwell3D` now gets real table population for the ranges upstream marks.
+
+### Missing items
+- The Rust port still approximates `NUM(field)` through explicit word counts derived from the upstream struct sizes, rather than sharing a literal generated `Regs` layout type.
+- Any upstream dirty-table ranges not present in `dirty_flags.cpp` remain intentionally absent; wider backend-specific dirty graphs still live in their backend state trackers.
+
+### Binary layout verification
+- PASS: dirty-table metadata only; no guest-visible payload layout changed.
+
+## 2026-04-30 — `video_core/src/engines/maxwell_3d.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/engines/maxwell_3d.h` and `/home/vricosti/Dev/emulators/zuyu/src/video_core/engines/maxwell_3d.cpp` (legacy process_method dirty-path follow-up)
+
+### Intentional differences
+- Rust still keeps `process_method(...)` as a compatibility entry point for local macro/legacy engine paths. Upstream routes the active command flow through `ConsumeSinkImpl() -> ProcessDirtyRegisters() -> ProcessMethodCall()` and does not expose this exact helper shape.
+- Rust still keeps `interface_state.current_dirty` as a coarse bridge for DMA/macro dirtiness outside the restored per-method dirty-table path.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: the legacy `process_method(...)` path no longer writes `regs[]` directly. It now routes register storage through `process_dirty_registers(...)`, so the restored `dirty.tables[method] -> dirty.flags[...]` behavior also applies on that compatibility path.
+- Fixed in this pass: the stale unused `PIPELINE_STRIDE` import in `dirty_flags.rs` was removed after the dirty-table owner port.
+
+### Missing items
+- `process_method(...)` remains a Rust compatibility helper and still does not mirror the literal upstream `ConsumeSinkImpl()` ordering/lifecycle.
+- `interface_state.current_dirty` is still present as a coarse DMA/macro bridge.
+- the engine owner still reconstructs register subviews from flat `regs[]` storage instead of owning literal nested upstream register structs.
+
+### Binary layout verification
+- PASS: control-flow/state-marking change only; no guest-visible struct or payload layout changed.
+
+## 2026-04-30 — `video_core/src/engines/sw_blitter/converter.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/engines/sw_blitter/converter.h` and `/home/vricosti/Dev/emulators/zuyu/src/video_core/engines/sw_blitter/converter.cpp` (Send-owner follow-up)
+
+### Intentional differences
+- Rust adds a `Send` bound to the `Converter` trait object cache so `SoftwareBlitEngine` can remain embedded in `Fermi2D`, which is required to satisfy the Rust engine-owner `Send` bounds. Upstream does not spell this at the interface level because the C++ ownership model does not encode thread-safety in the type system.
+- Rust still uses a direct `HashMap<u32, Box<dyn Converter + Send>>` cache in the matching file instead of the upstream `ConverterFactoryImpl` pImpl wrapper.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `ConverterFactory` cache entries are now `Send`, so embedding the upstream-matching software blitter owner inside `Fermi2D` no longer breaks the engine-owner `Send` contract.
+
+### Missing items
+- `ConverterFactory` still does not mirror the literal upstream `ConverterFactoryImpl` owner split.
+- the Rust port still uses runtime `Vec`-backed format traits instead of the upstream compile-time traits/template graph.
+
+### Binary layout verification
+- PASS: trait-bound/cache-owner change only; no guest-visible struct or payload layout changed.
+
+## 2026-04-30 — `video_core/src/engines/sw_blitter/blitter.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/engines/sw_blitter/blitter.h` and `/home/vricosti/Dev/emulators/zuyu/src/video_core/engines/sw_blitter/blitter.cpp`
+
+### Intentional differences
+- Rust does not store a literal upstream `MemoryManager&` owner in `SoftwareBlitEngine`. On this tree the active engine execution contract still passes `read_gpu` and expects `PendingWrite` results, so the matching owner file exposes `blit_to_pending_write(...)` as the narrow adaptation boundary.
+- Rust reuses the shared `Fermi2D::{Surface, Config, Filter, MemoryLayout}` owner types directly from `fermi_2d.rs` instead of maintaining a second reduced local copy in `blitter.rs`. This is closer to upstream ownership because the C++ owner includes `fermi_2d.h`.
+- Rust keeps `bytes_per_pixel_from_render_target_format(...)` as a local helper in this file because the upstream `PixelFormatFromRenderTargetFormat(...)` shared owner path is still not ported literally.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: the active software blit algorithm now lives in the matching owner file instead of remaining as a reduced row-copy fallback in `fermi_2d.rs`.
+- Fixed in this pass: the owner now performs the upstream `Blit(...)` data path shape:
+  - full source-surface read
+  - block-linear unswizzle or pitch-linear extraction
+  - same-format nearest-neighbor path
+  - IR conversion path through `ConverterFactory`
+  - bilinear filtering when requested
+  - destination-surface readback plus block-linear swizzle or pitch-linear pack
+
+### Missing items
+- `SoftwareBlitEngine` still does not own a literal `MemoryManager&` and still does not perform upstream `GpuGuestMemory` / `GpuGuestMemoryScoped` writeback in place.
+- the owner method is still named `blit_to_pending_write(...)` rather than the literal upstream `Blit(...)` because the surrounding Rust engine contract still returns pending writes.
+- the local `bytes_per_pixel_from_render_target_format(...)` helper should disappear once the shared upstream render-target-format owner path is ported.
+
+### Binary layout verification
+- PASS: this file owns algorithm/control flow only; no guest-visible raw struct layout changed here.
+
+## 2026-04-30 — `video_core/src/engines/fermi_2d.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/engines/fermi_2d.h` and `/home/vricosti/Dev/emulators/zuyu/src/video_core/engines/fermi_2d.cpp` (software-blitter ownership follow-up)
+
+### Intentional differences
+- Rust still constructs `Fermi2D` without a literal upstream `MemoryManager&` constructor argument. The active tree still instantiates engines through a reduced owner graph, so the software blitter is owned directly and invoked through the `read_gpu -> PendingWrite` adaptation boundary.
+- `Fermi2D` still reconstructs the upstream `Regs` sub-views from flat `regs[]` words and local register constants instead of owning a literal `union Regs` layout.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `execute_pending(...)` no longer owns a reduced row-by-row pitched copy fallback.
+- Fixed in this pass: after the rasterizer `accelerate_surface_copy(...)` attempt, `Fermi2D` now delegates the software fallback to the matching upstream owner file, `sw_blitter/blitter.rs`.
+
+### Missing items
+- `Fermi2D::new()` still does not receive/store a literal upstream `MemoryManager&`.
+- the owner still keeps only a partial representation of the upstream register/file state (`CpuIndexWrap`, `SectorPromotion`, and wider `Regs` layout are still incomplete).
+- `Surface` is still not a byte-for-byte Rust mirror of the upstream C++ struct/union layout.
+
+### Binary layout verification
+- FAIL: `Surface` and the surrounding register owner are still not literal byte-for-byte mirrors of the upstream C++ layout; this pass only fixed ownership of the software fallback path.
+
+## 2026-04-30 — `video_core/src/engines/sw_blitter/blitter.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/engines/sw_blitter/blitter.h` and `/home/vricosti/Dev/emulators/zuyu/src/video_core/engines/sw_blitter/blitter.cpp` (MemoryManager writeback follow-up)
+
+### Intentional differences
+- Rust stores `Arc<Mutex<MemoryManager>>` instead of a literal upstream `MemoryManager&`. This is the narrowest adaptation available in the current engine-owner graph while keeping the owner in the matching file.
+- Rust still keeps the upstream algorithm and helper ownership in `blitter.rs`, but does not mirror the upstream pImpl split literally.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: the active owner method now matches the upstream `bool Blit(...)` boundary instead of returning a Rust-only `PendingWrite`.
+- Fixed in this pass: destination writeback now goes through the bound `MemoryManager` inside `SoftwareBlitEngine`, which is the closest Rust equivalent to the upstream `GpuGuestMemoryScoped` owner path.
+
+### Missing items
+- `SoftwareBlitEngine` still does not own literal upstream `GpuGuestMemory` / `GpuGuestMemoryScoped` object types.
+- the file still does not mirror the literal upstream pImpl split between the public owner and `SoftwareBlitEngineImpl`.
+- the local `bytes_per_pixel_from_render_target_format(...)` helper should disappear once the shared upstream render-target-format owner path is ported.
+
+### Binary layout verification
+- PASS: owner/control-flow change only; no guest-visible raw payload layout changed in this file.
+
+## 2026-04-30 — `video_core/src/engines/fermi_2d.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/engines/fermi_2d.h` and `/home/vricosti/Dev/emulators/zuyu/src/video_core/engines/fermi_2d.cpp` (MemoryManager writeback follow-up)
+
+### Intentional differences
+- Rust still constructs `Fermi2D` from `Arc<Mutex<MemoryManager>>` rather than a literal upstream `MemoryManager&`, because the surrounding Rust engine-owner graph is still shared/heap-owned.
+- `Fermi2D` still reconstructs the upstream `Regs` subviews from flat `regs[]` words and constants instead of storing a literal `union Regs`.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: the software fallback path no longer depends on the old Rust-only `read_gpu -> PendingWrite` adaptation. `Fermi2D` now delegates to `SoftwareBlitEngine` and returns no synthetic pending write for the CPU blit path.
+- Fixed in this pass: the focused software-blit regressions now seed the upstream-owned `pixels_from_memory` register block correctly instead of relying on the older reduced test setup.
+
+### Missing items
+- `Fermi2D::new()` still does not receive/store a literal upstream `MemoryManager&`.
+- the owner still keeps only a partial representation of the upstream register/file state.
+- `Surface` and the wider register owner are still not byte-for-byte mirrors of the upstream C++ layout.
+
+### Binary layout verification
+- FAIL: `Surface` and the surrounding register owner remain structurally reduced versus the upstream `union Regs`; this pass fixed owner flow, not raw layout parity.
+
+## 2026-04-30 — `video_core/src/engines/fermi_2d.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/engines/fermi_2d.h` and `/home/vricosti/Dev/emulators/zuyu/src/video_core/engines/fermi_2d.cpp` (Surface layout follow-up)
+
+### Intentional differences
+- Rust still represents `Surface::format` as `u32` instead of the literal upstream `RenderTargetFormat` field type, because the wider render-target-format owner path on this tree still routes through raw values.
+- Rust still reconstructs the wider upstream `Regs` owner from flat `regs[]` storage and method constants instead of storing a literal `union Regs`.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `Surface` no longer stores separate Rust-only `block_width`, `block_height`, and `block_depth` words. It now mirrors the upstream owner shape with one `block_dimensions` word plus local bitfield-style accessors in the matching file.
+- Fixed in this pass: `Surface` now matches the upstream size contract (`0x28`), with a focused regression proving the layout size.
+
+### Missing items
+- `Surface` still does not mirror the literal upstream `union`/`BitField` surface syntax byte-for-byte; Rust exposes accessor methods instead.
+- the surrounding `Regs` owner is still not a literal upstream `union Regs` mirror.
+- the remaining register graph (`CpuIndexWrap`, `SectorPromotion`, and wider `pixels_from_memory`/other blocks) is still only partially modeled.
+
+### Binary layout verification
+- PASS: `Surface` now matches the upstream size contract (`0x28`) and stores `block_dimensions` in the same conceptual slot.
+
+## 2026-04-30 — `video_core/src/engines/fermi_2d.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/engines/fermi_2d.h` and `/home/vricosti/Dev/emulators/zuyu/src/video_core/engines/fermi_2d.cpp` (`pixels_from_memory` owner follow-up)
+
+### Intentional differences
+- Rust still reconstructs `pixels_from_memory` from the flat `regs[]` array instead of storing a literal nested field inside a full upstream `union Regs`.
+- Rust keeps `sample_mode_raw` as a plain `u32` plus local accessors, which is the closest faithful equivalent to the upstream nested union/bitfield ownership without inventing lossy Rust enums for arbitrary raw values.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: the `pixels_from_memory` block is no longer decoded ad hoc across `prepare_blit()`. It is now owned by a dedicated matching-file struct with the same conceptual fields and offsets as upstream.
+- Fixed in this pass: added focused regressions proving both the local size contract (`0x60`) and the low/high-word decode behavior for `du_dx`, `dv_dy`, `src_x0`, and `src_y0`.
+
+### Missing items
+- `pixels_from_memory` is still a reconstructed snapshot, not a literal field inside a full `Regs` owner.
+- the leading fields `block_shape`, `corral_size`, and `safe_overlap` are carried for layout parity but still not behaviorally consumed.
+- the wider `Regs` graph remains partial and still lacks literal nested ownership for many upstream blocks.
+
+### Binary layout verification
+- PASS: local `PixelsFromMemory` snapshot now matches the upstream size contract (`0x60`) and preserves the upstream field ordering used by `prepare_blit()`.
+
+## 2026-04-30 — `video_core/src/engines/fermi_2d.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/engines/fermi_2d.h` and `/home/vricosti/Dev/emulators/zuyu/src/video_core/engines/fermi_2d.cpp` (contiguous register-window decode follow-up)
+
+### Intentional differences
+- Rust still does not own a literal upstream `union Regs`; it reads contiguous register windows out of the flat `regs[]` array and converts them into matching-file raw structs.
+- `SurfaceRaw` keeps `format` and `linear` as raw `u32` words before local conversion, instead of storing literal upstream field types in the raw snapshot. This preserves the raw register bits without forcing invalid Rust enum states.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `src_surface()`, `dst_surface()`, and `pixels_from_memory()` no longer reconstruct active fields one-by-one from scattered loads. They now decode their register windows as contiguous raw blocks, which is materially closer to how upstream owns those fields inside `Regs`.
+- Fixed in this pass: the active `prepare_blit()` path now consumes raw-window snapshots built from the exact source register ranges for `Surface` (`0x28` bytes) and `pixels_from_memory` (`0x60` bytes).
+
+### Missing items
+- the wider `Regs` owner is still not a literal nested struct/union graph.
+- `Surface` still exposes a higher-level converted view instead of being the raw owner itself.
+- `RenderTargetFormat` is still not the literal stored field type of the raw surface snapshot on the Rust side.
+
+### Binary layout verification
+- PASS: `SurfaceRaw` and `PixelsFromMemory` now decode from contiguous register windows matching the upstream byte ranges used by `Regs`.
+
+## 2026-04-30 — `video_core/src/engines/fermi_2d.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/engines/fermi_2d.h` and `/home/vricosti/Dev/emulators/zuyu/src/video_core/engines/fermi_2d.cpp` (`Surface.format` typed-owner follow-up)
+
+### Intentional differences
+- Rust keeps `SurfaceRaw::format` as a raw `u32` register word and converts it locally into `RenderTargetFormat` when producing the active `Surface` owner view. This preserves the raw register window decode while moving the higher-level owner closer to the upstream typed field.
+- Unknown raw format discriminants currently collapse to `RenderTargetFormat::None` in `decode_render_target_format(...)`. Upstream can carry arbitrary raw bits in the union field; Rust cannot safely materialize invalid enum discriminants directly.
+- Rust still reconstructs `Surface` from `regs[]` windows instead of owning a literal upstream `union Regs`.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: the active `Surface` owner no longer stores `format` as a raw `u32`. It now carries `RenderTargetFormat`, which matches the upstream semantic owner type used by `Surface` and by `Blit()`.
+- Fixed in this pass: the local bytes-per-pixel path in `Fermi2D::blit()` now consumes the typed `RenderTargetFormat` owner instead of a raw integer field.
+
+### Missing items
+- the raw invalid-format bit pattern is still not preserved through the converted `Surface` owner view.
+- the wider `Regs` owner is still not a literal upstream nested struct/union graph.
+- `PixelFormatFromRenderTargetFormat(...)` is still not ported as the shared upstream owner path, so this file still keeps a local bytes-per-pixel helper.
+
+### Binary layout verification
+- PASS: `SurfaceRaw` remains the raw `0x28` register-window snapshot, so the underlying decoded byte layout used for `Surface` extraction did not regress in this pass.
+
+## 2026-04-30 — `video_core/src/engines/fermi_2d.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/engines/fermi_2d.h` and `/home/vricosti/Dev/emulators/zuyu/src/video_core/engines/fermi_2d.cpp` (active `Regs` window and local owner-type follow-up)
+
+### Intentional differences
+- Rust still stores the engine register file in a flat `regs[]` array and reconstructs only the active upstream window from `dst` through `pixels_from_memory`, instead of owning the literal full upstream `union Regs`.
+- `SurfaceRaw::format` and `SurfaceRaw::linear` still remain raw `u32` words in the decoded window so invalid guest bit patterns can survive the raw snapshot stage before local conversion.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: the active blit path no longer reads `dst`, `src`, `clip_enable`, `operation`, and `pixels_from_memory` from separate scattered register decoders. It now consumes one upstream-aligned `ActiveRegsRaw` window rooted at `dst` (`0x200`) with the correct local offsets through `pixels_from_memory` (`0x880`).
+- Fixed in this pass: the local `pixels_from_memory.sample_mode` owner is no longer an ad hoc `u32` field plus hand-built temporary struct. It is now represented as a matching-file raw owner word with owner-local `origin()` and `filter()` accessors, which is closer to the upstream nested union/bitfield surface.
+- Fixed in this pass: `Config` now uses `#[repr(C)]` and matches the upstream local owner size contract (`0x2c`) instead of relying on an implicit Rust layout.
+
+### Missing items
+- the full upstream `union Regs` is still missing; this file only owns the active window used by `Blit()`
+- many upstream nested blocks outside the active blit path remain unmodeled in Rust
+- `Surface`, `PixelsFromMemory`, and `Config` still use Rust helper methods instead of literal upstream `BitField` members
+
+### Binary layout verification
+- PASS: `ActiveRegsRaw` matches the active upstream byte span (`0x6e0`) and the verified member offsets for `dst`, `src`, `clip_enable`, `operation`, and `pixels_from_memory`
+- PASS: `Config` now matches the upstream local size contract (`0x2c`)
+- FAIL: overall full `Regs` parity remains incomplete because only the active blit window is modeled
+
+## 2026-04-30 — `video_core/src/engines/fermi_2d.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/engines/fermi_2d.h` and `/home/vricosti/Dev/emulators/zuyu/src/video_core/engines/fermi_2d.cpp` (nested active-block owner follow-up)
+
+### Intentional differences
+- Rust still reconstructs the active `Regs` slice from flat `regs[]` storage instead of owning the literal upstream `union Regs`.
+- The new local nested owners still keep raw `u32` payloads instead of literal upstream `BitField` member types, because the raw register-bit preservation happens before higher-level conversion on the Rust side.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `ActiveRegsRaw` no longer flattens the `render_enable`, `clip`, `color_key`, `beta4`, and `pattern_offset` parts of the active `Regs` window into unrelated standalone words. These now live as matching nested local owners in the same file, closer to the upstream `Regs` structure.
+- Fixed in this pass: `clip_enable()` now reads through the nested `clip` owner instead of a flattened `clip_enable` word, matching the upstream ownership boundary more closely.
+- Fixed in this pass: the active layout regressions now verify the nested active-block offsets (`render_enable`, `clip`, `color_key`, `beta4`, `pattern_offset`) instead of only the coarse outer window offsets.
+
+### Missing items
+- the active window is still only a subset of upstream `Regs`
+- the nested local owners still do not expose literal upstream bitfield member surfaces
+- the rest of the upstream `Regs` graph outside the blit-active window remains unmodeled
+
+### Binary layout verification
+- PASS: nested active-block offsets now match the upstream positions for `render_enable` (`0x264`), `clip` (`0x280`), `color_key` (`0x294`), `beta4` (`0x2A8`), and `pattern_offset` (`0x2B0`) relative to the full `Regs` owner
+- FAIL: full `union Regs` parity remains incomplete
+
+## 2026-04-30 — `video_core/src/engines/fermi_2d.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/engines/fermi_2d.h` and `/home/vricosti/Dev/emulators/zuyu/src/video_core/engines/fermi_2d.cpp` (intermediate active-block owner follow-up)
+
+### Intentional differences
+- Rust still reconstructs only the active `Regs` window from flat `regs[]` storage instead of storing the literal upstream `union Regs`.
+- The newly restored intermediate blocks are still raw owner payloads, not literal upstream `BitField`-typed submembers.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: the large placeholder gap between `pattern_select` and `pixels_from_memory` is no longer a single anonymous padding blob. The matching file now owns the real upstream intermediate blocks in order:
+  - `monochrome_pattern`
+  - `color_pattern`
+  - `render_solid`
+  - `pixels_from_cpu`
+  - `big_endian_control`
+- Fixed in this pass: focused layout regressions now verify the upstream offsets and sizes of these intermediate active blocks instead of leaving that region structurally opaque.
+
+### Missing items
+- these restored intermediate blocks are still not behaviorally consumed by the active Rust blit path
+- the wider full `Regs` owner before `dst` and after `pixels_from_memory` remains unmodeled
+- raw enum/bitfield discriminants are still represented as `u32` payloads plus Rust accessors
+
+### Binary layout verification
+- PASS: `MonochromePatternRaw` matches `0x18`
+- PASS: `ColorPatternRaw` matches `0x240`
+- PASS: `RenderSolidRaw` matches `0x280`
+- PASS: `PixelsFromCpuRaw` matches `0x64`
+- PASS: verified upstream-relative offsets for `monochrome_pattern` (`0x2E8`), `color_pattern` (`0x300`), `render_solid` (`0x580`), `pixels_from_cpu` (`0x800`), and `big_endian_control` (`0x870`) within the full `Regs` owner
+- FAIL: full `union Regs` parity remains incomplete
+
+## 2026-04-30 — `video_core/src/engines/fermi_2d.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/engines/fermi_2d.h` and `/home/vricosti/Dev/emulators/zuyu/src/video_core/engines/fermi_2d.cpp` (`RegsRaw` owner follow-up)
+
+### Intentional differences
+- Rust now stores the live engine register file through a local `RegsUnionRaw + tail` owner, but it still uses a Rust-only `RegsStorageRaw` wrapper because the generic engine trait expects `ENGINE_REG_COUNT` words while upstream `Fermi2D::Regs::NUM_REGS` is only `0x258`.
+- the trailing bytes from `0x8E0` to `NUM_REGS * 4` are still raw tail storage rather than richer named upstream fields, because upstream only exposes the union-wide `reg_array` contract there.
+- the extra runtime words beyond upstream `NUM_REGS` are still Rust-only storage, but they now live in an explicit local tail owner because the surrounding engine trait still requires `ENGINE_REG_COUNT` contiguous words.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: the matching file now owns an explicit `RegsPrefixRaw` for the upstream register header before `dst`, instead of leaving those early registers structurally invisible in the local Rust owner graph.
+- Fixed in this pass: the matching file now owns a top-level `RegsRaw` covering prefix + active window + trailing union padding, so the Rust side has a local structure aligned to the upstream `NUM_REGS` raw size contract.
+- Fixed in this pass: `RegsPrefixRaw` now uses explicit whole-struct zero initialization in its local owner file instead of relying on a derive path that was not valid for the large fixed arrays in this workspace.
+- Fixed in this pass: focused regressions now verify the upstream offsets and raw reads for `object`, `no_operation`, `notify`, `wait_for_idle`, `pm_trigger`, and the DMA header fields.
+- Fixed in this pass: the live `Fermi2D` storage no longer uses an anonymous `Box<[u32; ENGINE_REG_COUNT]>`. It now stores registers through a local `RegsUnionRaw` owner with `reg_array` parity for the upstream head and an explicit Rust-only tail for the extra generic-engine words.
+- Fixed in this pass: live read/write paths now go through one contiguous word view derived from that local owner, and focused regressions verify continuity across the upstream `reg_array` boundary into the Rust-only tail.
+- Fixed in this pass: the previously anonymous raw tails are now explicit local owners in the matching file. `RegsRawTail0x8e0To0x960` now owns the raw union tail between the active block and upstream `NUM_REGS`, and `RegsRuntimeTailRaw` now owns the extra generic-engine words after the upstream register head.
+- Fixed in this pass: the active `Blit()` read path no longer reconstructs the upstream head through `pod_read_unaligned` snapshots. `clip_enable`, `operation`, `dst`, `src`, `pixels_from_memory`, and `regs_raw()` now read from the live structured union head owner, which is closer to upstream `regs.<field>` access.
+- Fixed in this pass: several remaining active/head enum-like fields are no longer plain `u32` slots in the local raw owners. `notify`, `pixels_from_cpu_index_wrap`, `pixels_from_memory_sector_promotion`, `num_tpcs`, `render_enable.mode`, `color_key.format`, `pattern_select`, and monochrome-pattern format/color-format now use local typed `repr(transparent)` wrappers in the matching file.
+- Fixed in this pass: the remaining active-bitfield owners `clip_enable`, `color_key_enable`, and `rop` are no longer plain `u32` words in the live active raw owner. They now use local typed raw wrappers in the matching file, and `PatternOffsetRaw` now owns explicit upstream-shaped `x/y` extraction helpers instead of remaining an opaque raw word.
+- Fixed in this pass: `operation` is no longer stored as a plain `u32` slot in the active raw owner. It now uses a local typed raw wrapper in the matching file, and `Beta4Raw` now owns explicit upstream-shaped channel extraction helpers (`b/g/r/a`) instead of remaining a fully opaque word.
+- Fixed in this pass: the active `pixels_from_memory` bitfield-like head words `block_shape`, `corral_size`, and `safe_overlap` are no longer plain `u32` slots in the matching raw owner. They now use local typed raw wrappers plus upstream-shaped extraction helpers in the same file.
+- Fixed in this pass: `SurfaceRaw::format` and `SurfaceRaw::linear` are no longer plain `u32` words in the matching raw owner. They now use local typed raw wrappers in the same file, closer to the upstream `Surface` field ownership.
+- Fixed in this pass: `SurfaceRaw::block_dimensions` is no longer a plain `u32` word in the matching raw owner. It now uses a local typed raw wrapper with upstream-shaped `block_width/block_height/block_depth` extraction helpers in the same file.
+- Fixed in this pass: `RenderEnableRaw` and `ColorKeyRaw` now own more of their local register semantics in the matching file. `RenderEnableRaw` now exposes upstream-shaped address/mode accessors, and `ColorKeyRaw` now exposes local `format/value/enabled` accessors instead of remaining a passive field bag.
+- Fixed in this pass: `ClipRaw` now owns more of its local register semantics in the matching file. It now exposes local `x0/y0/width/height/enabled` accessors, and the active `clip_enable()` read path now goes through that owner instead of peeking through nested raw fields directly.
+- Fixed in this pass: `PixelsFromMemory` now owns more of its local sample-mode semantics in the matching file. It now exposes local `origin()` and `filter()` accessors, and `prepare_blit()` now consumes those owner-local methods instead of extracting a raw `SampleModeRaw` helper at the call site.
+- Fixed in this pass: `PixelsFromMemory` now owns more of its local coordinate/derivative semantics in the matching file. It now exposes local `dst_x0/dst_y0/dst_width/dst_height/du_dx/dv_dy/src_x0/src_y0` accessors, and `prepare_blit()` now consumes those owner-local methods instead of reading the raw fields directly.
+- Fixed in this pass: two more anonymous active-head paddings now live as explicit local owners in the matching file. `ActiveRegsPad0x2b8To0x2e8` now owns the raw gap between `pattern_select` and `monochrome_pattern`, and `ActiveRegsPad0x540To0x580` now owns the raw gap between `color_pattern` and `render_solid`.
+- Fixed in this pass: the remaining small anonymous active-head paddings now live as explicit local owners in the matching file. `ActiveRegsPad0x25c`, `ActiveRegsPad0x270`, `ActiveRegsPad0x864To0x870`, and `ActiveRegsPad0x874To0x880` now own the corresponding raw gaps instead of leaving those words as naked arrays or scalars in `ActiveRegsRaw`.
+- Fixed in this pass: the anonymous padding blocks in `RegsPrefixRaw` now live as explicit local owners in the matching file. `RegsPrefixPad0x004To0x100`, `RegsPrefixPad0x108To0x110`, `RegsPrefixPad0x114To0x140`, `RegsPrefixPad0x144To0x180`, and `RegsPrefixPad0x190To0x200` now own the corresponding raw header gaps instead of leaving them as naked arrays in the prefix owner.
+- Fixed in this pass: the remaining anonymous inner paddings of `RenderSolidRaw` and `PixelsFromCpuRaw` now live as explicit local owners in the matching file. `RenderSolidPad0x390To0x3e4`, `RenderSolidPad0x3e4To0x400`, and `PixelsFromCpuPad0x620To0x638` now own those raw gaps instead of leaving them as naked arrays inside the sub-block owners.
+- Fixed in this pass: `MonochromePatternRaw` now owns more of its local register semantics in the matching file. It now exposes local `color_format/format/color0/color1/pattern0/pattern1` accessors instead of remaining a passive field bag.
+- Fixed in this pass: `PointRaw` and `RenderSolidRaw` now own more of their local register semantics in the matching file. `PointRaw` now exposes local `x/y` accessors, and `RenderSolidRaw` now exposes local `prim_mode/prim_color_format/prim_color/line_tie_break_bits/prim_point_xy/prim_point(i)` accessors instead of remaining a passive field bag.
+- Fixed in this pass: `PixelsFromCpuRaw` now owns more of its local register semantics in the matching file. It now exposes local accessors for `data_type/color_format/index_format/mono_format/wrap/color0/color1/mono_opacity/src_width/src_height/data` instead of remaining a passive field bag.
+- Fixed in this pass: `ColorPatternRaw` now owns more of its local register semantics in the matching file. It now exposes local indexed accessors for the `X8R8G8B8`, `R5G6B5`, `X1R5G5B5`, and `Y8` pattern arrays instead of remaining a passive field bag.
+- Fixed in this pass: the remaining active head words `kind2d_check_enable`, `beta1`, and `big_endian_control` are no longer plain anonymous `u32` slots in the matching raw owner. They now use local typed raw wrappers in the same file.
+- Fixed in this pass: `PixelsFromCpuRaw` now owns more of its local coordinate/derivative register semantics in the matching file. It now exposes local accessors for `dx_du_frac/dx_du_int/dx_dv_frac/dy_dv_int/dst_x0_frac/dst_x0_int/dst_y0_frac/dst_y0_int` instead of leaving those words completely flat.
+
+### Missing items
+- the live stored owner is still `RegsStorageRaw`, not a literal upstream `union Regs` field on `Fermi2D`
+- the remaining tail after `pixels_from_memory` is still anonymous padding rather than named upstream fields, because upstream does not define more structured fields there
+- bitfield-typed members are still represented as typed raw wrappers with Rust accessors, not literal upstream `BitField<>` members
+
+### Binary layout verification
+- PASS: `RegsRaw` now matches the upstream `NUM_REGS * sizeof(u32)` size contract (`0x960`)
+- PASS: `RegsRawTail0x8e0To0x960` matches the upstream raw tail size (`0x80`)
+- PASS: `RegsRuntimeTailRaw` matches the Rust runtime tail size contract (`(ENGINE_REG_COUNT - NUM_REGS_WORDS) * 4`)
+- PASS: `RegsPrefixRaw` matches the upstream offsets through `semaphore_context_dma` and positions `active` at `0x200`
+- PASS: the live storage head exposes a contiguous `reg_array`-compatible word view through `NUM_REGS`
+- PASS: the local typed raw wrappers for `clip_enable`, `color_key_enable`, and `rop` preserve the same single-word raw layout as the upstream register slots while making the active owner graph less anonymous
+- PASS: `OperationRaw` and `Beta4Raw` preserve the same single-word raw layout as the upstream register slots while moving more of the active owner semantics into the matching file
+- PASS: `PixelsFromMemory` now preserves the same single-word raw layout for `block_shape`, `corral_size`, and `safe_overlap` while moving their active extraction logic into the matching owner file
+- PASS: `SurfaceRaw` still matches the upstream `0x28` layout while moving `format` and `linear` away from anonymous raw words toward file-local typed owners
+- PASS: `SurfaceRaw::block_dimensions` still preserves the same single-word raw layout while moving the upstream block-dimension extraction semantics into the matching owner file
+- PASS: `RenderEnableRaw` and `ColorKeyRaw` keep their upstream raw layout unchanged while moving more owner-local decoding semantics into the matching file
+- PASS: `ClipRaw` keeps its upstream raw layout unchanged while moving more owner-local decoding semantics into the matching file
+- PASS: `PixelsFromMemory` keeps its upstream raw layout unchanged while moving more owner-local sample-mode decoding semantics into the matching file
+- PASS: `PixelsFromMemory` keeps its upstream raw layout unchanged while moving more owner-local coordinate/derivative decoding semantics into the matching file
+- PASS: `ActiveRegsPad0x2b8To0x2e8` matches the upstream raw padding size (`0x30`)
+- PASS: `ActiveRegsPad0x540To0x580` matches the upstream raw padding size (`0x40`)
+- PASS: `ActiveRegsPad0x25c` matches the upstream raw padding size (`0x4`)
+- PASS: `ActiveRegsPad0x270` matches the upstream raw padding size (`0x10`)
+- PASS: `ActiveRegsPad0x864To0x870` matches the upstream raw padding size (`0xC`)
+- PASS: `ActiveRegsPad0x874To0x880` matches the upstream raw padding size (`0xC`)
+- PASS: `RegsPrefixPad0x004To0x100` matches the upstream raw padding size (`0xFC`)
+- PASS: `RegsPrefixPad0x108To0x110` matches the upstream raw padding size (`0x8`)
+- PASS: `RegsPrefixPad0x114To0x140` matches the upstream raw padding size (`0x2C`)
+- PASS: `RegsPrefixPad0x144To0x180` matches the upstream raw padding size (`0x3C`)
+- PASS: `RegsPrefixPad0x190To0x200` matches the upstream raw padding size (`0x70`)
+- PASS: `RenderSolidPad0x390To0x3e4` matches the upstream raw padding size (`0x50`)
+- PASS: `RenderSolidPad0x3e4To0x400` matches the upstream raw padding size (`0x1C`)
+- PASS: `PixelsFromCpuPad0x620To0x638` matches the upstream raw padding size (`0x18`)
+- PASS: `MonochromePatternRaw` keeps its upstream raw layout unchanged while moving more owner-local decoding semantics into the matching file
+- PASS: `PointRaw` and `RenderSolidRaw` keep their upstream raw layout unchanged while moving more owner-local decoding semantics into the matching file
+- PASS: `PixelsFromCpuRaw` keeps its upstream raw layout unchanged while moving more owner-local decoding semantics into the matching file
+- PASS: `ColorPatternRaw` keeps its upstream raw layout unchanged while moving more owner-local decoding semantics into the matching file
+- PASS: `kind2d_check_enable`, `beta1`, and `big_endian_control` still preserve the same single-word raw layout while no longer remaining anonymous raw words in the active owner graph
+- PASS: the `PixelsFromCpuRaw` derivative/coordinate words keep their upstream raw layout unchanged while moving more owner-local decoding semantics into the matching file
+- FAIL: full literal live union parity remains incomplete because `Fermi2D` still stores a Rust-only wrapper around the upstream-sized head
+
+## 2026-04-30 — `video_core/src/engines/sw_blitter/blitter.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/engines/sw_blitter/blitter.h` and `/home/vricosti/Dev/emulators/zuyu/src/video_core/engines/sw_blitter/blitter.cpp` (`RenderTargetFormat` typed-owner follow-up)
+
+### Intentional differences
+- Rust still calls the converter factory with raw numeric format ids (`src.format as u32`, `dst.format as u32`) because the local converter-owner API still expects raw values instead of the upstream shared `PixelFormatFromRenderTargetFormat(...)` path.
+- Rust keeps a local `bytes_per_pixel_from_render_target_format(...)` helper in this file instead of consuming the upstream shared `BytesPerBlock(PixelFormatFromRenderTargetFormat(...))` owner chain directly.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `SoftwareBlitEngine` no longer treats `Surface.format` as an untyped raw `u32` for its own bytes-per-pixel decisions. It now consumes the typed `RenderTargetFormat` owner exported by `Fermi2D::Surface`.
+- Fixed in this pass: the focused writeback regression now seeds typed `RenderTargetFormat` values in its local `Surface` literals instead of stale raw constants.
+
+### Missing items
+- the converter owner path still takes raw integer format ids rather than the literal upstream shared render-target-format mapping path.
+- the file still does not mirror the upstream pImpl split literally.
+
+### Binary layout verification
+- PASS: owner/type cleanup only; this file does not define a guest-visible raw payload layout.
+
+## 2026-04-30 — `video_core/src/engines/fermi_2d.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/engines/fermi_2d.h` and `/home/vricosti/Dev/emulators/zuyu/src/video_core/engines/fermi_2d.cpp` (`padding-owner rollback follow-up`)
+
+### Intentional differences
+- Rust still stores the live engine register file through `RegsStorageRaw` rather than a literal upstream `union Regs`, because the surrounding engine trait still requires `ENGINE_REG_COUNT` contiguous words and upstream `Fermi2D::Regs::NUM_REGS` is smaller.
+- `RegsRawTail0x8e0To0x960` and `RegsRuntimeTailRaw` remain explicit local owners because they serve the live storage boundary and contiguous-word contract, not just anonymous inner padding.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: the temporary Rust-only dedicated owner types for anonymous upstream `INSERT_PADDING_WORDS_NOINIT(...)` gaps were removed again. `RegsPrefixRaw`, `ActiveRegsRaw`, `RenderSolidRaw`, and `PixelsFromCpuRaw` now own those anonymous gaps directly as raw fields, which is closer to the upstream structure and avoids inventing fake semantic sub-owners.
+- Fixed in this pass: focused layout tests no longer assert sizes for artificial `*Pad0x*` types that have no upstream counterpart. The layout verification now stays at the real owner boundaries that upstream actually exposes.
+
+### Missing items
+- the live stored owner is still `RegsStorageRaw`, not a literal upstream `union Regs` field on `Fermi2D`
+- bitfield-typed members are still represented as typed raw wrappers with Rust accessors, not literal upstream `BitField<>` members
+- the wider `Regs` graph outside the active window is still only partially modeled
+
+### Binary layout verification
+- PASS: `test_regs_prefix_offsets_match_upstream` still passes after folding anonymous padding back into `RegsPrefixRaw`
+- PASS: `test_nested_active_blocks_match_upstream_sizes` still passes after folding anonymous padding back into `ActiveRegsRaw`, `RenderSolidRaw`, and `PixelsFromCpuRaw`
+- PASS: `cargo build --bin ruzu-cmd` passes after the rollback
+
+## 2026-04-30 — `video_core/src/engines/fermi_2d.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/engines/fermi_2d.h` and `/home/vricosti/Dev/emulators/zuyu/src/video_core/engines/fermi_2d.cpp` (`ASSERT_REG_POSITION parity follow-up`)
+
+### Intentional differences
+- Rust still verifies nested field positions through `offset_of!(...)` tests over local raw owners rather than the upstream `ASSERT_REG_POSITION(...)` macro, because Rust has no direct equivalent to the C++ macro pattern.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: the focused layout tests now cover more of the upstream `ASSERT_REG_POSITION(...)` contract directly. The active-window test now verifies `pixels_from_cpu_index_wrap`, `kind2d_check_enable`, `pixels_from_memory_sector_promotion`, `num_tpcs`, `rop`, `beta1`, and `pattern_select` offsets in addition to the previously covered active fields.
+- Fixed in this pass: nested upstream position contracts are now covered explicitly for `render_enable_addr_upper`, `render_enable_addr_lower`, `clip_x0`, `clip_y0`, `clip_width`, `clip_height`, `clip_enable`, `color_key_format`, `color_key`, and `color_key_enable` through parent-plus-child offset assertions over the matching local raw owners.
+
+### Missing items
+- the live stored owner is still `RegsStorageRaw`, not a literal upstream `union Regs` field on `Fermi2D`
+- bitfield-typed members are still represented as typed raw wrappers with Rust accessors, not literal upstream `BitField<>` members
+- the wider `Regs` graph outside the active window is still only partially modeled
+
+### Binary layout verification
+- PASS: `test_active_regs_window_offsets_match_upstream` now covers a larger subset of the upstream `ASSERT_REG_POSITION(...)` layout contract
+- PASS: `test_upstream_assert_reg_position_contracts_match_nested_fields` verifies the nested `render_enable`, `clip`, and `color_key` field positions against the upstream byte offsets
+- PASS: `cargo build --bin ruzu-cmd` passes after the test-layout follow-up
+
+## 2026-04-30 — `video_core/src/engines/fermi_2d.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/engines/fermi_2d.h` and `/home/vricosti/Dev/emulators/zuyu/src/video_core/engines/fermi_2d.cpp` (`flat active-field ownership follow-up`)
+
+### Intentional differences
+- Rust still uses local helper methods on `ActiveRegsRaw` to decode `render_enable`, `clip`, and `color_key` semantics because the language has no direct equivalent to the upstream mix of adjacent enum fields and `BitField<>` members.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `render_enable`, `clip`, and `color_key` are no longer modeled as Rust-only sub-struct owners. The matching file now stores their fields flat in `ActiveRegsRaw`, which is closer to the upstream `Regs` declaration where those fields are adjacent register members rather than nested structs.
+- Fixed in this pass: the focused raw-wrapper regression now exercises those semantics through `ActiveRegsRaw` itself instead of through separate local `RenderEnableRaw`, `ClipRaw`, and `ColorKeyRaw` helper structs that had no direct upstream counterpart.
+- Fixed in this pass: the active-window offset tests now validate the flat owner layout directly at `0x64..0x9C` instead of deriving those positions through nested Rust-only helper structs.
+
+### Missing items
+- the live stored owner is still `RegsStorageRaw`, not a literal upstream `union Regs` field on `Fermi2D`
+- bitfield-typed members are still represented as typed raw wrappers with Rust accessors, not literal upstream `BitField<>` members
+- the wider `Regs` graph outside the active window is still only partially modeled
+
+### Binary layout verification
+- PASS: `render_enable_addr_upper`, `render_enable_addr_lower`, and `render_enable_mode` now sit at `0x64`, `0x68`, and `0x6C` directly in `ActiveRegsRaw`
+- PASS: `clip_x0`, `clip_y0`, `clip_width`, `clip_height`, and `clip_enable` now sit at `0x80`, `0x84`, `0x88`, `0x8C`, and `0x90` directly in `ActiveRegsRaw`
+- PASS: `color_key_format`, `color_key`, and `color_key_enable` now sit at `0x94`, `0x98`, and `0x9C` directly in `ActiveRegsRaw`
+- PASS: `cargo test -p video_core test_typed_raw_wrappers_decode_upstream_enum_values -- --nocapture`
+- PASS: `cargo test -p video_core test_active_regs_window_offsets_match_upstream -- --nocapture`
+- PASS: `cargo build --bin ruzu-cmd`
+
+## 2026-04-30 — `video_core/src/engines/fermi_2d.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/engines/fermi_2d.h` and `/home/vricosti/Dev/emulators/zuyu/src/video_core/engines/fermi_2d.cpp` (`reg_array write-path parity follow-up`)
+
+### Intentional differences
+- Rust still keeps a wider contiguous `ENGINE_REG_COUNT` storage view for the generic engine trait, but the public Fermi2D register write paths now explicitly separate the upstream register head from that Rust-only tail.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `Fermi2D::call_method(...)` no longer writes through the generic `ENGINE_REG_COUNT` word view. It now asserts the upstream `Regs::NUM_REGS` bound and writes through the upstream head `reg_array`, matching the ownership and validation shape of upstream `Fermi2D::CallMethod`.
+- Fixed in this pass: `consume_sink_impl()` no longer silently accepts writes into the Rust-only tail through the public sink path. It now uses the same upstream `Regs::NUM_REGS` bound and `reg_array` owner as `CallMethod`.
+- Fixed in this pass: the tail-continuity regression no longer uses `write_reg()` to seed the Rust-only tail, because that path is not part of the upstream register contract. The test now writes the tail only through the internal contiguous storage view it is actually validating.
+
+### Missing items
+- the live stored owner is still `RegsStorageRaw`, not a literal upstream `union Regs` field on `Fermi2D`
+- bitfield-typed members are still represented as typed raw wrappers with Rust accessors, not literal upstream `BitField<>` members
+- the wider `Regs` graph outside the active window is still only partially modeled
+
+### Binary layout verification
+- PASS: `call_method` now panics on `method >= NUM_REGS_WORDS`, matching the upstream invalid-register contract
+- PASS: `test_storage_words_cover_union_head_and_rust_tail_contiguously` still validates that the wider Rust storage remains contiguous even though the public register path now stops at the upstream head boundary
+- PASS: `cargo test -p video_core test_call_method_rejects_registers_past_upstream_num_regs -- --nocapture`
+- PASS: `cargo build --bin ruzu-cmd`
+
+## 2026-04-30 — `video_core/src/engines/fermi_2d.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/engines/fermi_2d.h` and `/home/vricosti/Dev/emulators/zuyu/src/video_core/engines/fermi_2d.cpp` (`live regs-owner naming follow-up`)
+
+### Intentional differences
+- Rust still needs a wrapper around the upstream-sized register head because the local engine trait requires `ENGINE_REG_COUNT` contiguous words, but that wrapper now exposes a more literal `regs` owner name instead of a generic `head`.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: the live storage wrapper no longer names the upstream-sized register owner generically as `head`. `RegsStorageRaw` now carries that owner as `regs`, which is closer to the upstream `Fermi2D::regs` field and makes the runtime access path easier to audit against the C++ source.
+- Fixed in this pass: all live storage accessors now read through `storage.regs.reg_array` / `storage.regs.structured` rather than the more artificial `storage.head.*` path.
+
+### Missing items
+- the live stored owner is still `RegsStorageRaw`, not a literal upstream `union Regs` field on `Fermi2D`
+- bitfield-typed members are still represented as typed raw wrappers with Rust accessors, not literal upstream `BitField<>` members
+- the wider `Regs` graph outside the active window is still only partially modeled
+
+### Binary layout verification
+- PASS: `RegsStorageRaw` still starts its upstream-sized register owner at offset `0x0`, now via the `regs` field name
+- PASS: `RegsRuntimeTailRaw` still begins at `NUM_REGS_WORDS * 4`
+- PASS: `cargo test -p video_core test_regs_storage_size_matches_engine_reg_count -- --nocapture`
+- PASS: `cargo test -p video_core test_storage_words_cover_union_head_and_rust_tail_contiguously -- --nocapture`
+- PASS: `cargo build --bin ruzu-cmd`
+
+## 2026-04-30 — `video_core/src/engines/fermi_2d.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/engines/fermi_2d.h` and `/home/vricosti/Dev/emulators/zuyu/src/video_core/engines/fermi_2d.cpp` (`inline regs storage follow-up`)
+
+### Intentional differences
+- Rust still needs `RegsStorageRaw` because the local engine trait requires a contiguous runtime tail past upstream `Regs::NUM_REGS`, but the live `Fermi2D` owner no longer heap-boxes that storage.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `Fermi2D` no longer stores its register owner as `Box<RegsStorageRaw>`. The live `regs` storage is now inline in `Fermi2D`, which is closer to the upstream `Fermi2D::regs{}` field ownership and removes one Rust-only indirection layer.
+- Fixed in this pass: constructor initialization and all live register access paths now operate on inline storage rather than through a heap box, without changing the raw register layout contract.
+
+### Missing items
+- the live stored owner is still `RegsStorageRaw`, not a literal upstream `union Regs` field on `Fermi2D`
+- bitfield-typed members are still represented as typed raw wrappers with Rust accessors, not literal upstream `BitField<>` members
+- the wider `Regs` graph outside the active window is still only partially modeled
+
+### Binary layout verification
+- PASS: `RegsStorageRaw` size and internal offsets remain unchanged after removing `Box<>` from the parent owner
+- PASS: `cargo test -p video_core test_regs_storage_size_matches_engine_reg_count -- --nocapture`
+- PASS: `cargo test -p video_core test_storage_words_cover_union_head_and_rust_tail_contiguously -- --nocapture`
+- PASS: `cargo build --bin ruzu-cmd`
+
+## 2026-04-30 — `video_core/src/engines/fermi_2d.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/engines/fermi_2d.h` and `/home/vricosti/Dev/emulators/zuyu/src/video_core/engines/fermi_2d.cpp` (`live regs wrapper-removal attempt rollback`)
+
+### Intentional differences
+- Rust still keeps `RegsStorageRaw` as the live stored owner instead of splitting `Fermi2D` into a literal upstream `regs: RegsUnionRaw` field plus a separate runtime tail field. The local engine layer still requires a contiguous `ENGINE_REG_COUNT` storage view, and keeping the upstream-sized register head adjacent to the Rust-only tail inside one `#[repr(C)]` owner is the current safe way to preserve that contract.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: the attempted removal of `RegsStorageRaw` was rolled back. That attempt replaced the combined storage with two separate fields and rebuilt `ENGINE_REG_COUNT` slices from `RegsUnionRaw` alone, which did not provide a defensible contiguity guarantee for the Rust-only tail and therefore was structurally unsafe.
+- Fixed in this pass: `Fermi2D` now again stores its live register state through inline `RegsStorageRaw`, so `words()` / `words_mut()` derive their contiguous slice from one combined owner instead of stitching together two unrelated fields.
+- Fixed in this pass: `CallMethod`/`ConsumeSinkImpl` parity remains preserved after the rollback. Public register writes still target only the upstream `reg_array` head (`Regs::NUM_REGS`) even though the wider Rust-only contiguous tail remains present inside the combined storage.
+
+### Missing items
+- the live stored owner is still `RegsStorageRaw`, not a literal upstream `union Regs` field on `Fermi2D`
+- bitfield-typed members are still represented as typed raw wrappers with Rust accessors, not literal upstream `BitField<>` members
+- the wider `Regs` graph outside the active window is still only partially modeled
+
+### Binary layout verification
+- PASS: `RegsStorageRaw` remains `ENGINE_REG_COUNT * 4` bytes, with `regs` at offset `0x0` and `runtime_tail` starting at `NUM_REGS_WORDS * 4`
+- PASS: `cargo test -p video_core test_regs_storage_size_matches_engine_reg_count -- --nocapture`
+- PASS: `cargo test -p video_core test_storage_words_cover_union_head_and_rust_tail_contiguously -- --nocapture`
+- PASS: `cargo build --bin ruzu-cmd`
+
+## 2026-04-30 — `core/src/hle/kernel/k_hardware_timer.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/k_hardware_timer.cpp` and `/home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/k_hardware_timer.h` (`DoTask ordering follow-up`)
+
+### Intentional differences
+- Rust still keeps timer owner state in `Mutex<KHardwareTimerState>` and still resolves tasks through `thread_id` plus `GlobalSchedulerContext` / raw-pointer fallback, because this tree does not model literal `KThread : KTimerTask` inheritance.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `KHardwareTimer::do_task()` previously diverged from upstream by collecting expired tasks with `collect_expired_tasks()`, dropping the timer-state lock, delivering `thread.on_timer()` afterward, and only then reacquiring state to rearm the next deadline. Upstream keeps the scheduler lock and timer lock through `DoInterruptTaskImpl(GetTick())`, calls `task->OnTimer()` inline, and rearms before releasing ownership. Rust now follows that owner ordering more closely by running `state.base.do_interrupt_task_impl(...)` under the same locked block and rearming inside that block.
+
+### Missing items
+- `core/src/hle/kernel/k_hardware_timer_base.rs` is still structurally reduced versus upstream: it uses `BTreeMap<i64, Vec<TimerTaskId>>` instead of the intrusive `KTimerTask` red-black tree and embedded task-time ownership.
+- Re-audit whether the remaining `GlobalSchedulerContext` lookup under the timer-state lock can be reduced further without reintroducing the earlier callback deadlock adaptations.
+
+### Binary layout verification
+- PASS: timer-owner/control-flow change only; no guest-visible raw struct layout changed.
+- PASS: `cargo build --bin ruzu-cmd`
+
+## 2026-04-30 — `core/src/hle/kernel/svc/svc_thread.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/svc/svc_thread.cpp` (`SleepThread owner-call follow-up`)
+
+### Intentional differences
+- Rust still uses the local `sleep_timeout_tick_from_ns(...)` helper and the separately ported `k_thread.rs` bridge instead of the exact upstream in-file expression `GetCurrentThread(kernel).Sleep(timeout)`, because thread ownership is adapted through `Arc<KThreadLock>` / `get_current_emu_thread()`.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: the positive-timeout `SleepThread` path still called `with_current_thread_fast_mut(|thread| thread.sleep(timeout))` directly from `svc_thread.rs`. That bypassed the owner boundary already documented for this area and kept the active wait path tied to the thread-local raw-pointer cache instead of the `KThread` owner file. `svc_thread.rs` now forwards to `k_thread::sleep_current_thread(timeout)`, which is the Rust-side equivalent of upstream `GetCurrentThread(kernel).Sleep(timeout)`.
+
+### Missing items
+- Re-audit the remaining `SleepThread` positive-timeout path once the current MK8D blocker moves past the `SleepThread` vs `SignalProcessWideKey` frontier.
+
+### Binary layout verification
+- PASS: SVC/thread-owner call-path change only; no guest-visible raw payload layout changed.
+- PASS: `cargo build --bin ruzu-cmd`
+
+## 2026-04-30 — `core/src/hle/kernel/k_thread.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/k_thread.cpp` and `/home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/k_thread.h` (`Sleep current-thread bridge follow-up`)
+
+### Intentional differences
+- Rust still resolves the current thread through `get_current_emu_thread()` rather than the literal upstream `GetCurrentThread(kernel)` helper because current-thread ownership is carried through thread-local `Arc<KThreadLock>` state on this tree.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: the file lacked the owner-local bridge for the active `svc::SleepThread` path, so `svc_thread.rs` had to call the raw fast-pointer helper directly. `k_thread.rs` now owns `sleep_current_thread(timeout)`, which forwards the positive-timeout path to `KThread::sleep(...)` from the matching owner file.
+
+### Missing items
+- The wider `GetCurrentThread(kernel)` family is still not represented literally; several scheduler/kernel owners still use `with_current_thread_fast_mut(...)` directly.
+
+### Binary layout verification
+- PASS: thread-owner helper addition only; no guest-visible raw struct layout changed.
+- PASS: `cargo build --bin ruzu-cmd`
+
+## 2026-04-30 — `core/src/hle/kernel/k_scheduler.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/k_scheduler.cpp` and `/home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/k_scheduler.h` (`sleep-wakeup polling rollback follow-up`)
+
+### Intentional differences
+- Rust still keeps the local `wait_for_next_runnable_thread(...)` polling loop, because this tree does not yet have the literal upstream scheduler-fiber/event-wait integration for every runnable/wakeup source.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `wait_for_next_runnable_thread(...)` proactively called `wake_expired_sleeping_threads(process)` before selecting the next runnable thread. Upstream does not synthesize sleep wakeups from the scheduler loop; sleep timeout delivery is owned by `KHardwareTimer::DoTask()` calling `KThread::OnTimer()` under the timer callback path. Rust no longer polls `sleep_deadline` from the scheduler hot path.
+
+### Missing items
+- `wake_signaled_synchronization_threads(...)` remains a Rust-only scheduler polling fallback; upstream relies on the owning synchronization objects/queues rather than a scheduler-side scan.
+- `wait_for_next_runnable_thread(...)` itself remains a local scheduler fallback without a literal upstream owner equivalent.
+
+### Binary layout verification
+- PASS: scheduler control-flow change only; no guest-visible raw struct layout changed.
+- PASS: `cargo build --bin ruzu-cmd`
+
+## 2026-04-30 — `core/src/hle/kernel/k_thread.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/k_thread.cpp` and `/home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/k_thread.h` (`OnTimer timeout path tightening`)
+
+### Intentional differences
+- Rust still clears `sleep_deadline` / `waiting_lock_info` and mirrors the wait result into the emulated register context after timeout cancellation, because these are Rust-local adaptation fields with no literal upstream storage owner.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `KThread::on_timer()` pre-set `synced_index = -1` and `wait_result = ResultTimedOut` before invoking the owning queue's `CancelWait(...)`, then called the broad `finalize_wait_transition()` helper afterward. Upstream `KThread::OnTimer()` only checks `state == Waiting` and delegates timeout completion to `m_wait_queue->CancelWait(this, ResultTimedOut, false)`. Rust now leaves timeout result ownership to `CancelWait(...)` and performs only the remaining Rust-local cleanup afterward.
+
+### Missing items
+- Re-audit whether `apply_wait_result_to_context()` should also move closer to the queue/caller ownership boundary instead of remaining a Rust-local post-cancel step in `OnTimer()`.
+- `KThread::on_timer()` still does not ASSERT scheduler-lock ownership the way upstream does; it currently relies on `KHardwareTimer::do_task()` to provide that precondition.
+
+### Binary layout verification
+- PASS: thread timeout-control-flow change only; no guest-visible raw struct layout changed.
+- PASS: `cargo build --bin ruzu-cmd`

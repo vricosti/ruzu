@@ -138,12 +138,13 @@ impl GpuContext {
     /// Create a new GPU context with default engines and null backend.
     pub fn new() -> Self {
         let compute_memory_manager = Arc::new(Mutex::new(MemoryManager::new(0)));
+        let twod_memory_manager = Arc::new(Mutex::new(MemoryManager::new(0)));
         let dma_memory_manager = Arc::new(Mutex::new(MemoryManager::new(0)));
         let engines: Vec<Option<Box<dyn crate::engines::Engine>>> = vec![
             Some(Box::new(Maxwell3D::new())), // subchannel 0
             Some(Box::new(KeplerCompute::new(compute_memory_manager))), // subchannel 1
             Some(Box::new(InlineToMemory::new())), // subchannel 2
-            Some(Box::new(Fermi2D::new())),   // subchannel 3
+            Some(Box::new(Fermi2D::new(twod_memory_manager))), // subchannel 3
             Some(Box::new(MaxwellDMA::new(dma_memory_manager))), // subchannel 4
         ];
 

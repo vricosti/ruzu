@@ -18,6 +18,8 @@ use super::engine_interface::{EngineInterface, EngineInterfaceState};
 use super::engine_upload;
 use super::{ClassId, Engine, Framebuffer, PendingWrite, ENGINE_REG_COUNT};
 use crate::descriptor_table::{TicTable, TscTable};
+use crate::dirty_flags;
+use crate::engines::draw_manager as dm;
 use crate::macro_engine::macro_engine::{get_macro_engine, MacroEngine};
 use crate::macro_engine::macro_interpreter::MacroInterpreterImpl;
 use crate::memory_manager::MemoryManager;
@@ -25,6 +27,8 @@ use crate::query_cache::query_cache::{RenderConditionState, RenderConditionState
 use crate::query_cache::types::ComparisonMode;
 use crate::query_cache::types::QueryPropertiesFlags;
 use crate::rasterizer_interface::RasterizerInterface;
+use crate::transform_feedback::{StreamOutLayout, TransformFeedbackLayout, TransformFeedbackState};
+use shader_recompiler::shader_info::ReplaceConstant;
 
 #[derive(Clone, Copy)]
 struct Maxwell3DPtr(*mut Maxwell3D);
@@ -66,19 +70,19 @@ macro_rules! reg_index {
         $base / 4 + $field
     };
 }
-const RT_BASE: u32 = reg_index!(0x0800);
+pub(crate) const RT_BASE: u32 = reg_index!(0x0800);
 /// Words per render target.
-const RT_STRIDE: u32 = 0x10;
+pub(crate) const RT_STRIDE: u32 = 0x10;
 
 // Offsets within each render target (relative to RT_BASE + i*RT_STRIDE):
-const RT_OFF_ADDRESS_HIGH: u32 = 0x00;
-const RT_OFF_ADDRESS_LOW: u32 = 0x01;
-const RT_OFF_WIDTH: u32 = 0x02;
-const RT_OFF_HEIGHT: u32 = 0x03;
-const RT_OFF_FORMAT: u32 = 0x04;
+pub(crate) const RT_OFF_ADDRESS_HIGH: u32 = 0x00;
+pub(crate) const RT_OFF_ADDRESS_LOW: u32 = 0x01;
+pub(crate) const RT_OFF_WIDTH: u32 = 0x02;
+pub(crate) const RT_OFF_HEIGHT: u32 = 0x03;
+pub(crate) const RT_OFF_FORMAT: u32 = 0x04;
 
 /// Clear color RGBA: 4 consecutive f32-as-u32 registers.
-const CLEAR_COLOR_BASE: u32 = reg_index!(0x0D80);
+pub(crate) const CLEAR_COLOR_BASE: u32 = reg_index!(0x0D80);
 /// Clear depth value (f32 as u32 bits).
 #[allow(dead_code)]
 const CLEAR_DEPTH: u32 = reg_index!(0x0D90);
@@ -86,7 +90,7 @@ const CLEAR_DEPTH: u32 = reg_index!(0x0D90);
 #[allow(dead_code)]
 const CLEAR_STENCIL: u32 = reg_index!(0x0DA0);
 /// Clear surface trigger register.
-const CLEAR_SURFACE: u32 = reg_index!(0x19D0);
+pub(crate) const CLEAR_SURFACE: u32 = reg_index!(0x19D0);
 const RASTERIZE_ENABLE: u32 = reg_index!(0x037C);
 
 // ── Viewport registers ──────────────────────────────────────────────────────
@@ -106,24 +110,24 @@ const SCISSOR_STRIDE: u32 = 4;
 // ── Vertex buffer registers ─────────────────────────────────────────────────
 
 /// Vertex buffer first vertex.
-const VB_FIRST: u32 = reg_index!(0x0D74); // upstream byte 0x0D74
+pub(crate) const VB_FIRST: u32 = reg_index!(0x0D74); // upstream byte 0x0D74
 /// Vertex buffer vertex count.
-const VB_COUNT: u32 = reg_index!(0x0D78); // upstream byte 0x0D78
+pub(crate) const VB_COUNT: u32 = reg_index!(0x0D78); // upstream byte 0x0D78
 
 /// Vertex stream array base. 32 streams, 4 words each.
 /// Words: stride|enable, addr_high, addr_low, frequency.
-const VERTEX_STREAM_BASE: u32 = reg_index!(0x1C00);
-const VERTEX_STREAM_STRIDE: u32 = 4;
+pub(crate) const VERTEX_STREAM_BASE: u32 = reg_index!(0x1C00);
+pub(crate) const VERTEX_STREAM_STRIDE: u32 = 4;
 
 /// Vertex stream limit array base. 32 streams, 2 words each.
 #[allow(dead_code)]
-const VERTEX_STREAM_LIMIT_BASE: u32 = reg_index!(0x1F00);
+pub(crate) const VERTEX_STREAM_LIMIT_BASE: u32 = reg_index!(0x1F00);
 
 // ── Index buffer registers ──────────────────────────────────────────────────
 
 /// Index buffer base (7 words).
 /// Words: addr_high, addr_low, limit_high, limit_low, format, first, count.
-const IB_BASE: u32 = reg_index!(0x17C8);
+pub(crate) const IB_BASE: u32 = reg_index!(0x17C8);
 const IB_OFF_ADDR_HIGH: u32 = 0;
 const IB_OFF_ADDR_LOW: u32 = 1;
 #[allow(dead_code)]
@@ -131,22 +135,22 @@ const IB_OFF_LIMIT_HIGH: u32 = 2;
 #[allow(dead_code)]
 const IB_OFF_LIMIT_LOW: u32 = 3;
 const IB_OFF_FORMAT: u32 = 4;
-const IB_OFF_FIRST: u32 = 5;
-const IB_OFF_COUNT: u32 = 6;
+pub(crate) const IB_OFF_FIRST: u32 = 5;
+pub(crate) const IB_OFF_COUNT: u32 = 6;
 
 // ── Draw registers ──────────────────────────────────────────────────────────
 
 /// Draw end trigger (previously DRAW_REG).
-const DRAW_END: u32 = reg_index!(0x1614); // upstream byte 0x1614
+pub(crate) const DRAW_END: u32 = reg_index!(0x1614); // upstream byte 0x1614
 /// Draw begin: sets topology and instance mode.
-const DRAW_BEGIN: u32 = reg_index!(0x1618); // upstream byte 0x1618
+pub(crate) const DRAW_BEGIN: u32 = reg_index!(0x1618); // upstream byte 0x1618
 
 /// Signed base vertex offset for indexed draws (i32).
 const GLOBAL_BASE_VERTEX_INDEX: u32 = reg_index!(0x1434);
 /// Base instance offset for instanced draws.
 const GLOBAL_BASE_INSTANCE_INDEX: u32 = reg_index!(0x1438);
 /// Each write pushes 4 LE bytes of inline index data.
-const DRAW_INLINE_INDEX: u32 = reg_index!(0x15E8);
+pub(crate) const DRAW_INLINE_INDEX: u32 = reg_index!(0x15E8);
 
 // ── Report semaphore registers ────────────────────────────────────────────────
 
@@ -209,11 +213,18 @@ const CULL_TEST_ENABLE: u32 = reg_index!(0x1918);
 const FRONT_FACE: u32 = reg_index!(0x191C);
 const CULL_FACE: u32 = reg_index!(0x1920);
 const FRAMEBUFFER_SRGB: u32 = reg_index!(0x15B8);
+const VIEWPORT_SCALE_OFFSET_ENABLED: u32 = reg_index!(0x192C);
 
 // ── Shader program registers ────────────────────────────────────────────────
 
 /// Program region base: addr_high at +0, addr_low at +1.
 const PROGRAM_REGION_BASE: u32 = reg_index!(0x1608);
+const MANDATED_EARLY_Z: u32 = reg_index!(0x0210);
+const TESSELLATION_PARAMS: u32 = reg_index!(0x0320);
+const TRANSFORM_FEEDBACK_CONTROLS_BASE: u32 = reg_index!(0x0700);
+const TRANSFORM_FEEDBACK_CONTROL_STRIDE: u32 = 0x10 / 4;
+const TRANSFORM_FEEDBACK_ENABLED: u32 = reg_index!(0x0744);
+const STREAM_OUT_LAYOUT_BASE: u32 = reg_index!(0x2800);
 
 // ── Vertex attribute registers ────────────────────────────────────────────
 
@@ -221,21 +232,22 @@ const PROGRAM_REGION_BASE: u32 = reg_index!(0x1608);
 /// Per entry: bits[4:0]=buffer, bit[6]=constant, bits[20:7]=offset,
 ///            bits[26:21]=size, bits[29:27]=type, bit[31]=bgra.
 const VERTEX_ATTRIB_BASE: u32 = reg_index!(0x1160);
-const NUM_VERTEX_ATTRIBS: u32 = 32;
+pub(crate) const NUM_VERTEX_ATTRIBS: u32 = 32;
 
 // ── Shader pipeline registers ─────────────────────────────────────────────
 
 /// Shader pipeline base. 6 stages, 0x10 words each.
 /// Per stage: +0 packed(enable|type), +1 offset, +3 register_count, +4 binding_group.
-const PIPELINE_BASE: u32 = reg_index!(0x2000);
-const PIPELINE_STRIDE: u32 = 0x10;
-const NUM_SHADER_PROGRAMS: usize = 6;
+pub(crate) const PIPELINE_BASE: u32 = reg_index!(0x2000);
+pub(crate) const PIPELINE_STRIDE: u32 = 0x10;
+pub(crate) const NUM_SHADER_PROGRAMS: usize = 6;
 
 /// Shader program region: GPU virtual base of the shared shader code region.
 /// Two consecutive u32 registers — high then low — at byte offset 0x1608.
 /// Upstream: `Maxwell3D::Regs::ProgramRegion` (`address_high`, `address_low`).
 const PROGRAM_REGION_HIGH: u32 = reg_index!(0x1608);
 const PROGRAM_REGION_LOW: u32 = reg_index!(0x160C);
+const BINDLESS_TEXTURE_CONST_BUFFER_SLOT: u32 = reg_index!(0x2608);
 
 // ── Color write mask registers ────────────────────────────────────────────
 
@@ -249,7 +261,7 @@ const COLOR_MASK_BASE: u32 = reg_index!(0x1A00);
 // ── Render target control register ────────────────────────────────────────
 
 /// RT control: count in bits[3:0], target map in bits[6:4],[9:7],... (3 bits each).
-const RT_CONTROL: u32 = reg_index!(0x121C);
+pub(crate) const RT_CONTROL: u32 = reg_index!(0x121C);
 
 // ── Constant buffer registers ───────────────────────────────────────────────
 
@@ -273,17 +285,17 @@ const CB_BIND_TRIGGER_3: u32 = reg_index!(0x241C);
 const CB_BIND_TRIGGER_4: u32 = reg_index!(0x2424);
 
 /// Number of shader stages (vertex, tess ctrl, tess eval, geometry, fragment).
-const NUM_SHADER_STAGES: usize = 5;
+pub(crate) const NUM_SHADER_STAGES: usize = 5;
 /// Maximum constant buffer slots per stage.
-const MAX_CB_SLOTS: usize = 18;
+pub(crate) const MAX_CB_SLOTS: usize = 18;
 
 // ── Texture/Sampler pool registers ──────────────────────────────────────────
 
 /// Texture sampler pool base: +0 addr_high, +1 addr_low, +2 limit.
-const TEX_SAMPLER_POOL_BASE: u32 = reg_index!(0x155C);
+pub(crate) const TEX_SAMPLER_POOL_BASE: u32 = reg_index!(0x155C);
 
 /// Texture header pool base: +0 addr_high, +1 addr_low, +2 limit.
-const TEX_HEADER_POOL_BASE: u32 = reg_index!(0x1574);
+pub(crate) const TEX_HEADER_POOL_BASE: u32 = reg_index!(0x1574);
 
 /// Sampler binding mode register.
 /// 0 = Independently (tic_id and tsc_id are separate in texture handle)
@@ -325,42 +337,66 @@ const UPLOAD_REGS_BASE: usize = reg_index!(0x0180) as usize;
 const SYNC_INFO: u32 = reg_index!(0x02C8);
 /// Fragment barrier register.
 const FRAGMENT_BARRIER: u32 = reg_index!(0x0DE0);
-/// Draw texture trigger (writing src_y0 triggers the draw).
-const DRAW_TEXTURE_SRC_Y0: u32 = reg_index!(0x1088);
+/// Draw texture trigger (writing `regs.draw_texture.src_y0` triggers the draw).
+pub(crate) const DRAW_TEXTURE_SRC_Y0: u32 = reg_index!(0x10AC);
+/// `regs.surface_clip`.
+pub(crate) const SURFACE_CLIP_BASE: u32 = reg_index!(0x0FF4);
+const SURFACE_CLIP_HEIGHT_OFFSET: usize = 1;
+/// `regs.draw_texture`.
+const DRAW_TEXTURE_BASE: u32 = reg_index!(0x1080);
+const DRAW_TEXTURE_DST_X0_OFFSET: usize = 0;
+const DRAW_TEXTURE_DST_Y0_OFFSET: usize = 1;
+const DRAW_TEXTURE_DST_WIDTH_OFFSET: usize = 2;
+const DRAW_TEXTURE_DST_HEIGHT_OFFSET: usize = 3;
+const DRAW_TEXTURE_DX_DU_LOW_OFFSET: usize = 4;
+const DRAW_TEXTURE_DX_DU_HIGH_OFFSET: usize = 5;
+const DRAW_TEXTURE_DY_DV_LOW_OFFSET: usize = 6;
+const DRAW_TEXTURE_DY_DV_HIGH_OFFSET: usize = 7;
+const DRAW_TEXTURE_SRC_SAMPLER_OFFSET: usize = 8;
+const DRAW_TEXTURE_SRC_TEXTURE_OFFSET: usize = 9;
+const DRAW_TEXTURE_SRC_X0_OFFSET: usize = 10;
+const DRAW_TEXTURE_SRC_Y0_OFFSET: usize = 11;
+/// `regs.window_origin`.
+const WINDOW_ORIGIN: u32 = reg_index!(0x13AC);
 /// Vertex array instance first (triggers instanced array draw).
-const VERTEX_ARRAY_INSTANCE_FIRST: u32 = reg_index!(0x1214);
+pub(crate) const VERTEX_ARRAY_INSTANCE_FIRST: u32 = reg_index!(0x1214);
 /// Vertex array instance subsequent (triggers subsequent instance draw).
-const VERTEX_ARRAY_INSTANCE_SUBSEQUENT: u32 = reg_index!(0x1218);
+pub(crate) const VERTEX_ARRAY_INSTANCE_SUBSEQUENT: u32 = reg_index!(0x1218);
 /// Inline index 4x8 (index0 triggers 4-byte inline index push).
-const INLINE_INDEX_4X8_INDEX0: u32 = reg_index!(0x1300);
+pub(crate) const INLINE_INDEX_4X8_INDEX0: u32 = reg_index!(0x1300);
 /// Invalidate texture data cache register.
 const INVALIDATE_TEXTURE_DATA_CACHE: u32 = reg_index!(0x0F74);
 /// Tiled cache barrier register.
 const TILED_CACHE_BARRIER: u32 = reg_index!(0x0F7C);
 /// Clear report value register (triggers counter reset).
 const CLEAR_REPORT_VALUE: u32 = reg_index!(0x1530);
+/// Upstream `regs.zeta_enable`.
+pub(crate) const ZETA_ENABLE: u32 = reg_index!(0x1538);
+pub(crate) const ZETA_BASE: u32 = reg_index!(0x0FE0);
+pub(crate) const ZETA_SIZE_BASE: u32 = reg_index!(0x1228);
 /// Render enable block base: +0 addr_high, +1 addr_low, +2 mode.
 const RENDER_ENABLE_BASE: u32 = reg_index!(0x1550);
 /// Render enable mode register (triggers query condition evaluation).
 const RENDER_ENABLE_MODE: u32 = reg_index!(0x1554);
 /// Render enable override register.
 const RENDER_ENABLE_OVERRIDE: u32 = reg_index!(0x1944);
+const PRIMITIVE_TOPOLOGY_CONTROL: u32 = reg_index!(0x1948);
 /// Inline index 2x16 even (triggers 2-short inline index push).
-const INLINE_INDEX_2X16_EVEN: u32 = reg_index!(0x15EC);
+pub(crate) const INLINE_INDEX_2X16_EVEN: u32 = reg_index!(0x15EC);
 /// Topology override register.
-const TOPOLOGY_OVERRIDE: u32 = reg_index!(0x1970);
+pub(crate) const TOPOLOGY_OVERRIDE: u32 = reg_index!(0x1970);
 /// Index buffer 32-bit first register.
-const INDEX_BUFFER32_FIRST: u32 = reg_index!(0x17E4);
+pub(crate) const INDEX_BUFFER32_FIRST: u32 = reg_index!(0x17E4);
 /// Index buffer 16-bit first register.
-const INDEX_BUFFER16_FIRST: u32 = reg_index!(0x17E8);
+pub(crate) const INDEX_BUFFER16_FIRST: u32 = reg_index!(0x17E8);
 /// Index buffer 8-bit first register.
-const INDEX_BUFFER8_FIRST: u32 = reg_index!(0x17EC);
+pub(crate) const INDEX_BUFFER8_FIRST: u32 = reg_index!(0x17EC);
 /// Index buffer 32-bit subsequent register.
-const INDEX_BUFFER32_SUBSEQUENT: u32 = reg_index!(0x17F0);
+pub(crate) const INDEX_BUFFER32_SUBSEQUENT: u32 = reg_index!(0x17F0);
 /// Index buffer 16-bit subsequent register.
-const INDEX_BUFFER16_SUBSEQUENT: u32 = reg_index!(0x17F4);
+pub(crate) const INDEX_BUFFER16_SUBSEQUENT: u32 = reg_index!(0x17F4);
 /// Index buffer 8-bit subsequent register.
-const INDEX_BUFFER8_SUBSEQUENT: u32 = reg_index!(0x17F8);
+pub(crate) const INDEX_BUFFER8_SUBSEQUENT: u32 = reg_index!(0x17F8);
 /// Report semaphore query trigger (writing here fires the semaphore query).
 // Matches upstream MAXWELL3D_REG_INDEX(report_semaphore.query).
 const REPORT_SEMAPHORE_QUERY: u32 = REPORT_SEMAPHORE_TRIGGER;
@@ -377,8 +413,8 @@ const MACRO_REGISTERS_START: u32 = reg_index!(0x3800);
 
 // ── Common render target formats ────────────────────────────────────────────
 
-const RT_FORMAT_A8B8G8R8_UNORM: u32 = reg_index!(0x0354);
-const RT_FORMAT_A8B8G8R8_SRGB: u32 = reg_index!(0x0358);
+pub(crate) const RT_FORMAT_A8B8G8R8_UNORM: u32 = reg_index!(0x0354);
+pub(crate) const RT_FORMAT_A8B8G8R8_SRGB: u32 = reg_index!(0x0358);
 #[allow(dead_code)]
 const RT_FORMAT_A8R8G8B8_UNORM: u32 = reg_index!(0x00CC);
 #[allow(dead_code)]
@@ -392,11 +428,11 @@ const RT_FORMAT_R32G32_FLOAT: u32 = reg_index!(0x00C8);
 #[allow(dead_code)]
 const RT_FORMAT_R16_FLOAT: u32 = reg_index!(0x00F0);
 #[allow(dead_code)]
-const RT_FORMAT_R8_UNORM: u32 = reg_index!(0x00F0);
+pub(crate) const RT_FORMAT_R8_UNORM: u32 = reg_index!(0x00F0);
 #[allow(dead_code)]
 const RT_FORMAT_R16G16_UNORM: u32 = reg_index!(0x00D8);
 #[allow(dead_code)]
-const RT_FORMAT_B5G6R5_UNORM: u32 = reg_index!(0x00E8);
+pub(crate) const RT_FORMAT_B5G6R5_UNORM: u32 = reg_index!(0x00E8);
 #[allow(dead_code)]
 const RT_FORMAT_A2B10G10R10_UNORM: u32 = reg_index!(0x00D0);
 #[allow(dead_code)]
@@ -554,14 +590,6 @@ impl InstanceId {
     }
 }
 
-/// Internal draw mode state machine.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DrawMode {
-    General,
-    Instance,
-    InlineIndex,
-}
-
 #[derive(Debug, Clone, Copy)]
 struct VertexArrayParams {
     start: u32,
@@ -575,23 +603,6 @@ impl VertexArrayParams {
             start: raw & 0xFFFF,
             count: (raw >> 16) & 0xFFF,
             topology: PrimitiveTopology::from_raw((raw >> 28) & 0x7),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-struct IndexBufferSmallParams {
-    first: u32,
-    count: u32,
-    topology: PrimitiveTopology,
-}
-
-impl IndexBufferSmallParams {
-    fn from_raw(raw: u32) -> Self {
-        Self {
-            first: raw & 0xFFFF,
-            count: (raw >> 16) & 0xFFF,
-            topology: PrimitiveTopology::from_raw((raw >> 28) & 0xF),
         }
     }
 }
@@ -1743,6 +1754,27 @@ pub struct DrawCall {
     pub render_targets: [RenderTargetInfo; 8],
 }
 
+/// Port of `Maxwell3D::DirtyState`.
+///
+/// Upstream owns both the live dirty flags and the register-to-flag lookup
+/// tables inside the Maxwell3D owner. The Rust port still has reduced table
+/// population, but the owner boundary belongs here.
+pub struct DirtyState {
+    pub flags: [bool; 256],
+    pub tables: dirty_flags::DirtyTables,
+}
+
+impl DirtyState {
+    fn new() -> Self {
+        let mut flags = [false; 256];
+        flags.fill(true);
+        let mut tables =
+            std::array::from_fn(|_| vec![dirty_flags::flags::NULL_ENTRY; ENGINE_REG_COUNT]);
+        dirty_flags::setup_dirty_flags(&mut tables);
+        Self { flags, tables }
+    }
+}
+
 // ── Engine struct ───────────────────────────────────────────────────────────
 
 pub struct Maxwell3D {
@@ -1755,20 +1787,12 @@ pub struct Maxwell3D {
     execute_on: bool,
     /// Pending framebuffer output from clear operations.
     pending_framebuffer: Option<Framebuffer>,
-    /// Accumulated draw call records.
-    draw_calls: Vec<DrawCall>,
-    /// Current primitive topology (set on DRAW_BEGIN).
-    current_topology: PrimitiveTopology,
-    /// Whether the current draw is indexed (set when IB count is written).
-    draw_indexed: bool,
+    /// Upstream owner `DirtyState dirty`.
+    dirty: DirtyState,
+    /// Upstream owner `std::unique_ptr<DrawManager> draw_manager`.
+    draw_manager: dm::DrawManager,
     /// Constant buffer bindings: 5 shader stages x 18 slots.
     cb_bindings: [[ConstBufferBinding; MAX_CB_SLOTS]; NUM_SHADER_STAGES],
-    /// Draw mode state machine.
-    draw_mode: DrawMode,
-    /// Accumulated instance count in Instance mode.
-    instance_count: u32,
-    /// Accumulated inline index data bytes.
-    inline_index_data: Vec<u8>,
     /// Pending semaphore writes to be returned by execute_pending.
     pending_semaphore_writes: Vec<PendingWrite>,
     /// Bound rasterizer backend.
@@ -1802,9 +1826,65 @@ pub struct Maxwell3D {
     tic_table: TicTable,
     /// Graphics TSC descriptor table (texture sampler descriptors).
     tsc_table: TscTable,
+    /// Upstream owner `EngineHint engine_state`.
+    engine_state: EngineHint,
+    /// Upstream owner `replace_table`.
+    replace_table: std::collections::HashMap<u64, HleReplacementAttributeType>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u32)]
+pub enum EngineHint {
+    None = 0,
+    OnHleMacro = 1,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HleReplacementAttributeType {
+    BaseVertex,
+    BaseInstance,
+    DrawId,
 }
 
 impl Maxwell3D {
+    fn sync_draw_manager_from_local(&self, draw_manager: &mut dm::DrawManager) {
+        let vertex_buffer = dm::VertexBuffer {
+            first: self.regs[VB_FIRST as usize],
+            count: self.regs[VB_COUNT as usize],
+        };
+        let index_buffer = dm::IndexBuffer {
+            first: self.index_buffer_first(),
+            count: self.index_buffer_count(),
+            format: self.index_buffer_format(),
+        };
+        let base_instance = self.base_instance();
+        let base_index = self.base_vertex() as u32;
+        let shader_program_addresses = self.shader_program_addresses();
+        let index_buffer_gpu_addr = self.index_buffer_addr();
+        let index_buffer_gpu_addr_end = {
+            let base = IB_BASE as usize;
+            let high = self.regs[base + IB_OFF_LIMIT_HIGH as usize] as u64;
+            let low = self.regs[base + IB_OFF_LIMIT_LOW as usize] as u64;
+            (high << 32) | low
+        };
+        let draw_state = &mut draw_manager.draw_state;
+        draw_state.vertex_buffer = vertex_buffer;
+        draw_state.index_buffer = index_buffer;
+        draw_state.base_instance = base_instance;
+        draw_state.base_index = base_index;
+        draw_state.shader_program_addresses = shader_program_addresses;
+        draw_state.index_buffer_gpu_addr = index_buffer_gpu_addr;
+        draw_state.index_buffer_gpu_addr_end = index_buffer_gpu_addr_end;
+    }
+
+    fn with_draw_manager<R>(&mut self, f: impl FnOnce(&mut dm::DrawManager, &mut Self) -> R) -> R {
+        let mut draw_manager = std::mem::take(&mut self.draw_manager);
+        self.sync_draw_manager_from_local(&mut draw_manager);
+        let result = f(&mut draw_manager, self);
+        self.draw_manager = draw_manager;
+        result
+    }
+
     pub fn new() -> Self {
         // Build execution mask: mark which methods trigger immediate execution.
         let mut execution_mask = vec![false; u16::MAX as usize];
@@ -1823,13 +1903,9 @@ impl Maxwell3D {
             },
             execute_on: true,
             pending_framebuffer: None,
-            draw_calls: Vec::new(),
-            current_topology: PrimitiveTopology::Triangles,
-            draw_indexed: false,
+            dirty: DirtyState::new(),
+            draw_manager: dm::DrawManager::new(),
             cb_bindings: [[ConstBufferBinding::default(); MAX_CB_SLOTS]; NUM_SHADER_STAGES],
-            draw_mode: DrawMode::General,
-            instance_count: 0,
-            inline_index_data: Vec::new(),
             pending_semaphore_writes: Vec::new(),
             rasterizer: None,
             macro_positions: [0u32; 0x80],
@@ -1846,6 +1922,8 @@ impl Maxwell3D {
             gpu_ticks_getter: None,
             tic_table: TicTable::new(),
             tsc_table: TscTable::new(),
+            engine_state: EngineHint::None,
+            replace_table: std::collections::HashMap::new(),
         };
         engine.initialize_register_defaults();
         engine
@@ -1934,11 +2012,34 @@ impl Maxwell3D {
         self.memory_manager = Some(memory_manager);
     }
 
+    /// Rust owner-local bridge for upstream stored `MemoryManager&`.
+    pub fn memory_manager(&self) -> Option<Arc<Mutex<MemoryManager>>> {
+        self.memory_manager.as_ref().map(Arc::clone)
+    }
+
     pub fn set_guest_memory_reader(
         &mut self,
         guest_memory_reader: Arc<dyn Fn(u64, &mut [u8]) + Send + Sync>,
     ) {
         self.guest_memory_reader = Some(guest_memory_reader);
+    }
+
+    /// Rust owner-local bridge for the guest CPU-memory read callback used by
+    /// the current `MemoryManager` adaptation.
+    pub fn guest_memory_reader(&self) -> Option<Arc<dyn Fn(u64, &mut [u8]) + Send + Sync>> {
+        self.guest_memory_reader.as_ref().map(Arc::clone)
+    }
+
+    /// Rust owner-local bridge for upstream `Tegra::MemoryManager& gpu_memory`
+    /// access from shared shader-cache owners.
+    pub fn make_gpu_memory_reader(&self) -> Option<Arc<dyn Fn(u64, &mut [u8]) + Send + Sync>> {
+        let memory_manager = self.memory_manager.as_ref().cloned()?;
+        let guest_memory_reader = self.guest_memory_reader.as_ref().cloned()?;
+        Some(Arc::new(move |gpu_addr, output| {
+            memory_manager
+                .lock()
+                .read_block(gpu_addr, output, &*guest_memory_reader);
+        }))
     }
 
     pub fn set_guest_memory_writer(
@@ -1950,6 +2051,139 @@ impl Maxwell3D {
 
     pub fn set_gpu_ticks_getter(&mut self, gpu_ticks_getter: Arc<dyn Fn() -> u64 + Send + Sync>) {
         self.gpu_ticks_getter = Some(gpu_ticks_getter);
+    }
+
+    /// Upstream reads `regs.rasterize_enable` directly.
+    pub fn rasterize_enable(&self) -> bool {
+        self.regs[RASTERIZE_ENABLE as usize] != 0
+    }
+
+    pub fn engine_state(&self) -> EngineHint {
+        self.engine_state
+    }
+
+    pub fn current_topology(&self) -> PrimitiveTopology {
+        self.draw_manager.get_draw_state().topology
+    }
+
+    /// Upstream OpenGL owners read `maxwell3d->draw_manager->GetDrawState().topology`.
+    ///
+    /// The Rust tree still has a reduced `Maxwell3D`/`DrawManager` split, so
+    /// this accessor resolves the topology through the matching
+    /// `draw_manager.rs` owner logic instead of exposing another backend-local
+    /// reconstruction.
+    pub fn draw_manager_topology(&self) -> PrimitiveTopology {
+        self.draw_manager.get_draw_state().topology
+    }
+
+    /// Upstream `maxwell3d->regs.zeta_enable`.
+    pub fn zeta_enable(&self) -> bool {
+        self.regs[ZETA_ENABLE as usize] != 0
+    }
+
+    /// Upstream `maxwell3d->draw_manager->GetDrawState()`.
+    ///
+    /// The Rust runtime still lacks the literal live `DrawManager` owner
+    /// graph, so this returns the closest matching owner-local snapshot from
+    /// the current Maxwell register file.
+    pub fn draw_manager_state(&self) -> crate::engines::draw_manager::DrawState {
+        self.draw_manager.get_draw_state().clone()
+    }
+
+    /// Upstream reads `regs.mandated_early_z != 0` directly.
+    pub fn mandated_early_z(&self) -> bool {
+        self.regs[MANDATED_EARLY_Z as usize] != 0
+    }
+
+    /// Upstream reads `regs.tessellation.params.domain_type.Value()`.
+    pub fn tessellation_domain_type(&self) -> u32 {
+        self.regs[TESSELLATION_PARAMS as usize] & 0x3
+    }
+
+    /// Upstream reads `regs.tessellation.params.spacing.Value()`.
+    pub fn tessellation_spacing(&self) -> u32 {
+        (self.regs[TESSELLATION_PARAMS as usize] >> 4) & 0x3
+    }
+
+    /// Upstream compares `regs.tessellation.params.output_primitives` against `Triangles_CW`.
+    pub fn tessellation_clockwise(&self) -> bool {
+        ((self.regs[TESSELLATION_PARAMS as usize] >> 8) & 0x3) == 2
+    }
+
+    /// Upstream reads `regs.transform_feedback_enabled != 0` directly.
+    pub fn transform_feedback_enabled(&self) -> bool {
+        self.regs[TRANSFORM_FEEDBACK_ENABLED as usize] != 0
+    }
+
+    /// Port of the `SetXfbState(..., regs)` owner read inputs from upstream.
+    pub fn transform_feedback_state(&self) -> TransformFeedbackState {
+        let layouts = std::array::from_fn(|index| {
+            let base = (TRANSFORM_FEEDBACK_CONTROLS_BASE
+                + index as u32 * TRANSFORM_FEEDBACK_CONTROL_STRIDE) as usize;
+            TransformFeedbackLayout {
+                stream: self.regs[base],
+                varying_count: self.regs[base + 1],
+                stride: self.regs[base + 2],
+            }
+        });
+        let varyings = std::array::from_fn(|buffer| {
+            std::array::from_fn(|entry| {
+                StreamOutLayout::from_raw(
+                    self.regs[STREAM_OUT_LAYOUT_BASE as usize + buffer * 32 + entry],
+                )
+            })
+        });
+        TransformFeedbackState { layouts, varyings }
+    }
+
+    pub fn set_engine_state(&mut self, state: EngineHint) {
+        self.engine_state = state;
+    }
+
+    pub fn set_hle_replacement_attribute_type(
+        &mut self,
+        bank: u32,
+        offset: u32,
+        name: HleReplacementAttributeType,
+    ) {
+        let key = ((bank as u64) << 32) | offset as u64;
+        self.replace_table.insert(key, name);
+    }
+
+    pub fn get_replace_const_buffer(&self, bank: u32, offset: u32) -> Option<ReplaceConstant> {
+        let key = ((bank as u64) << 32) | offset as u64;
+        let value = self.replace_table.get(&key).copied()?;
+        Some(match value {
+            HleReplacementAttributeType::BaseVertex => ReplaceConstant::BaseVertex,
+            HleReplacementAttributeType::BaseInstance => ReplaceConstant::BaseInstance,
+            HleReplacementAttributeType::DrawId => ReplaceConstant::DrawID,
+        })
+    }
+
+    pub fn post_vtg_shader_attrib_skip_mask(&self) -> [u32; 8] {
+        let base = 0x1240 / 4;
+        let mut result = [0u32; 8];
+        result.copy_from_slice(&self.regs[base..base + 8]);
+        result
+    }
+
+    /// Upstream reads `regs.viewport_scale_offset_enabled` directly.
+    pub fn viewport_transform_state(&self) -> u32 {
+        self.regs[VIEWPORT_SCALE_OFFSET_ENABLED as usize]
+    }
+
+    /// Upstream reads `regs.bindless_texture_const_buffer_slot` directly.
+    pub fn bindless_texture_const_buffer_slot(&self) -> u32 {
+        self.regs[BINDLESS_TEXTURE_CONST_BUFFER_SLOT as usize]
+    }
+
+    /// Upstream reads `regs.sampler_binding` directly.
+    pub fn sampler_binding(&self) -> SamplerBinding {
+        if self.regs[SAMPLER_BINDING as usize] == SamplerBinding::ViaHeaderBinding as u32 {
+            SamplerBinding::ViaHeaderBinding
+        } else {
+            SamplerBinding::Independently
+        }
     }
 
     fn read_gpu_block(&self, addr: u64, output: &mut [u8]) -> bool {
@@ -2572,7 +2806,7 @@ impl Maxwell3D {
 
     /// Drain accumulated draw call records.
     pub fn take_draw_calls(&mut self) -> Vec<DrawCall> {
-        std::mem::take(&mut self.draw_calls)
+        self.with_draw_manager(|draw_manager, _| draw_manager.take_compat_draw_calls())
     }
 
     // ── Instance / base vertex accessors ─────────────────────────────────
@@ -2603,312 +2837,27 @@ impl Maxwell3D {
 
     // ── Side-effect handlers ─────────────────────────────────────────────
 
-    /// Handle clear_surface trigger.
-    ///
-    /// Bitfield:
-    /// - bit 0: clear Z (depth)
-    /// - bit 1: clear S (stencil)
-    /// - bit 2: clear R
-    /// - bit 3: clear G
-    /// - bit 4: clear B
-    /// - bit 5: clear A
-    /// - bits 6..9: RT index
-    fn handle_clear_surface(&mut self, flags: u32) {
-        let rt_index = ((flags >> 6) & 0xF) as usize;
-        let clear_r = flags & (1 << 2) != 0;
-        let clear_g = flags & (1 << 3) != 0;
-        let clear_b = flags & (1 << 4) != 0;
-        let clear_a = flags & (1 << 5) != 0;
-
-        if !clear_r && !clear_g && !clear_b && !clear_a {
-            // No color channels to clear (depth/stencil only) — skip for now.
-            log::trace!("Maxwell3D: clear_surface depth/stencil only, skipping");
-            return;
-        }
-
-        if rt_index >= 8 {
-            log::warn!("Maxwell3D: clear_surface invalid RT index {}", rt_index);
-            return;
-        }
-
-        let gpu_va = self.rt_address(rt_index);
-        let width = self.rt_width(rt_index);
-        let height = self.rt_height(rt_index);
-        let format = self.rt_format(rt_index);
-
-        if width == 0 || height == 0 || gpu_va == 0 {
-            log::trace!(
-                "Maxwell3D: clear_surface skipped (width={}, height={}, va=0x{:X})",
-                width,
-                height,
-                gpu_va
-            );
-            return;
-        }
-
-        let color = self.clear_color_rgba();
-
-        log::debug!(
-            "Maxwell3D: clear RT{} {}x{} fmt=0x{:X} color=[{:.3}, {:.3}, {:.3}, {:.3}] va=0x{:X}",
-            rt_index,
-            width,
-            height,
-            format,
-            color[0],
-            color[1],
-            color[2],
-            color[3],
-            gpu_va,
-        );
-
-        // Convert clear color to RGBA8 bytes based on format.
-        let pixel = format_clear_color(format, color, clear_r, clear_g, clear_b, clear_a);
-
-        // Fill framebuffer.
-        let pixel_count = (width as usize) * (height as usize);
-        let mut pixels = vec![0u8; pixel_count * 4];
-        for i in 0..pixel_count {
-            let off = i * 4;
-            pixels[off] = pixel[0];
-            pixels[off + 1] = pixel[1];
-            pixels[off + 2] = pixel[2];
-            pixels[off + 3] = pixel[3];
-        }
-
-        self.pending_framebuffer = Some(Framebuffer {
-            gpu_va,
-            width,
-            height,
-            pixels,
-        });
-    }
-
     /// Handle DRAW_BEGIN: captures topology and instance mode from value.
     fn handle_draw_begin(&mut self, value: u32) {
-        self.current_topology = PrimitiveTopology::from_raw(value);
-        let instance_id = InstanceId::from_raw(value);
-
-        log::debug!(
-            "Maxwell3D: DRAW_BEGIN topology={:?} instance_id={:?}",
-            self.current_topology,
-            instance_id,
-        );
-
-        match instance_id {
-            InstanceId::First => {
-                // Flush any pending instanced draw before resetting.
-                if self.draw_mode == DrawMode::Instance && self.instance_count > 0 {
-                    self.flush_deferred_draw();
-                }
-                self.instance_count = 0;
-                self.draw_mode = DrawMode::General;
-            }
-            InstanceId::Subsequent => {
-                self.instance_count += 1;
-                self.draw_mode = DrawMode::Instance;
-            }
-            InstanceId::Unchanged => {}
-        }
+        self.regs[DRAW_BEGIN as usize] = value;
+        self.with_draw_manager(|draw_manager, this| {
+            draw_manager.draw_begin(this);
+        });
     }
 
     /// Handle DRAW_END: behaviour depends on current draw mode.
     fn handle_draw_end(&mut self) {
-        match self.draw_mode {
-            DrawMode::General => {
-                let draw = self.build_draw_call(1, Vec::new());
-                log::debug!(
-                    "Maxwell3D: DRAW_END {:?} verts={}/{} indexed={} streams={}",
-                    draw.topology,
-                    draw.vertex_first,
-                    draw.vertex_count,
-                    draw.indexed,
-                    draw.vertex_streams.len(),
-                );
-                self.draw_calls.push(draw);
-                self.dispatch_draw_to_rasterizer(false, 1);
-            }
-            DrawMode::Instance => {
-                // Upstream DrawManager::DrawEnd does nothing for instance mode unless forced
-                // through DrawDeferred().
-            }
-            DrawMode::InlineIndex => {
-                let inline_data = std::mem::take(&mut self.inline_index_data);
-                let mut draw = self.build_draw_call(1, inline_data);
-                // Override index fields for inline index draws.
-                draw.indexed = true;
-                draw.index_format = IndexFormat::UnsignedInt;
-                draw.index_buffer_count = draw.inline_index_data.len() as u32 / 4;
-                log::debug!(
-                    "Maxwell3D: DRAW_END InlineIndex {:?} indices={}",
-                    draw.topology,
-                    draw.index_buffer_count,
-                );
-                self.draw_calls.push(draw);
-                self.dispatch_draw_to_rasterizer(true, 1);
-                self.draw_mode = DrawMode::General;
-            }
-        }
-    }
-
-    /// Build a `DrawState` snapshot from the current Maxwell3D registers
-    /// and forward it to the bound rasterizer via the upstream-parity
-    /// `RasterizerInterface::draw` entry point.
-    ///
-    /// Mirrors the `DrawManager::ProcessDraw → rasterizer->Draw` path that
-    /// upstream takes inside `Maxwell3D` when a draw method is hit. The
-    /// legacy `draw_calls` queue is preserved alongside this call so the
-    /// software rasterizer (still consumed by `GpuContext::flush_entries`)
-    /// keeps working until the OpenGL pipeline cache produces real GL
-    /// programs (gaps 4–5).
-    fn dispatch_draw_to_rasterizer(&mut self, is_indexed: bool, instance_count: u32) {
-        let draw_state = self.build_draw_state(is_indexed, instance_count);
-        let _ = self.with_rasterizer_mut(|rasterizer| {
-            rasterizer.draw(&draw_state, instance_count);
+        self.with_draw_manager(|draw_manager, this| {
+            draw_manager.draw_end(1, false, this);
         });
-    }
-
-    /// Build a `DrawState` reflecting the current Maxwell3D register file.
-    fn build_draw_state(
-        &self,
-        is_indexed: bool,
-        instance_count: u32,
-    ) -> crate::engines::draw_manager::DrawState {
-        use crate::engines::draw_manager as dm;
-        crate::engines::draw_manager::DrawState {
-            topology: self.current_topology,
-            draw_mode: match self.draw_mode {
-                DrawMode::General => dm::DrawMode::General,
-                DrawMode::Instance => dm::DrawMode::Instance,
-                DrawMode::InlineIndex => dm::DrawMode::InlineIndex,
-            },
-            draw_indexed: is_indexed,
-            base_index: self.base_vertex() as u32,
-            vertex_buffer: dm::VertexBuffer {
-                first: self.regs[VB_FIRST as usize],
-                count: self.regs[VB_COUNT as usize],
-            },
-            index_buffer: dm::IndexBuffer {
-                first: self.index_buffer_first(),
-                count: self.index_buffer_count(),
-                format: self.index_buffer_format(),
-            },
-            base_instance: self.base_instance(),
-            instance_count,
-            inline_index_draw_indexes: Vec::new(),
-            shader_program_addresses: self.shader_program_addresses(),
-            index_buffer_gpu_addr: self.index_buffer_addr(),
-            index_buffer_gpu_addr_end: {
-                let base = IB_BASE as usize;
-                let high = self.regs[base + IB_OFF_LIMIT_HIGH as usize] as u64;
-                let low = self.regs[base + IB_OFF_LIMIT_LOW as usize] as u64;
-                (high << 32) | low
-            },
-        }
     }
 
     /// Flush a deferred instanced draw batch. Called when a new First
     /// instance_id is seen or when take_draw_calls needs to finalize.
     fn flush_deferred_draw(&mut self) {
-        let count = self.instance_count + 1;
-        let draw = self.build_draw_call(count, Vec::new());
-        log::debug!(
-            "Maxwell3D: flush_deferred_draw {:?} instance_count={}",
-            draw.topology,
-            count,
-        );
-        self.draw_calls.push(draw);
-        self.dispatch_draw_to_rasterizer(false, count);
-        self.instance_count = 0;
-        self.draw_mode = DrawMode::General;
-    }
-
-    /// Build a DrawCall from current register state with the given instance
-    /// count and optional inline index data.
-    fn build_draw_call(&self, instance_count: u32, inline_index_data: Vec<u8>) -> DrawCall {
-        // Collect active vertex streams (scan all 32 slots).
-        let mut vertex_streams = Vec::new();
-        for i in 0..32 {
-            let info = self.vertex_stream_info(i);
-            if info.enabled {
-                vertex_streams.push(info);
-            }
-        }
-
-        // Collect active vertex attributes (non-zero raw word only).
-        let mut vertex_attribs = Vec::new();
-        for i in 0..NUM_VERTEX_ATTRIBS {
-            let raw = self.regs[(VERTEX_ATTRIB_BASE + i) as usize];
-            if raw != 0 {
-                vertex_attribs.push(self.vertex_attrib_info(i));
-            }
-        }
-
-        // Collect all 6 shader stages.
-        let mut shader_stages = [ShaderStageInfo::default(); NUM_SHADER_PROGRAMS];
-        for (i, stage) in shader_stages.iter_mut().enumerate() {
-            *stage = self.shader_stage_info(i as u32);
-        }
-
-        // Collect color masks for all 8 render targets.
-        let mut color_masks = [ColorMaskInfo::default(); 8];
-        for (i, mask) in color_masks.iter_mut().enumerate() {
-            *mask = self.color_mask_info(i);
-        }
-
-        // Collect render target control.
-        let rt_control = self.rt_control_info();
-
-        // Collect render target configurations.
-        let render_targets: [RenderTargetInfo; 8] = std::array::from_fn(|i| RenderTargetInfo {
-            address: self.rt_address(i),
-            width: self.rt_width(i),
-            height: self.rt_height(i),
-            format: self.rt_format(i),
+        self.with_draw_manager(|draw_manager, this| {
+            draw_manager.draw_deferred(this);
         });
-
-        // Collect blend info for all 8 render targets.
-        let mut blend = [BlendInfo::default(); 8];
-        for (i, b) in blend.iter_mut().enumerate() {
-            *b = self.effective_blend_info(i);
-        }
-
-        DrawCall {
-            topology: self.current_topology,
-            vertex_first: self.regs[VB_FIRST as usize],
-            vertex_count: self.regs[VB_COUNT as usize],
-            indexed: self.draw_indexed,
-            index_buffer_addr: self.index_buffer_addr(),
-            index_buffer_count: self.index_buffer_count(),
-            index_buffer_first: self.index_buffer_first(),
-            index_format: self.index_buffer_format(),
-            vertex_streams,
-            viewports: std::array::from_fn(|i| self.viewport_info(i as u32)),
-            scissors: std::array::from_fn(|i| self.scissor_info(i as u32)),
-            blend,
-            blend_color: self.blend_color_info(),
-            depth_stencil: self.depth_stencil_info(),
-            rasterizer: self.rasterizer_info(),
-            program_base_address: self.program_base_address(),
-            cb_bindings: self.cb_bindings,
-            vertex_attribs,
-            shader_stages,
-            color_masks,
-            rt_control,
-            tex_header_pool_addr: self.tex_header_pool_address(),
-            tex_header_pool_limit: self.tex_header_pool_limit(),
-            tex_sampler_pool_addr: self.tex_sampler_pool_address(),
-            tex_sampler_pool_limit: self.tex_sampler_pool_limit(),
-            instance_count,
-            base_instance: self.base_instance(),
-            base_vertex: self.base_vertex(),
-            inline_index_data,
-            sampler_binding: if self.regs[SAMPLER_BINDING as usize] == 1 {
-                SamplerBinding::ViaHeaderBinding
-            } else {
-                SamplerBinding::Independently
-            },
-            render_targets,
-        }
     }
 
     /// Handle report semaphore trigger (write to REPORT_SEMAPHORE_BASE + 3).
@@ -2986,62 +2935,242 @@ impl RenderConditionStateSource for Maxwell3D {
     }
 }
 
-/// Convert clear color f32s to 4 bytes based on render target format.
-///
-/// For formats where only certain channels are being cleared, uncleared
-/// channels default to 0 (since we're generating a full framebuffer fill,
-/// the partial clear only matters if we were compositing with existing data).
-fn format_clear_color(
-    format: u32,
-    color: [f32; 4],
-    clear_r: bool,
-    clear_g: bool,
-    clear_b: bool,
-    clear_a: bool,
-) -> [u8; 4] {
-    let r = if clear_r {
-        (color[0].clamp(0.0, 1.0) * 255.0) as u8
-    } else {
-        0
-    };
-    let g = if clear_g {
-        (color[1].clamp(0.0, 1.0) * 255.0) as u8
-    } else {
-        0
-    };
-    let b = if clear_b {
-        (color[2].clamp(0.0, 1.0) * 255.0) as u8
-    } else {
-        0
-    };
-    let a = if clear_a {
-        (color[3].clamp(0.0, 1.0) * 255.0) as u8
-    } else {
-        0
-    };
-
-    match format {
-        // A8B8G8R8: memory layout is [R, G, B, A] when read as bytes in LE.
-        RT_FORMAT_A8B8G8R8_UNORM | RT_FORMAT_A8B8G8R8_SRGB => [r, g, b, a],
-        // R8: single-channel 8-bit
-        RT_FORMAT_R8_UNORM => [r, 0, 0, 255],
-        // B5G6R5: 16-bit packed, convert to RGBA8
-        RT_FORMAT_B5G6R5_UNORM => [r, g, b, 255],
-        // All other formats: default to RGBA8 layout (float/HDR formats are
-        // quantized to 8-bit for the internal framebuffer representation).
-        _ => {
-            log::trace!(
-                "Maxwell3D: RT format 0x{:X}, using RGBA8 layout for clear",
-                format
-            );
-            [r, g, b, a]
-        }
-    }
-}
-
 impl Default for Maxwell3D {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl dm::Maxwell3DAccess for Maxwell3D {
+    fn should_execute(&self) -> bool {
+        self.should_execute()
+    }
+
+    fn global_base_instance_index(&self) -> u32 {
+        self.base_instance()
+    }
+
+    fn global_base_vertex_index(&self) -> u32 {
+        self.base_vertex() as u32
+    }
+
+    fn index_buffer(&self) -> dm::IndexBuffer {
+        dm::IndexBuffer {
+            first: self.index_buffer_first(),
+            count: self.index_buffer_count(),
+            format: self.index_buffer_format(),
+        }
+    }
+
+    fn vertex_buffer(&self) -> dm::VertexBuffer {
+        dm::VertexBuffer {
+            first: self.regs[VB_FIRST as usize],
+            count: self.regs[VB_COUNT as usize],
+        }
+    }
+
+    fn primitive_topology_control(&self) -> dm::PrimitiveTopologyControl {
+        dm::PrimitiveTopologyControl::from_raw(self.regs[PRIMITIVE_TOPOLOGY_CONTROL as usize])
+    }
+
+    fn topology_override(&self) -> dm::PrimitiveTopologyOverride {
+        dm::PrimitiveTopologyOverride::from_raw(self.regs[TOPOLOGY_OVERRIDE as usize])
+    }
+
+    fn topology_override_raw(&self) -> u32 {
+        self.regs[TOPOLOGY_OVERRIDE as usize]
+    }
+
+    fn draw_topology(&self) -> PrimitiveTopology {
+        PrimitiveTopology::from_raw(self.regs[DRAW_BEGIN as usize])
+    }
+
+    fn draw_instance_id(&self) -> (bool, bool) {
+        let instance_id = InstanceId::from_raw(self.regs[DRAW_BEGIN as usize]);
+        (
+            instance_id == InstanceId::First,
+            instance_id == InstanceId::Subsequent,
+        )
+    }
+
+    fn inline_index_2x16_values(&self) -> (u32, u32) {
+        let raw = self.regs[INLINE_INDEX_2X16_EVEN as usize];
+        (raw & 0xFFFF, (raw >> 16) & 0xFFFF)
+    }
+
+    fn inline_index_4x8_values(&self) -> [u32; 4] {
+        let raw = self.regs[INLINE_INDEX_4X8_INDEX0 as usize];
+        [
+            raw & 0xFF,
+            (raw >> 8) & 0xFF,
+            (raw >> 16) & 0xFF,
+            (raw >> 24) & 0xFF,
+        ]
+    }
+
+    fn vertex_array_instance_first_params(&self, argument: u32) -> (PrimitiveTopology, u32, u32) {
+        let params = VertexArrayParams::from_raw(argument);
+        (params.topology, params.start, params.count)
+    }
+
+    fn vertex_array_instance_subsequent_params(
+        &self,
+        argument: u32,
+    ) -> (PrimitiveTopology, u32, u32) {
+        let params = VertexArrayParams::from_raw(argument);
+        (params.topology, params.start, params.count)
+    }
+
+    fn set_dirty_flag(&mut self, index: u8) {
+        self.dirty.flags[index as usize] = true;
+        self.interface_state.current_dirty = true;
+    }
+
+    fn rasterizer_mut(&mut self) -> Option<&mut dyn RasterizerInterface> {
+        let raw = self.rasterizer?;
+        let rasterizer =
+            unsafe { &mut *std::mem::transmute::<[usize; 2], *mut dyn RasterizerInterface>(raw) };
+        Some(rasterizer)
+    }
+
+    fn shader_program_addresses(&self) -> [u64; 6] {
+        self.shader_program_addresses()
+    }
+
+    fn index_buffer_addr(&self) -> u64 {
+        self.index_buffer_addr()
+    }
+
+    fn draw_texture_params(&self) -> dm::DrawTextureParams {
+        let base = DRAW_TEXTURE_BASE as usize;
+        let dx_du = ((self.regs[base + DRAW_TEXTURE_DX_DU_HIGH_OFFSET] as u64) << 32)
+            | self.regs[base + DRAW_TEXTURE_DX_DU_LOW_OFFSET] as u64;
+        let dy_dv = ((self.regs[base + DRAW_TEXTURE_DY_DV_HIGH_OFFSET] as u64) << 32)
+            | self.regs[base + DRAW_TEXTURE_DY_DV_LOW_OFFSET] as u64;
+        dm::DrawTextureParams {
+            dst_x0: self.regs[base + DRAW_TEXTURE_DST_X0_OFFSET] as i32,
+            dst_y0: self.regs[base + DRAW_TEXTURE_DST_Y0_OFFSET] as i32,
+            dst_width: self.regs[base + DRAW_TEXTURE_DST_WIDTH_OFFSET] as i32,
+            dst_height: self.regs[base + DRAW_TEXTURE_DST_HEIGHT_OFFSET] as i32,
+            dx_du: dx_du as i64,
+            dy_dv: dy_dv as i64,
+            src_sampler: self.regs[base + DRAW_TEXTURE_SRC_SAMPLER_OFFSET],
+            src_texture: self.regs[base + DRAW_TEXTURE_SRC_TEXTURE_OFFSET],
+            src_x0: self.regs[base + DRAW_TEXTURE_SRC_X0_OFFSET] as i32,
+            src_y0: self.regs[base + DRAW_TEXTURE_SRC_Y0_OFFSET] as i32,
+        }
+    }
+
+    fn window_origin_lower_left(&self) -> bool {
+        (self.regs[WINDOW_ORIGIN as usize] & 1) != 0
+    }
+
+    fn surface_clip_height(&self) -> u32 {
+        (self.regs[SURFACE_CLIP_BASE as usize + SURFACE_CLIP_HEIGHT_OFFSET] >> 16) & 0xFFFF
+    }
+
+    fn clear_surface_flags(&self) -> u32 {
+        self.regs[CLEAR_SURFACE as usize]
+    }
+
+    fn rt_address(&self, index: usize) -> u64 {
+        self.rt_address(index)
+    }
+
+    fn rt_width(&self, index: usize) -> u32 {
+        self.rt_width(index)
+    }
+
+    fn rt_height(&self, index: usize) -> u32 {
+        self.rt_height(index)
+    }
+
+    fn rt_format(&self, index: usize) -> u32 {
+        self.rt_format(index)
+    }
+
+    fn clear_color_rgba(&self) -> [f32; 4] {
+        self.clear_color_rgba()
+    }
+
+    fn vertex_stream_info(&self, index: u32) -> VertexStreamInfo {
+        self.vertex_stream_info(index)
+    }
+
+    fn viewport_info(&self, index: u32) -> ViewportInfo {
+        self.viewport_info(index)
+    }
+
+    fn scissor_info(&self, index: u32) -> ScissorInfo {
+        self.scissor_info(index)
+    }
+
+    fn effective_blend_info(&self, rt: usize) -> BlendInfo {
+        self.effective_blend_info(rt)
+    }
+
+    fn blend_color_info(&self) -> BlendColorInfo {
+        self.blend_color_info()
+    }
+
+    fn depth_stencil_info(&self) -> DepthStencilInfo {
+        self.depth_stencil_info()
+    }
+
+    fn rasterizer_info(&self) -> RasterizerInfo {
+        self.rasterizer_info()
+    }
+
+    fn program_base_address(&self) -> u64 {
+        self.program_base_address()
+    }
+
+    fn const_buffer_binding(&self, stage: usize, slot: usize) -> ConstBufferBinding {
+        self.cb_bindings[stage][slot]
+    }
+
+    fn vertex_attrib_info(&self, index: u32) -> VertexAttribInfo {
+        self.vertex_attrib_info(index)
+    }
+
+    fn shader_stage_info(&self, index: u32) -> ShaderStageInfo {
+        self.shader_stage_info(index)
+    }
+
+    fn color_mask_info(&self, rt: usize) -> ColorMaskInfo {
+        self.color_mask_info(rt)
+    }
+
+    fn rt_control_info(&self) -> RtControlInfo {
+        self.rt_control_info()
+    }
+
+    fn tex_header_pool_address(&self) -> u64 {
+        self.tex_header_pool_address()
+    }
+
+    fn tex_header_pool_limit(&self) -> u32 {
+        self.tex_header_pool_limit()
+    }
+
+    fn tex_sampler_pool_address(&self) -> u64 {
+        self.tex_sampler_pool_address()
+    }
+
+    fn tex_sampler_pool_limit(&self) -> u32 {
+        self.tex_sampler_pool_limit()
+    }
+
+    fn sampler_binding(&self) -> SamplerBinding {
+        if self.regs[SAMPLER_BINDING as usize] == 1 {
+            SamplerBinding::ViaHeaderBinding
+        } else {
+            SamplerBinding::Independently
+        }
+    }
+
+    fn set_pending_framebuffer(&mut self, framebuffer: crate::engines::Framebuffer) {
+        self.pending_framebuffer = Some(framebuffer);
     }
 }
 
@@ -3103,14 +3232,18 @@ impl Maxwell3D {
     /// `Maxwell3D::ProcessDirtyRegisters`.
     fn process_dirty_registers(&mut self, method: u32, argument: u32) {
         let idx = method as usize;
-        if idx < ENGINE_REG_COUNT {
-            if self.regs[idx] == argument {
-                return;
-            }
-            self.regs[idx] = argument;
+        if idx >= ENGINE_REG_COUNT || self.regs[idx] == argument {
+            return;
         }
-        // In the full implementation, this would update dirty flag tables.
-        // For now, all registers are implicitly dirty on change.
+
+        self.regs[idx] = argument;
+
+        for table in &self.dirty.tables {
+            let dirty_index = table[idx] as usize;
+            if dirty_index < self.dirty.flags.len() {
+                self.dirty.flags[dirty_index] = true;
+            }
+        }
     }
 
     // ── Method call dispatch (matching upstream ProcessMethodCall) ───────
@@ -3205,116 +3338,11 @@ impl Maxwell3D {
                 let _ = self.with_rasterizer_mut(|rasterizer| rasterizer.tiled_cache_barrier());
             }
             _ => {
-                // Delegate to draw manager equivalent.
-                self.process_draw_method_call(method, argument);
+                self.with_draw_manager(|draw_manager, this| {
+                    draw_manager.process_method_call(method, argument, this);
+                });
             }
         }
-    }
-
-    /// Handle draw-related method calls. Matches the upstream
-    /// `DrawManager::ProcessMethodCall` dispatch.
-    fn process_draw_method_call(&mut self, method: u32, argument: u32) {
-        match method {
-            CLEAR_SURFACE => {
-                self.handle_clear_surface(argument);
-            }
-            DRAW_BEGIN => {
-                self.handle_draw_begin(argument);
-            }
-            DRAW_END => {
-                self.handle_draw_end();
-            }
-            VB_FIRST | VB_COUNT => {
-                // Values already written to regs by process_dirty_registers.
-            }
-            m if m == IB_BASE + IB_OFF_FIRST => {
-                // Value already written to regs.
-            }
-            m if m == IB_BASE + IB_OFF_COUNT => {
-                self.draw_indexed = true;
-            }
-            INDEX_BUFFER32_SUBSEQUENT | INDEX_BUFFER16_SUBSEQUENT | INDEX_BUFFER8_SUBSEQUENT => {
-                self.instance_count += 1;
-                self.draw_index_small(argument);
-            }
-            INDEX_BUFFER32_FIRST | INDEX_BUFFER16_FIRST | INDEX_BUFFER8_FIRST => {
-                self.draw_index_small(argument);
-            }
-            DRAW_INLINE_INDEX => {
-                self.inline_index_data
-                    .extend_from_slice(&argument.to_le_bytes());
-                self.draw_mode = DrawMode::InlineIndex;
-            }
-            INLINE_INDEX_2X16_EVEN => {
-                let even = self.regs[INLINE_INDEX_2X16_EVEN as usize] & 0xFFFF;
-                let odd = (self.regs[INLINE_INDEX_2X16_EVEN as usize] >> 16) & 0xFFFF;
-                self.inline_index_data
-                    .extend_from_slice(&even.to_le_bytes());
-                self.inline_index_data.extend_from_slice(&odd.to_le_bytes());
-                self.draw_mode = DrawMode::InlineIndex;
-            }
-            INLINE_INDEX_4X8_INDEX0 => {
-                let raw = self.regs[INLINE_INDEX_4X8_INDEX0 as usize];
-                for shift in [0, 8, 16, 24] {
-                    let idx = (raw >> shift) & 0xFF;
-                    self.inline_index_data.extend_from_slice(&idx.to_le_bytes());
-                }
-                self.draw_mode = DrawMode::InlineIndex;
-            }
-            VERTEX_ARRAY_INSTANCE_FIRST => {
-                self.draw_array_instanced(argument, false);
-            }
-            VERTEX_ARRAY_INSTANCE_SUBSEQUENT => {
-                self.draw_array_instanced(argument, true);
-            }
-            DRAW_TEXTURE_SRC_Y0 => {
-                self.draw_texture();
-            }
-            TOPOLOGY_OVERRIDE => {
-                // Value written to regs; topology override handled during draw.
-            }
-            _ => {}
-        }
-    }
-
-    /// Handle small indexed draw (index_buffer{32,16,8}_{first,subsequent}).
-    fn draw_index_small(&mut self, argument: u32) {
-        let params = IndexBufferSmallParams::from_raw(argument);
-        let mut draw = self.build_draw_call(1, Vec::new());
-        draw.topology = params.topology;
-        draw.indexed = true;
-        draw.index_buffer_first = params.first;
-        draw.index_buffer_count = params.count;
-        self.draw_calls.push(draw);
-        self.dispatch_draw_to_rasterizer(true, 1);
-    }
-
-    /// Handle `vertex_array_instance_{first,subsequent}` immediate instanced draws.
-    fn draw_array_instanced(&mut self, argument: u32, subsequent: bool) {
-        let params = VertexArrayParams::from_raw(argument);
-        self.current_topology = params.topology;
-        self.draw_mode = DrawMode::Instance;
-        if !subsequent {
-            self.instance_count = 1;
-        }
-
-        let mut draw = self.build_draw_call(1, Vec::new());
-        draw.topology = params.topology;
-        draw.indexed = false;
-        draw.vertex_first = params.start;
-        draw.vertex_count = params.count;
-        draw.base_instance = self.instance_count.saturating_sub(1);
-        self.instance_count += 1;
-        self.draw_calls.push(draw);
-        // Note: instance_count was just incremented; the dispatch reflects
-        // the *current* (post-increment) instance count, mirroring how
-        // upstream `DrawManager::DrawIndex` reads the live register state.
-        self.dispatch_draw_to_rasterizer(false, self.instance_count);
-    }
-
-    /// Handle draw-texture trigger.
-    fn draw_texture(&mut self) {
-        let _ = self.with_rasterizer_mut(|rasterizer| rasterizer.draw_texture());
     }
 
     // ── Upstream ProcessCBData / ProcessCBMultiData / ProcessCBBind ──────
@@ -3725,10 +3753,9 @@ impl Maxwell3D {
         );
 
         // Upstream calls draw_manager->DrawDeferred() here.
-        // Flush any deferred instanced draw.
-        if self.draw_mode == DrawMode::Instance && self.instance_count > 0 {
-            self.flush_deferred_draw();
-        }
+        self.with_draw_manager(|draw_manager, this| {
+            draw_manager.draw_deferred(this);
+        });
 
         self.macro_params.clear();
         self.macro_addresses.clear();
@@ -3774,25 +3801,35 @@ impl Maxwell3D {
     /// Process a method write: store to register array and handle side effects.
     /// This is the shared implementation used by `MacroProcessor::macro_write`.
     fn process_method(&mut self, method: u32, value: u32) {
-        let idx = method as usize;
-        if idx < ENGINE_REG_COUNT {
-            self.regs[idx] = value;
-        }
-
-        // Track draw_indexed flag when IB count register is written.
-        if method == IB_BASE + IB_OFF_COUNT && value > 0 {
-            self.draw_indexed = true;
-        }
+        self.process_dirty_registers(method, value);
 
         // Detect side-effect triggers.
         match method {
-            CLEAR_SURFACE => self.handle_clear_surface(value),
-            DRAW_BEGIN => self.handle_draw_begin(value),
-            DRAW_END => self.handle_draw_end(),
-            DRAW_INLINE_INDEX => {
-                self.inline_index_data
-                    .extend_from_slice(&value.to_le_bytes());
-                self.draw_mode = DrawMode::InlineIndex;
+            CLEAR_SURFACE | DRAW_BEGIN | DRAW_END | VB_FIRST | VB_COUNT => {
+                self.with_draw_manager(|draw_manager, this| {
+                    draw_manager.process_method_call(method, value, this);
+                });
+            }
+            m if m == IB_BASE + IB_OFF_FIRST || m == IB_BASE + IB_OFF_COUNT => {
+                self.with_draw_manager(|draw_manager, this| {
+                    draw_manager.process_method_call(method, value, this);
+                });
+            }
+            INDEX_BUFFER32_SUBSEQUENT
+            | INDEX_BUFFER16_SUBSEQUENT
+            | INDEX_BUFFER8_SUBSEQUENT
+            | INDEX_BUFFER32_FIRST
+            | INDEX_BUFFER16_FIRST
+            | INDEX_BUFFER8_FIRST
+            | DRAW_INLINE_INDEX
+            | INLINE_INDEX_2X16_EVEN
+            | INLINE_INDEX_4X8_INDEX0
+            | VERTEX_ARRAY_INSTANCE_FIRST
+            | VERTEX_ARRAY_INSTANCE_SUBSEQUENT
+            | DRAW_TEXTURE_SRC_Y0 => {
+                self.with_draw_manager(|draw_manager, this| {
+                    draw_manager.process_method_call(method, value, this);
+                });
             }
             REPORT_SEMAPHORE_TRIGGER => self.handle_report_semaphore(value),
             m if m >= CB_DATA_BASE && m < CB_DATA_END => self.handle_cb_data(value),
@@ -4007,6 +4044,7 @@ mod tests {
     struct RasterizerCalls {
         wait_for_idle: u32,
         draw_texture: u32,
+        clear_layers: Vec<u32>,
         signal_sync_point: Vec<u32>,
         reset_counter: Vec<u32>,
         query_writes: Vec<(u64, Vec<u8>)>,
@@ -4043,7 +4081,9 @@ mod tests {
         fn draw_texture(&mut self) {
             self.calls.lock().unwrap().draw_texture += 1;
         }
-        fn clear(&mut self, _layer_count: u32) {}
+        fn clear(&mut self, layer_count: u32) {
+            self.calls.lock().unwrap().clear_layers.push(layer_count);
+        }
         fn dispatch_compute(&mut self) {}
         fn reset_counter(&mut self, query_type: u32) {
             self.calls.lock().unwrap().reset_counter.push(query_type);
@@ -4217,7 +4257,7 @@ mod tests {
 
         // Trigger clear: clear RGBA on RT0 (bits 2-5 set, RT index 0).
         let flags = (1 << 2) | (1 << 3) | (1 << 4) | (1 << 5); // R|G|B|A
-        engine.handle_clear_surface(flags);
+        engine.call_method(CLEAR_SURFACE, flags, true);
 
         let fb = engine
             .take_framebuffer()
@@ -4234,11 +4274,43 @@ mod tests {
     }
 
     #[test]
+    fn test_call_method_clear_surface_routes_via_draw_manager_clear_owner() {
+        let mut engine = Maxwell3D::new();
+        let calls = Arc::new(Mutex::new(RasterizerCalls::default()));
+        let rasterizer = TestRasterizer::new(calls.clone());
+        engine.bind_rasterizer(&rasterizer);
+
+        let rt0_base = RT_BASE as usize;
+        engine.regs[rt0_base + RT_OFF_ADDRESS_HIGH as usize] = 0;
+        engine.regs[rt0_base + RT_OFF_ADDRESS_LOW as usize] = 0x1000;
+        engine.regs[rt0_base + RT_OFF_WIDTH as usize] = 4;
+        engine.regs[rt0_base + RT_OFF_HEIGHT as usize] = 2;
+        engine.regs[rt0_base + RT_OFF_FORMAT as usize] = RT_FORMAT_A8B8G8R8_UNORM;
+
+        let base = CLEAR_COLOR_BASE as usize;
+        engine.regs[base] = f32::to_bits(1.0);
+        engine.regs[base + 1] = f32::to_bits(0.0);
+        engine.regs[base + 2] = f32::to_bits(0.0);
+        engine.regs[base + 3] = f32::to_bits(1.0);
+
+        let flags = (1 << 2) | (1 << 3) | (1 << 4) | (1 << 5);
+        engine.call_method(CLEAR_SURFACE, flags, true);
+
+        assert_eq!(calls.lock().unwrap().clear_layers, vec![1]);
+        let fb = engine
+            .take_framebuffer()
+            .expect("DrawManager::clear should preserve the local framebuffer clear path");
+        assert_eq!(fb.gpu_va, 0x1000);
+        assert_eq!(fb.width, 4);
+        assert_eq!(fb.height, 2);
+    }
+
+    #[test]
     fn test_clear_with_zero_dimensions_skipped() {
         let mut engine = Maxwell3D::new();
         // RT0 has zero width/height — clear should not produce framebuffer.
         let flags = (1 << 2) | (1 << 3) | (1 << 4) | (1 << 5);
-        engine.handle_clear_surface(flags);
+        engine.call_method(CLEAR_SURFACE, flags, true);
         assert!(engine.take_framebuffer().is_none());
     }
 
@@ -4252,7 +4324,7 @@ mod tests {
         engine.regs[rt0_base + RT_OFF_FORMAT as usize] = RT_FORMAT_A8B8G8R8_UNORM;
 
         // Only depth clear (bit 0), no color channels.
-        engine.handle_clear_surface(1);
+        engine.call_method(CLEAR_SURFACE, 1, true);
         assert!(engine.take_framebuffer().is_none());
     }
 
@@ -4263,7 +4335,7 @@ mod tests {
         engine.handle_draw_begin(0x0004); // Triangles
         engine.handle_draw_end();
         assert!(engine.take_framebuffer().is_none());
-        assert_eq!(engine.draw_calls.len(), 1);
+        assert_eq!(engine.take_draw_calls().len(), 1);
     }
 
     #[test]
@@ -4282,7 +4354,7 @@ mod tests {
         engine.regs[base + 3] = f32::to_bits(1.0);
 
         let flags = (1 << 2) | (1 << 3) | (1 << 4) | (1 << 5);
-        engine.handle_clear_surface(flags);
+        engine.call_method(CLEAR_SURFACE, flags, true);
 
         assert!(engine.take_framebuffer().is_some());
         // Second take should return None.
@@ -4420,10 +4492,10 @@ mod tests {
     fn test_draw_begin_sets_topology() {
         let mut engine = Maxwell3D::new();
         engine.handle_draw_begin(4); // Triangles
-        assert_eq!(engine.current_topology, PrimitiveTopology::Triangles);
+        assert_eq!(engine.current_topology(), PrimitiveTopology::Triangles);
 
         engine.handle_draw_begin(1); // Lines
-        assert_eq!(engine.current_topology, PrimitiveTopology::Lines);
+        assert_eq!(engine.current_topology(), PrimitiveTopology::Lines);
     }
 
     #[test]
@@ -5754,8 +5826,26 @@ mod tests {
         // Topology = TriangleStrip(5), instance_id = Subsequent (bits[27:26]=1).
         let value = 5 | (1 << 26);
         engine.handle_draw_begin(value);
-        assert_eq!(engine.current_topology, PrimitiveTopology::TriangleStrip);
-        assert_eq!(engine.draw_mode, DrawMode::Instance);
+        let draw_state = engine.draw_manager_state();
+        assert_eq!(draw_state.topology, PrimitiveTopology::TriangleStrip);
+        assert_eq!(draw_state.draw_mode, dm::DrawMode::Instance);
+    }
+
+    #[test]
+    fn test_draw_manager_state_tracks_live_draw_owner() {
+        let mut engine = Maxwell3D::new();
+        let subsequent = PrimitiveTopology::TriangleStrip as u32 | (1 << 26);
+        engine.write_reg(DRAW_BEGIN, subsequent);
+        engine.write_reg(DRAW_INLINE_INDEX, 0x4433_2211);
+
+        let draw_state = engine.draw_manager_state();
+        assert_eq!(draw_state.topology, PrimitiveTopology::TriangleStrip);
+        assert_eq!(draw_state.draw_mode, dm::DrawMode::InlineIndex);
+        assert_eq!(draw_state.instance_count, 1);
+        assert_eq!(
+            draw_state.inline_index_draw_indexes,
+            0x4433_2211u32.to_le_bytes()
+        );
     }
 
     #[test]
@@ -5783,7 +5873,7 @@ mod tests {
 
         let draws = engine.take_draw_calls();
         assert!(draws.is_empty());
-        assert_eq!(engine.instance_count, 3);
+        assert_eq!(engine.draw_manager_state().instance_count, 3);
     }
 
     #[test]
@@ -5815,7 +5905,7 @@ mod tests {
             engine.write_reg(DRAW_BEGIN, subsequent);
             engine.write_reg(DRAW_END, 0);
         }
-        assert_eq!(engine.instance_count, 2);
+        assert_eq!(engine.draw_manager_state().instance_count, 2);
 
         // Flush via First.
         engine.write_reg(DRAW_BEGIN, 4);
@@ -5860,8 +5950,9 @@ mod tests {
         engine.write_reg(DRAW_INLINE_INDEX, 0x0000_0001);
         engine.write_reg(DRAW_INLINE_INDEX, 0x0000_0002);
 
-        assert_eq!(engine.inline_index_data.len(), 8);
-        assert_eq!(engine.draw_mode, DrawMode::InlineIndex);
+        let draw_state = engine.draw_manager_state();
+        assert_eq!(draw_state.inline_index_draw_indexes.len(), 8);
+        assert_eq!(draw_state.draw_mode, dm::DrawMode::InlineIndex);
     }
 
     #[test]
@@ -5889,17 +5980,23 @@ mod tests {
         engine.write_reg(DRAW_END, 0);
 
         // After draw, inline buffer should be empty.
-        assert!(engine.inline_index_data.is_empty());
+        assert!(engine
+            .draw_manager_state()
+            .inline_index_draw_indexes
+            .is_empty());
     }
 
     #[test]
-    fn test_inline_index_resets_to_general() {
+    fn test_inline_index_keeps_draw_mode_owned_by_draw_manager() {
         let mut engine = Maxwell3D::new();
         engine.write_reg(DRAW_BEGIN, 4);
         engine.write_reg(DRAW_INLINE_INDEX, 0x0000_0001);
         engine.write_reg(DRAW_END, 0);
 
-        assert_eq!(engine.draw_mode, DrawMode::General);
+        assert_eq!(
+            engine.draw_manager_state().draw_mode,
+            dm::DrawMode::InlineIndex
+        );
     }
 
     // ── Report Semaphore tests ───────────────────────────────────────────
@@ -6174,6 +6271,62 @@ mod tests {
         assert_eq!(engine.regs[POLYGON_MODE_BACK as usize], 0x1B02);
         assert_eq!(engine.shadow_state[DEPTH_TEST_FUNC as usize], 0x207);
         assert_eq!(engine.shadow_state[COLOR_MASK_BASE as usize], 0x1111);
+    }
+
+    #[test]
+    fn test_dirty_state_starts_dirty_and_marks_specific_flag() {
+        let mut engine = Maxwell3D::new();
+
+        assert!(engine.dirty.flags[dirty_flags::flags::INDEX_BUFFER as usize]);
+        assert!(engine.dirty.flags[dirty_flags::flags::SHADERS as usize]);
+
+        engine.dirty.flags.fill(false);
+        engine.interface_state.current_dirty = false;
+
+        <Maxwell3D as dm::Maxwell3DAccess>::set_dirty_flag(
+            &mut engine,
+            dirty_flags::flags::INDEX_BUFFER,
+        );
+
+        assert!(engine.dirty.flags[dirty_flags::flags::INDEX_BUFFER as usize]);
+        assert!(!engine.dirty.flags[dirty_flags::flags::SHADERS as usize]);
+        assert!(engine.interface_state.current_dirty);
+    }
+
+    #[test]
+    fn test_process_dirty_registers_marks_flags_from_dirty_tables() {
+        let mut engine = Maxwell3D::new();
+        let method = 0x123usize;
+
+        engine.dirty.flags.fill(false);
+        engine.dirty.tables[0][method] = dirty_flags::flags::INDEX_BUFFER;
+        engine.dirty.tables[1][method] = dirty_flags::flags::SHADERS;
+
+        engine.write_reg(method as u32, 0);
+        assert!(!engine.dirty.flags[dirty_flags::flags::INDEX_BUFFER as usize]);
+        assert!(!engine.dirty.flags[dirty_flags::flags::SHADERS as usize]);
+
+        engine.write_reg(method as u32, 0xCAFE_BABE);
+        assert!(engine.dirty.flags[dirty_flags::flags::INDEX_BUFFER as usize]);
+        assert!(engine.dirty.flags[dirty_flags::flags::SHADERS as usize]);
+    }
+
+    #[test]
+    fn test_process_method_marks_flags_from_dirty_tables() {
+        let mut engine = Maxwell3D::new();
+        let method = 0x124usize;
+
+        engine.dirty.flags.fill(false);
+        engine.dirty.tables[0][method] = dirty_flags::flags::INDEX_BUFFER;
+        engine.dirty.tables[1][method] = dirty_flags::flags::SHADERS;
+
+        engine.process_method(method as u32, 0);
+        assert!(!engine.dirty.flags[dirty_flags::flags::INDEX_BUFFER as usize]);
+        assert!(!engine.dirty.flags[dirty_flags::flags::SHADERS as usize]);
+
+        engine.process_method(method as u32, 0xFEED_FACE);
+        assert!(engine.dirty.flags[dirty_flags::flags::INDEX_BUFFER as usize]);
+        assert!(engine.dirty.flags[dirty_flags::flags::SHADERS as usize]);
     }
 
     #[test]
@@ -6765,6 +6918,44 @@ mod tests {
         engine.call_method(DRAW_TEXTURE_SRC_Y0, 0x1234, true);
 
         assert_eq!(calls.lock().unwrap().draw_texture, 1);
+    }
+
+    #[test]
+    fn test_draw_texture_trigger_populates_draw_texture_state_from_live_registers() {
+        let mut engine = Maxwell3D::new();
+        let calls = Arc::new(Mutex::new(RasterizerCalls::default()));
+        let rasterizer = TestRasterizer::new(calls);
+        engine.bind_rasterizer(&rasterizer);
+
+        let base = DRAW_TEXTURE_BASE as usize;
+        engine.regs[base + DRAW_TEXTURE_DST_X0_OFFSET] = 4096;
+        engine.regs[base + DRAW_TEXTURE_DST_Y0_OFFSET] = 8192;
+        engine.regs[base + DRAW_TEXTURE_DST_WIDTH_OFFSET] = 12288;
+        engine.regs[base + DRAW_TEXTURE_DST_HEIGHT_OFFSET] = 4096;
+        engine.regs[base + DRAW_TEXTURE_DX_DU_LOW_OFFSET] = 0x4000_0000;
+        engine.regs[base + DRAW_TEXTURE_DX_DU_HIGH_OFFSET] = 0;
+        engine.regs[base + DRAW_TEXTURE_DY_DV_LOW_OFFSET] = 0x8000_0000;
+        engine.regs[base + DRAW_TEXTURE_DY_DV_HIGH_OFFSET] = 0;
+        engine.regs[base + DRAW_TEXTURE_SRC_SAMPLER_OFFSET] = 7;
+        engine.regs[base + DRAW_TEXTURE_SRC_TEXTURE_OFFSET] = 9;
+        engine.regs[base + DRAW_TEXTURE_SRC_X0_OFFSET] = 2048;
+        engine.regs[base + DRAW_TEXTURE_SRC_Y0_OFFSET] = 1024;
+        engine.regs[SURFACE_CLIP_BASE as usize + SURFACE_CLIP_HEIGHT_OFFSET] = 100 << 16;
+        engine.regs[WINDOW_ORIGIN as usize] = 1;
+
+        engine.call_method(DRAW_TEXTURE_SRC_Y0, 1024, true);
+
+        let state = engine.draw_manager.get_draw_texture_state();
+        assert_eq!(state.dst_x0, 1.0);
+        assert_eq!(state.dst_y0, 98.0);
+        assert_eq!(state.dst_x1, 4.0);
+        assert_eq!(state.dst_y1, 99.0);
+        assert_eq!(state.src_x0, 0.5);
+        assert_eq!(state.src_y0, 0.25);
+        assert_eq!(state.src_x1, 1.25);
+        assert_eq!(state.src_y1, 0.75);
+        assert_eq!(state.src_sampler, 7);
+        assert_eq!(state.src_texture, 9);
     }
 
     #[test]

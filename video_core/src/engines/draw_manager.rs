@@ -8,6 +8,16 @@
 //! instanced draws, and draw textures.
 
 use crate::dirty_flags::flags as Dirty;
+use crate::engines::maxwell_3d::{
+    DrawCall, CLEAR_SURFACE, DRAW_BEGIN, DRAW_END, DRAW_INLINE_INDEX, DRAW_TEXTURE_SRC_Y0, IB_BASE,
+    IB_OFF_COUNT, IB_OFF_FIRST, INDEX_BUFFER16_FIRST, INDEX_BUFFER16_SUBSEQUENT,
+    INDEX_BUFFER32_FIRST, INDEX_BUFFER32_SUBSEQUENT, INDEX_BUFFER8_FIRST, INDEX_BUFFER8_SUBSEQUENT,
+    INLINE_INDEX_2X16_EVEN, INLINE_INDEX_4X8_INDEX0, NUM_SHADER_PROGRAMS, NUM_VERTEX_ATTRIBS,
+    RT_FORMAT_A8B8G8R8_SRGB, RT_FORMAT_A8B8G8R8_UNORM, RT_FORMAT_B5G6R5_UNORM, RT_FORMAT_R8_UNORM,
+    TOPOLOGY_OVERRIDE, VB_COUNT, VB_FIRST, VERTEX_ARRAY_INSTANCE_FIRST,
+    VERTEX_ARRAY_INSTANCE_SUBSEQUENT,
+};
+use crate::engines::Framebuffer;
 use crate::rasterizer_interface::RasterizerInterface;
 
 /// GPU virtual address type.
@@ -28,6 +38,15 @@ pub enum PrimitiveTopologyControl {
     UseSeparateState = 1,
 }
 
+impl PrimitiveTopologyControl {
+    pub fn from_raw(raw: u32) -> Self {
+        match raw {
+            1 => Self::UseSeparateState,
+            _ => Self::UseInBeginMethods,
+        }
+    }
+}
+
 // `PrimitiveTopology` is the upstream-faithful enum from
 // `engines::maxwell_3d` (matching `Maxwell3D::Regs::PrimitiveTopology`).
 // Re-exported here so existing imports of
@@ -43,6 +62,98 @@ pub enum PrimitiveTopologyOverride {
     Points = 1,
     Lines = 2,
     LineStrip = 3,
+}
+
+impl PrimitiveTopologyOverride {
+    pub fn from_raw(raw: u32) -> Self {
+        match raw {
+            1 => Self::Points,
+            2 => Self::Lines,
+            3 => Self::LineStrip,
+            _ => Self::None,
+        }
+    }
+}
+
+/// Port of `DrawManager::UpdateTopology()` as a pure owner-local helper.
+///
+/// This keeps the topology-resolution logic in the matching upstream owner
+/// file even when other owners need the same resolved draw-state topology.
+pub fn resolve_draw_topology(
+    mut draw_topology: PrimitiveTopology,
+    primitive_topology_control: PrimitiveTopologyControl,
+    topology_override: PrimitiveTopologyOverride,
+    topology_override_raw: u32,
+) -> PrimitiveTopology {
+    match primitive_topology_control {
+        PrimitiveTopologyControl::UseInBeginMethods => {}
+        PrimitiveTopologyControl::UseSeparateState => match topology_override {
+            PrimitiveTopologyOverride::None => {}
+            PrimitiveTopologyOverride::Points => {
+                draw_topology = PrimitiveTopology::Points;
+            }
+            PrimitiveTopologyOverride::Lines => {
+                draw_topology = PrimitiveTopology::Lines;
+            }
+            PrimitiveTopologyOverride::LineStrip => {
+                draw_topology = PrimitiveTopology::LineStrip;
+            }
+        },
+    }
+
+    if primitive_topology_control == PrimitiveTopologyControl::UseSeparateState
+        && topology_override != PrimitiveTopologyOverride::None
+        && topology_override != PrimitiveTopologyOverride::Points
+        && topology_override != PrimitiveTopologyOverride::Lines
+        && topology_override != PrimitiveTopologyOverride::LineStrip
+    {
+        draw_topology = PrimitiveTopology::from_raw(topology_override_raw);
+    }
+
+    draw_topology
+}
+
+fn format_clear_color(
+    format: u32,
+    color: [f32; 4],
+    clear_r: bool,
+    clear_g: bool,
+    clear_b: bool,
+    clear_a: bool,
+) -> [u8; 4] {
+    let r = if clear_r {
+        (color[0].clamp(0.0, 1.0) * 255.0) as u8
+    } else {
+        0
+    };
+    let g = if clear_g {
+        (color[1].clamp(0.0, 1.0) * 255.0) as u8
+    } else {
+        0
+    };
+    let b = if clear_b {
+        (color[2].clamp(0.0, 1.0) * 255.0) as u8
+    } else {
+        0
+    };
+    let a = if clear_a {
+        (color[3].clamp(0.0, 1.0) * 255.0) as u8
+    } else {
+        0
+    };
+
+    match format {
+        RT_FORMAT_A8B8G8R8_UNORM | RT_FORMAT_A8B8G8R8_SRGB => [r, g, b, a],
+        RT_FORMAT_R8_UNORM => [r, 0, 0, 255],
+        RT_FORMAT_B5G6R5_UNORM => [r, g, b, 255],
+        _ => {
+            log::trace!(
+                "DrawManager::clear RT format 0x{:X}, using RGBA8 layout for local framebuffer",
+                format
+            );
+            [r, g, b, a]
+        }
+    }
 }
 
 // `IndexFormat` is the upstream-faithful enum from
@@ -133,6 +244,23 @@ pub trait Maxwell3DAccess {
     /// Read the draw.instance_id register: returns (is_first, is_subsequent).
     fn draw_instance_id(&self) -> (bool, bool);
 
+    /// Decode the current packed `inline_index_2x16` register into its two
+    /// 16-bit values, matching upstream register-field access.
+    fn inline_index_2x16_values(&self) -> (u32, u32);
+
+    /// Decode the current packed `inline_index_4x8` register into its four
+    /// byte values, matching upstream register-field access.
+    fn inline_index_4x8_values(&self) -> [u32; 4];
+
+    /// Decode `vertex_array_instance_first` from the written argument.
+    fn vertex_array_instance_first_params(&self, argument: u32) -> (PrimitiveTopology, u32, u32);
+
+    /// Decode `vertex_array_instance_subsequent` from the written argument.
+    fn vertex_array_instance_subsequent_params(
+        &self,
+        argument: u32,
+    ) -> (PrimitiveTopology, u32, u32);
+
     /// Set a dirty flag. Upstream: `maxwell3d->dirty.flags[index] = true`.
     fn set_dirty_flag(&mut self, index: u8);
 
@@ -145,6 +273,97 @@ pub trait Maxwell3DAccess {
     fn shader_program_addresses(&self) -> [u64; 6] {
         [0; 6]
     }
+
+    /// Read the live `regs.draw_texture` payload.
+    fn draw_texture_params(&self) -> DrawTextureParams;
+
+    /// Read whether `regs.window_origin.mode != UpperLeft`.
+    fn window_origin_lower_left(&self) -> bool;
+
+    /// Read `regs.surface_clip.height`.
+    fn surface_clip_height(&self) -> u32;
+
+    /// Read the current clear-surface flags register payload.
+    fn clear_surface_flags(&self) -> u32;
+
+    /// Read render-target address.
+    fn rt_address(&self, index: usize) -> u64;
+
+    /// Read render-target width.
+    fn rt_width(&self, index: usize) -> u32;
+
+    /// Read render-target height.
+    fn rt_height(&self, index: usize) -> u32;
+
+    /// Read render-target format.
+    fn rt_format(&self, index: usize) -> u32;
+
+    /// Read clear color as RGBA floats.
+    fn clear_color_rgba(&self) -> [f32; 4];
+
+    /// Publish a pending framebuffer.
+    fn set_pending_framebuffer(&mut self, framebuffer: Framebuffer);
+
+    /// Read index buffer GPU virtual address.
+    fn index_buffer_addr(&self) -> u64;
+
+    /// Read vertex stream info for one stream slot.
+    fn vertex_stream_info(&self, index: u32) -> crate::engines::maxwell_3d::VertexStreamInfo;
+
+    /// Read viewport info for one viewport slot.
+    fn viewport_info(&self, index: u32) -> crate::engines::maxwell_3d::ViewportInfo;
+
+    /// Read scissor info for one scissor slot.
+    fn scissor_info(&self, index: u32) -> crate::engines::maxwell_3d::ScissorInfo;
+
+    /// Read effective blend state for one render target.
+    fn effective_blend_info(&self, rt: usize) -> crate::engines::maxwell_3d::BlendInfo;
+
+    /// Read blend constant color.
+    fn blend_color_info(&self) -> crate::engines::maxwell_3d::BlendColorInfo;
+
+    /// Read combined depth/stencil state.
+    fn depth_stencil_info(&self) -> crate::engines::maxwell_3d::DepthStencilInfo;
+
+    /// Read rasterizer state.
+    fn rasterizer_info(&self) -> crate::engines::maxwell_3d::RasterizerInfo;
+
+    /// Read shader program region base address.
+    fn program_base_address(&self) -> u64;
+
+    /// Read one constant-buffer binding.
+    fn const_buffer_binding(
+        &self,
+        stage: usize,
+        slot: usize,
+    ) -> crate::engines::maxwell_3d::ConstBufferBinding;
+
+    /// Read vertex attribute info for one attribute slot.
+    fn vertex_attrib_info(&self, index: u32) -> crate::engines::maxwell_3d::VertexAttribInfo;
+
+    /// Read shader stage info for one pipeline slot.
+    fn shader_stage_info(&self, index: u32) -> crate::engines::maxwell_3d::ShaderStageInfo;
+
+    /// Read color write mask for one render target.
+    fn color_mask_info(&self, rt: usize) -> crate::engines::maxwell_3d::ColorMaskInfo;
+
+    /// Read render target control info.
+    fn rt_control_info(&self) -> crate::engines::maxwell_3d::RtControlInfo;
+
+    /// Read texture header pool base address.
+    fn tex_header_pool_address(&self) -> u64;
+
+    /// Read texture header pool limit.
+    fn tex_header_pool_limit(&self) -> u32;
+
+    /// Read texture sampler pool base address.
+    fn tex_sampler_pool_address(&self) -> u64;
+
+    /// Read texture sampler pool limit.
+    fn tex_sampler_pool_limit(&self) -> u32;
+
+    /// Read sampler binding mode.
+    fn sampler_binding(&self) -> crate::engines::maxwell_3d::SamplerBinding;
 }
 
 // ── DrawManager ─────────────────────────────────────────────────────────────
@@ -202,6 +421,23 @@ pub struct DrawTextureState {
     pub src_texture: u32,
 }
 
+/// Raw draw-texture register payload from `Maxwell3D`.
+///
+/// Corresponds to `Maxwell3D::Regs::DrawTexture`.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DrawTextureParams {
+    pub dst_x0: i32,
+    pub dst_y0: i32,
+    pub dst_width: i32,
+    pub dst_height: i32,
+    pub dx_du: i64,
+    pub dy_dv: i64,
+    pub src_sampler: u32,
+    pub src_texture: u32,
+    pub src_x0: i32,
+    pub src_y0: i32,
+}
+
 /// Parameters for indirect draw calls.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct IndirectParams {
@@ -225,6 +461,7 @@ pub struct DrawManager {
     pub draw_state: DrawState,
     pub draw_texture_state: DrawTextureState,
     pub indirect_state: IndirectParams,
+    compat_draw_calls: Vec<DrawCall>,
 }
 
 impl DrawManager {
@@ -234,6 +471,7 @@ impl DrawManager {
             draw_state: DrawState::default(),
             draw_texture_state: DrawTextureState::default(),
             indirect_state: IndirectParams::default(),
+            compat_draw_calls: Vec::new(),
         }
     }
 
@@ -257,14 +495,165 @@ impl DrawManager {
         &self.indirect_state
     }
 
+    /// Drain the temporary software-facing compatibility queue.
+    pub fn take_compat_draw_calls(&mut self) -> Vec<DrawCall> {
+        std::mem::take(&mut self.compat_draw_calls)
+    }
+
+    /// Push a temporary software-facing compatibility draw snapshot.
+    pub fn push_compat_draw_call(&mut self, draw_call: DrawCall) {
+        self.compat_draw_calls.push(draw_call);
+    }
+
+    fn build_compat_draw_call(
+        &self,
+        draw_state: &DrawState,
+        draw_indexed: bool,
+        instance_count: u32,
+        maxwell3d: &dyn Maxwell3DAccess,
+    ) -> DrawCall {
+        let mut vertex_streams = Vec::new();
+        for i in 0..32u32 {
+            let info = maxwell3d.vertex_stream_info(i);
+            if info.enabled {
+                vertex_streams.push(info);
+            }
+        }
+
+        let mut vertex_attribs = Vec::new();
+        for i in 0..NUM_VERTEX_ATTRIBS {
+            let info = maxwell3d.vertex_attrib_info(i);
+            if info.buffer_index != 0
+                || info.constant
+                || info.offset != 0
+                || info.size as u32 != 0
+                || info.attrib_type as u32 != 0
+                || info.bgra
+            {
+                vertex_attribs.push(info);
+            }
+        }
+
+        let mut shader_stages =
+            [crate::engines::maxwell_3d::ShaderStageInfo::default(); NUM_SHADER_PROGRAMS];
+        for (i, stage) in shader_stages.iter_mut().enumerate() {
+            *stage = maxwell3d.shader_stage_info(i as u32);
+        }
+
+        let mut color_masks = [crate::engines::maxwell_3d::ColorMaskInfo::default(); 8];
+        for (i, mask) in color_masks.iter_mut().enumerate() {
+            *mask = maxwell3d.color_mask_info(i);
+        }
+
+        let render_targets =
+            std::array::from_fn(|i| crate::engines::maxwell_3d::RenderTargetInfo {
+                address: maxwell3d.rt_address(i),
+                width: maxwell3d.rt_width(i),
+                height: maxwell3d.rt_height(i),
+                format: maxwell3d.rt_format(i),
+            });
+
+        let mut blend = [crate::engines::maxwell_3d::BlendInfo::default(); 8];
+        for (i, item) in blend.iter_mut().enumerate() {
+            *item = maxwell3d.effective_blend_info(i);
+        }
+
+        let cb_bindings = std::array::from_fn(|stage| {
+            std::array::from_fn(|slot| maxwell3d.const_buffer_binding(stage, slot))
+        });
+
+        DrawCall {
+            topology: draw_state.topology,
+            vertex_first: draw_state.vertex_buffer.first,
+            vertex_count: draw_state.vertex_buffer.count,
+            indexed: draw_indexed,
+            index_buffer_addr: maxwell3d.index_buffer_addr(),
+            index_buffer_count: draw_state.index_buffer.count,
+            index_buffer_first: draw_state.index_buffer.first,
+            index_format: draw_state.index_buffer.format,
+            vertex_streams,
+            viewports: std::array::from_fn(|i| maxwell3d.viewport_info(i as u32)),
+            scissors: std::array::from_fn(|i| maxwell3d.scissor_info(i as u32)),
+            blend,
+            blend_color: maxwell3d.blend_color_info(),
+            depth_stencil: maxwell3d.depth_stencil_info(),
+            rasterizer: maxwell3d.rasterizer_info(),
+            program_base_address: maxwell3d.program_base_address(),
+            cb_bindings,
+            vertex_attribs,
+            shader_stages,
+            color_masks,
+            rt_control: maxwell3d.rt_control_info(),
+            tex_header_pool_addr: maxwell3d.tex_header_pool_address(),
+            tex_header_pool_limit: maxwell3d.tex_header_pool_limit(),
+            tex_sampler_pool_addr: maxwell3d.tex_sampler_pool_address(),
+            tex_sampler_pool_limit: maxwell3d.tex_sampler_pool_limit(),
+            instance_count,
+            base_instance: draw_state.base_instance,
+            base_vertex: draw_state.base_index as i32,
+            inline_index_data: draw_state.inline_index_draw_indexes.clone(),
+            sampler_binding: maxwell3d.sampler_binding(),
+            render_targets,
+        }
+    }
+
     /// Process a method call that may trigger draw operations.
     ///
     /// Corresponds to `DrawManager::ProcessMethodCall`.
     /// Stubbed — full implementation requires access to Maxwell3D registers to decode
     /// MAXWELL3D_REG_INDEX values (clear_surface, draw.begin/end, index_buffer32_*, etc.)
     /// Upstream: DrawManager::ProcessMethodCall() in video_core/engines/draw_manager.cpp
-    pub fn process_method_call(&mut self, _method: u32, _argument: u32) {
-        log::warn!("DrawManager::process_method_call: not yet implemented (requires Maxwell3D register index constants)");
+    pub fn process_method_call(
+        &mut self,
+        method: u32,
+        argument: u32,
+        maxwell3d: &mut dyn Maxwell3DAccess,
+    ) {
+        match method {
+            CLEAR_SURFACE => self.clear(1, maxwell3d),
+            DRAW_BEGIN => self.draw_begin(maxwell3d),
+            DRAW_END => self.draw_end(1, false, maxwell3d),
+            VB_FIRST | VB_COUNT => {}
+            m if m == IB_BASE + IB_OFF_FIRST => {}
+            m if m == IB_BASE + IB_OFF_COUNT => {
+                self.draw_state.draw_indexed = true;
+            }
+            INDEX_BUFFER32_SUBSEQUENT | INDEX_BUFFER16_SUBSEQUENT | INDEX_BUFFER8_SUBSEQUENT => {
+                self.draw_state.instance_count += 1;
+                self.draw_index_small(argument, maxwell3d);
+            }
+            INDEX_BUFFER32_FIRST | INDEX_BUFFER16_FIRST | INDEX_BUFFER8_FIRST => {
+                self.draw_index_small(argument, maxwell3d);
+            }
+            DRAW_INLINE_INDEX => {
+                self.set_inline_index_buffer(argument);
+            }
+            INLINE_INDEX_2X16_EVEN => {
+                let (even, odd) = maxwell3d.inline_index_2x16_values();
+                self.set_inline_index_buffer(even);
+                self.set_inline_index_buffer(odd);
+            }
+            INLINE_INDEX_4X8_INDEX0 => {
+                for index in maxwell3d.inline_index_4x8_values() {
+                    self.set_inline_index_buffer(index);
+                }
+            }
+            VERTEX_ARRAY_INSTANCE_FIRST => {
+                let (topology, start, count) =
+                    maxwell3d.vertex_array_instance_first_params(argument);
+                self.draw_array_instanced(topology, start, count, false, maxwell3d);
+            }
+            VERTEX_ARRAY_INSTANCE_SUBSEQUENT => {
+                let (topology, start, count) =
+                    maxwell3d.vertex_array_instance_subsequent_params(argument);
+                self.draw_array_instanced(topology, start, count, true, maxwell3d);
+            }
+            DRAW_TEXTURE_SRC_Y0 => {
+                self.draw_texture(maxwell3d);
+            }
+            TOPOLOGY_OVERRIDE => {}
+            _ => {}
+        }
     }
 
     /// Execute a clear operation.
@@ -276,7 +665,62 @@ impl DrawManager {
             if let Some(rasterizer) = maxwell3d.rasterizer_mut() {
                 rasterizer.clear(layer_count);
             }
+            self.produce_clear_framebuffer(maxwell3d);
         }
+    }
+
+    fn produce_clear_framebuffer(&mut self, maxwell3d: &mut dyn Maxwell3DAccess) {
+        let flags = maxwell3d.clear_surface_flags();
+        let rt_index = ((flags >> 6) & 0xF) as usize;
+        let clear_r = flags & (1 << 2) != 0;
+        let clear_g = flags & (1 << 3) != 0;
+        let clear_b = flags & (1 << 4) != 0;
+        let clear_a = flags & (1 << 5) != 0;
+
+        if !clear_r && !clear_g && !clear_b && !clear_a {
+            log::trace!("DrawManager::clear depth/stencil only, skipping local framebuffer");
+            return;
+        }
+
+        if rt_index >= 8 {
+            log::warn!("DrawManager::clear invalid RT index {}", rt_index);
+            return;
+        }
+
+        let gpu_va = maxwell3d.rt_address(rt_index);
+        let width = maxwell3d.rt_width(rt_index);
+        let height = maxwell3d.rt_height(rt_index);
+        let format = maxwell3d.rt_format(rt_index);
+
+        if width == 0 || height == 0 || gpu_va == 0 {
+            log::trace!(
+                "DrawManager::clear skipped local framebuffer (width={}, height={}, va=0x{:X})",
+                width,
+                height,
+                gpu_va
+            );
+            return;
+        }
+
+        let color = maxwell3d.clear_color_rgba();
+        let pixel = format_clear_color(format, color, clear_r, clear_g, clear_b, clear_a);
+
+        let pixel_count = width as usize * height as usize;
+        let mut pixels = vec![0u8; pixel_count * 4];
+        for i in 0..pixel_count {
+            let off = i * 4;
+            pixels[off] = pixel[0];
+            pixels[off + 1] = pixel[1];
+            pixels[off + 2] = pixel[2];
+            pixels[off + 3] = pixel[3];
+        }
+
+        maxwell3d.set_pending_framebuffer(Framebuffer {
+            gpu_va,
+            width,
+            height,
+            pixels,
+        });
     }
 
     /// Flush any deferred instanced draw calls.
@@ -432,7 +876,7 @@ impl DrawManager {
     /// Corresponds to `DrawManager::DrawEnd`.
     /// Upstream reads `regs.global_base_instance_index`, `regs.global_base_vertex_index`,
     /// `regs.index_buffer`, `regs.vertex_buffer` from Maxwell3D.
-    fn draw_end(
+    pub(crate) fn draw_end(
         &mut self,
         instance_count: u32,
         force_draw: bool,
@@ -501,16 +945,30 @@ impl DrawManager {
     /// Handle draw-texture trigger.
     ///
     /// Corresponds to `DrawManager::DrawTexture`.
-    /// Stubbed — requires access to Maxwell3D draw_texture and surface_clip registers to
-    /// compute dst/src coordinates, then calls rasterizer->DrawTexture().
     /// Upstream: DrawManager::DrawTexture() in video_core/engines/draw_manager.cpp
-    pub fn draw_texture(&mut self) {
-        // Full implementation requires reading regs.draw_texture (dst_x0, dst_y0, dst_width,
-        // dst_height, src_x0, src_y0, dx_du, dy_dv, src_sampler, src_texture),
-        // regs.window_origin.mode, and regs.surface_clip.height from Maxwell3D.
-        // These register types are not yet defined in the Maxwell3DAccess trait.
-        // Once they are, this should match upstream DrawTexture() exactly.
-        log::warn!("DrawManager::draw_texture: not yet implemented (requires draw_texture register types in Maxwell3DAccess)");
+    pub fn draw_texture(&mut self, maxwell3d: &mut dyn Maxwell3DAccess) {
+        let regs = maxwell3d.draw_texture_params();
+        self.draw_texture_state.dst_x0 = regs.dst_x0 as f32 / 4096.0;
+        self.draw_texture_state.dst_y0 = regs.dst_y0 as f32 / 4096.0;
+        let dst_width = regs.dst_width as f32 / 4096.0;
+        let dst_height = regs.dst_height as f32 / 4096.0;
+        if maxwell3d.window_origin_lower_left() {
+            self.draw_texture_state.dst_y0 =
+                maxwell3d.surface_clip_height() as f32 - self.draw_texture_state.dst_y0;
+        }
+        self.draw_texture_state.dst_x1 = self.draw_texture_state.dst_x0 + dst_width;
+        self.draw_texture_state.dst_y1 = self.draw_texture_state.dst_y0 + dst_height;
+        self.draw_texture_state.src_x0 = regs.src_x0 as f32 / 4096.0;
+        self.draw_texture_state.src_y0 = regs.src_y0 as f32 / 4096.0;
+        self.draw_texture_state.src_x1 =
+            (regs.dx_du as f32 / 4_294_967_296.0) * dst_width + self.draw_texture_state.src_x0;
+        self.draw_texture_state.src_y1 =
+            (regs.dy_dv as f32 / 4_294_967_296.0) * dst_height + self.draw_texture_state.src_y0;
+        self.draw_texture_state.src_sampler = regs.src_sampler;
+        self.draw_texture_state.src_texture = regs.src_texture;
+        if let Some(rasterizer) = maxwell3d.rasterizer_mut() {
+            rasterizer.draw_texture();
+        }
     }
 
     /// Update topology based on topology control mode and override.
@@ -518,37 +976,12 @@ impl DrawManager {
     /// Corresponds to `DrawManager::UpdateTopology`.
     /// Upstream reads `regs.primitive_topology_control` and `regs.topology_override`.
     fn update_topology(&mut self, maxwell3d: &dyn Maxwell3DAccess) {
-        match maxwell3d.primitive_topology_control() {
-            PrimitiveTopologyControl::UseInBeginMethods => {}
-            PrimitiveTopologyControl::UseSeparateState => {
-                match maxwell3d.topology_override() {
-                    PrimitiveTopologyOverride::None => {}
-                    PrimitiveTopologyOverride::Points => {
-                        self.draw_state.topology = PrimitiveTopology::Points;
-                    }
-                    PrimitiveTopologyOverride::Lines => {
-                        self.draw_state.topology = PrimitiveTopology::Lines;
-                    }
-                    PrimitiveTopologyOverride::LineStrip => {
-                        self.draw_state.topology = PrimitiveTopology::LineStrip;
-                    }
-                }
-                // Upstream default case: cast topology_override raw value to PrimitiveTopology.
-                // The match above covers all defined PrimitiveTopologyOverride variants.
-                // For unknown values, upstream does:
-                //   draw_state.topology = static_cast<PrimitiveTopology>(regs.topology_override);
-                // We handle this by checking if no branch matched:
-                let topo_override = maxwell3d.topology_override();
-                if topo_override != PrimitiveTopologyOverride::None
-                    && topo_override != PrimitiveTopologyOverride::Points
-                    && topo_override != PrimitiveTopologyOverride::Lines
-                    && topo_override != PrimitiveTopologyOverride::LineStrip
-                {
-                    self.draw_state.topology =
-                        PrimitiveTopology::from_raw(maxwell3d.topology_override_raw());
-                }
-            }
-        }
+        self.draw_state.topology = resolve_draw_topology(
+            self.draw_state.topology,
+            maxwell3d.primitive_topology_control(),
+            maxwell3d.topology_override(),
+            maxwell3d.topology_override_raw(),
+        );
     }
 
     /// Core draw dispatch.
@@ -573,6 +1006,10 @@ impl DrawManager {
 
         self.update_topology(maxwell3d);
 
+        let draw_call =
+            self.build_compat_draw_call(&self.draw_state, draw_indexed, instance_count, maxwell3d);
+        self.compat_draw_calls.push(draw_call);
+
         if maxwell3d.should_execute() {
             // `draw_state.draw_indexed` is already kept in sync with the
             // Maxwell3D register file by the caller chains that lead into
@@ -581,7 +1018,6 @@ impl DrawManager {
             // reference to the rasterizer so the rasterizer never sees a
             // stale value.
             self.draw_state.draw_indexed = draw_indexed;
-            self.draw_state.instance_count = instance_count;
             // Snapshot per-stage shader program addresses now, while we
             // still hold the immutable Maxwell3D borrow. The rasterizer
             // consumes them via `DrawState::shader_program_addresses` to
@@ -651,5 +1087,16 @@ mod tests {
         assert_eq!(ibs.first, 0xFFFF);
         assert_eq!(ibs.count, 0xFFF);
         assert_eq!(ibs.topology, PrimitiveTopology::Patches); // 0xF
+    }
+
+    #[test]
+    fn resolve_draw_topology_uses_separate_state_override() {
+        let resolved = resolve_draw_topology(
+            PrimitiveTopology::TriangleStrip,
+            PrimitiveTopologyControl::UseSeparateState,
+            PrimitiveTopologyOverride::Lines,
+            PrimitiveTopologyOverride::Lines as u32,
+        );
+        assert_eq!(resolved, PrimitiveTopology::Lines);
     }
 }
