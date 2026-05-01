@@ -5,13 +5,19 @@
 //!
 //! Shader binary caching and invalidation.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use std::sync::Mutex;
 
 use crate::control::channel_state::ChannelState;
 use crate::control::channel_state_cache::{ChannelInfo, ChannelSetupCaches};
+use crate::engines::kepler_compute::KeplerCompute;
+use crate::engines::maxwell_3d::{Maxwell3D, ShaderStageType};
 use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
-use crate::shader_environment::GenericEnvironment;
+use crate::shader_environment::{ComputeEnvironment, GenericEnvironment, GraphicsEnvironment};
+use shader_recompiler::frontend::instruction::{Instruction as MaxwellInstruction, Predicate};
+use shader_recompiler::frontend::maxwell_opcodes::{decode_opcode, MaxwellOpcode};
+use shader_recompiler::ir::flow_test::FlowTest;
 
 /// Virtual address type.
 pub type VAddr = u64;
@@ -19,6 +25,36 @@ pub type VAddr = u64;
 const YUZU_PAGEBITS: u64 = 14;
 const YUZU_PAGESIZE: u64 = 1 << YUZU_PAGEBITS;
 const NUM_PROGRAMS: usize = 6;
+const SHADER_INSTRUCTION_SIZE: u32 = 8;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum FlowStackToken {
+    Ssy,
+    Pbk,
+    Pexit,
+    Pret,
+    Pcnt,
+    Plongjmp,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct FlowStackEntry {
+    token: FlowStackToken,
+    target: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct PendingShaderFlow {
+    pc: u32,
+    stack: Vec<FlowStackEntry>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BranchDisposition {
+    AlwaysTaken,
+    NeverTaken,
+    Conditional,
+}
 
 /// Information about a compiled shader.
 #[derive(Debug, Default)]
@@ -53,13 +89,37 @@ pub struct ShaderCache {
     invalidation_cache: HashMap<u64, Vec<*mut Entry>>,
     storage: Vec<Box<ShaderInfo>>,
     marked_for_removal: Vec<*mut Entry>,
-    shader_infos: [Option<usize>; NUM_PROGRAMS],
+    shader_infos: [Option<*const ShaderInfo>; NUM_PROGRAMS],
     last_shaders_valid: bool,
 }
 
 // Safety: Entry pointers are only used within locked sections.
 unsafe impl Send for ShaderCache {}
 unsafe impl Sync for ShaderCache {}
+
+pub struct GraphicsEnvironments {
+    pub envs: [GraphicsEnvironment; NUM_PROGRAMS],
+    pub env_ptrs: [Option<usize>; NUM_PROGRAMS],
+}
+
+impl GraphicsEnvironments {
+    pub fn span(&self) -> Vec<&GenericEnvironment> {
+        self.env_ptrs
+            .iter()
+            .flatten()
+            .map(|&index| self.envs[index].generic_environment())
+            .collect()
+    }
+}
+
+impl Default for GraphicsEnvironments {
+    fn default() -> Self {
+        Self {
+            envs: std::array::from_fn(|_| GraphicsEnvironment::default()),
+            env_ptrs: [None; NUM_PROGRAMS],
+        }
+    }
+}
 
 impl ShaderCache {
     pub fn new() -> Self {
@@ -103,8 +163,161 @@ impl ShaderCache {
     }
 
     /// Reduced Rust accessor for the shared shader-info owner slots.
-    pub fn shader_info_slots(&self) -> &[Option<usize>; NUM_PROGRAMS] {
+    pub fn shader_info_slots(&self) -> &[Option<*const ShaderInfo>; NUM_PROGRAMS] {
         &self.shader_infos
+    }
+
+    /// Port of `ShaderCache::RefreshStages`.
+    pub fn refresh_stages(&mut self, unique_hashes: &mut [u64; NUM_PROGRAMS]) -> bool {
+        let Some(channel) = self.current_channel_info() else {
+            self.last_shaders_valid = false;
+            return false;
+        };
+        let maxwell_ptr = channel.maxwell3d as *const Maxwell3D;
+        if maxwell_ptr.is_null() {
+            self.last_shaders_valid = false;
+            return false;
+        }
+        let Some(gpu_memory) = channel.gpu_memory.as_ref().map(Arc::clone) else {
+            self.last_shaders_valid = false;
+            return false;
+        };
+        let maxwell3d = unsafe { &*maxwell_ptr };
+        if maxwell3d.memory_manager().is_none() || maxwell3d.guest_memory_reader().is_none() {
+            self.last_shaders_valid = false;
+            return false;
+        }
+
+        let base_addr = maxwell3d.program_region_address();
+        let rasterize_enable = maxwell3d.rasterize_enable();
+        let stage_infos: [crate::engines::maxwell_3d::ShaderStageInfo; NUM_PROGRAMS] =
+            std::array::from_fn(|index| maxwell3d.shader_stage_info(index as u32));
+        let stage_enabled: [bool; NUM_PROGRAMS] =
+            std::array::from_fn(|index| maxwell3d.is_shader_stage_enabled(index as u32));
+        for (index, unique_hash) in unique_hashes.iter_mut().enumerate() {
+            let stage_info = stage_infos[index];
+            if !stage_enabled[index] {
+                *unique_hash = 0;
+                self.shader_infos[index] = None;
+                continue;
+            }
+            if stage_info.program_type == ShaderStageType::Fragment && !rasterize_enable {
+                *unique_hash = 0;
+                self.shader_infos[index] = None;
+                continue;
+            }
+
+            let shader_addr = base_addr + stage_info.offset as u64;
+            let cpu_shader_addr = {
+                let memory = gpu_memory.lock();
+                memory.gpu_to_cpu_address(shader_addr)
+            };
+            let Some(cpu_shader_addr) = cpu_shader_addr else {
+                self.last_shaders_valid = false;
+                return false;
+            };
+
+            let shader_ptr = if let Some(shader_info) = self.try_get(cpu_shader_addr) {
+                shader_info as *const ShaderInfo
+            } else {
+                if stage_info.program_type == ShaderStageType::Invalid {
+                    *unique_hash = 0;
+                    self.shader_infos[index] = None;
+                    continue;
+                }
+                let mut env = GraphicsEnvironment::from_maxwell3d(
+                    maxwell3d,
+                    stage_info.program_type,
+                    base_addr,
+                    stage_info.offset,
+                );
+                self.make_shader_info(env.generic_environment_mut(), cpu_shader_addr)
+                    as *const ShaderInfo
+            };
+
+            let shader_info = unsafe { &*shader_ptr };
+            self.shader_infos[index] = Some(shader_ptr);
+            *unique_hash = shader_info.unique_hash;
+        }
+
+        self.last_shaders_valid = true;
+        true
+    }
+
+    /// Port of `ShaderCache::ComputeShader`.
+    pub fn compute_shader(&mut self) -> Option<&ShaderInfo> {
+        let channel = self.current_channel_info()?;
+        let kepler_ptr = channel.kepler_compute as *const KeplerCompute;
+        if kepler_ptr.is_null() {
+            return None;
+        }
+        let gpu_memory = channel.gpu_memory.as_ref().map(Arc::clone)?;
+        let guest_memory_reader = self.current_guest_memory_reader()?;
+        let kepler_compute = unsafe { &*kepler_ptr };
+
+        let program_base = kepler_compute.code_address();
+        let qmd = kepler_compute.launch_description();
+        let shader_addr = program_base + qmd.program_start as u64;
+        let cpu_shader_addr = {
+            let memory = gpu_memory.lock();
+            memory.gpu_to_cpu_address(shader_addr)?
+        };
+        if let Some(shader_ptr) = self
+            .try_get(cpu_shader_addr)
+            .map(|shader| shader as *const _)
+        {
+            return Some(unsafe { &*shader_ptr });
+        }
+
+        let mut env = ComputeEnvironment::from_kepler_compute(
+            kepler_compute,
+            Arc::clone(&gpu_memory),
+            Arc::clone(&guest_memory_reader),
+        );
+        Some(self.make_shader_info(env.generic_environment_mut(), cpu_shader_addr))
+    }
+
+    /// Port of `ShaderCache::GetGraphicsEnvironments`.
+    pub fn get_graphics_environments(
+        &self,
+        result: &mut GraphicsEnvironments,
+        unique_hashes: &[u64; NUM_PROGRAMS],
+    ) {
+        result.env_ptrs = [None; NUM_PROGRAMS];
+
+        let Some(maxwell3d) = self.current_maxwell3d() else {
+            return;
+        };
+        if maxwell3d.memory_manager().is_none() || maxwell3d.guest_memory_reader().is_none() {
+            return;
+        }
+        let base_addr = maxwell3d.program_region_address();
+        let mut env_index = 0usize;
+
+        for (index, unique_hash) in unique_hashes.iter().enumerate() {
+            if *unique_hash == 0 {
+                continue;
+            }
+            let Some(shader_ptr) = self.shader_infos[index] else {
+                continue;
+            };
+            let stage_info = maxwell3d.shader_stage_info(index as u32);
+            if stage_info.program_type == ShaderStageType::Invalid {
+                continue;
+            }
+
+            let shader_info = unsafe { &*shader_ptr };
+            let mut env = GraphicsEnvironment::from_maxwell3d(
+                maxwell3d,
+                stage_info.program_type,
+                base_addr,
+                stage_info.offset,
+            );
+            env.set_cached_size(shader_info.size_bytes);
+            result.envs[index] = env;
+            result.env_ptrs[env_index] = Some(index);
+            env_index += 1;
+        }
     }
 
     /// Removes shaders inside a given region.
@@ -286,6 +499,7 @@ impl ShaderCache {
             info.unique_hash = cached_hash;
             info.size_bytes = env.cached_size_bytes();
         } else {
+            self.walk_shader_control_flow(env);
             info.unique_hash = env.calculate_hash();
             info.size_bytes = env.read_size_bytes();
         }
@@ -293,6 +507,320 @@ impl ShaderCache {
         self.register(info, cpu_addr, size_bytes);
         self.try_get(cpu_addr)
             .expect("registered shader info must be reachable through lookup cache")
+    }
+
+    pub fn current_maxwell3d(&self) -> Option<&Maxwell3D> {
+        let channel = self.current_channel_info()?;
+        let ptr = channel.maxwell3d as *const Maxwell3D;
+        if ptr.is_null() {
+            None
+        } else {
+            Some(unsafe { &*ptr })
+        }
+    }
+
+    fn current_kepler_compute(&self) -> Option<&KeplerCompute> {
+        let channel = self.current_channel_info()?;
+        let ptr = channel.kepler_compute as *const KeplerCompute;
+        if ptr.is_null() {
+            None
+        } else {
+            Some(unsafe { &*ptr })
+        }
+    }
+
+    fn current_gpu_memory(
+        &self,
+    ) -> Option<Arc<parking_lot::Mutex<crate::memory_manager::MemoryManager>>> {
+        self.current_channel_info()?
+            .gpu_memory
+            .as_ref()
+            .map(Arc::clone)
+    }
+
+    fn current_guest_memory_reader(&self) -> Option<Arc<dyn Fn(u64, &mut [u8]) + Send + Sync>> {
+        self.current_maxwell3d()?.guest_memory_reader()
+    }
+
+    fn walk_shader_control_flow(&self, env: &mut GenericEnvironment) {
+        let mut pending = vec![PendingShaderFlow {
+            pc: env.start_address(),
+            stack: Vec::new(),
+        }];
+        let mut visited = HashSet::new();
+
+        while let Some(mut state) = pending.pop() {
+            loop {
+                if !visited.insert(state.clone()) {
+                    break;
+                }
+
+                let pc = state.pc;
+                let insn_raw = env.read_instruction(pc);
+                let insn = MaxwellInstruction::new(insn_raw);
+                let opcode = decode_opcode(insn_raw);
+                let disposition =
+                    Self::branch_disposition(opcode, insn.pred(), insn.branch_flow_test());
+                let next_pc = pc.wrapping_add(SHADER_INSTRUCTION_SIZE);
+
+                match opcode {
+                    Some(MaxwellOpcode::SSY) => {
+                        state.stack.push(FlowStackEntry {
+                            token: FlowStackToken::Ssy,
+                            target: Self::relative_branch_target(pc, insn),
+                        });
+                        state.pc = next_pc;
+                    }
+                    Some(MaxwellOpcode::PBK) => {
+                        state.stack.push(FlowStackEntry {
+                            token: FlowStackToken::Pbk,
+                            target: Self::relative_branch_target(pc, insn),
+                        });
+                        state.pc = next_pc;
+                    }
+                    Some(MaxwellOpcode::PCNT) => {
+                        state.stack.push(FlowStackEntry {
+                            token: FlowStackToken::Pcnt,
+                            target: Self::relative_branch_target(pc, insn),
+                        });
+                        state.pc = next_pc;
+                    }
+                    Some(MaxwellOpcode::CAL) => {
+                        let mut callee_stack = state.stack.clone();
+                        callee_stack.push(FlowStackEntry {
+                            token: FlowStackToken::Pret,
+                            target: next_pc,
+                        });
+                        pending.push(PendingShaderFlow {
+                            pc: Self::relative_branch_target(pc, insn),
+                            stack: callee_stack,
+                        });
+                        state.pc = next_pc;
+                    }
+                    Some(MaxwellOpcode::JCAL) => {
+                        let mut callee_stack = state.stack.clone();
+                        callee_stack.push(FlowStackEntry {
+                            token: FlowStackToken::Pret,
+                            target: next_pc,
+                        });
+                        pending.push(PendingShaderFlow {
+                            pc: insn.branch_absolute(),
+                            stack: callee_stack,
+                        });
+                        state.pc = next_pc;
+                    }
+                    Some(MaxwellOpcode::BRA) => {
+                        let target = Self::relative_branch_target(pc, insn);
+                        if disposition != BranchDisposition::AlwaysTaken {
+                            pending.push(PendingShaderFlow {
+                                pc: next_pc,
+                                stack: state.stack.clone(),
+                            });
+                        }
+                        if disposition == BranchDisposition::NeverTaken {
+                            state.pc = next_pc;
+                        } else {
+                            state.pc = target;
+                        }
+                    }
+                    Some(MaxwellOpcode::JMP) => {
+                        let target = insn.branch_absolute();
+                        if disposition != BranchDisposition::AlwaysTaken {
+                            pending.push(PendingShaderFlow {
+                                pc: next_pc,
+                                stack: state.stack.clone(),
+                            });
+                        }
+                        if disposition == BranchDisposition::NeverTaken {
+                            state.pc = next_pc;
+                        } else {
+                            state.pc = target;
+                        }
+                    }
+                    Some(MaxwellOpcode::SYNC) => {
+                        if !Self::continue_from_stack_target(
+                            &mut pending,
+                            &mut state,
+                            next_pc,
+                            FlowStackToken::Ssy,
+                            disposition,
+                        ) {
+                            break;
+                        }
+                    }
+                    Some(MaxwellOpcode::BRK) => {
+                        if !Self::continue_from_stack_target(
+                            &mut pending,
+                            &mut state,
+                            next_pc,
+                            FlowStackToken::Pbk,
+                            disposition,
+                        ) {
+                            break;
+                        }
+                    }
+                    Some(MaxwellOpcode::CONT) => {
+                        if !Self::continue_from_stack_target(
+                            &mut pending,
+                            &mut state,
+                            next_pc,
+                            FlowStackToken::Pcnt,
+                            disposition,
+                        ) {
+                            break;
+                        }
+                    }
+                    Some(MaxwellOpcode::RET) | Some(MaxwellOpcode::PRET) => {
+                        if !Self::continue_from_stack_target(
+                            &mut pending,
+                            &mut state,
+                            next_pc,
+                            FlowStackToken::Pret,
+                            disposition,
+                        ) {
+                            break;
+                        }
+                    }
+                    Some(MaxwellOpcode::EXIT) | Some(MaxwellOpcode::PEXIT) => {
+                        if !Self::continue_from_stack_target(
+                            &mut pending,
+                            &mut state,
+                            next_pc,
+                            FlowStackToken::Pexit,
+                            disposition,
+                        ) {
+                            break;
+                        }
+                    }
+                    Some(MaxwellOpcode::LONGJMP) | Some(MaxwellOpcode::PLONGJMP) => {
+                        if !Self::continue_from_stack_target(
+                            &mut pending,
+                            &mut state,
+                            next_pc,
+                            FlowStackToken::Plongjmp,
+                            disposition,
+                        ) {
+                            break;
+                        }
+                    }
+                    Some(MaxwellOpcode::KIL)
+                    | Some(MaxwellOpcode::BRX)
+                    | Some(MaxwellOpcode::JMX) => {
+                        if disposition != BranchDisposition::AlwaysTaken {
+                            pending.push(PendingShaderFlow {
+                                pc: next_pc,
+                                stack: state.stack.clone(),
+                            });
+                        }
+                        break;
+                    }
+                    _ => {
+                        state.pc = next_pc;
+                    }
+                }
+            }
+        }
+    }
+
+    fn relative_branch_target(pc: u32, insn: MaxwellInstruction) -> u32 {
+        pc.wrapping_add_signed(insn.branch_offset())
+            .wrapping_add(SHADER_INSTRUCTION_SIZE)
+    }
+
+    fn branch_disposition(
+        opcode: Option<MaxwellOpcode>,
+        pred: Predicate,
+        flow_test: Option<FlowTest>,
+    ) -> BranchDisposition {
+        let predicate_state = if pred.index == 7 {
+            if pred.negated {
+                BranchDisposition::NeverTaken
+            } else {
+                BranchDisposition::AlwaysTaken
+            }
+        } else {
+            BranchDisposition::Conditional
+        };
+
+        let Some(opcode) = opcode else {
+            return predicate_state;
+        };
+        let flow_state = if Self::opcode_has_flow_test(opcode) {
+            match flow_test {
+                Some(FlowTest::T) => BranchDisposition::AlwaysTaken,
+                Some(FlowTest::F) => BranchDisposition::NeverTaken,
+                Some(_) | None => BranchDisposition::Conditional,
+            }
+        } else {
+            BranchDisposition::AlwaysTaken
+        };
+
+        match (predicate_state, flow_state) {
+            (BranchDisposition::NeverTaken, _) | (_, BranchDisposition::NeverTaken) => {
+                BranchDisposition::NeverTaken
+            }
+            (BranchDisposition::AlwaysTaken, BranchDisposition::AlwaysTaken) => {
+                BranchDisposition::AlwaysTaken
+            }
+            _ => BranchDisposition::Conditional,
+        }
+    }
+
+    fn opcode_has_flow_test(opcode: MaxwellOpcode) -> bool {
+        matches!(
+            opcode,
+            MaxwellOpcode::BRA
+                | MaxwellOpcode::BRX
+                | MaxwellOpcode::EXIT
+                | MaxwellOpcode::JMP
+                | MaxwellOpcode::JMX
+                | MaxwellOpcode::KIL
+                | MaxwellOpcode::BRK
+                | MaxwellOpcode::CONT
+                | MaxwellOpcode::LONGJMP
+                | MaxwellOpcode::PRET
+                | MaxwellOpcode::RET
+                | MaxwellOpcode::SYNC
+        )
+    }
+
+    fn continue_from_stack_target(
+        pending: &mut Vec<PendingShaderFlow>,
+        state: &mut PendingShaderFlow,
+        next_pc: u32,
+        token: FlowStackToken,
+        disposition: BranchDisposition,
+    ) -> bool {
+        if disposition != BranchDisposition::AlwaysTaken {
+            pending.push(PendingShaderFlow {
+                pc: next_pc,
+                stack: state.stack.clone(),
+            });
+        }
+
+        if disposition == BranchDisposition::NeverTaken {
+            state.pc = next_pc;
+            return true;
+        }
+
+        if let Some((target, new_stack)) = Self::pop_flow_stack_target(&state.stack, token) {
+            state.pc = target;
+            state.stack = new_stack;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn pop_flow_stack_target(
+        stack: &[FlowStackEntry],
+        token: FlowStackToken,
+    ) -> Option<(u32, Vec<FlowStackEntry>)> {
+        let index = stack.iter().rposition(|entry| entry.token == token)?;
+        let mut new_stack = Vec::with_capacity(stack.len().saturating_sub(1));
+        new_stack.extend_from_slice(&stack[..index]);
+        new_stack.extend_from_slice(&stack[index + 1..]);
+        Some((stack[index].target, new_stack))
     }
 }
 
@@ -305,10 +833,29 @@ impl Default for ShaderCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engines::engine_interface::EngineInterface;
+    use crate::engines::kepler_compute::QueueMetaData;
+    use crate::engines::maxwell_3d::Maxwell3D;
     use crate::memory_manager::MemoryManager;
     use crate::shader_environment::GenericEnvironment;
     use parking_lot::Mutex as ParkingLotMutex;
     use std::sync::Arc;
+
+    fn make_cpu_reader(
+        cpu_base: u64,
+        backing: Arc<Vec<u8>>,
+    ) -> Arc<dyn Fn(u64, &mut [u8]) + Send + Sync> {
+        Arc::new(move |cpu_addr: u64, dst: &mut [u8]| {
+            dst.fill(0);
+            let offset = cpu_addr.saturating_sub(cpu_base) as usize;
+            if offset >= backing.len() {
+                return;
+            }
+            let available = backing.len() - offset;
+            let count = available.min(dst.len());
+            dst[..count].copy_from_slice(&backing[offset..offset + count]);
+        })
+    }
 
     #[test]
     fn shader_cache_starts_with_upstream_shared_state_defaults() {
@@ -391,5 +938,135 @@ mod tests {
         assert_ne!(shader.unique_hash, 0);
         assert!(shader.size_bytes >= 8);
         assert!(cache.try_get(0x9000).is_some());
+    }
+
+    #[test]
+    fn make_shader_info_slow_path_walks_branch_target_before_hashing() {
+        const BRA_TOP10: u64 = 0x324;
+        const EXIT_TOP10: u64 = 0x34C;
+        const PRED_PT: u64 = 7;
+        const FLOW_T: u64 = 15;
+
+        fn encode_control_flow(top10: u64, branch_offset: i32) -> u64 {
+            (top10 << 54)
+                | (((branch_offset as u32 as u64) & 0x00FF_FFFF) << 20)
+                | (PRED_PT << 16)
+                | FLOW_T
+        }
+
+        let program_base = 0x2_0000_0000;
+        let mut backing = vec![0u8; 0x80];
+        let bra = encode_control_flow(BRA_TOP10, 0x18);
+        let exit = encode_control_flow(EXIT_TOP10, 0);
+        backing[0x00..0x08].copy_from_slice(&bra.to_le_bytes());
+        backing[0x20..0x28].copy_from_slice(&exit.to_le_bytes());
+        let backing = Arc::new(backing);
+        let reader = Arc::new(move |gpu_addr: u64, dst: &mut [u8]| {
+            dst.fill(0);
+            let offset = (gpu_addr - program_base) as usize;
+            if offset >= backing.len() {
+                return;
+            }
+            let available = backing.len() - offset;
+            let count = available.min(dst.len());
+            dst[..count].copy_from_slice(&backing[offset..offset + count]);
+        });
+
+        let mut env = GenericEnvironment::new()
+            .with_gpu_read(reader)
+            .with_program(program_base, 0);
+        let mut cache = ShaderCache::new();
+
+        let shader = cache.make_shader_info(&mut env, 0xA000);
+        assert_ne!(shader.unique_hash, 0);
+        assert_eq!(shader.size_bytes, 0x28);
+    }
+
+    #[test]
+    fn refresh_stages_hashes_enabled_vertexb_shader_for_bound_channel() {
+        let gpu_base = 0x1_0000_0000;
+        let cpu_base = 0x2000;
+        let mut backing = vec![0u8; 0x2000];
+        backing[0x180..0x188].copy_from_slice(&0xE2400FFFFF87000Fu64.to_le_bytes());
+        let backing = Arc::new(backing);
+
+        let memory_manager = Arc::new(ParkingLotMutex::new(MemoryManager::new(0)));
+        memory_manager
+            .lock()
+            .map(gpu_base, cpu_base, 0x2000, 0, false);
+
+        let mut maxwell = Maxwell3D::new();
+        maxwell.set_memory_manager(Arc::clone(&memory_manager));
+        maxwell.set_guest_memory_reader(make_cpu_reader(cpu_base, Arc::clone(&backing)));
+        <Maxwell3D as EngineInterface>::call_method(&mut maxwell, 0x582, 1, true);
+        <Maxwell3D as EngineInterface>::call_method(&mut maxwell, 0x583, 0, true);
+        <Maxwell3D as EngineInterface>::call_method(&mut maxwell, 0x810, 1 | (1 << 4), true);
+        <Maxwell3D as EngineInterface>::call_method(&mut maxwell, 0x811, 0x100, true);
+
+        let mut channel = ChannelState::new(7);
+        channel.program_id = 0x1234;
+        channel.memory_manager = Some(Arc::clone(&memory_manager));
+        channel.maxwell_3d = Some(Box::new(maxwell));
+        channel.kepler_compute = Some(Box::default());
+
+        let mut cache = ShaderCache::new();
+        cache.create_channel(&channel);
+        cache.bind_to_channel(7);
+
+        let mut unique_hashes = [0u64; NUM_PROGRAMS];
+        assert!(cache.refresh_stages(&mut unique_hashes));
+        assert_ne!(unique_hashes[1], 0);
+        assert!(cache.shader_info_slots()[1].is_some());
+        assert!(cache.last_shaders_valid());
+    }
+
+    #[test]
+    fn compute_shader_builds_from_bound_channel_compute_state() {
+        let gpu_base = 0x1_0000_0000;
+        let cpu_base = 0x4000;
+        let mut backing = vec![0u8; 0x2000];
+        backing[0x180..0x188].copy_from_slice(&0xE2400FFFFF87000Fu64.to_le_bytes());
+        let backing = Arc::new(backing);
+
+        let memory_manager = Arc::new(ParkingLotMutex::new(MemoryManager::new(0)));
+        memory_manager
+            .lock()
+            .map(gpu_base, cpu_base, 0x2000, 0, false);
+
+        let mut maxwell = Maxwell3D::new();
+        maxwell.set_memory_manager(Arc::clone(&memory_manager));
+        maxwell.set_guest_memory_reader(make_cpu_reader(cpu_base, Arc::clone(&backing)));
+
+        let mut channel = ChannelState::new(9);
+        channel.program_id = 0x5678;
+        channel.memory_manager = Some(Arc::clone(&memory_manager));
+        channel.maxwell_3d = Some(Box::new(maxwell));
+        channel.kepler_compute = Some(Box::default());
+        let kepler = channel
+            .kepler_compute
+            .as_mut()
+            .expect("compute engine should exist for bound-channel shader-cache test");
+        kepler.call_method(0x582, 1, true);
+        kepler.call_method(0x583, 0, true);
+        kepler.launch_description = QueueMetaData {
+            program_start: 0x100,
+            block_dim_x: 32,
+            block_dim_y: 1,
+            block_dim_z: 1,
+            shared_alloc: 0x80,
+            local_pos_alloc: 0x40,
+            ..QueueMetaData::default()
+        };
+
+        let mut cache = ShaderCache::new();
+        cache.create_channel(&channel);
+        cache.bind_to_channel(9);
+
+        let shader = cache
+            .compute_shader()
+            .expect("bound compute channel should build a shader info");
+        assert_ne!(shader.unique_hash, 0);
+        assert!(shader.size_bytes >= 8);
+        assert!(cache.try_get(cpu_base + 0x100).is_some());
     }
 }

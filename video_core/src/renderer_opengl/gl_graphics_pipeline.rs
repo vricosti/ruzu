@@ -5,7 +5,11 @@
 //!
 //! OpenGL graphics pipeline management -- compiles and configures vertex/fragment/etc shaders.
 
+use std::hash::{Hash, Hasher};
 use std::sync::{Condvar, Mutex};
+
+use crate::transform_feedback::TransformFeedbackState;
+use common::cityhash::city_hash64;
 
 /// Maximum number of textures bound to a graphics pipeline.
 pub const MAX_TEXTURES: u32 = 64;
@@ -25,7 +29,7 @@ pub const XFB_ENTRY_STRIDE: usize = 3;
 /// Key used to identify a unique graphics pipeline configuration.
 ///
 /// Corresponds to `OpenGL::GraphicsPipelineKey`.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[repr(C)]
 pub struct GraphicsPipelineKey {
     pub unique_hashes: [u64; 6],
@@ -34,20 +38,32 @@ pub struct GraphicsPipelineKey {
     /// app_stage(3).
     pub raw: u32,
     pub padding: [u32; 3],
+    pub xfb_state: TransformFeedbackState,
 }
 
 impl GraphicsPipelineKey {
+    const XFB_ENABLED_SHIFT: u32 = 0;
+    const EARLY_Z_SHIFT: u32 = 1;
+    const GS_INPUT_TOPOLOGY_SHIFT: u32 = 2;
+    const TESSELLATION_PRIMITIVE_SHIFT: u32 = 6;
+    const TESSELLATION_SPACING_SHIFT: u32 = 8;
+    const TESSELLATION_CLOCKWISE_SHIFT: u32 = 10;
+    const APP_STAGE_SHIFT: u32 = 11;
+
+    const XFB_ENABLED_MASK: u32 = 0x1 << Self::XFB_ENABLED_SHIFT;
+    const EARLY_Z_MASK: u32 = 0x1 << Self::EARLY_Z_SHIFT;
+    const GS_INPUT_TOPOLOGY_MASK: u32 = 0xF << Self::GS_INPUT_TOPOLOGY_SHIFT;
+    const TESSELLATION_PRIMITIVE_MASK: u32 = 0x3 << Self::TESSELLATION_PRIMITIVE_SHIFT;
+    const TESSELLATION_SPACING_MASK: u32 = 0x3 << Self::TESSELLATION_SPACING_SHIFT;
+    const TESSELLATION_CLOCKWISE_MASK: u32 = 0x1 << Self::TESSELLATION_CLOCKWISE_SHIFT;
+    const APP_STAGE_MASK: u32 = 0x7 << Self::APP_STAGE_SHIFT;
+
     /// Hash the key, considering only relevant bytes (smaller if xfb not enabled).
     pub fn hash_key(&self) -> u64 {
         let size = self.size();
         let bytes: &[u8] =
             unsafe { std::slice::from_raw_parts(self as *const Self as *const u8, size) };
-        let mut h: u64 = 0xcbf29ce484222325;
-        for &b in bytes {
-            h ^= b as u64;
-            h = h.wrapping_mul(0x100000001b3);
-        }
-        h
+        city_hash64(bytes)
     }
 
     /// Returns the xfb_enabled bit.
@@ -58,6 +74,40 @@ impl GraphicsPipelineKey {
     /// Returns the early_z bit.
     pub fn early_z(&self) -> bool {
         ((self.raw >> 1) & 1) != 0
+    }
+
+    pub fn set_xfb_enabled(&mut self, enabled: bool) {
+        self.raw =
+            (self.raw & !Self::XFB_ENABLED_MASK) | ((enabled as u32) << Self::XFB_ENABLED_SHIFT);
+    }
+
+    pub fn set_early_z(&mut self, enabled: bool) {
+        self.raw = (self.raw & !Self::EARLY_Z_MASK) | ((enabled as u32) << Self::EARLY_Z_SHIFT);
+    }
+
+    pub fn set_gs_input_topology(&mut self, topology: u32) {
+        self.raw = (self.raw & !Self::GS_INPUT_TOPOLOGY_MASK)
+            | ((topology & 0xF) << Self::GS_INPUT_TOPOLOGY_SHIFT);
+    }
+
+    pub fn set_tessellation_primitive(&mut self, primitive: u32) {
+        self.raw = (self.raw & !Self::TESSELLATION_PRIMITIVE_MASK)
+            | ((primitive & 0x3) << Self::TESSELLATION_PRIMITIVE_SHIFT);
+    }
+
+    pub fn set_tessellation_spacing(&mut self, spacing: u32) {
+        self.raw = (self.raw & !Self::TESSELLATION_SPACING_MASK)
+            | ((spacing & 0x3) << Self::TESSELLATION_SPACING_SHIFT);
+    }
+
+    pub fn set_tessellation_clockwise(&mut self, clockwise: bool) {
+        self.raw = (self.raw & !Self::TESSELLATION_CLOCKWISE_MASK)
+            | ((clockwise as u32) << Self::TESSELLATION_CLOCKWISE_SHIFT);
+    }
+
+    pub fn set_app_stage(&mut self, app_stage: u32) {
+        self.raw =
+            (self.raw & !Self::APP_STAGE_MASK) | ((app_stage & 0x7) << Self::APP_STAGE_SHIFT);
     }
 
     /// Returns the effective size in bytes for hashing/comparison.
@@ -71,6 +121,12 @@ impl GraphicsPipelineKey {
             // offset of `padding` field
             std::mem::offset_of!(GraphicsPipelineKey, padding)
         }
+    }
+}
+
+impl Hash for GraphicsPipelineKey {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        state.write_u64(self.hash_key());
     }
 }
 
@@ -332,6 +388,11 @@ impl GraphicsPipeline {
         false
     }
 
+    #[cfg(test)]
+    pub fn set_built_for_test(&mut self, built: bool) {
+        self.is_built = built;
+    }
+
     /// Internal: configure transform feedback attributes.
     ///
     /// Port of `GraphicsPipeline::ConfigureTransformFeedbackImpl()`.
@@ -585,6 +646,37 @@ mod tests {
 
         assert!(size_xfb > size_no_xfb);
         assert_eq!(size_xfb, std::mem::size_of::<GraphicsPipelineKey>());
+    }
+
+    #[test]
+    fn graphics_pipeline_key_hash_matches_cityhash_over_effective_size() {
+        let mut key = GraphicsPipelineKey::default();
+        key.unique_hashes = [1, 2, 3, 4, 5, 6];
+        key.set_early_z(true);
+        key.set_gs_input_topology(5);
+        key.set_tessellation_primitive(2);
+        key.set_tessellation_spacing(1);
+        key.set_tessellation_clockwise(true);
+        key.set_app_stage(1);
+
+        let size = key.size();
+        let bytes = unsafe {
+            std::slice::from_raw_parts((&key as *const GraphicsPipelineKey).cast::<u8>(), size)
+        };
+        assert_eq!(key.hash_key(), city_hash64(bytes));
+
+        key.set_xfb_enabled(true);
+        key.xfb_state.layouts[0].stream = 3;
+        key.xfb_state.layouts[0].varying_count = 5;
+        key.xfb_state.layouts[0].stride = 0x20;
+        key.xfb_state.varyings[0][0] =
+            crate::transform_feedback::StreamOutLayout::from_raw(0x0403_0201);
+
+        let size = key.size();
+        let bytes = unsafe {
+            std::slice::from_raw_parts((&key as *const GraphicsPipelineKey).cast::<u8>(), size)
+        };
+        assert_eq!(key.hash_key(), city_hash64(bytes));
     }
 
     #[test]

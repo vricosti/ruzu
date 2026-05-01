@@ -74,6 +74,14 @@ fn should_trace_wait_debug() -> bool {
     std::env::var_os("RUZU_TRACE_WAIT_SYNC").is_some()
 }
 
+fn should_trace_priority_inheritance() -> bool {
+    std::env::var_os("RUZU_TRACE_PI").is_some()
+}
+
+fn should_trace_end_wait() -> bool {
+    std::env::var_os("RUZU_TRACE_END_WAIT").is_some()
+}
+
 // ---------------------------------------------------------------------------
 // Enums matching upstream k_thread.h
 // ---------------------------------------------------------------------------
@@ -1249,6 +1257,18 @@ impl KThread {
         waiter_address_key: KProcessAddress,
         waiter_is_kernel_address_key: bool,
     ) {
+        if should_trace_priority_inheritance() {
+            log::info!(
+                "PI add_waiter owner_tid={} owner_prio={} owner_base={} waiter_tid={} waiter_prio={} addr=0x{:X} kernel={}",
+                self.thread_id,
+                self.priority,
+                self.base_priority,
+                waiter_thread_id,
+                waiter_priority,
+                waiter_address_key.get(),
+                waiter_is_kernel_address_key,
+            );
+        }
         self.add_waiter_impl(
             waiter_thread_id,
             waiter_priority,
@@ -1294,6 +1314,16 @@ impl KThread {
         is_kernel_address_key: bool,
         has_waiters: &mut bool,
     ) -> Option<(u64, i32, Option<LockWithPriorityInheritanceInfo>)> {
+        if should_trace_priority_inheritance() {
+            log::info!(
+                "PI remove_waiter_by_key owner_tid={} prio={} base={} addr=0x{:X} kernel={}",
+                self.thread_id,
+                self.priority,
+                self.base_priority,
+                address_key.get(),
+                is_kernel_address_key,
+            );
+        }
         // Find the lock info for this address.
         let lock_idx = self.find_held_lock_index(address_key, is_kernel_address_key)?;
 
@@ -1315,6 +1345,16 @@ impl KThread {
 
         let next_owner_thread_id = next_owner_key.thread_id;
         let next_owner_priority = next_owner_key.priority;
+
+        if should_trace_priority_inheritance() {
+            log::info!(
+                "PI remove_waiter_by_key choose_next owner_tid={} next_tid={} next_prio={} remaining_waiters_before={}",
+                self.thread_id,
+                next_owner_thread_id,
+                next_owner_priority,
+                lock_info.get_waiter_count(),
+            );
+        }
 
         if lock_info.remove_waiter(next_owner_key.priority, next_owner_key.thread_id) {
             // The new owner was the only waiter — lock info is freed (dropped).
@@ -1351,6 +1391,16 @@ impl KThread {
         if new_priority != self.priority {
             let old_priority = self.priority;
             self.priority = new_priority;
+            if should_trace_priority_inheritance() {
+                log::info!(
+                    "PI restore_priority tid={} old_prio={} new_prio={} base_prio={} held_locks={}",
+                    self.thread_id,
+                    old_priority,
+                    new_priority,
+                    self.base_priority,
+                    self.held_lock_info_list.len(),
+                );
+            }
             self.notify_priority_change(old_priority);
         }
     }
@@ -1406,6 +1456,17 @@ impl KThread {
                 .find(|k| k.thread_id == waiter_thread_id)
                 .copied();
             if let Some(key) = found {
+                if should_trace_priority_inheritance() {
+                    log::info!(
+                        "PI remove_waiter_by_thread_id owner_tid={} owner_prio={} owner_base={} waiter_tid={} waiter_prio={} addr=0x{:X}",
+                        self.thread_id,
+                        self.priority,
+                        self.base_priority,
+                        waiter_thread_id,
+                        key.priority,
+                        self.held_lock_info_list[i].get_address_key().get(),
+                    );
+                }
                 let is_kernel = self.held_lock_info_list[i].get_is_kernel_address_key();
                 let is_empty =
                     self.held_lock_info_list[i].remove_waiter(key.priority, key.thread_id);
@@ -2539,6 +2600,7 @@ impl KThread {
             if self.get_state() == ThreadState::WAITING {
                 if let Some(wq) = self.wait_queue.clone() {
                     wq.cancel_wait(self, RESULT_TERMINATION_REQUESTED.get_inner_value(), true);
+                    self.finalize_wait_transition();
                     // Thread transitioned WAITING → RUNNABLE — push to PQ.
                     // Upstream: OnThreadStateChanged auto-pushes.
                     if let Some(parent) = self.parent.as_ref().and_then(Weak::upgrade) {
@@ -2852,6 +2914,12 @@ impl KThread {
         self.wait_queue = None;
     }
 
+    fn finalize_wait_transition(&mut self) {
+        self.sleep_deadline = None;
+        self.waiting_lock_info = None;
+        self.apply_wait_result_to_context();
+    }
+
     fn lock_scheduler(&self) -> Option<KScopedSchedulerLock<'static>> {
         let scheduler_lock = super::kernel::scheduler_lock()?;
         Some(KScopedSchedulerLock::new(scheduler_lock))
@@ -2877,6 +2945,19 @@ impl KThread {
             return;
         }
 
+        if should_trace_end_wait() {
+            log::info!(
+                "END_WAIT enter tid={} result=0x{:X} wait_reason={:?} wait_queue_present={} prio={} base={} addr=0x{:X}",
+                self.thread_id,
+                _wait_result,
+                self.wait_reason_for_debugging,
+                self.wait_queue.is_some(),
+                self.priority,
+                self.base_priority,
+                self.address_key.get(),
+            );
+        }
+
         // Upstream: ASSERT_MSG(false, "wait_queue is nullptr!"); return;
         // Avoid a hard crash — log and return early like upstream.
         let Some(wait_queue) = self.wait_queue.clone() else {
@@ -2886,9 +2967,18 @@ impl KThread {
             return;
         };
         wait_queue.end_wait(self, _wait_result);
-        self.sleep_deadline = None;
-        self.waiting_lock_info = None;
-        self.apply_wait_result_to_context();
+        self.finalize_wait_transition();
+
+        if should_trace_end_wait() {
+            log::info!(
+                "END_WAIT exit tid={} state={:?} result=0x{:X} prio={} base={}",
+                self.thread_id,
+                self.get_state(),
+                self.wait_result,
+                self.priority,
+                self.base_priority,
+            );
+        }
     }
 
     /// Cancel wait.
@@ -2905,9 +2995,7 @@ impl KThread {
             .clone()
             .expect("KThread::cancel_wait requires wait_queue while waiting");
         wait_queue.cancel_wait(self, _wait_result, _cancel_timer_task);
-        self.sleep_deadline = None;
-        self.waiting_lock_info = None;
-        self.apply_wait_result_to_context();
+        self.finalize_wait_transition();
     }
 
     /// Set the thread's activity (pause/resume).
@@ -3209,14 +3297,17 @@ impl KThread {
             );
         }
         if self.get_state() == ThreadState::WAITING {
-            self.synced_index = -1;
-            self.wait_result = RESULT_TIMED_OUT.get_inner_value();
             crate::hle::kernel::sleep_timing::observe_wake(self.thread_id);
             if let Some(wait_queue) = self.wait_queue.clone() {
                 if ct_trace {
                     log::info!("on_timer tid={} before_cancel_wait", self.thread_id);
                 }
                 wait_queue.cancel_wait(self, RESULT_TIMED_OUT.get_inner_value(), false);
+                // Upstream leaves timeout completion to CancelWait(); keep only
+                // the Rust-local cleanup that has no direct C++ field owner.
+                self.sleep_deadline = None;
+                self.waiting_lock_info = None;
+                self.apply_wait_result_to_context();
                 if ct_trace {
                     log::info!("on_timer tid={} after_cancel_wait", self.thread_id);
                 }
@@ -3464,6 +3555,13 @@ impl Drop for KScopedDisableDispatch {
     }
 }
 
+/// Sleep the current emulated thread.
+/// Mirrors the upstream owner boundary where `svc::SleepThread(...)`
+/// forwards the positive-timeout path to `GetCurrentThread(kernel).Sleep(timeout)`.
+pub fn sleep_current_thread(timeout: i64) -> Option<u32> {
+    super::kernel::get_current_emu_thread().map(|thread| thread.lock().unwrap().sleep(timeout))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3567,11 +3665,18 @@ mod tests {
         assert_eq!(thread.sleep(1), RESULT_SUCCESS.get_inner_value());
         assert_eq!(thread.get_state(), ThreadState::WAITING);
         assert!(thread.get_sleep_deadline().is_some());
+        thread.waiting_lock_info = Some(WaitingLockRef {
+            owner_thread_id: 99,
+            address_key: KProcessAddress::new(0x1234),
+            is_kernel_address_key: false,
+            owner_thread_ptr: 0,
+        });
 
         thread.on_timer();
 
         assert_eq!(thread.get_state(), ThreadState::RUNNABLE);
         assert!(thread.get_sleep_deadline().is_none());
+        assert!(thread.waiting_lock_info.is_none());
         assert_eq!(thread.get_wait_result(), RESULT_TIMED_OUT.get_inner_value());
     }
 

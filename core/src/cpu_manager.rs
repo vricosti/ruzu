@@ -463,8 +463,6 @@ impl CpuManager {
             drop(process);
             (parent_arc, is_64bit, jits)
         };
-        let _parent_arc_keepalive = parent_arc;
-
         loop {
             Self::shutdown_if_requested(kernel);
             let mut physical_core = kernel.current_physical_core();
@@ -477,6 +475,7 @@ impl CpuManager {
                 Self::run_guest_thread_once(
                     kernel,
                     physical_core,
+                    &parent_arc,
                     &thread_arc,
                     is_64bit,
                     &cached_jits,
@@ -505,6 +504,7 @@ impl CpuManager {
     fn run_guest_thread_once(
         kernel: &KernelCore,
         physical_core: &super::hle::kernel::physical_core::PhysicalCore,
+        process: &Arc<ProcessLock>,
         thread_arc: &Arc<KThreadLock>,
         is_64bit: bool,
         cached_jits: &[Option<*mut Box<dyn crate::arm::arm_interface::ArmInterface>>;
@@ -537,6 +537,7 @@ impl CpuManager {
             let jit_ref = &mut **jit;
             let opaque = &mut *(thread_ptr as *mut OpaqueKThread);
             use crate::arm::arm_interface::HaltReason;
+            let mut thread_context = crate::arm::arm_interface::ThreadContext::default();
 
             {
                 let thread = thread_arc.lock().unwrap();
@@ -614,11 +615,17 @@ impl CpuManager {
                     let system_ref = kernel.system();
                     if !system_ref.is_null() {
                         let system = system_ref.get();
-                        crate::hle::kernel::svc_dispatch::call(
-                            system,
+                        physical_core.dispatch_supervisor_call(
+                            jit_ref,
+                            &mut thread_context,
+                            &scheduler,
+                            process,
+                            thread_arc,
                             svc_num,
+                            0,
                             is_64bit,
                             &mut svc_args,
+                            system,
                         );
                         let (switched_scheduler_thread, needs_scheduling) = {
                             let scheduler = scheduler.lock().unwrap();
@@ -633,7 +640,7 @@ impl CpuManager {
                             thread.get_state()
                                 != crate::hle::kernel::k_thread::ThreadState::RUNNABLE
                         };
-                        if switched_scheduler_thread || current_thread_blocked || needs_scheduling {
+                        if current_thread_blocked {
                             log::trace!(
                                 "multi_core_run_guest_thread: tid={} core={} svc=0x{:x} reschedule after SVC switched={} blocked={} needs_sched={}",
                                 current_thread_id,
@@ -645,6 +652,17 @@ impl CpuManager {
                             );
                             Self::reschedule_current_core_raw(kernel);
                             return;
+                        }
+                        if switched_scheduler_thread || needs_scheduling {
+                            log::trace!(
+                                "multi_core_run_guest_thread: tid={} core={} svc=0x{:x} defer reschedule after SVC switched={} blocked={} needs_sched={}",
+                                current_thread_id,
+                                core_index,
+                                svc_num,
+                                switched_scheduler_thread,
+                                current_thread_blocked,
+                                needs_scheduling,
+                            );
                         }
                         log::trace!(
                             "multi_core_run_guest_thread: tid={} core={} svc=0x{:x} returned from svc_dispatch r0=0x{:X} r1=0x{:X}",
@@ -917,7 +935,7 @@ impl CpuManager {
                 // Single-core path: one host thread, no contention. Fetch the
                 // JIT per-iteration (matches upstream's RunThread) — the
                 // multi-core caching optimization above is unnecessary here.
-                let (is_64bit, cached_jits) = {
+                let (parent_arc, is_64bit, cached_jits) = {
                     let parent_weak = {
                         let thread = thread_arc.lock().unwrap();
                         match thread.parent.as_ref() {
@@ -942,11 +960,13 @@ impl CpuManager {
                             );
                         }
                     }
-                    (is_64bit, jits)
+                    drop(process);
+                    (parent_arc, is_64bit, jits)
                 };
                 Self::run_guest_thread_once(
                     kernel,
                     physical_core,
+                    &parent_arc,
                     &thread_arc,
                     is_64bit,
                     &cached_jits,

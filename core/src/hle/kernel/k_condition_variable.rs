@@ -16,8 +16,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use super::k_process::ProcessLock;
+use crate::arm::exclusive_monitor::ExclusiveMonitor;
 use crate::hle::kernel::k_process::KProcess;
-use crate::hle::kernel::k_scheduler::KScheduler;
 use crate::hle::kernel::k_thread::{
     ConditionVariableThreadKey, KThread, KThreadLock, ThreadWaitReasonForDebugging,
 };
@@ -41,6 +41,10 @@ fn trace_kcv(args: std::fmt::Arguments<'_>) {
     if idx < 256 {
         log::info!("{}", args);
     }
+}
+
+fn should_trace_kcv_wake() -> bool {
+    std::env::var_os("RUZU_TRACE_KCV_WAKE").is_some()
 }
 
 fn deadline_from_timeout_tick(timeout_tick: i64, current_tick: Option<i64>) -> Option<Instant> {
@@ -199,17 +203,43 @@ fn write_to_user(process_guard: &KProcess, address: u64, value: u32) -> bool {
 /// Atomic update of the lock tag at `address`.
 /// Matches upstream `UpdateLockAtomic(KernelCore&, u32*, KProcessAddress, u32, u32)`.
 ///
-/// Upstream uses ExclusiveMonitor CAS loop (ExclusiveRead32/ExclusiveWrite32).
-/// In the current implementation, process memory access is serialized by the
-/// process mutex, so a plain read-modify-write is sufficient. When multi-core
-/// guest execution with a real exclusive monitor is implemented, this should
-/// use the ExclusiveMonitor CAS loop.
+/// Upstream uses an ExclusiveMonitor CAS loop (ExclusiveRead32/ExclusiveWrite32).
+/// Rust follows that path when the process owns an initialized exclusive
+/// monitor. Bare-process unit tests can still reach this before
+/// `initialize_interfaces()`, so a serialized fallback remains for those
+/// non-runtime paths only.
 fn update_lock_atomic(
-    process_guard: &KProcess,
+    process_guard: &mut KProcess,
     address: u64,
     if_zero: u32,
     new_orr_mask: u32,
 ) -> Option<u32> {
+    if let Some(monitor) = process_guard.exclusive_monitor.as_mut() {
+        let current_core = super::kernel::get_kernel_ref()
+            .map(|kernel| kernel.current_physical_core_index())
+            .unwrap_or(0);
+
+        loop {
+            // Load the value from the address.
+            let expected = monitor.exclusive_read32(current_core, address);
+
+            // Orr in the new mask.
+            let mut value = expected | new_orr_mask;
+
+            // If the value is zero, use the if_zero value, otherwise use the newly orr'd value.
+            if expected == 0 {
+                value = if_zero;
+            }
+
+            // Try to store; if we fail, retry like upstream.
+            if monitor.exclusive_write32(current_core, address, value) {
+                return Some(expected);
+            }
+        }
+    }
+
+    // Fallback for tests / early bare-process setup paths that do not own an
+    // initialized process-backed exclusive monitor yet.
     // Load the value from the address.
     let expected = read_from_user(process_guard, address)?;
 
@@ -348,47 +378,6 @@ impl KConditionVariable {
         result
     }
 
-    pub(crate) fn wait_for_current_thread(
-        process: &Arc<ProcessLock>,
-        current_thread: &Arc<KThreadLock>,
-    ) {
-        let scheduler = super::kernel::get_kernel_ref()
-            .and_then(|kernel| kernel.current_scheduler().cloned())
-            .or_else(|| {
-                current_thread
-                    .lock()
-                    .unwrap()
-                    .scheduler
-                    .as_ref()
-                    .and_then(|scheduler| scheduler.upgrade())
-            })
-            .or_else(|| {
-                process
-                    .lock()
-                    .unwrap()
-                    .scheduler
-                    .as_ref()
-                    .and_then(|scheduler| scheduler.upgrade())
-            });
-
-        while current_thread.lock().unwrap().get_state() == super::k_thread::ThreadState::WAITING {
-            if let Some(scheduler) = scheduler.as_ref() {
-                scheduler.lock().unwrap().request_schedule();
-
-                let sched_ptr = {
-                    let mut scheduler_guard = scheduler.lock().unwrap();
-                    &mut *scheduler_guard as *mut KScheduler
-                };
-
-                unsafe {
-                    KScheduler::reschedule_current_core_raw(sched_ptr);
-                }
-            } else {
-                std::thread::yield_now();
-            }
-        }
-    }
-
     /// Wait for the lock at the given address.
     /// Matches upstream `KConditionVariable::WaitForAddress(KernelCore&, Handle, KProcessAddress, u32)`.
     ///
@@ -406,10 +395,8 @@ impl KConditionVariable {
         let current_thread_id = current_thread.lock().unwrap().get_thread_id();
 
         // Upstream's `KScopedSchedulerLock sl(kernel)` scope covers ONLY
-        // the "set up the wait" phase — it drops BEFORE the fiber-wait
-        // begins. Holding it across `wait_for_current_thread` would
-        // deadlock: another thread needs the same scheduler lock to fire
-        // EndWait and wake us.
+        // the "set up the wait" phase — it drops before the wait result is
+        // observed again on this guest fiber.
         let setup_result: Result<(), ResultCode> = (|| {
             let scheduler_lock = super::kernel::scheduler_lock()
                 .expect("scheduler_lock must exist — kernel not initialized?");
@@ -505,7 +492,6 @@ impl KConditionVariable {
             return early_return;
         }
 
-        Self::wait_for_current_thread(process, current_thread);
         let wait_result = current_thread.lock().unwrap().get_wait_result();
         log::trace!(
             "KConditionVariable::wait_for_address woke tid={} handle=0x{:08X} addr=0x{:X} wait_result={:#x}",
@@ -644,7 +630,6 @@ impl KConditionVariable {
         };
 
         if result == RESULT_SUCCESS {
-            Self::wait_for_current_thread(process, current_thread);
             ResultCode::new(current_thread.lock().unwrap().get_wait_result())
         } else {
             result
@@ -884,9 +869,25 @@ impl KConditionVariable {
         );
 
         if let Some(prev_tag) = prev_tag {
+            if should_trace_kcv_wake() {
+                log::info!(
+                    "KCV_WAKE signal_impl waiter_tid={} addr=0x{:X} own_tag=0x{:08X} prev_tag=0x{:08X}",
+                    waiting_thread_id,
+                    address.get(),
+                    own_tag,
+                    prev_tag,
+                );
+            }
             if prev_tag == INVALID_HANDLE {
                 // If nobody held the lock previously, we're all good.
                 // Matches upstream: thread->EndWait(ResultSuccess);
+                if should_trace_kcv_wake() {
+                    log::info!(
+                        "KCV_WAKE immediate_end_wait waiter_tid={} addr=0x{:X}",
+                        waiting_thread_id,
+                        address.get(),
+                    );
+                }
                 waiting_thread
                     .lock()
                     .unwrap()
@@ -910,6 +911,17 @@ impl KConditionVariable {
                     let wt_address_key = wt.get_address_key();
                     let wt_is_kernel = wt.get_is_kernel_address_key();
                     drop(wt);
+
+                    let owner_id = owner_thread.lock().unwrap().get_thread_id();
+                    if should_trace_kcv_wake() {
+                        log::info!(
+                            "KCV_WAKE requeue_waiter waiter_tid={} owner_tid={} addr=0x{:X} prev_tag=0x{:08X}",
+                            wt_id,
+                            owner_id,
+                            wt_address_key.get(),
+                            prev_tag,
+                        );
+                    }
 
                     owner_thread.lock().unwrap().add_waiter(
                         wt_id,
@@ -1484,7 +1496,7 @@ mod tests {
     }
 
     #[test]
-    fn wait_locked_guest_thread_path_loops_until_signal() {
+    fn wait_locked_guest_thread_path_resumes_after_signal_without_extra_wait_shim() {
         let (process, owner, _waiter, _owner_handle, address) = setup_threads();
         let key = 0x1c40;
         let start = Instant::now();

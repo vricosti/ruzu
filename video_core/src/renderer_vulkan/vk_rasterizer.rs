@@ -486,7 +486,12 @@ impl RasterizerVulkan {
     }
 
     /// Port of `RasterizerVulkan::AccelerateSurfaceCopy`.
-    pub fn accelerate_surface_copy(&mut self) -> bool {
+    pub fn accelerate_surface_copy(
+        &mut self,
+        _src: &crate::engines::fermi_2d::Surface,
+        _dst: &crate::engines::fermi_2d::Surface,
+        _copy_config: &crate::engines::fermi_2d::Config,
+    ) -> bool {
         // Delegates to blit_image via texture_cache
         false
     }

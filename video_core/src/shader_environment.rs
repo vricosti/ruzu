@@ -7,8 +7,27 @@
 //! from GPU memory during shader compilation.
 
 use std::collections::HashMap;
+use std::fs;
+use std::io::Write;
 use std::path::Path;
 use std::sync::Arc;
+
+use crate::engines::kepler_compute::{KeplerCompute, QmdConstBuffer};
+use crate::engines::maxwell_3d::{
+    ComponentType as MaxwellComponentType, ConstBufferBinding, EngineHint, Maxwell3D,
+    SamplerBinding, ShaderStageType, TextureDescriptor, TextureFormat as MaxwellTextureFormat,
+    TextureType as MaxwellTextureType,
+};
+use crate::memory_manager::MemoryManager;
+use crate::texture_cache::format_lookup_table::{
+    pixel_format_from_texture_info, ComponentType as LookupComponentType,
+    TextureFormat as LookupTextureFormat,
+};
+use crate::textures::texture::texture_pair;
+use common::fs::fs_util::path_to_utf8_string;
+use common::fs::path_util::{get_ruzu_path, RuzuPath};
+use parking_lot::Mutex as ParkingLotMutex;
+use shader_recompiler::program_header::ProgramHeader;
 
 /// GPU virtual address type.
 pub type GPUVAddr = u64;
@@ -34,15 +53,15 @@ const SELF_BRANCH_A: u64 = 0xE2400FFFFF87000F;
 /// Upstream: `GenericEnvironment::TryFindSize` line 252.
 const SELF_BRANCH_B: u64 = 0xE2400FFFFF07000F;
 
-/// GPU memory reader callback shape: read `bytes.len()` bytes starting at
-/// the given GPU virtual address.
+/// Guest CPU-memory reader callback shape: read `bytes.len()` bytes starting
+/// at the given CPU address.
 ///
-/// Rust adaptation of upstream's `Tegra::MemoryManager*` member field on
-/// `GenericEnvironment`. The Rust port doesn't have a single, persistent
-/// `MemoryManager` reference reachable from every video_core component
-/// yet, so the reader is injected as an `Arc<dyn Fn>` callback by the
-/// owner that does have access (e.g. `RasterizerOpenGL` via the
-/// `gpu_read` callback already plumbed through `render_draw_calls`).
+/// Rust adaptation helper used with the current `MemoryManager` port.
+/// Upstream `GenericEnvironment` stores a `Tegra::MemoryManager*` and lets
+/// it fetch shader bytes directly. The Rust `MemoryManager` still requires a
+/// CPU-address reader callback to complete `read_block(...)`, so this callback
+/// is kept as the closest available transport until that owner graph is made
+/// literal too.
 ///
 /// `Send + Sync` so it can be cloned across threads / fibers safely.
 pub type GpuMemoryReader = Arc<dyn Fn(GPUVAddr, &mut [u8]) + Send + Sync>;
@@ -71,6 +90,85 @@ pub fn make_cbuf_key(index: u32, offset: u32) -> u64 {
     ((index as u64) << 32) | (offset as u64)
 }
 
+fn stage_to_prefix(stage: ShaderStage) -> &'static str {
+    match stage {
+        ShaderStage::VertexB => "VB",
+        ShaderStage::TessellationControl => "TC",
+        ShaderStage::TessellationEval => "TE",
+        ShaderStage::Geometry => "GS",
+        ShaderStage::Fragment => "FS",
+        ShaderStage::Compute => "CS",
+        ShaderStage::VertexA => "VA",
+    }
+}
+
+fn dump_impl(
+    pipeline_hash: u64,
+    shader_hash: u64,
+    code: &[u64],
+    initial_offset: u32,
+    stage: ShaderStage,
+) {
+    let shader_dir = get_ruzu_path(RuzuPath::DumpDir);
+    let base_dir = shader_dir.join("shaders");
+    if let Err(error) = fs::create_dir_all(&base_dir) {
+        log::error!(
+            "Failed to create shader dump directories {}: {}",
+            path_to_utf8_string(&base_dir),
+            error
+        );
+        return;
+    }
+    let prefix = stage_to_prefix(stage);
+    let path = base_dir.join(format!(
+        "{pipeline_hash:016x}_{prefix}_{shader_hash:016x}.ash"
+    ));
+    let initial_offset = initial_offset as usize;
+    if initial_offset % INST_SIZE != 0 || initial_offset > code.len() * INST_SIZE {
+        log::error!(
+            "shader_environment::dump_impl: invalid initial_offset={} for {:?}",
+            initial_offset,
+            path
+        );
+        return;
+    }
+    let jump_index = initial_offset / INST_SIZE;
+    let code_size = code.len() * INST_SIZE - initial_offset;
+    let code_bytes =
+        unsafe { std::slice::from_raw_parts(code[jump_index..].as_ptr() as *const u8, code_size) };
+    let mut file = match std::fs::File::create(&path) {
+        Ok(file) => file,
+        Err(error) => {
+            log::error!(
+                "Failed to create shader dump file {}: {}",
+                path_to_utf8_string(&path),
+                error
+            );
+            return;
+        }
+    };
+    if let Err(error) = file.write_all(code_bytes) {
+        log::error!(
+            "Failed to write shader dump file {}: {}",
+            path_to_utf8_string(&path),
+            error
+        );
+        return;
+    }
+
+    // Upstream pads to the next 32-byte boundary after accounting for the
+    // skipped terminal self-branch instruction.
+    let padding_needed = (32 - ((code_size + INST_SIZE) % 32)) % 32;
+    let zeroes = vec![0u8; INST_SIZE + padding_needed];
+    if let Err(error) = file.write_all(&zeroes) {
+        log::error!(
+            "Failed to finalize shader dump file {}: {}",
+            path_to_utf8_string(&path),
+            error
+        );
+    }
+}
+
 /// Generic shader environment base.
 ///
 /// Provides instruction reading, constant buffer access, and texture info
@@ -82,37 +180,45 @@ pub fn make_cbuf_key(index: u32, offset: u32) -> u64 {
 /// The Rust port replaces that pointer with the [`GpuMemoryReader`]
 /// callback set via [`GenericEnvironment::with_gpu_read`].
 pub struct GenericEnvironment {
-    pub program_base: GPUVAddr,
-    pub start_address: u32,
-    pub stage: ShaderStage,
+    program_base: GPUVAddr,
+    start_address: u32,
+    stage: ShaderStage,
 
-    pub code: Vec<u64>,
-    pub texture_types: HashMap<u32, TextureType>,
-    pub texture_pixel_formats: HashMap<u32, TexturePixelFormat>,
-    pub cbuf_values: HashMap<u64, u32>,
-    pub cbuf_replacements: HashMap<u64, ReplaceConstant>,
+    code: Vec<u64>,
+    texture_types: HashMap<u32, TextureType>,
+    texture_pixel_formats: HashMap<u32, TexturePixelFormat>,
+    cbuf_values: HashMap<u64, u32>,
+    cbuf_replacements: HashMap<u64, ReplaceConstant>,
 
-    pub local_memory_size: u32,
-    pub texture_bound: u32,
-    pub shared_memory_size: u32,
-    pub workgroup_size: [u32; 3],
+    local_memory_size: u32,
+    texture_bound: u32,
+    shared_memory_size: u32,
+    workgroup_size: [u32; 3],
 
-    pub read_lowest: u32,
-    pub read_highest: u32,
-    pub cached_lowest: u32,
-    pub cached_highest: u32,
-    pub initial_offset: u32,
-    pub viewport_transform_state: u32,
+    read_lowest: u32,
+    read_highest: u32,
+    cached_lowest: u32,
+    cached_highest: u32,
+    initial_offset: u32,
+    viewport_transform_state: u32,
+    sph: ProgramHeader,
+    gp_passthrough_mask: [u32; 8],
 
-    pub has_unbound_instructions: bool,
-    pub has_hle_engine_state: bool,
-    pub is_proprietary_driver: bool,
+    has_unbound_instructions: bool,
+    has_hle_engine_state: bool,
+    is_proprietary_driver: bool,
 
     /// GPU memory reader. Rust adaptation of upstream's
-    /// `Tegra::MemoryManager*` field. `None` means no reader has been
-    /// installed yet — methods that need to fetch GPU memory will return
-    /// the documented "no data" value (0 from `read_instruction`,
-    /// `None` from `analyze`) instead of panicking.
+    /// stored `Tegra::MemoryManager*` owner. When present, shader reads go
+    /// through this owner first.
+    gpu_memory: Option<Arc<ParkingLotMutex<MemoryManager>>>,
+
+    /// Guest CPU-memory reader used by the current `MemoryManager`
+    /// adaptation.
+    ///
+    /// `None` means no reader has been installed yet — methods that need to
+    /// fetch GPU memory will return the documented "no data" value (0 from
+    /// `read_instruction`, `None` from `analyze`) instead of panicking.
     gpu_read: Option<GpuMemoryReader>,
 }
 
@@ -137,9 +243,12 @@ impl GenericEnvironment {
             cached_highest: 0,
             initial_offset: 0,
             viewport_transform_state: 1,
+            sph: ProgramHeader::default(),
+            gp_passthrough_mask: [0; 8],
             has_unbound_instructions: false,
             has_hle_engine_state: false,
             is_proprietary_driver: false,
+            gpu_memory: None,
             gpu_read: None,
         }
     }
@@ -156,12 +265,31 @@ impl GenericEnvironment {
         self
     }
 
+    /// Store the closest available upstream owner replacement for
+    /// `Tegra::MemoryManager*`.
+    pub fn with_gpu_memory(mut self, gpu_memory: Arc<ParkingLotMutex<MemoryManager>>) -> Self {
+        self.gpu_memory = Some(gpu_memory);
+        self
+    }
+
     /// Set program base / start address. Mirrors the upstream constructor's
     /// `program_base_` and `start_address_` parameters.
     pub fn with_program(mut self, program_base: GPUVAddr, start_address: u32) -> Self {
         self.program_base = program_base;
         self.start_address = start_address;
         self
+    }
+
+    /// Rust adaptation for owner-local stage assignment on reduced callers
+    /// that construct `GenericEnvironment` directly.
+    pub fn with_stage(mut self, stage: ShaderStage) -> Self {
+        self.stage = stage;
+        self
+    }
+
+    /// Port of the upstream base-owner `StartAddress()` accessor.
+    pub fn start_address(&self) -> u32 {
+        self.start_address
     }
 
     pub fn texture_bound_buffer(&self) -> u32 {
@@ -196,11 +324,10 @@ impl GenericEnvironment {
         // We use the injected reader. With no reader installed, this slot
         // is unreachable through the normal pipeline-build path (the cache
         // gates pipeline creation on `has_gpu_memory_reader`).
-        let Some(reader) = self.gpu_read.as_ref() else {
-            return 0;
-        };
         let mut buf = [0u8; INST_SIZE];
-        reader(self.program_base + address as u64, &mut buf);
+        if !self.read_gpu_bytes(self.program_base + address as u64, &mut buf) {
+            return 0;
+        }
         u64::from_le_bytes(buf)
     }
 
@@ -223,7 +350,6 @@ impl GenericEnvironment {
     /// Port of upstream `GenericEnvironment::TryFindSize`
     /// (`shader_environment.cpp:247`).
     fn try_find_size(&mut self) -> Option<u64> {
-        let reader = self.gpu_read.as_ref()?.clone();
         let mut guest_addr = self.program_base + self.start_address as u64;
         let mut offset: usize = 0;
         let mut size: usize = TRY_FIND_SIZE_BLOCK_BYTES;
@@ -234,7 +360,9 @@ impl GenericEnvironment {
             let words_offset = offset / INST_SIZE;
             let words_in_block = TRY_FIND_SIZE_BLOCK_BYTES / INST_SIZE;
             let mut block_bytes = [0u8; TRY_FIND_SIZE_BLOCK_BYTES];
-            reader(guest_addr, &mut block_bytes);
+            if !self.read_gpu_bytes(guest_addr, &mut block_bytes) {
+                return None;
+            }
             for i in 0..words_in_block {
                 let chunk: [u8; 8] = block_bytes[i * 8..(i + 1) * 8]
                     .try_into()
@@ -267,10 +395,9 @@ impl GenericEnvironment {
         self.code.resize(self.cached_size_words(), 0);
         // Upstream: `gpu_memory->ReadBlock(program_base + cached_lowest,
         //                                  code.data(), code.size() * sizeof(u64));`
-        if let Some(reader) = self.gpu_read.as_ref() {
-            let bytes_to_read = self.code.len() * INST_SIZE;
-            let mut buf = vec![0u8; bytes_to_read];
-            reader(self.program_base + self.cached_lowest as u64, &mut buf);
+        let bytes_to_read = self.code.len() * INST_SIZE;
+        let mut buf = vec![0u8; bytes_to_read];
+        if self.read_gpu_bytes(self.program_base + self.cached_lowest as u64, &mut buf) {
             for (i, chunk) in buf.chunks_exact(8).enumerate() {
                 self.code[i] = u64::from_le_bytes(chunk.try_into().expect("8 bytes"));
             }
@@ -285,6 +412,15 @@ impl GenericEnvironment {
         (self.cached_highest as usize) - (self.cached_lowest as usize) + INST_SIZE
     }
 
+    /// Borrow the cached shader body as instruction words.
+    ///
+    /// This is the owner-local replacement for foreign-file reads of the
+    /// upstream base-class `code`/`cached_highest` members.
+    pub fn cached_code_slice(&self) -> &[u64] {
+        let words = (self.cached_highest as usize) / INST_SIZE;
+        &self.code[..words.min(self.code.len())]
+    }
+
     pub fn read_size_bytes(&self) -> usize {
         (self.read_highest as usize) - (self.read_lowest as usize) + INST_SIZE
     }
@@ -297,17 +433,56 @@ impl GenericEnvironment {
     ///
     /// Port of upstream `GenericEnvironment::CalculateHash` (cpp:185).
     pub fn calculate_hash(&self) -> u64 {
-        let Some(reader) = self.gpu_read.as_ref() else {
-            return 0;
-        };
         let size = self.read_size_bytes();
         let mut buf = vec![0u8; size];
-        reader(self.program_base + self.read_lowest as u64, &mut buf);
+        if !self.read_gpu_bytes(self.program_base + self.read_lowest as u64, &mut buf) {
+            return 0;
+        }
         common::cityhash::city_hash64(&buf)
     }
 
     pub fn has_hle_macro_state(&self) -> bool {
         self.has_hle_engine_state
+    }
+
+    /// Port of upstream protected `GenericEnvironment::ReadTextureInfo(...)`.
+    fn read_texture_info(
+        &self,
+        tic_addr: GPUVAddr,
+        tic_limit: u32,
+        via_header_index: bool,
+        raw: u32,
+    ) -> TextureDescriptor {
+        let (tic_index, _) = texture_pair(raw, via_header_index);
+        assert!(tic_index <= tic_limit);
+        let Some(reader) = self.gpu_read.as_ref() else {
+            return TextureDescriptor::from_words(&[0; 8]);
+        };
+        let mut raw_bytes = [0u8; 32];
+        if let Some(gpu_memory) = self.gpu_memory.as_ref() {
+            gpu_memory.lock().read_block(
+                tic_addr + tic_index as u64 * 32,
+                &mut raw_bytes,
+                &**reader,
+            );
+        } else {
+            reader(tic_addr + tic_index as u64 * 32, &mut raw_bytes);
+        }
+        let mut words = [0u32; 8];
+        for (index, chunk) in raw_bytes.chunks_exact(4).enumerate() {
+            words[index] = u32::from_le_bytes(chunk.try_into().expect("4-byte TIC word"));
+        }
+        TextureDescriptor::from_words(&words)
+    }
+
+    pub fn dump(&mut self, pipeline_hash: u64, shader_hash: u64) {
+        dump_impl(
+            pipeline_hash,
+            shader_hash,
+            &self.code,
+            self.initial_offset,
+            self.stage,
+        );
     }
 
     /// Helper for `analyze`: borrow the first `size` bytes of `code` as a
@@ -319,6 +494,26 @@ impl GenericEnvironment {
         let len = size.min(total_bytes);
         unsafe { std::slice::from_raw_parts(self.code.as_ptr() as *const u8, len) }
     }
+
+    fn read_gpu_bytes(&self, gpu_addr: GPUVAddr, output: &mut [u8]) -> bool {
+        let Some(reader) = self.gpu_read.as_ref() else {
+            return false;
+        };
+        if let Some(gpu_memory) = self.gpu_memory.as_ref() {
+            gpu_memory.lock().read_block(gpu_addr, output, &**reader);
+        } else {
+            reader(gpu_addr, output);
+        }
+        true
+    }
+
+    fn read_u32(&self, gpu_addr: GPUVAddr) -> u32 {
+        let mut bytes = [0u8; 4];
+        if !self.read_gpu_bytes(gpu_addr, &mut bytes) {
+            return 0;
+        }
+        u32::from_le_bytes(bytes)
+    }
 }
 
 impl Default for GenericEnvironment {
@@ -329,17 +524,275 @@ impl Default for GenericEnvironment {
 
 /// Graphics shader environment.
 pub struct GraphicsEnvironment {
-    pub base: GenericEnvironment,
-    pub stage_index: usize,
-    // maxwell3d: &Maxwell3D,
+    base: GenericEnvironment,
+    maxwell3d: *const Maxwell3D,
+    stage_index: usize,
+    /// Rust-only fallback state for tests. Upstream live-owner paths read
+    /// these values directly from `maxwell3d`.
+    #[cfg(test)]
+    detached_state: GraphicsEnvironmentDetachedState,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy)]
+struct GraphicsEnvironmentDetachedState {
+    const_buffers: [ConstBufferBinding; 18],
+    tex_header_pool_addr: u64,
+    tex_header_pool_limit: u32,
+    sampler_binding: SamplerBinding,
 }
 
 impl GraphicsEnvironment {
     pub fn new() -> Self {
         Self {
             base: GenericEnvironment::new(),
+            maxwell3d: std::ptr::null(),
             stage_index: 0,
+            #[cfg(test)]
+            detached_state: GraphicsEnvironmentDetachedState {
+                const_buffers: [ConstBufferBinding::default(); 18],
+                tex_header_pool_addr: 0,
+                tex_header_pool_limit: 0,
+                sampler_binding: SamplerBinding::Independently,
+            },
         }
+    }
+
+    /// Port of `GraphicsEnvironment::GraphicsEnvironment(...)`.
+    pub fn from_maxwell3d(
+        maxwell3d: &Maxwell3D,
+        program: ShaderStageType,
+        program_base: GPUVAddr,
+        start_address: u32,
+    ) -> Self {
+        let mut env = Self::new();
+        env.maxwell3d = maxwell3d as *const Maxwell3D;
+        env.base = GenericEnvironment::new().with_program(program_base, start_address);
+        if let Some(gpu_memory) = maxwell3d.memory_manager() {
+            env.base = std::mem::take(&mut env.base).with_gpu_memory(gpu_memory);
+        }
+        if let Some(gpu_reader) = maxwell3d.guest_memory_reader() {
+            env.base = std::mem::take(&mut env.base).with_gpu_read(gpu_reader);
+        }
+        match program {
+            ShaderStageType::VertexA => {
+                env.base.stage = ShaderStage::VertexA;
+                env.stage_index = 0;
+            }
+            ShaderStageType::VertexB => {
+                env.base.stage = ShaderStage::VertexB;
+                env.stage_index = 0;
+            }
+            ShaderStageType::TessInit => {
+                env.base.stage = ShaderStage::TessellationControl;
+                env.stage_index = 1;
+            }
+            ShaderStageType::Tessellation => {
+                env.base.stage = ShaderStage::TessellationEval;
+                env.stage_index = 2;
+            }
+            ShaderStageType::Geometry => {
+                env.base.stage = ShaderStage::Geometry;
+                env.stage_index = 3;
+            }
+            ShaderStageType::Fragment => {
+                env.base.stage = ShaderStage::Fragment;
+                env.stage_index = 4;
+            }
+            ShaderStageType::Invalid => {}
+        }
+        env.base.initial_offset = std::mem::size_of::<ProgramHeader>() as u32;
+        env.base.gp_passthrough_mask = maxwell3d.post_vtg_shader_attrib_skip_mask();
+        env.base.texture_bound = maxwell3d.bindless_texture_const_buffer_slot();
+        env.base.is_proprietary_driver = env.base.texture_bound == 2;
+        env.base.has_hle_engine_state = maxwell3d.engine_state() == EngineHint::OnHleMacro;
+        if env.base.gpu_read.is_some() {
+            let mut bytes = [0u8; std::mem::size_of::<ProgramHeader>()];
+            env.base
+                .read_gpu_bytes(program_base + start_address as u64, &mut bytes);
+            for (index, chunk) in bytes.chunks_exact(4).enumerate() {
+                env.base.sph.raw[index] =
+                    u32::from_le_bytes(chunk.try_into().expect("4-byte SPH word"));
+            }
+            env.base.local_memory_size = env.base.sph.local_memory_size() as u32
+                + env.base.sph.shader_local_memory_crs_size();
+        }
+        env
+    }
+
+    fn maxwell3d(&self) -> &Maxwell3D {
+        unsafe { self.maxwell3d.as_ref() }
+            .expect("GraphicsEnvironment requires a live Maxwell3D owner outside tests")
+    }
+
+    #[cfg(test)]
+    fn graphics_const_buffer_binding_for_test(
+        &self,
+        cbuf_index: u32,
+    ) -> Option<ConstBufferBinding> {
+        unsafe { self.maxwell3d.as_ref() }
+            .and_then(|maxwell3d| {
+                maxwell3d
+                    .const_buffer_bindings(self.stage_index)
+                    .get(cbuf_index as usize)
+                    .copied()
+            })
+            .or_else(|| {
+                self.detached_state
+                    .const_buffers
+                    .get(cbuf_index as usize)
+                    .copied()
+            })
+    }
+
+    #[cfg(test)]
+    fn texture_header_state_for_test(&self) -> (u64, u32, bool) {
+        if let Some(maxwell3d) = unsafe { self.maxwell3d.as_ref() } {
+            (
+                maxwell3d.tex_header_pool_address(),
+                maxwell3d.tex_header_pool_limit(),
+                maxwell3d.sampler_binding() == SamplerBinding::ViaHeaderBinding,
+            )
+        } else {
+            (
+                self.detached_state.tex_header_pool_addr,
+                self.detached_state.tex_header_pool_limit,
+                self.detached_state.sampler_binding == SamplerBinding::ViaHeaderBinding,
+            )
+        }
+    }
+
+    pub fn read_cbuf_value(&mut self, cbuf_index: u32, cbuf_offset: u32) -> u32 {
+        #[cfg(test)]
+        let binding = self.graphics_const_buffer_binding_for_test(cbuf_index);
+        #[cfg(not(test))]
+        let binding = self
+            .maxwell3d()
+            .const_buffer_bindings(self.stage_index)
+            .get(cbuf_index as usize)
+            .copied();
+        let binding = binding.unwrap_or_else(|| {
+            panic!(
+                "GraphicsEnvironment::read_cbuf_value: invalid cbuf index {} for stage {}",
+                cbuf_index, self.stage_index
+            )
+        });
+        assert!(
+            binding.enabled,
+            "GraphicsEnvironment::read_cbuf_value: disabled cbuf {} for stage {}",
+            cbuf_index, self.stage_index
+        );
+        let mut value = 0u32;
+        if cbuf_offset < binding.size {
+            value = self.base.read_u32(binding.address + cbuf_offset as u64);
+        }
+        self.base
+            .cbuf_values
+            .insert(make_cbuf_key(cbuf_index, cbuf_offset), value);
+        value
+    }
+
+    pub fn read_texture_type(&mut self, handle: u32) -> TextureType {
+        #[cfg(test)]
+        let (tex_header_pool_addr, tex_header_pool_limit, via_header_binding) =
+            self.texture_header_state_for_test();
+        #[cfg(not(test))]
+        let maxwell3d = self.maxwell3d();
+        #[cfg(not(test))]
+        let tex_header_pool_addr = maxwell3d.tex_header_pool_address();
+        #[cfg(not(test))]
+        let tex_header_pool_limit = maxwell3d.tex_header_pool_limit();
+        #[cfg(not(test))]
+        let via_header_binding = maxwell3d.sampler_binding() == SamplerBinding::ViaHeaderBinding;
+        let entry = self.base.read_texture_info(
+            tex_header_pool_addr,
+            tex_header_pool_limit,
+            via_header_binding,
+            handle,
+        );
+        let result = convert_texture_type(&entry);
+        self.base.texture_types.insert(handle, result);
+        result
+    }
+
+    pub fn read_texture_pixel_format(&mut self, handle: u32) -> TexturePixelFormat {
+        #[cfg(test)]
+        let (tex_header_pool_addr, tex_header_pool_limit, via_header_binding) =
+            self.texture_header_state_for_test();
+        #[cfg(not(test))]
+        let maxwell3d = self.maxwell3d();
+        #[cfg(not(test))]
+        let tex_header_pool_addr = maxwell3d.tex_header_pool_address();
+        #[cfg(not(test))]
+        let tex_header_pool_limit = maxwell3d.tex_header_pool_limit();
+        #[cfg(not(test))]
+        let via_header_binding = maxwell3d.sampler_binding() == SamplerBinding::ViaHeaderBinding;
+        let entry = self.base.read_texture_info(
+            tex_header_pool_addr,
+            tex_header_pool_limit,
+            via_header_binding,
+            handle,
+        );
+        let result = convert_texture_pixel_format(&entry);
+        self.base.texture_pixel_formats.insert(handle, result);
+        result
+    }
+
+    pub fn is_texture_pixel_format_integer(&mut self, handle: u32) -> bool {
+        is_integer_pixel_format(self.read_texture_pixel_format(handle))
+    }
+
+    pub fn read_viewport_transform_state(&mut self) -> u32 {
+        self.base.viewport_transform_state = self.maxwell3d().viewport_transform_state();
+        self.base.viewport_transform_state
+    }
+
+    pub fn get_replace_const_buffer(&mut self, bank: u32, offset: u32) -> Option<ReplaceConstant> {
+        if !self.base.has_hle_engine_state {
+            return None;
+        }
+        let maxwell3d = unsafe { self.maxwell3d.as_ref() }?;
+        let replacement = maxwell3d.get_replace_const_buffer(bank, offset)?;
+        self.base
+            .cbuf_replacements
+            .insert(make_cbuf_key(bank, offset), replacement);
+        Some(replacement)
+    }
+
+    /// Rust adaptation of upstream private inheritance access to the
+    /// `GenericEnvironment` base owner.
+    pub fn generic_environment(&self) -> &GenericEnvironment {
+        &self.base
+    }
+
+    /// Rust adaptation of upstream private inheritance access to the
+    /// mutable `GenericEnvironment` base owner.
+    pub fn generic_environment_mut(&mut self) -> &mut GenericEnvironment {
+        &mut self.base
+    }
+
+    /// Owner-local forwarding surface for upstream `GenericEnvironment::SetCachedSize`.
+    pub fn set_cached_size(&mut self, size_bytes: usize) {
+        self.base.set_cached_size(size_bytes);
+    }
+
+    #[cfg(test)]
+    fn set_detached_const_buffer_binding(&mut self, index: usize, binding: ConstBufferBinding) {
+        self.detached_state.const_buffers[index] = binding;
+        self.maxwell3d = std::ptr::null();
+    }
+
+    #[cfg(test)]
+    fn set_detached_texture_header_pool_state(
+        &mut self,
+        tex_header_pool_addr: u64,
+        tex_header_pool_limit: u32,
+        sampler_binding: SamplerBinding,
+    ) {
+        self.detached_state.tex_header_pool_addr = tex_header_pool_addr;
+        self.detached_state.tex_header_pool_limit = tex_header_pool_limit;
+        self.detached_state.sampler_binding = sampler_binding;
+        self.maxwell3d = std::ptr::null();
     }
 }
 
@@ -349,17 +802,286 @@ impl Default for GraphicsEnvironment {
     }
 }
 
+impl shader_recompiler::environment::Environment for GraphicsEnvironment {
+    fn read_instruction(&mut self, address: u32) -> u64 {
+        self.base.read_instruction(address)
+    }
+
+    fn read_cbuf_value(&mut self, cbuf_index: u32, cbuf_offset: u32) -> u32 {
+        GraphicsEnvironment::read_cbuf_value(self, cbuf_index, cbuf_offset)
+    }
+
+    fn read_texture_type(&mut self, raw_handle: u32) -> TextureType {
+        GraphicsEnvironment::read_texture_type(self, raw_handle)
+    }
+
+    fn read_texture_pixel_format(&mut self, raw_handle: u32) -> TexturePixelFormat {
+        GraphicsEnvironment::read_texture_pixel_format(self, raw_handle)
+    }
+
+    fn is_texture_pixel_format_integer(&mut self, raw_handle: u32) -> bool {
+        GraphicsEnvironment::is_texture_pixel_format_integer(self, raw_handle)
+    }
+
+    fn read_viewport_transform_state(&mut self) -> u32 {
+        GraphicsEnvironment::read_viewport_transform_state(self)
+    }
+
+    fn texture_bound_buffer(&self) -> u32 {
+        self.base.texture_bound_buffer()
+    }
+
+    fn local_memory_size(&self) -> u32 {
+        self.base.local_memory_size()
+    }
+
+    fn shared_memory_size(&self) -> u32 {
+        self.base.shared_memory_size()
+    }
+
+    fn workgroup_size(&self) -> [u32; 3] {
+        self.base.workgroup_size()
+    }
+
+    fn has_hle_macro_state(&self) -> bool {
+        self.base.has_hle_macro_state()
+    }
+
+    fn get_replace_const_buffer(&mut self, bank: u32, offset: u32) -> Option<ReplaceConstant> {
+        GraphicsEnvironment::get_replace_const_buffer(self, bank, offset)
+    }
+
+    fn dump(&mut self, pipeline_hash: u64, shader_hash: u64) {
+        self.base.dump(pipeline_hash, shader_hash);
+    }
+
+    fn sph(&self) -> &ProgramHeader {
+        &self.base.sph
+    }
+
+    fn gp_passthrough_mask(&self) -> &[u32; 8] {
+        &self.base.gp_passthrough_mask
+    }
+
+    fn shader_stage(&self) -> ShaderStage {
+        self.base.stage
+    }
+
+    fn start_address(&self) -> u32 {
+        self.base.start_address
+    }
+
+    fn is_proprietary_driver(&self) -> bool {
+        self.base.is_proprietary_driver
+    }
+}
+
 /// Compute shader environment.
 pub struct ComputeEnvironment {
-    pub base: GenericEnvironment,
-    // kepler_compute: &KeplerCompute,
+    base: GenericEnvironment,
+    kepler_compute: *const KeplerCompute,
+    /// Rust-only fallback state for tests. Upstream live-owner paths read
+    /// these values directly from `kepler_compute`.
+    #[cfg(test)]
+    detached_state: ComputeEnvironmentDetachedState,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy)]
+struct ComputeEnvironmentDetachedState {
+    const_buffer_enable_mask: u32,
+    const_buffers: [QmdConstBuffer; 8],
+    tic_address: u64,
+    tic_limit: u32,
+    linked_tsc: bool,
 }
 
 impl ComputeEnvironment {
     pub fn new() -> Self {
         let mut base = GenericEnvironment::new();
         base.stage = ShaderStage::Compute;
-        Self { base }
+        Self {
+            base,
+            kepler_compute: std::ptr::null(),
+            #[cfg(test)]
+            detached_state: ComputeEnvironmentDetachedState {
+                const_buffer_enable_mask: 0,
+                const_buffers: [QmdConstBuffer::default(); 8],
+                tic_address: 0,
+                tic_limit: 0,
+                linked_tsc: false,
+            },
+        }
+    }
+
+    /// Port of `ComputeEnvironment::ComputeEnvironment(...)`.
+    pub fn from_kepler_compute(
+        kepler_compute: &KeplerCompute,
+        gpu_memory: Arc<ParkingLotMutex<MemoryManager>>,
+        gpu_reader: GpuMemoryReader,
+    ) -> Self {
+        let mut env = Self::new();
+        env.kepler_compute = kepler_compute as *const KeplerCompute;
+        let qmd = kepler_compute.launch_description();
+        env.base = GenericEnvironment::new()
+            .with_gpu_memory(gpu_memory)
+            .with_gpu_read(gpu_reader)
+            .with_program(kepler_compute.code_address(), qmd.program_start);
+        env.base.stage = ShaderStage::Compute;
+        env.base.local_memory_size = qmd.local_pos_alloc + qmd.local_crs_alloc;
+        env.base.texture_bound = kepler_compute.tex_cb_index();
+        env.base.is_proprietary_driver = env.base.texture_bound == 2;
+        env.base.shared_memory_size = qmd.shared_alloc;
+        env.base.workgroup_size = [qmd.block_dim_x, qmd.block_dim_y, qmd.block_dim_z];
+        env
+    }
+
+    fn kepler_compute(&self) -> &KeplerCompute {
+        unsafe { self.kepler_compute.as_ref() }
+            .expect("ComputeEnvironment requires a live KeplerCompute owner outside tests")
+    }
+
+    #[cfg(test)]
+    fn qmd_for_test(&self) -> Option<(u32, [QmdConstBuffer; 8], u64, u32, bool)> {
+        unsafe { self.kepler_compute.as_ref() }
+            .map(|kepler_compute| {
+                let qmd = kepler_compute.launch_description();
+                (
+                    qmd.const_buffer_enable_mask,
+                    qmd.const_buffers,
+                    kepler_compute.tic_address(),
+                    kepler_compute.tic_limit(),
+                    qmd.linked_tsc,
+                )
+            })
+            .or_else(|| {
+                Some((
+                    self.detached_state.const_buffer_enable_mask,
+                    self.detached_state.const_buffers,
+                    self.detached_state.tic_address,
+                    self.detached_state.tic_limit,
+                    self.detached_state.linked_tsc,
+                ))
+            })
+    }
+
+    pub fn read_cbuf_value(&mut self, cbuf_index: u32, cbuf_offset: u32) -> u32 {
+        #[cfg(test)]
+        let (enable_mask, cbufs, _, _, _) = self
+            .qmd_for_test()
+            .expect("ComputeEnvironment detached test state should always exist");
+        #[cfg(not(test))]
+        let qmd = self.kepler_compute().launch_description();
+        #[cfg(not(test))]
+        let enable_mask = qmd.const_buffer_enable_mask;
+        #[cfg(not(test))]
+        let cbufs = qmd.const_buffers;
+        let enabled = ((enable_mask >> cbuf_index) & 1) != 0;
+        let cbuf = cbufs.get(cbuf_index as usize).copied().unwrap_or_else(|| {
+            panic!(
+                "ComputeEnvironment::read_cbuf_value: invalid cbuf index {}",
+                cbuf_index
+            )
+        });
+        assert!(
+            enabled,
+            "ComputeEnvironment::read_cbuf_value: disabled cbuf {}",
+            cbuf_index
+        );
+        let mut value = 0u32;
+        if cbuf_offset < cbuf.size {
+            value = self.base.read_u32(cbuf.address + cbuf_offset as u64);
+        }
+        self.base
+            .cbuf_values
+            .insert(make_cbuf_key(cbuf_index, cbuf_offset), value);
+        value
+    }
+
+    pub fn read_texture_type(&mut self, handle: u32) -> TextureType {
+        #[cfg(test)]
+        let (_, _, tic_address, tic_limit, linked_tsc) = self
+            .qmd_for_test()
+            .expect("ComputeEnvironment detached test state should always exist");
+        #[cfg(not(test))]
+        let kepler_compute = self.kepler_compute();
+        #[cfg(not(test))]
+        let tic_address = kepler_compute.tic_address();
+        #[cfg(not(test))]
+        let tic_limit = kepler_compute.tic_limit();
+        #[cfg(not(test))]
+        let linked_tsc = kepler_compute.launch_description().linked_tsc;
+        let entry = self
+            .base
+            .read_texture_info(tic_address, tic_limit, linked_tsc, handle);
+        let result = convert_texture_type(&entry);
+        self.base.texture_types.insert(handle, result);
+        result
+    }
+
+    pub fn read_texture_pixel_format(&mut self, handle: u32) -> TexturePixelFormat {
+        #[cfg(test)]
+        let (_, _, tic_address, tic_limit, linked_tsc) = self
+            .qmd_for_test()
+            .expect("ComputeEnvironment detached test state should always exist");
+        #[cfg(not(test))]
+        let kepler_compute = self.kepler_compute();
+        #[cfg(not(test))]
+        let tic_address = kepler_compute.tic_address();
+        #[cfg(not(test))]
+        let tic_limit = kepler_compute.tic_limit();
+        #[cfg(not(test))]
+        let linked_tsc = kepler_compute.launch_description().linked_tsc;
+        let entry = self
+            .base
+            .read_texture_info(tic_address, tic_limit, linked_tsc, handle);
+        let result = convert_texture_pixel_format(&entry);
+        self.base.texture_pixel_formats.insert(handle, result);
+        result
+    }
+
+    pub fn is_texture_pixel_format_integer(&mut self, handle: u32) -> bool {
+        is_integer_pixel_format(self.read_texture_pixel_format(handle))
+    }
+
+    pub fn read_viewport_transform_state(&self) -> u32 {
+        self.base.viewport_transform_state
+    }
+
+    pub fn get_replace_const_buffer(&self, _bank: u32, _offset: u32) -> Option<ReplaceConstant> {
+        None
+    }
+
+    /// Rust adaptation of upstream private inheritance access to the
+    /// `GenericEnvironment` base owner.
+    pub fn generic_environment(&self) -> &GenericEnvironment {
+        &self.base
+    }
+
+    /// Rust adaptation of upstream private inheritance access to the
+    /// mutable `GenericEnvironment` base owner.
+    pub fn generic_environment_mut(&mut self) -> &mut GenericEnvironment {
+        &mut self.base
+    }
+
+    #[cfg(test)]
+    fn set_detached_const_buffer_enable_mask(&mut self, enable_mask: u32) {
+        self.detached_state.const_buffer_enable_mask = enable_mask;
+        self.kepler_compute = std::ptr::null();
+    }
+
+    #[cfg(test)]
+    fn set_detached_const_buffer(&mut self, index: usize, cbuf: QmdConstBuffer) {
+        self.detached_state.const_buffers[index] = cbuf;
+        self.kepler_compute = std::ptr::null();
+    }
+
+    #[cfg(test)]
+    fn set_detached_texture_state(&mut self, tic_address: u64, tic_limit: u32, linked_tsc: bool) {
+        self.detached_state.tic_address = tic_address;
+        self.detached_state.tic_limit = tic_limit;
+        self.detached_state.linked_tsc = linked_tsc;
+        self.kepler_compute = std::ptr::null();
     }
 }
 
@@ -369,24 +1091,100 @@ impl Default for ComputeEnvironment {
     }
 }
 
+impl shader_recompiler::environment::Environment for ComputeEnvironment {
+    fn read_instruction(&mut self, address: u32) -> u64 {
+        self.base.read_instruction(address)
+    }
+
+    fn read_cbuf_value(&mut self, cbuf_index: u32, cbuf_offset: u32) -> u32 {
+        ComputeEnvironment::read_cbuf_value(self, cbuf_index, cbuf_offset)
+    }
+
+    fn read_texture_type(&mut self, raw_handle: u32) -> TextureType {
+        ComputeEnvironment::read_texture_type(self, raw_handle)
+    }
+
+    fn read_texture_pixel_format(&mut self, raw_handle: u32) -> TexturePixelFormat {
+        ComputeEnvironment::read_texture_pixel_format(self, raw_handle)
+    }
+
+    fn is_texture_pixel_format_integer(&mut self, raw_handle: u32) -> bool {
+        ComputeEnvironment::is_texture_pixel_format_integer(self, raw_handle)
+    }
+
+    fn read_viewport_transform_state(&mut self) -> u32 {
+        ComputeEnvironment::read_viewport_transform_state(self)
+    }
+
+    fn texture_bound_buffer(&self) -> u32 {
+        self.base.texture_bound_buffer()
+    }
+
+    fn local_memory_size(&self) -> u32 {
+        self.base.local_memory_size()
+    }
+
+    fn shared_memory_size(&self) -> u32 {
+        self.base.shared_memory_size()
+    }
+
+    fn workgroup_size(&self) -> [u32; 3] {
+        self.base.workgroup_size()
+    }
+
+    fn has_hle_macro_state(&self) -> bool {
+        self.base.has_hle_macro_state()
+    }
+
+    fn get_replace_const_buffer(&mut self, bank: u32, offset: u32) -> Option<ReplaceConstant> {
+        ComputeEnvironment::get_replace_const_buffer(self, bank, offset)
+    }
+
+    fn dump(&mut self, pipeline_hash: u64, shader_hash: u64) {
+        self.base.dump(pipeline_hash, shader_hash);
+    }
+
+    fn sph(&self) -> &ProgramHeader {
+        &self.base.sph
+    }
+
+    fn gp_passthrough_mask(&self) -> &[u32; 8] {
+        &self.base.gp_passthrough_mask
+    }
+
+    fn shader_stage(&self) -> ShaderStage {
+        self.base.stage
+    }
+
+    fn start_address(&self) -> u32 {
+        self.base.start_address
+    }
+
+    fn is_proprietary_driver(&self) -> bool {
+        self.base.is_proprietary_driver
+    }
+}
+
 /// File-based shader environment for loading from pipeline cache.
 pub struct FileEnvironment {
-    pub code: Vec<u64>,
-    pub texture_types: HashMap<u32, TextureType>,
-    pub texture_pixel_formats: HashMap<u32, TexturePixelFormat>,
-    pub cbuf_values: HashMap<u64, u32>,
-    pub cbuf_replacements: HashMap<u64, ReplaceConstant>,
-    pub workgroup_size: [u32; 3],
-    pub local_memory_size: u32,
-    pub shared_memory_size: u32,
-    pub texture_bound: u32,
-    pub read_lowest: u32,
-    pub read_highest: u32,
-    pub initial_offset: u32,
-    pub viewport_transform_state: u32,
-    pub stage: ShaderStage,
-    pub start_address: u32,
-    pub is_proprietary_driver: bool,
+    code: Vec<u64>,
+    texture_types: HashMap<u32, TextureType>,
+    texture_pixel_formats: HashMap<u32, TexturePixelFormat>,
+    cbuf_values: HashMap<u64, u32>,
+    cbuf_replacements: HashMap<u64, ReplaceConstant>,
+    workgroup_size: [u32; 3],
+    local_memory_size: u32,
+    shared_memory_size: u32,
+    texture_bound: u32,
+    read_lowest: u32,
+    read_highest: u32,
+    initial_offset: u32,
+    viewport_transform_state: u32,
+    sph: ProgramHeader,
+    gp_passthrough_mask: [u32; 8],
+    stage: ShaderStage,
+    start_address: u32,
+    is_proprietary_driver: bool,
 }
 
 impl FileEnvironment {
@@ -405,6 +1203,8 @@ impl FileEnvironment {
             read_highest: 0,
             initial_offset: 0,
             viewport_transform_state: 1,
+            sph: ProgramHeader::default(),
+            gp_passthrough_mask: [0; 8],
             stage: ShaderStage::VertexB,
             start_address: 0,
             is_proprietary_driver: false,
@@ -415,46 +1215,33 @@ impl FileEnvironment {
     ///
     /// Port of `FileEnvironment::Deserialize`. Reads all fields written by
     /// `GenericEnvironment::Serialize` plus stage-specific trailing fields.
-    pub fn deserialize(&mut self, file: &mut std::fs::File) {
+    pub fn deserialize(&mut self, file: &mut std::fs::File) -> std::io::Result<()> {
         use std::io::Read;
 
-        let mut read_u32 = |f: &mut std::fs::File| -> u32 {
+        let read_u32 = |f: &mut std::fs::File| -> std::io::Result<u32> {
             let mut buf = [0u8; 4];
-            f.read_exact(&mut buf).unwrap_or(());
-            u32::from_le_bytes(buf)
+            f.read_exact(&mut buf)?;
+            Ok(u32::from_le_bytes(buf))
         };
-        let mut read_u64 = |f: &mut std::fs::File| -> u64 {
+        let read_u64 = |f: &mut std::fs::File| -> std::io::Result<u64> {
             let mut buf = [0u8; 8];
-            f.read_exact(&mut buf).unwrap_or(());
-            u64::from_le_bytes(buf)
+            f.read_exact(&mut buf)?;
+            Ok(u64::from_le_bytes(buf))
         };
 
-        let code_size = read_u64(file);
-        let num_texture_types = read_u64(file);
-        let num_texture_pixel_formats = read_u64(file);
-        let num_cbuf_values = read_u64(file);
-        let num_cbuf_replacement_values = read_u64(file);
-        self.local_memory_size = read_u32(file);
-        self.texture_bound = read_u32(file);
-        self.start_address = read_u32(file);
-        self.read_lowest = read_u32(file);
-        self.read_highest = read_u32(file);
-        self.viewport_transform_state = read_u32(file);
-        // stage: read as u32 and cast
-        let stage_raw = read_u32(file);
-        self.stage = match stage_raw {
-            0 => ShaderStage::VertexA,
-            1 => ShaderStage::VertexB,
-            2 => ShaderStage::TessellationControl,
-            3 => ShaderStage::TessellationEval,
-            4 => ShaderStage::Geometry,
-            5 => ShaderStage::Fragment,
-            6 => ShaderStage::Compute,
-            _ => {
-                log::warn!("FileEnvironment::deserialize: unknown stage {}", stage_raw);
-                ShaderStage::VertexB
-            }
-        };
+        let code_size = read_u64(file)?;
+        let num_texture_types = read_u64(file)?;
+        let num_texture_pixel_formats = read_u64(file)?;
+        let num_cbuf_values = read_u64(file)?;
+        let num_cbuf_replacement_values = read_u64(file)?;
+        self.local_memory_size = read_u32(file)?;
+        self.texture_bound = read_u32(file)?;
+        self.start_address = read_u32(file)?;
+        self.read_lowest = read_u32(file)?;
+        self.read_highest = read_u32(file)?;
+        self.viewport_transform_state = read_u32(file)?;
+        let stage_raw = read_u32(file)?;
+        self.stage = deserialize_enum_u32(stage_raw, ShaderStage::VertexA as u32, "ShaderStage")?;
 
         // Read code words (code_size bytes, rounded up to u64 boundary)
         let num_words = code_size.div_ceil(8) as usize;
@@ -462,77 +1249,60 @@ impl FileEnvironment {
         let code_bytes = unsafe {
             std::slice::from_raw_parts_mut(self.code.as_mut_ptr() as *mut u8, code_size as usize)
         };
-        file.read_exact(code_bytes).unwrap_or(());
+        file.read_exact(code_bytes)?;
 
-        // Deserialization mappings use the upstream-faithful discriminant
-        // values from `shader_recompiler::shader_info` (#[repr(u32)]):
-        //   TextureType:     Color1D=0, ColorArray1D=1, Color2D=2, ...
-        //   ReplaceConstant: BaseInstance=0, BaseVertex=1, DrawID=2
-        //   TexturePixelFormat: 103-variant enum, discriminant = variant index
         for _ in 0..num_texture_types {
-            let key = read_u32(file);
-            let type_raw = read_u32(file);
-            let texture_type = match type_raw {
-                0 => TextureType::Color1D,
-                1 => TextureType::ColorArray1D,
-                2 => TextureType::Color2D,
-                3 => TextureType::ColorArray2D,
-                4 => TextureType::Color3D,
-                5 => TextureType::ColorCube,
-                6 => TextureType::ColorArrayCube,
-                7 => TextureType::Buffer,
-                8 => TextureType::Color2DRect,
-                _ => TextureType::Color2D,
-            };
+            let key = read_u32(file)?;
+            let type_raw = read_u32(file)?;
+            let texture_type =
+                deserialize_enum_u32(type_raw, TextureType::Color2DRect as u32, "TextureType")?;
             self.texture_types.insert(key, texture_type);
         }
         for _ in 0..num_texture_pixel_formats {
-            let key = read_u32(file);
-            let fmt_raw = read_u32(file);
-            // SAFETY: TexturePixelFormat is #[repr(u32)] with 102
-            // contiguous discriminants starting at 0. If the raw value
-            // is out of range, we fall back to A8B8G8R8Unorm (0).
-            let fmt = if fmt_raw < 102 {
-                unsafe { std::mem::transmute::<u32, TexturePixelFormat>(fmt_raw) }
-            } else {
-                log::warn!("TexturePixelFormat out of range: {}", fmt_raw);
-                TexturePixelFormat::A8B8G8R8Unorm
-            };
+            let key = read_u32(file)?;
+            let fmt_raw = read_u32(file)?;
+            let fmt = deserialize_enum_u32(
+                fmt_raw,
+                TexturePixelFormat::D32FloatS8Uint as u32,
+                "TexturePixelFormat",
+            )?;
             self.texture_pixel_formats.insert(key, fmt);
         }
         for _ in 0..num_cbuf_values {
-            let key = read_u64(file);
-            let value = read_u32(file);
+            let key = read_u64(file)?;
+            let value = read_u32(file)?;
             self.cbuf_values.insert(key, value);
         }
         for _ in 0..num_cbuf_replacement_values {
-            let key = read_u64(file);
-            let rc_raw = read_u32(file);
-            let rc = match rc_raw {
-                0 => ReplaceConstant::BaseInstance,
-                1 => ReplaceConstant::BaseVertex,
-                _ => ReplaceConstant::DrawID,
-            };
+            let key = read_u64(file)?;
+            let rc_raw = read_u32(file)?;
+            let rc =
+                deserialize_enum_u32(rc_raw, ReplaceConstant::DrawID as u32, "ReplaceConstant")?;
             self.cbuf_replacements.insert(key, rc);
         }
         // Stage-specific trailing fields
         if self.stage == ShaderStage::Compute {
-            self.workgroup_size[0] = read_u32(file);
-            self.workgroup_size[1] = read_u32(file);
-            self.workgroup_size[2] = read_u32(file);
-            self.shared_memory_size = read_u32(file);
+            self.workgroup_size[0] = read_u32(file)?;
+            self.workgroup_size[1] = read_u32(file)?;
+            self.workgroup_size[2] = read_u32(file)?;
+            self.shared_memory_size = read_u32(file)?;
             self.initial_offset = 0;
         } else {
-            // sph: 4 * u32 = 16 bytes (ShaderProgramHeader is 20 bytes upstream but varies)
-            // Skip sph by reading past it; initial_offset = sizeof(sph) = 20 bytes upstream
-            let mut sph_buf = [0u8; 20];
-            file.read_exact(&mut sph_buf).unwrap_or(());
-            self.initial_offset = 20;
+            let mut sph_buf = [0u8; std::mem::size_of::<ProgramHeader>()];
+            file.read_exact(&mut sph_buf)?;
+            for (index, chunk) in sph_buf.chunks_exact(4).enumerate() {
+                self.sph.raw[index] =
+                    u32::from_le_bytes(chunk.try_into().expect("4-byte SPH word"));
+            }
+            self.initial_offset = std::mem::size_of::<ProgramHeader>() as u32;
             if self.stage == ShaderStage::Geometry {
-                let _gp_passthrough_mask = read_u32(file);
+                for item in &mut self.gp_passthrough_mask {
+                    *item = read_u32(file)?;
+                }
             }
         }
         self.is_proprietary_driver = self.texture_bound == 2;
+        Ok(())
     }
 
     pub fn read_instruction(&self, address: u32) -> u64 {
@@ -542,6 +1312,36 @@ impl FileEnvironment {
         self.code[((address - self.read_lowest) / 8) as usize]
     }
 
+    pub fn read_cbuf_value(&self, cbuf_index: u32, cbuf_offset: u32) -> u32 {
+        let key = make_cbuf_key(cbuf_index, cbuf_offset);
+        self.cbuf_values
+            .get(&key)
+            .copied()
+            .unwrap_or_else(|| panic!("Uncached read cbuf value {cbuf_index}:{cbuf_offset:#x}"))
+    }
+
+    pub fn read_texture_type(&self, handle: u32) -> TextureType {
+        self.texture_types
+            .get(&handle)
+            .copied()
+            .unwrap_or_else(|| panic!("Uncached read texture type {handle:#x}"))
+    }
+
+    pub fn read_texture_pixel_format(&self, handle: u32) -> TexturePixelFormat {
+        self.texture_pixel_formats
+            .get(&handle)
+            .copied()
+            .unwrap_or_else(|| panic!("Uncached read texture pixel format {handle:#x}"))
+    }
+
+    pub fn is_texture_pixel_format_integer(&self, handle: u32) -> bool {
+        is_integer_pixel_format(self.read_texture_pixel_format(handle))
+    }
+
+    pub fn read_viewport_transform_state(&self) -> u32 {
+        self.viewport_transform_state
+    }
+
     pub fn shader_stage(&self) -> ShaderStage {
         self.stage
     }
@@ -549,11 +1349,101 @@ impl FileEnvironment {
     pub fn has_hle_macro_state(&self) -> bool {
         !self.cbuf_replacements.is_empty()
     }
+
+    pub fn get_replace_const_buffer(&self, bank: u32, offset: u32) -> Option<ReplaceConstant> {
+        self.cbuf_replacements
+            .get(&make_cbuf_key(bank, offset))
+            .copied()
+    }
+
+    pub fn dump(&mut self, pipeline_hash: u64, shader_hash: u64) {
+        dump_impl(
+            pipeline_hash,
+            shader_hash,
+            &self.code,
+            self.initial_offset,
+            self.stage,
+        );
+    }
 }
 
 impl Default for FileEnvironment {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl shader_recompiler::environment::Environment for FileEnvironment {
+    fn read_instruction(&mut self, address: u32) -> u64 {
+        FileEnvironment::read_instruction(self, address)
+    }
+
+    fn read_cbuf_value(&mut self, cbuf_index: u32, cbuf_offset: u32) -> u32 {
+        FileEnvironment::read_cbuf_value(self, cbuf_index, cbuf_offset)
+    }
+
+    fn read_texture_type(&mut self, raw_handle: u32) -> TextureType {
+        FileEnvironment::read_texture_type(self, raw_handle)
+    }
+
+    fn read_texture_pixel_format(&mut self, raw_handle: u32) -> TexturePixelFormat {
+        FileEnvironment::read_texture_pixel_format(self, raw_handle)
+    }
+
+    fn is_texture_pixel_format_integer(&mut self, raw_handle: u32) -> bool {
+        FileEnvironment::is_texture_pixel_format_integer(self, raw_handle)
+    }
+
+    fn read_viewport_transform_state(&mut self) -> u32 {
+        FileEnvironment::read_viewport_transform_state(self)
+    }
+
+    fn texture_bound_buffer(&self) -> u32 {
+        self.texture_bound
+    }
+
+    fn local_memory_size(&self) -> u32 {
+        self.local_memory_size
+    }
+
+    fn shared_memory_size(&self) -> u32 {
+        self.shared_memory_size
+    }
+
+    fn workgroup_size(&self) -> [u32; 3] {
+        self.workgroup_size
+    }
+
+    fn has_hle_macro_state(&self) -> bool {
+        FileEnvironment::has_hle_macro_state(self)
+    }
+
+    fn get_replace_const_buffer(&mut self, bank: u32, offset: u32) -> Option<ReplaceConstant> {
+        FileEnvironment::get_replace_const_buffer(self, bank, offset)
+    }
+
+    fn dump(&mut self, pipeline_hash: u64, shader_hash: u64) {
+        FileEnvironment::dump(self, pipeline_hash, shader_hash);
+    }
+
+    fn sph(&self) -> &ProgramHeader {
+        &self.sph
+    }
+
+    fn gp_passthrough_mask(&self) -> &[u32; 8] {
+        &self.gp_passthrough_mask
+    }
+
+    fn shader_stage(&self) -> ShaderStage {
+        self.stage
+    }
+
+    fn start_address(&self) -> u32 {
+        self.start_address
+    }
+
+    fn is_proprietary_driver(&self) -> bool {
+        self.is_proprietary_driver
     }
 }
 
@@ -569,52 +1459,49 @@ pub fn serialize_pipeline(
     filename: &Path,
     cache_version: u32,
 ) {
-    use std::io::{Seek, SeekFrom, Write};
+    use std::io::Write;
 
     // All envs must be serializable
     if !envs.iter().all(|e| e.can_be_serialized()) {
         return;
     }
 
-    let file = std::fs::OpenOptions::new()
+    let mut file = match std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(filename);
-    let mut file = match file {
-        Ok(f) => f,
+        .open(filename)
+    {
+        Ok(file) => file,
         Err(e) => {
             log::error!("serialize_pipeline: failed to open {:?}: {}", filename, e);
             return;
         }
     };
 
-    // Write header if file is empty
-    let pos = file.seek(SeekFrom::Current(0)).unwrap_or(u64::MAX);
-    if pos == 0 {
-        if let Err(e) = file
-            .write_all(&MAGIC_NUMBER)
-            .and_then(|_| file.write_all(&cache_version.to_le_bytes()))
-        {
-            log::error!("serialize_pipeline: failed to write header: {}", e);
-            return;
+    let write_result = (|| -> std::io::Result<()> {
+        if file.metadata()?.len() == 0 {
+            file.write_all(&MAGIC_NUMBER)?;
+            file.write_all(&cache_version.to_le_bytes())?;
         }
-    }
 
-    let num_envs = envs.len() as u32;
-    if let Err(e) = file.write_all(&num_envs.to_le_bytes()) {
-        log::error!("serialize_pipeline: failed to write num_envs: {}", e);
-        return;
-    }
-
-    for env in envs {
-        if let Err(e) = serialize_generic_environment(env, &mut file) {
-            log::error!("serialize_pipeline: failed to serialize env: {}", e);
-            return;
+        let num_envs = envs.len() as u32;
+        file.write_all(&num_envs.to_le_bytes())?;
+        for env in envs {
+            serialize_generic_environment(env, &mut file)?;
         }
-    }
+        file.write_all(key)?;
+        Ok(())
+    })();
 
-    if let Err(e) = file.write_all(key) {
-        log::error!("serialize_pipeline: failed to write key: {}", e);
+    if let Err(e) = write_result {
+        log::error!("serialize_pipeline: {}", e);
+        if let Err(remove_error) = std::fs::remove_file(filename) {
+            log::error!(
+                "serialize_pipeline: failed to delete pipeline cache file {:?}: {}",
+                filename,
+                remove_error
+            );
+        }
     }
 }
 
@@ -676,10 +1563,13 @@ fn serialize_generic_environment(
         file.write_all(&env.workgroup_size[2].to_le_bytes())?;
         file.write_all(&env.shared_memory_size.to_le_bytes())?;
     } else {
-        // Write sph placeholder (20 bytes of zeros); upstream writes real SPH
-        file.write_all(&[0u8; 20])?;
+        for word in env.sph.raw {
+            file.write_all(&word.to_le_bytes())?;
+        }
         if env.stage == ShaderStage::Geometry {
-            file.write_all(&0u32.to_le_bytes())?;
+            for item in env.gp_passthrough_mask {
+                file.write_all(&item.to_le_bytes())?;
+            }
         }
     }
 
@@ -690,93 +1580,251 @@ fn serialize_generic_environment(
 ///
 /// Port of `VideoCommon::LoadPipelines`.
 /// Reads the binary cache file and calls `load_compute` or `load_graphics` for each entry.
-pub fn load_pipelines(
+pub fn load_pipelines<FStop>(
+    stop_loading: FStop,
     filename: &Path,
     expected_cache_version: u32,
     mut load_compute: Box<dyn FnMut(&mut std::fs::File, FileEnvironment)>,
     mut load_graphics: Box<dyn FnMut(&mut std::fs::File, Vec<FileEnvironment>)>,
-) {
+) where
+    FStop: Fn() -> bool,
+{
     use std::io::{Read, Seek, SeekFrom};
 
-    let mut file = match std::fs::File::open(filename) {
-        Ok(f) => f,
-        Err(_) => return, // File does not exist yet — normal case
+    let mut file = match std::fs::OpenOptions::new().read(true).open(filename) {
+        Ok(file) => file,
+        Err(_) => return,
     };
+    let mut remove_cache = false;
+    let mut invalid_magic = false;
+    let mut outdated_version = false;
 
-    // Read and verify header
-    let mut magic = [0u8; 8];
-    let mut version_buf = [0u8; 4];
-    if file.read_exact(&mut magic).is_err() || file.read_exact(&mut version_buf).is_err() {
-        log::error!("load_pipelines: failed to read header from {:?}", filename);
-        return;
-    }
-    let cache_version = u32::from_le_bytes(version_buf);
-    if magic != MAGIC_NUMBER || cache_version != expected_cache_version {
-        log::warn!(
-            "load_pipelines: invalid or outdated pipeline cache {:?}, removing",
-            filename
-        );
-        drop(file);
-        let _ = std::fs::remove_file(filename);
-        return;
-    }
+    let load_result = (|| -> std::io::Result<()> {
+        let end = file.seek(SeekFrom::End(0))?;
+        file.seek(SeekFrom::Start(0))?;
 
-    // Determine file size
-    let end = match file.seek(SeekFrom::End(0)) {
-        Ok(pos) => pos,
-        Err(e) => {
-            log::error!("load_pipelines: seek failed: {}", e);
-            return;
+        let mut magic = [0u8; 8];
+        let mut version_buf = [0u8; 4];
+        file.read_exact(&mut magic)?;
+        file.read_exact(&mut version_buf)?;
+        let cache_version = u32::from_le_bytes(version_buf);
+        if magic != MAGIC_NUMBER || cache_version != expected_cache_version {
+            remove_cache = true;
+            invalid_magic = magic != MAGIC_NUMBER;
+            outdated_version = cache_version != expected_cache_version;
+            return Ok(());
         }
-    };
-    file.seek(SeekFrom::Start(8 + 4)).unwrap_or(0); // rewind past header
 
-    while file.seek(SeekFrom::Current(0)).unwrap_or(end) < end {
-        // Read num_envs
-        let mut buf4 = [0u8; 4];
-        if file.read_exact(&mut buf4).is_err() {
-            break;
-        }
-        let num_envs = u32::from_le_bytes(buf4) as usize;
-
-        let mut envs: Vec<FileEnvironment> = Vec::with_capacity(num_envs);
-        let mut ok = true;
-        for _ in 0..num_envs {
-            let mut env = FileEnvironment::new();
-            // We cannot call env.deserialize here cleanly because it borrows &mut self and &mut file.
-            // Inline a simplified deserialize that uses a local helper.
-            if !deserialize_file_env_from(&mut env, &mut file) {
-                ok = false;
-                break;
+        while file.stream_position()? != end {
+            if stop_loading() {
+                return Ok(());
             }
-            envs.push(env);
-        }
-        if !ok {
-            break;
+
+            let mut buf4 = [0u8; 4];
+            file.read_exact(&mut buf4)?;
+            let num_envs = u32::from_le_bytes(buf4) as usize;
+
+            let mut envs: Vec<FileEnvironment> = Vec::with_capacity(num_envs);
+            for _ in 0..num_envs {
+                let mut env = FileEnvironment::new();
+                env.deserialize(&mut file)?;
+                envs.push(env);
+            }
+
+            if envs
+                .first()
+                .is_some_and(|env| env.shader_stage() == ShaderStage::Compute)
+            {
+                if let Some(env) = envs.into_iter().next() {
+                    load_compute(&mut file, env);
+                }
+            } else {
+                load_graphics(&mut file, envs);
+            }
         }
 
-        // Dispatch based on whether any env is a compute shader
-        if envs.iter().any(|e| e.stage == ShaderStage::Compute) {
-            if let Some(env) = envs.into_iter().next() {
-                load_compute(&mut file, env);
+        Ok(())
+    })();
+
+    if remove_cache {
+        drop(file);
+        if std::fs::remove_file(filename).is_ok() {
+            if invalid_magic {
+                log::error!("Invalid pipeline cache file");
+            }
+            if outdated_version {
+                log::info!("Deleting old pipeline cache");
             }
         } else {
-            load_graphics(&mut file, envs);
+            log::error!(
+                "Invalid pipeline cache file and failed to delete it in {:?}",
+                filename
+            );
+        }
+        return;
+    }
+
+    if let Err(e) = load_result {
+        log::error!("load_pipelines: {}", e);
+        drop(file);
+        if let Err(remove_error) = std::fs::remove_file(filename) {
+            log::error!(
+                "load_pipelines: failed to delete pipeline cache file {:?}: {}",
+                filename,
+                remove_error
+            );
         }
     }
 }
 
-/// Deserialize a FileEnvironment from an open file handle.
-/// Returns false on I/O error.
-fn deserialize_file_env_from(env: &mut FileEnvironment, file: &mut std::fs::File) -> bool {
-    // Delegate to the existing deserialize method
-    env.deserialize(file);
-    true
+fn convert_texture_type(entry: &TextureDescriptor) -> TextureType {
+    match entry.texture_type {
+        MaxwellTextureType::Texture1D => TextureType::Color1D,
+        MaxwellTextureType::Texture2D => {
+            if entry.normalized_coords {
+                TextureType::Color2D
+            } else {
+                TextureType::Color2DRect
+            }
+        }
+        MaxwellTextureType::Texture2DNoMip => {
+            if entry.normalized_coords {
+                TextureType::Color2D
+            } else {
+                TextureType::Color2DRect
+            }
+        }
+        MaxwellTextureType::Texture3D => TextureType::Color3D,
+        MaxwellTextureType::Cubemap => TextureType::ColorCube,
+        MaxwellTextureType::Array1D => TextureType::ColorArray1D,
+        MaxwellTextureType::Array2D => TextureType::ColorArray2D,
+        MaxwellTextureType::Buffer1D => TextureType::Buffer,
+        MaxwellTextureType::CubemapArray => TextureType::ColorArrayCube,
+        MaxwellTextureType::Invalid => TextureType::Color2D,
+    }
+}
+
+fn convert_component_type(component: MaxwellComponentType) -> LookupComponentType {
+    match component {
+        MaxwellComponentType::SNorm => LookupComponentType::Snorm,
+        MaxwellComponentType::UNorm => LookupComponentType::Unorm,
+        MaxwellComponentType::SInt => LookupComponentType::Sint,
+        MaxwellComponentType::UInt => LookupComponentType::Uint,
+        MaxwellComponentType::Float => LookupComponentType::Float,
+        MaxwellComponentType::SNormForceFp16 => LookupComponentType::Snorm,
+        MaxwellComponentType::UNormForceFp16 => LookupComponentType::Unorm,
+        MaxwellComponentType::Invalid => LookupComponentType::Unorm,
+    }
+}
+
+fn convert_texture_pixel_format(entry: &TextureDescriptor) -> TexturePixelFormat {
+    let pixel_format = pixel_format_from_texture_info(
+        convert_texture_format(entry.format),
+        convert_component_type(entry.r_type),
+        convert_component_type(entry.g_type),
+        convert_component_type(entry.b_type),
+        convert_component_type(entry.a_type),
+        entry.srgb_conversion,
+    );
+    unsafe { std::mem::transmute::<u32, TexturePixelFormat>(pixel_format as u32) }
+}
+
+fn convert_texture_format(format: MaxwellTextureFormat) -> LookupTextureFormat {
+    match format as u32 {
+        0x01 => LookupTextureFormat::R32G32B32A32,
+        0x02 => LookupTextureFormat::R32G32B32,
+        0x03 => LookupTextureFormat::R16G16B16A16,
+        0x04 => LookupTextureFormat::R32G32,
+        0x05 => LookupTextureFormat::R32B24G8,
+        0x06 => LookupTextureFormat::E5B9G9R9,
+        0x07 => LookupTextureFormat::B10G11R11,
+        0x08 => LookupTextureFormat::A8B8G8R8,
+        0x09 => LookupTextureFormat::A2B10G10R10,
+        0x0A => LookupTextureFormat::A2R10G10B10,
+        0x0B => LookupTextureFormat::R32,
+        0x0C => LookupTextureFormat::G8R8,
+        0x0D => LookupTextureFormat::R16G16,
+        0x0E => LookupTextureFormat::R16,
+        0x0F => LookupTextureFormat::R8,
+        0x10 => LookupTextureFormat::X8Z24,
+        0x11 => LookupTextureFormat::Z24S8,
+        0x12 => LookupTextureFormat::A4B4G4R4,
+        0x13 => LookupTextureFormat::Z16,
+        0x14 => LookupTextureFormat::A1B5G5R5,
+        0x15 => LookupTextureFormat::B5G6R5,
+        0x16 => LookupTextureFormat::A5B5G5R1,
+        0x17 => LookupTextureFormat::BC7U,
+        0x19 => LookupTextureFormat::Z32X24S8,
+        0x1D => LookupTextureFormat::G4R4,
+        0x24 => LookupTextureFormat::DXT1,
+        0x25 => LookupTextureFormat::DXT23,
+        0x26 => LookupTextureFormat::DXT45,
+        0x27 => LookupTextureFormat::DXN1,
+        0x28 => LookupTextureFormat::DXN2,
+        0x40 => LookupTextureFormat::Astc2d4x4,
+        0x41 => LookupTextureFormat::Astc2d5x5,
+        0x42 => LookupTextureFormat::Astc2d6x6,
+        0x43 => LookupTextureFormat::Astc2d8x6,
+        0x44 => LookupTextureFormat::Astc2d8x8,
+        0x45 => LookupTextureFormat::Astc2d10x10,
+        0x46 => LookupTextureFormat::Astc2d12x12,
+        0x50 => LookupTextureFormat::Astc2d5x4,
+        0x51 => LookupTextureFormat::Astc2d8x5,
+        0x52 => LookupTextureFormat::Astc2d10x8,
+        0x53 => LookupTextureFormat::Astc2d10x6,
+        0x54 => LookupTextureFormat::Astc2d10x5,
+        0x55 => LookupTextureFormat::Astc2d12x10,
+        0x56 => LookupTextureFormat::Astc2d6x5,
+        _ => LookupTextureFormat::A8B8G8R8,
+    }
+}
+
+fn is_integer_pixel_format(format: TexturePixelFormat) -> bool {
+    matches!(
+        format,
+        TexturePixelFormat::A8B8G8R8Sint
+            | TexturePixelFormat::A8B8G8R8Uint
+            | TexturePixelFormat::R8Sint
+            | TexturePixelFormat::R8Uint
+            | TexturePixelFormat::R16G16B16A16Sint
+            | TexturePixelFormat::R16G16B16A16Uint
+            | TexturePixelFormat::R32G32B32A32Uint
+            | TexturePixelFormat::R32G32B32A32Sint
+            | TexturePixelFormat::R16Uint
+            | TexturePixelFormat::R16Sint
+            | TexturePixelFormat::R16G16Uint
+            | TexturePixelFormat::R16G16Sint
+            | TexturePixelFormat::R8G8Sint
+            | TexturePixelFormat::R8G8Uint
+            | TexturePixelFormat::R32G32Uint
+            | TexturePixelFormat::R32G32Sint
+            | TexturePixelFormat::R32Uint
+            | TexturePixelFormat::R32Sint
+            | TexturePixelFormat::A2B10G10R10Uint
+    )
+}
+
+fn deserialize_enum_u32<T>(raw: u32, max: u32, type_name: &str) -> std::io::Result<T> {
+    if raw <= max {
+        // SAFETY: `T` is a repr(u32) enum and `raw` is range-checked against
+        // the highest contiguous upstream discriminant before transmuting.
+        Ok(unsafe { std::mem::transmute_copy::<u32, T>(&raw) })
+    } else {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("invalid {} discriminant {}", type_name, raw),
+        ))
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engines::engine_interface::EngineInterface;
+    use crate::engines::kepler_compute::{KeplerCompute, QueueMetaData};
+    use crate::engines::maxwell_3d::{Maxwell3D, ShaderStageType};
+    use crate::memory_manager::MemoryManager;
+    use parking_lot::Mutex as ParkingLotMutex;
     use std::sync::Mutex;
 
     /// Build a 64 KiB GPU-memory mock with a Maxwell self-branch sentinel
@@ -804,6 +1852,18 @@ mod tests {
             }
         });
         (reader, log)
+    }
+
+    fn make_mapped_memory_manager(
+        gpu_base: u64,
+        cpu_base: u64,
+        size: u64,
+    ) -> Arc<ParkingLotMutex<MemoryManager>> {
+        let memory_manager = Arc::new(ParkingLotMutex::new(MemoryManager::new(0)));
+        memory_manager
+            .lock()
+            .map(gpu_base, cpu_base, size, 0, false);
+        memory_manager
     }
 
     #[test]
@@ -919,5 +1979,467 @@ mod tests {
         let value = env.read_instruction(target_addr);
         assert_eq!(value, target_value);
         assert!(env.has_unbound_instructions);
+    }
+
+    #[test]
+    fn graphics_environment_from_maxwell3d_sets_stage_mapping() {
+        let maxwell = Maxwell3D::new();
+        let env = GraphicsEnvironment::from_maxwell3d(&maxwell, ShaderStageType::Fragment, 0, 0);
+
+        assert_eq!(env.base.stage, ShaderStage::Fragment);
+        assert_eq!(env.stage_index, 4);
+    }
+
+    #[test]
+    fn graphics_environment_from_maxwell3d_reads_sph_and_local_memory() {
+        let gpu_base = 0x3_0000_0000;
+        let cpu_base = 0x9000;
+        let mut bytes = [0u8; std::mem::size_of::<ProgramHeader>()];
+        let mut raw = [0u32; 20];
+        raw[1] = 0x20;
+        raw[2] = 0x1;
+        raw[3] = 0x10;
+        for (index, word) in raw.iter().enumerate() {
+            bytes[index * 4..index * 4 + 4].copy_from_slice(&word.to_le_bytes());
+        }
+        let bytes = Arc::new(bytes);
+        let reader = Arc::new(move |cpu_addr, dst: &mut [u8]| {
+            let offset = (cpu_addr - cpu_base) as usize;
+            let end = (offset + dst.len()).min(bytes.len());
+            if offset < bytes.len() {
+                dst[..end - offset].copy_from_slice(&bytes[offset..end]);
+            }
+        });
+        let mm = make_mapped_memory_manager(gpu_base, cpu_base, 0x1000);
+        let mut maxwell = Maxwell3D::new();
+        maxwell.set_memory_manager(Arc::clone(&mm));
+        maxwell.set_guest_memory_reader(reader);
+        let env =
+            GraphicsEnvironment::from_maxwell3d(&maxwell, ShaderStageType::VertexB, gpu_base, 0);
+
+        assert_eq!(
+            env.base.initial_offset as usize,
+            std::mem::size_of::<ProgramHeader>()
+        );
+        assert_eq!(env.base.sph.raw[1], 0x20);
+        assert_eq!(env.base.sph.raw[2], 0x1);
+        assert_eq!(env.base.sph.raw[3], 0x10);
+        assert_eq!(env.base.local_memory_size, 0x0100_0020 + 0x10);
+    }
+
+    #[test]
+    fn graphics_environment_reads_cbuf_value_from_snapshot_binding() {
+        let gpu_base = 0x1_0000_0000;
+        let mut backing = vec![0u8; 0x2000];
+        backing[0x100..0x104].copy_from_slice(&0xDEADBEEFu32.to_le_bytes());
+        let backing = Arc::new(backing);
+        let reader: GpuMemoryReader = Arc::new(move |gpu_addr, dst| {
+            let offset = (gpu_addr - gpu_base) as usize;
+            let end = (offset + dst.len()).min(backing.len());
+            if offset < backing.len() {
+                dst[..end - offset].copy_from_slice(&backing[offset..end]);
+            }
+        });
+
+        let mut env = GraphicsEnvironment::new();
+        env.base = GenericEnvironment::new()
+            .with_gpu_read(reader)
+            .with_program(gpu_base, 0);
+        env.set_detached_const_buffer_binding(
+            0,
+            ConstBufferBinding {
+                enabled: true,
+                address: gpu_base,
+                size: 0x1000,
+            },
+        );
+
+        let value = env.read_cbuf_value(0, 0x100);
+        assert_eq!(value, 0xDEADBEEF);
+        assert_eq!(
+            env.base.cbuf_values.get(&make_cbuf_key(0, 0x100)).copied(),
+            Some(0xDEADBEEF)
+        );
+    }
+
+    #[test]
+    fn graphics_environment_get_replace_const_buffer_uses_maxwell_owner() {
+        let mut maxwell = Maxwell3D::new();
+        maxwell.set_engine_state(EngineHint::OnHleMacro);
+        maxwell.set_hle_replacement_attribute_type(
+            2,
+            0x40,
+            crate::engines::maxwell_3d::HleReplacementAttributeType::BaseInstance,
+        );
+        let mut env = GraphicsEnvironment::from_maxwell3d(&maxwell, ShaderStageType::VertexB, 0, 0);
+
+        let replacement = env.get_replace_const_buffer(2, 0x40);
+        assert_eq!(replacement, Some(ReplaceConstant::BaseInstance));
+        assert_eq!(
+            env.base
+                .cbuf_replacements
+                .get(&make_cbuf_key(2, 0x40))
+                .copied(),
+            Some(ReplaceConstant::BaseInstance)
+        );
+    }
+
+    #[test]
+    fn graphics_environment_reads_live_maxwell_state_after_construction() {
+        let gpu_base = 0x1_0000_0000;
+        let cpu_base = 0xA000;
+        let mut backing = vec![0u8; 0x2000];
+        backing[0x100..0x104].copy_from_slice(&0xAABBCCDDu32.to_le_bytes());
+        let backing = Arc::new(backing);
+        let reader = Arc::new(move |cpu_addr, dst: &mut [u8]| {
+            let offset = (cpu_addr - cpu_base) as usize;
+            let end = (offset + dst.len()).min(backing.len());
+            if offset < backing.len() {
+                dst[..end - offset].copy_from_slice(&backing[offset..end]);
+            }
+        });
+
+        let mut maxwell = Maxwell3D::new();
+        let mm = make_mapped_memory_manager(gpu_base, cpu_base, 0x2000);
+        maxwell.set_memory_manager(Arc::clone(&mm));
+        maxwell.set_guest_memory_reader(reader);
+        let mut env =
+            GraphicsEnvironment::from_maxwell3d(&maxwell, ShaderStageType::VertexB, gpu_base, 0);
+
+        maxwell.call_method(0x8E0, 0x1000, true);
+        maxwell.call_method(0x8E1, 0x1, true);
+        maxwell.call_method(0x8E2, 0x0, true);
+        maxwell.call_method(0x904, 0x21, true);
+        maxwell.call_method(0x901, 0x21, true);
+        maxwell.call_method(0x64B, 0x1234, true);
+
+        assert_eq!(env.read_cbuf_value(2, 0x100), 0xAABBCCDD);
+        assert_eq!(env.read_viewport_transform_state(), 0x1234);
+    }
+
+    #[test]
+    fn graphics_environment_reads_texture_pixel_format_from_detached_state() {
+        let gpu_base = 0x4_0000_0000;
+        let mut raw = [0u8; 32];
+        let word0: u32 = 0x1D
+            | (2 << 7)
+            | (2 << 10)
+            | (2 << 13)
+            | (2 << 16)
+            | (2 << 19)
+            | (3 << 22)
+            | (4 << 25)
+            | (5 << 28);
+        raw[0..4].copy_from_slice(&word0.to_le_bytes());
+        let reader: GpuMemoryReader = Arc::new(move |gpu_addr, dst| {
+            dst.fill(0);
+            let expected_addr = gpu_base + 3 * 32;
+            if gpu_addr == expected_addr {
+                dst.copy_from_slice(&raw);
+            }
+        });
+
+        let mut env = GraphicsEnvironment::new();
+        env.base = GenericEnvironment::new()
+            .with_gpu_read(reader)
+            .with_program(gpu_base, 0);
+        env.set_detached_texture_header_pool_state(gpu_base, 3, SamplerBinding::Independently);
+
+        let format = env.read_texture_pixel_format(3);
+        assert_eq!(
+            env.base.texture_pixel_formats.get(&3).copied(),
+            Some(format)
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "disabled cbuf 2")]
+    fn graphics_environment_panics_on_disabled_live_cbuf() {
+        let maxwell = Maxwell3D::new();
+        let mut env = GraphicsEnvironment::from_maxwell3d(&maxwell, ShaderStageType::VertexB, 0, 0);
+        let _ = env.read_cbuf_value(2, 0);
+    }
+
+    #[test]
+    fn compute_environment_from_kepler_compute_includes_local_crs_alloc() {
+        let gpu_base = 0x2_0000_0000;
+        let cpu_base = 0xA000;
+        let backing = Arc::new(vec![0u8; 0x2000]);
+
+        let memory_manager = Arc::new(ParkingLotMutex::new(MemoryManager::new(0)));
+        memory_manager
+            .lock()
+            .map(gpu_base, cpu_base, 0x2000, 0, false);
+
+        let mut kepler = KeplerCompute::new(Arc::clone(&memory_manager));
+        kepler.launch_description = QueueMetaData {
+            program_start: 0x100,
+            shared_alloc: 0x80,
+            block_dim_x: 16,
+            block_dim_y: 2,
+            block_dim_z: 1,
+            local_pos_alloc: 0x40,
+            local_crs_alloc: 0x20,
+            linked_tsc: true,
+            ..QueueMetaData::default()
+        };
+        kepler.call_method(0x582, 0x2, true);
+        kepler.call_method(0x583, 0, true);
+
+        let reader = make_cpu_reader(cpu_base, backing);
+        let env =
+            ComputeEnvironment::from_kepler_compute(&kepler, Arc::clone(&memory_manager), reader);
+        assert_eq!(env.base.local_memory_size, 0x60);
+        assert_eq!(env.base.shared_memory_size, 0x80);
+        assert_eq!(env.base.workgroup_size, [16, 2, 1]);
+    }
+
+    #[test]
+    fn compute_environment_reads_live_qmd_state_after_construction() {
+        let gpu_base = 0x3_0000_0000;
+        let mut backing = vec![0u8; 0x2000];
+        backing[0x180..0x184].copy_from_slice(&0xCAFEBABEu32.to_le_bytes());
+        let backing = Arc::new(backing);
+
+        let memory_manager = Arc::new(ParkingLotMutex::new(MemoryManager::new(0)));
+        memory_manager
+            .lock()
+            .map(gpu_base, 0xB000, 0x2000, 0, false);
+        let mut kepler = KeplerCompute::new(Arc::clone(&memory_manager));
+        let reader: GpuMemoryReader = Arc::new(move |cpu_addr, dst| {
+            dst.fill(0);
+            let offset = cpu_addr.saturating_sub(0xB000) as usize;
+            if offset >= backing.len() {
+                return;
+            }
+            let available = backing.len() - offset;
+            let count = available.min(dst.len());
+            dst[..count].copy_from_slice(&backing[offset..offset + count]);
+        });
+        let mut env = ComputeEnvironment::from_kepler_compute(
+            &kepler,
+            Arc::clone(&memory_manager),
+            Arc::clone(&reader),
+        );
+
+        kepler.launch_description.const_buffer_enable_mask = 1;
+        kepler.launch_description.const_buffers[0] = QmdConstBuffer {
+            address: gpu_base,
+            size: 0x400,
+        };
+
+        assert_eq!(env.read_cbuf_value(0, 0x180), 0xCAFEBABE);
+    }
+
+    #[test]
+    #[should_panic(expected = "disabled cbuf 0")]
+    fn compute_environment_panics_on_disabled_live_cbuf() {
+        let memory_manager = Arc::new(ParkingLotMutex::new(MemoryManager::new(0)));
+        let kepler = KeplerCompute::new(Arc::clone(&memory_manager));
+        let reader: GpuMemoryReader = Arc::new(|_, dst| dst.fill(0));
+        let mut env = ComputeEnvironment::from_kepler_compute(&kepler, memory_manager, reader);
+        let _ = env.read_cbuf_value(0, 0);
+    }
+
+    #[test]
+    fn graphics_environment_implements_shader_environment_trait() {
+        use shader_recompiler::environment::Environment;
+
+        let mut maxwell = Maxwell3D::new();
+        maxwell.set_engine_state(EngineHint::OnHleMacro);
+        maxwell.set_hle_replacement_attribute_type(
+            1,
+            0x20,
+            crate::engines::maxwell_3d::HleReplacementAttributeType::DrawId,
+        );
+        let mut env =
+            GraphicsEnvironment::from_maxwell3d(&maxwell, ShaderStageType::Geometry, 0, 0);
+
+        let trait_env: &mut dyn Environment = &mut env;
+        assert_eq!(trait_env.shader_stage(), ShaderStage::Geometry);
+        assert_eq!(trait_env.start_address(), 0);
+        assert_eq!(
+            trait_env.gp_passthrough_mask(),
+            &maxwell.post_vtg_shader_attrib_skip_mask()
+        );
+        assert_eq!(
+            trait_env.get_replace_const_buffer(1, 0x20),
+            Some(ReplaceConstant::DrawID)
+        );
+    }
+
+    #[test]
+    fn file_environment_implements_shader_environment_trait() {
+        use shader_recompiler::environment::Environment;
+
+        let mut env = FileEnvironment::new();
+        env.stage = ShaderStage::Compute;
+        env.texture_bound = 7;
+        env.local_memory_size = 0x44;
+        env.shared_memory_size = 0x88;
+        env.workgroup_size = [4, 5, 6];
+        env.cbuf_values.insert(make_cbuf_key(3, 0x10), 0x12345678);
+        env.texture_types.insert(0x20, TextureType::ColorArray2D);
+        env.texture_pixel_formats
+            .insert(0x20, TexturePixelFormat::R32Uint);
+        env.cbuf_replacements
+            .insert(make_cbuf_key(3, 0x10), ReplaceConstant::BaseVertex);
+
+        let trait_env: &mut dyn Environment = &mut env;
+        assert_eq!(trait_env.read_cbuf_value(3, 0x10), 0x12345678);
+        assert_eq!(trait_env.read_texture_type(0x20), TextureType::ColorArray2D);
+        assert_eq!(
+            trait_env.read_texture_pixel_format(0x20),
+            TexturePixelFormat::R32Uint
+        );
+        assert!(trait_env.is_texture_pixel_format_integer(0x20));
+        assert_eq!(trait_env.texture_bound_buffer(), 7);
+        assert_eq!(trait_env.local_memory_size(), 0x44);
+        assert_eq!(trait_env.shared_memory_size(), 0x88);
+        assert_eq!(trait_env.workgroup_size(), [4, 5, 6]);
+        assert_eq!(
+            trait_env.get_replace_const_buffer(3, 0x10),
+            Some(ReplaceConstant::BaseVertex)
+        );
+    }
+
+    fn make_test_cache_path(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "ruzu-shader-env-{}-{}-{}.bin",
+            name,
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system time after epoch")
+                .as_nanos()
+        ))
+    }
+
+    fn read_test_cache_key(file: &mut std::fs::File, size: usize) -> Vec<u8> {
+        use std::io::Read;
+
+        let mut key = vec![0; size];
+        file.read_exact(&mut key)
+            .expect("read serialized cache key");
+        key
+    }
+
+    #[test]
+    fn load_pipelines_dispatches_compute_by_first_environment_stage() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let path = make_test_cache_path("compute-dispatch");
+        let mut env = GenericEnvironment::new();
+        env.stage = ShaderStage::Compute;
+        env.cached_lowest = 0;
+        env.cached_highest = 0;
+        env.code = vec![0];
+        env.shared_memory_size = 0x20;
+        env.workgroup_size = [1, 2, 3];
+        serialize_pipeline(b"test", &[&env], &path, 7);
+
+        let compute_calls = Arc::new(AtomicUsize::new(0));
+        let graphics_calls = Arc::new(AtomicUsize::new(0));
+        let compute_calls_clone = Arc::clone(&compute_calls);
+        let graphics_calls_clone = Arc::clone(&graphics_calls);
+        load_pipelines(
+            || false,
+            &path,
+            7,
+            Box::new(move |file, env| {
+                assert_eq!(env.shader_stage(), ShaderStage::Compute);
+                assert_eq!(read_test_cache_key(file, 4), b"test");
+                compute_calls_clone.fetch_add(1, Ordering::Relaxed);
+            }),
+            Box::new(move |file, _| {
+                let _ = read_test_cache_key(file, 4);
+                graphics_calls_clone.fetch_add(1, Ordering::Relaxed);
+            }),
+        );
+
+        assert_eq!(compute_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(graphics_calls.load(Ordering::Relaxed), 0);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn load_pipelines_deletes_invalid_cache_file() {
+        use std::io::Write;
+
+        let path = make_test_cache_path("invalid-header");
+        let mut file = std::fs::File::create(&path).expect("create invalid cache");
+        file.write_all(b"badcache").expect("write magic");
+        file.write_all(&999u32.to_le_bytes())
+            .expect("write version");
+        drop(file);
+
+        load_pipelines(|| false, &path, 7, Box::new(|_, _| {}), Box::new(|_, _| {}));
+
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn load_pipelines_deletes_truncated_cache_file() {
+        use std::io::Write;
+
+        let path = make_test_cache_path("truncated-entry");
+        let mut file = std::fs::File::create(&path).expect("create truncated cache");
+        file.write_all(&MAGIC_NUMBER).expect("write magic");
+        file.write_all(&7u32.to_le_bytes()).expect("write version");
+        file.write_all(&1u32.to_le_bytes())
+            .expect("write env count");
+        file.write_all(&0u64.to_le_bytes())
+            .expect("write partial code size");
+        drop(file);
+
+        load_pipelines(|| false, &path, 7, Box::new(|_, _| {}), Box::new(|_, _| {}));
+
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn load_pipelines_deletes_cache_with_invalid_stage_discriminant() {
+        use std::io::{Seek, SeekFrom, Write};
+
+        let path = make_test_cache_path("invalid-stage");
+        let mut env = GenericEnvironment::new();
+        env.stage = ShaderStage::Compute;
+        env.cached_lowest = 0;
+        env.cached_highest = 0;
+        env.code = vec![0];
+        env.shared_memory_size = 0x20;
+        env.workgroup_size = [1, 2, 3];
+        serialize_pipeline(b"test", &[&env], &path, 7);
+
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .expect("open serialized cache");
+        file.seek(SeekFrom::Start(80))
+            .expect("seek to stage discriminant");
+        file.write_all(&u32::MAX.to_le_bytes())
+            .expect("overwrite stage discriminant");
+        drop(file);
+
+        load_pipelines(|| false, &path, 7, Box::new(|_, _| {}), Box::new(|_, _| {}));
+
+        assert!(!path.exists());
+    }
+
+    fn make_cpu_reader(
+        cpu_base: u64,
+        backing: Arc<Vec<u8>>,
+    ) -> Arc<dyn Fn(u64, &mut [u8]) + Send + Sync> {
+        Arc::new(move |cpu_addr: u64, dst: &mut [u8]| {
+            dst.fill(0);
+            let offset = cpu_addr.saturating_sub(cpu_base) as usize;
+            if offset >= backing.len() {
+                return;
+            }
+            let available = backing.len() - offset;
+            let count = available.min(dst.len());
+            dst[..count].copy_from_slice(&backing[offset..offset + count]);
+        })
     }
 }

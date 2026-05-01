@@ -770,6 +770,11 @@ impl GpuCoreInterface for Gpu {
         // GPU query result (e.g. samples-passed) is silently dropped — the exact
         // failure mode that wedges MK8D's poll on 0x40037000.
         let gpu_ptr = self as *const Gpu as usize;
+        mm.set_guest_memory_reader(Arc::new(move |addr, output| {
+            let gpu = unsafe { &*(gpu_ptr as *const Gpu) };
+            let _ = gpu.read_guest_memory(addr, output);
+        }));
+        let gpu_ptr = self as *const Gpu as usize;
         mm.set_guest_memory_writer(Arc::new(move |addr, data| {
             // SAFETY: the GPU outlives every MemoryManager handle it owns; the
             // raw-pointer roundtrip is the same idiom used by other callbacks

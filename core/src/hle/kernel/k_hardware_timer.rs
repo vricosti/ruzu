@@ -6,6 +6,7 @@
 //! timer callbacks via CoreTiming. Inherits from KHardwareTimerBase.
 
 use std::collections::HashMap;
+use std::mem;
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
@@ -374,78 +375,59 @@ impl KHardwareTimer {
         if trace {
             log::info!("KHardwareTimer::do_task before_state_lock");
         }
-        let (deliveries, next_time) = {
-            let mut state = self.state.lock().unwrap();
-            if trace {
-                log::info!("KHardwareTimer::do_task after_state_lock");
-            }
-
-            if !Self::get_interrupt_enabled_locked(&state) {
-                if trace {
-                    log::info!("KHardwareTimer::do_task interrupt_not_enabled early_return");
-                }
-                return;
-            }
-
-            // Disable the timer interrupt while we handle this.
-            state.m_wakeup_time = i64::MAX;
-
-            let cur_tick = if let Some(ref core_timing) = state.core_timing {
-                core_timing.get_global_time_ns().as_nanos() as i64
-            } else {
-                0
-            };
-            let (fired_task_ids, next_time) = state.base.collect_expired_tasks(cur_tick);
-            log::trace!(
-                "KHardwareTimer::do_task cur_tick={} fired={:?} next_time={}",
-                cur_tick,
-                fired_task_ids,
-                next_time
-            );
-
-            let mut deliveries = Vec::with_capacity(fired_task_ids.len());
-            for task_id in fired_task_ids {
-                let target = if let Some(gsc) = gsc.as_ref() {
-                    gsc.lock()
-                        .unwrap()
-                        .get_thread_by_thread_id(task_id)
-                        .map(TimerTaskTarget::ThreadArc)
-                } else {
-                    None
-                }
-                .or_else(|| {
-                    state
-                        .thread_ptrs
-                        .get(&task_id)
-                        .copied()
-                        .filter(|ptr| *ptr != 0)
-                        .map(TimerTaskTarget::RawPtr)
-                });
-
-                if let Some(target) = target {
-                    deliveries.push(target);
-                }
-                state.thread_ptrs.remove(&task_id);
-            }
-
-            (deliveries, next_time)
-        };
+        let mut state = self.state.lock().unwrap();
         if trace {
-            log::info!(
-                "KHardwareTimer::do_task collected_deliveries count={} next_time={}",
-                deliveries.len(),
-                next_time
-            );
+            log::info!("KHardwareTimer::do_task after_state_lock");
         }
 
-        for target in deliveries {
+        if !Self::get_interrupt_enabled_locked(&state) {
+            if trace {
+                log::info!("KHardwareTimer::do_task interrupt_not_enabled early_return");
+            }
+            return;
+        }
+
+        // Disable the timer interrupt while we handle this.
+        state.m_wakeup_time = i64::MAX;
+
+        let cur_tick = if let Some(ref core_timing) = state.core_timing {
+            core_timing.get_global_time_ns().as_nanos() as i64
+        } else {
+            0
+        };
+
+        let trace_enabled = trace;
+        let gsc_ref = gsc.as_ref();
+        let mut thread_ptrs = mem::take(&mut state.thread_ptrs);
+        let next_time = state.base.do_interrupt_task_impl(cur_tick, |task_id| {
+            let target = if let Some(gsc) = gsc_ref {
+                gsc.lock()
+                    .unwrap()
+                    .get_thread_by_thread_id(task_id)
+                    .map(TimerTaskTarget::ThreadArc)
+            } else {
+                None
+            }
+            .or_else(|| {
+                thread_ptrs
+                    .get(&task_id)
+                    .copied()
+                    .filter(|ptr| *ptr != 0)
+                    .map(TimerTaskTarget::RawPtr)
+            });
+            thread_ptrs.remove(&task_id);
+
+            let Some(target) = target else {
+                return;
+            };
+
             match target {
                 TimerTaskTarget::ThreadArc(thread) => {
-                    if trace {
+                    if trace_enabled {
                         log::info!("KHardwareTimer::do_task before_thread_lock (ThreadArc)");
                     }
                     let mut thread = thread.lock().unwrap();
-                    if trace {
+                    if trace_enabled {
                         log::info!(
                             "KHardwareTimer::do_task after_thread_lock tid={}",
                             thread.get_thread_id()
@@ -462,11 +444,11 @@ impl KHardwareTimer {
                     thread.on_timer();
                 }
                 TimerTaskTarget::RawPtr(thread_ptr) => {
-                    if trace {
+                    if trace_enabled {
                         log::info!("KHardwareTimer::do_task RawPtr delivery");
                     }
                     let thread = unsafe { &mut *(thread_ptr as *mut KThread) };
-                    if trace {
+                    if trace_enabled {
                         log::info!(
                             "KHardwareTimer::do_task RawPtr tid={} pre_on_timer",
                             thread.get_thread_id()
@@ -483,13 +465,16 @@ impl KHardwareTimer {
                     thread.on_timer();
                 }
             }
-        }
+        });
+        state.thread_ptrs = thread_ptrs;
+        log::trace!(
+            "KHardwareTimer::do_task cur_tick={} next_time={}",
+            cur_tick,
+            next_time
+        );
 
-        if next_time > 0 {
-            let mut state = self.state.lock().unwrap();
-            if next_time <= state.m_wakeup_time {
-                self.rearm_interrupt_after_callback_locked(&mut state, next_time);
-            }
+        if next_time > 0 && next_time <= state.m_wakeup_time {
+            self.rearm_interrupt_after_callback_locked(&mut state, next_time);
         }
     }
 }

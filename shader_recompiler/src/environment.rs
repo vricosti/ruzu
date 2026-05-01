@@ -16,22 +16,22 @@ use super::stage::Stage;
 /// texture types, and other GPU state needed during translation.
 pub trait Environment {
     /// Read a 64-bit instruction at the given byte address.
-    fn read_instruction(&self, address: u32) -> u64;
+    fn read_instruction(&mut self, address: u32) -> u64;
 
     /// Read a 32-bit value from a constant buffer.
-    fn read_cbuf_value(&self, cbuf_index: u32, cbuf_offset: u32) -> u32;
+    fn read_cbuf_value(&mut self, cbuf_index: u32, cbuf_offset: u32) -> u32;
 
     /// Read the texture type for a raw texture handle.
-    fn read_texture_type(&self, raw_handle: u32) -> TextureType;
+    fn read_texture_type(&mut self, raw_handle: u32) -> TextureType;
 
     /// Read the texture pixel format for a raw texture handle.
-    fn read_texture_pixel_format(&self, raw_handle: u32) -> TexturePixelFormat;
+    fn read_texture_pixel_format(&mut self, raw_handle: u32) -> TexturePixelFormat;
 
     /// Check if a texture pixel format is integer.
-    fn is_texture_pixel_format_integer(&self, raw_handle: u32) -> bool;
+    fn is_texture_pixel_format_integer(&mut self, raw_handle: u32) -> bool;
 
     /// Read the viewport transform state register.
-    fn read_viewport_transform_state(&self) -> u32;
+    fn read_viewport_transform_state(&mut self) -> u32;
 
     /// Get the texture bound buffer index.
     fn texture_bound_buffer(&self) -> u32;
@@ -49,10 +49,10 @@ pub trait Environment {
     fn has_hle_macro_state(&self) -> bool;
 
     /// Get a replacement constant for a cbuf access (HLE macro support).
-    fn get_replace_const_buffer(&self, bank: u32, offset: u32) -> Option<ReplaceConstant>;
+    fn get_replace_const_buffer(&mut self, bank: u32, offset: u32) -> Option<ReplaceConstant>;
 
     /// Dump shader for debugging.
-    fn dump(&self, pipeline_hash: u64, shader_hash: u64);
+    fn dump(&mut self, pipeline_hash: u64, shader_hash: u64);
 
     /// Get the shader program header.
     fn sph(&self) -> &ProgramHeader;
