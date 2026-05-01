@@ -399,12 +399,59 @@ impl KPageTableBase {
     }
 
     /// Check if an address range can be contained within a region for a given state.
-    /// Matches upstream `KPageTableBase::CanContain(KProcessAddress, size_t, Svc::MemoryState)`.
+    /// Matches upstream `KPageTableBase::CanContain(KProcessAddress, size_t, Svc::MemoryState)`
+    /// (`zuyu/src/core/hle/kernel/k_page_table_base.cpp:574-619`).
+    ///
+    /// Earlier ruzu only checked `is_in_region`; it accepted addresses that
+    /// overlap the heap or alias regions for memory states that upstream
+    /// excludes from those (Shared, AliasCode, etc.). That caused
+    /// `svcMapSharedMemory` to succeed at addresses past heap_end on
+    /// AArch32, corrupting the page-table invariants and cascading into
+    /// the MK8D wedge — see `project_mk8d_can_contain_bug.md`.
     pub fn can_contain(&self, addr: usize, size: usize, state: SvcMemoryState) -> bool {
+        use SvcMemoryState::*;
+
+        let end = addr.saturating_add(size);
+        let last = end.saturating_sub(1);
+
         let region_start = self.get_region_address(state);
         let region_size = self.get_region_size(state);
-        let region_end = region_start + region_size;
-        region_start <= addr && addr + size <= region_end
+        let region_end = region_start.saturating_add(region_size);
+
+        let is_in_region =
+            region_start <= addr && addr < end && last <= region_end.saturating_sub(1);
+        let is_in_heap = !(end <= self.m_heap_region_start
+            || self.m_heap_region_end <= addr
+            || self.m_heap_region_start == self.m_heap_region_end);
+        let is_in_alias = !(end <= self.m_alias_region_start
+            || self.m_alias_region_end <= addr
+            || self.m_alias_region_start == self.m_alias_region_end);
+
+        match state {
+            Free | Kernel => is_in_region,
+            Io | Static | Code | CodeData | Shared | AliasCode | AliasCodeData | Stack
+            | ThreadLocal | Transferred | SharedTransferred | SharedCode | GeneratedCode
+            | CodeOut | Coverage | Insecure => is_in_region && !is_in_heap && !is_in_alias,
+            Normal => {
+                debug_assert!(
+                    is_in_heap,
+                    "CanContain(Normal) called with addr=0x{:x} size=0x{:x} not in heap",
+                    addr,
+                    size,
+                );
+                is_in_region && !is_in_alias
+            }
+            Ipc | NonSecureIpc | NonDeviceIpc => {
+                debug_assert!(
+                    is_in_alias,
+                    "CanContain(Ipc) called with addr=0x{:x} size=0x{:x} not in alias",
+                    addr,
+                    size,
+                );
+                is_in_region && !is_in_heap
+            }
+            _ => false,
+        }
     }
 
     // -- KMemoryState convenience overloads --
@@ -4458,5 +4505,85 @@ mod tests {
         let page = KPageTableBase::build_ipc_partial_page(b'Y', false, 0, &[1, 2, 3, 4]);
         assert_eq!(page.len(), PAGE_SIZE);
         assert!(page.iter().all(|b| *b == b'Y'));
+    }
+
+    /// Set up an AArch32-shaped page table for `can_contain` parity tests.
+    /// Mirrors the layout MK8D's process exposes:
+    ///   address_space   = [0x0000_0000, 0x1_0000_0000)
+    ///   code            = [0x0020_0000, 0x4000_0000)        ← MapSmall
+    ///   alias_code      = [0x0020_0000, 0x1_0000_0000)      ← MapSmall start..MapLarge end
+    ///   heap            = [0x4000_0000, 0xB800_0000)        ← 2 GiB
+    ///   alias           = [0xB800_0000, 0xF800_0000)        ← 1 GiB above heap
+    fn aarch32_layout() -> KPageTableBase {
+        let mut pt = KPageTableBase::new();
+        pt.m_address_space_start = 0x0000_0000;
+        pt.m_address_space_end = 0x1_0000_0000;
+        pt.m_code_region_start = 0x0020_0000;
+        pt.m_code_region_end = 0x4000_0000;
+        pt.m_alias_code_region_start = 0x0020_0000;
+        pt.m_alias_code_region_end = 0x1_0000_0000;
+        pt.m_heap_region_start = 0x4000_0000;
+        pt.m_heap_region_end = 0xB800_0000;
+        pt.m_alias_region_start = 0xB800_0000;
+        pt.m_alias_region_end = 0xF800_0000;
+        pt.m_stack_region_start = pt.m_code_region_start;
+        pt.m_stack_region_end = pt.m_code_region_end;
+        pt.m_kernel_map_region_start = pt.m_code_region_start;
+        pt.m_kernel_map_region_end = pt.m_code_region_end;
+        pt
+    }
+
+    /// Upstream `CanContain(Shared)` excludes addresses inside heap or alias —
+    /// this is the SVC #530 case that wedged MK8D when ruzu accepted it.
+    #[test]
+    fn can_contain_shared_rejects_address_in_alias_region() {
+        let pt = aarch32_layout();
+        // The actual MK8D SVC #530 args.
+        assert!(
+            !pt.can_contain(0xB940_4000, 0x40000, SvcMemoryState::Shared),
+            "Shared inside alias region must be rejected (matches upstream)"
+        );
+    }
+
+    #[test]
+    fn can_contain_shared_rejects_address_in_heap_region() {
+        let pt = aarch32_layout();
+        // 0x60000000 is firmly inside heap [0x40000000, 0xB8000000).
+        assert!(!pt.can_contain(0x6000_0000, 0x4000, SvcMemoryState::Shared));
+    }
+
+    #[test]
+    fn can_contain_shared_accepts_alias_code_below_heap() {
+        let pt = aarch32_layout();
+        // Inside MapSmall (alias_code region) and below heap.
+        assert!(pt.can_contain(0x0040_0000, 0x4000, SvcMemoryState::Shared));
+    }
+
+    #[test]
+    fn can_contain_normal_excludes_alias_but_not_heap() {
+        let pt = aarch32_layout();
+        // `Normal` maps to heap region. Overlap with alias must reject.
+        assert!(pt.can_contain(0x6000_0000, 0x4000, SvcMemoryState::Normal));
+        // Wholly inside alias (not heap) — Normal's region IS heap, so this
+        // is outside the region anyway, but the check still needs to hold.
+        assert!(!pt.can_contain(0xC000_0000, 0x4000, SvcMemoryState::Normal));
+    }
+
+    #[test]
+    fn can_contain_ipc_requires_alias_excludes_heap() {
+        let pt = aarch32_layout();
+        // Ipc maps to alias region. Inside alias is OK.
+        assert!(pt.can_contain(0xC000_0000, 0x4000, SvcMemoryState::Ipc));
+        // Outside alias rejects.
+        assert!(!pt.can_contain(0x6000_0000, 0x4000, SvcMemoryState::Ipc));
+    }
+
+    #[test]
+    fn can_contain_free_only_checks_region() {
+        let pt = aarch32_layout();
+        // Free should accept anything in the address space, even inside heap.
+        assert!(pt.can_contain(0x6000_0000, 0x4000, SvcMemoryState::Free));
+        // Outside the address space rejects.
+        assert!(!pt.can_contain(0xFFFF_FFFF, 0x4000, SvcMemoryState::Free));
     }
 }

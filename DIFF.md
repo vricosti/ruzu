@@ -12496,3 +12496,35 @@
 ### Binary layout verification
 - PASS: thread timeout-control-flow change only; no guest-visible raw struct layout changed.
 - PASS: `cargo build --bin ruzu-cmd`
+
+## 2026-05-01 — `core/src/core.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/core.cpp` (`CoreTiming RegisterHostThread callback follow-up`)
+
+### Intentional differences
+- Rust still flattens `System::Impl` ownership into [`core.rs`](/home/vricosti/Dev/emulators/ruzu/core/src/core.rs) and uses `SystemRef` plus a closure bridge for `CoreTiming::initialize(...)`, because this tree does not model the literal C++ pimpl layout.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: the `CoreTiming::initialize(...)` callback called `system_ref.get().kernel().unwrap().register_host_thread()`. Upstream wires this callback as `core_timing.Initialize([&system]() { system.RegisterHostThread(); });`, and `System::RegisterHostThread()` itself forwards to `impl->kernel.RegisterHostThread()`. The Rust callback now calls `system_ref.get().register_host_thread()`, which restores the matching owner boundary and removes the timer-thread panic when `kernel()` was observed as `None` from the closure path.
+- Fixed in this pass: Rust `System::register_host_thread(...)` unnecessarily required `&mut self`, which did not match its actual behavior or the upstream call shape. It now takes `&self`, matching the non-mutating owner role of upstream `System::RegisterHostThread()`.
+
+### Missing items
+- Re-audit the rest of `core_timing.initialize(...)` startup ordering against upstream `System` initialization once the current MK8D scheduler/timer frontier moves.
+
+### Binary layout verification
+- PASS: core-timing callback owner/signature change only; no guest-visible raw struct layout changed.
+- PASS: `cargo build --bin ruzu-cmd`
+
+## 2026-05-01 — `core/src/hle/kernel/k_page_table_base.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/k_page_table_base.cpp` (`CanContain heap/alias exclusion follow-up`)
+
+### Intentional differences
+- Rust keeps the per-state region lookup as `get_region_address(state)` / `get_region_size(state)` returning `usize` rather than `KProcessAddress` + `size_t`. This stays as a Rust-typing adaptation; the address/size semantics match upstream byte-for-byte.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `KPageTableBase::CanContain` (Rust `can_contain`) was a single-line `region_start <= addr && addr + size <= region_end`, which only implemented the `is_in_region` step and accepted any address inside the broad alias-code region for memory states upstream excludes from heap/alias overlap. Upstream `zuyu/src/core/hle/kernel/k_page_table_base.cpp:574-619` does a full per-state switch with `is_in_heap` and `is_in_alias` exclusion checks; for `Shared` (and `Io`/`Static`/`Code`/`CodeData`/`AliasCode`/`AliasCodeData`/`Stack`/`ThreadLocal`/`Transferred`/`SharedTransferred`/`SharedCode`/`GeneratedCode`/`CodeOut`/`Coverage`/`Insecure`) it returns `is_in_region && !is_in_heap && !is_in_alias`. The Rust port now mirrors that switch exactly, so `svcMapSharedMemory` rejects addresses inside the heap or alias region with `ResultInvalidCurrentMemory` matching upstream.
+- Fixed in this pass: added the `Normal` (heap) branch returning `is_in_region && !is_in_alias`, and the `Ipc`/`NonSecureIpc`/`NonDeviceIpc` branch returning `is_in_region && !is_in_heap`, matching upstream's `ASSERT(is_in_heap)` / `ASSERT(is_in_alias)` debug invariants via `debug_assert!`.
+- Verified: deterministic-seed `scripts/svc_diff.py` run of MK8D against upstream now matches at SVC #530 (`svcMapSharedMemory(addr=0xb9404000, size=0x40000)` correctly returns `ResultInvalidCurrentMemory` in both, the game falls back to `0xe8800000` in both). The diff jumps 69 SVCs forward to a different divergence at SVC #599 — the previously-cascading drift caused by this bug is gone.
+
+### Missing items
+- The `Inaccessible`, `Alias` (state value 7), and `Kernel`-with-overlap edge cases aren't exercised by MK8D and aren't covered by the new tests; they fall back to `false` matching upstream's `default` branch but lack focused regression coverage.
+
+### Binary layout verification
+- PASS: validation-only change; no guest-visible raw struct layout touched. Six focused regression tests added in `mod tests` (`can_contain_shared_rejects_address_in_alias_region`, `_in_heap_region`, `_accepts_alias_code_below_heap`, `can_contain_normal_excludes_alias_but_not_heap`, `can_contain_ipc_requires_alias_excludes_heap`, `can_contain_free_only_checks_region`) cover heap-edge / alias-edge addresses for the four behaviorally-distinct branches plus the SVC #530 MK8D wedge address. Workspace `cargo test` is currently broken by 128 pre-existing test-build errors unrelated to this change, so the new tests can't be run via cargo until those are repaired; release build (`cargo build --release --bin ruzu-cmd`) is clean.
