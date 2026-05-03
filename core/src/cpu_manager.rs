@@ -743,12 +743,15 @@ impl CpuManager {
                             let mut tc = crate::arm::arm_interface::ThreadContext::default();
                             jit_ref.get_context(&mut tc);
                             log::error!(
-                                "multi_core_run_guest_thread: tid={} core={} {} at pc=0x{:08X} lr=0x{:08X} — suspending thread",
+                                "multi_core_run_guest_thread: tid={} core={} {} at pc=0x{:016X} lr=0x{:016X} sp=0x{:016X} r0=0x{:016X} r28=0x{:016X} — suspending thread",
                                 current_thread_id,
                                 core_index,
                                 if prefetch_abort { "PrefetchAbort" } else { "Breakpoint" },
-                                tc.pc as u32,
-                                tc.lr as u32,
+                                tc.pc,
+                                tc.lr,
+                                tc.sp,
+                                tc.r[0],
+                                tc.r[28],
                             );
                         }
                         thread_arc
