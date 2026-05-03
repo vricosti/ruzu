@@ -436,8 +436,7 @@ impl KPageTableBase {
                 debug_assert!(
                     is_in_heap,
                     "CanContain(Normal) called with addr=0x{:x} size=0x{:x} not in heap",
-                    addr,
-                    size,
+                    addr, size,
                 );
                 is_in_region && !is_in_alias
             }
@@ -445,8 +444,7 @@ impl KPageTableBase {
                 debug_assert!(
                     is_in_alias,
                     "CanContain(Ipc) called with addr=0x{:x} size=0x{:x} not in alias",
-                    addr,
-                    size,
+                    addr, size,
                 );
                 is_in_region && !is_in_heap
             }
@@ -1341,12 +1339,6 @@ impl KPageTableBase {
             return (svc_results::RESULT_LIMIT_REACHED.get_inner_value(), 0);
         }
 
-        // Upstream: reserve resource limit, allocate physical pages.
-        // In our emulator, physical memory is pre-allocated in DeviceMemory.
-        // We compute the physical address from the virtual address.
-        // Physical address = DramMemoryMap::Base + virtual address offset.
-        let phys_addr = crate::device_memory::dram_memory_map::BASE + cur_address as u64;
-
         // Check that the region to grow is Free.
         let result = self.check_memory_state(
             cur_address,
@@ -1364,6 +1356,29 @@ impl KPageTableBase {
 
         // Map the new heap pages.
         let num_pages = allocation_size / PAGE_SIZE;
+
+        // Allocate physical pages from the kernel memory manager pool.
+        // Upstream: `KPageTableBase::SetHeapSize` calls
+        //   m_kernel.MemoryManager().AllocateAndOpen(&pg, num_pages, alloc_option);
+        // Then Operate(MapGroup, ...). Same pattern as map_pages_find_free above —
+        // computing `phys = DRAM_BASE + cur_address` assumes the guest VA fits in
+        // the host backing, which fails for the 3.4 GB heap STK requests in the
+        // 137 GB alias region. Pool allocation gives a host-backed phys address.
+        let alloc_option = self.m_allocate_option;
+        let phys_addr = if let Some(kernel) = crate::hle::kernel::kernel::get_kernel_mut() {
+            kernel
+                .memory_manager_mut()
+                .allocate_and_open_continuous(num_pages, 1, alloc_option)
+        } else {
+            0
+        };
+        if phys_addr == 0 {
+            log::error!(
+                "set_heap_size: AllocateAndOpenContinuous failed ({} pages, option=0x{:X})",
+                num_pages, alloc_option
+            );
+            return (svc_results::RESULT_OUT_OF_MEMORY.get_inner_value(), 0);
+        }
         let map_properties = KPageProperties {
             perm: KMemoryPermission::USER_READ_WRITE,
             io: false,
@@ -2221,8 +2236,37 @@ impl KPageTableBase {
                 return (op_result, 0);
             }
         } else {
-            // Allocate and map — use DramMemoryMap::Base + addr as phys.
-            let auto_phys = crate::device_memory::dram_memory_map::BASE + addr as u64;
+            // Allocate physical pages from the kernel memory manager pool.
+            //
+            // Upstream: `KPageTableBase::AllocateAndMapPagesImpl(...)`
+            //   pg = KPageGroup; m_kernel.MemoryManager().AllocateAndOpen(&pg, ...);
+            //   Operate(MapGroup, ...).
+            //
+            // Previous ruzu code computed `auto_phys = DRAM_BASE + addr` which
+            // implicitly assumed every guest virtual address fit inside the host
+            // backing buffer. For ARM64 user processes whose virtual address
+            // space spans 512 GB but the host buffer is 4 GB, this assertion
+            // failed in `HostMemory::map`. Allocating from the pool returns a
+            // physical address inside the bounded DRAM region, matching upstream
+            // and satisfying the host-memory bounds check.
+            let alloc_option = self.m_allocate_option;
+            let phys_addr = if let Some(kernel) =
+                crate::hle::kernel::kernel::get_kernel_mut()
+            {
+                kernel
+                    .memory_manager_mut()
+                    .allocate_and_open_continuous(num_pages, 1, alloc_option)
+            } else {
+                0
+            };
+            if phys_addr == 0 {
+                log::error!(
+                    "map_pages_find_free: AllocateAndOpenContinuous failed ({} pages, option=0x{:X})",
+                    num_pages,
+                    alloc_option
+                );
+                return (svc_results::RESULT_OUT_OF_MEMORY.get_inner_value(), 0);
+            }
             let properties = KPageProperties {
                 perm,
                 io: false,
@@ -2232,7 +2276,7 @@ impl KPageTableBase {
             let op_result = self.operate(
                 addr,
                 num_pages,
-                auto_phys,
+                phys_addr,
                 true,
                 properties,
                 OperationType::Map,
