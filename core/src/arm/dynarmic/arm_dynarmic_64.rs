@@ -682,11 +682,14 @@ impl ArmInterface for ArmDynarmic64 {
     }
 
     fn set_tpidrro_el0(&mut self, value: u64) {
-        // Upstream: m_cb->m_tpidrro_el0 = value
-        // The callback owns this but since it's moved into the JIT,
-        // we track it here. When guest memory is wired, this will
-        // be passed through properly.
+        // Upstream: m_cb->m_tpidrro_el0 = value, but the callback's value is
+        // read by the JIT through the JitState's tpidrro_el0 field — so we
+        // must propagate to the JIT. Without this, MRS x, tpidrro_el0 returns
+        // zero (libnx's TLS code reads at offset 0x1E0 from null and panics).
         self.tpidrro_el0 = value;
+        if let Some(jit) = self.jit.as_mut() {
+            jit.set_tpidrro_el0(value);
+        }
     }
 
     fn get_svc_arguments(&self, args: &mut [u64; 8]) {
