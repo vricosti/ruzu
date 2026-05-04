@@ -1357,28 +1357,19 @@ impl KPageTableBase {
         // Map the new heap pages.
         let num_pages = allocation_size / PAGE_SIZE;
 
-        // Allocate physical pages from the kernel memory manager pool.
-        // Upstream: `KPageTableBase::SetHeapSize` calls
-        //   m_kernel.MemoryManager().AllocateAndOpen(&pg, num_pages, alloc_option);
-        // Then Operate(MapGroup, ...). Same pattern as map_pages_find_free above —
-        // computing `phys = DRAM_BASE + cur_address` assumes the guest VA fits in
-        // the host backing, which fails for the 3.4 GB heap STK requests in the
-        // 137 GB alias region. Pool allocation gives a host-backed phys address.
-        let alloc_option = self.m_allocate_option;
-        let phys_addr = if let Some(kernel) = crate::hle::kernel::kernel::get_kernel_mut() {
-            kernel
-                .memory_manager_mut()
-                .allocate_and_open_continuous(num_pages, 1, alloc_option)
-        } else {
-            0
+        // Allocate physical pages from the kernel memory manager pool, mapping
+        // each allocated block at consecutive VAs. The buddy heap's largest
+        // block is 1 GB (shift 0x1E in MEMORY_BLOCK_PAGE_SHIFTS), but Switch
+        // games often request multi-GB heaps (STK: 3.4 GB). Loop allocating
+        // the largest block that fits the remaining size, mirroring upstream's
+        // `KMemoryManager::AllocateAndOpen(KPageGroup*, ...)` followed by
+        // `Operate(MapGroup, ...)`. The set of allocated blocks is logically a
+        // KPageGroup; iterating and Mapping each block to consecutive VAs is
+        // the multi-block analogue of single-block Map.
+        use super::k_page_heap::{
+            KPageHeap, MEMORY_BLOCK_PAGE_SHIFTS, NUM_MEMORY_BLOCK_PAGE_SHIFTS,
         };
-        if phys_addr == 0 {
-            log::error!(
-                "set_heap_size: AllocateAndOpenContinuous failed ({} pages, option=0x{:X})",
-                num_pages, alloc_option
-            );
-            return (svc_results::RESULT_OUT_OF_MEMORY.get_inner_value(), 0);
-        }
+        let alloc_option = self.m_allocate_option;
         let map_properties = KPageProperties {
             perm: KMemoryPermission::USER_READ_WRITE,
             io: false,
@@ -1389,16 +1380,76 @@ impl KPageTableBase {
                 DisableMergeAttribute::NONE
             },
         };
-        let op_result = self.operate(
-            cur_address,
-            num_pages,
-            phys_addr,
-            true,
-            map_properties,
-            OperationType::Map,
-        );
-        if op_result != 0 {
-            return (op_result, 0);
+
+        let mut remaining_pages = num_pages;
+        let mut map_va = cur_address;
+        let mut allocated_blocks: Vec<(u64, usize)> = Vec::new();
+        while remaining_pages > 0 {
+            // Try block sizes from largest-that-fits down to 1 page. The pool
+            // may be fragmented, so a 1 GB request can fail even if multiple
+            // 512 MB or smaller blocks are free. Fall through until we find a
+            // size the pool can satisfy.
+            let mut block_addr: u64 = 0;
+            let mut chosen_pages: usize = 0;
+            for i in (0..NUM_MEMORY_BLOCK_PAGE_SHIFTS).rev() {
+                let block_pages = (1usize << MEMORY_BLOCK_PAGE_SHIFTS[i]) / PAGE_SIZE;
+                if block_pages > remaining_pages {
+                    continue;
+                }
+                let addr = if let Some(kernel) =
+                    crate::hle::kernel::kernel::get_kernel_mut()
+                {
+                    let mm = kernel.memory_manager_mut();
+                    let heap_index = KPageHeap::get_aligned_block_index(block_pages, 1);
+                    if heap_index < 0 {
+                        0
+                    } else {
+                        mm.allocate_and_open_continuous(block_pages, 1, alloc_option)
+                    }
+                } else {
+                    0
+                };
+                if addr != 0 {
+                    block_addr = addr;
+                    chosen_pages = block_pages;
+                    break;
+                }
+            }
+            if block_addr == 0 {
+                if let Some(kernel) = crate::hle::kernel::kernel::get_kernel_mut() {
+                    let mm = kernel.memory_manager_mut();
+                    for (addr, np) in &allocated_blocks {
+                        mm.close(*addr, *np);
+                    }
+                }
+                log::error!(
+                    "set_heap_size: pool exhausted with {} pages remaining (option=0x{:X})",
+                    remaining_pages, alloc_option
+                );
+                return (svc_results::RESULT_OUT_OF_MEMORY.get_inner_value(), 0);
+            }
+            allocated_blocks.push((block_addr, chosen_pages));
+            log::debug!(
+                "set_heap_size: alloc block phys={:#x}..{:#x} ({} pages) -> va={:#x}",
+                block_addr,
+                block_addr + (chosen_pages * PAGE_SIZE) as u64,
+                chosen_pages,
+                map_va
+            );
+
+            let op_result = self.operate(
+                map_va,
+                chosen_pages,
+                block_addr,
+                true,
+                map_properties,
+                OperationType::Map,
+            );
+            if op_result != 0 {
+                return (op_result, 0);
+            }
+            map_va += chosen_pages * PAGE_SIZE;
+            remaining_pages -= chosen_pages;
         }
 
         // Zero the newly mapped heap pages.
@@ -2331,8 +2382,36 @@ impl KPageTableBase {
             return result;
         }
 
-        // Allocate and map.
-        let phys_addr = crate::device_memory::dram_memory_map::BASE + addr as u64;
+        // Allocate physical pages from the kernel memory manager pool.
+        //
+        // Upstream `KPageTableBase::MapPages` allocates from the kernel memory
+        // manager (via `AllocateAndOpen` / `AllocateAndMapPagesImpl`) for the
+        // CODE mapping path. Previously ruzu used `phys = DRAM_BASE + addr`
+        // (identity mapping), which works as long as no other allocator hands
+        // out the same phys range. With multi-block heap allocation now pulling
+        // 3+ GB from the Application pool, the buddy heap can return a 512 MB
+        // block at phys 0x100000000 — exactly where the NRO is identity-mapped
+        // — and `clear_fresh_backing_region` then zeroes the NRO code, causing
+        // PrefetchAbort on the next branch into the NRO. Allocating from the
+        // pool here matches upstream and prevents that conflict because the
+        // pool tracks every page once and never hands out an in-use page.
+        let alloc_option = self.m_allocate_option;
+        let phys_addr = if let Some(kernel) =
+            crate::hle::kernel::kernel::get_kernel_mut()
+        {
+            kernel
+                .memory_manager_mut()
+                .allocate_and_open_continuous(num_pages, 1, alloc_option)
+        } else {
+            0
+        };
+        if phys_addr == 0 {
+            log::error!(
+                "map_pages_at_address: AllocateAndOpenContinuous failed ({} pages, option=0x{:X})",
+                num_pages, alloc_option
+            );
+            return svc_results::RESULT_OUT_OF_MEMORY.get_inner_value();
+        }
         let properties = KPageProperties {
             perm,
             io: false,
