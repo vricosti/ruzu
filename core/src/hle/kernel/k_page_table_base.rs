@@ -202,6 +202,24 @@ impl KPageTableBase {
         }
     }
 
+    /// Zero a region of physical memory. Used by `set_heap_size` and other
+    /// pool-allocation callers to clear newly-allocated pages BEFORE they
+    /// are mapped into virtual address space — upstream's
+    /// `ClearBackingRegion(m_system, block.GetAddress(), block.GetSize(), m_heap_fill_value)`
+    /// does the same. Translates each phys page to a host pointer through
+    /// DeviceMemory and writes zeros.
+    fn clear_fresh_backing_region_phys(&self, phys_addr: u64, size: usize) {
+        if size == 0 {
+            return;
+        }
+        // The backing-buffer is owned by the System's DeviceMemory. Walk it
+        // through the existing Memory wrapper which already exposes
+        // `device_memory()` access via the m_memory pointer.
+        if let Some(memory) = &self.m_memory {
+            memory.lock().unwrap().zero_phys_block(phys_addr, size);
+        }
+    }
+
     /// Finalize the page table, releasing all resources.
     /// Port of upstream `KPageTableBase::Finalize`.
     ///
@@ -1095,6 +1113,20 @@ impl KPageTableBase {
                 // No-op in emulator.
                 0
             }
+            OperationType::MapGroup
+            | OperationType::MapFirstGroup
+            | OperationType::MapFirstGroupPhysical => {
+                // The page-group flavor of Operate is invoked through the
+                // dedicated `operate_with_group` entry point; if a caller
+                // arrives here with the single-phys signature, it indicates
+                // a port mismatch.
+                log::error!(
+                    "KPageTableBase::operate: {:?} requires page-group entry; \
+                     call operate_with_group instead",
+                    operation
+                );
+                svc_results::RESULT_INVALID_STATE.get_inner_value()
+            }
             OperationType::ChangePermissions
             | OperationType::ChangePermissionsAndRefresh
             | OperationType::ChangePermissionsAndRefreshAndFlush => {
@@ -1117,6 +1149,80 @@ impl KPageTableBase {
                 svc_results::RESULT_INVALID_STATE.get_inner_value()
             }
         }
+    }
+
+    /// Page-group flavor of `Operate`. Maps the blocks in `page_group` at
+    /// consecutive virtual addresses starting at `virt_addr`, optionally
+    /// re-opening references to each page so the kernel keeps the group
+    /// alive across the mapping's lifetime.
+    ///
+    /// Port of upstream's second `Operate` overload taking `const KPageGroup&`
+    /// (k_page_table_base.cpp). Mirrors the upstream switch:
+    ///
+    /// ```cpp
+    /// case OperationType::MapGroup:
+    /// case OperationType::MapFirstGroup:
+    /// case OperationType::MapFirstGroupPhysical: {
+    ///     const bool separate_heap = operation == MapFirstGroupPhysical;
+    ///     KScopedPageGroup spg(page_group, operation == MapGroup);
+    ///     for (const auto& node : page_group) {
+    ///         m_memory->MapMemoryRegion(...);
+    ///         virt_addr += node.GetSize();
+    ///     }
+    ///     spg.CancelClose();
+    /// }
+    /// ```
+    pub fn operate_with_group(
+        &mut self,
+        virt_addr: usize,
+        num_pages: usize,
+        page_group: &super::k_page_group::KPageGroup,
+        properties: KPageProperties,
+        operation: OperationType,
+    ) -> u32 {
+        debug_assert!(num_pages > 0);
+        debug_assert!(virt_addr % PAGE_SIZE == 0);
+        debug_assert_eq!(num_pages, page_group.get_num_pages());
+        match operation {
+            OperationType::MapGroup
+            | OperationType::MapFirstGroup
+            | OperationType::MapFirstGroupPhysical => {}
+            _ => {
+                log::error!(
+                    "operate_with_group: {:?} is not a page-group operation",
+                    operation
+                );
+                return svc_results::RESULT_INVALID_STATE.get_inner_value();
+            }
+        }
+
+        let separate_heap = matches!(operation, OperationType::MapFirstGroupPhysical);
+        // Maintain a new reference to every page in the group. Upstream's
+        // KScopedPageGroup is RAII; we mirror it manually so we can `cancel_close`
+        // on the success path.
+        let not_first = matches!(operation, OperationType::MapGroup);
+        let mut spg =
+            super::k_page_group::KScopedPageGroup::new(page_group, not_first);
+
+        let mut cur_va = virt_addr as u64;
+        for node in page_group.iter() {
+            let block_size = (node.get_num_pages() * PAGE_SIZE) as u64;
+            if let (Some(memory), Some(impl_pt)) = (&self.m_memory, &mut self.m_impl) {
+                memory.lock().unwrap().map_memory_region(
+                    impl_pt,
+                    cur_va,
+                    block_size,
+                    node.get_address(),
+                    Self::convert_to_memory_permission(properties.perm),
+                    separate_heap,
+                );
+            }
+            cur_va += block_size;
+        }
+
+        // Persist the references — the mapping owns them now.
+        spg.cancel_close();
+        0
     }
 
     // -- FindFreeArea --
@@ -1354,22 +1460,55 @@ impl KPageTableBase {
             return (result, 0);
         }
 
-        // Map the new heap pages.
         let num_pages = allocation_size / PAGE_SIZE;
 
-        // Allocate physical pages from the kernel memory manager pool, mapping
-        // each allocated block at consecutive VAs. The buddy heap's largest
-        // block is 1 GB (shift 0x1E in MEMORY_BLOCK_PAGE_SHIFTS), but Switch
-        // games often request multi-GB heaps (STK: 3.4 GB). Loop allocating
-        // the largest block that fits the remaining size, mirroring upstream's
-        // `KMemoryManager::AllocateAndOpen(KPageGroup*, ...)` followed by
-        // `Operate(MapGroup, ...)`. The set of allocated blocks is logically a
-        // KPageGroup; iterating and Mapping each block to consecutive VAs is
-        // the multi-block analogue of single-block Map.
-        use super::k_page_heap::{
-            KPageHeap, MEMORY_BLOCK_PAGE_SHIFTS, NUM_MEMORY_BLOCK_PAGE_SHIFTS,
-        };
+        // Allocate pages for the heap extension as a KPageGroup. Upstream:
+        //
+        //   KPageGroup pg(m_kernel, m_block_info_manager);
+        //   R_TRY(m_kernel.MemoryManager().AllocateAndOpen(
+        //       std::addressof(pg), allocation_size / PageSize, m_allocate_option));
         let alloc_option = self.m_allocate_option;
+        let mut pg = super::k_page_group::KPageGroup::with_kernel();
+        {
+            let Some(kernel) = crate::hle::kernel::kernel::get_kernel_mut() else {
+                return (svc_results::RESULT_OUT_OF_MEMORY.get_inner_value(), 0);
+            };
+            let rc = kernel
+                .memory_manager_mut()
+                .allocate_and_open(&mut pg, num_pages, alloc_option);
+            if rc != 0 {
+                return (rc, 0);
+            }
+        }
+
+        // RAII close the opened pages when we're done — if the mapping
+        // succeeds, operate(MapGroup) opens an extra reference (via
+        // KScopedPageGroup with not_first=true), so dropping `pg` brings
+        // refcount back to 1 and the mapping's reference keeps the pages
+        // alive. On failure path, dropping `pg` also frees the pages.
+        struct PgCloseGuard<'a> {
+            pg: &'a mut super::k_page_group::KPageGroup,
+            armed: bool,
+        }
+        impl<'a> Drop for PgCloseGuard<'a> {
+            fn drop(&mut self) {
+                if self.armed {
+                    self.pg.close();
+                }
+            }
+        }
+        let mut pg_guard = PgCloseGuard {
+            pg: &mut pg,
+            armed: true,
+        };
+
+        // Clear all the newly allocated pages. Upstream calls
+        // ClearBackingRegion(...) per block; we do the same — operate on
+        // PHYSICAL pages so it's correct even before the VA mapping exists.
+        for block in pg_guard.pg.iter() {
+            self.clear_fresh_backing_region_phys(block.get_address(), block.get_size());
+        }
+
         let map_properties = KPageProperties {
             perm: KMemoryPermission::USER_READ_WRITE,
             io: false,
@@ -1381,86 +1520,23 @@ impl KPageTableBase {
             },
         };
 
-        let mut remaining_pages = num_pages;
-        let mut map_va = cur_address;
-        let mut allocated_blocks: Vec<(u64, usize)> = Vec::new();
-        while remaining_pages > 0 {
-            // Try block sizes from largest-that-fits down to 1 page. The pool
-            // may be fragmented, so a 1 GB request can fail even if multiple
-            // 512 MB or smaller blocks are free. Fall through until we find a
-            // size the pool can satisfy.
-            let mut block_addr: u64 = 0;
-            let mut chosen_pages: usize = 0;
-            for i in (0..NUM_MEMORY_BLOCK_PAGE_SHIFTS).rev() {
-                let block_pages = (1usize << MEMORY_BLOCK_PAGE_SHIFTS[i]) / PAGE_SIZE;
-                if block_pages > remaining_pages {
-                    continue;
-                }
-                let addr = if let Some(kernel) =
-                    crate::hle::kernel::kernel::get_kernel_mut()
-                {
-                    let mm = kernel.memory_manager_mut();
-                    let heap_index = KPageHeap::get_aligned_block_index(block_pages, 1);
-                    if heap_index < 0 {
-                        0
-                    } else {
-                        mm.allocate_and_open_continuous(block_pages, 1, alloc_option)
-                    }
-                } else {
-                    0
-                };
-                if addr != 0 {
-                    block_addr = addr;
-                    chosen_pages = block_pages;
-                    break;
-                }
-            }
-            if block_addr == 0 {
-                if let Some(kernel) = crate::hle::kernel::kernel::get_kernel_mut() {
-                    let mm = kernel.memory_manager_mut();
-                    for (addr, np) in &allocated_blocks {
-                        mm.close(*addr, *np);
-                    }
-                }
-                log::error!(
-                    "set_heap_size: pool exhausted with {} pages remaining (option=0x{:X})",
-                    remaining_pages, alloc_option
-                );
-                return (svc_results::RESULT_OUT_OF_MEMORY.get_inner_value(), 0);
-            }
-            allocated_blocks.push((block_addr, chosen_pages));
-            log::debug!(
-                "set_heap_size: alloc block phys={:#x}..{:#x} ({} pages) -> va={:#x}",
-                block_addr,
-                block_addr + (chosen_pages * PAGE_SIZE) as u64,
-                chosen_pages,
-                map_va
-            );
-
-            let op_result = self.operate(
-                map_va,
-                chosen_pages,
-                block_addr,
-                true,
-                map_properties,
-                OperationType::Map,
-            );
-            if op_result != 0 {
-                return (op_result, 0);
-            }
-            map_va += chosen_pages * PAGE_SIZE;
-            remaining_pages -= chosen_pages;
+        // R_TRY(this->Operate(updater.GetPageList(), m_current_heap_end,
+        //                     num_pages, pg, map_properties, MapGroup, false));
+        let op_result = self.operate_with_group(
+            cur_address,
+            num_pages,
+            pg_guard.pg,
+            map_properties,
+            OperationType::MapGroup,
+        );
+        if op_result != 0 {
+            return (op_result, 0);
         }
 
-        // Zero the newly mapped heap pages.
-        // Upstream: the kernel allocates zeroed physical pages from KPageHeap.
-        // In our emulator, DeviceMemory is pre-allocated and may contain stale data,
-        // so we must explicitly zero the heap region after mapping.
-        self.clear_fresh_backing_region(cur_address, allocation_size);
-
+        // Commit the resource reservation.
         memory_reservation.commit();
 
-        // Update block manager: new region is Normal/UserReadWrite.
+        // Apply the memory block update.
         self.m_memory_block_manager.update(
             cur_address,
             num_pages,
@@ -1476,6 +1552,9 @@ impl KPageTableBase {
         );
 
         self.m_current_heap_end = self.m_heap_region_start + size;
+        // Drop the close guard explicitly so its Close() runs while we still
+        // hold the borrow chain we want — match upstream SCOPE_EXIT semantics.
+        drop(pg_guard);
         (0, self.m_heap_region_start)
     }
 
@@ -1869,7 +1948,8 @@ impl KPageTableBase {
     /// Matches upstream `KPageTableBase::LockMemoryAndOpen`.
     pub fn lock_memory_and_open(
         &mut self,
-        out_paddr: &mut u64,
+        out_pg: Option<&mut super::k_page_group::KPageGroup>,
+        out_paddr: Option<&mut u64>,
         addr: usize,
         size: usize,
         state_mask: KMemoryState,
@@ -1881,6 +1961,17 @@ impl KPageTableBase {
         new_perm: KMemoryPermission,
         lock_attr: KMemoryAttribute,
     ) -> u32 {
+        // Port of upstream `KPageTableBase::LockMemoryAndOpen`
+        // (k_page_table_base.cpp:759). Optionally returns a page group
+        // describing the locked pages and/or the head physical address.
+        // Upstream:
+        //   ASSERT(False(lock_attr & attr));
+        //   ASSERT(False(lock_attr & (IpcLocked | DeviceShared)));
+        //   if (out_pg) ASSERT(out_pg->GetNumPages() == 0);
+        debug_assert!(
+            (lock_attr.bits() & attr.bits()) == 0,
+            "lock_attr ∩ attr must be empty"
+        );
         let num_pages = size / PAGE_SIZE;
         if !self.contains_range(addr, size) {
             return svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value();
@@ -1912,23 +2003,40 @@ impl KPageTableBase {
         let old_perm = out_old_perm.unwrap_or(KMemoryPermission::NONE);
         let old_attr = out_old_attr.unwrap_or(KMemoryAttribute::NONE);
 
-        // Get physical address from the page table — the mapping for `addr`
-        // was created by an earlier MapPages call (potentially via pool-
-        // allocated phys, no longer DRAM_BASE-relative). Returning the
-        // identity-mapped address here would silently lie to the caller about
-        // where the memory actually lives in host backing.
-        *out_paddr = self
-            .m_impl
-            .as_ref()
-            .and_then(|p| p.get_physical_address(addr as u64))
-            .unwrap_or(0);
-        if *out_paddr == 0 {
-            log::error!(
-                "lock_memory_and_open: no physical mapping for addr={:#x}",
-                addr
-            );
-            return svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value();
+        // Get the physical address, if requested. Upstream:
+        //   ASSERT(this->GetPhysicalAddressLocked(out_paddr, addr));
+        if let Some(out_paddr) = out_paddr {
+            *out_paddr = match self
+                .m_impl
+                .as_ref()
+                .and_then(|p| p.get_physical_address(addr as u64))
+            {
+                Some(p) => p,
+                None => {
+                    log::error!(
+                        "lock_memory_and_open: no physical mapping for addr={:#x}",
+                        addr
+                    );
+                    return svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value();
+                }
+            };
         }
+
+        // Make the page group, if requested. Upstream:
+        //   if (out_pg != nullptr) {
+        //       R_TRY(this->MakePageGroup(*out_pg, addr, num_pages));
+        //   }
+        // We hold `out_pg` past this point so we can call `Open()` after the
+        // optional permission change succeeds (per upstream's tail).
+        let out_pg_ref = if let Some(out_pg) = out_pg {
+            let mpg = self.make_page_group(out_pg, addr, num_pages);
+            if mpg != 0 {
+                return mpg;
+            }
+            Some(out_pg)
+        } else {
+            None
+        };
 
         // Determine new perm and attr.
         let effective_new_perm = if new_perm != KMemoryPermission::NONE {
@@ -1970,6 +2078,12 @@ impl KPageTableBase {
             KMemoryBlockDisableMergeAttribute::LOCKED,
             KMemoryBlockDisableMergeAttribute::NONE,
         );
+
+        // If we have an output group, open. Upstream:
+        //   if (out_pg) { out_pg->Open(); }
+        if let Some(out_pg) = out_pg_ref {
+            out_pg.open();
+        }
 
         0
     }
@@ -2072,7 +2186,8 @@ impl KPageTableBase {
         size: usize,
     ) -> u32 {
         self.lock_memory_and_open(
-            out_paddr,
+            None,
+            Some(out_paddr),
             addr,
             size,
             KMemoryState::FLAG_CAN_IPC_USER_BUFFER,
@@ -2396,57 +2511,70 @@ impl KPageTableBase {
             return result;
         }
 
-        // Allocate physical pages from the kernel memory manager pool.
+        // Map the pages — upstream calls `AllocateAndMapPagesImpl` here.
+        // We inline that helper:
         //
-        // Upstream `KPageTableBase::MapPages` allocates from the kernel memory
-        // manager (via `AllocateAndOpen` / `AllocateAndMapPagesImpl`) for the
-        // CODE mapping path. Previously ruzu used `phys = DRAM_BASE + addr`
-        // (identity mapping), which works as long as no other allocator hands
-        // out the same phys range. With multi-block heap allocation now pulling
-        // 3+ GB from the Application pool, the buddy heap can return a 512 MB
-        // block at phys 0x100000000 — exactly where the NRO is identity-mapped
-        // — and `clear_fresh_backing_region` then zeroes the NRO code, causing
-        // PrefetchAbort on the next branch into the NRO. Allocating from the
-        // pool here matches upstream and prevents that conflict because the
-        // pool tracks every page once and never hands out an in-use page.
+        //   KPageGroup pg(m_kernel, m_block_info_manager);
+        //   R_TRY(m_kernel.MemoryManager().AllocateAndOpen(&pg, num_pages,
+        //                                                  m_allocate_option));
+        //   SCOPE_EXIT { pg.Close(); };
+        //   for (auto& it : pg) ClearBackingRegion(it);
+        //   R_RETURN(Operate(MapGroup, addr, num_pages, pg, ...));
         let alloc_option = self.m_allocate_option;
-        let phys_addr = if let Some(kernel) =
-            crate::hle::kernel::kernel::get_kernel_mut()
+        let mut pg = super::k_page_group::KPageGroup::with_kernel();
         {
-            kernel
+            let Some(kernel) = crate::hle::kernel::kernel::get_kernel_mut() else {
+                return svc_results::RESULT_OUT_OF_MEMORY.get_inner_value();
+            };
+            let rc = kernel
                 .memory_manager_mut()
-                .allocate_and_open_continuous(num_pages, 1, alloc_option)
-        } else {
-            0
-        };
-        if phys_addr == 0 {
-            log::error!(
-                "map_pages_at_address: AllocateAndOpenContinuous failed ({} pages, option=0x{:X})",
-                num_pages, alloc_option
-            );
-            return svc_results::RESULT_OUT_OF_MEMORY.get_inner_value();
+                .allocate_and_open(&mut pg, num_pages, alloc_option);
+            if rc != 0 {
+                return rc;
+            }
         }
+
+        // RAII close the open-first reference at end of scope. operate(MapGroup)
+        // adds a second reference; dropping `pg` brings net refcount to 1
+        // (held by the mapping). On failure path, also drops the reference
+        // back to 0 so the pool reclaims the pages.
+        struct PgCloseGuard<'a> {
+            pg: &'a mut super::k_page_group::KPageGroup,
+        }
+        impl<'a> Drop for PgCloseGuard<'a> {
+            fn drop(&mut self) {
+                self.pg.close();
+            }
+        }
+        let pg_guard = PgCloseGuard { pg: &mut pg };
+
+        // Clear all the newly allocated pages (upstream's per-block
+        // ClearBackingRegion loop). Acts on physical addresses since the
+        // virtual mapping is not yet established.
+        for block in pg_guard.pg.iter() {
+            self.clear_fresh_backing_region_phys(block.get_address(), block.get_size());
+        }
+
+        // Operate(MapGroup, ...).
         let properties = KPageProperties {
             perm,
             io: false,
             uncached: false,
-            disable_merge_attributes: DisableMergeAttribute::DISABLE_HEAD,
+            disable_merge_attributes: DisableMergeAttribute::NONE,
         };
-        let op_result = self.operate(
+        let op_result = self.operate_with_group(
             addr,
             num_pages,
-            phys_addr,
-            true,
+            pg_guard.pg,
             properties,
-            OperationType::Map,
+            OperationType::MapGroup,
         );
         if op_result != 0 {
             return op_result;
         }
 
-        self.clear_fresh_backing_region(addr, size);
-
-        // Update blocks.
+        // Update blocks (upstream uses KMemoryBlockManagerUpdateAllocator;
+        // ruzu's update path doesn't preallocate slab nodes — see TODO).
         self.m_memory_block_manager.update(
             addr,
             num_pages,
@@ -2456,6 +2584,7 @@ impl KPageTableBase {
             KMemoryBlockDisableMergeAttribute::NORMAL,
             KMemoryBlockDisableMergeAttribute::NONE,
         );
+        drop(pg_guard);
         0
     }
 
@@ -2598,96 +2727,249 @@ impl KPageTableBase {
     /// Map physical memory into the alias region.
     /// Matches upstream `KPageTableBase::MapPhysicalMemory`.
     pub fn map_physical_memory(&mut self, addr: usize, size: usize) -> u32 {
+        // Port of upstream `KPageTableBase::MapPhysicalMemory`
+        // (k_page_table_base.cpp:5111). Three-phase flow:
+        //   1. Walk the memory block manager to count already-mapped bytes.
+        //   2. Allocate `size - mapped` pages as a KPageGroup.
+        //   3. Walk the block manager again, mapping FREE ranges only,
+        //      drawing pages from the page-group iterator. Skip already-
+        //      mapped (Normal) ranges.
+        // If concurrent mappings change between phases (mapped_size differs),
+        // upstream retries — ruzu currently has no concurrency between
+        // SetHeapSize/MapPhysicalMemory callers (single-threaded SVC dispatch
+        // per process), but the retry loop is preserved structurally.
+        use super::k_scoped_resource_reservation::KScopedResourceReservation;
         if !self.is_in_alias_region(addr, size) {
             return svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value();
         }
-        let num_pages = size / PAGE_SIZE;
+        let last_address = addr + size - 1;
 
-        // Allocate physical pages from the kernel memory manager pool, mirror
-        // of set_heap_size's multi-block path: pool fragmentation can prevent
-        // a single contiguous allocation, so fall back through smaller block
-        // sizes when needed and map each block at consecutive VAs. Identity
-        // mapping (DRAM_BASE + addr) would clobber pool-owned phys pages
-        // because the alias region's identity-phys range overlaps the
-        // Application pool — same class as the NRO-zero bug fixed in 0044954.
-        use super::k_page_heap::{
-            KPageHeap, MEMORY_BLOCK_PAGE_SHIFTS, NUM_MEMORY_BLOCK_PAGE_SHIFTS,
-        };
-        let alloc_option = self.m_allocate_option;
-        let properties = KPageProperties {
-            perm: KMemoryPermission::USER_READ_WRITE,
-            io: false,
-            uncached: false,
-            disable_merge_attributes: DisableMergeAttribute::DISABLE_HEAD,
-        };
-
-        let mut remaining_pages = num_pages;
-        let mut map_va = addr;
-        let mut allocated_blocks: Vec<(u64, usize)> = Vec::new();
-        while remaining_pages > 0 {
-            let mut block_addr: u64 = 0;
-            let mut chosen_pages: usize = 0;
-            for i in (0..NUM_MEMORY_BLOCK_PAGE_SHIFTS).rev() {
-                let block_pages = (1usize << MEMORY_BLOCK_PAGE_SHIFTS[i]) / PAGE_SIZE;
-                if block_pages > remaining_pages {
-                    continue;
-                }
-                let phys = if let Some(kernel) =
-                    crate::hle::kernel::kernel::get_kernel_mut()
-                {
-                    let mm = kernel.memory_manager_mut();
-                    let heap_index = KPageHeap::get_aligned_block_index(block_pages, 1);
-                    if heap_index < 0 {
-                        0
-                    } else {
-                        mm.allocate_and_open_continuous(block_pages, 1, alloc_option)
+        loop {
+            // === Phase 1: count already-mapped bytes ===
+            let mut mapped_size: usize = 0;
+            {
+                let mut cur_address = addr;
+                for info in self.m_memory_block_manager.find_iterator(cur_address) {
+                    let info_state = info.get_state();
+                    let info_end = info.get_address() + info.get_size();
+                    let info_last = info_end - 1;
+                    let in_range_end = info_last.min(last_address);
+                    if info_state != KMemoryState::FREE {
+                        mapped_size += in_range_end + 1 - cur_address;
                     }
-                } else {
-                    0
+                    if last_address <= info_last {
+                        break;
+                    }
+                    cur_address = info_end;
+                }
+            }
+            // Already entirely mapped — nothing to do.
+            if mapped_size == size {
+                return 0;
+            }
+
+            // === Phase 2: allocate ===
+            let allocation_size = size - mapped_size;
+            let mut memory_reservation = KScopedResourceReservation::new(
+                self.m_resource_limit.clone(),
+                LimitableResource::PhysicalMemoryMax,
+                allocation_size as i64,
+            );
+            if !memory_reservation.succeeded() {
+                return svc_results::RESULT_LIMIT_REACHED.get_inner_value();
+            }
+
+            let alloc_option = self.m_allocate_option;
+            let mut pg = super::k_page_group::KPageGroup::with_kernel();
+            {
+                let Some(kernel) = crate::hle::kernel::kernel::get_kernel_mut() else {
+                    return svc_results::RESULT_OUT_OF_MEMORY.get_inner_value();
                 };
-                if phys != 0 {
-                    block_addr = phys;
-                    chosen_pages = block_pages;
+                let rc = kernel.memory_manager_mut().allocate_and_open(
+                    &mut pg,
+                    allocation_size / PAGE_SIZE,
+                    alloc_option,
+                );
+                if rc != 0 {
+                    return rc;
+                }
+            }
+
+            // === Phase 3: re-check + map ===
+            // Re-walk the block manager. If somebody mapped between phase 1
+            // and phase 3 (mapped_size changed), drop pg (auto-close) and
+            // retry. ruzu is single-threaded per process so this always
+            // matches; the loop is structural for fidelity.
+            let mut checked_mapped: usize = 0;
+            {
+                let mut cur_address = addr;
+                for info in self.m_memory_block_manager.find_iterator(cur_address) {
+                    let info_state = info.get_state();
+                    let info_end = info.get_address() + info.get_size();
+                    let info_last = info_end - 1;
+                    let in_range_end = info_last.min(last_address);
+                    if info_state != KMemoryState::FREE {
+                        checked_mapped += in_range_end + 1 - cur_address;
+                    }
+                    if last_address <= info_last {
+                        break;
+                    }
+                    cur_address = info_end;
+                }
+            }
+            if checked_mapped != mapped_size {
+                // Somebody raced with us — release the page group and retry.
+                pg.close();
+                continue;
+            }
+
+            // Iterate FREE ranges, slicing pages off the page group as we go.
+            // Snapshot block boundaries first so we don't borrow the block
+            // manager mutably and immutably at the same time.
+            let mut free_ranges: Vec<(usize, usize)> = Vec::new();
+            {
+                let mut cur_address = addr;
+                for info in self.m_memory_block_manager.find_iterator(cur_address) {
+                    let info_state = info.get_state();
+                    let info_end = info.get_address() + info.get_size();
+                    let info_last = info_end - 1;
+                    let in_range_end = info_last.min(last_address);
+                    if info_state == KMemoryState::FREE {
+                        let range_pages = (in_range_end + 1 - cur_address) / PAGE_SIZE;
+                        free_ranges.push((cur_address, range_pages));
+                    }
+                    if last_address <= info_last {
+                        break;
+                    }
+                    cur_address = info_end;
+                }
+            }
+
+            // Walk the page group, slicing blocks to fill each free VA range.
+            let pg_blocks: Vec<(u64, usize)> = pg
+                .iter()
+                .map(|b| (b.get_address(), b.get_num_pages()))
+                .collect();
+            let mut pg_idx = 0usize;
+            let mut pg_phys = pg_blocks
+                .first()
+                .map(|(a, _)| *a)
+                .unwrap_or(0);
+            let mut pg_remaining = pg_blocks.first().map(|(_, n)| *n).unwrap_or(0);
+
+            for &(range_va, range_pages) in &free_ranges {
+                let mut va = range_va;
+                let mut needed = range_pages;
+                while needed > 0 {
+                    if pg_remaining == 0 {
+                        pg_idx += 1;
+                        if pg_idx >= pg_blocks.len() {
+                            // Should not happen — page group sizes match.
+                            log::error!("map_physical_memory: page group ran short");
+                            return svc_results::RESULT_OUT_OF_MEMORY.get_inner_value();
+                        }
+                        pg_phys = pg_blocks[pg_idx].0;
+                        pg_remaining = pg_blocks[pg_idx].1;
+                    }
+                    let chunk = needed.min(pg_remaining);
+                    let cur_props = KPageProperties {
+                        perm: KMemoryPermission::USER_READ_WRITE,
+                        io: false,
+                        uncached: false,
+                        disable_merge_attributes: if va == addr {
+                            DisableMergeAttribute::DISABLE_HEAD
+                        } else {
+                            DisableMergeAttribute::NONE
+                        },
+                    };
+                    // Per-block clear of the freshly-allocated phys.
+                    self.clear_fresh_backing_region_phys(pg_phys, chunk * PAGE_SIZE);
+                    // Single-block Map (we're slicing the page group manually
+                    // per FREE range; one operate(Map) per slice).
+                    let rc = self.operate(va, chunk, pg_phys, true, cur_props, OperationType::Map);
+                    if rc != 0 {
+                        // Rollback: unmap whatever we already mapped in this
+                        // call. Upstream uses OperationType::UnmapPhysical.
+                        self.rollback_partial_map_physical(addr, va);
+                        pg.close();
+                        return rc;
+                    }
+                    // The pages in this slice have been opened-first by
+                    // AllocateAndOpen and are now bound to a VA mapping. We
+                    // need to keep the reference (operate(Map) doesn't open
+                    // through KScopedPageGroup since this is the legacy
+                    // single-phys path). Match upstream's MapGroup semantics
+                    // by opening one extra reference now — the eventual
+                    // pg.close() at end of scope will then leave net = 1.
+                    if let Some(kernel) = crate::hle::kernel::kernel::get_kernel_mut() {
+                        kernel.memory_manager_mut().open(pg_phys, chunk);
+                    }
+                    va += chunk * PAGE_SIZE;
+                    pg_phys += (chunk * PAGE_SIZE) as u64;
+                    pg_remaining -= chunk;
+                    needed -= chunk;
+                }
+            }
+
+            // Commit reservation, update block manager, drop pg (close).
+            memory_reservation.commit();
+            self.m_memory_block_manager.update(
+                addr,
+                size / PAGE_SIZE,
+                KMemoryState::NORMAL,
+                KMemoryPermission::USER_READ_WRITE,
+                KMemoryAttribute::NONE,
+                KMemoryBlockDisableMergeAttribute::NORMAL,
+                KMemoryBlockDisableMergeAttribute::NONE,
+            );
+            self.m_mapped_physical_memory_size += allocation_size;
+            pg.close();
+            return 0;
+        }
+    }
+
+    /// Roll back a partial `map_physical_memory` failure by unmapping the
+    /// FREE ranges in `[addr, last_unmap_address+1)` that we just touched.
+    /// Mirrors upstream's `ON_RESULT_FAILURE` lambda in MapPhysicalMemory.
+    fn rollback_partial_map_physical(&mut self, addr: usize, last_unmap_address: usize) {
+        if last_unmap_address <= addr {
+            return;
+        }
+        let last_unmap = last_unmap_address - 1;
+        let mut free_ranges: Vec<(usize, usize)> = Vec::new();
+        {
+            let mut cur_address = addr;
+            for info in self.m_memory_block_manager.find_iterator(cur_address) {
+                let info_state = info.get_state();
+                let info_end = info.get_address() + info.get_size();
+                let info_last = info_end - 1;
+                let in_range_end = info_last.min(last_unmap);
+                if info_state == KMemoryState::FREE {
+                    let pages = (in_range_end + 1 - cur_address) / PAGE_SIZE;
+                    free_ranges.push((cur_address, pages));
+                }
+                if last_unmap <= info_last {
                     break;
                 }
+                cur_address = info_end;
             }
-            if block_addr == 0 {
-                if let Some(kernel) = crate::hle::kernel::kernel::get_kernel_mut() {
-                    let mm = kernel.memory_manager_mut();
-                    for (a, np) in &allocated_blocks {
-                        mm.close(*a, *np);
-                    }
-                }
-                return svc_results::RESULT_OUT_OF_MEMORY.get_inner_value();
-            }
-            allocated_blocks.push((block_addr, chosen_pages));
-
-            let op_result = self.operate(
-                map_va,
-                chosen_pages,
-                block_addr,
-                true,
-                properties,
-                OperationType::Map,
-            );
-            if op_result != 0 {
-                return op_result;
-            }
-            map_va += chosen_pages * PAGE_SIZE;
-            remaining_pages -= chosen_pages;
         }
-
-        self.m_memory_block_manager.update(
-            addr,
-            num_pages,
-            KMemoryState::NORMAL,
-            KMemoryPermission::USER_READ_WRITE,
-            KMemoryAttribute::NONE,
-            KMemoryBlockDisableMergeAttribute::NORMAL,
-            KMemoryBlockDisableMergeAttribute::NONE,
-        );
-        self.m_mapped_physical_memory_size += size;
-        0
+        let unmap_props = KPageProperties {
+            perm: KMemoryPermission::NONE,
+            io: false,
+            uncached: false,
+            disable_merge_attributes: DisableMergeAttribute::NONE,
+        };
+        for (va, pages) in free_ranges {
+            let _ = self.operate(
+                va,
+                pages,
+                0,
+                false,
+                unmap_props,
+                OperationType::UnmapPhysical,
+            );
+        }
     }
 
     /// Unmap physical memory from the alias region.
@@ -2742,7 +3024,8 @@ impl KPageTableBase {
     ) -> u32 {
         let mut paddr = 0u64;
         self.lock_memory_and_open(
-            &mut paddr,
+            None,
+            Some(&mut paddr),
             addr,
             size,
             KMemoryState::FLAG_CAN_TRANSFER,
@@ -2837,12 +3120,22 @@ impl KPageTableBase {
             return op;
         }
 
-        // Map dst using the same physical pages as src. Look each page up
-        // through the page table since src's phys is no longer guaranteed to
-        // be DRAM_BASE-relative (set_heap_size / map_physical_memory now use
-        // pool allocation), and may not be contiguous across the range.
-        // Walk page-by-page, coalescing contiguous runs into a single
-        // operate(Map) call to minimize page-table churn.
+        // Build a KPageGroup describing src's existing physical pages.
+        // Upstream:
+        //   KPageGroup pg(m_kernel, m_block_info_manager);
+        //   R_TRY(this->MakePageGroup(pg, src_address, num_pages));
+        let mut pg = super::k_page_group::KPageGroup::new();
+        let mpg_rc = self.make_page_group(&mut pg, src, num_pages);
+        if mpg_rc != 0 {
+            return mpg_rc;
+        }
+
+        // Map dst with that page group via MapPageGroupImpl. Upstream:
+        //   const KPageProperties dst_properties = {new_perm, false, false,
+        //                                           DisableMergeAttribute::DisableHead};
+        //   R_TRY(this->MapPageGroupImpl(updater.GetPageList(), dst_address,
+        //                                 pg, dst_properties, false));
+        // On failure, restore src's permissions.
         let dst_props = KPageProperties {
             perm: new_perm,
             io: false,
@@ -2855,63 +3148,17 @@ impl KPageTableBase {
             uncached: false,
             disable_merge_attributes: DisableMergeAttribute::ENABLE_HEAD_BODY_TAIL,
         };
-        let mut mapped_pages = 0usize;
-        while mapped_pages < num_pages {
-            let src_page = (src + mapped_pages * PAGE_SIZE) as u64;
-            let dst_page = dst + mapped_pages * PAGE_SIZE;
-            let phys_start = match self
-                .m_impl
-                .as_ref()
-                .and_then(|p| p.get_physical_address(src_page))
-            {
-                Some(p) => p,
-                None => {
-                    let _ = self.operate(
-                        src,
-                        num_pages,
-                        0,
-                        false,
-                        revert,
-                        OperationType::ChangePermissions,
-                    );
-                    return svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value();
-                }
-            };
-            // Coalesce contiguous run.
-            let mut run_pages = 1usize;
-            while mapped_pages + run_pages < num_pages {
-                let next_src = src_page + (run_pages * PAGE_SIZE) as u64;
-                let next_phys = self
-                    .m_impl
-                    .as_ref()
-                    .and_then(|p| p.get_physical_address(next_src));
-                match next_phys {
-                    Some(p) if p == phys_start + (run_pages * PAGE_SIZE) as u64 => {
-                        run_pages += 1;
-                    }
-                    _ => break,
-                }
-            }
-            let op = self.operate(
-                dst_page,
-                run_pages,
-                phys_start,
-                true,
-                dst_props,
-                OperationType::Map,
+        let map_rc = self.map_page_group_impl(dst, &pg, dst_props);
+        if map_rc != 0 {
+            let _ = self.operate(
+                src,
+                num_pages,
+                0,
+                false,
+                revert,
+                OperationType::ChangePermissions,
             );
-            if op != 0 {
-                let _ = self.operate(
-                    src,
-                    num_pages,
-                    0,
-                    false,
-                    revert,
-                    OperationType::ChangePermissions,
-                );
-                return op;
-            }
-            mapped_pages += run_pages;
+            return map_rc;
         }
 
         // Update blocks.
@@ -3017,11 +3264,75 @@ impl KPageTableBase {
 
     /// Matches upstream `KPageTableBase::MapInsecureMemory`.
     pub fn map_insecure_memory(&mut self, addr: usize, size: usize) -> u32 {
+        // Port of upstream `KPageTableBase::MapInsecureMemory`
+        // (k_page_table_base.cpp:1379). Allocates from the *insecure* pool
+        // (KMemoryManager::Pool::SystemNonSecure on Nintendo NX), reserves
+        // against the kernel-wide insecure resource limit, and maps the
+        // resulting page group with Operate(MapGroup).
+        use super::k_scoped_resource_reservation::KScopedResourceReservation;
         let num_pages = size / PAGE_SIZE;
-        if !self.contains_range(addr, size) {
-            return svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value();
+
+        // Get the insecure memory resource limit and pool from KSystemControl.
+        let kernel_arc = crate::hle::kernel::kernel::get_kernel_ref();
+        let insecure_resource_limit = kernel_arc.and_then(|k| {
+            super::board::k_system_control::get_insecure_memory_resource_limit(k)
+        });
+        let insecure_pool_raw = super::board::k_system_control::get_insecure_memory_pool();
+        let insecure_pool_option = super::k_memory_manager::KMemoryManager::encode_option(
+            // Decode the raw pool id and re-encode as the (pool, FromFront)
+            // option upstream uses for insecure allocations.
+            match insecure_pool_raw {
+                0 => super::k_memory_manager::Pool::Application,
+                1 => super::k_memory_manager::Pool::Applet,
+                2 => super::k_memory_manager::Pool::System,
+                _ => super::k_memory_manager::Pool::SystemNonSecure,
+            },
+            super::k_memory_manager::Direction::FromFront,
+        );
+
+        // Reserve the insecure memory. NOTE: ResultOutOfMemory is returned
+        // here instead of the usual LimitReached (matches upstream comment).
+        let mut memory_reservation = KScopedResourceReservation::new(
+            insecure_resource_limit,
+            LimitableResource::PhysicalMemoryMax,
+            size as i64,
+        );
+        if !memory_reservation.succeeded() {
+            return svc_results::RESULT_OUT_OF_MEMORY.get_inner_value();
         }
 
+        // Allocate pages for the insecure memory.
+        let mut pg = super::k_page_group::KPageGroup::with_kernel();
+        {
+            let Some(kernel) = crate::hle::kernel::kernel::get_kernel_mut() else {
+                return svc_results::RESULT_OUT_OF_MEMORY.get_inner_value();
+            };
+            let rc = kernel
+                .memory_manager_mut()
+                .allocate_and_open(&mut pg, num_pages, insecure_pool_option);
+            if rc != 0 {
+                return rc;
+            }
+        }
+
+        // RAII close: balances the OpenFirst above so refcount returns to 1
+        // after Operate(MapGroup) opens its extra reference.
+        struct PgCloseGuard<'a> {
+            pg: &'a mut super::k_page_group::KPageGroup,
+        }
+        impl<'a> Drop for PgCloseGuard<'a> {
+            fn drop(&mut self) {
+                self.pg.close();
+            }
+        }
+        let pg_guard = PgCloseGuard { pg: &mut pg };
+
+        // Clear all the newly allocated pages (per-block phys clear).
+        for block in pg_guard.pg.iter() {
+            self.clear_fresh_backing_region_phys(block.get_address(), block.get_size());
+        }
+
+        // Validate that the address's state is valid (Free).
         let result = self.check_memory_state(
             addr,
             size,
@@ -3036,78 +3347,25 @@ impl KPageTableBase {
             return result;
         }
 
-        // Pool-allocate physical pages (multi-block fallback identical to
-        // set_heap_size / map_physical_memory). Identity-mapping
-        // (DRAM_BASE + addr) would clash with pool-owned pages.
-        use super::k_page_heap::{
-            KPageHeap, MEMORY_BLOCK_PAGE_SHIFTS, NUM_MEMORY_BLOCK_PAGE_SHIFTS,
-        };
-        let alloc_option = self.m_allocate_option;
-        let props = KPageProperties {
+        // Map the pages.
+        let map_properties = KPageProperties {
             perm: KMemoryPermission::USER_READ_WRITE,
             io: false,
             uncached: false,
             disable_merge_attributes: DisableMergeAttribute::DISABLE_HEAD,
         };
-
-        let mut remaining_pages = num_pages;
-        let mut map_va = addr;
-        let mut allocated_blocks: Vec<(u64, usize)> = Vec::new();
-        while remaining_pages > 0 {
-            let mut block_addr: u64 = 0;
-            let mut chosen_pages: usize = 0;
-            for i in (0..NUM_MEMORY_BLOCK_PAGE_SHIFTS).rev() {
-                let block_pages = (1usize << MEMORY_BLOCK_PAGE_SHIFTS[i]) / PAGE_SIZE;
-                if block_pages > remaining_pages {
-                    continue;
-                }
-                let phys = if let Some(kernel) =
-                    crate::hle::kernel::kernel::get_kernel_mut()
-                {
-                    let mm = kernel.memory_manager_mut();
-                    let heap_index = KPageHeap::get_aligned_block_index(block_pages, 1);
-                    if heap_index < 0 {
-                        0
-                    } else {
-                        mm.allocate_and_open_continuous(block_pages, 1, alloc_option)
-                    }
-                } else {
-                    0
-                };
-                if phys != 0 {
-                    block_addr = phys;
-                    chosen_pages = block_pages;
-                    break;
-                }
-            }
-            if block_addr == 0 {
-                if let Some(kernel) = crate::hle::kernel::kernel::get_kernel_mut() {
-                    let mm = kernel.memory_manager_mut();
-                    for (a, np) in &allocated_blocks {
-                        mm.close(*a, *np);
-                    }
-                }
-                return svc_results::RESULT_OUT_OF_MEMORY.get_inner_value();
-            }
-            allocated_blocks.push((block_addr, chosen_pages));
-
-            let op = self.operate(
-                map_va,
-                chosen_pages,
-                block_addr,
-                true,
-                props,
-                OperationType::Map,
-            );
-            if op != 0 {
-                return op;
-            }
-            map_va += chosen_pages * PAGE_SIZE;
-            remaining_pages -= chosen_pages;
+        let op = self.operate_with_group(
+            addr,
+            num_pages,
+            pg_guard.pg,
+            map_properties,
+            OperationType::MapGroup,
+        );
+        if op != 0 {
+            return op;
         }
 
-        self.clear_fresh_backing_region(addr, size);
-
+        // Apply the memory block update.
         self.m_memory_block_manager.update(
             addr,
             num_pages,
@@ -3118,6 +3376,10 @@ impl KPageTableBase {
             KMemoryBlockDisableMergeAttribute::NONE,
         );
         self.m_mapped_insecure_memory += size;
+
+        // Commit the memory reservation.
+        memory_reservation.commit();
+        drop(pg_guard);
         0
     }
 
@@ -4181,7 +4443,8 @@ impl KPageTableBase {
     ) -> u32 {
         let mut paddr = 0u64;
         self.lock_memory_and_open(
-            &mut paddr,
+            None,
+            Some(&mut paddr),
             addr,
             size,
             KMemoryState::FLAG_CAN_CODE_ALIAS,

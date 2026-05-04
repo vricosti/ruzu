@@ -86,32 +86,49 @@ const _: () = assert!(std::mem::size_of::<KBlockInfo>() <= 0x10);
 /// Port of Kernel::KPageGroup.
 ///
 /// Upstream holds `KernelCore& m_kernel` and `KBlockInfoManager* m_manager`.
-/// We use a Vec<KBlockInfo> instead of slab-allocated intrusive list, and
-/// store an optional Arc<Mutex<KMemoryManager>> for Open/Close reference counting.
+/// We use a Vec<KBlockInfo> instead of slab-allocated intrusive list. The
+/// memory-manager reference is fetched through the global kernel accessor
+/// (`kernel::get_kernel_mut()`) at Open/Close time — KernelCore is a static
+/// singleton in ruzu, matching upstream's `KernelCore& m_kernel`.
+///
+/// `kernel_owned` mirrors upstream's two-constructor distinction: a group
+/// constructed via `with_kernel()` participates in ref-count callbacks
+/// (Open/Close/OpenFirst route to KMemoryManager); a group constructed via
+/// `new()` is a "detached" group used for inspection only — Open/Close are
+/// no-ops, matching the upstream pattern of constructing KPageGroup with a
+/// null KernelCore reference for read-only purposes.
 pub struct KPageGroup {
     blocks: Vec<KBlockInfo>,
-    /// Reference to the memory manager for physical page reference counting.
-    /// Upstream accesses this via m_kernel.MemoryManager().
-    memory_manager: Option<Arc<Mutex<KMemoryManager>>>,
+    /// Whether Open/Close should drive ref-count callbacks via the global
+    /// kernel accessor. Set true by `with_kernel`, false by `new`.
+    kernel_owned: bool,
 }
 
 impl KPageGroup {
-    /// Create a page group without a memory manager reference.
-    /// Open/Close/CloseAndReset will skip reference counting.
+    /// Create a page group with no kernel reference. `Open`/`Close`/`OpenFirst`/
+    /// `CloseAndReset` are no-ops on this variant.
     pub fn new() -> Self {
         Self {
             blocks: Vec::new(),
-            memory_manager: None,
+            kernel_owned: false,
         }
     }
 
-    /// Create a page group with a memory manager reference.
-    /// Matches upstream `KPageGroup(KernelCore& kernel, KBlockInfoManager* m)`.
-    pub fn with_memory_manager(mm: Arc<Mutex<KMemoryManager>>) -> Self {
+    /// Create a page group attached to the global kernel. Matches upstream
+    /// `KPageGroup(KernelCore& kernel, KBlockInfoManager* m)`. Open/Close
+    /// route to `KernelCore::memory_manager_mut().{open,close,open_first}`.
+    pub fn with_kernel() -> Self {
         Self {
             blocks: Vec::new(),
-            memory_manager: Some(mm),
+            kernel_owned: true,
         }
+    }
+
+    /// Backwards-compatible constructor; the Arc parameter is ignored — the
+    /// group always reaches the kernel through the global accessor.
+    /// Behaves identically to `with_kernel`.
+    pub fn with_memory_manager(_mm: Arc<Mutex<KMemoryManager>>) -> Self {
+        Self::with_kernel()
     }
 
     pub fn finalize(&mut self) {
@@ -158,8 +175,11 @@ impl KPageGroup {
     /// Port of upstream `KPageGroup::Open`.
     /// Delegates to `KMemoryManager::Open(addr, num_pages)` for each block.
     pub fn open(&self) {
-        if let Some(ref mm) = self.memory_manager {
-            let mut mm = mm.lock().unwrap();
+        if !self.kernel_owned {
+            return;
+        }
+        if let Some(kernel) = super::kernel::get_kernel_mut() {
+            let mm = kernel.memory_manager_mut();
             for block in &self.blocks {
                 mm.open(block.get_address(), block.get_num_pages());
             }
@@ -169,8 +189,11 @@ impl KPageGroup {
     /// Increment reference count for all blocks (first reference).
     /// Port of upstream `KPageGroup::OpenFirst`.
     pub fn open_first(&self) {
-        if let Some(ref mm) = self.memory_manager {
-            let mut mm = mm.lock().unwrap();
+        if !self.kernel_owned {
+            return;
+        }
+        if let Some(kernel) = super::kernel::get_kernel_mut() {
+            let mm = kernel.memory_manager_mut();
             for block in &self.blocks {
                 mm.open(block.get_address(), block.get_num_pages());
             }
@@ -180,8 +203,11 @@ impl KPageGroup {
     /// Decrement reference count for all blocks.
     /// Port of upstream `KPageGroup::Close`.
     pub fn close(&self) {
-        if let Some(ref mm) = self.memory_manager {
-            let mut mm = mm.lock().unwrap();
+        if !self.kernel_owned {
+            return;
+        }
+        if let Some(kernel) = super::kernel::get_kernel_mut() {
+            let mm = kernel.memory_manager_mut();
             for block in &self.blocks {
                 mm.close(block.get_address(), block.get_num_pages());
             }
@@ -191,10 +217,12 @@ impl KPageGroup {
     /// Decrement reference count and reset the page group.
     /// Port of upstream `KPageGroup::CloseAndReset`.
     pub fn close_and_reset(&mut self) {
-        if let Some(ref mm) = self.memory_manager {
-            let mut mm = mm.lock().unwrap();
-            for block in &self.blocks {
-                mm.close(block.get_address(), block.get_num_pages());
+        if self.kernel_owned {
+            if let Some(kernel) = super::kernel::get_kernel_mut() {
+                let mm = kernel.memory_manager_mut();
+                for block in &self.blocks {
+                    mm.close(block.get_address(), block.get_num_pages());
+                }
             }
         }
         self.blocks.clear();

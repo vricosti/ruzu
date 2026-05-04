@@ -10,6 +10,7 @@
 
 use super::k_memory_block::PAGE_SIZE;
 use super::k_page_heap::KPageHeap;
+use super::svc::svc_results;
 use std::sync::Mutex;
 
 // ---------------------------------------------------------------------------
@@ -349,6 +350,160 @@ impl KMemoryManager {
         );
 
         allocated_block
+    }
+
+    /// Allocate `num_pages` from the pool as a sequence of buddy blocks,
+    /// appending each to `out_pg` and opening-first the reference count of
+    /// every page in the group.
+    ///
+    /// Port of upstream `KMemoryManager::AllocateAndOpen` (k_memory_manager.cpp:301).
+    /// Calls the shared `AllocatePageGroupImpl` (largest-fit walk over the
+    /// shift table), then matches upstream's per-block `OpenFirst` loop —
+    /// each block is processed as a contiguous run within its owning Impl.
+    pub fn allocate_and_open(
+        &mut self,
+        out_pg: &mut super::k_page_group::KPageGroup,
+        num_pages: usize,
+        option: u32,
+    ) -> u32 {
+        debug_assert!(out_pg.is_empty(), "out page group must be empty");
+        if num_pages == 0 {
+            return 0;
+        }
+
+        let (pool, dir) = Self::decode_option(option);
+        let pool_index = pool as usize;
+        let _lk = self.m_pool_locks[pool_index].lock().unwrap();
+
+        // Allocate the page group. Use a free function to side-step the
+        // borrow conflict between `_lk` (immutable borrow of m_pool_locks)
+        // and `&mut self`-style method calls.
+        let unoptimized = self.m_has_optimized_process[pool_index];
+        let head = self.m_pool_managers_head[pool_index];
+        let rc = Self::allocate_page_group_impl(
+            &mut self.m_managers,
+            head,
+            out_pg,
+            num_pages,
+            unoptimized,
+            true,
+        );
+        if rc != 0 {
+            return rc;
+        }
+
+        // Open-first each block, splitting per managing Impl per upstream.
+        let blocks: Vec<(u64, usize)> = out_pg
+            .iter()
+            .map(|b| (b.get_address(), b.get_num_pages()))
+            .collect();
+        for (cur_address, mut remaining_pages) in blocks {
+            let mut cur = cur_address;
+            while remaining_pages > 0 {
+                let idx = Self::find_manager_index(&self.m_managers, cur);
+                let manager = &mut self.m_managers[idx];
+                let to_end = manager.get_page_offset_to_end(cur);
+                let cur_pages = remaining_pages.min(to_end);
+                manager.open_first(cur, cur_pages);
+                cur += (cur_pages * PAGE_SIZE) as u64;
+                remaining_pages -= cur_pages;
+            }
+        }
+        0
+    }
+
+    /// Allocate a `KPageGroup` for `num_pages` from the pool whose head Impl
+    /// is `pool_head`, using the buddy heap's largest-block-first strategy.
+    ///
+    /// Port of upstream `KMemoryManager::AllocatePageGroupImpl`
+    /// (k_memory_manager.cpp:246). Walks block sizes from largest-fit down
+    /// to 4 KB, allocating multiples of each from each Impl in the pool's
+    /// chain. On failure, frees any blocks already added back to the pool
+    /// and finalizes the group.
+    ///
+    /// Free function so that callers can hold the pool lock as an immutable
+    /// borrow on `self.m_pool_locks` while passing `&mut self.m_managers`
+    /// here — Rust's borrow checker cannot prove disjointness across method
+    /// calls on `&mut self`.
+    fn allocate_page_group_impl(
+        managers: &mut [Impl],
+        pool_head: Option<usize>,
+        out_pg: &mut super::k_page_group::KPageGroup,
+        num_pages: usize,
+        _unoptimized: bool,
+        random: bool,
+    ) -> u32 {
+        let heap_index = KPageHeap::get_block_index(num_pages);
+        if heap_index < 0 {
+            return svc_results::RESULT_OUT_OF_MEMORY.get_inner_value();
+        }
+
+        let mut remaining = num_pages;
+
+        for index in (0..=heap_index).rev() {
+            if remaining == 0 {
+                break;
+            }
+            let pages_per_alloc = KPageHeap::get_block_num_pages(index as usize);
+
+            // Walk the pool's Impl chain. ruzu currently has a single Impl
+            // per pool, but iterate on `pool_head` and (eventually) follow
+            // next links so adding multi-Impl pools doesn't require revisits.
+            let mut cur_idx = pool_head;
+            while let Some(idx) = cur_idx {
+                while remaining >= pages_per_alloc {
+                    let allocated_block =
+                        managers[idx].m_heap.allocate_block(index, random);
+                    if allocated_block == 0 {
+                        break;
+                    }
+                    if out_pg.add_block(allocated_block, pages_per_alloc).is_err() {
+                        managers[idx].free(allocated_block, pages_per_alloc);
+                        Self::free_page_group_blocks(managers, out_pg);
+                        out_pg.finalize();
+                        return svc_results::RESULT_OUT_OF_MEMORY.get_inner_value();
+                    }
+                    remaining -= pages_per_alloc;
+                }
+                let _ = idx;
+                cur_idx = None;
+            }
+        }
+
+        if remaining != 0 {
+            Self::free_page_group_blocks(managers, out_pg);
+            out_pg.finalize();
+            return svc_results::RESULT_OUT_OF_MEMORY.get_inner_value();
+        }
+        0
+    }
+
+    /// Free every block currently in `pg` back to its owning Impl. Upstream
+    /// uses an `ON_RESULT_FAILURE` lambda that does the same walk.
+    fn free_page_group_blocks(
+        managers: &mut [Impl],
+        pg: &super::k_page_group::KPageGroup,
+    ) {
+        let blocks: Vec<(u64, usize)> = pg
+            .iter()
+            .map(|b| (b.get_address(), b.get_num_pages()))
+            .collect();
+        for (addr, pages) in blocks {
+            let idx = Self::find_manager_index(managers, addr);
+            let manager = &mut managers[idx];
+            let to_end = manager.get_page_offset_to_end(addr);
+            manager.free(addr, pages.min(to_end));
+        }
+    }
+
+    /// Find the manager index containing the given physical address.
+    fn find_manager_index(managers: &[Impl], address: u64) -> usize {
+        for (i, m) in managers.iter().enumerate() {
+            if m.contains(address) {
+                return i;
+            }
+        }
+        panic!("KMemoryManager: no manager for address {:#x}", address);
     }
 
     /// Open (increment) reference counts for pages at the given address.
