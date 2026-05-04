@@ -1164,6 +1164,13 @@ pub struct KernelCore {
     page_table_manager:
         Option<Arc<super::k_page_table_manager::KPageTableManager>>,
 
+    /// Kernel-wide physical memory layout. Upstream:
+    /// `KernelCore::Impl::memory_layout` populated at boot by
+    /// `KMemoryLayoutInit` from the SoC region tree. ruzu populates with
+    /// `populate_default_dram_user_pools` at boot — the same data
+    /// `core.rs` previously hardcoded inline for `initialize_pool` calls.
+    memory_layout: Option<Arc<Mutex<super::k_memory_layout::KMemoryLayout>>>,
+
     // -- Core timing --
     /// Reference to the system's CoreTiming.
     /// Upstream: accessed via `system.CoreTiming()` through `System& system` reference.
@@ -1242,6 +1249,7 @@ impl KernelCore {
             system_resource_limit: None,
             memory_block_slab_manager: None,
             page_table_manager: None,
+            memory_layout: None,
             next_host_thread_id: AtomicU32::new(hardware_properties::NUM_CPU_CORES),
             single_core_thread_id: AtomicU32::new(0),
             core_timing: None,
@@ -2180,14 +2188,63 @@ impl KernelCore {
         self.page_table_manager.clone()
     }
 
+    /// Get the kernel-wide physical memory layout. Upstream:
+    /// `KernelCore::MemoryLayout()`. Populated by
+    /// `initialize_memory_layout` at boot.
+    pub fn get_memory_layout(
+        &self,
+    ) -> Option<Arc<Mutex<super::k_memory_layout::KMemoryLayout>>> {
+        self.memory_layout.clone()
+    }
+
+    /// Populate the kernel-wide physical memory layout with the three
+    /// Switch DRAM user pools (Application / Applet / SystemNonSecure).
+    /// Mirrors the upstream init pass that walks the SoC region tree.
+    pub fn initialize_memory_layout(
+        &mut self,
+        application: (u64, usize),
+        applet: (u64, usize),
+        system: (u64, usize),
+    ) {
+        let mut layout = super::k_memory_layout::KMemoryLayout::new();
+        layout.populate_default_dram_user_pools(
+            application.0,
+            application.1,
+            applet.0,
+            applet.1,
+            system.0,
+            system.1,
+        );
+        self.memory_layout = Some(Arc::new(Mutex::new(layout)));
+    }
+
     /// Initialize the kernel-wide page-table-page slab. Upstream sizes
     /// this from `KernelPageTableHeapSize` (kernel.cpp:1067) — typically
     /// several thousand page-sized entries. ruzu doesn't currently spend
     /// any of this allocation pressure (flat page table) so the capacity
     /// is set conservatively.
+    ///
+    /// Wires a dedicated `KDynamicPageManager` as the page allocator
+    /// behind the slab so `is_in_range` queries return real (non-empty)
+    /// ranges and refcount accounting is anchored to a stable address
+    /// region. Mirrors upstream's
+    /// `Initialize(KDynamicPageManager*, capacity, rc_table)`.
     pub fn initialize_page_table_manager(&mut self, capacity: usize) {
-        let mut slab = super::k_page_table_slab_heap::KPageTableSlabHeap::new();
-        slab.initialize(capacity);
+        use super::k_dynamic_page_manager::KDynamicPageManager;
+        use super::k_memory_block::PAGE_SIZE;
+
+        // Reserve a dedicated page-manager region for the slab. Pick a
+        // base address well above any guest VA so `is_in_range` queries
+        // never collide with mapped guest memory.
+        let region_size = capacity * PAGE_SIZE;
+        let pa = Arc::new(Mutex::new(KDynamicPageManager::new()));
+        pa.lock()
+            .unwrap()
+            .initialize(0xFFFF_E000_0000_0000, region_size, PAGE_SIZE)
+            .expect("KPageTableSlabHeap page allocator init");
+
+        let slab = super::k_page_table_slab_heap::KPageTableSlabHeap::new();
+        slab.initialize(pa, capacity);
         let slab = Arc::new(slab);
         self.page_table_manager = Some(Arc::new(
             super::k_page_table_manager::KPageTableManager::new(slab),

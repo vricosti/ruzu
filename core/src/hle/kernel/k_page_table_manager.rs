@@ -45,17 +45,17 @@ impl KPageTableManager {
         Self { slab_heap }
     }
 
-    /// Allocate a page-table page. Upstream returns `KVirtualAddress`
-    /// pointing into the slab; ruzu returns the boxed page. `None` on
-    /// slab exhaustion.
-    pub fn allocate(&self) -> Option<Box<PageTablePage>> {
+    /// Allocate a page-table page. Returns the slab address (u64),
+    /// matching upstream's `KVirtualAddress Allocate()`. `None` on
+    /// slab exhaustion (upstream returns 0).
+    pub fn allocate(&self) -> Option<u64> {
         self.slab_heap.allocate()
     }
 
-    /// Free a page-table page back to the slab. Upstream's
-    /// `void Free(T* t)`.
-    pub fn free(&self, page: Box<PageTablePage>) {
-        self.slab_heap.free(page);
+    /// Free a page-table page back to the slab. Upstream:
+    /// `void Free(KVirtualAddress addr)`.
+    pub fn free(&self, addr: u64) {
+        self.slab_heap.free(addr);
     }
 
     /// Refcount accessor. Upstream's `RefCount GetRefCount(KVirtualAddress)`.

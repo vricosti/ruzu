@@ -483,10 +483,18 @@ impl KProcessPageTable {
         base.m_address_space_start = start.get() as usize;
         base.m_address_space_end = start.get() as usize + size;
         base.m_address_space_width = width;
-        // Initialize the block manager for this address space.
-        let _ = base
-            .m_memory_block_manager
-            .initialize(base.m_address_space_start, base.m_address_space_end);
+        // Initialize the block manager for this address space. Pull the
+        // kernel-wide slab manager so the sentinel block comes from the
+        // shared slab — matches upstream's `Initialize(start, end, slab)`
+        // signature.
+        let slab = crate::hle::kernel::kernel::get_kernel_ref()
+            .and_then(|k| k.get_memory_block_slab_manager());
+        let slab_ref = slab.as_deref();
+        let _ = base.m_memory_block_manager.initialize(
+            base.m_address_space_start,
+            base.m_address_space_end,
+            slab_ref,
+        );
         // Initialize the page table implementation (Common::PageTable).
         // Upstream does this in InitializeForProcess; here we do it in the
         // legacy path as well so that Operate() can write page table entries.

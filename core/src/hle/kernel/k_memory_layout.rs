@@ -222,6 +222,54 @@ impl KMemoryLayout {
         }
         (total_size, kernel_size)
     }
+
+    /// Pre-populate the physical tree with DramUserPool entries for the
+    /// three Switch user pools (Application / Applet / SystemNonSecure).
+    /// Mirrors upstream's `Kernel::Init::SetupDramPhysicalMemoryRegions`
+    /// — ruzu doesn't run the full setup pass yet, so this seeds the
+    /// tree from the same constants `core.rs` previously hardcoded for
+    /// `KMemoryManager::initialize_pool` calls.
+    ///
+    /// `KMemoryManager::initialize_from_layout` then walks the tree and
+    /// creates one Impl per pool region, matching upstream's
+    /// `for (it : layout.GetPhysicalMemoryRegionTree()) if (DramUserPool)`
+    /// loop in `KMemoryManager::Initialize`.
+    pub fn populate_default_dram_user_pools(
+        &mut self,
+        application_phys_start: u64,
+        application_size: usize,
+        applet_phys_start: u64,
+        applet_size: usize,
+        system_phys_start: u64,
+        system_size: usize,
+    ) {
+        let mut insert_pool = |start: u64, size: usize, type_id: u32| {
+            if size == 0 {
+                return;
+            }
+            self.m_physical_tree.insert_directly(
+                start,
+                start + size as u64 - 1,
+                0, /* no attributes */
+                type_id,
+            );
+        };
+        insert_pool(
+            application_phys_start,
+            application_size,
+            K_MEMORY_REGION_TYPE_DRAM_APPLICATION_POOL.get_value(),
+        );
+        insert_pool(
+            applet_phys_start,
+            applet_size,
+            K_MEMORY_REGION_TYPE_DRAM_APPLET_POOL.get_value(),
+        );
+        insert_pool(
+            system_phys_start,
+            system_size,
+            K_MEMORY_REGION_TYPE_DRAM_SYSTEM_POOL.get_value(),
+        );
+    }
 }
 
 impl Default for KMemoryLayout {
