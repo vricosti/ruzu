@@ -632,6 +632,48 @@ impl Memory {
     /// memset'ing every byte. This matches upstream's
     /// `DeviceMemory().buffer.ClearBackingRegion` path and avoids the O(size)
     /// memset that was ~26% of ruzu's CPU during MK8D boot.
+    /// Zero a region of physical memory (DeviceMemory backing buffer).
+    /// Used by KPageTableBase pool-allocation callers that need to clear
+    /// pages before mapping them into virtual address space (so the VA
+    /// mapping doesn't yet exist for `zero_block`'s VA path).
+    ///
+    /// Upstream calls `ClearBackingRegion(m_system, block.GetAddress(),
+    /// block.GetSize(), m_heap_fill_value)` per block in the page group.
+    /// `m_heap_fill_value` is typically zero in the standard build profile;
+    /// upstream uses non-zero values only when developer poisoning is on.
+    pub fn zero_phys_block(&self, phys_addr: u64, size: usize) {
+        if size == 0 {
+            return;
+        }
+        let buffer = unsafe { &*self.buffer };
+        let dm = unsafe { &*self.device_memory };
+        let backing_base = buffer.backing_base_pointer() as usize;
+        let backing_size = buffer.backing_size();
+        // Translate phys → host pointer (DeviceMemory is identity-mapped
+        // from `dram_memory_map::BASE` into the host backing buffer).
+        let dram_base = crate::device_memory::dram_memory_map::BASE;
+        if phys_addr < dram_base {
+            log::error!("zero_phys_block: phys {:#x} below DRAM base", phys_addr);
+            return;
+        }
+        let host_offset = (phys_addr - dram_base) as usize;
+        if host_offset
+            .checked_add(size)
+            .map(|end| end > backing_size)
+            .unwrap_or(true)
+        {
+            log::error!(
+                "zero_phys_block: phys {:#x}+{:#x} out of backing (backing_size={:#x})",
+                phys_addr, size, backing_size
+            );
+            return;
+        }
+        let _ = dm; // silences unused warning if device_memory accessor not needed
+        unsafe {
+            std::ptr::write_bytes((backing_base + host_offset) as *mut u8, 0u8, size);
+        }
+    }
+
     pub fn zero_block(&self, dest_addr: u64, size: usize) -> bool {
         if !self.address_space_contains(dest_addr, size) {
             log::error!("Unmapped ZeroBlock @ {:#018x} size={:#x}", dest_addr, size);
