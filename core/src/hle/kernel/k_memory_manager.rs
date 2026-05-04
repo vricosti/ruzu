@@ -63,6 +63,12 @@ struct Impl {
     m_heap: KPageHeap,
     m_page_reference_counts: Vec<u16>,
     m_pool: Pool,
+    /// Index of the next Impl in the same pool's chain (None == tail).
+    /// Upstream: `Impl* m_next` linked-list pointer.
+    m_next_idx: Option<usize>,
+    /// Index of the previous Impl in the same pool's chain (None == head).
+    /// Upstream: `Impl* m_prev` linked-list pointer.
+    m_prev_idx: Option<usize>,
 }
 
 impl Impl {
@@ -71,7 +77,22 @@ impl Impl {
             m_heap: KPageHeap::new(),
             m_page_reference_counts: Vec::new(),
             m_pool: Pool::Application,
+            m_next_idx: None,
+            m_prev_idx: None,
         }
+    }
+
+    fn get_next(&self) -> Option<usize> {
+        self.m_next_idx
+    }
+    fn get_prev(&self) -> Option<usize> {
+        self.m_prev_idx
+    }
+    fn set_next(&mut self, idx: Option<usize>) {
+        self.m_next_idx = idx;
+    }
+    fn set_prev(&mut self, idx: Option<usize>) {
+        self.m_prev_idx = idx;
     }
 
     /// Initialize the manager for a physical memory region.
@@ -230,8 +251,12 @@ const POOL_COUNT: usize = Pool::Count as usize;
 pub struct KMemoryManager {
     m_managers: Vec<Impl>,
     m_num_managers: usize,
-    /// Head index into m_managers for each pool.
+    /// Head index into m_managers for each pool. Upstream:
+    /// `std::array<Impl*, MaxManagerCount> m_pool_managers_head`.
     m_pool_managers_head: [Option<usize>; POOL_COUNT],
+    /// Tail index into m_managers for each pool. Upstream:
+    /// `std::array<Impl*, MaxManagerCount> m_pool_managers_tail`.
+    m_pool_managers_tail: [Option<usize>; POOL_COUNT],
     /// Total size of each pool (set during kernel init).
     m_pool_sizes: [usize; POOL_COUNT],
     /// Per-pool optimized process tracking.
@@ -247,6 +272,7 @@ impl KMemoryManager {
             m_managers: Vec::new(),
             m_num_managers: 0,
             m_pool_managers_head: [None; POOL_COUNT],
+            m_pool_managers_tail: [None; POOL_COUNT],
             m_pool_sizes: [0; POOL_COUNT],
             m_optimized_process_ids: [0; POOL_COUNT],
             m_has_optimized_process: [false; POOL_COUNT],
@@ -273,15 +299,33 @@ impl KMemoryManager {
 
         let mut manager = Impl::new();
         manager.initialize(phys_start, size, pool);
-        self.m_managers.push(manager);
-
         let manager_index = self.m_num_managers;
+        self.m_managers.push(manager);
         self.m_num_managers += 1;
 
-        // Set as head for this pool.
+        // Insert into the pool's chain. Upstream
+        // (k_memory_manager.cpp:111):
+        //
+        //   if (m_pool_managers_tail[i] == nullptr) {
+        //       m_pool_managers_head[i] = manager;
+        //   } else {
+        //       m_pool_managers_tail[i]->SetNext(manager);
+        //       manager->SetPrev(m_pool_managers_tail[i]);
+        //   }
+        //   m_pool_managers_tail[i] = manager;
         let pool_index = pool as usize;
-        self.m_pool_managers_head[pool_index] = Some(manager_index);
-        self.m_pool_sizes[pool_index] = size;
+        match self.m_pool_managers_tail[pool_index] {
+            None => {
+                self.m_pool_managers_head[pool_index] = Some(manager_index);
+            }
+            Some(tail_idx) => {
+                self.m_managers[tail_idx].set_next(Some(manager_index));
+                self.m_managers[manager_index].set_prev(Some(tail_idx));
+            }
+        }
+        self.m_pool_managers_tail[pool_index] = Some(manager_index);
+        // Pool size is the SUM of every Impl in the pool, so accumulate.
+        self.m_pool_sizes[pool_index] += size;
 
         log::info!(
             "KMemoryManager: initialized pool {:?} at {:#x}..{:#x} ({:#x} bytes)",
@@ -290,6 +334,34 @@ impl KMemoryManager {
             phys_start + size as u64,
             size
         );
+    }
+
+    /// Get the first Impl in the pool's chain for the given direction.
+    /// Upstream `KMemoryManager::GetFirstManager`:
+    ///
+    /// ```cpp
+    /// return dir == Direction::FromBack ? m_pool_managers_tail[pool]
+    ///                                   : m_pool_managers_head[pool];
+    /// ```
+    fn get_first_manager(&self, pool: Pool, dir: Direction) -> Option<usize> {
+        let pool_index = pool as usize;
+        match dir {
+            Direction::FromBack => self.m_pool_managers_tail[pool_index],
+            Direction::FromFront => self.m_pool_managers_head[pool_index],
+        }
+    }
+
+    /// Get the next Impl in the pool's chain for the given direction.
+    /// Upstream `KMemoryManager::GetNextManager`:
+    ///
+    /// ```cpp
+    /// return dir == Direction::FromBack ? cur->GetPrev() : cur->GetNext();
+    /// ```
+    fn get_next_manager(&self, cur: usize, dir: Direction) -> Option<usize> {
+        match dir {
+            Direction::FromBack => self.m_managers[cur].get_prev(),
+            Direction::FromFront => self.m_managers[cur].get_next(),
+        }
     }
 
     /// Set the total size for a pool.
@@ -314,21 +386,33 @@ impl KMemoryManager {
             return 0;
         }
 
-        let (pool, _dir) = Self::decode_option(option);
+        let (pool, dir) = Self::decode_option(option);
         let pool_index = pool as usize;
         let _lk = self.m_pool_locks[pool_index].lock().unwrap();
 
         let heap_index = KPageHeap::get_aligned_block_index(num_pages, align_pages);
 
-        // Find a manager for this pool and try to allocate.
-        let manager_idx = self.m_pool_managers_head[pool_index];
-        let Some(idx) = manager_idx else {
-            log::error!("AllocateAndOpenContinuous: no manager for pool {:?}", pool);
-            return 0;
-        };
-
-        let manager = &mut self.m_managers[idx];
-        let allocated_block = manager.allocate_aligned(heap_index, num_pages, align_pages);
+        // Walk the pool's Impl chain in `dir` order. Upstream
+        // (k_memory_manager.cpp:222):
+        //
+        //   for (chosen_manager = GetFirstManager(pool, dir);
+        //        chosen_manager != nullptr;
+        //        chosen_manager = GetNextManager(chosen_manager, dir)) {
+        //       allocated_block = chosen_manager->AllocateAligned(...);
+        //       if (allocated_block != 0) break;
+        //   }
+        let mut allocated_block: u64 = 0;
+        let mut chosen_idx: Option<usize> = None;
+        let mut cur_idx = self.get_first_manager(pool, dir);
+        while let Some(idx) = cur_idx {
+            allocated_block =
+                self.m_managers[idx].allocate_aligned(heap_index, num_pages, align_pages);
+            if allocated_block != 0 {
+                chosen_idx = Some(idx);
+                break;
+            }
+            cur_idx = self.get_next_manager(idx, dir);
+        }
 
         if allocated_block == 0 {
             log::error!(
@@ -339,8 +423,12 @@ impl KMemoryManager {
             return 0;
         }
 
-        // Open first reference.
-        manager.open_first(allocated_block, num_pages);
+        // Open first reference on the manager that actually allocated the
+        // block (upstream uses the chosen_manager pointer captured during
+        // the walk).
+        if let Some(idx) = chosen_idx {
+            self.m_managers[idx].open_first(allocated_block, num_pages);
+        }
 
         log::debug!(
             "AllocateAndOpenContinuous: allocated {} pages at {:#x} from pool {:?}",
@@ -379,10 +467,11 @@ impl KMemoryManager {
         // borrow conflict between `_lk` (immutable borrow of m_pool_locks)
         // and `&mut self`-style method calls.
         let unoptimized = self.m_has_optimized_process[pool_index];
-        let head = self.m_pool_managers_head[pool_index];
+        let pool_first = self.get_first_manager(pool, dir);
         let rc = Self::allocate_page_group_impl(
             &mut self.m_managers,
-            head,
+            pool_first,
+            dir,
             out_pg,
             num_pages,
             unoptimized,
@@ -427,7 +516,8 @@ impl KMemoryManager {
     /// calls on `&mut self`.
     fn allocate_page_group_impl(
         managers: &mut [Impl],
-        pool_head: Option<usize>,
+        pool_first: Option<usize>,
+        dir: Direction,
         out_pg: &mut super::k_page_group::KPageGroup,
         num_pages: usize,
         _unoptimized: bool,
@@ -446,10 +536,12 @@ impl KMemoryManager {
             }
             let pages_per_alloc = KPageHeap::get_block_num_pages(index as usize);
 
-            // Walk the pool's Impl chain. ruzu currently has a single Impl
-            // per pool, but iterate on `pool_head` and (eventually) follow
-            // next links so adding multi-Impl pools doesn't require revisits.
-            let mut cur_idx = pool_head;
+            // Walk the pool's Impl chain in `dir` order. Upstream
+            // (k_memory_manager.cpp:266):
+            //   for (Impl* cur_manager = GetFirstManager(pool, dir);
+            //        cur_manager != nullptr;
+            //        cur_manager = GetNextManager(cur_manager, dir))
+            let mut cur_idx = pool_first;
             while let Some(idx) = cur_idx {
                 while remaining >= pages_per_alloc {
                     let allocated_block =
@@ -465,8 +557,10 @@ impl KMemoryManager {
                     }
                     remaining -= pages_per_alloc;
                 }
-                let _ = idx;
-                cur_idx = None;
+                cur_idx = match dir {
+                    Direction::FromBack => managers[idx].get_prev(),
+                    Direction::FromFront => managers[idx].get_next(),
+                };
             }
         }
 

@@ -43,6 +43,7 @@ pub mod k_dynamic_page_manager;
 pub mod k_dynamic_resource_manager;
 pub mod k_memory_block;
 pub mod k_memory_block_manager;
+pub mod k_memory_block_slab_manager;
 pub mod k_memory_layout;
 pub mod k_memory_manager;
 pub mod k_memory_region;
