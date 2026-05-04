@@ -7,108 +7,125 @@
 //! and grows on demand by pulling pages from the page allocator.
 //! Typed aliases below match upstream's `KMemoryBlockSlabManager` and
 //! `KBlockInfoManager` declarations.
-//!
-//! Storage backing: ruzu's slab is host-allocated via `Box<T>`. Upstream's
-//! version carves guest-physical pages into typed entries — functionally
-//! identical here because the emulator runs entirely on host memory.
 
+use super::k_dynamic_page_manager::KDynamicPageManager;
+use super::k_dynamic_slab_heap::KDynamicSlabHeap;
 use super::k_memory_block::KMemoryBlock;
 use super::svc::svc_results;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 /// Generic resource manager — `KDynamicResourceManager<T>` in upstream.
 ///
-/// Owns a free list of pre-allocated `Box<T>` instances drawn from the
-/// kernel's `KDynamicPageManager` capacity at boot. `Allocate` pops a
-/// node (returns `None` on exhaustion to mirror upstream's null-on-fail);
-/// `Free` returns a node to the list.
+/// Wraps a `KDynamicSlabHeap<T>` (typed free list) and a
+/// `KDynamicPageManager` (page-level backing). Allocate forwards to the
+/// slab heap, which lazily pulls pages from the page manager on
+/// exhaustion. Free returns to the slab heap.
 ///
 /// Mirrors upstream's three-method surface (`Allocate`, `Free`,
-/// `GetSize`/`GetUsed`/`GetPeak`/`GetCount`) plus capacity introspection
-/// for diagnostics.
-#[derive(Debug)]
+/// `GetSize`/`GetUsed`/`GetPeak`/`GetCount`) plus a capacity-tracking
+/// `free_count()` accessor for diagnostics.
 pub struct KDynamicResourceManager<T: Default> {
-    free_list: Mutex<Vec<Box<T>>>,
-    capacity: usize,
-    used: std::sync::atomic::AtomicUsize,
-    peak: std::sync::atomic::AtomicUsize,
+    slab_heap: Arc<KDynamicSlabHeap<T>>,
+    page_allocator: Arc<Mutex<KDynamicPageManager>>,
+    /// True if the page manager owns its backing region (created by
+    /// `initialize`); false if both slab heap and page manager are
+    /// `Default::default()` (caller will wire externally).
+    initialized: bool,
 }
 
 impl<T: Default> KDynamicResourceManager<T> {
-    /// Create an empty manager. Call [`initialize`] to populate the slab.
+    /// Create an empty manager. Call [`initialize`] to populate it.
     pub fn new() -> Self {
         Self {
-            free_list: Mutex::new(Vec::new()),
-            capacity: 0,
-            used: std::sync::atomic::AtomicUsize::new(0),
-            peak: std::sync::atomic::AtomicUsize::new(0),
+            slab_heap: Arc::new(KDynamicSlabHeap::new(true)),
+            page_allocator: Arc::new(Mutex::new(KDynamicPageManager::new())),
+            initialized: false,
         }
     }
 
-    /// Pre-allocate `capacity` slab entries. Mirrors upstream's
-    /// `KDynamicResourceManager::Initialize(page_allocator, slab_heap)`,
-    /// where the slab is sized by the kernel's
-    /// `Kernel{Application,System}MemoryBlockSlabHeapSize` constants.
+    /// Pre-allocate `capacity` slab entries. The page manager is sized
+    /// in PAGE_SIZE chunks computed from `capacity * sizeof(T)`.
+    ///
+    /// Mirrors upstream's
+    /// `KDynamicResourceManager::Initialize(page_allocator, slab_heap)`
+    /// where the page allocator is pre-sized by the kernel-init layer
+    /// (`KernelApplicationMemoryBlockSlabHeapSize` /
+    /// `KernelSystemMemoryBlockSlabHeapSize`) and the slab heap is then
+    /// initialized to consume `object_count` worth of those pages.
     pub fn initialize(&mut self, capacity: usize) {
-        let mut list = self.free_list.lock().unwrap();
-        list.clear();
-        list.reserve(capacity);
-        for _ in 0..capacity {
-            list.push(Box::new(T::default()));
+        let entries_per_page = KDynamicSlabHeap::<T>::entries_per_page();
+        // Round up to whole pages so the slab gets at least `capacity`
+        // entries and the page manager has a real backing region to
+        // hand out.
+        let num_pages = capacity.div_ceil(entries_per_page).max(1);
+        let region_size = num_pages * super::k_memory_block::PAGE_SIZE;
+        // Anchor the page manager at a synthetic base address well above
+        // any legal guest VA so `is_in_range` queries against the slab
+        // backing don't collide with mapped guest memory. Each
+        // KDynamicResourceManager picks a unique base via a process-wide
+        // counter so multiple resource managers don't share a range.
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT_SLAB_BASE: AtomicU64 = AtomicU64::new(0xFFFF_F000_0000_0000);
+        let base = NEXT_SLAB_BASE.fetch_add(
+            (region_size as u64 + super::k_memory_block::PAGE_SIZE as u64) * 2,
+            Ordering::Relaxed,
+        );
+        {
+            let mut pa = self.page_allocator.lock().unwrap();
+            pa.initialize(base, region_size, super::k_memory_block::PAGE_SIZE)
+                .expect("KDynamicPageManager::initialize");
         }
-        drop(list);
-        self.capacity = capacity;
+        self.slab_heap.initialize_with_pages(
+            Arc::clone(&self.page_allocator),
+            num_pages,
+        );
+        self.initialized = true;
     }
 
-    /// Pop one entry from the free list. Upstream:
+    /// Pop one entry from the slab. Upstream:
     ///   `T* Allocate() const { return m_slab_heap->Allocate(m_page_allocator); }`
-    /// Returns `None` when the slab is exhausted (upstream returns `nullptr`).
+    /// Returns `None` when both the slab and the page manager are
+    /// exhausted (upstream returns `nullptr`).
     pub fn allocate(&self) -> Option<Box<T>> {
-        let mut list = self.free_list.lock().unwrap();
-        let item = list.pop()?;
-        let used = self.used.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-        let mut peak = self.peak.load(std::sync::atomic::Ordering::Relaxed);
-        while peak < used {
-            match self.peak.compare_exchange_weak(
-                peak,
-                used,
-                std::sync::atomic::Ordering::Relaxed,
-                std::sync::atomic::Ordering::Relaxed,
-            ) {
-                Ok(_) => break,
-                Err(actual) => peak = actual,
-            }
-        }
-        Some(item)
+        self.slab_heap.allocate()
     }
 
-    /// Return an entry to the free list. Upstream:
+    /// Return an entry to the slab. Upstream:
     ///   `void Free(T* t) const { m_slab_heap->Free(t); }`
-    /// Resets `*block` so reused entries don't carry stale state.
-    pub fn free(&self, mut block: Box<T>) {
-        *block = T::default();
-        self.free_list.lock().unwrap().push(block);
-        self.used
-            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    pub fn free(&self, block: Box<T>) {
+        self.slab_heap.free(block);
     }
 
+    /// Total slab capacity in bytes.
     pub fn get_size(&self) -> usize {
-        self.capacity * std::mem::size_of::<T>()
+        self.slab_heap.get_size()
     }
     pub fn get_used(&self) -> usize {
-        self.used.load(std::sync::atomic::Ordering::Relaxed)
+        self.slab_heap.get_used()
     }
     pub fn get_peak(&self) -> usize {
-        self.peak.load(std::sync::atomic::Ordering::Relaxed)
+        self.slab_heap.get_peak()
     }
     pub fn get_count(&self) -> usize {
-        self.capacity
+        self.slab_heap.get_count()
     }
 
-    /// Free count remaining in the slab — convenience used by
-    /// `KMemoryBlockManagerUpdateAllocator`'s pre-reservation check.
+    /// Free count remaining in the slab.
     pub fn free_count(&self) -> usize {
-        self.free_list.lock().unwrap().len()
+        self.slab_heap.get_count() - self.slab_heap.get_used()
+    }
+
+    /// Membership test for a slab-managed address. Used by
+    /// `KPageTableManager::IsInPageTableHeap` to validate pages handed
+    /// to `Free` actually came from this slab.
+    pub fn is_in_range(&self, addr: u64) -> bool {
+        self.slab_heap.is_in_range(addr)
+    }
+
+    /// Slab-region base address — for upstream-shape callers that want
+    /// to validate `addr in [base, base+size)`.
+    pub fn get_address(&self) -> u64 {
+        self.slab_heap.get_address()
     }
 }
 

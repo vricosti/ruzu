@@ -370,6 +370,44 @@ impl KMemoryManager {
         self.m_pool_sizes[pool as usize] = size;
     }
 
+    /// Initialize all pools by walking `layout`'s physical memory region
+    /// tree for `DramUserPool`-derived entries, creating one Impl per
+    /// region.
+    ///
+    /// Port of upstream `KMemoryManager::Initialize` (k_memory_manager.cpp:81+):
+    /// ```cpp
+    /// for (const auto& it : kernel.MemoryLayout().GetPhysicalMemoryRegionTree()) {
+    ///     if (it.IsDerivedFrom(KMemoryRegionType_DramUserPool)) {
+    ///         auto& manager = m_managers[it.GetAttributes()];
+    ///         manager.Initialize(...);
+    ///         // Insert into m_pool_managers_head/tail per region.GetType().
+    ///     }
+    /// }
+    /// ```
+    pub fn initialize_from_layout(
+        &mut self,
+        layout: &super::k_memory_layout::KMemoryLayout,
+    ) {
+        use super::k_memory_region_type::*;
+        for region in layout.get_physical_memory_region_tree().iter() {
+            if !region.is_derived_from(K_MEMORY_REGION_TYPE_DRAM_USER_POOL) {
+                continue;
+            }
+            let pool = if region.is_derived_from(K_MEMORY_REGION_TYPE_DRAM_APPLICATION_POOL) {
+                Pool::Application
+            } else if region.is_derived_from(K_MEMORY_REGION_TYPE_DRAM_APPLET_POOL) {
+                Pool::Applet
+            } else if region.is_derived_from(K_MEMORY_REGION_TYPE_DRAM_SYSTEM_NON_SECURE_POOL) {
+                Pool::SystemNonSecure
+            } else if region.is_derived_from(K_MEMORY_REGION_TYPE_DRAM_SYSTEM_POOL) {
+                Pool::System
+            } else {
+                continue;
+            };
+            self.initialize_pool(pool, region.get_address(), region.get_size());
+        }
+    }
+
     // --- Allocation ---
 
     /// Allocate contiguous physical pages and open the first reference.

@@ -131,49 +131,73 @@ impl PageLinkedList {
 }
 
 /// RAII helper that holds a `PageLinkedList` for the duration of a page-table
-/// update and (in upstream) frees it on destruction by calling
+/// update and frees it on destruction by calling
 /// `m_pt->FinalizeUpdate(this->GetPageList())`.
 ///
 /// Port of upstream `KPageTableBase::KScopedPageTableUpdater`
-/// (k_page_table_base.h:170). Rust's borrow checker forbids holding
-/// `&mut KPageTableBase` here while callers call methods on the same
-/// `KPageTableBase`, so the destructor is a no-op and callers must invoke
-/// `pt.finalize_update(updater.page_list())` at the end of scope themselves
-/// — `Drop` warns if the list is still non-empty when the helper goes out
-/// of scope. For ruzu the underlying free is a no-op (no
-/// `KPageTableManager`-allocated guest pages yet), so missing the call has
-/// no functional impact today, but the warning preserves upstream's
-/// "scoped finalize" contract for when the manager is ported.
-#[derive(Default, Debug)]
+/// (k_page_table_base.h:170):
+///
+/// ```cpp
+/// class KScopedPageTableUpdater {
+///     KPageTableBase* m_pt;
+///     PageLinkedList m_ll;
+///   public:
+///     explicit KScopedPageTableUpdater(KPageTableBase* pt) : m_pt(pt), m_ll() {}
+///     ~KScopedPageTableUpdater() { m_pt->FinalizeUpdate(GetPageList()); }
+/// };
+/// ```
+///
+/// Holds a raw `*mut KPageTableBase` to mirror upstream's destructor
+/// semantics — Rust's borrow checker would otherwise forbid the back-
+/// reference from coexisting with the caller's `&mut self` access.
+/// The pointer is valid for the helper's lifetime since the helper is
+/// always a stack local in a method that already holds `&mut self`.
+/// Finalize fires unconditionally on Drop.
 pub struct KScopedPageTableUpdater {
+    pt: *mut KPageTableBase,
     page_list: PageLinkedList,
 }
 
 impl KScopedPageTableUpdater {
-    pub fn new() -> Self {
+    /// Construct with a raw pointer to the page table whose update is
+    /// in progress. Mirrors upstream's `KScopedPageTableUpdater(KPageTableBase*)`.
+    ///
+    /// # Safety
+    /// `pt` must remain valid for the lifetime of the returned helper.
+    /// In practice always called with `self as *mut _` from inside a
+    /// method that already holds `&mut self`, so the pointer is non-null
+    /// and outlives the stack frame.
+    pub unsafe fn new(pt: *mut KPageTableBase) -> Self {
         Self {
+            pt,
             page_list: PageLinkedList::new(),
         }
     }
+
+    /// Convenience constructor for `&mut self`-holding callers.
+    pub fn from_mut(pt: &mut KPageTableBase) -> Self {
+        // SAFETY: pt is exclusively borrowed for at least the lifetime
+        // of this helper; we do not alias through the raw pointer.
+        unsafe { Self::new(pt as *mut _) }
+    }
+
     /// Borrow the page list, matching upstream's `GetPageList()` accessor.
     pub fn page_list(&mut self) -> &mut PageLinkedList {
         &mut self.page_list
-    }
-    /// Acknowledge the list is finalized so Drop won't warn. Equivalent to
-    /// upstream's `FinalizeUpdate(GetPageList())` consuming the list.
-    pub fn finalized(&mut self) {
-        self.page_list.pages.clear();
     }
 }
 
 impl Drop for KScopedPageTableUpdater {
     fn drop(&mut self) {
-        if !self.page_list.is_empty() {
-            log::warn!(
-                "KScopedPageTableUpdater: dropped with {} entries still pending — \
-                 caller forgot pt.finalize_update(updater.page_list())",
-                self.page_list.pages.len()
-            );
+        // Mirror upstream's destructor: unconditionally call
+        // `m_pt->FinalizeUpdate(this->GetPageList())`.
+        if !self.pt.is_null() {
+            // SAFETY: `pt` is valid for the lifetime of this helper per
+            // the unsafe contract on `new` / `from_mut`. The page list
+            // is exclusively borrowed within this Drop scope.
+            unsafe {
+                (*self.pt).finalize_update(&mut self.page_list);
+            }
         }
     }
 }
@@ -1069,10 +1093,22 @@ impl KPageTableBase {
         debug_assert!(self.m_kernel_map_region_start >= self.m_address_space_start);
         debug_assert!(self.m_kernel_map_region_end <= self.m_address_space_end);
 
-        // Initialize the memory block manager.
+        // Initialize the memory block manager. Upstream:
+        //   m_memory_block_manager.Initialize(start, end, slab_manager);
+        // The slab manager is the kernel-wide block slab; ruzu pulls it
+        // from `KernelCore::get_memory_block_slab_manager()` so the
+        // sentinel block is drawn from the same pool every subsequent
+        // update will use.
+        let slab = crate::hle::kernel::kernel::get_kernel_ref()
+            .and_then(|k| k.get_memory_block_slab_manager());
+        let slab_ref = slab.as_deref();
         if self
             .m_memory_block_manager
-            .initialize(self.m_address_space_start, self.m_address_space_end)
+            .initialize(
+                self.m_address_space_start,
+                self.m_address_space_end,
+                slab_ref,
+            )
             .is_err()
         {
             return svc_results::RESULT_OUT_OF_MEMORY.get_inner_value();
@@ -1149,8 +1185,25 @@ impl KPageTableBase {
     ///
     /// In the emulator, we don't use PageLinkedList (no guest page table entries).
     /// The operation modifies Core::Memory::Memory which updates the dynarmic PageTable.
+    /// Page-table operate (single phys variant). Mirrors upstream:
+    ///
+    /// ```cpp
+    /// Result Operate(PageLinkedList* page_list, KProcessAddress virt_addr,
+    ///                size_t num_pages, KPhysicalAddress phys_addr,
+    ///                bool is_pa_valid, KPageProperties properties,
+    ///                OperationType operation, bool reuse_ll);
+    /// ```
+    ///
+    /// The `page_list` parameter accumulates page-table pages that the
+    /// operation has freed, for `FinalizeUpdate` to return to the
+    /// `KPageTableManager`. ruzu's flat page table never produces such
+    /// pages today (see `k_page_table_manager.rs` header), so callers
+    /// can pass `None` if they don't have a `KScopedPageTableUpdater` in
+    /// scope; the principal phys-handlers pass `Some(updater.page_list())`
+    /// matching upstream's call shape.
     pub fn operate(
         &mut self,
+        _page_list: Option<&mut PageLinkedList>,
         virt_addr: usize,
         num_pages: usize,
         phys_addr: u64,
@@ -1259,6 +1312,7 @@ impl KPageTableBase {
     /// ```
     pub fn operate_with_group(
         &mut self,
+        _page_list: Option<&mut PageLinkedList>,
         virt_addr: usize,
         num_pages: usize,
         page_group: &super::k_page_group::KPageGroup,
@@ -1431,13 +1485,11 @@ impl KPageTableBase {
                 "FinalizeUpdate: page {:#x} has non-zero refcount",
                 page_addr
             );
-            // The page handle from PageLinkedList is a u64 phys/virt
-            // address; once a real KPageTableSlabHeap range exists, we
-            // can recover the boxed PageTablePage from the address. For
-            // now `manager.free` takes the boxed page directly — we drop
-            // a freshly-default-constructed placeholder so ref-count
-            // accounting stays consistent.
-            manager.free(Box::new(super::k_page_table_slab_heap::PageTablePage::default()));
+            // Mirrors upstream:
+            //   GetPageTableManager().Free(page);
+            // The slab heap looks up the entry by address and reclaims
+            // the in-slab Box — no placeholder allocation.
+            manager.free(page_addr);
         }
     }
 
@@ -1584,7 +1636,7 @@ impl KPageTableBase {
         // ruzu's Operate doesn't push to the list yet (no KPageTableManager
         // port), so the list stays empty — Drop won't fire FinalizeUpdate
         // until the manager lands.
-        let _updater = KScopedPageTableUpdater::new();
+        let _updater = KScopedPageTableUpdater::from_mut(self);
 
         let current_heap_size = self.m_current_heap_end - self.m_heap_region_start;
 
@@ -1616,6 +1668,7 @@ impl KPageTableBase {
                 disable_merge_attributes: DisableMergeAttribute::NONE,
             };
             let op_result = self.operate(
+                None,
                 free_start,
                 num_pages,
                 0,
@@ -1759,6 +1812,7 @@ impl KPageTableBase {
         // R_TRY(this->Operate(updater.GetPageList(), m_current_heap_end,
         //                     num_pages, pg, map_properties, MapGroup, false));
         let op_result = self.operate_with_group(
+            None,
             cur_address,
             num_pages,
             pg_guard.pg,
@@ -1875,6 +1929,7 @@ impl KPageTableBase {
             disable_merge_attributes: DisableMergeAttribute::NONE,
         };
         let op_result = self.operate(
+            None,
             addr,
             num_pages,
             0,
@@ -1956,6 +2011,7 @@ impl KPageTableBase {
                 disable_merge_attributes: DisableMergeAttribute::NONE,
             };
             let op_result = self.operate(
+                None,
                 addr,
                 num_pages,
                 0,
@@ -2033,6 +2089,7 @@ impl KPageTableBase {
             disable_merge_attributes: DisableMergeAttribute::DISABLE_HEAD_BODY_TAIL,
         };
         let op_result = self.operate(
+            None,
             src,
             num_pages,
             0,
@@ -2060,6 +2117,7 @@ impl KPageTableBase {
                 disable_merge_attributes: DisableMergeAttribute::ENABLE_HEAD_BODY_TAIL,
             };
             let _ = self.operate(
+                None,
                 src,
                 num_pages,
                 0,
@@ -2139,7 +2197,7 @@ impl KPageTableBase {
             uncached: false,
             disable_merge_attributes: DisableMergeAttribute::NONE,
         };
-        let op_result = self.operate(dst, num_pages, 0, false, unmap_props, OperationType::Unmap);
+        let op_result = self.operate(None, dst, num_pages, 0, false, unmap_props, OperationType::Unmap);
         if op_result != 0 {
             return op_result;
         }
@@ -2152,6 +2210,7 @@ impl KPageTableBase {
             disable_merge_attributes: DisableMergeAttribute::ENABLE_AND_MERGE_HEAD_BODY_TAIL,
         };
         let op_result = self.operate(
+            None,
             src,
             num_pages,
             0,
@@ -2215,7 +2274,7 @@ impl KPageTableBase {
             (lock_attr.bits() & attr.bits()) == 0,
             "lock_attr ∩ attr must be empty"
         );
-        let _updater = KScopedPageTableUpdater::new();
+        let _updater = KScopedPageTableUpdater::from_mut(self);
         let num_pages = size / PAGE_SIZE;
         if !self.contains_range(addr, size) {
             return svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value();
@@ -2300,6 +2359,7 @@ impl KPageTableBase {
                 disable_merge_attributes: DisableMergeAttribute::DISABLE_HEAD_BODY_TAIL,
             };
             let op_result = self.operate(
+                None,
                 addr,
                 num_pages,
                 0,
@@ -2395,6 +2455,7 @@ impl KPageTableBase {
                 disable_merge_attributes: DisableMergeAttribute::ENABLE_AND_MERGE_HEAD_BODY_TAIL,
             };
             let op_result = self.operate(
+                None,
                 addr,
                 num_pages,
                 0,
@@ -2489,6 +2550,7 @@ impl KPageTableBase {
             disable_merge_attributes: DisableMergeAttribute::DISABLE_HEAD,
         };
         let op_result = self.operate(
+            None,
             addr,
             num_pages,
             phys_addr,
@@ -2542,6 +2604,7 @@ impl KPageTableBase {
             disable_merge_attributes: DisableMergeAttribute::DISABLE_HEAD,
         };
         let op_result = self.operate(
+            None,
             addr,
             num_pages,
             phys_addr,
@@ -2649,6 +2712,7 @@ impl KPageTableBase {
                 disable_merge_attributes: DisableMergeAttribute::DISABLE_HEAD,
             };
             let op_result = self.operate(
+                None,
                 addr,
                 num_pages,
                 phys_addr,
@@ -2698,6 +2762,7 @@ impl KPageTableBase {
                 disable_merge_attributes: DisableMergeAttribute::DISABLE_HEAD,
             };
             let op_result = self.operate(
+                None,
                 addr,
                 num_pages,
                 phys_addr,
@@ -2735,7 +2800,7 @@ impl KPageTableBase {
         state: KMemoryState,
         perm: KMemoryPermission,
     ) -> u32 {
-        let _updater = KScopedPageTableUpdater::new();
+        let _updater = KScopedPageTableUpdater::from_mut(self);
         let size = num_pages * PAGE_SIZE;
         if !self.can_contain_k(addr, size, state) {
             return svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value();
@@ -2808,6 +2873,7 @@ impl KPageTableBase {
             disable_merge_attributes: DisableMergeAttribute::NONE,
         };
         let op_result = self.operate_with_group(
+            None,
             addr,
             num_pages,
             pg_guard.pg,
@@ -2863,7 +2929,7 @@ impl KPageTableBase {
             uncached: false,
             disable_merge_attributes: DisableMergeAttribute::NONE,
         };
-        let op_result = self.operate(addr, num_pages, 0, false, unmap_props, OperationType::Unmap);
+        let op_result = self.operate(None, addr, num_pages, 0, false, unmap_props, OperationType::Unmap);
         if op_result != 0 {
             return op_result;
         }
@@ -2947,7 +3013,7 @@ impl KPageTableBase {
             uncached: false,
             disable_merge_attributes: DisableMergeAttribute::NONE,
         };
-        let op_result = self.operate(addr, num_pages, 0, false, properties, operation);
+        let op_result = self.operate(None, addr, num_pages, 0, false, properties, operation);
         if op_result != 0 {
             return op_result;
         }
@@ -2989,7 +3055,7 @@ impl KPageTableBase {
         }
         let last_address = addr + size - 1;
 
-        let _updater = KScopedPageTableUpdater::new();
+        let _updater = KScopedPageTableUpdater::from_mut(self);
 
         loop {
             // === Phase 1: count already-mapped bytes ===
@@ -3133,7 +3199,7 @@ impl KPageTableBase {
                     self.clear_fresh_backing_region_phys(pg_phys, chunk * PAGE_SIZE);
                     // Single-block Map (we're slicing the page group manually
                     // per FREE range; one operate(Map) per slice).
-                    let rc = self.operate(va, chunk, pg_phys, true, cur_props, OperationType::Map);
+                    let rc = self.operate(None, va, chunk, pg_phys, true, cur_props, OperationType::Map);
                     if rc != 0 {
                         // Rollback: unmap whatever we already mapped in this
                         // call. Upstream uses OperationType::UnmapPhysical.
@@ -3209,6 +3275,7 @@ impl KPageTableBase {
         };
         for (va, pages) in free_ranges {
             let _ = self.operate(
+                None,
                 va,
                 pages,
                 0,
@@ -3234,6 +3301,7 @@ impl KPageTableBase {
             disable_merge_attributes: DisableMergeAttribute::NONE,
         };
         let op_result = self.operate(
+            None,
             addr,
             num_pages,
             0,
@@ -3307,7 +3375,7 @@ impl KPageTableBase {
     /// Map code memory: copies src pages to dst, reprotects src as KernelRead|NotMapped.
     /// Matches upstream `KPageTableBase::MapCodeMemory`.
     pub fn map_code_memory(&mut self, dst: usize, src: usize, size: usize) -> u32 {
-        let _updater = KScopedPageTableUpdater::new();
+        let _updater = KScopedPageTableUpdater::from_mut(self);
         let num_pages = size / PAGE_SIZE;
 
         if !self.can_contain(dst, size, SvcMemoryState::AliasCode) {
@@ -3357,6 +3425,7 @@ impl KPageTableBase {
             disable_merge_attributes: DisableMergeAttribute::DISABLE_HEAD_BODY_TAIL,
         };
         let op = self.operate(
+            None,
             src,
             num_pages,
             0,
@@ -3399,6 +3468,7 @@ impl KPageTableBase {
         let map_rc = self.map_page_group_impl(dst, &pg, dst_props);
         if map_rc != 0 {
             let _ = self.operate(
+                None,
                 src,
                 num_pages,
                 0,
@@ -3462,7 +3532,7 @@ impl KPageTableBase {
             uncached: false,
             disable_merge_attributes: DisableMergeAttribute::NONE,
         };
-        let op = self.operate(dst, num_pages, 0, false, unmap_props, OperationType::Unmap);
+        let op = self.operate(None, dst, num_pages, 0, false, unmap_props, OperationType::Unmap);
         if op != 0 {
             return op;
         }
@@ -3475,6 +3545,7 @@ impl KPageTableBase {
             disable_merge_attributes: DisableMergeAttribute::ENABLE_AND_MERGE_HEAD_BODY_TAIL,
         };
         let op = self.operate(
+            None,
             src,
             num_pages,
             0,
@@ -3518,7 +3589,7 @@ impl KPageTableBase {
         // against the kernel-wide insecure resource limit, and maps the
         // resulting page group with Operate(MapGroup).
         use super::k_scoped_resource_reservation::KScopedResourceReservation;
-        let _updater = KScopedPageTableUpdater::new();
+        let _updater = KScopedPageTableUpdater::from_mut(self);
         let num_pages = size / PAGE_SIZE;
 
         // Get the insecure memory resource limit and pool from KSystemControl.
@@ -3604,6 +3675,7 @@ impl KPageTableBase {
             disable_merge_attributes: DisableMergeAttribute::DISABLE_HEAD,
         };
         let op = self.operate_with_group(
+            None,
             addr,
             num_pages,
             pg_guard.pg,
@@ -3659,7 +3731,7 @@ impl KPageTableBase {
             uncached: false,
             disable_merge_attributes: DisableMergeAttribute::NONE,
         };
-        let op = self.operate(addr, num_pages, 0, false, unmap_props, OperationType::Unmap);
+        let op = self.operate(None, addr, num_pages, 0, false, unmap_props, OperationType::Unmap);
         if op != 0 {
             return op;
         }
@@ -3896,6 +3968,7 @@ impl KPageTableBase {
                 disable_merge_attributes: DisableMergeAttribute::NONE,
             };
             let rc = self.operate(
+                None,
                 current,
                 chunk_size / PAGE_SIZE,
                 0,
@@ -4188,6 +4261,7 @@ impl KPageTableBase {
                 return svc_results::RESULT_OUT_OF_MEMORY.get_inner_value();
             }
             let rc = self.operate(
+                None,
                 cur_mapped_addr,
                 1,
                 partial_phys,
@@ -4254,6 +4328,7 @@ impl KPageTableBase {
                             disable_merge_attributes: DisableMergeAttribute::NONE,
                         };
                         let _ = self.operate(
+                            None,
                             dst_addr,
                             mapped_pages,
                             0,
@@ -4274,6 +4349,7 @@ impl KPageTableBase {
                 }
             };
             let rc = self.operate(
+                None,
                 cur_mapped_addr,
                 1,
                 phys_addr,
@@ -4290,6 +4366,7 @@ impl KPageTableBase {
                         disable_merge_attributes: DisableMergeAttribute::NONE,
                     };
                     let _ = self.operate(
+                        None,
                         dst_addr,
                         mapped_pages,
                         0,
@@ -4335,6 +4412,7 @@ impl KPageTableBase {
                         disable_merge_attributes: DisableMergeAttribute::NONE,
                     };
                     let _ = self.operate(
+                        None,
                         dst_addr,
                         mapped_pages,
                         0,
@@ -4354,6 +4432,7 @@ impl KPageTableBase {
                 return svc_results::RESULT_OUT_OF_MEMORY.get_inner_value();
             }
             let rc = self.operate(
+                None,
                 cur_mapped_addr,
                 1,
                 partial_phys,
@@ -4370,6 +4449,7 @@ impl KPageTableBase {
                         disable_merge_attributes: DisableMergeAttribute::NONE,
                     };
                     let _ = self.operate(
+                        None,
                         dst_addr,
                         mapped_pages,
                         0,
@@ -4470,6 +4550,7 @@ impl KPageTableBase {
                 disable_merge_attributes: DisableMergeAttribute::NONE,
             };
             let rc = self.operate(
+                None,
                 aligned_start,
                 aligned_size / PAGE_SIZE,
                 0,
@@ -4663,6 +4744,7 @@ impl KPageTableBase {
                     };
 
                     let _ = self.operate(
+                        None,
                         cur_start,
                         (cur_end - cur_start) / PAGE_SIZE,
                         0,
@@ -4848,7 +4930,7 @@ impl KPageTableBase {
             uncached: true,
             disable_merge_attributes: DisableMergeAttribute::DISABLE_HEAD,
         };
-        let op = self.operate(dst, num_pages, phys_addr, true, props, OperationType::Map);
+        let op = self.operate(None, dst, num_pages, phys_addr, true, props, OperationType::Map);
         if op != 0 {
             return op;
         }
@@ -4892,7 +4974,7 @@ impl KPageTableBase {
             uncached: false,
             disable_merge_attributes: DisableMergeAttribute::NONE,
         };
-        let op = self.operate(dst, num_pages, 0, false, unmap_props, OperationType::Unmap);
+        let op = self.operate(None, dst, num_pages, 0, false, unmap_props, OperationType::Unmap);
         if op != 0 {
             return op;
         }
@@ -4942,6 +5024,7 @@ impl KPageTableBase {
             };
 
             let result = self.operate(
+                None,
                 cur_address,
                 block.get_num_pages(),
                 block.get_address(),
@@ -4959,6 +5042,7 @@ impl KPageTableBase {
                         disable_merge_attributes: DisableMergeAttribute::NONE,
                     };
                     let _ = self.operate(
+                        None,
                         start_address,
                         (cur_address - start_address) / PAGE_SIZE,
                         0,
@@ -5125,6 +5209,7 @@ impl KPageTableBase {
             disable_merge_attributes: DisableMergeAttribute::NONE,
         };
         let result = self.operate(
+            None,
             address,
             num_pages,
             0,
@@ -5188,6 +5273,7 @@ mod tests {
         page_table.m_memory_block_manager.initialize(
             page_table.m_address_space_start,
             page_table.m_address_space_end,
+            None,
         );
 
         page_table.m_memory_block_manager.update(
@@ -5231,6 +5317,7 @@ mod tests {
         page_table.m_memory_block_manager.initialize(
             page_table.m_address_space_start,
             page_table.m_address_space_end,
+            None,
         );
         page_table.m_memory_block_manager.update(
             0x1000_8000,
@@ -5262,6 +5349,7 @@ mod tests {
         page_table.m_memory_block_manager.initialize(
             page_table.m_address_space_start,
             page_table.m_address_space_end,
+            None,
         );
         page_table.m_memory_block_manager.update(
             0x1000_8000,
@@ -5293,6 +5381,7 @@ mod tests {
         page_table.m_memory_block_manager.initialize(
             page_table.m_address_space_start,
             page_table.m_address_space_end,
+            None,
         );
         page_table.m_memory_block_manager.update(
             0x1000_0000,

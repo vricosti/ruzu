@@ -909,7 +909,6 @@ impl System {
         // correctly when allocation is requested.
         {
             use crate::device_memory::dram_memory_map;
-            use crate::hle::kernel::k_memory_manager::Pool;
             const SECURE_POOL_OFFSET: u64 = 0xF000_0000;
             const SECURE_POOL_SIZE: usize = 256 * 1024 * 1024;
             const APPLET_POOL_OFFSET: u64 = 0xE000_0000;
@@ -917,22 +916,42 @@ impl System {
             const APPLICATION_POOL_OFFSET: u64 = 0x0400_0000;
             const APPLICATION_POOL_SIZE: usize = 0xE000_0000_usize - 0x0400_0000_usize;
 
-            let mm = kernel.memory_manager_mut();
-            mm.initialize_pool(
-                Pool::SECURE,
-                dram_memory_map::BASE + SECURE_POOL_OFFSET,
-                SECURE_POOL_SIZE,
+            // Populate the kernel-wide physical memory layout, then drive
+            // KMemoryManager init off the resulting region tree. Upstream:
+            //
+            //   for (auto& it : Kernel().MemoryLayout().GetPhysicalMemoryRegionTree()) {
+            //       if (it.IsDerivedFrom(KMemoryRegionType_DramUserPool)) {
+            //           m_managers[it.GetAttributes()].Initialize(...);
+            //       }
+            //   }
+            //
+            // ruzu's `populate_default_dram_user_pools` seeds the tree
+            // from the same pool offsets/sizes that were previously
+            // hardcoded as direct `initialize_pool` calls; the manager
+            // then walks the tree via `initialize_from_layout`.
+            kernel.initialize_memory_layout(
+                (
+                    dram_memory_map::BASE + APPLICATION_POOL_OFFSET,
+                    APPLICATION_POOL_SIZE,
+                ),
+                (
+                    dram_memory_map::BASE + APPLET_POOL_OFFSET,
+                    APPLET_POOL_SIZE,
+                ),
+                (
+                    dram_memory_map::BASE + SECURE_POOL_OFFSET,
+                    SECURE_POOL_SIZE,
+                ),
             );
-            mm.initialize_pool(
-                Pool::Applet,
-                dram_memory_map::BASE + APPLET_POOL_OFFSET,
-                APPLET_POOL_SIZE,
-            );
-            mm.initialize_pool(
-                Pool::Application,
-                dram_memory_map::BASE + APPLICATION_POOL_OFFSET,
-                APPLICATION_POOL_SIZE,
-            );
+            let layout_arc = kernel
+                .get_memory_layout()
+                .expect("memory layout just initialized");
+            {
+                let layout = layout_arc.lock().unwrap();
+                kernel
+                    .memory_manager_mut()
+                    .initialize_from_layout(&*layout);
+            }
 
             // Initialize the kernel-wide system resource limit. Upstream:
             // `KernelCore::Impl::InitializeSystemResourceLimit` (kernel.cpp:214).

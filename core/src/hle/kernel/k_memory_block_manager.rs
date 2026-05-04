@@ -20,10 +20,15 @@ use std::collections::BTreeMap;
 
 /// Port of Kernel::KMemoryBlockManager.
 ///
-/// Uses a BTreeMap<usize, KMemoryBlock> keyed by block address
-/// to match the upstream intrusive red-black tree.
+/// Uses a `BTreeMap<usize, Box<KMemoryBlock>>` keyed by block address
+/// to match the upstream intrusive red-black tree. The `Box<KMemoryBlock>`
+/// values are slab-allocated by `KMemoryBlockSlabManager` (or freshly
+/// `Box::new`d when no slab is provided), so coalescing in
+/// `update_with_allocator` returns the **original** handle directly to
+/// the allocator instead of wrapping a by-value `KMemoryBlock` in a
+/// fresh `Box` (the prior workaround). This keeps slab accounting honest.
 pub struct KMemoryBlockManager {
-    memory_block_tree: BTreeMap<usize, KMemoryBlock>,
+    memory_block_tree: BTreeMap<usize, Box<KMemoryBlock>>,
     m_start_address: usize,
     m_end_address: usize,
 }
@@ -37,19 +42,39 @@ impl KMemoryBlockManager {
         }
     }
 
-    /// Initialize the block manager with start/end addresses.
-    /// Creates a single Free block spanning the entire range.
+    /// Initialize the block manager with start/end addresses, drawing
+    /// the initial sentinel block from the slab manager.
     ///
-    /// Upstream: KMemoryBlockManager::Initialize(start, end, slab_manager).
-    /// We skip the slab manager — blocks are heap-allocated directly.
-    pub fn initialize(&mut self, st: usize, nd: usize) -> Result<(), ()> {
+    /// Upstream: `KMemoryBlockManager::Initialize(start, end, slab_manager)`
+    /// (k_memory_block_manager.cpp). The slab manager hands out the
+    /// first `KMemoryBlock` so the block manager's storage is owned by
+    /// the slab from the start; ruzu's `slab_manager` parameter is
+    /// optional to support legacy callers that still allocate inline,
+    /// but the kernel-init path always provides one (via
+    /// `KernelCore::initialize_memory_block_slab_manager`).
+    pub fn initialize(
+        &mut self,
+        st: usize,
+        nd: usize,
+        slab_manager: Option<
+            &super::k_dynamic_resource_manager::KMemoryBlockSlabManager,
+        >,
+    ) -> Result<(), ()> {
         self.m_start_address = st;
         self.m_end_address = nd;
         debug_assert!(st % PAGE_SIZE == 0);
         debug_assert!(nd % PAGE_SIZE == 0);
         debug_assert!(st < nd);
 
-        let mut start_block = KMemoryBlock::new();
+        // Draw the sentinel from the slab when one is provided. Upstream
+        // does this so the slab is the single source of truth for all
+        // KMemoryBlock storage in the manager.
+        let mut start_block: Box<KMemoryBlock> = match slab_manager
+            .and_then(|sm| sm.allocate())
+        {
+            Some(b) => b,
+            None => Box::new(KMemoryBlock::new()),
+        };
         start_block.initialize(
             st,
             (nd - st) / PAGE_SIZE,
@@ -95,7 +120,7 @@ impl KMemoryBlockManager {
             }
             found
         };
-        key.and_then(move |k| self.memory_block_tree.get_mut(&k))
+        key.and_then(move |k| self.memory_block_tree.get_mut(&k).map(|b| &mut **b))
     }
 
     /// Update blocks in the range [address, address + num_pages * PAGE_SIZE) to
@@ -387,7 +412,7 @@ impl KMemoryBlockManager {
     }
 
     pub fn iter(&self) -> impl Iterator<Item = &KMemoryBlock> {
-        self.memory_block_tree.values()
+        self.memory_block_tree.values().map(|b| &**b)
     }
 
     /// Find an iterator starting at the block containing `address`.
@@ -403,7 +428,7 @@ impl KMemoryBlockManager {
             .map(|(&k, _)| k)
             .unwrap_or(address);
 
-        self.memory_block_tree.range(start_key..).map(|(_, b)| b)
+        self.memory_block_tree.range(start_key..).map(|(_, b)| &**b)
     }
 
     pub fn block_count(&self) -> usize {
@@ -414,7 +439,8 @@ impl KMemoryBlockManager {
     ///
     /// Upstream: KMemoryBlockManager::CheckState.
     pub fn check_state(&self) -> bool {
-        let blocks: Vec<&KMemoryBlock> = self.memory_block_tree.values().collect();
+        let blocks: Vec<&KMemoryBlock> =
+            self.memory_block_tree.values().map(|b| &**b).collect();
         if blocks.is_empty() {
             return true;
         }
@@ -531,7 +557,7 @@ impl KMemoryBlockManager {
             // left_block covers [original_start, address)
             // block now covers [address, original_end)
             self.memory_block_tree
-                .insert(left_block.get_address(), *left_block);
+                .insert(left_block.get_address(), left_block);
             self.memory_block_tree.insert(block.get_address(), block);
         }
     }
@@ -588,14 +614,16 @@ impl KMemoryBlockManager {
             };
 
             if can_merge {
+                // `next_block: Box<KMemoryBlock>` — the slab handle we
+                // originally received from `allocate()`. Returning it
+                // to the allocator preserves slab accounting (was: a
+                // freshly Box::new'd wrapper, which leaked one slab
+                // entry's worth of accounting per coalesce).
                 let next_block = self.memory_block_tree.remove(&next_key).unwrap();
                 let cur_block = self.memory_block_tree.get_mut(&current_key).unwrap();
                 cur_block.add(&next_block);
-                // Return the coalesced node to the allocator. Upstream's
-                // allocator either fills its pre-reservation slots or
-                // releases to the slab if both slots are already occupied.
                 if let Some(a) = allocator.as_deref_mut() {
-                    a.free(Box::new(next_block));
+                    a.free(next_block);
                 }
             } else {
                 current_key = next_key;
@@ -704,7 +732,7 @@ mod tests {
     #[test]
     fn test_initialize_creates_single_free_block() {
         let mut mgr = KMemoryBlockManager::new();
-        mgr.initialize(0x200000, 0x400000).unwrap();
+        mgr.initialize(0x200000, 0x400000, None).unwrap();
         assert_eq!(mgr.block_count(), 1);
         assert!(mgr.check_state());
 
@@ -717,7 +745,7 @@ mod tests {
     #[test]
     fn test_update_splits_and_changes_state() {
         let mut mgr = KMemoryBlockManager::new();
-        mgr.initialize(0x200000, 0x400000).unwrap();
+        mgr.initialize(0x200000, 0x400000, None).unwrap();
 
         // Mark pages [0x210000, 0x220000) as Code/RX.
         mgr.update(
@@ -750,7 +778,7 @@ mod tests {
     #[test]
     fn test_update_at_start_boundary() {
         let mut mgr = KMemoryBlockManager::new();
-        mgr.initialize(0x200000, 0x400000).unwrap();
+        mgr.initialize(0x200000, 0x400000, None).unwrap();
 
         mgr.update(
             0x200000,
@@ -770,7 +798,7 @@ mod tests {
     #[test]
     fn test_adjacent_same_state_coalesces() {
         let mut mgr = KMemoryBlockManager::new();
-        mgr.initialize(0x200000, 0x400000).unwrap();
+        mgr.initialize(0x200000, 0x400000, None).unwrap();
 
         // Mark [200000, 210000) as Code.
         mgr.update(
@@ -805,7 +833,7 @@ mod tests {
     #[test]
     fn test_coalesce_for_update_merges_past_first_right_neighbor() {
         let mut mgr = KMemoryBlockManager::new();
-        mgr.initialize(0x40000000, 0x4000).unwrap();
+        mgr.initialize(0x40000000, 0x4000, None).unwrap();
 
         mgr.split_at(0x40001000);
         mgr.split_at(0x40002000);
@@ -831,7 +859,7 @@ mod tests {
     #[test]
     fn test_query_info() {
         let mut mgr = KMemoryBlockManager::new();
-        mgr.initialize(0x200000, 0x400000).unwrap();
+        mgr.initialize(0x200000, 0x400000, None).unwrap();
 
         mgr.update(
             0x210000,
@@ -856,7 +884,7 @@ mod tests {
     fn test_multiple_segments() {
         let mut mgr = KMemoryBlockManager::new();
         // Simulating the memory layout of loaded NSOs.
-        mgr.initialize(0x0, 0x1_0000_0000).unwrap(); // 4 GiB
+        mgr.initialize(0x0, 0x1_0000_0000, None).unwrap(); // 4 GiB
 
         // rtld text: [200000, 20F000) — RX
         mgr.update(
