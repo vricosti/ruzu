@@ -81,6 +81,20 @@ pub fn get_kernel_ref() -> Option<&'static KernelCore> {
     }
 }
 
+/// Mutable accessor for KERNEL_PTR — used by code paths (e.g. KPageTableBase
+/// allocation paths) that need `&mut KernelCore` to call `memory_manager_mut()`.
+/// The kernel pointer is set once at startup and never reassigned, so the
+/// returned reference is valid for the duration of the program.
+#[allow(clippy::mut_from_ref)]
+pub fn get_kernel_mut() -> Option<&'static mut KernelCore> {
+    let ptr = KERNEL_PTR.load(Ordering::Acquire);
+    if ptr.is_null() {
+        None
+    } else {
+        Some(unsafe { &mut *ptr })
+    }
+}
+
 /// Returns the kernel's global `KAbstractSchedulerLock`, if the kernel has
 /// been initialized. Matches upstream `KScheduler::GetSchedulerLock(kernel)`.
 ///
