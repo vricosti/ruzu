@@ -1912,9 +1912,23 @@ impl KPageTableBase {
         let old_perm = out_old_perm.unwrap_or(KMemoryPermission::NONE);
         let old_attr = out_old_attr.unwrap_or(KMemoryAttribute::NONE);
 
-        // Get physical address.
-        // In our emulator: phys_addr = DramMemoryMap::Base + virtual address.
-        *out_paddr = crate::device_memory::dram_memory_map::BASE + addr as u64;
+        // Get physical address from the page table — the mapping for `addr`
+        // was created by an earlier MapPages call (potentially via pool-
+        // allocated phys, no longer DRAM_BASE-relative). Returning the
+        // identity-mapped address here would silently lie to the caller about
+        // where the memory actually lives in host backing.
+        *out_paddr = self
+            .m_impl
+            .as_ref()
+            .and_then(|p| p.get_physical_address(addr as u64))
+            .unwrap_or(0);
+        if *out_paddr == 0 {
+            log::error!(
+                "lock_memory_and_open: no physical mapping for addr={:#x}",
+                addr
+            );
+            return svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value();
+        }
 
         // Determine new perm and attr.
         let effective_new_perm = if new_perm != KMemoryPermission::NONE {
@@ -2588,24 +2602,79 @@ impl KPageTableBase {
             return svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value();
         }
         let num_pages = size / PAGE_SIZE;
-        let phys_addr = crate::device_memory::dram_memory_map::BASE + addr as u64;
 
+        // Allocate physical pages from the kernel memory manager pool, mirror
+        // of set_heap_size's multi-block path: pool fragmentation can prevent
+        // a single contiguous allocation, so fall back through smaller block
+        // sizes when needed and map each block at consecutive VAs. Identity
+        // mapping (DRAM_BASE + addr) would clobber pool-owned phys pages
+        // because the alias region's identity-phys range overlaps the
+        // Application pool — same class as the NRO-zero bug fixed in 0044954.
+        use super::k_page_heap::{
+            KPageHeap, MEMORY_BLOCK_PAGE_SHIFTS, NUM_MEMORY_BLOCK_PAGE_SHIFTS,
+        };
+        let alloc_option = self.m_allocate_option;
         let properties = KPageProperties {
             perm: KMemoryPermission::USER_READ_WRITE,
             io: false,
             uncached: false,
             disable_merge_attributes: DisableMergeAttribute::DISABLE_HEAD,
         };
-        let op_result = self.operate(
-            addr,
-            num_pages,
-            phys_addr,
-            true,
-            properties,
-            OperationType::Map,
-        );
-        if op_result != 0 {
-            return op_result;
+
+        let mut remaining_pages = num_pages;
+        let mut map_va = addr;
+        let mut allocated_blocks: Vec<(u64, usize)> = Vec::new();
+        while remaining_pages > 0 {
+            let mut block_addr: u64 = 0;
+            let mut chosen_pages: usize = 0;
+            for i in (0..NUM_MEMORY_BLOCK_PAGE_SHIFTS).rev() {
+                let block_pages = (1usize << MEMORY_BLOCK_PAGE_SHIFTS[i]) / PAGE_SIZE;
+                if block_pages > remaining_pages {
+                    continue;
+                }
+                let phys = if let Some(kernel) =
+                    crate::hle::kernel::kernel::get_kernel_mut()
+                {
+                    let mm = kernel.memory_manager_mut();
+                    let heap_index = KPageHeap::get_aligned_block_index(block_pages, 1);
+                    if heap_index < 0 {
+                        0
+                    } else {
+                        mm.allocate_and_open_continuous(block_pages, 1, alloc_option)
+                    }
+                } else {
+                    0
+                };
+                if phys != 0 {
+                    block_addr = phys;
+                    chosen_pages = block_pages;
+                    break;
+                }
+            }
+            if block_addr == 0 {
+                if let Some(kernel) = crate::hle::kernel::kernel::get_kernel_mut() {
+                    let mm = kernel.memory_manager_mut();
+                    for (a, np) in &allocated_blocks {
+                        mm.close(*a, *np);
+                    }
+                }
+                return svc_results::RESULT_OUT_OF_MEMORY.get_inner_value();
+            }
+            allocated_blocks.push((block_addr, chosen_pages));
+
+            let op_result = self.operate(
+                map_va,
+                chosen_pages,
+                block_addr,
+                true,
+                properties,
+                OperationType::Map,
+            );
+            if op_result != 0 {
+                return op_result;
+            }
+            map_va += chosen_pages * PAGE_SIZE;
+            remaining_pages -= chosen_pages;
         }
 
         self.m_memory_block_manager.update(
@@ -2768,38 +2837,81 @@ impl KPageTableBase {
             return op;
         }
 
-        // Map dst using same physical pages.
-        let phys_addr = crate::device_memory::dram_memory_map::BASE + src as u64;
+        // Map dst using the same physical pages as src. Look each page up
+        // through the page table since src's phys is no longer guaranteed to
+        // be DRAM_BASE-relative (set_heap_size / map_physical_memory now use
+        // pool allocation), and may not be contiguous across the range.
+        // Walk page-by-page, coalescing contiguous runs into a single
+        // operate(Map) call to minimize page-table churn.
         let dst_props = KPageProperties {
             perm: new_perm,
             io: false,
             uncached: false,
             disable_merge_attributes: DisableMergeAttribute::DISABLE_HEAD,
         };
-        let op = self.operate(
-            dst,
-            num_pages,
-            phys_addr,
-            true,
-            dst_props,
-            OperationType::Map,
-        );
-        if op != 0 {
-            let revert = KPageProperties {
-                perm: KMemoryPermission::USER_READ_WRITE,
-                io: false,
-                uncached: false,
-                disable_merge_attributes: DisableMergeAttribute::ENABLE_HEAD_BODY_TAIL,
+        let revert = KPageProperties {
+            perm: KMemoryPermission::USER_READ_WRITE,
+            io: false,
+            uncached: false,
+            disable_merge_attributes: DisableMergeAttribute::ENABLE_HEAD_BODY_TAIL,
+        };
+        let mut mapped_pages = 0usize;
+        while mapped_pages < num_pages {
+            let src_page = (src + mapped_pages * PAGE_SIZE) as u64;
+            let dst_page = dst + mapped_pages * PAGE_SIZE;
+            let phys_start = match self
+                .m_impl
+                .as_ref()
+                .and_then(|p| p.get_physical_address(src_page))
+            {
+                Some(p) => p,
+                None => {
+                    let _ = self.operate(
+                        src,
+                        num_pages,
+                        0,
+                        false,
+                        revert,
+                        OperationType::ChangePermissions,
+                    );
+                    return svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value();
+                }
             };
-            let _ = self.operate(
-                src,
-                num_pages,
-                0,
-                false,
-                revert,
-                OperationType::ChangePermissions,
+            // Coalesce contiguous run.
+            let mut run_pages = 1usize;
+            while mapped_pages + run_pages < num_pages {
+                let next_src = src_page + (run_pages * PAGE_SIZE) as u64;
+                let next_phys = self
+                    .m_impl
+                    .as_ref()
+                    .and_then(|p| p.get_physical_address(next_src));
+                match next_phys {
+                    Some(p) if p == phys_start + (run_pages * PAGE_SIZE) as u64 => {
+                        run_pages += 1;
+                    }
+                    _ => break,
+                }
+            }
+            let op = self.operate(
+                dst_page,
+                run_pages,
+                phys_start,
+                true,
+                dst_props,
+                OperationType::Map,
             );
-            return op;
+            if op != 0 {
+                let _ = self.operate(
+                    src,
+                    num_pages,
+                    0,
+                    false,
+                    revert,
+                    OperationType::ChangePermissions,
+                );
+                return op;
+            }
+            mapped_pages += run_pages;
         }
 
         // Update blocks.
@@ -2924,16 +3036,74 @@ impl KPageTableBase {
             return result;
         }
 
-        let phys_addr = crate::device_memory::dram_memory_map::BASE + addr as u64;
+        // Pool-allocate physical pages (multi-block fallback identical to
+        // set_heap_size / map_physical_memory). Identity-mapping
+        // (DRAM_BASE + addr) would clash with pool-owned pages.
+        use super::k_page_heap::{
+            KPageHeap, MEMORY_BLOCK_PAGE_SHIFTS, NUM_MEMORY_BLOCK_PAGE_SHIFTS,
+        };
+        let alloc_option = self.m_allocate_option;
         let props = KPageProperties {
             perm: KMemoryPermission::USER_READ_WRITE,
             io: false,
             uncached: false,
             disable_merge_attributes: DisableMergeAttribute::DISABLE_HEAD,
         };
-        let op = self.operate(addr, num_pages, phys_addr, true, props, OperationType::Map);
-        if op != 0 {
-            return op;
+
+        let mut remaining_pages = num_pages;
+        let mut map_va = addr;
+        let mut allocated_blocks: Vec<(u64, usize)> = Vec::new();
+        while remaining_pages > 0 {
+            let mut block_addr: u64 = 0;
+            let mut chosen_pages: usize = 0;
+            for i in (0..NUM_MEMORY_BLOCK_PAGE_SHIFTS).rev() {
+                let block_pages = (1usize << MEMORY_BLOCK_PAGE_SHIFTS[i]) / PAGE_SIZE;
+                if block_pages > remaining_pages {
+                    continue;
+                }
+                let phys = if let Some(kernel) =
+                    crate::hle::kernel::kernel::get_kernel_mut()
+                {
+                    let mm = kernel.memory_manager_mut();
+                    let heap_index = KPageHeap::get_aligned_block_index(block_pages, 1);
+                    if heap_index < 0 {
+                        0
+                    } else {
+                        mm.allocate_and_open_continuous(block_pages, 1, alloc_option)
+                    }
+                } else {
+                    0
+                };
+                if phys != 0 {
+                    block_addr = phys;
+                    chosen_pages = block_pages;
+                    break;
+                }
+            }
+            if block_addr == 0 {
+                if let Some(kernel) = crate::hle::kernel::kernel::get_kernel_mut() {
+                    let mm = kernel.memory_manager_mut();
+                    for (a, np) in &allocated_blocks {
+                        mm.close(*a, *np);
+                    }
+                }
+                return svc_results::RESULT_OUT_OF_MEMORY.get_inner_value();
+            }
+            allocated_blocks.push((block_addr, chosen_pages));
+
+            let op = self.operate(
+                map_va,
+                chosen_pages,
+                block_addr,
+                true,
+                props,
+                OperationType::Map,
+            );
+            if op != 0 {
+                return op;
+            }
+            map_va += chosen_pages * PAGE_SIZE;
+            remaining_pages -= chosen_pages;
         }
 
         self.clear_fresh_backing_region(addr, size);
@@ -3062,8 +3232,15 @@ impl KPageTableBase {
             return None;
         }
 
-        // Physical address = DramMemoryMap::Base + virtual address.
-        let phys_addr = crate::device_memory::dram_memory_map::BASE + addr as u64;
+        // Look the physical address up via the page table — with pool-
+        // allocated mappings, identity-mapping (DRAM_BASE + addr) no longer
+        // describes the actual phys for arbitrary VAs. Callers expect the
+        // contiguous run starting at `addr`; we trust check_memory_state_range
+        // already verified the VA range is uniformly mapped.
+        let phys_addr = self
+            .m_impl
+            .as_ref()
+            .and_then(|p| p.get_physical_address(addr as u64))?;
         let is_heap = state == KMemoryState::NORMAL;
         Some((phys_addr, size, is_heap))
     }
@@ -3475,7 +3652,30 @@ impl KPageTableBase {
         let mut cur_mapped_addr = dst_addr;
 
         if aligned_src_start < mapping_src_start {
-            let partial_phys = crate::device_memory::dram_memory_map::BASE + cur_mapped_addr as u64;
+            // Allocate a fresh page from the pool for the partial-head buffer.
+            // Identity mapping (DRAM_BASE + cur_mapped_addr) would silently
+            // alias pool-owned pages — use pool allocation so this transit
+            // page is its own physical backing.
+            let partial_phys = if let Some(kernel) =
+                crate::hle::kernel::kernel::get_kernel_mut()
+            {
+                kernel
+                    .memory_manager_mut()
+                    .allocate_and_open_continuous(1, 1, self.m_allocate_option)
+            } else {
+                0
+            };
+            if partial_phys == 0 {
+                if unmapped_size > 0 {
+                    if let Some(resource_limit) = &self.m_resource_limit {
+                        resource_limit.lock().unwrap().release(
+                            LimitableResource::PhysicalMemoryMax,
+                            unmapped_size as i64,
+                        );
+                    }
+                }
+                return svc_results::RESULT_OUT_OF_MEMORY.get_inner_value();
+            }
             let rc = self.operate(
                 cur_mapped_addr,
                 1,
@@ -3523,11 +3723,45 @@ impl KPageTableBase {
         }
 
         for src_page in (mapping_src_start..mapping_src_end).step_by(PAGE_SIZE) {
-            let phys_addr = src_table
+            // Strictly look up the source page's phys via the page table. The
+            // earlier identity-mapping fallback (DRAM_BASE + src_page) was
+            // wrong for any pool-allocated mapping — it would map the IPC
+            // server's view to garbage host memory rather than the client's
+            // actual buffer.
+            let phys_addr = match src_table
                 .m_impl
                 .as_ref()
                 .and_then(|impl_pt| impl_pt.get_physical_address(src_page as u64))
-                .unwrap_or(crate::device_memory::dram_memory_map::BASE + src_page as u64);
+            {
+                Some(p) => p,
+                None => {
+                    if mapped_pages > 0 {
+                        let unmap_props = KPageProperties {
+                            perm: KMemoryPermission::NONE,
+                            io: false,
+                            uncached: false,
+                            disable_merge_attributes: DisableMergeAttribute::NONE,
+                        };
+                        let _ = self.operate(
+                            dst_addr,
+                            mapped_pages,
+                            0,
+                            false,
+                            unmap_props,
+                            OperationType::Unmap,
+                        );
+                    }
+                    if unmapped_size > 0 {
+                        if let Some(resource_limit) = &self.m_resource_limit {
+                            resource_limit.lock().unwrap().release(
+                                LimitableResource::PhysicalMemoryMax,
+                                unmapped_size as i64,
+                            );
+                        }
+                    }
+                    return svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value();
+                }
+            };
             let rc = self.operate(
                 cur_mapped_addr,
                 1,
@@ -3570,7 +3804,44 @@ impl KPageTableBase {
         if mapping_src_end < aligned_src_end
             && (aligned_src_start < mapping_src_end || aligned_src_start == mapping_src_start)
         {
-            let partial_phys = crate::device_memory::dram_memory_map::BASE + cur_mapped_addr as u64;
+            // Allocate fresh phys for the partial-tail buffer (parallel to the
+            // partial-head allocation above).
+            let partial_phys = if let Some(kernel) =
+                crate::hle::kernel::kernel::get_kernel_mut()
+            {
+                kernel
+                    .memory_manager_mut()
+                    .allocate_and_open_continuous(1, 1, self.m_allocate_option)
+            } else {
+                0
+            };
+            if partial_phys == 0 {
+                if mapped_pages > 0 {
+                    let unmap_props = KPageProperties {
+                        perm: KMemoryPermission::NONE,
+                        io: false,
+                        uncached: false,
+                        disable_merge_attributes: DisableMergeAttribute::NONE,
+                    };
+                    let _ = self.operate(
+                        dst_addr,
+                        mapped_pages,
+                        0,
+                        false,
+                        unmap_props,
+                        OperationType::Unmap,
+                    );
+                }
+                if unmapped_size > 0 {
+                    if let Some(resource_limit) = &self.m_resource_limit {
+                        resource_limit.lock().unwrap().release(
+                            LimitableResource::PhysicalMemoryMax,
+                            unmapped_size as i64,
+                        );
+                    }
+                }
+                return svc_results::RESULT_OUT_OF_MEMORY.get_inner_value();
+            }
             let rc = self.operate(
                 cur_mapped_addr,
                 1,
