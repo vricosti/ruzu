@@ -953,6 +953,13 @@ impl System {
             // up to 2), so ruzu uses a 4096 capacity which leaves plenty
             // of headroom.
             kernel.initialize_memory_block_slab_manager(4096);
+
+            // Initialize the kernel-wide page-table-page allocator.
+            // Upstream sizes this from `KernelPageTableHeapSize` (kernel.cpp:1067).
+            // ruzu's flat page table doesn't actually consume from this
+            // slab, so the capacity is conservative — 256 page-sized
+            // entries is far above the dormant usage.
+            kernel.initialize_page_table_manager(256);
         }
 
         // Provide CoreTiming to the kernel so guest thread functions can access it.

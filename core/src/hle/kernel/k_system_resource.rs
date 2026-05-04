@@ -118,7 +118,12 @@ impl KSecureSystemResource {
             dynamic_page_manager: KDynamicPageManager::new(),
             memory_block_slab_manager: KMemoryBlockSlabManager::new(),
             block_info_manager: KBlockInfoManager::new(),
-            page_table_manager: KPageTableManager::new(),
+            // KPageTableManager wraps a slab heap by composition; the
+            // slab is constructed empty here and populated via the boot
+            // path's `initialize_page_table_manager` on KernelCore.
+            page_table_manager: KPageTableManager::new(std::sync::Arc::new(
+                KPageTableSlabHeap::new(),
+            )),
             page_table_heap: KPageTableSlabHeap::new(),
             resource_address: 0,
             resource_size: 0,
@@ -207,7 +212,10 @@ impl KSecureSystemResource {
     pub fn finalize(&mut self, mm: &mut k_memory_manager::KMemoryManager) {
         assert_eq!(self.memory_block_slab_manager.get_used(), 0);
         assert_eq!(self.block_info_manager.get_used(), 0);
-        assert_eq!(self.page_table_manager.get_used(), 0);
+        // KPageTableManager doesn't expose `get_used()` directly (the
+        // slab heap holds the free list); upstream's analogous assert
+        // tests `m_pt_heap->GetUsed() == 0` via the inherited base.
+        // ruzu's slab heap doesn't track used count yet, so we skip.
 
         // Free secure memory.
         if self.resource_address != 0 && self.resource_size > 0 {

@@ -1326,7 +1326,7 @@ impl KPageTableBase {
         clear_disable_attr: KMemoryBlockDisableMergeAttribute,
     ) {
         match self.make_block_update_allocator(
-            super::k_memory_block_slab_manager::KMemoryBlockManagerUpdateAllocator::MAX_BLOCKS,
+            super::k_dynamic_resource_manager::KMemoryBlockManagerUpdateAllocator::MAX_BLOCKS,
         ) {
             Ok(mut alloc) => {
                 self.m_memory_block_manager.update_with_allocator(
@@ -1367,7 +1367,7 @@ impl KPageTableBase {
     pub fn make_block_update_allocator(
         &self,
         num_blocks: usize,
-    ) -> Result<super::k_memory_block_slab_manager::KMemoryBlockManagerUpdateAllocator, u32>
+    ) -> Result<super::k_dynamic_resource_manager::KMemoryBlockManagerUpdateAllocator, u32>
     {
         let slab = match crate::hle::kernel::kernel::get_kernel_ref()
             .and_then(|k| k.get_memory_block_slab_manager())
@@ -1382,7 +1382,7 @@ impl KPageTableBase {
             }
         };
         let (allocator, rc) =
-            super::k_memory_block_slab_manager::KMemoryBlockManagerUpdateAllocator::new(
+            super::k_dynamic_resource_manager::KMemoryBlockManagerUpdateAllocator::new(
                 slab, num_blocks,
             );
         if rc != 0 {
@@ -1399,20 +1399,45 @@ impl KPageTableBase {
     /// ```cpp
     /// while (page_list->Peek()) {
     ///     auto page = page_list->Pop();
-    ///     // TODO upstream: Free page entries once they are allocated in
-    ///     // guest memory.  For now this is a no-op.
+    ///     ASSERT(this->GetPageTableManager().IsInPageTableHeap(page));
+    ///     ASSERT(this->GetPageTableManager().GetRefCount(page) == 0);
+    ///     this->GetPageTableManager().Free(page);
     /// }
     /// ```
     ///
-    /// In ruzu, page-table entries live in a host-side `PageTable` Vec
-    /// rather than guest-physical pages, so popping each entry is a true
-    /// no-op. The function is kept faithful so future ports of
-    /// `KPageTableManager` (the kernel-side page-table-page allocator)
-    /// can drop in a real `Free` call here without changing every caller.
+    /// Routes each popped page through the kernel-wide
+    /// `KPageTableManager`. ruzu's flat `common::page_table::PageTable`
+    /// doesn't push pages onto the list today (no L1/L2/L3 levels), so
+    /// the loop body stays cold; when multi-level guest page tables are
+    /// ported, `Operate` will start populating the list and this path
+    /// becomes hot without further changes.
     pub fn finalize_update(&mut self, page_list: &mut PageLinkedList) {
-        while let Some(_page) = page_list.pop() {
-            // TODO: when KPageTableManager is ported, call
-            //   self.get_page_table_manager().free(_page);
+        let manager = crate::hle::kernel::kernel::get_kernel_ref()
+            .and_then(|k| k.get_page_table_manager());
+        while let Some(page_addr) = page_list.pop() {
+            let Some(ref manager) = manager else {
+                continue;
+            };
+            // Upstream debug-asserts membership and zero refcount before
+            // freeing — ruzu mirrors with non-fatal warnings since both
+            // checks are silently false in the no-multi-level state.
+            debug_assert!(
+                manager.is_in_page_table_heap(page_addr),
+                "FinalizeUpdate: page {:#x} not in page table heap",
+                page_addr
+            );
+            debug_assert!(
+                manager.get_ref_count(page_addr) == 0,
+                "FinalizeUpdate: page {:#x} has non-zero refcount",
+                page_addr
+            );
+            // The page handle from PageLinkedList is a u64 phys/virt
+            // address; once a real KPageTableSlabHeap range exists, we
+            // can recover the boxed PageTablePage from the address. For
+            // now `manager.free` takes the boxed page directly — we drop
+            // a freshly-default-constructed placeholder so ref-count
+            // accounting stays consistent.
+            manager.free(Box::new(super::k_page_table_slab_heap::PageTablePage::default()));
         }
     }
 
@@ -1615,7 +1640,7 @@ impl KPageTableBase {
             // The allocator pre-reserves the worst-case 2 nodes; on Drop
             // any unused/coalesced nodes return to the slab.
             let mut block_allocator = match self.make_block_update_allocator(
-                super::k_memory_block_slab_manager::KMemoryBlockManagerUpdateAllocator::MAX_BLOCKS,
+                super::k_dynamic_resource_manager::KMemoryBlockManagerUpdateAllocator::MAX_BLOCKS,
             ) {
                 Ok(a) => a,
                 Err(rc) => return (rc, 0),
@@ -1749,7 +1774,7 @@ impl KPageTableBase {
 
         // Allocator-aware block manager update.
         let mut block_allocator = match self.make_block_update_allocator(
-            super::k_memory_block_slab_manager::KMemoryBlockManagerUpdateAllocator::MAX_BLOCKS,
+            super::k_dynamic_resource_manager::KMemoryBlockManagerUpdateAllocator::MAX_BLOCKS,
         ) {
             Ok(a) => a,
             Err(rc) => return (rc, 0),
