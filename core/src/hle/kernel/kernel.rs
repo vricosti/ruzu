@@ -1138,6 +1138,22 @@ pub struct KernelCore {
     /// Physical memory manager. Upstream: `Impl::memory_manager`.
     memory_manager: KMemoryManager,
 
+    /// Kernel-wide resource limit. Upstream:
+    /// `KernelCore::Impl::system_resource_limit` set by
+    /// `InitializeSystemResourceLimit` at boot. Holds PhysicalMemoryMax,
+    /// ThreadCountMax, EventCountMax, TransferMemoryCountMax, SessionCountMax.
+    /// Used by services like KSystemControl::GetInsecureMemoryResourceLimit.
+    system_resource_limit:
+        Option<Arc<Mutex<super::k_resource_limit::KResourceLimit>>>,
+
+    /// Kernel-wide slab manager for KMemoryBlock nodes used by
+    /// `KMemoryBlockManagerUpdateAllocator`. Upstream:
+    /// `KernelCore::Impl::application_memory_block_manager` /
+    /// `system_memory_block_manager`. ruzu uses a single slab for all
+    /// processes since application/system distinction isn't enforced yet.
+    memory_block_slab_manager:
+        Option<Arc<Mutex<super::k_memory_block_slab_manager::KMemoryBlockSlabManager>>>,
+
     // -- Core timing --
     /// Reference to the system's CoreTiming.
     /// Upstream: accessed via `system.CoreTiming()` through `System& system` reference.
@@ -1213,6 +1229,8 @@ impl KernelCore {
             registered_in_use_objects: Mutex::new(Vec::new()),
 
             memory_manager: KMemoryManager::new(),
+            system_resource_limit: None,
+            memory_block_slab_manager: None,
             next_host_thread_id: AtomicU32::new(hardware_properties::NUM_CPU_CORES),
             single_core_thread_id: AtomicU32::new(0),
             core_timing: None,
@@ -2111,6 +2129,65 @@ impl KernelCore {
     /// Get the memory manager (mutable).
     pub fn memory_manager_mut(&mut self) -> &mut KMemoryManager {
         &mut self.memory_manager
+    }
+
+    /// Get the kernel-wide resource limit. Upstream:
+    /// `KernelCore::GetSystemResourceLimit()`.
+    pub fn get_system_resource_limit(
+        &self,
+    ) -> Option<Arc<Mutex<super::k_resource_limit::KResourceLimit>>> {
+        self.system_resource_limit.clone()
+    }
+
+    /// Get the kernel-wide KMemoryBlock slab manager. Upstream stores this
+    /// alongside the application/system memory block managers; ruzu uses
+    /// one shared slab.
+    pub fn get_memory_block_slab_manager(
+        &self,
+    ) -> Option<Arc<Mutex<super::k_memory_block_slab_manager::KMemoryBlockSlabManager>>> {
+        self.memory_block_slab_manager.clone()
+    }
+
+    /// Initialize the kernel-wide KMemoryBlock slab. Upstream creates
+    /// separate application / system slabs sized from
+    /// `KernelApplicationMemoryBlockSlabHeapSize` and
+    /// `KernelSystemMemoryBlockSlabHeapSize` in kernel.cpp:1070-71. ruzu
+    /// uses a single slab; capacity covers worst-case concurrent block
+    /// updates (~64 entries is far above the two-per-update upper bound
+    /// for any practical guest workload).
+    pub fn initialize_memory_block_slab_manager(&mut self, capacity: usize) {
+        self.memory_block_slab_manager = Some(Arc::new(Mutex::new(
+            super::k_memory_block_slab_manager::KMemoryBlockSlabManager::new(capacity),
+        )));
+    }
+
+    /// Initialize the kernel-wide resource limit. Upstream:
+    /// `KernelCore::Impl::InitializeSystemResourceLimit` (kernel.cpp:214):
+    ///
+    /// ```cpp
+    /// system_resource_limit = KResourceLimit::Create(...);
+    /// system_resource_limit->Initialize();
+    /// SetLimitValue(PhysicalMemoryMax, total_size);
+    /// SetLimitValue(ThreadCountMax, 800);
+    /// SetLimitValue(EventCountMax, 900);
+    /// SetLimitValue(TransferMemoryCountMax, 200);
+    /// SetLimitValue(SessionCountMax, 1133);
+    /// Reserve(PhysicalMemoryMax, kernel_size);
+    /// Reserve(PhysicalMemoryMax, secure_applet_memory_size /* 4 MiB */);
+    /// ```
+    pub fn initialize_system_resource_limit(&mut self, total_size: i64, kernel_size: i64) {
+        use super::k_resource_limit::{KResourceLimit, LimitableResource};
+        let mut rl = KResourceLimit::new();
+        let _ = rl.set_limit_value(LimitableResource::PhysicalMemoryMax, total_size);
+        let _ = rl.set_limit_value(LimitableResource::ThreadCountMax, 800);
+        let _ = rl.set_limit_value(LimitableResource::EventCountMax, 900);
+        let _ = rl.set_limit_value(LimitableResource::TransferMemoryCountMax, 200);
+        let _ = rl.set_limit_value(LimitableResource::SessionCountMax, 1133);
+        let _ = rl.reserve(LimitableResource::PhysicalMemoryMax, kernel_size);
+        // Reserve secure applet memory introduced in firmware 5.0.0.
+        let secure_applet_memory_size: i64 = 4 * 1024 * 1024;
+        let _ = rl.reserve(LimitableResource::PhysicalMemoryMax, secure_applet_memory_size);
+        self.system_resource_limit = Some(Arc::new(Mutex::new(rl)));
     }
 
     /// Initialize shutdown threads (one per core).

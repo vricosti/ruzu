@@ -116,16 +116,48 @@ impl KMemoryBlockManager {
         set_disable_attr: KMemoryBlockDisableMergeAttribute,
         clear_disable_attr: KMemoryBlockDisableMergeAttribute,
     ) {
+        // Backwards-compat wrapper that allocates split-block nodes from
+        // Rust's heap directly (no slab pressure tracking). New callers
+        // should use `update_with_allocator` so failed pre-reservation can
+        // be propagated up the call stack as `ResultOutOfResource`.
+        self.update_with_allocator(
+            None,
+            address,
+            num_pages,
+            state,
+            perm,
+            attr,
+            set_disable_attr,
+            clear_disable_attr,
+        );
+    }
+
+    /// Allocator-aware variant of `update`. Mirrors the upstream signature
+    /// `KMemoryBlockManager::Update(KMemoryBlockManagerUpdateAllocator*,
+    /// addr, num_pages, state, perm, attr, set_disable, clear_disable)`.
+    pub fn update_with_allocator(
+        &mut self,
+        mut allocator: Option<
+            &mut super::k_memory_block_slab_manager::KMemoryBlockManagerUpdateAllocator,
+        >,
+        address: usize,
+        num_pages: usize,
+        state: KMemoryState,
+        perm: KMemoryPermission,
+        attr: KMemoryAttribute,
+        set_disable_attr: KMemoryBlockDisableMergeAttribute,
+        clear_disable_attr: KMemoryBlockDisableMergeAttribute,
+    ) {
         let update_end = address + num_pages * PAGE_SIZE;
         debug_assert!(address % PAGE_SIZE == 0);
         debug_assert!(num_pages > 0);
         debug_assert!(update_end <= self.m_end_address);
 
         // Phase 1: Split block at start boundary if needed.
-        self.split_at(address);
+        self.split_at_with_allocator(address, allocator.as_deref_mut());
 
         // Phase 2: Split block at end boundary if needed.
-        self.split_at(update_end);
+        self.split_at_with_allocator(update_end, allocator.as_deref_mut());
 
         // Phase 3: Update all blocks in the range.
         let set_disable = !set_disable_attr.is_empty();
@@ -149,7 +181,11 @@ impl KMemoryBlockManager {
         }
 
         // Phase 4: Coalesce adjacent blocks that have become compatible.
-        self.coalesce_for_update(address, num_pages);
+        // Coalesced (removed) nodes return to the allocator's free pool so
+        // they don't leak into the slab unowned. Upstream: the allocator's
+        // destructor frees both pre-reserved slots back to the slab if
+        // they weren't consumed; coalesced blocks go back via Free.
+        self.coalesce_for_update_with_allocator(address, num_pages, allocator);
     }
 
     /// Update blocks in the range only if they match the test properties.
@@ -445,6 +481,21 @@ impl KMemoryBlockManager {
     /// split into two: [block_start, address) and [address, block_end).
     /// If `address` is already a block boundary, this is a no-op.
     fn split_at(&mut self, address: usize) {
+        self.split_at_with_allocator(address, None);
+    }
+
+    /// Split-block helper that draws the new block from a
+    /// `KMemoryBlockManagerUpdateAllocator` when one is provided.
+    ///
+    /// Upstream: `KMemoryBlockManager::Update` calls
+    /// `allocator->Allocate()` for each split, allowing the per-update
+    /// allocator's pre-reservation to absorb both potential splits without
+    /// hitting the slab again mid-walk.
+    fn split_at_with_allocator(
+        &mut self,
+        address: usize,
+        allocator: Option<&mut super::k_memory_block_slab_manager::KMemoryBlockManagerUpdateAllocator>,
+    ) {
         if address == self.m_start_address || address == self.m_end_address {
             return;
         }
@@ -468,13 +519,95 @@ impl KMemoryBlockManager {
         if let Some(key) = containing_key {
             // Remove the block, split it, and reinsert both halves.
             let mut block = self.memory_block_tree.remove(&key).unwrap();
-            let mut left_block = KMemoryBlock::new();
+            // Draw the left-half node from the per-update allocator if
+            // available — this matches upstream's
+            // `KMemoryBlock* new_block = allocator->Allocate();` pattern
+            // and consumes one of the pre-reserved slab slots.
+            let mut left_block: Box<KMemoryBlock> = match allocator {
+                Some(a) => a.allocate(),
+                None => Box::new(KMemoryBlock::new()),
+            };
             block.split(&mut left_block, address);
             // left_block covers [original_start, address)
             // block now covers [address, original_end)
             self.memory_block_tree
-                .insert(left_block.get_address(), left_block);
+                .insert(left_block.get_address(), *left_block);
             self.memory_block_tree.insert(block.get_address(), block);
+        }
+    }
+
+    /// Allocator-aware variant of `coalesce_for_update`. Coalesced
+    /// (removed) nodes are returned to the per-update allocator so they
+    /// can be reused or freed back to the slab on Drop.
+    fn coalesce_for_update_with_allocator(
+        &mut self,
+        address: usize,
+        num_pages: usize,
+        mut allocator: Option<
+            &mut super::k_memory_block_slab_manager::KMemoryBlockManagerUpdateAllocator,
+        >,
+    ) {
+        if self.memory_block_tree.is_empty() {
+            return;
+        }
+
+        let update_end = address + num_pages * PAGE_SIZE;
+
+        let mut current_key = self
+            .memory_block_tree
+            .range(..=address)
+            .rev()
+            .find(|(_, block)| block.get_address() <= address && address < block.get_end_address())
+            .map(|(&key, _)| key)
+            .unwrap_or(address);
+
+        if address != self.m_start_address {
+            if let Some((&prev_key, _)) = self.memory_block_tree.range(..current_key).next_back() {
+                current_key = prev_key;
+            }
+        }
+
+        loop {
+            let next_key = match self
+                .memory_block_tree
+                .range((
+                    std::ops::Bound::Excluded(current_key),
+                    std::ops::Bound::Unbounded,
+                ))
+                .next()
+                .map(|(&key, _)| key)
+            {
+                Some(key) => key,
+                None => break,
+            };
+
+            let can_merge = {
+                let cur = self.memory_block_tree.get(&current_key);
+                let next = self.memory_block_tree.get(&next_key);
+                matches!((cur, next), (Some(c), Some(n)) if c.can_merge_with(n))
+            };
+
+            if can_merge {
+                let next_block = self.memory_block_tree.remove(&next_key).unwrap();
+                let cur_block = self.memory_block_tree.get_mut(&current_key).unwrap();
+                cur_block.add(&next_block);
+                // Return the coalesced node to the allocator. Upstream's
+                // allocator either fills its pre-reservation slots or
+                // releases to the slab if both slots are already occupied.
+                if let Some(a) = allocator.as_deref_mut() {
+                    a.free(Box::new(next_block));
+                }
+            } else {
+                current_key = next_key;
+            }
+
+            let current_end = match self.memory_block_tree.get(&current_key) {
+                Some(block) => block.get_end_address(),
+                None => break,
+            };
+            if update_end < current_end {
+                break;
+            }
         }
     }
 

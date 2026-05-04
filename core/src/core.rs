@@ -840,7 +840,7 @@ impl System {
         let system_ref = SystemRef::from_ref(self);
         self.core_timing.initialize(move || {
             // Upstream: core_timing.Initialize([&system]() { system.RegisterHostThread(); });
-            system_ref.get().kernel().unwrap().register_host_thread();
+            system_ref.get().register_host_thread();
         });
 
         // Ensure VFS exists. Upstream does this in Initialize().
@@ -892,21 +892,67 @@ impl System {
         kernel.initialize();
         kernel.set_system_ref(system_ref);
 
-        // Initialize the kernel physical memory manager with a Secure pool.
-        // Upstream traverses the memory layout tree; we reserve a region at
-        // the top of DeviceMemory DRAM to avoid collision with guest
-        // identity-mapped regions (which use low addresses).
+        // Initialize the kernel physical memory manager pools.
+        // Upstream traverses the memory layout tree; we statically partition
+        // the 4 GiB DRAM into:
+        //
+        //   [0x8000_0000 .. 0x8400_0000)  — kernel-reserved low DRAM (code,
+        //                                   slab heap, identity mappings).
+        //   [0x8400_0000 .. 0xE000_0000)  — Application pool (~2.94 GiB) for
+        //                                   user processes' stacks, heaps, etc.
+        //   [0xE000_0000 .. 0xF000_0000)  — Applet pool (256 MiB) for applets.
+        //   [0xF000_0000 .. 0x1_0000_0000) — Secure pool (256 MiB) for shared
+        //                                    memory and kernel-private allocs.
+        //
+        // Order matters: the pool with the LARGEST start address must be
+        // initialized first so KMemoryManager's pool head linkage walks
+        // correctly when allocation is requested.
         {
             use crate::device_memory::dram_memory_map;
             use crate::hle::kernel::k_memory_manager::Pool;
-            const SECURE_POOL_OFFSET: u64 = 0xF000_0000; // 3.75 GiB into DRAM
-            const SECURE_POOL_SIZE: usize = 256 * 1024 * 1024; // 256 MiB
-            let secure_pool_base = dram_memory_map::BASE + SECURE_POOL_OFFSET;
-            kernel.memory_manager_mut().initialize_pool(
+            const SECURE_POOL_OFFSET: u64 = 0xF000_0000;
+            const SECURE_POOL_SIZE: usize = 256 * 1024 * 1024;
+            const APPLET_POOL_OFFSET: u64 = 0xE000_0000;
+            const APPLET_POOL_SIZE: usize = 256 * 1024 * 1024;
+            const APPLICATION_POOL_OFFSET: u64 = 0x0400_0000;
+            const APPLICATION_POOL_SIZE: usize = 0xE000_0000_usize - 0x0400_0000_usize;
+
+            let mm = kernel.memory_manager_mut();
+            mm.initialize_pool(
                 Pool::SECURE,
-                secure_pool_base,
+                dram_memory_map::BASE + SECURE_POOL_OFFSET,
                 SECURE_POOL_SIZE,
             );
+            mm.initialize_pool(
+                Pool::Applet,
+                dram_memory_map::BASE + APPLET_POOL_OFFSET,
+                APPLET_POOL_SIZE,
+            );
+            mm.initialize_pool(
+                Pool::Application,
+                dram_memory_map::BASE + APPLICATION_POOL_OFFSET,
+                APPLICATION_POOL_SIZE,
+            );
+
+            // Initialize the kernel-wide system resource limit. Upstream:
+            // `KernelCore::Impl::InitializeSystemResourceLimit` (kernel.cpp:214).
+            // total_size = sum of all pool sizes; kernel_size is the kernel's
+            // own reserved region (the [DRAM_BASE..APPLICATION_POOL_OFFSET)
+            // span between 0x80000000 and 0x84000000 = 64 MiB).
+            let total_size = (SECURE_POOL_SIZE
+                + APPLET_POOL_SIZE
+                + APPLICATION_POOL_SIZE) as i64;
+            let kernel_size = APPLICATION_POOL_OFFSET as i64;
+            kernel.initialize_system_resource_limit(total_size, kernel_size);
+
+            // Initialize the kernel-wide KMemoryBlock slab. Upstream sizes
+            // this from `KernelApplicationMemoryBlockSlabHeapSize` and
+            // `KernelSystemMemoryBlockSlabHeapSize` (kernel.cpp:1070-71)
+            // — typically several thousand entries. STK only needs a
+            // handful at peak (each MapPages/SetHeapSize update consumes
+            // up to 2), so ruzu uses a 4096 capacity which leaves plenty
+            // of headroom.
+            kernel.initialize_memory_block_slab_manager(4096);
         }
 
         // Provide CoreTiming to the kernel so guest thread functions can access it.
@@ -1756,7 +1802,7 @@ impl System {
     }
 
     /// Register a host thread as an auxiliary thread.
-    pub fn register_host_thread(&mut self) {
+    pub fn register_host_thread(&self) {
         if let Some(kernel) = self.kernel.as_ref() {
             kernel.register_host_thread();
         }

@@ -122,17 +122,13 @@ pub mod init {
 /// Get the kernel-wide resource limit used for insecure memory accounting.
 ///
 /// Port of upstream `KSystemControl::GetInsecureMemoryResourceLimit(KernelCore&)`
-/// (board/nintendo/nx/k_system_control.cpp:246), which returns
-/// `kernel.GetSystemResourceLimit()`. ruzu does not currently host a
-/// kernel-wide system resource limit (no `KernelCore::GetSystemResourceLimit`
-/// port yet); returning `None` mirrors the upstream call site shape so
-/// callers can branch on availability and skip the reservation when the
-/// kernel-wide limit isn't wired up.
+/// (board/nintendo/nx/k_system_control.cpp:246):
+/// `return kernel.GetSystemResourceLimit();`
 pub fn get_insecure_memory_resource_limit(
-    _kernel: &crate::hle::kernel::kernel::KernelCore,
+    kernel: &crate::hle::kernel::kernel::KernelCore,
 ) -> Option<std::sync::Arc<std::sync::Mutex<crate::hle::kernel::k_resource_limit::KResourceLimit>>>
 {
-    None
+    kernel.get_system_resource_limit()
 }
 
 /// Generate a random u64.

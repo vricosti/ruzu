@@ -94,6 +94,91 @@ pub enum OperationType {
 }
 
 // ---------------------------------------------------------------------------
+// PageLinkedList
+// ---------------------------------------------------------------------------
+
+/// Stack of page-table pages awaiting deferred free at end of an update.
+///
+/// Port of upstream `KPageTableBase::PageLinkedList` (k_page_table_base.h:116).
+/// Upstream stores intrusive `Node*` pointers (each Node is a 4 KB page);
+/// ruzu stores raw physical addresses since ruzu's page table doesn't yet
+/// have a kernel-side page-table-page allocator. `FinalizeUpdate` pops the
+/// list and (in upstream) calls `m_page_table_manager.Free(page)` — for
+/// ruzu the pop is a no-op because page-table entries live in a Rust Vec,
+/// not in guest physical pages.
+#[derive(Default, Debug)]
+pub struct PageLinkedList {
+    pages: Vec<u64>,
+}
+
+impl PageLinkedList {
+    pub const fn new() -> Self {
+        Self { pages: Vec::new() }
+    }
+    pub fn push(&mut self, page: u64) {
+        debug_assert_eq!(page & (PAGE_SIZE as u64 - 1), 0);
+        self.pages.push(page);
+    }
+    pub fn peek(&self) -> Option<u64> {
+        self.pages.last().copied()
+    }
+    pub fn pop(&mut self) -> Option<u64> {
+        self.pages.pop()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.pages.is_empty()
+    }
+}
+
+/// RAII helper that holds a `PageLinkedList` for the duration of a page-table
+/// update and (in upstream) frees it on destruction by calling
+/// `m_pt->FinalizeUpdate(this->GetPageList())`.
+///
+/// Port of upstream `KPageTableBase::KScopedPageTableUpdater`
+/// (k_page_table_base.h:170). Rust's borrow checker forbids holding
+/// `&mut KPageTableBase` here while callers call methods on the same
+/// `KPageTableBase`, so the destructor is a no-op and callers must invoke
+/// `pt.finalize_update(updater.page_list())` at the end of scope themselves
+/// — `Drop` warns if the list is still non-empty when the helper goes out
+/// of scope. For ruzu the underlying free is a no-op (no
+/// `KPageTableManager`-allocated guest pages yet), so missing the call has
+/// no functional impact today, but the warning preserves upstream's
+/// "scoped finalize" contract for when the manager is ported.
+#[derive(Default, Debug)]
+pub struct KScopedPageTableUpdater {
+    page_list: PageLinkedList,
+}
+
+impl KScopedPageTableUpdater {
+    pub fn new() -> Self {
+        Self {
+            page_list: PageLinkedList::new(),
+        }
+    }
+    /// Borrow the page list, matching upstream's `GetPageList()` accessor.
+    pub fn page_list(&mut self) -> &mut PageLinkedList {
+        &mut self.page_list
+    }
+    /// Acknowledge the list is finalized so Drop won't warn. Equivalent to
+    /// upstream's `FinalizeUpdate(GetPageList())` consuming the list.
+    pub fn finalized(&mut self) {
+        self.page_list.pages.clear();
+    }
+}
+
+impl Drop for KScopedPageTableUpdater {
+    fn drop(&mut self) {
+        if !self.page_list.is_empty() {
+            log::warn!(
+                "KScopedPageTableUpdater: dropped with {} entries still pending — \
+                 caller forgot pt.finalize_update(updater.page_list())",
+                self.page_list.pages.len()
+            );
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
 
@@ -1225,6 +1310,112 @@ impl KPageTableBase {
         0
     }
 
+    /// Allocator-aware shorthand for `m_memory_block_manager.update(...)`.
+    /// Constructs a `KMemoryBlockManagerUpdateAllocator` inline (matching
+    /// upstream's stack-local `KMemoryBlockManagerUpdateAllocator allocator`
+    /// pattern), drives the update, and drops the allocator so unused/
+    /// coalesced nodes return to the slab.
+    pub fn update_blocks(
+        &mut self,
+        address: usize,
+        num_pages: usize,
+        state: KMemoryState,
+        perm: KMemoryPermission,
+        attr: KMemoryAttribute,
+        set_disable_attr: KMemoryBlockDisableMergeAttribute,
+        clear_disable_attr: KMemoryBlockDisableMergeAttribute,
+    ) {
+        match self.make_block_update_allocator(
+            super::k_memory_block_slab_manager::KMemoryBlockManagerUpdateAllocator::MAX_BLOCKS,
+        ) {
+            Ok(mut alloc) => {
+                self.m_memory_block_manager.update_with_allocator(
+                    Some(&mut alloc),
+                    address,
+                    num_pages,
+                    state,
+                    perm,
+                    attr,
+                    set_disable_attr,
+                    clear_disable_attr,
+                );
+            }
+            Err(_) => {
+                // Slab not initialized yet (very early boot). Fall back to
+                // the heap-allocated path so existing call sites don't fail.
+                self.m_memory_block_manager.update(
+                    address,
+                    num_pages,
+                    state,
+                    perm,
+                    attr,
+                    set_disable_attr,
+                    clear_disable_attr,
+                );
+            }
+        }
+    }
+
+    /// Construct a `KMemoryBlockManagerUpdateAllocator` pre-reserving
+    /// `num_blocks` slab nodes. Returns the allocator on success or a
+    /// `RESULT_OUT_OF_RESOURCE` code if the kernel-wide slab can't satisfy
+    /// the request — matching upstream's behavior where the same
+    /// allocator constructor signals failure via `out_result`.
+    ///
+    /// Defaults to `MAX_BLOCKS` (= 2 in upstream) so each update can absorb
+    /// the worst-case two splits.
+    pub fn make_block_update_allocator(
+        &self,
+        num_blocks: usize,
+    ) -> Result<super::k_memory_block_slab_manager::KMemoryBlockManagerUpdateAllocator, u32>
+    {
+        let slab = match crate::hle::kernel::kernel::get_kernel_ref()
+            .and_then(|k| k.get_memory_block_slab_manager())
+        {
+            Some(s) => s,
+            None => {
+                log::error!(
+                    "make_block_update_allocator: no kernel-wide block slab \
+                     manager — initialize_memory_block_slab_manager not called?"
+                );
+                return Err(svc_results::RESULT_OUT_OF_RESOURCE.get_inner_value());
+            }
+        };
+        let (allocator, rc) =
+            super::k_memory_block_slab_manager::KMemoryBlockManagerUpdateAllocator::new(
+                slab, num_blocks,
+            );
+        if rc != 0 {
+            return Err(rc);
+        }
+        Ok(allocator)
+    }
+
+    /// Drain the deferred-free list at the end of a page-table update.
+    ///
+    /// Port of upstream `KPageTableBase::FinalizeUpdate`
+    /// (k_page_table_base.cpp:5787):
+    ///
+    /// ```cpp
+    /// while (page_list->Peek()) {
+    ///     auto page = page_list->Pop();
+    ///     // TODO upstream: Free page entries once they are allocated in
+    ///     // guest memory.  For now this is a no-op.
+    /// }
+    /// ```
+    ///
+    /// In ruzu, page-table entries live in a host-side `PageTable` Vec
+    /// rather than guest-physical pages, so popping each entry is a true
+    /// no-op. The function is kept faithful so future ports of
+    /// `KPageTableManager` (the kernel-side page-table-page allocator)
+    /// can drop in a real `Free` call here without changing every caller.
+    pub fn finalize_update(&mut self, page_list: &mut PageLinkedList) {
+        while let Some(_page) = page_list.pop() {
+            // TODO: when KPageTableManager is ported, call
+            //   self.get_page_table_manager().free(_page);
+        }
+    }
+
     // -- FindFreeArea --
 
     /// Find a free area in the given region.
@@ -1362,6 +1553,14 @@ impl KPageTableBase {
             return (svc_results::RESULT_OUT_OF_MEMORY.get_inner_value(), 0);
         }
 
+        // RAII scope for the page-table updater. Upstream:
+        //   KScopedPageTableUpdater updater(this);
+        //   ... this->Operate(updater.GetPageList(), ...);
+        // ruzu's Operate doesn't push to the list yet (no KPageTableManager
+        // port), so the list stays empty — Drop won't fire FinalizeUpdate
+        // until the manager lands.
+        let _updater = KScopedPageTableUpdater::new();
+
         let current_heap_size = self.m_current_heap_end - self.m_heap_region_start;
 
         if size < current_heap_size {
@@ -1410,8 +1609,20 @@ impl KPageTableBase {
                     .release(LimitableResource::PhysicalMemoryMax, free_size as i64);
             }
 
+            // Allocator-aware block manager update. Upstream:
+            //   KMemoryBlockManagerUpdateAllocator allocator(...);
+            //   m_memory_block_manager.Update(&allocator, ...);
+            // The allocator pre-reserves the worst-case 2 nodes; on Drop
+            // any unused/coalesced nodes return to the slab.
+            let mut block_allocator = match self.make_block_update_allocator(
+                super::k_memory_block_slab_manager::KMemoryBlockManagerUpdateAllocator::MAX_BLOCKS,
+            ) {
+                Ok(a) => a,
+                Err(rc) => return (rc, 0),
+            };
             // Update block manager: freed region becomes Free.
-            self.m_memory_block_manager.update(
+            self.m_memory_block_manager.update_with_allocator(
+                Some(&mut block_allocator),
                 free_start,
                 num_pages,
                 KMemoryState::FREE,
@@ -1536,8 +1747,15 @@ impl KPageTableBase {
         // Commit the resource reservation.
         memory_reservation.commit();
 
-        // Apply the memory block update.
-        self.m_memory_block_manager.update(
+        // Allocator-aware block manager update.
+        let mut block_allocator = match self.make_block_update_allocator(
+            super::k_memory_block_slab_manager::KMemoryBlockManagerUpdateAllocator::MAX_BLOCKS,
+        ) {
+            Ok(a) => a,
+            Err(rc) => return (rc, 0),
+        };
+        self.m_memory_block_manager.update_with_allocator(
+            Some(&mut block_allocator),
             cur_address,
             num_pages,
             KMemoryState::NORMAL,
@@ -1644,7 +1862,7 @@ impl KPageTableBase {
         }
 
         // Update block manager.
-        self.m_memory_block_manager.update(
+        self.update_blocks(
             addr,
             num_pages,
             old_state,
@@ -1828,7 +2046,7 @@ impl KPageTableBase {
         }
 
         // Update source block.
-        self.m_memory_block_manager.update(
+        self.update_blocks(
             src,
             num_pages,
             src_state,
@@ -1838,7 +2056,7 @@ impl KPageTableBase {
             KMemoryBlockDisableMergeAttribute::NONE,
         );
         // Update destination block.
-        self.m_memory_block_manager.update(
+        self.update_blocks(
             dst,
             num_pages,
             KMemoryState::STACK,
@@ -1921,7 +2139,7 @@ impl KPageTableBase {
         }
 
         // Update blocks.
-        self.m_memory_block_manager.update(
+        self.update_blocks(
             src,
             num_pages,
             src_state,
@@ -1930,7 +2148,7 @@ impl KPageTableBase {
             KMemoryBlockDisableMergeAttribute::NONE,
             KMemoryBlockDisableMergeAttribute::LOCKED,
         );
-        self.m_memory_block_manager.update(
+        self.update_blocks(
             dst,
             num_pages,
             KMemoryState::FREE,
@@ -1972,6 +2190,7 @@ impl KPageTableBase {
             (lock_attr.bits() & attr.bits()) == 0,
             "lock_attr ∩ attr must be empty"
         );
+        let _updater = KScopedPageTableUpdater::new();
         let num_pages = size / PAGE_SIZE;
         if !self.contains_range(addr, size) {
             return svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value();
@@ -2069,7 +2288,7 @@ impl KPageTableBase {
         }
 
         // Update block manager.
-        self.m_memory_block_manager.update(
+        self.update_blocks(
             addr,
             num_pages,
             old_state,
@@ -2164,7 +2383,7 @@ impl KPageTableBase {
         }
 
         // Update block manager.
-        self.m_memory_block_manager.update(
+        self.update_blocks(
             addr,
             num_pages,
             old_state,
@@ -2257,7 +2476,7 @@ impl KPageTableBase {
         }
 
         // Update block manager.
-        self.m_memory_block_manager.update(
+        self.update_blocks(
             addr,
             num_pages,
             KMemoryState::STATIC,
@@ -2310,7 +2529,7 @@ impl KPageTableBase {
         }
 
         // Update block manager.
-        self.m_memory_block_manager.update(
+        self.update_blocks(
             addr,
             num_pages,
             KMemoryState::IO_REGISTER,
@@ -2469,7 +2688,7 @@ impl KPageTableBase {
         }
 
         // Update blocks.
-        self.m_memory_block_manager.update(
+        self.update_blocks(
             addr,
             num_pages,
             state,
@@ -2491,6 +2710,7 @@ impl KPageTableBase {
         state: KMemoryState,
         perm: KMemoryPermission,
     ) -> u32 {
+        let _updater = KScopedPageTableUpdater::new();
         let size = num_pages * PAGE_SIZE;
         if !self.can_contain_k(addr, size, state) {
             return svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value();
@@ -2575,7 +2795,7 @@ impl KPageTableBase {
 
         // Update blocks (upstream uses KMemoryBlockManagerUpdateAllocator;
         // ruzu's update path doesn't preallocate slab nodes — see TODO).
-        self.m_memory_block_manager.update(
+        self.update_blocks(
             addr,
             num_pages,
             state,
@@ -2624,7 +2844,7 @@ impl KPageTableBase {
         }
 
         // Update blocks.
-        self.m_memory_block_manager.update(
+        self.update_blocks(
             addr,
             num_pages,
             KMemoryState::FREE,
@@ -2708,7 +2928,7 @@ impl KPageTableBase {
         }
 
         // Update block manager.
-        self.m_memory_block_manager.update(
+        self.update_blocks(
             addr,
             num_pages,
             new_state,
@@ -2743,6 +2963,8 @@ impl KPageTableBase {
             return svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value();
         }
         let last_address = addr + size - 1;
+
+        let _updater = KScopedPageTableUpdater::new();
 
         loop {
             // === Phase 1: count already-mapped bytes ===
@@ -2913,7 +3135,7 @@ impl KPageTableBase {
 
             // Commit reservation, update block manager, drop pg (close).
             memory_reservation.commit();
-            self.m_memory_block_manager.update(
+            self.update_blocks(
                 addr,
                 size / PAGE_SIZE,
                 KMemoryState::NORMAL,
@@ -2998,7 +3220,7 @@ impl KPageTableBase {
             return op_result;
         }
 
-        self.m_memory_block_manager.update(
+        self.update_blocks(
             addr,
             num_pages,
             KMemoryState::FREE,
@@ -3060,6 +3282,7 @@ impl KPageTableBase {
     /// Map code memory: copies src pages to dst, reprotects src as KernelRead|NotMapped.
     /// Matches upstream `KPageTableBase::MapCodeMemory`.
     pub fn map_code_memory(&mut self, dst: usize, src: usize, size: usize) -> u32 {
+        let _updater = KScopedPageTableUpdater::new();
         let num_pages = size / PAGE_SIZE;
 
         if !self.can_contain(dst, size, SvcMemoryState::AliasCode) {
@@ -3162,7 +3385,7 @@ impl KPageTableBase {
         }
 
         // Update blocks.
-        self.m_memory_block_manager.update(
+        self.update_blocks(
             src,
             num_pages,
             KMemoryState::NORMAL,
@@ -3171,7 +3394,7 @@ impl KPageTableBase {
             KMemoryBlockDisableMergeAttribute::LOCKED,
             KMemoryBlockDisableMergeAttribute::NONE,
         );
-        self.m_memory_block_manager.update(
+        self.update_blocks(
             dst,
             num_pages,
             KMemoryState::ALIAS_CODE,
@@ -3239,7 +3462,7 @@ impl KPageTableBase {
         }
 
         // Update blocks.
-        self.m_memory_block_manager.update(
+        self.update_blocks(
             dst,
             num_pages,
             KMemoryState::NONE,
@@ -3248,7 +3471,7 @@ impl KPageTableBase {
             KMemoryBlockDisableMergeAttribute::NONE,
             KMemoryBlockDisableMergeAttribute::NORMAL,
         );
-        self.m_memory_block_manager.update(
+        self.update_blocks(
             src,
             num_pages,
             KMemoryState::NORMAL,
@@ -3270,6 +3493,7 @@ impl KPageTableBase {
         // against the kernel-wide insecure resource limit, and maps the
         // resulting page group with Operate(MapGroup).
         use super::k_scoped_resource_reservation::KScopedResourceReservation;
+        let _updater = KScopedPageTableUpdater::new();
         let num_pages = size / PAGE_SIZE;
 
         // Get the insecure memory resource limit and pool from KSystemControl.
@@ -3366,7 +3590,7 @@ impl KPageTableBase {
         }
 
         // Apply the memory block update.
-        self.m_memory_block_manager.update(
+        self.update_blocks(
             addr,
             num_pages,
             KMemoryState::INSECURE,
@@ -3415,7 +3639,7 @@ impl KPageTableBase {
             return op;
         }
 
-        self.m_memory_block_manager.update(
+        self.update_blocks(
             addr,
             num_pages,
             KMemoryState::FREE,
@@ -4163,7 +4387,7 @@ impl KPageTableBase {
             }
         }
 
-        self.m_memory_block_manager.update(
+        self.update_blocks(
             dst_addr,
             aligned_src_size / PAGE_SIZE,
             dst_state,
@@ -4232,7 +4456,7 @@ impl KPageTableBase {
                 return rc;
             }
 
-            self.m_memory_block_manager.update(
+            self.update_blocks(
                 aligned_start,
                 aligned_size / PAGE_SIZE,
                 KMemoryState::NONE,
@@ -4604,7 +4828,7 @@ impl KPageTableBase {
             return op;
         }
 
-        self.m_memory_block_manager.update(
+        self.update_blocks(
             dst,
             num_pages,
             KMemoryState::IO_REGISTER,
@@ -4648,7 +4872,7 @@ impl KPageTableBase {
             return op;
         }
 
-        self.m_memory_block_manager.update(
+        self.update_blocks(
             dst,
             num_pages,
             KMemoryState::FREE,
@@ -4823,7 +5047,7 @@ impl KPageTableBase {
         }
 
         // Update the memory block manager to track the new state.
-        self.m_memory_block_manager.update(
+        self.update_blocks(
             addr,
             num_pages,
             state,
@@ -4888,7 +5112,7 @@ impl KPageTableBase {
         }
 
         // Update block manager back to Free.
-        self.m_memory_block_manager.update(
+        self.update_blocks(
             address,
             num_pages,
             KMemoryState::FREE,
