@@ -1152,7 +1152,17 @@ pub struct KernelCore {
     /// `system_memory_block_manager`. ruzu uses a single slab for all
     /// processes since application/system distinction isn't enforced yet.
     memory_block_slab_manager:
-        Option<Arc<Mutex<super::k_memory_block_slab_manager::KMemoryBlockSlabManager>>>,
+        Option<Arc<super::k_dynamic_resource_manager::KMemoryBlockSlabManager>>,
+
+    /// Kernel-wide page-table-page allocator. Upstream:
+    /// `KernelCore::Impl::page_table_manager` initialized from
+    /// `KernelPageTableHeapSize` at boot. Used by `KPageTableBase::Operate`
+    /// to allocate L1/L2/L3 page-table pages and by `FinalizeUpdate` to
+    /// free them. ruzu's flat `common::page_table::PageTable` doesn't
+    /// produce freeable pages today, but the manager is wired so the
+    /// future port of multi-level guest page tables lands cleanly.
+    page_table_manager:
+        Option<Arc<super::k_page_table_manager::KPageTableManager>>,
 
     // -- Core timing --
     /// Reference to the system's CoreTiming.
@@ -1231,6 +1241,7 @@ impl KernelCore {
             memory_manager: KMemoryManager::new(),
             system_resource_limit: None,
             memory_block_slab_manager: None,
+            page_table_manager: None,
             next_host_thread_id: AtomicU32::new(hardware_properties::NUM_CPU_CORES),
             single_core_thread_id: AtomicU32::new(0),
             core_timing: None,
@@ -2144,7 +2155,7 @@ impl KernelCore {
     /// one shared slab.
     pub fn get_memory_block_slab_manager(
         &self,
-    ) -> Option<Arc<Mutex<super::k_memory_block_slab_manager::KMemoryBlockSlabManager>>> {
+    ) -> Option<Arc<super::k_dynamic_resource_manager::KMemoryBlockSlabManager>> {
         self.memory_block_slab_manager.clone()
     }
 
@@ -2153,12 +2164,34 @@ impl KernelCore {
     /// `KernelApplicationMemoryBlockSlabHeapSize` and
     /// `KernelSystemMemoryBlockSlabHeapSize` in kernel.cpp:1070-71. ruzu
     /// uses a single slab; capacity covers worst-case concurrent block
-    /// updates (~64 entries is far above the two-per-update upper bound
+    /// updates (4096 entries is far above the two-per-update upper bound
     /// for any practical guest workload).
     pub fn initialize_memory_block_slab_manager(&mut self, capacity: usize) {
-        self.memory_block_slab_manager = Some(Arc::new(Mutex::new(
-            super::k_memory_block_slab_manager::KMemoryBlockSlabManager::new(capacity),
-        )));
+        let mut slab = super::k_dynamic_resource_manager::KMemoryBlockSlabManager::new();
+        slab.initialize(capacity);
+        self.memory_block_slab_manager = Some(Arc::new(slab));
+    }
+
+    /// Get the kernel-wide page-table-page allocator. Upstream:
+    /// `KernelCore::PageTableManager()` accessor.
+    pub fn get_page_table_manager(
+        &self,
+    ) -> Option<Arc<super::k_page_table_manager::KPageTableManager>> {
+        self.page_table_manager.clone()
+    }
+
+    /// Initialize the kernel-wide page-table-page slab. Upstream sizes
+    /// this from `KernelPageTableHeapSize` (kernel.cpp:1067) — typically
+    /// several thousand page-sized entries. ruzu doesn't currently spend
+    /// any of this allocation pressure (flat page table) so the capacity
+    /// is set conservatively.
+    pub fn initialize_page_table_manager(&mut self, capacity: usize) {
+        let mut slab = super::k_page_table_slab_heap::KPageTableSlabHeap::new();
+        slab.initialize(capacity);
+        let slab = Arc::new(slab);
+        self.page_table_manager = Some(Arc::new(
+            super::k_page_table_manager::KPageTableManager::new(slab),
+        ));
     }
 
     /// Initialize the kernel-wide resource limit. Upstream:

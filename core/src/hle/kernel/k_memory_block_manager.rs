@@ -138,7 +138,7 @@ impl KMemoryBlockManager {
     pub fn update_with_allocator(
         &mut self,
         mut allocator: Option<
-            &mut super::k_memory_block_slab_manager::KMemoryBlockManagerUpdateAllocator,
+            &mut super::k_dynamic_resource_manager::KMemoryBlockManagerUpdateAllocator,
         >,
         address: usize,
         num_pages: usize,
@@ -494,7 +494,7 @@ impl KMemoryBlockManager {
     fn split_at_with_allocator(
         &mut self,
         address: usize,
-        allocator: Option<&mut super::k_memory_block_slab_manager::KMemoryBlockManagerUpdateAllocator>,
+        allocator: Option<&mut super::k_dynamic_resource_manager::KMemoryBlockManagerUpdateAllocator>,
     ) {
         if address == self.m_start_address || address == self.m_end_address {
             return;
@@ -544,7 +544,7 @@ impl KMemoryBlockManager {
         address: usize,
         num_pages: usize,
         mut allocator: Option<
-            &mut super::k_memory_block_slab_manager::KMemoryBlockManagerUpdateAllocator,
+            &mut super::k_dynamic_resource_manager::KMemoryBlockManagerUpdateAllocator,
         >,
     ) {
         if self.memory_block_tree.is_empty() {
