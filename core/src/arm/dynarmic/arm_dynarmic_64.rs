@@ -499,6 +499,26 @@ impl ArmDynarmic64 {
         core_timing: Arc<crate::core_timing::CoreTiming>,
         core_memory: Option<Arc<std::sync::Mutex<Memory>>>,
     ) -> Self {
+        // Fetch fastmem pointer from core_memory BEFORE it gets moved
+        // into the callbacks. Mirrors A32's pattern
+        // (arm_dynarmic_32.rs:2010-2013). The pointer is the base of a
+        // 512 GiB host VM region whose pages mirror guest physical
+        // memory; the JIT emits direct `mov [r13+vaddr]` instructions
+        // against it for fast guest memory access.
+        //
+        // `RUZU_NO_FASTMEM=1` env-var disables fastmem entirely (forces
+        // the slow callback path for all memory accesses) — useful for
+        // debugging fastmem-related issues without rebuilding.
+        let fastmem_pointer: Option<*mut u8> = if std::env::var("RUZU_NO_FASTMEM").is_ok() {
+            log::warn!("ArmDynarmic64: RUZU_NO_FASTMEM set — fastmem disabled");
+            None
+        } else {
+            core_memory
+                .as_ref()
+                .map(|cm| cm.lock().unwrap().fastmem_pointer())
+                .filter(|p| !p.is_null())
+        };
+
         // Create JIT callbacks with shared memory reference
         let svc = Arc::new(AtomicU32::new(0));
         let last_exception_address = Arc::new(AtomicU64::new(0));
@@ -511,6 +531,12 @@ impl ArmDynarmic64 {
             last_exception_address.clone(),
             exclusive_monitor,
             core_index,
+        );
+
+        log::warn!(
+            "ArmDynarmic64: fastmem_pointer={:?} for core {}",
+            fastmem_pointer.map(|p| p as usize),
+            core_index
         );
 
         // Configure JIT
@@ -526,10 +552,33 @@ impl ArmDynarmic64 {
             } else {
                 Some(unsafe { (*exclusive_monitor).get_monitor() as *mut _ })
             },
-            fastmem_pointer: None, // TODO: wire for A64
+            fastmem_pointer,
             define_unpredictable_behaviour: true,
             processor_id: core_index as usize,
             wall_clock_cntpct: uses_wall_clock,
+            // Memory emit options matching upstream zuyu's
+            // `ArmDynarmic64::MakeJit` setup
+            // (zuyu/src/core/arm/dynarmic/arm_dynarmic_64.cpp:225-248).
+            // We default to 39-bit guest AS (Switch's extended user space
+            // and the size of ruzu's `VIRTUAL_RESERVE_SIZE = 1<<39` host
+            // fastmem region) with `silently_mirror_fastmem=false` so
+            // out-of-range accesses fall through to the callback path
+            // rather than aliasing into the fastmem region.
+            memory: rdynarmic::backend::x64::emit_context::MemoryEmitConfig {
+                fastmem_address_space_bits: 39,
+                silently_mirror_fastmem: false,
+                fastmem_exclusive_access: false,
+                recompile_on_fastmem_failure: false,
+                page_table_present: false,
+                page_table_address_space_bits: 39,
+                silently_mirror_page_table: false,
+                absolute_offset_page_table: true,
+                page_table_pointer_mask_bits: 0,
+                detect_misaligned_access_via_page_table: 0,
+                only_detect_misalignment_via_page_table_on_page_boundary: false,
+                check_halt_on_memory_access: false,
+                processor_id: core_index as usize,
+            },
         };
 
         // Create the JIT

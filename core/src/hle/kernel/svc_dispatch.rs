@@ -1554,6 +1554,83 @@ fn call64(system: &System, imm: u32, args: &mut SvcArgs) {
         Some(SvcId::GetSystemTick) => {
             set_arg64(args, 0, svc_tick::get_system_tick(system) as u64);
         }
+        // ====================================================================
+        // Synchronization (A64 — uses 64-bit args directly, no gather64 needed)
+        // ====================================================================
+        Some(SvcId::WaitSynchronization) => {
+            // IN: handles=arg[1], num=arg[2], timeout=arg[3]; OUT: ret=arg[0], index=arg[1]
+            let mut out_index = -1i32;
+            let result = svc_synchronization::wait_synchronization(
+                system,
+                &mut out_index,
+                get_arg64(args, 1),
+                get_arg64(args, 2) as i32,
+                get_arg64(args, 3) as i64,
+            );
+            set_arg64(args, 0, result.get_inner_value() as u64);
+            set_arg64(args, 1, out_index as u64);
+        }
+        Some(SvcId::CancelSynchronization) => {
+            let result =
+                svc_synchronization::cancel_synchronization(system, get_arg64(args, 0) as u32);
+            set_arg64(args, 0, result.get_inner_value() as u64);
+        }
+        Some(SvcId::ArbitrateLock) => {
+            let result = svc_lock::arbitrate_lock(
+                system,
+                get_arg64(args, 0) as u32, // thread_handle
+                get_arg64(args, 1),        // address (u64 — full 64 bits)
+                get_arg64(args, 2) as u32, // tag
+            );
+            set_arg64(args, 0, result.get_inner_value() as u64);
+        }
+        Some(SvcId::ArbitrateUnlock) => {
+            let result = svc_lock::arbitrate_unlock(system, get_arg64(args, 0));
+            set_arg64(args, 0, result.get_inner_value() as u64);
+        }
+        Some(SvcId::WaitProcessWideKeyAtomic) => {
+            let result = svc_condition_variable::wait_process_wide_key_atomic(
+                system,
+                get_arg64(args, 0),        // address
+                get_arg64(args, 1),        // cv_key
+                get_arg64(args, 2) as u32, // tag
+                get_arg64(args, 3) as i64, // timeout
+            );
+            set_arg64(args, 0, result.get_inner_value() as u64);
+        }
+        Some(SvcId::SignalProcessWideKey) => {
+            svc_condition_variable::signal_process_wide_key(
+                system,
+                get_arg64(args, 0),        // cv_key
+                get_arg64(args, 1) as i32, // count
+            );
+        }
+
+        // ====================================================================
+        // Shared / Transfer memory (A64)
+        // ====================================================================
+        Some(SvcId::MapSharedMemory) => {
+            let handle = get_arg64(args, 0) as u32;
+            let address = get_arg64(args, 1);
+            let size = get_arg64(args, 2);
+            let perm = get_arg64(args, 3) as u32;
+            let map_perm = unsafe {
+                std::mem::transmute::<u32, crate::hle::kernel::svc::svc_types::MemoryPermission>(
+                    perm,
+                )
+            };
+            let result =
+                svc_shared_memory::map_shared_memory(system, handle, address, size, map_perm);
+            set_arg64(args, 0, result.get_inner_value() as u64);
+        }
+        Some(SvcId::UnmapSharedMemory) => {
+            let handle = get_arg64(args, 0) as u32;
+            let address = get_arg64(args, 1);
+            let size = get_arg64(args, 2);
+            let result = svc_shared_memory::unmap_shared_memory(system, handle, address, size);
+            set_arg64(args, 0, result.get_inner_value() as u64);
+        }
+
         Some(SvcId::ConnectToNamedPort) => {
             let mut out = 0;
             let result = svc_port::connect_to_named_port(system, &mut out, get_arg64(args, 1));

@@ -1702,6 +1702,9 @@ impl ArmDynarmic32 {
             processor_id: core_index as usize,
             // Upstream: config.wall_clock_cntpct = m_uses_wall_clock
             wall_clock_cntpct: uses_wall_clock,
+            // A32 doesn't use the upstream-faithful A64 memory helpers;
+            // its existing fastmem path is per-emission. Pass defaults.
+            memory: rdynarmic::backend::x64::emit_context::MemoryEmitConfig::default(),
         };
 
         log::warn!(

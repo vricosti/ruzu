@@ -1177,7 +1177,10 @@ impl System {
         // Upstream: this happens inside each loader's Load() (e.g. nca.cpp:77-80),
         // but in the Rust port the process_id is assigned after Load() returns
         // (see kernel.create_new_user_process_id() above), so registration must
-        // happen here instead.
+        // happen here instead. Upstream nro.cpp:278-283 calls
+        // ReadProgramId(program_id) and falls through with program_id=0 on
+        // ErrorNoControl (NRO without NACP/Aset), so that's the expected
+        // behaviour here too — do not "fix" it with a homebrew default.
         if let Some(ref process) = self.current_process {
             let romfs_factory = self
                 .app_loader
@@ -1190,9 +1193,15 @@ impl System {
                         self.filesystem_controller.clone(),
                     ))
                 });
+            // Mirror upstream: u64 program_id{}; ReadProgramId(program_id);
+            // (zero-initialised; ReadProgramId leaves it 0 on ErrorNoControl).
+            let mut program_id: u64 = 0;
+            if let Some(ref loader) = self.app_loader {
+                let _ = loader.read_program_id(&mut program_id);
+            }
             self.filesystem_controller.lock().unwrap().register_process(
                 process.process_id,
-                process.get_program_id(),
+                program_id,
                 romfs_factory,
             );
         }

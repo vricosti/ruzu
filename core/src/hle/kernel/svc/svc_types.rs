@@ -178,6 +178,10 @@ pub enum InfoType {
     ThreadTickCount = 25,
     IsSvcPermitted = 26,
     IoRegionHint = 27,
+    /// Switch fw 18.0.0+ (libnx 4.x): extra alias-region size beyond the
+    /// normal alias region, used by processes that opt into 39-bit AS
+    /// extension. Returns 0 when no extra region is configured.
+    AliasRegionExtraSize = 28,
     MesosphereMeta = 65000,
     MesosphereCurrentProcess = 65001,
 }
@@ -213,6 +217,7 @@ impl InfoType {
             25 => Self::ThreadTickCount,
             26 => Self::IsSvcPermitted,
             27 => Self::IoRegionHint,
+            28 => Self::AliasRegionExtraSize,
             65000 => Self::MesosphereMeta,
             65001 => Self::MesosphereCurrentProcess,
             _ => {
