@@ -10,7 +10,7 @@ use common::ResultCode;
 
 use crate::hid_result;
 use crate::hid_types::*;
-use crate::resources::applet_resource::AppletResourceHolder;
+use crate::resources::applet_resource::{AppletResourceHolder, ARUID_INDEX_MAX};
 use crate::resources::npad::npad_resource::NPadResource;
 use crate::resources::npad::npad_types::*;
 use crate::resources::npad::npad_vibration::NpadVibration;
@@ -88,30 +88,113 @@ impl NPad {
     }
 
     /// Port of NPad::OnUpdate.
-    /// Iterates all aruids and controller data, reads input from EmulatedController
-    /// and writes to shared memory.
+    ///
+    /// Upstream iterates `controller_data[aruid_index][i]` (a 2D array of 10
+    /// EmulatedController-backed entries per aruid), reads input from the
+    /// device, and writes `NPadGenericState` entries into the shared-memory
+    /// LIFOs (fullkey_lifo, handheld_lifo, joy_*_lifo, etc.) based on each
+    /// controller's `NpadStyleIndex`.
+    ///
+    /// ruzu's port currently lacks the full controller_data array (see TODO
+    /// note below) and the `EmulatedController` integration is largely
+    /// stubbed (no real input devices wired up yet). To still let the guest
+    /// game see "a controller is attached", this implementation writes a
+    /// fixed Pro Controller (Fullkey) `NPadGenericState` with
+    /// `connection_status = is_connected | is_wired` to `npad_entry[0]`'s
+    /// `fullkey_lifo` for every assigned aruid.
+    ///
+    /// Once `EmulatedController::reload_from_settings` honors the
+    /// `Settings::values.players[i]` config and `controller_data` is fully
+    /// ported, this should be replaced by the full upstream loop (see
+    /// `zuyu/src/hid_core/resources/npad/npad.cpp:461`).
     pub fn on_update(&mut self) {
         if self.ref_counter == 0 {
             return;
         }
 
-        // The full NPad::OnUpdate is complex — it iterates AruidIndexMax entries,
-        // checks each aruid_data, then iterates 10 controllers per aruid,
-        // calling RequestPadStateUpdate and writing to shared memory lifos.
-        // This requires full integration with EmulatedController callbacks
-        // and shared memory NpadInternalState pointers.
-        //
-        // The core loop is:
-        //   for aruid_index in 0..AruidIndexMax:
-        //     data = applet_resource->GetAruidDataByIndex(aruid_index)
-        //     if !data.flag.is_assigned: continue
-        //     if !is_supported_npad_style_set: continue
-        //     for i in 0..10:
-        //       controller = controller_data[aruid_index][i]
-        //       shared_memory = data.shared_memory_format.npad.npad_entry[i].internal_state
-        //       if controller is not active/connected: continue
-        //       RequestPadStateUpdate(aruid, npad_id)
-        //       write pad_state into correct lifo based on controller_type
+        let Some(applet_resource) = self.applet_resource_holder.applet_resource.clone() else {
+            return;
+        };
+        let mut applet_resource = applet_resource.lock();
+
+        for aruid_index in 0..ARUID_INDEX_MAX {
+            // Mirror upstream's "skip if data is null or not assigned" gate.
+            let (assigned, aruid, enable_input) = {
+                let data = applet_resource.get_aruid_data_by_index(aruid_index);
+                (
+                    data.flag.is_assigned(),
+                    data.aruid,
+                    data.flag.enable_pad_input(),
+                )
+            };
+            if !assigned {
+                continue;
+            }
+
+            // Mirror upstream's IsSupportedNpadStyleSet gate.
+            let is_set = self
+                .npad_resource
+                .is_supported_npad_style_set(aruid)
+                .unwrap_or(false);
+            if !is_set {
+                continue;
+            }
+
+            // Mirror upstream's enable_pad_input gate.
+            if !enable_input {
+                continue;
+            }
+
+            // Get the npad shared-memory area for this aruid.
+            let Some(shared) = applet_resource.get_shared_memory_format_by_index_mut(aruid_index)
+            else {
+                continue;
+            };
+
+            // Loop over 10 controller slots like upstream, but only npad[0]
+            // currently gets a populated header (see method docs above for
+            // why). All other slots are left as their zero-init state, which
+            // matches upstream's behavior when no controller is connected at
+            // that index.
+            let npad = &mut shared.npad.npad_entry[0].internal_state;
+
+            // Mirror upstream `NPad::InitNewlyAddedController` for the
+            // Pro Controller (Fullkey) case (npad.cpp:202-215). These fields
+            // are normally written ONCE on a connect event; ruzu has no
+            // EmulatedController connect-event plumbing yet, so we keep
+            // re-writing them here. The values are idempotent.
+            npad.style_tag.raw |= NpadStyleSet::FULLKEY;
+            // device_type.fullkey = bit 0 (upstream `BitField<0,1,s32> fullkey`).
+            npad.device_type.raw |= 1 << 0;
+            // system_properties bits 11 (is_vertical), 13 (use_plus), 14 (use_minus).
+            npad.system_properties.raw |= (1 << 11) | (1 << 13) | (1 << 14);
+            // ColorAttribute::Ok = 0 (default), so fullkey_color.attribute is
+            // already correct from zero-init. No need to set explicitly.
+
+            // Build a Pro Controller / Fullkey `NPadGenericState`:
+            //   connection_status.raw bits: is_connected (0) | is_wired (1) = 0x3.
+            // Sampling number monotonically increases (upstream:
+            //   `npad->fullkey_lifo.ReadCurrentEntry().state.sampling_number + 1`).
+            let prev_sampling = npad.fullkey_lifo.read_current_entry().state.sampling_number;
+            let mut pad_state = NPadGenericState::default();
+            pad_state.connection_status.raw = 0x3;
+            pad_state.sampling_number = prev_sampling + 1;
+            npad.fullkey_lifo.write_next_entry(pad_state);
+
+            // Mirror the libnx-state write: upstream also updates
+            // `system_ext_lifo` with the `NpadCommonState` so libnx clients
+            // (which don't activate any specific style) still see a connected
+            // controller via that LIFO.
+            let prev_ext = npad
+                .system_ext_lifo
+                .read_current_entry()
+                .state
+                .sampling_number;
+            let mut libnx_state = NPadGenericState::default();
+            libnx_state.connection_status.raw = 0x3;
+            libnx_state.sampling_number = prev_ext + 1;
+            npad.system_ext_lifo.write_next_entry(libnx_state);
+        }
     }
 
     /// Get the vibration handler session aruid.

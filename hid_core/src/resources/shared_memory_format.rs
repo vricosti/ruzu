@@ -254,6 +254,52 @@ pub struct NpadInternalState {
     pub sixaxis_right_properties: SixAxisSensorProperties,
 }
 
+impl Default for NpadInternalState {
+    fn default() -> Self {
+        Self {
+            style_tag: NpadStyleTag::default(),
+            assignment_mode: NpadJoyAssignmentMode::default(),
+            fullkey_color: NpadFullKeyColorState::default(),
+            joycon_color: NpadJoyColorState::default(),
+            fullkey_lifo: Lifo::default(),
+            handheld_lifo: Lifo::default(),
+            joy_dual_lifo: Lifo::default(),
+            joy_left_lifo: Lifo::default(),
+            joy_right_lifo: Lifo::default(),
+            palma_lifo: Lifo::default(),
+            system_ext_lifo: Lifo::default(),
+            sixaxis_fullkey_lifo: NpadSixAxisSensorLifo::default(),
+            sixaxis_handheld_lifo: NpadSixAxisSensorLifo::default(),
+            sixaxis_dual_left_lifo: NpadSixAxisSensorLifo::default(),
+            sixaxis_dual_right_lifo: NpadSixAxisSensorLifo::default(),
+            sixaxis_left_lifo: NpadSixAxisSensorLifo::default(),
+            sixaxis_right_lifo: NpadSixAxisSensorLifo::default(),
+            device_type: DeviceType::default(),
+            _reserved1: [0; 0x4],
+            system_properties: NPadSystemProperties::default(),
+            button_properties: NpadSystemButtonProperties::default(),
+            battery_level_dual: NpadBatteryLevel::default(),
+            battery_level_left: NpadBatteryLevel::default(),
+            battery_level_right: NpadBatteryLevel::default(),
+            applet_footer_attributes: AppletFooterUiAttributes::default(),
+            applet_footer_type: AppletFooterUiType::default(),
+            _reserved2: [0; 0x5B],
+            _unknown: [0; 0x20],
+            gc_trigger_lifo: Lifo::default(),
+            lark_type_l_and_main: NpadLarkType::default(),
+            lark_type_r: NpadLarkType::default(),
+            lucia_type: NpadLuciaType::default(),
+            lager_type: NpadLagerType::default(),
+            sixaxis_fullkey_properties: SixAxisSensorProperties::default(),
+            sixaxis_handheld_properties: SixAxisSensorProperties::default(),
+            sixaxis_dual_left_properties: SixAxisSensorProperties::default(),
+            sixaxis_dual_right_properties: SixAxisSensorProperties::default(),
+            sixaxis_left_properties: SixAxisSensorProperties::default(),
+            sixaxis_right_properties: SixAxisSensorProperties::default(),
+        }
+    }
+}
+
 /// This is nn::hid::detail::NpadSharedMemoryEntry
 #[derive(Debug, Clone, Copy)]
 #[repr(C)]
@@ -262,8 +308,17 @@ pub struct NpadSharedMemoryEntry {
     pub _padding: [u8; 0xC08],
 }
 
+impl Default for NpadSharedMemoryEntry {
+    fn default() -> Self {
+        Self {
+            internal_state: NpadInternalState::default(),
+            _padding: [0; 0xC08],
+        }
+    }
+}
+
 /// This is nn::hid::detail::NpadSharedMemoryFormat
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 #[repr(C)]
 pub struct NpadSharedMemoryFormat {
     pub npad_entry: [NpadSharedMemoryEntry; MAX_SUPPORTED_NPAD_ID_TYPES],
@@ -304,6 +359,7 @@ const _: () = assert!(std::mem::size_of::<ConsoleSixAxisSensorSharedMemoryFormat
 ///
 /// The full shared memory layout as used by HID services.
 /// Total size is 0x40000 bytes.
+#[derive(Debug, Clone, Copy)]
 #[repr(C)]
 pub struct SharedMemoryFormat {
     pub debug_pad: DebugPadSharedMemoryFormat,
@@ -324,8 +380,71 @@ pub struct SharedMemoryFormat {
     pub _padding2: [u8; 0x2000],
 }
 
+impl Default for SharedMemoryFormat {
+    fn default() -> Self {
+        Self {
+            debug_pad: DebugPadSharedMemoryFormat::default(),
+            touch_screen: TouchScreenSharedMemoryFormat::default(),
+            mouse: MouseSharedMemoryFormat::default(),
+            keyboard: KeyboardSharedMemoryFormat::default(),
+            digitizer: DigitizerSharedMemoryFormat::default(),
+            home_button: HomeButtonSharedMemoryFormat::default(),
+            sleep_button: SleepButtonSharedMemoryFormat::default(),
+            capture_button: CaptureButtonSharedMemoryFormat::default(),
+            input_detector: InputDetectorSharedMemoryFormat::default(),
+            unique_pad: UniquePadSharedMemoryFormat::default(),
+            npad: NpadSharedMemoryFormat::default(),
+            gesture: GestureSharedMemoryFormat::default(),
+            console: ConsoleSixAxisSensorSharedMemoryFormat::default(),
+            _padding1: [0; 0x19E0],
+            debug_mouse: MouseSharedMemoryFormat::default(),
+            _padding2: [0; 0x2000],
+        }
+    }
+}
+
 impl SharedMemoryFormat {
     pub fn initialize(&mut self) {
-        // Upstream Initialize() is empty — shared memory is zero-initialized.
+        // Upstream Initialize() is empty because `std::construct_at` already
+        // ran the default constructors for the whole object graph on the
+        // mapped page. ruzu maps a zero-filled page first, then calls this
+        // method, so we must explicitly materialize the default state here.
+        *self = Self::default();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn initialize_materializes_lifo_default_state() {
+        let mut shared = SharedMemoryFormat::default();
+
+        shared.npad.npad_entry[0]
+            .internal_state
+            .fullkey_lifo
+            .total_buffer_count = 0;
+        shared.npad.npad_entry[0]
+            .internal_state
+            .system_ext_lifo
+            .total_buffer_count = 0;
+
+        shared.initialize();
+
+        assert_eq!(
+            shared.npad.npad_entry[0]
+                .internal_state
+                .fullkey_lifo
+                .total_buffer_count,
+            HID_ENTRY_COUNT as i64
+        );
+        assert_eq!(
+            shared.npad.npad_entry[0]
+                .internal_state
+                .system_ext_lifo
+                .total_buffer_count,
+            HID_ENTRY_COUNT as i64
+        );
     }
 }

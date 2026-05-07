@@ -115,6 +115,7 @@ impl ICommonStateGetter {
                 Some(Self::get_default_display_resolution_change_event_handler),
                 "GetDefaultDisplayResolutionChangeEvent",
             ),
+            (66, Some(Self::set_cpu_boost_mode_handler), "SetCpuBoostMode"),
             (68, Some(Self::get_built_in_display_type_handler), "GetBuiltInDisplayType"),
             (
                 80,
@@ -533,6 +534,49 @@ impl ICommonStateGetter {
         let mut rb = ResponseBuilder::new(ctx, 2, 1, 0);
         rb.push_result(RESULT_SUCCESS);
         rb.push_copy_objects(handle);
+    }
+
+    /// SetCpuBoostMode (cmd 66). Mirrors upstream
+    /// `ICommonStateGetter::SetCpuBoostMode` in
+    /// `am/service/common_state_getter.cpp`:
+    /// ```cpp
+    /// const auto& sm = system.ServiceManager();
+    /// const auto apm_sys = sm.GetService<APM::APM_Sys>("apm:sys");
+    /// ASSERT(apm_sys != nullptr);
+    /// apm_sys->SetCpuBoostMode(ctx);
+    /// ```
+    /// Forwards the request to apm:sys's matching handler.
+    fn set_cpu_boost_mode_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let service =
+            unsafe { &*(this as *const dyn ServiceFramework as *const ICommonStateGetter) };
+        let mut rp = RequestParser::new(ctx);
+        let mode = match rp.pop_u32() {
+            0 => crate::hle::service::apm::apm_controller::CpuBoostMode::Normal,
+            1 => crate::hle::service::apm::apm_controller::CpuBoostMode::FastLoad,
+            2 => crate::hle::service::apm::apm_controller::CpuBoostMode::Partial,
+            _ => crate::hle::service::apm::apm_controller::CpuBoostMode::Normal,
+        };
+
+        if let Some(service_manager) = service.system.get().service_manager() {
+            let apm_sys = crate::hle::service::sm::sm::ServiceManager::get_service_blocking(
+                &service_manager,
+                service.system,
+                "apm:sys",
+            );
+            if let Some(apm) = apm_sys
+                .as_any()
+                .downcast_ref::<crate::hle::service::apm::apm_interface::ApmSys>()
+            {
+                apm.set_cpu_boost_mode(mode);
+            } else {
+                log::warn!(
+                    "ICommonStateGetter::SetCpuBoostMode: apm:sys is not ApmSys (downcast failed)"
+                );
+            }
+        }
+
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
     }
 
     fn get_built_in_display_type_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {

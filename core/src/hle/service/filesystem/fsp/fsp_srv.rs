@@ -336,9 +336,35 @@ impl FspSrv {
     }
 
     fn open_sd_card_file_system_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
-        let _service = unsafe { &*(this as *const dyn ServiceFramework as *const FspSrv) };
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const FspSrv) };
         log::info!("FspSrv::OpenSdCardFileSystem called");
-        Self::push_interface_response(ctx, Arc::new(Self::make_empty_filesystem()));
+        let Some(fsc) = service.fsc.as_ref() else {
+            Self::push_error_with_null_interface(ctx, RESULT_TARGET_NOT_FOUND.raw());
+            return;
+        };
+
+        let sdmc_dir = {
+            let fsc = fsc.lock().unwrap();
+            match fsc.open_sdmc() {
+                Ok(dir) => dir,
+                Err(rc) => {
+                    Self::push_error_with_null_interface(ctx, rc.raw());
+                    return;
+                }
+            }
+        };
+
+        let fsc_for_size = Arc::clone(fsc);
+        let size_getter = SizeGetter {
+            get_free_size: Box::new(move || {
+                fsc_for_size.lock().unwrap().get_free_space_size(StorageId::SdCard)
+            }),
+            get_total_size: Box::new(move || {
+                fsc.lock().unwrap().get_total_space_size(StorageId::SdCard)
+            }),
+        };
+
+        Self::push_interface_response(ctx, Arc::new(IFileSystem::new(sdmc_dir, size_getter)));
     }
 
     fn parse_save_data_space_id(raw: u8) -> Option<SaveDataSpaceId> {

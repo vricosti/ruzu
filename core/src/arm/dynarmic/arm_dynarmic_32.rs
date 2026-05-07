@@ -391,6 +391,210 @@ fn maybe_dump_code_once(cb: &DynarmicCallbacks32) {
     maybe_scan_movw_movt(cb);
 }
 
+/// One-shot trigger that fires the literal / MOVW-MOVT scans the first time
+/// it is called (typically from the first guest SVC). Independent of
+/// RUZU_DUMP_CODE — only the per-scanner env vars need to be set.
+fn maybe_run_one_shot_scans(cb: &DynarmicCallbacks32) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static FIRED: AtomicBool = AtomicBool::new(false);
+    if !FIRED.swap(true, Ordering::SeqCst) {
+        // First call: run the one-shot scans (binary-time literal/MOVW
+        // searches). These don't depend on the target memory being mapped yet.
+        maybe_scan_word(cb);
+        maybe_scan_movw_movt(cb);
+        maybe_scan_thumb2_movw_movt(cb);
+        maybe_scan_bl(cb);
+        maybe_scan_state_write(cb);
+        // Also try the code-region dump now (binary is loaded by first SVC).
+        // This fires independently of memory-watch hits, useful for capturing
+        // function-entry / caller-area bytes when no watch is active.
+        maybe_dump_code_once(cb);
+    }
+    // Memory dump fires when the target region is mapped (which happens later
+    // than first SVC for shared-mem pages). It self-disables after one
+    // successful dump, matching the OnceLock pattern of the scanners.
+    maybe_dump_mem_after_n_svcs(cb);
+}
+
+/// Dump a guest-memory region as soon as it becomes mapped, then disable.
+/// `RUZU_DUMP_MEM_AT_FIRST_SVC=0xADDR:LEN[,...]` polls each region on every
+/// SVC entry; once `is_valid_virtual_address_range` returns true, the region
+/// is dumped and removed from the polling set. This lets us snapshot
+/// kernel-shared pages (hid, audio, etc.) at a specific point in boot.
+fn maybe_dump_mem_after_n_svcs(cb: &DynarmicCallbacks32) {
+    use std::sync::Mutex;
+    use std::sync::OnceLock;
+    static SPEC: OnceLock<Option<Mutex<Vec<(u64, u64, u64)>>>> = OnceLock::new();
+    let spec = SPEC.get_or_init(|| {
+        let raw = std::env::var("RUZU_DUMP_MEM_AT_FIRST_SVC").ok()?;
+        let mut out = Vec::new();
+        // New format: N:0xADDR:LEN where N = SVC count threshold (defer dump
+        // until at least N SVCs have entered this hook). Old format
+        // (0xADDR:LEN) remains supported with N=0 (dump as soon as mapped).
+        for token in raw.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
+            let parts: Vec<&str> = token.split(':').collect();
+            let (after_n, addr_str, len_str) = match parts.len() {
+                3 => (parts[0].parse::<u64>().unwrap_or(0), parts[1], parts[2]),
+                2 => (0u64, parts[0], parts[1]),
+                _ => continue,
+            };
+            let Ok(addr) = u64::from_str_radix(addr_str.trim_start_matches("0x"), 16) else {
+                continue;
+            };
+            let len = u64::from_str_radix(len_str.trim_start_matches("0x"), 16)
+                .ok()
+                .or_else(|| len_str.parse::<u64>().ok());
+            if let Some(len) = len {
+                out.push((after_n, addr, len));
+            }
+        }
+        Some(Mutex::new(out))
+    });
+    let Some(spec) = spec else {
+        return;
+    };
+    let mut pending = spec.lock().unwrap();
+    if pending.is_empty() {
+        return;
+    }
+    use std::sync::atomic::AtomicU64;
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed) + 1;
+    let mem = cb.mem();
+    pending.retain(|&(after_n, addr, len)| {
+        if n < after_n {
+            return true;
+        }
+        if !mem.is_valid_virtual_address_range(addr, len) {
+            return true;
+        }
+        let mut hex = String::with_capacity(len as usize * 2 + (len as usize / 16));
+        for i in 0..len {
+            use std::fmt::Write;
+            let _ = write!(hex, "{:02x}", mem.read_8(addr + i));
+            if i % 16 == 15 {
+                hex.push(' ');
+            }
+        }
+        eprintln!(
+            "[MEM_DUMP] svc_n={} addr=0x{:08X} len=0x{:X} bytes={}",
+            n,
+            addr,
+            len,
+            hex.trim()
+        );
+        false // remove from pending after dump
+    });
+}
+
+/// Thumb-2 MOVW T3 / MOVT T1 pair scanner. Mirrors `maybe_scan_movw_movt`
+/// but matches Thumb-2 encodings — most Switch game code (nnSdk) compiles
+/// to Thumb-2, so the ARM-only scanner misses them.
+///
+/// Encoding (as 32-bit LE word stored as two LE halfwords):
+///   MOVW T3: `1111 0 i 10 0100 imm4 | 0 imm3 Rd imm8`
+///            hw0 mask 0xFBF0, expected 0xF240
+///   MOVT T1: `1111 0 i 10 1100 imm4 | 0 imm3 Rd imm8`
+///            hw0 mask 0xFBF0, expected 0xF2C0
+///   imm16  = imm4 << 12 | i << 11 | imm3 << 8 | imm8
+///
+/// `RUZU_FIND_T2_MOVW_MOVT=0xVALUE:0xRANGE_START:0xRANGE_LEN` prints each hit
+/// as `[T2_MOVW_HIT] movw_pc=0x... movt_pc=0x... rd=rN value=0x...`.
+fn maybe_scan_thumb2_movw_movt(cb: &DynarmicCallbacks32) {
+    use std::sync::OnceLock;
+    static SPEC: OnceLock<Option<(u32, u64, u64)>> = OnceLock::new();
+    let spec = *SPEC.get_or_init(|| {
+        let raw = std::env::var("RUZU_FIND_T2_MOVW_MOVT").ok()?;
+        let parts: Vec<&str> = raw.split(':').collect();
+        if parts.len() != 3 {
+            return None;
+        }
+        let value = u32::from_str_radix(parts[0].trim_start_matches("0x"), 16).ok()?;
+        let start = u64::from_str_radix(parts[1].trim_start_matches("0x"), 16).ok()?;
+        let len = u64::from_str_radix(parts[2].trim_start_matches("0x"), 16)
+            .ok()
+            .or_else(|| parts[2].parse::<u64>().ok())?;
+        Some((value, start, len))
+    });
+    let Some((value, start, len)) = spec else {
+        return;
+    };
+    let target_lo = value & 0xFFFF;
+    let target_hi = (value >> 16) & 0xFFFF;
+    let mem = cb.mem();
+    let end = start + len;
+    const MAX_DISTANCE_BYTES: u64 = 32;
+    const PAGE_SIZE: u64 = 0x1000;
+    let read_t2 = |addr: u64| -> u32 {
+        let hw0 = (mem.read_8(addr) as u32) | ((mem.read_8(addr + 1) as u32) << 8);
+        let hw1 = (mem.read_8(addr + 2) as u32) | ((mem.read_8(addr + 3) as u32) << 8);
+        hw0 | (hw1 << 16)
+    };
+    let extract_imm16 = |insn: u32| -> u32 {
+        let hw0 = insn & 0xFFFF;
+        let hw1 = (insn >> 16) & 0xFFFF;
+        let imm4 = hw0 & 0xF;
+        let i = (hw0 >> 10) & 1;
+        let imm3 = (hw1 >> 12) & 7;
+        let imm8 = hw1 & 0xFF;
+        (imm4 << 12) | (i << 11) | (imm3 << 8) | imm8
+    };
+    let extract_rd = |insn: u32| -> u8 { (((insn >> 16) >> 8) & 0xF) as u8 };
+    let mut pc = start;
+    let mut hits = 0u32;
+    let mut next_page_check = start;
+    let mut current_page_valid = false;
+    while pc + 4 <= end {
+        // Skip unmapped pages without spamming the kernel log.
+        if pc >= next_page_check {
+            current_page_valid =
+                mem.is_valid_virtual_address_range(pc & !(PAGE_SIZE - 1), PAGE_SIZE);
+            next_page_check = (pc & !(PAGE_SIZE - 1)) + PAGE_SIZE;
+        }
+        if !current_page_valid {
+            pc = next_page_check;
+            continue;
+        }
+        let insn = read_t2(pc);
+        let hw0 = insn & 0xFFFF;
+        // MOVW T3: hw0 & 0xFBF0 == 0xF240
+        if (hw0 & 0xFBF0) == 0xF240 && extract_imm16(insn) == target_lo {
+            let rd = extract_rd(insn);
+            // Look ahead for MOVT T1 to same Rd within MAX_DISTANCE_BYTES (Thumb-2
+            // step is 2 bytes — 16-bit insns possible, but T2-MOVW/T1-MOVT are 4 bytes).
+            let mut q = pc + 4;
+            let q_end = (pc + MAX_DISTANCE_BYTES).min(end);
+            while q + 4 <= q_end {
+                let qi = read_t2(q);
+                let qhw0 = qi & 0xFFFF;
+                if (qhw0 & 0xFBF0) == 0xF2C0 {
+                    let q_rd = extract_rd(qi);
+                    if q_rd == rd {
+                        if extract_imm16(qi) == target_hi {
+                            eprintln!(
+                                "[T2_MOVW_HIT] movw_pc=0x{:08X} movt_pc=0x{:08X} rd=r{} value=0x{:08X}",
+                                pc, q, rd, value
+                            );
+                            hits += 1;
+                            if hits > 64 {
+                                eprintln!("[T2_MOVW_HIT] (more hits suppressed)");
+                                return;
+                            }
+                        }
+                        break;
+                    }
+                }
+                q += 2; // Thumb step
+            }
+        }
+        pc += 2; // Thumb step
+    }
+    eprintln!(
+        "[T2_MOVW_HIT] scan done: {} hits for value 0x{:08X} in [0x{:X}..0x{:X}]",
+        hits, value, start, end
+    );
+}
+
 /// Scan guest memory for ARM32 `MOVW Rd, #lo; MOVT Rd, #hi` pairs that
 /// compute a target 32-bit immediate. The MOVT must hit the same Rd as a
 /// preceding MOVW within `MAX_DISTANCE_INSNS` instructions.
@@ -500,9 +704,21 @@ fn maybe_scan_word(cb: &DynarmicCallbacks32) {
     };
     let mem = cb.mem();
     let end = start + len;
+    const PAGE_SIZE: u64 = 0x1000;
     let mut addr = start;
     let mut hits = 0;
+    let mut next_page_check = start;
+    let mut current_page_valid = false;
     while addr + 4 <= end {
+        if addr >= next_page_check {
+            current_page_valid =
+                mem.is_valid_virtual_address_range(addr & !(PAGE_SIZE - 1), PAGE_SIZE);
+            next_page_check = (addr & !(PAGE_SIZE - 1)) + PAGE_SIZE;
+        }
+        if !current_page_valid {
+            addr = next_page_check;
+            continue;
+        }
         let w = mem.read_32(addr);
         if w == value {
             // Print the 16 bytes around the hit (8 before, 8 after) for context
@@ -533,58 +749,203 @@ fn maybe_scan_word(cb: &DynarmicCallbacks32) {
     );
 }
 
-/// Scan guest memory for ARM BL instructions targeting a specific PC.
-/// `RUZU_FIND_BL=0xTARGET:0xRANGE_START:0xRANGE_LEN` scans RANGE_LEN bytes
-/// from RANGE_START for any 4-byte ARM word `0xEB______` whose decoded
-/// offset reaches TARGET. Prints all hits as `[BL_HIT] pc=0x... target=0x...`.
+/// Scan for ARM `STR Rt, [Rn, #+IMM]` paired with a recent `MOV Rt, #VAL`.
+/// `RUZU_FIND_STATE_WRITE=VAL:OFFSET:0xSTART:0xLEN` (decimal VAL/OFFSET).
+/// Walks STR-immediate ARM A1 encodings whose imm12==OFFSET and emits the
+/// PC plus the most recent assignment of the source reg, if it can be
+/// resolved to an immediate within the prior 4 instructions.
+/// Useful for locating state-machine writers, e.g. `state = 2` at +0x60.
+fn maybe_scan_state_write(cb: &DynarmicCallbacks32) {
+    use std::sync::OnceLock;
+    // (val, offset, start, len)
+    static SPEC: OnceLock<Option<(u32, u32, u64, u64)>> = OnceLock::new();
+    let spec = *SPEC.get_or_init(|| {
+        let raw = std::env::var("RUZU_FIND_STATE_WRITE").ok()?;
+        let parts: Vec<&str> = raw.split(':').collect();
+        if parts.len() != 4 {
+            return None;
+        }
+        let parse = |s: &str| {
+            let s = s.trim().trim_start_matches("0x");
+            u64::from_str_radix(s, 16)
+                .ok()
+                .or_else(|| s.parse::<u64>().ok())
+        };
+        let val = parse(parts[0])? as u32;
+        let off = parse(parts[1])? as u32;
+        let start = parse(parts[2])?;
+        let len = parse(parts[3])?;
+        Some((val, off, start, len))
+    });
+    let Some((val, off, start, len)) = spec else {
+        return;
+    };
+    let mem = cb.mem();
+    let end = start + len;
+    const PAGE_SIZE: u64 = 0x1000;
+    let mut addr = start;
+    let mut hits = 0;
+    let mut next_page_check = start;
+    let mut current_page_valid = false;
+    while addr + 4 <= end {
+        if addr >= next_page_check {
+            current_page_valid =
+                mem.is_valid_virtual_address_range(addr & !(PAGE_SIZE - 1), PAGE_SIZE);
+            next_page_check = (addr & !(PAGE_SIZE - 1)) + PAGE_SIZE;
+        }
+        if !current_page_valid {
+            addr = next_page_check;
+            continue;
+        }
+        let w = mem.read_32(addr);
+        // STR (immediate, A1, P=1, U=1, B=0, W=0, L=0): cond 0101_1000 Rn Rt imm12
+        // Match cond=AL or any cond. Mask off cond + Rn + Rt.
+        let masked = w & 0x0FF00FFF;
+        if masked == 0x05800000 | (off & 0xFFF) {
+            // Found STR Rt, [Rn, #+OFF]. Now look back for MOV Rt, #VAL.
+            let rt = (w >> 12) & 0xF;
+            let rn = (w >> 16) & 0xF;
+            let mut src_imm: Option<u32> = None;
+            let mut src_pc: u64 = 0;
+            for back in 1..=6u64 {
+                let prior_pc = addr.checked_sub(back * 4).unwrap_or(0);
+                let pw = mem.read_32(prior_pc);
+                // MOV (immediate, A1): cond 0011_1010_0000_Rd_imm12 (S=0)
+                //                or:   cond 0011_1011_0000_Rd_imm12 (S=1, MOVS)
+                // Match cond=AL preferred, with Rd == rt.
+                let match_mov = (pw & 0x0FFF_F000) == 0x03A00000 | (rt << 12);
+                if match_mov {
+                    let imm12 = pw & 0xFFF;
+                    let rot = (imm12 >> 8) & 0xF;
+                    let imm8 = imm12 & 0xFF;
+                    let imm = if rot == 0 {
+                        imm8
+                    } else {
+                        ((imm8 >> (2 * rot)) | (imm8 << (32 - 2 * rot))) & 0xFFFFFFFF
+                    };
+                    src_imm = Some(imm);
+                    src_pc = prior_pc;
+                    break;
+                }
+            }
+            // Emit if the preceding MOV matched the target value.
+            // If we couldn't find a MOV-imm, still emit the STR — useful when
+            // the source comes via memory load.
+            let label = if src_imm == Some(val) {
+                "[STATE_WRITE]"
+            } else if src_imm.is_some() {
+                "[STATE_WRITE_OTHER]"
+            } else {
+                "[STATE_WRITE_NOMOV]"
+            };
+            // Only emit STATE_WRITE_OTHER when the preceding MOV *was* an immediate
+            // (so we don't drown the log when reg was loaded from memory).
+            if matches!(label, "[STATE_WRITE]" | "[STATE_WRITE_OTHER]") {
+                eprintln!(
+                    "{} pc=0x{:08X} str=Rt=r{} Rn=r{} mov_pc=0x{:08X} mov_imm={}",
+                    label,
+                    addr,
+                    rt,
+                    rn,
+                    src_pc,
+                    src_imm
+                        .map(|v| format!("{}", v))
+                        .unwrap_or_else(|| "?".into())
+                );
+                hits += 1;
+                if hits > 256 {
+                    eprintln!("{} (more hits suppressed)", label);
+                    break;
+                }
+            }
+        }
+        addr += 4;
+    }
+    eprintln!(
+        "[STATE_WRITE] scan done: {} hits in [0x{:X}..0x{:X}] val={} off={}",
+        hits, start, end, val, off
+    );
+}
+
+/// Scan guest memory for ARM BL instructions targeting a specific PC or PC range.
+/// `RUZU_FIND_BL=0xTARGET:0xRANGE_START:0xRANGE_LEN` (single target)
+/// `RUZU_FIND_BL=0xLO-0xHI:0xRANGE_START:0xRANGE_LEN` (range of targets, inclusive)
+/// Scans RANGE_LEN bytes from RANGE_START for any 4-byte ARM BL/B/BLX word
+/// whose decoded offset reaches TARGET (or any address in [LO..=HI]).
+/// Prints all hits as `[BL_HIT] pc=0x... target=0x...`.
 fn maybe_scan_bl(cb: &DynarmicCallbacks32) {
     use std::sync::OnceLock;
-    static SPEC: OnceLock<Option<(u64, u64, u64)>> = OnceLock::new();
+    // (target_lo, target_hi inclusive, start, len)
+    static SPEC: OnceLock<Option<(u64, u64, u64, u64)>> = OnceLock::new();
     let spec = *SPEC.get_or_init(|| {
         let raw = std::env::var("RUZU_FIND_BL").ok()?;
         let parts: Vec<&str> = raw.split(':').collect();
         if parts.len() != 3 {
             return None;
         }
-        let target = u64::from_str_radix(parts[0].trim_start_matches("0x"), 16).ok()?;
-        let start = u64::from_str_radix(parts[1].trim_start_matches("0x"), 16).ok()?;
-        let len = u64::from_str_radix(parts[2].trim_start_matches("0x"), 16)
-            .ok()
-            .or_else(|| parts[2].parse::<u64>().ok())?;
-        Some((target, start, len))
+        let parse_hex = |s: &str| -> Option<u64> {
+            u64::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok()
+        };
+        let (target_lo, target_hi) = if let Some((lo, hi)) = parts[0].split_once('-') {
+            (parse_hex(lo)?, parse_hex(hi)?)
+        } else {
+            let t = parse_hex(parts[0])?;
+            (t, t)
+        };
+        let start = parse_hex(parts[1])?;
+        let len = parse_hex(parts[2]).or_else(|| parts[2].trim().parse::<u64>().ok())?;
+        Some((target_lo, target_hi, start, len))
     });
-    let Some((target, start, len)) = spec else {
+    let Some((target_lo, target_hi, start, len)) = spec else {
         return;
     };
     let mem = cb.mem();
     let end = start + len;
     let mut pc = start;
     let mut hits = 0;
+    // Cap output at 256 hits when a range is in use; 64 for a single target.
+    let cap = if target_lo == target_hi { 64 } else { 256 };
     while pc + 4 <= end {
         let w0 = mem.read_8(pc);
         let w1 = mem.read_8(pc + 1);
         let w2 = mem.read_8(pc + 2);
         let w3 = mem.read_8(pc + 3);
-        // ARM BL is 0xEB______ and unconditional B is 0xEA______ (tail call).
-        // Conditional BL/B (cccc 1010/1011) also possible; cover all conds
-        // by checking high nibble == 1010 or 1011 (mask 0x0F).
-        if (w3 & 0x0F) == 0x0A || (w3 & 0x0F) == 0x0B {
+        // ARM BL/B with any condition: high nibble == 1010 (B) or 1011 (BL).
+        // ARM BLX(imm) is encoded `1111 101H imm24` (top byte 0xFA or 0xFB).
+        let is_bl_b = (w3 & 0x0F) == 0x0A || (w3 & 0x0F) == 0x0B;
+        let is_blx = w3 == 0xFA || w3 == 0xFB;
+        if is_bl_b || is_blx {
             let imm24 = (w0 as u32) | ((w1 as u32) << 8) | ((w2 as u32) << 16);
             let signed = if imm24 & 0x800000 != 0 {
                 imm24 as i32 | (-(0x1_000_000_i32))
             } else {
                 imm24 as i32
             };
-            let computed_target = (pc as i64 + 8 + (signed as i64) * 4) as u64;
-            if computed_target == target {
+            let computed_target = if is_blx {
+                // BLX(imm) ARM->Thumb: target = (PC+8 + sign_extend(imm24:H:'0')) | 1
+                let h = (w3 & 0x01) as i64;
+                let off = (signed as i64) * 4 + (h * 2);
+                ((pc as i64 + 8 + off) as u64) | 1
+            } else {
+                (pc as i64 + 8 + (signed as i64) * 4) as u64
+            };
+            // Strip Thumb bit when matching against ARM-aligned targets.
+            let match_target = computed_target & !1u64;
+            if match_target >= target_lo && match_target <= target_hi {
                 let cond = (w3 >> 4) & 0xF;
-                let kind = if w3 & 0x01 != 0 { "BL" } else { "B " };
+                let kind = if is_blx {
+                    "BLX"
+                } else if w3 & 0x01 != 0 {
+                    "BL "
+                } else {
+                    "B  "
+                };
                 eprintln!(
                     "[BL_HIT] pc=0x{:08X} target=0x{:08X} kind={} cond=0x{:X}",
-                    pc, target, kind, cond
+                    pc, computed_target, kind, cond
                 );
                 hits += 1;
-                if hits > 64 {
+                if hits > cap {
                     eprintln!("[BL_HIT] (more hits suppressed)");
                     break;
                 }
@@ -593,8 +954,8 @@ fn maybe_scan_bl(cb: &DynarmicCallbacks32) {
         pc += 4;
     }
     eprintln!(
-        "[BL_HIT] scan done: {} hits in [0x{:X}..0x{:X}]",
-        hits, start, end
+        "[BL_HIT] scan done: {} hits in [0x{:X}..0x{:X}] target=[0x{:X}..0x{:X}]",
+        hits, start, end, target_lo, target_hi
     );
 }
 
@@ -965,6 +1326,10 @@ impl UserCallbacks for DynarmicCallbacks32 {
         // Upstream: m_parent.m_svc_swi = swi;
         //           m_parent.m_jit->HaltExecution(SupervisorCall);
         self.parent().svc_swi.store(svc_num, Ordering::Relaxed);
+        // RUZU_FIND_WORD / RUZU_FIND_MOVW_MOVT / RUZU_FIND_T2_MOVW_MOVT:
+        // run literal/MOV pair scans once after the first SVC entry, so the
+        // main module is loaded but boot is still early.
+        maybe_run_one_shot_scans(self);
         self.halt_execution(rdynarmic::halt_reason::HaltReason::SVC);
     }
 

@@ -326,6 +326,106 @@ impl SessionRequestManager {
     }
 }
 
+/// `OUT_BUF`: log the bytes the HLE handler wrote into a B/C-descriptor
+/// buffer (the IPC output the guest reads back). Gated by
+/// `RUZU_TRACE_OUT_BUF=1` (NOT by RUZU_SVC_TRACE — keep this opt-in
+/// because some handlers write large buffers that would flood the log).
+///
+/// Output format matches `scripts/svc_diff.py::OUT_BUF_RE`:
+///   `[T.TTTTTT] OUT_BUF [0xADDR] size=0xSZ: XXXXXXXX XXXXXXXX ...`
+/// Bytes are dumped as space-separated 4-byte little-endian-as-stored
+/// hex words (matching the `TLS_REQ` / `TLS_RSP_*` formatting), so the
+/// diff script reads both sides identically.
+///
+/// Mirror of zuyu's `OUT_BUF_XDESC` in WriteToOutgoingCommandBuffer:
+/// dump the bytes at X-descriptor[0] address. Used to confirm whether
+/// ruzu's IPC pipeline writes back to the X-desc input the same way
+/// zuyu's does (RW ioctls expect the input struct to be updated in
+/// place even if the formal output is in B-desc).
+impl HLERequestContext {
+    pub(super) fn trace_out_buf_xdesc(&self) {
+        if std::env::var_os("RUZU_TRACE_OUT_BUF").is_none() {
+            return;
+        }
+        // Mirror zuyu's OUT_BUF_XDESC: log raw[0]/raw[1] of each X-descriptor.
+        for (i, x) in self.buffer_x_descriptors.iter().enumerate() {
+            eprintln!(
+                "[{:>10.6}] OUT_BUF_XDESC[{}] raw[0]=0x{:08x} raw[1]=0x{:08x} addr=0x{:x} size=0x{:x}",
+                crate::hle::kernel::trace_format::elapsed_secs(),
+                i,
+                x.raw,
+                x.address_bits_0_31,
+                x.address(),
+                x.size(),
+            );
+        }
+        let Some(x) = self.buffer_x_descriptors.first() else {
+            return;
+        };
+        let addr = x.address();
+        let size = x.size() as usize;
+        if addr == 0 || size == 0 || size > 0x100 {
+            return;
+        }
+        let bytes = self.read_guest_memory(addr, size);
+        if bytes.is_empty() {
+            return;
+        }
+        let mut payload = String::with_capacity(bytes.len() * 2 + bytes.len() / 4);
+        for chunk in bytes.chunks(4) {
+            for byte in chunk {
+                use std::fmt::Write;
+                let _ = write!(payload, "{:02x}", byte);
+            }
+            for _ in chunk.len()..4 {
+                payload.push_str("00");
+            }
+            payload.push(' ');
+        }
+        eprintln!(
+            "[{:>10.6}] OUT_BUF [0x{:x}] size=0x{:x}: {}",
+            crate::hle::kernel::trace_format::elapsed_secs(),
+            addr,
+            size,
+            payload.trim_end()
+        );
+    }
+}
+
+fn trace_out_buf(address: u64, data: &[u8]) {
+    if std::env::var_os("RUZU_TRACE_OUT_BUF").is_none() {
+        return;
+    }
+    if data.is_empty() {
+        return;
+    }
+    // Cap to first 256 bytes (64 words) to avoid log flooding on
+    // multi-KB ioctl outputs. Diff script compares strings so both
+    // ruzu and zuyu must use the same cap. 256 is plenty for the
+    // nvdrv ioctl output structures we care about.
+    const MAX_BYTES: usize = 256;
+    let n = data.len().min(MAX_BYTES);
+    let mut payload = String::with_capacity(n * 2 + n / 4);
+    for chunk in data[..n].chunks(4) {
+        for byte in chunk {
+            use std::fmt::Write;
+            let _ = write!(payload, "{:02x}", byte);
+        }
+        // pad short tail chunk so word boundary stays consistent
+        for _ in chunk.len()..4 {
+            payload.push_str("00");
+        }
+        payload.push(' ');
+    }
+    eprintln!(
+        "[{:>10.6}] OUT_BUF [0x{:x}] size=0x{:x}: {}",
+        crate::hle::kernel::trace_format::elapsed_secs(),
+        address,
+        data.len(),
+        payload.trim_end()
+    );
+}
+
 pub fn complete_sync_request(
     manager: &Arc<Mutex<SessionRequestManager>>,
     context: &mut HLERequestContext,
@@ -695,20 +795,19 @@ impl HLERequestContext {
         self.create_session_with_manager(manager)
     }
 
-    /// Creates a full KSession that shares an existing SessionRequestManager.
-    /// Used by CloneCurrentObject to replicate upstream behavior where the clone
-    /// is registered with the SAME manager as the parent session.
+    /// Creates a full KSession that shares an existing SessionRequestManager,
+    /// returning the client-session object ID instead of pre-resolving a
+    /// process handle.
     ///
-    /// Matches upstream `Controller::CloneCurrentObject`:
-    /// ```cpp
-    /// session_manager->GetServerManager().RegisterSession(
-    ///     &session->GetServerSession(), session_manager);
-    /// ```
-    pub fn create_session_with_manager(
+    /// This matches the upstream ownership model used by
+    /// `Controller::CloneCurrentObject` and `IPC::ResponseBuilder::PushIpcInterface`,
+    /// where the response stores the client-session object and final handle
+    /// translation happens later in `WriteToOutgoingCommandBuffer()`.
+    pub fn create_session_with_manager_object_id(
         &mut self,
         manager: Arc<std::sync::Mutex<SessionRequestManager>>,
-    ) -> Option<Handle> {
-        log::info!("HLERequestContext::create_session_with_manager: begin");
+    ) -> Option<u64> {
+        log::info!("HLERequestContext::create_session_with_manager_object_id: begin");
         let thread = self.thread.as_ref()?;
         let thread_guard = thread.lock().unwrap();
         let parent = thread_guard.parent.as_ref()?.upgrade()?;
@@ -718,8 +817,6 @@ impl HLERequestContext {
             std::sync::atomic::AtomicU64::new(0x1000_0000);
         let object_id = NEXT_SESSION_OBJECT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
-        // Create the full KSession (owns both server and client endpoints).
-        // Matches upstream: KSession::Create(kernel) + Initialize(nullptr, 0).
         let session = Arc::new(std::sync::Mutex::new(
             crate::hle::kernel::k_session::KSession::new(),
         ));
@@ -734,29 +831,55 @@ impl HLERequestContext {
                 .initialize_with_manager(object_id, manager.clone());
         }
         log::info!(
-            "HLERequestContext::create_session_with_manager: endpoints initialized object_id={:#x}",
+            "HLERequestContext::create_session_with_manager_object_id: endpoints initialized object_id={:#x}",
             object_id
         );
 
         let server_session = session.lock().unwrap().get_server_session().clone();
         let client_session = session.lock().unwrap().get_client_session().clone();
 
-        // Register the server session with its manager.
-        // Matches upstream: ServerManager.RegisterSession(&serverSession, manager).
-        log::info!("HLERequestContext::create_session_with_manager: registering session");
+        log::info!(
+            "HLERequestContext::create_session_with_manager_object_id: registering session endpoints"
+        );
         server_session.lock().unwrap().set_manager(manager.clone());
         client_session
             .lock()
             .unwrap()
             .initialize_with_manager(object_id, manager.clone());
 
-        // Store server session for push_ipc_interface to register with ServerManager.
         self.last_created_server_session = Some(server_session.clone());
 
-        // Register the owning session and the client endpoint in the process object tables.
-        log::info!("HLERequestContext::create_session_with_manager: registering process objects");
+        log::info!(
+            "HLERequestContext::create_session_with_manager_object_id: registering process objects"
+        );
         process.register_session_object(object_id, session);
         process.register_client_session_object(object_id, client_session);
+
+        log::info!(
+            "HLERequestContext::create_session_with_manager_object_id: done object_id={:#x}",
+            object_id
+        );
+        Some(object_id)
+    }
+
+    /// Creates a full KSession that shares an existing SessionRequestManager.
+    /// Used by CloneCurrentObject to replicate upstream behavior where the clone
+    /// is registered with the SAME manager as the parent session.
+    ///
+    /// Matches upstream `Controller::CloneCurrentObject`:
+    /// ```cpp
+    /// session_manager->GetServerManager().RegisterSession(
+    ///     &session->GetServerSession(), session_manager);
+    /// ```
+    pub fn create_session_with_manager(
+        &mut self,
+        manager: Arc<std::sync::Mutex<SessionRequestManager>>,
+    ) -> Option<Handle> {
+        let object_id = self.create_session_with_manager_object_id(manager)?;
+        let thread = self.thread.as_ref()?;
+        let thread_guard = thread.lock().unwrap();
+        let parent = thread_guard.parent.as_ref()?.upgrade()?;
+        let mut process = parent.lock().unwrap();
         let handle = process.handle_table.add(object_id).ok()?;
         log::info!(
             "HLERequestContext::create_session_with_manager: done handle={:#x}",
@@ -836,6 +959,30 @@ impl HLERequestContext {
             );
         }
         handle
+    }
+
+    /// Installs an existing readable-event object into the current process object table,
+    /// returning the object ID without pre-resolving a process handle.
+    ///
+    /// This matches upstream `OutCopyHandle<KReadableEvent>` ownership more closely:
+    /// the response stores the object, and `WriteToOutgoingCommandBuffer()` performs
+    /// final `handle_table.Add(...)` translation.
+    pub fn register_readable_event_object(
+        &self,
+        readable_event: Arc<Mutex<KReadableEvent>>,
+    ) -> Option<u64> {
+        let thread = self.thread.as_ref()?;
+        let thread_guard = thread.lock().unwrap();
+        let parent = thread_guard.parent.as_ref()?.upgrade()?;
+        let mut process = parent.lock().unwrap();
+
+        if process.ensure_handle_table_initialized() != RESULT_SUCCESS.get_inner_value() {
+            return None;
+        }
+
+        let object_id = readable_event.lock().unwrap().object_id;
+        process.register_readable_event_object(object_id, readable_event);
+        Some(object_id)
     }
 
     pub fn owner_process_arc(&self) -> Option<Arc<crate::hle::kernel::k_process::ProcessLock>> {
@@ -1015,6 +1162,7 @@ impl HLERequestContext {
         let size = data.len().min(buffer_size);
         let address = self.buffer_b_descriptors[buffer_index].address();
         self.write_guest_memory(address, &data[..size]);
+        trace_out_buf(address, &data[..size]);
         size
     }
 
@@ -1029,6 +1177,7 @@ impl HLERequestContext {
         let size = data.len().min(buffer_size);
         let address = self.buffer_c_descriptors[buffer_index].address();
         self.write_guest_memory(address, &data[..size]);
+        trace_out_buf(address, &data[..size]);
         size
     }
 
@@ -1389,6 +1538,26 @@ impl HLERequestContext {
                             manager.lock().unwrap().append_domain_handler(handler);
                             let count = manager.lock().unwrap().domain_handler_count();
                             self.cmd_buf[current_offset] = count as u32;
+                            // RUZU_IPC_DOMAIN_OUT=1 — log domain object ID
+                            // emission. If the client (libnx) thinks the
+                            // session is non-domain, it will read this `count`
+                            // value as a kernel handle (typically a small
+                            // integer like 1, 2, 3) — directly producing the
+                            // `handle 0x1 not in handle table` failure mode.
+                            // domain_offset is the offset PAST the raw data
+                            // section, so a non-domain client reads the value
+                            // as the move/copy handle slot.
+                            if std::env::var_os("RUZU_IPC_DOMAIN_OUT").is_some() {
+                                let (svc, cmd, _ioctl) =
+                                    IPC_TRACE_CURRENT.with(|c| c.borrow().clone());
+                                eprintln!(
+                                    "[IPC_DOMAIN_OUT] service={} cmd={} offset={} domain_object_id={} (libnx will read this as a handle if client thinks session is non-domain)",
+                                    if svc.is_empty() { "?" } else { svc.as_str() },
+                                    cmd,
+                                    current_offset,
+                                    count
+                                );
+                            }
                         } else {
                             self.cmd_buf[current_offset] = 0;
                         }
@@ -1450,11 +1619,37 @@ impl HLERequestContext {
             }
         }
 
+        // Diagnostic mirror of zuyu's OUT_BUF_XDESC: dump the bytes at
+        // X-desc[0] address after the response has been written to TLS.
+        // Matches the trigger point in zuyu's `WriteToOutgoingCommandBuffer`.
+        self.trace_out_buf_xdesc();
+
         RESULT_SUCCESS
     }
 
     fn resolve_ipc_object_handle(&self, obj_ref: KAutoObjectRef) -> Option<u32> {
         if let Some(handle) = obj_ref.as_handle() {
+            // RUZU_IPC_HANDLE_OUT=1 — log every raw-handle path that bypasses
+            // handle_table.Add. The handle is written verbatim to the client
+            // IPC buffer; if it's not actually present in the client's table,
+            // the client will see `handle 0x... not in handle table` on the
+            // next SendSyncRequest. Surfacing all raw-handle outputs lets us
+            // see which service pushed a bad value (or whether the bug is
+            // elsewhere — e.g. domain object ID or raw payload mis-parsed).
+            if std::env::var_os("RUZU_IPC_HANDLE_OUT").is_some() {
+                let valid = self
+                    .owner_process_arc()
+                    .map(|p| p.lock().unwrap().handle_table.is_valid_handle(handle))
+                    .unwrap_or(false);
+                let (svc, cmd, _ioctl) = IPC_TRACE_CURRENT.with(|c| c.borrow().clone());
+                eprintln!(
+                    "[IPC_HANDLE_OUT] kind=raw service={} cmd={} handle=0x{:08X} client_valid={}",
+                    if svc.is_empty() { "?" } else { svc.as_str() },
+                    cmd,
+                    handle,
+                    valid
+                );
+            }
             return Some(handle);
         }
 
@@ -1467,7 +1662,18 @@ impl HLERequestContext {
         if process.ensure_handle_table_initialized() != RESULT_SUCCESS.get_inner_value() {
             return None;
         }
-        process.handle_table.add(object_id).ok()
+        let result = process.handle_table.add(object_id).ok();
+        if std::env::var_os("RUZU_IPC_HANDLE_OUT").is_some() {
+            let (svc, cmd, _ioctl) = IPC_TRACE_CURRENT.with(|c| c.borrow().clone());
+            eprintln!(
+                "[IPC_HANDLE_OUT] kind=add service={} cmd={} object_id=0x{:X} new_handle={:?}",
+                if svc.is_empty() { "?" } else { svc.as_str() },
+                cmd,
+                object_id,
+                result.map(|h| format!("0x{:08X}", h))
+            );
+        }
+        result
     }
 
     /// Returns a description of the current IPC command for debugging.

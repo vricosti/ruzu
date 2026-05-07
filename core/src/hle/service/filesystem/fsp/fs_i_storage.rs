@@ -1,19 +1,28 @@
 //! Port of zuyu/src/core/hle/service/filesystem/fsp/fs_i_storage.h and fs_i_storage.cpp
 //!
 //! IStorage service.
+//!
+//! Mirrors upstream's `D<&IStorage::Method>` dispatch + `Out<T>` / `OutBuffer<T>`
+//! signatures via the CMIF helpers (`CmifRequest`, `CmifResponse`).
 
 use std::collections::BTreeMap;
 
 use crate::file_sys::errors;
 use crate::file_sys::vfs::vfs_types::VirtualFile;
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
+use crate::hle::service::cmif_serialization::{CmifRequest, CmifResponse};
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
-use crate::hle::service::ipc_helpers::{RequestParser, ResponseBuilder};
+use crate::hle::service::ipc_helpers::ResponseBuilder;
 use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
 
 #[inline]
 fn to_ipc_result(r: common::ResultCode) -> ResultCode {
     ResultCode::new(r.raw())
+}
+
+/// Number of u32 words for `Result + raw<T>` CMIF response.
+const fn response_words<T>() -> u32 {
+    2 + ((core::mem::size_of::<T>() as u32 + 3) / 4)
 }
 
 /// IPC command table for IStorage:
@@ -48,35 +57,31 @@ impl IStorage {
         }
     }
 
-    fn read_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
-        let storage = unsafe { &*(this as *const dyn ServiceFramework as *const IStorage) };
-        let mut rp = RequestParser::new(ctx);
-        let offset = rp.pop_i64();
-        let length = rp.pop_i64();
-        let backend_size = storage.backend.get_size();
+    fn as_self(this: &dyn ServiceFramework) -> &Self {
+        unsafe { &*(this as *const dyn ServiceFramework as *const Self) }
+    }
 
+    // ---------------- Business-logic methods ----------------
+    // Mirror upstream `Result IStorage::Read(OutBuffer, s64, s64)` and
+    // `Result IStorage::GetSize(Out<u64>)`.
+
+    fn read(&self, out_bytes: &mut [u8], offset: i64, length: i64) -> ResultCode {
+        let backend_size = self.backend.get_size();
         log::debug!(
             "IStorage::Read called, offset=0x{:X}, length={}, backend_size={}",
             offset,
             length,
             backend_size
         );
-
         if length < 0 {
-            let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
-            rb.push_result(to_ipc_result(errors::RESULT_INVALID_SIZE));
-            return;
+            return to_ipc_result(errors::RESULT_INVALID_SIZE);
         }
         if offset < 0 {
-            let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
-            rb.push_result(to_ipc_result(errors::RESULT_INVALID_OFFSET));
-            return;
+            return to_ipc_result(errors::RESULT_INVALID_OFFSET);
         }
-
-        let mut data = vec![0u8; length as usize];
-        let bytes_read = storage
+        let bytes_read = self
             .backend
-            .read(&mut data, length as usize, offset as usize);
+            .read(out_bytes, length as usize, offset as usize);
         if bytes_read != length as usize {
             log::warn!(
                 "IStorage::Read short read, offset=0x{:X}, requested={}, read={}, backend_size={}",
@@ -86,11 +91,12 @@ impl IStorage {
                 backend_size
             );
         }
+        // Investigation hook — mirrors zuyu's ZUYU_ISTORAGE_READ_DUMP.
         if std::env::var_os("RUZU_ISTORAGE_READ_DUMP").is_some() {
             use std::fmt::Write;
-            let n = data.len().min(64);
+            let n = out_bytes.len().min(64);
             let mut hex = String::new();
-            for b in &data[..n] {
+            for b in &out_bytes[..n] {
                 let _ = write!(hex, "{:02x}", b);
             }
             log::warn!(
@@ -102,26 +108,52 @@ impl IStorage {
                 hex
             );
         }
-        ctx.write_buffer(&data, 0);
+        RESULT_SUCCESS
+    }
 
-        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
-        rb.push_result(RESULT_SUCCESS);
+    fn get_size(&self, out_size: &mut u64) -> ResultCode {
+        *out_size = self.backend.get_size() as u64;
+        log::debug!("IStorage::GetSize called, size={}", *out_size);
+        RESULT_SUCCESS
+    }
+
+    // ---------------- Per-cmd dispatch shims ----------------
+
+    fn reply_result_only(ctx: &mut HLERequestContext, result: ResultCode) {
+        let mut response = CmifResponse::result_only(ctx, result);
+        let _ = &mut response;
+    }
+
+    fn read_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let storage = Self::as_self(this);
+        let mut request = CmifRequest::new(ctx);
+        let offset = request.raw::<i64>();
+        let length = request.raw::<i64>();
+        let buffer_size = ctx.get_write_buffer_size(0);
+        let read_size = if length >= 0 {
+            core::cmp::min(length as usize, buffer_size)
+        } else {
+            0
+        };
+        let mut buffer = vec![0u8; read_size];
+        let result = storage.read(&mut buffer, offset, length);
+        if result == RESULT_SUCCESS {
+            ctx.write_buffer(&buffer, 0);
+        }
+        Self::reply_result_only(ctx, result);
     }
 
     fn get_size_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
-        let storage = unsafe { &*(this as *const dyn ServiceFramework as *const IStorage) };
-        let size = storage.backend.get_size() as u64;
-
-        log::debug!("IStorage::GetSize called, size={}", size);
-
-        let mut rb = ResponseBuilder::new(ctx, 4, 0, 0);
-        rb.push_result(RESULT_SUCCESS);
-        rb.push_u64(size);
+        let storage = Self::as_self(this);
+        let mut size: u64 = 0;
+        let result = storage.get_size(&mut size);
+        let mut response = CmifResponse::new(ctx, response_words::<u64>(), 0, 0);
+        response.push_result(result);
+        response.push_u64(size);
     }
 
     fn stub_success_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
-        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
-        rb.push_result(RESULT_SUCCESS);
+        Self::reply_result_only(ctx, RESULT_SUCCESS);
     }
 }
 

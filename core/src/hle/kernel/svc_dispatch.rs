@@ -1151,7 +1151,6 @@ fn call32(system: &System, imm: u32, args: &mut SvcArgs) {
                 reason, info1, info2
             );
             svc_exception::break_execution(system, reason, info1, info2);
-            std::process::exit(1);
         }
         Some(SvcId::OutputDebugString) => {
             // IN: str=arg32[0], len=arg32[1]; OUT: ret=arg32[0]
@@ -1661,7 +1660,6 @@ fn call64(system: &System, imm: u32, args: &mut SvcArgs) {
                 reason, info1, info2
             );
             svc_exception::break_execution(system, reason, info1, info2);
-            std::process::exit(1);
         }
         Some(SvcId::OutputDebugString) => {
             let str_ptr = get_arg64(args, 0);
@@ -1681,6 +1679,46 @@ fn call64(system: &System, imm: u32, args: &mut SvcArgs) {
         }
         Some(SvcId::MapPhysicalMemory) => {
             set_arg64(args, 0, STUB_SUCCESS as u64);
+        }
+        // Transfer memory — STK creates one between binder Connect and the
+        // first DequeueBuffer. The 32-bit dispatch (`call32`) handles
+        // these; without the parallel call64 arms STK saw a stub-success
+        // with handle=0 and bailed out via Disconnect (txn=11), so no
+        // frame ever reached the producer queue.
+        Some(SvcId::CreateTransferMemory) => {
+            // IN: address=arg64[1], size=arg64[2], perm=arg64[3]
+            // OUT: ret=arg64[0], handle=arg64[1]
+            let address = get_arg64(args, 1);
+            let size = get_arg64(args, 2);
+            let map_perm = unsafe { std::mem::transmute(get_arg64(args, 3) as u32) };
+            let mut handle = 0u32;
+            let result = svc_transfer_memory::create_transfer_memory(
+                system,
+                &mut handle,
+                address,
+                size,
+                map_perm,
+            );
+            set_arg64(args, 0, result.get_inner_value() as u64);
+            set_arg64(args, 1, handle as u64);
+        }
+        Some(SvcId::MapTransferMemory) => {
+            // IN: handle=arg64[0], address=arg64[1], size=arg64[2], perm=arg64[3]
+            let handle = get_arg64(args, 0) as u32;
+            let address = get_arg64(args, 1);
+            let size = get_arg64(args, 2);
+            let map_perm = unsafe { std::mem::transmute(get_arg64(args, 3) as u32) };
+            let result =
+                svc_transfer_memory::map_transfer_memory(system, handle, address, size, map_perm);
+            set_arg64(args, 0, result.get_inner_value() as u64);
+        }
+        Some(SvcId::UnmapTransferMemory) => {
+            // IN: handle=arg64[0], address=arg64[1], size=arg64[2]
+            let handle = get_arg64(args, 0) as u32;
+            let address = get_arg64(args, 1);
+            let size = get_arg64(args, 2);
+            let result = svc_transfer_memory::unmap_transfer_memory(system, handle, address, size);
+            set_arg64(args, 0, result.get_inner_value() as u64);
         }
         Some(SvcId::GetResourceLimitLimitValue) => {
             set_arg64(args, 0, STUB_SUCCESS as u64);
@@ -1981,6 +2019,31 @@ fn dump_svc_full_regs(system: &System, imm: u32, tid: i64, label: &str) {
         ctx.r[12] as u32, ctx.r[13] as u32, ctx.r[14] as u32, ctx.r[15] as u32,
         ctx.pstate,
     );
+    // Optional: dump 16 words of stack at sp to surface saved-LR chain.
+    // Gated by RUZU_SVC_TRACE_STACK to keep RUZU_SVC_TRACE_REGS output clean
+    // when stack contents aren't needed.
+    if std::env::var_os("RUZU_SVC_TRACE_STACK").is_some() {
+        let sp = ctx.r[13] as u64;
+        let mem = process.process_memory.read().unwrap();
+        let mut hex = String::with_capacity(64 * 9);
+        for i in 0..64u64 {
+            let addr = sp + i * 4;
+            let w = if mem.is_valid_range(addr, 4) {
+                mem.read_32(addr)
+            } else {
+                0xDEADBEEF
+            };
+            use std::fmt::Write;
+            let _ = write!(hex, "{:08x} ", w);
+        }
+        eprintln!(
+            "[{:>10.6}] STACK {} sp={:#010x} {}",
+            super::trace_format::elapsed_secs(),
+            label,
+            sp as u32,
+            hex.trim()
+        );
+    }
 }
 
 fn maybe_dump_process_memory(system: &System, tid: i64) {

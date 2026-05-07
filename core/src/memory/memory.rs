@@ -45,6 +45,49 @@ pub struct Memory {
     gpu_dirty_managers: Vec<Arc<Mutex<GpuDirtyMemoryManager>>>,
 }
 
+/// Parse a `RUZU_WATCH_BLOCK=ADDR:LEN[,ADDR:LEN...]` spec into byte ranges.
+fn parse_block_watch_ranges() -> Vec<(u64, u64)> {
+    let raw = match std::env::var("RUZU_WATCH_BLOCK") {
+        Ok(s) => s,
+        Err(_) => return Vec::new(),
+    };
+    let mut out = Vec::new();
+    for tok in raw.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        let (addr, size) = match tok.split_once(':') {
+            Some((a, s)) => (a, s.parse::<u64>().unwrap_or(8)),
+            None => (tok, 8),
+        };
+        let addr_str = addr
+            .strip_prefix("0x")
+            .or_else(|| addr.strip_prefix("0X"))
+            .unwrap_or(addr);
+        if let Ok(start) = u64::from_str_radix(addr_str, 16) {
+            out.push((start, start.saturating_add(size)));
+        }
+    }
+    out
+}
+
+fn check_block_watch(kind: &str, dest_addr: u64, src: &[u8]) {
+    use std::sync::OnceLock;
+    static RANGES: OnceLock<Vec<(u64, u64)>> = OnceLock::new();
+    let ranges = RANGES.get_or_init(parse_block_watch_ranges);
+    if ranges.is_empty() {
+        return;
+    }
+    let end = dest_addr.saturating_add(src.len() as u64);
+    let Some(&(rs, re)) = ranges.iter().find(|(s, e)| dest_addr < *e && end > *s) else {
+        return;
+    };
+    let bt = std::backtrace::Backtrace::force_capture();
+    let dump_len = src.len().min(64);
+    eprintln!(
+        "[BLOCK_WATCH:{kind}] dest=0x{dest_addr:016X} len={} (range hit 0x{rs:X}..0x{re:X}) bytes[..{dump_len}]={:02x?}\n{bt}",
+        src.len(),
+        &src[..dump_len]
+    );
+}
+
 // SAFETY: Memory is used behind Arc<Mutex<>> and all raw pointers are
 // to long-lived objects (DeviceMemory, HostMemory, PageTable) that outlive Memory.
 unsafe impl Send for Memory {}
@@ -427,6 +470,25 @@ impl Memory {
     unsafe fn read_raw<T: Copy + Default>(&self, vaddr: u64) -> T {
         let ptr = self.get_pointer_impl(vaddr);
         if ptr.is_null() {
+            // RUZU_TRACE_UNMAPPED_BT=1 — capture host backtrace on the first
+            // few unmapped reads so we can identify the calling subsystem
+            // (HLE service code path, JIT trampoline, etc.). Throttled to
+            // 5 entries to avoid log spam.
+            if std::env::var_os("RUZU_TRACE_UNMAPPED_BT").is_some() {
+                use std::sync::atomic::{AtomicU32, Ordering};
+                static SHOWN: AtomicU32 = AtomicU32::new(0);
+                let n = SHOWN.fetch_add(1, Ordering::Relaxed);
+                if n < 5 {
+                    let bt = std::backtrace::Backtrace::force_capture();
+                    eprintln!(
+                        "[UNMAPPED_BT #{}] vaddr=0x{:016X} size={}\n{}",
+                        n,
+                        vaddr,
+                        std::mem::size_of::<T>() * 8,
+                        bt
+                    );
+                }
+            }
             log::error!(
                 "Unmapped Read{} @ {:#018x}",
                 std::mem::size_of::<T>() * 8,
@@ -590,6 +652,14 @@ impl Memory {
     pub fn write_block(&self, dest_addr: u64, src: &[u8]) -> bool {
         let size = src.len();
 
+        // RUZU_WATCH_BLOCK=START:LEN — emit a backtrace + first 64 bytes of
+        // the source whenever a block write touches [START, START+LEN). Used
+        // to find HLE-side writers of guest memory that the JIT
+        // memory_write_NN watch doesn't see.
+        if std::env::var_os("RUZU_WATCH_BLOCK").is_some() {
+            check_block_watch("write_block", dest_addr, src);
+        }
+
         // Upstream: AddressSpaceContains check before walking pages.
         if !self.address_space_contains(dest_addr, size) {
             log::error!("Unmapped WriteBlock @ {:#018x} size={:#x}", dest_addr, size);
@@ -664,7 +734,9 @@ impl Memory {
         {
             log::error!(
                 "zero_phys_block: phys {:#x}+{:#x} out of backing (backing_size={:#x})",
-                phys_addr, size, backing_size
+                phys_addr,
+                size,
+                backing_size
             );
             return;
         }

@@ -213,13 +213,44 @@ impl KHandleTable {
 
     /// Look up an object by handle.
     pub fn get_object(&self, handle: Handle) -> Option<u64> {
-        let (index, _linear_id, reserved) = decode_handle(handle);
+        let (index, linear_id, reserved) = decode_handle(handle);
         if reserved != 0 {
+            // RUZU_HANDLE_MISS_TRACE=1 — log every reserved!=0 handle lookup.
+            // Useful to surface lookups where the value is architecturally
+            // invalid (e.g., 0x1 → linear_id=0 → reserved=0 but linear_id=0
+            // also fails is_valid_handle).
+            if std::env::var_os("RUZU_HANDLE_MISS_TRACE").is_some() {
+                eprintln!(
+                    "[HANDLE_MISS] handle=0x{:08X} reserved={} (architecturally invalid)",
+                    handle, reserved
+                );
+            }
             return None;
         }
         if self.is_valid_handle(handle) {
             Some(self.objects[index as usize])
         } else {
+            // RUZU_HANDLE_MISS_TRACE=1 — log misses with full diagnostic. The
+            // common failure mode for STK was `handle=0x1` (linear_id=0)
+            // surfacing here because libnx parsed `0x1` from an IPC reply
+            // slot that should have contained a handle but actually held a
+            // domain object ID or raw payload byte.
+            if std::env::var_os("RUZU_HANDLE_MISS_TRACE").is_some() {
+                let stored_obj = if (index as usize) < self.objects.len() {
+                    self.objects[index as usize]
+                } else {
+                    0
+                };
+                let stored_lin = if (index as usize) < self.entry_infos.len() {
+                    unsafe { self.entry_infos[index as usize].linear_id }
+                } else {
+                    0
+                };
+                eprintln!(
+                    "[HANDLE_MISS] handle=0x{:08X} index={} linear_id={} stored_obj={} stored_linear_id={} table_size={} count={}",
+                    handle, index, linear_id, stored_obj, stored_lin, self.table_size, self.count
+                );
+            }
             None
         }
     }

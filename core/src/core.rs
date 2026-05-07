@@ -934,23 +934,15 @@ impl System {
                     dram_memory_map::BASE + APPLICATION_POOL_OFFSET,
                     APPLICATION_POOL_SIZE,
                 ),
-                (
-                    dram_memory_map::BASE + APPLET_POOL_OFFSET,
-                    APPLET_POOL_SIZE,
-                ),
-                (
-                    dram_memory_map::BASE + SECURE_POOL_OFFSET,
-                    SECURE_POOL_SIZE,
-                ),
+                (dram_memory_map::BASE + APPLET_POOL_OFFSET, APPLET_POOL_SIZE),
+                (dram_memory_map::BASE + SECURE_POOL_OFFSET, SECURE_POOL_SIZE),
             );
             let layout_arc = kernel
                 .get_memory_layout()
                 .expect("memory layout just initialized");
             {
                 let layout = layout_arc.lock().unwrap();
-                kernel
-                    .memory_manager_mut()
-                    .initialize_from_layout(&*layout);
+                kernel.memory_manager_mut().initialize_from_layout(&*layout);
             }
 
             // Initialize the kernel-wide system resource limit. Upstream:
@@ -958,9 +950,7 @@ impl System {
             // total_size = sum of all pool sizes; kernel_size is the kernel's
             // own reserved region (the [DRAM_BASE..APPLICATION_POOL_OFFSET)
             // span between 0x80000000 and 0x84000000 = 64 MiB).
-            let total_size = (SECURE_POOL_SIZE
-                + APPLET_POOL_SIZE
-                + APPLICATION_POOL_SIZE) as i64;
+            let total_size = (SECURE_POOL_SIZE + APPLET_POOL_SIZE + APPLICATION_POOL_SIZE) as i64;
             let kernel_size = APPLICATION_POOL_OFFSET as i64;
             kernel.initialize_system_resource_limit(total_size, kernel_size);
 

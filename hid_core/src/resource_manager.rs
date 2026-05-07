@@ -106,6 +106,18 @@ impl ResourceManager {
         }
     }
 
+    /// Wires the kernel-backed shared-memory factory used by AppletResource.
+    /// Must be called by the `core` crate during HID startup, before any IPC
+    /// path triggers `create_applet_resource` / `register_core_applet_resource`.
+    pub fn set_shared_memory_backing(
+        &self,
+        backing: Arc<dyn crate::resources::shared_memory_holder::KSharedMemoryBacking>,
+    ) {
+        if let Some(ref applet_resource) = self.applet_resource {
+            applet_resource.lock().set_shared_memory_backing(backing);
+        }
+    }
+
     pub fn initialize(&mut self) {
         if self.is_initialized {
             return;
@@ -309,10 +321,14 @@ impl ResourceManager {
     /// Port of upstream `ResourceManager::GetSharedMemoryHandle`.
     ///
     /// The upstream owner returns a `Kernel::KSharedMemory*`. The Rust port
-    /// preserves method ownership and validation here, but returns the
-    /// validated applet-resource slot index because `hid_core` cannot name
-    /// kernel types without a `core` dependency cycle.
-    pub fn get_shared_memory_handle(&self, aruid: u64) -> Result<usize, ResultCode> {
+    /// preserves method ownership and validation here. `hid_core` returns the
+    /// holder's keepalive as `Arc<dyn Any + Send + Sync>` (since it cannot
+    /// name `KSharedMemory` directly), and the `core` IPC layer downcasts it
+    /// to `Arc<KSharedMemory>` to register on the process handle table.
+    pub fn get_shared_memory_handle(
+        &self,
+        aruid: u64,
+    ) -> Result<std::sync::Arc<dyn std::any::Any + Send + Sync>, ResultCode> {
         let _lock = self.shared_mutex.read();
         let Some(ref resource) = self.applet_resource else {
             return Err(hid_result::RESULT_SHARED_MEMORY_NOT_INITIALIZED);

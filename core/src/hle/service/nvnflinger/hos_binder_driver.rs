@@ -124,12 +124,15 @@ impl IHosBinderDriver {
 
         if let Some(binder) = svc.server.try_get_binder(id) {
             binder.transact(transaction_id, &parcel_data, &mut parcel_reply, flags);
+            // For txn=1 (RequestBuffer) dump up to 400 bytes; the GraphicBuffer
+            // payload is ~380 bytes and we want to byte-diff against zuyu.
+            let dump_len = if transaction_id == 1 { 400 } else { 32 };
             trace_binder_txn(format_args!(
                 "IHOSBinderDriver::TransactParcel reply id={} txn={} reply_len={} first_bytes=[{:02x?}]",
                 id,
                 transaction_id,
                 parcel_reply.len(),
-                &parcel_reply[..parcel_reply.len().min(32)]
+                &parcel_reply[..parcel_reply.len().min(dump_len)]
             ));
         } else {
             log::warn!("TransactParcel: binder id={} not found", id);
@@ -215,20 +218,20 @@ impl IHosBinderDriver {
             );
         }
 
-        let handle = ctx
-            .copy_handle_for_readable_event(readable_event)
+        let object_id = ctx
+            .register_readable_event_object(readable_event)
             .unwrap_or(0);
         if std::env::var_os("RUZU_TRACE_BINDER_HANDLE").is_some() {
             log::info!(
-                "IHOSBinderDriver::GetNativeHandle copy id={} type_id={} handle=0x{:08X}",
+                "IHOSBinderDriver::GetNativeHandle copy id={} type_id={} object_id={:#x}",
                 id,
                 type_id,
-                handle
+                object_id
             );
         }
         let mut rb = ResponseBuilder::new(ctx, 2, 1, 0);
         rb.push_result(RESULT_SUCCESS);
-        rb.push_copy_objects(handle);
+        rb.push_copy_object_id(object_id);
     }
 
     /// cmd 3: TransactParcelAuto (same as TransactParcel but with AutoSelect buffers)

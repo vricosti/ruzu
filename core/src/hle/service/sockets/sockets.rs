@@ -6,6 +6,10 @@
 //!
 //! Socket service registration and common types.
 
+use super::bsd::{Bsd, BsdCfg};
+use super::nsd::Nsd;
+use super::sfdnsres::Sfdnsres;
+
 /// Errno values matching upstream.
 ///
 /// Corresponds to `Errno` in upstream sockets.h.
@@ -172,19 +176,36 @@ pub fn loop_process(system: crate::core::SystemRef) {
 
     let mut server_manager = ServerManager::new(system);
 
-    let stub_names = &["bsd:u", "bsd:s", "bsdcfg", "nsd:u", "nsd:a", "sfdnsres"];
-    for &name in stub_names {
-        let svc_name = name.to_string();
-        server_manager.register_named_service(
-            name,
-            Box::new(move || -> SessionRequestHandlerPtr {
-                std::sync::Arc::new(crate::hle::service::services::GenericStubService::new(
-                    &svc_name,
-                ))
-            }),
-            16,
-        );
-    }
+    server_manager.register_named_service(
+        "bsd:s",
+        Box::new(|| -> SessionRequestHandlerPtr { std::sync::Arc::new(Bsd::new(true)) }),
+        16,
+    );
+    server_manager.register_named_service(
+        "bsd:u",
+        Box::new(|| -> SessionRequestHandlerPtr { std::sync::Arc::new(Bsd::new(false)) }),
+        16,
+    );
+    server_manager.register_named_service(
+        "bsdcfg",
+        Box::new(|| -> SessionRequestHandlerPtr { std::sync::Arc::new(BsdCfg::new()) }),
+        16,
+    );
+    server_manager.register_named_service(
+        "nsd:a",
+        Box::new(|| -> SessionRequestHandlerPtr { std::sync::Arc::new(Nsd::new("nsd:a")) }),
+        16,
+    );
+    server_manager.register_named_service(
+        "nsd:u",
+        Box::new(|| -> SessionRequestHandlerPtr { std::sync::Arc::new(Nsd::new("nsd:u")) }),
+        16,
+    );
+    server_manager.register_named_service(
+        "sfdnsres",
+        Box::new(|| -> SessionRequestHandlerPtr { std::sync::Arc::new(Sfdnsres::new()) }),
+        16,
+    );
 
     server_manager.start_additional_host_threads("bsdsocket", 2);
 

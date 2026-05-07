@@ -48,7 +48,8 @@ pub fn get_info(
         | InfoType::TotalNonSystemMemorySize
         | InfoType::UsedNonSystemMemorySize
         | InfoType::IsApplication
-        | InfoType::FreeThreadCount => {
+        | InfoType::FreeThreadCount
+        | InfoType::AliasRegionExtraSize => {
             if info_sub_id != 0 {
                 return RESULT_INVALID_ENUM_VALUE;
             }
@@ -147,6 +148,11 @@ pub fn get_info(
                     } else {
                         *result = 0;
                     }
+                }
+                InfoType::AliasRegionExtraSize => {
+                    // Local fw-18+ extension used by newer homebrew/libnx.
+                    // When no extra 39-bit alias region is configured, the kernel returns 0.
+                    *result = 0;
                 }
                 _ => {
                     log::error!("Unimplemented svcGetInfo id=0x{:X}", info_id_type as u32);
@@ -301,4 +307,64 @@ pub fn get_system_info(
 ) -> ResultCode {
     log::warn!("svc::GetSystemInfo: Upstream UNIMPLEMENTED");
     RESULT_NOT_IMPLEMENTED
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::System;
+    use crate::hle::kernel::k_process::KProcess;
+    use crate::hle::kernel::k_thread::KThread;
+    use std::sync::{Arc, Mutex};
+
+    fn test_system() -> System {
+        let mut system = System::new_for_test();
+
+        let process = Arc::new(crate::hle::kernel::k_process::ProcessLock::from_value(
+            KProcess::new(),
+        ));
+        {
+            let mut process_guard = process.lock().unwrap();
+            process_guard.process_id = 1;
+            process_guard.initialize_handle_table();
+        }
+
+        let current_thread = Arc::new(crate::hle::kernel::k_thread::KThreadLock::new(
+            KThread::new(),
+        ));
+        {
+            let mut thread = current_thread.lock().unwrap();
+            thread.thread_id = 1;
+            thread.object_id = 1;
+        }
+        process
+            .lock()
+            .unwrap()
+            .register_thread_object(current_thread);
+
+        let scheduler = Arc::new(Mutex::new(
+            crate::hle::kernel::k_scheduler::KScheduler::new(0),
+        ));
+        scheduler.lock().unwrap().initialize(1, 0, 0);
+        let shared_memory = process.lock().unwrap().get_shared_memory();
+
+        system.set_current_process_arc(process);
+        system.set_scheduler_arc(scheduler);
+        system.set_shared_process_memory(shared_memory);
+        system.set_runtime_program_id(1);
+        system.set_runtime_64bit(false);
+        system
+    }
+
+    #[test]
+    fn alias_region_extra_size_returns_zero() {
+        let system = test_system();
+        let mut result = u64::MAX;
+
+        assert_eq!(
+            get_info(&system, &mut result, InfoType::AliasRegionExtraSize, 0, 0),
+            RESULT_SUCCESS
+        );
+        assert_eq!(result, 0);
+    }
 }

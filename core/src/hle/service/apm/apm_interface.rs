@@ -408,6 +408,10 @@ impl SessionRequestHandler for ApmSys {
     fn service_name(&self) -> &str {
         "apm:sys"
     }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
 }
 
 impl ServiceFramework for ApmSys {

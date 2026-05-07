@@ -384,10 +384,7 @@ impl KMemoryManager {
     ///     }
     /// }
     /// ```
-    pub fn initialize_from_layout(
-        &mut self,
-        layout: &super::k_memory_layout::KMemoryLayout,
-    ) {
+    pub fn initialize_from_layout(&mut self, layout: &super::k_memory_layout::KMemoryLayout) {
         use super::k_memory_region_type::*;
         for region in layout.get_physical_memory_region_tree().iter() {
             if !region.is_derived_from(K_MEMORY_REGION_TYPE_DRAM_USER_POOL) {
@@ -582,8 +579,7 @@ impl KMemoryManager {
             let mut cur_idx = pool_first;
             while let Some(idx) = cur_idx {
                 while remaining >= pages_per_alloc {
-                    let allocated_block =
-                        managers[idx].m_heap.allocate_block(index, random);
+                    let allocated_block = managers[idx].m_heap.allocate_block(index, random);
                     if allocated_block == 0 {
                         break;
                     }
@@ -612,10 +608,7 @@ impl KMemoryManager {
 
     /// Free every block currently in `pg` back to its owning Impl. Upstream
     /// uses an `ON_RESULT_FAILURE` lambda that does the same walk.
-    fn free_page_group_blocks(
-        managers: &mut [Impl],
-        pg: &super::k_page_group::KPageGroup,
-    ) {
+    fn free_page_group_blocks(managers: &mut [Impl], pg: &super::k_page_group::KPageGroup) {
         let blocks: Vec<(u64, usize)> = pg
             .iter()
             .map(|b| (b.get_address(), b.get_num_pages()))

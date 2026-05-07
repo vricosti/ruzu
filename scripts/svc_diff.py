@@ -209,6 +209,18 @@ def parse_ruzu(path, target_tid=73):
                 if m and cur["tls_rsp_tls"] is None:
                     cur["tls_rsp_tls"] = (int(m.group(1), 16), m.group(2).strip())
             elif "OUT_BUF" in line:
+                # Skip OUT_BUF_XDESC lines and the WriteToOutgoingCommandBuffer
+                # data dump that follows them — both read from
+                # `buffer_x_descriptors[0]` which on zuyu's existing
+                # instrumentation path holds the PREVIOUS request's
+                # X-descriptor (stale across IPCs), not the current one.
+                # The clean ground-truth OUT_BUF for diffing comes from
+                # the per-WriteBufferB/C trace mirror added in this
+                # investigation pass; that's the only one we keep.
+                if "OUT_BUF_XDESC" in line:
+                    continue
+                if "WriteToOutgoingCommandBuffer" in line:
+                    continue
                 m = OUT_BUF_RE.search(line)
                 if m:
                     cur["out_buf"] = (
@@ -269,6 +281,15 @@ def parse_zuyu(path, target_tid=75):
                     grouped = " ".join(bytes_hex[i : i + 8] for i in range(0, len(bytes_hex), 8))
                     cur["tls_rsp"] = (int(m.group(1), 16), grouped)
             elif "OUT_BUF" in line:
+                # Skip OUT_BUF_XDESC lines and the WriteToOutgoingCommandBuffer
+                # data dump that follows them — same reason as parse_ruzu.
+                # The clean ground-truth OUT_BUF for diffing comes from
+                # the per-WriteBufferB/C trace mirror added in this
+                # investigation pass; that's the only one we keep.
+                if "OUT_BUF_XDESC" in line:
+                    continue
+                if "WriteToOutgoingCommandBuffer" in line:
+                    continue
                 m = OUT_BUF_RE.search(line)
                 if m:
                     cur["out_buf"] = (
@@ -386,19 +407,36 @@ def main():
             r_addr, r_size, r_hex = r_ob
             z_addr, z_size, z_hex = z_ob
             # Addresses may differ across runs due to allocator ordering;
-            # only compare content bytes + size.
-            if r_size != z_size:
-                print(f"\n[SVC #{i+1}] OUT_BUF SIZE DIFFERS "
-                      f"(imm=0x{r['imm']:02x}): ruzu=0x{r_size:x} zuyu=0x{z_size:x}")
-                print(f"  ruzu @0x{r_addr:x}: {r_hex}")
-                print(f"  zuyu @0x{z_addr:x}: {z_hex}")
-                return
-            if r_hex != z_hex:
+            # only compare content bytes.
+            #
+            # Size mismatch alone is treated as benign IF the shared prefix
+            # bytes match: one side may zero-pad the entire client buffer
+            # while the other writes only the meaningful parcel — both are
+            # legal as long as the cmif response size word agrees, and the
+            # game only reads up to that size. The diff cares about
+            # content divergence, not handler buffer-fill style.
+            r_bytes = r_hex.replace(" ", "")
+            z_bytes = z_hex.replace(" ", "")
+            common_chars = min(len(r_bytes), len(z_bytes))
+            if r_bytes[:common_chars] != z_bytes[:common_chars]:
                 print(f"\n[SVC #{i+1}] OUT_BUF DIFFERS "
-                      f"(imm=0x{r['imm']:02x}, size=0x{r_size:x}):")
+                      f"(imm=0x{r['imm']:02x}, ruzu_size=0x{r_size:x}, zuyu_size=0x{z_size:x}):")
                 print(f"  ruzu @0x{r_addr:x}: {r_hex}")
                 print(f"  zuyu @0x{z_addr:x}: {z_hex}")
                 return
+            # Tail-only difference (one side zero-padded further). Note &
+            # continue.
+            if r_size != z_size:
+                tail_zero_only = (
+                    r_bytes[common_chars:].replace("0", "") == ""
+                    and z_bytes[common_chars:].replace("0", "") == ""
+                )
+                if not tail_zero_only:
+                    print(f"\n[SVC #{i+1}] OUT_BUF TAIL DIFFERS (non-zero) "
+                          f"(imm=0x{r['imm']:02x}, ruzu_size=0x{r_size:x}, zuyu_size=0x{z_size:x}):")
+                    print(f"  ruzu @0x{r_addr:x}: {r_hex}")
+                    print(f"  zuyu @0x{z_addr:x}: {z_hex}")
+                    return
     print(f"\nNo divergence found in first {n} SVCs (at args/tls level).")
     if rsp_gate and suppressed_tail:
         print(

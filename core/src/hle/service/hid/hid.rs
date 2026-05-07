@@ -2,6 +2,7 @@
 //!
 //! Entry point for the HID service module.
 
+use std::any::Any;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -10,10 +11,68 @@ use hid_core::resource_manager::{
     ResourceManager, DEFAULT_UPDATE_NS, MOTION_UPDATE_NS, MOUSE_KEYBOARD_UPDATE_NS, NPAD_UPDATE_NS,
 };
 use hid_core::resources::hid_firmware_settings::HidFirmwareSettings;
+use hid_core::resources::shared_memory_holder::KSharedMemoryBacking;
 
 use crate::core_timing;
+use crate::hle::kernel::k_shared_memory::{KSharedMemory, MemoryPermission};
 use crate::hle::service::hle_ipc::{SessionRequestHandlerFactory, SessionRequestHandlerPtr};
 use crate::hle::service::server_manager::ServerManager;
+
+/// Implementation of `hid_core::KSharedMemoryBacking` that allocates real
+/// `KSharedMemory` objects from the kernel.
+///
+/// Mirrors upstream `SharedMemoryHolder::Initialize`:
+/// `KSharedMemory::Create + Initialize + Register`. Passed once into
+/// `ResourceManager::set_shared_memory_backing` at HID service startup so
+/// every `AppletResource::create_applet_resource` allocates a kernel-backed
+/// page that the daemon writes to and the guest maps via
+/// `IAppletResource::GetSharedMemoryHandle`.
+struct HidKSharedMemoryBacking {
+    system: crate::core::SystemRef,
+}
+
+impl HidKSharedMemoryBacking {
+    fn new(system: crate::core::SystemRef) -> Self {
+        Self { system }
+    }
+}
+
+impl KSharedMemoryBacking for HidKSharedMemoryBacking {
+    fn create(&self, size: usize) -> Option<(*mut u8, Arc<dyn Any + Send + Sync>)> {
+        let system_ptr =
+            self.system.get() as *const crate::core::System as *mut crate::core::System;
+        // SAFETY: SystemRef holds a stable pointer for the program lifetime;
+        // the &mut access below is serialized by virtue of being called from
+        // hid::loop_process initialization (single-threaded path).
+        let device_memory_ptr = unsafe { (*system_ptr).device_memory() as *const _ };
+        let kernel = unsafe { (*system_ptr).kernel_mut()? };
+
+        let mut shared_memory = KSharedMemory::new();
+        if shared_memory
+            .initialize(
+                unsafe { &*device_memory_ptr },
+                kernel.memory_manager_mut(),
+                MemoryPermission::None,
+                MemoryPermission::Read,
+                size,
+            )
+            .is_error()
+        {
+            return None;
+        }
+
+        let host_ptr = shared_memory.get_pointer_mut(0);
+        if host_ptr.is_null() {
+            return None;
+        }
+
+        // Box the KSharedMemory inside an Arc<dyn Any> for hid_core's opaque
+        // keepalive slot. The `core` side recovers it via downcast in
+        // IAppletResource::GetSharedMemoryHandle.
+        let keepalive: Arc<dyn Any + Send + Sync> = Arc::new(shared_memory);
+        Some((host_ptr, keepalive))
+    }
+}
 
 /// Named services registered by the HID module:
 /// - "hid"      -> IHidServer
@@ -30,6 +89,14 @@ pub fn loop_process(system: crate::core::SystemRef) {
         firmware_settings.clone(),
         hid_core,
     )));
+
+    // Wire up the kernel-backed shared-memory factory before any IPC handler
+    // can run. Mirrors upstream's behavior where `SharedMemoryHolder::Initialize`
+    // takes a `Core::System&` directly; ruzu cannot do that across the
+    // hid_core/core crate boundary so we inject the backing as a trait object.
+    resource_manager
+        .lock()
+        .set_shared_memory_backing(Arc::new(HidKSharedMemoryBacking::new(system.clone())));
 
     resource_manager.lock().initialize();
 

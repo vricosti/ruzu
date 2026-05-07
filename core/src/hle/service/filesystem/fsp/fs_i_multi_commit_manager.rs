@@ -5,8 +5,8 @@
 use std::collections::BTreeMap;
 
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
+use crate::hle::service::cmif_serialization::CmifResponse;
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
-use crate::hle::service::ipc_helpers::ResponseBuilder;
 use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
 
 /// IPC command table for IMultiCommitManager:
@@ -31,18 +31,18 @@ impl IMultiCommitManager {
         }
     }
 
-    /// Port of upstream IMultiCommitManager::Add (stubbed — returns success).
+    /// Port of upstream `IMultiCommitManager::Add` (stubbed — returns success).
     fn add_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         log::warn!("(STUBBED) IMultiCommitManager::Add");
-        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
-        rb.push_result(RESULT_SUCCESS);
+        let mut response = CmifResponse::result_only(ctx, RESULT_SUCCESS);
+        let _ = &mut response;
     }
 
-    /// Port of upstream IMultiCommitManager::Commit (stubbed — returns success).
+    /// Port of upstream `IMultiCommitManager::Commit` (stubbed — returns success).
     fn commit_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         log::warn!("(STUBBED) IMultiCommitManager::Commit");
-        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
-        rb.push_result(RESULT_SUCCESS);
+        let mut response = CmifResponse::result_only(ctx, RESULT_SUCCESS);
+        let _ = &mut response;
     }
 }
 

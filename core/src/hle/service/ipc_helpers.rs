@@ -229,6 +229,17 @@ impl<'a> ResponseBuilder<'a> {
             .push(KAutoObjectRef::Handle(handle));
     }
 
+    /// Push a copy object by kernel object id.
+    ///
+    /// Matches upstream `PushCopyObjects(O* ptr)` more closely than pre-resolving
+    /// a process handle in the service implementation.
+    pub fn push_copy_object_id(&mut self, object_id: u64) {
+        use super::hle_ipc::KAutoObjectRef;
+        self.context
+            .outgoing_copy_objects
+            .push(KAutoObjectRef::ObjectId(object_id));
+    }
+
     /// Push a move handle into the outgoing move objects list.
     ///
     /// Matches upstream `ResponseBuilder::PushMoveObjects(O* ptr)`.
@@ -301,10 +312,11 @@ impl<'a> ResponseBuilder<'a> {
             };
             child_manager.lock().unwrap().set_session_handler(iface);
 
-            // Create session and get handle.
-            let handle = self
+            // Create session and keep the client-session object unresolved until
+            // WriteToOutgoingCommandBuffer(), matching upstream PushIpcInterface.
+            let object_id = self
                 .context
-                .create_session_with_manager(child_manager.clone())
+                .create_session_with_manager_object_id(child_manager.clone())
                 .unwrap_or(0);
 
             // Register with ServerManager (matching upstream line 164).
@@ -319,7 +331,7 @@ impl<'a> ResponseBuilder<'a> {
                 }
             }
 
-            self.push_move_objects(handle);
+            self.push_move_object_id(object_id);
         }
     }
 
@@ -638,7 +650,7 @@ mod tests {
         let manager = Arc::new(Mutex::new(SessionRequestManager::new()));
         ctx.set_session_request_manager(manager);
 
-        let handle;
+        let object_id;
         {
             let mut rb = ResponseBuilder::new(&mut ctx, 2, 0, 1);
             rb.push_result(RESULT_SUCCESS);
@@ -646,23 +658,83 @@ mod tests {
         }
 
         assert_eq!(ctx.outgoing_move_objects.len(), 1);
-        handle = match &ctx.outgoing_move_objects[0] {
-            crate::hle::service::hle_ipc::KAutoObjectRef::Handle(handle) => *handle,
-            _ => panic!("expected handle-backed move object"),
+        object_id = match &ctx.outgoing_move_objects[0] {
+            crate::hle::service::hle_ipc::KAutoObjectRef::ObjectId(object_id) => *object_id,
+            _ => panic!("expected object-backed move object"),
         };
-        assert_ne!(handle, 0);
+        assert_ne!(object_id, 0);
 
         assert_eq!(ctx.write_to_outgoing_command_buffer(), RESULT_SUCCESS);
 
         let mem = memory.lock().unwrap();
         let handle_word = mem.read_32(tls_address + 12);
-        assert_eq!(handle_word, handle);
+        assert_ne!(handle_word, 0);
         assert!(process
             .lock()
             .unwrap()
             .handle_table
-            .get_object(handle)
+            .get_object(handle_word)
             .is_some());
+        assert_eq!(
+            process.lock().unwrap().handle_table.get_object(handle_word),
+            Some(object_id)
+        );
+    }
+
+    #[test]
+    fn push_copy_object_id_writes_copy_handle_into_response() {
+        use std::sync::{Arc, Mutex};
+
+        use crate::guest_memory::GuestMemory;
+        use crate::hle::kernel::k_process::KProcess;
+        use crate::hle::kernel::k_readable_event::KReadableEvent;
+        use crate::hle::kernel::k_thread::KThread;
+        use crate::hle::kernel::kernel::KernelCore;
+        use crate::memory::memory::Memory;
+
+        let kernel = Arc::new(Mutex::new(KernelCore::new()));
+        let memory = Arc::new(Mutex::new(Memory::new(Box::new(GuestMemory::new(0x2000)))));
+        let process = Arc::new(Mutex::new(KProcess::new()));
+        process.lock().unwrap().page_table.heap_region_start = 0;
+        process.lock().unwrap().page_table.heap_region_end = 0x2000;
+
+        let thread = Arc::new(Mutex::new(KThread::new()));
+        thread.lock().unwrap().tls_address = 0x100;
+        thread.lock().unwrap().parent = Some(Arc::downgrade(&process));
+
+        let mut ctx = HLERequestContext::new_with_thread(
+            Arc::clone(&kernel),
+            Arc::clone(&memory),
+            Arc::clone(&thread),
+        );
+
+        let readable_event = Arc::new(Mutex::new(KReadableEvent::new()));
+        readable_event.lock().unwrap().object_id = 0x2000_0001;
+        let object_id = ctx
+            .register_readable_event_object(Arc::clone(&readable_event))
+            .unwrap();
+
+        {
+            let mut rb = ResponseBuilder::new(&mut ctx, 2, 1, 0);
+            rb.push_result(RESULT_SUCCESS);
+            rb.push_copy_object_id(object_id);
+        }
+
+        assert_eq!(ctx.outgoing_copy_objects.len(), 1);
+        assert!(matches!(
+            ctx.outgoing_copy_objects[0],
+            crate::hle::service::hle_ipc::KAutoObjectRef::ObjectId(id) if id == object_id
+        ));
+
+        assert_eq!(ctx.write_to_outgoing_command_buffer(), RESULT_SUCCESS);
+
+        let mem = memory.lock().unwrap();
+        let handle_word = mem.read_32(0x100 + 12);
+        assert_ne!(handle_word, 0);
+        assert_eq!(
+            process.lock().unwrap().handle_table.get_object(handle_word),
+            Some(object_id)
+        );
     }
 
     #[test]

@@ -18,13 +18,27 @@ PAT = re.compile(
 )
 
 
+# Manual mapping from ruzu's Rust class names to zuyu's wire/short names.
+# ruzu logs the IPC service via std::any::type_name (Rust path),
+# zuyu logs the wire-protocol name registered with sm:. Without this map,
+# diffs misclassify identical IPC sequences as "only in zuyu / only in ruzu".
+#
+# Add new entries here as they show up in `only_in_*` summary output.
+_SERVICE_NAME_MAP = {
+    "IAudioRendererManager": "audren:u",
+    "IPlatformServiceManager": "pl:u",
+    "IApplicationProxyService": "appletOE",
+    "IStaticService": "mii:e",  # also used by other IStaticService classes; risk of collision
+}
+
+
 # Normalize Rust-qualified service names ("core::hle::service::...::IStorage")
 # down to the tail class name so they align with zuyu's short names.
 def _normalize_service(name):
     name = name.rstrip(":")
     if "::" in name:
         name = name.split("::")[-1]
-    return name
+    return _SERVICE_NAME_MAP.get(name, name)
 
 
 def parse(path):

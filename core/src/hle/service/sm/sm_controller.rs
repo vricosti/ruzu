@@ -116,23 +116,34 @@ impl Controller {
         // the parent's SessionRequestManager directly (not a new one).
         let parent_manager = ctx.get_manager().cloned();
 
-        let session_handle = if let Some(manager) = parent_manager {
+        let client_session_object_id = if let Some(manager) = parent_manager {
             log::info!("Controller::CloneCurrentObject: creating clone session");
-            ctx.create_session_with_manager(manager).unwrap_or(0)
+            let object_id = ctx
+                .create_session_with_manager_object_id(manager.clone())
+                .unwrap_or(0);
+            if let Some(server_manager) = manager.lock().unwrap().get_server_manager().cloned() {
+                if let Some(server_session) = ctx.last_created_server_session.take() {
+                    let _ = server_manager
+                        .lock()
+                        .unwrap()
+                        .register_session(server_session, manager.clone());
+                }
+            }
+            object_id
         } else {
             log::warn!("CloneCurrentObject: no manager to clone");
             0
         };
 
         log::info!(
-            "Controller::CloneCurrentObject: clone session handle={:#x}",
-            session_handle
+            "Controller::CloneCurrentObject: clone session object_id={:#x}",
+            client_session_object_id
         );
 
         let mut rb =
             ResponseBuilder::new_with_flags(ctx, 2, 0, 1, ResponseBuilderFlags::AlwaysMoveHandles);
         rb.push_result(RESULT_SUCCESS);
-        rb.push_move_objects(session_handle);
+        rb.push_move_object_id(client_session_object_id);
     }
 
     /// Clones the current session object (extended variant).
