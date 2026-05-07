@@ -12,7 +12,7 @@ use crate::hle::kernel::k_thread::KThreadLock;
 use crate::hle::kernel::kernel::KernelCore;
 use common::fiber::Fiber;
 use common::thread::Barrier;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 /// Per-core data held by the CPU manager.
@@ -178,6 +178,40 @@ impl CpuManager {
                 .expect("Failed to spawn CPU thread");
 
             self.core_data[core].host_thread = Some(handle);
+        }
+
+        // RUZU_FORCE_SAMPLE_MS=N — spawn a debug sampler thread that calls
+        // PhysicalCore::interrupt() on every core every N ms. Forces the JIT
+        // to halt periodically (returning HaltReason::EXTERNAL_HALT), which
+        // surfaces a SPIN trace sample via `cpu_manager.rs:686-718`. Used to
+        // identify the spin location during a CPU-bound JIT run that makes
+        // 0 SVCs (block-cache misses, ticks check, and SVCs all fail to fire).
+        if let Ok(s) = std::env::var("RUZU_FORCE_SAMPLE_MS") {
+            if let Ok(period_ms) = s.parse::<u64>() {
+                if period_ms >= 1 {
+                    let stop = self.stop_requested.clone();
+                    let kp = kernel_ptr as usize;
+                    let num = self.num_cores;
+                    let _ = std::thread::Builder::new()
+                        .name("RUZU_FORCE_SAMPLE".into())
+                        .spawn(move || {
+                            let kernel = unsafe { &*(kp as *const KernelCore) };
+                            log::warn!(
+                                "RUZU_FORCE_SAMPLE: sampler thread started, period={}ms cores={}",
+                                period_ms,
+                                num
+                            );
+                            while !stop.load(Ordering::Relaxed) {
+                                std::thread::sleep(std::time::Duration::from_millis(period_ms));
+                                for c in 0..num {
+                                    if let Some(pc) = kernel.physical_core(c) {
+                                        pc.interrupt();
+                                    }
+                                }
+                            }
+                        });
+                }
+            }
         }
     }
 
@@ -683,12 +717,39 @@ impl CpuManager {
                     // guest-code spin loop with no SVCs gets its PC/LR/SP
                     // surfaced via `kernel::{GUEST_PC,GUEST_LR,GUEST_SP}
                     // [core_index]` after each preempt.
-                    {
+                    let _spin_pc = {
                         let mut tc_pc = crate::arm::arm_interface::ThreadContext::default();
                         jit_ref.get_context(&mut tc_pc);
                         crate::hle::kernel::kernel::record_guest_full(
                             core_index, tc_pc.pc, tc_pc.lr, tc_pc.sp, &tc_pc.r,
                         );
+                        tc_pc
+                    };
+                    // RUZU_SPIN_TRACE=1 — log live PC/LR/key registers on
+                    // every halt for the configured tid (default 73).
+                    // Bypasses the preemption-thread SIGUSR1 dump path which
+                    // gets starved when the JIT thread saturates a host core.
+                    if std::env::var_os("RUZU_SPIN_TRACE").is_some() {
+                        let target_tid: u64 = std::env::var("RUZU_SPIN_TRACE_TID")
+                            .ok()
+                            .and_then(|s| s.parse().ok())
+                            .unwrap_or(73);
+                        let cur_tid = thread_arc.lock().unwrap().get_thread_id() as u64;
+                        if cur_tid == target_tid {
+                            static SPIN_COUNT: AtomicU64 = AtomicU64::new(0);
+                            let n = SPIN_COUNT.fetch_add(1, Ordering::Relaxed);
+                            // Throttle: log first 200, then every 1000th.
+                            if n < 200 || n % 1000 == 0 {
+                                eprintln!(
+                                    "[SPIN] n={} tid={} pc=0x{:016X} lr=0x{:016X} sp=0x{:016X} x21=0x{:X} x22=0x{:X} x7=0x{:X} x18=0x{:X} x20=0x{:X} halt={:?}",
+                                    n, cur_tid,
+                                    _spin_pc.pc, _spin_pc.lr, _spin_pc.sp,
+                                    _spin_pc.r[21], _spin_pc.r[22], _spin_pc.r[7],
+                                    _spin_pc.r[18], _spin_pc.r[20],
+                                    halt_reason
+                                );
+                            }
+                        }
                     }
                     let current_thread_id = thread_arc.lock().unwrap().get_thread_id();
                     let interrupt = halt_reason.contains(HaltReason::BREAK_LOOP);

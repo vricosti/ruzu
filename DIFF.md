@@ -196,6 +196,53 @@
 ### Binary layout verification
 - PASS: helper-only change; no raw-serialized structs affected.
 
+## 2026-05-06 — rdynarmic/src/frontend/a64/translate/floating_point_conversion_fixed_point.rs, rdynarmic/src/frontend/a64/translate/floating_point.rs, rdynarmic/src/frontend/a64/translate/visitor.rs, and rdynarmic/src/frontend/a64/translate/mod.rs vs /home/vricosti/Dev/emulators/zuyu/externals/dynarmic/src/dynarmic/frontend/A64/translate/impl/floating_point_conversion_fixed_point.cpp
+
+### Intentional differences
+- The fixed-point conversion methods now live in the matching owner file `floating_point_conversion_fixed_point.rs`, while `visitor.rs` and `mod.rs` only provide the mechanical Rust dispatch/module wiring. This preserves upstream method ownership.
+- Rust expresses the upstream typed IR calls through width-dispatched emitter helpers (`fp_fixed_to_single`, `fp_fixed_to_double`, `fp_to_fixed_s32/s64`, `fp_to_fixed_u32/u64`) instead of C++ overload resolution. This is a mechanical language adaptation with the same ownership and control flow.
+- `floating_point.rs` is now a residual counterpart shell rather than an active behavior owner. This keeps the upstream file-structure counterpart present while the real logic has been split into the dedicated upstream-matching files.
+
+### Unintentional differences (to fix)
+- `unallocated_encoding()` still routes through the tree's interpret-based fallback instead of the stricter upstream exception path, so invalid fixed-point encodings are not yet behaviorally identical at the trap/exception boundary.
+
+### Missing items
+- Re-audit whether the now-empty `floating_point.rs` counterpart should remain as a documented shell or be reduced further once every upstream floating-point owner file has a direct Rust counterpart.
+
+### Binary layout verification
+- PASS: translator-only slice; no raw-serialized structs or shared binary payloads are defined here.
+
+## 2026-05-06 — rdynarmic/src/frontend/a64/translate/mod.rs vs /home/vricosti/Dev/emulators/zuyu/externals/dynarmic/src/dynarmic/frontend/A64/translate/impl/*.cpp
+
+### Intentional differences
+- The Rust translator no longer keeps the extra local catch-all file `rdynarmic/src/frontend/a64/translate/floating_point.rs`. Upstream has no corresponding `floating_point.cpp`, so deleting the dead merged owner is closer to literal file-structure parity than preserving an empty local shell.
+- Shared scalar floating-point helper ownership remains in `rdynarmic/src/frontend/a64/translate/helpers.rs`, which is the closest Rust counterpart to upstream `impl.h` for cross-file translator helpers such as `FPGetDataSize`.
+
+### Unintentional differences (to fix)
+- `unallocated_encoding()` still routes through the tree's interpret-based fallback instead of the stricter upstream exception path, so invalid A64 floating-point encodings are not yet behaviorally identical at the trap boundary.
+
+### Missing items
+- Re-audit the remaining A64 translator helper ownership against upstream `impl.h` once more non-floating-point owner files are split or tightened.
+
+### Binary layout verification
+- PASS: module-graph cleanup only; no raw-serialized structs or shared binary payloads are involved.
+
+## 2026-05-06 — `rdynarmic/src/frontend/a64/types.rs`, `rdynarmic/src/frontend/a64/translate/visitor.rs`, and `rdynarmic/src/frontend/a64/translate/mod.rs` vs `/home/vricosti/Dev/emulators/zuyu/externals/dynarmic/src/dynarmic/interface/A64/config.h`, `/home/vricosti/Dev/emulators/zuyu/externals/dynarmic/src/dynarmic/frontend/A64/translate/impl/impl.cpp`, and `/home/vricosti/Dev/emulators/zuyu/externals/dynarmic/src/dynarmic/frontend/A64/translate/a64_translate.cpp`
+
+### Intentional differences
+- `decode_error()` now uses Rust `unreachable!()` instead of upstream `UNREACHABLE()`. This is the direct language-level equivalent and keeps the ownership in `visitor.rs`.
+- The Rust A64 exception enum now uses explicit `#[repr(u64)]` discriminants to match upstream callback-visible exception codes for the shared variants in `interface/A64/config.h`.
+
+### Unintentional differences (to fix)
+- `rdynarmic/src/frontend/a64/types.rs` still carries Rust-local `HypervisorCall` and `SupervisorCall` variants that do not exist in upstream A64 `config.h`. The shared exception code range now matches upstream for the common values, but the enum is still not a literal mirror.
+- `rdynarmic/src/frontend/a64/translate/exception.rs` still routes `HVC` to the Rust-local `HypervisorCall` exception and `SMC` to `interpret_this_instruction()`. Upstream A64 does not currently expose those local behaviors through `config.h`, so this file still needs a separate parity decision.
+
+### Missing items
+- Re-audit `HVC` / `SMC` behavior and remove or replace the Rust-local A64 exception variants if the goal remains literal upstream interface parity.
+
+### Binary layout verification
+- PASS: translator/control-flow slice only; no raw-serialized structs or shared binary payloads are defined here.
+
 ## 2026-03-29 — video_core/src/renderer_opengl/gl_rasterizer.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_rasterizer.cpp
 
 ### Intentional differences
@@ -1611,9 +1658,26 @@
 ### Missing items
 - Full upstream `ServiceContext::CreateEvent` / `KEvent` ownership is still represented as a Rust-only `KReadableEvent` plus copied handle owner, not a literal `KEvent*`.
 - Re-audit `IocCtrlClearEventWait` once the upstream host-action path exists in Rust.
+- `IocCtrlEventWait` still uses a Rust `SystemRef` raw-pointer bridge to reach `stall_application()` / `unstall_application()` because the current service-owner graph does not expose a literal mutable `Core::System&`. Behavior is now closer to upstream, but the access pattern is still an adaptation.
 
 ### Binary layout verification
 - PASS: `SyncpointEventValue`, `IocCtrlEventWaitParams`, and related ioctl structs remain unchanged; only event-slot lifecycle logic changed.
+
+## 2026-05-02 — `core/src/hle/service/nvdrv/devices/nvhost_ctrl.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/hle/service/nvdrv/devices/nvhost_ctrl.cpp` (`IocCtrlEventWait WaitHost stall/un-stall follow-up`)
+
+### Intentional differences
+- Rust still reaches `System::stall_application()` / `unstall_application()` through a raw-pointer `SystemRef` bridge in the matching owner file because the current service graph does not expose a literal mutable `Core::System&`. This preserves upstream behavior ordering without moving the logic out of `nvhost_ctrl.rs`.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: both `IocCtrlEventWait` fallback `WaitHost(...)` branches (`timeout == 0` and blocking wait) previously called `wait_host()` directly. Upstream wraps `WaitHost(...)` in `system.StallApplication(); ...; system.UnstallApplication();`. Rust now mirrors that lifecycle ordering in the matching owner file.
+
+### Missing items
+- `IocCtrlEventWait` still differs structurally from upstream around `NvEventsLock()` and `SCOPE_EXIT` because Rust models event storage with `Arc<Mutex<Vec<InternalEvent>>>` plus local lock scopes instead of the literal C++ owner fields and RAII helpers.
+
+### Binary layout verification
+- PASS: no ioctl/raw struct layout changed in this pass.
+- PASS: `cargo test -p core event_wait_non_allocation_fallback_wait_host_resets_fails_and_returns_target -- --nocapture`
+- PASS: `cargo build --bin ruzu-cmd`
 
 ## 2026-03-28 — `core/src/hle/service/nvdrv/devices/nvhost_as_gpu.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/hle/service/nvdrv/devices/nvhost_as_gpu.cpp`
 
@@ -12528,3 +12592,982 @@
 
 ### Binary layout verification
 - PASS: validation-only change; no guest-visible raw struct layout touched. Six focused regression tests added in `mod tests` (`can_contain_shared_rejects_address_in_alias_region`, `_in_heap_region`, `_accepts_alias_code_below_heap`, `can_contain_normal_excludes_alias_but_not_heap`, `can_contain_ipc_requires_alias_excludes_heap`, `can_contain_free_only_checks_region`) cover heap-edge / alias-edge addresses for the four behaviorally-distinct branches plus the SVC #530 MK8D wedge address. Workspace `cargo test` is currently broken by 128 pre-existing test-build errors unrelated to this change, so the new tests can't be run via cargo until those are repaired; release build (`cargo build --release --bin ruzu-cmd`) is clean.
+
+## 2026-05-02 — `hid_core/src/resources/shared_memory_format.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/hid_core/resources/shared_memory_format.h` and `/home/vricosti/Dev/emulators/zuyu/src/hid_core/resources/ring_lifo.h` (`SharedMemoryFormat default-construction follow-up`)
+
+### Intentional differences
+- Rust still expresses the nested `Lifo`/shared-memory object graph with explicit `Default` impls instead of C++ in-class field initializers plus `std::construct_at(...)`. This is an implementation-language adaptation only; the stored field values now match upstream's post-construction state.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `SharedMemoryFormat::initialize()` was a no-op that assumed zero-filled pages were sufficient. Upstream `SharedMemoryHolder::Initialize()` placement-constructs `SharedMemoryFormat` on the mapped page, which runs nested `Lifo` default initializers such as `total_buffer_count = max_buffer_size`. Rust now materializes the full default object graph in `SharedMemoryFormat::initialize()`, restoring the upstream live-page initialization contract instead of leaving nested lifos at all-zero state.
+
+### Missing items
+- `SharedMemoryFormat::initialize()` still relies on Rust `Default` impls rather than a more literal placement-construction model. Behavioral parity is restored for the active fields, but the allocation path is still not a byte-for-byte structural mirror of upstream construction.
+
+### Binary layout verification
+- PASS: `SharedMemoryFormat`, `NpadSharedMemoryEntry`, and `NpadInternalState` keep their existing `repr(C)` field order; only initialization behavior changed.
+- PASS: `cargo test -p hid_core initialize_materializes_lifo_default_state -- --nocapture`
+- PASS: `cargo build --bin ruzu-cmd`
+
+## 2026-05-02 — `hid_core/src/resources/npad/npad.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/hid_core/resources/npad/npad.cpp` (`remove local Lifo total_buffer_count patch from OnUpdate`)
+
+### Intentional differences
+- Rust `NPad::on_update()` still contains a temporary controller-presence shortcut: it synthesizes a fixed Fullkey controller state in `npad_entry[0]` because the full upstream `controller_data[aruid_index][i]` graph and `EmulatedController` callbacks are not yet ported.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `NPad::on_update()` locally patched `fullkey_lifo.total_buffer_count` and `system_ext_lifo.total_buffer_count` on every update to compensate for missing shared-memory construction. Upstream does not mutate those fields in `NPad::OnUpdate()`; they come from `Lifo` default construction. Rust no longer keeps that behavior in the wrong owner file.
+
+### Missing items
+- The bigger temporary shortcut remains: `NPad::on_update()` still writes a synthetic Fullkey/system-ext state rather than executing the upstream controller iteration, connect/disconnect path, and per-style LIFO updates.
+
+### Binary layout verification
+- PASS: no layout changes in this pass; only ownership of `total_buffer_count` initialization moved.
+- PASS: `cargo build --bin ruzu-cmd`
+
+## 2026-05-05 — `core/src/hle/service/hle_ipc.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/hle/service/hle_ipc.cpp` and `/home/vricosti/Dev/emulators/zuyu/src/core/hle/service/hle_ipc.h` (`object-owned clone/session response translation follow-up`)
+
+### Intentional differences
+- Rust still models outgoing copied/moved kernel objects as `KAutoObjectRef::{ObjectId, Handle}` rather than raw `KAutoObject*`, because kernel object ownership is expressed through process object IDs and `Arc<Mutex<...>>` on this tree.
+- Rust currently carries extra local diagnostics in this file (`trace_out_buf`, `trace_out_buf_xdesc`, and related logging gates) to compare IPC buffer writes against upstream while STK investigation is active. These are investigation-only and not part of the upstream owner surface.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: the helper path for synthetic child sessions only exposed `create_session_with_manager(...) -> Handle`, which pre-resolved a process handle too early. Upstream stores the client session object and only translates it to a handle in `WriteToOutgoingCommandBuffer()`. Rust now also exposes `create_session_with_manager_object_id(...) -> object_id`, and the owner path can defer handle translation to the outgoing-buffer phase.
+
+### Missing items
+- Re-audit all remaining service paths that still push pre-resolved handles where upstream pushes move objects, not just the `CloneCurrentObject` / `PushIpcInterface` paths fixed here.
+- Remove the temporary IPC out-buffer diagnostics once the current STK crash frontier is understood and no longer needs them.
+
+### Binary layout verification
+- PASS: IPC response ownership/translation change only; no guest-visible raw struct layout changed.
+- PASS: `cargo build --release --bin ruzu-cmd`
+
+## 2026-05-05 — `core/src/hle/service/ipc_helpers.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/hle/service/ipc_helpers.h` (`PushIpcInterface object-vs-handle parity follow-up`)
+
+### Intentional differences
+- Rust still uses `push_move_object_id(...)` / `KAutoObjectRef::ObjectId` instead of storing the literal upstream `KClientSession&` pointer because the Rust kernel object graph is keyed by object ID rather than raw object pointer identity.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: non-domain `ResponseBuilder::push_ipc_interface(...)` created a child session and immediately pushed a resolved handle into `outgoing_move_objects`. Upstream `IPC::ResponseBuilder::PushIpcInterface(...)` stores the client session object and lets `WriteToOutgoingCommandBuffer()` allocate the handle later. Rust now mirrors that ownership and defers translation.
+
+### Missing items
+- Re-audit whether any other `ResponseBuilder` helpers still bypass the upstream object-owned response path by injecting handles directly.
+
+### Binary layout verification
+- PASS: response-object ownership change only; no guest-visible raw buffer layout changed.
+- PASS: focused regression updated to assert TLS handle translation from an object-backed move response.
+- PASS: `cargo build --release --bin ruzu-cmd`
+
+## 2026-05-05 — `core/src/hle/service/sm/sm_controller.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/hle/service/sm/sm_controller.cpp` (`CloneCurrentObject owner-path parity follow-up`)
+
+### Intentional differences
+- Rust still creates clone sessions through `HLERequestContext` helper methods instead of calling the literal kernel `KSession::Create/Initialize/Register` sequence inline in this file, because the current Rust kernel/session construction API is centralized in the request-context owner graph.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `Controller::clone_current_object(...)` created a clone session and pushed a pre-resolved handle into the response. Upstream `Controller::CloneCurrentObject(...)` registers the new server session with the existing `SessionRequestManager`, then pushes the client session object via `ResponseBuilder(... AlwaysMoveHandles)` so handle translation happens later. Rust now mirrors that behavior by creating an object-owned clone session, registering the new server session with the parent `ServerManager`, and pushing the unresolved client-session object ID.
+
+### Missing items
+- Runtime STK still logs `SendSyncRequest: handle 0x1 not in handle table` after the clone path has been corrected, so there is at least one additional invalid-handle or response-interpretation bug beyond this owner-path fix.
+- `CloneCurrentObjectEx` still forwards directly to `clone_current_object()`; this matches upstream today, but the path should be re-audited if upstream changes.
+
+### Binary layout verification
+- PASS: service owner-path change only; no guest-visible raw struct layout changed.
+- PASS: `cargo build --release --bin ruzu-cmd`
+
+## 2026-05-05 — `core/src/hle/service/hle_ipc.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/hle/service/hle_ipc.cpp` and `/home/vricosti/Dev/emulators/zuyu/src/core/hle/service/hle_ipc.h` (`readable-event copy-object parity follow-up`)
+
+### Intentional differences
+- Rust still exposes both `copy_handle_for_readable_event(...)` and `register_readable_event_object(...)` because this tree still contains older service paths that pre-resolve handles. Upstream only models the object-owned path at the IPC boundary.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: readable-event copy-handle responses only had the pre-resolved helper path, which encouraged service owners to allocate process handles too early. Rust now also exposes `register_readable_event_object(...)`, so services can mirror upstream `OutCopyHandle<KReadableEvent>` ownership and defer final handle translation to `WriteToOutgoingCommandBuffer()`.
+
+### Missing items
+- Re-audit the remaining event/copy-handle services that still call `copy_handle_for_readable_event(...)` and push pre-resolved handles into `ResponseBuilder`.
+
+### Binary layout verification
+- PASS: IPC handle-translation owner change only; no guest-visible raw struct layout changed.
+- PASS: `cargo build --release --bin ruzu-cmd`
+
+## 2026-05-05 — `core/src/hle/service/ipc_helpers.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/hle/service/ipc_helpers.h` (`PushCopyObjects object-vs-handle parity follow-up`)
+
+### Intentional differences
+- Rust still exposes both `push_copy_objects(handle)` and `push_copy_object_id(object_id)` because many service owners on this tree still return pre-resolved handles. Upstream only exposes the object-owned API surface.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: there was no copy-object equivalent to the move-object owner path restored earlier. `ResponseBuilder` now exposes `push_copy_object_id(...)`, which matches upstream `PushCopyObjects(O* ptr)` ownership more closely and lets service files defer handle creation to `WriteToOutgoingCommandBuffer()`.
+
+### Missing items
+- Re-audit all copy-handle-returning services and convert the non-upstream pre-resolved-handle paths that still remain.
+- Focused regression was added locally, but `cargo test -p core` is still blocked by pre-existing unrelated test-build failures elsewhere in the crate.
+
+### Binary layout verification
+- PASS: response-object ownership change only; no guest-visible raw buffer layout changed.
+- PASS: focused regression added for copy-object TLS handle translation.
+- PASS: `cargo build --release --bin ruzu-cmd`
+
+## 2026-05-05 — `core/src/hle/service/nvnflinger/hos_binder_driver.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/hle/service/nvnflinger/hos_binder_driver.cpp` (`GetNativeHandle copy-object parity follow-up`)
+
+### Intentional differences
+- Rust still performs extra `register_native_handle_owner(...)` bookkeeping before returning the readable event, because this tree needs a Rust-only process/scheduler bridge so later event signaling can wake `WaitSynchronization` users correctly.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `IHOSBinderDriver::get_native_handle_handler(...)` used `copy_handle_for_readable_event(...)` and then `push_copy_objects(handle)`, which pre-resolved the returned event handle in the service owner. Upstream returns `OutCopyHandle<KReadableEvent>` and leaves final handle-table translation to the IPC writer. Rust now registers the readable-event object and pushes it as a copy object instead.
+
+### Missing items
+- STK runtime still shows `SendSyncRequest: handle 0x1 not in handle table` before the Binder path and still crashes after the first `SignalProcessWideKey`, so the active STK blocker is not resolved by this Binder copy-handle parity fix.
+
+### Binary layout verification
+- PASS: Binder copy-handle owner-path change only; no guest-visible raw parcel or IPC buffer layout changed.
+- PASS: `cargo build --release --bin ruzu-cmd`
+
+## 2026-05-05 — `core/src/hle/kernel/svc/svc_info.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/svc/svc_info.cpp` (`AliasRegionExtraSize follow-up for newer homebrew`)
+
+### Intentional differences
+- Rust handles `InfoType::AliasRegionExtraSize (0x1C)` and returns `0` when no extra alias region is configured. This enum value is not present in the current upstream `svc_info.cpp` source of truth, but the Rust tree already exposes the newer `InfoType` variant and STK/libnx requests it at runtime. Returning `0` matches the documented “no extra alias region configured” behavior for the local newer-fw extension.
+
+### Unintentional differences (to fix)
+- `svc_info.rs` still diverges structurally from upstream because the newer local `InfoType` variants (`AliasRegionExtraSize`, plus other non-upstream additions in `svc_types.rs`) are not represented in the current upstream C++ file set.
+- `ThreadTickCount` and `IdleTickCount` remain behaviorally reduced versus upstream in this file.
+
+### Missing items
+- Re-audit whether `IsSvcPermitted` and `IoRegionHint` should remain exposed in the Rust enum without corresponding upstream `GetInfo` handling in this tree.
+
+### Binary layout verification
+- PASS: no raw struct layout changed.
+- PASS: focused regression added for `AliasRegionExtraSize -> 0`.
+
+## 2026-05-05 — `core/src/arm/dynarmic/arm_dynarmic_64.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/arm/dynarmic/arm_dynarmic_64.cpp` and `/home/vricosti/Dev/emulators/zuyu/src/core/arm/dynarmic/arm_dynarmic_64.h` (`A64 memory-watch and optimization-mask diagnostics for STK crash frontier`)
+
+### Intentional differences
+- Rust now carries temporary local diagnostics in the matching owner file that upstream does not have:
+  - `RUZU_WATCH_ADDR`-driven A64 memory read/write logging
+  - `RUZU_A64_OPTIMIZATION_MASK`
+  - `RUZU_A64_NO_OPTIMIZATIONS`
+- These are investigation-only controls for the active STK JIT crash frontier. They are isolated to `arm_dynarmic_64.rs` and do not change normal runtime behavior when unset.
+
+### Unintentional differences (to fix)
+- `arm_dynarmic_64.rs` still diverges structurally from upstream because it lacks the literal parent-owned callback graph used by C++ (`DynarmicCallbacks64(ArmDynarmic64& parent, KProcess* process)`), so diagnostics cannot yet report the exact guest PC/register state on each watched A64 access the way the A32 Rust file can.
+
+### Missing items
+- Re-audit whether the active STK crash is a Dynarmic fast-dispatch / block-linking issue and unwind these diagnostics once the frontier is resolved.
+- The Rust A64 backend still lacks the richer per-access PC/register diagnostics currently present in `arm_dynarmic_32.rs`.
+
+### Binary layout verification
+- PASS: no guest-visible raw struct layout changed; instrumentation only.
+- PASS: focused unit tests added for watch-range parsing and A64 optimization-mask parsing.
+- PASS: `cargo build --release --bin ruzu-cmd`
+
+## 2026-05-05 — `core/src/arm/dynarmic/arm_dynarmic_64.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/arm/dynarmic/arm_dynarmic_64.cpp` and `/home/vricosti/Dev/emulators/zuyu/src/core/arm/dynarmic/arm_dynarmic_64.h` (`A64 SVC register-halt diagnostics for STK handle corruption`)
+
+### Intentional differences
+- Rust now carries temporary `RUZU_TRACE_A64_SVC_REGS` diagnostics in the matching owner file. When enabled, `run_thread()`, `step_thread()`, and `get_svc_arguments()` dump the live A64 `x0..x7`, `pc`, and latched `svc` number at the exact SVC halt frontier. Upstream has no equivalent logging.
+
+### Unintentional differences (to fix)
+- `ArmDynarmic64` still does not expose the literal parent-owned callback graph from upstream, so the callback itself cannot print the live guest registers at `CallSVC(...)`. The current diagnostics therefore log immediately after `jit.run()/step()` returns and again in `get_svc_arguments()`, which is close to but not identical to upstream ownership.
+
+### Missing items
+- Use these diagnostics to determine whether STK's bad `SendSyncRequest(handle=0x1)` already exists in the JIT register file at SVC halt or is introduced later by Rust-side SVC argument handling.
+- Remove the temporary diagnostics once the active STK A64 corruption frontier is fixed.
+
+### Binary layout verification
+- PASS: instrumentation only; no guest-visible raw struct layout changed.
+
+## 2026-05-06 — `core/src/arm/dynarmic/arm_dynarmic_64.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/arm/dynarmic/arm_dynarmic_64.cpp`
+
+### Intentional differences
+- Rust now exposes temporary investigation-only `RUZU_TRACE_A64_ACCESS_PC` / `RUZU_TRACE_A64_ACCESS_LIMIT` diagnostics in the matching owner file to log bounded guest memory accesses for a chosen A64 PC. Upstream has no equivalent tracing surface.
+- The new tracing reuses the Rust-local `watch_context()` access to `A64JitState`, which is already part of the existing diagnostic-only divergence in this file.
+
+### Unintentional differences (to fix)
+- The temporary access tracing is not upstream behavior and should be removed once the active STK guest-heap corruption frontier is isolated.
+
+### Missing items
+- None in the upstream behavioral owner path for this slice; this change is diagnostics only.
+
+### Binary layout verification
+- PASS: instrumentation only; no guest-visible raw struct layout changed.
+
+## 2026-05-05 — `core/src/arm/dynarmic/arm_dynarmic_64.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/arm/dynarmic/arm_dynarmic_64.cpp` and `/home/vricosti/Dev/emulators/zuyu/src/core/arm/dynarmic/arm_dynarmic_64.h` (`A64 invalid-read guest frame-chain diagnostics for STK`)
+
+### Intentional differences
+- Rust now extends the temporary `RUZU_TRACE_A64_INVALID_DATA_READ` diagnostics to print `x29` and a short guest frame-pointer chain (`fp0`, `prev_fp0`, `ret0`, `prev_fp1`, `ret1`) when an A64 invalid data read is observed. Upstream has no equivalent diagnostic path.
+
+### Unintentional differences (to fix)
+- The guest frame chain is still recovered through local validated guest-memory reads from the callback, rather than a literal upstream parent-owned backtrace path.
+- The diagnostic assumes the guest is currently using a standard AArch64 frame-pointer chain; frameless callers or clobbered frame pointers will still truncate the trace.
+
+### Missing items
+- Use the new frame-chain diagnostics to identify the caller path that feeds the bogus `x1` into STK block `0x80E43E18`.
+- Remove the temporary diagnostics once the active STK corruption frontier is fixed.
+
+### Binary layout verification
+- PASS: instrumentation only; no guest-visible raw struct layout changed.
+
+## 2026-05-05 — `core/src/arm/dynarmic/arm_dynarmic_64.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/arm/dynarmic/arm_dynarmic_64.cpp` and `/home/vricosti/Dev/emulators/zuyu/src/core/arm/dynarmic/arm_dynarmic_64.h` (`A64 null-fetch diagnostics for STK`)
+
+### Intentional differences
+- Rust now exposes a temporary `RUZU_TRACE_A64_NULL_FETCH` diagnostic in `memory_read_code()` to dump guest `pc/lr/sp` plus selected GPRs when the A64 frontend attempts to fetch code at `vaddr=0`. Upstream has no equivalent logging surface.
+
+### Unintentional differences (to fix)
+- The null-fetch diagnostic still recovers guest state through the local `A64JitState` pointer hook (`jit_pc_ptr`) instead of the literal upstream parent-owned access path.
+
+### Missing items
+- Use the null-fetch trace to identify the exact caller/return chain that reaches `pc=0` in STK after the `0x80E4BBFC -> 0x80E56160` dispatcher path.
+- Remove the temporary diagnostics once the active STK null-jump frontier is fixed.
+
+### Binary layout verification
+- PASS: instrumentation only; no guest-visible raw struct layout changed.
+
+## 2026-05-05 — `core/src/arm/dynarmic/arm_dynarmic_64.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/arm/dynarmic/arm_dynarmic_64.cpp` and `/home/vricosti/Dev/emulators/zuyu/src/core/arm/dynarmic/arm_dynarmic_64.h` (`A64 invalid-data-read diagnostics for STK`)
+
+### Intentional differences
+- Rust now exposes a temporary `RUZU_TRACE_A64_INVALID_DATA_READ` diagnostic in `memory_read_64()` to dump guest register state when an A64 64-bit guest read targets an invalid virtual address. Upstream has no equivalent logging surface.
+- The same diagnostic also force-logs low-page (`vaddr < 0x1000`) 64-bit reads, because the current Rust `is_valid_virtual_address_range()` screen is too weak to catch the active `0x8` / `0x18` STK dereferences before `Memory::read_64()` reports them as unmapped.
+
+### Unintentional differences (to fix)
+- The diagnostic still relies on the local `A64JitState` pointer hook (`jit_pc_ptr`) instead of the literal upstream callback-owner access path.
+
+### Missing items
+- Use the invalid-read trace to identify the exact guest block that dereferences `0x8` / `0x18` in STK once `FAST_DISPATCH` / `BLOCK_LINKING` are disabled.
+- Remove the temporary diagnostics once the active STK invalid-pointer frontier is fixed.
+
+### Binary layout verification
+- PASS: instrumentation only; no guest-visible raw struct layout changed.
+
+## 2026-05-05 — `rdynarmic/src/backend/x64/emit_data_processing.rs` vs Dynarmic x64 masked-shift owner
+
+### Intentional differences
+- The Rust masked-shift emitter now reserves `RCX` for the register shift-count before allocating the destination scratch register, matching the ownership/order already used by the adjacent non-masked shift path.
+- A focused unit regression now pins this allocator-ordering contract in the matching owner test module.
+
+### Unintentional differences (to fix)
+- The broader x64 reg-allocator pressure issue is still under investigation for STK; this slice only fixes the concrete `RCX` allocation-order bug isolated at `pc=0x80E42B7C`.
+
+### Missing items
+- Re-run STK after this masked-shift fix to confirm whether the compile-time allocator panic is gone or whether a later x64 emitter path is now the next frontier.
+
+### Binary layout verification
+- PASS: emitter ordering and tests only; no guest-visible raw struct layout changed.
+
+## 2026-05-05 — `rdynarmic/src/backend/x64/emit.rs` vs Dynarmic x64 block emitter ownership (`A64 per-op emit diagnostics for STK reg-allocator panic`)
+
+### Intentional differences
+- Rust now exposes a temporary `RUZU_TRACE_A64_EMIT_PC` diagnostic in `emit_block(...)` to print `inst#` and `opcode` for a selected A64 block entry `pc`. Upstream has no equivalent logging surface.
+
+### Unintentional differences (to fix)
+- The diagnostic is investigation-only and should be removed once the active STK x64 emitter/reg-allocator panic is fixed.
+
+### Missing items
+- Use the per-op emit trace on the failing block `0x80E42B7C` to identify which emitter/opcode exhausts the available host registers.
+
+### Binary layout verification
+- PASS: instrumentation only; no guest-visible raw struct layout changed.
+
+## 2026-05-05 — `core/src/arm/dynarmic/arm_dynarmic_64.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/arm/dynarmic/arm_dynarmic_64.cpp` and `/home/vricosti/Dev/emulators/zuyu/src/core/arm/dynarmic/arm_dynarmic_64.h` (`A64 SVC caller-context diagnostics for STK handle corruption`)
+
+### Intentional differences
+- The temporary `RUZU_TRACE_A64_SVC_REGS` diagnostics now also dump `lr` and `sp` alongside `pc` and `x0..x7`. Upstream has no equivalent logging.
+
+### Unintentional differences (to fix)
+- Rust still cannot log the caller context from the literal upstream callback owner (`CallSVC(...)`) because the callback graph is adapted around rdynarmic ownership; the logs are still taken immediately after JIT halt and in `get_svc_arguments()`.
+
+### Missing items
+- Use the new `lr` dump to identify the guest caller that produces `SendSyncRequest(handle=0x1)` and compare that exact callsite against zuyu.
+
+### Binary layout verification
+- PASS: instrumentation only; no guest-visible raw struct layout changed.
+
+## 2026-05-05 — `core/src/arm/dynarmic/arm_dynarmic_64.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/arm/dynarmic/arm_dynarmic_64.cpp` and `/home/vricosti/Dev/emulators/zuyu/src/core/arm/dynarmic/arm_dynarmic_64.h` (`A64 callee-saved SVC diagnostics for STK slot-table corruption`)
+
+### Intentional differences
+- The temporary `RUZU_TRACE_A64_SVC_REGS` diagnostics now also dump `x21`, `x22`, `x24`, and `x25` at the SVC halt frontier. Upstream has no equivalent logging; this is investigation-only state capture for the active STK slot-table frontier.
+
+### Unintentional differences (to fix)
+- Rust still cannot emit these registers from the literal upstream callback owner `DynarmicCallbacks64::CallSVC(...)` because the A64 Rust callback graph remains adapted around rdynarmic ownership. The logs are still taken immediately after JIT halt and again in `get_svc_arguments()`.
+
+### Missing items
+- Use the new callee-saved register dump to confirm the exact slot-table base (`x21`) and slot index (`x22`) used by the bad STK `SendSyncRequest(handle=0x1)` caller at `0x8077b080..0x8077b130`.
+- Remove the temporary diagnostics once the active STK corruption frontier is fixed.
+
+### Binary layout verification
+- PASS: instrumentation only; no guest-visible raw struct layout changed.
+
+## 2026-05-05 — `core/src/arm/dynarmic/arm_dynarmic_64.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/arm/dynarmic/arm_dynarmic_64.cpp` and `/home/vricosti/Dev/emulators/zuyu/src/core/arm/dynarmic/arm_dynarmic_64.h` (`A64 watchpoint PC diagnostics for STK slot-table corruption`)
+
+### Intentional differences
+- Rust now extends the temporary `RUZU_WATCH_ADDR` diagnostics to print the approximate A64 guest `pc` alongside watched reads/writes. This is investigation-only and has no upstream equivalent.
+
+### Unintentional differences (to fix)
+- Rust still obtains this `pc` through a local rdynarmic callback hook (`set_pc_ptr()` on the local rdynarmic tree) because the upstream callback owner can read state directly through `m_parent.m_jit`. The diagnostic surface is useful, but the access path remains an adaptation.
+
+### Missing items
+- Use the new watchpoint `pc` trace to identify the exact guest instruction that writes `0x1` into STK slot-table entry `0x815479d0`.
+- Remove the temporary diagnostics once the active STK corruption frontier is fixed.
+
+### Binary layout verification
+- PASS: instrumentation only; no guest-visible raw struct layout changed.
+
+## 2026-05-05 — `core/src/arm/dynarmic/arm_dynarmic_64.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/arm/dynarmic/arm_dynarmic_64.cpp` and `/home/vricosti/Dev/emulators/zuyu/src/core/arm/dynarmic/arm_dynarmic_64.h` (`A64 watchpoint register-context diagnostics for STK slot-table corruption`)
+
+### Intentional differences
+- Rust now extends the temporary `RUZU_WATCH_ADDR` diagnostics to print `lr`, `x0`, `x1`, `x19`, `x20`, `x21`, `x22`, and `x25` alongside the approximate guest `pc` on watched A64 reads/writes. Upstream has no equivalent logging.
+
+### Unintentional differences (to fix)
+- The watchpoint context is still recovered through the local rdynarmic `A64JitState` pointer derived from `pc`, rather than the literal upstream parent-owned callback state access path.
+- The logged `pc` remains block-level/approximate, not the exact individual guest memory instruction address.
+
+### Missing items
+- Use the richer watchpoint context to identify the caller around the `0x815479d0 <- 1` store and determine whether the guest is storing a real reply value, a domain object id, or a stale sentinel into the slot table.
+- Remove the temporary diagnostics once the active STK corruption frontier is fixed.
+
+### Binary layout verification
+- PASS: instrumentation only; no guest-visible raw struct layout changed.
+## 2026-05-05 — rdynarmic/src/frontend/a64/translate/data_processing_register.rs vs Dynarmic A64 data-processing-register owner
+
+### Intentional differences
+- `RBIT` is implemented with existing scalar IR primitives instead of introducing a new dedicated IR opcode: this preserves the owner boundary in the A64 translate file while avoiding the previously active interpret fallback.
+
+### Unintentional differences (to fix)
+- `REV16`, `REV32`, and `CLS` still fall back to interpreter in the same owner file.
+
+### Missing items
+- Literal parity for the remaining one-source A64 register operations that still use `interpret_this_instruction()`.
+
+### Binary layout verification
+- PASS: no binary layout surface changed in this slice.
+
+## 2026-05-05 — `rdynarmic/src/frontend/a64/translate/data_processing_register.rs`, `rdynarmic/src/ir/opcode.rs`, `rdynarmic/src/ir/emitter.rs`, `rdynarmic/src/ir/opt/constant_propagation.rs`, `rdynarmic/src/backend/x64/emit.rs`, `rdynarmic/src/backend/x64/emit_data_processing.rs` vs Dynarmic A64/x64 `RBIT` ownership
+
+### Intentional differences
+- Rust now uses dedicated `ReverseBits32` / `ReverseBits64` IR opcodes for A64 `RBIT`, owned across the matching translate, IR, optimization, and x64 emit files. This diverges from the previous temporary scalar-expansion shortcut because the expansion triggered x64 register-allocation exhaustion on the active STK block.
+- The x64 backend currently lowers `ReverseBits32` / `ReverseBits64` through local host-call helpers to `u32::reverse_bits()` / `u64::reverse_bits()` rather than a literal inlined x64 bit-twiddle sequence. This is a temporary backend adaptation to preserve behavior while avoiding the active allocator-pressure regression.
+
+### Unintentional differences (to fix)
+- The new x64 lowering is still host-call based and therefore not yet a literal parity implementation of Dynarmic's eventual backend lowering strategy.
+- `REV16`, `REV32`, and `CLS` still fall back to interpreter in `data_processing_register.rs`.
+
+### Missing items
+- Replace the temporary host-call lowering with a literal backend implementation once the allocator-pressure frontier is understood and fixed.
+- Port the remaining A64 single-source register operations in this owner file that still use `interpret_this_instruction()`.
+
+### Binary layout verification
+- PASS: IR/backend opcode additions only; no guest-visible raw struct layout changed in this slice.
+
+## 2026-05-05 — `rdynarmic/src/jit.rs` vs Dynarmic JIT dispatcher ownership (`A64 compile-miss diagnostics for STK reg-allocator panic`)
+
+### Intentional differences
+- Rust now exposes a temporary `RUZU_TRACE_A64_COMPILE_PC` diagnostic in `lookup_block_trampoline(...)` to log the exact A64 `pc/lr/sp` for cache-miss block compilation. Upstream has no equivalent logging surface.
+
+### Unintentional differences (to fix)
+- The diagnostic is still local investigation-only code and should be removed once the active STK compile-time panic frontier is fixed.
+
+### Missing items
+- Use the new compile-miss trace to identify which exact A64 block still exhausts the x64 reg allocator after the `RBIT` correctness fix.
+
+### Binary layout verification
+- PASS: instrumentation only; no guest-visible raw struct layout changed.
+
+## 2026-05-06 — `rdynarmic/src/frontend/a64/translate/data_processing_register.rs`, `rdynarmic/src/ir/opcode.rs`, `rdynarmic/src/ir/emitter.rs`, `rdynarmic/src/ir/opt/constant_propagation.rs`, `rdynarmic/src/backend/x64/emit.rs`, `rdynarmic/src/backend/x64/emit_data_processing.rs` vs `/home/vricosti/Dev/emulators/zuyu/externals/dynarmic/src/dynarmic/frontend/A64/translate/impl/data_processing_register.cpp`
+
+### Intentional differences
+- `RBIT` is again owned entirely by the A64 translator file, matching upstream ownership. Rust keeps the same bit-twiddle expansion in the matching translator file instead of routing through synthetic scalar `ReverseBits32` / `ReverseBits64` IR opcodes.
+- Rust still expresses the upstream translator sequence through the existing typed emitter API (`logical_shift_left_32`, `and_32`, `or_32`, `pack_2x32_to_1x64`) rather than C++ lambda syntax. This is a mechanical language adaptation only.
+
+### Unintentional differences (to fix)
+- `REV16`, `REV32`, and `CLS` in `data_processing_register.rs` still fall back to `interpret_this_instruction()` and therefore remain behind upstream behavioral parity.
+- The older 2026-05-05 local `ReverseBits32` / `ReverseBits64` IR/backend path documented above was a temporary divergence and has now been unwound; that earlier entry is no longer the current state of the tree.
+
+### Missing items
+- Port the remaining one-source A64 register operations in `data_processing_register.rs` that still use interpreter fallback.
+- Re-run the STK runtime investigation with the literal upstream `RBIT` ownership restored to confirm whether the earlier allocator-pressure frontier moved or disappeared.
+
+### Binary layout verification
+- PASS: translator/IR/backend ownership only; no guest-visible raw struct layout changed in this slice.
+
+## 2026-05-06 — `rdynarmic/src/frontend/a64/translate/data_processing_register.rs` vs `/home/vricosti/Dev/emulators/zuyu/externals/dynarmic/src/dynarmic/frontend/A64/translate/impl/data_processing_register.cpp` (`REV16`, `REV32`, `CLS` parity follow-up)
+
+### Intentional differences
+- `REV16`, `REV32`, and `CLS` now live in the matching A64 translator owner file and follow the same control flow as upstream, expressed through the existing Rust emitter API. This is a mechanical language adaptation only.
+- Focused translator tests are local Rust tests that assert these instructions no longer end in `Terminal::Interpret` and emit the expected opcode families (`Or32`, `ByteReverseWord`, `CountLeadingZeros32` / `Eor32`). Upstream has no equivalent Rust unit-test surface.
+
+### Unintentional differences (to fix)
+- `UDIV` and `SDIV` still live in `rdynarmic/src/frontend/a64/translate/data_processing_addsub.rs`, while upstream keeps them in `data_processing_register.cpp`. That ownership mismatch remains.
+
+### Missing items
+- Move `UDIV` and `SDIV` back into `rdynarmic/src/frontend/a64/translate/data_processing_register.rs` to complete literal method ownership parity for this upstream file.
+- After that ownership move, re-audit the dispatcher/module split so this upstream C++ owner is conceptually complete on the Rust side.
+
+### Binary layout verification
+- PASS: translator IR only; no guest-visible raw struct layout changed in this slice.
+
+## 2026-05-06 — `rdynarmic/src/halt_reason.rs` vs `/home/vricosti/Dev/emulators/zuyu/externals/dynarmic/src/dynarmic/interface/halt_reason.h`
+
+### Intentional differences
+- The Rust file keeps local compatibility aliases (`SVC`, `BREAKPOINT`, `EXTERNAL_HALT`, `PREFETCH_ABORT`, `EXCEPTION_RAISED`) on top of the upstream-shaped bit surface so existing Rust callers do not all need to rename at once. The underlying bit values now match upstream Dynarmic.
+- Focused Rust unit tests assert the upstream bit values and the alias mapping. Upstream has no equivalent Rust unit-test surface.
+
+### Unintentional differences (to fix)
+- `EXCEPTION_RAISED` remains a Rust-only alias (`USER_DEFINED1`). Upstream has no such semantic halt reason; it only has `UserDefined1`. Remaining callers should be unwound so this alias can disappear.
+
+### Missing items
+- Continue removing active uses of the Rust-only `EXCEPTION_RAISED` semantic in favor of upstream-shaped halt reasons or callback-driven halt decisions.
+
+### Binary layout verification
+- PASS: constant/bitflag surface only; no raw struct layout involved.
+
+## 2026-05-06 — `rdynarmic/src/backend/x64/emit_a64.rs` vs `/home/vricosti/Dev/emulators/zuyu/externals/dynarmic/src/dynarmic/backend/x64/a64_emit_x64.cpp`
+
+### Intentional differences
+- `EmitA64ExceptionRaised` no longer pre-sets a synthetic halt bit before calling the host callback. This now matches upstream ownership more closely: the callback decides whether to halt, and the terminal still returns through the dispatcher.
+
+### Unintentional differences (to fix)
+- The wider Rust backend still lacks the explicit upstream `InterpreterFallback` callback surface, so `Terminal::Interpret` cannot yet notify the host the way upstream Dynarmic does. This is now the active structural gap on the STK front.
+
+### Missing items
+- Port the upstream `InterpreterFallback(pc, num_instructions)` callback surface into `rdynarmic` and wire it into the x64 terminal path.
+
+### Binary layout verification
+- PASS: backend codegen ownership only; no guest-visible raw struct layout changed in this slice.
+
+## 2026-05-06 — `core/src/arm/dynarmic/arm_dynarmic_64.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/arm/dynarmic/arm_dynarmic_64.cpp` and `/home/vricosti/Dev/emulators/zuyu/src/core/arm/dynarmic/arm_dynarmic.h`
+
+### Intentional differences
+- The Rust callback now uses the injected `halt_reason` pointer to request `PREFETCH_ABORT` and `BREAKPOINT`, which is the closest local equivalent to upstream `m_parent.m_jit->HaltExecution(hr)` without a direct parent-JIT back-reference in this owner.
+- Focused Rust unit tests cover the A64 halt-reason translation surface (`MEMORY_ABORT`, `SVC`, `BREAKPOINT`, `PREFETCH_ABORT`, `BREAK_LOOP`) and ensure the legacy Rust-only `EXCEPTION_RAISED` bit no longer aliases to `PrefetchAbort`.
+
+### Unintentional differences (to fix)
+- `DynarmicCallbacks64::ExceptionRaised` still lacks the upstream debugger-enabled split (`m_debugger_enabled` / `NotifyThreadStopped`) and currently always halts on `Breakpoint`.
+- The file still carries extensive temporary diagnostics unrelated to upstream ownership or behavior.
+- The missing `InterpreterFallback` callback from `rdynarmic` means this owner still cannot match upstream behavior for untranslated A64 instructions.
+
+### Missing items
+- Port `InterpreterFallback` through `rdynarmic` and implement the matching owner callback here.
+- Revisit the `Breakpoint` path once debugger parity exists on the Rust side.
+- Remove the temporary investigation hooks from this file after the current STK front is resolved.
+
+### Binary layout verification
+- PASS: callback/lifecycle behavior only; no raw struct layout changed in this slice.
+
+## 2026-05-06 — `rdynarmic/src/frontend/a64/translate/simd_three_same.rs`, `rdynarmic/src/frontend/a64/translate/simd_two_register_misc.rs`, `rdynarmic/src/ir/opcode.rs`, `rdynarmic/src/ir/emitter.rs`, `rdynarmic/src/backend/x64/emit.rs`, `rdynarmic/src/backend/x64/emit_vector_compare.rs`, and `rdynarmic/src/backend/x64/emit_vector_multiply.rs` vs `/home/vricosti/Dev/emulators/zuyu/externals/dynarmic/src/dynarmic/frontend/A64/translate/impl/simd_three_same.cpp`, `/home/vricosti/Dev/emulators/zuyu/externals/dynarmic/src/dynarmic/frontend/A64/translate/impl/simd_two_register_misc.cpp`, and `/home/vricosti/Dev/emulators/zuyu/externals/dynarmic/src/dynarmic/ir/ir_emitter.h/.cpp`
+
+### Intentional differences
+- `simd_three_same.rs` and `simd_two_register_misc.rs` remain focused Rust owner files for the same upstream translator slices, but the x64 backend still expresses the new `VectorLess*Signed*` and `VectorPaired*Lower*` operations through local helper emitters and fallback functions rather than literal C++ templates/macros. This preserves owner placement and semantics while adapting to the existing Rust backend surface.
+- The new `VectorPairedMin/Max*Lower*` x64 implementations in `emit_vector_multiply.rs` use explicit Rust fallback helpers to compute the lower-half paired reduction result. This is a mechanical backend adaptation to the current Rust emitter tree, not a translator ownership drift.
+- Focused Rust tests now assert the exact parity-sensitive contracts that were previously missing: `ReservedValue` vs normal translation for `UMINP`, and direct opcode ownership for `CMEQ_zero_2`, `CMLE_2`, and `CMLT_2`. Upstream has no equivalent Rust unit-test surface.
+
+### Unintentional differences (to fix)
+- `simd_three_same.rs` only has focused regression coverage for `UMINP`. The sibling paired ops `UMAXP`, `SMINP`, and `SMAXP` now share the same lower/full dispatch path, but they are not yet covered by equally focused translator regressions.
+- `emit_vector_compare.rs` implements `VectorLessEqualSigned*` as `NOT(a > b)` and `VectorLessSigned*` as `b > a` on x64. This is semantically correct for the current host backend, but it should still be re-audited against upstream backend ownership if the goal extends from translator parity to literal host-lowering parity.
+
+### Missing items
+- Add focused translator regressions for `UMAXP`, `SMINP`, and `SMAXP` to prove the `Q=0` lower-path and `Q=1` full-path split across the whole upstream family.
+- Re-audit whether upstream has matching host-lowering owners for the signed less-than / less-equal vector compares and the paired-lower min/max family, and mirror that more literally if the remaining x64 backend structure still diverges.
+
+### Binary layout verification
+- PASS: translator IR and x64 emitter ownership only; no guest-visible raw struct layout changed in this slice.
+
+## 2026-05-06 — `rdynarmic/src/frontend/a64/translate/exception.rs`, `rdynarmic/src/frontend/a64/decoder.rs`, `rdynarmic/src/frontend/a64/translate/visitor.rs`, `rdynarmic/src/frontend/a64/translate/mod.rs`, and `rdynarmic/src/frontend/a64/types.rs` vs `/home/vricosti/Dev/emulators/zuyu/externals/dynarmic/src/dynarmic/frontend/A64/translate/impl/a64_exception_generating.cpp`, `/home/vricosti/Dev/emulators/zuyu/externals/dynarmic/src/dynarmic/frontend/A64/translate/impl/impl.cpp`, `/home/vricosti/Dev/emulators/zuyu/externals/dynarmic/src/dynarmic/frontend/A64/translate/a64_translate.cpp`, `/home/vricosti/Dev/emulators/zuyu/externals/dynarmic/src/dynarmic/interface/A64/config.h`, and `/home/vricosti/Dev/emulators/zuyu/externals/dynarmic/src/dynarmic/frontend/A64/decoder/a64.inc`
+
+### Intentional differences
+- `decode_error()` now uses Rust `unreachable!()` as the local equivalent of upstream `UNREACHABLE()`.
+- The shared A64 exception helper ownership is still split across Rust `visitor.rs`, `mod.rs`, and `types.rs` because Rust does not have an exact header/implementation split equivalent to upstream `impl.h` plus `impl.cpp` and `a64_translate.cpp`. The behavior and owner boundaries now match the corresponding upstream files.
+- Focused Rust tests assert decoder and translator exception-boundary behavior (`HVC`/`SMC` not decoded, undecodable instructions interpreted, missing-code raising `NoExecuteFault`, `UnallocatedEncoding`/`ReservedValue`/`UnpredictableInstruction` raising exceptions). Upstream has no equivalent Rust unit-test surface.
+
+### Unintentional differences (to fix)
+- None in this exception/decode boundary slice after removing the dead Rust-local `HVC` / `SMC` methods and aligning the callback-visible exception codes to upstream.
+
+### Missing items
+- None on the active `SVC` / `BRK` / `UnallocatedEncoding` / `ReservedValue` / `UnpredictableInstruction` / `NoExecuteFault` boundary.
+
+### Binary layout verification
+- PASS: translator/decoder behavior only; no guest-visible raw struct layout changed in this slice.
+
+## 2026-05-06 — `rdynarmic/src/frontend/a64/translate/floating_point_conversion_integer.rs`, `rdynarmic/src/frontend/a64/translate/floating_point.rs`, `rdynarmic/src/frontend/a64/translate/visitor.rs`, `rdynarmic/src/frontend/a64/translate/mod.rs`, and `rdynarmic/src/ir/emitter.rs` vs `/home/vricosti/Dev/emulators/zuyu/externals/dynarmic/src/dynarmic/frontend/A64/translate/impl/floating_point_conversion_integer.cpp`
+
+### Intentional differences
+- `SCVTF_float_int`, `UCVTF_float_int`, `FMOV_float_gen`, `FCVTNS_float`, `FCVTNU_float`, `FCVTZS_float_int`, `FCVTZU_float_int`, `FCVTAS_float`, `FCVTAU_float`, `FCVTPS_float`, `FCVTPU_float`, `FCVTMS_float`, and `FCVTMU_float` now live in their own matching Rust owner file instead of the merged `floating_point.rs` catch-all. This restores the upstream file/method ownership split.
+- Visitor dispatch now routes all scalar integer-conversion instruction names directly to matching Rust methods (`scvtf_float_int`, `ucvtf_float_int`, `fmov_float_gen`, `fcvtns_float`, `fcvtnu_float`, `fcvtzs_float_int`, `fcvtzu_float_int`, `fcvtas_float`, `fcvtau_float`, `fcvtps_float`, `fcvtpu_float`, `fcvtms_float`, `fcvtmu_float`) instead of falling through unstated catch-all ownership.
+- Rust expresses the upstream typed IR surface (`FPSignedFixedToSingle/Double`, `FPUnsignedFixedToSingle/Double`, `FPToFixedS32/S64/U32/U64`, `Vpart_scalar`) through the existing emitter helpers (`fp_fixed_to_single`, `fp_fixed_to_double`, `fp_to_fixed_s32`, `fp_to_fixed_s64`, `fp_to_fixed_u32`, `fp_to_fixed_u64`, `vector_get_element`, `vector_set_element`, scalar register/vector getters and setters). This is a mechanical emitter/visitor adaptation only.
+- [emitter.rs](/home/vricosti/Dev/emulators/rdynarmic/src/ir/emitter.rs) now owns the missing `fp_to_fixed_s64` and `fp_to_fixed_u64` helper boundaries required by the upstream 64-bit conversion paths.
+- Focused Rust tests assert that representative scalar integer-conversion encodings no longer end in `Terminal::Interpret` and emit the expected conversion/register-transfer opcode families. Upstream has no equivalent Rust unit-test surface.
+
+### Unintentional differences (to fix)
+- `FMOV_float_gen` is behaviorally close but still more explicit than upstream because this tree lacks literal `X(bitsize)` and `Vpart_scalar(...)` helper surfaces; the Rust owner reconstructs the `part==1` path with `get_q` plus `vector_get_element`/`vector_set_element`.
+- `TranslatorVisitor::unallocated_encoding()` on this tree still routes to `interpret_this_instruction()`, so invalid encoding cases in this slice still terminate via the local interpret path instead of the stricter upstream exception behavior.
+- [floating_point.rs](/home/vricosti/Dev/emulators/rdynarmic/src/frontend/a64/translate/floating_point.rs) still remains the merged owner for the fixed-point conversion file only; this slice removes the integer-conversion and `FMOV_float_gen` debt, but not the fixed-point one.
+
+### Missing items
+- Split the remaining upstream [floating_point_conversion_fixed_point.cpp](/home/vricosti/Dev/emulators/zuyu/externals/dynarmic/src/dynarmic/frontend/A64/translate/impl/floating_point_conversion_fixed_point.cpp) owner out of [floating_point.rs](/home/vricosti/Dev/emulators/rdynarmic/src/frontend/a64/translate/floating_point.rs).
+- Revisit the global `unallocated_encoding()` behavior if the goal remains literal upstream exception semantics, not only file ownership parity.
+
+### Binary layout verification
+- PASS: translator IR only; no guest-visible raw struct layout changed in this slice.
+
+## 2026-05-06 — `rdynarmic/src/frontend/a64/translate/floating_point_data_processing_three_register.rs`, `rdynarmic/src/frontend/a64/translate/floating_point.rs`, `rdynarmic/src/frontend/a64/translate/visitor.rs`, and `rdynarmic/src/frontend/a64/translate/mod.rs` vs `/home/vricosti/Dev/emulators/zuyu/externals/dynarmic/src/dynarmic/frontend/A64/translate/impl/floating_point_data_processing_three_register.cpp`
+
+### Intentional differences
+- `FMADD_float`, `FMSUB_float`, `FNMADD_float`, and `FNMSUB_float` now live in their own matching Rust owner file instead of the merged `floating_point.rs` catch-all. This restores the upstream file/method ownership split.
+- Visitor dispatch now calls `fmadd_float`, `fmsub_float`, `fnmadd_float`, and `fnmsub_float` explicitly instead of the earlier shortened local names `fmadd`, `fmsub`, `fnmadd`, and `fnmsub`. This is a naming/ownership correction toward the upstream instruction surface.
+- Rust expresses upstream typed IR calls (`ir.FPMulAdd`, `ir.FPMulSub`, `ir.FPNeg`) through the existing width-dispatched emitter API (`fp_mul_add`, `fp_mul_sub`, `fp_neg`). This is a mechanical emitter adaptation only.
+- Focused Rust tests assert that the representative scalar three-register encodings no longer end in `Terminal::Interpret` and emit the expected fused multiply-add/sub opcode families. Upstream has no equivalent Rust unit-test surface.
+
+### Unintentional differences (to fix)
+- `TranslatorVisitor::unallocated_encoding()` on this tree still routes to `interpret_this_instruction()`, so invalid datasize cases in this slice still terminate via the local interpret path instead of the stricter upstream exception behavior.
+- `floating_point.rs` remains a merged owner for the remaining upstream floating-point conversion files (`floating_point_conversion_integer.cpp` and `floating_point_conversion_fixed_point.cpp`) and `FMOV_float_gen`.
+
+### Missing items
+- Continue splitting the remaining upstream floating-point owners out of `floating_point.rs`, with the conversion files as the next clean slices.
+- Revisit the global `unallocated_encoding()` behavior if the goal remains literal upstream exception semantics, not only file ownership parity.
+
+### Binary layout verification
+- PASS: translator IR only; no guest-visible raw struct layout changed in this slice.
+
+## 2026-05-06 — `rdynarmic/src/frontend/a64/translate/helpers.rs`, `rdynarmic/src/frontend/a64/translate/floating_point.rs`, `rdynarmic/src/frontend/a64/translate/floating_point_data_processing_one_register.rs`, `rdynarmic/src/backend/x64/emit_floating_point.rs`, and `rdynarmic/src/backend/x64/fp_helpers.rs` vs `/home/vricosti/Dev/emulators/zuyu/externals/dynarmic/src/dynarmic/frontend/A64/translate/impl/impl.h`, `/home/vricosti/Dev/emulators/zuyu/externals/dynarmic/src/dynarmic/frontend/A64/translate/impl/floating_point_data_processing_one_register.cpp`, and `/home/vricosti/Dev/emulators/zuyu/externals/dynarmic/src/dynarmic/backend/x64/emit_x64_floating_point.cpp`
+
+### Intentional differences
+- The shared `FPGetDataSize(...)` concept no longer lives in the merged `floating_point.rs` catch-all. It now lives in the shared translator helper owner [helpers.rs](/home/vricosti/Dev/emulators/rdynarmic/src/frontend/a64/translate/helpers.rs), which is the closest Rust owner to upstream `impl.h` shared helper placement.
+- `FRINTA_float` now uses a distinct local rounding-mode tag `4` for tie-away-from-zero instead of collapsing onto tie-even. This restores the upstream translator distinction from `FP::RoundingMode::ToNearest_TieAwayFromZero`.
+- The x64 backend now follows the upstream split more closely for scalar `FPRoundInt*`: SSE `round*` is still used only where it can express the requested mode, and the unsupported tie-away path falls back to explicit helper code in [fp_helpers.rs](/home/vricosti/Dev/emulators/rdynarmic/src/backend/x64/fp_helpers.rs). Rust uses direct helper functions instead of upstream LUT/template machinery, but the owner boundary is now aligned.
+- Focused Rust tests assert both translator ownership and backend value behavior for `FRINTA_float` and the scalar round-int helpers. Upstream has no equivalent Rust unit-test surface.
+
+### Unintentional differences (to fix)
+- The backend fallback helpers in [fp_helpers.rs](/home/vricosti/Dev/emulators/rdynarmic/src/backend/x64/fp_helpers.rs) now fix value semantics for tie-away rounding, but they still ignore the `exact` flag and do not model upstream FPSR/inexact exception side effects. Upstream `EmitFPRound(...)` participates in fuller FP exception semantics.
+- `TranslatorVisitor::unallocated_encoding()` on this tree still routes through `interpret_this_instruction()`, so invalid `FPGetDataSize(...)` cases still terminate via the existing local interpret path instead of the stricter upstream exception behavior.
+
+### Missing items
+- Revisit scalar `FPRoundInt*` exact/FPSR behavior so the host-call fallback matches upstream exception semantics, not only value semantics.
+- Continue shrinking the remaining structural debt in `rdynarmic/src/frontend/a64/translate/floating_point.rs`; this slice fixed the shared datasize helper ownership, but the file is still a merged owner for other upstream FP translator files.
+
+### Binary layout verification
+- PASS: translator/backend helper ownership only; no guest-visible raw struct layout changed in this slice.
+
+## 2026-05-06 — `rdynarmic/src/frontend/a64/translate/floating_point_data_processing_one_register.rs`, `rdynarmic/src/frontend/a64/translate/floating_point.rs`, and `rdynarmic/src/frontend/a64/translate/visitor.rs` vs `/home/vricosti/Dev/emulators/zuyu/externals/dynarmic/src/dynarmic/frontend/A64/translate/impl/floating_point_data_processing_one_register.cpp` and `/home/vricosti/Dev/emulators/zuyu/externals/dynarmic/src/dynarmic/frontend/A64/decoder/a64.inc`
+
+### Intentional differences
+- `FMOV_float_imm`, `FCVT_float`, and the scalar `FRINT*` family now live in the matching Rust owner file instead of the merged `floating_point.rs` catch-all, and visitor dispatch now routes the corresponding decode names (`FMOV_float_imm`, `FCVT_float`, `FRINTN_float`, `FRINTP_float`, `FRINTM_float`, `FRINTZ_float`, `FRINTA_float`, `FRINTX_float`, `FRINTI_float`) into that owner. This restores the upstream file and method ownership split for the decoder cases already present in Rust `a64.inc`.
+- Rust expresses upstream typed IR results through the existing width-dispatched emitter API (`fp_half_to_single`, `fp_half_to_double`, `fp_single_to_half`, `fp_single_to_double`, `fp_double_to_half`, `fp_double_to_single`, `fp_round_int`) plus local scalar immediate construction. This is a mechanical emitter-API adaptation only.
+- The upstream file-local `FloatingPointRoundToIntegral(...)` helper is mirrored here as a file-local Rust helper rather than an anonymous-namespace helper. Ownership remains in the matching owner file.
+- Focused Rust tests assert that representative `FMOV_float_imm`, `FCVT_float`, and `FRINTN_float` translations no longer end in `Terminal::Interpret` and emit the expected IR opcode families. Upstream has no equivalent Rust unit-test surface.
+
+### Unintentional differences (to fix)
+- The shared `fp_datasize(...)` helper still lives in `rdynarmic/src/frontend/a64/translate/floating_point.rs`, so the new owner file still depends on the merged catch-all for a cross-file helper that upstream keeps in shared translator infrastructure via `impl.h`.
+- `TranslatorVisitor::unallocated_encoding()` on this tree still routes to `interpret_this_instruction()`, so invalid one-register FP encodings still terminate via the existing local interpret path instead of the stricter upstream exception behavior.
+- `FRINTA_float` is still not behaviorally literal on this tree. Upstream uses `FP::RoundingMode::ToNearest_TieAwayFromZero`; this Rust/x64 backend currently only implements the 2-bit SSE-style rounding set in `fp_round_int`, so `FRINTA_float` is translated through the one-register owner but still approximates tie-away rounding as tie-even.
+
+### Missing items
+- Revisit moving the shared FP datasize helper out of `floating_point.rs` once more FP owner files exist.
+- Revisit the global `unallocated_encoding()` behavior if the goal remains literal upstream exception semantics, not only file ownership parity.
+- Revisit `fp_round_int` backend parity so `FRINTA_float` can use a literal tie-away rounding mode instead of the current approximation.
+
+### Binary layout verification
+- PASS: translator IR only; no guest-visible raw struct layout changed in this slice.
+
+## 2026-05-06 — `rdynarmic/src/frontend/a64/translate/data_processing_register.rs` and `rdynarmic/src/frontend/a64/translate/data_processing_addsub.rs` vs `/home/vricosti/Dev/emulators/zuyu/externals/dynarmic/src/dynarmic/frontend/A64/translate/impl/data_processing_register.cpp` (`UDIV`, `SDIV` ownership parity follow-up)
+
+### Intentional differences
+- `UDIV` and `SDIV` now live in the matching A64 translator owner file, matching upstream method ownership. Rust still expresses the result through width-specific emitter calls (`unsigned_div_32` / `unsigned_div_64`, `signed_div_32` / `signed_div_64`) instead of C++'s single typed `ir.UnsignedDiv` / `ir.SignedDiv` surface. This is a mechanical emitter-API adaptation only.
+- Focused translator tests are local Rust tests that assert `UDIV` and `SDIV` no longer end in `Terminal::Interpret` and emit the expected divide opcode families. Upstream has no equivalent Rust unit-test surface.
+- The generated decoder/visitor split already mirrors upstream `a64.inc` instruction ownership for `RBIT_int`, `REV16_int`, `REV`, `CLZ_int`, `CLS_int`, and `REV32_int`. Rust visitor method names stay snake_case (`rbit`, `rev16`, `rev`, `clz`, `cls`, `rev32`) as a naming-only language adaptation.
+
+### Unintentional differences (to fix)
+- None in this ownership slice after the decoder re-audit.
+
+### Missing items
+- Keep using this file as the sole owner for the remaining A64 single-source register operations from upstream `data_processing_register.cpp`.
+
+### Binary layout verification
+- PASS: translator IR only; no guest-visible raw struct layout changed in this slice.
+
+## 2026-05-06 — `rdynarmic/src/frontend/a64/translate/floating_point_compare.rs`, `rdynarmic/src/frontend/a64/translate/floating_point_conditional_compare.rs`, `rdynarmic/src/frontend/a64/translate/floating_point.rs`, `rdynarmic/src/frontend/a64/translate/visitor.rs`, and `rdynarmic/src/frontend/a64/translate/mod.rs` vs `/home/vricosti/Dev/emulators/zuyu/externals/dynarmic/src/dynarmic/frontend/A64/translate/impl/floating_point_compare.cpp`, `/home/vricosti/Dev/emulators/zuyu/externals/dynarmic/src/dynarmic/frontend/A64/translate/impl/floating_point_conditional_compare.cpp`, and `/home/vricosti/Dev/emulators/zuyu/externals/dynarmic/src/dynarmic/frontend/A64/decoder/a64.inc`
+
+### Intentional differences
+- The two FP compare owners now live in their own matching Rust files, and the visitor dispatch now routes `FCMP_float`, `FCMPE_float`, `FCCMP_float`, and `FCCMPE_float` separately instead of collapsing each pair into one catch-all fallback. This restores the upstream owner split.
+- Rust still expresses the shared upstream `FPCompare(...)` helper logic through local module-level helper functions and the existing emitter API (`fp_compare`, `nzcv_from_packed_flags`, `conditional_select_nzcv`) rather than C++ anonymous namespaces and typed `Imm<>` wrappers. This is a mechanical language adaptation only.
+- The shared `FPGetDataSize(...)` concept is currently surfaced as `TranslatorVisitor::fp_datasize(...)` on the existing Rust floating-point translator owner, rather than as an inline helper in a shared header as upstream does in `impl.h`.
+- Focused Rust tests assert that `FCMP`, `FCMPE`, `FCCMP`, and `FCCMPE` no longer end in `Terminal::Interpret` and emit the expected `FPCompare*`, `NZCVFromPackedFlags`, and `ConditionalSelectNZCV` opcode families. Upstream has no equivalent Rust unit-test surface.
+
+### Unintentional differences (to fix)
+- `floating_point.rs` is still a large catch-all file owning many operations that upstream splits across multiple files such as `floating_point_conditional_select.cpp`, `floating_point_conversion_integer.cpp`, `floating_point_conversion_fixed_point.cpp`, and the one/two/three-register data-processing files. The compare owners are fixed, but the wider floating-point folder is still structurally merged.
+- The shared `fp_datasize(...)` helper still lives in `floating_point.rs`, so the new compare files depend on a helper owned by the catch-all file instead of a smaller shared FP helper owner analogous to upstream `impl.h`.
+
+### Missing items
+- Continue splitting the remaining upstream floating-point owners out of `floating_point.rs`, starting with the next cleanly isolated files rather than adding more behavior to the catch-all.
+- Revisit whether the shared FP datasize helper should move out of `floating_point.rs` once more upstream floating-point owner files exist on the Rust side.
+
+### Binary layout verification
+- PASS: translator IR only; no guest-visible raw struct layout changed in this slice.
+
+## 2026-05-06 — `rdynarmic/src/frontend/a64/translate/floating_point_conditional_select.rs`, `rdynarmic/src/frontend/a64/translate/floating_point.rs`, `rdynarmic/src/frontend/a64/translate/visitor.rs`, and `rdynarmic/src/frontend/a64/translate/mod.rs` vs `/home/vricosti/Dev/emulators/zuyu/externals/dynarmic/src/dynarmic/frontend/A64/translate/impl/floating_point_conditional_select.cpp` and `/home/vricosti/Dev/emulators/zuyu/externals/dynarmic/src/dynarmic/frontend/A64/decoder/a64.inc`
+
+### Intentional differences
+- `FCSEL_float` now lives in its own matching Rust owner file and visitor dispatch now calls `fcsel_float(inst)` instead of a shortened catch-all fallback name. This restores the upstream owner split and makes the Rust method surface closer to the upstream translator interface.
+- Rust expresses the upstream `ir.ConditionalSelect(cond, operand1, operand2)` through the width-specific emitter API (`conditional_select_32` / `conditional_select_64`) plus `Value::ImmCond(cond)`. This is a mechanical emitter adaptation only.
+- The shared `FPGetDataSize(...)` concept still comes from `TranslatorVisitor::fp_datasize(...)` on the existing floating-point translator owner, not from a shared header helper as upstream does in `impl.h`.
+- Focused Rust tests assert that `FCSEL_float` no longer ends in `Terminal::Interpret` and emits the expected conditional-select opcode family. Upstream has no equivalent Rust unit-test surface.
+
+### Unintentional differences (to fix)
+- `floating_point.rs` still remains a large merged owner for many upstream floating-point files. `FCSEL_float` has been split out, but the wider structural drift in the floating-point folder remains.
+- The shared `fp_datasize(...)` helper is still owned by `floating_point.rs`, so the new conditional-select owner depends on the catch-all file for a cross-file helper that upstream keeps in shared translator infrastructure.
+
+### Missing items
+- Continue splitting the remaining upstream floating-point owners out of `floating_point.rs`, especially the one/two/three-register data-processing files and conversion files.
+- Revisit moving the FP datasize helper out of `floating_point.rs` once more floating-point owner files exist on the Rust side.
+
+### Binary layout verification
+- PASS: translator IR only; no guest-visible raw struct layout changed in this slice.
+
+## 2026-05-06 — `rdynarmic/src/frontend/a64/translate/floating_point_data_processing_two_register.rs`, `rdynarmic/src/frontend/a64/translate/floating_point.rs`, `rdynarmic/src/frontend/a64/translate/mod.rs`, and `rdynarmic/src/ir/emitter.rs` vs `/home/vricosti/Dev/emulators/zuyu/externals/dynarmic/src/dynarmic/frontend/A64/translate/impl/floating_point_data_processing_two_register.cpp` and `/home/vricosti/Dev/emulators/zuyu/externals/dynarmic/src/dynarmic/ir/ir_emitter.h/.cpp`
+
+### Intentional differences
+- `FMUL_float`, `FDIV_float`, `FADD_float`, `FSUB_float`, `FMAX_float`, `FMIN_float`, `FMAXNM_float`, `FMINNM_float`, and `FNMUL_float` now live in their own matching Rust owner file instead of the merged `floating_point.rs` catch-all. This restores the upstream file/method ownership split.
+- Rust expresses upstream `IR::U32U64`-typed operations through the existing width-dispatched emitter helpers (`fp_mul`, `fp_div`, `fp_add`, `fp_sub`, `fp_max`, `fp_min`, `fp_max_numeric`, `fp_min_numeric`, `fp_neg`). This is a mechanical emitter-API adaptation only.
+- Focused Rust tests assert that representative scalar two-register ops no longer end in `Terminal::Interpret`, and that the half-precision encoding path is rejected before any `FPAdd*` IR is emitted. Upstream has no equivalent Rust unit-test surface.
+
+### Unintentional differences (to fix)
+- The shared `fp_datasize(...)` helper still lives in `rdynarmic/src/frontend/a64/translate/floating_point.rs`, so the new owner file still depends on the merged catch-all for a cross-file helper that upstream keeps in shared translator infrastructure via `impl.h`.
+- `TranslatorVisitor::unallocated_encoding()` on this tree still routes to `interpret_this_instruction()`, so half-precision rejection in this slice terminates via the existing local unallocated path instead of the stricter upstream exception behavior.
+- `floating_point.rs` remains a merged owner for many other upstream FP translator files; this slice fixes the two-register owner only.
+
+### Missing items
+- Continue splitting the remaining upstream floating-point owners out of `floating_point.rs`, especially the one-register, three-register, and conversion files.
+- Revisit moving the shared FP datasize helper out of `floating_point.rs` once more FP owner files exist.
+- Revisit the global `unallocated_encoding()` behavior if the goal remains literal upstream exception semantics, not only file ownership parity.
+
+### Binary layout verification
+- PASS: translator IR and emitter helper ownership only; no guest-visible raw struct layout changed in this slice.
+
+## 2026-05-06 — `rdynarmic/src/frontend/a64/translate/floating_point_data_processing_one_register.rs`, `rdynarmic/src/frontend/a64/translate/floating_point.rs`, and `rdynarmic/src/frontend/a64/translate/mod.rs` vs `/home/vricosti/Dev/emulators/zuyu/externals/dynarmic/src/dynarmic/frontend/A64/translate/impl/floating_point_data_processing_one_register.cpp`
+
+### Intentional differences
+- `FMOV_float`, `FABS_float`, `FNEG_float`, and `FSQRT_float` now live in their own matching Rust owner file instead of the merged `floating_point.rs` catch-all. This restores the upstream file/method ownership split for the one-register operations already present on this tree.
+- Rust still expresses the upstream typed IR surface (`IR::U16U32U64` / `IR::U32U64`) through the existing width-dispatched scalar read/write helpers and emitter API (`fp_abs`, `fp_neg`, `fp_sqrt`). This is a mechanical emitter-API adaptation only.
+- Focused Rust tests assert that representative one-register scalar operations no longer end in `Terminal::Interpret`, and that half-precision `FSQRT` is rejected before any `FPSqrt*` IR is emitted. Upstream has no equivalent Rust unit-test surface.
+
+### Unintentional differences (to fix)
+- The shared `fp_datasize(...)` helper still lives in `rdynarmic/src/frontend/a64/translate/floating_point.rs`, so the new owner file still depends on the merged catch-all for a cross-file helper that upstream keeps in shared translator infrastructure via `impl.h`.
+- `TranslatorVisitor::unallocated_encoding()` on this tree still routes to `interpret_this_instruction()`, so half-precision rejection in this slice terminates via the existing local unallocated path instead of the stricter upstream exception behavior.
+- The rest of upstream `floating_point_data_processing_one_register.cpp` is still not restored in the matching owner on this tree: `FMOV_float_imm`, `FCVT_float`, and the `FRINT*` family remain in `floating_point.rs` as interpreter fallbacks.
+
+### Missing items
+- Continue the same owner file with the remaining upstream one-register operations: `FMOV_float_imm`, `FCVT_float`, `FRINTN_float`, `FRINTP_float`, `FRINTM_float`, `FRINTZ_float`, `FRINTA_float`, `FRINTX_float`, and `FRINTI_float`.
+- Revisit moving the shared FP datasize helper out of `floating_point.rs` once more FP owner files exist.
+- Revisit the global `unallocated_encoding()` behavior if the goal remains literal upstream exception semantics, not only file ownership parity.
+
+### Binary layout verification
+- PASS: translator IR only; no guest-visible raw struct layout changed in this slice.
+
+## 2026-05-06 — `rdynarmic/src/jit_config.rs`, `rdynarmic/src/backend/x64/emit_context.rs`, `rdynarmic/src/backend/x64/emit_terminal.rs`, `rdynarmic/src/jit.rs`, `rdynarmic/src/ir/terminal.rs`, `rdynarmic/src/frontend/a64/translate/visitor.rs`, and `core/src/arm/dynarmic/arm_dynarmic_64.rs` vs `/home/vricosti/Dev/emulators/zuyu/externals/dynarmic/src/dynarmic/backend/x64/a64_emit_x64.cpp`, `/home/vricosti/Dev/emulators/zuyu/externals/dynarmic/src/dynarmic/frontend/A64/translate/impl/impl.cpp`, and `/home/vricosti/Dev/emulators/zuyu/src/core/arm/dynarmic/arm_dynarmic_64.cpp`
+
+### Intentional differences
+- Rust exposes the upstream `InterpreterFallback(pc, num_instructions)` callback through the local `UserCallbacks` trait and `EmitCallbacks` struct rather than C++ virtual dispatch. This is a mechanical language adaptation only.
+- `Terminal::Interpret` now stores only `next` plus `num_instructions`, matching upstream terminal ownership more closely; Rust no longer carries the earlier extra local `pc` field.
+- A focused Rust regression now asserts that A64 `interpret_this_instruction()` uses the current location as the interpret terminal target, matching upstream `IR::Term::Interpret(*ir.current_location)`. Upstream has no equivalent Rust unit-test surface.
+
+### Unintentional differences (to fix)
+- `core/src/arm/dynarmic/arm_dynarmic_64.rs` still handles `interpreter_fallback()` as a local log-and-halt path. Upstream first calls `LogBacktrace(m_process)` and then routes through `ReturnException(pc, PrefetchAbort)`, which also snapshots context into `m_breakpoint_context` before halting.
+- The Rust A64 callback layer still carries substantial temporary investigation-only tracing in `arm_dynarmic_64.rs` (`RUZU_LOG_INTERPRET_PC`, access/watch logging, extra register dumps). These are not upstream parity and should be unwound once the active STK investigation no longer needs them.
+
+### Missing items
+- Revisit `arm_dynarmic_64.rs` `InterpreterFallback` lifecycle parity so it mirrors upstream `LogBacktrace` plus `ReturnException(pc, PrefetchAbort)` behavior more literally.
+- Revisit whether A32 host-side `InterpreterFallback` needs the same lifecycle tightening once the A64 path is settled.
+- Continue investigating the current STK guest trap site at `0x8076E64C` (`udf #0`) now that the A64 interpret terminal points at the correct PC.
+
+### Binary layout verification
+- PASS: callback/JIT/terminal control-flow ownership only; no guest-visible raw struct layout changed in this slice.
+
+## 2026-05-06 — `core/src/hle/kernel/svc_dispatch.rs` and `core/src/hle/kernel/svc/svc_exception.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/svc.cpp` and `/home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/svc/svc_exception.cpp`
+
+### Intentional differences
+- Rust still routes `Break` through free functions and local argument helpers instead of upstream C++ wrapper templates. This is a mechanical language adaptation only.
+
+### Unintentional differences (to fix)
+- `svc_dispatch.rs` had been terminating the host process with `std::process::exit(1)` after `svc_exception::break_execution(...)` for both 32-bit and 64-bit `Break`. Upstream `Svc::Break` does not terminate the emulator there; it logs, reports, and optionally suspends for the debugger. This forced-exit divergence has now been removed.
+- `svc_exception.rs` still lacks the upstream reporter call (`SaveSvcBreakReport`) and debugger notification/suspend flow (`NotifyThreadStopped`, `RequestSuspend(Debug)`), so `Break` lifecycle parity remains incomplete even after removing the local forced exit.
+
+### Missing items
+- Port the remaining upstream `Break` side effects in `svc_exception.rs`: reporter integration, debugger notification, and debug suspend semantics.
+- Add a focused regression covering that `SvcId::Break` returns to guest control flow rather than aborting the host process.
+
+### Binary layout verification
+- PASS: SVC control-flow handling only; no guest-visible raw struct layout changed in this slice.
+
+## 2026-05-06 — `core/src/arm/dynarmic/arm_dynarmic_64.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/arm/dynarmic/arm_dynarmic_64.cpp`
+
+### Intentional differences
+- Rust snapshots the upstream `m_breakpoint_context` through a shared `Arc<Mutex<ThreadContext>>` owned by `ArmDynarmic64` and filled from the callback-side `A64JitState` pointer. This is a mechanical adaptation of the upstream parent-reference pattern only.
+- A focused Rust regression now checks that `thread_context_from_jit_state(...)` reconstructs `ThreadContext` from `A64JitState` with the expected GPR/vector/FP state mapping. Upstream has no equivalent Rust unit-test surface.
+
+### Unintentional differences (to fix)
+- `InterpreterFallback(...)` still does not mirror the full upstream lifecycle: Rust still lacks the upstream `LogBacktrace(m_process)` call before reporting the unimplemented instruction.
+- `ExceptionRaised(...)` still logs more local diagnostic detail than upstream on the default path and still lacks the exact upstream debugger-enabled branch ownership around `InstructionBreakpoint`.
+- Although `breakpoint_context` is now snapped on fallback/exception paths, the active STK frontier did not move: runtime still loops on `Unimplemented instruction @ 0x8076E64C (instr = 00000000)` followed by `PrefetchAbort` at the same PC.
+
+### Missing items
+- Revisit `InterpreterFallback` parity again if the goal remains literal upstream behavior, especially `LogBacktrace(...)`.
+- Revisit the debugger-enabled `ExceptionRaised(...)` ownership split once the active STK trap is understood.
+- Continue investigating why STK reaches the real guest `udf #0` at `0x8076E64C`; current evidence suggests this is not explained by the old `Break` forced-exit or missing breakpoint-context snapshot.
+
+### Binary layout verification
+- PASS: `ThreadContext` snapshot/control-flow only; no guest-visible raw struct layout changed in this slice.
+
+## 2026-05-06 — `core/src/arm/dynarmic/arm_dynarmic_64.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/arm/dynarmic/arm_dynarmic_64.cpp` (`CallSVC halt parity follow-up`)
+
+### Intentional differences
+- `rdynarmic` still sets the A64 `SVC` halt bit in generated x64 before invoking the host callback, while Rust now also ORs `HaltReason::SVC` from `DynarmicCallbacks64::call_supervisor()`. This duplicates the bit set but preserves the upstream owner-local contract that `CallSVC()` itself requests a supervisor-call halt through the JIT owner.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `DynarmicCallbacks64::call_supervisor()` only latched `svc_num` and relied on a local assumption that the generated code would always halt after the callback. Upstream `DynarmicCallbacks64::CallSVC()` explicitly does both actions: `m_parent.m_svc = svc; m_parent.m_jit->HaltExecution(SupervisorCall);`. Rust now mirrors that lifecycle in the matching owner file.
+
+### Missing items
+- Re-audit whether `rdynarmic/src/backend/x64/emit_a64.rs` should continue directly storing the `SVC` halt bit once the callback-side upstream contract is restored, or whether a more literal split is possible there.
+- Remove the temporary A64/STK diagnostics from `arm_dynarmic_64.rs` once the `svc #0x26` runtime frontier is understood.
+
+### Binary layout verification
+- PASS: callback lifecycle only; no guest-visible raw struct layout changed.
+- PASS: focused regression added in `rdynarmic/src/jit.rs` proving A64 `svc #0x26` both halts and delivers the correct immediate to callbacks.
+- PASS: `cargo build --release --bin ruzu-cmd`
+
+## 2026-05-06 — `rdynarmic/src/backend/x64/emit_a64.rs` and `rdynarmic/src/backend/x64/a32_emit_a32.rs` vs `/home/vricosti/Dev/emulators/zuyu/externals/dynarmic/src/dynarmic/backend/x64/a64_emit_x64.cpp` and `/home/vricosti/Dev/emulators/zuyu/externals/dynarmic/src/dynarmic/backend/x64/a32_emit_x64.cpp` (`SVC halt bit follow-up`)
+
+### Intentional differences
+- Rust still materializes the halt bit with an immediate store in the matching backend owner files instead of the exact upstream helper spelling, but it now uses the shared `crate::halt_reason::HaltReason::SVC.bits()` source of truth rather than a stale hard-coded legacy literal.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: both A64 and A32 x64 lowerings still wrote the obsolete literal `2` for `CallSupervisor`, from before `HaltReason` was remapped to upstream Dynarmic bits. That made generated `svc` blocks return the wrong halt reason under the newer shared enum. The matching backend owners now store `HaltReason::SVC.bits()` instead.
+
+### Missing items
+- Re-audit the remaining x64 backend sites that still use legacy raw halt literals or comments inherited from the old compact Rust halt layout.
+- Revisit whether `A32ExceptionRaised` still needs a similar cleanup around any remaining legacy raw halt literal usage.
+
+### Binary layout verification
+- PASS: backend halt/control-flow change only; no guest-visible raw struct layout changed.
+
+## 2026-05-06 — `rdynarmic/src/frontend/a64/translate/load_store_multiple_structures.rs`, `rdynarmic/src/frontend/a64/translate/simd.rs`, and `rdynarmic/src/frontend/a64/translate/mod.rs` vs `/home/vricosti/Dev/emulators/zuyu/externals/dynarmic/src/dynarmic/frontend/A64/translate/impl/load_store_multiple_structures.cpp`
+
+### Intentional differences
+- Rust now restores the missing upstream owner file instead of keeping `STx_mult_1`, `STx_mult_2`, `LDx_mult_1`, and `LDx_mult_2` in the old catch-all `simd.rs`. This is a structural parity fix, not a behavioral redesign.
+- The shared upstream helper `SharedDecodeAndOperation(...)` is expressed as a private Rust method on `TranslatorVisitor` with `Option<Reg>` for the optional writeback register. This is a mechanical language adaptation only.
+- Focused Rust regressions now cover the exact STK encoding `0x4CDFA041` and the upstream `ReservedValue` rule for `(size == 0b11 && !Q) && selem != 1`. Upstream has no equivalent Rust unit-test surface.
+
+### Unintentional differences (to fix)
+- The rest of the AdvSIMD structure load/store family is still structurally wrong on this tree: single-structure `ST1/2/3/4`, `LD1/2/3/4`, and `LDxR` variants still live as interpreter fallbacks in `simd.rs` instead of their own upstream owner files.
+- The first STK frontier moved from `ld1 {v1.16b-v2.16b}, [x2], #32` at `0x80E3C6A4` to a later `shrn v0.8b, v0.8h, #4` at `0x80E3B74C`, so this slice fixed one real gap but did not complete AdvSIMD shift/arrangement parity.
+
+### Missing items
+- Continue the A64 AdvSIMD owner split with the remaining upstream files adjacent to this area, especially `simd_shift_by_immediate.cpp` and the still-missing structure single-load/store owners.
+- Re-run STK after each newly ported AdvSIMD slice; current evidence says the boot frontier is still moving instruction-by-instruction through missing backend parity, not HLE-only gaps.
+
+### Binary layout verification
+- PASS: translator/control-flow ownership only; no guest-visible raw struct layout changed.
+- PASS: `cargo test ldx_mult_1_stk_encoding_translates_without_interpret_terminal -- --nocapture`
+- PASS: `cargo test ldx_mult_reserved_value_matches_upstream -- --nocapture`
+
+## 2026-05-06 — `rdynarmic/src/frontend/a64/translate/simd_shift_by_immediate.rs` and `rdynarmic/src/frontend/a64/translate/visitor.rs` vs `/home/vricosti/Dev/emulators/zuyu/externals/dynarmic/src/dynarmic/frontend/A64/translate/impl/simd_shift_by_immediate.cpp`
+
+### Intentional differences
+- Rust still ports only the active subset needed on this tree from the upstream owner file; `SHL_2`, `USHR_2`, `SSHR_2`, `SHRN`, and `RSHRN` now live in the matching Rust owner, while the rest of the upstream shift-by-immediate family remains absent.
+- The upstream `Vpart(64, Vd, part, result)` writeback for narrowing results is expressed through existing Rust vector helpers by reconstructing the 128-bit register with `vector_get_element` / `vector_set_element`. This is a mechanical adaptation to the current Rust IR surface.
+- Focused Rust regression now covers the exact STK encoding `0x0F0C8400` (`shrn v0.8b, v0.8h, #4`) to ensure the decoder no longer falls into `Terminal::Interpret`.
+
+### Unintentional differences (to fix)
+- The rest of upstream `simd_shift_by_immediate.cpp` is still missing from this tree: saturating narrowing variants, `SSHLL/USHLL`, `SRI`, `SLI`, and the other rounding/accumulating forms are still absent.
+- `perform_rounding_correction(...)` is now local to this Rust file instead of a shared anonymous-namespace helper near the rest of the upstream shift-right family. Ownership is still file-correct, but helper placement inside the file could be made more literal if more of the upstream family is ported.
+
+### Missing items
+- Continue porting the remaining `simd_shift_by_immediate.cpp` family in the same Rust owner file.
+- Rebuild and rerun STK after this slice to confirm the frontier moves past `0x80E3B74C`.
+
+### Binary layout verification
+- PASS: translator/control-flow ownership only; no guest-visible raw struct layout changed.
+- PASS: `cargo test shrn_stk_encoding_translates_without_interpret_terminal -- --nocapture`
+
+## 2026-05-06 — `rdynarmic/src/backend/x64/emit_vector_arrangement.rs` vs `/home/vricosti/Dev/emulators/zuyu/externals/dynarmic/src/dynarmic/backend/x64/emit_x64_vector.cpp`
+
+### Intentional differences
+- Rust keeps the matching `VectorNarrow16/32/64` owner in the local x64 vector-arrangement backend file, but expresses the zero-high-half cases through existing `rxbyak` scratch-XMM helpers instead of upstream's exact Xbyak wrapper spelling. This is a mechanical backend adaptation only.
+- The scalar fallback helpers are local `extern "C"` Rust functions instead of upstream templated fallback helpers. Ownership stays in the matching backend file.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: the Rust x64 emitter had drifted from upstream by treating `VectorNarrow16`, `VectorNarrow32`, and `VectorNarrow64` as if they consumed two vector arguments. Upstream emits all three as unary ops from `args[0]` only. The stale Rust two-argument lowering could reach `use_scratch_impl on non-Inst non-immediate value` at runtime once STK advanced past the `SHRN` frontend gap. The Rust backend owner now matches upstream's unary contract and zero-fills the unused upper lanes from the single source vector.
+
+### Missing items
+- Add focused backend execution regressions for `VectorNarrow16/32/64` so the unary codegen contract is not only validated indirectly through STK runtime progress.
+- Re-audit adjacent vector-arrangement ops for any other stale binary/unary ownership drift now that STK is executing deeper into AdvSIMD narrowing paths.
+
+### Binary layout verification
+- PASS: backend codegen/control-flow change only; no guest-visible raw struct layout changed.
+- PASS: `cargo build -q --release --bin ruzu-cmd`
+
+## 2026-05-06 — `rdynarmic/src/frontend/a64/translate/simd_two_register_misc.rs` and `rdynarmic/src/frontend/a64/translate/visitor.rs` vs `/home/vricosti/Dev/emulators/zuyu/externals/dynarmic/src/dynarmic/frontend/A64/translate/impl/simd_two_register_misc.cpp`
+
+### Intentional differences
+- Rust continues to port only the active subset of the upstream owner file. `FCVTN` now lives in the correct Rust owner beside the already-ported `XTN`, FP zero-comparisons, and vector FP/int conversion methods; the rest of the upstream family remains absent for now.
+- Upstream `Vpart(64, Vd, Q, result)` is expressed through the existing Rust vector helpers by reconstructing the 128-bit destination from 64-bit lanes when `Q=1`. This is a mechanical adaptation to the current Rust IR surface.
+- Focused Rust regression now covers the exact STK encoding `0x0E616BFF` (`fcvtn v31.2s, v31.2d`) to ensure the decoder/visitor no longer fall into `Terminal::Interpret`.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `FCVTN` decoded on this tree but had no visitor dispatch or method owner in `simd_two_register_misc.rs`, so STK fell into `InterpretThisInstruction()` at `0x8005EEE4`.
+- Fixed in this pass: an initial Rust port wrongly copied a `sz && !Q` reserved-value guard from a different sub-group. Upstream `TranslatorVisitor::FCVTN(bool Q, bool sz, Vec Vn, Vec Vd)` does not reject the `Q=0, sz=1` form used by STK (`fcvtn v31.2s, v31.2d`), and the Rust owner now matches that behavior.
+
+### Missing items
+- Continue the remaining upstream `simd_two_register_misc.cpp` slice, especially `FCVTL`, `FCVTNS_4`, `FCVTNU_4`, `FCVTXN_2`, and the other still-absent FP/vector conversion siblings.
+- Re-run STK after rebuilding `ruzu-cmd` release to identify the next active AdvSIMD/FP frontier after `FCVTN`.
+
+### Binary layout verification
+- PASS: translator/control-flow ownership only; no guest-visible raw struct layout changed.
+- PASS: `cargo test --manifest-path /home/vricosti/Dev/emulators/rdynarmic/Cargo.toml fcvtn_stk_encoding_translates_without_interpret_terminal -- --nocapture`
+
+## 2026-05-06 — `rdynarmic/src/frontend/a64/translate/simd_three_same.rs` and `rdynarmic/src/frontend/a64/translate/visitor.rs` vs `/home/vricosti/Dev/emulators/zuyu/externals/dynarmic/src/dynarmic/frontend/A64/translate/impl/simd_three_same.cpp`
+
+### Intentional differences
+- Rust still ports only an active subset of upstream `simd_three_same.cpp`. `FADD_2` and `FSUB_2` now live in the correct Rust owner alongside the already-ported integer/vector compare and bitwise slices, while the rest of the upstream FP vector arithmetic family remains absent.
+- Upstream `V(datasize, Vd, result)` is expressed through the existing Rust vector read/write helpers. This is a mechanical language adaptation only.
+- Focused Rust regression now covers the exact STK encoding `0x4EFCD41C` (`fsub v28.2d, v0.2d, v28.2d`) to ensure the decoder/visitor no longer fall into `Terminal::Interpret`.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `FADD_2` and `FSUB_2` decoded on this tree but had no visitor dispatch or matching owner methods, so STK advanced to `InterpretThisInstruction()` at `0x8005EF28`.
+- The rest of the upstream FP vector arithmetic siblings in this owner file are still missing from Rust, so more STK movement is likely to expose adjacent gaps in the same file.
+
+### Missing items
+- Continue the upstream `simd_three_same.cpp` FP vector family in this same owner, especially `FABD_4`, `FMLA_vec_2`, `FMLS_vec_2`, and the remaining compare/arithmetic siblings if STK hits them next.
+- Rebuild `ruzu-cmd` release and rerun STK after this slice to identify the next active frontier.
+
+### Binary layout verification
+- PASS: translator/control-flow ownership only; no guest-visible raw struct layout changed.
+- PASS: `cargo test --manifest-path /home/vricosti/Dev/emulators/rdynarmic/Cargo.toml fsub_2_stk_encoding_translates_without_interpret_terminal -- --nocapture`
+
+## 2026-05-06 — `rdynarmic/src/frontend/a64/translate/simd_two_register_misc.rs` and `rdynarmic/src/frontend/a64/translate/visitor.rs` vs `/home/vricosti/Dev/emulators/zuyu/externals/dynarmic/src/dynarmic/frontend/A64/translate/impl/simd_two_register_misc.cpp`
+
+### Intentional differences
+- Rust still ports only an active subset of upstream `simd_two_register_misc.cpp`. `FABS_2` and `FNEG_2` now live in the correct Rust owner beside the already-ported compare, narrow, and FP-conversion slices; the rest of the upstream miscellaneous SIMD family remains absent for now.
+- Upstream writes the result back through `V(datasize, Vd, result)`, while Rust uses the existing vector read/write helpers. This is a mechanical language adaptation only.
+- Focused Rust regression now covers the exact STK encoding `0x6EE0FBBD` (`fneg v29.2d, v29.2d`) to ensure the decoder/visitor no longer fall into `Terminal::Interpret`.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `FNEG_2` decoded on this tree but had no visitor dispatch or owner method in `simd_two_register_misc.rs`, so STK advanced to `InterpretThisInstruction()` at `0x80E2EF54`.
+- The rest of the upstream FP/vector misc siblings in this owner file are still missing from Rust, so adjacent gaps in the same file may still surface as STK advances.
+
+### Missing items
+- Continue the upstream `simd_two_register_misc.cpp` FP/vector miscellaneous slice in this same owner, especially the remaining estimate/reciprocal/rounding siblings if STK reaches them next.
+- Rebuild `ruzu-cmd` release and rerun STK after this slice to identify the next active frontier.
+
+### Binary layout verification
+- PASS: translator/control-flow ownership only; no guest-visible raw struct layout changed.
+- PASS: `cargo test --manifest-path /home/vricosti/Dev/emulators/rdynarmic/Cargo.toml fneg_2_stk_encoding_translates_without_interpret_terminal -- --nocapture`
+
+## 2026-05-06 — `rdynarmic/src/frontend/a64/translate/simd_modified_immediate.rs` vs `/home/vricosti/Dev/emulators/zuyu/externals/dynarmic/src/dynarmic/frontend/A64/translate/impl/simd_modified_immediate.cpp`
+
+### Intentional differences
+- Rust still keeps the upstream owner split literal: all `MOVI / MVNI / ORR-imm / BIC-imm` behavior lives in `simd_modified_immediate.rs`, while dispatch remains mechanical in `visitor.rs`.
+- Upstream writes vector immediates via `V(128, Vd, imm)` / `V(datasize, Vd, result)`; Rust expresses the same ownership through the existing `set_q/get_q` helpers and IR value builders. This is a mechanical language adaptation only.
+- Focused Rust regression now covers the exact STK encoding `0x2F00E41C` (`movi d28, #0`) to ensure this valid `cmode=0b1110, op=1` form no longer routes into the exception path.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: the Rust `MOVI` case table omitted the upstream-valid selector `concatenate(cmode, op) == 0b11101` (`cmode=0b1110, op=1`), so STK reached `ExceptionRaised` at `0x8005EDC4` on a valid `movi d28, #0`. The Rust owner now matches the upstream case table.
+- The rest of the modified-immediate family is still only partially regression-tested on this tree, so adjacent valid selectors should be re-audited if STK reaches them next.
+
+### Missing items
+- Add more focused regressions for the neighboring modified-immediate selectors that currently rely only on the existing table tests and runtime movement.
+- Re-run STK after rebuilding `ruzu-cmd` release to identify the next active frontier after the `movi d28, #0` false exception is removed.
+
+### Binary layout verification
+- PASS: translator/control-flow ownership only; no guest-visible raw struct layout changed.
+- PASS: `cargo test --manifest-path /home/vricosti/Dev/emulators/rdynarmic/Cargo.toml movi_d28_zero_stk_encoding_translates_without_exception_path -- --nocapture`
+
+## 2026-05-06 — `core/src/hle/service/sockets/sockets.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/hle/service/sockets/sockets.cpp`
+
+### Intentional differences
+- Rust still registers services through `ServerManager::register_named_service(...)` closures returning `Arc<dyn SessionRequestHandler>`, instead of C++ `std::make_shared<...>`. This is the expected mechanical ownership adaptation of the same upstream service graph.
+- The Rust file continues to use the existing `ServerManager::run_server(server_manager)` interface rather than the C++ move-only `RunServer(std::move(server_manager))`. This is a mechanical language adaptation only.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `loop_process()` was still registering `"bsd:u"`, `"bsd:s"`, `"bsdcfg"`, `"nsd:a"`, `"nsd:u"`, and `"sfdnsres"` through `GenericStubService`, even though the real Rust owners already existed in `bsd.rs`, `nsd.rs`, and `sfdnsres.rs`. Upstream `sockets.cpp` registers the real owners directly, and Rust now matches that ownership.
+- `nifm:u` remains on `GenericStubService` in its own owner file, so STK still visibly routes through stubbed network-init calls after this sockets wiring fix.
+
+### Missing items
+- Port the same owner-level registration fix in `core/src/hle/service/nifm/nifm.rs` so `"nifm:u"`, `"nifm:a"`, and `"nifm:s"` stop going through `GenericStubService`.
+- Re-audit any remaining service loop files that still register real owner files through generic stubs rather than their upstream counterparts.
+
+### Binary layout verification
+- PASS: service registration/control-flow change only; no guest-visible raw struct layout changed.
+- PASS: `cargo build -q --release --bin ruzu-cmd`
+- PASS: STK rerun no longer shows `GenericStubService(bsd:u)` on the active path; `nifm:u` remains the next visible stub frontier.
+
+## 2026-05-06 — `core/src/hle/service/nifm/nifm.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/hle/service/nifm/nifm.cpp`
+
+### Intentional differences
+- Rust keeps the upstream owner file boundary literal: `NetworkInterface`, `IGeneralService`, `IRequest`, `IScanRequest`, and `INetworkProfile` now all live in `nifm.rs`, but their lifecycle is expressed through `Arc<dyn SessionRequestHandler>` and `ServiceFramework` rather than C++ `shared_ptr` + CRTP. This is the expected mechanical adaptation.
+- `IRequest::GetSystemEventReadableHandles` uses the existing Rust service-layer `Event::copy_handle(ctx)` bridge instead of upstream raw `KEvent*` ownership. This preserves the same IPC-facing readable-event behavior while adapting to the current Rust event owner model.
+- `GetCurrentNetworkProfile` and `GetCurrentIpConfigInfo` remain conservative zero-filled stubs inside the correct owner, rather than full upstream struct population. That keeps method ownership correct while leaving behavioral debt explicit.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `loop_process()` was still registering `"nifm:u"`, `"nifm:a"`, and `"nifm:s"` through `GenericStubService`, even though `nifm.rs` was already the correct upstream owner file. Rust now registers real `NetworkInterface` owners like upstream.
+- Fixed in this pass: `nifm.rs` previously exposed only ad hoc Rust helper methods with no IPC handler surface, so even the existing owner file could not actually serve `CreateGeneralService` / `CreateRequest` / `CreateScanRequest` / `IRequest` IPC. The matching `ServiceFramework` / `SessionRequestHandler` surfaces now exist in this owner.
+- `IGeneralService` still does not mirror the full upstream network-profile data population or room-network spoofing behavior from `nifm.cpp`; several methods remain behaviorally stubbed despite now living in the right owner.
+
+### Missing items
+- Port the remaining upstream `IGeneralService` payload structs and logic, especially `SfNetworkProfileData`, `IpConfigInfo`, and room-network-aware spoofing in `GetCurrentNetworkProfile`, `GetCurrentIpAddress`, and `GetCurrentIpConfigInfo`.
+- Re-audit whether `IRequest::GetSystemEventReadableHandles` should be tightened further toward the upstream `KReadableEvent` ownership path once the broader event bridge work stabilizes.
+- Investigate the remaining STK blocker after this slice: guest-side data-dir discovery still fails on `supertuxkart.1.5` even with `bsd:u` and `nifm:u` no longer routed through `GenericStubService`.
+
+### Binary layout verification
+- PASS: service registration/control-flow change only; no guest-visible raw struct layout changed.
+- PASS: `cargo build -q --release --bin ruzu-cmd`
+- PASS: STK rerun no longer shows `GenericStubService(nifm:u)` on the active path; the next visible blocker is STK's own data-dir fatal.
+
+## 2026-05-07 — `common/src/fs/path_util.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/common/fs/path_util.cpp`
+
+### Intentional differences
+- Rust already diverged from upstream before this pass by introducing a legacy `~/.local/share/yuzu` fallback for `data_root` when the primary `ruzu` NAND is empty. Upstream `path_util.cpp` has no such compatibility path; it always uses the active yuzu root.
+- This pass extends that Rust-only compatibility heuristic to also treat `sdmc/FsAccessLog.txt` as non-meaningful content and prefer the legacy yuzu root when the primary SDMC is effectively empty but the legacy SDMC is populated. This is an explicit compatibility adaptation for existing user data, not literal upstream behavior.
+
+### Unintentional differences (to fix)
+- Runtime evidence still does not show the new legacy-root info log during STK boot, and STK still reports `//share/supertuxkart/data/` missing. So while the helper and unit tests are correct locally, this compatibility path is not yet proven to be active on the real STK path.
+- The log message in `reinitialize()` still says `because ruzu NAND is empty` even when the SDMC branch is what actually selected the legacy root. That reason string is now stale and should be tightened if this compatibility path is kept.
+
+### Missing items
+- Re-audit why the legacy-root heuristic does not appear to trigger in the live STK run despite passing SDMC-focused tests.
+- If the compatibility path stays, tighten the runtime logging so it reports whether NAND or SDMC emptiness caused the legacy-root selection.
+
+### Binary layout verification
+- PASS: path-selection/helper change only; no serialized or raw-memory layout changed.
+- PASS: `cargo test -q -p common test_legacy_yuzu_root_selected_when_ruzu_nand_is_empty -- --nocapture`
+- PASS: `cargo test -q -p common test_legacy_yuzu_root_selected_when_ruzu_sdmc_only_has_access_log -- --nocapture`
+- PASS: `cargo test -q -p common test_legacy_yuzu_root_not_selected_when_ruzu_sdmc_has_meaningful_content -- --nocapture`
+
+## 2026-05-07 — `core/src/hle/service/filesystem/filesystem.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/hle/service/filesystem/filesystem.cpp`
+
+### Intentional differences
+- Rust still expresses the upstream controller ownership with direct methods on `FileSystemController` and `Arc<Mutex<...>>` callers instead of C++ references and `std::shared_ptr`. This is a mechanical ownership adaptation only.
+- `cargo test -p core` remains blocked by unrelated pre-existing test-build failures elsewhere in the crate, so this pass could only be validated by focused compilation and runtime movement rather than a clean crate-wide test run.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: Rust had no counterpart for upstream `FileSystemController::OpenSDMC`, `GetFreeSpaceSize`, or `GetTotalSpaceSize`, which prevented `fsp-srv` from constructing a real SD-card-backed `IFileSystem`.
+- STK runtime still does not find `//share/supertuxkart/data/` after this pass, so the remaining blocker is now later in the homebrew filesystem path rather than this missing controller ownership.
+
+### Missing items
+- Add more focused controller regressions once the broader `core` test tree is buildable again, especially for `StorageId::Host`, `StorageId::NandSystem`, and `StorageId::NandUser`.
+- Continue tracing why STK still fails its homebrew data lookup even with a real `OpenSDMC` path now present.
+
+### Binary layout verification
+- PASS: controller/service ownership change only; no guest-visible raw struct layout changed.
+- PASS: `cargo build -q --release --bin ruzu-cmd`
+
+## 2026-05-07 — `core/src/hle/service/filesystem/fsp/fsp_srv.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/hle/service/filesystem/fsp/fsp_srv.cpp`
+
+### Intentional differences
+- Rust still serializes the `OutInterface<IFileSystem>` response through `push_interface_response(...)` and `Arc<IFileSystem>` instead of upstream CMIF templates plus `std::shared_ptr`. This is the expected language adaptation of the same owner boundary.
+- The SD-card `SizeGetter` is expressed as Rust closures capturing the existing `Arc<Mutex<FileSystemController>>`, rather than upstream `SizeGetter::FromStorageId(...)`. That is a mechanical adaptation of the same ownership concept.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `OpenSdCardFileSystem` was returning `make_empty_filesystem()` instead of following the upstream flow `fsc.OpenSDMC(&sdmc_dir)` then `IFileSystem(system, sdmc_dir, SizeGetter::FromStorageId(...SdCard))`.
+- STK runtime still reports `supertuxkart.1.5` missing after this fix, so the active homebrew path issue is no longer this fake empty-SDMC filesystem owner.
+
+### Missing items
+- Re-audit other `fsp-srv` methods that still synthesize empty placeholder filesystems or storages instead of using the `FileSystemController`.
+- Continue the STK investigation on the remaining homebrew filesystem/data-dir path after `OpenSdCardFileSystem` parity.
+
+### Binary layout verification
+- PASS: service/controller wiring change only; no guest-visible raw struct layout changed.
+- PASS: `cargo build -q --release --bin ruzu-cmd`
+- PASS: runtime log now shows the real `FspSrv::OpenSdCardFileSystem called` path with the empty-filesystem shortcut removed; STK still fails later on data discovery.

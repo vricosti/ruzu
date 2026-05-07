@@ -143,6 +143,12 @@ pub struct AppletResource {
     registration_list: AruidRegisterList,
     data: [AruidData; ARUID_INDEX_MAX],
     shared_memory_holder: Vec<SharedMemoryHolder>,
+    /// Provides kernel-backed shared memory for new aruid entries.
+    /// Set once during HID startup by the `core` crate; without it, the
+    /// `create_applet_resource` / `register_core_applet_resource` paths
+    /// fail at the holder Initialize call.
+    shared_memory_backing:
+        Option<std::sync::Arc<dyn super::shared_memory_holder::KSharedMemoryBacking>>,
     ref_counter: i32,
     active_vibration_aruid: u64,
 }
@@ -162,9 +168,21 @@ impl AppletResource {
             registration_list: AruidRegisterList::default(),
             data,
             shared_memory_holder: holders,
+            shared_memory_backing: None,
             ref_counter: 0,
             active_vibration_aruid: 0,
         }
+    }
+
+    /// Wires the kernel-backed shared-memory factory used by all subsequent
+    /// `create_applet_resource` / `register_core_applet_resource` calls. The
+    /// `core` crate calls this once during HID service startup with an
+    /// implementation that allocates real `KSharedMemory` objects.
+    pub fn set_shared_memory_backing(
+        &mut self,
+        backing: std::sync::Arc<dyn super::shared_memory_holder::KSharedMemoryBacking>,
+    ) {
+        self.shared_memory_backing = Some(backing);
     }
 
     pub fn create_applet_resource(&mut self, aruid: u64) -> ResultCode {
@@ -178,9 +196,17 @@ impl AppletResource {
             return hid_result::RESULT_ARUID_ALREADY_REGISTERED;
         }
 
+        let Some(backing) = self.shared_memory_backing.clone() else {
+            log::error!(
+                "AppletResource::create_applet_resource: no KSharedMemoryBacking wired \
+                 (core::hle::service::hid::hid::loop_process must call \
+                 ResourceManager::set_shared_memory_backing before any IPC handler runs)"
+            );
+            return hid_result::RESULT_SHARED_MEMORY_NOT_INITIALIZED;
+        };
         let shared_memory = &mut self.shared_memory_holder[index];
         if !shared_memory.is_mapped() {
-            let result = shared_memory.initialize();
+            let result = shared_memory.initialize(&*backing);
             if result.is_error() {
                 return result;
             }
@@ -305,18 +331,24 @@ impl AppletResource {
     /// Port of upstream `AppletResource::GetSharedMemoryHandle`.
     ///
     /// Upstream returns `shared_memory_holder[index].GetHandle()`, which is a
-    /// `Kernel::KSharedMemory*`. The hid_core crate cannot own kernel objects
-    /// without a dependency cycle into `core`, so the Rust port returns the
-    /// validated holder index instead. The `core` service layer uses that
-    /// index to mirror the same shared-memory payload into a real
-    /// `KSharedMemory` object and hand out the copy handle.
-    pub fn get_shared_memory_handle(&self, aruid: u64) -> Result<usize, ResultCode> {
+    /// `Kernel::KSharedMemory*`. ruzu's hid_core crate cannot reference
+    /// `KSharedMemory` directly without creating a circular dependency on
+    /// `core`, so the holder stores the kernel object as
+    /// `Arc<dyn Any + Send + Sync>`. The `core` service layer downcasts the
+    /// returned keepalive to `Arc<KSharedMemory>` to register it on the
+    /// process handle table.
+    pub fn get_shared_memory_handle(
+        &self,
+        aruid: u64,
+    ) -> Result<std::sync::Arc<dyn std::any::Any + Send + Sync>, ResultCode> {
         let index = self.get_index_from_aruid(aruid);
         if index >= ARUID_INDEX_MAX {
             return Err(hid_result::RESULT_ARUID_NOT_REGISTERED);
         }
 
-        Ok(index)
+        self.shared_memory_holder[index]
+            .get_handle()
+            .ok_or(hid_result::RESULT_SHARED_MEMORY_NOT_INITIALIZED)
     }
 
     pub fn get_aruid_data(&self, aruid: u64) -> Option<&AruidData> {
@@ -590,19 +622,37 @@ impl Default for AppletResource {
 
 #[cfg(test)]
 mod tests {
+    use std::any::Any;
+    use std::sync::Arc;
+
     use super::{AppletResource, ARUID_INDEX_MAX};
+    use crate::resources::shared_memory_holder::KSharedMemoryBacking;
+
+    struct TestSharedMemoryBacking;
+
+    impl KSharedMemoryBacking for TestSharedMemoryBacking {
+        fn create(&self, size: usize) -> Option<(*mut u8, Arc<dyn Any + Send + Sync>)> {
+            let mut bytes = vec![0u8; size].into_boxed_slice();
+            let ptr = bytes.as_mut_ptr();
+            let keepalive: Arc<dyn Any + Send + Sync> = Arc::new(bytes);
+            Some((ptr, keepalive))
+        }
+    }
 
     #[test]
     fn get_shared_memory_handle_returns_registered_holder_index() {
         let mut resource = AppletResource::new();
+        resource.set_shared_memory_backing(Arc::new(TestSharedMemoryBacking));
 
         assert!(resource
             .register_applet_resource_user_id(0x1234, true)
             .is_success());
         assert!(resource.create_applet_resource(0x1234).is_success());
 
-        let index = resource.get_shared_memory_handle(0x1234).unwrap();
-        assert!(index < ARUID_INDEX_MAX);
+        let handle = resource.get_shared_memory_handle(0x1234).unwrap();
+        assert!(handle.downcast::<Box<[u8]>>().is_ok());
         assert_eq!(resource.get_shared_memory_format(0x1234).is_some(), true);
+        assert_eq!(resource.get_index_from_aruid(0x1234), 0);
+        assert!(resource.get_index_from_aruid(0x1234) < ARUID_INDEX_MAX);
     }
 }

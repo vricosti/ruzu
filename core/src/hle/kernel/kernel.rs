@@ -1143,8 +1143,7 @@ pub struct KernelCore {
     /// `InitializeSystemResourceLimit` at boot. Holds PhysicalMemoryMax,
     /// ThreadCountMax, EventCountMax, TransferMemoryCountMax, SessionCountMax.
     /// Used by services like KSystemControl::GetInsecureMemoryResourceLimit.
-    system_resource_limit:
-        Option<Arc<Mutex<super::k_resource_limit::KResourceLimit>>>,
+    system_resource_limit: Option<Arc<Mutex<super::k_resource_limit::KResourceLimit>>>,
 
     /// Kernel-wide slab manager for KMemoryBlock nodes used by
     /// `KMemoryBlockManagerUpdateAllocator`. Upstream:
@@ -1161,8 +1160,7 @@ pub struct KernelCore {
     /// free them. ruzu's flat `common::page_table::PageTable` doesn't
     /// produce freeable pages today, but the manager is wired so the
     /// future port of multi-level guest page tables lands cleanly.
-    page_table_manager:
-        Option<Arc<super::k_page_table_manager::KPageTableManager>>,
+    page_table_manager: Option<Arc<super::k_page_table_manager::KPageTableManager>>,
 
     /// Kernel-wide physical memory layout. Upstream:
     /// `KernelCore::Impl::memory_layout` populated at boot by
@@ -2191,9 +2189,7 @@ impl KernelCore {
     /// Get the kernel-wide physical memory layout. Upstream:
     /// `KernelCore::MemoryLayout()`. Populated by
     /// `initialize_memory_layout` at boot.
-    pub fn get_memory_layout(
-        &self,
-    ) -> Option<Arc<Mutex<super::k_memory_layout::KMemoryLayout>>> {
+    pub fn get_memory_layout(&self) -> Option<Arc<Mutex<super::k_memory_layout::KMemoryLayout>>> {
         self.memory_layout.clone()
     }
 
@@ -2276,7 +2272,10 @@ impl KernelCore {
         let _ = rl.reserve(LimitableResource::PhysicalMemoryMax, kernel_size);
         // Reserve secure applet memory introduced in firmware 5.0.0.
         let secure_applet_memory_size: i64 = 4 * 1024 * 1024;
-        let _ = rl.reserve(LimitableResource::PhysicalMemoryMax, secure_applet_memory_size);
+        let _ = rl.reserve(
+            LimitableResource::PhysicalMemoryMax,
+            secure_applet_memory_size,
+        );
         self.system_resource_limit = Some(Arc::new(Mutex::new(rl)));
     }
 

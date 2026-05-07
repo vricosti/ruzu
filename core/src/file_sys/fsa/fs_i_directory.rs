@@ -49,6 +49,13 @@ impl IDirectory {
         );
         let result: Vec<DirectoryEntry> =
             self.entries[self.next_entry_index..self.next_entry_index + actual].to_vec();
+        log::info!(
+            "FileSys::Fsa::IDirectory::Read max_entries={} next={} actual={} names={:?}",
+            max_entries,
+            self.next_entry_index,
+            actual,
+            result.iter().map(DirectoryEntry::name_str).collect::<Vec<_>>()
+        );
         self.next_entry_index += actual;
         Ok(result)
     }

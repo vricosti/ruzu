@@ -75,10 +75,8 @@ impl<T: Default> KDynamicResourceManager<T> {
             pa.initialize(base, region_size, super::k_memory_block::PAGE_SIZE)
                 .expect("KDynamicPageManager::initialize");
         }
-        self.slab_heap.initialize_with_pages(
-            Arc::clone(&self.page_allocator),
-            num_pages,
-        );
+        self.slab_heap
+            .initialize_with_pages(Arc::clone(&self.page_allocator), num_pages);
         self.initialized = true;
     }
 
@@ -246,5 +244,4 @@ impl Drop for KMemoryBlockManagerUpdateAllocator {
 /// `KBlockInfoManager` — typed alias for a slab of `KBlockInfo` nodes
 /// (used by `KPageGroup`). Matches upstream's
 /// `class KBlockInfoManager : public KDynamicResourceManager<KBlockInfo> {};`
-pub type KBlockInfoManager =
-    KDynamicResourceManager<super::k_page_group::KBlockInfo>;
+pub type KBlockInfoManager = KDynamicResourceManager<super::k_page_group::KBlockInfo>;

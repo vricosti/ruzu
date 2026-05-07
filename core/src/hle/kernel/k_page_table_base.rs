@@ -1340,8 +1340,7 @@ impl KPageTableBase {
         // KScopedPageGroup is RAII; we mirror it manually so we can `cancel_close`
         // on the success path.
         let not_first = matches!(operation, OperationType::MapGroup);
-        let mut spg =
-            super::k_page_group::KScopedPageGroup::new(page_group, not_first);
+        let mut spg = super::k_page_group::KScopedPageGroup::new(page_group, not_first);
 
         let mut cur_va = virt_addr as u64;
         for node in page_group.iter() {
@@ -1421,8 +1420,7 @@ impl KPageTableBase {
     pub fn make_block_update_allocator(
         &self,
         num_blocks: usize,
-    ) -> Result<super::k_dynamic_resource_manager::KMemoryBlockManagerUpdateAllocator, u32>
-    {
+    ) -> Result<super::k_dynamic_resource_manager::KMemoryBlockManagerUpdateAllocator, u32> {
         let slab = match crate::hle::kernel::kernel::get_kernel_ref()
             .and_then(|k| k.get_memory_block_slab_manager())
         {
@@ -1466,8 +1464,8 @@ impl KPageTableBase {
     /// ported, `Operate` will start populating the list and this path
     /// becomes hot without further changes.
     pub fn finalize_update(&mut self, page_list: &mut PageLinkedList) {
-        let manager = crate::hle::kernel::kernel::get_kernel_ref()
-            .and_then(|k| k.get_page_table_manager());
+        let manager =
+            crate::hle::kernel::kernel::get_kernel_ref().and_then(|k| k.get_page_table_manager());
         while let Some(page_addr) = page_list.pop() {
             let Some(ref manager) = manager else {
                 continue;
@@ -1762,9 +1760,10 @@ impl KPageTableBase {
             let Some(kernel) = crate::hle::kernel::kernel::get_kernel_mut() else {
                 return (svc_results::RESULT_OUT_OF_MEMORY.get_inner_value(), 0);
             };
-            let rc = kernel
-                .memory_manager_mut()
-                .allocate_and_open(&mut pg, num_pages, alloc_option);
+            let rc =
+                kernel
+                    .memory_manager_mut()
+                    .allocate_and_open(&mut pg, num_pages, alloc_option);
             if rc != 0 {
                 return (rc, 0);
             }
@@ -2197,7 +2196,15 @@ impl KPageTableBase {
             uncached: false,
             disable_merge_attributes: DisableMergeAttribute::NONE,
         };
-        let op_result = self.operate(None, dst, num_pages, 0, false, unmap_props, OperationType::Unmap);
+        let op_result = self.operate(
+            None,
+            dst,
+            num_pages,
+            0,
+            false,
+            unmap_props,
+            OperationType::Unmap,
+        );
         if op_result != 0 {
             return op_result;
         }
@@ -2738,9 +2745,7 @@ impl KPageTableBase {
             // physical address inside the bounded DRAM region, matching upstream
             // and satisfying the host-memory bounds check.
             let alloc_option = self.m_allocate_option;
-            let phys_addr = if let Some(kernel) =
-                crate::hle::kernel::kernel::get_kernel_mut()
-            {
+            let phys_addr = if let Some(kernel) = crate::hle::kernel::kernel::get_kernel_mut() {
                 kernel
                     .memory_manager_mut()
                     .allocate_and_open_continuous(num_pages, 1, alloc_option)
@@ -2836,9 +2841,10 @@ impl KPageTableBase {
             let Some(kernel) = crate::hle::kernel::kernel::get_kernel_mut() else {
                 return svc_results::RESULT_OUT_OF_MEMORY.get_inner_value();
             };
-            let rc = kernel
-                .memory_manager_mut()
-                .allocate_and_open(&mut pg, num_pages, alloc_option);
+            let rc =
+                kernel
+                    .memory_manager_mut()
+                    .allocate_and_open(&mut pg, num_pages, alloc_option);
             if rc != 0 {
                 return rc;
             }
@@ -2929,7 +2935,15 @@ impl KPageTableBase {
             uncached: false,
             disable_merge_attributes: DisableMergeAttribute::NONE,
         };
-        let op_result = self.operate(None, addr, num_pages, 0, false, unmap_props, OperationType::Unmap);
+        let op_result = self.operate(
+            None,
+            addr,
+            num_pages,
+            0,
+            false,
+            unmap_props,
+            OperationType::Unmap,
+        );
         if op_result != 0 {
             return op_result;
         }
@@ -3164,10 +3178,7 @@ impl KPageTableBase {
                 .map(|b| (b.get_address(), b.get_num_pages()))
                 .collect();
             let mut pg_idx = 0usize;
-            let mut pg_phys = pg_blocks
-                .first()
-                .map(|(a, _)| *a)
-                .unwrap_or(0);
+            let mut pg_phys = pg_blocks.first().map(|(a, _)| *a).unwrap_or(0);
             let mut pg_remaining = pg_blocks.first().map(|(_, n)| *n).unwrap_or(0);
 
             for &(range_va, range_pages) in &free_ranges {
@@ -3199,7 +3210,15 @@ impl KPageTableBase {
                     self.clear_fresh_backing_region_phys(pg_phys, chunk * PAGE_SIZE);
                     // Single-block Map (we're slicing the page group manually
                     // per FREE range; one operate(Map) per slice).
-                    let rc = self.operate(None, va, chunk, pg_phys, true, cur_props, OperationType::Map);
+                    let rc = self.operate(
+                        None,
+                        va,
+                        chunk,
+                        pg_phys,
+                        true,
+                        cur_props,
+                        OperationType::Map,
+                    );
                     if rc != 0 {
                         // Rollback: unmap whatever we already mapped in this
                         // call. Upstream uses OperationType::UnmapPhysical.
@@ -3532,7 +3551,15 @@ impl KPageTableBase {
             uncached: false,
             disable_merge_attributes: DisableMergeAttribute::NONE,
         };
-        let op = self.operate(None, dst, num_pages, 0, false, unmap_props, OperationType::Unmap);
+        let op = self.operate(
+            None,
+            dst,
+            num_pages,
+            0,
+            false,
+            unmap_props,
+            OperationType::Unmap,
+        );
         if op != 0 {
             return op;
         }
@@ -3594,9 +3621,8 @@ impl KPageTableBase {
 
         // Get the insecure memory resource limit and pool from KSystemControl.
         let kernel_arc = crate::hle::kernel::kernel::get_kernel_ref();
-        let insecure_resource_limit = kernel_arc.and_then(|k| {
-            super::board::k_system_control::get_insecure_memory_resource_limit(k)
-        });
+        let insecure_resource_limit = kernel_arc
+            .and_then(|k| super::board::k_system_control::get_insecure_memory_resource_limit(k));
         let insecure_pool_raw = super::board::k_system_control::get_insecure_memory_pool();
         let insecure_pool_option = super::k_memory_manager::KMemoryManager::encode_option(
             // Decode the raw pool id and re-encode as the (pool, FromFront)
@@ -3627,9 +3653,11 @@ impl KPageTableBase {
             let Some(kernel) = crate::hle::kernel::kernel::get_kernel_mut() else {
                 return svc_results::RESULT_OUT_OF_MEMORY.get_inner_value();
             };
-            let rc = kernel
-                .memory_manager_mut()
-                .allocate_and_open(&mut pg, num_pages, insecure_pool_option);
+            let rc = kernel.memory_manager_mut().allocate_and_open(
+                &mut pg,
+                num_pages,
+                insecure_pool_option,
+            );
             if rc != 0 {
                 return rc;
             }
@@ -3731,7 +3759,15 @@ impl KPageTableBase {
             uncached: false,
             disable_merge_attributes: DisableMergeAttribute::NONE,
         };
-        let op = self.operate(None, addr, num_pages, 0, false, unmap_props, OperationType::Unmap);
+        let op = self.operate(
+            None,
+            addr,
+            num_pages,
+            0,
+            false,
+            unmap_props,
+            OperationType::Unmap,
+        );
         if op != 0 {
             return op;
         }
@@ -4240,22 +4276,22 @@ impl KPageTableBase {
             // Identity mapping (DRAM_BASE + cur_mapped_addr) would silently
             // alias pool-owned pages — use pool allocation so this transit
             // page is its own physical backing.
-            let partial_phys = if let Some(kernel) =
-                crate::hle::kernel::kernel::get_kernel_mut()
-            {
-                kernel
-                    .memory_manager_mut()
-                    .allocate_and_open_continuous(1, 1, self.m_allocate_option)
+            let partial_phys = if let Some(kernel) = crate::hle::kernel::kernel::get_kernel_mut() {
+                kernel.memory_manager_mut().allocate_and_open_continuous(
+                    1,
+                    1,
+                    self.m_allocate_option,
+                )
             } else {
                 0
             };
             if partial_phys == 0 {
                 if unmapped_size > 0 {
                     if let Some(resource_limit) = &self.m_resource_limit {
-                        resource_limit.lock().unwrap().release(
-                            LimitableResource::PhysicalMemoryMax,
-                            unmapped_size as i64,
-                        );
+                        resource_limit
+                            .lock()
+                            .unwrap()
+                            .release(LimitableResource::PhysicalMemoryMax, unmapped_size as i64);
                     }
                 }
                 return svc_results::RESULT_OUT_OF_MEMORY.get_inner_value();
@@ -4394,12 +4430,12 @@ impl KPageTableBase {
         {
             // Allocate fresh phys for the partial-tail buffer (parallel to the
             // partial-head allocation above).
-            let partial_phys = if let Some(kernel) =
-                crate::hle::kernel::kernel::get_kernel_mut()
-            {
-                kernel
-                    .memory_manager_mut()
-                    .allocate_and_open_continuous(1, 1, self.m_allocate_option)
+            let partial_phys = if let Some(kernel) = crate::hle::kernel::kernel::get_kernel_mut() {
+                kernel.memory_manager_mut().allocate_and_open_continuous(
+                    1,
+                    1,
+                    self.m_allocate_option,
+                )
             } else {
                 0
             };
@@ -4423,10 +4459,10 @@ impl KPageTableBase {
                 }
                 if unmapped_size > 0 {
                     if let Some(resource_limit) = &self.m_resource_limit {
-                        resource_limit.lock().unwrap().release(
-                            LimitableResource::PhysicalMemoryMax,
-                            unmapped_size as i64,
-                        );
+                        resource_limit
+                            .lock()
+                            .unwrap()
+                            .release(LimitableResource::PhysicalMemoryMax, unmapped_size as i64);
                     }
                 }
                 return svc_results::RESULT_OUT_OF_MEMORY.get_inner_value();
@@ -4930,7 +4966,15 @@ impl KPageTableBase {
             uncached: true,
             disable_merge_attributes: DisableMergeAttribute::DISABLE_HEAD,
         };
-        let op = self.operate(None, dst, num_pages, phys_addr, true, props, OperationType::Map);
+        let op = self.operate(
+            None,
+            dst,
+            num_pages,
+            phys_addr,
+            true,
+            props,
+            OperationType::Map,
+        );
         if op != 0 {
             return op;
         }
@@ -4974,7 +5018,15 @@ impl KPageTableBase {
             uncached: false,
             disable_merge_attributes: DisableMergeAttribute::NONE,
         };
-        let op = self.operate(None, dst, num_pages, 0, false, unmap_props, OperationType::Unmap);
+        let op = self.operate(
+            None,
+            dst,
+            num_pages,
+            0,
+            false,
+            unmap_props,
+            OperationType::Unmap,
+        );
         if op != 0 {
             return op;
         }

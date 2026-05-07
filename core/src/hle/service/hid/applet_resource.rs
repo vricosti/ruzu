@@ -6,10 +6,9 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use hid_core::resource_manager::ResourceManager;
-use hid_core::resources::shared_memory_format::SharedMemoryFormat;
 
 use crate::core::SystemRef;
-use crate::hle::kernel::k_shared_memory::{KSharedMemory, MemoryPermission};
+use crate::hle::kernel::k_shared_memory::KSharedMemory;
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
 use crate::hle::service::ipc_helpers::ResponseBuilder;
@@ -30,59 +29,40 @@ pub struct IAppletResource {
 }
 
 impl IAppletResource {
+    /// Mirrors upstream `IAppletResource::GetSharedMemoryHandle`'s call into
+    /// `ResourceManager::GetSharedMemoryHandle` → `AppletResource::GetSharedMemoryHandle`,
+    /// which returns the existing `Kernel::KSharedMemory*` from the holder.
+    /// We then assign a fresh kernel object id and wrap the existing
+    /// `Arc<KSharedMemory>` for the handle table.
+    ///
+    /// IMPORTANT: this MUST NOT allocate a new KSharedMemory. The holder's
+    /// page is the live page that the HID daemon writes to via
+    /// `update_npad`/`update_controllers`/etc.; cloning it to a new page
+    /// would freeze the guest's view at the moment of the IPC call (see
+    /// project memory entry `project_mk8d_hid_shared_mem_root_cause_2026_05_02`).
     fn create_shared_memory_object(
         &self,
-        ctx: &HLERequestContext,
+        _ctx: &HLERequestContext,
     ) -> Option<(u64, Arc<KSharedMemory>)> {
-        let snapshot = {
+        let opaque_handle = {
             let resource_manager = self.resource_manager.lock();
-            resource_manager.get_shared_memory_handle(self.aruid).ok()?;
             let applet_resource = resource_manager.get_applet_resource()?;
             let applet_resource = applet_resource.lock();
-            let shared_memory = applet_resource.get_shared_memory_format(self.aruid)?;
-
-            let size = std::mem::size_of::<SharedMemoryFormat>();
-            let mut snapshot = vec![0u8; size];
-            unsafe {
-                std::ptr::copy_nonoverlapping(
-                    shared_memory as *const SharedMemoryFormat as *const u8,
-                    snapshot.as_mut_ptr(),
-                    size,
-                );
-            }
-            snapshot
+            applet_resource.get_shared_memory_handle(self.aruid).ok()?
         };
+
+        // Recover the concrete `Arc<KSharedMemory>` from the opaque keepalive
+        // stored by `HidKSharedMemoryBacking` (see core/src/hle/service/hid/hid.rs).
+        let shared_memory = opaque_handle.downcast::<KSharedMemory>().ok()?;
 
         let system_ptr =
             self.system.get() as *const crate::core::System as *mut crate::core::System;
-        let device_memory_ptr = unsafe { (*system_ptr).device_memory() as *const _ };
+        // SAFETY: SystemRef is valid for program lifetime; kernel_mut() is
+        // serialized by the system's internal locking and matches the access
+        // pattern used elsewhere in this file.
         let kernel = unsafe { (*system_ptr).kernel_mut()? };
-
-        let mut shared_memory = KSharedMemory::new();
-        if shared_memory
-            .initialize(
-                unsafe { &*device_memory_ptr },
-                kernel.memory_manager_mut(),
-                MemoryPermission::None,
-                MemoryPermission::Read,
-                std::mem::size_of::<SharedMemoryFormat>(),
-            )
-            .is_error()
-        {
-            return None;
-        }
-
-        let dst = shared_memory.get_pointer_mut(0);
-        if dst.is_null() {
-            return None;
-        }
-
-        unsafe {
-            std::ptr::copy_nonoverlapping(snapshot.as_ptr(), dst, snapshot.len());
-        }
-
         let object_id = kernel.create_new_object_id() as u64;
-        Some((object_id, Arc::new(shared_memory)))
+        Some((object_id, shared_memory))
     }
 
     /// Upstream: IAppletResource::GetSharedMemoryHandle

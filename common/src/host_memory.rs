@@ -352,7 +352,11 @@ impl HostMemory {
         assert!(host_offset % PAGE_ALIGNMENT == 0);
         assert!(length % PAGE_ALIGNMENT == 0);
         assert!(virtual_offset + length <= self.virtual_size);
-        assert!(host_offset + length <= self.backing_size);
+        assert!(
+            host_offset + length <= self.backing_size,
+            "host_memory::map: host_offset=0x{:X} + length=0x{:X} > backing_size=0x{:X} (virtual_offset=0x{:X}, virtual_size=0x{:X})",
+            host_offset, length, self.backing_size, virtual_offset, self.virtual_size
+        );
 
         if length == 0 || self.virtual_base.is_null() {
             return;

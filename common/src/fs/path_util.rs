@@ -76,8 +76,27 @@ fn has_populated_system_registered(root: &Path) -> bool {
     entries.flatten().next().is_some()
 }
 
+fn is_meaningful_sdmc_entry(entry_path: &Path) -> bool {
+    entry_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name != "FsAccessLog.txt")
+}
+
+fn has_populated_sdmc(root: &Path) -> bool {
+    let sdmc = root.join(SDMC_DIR);
+    let Ok(entries) = std::fs::read_dir(&sdmc) else {
+        return false;
+    };
+    entries
+        .flatten()
+        .map(|entry| entry.path())
+        .any(|entry_path| is_meaningful_sdmc_entry(&entry_path))
+}
+
 fn should_use_legacy_yuzu_root(primary_root: &Path, legacy_root: &Path) -> bool {
-    !has_populated_system_registered(primary_root) && has_populated_system_registered(legacy_root)
+    (!has_populated_system_registered(primary_root) && has_populated_system_registered(legacy_root))
+        || (!has_populated_sdmc(primary_root) && has_populated_sdmc(legacy_root))
 }
 
 impl PathManager {
@@ -686,6 +705,64 @@ mod tests {
         .unwrap();
 
         assert!(should_use_legacy_yuzu_root(&primary, &legacy));
+
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn test_legacy_yuzu_root_selected_when_ruzu_sdmc_only_has_access_log() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let base = std::env::temp_dir().join(format!("ruzu-path-util-{unique}"));
+        let primary = base.join("ruzu");
+        let legacy = base.join("yuzu");
+
+        fs::create_dir_all(primary.join("sdmc")).unwrap();
+        fs::write(primary.join("sdmc/FsAccessLog.txt"), b"log").unwrap();
+        fs::create_dir_all(legacy.join("sdmc/share/supertuxkart/data")).unwrap();
+        fs::write(
+            legacy
+                .join("sdmc/share/supertuxkart/data")
+                .join("supertuxkart.1.5"),
+            b"x",
+        )
+        .unwrap();
+
+        assert!(should_use_legacy_yuzu_root(&primary, &legacy));
+
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn test_legacy_yuzu_root_not_selected_when_ruzu_sdmc_has_meaningful_content() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let base = std::env::temp_dir().join(format!("ruzu-path-util-{unique}"));
+        let primary = base.join("ruzu");
+        let legacy = base.join("yuzu");
+
+        fs::create_dir_all(primary.join("sdmc/share/supertuxkart/data")).unwrap();
+        fs::write(
+            primary
+                .join("sdmc/share/supertuxkart/data")
+                .join("supertuxkart.1.5"),
+            b"x",
+        )
+        .unwrap();
+        fs::create_dir_all(legacy.join("sdmc/share/supertuxkart/data")).unwrap();
+        fs::write(
+            legacy
+                .join("sdmc/share/supertuxkart/data")
+                .join("supertuxkart.1.5"),
+            b"x",
+        )
+        .unwrap();
+
+        assert!(!should_use_legacy_yuzu_root(&primary, &legacy));
 
         let _ = fs::remove_dir_all(base);
     }

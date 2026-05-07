@@ -13,7 +13,7 @@ use crate::file_sys::fs_filesystem::{DirectoryEntryType, OpenMode};
 use crate::file_sys::registered_cache::{
     ContentProvider, ContentProviderUnion, ContentProviderUnionSlot,
 };
-use crate::file_sys::romfs_factory::RomFSFactory;
+use crate::file_sys::romfs_factory::{RomFSFactory, StorageId};
 use crate::file_sys::savedata_factory::SaveDataFactory;
 use crate::file_sys::sdmc_factory::SdmcFactory;
 use crate::file_sys::vfs::vfs_offset::OffsetVfsFile;
@@ -149,6 +149,78 @@ impl FileSystemController {
         &self,
     ) -> Option<crate::file_sys::vfs::vfs_types::VirtualDir> {
         self.sdmc_factory.as_ref()?.get_sdmc_content_directory()
+    }
+
+    /// Port of upstream `FileSystemController::OpenSDMC` (filesystem.cpp:359-372).
+    pub fn open_sdmc(&self) -> Result<VirtualDir, ResultCode> {
+        log::trace!("FileSystemController::OpenSDMC called");
+
+        let Some(sdmc_factory) = self.sdmc_factory.as_ref() else {
+            return Err(errors::RESULT_PORT_SD_CARD_NO_DEVICE);
+        };
+
+        let sdmc = sdmc_factory.open();
+        log::debug!(
+            "FileSystemController::OpenSDMC returning root={}",
+            sdmc.get_full_path()
+        );
+        Ok(sdmc)
+    }
+
+    /// Port of upstream `FileSystemController::GetFreeSpaceSize` (filesystem.cpp:402-424).
+    pub fn get_free_space_size(&self, id: StorageId) -> u64 {
+        match id {
+            StorageId::None | StorageId::GameCard => 0,
+            StorageId::SdCard => self
+                .sdmc_factory
+                .as_ref()
+                .map(|factory| factory.get_sdmc_free_space())
+                .unwrap_or(0),
+            StorageId::Host => self
+                .bis_factory
+                .as_ref()
+                .map(|factory| {
+                    factory.get_system_nand_free_space() + factory.get_user_nand_free_space()
+                })
+                .unwrap_or(0),
+            StorageId::NandSystem => self
+                .bis_factory
+                .as_ref()
+                .map(|factory| factory.get_system_nand_free_space())
+                .unwrap_or(0),
+            StorageId::NandUser => self
+                .bis_factory
+                .as_ref()
+                .map(|factory| factory.get_user_nand_free_space())
+                .unwrap_or(0),
+        }
+    }
+
+    /// Port of upstream `FileSystemController::GetTotalSpaceSize` (filesystem.cpp:426-448).
+    pub fn get_total_space_size(&self, id: StorageId) -> u64 {
+        match id {
+            StorageId::None | StorageId::GameCard => 0,
+            StorageId::SdCard => self
+                .sdmc_factory
+                .as_ref()
+                .map(|factory| factory.get_sdmc_total_space())
+                .unwrap_or(0),
+            StorageId::Host => self
+                .bis_factory
+                .as_ref()
+                .map(|factory| factory.get_full_nand_total_space())
+                .unwrap_or(0),
+            StorageId::NandSystem => self
+                .bis_factory
+                .as_ref()
+                .map(|factory| factory.get_system_nand_total_space())
+                .unwrap_or(0),
+            StorageId::NandUser => self
+                .bis_factory
+                .as_ref()
+                .map(|factory| factory.get_user_nand_total_space())
+                .unwrap_or(0),
+        }
     }
 
     /// Port of upstream `FileSystemController::RegisterProcess` (filesystem.cpp:298-311).
@@ -333,6 +405,11 @@ impl FileSystemController {
         if self.sdmc_factory.is_none() {
             let sdmc_dir_path = get_ruzu_path(RuzuPath::SDMCDir);
             let sdmc_load_dir_path = sdmc_dir_path.join("atmosphere/contents");
+            log::debug!(
+                "FileSystemController::CreateFactories using sdmc_dir={} sdmc_load_dir={}",
+                path_to_utf8_string(&sdmc_dir_path),
+                path_to_utf8_string(&sdmc_load_dir_path),
+            );
             let sd_directory: VirtualDir =
                 Arc::new(crate::file_sys::vfs::vfs_real::RealVfsDirectory::new(
                     vfs.clone(),
@@ -516,6 +593,61 @@ mod tests {
         assert!(provider.has_slot(ContentProviderUnionSlot::SysNAND));
         assert!(provider.has_slot(ContentProviderUnionSlot::UserNAND));
         assert!(provider.has_slot(ContentProviderUnionSlot::SDMC));
+
+        set_ruzu_path(RuzuPath::NANDDir, &old_nand);
+        set_ruzu_path(RuzuPath::LoadDir, &old_load);
+        set_ruzu_path(RuzuPath::DumpDir, &old_dump);
+        set_ruzu_path(RuzuPath::SDMCDir, &old_sdmc);
+
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn open_sdmc_returns_real_sdmc_root_after_factory_creation() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let base = std::env::temp_dir().join(format!("ruzu-fsc-open-sdmc-{unique}"));
+        let nand = base.join("nand");
+        let load = base.join("load");
+        let dump = base.join("dump");
+        let sdmc = base.join("sdmc");
+
+        fs::create_dir_all(nand.join("system/Contents/registered")).unwrap();
+        fs::create_dir_all(nand.join("system/Contents/placehld")).unwrap();
+        fs::create_dir_all(nand.join("user/Contents/registered")).unwrap();
+        fs::create_dir_all(nand.join("user/Contents/placehld")).unwrap();
+        fs::create_dir_all(&load).unwrap();
+        fs::create_dir_all(&dump).unwrap();
+        fs::create_dir_all(sdmc.join("Nintendo/Contents/registered")).unwrap();
+        fs::create_dir_all(sdmc.join("Nintendo/Contents/placehld")).unwrap();
+        fs::create_dir_all(sdmc.join("atmosphere/contents")).unwrap();
+        fs::create_dir_all(sdmc.join("share/supertuxkart/data")).unwrap();
+        fs::write(sdmc.join("share/supertuxkart/data/supertuxkart.1.5"), b"x").unwrap();
+
+        let old_nand = get_ruzu_path(RuzuPath::NANDDir);
+        let old_load = get_ruzu_path(RuzuPath::LoadDir);
+        let old_dump = get_ruzu_path(RuzuPath::DumpDir);
+        let old_sdmc = get_ruzu_path(RuzuPath::SDMCDir);
+
+        set_ruzu_path(RuzuPath::NANDDir, &nand);
+        set_ruzu_path(RuzuPath::LoadDir, &load);
+        set_ruzu_path(RuzuPath::DumpDir, &dump);
+        set_ruzu_path(RuzuPath::SDMCDir, &sdmc);
+
+        let mut controller = FileSystemController::new();
+        controller.create_factories(crate::file_sys::vfs::vfs_real::RealVfsFilesystem::new(), false);
+
+        let opened = controller.open_sdmc().unwrap();
+        assert!(opened
+            .get_file_relative("share/supertuxkart/data/supertuxkart.1.5")
+            .is_some());
+        assert!(controller.get_free_space_size(crate::file_sys::romfs_factory::StorageId::SdCard) > 0);
+        assert_eq!(
+            controller.get_total_space_size(crate::file_sys::romfs_factory::StorageId::SdCard),
+            0x10000000000
+        );
 
         set_ruzu_path(RuzuPath::NANDDir, &old_nand);
         set_ruzu_path(RuzuPath::LoadDir, &old_load);

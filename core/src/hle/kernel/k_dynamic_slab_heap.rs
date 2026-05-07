@@ -93,9 +93,9 @@ impl<T: Default> KDynamicSlabHeap<T> {
                 }
             }
         }
-        self.address.store(start_address as usize, Ordering::Relaxed);
-        self.size
-            .store(num_pages * PAGE_SIZE, Ordering::Relaxed);
+        self.address
+            .store(start_address as usize, Ordering::Relaxed);
+        self.size.store(num_pages * PAGE_SIZE, Ordering::Relaxed);
 
         // Carve into typed entries and seed the free list.
         let entries_per_page = Self::entries_per_page();
@@ -177,10 +177,8 @@ impl<T: Default> KDynamicSlabHeap<T> {
         }
         let item = Box::new(T::default());
         drop(list);
-        self.capacity
-            .fetch_add(entries_per_page, Ordering::Relaxed);
-        self.size
-            .fetch_add(PAGE_SIZE, Ordering::Relaxed);
+        self.capacity.fetch_add(entries_per_page, Ordering::Relaxed);
+        self.size.fetch_add(PAGE_SIZE, Ordering::Relaxed);
         self.bump_used();
         Some(item)
     }
@@ -199,12 +197,10 @@ impl<T: Default> KDynamicSlabHeap<T> {
         let new = self.used.fetch_add(1, Ordering::Relaxed) + 1;
         let mut peak = self.peak.load(Ordering::Relaxed);
         while peak < new {
-            match self.peak.compare_exchange_weak(
-                peak,
-                new,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) {
+            match self
+                .peak
+                .compare_exchange_weak(peak, new, Ordering::Relaxed, Ordering::Relaxed)
+            {
                 Ok(_) => break,
                 Err(actual) => peak = actual,
             }

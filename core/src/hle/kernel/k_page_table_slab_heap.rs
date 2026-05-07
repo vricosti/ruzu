@@ -104,11 +104,7 @@ impl KPageTableSlabHeap {
     ///   `Initialize(KDynamicPageManager*, size_t object_count, RefCount* rc)`
     /// where `rc` is carved from the kernel management region. ruzu owns
     /// the refcount Vec inline since the slab is host-backed.
-    pub fn initialize(
-        &self,
-        page_allocator: Arc<Mutex<KDynamicPageManager>>,
-        num_pages: usize,
-    ) {
+    pub fn initialize(&self, page_allocator: Arc<Mutex<KDynamicPageManager>>, num_pages: usize) {
         // Reserve `num_pages` from the page manager up-front so its
         // used-count reflects the slab's footprint. Upstream's
         // `KDynamicSlabHeap::Initialize` does the equivalent.
@@ -127,7 +123,9 @@ impl KPageTableSlabHeap {
             }
         }
         let mut inner = self.inner.lock().unwrap();
-        inner.pages = (0..num_pages).map(|_| Box::new(PageTablePage::default())).collect();
+        inner.pages = (0..num_pages)
+            .map(|_| Box::new(PageTablePage::default()))
+            .collect();
         inner.in_use = vec![false; num_pages];
         inner.ref_counts = vec![0; num_pages];
         inner.address = start_address;
@@ -167,10 +165,7 @@ impl KPageTableSlabHeap {
             return;
         };
         if !inner.in_use[idx] {
-            log::warn!(
-                "KPageTableSlabHeap::free: double free of addr {:#x}",
-                addr
-            );
+            log::warn!("KPageTableSlabHeap::free: double free of addr {:#x}", addr);
             return;
         }
         // Reset the entry contents so reused pages don't carry stale

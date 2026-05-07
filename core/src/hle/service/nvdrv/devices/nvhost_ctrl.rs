@@ -216,6 +216,18 @@ impl NvHostCtrl {
         unsafe { &*self.syncpoint_manager }
     }
 
+    fn wait_host_stalled(&self, fence_id: u32, target_value: u32) {
+        let system_ptr = self.events_interface.system().get() as *const crate::core::System
+            as *mut crate::core::System;
+        // SAFETY: `SystemRef` is valid for the service lifetime. This mirrors
+        // upstream `system.StallApplication(); WaitHost(...); system.UnstallApplication();`
+        // from the matching owner file.
+        let stall_guard = unsafe { (*system_ptr).stall_application() };
+        self.syncpoint_manager().wait_host(fence_id, target_value);
+        unsafe { (*system_ptr).unstall_application() };
+        drop(stall_guard);
+    }
+
     fn create_nv_event(&self, events: &mut [InternalEvent], mask: &mut u64, event_id: u32) {
         let event = &mut events[event_id as usize];
         event.readable_event = Some(
@@ -433,7 +445,7 @@ impl NvHostCtrl {
             if params.timeout == 0 {
                 if events[slot as usize].fails > 2 {
                     events[slot as usize].fails = 0;
-                    self.syncpoint_manager().wait_host(fence_id, target_value);
+                    self.wait_host_stalled(fence_id, target_value);
                     params.value.raw = target_value;
                     if Self::should_trace_event_wait() {
                         log::info!(
@@ -466,7 +478,7 @@ impl NvHostCtrl {
 
                 if events[slot as usize].fails > 2 {
                     events[slot as usize].fails = 0;
-                    self.syncpoint_manager().wait_host(fence_id, target_value);
+                    self.wait_host_stalled(fence_id, target_value);
                     params.value.raw = target_value;
                     if Self::should_trace_event_wait() {
                         log::info!(
@@ -711,6 +723,46 @@ mod tests {
             ctrl.ioc_ctrl_clear_event_wait(&mut clear),
             NvResult::Success
         );
+
+        std::mem::forget(system);
+    }
+
+    #[test]
+    fn event_wait_non_allocation_fallback_wait_host_resets_fails_and_returns_target() {
+        let system = System::new_for_test();
+        let events = Arc::new(EventInterface::new(SystemRef::from_ref(&system)));
+        let syncpoints = SyncpointManager::new();
+        let ctrl = NvHostCtrl::new(events, &syncpoints);
+        let fence_id = syncpoints.allocate_syncpoint(false);
+
+        let mut register = IocCtrlEventRegisterParams { user_event_id: 2 };
+        assert_eq!(
+            ctrl.ioc_ctrl_event_register(&mut register),
+            NvResult::Success
+        );
+
+        {
+            let mut events = ctrl.events.lock().unwrap();
+            events[2].fails = 3;
+        }
+
+        let mut params = IocCtrlEventWaitParams {
+            fence: NvFence {
+                id: fence_id as i32,
+                value: 5,
+            },
+            timeout: 1,
+            value: super::SyncpointEventValue { raw: 2 },
+        };
+
+        let result = ctrl.ioc_ctrl_event_wait(&mut params, false);
+
+        assert_eq!(result, NvResult::Success);
+        assert_eq!(params.value.raw, 5);
+        {
+            let events = ctrl.events.lock().unwrap();
+            assert_eq!(events[2].fails, 0);
+        }
 
         std::mem::forget(system);
     }

@@ -1,6 +1,9 @@
 //! Port of zuyu/src/core/hle/service/filesystem/fsp/fs_i_file.h and fs_i_file.cpp
 //!
 //! IFile service.
+//!
+//! Mirrors upstream's `D<&IFile::Method>` dispatch + `Out<T>` / `InBuffer<T>` /
+//! `OutBuffer<T>` signatures via the CMIF helpers (`CmifRequest`, `CmifResponse`).
 
 use std::collections::BTreeMap;
 
@@ -8,9 +11,14 @@ use crate::file_sys::fs_file::{ReadOption, WriteOption};
 use crate::file_sys::fsa::fs_i_file::IFile as FsaIFile;
 use crate::file_sys::vfs::vfs_types::VirtualFile;
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
+use crate::hle::service::cmif_serialization::{CmifRequest, CmifResponse};
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
-use crate::hle::service::ipc_helpers::{RequestParser, ResponseBuilder};
 use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
+
+/// Number of u32 words for `Result + raw<T>` CMIF response.
+const fn response_words<T>() -> u32 {
+    2 + ((core::mem::size_of::<T>() as u32 + 3) / 4)
+}
 
 /// IPC command table for IFile:
 ///
@@ -48,137 +56,155 @@ impl IFile {
         }
     }
 
-    /// Port of upstream IFile::Read.
-    ///
-    /// CMIF input params: ReadOption (u32), offset (s64), size (s64).
-    /// CMIF output: out_size (s64), out_buffer (via buffer descriptor).
-    fn read_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
-        let service = unsafe { &*(this as *const dyn ServiceFramework as *const IFile) };
-        let mut rp = RequestParser::new(ctx);
-        let option_raw = rp.pop_u32();
-        rp.skip(1); // padding to align s64
-        let offset = rp.pop_i64();
-        let size = rp.pop_i64();
+    fn as_self(this: &dyn ServiceFramework) -> &Self {
+        unsafe { &*(this as *const dyn ServiceFramework as *const Self) }
+    }
 
-        let option = ReadOption { value: option_raw };
+    // ---------------- Business-logic methods ----------------
+
+    fn read(
+        &self,
+        option: ReadOption,
+        out_size: &mut i64,
+        offset: i64,
+        out_buffer: &mut [u8],
+        size: i64,
+    ) -> ResultCode {
         log::debug!(
             "IFile::Read called, option={}, offset={:#x}, size={}",
             option.value,
             offset,
             size
         );
-
-        let buffer_size = ctx.get_write_buffer_size(0);
-        let read_size = std::cmp::min(size as usize, buffer_size);
-        let mut output = vec![0u8; read_size];
-
-        match service
-            .backend
-            .read(offset, &mut output, read_size, &option)
-        {
+        let read_size = core::cmp::min(size as usize, out_buffer.len());
+        match self.backend.read(offset, out_buffer, read_size, &option) {
             Ok(bytes_read) => {
-                ctx.write_buffer(&output[..bytes_read], 0);
-                let mut rb = ResponseBuilder::new(ctx, 4, 0, 0);
-                rb.push_result(RESULT_SUCCESS);
-                rb.push_i64(bytes_read as i64);
+                *out_size = bytes_read as i64;
+                RESULT_SUCCESS
             }
-            Err(rc) => {
-                let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
-                rb.push_result(ResultCode::new(rc.0));
-            }
+            Err(rc) => ResultCode::new(rc.0),
         }
     }
 
-    /// Port of upstream IFile::Write.
-    ///
-    /// CMIF input params: WriteOption (u32), offset (s64), size (s64).
-    /// CMIF input buffer via buffer descriptor.
-    fn write_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
-        let service = unsafe { &*(this as *const dyn ServiceFramework as *const IFile) };
-        let mut rp = RequestParser::new(ctx);
-        let option_raw = rp.pop_u32();
-        rp.skip(1); // padding to align s64
-        let offset = rp.pop_i64();
-        let size = rp.pop_i64();
-
-        let option = WriteOption { value: option_raw };
+    fn write(&self, buffer: &[u8], option: WriteOption, offset: i64, size: i64) -> ResultCode {
         log::debug!(
             "IFile::Write called, option={}, offset={:#x}, size={}",
             option.value,
             offset,
             size
         );
+        let write_size = core::cmp::min(size as usize, buffer.len());
+        match self
+            .backend
+            .write(offset, &buffer[..write_size], write_size, &option)
+        {
+            Ok(()) => RESULT_SUCCESS,
+            Err(rc) => ResultCode::new(rc.0),
+        }
+    }
+
+    fn flush(&self) -> ResultCode {
+        log::debug!("IFile::Flush called");
+        match self.backend.flush() {
+            Ok(()) => RESULT_SUCCESS,
+            Err(rc) => ResultCode::new(rc.0),
+        }
+    }
+
+    fn set_size(&self, size: i64) -> ResultCode {
+        log::debug!("IFile::SetSize called, size={}", size);
+        match self.backend.set_size(size) {
+            Ok(()) => RESULT_SUCCESS,
+            Err(rc) => ResultCode::new(rc.0),
+        }
+    }
+
+    fn get_size(&self, out_size: &mut i64) -> ResultCode {
+        log::debug!("IFile::GetSize called");
+        match self.backend.get_size() {
+            Ok(size) => {
+                *out_size = size;
+                RESULT_SUCCESS
+            }
+            Err(rc) => ResultCode::new(rc.0),
+        }
+    }
+
+    // ---------------- Per-cmd dispatch shims ----------------
+
+    fn reply_result_only(ctx: &mut HLERequestContext, result: ResultCode) {
+        let mut response = CmifResponse::result_only(ctx, result);
+        let _ = &mut response;
+    }
+
+    fn read_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let service = Self::as_self(this);
+        let mut request = CmifRequest::new(ctx);
+        let option_raw = request.raw::<u32>();
+        request.align_for::<i64>(); // align to next s64
+        let offset = request.raw::<i64>();
+        let size = request.raw::<i64>();
+        let option = ReadOption { value: option_raw };
+        log::trace!(
+            "IFile::Read parsed option={} offset={:#x} size={}",
+            option.value,
+            offset,
+            size
+        );
+
+        let buffer_size = ctx.get_write_buffer_size(0);
+        let read_size = core::cmp::min(size as usize, buffer_size);
+        let mut buffer = vec![0u8; read_size];
+        let mut out_size: i64 = 0;
+        let result = service.read(option, &mut out_size, offset, &mut buffer, size);
+        if result == RESULT_SUCCESS {
+            ctx.write_buffer(&buffer[..out_size as usize], 0);
+            let mut response = CmifResponse::new(ctx, response_words::<i64>(), 0, 0);
+            response.push_result(result);
+            response.push_u64(out_size as u64);
+        } else {
+            Self::reply_result_only(ctx, result);
+        }
+    }
+
+    fn write_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let service = Self::as_self(this);
+        let mut request = CmifRequest::new(ctx);
+        let option_raw = request.raw::<u32>();
+        request.align_for::<i64>(); // align to next s64
+        let offset = request.raw::<i64>();
+        let size = request.raw::<i64>();
+        let option = WriteOption { value: option_raw };
 
         let data = ctx.read_buffer(0);
-        let write_size = std::cmp::min(size as usize, data.len());
-
-        match service
-            .backend
-            .write(offset, &data[..write_size], write_size, &option)
-        {
-            Ok(()) => {
-                let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
-                rb.push_result(RESULT_SUCCESS);
-            }
-            Err(rc) => {
-                let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
-                rb.push_result(ResultCode::new(rc.0));
-            }
-        }
+        let result = service.write(&data, option, offset, size);
+        Self::reply_result_only(ctx, result);
     }
 
-    /// Port of upstream IFile::Flush.
     fn flush_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
-        let service = unsafe { &*(this as *const dyn ServiceFramework as *const IFile) };
-        log::debug!("IFile::Flush called");
-
-        match service.backend.flush() {
-            Ok(()) => {
-                let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
-                rb.push_result(RESULT_SUCCESS);
-            }
-            Err(rc) => {
-                let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
-                rb.push_result(ResultCode::new(rc.0));
-            }
-        }
+        let service = Self::as_self(this);
+        let result = service.flush();
+        Self::reply_result_only(ctx, result);
     }
 
-    /// Port of upstream IFile::SetSize.
     fn set_size_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
-        let service = unsafe { &*(this as *const dyn ServiceFramework as *const IFile) };
-        let mut rp = RequestParser::new(ctx);
-        let size = rp.pop_i64();
-
-        log::debug!("IFile::SetSize called, size={}", size);
-
-        match service.backend.set_size(size) {
-            Ok(()) => {
-                let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
-                rb.push_result(RESULT_SUCCESS);
-            }
-            Err(rc) => {
-                let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
-                rb.push_result(ResultCode::new(rc.0));
-            }
-        }
+        let service = Self::as_self(this);
+        let mut request = CmifRequest::new(ctx);
+        let size = request.raw::<i64>();
+        let result = service.set_size(size);
+        Self::reply_result_only(ctx, result);
     }
 
-    /// Port of upstream IFile::GetSize.
     fn get_size_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
-        let service = unsafe { &*(this as *const dyn ServiceFramework as *const IFile) };
-        log::debug!("IFile::GetSize called");
-
-        match service.backend.get_size() {
-            Ok(size) => {
-                let mut rb = ResponseBuilder::new(ctx, 4, 0, 0);
-                rb.push_result(RESULT_SUCCESS);
-                rb.push_i64(size);
-            }
-            Err(rc) => {
-                let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
-                rb.push_result(ResultCode::new(rc.0));
-            }
+        let service = Self::as_self(this);
+        let mut out_size: i64 = 0;
+        let result = service.get_size(&mut out_size);
+        if result == RESULT_SUCCESS {
+            let mut response = CmifResponse::new(ctx, response_words::<i64>(), 0, 0);
+            response.push_result(result);
+            response.push_u64(out_size as u64);
+        } else {
+            Self::reply_result_only(ctx, result);
         }
     }
 }

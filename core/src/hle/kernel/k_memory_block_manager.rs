@@ -56,9 +56,7 @@ impl KMemoryBlockManager {
         &mut self,
         st: usize,
         nd: usize,
-        slab_manager: Option<
-            &super::k_dynamic_resource_manager::KMemoryBlockSlabManager,
-        >,
+        slab_manager: Option<&super::k_dynamic_resource_manager::KMemoryBlockSlabManager>,
     ) -> Result<(), ()> {
         self.m_start_address = st;
         self.m_end_address = nd;
@@ -69,9 +67,7 @@ impl KMemoryBlockManager {
         // Draw the sentinel from the slab when one is provided. Upstream
         // does this so the slab is the single source of truth for all
         // KMemoryBlock storage in the manager.
-        let mut start_block: Box<KMemoryBlock> = match slab_manager
-            .and_then(|sm| sm.allocate())
-        {
+        let mut start_block: Box<KMemoryBlock> = match slab_manager.and_then(|sm| sm.allocate()) {
             Some(b) => b,
             None => Box::new(KMemoryBlock::new()),
         };
@@ -439,8 +435,7 @@ impl KMemoryBlockManager {
     ///
     /// Upstream: KMemoryBlockManager::CheckState.
     pub fn check_state(&self) -> bool {
-        let blocks: Vec<&KMemoryBlock> =
-            self.memory_block_tree.values().map(|b| &**b).collect();
+        let blocks: Vec<&KMemoryBlock> = self.memory_block_tree.values().map(|b| &**b).collect();
         if blocks.is_empty() {
             return true;
         }
@@ -520,7 +515,9 @@ impl KMemoryBlockManager {
     fn split_at_with_allocator(
         &mut self,
         address: usize,
-        allocator: Option<&mut super::k_dynamic_resource_manager::KMemoryBlockManagerUpdateAllocator>,
+        allocator: Option<
+            &mut super::k_dynamic_resource_manager::KMemoryBlockManagerUpdateAllocator,
+        >,
     ) {
         if address == self.m_start_address || address == self.m_end_address {
             return;

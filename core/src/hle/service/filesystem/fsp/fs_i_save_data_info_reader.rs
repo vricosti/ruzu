@@ -5,8 +5,8 @@
 use std::collections::BTreeMap;
 
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
+use crate::hle::service::cmif_serialization::CmifResponse;
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
-use crate::hle::service::ipc_helpers::ResponseBuilder;
 use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
 
 /// Port of ISaveDataInfoReader::SaveDataInfo
@@ -61,15 +61,16 @@ impl ISaveDataInfoReader {
         }
     }
 
-    /// Port of upstream ISaveDataInfoReader::ReadSaveDataInfo.
-    ///
-    /// Returns save data entries to the caller. Currently stubbed to return 0 entries,
-    /// which is safe for initial boot (no save data found).
+    /// Port of upstream `ISaveDataInfoReader::ReadSaveDataInfo`.
+    /// Returns save-data entries to the caller. Currently stubbed to return 0
+    /// entries (safe for initial boot — no save data found). Upstream signature:
+    /// `Result ReadSaveDataInfo(Out<s64> out_count, OutBuffer<...> out_info)`.
     fn read_save_data_info_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         log::warn!("(STUBBED) ISaveDataInfoReader::ReadSaveDataInfo returning 0 entries");
-        let mut rb = ResponseBuilder::new(ctx, 4, 0, 0);
-        rb.push_result(RESULT_SUCCESS);
-        rb.push_i64(0); // out_count = 0
+        // 4 words = result(2) + i64(2). Matches upstream `Out<s64>`.
+        let mut response = CmifResponse::new(ctx, 4, 0, 0);
+        response.push_result(RESULT_SUCCESS);
+        response.push_u64(0); // out_count = 0
     }
 }
 
