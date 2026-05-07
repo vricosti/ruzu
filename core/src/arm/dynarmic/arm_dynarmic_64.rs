@@ -120,6 +120,63 @@ fn trace_a64_access_pc() -> Option<u64> {
     *PC.get_or_init(|| parse_u64_env("RUZU_TRACE_A64_ACCESS_PC"))
 }
 
+/// Parse `RUZU_DUMP_VEC_AT_PC=PC[,PC,...]` (hex). On every memory read,
+/// if the JIT PC matches one of the listed PCs we dump V17/V18 (full
+/// 128-bit) plus X3/X5 to stderr. Used to inspect strchr-style
+/// vectorized scan state at loop boundaries (LD1 at 0x80E3C6A4 /
+/// 0x80E3C6F0 — V17/V18/X5 carry over from the previous iteration's
+/// ADDP/UMOV chain since the load only writes V1/V2).
+fn dump_vec_at_pcs() -> &'static [u64] {
+    use std::sync::OnceLock;
+    static PCS: OnceLock<Vec<u64>> = OnceLock::new();
+    PCS.get_or_init(|| {
+        let Ok(raw) = std::env::var("RUZU_DUMP_VEC_AT_PC") else {
+            return Vec::new();
+        };
+        raw.split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .filter_map(|s| {
+                let s = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")).unwrap_or(s);
+                u64::from_str_radix(s, 16).ok()
+            })
+            .collect()
+    })
+    .as_slice()
+}
+
+#[inline(always)]
+fn dump_vec_at_pc(cb: &DynarmicCallbacks64) {
+    let pcs = dump_vec_at_pcs();
+    if pcs.is_empty() {
+        return;
+    }
+    let Some(pc_ptr) = cb.jit_pc_ptr else { return; };
+    let jit_state_ptr = unsafe {
+        (pc_ptr as *const u8).sub(A64JitState::offset_of_pc()) as *const A64JitState
+    };
+    let jit_state = unsafe { &*jit_state_ptr };
+    if !pcs.contains(&jit_state.pc) {
+        return;
+    }
+    // V<i> = (vec[2i], vec[2i+1]) — low/high 64 bits.
+    let vlo = |i: usize| jit_state.vec[2 * i];
+    let vhi = |i: usize| jit_state.vec[2 * i + 1];
+    let x3 = jit_state.reg[3];
+    let x5 = jit_state.reg[5];
+    eprintln!(
+        "[VEC_DUMP] pc=0x{:016X} v3=0x{:016X}{:016X} v4=0x{:016X}{:016X} v7=0x{:016X}{:016X} v16=0x{:016X}{:016X} v17=0x{:016X}{:016X} v18=0x{:016X}{:016X} x3=0x{:016X} x5=0x{:016X}",
+        jit_state.pc,
+        vhi(3), vlo(3),
+        vhi(4), vlo(4),
+        vhi(7), vlo(7),
+        vhi(16), vlo(16),
+        vhi(17), vlo(17),
+        vhi(18), vlo(18),
+        x3, x5
+    );
+}
+
 fn trace_a64_access_budget() -> &'static AtomicU32 {
     use std::sync::OnceLock;
     static BUDGET: OnceLock<AtomicU32> = OnceLock::new();
@@ -510,6 +567,7 @@ x19=0x{:016X} x20=0x{:016X} x21=0x{:016X} x22=0x{:016X} x25=0x{:016X}",
 
     fn memory_read_64(&self, vaddr: u64) -> u64 {
         self.check_memory_access(vaddr, 8);
+        dump_vec_at_pc(self);
         // RUZU_TRACE_R64_VALUE=0xVAL — log on Read64 that RETURNS the
         // target value. Inverse of W64_VALUE; used to track where a
         // sentinel value enters guest registers from memory.
@@ -577,6 +635,33 @@ x19=0x{:016X} x20=0x{:016X} x21=0x{:016X} x22=0x{:016X} x25=0x{:016X} {}",
                         jit_state.reg[25],
                         frame_chain,
                     );
+                    if std::env::var_os("RUZU_DUMP_INVALID_X19").is_some() {
+                        let base = jit_state.reg[19];
+                        let mut bytes = Vec::with_capacity(96);
+                        for i in 0..96u64 {
+                            let addr = base + i;
+                            let valid = if let Some(ref cm) = self.core_memory {
+                                cm.lock().unwrap().is_valid_virtual_address_range(addr, 1)
+                            } else {
+                                self.memory.read().unwrap().is_valid_range(addr, 1)
+                            };
+                            if !valid {
+                                break;
+                            }
+                            let b = if let Some(ref cm) = self.core_memory {
+                                cm.lock().unwrap().read_8(addr)
+                            } else {
+                                self.memory.read().unwrap().read_8(addr)
+                            };
+                            bytes.push(b);
+                        }
+                        let ascii: String = bytes
+                            .iter()
+                            .map(|&b| if (0x20..=0x7e).contains(&b) { b as char } else { '.' })
+                            .collect();
+                        eprintln!("[A64_INVALID_READ64_X19_BYTES] addr=0x{base:016X} bytes={bytes:02X?}");
+                        eprintln!("[A64_INVALID_READ64_X19_ASCII] {ascii}");
+                    }
                 } else {
                     eprintln!(
                         "[A64_INVALID_READ64] vaddr=0x{:016X} jit_state=<unavailable>",
@@ -597,6 +682,11 @@ x19=0x{:016X} x20=0x{:016X} x21=0x{:016X} x22=0x{:016X} x25=0x{:016X} {}",
 
     fn memory_read_128(&self, vaddr: u64) -> (u64, u64) {
         self.check_memory_access(vaddr, 16);
+        // RUZU_DUMP_VEC_AT_PC=PC[,PC,...] — for vectorized strchr/strpbrk
+        // scans, dump V17/V18/X3/X5 at LD1 entry. The reduction state
+        // from the previous iteration is still live in V17/V18/X5
+        // because LD1 only writes V1/V2.
+        dump_vec_at_pc(self);
         // RUZU_TRACE_R128_PC=1 — log the JIT PC + key registers on the
         // FIRST few 128-bit reads. Used to identify the guest code that
         // emits a long sequential vector-load scan (e.g. STK's STK
