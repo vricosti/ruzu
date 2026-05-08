@@ -262,7 +262,7 @@ impl Bsd {
             (0, Some(Bsd::register_client_handler), "RegisterClient"),
             (1, Some(Bsd::start_monitoring_handler), "StartMonitoring"),
             (2, Some(Bsd::socket_handler), "Socket"),
-            (3, Some(Bsd::socket_handler), "SocketExempt"),
+            (3, None, "SocketExempt"),
             (4, None, "Open"),
             (5, Some(Bsd::select_handler), "Select"),
             (6, Some(Bsd::poll_handler), "Poll"),

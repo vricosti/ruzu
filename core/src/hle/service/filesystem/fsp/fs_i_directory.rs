@@ -124,6 +124,11 @@ impl IDirectory {
 
 impl SessionRequestHandler for IDirectory {
     fn handle_sync_request(&self, ctx: &mut HLERequestContext) -> ResultCode {
+        if std::env::var_os("RUZU_TRACE_IFS_DISPATCH").is_some() {
+            let cmd = ctx.get_command();
+            let name = self.handlers.get(&cmd).map(|fi| fi.name).unwrap_or("<unknown>");
+            eprintln!("[IDIR_DISPATCH] cmd={} ({})", cmd, name);
+        }
         ServiceFramework::handle_sync_request_impl(self, ctx)
     }
     fn service_name(&self) -> &str {

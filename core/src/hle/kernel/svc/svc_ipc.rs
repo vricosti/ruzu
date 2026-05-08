@@ -265,6 +265,42 @@ fn send_sync_request_impl(
         is_domain,
         context.get_command(),
     );
+    // Env-gated SVC-level trace: every SendSyncRequest with ASCII-decoded
+    // request TLS preview. Useful when an IPC is suspected lost between libnx
+    // and the service dispatcher: this fires BEFORE any service routing, so
+    // any guest-issued SendSyncRequest will appear here.
+    if std::env::var_os("RUZU_TRACE_SVC_IPC").is_some() {
+        let mut printable = String::new();
+        let mem_opt = (|| -> Option<_> {
+            let thread = system.current_thread()?;
+            let parent = {
+                let g = thread.lock().unwrap();
+                g.parent.as_ref()?.clone()
+            }.upgrade()?;
+            let process = parent.lock().unwrap();
+            process.page_table.get_base().m_memory.clone()
+        })();
+        if let Some(mem_arc) = mem_opt {
+            let mem = mem_arc.lock().unwrap();
+            for i in 0..256u64 {
+                let word = mem.read_32(request_message_address + i);
+                let b = (word & 0xff) as u8;
+                if b >= 0x20 && b < 0x7f {
+                    printable.push(b as char);
+                } else if b == 0 && !printable.is_empty() && !printable.ends_with(' ') {
+                    printable.push(' ');
+                }
+            }
+        }
+        eprintln!(
+            "[SVC_IPC] handle={:#x} service={} cmd={} dom={} ascii={:?}",
+            session_handle,
+            session_handler_name,
+            context.get_command(),
+            is_domain,
+            printable.trim(),
+        );
+    }
 
     if trace_sync {
         log::info!("svc::SendSyncRequest stage=complete_sync_request_begin");
