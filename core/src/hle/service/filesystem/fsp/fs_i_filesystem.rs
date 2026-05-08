@@ -119,10 +119,8 @@ impl IFileSystem {
         unsafe { &*(this as *const dyn ServiceFramework as *const Self) }
     }
 
-    /// Read a `FileSys::Sf::Path` (upstream `InLargeData<Path, BufferAttr_HipcPointer>`)
-    /// from the request's pointer buffer at the given index.
-    fn read_path(ctx: &HLERequestContext, index: usize) -> Result<String, ResultCode> {
-        let path_bytes = ctx.read_buffer(index);
+    /// Decode a `FileSys::Sf::Path` payload into a Rust string.
+    fn decode_path_bytes(path_bytes: &[u8]) -> Result<String, ResultCode> {
         if path_bytes.len() < core::mem::size_of::<SfPath>() {
             return Err(ResultCode::new(u32::MAX));
         }
@@ -135,6 +133,17 @@ impl IFileSystem {
             );
         }
         Ok(path.as_str().to_string())
+    }
+
+    /// Read a `FileSys::Sf::Path` (upstream `InLargeData<Path, BufferAttr_HipcPointer>`)
+    /// from the request's X descriptor at the given index.
+    ///
+    /// Upstream CMIF unwrap uses `ReadBufferX()` for `BufferAttr_HipcPointer`.
+    /// Using the local `ReadBuffer()` auto-select path here can consume the
+    /// wrong descriptor when both A and X are present.
+    fn read_path(ctx: &HLERequestContext, index: usize) -> Result<String, ResultCode> {
+        let path_bytes = ctx.read_buffer_x(index);
+        Self::decode_path_bytes(&path_bytes)
     }
 
     // ---------------- Business-logic methods ----------------
@@ -360,6 +369,15 @@ impl IFileSystem {
             _ => CreateOption::None,
         };
         let result = service.create_file(&path, option, size);
+        if std::env::var_os("RUZU_TRACE_FS_RESULTS").is_some() {
+            eprintln!(
+                "[FS_RESULT] CreateFile path={} option_raw={} size={} result=0x{:08x}",
+                path,
+                option_raw,
+                size,
+                result.get_inner_value()
+            );
+        }
         Self::reply_result_only(ctx, result);
     }
 
@@ -370,6 +388,13 @@ impl IFileSystem {
             Err(rc) => return Self::reply_result_only(ctx, rc),
         };
         let result = service.delete_file(&path);
+        if std::env::var_os("RUZU_TRACE_FS_RESULTS").is_some() {
+            eprintln!(
+                "[FS_RESULT] DeleteFile path={} result=0x{:08x}",
+                path,
+                result.get_inner_value()
+            );
+        }
         Self::reply_result_only(ctx, result);
     }
 
@@ -380,6 +405,13 @@ impl IFileSystem {
             Err(rc) => return Self::reply_result_only(ctx, rc),
         };
         let result = service.create_directory(&path);
+        if std::env::var_os("RUZU_TRACE_FS_RESULTS").is_some() {
+            eprintln!(
+                "[FS_RESULT] CreateDirectory path={} result=0x{:08x}",
+                path,
+                result.get_inner_value()
+            );
+        }
         Self::reply_result_only(ctx, result);
     }
 
@@ -390,6 +422,13 @@ impl IFileSystem {
             Err(rc) => return Self::reply_result_only(ctx, rc),
         };
         let result = service.delete_directory(&path);
+        if std::env::var_os("RUZU_TRACE_FS_RESULTS").is_some() {
+            eprintln!(
+                "[FS_RESULT] DeleteDirectory path={} result=0x{:08x}",
+                path,
+                result.get_inner_value()
+            );
+        }
         Self::reply_result_only(ctx, result);
     }
 
@@ -403,6 +442,13 @@ impl IFileSystem {
             Err(rc) => return Self::reply_result_only(ctx, rc),
         };
         let result = service.delete_directory_recursively(&path);
+        if std::env::var_os("RUZU_TRACE_FS_RESULTS").is_some() {
+            eprintln!(
+                "[FS_RESULT] DeleteDirectoryRecursively path={} result=0x{:08x}",
+                path,
+                result.get_inner_value()
+            );
+        }
         Self::reply_result_only(ctx, result);
     }
 
@@ -417,6 +463,14 @@ impl IFileSystem {
             Err(rc) => return Self::reply_result_only(ctx, rc),
         };
         let result = service.rename_file(&old_path, &new_path);
+        if std::env::var_os("RUZU_TRACE_FS_RESULTS").is_some() {
+            eprintln!(
+                "[FS_RESULT] RenameFile old_path={} new_path={} result=0x{:08x}",
+                old_path,
+                new_path,
+                result.get_inner_value()
+            );
+        }
         Self::reply_result_only(ctx, result);
     }
 
@@ -428,6 +482,14 @@ impl IFileSystem {
         };
         let mut out_type: u32 = 0;
         let result = service.get_entry_type(&mut out_type, &path);
+        if std::env::var_os("RUZU_TRACE_FS_RESULTS").is_some() {
+            eprintln!(
+                "[FS_RESULT] GetEntryType path={} result=0x{:08x} out_type={}",
+                path,
+                result.get_inner_value(),
+                out_type
+            );
+        }
         if result == RESULT_SUCCESS {
             // Out<u32>: 3 words = result(2) + u32(1).
             let mut response = CmifResponse::new(ctx, response_words::<u32>(), 0, 0);
@@ -448,6 +510,15 @@ impl IFileSystem {
         };
         let mut out_interface: Option<Arc<IFile>> = None;
         let result = service.open_file(&mut out_interface, &path, mode_raw);
+        if std::env::var_os("RUZU_TRACE_FS_RESULTS").is_some() {
+            eprintln!(
+                "[FS_RESULT] OpenFile path={} mode=0x{:x} result=0x{:08x} has_iface={}",
+                path,
+                mode_raw,
+                result.get_inner_value(),
+                out_interface.is_some()
+            );
+        }
         Self::reply_with_interface(ctx, result, out_interface);
     }
 
@@ -461,6 +532,34 @@ impl IFileSystem {
         };
         let mut out_interface: Option<Arc<IDirectory>> = None;
         let result = service.open_directory(&mut out_interface, &path, mode_raw);
+        if std::env::var_os("RUZU_TRACE_FS_RESULTS").is_some() {
+            let tid: u64 = ctx
+                .get_thread()
+                .map(|t| t.lock().unwrap().get_thread_id())
+                .unwrap_or(0);
+            // Per-core GUEST_PC/GUEST_LR snapshot from the last SVC return.
+            // For a single-threaded loop the SVC issuer's LR points at the
+            // game function that called the libnx fsdev_opendir wrapper.
+            let pcs: Vec<String> = (0..crate::hle::kernel::kernel::GUEST_PC.len())
+                .map(|i| {
+                    format!(
+                        "core{}: pc=0x{:X} lr=0x{:X}",
+                        i,
+                        crate::hle::kernel::kernel::GUEST_PC[i].load(std::sync::atomic::Ordering::Acquire),
+                        crate::hle::kernel::kernel::GUEST_LR[i].load(std::sync::atomic::Ordering::Acquire),
+                    )
+                })
+                .collect();
+            eprintln!(
+                "[FS_RESULT] OpenDirectory tid={} path={} mode=0x{:x} result=0x{:08x} has_iface={} | {}",
+                tid,
+                path,
+                mode_raw,
+                result.get_inner_value(),
+                out_interface.is_some(),
+                pcs.join(" "),
+            );
+        }
         Self::reply_with_interface(ctx, result, out_interface);
     }
 
@@ -499,6 +598,13 @@ impl IFileSystem {
             Err(rc) => return Self::reply_result_only(ctx, rc),
         };
         let result = service.clean_directory_recursively(&path);
+        if std::env::var_os("RUZU_TRACE_FS_RESULTS").is_some() {
+            eprintln!(
+                "[FS_RESULT] CleanDirectoryRecursively path={} result=0x{:08x}",
+                path,
+                result.get_inner_value()
+            );
+        }
         Self::reply_result_only(ctx, result);
     }
 
@@ -510,6 +616,13 @@ impl IFileSystem {
         };
         let mut out_timestamp = FileTimeStampRaw::default();
         let result = service.get_file_time_stamp_raw(&mut out_timestamp, &path);
+        if std::env::var_os("RUZU_TRACE_FS_RESULTS").is_some() {
+            eprintln!(
+                "[FS_RESULT] GetFileTimeStampRaw path={} result=0x{:08x}",
+                path,
+                result.get_inner_value()
+            );
+        }
         if result == RESULT_SUCCESS {
             let mut response = CmifResponse::new(ctx, response_words::<FileTimeStampRaw>(), 0, 0);
             response.push_result(result);
@@ -557,6 +670,20 @@ impl ServiceFramework for IFileSystem {
         Self: Sized,
     {
         let cmd = ctx.get_command();
+        if std::env::var_os("RUZU_TRACE_IFS_DISPATCH").is_some() {
+            let fi_name = self.handlers().get(&cmd).map(|fi| fi.name).unwrap_or("<unknown>");
+            // For path-bearing cmds (GetEntryType=7, OpenFile=8, OpenDirectory=9, GetFileTimeStampRaw=14),
+            // peek the X-buffer for the path. read_buffer_x is non-destructive.
+            let path_preview = match cmd {
+                0 | 1 | 2 | 3 | 4 | 7 | 8 | 9 | 10 | 14 => {
+                    let bytes = ctx.read_buffer_x(0);
+                    let nul = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+                    String::from_utf8_lossy(&bytes[..nul.min(256)]).into_owned()
+                }
+                _ => String::new(),
+            };
+            eprintln!("[IFS_DISPATCH] cmd={} ({}) path={:?}", cmd, fi_name, path_preview);
+        }
         if let Some(fi) = self.handlers().get(&cmd) {
             if let Some(callback) = fi.handler_callback {
                 log::trace!("Service::{}: {}", self.get_service_name(), fi.name);
@@ -571,5 +698,29 @@ impl ServiceFramework for IFileSystem {
         );
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::IFileSystem;
+    use crate::file_sys::fssrv::fssrv_sf_path::Path as SfPath;
+
+    #[test]
+    fn decode_path_bytes_round_trips_full_nested_path() {
+        let path = SfPath::encode("//./supertuxkart/cached-textures/");
+        let bytes = unsafe {
+            core::slice::from_raw_parts(
+                &path as *const SfPath as *const u8,
+                core::mem::size_of::<SfPath>(),
+            )
+        };
+        let decoded = IFileSystem::decode_path_bytes(bytes).unwrap();
+        assert_eq!(decoded, "//./supertuxkart/cached-textures/");
+    }
+
+    #[test]
+    fn decode_path_bytes_rejects_short_buffer() {
+        assert!(IFileSystem::decode_path_bytes(&[0u8; 8]).is_err());
     }
 }

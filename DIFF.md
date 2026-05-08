@@ -13571,3 +13571,82 @@
 - PASS: service/controller wiring change only; no guest-visible raw struct layout changed.
 - PASS: `cargo build -q --release --bin ruzu-cmd`
 - PASS: runtime log now shows the real `FspSrv::OpenSdCardFileSystem called` path with the empty-filesystem shortcut removed; STK still fails later on data discovery.
+
+## 2026-05-07 — `core/src/hle/service/filesystem/fsp/fs_i_filesystem.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/hle/service/filesystem/fsp/fs_i_filesystem.cpp`
+
+### Intentional differences
+- Rust still owns the CMIF unwrap manually inside per-command handler shims instead of using upstream template-generated `D<&IFileSystem::Method>` wrappers. This is an existing language adaptation, but the business-logic owner file remains correct.
+- The focused tests added in this pass validate `SfPath` payload decoding locally rather than reconstructing a full `HLERequestContext` with live X descriptors. That keeps the regression near the owner file while avoiding wider IPC test scaffolding that is still unstable in this tree.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `read_path()` was using `HLERequestContext::read_buffer()`, which auto-selected A before X. Upstream `InLargeData<FileSys::Sf::Path, BufferAttr_HipcPointer>` unwraps through `ReadBufferX()`, not the generic selector. Rust now follows that owner-local CMIF contract.
+- This fix did not move the active STK `cached-textures` frontier. Runtime still shows only `CreateDirectory(//./supertuxkart)` around the `./supertuxkart/cached-textures/` guest log line, so the remaining cause is elsewhere in the guest/runtime path.
+
+### Missing items
+- Re-audit other manual `InLargeData<..., BufferAttr_HipcPointer>` call sites in filesystem/HLE owners that may still be using `read_buffer()` instead of the upstream-specific X-buffer path.
+- Continue STK investigation on why the app logs `Creating directory './supertuxkart/cached-textures/'` without emitting a corresponding `IFileSystem::CreateDirectory` call for that full path.
+
+### Binary layout verification
+- PASS: `SfPath` remains `EntryNameLengthMax + 1` bytes, matching upstream trivial-copy layout.
+- PASS: `cargo build -q --release --bin ruzu-cmd`
+- FAIL: `cargo test -p core ...` is still blocked by unrelated pre-existing test-build failures elsewhere in the crate.
+
+## 2026-05-08 — `core/src/hle/service/sockets/bsd.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/hle/service/sockets/bsd.cpp`
+
+### Intentional differences
+- Rust still represents upstream `ServiceFramework<BSD>::FunctionInfo` handler pointers as `Option<fn(...)>` entries in a `BTreeMap`. This preserves the same command ownership and null-handler behavior while adapting C++ member-function pointers to Rust.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: command 3 `SocketExempt` was incorrectly wired to the Rust `socket_handler`. Upstream declares `{3, nullptr, "SocketExempt"}`. Rust now uses `None` for command 3.
+
+### Missing items
+- Continue auditing the remaining BSD command table against upstream, including TIPC-specific registration, without treating generic HLE dispatch/control commands as BSD function-command evidence.
+
+### Binary layout verification
+- PASS: command table wiring only; no guest-visible raw struct layout changed.
+
+## 2026-05-08 — `core/src/file_sys/fsa/fs_i_directory.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/file_sys/fsa/fs_i_directory.h`
+
+### Intentional differences
+- Rust returns `Vec<DirectoryEntry>` from `read()` instead of writing through `DirectoryEntry* out_entries`; the service-layer owner copies those entries into the guest output buffer. This is an existing Rust ownership adaptation.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `IDirectory::read()` emitted a local `log::info!` trace for every directory read. Upstream `DoRead()` only computes `actual_entries`, advances `next_entry_index`, writes `out_count`, and copies entries; it does not log. The Rust trace was removed to restore upstream-visible behavior and keep STK diagnostics from being dominated by local-only noise.
+
+### Missing items
+- None identified in this slice for `Read()`/`GetEntryCount()` ordering; constructor indexing and save-data-size filtering were rechecked against upstream and remain in the matching owner file.
+
+### Binary layout verification
+- PASS: no `DirectoryEntry` field layout changed; this pass only removed local logging from the read path.
+
+## 2026-05-08 — `core/src/arm/dynarmic/arm_dynarmic_64.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/arm/dynarmic/arm_dynarmic_64.cpp`
+
+### Intentional differences
+- Added env-gated diagnostics in the A64 `exclusive_write_32` callback: `RUZU_TRACE_EXCLUSIVE32_ALL=1` logs the first 128 32-bit exclusive writes, including PC/LR/SP/key registers and the final success boolean. This is local investigation instrumentation, not an upstream behavior port.
+- Existing `RUZU_TRACE_CAS32_PC=1` remains a narrower diagnostic for suspicious addresses; both hooks are inactive unless explicitly requested.
+
+### Unintentional differences (to fix)
+- None introduced in guest-visible behavior; the callback still calls `check_memory_access(...)` and then the existing `core_memory.write_exclusive_32(...)`/`memory_write_32(...)` path in the same order.
+
+### Missing items
+- The broader exclusive-monitor implementation still needs a separate upstream parity audit against Dynarmic's local upstream if STK evidence points back to failed exclusive reservations. Current STK trace showed 128/128 traced 32-bit exclusive writes succeeded, so this was not treated as the next behavioral fix.
+
+### Binary layout verification
+- PASS: diagnostic-only callback change; no guest-visible raw struct layout changed.
+- PASS: `cargo build -q --release --bin ruzu-cmd`
+
+## 2026-05-08 — `core/src/hle/service/filesystem/fsp/fs_i_filesystem.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/hle/service/filesystem/fsp/fs_i_filesystem.cpp`
+
+### Intentional differences
+- Added env-gated `RUZU_TRACE_FS_RESULTS` diagnostics for the remaining file/directory commands (`CreateFile`, `DeleteFile`, `DeleteDirectory`, `DeleteDirectoryRecursively`, `RenameFile`, `OpenFile`, `CleanDirectoryRecursively`). Upstream has ordinary `LOG_DEBUG` lines in the same owner methods; this Rust trace is local investigation output and remains disabled unless explicitly requested.
+- Rust still implements per-command CMIF handler shims manually instead of upstream `D<&IFileSystem::Method>` generated dispatch. This is the existing language adaptation; each command still lives in the matching owner file and calls the same business method.
+
+### Unintentional differences (to fix)
+- None introduced in guest-visible behavior. The trace is emitted after the existing backend call and before the existing reply construction, without changing result codes, output interfaces, raw payloads, or handler ordering.
+
+### Missing items
+- Use the expanded trace to identify why STK logs `Creating directory './supertuxkart/cached-textures/'` and immediately falls back without a matching `CreateDirectory(//./supertuxkart/cached-textures/)` IPC call.
+- Continue auditing other manual filesystem CMIF buffer unwrap sites for strict `BufferAttr_HipcPointer`/X-buffer parity.
+
+### Binary layout verification
+- PASS: diagnostic-only logging; no guest-visible raw struct layout changed.

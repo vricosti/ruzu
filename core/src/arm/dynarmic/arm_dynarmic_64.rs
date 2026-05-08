@@ -929,34 +929,43 @@ x0=0x{:016X} x1=0x{:016X} x19=0x{:016X} x20=0x{:016X} x21=0x{:016X}",
         // FIRST few exclusive-write-32 calls. Used to identify the guest
         // code that emits a tight CAS spinloop (e.g. STK's atomic CAS on
         // 0x0000ff00ffff0008 right after Connect).
-        if std::env::var_os("RUZU_TRACE_CAS32_PC").is_some() {
+        let trace_line = if std::env::var_os("RUZU_TRACE_CAS32_PC").is_some()
+            || std::env::var_os("RUZU_TRACE_EXCLUSIVE32_ALL").is_some()
+        {
             use std::sync::atomic::{AtomicU32, Ordering};
             static SHOWN: AtomicU32 = AtomicU32::new(0);
             // Only trace CAS at non-canonical / suspicious addresses
             // (outside the normal libnx mutex region 0x80000000..0x90000000).
-            let suspicious = vaddr < 0x8000_0000 || vaddr >= 0x9000_0000;
+            let trace_all = std::env::var_os("RUZU_TRACE_EXCLUSIVE32_ALL").is_some();
+            let suspicious = trace_all || vaddr < 0x8000_0000 || vaddr >= 0x9000_0000;
             let n = if suspicious {
                 SHOWN.fetch_add(1, Ordering::Relaxed)
             } else {
                 u32::MAX
             };
-            if n < 12 {
+            if n < 128 {
                 if let Some(pc_ptr) = self.jit_pc_ptr {
                     let jit_state_ptr = unsafe {
                         (pc_ptr as *const u8).sub(A64JitState::offset_of_pc()) as *const A64JitState
                     };
                     let s = unsafe { &*jit_state_ptr };
-                    eprintln!(
+                    Some(format!(
                         "[CAS32 #{}] vaddr=0x{:016X} value=0x{:08X} expected=0x{:08X} pc=0x{:016X} lr=0x{:016X} sp=0x{:016X} \
 x0=0x{:016X} x1=0x{:016X} x2=0x{:016X} x3=0x{:016X} x19=0x{:016X} x20=0x{:016X} x21=0x{:016X} x22=0x{:016X} x29=0x{:016X}",
                         n, vaddr, value, expected, s.pc, s.reg[30], s.sp,
                         s.reg[0], s.reg[1], s.reg[2], s.reg[3],
                         s.reg[19], s.reg[20], s.reg[21], s.reg[22], s.reg[29],
-                    );
+                    ))
+                } else {
+                    None
                 }
+            } else {
+                None
             }
-        }
-        self.check_memory_access(vaddr, 4)
+        } else {
+            None
+        };
+        let success = self.check_memory_access(vaddr, 4)
             && if let Some(ref cm) = self.core_memory {
                 cm.lock()
                     .unwrap()
@@ -964,7 +973,11 @@ x0=0x{:016X} x1=0x{:016X} x2=0x{:016X} x3=0x{:016X} x19=0x{:016X} x20=0x{:016X} 
             } else {
                 self.memory_write_32(vaddr, value);
                 true
-            }
+            };
+        if let Some(line) = trace_line {
+            eprintln!("{line} success={success}");
+        }
+        success
     }
 
     fn exclusive_write_64(&mut self, vaddr: u64, value: u64, expected: u64) -> bool {
