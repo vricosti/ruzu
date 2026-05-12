@@ -6,12 +6,25 @@
 //! much more directly to upstream `make_fcontext` / `jump_fcontext` than the
 //! previous coroutine-based backend.
 
-use context::stack::FixedSizeStack;
+// Use `ProtectedFixedSizeStack` so that fiber stack overflows fault on a
+// guard page instead of silently corrupting adjacent memory. Upstream zuyu
+// uses `VirtualBuffer<u8>` which is paired with explicit guard handling;
+// ruzu's prior `FixedSizeStack` had no protection — a 512 KB fiber stack
+// overflow could land anywhere in the host VA space, including the
+// fastmem arena's backing pages, causing the kind of silent dlmalloc
+// state corruption observed in the STK multi-core wedge.
+use context::stack::ProtectedFixedSizeStack as FixedSizeStack;
 use context::{Context, Transfer};
 use parking_lot::Mutex;
 use std::sync::{Arc, Weak};
 
-const DEFAULT_STACK_SIZE: usize = 512 * 1024;
+// Upstream zuyu uses 512 KB but with `VirtualBuffer<u8>` which is paired
+// with a guard page protection. Ruzu's debug-mode Rust frames are
+// significantly larger than equivalent C++ frames (no inlining, more
+// scaffolding for safety checks). Confirmed via guard-page SIGSEGV that
+// the 512 KB stack overflows almost immediately at STK boot. Use 4 MB
+// to give Rust frames headroom; release-mode builds could shrink this.
+const DEFAULT_STACK_SIZE: usize = 4 * 1024 * 1024;
 type RawContext = usize;
 
 fn context_to_raw(context: Context) -> RawContext {
@@ -79,18 +92,38 @@ impl Fiber {
     }
 
     fn start(&self, transfer: Transfer) -> ! {
+        // Inside start() the new fiber's guard is locked by the YieldTo
+        // caller, so this fiber's FiberImpl is exclusively accessible. We
+        // can safely create &mut here — but the PREVIOUS fiber's guard
+        // hand-off requires care: it's locked by us (via this fiber's
+        // resume path) and we'll unlock it. While the unlock window is
+        // open, another thread on a different core could begin its own
+        // YieldTo targeting the previous fiber. We must therefore drop
+        // any `&mut FiberImpl` to the previous fiber BEFORE force_unlock.
         let entry_point = {
             let imp = unsafe { &mut *self.imp.get() };
             let previous_fiber = imp
                 .previous_fiber
                 .take()
                 .expect("Fiber::start missing previous_fiber");
-            let previous_imp = unsafe { &mut *previous_fiber.imp.get() };
-            previous_imp.context = Some(context_to_raw(transfer.context));
-            unsafe { previous_imp.guard.force_unlock() };
-            imp.entry_point
-                .take()
-                .expect("Fiber::start missing entry point")
+            let entry = imp.entry_point.take();
+            // Drop `imp` (this fiber's &mut) before touching previous's
+            // FiberImpl so we don't briefly hold &mut to two FiberImpls
+            // and risk aliasing if the second &mut narrowly overlaps with
+            // another core's YieldTo on the previous fiber.
+            drop(imp);
+            // Access previous fiber's FiberImpl via raw pointer so we
+            // never create a `&mut FiberImpl` that could alias with a
+            // concurrent YieldTo on the previous fiber after we unlock.
+            let prev_imp_ptr = previous_fiber.imp.get();
+            unsafe {
+                std::ptr::addr_of_mut!((*prev_imp_ptr).context)
+                    .write(Some(context_to_raw(transfer.context)));
+                // Release-store visible to whichever thread will pick up
+                // the previous fiber next via lock().
+                (*prev_imp_ptr).guard.force_unlock();
+            }
+            entry.expect("Fiber::start missing entry point")
         };
 
         entry_point();
@@ -98,6 +131,8 @@ impl Fiber {
     }
 
     fn on_rewind(&self, _transfer: Transfer) -> ! {
+        // on_rewind runs on this fiber while its guard is held by the
+        // caller of Rewind. Safe to use `&mut` for fields of self.
         let rewind_point = {
             let imp = unsafe { &mut *self.imp.get() };
             assert!(imp.context.is_some(), "Fiber::on_rewind missing context");
@@ -148,8 +183,12 @@ impl Fiber {
             imp: std::cell::UnsafeCell::new(imp),
         });
 
-        let fiber_imp = unsafe { &mut *fiber.imp.get() };
-        let guard = fiber_imp.guard.lock();
+        // Lock the guard via &Mutex (raw-pointer-dereferenced field) — does
+        // NOT create a `&mut FiberImpl`. We're the sole owner at this
+        // point (Arc was just constructed) so even &mut would be sound,
+        // but matching the no-&mut convention used in yield_to keeps the
+        // pattern uniform.
+        let guard = unsafe { (*fiber.imp.get()).guard.lock() };
         std::mem::forget(guard);
 
         fiber
@@ -159,25 +198,49 @@ impl Fiber {
     /// Fiber 'from' must be the currently running fiber.
     /// Matches upstream `Fiber::YieldTo(weak_ptr<Fiber>, Fiber&)`.
     pub fn yield_to(weak_from: Weak<Fiber>, to: &Arc<Fiber>) {
-        let to_imp = unsafe { &mut *to.imp.get() };
-        let guard = to_imp.guard.lock();
+        // CRITICAL: do NOT create `&mut FiberImpl` for `to` BEFORE acquiring
+        // the guard. Two host threads (different physical cores) can each
+        // call yield_to on the same `to` fiber concurrently. If both
+        // construct `&mut FiberImpl` before either acquires the lock, the
+        // two `&mut` would briefly co-exist — UB under Rust's `noalias`.
+        // The C++ upstream uses raw pointers (no aliasing claim) and is
+        // safe; the original Rust port translated `to.impl->guard.lock()`
+        // as `(&mut *to.imp.get()).guard.lock()` which silently introduced
+        // the UB. Acquire the lock through the raw pointer first, then
+        // construct &mut (the lock now guarantees exclusivity).
+        let guard = unsafe { (*to.imp.get()).guard.lock() };
         std::mem::forget(guard);
+        let to_imp = unsafe { &mut *to.imp.get() };
         to_imp.previous_fiber = weak_from.upgrade();
 
-        let transfer = unsafe {
-            raw_to_context(to_imp.context.expect("Target fiber missing context"))
-                .resume(Arc::as_ptr(to) as usize)
-        };
+        let context = to_imp.context.expect("Target fiber missing context");
+        // Drop the &mut before the context-switch so no `&mut FiberImpl`
+        // lives across the resume. After resume returns, another thread
+        // might have already unlocked our guard and started its own
+        // yield_to with this fiber as the target; that would create a new
+        // `&mut FiberImpl` and the OLD `to_imp` would be an aliased &mut.
+        drop(to_imp);
+        let transfer = unsafe { raw_to_context(context).resume(Arc::as_ptr(to) as usize) };
 
         if let Some(from) = weak_from.upgrade() {
+            // Same pattern: acquire access without creating &mut, then
+            // narrow scope of any &mut we do construct.
             let from_imp = unsafe { &mut *from.imp.get() };
             let previous_fiber = from_imp
                 .previous_fiber
                 .take()
                 .expect("previous_fiber is nullptr!");
-            let previous_imp = unsafe { &mut *previous_fiber.imp.get() };
-            previous_imp.context = Some(context_to_raw(transfer.context));
-            unsafe { previous_imp.guard.force_unlock() };
+            drop(from_imp);
+            // Use raw pointer for the previous fiber — after the
+            // force_unlock below, another thread can immediately take its
+            // guard. Holding `&mut` past force_unlock would be the
+            // mirror-image of the bug at the entry of yield_to.
+            let prev_imp_ptr = previous_fiber.imp.get();
+            unsafe {
+                std::ptr::addr_of_mut!((*prev_imp_ptr).context)
+                    .write(Some(context_to_raw(transfer.context)));
+                (*prev_imp_ptr).guard.force_unlock();
+            }
         }
     }
 
