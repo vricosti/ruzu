@@ -7,6 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use hid_core::hid_core::HIDCore;
+use hid_core::hid_types::{NpadIdType, NpadStyleIndex};
 use hid_core::resource_manager::{
     ResourceManager, DEFAULT_UPDATE_NS, MOTION_UPDATE_NS, MOUSE_KEYBOARD_UPDATE_NS, NPAD_UPDATE_NS,
 };
@@ -85,6 +86,30 @@ impl KSharedMemoryBacking for HidKSharedMemoryBacking {
 pub fn loop_process(system: crate::core::SystemRef) {
     let firmware_settings = Arc::new(HidFirmwareSettings::new());
     let hid_core = Arc::new(parking_lot::Mutex::new(HIDCore::new()));
+
+    // Seed a default Pro Controller as Player 1.
+    //
+    // Upstream's Qt/Android frontends connect controllers through the
+    // input config flow (`configure_input_player.cpp::Connect(true)`)
+    // BEFORE the game runs. yuzu_cmd reaches the same end state via
+    // `Settings::values.players[i].connected` being deserialised from
+    // the saved config. ruzu_cmd has no config wiring yet, so the
+    // EmulatedController fields default to `is_connected = false` and
+    // games that gate boot behaviour on a connected controller (MK8D
+    // waits before calling `OpenLayer`) stall indefinitely.
+    //
+    // Mirror upstream's `Frontend::DefaultController::ReconfigureControllers`
+    // priority: Pro Controller (Fullkey) gets the first slot. We attach
+    // it permanently (not temporary) so the connection survives the next
+    // `EmulatedController::ReloadFromSettings` if/when that lands.
+    {
+        let mut hc = hid_core.lock();
+        let p1 = hc.get_emulated_controller_mut(NpadIdType::Player1);
+        p1.set_npad_style_index(NpadStyleIndex::Fullkey);
+        p1.connect(false);
+        log::info!("HID: auto-connected default Pro Controller as Player 1");
+    }
+
     let resource_manager = Arc::new(parking_lot::Mutex::new(ResourceManager::new(
         firmware_settings.clone(),
         hid_core,
