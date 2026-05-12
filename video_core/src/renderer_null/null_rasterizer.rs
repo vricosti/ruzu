@@ -64,12 +64,27 @@ impl Default for AccelerateDMA {
 /// Corresponds to zuyu's `Null::RasterizerNull`.
 /// Implements [`RasterizerInterface`] with stub implementations.
 /// Functional side effects (queries, fences, syncpoints) are preserved.
+/// GPU virtual address → CPU virtual address translator.
+///
+/// Calls into the active GPU channel's `MemoryManager::gpu_to_cpu_address`.
+/// Returns `None` if the GPU VA is not currently mapped in the channel's
+/// page table.
+pub type GpuToCpuTranslator = Arc<dyn Fn(u64) -> Option<u64> + Send + Sync>;
+
 pub struct RasterizerNull {
     syncpoints: Arc<SyncpointManager>,
     accelerate_dma: AccelerateDMA,
     channel_caches: ChannelSetupCaches<ChannelInfo>,
     guest_memory_writer: Option<crate::renderer_base::GuestMemoryWriter>,
     gpu_ticks_getter: Option<crate::renderer_base::GpuTicksGetter>,
+    /// Translates GPU VAs to CPU VAs. Upstream's `RasterizerNull::Query`
+    /// calls `gpu_memory->Write<u64>(gpu_addr, ...)` where `gpu_memory`
+    /// is a `Tegra::MemoryManager` that handles GPU VA → CPU VA
+    /// translation internally. Ruzu's `guest_memory_writer` expects a
+    /// CPU VA, so we must translate first via this hook. Without it,
+    /// MK8D's GPU semaphore_trigger commands write to unmapped CPU
+    /// addresses (the GPU VA being passed verbatim to write_block).
+    gpu_to_cpu: Option<GpuToCpuTranslator>,
 }
 
 impl RasterizerNull {
@@ -80,6 +95,7 @@ impl RasterizerNull {
             channel_caches: ChannelSetupCaches::new(),
             guest_memory_writer: None,
             gpu_ticks_getter: None,
+            gpu_to_cpu: None,
         }
     }
 
@@ -90,6 +106,11 @@ impl RasterizerNull {
 
     pub fn set_guest_memory_writer(&mut self, writer: crate::renderer_base::GuestMemoryWriter) {
         self.guest_memory_writer = Some(writer);
+    }
+
+    /// Register a GPU VA → CPU VA translator. See [`GpuToCpuTranslator`].
+    pub fn set_gpu_to_cpu_translator(&mut self, translator: GpuToCpuTranslator) {
+        self.gpu_to_cpu = Some(translator);
     }
 
     pub fn set_gpu_ticks_getter(&mut self, getter: crate::renderer_base::GpuTicksGetter) {
@@ -140,6 +161,17 @@ impl RasterizerInterface for RasterizerNull {
         let Some(gpu_write) = self.guest_memory_writer.as_ref().cloned() else {
             return;
         };
+        // Translate GPU VA → CPU VA via the channel's MemoryManager,
+        // matching upstream's `gpu_memory->Write<u64>(gpu_addr, ...)`
+        // semantics. Without translation, the puller's GPU-VA argument
+        // is passed straight to write_block (which expects CPU VA) and
+        // we get "Unmapped WriteBlock" on what looks like a high
+        // 36-bit address (the unmapped GPU VA).
+        let translate = |gpu_va: u64| -> Option<u64> {
+            self.gpu_to_cpu
+                .as_ref()
+                .and_then(|f| f(gpu_va))
+        };
         let has_timeout = flags.contains(QueryPropertiesFlags::HAS_TIMEOUT);
         if has_timeout {
             let gpu_ticks = self
@@ -147,10 +179,29 @@ impl RasterizerInterface for RasterizerNull {
                 .as_ref()
                 .map(|getter| getter())
                 .unwrap_or(0);
-            gpu_write(gpu_addr + 8, &gpu_ticks.to_le_bytes());
-            gpu_write(gpu_addr, &(payload as u64).to_le_bytes());
+            if let Some(cpu) = translate(gpu_addr + 8) {
+                gpu_write(cpu, &gpu_ticks.to_le_bytes());
+            } else {
+                log::error!(
+                    "RasterizerNull::query: GPU VA 0x{:X}+8 has no CPU mapping (ticks write skipped)",
+                    gpu_addr
+                );
+            }
+            if let Some(cpu) = translate(gpu_addr) {
+                gpu_write(cpu, &(payload as u64).to_le_bytes());
+            } else {
+                log::error!(
+                    "RasterizerNull::query: GPU VA 0x{:X} has no CPU mapping (payload write skipped)",
+                    gpu_addr
+                );
+            }
+        } else if let Some(cpu) = translate(gpu_addr) {
+            gpu_write(cpu, &payload.to_le_bytes());
         } else {
-            gpu_write(gpu_addr, &payload.to_le_bytes());
+            log::error!(
+                "RasterizerNull::query: GPU VA 0x{:X} has no CPU mapping (u32 payload write skipped)",
+                gpu_addr
+            );
         }
     }
 
