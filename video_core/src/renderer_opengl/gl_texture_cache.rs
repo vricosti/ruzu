@@ -264,9 +264,35 @@ impl Image {
 
     /// Port of `Image::DownloadMemory`.
     /// Downloads pixel data from GPU texture to CPU.
-    pub fn download_memory(&mut self, _output: &mut [u8], _level: i32) {
-        // Full implementation:
-        // glGetTextureImage(texture, level, gl_format, gl_type, size, output.as_mut_ptr())
+    ///
+    /// Upstream calls `glGetTextureImage(texture, level, gl_format, gl_type,
+    /// size, buffer)` to read the mip level into `output`. Without this, the
+    /// `TextureCache::download_memory` path has nothing to write back to
+    /// guest memory and rendered framebuffers stay zero — visible to user
+    /// as a black SDL window even though MK8D submitted layers correctly.
+    pub fn download_memory(&mut self, output: &mut [u8], level: i32) {
+        if self.current_texture == 0
+            || self.gl_format == gl::NONE
+            || self.gl_type == gl::NONE
+            || output.is_empty()
+        {
+            return;
+        }
+        // Safety: glGetTextureImage on a valid texture; `output` length
+        // must be at least `buf_size` (caller's responsibility — upstream
+        // sizes via `image.unswizzled_size_bytes`). Pass output.len() as
+        // bufSize so the driver clips if needed.
+        unsafe {
+            gl::PixelStorei(gl::PACK_ALIGNMENT, 1);
+            gl::GetTextureImage(
+                self.current_texture,
+                level,
+                self.gl_format,
+                self.gl_type,
+                output.len() as i32,
+                output.as_mut_ptr() as *mut _,
+            );
+        }
     }
 
     /// Port of `Image::ScaleUp`.
