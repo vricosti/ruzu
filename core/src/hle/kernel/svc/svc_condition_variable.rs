@@ -430,6 +430,126 @@ fn dump_cv_state(
         ctx_words[8], ctx_words[9], ctx_words[10], ctx_words[11],
         ctx_words[12], ctx_words[13], ctx_words[14], ctx_words[15],
     );
+
+    // Wider mutex-region dump: 32 words BEFORE mutex_addr (catches the
+    // surrounding parent struct), and the code AT the calling PC
+    // (4 ARM32 instructions = 16 bytes, around the predicate check).
+    if let Some(memory) = process.page_table.get_base().m_memory.as_ref() {
+        let m = memory.lock().unwrap();
+        let region_base = mutex_addr.wrapping_sub(128);
+        let mut region_words: [u32; 32] = [0; 32];
+        for i in 0..32u64 {
+            region_words[i as usize] = m.read_32(region_base.wrapping_add(i * 4));
+        }
+        log::info!(
+            "[DUMP_CV] {} tid={} region@0x{:X}: {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X}",
+            kind, tid, region_base,
+            region_words[0], region_words[1], region_words[2], region_words[3],
+            region_words[4], region_words[5], region_words[6], region_words[7],
+            region_words[8], region_words[9], region_words[10], region_words[11],
+            region_words[12], region_words[13], region_words[14], region_words[15],
+        );
+        log::info!(
+            "[DUMP_CV] {} tid={} region@0x{:X}+64: {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X}",
+            kind, tid, region_base.wrapping_add(64),
+            region_words[16], region_words[17], region_words[18], region_words[19],
+            region_words[20], region_words[21], region_words[22], region_words[23],
+            region_words[24], region_words[25], region_words[26], region_words[27],
+            region_words[28], region_words[29], region_words[30], region_words[31],
+        );
+
+        // Dump 8 ARM32 instructions around the guest PC (the svc wrapper).
+        let code_base = (pc as u64).wrapping_sub(28);
+        let mut insns: [u32; 8] = [0; 8];
+        for i in 0..8u64 {
+            insns[i as usize] = m.read_32(code_base.wrapping_add(i * 4));
+        }
+        log::info!(
+            "[DUMP_CV] {} tid={} insns@0x{:X} (PC=0x{:X}): {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X}",
+            kind, tid, code_base, pc,
+            insns[0], insns[1], insns[2], insns[3],
+            insns[4], insns[5], insns[6], insns[7],
+        );
+
+        // Dump 16 ARM32 instructions BEFORE the caller LR — that's where
+        // the predicate check and the marker write live (the svc wrapper
+        // itself is a thin <4-instruction stub).
+        let caller_base = (lr as u64).wrapping_sub(60);
+        let mut caller_insns: [u32; 16] = [0; 16];
+        for i in 0..16u64 {
+            caller_insns[i as usize] = m.read_32(caller_base.wrapping_add(i * 4));
+        }
+        log::info!(
+            "[DUMP_CV] {} tid={} caller_insns@0x{:X} (LR=0x{:X}): {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X}",
+            kind, tid, caller_base, lr,
+            caller_insns[0], caller_insns[1], caller_insns[2], caller_insns[3],
+            caller_insns[4], caller_insns[5], caller_insns[6], caller_insns[7],
+            caller_insns[8], caller_insns[9], caller_insns[10], caller_insns[11],
+            caller_insns[12], caller_insns[13], caller_insns[14], caller_insns[15],
+        );
+    }
+
+    // Stack dump: the caller's register-spilled predicate locals
+    // live on its stack. 32 words above SP catches the recent
+    // frame's locals.
+    if let Some(memory) = process.page_table.get_base().m_memory.as_ref() {
+        let m = memory.lock().unwrap();
+        let mut stack_words: [u32; 32] = [0; 32];
+        for i in 0..32u64 {
+            stack_words[i as usize] = m.read_32(sp.wrapping_add(i * 4) as u64);
+        }
+        log::info!(
+            "[DUMP_CV] {} tid={} stack@SP+0..128: {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X}",
+            kind, tid,
+            stack_words[0], stack_words[1], stack_words[2], stack_words[3],
+            stack_words[4], stack_words[5], stack_words[6], stack_words[7],
+            stack_words[8], stack_words[9], stack_words[10], stack_words[11],
+            stack_words[12], stack_words[13], stack_words[14], stack_words[15],
+        );
+        log::info!(
+            "[DUMP_CV] {} tid={} stack@SP+64..128: {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X}",
+            kind, tid,
+            stack_words[16], stack_words[17], stack_words[18], stack_words[19],
+            stack_words[20], stack_words[21], stack_words[22], stack_words[23],
+            stack_words[24], stack_words[25], stack_words[26], stack_words[27],
+            stack_words[28], stack_words[29], stack_words[30], stack_words[31],
+        );
+    }
+
+    // Chase inline pointers. Any ctx word that looks like a heap/stack
+    // pointer (high bit set in the upper byte, or in known guest VA
+    // ranges) gets a 16-word dereference dump. This catches the
+    // predicate when it lives in a struct pointed-to from the
+    // cv/mutex region.
+    if let Some(memory) = process.page_table.get_base().m_memory.as_ref() {
+        let m = memory.lock().unwrap();
+        let mut seen: Vec<u32> = Vec::with_capacity(8);
+        for (i, &w) in ctx_words.iter().enumerate() {
+            // Heuristic: guest pointers are 32-bit non-zero values in
+            // the 0x01000000..0xFF000000 range (typical NRO/heap/stack
+            // mappings for MK8D's ARM32 address space). Skip small
+            // counters, tags, and obvious non-pointers.
+            if w < 0x0010_0000 || w == 0xFFFF_FFFF {
+                continue;
+            }
+            if seen.contains(&w) {
+                continue;
+            }
+            seen.push(w);
+            let mut sub: [u32; 16] = [0; 16];
+            for j in 0..16u64 {
+                sub[j as usize] = m.read_32((w as u64).wrapping_add(j * 4));
+            }
+            log::info!(
+                "[DUMP_CV] {} tid={} *(+{:02})=0x{:08X}: {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X}",
+                kind, tid, i * 4, w,
+                sub[0], sub[1], sub[2], sub[3],
+                sub[4], sub[5], sub[6], sub[7],
+                sub[8], sub[9], sub[10], sub[11],
+                sub[12], sub[13], sub[14], sub[15],
+            );
+        }
+    }
 }
 
 /// One-shot memory dump triggered at first WaitProcessWideKeyAtomic where
