@@ -5,6 +5,22 @@
 //!
 //! OpenGL texture cache -- manages GPU texture and image objects, framebuffers, and samplers.
 
+use std::collections::HashMap;
+
+use crate::engines::maxwell_3d::RenderTargetInfo;
+use crate::framebuffer_config::FramebufferConfig;
+use crate::renderer_base::GuestMemoryWriter;
+use crate::shader_environment::TextureType;
+use crate::surface::PixelFormat;
+use crate::texture_cache::image_base::ImageBase;
+use crate::texture_cache::image_view_base::ImageViewBase;
+use crate::texture_cache::image_base::ImageFlagBits;
+use crate::texture_cache::texture_cache_base::{
+    FramebufferImageView, TextureCacheBase as CommonTextureCache,
+};
+use crate::texture_cache::types::{ImageId, ImageType, ImageViewId, SubresourceRange};
+use crate::texture_cache::util::{full_download_copies, swizzle_image};
+
 /// Number of render targets.
 pub const NUM_RT: usize = 8;
 
@@ -228,6 +244,7 @@ pub struct Image {
     pub gl_type: u32,
     pub gl_num_levels: i32,
     pub current_texture: u32,
+    pub num_samples: i32,
 }
 
 impl Image {
@@ -240,11 +257,78 @@ impl Image {
             gl_type: gl::NONE,
             gl_num_levels: 0,
             current_texture: 0,
+            num_samples: 1,
         }
     }
 
     pub fn handle(&self) -> u32 {
         self.current_texture
+    }
+
+    /// Port of
+    /// `Image::Image(TextureCacheRuntime&, const VideoCommon::ImageInfo&, GPUVAddr, VAddr)`
+    /// for the currently ported render-target path.
+    pub fn from_base(base: &ImageBase) -> Self {
+        let tuple = super::maxwell_to_gl::get_format_tuple(base.info.format as usize);
+        let width = base.info.size.width.max(1) as i32;
+        let height = base.info.size.height.max(1) as i32;
+        let depth = base.info.size.depth.max(1) as i32;
+        let max_host_mip_levels = 32 - base.info.size.width.max(1).leading_zeros();
+        let gl_num_levels = base
+            .info
+            .resources
+            .levels
+            .min(max_host_mip_levels as i32)
+            .max(1);
+
+        let mut texture = 0;
+        unsafe {
+            match base.info.image_type {
+                ImageType::E1D => {
+                    gl::CreateTextures(gl::TEXTURE_1D, 1, &mut texture);
+                    if texture != 0 {
+                        gl::TextureStorage1D(texture, gl_num_levels, tuple.internal_format, width);
+                    }
+                }
+                ImageType::E3D => {
+                    gl::CreateTextures(gl::TEXTURE_3D, 1, &mut texture);
+                    if texture != 0 {
+                        gl::TextureStorage3D(
+                            texture,
+                            gl_num_levels,
+                            tuple.internal_format,
+                            width,
+                            height,
+                            depth,
+                        );
+                    }
+                }
+                ImageType::Buffer => {}
+                ImageType::E2D | ImageType::Linear => {
+                    gl::CreateTextures(gl::TEXTURE_2D, 1, &mut texture);
+                    if texture != 0 {
+                        gl::TextureStorage2D(
+                            texture,
+                            gl_num_levels,
+                            tuple.internal_format,
+                            width,
+                            height,
+                        );
+                    }
+                }
+            }
+        }
+
+        Self {
+            texture,
+            upscaled_backup: 0,
+            gl_internal_format: tuple.internal_format,
+            gl_format: tuple.format,
+            gl_type: tuple.gl_type,
+            gl_num_levels,
+            current_texture: texture,
+            num_samples: base.info.num_samples as i32,
+        }
     }
 
     /// Port of `Image::StorageHandle`.
@@ -331,6 +415,11 @@ pub struct ImageView {
     pub default_handle: u32,
     pub internal_format: u32,
     pub buffer_size: u32,
+    original_texture: u32,
+    num_samples: i32,
+    flat_range: SubresourceRange,
+    full_range: SubresourceRange,
+    is_render_target: bool,
 }
 
 impl ImageView {
@@ -340,6 +429,11 @@ impl ImageView {
             default_handle: 0,
             internal_format: gl::NONE,
             buffer_size: 0,
+            original_texture: 0,
+            num_samples: 0,
+            flat_range: SubresourceRange::default(),
+            full_range: SubresourceRange::default(),
+            is_render_target: false,
         }
     }
 
@@ -355,6 +449,80 @@ impl ImageView {
         self.internal_format
     }
 
+    /// Port of
+    /// `ImageView::ImageView(TextureCacheRuntime&, const ImageViewInfo&, ImageId, Image&, ...)`
+    /// for the currently ported Color2D render-target path.
+    pub fn new_color_2d(base: &ImageViewBase, image: &Image) -> Self {
+        let mut view = Self::new();
+        view.internal_format = present_internal_format(base.format);
+        view.original_texture = image.handle();
+        view.num_samples = image.num_samples;
+        view.flat_range = base.range;
+        view.full_range = base.range;
+        view.is_render_target = true;
+
+        view.setup_view(TextureType::Color2D);
+        view.default_handle = view.handle_for_texture_type(TextureType::Color2D);
+        view
+    }
+
+    pub fn handle_for_texture_type(&self, handle_type: TextureType) -> u32 {
+        self.handle(handle_type as usize)
+    }
+
+    fn setup_view(&mut self, view_type: TextureType) {
+        let view = self.make_view(view_type, self.internal_format);
+        self.views[view_type as usize] = view;
+    }
+
+    fn make_view(&self, view_type: TextureType, view_format: u32) -> u32 {
+        if self.original_texture == 0 {
+            return 0;
+        }
+        let view_range = match view_type {
+            TextureType::Color1D
+            | TextureType::Color2D
+            | TextureType::ColorCube
+            | TextureType::Color2DRect => self.flat_range,
+            TextureType::ColorArray1D
+            | TextureType::ColorArray2D
+            | TextureType::Color3D
+            | TextureType::ColorArrayCube => self.full_range,
+            _ => return 0,
+        };
+        let target = match view_type {
+            TextureType::Color1D => gl::TEXTURE_1D,
+            TextureType::ColorArray1D => gl::TEXTURE_1D_ARRAY,
+            TextureType::Color2D | TextureType::Color2DRect => gl::TEXTURE_2D,
+            TextureType::ColorArray2D => gl::TEXTURE_2D_ARRAY,
+            TextureType::Color3D => gl::TEXTURE_3D,
+            TextureType::ColorCube => gl::TEXTURE_CUBE_MAP,
+            TextureType::ColorArrayCube => gl::TEXTURE_CUBE_MAP_ARRAY,
+            _ => return 0,
+        };
+        let mut view = 0;
+        unsafe {
+            gl::GenTextures(1, &mut view);
+            if view != 0 {
+                gl::TextureView(
+                    view,
+                    target,
+                    self.original_texture,
+                    view_format,
+                    view_range.base.level as u32,
+                    view_range.extent.levels as u32,
+                    view_range.base.layer as u32,
+                    view_range.extent.layers as u32,
+                );
+                gl::TextureParameteri(view, gl::TEXTURE_MIN_FILTER, gl::NEAREST as i32);
+                gl::TextureParameteri(view, gl::TEXTURE_MAG_FILTER, gl::NEAREST as i32);
+                gl::TextureParameteri(view, gl::TEXTURE_WRAP_S, gl::CLAMP_TO_EDGE as i32);
+                gl::TextureParameteri(view, gl::TEXTURE_WRAP_T, gl::CLAMP_TO_EDGE as i32);
+            }
+        }
+        view
+    }
+
     /// Port of `ImageView::StorageView`.
     /// Returns or creates a texture view for image load/store with a specific format.
     pub fn storage_view(&mut self, texture_type: u32, image_format: u32) -> u32 {
@@ -363,6 +531,14 @@ impl ImageView {
         let _ = (texture_type, image_format);
         self.default_handle
     }
+}
+
+/// Returns the OpenGL internal format for an image view.
+///
+/// Port of the `MaxwellToGL::GetFormatTuple(format).internal_format` branch
+/// used by upstream `ImageView::ImageView(...)`.
+pub fn present_internal_format(format: PixelFormat) -> u32 {
+    super::maxwell_to_gl::get_format_tuple(format as usize).internal_format
 }
 
 impl Drop for ImageView {
@@ -465,6 +641,250 @@ impl TextureCacheParams {
     pub const IMPLEMENTS_ASYNC_DOWNLOADS: bool = true;
 }
 
+/// OpenGL texture cache policy instance.
+///
+/// Corresponds to upstream
+/// `using TextureCache = VideoCommon::TextureCache<TextureCacheParams>`.
+/// The Rust base cache still owns backend-independent `ImageBase` /
+/// `ImageViewBase` slots, while this OpenGL wrapper owns the backend
+/// `OpenGL::ImageView` slots keyed by the same `ImageViewId`.
+pub struct TextureCache {
+    pub base: CommonTextureCache,
+    images: HashMap<ImageId, Image>,
+    image_views: HashMap<ImageViewId, ImageView>,
+    framebuffers: HashMap<ImageViewId, TextureCacheFramebuffer>,
+}
+
+/// OpenGL backend result of `TextureCache<P>::TryFindFramebufferImageView`.
+pub struct FramebufferImageViewOpenGL {
+    pub view_id: ImageViewId,
+    pub display_texture: u32,
+    pub width: u32,
+    pub height: u32,
+    pub scaled: bool,
+}
+
+impl TextureCache {
+    pub fn new() -> Self {
+        Self {
+            base: CommonTextureCache::new(),
+            images: HashMap::new(),
+            image_views: HashMap::new(),
+            framebuffers: HashMap::new(),
+        }
+    }
+
+    pub fn set_guest_memory_writer(&mut self, writer: GuestMemoryWriter) {
+        self.base.set_guest_memory_writer(writer);
+    }
+
+    /// Port of `TextureCache<P>::DownloadMemory` for `TextureCacheParams =
+    /// OpenGL`. The base implementation uses an `image_downloader` closure
+    /// callback so the borrow-checker doesn't let it reach into the backend
+    /// image table; ruzu inverts the call here so the OpenGL wrapper does
+    /// the per-image loop in user code with direct access to
+    /// `self.images: HashMap<ImageId, Image>`.
+    ///
+    /// Without this, `gl_rasterizer::flush_region` → base
+    /// `download_memory` early-returns at the missing-downloader guard,
+    /// guest framebuffer pages stay zero, and the compositor reads zeros
+    /// → black SDL window.
+    pub fn download_memory(&mut self, cpu_addr: u64, size: usize) {
+        let Some(writer) = self.base.guest_memory_writer.as_ref().cloned() else {
+            return;
+        };
+
+        // Snapshot the images we want to download, filtered + sorted exactly
+        // as the base path used to do internally.
+        let mut images = self.base.collect_images_in_region(cpu_addr, size);
+        images.retain(|&id| self.base.slot_images[id].is_safe_download());
+        if images.is_empty() {
+            return;
+        }
+        for &id in &images {
+            self.base.slot_images[id]
+                .flags
+                .remove(ImageFlagBits::GPU_MODIFIED);
+        }
+        images.sort_by_key(|&id| self.base.slot_images[id].modification_tick);
+
+        for image_id in images {
+            // Make sure the backend image slot exists for this base image —
+            // `update_render_targets_from_draw_state` typically pre-populates
+            // it, but defensive insertion here keeps offscreen downloads
+            // working even before any draw has touched the slot.
+            let base_image = self.base.slot_images[image_id].clone();
+            let backend_image = self
+                .images
+                .entry(image_id)
+                .or_insert_with(|| Image::from_base(&base_image));
+
+            // Drain the GPU texture into a staging buffer sized by the
+            // upstream `unswizzled_size_bytes` (the in-memory layout the
+            // guest expects).
+            let buffer_size = base_image.unswizzled_size_bytes as usize;
+            if buffer_size == 0 {
+                continue;
+            }
+            let mut staging = vec![0u8; buffer_size];
+            backend_image.download_memory(&mut staging, 0);
+
+            // Swizzle (or pitch-copy) the staging buffer back into guest
+            // memory at `image.cpu_addr`. For linear pitch surfaces (the
+            // common framebuffer case) this is a row-by-row block copy;
+            // for block-linear surfaces it walks `swizzle_texture`.
+            let copies = full_download_copies(&base_image.info);
+            swizzle_image(
+                writer.as_ref(),
+                base_image.cpu_addr,
+                &base_image.info,
+                &copies,
+                &staging,
+                &mut self.base.swizzle_data_buffer,
+            );
+        }
+    }
+
+    pub fn write_memory(&mut self, cpu_addr: u64, size: usize) {
+        self.base.write_memory(cpu_addr, size);
+    }
+
+    pub fn unmap_memory(&mut self, cpu_addr: u64, size: usize) {
+        self.framebuffers.clear();
+        self.image_views.clear();
+        self.images.clear();
+        self.base.unmap_memory(cpu_addr, size);
+    }
+
+    pub fn tick_frame(&mut self) {
+        self.base.tick_frame();
+    }
+
+    pub fn should_wait_async_flushes(&self) -> bool {
+        self.base.should_wait_async_flushes()
+    }
+
+    pub fn has_uncommitted_flushes(&self) -> bool {
+        self.base.has_uncommitted_flushes()
+    }
+
+    pub fn pop_async_flushes(&mut self) {
+        self.base.pop_async_flushes();
+    }
+
+    pub fn commit_async_flushes(&mut self) {
+        self.base.commit_async_flushes();
+    }
+
+    pub fn update_render_targets_from_draw_state(
+        &mut self,
+        draw_state: &crate::engines::draw_manager::DrawState,
+        gpu_to_cpu: impl FnMut(crate::texture_cache::image_base::GPUVAddr) -> Option<u64>,
+    ) {
+        self.base
+            .update_render_targets_from_draw_state(draw_state, gpu_to_cpu);
+        for (image_id, image) in self.base.slot_images.iter() {
+            self.images
+                .entry(image_id)
+                .or_insert_with(|| Image::from_base(image));
+        }
+    }
+
+    /// Port of `TextureCache<P>::TryFindFramebufferImageView` for
+    /// `TextureCacheParams = OpenGL`.
+    pub fn try_find_framebuffer_image_view(
+        &mut self,
+        config: &FramebufferConfig,
+        cpu_addr: u64,
+    ) -> Option<FramebufferImageViewOpenGL> {
+        let framebuffer_view = self
+            .base
+            .try_find_framebuffer_image_view(config, cpu_addr)?;
+        let FramebufferImageView {
+            view_id,
+            view,
+            scaled,
+        } = framebuffer_view;
+        let image_id = view.image_id;
+        let backend_image = self.images.entry(image_id).or_insert_with(|| {
+            let image = &self.base.slot_images[image_id];
+            Image::from_base(image)
+        });
+        let backend_view = self
+            .image_views
+            .entry(view_id)
+            .or_insert_with(|| ImageView::new_color_2d(&view, backend_image));
+        let display_texture = backend_view.handle_for_texture_type(TextureType::Color2D);
+        if display_texture == 0 {
+            return None;
+        }
+        Some(FramebufferImageViewOpenGL {
+            view_id,
+            display_texture,
+            width: view.size.width,
+            height: view.size.height,
+            scaled,
+        })
+    }
+
+    /// OpenGL counterpart of upstream `TextureCache<P>::GetFramebuffer()` for
+    /// the currently ported single-color-target clear/present path.
+    pub fn framebuffer_for_render_target(
+        &mut self,
+        rt: &RenderTargetInfo,
+    ) -> Option<(u32, u32, u32)> {
+        if rt.address == 0 || rt.width == 0 || rt.height == 0 {
+            return None;
+        }
+
+        let (image_id, image_base) = self.base.slot_images.iter().find(|(_, image)| {
+            image.gpu_addr == rt.address
+                && image.info.size.width == rt.width
+                && image.info.size.height == rt.height
+                && !image.image_view_ids.is_empty()
+        })?;
+        let view_id = image_base.image_view_ids[0];
+        let view_base = self.base.slot_image_views[view_id].clone();
+
+        let backend_image = self
+            .images
+            .entry(image_id)
+            .or_insert_with(|| Image::from_base(image_base));
+        let backend_view = self
+            .image_views
+            .entry(view_id)
+            .or_insert_with(|| ImageView::new_color_2d(&view_base, backend_image));
+        let texture = backend_view.handle_for_texture_type(TextureType::Color2D);
+        if texture == 0 {
+            return None;
+        }
+
+        let framebuffer = self.framebuffers.entry(view_id).or_insert_with(|| {
+            let mut framebuffer = 0;
+            unsafe {
+                gl::CreateFramebuffers(1, &mut framebuffer);
+                if framebuffer != 0 {
+                    gl::NamedFramebufferTexture(framebuffer, gl::COLOR_ATTACHMENT0, texture, 0);
+                    gl::BindFramebuffer(gl::DRAW_FRAMEBUFFER, framebuffer);
+                    gl::DrawBuffer(gl::COLOR_ATTACHMENT0);
+                }
+            }
+            TextureCacheFramebuffer {
+                framebuffer,
+                buffer_bits: gl::COLOR_BUFFER_BIT,
+            }
+        });
+        let handle = framebuffer.handle();
+        (handle != 0).then_some((handle, view_base.size.width, view_base.size.height))
+    }
+}
+
+impl Default for TextureCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -480,5 +900,25 @@ mod tests {
         assert!(TextureCacheParams::ENABLE_VALIDATION);
         assert!(TextureCacheParams::FRAMEBUFFER_BLITS);
         assert!(TextureCacheParams::HAS_EMULATED_COPIES);
+    }
+
+    #[test]
+    fn present_internal_format_matches_basic_surface_formats() {
+        assert_eq!(
+            present_internal_format(PixelFormat::A8B8G8R8Unorm),
+            gl::RGBA8
+        );
+        assert_eq!(
+            present_internal_format(PixelFormat::B8G8R8A8Unorm),
+            gl::RGBA8
+        );
+        assert_eq!(
+            present_internal_format(PixelFormat::A8B8G8R8Srgb),
+            gl::SRGB8_ALPHA8
+        );
+        assert_eq!(
+            present_internal_format(PixelFormat::R5G6B5Unorm),
+            gl::RGB565
+        );
     }
 }
