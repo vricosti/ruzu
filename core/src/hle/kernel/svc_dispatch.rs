@@ -1770,29 +1770,33 @@ pub fn call(system: &System, imm: u32, is_64bit: bool, args: &mut SvcArgs) {
             .and_then(|t| t.lock().ok().map(|g| g.get_thread_id()))
             .unwrap_or(0);
 
-        // Env-gated per-tid svc tracer. `RUZU_TRACE_TID_SVC=N` logs EVERY
-        // svc call from thread N (no rate limiting). Used to figure out
-        // what a "silent" game-main thread is actually doing when it
-        // appears wedged but is still being scheduled. For MK8D the
-        // target is tid=73; default ON for that tid to avoid the
-        // boilerplate of having to set the env var every time.
+        // Env-gated per-tid svc tracer. `RUZU_TRACE_TID_SVC=N` logs every
+        // svc call from thread N. `RUZU_TRACE_TID_SVC=*` (or `all`) logs all
+        // threads. `RUZU_TRACE_TID_SVC=N,M,...` logs the listed thread ids.
+        // Used to figure out what a "silent" game-main thread is actually
+        // doing when it appears wedged but is still being scheduled.
         if let Some(target_str) = std::env::var_os("RUZU_TRACE_TID_SVC") {
-            if let Some(target) = target_str.to_string_lossy().parse::<u64>().ok() {
-                if target == tid {
-                    let name = SvcId::from_u32(imm)
-                        .map(|id| format!("{:?}", id))
-                        .unwrap_or_else(|| format!("svc#0x{:02X}", imm));
-                    log::info!(
-                        "[TID_SVC] tid={} core={} svc={} args=[0x{:X}, 0x{:X}, 0x{:X}, 0x{:X}]",
-                        tid,
-                        core_id,
-                        name,
-                        dispatch_args[0],
-                        dispatch_args[1],
-                        dispatch_args[2],
-                        dispatch_args[3],
-                    );
-                }
+            let target_str = target_str.to_string_lossy();
+            let want = target_str == "*"
+                || target_str == "all"
+                || target_str
+                    .split(',')
+                    .filter_map(|s| s.trim().parse::<u64>().ok())
+                    .any(|t| t == tid);
+            if want {
+                let name = SvcId::from_u32(imm)
+                    .map(|id| format!("{:?}", id))
+                    .unwrap_or_else(|| format!("svc#0x{:02X}", imm));
+                log::info!(
+                    "[TID_SVC] tid={} core={} svc={} args=[0x{:X}, 0x{:X}, 0x{:X}, 0x{:X}]",
+                    tid,
+                    core_id,
+                    name,
+                    dispatch_args[0],
+                    dispatch_args[1],
+                    dispatch_args[2],
+                    dispatch_args[3],
+                );
             }
         }
         if core_id < hardware_properties::NUM_CPU_CORES as usize {
