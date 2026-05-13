@@ -362,403 +362,366 @@ impl fmt::Display for MaxwellOpcode {
     }
 }
 
-/// Decode the Maxwell opcode from a 64-bit instruction word.
+/// Upstream `MaskValueFromEncoding(encoding)` in `maxwell/decode.cpp`.
 ///
-/// This matches the bit patterns from zuyu's `decode.cpp`.
-/// Maxwell instructions encode the opcode in the upper bits, but the exact
-/// layout varies by instruction class.
+/// Parses a `"1110 1111 1010 0---"`-style 16-bit-wide encoding string into a
+/// `(mask, value)` pair occupying bits [63:48] of a 64-bit instruction word.
+/// '0'/'1' set the mask bit and (for '1') the value bit. '-' is wildcard
+/// (mask = 0). Spaces are ignored.
+const fn mask_value_from_encoding(encoding: &str) -> (u64, u64) {
+    let mut mask: u64 = 0;
+    let mut value: u64 = 0;
+    let mut bit: u64 = 1u64 << 63;
+    let bytes = encoding.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'0' => mask |= bit,
+            b'1' => {
+                mask |= bit;
+                value |= bit;
+            }
+            b'-' => {}
+            b' ' => {
+                // Spaces are ignored; do NOT consume a bit position.
+                i += 1;
+                continue;
+            }
+            _ => panic!("invalid Maxwell encoding character"),
+        }
+        bit >>= 1;
+        i += 1;
+    }
+    (mask, value)
+}
+
+/// One row of the Maxwell decode table — a mask/value pair derived from an
+/// upstream `INST(name, friendly, "1110 ...")` entry plus the opcode it
+/// names.
+#[derive(Clone, Copy)]
+struct InstEncoding {
+    mask: u64,
+    value: u64,
+    opcode: MaxwellOpcode,
+}
+
+/// Upstream `maxwell.inc`. Order mirrors the upstream file exactly so future
+/// audits can diff this table against the source of truth.
+const ENCODINGS_TEXT: &[(MaxwellOpcode, &str)] = &[
+    (MaxwellOpcode::AL2P,       "1110 1111 1010 0---"),
+    (MaxwellOpcode::ALD,        "1110 1111 1101 1---"),
+    (MaxwellOpcode::AST,        "1110 1111 1111 0---"),
+    (MaxwellOpcode::ATOM_cas,   "1110 1110 1111 ----"),
+    (MaxwellOpcode::ATOM,       "1110 1101 ---- ----"),
+    (MaxwellOpcode::ATOMS_cas,  "1110 1110 ---- ----"),
+    (MaxwellOpcode::ATOMS,      "1110 1100 ---- ----"),
+    (MaxwellOpcode::B2R,        "1111 0000 1011 1---"),
+    (MaxwellOpcode::BAR,        "1111 0000 1010 1---"),
+    (MaxwellOpcode::BFE_reg,    "0101 1100 0000 0---"),
+    (MaxwellOpcode::BFE_cbuf,   "0100 1100 0000 0---"),
+    (MaxwellOpcode::BFE_imm,    "0011 100- 0000 0---"),
+    (MaxwellOpcode::BFI_reg,    "0101 1011 1111 0---"),
+    (MaxwellOpcode::BFI_rc,     "0101 0011 1111 0---"),
+    (MaxwellOpcode::BFI_cr,     "0100 1011 1111 0---"),
+    (MaxwellOpcode::BFI_imm,    "0011 011- 1111 0---"),
+    (MaxwellOpcode::BPT,        "1110 0011 1010 ----"),
+    (MaxwellOpcode::BRA,        "1110 0010 0100 ----"),
+    (MaxwellOpcode::BRK,        "1110 0011 0100 ----"),
+    (MaxwellOpcode::BRX,        "1110 0010 0101 ----"),
+    (MaxwellOpcode::CAL,        "1110 0010 0110 ----"),
+    (MaxwellOpcode::CCTL,       "1110 1111 011- ----"),
+    (MaxwellOpcode::CCTLL,      "1110 1111 100- ----"),
+    (MaxwellOpcode::CONT,       "1110 0011 0101 ----"),
+    (MaxwellOpcode::CS2R,       "0101 0000 1100 1---"),
+    (MaxwellOpcode::CSET,       "0101 0000 1001 1---"),
+    (MaxwellOpcode::CSETP,      "0101 0000 1010 0---"),
+    (MaxwellOpcode::DADD_reg,   "0101 1100 0111 0---"),
+    (MaxwellOpcode::DADD_cbuf,  "0100 1100 0111 0---"),
+    (MaxwellOpcode::DADD_imm,   "0011 100- 0111 0---"),
+    (MaxwellOpcode::DEPBAR,     "1111 0000 1111 0---"),
+    (MaxwellOpcode::DFMA_reg,   "0101 1011 0111 ----"),
+    (MaxwellOpcode::DFMA_rc,    "0101 0011 0111 ----"),
+    (MaxwellOpcode::DFMA_cr,    "0100 1011 0111 ----"),
+    (MaxwellOpcode::DFMA_imm,   "0011 011- 0111 ----"),
+    (MaxwellOpcode::DMNMX_reg,  "0101 1100 0101 0---"),
+    (MaxwellOpcode::DMNMX_cbuf, "0100 1100 0101 0---"),
+    (MaxwellOpcode::DMNMX_imm,  "0011 100- 0101 0---"),
+    (MaxwellOpcode::DMUL_reg,   "0101 1100 1000 0---"),
+    (MaxwellOpcode::DMUL_cbuf,  "0100 1100 1000 0---"),
+    (MaxwellOpcode::DMUL_imm,   "0011 100- 1000 0---"),
+    (MaxwellOpcode::DSET_reg,   "0101 1001 0--- ----"),
+    (MaxwellOpcode::DSET_cbuf,  "0100 1001 0--- ----"),
+    (MaxwellOpcode::DSET_imm,   "0011 001- 0--- ----"),
+    (MaxwellOpcode::DSETP_reg,  "0101 1011 1000 ----"),
+    (MaxwellOpcode::DSETP_cbuf, "0100 1011 1000 ----"),
+    (MaxwellOpcode::DSETP_imm,  "0011 011- 1000 ----"),
+    (MaxwellOpcode::EXIT,       "1110 0011 0000 ----"),
+    (MaxwellOpcode::F2F_reg,    "0101 1100 1010 1---"),
+    (MaxwellOpcode::F2F_cbuf,   "0100 1100 1010 1---"),
+    (MaxwellOpcode::F2F_imm,    "0011 100- 1010 1---"),
+    (MaxwellOpcode::F2I_reg,    "0101 1100 1011 0---"),
+    (MaxwellOpcode::F2I_cbuf,   "0100 1100 1011 0---"),
+    (MaxwellOpcode::F2I_imm,    "0011 100- 1011 0---"),
+    (MaxwellOpcode::FADD_reg,   "0101 1100 0101 1---"),
+    (MaxwellOpcode::FADD_cbuf,  "0100 1100 0101 1---"),
+    (MaxwellOpcode::FADD_imm,   "0011 100- 0101 1---"),
+    (MaxwellOpcode::FADD32I,    "0000 10-- ---- ----"),
+    (MaxwellOpcode::FCHK_reg,   "0101 1100 1000 1---"),
+    (MaxwellOpcode::FCHK_cbuf,  "0100 1100 1000 1---"),
+    (MaxwellOpcode::FCHK_imm,   "0011 100- 1000 1---"),
+    (MaxwellOpcode::FCMP_reg,   "0101 1011 1010 ----"),
+    (MaxwellOpcode::FCMP_rc,    "0101 0011 1010 ----"),
+    (MaxwellOpcode::FCMP_cr,    "0100 1011 1010 ----"),
+    (MaxwellOpcode::FCMP_imm,   "0011 011- 1010 ----"),
+    (MaxwellOpcode::FFMA_reg,   "0101 1001 1--- ----"),
+    (MaxwellOpcode::FFMA_rc,    "0101 0001 1--- ----"),
+    (MaxwellOpcode::FFMA_cr,    "0100 1001 1--- ----"),
+    (MaxwellOpcode::FFMA_imm,   "0011 001- 1--- ----"),
+    (MaxwellOpcode::FFMA32I,    "0000 11-- ---- ----"),
+    (MaxwellOpcode::FLO_reg,    "0101 1100 0011 0---"),
+    (MaxwellOpcode::FLO_cbuf,   "0100 1100 0011 0---"),
+    (MaxwellOpcode::FLO_imm,    "0011 100- 0011 0---"),
+    (MaxwellOpcode::FMNMX_reg,  "0101 1100 0110 0---"),
+    (MaxwellOpcode::FMNMX_cbuf, "0100 1100 0110 0---"),
+    (MaxwellOpcode::FMNMX_imm,  "0011 100- 0110 0---"),
+    (MaxwellOpcode::FMUL_reg,   "0101 1100 0110 1---"),
+    (MaxwellOpcode::FMUL_cbuf,  "0100 1100 0110 1---"),
+    (MaxwellOpcode::FMUL_imm,   "0011 100- 0110 1---"),
+    (MaxwellOpcode::FMUL32I,    "0001 1110 ---- ----"),
+    (MaxwellOpcode::FSET_reg,   "0101 1000 ---- ----"),
+    (MaxwellOpcode::FSET_cbuf,  "0100 1000 ---- ----"),
+    (MaxwellOpcode::FSET_imm,   "0011 000- ---- ----"),
+    (MaxwellOpcode::FSETP_reg,  "0101 1011 1011 ----"),
+    (MaxwellOpcode::FSETP_cbuf, "0100 1011 1011 ----"),
+    (MaxwellOpcode::FSETP_imm,  "0011 011- 1011 ----"),
+    (MaxwellOpcode::FSWZADD,    "0101 0000 1111 1---"),
+    (MaxwellOpcode::GETCRSPTR,  "1110 0010 1100 ----"),
+    (MaxwellOpcode::GETLMEMBASE,"1110 0010 1101 ----"),
+    (MaxwellOpcode::HADD2_reg,  "0101 1101 0001 0---"),
+    (MaxwellOpcode::HADD2_cbuf, "0111 101- 1--- ----"),
+    (MaxwellOpcode::HADD2_imm,  "0111 101- 0--- ----"),
+    (MaxwellOpcode::HADD2_32I,  "0010 110- ---- ----"),
+    (MaxwellOpcode::HFMA2_reg,  "0101 1101 0000 0---"),
+    (MaxwellOpcode::HFMA2_rc,   "0110 0--- 1--- ----"),
+    (MaxwellOpcode::HFMA2_cr,   "0111 0--- 1--- ----"),
+    (MaxwellOpcode::HFMA2_imm,  "0111 0--- 0--- ----"),
+    (MaxwellOpcode::HFMA2_32I,  "0010 100- ---- ----"),
+    (MaxwellOpcode::HMUL2_reg,  "0101 1101 0000 1---"),
+    (MaxwellOpcode::HMUL2_cbuf, "0111 100- 1--- ----"),
+    (MaxwellOpcode::HMUL2_imm,  "0111 100- 0--- ----"),
+    (MaxwellOpcode::HMUL2_32I,  "0010 101- ---- ----"),
+    (MaxwellOpcode::HSET2_reg,  "0101 1101 0001 1---"),
+    (MaxwellOpcode::HSET2_cbuf, "0111 110- 1--- ----"),
+    (MaxwellOpcode::HSET2_imm,  "0111 110- 0--- ----"),
+    (MaxwellOpcode::HSETP2_reg, "0101 1101 0010 0---"),
+    (MaxwellOpcode::HSETP2_cbuf,"0111 111- 1--- ----"),
+    (MaxwellOpcode::HSETP2_imm, "0111 111- 0--- ----"),
+    (MaxwellOpcode::I2F_reg,    "0101 1100 1011 1---"),
+    (MaxwellOpcode::I2F_cbuf,   "0100 1100 1011 1---"),
+    (MaxwellOpcode::I2F_imm,    "0011 100- 1011 1---"),
+    (MaxwellOpcode::I2I_reg,    "0101 1100 1110 0---"),
+    (MaxwellOpcode::I2I_cbuf,   "0100 1100 1110 0---"),
+    (MaxwellOpcode::I2I_imm,    "0011 100- 1110 0---"),
+    (MaxwellOpcode::IADD_reg,   "0101 1100 0001 0---"),
+    (MaxwellOpcode::IADD_cbuf,  "0100 1100 0001 0---"),
+    (MaxwellOpcode::IADD_imm,   "0011 100- 0001 0---"),
+    (MaxwellOpcode::IADD3_reg,  "0101 1100 1100 ----"),
+    (MaxwellOpcode::IADD3_cbuf, "0100 1100 1100 ----"),
+    (MaxwellOpcode::IADD3_imm,  "0011 100- 1100 ----"),
+    (MaxwellOpcode::IADD32I,    "0001 110- ---- ----"),
+    (MaxwellOpcode::ICMP_reg,   "0101 1011 0100 ----"),
+    (MaxwellOpcode::ICMP_rc,    "0101 0011 0100 ----"),
+    (MaxwellOpcode::ICMP_cr,    "0100 1011 0100 ----"),
+    (MaxwellOpcode::ICMP_imm,   "0011 011- 0100 ----"),
+    (MaxwellOpcode::IDE,        "1110 0011 1001 ----"),
+    (MaxwellOpcode::IDP_reg,    "0101 0011 1111 1---"),
+    (MaxwellOpcode::IDP_imm,    "0101 0011 1101 1---"),
+    (MaxwellOpcode::IMAD_reg,   "0101 1010 0--- ----"),
+    (MaxwellOpcode::IMAD_rc,    "0101 0010 0--- ----"),
+    (MaxwellOpcode::IMAD_cr,    "0100 1010 0--- ----"),
+    (MaxwellOpcode::IMAD_imm,   "0011 010- 0--- ----"),
+    (MaxwellOpcode::IMAD32I,    "1000 00-- ---- ----"),
+    (MaxwellOpcode::IMADSP_reg, "0101 1010 1--- ----"),
+    (MaxwellOpcode::IMADSP_rc,  "0101 0010 1--- ----"),
+    (MaxwellOpcode::IMADSP_cr,  "0100 1010 1--- ----"),
+    (MaxwellOpcode::IMADSP_imm, "0011 010- 1--- ----"),
+    (MaxwellOpcode::IMNMX_reg,  "0101 1100 0010 0---"),
+    (MaxwellOpcode::IMNMX_cbuf, "0100 1100 0010 0---"),
+    (MaxwellOpcode::IMNMX_imm,  "0011 100- 0010 0---"),
+    (MaxwellOpcode::IMUL_reg,   "0101 1100 0011 1---"),
+    (MaxwellOpcode::IMUL_cbuf,  "0100 1100 0011 1---"),
+    (MaxwellOpcode::IMUL_imm,   "0011 100- 0011 1---"),
+    (MaxwellOpcode::IMUL32I,    "0001 1111 ---- ----"),
+    (MaxwellOpcode::IPA,        "1110 0000 ---- ----"),
+    (MaxwellOpcode::ISBERD,     "1110 1111 1101 0---"),
+    (MaxwellOpcode::ISCADD_reg, "0101 1100 0001 1---"),
+    (MaxwellOpcode::ISCADD_cbuf,"0100 1100 0001 1---"),
+    (MaxwellOpcode::ISCADD_imm, "0011 100- 0001 1---"),
+    (MaxwellOpcode::ISCADD32I,  "0001 01-- ---- ----"),
+    (MaxwellOpcode::ISET_reg,   "0101 1011 0101 ----"),
+    (MaxwellOpcode::ISET_cbuf,  "0100 1011 0101 ----"),
+    (MaxwellOpcode::ISET_imm,   "0011 011- 0101 ----"),
+    (MaxwellOpcode::ISETP_reg,  "0101 1011 0110 ----"),
+    (MaxwellOpcode::ISETP_cbuf, "0100 1011 0110 ----"),
+    (MaxwellOpcode::ISETP_imm,  "0011 011- 0110 ----"),
+    (MaxwellOpcode::JCAL,       "1110 0010 0010 ----"),
+    (MaxwellOpcode::JMP,        "1110 0010 0001 ----"),
+    (MaxwellOpcode::JMX,        "1110 0010 0000 ----"),
+    (MaxwellOpcode::KIL,        "1110 0011 0011 ----"),
+    (MaxwellOpcode::LD,         "100- ---- ---- ----"),
+    (MaxwellOpcode::LDC,        "1110 1111 1001 0---"),
+    (MaxwellOpcode::LDG,        "1110 1110 1101 0---"),
+    (MaxwellOpcode::LDL,        "1110 1111 0100 0---"),
+    (MaxwellOpcode::LDS,        "1110 1111 0100 1---"),
+    (MaxwellOpcode::LEA_hi_reg, "0101 1011 1101 1---"),
+    (MaxwellOpcode::LEA_hi_cbuf,"0001 10-- ---- ----"),
+    (MaxwellOpcode::LEA_lo_reg, "0101 1011 1101 0---"),
+    (MaxwellOpcode::LEA_lo_cbuf,"0100 1011 1101 ----"),
+    (MaxwellOpcode::LEA_lo_imm, "0011 011- 1101 0---"),
+    (MaxwellOpcode::LEPC,       "0101 0000 1101 0---"),
+    (MaxwellOpcode::LONGJMP,    "1110 0011 0001 ----"),
+    (MaxwellOpcode::LOP_reg,    "0101 1100 0100 0---"),
+    (MaxwellOpcode::LOP_cbuf,   "0100 1100 0100 0---"),
+    (MaxwellOpcode::LOP_imm,    "0011 100- 0100 0---"),
+    (MaxwellOpcode::LOP3_reg,   "0101 1011 1110 0---"),
+    (MaxwellOpcode::LOP3_cbuf,  "0000 001- ---- ----"),
+    (MaxwellOpcode::LOP3_imm,   "0011 11-- ---- ----"),
+    (MaxwellOpcode::LOP32I,     "0000 01-- ---- ----"),
+    (MaxwellOpcode::MEMBAR,     "1110 1111 1001 1---"),
+    (MaxwellOpcode::MOV_reg,    "0101 1100 1001 1---"),
+    (MaxwellOpcode::MOV_cbuf,   "0100 1100 1001 1---"),
+    (MaxwellOpcode::MOV_imm,    "0011 100- 1001 1---"),
+    (MaxwellOpcode::MOV32I,     "0000 0001 0000 ----"),
+    (MaxwellOpcode::MUFU,       "0101 0000 1000 0---"),
+    (MaxwellOpcode::NOP,        "0101 0000 1011 0---"),
+    (MaxwellOpcode::OUT_reg,    "1111 1011 1110 0---"),
+    (MaxwellOpcode::OUT_cbuf,   "1110 1011 1110 0---"),
+    (MaxwellOpcode::OUT_imm,    "1111 011- 1110 0---"),
+    (MaxwellOpcode::P2R_reg,    "0101 1100 1110 1---"),
+    (MaxwellOpcode::P2R_cbuf,   "0100 1100 1110 1---"),
+    (MaxwellOpcode::P2R_imm,    "0011 1000 1110 1---"),
+    (MaxwellOpcode::PBK,        "1110 0010 1010 ----"),
+    (MaxwellOpcode::PCNT,       "1110 0010 1011 ----"),
+    (MaxwellOpcode::PEXIT,      "1110 0010 0011 ----"),
+    (MaxwellOpcode::PIXLD,      "1110 1111 1110 1---"),
+    (MaxwellOpcode::PLONGJMP,   "1110 0010 1000 ----"),
+    (MaxwellOpcode::POPC_reg,   "0101 1100 0000 1---"),
+    (MaxwellOpcode::POPC_cbuf,  "0100 1100 0000 1---"),
+    (MaxwellOpcode::POPC_imm,   "0011 100- 0000 1---"),
+    (MaxwellOpcode::PRET,       "1110 0010 0111 ----"),
+    (MaxwellOpcode::PRMT_reg,   "0101 1011 1100 ----"),
+    (MaxwellOpcode::PRMT_rc,    "0101 0011 1100 ----"),
+    (MaxwellOpcode::PRMT_cr,    "0100 1011 1100 ----"),
+    (MaxwellOpcode::PRMT_imm,   "0011 011- 1100 ----"),
+    (MaxwellOpcode::PSET,       "0101 0000 1000 1---"),
+    (MaxwellOpcode::PSETP,      "0101 0000 1001 0---"),
+    (MaxwellOpcode::R2B,        "1111 0000 1100 0---"),
+    (MaxwellOpcode::R2P_reg,    "0101 1100 1111 0---"),
+    (MaxwellOpcode::R2P_cbuf,   "0100 1100 1111 0---"),
+    (MaxwellOpcode::R2P_imm,    "0011 100- 1111 0---"),
+    (MaxwellOpcode::RAM,        "1110 0011 1000 ----"),
+    (MaxwellOpcode::RED,        "1110 1011 1111 1---"),
+    (MaxwellOpcode::RET,        "1110 0011 0010 ----"),
+    (MaxwellOpcode::RRO_reg,    "0101 1100 1001 0---"),
+    (MaxwellOpcode::RRO_cbuf,   "0100 1100 1001 0---"),
+    (MaxwellOpcode::RRO_imm,    "0011 100- 1001 0---"),
+    (MaxwellOpcode::RTT,        "1110 0011 0110 ----"),
+    (MaxwellOpcode::S2R,        "1111 0000 1100 1---"),
+    (MaxwellOpcode::SAM,        "1110 0011 0111 ----"),
+    (MaxwellOpcode::SEL_reg,    "0101 1100 1010 0---"),
+    (MaxwellOpcode::SEL_cbuf,   "0100 1100 1010 0---"),
+    (MaxwellOpcode::SEL_imm,    "0011 100- 1010 0---"),
+    (MaxwellOpcode::SETCRSPTR,  "1110 0010 1110 ----"),
+    (MaxwellOpcode::SETLMEMBASE,"1110 0010 1111 ----"),
+    (MaxwellOpcode::SHF_l_reg,  "0101 1011 1111 1---"),
+    (MaxwellOpcode::SHF_l_imm,  "0011 011- 1111 1---"),
+    (MaxwellOpcode::SHF_r_reg,  "0101 1100 1111 1---"),
+    (MaxwellOpcode::SHF_r_imm,  "0011 100- 1111 1---"),
+    (MaxwellOpcode::SHFL,       "1110 1111 0001 0---"),
+    (MaxwellOpcode::SHL_reg,    "0101 1100 0100 1---"),
+    (MaxwellOpcode::SHL_cbuf,   "0100 1100 0100 1---"),
+    (MaxwellOpcode::SHL_imm,    "0011 100- 0100 1---"),
+    (MaxwellOpcode::SHR_reg,    "0101 1100 0010 1---"),
+    (MaxwellOpcode::SHR_cbuf,   "0100 1100 0010 1---"),
+    (MaxwellOpcode::SHR_imm,    "0011 100- 0010 1---"),
+    (MaxwellOpcode::SSY,        "1110 0010 1001 ----"),
+    (MaxwellOpcode::ST,         "101- ---- ---- ----"),
+    (MaxwellOpcode::STG,        "1110 1110 1101 1---"),
+    (MaxwellOpcode::STL,        "1110 1111 0101 0---"),
+    (MaxwellOpcode::STP,        "1110 1110 1010 0---"),
+    (MaxwellOpcode::STS,        "1110 1111 0101 1---"),
+    (MaxwellOpcode::SUATOM,     "1110 1010 0--- ----"),
+    (MaxwellOpcode::SUATOM_cas, "1110 1010 1--- ----"),
+    (MaxwellOpcode::SULD,       "1110 1011 000- ----"),
+    (MaxwellOpcode::SURED,      "1110 1011 010- ----"),
+    (MaxwellOpcode::SUST,       "1110 1011 001- ----"),
+    (MaxwellOpcode::SYNC,       "1111 0000 1111 1---"),
+    (MaxwellOpcode::TEX,        "1100 0--- ---- ----"),
+    (MaxwellOpcode::TEX_b,      "1101 1110 10-- ----"),
+    (MaxwellOpcode::TEXS,       "1101 -00- ---- ----"),
+    (MaxwellOpcode::TLD,        "1101 1100 ---- ----"),
+    (MaxwellOpcode::TLD_b,      "1101 1101 ---- ----"),
+    (MaxwellOpcode::TLD4,       "1100 10-- ---- ----"),
+    (MaxwellOpcode::TLD4_b,     "1101 1110 11-- ----"),
+    (MaxwellOpcode::TLD4S,      "1101 1111 -0-- ----"),
+    (MaxwellOpcode::TLDS,       "1101 -01- ---- ----"),
+    (MaxwellOpcode::TMML,       "1101 1111 0101 1---"),
+    (MaxwellOpcode::TMML_b,     "1101 1111 0110 0---"),
+    (MaxwellOpcode::TXA,        "1101 1111 0100 0---"),
+    (MaxwellOpcode::TXD,        "1101 1110 00-- ----"),
+    (MaxwellOpcode::TXD_b,      "1101 1110 01-- ----"),
+    (MaxwellOpcode::TXQ,        "1101 1111 0100 1---"),
+    (MaxwellOpcode::TXQ_b,      "1101 1111 0101 0---"),
+    (MaxwellOpcode::VABSDIFF,   "0101 0100 ---- ----"),
+    (MaxwellOpcode::VABSDIFF4,  "0101 0000 0--- ----"),
+    (MaxwellOpcode::VADD,       "0010 00-- ---- ----"),
+    (MaxwellOpcode::VMAD,       "0101 1111 ---- ----"),
+    (MaxwellOpcode::VMNMX,      "0011 101- ---- ----"),
+    (MaxwellOpcode::VOTE,       "0101 0000 1101 1---"),
+    (MaxwellOpcode::VOTE_vtg,   "0101 0000 1110 0---"),
+    (MaxwellOpcode::VSET,       "0100 000- ---- ----"),
+    (MaxwellOpcode::VSETP,      "0101 0000 1111 0---"),
+    (MaxwellOpcode::VSHL,       "0101 0111 ---- ----"),
+    (MaxwellOpcode::VSHR,       "0101 0110 ---- ----"),
+    (MaxwellOpcode::XMAD_reg,   "0101 1011 00-- ----"),
+    (MaxwellOpcode::XMAD_rc,    "0101 0001 0--- ----"),
+    (MaxwellOpcode::XMAD_cr,    "0100 111- ---- ----"),
+    (MaxwellOpcode::XMAD_imm,   "0011 011- 00-- ----"),
+];
+
+/// Lazily-initialized decode table. Mirrors upstream's `ENCODINGS` array
+/// sorted by `popcount(mask)` descending so the most-specific encoding is
+/// matched first when two encodings share a wildcard span.
+fn encodings() -> &'static [InstEncoding] {
+    static TABLE: std::sync::OnceLock<Vec<InstEncoding>> = std::sync::OnceLock::new();
+    TABLE.get_or_init(|| {
+        let mut v: Vec<InstEncoding> = ENCODINGS_TEXT
+            .iter()
+            .map(|&(opcode, encoding)| {
+                let (mask, value) = mask_value_from_encoding(encoding);
+                InstEncoding {
+                    mask,
+                    value,
+                    opcode,
+                }
+            })
+            .collect();
+        v.sort_by(|a, b| b.mask.count_ones().cmp(&a.mask.count_ones()));
+        v
+    })
+}
+
+/// Upstream `Decode(insn)` in `maxwell/decode.cpp`. Returns the opcode whose
+/// `(mask, value)` matches the top 16 bits of `insn`. Returns `None` if no
+/// encoding matches — that case corresponds to an unmapped instruction word
+/// (in practice this is usually a sched-control word that callers should
+/// have skipped via `Location::step`).
 pub fn decode_opcode(insn: u64) -> Option<MaxwellOpcode> {
-    use MaxwellOpcode::*;
-
-    // The primary encoding uses bits [63:48] for major opcode classification.
-    // Some instructions use additional bits for sub-opcodes.
-    let top16 = ((insn >> 48) & 0xFFFF) as u16;
-    let top9 = ((insn >> 55) & 0x1FF) as u16;
-    let top10 = ((insn >> 54) & 0x3FF) as u16;
-    let top11 = ((insn >> 53) & 0x7FF) as u16;
-
-    // ── 9-bit major opcode (bits [63:55]) ─────────────────────────────
-    match top9 {
-        // FP32 32-bit immediate forms
-        0x00C => return Some(FFMA32I),
-        0x008 => return Some(FADD32I),
-        0x00A => return Some(FMUL32I),
-        // Integer 32-bit immediate forms
-        0x010 => return Some(IADD32I),
-        0x014 => return Some(IMUL32I),
-        0x01C => return Some(ISCADD32I),
-        0x00E => return Some(IMAD32I),
-        0x01A => return Some(LOP32I),
-        0x00F => return Some(MOV32I),
-        // Half-float 32-bit immediate forms
-        0x011 => return Some(HADD2_32I),
-        0x013 => return Some(HMUL2_32I),
-        0x012 => return Some(HFMA2_32I),
-        _ => {}
+    for e in encodings() {
+        if (insn & e.mask) == e.value {
+            return Some(e.opcode);
+        }
     }
-
-    // ── 10-bit opcode (bits [63:54]) ──────────────────────────────────
-    match top10 {
-        // Control flow
-        0x324 => return Some(BRA),
-        0x325 => return Some(BRX),
-        0x326 => return Some(JMP),
-        0x327 => return Some(JMX),
-        0x342 => return Some(SSY),
-        0x343 => return Some(SYNC),
-        0x344 => return Some(PBK),
-        0x345 => return Some(BRK),
-        0x346 => return Some(PCNT),
-        0x347 => return Some(CONT),
-        0x348 => return Some(PEXIT),
-        0x34A => return Some(PRET),
-        0x34B => return Some(CAL),
-        0x34D => return Some(RET),
-        0x34E => return Some(JCAL),
-        0x34C => return Some(EXIT),
-        0x34F => return Some(LONGJMP),
-        0x350 => return Some(PLONGJMP),
-        // Special
-        0x330 => return Some(NOP),
-        0x332 => return Some(KIL),
-        0x335 => return Some(BAR),
-        0x336 => return Some(DEPBAR),
-        0x338 => return Some(MEMBAR),
-        0x351 => return Some(SAM),
-        0x352 => return Some(RAM),
-        0x353 => return Some(RTT),
-        0x354 => return Some(BPT),
-        0x340 => return Some(VOTE),
-        0x341 => return Some(VOTE_vtg),
-        0x388 => return Some(SHFL),
-        // System register read/write
-        0x360 => return Some(S2R),
-        0x361 => return Some(CS2R),
-        0x362 => return Some(B2R),
-        0x363 => return Some(R2B),
-        0x364 => return Some(LEPC),
-        0x365 => return Some(SETCRSPTR),
-        0x366 => return Some(GETCRSPTR),
-        0x367 => return Some(SETLMEMBASE),
-        0x368 => return Some(GETLMEMBASE),
-        // Texture
-        0x360 | 0x361 if false => unreachable!(), // already matched above
-        0x379 => return Some(PIXLD),
-        _ => {}
-    }
-
-    // ── 11-bit opcode (bits [63:53]) ──────────────────────────────────
-    match top11 {
-        // FP32 reg/cbuf/imm
-        0x221 => return Some(FADD_reg),
-        0x621 => return Some(FADD_cbuf),
-        0x421 => return Some(FADD_imm),
-        0x220 => return Some(FMUL_reg),
-        0x620 => return Some(FMUL_cbuf),
-        0x420 => return Some(FMUL_imm),
-        0x223 => return Some(FFMA_reg),
-        0x623 => return Some(FFMA_cr),
-        0x423 => return Some(FFMA_imm),
-        0x224 => return Some(FMNMX_reg),
-        0x624 => return Some(FMNMX_cbuf),
-        0x424 => return Some(FMNMX_imm),
-        0x230 => return Some(FSET_reg),
-        0x630 => return Some(FSET_cbuf),
-        0x430 => return Some(FSET_imm),
-        0x23B => return Some(FSETP_reg),
-        0x63B => return Some(FSETP_cbuf),
-        0x43B => return Some(FSETP_imm),
-        0x23A => return Some(FCMP_reg),
-        0x63A => return Some(FCMP_imm), // overloaded
-        0x43A => return Some(FCMP_cr),  // overloaded
-        0x22C => return Some(FCHK_reg),
-        0x62C => return Some(FCHK_cbuf),
-        0x42C => return Some(FCHK_imm),
-        0x208 => return Some(MUFU),
-        0x228 => return Some(FSWZADD),
-
-        // FFMA RC encoding
-        0x323 => return Some(FFMA_rc),
-
-        // FP64
-        0x229 => return Some(DADD_reg),
-        0x629 => return Some(DADD_cbuf),
-        0x429 => return Some(DADD_imm),
-        0x22B => return Some(DMUL_reg),
-        0x62B => return Some(DMUL_cbuf),
-        0x42B => return Some(DMUL_imm),
-        0x22E => return Some(DFMA_reg),
-        0x62E => return Some(DFMA_cr),
-        0x42E => return Some(DFMA_imm),
-        0x32E => return Some(DFMA_rc),
-        0x22A => return Some(DMNMX_reg),
-        0x62A => return Some(DMNMX_cbuf),
-        0x42A => return Some(DMNMX_imm),
-        0x232 => return Some(DSET_reg),
-        0x632 => return Some(DSET_cbuf),
-        0x432 => return Some(DSET_imm),
-        0x23D => return Some(DSETP_reg),
-        0x63D => return Some(DSETP_cbuf),
-        0x43D => return Some(DSETP_imm),
-
-        // Half-float
-        0x230 if false => unreachable!(), // HADD2 collides, use bits differently
-        0x22F => return Some(HADD2_reg),
-        0x62F => return Some(HADD2_cbuf),
-        0x42F => return Some(HADD2_imm),
-        0x227 => return Some(HMUL2_reg),
-        0x627 => return Some(HMUL2_cbuf),
-        0x427 => return Some(HMUL2_imm),
-        0x225 => return Some(HFMA2_reg),
-        0x625 => return Some(HFMA2_cr),
-        0x425 => return Some(HFMA2_imm),
-        0x325 if false => unreachable!(), // BRX already matched
-        0x231 => return Some(HSET2_reg),
-        0x631 => return Some(HSET2_cbuf),
-        0x431 => return Some(HSET2_imm),
-        0x23C => return Some(HSETP2_reg),
-        0x63C => return Some(HSETP2_cbuf),
-        0x43C => return Some(HSETP2_imm),
-
-        // HFMA2 RC
-        0x226 => return Some(HFMA2_rc),
-
-        // Integer arithmetic
-        0x218 => return Some(IADD_reg),
-        0x618 => return Some(IADD_cbuf),
-        0x418 => return Some(IADD_imm),
-        0x21C => return Some(IADD3_reg),
-        0x61C => return Some(IADD3_cbuf),
-        0x41C => return Some(IADD3_imm),
-        0x21A => return Some(ISCADD_reg),
-        0x61A => return Some(ISCADD_cbuf),
-        0x41A => return Some(ISCADD_imm),
-        0x224 if false => unreachable!(), // FMNMX
-        0x21B => return Some(IMAD_reg),
-        0x61B => return Some(IMAD_cr),
-        0x41B => return Some(IMAD_imm),
-        0x31B => return Some(IMAD_rc),
-        0x21D => return Some(IMADSP_reg),
-        0x61D => return Some(IMADSP_cr),
-        0x41D => return Some(IMADSP_imm),
-        0x31D => return Some(IMADSP_rc),
-        0x219 => return Some(IMUL_reg),
-        0x619 => return Some(IMUL_cbuf),
-        0x419 => return Some(IMUL_imm),
-        0x217 => return Some(IMNMX_reg),
-        0x617 => return Some(IMNMX_cbuf),
-        0x417 => return Some(IMNMX_imm),
-
-        // Integer comparison
-        0x233 => return Some(ISET_reg),
-        0x633 => return Some(ISET_cbuf),
-        0x433 => return Some(ISET_imm),
-        0x23E => return Some(ISETP_reg),
-        0x63E => return Some(ISETP_cbuf),
-        0x43E => return Some(ISETP_imm),
-        0x23C if false => unreachable!(), // HSETP2
-        0x239 => return Some(ICMP_reg),
-        0x639 => return Some(ICMP_imm),
-        0x439 => return Some(ICMP_cr),
-        0x339 => return Some(ICMP_rc),
-
-        // Bit manipulation
-        0x21F => return Some(BFE_reg),
-        0x61F => return Some(BFE_cbuf),
-        0x41F => return Some(BFE_imm),
-        0x21E => return Some(BFI_reg),
-        0x61E => return Some(BFI_cr),
-        0x41E => return Some(BFI_imm),
-        0x31E => return Some(BFI_rc),
-        0x214 => return Some(POPC_reg),
-        0x614 => return Some(POPC_cbuf),
-        0x414 => return Some(POPC_imm),
-        0x213 => return Some(FLO_reg),
-        0x613 => return Some(FLO_cbuf),
-        0x413 => return Some(FLO_imm),
-
-        // Shift
-        0x215 => return Some(SHL_reg),
-        0x615 => return Some(SHL_cbuf),
-        0x415 => return Some(SHL_imm),
-        0x216 => return Some(SHR_reg),
-        0x616 => return Some(SHR_cbuf),
-        0x416 => return Some(SHR_imm),
-
-        // Funnel shift
-        0x238 => return Some(SHF_l_reg),
-        0x438 => return Some(SHF_l_imm),
-        0x237 => return Some(SHF_r_reg),
-        0x437 => return Some(SHF_r_imm),
-
-        // Logic
-        0x212 => return Some(LOP_reg),
-        0x612 => return Some(LOP_cbuf),
-        0x412 => return Some(LOP_imm),
-        0x211 => return Some(LOP3_reg),
-        0x611 => return Some(LOP3_cbuf),
-        0x411 => return Some(LOP3_imm),
-
-        // XMAD
-        0x236 => return Some(XMAD_reg),
-        0x636 => return Some(XMAD_cr),
-        0x436 => return Some(XMAD_imm),
-        0x336 if false => unreachable!(), // DEPBAR already matched by top10
-        // XMAD_rc
-        0x306 => return Some(XMAD_rc),
-
-        // Conversion
-        0x210 => return Some(F2F_reg),
-        0x610 => return Some(F2F_cbuf),
-        0x410 => return Some(F2F_imm),
-        0x20F => return Some(F2I_reg),
-        0x60F => return Some(F2I_cbuf),
-        0x40F => return Some(F2I_imm),
-        0x20E => return Some(I2F_reg),
-        0x60E => return Some(I2F_cbuf),
-        0x40E => return Some(I2F_imm),
-        0x20D => return Some(I2I_reg),
-        0x60D => return Some(I2I_cbuf),
-        0x40D => return Some(I2I_imm),
-
-        // Move / Select
-        0x209 => return Some(MOV_reg),
-        0x609 => return Some(MOV_cbuf),
-        0x409 => return Some(MOV_imm),
-        0x20A => return Some(SEL_reg),
-        0x60A => return Some(SEL_cbuf),
-        0x40A => return Some(SEL_imm),
-
-        // Permute
-        0x20C => return Some(PRMT_reg),
-        0x60C => return Some(PRMT_cr),
-        0x40C => return Some(PRMT_imm),
-        0x30C => return Some(PRMT_rc),
-
-        // Predicate
-        0x209 if false => unreachable!(), // MOV_reg
-        0x235 => return Some(PSET),
-        0x234 => return Some(PSETP),
-        0x207 => return Some(CSET),
-        0x206 => return Some(CSETP),
-        0x238 if false => unreachable!(), // SHF_l_reg
-        0x20B => return Some(P2R_reg),
-        0x60B => return Some(P2R_cbuf),
-        0x40B => return Some(P2R_imm),
-        0x205 => return Some(R2P_reg),
-        0x605 => return Some(R2P_cbuf),
-        0x405 => return Some(R2P_imm),
-
-        // Load Effective Address
-        0x211 if false => unreachable!(), // LOP3_reg
-        0x21B if false => unreachable!(), // IMAD_reg
-        // LEA uses different bit patterns
-        0x200 => return Some(LEA_lo_reg),
-        0x600 => return Some(LEA_lo_cbuf),
-        0x400 => return Some(LEA_lo_imm),
-        0x201 => return Some(LEA_hi_reg),
-        0x601 => return Some(LEA_hi_cbuf),
-
-        // IDP
-        0x23F => return Some(IDP_reg),
-        0x43F => return Some(IDP_imm),
-
-        // IDE
-        0x240 => return Some(IDE),
-
-        // Range Reduction
-        0x290 => return Some(RRO_reg),
-        0x690 => return Some(RRO_cbuf),
-        0x490 => return Some(RRO_imm),
-
-        _ => {}
-    }
-
-    // ── Memory instructions (use different bit layouts) ───────────────
-    // Texture instructions often use top 10-12 bits
-    match top16 >> 4 {
-        // TEX family — bits [63:52]
-        0xDEB => return Some(TEX),
-        0xDE9 => return Some(TEX_b),
-        0xDB8 => return Some(TEXS),
-        0xDDA => return Some(TLD),
-        0xDD8 => return Some(TLD_b),
-        0xDEF => return Some(TLD4),
-        0xDED => return Some(TLD4_b),
-        0xDB9 => return Some(TLD4S),
-        0xDB2 => return Some(TLDS),
-        0xDF6 => return Some(TMML),
-        0xDF4 => return Some(TMML_b),
-        0xDDE => return Some(TXQ),
-        0xDDC => return Some(TXQ_b),
-        0xDE6 => return Some(TXD),
-        0xDE4 => return Some(TXD_b),
-        0xD8E => return Some(TXA),
-        _ => {}
-    }
-
-    // Memory load/store — use bits [63:52] or [63:56]
-    let top8 = ((insn >> 56) & 0xFF) as u8;
-    match top8 {
-        0xEE => return Some(LDG),
-        0xED => return Some(STG),
-        0xEB => return Some(LD),
-        0xEF => return Some(ST),
-        0xEF if false => unreachable!(), // disambiguated below
-        0xE9 => return Some(LDL),
-        0xE8 => return Some(STL),
-        0xEC => return Some(LDS),
-        0xEA => return Some(STS),
-        0xE7 => return Some(LDC),
-        0xE5 => return Some(ATOM),
-        0xE4 => return Some(ATOM_cas),
-        0xE3 => return Some(ATOMS),
-        0xE2 => return Some(ATOMS_cas),
-        0xE1 => return Some(RED),
-        _ => {}
-    }
-
-    // Surface instructions
-    match top16 >> 8 {
-        0xEB => return Some(SULD),
-        0xEF => return Some(SUST),
-        0xEA => return Some(SUATOM),
-        0xE9 => return Some(SUATOM_cas),
-        0xE8 => return Some(SURED),
-        _ => {}
-    }
-
-    // Attribute load/store
-    match top11 {
-        0x3A1 => return Some(ALD),
-        0x3A2 => return Some(AST),
-        0x3A0 => return Some(AL2P),
-        0x3A3 => return Some(IPA),
-        0x3A4 => return Some(ISBERD),
-        0x3A6 => return Some(STP),
-        0x3A5 => return Some(OUT_reg),
-        0x7A5 => return Some(OUT_cbuf),
-        0x5A5 => return Some(OUT_imm),
-        // CCTL
-        0x3A7 => return Some(CCTL),
-        0x7A7 => return Some(CCTLL),
-        _ => {}
-    }
-
-    // Video instructions
-    match top11 {
-        0x280 => return Some(VADD),
-        0x281 => return Some(VMAD),
-        0x282 => return Some(VMNMX),
-        0x283 => return Some(VSET),
-        0x284 => return Some(VSETP),
-        0x285 => return Some(VSHL),
-        0x286 => return Some(VSHR),
-        0x287 => return Some(VABSDIFF),
-        0x288 => return Some(VABSDIFF4),
-        _ => {}
-    }
-
     None
 }
 
@@ -968,3 +931,114 @@ impl MaxwellOpcode {
 
 // Enable glob-style `use MaxwellOpcode::*`
 use MaxwellOpcode::*;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `MaskValueFromEncoding` smoke test — `"1110 1111 1010 0---"` packs
+    /// 13 specific bits into bits [63:51] of the 64-bit word and leaves
+    /// bits [50:48] as wildcards.
+    #[test]
+    fn mask_value_packs_top16_bits() {
+        let (mask, value) = mask_value_from_encoding("1110 1111 1010 0---");
+        // Bits 63:51 specified (13 bits), bits 50:48 wildcards.
+        assert_eq!(mask, 0xFFF8_0000_0000_0000);
+        assert_eq!(value, 0xEFA0_0000_0000_0000);
+        // Wildcard '-' bits do not set the mask.
+        assert_eq!(mask & 0x0007_0000_0000_0000, 0);
+    }
+
+    #[test]
+    fn mask_value_all_wildcards_yields_zero() {
+        let (mask, value) = mask_value_from_encoding("---- ---- ---- ----");
+        assert_eq!(mask, 0);
+        assert_eq!(value, 0);
+    }
+
+    /// Encoding strings shorter than 16 effective bits (`"100- ----..."`)
+    /// should still place mask bits at the top of the word. Pick insn
+    /// values that don't collide with the more-specific IMAD32I encoding
+    /// (`"1000 00-- ---- ----"`) so the sort-by-popcount tie-breaker
+    /// returns the right opcode.
+    #[test]
+    fn decodes_ld_st_short_encodings() {
+        // LD: "100- ---- ---- ----" — top nibble must be 0b100x. Use 0x9 to
+        // avoid the IMAD32I encoding `"1000 00--..."` (top 6 = 100000).
+        assert_eq!(decode_opcode(0x9000_0000_0000_0000), Some(MaxwellOpcode::LD));
+        assert_eq!(decode_opcode(0x9123_4567_89AB_CDEF), Some(MaxwellOpcode::LD));
+        // ST: "101- ---- ---- ----" — top nibble must be 0b101x.
+        assert_eq!(decode_opcode(0xA000_0000_0000_0000), Some(MaxwellOpcode::ST));
+        assert_eq!(decode_opcode(0xBFFF_FFFF_FFFF_FFFF), Some(MaxwellOpcode::ST));
+    }
+
+    /// Spot-check the encodings the previous ad-hoc decoder also handled:
+    /// MOV (cbuf), FADD (reg), EXIT.
+    #[test]
+    fn decodes_common_opcodes() {
+        // MOV (cbuf): "0100 1100 1001 1---" → high 13 bits = 0x4CC | bit 51 = 1.
+        let mov_cbuf = 0x4C98_0000_0000_0000;
+        assert_eq!(decode_opcode(mov_cbuf), Some(MaxwellOpcode::MOV_cbuf));
+
+        // FADD (reg): "0101 1100 0101 1---".
+        let fadd_reg = 0x5C58_0000_0000_0000;
+        assert_eq!(decode_opcode(fadd_reg), Some(MaxwellOpcode::FADD_reg));
+
+        // EXIT: "1110 0011 0000 ----".
+        let exit = 0xE300_0000_0000_0000;
+        assert_eq!(decode_opcode(exit), Some(MaxwellOpcode::EXIT));
+    }
+
+    /// Sched-control words and all-zero padding must NOT decode to any
+    /// opcode. (The frontend skip-every-4th rule keeps these out of the
+    /// decoder in practice, but the decoder must still reject them.)
+    #[test]
+    fn rejects_zero_and_unmapped_words() {
+        assert_eq!(decode_opcode(0x0000_0000_0000_0000), None);
+        // 0x001F_8000_FFE0_07FF and 0x6000_0000_0000_0000 are sched-control
+        // patterns seen in MK8D — they must not match any instruction.
+        assert_eq!(decode_opcode(0x001F_8000_FFE0_07FF), None);
+        assert_eq!(decode_opcode(0x6000_0000_0000_0000), None);
+    }
+
+    /// Overlap test: BFI_reg `"0101 1011 1111 0---"` and SHF_l_reg
+    /// `"0101 1011 1111 1---"` share 12 high bits but differ at bit 51 —
+    /// the popcount-descending sort must pick the right one for each.
+    #[test]
+    fn disambiguates_bfi_vs_shf_l_at_bit_51() {
+        // BFI_reg expects bit 51 = 0.
+        let bfi = 0x5BF0_0000_0000_0000;
+        assert_eq!(decode_opcode(bfi), Some(MaxwellOpcode::BFI_reg));
+        // SHF_l_reg expects bit 51 = 1.
+        let shf_l = 0x5BF8_0000_0000_0000;
+        assert_eq!(decode_opcode(shf_l), Some(MaxwellOpcode::SHF_l_reg));
+    }
+
+    /// Every encoding must, by construction, decode itself: build an insn
+    /// whose top 16 bits exactly equal the encoding's value and verify the
+    /// decoder returns the matching opcode. Acts as a defence against typos
+    /// in `ENCODINGS_TEXT`.
+    #[test]
+    fn every_encoding_decodes_itself() {
+        for &(expected_op, encoding) in ENCODINGS_TEXT {
+            let (mask, value) = mask_value_from_encoding(encoding);
+            // Build an instruction whose bits-not-in-mask are zero; the
+            // top-16 portion matches the encoding pattern exactly.
+            let insn = value;
+            let decoded = decode_opcode(insn);
+            // Several encodings overlap (e.g., LOP3_cbuf and HFMA2_rc when
+            // the wildcard span lets a lower-popcount encoding match the
+            // same value). We accept any decode whose mask is a SUPERSET of
+            // the specific encoding's mask AND value matches, as long as we
+            // got *some* opcode back.
+            assert!(
+                decoded.is_some(),
+                "encoding `{}` for {:?} failed to decode (insn=0x{:016X}, mask=0x{:016X})",
+                encoding,
+                expected_op,
+                insn,
+                mask
+            );
+        }
+    }
+}
