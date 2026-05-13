@@ -278,9 +278,17 @@ impl Gpu {
     }
 
     pub fn set_guest_memory_reader(&self, reader: Arc<dyn Fn(u64, &mut [u8]) + Send + Sync>) {
+        if std::env::var_os("RUZU_TRACE_PRESENT").is_some() {
+            log::info!("[PRESENT] GPU::set_guest_memory_reader");
+        }
         // Also propagate to the renderer for framebuffer display.
         if let Some(ref mut renderer) = *self.renderer.lock().unwrap() {
+            if std::env::var_os("RUZU_TRACE_PRESENT").is_some() {
+                log::info!("[PRESENT] GPU propagating device_memory_reader to renderer");
+            }
             renderer.set_device_memory_reader(reader.clone());
+        } else if std::env::var_os("RUZU_TRACE_PRESENT").is_some() {
+            log::info!("[PRESENT] GPU has no renderer while setting guest_memory_reader");
         }
         *self.guest_memory_reader.lock().unwrap() = Some(reader);
     }
@@ -478,16 +486,37 @@ impl Gpu {
     }
 
     /// Request a host GPU memory flush from the CPU.
-    pub fn request_flush(&self, _addr: DAddr, _size: usize) -> u64 {
-        // NOTE: Full implementation calls RequestSyncOperation which enqueues a flush.
-        // Returns the next fence counter value.
-        // Stubbed until rasterizer integration is complete.
-        let fence = self.current_sync_fence.load(Ordering::Relaxed) + 1;
-        log::warn!(
-            "Gpu::request_flush: rasterizer not integrated, returning fence {}",
-            fence
-        );
-        fence
+    ///
+    /// Port of upstream `GPU::RequestFlush(DAddr, std::size_t)`:
+    ///
+    /// ```cpp
+    /// u64 GPU::RequestFlush(DAddr addr, std::size_t size) {
+    ///     return impl->RequestSyncOperation(
+    ///         [this, addr, size]() { impl->rasterizer->FlushRegion(addr, size); });
+    /// }
+    /// ```
+    ///
+    /// Enqueues a sync operation that calls the rasterizer's `flush_region`
+    /// and returns the fence number. The caller is expected to either call
+    /// `wait_for_sync_operation(fence)` to block on completion, or let the
+    /// GPU thread drain it asynchronously via `tick_work`. This is the path
+    /// MK8D / STK / Switch homebrew use to drain GPU writes before reading
+    /// a framebuffer from CPU memory (e.g. before QueueBuffer).
+    pub fn request_flush(&self, addr: DAddr, size: usize) -> u64 {
+        // Capture &Gpu as a raw `usize` so the closure is Send. The Gpu
+        // outlives every sync request (sync_requests is owned by Gpu and
+        // drained before drop), so the deref inside the callback is safe.
+        let gpu_addr = self as *const Gpu as usize;
+        self.request_sync_operation(Box::new(move || {
+            let gpu = unsafe { &*(gpu_addr as *const Gpu) };
+            if let Some(rasterizer) = gpu.rasterizer_ptr() {
+                unsafe { &mut *rasterizer }.flush_region(addr, size as u64);
+            } else if std::env::var_os("RUZU_TRACE_PRESENT").is_some() {
+                log::info!(
+                    "[PRESENT] Gpu::request_flush sync callback: no rasterizer bound"
+                );
+            }
+        }))
     }
 
     /// Obtains current flush request fence id.
@@ -672,6 +701,22 @@ impl Gpu {
     /// Simplified: upstream also handles NvFence gating for multi-fence
     /// swap chains. We skip fence gating and composite directly.
     pub fn request_composite(&self, layers: Vec<FramebufferConfig>) {
+        if std::env::var_os("RUZU_TRACE_PRESENT").is_some() {
+            log::info!("[PRESENT] GPU::request_composite layers={}", layers.len());
+            for (index, layer) in layers.iter().take(4).enumerate() {
+                log::info!(
+                    "[PRESENT] layer{} addr=0x{:X} offset=0x{:X} {}x{} stride={} format=0x{:X}",
+                    index,
+                    layer.address,
+                    layer.offset,
+                    layer.width,
+                    layer.height,
+                    layer.stride,
+                    layer.pixel_format.0
+                );
+            }
+        }
+
         // Capture a raw pointer to self for the callback via usize (Send-safe).
         // Safety: the Gpu outlives the sync request (we wait for it below).
         let gpu_addr = self as *const Gpu as usize;
@@ -679,7 +724,15 @@ impl Gpu {
             let gpu = unsafe { &*(gpu_addr as *const Gpu) };
             let mut renderer_guard = gpu.renderer.lock().unwrap();
             if let Some(ref mut renderer) = *renderer_guard {
+                if std::env::var_os("RUZU_TRACE_PRESENT").is_some() {
+                    log::info!(
+                        "[PRESENT] GPU sync callback calling renderer.composite layers={}",
+                        layers.len()
+                    );
+                }
                 renderer.composite(&layers);
+            } else if std::env::var_os("RUZU_TRACE_PRESENT").is_some() {
+                log::info!("[PRESENT] GPU sync callback has no renderer");
             }
         }));
         self.gpu_thread.lock().unwrap().tick_gpu();
@@ -920,7 +973,12 @@ mod tests {
         ) {
         }
         fn draw_texture(&mut self) {}
-        fn clear(&mut self, _layer_count: u32) {}
+        fn clear(
+            &mut self,
+            _draw_state: &crate::engines::draw_manager::DrawState,
+            _layer_count: u32,
+        ) {
+        }
         fn dispatch_compute(&mut self) {}
         fn reset_counter(&mut self, _query_type: u32) {}
         fn query(
