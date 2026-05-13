@@ -472,6 +472,16 @@ pub unsafe fn notify_waiters_on_state(
     result: u32,
 ) -> bool {
     let waiters = state.waiter_snapshot();
+    if std::env::var_os("RUZU_TRACE_NOTIFY_WAITERS").is_some() {
+        let n = waiters.len();
+        log::info!(
+            "[NOTIFY] object_id={} waiters={} state_head_null={} state_tail_null={}",
+            signaled_object_id,
+            n,
+            state.head.is_null(),
+            state.tail.is_null()
+        );
+    }
     let mut woke_any = false;
     for thread in waiters {
         let mut guard = thread.lock().unwrap();

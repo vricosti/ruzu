@@ -171,6 +171,19 @@ impl Event {
     /// lazily as a real kernel event/readable-event pair when first requested.
     pub fn copy_handle(&self, ctx: &HLERequestContext) -> Option<Handle> {
         let readable_event = self.create_kernel_bridge_from_context(ctx)?;
+        // Diagnostic — when an MK8D-style freeze happens on `object_id=N`,
+        // logging the full backtrace at copy_handle correlates the
+        // [EVENT_REG] log with the calling service (e.g. `vi::
+        // application_display_service::get_display_vsync_event`). Off by
+        // default; gated to keep release builds quiet.
+        if std::env::var_os("RUZU_TRACE_EVENT_HANDOUT").is_some() {
+            let object_id = readable_event.lock().unwrap().object_id;
+            log::info!(
+                "[EVENT_HANDOUT] readable_event object_id={} bt:\n{}",
+                object_id,
+                std::backtrace::Backtrace::force_capture()
+            );
+        }
         ctx.copy_handle_for_readable_event(readable_event)
     }
 
