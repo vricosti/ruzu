@@ -157,8 +157,17 @@ pub fn compile_shader(
     {
         let mut tv = TranslatorVisitor::new(&mut program, 0);
 
-        // Translate each instruction
-        for &insn in code {
+        // Skip Maxwell sched-control words. Each 32-byte SASS bundle is one
+        // 8-byte sched word followed by three 8-byte instructions, so every
+        // word whose index is a multiple of 4 is control metadata that the
+        // opcode decoder does not understand. Upstream's `Location::step`
+        // handles this by iterating over byte offsets and skipping `%32==0`
+        // slots; ruzu iterates over a `&[u64]` so the equivalent guard is
+        // `index % 4 != 0`.
+        for (i, &insn) in code.iter().enumerate() {
+            if i % 4 == 0 {
+                continue;
+            }
             tv.translate_instruction(insn);
         }
     }
@@ -207,7 +216,12 @@ pub fn compile_shader_glsl(
     program.blocks.push(Block::new());
     {
         let mut tv = TranslatorVisitor::new(&mut program, 0);
-        for &insn in code {
+        // Skip Maxwell sched-control words (every 4th 64-bit word) — see
+        // the matching comment in `compile_shader` above.
+        for (i, &insn) in code.iter().enumerate() {
+            if i % 4 == 0 {
+                continue;
+            }
             tv.translate_instruction(insn);
         }
     }
@@ -215,8 +229,11 @@ pub fn compile_shader_glsl(
     ir_opt::optimize(&mut program);
 
     let mut bindings = backend::bindings::Bindings::default();
-    let source = backend::glsl::emit_glsl(profile, runtime_info, &program, &mut bindings);
+    let source = backend::glsl::emit_glsl(profile, runtime_info, &mut program, &mut bindings);
     log::debug!("  GLSL: {} bytes", source.len());
+    if std::env::var_os("RUZU_DUMP_GLSL").is_some() {
+        eprintln!("[RUZU_DUMP_GLSL {:?}]\n{}", stage, source);
+    }
 
     CompiledGlslShader {
         source,
