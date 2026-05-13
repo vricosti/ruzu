@@ -75,47 +75,81 @@ fn read_from_user(process_guard: &KProcess, address: u64) -> Option<i32> {
 }
 
 /// Decrement the value at `address` if it is < `value`. Returns the pre-decrement value.
-/// Port of upstream `DecrementIfLessThan`. Upstream uses the exclusive monitor;
-/// the scheduler lock provides the serialization guarantee here instead.
+///
+/// Port of upstream `DecrementIfLessThan` (k_address_arbiter.cpp:30-68). Upstream
+/// uses the exclusive monitor (LDREX/STREX CAS loop). We mirror that with
+/// `Memory::write_exclusive_32` which performs `compare_exchange(SeqCst, SeqCst)`
+/// on the guest atomic. Retry on contention.
+///
+/// The non-CAS variant was racy: two cores reading the same `current` and both
+/// writing `current-1` lost a decrement, corrupting the arbiter waiter counter
+/// and producing pthread-mutex contention drops (MK8D cv lost-wakeup, STK heap
+/// state corruption).
 fn decrement_if_less_than(process_guard: &KProcess, address: u64, value: i32) -> Option<i32> {
-    let current = read_from_user(process_guard, address)?;
-    if current < value {
+    loop {
+        let current = read_from_user(process_guard, address)?;
+        if current >= value {
+            return Some(current);
+        }
         let new_value = current.wrapping_sub(1) as u32;
-        if let Some(memory) = process_guard.page_table.get_base().m_memory.as_ref() {
-            memory.lock().unwrap().write_32(address, new_value);
+        let expected = current as u32;
+        let cas_ok = if let Some(memory) = process_guard.page_table.get_base().m_memory.as_ref() {
+            memory
+                .lock()
+                .unwrap()
+                .write_exclusive_32(address, new_value, expected)
         } else {
             let mut mem = process_guard.process_memory.write().unwrap();
             if !mem.is_valid_range(address, 4) {
                 return None;
             }
+            // process_memory fallback path: best-effort plain write (no CAS
+            // primitive). Used only when the main Memory backing is absent
+            // (early init / unit tests), so contention should not occur here.
             mem.write_32(address, new_value);
+            true
+        };
+        if cas_ok {
+            return Some(current);
         }
+        // CAS failed — another core won the race. Retry.
     }
-    Some(current)
 }
 
 /// Replace the value at `address` with `new_value` if it currently equals `value`.
 /// Returns the pre-replacement value.
-/// Port of upstream `UpdateIfEqual`. Upstream uses the exclusive monitor.
+///
+/// Port of upstream `UpdateIfEqual` (k_address_arbiter.cpp:70-108). Same CAS-loop
+/// rationale as `decrement_if_less_than` above.
 fn update_if_equal(
     process_guard: &KProcess,
     address: u64,
     value: i32,
     new_value: i32,
 ) -> Option<i32> {
-    let current = read_from_user(process_guard, address)?;
-    if current == value {
-        if let Some(memory) = process_guard.page_table.get_base().m_memory.as_ref() {
-            memory.lock().unwrap().write_32(address, new_value as u32);
+    loop {
+        let current = read_from_user(process_guard, address)?;
+        if current != value {
+            return Some(current);
+        }
+        let expected = current as u32;
+        let cas_ok = if let Some(memory) = process_guard.page_table.get_base().m_memory.as_ref() {
+            memory
+                .lock()
+                .unwrap()
+                .write_exclusive_32(address, new_value as u32, expected)
         } else {
             let mut mem = process_guard.process_memory.write().unwrap();
             if !mem.is_valid_range(address, 4) {
                 return None;
             }
             mem.write_32(address, new_value as u32);
+            true
+        };
+        if cas_ok {
+            return Some(current);
         }
     }
-    Some(current)
 }
 
 // ---------------------------------------------------------------------------
