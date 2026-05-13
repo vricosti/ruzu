@@ -602,6 +602,15 @@ pub fn wait(
             unsafe {
                 (*state_ptr).link_node(&mut nodes[i] as *mut ThreadListNode);
             }
+            if std::env::var_os("RUZU_TRACE_NOTIFY_WAITERS").is_some() {
+                log::info!(
+                    "[LINK] tid={} object_id={} state_addr={:p} node={:p}",
+                    current_thread_id,
+                    *oid,
+                    state_ptr,
+                    &nodes[i] as *const ThreadListNode,
+                );
+            }
             state_ptrs.push(state_ptr);
         }
 
