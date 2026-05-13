@@ -94,6 +94,17 @@ impl SynchronizationObjectState {
         self.head.is_null()
     }
 
+    /// Diagnostic — pointer value of head, for cross-referencing wait/notify
+    /// pairs in trace logs.
+    pub fn head_addr(&self) -> *const ThreadListNode {
+        self.head
+    }
+
+    /// Diagnostic — pointer value of tail.
+    pub fn tail_addr(&self) -> *const ThreadListNode {
+        self.tail
+    }
+
     /// Link a ThreadListNode to the tail. Mirrors upstream `LinkNode`.
     ///
     /// # Safety
@@ -475,11 +486,12 @@ pub unsafe fn notify_waiters_on_state(
     if std::env::var_os("RUZU_TRACE_NOTIFY_WAITERS").is_some() {
         let n = waiters.len();
         log::info!(
-            "[NOTIFY] object_id={} waiters={} state_head_null={} state_tail_null={}",
+            "[NOTIFY] object_id={} waiters={} state_addr={:p} head={:?} tail={:?}",
             signaled_object_id,
             n,
-            state.head.is_null(),
-            state.tail.is_null()
+            state as *const _,
+            state.head_addr(),
+            state.tail_addr(),
         );
     }
     let mut woke_any = false;
@@ -550,6 +562,14 @@ pub fn wait(
         }
 
         if let Some(index) = first_signaled_index(&process_guard, &object_ids) {
+            if std::env::var_os("RUZU_TRACE_NOTIFY_WAITERS").is_some() {
+                log::info!(
+                    "[WAIT_EARLY] tid={} object_ids={:?} signaled_index={} short-circuit (no link)",
+                    current_thread_id,
+                    object_ids,
+                    index,
+                );
+            }
             *out_index = index as i32;
             sleep_guard.cancel_sleep();
             return crate::hle::result::RESULT_SUCCESS;
