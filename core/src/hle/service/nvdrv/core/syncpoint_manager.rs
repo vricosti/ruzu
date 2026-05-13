@@ -155,6 +155,15 @@ impl SyncpointManager {
     }
 
     pub fn is_fence_signalled(&self, fence: &NvFence) -> bool {
+        // Refresh counter_min from host1x before checking — same rationale as
+        // `read_syncpoint_min_value`. Upstream's `IsFenceSignalled` reads
+        // `counter_min`/`counter_max` directly under the assumption that
+        // host1x has been keeping them in sync, but ruzu's bridge only fires
+        // on explicit `update_min` calls. Without this refresh, the polling-
+        // wait short-circuit in `nvhost_ctrl::IocCtrlEventWait` sees stale
+        // counter_min and returns "signalled" prematurely (task #164).
+        let _ = self.update_min(fence.id as u32);
+
         let result = self.has_syncpoint_expired(fence.id as u32, fence.value);
         if std::env::var_os("RUZU_TRACE_SYNCPOINT").is_some() {
             log::info!(
@@ -197,7 +206,24 @@ impl SyncpointManager {
     }
 
     /// Returns the minimum value of the syncpoint.
+    ///
+    /// Before returning, this refreshes `counter_min` from the host1x
+    /// syncpoint manager (the GPU-side source of truth). Without this
+    /// refresh, `counter_min` only updates when `update_min` is explicitly
+    /// invoked (e.g. inside the IocCtrlEventWait failure path), which
+    /// leaves the value stale on every other read site — including the
+    /// "fence already signalled?" short-circuit at the top of
+    /// IocCtrlEventWait. A stale `counter_min` makes `is_fence_signalled`
+    /// return true with a 0-value fence on a freshly-initialized syncpoint,
+    /// which makes MK8D's polling-wait loop exit prematurely (task #164).
+    ///
+    /// Performance-wise this adds one host1x atomic load + one `counter_min`
+    /// atomic store per read; negligible compared to an ioctl roundtrip.
     pub fn read_syncpoint_min_value(&self, id: u32) -> u32 {
+        // Pre-refresh from host1x — does its own locking. Done before we
+        // take the syncpoints lock to avoid holding two locks at once.
+        let _ = self.update_min(id);
+
         let syncpoints = self.syncpoints.lock().unwrap();
         let syncpoint = &syncpoints[id as usize];
 
