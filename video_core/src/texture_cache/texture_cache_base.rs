@@ -21,9 +21,14 @@ use parking_lot::ReentrantMutex;
 
 use common::slot_vector::SlotVector;
 
+use crate::framebuffer_config::{BlendMode, FramebufferConfig};
+use crate::renderer_base::GuestMemoryWriter;
+
 use super::descriptor_table::DescriptorTable;
-use super::image_base::{GPUVAddr, ImageAllocBase, ImageBase, ImageMapView};
+use super::format_lookup_table::PixelFormat;
+use super::image_base::{GPUVAddr, ImageAllocBase, ImageBase, ImageFlagBits, ImageMapView};
 use super::image_view_base::ImageViewBase;
+use super::image_view_info::{ImageViewInfo, SwizzleSource};
 use super::render_targets::RenderTargets;
 use super::types::*;
 
@@ -43,6 +48,21 @@ pub struct ImageViewInOut {
     pub blacklist: bool,
     pub id: ImageViewId,
 }
+
+/// Backend-independent result of `TextureCache<P>::TryFindFramebufferImageView`.
+///
+/// Upstream returns `P::ImageView*` plus the rescale flag. The Rust cache still
+/// stores only `ImageViewBase`, so the OpenGL backend maps `view_id` to its
+/// backend image-view handle when that storage is available.
+#[derive(Debug, Clone)]
+pub struct FramebufferImageView {
+    pub view_id: ImageViewId,
+    pub view: ImageViewBase,
+    pub scaled: bool,
+}
+
+pub type ImageDownloader =
+    Arc<dyn Fn(ImageId, &ImageBase, &mut [u8]) -> bool + Send + Sync + 'static>;
 
 // ── AsyncDecodeContext ─────────────────────────────────────────────────
 
@@ -218,6 +238,11 @@ pub struct TextureCacheBase {
     pub swizzle_data_buffer: Vec<u8>,
     pub unswizzle_data_buffer: Vec<u8>,
 
+    // Rust adaptation of upstream `Runtime::DownloadStagingBuffer` +
+    // backend `Image::DownloadMemory` and `Tegra::MemoryManager`.
+    pub image_downloader: Option<ImageDownloader>,
+    pub guest_memory_writer: Option<GuestMemoryWriter>,
+
     // Mutex
     pub mutex: ReentrantMutex<()>,
 }
@@ -258,8 +283,18 @@ impl TextureCacheBase {
             image_allocs_table: HashMap::new(),
             swizzle_data_buffer: vec![0u8; 8 * 1024 * 1024], // 8 MiB
             unswizzle_data_buffer: vec![0u8; 1 * 1024 * 1024], // 1 MiB
+            image_downloader: None,
+            guest_memory_writer: None,
             mutex: ReentrantMutex::new(()),
         }
+    }
+
+    pub fn set_image_downloader(&mut self, downloader: ImageDownloader) {
+        self.image_downloader = Some(downloader);
+    }
+
+    pub fn set_guest_memory_writer(&mut self, writer: GuestMemoryWriter) {
+        self.guest_memory_writer = Some(writer);
     }
 
     /// Notify the cache that a new frame has been queued.
@@ -301,13 +336,138 @@ impl TextureCacheBase {
     /// In the full implementation, this forces a download of all GPU-modified
     /// images in the given CPU address range back to guest memory.
     pub fn download_memory(&mut self, cpu_addr: u64, size: usize) {
+        let Some(downloader) = self.image_downloader.as_ref().cloned() else {
+            if std::env::var_os("RUZU_TRACE_TEXTURE_DOWNLOAD").is_some() {
+                log::info!(
+                    "[TEXTURE_DOWNLOAD] miss no_image_downloader cpu=0x{:X} size={}",
+                    cpu_addr,
+                    size
+                );
+            }
+            return;
+        };
+        let Some(writer) = self.guest_memory_writer.as_ref().cloned() else {
+            if std::env::var_os("RUZU_TRACE_TEXTURE_DOWNLOAD").is_some() {
+                log::info!(
+                    "[TEXTURE_DOWNLOAD] miss no_guest_memory_writer cpu=0x{:X} size={}",
+                    cpu_addr,
+                    size
+                );
+            }
+            return;
+        };
+
+        let mut images = self.collect_images_in_region(cpu_addr, size);
+        images.retain(|&image_id| self.slot_images[image_id].is_safe_download());
+        if images.is_empty() {
+            return;
+        }
+
+        for &image_id in &images {
+            self.slot_images[image_id]
+                .flags
+                .remove(ImageFlagBits::GPU_MODIFIED);
+        }
+        images.sort_by_key(|&image_id| self.slot_images[image_id].modification_tick);
+
+        for image_id in images {
+            let image = self.slot_images[image_id].clone();
+            let mut staging = vec![0u8; image.unswizzled_size_bytes as usize];
+            if !downloader(image_id, &image, &mut staging) {
+                continue;
+            }
+            let copies = super::util::full_download_copies(&image.info);
+            super::util::swizzle_image(
+                writer.as_ref(),
+                image.cpu_addr,
+                &image.info,
+                &copies,
+                &staging,
+                &mut self.swizzle_data_buffer,
+            );
+        }
+    }
+
+    /// Port of `TextureCache<P>::TryFindFramebufferImageView`.
+    pub fn try_find_framebuffer_image_view(
+        &mut self,
+        config: &FramebufferConfig,
+        cpu_addr: u64,
+    ) -> Option<FramebufferImageView> {
+        if cpu_addr == 0 {
+            return None;
+        }
+
+        let valid_image_ids: Vec<ImageId> = self
+            .collect_images_in_region(cpu_addr, 1)
+            .into_iter()
+            .filter(|&image_id| {
+                let image = &self.slot_images[image_id];
+                image.cpu_addr == cpu_addr && !image.image_view_ids.is_empty()
+            })
+            .collect();
+
+        let image_id = match valid_image_ids.as_slice() {
+            [] => return None,
+            [only] => *only,
+            many => *many
+                .iter()
+                .max_by_key(|&&id| self.slot_images[id].modification_tick)
+                .expect("non-empty image list"),
+        };
+
+        let view_format = match config.pixel_format.0 {
+            4 => PixelFormat::R5G6B5Unorm,
+            5 => PixelFormat::B8G8R8A8Unorm,
+            _ => PixelFormat::A8B8G8R8Unorm,
+        };
+        let mut info = ImageViewInfo::for_render_target(
+            ImageViewType::E2D,
+            view_format,
+            SubresourceRange::default(),
+        );
+        if config.blending == BlendMode::Opaque {
+            info.x_source = SwizzleSource::R as u8;
+            info.y_source = SwizzleSource::G as u8;
+            info.z_source = SwizzleSource::B as u8;
+            info.w_source = SwizzleSource::OneFloat as u8;
+        }
+
+        let image = &self.slot_images[image_id];
+        let view_id = image
+            .find_view(&info)
+            .is_valid()
+            .then(|| image.find_view(&info))
+            .unwrap_or_else(|| image.image_view_ids[0]);
+        let view = self.slot_image_views[view_id].clone();
+        Some(FramebufferImageView {
+            view_id,
+            view,
+            scaled: image.flags.contains(ImageFlagBits::RESCALED),
+        })
+    }
+
+    /// Collect every `ImageId` whose backing CPU pages overlap the given
+    /// region. Public so backend wrappers (e.g. `renderer_opengl::TextureCache`)
+    /// can implement their own `download_memory` that needs direct access to
+    /// the backend-specific image table — the base callback-based path can't
+    /// borrow that table without interior mutability, so the wrapper does the
+    /// full loop in user code instead.
+    pub fn collect_images_in_region(&self, cpu_addr: u64, size: usize) -> Vec<ImageId> {
+        let mut image_ids = Vec::new();
+        let mut seen = HashSet::new();
         Self::for_each_cpu_page(cpu_addr, size, |page| {
-            if let Some(image_ids) = self.page_table.get(&page) {
-                for &_image_id in image_ids {
-                    // In full implementation: download image to guest memory
+            if let Some(map_ids) = self.page_table.get(&page) {
+                for &map_id in map_ids {
+                    let map = &self.slot_map_views[map_id];
+                    if !map.overlaps(cpu_addr, size) || !seen.insert(map.image_id) {
+                        continue;
+                    }
+                    image_ids.push(map.image_id);
                 }
             }
         });
+        image_ids
     }
 
     /// Remove images in a region.
