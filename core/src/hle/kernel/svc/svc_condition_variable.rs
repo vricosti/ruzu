@@ -184,6 +184,7 @@ pub fn wait_process_wide_key_atomic(
     timeout_ns: i64,
 ) -> ResultCode {
     maybe_dump_mem_at_wait(system, cv_key);
+    dump_cv_state(system, "WAIT", address, cv_key, Some(tag), Some(timeout_ns));
     if should_trace_cv_debug() {
         log::info!(
             "svc::WaitProcessWideKeyAtomic tid={:?} address=0x{:X} cv_key=0x{:X} tag=0x{:08X} timeout_ns={}",
@@ -329,6 +330,108 @@ pub fn wait_process_wide_key_atomic(
     ResultCode::new(result)
 }
 
+/// Repeating CV-state dumper.
+///
+/// `RUZU_DUMP_CV=0xCVKEY` (single value or comma-separated list of cv_keys)
+/// enables this. Fires on EVERY WaitProcessWideKeyAtomic and EVERY
+/// SignalProcessWideKey whose cv_key matches one of the watched keys.
+///
+/// For each fire, logs:
+///   - kind (WAIT or SIGNAL)
+///   - tid + core
+///   - mutex_addr value (32-bit word at mutex_addr)
+///   - cv_key value (32-bit word at cv_key)
+///   - 16 words of context starting at mutex_addr (to spot predicate fields
+///     near the mutex/cv pair)
+///   - extra arg (tag for WAIT, count for SIGNAL)
+///   - PC/LR/SP from the current thread's ARM context (so we can correlate
+///     with the guest stack trace)
+///
+/// Used to diagnose lost-wakeup races: order WAIT/SIGNAL events and observe
+/// whether the predicate near the mutex is set when WAIT enters.
+fn dump_cv_state(
+    system: &System,
+    kind: &'static str,
+    mutex_addr: u64,
+    cv_key: u64,
+    extra: Option<u32>,
+    timeout_ns: Option<i64>,
+) {
+    use std::sync::OnceLock;
+    static TARGETS: OnceLock<Vec<u64>> = OnceLock::new();
+    let targets = TARGETS.get_or_init(|| {
+        std::env::var("RUZU_DUMP_CV")
+            .ok()
+            .map(|raw| {
+                raw.split(',')
+                    .map(|s| s.trim())
+                    .filter(|s| !s.is_empty())
+                    .filter_map(|tok| u64::from_str_radix(tok.trim_start_matches("0x"), 16).ok())
+                    .collect()
+            })
+            .unwrap_or_default()
+    });
+    if targets.is_empty() || !targets.contains(&cv_key) {
+        return;
+    }
+
+    let tid = system.current_thread_id().unwrap_or(0);
+    let core = system
+        .current_thread()
+        .and_then(|t| Some(t.lock().ok()?.get_current_core().max(0) as usize))
+        .unwrap_or(usize::MAX);
+
+    let process = system.current_process_arc();
+    let process = process.lock().unwrap();
+
+    // PC/LR/SP for guest backtrace correlation.
+    let (pc, lr, sp) = if core < crate::hardware_properties::NUM_CPU_CORES as usize {
+        if let Some(cpu) = process.get_arm_interface(core) {
+            let mut ctx = crate::arm::arm_interface::ThreadContext::default();
+            cpu.get_context(&mut ctx);
+            (ctx.pc, ctx.lr, ctx.sp)
+        } else {
+            (0, 0, 0)
+        }
+    } else {
+        (0, 0, 0)
+    };
+
+    let mutex_val: u32;
+    let cv_val: u32;
+    let mut ctx_words: [u32; 16] = [0; 16];
+    if let Some(memory) = process.page_table.get_base().m_memory.as_ref() {
+        let m = memory.lock().unwrap();
+        mutex_val = m.read_32(mutex_addr);
+        cv_val = m.read_32(cv_key);
+        for i in 0..16u64 {
+            ctx_words[i as usize] = m.read_32(mutex_addr.wrapping_add(i * 4));
+        }
+    } else {
+        mutex_val = 0;
+        cv_val = 0;
+    }
+
+    let extra_str = match (extra, timeout_ns) {
+        (Some(v), Some(t)) => format!(" tag=0x{:08X} timeout_ns={}", v, t),
+        (Some(v), None) => format!(" count={}", v as i32),
+        _ => String::new(),
+    };
+
+    log::info!(
+        "[DUMP_CV] {} tid={} core={} cv_key=0x{:X} mutex_addr=0x{:X} mutex_val=0x{:08X} cv_val=0x{:08X}{} pc=0x{:08X} lr=0x{:08X} sp=0x{:08X}",
+        kind, tid, core, cv_key, mutex_addr, mutex_val, cv_val, extra_str, pc, lr, sp
+    );
+    log::info!(
+        "[DUMP_CV] {} tid={} ctx@0x{:X}: {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X}",
+        kind, tid, mutex_addr,
+        ctx_words[0], ctx_words[1], ctx_words[2], ctx_words[3],
+        ctx_words[4], ctx_words[5], ctx_words[6], ctx_words[7],
+        ctx_words[8], ctx_words[9], ctx_words[10], ctx_words[11],
+        ctx_words[12], ctx_words[13], ctx_words[14], ctx_words[15],
+    );
+}
+
 /// One-shot memory dump triggered at first WaitProcessWideKeyAtomic where
 /// the cv_key matches `RUZU_DUMP_MEM_AT_WAIT_CV=0xCV_KEY`.
 /// `RUZU_DUMP_MEM_AT_FIRST_SIGNAL=0xADDR:LEN[,0xADDR2:LEN2,...]` reads LEN
@@ -457,6 +560,19 @@ fn maybe_dump_mem_at_first_signal(system: &System) {
 pub fn signal_process_wide_key(system: &System, cv_key: u64, count: i32) {
     maybe_scan_word_at_signal(system);
     maybe_dump_mem_at_first_signal(system);
+    // Inverse mapping: SignalProcessWideKey only knows cv_key, not the
+    // associated mutex address — pass `cv_key.wrapping_sub(4)` as the
+    // probed mutex location, since libnx/nnSdk layout puts the mutex
+    // immediately before the cv_key in memory. dump_cv_state itself
+    // bounds-checks so a wrong guess just produces zeros (no crash).
+    dump_cv_state(
+        system,
+        "SIGNAL",
+        cv_key.wrapping_sub(4),
+        cv_key,
+        Some(count as u32),
+        None,
+    );
     if should_trace_cv_debug() {
         log::info!(
             "svc::SignalProcessWideKey tid={:?} cv_key=0x{:X} count={}",
