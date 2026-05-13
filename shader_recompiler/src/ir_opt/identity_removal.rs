@@ -46,13 +46,23 @@ pub fn identity_removal_pass(program: &mut Program) {
         }
     }
 
-    // Phase 2: Replace identity references in all instruction arguments.
+    // Phase 2: Replace identity references in all instruction arguments,
+    // including phi-node operands. Upstream `ReplaceUsesWith` walks every
+    // user via the use-def chain; ruzu does it indirectly by scanning all
+    // `args` and `phi_args` here.
     for block in &mut program.blocks {
         for inst in &mut block.instructions {
             for arg in &mut inst.args {
                 if let Value::Inst(r) = arg {
                     if let Some(&resolved) = identity_targets.get(&(r.block, r.inst)) {
                         *arg = resolved;
+                    }
+                }
+            }
+            for (_, val) in &mut inst.phi_args {
+                if let Value::Inst(r) = val {
+                    if let Some(&resolved) = identity_targets.get(&(r.block, r.inst)) {
+                        *val = resolved;
                     }
                 }
             }
