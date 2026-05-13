@@ -365,6 +365,22 @@ impl KConditionVariable {
             result
         };
 
+        // RUZU_TRACE_UNLOCK=1 — log every ArbitrateUnlock with the
+        // recovered next_owner, so we can confirm whether the unlock
+        // actually wakes the requeued CV waiter (MK8D wedge analysis).
+        if std::env::var_os("RUZU_TRACE_UNLOCK").is_some() {
+            let next_id = next_owner_thread
+                .as_ref()
+                .map(|t| t.lock().unwrap().get_thread_id());
+            log::info!(
+                "[UNLOCK] tid={} addr=0x{:X} next_owner_tid={:?} result=0x{:08X}",
+                current_thread_id,
+                addr,
+                next_id,
+                result.get_inner_value(),
+            );
+        }
+
         // If necessary, signal the next owner thread.
         // Matches upstream ordering: `next_owner_thread->EndWait(result)` still runs
         // while the scheduler lock is held.
