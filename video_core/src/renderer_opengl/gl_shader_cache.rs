@@ -11,10 +11,14 @@ use std::sync::Arc;
 
 use shader_recompiler::profile::Profile as ShaderProfile;
 use shader_recompiler::runtime_info::RuntimeInfo;
-use shader_recompiler::{compile_shader_glsl, CompiledGlslShader, ShaderStage};
+use shader_recompiler::{
+    compile_dual_vertex_shader_glsl_at_offset, compile_shader_glsl_at_offset, CompiledGlslShader,
+    ShaderStage,
+};
 
 use crate::shader_cache::{GraphicsEnvironments, ShaderCache as SharedShaderCache};
 use crate::shader_environment::{GenericEnvironment, GpuMemoryReader};
+use shader_recompiler::program_header::ProgramHeader;
 
 use super::gl_compute_pipeline::{ComputePipeline, ComputePipelineKey};
 use super::gl_graphics_pipeline::{GraphicsPipeline, GraphicsPipelineKey};
@@ -355,10 +359,12 @@ impl ShaderCache {
             return Some(pipeline);
         };
 
+        let uses_vertex_a =
+            self.pending_program_addresses[0] != 0 && self.pending_program_addresses[1] != 0;
+
         // Maxwell3D shader program slot index → recompiler stage and
-        // `glsl_sources` slot. Slot 0 is VertexA, which upstream merges
-        // into the VertexB program; we skip it here and rely on slot 1
-        // (VertexB) for the vertex shader.
+        // `glsl_sources` slot. Slot 0 is VertexA; upstream merges it into
+        // the VertexB program and emits the merged program as GL slot 0.
         const STAGE_LAYOUT: &[(usize, ShaderStage, usize)] = &[
             (1, ShaderStage::VertexB, 0),
             (2, ShaderStage::TessellationControl, 1),
@@ -367,9 +373,41 @@ impl ShaderCache {
             (5, ShaderStage::Fragment, 4),
         ];
 
+        if uses_vertex_a {
+            let mut va_env = GenericEnvironment::new()
+                .with_gpu_read(Arc::clone(reader))
+                .with_program(self.pending_program_addresses[0], 0)
+                .with_initial_offset(std::mem::size_of::<ProgramHeader>() as u32)
+                .with_stage(ShaderStage::VertexA);
+            let mut vb_env = GenericEnvironment::new()
+                .with_gpu_read(Arc::clone(reader))
+                .with_program(self.pending_program_addresses[1], 0)
+                .with_initial_offset(std::mem::size_of::<ProgramHeader>() as u32)
+                .with_stage(ShaderStage::VertexB);
+
+            if va_env.analyze().is_none() {
+                log::warn!("gl_shader_cache: TryFindSize failed for VertexA");
+            } else if vb_env.analyze().is_none() {
+                log::warn!("gl_shader_cache: TryFindSize failed for VertexB");
+            } else {
+                let compiled = compile_dual_vertex_shader_glsl_at_offset(
+                    va_env.cached_instruction_slice(),
+                    va_env.cached_instruction_start(),
+                    vb_env.cached_instruction_slice(),
+                    vb_env.cached_instruction_start(),
+                    &ShaderProfile::default(),
+                    &RuntimeInfo::default(),
+                );
+                pipeline.glsl_sources[0] = Some(compiled.source);
+            }
+        }
+
         for &(slot, stage, gl_slot) in STAGE_LAYOUT {
             let address = self.pending_program_addresses[slot];
             if address == 0 {
+                continue;
+            }
+            if uses_vertex_a && slot == 1 {
                 continue;
             }
 
@@ -385,6 +423,7 @@ impl ShaderCache {
             let mut env = GenericEnvironment::new()
                 .with_gpu_read(Arc::clone(reader))
                 .with_program(address, 0)
+                .with_initial_offset(std::mem::size_of::<ProgramHeader>() as u32)
                 .with_stage(stage);
 
             // Find the shader's tail with the upstream sentinel scan.
@@ -401,8 +440,11 @@ impl ShaderCache {
             // and including the block containing the sentinel; the prefix
             // up to `cached_highest` is the actual shader body the
             // recompiler should consume.
-            let code_slice = env.cached_code_slice();
-            let compiled = self.compile_stage_glsl(code_slice, stage);
+            let compiled = self.compile_stage_glsl_at_offset(
+                env.cached_instruction_slice(),
+                stage,
+                env.cached_instruction_start(),
+            );
             log::debug!(
                 "gl_shader_cache: compiled {:?} stage to {} bytes of GLSL",
                 stage,
@@ -428,6 +470,8 @@ impl ShaderCache {
         environments: &mut GraphicsEnvironments,
     ) -> Option<GraphicsPipeline> {
         let mut pipeline = GraphicsPipeline::new(self.graphics_key);
+        let uses_vertex_a = self.graphics_key.unique_hashes[0] != 0;
+        let uses_vertex_b = self.graphics_key.unique_hashes[1] != 0;
 
         const STAGE_LAYOUT: &[(usize, ShaderStage, usize)] = &[
             (1, ShaderStage::VertexB, 0),
@@ -437,21 +481,54 @@ impl ShaderCache {
             (5, ShaderStage::Fragment, 4),
         ];
 
-        for &(slot, stage, gl_slot) in STAGE_LAYOUT {
+        if uses_vertex_a && uses_vertex_b {
+            let va_env = environments.envs[0].generic_environment_mut();
+            if va_env.cached_code_slice().is_empty() && va_env.analyze().is_none() {
+                log::warn!("gl_shader_cache: shared environment analyze failed for VertexA");
+                return Some(pipeline);
+            }
+            let va_code = va_env.cached_instruction_slice().to_vec();
+            let va_start = va_env.cached_instruction_start();
+
+            let vb_env = environments.envs[1].generic_environment_mut();
+            if vb_env.cached_code_slice().is_empty() && vb_env.analyze().is_none() {
+                log::warn!("gl_shader_cache: shared environment analyze failed for VertexB");
+                return Some(pipeline);
+            }
+            let compiled = compile_dual_vertex_shader_glsl_at_offset(
+                &va_code,
+                va_start,
+                vb_env.cached_instruction_slice(),
+                vb_env.cached_instruction_start(),
+                &ShaderProfile::default(),
+                &RuntimeInfo::default(),
+            );
+            pipeline.glsl_sources[0] = Some(compiled.source);
+        }
+
+        for &(slot, _stage, gl_slot) in STAGE_LAYOUT {
             if self.graphics_key.unique_hashes[slot] == 0 {
+                continue;
+            }
+            if uses_vertex_a && slot == 1 {
                 continue;
             }
 
             let env = environments.envs[slot].generic_environment_mut();
+            let actual_stage = env.shader_stage();
             if env.cached_code_slice().is_empty() && env.analyze().is_none() {
                 log::warn!(
                     "gl_shader_cache: shared environment analyze failed for stage {:?}",
-                    stage
+                    actual_stage
                 );
                 continue;
             }
 
-            let compiled = self.compile_stage_glsl(env.cached_code_slice(), stage);
+            let compiled = self.compile_stage_glsl_at_offset(
+                env.cached_instruction_slice(),
+                actual_stage,
+                env.cached_instruction_start(),
+            );
             pipeline.glsl_sources[gl_slot] = Some(compiled.source);
         }
 
@@ -474,9 +551,18 @@ impl ShaderCache {
     /// the eventual real path can pull the active GPU `Profile` and
     /// per-pipeline `RuntimeInfo` from `self`.
     pub fn compile_stage_glsl(&self, code: &[u64], stage: ShaderStage) -> CompiledGlslShader {
+        self.compile_stage_glsl_at_offset(code, stage, 0)
+    }
+
+    pub fn compile_stage_glsl_at_offset(
+        &self,
+        code: &[u64],
+        stage: ShaderStage,
+        base_offset: u32,
+    ) -> CompiledGlslShader {
         let profile = ShaderProfile::default();
         let runtime_info = RuntimeInfo::default();
-        compile_shader_glsl(code, stage, &profile, &runtime_info)
+        compile_shader_glsl_at_offset(code, stage, base_offset, &profile, &runtime_info)
     }
 
     /// Create a new compute pipeline.
@@ -776,7 +862,7 @@ mod tests {
         channel.maxwell_3d = Some(Box::new(maxwell));
         channel.kepler_compute = Some(Box::default());
 
-        let mut shared_cache = SharedShaderCache::new();
+        let mut shared_cache = SharedShaderCache::default();
         shared_cache.create_channel(&channel);
         shared_cache.bind_to_channel(7);
 

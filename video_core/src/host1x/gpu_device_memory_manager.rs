@@ -10,6 +10,7 @@
 //! the core device memory manager crate is fully ported.
 
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Number of virtual address bits for the Maxwell device address space.
 ///
@@ -53,13 +54,40 @@ pub struct MaxwellDeviceMemoryManager {
     /// `update_pages_cached_count` then still maintains the ref counts
     /// (matches upstream when `memory_device_inter == nullptr`).
     mark_region_caching: Mutex<Option<MarkRegionCachingFn>>,
+
+    /// SMMU bump allocator — next free device address. Matches upstream's
+    /// `Core::DeviceMemoryManager<MaxwellDeviceTraits>::Allocate` returning
+    /// fresh SMMU virtual addresses. Starts at `SMMU_BASE` and increments
+    /// by aligned size. Allocation is bump-only — no free-list — which
+    /// matches upstream's MK8D startup behavior closely enough for the
+    /// games tested.
+    smmu_next: AtomicU64,
+
+    /// SMMU page table: page-aligned device address → host pointer (as
+    /// `usize` since raw pointers don't impl `Send`/`Sync` automatically).
+    /// Upstream's equivalent is the `entries` array in
+    /// `DeviceMemoryManager<MaxwellDeviceTraits>`, indexed by page number.
+    /// Populated by `smmu_map`, walked by `smmu_get_host_ptr`.
+    smmu_page_table: Mutex<std::collections::HashMap<u64, usize>>,
 }
+
+/// Base device address for the SMMU bump allocator. Mirrors upstream's
+/// `host1x.MemoryManager().Allocate()` returning small DRAM offsets like
+/// `0x41000` (observed in zuyu logs for MK8D handle 0x8).
+pub const SMMU_BASE: u64 = 0x40000;
+
+/// Page size used by the SMMU page table — matches CPU page size so each
+/// host page maps to one SMMU page.
+pub const SMMU_PAGE_BITS: u32 = 12;
+pub const SMMU_PAGE_SIZE: u64 = 1 << SMMU_PAGE_BITS;
 
 impl Default for MaxwellDeviceMemoryManager {
     fn default() -> Self {
         Self {
             cached_pages: Mutex::new(std::collections::HashMap::new()),
             mark_region_caching: Mutex::new(None),
+            smmu_next: AtomicU64::new(SMMU_BASE),
+            smmu_page_table: Mutex::new(std::collections::HashMap::new()),
         }
     }
 }
@@ -130,6 +158,131 @@ impl MaxwellDeviceMemoryManager {
     /// `Core::Memory::Memory::RasterizerMarkRegionCached` path.
     pub fn set_mark_region_caching(&self, callback: MarkRegionCachingFn) {
         *self.mark_region_caching.lock().unwrap() = Some(callback);
+    }
+
+    /// Allocate `size` bytes of device-virtual address space. Returns a
+    /// device address. Aligned up to `SMMU_PAGE_SIZE` and reserved via a
+    /// bump allocator.
+    ///
+    /// Port of `Core::DeviceMemoryManager<MaxwellDeviceTraits>::Allocate`
+    /// (the bump-pointer fast path; upstream also has a small-page
+    /// allocator backed by free lists that we omit until needed).
+    pub fn smmu_allocate(&self, size: usize) -> DAddr {
+        let aligned_size = ((size as u64) + SMMU_PAGE_SIZE - 1) & !(SMMU_PAGE_SIZE - 1);
+        self.smmu_next.fetch_add(aligned_size, Ordering::Relaxed)
+    }
+
+    /// Install an SMMU page-table mapping: for each page in
+    /// `[d_address, d_address + size)`, record the corresponding host
+    /// pointer so later `smmu_get_host_ptr` calls can translate device
+    /// addresses back to host memory.
+    ///
+    /// Port of `Core::DeviceMemoryManager<Traits>::Map`. `host_ptr` is the
+    /// start of the host backing for the `size`-byte region — typically
+    /// obtained from `core::Memory::get_pointer(guest_vaddr)`.
+    ///
+    /// # Safety
+    /// `host_ptr` must remain valid for the lifetime of this mapping, and
+    /// must point to at least `size` bytes of accessible memory. Caller
+    /// (typically `nvmap::pin_handle`) must ensure unmapping clears the
+    /// page table entries before the host backing is freed.
+    pub fn smmu_map(&self, d_address: DAddr, host_ptr: *const u8, size: usize) {
+        if host_ptr.is_null() || size == 0 {
+            return;
+        }
+        let start_page = d_address >> SMMU_PAGE_BITS;
+        let end_page = (d_address + size as u64 + SMMU_PAGE_SIZE - 1) >> SMMU_PAGE_BITS;
+        let host_base = host_ptr as usize;
+        let d_base = start_page << SMMU_PAGE_BITS;
+        let mut table = self.smmu_page_table.lock().unwrap();
+        for page in start_page..end_page {
+            let page_offset = (page << SMMU_PAGE_BITS) - d_base;
+            table.insert(page, host_base + page_offset as usize);
+        }
+    }
+
+    /// Look up the host pointer for a device address via the SMMU page
+    /// table. Returns `None` if no mapping exists.
+    ///
+    /// Port of the page-walk inside upstream
+    /// `Core::DeviceMemoryManager<Traits>::ReadBlockUnsafe`.
+    pub fn smmu_get_host_ptr(&self, d_address: DAddr) -> Option<*const u8> {
+        let page = d_address >> SMMU_PAGE_BITS;
+        let page_offset = (d_address & (SMMU_PAGE_SIZE - 1)) as usize;
+        let table = self.smmu_page_table.lock().unwrap();
+        table
+            .get(&page)
+            .map(|&base| (base + page_offset) as *const u8)
+    }
+
+    /// Read `output.len()` bytes from a device address into `output`,
+    /// walking the SMMU page table page-by-page so multi-page reads
+    /// resolve correctly. Returns `true` if every page was mapped.
+    ///
+    /// Port of upstream `Core::DeviceMemoryManager<Traits>::ReadBlockUnsafe`.
+    pub fn smmu_read_block(&self, d_address: DAddr, output: &mut [u8]) -> bool {
+        if output.is_empty() {
+            return true;
+        }
+        let table = self.smmu_page_table.lock().unwrap();
+        let mut remaining = output.len();
+        let mut out_off = 0usize;
+        let mut current = d_address;
+        while remaining > 0 {
+            let page = current >> SMMU_PAGE_BITS;
+            let page_off = (current & (SMMU_PAGE_SIZE - 1)) as usize;
+            let bytes_in_page = (SMMU_PAGE_SIZE as usize - page_off).min(remaining);
+            match table.get(&page) {
+                Some(&base) => unsafe {
+                    let src = (base + page_off) as *const u8;
+                    std::ptr::copy_nonoverlapping(
+                        src,
+                        output.as_mut_ptr().add(out_off),
+                        bytes_in_page,
+                    );
+                },
+                None => return false,
+            }
+            out_off += bytes_in_page;
+            remaining -= bytes_in_page;
+            current += bytes_in_page as u64;
+        }
+        true
+    }
+
+    /// Write `data.len()` bytes from `data` to a device address, walking
+    /// the SMMU page table page-by-page. Returns `true` if every page was
+    /// mapped.
+    ///
+    /// Port of upstream `Core::DeviceMemoryManager<Traits>::WriteBlockUnsafe`.
+    pub fn smmu_write_block(&self, d_address: DAddr, data: &[u8]) -> bool {
+        if data.is_empty() {
+            return true;
+        }
+        let table = self.smmu_page_table.lock().unwrap();
+        let mut remaining = data.len();
+        let mut in_off = 0usize;
+        let mut current = d_address;
+        while remaining > 0 {
+            let page = current >> SMMU_PAGE_BITS;
+            let page_off = (current & (SMMU_PAGE_SIZE - 1)) as usize;
+            let bytes_in_page = (SMMU_PAGE_SIZE as usize - page_off).min(remaining);
+            match table.get(&page) {
+                Some(&base) => unsafe {
+                    let dst = (base + page_off) as *mut u8;
+                    std::ptr::copy_nonoverlapping(
+                        data.as_ptr().add(in_off),
+                        dst,
+                        bytes_in_page,
+                    );
+                },
+                None => return false,
+            }
+            in_off += bytes_in_page;
+            remaining -= bytes_in_page;
+            current += bytes_in_page as u64;
+        }
+        true
     }
 
     /// Port of upstream

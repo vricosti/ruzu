@@ -194,14 +194,26 @@ pub struct NvMap {
     handles: Mutex<HashMap<HandleId, Arc<Handle>>>,
     unmap_queue: Mutex<LinkedList<Arc<Handle>>>,
     next_handle_id: AtomicU32,
+    /// Optional `SystemRef` used by `pin_handle` to reach `Host1x` and
+    /// allocate/map SMMU addresses. Mirrors upstream `NvMap`'s `host1x`
+    /// reference member (passed via constructor). When `null()` (e.g.,
+    /// from tests via `NvMap::new()`), `pin_handle` falls back to the
+    /// legacy CPU-VA-as-d_address behavior so existing unit tests still
+    /// pass.
+    system: crate::core::SystemRef,
 }
 
 impl NvMap {
     pub fn new() -> Self {
+        Self::new_with_system(crate::core::SystemRef::null())
+    }
+
+    pub fn new_with_system(system: crate::core::SystemRef) -> Self {
         Self {
             handles: Mutex::new(HashMap::new()),
             unmap_queue: Mutex::new(LinkedList::new()),
             next_handle_id: AtomicU32::new(HANDLE_ID_INCREMENT),
+            system,
         }
     }
 
@@ -274,15 +286,54 @@ impl NvMap {
                 }
             }
 
-            // Upstream allocates SMMU address space via host1x.Allocator() and maps
-            // through host1x.GMMU().Map(). It handles two cases:
-            //   1. low_area_pin: allocates from a small-page region via host1x.Allocator()
-            //   2. normal pin: allocates from the big-page SMMU allocator
-            // Both map the handle's backing memory into the GPU address space.
-            // Until Host1x GMMU integration is available, use the CPU address as a
-            // placeholder device address so that pinning still returns a valid address.
+            // Upstream allocates SMMU address space via
+            // `host1x.MemoryManager().Allocate(aligned_size)` then maps
+            // through `host1x.MemoryManager().Map(d_address, vaddress, size, smmu_id)`,
+            // installing an SMMU page-table entry that translates the
+            // device-physical address back to the same host backing the
+            // CPU page-table points to for `inner.address`.
+            //
+            // Port (2026-05-14): we now allocate a real SMMU d_address via
+            // `Host1xCoreInterface::smmu_allocate`, look up the host
+            // backing for the guest CPU VA via `Memory::get_pointer`, and
+            // install the mapping via `smmu_map`. This replaces the
+            // long-standing placeholder that just returned the guest CPU
+            // VA — that stub caused MK8D's GPU reads to land on a
+            // different host page than the ARM CPU's fastmem writes
+            // (project_mk8d_shader_uninitialized_2026_05_14.md).
             if inner.d_address == 0 && inner.address != 0 {
-                inner.d_address = inner.address;
+                let host_ptr = {
+                    let sys = self.system.get();
+                    sys.memory_shared().and_then(|memory| {
+                        let m = memory.lock().unwrap();
+                        let p = m.get_pointer_silent(inner.address);
+                        if p.is_null() {
+                            None
+                        } else {
+                            Some(p as usize)
+                        }
+                    })
+                };
+                let size = inner.size as usize;
+                if let (Some(host_ptr), Some(host1x)) = (
+                    host_ptr,
+                    self.system.get().host1x_core(),
+                ) {
+                    let d_address = host1x.smmu_allocate(size);
+                    host1x.smmu_map(d_address, host_ptr, size);
+                    inner.d_address = d_address;
+                    if std::env::var_os("RUZU_TRACE_NVMAP_PIN").is_some() {
+                        eprintln!(
+                            "[NVMAP_PIN] handle=0x{:X} vaddr=0x{:X} size=0x{:X} -> d_address=0x{:X} host_ptr=0x{:X}",
+                            handle_id, inner.address, size, d_address, host_ptr
+                        );
+                    }
+                } else {
+                    // Fallback path for tests / contexts without a live
+                    // System. Preserves prior behavior so existing tests
+                    // that don't exercise the GPU continue to pass.
+                    inner.d_address = inner.address;
+                }
             }
         }
 

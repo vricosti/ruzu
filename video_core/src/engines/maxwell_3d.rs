@@ -156,7 +156,7 @@ pub(crate) const DRAW_INLINE_INDEX: u32 = reg_index!(0x15E8);
 
 /// Report semaphore block: 4 words (addr_high, addr_low, payload, query).
 /// Writing to REPORT_SEMAPHORE_BASE + 3 triggers the operation.
-const REPORT_SEMAPHORE_BASE: u32 = reg_index!(0x06C0);
+const REPORT_SEMAPHORE_BASE: u32 = reg_index!(0x1B00);
 /// Trigger register for report semaphore (writing here fires the operation).
 const REPORT_SEMAPHORE_TRIGGER: u32 = REPORT_SEMAPHORE_BASE + 3;
 
@@ -278,11 +278,11 @@ const CB_DATA_END: u32 = reg_index!(0x23D0); // exclusive
 const CB_BIND_BASE: u32 = reg_index!(0x2400);
 const CB_BIND_STRIDE: u32 = 8;
 /// CB bind trigger registers (one per shader stage).
-const CB_BIND_TRIGGER_0: u32 = reg_index!(0x2404);
-const CB_BIND_TRIGGER_1: u32 = reg_index!(0x240C);
-const CB_BIND_TRIGGER_2: u32 = reg_index!(0x2414);
-const CB_BIND_TRIGGER_3: u32 = reg_index!(0x241C);
-const CB_BIND_TRIGGER_4: u32 = reg_index!(0x2424);
+const CB_BIND_TRIGGER_0: u32 = reg_index!(0x2410);
+const CB_BIND_TRIGGER_1: u32 = reg_index!(0x2430);
+const CB_BIND_TRIGGER_2: u32 = reg_index!(0x2450);
+const CB_BIND_TRIGGER_3: u32 = reg_index!(0x2470);
+const CB_BIND_TRIGGER_4: u32 = reg_index!(0x2490);
 
 /// Number of shader stages (vertex, tess ctrl, tess eval, geometry, fragment).
 pub(crate) const NUM_SHADER_STAGES: usize = 5;
@@ -377,7 +377,7 @@ pub(crate) const ZETA_SIZE_BASE: u32 = reg_index!(0x1228);
 /// Render enable block base: +0 addr_high, +1 addr_low, +2 mode.
 const RENDER_ENABLE_BASE: u32 = reg_index!(0x1550);
 /// Render enable mode register (triggers query condition evaluation).
-const RENDER_ENABLE_MODE: u32 = reg_index!(0x1554);
+const RENDER_ENABLE_MODE: u32 = RENDER_ENABLE_BASE + 2;
 /// Render enable override register.
 const RENDER_ENABLE_OVERRIDE: u32 = reg_index!(0x1944);
 const PRIMITIVE_TOPOLOGY_CONTROL: u32 = reg_index!(0x1948);
@@ -2763,6 +2763,20 @@ impl Maxwell3D {
         out
     }
 
+    /// Consume `dirty.flags[VideoCommon::Dirty::Shaders]`.
+    ///
+    /// Upstream owner: `ShaderCache::RefreshStages` reads and clears
+    /// `maxwell3d->dirty.flags[VideoCommon::Dirty::Shaders]` before
+    /// rebuilding stage hashes.
+    pub(crate) fn consume_dirty_shaders(&mut self) -> bool {
+        let dirty = &mut self.dirty.flags[dirty_flags::flags::SHADERS as usize];
+        if !*dirty {
+            return false;
+        }
+        *dirty = false;
+        true
+    }
+
     // ── Color mask accessors ─────────────────────────────────────────────
 
     /// Read color write mask for render target `rt` (0..7).
@@ -3093,6 +3107,14 @@ impl dm::Maxwell3DAccess for Maxwell3D {
         self.clear_color_rgba()
     }
 
+    fn clear_depth(&self) -> f32 {
+        f32::from_bits(self.regs[CLEAR_DEPTH as usize])
+    }
+
+    fn clear_stencil(&self) -> i32 {
+        self.regs[CLEAR_STENCIL as usize] as i32
+    }
+
     fn vertex_stream_info(&self, index: u32) -> VertexStreamInfo {
         self.vertex_stream_info(index)
     }
@@ -3234,6 +3256,23 @@ impl Maxwell3D {
         let idx = method as usize;
         if idx >= ENGINE_REG_COUNT || self.regs[idx] == argument {
             return;
+        }
+
+        if std::env::var_os("RUZU_TRACE_PIPELINE_REGS").is_some() {
+            let pipeline_end = PIPELINE_BASE + PIPELINE_STRIDE * NUM_SHADER_PROGRAMS as u32;
+            if method >= PIPELINE_BASE && method < pipeline_end {
+                let rel = method - PIPELINE_BASE;
+                let stage = rel / PIPELINE_STRIDE;
+                let field = rel % PIPELINE_STRIDE;
+                log::info!(
+                    "Maxwell3D::pipeline_reg_write stage={} field=0x{:X} method=0x{:X} old=0x{:08X} new=0x{:08X}",
+                    stage,
+                    field,
+                    method,
+                    self.regs[idx],
+                    argument
+                );
+            }
         }
 
         self.regs[idx] = argument;
@@ -3495,6 +3534,56 @@ impl Maxwell3D {
         self.process_cb_multi_data(&zeroes);
     }
 
+    pub(crate) fn hle_d7333d26e0a93ede(&mut self, parameters: &[u32]) {
+        self.refresh_parameters();
+        let Some(&index) = parameters.first() else {
+            return;
+        };
+        let index = index as usize;
+        let address = self.regs[SHADOW_SCRATCH_BASE as usize + 42 + index];
+        let size = self.regs[SHADOW_SCRATCH_BASE as usize + 47 + index];
+        self.regs[CB_CONFIG_BASE as usize] = size;
+        self.regs[CB_CONFIG_BASE as usize + 1] = (address >> 24) & 0xFF;
+        self.regs[CB_CONFIG_BASE as usize + 2] = address << 8;
+    }
+
+    pub(crate) fn hle_bind_shader(&mut self, parameters: &[u32]) {
+        self.refresh_parameters();
+        if parameters.len() < 5 {
+            return;
+        }
+
+        let index = parameters[0] as usize;
+        if parameters[1].wrapping_sub(self.regs[SHADOW_SCRATCH_BASE as usize + 28 + index]) == 0 {
+            return;
+        }
+
+        let pipeline_base = (PIPELINE_BASE + ((index as u32) & 0xF) * PIPELINE_STRIDE) as usize;
+        self.regs[pipeline_base + 1] = parameters[2];
+        self.dirty.flags[dirty_flags::flags::SHADERS as usize] = true;
+        self.interface_state.current_dirty = true;
+        self.regs[SHADOW_SCRATCH_BASE as usize + 28 + index] = parameters[1];
+        self.regs[SHADOW_SCRATCH_BASE as usize + 34 + index] = parameters[2];
+
+        let address = parameters[4];
+        self.regs[CB_CONFIG_BASE as usize] = 0x10000;
+        self.regs[CB_CONFIG_BASE as usize + 1] = (address >> 24) & 0xFF;
+        self.regs[CB_CONFIG_BASE as usize + 2] = address << 8;
+        self.regs[CB_CONFIG_BASE as usize + 3] = 0;
+
+        let bind_group_id = (parameters[3] & 0x7F) as usize;
+        if bind_group_id >= NUM_SHADER_STAGES {
+            log::warn!(
+                "HLE_BindShader: bind_group_id {} out of range",
+                bind_group_id
+            );
+            return;
+        }
+        let bind_base = (CB_BIND_BASE + bind_group_id as u32 * CB_BIND_STRIDE) as usize;
+        self.regs[bind_base + 4] = 0x11;
+        self.process_cb_bind(bind_group_id);
+    }
+
     pub(crate) fn hle_clear_memory(&mut self, parameters: &[u32], zero_memory: &mut Vec<u32>) {
         self.refresh_parameters();
         if parameters.len() < 3 {
@@ -3735,11 +3824,25 @@ impl Maxwell3D {
         let self_raw = std::ptr::from_mut(self);
         let self_ptr = Maxwell3DPtr(self_raw);
         self.macro_engine.set_maxwell_3d(self_raw);
-        let compile = |code: &[u32]| -> Box<dyn crate::macro_engine::macro_engine::CachedMacro> {
+        // Macro register-write trace. `RUZU_TRACE_MACRO_WRITE=1` prints every
+        // method+value pair the macro interpreter emits via `call_method`.
+        // Used to diagnose missing shader-pipeline configuration writes for
+        // MK8D — see project_mk8d_shader_uninitialized_2026_05_14.md.
+        let trace_macro_writes = std::env::var_os("RUZU_TRACE_MACRO_WRITE").is_some();
+        let macro_start_for_trace = macro_method;
+        let compile = move |code: &[u32]| -> Box<dyn crate::macro_engine::macro_engine::CachedMacro> {
             let mut program = MacroInterpreterImpl::new(code.to_vec());
             let writer_ptr = self_ptr;
-            program.set_method_writer(move |address, value, _is_last_call| unsafe {
-                writer_ptr.call_method(address, value);
+            program.set_method_writer(move |address, value, _is_last_call| {
+                if trace_macro_writes {
+                    eprintln!(
+                        "[MACRO_WRITE] macro_start=0x{:X} method=0x{:X} value=0x{:08X}",
+                        macro_start_for_trace, address, value
+                    );
+                }
+                unsafe {
+                    writer_ptr.call_method(address, value);
+                }
             });
             let reader_ptr = self_ptr;
             program.set_method_reader(move |method| unsafe { reader_ptr.read_reg(method) });
@@ -4081,7 +4184,11 @@ mod tests {
         fn draw_texture(&mut self) {
             self.calls.lock().unwrap().draw_texture += 1;
         }
-        fn clear(&mut self, layer_count: u32) {
+        fn clear(
+            &mut self,
+            _draw_state: &crate::engines::draw_manager::DrawState,
+            layer_count: u32,
+        ) {
             self.calls.lock().unwrap().clear_layers.push(layer_count);
         }
         fn dispatch_compute(&mut self) {}
@@ -6640,6 +6747,54 @@ mod tests {
     }
 
     #[test]
+    fn test_hle_d7333d26e0a93ede_sets_const_buffer_from_shadow_scratch() {
+        let mut engine = Maxwell3D::new();
+        engine.regs[SHADOW_SCRATCH_BASE as usize + 43] = 0x1234_5678;
+        engine.regs[SHADOW_SCRATCH_BASE as usize + 48] = 0x6000;
+
+        engine.hle_d7333d26e0a93ede(&[1]);
+
+        assert_eq!(engine.regs[CB_CONFIG_BASE as usize], 0x6000);
+        assert_eq!(engine.regs[(CB_CONFIG_BASE + 1) as usize], 0x12);
+        assert_eq!(engine.regs[(CB_CONFIG_BASE + 2) as usize], 0x3456_7800);
+    }
+
+    #[test]
+    fn test_hle_bind_shader_sets_pipeline_offset_and_cb_bind() {
+        let mut engine = Maxwell3D::new();
+        engine.dirty.flags.fill(false);
+
+        engine.hle_bind_shader(&[1, 0xAAAA, 0x240, 0, 0x1234_5600]);
+
+        let pipeline_base = (PIPELINE_BASE + PIPELINE_STRIDE) as usize;
+        assert_eq!(engine.regs[pipeline_base + 1], 0x240);
+        assert!(engine.dirty.flags[dirty_flags::flags::SHADERS as usize]);
+        assert_eq!(engine.regs[SHADOW_SCRATCH_BASE as usize + 29], 0xAAAA);
+        assert_eq!(engine.regs[SHADOW_SCRATCH_BASE as usize + 35], 0x240);
+        assert_eq!(engine.regs[CB_CONFIG_BASE as usize], 0x10000);
+        assert_eq!(engine.regs[(CB_CONFIG_BASE + 1) as usize], 0x12);
+        assert_eq!(engine.regs[(CB_CONFIG_BASE + 2) as usize], 0x3456_0000);
+        assert_eq!(engine.regs[(CB_CONFIG_BASE + 3) as usize], 0);
+        assert_eq!(engine.regs[(CB_BIND_BASE + 4) as usize], 0x11);
+        assert!(engine.cb_bindings[0][1].enabled);
+        assert_eq!(engine.cb_bindings[0][1].address, 0x12_3456_0000);
+        assert_eq!(engine.cb_bindings[0][1].size, 0x10000);
+    }
+
+    #[test]
+    fn test_hle_bind_shader_early_return_preserves_pipeline_offset() {
+        let mut engine = Maxwell3D::new();
+        engine.regs[SHADOW_SCRATCH_BASE as usize + 29] = 0xAAAA;
+        engine.dirty.flags.fill(false);
+
+        engine.hle_bind_shader(&[1, 0xAAAA, 0x240, 0, 0x1234_5600]);
+
+        let pipeline_base = (PIPELINE_BASE + PIPELINE_STRIDE) as usize;
+        assert_eq!(engine.regs[pipeline_base + 1], 0);
+        assert!(!engine.dirty.flags[dirty_flags::flags::SHADERS as usize]);
+    }
+
+    #[test]
     fn test_process_cb_multi_data_writes_through_memory_manager() {
         let mut engine = Maxwell3D::new();
         let memory_manager = Arc::new(parking_lot::Mutex::new(
@@ -6777,6 +6932,15 @@ mod tests {
         assert!(engine.interface_state.execution_mask[DRAW_BEGIN as usize]);
         assert!(engine.interface_state.execution_mask[CLEAR_SURFACE as usize]);
         assert!(engine.interface_state.execution_mask[CB_DATA_BASE as usize]);
+        assert_eq!(REPORT_SEMAPHORE_BASE, 0x6C0);
+        assert_eq!(REPORT_SEMAPHORE_QUERY, 0x6C3);
+        assert_eq!(RENDER_ENABLE_BASE, 0x554);
+        assert_eq!(RENDER_ENABLE_MODE, 0x556);
+        assert_eq!(CB_BIND_TRIGGER_0, 0x904);
+        assert_eq!(CB_BIND_TRIGGER_1, 0x90C);
+        assert_eq!(CB_BIND_TRIGGER_2, 0x914);
+        assert_eq!(CB_BIND_TRIGGER_3, 0x91C);
+        assert_eq!(CB_BIND_TRIGGER_4, 0x924);
         assert!(engine.interface_state.execution_mask[CB_BIND_TRIGGER_0 as usize]);
         assert!(engine.interface_state.execution_mask[SYNC_INFO as usize]);
         assert!(engine.interface_state.execution_mask[LAUNCH_DMA as usize]);

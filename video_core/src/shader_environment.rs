@@ -287,6 +287,13 @@ impl GenericEnvironment {
         self
     }
 
+    /// Rust adaptation for callers that construct the generic base owner
+    /// directly instead of going through `GraphicsEnvironment`.
+    pub fn with_initial_offset(mut self, initial_offset: u32) -> Self {
+        self.initial_offset = initial_offset;
+        self
+    }
+
     /// Port of the upstream base-owner `StartAddress()` accessor.
     pub fn start_address(&self) -> u32 {
         self.start_address
@@ -375,6 +382,17 @@ impl GenericEnvironment {
             for index in (0..TRY_FIND_SIZE_BLOCK_BYTES).step_by(INST_SIZE) {
                 let inst = self.code[words_offset + index / INST_SIZE];
                 if inst == SELF_BRANCH_A || inst == SELF_BRANCH_B {
+                    if std::env::var_os("RUZU_TRACE_SHADER_WORDS").is_some() {
+                        let matched_byte_offset = offset + index;
+                        eprintln!(
+                            "[TRY_FIND_SIZE] sentinel matched at byte_offset=0x{:X} word_index={} sentinel=0x{:016X} (start_address=0x{:X} program_base=0x{:X})",
+                            matched_byte_offset,
+                            words_offset + index / INST_SIZE,
+                            inst,
+                            self.start_address,
+                            self.program_base,
+                        );
+                    }
                     return Some((offset + index) as u64);
                 }
             }
@@ -417,8 +435,41 @@ impl GenericEnvironment {
     /// This is the owner-local replacement for foreign-file reads of the
     /// upstream base-class `code`/`cached_highest` members.
     pub fn cached_code_slice(&self) -> &[u64] {
-        let words = (self.cached_highest as usize) / INST_SIZE;
+        let words = self.cached_size_words();
         &self.code[..words.min(self.code.len())]
+    }
+
+    /// Byte offset corresponding to `cached_code_slice()[0]`.
+    pub fn cached_code_start(&self) -> u32 {
+        self.cached_lowest
+    }
+
+    /// Borrow the executable shader instructions after the SPH/program header.
+    ///
+    /// Upstream OpenGL builds the Maxwell CFG from
+    /// `env.StartAddress() + sizeof(Shader::ProgramHeader)`, while the cached
+    /// code buffer starts at `env.StartAddress()` so it can also contain the
+    /// SPH. This accessor keeps that ownership decision in the environment
+    /// file until the Rust recompiler takes an `Environment` directly.
+    pub fn cached_instruction_slice(&self) -> &[u64] {
+        let code = self.cached_code_slice();
+        let words_to_skip = (self.initial_offset / INST_SIZE as u32) as usize;
+        if words_to_skip >= code.len() {
+            &[]
+        } else {
+            &code[words_to_skip..]
+        }
+    }
+
+    /// Byte offset corresponding to `cached_instruction_slice()[0]`.
+    pub fn cached_instruction_start(&self) -> u32 {
+        self.cached_lowest.saturating_add(self.initial_offset)
+    }
+
+    /// Port of the upstream `Environment::ShaderStage()` view for reduced
+    /// callers that operate on the generic base owner directly.
+    pub fn shader_stage(&self) -> ShaderStage {
+        self.stage
     }
 
     pub fn read_size_bytes(&self) -> usize {
@@ -1951,6 +2002,61 @@ mod tests {
         assert_ne!(hash, 0);
         assert_eq!(env.cached_lowest, 0);
         assert_eq!(env.cached_highest, sentinel_offset as u32);
+    }
+
+    #[test]
+    fn cached_code_slice_stops_at_cached_size_after_block_scan() {
+        let program_base: u64 = 0x4_1000_0000;
+        let sentinel_offset = 0x40;
+        let (reader, _log) =
+            make_mock_gpu_with_sentinel(program_base, sentinel_offset, SELF_BRANCH_A);
+        let mut env = GenericEnvironment::new()
+            .with_gpu_read(reader)
+            .with_program(program_base, 0);
+
+        env.analyze().expect("analyze must find sentinel");
+
+        // TryFindSize reads a full 0x1000-byte block, but upstream's cached
+        // shader body is bounded by CachedSizeWords(), including the sentinel.
+        assert_eq!(env.code.len(), TRY_FIND_SIZE_BLOCK_BYTES / INST_SIZE);
+        assert_eq!(
+            env.cached_code_slice().len(),
+            sentinel_offset / INST_SIZE + 1
+        );
+        assert_eq!(env.cached_code_slice().last().copied(), Some(SELF_BRANCH_A));
+    }
+
+    #[test]
+    fn cached_instruction_slice_skips_program_header_like_upstream_cfg() {
+        let program_base: u64 = 0x4_2000_0000;
+        let header_size = std::mem::size_of::<ProgramHeader>();
+        let sentinel_offset = header_size + INST_SIZE;
+        let mut backing = vec![0u8; TRY_FIND_SIZE_BLOCK_BYTES];
+        backing[0..8].copy_from_slice(&0x6000_0000_0000_0000u64.to_le_bytes());
+        backing[header_size..header_size + INST_SIZE]
+            .copy_from_slice(&0x1111_2222_3333_4444u64.to_le_bytes());
+        backing[sentinel_offset..sentinel_offset + INST_SIZE]
+            .copy_from_slice(&SELF_BRANCH_A.to_le_bytes());
+        let backing = Arc::new(backing);
+        let reader: GpuMemoryReader = Arc::new(move |gpu_addr, dst| {
+            let offset = (gpu_addr - program_base) as usize;
+            let end = (offset + dst.len()).min(backing.len());
+            if offset < backing.len() {
+                dst[..end - offset].copy_from_slice(&backing[offset..end]);
+            }
+        });
+        let mut env = GenericEnvironment::new()
+            .with_gpu_read(reader)
+            .with_program(program_base, 0)
+            .with_initial_offset(header_size as u32);
+
+        env.analyze().expect("analyze must find sentinel");
+
+        assert_eq!(env.cached_instruction_start(), header_size as u32);
+        assert_eq!(
+            env.cached_instruction_slice(),
+            &[0x1111_2222_3333_4444u64, SELF_BRANCH_A]
+        );
     }
 
     #[test]

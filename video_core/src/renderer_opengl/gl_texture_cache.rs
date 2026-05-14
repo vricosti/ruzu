@@ -13,8 +13,8 @@ use crate::renderer_base::GuestMemoryWriter;
 use crate::shader_environment::TextureType;
 use crate::surface::PixelFormat;
 use crate::texture_cache::image_base::ImageBase;
-use crate::texture_cache::image_view_base::ImageViewBase;
 use crate::texture_cache::image_base::ImageFlagBits;
+use crate::texture_cache::image_view_base::ImageViewBase;
 use crate::texture_cache::texture_cache_base::{
     FramebufferImageView, TextureCacheBase as CommonTextureCache,
 };
@@ -665,9 +665,15 @@ pub struct FramebufferImageViewOpenGL {
 }
 
 impl TextureCache {
-    pub fn new() -> Self {
+    /// Port of `OpenGL::TextureCache::TextureCache(Runtime&, MaxwellDeviceMemoryManager&)`.
+    /// `device_memory` is the shared `Arc` from `Host1x::memory_manager()`.
+    pub fn new(
+        device_memory: std::sync::Arc<
+            crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager,
+        >,
+    ) -> Self {
         Self {
-            base: CommonTextureCache::new(),
+            base: CommonTextureCache::new(device_memory),
             images: HashMap::new(),
             image_views: HashMap::new(),
             framebuffers: HashMap::new(),
@@ -880,8 +886,13 @@ impl TextureCache {
 }
 
 impl Default for TextureCache {
+    /// Standalone default for tests / fallback paths. Production
+    /// construction goes through `RasterizerOpenGL::new`, which threads
+    /// the shared `Arc` from `Host1x::memory_manager()`.
     fn default() -> Self {
-        Self::new()
+        Self::new(std::sync::Arc::new(
+            crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager::default(),
+        ))
     }
 }
 

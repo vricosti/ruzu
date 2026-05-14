@@ -114,11 +114,14 @@ impl RendererOpenGL {
     pub fn new<F>(
         load_fn: F,
         syncpoints: Arc<SyncpointManager>,
-        context: Box<dyn GraphicsContext + Send>,
+        device_memory: Arc<crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager>,
+        mut context: Box<dyn GraphicsContext + Send>,
     ) -> Result<Self, OpenGLError>
     where
         F: FnMut(&'static str) -> *const std::os::raw::c_void,
     {
+        context.make_current();
+
         // Load GL function pointers
         gl::load_with(load_fn);
 
@@ -129,8 +132,10 @@ impl RendererOpenGL {
         // Initialize blit screen pipeline
         let blit_screen = BlitScreen::new().map_err(|e| OpenGLError::ShaderCompileFailed(e))?;
 
-        // Initialize rasterizer
-        let rasterizer = RasterizerOpenGL::new(&device, syncpoints);
+        // Initialize rasterizer with the shared MaxwellDeviceMemoryManager.
+        // Mirrors upstream RendererOpenGL ctor: rasterizer(emu_window, gpu,
+        // device_memory, device, program_manager, state_tracker).
+        let rasterizer = RasterizerOpenGL::new(&device, syncpoints, device_memory);
 
         // Set up initial GL state (matching zuyu's RendererOpenGL constructor)
         unsafe {
@@ -196,6 +201,8 @@ impl RendererOpenGL {
             );
         }
 
+        context.done_current();
+
         Ok(Self {
             device,
             state_tracker,
@@ -230,6 +237,15 @@ impl RendererOpenGL {
     /// 8. context->SwapBuffers()
     /// 9. render_window.OnFrameDisplayed()
     pub fn composite_impl(&mut self, framebuffers: &[FramebufferConfig]) {
+        self.context.make_current();
+
+        if std::env::var_os("RUZU_TRACE_PRESENT").is_some() {
+            log::info!(
+                "[PRESENT] RendererOpenGL::composite_impl framebuffers={}",
+                framebuffers.len()
+            );
+        }
+
         if framebuffers.is_empty() {
             return;
         }
@@ -242,6 +258,7 @@ impl RendererOpenGL {
             framebuffers,
             &self.framebuffer_layout,
             &mut self.state_tracker,
+            &mut self.rasterizer,
             false,
             self.device_memory.as_ref(),
         );
@@ -253,6 +270,12 @@ impl RendererOpenGL {
         self.rasterizer.tick_frame();
 
         self.context.swap_buffers();
+        if std::env::var_os("RUZU_TRACE_PRESENT").is_some() {
+            log::info!(
+                "[PRESENT] RendererOpenGL::composite_impl swapped current_frame={}",
+                self.base_data.current_frame
+            );
+        }
         // Upstream: render_window.OnFrameDisplayed()
         // EmuWindow callback not yet wired through renderer.
     }
@@ -399,6 +422,9 @@ impl RendererBase for RendererOpenGL {
     }
 
     fn set_device_memory_reader(&mut self, reader: crate::renderer_base::DeviceMemoryReader) {
+        if std::env::var_os("RUZU_TRACE_PRESENT").is_some() {
+            log::info!("[PRESENT] RendererOpenGL::set_device_memory_reader");
+        }
         self.device_memory = Some(reader);
     }
 
@@ -410,9 +436,7 @@ impl RendererBase for RendererOpenGL {
     }
 
     fn set_guest_memory_writer(&mut self, writer: crate::renderer_base::GuestMemoryWriter) {
-        let _ = writer;
-        // Upstream OpenGL query/inline writeback goes through the bound channel
-        // memory manager rather than a renderer-owned guest-memory callback.
+        self.rasterizer.set_guest_memory_writer(writer);
     }
 
     fn set_gpu_ticks_getter(&mut self, getter: crate::renderer_base::GpuTicksGetter) {

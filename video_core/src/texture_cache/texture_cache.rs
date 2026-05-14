@@ -16,8 +16,14 @@
 //! (Runtime, Image slot vectors, Maxwell3D registers, etc.) log a warning
 //! and return safe defaults until those types are ported.
 
-use super::image_base::GPUVAddr;
-use super::image_info::ImageInfo;
+use crate::engines::draw_manager::DrawState;
+use crate::engines::maxwell_3d::RenderTargetInfo;
+use crate::surface;
+
+use super::image_base::{GPUVAddr, ImageBase, ImageFlagBits, ImageMapView};
+use super::image_info::{ImageInfo, TilingMode};
+use super::image_view_base::ImageViewBase;
+use super::image_view_info::ImageViewInfo;
 use super::texture_cache_base::*;
 use super::types::*;
 
@@ -105,6 +111,68 @@ impl TextureCacheBase {
         log::warn!("TextureCacheBase::update_render_targets: backend types not yet available");
     }
 
+    /// Rust bridge for `TextureCache<P>::UpdateRenderTargets` while the cache
+    /// does not own a `Maxwell3D*`.
+    ///
+    /// Upstream reads `maxwell3d->regs.rt_control` and `maxwell3d->regs.rt[]`
+    /// directly from this owner. The Rust draw path snapshots those registers
+    /// into `DrawState` and provides the channel GPU→CPU translator here.
+    pub fn update_render_targets_from_draw_state(
+        &mut self,
+        draw_state: &DrawState,
+        mut gpu_to_cpu: impl FnMut(GPUVAddr) -> Option<u64>,
+    ) {
+        let count = draw_state.rt_control.count.min(NUM_RT as u32) as usize;
+        if count == 0 {
+            return;
+        }
+
+        for color_index in 0..count {
+            let target_index = draw_state.rt_control.map[color_index] as usize;
+            if target_index >= NUM_RT {
+                continue;
+            }
+            let rt = draw_state.render_targets[target_index];
+            if rt.address == 0 || rt.width == 0 || rt.height == 0 || rt.format == 0 {
+                continue;
+            }
+            let Some(cpu_addr) = gpu_to_cpu(rt.address) else {
+                if std::env::var_os("RUZU_TRACE_RT").is_some() {
+                    log::info!(
+                        "[RT] miss translate color={} target={} gpu=0x{:X} {}x{} fmt=0x{:X}",
+                        color_index,
+                        target_index,
+                        rt.address,
+                        rt.width,
+                        rt.height,
+                        rt.format
+                    );
+                }
+                continue;
+            };
+
+            let image_id = self.find_or_insert_render_target_image(&rt, cpu_addr);
+            self.ensure_render_target_view(image_id);
+            self.mark_modification_by_id(image_id);
+
+            if std::env::var_os("RUZU_TRACE_RT").is_some() {
+                let image = &self.slot_images[image_id];
+                log::info!(
+                    "[RT] color={} target={} gpu=0x{:X} cpu=0x{:X} {}x{} fmt=0x{:X} image={} views={}",
+                    color_index,
+                    target_index,
+                    rt.address,
+                    cpu_addr,
+                    rt.width,
+                    rt.height,
+                    rt.format,
+                    image_id.index,
+                    image.image_view_ids.len()
+                );
+            }
+        }
+    }
+
     // ── Image lookup / insertion ───────────────────────────────────────
 
     /// Port of `TextureCache<P>::FindOrInsertImage`.
@@ -147,6 +215,81 @@ impl TextureCacheBase {
         ImageId::default()
     }
 
+    fn find_or_insert_render_target_image(
+        &mut self,
+        rt: &RenderTargetInfo,
+        cpu_addr: u64,
+    ) -> ImageId {
+        let pixel_format = surface::pixel_format_from_render_target_format(rt.format);
+        let pitch = rt
+            .width
+            .saturating_mul(surface::bytes_per_block(pixel_format));
+        let info = ImageInfo {
+            format: pixel_format,
+            image_type: ImageType::Linear,
+            resources: SubresourceExtent {
+                levels: 1,
+                layers: 1,
+            },
+            size: Extent3D {
+                width: rt.width,
+                height: rt.height,
+                depth: 1,
+            },
+            tiling: TilingMode::PitchLinear(pitch),
+            layer_stride: 0,
+            maybe_unaligned_layer_stride: 0,
+            num_samples: 1,
+            tile_width_spacing: 0,
+            rescaleable: false,
+            downscaleable: false,
+            forced_flushed: false,
+            dma_downloaded: false,
+            is_sparse: false,
+        };
+
+        if let Some((image_id, _)) = self.slot_images.iter().find(|(_, image)| {
+            image.gpu_addr == rt.address
+                && image.cpu_addr == cpu_addr
+                && image.info.size.width == info.size.width
+                && image.info.size.height == info.size.height
+                && image.info.format == info.format
+        }) {
+            return image_id;
+        }
+
+        let image_id = self
+            .slot_images
+            .insert(ImageBase::new(info, rt.address, cpu_addr));
+        let image_size = self.slot_images[image_id].guest_size_bytes as usize;
+        let map_id = self.slot_map_views.insert(ImageMapView::new(
+            rt.address, cpu_addr, image_size, image_id,
+        ));
+        self.slot_images[image_id].map_view_id = map_id;
+        self.register_image(image_id);
+        image_id
+    }
+
+    fn ensure_render_target_view(&mut self, image_id: ImageId) -> ImageViewId {
+        let image = &self.slot_images[image_id];
+        let info = ImageViewInfo::for_render_target(
+            ImageViewType::E2D,
+            image.info.format,
+            SubresourceRange::default(),
+        );
+        let existing = image.find_view(&info);
+        if existing.is_valid() {
+            return existing;
+        }
+
+        let gpu_addr = image.gpu_addr;
+        let image_info = image.info.clone();
+        let view = ImageViewBase::new(&info, &image_info, image_id, gpu_addr);
+        let view_id = self.slot_image_views.insert(view);
+        self.slot_images[image_id].insert_view(info, view_id);
+        view_id
+    }
+
     /// Port of `TextureCache<P>::JoinImages`.
     ///
     /// Resolves overlapping images by computing aliases and copies to do.
@@ -165,8 +308,25 @@ impl TextureCacheBase {
     /// Port of `TextureCache<P>::RegisterImage`.
     ///
     /// Inserts the image into page tables and marks it for CPU write-tracking.
-    pub fn register_image(&mut self, _image_id: ImageId) {
-        log::warn!("TextureCacheBase::register_image: backend types not yet available");
+    pub fn register_image(&mut self, image_id: ImageId) {
+        let map_id = self.slot_images[image_id].map_view_id;
+        if !map_id.is_valid() {
+            log::warn!("TextureCacheBase::register_image: image has no map view");
+            return;
+        }
+        let (cpu_addr, size) = {
+            let map = &self.slot_map_views[map_id];
+            (map.cpu_addr, map.size)
+        };
+        Self::for_each_cpu_page(cpu_addr, size, |page| {
+            let entries = self.page_table.entry(page).or_default();
+            if !entries.contains(&map_id) {
+                entries.push(map_id);
+            }
+        });
+        self.slot_images[image_id]
+            .flags
+            .insert(ImageFlagBits::REGISTERED);
     }
 
     /// Port of `TextureCache<P>::UnregisterImage`.
@@ -176,19 +336,85 @@ impl TextureCacheBase {
         log::warn!("TextureCacheBase::unregister_image: backend types not yet available");
     }
 
-    /// Port of `TextureCache<P>::TrackImage`.
+    /// Port of `TextureCache<P>::TrackImage` (texture_cache.h:2113).
     ///
-    /// Registers a CPU write-fault handler so the image is invalidated on
-    /// guest writes.
-    pub fn track_image(&mut self, _image_id: ImageId) {
-        log::warn!("TextureCacheBase::track_image: backend types not yet available");
+    /// Marks the image as `Tracked` and bumps the per-page cached count
+    /// on the shared `MaxwellDeviceMemoryManager` so guest CPU writes to
+    /// the image's backing range trigger cache invalidation. Handles both
+    /// dense images (single contiguous range) and sparse images (multiple
+    /// map views), matching upstream's branch on `ImageFlagBits::Sparse`.
+    pub fn track_image(&mut self, image_id: ImageId) {
+        let image = &mut self.slot_images[image_id];
+        debug_assert!(
+            !image.flags.contains(ImageFlagBits::TRACKED),
+            "TextureCache::track_image: image already tracked"
+        );
+        image.flags.insert(ImageFlagBits::TRACKED);
+        let is_sparse = image.flags.contains(ImageFlagBits::SPARSE);
+        let registered = image.flags.contains(ImageFlagBits::REGISTERED);
+        let cpu_addr = image.cpu_addr;
+        let guest_size_bytes = image.guest_size_bytes;
+        if !is_sparse {
+            // Upstream guard: skip the "kernel" sentinel range
+            // (`cpu_addr >= ~(1ULL << 40)`).
+            if cpu_addr < !(1u64 << 40) {
+                self.device_memory
+                    .update_pages_cached_count(cpu_addr, guest_size_bytes as usize, 1);
+            }
+            return;
+        }
+        debug_assert!(
+            registered,
+            "TextureCache::track_image: sparse image must be registered first"
+        );
+        let sparse_maps = self
+            .sparse_views
+            .get(&image_id)
+            .expect("sparse image missing from sparse_views")
+            .clone();
+        for map_view_id in sparse_maps {
+            let map = &self.slot_map_views[map_view_id];
+            self.device_memory
+                .update_pages_cached_count(map.cpu_addr, map.size, 1);
+        }
     }
 
-    /// Port of `TextureCache<P>::UntrackImage`.
+    /// Port of `TextureCache<P>::UntrackImage` (texture_cache.h:2141).
     ///
-    /// Removes the CPU write-fault handler for the image.
-    pub fn untrack_image(&mut self, _image_id: ImageId) {
-        log::warn!("TextureCacheBase::untrack_image: backend types not yet available");
+    /// Inverse of `track_image`: clears the `Tracked` flag and decrements
+    /// the per-page cached count for the image's backing pages.
+    pub fn untrack_image(&mut self, image_id: ImageId) {
+        let image = &mut self.slot_images[image_id];
+        debug_assert!(
+            image.flags.contains(ImageFlagBits::TRACKED),
+            "TextureCache::untrack_image: image not tracked"
+        );
+        image.flags.remove(ImageFlagBits::TRACKED);
+        let is_sparse = image.flags.contains(ImageFlagBits::SPARSE);
+        let registered = image.flags.contains(ImageFlagBits::REGISTERED);
+        let cpu_addr = image.cpu_addr;
+        let guest_size_bytes = image.guest_size_bytes;
+        if !is_sparse {
+            if cpu_addr < !(1u64 << 40) {
+                self.device_memory
+                    .update_pages_cached_count(cpu_addr, guest_size_bytes as usize, -1);
+            }
+            return;
+        }
+        debug_assert!(
+            registered,
+            "TextureCache::untrack_image: sparse image must be registered first"
+        );
+        let sparse_maps = self
+            .sparse_views
+            .get(&image_id)
+            .expect("sparse image missing from sparse_views")
+            .clone();
+        for map_view_id in sparse_maps {
+            let map = &self.slot_map_views[map_view_id];
+            self.device_memory
+                .update_pages_cached_count(map.cpu_addr, map.size, -1);
+        }
     }
 
     /// Port of `TextureCache<P>::DeleteImage`.
@@ -244,8 +470,15 @@ impl TextureCacheBase {
     ///
     /// Sets the `GpuModified` flag on the image and updates
     /// `modification_tick`.
-    pub fn mark_modification_by_id(&mut self, _id: ImageId) {
-        log::warn!("TextureCacheBase::mark_modification_by_id: backend types not yet available");
+    pub fn mark_modification_by_id(&mut self, id: ImageId) {
+        if !id.is_valid() {
+            return;
+        }
+        self.modification_tick = self.modification_tick.saturating_add(1);
+        let image = &mut self.slot_images[id];
+        image.flags.insert(ImageFlagBits::GPU_MODIFIED);
+        image.flags.remove(ImageFlagBits::CPU_MODIFIED);
+        image.modification_tick = self.modification_tick;
     }
 
     // ── GPU memory queries ─────────────────────────────────────────────
@@ -257,5 +490,47 @@ impl TextureCacheBase {
     /// Returns false until backend image types are available.
     pub fn is_region_gpu_modified(&self, _addr: u64, _size: usize) -> bool {
         false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engines::maxwell_3d::{RenderTargetInfo, RtControlInfo};
+    use crate::framebuffer_config::FramebufferConfig;
+
+    #[test]
+    fn update_render_targets_from_draw_state_registers_presentable_view() {
+        use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
+        use std::sync::Arc;
+        let mut cache =
+            TextureCacheBase::new(Arc::new(MaxwellDeviceMemoryManager::default()));
+        let mut draw_state = DrawState::default();
+        draw_state.rt_control = RtControlInfo {
+            count: 1,
+            map: [0, 0, 0, 0, 0, 0, 0, 0],
+        };
+        draw_state.render_targets[0] = RenderTargetInfo {
+            address: 0x4000_0000,
+            width: 64,
+            height: 32,
+            format: 0xD5,
+        };
+
+        cache.update_render_targets_from_draw_state(&draw_state, |gpu_addr| {
+            (gpu_addr == 0x4000_0000).then_some(0x535B_5000)
+        });
+
+        let config = FramebufferConfig {
+            address: 0x535B_5000,
+            width: 64,
+            height: 32,
+            stride: 64,
+            ..Default::default()
+        };
+        let view = cache.try_find_framebuffer_image_view(&config, 0x535B_5000);
+        assert!(view.is_some());
+        assert_eq!(cache.slot_images.size(), 1);
+        assert_eq!(cache.slot_image_views.size(), 1);
     }
 }
