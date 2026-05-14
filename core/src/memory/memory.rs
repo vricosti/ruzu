@@ -1034,6 +1034,23 @@ impl Memory {
 
     /// Write a u32 (LE). Matches upstream `Memory::Write32`.
     pub fn write_32(&self, vaddr: u64, data: u32) {
+        // `RUZU_TRACE_MEMORY_W32_AT_VADDR=0xVADDR` — log every Rust-side
+        // `Memory::write_32` call whose vaddr matches. Counterpart to the
+        // existing `RUZU_TRACE_MEMORY_W64_AT_VADDR`. Catches HLE / kernel
+        // writes (like `write_to_user` in k_condition_variable) that
+        // bypass the JIT memory_write_32 callback. Pair with
+        // `RUZU_NO_FASTMEM_W32=1` to see ALL writes (guest + kernel).
+        if let Ok(spec) = std::env::var("RUZU_TRACE_MEMORY_W32_AT_VADDR") {
+            if let Ok(target) = u64::from_str_radix(spec.trim_start_matches("0x"), 16) {
+                if vaddr <= target && target < vaddr + 4 {
+                    let bt = std::backtrace::Backtrace::force_capture();
+                    eprintln!(
+                        "[MEMORY_W32] vaddr=0x{:016X} data=0x{:08X}\n{}",
+                        vaddr, data, bt
+                    );
+                }
+            }
+        }
         self.handle_rasterizer_write(vaddr, std::mem::size_of::<u32>());
         if (vaddr & 3) == 0 {
             unsafe { self.write_raw::<u32>(vaddr, data) }
