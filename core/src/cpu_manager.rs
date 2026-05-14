@@ -12,8 +12,9 @@ use crate::hle::kernel::k_thread::KThreadLock;
 use crate::hle::kernel::kernel::KernelCore;
 use common::fiber::Fiber;
 use common::thread::Barrier;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 /// Per-core data held by the CPU manager.
 /// Matches upstream `CpuManager::CoreData`.
@@ -68,6 +69,52 @@ const _MAX_CYCLE_RUNS: usize = 5;
 static TID17_HALT_SAMPLE_COUNT: AtomicU32 = AtomicU32::new(0);
 static THREAD_PROBE_HALT_COUNT: AtomicU32 = AtomicU32::new(0);
 static PC_PROBE_HALT_COUNT: AtomicU32 = AtomicU32::new(0);
+static RUNNING_GUEST_THREADS: OnceLock<Mutex<HashMap<u64, usize>>> = OnceLock::new();
+static SERIALIZED_JIT_RUN: OnceLock<Mutex<()>> = OnceLock::new();
+static THREAD_SCHED_MISMATCH_COUNT: AtomicU64 = AtomicU64::new(0);
+static JIT_RUN_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
+
+struct RunningGuestThreadGuard {
+    enabled: bool,
+    thread_id: u64,
+    core_index: usize,
+}
+
+impl RunningGuestThreadGuard {
+    fn new(enabled: bool, thread_id: u64, core_index: usize, thread_ptr: usize) -> Self {
+        if enabled {
+            let mut running = RUNNING_GUEST_THREADS
+                .get_or_init(|| Mutex::new(HashMap::new()))
+                .lock()
+                .unwrap();
+            if let Some(owner_core) = running.insert(thread_id, core_index) {
+                eprintln!(
+                    "[THREAD_CONCURRENCY] tid={} ptr=0x{:X} already_running_core={} entering_core={}",
+                    thread_id, thread_ptr, owner_core, core_index
+                );
+            }
+        }
+        Self {
+            enabled,
+            thread_id,
+            core_index,
+        }
+    }
+}
+
+impl Drop for RunningGuestThreadGuard {
+    fn drop(&mut self) {
+        if !self.enabled {
+            return;
+        }
+        if let Some(map) = RUNNING_GUEST_THREADS.get() {
+            let mut running = map.lock().unwrap();
+            if running.get(&self.thread_id) == Some(&self.core_index) {
+                running.remove(&self.thread_id);
+            }
+        }
+    }
+}
 
 fn parse_hex_env_u64(name: &str) -> Option<u64> {
     let value = std::env::var(name).ok()?;
@@ -127,6 +174,16 @@ impl CpuManager {
         } else {
             1
         };
+        if self.is_multicore {
+            if let Ok(raw_core_count) = std::env::var("RUZU_CORE_COUNT") {
+                if let Ok(core_count) = raw_core_count.parse::<usize>() {
+                    if (1..=hardware_properties::NUM_CPU_CORES as usize).contains(&core_count) {
+                        self.num_cores = core_count;
+                        log::warn!("RUZU_CORE_COUNT={} -> limiting CPU host cores", core_count);
+                    }
+                }
+            }
+        }
 
         // Create GPU barrier: num_cores + 1 (the +1 is for the GPU thread)
         self.gpu_barrier = Some(Arc::new(Barrier::new(self.num_cores + 1)));
@@ -566,6 +623,46 @@ impl CpuManager {
             let mut t = thread_arc.lock().unwrap();
             &mut *t as *mut super::hle::kernel::k_thread::KThread
         };
+        let trace_thread_concurrency = std::env::var_os("RUZU_TRACE_THREAD_CONCURRENCY").is_some();
+        let (thread_id_for_guard, thread_current_core, thread_active_core) =
+            if trace_thread_concurrency {
+                let thread = thread_arc.lock().unwrap();
+                (
+                    thread.get_thread_id(),
+                    thread.get_current_core(),
+                    thread.get_active_core(),
+                )
+            } else {
+                (0, 0, 0)
+            };
+        if trace_thread_concurrency {
+            let scheduler_current = scheduler.lock().unwrap().get_scheduler_current_thread_id();
+            let mismatch = scheduler_current != Some(thread_id_for_guard)
+                || thread_current_core != core_index as i32
+                || (thread_active_core >= 0 && thread_active_core != core_index as i32);
+            if mismatch {
+                let n = THREAD_SCHED_MISMATCH_COUNT.fetch_add(1, Ordering::Relaxed);
+                if n < 200 || n % 1000 == 0 {
+                    eprintln!(
+                        "[THREAD_SCHED_MISMATCH] n={} tid={} ptr=0x{:X} entering_core={} scheduler_current={:?} thread_current_core={} thread_active_core={}",
+                        n,
+                        thread_id_for_guard,
+                        thread_ptr as usize,
+                        core_index,
+                        scheduler_current,
+                        thread_current_core,
+                        thread_active_core
+                    );
+                }
+            }
+        } else {
+        }
+        let _running_thread_guard = RunningGuestThreadGuard::new(
+            trace_thread_concurrency,
+            thread_id_for_guard,
+            core_index,
+            thread_ptr as usize,
+        );
 
         unsafe {
             let jit_ref = &mut **jit;
@@ -584,12 +681,44 @@ impl CpuManager {
                 return;
             }
 
-            physical_core.set_running(
-                jit_ref as *mut dyn crate::arm::arm_interface::ArmInterface,
-                thread_ptr,
-            );
+            let jit_ptr = jit_ref as *mut dyn crate::arm::arm_interface::ArmInterface;
+            if !physical_core.enter_running(jit_ptr, thread_ptr) {
+                return;
+            }
+            if std::env::var_os("RUZU_TRACE_JIT_RUNS").is_some() {
+                let n = JIT_RUN_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
+                if n < 512 || n.is_multiple_of(1000) {
+                    jit_ref.get_context(&mut thread_context);
+                    let thread = thread_arc.lock().unwrap();
+                    let scheduler_current =
+                        scheduler.lock().unwrap().get_scheduler_current_thread_id();
+                    eprintln!(
+                        "[JIT_RUN #{}] core={} tid={} scheduler_current={:?} thread_current_core={} thread_active_core={} pc=0x{:016X} lr=0x{:016X} sp=0x{:016X}",
+                        n,
+                        core_index,
+                        thread.get_thread_id(),
+                        scheduler_current,
+                        thread.get_current_core(),
+                        thread.get_active_core(),
+                        thread_context.pc,
+                        thread_context.lr,
+                        thread_context.sp,
+                    );
+                }
+            }
+            let _serialized_jit_guard = if std::env::var_os("RUZU_SERIALIZE_JIT").is_some() {
+                Some(
+                    SERIALIZED_JIT_RUN
+                        .get_or_init(|| Mutex::new(()))
+                        .lock()
+                        .unwrap(),
+                )
+            } else {
+                None
+            };
             let event = physical_core.run_thread(jit_ref, opaque);
-            physical_core.clear_running();
+            drop(_serialized_jit_guard);
+            physical_core.exit_running(jit_ptr, thread_ptr);
 
             match event {
                 crate::hle::kernel::physical_core::PhysicalCoreExecutionEvent::SupervisorCall {

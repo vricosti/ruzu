@@ -261,7 +261,9 @@ impl PageTable {
         if page_index >= self.backing_addr.size() {
             return None;
         }
-        Some(self.backing_addr[page_index] + virt_addr)
+        // backing_addr was stored via wrapping_sub in the page mapping path;
+        // recover the physical address via the corresponding wrapping_add.
+        Some(self.backing_addr[page_index].wrapping_add(virt_addr))
     }
 }
 

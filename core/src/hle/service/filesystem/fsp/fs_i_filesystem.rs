@@ -545,8 +545,10 @@ impl IFileSystem {
                     format!(
                         "core{}: pc=0x{:X} lr=0x{:X}",
                         i,
-                        crate::hle::kernel::kernel::GUEST_PC[i].load(std::sync::atomic::Ordering::Acquire),
-                        crate::hle::kernel::kernel::GUEST_LR[i].load(std::sync::atomic::Ordering::Acquire),
+                        crate::hle::kernel::kernel::GUEST_PC[i]
+                            .load(std::sync::atomic::Ordering::Acquire),
+                        crate::hle::kernel::kernel::GUEST_LR[i]
+                            .load(std::sync::atomic::Ordering::Acquire),
                     )
                 })
                 .collect();
@@ -617,10 +619,28 @@ impl IFileSystem {
         let mut out_timestamp = FileTimeStampRaw::default();
         let result = service.get_file_time_stamp_raw(&mut out_timestamp, &path);
         if std::env::var_os("RUZU_TRACE_FS_RESULTS").is_some() {
+            let tid: u64 = ctx
+                .get_thread()
+                .map(|t| t.lock().unwrap().get_thread_id())
+                .unwrap_or(0);
+            let pcs: Vec<String> = (0..crate::hle::kernel::kernel::GUEST_PC.len())
+                .map(|i| {
+                    format!(
+                        "core{}: pc=0x{:X} lr=0x{:X}",
+                        i,
+                        crate::hle::kernel::kernel::GUEST_PC[i]
+                            .load(std::sync::atomic::Ordering::Acquire),
+                        crate::hle::kernel::kernel::GUEST_LR[i]
+                            .load(std::sync::atomic::Ordering::Acquire),
+                    )
+                })
+                .collect();
             eprintln!(
-                "[FS_RESULT] GetFileTimeStampRaw path={} result=0x{:08x}",
+                "[FS_RESULT] GetFileTimeStampRaw tid={} path={} result=0x{:08x} | {}",
+                tid,
                 path,
-                result.get_inner_value()
+                result.get_inner_value(),
+                pcs.join(" "),
             );
         }
         if result == RESULT_SUCCESS {
@@ -671,7 +691,11 @@ impl ServiceFramework for IFileSystem {
     {
         let cmd = ctx.get_command();
         if std::env::var_os("RUZU_TRACE_IFS_DISPATCH").is_some() {
-            let fi_name = self.handlers().get(&cmd).map(|fi| fi.name).unwrap_or("<unknown>");
+            let fi_name = self
+                .handlers()
+                .get(&cmd)
+                .map(|fi| fi.name)
+                .unwrap_or("<unknown>");
             // For path-bearing cmds (GetEntryType=7, OpenFile=8, OpenDirectory=9, GetFileTimeStampRaw=14),
             // peek the X-buffer for the path. read_buffer_x is non-destructive.
             let path_preview = match cmd {
@@ -682,7 +706,10 @@ impl ServiceFramework for IFileSystem {
                 }
                 _ => String::new(),
             };
-            eprintln!("[IFS_DISPATCH] cmd={} ({}) path={:?}", cmd, fi_name, path_preview);
+            eprintln!(
+                "[IFS_DISPATCH] cmd={} ({}) path={:?}",
+                cmd, fi_name, path_preview
+            );
         }
         if let Some(fi) = self.handlers().get(&cmd) {
             if let Some(callback) = fi.handler_callback {

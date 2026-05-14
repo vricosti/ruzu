@@ -2,6 +2,7 @@ use crate::common::common::CpuAddr;
 use crate::renderer::command::mix::copy_mix_buffer;
 use crate::renderer::command::util::write_copy;
 use crate::renderer::effect::aux_::AuxInfoDsp;
+use crate::{guest_read_block, guest_write_block};
 use std::fmt::Write;
 
 #[derive(Debug, Clone, Copy)]
@@ -73,7 +74,7 @@ pub fn process_aux_command(payload: &AuxPayload, mix_buffers: &mut [i32], sample
     };
     if payload.effect_enabled {
         let input = mix_buffers[input_range.clone()].to_vec();
-        let written = write_aux_buffer(
+        let _ = write_aux_buffer(
             payload.send_buffer_info,
             payload.send_buffer,
             payload.count_max,
@@ -91,7 +92,7 @@ pub fn process_aux_command(payload: &AuxPayload, mix_buffers: &mut [i32], sample
             payload.write_offset,
             payload.update_count,
         );
-        if written == 0 || read < sample_count as u32 {
+        if read != sample_count as u32 {
             for sample in &mut mix_buffers[output_range.start + read as usize..output_range.end] {
                 *sample = 0;
             }
@@ -116,12 +117,13 @@ pub fn dump_aux_command(payload: &AuxPayload, dump: &mut String) {
 }
 
 pub(crate) fn reset_aux_info(addr: CpuAddr) {
-    let Some(info) = read_aux_info_mut(addr) else {
+    let Some(mut info) = read_aux_info(addr) else {
         return;
     };
     info.read_offset = 0;
     info.write_offset = 0;
     info.total_sample_count = 0;
+    write_aux_info(addr, &info);
 }
 
 pub(crate) fn write_aux_buffer(
@@ -141,42 +143,40 @@ pub(crate) fn write_aux_buffer(
         return 0;
     }
 
-    let Some(info) = read_aux_info_mut(info_addr) else {
+    let Some(mut info) = read_aux_info(info_addr) else {
         return 0;
     };
 
-    let mut target_write_offset = info.write_offset.saturating_add(write_offset);
+    let mut target_write_offset = info.write_offset + write_offset;
     if target_write_offset > count_max {
         return 0;
     }
 
     let buffer_len = count_max as usize;
-    let buffer = unsafe { std::slice::from_raw_parts_mut(buffer_addr as *mut i32, buffer_len) };
     let mut remaining = write_count as usize;
     let mut read_pos = 0usize;
     while remaining > 0 {
         let available = buffer_len.saturating_sub(target_write_offset as usize);
         let to_write = available.min(remaining);
-        if to_write == 0 {
-            break;
+        if to_write > 0 {
+            let write_addr =
+                buffer_addr + target_write_offset as usize * std::mem::size_of::<i32>();
+            let end = read_pos + to_write;
+            if !guest_write_block(write_addr as u64, i32_slice_as_bytes(&input[read_pos..end])) {
+                return write_count.saturating_sub(remaining as u32);
+            }
         }
-        let end = read_pos.saturating_add(to_write).min(input.len());
-        if end <= read_pos {
-            break;
-        }
-        buffer[target_write_offset as usize..target_write_offset as usize + (end - read_pos)]
-            .copy_from_slice(&input[read_pos..end]);
-        target_write_offset = (target_write_offset + (end - read_pos) as u32) % count_max;
-        remaining -= end - read_pos;
-        read_pos = end;
+        target_write_offset = (target_write_offset + to_write as u32) % count_max;
+        remaining -= to_write;
+        read_pos += to_write;
     }
 
     if update_count != 0 {
         info.write_offset = (info.write_offset + update_count) % count_max;
-        info.total_sample_count = info.total_sample_count.saturating_add(update_count);
+        write_aux_info(info_addr, &info);
     }
 
-    write_count.saturating_sub(remaining as u32)
+    write_count
 }
 
 pub(crate) fn read_aux_buffer(
@@ -196,28 +196,28 @@ pub(crate) fn read_aux_buffer(
         return 0;
     }
 
-    let Some(info) = read_aux_info_mut(info_addr) else {
+    let Some(mut info) = read_aux_info(info_addr) else {
         return 0;
     };
 
-    let mut target_read_offset = info.read_offset.saturating_add(read_offset);
+    let mut target_read_offset = info.read_offset + read_offset;
     if target_read_offset > count_max {
         return 0;
     }
 
     let buffer_len = count_max as usize;
-    let buffer = unsafe { std::slice::from_raw_parts(buffer_addr as *const i32, buffer_len) };
     let mut remaining = read_count as usize;
     let mut write_pos = 0usize;
-    while remaining > 0 && write_pos < output.len() {
+    while remaining > 0 {
         let available = buffer_len.saturating_sub(target_read_offset as usize);
-        let to_read = available.min(remaining).min(output.len() - write_pos);
-        if to_read == 0 {
-            break;
+        let to_read = available.min(remaining);
+        if to_read > 0 {
+            let read_addr = buffer_addr + target_read_offset as usize * std::mem::size_of::<i32>();
+            let out = &mut output[write_pos..write_pos + to_read];
+            if !guest_read_block(read_addr as u64, i32_slice_as_bytes_mut(out)) {
+                return read_count.saturating_sub(remaining as u32);
+            }
         }
-        output[write_pos..write_pos + to_read].copy_from_slice(
-            &buffer[target_read_offset as usize..target_read_offset as usize + to_read],
-        );
         target_read_offset = (target_read_offset + to_read as u32) % count_max;
         remaining -= to_read;
         write_pos += to_read;
@@ -225,16 +225,61 @@ pub(crate) fn read_aux_buffer(
 
     if update_count != 0 {
         info.read_offset = (info.read_offset + update_count) % count_max;
+        write_aux_info(info_addr, &info);
     }
 
-    read_count.saturating_sub(remaining as u32)
+    read_count
 }
 
-fn read_aux_info_mut(addr: CpuAddr) -> Option<&'static mut AuxInfoDsp> {
+fn read_aux_info(addr: CpuAddr) -> Option<AuxInfoDsp> {
     if addr == 0 {
         return None;
     }
-    Some(unsafe { &mut *(addr as *mut AuxInfoDsp) })
+    let mut info = AuxInfoDsp::default();
+    guest_read_block(addr as u64, aux_info_as_bytes_mut(&mut info)).then_some(info)
+}
+
+fn write_aux_info(addr: CpuAddr, info: &AuxInfoDsp) -> bool {
+    if addr == 0 {
+        return false;
+    }
+    guest_write_block(addr as u64, aux_info_as_bytes(info))
+}
+
+fn aux_info_as_bytes(info: &AuxInfoDsp) -> &[u8] {
+    unsafe {
+        std::slice::from_raw_parts(
+            info as *const AuxInfoDsp as *const u8,
+            std::mem::size_of::<AuxInfoDsp>(),
+        )
+    }
+}
+
+fn aux_info_as_bytes_mut(info: &mut AuxInfoDsp) -> &mut [u8] {
+    unsafe {
+        std::slice::from_raw_parts_mut(
+            info as *mut AuxInfoDsp as *mut u8,
+            std::mem::size_of::<AuxInfoDsp>(),
+        )
+    }
+}
+
+fn i32_slice_as_bytes(samples: &[i32]) -> &[u8] {
+    unsafe {
+        std::slice::from_raw_parts(
+            samples.as_ptr() as *const u8,
+            std::mem::size_of_val(samples),
+        )
+    }
+}
+
+fn i32_slice_as_bytes_mut(samples: &mut [i32]) -> &mut [u8] {
+    unsafe {
+        std::slice::from_raw_parts_mut(
+            samples.as_mut_ptr() as *mut u8,
+            std::mem::size_of_val(samples),
+        )
+    }
 }
 
 fn mix_buffer_range(

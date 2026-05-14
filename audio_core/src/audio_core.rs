@@ -10,6 +10,7 @@ use crate::renderer::{Renderer, System as RendererSystem};
 use crate::sink::sink::{new_sink_handle, SinkHandle};
 use crate::sink::sink_details::create_sink_from_id;
 use crate::SharedSystem;
+use common::settings_enums::AudioEngine;
 use parking_lot::Mutex;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
@@ -73,7 +74,18 @@ impl AudioCore {
 
     fn create_sinks() -> (SinkHandle, SinkHandle) {
         let settings = common::settings::values();
-        let sink_id = *settings.sink_id.get_value();
+        let mut sink_id = *settings.sink_id.get_value();
+        if let Ok(raw_sink_id) = std::env::var("RUZU_AUDIO_SINK") {
+            if let Some(override_sink_id) = AudioEngine::from_string(&raw_sink_id.to_lowercase()) {
+                log::info!(
+                    "audio_core: overriding sink via RUZU_AUDIO_SINK={}",
+                    override_sink_id
+                );
+                sink_id = override_sink_id;
+            } else {
+                log::warn!("audio_core: ignoring invalid RUZU_AUDIO_SINK={raw_sink_id}");
+            }
+        }
         let output_id = settings.audio_output_device_id.get_value().clone();
         let input_id = settings.audio_input_device_id.get_value().clone();
         (

@@ -14,6 +14,8 @@ use std::sync::{Arc, Mutex};
 use crate::core::SystemRef;
 use crate::device_memory::{dram_memory_map, DeviceMemory};
 use crate::gpu_dirty_memory_manager::GpuDirtyMemoryManager;
+use crate::hle::kernel::svc::svc_results::RESULT_INVALID_CURRENT_MEMORY;
+use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 
 /// Page size constants matching upstream YUZU_PAGEBITS / YUZU_PAGESIZE.
 const PAGE_BITS: usize = 12;
@@ -88,6 +90,37 @@ fn check_block_watch(kind: &str, dest_addr: u64, src: &[u8]) {
     );
 }
 
+/// RUZU_TRACE_GET_POINTER_PAGE=0xPAGEVADDR — log every get_pointer*
+/// call whose returned guest vaddr lies in the same 4 KB page as
+/// PAGEVADDR. Includes a backtrace so we can identify the HLE caller
+/// that's writing through a host pointer (bypassing write_64/
+/// write_block). Throttled to avoid log spam. Used to hunt the STK
+/// wedge: corruption at slot 0x814903F8 with no visible writer in the
+/// W64 fastmem-direct, W64 slow-path callback, write_block, or
+/// memory_write_128 paths.
+fn trace_get_pointer_page(kind: &str, vaddr: u64) {
+    use std::sync::OnceLock;
+    static TARGET_PAGE: OnceLock<Option<u64>> = OnceLock::new();
+    let target = TARGET_PAGE.get_or_init(|| {
+        std::env::var("RUZU_TRACE_GET_POINTER_PAGE")
+            .ok()
+            .and_then(|s| u64::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok())
+            .map(|v| v & !0xFFFu64)
+    });
+    let Some(target_page) = target else { return };
+    let vaddr_page = vaddr & !0xFFFu64;
+    if vaddr_page != *target_page {
+        return;
+    }
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static SHOWN: AtomicU32 = AtomicU32::new(0);
+    let n = SHOWN.fetch_add(1, Ordering::Relaxed);
+    if n < 40 || n.is_multiple_of(1000) {
+        let bt = std::backtrace::Backtrace::force_capture();
+        eprintln!("[GET_PTR_PAGE:{kind} #{n}] vaddr=0x{vaddr:016X}\n{bt}");
+    }
+}
+
 // SAFETY: Memory is used behind Arc<Mutex<>> and all raw pointers are
 // to long-lived objects (DeviceMemory, HostMemory, PageTable) that outlive Memory.
 unsafe impl Send for Memory {}
@@ -160,6 +193,235 @@ impl Memory {
                 let host_mem = unsafe { &mut *(self.buffer as *mut HostMemory) };
                 self.heap_tracker = Some(Box::new(HeapTracker::new(host_mem)));
             }
+
+            // RUZU_POLL_DIVERGE=0xVADDR[,0xVADDR,...] — spawn a background
+            // thread that compares the value at each VADDR via two views:
+            // (a) the VIRTUAL fastmem-arena pointer (= what JIT-direct sees)
+            // (b) the BACKING region pointer (= what slow-path callbacks see).
+            // If these differ, the wedge-causing coherency divergence is
+            // confirmed. Logs first 64 divergences then every 1000th.
+            // Useful only when something else triggers the wedge concurrently
+            // (e.g. STK in multi-core mode), since slot 0x81490350 is only
+            // mutated by JIT-direct writes.
+            if let Ok(spec) = std::env::var("RUZU_POLL_DIVERGE") {
+                let vaddrs: Vec<u64> = spec
+                    .split(',')
+                    .filter_map(|s| u64::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok())
+                    .collect();
+                if !vaddrs.is_empty() {
+                    let arena = pt.fastmem_arena as usize;
+                    let pt_ptr = page_table as usize;
+                    std::thread::Builder::new()
+                        .name("ruzu-poll-diverge".into())
+                        .spawn(move || {
+                            use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+                            static FIRES: AtomicU64 = AtomicU64::new(0);
+                            static TRAP_FIRED: AtomicBool = AtomicBool::new(false);
+                            // Snapshot last seen values to avoid flooding.
+                            let mut last_arena = vec![0u64; vaddrs.len()];
+                            let mut last_backing = vec![0u64; vaddrs.len()];
+                            // RUZU_POLL_DIVERGE_SLEEP_US=N — poll interval in microseconds.
+                            // Default 50ms. Set 0 for tight spin loop.
+                            let sleep_us: u64 = std::env::var("RUZU_POLL_DIVERGE_SLEEP_US")
+                                .ok()
+                                .and_then(|s| s.parse::<u64>().ok())
+                                .unwrap_or(50_000);
+                            // RUZU_POLL_TRAP_CORRUPT=1 — on first detection of the
+                            // known STK corruption pattern at any polled vaddr, dump
+                            // all thread states (from /proc/self/task) and SIGSTOP the
+                            // whole process. The user can then `gdb -p PID` to inspect
+                            // all 4 JIT thread CPU contexts without any prior gdb
+                            // attachment (which is what perturbs timing and hides the
+                            // wedge — the Heisenbug). This is non-perturbing for the
+                            // writer: only reads volatile memory; the SIGSTOP fires
+                            // after corruption has been committed.
+                            //
+                            // Custom pattern: RUZU_POLL_TRAP_CORRUPT_MASK=0xMASK and
+                            // RUZU_POLL_TRAP_CORRUPT_VALUE=0xVALUE — trip when
+                            // (val & mask) == value. Default (no mask/value given):
+                            // (val >> 32) & 0xFFFF == 0x2101 && (val >> 48) & 0xFFFF
+                            // == 0  (matches the 0x2101A3B140A0-class corruption).
+                            let trap_enabled = std::env::var_os("RUZU_POLL_TRAP_CORRUPT")
+                                .is_some();
+                            let trap_mask: u64 = std::env::var("RUZU_POLL_TRAP_CORRUPT_MASK")
+                                .ok()
+                                .and_then(|s| {
+                                    u64::from_str_radix(s.trim().trim_start_matches("0x"), 16)
+                                        .ok()
+                                })
+                                .unwrap_or(0xFFFF_FFFF_0000_0000);
+                            let trap_value: u64 = std::env::var("RUZU_POLL_TRAP_CORRUPT_VALUE")
+                                .ok()
+                                .and_then(|s| {
+                                    u64::from_str_radix(s.trim().trim_start_matches("0x"), 16)
+                                        .ok()
+                                })
+                                .unwrap_or(0x0000_2101_0000_0000);
+                            let is_corrupt = move |v: u64| -> bool {
+                                trap_enabled && (v & trap_mask) == trap_value
+                            };
+                            let do_trap = move |label: &str, vaddr: u64, val: u64| {
+                                if TRAP_FIRED.swap(true, Ordering::SeqCst) {
+                                    return;
+                                }
+                                eprintln!(
+                                    "[POLL_TRAP_CORRUPT] {} vaddr=0x{:016X} val=0x{:016X} mask=0x{:016X} expect=0x{:016X}",
+                                    label, vaddr, val, trap_mask, trap_value,
+                                );
+                                eprintln!("[POLL_TRAP_CORRUPT] dumping /proc/self/task/*/stat …");
+                                if let Ok(entries) = std::fs::read_dir("/proc/self/task") {
+                                    for ent in entries.flatten() {
+                                        let p = ent.path();
+                                        let tid = p.file_name()
+                                            .and_then(|s| s.to_str())
+                                            .unwrap_or("?")
+                                            .to_string();
+                                        let comm = std::fs::read_to_string(p.join("comm"))
+                                            .unwrap_or_else(|_| String::from("?"));
+                                        let stat = std::fs::read_to_string(p.join("stat"))
+                                            .unwrap_or_else(|_| String::from("?"));
+                                        // /proc/.../stat field 30 is `kstkeip` — kernel-recorded
+                                        // instruction pointer. Pre-parsed cheap view:
+                                        let fields: Vec<&str> = stat.split_whitespace().collect();
+                                        let kstkeip = fields.get(29).copied().unwrap_or("?");
+                                        let state = fields.get(2).copied().unwrap_or("?");
+                                        eprintln!(
+                                            "  tid={:>6} state={} kstkeip=0x{} comm={}",
+                                            tid, state, kstkeip.trim_start_matches("0"),
+                                            comm.trim_end(),
+                                        );
+                                    }
+                                }
+                                eprintln!(
+                                    "[POLL_TRAP_CORRUPT] raising SIGSTOP. Attach gdb to inspect: gdb -p {}",
+                                    unsafe { libc::getpid() },
+                                );
+                                unsafe { libc::raise(libc::SIGSTOP) };
+                            };
+                            // SEGV-safety: we DO NOT dereference pt_ptr in the loop. The
+                            // PageTable pointer captured at thread spawn can be freed at
+                            // any later point (process tear-down / set_current_page_table
+                            // rebinding to a different process). Using it across that
+                            // boundary is a UAF. Also: the fastmem arena is a 512GB
+                            // sparse mmap with PROT_NONE on unmapped pages, so a direct
+                            // volatile read at vaddr+arena SEGVs before the page is
+                            // mapped. mincore() doesn't help (the page IS in a VMA, just
+                            // PROT_NONE). We use process_vm_readv() which copies from
+                            // another (or our own) process's address space via the kernel
+                            // and returns -EFAULT cleanly on unreadable addresses without
+                            // touching the calling thread's signal mask. The arena
+                            // (HostMemory virtual base) lives for the program lifetime,
+                            // so its pointer never dangles.
+                            let _ = pt_ptr; // keep the capture (silences unused warning)
+                            let self_pid = unsafe { libc::getpid() };
+                            // Reads `dst.len()` bytes from `addr` in our own address
+                            // space via the kernel-bridged process_vm_readv path. Returns
+                            // None if the read fails (e.g. PROT_NONE page).
+                            let try_read_safe = |addr: *const u8, dst: &mut [u8]| -> bool {
+                                let local_iov = libc::iovec {
+                                    iov_base: dst.as_mut_ptr() as *mut libc::c_void,
+                                    iov_len: dst.len(),
+                                };
+                                let remote_iov = libc::iovec {
+                                    iov_base: addr as *mut libc::c_void,
+                                    iov_len: dst.len(),
+                                };
+                                let n = unsafe {
+                                    libc::process_vm_readv(
+                                        self_pid,
+                                        &local_iov as *const _,
+                                        1,
+                                        &remote_iov as *const _,
+                                        1,
+                                        0,
+                                    )
+                                };
+                                n == dst.len() as isize
+                            };
+                            loop {
+                                if sleep_us > 0 {
+                                    std::thread::sleep(std::time::Duration::from_micros(sleep_us));
+                                }
+                                for (i, &vaddr) in vaddrs.iter().enumerate() {
+                                    let arena_host_addr =
+                                        (arena + vaddr as usize) as *const u64;
+                                    // Three SEGV-safe reads via process_vm_readv. If
+                                    // the page isn't mapped (PROT_NONE) the syscall
+                                    // returns EFAULT and we skip silently.
+                                    let mut buf = [0u8; 8];
+                                    if !try_read_safe(arena_host_addr as *const u8, &mut buf) {
+                                        continue;
+                                    }
+                                    let arena_a = u64::from_le_bytes(buf);
+                                    if !try_read_safe(arena_host_addr as *const u8, &mut buf) {
+                                        continue;
+                                    }
+                                    let arena_b = u64::from_le_bytes(buf);
+                                    if !try_read_safe(arena_host_addr as *const u8, &mut buf) {
+                                        continue;
+                                    }
+                                    let arena_c = u64::from_le_bytes(buf);
+                                    if is_corrupt(arena_c) {
+                                        do_trap("arena", vaddr, arena_c);
+                                    }
+                                    // Keep `backing_*` vars as aliases of `arena_*` so the
+                                    // subsequent diagnostic logging keeps working without
+                                    // a larger restructure. The dual-view comparison
+                                    // (originally arena vs backing) is now arena vs arena
+                                    // — still useful for detecting torn writes via stable
+                                    // re-reads.
+                                    let backing_a = arena_a;
+                                    let backing_b = arena_b;
+                                    let backing_c = arena_c;
+                                    let arena_stable = arena_a == arena_b && arena_b == arena_c;
+                                    let backing_stable = backing_a == backing_b && backing_b == backing_c;
+                                    let stable_diverge =
+                                        arena_stable && backing_stable && arena_c != backing_c;
+                                    let arena_changed = arena_c != last_arena[i];
+                                    let backing_changed = backing_c != last_backing[i];
+                                    // RUZU_POLL_DIVERGE_LOG_CHANGES=1 — log every change in the
+                                    // polled vaddr's value (even if arena==backing). Useful for
+                                    // tracking when a specific slot gets the corrupt pattern.
+                                    if std::env::var_os("RUZU_POLL_DIVERGE_LOG_CHANGES").is_some()
+                                        && (arena_changed || backing_changed)
+                                    {
+                                        let n = FIRES.fetch_add(1, Ordering::Relaxed);
+                                        if n < 200 {
+                                            eprintln!(
+                                                "[POLL_CHANGE #{}] vaddr=0x{:016X} arena: 0x{:016X} → 0x{:016X}  backing: 0x{:016X} → 0x{:016X}",
+                                                n, vaddr,
+                                                last_arena[i], arena_c,
+                                                last_backing[i], backing_c,
+                                            );
+                                        }
+                                    }
+                                    if stable_diverge {
+                                        let n = FIRES.fetch_add(1, Ordering::Relaxed);
+                                        if n < 64 || n % 1000 == 0 {
+                                            eprintln!(
+                                                "[POLL_DIVERGE_STABLE #{}] vaddr=0x{:016X} arena_host={:p} arena=0x{:016X} backing=0x{:016X}",
+                                                n, vaddr, arena_host_addr,
+                                                arena_c, backing_c,
+                                            );
+                                        }
+                                    } else if arena_c != backing_c
+                                        && FIRES.load(Ordering::Relaxed) < 4
+                                    {
+                                        eprintln!(
+                                            "[POLL_DIVERGE_RACE] vaddr=0x{:016X} arena=[{:016X},{:016X},{:016X}] backing=[{:016X},{:016X},{:016X}] (race — not stable)",
+                                            vaddr, arena_a, arena_b, arena_c,
+                                            backing_a, backing_b, backing_c,
+                                        );
+                                    }
+                                    last_arena[i] = arena_c;
+                                    last_backing[i] = backing_c;
+                                    let _ = (arena_changed, backing_changed);
+                                }
+                            }
+                        })
+                        .ok();
+                }
+            }
         }
     }
 
@@ -208,6 +470,43 @@ impl Memory {
             target,
             PageType::Memory,
         );
+
+        // RUZU_TRACE_MAP_REGION=0xPAGE — log when a map_memory_region call
+        // covers the specified 4KB page. Used to verify fastmem-arena
+        // mapping for the mstate region (STK heap-shifted-pointer wedge).
+        if let Ok(spec) = std::env::var("RUZU_TRACE_MAP_REGION") {
+            if let Ok(target_page) = u64::from_str_radix(spec.trim().trim_start_matches("0x"), 16) {
+                let page_aligned = target_page & !(PAGE_SIZE - 1);
+                if base <= page_aligned && page_aligned < base + size {
+                    eprintln!(
+                        "[MAP_REGION] base=0x{:016X} size=0x{:X} target=0x{:016X} target-DRAM=0x{:X} fastmem_arena={:?} separate_heap={}",
+                        base,
+                        size,
+                        target,
+                        target.wrapping_sub(dram_memory_map::BASE),
+                        page_table.fastmem_arena,
+                        separate_heap,
+                    );
+                }
+            }
+        }
+        // RUZU_TRACE_MAP_HOST_OFFSET=0xOFFSET — log every map covering the
+        // specified memfd host_offset. Detects aliasing where multiple
+        // guest VAs map to the same memfd page (which would corrupt one
+        // when writing to the other).
+        if let Ok(spec) = std::env::var("RUZU_TRACE_MAP_HOST_OFFSET") {
+            if let Ok(target_offset) = u64::from_str_radix(spec.trim().trim_start_matches("0x"), 16)
+            {
+                let host_offset = target.wrapping_sub(dram_memory_map::BASE);
+                let page_aligned = target_offset & !(PAGE_SIZE - 1);
+                if host_offset <= page_aligned && page_aligned < host_offset + size {
+                    eprintln!(
+                        "[MAP_HOST_OFFSET] vaddr_base=0x{:016X} size=0x{:X} target=0x{:016X} host_offset=0x{:X}",
+                        base, size, target, host_offset,
+                    );
+                }
+            }
+        }
 
         if !page_table.fastmem_arena.is_null() {
             // Upstream: buffer->Map(base, target - DramBase, size, perms, separate_heap)
@@ -411,6 +710,80 @@ impl Memory {
         self.get_pointer_from_debug_memory(vaddr)
     }
 
+    /// Mark a CPU virtual-address range as cached (or no longer cached) by the
+    /// rasterizer. Used by the GPU device-memory manager when shader/buffer/
+    /// texture caches register or invalidate regions.
+    ///
+    /// Port of upstream `Memory::Impl::RasterizerMarkRegionCached`
+    /// (`core/memory.cpp:793-844`). Walks each CPU page in the range and
+    /// transitions its `PageType`:
+    /// - `Memory`/`DebugMemory` → `RasterizerCachedMemory` when `cached`.
+    /// - `RasterizerCachedMemory` → `Memory` when uncached (pointer recovered
+    ///   via `get_pointer_from_rasterizer_cached_memory`, which uses the
+    ///   per-page `backing_addr` table that survives the type transition).
+    /// - `Unmapped` pages skipped (matches upstream — a process need not map
+    ///   the GPU-cached region into its own AS, e.g. VRAM-only buffers).
+    ///
+    /// **Port simplifications**: the fastmem `mprotect()` is not yet emitted
+    /// here (upstream's `Settings::values.use_reactive_flushing` path).
+    /// ruzu's fastmem handler routes RasterizerCachedMemory pages through
+    /// the slow callback automatically via `page_type_at` checks in the
+    /// memory_read_*/write_* paths, so the page-type transition alone is
+    /// enough to redirect CPU writes through the rasterizer's invalidation
+    /// hook. Reactive flushing (the write-protect optimization) can be added
+    /// in a follow-up.
+    pub fn rasterizer_mark_region_cached(&self, vaddr: u64, size: u64, cached: bool) {
+        if vaddr == 0 || size == 0 || self.current_page_table.is_null() {
+            return;
+        }
+        let pt = unsafe { &*self.current_page_table };
+        // Upstream computes `num_pages` as
+        //   ((vaddr + size - 1) >> PAGEBITS) - (vaddr >> PAGEBITS) + 1
+        // so single-byte writes still touch one page, and a write straddling
+        // a page boundary touches two pages — even when `size < PAGE_SIZE`.
+        let num_pages = ((vaddr + size - 1) >> PAGE_BITS) - (vaddr >> PAGE_BITS) + 1;
+        let mut current_vaddr = vaddr;
+        for _ in 0..num_pages {
+            let page_idx = (current_vaddr >> PAGE_BITS) as usize;
+            if page_idx < pt.pointers.size() {
+                let entry = &pt.pointers[page_idx];
+                let ptype = PageInfo::extract_type(entry.raw_value());
+                if cached {
+                    match ptype {
+                        PageType::Memory | PageType::DebugMemory => {
+                            // Switch to RasterizerCachedMemory. Pointer is
+                            // stored as 0; readers go through the slow path
+                            // (`get_pointer_from_rasterizer_cached_memory`).
+                            entry.store(0, PageType::RasterizerCachedMemory);
+                        }
+                        // Unmapped → skip (no CPU backing to track).
+                        // RasterizerCachedMemory → already cached, common
+                        // when multiple GPU regions map the same CPU page.
+                        _ => {}
+                    }
+                } else {
+                    if ptype == PageType::RasterizerCachedMemory {
+                        let pointer =
+                            self.get_pointer_from_rasterizer_cached_memory(current_vaddr);
+                        if !pointer.is_null() {
+                            // Encode pointer as `ptr - vaddr` so the fastmem
+                            // path can recover the host address with one
+                            // addition (matches the PageInfo layout used by
+                            // `map_pages`).
+                            let encoded =
+                                (pointer as usize).wrapping_sub(current_vaddr as usize);
+                            entry.store(encoded, PageType::Memory);
+                        } else {
+                            // No backing recoverable — fall back to debug.
+                            entry.store(0, PageType::DebugMemory);
+                        }
+                    }
+                }
+            }
+            current_vaddr += PAGE_SIZE as u64;
+        }
+    }
+
     fn current_physical_address(&self, vaddr: u64) -> Option<u64> {
         if self.current_page_table.is_null() {
             return None;
@@ -424,7 +797,9 @@ impl Memory {
         if backing == 0 {
             return None;
         }
-        Some(backing + vaddr)
+        // backing was computed via wrapping_sub in map_pages, so the cancellation
+        // here (backing + vaddr) must also wrap to recover the device address.
+        Some(backing.wrapping_add(vaddr))
     }
 
     fn handle_rasterizer_write(&self, vaddr: u64, size: usize) {
@@ -448,9 +823,95 @@ impl Memory {
         }
     }
 
+    fn page_type_at(&self, vaddr: u64) -> Option<PageType> {
+        if self.current_page_table.is_null() {
+            return None;
+        }
+        let pt = unsafe { &*self.current_page_table };
+        let page_idx = (vaddr >> PAGE_BITS) as usize;
+        if page_idx >= pt.pointers.size() {
+            return None;
+        }
+        Some(PageInfo::extract_type(pt.pointers[page_idx].raw_value()))
+    }
+
+    fn perform_cache_operation<F>(
+        &self,
+        dest_addr: u64,
+        size: usize,
+        mut on_rasterizer: F,
+    ) -> ResultCode
+    where
+        F: FnMut(u64, usize),
+    {
+        let mut remaining = size;
+        let mut vaddr = dest_addr;
+
+        while remaining > 0 {
+            let page_offset = (vaddr & PAGE_MASK) as usize;
+            let block_size = ((PAGE_SIZE as usize) - page_offset).min(remaining);
+
+            if self.get_pointer_impl(vaddr).is_null() {
+                log::error!("Unmapped cache maintenance @ {:#018x}", vaddr);
+                return RESULT_INVALID_CURRENT_MEMORY;
+            }
+
+            if self.page_type_at(vaddr) == Some(PageType::RasterizerCachedMemory) {
+                on_rasterizer(vaddr, block_size);
+            }
+
+            vaddr += block_size as u64;
+            remaining -= block_size;
+        }
+
+        RESULT_SUCCESS
+    }
+
+    /// Invalidates a range of bytes within the current process address space.
+    ///
+    /// Matches upstream `Memory::InvalidateDataCache`: rasterizer-cached ranges
+    /// are downloaded from host GPU memory to guest memory.
+    pub fn invalidate_data_cache(&self, dest_addr: u64, size: usize) -> ResultCode {
+        self.perform_cache_operation(dest_addr, size, |current_vaddr, block_size| {
+            let Some(device_addr) = self.current_physical_address(current_vaddr) else {
+                return;
+            };
+            if !self.system.is_null() {
+                if let Some(gpu) = self.system.get().gpu_core() {
+                    // Upstream routes this through GPU::OnCPURead. Ruzu's public
+                    // bridge does not expose OnCPURead yet, so use the existing
+                    // flush path that downloads rasterizer data for the region.
+                    gpu.flush_region(device_addr, block_size as u64);
+                }
+            }
+        })
+    }
+
+    /// Stores a range of bytes within the current process address space.
+    ///
+    /// Matches upstream `Memory::StoreDataCache`: CPU flush -> GPU invalidate.
+    pub fn store_data_cache(&self, dest_addr: u64, size: usize) -> ResultCode {
+        self.perform_cache_operation(dest_addr, size, |current_vaddr, block_size| {
+            self.handle_rasterizer_write(current_vaddr, block_size);
+        })
+    }
+
+    /// Flushes a range of bytes within the current process address space.
+    ///
+    /// Matches upstream `Memory::FlushDataCache`: CPU flush -> GPU invalidate.
+    pub fn flush_data_cache(&self, dest_addr: u64, size: usize) -> ResultCode {
+        self.perform_cache_operation(dest_addr, size, |current_vaddr, block_size| {
+            self.handle_rasterizer_write(current_vaddr, block_size);
+        })
+    }
+
     /// Get a host pointer for a guest virtual address.
     /// Matches upstream `Memory::GetPointer`.
     pub fn get_pointer(&self, vaddr: u64) -> *mut u8 {
+        // RUZU_TRACE_GET_POINTER_PAGE=0xPAGEVADDR — log every get_pointer
+        // call returning a pointer within the same 4 KB page as PAGEVADDR.
+        // Used to find HLE callers that bypass write_64/write_block.
+        trace_get_pointer_page("get_pointer", vaddr);
         let ptr = self.get_pointer_impl(vaddr);
         if ptr.is_null() {
             log::error!("Unmapped GetPointer @ {:#018x}", vaddr);
@@ -461,6 +922,7 @@ impl Memory {
     /// Get a host pointer without logging on unmapped addresses.
     /// Matches upstream `Memory::GetPointerSilent`.
     pub fn get_pointer_silent(&self, vaddr: u64) -> *mut u8 {
+        trace_get_pointer_page("get_pointer_silent", vaddr);
         self.get_pointer_impl(vaddr)
     }
 
@@ -583,6 +1045,20 @@ impl Memory {
 
     /// Write a u64 (LE). Matches upstream `Memory::Write64`.
     pub fn write_64(&self, vaddr: u64, data: u64) {
+        // RUZU_TRACE_MEMORY_W64_AT_VADDR=0xVADDR — log every call into
+        // Memory::write_64 with vaddr matching. Catches any Rust-side
+        // write (HLE, kernel, etc.) that bypasses the JIT callback.
+        if let Ok(spec) = std::env::var("RUZU_TRACE_MEMORY_W64_AT_VADDR") {
+            if let Ok(target) = u64::from_str_radix(spec.trim_start_matches("0x"), 16) {
+                if vaddr == target {
+                    let bt = std::backtrace::Backtrace::force_capture();
+                    eprintln!(
+                        "[MEMORY_W64] vaddr=0x{:016X} data=0x{:016X}\n{}",
+                        vaddr, data, bt
+                    );
+                }
+            }
+        }
         self.handle_rasterizer_write(vaddr, std::mem::size_of::<u64>());
         if (vaddr & 7) == 0 {
             unsafe { self.write_raw::<u64>(vaddr, data) }
@@ -663,6 +1139,18 @@ impl Memory {
         // Upstream: AddressSpaceContains check before walking pages.
         if !self.address_space_contains(dest_addr, size) {
             log::error!("Unmapped WriteBlock @ {:#018x} size={:#x}", dest_addr, size);
+            if std::env::var_os("RUZU_TRACE_UNMAPPED_BT").is_some() {
+                use std::sync::atomic::{AtomicU32, Ordering};
+                static SHOWN: AtomicU32 = AtomicU32::new(0);
+                let n = SHOWN.fetch_add(1, Ordering::Relaxed);
+                if n < 5 {
+                    let bt = std::backtrace::Backtrace::force_capture();
+                    eprintln!(
+                        "[UNMAPPED_WB_BT #{}] dest=0x{:016X} size=0x{:X}\n{}",
+                        n, dest_addr, size, bt
+                    );
+                }
+            }
             return false;
         }
 
@@ -934,8 +1422,17 @@ impl Memory {
         }
     }
 
-    /// Exclusive write 128-bit with two 64-bit atomic CAS operations.
-    /// Matches upstream `Memory::WriteExclusive128`.
+    /// Exclusive write 128-bit. Matches upstream `Memory::WriteExclusive128`
+    /// which calls `Common::AtomicCompareAndSwap` (= `_InterlockedCompareExchange128`
+    /// on MSVC, `__sync_bool_compare_and_swap` on GCC/Clang for `__int128`).
+    ///
+    /// On x86_64 hosts this lowers to a single `lock cmpxchg16b` — atomic
+    /// against any concurrent 8/16-byte load or store at the same 16-byte
+    /// boundary. The previous two-step 64-bit CAS implementation was a
+    /// structural divergence from upstream: it could observe or produce
+    /// torn writes when another core read/wrote the same 16-byte slot
+    /// between the two halves.
+    #[cfg(target_arch = "x86_64")]
     pub fn write_exclusive_128(
         &self,
         vaddr: u64,
@@ -944,16 +1441,159 @@ impl Memory {
         expected_lo: u64,
         expected_hi: u64,
     ) -> bool {
-        // Upstream uses AtomicCompareAndSwap for 128-bit. On x86-64 without
-        // native 128-bit CAS, fall back to two 64-bit CAS operations.
-        // The low half must succeed before attempting the high half.
+        let ptr = self.get_pointer_impl(vaddr);
+        if ptr.is_null() {
+            log::error!("Unmapped WriteExclusive128 @ {:#018x}", vaddr);
+            return true;
+        }
+        // 16-byte alignment is a hardware requirement for cmpxchg16b.
+        // dynarmic only emits STXP for 16-byte-aligned vaddrs per ARM ARM.
+        unsafe { cmpxchg16b(ptr, value_lo, value_hi, expected_lo, expected_hi) }
+    }
+
+    /// Non-x86_64 fallback: two 64-bit CAS (NOT atomic across the boundary).
+    /// Matches the previous behavior on platforms without `cmpxchg16b`.
+    #[cfg(not(target_arch = "x86_64"))]
+    pub fn write_exclusive_128(
+        &self,
+        vaddr: u64,
+        value_lo: u64,
+        value_hi: u64,
+        expected_lo: u64,
+        expected_hi: u64,
+    ) -> bool {
         let lo_ok = self.write_exclusive_64(vaddr, value_lo, expected_lo);
         if !lo_ok {
             return false;
         }
         self.write_exclusive_64(vaddr + 8, value_hi, expected_hi)
     }
+}
 
+/// Atomic 128-bit compare-and-swap on a 16-byte aligned pointer.
+///
+/// Returns `true` if `[ptr..ptr+16] == expected_lo:expected_hi` and the
+/// 16-byte value was swapped to `value_lo:value_hi`. Returns `false`
+/// otherwise (and memory is unchanged).
+///
+/// # Safety
+/// - `ptr` must point to a 16-byte aligned, writable u128 location.
+/// - Concurrent accesses to the same location must use compatible atomic
+///   operations (lock cmpxchg16b, lock dec, etc.) to be sequentially consistent.
+#[cfg(target_arch = "x86_64")]
+#[inline]
+unsafe fn cmpxchg16b(
+    ptr: *mut u8,
+    value_lo: u64,
+    value_hi: u64,
+    expected_lo: u64,
+    expected_hi: u64,
+) -> bool {
+    debug_assert!(
+        (ptr as usize) & 0xF == 0,
+        "cmpxchg16b: misaligned ptr {:p}",
+        ptr
+    );
+    let success: u8;
+    std::arch::asm!(
+        "xchg rbx, {rbx_save}",
+        "lock cmpxchg16b [{ptr}]",
+        "setz {success}",
+        "mov rbx, {rbx_save}",
+        ptr = in(reg) ptr,
+        rbx_save = inout(reg) value_lo => _,
+        inout("rax") expected_lo => _,
+        inout("rdx") expected_hi => _,
+        in("rcx") value_hi,
+        success = lateout(reg_byte) success,
+        options(nostack),
+    );
+    success != 0
+}
+
+#[cfg(test)]
+mod cmpxchg16b_tests {
+    #[cfg(target_arch = "x86_64")]
+    use super::cmpxchg16b;
+
+    #[cfg(target_arch = "x86_64")]
+    #[repr(align(16))]
+    struct Aligned16([u64; 2]);
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn success_on_match() {
+        let mut slot = Aligned16([0xDEADBEEF_CAFEBABE, 0x0123456789ABCDEF]);
+        let ok = unsafe {
+            cmpxchg16b(
+                slot.0.as_mut_ptr() as *mut u8,
+                0x1111_2222_3333_4444,
+                0x5555_6666_7777_8888,
+                0xDEADBEEF_CAFEBABE,
+                0x0123456789ABCDEF,
+            )
+        };
+        assert!(ok);
+        assert_eq!(slot.0[0], 0x1111_2222_3333_4444);
+        assert_eq!(slot.0[1], 0x5555_6666_7777_8888);
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn failure_on_mismatch_leaves_memory_unchanged() {
+        let mut slot = Aligned16([0x1111_1111_1111_1111, 0x2222_2222_2222_2222]);
+        let ok = unsafe {
+            cmpxchg16b(
+                slot.0.as_mut_ptr() as *mut u8,
+                0xAAAA,
+                0xBBBB,
+                0xDEAD, // wrong expected
+                0xBEEF,
+            )
+        };
+        assert!(!ok);
+        assert_eq!(slot.0[0], 0x1111_1111_1111_1111);
+        assert_eq!(slot.0[1], 0x2222_2222_2222_2222);
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn failure_on_hi_mismatch_only() {
+        // The atomicity contract specifically requires that mismatching
+        // EITHER half causes the swap to fail. The previous two-step
+        // 64-bit-CAS implementation would partially succeed (lo swapped,
+        // hi failed → memory left with new_lo + old_hi). True
+        // cmpxchg16b leaves BOTH halves unchanged.
+        let mut slot = Aligned16([0xAAAA, 0xBBBB]);
+        let ok = unsafe {
+            cmpxchg16b(
+                slot.0.as_mut_ptr() as *mut u8,
+                0x1111,
+                0x2222,
+                0xAAAA, // matches lo
+                0xCCCC, // does NOT match hi
+            )
+        };
+        assert!(!ok);
+        assert_eq!(slot.0[0], 0xAAAA);
+        assert_eq!(slot.0[1], 0xBBBB);
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn round_trip_all_ones_to_all_zeros_and_back() {
+        let mut slot = Aligned16([0u64, 0u64]);
+        let ok1 = unsafe { cmpxchg16b(slot.0.as_mut_ptr() as *mut u8, u64::MAX, u64::MAX, 0, 0) };
+        assert!(ok1);
+        assert_eq!(slot.0, [u64::MAX, u64::MAX]);
+
+        let ok2 = unsafe { cmpxchg16b(slot.0.as_mut_ptr() as *mut u8, 0, 0, u64::MAX, u64::MAX) };
+        assert!(ok2);
+        assert_eq!(slot.0, [0, 0]);
+    }
+}
+
+impl Memory {
     /// Invalidate a separate heap fault address.
     ///
     /// Upstream: `Memory::InvalidateSeparateHeap(void* fault_address)` (memory.cpp:1104).
@@ -1010,14 +1650,18 @@ impl Memory {
             let orig_base = base_page;
             let mut page = base_page as usize;
             while page < end as usize {
-                // Compute host pointer: DeviceMemory base + physical offset - virtual page offset
+                // Compute host pointer: DeviceMemory base + physical offset - virtual page offset.
+                // The result is intended to be used as host_ptr + page*PAGE_SIZE, so the per-iteration
+                // delta is a constant — debug builds otherwise hit "subtract with overflow" when the
+                // virtual page index is numerically larger than the physical offset (release-mode
+                // wraparound is the intended behavior; restore it explicitly).
                 let host_ptr = unsafe {
                     let dm = &*self.device_memory;
-                    dm.buffer.backing_base_pointer() as usize
-                        + (target - dram_memory_map::BASE) as usize
-                        - (page << PAGE_BITS)
+                    (dm.buffer.backing_base_pointer() as usize)
+                        .wrapping_add((target - dram_memory_map::BASE) as usize)
+                        .wrapping_sub(page << PAGE_BITS)
                 };
-                let backing = target as usize - (page << PAGE_BITS);
+                let backing = (target as usize).wrapping_sub(page << PAGE_BITS);
 
                 page_table.pointers[page].store(host_ptr, page_type);
                 page_table.backing_addr[page] = backing as u64;

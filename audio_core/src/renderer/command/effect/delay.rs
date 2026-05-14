@@ -41,34 +41,73 @@ impl DelayPayload {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 #[repr(C)]
 pub struct DelayState {
-    pub sample_count_max: [u32; MAX_CHANNELS as usize],
-    pub sample_count: [u32; MAX_CHANNELS as usize],
-    pub buffer_pos: [u32; MAX_CHANNELS as usize],
+    pub unk_000: [i32; 8],
+    pub delay_lines: [DelayLine; MAX_CHANNELS as usize],
     pub feedback_gain: f32,
     pub delay_feedback_gain: f32,
     pub delay_feedback_cross_gain: f32,
     pub lowpass_gain: f32,
     pub lowpass_feedback_gain: f32,
     pub lowpass_z: [f32; MAX_CHANNELS as usize],
-    pub _padding0: [u8; 0x490],
+}
+
+const _: () = assert!(std::mem::size_of::<DelayState>() <= 0x500);
+
+#[derive(Debug, Clone)]
+#[repr(C)]
+pub struct DelayLine {
+    pub sample_count_max: i32,
+    pub sample_count: i32,
+    pub buffer: Vec<f32>,
+    pub buffer_pos: u32,
+    pub decay_rate: f32,
+}
+
+impl DelayLine {
+    fn read(&self) -> f32 {
+        if self.buffer.is_empty() {
+            return 0.0;
+        }
+        self.buffer[self.buffer_pos as usize]
+    }
+
+    fn write(&mut self, value: f32) {
+        if self.buffer.is_empty() {
+            self.buffer.push(0.0);
+            self.sample_count = 1;
+            self.buffer_pos = 0;
+        }
+        self.buffer[self.buffer_pos as usize] = value;
+        self.buffer_pos = (self.buffer_pos + 1) % self.buffer.len() as u32;
+    }
+}
+
+impl Default for DelayLine {
+    fn default() -> Self {
+        Self {
+            sample_count_max: 0,
+            sample_count: 0,
+            buffer: Vec::new(),
+            buffer_pos: 0,
+            decay_rate: 0.0,
+        }
+    }
 }
 
 impl Default for DelayState {
     fn default() -> Self {
         Self {
-            sample_count_max: [0; MAX_CHANNELS as usize],
-            sample_count: [0; MAX_CHANNELS as usize],
-            buffer_pos: [0; MAX_CHANNELS as usize],
+            unk_000: [0; 8],
+            delay_lines: std::array::from_fn(|_| DelayLine::default()),
             feedback_gain: 0.0,
             delay_feedback_gain: 0.0,
             delay_feedback_cross_gain: 0.0,
             lowpass_gain: 1.0,
             lowpass_feedback_gain: 0.0,
             lowpass_z: [0.0; MAX_CHANNELS as usize],
-            _padding0: [0; 0x490],
         }
     }
 }
@@ -151,9 +190,11 @@ pub fn set_delay_effect_parameter(parameter: &delay::ParameterVersion2, state: &
 pub fn initialize_delay_effect(
     parameter: &delay::ParameterVersion2,
     state: &mut DelayState,
-    workbuffer_addr: CpuAddr,
+    _workbuffer_addr: CpuAddr,
 ) {
-    *state = DelayState::default();
+    // The state pointer references EffectInfoBase's raw state storage. Build
+    // Vec-backed delay lines in place; upstream's workbuffer parameter is unused.
+    unsafe { std::ptr::write(state, DelayState::default()) };
 
     let channel_count = parameter.channel_count.max(0) as usize;
     let sample_rate = fixed_14_to_f32(parameter.sample_rate).floor().max(0.0);
@@ -162,15 +203,14 @@ pub fn initialize_delay_effect(
     let delay_samples =
         (((parameter.delay_time.max(0) as f32) * sample_rate) / 1000.0).floor() as u32;
 
-    let mut total_samples = 0usize;
     for channel in 0..channel_count.min(MAX_CHANNELS as usize) {
-        let channel_samples = delay_samples.min(sample_count_max).max(1);
-        state.sample_count_max[channel] = sample_count_max;
-        state.sample_count[channel] = channel_samples;
-        total_samples = total_samples.saturating_add(channel_samples as usize);
-    }
-    if let Some(workbuffer) = read_f32_slice_mut(workbuffer_addr, total_samples) {
-        workbuffer.fill(0.0);
+        let channel_samples = delay_samples.min(sample_count_max);
+        let buffer_len = channel_samples.max(1) as usize;
+        state.delay_lines[channel].sample_count_max = sample_count_max as i32;
+        state.delay_lines[channel].sample_count = channel_samples as i32;
+        state.delay_lines[channel].buffer = vec![0.0; buffer_len];
+        state.delay_lines[channel].buffer_pos = 0;
+        state.delay_lines[channel].decay_rate = 1.0;
     }
 
     set_delay_effect_parameter(parameter, state);
@@ -184,7 +224,7 @@ pub fn apply_delay_effect(
     outputs: &[i16; MAX_CHANNELS as usize],
     mix_buffers: &mut [i32],
     sample_count: usize,
-    workbuffer_addr: CpuAddr,
+    _workbuffer_addr: CpuAddr,
 ) {
     let channel_count = parameter.channel_count.max(0) as usize;
     let active_channels = channel_count.min(inputs.len()).min(outputs.len());
@@ -199,17 +239,6 @@ pub fn apply_delay_effect(
         return;
     }
 
-    let total_delay_samples = (0..active_channels)
-        .map(|channel| state.sample_count[channel].max(1) as usize)
-        .sum();
-    let Some(delay_buffer) = read_f32_slice_mut(workbuffer_addr, total_delay_samples) else {
-        for channel in 0..active_channels {
-            copy_mix_buffer(mix_buffers, sample_count, outputs[channel], inputs[channel]);
-        }
-        return;
-    };
-    let offsets = delay_workbuffer_offsets(state, active_channels);
-
     let in_gain = fixed_14_to_f32(parameter.in_gain);
     let wet_gain = fixed_14_to_f32(parameter.wet_gain);
     let dry_gain = fixed_14_to_f32(parameter.dry_gain);
@@ -222,9 +251,7 @@ pub fn apply_delay_effect(
             input_samples[channel] =
                 mix_buffer_sample(mix_buffers, inputs[channel], sample_count, sample_index) as f32;
 
-            let channel_samples = state.sample_count[channel].max(1) as usize;
-            let pos = (state.buffer_pos[channel] as usize) % channel_samples;
-            delay_samples[channel] = delay_buffer[offsets[channel] + pos];
+            delay_samples[channel] = state.delay_lines[channel].read();
         }
 
         let mut gained_samples = [0.0f32; MAX_CHANNELS as usize];
@@ -239,10 +266,7 @@ pub fn apply_delay_effect(
         for channel in 0..active_channels {
             state.lowpass_z[channel] = gained_samples[channel] * state.lowpass_gain
                 + state.lowpass_z[channel] * state.lowpass_feedback_gain;
-            let channel_samples = state.sample_count[channel].max(1) as usize;
-            let pos = (state.buffer_pos[channel] as usize) % channel_samples;
-            delay_buffer[offsets[channel] + pos] = state.lowpass_z[channel];
-            state.buffer_pos[channel] = ((pos + 1) % channel_samples) as u32;
+            state.delay_lines[channel].write(state.lowpass_z[channel]);
         }
 
         for channel in 0..active_channels {
@@ -268,28 +292,8 @@ fn read_delay_state_mut(addr: CpuAddr) -> Option<&'static mut DelayState> {
     Some(unsafe { &mut *(addr as *mut DelayState) })
 }
 
-fn read_f32_slice_mut(addr: CpuAddr, len: usize) -> Option<&'static mut [f32]> {
-    if addr == 0 {
-        return None;
-    }
-    Some(unsafe { std::slice::from_raw_parts_mut(addr as *mut f32, len) })
-}
-
 fn fixed_14_to_f32(value: i32) -> f32 {
     value as f32 / 16384.0
-}
-
-fn delay_workbuffer_offsets(
-    state: &DelayState,
-    channel_count: usize,
-) -> [usize; MAX_CHANNELS as usize] {
-    let mut offsets = [0usize; MAX_CHANNELS as usize];
-    let mut current = 0usize;
-    for channel in 0..channel_count.min(MAX_CHANNELS as usize) {
-        offsets[channel] = current;
-        current = current.saturating_add(state.sample_count[channel].max(1) as usize);
-    }
-    offsets
 }
 
 fn delay_matrix_value(state: &DelayState, channel_count: usize, src: usize, dst: usize) -> f32 {

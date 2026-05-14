@@ -102,8 +102,11 @@ impl HostMemoryImpl {
                 ));
             }
 
-            // Enable huge pages
-            libc::madvise(virtual_map_base, virtual_size, libc::MADV_HUGEPAGE);
+            // Enable huge pages (skip when RUZU_NO_HUGEPAGE=1; diagnostic for
+            // multi-thread mmap THP interactions).
+            if std::env::var_os("RUZU_NO_HUGEPAGE").is_none() {
+                libc::madvise(virtual_map_base, virtual_size, libc::MADV_HUGEPAGE);
+            }
 
             let free_manager = FreeRegionManager::new();
             free_manager.set_address_space(virtual_map_base as *mut u8, virtual_size);
@@ -158,6 +161,25 @@ impl HostMemoryImpl {
                 host_offset as libc::off_t,
             );
             assert!(ret != libc::MAP_FAILED, "mmap failed during Map");
+            // RUZU_TRACE_HOST_MMAP=0xVADDR — log HostMemoryImpl::map calls
+            // whose `vo` (= passed virtual_offset) covers the GUEST vaddr.
+            // Used to verify fastmem arena mapping actually happens for
+            // the mstate region.
+            if let Ok(spec) = std::env::var("RUZU_TRACE_HOST_MMAP") {
+                if let Ok(target_vaddr) =
+                    u64::from_str_radix(spec.trim().trim_start_matches("0x"), 16)
+                {
+                    // `vo` is the offset within virtual_base; for our setup,
+                    // it equals the guest vaddr (the JIT uses R13 + vaddr).
+                    if (vo as u64) <= target_vaddr && target_vaddr < (vo as u64) + len as u64 {
+                        let mmap_target_va = self.virtual_base.add(vo) as u64;
+                        eprintln!(
+                            "[HOST_MMAP] virtual_base={:p} vo=0x{:X} mmap_target_host_va=0x{:X} len=0x{:X} fd={} host_offset=0x{:X} flags=0x{:X} perms={:?} ret={:p}",
+                            self.virtual_base, vo, mmap_target_va, len, self.fd, host_offset, flags, perms, ret
+                        );
+                    }
+                }
+            }
         }
     }
 
@@ -193,6 +215,20 @@ impl HostMemoryImpl {
         write: bool,
         _execute: bool,
     ) {
+        // RUZU_TRACE_HOST_MMAP=0xVADDR — also log protect calls covering it.
+        if let Ok(spec) = std::env::var("RUZU_TRACE_HOST_MMAP") {
+            if let Ok(target_vaddr) = u64::from_str_radix(spec.trim().trim_start_matches("0x"), 16)
+            {
+                if (virtual_offset as u64) <= target_vaddr
+                    && target_vaddr < (virtual_offset as u64) + length as u64
+                {
+                    eprintln!(
+                        "[HOST_PROTECT] vo=0x{:X} len=0x{:X} read={} write={}",
+                        virtual_offset, length, read, write
+                    );
+                }
+            }
+        }
         let (mut vo, mut len) = (virtual_offset, length);
         self.adjust_map(&mut vo, &mut len);
         if len == 0 {

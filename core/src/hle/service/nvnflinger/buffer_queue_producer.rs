@@ -1061,7 +1061,9 @@ impl IBinder for BufferQueueProducer {
             event_owner.initialize(owner_process_id, readable_event_object_id);
             readable_event.initialize(event_object_id, readable_event_object_id);
             if signaled {
-                readable_event.is_signaled = true;
+                readable_event
+                    .is_signaled
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
             }
 
             let event_owner = Arc::new(Mutex::new(event_owner));
@@ -1164,13 +1166,13 @@ mod tests {
         let producer = BufferQueueProducer::new(test_service_context(), core, test_nvmap());
         producer.register_native_handle_owner(process, scheduler);
         let event = producer.get_native_handle(0).unwrap();
-        assert!(!event.lock().unwrap().is_signaled);
+        assert!(!event.lock().unwrap().is_signaled());
 
         let (status, _) = producer.connect(None, NativeWindowApi::Egl, false);
         assert_eq!(status, Status::NoError);
         assert_eq!(producer.disconnect(NativeWindowApi::Egl), Status::NoError);
 
-        assert!(event.lock().unwrap().is_signaled);
+        assert!(event.lock().unwrap().is_signaled());
     }
 
     #[test]
@@ -1187,7 +1189,7 @@ mod tests {
             producer.set_preallocated_buffer(0, Some(buffer)),
             Status::NoError
         );
-        assert!(event.lock().unwrap().is_signaled);
+        assert!(event.lock().unwrap().is_signaled());
 
         let inner = core.mutex.lock().unwrap();
         assert_eq!(inner.default_width, 1280);

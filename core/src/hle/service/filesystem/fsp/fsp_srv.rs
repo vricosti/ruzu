@@ -357,7 +357,10 @@ impl FspSrv {
         let fsc_for_size = Arc::clone(fsc);
         let size_getter = SizeGetter {
             get_free_size: Box::new(move || {
-                fsc_for_size.lock().unwrap().get_free_space_size(StorageId::SdCard)
+                fsc_for_size
+                    .lock()
+                    .unwrap()
+                    .get_free_space_size(StorageId::SdCard)
             }),
             get_total_size: Box::new(move || {
                 fsc.lock().unwrap().get_total_space_size(StorageId::SdCard)

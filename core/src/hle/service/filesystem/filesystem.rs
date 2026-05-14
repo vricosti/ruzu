@@ -637,13 +637,18 @@ mod tests {
         set_ruzu_path(RuzuPath::SDMCDir, &sdmc);
 
         let mut controller = FileSystemController::new();
-        controller.create_factories(crate::file_sys::vfs::vfs_real::RealVfsFilesystem::new(), false);
+        controller.create_factories(
+            crate::file_sys::vfs::vfs_real::RealVfsFilesystem::new(),
+            false,
+        );
 
         let opened = controller.open_sdmc().unwrap();
         assert!(opened
             .get_file_relative("share/supertuxkart/data/supertuxkart.1.5")
             .is_some());
-        assert!(controller.get_free_space_size(crate::file_sys::romfs_factory::StorageId::SdCard) > 0);
+        assert!(
+            controller.get_free_space_size(crate::file_sys::romfs_factory::StorageId::SdCard) > 0
+        );
         assert_eq!(
             controller.get_total_space_size(crate::file_sys::romfs_factory::StorageId::SdCard),
             0x10000000000

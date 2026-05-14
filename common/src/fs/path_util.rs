@@ -526,7 +526,7 @@ pub fn get_path_without_top(path: &str) -> &str {
     let name_index = name_bck_index.min(name_fwd_index);
 
     if name_index == usize::MAX {
-        return "";
+        return s;
     }
 
     &s[name_index + 1..]
@@ -669,6 +669,8 @@ mod tests {
     #[test]
     fn test_get_path_without_top() {
         assert_eq!(get_path_without_top("/top/rest/of/path"), "rest/of/path");
+        assert_eq!(get_path_without_top("top/rest/of/path"), "rest/of/path");
+        assert_eq!(get_path_without_top("single"), "single");
     }
 
     #[test]

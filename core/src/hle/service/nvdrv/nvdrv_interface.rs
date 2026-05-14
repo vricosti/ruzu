@@ -49,6 +49,11 @@ impl NvdrvInterface {
         std::env::var_os("RUZU_NVDRV_TRACE").is_some_and(|value| value != std::ffi::OsStr::new("0"))
     }
 
+    fn should_trace_ioctl_fp() -> bool {
+        std::env::var_os("RUZU_TRACE_IOCTL_FP")
+            .is_some_and(|value| value != std::ffi::OsStr::new("0"))
+    }
+
     fn should_trace_ioctl_payload(command: Ioctl) -> bool {
         matches!(
             command.raw,
@@ -76,6 +81,17 @@ impl NvdrvInterface {
             .map(|b| format!("{:02X}", b))
             .collect::<Vec<_>>()
             .join(" ")
+    }
+
+    fn format_ioctl_fp_hex(bytes: &[u8]) -> String {
+        let mut hex = String::new();
+        for (i, byte) in bytes.iter().take(0x40).enumerate() {
+            if i > 0 && (i & 3) == 0 {
+                hex.push(' ');
+            }
+            hex.push_str(&format!("{:02x}", byte));
+        }
+        hex
     }
 
     pub fn new(nvdrv: Arc<Module>) -> Self {
@@ -171,6 +187,16 @@ impl NvdrvInterface {
             command.raw,
             nv_result
         );
+        if Self::should_trace_ioctl_fp() {
+            eprintln!(
+                "[IOCTL_FP] fd={} ioctl=0x{:08X} out_sz=0x{:x} nv_result=0x{:x} head={}",
+                fd,
+                command.raw,
+                output.len(),
+                nv_result as u32,
+                Self::format_ioctl_fp_hex(output)
+            );
+        }
         if Self::should_trace_ioctl_payload(command) {
             log::trace!(
                 "Ioctl1 output fd={} ioctl=0x{:08X} len=0x{:X} bytes=[{}]",

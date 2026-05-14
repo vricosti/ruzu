@@ -63,6 +63,9 @@ impl SdlGlContext {
     pub fn swap_buffers(&self) {
         // Maps to: SDL_GL_SwapWindow(window)
         unsafe { sdl::SDL_GL_SwapWindow(self.window) };
+        if std::env::var_os("RUZU_TRACE_PRESENT").is_some() {
+            log::info!("[PRESENT] SDL_GL_SwapWindow");
+        }
     }
 
     /// Makes this context current on the calling thread.
@@ -75,6 +78,12 @@ impl SdlGlContext {
         }
         let ret = unsafe { sdl::SDL_GL_MakeCurrent(self.window, self.context) };
         self.is_current = ret == 0;
+        if ret != 0 {
+            let err = unsafe { CStr::from_ptr(sdl::SDL_GetError()) }.to_string_lossy();
+            log::error!("SDL_GL_MakeCurrent failed: {}", err);
+        } else if std::env::var_os("RUZU_TRACE_PRESENT").is_some() {
+            log::info!("[PRESENT] SDL_GL_MakeCurrent");
+        }
     }
 
     /// Releases this context from the calling thread.

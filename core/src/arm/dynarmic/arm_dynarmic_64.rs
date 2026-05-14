@@ -137,7 +137,10 @@ fn dump_vec_at_pcs() -> &'static [u64] {
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .filter_map(|s| {
-                let s = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")).unwrap_or(s);
+                let s = s
+                    .strip_prefix("0x")
+                    .or_else(|| s.strip_prefix("0X"))
+                    .unwrap_or(s);
                 u64::from_str_radix(s, 16).ok()
             })
             .collect()
@@ -151,10 +154,11 @@ fn dump_vec_at_pc(cb: &DynarmicCallbacks64) {
     if pcs.is_empty() {
         return;
     }
-    let Some(pc_ptr) = cb.jit_pc_ptr else { return; };
-    let jit_state_ptr = unsafe {
-        (pc_ptr as *const u8).sub(A64JitState::offset_of_pc()) as *const A64JitState
+    let Some(pc_ptr) = cb.jit_pc_ptr else {
+        return;
     };
+    let jit_state_ptr =
+        unsafe { (pc_ptr as *const u8).sub(A64JitState::offset_of_pc()) as *const A64JitState };
     let jit_state = unsafe { &*jit_state_ptr };
     if !pcs.contains(&jit_state.pc) {
         return;
@@ -281,6 +285,54 @@ fn translate_halt_reason(hr: rdynarmic::halt_reason::HaltReason) -> HaltReason {
     }
 
     result
+}
+
+/// Per-emulator-core atomic counters for `RUZU_COUNT_W64_BY_CORE_AT_VADDR`.
+/// 16 slots covers any reasonable core count. Indexed by `core_index`.
+static W64_BY_CORE_COUNTERS: [std::sync::atomic::AtomicU64; 16] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+
+/// Print the per-core W64 counter snapshot. Async-signal-safe (uses
+/// `eprintln!` which acquires stdout lock — fine outside the signal handler).
+/// Call from a SIGUSR2 handler to dump cumulative counts.
+pub fn dump_w64_by_core_counters() {
+    eprintln!("{}", w64_by_core_summary_string());
+}
+
+/// String form of the per-core W64 counter snapshot. Useful for log files
+/// when stderr is being flooded by other emitters.
+pub fn w64_by_core_summary_string() -> String {
+    use std::fmt::Write;
+    let mut out = String::with_capacity(256);
+    out.push_str("[W64_BY_CORE_SUMMARY] hits per emulator core:");
+    let mut any = false;
+    for (i, c) in W64_BY_CORE_COUNTERS.iter().enumerate() {
+        let v = c.load(std::sync::atomic::Ordering::Relaxed);
+        if v > 0 {
+            let _ = write!(out, "\n  core={}: {}", i, v);
+            any = true;
+        }
+    }
+    if !any {
+        out.push_str("\n  (no hits)");
+    }
+    out
 }
 
 /// JIT callbacks for ARM64.
@@ -567,7 +619,103 @@ x19=0x{:016X} x20=0x{:016X} x21=0x{:016X} x22=0x{:016X} x25=0x{:016X}",
 
     fn memory_read_64(&self, vaddr: u64) -> u64 {
         self.check_memory_access(vaddr, 8);
+        // RUZU_SNAPSHOT_VADDR=0xADDR — on every slow-path Read64, also
+        // probe [ADDR] via slow path and log when its value first
+        // changes from the initial reading. Used to bisect when a
+        // mutating write first corrupts a tracked location, since
+        // direct-fastmem stores are invisible to write callbacks.
+        if let Ok(spec) = std::env::var("RUZU_SNAPSHOT_VADDR") {
+            let target = u64::from_str_radix(spec.trim().trim_start_matches("0x"), 16).unwrap_or(0);
+            if target != 0 {
+                use std::sync::atomic::{AtomicU64, Ordering};
+                static LAST: AtomicU64 = AtomicU64::new(u64::MAX);
+                static SHOWN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                let cur = if let Some(ref cm) = self.core_memory {
+                    let m = cm.lock().unwrap();
+                    if m.is_valid_virtual_address_range(target, 8) {
+                        m.read_64(target)
+                    } else {
+                        u64::MAX
+                    }
+                } else {
+                    let m = self.memory.read().unwrap();
+                    if m.is_valid_range(target, 8) {
+                        m.read_64(target)
+                    } else {
+                        u64::MAX
+                    }
+                };
+                let prev = LAST.swap(cur, Ordering::Relaxed);
+                // Only log on TRANSITION from "valid heap addr" (top 24 bits zero,
+                // i.e. value <= 0xFF_FFFF_FFFF) to "out-of-range" (top 24 bits set),
+                // OR on the very first time the value crosses out-of-range.
+                let prev_oor = prev != u64::MAX && prev > 0xFF_FFFF_FFFFu64;
+                let cur_oor = cur != u64::MAX && cur > 0xFF_FFFF_FFFFu64;
+                let log_now = prev != cur && prev != u64::MAX && (cur_oor != prev_oor || cur_oor);
+                // ALSO compare against fastmem-arena read for this same vaddr.
+                let arena_value: u64 = if let Some(ref cm) = self.core_memory {
+                    let arena = cm.lock().unwrap().fastmem_pointer();
+                    if !arena.is_null() {
+                        unsafe {
+                            std::ptr::read_unaligned(arena.add(target as usize) as *const u64)
+                        }
+                    } else {
+                        0
+                    }
+                } else {
+                    0
+                };
+                let arena_differs_from_slow = arena_value != cur && cur != u64::MAX;
+                if log_now || arena_differs_from_slow {
+                    let n = SHOWN.fetch_add(1, Ordering::Relaxed);
+                    if n < 1024 {
+                        if let Some(pc_ptr) = self.jit_pc_ptr {
+                            let jit_state_ptr = unsafe {
+                                (pc_ptr as *const u8).sub(A64JitState::offset_of_pc())
+                                    as *const A64JitState
+                            };
+                            let s = unsafe { &*jit_state_ptr };
+                            eprintln!(
+                                "[SNAPSHOT #{}] [0x{:016X}] slow=0x{:016X} arena=0x{:016X} differ={} prev=0x{:016X} (around pc=0x{:016X} lr=0x{:016X} via Read64@0x{:X})",
+                                n, target, cur, arena_value, arena_differs_from_slow, prev, s.pc, s.reg[30], vaddr
+                            );
+                        }
+                    }
+                }
+            }
+        }
         dump_vec_at_pc(self);
+        // RUZU_TRACE_R64_AT_VADDR=0xADDR/0xMASK — log on every Read64 whose
+        // (vaddr & MASK) == (ADDR & MASK). Used for catching tagged-pointer
+        // / out-of-range accesses (e.g. STK reads at 0x00ff_0000_0000_xxxx).
+        if let Ok(spec) = std::env::var("RUZU_TRACE_R64_AT_VADDR") {
+            let mut parts = spec.splitn(2, '/');
+            let addr_str = parts.next().unwrap_or("");
+            let mask_str = parts.next().unwrap_or("0xFFFFFFFFFFFFFFFF");
+            let target = u64::from_str_radix(addr_str.trim_start_matches("0x"), 16).unwrap_or(0);
+            let mask = u64::from_str_radix(mask_str.trim_start_matches("0x"), 16).unwrap_or(!0);
+            if (vaddr & mask) == (target & mask) {
+                use std::sync::atomic::{AtomicU32, Ordering};
+                static SHOWN: AtomicU32 = AtomicU32::new(0);
+                let n = SHOWN.fetch_add(1, Ordering::Relaxed);
+                if n < 16 {
+                    if let Some(pc_ptr) = self.jit_pc_ptr {
+                        let jit_state_ptr = unsafe {
+                            (pc_ptr as *const u8).sub(A64JitState::offset_of_pc())
+                                as *const A64JitState
+                        };
+                        let s = unsafe { &*jit_state_ptr };
+                        eprintln!(
+                            "[R64_AT_VADDR #{}] vaddr=0x{:016X} pc=0x{:016X} lr=0x{:016X} sp=0x{:016X} \
+x0=0x{:016X} x1=0x{:016X} x2=0x{:016X} x19=0x{:016X} x20=0x{:016X} x21=0x{:016X} x22=0x{:016X}",
+                            n, vaddr, s.pc, s.reg[30], s.sp,
+                            s.reg[0], s.reg[1], s.reg[2],
+                            s.reg[19], s.reg[20], s.reg[21], s.reg[22],
+                        );
+                    }
+                }
+            }
+        }
         // RUZU_TRACE_R64_VALUE=0xVAL — log on Read64 that RETURNS the
         // target value. Inverse of W64_VALUE; used to track where a
         // sentinel value enters guest registers from memory.
@@ -614,9 +762,10 @@ x0=0x{:016X} x1=0x{:016X} x2=0x{:016X} x19=0x{:016X} x20=0x{:016X} x21=0x{:016X}
                     let jit_state = unsafe { &*jit_state_ptr };
                     let frame_chain = self.format_guest_frame_chain_for_diag(jit_state.reg[29]);
                     eprintln!(
-                        "[A64_INVALID_READ64] vaddr=0x{:016X} pc=0x{:016X} lr=0x{:016X} sp=0x{:016X} \
+                        "[A64_INVALID_READ64] core={} vaddr=0x{:016X} pc=0x{:016X} lr=0x{:016X} sp=0x{:016X} \
 x29=0x{:016X} x0=0x{:016X} x1=0x{:016X} x2=0x{:016X} x3=0x{:016X} x4=0x{:016X} x5=0x{:016X} \
 x19=0x{:016X} x20=0x{:016X} x21=0x{:016X} x22=0x{:016X} x25=0x{:016X} {}",
+                        self.core_index,
                         vaddr,
                         jit_state.pc,
                         jit_state.reg[30],
@@ -635,6 +784,101 @@ x19=0x{:016X} x20=0x{:016X} x21=0x{:016X} x22=0x{:016X} x25=0x{:016X} {}",
                         jit_state.reg[25],
                         frame_chain,
                     );
+                    if let Ok(spec) = std::env::var("RUZU_DUMP_ON_INVALID") {
+                        use std::sync::atomic::{AtomicU32, Ordering};
+                        static DUMP_COUNT: AtomicU32 = AtomicU32::new(0);
+                        let n = DUMP_COUNT.fetch_add(1, Ordering::Relaxed);
+                        if n < 4 {
+                            let mut parts = spec.splitn(2, ':');
+                            let addr = parts
+                                .next()
+                                .and_then(|s| {
+                                    u64::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok()
+                                })
+                                .unwrap_or(0);
+                            let size = parts
+                                .next()
+                                .and_then(|s| s.trim().parse::<usize>().ok())
+                                .unwrap_or(64)
+                                .min(128);
+                            if addr != 0 {
+                                let mut slow = Vec::with_capacity(size);
+                                let mut arena = Vec::with_capacity(size);
+                                for off in 0..size {
+                                    let byte_addr = addr + off as u64;
+                                    let slow_byte = if let Some(ref cm) = self.core_memory {
+                                        let m = cm.lock().unwrap();
+                                        if m.is_valid_virtual_address_range(byte_addr, 1) {
+                                            m.read_8(byte_addr)
+                                        } else {
+                                            0xff
+                                        }
+                                    } else {
+                                        let m = self.memory.read().unwrap();
+                                        if m.is_valid_range(byte_addr, 1) {
+                                            m.read_8(byte_addr)
+                                        } else {
+                                            0xff
+                                        }
+                                    };
+                                    let arena_byte = if let Some(ref cm) = self.core_memory {
+                                        let arena_ptr = cm.lock().unwrap().fastmem_pointer();
+                                        if !arena_ptr.is_null() {
+                                            unsafe { *arena_ptr.add(byte_addr as usize) }
+                                        } else {
+                                            0xff
+                                        }
+                                    } else {
+                                        0xff
+                                    };
+                                    slow.push(slow_byte);
+                                    arena.push(arena_byte);
+                                }
+                                let slow_hex = slow
+                                    .iter()
+                                    .map(|b| format!("{:02x}", b))
+                                    .collect::<Vec<_>>()
+                                    .join(" ");
+                                let arena_hex = arena
+                                    .iter()
+                                    .map(|b| format!("{:02x}", b))
+                                    .collect::<Vec<_>>()
+                                    .join(" ");
+                                eprintln!(
+                                    "[DUMP_ON_INVALID #{}] addr=0x{:016X} size={} slow={} arena={} differ={}",
+                                    n,
+                                    addr,
+                                    size,
+                                    slow_hex,
+                                    arena_hex,
+                                    slow != arena
+                                );
+                            }
+                        }
+                    }
+                    if std::env::var_os("RUZU_DUMP_X22_PLUS_16").is_some() {
+                        // Read [x22+0x10] via the slow path to see what
+                        // the stored value really is — for diagnosing the
+                        // STK fastmem-coherency wedge where the JIT reads
+                        // a corrupt free-list head pointer at this addr.
+                        let addr = jit_state.reg[22].wrapping_add(0x10);
+                        let valid = if let Some(ref cm) = self.core_memory {
+                            cm.lock().unwrap().is_valid_virtual_address_range(addr, 8)
+                        } else {
+                            self.memory.read().unwrap().is_valid_range(addr, 8)
+                        };
+                        if valid {
+                            let v = if let Some(ref cm) = self.core_memory {
+                                cm.lock().unwrap().read_64(addr)
+                            } else {
+                                self.memory.read().unwrap().read_64(addr)
+                            };
+                            eprintln!(
+                                "[A64_INVALID_READ64_X22_16] [0x{:016X}]=0x{:016X} (slow-path read of free-list head; compare to JIT's x19=0x{:016X})",
+                                addr, v, jit_state.reg[19]
+                            );
+                        }
+                    }
                     if std::env::var_os("RUZU_DUMP_INVALID_X19").is_some() {
                         let base = jit_state.reg[19];
                         let mut bytes = Vec::with_capacity(96);
@@ -657,9 +901,17 @@ x19=0x{:016X} x20=0x{:016X} x21=0x{:016X} x22=0x{:016X} x25=0x{:016X} {}",
                         }
                         let ascii: String = bytes
                             .iter()
-                            .map(|&b| if (0x20..=0x7e).contains(&b) { b as char } else { '.' })
+                            .map(|&b| {
+                                if (0x20..=0x7e).contains(&b) {
+                                    b as char
+                                } else {
+                                    '.'
+                                }
+                            })
                             .collect();
-                        eprintln!("[A64_INVALID_READ64_X19_BYTES] addr=0x{base:016X} bytes={bytes:02X?}");
+                        eprintln!(
+                            "[A64_INVALID_READ64_X19_BYTES] addr=0x{base:016X} bytes={bytes:02X?}"
+                        );
                         eprintln!("[A64_INVALID_READ64_X19_ASCII] {ascii}");
                     }
                 } else {
@@ -754,6 +1006,48 @@ x0=0x{:016X} x1=0x{:016X} x2=0x{:016X} x3=0x{:016X} x19=0x{:016X} x20=0x{:016X} 
         if !self.check_memory_access(vaddr, 1) {
             return;
         }
+        if let Ok(spec) = std::env::var("RUZU_TRACE_W_AT_VADDR") {
+            if let Ok(target) = u64::from_str_radix(spec.trim_start_matches("0x"), 16) {
+                if vaddr == target {
+                    if let Some(pc_ptr) = self.jit_pc_ptr {
+                        let s = unsafe {
+                            &*((pc_ptr as *const u8).sub(A64JitState::offset_of_pc())
+                                as *const A64JitState)
+                        };
+                        eprintln!(
+                            "[W8_AT] vaddr=0x{:016X} value=0x{:02X} pc=0x{:016X} lr=0x{:016X}",
+                            vaddr, value, s.pc, s.reg[30]
+                        );
+                    }
+                }
+            }
+        }
+        // RUZU_TRACE_W8_HEAP_TAG=1 — log every W8 write whose vaddr is in
+        // the heap range (vaddr >> 32 == 0x21) AND whose value has bit 0
+        // set (i.e. could be the byte that taints chunk[+16] with the
+        // PINUSE-tag pattern producing x4 = 0x814903E1 at the unlink).
+        // Use with RUZU_NO_FASTMEM_W8=1 to route all W8 writes through
+        // this callback. Throttled to 200 events.
+        if std::env::var_os("RUZU_TRACE_W8_HEAP_TAG").is_some()
+            && (vaddr >> 32) == 0x21
+            && (value & 1) == 1
+        {
+            use std::sync::atomic::{AtomicU32, Ordering};
+            static N: AtomicU32 = AtomicU32::new(0);
+            let n = N.fetch_add(1, Ordering::Relaxed);
+            if n < 200 {
+                if let Some(pc_ptr) = self.jit_pc_ptr {
+                    let s = unsafe {
+                        &*((pc_ptr as *const u8).sub(A64JitState::offset_of_pc())
+                            as *const A64JitState)
+                    };
+                    eprintln!(
+                        "[W8_HEAP_TAG #{}] vaddr=0x{:016X} value=0x{:02X} pc=0x{:016X} lr=0x{:016X}",
+                        n, vaddr, value, s.pc, s.reg[30]
+                    );
+                }
+            }
+        }
         watch_write_64(self, vaddr, 1, value as u128);
         trace_a64_access_64(self, "WRITE", vaddr, 1, value as u128);
         if let Some(ref cm) = self.core_memory {
@@ -766,6 +1060,22 @@ x0=0x{:016X} x1=0x{:016X} x2=0x{:016X} x3=0x{:016X} x19=0x{:016X} x20=0x{:016X} 
     fn memory_write_16(&mut self, vaddr: u64, value: u16) {
         if !self.check_memory_access(vaddr, 2) {
             return;
+        }
+        if let Ok(spec) = std::env::var("RUZU_TRACE_W_AT_VADDR") {
+            if let Ok(target) = u64::from_str_radix(spec.trim_start_matches("0x"), 16) {
+                if vaddr == target || vaddr + 1 == target {
+                    if let Some(pc_ptr) = self.jit_pc_ptr {
+                        let s = unsafe {
+                            &*((pc_ptr as *const u8).sub(A64JitState::offset_of_pc())
+                                as *const A64JitState)
+                        };
+                        eprintln!(
+                            "[W16_AT] vaddr=0x{:016X} value=0x{:04X} pc=0x{:016X} lr=0x{:016X}",
+                            vaddr, value, s.pc, s.reg[30]
+                        );
+                    }
+                }
+            }
         }
         watch_write_64(self, vaddr, 2, value as u128);
         trace_a64_access_64(self, "WRITE", vaddr, 2, value as u128);
@@ -780,6 +1090,70 @@ x0=0x{:016X} x1=0x{:016X} x2=0x{:016X} x3=0x{:016X} x19=0x{:016X} x20=0x{:016X} 
         if !self.check_memory_access(vaddr, 4) {
             return;
         }
+        if let Ok(spec) = std::env::var("RUZU_TRACE_W_AT_VADDR") {
+            if let Ok(target) = u64::from_str_radix(spec.trim_start_matches("0x"), 16) {
+                if vaddr <= target && target < vaddr + 4 {
+                    if let Some(pc_ptr) = self.jit_pc_ptr {
+                        let s = unsafe {
+                            &*((pc_ptr as *const u8).sub(A64JitState::offset_of_pc())
+                                as *const A64JitState)
+                        };
+                        let saved_lr = self.memory_read_64(s.sp + 8);
+                        let x27 = s.reg[27];
+                        let x27_table = self.memory_read_64(x27 + 0x20);
+                        let x27_indices = self.memory_read_64(x27 + 0x28);
+                        let x27_count = self.memory_read_64(x27 + 0x30) as u32;
+                        let table0 = self.memory_read_64(x27_table);
+                        let table1 = self.memory_read_64(x27_table + 8);
+                        let table0_obj = self.memory_read_64(table0);
+                        let table1_obj = self.memory_read_64(table1);
+                        let idx0 = self.memory_read_64(x27_indices) as u32;
+                        let idx1 = (self.memory_read_64(x27_indices) >> 32) as u32;
+                        let idx2 = self.memory_read_64(x27_indices + 8) as u32;
+                        let idx3 = (self.memory_read_64(x27_indices + 8) >> 32) as u32;
+                        let idx8 = self.memory_read_64(x27_indices + 32) as u32;
+                        let idx9 = (self.memory_read_64(x27_indices + 32) >> 32) as u32;
+                        let idx10 = self.memory_read_64(x27_indices + 40) as u32;
+                        let idx11 = (self.memory_read_64(x27_indices + 40) >> 32) as u32;
+                        let table_idx10 = self.memory_read_64(x27_table + (idx10 as u64) * 8);
+                        let table_idx10_obj = self.memory_read_64(table_idx10);
+                        eprintln!(
+                            "[W32_AT] vaddr=0x{:016X} value=0x{:08X} pc=0x{:016X} lr=0x{:016X} saved_lr=0x{:016X} sp=0x{:016X} x0=0x{:016X} x1=0x{:016X} x19=0x{:016X} x20=0x{:016X} x21=0x{:016X} x27=0x{:016X} x28=0x{:016X} x27_table=0x{:016X} x27_indices=0x{:016X} x27_count={} table0=0x{:016X}->0x{:016X} table1=0x{:016X}->0x{:016X} idx0_3=[{},{},{},{}] idx8_11=[{},{},{},{}] table_idx10=0x{:016X}->0x{:016X}",
+                            vaddr,
+                            value,
+                            s.pc,
+                            s.reg[30],
+                            saved_lr,
+                            s.sp,
+                            s.reg[0],
+                            s.reg[1],
+                            s.reg[19],
+                            s.reg[20],
+                            s.reg[21],
+                            x27,
+                            s.reg[28],
+                            x27_table,
+                            x27_indices,
+                            x27_count,
+                            table0,
+                            table0_obj,
+                            table1,
+                            table1_obj,
+                            idx0,
+                            idx1,
+                            idx2,
+                            idx3,
+                            idx8,
+                            idx9,
+                            idx10,
+                            idx11,
+                            table_idx10,
+                            table_idx10_obj
+                        );
+                    }
+                }
+            }
+        }
         watch_write_64(self, vaddr, 4, value as u128);
         trace_a64_access_64(self, "WRITE", vaddr, 4, value as u128);
         if let Some(ref cm) = self.core_memory {
@@ -793,6 +1167,116 @@ x0=0x{:016X} x1=0x{:016X} x2=0x{:016X} x3=0x{:016X} x19=0x{:016X} x20=0x{:016X} 
         if !self.check_memory_access(vaddr, 8) {
             return;
         }
+        // RUZU_COUNT_W64_BY_CORE_AT_VADDR=0xVADDR — atomic per-core counter
+        // for slow-path W64 writes targeting the specified vaddr. Used to
+        // identify which emulator cores write to a tracked memory location.
+        // Lighter than RUZU_TRACE_W64_AT_VADDR (no eprintln). SIGUSR2 dumps
+        // via `dump_w64_by_core_counters()` (module-level public fn).
+        if let Ok(spec) = std::env::var("RUZU_COUNT_W64_BY_CORE_AT_VADDR") {
+            if let Ok(target) = u64::from_str_radix(spec.trim_start_matches("0x"), 16) {
+                if vaddr == target {
+                    use std::sync::atomic::Ordering;
+                    let idx = self.core_index.min(15);
+                    W64_BY_CORE_COUNTERS[idx].fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+        // RUZU_DIVERGE_PAGE=0xPAGE — after the slow-path write, read back
+        // the value via the FASTMEM ARENA host pointer (virtual_base +
+        // vaddr) and compare. If they differ, the slow-path memory and
+        // the fastmem arena are NOT aliased to the same physical page —
+        // this is the STK heap-shifted-pointer wedge root cause.
+        // Specify a single 4KB page (matches whole page).
+        let diverge_check = std::env::var("RUZU_DIVERGE_PAGE")
+            .ok()
+            .and_then(|s| u64::from_str_radix(s.trim_start_matches("0x"), 16).ok());
+        if let Some(page) = diverge_check {
+            if (vaddr & !0xFFFu64) == (page & !0xFFFu64) {
+                use std::sync::atomic::{AtomicU32, Ordering};
+                static SHOWN: AtomicU32 = AtomicU32::new(0);
+                let n = SHOWN.fetch_add(1, Ordering::Relaxed);
+                if n < 64 || n.is_multiple_of(1000) {
+                    if let Some(ref cm) = self.core_memory {
+                        let cm_guard = cm.lock().unwrap();
+                        let arena = cm_guard.fastmem_pointer();
+                        // Read back the value via the slow-path Memory API
+                        // (which goes through pt.pointers[idx] = backing_base + offset).
+                        let slow_readback = cm_guard.read_64(vaddr);
+                        drop(cm_guard);
+                        if !arena.is_null() {
+                            let arena_host_addr = unsafe { arena.add(vaddr as usize) };
+                            let arena_value =
+                                unsafe { std::ptr::read_unaligned(arena_host_addr as *const u64) };
+                            let differ_arena = arena_value != value;
+                            let differ_slow = slow_readback != value;
+                            if differ_arena || differ_slow || n < 16 {
+                                eprintln!(
+                                    "[DIVERGE_W64 #{}] vaddr=0x{:016X} wrote=0x{:016X} slow_readback=0x{:016X} fastmem_arena=0x{:016X} arena_host={:p} differ_arena={} differ_slow={}",
+                                    n, vaddr, value, slow_readback, arena_value,
+                                    arena_host_addr, differ_arena, differ_slow
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // RUZU_TRACE_W64_AT_VADDR=0xVADDR — log every 64-bit write whose
+        // target vaddr matches. Used to find the FIRST write that
+        // stores a corrupt value into a tracked location.
+        // Special suffix `:page` matches the entire 4KB page containing
+        // VADDR (e.g. "0x81490350:page" matches 0x81490000..0x81491000).
+        if let Ok(spec) = std::env::var("RUZU_TRACE_W64_AT_VADDR") {
+            let (addr_part, page_match) = if let Some(stripped) = spec.strip_suffix(":page") {
+                (stripped, true)
+            } else {
+                (spec.as_str(), false)
+            };
+            // Special form `*` matches any vaddr (useful for finding OOR
+            // values being written anywhere when combined with FILTER_OOR).
+            let match_any = addr_part.trim() == "*";
+            let target = if match_any {
+                0
+            } else {
+                u64::from_str_radix(addr_part.trim().trim_start_matches("0x"), 16).unwrap_or(0)
+            };
+            let matches = if match_any {
+                true
+            } else if page_match {
+                (vaddr & !0xFFFu64) == (target & !0xFFFu64)
+            } else {
+                vaddr == target
+            };
+            // RUZU_TRACE_W64_FILTER_OOR=1 — also restrict to writes whose
+            // VALUE is out-of-range (top 24 bits non-zero, > 0xFF_FFFF_FFFF).
+            let oor_filter_ok = if std::env::var_os("RUZU_TRACE_W64_FILTER_OOR").is_some() {
+                value > 0xFF_FFFF_FFFFu64
+            } else {
+                true
+            };
+            if matches && oor_filter_ok {
+                use std::sync::atomic::{AtomicU32, Ordering};
+                static SHOWN: AtomicU32 = AtomicU32::new(0);
+                let n = SHOWN.fetch_add(1, Ordering::Relaxed);
+                // Always log the first 32, then every 1000th.
+                if n < 32 || n.is_multiple_of(1000) {
+                    if let Some(pc_ptr) = self.jit_pc_ptr {
+                        let jit_state_ptr = unsafe {
+                            (pc_ptr as *const u8).sub(A64JitState::offset_of_pc())
+                                as *const A64JitState
+                        };
+                        let s = unsafe { &*jit_state_ptr };
+                        eprintln!(
+                            "[W64_AT_VADDR #{}] vaddr=0x{:016X} value=0x{:016X} pc=0x{:016X} lr=0x{:016X} \
+x0=0x{:016X} x1=0x{:016X} x2=0x{:016X} x19=0x{:016X} x20=0x{:016X} x21=0x{:016X} x22=0x{:016X}",
+                            n, vaddr, value, s.pc, s.reg[30],
+                            s.reg[0], s.reg[1], s.reg[2],
+                            s.reg[19], s.reg[20], s.reg[21], s.reg[22],
+                        );
+                    }
+                }
+            }
+        }
         // RUZU_TRACE_W64_VALUE=0xVAL — fire on every 64-bit write whose
         // value matches VAL. Used to find the source of a sentinel value
         // being placed into a struct field (e.g. STK's mysterious
@@ -803,7 +1287,7 @@ x0=0x{:016X} x1=0x{:016X} x2=0x{:016X} x3=0x{:016X} x19=0x{:016X} x20=0x{:016X} 
                 use std::sync::atomic::{AtomicU32, Ordering};
                 static SHOWN: AtomicU32 = AtomicU32::new(0);
                 let n = SHOWN.fetch_add(1, Ordering::Relaxed);
-                if n < 8 {
+                if n < 32 || n.is_multiple_of(1000) {
                     if let Some(pc_ptr) = self.jit_pc_ptr {
                         let jit_state_ptr = unsafe {
                             (pc_ptr as *const u8).sub(A64JitState::offset_of_pc())
@@ -828,11 +1312,160 @@ x0=0x{:016X} x1=0x{:016X} x2=0x{:016X} x3=0x{:016X} x19=0x{:016X} x20=0x{:016X} 
         } else {
             self.memory.write().unwrap().write_64(vaddr, value);
         }
+        // RUZU_DIVERGE_PAGE post-write check: read back via BOTH slow path
+        // and fastmem arena to confirm the write took effect coherently.
+        // ALSO: write a sentinel via fastmem-arena directly and read it
+        // back via slow-path to check the OTHER coherency direction.
+        if let Ok(spec) = std::env::var("RUZU_DIVERGE_PAGE") {
+            if let Ok(target_page) = u64::from_str_radix(spec.trim_start_matches("0x"), 16) {
+                if (vaddr & !0xFFFu64) == (target_page & !0xFFFu64) {
+                    use std::sync::atomic::{AtomicU32, Ordering};
+                    static SHOWN_POST: AtomicU32 = AtomicU32::new(0);
+                    let n = SHOWN_POST.fetch_add(1, Ordering::Relaxed);
+                    if n < 8 {
+                        if let Some(ref cm) = self.core_memory {
+                            let cm_guard = cm.lock().unwrap();
+                            let arena = cm_guard.fastmem_pointer();
+                            let slow = cm_guard.read_64(vaddr);
+                            drop(cm_guard);
+                            if !arena.is_null() {
+                                let arena_value = unsafe {
+                                    std::ptr::read_unaligned(arena.add(vaddr as usize) as *const u64)
+                                };
+                                // Write sentinel via fastmem-arena pointer,
+                                // then read via slow path. If memory is fully
+                                // coherent, slow-path read returns sentinel.
+                                let sentinel: u64 = 0xDEADBEEF_CAFEBABE;
+                                unsafe {
+                                    std::ptr::write_unaligned(
+                                        arena.add(vaddr as usize) as *mut u64,
+                                        sentinel,
+                                    );
+                                }
+                                let slow_after_arena_write = self
+                                    .core_memory
+                                    .as_ref()
+                                    .map(|cm2| cm2.lock().unwrap().read_64(vaddr))
+                                    .unwrap_or(0);
+                                // Restore the original value.
+                                unsafe {
+                                    std::ptr::write_unaligned(
+                                        arena.add(vaddr as usize) as *mut u64,
+                                        value,
+                                    );
+                                }
+                                eprintln!(
+                                    "[POST_WRITE #{}] vaddr=0x{:016X} wrote=0x{:016X} slow_readback=0x{:016X} fastmem_arena=0x{:016X} sentinel_via_slow=0x{:016X} match={} sentinel_match={}",
+                                    n, vaddr, value, slow, arena_value,
+                                    slow_after_arena_write,
+                                    slow == value && arena_value == value,
+                                    slow_after_arena_write == sentinel,
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     fn memory_write_128(&mut self, vaddr: u64, value_lo: u64, value_hi: u64) {
+        // Capture xmm1's and xmm15's hardware state at the very first
+        // opportunity. xmm15 acts as a "fallback fired" marker (set to
+        // all-FFs by the fastmem fallback when RUZU_FALLBACK_MARK_XMM15=1).
+        let xmm1_lo_at_entry: u64;
+        let xmm1_hi_at_entry: u64;
+        let xmm15_lo_at_entry: u64;
+        let xmm15_hi_at_entry: u64;
+        let xmm14_lo_at_entry: u64;
+        let xmm14_hi_at_entry: u64;
+        let xmm13_lo_at_entry: u64;
+        let xmm13_hi_at_entry: u64;
+        let xmm12_lo_at_entry: u64;
+        let xmm12_hi_at_entry: u64;
+        unsafe {
+            std::arch::asm!(
+                "movq {l}, xmm1",
+                "pextrq {h}, xmm1, 1",
+                "movq {l15}, xmm15",
+                "pextrq {h15}, xmm15, 1",
+                "movq {l14}, xmm14",
+                "pextrq {h14}, xmm14, 1",
+                "movq {l13}, xmm13",
+                "pextrq {h13}, xmm13, 1",
+                "movq {l12}, xmm12",
+                "pextrq {h12}, xmm12, 1",
+                l = lateout(reg) xmm1_lo_at_entry,
+                h = lateout(reg) xmm1_hi_at_entry,
+                l15 = lateout(reg) xmm15_lo_at_entry,
+                h15 = lateout(reg) xmm15_hi_at_entry,
+                l14 = lateout(reg) xmm14_lo_at_entry,
+                h14 = lateout(reg) xmm14_hi_at_entry,
+                l13 = lateout(reg) xmm13_lo_at_entry,
+                h13 = lateout(reg) xmm13_hi_at_entry,
+                l12 = lateout(reg) xmm12_lo_at_entry,
+                h12 = lateout(reg) xmm12_hi_at_entry,
+                options(nostack, preserves_flags),
+            );
+        }
         if !self.check_memory_access(vaddr, 16) {
             return;
+        }
+        // RUZU_TRACE_W64_AT_VADDR — same logic as W64 path; also matches
+        // 128-bit writes (which span vaddr..vaddr+16).
+        if let Ok(spec) = std::env::var("RUZU_TRACE_W64_AT_VADDR") {
+            let (addr_part, page_match) = if let Some(stripped) = spec.strip_suffix(":page") {
+                (stripped, true)
+            } else {
+                (spec.as_str(), false)
+            };
+            let match_any = addr_part.trim() == "*";
+            let target = if match_any {
+                0
+            } else {
+                u64::from_str_radix(addr_part.trim().trim_start_matches("0x"), 16).unwrap_or(0)
+            };
+            let matches_lo = if match_any {
+                true
+            } else if page_match {
+                (vaddr & !0xFFFu64) == (target & !0xFFFu64)
+            } else {
+                vaddr == target
+            };
+            let matches_hi = if match_any {
+                false
+            } else if page_match {
+                ((vaddr + 8) & !0xFFFu64) == (target & !0xFFFu64)
+            } else {
+                vaddr + 8 == target
+            };
+            // RUZU_TRACE_W64_FILTER_OOR — restrict to writes whose lo OR hi
+            // half is out-of-range (top 24 bits set, > 0xFF_FFFF_FFFF).
+            let oor_filter_ok = if std::env::var_os("RUZU_TRACE_W64_FILTER_OOR").is_some() {
+                value_lo > 0xFF_FFFF_FFFFu64 || value_hi > 0xFF_FFFF_FFFFu64
+            } else {
+                true
+            };
+            if (matches_lo || matches_hi) && oor_filter_ok {
+                use std::sync::atomic::{AtomicU32, Ordering};
+                static SHOWN_128: AtomicU32 = AtomicU32::new(0);
+                let n = SHOWN_128.fetch_add(1, Ordering::Relaxed);
+                if n < 32 || n.is_multiple_of(1000) {
+                    if let Some(pc_ptr) = self.jit_pc_ptr {
+                        let jit_state_ptr = unsafe {
+                            (pc_ptr as *const u8).sub(A64JitState::offset_of_pc())
+                                as *const A64JitState
+                        };
+                        let s = unsafe { &*jit_state_ptr };
+                        eprintln!(
+                            "[W128_AT_VADDR #{}] vaddr=0x{:016X} lo=0x{:016X} hi=0x{:016X} pc=0x{:016X} lr=0x{:016X} \
+x19=0x{:016X} x20=0x{:016X} x22=0x{:016X}",
+                            n, vaddr, value_lo, value_hi, s.pc, s.reg[30],
+                            s.reg[19], s.reg[20], s.reg[22],
+                        );
+                    }
+                }
+            }
         }
         // RUZU_TRACE_W64_VALUE also checks 128-bit writes (lo OR hi half).
         if let Ok(target_str) = std::env::var("RUZU_TRACE_W64_VALUE") {
@@ -848,11 +1481,25 @@ x0=0x{:016X} x1=0x{:016X} x2=0x{:016X} x3=0x{:016X} x19=0x{:016X} x20=0x{:016X} 
                                 as *const A64JitState
                         };
                         let s = unsafe { &*jit_state_ptr };
+                        // Also dump VN_lo/hi from JitState. RUZU_DUMP_V_INDEX=31 (decimal).
+                        let v_idx: usize = std::env::var("RUZU_DUMP_V_INDEX")
+                            .ok()
+                            .and_then(|s| s.parse().ok())
+                            .unwrap_or(31);
+                        let vlo = s.vec.get(2 * v_idx).copied().unwrap_or(0);
+                        let vhi = s.vec.get(2 * v_idx + 1).copied().unwrap_or(0);
                         eprintln!(
                             "[W128_VALUE #{}] vaddr=0x{:016X} lo=0x{:016X} hi=0x{:016X} pc=0x{:016X} lr=0x{:016X} \
-x0=0x{:016X} x1=0x{:016X} x19=0x{:016X} x20=0x{:016X} x21=0x{:016X}",
+x0=0x{:016X} x1=0x{:016X} x19=0x{:016X} x20=0x{:016X} x21=0x{:016X} v{}_lo=0x{:016X} v{}_hi=0x{:016X} \
+xmm1_lo=0x{:016X} xmm1_hi=0x{:016X} xmm12_lo=0x{:016X} xmm12_hi=0x{:016X} xmm13_lo=0x{:016X} xmm13_hi=0x{:016X} xmm14_lo=0x{:016X} xmm14_hi=0x{:016X} xmm15_lo=0x{:016X} xmm15_hi=0x{:016X}",
                             n, vaddr, value_lo, value_hi, s.pc, s.reg[30],
                             s.reg[0], s.reg[1], s.reg[19], s.reg[20], s.reg[21],
+                            v_idx, vlo, v_idx, vhi,
+                            xmm1_lo_at_entry, xmm1_hi_at_entry,
+                            xmm12_lo_at_entry, xmm12_hi_at_entry,
+                            xmm13_lo_at_entry, xmm13_hi_at_entry,
+                            xmm14_lo_at_entry, xmm14_hi_at_entry,
+                            xmm15_lo_at_entry, xmm15_hi_at_entry,
                         );
                     }
                 }
@@ -931,28 +1578,37 @@ x0=0x{:016X} x1=0x{:016X} x19=0x{:016X} x20=0x{:016X} x21=0x{:016X}",
         // 0x0000ff00ffff0008 right after Connect).
         let trace_line = if std::env::var_os("RUZU_TRACE_CAS32_PC").is_some()
             || std::env::var_os("RUZU_TRACE_EXCLUSIVE32_ALL").is_some()
+            || std::env::var_os("RUZU_TRACE_EXCLUSIVE32_ADDR").is_some()
         {
             use std::sync::atomic::{AtomicU32, Ordering};
             static SHOWN: AtomicU32 = AtomicU32::new(0);
+            static TARGET_SHOWN: AtomicU32 = AtomicU32::new(0);
             // Only trace CAS at non-canonical / suspicious addresses
             // (outside the normal libnx mutex region 0x80000000..0x90000000).
             let trace_all = std::env::var_os("RUZU_TRACE_EXCLUSIVE32_ALL").is_some();
-            let suspicious = trace_all || vaddr < 0x8000_0000 || vaddr >= 0x9000_0000;
-            let n = if suspicious {
+            let trace_target = std::env::var("RUZU_TRACE_EXCLUSIVE32_ADDR")
+                .ok()
+                .and_then(|raw| u64::from_str_radix(raw.trim().trim_start_matches("0x"), 16).ok())
+                .is_some_and(|target| target == vaddr);
+            let suspicious =
+                trace_all || trace_target || vaddr < 0x8000_0000 || vaddr >= 0x9000_0000;
+            let n = if trace_target {
+                TARGET_SHOWN.fetch_add(1, Ordering::Relaxed)
+            } else if suspicious {
                 SHOWN.fetch_add(1, Ordering::Relaxed)
             } else {
                 u32::MAX
             };
-            if n < 128 {
+            if n < 512 || (trace_target && n % 1000 == 0) {
                 if let Some(pc_ptr) = self.jit_pc_ptr {
                     let jit_state_ptr = unsafe {
                         (pc_ptr as *const u8).sub(A64JitState::offset_of_pc()) as *const A64JitState
                     };
                     let s = unsafe { &*jit_state_ptr };
                     Some(format!(
-                        "[CAS32 #{}] vaddr=0x{:016X} value=0x{:08X} expected=0x{:08X} pc=0x{:016X} lr=0x{:016X} sp=0x{:016X} \
+                        "[CAS32 #{}] core={} vaddr=0x{:016X} value=0x{:08X} expected=0x{:08X} pc=0x{:016X} lr=0x{:016X} sp=0x{:016X} \
 x0=0x{:016X} x1=0x{:016X} x2=0x{:016X} x3=0x{:016X} x19=0x{:016X} x20=0x{:016X} x21=0x{:016X} x22=0x{:016X} x29=0x{:016X}",
-                        n, vaddr, value, expected, s.pc, s.reg[30], s.sp,
+                        n, self.core_index, vaddr, value, expected, s.pc, s.reg[30], s.sp,
                         s.reg[0], s.reg[1], s.reg[2], s.reg[3],
                         s.reg[19], s.reg[20], s.reg[21], s.reg[22], s.reg[29],
                     ))
@@ -976,6 +1632,53 @@ x0=0x{:016X} x1=0x{:016X} x2=0x{:016X} x3=0x{:016X} x19=0x{:016X} x20=0x{:016X} 
             };
         if let Some(line) = trace_line {
             eprintln!("{line} success={success}");
+        }
+        if success {
+            if let Some(target) = std::env::var("RUZU_TRACE_EXCLUSIVE32_ADDR")
+                .ok()
+                .and_then(|raw| u64::from_str_radix(raw.trim().trim_start_matches("0x"), 16).ok())
+                .filter(|target| *target == vaddr)
+            {
+                use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+                static TARGET_LOCK_HELD: AtomicBool = AtomicBool::new(false);
+                static TARGET_LOCK_DIAG_COUNT: AtomicU32 = AtomicU32::new(0);
+                let is_unlock = value == 0;
+                let bad_transition = if is_unlock {
+                    TARGET_LOCK_HELD
+                        .compare_exchange(true, false, Ordering::SeqCst, Ordering::SeqCst)
+                        .is_err()
+                } else {
+                    TARGET_LOCK_HELD
+                        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                        .is_err()
+                };
+                if bad_transition {
+                    let n = TARGET_LOCK_DIAG_COUNT.fetch_add(1, Ordering::Relaxed);
+                    if n < 64 || n % 1000 == 0 {
+                        if let Some(pc_ptr) = self.jit_pc_ptr {
+                            let jit_state_ptr = unsafe {
+                                (pc_ptr as *const u8).sub(A64JitState::offset_of_pc())
+                                    as *const A64JitState
+                            };
+                            let s = unsafe { &*jit_state_ptr };
+                            eprintln!(
+                                "[CAS32_LOCK_STATE_BAD #{}] core={} target=0x{:016X} op={} value=0x{:08X} expected=0x{:08X} pc=0x{:016X} lr=0x{:016X} sp=0x{:016X} x19=0x{:016X} x20=0x{:016X}",
+                                n,
+                                self.core_index,
+                                target,
+                                if is_unlock { "unlock_without_lock" } else { "lock_while_held" },
+                                value,
+                                expected,
+                                s.pc,
+                                s.reg[30],
+                                s.sp,
+                                s.reg[19],
+                                s.reg[20],
+                            );
+                        }
+                    }
+                }
+            }
         }
         success
     }
@@ -1270,6 +1973,34 @@ impl ArmDynarmic64 {
             core_index
         );
 
+        // RUZU_PROTECT_PAGE=0xVADDR — mprotect the 4KB fastmem-arena page
+        // containing VADDR to PROT_READ-only. Forces every guest write to
+        // that page to fault, dispatching through the SIGSEGV handler →
+        // fastmem fallback stub → memory_write_64 callback. Used to
+        // capture every write to a tracked location (e.g. a free-list
+        // head pointer) when direct-fastmem stores are otherwise
+        // invisible to the slow-path callback.
+        if let (Some(arena), Ok(spec)) = (fastmem_pointer, std::env::var("RUZU_PROTECT_PAGE")) {
+            if core_index == 0 {
+                let target =
+                    u64::from_str_radix(spec.trim().trim_start_matches("0x"), 16).unwrap_or(0);
+                if target != 0 {
+                    let page_size = 4096usize;
+                    let page_aligned_va = (target as usize) & !(page_size - 1);
+                    let host_addr = unsafe { arena.add(page_aligned_va) };
+                    let rc = unsafe {
+                        libc::mprotect(host_addr as *mut libc::c_void, page_size, libc::PROT_READ)
+                    };
+                    log::warn!(
+                        "RUZU_PROTECT_PAGE: mprotect(host=0x{:X}, 4KB, PROT_READ) for guest=0x{:X} → rc={}",
+                        host_addr as usize,
+                        page_aligned_va,
+                        rc
+                    );
+                }
+            }
+        }
+
         let optimizations =
             if let Some(mask) = parse_optimization_mask_env("RUZU_A64_OPTIMIZATION_MASK") {
                 optimization_flags_from_mask(mask)
@@ -1311,7 +2042,7 @@ impl ArmDynarmic64 {
                 fastmem_address_space_bits: 39,
                 silently_mirror_fastmem: false,
                 fastmem_exclusive_access: false,
-                recompile_on_fastmem_failure: false,
+                recompile_on_fastmem_failure: true,
                 page_table_present: false,
                 page_table_address_space_bits: 39,
                 silently_mirror_page_table: false,
