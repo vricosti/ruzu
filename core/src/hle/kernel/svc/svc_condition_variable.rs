@@ -516,6 +516,59 @@ fn dump_cv_state(
         );
     }
 
+    // Optional fixed code-window dump: `RUZU_DUMP_CV_CODE=0xADDR:N` reads
+    // N ARM32 instructions starting at ADDR. Used to extract the function
+    // body around return addresses found in the stack chain (e.g. the
+    // wait-routine the application is blocked in). Comma-separated for
+    // multiple ranges: `RUZU_DUMP_CV_CODE=0x758280:80,0x9A6800:32`.
+    {
+        use std::sync::OnceLock;
+        static CODE_SPECS: OnceLock<Vec<(u64, u64)>> = OnceLock::new();
+        let specs = CODE_SPECS.get_or_init(|| {
+            std::env::var("RUZU_DUMP_CV_CODE")
+                .ok()
+                .map(|raw| {
+                    raw.split(',')
+                        .map(|s| s.trim())
+                        .filter(|s| !s.is_empty())
+                        .filter_map(|tok| {
+                            let (a, n) = tok.split_once(':')?;
+                            let addr =
+                                u64::from_str_radix(a.trim_start_matches("0x"), 16).ok()?;
+                            let len = n.parse::<u64>().ok()?;
+                            Some((addr, len))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default()
+        });
+        if !specs.is_empty() {
+            if let Some(memory) = process.page_table.get_base().m_memory.as_ref() {
+                let m = memory.lock().unwrap();
+                for &(addr, n) in specs {
+                    // Print 8 insns per line.
+                    let mut i = 0u64;
+                    while i < n {
+                        let chunk_n = (n - i).min(8);
+                        let mut line = format!(
+                            "[DUMP_CV] {} tid={} code@0x{:08X}:",
+                            kind,
+                            tid,
+                            addr.wrapping_add(i * 4)
+                        );
+                        for j in 0..chunk_n {
+                            let w = m.read_32(addr.wrapping_add((i + j) * 4));
+                            use std::fmt::Write;
+                            let _ = write!(line, " {:08X}", w);
+                        }
+                        log::info!("{}", line);
+                        i += chunk_n;
+                    }
+                }
+            }
+        }
+    }
+
     // Stack-walked call chain: scan SP..SP+128 for words that look like
     // code-region return addresses (typical guest code lives below
     // 0x02000000 for MK8D's ARM32 image). For each such candidate dump
