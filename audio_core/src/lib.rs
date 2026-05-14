@@ -63,6 +63,23 @@ pub fn guest_read_block(guest_addr: u64, dest: &mut [u8]) -> bool {
     false
 }
 
+/// Write a block to guest memory via the global accessor.
+/// Returns true on success, false if accessor unset or write failed.
+pub fn guest_write_block(guest_addr: u64, src: &[u8]) -> bool {
+    static MISS_LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if let Some(mem) = GUEST_MEMORY_ACCESSOR.get() {
+        if let Ok(guard) = mem.lock() {
+            return guard.write_block(guest_addr, src);
+        }
+    } else if !MISS_LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        log::warn!(
+            "guest_write_block: GUEST_MEMORY_ACCESSOR not set yet (first miss at 0x{:X})",
+            guest_addr
+        );
+    }
+    false
+}
+
 /// Allow other audio_core code paths to initialize the global accessor
 /// directly (e.g. from system_manager init when CommandListProcessor::initialize
 /// has not been called yet).

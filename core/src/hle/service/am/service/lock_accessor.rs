@@ -56,7 +56,9 @@ impl ILockAccessor {
         let owner_process_id = owner_process.lock().unwrap().get_process_id();
         event.initialize(owner_process_id, readable_event_object_id);
         readable_event.initialize(event_object_id, readable_event_object_id);
-        readable_event.is_signaled = true;
+        readable_event
+            .is_signaled
+            .store(true, std::sync::atomic::Ordering::Relaxed);
 
         let event = Arc::new(Mutex::new(event));
         let readable_event = Arc::new(Mutex::new(readable_event));
@@ -213,6 +215,6 @@ mod tests {
             .unwrap()
             .get_readable_event_by_object_id(accessor.readable_event_object_id)
             .is_some());
-        assert!(accessor.readable_event.lock().unwrap().is_signaled);
+        assert!(accessor.readable_event.lock().unwrap().is_signaled());
     }
 }

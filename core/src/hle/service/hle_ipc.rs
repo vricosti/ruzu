@@ -913,7 +913,8 @@ impl HLERequestContext {
             let mut re = readable.lock().unwrap();
             re.initialize(0, object_id);
             if signaled {
-                re.is_signaled = true;
+                re.is_signaled
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
             }
         }
         process.register_readable_event_object(object_id, readable.clone());

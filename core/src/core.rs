@@ -833,7 +833,16 @@ impl System {
 
         // Read configuration from settings.
         // In C++: is_multicore = Settings::values.use_multi_core.GetValue()
-        self.is_multicore = *common::settings::values().use_multi_core.get_value();
+        // RUZU_SINGLE_CORE=1 — env-var override to force single-core mode.
+        // Used to test whether STK heap-shifted-pointer wedge is a multi-core
+        // race (gdb-attach perturbation eliminates the wedge, suggesting
+        // timing/race dependency).
+        if std::env::var_os("RUZU_SINGLE_CORE").is_some() {
+            log::warn!("RUZU_SINGLE_CORE=1 → forcing single-core mode");
+            self.is_multicore = false;
+        } else {
+            self.is_multicore = *common::settings::values().use_multi_core.get_value();
+        }
 
         self.core_timing.set_multicore(self.is_multicore);
         // In C++: core_timing.Initialize([&system]() { system.RegisterHostThread(); });

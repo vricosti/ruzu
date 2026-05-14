@@ -328,7 +328,10 @@ impl IRequest {
     fn set_requirement_preset_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         let mut rp = RequestParser::new(ctx);
         let param = rp.pop_u32();
-        log::warn!("(STUBBED) IRequest::SetRequirementPreset called, param={}", param);
+        log::warn!(
+            "(STUBBED) IRequest::SetRequirementPreset called, param={}",
+            param
+        );
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
     }
@@ -558,7 +561,10 @@ impl IGeneralService {
         push_interface_response(ctx, Arc::new(IRequest::new()));
     }
 
-    fn get_current_network_profile_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn get_current_network_profile_handler(
+        _this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         log::warn!("(STUBBED) IGeneralService::GetCurrentNetworkProfile called");
         let out = vec![0u8; ctx.get_write_buffer_size(0)];
         ctx.write_buffer(&out, 0);
@@ -641,7 +647,11 @@ impl IGeneralService {
         log::warn!("(STUBBED) IGeneralService::IsEthernetCommunicationEnabled called");
         let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
         rb.push_result(RESULT_SUCCESS);
-        rb.push_u8(if get_host_ipv4_address().is_some() { 1 } else { 0 });
+        rb.push_u8(if get_host_ipv4_address().is_some() {
+            1
+        } else {
+            0
+        });
     }
 
     fn is_any_internet_request_accepted_handler(
@@ -651,7 +661,11 @@ impl IGeneralService {
         log::error!("(STUBBED) IGeneralService::IsAnyInternetRequestAccepted called");
         let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
         rb.push_result(RESULT_SUCCESS);
-        rb.push_u8(if get_host_ipv4_address().is_some() { 1 } else { 0 });
+        rb.push_u8(if get_host_ipv4_address().is_some() {
+            1
+        } else {
+            0
+        });
     }
 
     fn is_any_foreground_request_accepted_handler(

@@ -14,6 +14,7 @@ use crate::hle::service::cmif_serialization::{CmifRequest, CmifResponse};
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
 use crate::hle::service::ipc_helpers::ResponseBuilder;
 use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
+use std::sync::atomic::Ordering;
 
 #[inline]
 fn to_ipc_result(r: common::ResultCode) -> ResultCode {
@@ -137,6 +138,59 @@ impl IStorage {
         };
         let mut buffer = vec![0u8; read_size];
         let result = storage.read(&mut buffer, offset, length);
+        if std::env::var_os("RUZU_ISTORAGE_READ_CONTEXT").is_some() {
+            let (tid, thread_pc, thread_lr, thread_sp) = ctx
+                .get_thread()
+                .map(|thread| {
+                    let guard = thread.lock().unwrap();
+                    (
+                        guard.get_thread_id(),
+                        guard.thread_context.pc,
+                        guard.thread_context.lr,
+                        guard.thread_context.sp,
+                    )
+                })
+                .unwrap_or((0, 0, 0, 0));
+            let pcs: Vec<String> = (0..crate::hle::kernel::kernel::GUEST_PC.len())
+                .map(|i| {
+                    format!(
+                        "core{}:pc=0x{:X}:lr=0x{:X}:sp=0x{:X}",
+                        i,
+                        crate::hle::kernel::kernel::GUEST_PC[i].load(Ordering::Acquire),
+                        crate::hle::kernel::kernel::GUEST_LR[i].load(Ordering::Acquire),
+                        crate::hle::kernel::kernel::GUEST_SP[i].load(Ordering::Acquire),
+                    )
+                })
+                .collect();
+            log::warn!(
+                "IStorage::ReadContext tid={} thread_pc=0x{:X} thread_lr=0x{:X} thread_sp=0x{:X} offset=0x{:X} length={} result=0x{:08X} {}",
+                tid,
+                thread_pc,
+                thread_lr,
+                thread_sp,
+                offset,
+                length,
+                result.get_inner_value(),
+                pcs.join(" ")
+            );
+            if let (Ok(spec), Some(memory)) =
+                (std::env::var("RUZU_ISTORAGE_READ_U32_AT"), ctx.get_memory())
+            {
+                let memory = memory.lock().unwrap();
+                let values: Vec<String> = spec
+                    .split(',')
+                    .filter_map(|raw| {
+                        let raw = raw.trim();
+                        if raw.is_empty() {
+                            return None;
+                        }
+                        let addr = u64::from_str_radix(raw.trim_start_matches("0x"), 16).ok()?;
+                        Some(format!("0x{:X}=0x{:08X}", addr, memory.read_32(addr)))
+                    })
+                    .collect();
+                log::warn!("IStorage::ReadU32At {}", values.join(" "));
+            }
+        }
         if result == RESULT_SUCCESS {
             ctx.write_buffer(&buffer, 0);
         }

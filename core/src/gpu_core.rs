@@ -117,4 +117,7 @@ pub trait GpuCoreInterface: Any + Send {
 
     /// Mirrors the upstream `GPU::OnCPUWrite(DAddr, u64)`.
     fn on_cpu_write(&self, addr: u64, size: u64) -> bool;
+
+    /// Mirrors the upstream `GPU::FlushRegion(DAddr, u64)`.
+    fn flush_region(&self, addr: u64, size: u64);
 }

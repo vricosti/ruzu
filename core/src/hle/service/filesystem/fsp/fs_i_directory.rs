@@ -64,6 +64,18 @@ impl IDirectory {
         match backend.read(max_entries as i64) {
             Ok(entries) => {
                 let count = entries.len();
+                if std::env::var_os("RUZU_TRACE_FS_RESULTS").is_some() {
+                    let preview = entries
+                        .iter()
+                        .take(16)
+                        .map(|entry| format!("{}:{}", entry.entry_type, entry.name_str()))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    eprintln!(
+                        "[FS_RESULT] IDirectory::Read max_entries={} count={} preview=[{}]",
+                        max_entries, count, preview
+                    );
+                }
                 if count > 0 {
                     let byte_len = count * entry_size;
                     let dst = &mut out_entries[..byte_len];
@@ -126,7 +138,11 @@ impl SessionRequestHandler for IDirectory {
     fn handle_sync_request(&self, ctx: &mut HLERequestContext) -> ResultCode {
         if std::env::var_os("RUZU_TRACE_IFS_DISPATCH").is_some() {
             let cmd = ctx.get_command();
-            let name = self.handlers.get(&cmd).map(|fi| fi.name).unwrap_or("<unknown>");
+            let name = self
+                .handlers
+                .get(&cmd)
+                .map(|fi| fi.name)
+                .unwrap_or("<unknown>");
             eprintln!("[IDIR_DISPATCH] cmd={} ({})", cmd, name);
         }
         ServiceFramework::handle_sync_request_impl(self, ctx)

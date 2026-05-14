@@ -957,6 +957,8 @@ mod tests {
         fn on_cpu_write(&self, _addr: u64, _size: u64) -> bool {
             false
         }
+
+        fn flush_region(&self, _addr: u64, _size: u64) {}
     }
 
     #[test]

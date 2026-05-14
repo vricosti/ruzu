@@ -99,6 +99,7 @@ pub struct SinkStream {
     last_sample_count_update_time: Instant,
     system_volume: f32,
     device_volume: f32,
+    discard_buffers: bool,
     /// Shared release synchronization (atomics + condvar).
     pub release: Arc<ReleaseSync>,
     /// Backend start/stop callback. Called with `true` to start, `false` to stop.
@@ -125,6 +126,7 @@ impl SinkStream {
             last_sample_count_update_time: Instant::now(),
             system_volume: 1.0,
             device_volume: 1.0,
+            discard_buffers: false,
             release: Arc::new(ReleaseSync::new()),
             backend_ctl: None,
         }
@@ -136,6 +138,10 @@ impl SinkStream {
     /// the backend stream.
     pub fn set_backend_ctl(&mut self, ctl: BackendStartStopFn) {
         self.backend_ctl = Some(ctl);
+    }
+
+    pub fn set_discard_buffers(&mut self, discard: bool) {
+        self.discard_buffers = discard;
     }
 
     /// Matches upstream CubebSinkStream::Start → cubeb_stream_start.
@@ -203,6 +209,10 @@ impl SinkStream {
     }
 
     pub fn append_buffer(&mut self, mut buffer: SinkBuffer, samples: &[i16]) {
+        if self.discard_buffers {
+            return;
+        }
+
         let queued_buffer = {
             buffer.consumed = false;
             buffer.frames_played = 0;

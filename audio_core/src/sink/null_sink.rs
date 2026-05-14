@@ -61,6 +61,7 @@ impl Sink for NullSink {
         stream.name = name.to_string();
         stream.set_device_volume(self.device_volume);
         stream.set_system_volume(self.system_volume);
+        stream.set_discard_buffers(true);
         let handle = new_stream_handle(stream);
         self.streams.push(StreamEntry {
             name: name.to_string(),
@@ -88,5 +89,34 @@ impl Sink for NullSink {
 
     fn get_system_channels(&self) -> u32 {
         self.system_channels
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sink::sink_stream::SinkBuffer;
+    use parking_lot::Mutex;
+
+    fn make_system() -> SharedSystem {
+        Arc::new(Mutex::new(ruzu_core::core::System::new()))
+    }
+
+    #[test]
+    fn null_sink_append_buffer_is_noop_like_upstream() {
+        let mut sink = NullSink::new("null");
+        let stream = sink.acquire_sink_stream(make_system(), 2, "null", StreamType::Render);
+
+        stream.lock().append_buffer(
+            SinkBuffer {
+                frames: 240,
+                frames_played: 0,
+                tag: 1,
+                consumed: false,
+            },
+            &[0; 480],
+        );
+
+        assert_eq!(stream.lock().get_queue_size(), 0);
     }
 }
