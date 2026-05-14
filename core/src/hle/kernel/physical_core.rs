@@ -508,21 +508,51 @@ impl PhysicalCore {
         }
     }
 
-    /// Set the arm interface and thread currently running on this core.
-    /// Called at the start of RunThread, matching upstream's pattern.
-    pub fn set_running(
+    /// Enter the running context for this core.
+    ///
+    /// Upstream: `PhysicalCore::RunThread()` local `EnterContext` lambda.
+    /// The interrupted check and publication of `(m_arm_interface,
+    /// m_current_thread)` must happen under the same guard so an interrupt
+    /// cannot arrive between "not interrupted" and "JIT is running".
+    pub fn enter_running(
+        &self,
+        arm_interface: *mut dyn crate::arm::arm_interface::ArmInterface,
+        thread: *mut KThread,
+    ) -> bool {
+        let mut state = self.m_guard.lock().unwrap();
+        if state.m_is_interrupted {
+            return false;
+        }
+        state.m_arm_interface = Some(arm_interface);
+        state.m_current_thread = Some(thread);
+
+        // Upstream calls `interface->LockThread(thread)` while the core
+        // context is held. Dynarmic currently has a no-op implementation, but
+        // preserving this order matters for backends that synchronize thread
+        // parameter access with `Interrupt()`.
+        unsafe {
+            let thread_as_arm = &mut *(thread as *mut crate::arm::arm_interface::KThread);
+            (*arm_interface).lock_thread(thread_as_arm);
+        }
+
+        true
+    }
+
+    /// Exit the running context for this core.
+    ///
+    /// Upstream: `PhysicalCore::RunThread()` local `ExitContext` lambda.
+    /// Unlock the thread first, then clear the core's published running state
+    /// under `m_guard`.
+    pub fn exit_running(
         &self,
         arm_interface: *mut dyn crate::arm::arm_interface::ArmInterface,
         thread: *mut KThread,
     ) {
-        let mut state = self.m_guard.lock().unwrap();
-        state.m_arm_interface = Some(arm_interface);
-        state.m_current_thread = Some(thread);
-    }
+        unsafe {
+            let thread_as_arm = &mut *(thread as *mut crate::arm::arm_interface::KThread);
+            (*arm_interface).unlock_thread(thread_as_arm);
+        }
 
-    /// Clear the arm interface and thread (no longer running on this core).
-    /// Called at the end of RunThread.
-    pub fn clear_running(&self) {
         let mut state = self.m_guard.lock().unwrap();
         state.m_arm_interface = None;
         state.m_current_thread = None;
@@ -539,6 +569,23 @@ impl PhysicalCore {
 
         // Add interrupt flag.
         state.m_is_interrupted = true;
+
+        // Env-gated IPI trace: `RUZU_TRACE_IPI=1` logs every interrupt()
+        // call with target core and the JIT/thread running there. Used to
+        // diagnose cross-core wake latency for newly-RUNNABLE threads (the
+        // MK8D wedge investigation). Format matches the SVC trace
+        // elapsed_secs() prefix for inline correlation.
+        if std::env::var_os("RUZU_TRACE_IPI").is_some() {
+            let t = crate::hle::kernel::trace_format::elapsed_secs();
+            let running_tid = current_thread.map(|p| unsafe { (*p).get_thread_id() }).unwrap_or(0);
+            eprintln!(
+                "[{:>10.6}] [IPI] target_core={} running_tid={} running_jit={}",
+                t,
+                self.m_core_index,
+                running_tid,
+                arm_interface.is_some()
+            );
+        }
 
         // Interrupt ourselves (wake from idle).
         self.m_on_interrupt.notify_one();
