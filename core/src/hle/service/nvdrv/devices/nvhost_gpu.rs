@@ -241,15 +241,25 @@ impl NvHostGpu {
     }
 
     fn trace_command_list_headers(label: &str, headers: &[GpuCommandListHeader]) {
-        if !Self::should_trace_init_path() {
+        let explicit_limit = std::env::var("RUZU_TRACE_GPFIFO_HEADERS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok());
+        if !Self::should_trace_init_path() && explicit_limit.is_none() {
             return;
         }
-        for (index, header) in headers.iter().take(8).enumerate() {
+        let limit = explicit_limit.unwrap_or(8);
+        for (index, header) in headers.iter().take(limit).enumerate() {
+            let addr = header.raw & ((1_u64 << 40) - 1);
+            let is_non_main = (header.raw >> 41) & 1;
+            let size = (header.raw >> 42) & ((1_u64 << 21) - 1);
             log::info!(
-                "nvhost_gpu::{} header[{}] raw=0x{:016X}",
+                "nvhost_gpu::{} header[{}] raw=0x{:016X} addr=0x{:X} size={} non_main={}",
                 label,
                 index,
-                header.raw
+                header.raw,
+                addr,
+                size,
+                is_non_main
             );
         }
     }

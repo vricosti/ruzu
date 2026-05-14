@@ -236,14 +236,46 @@ impl NvMapDevice {
         debug_assert_eq!(lock_result, 0);
         if Self::should_trace_alloc_loop() {
             let inner = handle.lock_inner();
+            let host_ptr = process.lock().unwrap().get_memory().and_then(|memory| {
+                let memory = memory.lock().unwrap();
+                let ptr = memory.get_pointer_silent(inner.address);
+                if ptr.is_null() {
+                    None
+                } else {
+                    Some(ptr as usize)
+                }
+            });
             log::info!(
-                "nvmap::IocAlloc end fd={} handle=0x{:X} result={} alloc_addr=0x{:X} size=0x{:X}",
+                "nvmap::IocAlloc end fd={} handle=0x{:X} result={} alloc_addr=0x{:X} size=0x{:X} host_ptr={:?}",
                 fd,
                 params.handle,
                 result as u32,
                 inner.address,
-                inner.size
+                inner.size,
+                host_ptr.map(|ptr| format!("0x{ptr:X}"))
             );
+        }
+
+        if let Ok(raw_handle) = std::env::var("RUZU_STOP_NVMAP_ALLOC_HANDLE") {
+            let digits = raw_handle
+                .trim()
+                .strip_prefix("0x")
+                .or_else(|| raw_handle.trim().strip_prefix("0X"))
+                .unwrap_or(raw_handle.trim());
+            let parsed = u32::from_str_radix(digits, 16)
+                .ok()
+                .or_else(|| raw_handle.trim().parse::<u32>().ok());
+            if parsed == Some(params.handle) {
+                eprintln!(
+                    "[NVMAP_ALLOC_STOP] handle=0x{:X} addr=0x{:X} size=0x{:X}",
+                    params.handle,
+                    params.address,
+                    handle_size
+                );
+                unsafe {
+                    libc::raise(libc::SIGSTOP);
+                }
+            }
         }
 
         NvResult::Success
