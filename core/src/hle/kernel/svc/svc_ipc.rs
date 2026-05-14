@@ -276,7 +276,8 @@ fn send_sync_request_impl(
             let parent = {
                 let g = thread.lock().unwrap();
                 g.parent.as_ref()?.clone()
-            }.upgrade()?;
+            }
+            .upgrade()?;
             let process = parent.lock().unwrap();
             process.page_table.get_base().m_memory.clone()
         })();

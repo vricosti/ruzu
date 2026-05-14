@@ -7,8 +7,8 @@
 use crate::core::System;
 use crate::hle::kernel::k_typed_address::KProcessAddress;
 use crate::hle::kernel::svc::svc_results::*;
-use crate::hle::kernel::svc_common::Handle;
-use crate::hle::result::{ResultCode, RESULT_SUCCESS};
+use crate::hle::kernel::svc_common::{Handle, PseudoHandle};
+use crate::hle::result::ResultCode;
 
 /// Flushes the entire data cache.
 /// Upstream: UNIMPLEMENTED() — intentionally unimplemented.
@@ -61,11 +61,14 @@ pub fn flush_process_data_cache(
     // R_UNLESS(size == static_cast<uint64_t>(size), ResultInvalidCurrentMemory);
 
     // Get the process from its handle.
-    // Upstream: GetCurrentProcess(kernel).GetHandleTable().GetObject<KProcess>(process_handle)
+    // Upstream: GetCurrentProcess(kernel).GetHandleTable().GetObject<KProcess>(process_handle).
+    // `GetObject<KProcess>` accepts CurrentProcess as a typed pseudo-handle.
     let process = system.current_process_arc().lock().unwrap();
-    let Some(object_id) = process.handle_table.get_object(process_handle) else {
+    if process_handle != PseudoHandle::CurrentProcess as Handle
+        && process.handle_table.get_object(process_handle).is_none()
+    {
         return RESULT_INVALID_HANDLE;
-    };
+    }
 
     // Verify the region is within range.
     // Upstream: page_table.Contains(address, size)
@@ -78,14 +81,14 @@ pub fn flush_process_data_cache(
 
     // Perform the operation.
     // Upstream: GetCurrentMemory(kernel).FlushDataCache(address, size)
-    // This is a no-op on HLE since we don't have real data caches to flush.
-    // The upstream implementation calls into Memory::FlushDataCache which
-    // is effectively a no-op on x86/host.
-    log::debug!(
-        "svc::FlushProcessDataCache: flushing address=0x{:X}, size=0x{:X} (no-op on HLE)",
-        address,
-        size
-    );
+    let Some(memory) = process.page_table.get_base().m_memory.as_ref().cloned() else {
+        return RESULT_INVALID_CURRENT_MEMORY;
+    };
+    drop(process);
 
-    RESULT_SUCCESS
+    let result = memory
+        .lock()
+        .unwrap()
+        .flush_data_cache(address, size as usize);
+    result
 }

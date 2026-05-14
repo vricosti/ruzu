@@ -289,7 +289,9 @@ pub fn synchronize_preemption_state(system: &System) {
         if pinned_id == current_thread_id {
             // Clear the current thread's interrupt flag.
             if let Some(thread) = process.get_thread_by_thread_id(current_thread_id) {
-                thread.lock().unwrap().clear_interrupt_flag();
+                let mut thread = thread.lock().unwrap();
+                thread.clear_interrupt_flag();
+                thread.unpin();
             }
 
             // Unpin the current thread.

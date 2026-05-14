@@ -6,6 +6,7 @@
 //! Mirrors `KReadableEvent::Signal` which under scheduler lock walks the
 //! intrusive waiter list on the owning sync object.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use super::k_process::ProcessLock;
@@ -19,7 +20,7 @@ use crate::hle::result::RESULT_SUCCESS;
 /// Matches upstream `KReadableEvent` class (k_readable_event.h).
 pub struct KReadableEvent {
     pub object_id: u64,
-    pub is_signaled: bool,
+    pub is_signaled: AtomicBool,
     pub parent_id: Option<u64>,
     pub sync_object: SynchronizationObjectState,
 }
@@ -36,7 +37,7 @@ impl KReadableEvent {
     pub fn new() -> Self {
         Self {
             object_id: 0,
-            is_signaled: false,
+            is_signaled: AtomicBool::new(false),
             parent_id: None,
             sync_object: SynchronizationObjectState::new(),
         }
@@ -44,7 +45,7 @@ impl KReadableEvent {
 
     pub fn initialize(&mut self, parent_id: u64, object_id: u64) {
         self.object_id = object_id;
-        self.is_signaled = false;
+        self.is_signaled.store(false, Ordering::Relaxed);
         self.parent_id = Some(parent_id);
         debug_assert!(self.sync_object.is_empty());
     }
@@ -61,7 +62,7 @@ impl KReadableEvent {
     /// call from any context — guest syscall or host thread.
     pub fn signal(&mut self) -> u32 {
         let _scheduler_guard = Self::lock_scheduler();
-        self.is_signaled = true;
+        self.is_signaled.store(true, Ordering::Relaxed);
         if std::env::var_os("RUZU_TRACE_EVENTS").is_some() {
             log::info!("EVENT_SIGNAL object_id={} via=signal", self.object_id);
         }
@@ -85,16 +86,16 @@ impl KReadableEvent {
     /// Reset the event. Mirrors upstream `KReadableEvent::Reset`.
     pub fn reset(&mut self) -> u32 {
         let _scheduler_guard = Self::lock_scheduler();
-        if !self.is_signaled {
+        if !self.is_signaled.load(Ordering::Relaxed) {
             return RESULT_INVALID_STATE.get_inner_value();
         }
-        self.is_signaled = false;
+        self.is_signaled.store(false, Ordering::Relaxed);
         RESULT_SUCCESS.get_inner_value()
     }
 
     /// Is the event signaled?
     pub fn is_signaled(&self) -> bool {
-        self.is_signaled
+        self.is_signaled.load(Ordering::Relaxed)
     }
 
     /// Mirrors upstream `KSynchronizationObject::NotifyAvailable` as invoked
@@ -102,7 +103,7 @@ impl KReadableEvent {
     ///
     /// Caller must hold the scheduler lock.
     fn notify_available(&self) {
-        if !self.is_signaled {
+        if !self.is_signaled.load(Ordering::Relaxed) {
             return;
         }
         unsafe {

@@ -321,21 +321,27 @@ impl ThreadQueueImplForKSynchronizationObjectWait {
 /// Enum wrapping the possible sync-object sources so wait() can query the
 /// right state_ptr + signaled check per object_id.
 enum WaitableObject {
-    ReadableEvent(Arc<Mutex<KReadableEvent>>),
+    ReadableEvent {
+        _event: Arc<Mutex<KReadableEvent>>,
+        is_signaled: *const std::sync::atomic::AtomicBool,
+        sync_state: *mut SynchronizationObjectState,
+    },
     ServerPort(Arc<Mutex<KPort>>),
     ServerSession(Arc<Mutex<KServerSession>>),
     Thread(Arc<KThreadLock>),
-    Process,
+    Process(Arc<ProcessLock>),
 }
 
 impl WaitableObject {
-    fn is_signaled(&self, process: &KProcess) -> bool {
+    fn is_signaled(&self) -> bool {
         match self {
-            Self::ReadableEvent(event) => event.lock().unwrap().is_signaled(),
+            Self::ReadableEvent { is_signaled, .. } => unsafe {
+                (**is_signaled).load(std::sync::atomic::Ordering::Relaxed)
+            },
             Self::ServerPort(port) => port.lock().unwrap().server.is_signaled(),
             Self::ServerSession(session) => session.lock().unwrap().is_signaled(),
             Self::Thread(thread) => thread.lock().unwrap().is_signaled(),
-            Self::Process => process.is_signaled(),
+            Self::Process(process) => process.lock().unwrap().is_signaled(),
         }
     }
 
@@ -345,12 +351,9 @@ impl WaitableObject {
     /// The caller must guarantee the state lives at least as long as any node
     /// that is linked into it — i.e. the pointer is used while the underlying
     /// `Arc` is held and the scheduler lock is acquired on touch.
-    fn sync_state_ptr(&self, process: &mut KProcess) -> *mut SynchronizationObjectState {
+    fn sync_state_ptr(&self) -> *mut SynchronizationObjectState {
         match self {
-            Self::ReadableEvent(event) => {
-                let mut guard = event.lock().unwrap();
-                &mut guard.sync_object as *mut SynchronizationObjectState
-            }
+            Self::ReadableEvent { sync_state, .. } => *sync_state,
             Self::ServerPort(port) => {
                 let mut guard = port.lock().unwrap();
                 &mut guard.server.sync_object as *mut SynchronizationObjectState
@@ -363,48 +366,85 @@ impl WaitableObject {
                 let mut guard = thread.lock().unwrap();
                 &mut guard.sync_object as *mut SynchronizationObjectState
             }
-            Self::Process => &mut process.sync_object as *mut SynchronizationObjectState,
+            Self::Process(process) => {
+                let mut guard = process.lock().unwrap();
+                &mut guard.sync_object as *mut SynchronizationObjectState
+            }
         }
     }
 }
 
-fn resolve_waitable_object(process: &KProcess, object_id: u64) -> Option<WaitableObject> {
-    if let Some(port) = process.get_server_port_by_object_id(object_id) {
+fn resolve_waitable_object(
+    process: &Arc<ProcessLock>,
+    process_guard: &KProcess,
+    object_id: u64,
+) -> Option<WaitableObject> {
+    if let Some(port) = process_guard.get_server_port_by_object_id(object_id) {
         return Some(WaitableObject::ServerPort(port));
     }
-    if let Some(event) = process.get_readable_event_by_object_id(object_id) {
-        return Some(WaitableObject::ReadableEvent(event));
+    if let Some(event) = process_guard.get_readable_event_by_object_id(object_id) {
+        let (is_signaled, sync_state) = {
+            let mut guard = event.lock().unwrap();
+            (
+                &guard.is_signaled as *const std::sync::atomic::AtomicBool,
+                &mut guard.sync_object as *mut SynchronizationObjectState,
+            )
+        };
+        return Some(WaitableObject::ReadableEvent {
+            _event: event,
+            is_signaled,
+            sync_state,
+        });
     }
-    if let Some(session) = process.get_server_session_by_object_id(object_id) {
+    if let Some(session) = process_guard.get_server_session_by_object_id(object_id) {
         return Some(WaitableObject::ServerSession(session));
     }
-    if let Some(thread) = process.get_thread_by_object_id(object_id) {
+    if let Some(thread) = process_guard.get_thread_by_object_id(object_id) {
         return Some(WaitableObject::Thread(thread));
     }
-    if process.process_id == object_id {
-        return Some(WaitableObject::Process);
+    if process_guard.process_id == object_id {
+        return Some(WaitableObject::Process(process.clone()));
     }
     None
 }
 
 pub fn is_object_signaled(process: &KProcess, object_id: u64) -> bool {
-    resolve_waitable_object(process, object_id)
-        .map(|object| object.is_signaled(process))
-        .unwrap_or(false)
+    // Compatibility helper for older call sites: resolve through a temporary
+    // process Arc is not possible here, so keep the previous direct behavior
+    // for non-process objects and handle process inline.
+    if let Some(port) = process.get_server_port_by_object_id(object_id) {
+        return port.lock().unwrap().server.is_signaled();
+    }
+    if let Some(event) = process.get_readable_event_by_object_id(object_id) {
+        return event.lock().unwrap().is_signaled();
+    }
+    if let Some(session) = process.get_server_session_by_object_id(object_id) {
+        return session.lock().unwrap().is_signaled();
+    }
+    if let Some(thread) = process.get_thread_by_object_id(object_id) {
+        return thread.lock().unwrap().is_signaled();
+    }
+    if process.process_id == object_id {
+        return process.is_signaled();
+    }
+    false
 }
 
-fn is_known_object(process: &KProcess, object_id: u64) -> bool {
-    resolve_waitable_object(process, object_id).is_some()
+fn first_signaled_waitable_index(objects: &[WaitableObject]) -> Option<usize> {
+    objects
+        .iter()
+        .position(|object| object.is_signaled())
 }
 
-fn all_objects_known(process: &KProcess, object_ids: &[u64]) -> bool {
-    object_ids.iter().all(|&oid| is_known_object(process, oid))
-}
-
-fn first_signaled_index(process: &KProcess, object_ids: &[u64]) -> Option<usize> {
+fn resolve_waitable_objects(
+    process: &Arc<ProcessLock>,
+    object_ids: &[u64],
+) -> Option<Vec<WaitableObject>> {
+    let process_guard = process.lock().unwrap();
     object_ids
         .iter()
-        .position(|&oid| is_object_signaled(process, oid))
+        .map(|&oid| resolve_waitable_object(process, &process_guard, oid))
+        .collect()
 }
 
 /// KSynchronizationObject — kernel object that threads can wait on.
@@ -544,6 +584,9 @@ pub fn wait(
         let guard = current_thread.lock().unwrap();
         &*guard as *const KThread as usize
     };
+    let Some(waitable_objects) = resolve_waitable_objects(process, &object_ids) else {
+        return RESULT_INVALID_HANDLE;
+    };
 
     let result = {
         let (mut sleep_guard, timer) = KScopedSchedulerLockAndSleep::new(
@@ -554,14 +597,7 @@ pub fn wait(
             timeout_ns,
         );
 
-        let mut process_guard = process.lock().unwrap();
-
-        if !all_objects_known(&process_guard, &object_ids) {
-            sleep_guard.cancel_sleep();
-            return RESULT_INVALID_HANDLE;
-        }
-
-        if let Some(index) = first_signaled_index(&process_guard, &object_ids) {
+        if let Some(index) = first_signaled_waitable_index(&waitable_objects) {
             if std::env::var_os("RUZU_TRACE_NOTIFY_WAITERS").is_some() {
                 log::info!(
                     "[WAIT_EARLY] tid={} object_ids={:?} signaled_index={} short-circuit (no link)",
@@ -592,11 +628,7 @@ pub fn wait(
 
         let current_thread_weak = Arc::downgrade(current_thread);
         for (i, oid) in object_ids.iter().enumerate() {
-            let Some(object) = resolve_waitable_object(&process_guard, *oid) else {
-                sleep_guard.cancel_sleep();
-                return RESULT_INVALID_HANDLE;
-            };
-            let state_ptr = object.sync_state_ptr(&mut process_guard);
+            let state_ptr = waitable_objects[i].sync_state_ptr();
             nodes[i].thread = current_thread_weak.clone();
             nodes[i].object_id = *oid;
             unsafe {

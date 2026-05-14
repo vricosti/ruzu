@@ -222,22 +222,6 @@ impl GlobalSchedulerContext {
                     self.m_priority_queue.get_scheduled_front(3),
                 ));
             }
-
-            // Wake the target core from idle so it picks up the new thread.
-            // Upstream: KScheduler::RescheduleOtherCores triggers interrupts
-            // on cores whose highest priority changed.
-            if active_core >= 0 {
-                if let Some(kernel) = super::kernel::get_kernel_ref() {
-                    if let Some(core) = kernel.physical_core(active_core as usize) {
-                        log::trace!(
-                            "GSC::on_thread_state_changed tid={} interrupting core {}",
-                            thread_id,
-                            active_core
-                        );
-                        core.interrupt();
-                    }
-                }
-            }
         }
     }
 
@@ -288,6 +272,7 @@ impl GlobalSchedulerContext {
             priority,
             is_dummy,
         );
+        self.m_priority_queue.increment_scheduled_count(thread_id);
         self.m_scheduler_update_needed
             .store(true, std::sync::atomic::Ordering::Release);
     }

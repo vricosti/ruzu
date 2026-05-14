@@ -1338,10 +1338,14 @@ impl KernelCore {
                     drop(gsc);
                 }
 
-                // Interrupt all cores.
-                for core_id in 0..hardware_properties::NUM_CPU_CORES as usize {
-                    if let Some(core) = kernel.physical_core(core_id) {
-                        core.interrupt();
+                // Local ruzu addition: interrupt cores to force JIT exits.
+                // Upstream only rotates scheduled queues here; keep this
+                // diagnostic gate to isolate preemption-vs-JIT-exit effects.
+                if std::env::var_os("RUZU_NO_PREEMPT_INTERRUPTS").is_none() {
+                    for core_id in 0..hardware_properties::NUM_CPU_CORES as usize {
+                        if let Some(core) = kernel.physical_core(core_id) {
+                            core.interrupt();
+                        }
                     }
                 }
 
@@ -1571,7 +1575,9 @@ impl KernelCore {
 
         let stop = Arc::clone(&self.preemption_stop);
         let kernel_ptr_val = KERNEL_PTR.load(Ordering::Acquire);
-        if !kernel_ptr_val.is_null() {
+        if std::env::var_os("RUZU_DISABLE_PREEMPTION_THREAD").is_some() {
+            log::warn!("RUZU_DISABLE_PREEMPTION_THREAD=1 -> skipping local preemption thread");
+        } else if !kernel_ptr_val.is_null() {
             let thread = std::thread::Builder::new()
                 .name("PreemptionThread".to_string())
                 .spawn(move || {
@@ -1582,9 +1588,11 @@ impl KernelCore {
                             break;
                         }
                         let kernel = unsafe { &*kp };
-                        for core_id in 0..hardware_properties::NUM_CPU_CORES as usize {
-                            if let Some(core) = kernel.physical_core(core_id) {
-                                core.interrupt();
+                        if std::env::var_os("RUZU_NO_PREEMPT_INTERRUPTS").is_none() {
+                            for core_id in 0..hardware_properties::NUM_CPU_CORES as usize {
+                                if let Some(core) = kernel.physical_core(core_id) {
+                                    core.interrupt();
+                                }
                             }
                         }
                         if DUMP_REQUESTED.load(Ordering::Relaxed) {

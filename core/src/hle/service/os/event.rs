@@ -139,7 +139,9 @@ impl Event {
         event.initialize(owner_process_id, readable_event_object_id);
         readable_event.initialize(event_object_id, readable_event_object_id);
         if signaled {
-            readable_event.is_signaled = true;
+            readable_event
+                .is_signaled
+                .store(true, std::sync::atomic::Ordering::Relaxed);
         }
 
         let event = Arc::new(Mutex::new(event));

@@ -16,6 +16,7 @@ use crate::core::System;
 use crate::hardware_properties;
 use crate::hle::kernel::svc::svc_activity;
 use crate::hle::kernel::svc::svc_address_arbiter;
+use crate::hle::kernel::svc::svc_cache;
 use crate::hle::kernel::svc::svc_condition_variable;
 use crate::hle::kernel::svc::svc_debug_string;
 use crate::hle::kernel::svc::svc_event;
@@ -1218,18 +1219,38 @@ fn call32(system: &System, imm: u32, args: &mut SvcArgs) {
         // =====================================================================
         // Cache
         // =====================================================================
-        Some(SvcId::FlushEntireDataCache) => {}
+        Some(SvcId::FlushEntireDataCache) => {
+            svc_cache::flush_entire_data_cache();
+        }
         Some(SvcId::FlushDataCache) => {
-            set_arg32(args, 0, STUB_SUCCESS);
+            let result =
+                svc_cache::flush_data_cache(get_arg32(args, 0) as u64, get_arg32(args, 1) as u64);
+            set_arg32(args, 0, result.get_inner_value());
         }
         Some(SvcId::InvalidateProcessDataCache) => {
-            set_arg32(args, 0, STUB_SUCCESS);
+            let result = svc_cache::invalidate_process_data_cache(
+                get_arg32(args, 0),
+                gather64(args, 2, 3),
+                gather64(args, 1, 4),
+            );
+            set_arg32(args, 0, result.get_inner_value());
         }
         Some(SvcId::StoreProcessDataCache) => {
-            set_arg32(args, 0, STUB_SUCCESS);
+            let result = svc_cache::store_process_data_cache(
+                get_arg32(args, 0),
+                gather64(args, 2, 3),
+                gather64(args, 1, 4),
+            );
+            set_arg32(args, 0, result.get_inner_value());
         }
         Some(SvcId::FlushProcessDataCache) => {
-            set_arg32(args, 0, STUB_SUCCESS);
+            let result = svc_cache::flush_process_data_cache(
+                system,
+                get_arg32(args, 0),
+                gather64(args, 2, 3),
+                gather64(args, 1, 4),
+            );
+            set_arg32(args, 0, result.get_inner_value());
         }
 
         // =====================================================================
@@ -1679,6 +1700,41 @@ fn call64(system: &System, imm: u32, args: &mut SvcArgs) {
         }
         Some(SvcId::MapPhysicalMemory) => {
             set_arg64(args, 0, STUB_SUCCESS as u64);
+        }
+        // ====================================================================
+        // Cache (A64)
+        // ====================================================================
+        Some(SvcId::FlushEntireDataCache) => {
+            svc_cache::flush_entire_data_cache();
+        }
+        Some(SvcId::FlushDataCache) => {
+            let result = svc_cache::flush_data_cache(get_arg64(args, 0), get_arg64(args, 1));
+            set_arg64(args, 0, result.get_inner_value() as u64);
+        }
+        Some(SvcId::InvalidateProcessDataCache) => {
+            let result = svc_cache::invalidate_process_data_cache(
+                get_arg64(args, 0) as u32,
+                get_arg64(args, 1),
+                get_arg64(args, 2),
+            );
+            set_arg64(args, 0, result.get_inner_value() as u64);
+        }
+        Some(SvcId::StoreProcessDataCache) => {
+            let result = svc_cache::store_process_data_cache(
+                get_arg64(args, 0) as u32,
+                get_arg64(args, 1),
+                get_arg64(args, 2),
+            );
+            set_arg64(args, 0, result.get_inner_value() as u64);
+        }
+        Some(SvcId::FlushProcessDataCache) => {
+            let result = svc_cache::flush_process_data_cache(
+                system,
+                get_arg64(args, 0) as u32,
+                get_arg64(args, 1),
+                get_arg64(args, 2),
+            );
+            set_arg64(args, 0, result.get_inner_value() as u64);
         }
         // Transfer memory — STK creates one between binder Connect and the
         // first DequeueBuffer. The 32-bit dispatch (`call32`) handles

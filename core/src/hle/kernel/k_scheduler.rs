@@ -866,12 +866,42 @@ impl KScheduler {
 
         // Select top thread per core from PQ.
         for core_id in 0..NUM_CPU_CORES as usize {
-            let top_thread_id = gsc.m_priority_queue.get_scheduled_front(core_id as i32);
-            // Upstream: check pinned thread for the process.
-            // If the top thread's process has a pinned thread for this core,
-            // and it's different from the top thread, prefer the pinned one
-            // (unless top thread has kernel waiters).
-            // Simplified: no pinned thread support yet.
+            let mut top_thread_id = gsc.m_priority_queue.get_scheduled_front(core_id as i32);
+
+            // Upstream: if the top thread's process has a pinned thread for this
+            // core, prefer it unless the normal top thread has kernel waiters.
+            if let Some(top_id) = top_thread_id {
+                let pinned_id = gsc
+                    .get_thread_by_thread_id(top_id)
+                    .and_then(|top_thread| {
+                        let top_guard = top_thread.lock().unwrap();
+                        if top_guard.get_num_kernel_waiters() != 0 {
+                            return None;
+                        }
+                        let parent = top_guard.parent.as_ref().and_then(|w| w.upgrade())?;
+                        drop(top_guard);
+
+                        parent.lock().unwrap().get_pinned_thread(core_id as i32)
+                    });
+
+                if let Some(pinned_id) = pinned_id {
+                    if pinned_id != top_id {
+                        let pinned_is_runnable = gsc
+                            .get_thread_by_thread_id(pinned_id)
+                            .map(|pinned_thread| {
+                                pinned_thread.lock().unwrap().get_raw_state()
+                                    == ThreadState::RUNNABLE
+                            })
+                            .unwrap_or(false);
+                        if pinned_is_runnable {
+                            top_thread_id = Some(pinned_id);
+                        } else {
+                            top_thread_id = None;
+                        }
+                    }
+                }
+            }
+
             if top_thread_id.is_none() {
                 idle_cores |= 1u64 << core_id;
             }
