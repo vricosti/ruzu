@@ -243,15 +243,24 @@ pub struct TextureCacheBase {
     pub image_downloader: Option<ImageDownloader>,
     pub guest_memory_writer: Option<GuestMemoryWriter>,
 
+    /// Shared `MaxwellDeviceMemoryManager` reference. Mirrors upstream
+    /// `MaxwellDeviceMemoryManager& device_memory` member used by
+    /// `TrackImage` / `UntrackImage` to drive `UpdatePagesCachedCount`.
+    /// Same `Arc` as `Host1x::memory_manager()` and `ShaderCache::device_memory()`.
+    pub device_memory: std::sync::Arc<crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager>,
+
     // Mutex
     pub mutex: ReentrantMutex<()>,
 }
 
 impl TextureCacheBase {
-    /// Create a new texture cache (placeholder constructor).
+    /// Create a new texture cache.
     ///
     /// Port of `TextureCache<P>::TextureCache(Runtime&, MaxwellDeviceMemoryManager&)`.
-    pub fn new() -> Self {
+    /// `device_memory` is the shared `Arc` from `Host1x::memory_manager()`.
+    pub fn new(
+        device_memory: std::sync::Arc<crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager>,
+    ) -> Self {
         Self {
             slot_images: SlotVector::new(),
             slot_map_views: SlotVector::new(),
@@ -285,6 +294,7 @@ impl TextureCacheBase {
             unswizzle_data_buffer: vec![0u8; 1 * 1024 * 1024], // 1 MiB
             image_downloader: None,
             guest_memory_writer: None,
+            device_memory,
             mutex: ReentrantMutex::new(()),
         }
     }
@@ -547,10 +557,12 @@ impl TextureCacheBase {
 #[cfg(test)]
 mod tests {
     use super::TextureCacheBase;
+    use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
+    use std::sync::Arc;
 
     #[test]
     fn texture_cache_mutex_is_reentrant() {
-        let cache = TextureCacheBase::new();
+        let cache = TextureCacheBase::new(Arc::new(MaxwellDeviceMemoryManager::default()));
         let _lock_a = cache.mutex.lock();
         let _lock_b = cache.mutex.lock();
     }

@@ -82,7 +82,7 @@ impl Container {
 
     pub fn new_with_system(system: SystemRef) -> Self {
         Self {
-            file: Arc::new(NvMap::new()),
+            file: Arc::new(NvMap::new_with_system(system)),
             manager: SyncpointManager::new_with_system(system),
             device_file_data: Host1xDeviceFileData::default(),
             inner: Mutex::new(ContainerInner {

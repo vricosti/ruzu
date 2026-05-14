@@ -13,6 +13,7 @@ use log::error;
 use ruzu_core::host1x_core::Host1xCoreInterface;
 
 use crate::host1x::ffmpeg::ffmpeg::Frame;
+use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
 use crate::host1x::syncpoint_manager::SyncpointManager;
 
 // --------------------------------------------------------------------------
@@ -184,8 +185,12 @@ pub struct Host1x {
     syncpoint_manager: Arc<SyncpointManager>,
     frame_queue: Arc<FrameQueue>,
     devices: Mutex<HashMap<i32, Arc<crate::cdma_pusher::CDmaPusher>>>,
+    /// Single shared `MaxwellDeviceMemoryManager` instance. Mirrors
+    /// upstream `Tegra::Host1x::Host1x::memory_manager` — every GPU cache
+    /// (shader, buffer, texture, query) holds a reference to this same
+    /// instance via the GPU/renderer/rasterizer construction chain.
+    memory_manager: Arc<MaxwellDeviceMemoryManager>,
     // Upstream fields not yet wired:
-    // - memory_manager: MaxwellDeviceMemoryManager — requires Core::System::DeviceMemory
     // - gmmu_manager: MemoryManager — requires Core::System and device memory manager
     // - allocator: FlatAllocator<u32, 0, 32> — requires Common::FlatAllocator port
 }
@@ -196,11 +201,19 @@ impl Host1x {
             syncpoint_manager: Arc::new(SyncpointManager::new()),
             frame_queue: Arc::new(FrameQueue::new()),
             devices: Mutex::new(HashMap::new()),
+            memory_manager: Arc::new(MaxwellDeviceMemoryManager::default()),
         }
     }
 
     pub fn syncpoint_manager(&self) -> &Arc<SyncpointManager> {
         &self.syncpoint_manager
+    }
+
+    /// Port of upstream `Tegra::Host1x::Host1x::MemoryManager()`.
+    /// Returns the single shared `MaxwellDeviceMemoryManager` instance
+    /// that all GPU caches reference.
+    pub fn memory_manager(&self) -> &Arc<MaxwellDeviceMemoryManager> {
+        &self.memory_manager
     }
 
     pub fn frame_queue(&self) -> &Arc<FrameQueue> {
@@ -309,5 +322,21 @@ impl Host1xCoreInterface for Host1x {
             id,
             &crate::host1x::syncpoint_manager::ActionHandle::from_raw(handle),
         );
+    }
+
+    fn smmu_allocate(&self, size: usize) -> u64 {
+        self.memory_manager.smmu_allocate(size)
+    }
+
+    fn smmu_map(&self, d_address: u64, host_ptr: usize, size: usize) {
+        self.memory_manager
+            .smmu_map(d_address, host_ptr as *const u8, size);
+    }
+
+    fn smmu_lookup(&self, d_address: u64) -> usize {
+        self.memory_manager
+            .smmu_get_host_ptr(d_address)
+            .map(|p| p as usize)
+            .unwrap_or(0)
     }
 }

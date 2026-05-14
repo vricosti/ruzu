@@ -512,9 +512,7 @@ impl Gpu {
             if let Some(rasterizer) = gpu.rasterizer_ptr() {
                 unsafe { &mut *rasterizer }.flush_region(addr, size as u64);
             } else if std::env::var_os("RUZU_TRACE_PRESENT").is_some() {
-                log::info!(
-                    "[PRESENT] Gpu::request_flush sync callback: no rasterizer bound"
-                );
+                log::info!("[PRESENT] Gpu::request_flush sync callback: no rasterizer bound");
             }
         }))
     }
@@ -950,6 +948,10 @@ impl GpuCoreInterface for Gpu {
 
     fn on_cpu_write(&self, addr: u64, size: u64) -> bool {
         Gpu::on_cpu_write(self, addr, size)
+    }
+
+    fn flush_region(&self, addr: u64, size: u64) {
+        Gpu::flush_region(self, addr, size);
     }
 }
 

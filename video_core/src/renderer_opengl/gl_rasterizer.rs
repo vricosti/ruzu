@@ -19,19 +19,22 @@ use super::gl_device::Device;
 use super::gl_fence_manager::{Fence, FenceManagerOpenGL};
 use super::gl_query_cache::QueryCache;
 use super::gl_shader_cache::ShaderCache as OpenGLShaderCache;
+use super::gl_texture_cache::TextureCache as OpenGLTextureCache;
 use crate::buffer_cache::buffer_cache::BufferCache as CommonBufferCache;
 use crate::buffer_cache::word_manager::DeviceTracker;
 use crate::engines::draw_manager::DrawState;
 use crate::engines::maxwell_3d::DrawCall;
 use crate::engines::Framebuffer;
 use crate::fence_manager::FenceManager;
+use crate::framebuffer_config::FramebufferConfig;
 use crate::host1x::syncpoint_manager::SyncpointManager;
 use crate::query_cache::types::QueryPropertiesFlags;
 use crate::query_cache_top::QueryType as VideoQueryType;
 use crate::rasterizer::SoftwareRasterizer;
 use crate::rasterizer_interface::{RasterizerDownloadArea, RasterizerInterface};
+use crate::renderer_base::GuestMemoryWriter;
+use crate::renderer_opengl::present::layer::FramebufferTextureInfo;
 use crate::shader_cache::ShaderCache;
-use crate::texture_cache::texture_cache_base::TextureCacheBase;
 
 struct OpenGLDeviceTracker;
 static OPENGL_DEVICE_TRACKER: OpenGLDeviceTracker = OpenGLDeviceTracker;
@@ -255,7 +258,7 @@ pub struct RasterizerOpenGL {
     num_queued_commands: u32,
     has_written_global_memory: bool,
     buffer_cache: CommonBufferCache<OpenGLBufferCacheParams, OpenGLDeviceTracker>,
-    texture_cache: TextureCacheBase,
+    texture_cache: OpenGLTextureCache,
     /// Generic region-tracking shader cache (region invalidation, guest address bookkeeping).
     /// Upstream inherits `GL::ShaderCache` from `VideoCommon::ShaderCache`; we keep them
     /// as two separate composed fields so each can evolve independently.
@@ -304,7 +307,15 @@ impl Drop for RasterizerOpenGL {
 
 impl RasterizerOpenGL {
     /// Create a new rasterizer. Must be called with a current GL context.
-    pub fn new(device: &Device, syncpoints: Arc<SyncpointManager>) -> Self {
+    ///
+    /// `device_memory` is the single shared `MaxwellDeviceMemoryManager`
+    /// from `Host1x::memory_manager()`. Upstream:
+    /// `RasterizerOpenGL::RasterizerOpenGL(emu_window, gpu, device_memory, ...)`.
+    pub fn new(
+        device: &Device,
+        syncpoints: Arc<SyncpointManager>,
+        device_memory: Arc<crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager>,
+    ) -> Self {
         let mut transient_vao: u32 = 0;
         unsafe {
             gl::GenVertexArrays(1, &mut transient_vao);
@@ -323,8 +334,8 @@ impl RasterizerOpenGL {
             num_queued_commands: 0,
             has_written_global_memory: false,
             buffer_cache,
-            texture_cache: TextureCacheBase::new(),
-            shader_cache: ShaderCache::new(),
+            texture_cache: OpenGLTextureCache::new(device_memory.clone()),
+            shader_cache: ShaderCache::new(device_memory),
             gl_shader_cache: OpenGLShaderCache::new(),
             query_cache: QueryCache::new(),
             invalidate_gpu_cache_callback: None,
@@ -337,6 +348,9 @@ impl RasterizerOpenGL {
 
     #[cfg(test)]
     fn new_for_test(syncpoints: Arc<SyncpointManager>) -> Self {
+        let test_device_memory = Arc::new(
+            crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager::default(),
+        );
         Self {
             syncpoints,
             fence_backend: FenceManagerOpenGL::new(),
@@ -345,8 +359,8 @@ impl RasterizerOpenGL {
             num_queued_commands: 0,
             has_written_global_memory: false,
             buffer_cache: CommonBufferCache::new(&OPENGL_DEVICE_TRACKER),
-            texture_cache: TextureCacheBase::new(),
-            shader_cache: ShaderCache::new(),
+            texture_cache: OpenGLTextureCache::new(test_device_memory),
+            shader_cache: ShaderCache::default(),
             gl_shader_cache: OpenGLShaderCache::new(),
             query_cache: QueryCache::new(),
             invalidate_gpu_cache_callback: None,
@@ -381,6 +395,60 @@ impl RasterizerOpenGL {
         self.gpu_ticks_getter = Some(getter);
     }
 
+    pub fn set_guest_memory_writer(&mut self, writer: GuestMemoryWriter) {
+        self.texture_cache.set_guest_memory_writer(writer);
+    }
+
+    /// Port of `RasterizerOpenGL::AccelerateDisplay`.
+    pub fn accelerate_display(
+        &mut self,
+        config: &FramebufferConfig,
+        framebuffer_addr: u64,
+        _pixel_stride: u32,
+    ) -> Option<FramebufferTextureInfo> {
+        if framebuffer_addr == 0 {
+            return None;
+        }
+
+        let texture_cache: *mut OpenGLTextureCache = &mut self.texture_cache;
+        let framebuffer_view = unsafe {
+            let _texture_lock = (*texture_cache).base.mutex.lock();
+            (*texture_cache).try_find_framebuffer_image_view(config, framebuffer_addr)
+        };
+
+        let Some(framebuffer_view) = framebuffer_view else {
+            if std::env::var_os("RUZU_TRACE_PRESENT").is_some() {
+                log::info!(
+                    "[PRESENT] AccelerateDisplay miss no_texture_cache_view addr=0x{:X} {}x{} stride={}",
+                    framebuffer_addr,
+                    config.width,
+                    config.height,
+                    config.stride
+                );
+            }
+            return None;
+        };
+
+        if std::env::var_os("RUZU_TRACE_PRESENT").is_some() {
+            log::info!(
+                "[PRESENT] AccelerateDisplay hit view_id={} texture={} addr=0x{:X} size={}x{} scaled={}",
+                framebuffer_view.view_id.index,
+                framebuffer_view.display_texture,
+                framebuffer_addr,
+                framebuffer_view.width,
+                framebuffer_view.height,
+                framebuffer_view.scaled
+            );
+        }
+        Some(FramebufferTextureInfo {
+            display_texture: framebuffer_view.display_texture,
+            width: framebuffer_view.width,
+            height: framebuffer_view.height,
+            scaled_width: framebuffer_view.width,
+            scaled_height: framebuffer_view.height,
+        })
+    }
+
     /// Process draw calls and produce a framebuffer.
     ///
     /// Currently delegates to the software rasterizer. As more GL pipeline
@@ -413,10 +481,10 @@ impl RasterizerOpenGL {
     fn should_wait_async_flushes(&mut self) -> bool {
         let buffer_cache: *mut CommonBufferCache<OpenGLBufferCacheParams, OpenGLDeviceTracker> =
             &mut self.buffer_cache;
-        let texture_cache: *mut TextureCacheBase = &mut self.texture_cache;
+        let texture_cache: *mut OpenGLTextureCache = &mut self.texture_cache;
         unsafe {
             let _buffer_lock = (*buffer_cache).mutex.lock();
-            let _texture_lock = (*texture_cache).mutex.lock();
+            let _texture_lock = (*texture_cache).base.mutex.lock();
             (*texture_cache).should_wait_async_flushes()
                 || (*buffer_cache).should_wait_async_flushes()
                 || self.query_cache.should_wait_async_flushes()
@@ -426,10 +494,10 @@ impl RasterizerOpenGL {
     fn should_flush_async(&mut self) -> bool {
         let buffer_cache: *mut CommonBufferCache<OpenGLBufferCacheParams, OpenGLDeviceTracker> =
             &mut self.buffer_cache;
-        let texture_cache: *mut TextureCacheBase = &mut self.texture_cache;
+        let texture_cache: *mut OpenGLTextureCache = &mut self.texture_cache;
         unsafe {
             let _buffer_lock = (*buffer_cache).mutex.lock();
-            let _texture_lock = (*texture_cache).mutex.lock();
+            let _texture_lock = (*texture_cache).base.mutex.lock();
             (*texture_cache).has_uncommitted_flushes()
                 || (*buffer_cache).has_uncommitted_flushes()
                 || self.query_cache.has_uncommitted_flushes()
@@ -439,10 +507,10 @@ impl RasterizerOpenGL {
     fn pop_async_flushes(&mut self) {
         let buffer_cache: *mut CommonBufferCache<OpenGLBufferCacheParams, OpenGLDeviceTracker> =
             &mut self.buffer_cache;
-        let texture_cache: *mut TextureCacheBase = &mut self.texture_cache;
+        let texture_cache: *mut OpenGLTextureCache = &mut self.texture_cache;
         unsafe {
             let _buffer_lock = (*buffer_cache).mutex.lock();
-            let _texture_lock = (*texture_cache).mutex.lock();
+            let _texture_lock = (*texture_cache).base.mutex.lock();
             (*texture_cache).pop_async_flushes();
             (*buffer_cache).pop_async_flushes();
         }
@@ -452,10 +520,10 @@ impl RasterizerOpenGL {
     fn commit_async_flushes(&mut self) {
         let buffer_cache: *mut CommonBufferCache<OpenGLBufferCacheParams, OpenGLDeviceTracker> =
             &mut self.buffer_cache;
-        let texture_cache: *mut TextureCacheBase = &mut self.texture_cache;
+        let texture_cache: *mut OpenGLTextureCache = &mut self.texture_cache;
         unsafe {
             let _buffer_lock = (*buffer_cache).mutex.lock();
-            let _texture_lock = (*texture_cache).mutex.lock();
+            let _texture_lock = (*texture_cache).base.mutex.lock();
             (*texture_cache).commit_async_flushes();
             (*buffer_cache).commit_async_flushes();
         }
@@ -495,7 +563,7 @@ impl RasterizerInterface for RasterizerOpenGL {
     ///   `maxwell3d->draw_manager->GetDrawState()` — but without requiring
     ///   the rasterizer to carry a Maxwell3D reference.
     /// * Buffer-cache / texture-cache binding (`buffer_cache.mutex`,
-    ///   `texture_cache.mutex`, `SyncState`, `SetEngine`) and the actual
+    ///   `texture_cache.base.mutex`, `SyncState`, `SetEngine`) and the actual
     ///   `glDraw*` family are still deferred to step 4+. They require real
     ///   buffer/texture caches and a compiled GL program.
     ///
@@ -504,6 +572,18 @@ impl RasterizerInterface for RasterizerOpenGL {
     /// every `Draw` — a single pipeline key may be drawn with multiple
     /// topologies in successive calls.
     fn draw(&mut self, draw_state: &DrawState, instance_count: u32) {
+        if let Some(mm) = self.channel_memory_manager.as_ref().cloned() {
+            let texture_cache: *mut OpenGLTextureCache = &mut self.texture_cache;
+            unsafe {
+                let _texture_lock = (*texture_cache).base.mutex.lock();
+                (*texture_cache).update_render_targets_from_draw_state(draw_state, |gpu_addr| {
+                    mm.lock().gpu_to_cpu_address(gpu_addr)
+                });
+            }
+        } else if std::env::var_os("RUZU_TRACE_RT").is_some() {
+            log::info!("[RT] miss no_channel_memory_manager");
+        }
+
         let Some(pipeline) = self
             .gl_shader_cache
             .current_graphics_pipeline_with_shared_cache(&mut self.shader_cache)
@@ -610,8 +690,90 @@ impl RasterizerInterface for RasterizerOpenGL {
         debug!("RasterizerOpenGL::draw_texture");
     }
 
-    fn clear(&mut self, _layer_count: u32) {
-        debug!("RasterizerOpenGL::clear");
+    fn clear(&mut self, draw_state: &DrawState, layer_count: u32) {
+        let flags = draw_state.clear_state.flags;
+        let clear_z = flags & (1 << 0) != 0;
+        let clear_s = flags & (1 << 1) != 0;
+        let clear_r = flags & (1 << 2) != 0;
+        let clear_g = flags & (1 << 3) != 0;
+        let clear_b = flags & (1 << 4) != 0;
+        let clear_a = flags & (1 << 5) != 0;
+        let use_color = clear_r || clear_g || clear_b || clear_a;
+        let use_depth = clear_z;
+        let use_stencil = clear_s;
+
+        if !use_color && !use_depth && !use_stencil {
+            return;
+        }
+
+        if !use_color {
+            if std::env::var_os("RUZU_TRACE_CLEAR").is_some() {
+                debug!(
+                    "RasterizerOpenGL::clear depth/stencil-only skipped layers={}",
+                    layer_count
+                );
+            }
+            return;
+        }
+
+        let rt_index = ((flags >> 6) & 0xF) as usize;
+        if rt_index >= draw_state.render_targets.len() {
+            return;
+        }
+        let rt = draw_state.render_targets[rt_index];
+        let Some(mm) = self.channel_memory_manager.as_ref().cloned() else {
+            if std::env::var_os("RUZU_TRACE_CLEAR").is_some() {
+                debug!("RasterizerOpenGL::clear skipped, no channel memory manager");
+            }
+            return;
+        };
+
+        let texture_cache: *mut OpenGLTextureCache = &mut self.texture_cache;
+        let framebuffer = unsafe {
+            let _texture_lock = (*texture_cache).base.mutex.lock();
+            (*texture_cache).update_render_targets_from_draw_state(draw_state, |gpu_addr| {
+                mm.lock().gpu_to_cpu_address(gpu_addr)
+            });
+            (*texture_cache).framebuffer_for_render_target(&rt)
+        };
+        let Some((framebuffer, width, height)) = framebuffer else {
+            if std::env::var_os("RUZU_TRACE_CLEAR").is_some() {
+                debug!(
+                    "RasterizerOpenGL::clear skipped, no framebuffer rt={} gpu=0x{:X} {}x{} fmt=0x{:X}",
+                    rt_index, rt.address, rt.width, rt.height, rt.format
+                );
+            }
+            return;
+        };
+
+        unsafe {
+            gl::BindFramebuffer(gl::DRAW_FRAMEBUFFER, framebuffer);
+            gl::Viewport(0, 0, width as i32, height as i32);
+            gl::Disablei(gl::SCISSOR_TEST, 0);
+            gl::ColorMaski(
+                0,
+                if clear_r { gl::TRUE } else { gl::FALSE },
+                if clear_g { gl::TRUE } else { gl::FALSE },
+                if clear_b { gl::TRUE } else { gl::FALSE },
+                if clear_a { gl::TRUE } else { gl::FALSE },
+            );
+            gl::ClearBufferfv(gl::COLOR, 0, draw_state.clear_state.color.as_ptr());
+            gl::ColorMaski(0, gl::TRUE, gl::TRUE, gl::TRUE, gl::TRUE);
+        }
+        self.num_queued_commands = self.num_queued_commands.saturating_add(1);
+
+        if std::env::var_os("RUZU_TRACE_CLEAR").is_some() {
+            debug!(
+                "RasterizerOpenGL::clear color rt={} gpu=0x{:X} fbo={} {}x{} rgba={:?} layers={}",
+                rt_index,
+                rt.address,
+                framebuffer,
+                width,
+                height,
+                draw_state.clear_state.color,
+                layer_count
+            );
+        }
     }
 
     fn dispatch_compute(&mut self) {
@@ -1028,16 +1190,18 @@ impl RasterizerInterface for RasterizerOpenGL {
     }
 
     fn initialize_channel(&mut self, channel: &crate::control::channel_state::ChannelState) {
+        self.shader_cache.create_channel(channel);
         self.query_cache.create_channel(channel);
         // Upstream `RasterizerOpenGL` also creates per-channel state for the
-        // texture, buffer, and shader caches here. Those owners are still
-        // partially reduced in Rust.
+        // texture and buffer caches here. Those owners are still partially
+        // reduced in Rust.
     }
 
     fn bind_channel(&mut self, channel: &crate::control::channel_state::ChannelState) {
         if self.buffer_cache.channel_state.is_none() {
             self.buffer_cache.channel_state = Some(Box::default());
         }
+        self.shader_cache.bind_to_channel(channel.bind_id);
         self.query_cache.bind_to_channel(channel.bind_id);
         // Extract the channel's MemoryManager and store it so subsequent
         // draws can build GpuMemoryAccess adapters.
@@ -1069,6 +1233,7 @@ impl RasterizerInterface for RasterizerOpenGL {
     }
 
     fn release_channel(&mut self, channel_id: i32) {
+        self.shader_cache.erase_channel(channel_id);
         self.query_cache.erase_channel(channel_id);
         self.channel_memory_manager = None;
     }

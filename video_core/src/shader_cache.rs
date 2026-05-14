@@ -81,7 +81,11 @@ impl Entry {
 ///
 /// Handles invalidation when guest memory is modified.
 pub struct ShaderCache {
-    device_memory: MaxwellDeviceMemoryManager,
+    /// Shared `MaxwellDeviceMemoryManager` instance — same `Arc` is held
+    /// by `Host1x::memory_manager`, the buffer cache, and the texture
+    /// cache. Mirrors upstream's `MaxwellDeviceMemoryManager& device_memory`
+    /// reference member.
+    device_memory: Arc<MaxwellDeviceMemoryManager>,
     channel_caches: ChannelSetupCaches<ChannelInfo>,
     lookup_mutex: Mutex<()>,
     invalidation_mutex: Mutex<()>,
@@ -121,10 +125,25 @@ impl Default for GraphicsEnvironments {
     }
 }
 
+fn shader_stage_type_from_index(index: usize) -> ShaderStageType {
+    match index {
+        0 => ShaderStageType::VertexA,
+        1 => ShaderStageType::VertexB,
+        2 => ShaderStageType::TessInit,
+        3 => ShaderStageType::Tessellation,
+        4 => ShaderStageType::Geometry,
+        5 => ShaderStageType::Fragment,
+        _ => ShaderStageType::Invalid,
+    }
+}
+
 impl ShaderCache {
-    pub fn new() -> Self {
+    /// Port of upstream `ShaderCache::ShaderCache(MaxwellDeviceMemoryManager& device_memory_)`.
+    /// Takes a shared `Arc` rather than a reference: the same instance is
+    /// held by `Host1x`, the buffer cache, and the texture cache.
+    pub fn new(device_memory: Arc<MaxwellDeviceMemoryManager>) -> Self {
         Self {
-            device_memory: MaxwellDeviceMemoryManager::default(),
+            device_memory,
             channel_caches: ChannelSetupCaches::new(),
             lookup_mutex: Mutex::new(()),
             invalidation_mutex: Mutex::new(()),
@@ -135,6 +154,12 @@ impl ShaderCache {
             shader_infos: [None; NUM_PROGRAMS],
             last_shaders_valid: false,
         }
+    }
+
+    /// Access the shared `MaxwellDeviceMemoryManager`. Same `Arc` as
+    /// `Host1x::memory_manager()`.
+    pub fn device_memory(&self) -> &Arc<MaxwellDeviceMemoryManager> {
+        &self.device_memory
     }
 
     /// Port of the shared `ShaderCache` channel-owner `CreateChannel` edge.
@@ -173,16 +198,19 @@ impl ShaderCache {
             self.last_shaders_valid = false;
             return false;
         };
-        let maxwell_ptr = channel.maxwell3d as *const Maxwell3D;
+        let maxwell_ptr = channel.maxwell3d as *mut Maxwell3D;
         if maxwell_ptr.is_null() {
             self.last_shaders_valid = false;
             return false;
+        }
+        let maxwell3d = unsafe { &mut *maxwell_ptr };
+        if !maxwell3d.consume_dirty_shaders() {
+            return self.last_shaders_valid;
         }
         let Some(gpu_memory) = channel.gpu_memory.as_ref().map(Arc::clone) else {
             self.last_shaders_valid = false;
             return false;
         };
-        let maxwell3d = unsafe { &*maxwell_ptr };
         if maxwell3d.memory_manager().is_none() || maxwell3d.guest_memory_reader().is_none() {
             self.last_shaders_valid = false;
             return false;
@@ -196,15 +224,23 @@ impl ShaderCache {
             std::array::from_fn(|index| maxwell3d.is_shader_stage_enabled(index as u32));
         for (index, unique_hash) in unique_hashes.iter_mut().enumerate() {
             let stage_info = stage_infos[index];
+            let program_type = shader_stage_type_from_index(index);
             if !stage_enabled[index] {
                 *unique_hash = 0;
                 self.shader_infos[index] = None;
                 continue;
             }
-            if stage_info.program_type == ShaderStageType::Fragment && !rasterize_enable {
+            if program_type == ShaderStageType::Fragment && !rasterize_enable {
                 *unique_hash = 0;
                 self.shader_infos[index] = None;
                 continue;
+            }
+
+            if std::env::var_os("RUZU_TRACE_SHADER_WORDS").is_some() {
+                eprintln!(
+                    "[SHADER_STAGE_INFO] index={} program={:?} reg_program={:?} offset=0x{:X} base=0x{:X}",
+                    index, program_type, stage_info.program_type, stage_info.offset, base_addr
+                );
             }
 
             let shader_addr = base_addr + stage_info.offset as u64;
@@ -212,6 +248,18 @@ impl ShaderCache {
                 let memory = gpu_memory.lock();
                 memory.gpu_to_cpu_address(shader_addr)
             };
+            if std::env::var_os("RUZU_TRACE_SHADER_WORDS").is_some() {
+                match cpu_shader_addr {
+                    Some(cpu) => eprintln!(
+                        "[SHADER_VA] gpu=0x{:X} -> cpu=0x{:X}",
+                        shader_addr, cpu
+                    ),
+                    None => eprintln!(
+                        "[SHADER_VA] gpu=0x{:X} -> UNMAPPED (gpu_to_cpu_address returned None)",
+                        shader_addr
+                    ),
+                }
+            }
             let Some(cpu_shader_addr) = cpu_shader_addr else {
                 self.last_shaders_valid = false;
                 return false;
@@ -220,14 +268,14 @@ impl ShaderCache {
             let shader_ptr = if let Some(shader_info) = self.try_get(cpu_shader_addr) {
                 shader_info as *const ShaderInfo
             } else {
-                if stage_info.program_type == ShaderStageType::Invalid {
+                if program_type == ShaderStageType::Invalid {
                     *unique_hash = 0;
                     self.shader_infos[index] = None;
                     continue;
                 }
                 let mut env = GraphicsEnvironment::from_maxwell3d(
                     maxwell3d,
-                    stage_info.program_type,
+                    program_type,
                     base_addr,
                     stage_info.offset,
                 );
@@ -302,14 +350,15 @@ impl ShaderCache {
                 continue;
             };
             let stage_info = maxwell3d.shader_stage_info(index as u32);
-            if stage_info.program_type == ShaderStageType::Invalid {
+            let program_type = shader_stage_type_from_index(index);
+            if program_type == ShaderStageType::Invalid {
                 continue;
             }
 
             let shader_info = unsafe { &*shader_ptr };
             let mut env = GraphicsEnvironment::from_maxwell3d(
                 maxwell3d,
-                stage_info.program_type,
+                program_type,
                 base_addr,
                 stage_info.offset,
             );
@@ -825,8 +874,12 @@ impl ShaderCache {
 }
 
 impl Default for ShaderCache {
+    /// Convenience default: fresh empty `MaxwellDeviceMemoryManager`.
+    /// Production code constructs `ShaderCache` from
+    /// `Host1x::memory_manager()`. Used by tests and standalone benches
+    /// that don't need cross-cache invalidation.
     fn default() -> Self {
-        Self::new()
+        Self::new(Arc::new(MaxwellDeviceMemoryManager::default()))
     }
 }
 
@@ -859,7 +912,7 @@ mod tests {
 
     #[test]
     fn shader_cache_starts_with_upstream_shared_state_defaults() {
-        let cache = ShaderCache::new();
+        let cache = ShaderCache::default();
         assert!(cache.current_channel_info().is_none());
         assert_eq!(cache.shader_info_slots(), &[None; NUM_PROGRAMS]);
         assert!(!cache.last_shaders_valid());
@@ -867,7 +920,7 @@ mod tests {
 
     #[test]
     fn shader_cache_channel_owner_tracks_bound_channel_info() {
-        let mut cache = ShaderCache::new();
+        let mut cache = ShaderCache::default();
         let mut channel = ChannelState::new(7);
         channel.program_id = 0x1234;
         channel.memory_manager = Some(Arc::new(ParkingLotMutex::new(MemoryManager::new(0))));
@@ -888,7 +941,7 @@ mod tests {
 
     #[test]
     fn register_creates_lookup_and_invalidation_entries() {
-        let mut cache = ShaderCache::new();
+        let mut cache = ShaderCache::default();
         cache.register(
             Box::new(ShaderInfo {
                 unique_hash: 0x1234,
@@ -932,7 +985,7 @@ mod tests {
             .with_gpu_read(reader)
             .with_program(program_base, 0);
         let _ = env.read_instruction(0);
-        let mut cache = ShaderCache::new();
+        let mut cache = ShaderCache::default();
 
         let shader = cache.make_shader_info(&mut env, 0x9000);
         assert_ne!(shader.unique_hash, 0);
@@ -975,7 +1028,7 @@ mod tests {
         let mut env = GenericEnvironment::new()
             .with_gpu_read(reader)
             .with_program(program_base, 0);
-        let mut cache = ShaderCache::new();
+        let mut cache = ShaderCache::default();
 
         let shader = cache.make_shader_info(&mut env, 0xA000);
         assert_ne!(shader.unique_hash, 0);
@@ -1009,7 +1062,7 @@ mod tests {
         channel.maxwell_3d = Some(Box::new(maxwell));
         channel.kepler_compute = Some(Box::default());
 
-        let mut cache = ShaderCache::new();
+        let mut cache = ShaderCache::default();
         cache.create_channel(&channel);
         cache.bind_to_channel(7);
 
@@ -1018,6 +1071,31 @@ mod tests {
         assert_ne!(unique_hashes[1], 0);
         assert!(cache.shader_info_slots()[1].is_some());
         assert!(cache.last_shaders_valid());
+    }
+
+    #[test]
+    fn refresh_stages_respects_shader_dirty_gate() {
+        let memory_manager = Arc::new(ParkingLotMutex::new(MemoryManager::new(0)));
+        let mut maxwell = Maxwell3D::new();
+        maxwell.set_memory_manager(Arc::clone(&memory_manager));
+        maxwell.set_guest_memory_reader(make_cpu_reader(0, Arc::new(vec![0; 0x1000])));
+
+        let mut channel = ChannelState::new(8);
+        channel.program_id = 0x4321;
+        channel.memory_manager = Some(Arc::clone(&memory_manager));
+        channel.maxwell_3d = Some(Box::new(maxwell));
+        channel.kepler_compute = Some(Box::default());
+
+        let mut cache = ShaderCache::default();
+        cache.create_channel(&channel);
+        cache.bind_to_channel(8);
+
+        let mut unique_hashes = [0xDEAD_BEEFu64; NUM_PROGRAMS];
+        assert!(!cache.refresh_stages(&mut unique_hashes));
+        unique_hashes = [0xDEAD_BEEFu64; NUM_PROGRAMS];
+        assert!(!cache.refresh_stages(&mut unique_hashes));
+        assert_eq!(unique_hashes, [0xDEAD_BEEFu64; NUM_PROGRAMS]);
+        assert!(cache.shader_info_slots().iter().all(Option::is_none));
     }
 
     #[test]
@@ -1058,7 +1136,7 @@ mod tests {
             ..QueueMetaData::default()
         };
 
-        let mut cache = ShaderCache::new();
+        let mut cache = ShaderCache::default();
         cache.create_channel(&channel);
         cache.bind_to_channel(9);
 

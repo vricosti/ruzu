@@ -23,6 +23,7 @@
 //! | `-v` / `--version`   | handled by clap          |
 
 use clap::Parser;
+use sdl2::libc;
 use std::ffi::OsStr;
 
 pub mod emu_window;
@@ -219,10 +220,311 @@ fn on_status_message_received(msg_type: u32, nickname: &str) {
 /// 8. system.Run()  — starts CPU threads in background
 /// 9. while (emu_window->IsOpen()) { emu_window->WaitEvent(); }
 /// 10. system.Pause(), system.ShutdownMainProcess()
+/// Global atomic holding the fastmem-arena base pointer for the SIGILL
+/// handler to compute host VAs. Set once at process init by reading
+/// `/proc/self/maps` lazily, or via `RUZU_DUMP_FASTMEM_VAS` env var.
+static FASTMEM_BASE_FOR_SIGILL: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Parsed list of guest vaddrs to dump from the SIGILL handler (env-var-driven).
+static DUMP_FASTMEM_VAS: std::sync::LazyLock<Vec<u64>> = std::sync::LazyLock::new(|| {
+    std::env::var("RUZU_DUMP_FASTMEM_VAS")
+        .ok()
+        .map(|spec| {
+            spec.split(',')
+                .filter_map(|s| u64::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok())
+                .collect()
+        })
+        .unwrap_or_default()
+});
+
+/// Auto-detect fastmem arena base from /proc/self/maps. Best-effort; uses
+/// the largest anonymous rw-p mapping > 100 GB. Populates
+/// `FASTMEM_BASE_FOR_SIGILL` for the SIGILL handler.
+fn detect_fastmem_base_for_sigill() {
+    let maps = match std::fs::read_to_string("/proc/self/maps") {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+    let mut best: (usize, usize) = (0, 0); // (size, start)
+    for line in maps.lines() {
+        // Format: addr-addr perm offset dev inode pathname
+        let Some(dash) = line.find('-') else { continue };
+        let space = match line[dash..].find(' ') {
+            Some(p) => dash + p,
+            None => continue,
+        };
+        let start = u64::from_str_radix(&line[..dash], 16).unwrap_or(0) as usize;
+        let end = u64::from_str_radix(&line[dash + 1..space], 16).unwrap_or(0) as usize;
+        let size = end.saturating_sub(start);
+        let perm = &line[space + 1..space + 1 + 4.min(line.len() - space - 1)];
+        if size > 100 * (1 << 30) && perm.contains("rw") {
+            if size > best.0 {
+                best = (size, start);
+            }
+        }
+    }
+    if best.1 != 0 {
+        FASTMEM_BASE_FOR_SIGILL.store(best.1, std::sync::atomic::Ordering::Relaxed);
+        eprintln!(
+            "[SIGILL-init] fastmem arena base auto-detected: 0x{:016X} (size {} GB)",
+            best.1,
+            best.0 >> 30
+        );
+    }
+}
+
+/// SIGILL handler — installed when RUZU_SIGILL_TRACE=1.
+/// Prints faulting RIP and exits, so per-inst-check UD2 traps can be
+/// localized to a specific JIT-emitted location.
+extern "C" fn ruzu_sigill_handler(
+    _sig: sdl2::libc::c_int,
+    _info: *mut libc::siginfo_t,
+    ucontext: *mut libc::c_void,
+) {
+    unsafe {
+        let uc = ucontext as *mut libc::ucontext_t;
+        let mctx = &(*uc).uc_mcontext;
+        let rip = mctx.gregs[libc::REG_RIP as usize] as u64;
+        let rax = mctx.gregs[libc::REG_RAX as usize] as u64;
+        let r11 = mctx.gregs[libc::REG_R11 as usize] as u64;
+        let r15 = mctx.gregs[libc::REG_R15 as usize] as u64;
+        let bytes_around: [u8; 8] = std::ptr::read_unaligned(rip as *const [u8; 8]);
+
+        // Sentinel detection: rax==0xCAFEF00D is the legacy SetX trap
+        // marker; r11==0xCAFEF00D (sign-extended to 0xFFFFFFFFCAFEF00D)
+        // is the fastmem-W64 trap (uses R11 as scratch to avoid RAX
+        // regalloc conflicts). Vaddr is at [RSP+16] for fastmem trap.
+        //
+        // The new RUZU_TRAP_FASTMEM_ANY_VADDR_RANGE trap encodes write
+        // width in the low byte: 0xCAFEF008 (W8), 0xCAFEF010 (W16),
+        // 0xCAFEF020 (W32), 0xCAFEF040 (W64). All such sentinels also
+        // use the stack-recovery convention.
+        let rsp = mctx.gregs[libc::REG_RSP as usize] as u64;
+        let is_width_sentinel = |v: u64| -> bool {
+            // High 32 bits of sign-extended sentinel are 0xFFFFFFFF; low 32
+            // bits are 0xCAFEF0XX with XX ∈ {0D, 08, 10, 20, 40}.
+            let low = v & 0xFFFF_FFFF;
+            let high = v >> 32;
+            (high == 0xFFFF_FFFF || high == 0)
+                && (low & 0xFFFF_FF00) == 0xCAFE_F000
+                && matches!(low & 0xFF, 0x0D | 0x08 | 0x10 | 0x20 | 0x40 | 0x80 | 0xE1)
+        };
+        let has_recovery_stack = is_width_sentinel(rax) || is_width_sentinel(r11);
+        let recovered_vaddr = if has_recovery_stack {
+            std::ptr::read_unaligned((rsp + 16) as *const u64)
+        } else {
+            0
+        };
+        let recovered_aux = if has_recovery_stack {
+            std::ptr::read_unaligned((rsp + 24) as *const u64)
+        } else {
+            0
+        };
+        let s = format!(
+            "[SIGILL] rip=0x{:016X} rax=0x{:016X} r11=0x{:016X} r15=0x{:016X} bytes={:02X?} recovered_vaddr=0x{:016X} recovered_aux=0x{:016X}\n",
+            rip, rax, r11, r15, bytes_around, recovered_vaddr, recovered_aux
+        );
+        let bytes = s.as_bytes();
+        sdl2::libc::write(2, bytes.as_ptr() as *const libc::c_void, bytes.len());
+
+        // R15 == JitState pointer when in JIT code. A64JitState layout:
+        //   offset 0..248:  reg[0..31] (X0..X30)
+        //   offset 248:     sp
+        //   offset 256:     pc
+        // RAX (the reg_index_imm we just wrote) tells which X-register
+        // triggered the trap. Dump all guest GPRs + PC + SP + the
+        // reg-being-set (RAX = reg_index).
+        if r15 != 0 {
+            // Cap the readback to avoid faulting if R15 is not a valid pointer.
+            // We rely on stable struct layout matching `A64JitState`.
+            let pc = std::ptr::read_unaligned((r15 + 256) as *const u64);
+            let sp = std::ptr::read_unaligned((r15 + 248) as *const u64);
+            let s2 = format!(
+                "[SIGILL]   trapping reg index = X{}, guest PC = 0x{:016X}, guest SP = 0x{:016X}\n",
+                rax, pc, sp
+            );
+            sdl2::libc::write(2, s2.as_bytes().as_ptr() as *const libc::c_void, s2.len());
+            // Dump X0..X30
+            for i in 0..31 {
+                let x = std::ptr::read_unaligned((r15 + (i * 8) as u64) as *const u64);
+                let s3 = format!("[SIGILL]   X{:<2} = 0x{:016X}\n", i, x);
+                sdl2::libc::write(2, s3.as_bytes().as_ptr() as *const libc::c_void, s3.len());
+            }
+        }
+
+        // Auto-dump the value at recovered_vaddr (the trap's destination).
+        // For any fastmem-trap with stack-recovery, recovered_vaddr is the
+        // guest vaddr the JIT was writing to; after the trap fires, host
+        // memory at [arena_base + recovered_vaddr] holds the just-stored
+        // value. This is more useful than printing only the value reg
+        // (which can be clobbered by ordered xchg or stale in JitState).
+        let fastmem_base_value = FASTMEM_BASE_FOR_SIGILL.load(std::sync::atomic::Ordering::Relaxed);
+        if has_recovery_stack && fastmem_base_value != 0 && recovered_vaddr != 0 {
+            let host_addr = fastmem_base_value.wrapping_add(recovered_vaddr as usize);
+            let stored = std::ptr::read_unaligned(host_addr as *const u64);
+            let s = format!(
+                "[SIGILL]   stored_value@vaddr=0x{:016X} = 0x{:016X}\n",
+                recovered_vaddr, stored,
+            );
+            sdl2::libc::write(2, s.as_bytes().as_ptr() as *const libc::c_void, s.len());
+        }
+
+        // RUZU_DUMP_FASTMEM_VAS=0xVADDR[,0xVADDR,...] — at SIGILL time, also
+        // dump 16 bytes of host memory at fastmem_base + guest_vaddr for each
+        // listed guest vaddr. Used to verify what the JIT's mov [r13+vaddr]
+        // would have actually read.
+        let fastmem_base = FASTMEM_BASE_FOR_SIGILL.load(std::sync::atomic::Ordering::Relaxed);
+        if fastmem_base != 0 {
+            // VAddrs to dump: encoded as RUZU_DUMP_FASTMEM_VAS env value.
+            // Not safe to call env::var inside a signal handler (it allocates)
+            // — so we read the env via a static parsed at startup.
+            for &vaddr in &*DUMP_FASTMEM_VAS {
+                let host_addr = fastmem_base.wrapping_add(vaddr as usize);
+                let lo = std::ptr::read_unaligned(host_addr as *const u64);
+                let hi = std::ptr::read_unaligned((host_addr + 8) as *const u64);
+                let s = format!(
+                    "[SIGILL]   *[host=0x{:016X}, guest=0x{:016X}] = 0x{:016X} 0x{:016X}\n",
+                    host_addr, vaddr, lo, hi,
+                );
+                sdl2::libc::write(2, s.as_bytes().as_ptr() as *const libc::c_void, s.len());
+            }
+        }
+
+        // RUZU_SIGILL_MAX=N — log up to N traps then exit. Default 1 (legacy behavior).
+        // Allows bisecting causal chain by capturing multiple corrupt-write events.
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static SIGILL_COUNT: AtomicU32 = AtomicU32::new(0);
+        let max = std::env::var("RUZU_SIGILL_MAX")
+            .ok()
+            .and_then(|s| s.parse::<u32>().ok())
+            .unwrap_or(1);
+        let n = SIGILL_COUNT.fetch_add(1, Ordering::Relaxed);
+        if n + 1 < max {
+            // Skip the UD2 (2 bytes) and resume.
+            (*uc).uc_mcontext.gregs[libc::REG_RIP as usize] = (rip + 2) as i64;
+            return;
+        }
+        sdl2::libc::_exit(132);
+    }
+}
+
 fn main() {
     // Initialise logging backend (upstream: Common::Log::Initialize /
     // SetColorConsoleBackendEnabled / Start).
     env_logger::init();
+
+    if std::env::var_os("RUZU_SIGILL_TRACE").is_some() {
+        unsafe {
+            let mut sa: sdl2::libc::sigaction = std::mem::zeroed();
+            sa.sa_sigaction = ruzu_sigill_handler as usize;
+            sa.sa_flags = libc::SA_SIGINFO;
+            sdl2::libc::sigemptyset(&mut sa.sa_mask);
+            sdl2::libc::sigaction(libc::SIGILL, &sa, std::ptr::null_mut());
+        }
+        // Spawn background detector for fastmem base (populates global
+        // FASTMEM_BASE_FOR_SIGILL atomic that the handler reads to dump
+        // host memory at trap moments).
+        std::thread::Builder::new()
+            .name("sigill-fastmem-detect".into())
+            .spawn(|| {
+                // Wait until fastmem is initialized (gives Memory::new time).
+                for _ in 0..200 {
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                    detect_fastmem_base_for_sigill();
+                    if FASTMEM_BASE_FOR_SIGILL.load(std::sync::atomic::Ordering::Relaxed) != 0 {
+                        return;
+                    }
+                }
+            })
+            .ok();
+    }
+
+    // RUZU_ALLOW_PTRACER=1 — opt into being ptraceable from any process.
+    // YAMA's ptrace_scope=1 (default on Ubuntu) restricts ptrace to direct
+    // descendants. Setting `PR_SET_PTRACER` to `PR_SET_PTRACER_ANY` (-1)
+    // lets external gdb/strace attach without sudo. Used by
+    // `scripts/hw_watch_wedge.py` to set a hardware watchpoint on the
+    // fastmem arena page that wedges STK's allocator.
+    // RUZU_BLOCK_COUNT_PC=0xLO-0xHI: install a SIGUSR2 handler that dumps
+    // per-emulator-core block-entry counts. The counters live in rdynarmic.
+    // Gentle alternative to RUZU_BLOCK_TRACE_PC for distributions where
+    // eprintln-based tracing would mask the race timing.
+    if std::env::var_os("RUZU_BLOCK_COUNT_PC").is_some()
+        || std::env::var_os("RUZU_COUNT_W64_BY_CORE_AT_VADDR").is_some()
+        || std::env::var_os("RUZU_BLOCK_PROLOGUE_COUNT_PC").is_some()
+        || std::env::var_os("RUZU_FIRST_PCS_PER_CORE").is_some()
+    {
+        // SIGUSR2 path — useful when the JIT thread isn't flooding stderr.
+        extern "C" fn dump_counts(_: libc::c_int) {
+            rdynarmic::jit::dump_block_count_summary();
+            eprintln!("{}", rdynarmic::jit::block_prologue_count_summary_string());
+            eprintln!("{}", rdynarmic::jit::first_pcs_per_core_summary_string());
+            ruzu_core::arm::dynarmic::arm_dynarmic_64::dump_w64_by_core_counters();
+        }
+        unsafe {
+            let mut sa: libc::sigaction = std::mem::zeroed();
+            sa.sa_sigaction = dump_counts as usize;
+            sa.sa_flags = 0;
+            libc::sigemptyset(&mut sa.sa_mask);
+            libc::sigaction(libc::SIGUSR2, &sa, std::ptr::null_mut());
+        }
+        // RUZU_COUNT_DUMP_FILE=/tmp/x.log — periodic background dump every 5s.
+        // Robust against eprintln-flood deadlocks where SIGUSR2 races stderr.
+        // Writes both BLOCK_COUNT and W64_BY_CORE summaries.
+        if let Ok(path) = std::env::var("RUZU_COUNT_DUMP_FILE") {
+            std::thread::Builder::new()
+                .name("count-dumper".into())
+                .spawn(move || loop {
+                    std::thread::sleep(std::time::Duration::from_secs(5));
+                    if let Ok(file) = std::fs::OpenOptions::new()
+                        .create(true)
+                        .write(true)
+                        .truncate(true)
+                        .open(&path)
+                    {
+                        use std::io::Write;
+                        let mut w = std::io::BufWriter::new(file);
+                        let ts = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs())
+                            .unwrap_or(0);
+                        let _ = writeln!(w, "[count-dumper] ts={}", ts);
+                        let _ = writeln!(w, "{}", rdynarmic::jit::block_count_summary_string());
+                        let _ = writeln!(
+                            w,
+                            "{}",
+                            rdynarmic::jit::block_prologue_count_summary_string()
+                        );
+                        let _ =
+                            writeln!(w, "{}", rdynarmic::jit::first_pcs_per_core_summary_string());
+                        let _ = writeln!(
+                            w,
+                            "{}",
+                            ruzu_core::arm::dynarmic::arm_dynarmic_64::w64_by_core_summary_string()
+                        );
+                    }
+                })
+                .ok();
+        }
+        eprintln!(
+            "[BLOCK_COUNT/W64_BY_CORE] enabled — send SIGUSR2 to print summary, \
+             or set RUZU_COUNT_DUMP_FILE=/tmp/x.log for periodic file dumps"
+        );
+    }
+
+    if std::env::var_os("RUZU_ALLOW_PTRACER").is_some() {
+        // PR_SET_PTRACER (0x59616d61, "Yama") with PR_SET_PTRACER_ANY (-1)
+        // tells YAMA to permit any process to ptrace this one. Avoids
+        // ptrace_scope=1 restriction without requiring sudo.
+        unsafe {
+            let rc = libc::prctl(libc::PR_SET_PTRACER, libc::PR_SET_PTRACER_ANY, 0, 0, 0);
+            log::info!(
+                "RUZU_ALLOW_PTRACER=1 → prctl(PR_SET_PTRACER, PR_SET_PTRACER_ANY)={}",
+                rc
+            );
+        }
+    }
 
     // Parse CLI arguments (upstream: getopt_long loop).
     let args = Args::parse();
@@ -374,6 +676,10 @@ fn main() {
         // Host1x (upstream core.cpp:277): host1x_core = make_unique<Host1x>(system)
         let host1x = video_core::host1x::host1x::Host1x::new();
         let syncpoints = host1x.syncpoint_manager().clone();
+        // Upstream: `auto& device_memory = system.Host1x().MemoryManager();`.
+        // Single shared instance — passed by `Arc::clone` into the
+        // renderer/rasterizer/shader-cache chain below.
+        let device_memory = host1x.memory_manager().clone();
         system.set_host1x_core(Box::new(host1x));
 
         // GPU (upstream core.cpp:278): gpu_core = VideoCore::CreateGPU(emu_window, system)
@@ -404,6 +710,7 @@ fn main() {
                             }
                         },
                         syncpoints.clone(),
+                        device_memory.clone(),
                         context,
                     )
                     .unwrap_or_else(|e| {
@@ -469,16 +776,34 @@ fn main() {
             };
         gpu.bind_renderer(renderer);
         gpu.set_guest_memory_reader(Arc::new(move |addr, output: &mut [u8]| {
-            // Upstream: reads through Memory which resolves via the process page table.
-            // The Memory page table maps guest virtual addresses to DeviceMemory host
-            // pointers. This works for addresses that have been mapped by the kernel
-            // (code, heap, stack, TLS, etc.).
+            // The address handed to us is a *device address* coming from the
+            // GPU's GMMU after walking GPU VA → device. Resolve in this order:
+            //   1. SMMU page table on Host1x (`nvmap::pin_handle` populates
+            //      it via `smmu_map`). This is the upstream-faithful path
+            //      and the only one that returns the same host backing the
+            //      ARM CPU writes through via fastmem.
+            //   2. Guest CPU page-table read (legacy fallback for code paths
+            //      that still hand us a CPU VA — until they all migrate to
+            //      device addresses).
+            //   3. Direct DeviceMemory access for addresses inside the DRAM
+            //      window (`dram_memory_map::BASE`+).
             let sys = system_ref.get();
+            if let Some(host1x) = sys.host1x_core() {
+                let host_ptr = host1x.smmu_lookup(addr);
+                if host_ptr != 0 {
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            host_ptr as *const u8,
+                            output.as_mut_ptr(),
+                            output.len(),
+                        );
+                    }
+                    return;
+                }
+            }
             if let Some(memory) = sys.memory_shared() {
                 let m = memory.lock().unwrap();
                 if !m.read_block(addr, output) {
-                    // Fallback: direct DeviceMemory access for addresses not
-                    // in the process page table (e.g., nvmap device addresses).
                     let dm = sys.device_memory();
                     let base = ruzu_core::device_memory::dram_memory_map::BASE;
                     if addr >= base {
@@ -498,7 +823,21 @@ fn main() {
         let system_ref2 = ruzu_core::core::SystemRef::from_ref(&system);
         gpu.set_guest_memory_writer(Arc::new(move |addr, data: &[u8]| {
             let sys = system_ref2.get();
-            // Write through Memory first, fallback to DeviceMemory.
+            // Same resolution order as the reader — SMMU first, then guest
+            // page table, then DRAM-direct.
+            if let Some(host1x) = sys.host1x_core() {
+                let host_ptr = host1x.smmu_lookup(addr);
+                if host_ptr != 0 {
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            data.as_ptr(),
+                            host_ptr as *mut u8,
+                            data.len(),
+                        );
+                    }
+                    return;
+                }
+            }
             if let Some(memory) = sys.memory_shared() {
                 let m = memory.lock().unwrap();
                 if m.write_block(addr, data) {
@@ -525,13 +864,29 @@ fn main() {
         // Without this, MK8D's GPU semaphore writes go to unmapped CPU
         // addresses (the GPU VA is passed straight through).
         //
-        // SAFETY: `gpu_ptr_for_translator` points to the Box<Gpu> we're
-        // about to move into `system.set_gpu_core`. System owns the Gpu
-        // for the full emulation lifetime; the translator closure is
-        // also bound by that lifetime via the renderer. The renderer is
-        // dropped on System shutdown before the Gpu is dropped.
+        // SAFETY: `gpu_ptr` points to the Box<Gpu> we're about to move
+        // into `system.set_gpu_core`. System owns the Gpu for the full
+        // emulation lifetime; the translator closure is also bound by
+        // that lifetime via the renderer. The renderer is dropped on
+        // System shutdown before the Gpu is dropped.
         let gpu_ptr_for_translator = gpu.as_ref() as *const video_core::gpu::Gpu;
         unsafe { gpu.install_gpu_to_cpu_translator(gpu_ptr_for_translator) };
+
+        // Install the rasterizer → Memory `mark_region_cached` callback on
+        // the *shared* `MaxwellDeviceMemoryManager` (the same `Arc` held by
+        // `Host1x` and every GPU cache). Upstream:
+        // `MaxwellDeviceMethods::MarkRegionCaching` → `Memory::RasterizerMarkRegionCached`.
+        // Installed once, applies to every cache that hands the device
+        // memory manager an `UpdatePagesCachedCount` call.
+        let system_ref3 = ruzu_core::core::SystemRef::from_ref(&system);
+        device_memory.set_mark_region_caching(Box::new(move |addr, size, cached| {
+            let sys = system_ref3.get();
+            if let Some(memory) = sys.memory_shared() {
+                let m = memory.lock().unwrap();
+                m.rasterizer_mark_region_cached(addr, size as u64, cached);
+            }
+        }));
+
         system.set_gpu_core(gpu);
 
         // AudioCore (upstream core.cpp:283): audio_core = make_unique<AudioCore>(system)
