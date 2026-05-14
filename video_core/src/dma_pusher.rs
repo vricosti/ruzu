@@ -19,9 +19,41 @@ use ruzu_core::core::SystemRef;
 
 static DMA_FLOW_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
 static DMA_FLOW_DISPATCH_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
+static COMMAND_WORDS_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
 
 fn should_trace_dma_flow() -> bool {
     std::env::var_os("RUZU_TRACE_DMA_FLOW").is_some()
+}
+
+fn command_words_trace_limit() -> Option<u32> {
+    static LIMIT: OnceLock<Option<u32>> = OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        std::env::var("RUZU_TRACE_COMMAND_WORDS")
+            .ok()
+            .map(|value| value.parse::<u32>().unwrap_or(64))
+    })
+}
+
+fn command_words_preview_len() -> usize {
+    static LEN: OnceLock<usize> = OnceLock::new();
+    *LEN.get_or_init(|| {
+        std::env::var("RUZU_TRACE_COMMAND_WORDS_LEN")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(32)
+            .clamp(1, 256)
+    })
+}
+
+fn command_words_find_value() -> Option<u32> {
+    static VALUE: OnceLock<Option<u32>> = OnceLock::new();
+    *VALUE.get_or_init(|| {
+        std::env::var("RUZU_FIND_COMMAND_WORD")
+            .ok()
+            .and_then(|value| {
+                u32::from_str_radix(value.trim().trim_start_matches("0x"), 16).ok()
+            })
+    })
 }
 
 /// Per-submit method-dispatch trace gate. `RUZU_TRACE_PULLER_SUBMITS=N` logs
@@ -598,6 +630,7 @@ impl DmaPusher {
         let mut raw = vec![0u8; byte_len];
         let gpu = unsafe { &*self.gpu };
         let mm = self.memory_manager.lock();
+        let translated_cpu_addr = mm.gpu_to_cpu_address(gpu_addr);
         let read_cpu = |cpu_addr, dst: &mut [u8]| {
             if !gpu.read_guest_memory(cpu_addr, dst) {
                 log::warn!(
@@ -611,6 +644,46 @@ impl DmaPusher {
             mm.read_block_unsafe(gpu_addr, &mut raw, &read_cpu);
         } else {
             mm.read_block(gpu_addr, &mut raw, &read_cpu);
+        }
+        if let Some(limit) = command_words_trace_limit() {
+            let idx = COMMAND_WORDS_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
+            if let Some(needle) = command_words_find_value() {
+                for (word_index, chunk) in raw.chunks_exact(4).enumerate() {
+                    let word = u32::from_le_bytes(chunk.try_into().unwrap());
+                    if word == needle {
+                        log::info!(
+                            "[COMMAND_WORD_FIND] #{} gpu=0x{:X} cpu={:?} count={} word_index={} value=0x{:08X}",
+                            idx,
+                            gpu_addr,
+                            translated_cpu_addr.map(|addr| format!("0x{addr:X}")),
+                            command_count,
+                            word_index,
+                            word
+                        );
+                    }
+                }
+            }
+            if idx < limit {
+                let preview_len = command_words_preview_len().min(command_count);
+                let words: Vec<String> = raw
+                    .chunks_exact(4)
+                    .take(preview_len)
+                    .map(|chunk| {
+                        let word = u32::from_le_bytes(chunk.try_into().unwrap());
+                        format!("{word:08X}")
+                    })
+                    .collect();
+                log::info!(
+                    "[COMMAND_WORDS] #{} gpu=0x{:X} cpu={:?} count={} unsafe={} words[0..{}]={}",
+                    idx,
+                    gpu_addr,
+                    translated_cpu_addr.map(|addr| format!("0x{addr:X}")),
+                    command_count,
+                    self.should_use_unsafe_read(),
+                    preview_len,
+                    words.join(" "),
+                );
+            }
         }
         raw
     }

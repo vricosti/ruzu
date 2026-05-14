@@ -351,6 +351,27 @@ extern "C" fn ruzu_sigill_handler(
                 let s3 = format!("[SIGILL]   X{:<2} = 0x{:016X}\n", i, x);
                 sdl2::libc::write(2, s3.as_bytes().as_ptr() as *const libc::c_void, s3.len());
             }
+
+            // A32 traps share the same host R15 convention but the JitState
+            // layout is `u32 reg[16]` followed by upper/CPSR shadow fields.
+            // Print this alongside the A64 view so A32 fastmem diagnostics can
+            // recover the actual guest PC (R15) without changing the trap ABI.
+            let mut a32_regs = [0u32; 16];
+            for i in 0..16 {
+                a32_regs[i] =
+                    std::ptr::read_unaligned((r15 + (i * 4) as u64) as *const u32);
+            }
+            let a32_upper = std::ptr::read_unaligned((r15 + 64) as *const u32);
+            let a32_cpsr_nzcv = std::ptr::read_unaligned((r15 + 76) as *const u32);
+            let s4 = format!(
+                "[SIGILL]   A32 R15/PC=0x{:08X} SP=0x{:08X} LR=0x{:08X} upper=0x{:08X} cpsr_nzcv=0x{:08X}\n",
+                a32_regs[15], a32_regs[13], a32_regs[14], a32_upper, a32_cpsr_nzcv
+            );
+            sdl2::libc::write(2, s4.as_bytes().as_ptr() as *const libc::c_void, s4.len());
+            for i in 0..16 {
+                let s5 = format!("[SIGILL]   R{:<2} = 0x{:08X}\n", i, a32_regs[i]);
+                sdl2::libc::write(2, s5.as_bytes().as_ptr() as *const libc::c_void, s5.len());
+            }
         }
 
         // Auto-dump the value at recovered_vaddr (the trap's destination).
@@ -797,6 +818,31 @@ fn main() {
                             output.as_mut_ptr(),
                             output.len(),
                         );
+                    }
+                    if let Ok(raw_trace_addr) = std::env::var("RUZU_TRACE_GUEST_MEMORY_READER") {
+                        let raw_trace_addr = raw_trace_addr.trim();
+                        let parsed_trace_addr = raw_trace_addr
+                            .strip_prefix("0x")
+                            .or_else(|| raw_trace_addr.strip_prefix("0X"))
+                            .and_then(|digits| u64::from_str_radix(digits, 16).ok())
+                            .or_else(|| raw_trace_addr.parse::<u64>().ok());
+                        if parsed_trace_addr == Some(addr) {
+                            let preview_words: Vec<String> = output
+                                .chunks_exact(4)
+                                .take(8)
+                                .map(|word| {
+                                    let value = u32::from_le_bytes(word.try_into().unwrap());
+                                    format!("{value:08X}")
+                                })
+                                .collect();
+                            log::info!(
+                                "[GUEST_MEMORY_READER] addr=0x{:X} len={} smmu_host=0x{:X} words=[{}]",
+                                addr,
+                                output.len(),
+                                host_ptr,
+                                preview_words.join(" "),
+                            );
+                        }
                     }
                     return;
                 }

@@ -14559,6 +14559,49 @@
 - Fixed in this pass: `KThread::pin()` and `KThread::unpin()` restored affinity/core state but did not notify the scheduler priority queue. Upstream calls `KScheduler::OnThreadAffinityMaskChanged()` when the runnable thread's active core or affinity changes. Rust now routes this through `GlobalSchedulerContext::on_thread_affinity_changed()` and increments scheduled count there.
 - Fixed in this pass: `SynchronizePreemptionState` removed the process pinned slot but did not call `KThread::unpin()`. Upstream `KProcess::UnpinCurrentThread()` calls `cur_thread->Unpin()` before clearing the process pinned slot. Rust now clears the interrupt flag, unpins the thread, then clears the process pinned slot.
 
+## 2026-05-14 — `video_core/src/dma_pusher.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/dma_pusher.cpp`
+
+### Intentional differences
+- Added env-gated `RUZU_TRACE_COMMAND_WORDS=N` diagnostics in the Rust counterpart of upstream `DmaPusher::Step` command-buffer fetch. When enabled, Rust logs the GPU VA, first translated CPU/device address, unsafe-read mode, command count, and first `RUZU_TRACE_COMMAND_WORDS_LEN` words after `MemoryManager::ReadBlock{Unsafe}`. Upstream does not have this exact diagnostic; it is inactive by default and exists to compare MK8D command-buffer contents around the missing `HLE_BindShader` macro invocation.
+
+### Unintentional differences (to fix)
+- No guest-visible behavior was intentionally changed in this pass. The diagnostic reads the same fetched byte buffer after the existing read path and does not alter dispatch state.
+
+### Missing items
+- Use the new command-word trace to determine whether MK8D's missing `0xE24`/`HLE_BindShader` sequence is absent from the GPU command buffer before decoding, or whether a later DMA/macro dispatch path drops it.
+
+### Binary layout verification
+- N/A: diagnostic-only logging; `CommandListHeader` and `CommandHeader` layout unchanged.
+
+## 2026-05-14 — `core/src/memory/memory.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/memory.cpp`
+
+### Intentional differences
+- Added env-gated `RUZU_TRACE_READ_BLOCK_PTR=0xADDR` diagnostics to `Memory::read_block`, the Rust counterpart of upstream `Memory::ReadBlock`. When enabled, Rust logs the host pointer used for the page containing the requested guest address. This is diagnostic-only and is being used to resolve the exact host backing pointer for MK8D's GPU command-buffer read at device/CPU address `0x809D000`.
+
+### Unintentional differences (to fix)
+- No guest-visible behavior was intentionally changed in this pass. The diagnostic only logs after the normal page lookup succeeds and before the existing `copy_nonoverlapping`.
+
+### Missing items
+- Use the logged host pointer to set a hardware watchpoint on the real backing address and identify the guest/JIT writer of MK8D's divergent command buffer.
+
+### Binary layout verification
+- N/A: diagnostic-only logging in the memory read path; no guest-visible raw layout changed.
+
+## 2026-05-14 — `core/src/hle/service/nvdrv/devices/nvmap.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/hle/service/nvdrv/devices/nvmap.cpp`
+
+### Intentional differences
+- Extended existing env-gated `RUZU_TRACE_NVMAP_LOOP` diagnostics in `NvMapDevice::ioc_alloc` to include the host backing pointer for the allocated guest CPU address when available. Upstream does not log this; Rust behavior is unchanged when the diagnostic is disabled.
+- Added env-gated `RUZU_STOP_NVMAP_ALLOC_HANDLE=0xHANDLE` diagnostic stop after `NvMapDevice::ioc_alloc` finishes mapping the requested handle. This raises `SIGSTOP` only for the selected handle so an external debugger can attach before the guest writes into the just-allocated nvmap buffer.
+
+### Unintentional differences (to fix)
+- No guest-visible behavior was intentionally changed in this pass. The diagnostic reads the existing memory pointer after `LockForMapDeviceAddressSpace` succeeds and does not alter nvmap handle state.
+
+### Missing items
+- Use the `IocAlloc` host pointer plus `RUZU_STOP_NVMAP_ALLOC_HANDLE=0x44` to set a hardware watchpoint early enough to catch the CPU writer of MK8D's command buffer at offset `0x600000`.
+
+### Binary layout verification
+- PASS: `IocAllocParams` layout remains asserted at 32 bytes; diagnostic-only logging does not change ioctl payloads.
+
 ### Missing items
 - `KThread::unpin()` still does not resume `m_pinned_waiter_list` equivalents; that list is only stubbed in Rust. This remains a scheduler/thread parity gap outside the MK8D timing slice.
 
@@ -14639,3 +14682,66 @@
 
 ### Binary layout verification
 - N/A: `KReadableEvent` is a host-side kernel object in Rust and is not serialized as a guest-visible raw payload.
+
+## 2026-05-14 — `ruzu_cmd/src/main.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/yuzu_cmd/yuzu.cpp`
+
+### Intentional differences
+- Added env-gated `RUZU_TRACE_GUEST_MEMORY_READER=0xADDR` diagnostics to the Rust GPU guest-memory reader callback installed by `ruzu-cmd`. When the exact device/CPU address is read, Rust logs the SMMU host pointer and the first copied words. Upstream `yuzu_cmd/yuzu.cpp` does not own this callback because upstream wires GPU memory through C++ core/video-core objects directly; this Rust frontend bridge is an existing port adaptation.
+- Extended the existing `RUZU_SIGILL_TRACE` diagnostic dump to print the A32 `JitState` view (`R0..R15`, `upper_location_descriptor`, `cpsr_nzcv`) alongside the previous A64 view. This is diagnostic-only and is needed because MK8D is AArch32; the previous A64-only dump produced bogus guest PC/SP values for A32 fastmem traps.
+
+### Unintentional differences (to fix)
+- No guest-visible behavior was intentionally changed in this pass. The diagnostic is being used to verify whether MK8D's DMA command buffer at device address `0x809D000` is read from the same host alias that `nvmap::IocAlloc` exposed for handle `0x44`.
+
+### Missing items
+- If `RUZU_TRACE_GUEST_MEMORY_READER=0x809D000` reports a different `smmu_host` than `nvmap::IocAlloc host_ptr + 0x600000`, audit `Host1x::smmu_map` / `smmu_lookup` ownership against upstream `DeviceMemoryManager`.
+- If the host pointer matches, the next diagnostic must move to the A32 fastmem write path because external gdb hardware watchpoints did not catch the CPU write despite the buffer being zero at `IocAlloc` stop and populated by the later DMA read.
+
+### Binary layout verification
+- N/A: frontend diagnostic logging only; no guest-visible raw struct or IPC payload layout changed.
+
+## 2026-05-14 — `/home/vricosti/Dev/emulators/rdynarmic/src/backend/x64/a32_emit_a32.rs` vs `/home/vricosti/Dev/emulators/zuyu/externals/dynarmic/src/dynarmic/backend/x64/a32_emit_x64_memory.cpp` and `/home/vricosti/Dev/emulators/zuyu/externals/dynarmic/src/dynarmic/backend/x64/emit_x64_memory.cpp.inc`
+
+### Intentional differences
+- Added env-gated `RUZU_TRAP_FASTMEM_ANY_VADDR_RANGE=0xLO:0xHI` diagnostics to the A32 fastmem-direct write path. This mirrors the existing Rust A64 diagnostic shape and is inactive unless explicitly set. Upstream dynarmic has no equivalent diagnostic; the normal fastmem write behavior remains the same when the env var is absent.
+- The A32 diagnostic uses the same SIGILL sentinel convention as the existing A64 diagnostic (`0xCAFEF008`, `0xCAFEF010`, `0xCAFEF020`, `0xCAFEF040`) and the same stack convention so `ruzu_cmd` can recover the trapped guest vaddr.
+- Added `RUZU_TRAP_FASTMEM_ANY_VADDR_RANGE_NONZERO=1` as a companion filter for the A32 range trap. When enabled, zero stores inside the watched range are ignored; this is needed because MK8D first clears the command-buffer page before writing useful DMA words.
+- Added `RUZU_TRAP_FASTMEM_ANY_VADDR_RANGE_VALUE=0xVALUE` as a companion filter for the A32 range trap. When enabled, only stores whose post-write memory value equals the selected value trigger. This is currently used to skip MK8D's `0xBEEF2929` command-buffer fill and catch the final DMA word `0x20020381`.
+
+### Unintentional differences (to fix)
+- No guest-visible behavior was intentionally changed in this pass. The diagnostic exists to identify the guest A32 store that first writes MK8D's command buffer at CPU alias `0x70FFB000..0x70FFB800`, which later appears in DMA as device address `0x809D000`.
+
+### Missing items
+- If the A32 range trap does not fire for `0x70FFB000..0x70FFB800`, audit non-fastmem A32 writes and HLE/GPU writer paths next; external gdb hardware watchpoints did not fire despite the SMMU backing being zero at `IocAlloc` stop and populated by the later DMA read.
+
+### Binary layout verification
+- N/A: JIT diagnostic trap insertion only; no guest-visible raw struct or IPC payload layout changed.
+
+## 2026-05-14 — `core/src/hle/service/nvdrv/devices/nvhost_gpu.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/hle/service/nvdrv/devices/nvhost_gpu.cpp` and `/home/vricosti/Dev/emulators/zuyu/src/video_core/dma_pusher.h`
+
+### Intentional differences
+- Extended the existing env-gated `nvhost_gpu` command-list diagnostic to accept `RUZU_TRACE_GPFIFO_HEADERS=N`. When set, Rust logs up to `N` submitted `CommandListHeader` entries and decodes the upstream bitfields (`addr`, `size`, `is_non_main`) defined in `video_core/dma_pusher.h`.
+- The default `RUZU_TRACE_NVHOST_GPU_INIT=1` behavior remains limited to the first 8 headers, matching the previous local diagnostic volume. Upstream has no equivalent diagnostic in `nvhost_gpu.cpp`; submit behavior remains unchanged when diagnostics are absent.
+
+### Unintentional differences (to fix)
+- No guest-visible behavior was intentionally changed in this pass. The diagnostic is being used to compare MK8D's submitted GPFIFO segments around the missing `m=0xE24`/`HLE_BindShader` macro trigger.
+
+### Missing items
+- If ruzu's GPFIFO header sequence differs from zuyu before the first draw, continue tracing the command-list producer path. If headers match but fetched words differ, move the comparison to GPU-memory writes for the specific segment.
+
+### Binary layout verification
+- PASS: `GpuCommandListHeader` remains a `#[repr(C)]` raw `u64`; the diagnostic decodes the same bit positions as upstream (`addr` bits 0..39, `is_non_main` bit 41, `size` bits 42..62) without changing serialization or IPC payload layout.
+
+## 2026-05-14 — `video_core/src/dma_pusher.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/dma_pusher.cpp` and `/home/vricosti/Dev/emulators/zuyu/src/video_core/dma_pusher.h`
+
+### Intentional differences
+- Added env-gated `RUZU_FIND_COMMAND_WORD=0xWORD` diagnostics inside the Rust pushbuffer fetch path. When `RUZU_TRACE_COMMAND_WORDS` is also enabled, Rust scans the fetched command words and logs every matching word index with the same GPU/CPU address context as the existing `COMMAND_WORDS` trace.
+- Upstream `DmaPusher::Step` reads a command-list header and then processes fetched command words without this diagnostic. The Rust behavior is unchanged when the env var is absent; this exists only to locate MK8D's missing raw `m=0xE24` macro-trigger header inside large command buffers.
+
+### Unintentional differences (to fix)
+- No guest-visible behavior was intentionally changed in this pass. Existing Rust DMA decode and command dispatch ownership remains in `dma_pusher.rs`, matching upstream `dma_pusher.cpp`.
+
+### Missing items
+- Use the finder to determine whether `0x20050E24` appears after the first draw in ruzu's 477-word pushbuffer, or whether the entire command segment is missing from the submitted GPFIFO sequence. If present but late, compare command-buffer producer ordering; if absent, trace the CPU write/source segment.
+
+### Binary layout verification
+- N/A: diagnostic-only scan over already-fetched command bytes; no command header or command-list layout changed.

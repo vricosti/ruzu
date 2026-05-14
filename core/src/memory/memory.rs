@@ -1087,6 +1087,18 @@ impl Memory {
     /// Matches upstream `Memory::ReadBlock` (via WalkBlock pattern).
     pub fn read_block(&self, src_addr: u64, dest: &mut [u8]) -> bool {
         let size = dest.len();
+        let trace_read_ptr = std::env::var("RUZU_TRACE_READ_BLOCK_PTR")
+            .ok()
+            .and_then(|raw| {
+                let raw = raw.trim();
+                let digits = raw
+                    .strip_prefix("0x")
+                    .or_else(|| raw.strip_prefix("0X"))
+                    .unwrap_or(raw);
+                u64::from_str_radix(digits, 16)
+                    .ok()
+                    .or_else(|| raw.parse::<u64>().ok())
+            });
 
         // Upstream: AddressSpaceContains check before walking pages.
         if !self.address_space_contains(src_addr, size) {
@@ -1111,6 +1123,16 @@ impl Memory {
                 dest[offset..offset + copy_amount].fill(0);
                 user_accessible = false;
             } else {
+                if trace_read_ptr.is_some_and(|target| vaddr <= target && target < vaddr + copy_amount as u64) {
+                    log::info!(
+                        "[READ_BLOCK_PTR] src=0x{:X} page_vaddr=0x{:X} ptr={:p} copy=0x{:X} size=0x{:X}",
+                        src_addr,
+                        vaddr,
+                        ptr,
+                        copy_amount,
+                        size,
+                    );
+                }
                 unsafe {
                     std::ptr::copy_nonoverlapping(ptr, dest[offset..].as_mut_ptr(), copy_amount);
                 }
