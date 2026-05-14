@@ -9,50 +9,10 @@
 
 use super::util;
 use super::window_adapt_pass::WindowAdaptPass;
-
-// ---------------------------------------------------------------------------
-// Host shader sources (placeholders until host_shaders are ported)
-// ---------------------------------------------------------------------------
-
-/// Fragment shader for basic present (nearest/bilinear).
-const OPENGL_PRESENT_FRAG: &str = r#"#version 460
-layout(binding = 0) uniform sampler2D color_texture;
-layout(location = 0) in vec2 frag_tex_coord;
-layout(location = 0) out vec4 color;
-void main() {
-    color = texture(color_texture, frag_tex_coord);
-}
-"#;
-
-/// Fragment shader for bicubic interpolation.
-const PRESENT_BICUBIC_FRAG: &str = r#"#version 460
-layout(binding = 0) uniform sampler2D color_texture;
-layout(location = 0) in vec2 frag_tex_coord;
-layout(location = 0) out vec4 color;
-void main() {
-    color = texture(color_texture, frag_tex_coord);
-}
-"#;
-
-/// Fragment shader for Gaussian blur.
-const PRESENT_GAUSSIAN_FRAG: &str = r#"#version 460
-layout(binding = 0) uniform sampler2D color_texture;
-layout(location = 0) in vec2 frag_tex_coord;
-layout(location = 0) out vec4 color;
-void main() {
-    color = texture(color_texture, frag_tex_coord);
-}
-"#;
-
-/// Fragment shader for ScaleForce.
-const OPENGL_PRESENT_SCALEFORCE_FRAG: &str = r#"#version 460
-layout(binding = 0) uniform sampler2D color_texture;
-layout(location = 0) in vec2 frag_tex_coord;
-layout(location = 0) out vec4 color;
-void main() {
-    color = texture(color_texture, frag_tex_coord);
-}
-"#;
+use crate::host_shaders::fragment_shaders::{
+    OPENGL_PRESENT_FRAG, OPENGL_PRESENT_SCALEFORCE_FRAG, PRESENT_BICUBIC_FRAG,
+    PRESENT_GAUSSIAN_FRAG,
+};
 
 // ---------------------------------------------------------------------------
 // Factory functions

@@ -1273,7 +1273,12 @@ mod tests {
         ) {
         }
         fn draw_texture(&mut self) {}
-        fn clear(&mut self, _layer_count: u32) {}
+        fn clear(
+            &mut self,
+            _draw_state: &crate::engines::draw_manager::DrawState,
+            _layer_count: u32,
+        ) {
+        }
         fn dispatch_compute(&mut self) {}
         fn reset_counter(&mut self, _query_type: u32) {}
         fn query(

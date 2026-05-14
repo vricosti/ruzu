@@ -9,9 +9,10 @@
 
 use crate::dirty_flags::flags as Dirty;
 use crate::engines::maxwell_3d::{
-    DrawCall, CLEAR_SURFACE, DRAW_BEGIN, DRAW_END, DRAW_INLINE_INDEX, DRAW_TEXTURE_SRC_Y0, IB_BASE,
-    IB_OFF_COUNT, IB_OFF_FIRST, INDEX_BUFFER16_FIRST, INDEX_BUFFER16_SUBSEQUENT,
-    INDEX_BUFFER32_FIRST, INDEX_BUFFER32_SUBSEQUENT, INDEX_BUFFER8_FIRST, INDEX_BUFFER8_SUBSEQUENT,
+    DrawCall, RenderTargetInfo, RtControlInfo, CLEAR_SURFACE, DRAW_BEGIN, DRAW_END,
+    DRAW_INLINE_INDEX, DRAW_TEXTURE_SRC_Y0, IB_BASE, IB_OFF_COUNT, IB_OFF_FIRST,
+    INDEX_BUFFER16_FIRST, INDEX_BUFFER16_SUBSEQUENT, INDEX_BUFFER32_FIRST,
+    INDEX_BUFFER32_SUBSEQUENT, INDEX_BUFFER8_FIRST, INDEX_BUFFER8_SUBSEQUENT,
     INLINE_INDEX_2X16_EVEN, INLINE_INDEX_4X8_INDEX0, NUM_SHADER_PROGRAMS, NUM_VERTEX_ATTRIBS,
     RT_FORMAT_A8B8G8R8_SRGB, RT_FORMAT_A8B8G8R8_UNORM, RT_FORMAT_B5G6R5_UNORM, RT_FORMAT_R8_UNORM,
     TOPOLOGY_OVERRIDE, VB_COUNT, VB_FIRST, VERTEX_ARRAY_INSTANCE_FIRST,
@@ -301,6 +302,16 @@ pub trait Maxwell3DAccess {
     /// Read clear color as RGBA floats.
     fn clear_color_rgba(&self) -> [f32; 4];
 
+    /// Read clear depth value.
+    fn clear_depth(&self) -> f32 {
+        0.0
+    }
+
+    /// Read clear stencil value.
+    fn clear_stencil(&self) -> i32 {
+        0
+    }
+
     /// Publish a pending framebuffer.
     fn set_pending_framebuffer(&mut self, framebuffer: Framebuffer);
 
@@ -404,6 +415,21 @@ pub struct DrawState {
     pub index_buffer_gpu_addr: u64,
     /// GPU virtual address of the index buffer end (start + limit).
     pub index_buffer_gpu_addr_end: u64,
+    /// Render target control snapshot at draw-dispatch time.
+    pub rt_control: RtControlInfo,
+    /// Render target configurations for up to 8 color targets.
+    pub render_targets: [RenderTargetInfo; 8],
+    /// Clear-register snapshot captured before dispatching to the rasterizer.
+    pub clear_state: ClearState,
+}
+
+/// Clear state captured from Maxwell3D registers.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ClearState {
+    pub flags: u32,
+    pub color: [f32; 4],
+    pub depth: f32,
+    pub stencil: i32,
 }
 
 /// State for draw-texture operations.
@@ -662,8 +688,22 @@ impl DrawManager {
     /// Upstream: `maxwell3d->rasterizer->Clear(layer_count)` if ShouldExecute.
     pub fn clear(&mut self, layer_count: u32, maxwell3d: &mut dyn Maxwell3DAccess) {
         if maxwell3d.should_execute() {
+            self.draw_state.rt_control = maxwell3d.rt_control_info();
+            self.draw_state.render_targets =
+                std::array::from_fn(|i| crate::engines::maxwell_3d::RenderTargetInfo {
+                    address: maxwell3d.rt_address(i),
+                    width: maxwell3d.rt_width(i),
+                    height: maxwell3d.rt_height(i),
+                    format: maxwell3d.rt_format(i),
+                });
+            self.draw_state.clear_state = ClearState {
+                flags: maxwell3d.clear_surface_flags(),
+                color: maxwell3d.clear_color_rgba(),
+                depth: maxwell3d.clear_depth(),
+                stencil: maxwell3d.clear_stencil(),
+            };
             if let Some(rasterizer) = maxwell3d.rasterizer_mut() {
-                rasterizer.clear(layer_count);
+                rasterizer.clear(&self.draw_state, layer_count);
             }
             self.produce_clear_framebuffer(maxwell3d);
         }
@@ -1024,6 +1064,14 @@ impl DrawManager {
             // build a `GraphicsPipelineKey` without needing a Maxwell3D
             // back-reference of its own.
             self.draw_state.shader_program_addresses = maxwell3d.shader_program_addresses();
+            self.draw_state.rt_control = maxwell3d.rt_control_info();
+            self.draw_state.render_targets =
+                std::array::from_fn(|i| crate::engines::maxwell_3d::RenderTargetInfo {
+                    address: maxwell3d.rt_address(i),
+                    width: maxwell3d.rt_width(i),
+                    height: maxwell3d.rt_height(i),
+                    format: maxwell3d.rt_format(i),
+                });
             if let Some(rasterizer) = maxwell3d.rasterizer_mut() {
                 rasterizer.draw(&self.draw_state, instance_count);
             }

@@ -13,6 +13,7 @@ use super::gl_state_tracker::StateTracker;
 use super::present::filters::{self, ScalingFilter};
 use super::present::layer::Layer;
 use super::present::window_adapt_pass::WindowAdaptPass;
+use super::RasterizerOpenGL;
 
 /// BlitScreen handles the final frame composition to the window.
 ///
@@ -44,6 +45,7 @@ impl BlitScreen {
         framebuffers: &[FramebufferConfig],
         layout: &FramebufferLayout,
         state_tracker: &mut StateTracker,
+        rasterizer: &mut RasterizerOpenGL,
         invert_y: bool,
         device_memory: Option<&crate::renderer_base::DeviceMemoryReader>,
     ) {
@@ -97,6 +99,7 @@ impl BlitScreen {
                 framebuffers,
                 layout,
                 invert_y,
+                rasterizer,
                 device_memory,
             );
         }

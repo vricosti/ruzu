@@ -351,7 +351,7 @@ impl MacroInterpreterImpl {
         let trace_macro_flow = std::env::var_os("RUZU_TRACE_MACRO_FLOW").is_some();
         if trace_macro_14f || trace_macro_flow {
             let idx = MACRO_14F_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
-            if idx < 128 {
+            if idx < 2048 {
                 log::info!(
                     "MacroInterpreterImpl::send method=0x{:X} write#{} addr=0x{:X} value=0x{:08X} increment=0x{:X}",
                     self.current_method,

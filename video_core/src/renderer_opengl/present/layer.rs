@@ -12,6 +12,7 @@ use super::present_uniforms::{make_orthographic_matrix, ScreenRectVertex};
 use super::smaa::SMAA;
 
 use crate::framebuffer_config::{self, FramebufferConfig};
+use crate::renderer_opengl::RasterizerOpenGL;
 use ruzu_core::frontend::framebuffer_layout::FramebufferLayout;
 
 /// Information about a framebuffer texture for display.
@@ -117,9 +118,10 @@ impl Layer {
         framebuffer: &FramebufferConfig,
         layout: &FramebufferLayout,
         invert_y: bool,
+        rasterizer: &mut RasterizerOpenGL,
         device_memory: Option<&crate::renderer_base::DeviceMemoryReader>,
     ) -> u32 {
-        let info = self.prepare_render_target(framebuffer, device_memory);
+        let info = self.prepare_render_target(framebuffer, rasterizer, device_memory);
         let crop = framebuffer_config::normalize_crop(framebuffer, info.width, info.height);
         let texture = info.display_texture;
 
@@ -163,6 +165,7 @@ impl Layer {
     fn prepare_render_target(
         &mut self,
         framebuffer: &FramebufferConfig,
+        rasterizer: &mut RasterizerOpenGL,
         device_memory: Option<&crate::renderer_base::DeviceMemoryReader>,
     ) -> FramebufferTextureInfo {
         if self.framebuffer_texture.width != framebuffer.width as i32
@@ -173,7 +176,7 @@ impl Layer {
             self.configure_framebuffer_texture(framebuffer);
         }
 
-        self.load_fb_to_screen_info(framebuffer, device_memory)
+        self.load_fb_to_screen_info(framebuffer, rasterizer, device_memory)
     }
 
     /// Load the framebuffer from emulated memory into the screen texture.
@@ -186,12 +189,16 @@ impl Layer {
     fn load_fb_to_screen_info(
         &mut self,
         framebuffer: &FramebufferConfig,
+        rasterizer: &mut RasterizerOpenGL,
         device_memory: Option<&crate::renderer_base::DeviceMemoryReader>,
     ) -> FramebufferTextureInfo {
         let framebuffer_addr = framebuffer.address + framebuffer.offset as u64;
 
-        // TODO: Try rasterizer.AccelerateDisplay() fast path first.
-        // For now, always use the slow path (read from device memory + unswizzle).
+        if let Some(info) =
+            rasterizer.accelerate_display(framebuffer, framebuffer_addr, framebuffer.stride)
+        {
+            return info;
+        }
 
         if framebuffer_addr == 0 {
             // No framebuffer address — return empty texture.
@@ -244,7 +251,7 @@ impl Layer {
             reader(framebuffer_addr, &mut tiled_data);
 
             // Unswizzle from Tegra block-linear to linear layout.
-            let linear_size = (framebuffer.stride * framebuffer.height * bytes_per_pixel) as usize;
+            let linear_size = (framebuffer.width * framebuffer.height * bytes_per_pixel) as usize;
             if self.gl_framebuffer_data.len() < linear_size {
                 self.gl_framebuffer_data.resize(linear_size, 0);
             }
@@ -252,13 +259,33 @@ impl Layer {
                 &mut self.gl_framebuffer_data[..linear_size],
                 &tiled_data,
                 bytes_per_pixel,
-                framebuffer.stride, // width in pixels (stride)
+                framebuffer.width,
                 framebuffer.height,
                 1, // depth
                 block_height_log2,
                 0, // block_depth
                 1, // stride_alignment
             );
+
+            if std::env::var_os("RUZU_TRACE_PRESENT").is_some() {
+                let nonzero = self.gl_framebuffer_data[..linear_size]
+                    .iter()
+                    .filter(|&&byte| byte != 0)
+                    .take(1024)
+                    .count();
+                let checksum = self.gl_framebuffer_data[..linear_size]
+                    .iter()
+                    .take(4096)
+                    .fold(0u64, |acc, &byte| acc.wrapping_mul(16777619) ^ byte as u64);
+                log::info!(
+                    "[PRESENT] LoadFB addr=0x{:X} size={} linear_size={} first_1k_nonzero={} checksum4k=0x{:X}",
+                    framebuffer_addr,
+                    size_in_bytes,
+                    linear_size,
+                    nonzero,
+                    checksum
+                );
+            }
 
             // Upload to GL texture.
             unsafe {

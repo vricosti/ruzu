@@ -54,6 +54,14 @@ impl Maxwell3DPtr {
     unsafe fn clear_memory(self, parameters: &[u32], zero_memory: &mut Vec<u32>) {
         (&mut *self.0).hle_clear_memory(parameters, zero_memory);
     }
+
+    unsafe fn d7333d26e0a93ede(self, parameters: &[u32]) {
+        (&mut *self.0).hle_d7333d26e0a93ede(parameters);
+    }
+
+    unsafe fn bind_shader(self, parameters: &[u32]) {
+        (&mut *self.0).hle_bind_shader(parameters);
+    }
 }
 
 /// HLE: DrawArraysIndirect (non-extended).
@@ -161,41 +169,34 @@ impl CachedMacro for HleC713C83d8f63Ccf3 {
 /// HLE: D7333D26E0A93EDE — const buffer address setup.
 ///
 /// Port of `HLE_D7333D26E0A93EDE`.
-struct HleD7333d26e0a93Ede;
+struct HleD7333d26e0a93Ede {
+    maxwell3d: Option<Maxwell3DPtr>,
+}
 
 impl CachedMacro for HleD7333d26e0a93Ede {
-    fn execute(&mut self, _parameters: &[u32], _method: u32) {
-        // Stubbed — requires Maxwell3D register access to read shadow_scratch[42+index] and
-        // shadow_scratch[47+index] and write const_buffer.{size, address_high, address_low}.
-        // Upstream: HLE_D7333D26E0A93EDE::Execute() in video_core/macro/macro_hle.cpp:
-        //   index = params[0]
-        //   address = regs.shadow_scratch[42 + index]
-        //   size = regs.shadow_scratch[47 + index]
-        //   const_buffer.size = size
-        //   const_buffer.address_high = (address >> 24) & 0xFF
-        //   const_buffer.address_low = address << 8
-        log::warn!("HLE_D7333D26E0A93EDE: not yet implemented (requires Maxwell3D integration)");
+    fn execute(&mut self, parameters: &[u32], _method: u32) {
+        let Some(maxwell3d) = self.maxwell3d else {
+            log::warn!("HLE_D7333D26E0A93EDE: missing Maxwell3D owner");
+            return;
+        };
+        unsafe { maxwell3d.d7333d26e0a93ede(parameters) };
     }
 }
 
 /// HLE: BindShader.
 ///
 /// Port of `HLE_BindShader`.
-struct HleBindShader;
+struct HleBindShader {
+    maxwell3d: Option<Maxwell3DPtr>,
+}
 
 impl CachedMacro for HleBindShader {
-    fn execute(&mut self, _parameters: &[u32], _method: u32) {
-        // Stubbed — requires Maxwell3D register access to update pipelines[index].offset,
-        // shadow_scratch entries, const_buffer address fields, and call ProcessCBBind.
-        // Upstream: HLE_BindShader::Execute() in video_core/macro/macro_hle.cpp:
-        //   index = params[0]; if params[1] == shadow_scratch[28+index] => early return
-        //   regs.pipelines[index & 0xF].offset = params[2]
-        //   dirty.flags[Shaders] = true
-        //   shadow_scratch[28+index] = params[1]; shadow_scratch[34+index] = params[2]
-        //   address = params[4]
-        //   const_buffer.{size=0x10000, address_high, address_low, offset=0}
-        //   bind_group[params[3] & 0x7F].raw_config = 0x11; ProcessCBBind(bind_group_id)
-        log::warn!("HLE_BindShader: not yet implemented (requires Maxwell3D integration)");
+    fn execute(&mut self, parameters: &[u32], _method: u32) {
+        let Some(maxwell3d) = self.maxwell3d else {
+            log::warn!("HLE_BindShader: missing Maxwell3D owner");
+            return;
+        };
+        unsafe { maxwell3d.bind_shader(parameters) };
     }
 }
 
@@ -319,8 +320,12 @@ impl HleMacro {
         });
         builders.insert(HASH_MULTI_LAYER_CLEAR, |_| Box::new(HleMultiLayerClear));
         builders.insert(HASH_C713C83D8F63CCF3, |_| Box::new(HleC713C83d8f63Ccf3));
-        builders.insert(HASH_D7333D26E0A93EDE, |_| Box::new(HleD7333d26e0a93Ede));
-        builders.insert(HASH_BIND_SHADER, |_| Box::new(HleBindShader));
+        builders.insert(HASH_D7333D26E0A93EDE, |maxwell3d| {
+            Box::new(HleD7333d26e0a93Ede { maxwell3d })
+        });
+        builders.insert(HASH_BIND_SHADER, |maxwell3d| {
+            Box::new(HleBindShader { maxwell3d })
+        });
         builders.insert(HASH_SET_RASTER_BOUNDING_BOX, |_| {
             Box::new(HleSetRasterBoundingBox)
         });

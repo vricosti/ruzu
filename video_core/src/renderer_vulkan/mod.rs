@@ -808,7 +808,7 @@ impl RasterizerInterface for RasterizerVulkan {
         debug!("RasterizerVulkan::draw_texture");
     }
 
-    fn clear(&mut self, layer_count: u32) {
+    fn clear(&mut self, _draw_state: &crate::engines::draw_manager::DrawState, layer_count: u32) {
         trace!("RasterizerVulkan::clear layers={}", layer_count);
     }
 

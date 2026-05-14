@@ -33,16 +33,47 @@ impl FormatTuple {
     }
 }
 
-// S3TC/DXT compressed format constants (EXT_texture_compression_s3tc).
-// These are not always in the base gl crate.
+// Extension constants used by upstream's `FORMAT_TABLE`. The `gl` crate does
+// not expose all KHR/EXT names on every generated profile, so keep the numeric
+// values next to the upstream table they serve.
 const GL_COMPRESSED_RGBA_S3TC_DXT1_EXT: u32 = 0x83F1;
 const GL_COMPRESSED_RGBA_S3TC_DXT3_EXT: u32 = 0x83F2;
 const GL_COMPRESSED_RGBA_S3TC_DXT5_EXT: u32 = 0x83F3;
+const GL_COMPRESSED_SRGB_ALPHA_S3TC_DXT1_EXT: u32 = 0x8C4D;
+const GL_COMPRESSED_SRGB_ALPHA_S3TC_DXT3_EXT: u32 = 0x8C4E;
+const GL_COMPRESSED_SRGB_ALPHA_S3TC_DXT5_EXT: u32 = 0x8C4F;
+const GL_COMPRESSED_RGBA_ASTC_4X4_KHR: u32 = 0x93B0;
+const GL_COMPRESSED_RGBA_ASTC_5X4_KHR: u32 = 0x93B1;
+const GL_COMPRESSED_RGBA_ASTC_5X5_KHR: u32 = 0x93B2;
+const GL_COMPRESSED_RGBA_ASTC_6X5_KHR: u32 = 0x93B3;
+const GL_COMPRESSED_RGBA_ASTC_6X6_KHR: u32 = 0x93B4;
+const GL_COMPRESSED_RGBA_ASTC_8X5_KHR: u32 = 0x93B5;
+const GL_COMPRESSED_RGBA_ASTC_8X6_KHR: u32 = 0x93B6;
+const GL_COMPRESSED_RGBA_ASTC_8X8_KHR: u32 = 0x93B7;
+const GL_COMPRESSED_RGBA_ASTC_10X5_KHR: u32 = 0x93B8;
+const GL_COMPRESSED_RGBA_ASTC_10X6_KHR: u32 = 0x93B9;
+const GL_COMPRESSED_RGBA_ASTC_10X8_KHR: u32 = 0x93BA;
+const GL_COMPRESSED_RGBA_ASTC_10X10_KHR: u32 = 0x93BB;
+const GL_COMPRESSED_RGBA_ASTC_12X10_KHR: u32 = 0x93BC;
+const GL_COMPRESSED_RGBA_ASTC_12X12_KHR: u32 = 0x93BD;
+const GL_COMPRESSED_SRGB8_ALPHA8_ASTC_4X4_KHR: u32 = 0x93D0;
+const GL_COMPRESSED_SRGB8_ALPHA8_ASTC_5X4_KHR: u32 = 0x93D1;
+const GL_COMPRESSED_SRGB8_ALPHA8_ASTC_5X5_KHR: u32 = 0x93D2;
+const GL_COMPRESSED_SRGB8_ALPHA8_ASTC_6X5_KHR: u32 = 0x93D3;
+const GL_COMPRESSED_SRGB8_ALPHA8_ASTC_6X6_KHR: u32 = 0x93D4;
+const GL_COMPRESSED_SRGB8_ALPHA8_ASTC_8X5_KHR: u32 = 0x93D5;
+const GL_COMPRESSED_SRGB8_ALPHA8_ASTC_8X6_KHR: u32 = 0x93D6;
+const GL_COMPRESSED_SRGB8_ALPHA8_ASTC_8X8_KHR: u32 = 0x93D7;
+const GL_COMPRESSED_SRGB8_ALPHA8_ASTC_10X5_KHR: u32 = 0x93D8;
+const GL_COMPRESSED_SRGB8_ALPHA8_ASTC_10X6_KHR: u32 = 0x93D9;
+const GL_COMPRESSED_SRGB8_ALPHA8_ASTC_10X8_KHR: u32 = 0x93DA;
+const GL_COMPRESSED_SRGB8_ALPHA8_ASTC_10X10_KHR: u32 = 0x93DB;
+const GL_COMPRESSED_SRGB8_ALPHA8_ASTC_12X10_KHR: u32 = 0x93DC;
+const GL_COMPRESSED_SRGB8_ALPHA8_ASTC_12X12_KHR: u32 = 0x93DD;
 
 /// Format table mapping PixelFormat enum to GL format tuples.
 ///
 /// Corresponds to `OpenGL::MaxwellToGL::FORMAT_TABLE`.
-/// NOTE: Only a representative subset is included here. The full table has MaxPixelFormat entries.
 pub static FORMAT_TABLE: &[FormatTuple] = &[
     FormatTuple::new(gl::RGBA8, gl::RGBA, gl::UNSIGNED_INT_8_8_8_8_REV), // A8B8G8R8_UNORM
     FormatTuple::new(gl::RGBA8_SNORM, gl::RGBA, gl::BYTE),               // A8B8G8R8_SNORM
@@ -57,12 +88,18 @@ pub static FORMAT_TABLE: &[FormatTuple] = &[
         gl::RGBA_INTEGER,
         gl::UNSIGNED_INT_2_10_10_10_REV,
     ), // A2B10G10R10_UINT
+    FormatTuple::new(gl::RGB10_A2, gl::BGRA, gl::UNSIGNED_INT_2_10_10_10_REV), // A2R10G10B10_UNORM
+    FormatTuple::new(gl::RGB5_A1, gl::RGBA, gl::UNSIGNED_SHORT_1_5_5_5_REV), // A1B5G5R5_UNORM
+    FormatTuple::new(gl::RGB5_A1, gl::RGBA, gl::UNSIGNED_SHORT_5_5_5_1), // A5B5G5R1_UNORM
     FormatTuple::new(gl::R8, gl::RED, gl::UNSIGNED_BYTE),                // R8_UNORM
     FormatTuple::new(gl::R8_SNORM, gl::RED, gl::BYTE),                   // R8_SNORM
     FormatTuple::new(gl::R8I, gl::RED_INTEGER, gl::BYTE),                // R8_SINT
     FormatTuple::new(gl::R8UI, gl::RED_INTEGER, gl::UNSIGNED_BYTE),      // R8_UINT
     FormatTuple::new(gl::RGBA16F, gl::RGBA, gl::HALF_FLOAT),             // R16G16B16A16_FLOAT
     FormatTuple::new(gl::RGBA16, gl::RGBA, gl::UNSIGNED_SHORT),          // R16G16B16A16_UNORM
+    FormatTuple::new(gl::RGBA16_SNORM, gl::RGBA, gl::SHORT),             // R16G16B16A16_SNORM
+    FormatTuple::new(gl::RGBA16I, gl::RGBA_INTEGER, gl::SHORT),          // R16G16B16A16_SINT
+    FormatTuple::new(gl::RGBA16UI, gl::RGBA_INTEGER, gl::UNSIGNED_SHORT), // R16G16B16A16_UINT
     FormatTuple::new(
         gl::R11F_G11F_B10F,
         gl::RGB,
@@ -79,34 +116,90 @@ pub static FORMAT_TABLE: &[FormatTuple] = &[
     FormatTuple::compressed(gl::COMPRESSED_RGBA_BPTC_UNORM),             // BC7_UNORM
     FormatTuple::compressed(gl::COMPRESSED_RGB_BPTC_UNSIGNED_FLOAT),     // BC6H_UFLOAT
     FormatTuple::compressed(gl::COMPRESSED_RGB_BPTC_SIGNED_FLOAT),       // BC6H_SFLOAT
+    FormatTuple::compressed(GL_COMPRESSED_RGBA_ASTC_4X4_KHR),            // ASTC_2D_4X4_UNORM
+    FormatTuple::new(gl::RGBA8, gl::BGRA, gl::UNSIGNED_INT_8_8_8_8_REV), // B8G8R8A8_UNORM
     FormatTuple::new(gl::RGBA32F, gl::RGBA, gl::FLOAT),                  // R32G32B32A32_FLOAT
     FormatTuple::new(gl::RGBA32I, gl::RGBA_INTEGER, gl::INT),            // R32G32B32A32_SINT
     FormatTuple::new(gl::RG32F, gl::RG, gl::FLOAT),                      // R32G32_FLOAT
+    FormatTuple::new(gl::RG32I, gl::RG_INTEGER, gl::INT),                // R32G32_SINT
     FormatTuple::new(gl::R32F, gl::RED, gl::FLOAT),                      // R32_FLOAT
     FormatTuple::new(gl::R16F, gl::RED, gl::HALF_FLOAT),                 // R16_FLOAT
     FormatTuple::new(gl::R16, gl::RED, gl::UNSIGNED_SHORT),              // R16_UNORM
+    FormatTuple::new(gl::R16_SNORM, gl::RED, gl::SHORT),                 // R16_SNORM
     FormatTuple::new(gl::R16UI, gl::RED_INTEGER, gl::UNSIGNED_SHORT),    // R16_UINT
     FormatTuple::new(gl::R16I, gl::RED_INTEGER, gl::SHORT),              // R16_SINT
+    FormatTuple::new(gl::RG16, gl::RG, gl::UNSIGNED_SHORT),              // R16G16_UNORM
     FormatTuple::new(gl::RG16F, gl::RG, gl::HALF_FLOAT),                 // R16G16_FLOAT
     FormatTuple::new(gl::RG16UI, gl::RG_INTEGER, gl::UNSIGNED_SHORT),    // R16G16_UINT
+    FormatTuple::new(gl::RG16I, gl::RG_INTEGER, gl::SHORT),              // R16G16_SINT
+    FormatTuple::new(gl::RG16_SNORM, gl::RG, gl::SHORT),                 // R16G16_SNORM
+    FormatTuple::new(gl::RGB32F, gl::RGB, gl::FLOAT),                    // R32G32B32_FLOAT
     FormatTuple::new(gl::SRGB8_ALPHA8, gl::RGBA, gl::UNSIGNED_INT_8_8_8_8_REV), // A8B8G8R8_SRGB
     FormatTuple::new(gl::RG8, gl::RG, gl::UNSIGNED_BYTE),                // R8G8_UNORM
+    FormatTuple::new(gl::RG8_SNORM, gl::RG, gl::BYTE),                   // R8G8_SNORM
+    FormatTuple::new(gl::RG8I, gl::RG_INTEGER, gl::BYTE),                // R8G8_SINT
     FormatTuple::new(gl::RG8UI, gl::RG_INTEGER, gl::UNSIGNED_BYTE),      // R8G8_UINT
     FormatTuple::new(gl::RG32UI, gl::RG_INTEGER, gl::UNSIGNED_INT),      // R32G32_UINT
+    FormatTuple::new(gl::RGB16F, gl::RGBA, gl::HALF_FLOAT),              // R16G16B16X16_FLOAT
     FormatTuple::new(gl::R32UI, gl::RED_INTEGER, gl::UNSIGNED_INT),      // R32_UINT
     FormatTuple::new(gl::R32I, gl::RED_INTEGER, gl::INT),                // R32_SINT
+    FormatTuple::compressed(GL_COMPRESSED_RGBA_ASTC_8X8_KHR),            // ASTC_2D_8X8_UNORM
+    FormatTuple::compressed(GL_COMPRESSED_RGBA_ASTC_8X5_KHR),            // ASTC_2D_8X5_UNORM
+    FormatTuple::compressed(GL_COMPRESSED_RGBA_ASTC_5X4_KHR),            // ASTC_2D_5X4_UNORM
+    FormatTuple::new(gl::SRGB8_ALPHA8, gl::BGRA, gl::UNSIGNED_INT_8_8_8_8_REV), // B8G8R8A8_SRGB
+    FormatTuple::compressed(GL_COMPRESSED_SRGB_ALPHA_S3TC_DXT1_EXT),     // BC1_RGBA_SRGB
+    FormatTuple::compressed(GL_COMPRESSED_SRGB_ALPHA_S3TC_DXT3_EXT),     // BC2_SRGB
+    FormatTuple::compressed(GL_COMPRESSED_SRGB_ALPHA_S3TC_DXT5_EXT),     // BC3_SRGB
+    FormatTuple::compressed(gl::COMPRESSED_SRGB_ALPHA_BPTC_UNORM),       // BC7_SRGB
+    FormatTuple::new(gl::RGBA4, gl::RGBA, gl::UNSIGNED_SHORT_4_4_4_4_REV), // A4B4G4R4_UNORM
+    FormatTuple::new(gl::R8, gl::RED, gl::UNSIGNED_BYTE),                // G4R4_UNORM
+    FormatTuple::compressed(GL_COMPRESSED_SRGB8_ALPHA8_ASTC_4X4_KHR),    // ASTC_2D_4X4_SRGB
+    FormatTuple::compressed(GL_COMPRESSED_SRGB8_ALPHA8_ASTC_8X8_KHR),    // ASTC_2D_8X8_SRGB
+    FormatTuple::compressed(GL_COMPRESSED_SRGB8_ALPHA8_ASTC_8X5_KHR),    // ASTC_2D_8X5_SRGB
+    FormatTuple::compressed(GL_COMPRESSED_SRGB8_ALPHA8_ASTC_5X4_KHR),    // ASTC_2D_5X4_SRGB
+    FormatTuple::compressed(GL_COMPRESSED_RGBA_ASTC_5X5_KHR),            // ASTC_2D_5X5_UNORM
+    FormatTuple::compressed(GL_COMPRESSED_SRGB8_ALPHA8_ASTC_5X5_KHR),    // ASTC_2D_5X5_SRGB
+    FormatTuple::compressed(GL_COMPRESSED_RGBA_ASTC_10X8_KHR),           // ASTC_2D_10X8_UNORM
+    FormatTuple::compressed(GL_COMPRESSED_SRGB8_ALPHA8_ASTC_10X8_KHR),   // ASTC_2D_10X8_SRGB
+    FormatTuple::compressed(GL_COMPRESSED_RGBA_ASTC_6X6_KHR),            // ASTC_2D_6X6_UNORM
+    FormatTuple::compressed(GL_COMPRESSED_SRGB8_ALPHA8_ASTC_6X6_KHR),    // ASTC_2D_6X6_SRGB
+    FormatTuple::compressed(GL_COMPRESSED_RGBA_ASTC_10X6_KHR),           // ASTC_2D_10X6_UNORM
+    FormatTuple::compressed(GL_COMPRESSED_SRGB8_ALPHA8_ASTC_10X6_KHR),   // ASTC_2D_10X6_SRGB
+    FormatTuple::compressed(GL_COMPRESSED_RGBA_ASTC_10X5_KHR),           // ASTC_2D_10X5_UNORM
+    FormatTuple::compressed(GL_COMPRESSED_SRGB8_ALPHA8_ASTC_10X5_KHR),   // ASTC_2D_10X5_SRGB
+    FormatTuple::compressed(GL_COMPRESSED_RGBA_ASTC_10X10_KHR),          // ASTC_2D_10X10_UNORM
+    FormatTuple::compressed(GL_COMPRESSED_SRGB8_ALPHA8_ASTC_10X10_KHR),  // ASTC_2D_10X10_SRGB
+    FormatTuple::compressed(GL_COMPRESSED_RGBA_ASTC_12X10_KHR),          // ASTC_2D_12X10_UNORM
+    FormatTuple::compressed(GL_COMPRESSED_SRGB8_ALPHA8_ASTC_12X10_KHR),  // ASTC_2D_12X10_SRGB
+    FormatTuple::compressed(GL_COMPRESSED_RGBA_ASTC_12X12_KHR),          // ASTC_2D_12X12_UNORM
+    FormatTuple::compressed(GL_COMPRESSED_SRGB8_ALPHA8_ASTC_12X12_KHR),  // ASTC_2D_12X12_SRGB
+    FormatTuple::compressed(GL_COMPRESSED_RGBA_ASTC_8X6_KHR),            // ASTC_2D_8X6_UNORM
+    FormatTuple::compressed(GL_COMPRESSED_SRGB8_ALPHA8_ASTC_8X6_KHR),    // ASTC_2D_8X6_SRGB
+    FormatTuple::compressed(GL_COMPRESSED_RGBA_ASTC_6X5_KHR),            // ASTC_2D_6X5_UNORM
+    FormatTuple::compressed(GL_COMPRESSED_SRGB8_ALPHA8_ASTC_6X5_KHR),    // ASTC_2D_6X5_SRGB
+    FormatTuple::new(gl::RGB9_E5, gl::RGB, gl::UNSIGNED_INT_5_9_9_9_REV), // E5B9G9R9_FLOAT
     FormatTuple::new(gl::DEPTH_COMPONENT32F, gl::DEPTH_COMPONENT, gl::FLOAT), // D32_FLOAT
     FormatTuple::new(
         gl::DEPTH_COMPONENT16,
         gl::DEPTH_COMPONENT,
         gl::UNSIGNED_SHORT,
     ), // D16_UNORM
+    FormatTuple::new(
+        gl::DEPTH_COMPONENT24,
+        gl::DEPTH_COMPONENT,
+        gl::UNSIGNED_INT_24_8,
+    ), // X8_D24_UNORM
     FormatTuple::new(gl::STENCIL_INDEX8, gl::STENCIL, gl::UNSIGNED_BYTE), // S8_UINT
     FormatTuple::new(
         gl::DEPTH24_STENCIL8,
         gl::DEPTH_STENCIL,
         gl::UNSIGNED_INT_24_8,
     ), // D24_UNORM_S8_UINT
+    FormatTuple::new(
+        gl::DEPTH24_STENCIL8,
+        gl::DEPTH_STENCIL,
+        gl::UNSIGNED_INT_24_8,
+    ), // S8_UINT_D24_UNORM
     FormatTuple::new(
         gl::DEPTH32F_STENCIL8,
         gl::DEPTH_STENCIL,
@@ -465,5 +558,35 @@ pub fn logic_op(op: u32) -> u32 {
             log::warn!("Unimplemented logic op: {:#x}", op);
             gl::COPY
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::surface::PixelFormat;
+
+    #[test]
+    fn format_table_covers_every_upstream_pixel_format() {
+        assert_eq!(
+            FORMAT_TABLE.len(),
+            PixelFormat::MaxDepthStencilFormat as usize
+        );
+        assert_eq!(
+            get_format_tuple(PixelFormat::A8B8G8R8Unorm as usize).internal_format,
+            gl::RGBA8
+        );
+        assert_eq!(
+            get_format_tuple(PixelFormat::B8G8R8A8Srgb as usize).internal_format,
+            gl::SRGB8_ALPHA8
+        );
+        assert_eq!(
+            get_format_tuple(PixelFormat::A2R10G10B10Unorm as usize).format,
+            gl::BGRA
+        );
+        assert_eq!(
+            get_format_tuple(PixelFormat::D32FloatS8Uint as usize).gl_type,
+            gl::FLOAT_32_UNSIGNED_INT_24_8_REV
+        );
     }
 }
