@@ -376,6 +376,40 @@ pub fn start_thread(system: &System, thread_handle: Handle) -> ResultCode {
             result,
         );
     }
+
+    // EXPERIMENT (RUZU_STARTTHREAD_DELAY_US=N): pause the parent for N
+    // microseconds AFTER svcStartThread returns to give the newly-RUNNABLE
+    // child a chance to issue its first SVC before the parent continues.
+    //
+    // Background: MK8D wedge investigation traced the bug to a 157µs gap
+    // between the child being scheduled and its first SVC. During this
+    // gap the parent (tid=73) completes its critical section via
+    // guest-userspace fastpath and releases the mutex. By the time the
+    // child runs, the mutex is free → no contention → no wait_mask →
+    // parent's libnx unlock skips svcArbitrateUnlock → downstream lost
+    // wakeup at 0x7F2C0BCC. Zuyu's child reaches its first SVC in ~89µs
+    // (fast enough to contend before parent unlocks).
+    //
+    // This is a *diagnostic experiment* — if pausing here unwedges MK8D,
+    // the wedge is confirmed as a JIT-startup latency timing race and
+    // the proper fix is to either reduce child JIT-startup overhead or
+    // pre-compile entry blocks. If MK8D still wedges, the timing race
+    // hypothesis is wrong and something else is going on.
+    if let Ok(spec) = std::env::var("RUZU_STARTTHREAD_DELAY_US") {
+        if let Ok(us) = spec.parse::<u64>() {
+            if us > 0 {
+                if std::env::var_os("RUZU_TRACE_STARTTHREAD_DELAY").is_some() {
+                    log::info!(
+                        "svc::StartThread(0x{:08X}): pausing parent for {}µs",
+                        thread_handle,
+                        us
+                    );
+                }
+                std::thread::sleep(std::time::Duration::from_micros(us));
+            }
+        }
+    }
+
     ResultCode::new(result)
 }
 
