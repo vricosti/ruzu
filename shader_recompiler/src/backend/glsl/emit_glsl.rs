@@ -6,110 +6,621 @@
 //! Maps to upstream `backend/glsl/emit_glsl.cpp`.
 
 use crate::ir;
+use crate::ir::instruction::Inst;
 use crate::ir::opcodes::Opcode;
+use crate::ir::program::SyntaxNode;
+use crate::ir::value::{InstRef, Value};
 
 use super::glsl_emit_context::EmitContext;
+use super::var_alloc::GlslVarType;
 
 /// Walk an IR program and emit GLSL code.
-pub fn emit_program(ctx: &mut EmitContext, program: &ir::Program) {
-    ctx.add_line("void main() {");
-    for block in &program.blocks {
-        for inst in &block.instructions {
-            emit_inst(ctx, inst);
+pub fn emit_program(ctx: &mut EmitContext, program: &mut ir::Program) {
+    if program.syntax_list.is_empty() {
+        for block_index in 0..program.blocks.len() as u32 {
+            emit_block(ctx, program, block_index);
+        }
+        return;
+    }
+
+    for node in program.syntax_list.clone() {
+        match node {
+            SyntaxNode::Block(block_index) => emit_block(ctx, program, block_index),
+            SyntaxNode::If { cond, .. } => {
+                let cond = ctx.var_alloc.consume(program, &cond);
+                ctx.add_fmt(format!("if({}){{", cond));
+            }
+            SyntaxNode::EndIf { .. } => ctx.add_line("}"),
+            SyntaxNode::Break { cond, .. } => {
+                if let Value::ImmU1(true) = cond {
+                    ctx.add_line("break;");
+                } else if !matches!(cond, Value::ImmU1(false)) {
+                    let cond = ctx.var_alloc.consume(program, &cond);
+                    ctx.add_fmt(format!("if({}){{break;}}", cond));
+                }
+            }
+            SyntaxNode::Return | SyntaxNode::Unreachable => ctx.add_line("return;"),
+            SyntaxNode::Loop { .. } => ctx.add_line("for(;;){"),
+            SyntaxNode::Repeat { cond, .. } => {
+                let cond = ctx.var_alloc.consume(program, &cond);
+                ctx.add_fmt(format!(
+                    "if(--loop{}<0 || !{}){{break;}}}}",
+                    ctx.num_safety_loop_vars, cond
+                ));
+                ctx.num_safety_loop_vars += 1;
+            }
         }
     }
-    ctx.add_line("}");
+}
+
+fn emit_block(ctx: &mut EmitContext, program: &mut ir::Program, block_index: u32) {
+    let inst_count = program.block(block_index).instructions.len() as u32;
+    for inst_index in 0..inst_count {
+        emit_inst(
+            ctx,
+            program,
+            InstRef {
+                block: block_index,
+                inst: inst_index,
+            },
+        );
+    }
 }
 
 /// Emit a single IR instruction as GLSL.
-fn emit_inst(ctx: &mut EmitContext, inst: &ir::instruction::Inst) {
-    match inst.opcode {
+fn emit_inst(ctx: &mut EmitContext, program: &mut ir::Program, inst_ref: InstRef) {
+    let inst_snapshot = program.block(inst_ref.block).inst(inst_ref.inst).clone();
+    match inst_snapshot.opcode {
         // Arithmetic - float
-        Opcode::FPAdd32 => ctx.add_line("f_0=f_1+f_2;"),
-        Opcode::FPMul32 => ctx.add_line("f_0=f_1*f_2;"),
-        Opcode::FPFma32 => ctx.add_line("f_0=fma(f_1,f_2,f_3);"),
-        Opcode::FPMax32 => ctx.add_line("f_0=max(f_1,f_2);"),
-        Opcode::FPMin32 => ctx.add_line("f_0=min(f_1,f_2);"),
-        Opcode::FPNeg32 => ctx.add_line("f_0=-f_1;"),
-        Opcode::FPAbs32 => ctx.add_line("f_0=abs(f_1);"),
-        Opcode::FPSaturate32 => ctx.add_line("f_0=clamp(f_1,0.0f,1.0f);"),
-        Opcode::FPRoundEven32 => ctx.add_line("f_0=roundEven(f_1);"),
-        Opcode::FPFloor32 => ctx.add_line("f_0=floor(f_1);"),
-        Opcode::FPCeil32 => ctx.add_line("f_0=ceil(f_1);"),
-        Opcode::FPTrunc32 => ctx.add_line("f_0=trunc(f_1);"),
-        Opcode::FPSin => ctx.add_line("f_0=sin(f_1);"),
-        Opcode::FPCos => ctx.add_line("f_0=cos(f_1);"),
-        Opcode::FPExp2 => ctx.add_line("f_0=exp2(f_1);"),
-        Opcode::FPLog2 => ctx.add_line("f_0=log2(f_1);"),
-        Opcode::FPRecip32 => ctx.add_line("f_0=1.0f/f_1;"),
-        Opcode::FPRecipSqrt32 => ctx.add_line("f_0=inversesqrt(f_1);"),
-        Opcode::FPSqrt32 => ctx.add_line("f_0=sqrt(f_1);"),
+        Opcode::FPAdd32 => emit_binary(
+            ctx,
+            program,
+            inst_ref,
+            &inst_snapshot,
+            GlslVarType::F32,
+            "+",
+        ),
+        Opcode::FPMul32 => emit_binary(
+            ctx,
+            program,
+            inst_ref,
+            &inst_snapshot,
+            GlslVarType::F32,
+            "*",
+        ),
+        Opcode::FPFma32 => emit_ternary_call(
+            ctx,
+            program,
+            inst_ref,
+            &inst_snapshot,
+            GlslVarType::F32,
+            "fma",
+        ),
+        Opcode::FPMax32 => emit_binary_call(
+            ctx,
+            program,
+            inst_ref,
+            &inst_snapshot,
+            GlslVarType::F32,
+            "max",
+        ),
+        Opcode::FPMin32 => emit_binary_call(
+            ctx,
+            program,
+            inst_ref,
+            &inst_snapshot,
+            GlslVarType::F32,
+            "min",
+        ),
+        Opcode::FPNeg32 => emit_unary_prefix(
+            ctx,
+            program,
+            inst_ref,
+            &inst_snapshot,
+            GlslVarType::F32,
+            "-",
+        ),
+        Opcode::FPAbs32 => emit_unary_call(
+            ctx,
+            program,
+            inst_ref,
+            &inst_snapshot,
+            GlslVarType::F32,
+            "abs",
+        ),
+        Opcode::FPSaturate32 => emit_unary_expr(
+            ctx,
+            program,
+            inst_ref,
+            &inst_snapshot,
+            GlslVarType::F32,
+            |v| format!("clamp({},0.0f,1.0f)", v),
+        ),
+        Opcode::FPRoundEven32 => emit_unary_call(
+            ctx,
+            program,
+            inst_ref,
+            &inst_snapshot,
+            GlslVarType::F32,
+            "roundEven",
+        ),
+        Opcode::FPFloor32 => emit_unary_call(
+            ctx,
+            program,
+            inst_ref,
+            &inst_snapshot,
+            GlslVarType::F32,
+            "floor",
+        ),
+        Opcode::FPCeil32 => emit_unary_call(
+            ctx,
+            program,
+            inst_ref,
+            &inst_snapshot,
+            GlslVarType::F32,
+            "ceil",
+        ),
+        Opcode::FPTrunc32 => emit_unary_call(
+            ctx,
+            program,
+            inst_ref,
+            &inst_snapshot,
+            GlslVarType::F32,
+            "trunc",
+        ),
+        Opcode::FPSin => emit_unary_call(
+            ctx,
+            program,
+            inst_ref,
+            &inst_snapshot,
+            GlslVarType::F32,
+            "sin",
+        ),
+        Opcode::FPCos => emit_unary_call(
+            ctx,
+            program,
+            inst_ref,
+            &inst_snapshot,
+            GlslVarType::F32,
+            "cos",
+        ),
+        Opcode::FPExp2 => emit_unary_call(
+            ctx,
+            program,
+            inst_ref,
+            &inst_snapshot,
+            GlslVarType::F32,
+            "exp2",
+        ),
+        Opcode::FPLog2 => emit_unary_call(
+            ctx,
+            program,
+            inst_ref,
+            &inst_snapshot,
+            GlslVarType::F32,
+            "log2",
+        ),
+        Opcode::FPRecip32 => emit_unary_expr(
+            ctx,
+            program,
+            inst_ref,
+            &inst_snapshot,
+            GlslVarType::F32,
+            |v| format!("1.0f/({})", v),
+        ),
+        Opcode::FPRecipSqrt32 => emit_unary_call(
+            ctx,
+            program,
+            inst_ref,
+            &inst_snapshot,
+            GlslVarType::F32,
+            "inversesqrt",
+        ),
+        Opcode::FPSqrt32 => emit_unary_call(
+            ctx,
+            program,
+            inst_ref,
+            &inst_snapshot,
+            GlslVarType::F32,
+            "sqrt",
+        ),
 
         // Arithmetic - integer
-        Opcode::IAdd32 => ctx.add_line("u_0=u_1+u_2;"),
-        Opcode::ISub32 => ctx.add_line("u_0=u_1-u_2;"),
-        Opcode::IMul32 => ctx.add_line("u_0=u_1*u_2;"),
-        Opcode::INeg32 => ctx.add_line("u_0=uint(-int(u_1));"),
-        Opcode::IAbs32 => ctx.add_line("u_0=uint(abs(int(u_1)));"),
-        Opcode::ShiftLeftLogical32 => ctx.add_line("u_0=u_1<<u_2;"),
-        Opcode::ShiftRightLogical32 => ctx.add_line("u_0=u_1>>u_2;"),
-        Opcode::ShiftRightArithmetic32 => ctx.add_line("u_0=uint(int(u_1)>>int(u_2));"),
-        Opcode::BitwiseAnd32 => ctx.add_line("u_0=u_1&u_2;"),
-        Opcode::BitwiseOr32 => ctx.add_line("u_0=u_1|u_2;"),
-        Opcode::BitwiseXor32 => ctx.add_line("u_0=u_1^u_2;"),
-        Opcode::BitwiseNot32 => ctx.add_line("u_0=~u_1;"),
-        Opcode::BitReverse32 => ctx.add_line("u_0=bitfieldReverse(u_1);"),
-        Opcode::BitCount32 => ctx.add_line("u_0=uint(bitCount(u_1));"),
-        Opcode::SMin32 => ctx.add_line("u_0=uint(min(int(u_1),int(u_2)));"),
-        Opcode::UMin32 => ctx.add_line("u_0=min(u_1,u_2);"),
-        Opcode::SMax32 => ctx.add_line("u_0=uint(max(int(u_1),int(u_2)));"),
-        Opcode::UMax32 => ctx.add_line("u_0=max(u_1,u_2);"),
-        Opcode::BitFieldInsert => ctx.add_line("u_0=bitfieldInsert(u_1,u_2,int(u_3),int(u_4));"),
-        Opcode::BitFieldSExtract => {
-            ctx.add_line("u_0=uint(bitfieldExtract(int(u_1),int(u_2),int(u_3)));")
-        }
-        Opcode::BitFieldUExtract => ctx.add_line("u_0=bitfieldExtract(u_1,int(u_2),int(u_3));"),
+        Opcode::IAdd32 => emit_binary(
+            ctx,
+            program,
+            inst_ref,
+            &inst_snapshot,
+            GlslVarType::U32,
+            "+",
+        ),
+        Opcode::ISub32 => emit_binary(
+            ctx,
+            program,
+            inst_ref,
+            &inst_snapshot,
+            GlslVarType::U32,
+            "-",
+        ),
+        Opcode::IMul32 => emit_binary(
+            ctx,
+            program,
+            inst_ref,
+            &inst_snapshot,
+            GlslVarType::U32,
+            "*",
+        ),
+        Opcode::INeg32 => emit_unary_expr(
+            ctx,
+            program,
+            inst_ref,
+            &inst_snapshot,
+            GlslVarType::U32,
+            |v| format!("uint(-int({}))", v),
+        ),
+        Opcode::IAbs32 => emit_unary_expr(
+            ctx,
+            program,
+            inst_ref,
+            &inst_snapshot,
+            GlslVarType::U32,
+            |v| format!("uint(abs(int({})))", v),
+        ),
+        Opcode::ShiftLeftLogical32 => emit_binary(
+            ctx,
+            program,
+            inst_ref,
+            &inst_snapshot,
+            GlslVarType::U32,
+            "<<",
+        ),
+        Opcode::ShiftRightLogical32 => emit_binary(
+            ctx,
+            program,
+            inst_ref,
+            &inst_snapshot,
+            GlslVarType::U32,
+            ">>",
+        ),
+        Opcode::ShiftRightArithmetic32 => emit_binary_expr(
+            ctx,
+            program,
+            inst_ref,
+            &inst_snapshot,
+            GlslVarType::U32,
+            |a, b| format!("uint(int({})>>int({}))", a, b),
+        ),
+        Opcode::BitwiseAnd32 => emit_binary(
+            ctx,
+            program,
+            inst_ref,
+            &inst_snapshot,
+            GlslVarType::U32,
+            "&",
+        ),
+        Opcode::BitwiseOr32 => emit_binary(
+            ctx,
+            program,
+            inst_ref,
+            &inst_snapshot,
+            GlslVarType::U32,
+            "|",
+        ),
+        Opcode::BitwiseXor32 => emit_binary(
+            ctx,
+            program,
+            inst_ref,
+            &inst_snapshot,
+            GlslVarType::U32,
+            "^",
+        ),
+        Opcode::BitwiseNot32 => emit_unary_prefix(
+            ctx,
+            program,
+            inst_ref,
+            &inst_snapshot,
+            GlslVarType::U32,
+            "~",
+        ),
+        Opcode::BitReverse32 => emit_unary_call(
+            ctx,
+            program,
+            inst_ref,
+            &inst_snapshot,
+            GlslVarType::U32,
+            "bitfieldReverse",
+        ),
+        Opcode::BitCount32 => emit_unary_expr(
+            ctx,
+            program,
+            inst_ref,
+            &inst_snapshot,
+            GlslVarType::U32,
+            |v| format!("uint(bitCount({}))", v),
+        ),
+        Opcode::SMin32 => emit_binary_expr(
+            ctx,
+            program,
+            inst_ref,
+            &inst_snapshot,
+            GlslVarType::U32,
+            |a, b| format!("uint(min(int({}),int({})))", a, b),
+        ),
+        Opcode::UMin32 => emit_binary_call(
+            ctx,
+            program,
+            inst_ref,
+            &inst_snapshot,
+            GlslVarType::U32,
+            "min",
+        ),
+        Opcode::SMax32 => emit_binary_expr(
+            ctx,
+            program,
+            inst_ref,
+            &inst_snapshot,
+            GlslVarType::U32,
+            |a, b| format!("uint(max(int({}),int({})))", a, b),
+        ),
+        Opcode::UMax32 => emit_binary_call(
+            ctx,
+            program,
+            inst_ref,
+            &inst_snapshot,
+            GlslVarType::U32,
+            "max",
+        ),
+        Opcode::BitFieldInsert => emit_quaternary_expr(
+            ctx,
+            program,
+            inst_ref,
+            &inst_snapshot,
+            GlslVarType::U32,
+            |a, b, c, d| format!("bitfieldInsert({},{},int({}),int({}))", a, b, c, d),
+        ),
+        Opcode::BitFieldSExtract => emit_ternary_expr(
+            ctx,
+            program,
+            inst_ref,
+            &inst_snapshot,
+            GlslVarType::U32,
+            |a, b, c| format!("uint(bitfieldExtract(int({}),int({}),int({})))", a, b, c),
+        ),
+        Opcode::BitFieldUExtract => emit_ternary_expr(
+            ctx,
+            program,
+            inst_ref,
+            &inst_snapshot,
+            GlslVarType::U32,
+            |a, b, c| format!("bitfieldExtract({},int({}),int({}))", a, b, c),
+        ),
 
         // Comparisons - float
-        Opcode::FPOrdLessThan32 => ctx.add_line("b_0=f_1<f_2;"),
-        Opcode::FPOrdEqual32 => ctx.add_line("b_0=f_1==f_2;"),
-        Opcode::FPOrdLessThanEqual32 => ctx.add_line("b_0=f_1<=f_2;"),
-        Opcode::FPOrdGreaterThan32 => ctx.add_line("b_0=f_1>f_2;"),
-        Opcode::FPOrdGreaterThanEqual32 => ctx.add_line("b_0=f_1>=f_2;"),
-        Opcode::FPOrdNotEqual32 => ctx.add_line("b_0=f_1!=f_2;"),
-        Opcode::FPUnordLessThan32 => ctx.add_line("b_0=!(f_1>=f_2);"),
-        Opcode::FPUnordEqual32 => ctx.add_line("b_0=!(f_1!=f_2);"),
-        Opcode::FPUnordLessThanEqual32 => ctx.add_line("b_0=!(f_1>f_2);"),
-        Opcode::FPUnordGreaterThan32 => ctx.add_line("b_0=!(f_1<=f_2);"),
-        Opcode::FPUnordGreaterThanEqual32 => ctx.add_line("b_0=!(f_1<f_2);"),
-        Opcode::FPUnordNotEqual32 => ctx.add_line("b_0=!(f_1==f_2);"),
-        Opcode::FPIsNan32 => ctx.add_line("b_0=isnan(f_1);"),
+        Opcode::FPOrdLessThan32 => emit_binary_expr(
+            ctx,
+            program,
+            inst_ref,
+            &inst_snapshot,
+            GlslVarType::U1,
+            |a, b| format!("{}<{}", a, b),
+        ),
+        Opcode::FPOrdEqual32 => emit_binary_expr(
+            ctx,
+            program,
+            inst_ref,
+            &inst_snapshot,
+            GlslVarType::U1,
+            |a, b| format!("{}=={}", a, b),
+        ),
+        Opcode::FPOrdLessThanEqual32 => emit_binary_expr(
+            ctx,
+            program,
+            inst_ref,
+            &inst_snapshot,
+            GlslVarType::U1,
+            |a, b| format!("{}<={}", a, b),
+        ),
+        Opcode::FPOrdGreaterThan32 => emit_binary_expr(
+            ctx,
+            program,
+            inst_ref,
+            &inst_snapshot,
+            GlslVarType::U1,
+            |a, b| format!("{}>{}", a, b),
+        ),
+        Opcode::FPOrdGreaterThanEqual32 => emit_binary_expr(
+            ctx,
+            program,
+            inst_ref,
+            &inst_snapshot,
+            GlslVarType::U1,
+            |a, b| format!("{}>={}", a, b),
+        ),
+        Opcode::FPOrdNotEqual32 => emit_binary_expr(
+            ctx,
+            program,
+            inst_ref,
+            &inst_snapshot,
+            GlslVarType::U1,
+            |a, b| format!("{}!={}", a, b),
+        ),
+        Opcode::FPUnordLessThan32 => emit_binary_expr(
+            ctx,
+            program,
+            inst_ref,
+            &inst_snapshot,
+            GlslVarType::U1,
+            |a, b| format!("!({}>={})", a, b),
+        ),
+        Opcode::FPUnordEqual32 => emit_binary_expr(
+            ctx,
+            program,
+            inst_ref,
+            &inst_snapshot,
+            GlslVarType::U1,
+            |a, b| format!("!({}!={})", a, b),
+        ),
+        Opcode::FPUnordLessThanEqual32 => emit_binary_expr(
+            ctx,
+            program,
+            inst_ref,
+            &inst_snapshot,
+            GlslVarType::U1,
+            |a, b| format!("!({}>{})", a, b),
+        ),
+        Opcode::FPUnordGreaterThan32 => emit_binary_expr(
+            ctx,
+            program,
+            inst_ref,
+            &inst_snapshot,
+            GlslVarType::U1,
+            |a, b| format!("!({}<={})", a, b),
+        ),
+        Opcode::FPUnordGreaterThanEqual32 => emit_binary_expr(
+            ctx,
+            program,
+            inst_ref,
+            &inst_snapshot,
+            GlslVarType::U1,
+            |a, b| format!("!({}<{})", a, b),
+        ),
+        Opcode::FPUnordNotEqual32 => emit_binary_expr(
+            ctx,
+            program,
+            inst_ref,
+            &inst_snapshot,
+            GlslVarType::U1,
+            |a, b| format!("!({}=={})", a, b),
+        ),
+        Opcode::FPIsNan32 => emit_unary_call(
+            ctx,
+            program,
+            inst_ref,
+            &inst_snapshot,
+            GlslVarType::U1,
+            "isnan",
+        ),
 
         // Comparisons - integer
-        Opcode::SLessThan => ctx.add_line("b_0=int(u_1)<int(u_2);"),
-        Opcode::ULessThan => ctx.add_line("b_0=u_1<u_2;"),
-        Opcode::IEqual => ctx.add_line("b_0=u_1==u_2;"),
-        Opcode::SLessThanEqual => ctx.add_line("b_0=int(u_1)<=int(u_2);"),
-        Opcode::ULessThanEqual => ctx.add_line("b_0=u_1<=u_2;"),
-        Opcode::SGreaterThan => ctx.add_line("b_0=int(u_1)>int(u_2);"),
-        Opcode::UGreaterThan => ctx.add_line("b_0=u_1>u_2;"),
-        Opcode::INotEqual => ctx.add_line("b_0=u_1!=u_2;"),
-        Opcode::SGreaterThanEqual => ctx.add_line("b_0=int(u_1)>=int(u_2);"),
-        Opcode::UGreaterThanEqual => ctx.add_line("b_0=u_1>=u_2;"),
+        Opcode::SLessThan => emit_binary_expr(
+            ctx,
+            program,
+            inst_ref,
+            &inst_snapshot,
+            GlslVarType::U1,
+            |a, b| format!("int({})<int({})", a, b),
+        ),
+        Opcode::ULessThan => emit_binary_expr(
+            ctx,
+            program,
+            inst_ref,
+            &inst_snapshot,
+            GlslVarType::U1,
+            |a, b| format!("{}<{}", a, b),
+        ),
+        Opcode::IEqual => emit_binary_expr(
+            ctx,
+            program,
+            inst_ref,
+            &inst_snapshot,
+            GlslVarType::U1,
+            |a, b| format!("{}=={}", a, b),
+        ),
+        Opcode::SLessThanEqual => emit_binary_expr(
+            ctx,
+            program,
+            inst_ref,
+            &inst_snapshot,
+            GlslVarType::U1,
+            |a, b| format!("int({})<=int({})", a, b),
+        ),
+        Opcode::ULessThanEqual => emit_binary_expr(
+            ctx,
+            program,
+            inst_ref,
+            &inst_snapshot,
+            GlslVarType::U1,
+            |a, b| format!("{}<={}", a, b),
+        ),
+        Opcode::SGreaterThan => emit_binary_expr(
+            ctx,
+            program,
+            inst_ref,
+            &inst_snapshot,
+            GlslVarType::U1,
+            |a, b| format!("int({})>int({})", a, b),
+        ),
+        Opcode::UGreaterThan => emit_binary_expr(
+            ctx,
+            program,
+            inst_ref,
+            &inst_snapshot,
+            GlslVarType::U1,
+            |a, b| format!("{}>{}", a, b),
+        ),
+        Opcode::INotEqual => emit_binary_expr(
+            ctx,
+            program,
+            inst_ref,
+            &inst_snapshot,
+            GlslVarType::U1,
+            |a, b| format!("{}!={}", a, b),
+        ),
+        Opcode::SGreaterThanEqual => emit_binary_expr(
+            ctx,
+            program,
+            inst_ref,
+            &inst_snapshot,
+            GlslVarType::U1,
+            |a, b| format!("int({})>=int({})", a, b),
+        ),
+        Opcode::UGreaterThanEqual => emit_binary_expr(
+            ctx,
+            program,
+            inst_ref,
+            &inst_snapshot,
+            GlslVarType::U1,
+            |a, b| format!("{}>={}", a, b),
+        ),
 
         // Logical
-        Opcode::LogicalOr => ctx.add_line("b_0=b_1||b_2;"),
-        Opcode::LogicalAnd => ctx.add_line("b_0=b_1&&b_2;"),
-        Opcode::LogicalXor => ctx.add_line("b_0=b_1^^b_2;"),
-        Opcode::LogicalNot => ctx.add_line("b_0=!b_1;"),
+        Opcode::LogicalOr => emit_binary_expr(
+            ctx,
+            program,
+            inst_ref,
+            &inst_snapshot,
+            GlslVarType::U1,
+            |a, b| format!("{}||{}", a, b),
+        ),
+        Opcode::LogicalAnd => emit_binary_expr(
+            ctx,
+            program,
+            inst_ref,
+            &inst_snapshot,
+            GlslVarType::U1,
+            |a, b| format!("{}&&{}", a, b),
+        ),
+        Opcode::LogicalXor => emit_binary_expr(
+            ctx,
+            program,
+            inst_ref,
+            &inst_snapshot,
+            GlslVarType::U1,
+            |a, b| format!("{}^^{}", a, b),
+        ),
+        Opcode::LogicalNot => {
+            emit_unary_prefix(ctx, program, inst_ref, &inst_snapshot, GlslVarType::U1, "!")
+        }
 
         // Select
-        Opcode::SelectU32 => ctx.add_line("u_0=b_1?u_2:u_3;"),
-        Opcode::SelectF32 => ctx.add_line("f_0=b_1?f_2:f_3;"),
+        Opcode::SelectU32 => emit_select(ctx, program, inst_ref, &inst_snapshot, GlslVarType::U32),
+        Opcode::SelectF32 => emit_select(ctx, program, inst_ref, &inst_snapshot, GlslVarType::F32),
 
         // Undefined
-        Opcode::UndefU1 => ctx.add_line("b_0=false;"),
-        Opcode::UndefU8 | Opcode::UndefU16 | Opcode::UndefU32 => ctx.add_line("u_0=0u;"),
+        Opcode::UndefU1 => add_assign(ctx, program, inst_ref, GlslVarType::U1, "false".to_string()),
+        Opcode::UndefU8 | Opcode::UndefU16 | Opcode::UndefU32 => {
+            add_assign(ctx, program, inst_ref, GlslVarType::U32, "0u".to_string())
+        }
 
         // Barriers
         Opcode::Barrier => ctx.add_line("barrier();"),
@@ -120,24 +631,108 @@ fn emit_inst(ctx: &mut EmitContext, inst: &ir::instruction::Inst) {
         Opcode::DemoteToHelperInvocation => ctx.add_line("discard;"),
 
         // Bitwise conversion
-        Opcode::BitCastU32F32 => ctx.add_line("u_0=floatBitsToUint(f_1);"),
-        Opcode::BitCastF32U32 => ctx.add_line("f_0=uintBitsToFloat(u_1);"),
+        Opcode::BitCastU32F32 => emit_unary_expr(
+            ctx,
+            program,
+            inst_ref,
+            &inst_snapshot,
+            GlslVarType::U32,
+            |v| format!("floatBitsToUint({})", v),
+        ),
+        Opcode::BitCastF32U32 => emit_unary_expr(
+            ctx,
+            program,
+            inst_ref,
+            &inst_snapshot,
+            GlslVarType::F32,
+            |v| format!("uintBitsToFloat({})", v),
+        ),
         Opcode::Identity => {}
         Opcode::BitCastU16F16 | Opcode::BitCastF16U16 => {}
-        Opcode::BitCastU64F64 => ctx.add_line("u64_0=doubleBitsToUint64(d_1);"),
-        Opcode::BitCastF64U64 => ctx.add_line("d_0=uint64BitsToDouble(u64_1);"),
+        Opcode::BitCastU64F64 => emit_unary_expr(
+            ctx,
+            program,
+            inst_ref,
+            &inst_snapshot,
+            GlslVarType::U64,
+            |v| format!("doubleBitsToUint64({})", v),
+        ),
+        Opcode::BitCastF64U64 => emit_unary_expr(
+            ctx,
+            program,
+            inst_ref,
+            &inst_snapshot,
+            GlslVarType::F64,
+            |v| format!("uint64BitsToDouble({})", v),
+        ),
 
         // Pack/unpack
-        Opcode::PackHalf2x16 => ctx.add_line("u_0=packHalf2x16(f2_1);"),
-        Opcode::UnpackHalf2x16 => ctx.add_line("f2_0=unpackHalf2x16(u_1);"),
+        Opcode::PackHalf2x16 => emit_unary_expr(
+            ctx,
+            program,
+            inst_ref,
+            &inst_snapshot,
+            GlslVarType::U32,
+            |v| format!("packHalf2x16({})", v),
+        ),
+        Opcode::UnpackHalf2x16 => emit_unary_expr(
+            ctx,
+            program,
+            inst_ref,
+            &inst_snapshot,
+            GlslVarType::F32x2,
+            |v| format!("unpackHalf2x16({})", v),
+        ),
 
         // Conversion
-        Opcode::ConvertF32S32 => ctx.add_line("f_0=float(int(u_1));"),
-        Opcode::ConvertF32U32 => ctx.add_line("f_0=float(u_1);"),
-        Opcode::ConvertS32F32 => ctx.add_line("u_0=uint(int(f_1));"),
-        Opcode::ConvertU32F32 => ctx.add_line("u_0=uint(f_1);"),
-        Opcode::ConvertF32F64 => ctx.add_line("f_0=float(d_1);"),
-        Opcode::ConvertF64F32 => ctx.add_line("d_0=double(f_1);"),
+        Opcode::ConvertF32S32 => emit_unary_expr(
+            ctx,
+            program,
+            inst_ref,
+            &inst_snapshot,
+            GlslVarType::F32,
+            |v| format!("float(int({}))", v),
+        ),
+        Opcode::ConvertF32U32 => emit_unary_expr(
+            ctx,
+            program,
+            inst_ref,
+            &inst_snapshot,
+            GlslVarType::F32,
+            |v| format!("float({})", v),
+        ),
+        Opcode::ConvertS32F32 => emit_unary_expr(
+            ctx,
+            program,
+            inst_ref,
+            &inst_snapshot,
+            GlslVarType::U32,
+            |v| format!("uint(int({}))", v),
+        ),
+        Opcode::ConvertU32F32 => emit_unary_expr(
+            ctx,
+            program,
+            inst_ref,
+            &inst_snapshot,
+            GlslVarType::U32,
+            |v| format!("uint({})", v),
+        ),
+        Opcode::ConvertF32F64 => emit_unary_expr(
+            ctx,
+            program,
+            inst_ref,
+            &inst_snapshot,
+            GlslVarType::F32,
+            |v| format!("float({})", v),
+        ),
+        Opcode::ConvertF64F32 => emit_unary_expr(
+            ctx,
+            program,
+            inst_ref,
+            &inst_snapshot,
+            GlslVarType::F64,
+            |v| format!("double({})", v),
+        ),
 
         // Special
         Opcode::Prologue | Opcode::Epilogue | Opcode::Void | Opcode::Phi | Opcode::PhiMove => {}
@@ -146,7 +741,194 @@ fn emit_inst(ctx: &mut EmitContext, inst: &ir::instruction::Inst) {
 
         // Everything else
         _ => {
-            ctx.add_fmt(format!("// {} (not yet emitted)", inst.opcode.name()));
+            ctx.add_fmt(format!(
+                "// {} (not yet emitted)",
+                inst_snapshot.opcode.name()
+            ));
         }
     }
+}
+
+fn inst_mut<'a>(program: &'a mut ir::Program, inst_ref: InstRef) -> &'a mut Inst {
+    program.block_mut(inst_ref.block).inst_mut(inst_ref.inst)
+}
+
+fn add_assign(
+    ctx: &mut EmitContext,
+    program: &mut ir::Program,
+    inst_ref: InstRef,
+    ty: GlslVarType,
+    expr: String,
+) {
+    let dst = ctx.var_alloc.add_define(inst_mut(program, inst_ref), ty);
+    if dst.is_empty() {
+        return;
+    }
+    ctx.add_fmt(format!("{}={};", dst, expr));
+}
+
+fn consume_args(
+    ctx: &mut EmitContext,
+    program: &mut ir::Program,
+    inst: &Inst,
+    count: usize,
+) -> Vec<String> {
+    inst.args
+        .iter()
+        .take(count)
+        .map(|arg| ctx.var_alloc.consume(program, arg))
+        .collect()
+}
+
+fn emit_unary_expr(
+    ctx: &mut EmitContext,
+    program: &mut ir::Program,
+    inst_ref: InstRef,
+    inst: &Inst,
+    ty: GlslVarType,
+    f: impl FnOnce(String) -> String,
+) {
+    let args = consume_args(ctx, program, inst, 1);
+    add_assign(ctx, program, inst_ref, ty, f(args[0].clone()));
+}
+
+fn emit_unary_call(
+    ctx: &mut EmitContext,
+    program: &mut ir::Program,
+    inst_ref: InstRef,
+    inst: &Inst,
+    ty: GlslVarType,
+    func: &str,
+) {
+    emit_unary_expr(ctx, program, inst_ref, inst, ty, |v| {
+        format!("{}({})", func, v)
+    });
+}
+
+fn emit_unary_prefix(
+    ctx: &mut EmitContext,
+    program: &mut ir::Program,
+    inst_ref: InstRef,
+    inst: &Inst,
+    ty: GlslVarType,
+    op: &str,
+) {
+    emit_unary_expr(ctx, program, inst_ref, inst, ty, |v| {
+        format!("{}({})", op, v)
+    });
+}
+
+fn emit_binary_expr(
+    ctx: &mut EmitContext,
+    program: &mut ir::Program,
+    inst_ref: InstRef,
+    inst: &Inst,
+    ty: GlslVarType,
+    f: impl FnOnce(String, String) -> String,
+) {
+    let args = consume_args(ctx, program, inst, 2);
+    add_assign(
+        ctx,
+        program,
+        inst_ref,
+        ty,
+        f(args[0].clone(), args[1].clone()),
+    );
+}
+
+fn emit_binary(
+    ctx: &mut EmitContext,
+    program: &mut ir::Program,
+    inst_ref: InstRef,
+    inst: &Inst,
+    ty: GlslVarType,
+    op: &str,
+) {
+    emit_binary_expr(ctx, program, inst_ref, inst, ty, |a, b| {
+        format!("({}){}({})", a, op, b)
+    });
+}
+
+fn emit_binary_call(
+    ctx: &mut EmitContext,
+    program: &mut ir::Program,
+    inst_ref: InstRef,
+    inst: &Inst,
+    ty: GlslVarType,
+    func: &str,
+) {
+    emit_binary_expr(ctx, program, inst_ref, inst, ty, |a, b| {
+        format!("{}({},{})", func, a, b)
+    });
+}
+
+fn emit_ternary_expr(
+    ctx: &mut EmitContext,
+    program: &mut ir::Program,
+    inst_ref: InstRef,
+    inst: &Inst,
+    ty: GlslVarType,
+    f: impl FnOnce(String, String, String) -> String,
+) {
+    let args = consume_args(ctx, program, inst, 3);
+    add_assign(
+        ctx,
+        program,
+        inst_ref,
+        ty,
+        f(args[0].clone(), args[1].clone(), args[2].clone()),
+    );
+}
+
+fn emit_ternary_call(
+    ctx: &mut EmitContext,
+    program: &mut ir::Program,
+    inst_ref: InstRef,
+    inst: &Inst,
+    ty: GlslVarType,
+    func: &str,
+) {
+    emit_ternary_expr(ctx, program, inst_ref, inst, ty, |a, b, c| {
+        format!("{}({},{},{})", func, a, b, c)
+    });
+}
+
+fn emit_quaternary_expr(
+    ctx: &mut EmitContext,
+    program: &mut ir::Program,
+    inst_ref: InstRef,
+    inst: &Inst,
+    ty: GlslVarType,
+    f: impl FnOnce(String, String, String, String) -> String,
+) {
+    let args = consume_args(ctx, program, inst, 4);
+    add_assign(
+        ctx,
+        program,
+        inst_ref,
+        ty,
+        f(
+            args[0].clone(),
+            args[1].clone(),
+            args[2].clone(),
+            args[3].clone(),
+        ),
+    );
+}
+
+fn emit_select(
+    ctx: &mut EmitContext,
+    program: &mut ir::Program,
+    inst_ref: InstRef,
+    inst: &Inst,
+    ty: GlslVarType,
+) {
+    let args = consume_args(ctx, program, inst, 3);
+    add_assign(
+        ctx,
+        program,
+        inst_ref,
+        ty,
+        format!("{}?{}:{}", args[0], args[1], args[2]),
+    );
 }

@@ -7,6 +7,11 @@
 
 use std::fmt;
 
+use crate::ir;
+use crate::ir::instruction::Inst;
+use crate::ir::types::Type;
+use crate::ir::value::{InstRef, Value};
+
 /// GLSL variable type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GlslVarType {
@@ -216,10 +221,72 @@ impl VarAlloc {
         }
     }
 
-    /// Define a variable of the given type.
-    pub fn define(&mut self, var_type: GlslVarType) -> String {
-        let id = self.alloc(var_type);
-        self.representation(id)
+    /// Used for explicit usages of variables, may revert to temporaries.
+    ///
+    /// Port of upstream `VarAlloc::Define(IR::Inst&, GlslVarType)`.
+    pub fn define(&mut self, inst: &mut Inst, var_type: GlslVarType) -> String {
+        if inst.has_uses() {
+            inst.definition = self.alloc(var_type).raw;
+            self.representation(Id {
+                raw: inst.definition,
+            })
+        } else {
+            let mut id = Id::new();
+            id.set_type(var_type);
+            self.get_use_tracker_mut(var_type).uses_temp = true;
+            inst.definition = id.raw;
+            format!("t{}", self.representation(id))
+        }
+    }
+
+    pub fn define_ir_type(&mut self, inst: &mut Inst, ir_type: Type) -> String {
+        self.define(inst, self.reg_type(ir_type))
+    }
+
+    /// Used to assign variables used by the IR. May return a blank string if
+    /// the instruction's result is unused in the IR.
+    ///
+    /// Port of upstream `VarAlloc::AddDefine(IR::Inst&, GlslVarType)`.
+    pub fn add_define(&mut self, inst: &mut Inst, var_type: GlslVarType) -> String {
+        if inst.has_uses() {
+            inst.definition = self.alloc(var_type).raw;
+            self.representation(Id {
+                raw: inst.definition,
+            })
+        } else {
+            String::new()
+        }
+    }
+
+    pub fn add_define_ir_type(&mut self, inst: &mut Inst, ir_type: Type) -> String {
+        self.add_define(inst, self.reg_type(ir_type))
+    }
+
+    /// Port of upstream `VarAlloc::Consume(const IR::Value&)`.
+    pub fn consume(&mut self, program: &mut ir::Program, value: &Value) -> String {
+        if value.is_immediate() {
+            return make_imm(value);
+        }
+        match value {
+            Value::Inst(inst_ref) => self.consume_inst(program, inst_recursive(program, *inst_ref)),
+            _ => panic!("Cannot consume non-instruction GLSL value {:?}", value),
+        }
+    }
+
+    /// Port of upstream `VarAlloc::ConsumeInst(IR::Inst&)`.
+    pub fn consume_inst(&mut self, program: &mut ir::Program, inst_ref: InstRef) -> String {
+        let inst = program.block_mut(inst_ref.block).inst_mut(inst_ref.inst);
+        let id = Id {
+            raw: inst.definition,
+        };
+        if inst.use_count > 0 {
+            inst.use_count -= 1;
+        }
+        let repr = self.representation(id);
+        if !inst.has_uses() && id.is_valid() {
+            self.free(id);
+        }
+        repr
     }
 
     /// Get the string representation of a variable.
@@ -318,10 +385,78 @@ impl VarAlloc {
         let tracker = self.get_use_tracker_mut(id.var_type());
         tracker.var_use[id.index() as usize] = false;
     }
+
+    pub fn reg_type(&self, ir_type: Type) -> GlslVarType {
+        match ir_type {
+            Type::U1 => GlslVarType::U1,
+            Type::U32 => GlslVarType::U32,
+            Type::F32 => GlslVarType::F32,
+            Type::U64 => GlslVarType::U64,
+            Type::F64 => GlslVarType::F64,
+            Type::U32x2 => GlslVarType::U32x2,
+            Type::F32x2 => GlslVarType::F32x2,
+            Type::U32x3 => GlslVarType::U32x3,
+            Type::F32x3 => GlslVarType::F32x3,
+            Type::U32x4 => GlslVarType::U32x4,
+            Type::F32x4 => GlslVarType::F32x4,
+            _ => panic!("Unsupported GLSL IR type {:?}", ir_type),
+        }
+    }
 }
 
 impl Default for VarAlloc {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+fn inst_recursive(program: &ir::Program, mut inst_ref: InstRef) -> InstRef {
+    loop {
+        let inst = program.block(inst_ref.block).inst(inst_ref.inst);
+        if inst.opcode != ir::opcodes::Opcode::Identity || inst.args.is_empty() {
+            return inst_ref;
+        }
+        match inst.args[0] {
+            Value::Inst(next) => inst_ref = next,
+            _ => return inst_ref,
+        }
+    }
+}
+
+fn make_imm(value: &Value) -> String {
+    match value {
+        Value::ImmU1(v) => {
+            if *v {
+                "true".to_string()
+            } else {
+                "false".to_string()
+            }
+        }
+        Value::ImmU8(v) => format!("{}u", v),
+        Value::ImmU16(v) => format!("{}u", v),
+        Value::ImmU32(v) => format!("{}u", v),
+        Value::ImmU64(v) => format!("{}ul", v),
+        Value::ImmF16(v) => format!("uintBitsToFloat({}u)", v),
+        Value::ImmF32(v) => format_float(*v),
+        Value::ImmF64(v) => format!("double({})", v),
+        _ => panic!("Value is not an immediate {:?}", value),
+    }
+}
+
+fn format_float(value: f32) -> String {
+    if value.is_nan() {
+        return "uintBitsToFloat(0x7fc00000u)".to_string();
+    }
+    if value == f32::INFINITY {
+        return "uintBitsToFloat(0x7f800000u)".to_string();
+    }
+    if value == f32::NEG_INFINITY {
+        return "uintBitsToFloat(0xff800000u)".to_string();
+    }
+    let s = format!("{}", value);
+    if s.contains(['.', 'e', 'E']) {
+        format!("{}f", s)
+    } else {
+        format!("{}.f", s)
     }
 }

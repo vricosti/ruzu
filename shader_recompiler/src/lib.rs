@@ -50,8 +50,8 @@ pub mod varying_state;
 // Re-export public API
 pub use ir::types::ShaderStage;
 pub use pipeline_cache::{
-    compile_shader, compile_shader_glsl, CompiledGlslShader, CompiledShader, PipelineCache,
-    ShaderKey,
+    compile_dual_vertex_shader_glsl_at_offset, compile_shader, compile_shader_glsl,
+    compile_shader_glsl_at_offset, CompiledGlslShader, CompiledShader, PipelineCache, ShaderKey,
 };
 pub use profile::Profile;
 pub use runtime_info::RuntimeInfo;

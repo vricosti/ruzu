@@ -32,6 +32,7 @@ use crate::ir::program::Program;
 
 /// Run all optimization passes on the program in the correct order.
 pub fn optimize(program: &mut Program) {
+    ssa_rewrite_pass::ssa_rewrite_pass(program);
     identity_removal::identity_removal_pass(program);
     constant_propagation::constant_propagation_pass(program);
     dead_code_elimination::dead_code_elimination_pass(program);
