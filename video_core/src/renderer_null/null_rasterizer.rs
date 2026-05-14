@@ -133,7 +133,7 @@ impl RasterizerInterface for RasterizerNull {
         trace!("RasterizerNull::draw_texture (no-op)");
     }
 
-    fn clear(&mut self, _layer_count: u32) {
+    fn clear(&mut self, _draw_state: &crate::engines::draw_manager::DrawState, _layer_count: u32) {
         trace!("RasterizerNull::clear (no-op)");
     }
 
@@ -167,11 +167,8 @@ impl RasterizerInterface for RasterizerNull {
         // is passed straight to write_block (which expects CPU VA) and
         // we get "Unmapped WriteBlock" on what looks like a high
         // 36-bit address (the unmapped GPU VA).
-        let translate = |gpu_va: u64| -> Option<u64> {
-            self.gpu_to_cpu
-                .as_ref()
-                .and_then(|f| f(gpu_va))
-        };
+        let translate =
+            |gpu_va: u64| -> Option<u64> { self.gpu_to_cpu.as_ref().and_then(|f| f(gpu_va)) };
         let has_timeout = flags.contains(QueryPropertiesFlags::HAS_TIMEOUT);
         if has_timeout {
             let gpu_ticks = self
@@ -333,7 +330,7 @@ mod tests {
         rast.draw(&ds, 1);
         rast.draw(&ds, 4);
         rast.draw_texture();
-        rast.clear(1);
+        rast.clear(&crate::engines::draw_manager::DrawState::default(), 1);
         rast.dispatch_compute();
         rast.flush_all();
         rast.wait_for_idle();
@@ -478,7 +475,7 @@ mod tests {
         // Should work through the trait object
         let ds = crate::engines::draw_manager::DrawState::default();
         rast.draw(&ds, 1);
-        rast.clear(1);
+        rast.clear(&crate::engines::draw_manager::DrawState::default(), 1);
         rast.flush_all();
         rast.tick_frame();
     }

@@ -873,18 +873,97 @@ pub fn full_upload_swizzles(info: &ImageInfo) -> Vec<SwizzleParameters> {
 
 /// Port of `SwizzleImage`.
 ///
-/// Upstream writes swizzled texture data back to GPU memory via
-/// `Tegra::MemoryManager`.  The memory manager is not yet ported; logs a
-/// warning and returns without writing.
+/// Upstream writes through `Tegra::MemoryManager& gpu_memory`. Ruzu's renderer
+/// side receives a CPU/device-address writer callback instead, so callers pass
+/// the already translated image CPU base address.
 pub fn swizzle_image(
-    _gpu_memory: &(),
-    _gpu_addr: GPUVAddr,
-    _info: &ImageInfo,
-    _copies: &[BufferImageCopy],
-    _memory: &[u8],
-    _tmp_buffer: &mut Vec<u8>,
+    guest_memory_writer: &dyn Fn(u64, &[u8]),
+    cpu_addr: VAddr,
+    info: &ImageInfo,
+    copies: &[BufferImageCopy],
+    memory: &[u8],
+    tmp_buffer: &mut Vec<u8>,
 ) {
-    log::warn!("swizzle_image: MemoryManager not yet ported — no data written");
+    let bytes_per_block = surface::bytes_per_block(info.format);
+    if bytes_per_block == 0 {
+        return;
+    }
+
+    for copy in copies {
+        if info.image_type == ImageType::Linear {
+            let pitch = info.pitch();
+            if pitch == 0 {
+                continue;
+            }
+            let row_bytes = copy.image_extent.width.saturating_mul(bytes_per_block) as usize;
+            let input_stride = copy.buffer_row_length.saturating_mul(bytes_per_block) as usize;
+            for layer in 0..copy.image_subresource.num_layers.max(1) as u32 {
+                for y in 0..copy.image_extent.height {
+                    let src_offset = copy.buffer_offset
+                        + layer as usize * copy.buffer_image_height as usize * input_stride
+                        + y as usize * input_stride;
+                    let src_end = src_offset.saturating_add(row_bytes);
+                    if src_end > memory.len() {
+                        break;
+                    }
+                    let dst_offset = layer as u64 * info.layer_stride as u64
+                        + (copy.image_offset.y as u64 + y as u64) * pitch as u64
+                        + copy.image_offset.x as u64 * bytes_per_block as u64;
+                    guest_memory_writer(cpu_addr + dst_offset, &memory[src_offset..src_end]);
+                }
+            }
+            continue;
+        }
+
+        let block = info.block();
+        let width = if copy.buffer_row_length != 0 {
+            copy.buffer_row_length
+        } else {
+            copy.image_extent.width
+        };
+        let height = if copy.buffer_image_height != 0 {
+            copy.buffer_image_height
+        } else {
+            copy.image_extent.height
+        };
+        let swizzled_size = crate::textures::decoders::calculate_size(
+            true,
+            bytes_per_block,
+            width,
+            height,
+            copy.image_extent.depth.max(1),
+            block.height,
+            block.depth,
+        );
+        if swizzled_size == 0 {
+            continue;
+        }
+        tmp_buffer.clear();
+        tmp_buffer.resize(swizzled_size, 0);
+
+        let src_offset = copy.buffer_offset;
+        if src_offset >= memory.len() {
+            continue;
+        }
+        let src = &memory[src_offset..];
+        crate::textures::decoders::swizzle_texture(
+            tmp_buffer,
+            src,
+            bytes_per_block,
+            width,
+            height,
+            copy.image_extent.depth.max(1),
+            block.height,
+            block.depth,
+            calculate_level_stride_alignment(info, copy.image_subresource.base_level as u32),
+        );
+
+        // For the full-image download path, `buffer_offset` follows the same
+        // per-level order as the guest image layout calculated by
+        // `FullDownloadCopies`. Subresource-offset writes need the full
+        // upstream `SwizzleBlockLinearImage` port.
+        guest_memory_writer(cpu_addr + copy.buffer_offset as u64, tmp_buffer);
+    }
 }
 
 // ── Mip helpers ────────────────────────────────────────────────────────
@@ -1312,5 +1391,74 @@ pub fn map_size_bytes(image: &ImageBase) -> u32 {
         image.converted_size_bytes
     } else {
         image.unswizzled_size_bytes
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::texture_cache::image_info::TilingMode;
+    use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn swizzle_image_pitch_linear_writes_rows_to_guest() {
+        let writes = Arc::new(Mutex::new(Vec::<(u64, Vec<u8>)>::new()));
+        let writes_for_callback = Arc::clone(&writes);
+        let writer = move |addr: u64, bytes: &[u8]| {
+            writes_for_callback
+                .lock()
+                .unwrap()
+                .push((addr, bytes.to_vec()));
+        };
+
+        let info = ImageInfo {
+            format: PixelFormat::A8B8G8R8Unorm,
+            image_type: ImageType::Linear,
+            resources: SubresourceExtent {
+                levels: 1,
+                layers: 1,
+            },
+            size: Extent3D {
+                width: 2,
+                height: 2,
+                depth: 1,
+            },
+            tiling: TilingMode::PitchLinear(16),
+            layer_stride: 0,
+            maybe_unaligned_layer_stride: 0,
+            num_samples: 1,
+            tile_width_spacing: 0,
+            rescaleable: false,
+            downscaleable: false,
+            forced_flushed: false,
+            dma_downloaded: false,
+            is_sparse: false,
+        };
+        let copy = BufferImageCopy {
+            buffer_offset: 0,
+            buffer_size: 16,
+            buffer_row_length: 2,
+            buffer_image_height: 2,
+            image_subresource: SubresourceLayers {
+                base_level: 0,
+                base_layer: 0,
+                num_layers: 1,
+            },
+            image_offset: Offset3D { x: 0, y: 0, z: 0 },
+            image_extent: Extent3D {
+                width: 2,
+                height: 2,
+                depth: 1,
+            },
+        };
+        let memory: Vec<u8> = (0..16).collect();
+        let mut tmp = Vec::new();
+
+        swizzle_image(&writer, 0x1000, &info, &[copy], &memory, &mut tmp);
+
+        let writes = writes.lock().unwrap();
+        assert_eq!(writes.len(), 2);
+        assert_eq!(writes[0], (0x1000, vec![0, 1, 2, 3, 4, 5, 6, 7]));
+        assert_eq!(writes[1], (0x1010, vec![8, 9, 10, 11, 12, 13, 14, 15]));
     }
 }

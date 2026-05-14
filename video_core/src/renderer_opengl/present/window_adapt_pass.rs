@@ -10,26 +10,18 @@
 use super::layer::Layer;
 use super::present_uniforms::ScreenRectVertex;
 use crate::framebuffer_config::{BlendMode, FramebufferConfig};
+use crate::host_shaders::vertex_shaders::OPENGL_PRESENT_VERT;
+use crate::renderer_opengl::RasterizerOpenGL;
 use ruzu_core::frontend::framebuffer_layout::FramebufferLayout;
-
-/// Vertex shader for the present pass.
-///
-/// Port of `HostShaders::OPENGL_PRESENT_VERT`.
-const OPENGL_PRESENT_VERT: &str = r#"#version 460
-layout(location = 0) in vec2 position;
-layout(location = 1) in vec2 tex_coord;
-layout(location = 0) out vec2 frag_tex_coord;
-layout(location = 0) uniform mat3x2 model_view_matrix;
-void main() {
-    frag_tex_coord = tex_coord;
-    gl_Position = vec4(model_view_matrix * vec3(position, 1.0), 0.0, 1.0);
-}
-"#;
 
 /// Compile a shader from source.
 fn compile_shader(source: &str, shader_type: u32) -> u32 {
     unsafe {
         let shader = gl::CreateShader(shader_type);
+        let source = source
+            .find("#version")
+            .map(|index| &source[index..])
+            .unwrap_or(source);
         let c_source = std::ffi::CString::new(source).unwrap();
         let ptr = c_source.as_ptr();
         gl::ShaderSource(shader, 1, &ptr, std::ptr::null());
@@ -178,6 +170,7 @@ impl WindowAdaptPass {
         framebuffers: &[FramebufferConfig],
         layout: &FramebufferLayout,
         invert_y: bool,
+        rasterizer: &mut RasterizerOpenGL,
         device_memory: Option<&crate::renderer_base::DeviceMemoryReader>,
     ) {
         if self.program == 0 {
@@ -209,6 +202,7 @@ impl WindowAdaptPass {
                 &framebuffers[i],
                 layout,
                 invert_y,
+                rasterizer,
                 device_memory,
             );
             textures.push(texture);

@@ -57,7 +57,7 @@ pub trait RasterizerInterface {
     fn draw_texture(&mut self);
 
     /// Clear the current framebuffer.
-    fn clear(&mut self, layer_count: u32);
+    fn clear(&mut self, draw_state: &DrawState, layer_count: u32);
 
     /// Dispatch a compute shader invocation.
     fn dispatch_compute(&mut self);

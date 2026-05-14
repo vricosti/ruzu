@@ -795,7 +795,7 @@ impl Puller {
         }
         match action.op() {
             FenceOperation::Acquire => {
-                self.with_rasterizer_mut(|rasterizer| rasterizer.release_fences(false));
+                self.with_rasterizer_mut(|rasterizer| rasterizer.release_fences(true));
             }
             FenceOperation::Increment => {
                 let syncpoint_id = action.syncpoint_id();
@@ -962,7 +962,7 @@ mod tests {
         syncpoints: StdArc<StdMutex<Vec<u32>>>,
         wait_for_idle_calls: StdArc<StdMutex<u32>>,
         reference_calls: StdArc<StdMutex<u32>>,
-        release_fence_calls: StdArc<StdMutex<u32>>,
+        release_fence_calls: StdArc<StdMutex<Vec<bool>>>,
         query_calls: StdArc<StdMutex<Vec<(u64, u32, QueryPropertiesFlags, u32)>>>,
     }
 
@@ -974,7 +974,12 @@ mod tests {
         ) {
         }
         fn draw_texture(&mut self) {}
-        fn clear(&mut self, _layer_count: u32) {}
+        fn clear(
+            &mut self,
+            _draw_state: &crate::engines::draw_manager::DrawState,
+            _layer_count: u32,
+        ) {
+        }
         fn dispatch_compute(&mut self) {}
         fn reset_counter(&mut self, _query_type: u32) {}
         fn query(
@@ -1007,8 +1012,8 @@ mod tests {
         fn signal_reference(&mut self) {
             *self.reference_calls.lock().unwrap() += 1;
         }
-        fn release_fences(&mut self, _force: bool) {
-            *self.release_fence_calls.lock().unwrap() += 1;
+        fn release_fences(&mut self, force: bool) {
+            self.release_fence_calls.lock().unwrap().push(force);
         }
         fn flush_all(&mut self) {}
         fn flush_region(&mut self, _addr: u64, _size: u64) {}
@@ -1059,6 +1064,20 @@ mod tests {
         puller.process_fence_action_method();
 
         assert_eq!(*syncpoints.lock().unwrap(), vec![7]);
+    }
+
+    #[test]
+    fn fence_acquire_forces_fence_release() {
+        let mut puller = Puller::default();
+        let fake = Box::new(FakeRasterizer::default());
+        let releases = fake.release_fence_calls.clone();
+        let raw: *const dyn RasterizerInterface = Box::leak(fake);
+        puller.bind_rasterizer(unsafe { &*raw });
+        puller.regs.reg_array[0x1D] = 9 << 8;
+
+        puller.process_fence_action_method();
+
+        assert_eq!(*releases.lock().unwrap(), vec![true]);
     }
 
     #[test]
@@ -1114,6 +1133,6 @@ mod tests {
         assert_eq!(puller.regs.acquire_value(), 2);
         assert_eq!(puller.regs.acquire_active(), 1);
         assert_eq!(puller.regs.acquire_mode(), 1);
-        assert_eq!(*releases.lock().unwrap(), 1);
+        assert_eq!(*releases.lock().unwrap(), vec![false]);
     }
 }

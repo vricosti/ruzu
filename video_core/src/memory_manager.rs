@@ -1512,10 +1512,32 @@ impl MemoryManager {
 
     pub fn write_block_unsafe_owned(&self, gpu_dest: u64, input: &[u8]) {
         let Some(writer) = self.guest_memory_writer.as_ref().cloned() else {
+            if std::env::var_os("RUZU_GPU_VA_TRACE").is_some() {
+                log::info!(
+                    "[GPU_VA_WRITEBLOCK] gpu_va=0x{:X} size={} unmapped_reason=no_writer",
+                    gpu_dest,
+                    input.len()
+                );
+            }
             return;
         };
+        let trace = std::env::var_os("RUZU_GPU_VA_TRACE").is_some();
         self.inner
             .write_block_unsafe(gpu_dest, input, &mut |cpu_addr, data| {
+                if trace {
+                    let head = data
+                        .iter()
+                        .take(4)
+                        .enumerate()
+                        .fold(0u32, |acc, (idx, byte)| acc | ((*byte as u32) << (idx * 8)));
+                    log::info!(
+                        "[GPU_VA_WRITEBLOCK] gpu_va=0x{:X} cpu=0x{:X} size={} head_u32=0x{:X}",
+                        gpu_dest,
+                        cpu_addr,
+                        data.len(),
+                        head
+                    );
+                }
                 writer(cpu_addr, data)
             });
     }
@@ -1646,7 +1668,12 @@ mod tests {
         ) {
         }
         fn draw_texture(&mut self) {}
-        fn clear(&mut self, _layer_count: u32) {}
+        fn clear(
+            &mut self,
+            _draw_state: &crate::engines::draw_manager::DrawState,
+            _layer_count: u32,
+        ) {
+        }
         fn dispatch_compute(&mut self) {}
         fn reset_counter(&mut self, _query_type: u32) {}
         fn query(
