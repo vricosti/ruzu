@@ -1663,8 +1663,12 @@ impl KProcess {
     ) {
         if !is_termination_requested {
             self.pin_thread(core_id, thread_id);
-            // Upstream: KScheduler::SetSchedulerUpdateNeeded(m_kernel)
-            // The caller (KInterruptManager) must notify the scheduler.
+            if let Some(ref gsc) = self.global_scheduler_context {
+                gsc.lock()
+                    .unwrap()
+                    .m_scheduler_update_needed
+                    .store(true, std::sync::atomic::Ordering::Release);
+            }
         }
     }
 
@@ -1756,7 +1760,21 @@ impl KProcess {
         // Setup page table (upstream lines 408-417).
         {
             let as_type = flags & ADDRESS_SPACE_MASK;
-            let enable_aslr = (flags & CreateProcessFlag::ENABLE_ASLR.bits()) != 0;
+            let enable_aslr_flag = (flags & CreateProcessFlag::ENABLE_ASLR.bits()) != 0;
+            // Investigation hook: `RUZU_DISABLE_ASLR=1` forces enable_aslr=false
+            // so kernel page-table region placement is deterministic across runs.
+            // Useful for SVC trace diffing against zuyu with matched RNG seeds,
+            // gdb-attach reproducibility, and any other "did I hit the same
+            // address this run?" investigation. Pairs with `RUZU_RNG_SEED` which
+            // controls libnx's RandomEntropy (game-level RNG).
+            let enable_aslr = if std::env::var_os("RUZU_DISABLE_ASLR")
+                .is_some_and(|v| v != std::ffi::OsStr::new("0"))
+            {
+                log::info!("RUZU_DISABLE_ASLR=1 — forcing enable_aslr=false");
+                false
+            } else {
+                enable_aslr_flag
+            };
             let enable_das_merge =
                 (flags & CreateProcessFlag::DISABLE_DEVICE_ADDRESS_SPACE_MERGE.bits()) == 0;
             // Preserve the Memory reference if already wired (set by System::load
@@ -2014,6 +2032,11 @@ impl KProcess {
         }
 
         // Set the address space type and code address (upstream lines 1182-1204).
+        log::info!(
+            "[NPDM] address_space_type = {:?} is_64bit = {}",
+            metadata.get_address_space_type(),
+            metadata.is_64_bit_program()
+        );
         match metadata.get_address_space_type() {
             ProgramAddressSpaceType::Is39Bit => {
                 flags |= CreateProcessFlag::ADDRESS_SPACE_64_BIT;
