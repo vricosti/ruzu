@@ -12,7 +12,7 @@ use crate::profile::Profile;
 use crate::runtime_info::RuntimeInfo;
 use crate::stage::Stage;
 
-use super::var_alloc::VarAlloc;
+use super::var_alloc::{glsl_type_str, GlslVarType, VarAlloc};
 
 /// Per-generic-output element info.
 #[derive(Debug, Clone, Default)]
@@ -135,5 +135,47 @@ impl<'a> EmitContext<'a> {
     pub fn add_header(&mut self, line: &str) {
         self.header.push_str(line);
         self.header.push('\n');
+    }
+
+    pub fn define_variables(&self, header: &mut String) {
+        for var_type in [
+            GlslVarType::U1,
+            GlslVarType::F16x2,
+            GlslVarType::U32,
+            GlslVarType::F32,
+            GlslVarType::U64,
+            GlslVarType::F64,
+            GlslVarType::U32x2,
+            GlslVarType::F32x2,
+            GlslVarType::U32x3,
+            GlslVarType::F32x3,
+            GlslVarType::U32x4,
+            GlslVarType::F32x4,
+            GlslVarType::PrecF32,
+            GlslVarType::PrecF64,
+        ] {
+            let tracker = self.var_alloc.get_use_tracker(var_type);
+            let type_name = glsl_type_str(var_type);
+            if tracker.uses_temp {
+                header.push_str(&format!(
+                    "{} t{}={}(0);\n",
+                    type_name,
+                    self.var_alloc.representation_indexed(0, var_type),
+                    type_name
+                ));
+            }
+            for index in 0..tracker.num_used {
+                header.push_str(&format!(
+                    "{} {}={}(0);\n",
+                    type_name,
+                    self.var_alloc
+                        .representation_indexed(index as u32, var_type),
+                    type_name
+                ));
+            }
+        }
+        for index in 0..self.num_safety_loop_vars {
+            header.push_str(&format!("int loop{}=0x2000;\n", index));
+        }
     }
 }

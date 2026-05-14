@@ -53,10 +53,9 @@ fn undef_opcode(var: Variable) -> Opcode {
     match var {
         Variable::Reg(_) => Opcode::UndefU32,
         Variable::Pred(_) => Opcode::UndefU1,
-        Variable::ZeroFlag
-        | Variable::SignFlag
-        | Variable::CarryFlag
-        | Variable::OverflowFlag => Opcode::UndefU1,
+        Variable::ZeroFlag | Variable::SignFlag | Variable::CarryFlag | Variable::OverflowFlag => {
+            Opcode::UndefU1
+        }
         Variable::Goto(_) => Opcode::UndefU1,
         Variable::IndirectBranch => Opcode::UndefU32,
     }
@@ -69,10 +68,9 @@ fn undef_type(var: Variable) -> Type {
     match var {
         Variable::Reg(_) => Type::U32,
         Variable::Pred(_) => Type::U1,
-        Variable::ZeroFlag
-        | Variable::SignFlag
-        | Variable::CarryFlag
-        | Variable::OverflowFlag => Type::U1,
+        Variable::ZeroFlag | Variable::SignFlag | Variable::CarryFlag | Variable::OverflowFlag => {
+            Type::U1
+        }
         Variable::Goto(_) => Type::U1,
         Variable::IndirectBranch => Type::U32,
     }
@@ -313,12 +311,7 @@ impl Pass {
     /// instruction itself is converted to `Identity(replacement)` so that
     /// any stale `Value::Inst(def_inst)` that slips through (or future
     /// pre-existing Identity chains) still resolves correctly when chased.
-    fn replace_uses_with(
-        &mut self,
-        program: &mut Program,
-        def_inst: InstRef,
-        replacement: Value,
-    ) {
+    fn replace_uses_with(&mut self, program: &mut Program, def_inst: InstRef, replacement: Value) {
         let user_set = self.users.remove(&def_inst).unwrap_or_default();
         for user_ref in user_set {
             let mut changed = false;

@@ -41,17 +41,28 @@ use crate::runtime_info::RuntimeInfo;
 pub fn emit_glsl(
     profile: &Profile,
     runtime_info: &RuntimeInfo,
-    program: &ir::Program,
+    program: &mut ir::Program,
     bindings: &mut Bindings,
 ) -> String {
     let mut ctx = glsl_emit_context::EmitContext::new(program, bindings, profile, runtime_info);
     emit_glsl::emit_program(&mut ctx, program);
-    format!("{}\n{}", ctx.header, ctx.code)
+    let mut header = std::mem::take(&mut ctx.header);
+    header.push_str("void main(){\n");
+    if program.local_memory_size > 0 {
+        header.push_str(&format!(
+            "uint lmem[{}];\n",
+            program.local_memory_size.div_ceil(4)
+        ));
+    }
+    ctx.define_variables(&mut header);
+    let code = std::mem::take(&mut ctx.code);
+    format!("{}{}{}", header, code, "}\n")
 }
 
 /// Convenience overload without explicit bindings.
 pub fn emit_glsl_default(profile: &Profile, program: &ir::Program) -> String {
     let mut bindings = Bindings::default();
     let runtime_info = RuntimeInfo::default();
-    emit_glsl(profile, &runtime_info, program, &mut bindings)
+    let mut program = program.clone();
+    emit_glsl(profile, &runtime_info, &mut program, &mut bindings)
 }

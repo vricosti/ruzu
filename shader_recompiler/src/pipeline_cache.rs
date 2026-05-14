@@ -13,10 +13,11 @@ use std::collections::HashMap;
 
 use super::backend;
 use super::frontend::control_flow;
-use super::frontend::maxwell_opcodes;
 use super::frontend::structured_control_flow;
 use super::frontend::translate::TranslatorVisitor;
+use super::frontend::translate_program::merge_dual_vertex_programs;
 use super::ir::basic_block::Block;
+use super::ir::post_order::post_order;
 use super::ir::program::{Program, ShaderInfo};
 use super::ir::types::ShaderStage;
 use super::ir_opt;
@@ -60,6 +61,75 @@ pub struct PipelineCache {
     cache: HashMap<ShaderKey, CompiledShader>,
     /// GPU/driver profile for SPIR-V emission.
     profile: Profile,
+}
+
+fn translate_cfg_to_program(
+    code: &[u64],
+    stage: ShaderStage,
+    base_offset: u32,
+    cfg_blocks: &[control_flow::CfgBlock],
+) -> Program {
+    let syntax_list = structured_control_flow::structure_cfg(cfg_blocks);
+    let mut program = Program::new(stage);
+    program.syntax_list = syntax_list;
+    program.blocks = (0..cfg_blocks.len()).map(|_| Block::new()).collect();
+
+    for (idx, cfg_block) in cfg_blocks.iter().enumerate() {
+        if let Some(target) = cfg_block.branch_true {
+            if target < cfg_blocks.len() {
+                program.block_mut(idx as u32).add_successor(target as u32);
+                program.block_mut(target as u32).add_predecessor(idx as u32);
+            }
+        }
+        if let Some(target) = cfg_block.branch_false {
+            if target < cfg_blocks.len() {
+                program.block_mut(idx as u32).add_successor(target as u32);
+                program.block_mut(target as u32).add_predecessor(idx as u32);
+            }
+        }
+    }
+
+    for (idx, cfg_block) in cfg_blocks.iter().enumerate() {
+        program.block_mut(idx as u32).order = idx as u32;
+        let mut tv = TranslatorVisitor::new(&mut program, idx as u32);
+        for i in cfg_block.begin as usize..cfg_block.end as usize {
+            if i >= code.len() {
+                break;
+            }
+            // Skip Maxwell sched-control words. Each 32-byte SASS bundle is one
+            // 8-byte sched word followed by three 8-byte instructions, so every
+            // absolute word whose byte offset is 32-byte aligned is control metadata.
+            if is_sched_control_word(base_offset, i) {
+                continue;
+            }
+            if std::env::var_os("RUZU_TRACE_SHADER_WORDS").is_some()
+                && maxwell_opcode_is_unknown(code[i])
+            {
+                eprintln!(
+                    "[SHADER_WORD_UNKNOWN] stage={:?} abs=0x{:X} index={} word=0x{:016X}",
+                    stage,
+                    base_offset + (i as u32 * 8),
+                    i,
+                    code[i]
+                );
+            }
+            tv.translate_instruction(code[i]);
+        }
+    }
+
+    if !program.blocks.is_empty() {
+        program.post_order_blocks = post_order(&program.blocks, 0);
+    }
+
+    program
+}
+
+fn is_sched_control_word(base_offset: u32, word_index: usize) -> bool {
+    ((base_offset as usize / 8) + word_index) % 4 == 0
+}
+
+fn maxwell_opcode_is_unknown(word: u64) -> bool {
+    super::frontend::maxwell_opcodes::decode_opcode(word).is_none()
 }
 
 impl PipelineCache {
@@ -143,34 +213,10 @@ pub fn compile_shader(
     let cfg_blocks = control_flow::build_cfg(code);
     log::trace!("  CFG: {} blocks", cfg_blocks.len());
 
-    // Step 2: Convert flat CFG to structured control flow (if/loop/break/return).
-    let syntax_list = structured_control_flow::structure_cfg(&cfg_blocks);
-    log::trace!("  Syntax nodes: {}", syntax_list.len());
-
-    // Step 3: Translate Maxwell instructions to IR.
-    let mut program = Program::new(stage);
-    program.syntax_list = syntax_list;
-
-    // Create initial block for the entry point
-    program.blocks.push(Block::new());
-
-    {
-        let mut tv = TranslatorVisitor::new(&mut program, 0);
-
-        // Skip Maxwell sched-control words. Each 32-byte SASS bundle is one
-        // 8-byte sched word followed by three 8-byte instructions, so every
-        // word whose index is a multiple of 4 is control metadata that the
-        // opcode decoder does not understand. Upstream's `Location::step`
-        // handles this by iterating over byte offsets and skipping `%32==0`
-        // slots; ruzu iterates over a `&[u64]` so the equivalent guard is
-        // `index % 4 != 0`.
-        for (i, &insn) in code.iter().enumerate() {
-            if i % 4 == 0 {
-                continue;
-            }
-            tv.translate_instruction(insn);
-        }
-    }
+    // Step 2/3: Convert flat CFG to structured control flow and translate
+    // Maxwell instructions into matching IR blocks.
+    let mut program = translate_cfg_to_program(code, stage, 0, &cfg_blocks);
+    log::trace!("  Syntax nodes: {}", program.syntax_list.len());
 
     // Step 4: Run optimization passes.
     ir_opt::optimize(&mut program);
@@ -209,22 +255,7 @@ pub fn compile_shader_glsl(
     );
 
     let cfg_blocks = control_flow::build_cfg(code);
-    let syntax_list = structured_control_flow::structure_cfg(&cfg_blocks);
-
-    let mut program = Program::new(stage);
-    program.syntax_list = syntax_list;
-    program.blocks.push(Block::new());
-    {
-        let mut tv = TranslatorVisitor::new(&mut program, 0);
-        // Skip Maxwell sched-control words (every 4th 64-bit word) — see
-        // the matching comment in `compile_shader` above.
-        for (i, &insn) in code.iter().enumerate() {
-            if i % 4 == 0 {
-                continue;
-            }
-            tv.translate_instruction(insn);
-        }
-    }
+    let mut program = translate_cfg_to_program(code, stage, 0, &cfg_blocks);
 
     ir_opt::optimize(&mut program);
 
@@ -242,6 +273,100 @@ pub fn compile_shader_glsl(
     }
 }
 
+/// Compile a Maxwell shader whose first word corresponds to an absolute
+/// shader-program byte offset. This preserves upstream `Location` ownership
+/// for sched-control skipping when the cached slice does not start at offset 0.
+pub fn compile_shader_glsl_at_offset(
+    code: &[u64],
+    stage: ShaderStage,
+    base_offset: u32,
+    profile: &Profile,
+    runtime_info: &RuntimeInfo,
+) -> CompiledGlslShader {
+    log::debug!(
+        "Compiling {:?} shader to GLSL ({} instructions, base_offset=0x{:X})",
+        stage,
+        code.len(),
+        base_offset
+    );
+    if std::env::var_os("RUZU_TRACE_SHADER_WORDS").is_some() {
+        eprintln!(
+            "[SHADER_CODE] stage={:?} base=0x{:X} words={}",
+            stage,
+            base_offset,
+            code.len()
+        );
+        for (i, &word) in code.iter().take(32).enumerate() {
+            eprintln!(
+                "[SHADER_CODE_WORD] stage={:?} abs=0x{:X} index={} sched={} word=0x{:016X}",
+                stage,
+                base_offset + (i as u32 * 8),
+                i,
+                is_sched_control_word(base_offset, i),
+                word
+            );
+        }
+    }
+
+    let cfg_blocks = control_flow::build_cfg(code);
+    let mut program = translate_cfg_to_program(code, stage, base_offset, &cfg_blocks);
+
+    ir_opt::optimize(&mut program);
+
+    let mut bindings = backend::bindings::Bindings::default();
+    let source = backend::glsl::emit_glsl(profile, runtime_info, &mut program, &mut bindings);
+    if std::env::var_os("RUZU_DUMP_GLSL").is_some() {
+        eprintln!("[RUZU_DUMP_GLSL {:?}]\n{}", stage, source);
+    }
+
+    CompiledGlslShader {
+        source,
+        info: program.info,
+        stage,
+    }
+}
+
+/// Compile a Maxwell VertexA + VertexB pair into one merged VertexB GLSL
+/// program, matching upstream `MergeDualVertexPrograms` ownership.
+pub fn compile_dual_vertex_shader_glsl_at_offset(
+    vertex_a_code: &[u64],
+    vertex_a_base_offset: u32,
+    vertex_b_code: &[u64],
+    vertex_b_base_offset: u32,
+    profile: &Profile,
+    runtime_info: &RuntimeInfo,
+) -> CompiledGlslShader {
+    log::debug!(
+        "Compiling dual vertex shader to GLSL (va={} words @0x{:X}, vb={} words @0x{:X})",
+        vertex_a_code.len(),
+        vertex_a_base_offset,
+        vertex_b_code.len(),
+        vertex_b_base_offset
+    );
+    if std::env::var_os("RUZU_TRACE_SHADER_WORDS").is_some() {
+        trace_shader_words(ShaderStage::VertexA, vertex_a_base_offset, vertex_a_code);
+        trace_shader_words(ShaderStage::VertexB, vertex_b_base_offset, vertex_b_code);
+    }
+
+    let mut vertex_a =
+        translate_and_optimize(vertex_a_code, ShaderStage::VertexA, vertex_a_base_offset);
+    let mut vertex_b =
+        translate_and_optimize(vertex_b_code, ShaderStage::VertexB, vertex_b_base_offset);
+    let mut program = merge_dual_vertex_programs(&mut vertex_a, &mut vertex_b);
+
+    let mut bindings = backend::bindings::Bindings::default();
+    let source = backend::glsl::emit_glsl(profile, runtime_info, &mut program, &mut bindings);
+    if std::env::var_os("RUZU_DUMP_GLSL").is_some() {
+        eprintln!("[RUZU_DUMP_GLSL DualVertex]\n{}", source);
+    }
+
+    CompiledGlslShader {
+        source,
+        info: program.info,
+        stage: ShaderStage::VertexB,
+    }
+}
+
 /// Hash Maxwell instruction code for cache lookup.
 fn hash_code(code: &[u64]) -> u64 {
     // FNV-1a hash
@@ -256,9 +381,37 @@ fn hash_code(code: &[u64]) -> u64 {
     hash
 }
 
+fn translate_and_optimize(code: &[u64], stage: ShaderStage, base_offset: u32) -> Program {
+    let cfg_blocks = control_flow::build_cfg(code);
+    let mut program = translate_cfg_to_program(code, stage, base_offset, &cfg_blocks);
+    ir_opt::optimize(&mut program);
+    program
+}
+
+fn trace_shader_words(stage: ShaderStage, base_offset: u32, code: &[u64]) {
+    eprintln!(
+        "[SHADER_CODE] stage={:?} base=0x{:X} words={}",
+        stage,
+        base_offset,
+        code.len()
+    );
+    for (i, &word) in code.iter().take(32).enumerate() {
+        eprintln!(
+            "[SHADER_CODE_WORD] stage={:?} abs=0x{:X} index={} sched={} word=0x{:016X}",
+            stage,
+            base_offset + (i as u32 * 8),
+            i,
+            is_sched_control_word(base_offset, i),
+            word
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::frontend::control_flow::{CfgBlock, Condition, EndClass};
+    use crate::ir::program::SyntaxNode;
 
     #[test]
     fn test_hash_code_deterministic() {
@@ -303,6 +456,54 @@ mod tests {
             "GLSL emitter should produce a non-empty source string for an empty shader"
         );
         assert_eq!(compiled.stage, ShaderStage::VertexB);
+    }
+
+    #[test]
+    fn cfg_translation_creates_matching_ir_blocks_and_edges() {
+        let cfg_blocks = vec![
+            CfgBlock {
+                begin: 0,
+                end: 1,
+                end_class: EndClass::Branch,
+                branch_true: Some(1),
+                branch_false: None,
+                cond: Condition::always(),
+                stack_depth: 0,
+            },
+            CfgBlock {
+                begin: 1,
+                end: 2,
+                end_class: EndClass::Branch,
+                branch_true: None,
+                branch_false: None,
+                cond: Condition::always(),
+                stack_depth: 0,
+            },
+        ];
+
+        let program =
+            translate_cfg_to_program(&[0, 0], ShaderStage::VertexB, 0, cfg_blocks.as_slice());
+
+        assert_eq!(program.blocks.len(), 2);
+        assert_eq!(program.block(0).imm_successors, vec![1]);
+        assert_eq!(program.block(1).imm_predecessors, vec![0]);
+        assert_eq!(program.post_order_blocks, vec![1, 0]);
+        assert!(
+            program
+                .syntax_list
+                .iter()
+                .any(|node| matches!(node, SyntaxNode::Block(1))),
+            "syntax block indices must have matching IR blocks"
+        );
+    }
+
+    #[test]
+    fn sched_control_skip_uses_absolute_shader_offset() {
+        assert!(is_sched_control_word(0, 0));
+        assert!(!is_sched_control_word(0, 1));
+        assert!(is_sched_control_word(8, 3));
+        assert!(!is_sched_control_word(8, 0));
+        assert!(is_sched_control_word(0x50, 2));
     }
 
     #[test]
