@@ -1848,6 +1848,20 @@ impl KPageTableBase {
         );
 
         self.m_current_heap_end = self.m_heap_region_start + size;
+        // RUZU_TRACE_HEAP_GROW=1 — log heap-region bounds + the just-grown
+        // range so we can correlate later "Unmapped Read" addresses
+        // against what set_heap_size actually mapped.
+        if std::env::var_os("RUZU_TRACE_HEAP_GROW").is_some() {
+            eprintln!(
+                "[HEAP_GROW] region=[0x{:016X}..0x{:016X}) current_end=0x{:016X} grew=[0x{:016X}..0x{:016X}) size={}MB",
+                self.m_heap_region_start,
+                self.m_heap_region_end,
+                self.m_current_heap_end,
+                cur_address,
+                cur_address + allocation_size,
+                allocation_size / (1024 * 1024),
+            );
+        }
         // Drop the close guard explicitly so its Close() runs while we still
         // hold the borrow chain we want — match upstream SCOPE_EXIT semantics.
         drop(pg_guard);

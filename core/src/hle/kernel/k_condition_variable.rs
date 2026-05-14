@@ -37,14 +37,26 @@ fn trace_kcv(args: std::fmt::Arguments<'_>) {
     if std::env::var_os("RUZU_TRACE_KCV").is_none() {
         return;
     }
+    let limit = std::env::var("RUZU_TRACE_KCV_LIMIT")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(256);
     let idx = TRACE_KCV_COUNT.fetch_add(1, Ordering::Relaxed);
-    if idx < 256 {
+    if idx < limit {
         log::info!("{}", args);
     }
 }
 
 fn should_trace_kcv_wake() -> bool {
     std::env::var_os("RUZU_TRACE_KCV_WAKE").is_some()
+}
+
+fn current_trace_owner() -> (Option<u64>, i32) {
+    let tid = super::kernel::get_current_thread_id_fast();
+    let core = super::kernel::get_kernel_ref()
+        .map(|kernel| kernel.current_physical_core_index() as i32)
+        .unwrap_or(-1);
+    (tid, core)
 }
 
 fn deadline_from_timeout_tick(timeout_tick: i64, current_tick: Option<i64>) -> Option<Instant> {
@@ -573,8 +585,11 @@ impl KConditionVariable {
             // Signal the thread.
             // Matches upstream: this->SignalImpl(target_thread);
             self.signal_impl(process_guard, &waiting_thread);
+            let (issuer_tid, issuer_core) = current_trace_owner();
             trace_kcv(format_args!(
-                "KCV::signal cv_key=0x{:X} woke_tid={} remaining_first={:?}",
+                "KCV::signal issuer_tid={:?} issuer_core={} cv_key=0x{:X} woke_tid={} remaining_first={:?}",
+                issuer_tid,
+                issuer_core,
                 cv_key,
                 waiting_thread_id,
                 self.waiting_threads.nfind_key(cv_key).map(|k| k.thread_id)
@@ -596,6 +611,13 @@ impl KConditionVariable {
             Some(key) if key.cv_key == cv_key
         ) {
             write_to_user(process_guard, cv_key, 0);
+            let (issuer_tid, issuer_core) = current_trace_owner();
+            trace_kcv(format_args!(
+                "KCV::signal issuer_tid={:?} issuer_core={} cv_key=0x{:X} clear_has_waiter_flag no_remaining_waiters",
+                issuer_tid,
+                issuer_core,
+                cv_key,
+            ));
         }
 
         RESULT_SUCCESS

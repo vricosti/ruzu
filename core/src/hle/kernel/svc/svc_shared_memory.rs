@@ -126,15 +126,64 @@ pub fn map_shared_memory(
     };
 
     // Validate that the address can contain shared memory.
-    if !process.page_table.can_contain(
+    let can_contain = process.page_table.can_contain(
         crate::hle::kernel::k_typed_address::KProcessAddress::new(address),
         size as usize,
         KMemoryState::SHARED,
-    ) {
+    );
+    // RUZU_BYPASS_CAN_CONTAIN_SHARED=1 — diagnostic: skip the CanContain
+    // check and allow the map even if the request overlaps the heap
+    // region. MK8D's first non-audio shared-memory map lands at an
+    // address inside its heap REGION's reserved 2 GB window (heap is
+    // only ~1.875 GB actual, but the region is bigger). Upstream's
+    // CanContain has the same logic — this bypass tests whether MK8D
+    // progresses past this point.
+    let bypass_check = std::env::var_os("RUZU_BYPASS_CAN_CONTAIN_SHARED").is_some();
+    if !can_contain && !bypass_check {
         log::error!(
             "svc::MapSharedMemory: address {:#x} size {:#x} cannot contain Shared",
             address,
             size
+        );
+        // Dump the process page-table region layout so we can diagnose
+        // which region the request collides with vs upstream.
+        let pt = &process.page_table;
+        // Convert ProcessAddress accessors to raw u64 via .into()
+        let heap_s: u64 = pt.get_heap_region_start().into();
+        let heap_e: u64 = heap_s + pt.get_heap_region_size() as u64;
+        let alias_s: u64 = pt.get_alias_region_start().into();
+        let alias_e: u64 = alias_s + pt.get_alias_region_size() as u64;
+        let alias_code_s: u64 = pt.get_alias_code_region_start().into();
+        let alias_code_e: u64 = alias_code_s + pt.get_alias_code_region_size() as u64;
+        let code_s: u64 = pt.get_code_region_start().into();
+        let code_e: u64 = code_s + pt.get_code_region_size() as u64;
+        let stack_s: u64 = pt.get_stack_region_start().into();
+        let stack_e: u64 = stack_s + pt.get_stack_region_size() as u64;
+        let kmap_s: u64 = pt.get_kernel_map_region_start().into();
+        let kmap_e: u64 = kmap_s + pt.get_kernel_map_region_size() as u64;
+        let addr_s: u64 = pt.get_address_space_start().into();
+        let addr_e: u64 = addr_s + pt.get_address_space_size() as u64;
+        log::error!(
+            "  region: alias_code=[{:#x}..{:#x}] code=[{:#x}..{:#x}] heap=[{:#x}..{:#x}] alias=[{:#x}..{:#x}] stack=[{:#x}..{:#x}] kmap=[{:#x}..{:#x}] addr_space=[{:#x}..{:#x}]",
+            alias_code_s, alias_code_e,
+            code_s, code_e,
+            heap_s, heap_e,
+            alias_s, alias_e,
+            stack_s, stack_e,
+            kmap_s, kmap_e,
+            addr_s, addr_e,
+        );
+        let end = address.saturating_add(size);
+        let last = end.saturating_sub(1);
+        let is_in_region =
+            alias_code_s <= address && address < end && last <= alias_code_e.saturating_sub(1);
+        let is_in_heap = !(end <= heap_s || heap_e <= address || heap_s == heap_e);
+        let is_in_alias = !(end <= alias_s || alias_e <= address || alias_s == alias_e);
+        log::error!(
+            "  check: is_in_region={} is_in_heap={} is_in_alias={} (need true && false && false)",
+            is_in_region,
+            is_in_heap,
+            is_in_alias
         );
         return RESULT_INVALID_CURRENT_MEMORY;
     }

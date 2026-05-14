@@ -93,7 +93,7 @@ pub fn handle_interrupt(kernel: &KernelCore, core_id: i32) {
                     // Upstream: cur_thread->Pin(core_id)
                     {
                         let mut thread = thread_arc.lock().unwrap();
-                        thread.pin(thread_core);
+                        thread.pin(core_id);
                     }
 
                     // Upstream: GetCurrentThread(kernel).SetInterruptFlag();

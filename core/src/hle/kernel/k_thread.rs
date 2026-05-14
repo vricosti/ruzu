@@ -2806,13 +2806,33 @@ impl KThread {
         self.original_physical_affinity_mask = self.physical_affinity_mask.clone();
 
         // Bind to current core.
-        let _active_core = self.get_active_core();
+        let old_active_core = self.get_active_core();
+        let old_affinity = self.physical_affinity_mask.get_affinity_mask();
         self.set_active_core(current_core);
         self.physical_ideal_core_id = current_core;
         self.physical_affinity_mask
             .set_affinity_mask(1u64 << current_core);
 
-        // Upstream: notify scheduler of affinity change if needed.
+        if (old_active_core != current_core
+            || self.physical_affinity_mask.get_affinity_mask() != old_affinity)
+            && self.get_raw_state() == ThreadState::RUNNABLE
+        {
+            if let Some(gsc_arc) = self
+                .global_scheduler_context
+                .as_ref()
+                .and_then(Weak::upgrade)
+            {
+                gsc_arc.lock().unwrap().on_thread_affinity_changed(
+                    self.thread_id,
+                    old_active_core,
+                    old_affinity,
+                    current_core,
+                    self.physical_affinity_mask.get_affinity_mask(),
+                    self.priority,
+                    self.thread_type == ThreadType::Dummy,
+                );
+            }
+        }
 
         // Disallow thread suspension.
         self.suspend_allowed_flags &=
@@ -2831,14 +2851,15 @@ impl KThread {
         self.num_core_migration_disables -= 1;
 
         // Restore original affinity.
+        let old_active_core = self.get_active_core();
         let old_mask = self.physical_affinity_mask.clone();
+        let old_affinity = old_mask.get_affinity_mask();
         self.physical_ideal_core_id = self.original_physical_ideal_core_id;
         self.physical_affinity_mask = self.original_physical_affinity_mask.clone();
 
-        if self.physical_affinity_mask.get_affinity_mask() != old_mask.get_affinity_mask() {
-            let active_core = self.get_active_core();
+        if self.physical_affinity_mask.get_affinity_mask() != old_affinity {
             // Check if current core is still valid.
-            if (self.physical_affinity_mask.get_affinity_mask() & (1u64 << active_core)) == 0 {
+            if (self.physical_affinity_mask.get_affinity_mask() & (1u64 << old_active_core)) == 0 {
                 if self.physical_ideal_core_id >= 0 {
                     self.set_active_core(self.physical_ideal_core_id);
                 } else {
@@ -2849,7 +2870,23 @@ impl KThread {
                     }
                 }
             }
-            // Upstream: notify scheduler of affinity change.
+            if self.get_raw_state() == ThreadState::RUNNABLE {
+                if let Some(gsc_arc) = self
+                    .global_scheduler_context
+                    .as_ref()
+                    .and_then(Weak::upgrade)
+                {
+                    gsc_arc.lock().unwrap().on_thread_affinity_changed(
+                        self.thread_id,
+                        old_active_core,
+                        old_affinity,
+                        self.get_active_core(),
+                        self.physical_affinity_mask.get_affinity_mask(),
+                        self.priority,
+                        self.thread_type == ThreadType::Dummy,
+                    );
+                }
+            }
         }
 
         // Allow thread suspension (if termination not requested).

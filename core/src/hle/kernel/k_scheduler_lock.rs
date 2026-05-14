@@ -14,6 +14,54 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::k_spin_lock::KAlignedSpinLock;
 
+fn should_trace_scheduler_lock() -> bool {
+    std::env::var_os("RUZU_TRACE_SCHED_LOCK").is_some()
+        || std::env::var_os("RUZU_TRACE_SLEEP").is_some()
+}
+
+fn should_trace_scheduler_lock_owner(owner: u64) -> bool {
+    if std::env::var_os("RUZU_TRACE_SCHED_LOCK").is_none() {
+        return false;
+    }
+    match std::env::var("RUZU_TRACE_SCHED_LOCK_OWNER") {
+        Ok(spec) => spec
+            .split(',')
+            .filter_map(|raw| raw.trim().parse::<u64>().ok())
+            .any(|id| id == owner),
+        Err(_) => false,
+    }
+}
+
+fn trace_scheduler_lock_context(label: &str, current_id: u64, owner: u64, elapsed_us: u128) {
+    let current_tid = super::kernel::get_current_thread_id_fast();
+    let current_core = super::kernel::with_current_thread_fast_mut(|t| t.get_current_core());
+    let svc: Vec<String> = (0..super::kernel::SVC_IN_PROGRESS.len())
+        .map(|core| {
+            let packed = super::kernel::SVC_IN_PROGRESS[core].load(Ordering::Acquire);
+            let tid = packed >> 32;
+            let imm = packed & 0xFFFF_FFFF;
+            let pc = super::kernel::GUEST_PC[core].load(Ordering::Acquire);
+            let lr = super::kernel::GUEST_LR[core].load(Ordering::Acquire);
+            let sp = super::kernel::GUEST_SP[core].load(Ordering::Acquire);
+            format!(
+                "c{}:tid={} svc=0x{:X} pc=0x{:X} lr=0x{:X} sp=0x{:X}",
+                core, tid, imm, pc, lr, sp
+            )
+        })
+        .collect();
+
+    eprintln!(
+        "[SCHED_LOCK] {} elapsed_us={} current_tid={:?} current_core={:?} current_sched_id={} owner={} svc=[{}]",
+        label,
+        elapsed_us,
+        current_tid,
+        current_core,
+        current_id,
+        owner,
+        svc.join(" | "),
+    );
+}
+
 /// Counter for synthetic host-thread IDs. Reserved range: `>= 2^63` so it
 /// never collides with guest KThread IDs (those are allocated starting at
 /// small positive values by the kernel thread-id allocator).
@@ -196,14 +244,18 @@ impl KAbstractSchedulerLock {
     /// Matches upstream `KAbstractSchedulerLock::Lock()`.
     pub fn lock(&self) {
         let current_tid = super::kernel::get_current_thread_id_fast();
+        let current_sched_id = current_sched_thread_id();
         log::trace!(
             "KAbstractSchedulerLock::lock enter current_tid={:?} owner={} count={}",
             current_tid,
             self.m_owner_thread.load(Ordering::Relaxed),
             self.m_lock_count.get()
         );
-        if self.is_locked_by_current_thread() {
+        if self.m_owner_thread.load(Ordering::Relaxed) == current_sched_id {
             debug_assert!(self.m_lock_count.get() > 0);
+            if should_trace_scheduler_lock_owner(current_sched_id) {
+                trace_scheduler_lock_context("recursive", current_sched_id, current_sched_id, 0);
+            }
         } else {
             log::trace!(
                 "KAbstractSchedulerLock::lock current_tid={:?} before disable_scheduling",
@@ -214,7 +266,38 @@ impl KAbstractSchedulerLock {
                 "KAbstractSchedulerLock::lock current_tid={:?} before spin_lock",
                 current_tid
             );
-            self.m_spin_lock.lock();
+            if should_trace_scheduler_lock() {
+                let start = std::time::Instant::now();
+                let mut next_log_us = 1_000u128;
+                loop {
+                    if self.m_spin_lock.try_lock() {
+                        let elapsed_us = start.elapsed().as_micros();
+                        if elapsed_us >= 1_000 {
+                            trace_scheduler_lock_context(
+                                "acquired-after-wait",
+                                current_sched_id,
+                                self.m_owner_thread.load(Ordering::Acquire),
+                                elapsed_us,
+                            );
+                        }
+                        break;
+                    }
+
+                    let elapsed_us = start.elapsed().as_micros();
+                    if elapsed_us >= next_log_us {
+                        trace_scheduler_lock_context(
+                            "waiting",
+                            current_sched_id,
+                            self.m_owner_thread.load(Ordering::Acquire),
+                            elapsed_us,
+                        );
+                        next_log_us = elapsed_us + 1_000_000;
+                    }
+                    std::thread::yield_now();
+                }
+            } else {
+                self.m_spin_lock.lock();
+            }
             log::trace!(
                 "KAbstractSchedulerLock::lock current_tid={:?} acquired spin_lock",
                 current_tid
@@ -227,7 +310,10 @@ impl KAbstractSchedulerLock {
             // Use `current_sched_thread_id()` — returns the guest tid or a
             // unique per-OS-thread synthetic ID for host threads.
             self.m_owner_thread
-                .store(current_sched_thread_id(), Ordering::Relaxed);
+                .store(current_sched_id, Ordering::Relaxed);
+            if should_trace_scheduler_lock_owner(current_sched_id) {
+                trace_scheduler_lock_context("acquire", current_sched_id, current_sched_id, 0);
+            }
         }
 
         self.m_lock_count.set(self.m_lock_count.get() + 1);
@@ -263,6 +349,15 @@ impl KAbstractSchedulerLock {
             );
 
             self.m_owner_thread.store(0, Ordering::Relaxed);
+            let previous_owner = current_sched_thread_id();
+            if should_trace_scheduler_lock_owner(previous_owner) {
+                trace_scheduler_lock_context(
+                    "release-before-spin-unlock",
+                    previous_owner,
+                    previous_owner,
+                    0,
+                );
+            }
             self.m_spin_lock.unlock();
             log::trace!("KAbstractSchedulerLock::unlock before enable_scheduling");
             (self.callbacks.enable_scheduling)(cores_needing_scheduling);
