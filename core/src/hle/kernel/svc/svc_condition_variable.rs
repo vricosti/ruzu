@@ -516,6 +516,42 @@ fn dump_cv_state(
         );
     }
 
+    // Stack-walked call chain: scan SP..SP+128 for words that look like
+    // code-region return addresses (typical guest code lives below
+    // 0x02000000 for MK8D's ARM32 image). For each such candidate dump
+    // 8 ARM32 instructions ending at the candidate — the BL whose
+    // return-address that is, plus a few prior instructions. Gives a
+    // multi-frame call trace at the wedge moment without symbolic info.
+    if let Some(memory) = process.page_table.get_base().m_memory.as_ref() {
+        let m = memory.lock().unwrap();
+        let mut shown: Vec<u32> = Vec::with_capacity(16);
+        for slot in 0..32u64 {
+            let word = m.read_32(sp.wrapping_add(slot * 4) as u64);
+            // Heuristic: ARM32 code addresses in MK8D's image are in the
+            // 0x00100000..0x02000000 range. Word-aligned (low 2 bits 0).
+            if word < 0x0010_0000 || word >= 0x0200_0000 || word & 0x3 != 0 {
+                continue;
+            }
+            if shown.contains(&word) {
+                continue;
+            }
+            shown.push(word);
+            // Dump 8 ARM32 instructions: 6 before the return address
+            // (which contains the BL) + the return address + 1 after.
+            let base = (word as u64).wrapping_sub(24);
+            let mut insns: [u32; 8] = [0; 8];
+            for i in 0..8u64 {
+                insns[i as usize] = m.read_32(base.wrapping_add(i * 4));
+            }
+            log::info!(
+                "[DUMP_CV] {} tid={} chain@SP+{:03} ret=0x{:08X}: {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X}",
+                kind, tid, slot * 4, word,
+                insns[0], insns[1], insns[2], insns[3],
+                insns[4], insns[5], insns[6], insns[7],
+            );
+        }
+    }
+
     // Chase inline pointers. Any ctx word that looks like a heap/stack
     // pointer (high bit set in the upper byte, or in known guest VA
     // ranges) gets a 16-word dereference dump. This catches the
