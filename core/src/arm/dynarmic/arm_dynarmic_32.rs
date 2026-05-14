@@ -131,8 +131,74 @@ fn watched_ranges() -> &'static [(u64, u64)] {
     })
 }
 
+/// Trace targets parsed from `RUZU_TRACE_W_AT_VADDR=0xADDR[,0xADDR2,...]`.
+/// Each target matches any write whose [vaddr, vaddr+size) range overlaps the
+/// 4-byte word at the target address. On match, logs core/pc/lr + value. This
+/// mirrors `RUZU_TRACE_W_AT_VADDR` in `arm_dynarmic_64.rs` but uses the A32
+/// PC/LR layout (reg[14]=LR is the u32 BEFORE reg[15]=PC in JitState).
+fn trace_write_targets() -> &'static [u64] {
+    use std::sync::OnceLock;
+    static TARGETS: OnceLock<Vec<u64>> = OnceLock::new();
+    TARGETS.get_or_init(|| {
+        std::env::var("RUZU_TRACE_W_AT_VADDR")
+            .ok()
+            .map(|raw| {
+                raw.split(',')
+                    .map(|s| s.trim())
+                    .filter(|s| !s.is_empty())
+                    .filter_map(|tok| {
+                        u64::from_str_radix(tok.trim_start_matches("0x"), 16).ok()
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    })
+}
+
+#[inline(always)]
+fn maybe_trace_w_at_vaddr(
+    cb: &DynarmicCallbacks32,
+    vaddr: u64,
+    size: u64,
+    value: u128,
+) {
+    let targets = trace_write_targets();
+    if targets.is_empty() {
+        return;
+    }
+    let end = vaddr.saturating_add(size);
+    let hits = targets.iter().any(|t| vaddr <= *t && *t < end);
+    if !hits {
+        return;
+    }
+    let pc_ptr = cb.jit_pc_ptr;
+    let pc = pc_ptr.map(|p| unsafe { p.read_volatile() }).unwrap_or(0);
+    let lr = pc_ptr
+        .map(|p| unsafe { p.offset(-1).read_volatile() })
+        .unwrap_or(0);
+    let core = cb.parent.load(std::sync::atomic::Ordering::Relaxed);
+    let core_id = if core.is_null() {
+        -1i32
+    } else {
+        unsafe { (*core).core_index() as i32 }
+    };
+    let t = crate::hle::kernel::trace_format::elapsed_secs();
+    eprintln!(
+        "[{:>10.6}] [W{}_AT] core={} pc=0x{:08X} lr=0x{:08X} vaddr=0x{:08X} value=0x{:0width$X}",
+        t,
+        size * 8,
+        core_id,
+        pc,
+        lr,
+        vaddr as u32,
+        value,
+        width = (size as usize) * 2
+    );
+}
+
 #[inline(always)]
 fn watch_write(cb: &DynarmicCallbacks32, vaddr: u64, size: u64, value: u128) {
+    maybe_trace_w_at_vaddr(cb, vaddr, size, value);
     // Same filter semantics as watch_read: either filter alone is enough;
     // when both set, both must match. Lets us log writes from a PC window
     // regardless of address (useful for tracing helper function writes).
@@ -1237,10 +1303,12 @@ impl UserCallbacks for DynarmicCallbacks32 {
     }
 
     fn exclusive_write_8(&mut self, vaddr: u64, value: u8, expected: u8) -> bool {
+        maybe_trace_w_at_vaddr(self, vaddr, 1, value as u128);
         self.check_memory_access(vaddr, 1) && self.mem().write_exclusive_8(vaddr, value, expected)
     }
 
     fn exclusive_write_16(&mut self, vaddr: u64, value: u16, expected: u16) -> bool {
+        maybe_trace_w_at_vaddr(self, vaddr, 2, value as u128);
         self.check_memory_access(vaddr, 2) && self.mem().write_exclusive_16(vaddr, value, expected)
     }
 
@@ -1248,6 +1316,7 @@ impl UserCallbacks for DynarmicCallbacks32 {
         if !self.check_memory_access(vaddr, 4) {
             return false;
         }
+        maybe_trace_w_at_vaddr(self, vaddr, 4, value as u128);
         let ok = self.mem().write_exclusive_32(vaddr, value, expected);
         // Same PC-range filter as watch_read / watch_write. Reports STLEX
         // attempts (write_exclusive_32) so we can distinguish "lock never
@@ -1269,6 +1338,7 @@ impl UserCallbacks for DynarmicCallbacks32 {
     }
 
     fn exclusive_write_64(&mut self, vaddr: u64, value: u64, expected: u64) -> bool {
+        maybe_trace_w_at_vaddr(self, vaddr, 8, value as u128);
         self.check_memory_access(vaddr, 8) && self.mem().write_exclusive_64(vaddr, value, expected)
     }
 
@@ -1280,6 +1350,7 @@ impl UserCallbacks for DynarmicCallbacks32 {
         expected_lo: u64,
         expected_hi: u64,
     ) -> bool {
+        maybe_trace_w_at_vaddr(self, vaddr, 16, ((value_hi as u128) << 64) | (value_lo as u128));
         self.check_memory_access(vaddr, 16)
             && self
                 .mem()
