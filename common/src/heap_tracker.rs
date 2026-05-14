@@ -386,6 +386,28 @@ impl HeapTracker {
         perm: MemoryPermission,
         is_separate_heap: bool,
     ) {
+        // `RUZU_TRACE_HEAP_TRACKER_MAP=1` logs every map call so we can
+        // verify the fastmem-arena MAP_FIXED alias gets installed for a
+        // given guest VA region. `RUZU_TRACE_HEAP_TRACKER_MAP=0xVADDR`
+        // narrows to calls whose [virtual_offset, +length) covers VADDR.
+        if let Ok(spec) = std::env::var("RUZU_TRACE_HEAP_TRACKER_MAP") {
+            let log = if spec.trim() == "1" || spec.trim().is_empty() {
+                true
+            } else if let Ok(target) =
+                u64::from_str_radix(spec.trim().trim_start_matches("0x"), 16)
+            {
+                let v = virtual_offset as u64;
+                v <= target && target < v + length as u64
+            } else {
+                false
+            };
+            if log {
+                eprintln!(
+                    "[HEAP_TRACKER_MAP] vaddr=0x{:X} host_offset=0x{:X} length=0x{:X} is_separate_heap={}",
+                    virtual_offset, host_offset, length, is_separate_heap
+                );
+            }
+        }
         // When mapping other memory, map pages immediately.
         if !is_separate_heap {
             self.buffer_mut()
@@ -573,6 +595,23 @@ impl HeapTracker {
                 rebuild_required = true;
             }
 
+            if let Ok(spec) = std::env::var("RUZU_TRACE_HEAP_TRACKER_MAP") {
+                let log = if spec.trim() == "1" || spec.trim().is_empty() {
+                    true
+                } else if let Ok(target) =
+                    u64::from_str_radix(spec.trim().trim_start_matches("0x"), 16)
+                {
+                    vaddr <= target && target < vaddr + size as u64
+                } else {
+                    false
+                };
+                if log {
+                    eprintln!(
+                        "[HEAP_TRACKER_DEFER_MAP] vaddr=0x{:X} paddr=0x{:X} size=0x{:X} (mmap_fixed alias now live)",
+                        vaddr, paddr, size
+                    );
+                }
+            }
             // Map the area.
             self.buffer_mut()
                 .map(vaddr as usize, paddr as usize, size, perm, false);

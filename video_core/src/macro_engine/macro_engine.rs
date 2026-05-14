@@ -397,6 +397,20 @@ impl MacroEngine {
                 mid_method
             );
         }
+        if std::env::var_os("RUZU_TRACE_MACRO_HASH").is_some() {
+            let head: String = code_for_compile
+                .iter()
+                .take(8)
+                .map(|w| format!("0x{:08X},", w))
+                .collect();
+            eprintln!(
+                "[MACRO_HASH] method=0x{:X} len={} hash=0x{:016X} first8=[{}]",
+                method,
+                code_for_compile.len(),
+                hash,
+                head
+            );
+        }
 
         let lle_program = compile_fn(&code_for_compile);
 
