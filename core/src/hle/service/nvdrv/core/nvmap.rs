@@ -315,10 +315,8 @@ impl NvMap {
                     })
                 };
                 let size = inner.size as usize;
-                if let (Some(host_ptr), Some(host1x)) = (
-                    host_ptr,
-                    self.system.get().host1x_core(),
-                ) {
+                if let (Some(host_ptr), Some(host1x)) = (host_ptr, self.system.get().host1x_core())
+                {
                     let d_address = host1x.smmu_allocate(size);
                     host1x.smmu_map(d_address, host_ptr, size);
                     inner.d_address = d_address;
