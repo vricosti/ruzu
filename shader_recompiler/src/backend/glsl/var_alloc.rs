@@ -262,13 +262,25 @@ impl VarAlloc {
         self.add_define(inst, self.reg_type(ir_type))
     }
 
+    /// Port of upstream `VarAlloc::PhiDefine(IR::Inst&, IR::Type)`.
+    pub fn phi_define(&mut self, inst: &mut Inst, ir_type: Type) -> String {
+        self.add_define(inst, self.reg_type(ir_type))
+    }
+
+    pub fn definition_repr(&self, inst: &Inst) -> String {
+        self.representation(Id {
+            raw: inst.definition,
+        })
+    }
+
     /// Port of upstream `VarAlloc::Consume(const IR::Value&)`.
     pub fn consume(&mut self, program: &mut ir::Program, value: &Value) -> String {
-        if value.is_immediate() {
-            return make_imm(value);
+        let resolved = resolve_identity_value(program, *value);
+        if resolved.is_immediate() {
+            return make_imm(&resolved);
         }
-        match value {
-            Value::Inst(inst_ref) => self.consume_inst(program, inst_recursive(program, *inst_ref)),
+        match resolved {
+            Value::Inst(inst_ref) => self.consume_inst(program, inst_recursive(program, inst_ref)),
             _ => panic!("Cannot consume non-instruction GLSL value {:?}", value),
         }
     }
@@ -279,6 +291,25 @@ impl VarAlloc {
         let id = Id {
             raw: inst.definition,
         };
+        if !id.is_valid() {
+            if let Some(imm) = undefined_immediate(inst.opcode) {
+                if inst.use_count > 0 {
+                    inst.use_count -= 1;
+                }
+                return imm.to_string();
+            }
+        }
+        if !id.is_valid() && std::env::var_os("RUZU_TRACE_GLSL_UNDEFINED_CONSUME").is_some() {
+            eprintln!(
+                "[GLSL_UNDEFINED_CONSUME] ref={}:{} opcode={} return_type={:?} use_count={} args={:?}",
+                inst_ref.block,
+                inst_ref.inst,
+                inst.opcode.name(),
+                inst.return_type(),
+                inst.use_count,
+                inst.args,
+            );
+        }
         if inst.use_count > 0 {
             inst.use_count -= 1;
         }
@@ -423,6 +454,28 @@ fn inst_recursive(program: &ir::Program, mut inst_ref: InstRef) -> InstRef {
     }
 }
 
+fn resolve_identity_value(program: &ir::Program, mut value: Value) -> Value {
+    while let Value::Inst(inst_ref) = value {
+        let inst = program.block(inst_ref.block).inst(inst_ref.inst);
+        if inst.opcode != ir::opcodes::Opcode::Identity || inst.args.is_empty() {
+            return value;
+        }
+        value = inst.args[0];
+    }
+    value
+}
+
+fn undefined_immediate(opcode: ir::opcodes::Opcode) -> Option<&'static str> {
+    match opcode {
+        ir::opcodes::Opcode::UndefU1 => Some("false"),
+        ir::opcodes::Opcode::UndefU8
+        | ir::opcodes::Opcode::UndefU16
+        | ir::opcodes::Opcode::UndefU32 => Some("0u"),
+        ir::opcodes::Opcode::UndefU64 => Some("0ul"),
+        _ => None,
+    }
+}
+
 fn make_imm(value: &Value) -> String {
     match value {
         Value::ImmU1(v) => {
@@ -458,5 +511,58 @@ fn format_float(value: f32) -> String {
         format!("{}f", s)
     } else {
         format!("{}.f", s)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::ir::basic_block::Block;
+    use crate::ir::instruction::Inst;
+    use crate::ir::opcodes::Opcode;
+    use crate::ir::types::ShaderStage;
+    use crate::ir::value::{InstRef, Value};
+
+    use super::VarAlloc;
+
+    #[test]
+    fn consume_resolves_identity_to_immediate() {
+        let mut program = crate::ir::Program::new(ShaderStage::VertexB);
+        program.blocks.push(Block::new());
+        let identity = program
+            .block_mut(0)
+            .append_inst(Inst::new(Opcode::Identity, vec![Value::ImmU32(0)]));
+
+        let mut alloc = VarAlloc::new();
+        let value = alloc.consume(
+            &mut program,
+            &Value::Inst(InstRef {
+                block: 0,
+                inst: identity,
+            }),
+        );
+
+        assert_eq!(value, "0u");
+    }
+
+    #[test]
+    fn consume_unemitted_undef_uses_upstream_zero_literal() {
+        let mut program = crate::ir::Program::new(ShaderStage::VertexB);
+        program.blocks.push(Block::new());
+        let undef = program
+            .block_mut(0)
+            .append_inst(Inst::new(Opcode::UndefU32, Vec::new()));
+        program.block_mut(0).inst_mut(undef).use_count = 1;
+
+        let mut alloc = VarAlloc::new();
+        let value = alloc.consume(
+            &mut program,
+            &Value::Inst(InstRef {
+                block: 0,
+                inst: undef,
+            }),
+        );
+
+        assert_eq!(value, "0u");
+        assert_eq!(program.block(0).inst(undef).use_count, 0);
     }
 }

@@ -82,22 +82,23 @@ impl<'a> EmitContext<'a> {
 
         match program.stage {
             ir::types::ShaderStage::VertexB => {
-                ctx.stage_name = "vertex";
+                ctx.stage_name = "vs";
             }
             ir::types::ShaderStage::TessellationControl => {
-                ctx.stage_name = "tess_control";
+                ctx.stage_name = "tcs";
             }
             ir::types::ShaderStage::TessellationEval => {
-                ctx.stage_name = "tess_eval";
+                ctx.stage_name = "tes";
             }
             ir::types::ShaderStage::Geometry => {
-                ctx.stage_name = "geometry";
+                ctx.stage_name = "gs";
             }
             ir::types::ShaderStage::Fragment => {
-                ctx.stage_name = "fragment";
+                ctx.stage_name = "fs";
+                ctx.position_name = "gl_FragCoord";
             }
             ir::types::ShaderStage::Compute => {
-                ctx.stage_name = "compute";
+                ctx.stage_name = "cs";
             }
             ir::types::ShaderStage::VertexA => {
                 unreachable!("VertexA must be merged into VertexB before GLSL emission");
@@ -113,8 +114,18 @@ impl<'a> EmitContext<'a> {
                 binding: bindings.texture,
                 count: 1,
             });
+            ctx.header.push_str(&format!(
+                "layout(binding={})uniform sampler2D {}_tex{};\n",
+                bindings.texture, ctx.stage_name, _desc.cbuf_index
+            ));
             bindings.texture += 1;
         }
+
+        ctx.define_generic_inputs(program);
+        ctx.define_generic_outputs(program);
+        ctx.define_fragment_outputs(program);
+        ctx.define_constant_buffers(bindings, program);
+        ctx.define_helper_functions();
 
         ctx
     }
@@ -135,6 +146,120 @@ impl<'a> EmitContext<'a> {
     pub fn add_header(&mut self, line: &str) {
         self.header.push_str(line);
         self.header.push('\n');
+    }
+
+    pub fn is_input_array(&self) -> bool {
+        matches!(
+            self.stage,
+            Stage::Geometry | Stage::TessellationControl | Stage::TessellationEval
+        )
+    }
+
+    fn input_array_decorator(&self) -> &'static str {
+        if self.is_input_array() {
+            "[]"
+        } else {
+            ""
+        }
+    }
+
+    fn output_decorator(&self, invocations: u32) -> String {
+        if self.stage == Stage::TessellationControl {
+            format!("[{}]", invocations)
+        } else {
+            String::new()
+        }
+    }
+
+    fn define_generic_inputs(&mut self, program: &ir::Program) {
+        for index in 0..32usize {
+            if !program.info.loads.generic_any(index)
+                || !self.runtime_info.previous_stage_stores.generic_any(index)
+            {
+                continue;
+            }
+            self.header.push_str(&format!(
+                "layout(location={})in vec4 in_attr{}{};\n",
+                index,
+                index,
+                self.input_array_decorator()
+            ));
+        }
+    }
+
+    fn define_generic_outputs(&mut self, program: &ir::Program) {
+        for index in 0..32usize {
+            if program.info.stores.generic_any(index) {
+                self.define_generic_output(index, program.invocations);
+            }
+        }
+    }
+
+    fn define_generic_output(&mut self, index: usize, invocations: u32) {
+        let num_components = 4u32;
+        let name = format!("out_attr{}", index);
+        self.header.push_str(&format!(
+            "layout(location={})out vec4 {}{};\n",
+            index,
+            name,
+            self.output_decorator(invocations)
+        ));
+        let info = GenericElementInfo {
+            name,
+            first_element: 0,
+            num_components,
+        };
+        for component in 0..4usize {
+            self.output_generics[index][component] = info.clone();
+        }
+    }
+
+    fn define_fragment_outputs(&mut self, program: &ir::Program) {
+        if self.stage != Stage::Fragment {
+            return;
+        }
+        for (render_target, &enabled) in program.info.stores_frag_color.iter().enumerate() {
+            if enabled || self.profile.need_declared_frag_colors {
+                self.header.push_str(&format!(
+                    "layout(location={})out vec4 frag_color{};\n",
+                    render_target, render_target
+                ));
+            }
+        }
+    }
+
+    fn define_constant_buffers(&mut self, bindings: &mut Bindings, program: &ir::Program) {
+        for desc in &program.info.constant_buffer_descriptors {
+            let cbuf_type = if self.profile.has_gl_cbuf_ftou_bug {
+                "uvec4"
+            } else {
+                "vec4"
+            };
+            let used_size = program.info.constant_buffer_used_sizes[desc.index as usize];
+            let cbuf_used_size = used_size.max(16).div_ceil(16);
+            let cbuf_binding_size = if program.info.uses_global_memory {
+                0x1000
+            } else {
+                cbuf_used_size
+            };
+            self.header.push_str(&format!(
+                "layout(std140,binding={}) uniform {}_cbuf_{}{{{} {}_cbuf{}[{}];}};\n",
+                bindings.uniform_buffer,
+                self.stage_name,
+                desc.index,
+                cbuf_type,
+                self.stage_name,
+                desc.index,
+                cbuf_binding_size
+            ));
+            bindings.uniform_buffer += desc.count;
+        }
+    }
+
+    fn define_helper_functions(&mut self) {
+        self.header.push_str(
+            "\n#define ftoi floatBitsToInt\n#define ftou floatBitsToUint\n#define itof intBitsToFloat\n#define utof uintBitsToFloat\n",
+        );
     }
 
     pub fn define_variables(&self, header: &mut String) {

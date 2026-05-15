@@ -14,8 +14,13 @@ use super::value::{Reg, Value};
 /// A basic block in the IR program.
 #[derive(Debug, Clone)]
 pub struct Block {
-    /// Instructions in this block, in order of execution.
-    pub instructions: Vec<Inst>,
+    /// Instruction arena slots in insertion order.
+    ///
+    /// `Value::Inst(InstRef)` stores the slot index, so entries must not shift
+    /// after creation. Physical erasure marks a slot as `None`, mirroring the
+    /// upstream pointer-stable instruction identity without requiring a full
+    /// intrusive list yet.
+    pub instructions: Vec<Option<Inst>>,
     /// Immediate predecessor block indices.
     pub imm_predecessors: Vec<u32>,
     /// Immediate successor block indices.
@@ -49,7 +54,7 @@ impl Block {
     /// Returns the index of the new instruction within this block.
     pub fn append_inst(&mut self, inst: Inst) -> u32 {
         let idx = self.instructions.len() as u32;
-        self.instructions.push(inst);
+        self.instructions.push(Some(inst));
         idx
     }
 
@@ -61,7 +66,16 @@ impl Block {
 
     /// Insert an instruction at the given position.
     pub fn insert_inst(&mut self, position: usize, inst: Inst) {
-        self.instructions.insert(position, inst);
+        debug_assert!(
+            position >= self.instructions.len(),
+            "Block::insert_inst would shift stable InstRef slots"
+        );
+        self.instructions.push(Some(inst));
+    }
+
+    /// Physically erase an instruction while preserving every other slot index.
+    pub fn erase_inst(&mut self, idx: u32) {
+        self.instructions[idx as usize] = None;
     }
 
     /// Add a successor block (CFG edge).
@@ -95,32 +109,60 @@ impl Block {
 
     /// Whether this block is empty (no instructions).
     pub fn is_empty(&self) -> bool {
-        self.instructions.is_empty()
+        self.instructions.iter().all(Option::is_none)
     }
 
-    /// Number of instructions in this block.
+    /// Number of stable instruction slots in this block.
     pub fn len(&self) -> usize {
         self.instructions.len()
     }
 
+    /// Number of live instructions in this block.
+    pub fn live_len(&self) -> usize {
+        self.instructions
+            .iter()
+            .filter(|inst| inst.is_some())
+            .count()
+    }
+
     /// Get instruction at index.
     pub fn inst(&self, idx: u32) -> &Inst {
-        &self.instructions[idx as usize]
+        self.instructions[idx as usize]
+            .as_ref()
+            .expect("accessed erased instruction slot")
     }
 
     /// Get mutable instruction at index.
     pub fn inst_mut(&mut self, idx: u32) -> &mut Inst {
-        &mut self.instructions[idx as usize]
+        self.instructions[idx as usize]
+            .as_mut()
+            .expect("accessed erased instruction slot")
     }
 
     /// Iterate over instructions.
-    pub fn iter(&self) -> std::slice::Iter<'_, Inst> {
-        self.instructions.iter()
+    pub fn iter(&self) -> impl Iterator<Item = &Inst> {
+        self.instructions.iter().filter_map(Option::as_ref)
     }
 
     /// Iterate over instructions mutably.
-    pub fn iter_mut(&mut self) -> std::slice::IterMut<'_, Inst> {
-        self.instructions.iter_mut()
+    pub fn iter_mut(&mut self) -> impl Iterator<Item = &mut Inst> {
+        self.instructions.iter_mut().filter_map(Option::as_mut)
+    }
+
+    /// Iterate over live instruction slots.
+    pub fn indexed_iter(&self) -> impl Iterator<Item = (u32, &Inst)> {
+        self.instructions
+            .iter()
+            .enumerate()
+            .filter_map(|(index, inst)| inst.as_ref().map(|inst| (index as u32, inst)))
+    }
+
+    /// Iterate over live instruction slots mutably.
+    pub fn indexed_iter_mut(&mut self) -> impl Iterator<Item = (u32, &mut Inst)> {
+        self.instructions
+            .iter_mut()
+            .enumerate()
+            .filter_map(|(index, inst)| inst.as_mut().map(|inst| (index as u32, inst)))
     }
 }
 

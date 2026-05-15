@@ -544,16 +544,75 @@ impl Opcode {
 
     /// Whether this instruction may have side effects.
     pub fn may_have_side_effects(self) -> bool {
-        match self.return_type() {
-            Type::Void => true,
-            _ => matches!(
-                self,
-                Opcode::Barrier
-                    | Opcode::WorkgroupMemoryBarrier
-                    | Opcode::DeviceMemoryBarrier
-                    | Opcode::ImageWrite
-            ),
-        }
+        matches!(
+            self,
+            Opcode::ConditionRef
+                | Opcode::Reference
+                | Opcode::PhiMove
+                | Opcode::Prologue
+                | Opcode::Epilogue
+                | Opcode::Join
+                | Opcode::DemoteToHelperInvocation
+                | Opcode::Barrier
+                | Opcode::WorkgroupMemoryBarrier
+                | Opcode::DeviceMemoryBarrier
+                | Opcode::EmitVertex
+                | Opcode::EndPrimitive
+                | Opcode::SetAttribute
+                | Opcode::SetAttributeIndexed
+                | Opcode::SetPatch
+                | Opcode::SetFragColor
+                | Opcode::SetSampleMask
+                | Opcode::SetFragDepth
+                | Opcode::WriteGlobalU8
+                | Opcode::WriteGlobalS8
+                | Opcode::WriteGlobalU16
+                | Opcode::WriteGlobalS16
+                | Opcode::WriteGlobal32
+                | Opcode::WriteGlobal64
+                | Opcode::WriteGlobal128
+                | Opcode::WriteStorageU8
+                | Opcode::WriteStorageS8
+                | Opcode::WriteStorageU16
+                | Opcode::WriteStorageS16
+                | Opcode::WriteStorage32
+                | Opcode::WriteStorage64
+                | Opcode::WriteStorage128
+                | Opcode::WriteLocal
+                | Opcode::WriteSharedU8
+                | Opcode::WriteSharedU16
+                | Opcode::WriteSharedU32
+                | Opcode::WriteSharedU64
+                | Opcode::WriteSharedU128
+                | Opcode::GlobalAtomicIAdd32
+                | Opcode::GlobalAtomicSMin32
+                | Opcode::GlobalAtomicUMin32
+                | Opcode::GlobalAtomicSMax32
+                | Opcode::GlobalAtomicUMax32
+                | Opcode::GlobalAtomicAnd32
+                | Opcode::GlobalAtomicOr32
+                | Opcode::GlobalAtomicXor32
+                | Opcode::GlobalAtomicExchange32
+                | Opcode::StorageAtomicIAdd32
+                | Opcode::StorageAtomicSMin32
+                | Opcode::StorageAtomicUMin32
+                | Opcode::StorageAtomicSMax32
+                | Opcode::StorageAtomicUMax32
+                | Opcode::StorageAtomicAnd32
+                | Opcode::StorageAtomicOr32
+                | Opcode::StorageAtomicXor32
+                | Opcode::StorageAtomicExchange32
+                | Opcode::SharedAtomicIAdd32
+                | Opcode::SharedAtomicSMin32
+                | Opcode::SharedAtomicUMin32
+                | Opcode::SharedAtomicSMax32
+                | Opcode::SharedAtomicUMax32
+                | Opcode::SharedAtomicAnd32
+                | Opcode::SharedAtomicOr32
+                | Opcode::SharedAtomicXor32
+                | Opcode::SharedAtomicExchange32
+                | Opcode::ImageWrite
+        )
     }
 
     /// Get the full metadata for this opcode.
@@ -2621,5 +2680,26 @@ impl Opcode {
 impl fmt::Display for Opcode {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.name())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Opcode;
+
+    #[test]
+    fn register_ssa_ops_are_not_side_effects() {
+        assert!(!Opcode::SetRegister.may_have_side_effects());
+        assert!(!Opcode::SetPred.may_have_side_effects());
+        assert!(!Opcode::SetZFlag.may_have_side_effects());
+        assert!(!Opcode::GetRegister.may_have_side_effects());
+    }
+
+    #[test]
+    fn guest_visible_outputs_remain_side_effects() {
+        assert!(Opcode::SetAttribute.may_have_side_effects());
+        assert!(Opcode::SetFragColor.may_have_side_effects());
+        assert!(Opcode::WriteGlobal32.may_have_side_effects());
+        assert!(Opcode::Barrier.may_have_side_effects());
     }
 }

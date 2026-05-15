@@ -627,12 +627,19 @@ impl<'a> TranslatorVisitor<'a> {
                 self::load_store_attribute::ipa(self, insn);
             }
 
+            // Control flow. The CFG builder owns block/successor structure, but
+            // EXIT still has stage-specific side effects upstream: fragment
+            // shaders write their color/depth/sample outputs in
+            // `TranslatorVisitor::EXIT()` before control returns.
+            MaxwellOpcode::EXIT => {
+                self.translate_exit(insn);
+            }
+
             // Control flow — handled by the CFG builder
             MaxwellOpcode::BRA
             | MaxwellOpcode::BRK
             | MaxwellOpcode::SYNC
             | MaxwellOpcode::CONT
-            | MaxwellOpcode::EXIT
             | MaxwellOpcode::SSY
             | MaxwellOpcode::PBK
             | MaxwellOpcode::PCNT

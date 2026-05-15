@@ -80,6 +80,7 @@ pub trait ShaderInfoExt {
 
 impl ShaderInfoExt for ShaderInfo {
     fn register_cbuf(&mut self, index: u32) {
+        self.constant_buffer_mask |= 1u32 << index;
         if !self
             .constant_buffer_descriptors
             .iter()

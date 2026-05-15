@@ -8,10 +8,14 @@
 //! flow AST, and returns an IR::Program.
 
 use crate::ir::basic_block::Block;
+use crate::ir::opcodes::Opcode;
 use crate::ir::program::{Program, SyntaxNode};
 use crate::ir::types::ShaderStage;
-use crate::ir::value::{InstRef, Value};
+use crate::ir::value::{Attribute, InstRef, Value};
 use crate::ir_opt;
+use crate::runtime_info::{AttributeType, RuntimeInfo};
+use crate::varying_state::VaryingState;
+use std::collections::{BTreeMap, VecDeque};
 
 /// Translate a Maxwell shader program from CFG to IR.
 ///
@@ -101,13 +105,87 @@ pub fn merge_dual_vertex_programs(vertex_a: &mut Program, vertex_b: &mut Program
 }
 
 /// Convert legacy (fixed-function) varyings to generic attributes.
-///
-/// Not yet implemented: requires attribute mapping tables and instruction mutation.
-pub fn convert_legacy_to_generic(
-    _program: &mut Program,
-    _runtime_info: &crate::runtime_info::RuntimeInfo,
-) {
-    log::warn!("ConvertLegacyToGeneric not yet implemented — attributes left unmapped");
+pub fn convert_legacy_to_generic(program: &mut Program, runtime_info: &RuntimeInfo) {
+    if program.info.stores.legacy() {
+        let mut unused_output_generics = VecDeque::new();
+        for index in 0..NUM_GENERICS {
+            if !program.info.stores.generic_any(index) {
+                unused_output_generics.push_back(generic_x(index));
+            }
+        }
+
+        program.info.legacy_stores_mapping = generate_legacy_to_generic_mappings(
+            &program.info.stores,
+            unused_output_generics,
+            &BTreeMap::new(),
+        );
+
+        let block_indices = program.post_order_blocks.clone();
+        let mappings = program.info.legacy_stores_mapping.clone();
+        let mut mapped_store_attrs = Vec::new();
+        for block_index in block_indices {
+            for inst in program.block_mut(block_index).iter_mut() {
+                if inst.opcode != Opcode::SetAttribute {
+                    continue;
+                }
+                let Some(Value::Attribute(attr)) = inst.args.first().copied() else {
+                    continue;
+                };
+                if !is_legacy_attribute(attr) {
+                    continue;
+                }
+                if let Some(&mapped_attr) = mappings.get(&(attr.0 as u64)) {
+                    mapped_store_attrs.push(mapped_attr);
+                    inst.args[0] = Value::Attribute(Attribute(mapped_attr as u32));
+                }
+            }
+        }
+        for mapped_attr in mapped_store_attrs {
+            program.info.stores.set(mapped_attr as usize, true);
+        }
+    }
+
+    if program.info.loads.legacy() {
+        let mut unused_input_generics = VecDeque::new();
+        for index in 0..NUM_GENERICS {
+            let input_type = runtime_info.generic_input_types[index];
+            if !runtime_info.previous_stage_stores.generic_any(index)
+                || !program.info.loads.generic_any(index)
+                || input_type == AttributeType::Disabled
+            {
+                unused_input_generics.push_back(generic_x(index));
+            }
+        }
+
+        let mappings = generate_legacy_to_generic_mappings(
+            &program.info.loads,
+            unused_input_generics,
+            &runtime_info.previous_stage_legacy_stores_mapping,
+        );
+
+        let block_indices = program.post_order_blocks.clone();
+        let mut mapped_load_attrs = Vec::new();
+        for block_index in block_indices {
+            for inst in program.block_mut(block_index).iter_mut() {
+                if inst.opcode != Opcode::GetAttribute {
+                    continue;
+                }
+                let Some(Value::Attribute(attr)) = inst.args.first().copied() else {
+                    continue;
+                };
+                if !is_legacy_attribute(attr) {
+                    continue;
+                }
+                if let Some(&mapped_attr) = mappings.get(&(attr.0 as u64)) {
+                    mapped_load_attrs.push(mapped_attr);
+                    inst.args[0] = Value::Attribute(Attribute(mapped_attr as u32));
+                }
+            }
+        }
+        for mapped_attr in mapped_load_attrs {
+            program.info.loads.set(mapped_attr as usize, true);
+        }
+    }
 }
 
 /// Generate a passthrough geometry shader for layer emulation.
@@ -158,7 +236,7 @@ fn remap_syntax_node_blocks(node: &SyntaxNode, offset: u32) -> SyntaxNode {
 }
 
 fn remap_block(mut block: Block, offset: u32) -> Block {
-    for inst in &mut block.instructions {
+    for inst in block.iter_mut() {
         for arg in &mut inst.args {
             *arg = remap_value_blocks(*arg, offset);
         }
@@ -185,6 +263,161 @@ fn remap_value_blocks(value: Value, offset: u32) -> Value {
     }
 }
 
+const NUM_GENERICS: usize = 32;
+const NUM_FIXEDFNCTEXTURE: usize = 10;
+const COLOR_FRONT_DIFFUSE_R: u32 = 160;
+const COLOR_BACK_SPECULAR_A: u32 = 175;
+const FOG_COORDINATE: u32 = 186;
+const FIXED_FNC_TEXTURE0_S: u32 = 192;
+const FIXED_FNC_TEXTURE9_Q: u32 = 231;
+
+fn generic_x(index: usize) -> u64 {
+    (Attribute::generic(index as u32, 0).0) as u64
+}
+
+fn is_legacy_attribute(attribute: Attribute) -> bool {
+    let raw = attribute.0;
+    (COLOR_FRONT_DIFFUSE_R..=COLOR_BACK_SPECULAR_A).contains(&raw)
+        || raw == FOG_COORDINATE
+        || (FIXED_FNC_TEXTURE0_S..=FIXED_FNC_TEXTURE9_Q).contains(&raw)
+}
+
+fn generate_legacy_to_generic_mappings(
+    state: &VaryingState,
+    mut unused_generics: VecDeque<u64>,
+    previous_stage_mapping: &BTreeMap<u64, u64>,
+) -> BTreeMap<u64, u64> {
+    let mut mapping = BTreeMap::new();
+
+    for index in 0..4 {
+        let attr = COLOR_FRONT_DIFFUSE_R as usize + index * 4;
+        if state.any_component(attr) {
+            update_legacy_mapping(
+                &mut mapping,
+                &mut unused_generics,
+                previous_stage_mapping,
+                attr as u64,
+                4,
+            );
+        }
+    }
+
+    if state.get(FOG_COORDINATE as usize) {
+        update_legacy_mapping(
+            &mut mapping,
+            &mut unused_generics,
+            previous_stage_mapping,
+            FOG_COORDINATE as u64,
+            1,
+        );
+    }
+
+    for index in 0..NUM_FIXEDFNCTEXTURE {
+        let attr = FIXED_FNC_TEXTURE0_S as usize + index * 4;
+        if state.any_component(attr) {
+            update_legacy_mapping(
+                &mut mapping,
+                &mut unused_generics,
+                previous_stage_mapping,
+                attr as u64,
+                4,
+            );
+        }
+    }
+
+    mapping
+}
+
+fn update_legacy_mapping(
+    mapping: &mut BTreeMap<u64, u64>,
+    unused_generics: &mut VecDeque<u64>,
+    previous_stage_mapping: &BTreeMap<u64, u64>,
+    attr: u64,
+    count: u64,
+) {
+    if previous_stage_mapping.contains_key(&attr) {
+        for i in 0..count {
+            let key = attr + i;
+            mapping.insert(key, previous_stage_mapping[&key]);
+        }
+    } else {
+        let generic = unused_generics
+            .front()
+            .copied()
+            .expect("no free generic attribute for legacy varying conversion");
+        for i in 0..count {
+            mapping.insert(attr + i, generic + i);
+        }
+        unused_generics.pop_front();
+    }
+}
+
+#[cfg(test)]
+mod convert_legacy_tests {
+    use super::*;
+    use crate::ir::basic_block::Block;
+    use crate::ir::instruction::Inst;
+
+    #[test]
+    fn convert_legacy_to_generic_rewrites_store_and_records_mapping() {
+        let mut program = Program::new(ShaderStage::VertexB);
+        let mut block = Block::new();
+        block.append_inst(Inst::new(
+            Opcode::SetAttribute,
+            vec![
+                Value::Attribute(Attribute(COLOR_FRONT_DIFFUSE_R)),
+                Value::ImmF32(1.0),
+                Value::ImmU32(0),
+            ],
+        ));
+        program.blocks.push(block);
+        program.post_order_blocks.push(0);
+        program
+            .info
+            .stores
+            .set(COLOR_FRONT_DIFFUSE_R as usize, true);
+
+        convert_legacy_to_generic(&mut program, &RuntimeInfo::default());
+
+        let mapped = program.info.legacy_stores_mapping[&(COLOR_FRONT_DIFFUSE_R as u64)];
+        assert_eq!(mapped, Attribute::generic(0, 0).0 as u64);
+        assert!(program.info.stores.get(mapped as usize));
+        assert_eq!(
+            program.blocks[0].inst(0).args[0],
+            Value::Attribute(Attribute(mapped as u32))
+        );
+    }
+
+    #[test]
+    fn convert_legacy_to_generic_reuses_previous_stage_mapping_for_load() {
+        let mut runtime_info = RuntimeInfo::default();
+        runtime_info
+            .previous_stage_legacy_stores_mapping
+            .insert(FOG_COORDINATE as u64, Attribute::generic(7, 0).0 as u64);
+
+        let mut program = Program::new(ShaderStage::Fragment);
+        let mut block = Block::new();
+        block.append_inst(Inst::new(
+            Opcode::GetAttribute,
+            vec![
+                Value::Attribute(Attribute(FOG_COORDINATE)),
+                Value::ImmU32(0),
+            ],
+        ));
+        program.blocks.push(block);
+        program.post_order_blocks.push(0);
+        program.info.loads.set(FOG_COORDINATE as usize, true);
+
+        convert_legacy_to_generic(&mut program, &runtime_info);
+
+        assert!(program.info.loads.get(Attribute::generic(7, 0).0 as usize));
+        assert_eq!(
+            program.blocks[0].inst(0).args[0],
+            Value::Attribute(Attribute::generic(7, 0))
+        );
+    }
+}
+
 fn regenerate_block_order_from_syntax(program: &mut Program) {
     let mut order = 0;
     for node in &program.syntax_list {
@@ -208,9 +441,7 @@ mod tests {
     fn merge_dual_vertex_programs_remaps_vertex_b_block_references() {
         let mut vertex_a = Program::new(ShaderStage::VertexA);
         let mut va_block = Block::new();
-        va_block
-            .instructions
-            .push(Inst::new(Opcode::Epilogue, Vec::new()));
+        va_block.append_inst(Inst::new(Opcode::Epilogue, Vec::new()));
         vertex_a.blocks.push(va_block);
         vertex_a.syntax_list = vec![SyntaxNode::Block(0), SyntaxNode::Return];
         vertex_a.post_order_blocks = vec![0];
@@ -220,10 +451,8 @@ mod tests {
         let mut vertex_b = Program::new(ShaderStage::VertexB);
         let mut vb_block = Block::new();
         vb_block.add_successor(0);
-        vb_block
-            .instructions
-            .push(Inst::new(Opcode::Prologue, Vec::new()));
-        vb_block.instructions.push(Inst::new(
+        vb_block.append_inst(Inst::new(Opcode::Prologue, Vec::new()));
+        vb_block.append_inst(Inst::new(
             Opcode::Identity,
             vec![Value::Inst(InstRef { block: 0, inst: 0 })],
         ));

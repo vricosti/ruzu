@@ -11,7 +11,29 @@
 
 use crate::ir::opcodes::Opcode;
 use crate::ir::program::{CbufDescriptor, Program, StorageDescriptor, TexDescriptor};
+use crate::ir::types::Type;
 use crate::ir::value::Value;
+
+fn cbuf_type_bit(opcode: Opcode) -> u32 {
+    match opcode {
+        Opcode::GetCbufU8 | Opcode::GetCbufS8 => Type::U8 as u32,
+        Opcode::GetCbufU16 | Opcode::GetCbufS16 => Type::U16 as u32,
+        Opcode::GetCbufU32 => Type::U32 as u32,
+        Opcode::GetCbufF32 => Type::F32 as u32,
+        Opcode::GetCbufU32x2 => Type::U32x2 as u32,
+        _ => 0,
+    }
+}
+
+fn cbuf_element_size(opcode: Opcode) -> u32 {
+    match opcode {
+        Opcode::GetCbufU8 | Opcode::GetCbufS8 => 1,
+        Opcode::GetCbufU16 | Opcode::GetCbufS16 => 2,
+        Opcode::GetCbufU32 | Opcode::GetCbufF32 => 4,
+        Opcode::GetCbufU32x2 => 8,
+        _ => 0,
+    }
+}
 
 /// Collect shader resource usage information.
 pub fn collect_shader_info_pass(program: &mut Program) {
@@ -21,7 +43,7 @@ pub fn collect_shader_info_pass(program: &mut Program) {
     let mut tex_set = std::collections::BTreeSet::<u32>::new();
 
     for block in &program.blocks {
-        for inst in &block.instructions {
+        for inst in block.iter() {
             match inst.opcode {
                 // Constant buffer access
                 Opcode::GetCbufU32
@@ -29,9 +51,19 @@ pub fn collect_shader_info_pass(program: &mut Program) {
                 | Opcode::GetCbufU8
                 | Opcode::GetCbufS8
                 | Opcode::GetCbufU16
-                | Opcode::GetCbufS16 => {
+                | Opcode::GetCbufS16
+                | Opcode::GetCbufU32x2 => {
                     if let Some(&Value::ImmU32(idx)) = inst.args.first() {
                         cbuf_set.insert(idx);
+                        program.info.constant_buffer_mask |= 1u32 << idx;
+                        let element_size = cbuf_element_size(inst.opcode);
+                        let size = &mut program.info.constant_buffer_used_sizes[idx as usize];
+                        if let Some(Value::ImmU32(offset)) = inst.args.get(1) {
+                            *size = (*size).max(offset + element_size).div_ceil(16) * 16;
+                        } else {
+                            *size = 0x10000;
+                        }
+                        program.info.used_constant_buffer_types |= cbuf_type_bit(inst.opcode);
                     }
                 }
 
@@ -51,7 +83,17 @@ pub fn collect_shader_info_pass(program: &mut Program) {
 
                 // Fragment color output
                 Opcode::SetFragColor => {
-                    // Fragment shaders always store to render target 0+
+                    if let Some(Value::ImmU32(render_target)) = inst.args.first() {
+                        if (*render_target as usize) < program.info.stores_frag_color.len() {
+                            program.info.stores_frag_color[*render_target as usize] = true;
+                        }
+                    }
+                }
+                Opcode::SetSampleMask => {
+                    program.info.stores_sample_mask = true;
+                }
+                Opcode::SetFragDepth => {
+                    program.info.stores_frag_depth = true;
                 }
 
                 // Texture access

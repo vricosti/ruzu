@@ -31,7 +31,7 @@ pub fn conditional_barrier_pass(program: &mut Program) {
             SyntaxNode::Block(block_idx) => {
                 let block_idx = *block_idx as usize;
                 if block_idx < program.blocks.len() {
-                    for inst in &mut program.blocks[block_idx].instructions {
+                    for inst in program.blocks[block_idx].iter_mut() {
                         if (conditional_control_flow_count > 0 || conditional_return_count > 0)
                             && inst.opcode == Opcode::Barrier
                         {

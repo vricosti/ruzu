@@ -8,7 +8,7 @@
 //! Two phases:
 //! 1. For each instruction argument, resolve chains of Identity instructions
 //!    so that `Identity(Identity(x))` becomes just `x`.
-//! 2. Remove Identity and Void instructions from the block.
+//! 2. Erase Identity slots after all users have been rewritten.
 
 use crate::ir::opcodes::Opcode;
 use crate::ir::program::Program;
@@ -22,9 +22,9 @@ pub fn identity_removal_pass(program: &mut Program) {
         std::collections::HashMap::new();
 
     for (block_idx, block) in program.blocks.iter().enumerate() {
-        for (inst_idx, inst) in block.instructions.iter().enumerate() {
+        for (inst_idx, inst) in block.indexed_iter() {
             if inst.opcode == Opcode::Identity && !inst.args.is_empty() {
-                identity_targets.insert((block_idx as u32, inst_idx as u32), inst.args[0]);
+                identity_targets.insert((block_idx as u32, inst_idx), inst.args[0]);
             }
         }
     }
@@ -51,7 +51,7 @@ pub fn identity_removal_pass(program: &mut Program) {
     // user via the use-def chain; ruzu does it indirectly by scanning all
     // `args` and `phi_args` here.
     for block in &mut program.blocks {
-        for inst in &mut block.instructions {
+        for inst in block.iter_mut() {
             for arg in &mut inst.args {
                 if let Value::Inst(r) = arg {
                     if let Some(&resolved) = identity_targets.get(&(r.block, r.inst)) {
@@ -69,10 +69,15 @@ pub fn identity_removal_pass(program: &mut Program) {
         }
     }
 
-    // Phase 3: Remove Identity and Void instructions.
-    for block in &mut program.blocks {
-        block
-            .instructions
-            .retain(|inst| inst.opcode != Opcode::Identity && inst.opcode != Opcode::Void);
+    // Phase 3: erase list nodes whose users have already been rewritten.
+    // `Block` keeps stable slots, so this matches upstream physical erase
+    // semantics without shifting later `InstRef` identities.
+    let erased: Vec<(u32, u32)> = identity_targets.keys().copied().collect();
+    for (block_idx, inst_idx) in erased {
+        if let Some(block) = program.blocks.get_mut(block_idx as usize) {
+            if (inst_idx as usize) < block.instructions.len() {
+                block.erase_inst(inst_idx);
+            }
+        }
     }
 }

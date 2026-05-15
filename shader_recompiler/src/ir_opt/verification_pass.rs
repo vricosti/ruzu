@@ -31,7 +31,7 @@ pub fn verification_pass(program: &Program) {
 /// Upstream: `ValidateTypes` (verification_pass.cpp:14-31).
 fn validate_types(program: &Program) {
     for block in &program.blocks {
-        for inst in &block.instructions {
+        for inst in block.iter() {
             if inst.opcode == crate::ir::opcodes::Opcode::Phi {
                 continue;
             }
@@ -59,7 +59,7 @@ fn validate_uses(program: &Program) {
     let mut actual_uses: HashMap<(usize, usize), i32> = HashMap::new();
 
     for (block_idx, block) in program.blocks.iter().enumerate() {
-        for (inst_idx, inst) in block.instructions.iter().enumerate() {
+        for (inst_idx, inst) in block.indexed_iter() {
             let _ = (block_idx, inst_idx);
             for arg in &inst.args {
                 if let crate::ir::value::Value::Inst(ref inst_ref) = arg {
@@ -75,7 +75,9 @@ fn validate_uses(program: &Program) {
         if block_idx < program.blocks.len()
             && inst_idx < program.blocks[block_idx].instructions.len()
         {
-            let inst = &program.blocks[block_idx].instructions[inst_idx];
+            let Some(inst) = program.blocks[block_idx].instructions[inst_idx].as_ref() else {
+                continue;
+            };
             if inst.use_count as i32 != uses {
                 log::error!(
                     "Use count mismatch at block {} inst {}: expected {}, got {}",
@@ -94,7 +96,8 @@ fn validate_forward_declarations(program: &Program) {
     let mut definitions: HashSet<(usize, usize)> = HashSet::new();
 
     for (block_idx, block) in program.blocks.iter().enumerate() {
-        for (inst_idx, inst) in block.instructions.iter().enumerate() {
+        for (inst_idx, inst) in block.indexed_iter() {
+            let inst_idx = inst_idx as usize;
             definitions.insert((block_idx, inst_idx));
             if inst.opcode == crate::ir::opcodes::Opcode::Phi {
                 continue;
@@ -120,7 +123,7 @@ fn validate_forward_declarations(program: &Program) {
 fn validate_phi_nodes(program: &Program) {
     for block in &program.blocks {
         let mut no_more_phis = false;
-        for inst in &block.instructions {
+        for inst in block.iter() {
             if inst.opcode == crate::ir::opcodes::Opcode::Phi {
                 if no_more_phis {
                     log::error!("Interleaved phi nodes detected");
