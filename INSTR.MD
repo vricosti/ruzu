@@ -29,25 +29,27 @@ closely enough
   swizzle (the Tegra texture format is non-trivial). Multi-day at minimum, and verifying correctness requires actually rendering
   frames — without a working GPU pipeline end-to-end, bugs are silent and hard to attribute.
   ----
-  ● Definitive end-of-session conclusion:
+  Oui, Vec<Option<Inst>> est acceptable comme étape intermédiaire, mais ce n’est pas équivalent à une vraie liste intrusive côté
+  performance ni côté parité.
 
-  The MK8D wedge bottom-line, derived from this session's deep dive:
-  
-  1. SMMU port (commit bdced9b) ✅ — architectural fix, GPU now sees correct device-physical addresses matching zuyu (dev=0x41000).
-  2. Diagnostic env vars (commit 0eaf05f) ✅ — RUZU_TRACE_HEAP_TRACKER_MAP, RUZU_TRACE_MACRO_HASH for future cross-emulator
-  comparison work.
-  3. Root cause identified — same cv 0x7F2C0BCC lost-wakeup:
-    - tid=73's wedge state: WaitProcessWideKeyAtomic args=[0x7F2C0BC8, 0x7F2C0BCC, 0x81FF, 0xFFFFFFFF]
-    - This is the IDENTICAL cv key from project_mk8d_pthread_cond_lost_wakeup_2026_05_13.md
-    - The user's kernel fixes moved MK8D past the FIRST wedge instance (into GPU pipeline init). This is the SECOND iteration of
-  the same worker-pool wedge.
-    - Per prior diagnosis: kernel KScheduler::reschedule_other_cores IPI fires during KScopedSchedulerLockAndSleep drop; on some
-  races the other core's dispatch loop misses the wake.
-  
-  The path forward: continue the multi-day kernel-scheduler investigation from project_mk8d_pthread_cond_lost_wakeup_2026_05_13.md.
-   The SMMU work removed an architectural blocker but the upstream timing race is unchanged.
+  Comparaison rapide :
 
-  Branch state:
-  - 2 new commits ahead of ee9abbf
-  - ~85 files in working tree still uncommitted (kernel, audio, shader_recompiler — from prior sessions)
-  - zuyu source has 6 diagnostic patches (env-gated, harmless)
+  - Vec<Option<Inst>>
+      - Avantages : indices stables, simple à porter, bonne localité mémoire, peu risqué.
+      - Coût : les itérations doivent skipper les trous, les blocs très modifiés peuvent accumuler des tombstones, erase ne libère
+        pas physiquement, certaines passes doivent rester disciplinées.
+      - Performance probable : correcte pour maintenant, surtout si les shaders ont peu d’effacements par bloc.
+  - Liste intrusive upstream-style
+      - Avantages : erase physique O(1), identités stables, itération uniquement sur les instructions vivantes, meilleure parité
+        avec Dynarmic/zuyu.
+      - Coût : plus complexe en Rust, besoin d’arena avec handles stables + liens prev/next, plus de risques de bugs d’emprunt/
+        aliasing si mal conçu.
+      - Performance probable : meilleure dans les passes qui effacent beaucoup, mais moins cache-friendly qu’un Vec dense.
+
+  Donc mon avis : Vec<Option<Inst>> est OK comme première version robuste pour éliminer les bugs d’indices qui shiftent. Mais si
+  l’objectif est vraiment “upstream-faithful long-term”, la cible correcte est une arena stable avec liste intrusive logique :
+  handles stables, prev/next, erase physique du chaînage, stockage arena séparé.
+
+  Je ne vendrais pas Vec<Option<Inst>> comme version définitive. Je l’utiliserais pour stabiliser vite, ajouter les tests, puis
+  migrer vers une InstArena intrusive propre si les passes IR continuent à diverger d’upstream ou si les tombstones deviennent
+  visibles dans les profils.
