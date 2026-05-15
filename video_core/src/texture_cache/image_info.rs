@@ -112,15 +112,119 @@ impl ImageInfo {
 
     /// Construct from a TIC entry.
     ///
-    /// Port of `ImageInfo::ImageInfo(const TICEntry& config)`.
+    /// Port of upstream `ImageInfo::ImageInfo(const TICEntry& config)`
+    /// (image_info.cpp:28-125). Decodes format, tiling, MSAA, type and
+    /// per-dimension sizes off `TicEntry`'s bitfield accessors.
     ///
-    /// Full implementation requires TICEntry, PixelFormatFromTextureInfo,
-    /// NumSamples*, CalculateLayerStride/Size helpers — these types are not yet
-    /// ported from Tegra::Texture.  Returns a default `ImageInfo` and logs a
-    /// warning until the upstream types are available.
-    pub fn from_tic_entry(_config: &()) -> Self {
-        log::warn!("ImageInfo::from_tic_entry: TICEntry not yet ported — returning default");
-        Self::default()
+    /// `CalculateLayerStride` / `CalculateLayerSize` (`layer_stride` and
+    /// `maybe_unaligned_layer_stride` upstream) plus the rescale/downscale
+    /// thresholds still require the surface-helper port and are left as
+    /// zero / `false` until those land. `forced_flushed` / `dma_downloaded`
+    /// need `Settings::values.use_reactive_flushing` from common::settings
+    /// which is not wired here yet, so default to the pre-flushing branch.
+    pub fn from_tic_entry(config: &crate::textures::texture::TicEntry) -> Self {
+        // `format_lookup_table::{ComponentType,TextureFormat}` are the placeholder
+        // enums the lookup table is keyed on. They're a strict subset of the
+        // full `textures::texture::{ComponentType,TextureFormat}`, so we decode
+        // straight from the raw TIC bit fields.
+        use super::format_lookup_table::{ComponentType, TextureFormat};
+        use crate::textures::texture::TextureType;
+
+        let mut info = Self::default();
+
+        // PixelFormat decode — malformed TIC bits can return None on
+        // `from_raw`. Fall back to a sentinel + Snorm so the lookup table
+        // folds the entry to `PixelFormat::Invalid` (hash miss). The outer
+        // `create_image_view` then knows to skip this view.
+        let format =
+            TextureFormat::from_raw(config.format()).unwrap_or(TextureFormat::R32G32B32A32);
+        let r_type = ComponentType::from_raw(config.r_type()).unwrap_or(ComponentType::Snorm);
+        let g_type = ComponentType::from_raw(config.g_type()).unwrap_or(ComponentType::Snorm);
+        let b_type = ComponentType::from_raw(config.b_type()).unwrap_or(ComponentType::Snorm);
+        let a_type = ComponentType::from_raw(config.a_type()).unwrap_or(ComponentType::Snorm);
+        let is_srgb = config.srgb_conversion() != 0;
+        info.format = super::format_lookup_table::pixel_format_from_texture_info(
+            format, r_type, g_type, b_type, a_type, is_srgb,
+        );
+
+        // MSAA still requires a NumSamples-from-mode helper; for now treat
+        // every texture as single-sampled.
+        info.num_samples = 1;
+        info.resources.levels = (config.max_mip_level() + 1) as i32;
+
+        // Tiling: pitch- or block-linear branch.
+        if config.is_pitch_linear() {
+            info.tiling = TilingMode::PitchLinear(config.pitch());
+        } else if config.is_block_linear() {
+            info.tiling = TilingMode::BlockLinear(Extent3D {
+                width: config.block_width(),
+                height: config.block_height(),
+                depth: config.block_depth(),
+            });
+        }
+
+        info.is_sparse = config.is_sparse() != 0;
+        info.tile_width_spacing = 0; // bit accessor not yet exposed on TicEntry
+
+        // TextureType → ImageType + size.
+        let texture_type =
+            TextureType::from_raw(config.texture_type()).unwrap_or(TextureType::Texture2D);
+        match texture_type {
+            TextureType::Texture1D => {
+                info.image_type = ImageType::E1D;
+                info.size.width = config.width();
+                info.resources.layers = 1;
+            }
+            TextureType::Texture1DArray => {
+                info.image_type = ImageType::E1D;
+                info.size.width = config.width();
+                info.resources.layers = config.depth() as i32;
+            }
+            TextureType::Texture2D | TextureType::Texture2DNoMipmap => {
+                info.image_type = if config.is_pitch_linear() {
+                    ImageType::Linear
+                } else {
+                    ImageType::E2D
+                };
+                info.size.width = config.width();
+                info.size.height = config.height();
+                info.resources.layers = config.base_layer() as i32 + 1;
+                info.rescaleable = !config.is_pitch_linear();
+            }
+            TextureType::Texture2DArray => {
+                info.image_type = ImageType::E2D;
+                info.size.width = config.width();
+                info.size.height = config.height();
+                info.resources.layers = (config.base_layer() + config.depth()) as i32;
+                info.rescaleable = true;
+            }
+            TextureType::TextureCubemap => {
+                info.image_type = ImageType::E2D;
+                info.size.width = config.width();
+                info.size.height = config.height();
+                info.resources.layers = config.base_layer() as i32 + 6;
+            }
+            TextureType::TextureCubeArray => {
+                info.image_type = ImageType::E2D;
+                info.size.width = config.width();
+                info.size.height = config.height();
+                info.resources.layers = (config.base_layer() + config.depth() * 6) as i32;
+            }
+            TextureType::Texture3D => {
+                info.image_type = ImageType::E3D;
+                info.size.width = config.width();
+                info.size.height = config.height();
+                info.size.depth = config.depth();
+                info.resources.layers = 1;
+            }
+            TextureType::Texture1DBuffer => {
+                info.image_type = ImageType::Buffer;
+                info.size.width = config.width();
+                info.resources.layers = 1;
+            }
+        }
+
+        info
     }
 
     /// Construct from a render target config.
