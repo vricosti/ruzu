@@ -871,18 +871,16 @@ impl KScheduler {
             // Upstream: if the top thread's process has a pinned thread for this
             // core, prefer it unless the normal top thread has kernel waiters.
             if let Some(top_id) = top_thread_id {
-                let pinned_id = gsc
-                    .get_thread_by_thread_id(top_id)
-                    .and_then(|top_thread| {
-                        let top_guard = top_thread.lock().unwrap();
-                        if top_guard.get_num_kernel_waiters() != 0 {
-                            return None;
-                        }
-                        let parent = top_guard.parent.as_ref().and_then(|w| w.upgrade())?;
-                        drop(top_guard);
+                let pinned_id = gsc.get_thread_by_thread_id(top_id).and_then(|top_thread| {
+                    let top_guard = top_thread.lock().unwrap();
+                    if top_guard.get_num_kernel_waiters() != 0 {
+                        return None;
+                    }
+                    let parent = top_guard.parent.as_ref().and_then(|w| w.upgrade())?;
+                    drop(top_guard);
 
-                        parent.lock().unwrap().get_pinned_thread(core_id as i32)
-                    });
+                    parent.lock().unwrap().get_pinned_thread(core_id as i32)
+                });
 
                 if let Some(pinned_id) = pinned_id {
                     if pinned_id != top_id {
@@ -1144,6 +1142,25 @@ impl KScheduler {
         };
 
         let mut process = process.lock().unwrap();
+        {
+            let current_thread = current_thread.lock().unwrap();
+            if current_thread.get_yield_schedule_count() == process.get_scheduled_count() {
+                return;
+            }
+        }
+
+        // Upstream wraps the runnable-state check, priority-queue rotation,
+        // scheduled-count update, and yield-count update in KScopedSchedulerLock.
+        //
+        // Rust must keep the existing host-lock order (`ProcessLock` before
+        // scheduler lock) because several wait/sleep paths already take that
+        // order. Upstream has no equivalent host process mutex, so this is a
+        // Rust-only deadlock-avoidance adaptation while still protecting the
+        // priority-queue mutation with KScopedSchedulerLock.
+        let scheduler_lock = super::kernel::scheduler_lock()
+            .expect("global scheduler lock must be initialized before yielding");
+        let _scheduler_guard = super::k_scheduler_lock::KScopedSchedulerLock::new(scheduler_lock);
+
         {
             let current_thread = current_thread.lock().unwrap();
             if current_thread.get_state() != ThreadState::RUNNABLE {

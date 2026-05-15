@@ -566,13 +566,22 @@ pub fn sleep_thread(system: &System, ns: i64) {
     );
     let current_process = system.current_process_arc();
     let sched_arc = system.scheduler_arc();
-    let mut scheduler = sched_arc.lock().unwrap();
-    if ns == YieldType::WithoutCoreMigration as i64 {
-        scheduler.yield_without_core_migration(current_process, current_thread_id);
-    } else if ns == YieldType::WithCoreMigration as i64 {
-        scheduler.yield_with_core_migration(current_process, current_thread_id);
-    } else if ns == YieldType::ToAnyThread as i64 {
-        scheduler.yield_to_any_thread(current_process, current_thread_id);
+    let scheduler_ptr = {
+        let mut scheduler = sched_arc.lock().unwrap();
+        &mut *scheduler as *mut crate::hle::kernel::k_scheduler::KScheduler
+    };
+    // Upstream calls the static KScheduler yield helpers directly; no host-side
+    // scheduler mutex is held while KScopedSchedulerLock unlock callbacks run.
+    // Keep the Rust Arc<Mutex<KScheduler>> out of the yield body, otherwise the
+    // scheduler-lock release path deadlocks when it re-enters scheduler update.
+    unsafe {
+        if ns == YieldType::WithoutCoreMigration as i64 {
+            (*scheduler_ptr).yield_without_core_migration(current_process, current_thread_id);
+        } else if ns == YieldType::WithCoreMigration as i64 {
+            (*scheduler_ptr).yield_with_core_migration(current_process, current_thread_id);
+        } else if ns == YieldType::ToAnyThread as i64 {
+            (*scheduler_ptr).yield_to_any_thread(current_process, current_thread_id);
+        }
     }
 }
 

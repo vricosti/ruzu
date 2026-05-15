@@ -393,8 +393,7 @@ impl HeapTracker {
         if let Ok(spec) = std::env::var("RUZU_TRACE_HEAP_TRACKER_MAP") {
             let log = if spec.trim() == "1" || spec.trim().is_empty() {
                 true
-            } else if let Ok(target) =
-                u64::from_str_radix(spec.trim().trim_start_matches("0x"), 16)
+            } else if let Ok(target) = u64::from_str_radix(spec.trim().trim_start_matches("0x"), 16)
             {
                 let v = virtual_offset as u64;
                 v <= target && target < v + length as u64

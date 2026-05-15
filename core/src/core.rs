@@ -843,6 +843,9 @@ impl System {
         } else {
             self.is_multicore = *common::settings::values().use_multi_core.get_value();
         }
+        self.is_async_gpu = *common::settings::values()
+            .use_asynchronous_gpu_emulation
+            .get_value();
 
         self.core_timing.set_multicore(self.is_multicore);
         // In C++: core_timing.Initialize([&system]() { system.RegisterHostThread(); });

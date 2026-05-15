@@ -146,9 +146,7 @@ fn trace_write_targets() -> &'static [u64] {
                 raw.split(',')
                     .map(|s| s.trim())
                     .filter(|s| !s.is_empty())
-                    .filter_map(|tok| {
-                        u64::from_str_radix(tok.trim_start_matches("0x"), 16).ok()
-                    })
+                    .filter_map(|tok| u64::from_str_radix(tok.trim_start_matches("0x"), 16).ok())
                     .collect()
             })
             .unwrap_or_default()
@@ -156,12 +154,7 @@ fn trace_write_targets() -> &'static [u64] {
 }
 
 #[inline(always)]
-fn maybe_trace_w_at_vaddr(
-    cb: &DynarmicCallbacks32,
-    vaddr: u64,
-    size: u64,
-    value: u128,
-) {
+fn maybe_trace_w_at_vaddr(cb: &DynarmicCallbacks32, vaddr: u64, size: u64, value: u128) {
     let targets = trace_write_targets();
     if targets.is_empty() {
         return;
@@ -1350,7 +1343,12 @@ impl UserCallbacks for DynarmicCallbacks32 {
         expected_lo: u64,
         expected_hi: u64,
     ) -> bool {
-        maybe_trace_w_at_vaddr(self, vaddr, 16, ((value_hi as u128) << 64) | (value_lo as u128));
+        maybe_trace_w_at_vaddr(
+            self,
+            vaddr,
+            16,
+            ((value_hi as u128) << 64) | (value_lo as u128),
+        );
         self.check_memory_access(vaddr, 16)
             && self
                 .mem()

@@ -577,7 +577,9 @@ impl PhysicalCore {
         // elapsed_secs() prefix for inline correlation.
         if std::env::var_os("RUZU_TRACE_IPI").is_some() {
             let t = crate::hle::kernel::trace_format::elapsed_secs();
-            let running_tid = current_thread.map(|p| unsafe { (*p).get_thread_id() }).unwrap_or(0);
+            let running_tid = current_thread
+                .map(|p| unsafe { (*p).get_thread_id() })
+                .unwrap_or(0);
             eprintln!(
                 "[{:>10.6}] [IPI] target_core={} running_tid={} running_jit={}",
                 t,
