@@ -1131,15 +1131,135 @@ impl RasterizerInterface for RasterizerOpenGL {
             .base
             .synchronize_graphics_descriptors(draw_state.descriptor_sync_regs);
         pipeline.configure(is_indexed);
-        // Upstream calls `FillGraphicsImageViews<has_images>(views)` after the
-        // per-stage descriptor-collection loop (gl_graphics_pipeline.cpp:380).
-        // The per-stage loop needs `Shader::Info::texture_descriptors`
-        // plumbed into the pipeline and per-cbuf TIC-handle reads through
-        // the GPU memory manager — both unported. Once available, the
-        // collected `ImageViewInOut` slice gets handed here:
-        //     self.texture_cache.base.fill_graphics_image_views(&mut views, has_images);
-        // For now the call site stays a TODO at this exact point so the
-        // upstream sequencing is preserved when the producers land.
+
+        // Per-stage texture / image descriptor collection — port of the
+        // `config_stage` lambda body in upstream `ConfigureImpl`
+        // (gl_graphics_pipeline.cpp:293-376). For each stage's shader info,
+        // walk `texture_buffer_descriptors`, `image_buffer_descriptors`,
+        // `texture_descriptors`, `image_descriptors`; for each descriptor
+        // read `count` 32-bit TIC handles from its cbuf binding via the
+        // GPU memory reader; push one `ImageViewInOut` per handle.
+        //
+        // The cbuf address comes from `draw_state.cb_bindings[stage][cbuf_index]
+        // .address + offset` (Maxwell3D const-buffer state). Handle decode
+        // splits the raw u32 into (tic_id, tsc_id) using `texture_pair` —
+        // when `sampler_binding == ViaHeaderBinding` the two ids collapse.
+        //
+        // Gated behind `RUZU_TEXTURE_CACHE_FILL=1` while the upstream-faithful
+        // descriptor collection is being verified. Default-off because the
+        // path still has rough edges (cbuf_index validation, MAX_CB_SLOTS
+        // bounds, descriptor count sanity); turning it on for MK8D currently
+        // SIGSEGVs late in startup. Once the bounds are tightened this gate
+        // gets removed.
+        if std::env::var_os("RUZU_TEXTURE_CACHE_FILL").is_some() {
+        let via_header_index = draw_state.descriptor_sync_regs.sampler_binding_via_header;
+        let mut views: Vec<crate::texture_cache::texture_cache_base::ImageViewInOut> =
+            Vec::with_capacity(64);
+        let mut has_images = false;
+        let gpu_memory_arc = self.texture_cache.base.device_memory.clone();
+        let gpu_memory = &*gpu_memory_arc;
+        let read_handle =
+            |gpu_memory: &dyn crate::texture_cache::descriptor_table::GpuMemoryReader,
+             stage: usize,
+             cbuf_index: u32,
+             offset: u32|
+             -> Option<u32> {
+                let binding =
+                    &draw_state.cb_bindings[stage][cbuf_index as usize];
+                if !binding.enabled {
+                    return None;
+                }
+                let addr = binding.address + offset as u64;
+                let mut buf = [0u8; 4];
+                if !gpu_memory.read_block(addr, &mut buf) {
+                    return None;
+                }
+                Some(u32::from_le_bytes(buf))
+            };
+        for stage in 0..crate::renderer_opengl::gl_graphics_pipeline::NUM_STAGES {
+            let Some(info) = pipeline.stage_infos[stage].as_ref() else {
+                continue;
+            };
+            // Texture buffer descriptors — handle only (no sampler).
+            for desc in &info.texture_buffer_descriptors {
+                for idx in 0..desc.count {
+                    let index_offset = idx << desc.size_shift;
+                    let offset = desc.cbuf_offset + index_offset;
+                    if let Some(raw) = read_handle(gpu_memory, stage, desc.cbuf_index, offset) {
+                        let (tic_id, _) =
+                            crate::textures::texture::texture_pair(raw, via_header_index);
+                        views.push(crate::texture_cache::texture_cache_base::ImageViewInOut {
+                            index: tic_id,
+                            blacklist: false,
+                            id: Default::default(),
+                        });
+                    }
+                }
+            }
+            // Image buffer descriptors — blacklist=false, no sampler. Upstream
+            // calls these out separately under `Spec::has_image_buffers`.
+            for desc in &info.image_buffer_descriptors {
+                for idx in 0..desc.count {
+                    let index_offset = idx << desc.size_shift;
+                    let offset = desc.cbuf_offset + index_offset;
+                    if let Some(raw) = read_handle(gpu_memory, stage, desc.cbuf_index, offset) {
+                        let (tic_id, _) =
+                            crate::textures::texture::texture_pair(raw, via_header_index);
+                        views.push(crate::texture_cache::texture_cache_base::ImageViewInOut {
+                            index: tic_id,
+                            blacklist: false,
+                            id: Default::default(),
+                        });
+                    }
+                }
+            }
+            // Sampled texture descriptors. Each handle yields one image-view
+            // and one sampler-id; ruzu collects the sampler IDs lazily below
+            // (GetGraphicsSamplerId would be the upstream call — TODO once
+            // the sampler slot pool is concrete).
+            for desc in &info.texture_descriptors {
+                for idx in 0..desc.count {
+                    let index_offset = idx << desc.size_shift;
+                    let offset = desc.cbuf_offset + index_offset;
+                    if let Some(raw) = read_handle(gpu_memory, stage, desc.cbuf_index, offset) {
+                        let (tic_id, _tsc_id) =
+                            crate::textures::texture::texture_pair(raw, via_header_index);
+                        views.push(crate::texture_cache::texture_cache_base::ImageViewInOut {
+                            index: tic_id,
+                            blacklist: false,
+                            id: Default::default(),
+                        });
+                    }
+                }
+            }
+            // Image (storage image) descriptors. Upstream tags
+            // blacklist = desc.is_written so written-to render targets
+            // can be detected and scaled down.
+            for desc in &info.image_descriptors {
+                has_images = true;
+                for idx in 0..desc.count {
+                    let index_offset = idx << desc.size_shift;
+                    let offset = desc.cbuf_offset + index_offset;
+                    if let Some(raw) = read_handle(gpu_memory, stage, desc.cbuf_index, offset) {
+                        let (tic_id, _) =
+                            crate::textures::texture::texture_pair(raw, via_header_index);
+                        views.push(crate::texture_cache::texture_cache_base::ImageViewInOut {
+                            index: tic_id,
+                            blacklist: desc.is_written,
+                            id: Default::default(),
+                        });
+                    }
+                }
+            }
+        }
+        // Mirror upstream `FillGraphicsImageViews<has_images>(views)` from
+        // gl_graphics_pipeline.cpp:380. `has_blacklists = has_images` per
+        // upstream's `Spec::has_images` template parameter.
+        self.texture_cache
+            .base
+            .fill_graphics_image_views(&mut views, has_images);
+        drop(gpu_memory_arc);
+        } // RUZU_TEXTURE_CACHE_FILL gate
         self.buffer_cache
             .set_graphics_base_uniform_bindings(&pipeline.base_uniform_bindings);
         if trace_draw {

@@ -205,6 +205,14 @@ pub struct GraphicsPipeline {
     /// (gap 5). Mirrors upstream `OpenGL::ProgramManager::BindGraphicsPipeline`'s
     /// per-pipeline `OGLPipeline` object.
     program_pipeline: u32,
+
+    /// Per-stage shader translation result. Mirrors upstream
+    /// `std::array<Shader::Info, NUM_STAGES> stage_infos`. Populated by
+    /// `apply_shader_infos` so the rasterizer-side ConfigureImpl
+    /// equivalent can iterate `texture_descriptors` /
+    /// `texture_buffer_descriptors` / `image_descriptors` per stage to
+    /// build `ImageViewInOut[]` for `fill_graphics_image_views`.
+    pub stage_infos: [Option<ShaderInfo>; NUM_STAGES],
 }
 
 // SAFETY: The GL sync handle is only accessed while the built_mutex is held.
@@ -252,6 +260,7 @@ impl GraphicsPipeline {
             built_fence: std::ptr::null(),
             is_built: true,
             program_pipeline: 0,
+            stage_infos: Default::default(),
         }
     }
 
@@ -271,6 +280,11 @@ impl GraphicsPipeline {
         self.base_storage_bindings = [0; NUM_STAGES];
         self.num_texture_buffers = [0; NUM_STAGES];
         self.num_image_buffers = [0; NUM_STAGES];
+
+        // Keep a per-stage `Info` clone so the rasterizer-side ConfigureImpl
+        // can iterate `texture_descriptors[]` etc. at draw time. Upstream
+        // stores these inside `GraphicsPipeline` as `stage_infos`.
+        self.stage_infos = std::array::from_fn(|stage| infos[stage].clone());
 
         for stage in 0..NUM_STAGES {
             if let Some(info) = infos[stage].as_ref() {
