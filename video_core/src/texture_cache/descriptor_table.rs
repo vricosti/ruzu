@@ -8,17 +8,34 @@
 
 use super::image_base::GPUVAddr;
 
+/// Read N bytes from a GPU device address into `output`.
+///
+/// Port of upstream `Tegra::MemoryManager::ReadBlockUnsafe`: the descriptor
+/// table calls this with the table base + `index * sizeof(Descriptor)` so
+/// `Read(index)` lands on a real TICEntry / TSCEntry from GPU memory.
+/// Returns `true` if every byte was successfully read (all underlying
+/// pages mapped). Returning `false` is treated as a transient read failure
+/// — `Read` then falls back to the cached descriptor + reports `changed=false`.
+pub trait GpuMemoryReader {
+    fn read_block(&self, d_address: u64, output: &mut [u8]) -> bool;
+}
+
 // ── DescriptorTable<T> ────────────────────────────────────────────────
 
 /// A lazily-synchronised descriptor array backed by GPU memory.
 ///
 /// Port of `VideoCommon::DescriptorTable<Descriptor>`.
 ///
-/// The upstream implementation reads descriptors directly from
-/// `Tegra::MemoryManager`.  Here we store a type-erased reference to the
-/// GPU memory manager and perform the same caching logic.
+/// The upstream implementation stores a `Tegra::MemoryManager&` reference;
+/// ruzu instead threads a `&dyn GpuMemoryReader` through `Read` so the
+/// table doesn't need a back-reference to the memory manager. The caller
+/// (texture-cache visit_image_view) already has access to the channel's
+/// `MaxwellDeviceMemoryManager` via the cache's `device_memory` Arc.
 ///
-/// `T` must be `Copy + PartialEq + Default`.
+/// `T` must be `Copy + PartialEq + Default`. Reads are done via a byte
+/// buffer + `ptr::read_unaligned`, so `T` should be a plain
+/// `#[repr(C)]` POD type (TICEntry / TSCEntry both qualify — fixed-size
+/// `[u64; 4]` wrappers).
 pub struct DescriptorTable<T: Copy + PartialEq + Default> {
     current_gpu_addr: GPUVAddr,
     current_limit: u32,
@@ -64,17 +81,36 @@ impl<T: Copy + PartialEq + Default> DescriptorTable<T> {
     /// Returns `(descriptor, changed)`.  `changed` is `true` if this is the
     /// first read or the value differs from the cached copy.
     ///
-    /// Port of `DescriptorTable::Read`.
+    /// Port of upstream `DescriptorTable::Read`: reads `sizeof(Descriptor)`
+    /// bytes from `current_gpu_addr + index * sizeof(Descriptor)` via the
+    /// supplied `gpu_memory` reader. The caller (texture-cache
+    /// `visit_image_view`) wires this up to the channel's
+    /// `MaxwellDeviceMemoryManager::smmu_read_block`.
     ///
-    /// NOTE: The actual GPU memory read is stubbed out — the full
-    /// implementation requires a reference to `Tegra::MemoryManager` which
-    /// is not yet ported.
-    pub fn read(&mut self, index: u32) -> (T, bool) {
+    /// If the GPU read fails (page not mapped at the table location)
+    /// falls back to the previously-cached descriptor with `changed=false`,
+    /// so a transient unmapped page does not poison the cache with a
+    /// `Default::default()` value.
+    pub fn read(&mut self, gpu_memory: &dyn GpuMemoryReader, index: u32) -> (T, bool) {
         debug_assert!(index <= self.current_limit);
-        // Upstream: gpu_memory->ReadBlockUnsafe(current_gpu_addr + index * sizeof(Descriptor), &descriptor, sizeof(Descriptor))
-        // Requires a reference to Tegra::MemoryManager (GPU memory manager) which is
-        // not yet wired to the texture cache. Returns default until integration.
-        let descriptor = T::default(); // placeholder — needs GPU memory read
+        let item_size = std::mem::size_of::<T>();
+        let descriptor_addr = self.current_gpu_addr + (index as u64) * (item_size as u64);
+
+        let mut buf = vec![0u8; item_size];
+        let descriptor = if gpu_memory.read_block(descriptor_addr, &mut buf) {
+            // SAFETY: `T` is bounded by `Copy + PartialEq + Default`. The
+            // descriptor table is only instantiated with `TicEntry` /
+            // `TscEntry`, both `#[repr(C)]` `[u64; 4]` wrappers with no
+            // invalid bit patterns. `read_block` writes exactly
+            // `item_size` bytes into `buf` when it returns `true`.
+            unsafe { std::ptr::read_unaligned(buf.as_ptr() as *const T) }
+        } else {
+            // Read failure (unmapped page at the descriptor location).
+            // Upstream would have UB'd through ReadBlockUnsafe; ruzu
+            // treats it as "descriptor unchanged" so the cached image
+            // view id is reused.
+            self.descriptors[index as usize]
+        };
 
         let changed = if self.is_descriptor_read(index) {
             descriptor != self.descriptors[index as usize]

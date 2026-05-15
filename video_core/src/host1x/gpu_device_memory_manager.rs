@@ -81,6 +81,16 @@ pub const SMMU_BASE: u64 = 0x40000;
 pub const SMMU_PAGE_BITS: u32 = 12;
 pub const SMMU_PAGE_SIZE: u64 = 1 << SMMU_PAGE_BITS;
 
+/// Implement the texture-cache `GpuMemoryReader` adapter so descriptor
+/// tables can read TIC/TSC entries directly via `smmu_read_block`. The
+/// texture cache holds an `Arc<MaxwellDeviceMemoryManager>`, so passing
+/// `&*device_memory` already yields a `&dyn GpuMemoryReader`.
+impl crate::texture_cache::descriptor_table::GpuMemoryReader for MaxwellDeviceMemoryManager {
+    fn read_block(&self, d_address: u64, output: &mut [u8]) -> bool {
+        self.smmu_read_block(d_address, output)
+    }
+}
+
 impl Default for MaxwellDeviceMemoryManager {
     fn default() -> Self {
         Self {
