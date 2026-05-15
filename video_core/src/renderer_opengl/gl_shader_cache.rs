@@ -10,10 +10,11 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use shader_recompiler::profile::Profile as ShaderProfile;
-use shader_recompiler::runtime_info::RuntimeInfo;
+use shader_recompiler::runtime_info::{InputTopology, RuntimeInfo, TessPrimitive, TessSpacing};
+use shader_recompiler::shader_info::Info as ShaderInfo;
 use shader_recompiler::{
-    compile_dual_vertex_shader_glsl_at_offset, compile_shader_glsl_at_offset, CompiledGlslShader,
-    ShaderStage,
+    compile_dual_vertex_shader_glsl_at_offset_with_bindings,
+    compile_shader_glsl_at_offset_with_bindings, CompiledGlslShader, ShaderStage,
 };
 
 use crate::shader_cache::{GraphicsEnvironments, ShaderCache as SharedShaderCache};
@@ -372,6 +373,8 @@ impl ShaderCache {
             (4, ShaderStage::Geometry, 3),
             (5, ShaderStage::Fragment, 4),
         ];
+        let mut bindings = shader_recompiler::backend::bindings::Bindings::default();
+        let mut infos: [Option<ShaderInfo>; 5] = Default::default();
 
         if uses_vertex_a {
             let mut va_env = GenericEnvironment::new()
@@ -390,18 +393,67 @@ impl ShaderCache {
             } else if vb_env.analyze().is_none() {
                 log::warn!("gl_shader_cache: TryFindSize failed for VertexB");
             } else {
-                let compiled = compile_dual_vertex_shader_glsl_at_offset(
+                let runtime_info =
+                    Self::make_runtime_info(&self.graphics_key, ShaderStage::VertexB, None);
+                let compiled = compile_dual_vertex_shader_glsl_at_offset_with_bindings(
                     va_env.cached_instruction_slice(),
                     va_env.cached_instruction_start(),
                     vb_env.cached_instruction_slice(),
                     vb_env.cached_instruction_start(),
                     &ShaderProfile::default(),
-                    &RuntimeInfo::default(),
+                    &runtime_info,
+                    &mut bindings,
                 );
+                let mut previous_info = compiled.info.clone();
+                infos[0] = Some(previous_info.clone());
                 pipeline.glsl_sources[0] = Some(compiled.source);
+
+                for &(slot, stage, gl_slot) in STAGE_LAYOUT {
+                    let address = self.pending_program_addresses[slot];
+                    if address == 0 || slot == 1 {
+                        continue;
+                    }
+
+                    let mut env = GenericEnvironment::new()
+                        .with_gpu_read(Arc::clone(reader))
+                        .with_program(address, 0)
+                        .with_initial_offset(std::mem::size_of::<ProgramHeader>() as u32)
+                        .with_stage(stage);
+
+                    let Some(_hash) = env.analyze() else {
+                        log::warn!(
+                            "gl_shader_cache: TryFindSize failed for stage {:?} at 0x{:X}",
+                            stage,
+                            address
+                        );
+                        continue;
+                    };
+
+                    let runtime_info =
+                        Self::make_runtime_info(&self.graphics_key, stage, Some(&previous_info));
+                    let compiled = self.compile_stage_glsl_at_offset_with_runtime_info(
+                        env.cached_instruction_slice(),
+                        stage,
+                        env.cached_instruction_start(),
+                        &runtime_info,
+                        &mut bindings,
+                    );
+                    log::debug!(
+                        "gl_shader_cache: compiled {:?} stage to {} bytes of GLSL",
+                        stage,
+                        compiled.source.len()
+                    );
+                    previous_info = compiled.info.clone();
+                    pipeline.glsl_sources[gl_slot] = Some(compiled.source);
+                    infos[gl_slot] = Some(previous_info.clone());
+                }
+
+                pipeline.apply_shader_infos(&infos);
+                return Some(pipeline);
             }
         }
 
+        let mut previous_info: Option<ShaderInfo> = None;
         for &(slot, stage, gl_slot) in STAGE_LAYOUT {
             let address = self.pending_program_addresses[slot];
             if address == 0 {
@@ -440,19 +492,26 @@ impl ShaderCache {
             // and including the block containing the sentinel; the prefix
             // up to `cached_highest` is the actual shader body the
             // recompiler should consume.
-            let compiled = self.compile_stage_glsl_at_offset(
+            let runtime_info =
+                Self::make_runtime_info(&self.graphics_key, stage, previous_info.as_ref());
+            let compiled = self.compile_stage_glsl_at_offset_with_runtime_info(
                 env.cached_instruction_slice(),
                 stage,
                 env.cached_instruction_start(),
+                &runtime_info,
+                &mut bindings,
             );
             log::debug!(
                 "gl_shader_cache: compiled {:?} stage to {} bytes of GLSL",
                 stage,
                 compiled.source.len()
             );
+            previous_info = Some(compiled.info.clone());
+            infos[gl_slot] = previous_info.clone();
             pipeline.glsl_sources[gl_slot] = Some(compiled.source);
         }
 
+        pipeline.apply_shader_infos(&infos);
         Some(pipeline)
     }
 
@@ -480,6 +539,8 @@ impl ShaderCache {
             (4, ShaderStage::Geometry, 3),
             (5, ShaderStage::Fragment, 4),
         ];
+        let mut bindings = shader_recompiler::backend::bindings::Bindings::default();
+        let mut infos: [Option<ShaderInfo>; 5] = Default::default();
 
         if uses_vertex_a && uses_vertex_b {
             let va_env = environments.envs[0].generic_environment_mut();
@@ -495,17 +556,55 @@ impl ShaderCache {
                 log::warn!("gl_shader_cache: shared environment analyze failed for VertexB");
                 return Some(pipeline);
             }
-            let compiled = compile_dual_vertex_shader_glsl_at_offset(
+            let runtime_info =
+                Self::make_runtime_info(&self.graphics_key, ShaderStage::VertexB, None);
+            let compiled = compile_dual_vertex_shader_glsl_at_offset_with_bindings(
                 &va_code,
                 va_start,
                 vb_env.cached_instruction_slice(),
                 vb_env.cached_instruction_start(),
                 &ShaderProfile::default(),
-                &RuntimeInfo::default(),
+                &runtime_info,
+                &mut bindings,
             );
+            let mut previous_info = compiled.info.clone();
+            infos[0] = Some(previous_info.clone());
             pipeline.glsl_sources[0] = Some(compiled.source);
+
+            for &(slot, _stage, gl_slot) in STAGE_LAYOUT {
+                if self.graphics_key.unique_hashes[slot] == 0 || slot == 1 {
+                    continue;
+                }
+
+                let env = environments.envs[slot].generic_environment_mut();
+                let actual_stage = env.shader_stage();
+                if env.cached_code_slice().is_empty() && env.analyze().is_none() {
+                    log::warn!(
+                        "gl_shader_cache: shared environment analyze failed for stage {:?}",
+                        actual_stage
+                    );
+                    continue;
+                }
+
+                let runtime_info =
+                    Self::make_runtime_info(&self.graphics_key, actual_stage, Some(&previous_info));
+                let compiled = self.compile_stage_glsl_at_offset_with_runtime_info(
+                    env.cached_instruction_slice(),
+                    actual_stage,
+                    env.cached_instruction_start(),
+                    &runtime_info,
+                    &mut bindings,
+                );
+                previous_info = compiled.info.clone();
+                infos[gl_slot] = Some(previous_info.clone());
+                pipeline.glsl_sources[gl_slot] = Some(compiled.source);
+            }
+
+            pipeline.apply_shader_infos(&infos);
+            return Some(pipeline);
         }
 
+        let mut previous_info: Option<ShaderInfo> = None;
         for &(slot, _stage, gl_slot) in STAGE_LAYOUT {
             if self.graphics_key.unique_hashes[slot] == 0 {
                 continue;
@@ -524,15 +623,72 @@ impl ShaderCache {
                 continue;
             }
 
-            let compiled = self.compile_stage_glsl_at_offset(
+            let runtime_info =
+                Self::make_runtime_info(&self.graphics_key, actual_stage, previous_info.as_ref());
+            let compiled = self.compile_stage_glsl_at_offset_with_runtime_info(
                 env.cached_instruction_slice(),
                 actual_stage,
                 env.cached_instruction_start(),
+                &runtime_info,
+                &mut bindings,
             );
+            previous_info = Some(compiled.info.clone());
+            infos[gl_slot] = previous_info.clone();
             pipeline.glsl_sources[gl_slot] = Some(compiled.source);
         }
 
+        pipeline.apply_shader_infos(&infos);
         Some(pipeline)
+    }
+
+    /// Port of upstream `OpenGL::MakeRuntimeInfo(...)` in
+    /// `gl_shader_cache.cpp`.
+    fn make_runtime_info(
+        key: &GraphicsPipelineKey,
+        stage: ShaderStage,
+        previous_program: Option<&ShaderInfo>,
+    ) -> RuntimeInfo {
+        let mut info = RuntimeInfo::default();
+        if let Some(previous_program) = previous_program {
+            info.previous_stage_stores = previous_program.stores.clone();
+            info.previous_stage_legacy_stores_mapping =
+                previous_program.legacy_stores_mapping.clone();
+        } else {
+            // Mark all stores as available for vertex shaders.
+            info.previous_stage_stores.mask.fill(u64::MAX);
+        }
+
+        match stage {
+            ShaderStage::TessellationEval => {
+                info.tess_clockwise = !key.tessellation_clockwise();
+                info.tess_primitive = match key.tessellation_primitive() {
+                    0 => TessPrimitive::Isolines,
+                    1 => TessPrimitive::Triangles,
+                    2 => TessPrimitive::Quads,
+                    _ => TessPrimitive::Triangles,
+                };
+                info.tess_spacing = match key.tessellation_spacing() {
+                    0 => TessSpacing::Equal,
+                    1 => TessSpacing::FractionalOdd,
+                    2 => TessSpacing::FractionalEven,
+                    _ => TessSpacing::Equal,
+                };
+            }
+            ShaderStage::Fragment => {
+                info.force_early_z = key.early_z();
+            }
+            _ => {}
+        }
+
+        info.input_topology = match key.gs_input_topology() {
+            0 => InputTopology::Points,
+            1 | 2 | 3 => InputTopology::Lines,
+            10 | 11 => InputTopology::LinesAdjacency,
+            12 | 13 => InputTopology::TrianglesAdjacency,
+            _ => InputTopology::Triangles,
+        };
+
+        info
     }
 
     /// Translate a single Maxwell shader stage to GLSL via the recompiler.
@@ -560,9 +716,34 @@ impl ShaderCache {
         stage: ShaderStage,
         base_offset: u32,
     ) -> CompiledGlslShader {
+        let runtime_info = Self::make_runtime_info(&self.graphics_key, stage, None);
+        let mut bindings = shader_recompiler::backend::bindings::Bindings::default();
+        self.compile_stage_glsl_at_offset_with_runtime_info(
+            code,
+            stage,
+            base_offset,
+            &runtime_info,
+            &mut bindings,
+        )
+    }
+
+    fn compile_stage_glsl_at_offset_with_runtime_info(
+        &self,
+        code: &[u64],
+        stage: ShaderStage,
+        base_offset: u32,
+        runtime_info: &RuntimeInfo,
+        bindings: &mut shader_recompiler::backend::bindings::Bindings,
+    ) -> CompiledGlslShader {
         let profile = ShaderProfile::default();
-        let runtime_info = RuntimeInfo::default();
-        compile_shader_glsl_at_offset(code, stage, base_offset, &profile, &runtime_info)
+        compile_shader_glsl_at_offset_with_bindings(
+            code,
+            stage,
+            base_offset,
+            &profile,
+            runtime_info,
+            bindings,
+        )
     }
 
     /// Create a new compute pipeline.

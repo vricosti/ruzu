@@ -138,6 +138,19 @@ pub enum ComponentType {
     Float = 7,
 }
 
+impl ComponentType {
+    pub fn from_raw(value: u32) -> Option<Self> {
+        match value {
+            1 => Some(Self::Snorm),
+            2 => Some(Self::Unorm),
+            3 => Some(Self::Sint),
+            4 => Some(Self::Uint),
+            7 => Some(Self::Float),
+            _ => None,
+        }
+    }
+}
+
 // ── TextureFormat placeholder ──────────────────────────────────────────
 // Upstream: Tegra::Texture::TextureFormat
 
@@ -149,62 +162,134 @@ pub enum TextureFormat {
     R16G16B16A16 = 0x03,
     R32G32 = 0x04,
     R32B24G8 = 0x05,
-    E5B9G9R9 = 0x06,
+    ETC2_RGB = 0x06,
+    X8B8G8R8 = 0x07,
     A8B8G8R8 = 0x08,
     A2B10G10R10 = 0x09,
-    G8R8 = 0x0c,
-    R16 = 0x0e,
-    R8 = 0x0f,
-    R16G16 = 0x0d,
-    R32 = 0x0b,
-    B10G11R11 = 0x07,
-    B5G6R5 = 0x15,
-    A1B5G5R5 = 0x14,
-    A5B5G5R1 = 0x16,
+    ETC2_RGB_PTA = 0x0a,
+    ETC2_RGBA = 0x0b,
+    R16G16 = 0x0c,
+    G8R24 = 0x0d,
+    G24R8 = 0x0e,
+    R32 = 0x0f,
+    BC6H_S16 = 0x10,
+    BC6H_U16 = 0x11,
     A4B4G4R4 = 0x12,
-    G4R4 = 0x1d,
-    A2R10G10B10 = 0x0a,
-    // Z32 = 0x0a — same discriminant as A2R10G10B10, use alias below
-    X8Z24 = 0x10,
-    Z16 = 0x13,
-    Z24S8 = 0x11,
-    // G24R8 = 0x11 — same discriminant as Z24S8, use alias below
-    // S8Z24 = 0x14 — same discriminant as A1B5G5R5, use alias below
-    Z32X24S8 = 0x19,
+    A5B5G5R1 = 0x13,
+    A1B5G5R5 = 0x14,
+    B5G6R5 = 0x15,
+    B6G5R5 = 0x16,
+    BC7U = 0x17,
+    G8R8 = 0x18,
+    EAC = 0x19,
+    EACX2 = 0x1a,
+    R16 = 0x1b,
+    Y8_VIDEO = 0x1c,
+    R8 = 0x1d,
+    G4R4 = 0x1e,
+    R1 = 0x1f,
+    E5B9G9R9 = 0x20,
+    B10G11R11 = 0x21,
+    G8B8G8R8 = 0x22,
+    B8G8R8G8 = 0x23,
     DXT1 = 0x24,
     DXT23 = 0x25,
     DXT45 = 0x26,
     DXN1 = 0x27,
     DXN2 = 0x28,
-    BC7U = 0x17,
-    // BC6hS16 = 0x10 — same discriminant as X8Z24, use alias below
-    // BC6hU16 = 0x10 — same discriminant as X8Z24, use alias below
+    Z24S8 = 0x29,
+    X8Z24 = 0x2a,
+    S8Z24 = 0x2b,
+    Z32 = 0x2f,
+    Z32X24S8 = 0x30,
+    Z16 = 0x3a,
     Astc2d4x4 = 0x40,
-    Astc2d5x4 = 0x50,
     Astc2d5x5 = 0x41,
-    Astc2d8x8 = 0x44,
-    Astc2d8x5 = 0x51,
-    Astc2d10x8 = 0x52,
     Astc2d6x6 = 0x42,
-    Astc2d10x6 = 0x53,
-    Astc2d10x5 = 0x54,
+    Astc2d8x8 = 0x44,
     Astc2d10x10 = 0x45,
-    Astc2d12x10 = 0x55,
     Astc2d12x12 = 0x46,
-    Astc2d8x6 = 0x43,
-    Astc2d6x5 = 0x56,
-    // S8 = 0x0a — same discriminant as A2R10G10B10, use alias below
+    Astc2d5x4 = 0x50,
+    Astc2d6x5 = 0x51,
+    Astc2d8x6 = 0x52,
+    Astc2d10x8 = 0x53,
+    Astc2d12x10 = 0x54,
+    Astc2d8x5 = 0x55,
+    Astc2d10x5 = 0x56,
+    Astc2d10x6 = 0x57,
 }
 
-// Aliases for duplicate discriminant values.
-// Upstream C++ uses these as separate enum values with the same numeric value.
 impl TextureFormat {
-    pub const Z32: Self = Self::A2R10G10B10;
-    pub const G24R8: Self = Self::Z24S8;
-    pub const S8Z24: Self = Self::A1B5G5R5;
-    pub const BC6H_S16: Self = Self::X8Z24;
-    pub const BC6H_U16: Self = Self::X8Z24;
-    pub const S8: Self = Self::A2R10G10B10;
+    // Render-target/shader helper alias still used by the current Rust
+    // `shader_environment` bridge. Upstream shader_environment reads a real
+    // TICEntry instead of converting through this alias.
+    pub const A2R10G10B10: Self = Self::ETC2_RGB_PTA;
+
+    pub fn from_raw(value: u32) -> Option<Self> {
+        match value {
+            0x01 => Some(Self::R32G32B32A32),
+            0x02 => Some(Self::R32G32B32),
+            0x03 => Some(Self::R16G16B16A16),
+            0x04 => Some(Self::R32G32),
+            0x05 => Some(Self::R32B24G8),
+            0x06 => Some(Self::ETC2_RGB),
+            0x07 => Some(Self::X8B8G8R8),
+            0x08 => Some(Self::A8B8G8R8),
+            0x09 => Some(Self::A2B10G10R10),
+            0x0a => Some(Self::ETC2_RGB_PTA),
+            0x0b => Some(Self::ETC2_RGBA),
+            0x0c => Some(Self::R16G16),
+            0x0d => Some(Self::G8R24),
+            0x0e => Some(Self::G24R8),
+            0x0f => Some(Self::R32),
+            0x10 => Some(Self::BC6H_S16),
+            0x11 => Some(Self::BC6H_U16),
+            0x12 => Some(Self::A4B4G4R4),
+            0x13 => Some(Self::A5B5G5R1),
+            0x14 => Some(Self::A1B5G5R5),
+            0x15 => Some(Self::B5G6R5),
+            0x16 => Some(Self::B6G5R5),
+            0x17 => Some(Self::BC7U),
+            0x18 => Some(Self::G8R8),
+            0x19 => Some(Self::EAC),
+            0x1a => Some(Self::EACX2),
+            0x1b => Some(Self::R16),
+            0x1c => Some(Self::Y8_VIDEO),
+            0x1d => Some(Self::R8),
+            0x1e => Some(Self::G4R4),
+            0x1f => Some(Self::R1),
+            0x20 => Some(Self::E5B9G9R9),
+            0x21 => Some(Self::B10G11R11),
+            0x22 => Some(Self::G8B8G8R8),
+            0x23 => Some(Self::B8G8R8G8),
+            0x24 => Some(Self::DXT1),
+            0x25 => Some(Self::DXT23),
+            0x26 => Some(Self::DXT45),
+            0x27 => Some(Self::DXN1),
+            0x28 => Some(Self::DXN2),
+            0x29 => Some(Self::Z24S8),
+            0x2a => Some(Self::X8Z24),
+            0x2b => Some(Self::S8Z24),
+            0x2f => Some(Self::Z32),
+            0x30 => Some(Self::Z32X24S8),
+            0x3a => Some(Self::Z16),
+            0x40 => Some(Self::Astc2d4x4),
+            0x41 => Some(Self::Astc2d5x5),
+            0x42 => Some(Self::Astc2d6x6),
+            0x44 => Some(Self::Astc2d8x8),
+            0x45 => Some(Self::Astc2d10x10),
+            0x46 => Some(Self::Astc2d12x12),
+            0x50 => Some(Self::Astc2d5x4),
+            0x51 => Some(Self::Astc2d6x5),
+            0x52 => Some(Self::Astc2d8x6),
+            0x53 => Some(Self::Astc2d10x8),
+            0x54 => Some(Self::Astc2d12x10),
+            0x55 => Some(Self::Astc2d8x5),
+            0x56 => Some(Self::Astc2d10x5),
+            0x57 => Some(Self::Astc2d10x6),
+            _ => None,
+        }
+    }
 }
 
 // ── Hash function ──────────────────────────────────────────────────────

@@ -250,10 +250,9 @@ impl ShaderCache {
             };
             if std::env::var_os("RUZU_TRACE_SHADER_WORDS").is_some() {
                 match cpu_shader_addr {
-                    Some(cpu) => eprintln!(
-                        "[SHADER_VA] gpu=0x{:X} -> cpu=0x{:X}",
-                        shader_addr, cpu
-                    ),
+                    Some(cpu) => {
+                        eprintln!("[SHADER_VA] gpu=0x{:X} -> cpu=0x{:X}", shader_addr, cpu)
+                    }
                     None => eprintln!(
                         "[SHADER_VA] gpu=0x{:X} -> UNMAPPED (gpu_to_cpu_address returned None)",
                         shader_addr
