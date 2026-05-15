@@ -17,7 +17,16 @@ use super::image_base::GPUVAddr;
 /// pages mapped). Returning `false` is treated as a transient read failure
 /// — `Read` then falls back to the cached descriptor + reports `changed=false`.
 pub trait GpuMemoryReader {
+    /// Read `output.len()` bytes from a GPU device address into `output`.
+    /// Returns `true` if every byte was successfully read.
     fn read_block(&self, d_address: u64, output: &mut [u8]) -> bool;
+
+    /// Returns `true` if the GPU device address has a backing host mapping
+    /// (i.e. the page-table walk succeeds). Used by `is_valid_entry` to
+    /// reject TIC descriptors whose `Address()` points outside any mapped
+    /// SMMU page. Equivalent to upstream
+    /// `Tegra::MemoryManager::GpuToCpuAddress(addr).has_value()`.
+    fn addr_valid(&self, d_address: u64) -> bool;
 }
 
 // ── DescriptorTable<T> ────────────────────────────────────────────────
