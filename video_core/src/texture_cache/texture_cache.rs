@@ -49,9 +49,13 @@ impl TextureCacheBase {
 
     /// Port of `TextureCache<P>::FillGraphicsImageViews`
     /// (texture_cache.h:192-197). Thin wrapper that forwards to
-    /// `fill_image_views` over the channel's graphics image table.
+    /// `fill_image_views` over the channel's graphics image table, supplying
+    /// the channel's `MaxwellDeviceMemoryManager` as the descriptor-table
+    /// memory reader.
     pub fn fill_graphics_image_views(&mut self, views: &mut [ImageViewInOut], has_blacklists: bool) {
+        let gpu_memory = self.device_memory.clone();
         Self::fill_image_views(
+            &*gpu_memory,
             &mut self.channel_state.graphics_image_table,
             &mut self.channel_state.graphics_image_view_ids,
             &mut self.channel_state.image_views,
@@ -65,7 +69,9 @@ impl TextureCacheBase {
     /// (texture_cache.h:199-203). Upstream passes `has_blacklists=true`
     /// unconditionally to the underlying `FillImageViews` template.
     pub fn fill_compute_image_views(&mut self, views: &mut [ImageViewInOut]) {
+        let gpu_memory = self.device_memory.clone();
         Self::fill_image_views(
+            &*gpu_memory,
             &mut self.channel_state.compute_image_table,
             &mut self.channel_state.compute_image_view_ids,
             &mut self.channel_state.image_views,
@@ -83,6 +89,7 @@ impl TextureCacheBase {
     /// needs backend image access and is left as a TODO until the slot pools
     /// are concrete.
     fn fill_image_views(
+        gpu_memory: &dyn super::descriptor_table::GpuMemoryReader,
         table: &mut DescriptorTable<crate::textures::texture::TicEntry>,
         cached_ids: &mut [ImageViewId],
         image_views_cache: &mut std::collections::HashMap<
@@ -98,7 +105,13 @@ impl TextureCacheBase {
             *has_deleted_images = false;
             has_blacklisted = false;
             for view in views.iter_mut() {
-                view.id = Self::visit_image_view(table, cached_ids, image_views_cache, view.index);
+                view.id = Self::visit_image_view(
+                    gpu_memory,
+                    table,
+                    cached_ids,
+                    image_views_cache,
+                    view.index,
+                );
                 if has_blacklists && view.blacklist && view.id != NULL_IMAGE_VIEW_ID {
                     // Upstream: ScaleDown(slot_images[image_view.image_id])
                     // sets has_blacklisted=true when a rescale-down fires.
@@ -119,6 +132,7 @@ impl TextureCacheBase {
     /// contents are uploaded. `PrepareImageView` is still a stub while the
     /// backend `P::ImageView`/`P::Image` slot pools are not wired.
     fn visit_image_view(
+        gpu_memory: &dyn super::descriptor_table::GpuMemoryReader,
         table: &mut DescriptorTable<crate::textures::texture::TicEntry>,
         cached_ids: &mut [ImageViewId],
         image_views_cache: &mut std::collections::HashMap<
@@ -131,7 +145,7 @@ impl TextureCacheBase {
             // Matches upstream LOG_DEBUG + NULL_IMAGE_VIEW_ID return.
             return NULL_IMAGE_VIEW_ID;
         }
-        let (descriptor, is_new) = table.read(index);
+        let (descriptor, is_new) = table.read(gpu_memory, index);
         let slot = &mut cached_ids[index as usize];
         if is_new {
             *slot = Self::find_image_view(image_views_cache, &descriptor);
