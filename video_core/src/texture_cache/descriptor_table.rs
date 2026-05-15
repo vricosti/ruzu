@@ -132,7 +132,27 @@ impl<T: Copy + PartialEq + Default> DescriptorTable<T> {
 
     // ── Private helpers ────────────────────────────────────────────────
 
+    /// Upstream's TIC/TSC table is bounded by Maxwell3D limits that fit in
+    /// the firmware (low thousands). When the GPU regs are uninitialized at
+    /// boot or get a garbage write, the raw u32 limit can be `0xFFFFFFFF`
+    /// — that would translate to a 32 GiB descriptor `Vec::resize`, which
+    /// SIGSEGVs the allocator. Clamp to a generous-but-finite cap; values
+    /// above it indicate a register read against uninitialized state.
+    const MAX_REASONABLE_LIMIT: u32 = 0xFFFF; // 65 536 descriptors
+
     fn refresh(&mut self, gpu_addr: GPUVAddr, limit: u32) {
+        if limit > Self::MAX_REASONABLE_LIMIT {
+            log::warn!(
+                "DescriptorTable::refresh: limit={} > {} — clamping (regs likely uninitialized)",
+                limit,
+                Self::MAX_REASONABLE_LIMIT,
+            );
+            self.current_gpu_addr = gpu_addr;
+            self.current_limit = 0;
+            self.read_descriptors.clear();
+            self.descriptors.clear();
+            return;
+        }
         self.current_gpu_addr = gpu_addr;
         self.current_limit = limit;
 
