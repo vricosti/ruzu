@@ -228,12 +228,25 @@ pub struct BufferCacheRuntime {
 impl BufferCacheRuntime {
     /// Create a new buffer cache runtime.
     ///
-    /// Port of `BufferCacheRuntime::BufferCacheRuntime()`.
-    pub fn new(_device: &super::gl_device::Device) -> Self {
+    /// Port of `BufferCacheRuntime::BufferCacheRuntime()`
+    /// (gl_buffer_cache.cpp:139-144). `device_access_memory` is the
+    /// per-process VRAM budget. When the NVX_gpu_memory_info extension is
+    /// present, upstream sets it to `GetCurrentDedicatedVideoMemory() +
+    /// 512 MiB` so the subsequent `GetDeviceMemoryUsage` subtraction stays
+    /// non-negative. Otherwise it falls back to a hard-coded 2 GiB
+    /// minimum.
+    pub fn new(device: &super::gl_device::Device) -> Self {
         let mut max_attributes: i32 = 16;
         unsafe {
             gl::GetIntegerv(gl::MAX_VERTEX_ATTRIBS, &mut max_attributes);
         }
+
+        const HALF_GIB: u64 = 512 * 1024 * 1024;
+        let device_access_memory = if device.can_report_memory() {
+            device.get_current_dedicated_video_memory() + HALF_GIB
+        } else {
+            2 * 1024 * 1024 * 1024
+        };
 
         Self {
             has_fast_buffer_sub_data: false,
@@ -244,7 +257,7 @@ impl BufferCacheRuntime {
             graphics_base_uniform_bindings: [0; NUM_STAGES],
             graphics_base_storage_bindings: [0; NUM_STAGES],
             index_buffer_offset: 0,
-            device_access_memory: 2 * 1024 * 1024 * 1024, // 2 GiB default
+            device_access_memory,
         }
     }
 
@@ -285,20 +298,27 @@ impl BufferCacheRuntime {
     }
 
     /// Get device memory usage.
+    ///
+    /// Port of `BufferCacheRuntime::GetDeviceMemoryUsage` (gl_buffer_cache
+    /// .cpp:159-164). Upstream uses
+    /// `GL_GPU_MEMORY_INFO_TOTAL_AVAILABLE_MEMORY_NVX = 0x9048` (not the
+    /// CURRENT_AVAILABLE variant 0x9049). Since `device_access_memory`
+    /// was initialised in the ctor as `total + 512 MiB`, this returns a
+    /// roughly-constant 512 MiB headroom value when the NVX extension is
+    /// active — same as upstream.
+    ///
+    /// The 2 GiB fallback (no NVX) matches upstream returning `2_GiB`.
     pub fn get_device_memory_usage(&self) -> u64 {
-        // GL_GPU_MEMORY_INFO_CURRENT_AVAILABLE_VIDMEM_NVX = 0x9049
-        const GL_GPU_MEMORY_INFO_CURRENT_AVAILABLE_VIDMEM_NVX: u32 = 0x9049;
-        let mut available_kb: i32 = 0;
+        const GL_GPU_MEMORY_INFO_TOTAL_AVAILABLE_MEMORY_NVX: u32 = 0x9048;
+        let mut total_kb: i32 = 0;
         unsafe {
-            gl::GetIntegerv(
-                GL_GPU_MEMORY_INFO_CURRENT_AVAILABLE_VIDMEM_NVX,
-                &mut available_kb,
-            );
+            gl::GetIntegerv(GL_GPU_MEMORY_INFO_TOTAL_AVAILABLE_MEMORY_NVX, &mut total_kb);
         }
-        if available_kb > 0 {
-            self.device_access_memory - (available_kb as u64 * 1024)
+        if total_kb > 0 {
+            self.device_access_memory
+                .saturating_sub((total_kb as u64) * 1024)
         } else {
-            0
+            2 * 1024 * 1024 * 1024
         }
     }
 
@@ -463,7 +483,13 @@ impl base::BufferCacheRuntime for BufferCacheRuntime {
                 offset as isize,
                 size as isize,
             );
-            if std::env::var_os("RUZU_DUMP_GL_UBO_BIND").is_some() && stage == 0 && binding == 0 {
+            if std::env::var_os("RUZU_DUMP_GL_UBO_BIND").is_some() {
+                use std::sync::atomic::{AtomicUsize, Ordering};
+                static DUMPS: AtomicUsize = AtomicUsize::new(0);
+                let dump_index = DUMPS.fetch_add(1, Ordering::Relaxed);
+                if dump_index >= 32 {
+                    return;
+                }
                 let dump_size = (size as usize).min(0x240);
                 let mut bytes = vec![0u8; dump_size];
                 gl::GetNamedBufferSubData(
@@ -483,9 +509,11 @@ impl base::BufferCacheRuntime for BufferCacheRuntime {
                     })
                     .collect();
                 log::info!(
-                    "[GL_UBO_BIND] stage={} binding={} handle={} offset=0x{:X} size=0x{:X} words={}",
+                    "[GL_UBO_BIND] #{} stage={} binding={} local_binding={} handle={} offset=0x{:X} size=0x{:X} words={}",
+                    dump_index,
                     stage,
                     binding,
+                    binding_index,
                     gpu_handle,
                     offset,
                     size,

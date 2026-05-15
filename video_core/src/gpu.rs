@@ -693,11 +693,10 @@ impl Gpu {
     /// Request a composite (frame presentation).
     ///
     /// Matches upstream `GPU::Impl::RequestComposite(layers, fences)`:
-    /// queues the composite as a sync operation, signals the GPU thread
-    /// via TickGPU, then waits for execution.
-    ///
-    /// Simplified: upstream also handles NvFence gating for multi-fence
-    /// swap chains. We skip fence gating and composite directly.
+    /// queues fence registration as a sync operation, signals the GPU thread
+    /// via TickGPU, then waits for registration. If fences are present,
+    /// composition runs from the host1x syncpoint callback once every fence
+    /// has reached its target value.
     pub fn request_composite(&self, layers: Vec<FramebufferConfig>) {
         if std::env::var_os("RUZU_TRACE_PRESENT").is_some() {
             log::info!("[PRESENT] GPU::request_composite layers={}", layers.len());
@@ -715,22 +714,68 @@ impl Gpu {
             }
         }
 
+        self.request_composite_with_fences(layers, Vec::new());
+    }
+
+    fn composite_layers(&self, layers: &[FramebufferConfig]) {
+        let mut renderer_guard = self.renderer.lock().unwrap();
+        if let Some(ref mut renderer) = *renderer_guard {
+            if std::env::var_os("RUZU_TRACE_PRESENT").is_some() {
+                log::info!(
+                    "[PRESENT] GPU sync callback calling renderer.composite layers={}",
+                    layers.len()
+                );
+            }
+            renderer.composite(layers);
+        } else if std::env::var_os("RUZU_TRACE_PRESENT").is_some() {
+            log::info!("[PRESENT] GPU sync callback has no renderer");
+        }
+    }
+
+    fn request_composite_with_fences(&self, layers: Vec<FramebufferConfig>, fences: Vec<NvFence>) {
         // Capture a raw pointer to self for the callback via usize (Send-safe).
         // Safety: the Gpu outlives the sync request (we wait for it below).
         let gpu_addr = self as *const Gpu as usize;
         let wait_fence = self.request_sync_operation(Box::new(move || {
             let gpu = unsafe { &*(gpu_addr as *const Gpu) };
-            let mut renderer_guard = gpu.renderer.lock().unwrap();
-            if let Some(ref mut renderer) = *renderer_guard {
+            let valid_fences: Vec<NvFence> =
+                fences.into_iter().filter(|fence| fence.id >= 0).collect();
+            if valid_fences.is_empty() {
+                gpu.composite_layers(&layers);
+                return;
+            }
+
+            let system = gpu.system_ref();
+            let Some(host1x) = system.get().host1x_core() else {
+                log::warn!(
+                    "Gpu::request_composite missing host1x_core; composing without {} fences",
+                    valid_fences.len()
+                );
+                gpu.composite_layers(&layers);
+                return;
+            };
+
+            let remaining = Arc::new(AtomicUsize::new(valid_fences.len()));
+            for fence in valid_fences {
+                let remaining = Arc::clone(&remaining);
+                let layers = layers.clone();
                 if std::env::var_os("RUZU_TRACE_PRESENT").is_some() {
                     log::info!(
-                        "[PRESENT] GPU sync callback calling renderer.composite layers={}",
-                        layers.len()
+                        "[PRESENT] waiting fence id={} value={} before composite",
+                        fence.id,
+                        fence.value
                     );
                 }
-                renderer.composite(&layers);
-            } else if std::env::var_os("RUZU_TRACE_PRESENT").is_some() {
-                log::info!("[PRESENT] GPU sync callback has no renderer");
+                host1x.register_host_action(
+                    fence.id as u32,
+                    fence.value,
+                    Box::new(move || {
+                        if remaining.fetch_sub(1, Ordering::AcqRel) == 1 {
+                            let gpu = unsafe { &*(gpu_addr as *const Gpu) };
+                            gpu.composite_layers(&layers);
+                        }
+                    }),
+                );
             }
         }));
         self.gpu_thread.lock().unwrap().tick_gpu();
@@ -906,7 +951,7 @@ impl GpuCoreInterface for Gpu {
         Gpu::push_gpu_entries(self, channel_id, command_list);
     }
 
-    fn request_composite(&self, layers: Vec<CoreFramebufferConfig>, _fences: Vec<NvFence>) {
+    fn request_composite(&self, layers: Vec<CoreFramebufferConfig>, fences: Vec<NvFence>) {
         let layers = layers
             .into_iter()
             .map(|layer| FramebufferConfig {
@@ -943,7 +988,7 @@ impl GpuCoreInterface for Gpu {
                 },
             })
             .collect();
-        Gpu::request_composite(self, layers);
+        self.request_composite_with_fences(layers, fences);
     }
 
     fn on_cpu_write(&self, addr: u64, size: u64) -> bool {

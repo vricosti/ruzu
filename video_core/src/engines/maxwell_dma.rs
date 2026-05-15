@@ -1,10 +1,9 @@
 // SPDX-FileCopyrightText: 2025 ruzu contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! Maxwell DMA engine stub (NV class B0B5).
+//! Maxwell DMA engine (NV class B0B5).
 //!
-//! Handles GPU memory copy operations. Detects launch trigger writes and logs
-//! parameters; actual DMA copy is not yet implemented.
+//! Handles the pitch-linear DMA copy subset used by early renderer paths.
 
 use std::sync::Arc;
 
@@ -117,6 +116,17 @@ impl MaxwellDMA {
 
     // ── Launch handling ────────────────────────────────────────────────
 
+    fn with_rasterizer_mut<R>(
+        &mut self,
+        f: impl FnOnce(&mut dyn RasterizerInterface) -> R,
+    ) -> Option<R> {
+        let raw = self.rasterizer?;
+        // The command processor owns engines separately from the renderer,
+        // mirroring upstream's raw `RasterizerInterface*` stored by engines.
+        let ptr: *mut dyn RasterizerInterface = unsafe { std::mem::transmute(raw) };
+        Some(unsafe { f(&mut *ptr) })
+    }
+
     fn handle_launch(&mut self) {
         if std::env::var_os("RUZU_TRACE_ENGINE_LAUNCH").is_some() {
             log::info!(
@@ -218,6 +228,29 @@ impl Engine for MaxwellDMA {
 
         let pi = self.pitch_in().max(ll);
         let po = self.pitch_out().max(ll);
+        let src_span = (pi as u64)
+            .saturating_mul(lines.saturating_sub(1) as u64)
+            .saturating_add(ll as u64);
+        let dst_span = (po as u64)
+            .saturating_mul(lines.saturating_sub(1) as u64)
+            .saturating_add(ll as u64);
+        let src_addr = self.src_addr();
+        let dst_addr = self.dst_addr();
+
+        // Upstream `MaxwellDMA::Launch` calls `memory_manager.FlushCaching()`
+        // before reading from the DMA source. In the Rust OpenGL path, render
+        // target contents may still live only in the texture cache, so flush
+        // the source range through the rasterizer before the CPU fallback copy.
+        if src_span != 0 {
+            self.with_rasterizer_mut(|rasterizer| {
+                rasterizer.flush_region(src_addr, src_span);
+            });
+        }
+        if dst_span != 0 {
+            self.with_rasterizer_mut(|rasterizer| {
+                rasterizer.invalidate_region(dst_addr, dst_span);
+            });
+        }
 
         // Build destination buffer line-by-line.
         let dst_size = (po as u64 * lines as u64) as usize;
@@ -254,6 +287,93 @@ impl Engine for MaxwellDMA {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engines::draw_manager::DrawState;
+    use crate::query_cache::types::QueryPropertiesFlags;
+    use crate::rasterizer_interface::RasterizerDownloadArea;
+
+    #[derive(Default)]
+    struct RasterizerCalls {
+        flushes: Vec<(u64, u64)>,
+        invalidations: Vec<(u64, u64)>,
+    }
+
+    struct TestRasterizer {
+        calls: Arc<Mutex<RasterizerCalls>>,
+    }
+
+    impl TestRasterizer {
+        fn new(calls: Arc<Mutex<RasterizerCalls>>) -> Self {
+            Self { calls }
+        }
+    }
+
+    impl RasterizerInterface for TestRasterizer {
+        fn draw(&mut self, _draw_state: &DrawState, _instance_count: u32) {}
+        fn draw_texture(&mut self) {}
+        fn clear(&mut self, _draw_state: &DrawState, _layer_count: u32) {}
+        fn dispatch_compute(&mut self) {}
+        fn reset_counter(&mut self, _query_type: u32) {}
+        fn query(
+            &mut self,
+            _gpu_addr: u64,
+            _query_type: u32,
+            _flags: QueryPropertiesFlags,
+            _payload: u32,
+            _subreport: u32,
+        ) {
+        }
+        fn bind_graphics_uniform_buffer(
+            &mut self,
+            _stage: usize,
+            _index: u32,
+            _gpu_addr: u64,
+            _size: u32,
+        ) {
+        }
+        fn disable_graphics_uniform_buffer(&mut self, _stage: usize, _index: u32) {}
+        fn signal_fence(&mut self, _func: Box<dyn FnOnce() + Send>) {}
+        fn sync_operation(&mut self, _func: Box<dyn FnOnce() + Send>) {}
+        fn signal_sync_point(&mut self, _value: u32) {}
+        fn signal_reference(&mut self) {}
+        fn release_fences(&mut self, _force: bool) {}
+        fn flush_all(&mut self) {}
+        fn flush_region(&mut self, addr: u64, size: u64) {
+            self.calls.lock().flushes.push((addr, size));
+        }
+        fn must_flush_region(&self, _addr: u64, _size: u64) -> bool {
+            false
+        }
+        fn get_flush_area(&self, addr: u64, size: u64) -> RasterizerDownloadArea {
+            RasterizerDownloadArea {
+                start_address: addr,
+                end_address: addr + size,
+                preemptive: false,
+            }
+        }
+        fn invalidate_region(&mut self, addr: u64, size: u64) {
+            self.calls.lock().invalidations.push((addr, size));
+        }
+        fn on_cache_invalidation(&mut self, _addr: u64, _size: u64) {}
+        fn on_cpu_write(&mut self, _addr: u64, _size: u64) -> bool {
+            false
+        }
+        fn invalidate_gpu_cache(&mut self) {}
+        fn unmap_memory(&mut self, _addr: u64, _size: u64) {}
+        fn modify_gpu_memory(&mut self, _as_id: usize, _addr: u64, _size: u64) {}
+        fn flush_and_invalidate_region(&mut self, _addr: u64, _size: u64) {}
+        fn wait_for_idle(&mut self) {}
+        fn fragment_barrier(&mut self) {}
+        fn tiled_cache_barrier(&mut self) {}
+        fn flush_commands(&mut self) {}
+        fn tick_frame(&mut self) {}
+        fn accelerate_inline_to_memory(
+            &mut self,
+            _address: u64,
+            _copy_size: usize,
+            _memory: &[u8],
+        ) {
+        }
+    }
 
     fn new_test_engine() -> MaxwellDMA {
         MaxwellDMA::new(Arc::new(Mutex::new(MemoryManager::new(0))))
@@ -391,6 +511,35 @@ mod tests {
         // Line 1: 4 bytes copied + 12 zeros.
         assert_eq!(&dst[16..20], &[5, 6, 7, 8]);
         assert_eq!(&dst[20..32], &[0; 12]);
+    }
+
+    #[test]
+    fn test_dma_fallback_flushes_source_and_invalidates_destination() {
+        let mut eng = new_test_engine();
+        let calls = Arc::new(Mutex::new(RasterizerCalls::default()));
+        let rasterizer = TestRasterizer::new(Arc::clone(&calls));
+        eng.bind_rasterizer(&rasterizer);
+
+        eng.write_reg(SRC_ADDR_HIGH, 0);
+        eng.write_reg(SRC_ADDR_LOW, 0x1000);
+        eng.write_reg(DST_ADDR_HIGH, 0);
+        eng.write_reg(DST_ADDR_LOW, 0x8000);
+        eng.write_reg(PITCH_IN, 16);
+        eng.write_reg(PITCH_OUT, 32);
+        eng.write_reg(LINE_LENGTH, 8);
+        eng.write_reg(LINE_COUNT, 3);
+        eng.write_reg(LAUNCH_DMA, 1);
+
+        let src = vec![0x55; 0x100];
+        let writes = eng.execute_pending(&|addr, buf| {
+            let offset = (addr - 0x1000) as usize;
+            buf.copy_from_slice(&src[offset..offset + buf.len()]);
+        });
+
+        assert_eq!(writes.len(), 1);
+        let calls = calls.lock();
+        assert_eq!(calls.flushes, vec![(0x1000, 40)]);
+        assert_eq!(calls.invalidations, vec![(0x8000, 72)]);
     }
 
     #[test]

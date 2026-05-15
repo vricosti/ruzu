@@ -14886,6 +14886,228 @@
 ### Binary layout verification
 - N/A: GLSL text emission only; no guest-visible raw struct or serialized payload layout changed.
 
+## 2026-05-15 — `video_core/src/renderer_opengl/present/window_adapt_pass.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/present/window_adapt_pass.cpp`
+
+### Intentional differences
+- Added env-gated `RUZU_TRACE_PRESENT_PHASES` diagnostics around the presentation clear/draw path. This is local instrumentation only; it preserves read-framebuffer and pixel-pack state and is disabled by default.
+- Expanded env-gated `RUZU_TRACE_PRESENT_DRAW` to report viewport, scissor, color mask, rasterizer-discard, cull, depth, and stencil state after the present draw. Upstream has no equivalent log; this is diagnostic-only.
+- Added env-gated `RUZU_PRESENT_FORCE_SOLID` diagnostic that compiles a solid-red fragment shader for the present pass. This is not an upstream behavior path and must remain disabled outside isolation runs.
+- Rust now uses separable vertex/fragment programs and a local present program pipeline, matching upstream `CreateProgram` + `ProgramManager::BindPresentPrograms` behavior more closely than the previous monolithic-program bridge. Ownership still differs because upstream uses the shared renderer `ProgramManager`; Rust keeps a local pipeline inside `WindowAdaptPass` until `BlitScreen` owns/passes the shared manager.
+- Rust explicitly initializes the `color_texture` sampler uniform to texture unit 0 after linking the fragment program. Upstream relies on `layout(binding = 0)`; the explicit assignment is harmless and documents the bridge behavior.
+- Rust does not implement the upstream `device.HasVertexBufferUnifiedMemory()` fast path; it always binds the host VBO through `glBindVertexBuffer`.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `WindowAdaptPass::DrawToFramebuffer` relied on constructor-time VAO DSA setup only. Upstream re-enables and redefines the vertex attribute array/divisor/format/binding state and binds the vertex buffer inside every draw call. Rust now reapplies that state in `draw_to_framebuffer` before binding the sampler and drawing layers.
+
+### Missing items
+- Move present-program binding from `WindowAdaptPass`'s local pipeline to the shared renderer `ProgramManager`, exactly matching upstream ownership.
+- Port the unified vertex-buffer-address path for drivers exposing `GL_NV_vertex_buffer_unified_memory`.
+
+### Binary layout verification
+- PASS: `ScreenRectVertex` remains `#[repr(C)]` with two `[f32; 2]` fields. Attribute offsets used here remain 0 for `position` and 8 for `tex_coord`, matching upstream `offsetof(ScreenRectVertex, position/tex_coord)`.
+
+## 2026-05-15 — `video_core/src/renderer_opengl/gl_texture_cache.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_texture_cache.cpp`
+
+### Intentional differences
+- Rust still sets basic texture view filtering/wrap parameters in `ImageView::make_view`. Upstream leaves these to sampler objects and format/swizzle setup. Sampler binding overrides the filter/wrap state in the normal sampled path.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `ImageView::make_view` mapped shader texture view types to non-multisample GL targets unconditionally. Upstream calls `ImageTarget(view_type, num_samples)` and selects `GL_TEXTURE_2D_MULTISAMPLE` / `GL_TEXTURE_2D_MULTISAMPLE_ARRAY` when the parent image has more than one sample. Rust now ports that helper as `image_view_target` and uses it for every `glTextureView` call.
+- Fixed in this pass: the OpenGL `TryFindFramebufferImageView` presentation path materialized the display view through the local `new_color_2d` render-target helper. Upstream returns a normal `ImageView(info, image)` for the framebuffer view info, preserving `ImageViewInfo` swizzle and `IsRenderTarget()` semantics. Rust now uses `ImageView::from_image_view_info` for the presentation framebuffer view.
+
+### Missing items
+- Port upstream `ApplySwizzle` in `ImageView::MakeView` for non-render-target views. Rust still relies on the default texture component mapping.
+- Replace manual `glGenTextures` view creation with the OpenGL resource-wrapper ownership equivalent once the GL resource manager port is complete.
+
+### Binary layout verification
+- N/A: host OpenGL texture-view target selection only; no guest-visible raw struct or serialized payload layout changed.
+
+## 2026-05-15 — `video_core/src/engines/maxwell_3d.rs`, `video_core/src/engines/draw_manager.rs`, `video_core/src/texture_cache/image_info.rs`, `video_core/src/texture_cache/texture_cache.rs`, and `video_core/src/renderer_opengl/gl_texture_cache.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/engines/maxwell_3d.h`, `/home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/image_info.cpp`, `/home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/texture_cache.h`, and `/home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_texture_cache.cpp`
+
+### Intentional differences
+- `RUZU_TRACE_PRESENT_ALIASES` is env-gated diagnostic output only.
+- `ImageInfo::from_render_target_info` keeps `num_samples = 1` because ruzu `DrawState` does not yet carry Maxwell3D anti-alias samples mode; this preserves the pre-existing single-sample behavior until the AA register is threaded through the draw-state snapshot.
+- The old `from_render_target_config(&(), ...)` stub remains as a compatibility shim for unported call sites; real render-target paths now use `from_render_target_info`.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: render-target snapshots only preserved address/width/height/format, so `TextureCacheBase::find_or_insert_render_target_image` fabricated every RT as pitch-linear. Rust now snapshots upstream `RenderTargetConfig` fields (`tile_mode`, `depth`, `array_pitch`, `base_layer`) and decodes pitch/block-linear layout through `ImageInfo::from_render_target_info`.
+
+### Missing items
+- Thread Maxwell3D anti-alias samples mode into the draw-state snapshot and `ImageInfo::from_render_target_info`.
+- Include remaining `RenderTargetConfig` fields such as volume/mark_ieee_clean if future paths require them.
+- Full `FindRenderTargetView` parity is still incomplete: delete/retry loop, `TryFindBase`, true `FindOrEmplaceImageView` helper ownership, alias/overlap registration through `JoinImages`, and backend runtime interactions remain incomplete.
+- `SynchronizeAliases`/`CopyImage` are still not ported; the latest trace shows present images currently have `aliases=0 overlaps=0`, so alias construction remains a separate blocker.
+
+### Binary layout verification
+- N/A: Rust `RenderTargetInfo` is an internal snapshot, not raw-copied guest/host ABI. Upstream `RenderTargetConfig` raw register layout was verified by field offsets from `maxwell_3d.h`; Rust captures the corresponding words individually.
+
+## 2026-05-15 — `video_core/src/renderer_opengl/gl_rasterizer.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_graphics_pipeline.cpp` and `/home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_rasterizer.cpp`
+
+### Intentional differences
+- Texture/image descriptor binding logic still physically lives in `gl_rasterizer.rs` because ruzu's `GraphicsPipeline` does not yet own references to `TextureCache`, `BufferCache`, Maxwell3D register state, and GPU memory like upstream `GraphicsPipeline::ConfigureImpl`. This is an ownership mismatch to unwind.
+- Descriptor reads keep defensive bounds checks and a sanity cap (`MAX_DESC_COUNT = 256`) around shader-provided indices. Upstream asserts these invariants; Rust currently avoids guest-triggered panics while this path is still under active porting.
+- Env-gated diagnostics (`RUZU_TRACE_BIND_TEXTURES`, `RUZU_DUMP_BOUND_TEXTURES`, `RUZU_TRACE_TEXTURE_DESCRIPTORS`) remain local instrumentation only.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: the port of upstream texture/image descriptor collection, `FillGraphicsImageViews`, `PrepareImageView`, `glBindTextures`, `glBindSamplers`, and `glBindImageTextures` was hidden behind `RUZU_TEXTURE_CACHE_FILL=1`. Upstream performs this unconditionally inside `GraphicsPipeline::ConfigureImpl`; ruzu now does the same by default.
+
+### Missing items
+- Move the descriptor collection and binding body from `RasterizerOpenGL::draw` into the upstream-corresponding `GraphicsPipeline::configure_impl` ownership once the Rust backend can pass/cache the same dependencies.
+- Restore upstream ordering exactly: `texture_cache.FillGraphicsImageViews`, `texture_cache.UpdateRenderTargets(false)`, framebuffer bind through the state tracker, `buffer_cache.UpdateGraphicsBuffers`, host geometry buffer bind, program bind, then descriptor texture/image binding.
+- Replace defensive descriptor fallback behavior with upstream-style assertions once shader info and descriptor-table invariants are stable enough.
+
+### Binary layout verification
+- N/A: host OpenGL binding path only; no guest-visible raw struct or serialized payload layout changed.
+
+## 2026-05-15 — `video_core/src/engines/maxwell_dma.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/engines/maxwell_dma.cpp` and `/home/vricosti/Dev/emulators/zuyu/src/video_core/engines/maxwell_dma.h`
+
+### Intentional differences
+- Rust still implements the existing pitch-linear CPU fallback subset through `Engine::execute_pending`, returning a `PendingWrite` for the command processor to apply. Upstream executes `MaxwellDMA::Launch` immediately and writes through `MemoryManager` / `GpuGuestMemoryScoped`.
+- Rust has no `AccelerateDMAInterface` owner yet (`BufferCopy`, `BufferClear`, `ImageToBuffer`, `BufferToImage`). This pass therefore mirrors upstream `memory_manager.FlushCaching()` with rasterizer cache callbacks around the CPU fallback instead of porting `rasterizer->AccessAccelerateDMA()`.
+- Rust register ownership is still partial and uses explicit method constants for the currently implemented early-renderer subset; upstream owns the full `Regs` packed layout with `LaunchDMA`, remap, semaphore, and block-linear parameter fields.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: the Rust DMA fallback read source GPU memory without first flushing rasterizer-owned cached contents. Upstream `MaxwellDMA::Launch` calls `memory_manager.FlushCaching()` before CPU fallback copies; Rust now calls `rasterizer.flush_region(src_addr, src_span)` before `read_gpu`.
+- Fixed in this pass: the Rust fallback did not invalidate rasterizer cache for the destination range before returning a pending guest-memory write. Rust now calls `rasterizer.invalidate_region(dst_addr, dst_span)` so stale destination image/cache state is not reused after the copy.
+
+### Missing items
+- Port upstream `LaunchDMA` bitfield decoding and branch structure exactly, including multiline vs single-line handling, remap clear, semaphore release, and memory-layout assertions.
+- Add Rust `AccelerateDMAInterface` parity and wire OpenGL buffer-cache / texture-cache implementations for `BufferCopy`, `BufferClear`, `ImageToBuffer`, and `BufferToImage`.
+- Port block-linear to pitch, pitch to block-linear, and block-linear to block-linear paths with upstream `CalculateSize`, `UnswizzleSubrect`, `SwizzleSubrect`, and remap handling.
+- Replace the raw transmuted rasterizer pointer bridge with the same lifetime/ownership model used by the command-processor engine bindings once that subsystem is ported structurally.
+
+### Binary layout verification
+- FAIL/incomplete: upstream `MaxwellDMA::Regs`, `DMA::Parameters`, `DMA::ImageOperand`, and related packed bitfield payloads are not represented as full Rust binary-layout equivalents in this file yet. The current implementation only uses individual register words needed by the pitch-linear fallback subset.
+
+## 2026-05-15 — `video_core/src/texture_cache/texture_cache_base.rs` and `video_core/src/texture_cache/texture_cache.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/texture_cache.h`
+
+### Intentional differences
+- Rust still exposes `TryFindFramebufferImageView` through the backend-independent `TextureCacheBase`, then materializes the OpenGL `ImageView` in `renderer_opengl/gl_texture_cache.rs`. Upstream's templated `TextureCache<P>` returns `P::ImageView*` directly.
+- The framebuffer-display lookup still uses Rust's current `collect_images_in_region(cpu_addr, 1)` helper instead of upstream's direct `page_table.find(cpu_addr >> YUZU_PAGEBITS)` iteration. The observable selection rules remain the same for exact `image.cpu_addr == cpu_addr` matches.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: when the exact framebuffer `ImageViewInfo` was missing, Rust returned `image.image_view_ids[0]`. Upstream calls `FindOrEmplaceImageView(image_id, info)`, creating a display-specific view with the Android framebuffer format and opaque-blend swizzle. Rust now inserts and records that view on the image before returning it.
+
+### Missing items
+- Port the full upstream `FindOrEmplaceImageView` helper ownership instead of open-coding the framebuffer case in `TryFindFramebufferImageView`.
+- Finish alias synchronization (`SynchronizeAliases` / `CopyImage`) so a display image can receive content from a newer aliased render-target image before presentation.
+- Replace the temporary backend-independent/base split with upstream-equivalent `TextureCache<P>` ownership once Rust has the backend type plumbing to match the C++ template structure more closely.
+
+### Binary layout verification
+- N/A: host-side texture-cache view selection only; no guest-visible raw struct or serialized payload layout changed.
+
+## 2026-05-15 — `video_core/src/texture_cache/image_info.rs`, `video_core/src/texture_cache/texture_cache.rs`, `video_core/src/renderer_opengl/gl_texture_cache.rs`, and `video_core/src/renderer_opengl/gl_rasterizer.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/image_info.cpp`, `/home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/texture_cache.h`, `/home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_texture_cache.cpp`, and `/home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_rasterizer.cpp`
+
+### Intentional differences
+- Rust exposes `TextureCacheBase::{find_image, find_or_insert_image, insert_image}` as `pub(crate)` so the OpenGL wrapper can mirror upstream template-owned `TextureCache<P>::BlitImage` behavior without moving the base cache ownership into the backend file.
+- Rust `TextureCache::blit_image` is the OpenGL-owned Fermi2D blit path only. It ports the upstream `FRAMEBUFFER_BLITS` path and leaves the other upstream accelerated-copy classes for later slices.
+- `RUZU_TRACE_FERMI2D_BLIT` is env-gated diagnostic logging only; upstream has no equivalent runtime log.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `ImageInfo::from_fermi2d_surface` was a placeholder and did not translate Fermi2D pitch/block-linear surfaces into image type, size, tiling, resources, or forced-flush/download flags. Rust now mirrors upstream `ImageInfo(const Tegra::Engines::Fermi2D::Surface&)` for the implemented fields.
+- Fixed in this pass: `RasterizerOpenGL::accelerate_surface_copy` returned `false`, so Fermi2D copies always fell back or disappeared. Rust now routes to `TextureCache::blit_image`, matching upstream `RasterizerOpenGL::AccelerateSurfaceCopy` ownership.
+- Fixed in this pass: the OpenGL texture cache had no owner-side FBO blit wrapper for source/destination image views. Rust now creates mapped source/destination images, materializes color image views, gets FBOs, calls `glBlitNamedFramebuffer`, and marks the destination image GPU-modified.
+
+### Missing items
+- Non-framebuffer accelerated copy paths from upstream `TextureCache<P>::BlitImage` remain missing.
+- Depth/stencil blit handling is not complete; this slice handles color-view FBO blits only.
+- `find_or_insert_mapped_image` is a Rust bridge over the current cache layout. The long-term parity target is still the full upstream texture-cache lifecycle around image aliases, joins, overlaps, and render-target tracking.
+- Early MK8D did not exercise this Fermi2D path in smoke tests; the current black output remains in texture sampling/upload/descriptor semantics, not this copy path.
+
+### Binary layout verification
+- N/A: host-side texture-cache metadata and OpenGL blit state only; no guest-visible raw struct or serialized payload layout changed.
+
+## 2026-05-15 — `shader_recompiler/src/ir_opt/texture_pass.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/shader_recompiler/ir_opt/texture_pass.cpp`
+
+### Intentional differences
+- Rust still preserves descriptor index in `Arg(0)` for non-array descriptors and preserves the raw dynamic offset for descriptor arrays. Upstream clears `Arg(0)` for non-arrays and inserts `UMin(ShiftRightArithmetic(dynamic_offset, 3), 7)` before array users; porting this literally requires stable pre-instruction insertion in the current `Vec<Option<Inst>>` IR model.
+- `PatchImageSampleImplicitLod` and `PatchTexelFetch` remain unported because both require upstream-style insertion immediately before an existing instruction and use-replacement ordering.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: upstream clears `ImageFetch` Arg(4) unless the fetch type is `Color2D`, `Color2DRect`, or `ColorArray2D`. Rust now clears Arg(4) for non-2D fetches instead of leaving a stale multisample operand visible.
+- Fixed in this pass: upstream `Descriptors::Add(TextureDescriptor)` deduplicates texture descriptors without comparing `is_multisample`, then ORs the flag into the existing descriptor. Rust now matches this merge behavior in both `TexturePass` and `JoinTextureInfo`.
+
+### Missing items
+- Implement stable pre-instruction insertion for the Rust IR so texture pass can port descriptor-array index rewriting, `PatchImageSampleImplicitLod`, and SNORM texel-fetch conversion literally.
+- Implement env-backed `TryGetConstant` for dynamic `BitwiseAnd32` cbuf masks.
+- Complete GLSL/backend emission for the full sampled/image operation set and descriptor-array indexing.
+
+### Binary layout verification
+- N/A: shader IR metadata only; no guest-visible raw struct or serialized payload layout changed.
+
+## 2026-05-15 — `video_core/src/engines/maxwell_3d.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/engines/maxwell_3d.cpp`
+
+### Intentional differences
+- Added env-gated `RUZU_TRACE_INDEX_BUFFER_REGS=1` diagnostics to log raw index-buffer register writes and `DRAW_END` state. Upstream has no equivalent diagnostic; this is disabled by default and does not change register state or draw behavior.
+
+### Unintentional differences (to fix)
+- None introduced by this diagnostic pass.
+
+### Missing items
+- This pass did not audit or port broader `Maxwell3D` method ownership. It only verified the indexed draw path used during the MK8D black-screen investigation.
+
+### Binary layout verification
+- N/A: diagnostic logging only; no guest-visible raw struct or serialized payload layout changed.
+
+## 2026-05-15 — `shader_recompiler/src/frontend/translate/common_encoding.rs`, `shader_recompiler/src/frontend/translate/mod.rs`, `shader_recompiler/src/frontend/translate/floating_point_add.rs`, `shader_recompiler/src/frontend/translate/floating_point_multiply.rs`, and `shader_recompiler/src/frontend/translate/floating_point_fused_multiply_add.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/shader_recompiler/frontend/maxwell/translate/impl/impl.cpp`, `/home/vricosti/Dev/emulators/zuyu/src/shader_recompiler/frontend/maxwell/translate/impl/floating_point_add.cpp`, `/home/vricosti/Dev/emulators/zuyu/src/shader_recompiler/frontend/maxwell/translate/impl/floating_point_multiply.cpp`, and `/home/vricosti/Dev/emulators/zuyu/src/shader_recompiler/frontend/maxwell/translate/impl/floating_point_fused_multiply_add.cpp`
+
+### Intentional differences
+- Rust still emits simplified floating-point operations without fully threading upstream `FpControl` behavior through every call site. This pass only fixes operand decoding/source ownership bugs that were objectively divergent and directly affected MK8D vertex shaders.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: Rust `decode_imm32` read the low 32 instruction bits, while upstream `GetImm32`/`GetFloatImm32` reads `BitField<20, 32>`. Rust now decodes bits `[20:51]`.
+- Fixed in this pass: Rust `decode_src_b_f32` immediate mode shifted by 13 and ignored the sign bit. Upstream `GetFloatImm20` shifts the 19-bit payload by 12 and uses bit 56 as the float sign. Rust now delegates to `get_float_imm20`.
+- Fixed in this pass: Rust `FADD` decoded `abs_b` from bit 44; upstream decodes bit 49. Rust now uses bit 49.
+- Fixed in this pass: Rust `FADD32I` decoded `abs_b` from bit 52; upstream decodes bit 57. Rust now uses bit 57.
+- Fixed in this pass: Rust `FMUL` treated bit 48 as `neg_a`; upstream treats bit 48 as `neg_b`. Rust now applies the modifier to source B.
+- Fixed in this pass: Rust `FMUL32I` ignored saturate bit 55. Rust now applies `FPSaturate` when bit 55 is set.
+- Fixed in this pass: Rust `FFMA_reg/rc/cr/imm` used one generic source-B decoder plus `src_c=reg39`, which mismatched upstream source ownership for `rc` and `cr`. Rust now selects `(src_b, src_c)` per upstream: `reg=(reg20,reg39)`, `rc=(reg39,cbuf)`, `cr=(cbuf,reg39)`, `imm=(imm20,reg39)`.
+- Fixed in this pass: Rust regular `FFMA` treated bit 48 as `neg_a`. Upstream regular `FFMA` has `neg_a=false` and bit 48 is `neg_b`. Rust now mirrors that ownership.
+- Fixed in this pass: Rust `FFMA32I` ignored `neg_a`, `neg_c`, and `sat`. Rust now decodes bits 56, 57, and 55 respectively.
+
+### Missing items
+- `FADD`, `FMUL`, and `FFMA` still do not fully implement upstream `cc` exception behavior, rounding mode, FTZ/FMZ handling, and `FMUL` scale handling. These remain separate parity debt.
+- Tests currently cover the shared 32I immediate bitfield regression. More translator-level tests should be added once the single-instruction Maxwell-to-IR test harness is expanded to assert operand modifier placement directly.
+
+### Binary layout verification
+- N/A: shader frontend IR translation only; no guest-visible raw struct or serialized payload layout changed.
+
+## 2026-05-15 — `video_core/src/renderer_opengl/gl_rasterizer.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_rasterizer.cpp` and `/home/vricosti/Dev/emulators/zuyu/src/video_core/buffer_cache/buffer_cache.h`
+
+### Intentional differences
+- Expanded `RUZU_TRACE_DRAW_SUMMARY` to include index-buffer format, element size, first/count, GPU address range, base index, vertex first/count, and the final OpenGL element-buffer offset. Upstream has no equivalent logging; this is diagnostic-only and is disabled by default.
+- Expanded the same diagnostic to include render-target count/map plus the first four RT GPU address, translated device/CPU address, size, and format entries so draw RTs can be correlated with nvnflinger present buffers.
+- Expanded `RUZU_DUMP_DRAW_BUFFERS` to read the guest GPU bytes for the index buffer and vertex stream 0 before dumping the corresponding OpenGL buffer prefixes. The diagnostic translates GPU VA to device/CPU address and then uses the renderer device-memory reader, avoiding guest-visible behavior and preserving the upstream runtime path when the env var is unset.
+- Expanded `RUZU_DUMP_BOUND_TEXTURES` to include the bound image-view id, view GPU address, parent image GPU address, and parent image CPU/device address for sampled textures. This is diagnostic-only metadata for correlating sampled inputs with render-target producers.
+
+### Unintentional differences (to fix)
+- None introduced in this pass.
+
+### Missing items
+- If this trace confirms a mismatch, the next fix must preserve upstream ownership: draw-state capture remains under Maxwell3D/DrawManager ownership, while final index-buffer offset calculation remains under BufferCache ownership.
+
+### Binary layout verification
+- N/A: host-side diagnostic logging only; no guest-visible raw struct or serialized payload layout changed.
+
+## 2026-05-15 — `video_core/src/renderer_opengl/gl_graphics_pipeline.rs` and `video_core/src/renderer_opengl/gl_rasterizer.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_graphics_pipeline.cpp`, `/home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_shader_manager.cpp`, and `/home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_rasterizer.cpp`
+
+### Intentional differences
+- `RUZU_TRACE_PIPELINE_BUILD` and `RUZU_TRACE_PIPELINE_BUILD_SOURCE` are env-gated diagnostics only. Upstream creates per-stage source programs in `GraphicsPipeline` and binds them through `ProgramManager::BindSourcePrograms`; Rust now logs the same stage-to-program relationship when diagnostics are enabled.
+- `RasterizerOpenGL::total_draw_count` is a diagnostic-only monotonic counter. Upstream only tracks `num_queued_commands`, which intentionally resets on `FlushCommands`/`TickFrame`; retaining the upstream counter for batching while adding a separate diagnostic sequence avoids changing flush behavior.
+- `RUZU_DUMP_BOUND_TEXTURES_LIMIT` is an env-gated diagnostic limit for texture readback logs. It does not affect the actual `glBindTextures`/`glBindSamplers` calls.
+- `RUZU_TRACE_DRAW_SUMMARY` also logs scissor state, first vertex-attribute bindings, and the element-buffer binding. These are diagnostic queries only and do not modify OpenGL state.
+- `RUZU_DUMP_DRAW_BUFFERS` is an env-gated diagnostic that reads bytes from the currently bound vertex/index GL buffers at `GL_VERTEX_BINDING_OFFSET + attrib.relative_offset` and the index-buffer offset with `glGetNamedBufferSubData`.
+
+### Unintentional differences (to fix)
+- None introduced in this pass. The diagnostic `seq` field is separate from upstream-equivalent `num_queued_commands`, so command flushing still follows upstream reset semantics.
+
+### Missing items
+- Rust still binds per-pipeline program-pipeline objects directly in `GraphicsPipeline::configure`; upstream centralizes this through `ProgramManager::BindSourcePrograms` and tracks current stage programs globally.
+- `GraphicsPipeline` construction/build remains synchronous/lazy in Rust, while upstream supports worker-thread shader building and fence-based readiness.
+
+### Binary layout verification
+- N/A: host OpenGL diagnostics and renderer counters only; no guest-visible raw struct or serialized payload layout changed.
+
 ## 2026-05-15 — `video_core/src/engines/draw_manager.rs`, `video_core/src/engines/maxwell_3d.rs`, `video_core/src/renderer_opengl/gl_rasterizer.rs`, and `video_core/src/buffer_cache/buffer_cache.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/engines/draw_manager.cpp`, `/home/vricosti/Dev/emulators/zuyu/src/video_core/engines/maxwell_3d.h`, and `/home/vricosti/Dev/emulators/zuyu/src/video_core/buffer_cache/buffer_cache.h`
 
 ### Intentional differences
@@ -15121,3 +15343,285 @@
 ### Binary layout verification
 - PASS: `TicEntry` remains `repr(C)` and 0x20 bytes, matching upstream `static_assert(sizeof(TICEntry) == 0x20)`.
 - PASS: `ImageViewInfo` remains `repr(C)` and stores the same semantic fields as upstream (`type`, `format`, `range`, four swizzle bytes). The constructor initializes all fields deterministically before return.
+
+## 2026-05-15 — `shader_recompiler/src/ir_opt/texture_pass.rs`, `shader_recompiler/src/ir_opt/collect_info.rs`, `shader_recompiler/src/ir_opt/mod.rs`, `shader_recompiler/src/pipeline_cache.rs`, and `video_core/src/renderer_opengl/gl_shader_cache.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/shader_recompiler/ir_opt/texture_pass.cpp`, `/home/vricosti/Dev/emulators/zuyu/src/shader_recompiler/ir_opt/collect_shader_info_pass.cpp`, and `/home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_shader_cache.cpp`
+
+### Intentional differences
+- Rust added `texture_pass_bound_textures` as a narrow bound-texture pass for the current Maxwell GLSL path. Upstream `TexturePass` is a larger pass that resolves bindless, constant-buffer, image, texture-buffer, MSAA, and descriptor-array cases from `Environment`.
+- Rust threads `texture_bound_buffer` explicitly through `pipeline_cache`/`gl_shader_cache`; upstream owns this through shader `Environment` and graphics pipeline key construction. This is a temporary Rust ownership bridge while the shader environment is still partial.
+- `collect_info.rs` now preserves descriptors produced by `texture_pass_bound_textures` instead of synthesizing fallback descriptors. Upstream `CollectShaderInfoPass` does not own texture descriptor construction.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: texture instructions used the raw 13-bit cbuf field as a descriptor handle. Upstream interprets the field as a constant-buffer word offset, so Rust now multiplies by four and rewrites the IR handle to a compact descriptor index during the texture pass.
+
+### Missing items
+- Port full upstream `TexturePass`: bindless handle tracking, `Track`/`Visit` structure, image descriptors, texture buffers, descriptor arrays, multisample metadata, TIC-derived texture type refinement, and the complete no-rewrite cases.
+- Move the explicit `texture_bound_buffer` bridge into upstream-faithful `Environment`/pipeline ownership once those files are structurally complete.
+
+### Binary layout verification
+- N/A: shader IR metadata and GLSL pipeline construction only; no guest-visible raw struct or serialized payload layout changed.
+
+## 2026-05-15 — `shader_recompiler/src/frontend/translate/texture_fetch*.rs`, `shader_recompiler/src/frontend/translate/texture_load*.rs`, `shader_recompiler/src/frontend/translate/texture_gather.rs`, and `shader_recompiler/src/frontend/translate/texture_query.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/shader_recompiler/frontend/maxwell/translate/impl/texture*.cpp`
+
+### Intentional differences
+- Rust still implements only the subset of Maxwell texture instruction lowering needed by the current GLSL path. Upstream decodes more texture operands, sparse/result masks, offsets, projection, and type-specific behavior.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: bound texture instructions now pass the upstream byte cbuf offset (`field * 4`) into IR, rather than treating the encoded word field as a final descriptor id.
+
+### Missing items
+- Complete per-instruction upstream parity for texture fetch/load/gather/query variants, including swizzled forms, bindless paths, offsets, array/cube typing, sparse residency, and full result component masks.
+
+### Binary layout verification
+- N/A: shader instruction translation only; no guest-visible raw struct or serialized payload layout changed.
+
+## 2026-05-15 — `shader_recompiler/src/backend/glsl/glsl_emit_context.rs` and `shader_recompiler/src/backend/glsl/emit_glsl_image.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/shader_recompiler/backend/glsl/glsl_emit_context.cpp` and `/home/vricosti/Dev/emulators/zuyu/src/shader_recompiler/backend/glsl/emit_glsl_image.cpp`
+
+### Intentional differences
+- Rust now mirrors upstream sampler naming at the important binding boundary: declarations use `layout(binding=N) uniform sampler2D texN`, and image sampling resolves `TextureInstInfo::descriptor_index` through `ctx.textures[descriptor_index].binding`.
+- The implementation remains restricted to simple `sampler2D` sample paths. Upstream derives sampler/image types and coordinates from full `TextureDescriptor` and emits the complete sparse/offset/lod/bias/image operation set.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: Rust previously declared stage/cbuf-index sampler names while `emit_glsl_image.rs` referenced descriptor-index names, producing undeclared/redeclared GLSL once multiple sampled textures were present.
+
+### Missing items
+- Port full upstream GLSL image emission: type-specific sampler declarations, texture arrays/cubes/buffers, depth/MSAA, image load/store/atomics, offsets, sparse queries, and complete coordinate construction.
+
+### Binary layout verification
+- N/A: GLSL text emission only; no guest-visible raw struct or serialized payload layout changed.
+
+## 2026-05-15 — `video_core/src/renderer_opengl/gl_rasterizer.rs`, `video_core/src/texture_cache/texture_cache.rs`, and `video_core/src/texture_cache/texture_cache_base.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_graphics_pipeline.cpp`, `/home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/texture_cache.h`, and `/home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/texture_cache_base.h`
+
+### Intentional differences
+- Rust `gl_rasterizer.rs` performs the current graphics descriptor fill/bind bridge directly under `RUZU_TEXTURE_CACHE_FILL=1`; upstream does this in `GraphicsPipeline::ConfigureImpl`/`prepare_stage` with backend template ownership.
+- `get_graphics_sampler_id_with_gpu_reader` lives next to upstream-owned `GetGraphicsSamplerId` logic but accepts a caller-provided GPU-VA reader. This is a Rust ownership bridge because the current cache base stores Host1x SMMU device memory while MK8D's graphics cbuf/TSC table addresses are channel GPU virtual addresses.
+- Env-gated diagnostics (`RUZU_TRACE_TEXTURE_DESCRIPTORS`, `RUZU_TRACE_TSC_READ`, `RUZU_TRACE_BIND_TEXTURES`) are local debugging additions and are inert when unset.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: sampled texture handles were read through the Host1x SMMU device-memory manager, which returned no data for MK8D's cbuf GPU VAs. Rust now reads cbuf handles through the channel `MemoryManager` and `DeviceMemoryReader`.
+- Fixed in this pass: sampled TSC descriptors used the same wrong address-space path. Rust now reads TSC entries from `tex_sampler_addr + index * sizeof(TSCEntry)` through the channel GPU-VA reader.
+- Fixed in this pass: `TextureCacheBase::new` did not reserve slot 0 for the null sampler. Upstream inserts a null sampler in `TextureCache<P>::TextureCache` so `NULL_SAMPLER_ID{0}` is never returned for a real descriptor; Rust now reserves the same slot before any real `FindSampler` insert.
+
+### Missing items
+- Move descriptor fill/bind ownership out of `gl_rasterizer.rs` into the upstream-corresponding graphics pipeline/texture-cache structure once the Rust backend types can mirror C++ templates more closely.
+- Reserve upstream null image and null image-view slots with backend-equivalent objects; this pass only fixed the sampler null slot because it was blocking real sampler binding.
+- Remove the `RUZU_TEXTURE_CACHE_FILL` gate after the descriptor path is fully upstream-faithful and no longer partial.
+
+### Binary layout verification
+- PASS: `TscEntry` remains `repr(C)` and 0x20 bytes; TSC reads use `size_of::<TscEntry>()` and `read_unaligned`, matching raw descriptor-table semantics.
+- PASS: the null sampler descriptor initializes the same upstream fields (`min_filter`, `mag_filter`, `mipmap_filter`, `cubemap_anisotropy`) before insertion into slot 0.
+
+## 2026-05-15 — `video_core/src/texture_cache/descriptor_table.rs`, `video_core/src/texture_cache/texture_cache.rs`, `video_core/src/texture_cache/texture_cache_base.rs`, `video_core/src/texture_cache/util.rs`, `video_core/src/renderer_opengl/gl_rasterizer.rs`, and `video_core/src/renderer_opengl/gl_texture_cache.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/descriptor_table.h`, `/home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/texture_cache.h`, `/home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/texture_cache_base.h`, `/home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/util.cpp`, `/home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_graphics_pipeline.cpp`, and `/home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_texture_cache.cpp`
+
+### Intentional differences
+- `DescriptorTable::read_with` is a Rust-only overload of upstream `DescriptorTable::Read`. It preserves descriptor-table ownership and behavior but lets current ruzu call sites supply the channel `MemoryManager` GPU-VA reader explicitly, because the Rust cache base does not yet store the same live `Tegra::MemoryManager&` reference that upstream `TextureCacheChannelInfo` owns.
+- `fill_graphics_image_views_with_gpu_reader` mirrors upstream `FillGraphicsImageViews`/`VisitImageView` but is limited to the graphics path and takes explicit reader/address-valid callbacks. This is a bridge until the channel memory-manager ownership is made upstream-faithful inside `TextureCacheChannelInfo`.
+- `TextureCache::refresh_contents_with_gpu_reader` uploads through a temporary OpenGL PBO and existing `Image::upload_memory`. Upstream uses `runtime.UploadStagingBuffer`, `UploadImageContents`, conversion helpers, async decode, and richer alias synchronization. The temporary PBO keeps behavior functional without pretending the staging runtime is ported.
+- Env-gated `RUZU_TRACE_TEXTURE_UPLOAD` diagnostics report prepare/upload/read-miss decisions. Upstream has different logging/profiling infrastructure; runtime behavior is unchanged when the env var is unset.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `TextureCacheBase::new` still failed to reserve upstream null image and null image-view slots. Upstream inserts `NullImageParams{}` and `NullImageViewParams{}` before any real resource, so Rust now reserves `NULL_IMAGE_ID{0}` and `NULL_IMAGE_VIEW_ID{0}` as well as `NULL_SAMPLER_ID{0}`.
+- Fixed in this pass: `TextureCache::update_render_targets_from_draw_state` attempted to materialize every slot image as an OpenGL `Image`, including the newly-correct null image. Rust now skips `NULL_IMAGE_ID`, matching upstream's null-resource convention.
+- Fixed in this pass: graphics TIC descriptors were still read through the backend SMMU reader, so MK8D resolved image views to null while samplers were already valid. Rust now reads TIC descriptors and validates image addresses through the channel GPU-VA reader, matching upstream's `DescriptorTable<TICEntry>` ownership through `Tegra::MemoryManager`.
+- Fixed in this pass: sampled image views were prepared after descriptor fill only through the null path. With TIC channel reads fixed, real image ids are prepared, CPU-modified contents are unswizzled, uploaded to GL, and then bound with non-zero texture and sampler handles.
+
+### Missing items
+- Move the channel GPU-VA reader into `TextureCacheChannelInfo`/descriptor-table ownership instead of passing closures from `gl_rasterizer.rs`; upstream stores the memory manager reference in the descriptor table itself.
+- Port full upstream `PrepareImageView`, `PrepareImage`, `RefreshContents`, `UploadImageContents`, `SynchronizeAliases`, converted/accelerated upload paths, async ASTC decode, sparse image handling, rescale handling, and runtime staging-buffer management.
+- `unswizzle_image` currently covers the direct linear and block-linear full-image path used by the current smoke. It still needs line-by-line parity for all copy rectangles, conversion formats, per-subresource edge cases, accelerated uploads, and exact staging-buffer layout.
+- Descriptor/bind ownership remains under the partial `RUZU_TEXTURE_CACHE_FILL` bridge in `gl_rasterizer.rs`; upstream performs this in graphics pipeline `prepare_stage`.
+
+### Binary layout verification
+- PASS: `TicEntry`/`TscEntry` remain raw 0x20-byte descriptor payloads; descriptor-table reads use `size_of::<T>()` and unaligned raw copy, matching upstream `ReadBlockUnsafe`.
+- PASS: null image, image-view, and sampler ids are now all reserved at slot index 0 before any real insertion. The focused test `texture_cache_reserves_zero_for_null_resources` verifies the first real image and sampler are index 1.
+- N/A: OpenGL PBO staging and texture upload objects are host-side only; no guest-visible raw struct or IPC payload layout changed.
+
+## 2026-05-15 — `shader_recompiler/src/ir_opt/texture_pass.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/shader_recompiler/ir_opt/texture_pass.cpp`
+
+### Intentional differences
+- Superseded by the following entry: Rust now has upstream `BoundImage*` and `BindlessImage*` IR opcodes. Current frontend lowering still mostly emits normalized `Image*` operations, so the compatibility path remains.
+- `texture_pass_bound_textures` still receives `texture_bound_buffer` explicitly. Upstream reads this through `Environment::TextureBoundBuffer`; ruzu does not yet have the same environment ownership in this pipeline.
+- Dynamic descriptor-array tracking records the upstream `count=8` and `size_shift=3` metadata, but currently leaves the tracked dynamic SSA value as arg0. Upstream emits `umin(asr(dynamic_offset, 3), 7)` before replacing the handle; Rust GLSL image emission does not yet consume dynamic descriptor indices.
+- The pass remains a subset of upstream `TexturePass(env, program, host_info)`: it tracks cbuf-derived handles for current normalized texture/image operations but does not yet use TIC-derived texture types or pixel formats.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `TexturePass` was a warning-only stub and `JoinTextureInfo` was a warning-only stub. Rust now rebuilds texture/image descriptor arrays, deduplicates entries, merges image read/write/integer flags, and updates `TextureInstInfo::descriptor_index`.
+- Fixed in this pass: separate texture/sampler handles built with `BitwiseOr32` are now tracked into primary and secondary cbuf fields using the same ordering/swap rule as upstream.
+- Fixed in this pass: dynamic cbuf offsets built through `IAdd32` are now recognized as descriptor arrays with upstream descriptor size metadata.
+- Fixed in this pass: stale frontend `register_texture` placeholders are cleared when the pass owns descriptor rebuilding, so backend descriptor indices refer to the rebuilt upstream-style arrays.
+
+### Missing items
+- Superseded by the following entry for opcode normalization and environment type/format reads.
+- Upstream `Environment::ReadCbufValue` fallback in `TryGetConstant` and host-info driven `PatchImageSampleImplicitLod`.
+- Complete bindless traversal through `IR::BreadthFirstSearch`; current Rust tracking is recursive and bounded to the expression forms currently needed.
+- Upstream dynamic index insertion (`umin(asr(dynamic_offset, 3), 7)`) and backend consumption of dynamic descriptor indices.
+- Full backend image atomic emission, complete image buffer behavior, SNORM texel-fetch workaround, rectangle coordinate patching, and all no-rewrite failure cases from upstream.
+
+### Binary layout verification
+- N/A: shader IR metadata only; no guest-visible raw struct or serialized payload layout changed.
+
+## 2026-05-15 — `shader_recompiler/src/ir/opcodes.rs` and `shader_recompiler/src/ir_opt/texture_pass.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/shader_recompiler/ir_opt/texture_pass.cpp`
+
+### Intentional differences
+- Rust now has the upstream pre-TexturePass `BoundImage*` and `BindlessImage*` opcode surface and normalizes it through `indexed_instruction`, matching upstream `IndexedInstruction`.
+- `texture_pass(env, program, host_info)` now exists and reads `Environment::texture_bound_buffer`, texture type, texture pixel format, and integer-format state. The existing `texture_pass_bound_textures` wrapper remains as a compatibility bridge for current ruzu call sites that pass only `env.TextureBoundBuffer()`.
+- `PatchImageSampleImplicitLod` and `PatchTexelFetch` are still diagnostic warnings rather than IR rewrites. Porting them literally requires the Rust IR insertion API to support upstream-style insertion before an existing instruction and replacement of all uses with a composite expression.
+- `TryGetConstant` inside `BitwiseAnd32` still does not call `Environment::ReadCbufValue` for non-immediate masks in this Rust slice. The common immediate-mask path is implemented; the env-backed cbuf-constant fallback remains missing.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: upstream `BoundImage*`/`BindlessImage*` opcodes were absent from Rust IR, making full `TexturePass` ownership impossible.
+- Fixed in this pass: `TexturePass` no longer leaves pre-indexed image atomics unclassified. Image atomics now normalize to indexed `ImageAtomic*` opcodes and register image/image-buffer descriptors with read/write/integer metadata.
+- Fixed in this pass: `ImageQueryDimensions` and 1D `ImageFetch` now use the environment texture type where available, matching the upstream type-refinement branch.
+- Fixed in this pass: `JoinTextureInfo` and descriptor addition now share image-buffer merge semantics with image descriptors, including read/write/integer flag merging.
+
+### Missing items
+- Wire current shader compilation call sites to pass the full `Environment` into `texture_pass` instead of using only `texture_bound_buffer`.
+- Port upstream `PatchImageSampleImplicitLod` for `Color2DRect` and `PatchTexelFetch` for SNORM texture-buffer fetches.
+- Implement env-backed `TryGetConstant` for dynamic `BitwiseAnd32` cbuf masks.
+- Port frontend lowering to emit upstream `BoundImage*` and `BindlessImage*` opcodes directly, instead of the current normalized `Image*` subset.
+- Add backend emission for image atomics and the full sampled/image operation set; current GLSL emission still only has a real simple `ImageSampleImplicitLod` path.
+
+### Binary layout verification
+- N/A: shader IR opcodes and descriptor metadata only; no guest-visible raw struct or serialized payload layout changed.
+
+## 2026-05-15 — `video_core/src/renderer_opengl/mod.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/renderer_opengl.cpp`
+
+### Intentional differences
+- Added env-gated diagnostic `RUZU_TRACE_PRESENT_READBACK` after `blit_screen.draw_screen` and before `SwapBuffers`. This is local instrumentation only; it reads a 64x64 RGBA sample from the default framebuffer and logs RGB/alpha nonzero counts plus checksum.
+- The diagnostic preserves GL pixel-pack state (`PIXEL_PACK_BUFFER`, `PACK_ALIGNMENT`, `PACK_ROW_LENGTH`) before returning to the upstream presentation sequence.
+
+### Unintentional differences (to fix)
+- None introduced intentionally; this is not a behavioral port change.
+
+### Missing items
+- Remove or keep gated as diagnostic once the MK8D black/blank presentation issue is resolved.
+
+### Binary layout verification
+- N/A: host-side OpenGL diagnostic only; no guest-visible raw struct or serialized payload layout changed.
+
+## 2026-05-15 — `video_core/src/renderer_opengl/mod.rs` and `video_core/src/renderer_opengl/present/window_adapt_pass.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/renderer_opengl.cpp`, `gl_blit_screen.cpp`, and `present/window_adapt_pass.cpp`
+
+### Intentional differences
+- Env-gated `RUZU_TRACE_PRESENT_READBACK` and `RUZU_TRACE_RT_READBACK` diagnostics are local instrumentation only. They preserve GL pixel-pack/framebuffer state and are disabled by default.
+- `RUZU_TRACE_RT_READBACK` samples five small regions of the current draw framebuffer instead of a single origin block. Upstream has no equivalent diagnostic; this was added only to distinguish empty render targets from a bad sample location.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `RendererOpenGL` initialized `framebuffer_layout` with `FramebufferLayout::default()`, leaving `layout.screen` as `{0,0,0,0}`. Upstream initializes through `RendererBase::UpdateCurrentFramebufferLayout()` / `Layout::DefaultFrameLayout(width,height)`, giving the present quad a real screen rectangle. Rust now initializes with `default_frame_layout(ScreenUndocked::WIDTH, ScreenUndocked::HEIGHT)`.
+- Fixed in this pass: `WindowAdaptPass::DrawToFramebuffer` cleared the default framebuffer to a hardcoded cornflower-blue color. Upstream reads `Settings::values.bg_red/bg_green/bg_blue`; Rust now reads `common::settings::values()` before `glClearColor`.
+- Fixed in this pass: present attribute/uniform locations used raw literals in `window_adapt_pass.rs`. Rust now uses the owner constants from `present_uniforms.rs`, matching upstream's `PositionLocation`, `TexCoordLocation`, and `ModelViewMatrixLocation` ownership.
+- Fixed in this pass: Rust present used `glUseProgram(self.program)` while a guest program pipeline could remain bound. Upstream uses `ProgramManager::BindPresentPrograms`, which binds the present shader stages through the pipeline manager. Rust now saves the current monolithic program and program-pipeline binding, binds pipeline 0 for the monolithic present program, then restores both after drawing.
+
+### Missing items
+- `BlitScreen::CreateWindowAdapt` still hardcodes bilinear instead of reading the upstream `PresentFilters::get_scaling_filter()` path.
+- `RendererOpenGL` still owns a local framebuffer layout instead of reading it from the frontend window object like upstream `render_window.GetFramebufferLayout()`.
+- The present pass still lacks upstream `ProgramManager::BindPresentPrograms`/`RestoreGuestPipeline` ownership; Rust uses a monolithic GL program with explicit pipeline unbind/restore as an interim parity bridge.
+
+### Binary layout verification
+- N/A: renderer presentation state and host GL diagnostics only; no guest-visible raw struct or serialized payload layout changed.
+
+## 2026-05-15 — `video_core/src/renderer_opengl/mod.rs` and `video_core/src/renderer_opengl/gl_rasterizer.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/renderer_opengl.cpp` and `/home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_rasterizer.cpp`
+
+### Intentional differences
+- `RendererOpenGL::composite_impl` now calls `state_tracker.notify_framebuffer()` immediately before the upstream-owned `state_tracker.BindFramebuffer(0)` equivalent. Upstream does not need this because render-target framebuffer binds are mediated by its state tracker; the Rust port still has direct GL framebuffer binds in helper paths, so this preserves the upstream effect that presentation really targets the window framebuffer.
+- Expanded the env-gated `RUZU_DUMP_PRESENT_TEXTURE` diagnostic to log texture internal format, immutable-level state, base/max level, sampler-relevant texture parameters, texture-view range, and swizzle. Upstream has no equivalent diagnostic; it is disabled by default and only supports the current MK8D presentation-sampling investigation.
+
+### Unintentional differences (to fix)
+- None introduced intentionally in normal execution. The framebuffer invalidation is a temporary bridge until remaining direct framebuffer binds are moved behind the upstream-equivalent state-tracker ownership.
+
+### Missing items
+- Remove the explicit pre-present invalidation once all render-target and presentation helper paths update/bind framebuffer state through the same owner as upstream.
+- Remove or keep strictly diagnostic-gated `RUZU_DUMP_PRESENT_TEXTURE` once presentation texture sampling is fixed.
+
+### Binary layout verification
+- N/A: host OpenGL state and diagnostics only; no guest-visible raw struct or serialized payload layout changed.
+
+## 2026-05-15 — `video_core/src/gpu.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/gpu.cpp`
+
+### Intentional differences
+- Rust uses an `Arc<AtomicUsize>` countdown per composite request instead of upstream's `request_swap_counters`/`free_swap_counters` deque. This preserves the upstream behavior that `renderer->Composite(layers)` runs only after every submitted `NvFence` reaches its syncpoint target, while avoiding a long-lived index arena for this localized callback lifetime.
+- Rust filters negative fence IDs before registration. Upstream receives a vector of valid `NvFence` objects from callers; this guard prevents an invalid sentinel from being cast to a huge syncpoint ID if one leaks through the Rust trait boundary.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `GpuCoreInterface::request_composite` ignored its `fences` argument and called `renderer.composite` immediately. Upstream `GPU::Impl::RequestComposite` registers guest/host syncpoint actions and defers presentation until all fences are signalled. The immediate Rust path let nvnflinger present preallocated MK8D swapchain slots before the GPU rendered into them, producing alternating black buffers.
+
+### Missing items
+- Port the exact upstream `request_swap_counters`/`free_swap_counters` storage if future review requires identical long-lived request-counter ownership instead of the current per-request `Arc<AtomicUsize>` countdown.
+- Add a focused unit test with two fences proving that composite runs exactly once after the second syncpoint callback.
+
+### Binary layout verification
+- N/A: GPU scheduling/callback logic only; no guest-visible raw struct or serialized payload layout changed.
+
+## 2026-05-15 — `video_core/src/renderer_opengl/gl_texture_cache.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/texture_cache.h`
+
+### Intentional differences
+- None added in this pass.
+
+### Unintentional differences (to fix)
+- `OpenGLTextureCache::unmap_memory` (gl_texture_cache.rs:1631) blanket-clears `self.framebuffers`, `self.image_views`, and `self.images` on every call. Upstream `TextureCache<P>::UnmapMemory` (texture_cache.h:599) walks only the images whose CPU region overlaps the unmapped range and unregisters/deletes just those. The current code would nuke every backend GL texture (and immediately recreate them as fresh zero storage) for any unmap. It does not actually trigger today — `MemoryManager::unmap` in `video_core/src/memory_manager.rs:411` deliberately skips the `rasterizer->UnmapMemory` propagation pending a real RasterizerInterface wiring — but the latent bug must be fixed alongside that wiring.
+- Open question for the MK8D presentation work: the slot-1 / slot-2 swapchain images (cpu=0xA6C000, 0x12DC000) sample as fully zero at present time. With instrumentation that reads both the FBO color attachment via `glReadPixels` AND the underlying `glGetTextureSubImage` on the attached texture, both consistently return zeros immediately after the slot-1/2 draw — i.e. the draw itself is writing zero pixels, not a wipe between draw and present. Pipeline, viewport, scissor, color-mask, vertex/index data, and shader programs all match slot 0's setup per DRAW_SUMMARY. The remaining suspect is either an upstream-bound sampled texture differing between the slot-0 and slot-1 draws (most likely the offscreen RT at cpu=0x71DD000) or MK8D intentionally rendering zero into those slots while it is stuck on the kernel cv `0x7F2C0BCC` wedge documented in MEMORY.md.
+
+### Missing items
+- Port `TextureCache<P>::UnmapMemory` faithfully (collect overlapping image_ids, untrack, unregister, delete) rather than the current blanket clear, then wire `rasterizer->UnmapMemory` from `MemoryManager::unmap`.
+- Add a per-image storage-change trace (handle change, `gl::DeleteTextures`, upload events) so the gray→zero transition for slots 1/2 can be pinpointed.
+
+### Binary layout verification
+- N/A: host GL backend state only; no guest-visible raw struct or serialized payload layout changed.
+
+## 2026-05-15 — `video_core/src/renderer_opengl/gl_state_tracker.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_state_tracker.h`
+
+### Intentional differences
+- `NotifyFramebuffer()` now also invalidates the cached framebuffer handle by setting it to `GLuint::MAX`. Upstream only dirties `VideoCommon::Dirty::RenderTargets` because upstream render-target binds are consistently mediated by the state tracker; ruzu still has several direct `glBindFramebuffer` calls in rasterizer/present helper code that can make the cached handle stale.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: presentation called `state_tracker.bind_framebuffer(0)`, but the cache already contained `0`, so no real `glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0)` happened after draw code had directly bound a render-target FBO. As a result, the present pass cleared/drew into the previous RT while the SDL default framebuffer stayed at its background color.
+
+### Missing items
+- Replace remaining direct OpenGL framebuffer binds in rasterizer/present helper paths with state-tracker-mediated ownership where upstream does so, then remove the cache-sentinel workaround from `NotifyFramebuffer()`.
+
+### Binary layout verification
+- N/A: host GL state tracking only; no guest-visible raw struct or serialized payload layout changed.
+
+## 2026-05-15 — `shader_recompiler/src/backend/glsl/mod.rs`, `shader_recompiler/src/backend/glsl/glsl_emit_context.rs`, `video_core/src/renderer_opengl/gl_graphics_pipeline.rs`, `video_core/src/renderer_opengl/gl_rasterizer.rs`, `video_core/src/renderer_opengl/gl_texture_cache.rs`, `video_core/src/renderer_opengl/gl_buffer_cache.rs`, and `video_core/src/buffer_cache/buffer_cache.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/shader_recompiler/backend/glsl/glsl_emit_context.cpp`, `/home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_graphics_pipeline.cpp`, `/home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/texture_cache.h`, `/home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_texture_cache.cpp`, `/home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_buffer_cache.h`, and `/home/vricosti/Dev/emulators/zuyu/src/video_core/buffer_cache/buffer_cache.h`
+
+### Intentional differences
+- `RUZU_DUMP_BOUND_TEXTURES`, `RUZU_TRACE_TEXTURE_UPLOAD`, expanded `RUZU_DUMP_GL_UBO_BIND`, `RUZU_TRACE_DRAW_SUMMARY`, and `RUZU_FRAGMENT_DEBUG` output overrides are env-gated diagnostics only. The texture dump now reads a complete `RGBA8` image when the allocation is reasonably bounded, because `glGetTextureImage` rejects undersized buffers.
+- `RUZU_FORCE_NO_MIP_SAMPLERS` is an env-gated diagnostic override that maps sampler minification to `TextureMipmapFilter::None`. It is used only to test whether black sampling comes from missing/uninitialized mip levels.
+- `RUZU_DISABLE_SAMPLER_BIND` is an env-gated diagnostic override that binds texture handles with null sampler objects to test whether sampler-object state is causing black samples.
+- OpenGL fast mapped uniform-buffer upload falls back to the classic cached path when `Runtime::BindMappedUniformBuffer` returns `None`. Upstream has a real stream-buffer span and copies into it; ruzu does not yet have that backing storage, so fallback is slower but prevents shaders from reading an unpopulated fast UBO.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: GLSL setup declared images/textures before constant buffers. Upstream calls `DefineConstantBuffers`, `DefineConstantBufferIndirect`, `DefineStorageBuffers`, then `SetupImages` and `SetupTextures`; Rust now at least preserves the constant-buffer-before-image/texture binding order so shared `Bindings` counters match this part of upstream.
+- Fixed in this pass: GLSL emitted only regular sampled textures and hardcoded `sampler2D`. Rust now emits texture-buffer descriptors before texture descriptors, image-buffer descriptors before image descriptors, and uses upstream-style sampler/image type strings and binding-index variable names.
+- Fixed in this pass: `Color2DRect` sampler declarations used `sampler2DRect`/`sampler2DRectShadow`; upstream maps `Color2DRect` through the normal 2D sampler path for GLSL backend declarations.
+- Fixed in this pass: `GraphicsPipeline::apply_shader_infos` did not count `texture_buffer_descriptors` or `image_buffer_descriptors`, so descriptor binding reservation could not match upstream `NumDescriptors` accounting.
+- Fixed in this pass: rasterizer descriptor binding consumed texture/image-buffer descriptors without reserving GL texture/image units for them. Rust now advances the same binding counters for buffer descriptors before regular texture/image descriptors.
+- Fixed in this pass: OpenGL texture uploads omitted upstream `TextureCacheRuntime::InsertUploadMemoryBarrier()` after upload. Rust now issues `glMemoryBarrier(GL_TEXTURE_FETCH_BARRIER_BIT | GL_SHADER_IMAGE_ACCESS_BARRIER_BIT)`.
+- Fixed in this pass: `Sampler::from_tsc_entry` passed raw `0` as the mag-filter mipmap mode. Upstream calls `TextureFilterMode(config.mag_filter, TextureMipmapFilter::None)`, and `None == 1`, so Rust now passes `1`.
+- Fixed in this pass: `BindHostGraphicsUniformBuffer` marked a small UBO as fast-bound and returned even when OpenGL `BindMappedUniformBuffer` returned no mapped span. Rust now falls through to the cached buffer path unless fast storage was actually bound and populated.
+
+### Missing items
+- `DefineConstantBufferIndirect`, `DefineStorageBuffers`, `DefineHelperFunctions`, and `DefineConstants` are still not fully ordered/owned like upstream GLSL emit context.
+- Port OpenGL stream-buffer backed `BindMappedUniformBuffer` instead of relying on the cached fallback for non-fast-buffer-subdata drivers.
+- Move texture/image-buffer descriptor binding ownership back into upstream-corresponding `GraphicsPipeline::ConfigureImpl`/`prepare_stage` structure once the Rust backend types can mirror C++ templates more closely.
+- Complete GLSL image operation emission, texture-buffer fetch patching, SNORM workaround, bindless/dynamic descriptor handling, and descriptor-array indexing.
+- Remove or keep strictly diagnostic-gated `RUZU_FRAGMENT_DEBUG` once MK8D's zero-fragment-output path is isolated.
+
+### Binary layout verification
+- N/A: shader GLSL text, host GL binding state, host texture upload barriers, and host buffer-cache upload paths only; no guest-visible raw struct or serialized payload layout changed.
+
+## 2026-05-15 — `shader_recompiler/src/backend/glsl/emit_glsl.rs` and `shader_recompiler/src/backend/glsl/emit_glsl_special.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/shader_recompiler/backend/glsl/emit_glsl_special.cpp`
+
+### Intentional differences
+- Rust still has a minimal phi/reference implementation in this file. This pass only ports upstream `EmitPrologue` output-varying initialization and the same reinitialization after `EmitVertex`.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: Rust ignored `Opcode::Prologue`, while upstream `EmitPrologue` calls `InitializeOutputVaryings`. Rust now initializes `gl_Position` for VertexB/Geometry and initializes every declared generic output to upstream defaults (`vec4(0,0,0,1)` for the current full-vec4 output representation).
+- Fixed in this pass: Rust `EmitVertex` did not reinitialize output varyings after emitting a geometry vertex. It now mirrors upstream's `EmitEmitVertex` ordering at the current single-stream level.
+
+### Missing items
+- Full upstream `EmitPhi`, `EmitReference`, and `EmitPhiMove` behavior remains incomplete in Rust.
+- `EmitEmitVertex`/`EmitEndPrimitive` still do not consume the upstream stream argument; current Rust signature emits the no-argument GLSL form.
+- `DefineGenericOutput` still uses full `vec4` declarations only; upstream can split outputs by component and transform-feedback metadata.
+
+### Binary layout verification
+- N/A: GLSL text emission only; no guest-visible raw struct or serialized payload layout changed.

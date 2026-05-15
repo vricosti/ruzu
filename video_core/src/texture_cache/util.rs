@@ -726,6 +726,13 @@ pub fn is_valid_entry(
     gpu_memory: &dyn super::descriptor_table::GpuMemoryReader,
     config: &crate::textures::texture::TicEntry,
 ) -> bool {
+    is_valid_entry_with_addr_valid(config, |address| gpu_memory.addr_valid(address))
+}
+
+pub fn is_valid_entry_with_addr_valid(
+    config: &crate::textures::texture::TicEntry,
+    mut addr_valid: impl FnMut(GPUVAddr) -> bool,
+) -> bool {
     let address = config.address();
     if address == 0 {
         return false;
@@ -733,7 +740,7 @@ pub fn is_valid_entry(
     if address >= 1u64 << 40 {
         return false;
     }
-    if gpu_memory.addr_valid(address) {
+    if addr_valid(address) {
         return true;
     }
     // Upstream: second has_value with explicit size. Compute the size so
@@ -741,25 +748,60 @@ pub fn is_valid_entry(
     // lands, the check itself collapses to the same single-page validation.
     let info = super::image_info::ImageInfo::from_tic_entry(config);
     let _guest_size_bytes = calculate_guest_size_in_bytes(&info);
-    gpu_memory.addr_valid(address)
+    addr_valid(address)
 }
 
 // ── Swizzle / unswizzle ────────────────────────────────────────────────
 
 /// Port of `UnswizzleImage`.
 ///
-/// Upstream reads swizzled texture data from GPU memory via `Tegra::MemoryManager`
-/// and writes the unswizzled result.  The memory manager is not yet ported;
-/// returns an empty copy list and logs a warning.
+/// Converts guest texture memory into the linear upload buffer consumed by the
+/// backend `Image::UploadMemory` path and returns the matching
+/// `BufferImageCopy` list. The caller owns the GPU-memory read; `input` starts
+/// at `gpu_addr` and contains the image's guest-layout bytes.
 pub fn unswizzle_image(
     _gpu_memory: &(),
     _gpu_addr: GPUVAddr,
-    _info: &ImageInfo,
-    _input: &[u8],
-    _output: &mut [u8],
+    info: &ImageInfo,
+    input: &[u8],
+    output: &mut [u8],
 ) -> Vec<BufferImageCopy> {
-    log::warn!("unswizzle_image: MemoryManager not yet ported — returning empty copy list");
-    Vec::new()
+    let copies = full_download_copies(info);
+    let bytes_per_block = surface::bytes_per_block(info.format);
+    if bytes_per_block == 0 {
+        return Vec::new();
+    }
+
+    if info.image_type == ImageType::Linear {
+        let copy_size = input.len().min(output.len());
+        output[..copy_size].copy_from_slice(&input[..copy_size]);
+        return copies;
+    }
+
+    let params = full_upload_swizzles(info);
+    let block = info.block();
+    for (copy, param) in copies.iter().zip(params.iter()) {
+        let dst_offset = copy.buffer_offset;
+        if dst_offset >= output.len() || param.buffer_offset >= input.len() {
+            continue;
+        }
+        let dst_size = copy.buffer_size.min(output.len() - dst_offset);
+        let src = &input[param.buffer_offset..];
+        let dst = &mut output[dst_offset..dst_offset + dst_size];
+        crate::textures::decoders::unswizzle_texture(
+            dst,
+            src,
+            bytes_per_block,
+            copy.image_extent.width,
+            copy.image_extent.height,
+            copy.image_extent.depth.max(1),
+            block.height,
+            block.depth,
+            calculate_level_stride_alignment(info, copy.image_subresource.base_level as u32),
+        );
+    }
+
+    copies
 }
 
 /// Port of `ConvertImage`.

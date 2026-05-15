@@ -3,7 +3,7 @@
 
 //! Port of zuyu/src/shader_recompiler/frontend/maxwell/translate/impl/floating_point_multiply.cpp
 
-use super::{bit, field, TranslatorVisitor};
+use super::{bit, TranslatorVisitor};
 use crate::frontend::maxwell_opcodes::MaxwellOpcode;
 use crate::ir::value::Value;
 
@@ -12,12 +12,12 @@ pub fn fmul(tv: &mut TranslatorVisitor, insn: u64, opcode: MaxwellOpcode) {
     let src_a = tv.f(tv.src_a_reg(insn));
     let src_b = tv.decode_src_b_f32(insn, opcode);
 
-    let neg_a = bit(insn, 48);
+    let neg_b = bit(insn, 48);
     let sat = bit(insn, 50);
 
-    let a = if neg_a { tv.ir.fp_neg_32(src_a) } else { src_a };
+    let b = tv.ir.fp_abs_neg_32(src_b, false, neg_b);
 
-    let mut result = tv.ir.fp_mul_32(a, src_b);
+    let mut result = tv.ir.fp_mul_32(src_a, b);
 
     if sat {
         result = tv.ir.fp_saturate_32(result);
@@ -32,7 +32,11 @@ pub fn fmul32i(tv: &mut TranslatorVisitor, insn: u64) {
     let imm = tv.decode_imm32(insn);
     let src_b = Value::ImmF32(f32::from_bits(imm));
 
-    let result = tv.ir.fp_mul_32(src_a, src_b);
+    let mut result = tv.ir.fp_mul_32(src_a, src_b);
+
+    if bit(insn, 55) {
+        result = tv.ir.fp_saturate_32(result);
+    }
 
     tv.set_f(dst, result);
 }

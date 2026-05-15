@@ -101,12 +101,27 @@ impl<T: Copy + PartialEq + Default> DescriptorTable<T> {
     /// so a transient unmapped page does not poison the cache with a
     /// `Default::default()` value.
     pub fn read(&mut self, gpu_memory: &dyn GpuMemoryReader, index: u32) -> (T, bool) {
+        self.read_with(index, |descriptor_addr, output| {
+            gpu_memory.read_block(descriptor_addr, output)
+        })
+    }
+
+    /// Read a descriptor through a caller-provided GPU-VA reader.
+    ///
+    /// Same ownership as upstream `DescriptorTable::Read`; this overload exists
+    /// because some ruzu call sites have direct access to the channel
+    /// `MemoryManager` rather than the backend-independent SMMU reader.
+    pub fn read_with(
+        &mut self,
+        index: u32,
+        mut read_block: impl FnMut(GPUVAddr, &mut [u8]) -> bool,
+    ) -> (T, bool) {
         debug_assert!(index <= self.current_limit);
         let item_size = std::mem::size_of::<T>();
         let descriptor_addr = self.current_gpu_addr + (index as u64) * (item_size as u64);
 
         let mut buf = vec![0u8; item_size];
-        let descriptor = if gpu_memory.read_block(descriptor_addr, &mut buf) {
+        let descriptor = if read_block(descriptor_addr, &mut buf) {
             // SAFETY: `T` is bounded by `Copy + PartialEq + Default`. The
             // descriptor table is only instantiated with `TicEntry` /
             // `TscEntry`, both `#[repr(C)]` `[u64; 4]` wrappers with no

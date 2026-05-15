@@ -22,16 +22,16 @@ pub fn texs(tv: &mut TranslatorVisitor, insn: u64) {
     let dst1 = tv.dst_reg(insn);
     let dst2 = field(insn, 28, 8);
     let src_reg = tv.src_a_reg(insn);
-    let tex_index = field(insn, 36, 13);
+    let cbuf_offset = field(insn, 36, 13) * 4;
 
     let info = TextureInstInfo {
-        descriptor_index: tex_index as u16,
+        descriptor_index: cbuf_offset as u16,
         texture_type: 1, // 2D
         ..Default::default()
     };
 
     tv.ir.program.info.register_texture(
-        tex_index,
+        cbuf_offset,
         crate::shader_info::TextureType::ColorArray1D,
         false,
     );
@@ -39,7 +39,7 @@ pub fn texs(tv: &mut TranslatorVisitor, insn: u64) {
     let coord_x = tv.f(src_reg);
     let coord_y = tv.f(src_reg + 1);
     let coords = tv.ir.composite_construct_f32x2(coord_x, coord_y);
-    let handle = Value::ImmU32(tex_index);
+    let handle = Value::ImmU32(cbuf_offset);
 
     let result = tv
         .ir

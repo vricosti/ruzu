@@ -212,17 +212,13 @@ impl<'a> TranslatorVisitor<'a> {
                 self.ir.program.info.register_cbuf(cb_index);
                 self.ir.get_cbuf_f32(binding, offset)
             }
-            SrcType::Immediate => {
-                let imm_bits = field(insn, 20, 19) << 13;
-                let f = f32::from_bits(imm_bits);
-                Value::ImmF32(f)
-            }
+            SrcType::Immediate => self.get_float_imm20(insn),
         }
     }
 
     /// Decode the 32-bit immediate for 32I-type instructions.
     pub fn decode_imm32(&self, insn: u64) -> u32 {
-        (insn & 0xFFFFFFFF) as u32
+        field(insn, 20, 32)
     }
 
     /// Decode the destination register index from bits [7:0].

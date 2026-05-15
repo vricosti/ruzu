@@ -61,6 +61,55 @@ pub fn emit_glsl(
     {
         return format!("{}frag_color0=vec4(1.0,0.0,0.0,1.0);return;}}\n", header);
     }
+    if let Ok(mode) = std::env::var("RUZU_FRAGMENT_DEBUG") {
+        if program.stage == ir::types::ShaderStage::Fragment {
+            match mode.as_str() {
+                "attr1" if program.info.loads.generic_any(1) => {
+                    return format!("{}frag_color0=abs(in_attr1);return;}}\n", header);
+                }
+                "attr2" if program.info.loads.generic_any(2) => {
+                    return format!("{}frag_color0=abs(in_attr2);return;}}\n", header);
+                }
+                "tex0_attr1" if !ctx.textures.is_empty() && program.info.loads.generic_any(1) => {
+                    return format!(
+                        "{}frag_color0=texture(tex{},in_attr1.xy);return;}}\n",
+                        header, ctx.textures[0].binding
+                    );
+                }
+                "tex0_attr2" if !ctx.textures.is_empty() && program.info.loads.generic_any(2) => {
+                    return format!(
+                        "{}frag_color0=texture(tex{},in_attr2.xy);return;}}\n",
+                        header, ctx.textures[0].binding
+                    );
+                }
+                "tex1_attr2" if ctx.textures.len() > 1 && program.info.loads.generic_any(2) => {
+                    return format!(
+                        "{}frag_color0=texture(tex{},in_attr2.xy);return;}}\n",
+                        header, ctx.textures[1].binding
+                    );
+                }
+                "tex0_zero" => {
+                    if let Some(texture) = ctx.textures.first() {
+                        return format!(
+                            "{}frag_color0=texture(tex{},vec2(0.0,0.0));return;}}\n",
+                            header, texture.binding
+                        );
+                    }
+                    return format!("{}frag_color0=vec4(0.0,1.0,0.0,1.0);return;}}\n", header);
+                }
+                "tex0_fetch0" => {
+                    if let Some(texture) = ctx.textures.first() {
+                        return format!(
+                            "{}frag_color0=texelFetch(tex{},ivec2(0,0),0);return;}}\n",
+                            header, texture.binding
+                        );
+                    }
+                    return format!("{}frag_color0=vec4(0.0,1.0,0.0,1.0);return;}}\n", header);
+                }
+                _ => {}
+            }
+        }
+    }
     if std::env::var_os("RUZU_FORCE_VERTEX_TRIANGLE").is_some()
         && matches!(
             program.stage,

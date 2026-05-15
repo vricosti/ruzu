@@ -20,21 +20,21 @@ use crate::ir::value::Value;
 pub fn txq(tv: &mut TranslatorVisitor, insn: u64, _opcode: MaxwellOpcode) {
     let dst = tv.dst_reg(insn);
     let src_reg = tv.src_a_reg(insn);
-    let tex_index = field(insn, 36, 13);
+    let cbuf_offset = field(insn, 36, 13) * 4;
 
     let info = TextureInstInfo {
-        descriptor_index: tex_index as u16,
+        descriptor_index: cbuf_offset as u16,
         ..Default::default()
     };
 
     tv.ir.program.info.register_texture(
-        tex_index,
+        cbuf_offset,
         crate::shader_info::TextureType::ColorArray1D,
         false,
     );
 
     let lod = tv.x(src_reg);
-    let handle = Value::ImmU32(tex_index);
+    let handle = Value::ImmU32(cbuf_offset);
 
     let result = tv.ir.image_query_dimensions(handle, lod, info.to_u32());
 

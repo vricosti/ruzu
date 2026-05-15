@@ -10,6 +10,7 @@ use crate::backend::bindings::Bindings;
 use crate::ir;
 use crate::profile::Profile;
 use crate::runtime_info::RuntimeInfo;
+use crate::shader_info::{ImageFormat, TextureType};
 use crate::stage::Stage;
 
 use super::var_alloc::{glsl_type_str, GlslVarType, VarAlloc};
@@ -48,6 +49,65 @@ pub struct EmitContext<'a> {
     pub uses_y_direction: bool,
     pub uses_cc_carry: bool,
     pub uses_geometry_passthrough: bool,
+}
+
+fn sampler_type(texture_type: TextureType, is_depth: bool, is_multisample: bool) -> &'static str {
+    match (texture_type, is_depth, is_multisample) {
+        (TextureType::Color1D, false, _) => "sampler1D",
+        (TextureType::ColorArray1D, false, _) => "sampler1DArray",
+        (TextureType::Color2D, false, false) => "sampler2D",
+        (TextureType::Color2D, false, true) => "sampler2DMS",
+        (TextureType::ColorArray2D, false, false) => "sampler2DArray",
+        (TextureType::ColorArray2D, false, true) => "sampler2DMSArray",
+        (TextureType::Color3D, false, _) => "sampler3D",
+        (TextureType::ColorCube, false, _) => "samplerCube",
+        (TextureType::ColorArrayCube, false, _) => "samplerCubeArray",
+        (TextureType::Buffer, false, _) => "samplerBuffer",
+        (TextureType::Color2DRect, false, _) => "sampler2D",
+        (TextureType::Color1D, true, _) => "sampler1DShadow",
+        (TextureType::ColorArray1D, true, _) => "sampler1DArrayShadow",
+        (TextureType::Color2D, true, _) => "sampler2DShadow",
+        (TextureType::ColorArray2D, true, _) => "sampler2DArrayShadow",
+        (TextureType::ColorCube, true, _) => "samplerCubeShadow",
+        (TextureType::ColorArrayCube, true, _) => "samplerCubeArrayShadow",
+        (TextureType::Color2DRect, true, _) => "sampler2DShadow",
+        _ => "sampler2D",
+    }
+}
+
+fn image_type(texture_type: TextureType) -> &'static str {
+    match texture_type {
+        TextureType::Color1D => "uimage1D",
+        TextureType::ColorArray1D => "uimage1DArray",
+        TextureType::Color2D => "uimage2D",
+        TextureType::ColorArray2D => "uimage2DArray",
+        TextureType::Color3D => "uimage3D",
+        TextureType::ColorCube => "uimageCube",
+        TextureType::ColorArrayCube => "uimageCubeArray",
+        TextureType::Buffer => "uimageBuffer",
+        TextureType::Color2DRect => "uimage2DRect",
+    }
+}
+
+fn image_format_string(format: ImageFormat) -> &'static str {
+    match format {
+        ImageFormat::Typeless => "",
+        ImageFormat::R8Uint => ",r8ui",
+        ImageFormat::R8Sint => ",r8i",
+        ImageFormat::R16Uint => ",r16ui",
+        ImageFormat::R16Sint => ",r16i",
+        ImageFormat::R32Uint => ",r32ui",
+        ImageFormat::R32G32Uint => ",rg32ui",
+        ImageFormat::R32G32B32A32Uint => ",rgba32ui",
+    }
+}
+
+fn image_access_qualifier(is_written: bool, is_read: bool) -> &'static str {
+    match (is_written, is_read) {
+        (true, false) => "writeonly ",
+        (false, true) => "readonly ",
+        _ => "",
+    }
 }
 
 impl<'a> EmitContext<'a> {
@@ -105,29 +165,107 @@ impl<'a> EmitContext<'a> {
             }
         }
 
-        // Set up texture bindings
-        // Note: upstream has texture_buffer_descriptors, image_buffer_descriptors, and
-        // image_descriptors on ShaderInfo, but those are not yet ported.
-        // For now we bind texture_descriptors with one binding each.
-        for _desc in &program.info.texture_descriptors {
-            ctx.textures.push(TextureImageDefinition {
-                binding: bindings.texture,
-                count: 1,
-            });
-            ctx.header.push_str(&format!(
-                "layout(binding={})uniform sampler2D {}_tex{};\n",
-                bindings.texture, ctx.stage_name, _desc.cbuf_index
-            ));
-            bindings.texture += 1;
-        }
-
         ctx.define_generic_inputs(program);
         ctx.define_generic_outputs(program);
         ctx.define_fragment_outputs(program);
         ctx.define_constant_buffers(bindings, program);
+        ctx.setup_images(bindings, program);
+        ctx.setup_textures(bindings, program);
         ctx.define_helper_functions();
 
         ctx
+    }
+
+    fn setup_textures(&mut self, bindings: &mut Bindings, program: &ir::Program) {
+        for desc in &program.info.texture_buffer_descriptors {
+            let binding = bindings.texture;
+            self.texture_buffers.push(TextureImageDefinition {
+                binding,
+                count: desc.count,
+            });
+            let array_decorator = if desc.count > 1 {
+                format!("[{}]", desc.count)
+            } else {
+                String::new()
+            };
+            self.header.push_str(&format!(
+                "layout(binding={}) uniform samplerBuffer tex{}{};\n",
+                binding, binding, array_decorator
+            ));
+            bindings.texture += desc.count;
+        }
+
+        // Upstream names sampler variables by their assigned GLSL binding
+        // (`tex{binding}`), not by the source TIC cbuf index. TexturePass
+        // compacts source descriptors before GLSL emission, so using cbuf_index
+        // here creates duplicate declarations and undeclared compact operands.
+        for desc in &program.info.texture_descriptors {
+            let binding = bindings.texture;
+            self.textures.push(TextureImageDefinition {
+                binding,
+                count: desc.count,
+            });
+            let array_decorator = if desc.count > 1 {
+                format!("[{}]", desc.count)
+            } else {
+                String::new()
+            };
+            self.header.push_str(&format!(
+                "layout(binding={}) uniform {} tex{}{};\n",
+                binding,
+                sampler_type(desc.texture_type, desc.is_depth, desc.is_multisample),
+                binding,
+                array_decorator
+            ));
+            bindings.texture += desc.count;
+        }
+    }
+
+    fn setup_images(&mut self, bindings: &mut Bindings, program: &ir::Program) {
+        for desc in &program.info.image_buffer_descriptors {
+            let binding = bindings.image;
+            self.image_buffers.push(TextureImageDefinition {
+                binding,
+                count: desc.count,
+            });
+            let array_decorator = if desc.count > 1 {
+                format!("[{}]", desc.count)
+            } else {
+                String::new()
+            };
+            self.header.push_str(&format!(
+                "layout(binding={}{}) uniform {}uimageBuffer img{}{};\n",
+                binding,
+                image_format_string(desc.format),
+                image_access_qualifier(desc.is_written, desc.is_read),
+                binding,
+                array_decorator
+            ));
+            bindings.image += desc.count;
+        }
+
+        for desc in &program.info.image_descriptors {
+            let binding = bindings.image;
+            self.images.push(TextureImageDefinition {
+                binding,
+                count: desc.count,
+            });
+            let array_decorator = if desc.count > 1 {
+                format!("[{}]", desc.count)
+            } else {
+                String::new()
+            };
+            self.header.push_str(&format!(
+                "layout(binding={}{})uniform {}{} img{}{};\n",
+                binding,
+                image_format_string(desc.format),
+                image_access_qualifier(desc.is_written, desc.is_read),
+                image_type(desc.texture_type),
+                binding,
+                array_decorator
+            ));
+            bindings.image += desc.count;
+        }
     }
 
     /// Append a line of GLSL code.

@@ -125,23 +125,25 @@ pub fn collect_shader_info_pass(program: &mut Program) {
         .map(|index| CbufDescriptor { index, count: 1 })
         .collect();
 
-    program.info.texture_descriptors = tex_set
-        .into_iter()
-        .map(|index| TexDescriptor {
-            cbuf_index: index,
-            texture_type: crate::shader_info::TextureType::Color2D,
-            is_depth: false,
-            is_multisample: false,
-            has_secondary: false,
-            cbuf_offset: 0,
-            shift_left: 0,
-            secondary_cbuf_index: 0,
-            secondary_cbuf_offset: 0,
-            secondary_shift_left: 0,
-            count: 1,
-            size_shift: 0,
-        })
-        .collect();
+    if program.info.texture_descriptors.is_empty() {
+        program.info.texture_descriptors = tex_set
+            .into_iter()
+            .map(|index| TexDescriptor {
+                cbuf_index: index,
+                texture_type: crate::shader_info::TextureType::Color2D,
+                is_depth: false,
+                is_multisample: false,
+                has_secondary: false,
+                cbuf_offset: 0,
+                shift_left: 0,
+                secondary_cbuf_index: 0,
+                secondary_cbuf_offset: 0,
+                secondary_shift_left: 0,
+                count: 1,
+                size_shift: 0,
+            })
+            .collect();
+    }
 
     if uses_local_memory {
         program.info.uses_local_memory = true;

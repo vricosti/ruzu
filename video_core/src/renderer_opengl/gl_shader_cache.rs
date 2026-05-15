@@ -14,11 +14,13 @@ use shader_recompiler::runtime_info::{InputTopology, RuntimeInfo, TessPrimitive,
 use shader_recompiler::shader_info::Info as ShaderInfo;
 use shader_recompiler::{
     compile_dual_vertex_shader_glsl_at_offset_with_bindings,
-    compile_shader_glsl_at_offset_with_bindings, CompiledGlslShader, ShaderStage,
+    compile_shader_glsl_at_offset_with_bindings,
+    compile_shader_glsl_at_offset_with_bindings_and_texture_bound, CompiledGlslShader, ShaderStage,
 };
 
 use crate::shader_cache::{GraphicsEnvironments, ShaderCache as SharedShaderCache};
 use crate::shader_environment::{GenericEnvironment, GpuMemoryReader};
+use shader_recompiler::environment::Environment as ShaderEnvironment;
 use shader_recompiler::program_header::ProgramHeader;
 
 use super::gl_compute_pipeline::{ComputePipeline, ComputePipelineKey};
@@ -431,10 +433,12 @@ impl ShaderCache {
 
                     let runtime_info =
                         Self::make_runtime_info(&self.graphics_key, stage, Some(&previous_info));
+                    let texture_bound_buffer = env.texture_bound_buffer();
                     let compiled = self.compile_stage_glsl_at_offset_with_runtime_info(
                         env.cached_instruction_slice(),
                         stage,
                         env.cached_instruction_start(),
+                        Some(texture_bound_buffer),
                         &runtime_info,
                         &mut bindings,
                     );
@@ -494,10 +498,12 @@ impl ShaderCache {
             // recompiler should consume.
             let runtime_info =
                 Self::make_runtime_info(&self.graphics_key, stage, previous_info.as_ref());
+            let texture_bound_buffer = env.texture_bound_buffer();
             let compiled = self.compile_stage_glsl_at_offset_with_runtime_info(
                 env.cached_instruction_slice(),
                 stage,
                 env.cached_instruction_start(),
+                Some(texture_bound_buffer),
                 &runtime_info,
                 &mut bindings,
             );
@@ -588,10 +594,12 @@ impl ShaderCache {
 
                 let runtime_info =
                     Self::make_runtime_info(&self.graphics_key, actual_stage, Some(&previous_info));
+                let texture_bound_buffer = env.texture_bound_buffer();
                 let compiled = self.compile_stage_glsl_at_offset_with_runtime_info(
                     env.cached_instruction_slice(),
                     actual_stage,
                     env.cached_instruction_start(),
+                    Some(texture_bound_buffer),
                     &runtime_info,
                     &mut bindings,
                 );
@@ -625,10 +633,12 @@ impl ShaderCache {
 
             let runtime_info =
                 Self::make_runtime_info(&self.graphics_key, actual_stage, previous_info.as_ref());
+            let texture_bound_buffer = env.texture_bound_buffer();
             let compiled = self.compile_stage_glsl_at_offset_with_runtime_info(
                 env.cached_instruction_slice(),
                 actual_stage,
                 env.cached_instruction_start(),
+                Some(texture_bound_buffer),
                 &runtime_info,
                 &mut bindings,
             );
@@ -722,6 +732,7 @@ impl ShaderCache {
             code,
             stage,
             base_offset,
+            None,
             &runtime_info,
             &mut bindings,
         )
@@ -732,18 +743,31 @@ impl ShaderCache {
         code: &[u64],
         stage: ShaderStage,
         base_offset: u32,
+        texture_bound_buffer: Option<u32>,
         runtime_info: &RuntimeInfo,
         bindings: &mut shader_recompiler::backend::bindings::Bindings,
     ) -> CompiledGlslShader {
         let profile = ShaderProfile::default();
-        compile_shader_glsl_at_offset_with_bindings(
-            code,
-            stage,
-            base_offset,
-            &profile,
-            runtime_info,
-            bindings,
-        )
+        if let Some(texture_bound_buffer) = texture_bound_buffer {
+            compile_shader_glsl_at_offset_with_bindings_and_texture_bound(
+                code,
+                stage,
+                base_offset,
+                texture_bound_buffer,
+                &profile,
+                runtime_info,
+                bindings,
+            )
+        } else {
+            compile_shader_glsl_at_offset_with_bindings(
+                code,
+                stage,
+                base_offset,
+                &profile,
+                runtime_info,
+                bindings,
+            )
+        }
     }
 
     /// Create a new compute pipeline.

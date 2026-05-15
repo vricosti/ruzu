@@ -291,6 +291,8 @@ impl GraphicsPipeline {
                 self.enabled_stages_mask |= 1u32 << stage;
                 self.enabled_uniform_buffer_masks[stage] = info.constant_buffer_mask;
                 self.uniform_buffer_sizes[stage].copy_from_slice(&info.constant_buffer_used_sizes);
+                self.num_texture_buffers[stage] = num_descriptors(&info.texture_buffer_descriptors);
+                self.num_image_buffers[stage] = num_descriptors(&info.image_buffer_descriptors);
             }
 
             if stage < NUM_STAGES - 1 {
@@ -401,6 +403,26 @@ impl GraphicsPipeline {
                 Ok(program) => {
                     self.source_programs[stage_index] = program;
                     self.enabled_stages_mask |= 1 << stage_index;
+                    if std::env::var_os("RUZU_TRACE_PIPELINE_BUILD").is_some() {
+                        let hash = city_hash64(source.as_bytes());
+                        log::info!(
+                            "[PIPELINE_BUILD] pipeline_key=0x{:016X} stage={} program={} source_hash=0x{:016X} source_bytes={}",
+                            self.key.hash_key(),
+                            stage_name(stage_index),
+                            program,
+                            hash,
+                            source.len()
+                        );
+                        if std::env::var_os("RUZU_TRACE_PIPELINE_BUILD_SOURCE").is_some() {
+                            eprintln!(
+                                "[PIPELINE_BUILD_SOURCE stage={} program={} hash=0x{:016X}]\n{}",
+                                stage_name(stage_index),
+                                program,
+                                hash,
+                                source
+                            );
+                        }
+                    }
                 }
                 Err(msg) => {
                     // Roll back any handles we already created.
@@ -537,6 +559,17 @@ fn stage_bit(stage_index: usize) -> u32 {
         3 => gl::GEOMETRY_SHADER_BIT,
         4 => gl::FRAGMENT_SHADER_BIT,
         _ => 0,
+    }
+}
+
+fn stage_name(stage_index: usize) -> &'static str {
+    match stage_index {
+        0 => "Vertex",
+        1 => "TessControl",
+        2 => "TessEval",
+        3 => "Geometry",
+        4 => "Fragment",
+        _ => "Unknown",
     }
 }
 

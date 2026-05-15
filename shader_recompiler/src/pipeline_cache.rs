@@ -318,6 +318,7 @@ pub fn compile_shader_glsl_at_offset(
         profile,
         runtime_info,
         &mut bindings,
+        None,
     )
 }
 
@@ -334,7 +335,38 @@ pub fn compile_shader_glsl_at_offset_with_bindings(
     runtime_info: &RuntimeInfo,
     bindings: &mut backend::bindings::Bindings,
 ) -> CompiledGlslShader {
-    emit_glsl_program_at_offset(code, stage, base_offset, profile, runtime_info, bindings)
+    emit_glsl_program_at_offset(
+        code,
+        stage,
+        base_offset,
+        profile,
+        runtime_info,
+        bindings,
+        None,
+    )
+}
+
+/// OpenGL graphics path variant that mirrors upstream's
+/// `TexturePass(env, program, host_info)` for currently ported bound
+/// texture instructions.
+pub fn compile_shader_glsl_at_offset_with_bindings_and_texture_bound(
+    code: &[u64],
+    stage: ShaderStage,
+    base_offset: u32,
+    texture_bound_buffer: u32,
+    profile: &Profile,
+    runtime_info: &RuntimeInfo,
+    bindings: &mut backend::bindings::Bindings,
+) -> CompiledGlslShader {
+    emit_glsl_program_at_offset(
+        code,
+        stage,
+        base_offset,
+        profile,
+        runtime_info,
+        bindings,
+        Some(texture_bound_buffer),
+    )
 }
 
 fn emit_glsl_program_at_offset(
@@ -344,6 +376,7 @@ fn emit_glsl_program_at_offset(
     profile: &Profile,
     runtime_info: &RuntimeInfo,
     bindings: &mut backend::bindings::Bindings,
+    texture_bound_buffer: Option<u32>,
 ) -> CompiledGlslShader {
     log::debug!(
         "Compiling {:?} shader to GLSL ({} instructions, base_offset=0x{:X})",
@@ -358,7 +391,11 @@ fn emit_glsl_program_at_offset(
     let cfg_blocks = control_flow::build_cfg(code);
     let mut program = translate_cfg_to_program(code, stage, base_offset, &cfg_blocks);
 
-    ir_opt::optimize(&mut program);
+    if let Some(texture_bound_buffer) = texture_bound_buffer {
+        ir_opt::optimize_with_bound_textures(&mut program, texture_bound_buffer);
+    } else {
+        ir_opt::optimize(&mut program);
+    }
 
     convert_legacy_to_generic(&mut program, runtime_info);
     let source = backend::glsl::emit_glsl(profile, runtime_info, &mut program, bindings);

@@ -7,6 +7,7 @@
 
 use crate::ir;
 use crate::ir::instruction::Inst;
+use crate::ir::types::TextureInstInfo;
 use crate::ir::value::InstRef;
 
 use super::glsl_emit_context::EmitContext;
@@ -22,21 +23,25 @@ pub fn emit_image_sample_implicit_lod_inst(
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    let texture_index = inst.args[0].imm_u32();
+    let info = TextureInstInfo::from_u32(inst.flags);
+    let descriptor_index = info.descriptor_index as usize;
+    let texture = ctx
+        .textures
+        .get(descriptor_index)
+        .map(|definition| format!("tex{}", definition.binding))
+        .unwrap_or_else(|| {
+            // Keep emission deterministic for partially-ported shaders; a
+            // missing descriptor will still fail GLSL compilation visibly.
+            format!("tex{}", inst.args[0].imm_u32())
+        });
     let coords = ctx.var_alloc.consume(program, &inst.args[1]);
     let dst = ctx
         .var_alloc
         .define(inst_mut(program, inst_ref), GlslVarType::F32x4);
     if ctx.stage == crate::stage::Stage::Fragment {
-        ctx.add_fmt(format!(
-            "{}=texture({}_tex{},{});",
-            dst, ctx.stage_name, texture_index, coords
-        ));
+        ctx.add_fmt(format!("{}=texture({},{});", dst, texture, coords));
     } else {
-        ctx.add_fmt(format!(
-            "{}=textureLod({}_tex{}, {}, 0.0);",
-            dst, ctx.stage_name, texture_index, coords
-        ));
+        ctx.add_fmt(format!("{}=textureLod({}, {}, 0.0);", dst, texture, coords));
     }
 }
 

@@ -1748,6 +1748,7 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
 
         if use_fast_buffer {
             // Upstream fast path: either BindMappedUniformBuffer or PushFastUniformBuffer.
+            let mut fast_buffer_bound = false;
             if P::IS_OPENGL {
                 if let Some(ref mut rt) = self.runtime {
                     if rt.has_fast_buffer_sub_data() {
@@ -1757,23 +1758,39 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
                             let mut buf = vec![0u8; size as usize];
                             dm.read_block_unsafe(device_addr, &mut buf);
                             rt.push_fast_uniform_buffer(stage, binding_index, &buf);
+                            fast_buffer_bound = true;
                         }
                     } else {
                         // Upstream: runtime.BindMappedUniformBuffer(stage, binding_index, size)
                         // then copies device memory into the mapped span.
-                        if let Some(mapped) =
-                            rt.bind_mapped_uniform_buffer(stage, binding_index, size)
-                        {
-                            let _ = mapped; // mapped span written by runtime
-                        }
+                        //
+                        // Ruzu's OpenGL runtime does not have the upstream
+                        // stream-buffer backing yet; the trait currently
+                        // returns None. Falling through to the cached path is
+                        // slower but preserves the required UBO contents.
+                        fast_buffer_bound = rt
+                            .bind_mapped_uniform_buffer(stage, binding_index, size)
+                            .is_some();
                     }
                 }
+                if !fast_buffer_bound {
+                    // No fast storage was actually bound/populated; use the
+                    // regular cached buffer path below.
+                } else {
+                    if let Some(ref mut cs) = self.channel_state {
+                        cs.fast_bound_uniform_buffers[stage] |= 1u32 << binding_index;
+                        cs.uniform_buffer_binding_sizes[stage][binding_index as usize] = size;
+                    }
+                    return;
+                }
+            }
+            if fast_buffer_bound {
                 if let Some(ref mut cs) = self.channel_state {
                     cs.fast_bound_uniform_buffers[stage] |= 1u32 << binding_index;
                     cs.uniform_buffer_binding_sizes[stage][binding_index as usize] = size;
                 }
+                return;
             }
-            return;
         }
 
         // Classic cached path.

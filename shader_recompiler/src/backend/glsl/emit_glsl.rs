@@ -13,6 +13,7 @@ use crate::ir::types::Type;
 use crate::ir::value::{InstRef, Value};
 
 use super::emit_glsl_context_get_set;
+use super::emit_glsl_special;
 use super::glsl_emit_context::EmitContext;
 use super::var_alloc::GlslVarType;
 
@@ -850,7 +851,8 @@ fn emit_inst(ctx: &mut EmitContext, program: &mut ir::Program, inst_ref: InstRef
         }
 
         // Special
-        Opcode::Prologue | Opcode::Epilogue | Opcode::Void | Opcode::Phi => {}
+        Opcode::Prologue => emit_glsl_special::emit_prologue(ctx),
+        Opcode::Epilogue | Opcode::Void | Opcode::Phi => {}
         Opcode::PhiMove => emit_phi_move(ctx, program, &inst_snapshot),
         Opcode::Reference => {
             let _ = ctx.var_alloc.consume(program, &inst_snapshot.args[0]);
