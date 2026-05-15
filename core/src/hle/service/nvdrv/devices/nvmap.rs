@@ -268,9 +268,7 @@ impl NvMapDevice {
             if parsed == Some(params.handle) {
                 eprintln!(
                     "[NVMAP_ALLOC_STOP] handle=0x{:X} addr=0x{:X} size=0x{:X}",
-                    params.handle,
-                    params.address,
-                    handle_size
+                    params.handle, params.address, handle_size
                 );
                 unsafe {
                     libc::raise(libc::SIGSTOP);
