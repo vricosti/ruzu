@@ -1146,46 +1146,81 @@ impl RasterizerInterface for RasterizerOpenGL {
         // when `sampler_binding == ViaHeaderBinding` the two ids collapse.
         //
         // Gated behind `RUZU_TEXTURE_CACHE_FILL=1` while the upstream-faithful
-        // descriptor collection is being verified. Default-off because the
-        // path still has rough edges (cbuf_index validation, MAX_CB_SLOTS
-        // bounds, descriptor count sanity); turning it on for MK8D currently
-        // SIGSEGVs late in startup. Once the bounds are tightened this gate
-        // gets removed.
+        // descriptor collection is being verified end-to-end. Hardened with
+        // explicit bounds checks on every index that could come from
+        // shader-info (uninitialised or out-of-range u32s would otherwise
+        // panic via array indexing and crash through the SIGSEGV handler).
         if std::env::var_os("RUZU_TEXTURE_CACHE_FILL").is_some() {
+        const MAX_DESC_COUNT: u32 = 256; // sanity cap (upstream rarely > 16)
+        const NUM_STAGES: usize = crate::renderer_opengl::gl_graphics_pipeline::NUM_STAGES;
+        let max_cb_slots = crate::engines::maxwell_3d::MAX_CB_SLOTS;
+        let num_shader_stages = draw_state.cb_bindings.len();
+
         let via_header_index = draw_state.descriptor_sync_regs.sampler_binding_via_header;
         let mut views: Vec<crate::texture_cache::texture_cache_base::ImageViewInOut> =
             Vec::with_capacity(64);
         let mut has_images = false;
         let gpu_memory_arc = self.texture_cache.base.device_memory.clone();
         let gpu_memory = &*gpu_memory_arc;
+
         let read_handle =
             |gpu_memory: &dyn crate::texture_cache::descriptor_table::GpuMemoryReader,
              stage: usize,
              cbuf_index: u32,
              offset: u32|
              -> Option<u32> {
-                let binding =
-                    &draw_state.cb_bindings[stage][cbuf_index as usize];
+                if stage >= num_shader_stages {
+                    return None;
+                }
+                let cbuf_idx = cbuf_index as usize;
+                if cbuf_idx >= max_cb_slots {
+                    return None;
+                }
+                let binding = &draw_state.cb_bindings[stage][cbuf_idx];
                 if !binding.enabled {
                     return None;
                 }
-                let addr = binding.address + offset as u64;
+                let addr = binding.address.checked_add(offset as u64)?;
                 let mut buf = [0u8; 4];
                 if !gpu_memory.read_block(addr, &mut buf) {
                     return None;
                 }
                 Some(u32::from_le_bytes(buf))
             };
-        for stage in 0..crate::renderer_opengl::gl_graphics_pipeline::NUM_STAGES {
+
+        // For each descriptor: compute clamped count, then loop. Per-entry
+        // index_offset uses checked u32 arithmetic so a malformed shift_left
+        // can't silently wrap into a wildly wrong cbuf offset.
+        let resolve_handle = |gpu_memory: &dyn crate::texture_cache::descriptor_table::GpuMemoryReader,
+                              stage: usize,
+                              cbuf_index: u32,
+                              cbuf_offset: u32,
+                              size_shift: u32,
+                              idx: u32|
+         -> Option<u32> {
+            // `idx << size_shift` — checked shift + checked add.
+            let shift = size_shift.min(31);
+            let index_offset = idx.checked_shl(shift)?;
+            let offset = cbuf_offset.checked_add(index_offset)?;
+            read_handle(gpu_memory, stage, cbuf_index, offset)
+        };
+
+        for stage in 0..NUM_STAGES.min(num_shader_stages) {
             let Some(info) = pipeline.stage_infos[stage].as_ref() else {
                 continue;
             };
             // Texture buffer descriptors — handle only (no sampler).
             for desc in &info.texture_buffer_descriptors {
-                for idx in 0..desc.count {
-                    let index_offset = idx << desc.size_shift;
-                    let offset = desc.cbuf_offset + index_offset;
-                    if let Some(raw) = read_handle(gpu_memory, stage, desc.cbuf_index, offset) {
+                let count = desc.count.min(MAX_DESC_COUNT);
+                for idx in 0..count {
+                    if let Some(raw) = resolve_handle(
+                        gpu_memory,
+                        stage,
+                        desc.cbuf_index,
+                        desc.cbuf_offset,
+                        desc.size_shift,
+                        idx,
+                    ) {
                         let (tic_id, _) =
                             crate::textures::texture::texture_pair(raw, via_header_index);
                         views.push(crate::texture_cache::texture_cache_base::ImageViewInOut {
@@ -1199,10 +1234,16 @@ impl RasterizerInterface for RasterizerOpenGL {
             // Image buffer descriptors — blacklist=false, no sampler. Upstream
             // calls these out separately under `Spec::has_image_buffers`.
             for desc in &info.image_buffer_descriptors {
-                for idx in 0..desc.count {
-                    let index_offset = idx << desc.size_shift;
-                    let offset = desc.cbuf_offset + index_offset;
-                    if let Some(raw) = read_handle(gpu_memory, stage, desc.cbuf_index, offset) {
+                let count = desc.count.min(MAX_DESC_COUNT);
+                for idx in 0..count {
+                    if let Some(raw) = resolve_handle(
+                        gpu_memory,
+                        stage,
+                        desc.cbuf_index,
+                        desc.cbuf_offset,
+                        desc.size_shift,
+                        idx,
+                    ) {
                         let (tic_id, _) =
                             crate::textures::texture::texture_pair(raw, via_header_index);
                         views.push(crate::texture_cache::texture_cache_base::ImageViewInOut {
@@ -1218,10 +1259,16 @@ impl RasterizerInterface for RasterizerOpenGL {
             // (GetGraphicsSamplerId would be the upstream call — TODO once
             // the sampler slot pool is concrete).
             for desc in &info.texture_descriptors {
-                for idx in 0..desc.count {
-                    let index_offset = idx << desc.size_shift;
-                    let offset = desc.cbuf_offset + index_offset;
-                    if let Some(raw) = read_handle(gpu_memory, stage, desc.cbuf_index, offset) {
+                let count = desc.count.min(MAX_DESC_COUNT);
+                for idx in 0..count {
+                    if let Some(raw) = resolve_handle(
+                        gpu_memory,
+                        stage,
+                        desc.cbuf_index,
+                        desc.cbuf_offset,
+                        desc.size_shift,
+                        idx,
+                    ) {
                         let (tic_id, _tsc_id) =
                             crate::textures::texture::texture_pair(raw, via_header_index);
                         views.push(crate::texture_cache::texture_cache_base::ImageViewInOut {
@@ -1237,10 +1284,16 @@ impl RasterizerInterface for RasterizerOpenGL {
             // can be detected and scaled down.
             for desc in &info.image_descriptors {
                 has_images = true;
-                for idx in 0..desc.count {
-                    let index_offset = idx << desc.size_shift;
-                    let offset = desc.cbuf_offset + index_offset;
-                    if let Some(raw) = read_handle(gpu_memory, stage, desc.cbuf_index, offset) {
+                let count = desc.count.min(MAX_DESC_COUNT);
+                for idx in 0..count {
+                    if let Some(raw) = resolve_handle(
+                        gpu_memory,
+                        stage,
+                        desc.cbuf_index,
+                        desc.cbuf_offset,
+                        desc.size_shift,
+                        idx,
+                    ) {
                         let (tic_id, _) =
                             crate::textures::texture::texture_pair(raw, via_header_index);
                         views.push(crate::texture_cache::texture_cache_base::ImageViewInOut {
