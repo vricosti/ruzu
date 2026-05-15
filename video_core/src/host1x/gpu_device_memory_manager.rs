@@ -89,6 +89,10 @@ impl crate::texture_cache::descriptor_table::GpuMemoryReader for MaxwellDeviceMe
     fn read_block(&self, d_address: u64, output: &mut [u8]) -> bool {
         self.smmu_read_block(d_address, output)
     }
+
+    fn addr_valid(&self, d_address: u64) -> bool {
+        self.smmu_get_host_ptr(d_address).is_some()
+    }
 }
 
 impl Default for MaxwellDeviceMemoryManager {

@@ -703,14 +703,45 @@ pub fn make_reinterpret_image_copies(
 
 // ── Validation ─────────────────────────────────────────────────────────
 
-/// Port of `IsValidEntry`.
+/// Port of upstream `VideoCommon::IsValidEntry` (util.cpp:818-832).
 ///
-/// Upstream reads the GPU virtual address from a `TICEntry` and checks whether
-/// it maps to a valid physical address via `Tegra::MemoryManager`.  Both types
-/// are not yet ported; returns `false` and logs a warning.
-pub fn is_valid_entry(_gpu_memory: &(), _config: &()) -> bool {
-    log::warn!("is_valid_entry: MemoryManager / TICEntry not yet ported — returning false");
-    false
+/// ```cpp
+/// const GPUVAddr address = config.Address();
+/// if (address == 0) return false;
+/// if (address >= (1ULL << 40)) return false;
+/// if (gpu_memory.GpuToCpuAddress(address).has_value()) return true;
+/// const ImageInfo info{config};
+/// const size_t guest_size_bytes = CalculateGuestSizeInBytes(info);
+/// return gpu_memory.GpuToCpuAddress(address, guest_size_bytes).has_value();
+/// ```
+///
+/// Ruzu maps `GpuToCpuAddress` → `MaxwellDeviceMemoryManager::smmu_get_host_ptr`,
+/// which only validates the page at the start of the range. The size-aware
+/// second `has_value` check upstream catches sparse-tail mappings; until
+/// ruzu's MDMM grows a range-walk helper, the size-aware call is just the
+/// first check repeated — `calculate_guest_size_in_bytes` is still computed
+/// so future plumbing only needs to swap the second `smmu_get_host_ptr`
+/// for `smmu_range_mapped(addr, size)`.
+pub fn is_valid_entry(
+    gpu_memory: &dyn super::descriptor_table::GpuMemoryReader,
+    config: &crate::textures::texture::TicEntry,
+) -> bool {
+    let address = config.address();
+    if address == 0 {
+        return false;
+    }
+    if address >= 1u64 << 40 {
+        return false;
+    }
+    if gpu_memory.addr_valid(address) {
+        return true;
+    }
+    // Upstream: second has_value with explicit size. Compute the size so
+    // the call site keeps the contract; until the range-aware SMMU walk
+    // lands, the check itself collapses to the same single-page validation.
+    let info = super::image_info::ImageInfo::from_tic_entry(config);
+    let _guest_size_bytes = calculate_guest_size_in_bytes(&info);
+    gpu_memory.addr_valid(address)
 }
 
 // ── Swizzle / unswizzle ────────────────────────────────────────────────

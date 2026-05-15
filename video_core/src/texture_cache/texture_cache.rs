@@ -148,7 +148,7 @@ impl TextureCacheBase {
         let (descriptor, is_new) = table.read(gpu_memory, index);
         let slot = &mut cached_ids[index as usize];
         if is_new {
-            *slot = Self::find_image_view(image_views_cache, &descriptor);
+            *slot = Self::find_image_view(gpu_memory, image_views_cache, &descriptor);
         }
         if *slot != NULL_IMAGE_VIEW_ID {
             // Upstream: PrepareImageView(image_view_id, false, false). Needs
@@ -167,44 +167,78 @@ impl TextureCacheBase {
     /// return image_view_id;
     /// ```
     ///
-    /// The `try_emplace` semantics map to Rust's `HashMap::entry(..).or_insert_with(..)`.
-    /// The `IsValidEntry` GPU-memory check and `CreateImageView` (which builds
-    /// a backend `P::ImageView` via `Runtime::UploadStagingBuffer` +
-    /// `Image::UploadMemory`) are not yet implemented; until they are, the
-    /// cache caches a `NULL_IMAGE_VIEW_ID` per unique descriptor — same
-    /// observable behaviour as the previous stub, but with the cache shape
-    /// in place so plugging in `create_image_view` is a one-line swap.
+    /// `IsValidEntry` is now wired (util::is_valid_entry); on invalid
+    /// descriptors we return `NULL_IMAGE_VIEW_ID` early without touching
+    /// the cache. `CreateImageView` still resolves to a NULL stub because
+    /// the backend `P::ImageView`/`P::Image` slot pools are missing — once
+    /// they land the cache shape stays the same, only `create_image_view`'s
+    /// body changes.
     fn find_image_view(
+        gpu_memory: &dyn super::descriptor_table::GpuMemoryReader,
         image_views_cache: &mut std::collections::HashMap<
             crate::textures::texture::TicEntry,
             ImageViewId,
         >,
         descriptor: &crate::textures::texture::TicEntry,
     ) -> ImageViewId {
-        // TODO(texture_cache): upstream first guards on
-        //   `IsValidEntry(*gpu_memory, *descriptor)` — needs a GPU memory
-        //   reader on the channel before the GPU virtual address can be
-        //   validated. Until then we proceed to the cache lookup; misses
-        //   still resolve to NULL via the create-image-view stub.
+        if !super::util::is_valid_entry(gpu_memory, descriptor) {
+            return NULL_IMAGE_VIEW_ID;
+        }
         *image_views_cache
             .entry(*descriptor)
             .or_insert_with(|| Self::create_image_view(descriptor))
     }
 
-    /// Port of `TextureCache<P>::CreateImageView` (texture_cache.h:1115-1137).
+    /// Port of `TextureCache<P>::CreateImageView` (texture_cache.h:1115-1137):
+    /// ```cpp
+    /// const ImageInfo info(config);
+    /// if (info.type == ImageType::Buffer) {
+    ///     const ImageViewInfo view_info(config, 0);
+    ///     return slot_image_views.insert(runtime, info, view_info, config.Address());
+    /// }
+    /// const u32 layer_offset = config.BaseLayer() * info.layer_stride;
+    /// const GPUVAddr image_gpu_addr = config.Address() - layer_offset;
+    /// const ImageId image_id = FindOrInsertImage(info, image_gpu_addr);
+    /// if (!image_id) return NULL_IMAGE_VIEW_ID;
+    /// ImageBase& image = slot_images[image_id];
+    /// const SubresourceBase base = image.TryFindBase(config.Address()).value();
+    /// const ImageViewInfo view_info(config, base.layer);
+    /// const ImageViewId image_view_id = FindOrEmplaceImageView(image_id, view_info);
+    /// slot_image_views[image_view_id].flags |= ImageViewFlagBits::Strong;
+    /// image.flags |= ImageFlagBits::Strong;
+    /// return image_view_id;
+    /// ```
     ///
-    /// Upstream constructs an `ImageInfo` from the TIC, either:
-    ///   * for `ImageType::Buffer`: inserts a fresh `slot_image_views` entry
-    ///     bound to `descriptor.Address()`, OR
-    ///   * for normal images: resolves the backing image (`FindOrInsertImage`),
-    ///     reads `image.TryFindBase(descriptor.Address())`, and emplaces an
-    ///     `ImageViewInfo` view via `FindOrEmplaceImageView`.
-    ///
-    /// Both branches require concrete backend `P::ImageView`/`P::Image` types
-    /// plus `Runtime::UploadStagingBuffer` for the upload path — none of
-    /// which exist yet in ruzu. The stub returns `NULL_IMAGE_VIEW_ID` so the
-    /// outer scaffolding skips the slot.
-    fn create_image_view(_descriptor: &crate::textures::texture::TicEntry) -> ImageViewId {
+    /// Ruzu computes the data-path bits (`ImageInfo`, Buffer-vs-normal split,
+    /// `image_gpu_addr = config.Address() - layer_offset`) so the upstream
+    /// shape is visible, but the actual `slot_image_views.insert` /
+    /// `FindOrInsertImage` / `slot_images` operations need backend
+    /// `P::ImageView`+`P::Image` types plus `Runtime::UploadStagingBuffer`
+    /// — none wired yet. Until they are, the body returns
+    /// `NULL_IMAGE_VIEW_ID` at the same exit point upstream takes when
+    /// `FindOrInsertImage` fails.
+    fn create_image_view(descriptor: &crate::textures::texture::TicEntry) -> ImageViewId {
+        let info = super::image_info::ImageInfo::from_tic_entry(descriptor);
+        if info.image_type == ImageType::Buffer {
+            // Upstream: `ImageViewInfo view_info(config, 0)` + `slot_image_views
+            // .insert(runtime, info, view_info, config.Address())`. The
+            // ImageViewInfo port exists (image_view_info.rs::from_tic_entry),
+            // but the slot insert requires a backend `P::ImageView`. Bail.
+            let _view_info = super::image_view_info::ImageViewInfo::from_tic_entry(descriptor, 0);
+            return NULL_IMAGE_VIEW_ID;
+        }
+        // Layer-base offset: `image_gpu_addr = config.Address() - BaseLayer * layer_stride`.
+        // `info.layer_stride` is still 0 (ImageInfo::from_tic_entry leaves it
+        // until the CalculateLayerStride port lands), so this collapses to
+        // `image_gpu_addr = config.Address()` for now. Recorded for symmetry
+        // with upstream so the call site is upstream-faithful when the helper
+        // is filled in.
+        let layer_offset = descriptor.base_layer() as u64 * info.layer_stride as u64;
+        let _image_gpu_addr = descriptor.address().wrapping_sub(layer_offset);
+        // Upstream now calls `FindOrInsertImage(info, image_gpu_addr)`. That
+        // path owns the image slot pool + insert/upload pipeline and isn't
+        // wired yet. Returning NULL matches upstream's `if (!image_id) return
+        // NULL_IMAGE_VIEW_ID` fail-out.
         NULL_IMAGE_VIEW_ID
     }
 
