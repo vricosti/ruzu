@@ -819,12 +819,30 @@ fn call32(system: &System, imm: u32, args: &mut SvcArgs) {
             set_arg32(args, 0, result.get_inner_value());
         }
         Some(SvcId::WaitProcessWideKeyAtomic) => {
+            let mutex_addr = get_arg32(args, 0) as u64;
+            let cv_key = get_arg32(args, 1) as u64;
+            let tag = get_arg32(args, 2);
+            let timeout = gather64(args, 3, 4) as i64;
+            // RUZU_TRACE_CV_TIMEOUT=1 — log the full 64-bit timeout so we can
+            // tell infinite (-1) from a 4.3s u32-truncated value (0xFFFFFFFF).
+            if std::env::var_os("RUZU_TRACE_CV_TIMEOUT").is_some() {
+                log::info!(
+                    "[CV_TIMEOUT] tid={} mutex=0x{:X} cv=0x{:X} tag=0x{:X} args[3]=0x{:X} args[4]=0x{:X} timeout_i64={} (={}ms)",
+                    system
+                        .current_thread()
+                        .and_then(|t| t.lock().ok().map(|g| g.get_thread_id()))
+                        .unwrap_or(0),
+                    mutex_addr,
+                    cv_key,
+                    tag,
+                    get_arg32(args, 3),
+                    get_arg32(args, 4),
+                    timeout,
+                    timeout / 1_000_000,
+                );
+            }
             let result = svc_condition_variable::wait_process_wide_key_atomic(
-                system,
-                get_arg32(args, 0) as u64,
-                get_arg32(args, 1) as u64,
-                get_arg32(args, 2),
-                gather64(args, 3, 4) as i64,
+                system, mutex_addr, cv_key, tag, timeout,
             );
             set_arg32(args, 0, result.get_inner_value());
         }
@@ -1914,6 +1932,23 @@ pub fn call(system: &System, imm: u32, is_64bit: bool, args: &mut SvcArgs) {
         0
     };
 
+    // RUZU_PROFILE_WAKE: if this thread had a pending wake-emit timestamp
+    // recorded by KConditionVariable::signal_impl, consume it now — the
+    // thread is about to enter a fresh SVC, so it's already running again.
+    if tid >= 0 {
+        consume_wake_latency(tid as u64);
+        // RUZU_PROFILE_GAP: time spent in JIT since this tid's last SVC exit.
+        gap_on_svc_entry(tid as u64);
+    }
+
+    let profile_svc = std::env::var_os("RUZU_PROFILE_SVC").is_some();
+    let profile_svc_per_tid = std::env::var_os("RUZU_PROFILE_SVC_PER_TID").is_some();
+    let svc_start = if profile_svc || profile_svc_per_tid {
+        Some(std::time::Instant::now())
+    } else {
+        None
+    };
+
     if trace_enabled {
         // Log SVC entry
         eprintln!(
@@ -1968,6 +2003,22 @@ pub fn call(system: &System, imm: u32, is_64bit: bool, args: &mut SvcArgs) {
         }
     }
 
+    if let Some(start) = svc_start {
+        let elapsed = start.elapsed();
+        if profile_svc {
+            record_svc_profile(imm, elapsed);
+        }
+        if profile_svc_per_tid {
+            record_svc_per_tid(tid, imm, elapsed);
+        }
+    }
+
+    // RUZU_PROFILE_GAP: stamp this tid's last-SVC-exit-time so the next SVC
+    // entry on the same tid can compute the in-JIT gap.
+    if tid >= 0 {
+        gap_on_svc_exit(tid as u64);
+    }
+
     // After the handler returns, if we just finished SVC #start on the
     // target thread (default 73, see RUZU_TRACE_PC_TID), activate PC tracing
     // so the next block boundaries get logged.
@@ -2006,6 +2057,357 @@ pub fn call(system: &System, imm: u32, is_64bit: bool, args: &mut SvcArgs) {
     // released after the SVC handler. In this cooperative port, drain a
     // pending current-thread termination once per SVC return path.
     drain_current_thread_termination(system);
+}
+
+/// SVC-to-SVC gap profile: `RUZU_PROFILE_GAP=1`.
+///
+/// For each tid, on SVC entry compute `now - last_svc_exit_ts[tid]` — this is
+/// the time the thread spent executing guest code in the JIT between
+/// supervisor calls. Aggregated per-tid as count/total/max plus log2 bucket
+/// histogram. Dumped via SIGUSR2 alongside the other profiles.
+///
+/// On the very first SVC of a tid, no `last_svc_exit_ts` is recorded yet, so
+/// the gap is skipped. On SVC exit, `last_svc_exit_ts[tid]` is updated to now.
+static GAP_LAST_EXIT: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<u64, std::time::Instant>>,
+> = std::sync::OnceLock::new();
+
+static GAP_AGG: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<u64, GapAggEntry>>> =
+    std::sync::OnceLock::new();
+
+#[derive(Default, Clone)]
+struct GapAggEntry {
+    count: u64,
+    total_ns: u64,
+    max_ns: u64,
+    buckets: [u64; 32],
+}
+
+fn gap_profile_enabled() -> bool {
+    std::env::var_os("RUZU_PROFILE_GAP").is_some()
+}
+
+fn gap_on_svc_entry(tid: u64) {
+    if !gap_profile_enabled() {
+        return;
+    }
+    let Some(last_map) = GAP_LAST_EXIT.get() else {
+        return; // first ever SVC across the process — nothing to compare yet
+    };
+    let last_ts = {
+        let guard = last_map.lock().unwrap();
+        guard.get(&tid).copied()
+    };
+    let Some(last) = last_ts else { return };
+    let delta = last.elapsed();
+    let ns = delta.as_nanos() as u64;
+    let agg_map = GAP_AGG.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    let mut guard = agg_map.lock().unwrap();
+    let entry = guard.entry(tid).or_default();
+    entry.count += 1;
+    entry.total_ns = entry.total_ns.saturating_add(ns);
+    if ns > entry.max_ns {
+        entry.max_ns = ns;
+    }
+    let bucket = if ns == 0 {
+        0
+    } else {
+        ((63 - ns.leading_zeros()) as usize).min(entry.buckets.len() - 1)
+    };
+    entry.buckets[bucket] += 1;
+}
+
+fn gap_on_svc_exit(tid: u64) {
+    if !gap_profile_enabled() {
+        return;
+    }
+    let map = GAP_LAST_EXIT.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    let mut guard = map.lock().unwrap();
+    guard.insert(tid, std::time::Instant::now());
+}
+
+pub fn dump_gap_profile() {
+    let Some(agg) = GAP_AGG.get() else {
+        return;
+    };
+    let snap: Vec<(u64, GapAggEntry)> = {
+        let guard = agg.lock().unwrap();
+        guard.iter().map(|(k, v)| (*k, v.clone())).collect()
+    };
+    let mut snap = snap;
+    snap.sort_by_key(|(_, e)| std::cmp::Reverse(e.total_ns));
+    eprintln!("[GAP_PROFILE] per-tid SVC-to-SVC gap (time in JIT between SVCs), top by total:");
+    for (tid, e) in snap.iter().take(10) {
+        eprintln!(
+            "[GAP_PROFILE] tid={:<4} count={:<7} total={:>9.2}ms avg={:>9.1}us max={:>9.1}us",
+            tid,
+            e.count,
+            e.total_ns as f64 / 1e6,
+            e.total_ns as f64 / e.count as f64 / 1e3,
+            e.max_ns as f64 / 1e3,
+        );
+        let mut printed = false;
+        for (k, &c) in e.buckets.iter().enumerate() {
+            if c == 0 {
+                continue;
+            }
+            if !printed {
+                eprintln!("[GAP_PROFILE]   histogram (ns range -> count):");
+                printed = true;
+            }
+            let lo = 1u64 << k;
+            let hi = if k + 1 < 64 {
+                1u64 << (k + 1)
+            } else {
+                u64::MAX
+            };
+            eprintln!(
+                "[GAP_PROFILE]     [{:>9}, {:>9})  {}",
+                format_ns_short(lo),
+                format_ns_short(hi),
+                c
+            );
+        }
+    }
+}
+
+/// Wake-latency profile: `RUZU_PROFILE_WAKE=1`.
+///
+/// `KConditionVariable::signal_impl` calls `record_wake_emit(tid)` right after
+/// `end_wait()` on each woken thread. Then at the *next* SVC entry on that
+/// thread, `consume_wake_latency(tid)` returns the elapsed `Duration` from
+/// signal-emit → woken thread reaching its next supervisor call. That delta
+/// captures: scheduler dispatch latency + fiber resume + JIT block execution
+/// time between wake-up and the post-wait SVC return.
+static WAKE_PENDING: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<u64, std::time::Instant>>,
+> = std::sync::OnceLock::new();
+
+static WAKE_LATENCY: std::sync::OnceLock<std::sync::Mutex<WakeLatencyAgg>> =
+    std::sync::OnceLock::new();
+
+#[derive(Default)]
+struct WakeLatencyAgg {
+    count: u64,
+    total_ns: u64,
+    max_ns: u64,
+    /// log2 bucket histogram. bucket[k] counts samples with `ns >> k > 0` &&
+    /// `ns >> (k+1) == 0`, i.e. ns in `[2^k, 2^(k+1))`. Buckets go up to 32 bits
+    /// of nanoseconds = ~4 seconds.
+    buckets: [u64; 32],
+}
+
+pub fn record_wake_emit(tid: u64) {
+    if std::env::var_os("RUZU_PROFILE_WAKE").is_none() {
+        return;
+    }
+    let map = WAKE_PENDING.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    let mut guard = map.lock().unwrap();
+    // Last-write-wins: if multiple signals stack up on one tid, keep the
+    // earliest emit so the measured latency reflects the worst (longest) wait.
+    guard.entry(tid).or_insert_with(std::time::Instant::now);
+}
+
+fn consume_wake_latency(tid: u64) {
+    let Some(map) = WAKE_PENDING.get() else {
+        return;
+    };
+    let emit = {
+        let mut guard = map.lock().unwrap();
+        guard.remove(&tid)
+    };
+    let Some(emit_ts) = emit else { return };
+    let delta = emit_ts.elapsed();
+    let ns = delta.as_nanos() as u64;
+    let agg = WAKE_LATENCY.get_or_init(|| std::sync::Mutex::new(WakeLatencyAgg::default()));
+    let mut g = agg.lock().unwrap();
+    g.count += 1;
+    g.total_ns = g.total_ns.saturating_add(ns);
+    if ns > g.max_ns {
+        g.max_ns = ns;
+    }
+    let bucket = if ns == 0 {
+        0
+    } else {
+        (63 - ns.leading_zeros()) as usize
+    };
+    let bucket = bucket.min(g.buckets.len() - 1);
+    g.buckets[bucket] += 1;
+}
+
+pub fn dump_wake_latency() {
+    let Some(agg) = WAKE_LATENCY.get() else {
+        return;
+    };
+    let snap = {
+        let g = agg.lock().unwrap();
+        (g.count, g.total_ns, g.max_ns, g.buckets)
+    };
+    let (count, total_ns, max_ns, buckets) = snap;
+    if count == 0 {
+        eprintln!("[WAKE_LATENCY] no samples (RUZU_PROFILE_WAKE=1 enabled?)");
+        return;
+    }
+    eprintln!(
+        "[WAKE_LATENCY] count={} total={:.2}ms avg={:.1}us max={:.1}us",
+        count,
+        total_ns as f64 / 1e6,
+        total_ns as f64 / count as f64 / 1e3,
+        max_ns as f64 / 1e3,
+    );
+    eprintln!("[WAKE_LATENCY] histogram (ns range -> count):");
+    for (k, &c) in buckets.iter().enumerate() {
+        if c == 0 {
+            continue;
+        }
+        let lo = 1u64 << k;
+        let hi = if k + 1 < 64 {
+            1u64 << (k + 1)
+        } else {
+            u64::MAX
+        };
+        let lo_str = format_ns_short(lo);
+        let hi_str = format_ns_short(hi);
+        eprintln!("[WAKE_LATENCY]   [{:>9}, {:>9})  {}", lo_str, hi_str, c);
+    }
+}
+
+fn format_ns_short(ns: u64) -> String {
+    if ns >= 1_000_000_000 {
+        format!("{:.1}s", ns as f64 / 1e9)
+    } else if ns >= 1_000_000 {
+        format!("{:.1}ms", ns as f64 / 1e6)
+    } else if ns >= 1_000 {
+        format!("{:.1}us", ns as f64 / 1e3)
+    } else {
+        format!("{}ns", ns)
+    }
+}
+
+/// Per-(tid, SVC) wall-clock profile: `RUZU_PROFILE_SVC_PER_TID=1`.
+/// Keyed by `(tid, imm)`. Dumped via `dump_svc_per_tid_profile()`.
+///
+/// Distinct from `SVC_PROFILE` (which aggregates over all tids): this one
+/// answers "which thread spends most time in which SVC type". Most useful for
+/// identifying which thread is starved on which event — e.g. "tid=102 spends
+/// X seconds in WaitSync" pinpoints the audio worker's main blocker.
+static SVC_PER_TID_PROFILE: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<(i64, u32), SvcProfileEntry>>,
+> = std::sync::OnceLock::new();
+
+fn record_svc_per_tid(tid: i64, imm: u32, elapsed: std::time::Duration) {
+    let map =
+        SVC_PER_TID_PROFILE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    let ns = elapsed.as_nanos() as u64;
+    let mut guard = map.lock().unwrap();
+    let entry = guard.entry((tid, imm)).or_default();
+    entry.count += 1;
+    entry.total_ns = entry.total_ns.saturating_add(ns);
+    if ns > entry.max_ns {
+        entry.max_ns = ns;
+    }
+}
+
+pub fn dump_svc_per_tid_profile() {
+    let Some(map) = SVC_PER_TID_PROFILE.get() else {
+        return;
+    };
+    let snap: Vec<((i64, u32), SvcProfileEntry)> = {
+        let guard = map.lock().unwrap();
+        guard.iter().map(|(k, v)| (*k, v.clone())).collect()
+    };
+    // Group by tid, then sort each tid's rows by total_ns desc.
+    let mut by_tid: std::collections::HashMap<i64, Vec<(u32, SvcProfileEntry)>> =
+        std::collections::HashMap::new();
+    for ((tid, imm), entry) in snap {
+        by_tid.entry(tid).or_default().push((imm, entry));
+    }
+    let mut tids: Vec<i64> = by_tid.keys().copied().collect();
+    tids.sort_by_key(|t| {
+        std::cmp::Reverse(
+            by_tid
+                .get(t)
+                .map(|v| v.iter().map(|(_, e)| e.total_ns).sum::<u64>())
+                .unwrap_or(0),
+        )
+    });
+    eprintln!("[SVC_PER_TID] top tids (each sorted by total SVC time):");
+    for tid in tids.iter().take(10) {
+        let mut rows = by_tid.remove(tid).unwrap();
+        rows.sort_by_key(|(_, e)| std::cmp::Reverse(e.total_ns));
+        let total_per_tid: u64 = rows.iter().map(|(_, e)| e.total_ns).sum();
+        eprintln!(
+            "[SVC_PER_TID] tid={:<4} sum_total={:.2}ms",
+            tid,
+            total_per_tid as f64 / 1e6
+        );
+        for (imm, e) in rows.iter().take(6) {
+            let name = SvcId::from_u32(*imm)
+                .map(|id| format!("{:?}", id))
+                .unwrap_or_else(|| format!("svc#0x{:02X}", imm));
+            eprintln!(
+                "[SVC_PER_TID]   imm=0x{:02X} {:>26}  count={:<6} total={:>9.2}ms  avg={:>9.1}us  max={:>9.1}us",
+                imm,
+                name,
+                e.count,
+                e.total_ns as f64 / 1e6,
+                e.total_ns as f64 / e.count as f64 / 1e3,
+                e.max_ns as f64 / 1e3,
+            );
+        }
+    }
+}
+
+/// Per-SVC wall-clock profile. Populated when `RUZU_PROFILE_SVC=1`.
+/// Keyed by SVC `imm` (0x00..0x7F). Dumped via `dump_svc_profile()`.
+static SVC_PROFILE: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<u32, SvcProfileEntry>>,
+> = std::sync::OnceLock::new();
+
+#[derive(Default, Clone)]
+struct SvcProfileEntry {
+    count: u64,
+    total_ns: u64,
+    max_ns: u64,
+}
+
+fn record_svc_profile(imm: u32, elapsed: std::time::Duration) {
+    let map = SVC_PROFILE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    let ns = elapsed.as_nanos() as u64;
+    let mut guard = map.lock().unwrap();
+    let entry = guard.entry(imm).or_default();
+    entry.count += 1;
+    entry.total_ns += ns;
+    if ns > entry.max_ns {
+        entry.max_ns = ns;
+    }
+}
+
+pub fn dump_svc_profile() {
+    let Some(map) = SVC_PROFILE.get() else {
+        return;
+    };
+    let snap: Vec<(u32, SvcProfileEntry)> = {
+        let guard = map.lock().unwrap();
+        guard.iter().map(|(k, v)| (*k, v.clone())).collect()
+    };
+    let mut snap = snap;
+    snap.sort_by_key(|(_, e)| std::cmp::Reverse(e.total_ns));
+    eprintln!("[SVC_PROFILE] top SVCs by total time:");
+    for (imm, e) in snap.iter().take(20) {
+        let name = SvcId::from_u32(*imm)
+            .map(|id| format!("{:?}", id))
+            .unwrap_or_else(|| format!("svc#0x{:02X}", imm));
+        eprintln!(
+            "[SVC_PROFILE]   imm=0x{:02X} {:>26}  count={:<7}  total={:>9.2}ms  avg={:>9.1}us  max={:>9.1}us",
+            imm,
+            name,
+            e.count,
+            e.total_ns as f64 / 1e6,
+            e.total_ns as f64 / e.count as f64 / 1e3,
+            e.max_ns as f64 / 1e3,
+        );
+    }
 }
 
 /// Per-tid SVC counter for the memory snapshot hook (RUZU_DUMP_AT_SVC=N).

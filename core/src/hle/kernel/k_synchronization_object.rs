@@ -121,7 +121,12 @@ impl SynchronizationObjectState {
         self.tail = node;
     }
 
-    /// Unlink a ThreadListNode. Mirrors upstream `UnlinkNode`.
+    /// Unlink a ThreadListNode. Mirrors upstream `UnlinkNode`
+    /// (k_synchronization_object.h:47-66): the unlinked node's `next` field
+    /// is left pointing at the following list element on purpose, because
+    /// `KSynchronizationObject::NotifyAvailable`'s for-loop reads it after
+    /// the body has unlinked the current node:
+    ///   for (cur = head; cur != nullptr; cur = cur->next) { body(cur); }
     ///
     /// # Safety
     /// - Caller holds the scheduler lock for the owning kernel.
@@ -148,7 +153,8 @@ impl SynchronizationObjectState {
         if self.tail == cur {
             self.tail = prev;
         }
-        (*cur).next = ptr::null_mut();
+        // Intentionally do NOT clear `(*cur).next`. Upstream preserves it so
+        // that iteration loops can continue past an unlinked-from-list node.
     }
 
     /// Walk the list under the scheduler lock and collect strong refs to the
@@ -431,9 +437,7 @@ pub fn is_object_signaled(process: &KProcess, object_id: u64) -> bool {
 }
 
 fn first_signaled_waitable_index(objects: &[WaitableObject]) -> Option<usize> {
-    objects
-        .iter()
-        .position(|object| object.is_signaled())
+    objects.iter().position(|object| object.is_signaled())
 }
 
 fn resolve_waitable_objects(
@@ -588,7 +592,7 @@ pub fn wait(
         return RESULT_INVALID_HANDLE;
     };
 
-    let result = {
+    let _result = {
         let (mut sleep_guard, timer) = KScopedSchedulerLockAndSleep::new(
             scheduler_lock,
             hardware_timer.as_ref(),

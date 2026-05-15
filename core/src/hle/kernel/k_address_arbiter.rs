@@ -405,26 +405,37 @@ impl KAddressArbiter {
     /// Core signal loop shared by the three signal variants. Caller holds the
     /// scheduler lock. Pops up to `count` (or all, if count <= 0) waiters from
     /// the tree at `addr` and fires `EndWait(ResultSuccess)` on each.
+    ///
+    /// Matches upstream `KAddressArbiter::Signal` body (k_address_arbiter.cpp:139-149):
+    ///   target_thread->EndWait(ResultSuccess);
+    ///   ASSERT(target_thread->IsWaitingForAddressArbiter());
+    ///   target_thread->ClearAddressArbiter();
+    ///   it = m_tree.erase(it);
     fn signal_locked(&mut self, process_guard: &mut KProcess, addr: u64, count: i32) {
         let mut num_waiters = 0i32;
         while count <= 0 || num_waiters < count {
             let Some(target_thread_id) = self.waiting_threads.first_waiter_for_addr(addr) else {
                 break;
             };
-            // Remove from the tree first to mirror upstream's
-            // `it = m_tree.erase(it)` ordering.
-            self.waiting_threads.erase_by_thread_id(target_thread_id);
-            let Some(target_thread) = process_guard.get_thread_by_thread_id(target_thread_id)
-            else {
-                // Waiter vanished — skip and continue.
-                continue;
-            };
+            // Kernel invariant: the arbiter tree only contains live threads
+            // that are still waiting on an address arbiter. Upstream's
+            // `&*it` dereference is unconditional (k_address_arbiter.cpp:142);
+            // we match that and panic on invariant break.
+            let target_thread = process_guard
+                .get_thread_by_thread_id(target_thread_id)
+                .expect(
+                    "KAddressArbiter::signal: arbiter tree references unknown thread \
+                     (kernel invariant violated — thread cleanup missed tree entry)",
+                );
             {
                 let mut guard = target_thread.lock().unwrap();
+                // EndWait first, matching upstream order.
+                guard.end_wait(RESULT_SUCCESS.get_inner_value());
                 debug_assert!(guard.is_waiting_for_address_arbiter());
                 guard.clear_address_arbiter();
-                guard.end_wait(RESULT_SUCCESS.get_inner_value());
             }
+            // Erase from tree last (matches `it = m_tree.erase(it)`).
+            self.waiting_threads.erase_by_thread_id(target_thread_id);
             num_waiters += 1;
         }
     }
@@ -465,7 +476,7 @@ impl KAddressArbiter {
                 return Err(RESULT_TERMINATION_REQUESTED);
             }
 
-            let mut process_guard = process.lock().unwrap();
+            let process_guard = process.lock().unwrap();
 
             // Read / optionally decrement userspace value.
             let user_value = if decrement {
@@ -486,14 +497,21 @@ impl KAddressArbiter {
                 return Err(RESULT_TIMED_OUT);
             }
 
-            // Set up the wait: mark thread as waiting on arbiter + enqueue.
+            // Match upstream tail (k_address_arbiter.cpp:289-295):
+            //   cur_thread->SetAddressArbiter(&m_tree, addr);
+            //   m_tree.insert(*cur_thread);
+            //   wait_queue.SetHardwareTimer(timer);
+            //   cur_thread->BeginWait(&wait_queue);
+            //   cur_thread->SetWaitReasonForDebugging(Arbitration);
+            // Tree insert MUST happen before BeginWait flips state to WAITING.
+            current_thread.lock().unwrap().set_address_arbiter(addr);
+            self.waiting_threads
+                .insert(addr, priority, current_thread_id);
             let mut wait_queue = ThreadQueueImplForKAddressArbiter::queue();
             if let Some(timer) = timer {
                 wait_queue.set_hardware_timer(timer);
             }
-            Self::begin_wait_arbiter(current_thread, wait_queue, addr, priority);
-            self.waiting_threads
-                .insert(addr, priority, current_thread_id);
+            Self::begin_wait_arbiter(current_thread, wait_queue);
             drop(process_guard);
 
             Ok(())
@@ -542,7 +560,7 @@ impl KAddressArbiter {
                 return Err(RESULT_TERMINATION_REQUESTED);
             }
 
-            let mut process_guard = process.lock().unwrap();
+            let process_guard = process.lock().unwrap();
             let Some(user_value) = read_from_user(&process_guard, addr) else {
                 sleep_guard.cancel_sleep();
                 return Err(RESULT_INVALID_CURRENT_MEMORY);
@@ -556,13 +574,16 @@ impl KAddressArbiter {
                 return Err(RESULT_TIMED_OUT);
             }
 
+            // Match upstream tail (k_address_arbiter.cpp:337-343), same
+            // sequencing as WaitIfLessThan above.
+            current_thread.lock().unwrap().set_address_arbiter(addr);
+            self.waiting_threads
+                .insert(addr, priority, current_thread_id);
             let mut wait_queue = ThreadQueueImplForKAddressArbiter::queue();
             if let Some(timer) = timer {
                 wait_queue.set_hardware_timer(timer);
             }
-            Self::begin_wait_arbiter(current_thread, wait_queue, addr, priority);
-            self.waiting_threads
-                .insert(addr, priority, current_thread_id);
+            Self::begin_wait_arbiter(current_thread, wait_queue);
             drop(process_guard);
 
             Ok(())
@@ -576,14 +597,17 @@ impl KAddressArbiter {
         ResultCode::new(current_thread.lock().unwrap().get_wait_result())
     }
 
-    fn begin_wait_arbiter(
-        current_thread: &Arc<KThreadLock>,
-        wait_queue: KThreadQueue,
-        addr: u64,
-        _priority: i32,
-    ) {
+    /// Begin-wait tail for the arbiter wait variants. Matches upstream
+    /// `KAddressArbiter::WaitIfLessThan` / `WaitIfEqual` tail
+    /// (k_address_arbiter.cpp:294-295):
+    ///   cur_thread->BeginWait(&wait_queue);
+    ///   cur_thread->SetWaitReasonForDebugging(Arbitration);
+    ///
+    /// `SetAddressArbiter` and the tree insert are pulled up to the caller
+    /// so they execute BEFORE `BeginWait` flips state to WAITING — same
+    /// upstream-order invariant as `KConditionVariable::Wait`.
+    fn begin_wait_arbiter(current_thread: &Arc<KThreadLock>, wait_queue: KThreadQueue) {
         let mut thread = current_thread.lock().unwrap();
-        thread.set_address_arbiter(addr);
         thread.begin_wait_with_queue(wait_queue);
         thread.set_wait_reason_for_debugging(ThreadWaitReasonForDebugging::Arbitration);
     }

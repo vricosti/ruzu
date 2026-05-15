@@ -358,8 +358,7 @@ extern "C" fn ruzu_sigill_handler(
             // recover the actual guest PC (R15) without changing the trap ABI.
             let mut a32_regs = [0u32; 16];
             for i in 0..16 {
-                a32_regs[i] =
-                    std::ptr::read_unaligned((r15 + (i * 4) as u64) as *const u32);
+                a32_regs[i] = std::ptr::read_unaligned((r15 + (i * 4) as u64) as *const u32);
             }
             let a32_upper = std::ptr::read_unaligned((r15 + 64) as *const u32);
             let a32_cpsr_nzcv = std::ptr::read_unaligned((r15 + 76) as *const u32);
@@ -434,6 +433,45 @@ fn main() {
     // Initialise logging backend (upstream: Common::Log::Initialize /
     // SetColorConsoleBackendEnabled / Start).
     env_logger::init();
+
+    // `RUZU_PROFILE_IPC=1` / `RUZU_PROFILE_SVC=1` — install a single SIGUSR2
+    // handler that dumps whichever profile is enabled. atexit hooks fire on
+    // normal exit only (not on signal-terminated runs).
+    let want_ipc_profile = std::env::var_os("RUZU_PROFILE_IPC").is_some();
+    let want_svc_profile = std::env::var_os("RUZU_PROFILE_SVC").is_some();
+    let want_wake_profile = std::env::var_os("RUZU_PROFILE_WAKE").is_some();
+    let want_gap_profile = std::env::var_os("RUZU_PROFILE_GAP").is_some();
+    let want_svc_per_tid = std::env::var_os("RUZU_PROFILE_SVC_PER_TID").is_some();
+    if want_ipc_profile
+        || want_svc_profile
+        || want_wake_profile
+        || want_gap_profile
+        || want_svc_per_tid
+    {
+        extern "C" fn profile_signal(_signum: libc::c_int) {
+            ruzu_core::hle::kernel::svc::svc_ipc::dump_ipc_profile();
+            ruzu_core::hle::kernel::svc_dispatch::dump_svc_profile();
+            ruzu_core::hle::kernel::svc_dispatch::dump_svc_per_tid_profile();
+            ruzu_core::hle::kernel::svc_dispatch::dump_wake_latency();
+            ruzu_core::hle::kernel::svc_dispatch::dump_gap_profile();
+        }
+        unsafe {
+            let mut sa: sdl2::libc::sigaction = std::mem::zeroed();
+            sa.sa_sigaction = profile_signal as usize;
+            sdl2::libc::sigemptyset(&mut sa.sa_mask);
+            sdl2::libc::sigaction(libc::SIGUSR2, &sa, std::ptr::null_mut());
+        }
+        extern "C" fn profile_atexit() {
+            ruzu_core::hle::kernel::svc::svc_ipc::dump_ipc_profile();
+            ruzu_core::hle::kernel::svc_dispatch::dump_svc_profile();
+            ruzu_core::hle::kernel::svc_dispatch::dump_svc_per_tid_profile();
+            ruzu_core::hle::kernel::svc_dispatch::dump_wake_latency();
+            ruzu_core::hle::kernel::svc_dispatch::dump_gap_profile();
+        }
+        unsafe {
+            libc::atexit(profile_atexit);
+        }
+    }
 
     if std::env::var_os("RUZU_SIGILL_TRACE").is_some() {
         unsafe {
@@ -711,7 +749,9 @@ fn main() {
         //   auto renderer = CreateRenderer(system, emu_window, *gpu, context);
         //   gpu->BindRenderer(renderer);
         let system_ref = ruzu_core::core::SystemRef::from_ref(&system);
-        let gpu = Box::new(video_core::gpu::Gpu::new(false, true));
+        let use_async_gpu =
+            *common::settings::values().use_asynchronous_gpu_emulation.get_value();
+        let gpu = Box::new(video_core::gpu::Gpu::new(use_async_gpu, true));
         gpu.set_system_ref(system_ref);
         let gpu_ptr = gpu.as_ref() as *const video_core::gpu::Gpu as usize;
 

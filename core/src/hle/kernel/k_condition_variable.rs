@@ -468,41 +468,35 @@ impl KConditionVariable {
                 return Err(RESULT_INVALID_HANDLE);
             };
 
-            // Update the lock: set address key on current thread and add as waiter.
-            // Matches upstream: cur_thread->SetUserAddressKey(addr, value);
-            //                   owner_thread->AddWaiter(cur_thread);
-            process_guard.remove_from_priority_queue(current_thread_id);
-            let (owner_thread_id, owner_thread_ptr) = {
-                let mut og = owner_thread.lock().unwrap();
-                let id = og.get_thread_id();
-                let ptr = (&mut *og) as *mut KThread as usize;
-                (id, ptr)
+            // Match upstream sequence (k_condition_variable.cpp:179-184):
+            //   cur_thread->SetUserAddressKey(addr, value);
+            //   owner_thread->AddWaiter(cur_thread);
+            //   cur_thread->BeginWait(&wait_queue);
+            //   cur_thread->SetWaitReasonForDebugging(ConditionVar);
+            // Tree insert (AddWaiter) MUST happen before BeginWait flips state
+            // to WAITING — same upstream-order invariant as wait_locked
+            // (CLAUDE.md Rule G).
+            let (priority, address_key, is_kernel) = {
+                let mut ct = current_thread.lock().unwrap();
+                ct.set_user_address_key(KProcessAddress::new(addr), value);
+                (
+                    ct.get_priority(),
+                    ct.get_address_key(),
+                    ct.get_is_kernel_address_key(),
+                )
             };
-            Self::begin_wait_for_address(
+            owner_thread.lock().unwrap().add_waiter(
                 current_thread,
-                owner_thread_id,
-                owner_thread_ptr,
-                addr,
-                value,
+                current_thread_id,
+                priority,
+                address_key,
+                is_kernel,
             );
-            {
-                let ct = current_thread.lock().unwrap();
-                let priority = ct.get_priority();
-                let address_key = ct.get_address_key();
-                let is_kernel = ct.get_is_kernel_address_key();
-                drop(ct);
-                owner_thread.lock().unwrap().add_waiter(
-                    current_thread_id,
-                    priority,
-                    address_key,
-                    is_kernel,
-                );
-            }
+            Self::begin_wait_for_address(current_thread);
 
             log::trace!(
-                "KConditionVariable::wait_for_address sleep tid={} owner_tid={} handle=0x{:08X} addr=0x{:X} value=0x{:08X}",
+                "KConditionVariable::wait_for_address sleep tid={} handle=0x{:08X} addr=0x{:X} value=0x{:08X}",
                 current_thread_id,
-                owner_thread_id,
                 handle,
                 addr,
                 value
@@ -564,17 +558,26 @@ impl KConditionVariable {
                 break;
             }
 
+            // Kernel invariant: a cv-tree entry references a live thread
+            // whose own condvar_key equals the tree-key's cv_key. The tree is
+            // only inserted under scheduler lock by wait_locked (after
+            // SetConditionVariable) and only erased here or in cancel paths
+            // that also clear the thread's state. Upstream dereferences
+            // `*it` unconditionally (k_condition_variable.cpp:252); we match
+            // that and panic on invariant break instead of silently dropping
+            // the signal.
             let waiting_thread_id = waiting_thread_key.thread_id;
-            let Some(waiting_thread) = process_guard.get_thread_by_thread_id(waiting_thread_id)
-            else {
-                self.waiting_threads.erase(waiting_thread_key);
-                continue;
-            };
-
-            if waiting_thread.lock().unwrap().get_condition_variable_key() != cv_key {
-                self.waiting_threads.erase(waiting_thread_key);
-                continue;
-            }
+            let waiting_thread = process_guard
+                .get_thread_by_thread_id(waiting_thread_id)
+                .expect(
+                    "KConditionVariable::signal: cv tree references unknown thread \
+                     (kernel invariant violated — thread cleanup missed tree entry)",
+                );
+            debug_assert_eq!(
+                waiting_thread.lock().unwrap().get_condition_variable_key(),
+                cv_key,
+                "cv tree key and thread condvar_key out of sync",
+            );
 
             // Remove from tree and clear condvar state.
             // Matches upstream: it = m_tree.erase(it);
@@ -837,20 +840,33 @@ impl KConditionVariable {
             return crate::hle::kernel::svc::svc_results::RESULT_TIMED_OUT;
         }
 
+        // Match upstream `KConditionVariable::Wait` tail (k_condition_variable.cpp:324-330):
+        //   cur_thread->SetConditionVariable(&m_tree, addr, key, value);
+        //   m_tree.insert(*cur_thread);
+        //   wait_queue.SetHardwareTimer(timer);
+        //   cur_thread->BeginWait(&wait_queue);
+        //   cur_thread->SetWaitReasonForDebugging(ConditionVar);
+        // Tree insert MUST happen before BeginWait flips state to WAITING —
+        // every step is under the same KScopedSchedulerLockAndSleep, so a
+        // concurrent signal cannot observe the intermediate states, but the
+        // upstream order is preserved literally per CLAUDE.md Rule G.
+        let thread_key = {
+            let mut t = current_thread.lock().unwrap();
+            t.set_condition_variable(KProcessAddress::new(addr), key, value);
+            t.condition_variable_tree_key()
+        };
+        self.waiting_threads.insert(thread_key);
+
         if let Some(timer) = timer {
             wait_queue.set_hardware_timer(timer);
         }
-        log::trace!(
-            "KConditionVariable::wait_locked tid={} before begin_wait_condition_variable",
-            current_thread_id
-        );
 
-        // Update condition variable tracking.
-        // Matches upstream: cur_thread->SetConditionVariable(&m_tree, addr, key, value);
-        //                   m_tree.insert(*cur_thread);
-        Self::begin_wait_condition_variable(current_thread, wait_queue, addr, key, value, timeout);
-        let thread_key = current_thread.lock().unwrap().condition_variable_tree_key();
-        self.waiting_threads.insert(thread_key);
+        {
+            let mut t = current_thread.lock().unwrap();
+            t.begin_wait_with_queue(wait_queue);
+            t.set_wait_reason_for_debugging(ThreadWaitReasonForDebugging::ConditionVar);
+        }
+
         trace_kcv(format_args!(
             "KCV::wait enqueue tid={} addr=0x{:X} key=0x{:X} tag=0x{:08X} timeout={} bucket_count={}",
             current_thread_id,
@@ -961,23 +977,16 @@ impl KConditionVariable {
                         );
                     }
 
+                    // Matches upstream `owner_thread->AddWaiter(thread)`
+                    // (k_condition_variable.cpp:230): KThread::add_waiter
+                    // now sets the waiter's lock-owner back-pointer too.
                     owner_thread.lock().unwrap().add_waiter(
+                        waiting_thread,
                         wt_id,
                         wt_priority,
                         wt_address_key,
                         wt_is_kernel,
                     );
-
-                    let (owner_id, owner_ptr) = {
-                        let mut og = owner_thread.lock().unwrap();
-                        let id = og.get_thread_id();
-                        let ptr = (&mut *og) as *mut KThread as usize;
-                        (id, ptr)
-                    };
-                    waiting_thread
-                        .lock()
-                        .unwrap()
-                        .set_waiting_lock_owner_thread_id(Some(owner_id), owner_ptr);
                 } else {
                     // The lock was tagged with a thread that doesn't exist.
                     // Matches upstream: thread->EndWait(ResultInvalidState);
@@ -1026,43 +1035,21 @@ impl KConditionVariable {
     ///   cur_thread->SetUserAddressKey(addr, value);
     ///   owner_thread->AddWaiter(cur_thread);
     ///   cur_thread->BeginWait(&wait_queue);
-    fn begin_wait_for_address(
-        current_thread: &Arc<KThreadLock>,
-        owner_thread_id: u64,
-        owner_thread_ptr: usize,
-        addr: u64,
-        value: u32,
-    ) {
+    /// Begin-wait tail for `wait_for_address`, matching upstream
+    /// `KConditionVariable::WaitForAddress` (k_condition_variable.cpp:182-184):
+    ///   cur_thread->BeginWait(&wait_queue);
+    ///   cur_thread->SetWaitReasonForDebugging(ConditionVar);
+    ///
+    /// The lock-owner back-pointer is no longer set here — `KThread::add_waiter`
+    /// (called by the caller right before this) sets it as part of upstream's
+    /// `AddWaiter` → `lock_info->AddWaiter` → `waiter->SetWaitingLockInfo(this)`
+    /// chain. The `set_user_address_key` step is also pulled up to the caller
+    /// to match upstream's exact sequencing.
+    fn begin_wait_for_address(current_thread: &Arc<KThreadLock>) {
         let mut current_thread = current_thread.lock().unwrap();
-        current_thread.set_user_address_key(KProcessAddress::new(addr), value);
-        current_thread.set_waiting_lock_owner_thread_id(Some(owner_thread_id), owner_thread_ptr);
         current_thread
             .begin_wait_with_queue(ThreadQueueImplForKConditionVariableWaitForAddress::queue());
         current_thread.set_wait_reason_for_debugging(ThreadWaitReasonForDebugging::ConditionVar);
-    }
-
-    /// Set up a thread to wait on a condition variable.
-    /// Matches upstream logic inside Wait:
-    ///   cur_thread->SetConditionVariable(&m_tree, addr, key, value);
-    ///   m_tree.insert(*cur_thread);
-    ///   cur_thread->BeginWait(&wait_queue);
-    fn begin_wait_condition_variable(
-        current_thread: &Arc<KThreadLock>,
-        wait_queue: KThreadQueue,
-        addr: u64,
-        key: u64,
-        value: u32,
-        timeout: i64,
-    ) {
-        let mut current_thread = current_thread.lock().unwrap();
-        current_thread.set_condition_variable(KProcessAddress::new(addr), key, value);
-        current_thread.set_waiting_lock_owner_thread_id(None, 0);
-        current_thread.begin_wait_with_queue(wait_queue);
-        current_thread.set_wait_reason_for_debugging(ThreadWaitReasonForDebugging::ConditionVar);
-        if timeout > 0 {
-            current_thread.sleep_deadline =
-                deadline_from_timeout_tick(timeout, super::kernel::get_current_hardware_tick());
-        }
     }
 }
 
@@ -1332,15 +1319,12 @@ mod tests {
             let is_kernel = wt.get_is_kernel_address_key();
             let priority = wt.get_priority();
             drop(wt);
-            let owner_ptr = {
-                let mut og = owner.lock().unwrap();
-                og.add_waiter(2, priority, addr_key, is_kernel);
-                (&mut *og) as *mut KThread as usize
-            };
-            waiter
+            // KThread::add_waiter sets the waiter's lock-owner back-pointer
+            // internally (matches upstream AddWaiter semantics).
+            owner
                 .lock()
                 .unwrap()
-                .set_waiting_lock_owner_thread_id(Some(1), owner_ptr);
+                .add_waiter(&waiter, 2, priority, addr_key, is_kernel);
         }
 
         let result = KConditionVariable::signal_to_address(&process, &owner, address);

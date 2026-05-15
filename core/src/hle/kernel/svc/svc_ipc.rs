@@ -365,7 +365,69 @@ pub fn send_sync_request(system: &System, session_handle: Handle) -> ResultCode 
         Some(thread) => thread.lock().unwrap().get_tls_address().get(),
         None => return RESULT_INVALID_HANDLE,
     };
-    send_sync_request_impl(system, session_handle, tls_address)
+    // `RUZU_PROFILE_IPC=1` — measure wall-clock time per SendSyncRequest
+    // and dump a per-handle histogram (count, total_us, avg_us, max_us)
+    // on a SIGUSR1 or process exit. Used to find HLE handlers that are
+    // bottlenecking the producer thread (project_kernel_race_attack_surface_2026_05_14).
+    if std::env::var_os("RUZU_PROFILE_IPC").is_some() {
+        let start = std::time::Instant::now();
+        let result = send_sync_request_impl(system, session_handle, tls_address);
+        record_ipc_profile(session_handle, start.elapsed());
+        result
+    } else {
+        send_sync_request_impl(system, session_handle, tls_address)
+    }
+}
+
+/// Per-handle IPC profile aggregator. `RUZU_PROFILE_IPC=1` populates this;
+/// `dump_ipc_profile()` prints the top-N hottest handles on demand
+/// (registered as a SIGUSR2 handler in `ruzu_cmd::main`, or call at exit).
+static IPC_PROFILE: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<u32, IpcProfileEntry>>,
+> = std::sync::OnceLock::new();
+
+#[derive(Default, Clone)]
+struct IpcProfileEntry {
+    count: u64,
+    total_ns: u64,
+    max_ns: u64,
+}
+
+fn record_ipc_profile(session_handle: u32, elapsed: std::time::Duration) {
+    let map = IPC_PROFILE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    let ns = elapsed.as_nanos() as u64;
+    let mut guard = map.lock().unwrap();
+    let entry = guard.entry(session_handle).or_default();
+    entry.count += 1;
+    entry.total_ns += ns;
+    if ns > entry.max_ns {
+        entry.max_ns = ns;
+    }
+}
+
+/// Print the IPC-profile histogram. Sorted by total_ns descending.
+/// Top 20 entries by default. Called on SIGUSR2 / exit.
+pub fn dump_ipc_profile() {
+    let Some(map) = IPC_PROFILE.get() else {
+        return;
+    };
+    let snap: Vec<(u32, IpcProfileEntry)> = {
+        let guard = map.lock().unwrap();
+        guard.iter().map(|(h, e)| (*h, e.clone())).collect()
+    };
+    let mut snap = snap;
+    snap.sort_by_key(|(_, e)| std::cmp::Reverse(e.total_ns));
+    eprintln!("[IPC_PROFILE] top handles by total time:");
+    for (h, e) in snap.iter().take(20) {
+        eprintln!(
+            "[IPC_PROFILE]   handle=0x{:X}  count={}  total={:.2}ms  avg={:.1}us  max={:.1}us",
+            h,
+            e.count,
+            e.total_ns as f64 / 1e6,
+            e.total_ns as f64 / e.count as f64 / 1e3,
+            e.max_ns as f64 / 1e3,
+        );
+    }
 }
 
 #[cfg(test)]
