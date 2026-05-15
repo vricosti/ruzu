@@ -411,6 +411,10 @@ impl base::BufferCacheRuntime for BufferCacheRuntime {
         }
     }
 
+    fn index_offset(&self) -> usize {
+        BufferCacheRuntime::index_offset(self)
+    }
+
     /// Port of upstream `BufferCacheRuntime::BindVertexBuffers`
     /// (`gl_buffer_cache.cpp:242`).
     fn bind_vertex_buffers(&mut self, bindings: &HostBindings, gpu_handles: &[u32]) {
@@ -433,13 +437,74 @@ impl base::BufferCacheRuntime for BufferCacheRuntime {
 
     fn bind_uniform_buffer(
         &mut self,
-        _stage: usize,
+        stage: usize,
         binding_index: u32,
         _buffer: BufferId,
-        _offset: u32,
-        _size: u32,
+        gpu_handle: u32,
+        offset: u32,
+        size: u32,
     ) {
-        log::trace!("GL bind_uniform_buffer binding={}", binding_index);
+        if self.use_assembly_shaders || gpu_handle == 0 {
+            log::trace!(
+                "GL bind_uniform_buffer skipped stage={} binding={} handle={}",
+                stage,
+                binding_index,
+                gpu_handle
+            );
+            return;
+        }
+        let base_binding = self.graphics_base_uniform_bindings[stage];
+        let binding = base_binding + binding_index;
+        unsafe {
+            gl::BindBufferRange(
+                gl::UNIFORM_BUFFER,
+                binding,
+                gpu_handle,
+                offset as isize,
+                size as isize,
+            );
+            if std::env::var_os("RUZU_DUMP_GL_UBO_BIND").is_some() && stage == 0 && binding == 0 {
+                let dump_size = (size as usize).min(0x240);
+                let mut bytes = vec![0u8; dump_size];
+                gl::GetNamedBufferSubData(
+                    gpu_handle,
+                    offset as isize,
+                    dump_size as isize,
+                    bytes.as_mut_ptr().cast(),
+                );
+                let words: Vec<String> = bytes
+                    .chunks_exact(4)
+                    .take(40)
+                    .map(|chunk| {
+                        format!(
+                            "{:08X}",
+                            u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]])
+                        )
+                    })
+                    .collect();
+                log::info!(
+                    "[GL_UBO_BIND] stage={} binding={} handle={} offset=0x{:X} size=0x{:X} words={}",
+                    stage,
+                    binding,
+                    gpu_handle,
+                    offset,
+                    size,
+                    words.join(" ")
+                );
+            }
+        }
+        log::trace!(
+            "GL bind_uniform_buffer stage={} binding={} handle={} offset=0x{:X} size=0x{:X}",
+            stage,
+            binding,
+            gpu_handle,
+            offset,
+            size
+        );
+    }
+
+    fn set_base_uniform_bindings(&mut self, bindings: &[u32; NUM_STAGES]) {
+        BufferCacheRuntime::set_base_uniform_bindings(self, bindings);
     }
 
     fn bind_storage_buffer(

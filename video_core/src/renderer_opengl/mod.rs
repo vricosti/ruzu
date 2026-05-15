@@ -425,6 +425,7 @@ impl RendererBase for RendererOpenGL {
         if std::env::var_os("RUZU_TRACE_PRESENT").is_some() {
             log::info!("[PRESENT] RendererOpenGL::set_device_memory_reader");
         }
+        self.rasterizer.set_device_memory_reader(reader.clone());
         self.device_memory = Some(reader);
     }
 

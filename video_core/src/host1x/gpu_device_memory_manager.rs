@@ -9,8 +9,8 @@
 //! in Rust we define the trait constants and a placeholder manager struct until
 //! the core device memory manager crate is fully ported.
 
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 
 /// Number of virtual address bits for the Maxwell device address space.
 ///
@@ -270,11 +270,7 @@ impl MaxwellDeviceMemoryManager {
             match table.get(&page) {
                 Some(&base) => unsafe {
                     let dst = (base + page_off) as *mut u8;
-                    std::ptr::copy_nonoverlapping(
-                        data.as_ptr().add(in_off),
-                        dst,
-                        bytes_in_page,
-                    );
+                    std::ptr::copy_nonoverlapping(data.as_ptr().add(in_off), dst, bytes_in_page);
                 },
                 None => return false,
             }
@@ -432,14 +428,12 @@ mod tests {
 
     /// Helper: a `MarkRegionCaching` callback that records every call so
     /// tests can assert the upstream batching semantics.
-    fn recorder() -> (
-        MarkRegionCachingFn,
-        Arc<Mutex<Vec<(u64, usize, bool)>>>,
-    ) {
+    fn recorder() -> (MarkRegionCachingFn, Arc<Mutex<Vec<(u64, usize, bool)>>>) {
         let log = Arc::new(Mutex::new(Vec::new()));
         let log_clone = Arc::clone(&log);
-        let cb: MarkRegionCachingFn =
-            Box::new(move |addr, size, caching| log_clone.lock().unwrap().push((addr, size, caching)));
+        let cb: MarkRegionCachingFn = Box::new(move |addr, size, caching| {
+            log_clone.lock().unwrap().push((addr, size, caching))
+        });
         (cb, log)
     }
 
@@ -455,7 +449,10 @@ mod tests {
         mgr.update_pages_cached_count(0x1000, 0x100, -1);
 
         let calls = log.lock().unwrap();
-        assert_eq!(*calls, vec![(0x1000, 0x1000, true), (0x1000, 0x1000, false)]);
+        assert_eq!(
+            *calls,
+            vec![(0x1000, 0x1000, true), (0x1000, 0x1000, false)]
+        );
     }
 
     #[test]
@@ -483,7 +480,10 @@ mod tests {
         mgr.update_pages_cached_count(0x2000, 0x1000, -1); // 1→0: uncache
 
         let calls = log.lock().unwrap();
-        assert_eq!(*calls, vec![(0x2000, 0x1000, true), (0x2000, 0x1000, false)]);
+        assert_eq!(
+            *calls,
+            vec![(0x2000, 0x1000, true), (0x2000, 0x1000, false)]
+        );
     }
 
     #[test]

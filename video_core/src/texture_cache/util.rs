@@ -10,7 +10,11 @@
 //! and constant definitions are ported in full; complex bodies are stubbed
 //! with `todo!()` and will be filled as dependent types are completed.
 
-use super::format_lookup_table::PixelFormat;
+use crate::textures::texture::TicEntry;
+
+use super::format_lookup_table::{
+    pixel_format_from_texture_info, ComponentType, PixelFormat, TextureFormat,
+};
 use super::image_base::{GPUVAddr, ImageBase, VAddr};
 use super::image_info::ImageInfo;
 use super::types::*;
@@ -563,12 +567,31 @@ pub fn calculate_level_stride_alignment(info: &ImageInfo, level: u32) -> u32 {
 // ── Format helpers ─────────────────────────────────────────────────────
 
 /// Port of `PixelFormatFromTIC`.
-///
-/// Full implementation requires `Tegra::Texture::TICEntry`, which is not yet
-/// ported.  Returns `PixelFormat::Invalid` and logs a warning.
-pub fn pixel_format_from_tic(_config: &()) -> PixelFormat {
-    log::warn!("pixel_format_from_tic: TICEntry not yet ported — returning Invalid");
-    PixelFormat::Invalid
+pub fn pixel_format_from_tic(config: &TicEntry) -> PixelFormat {
+    let Some(format) = TextureFormat::from_raw(config.format()) else {
+        return PixelFormat::Invalid;
+    };
+    let Some(red) = ComponentType::from_raw(config.r_type()) else {
+        return PixelFormat::Invalid;
+    };
+    let Some(green) = ComponentType::from_raw(config.g_type()) else {
+        return PixelFormat::Invalid;
+    };
+    let Some(blue) = ComponentType::from_raw(config.b_type()) else {
+        return PixelFormat::Invalid;
+    };
+    let Some(alpha) = ComponentType::from_raw(config.a_type()) else {
+        return PixelFormat::Invalid;
+    };
+
+    pixel_format_from_texture_info(
+        format,
+        red,
+        green,
+        blue,
+        alpha,
+        config.srgb_conversion() != 0,
+    )
 }
 
 /// Port of `RenderTargetImageViewType`.

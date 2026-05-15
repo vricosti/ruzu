@@ -486,6 +486,13 @@ pub trait BufferCacheRuntime {
     /// separately because `BufferBase` is backend-agnostic.
     fn bind_index_buffer(&mut self, buffer: BufferId, gpu_handle: u32, offset: u32, size: u32);
 
+    /// Return the backend index offset consumed by the rasterizer draw call.
+    ///
+    /// Upstream OpenGL exposes this as `BufferCacheRuntime::IndexOffset()`.
+    fn index_offset(&self) -> usize {
+        0
+    }
+
     // -- Vertex buffer binding --
 
     /// Bind vertex buffers collected in `HostBindings`.
@@ -506,9 +513,16 @@ pub trait BufferCacheRuntime {
         stage: usize,
         binding_index: u32,
         buffer: BufferId,
+        gpu_handle: u32,
         offset: u32,
         size: u32,
     );
+
+    /// Set per-stage base uniform binding points.
+    ///
+    /// Upstream OpenGL stores this on `BufferCacheRuntime` and adds the base
+    /// to each stage-local uniform binding index.
+    fn set_base_uniform_bindings(&mut self, _bindings: &[u32; NUM_STAGES as usize]) {}
 
     // -- Storage buffer binding (graphics) --
 

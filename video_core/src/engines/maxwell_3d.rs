@@ -539,12 +539,12 @@ impl IndexFormat {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
 pub enum ShadowRamControl {
-    /// Normal operation — no shadowing.
-    MethodTrack = 0,
     /// Track writes into shadow state.
-    Track = 1,
+    Track = 0,
     /// Track with filter.
-    TrackWithFilter = 2,
+    TrackWithFilter = 1,
+    /// Only write to the real hardware register.
+    Passthrough = 2,
     /// Replay from shadow state instead of using written values.
     Replay = 3,
 }
@@ -552,10 +552,11 @@ pub enum ShadowRamControl {
 impl ShadowRamControl {
     pub fn from_raw(value: u32) -> Self {
         match value {
-            1 => Self::Track,
-            2 => Self::TrackWithFilter,
+            0 => Self::Track,
+            1 => Self::TrackWithFilter,
+            2 => Self::Passthrough,
             3 => Self::Replay,
-            _ => Self::MethodTrack,
+            _ => Self::Passthrough,
         }
     }
 }
@@ -1493,7 +1494,7 @@ impl SamplerDescriptor {
 // ── Info structs ────────────────────────────────────────────────────────────
 
 /// Information about an active vertex stream.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct VertexStreamInfo {
     pub index: u32,
     pub address: u64,
@@ -1562,6 +1563,17 @@ pub struct BlendColorInfo {
     pub a: f32,
 }
 
+impl Default for BlendColorInfo {
+    fn default() -> Self {
+        Self {
+            r: 0.0,
+            g: 0.0,
+            b: 0.0,
+            a: 0.0,
+        }
+    }
+}
+
 /// Stencil state for one face.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StencilFaceInfo {
@@ -1601,6 +1613,21 @@ pub struct DepthStencilInfo {
     pub back: StencilFaceInfo,
 }
 
+impl Default for DepthStencilInfo {
+    fn default() -> Self {
+        Self {
+            depth_test_enable: false,
+            depth_write_enable: false,
+            depth_func: ComparisonOp::Always,
+            depth_mode: DepthMode::ZeroToOne,
+            stencil_enable: false,
+            stencil_two_side: false,
+            front: StencilFaceInfo::default(),
+            back: StencilFaceInfo::default(),
+        }
+    }
+}
+
 /// Vertex attribute info unpacked from a single register word.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VertexAttribInfo {
@@ -1610,6 +1637,19 @@ pub struct VertexAttribInfo {
     pub size: VertexAttribSize,
     pub attrib_type: VertexAttribType,
     pub bgra: bool,
+}
+
+impl Default for VertexAttribInfo {
+    fn default() -> Self {
+        Self {
+            buffer_index: 0,
+            constant: false,
+            offset: 0,
+            size: VertexAttribSize::Invalid,
+            attrib_type: VertexAttribType::Invalid,
+            bgra: false,
+        }
+    }
 }
 
 /// Shader stage info for one of the 6 pipeline program slots.
@@ -1683,6 +1723,23 @@ pub struct RasterizerInfo {
     pub depth_bias: f32,
     pub slope_scale_depth_bias: f32,
     pub depth_bias_clamp: f32,
+}
+
+impl Default for RasterizerInfo {
+    fn default() -> Self {
+        Self {
+            cull_enable: false,
+            front_face: FrontFace::CCW,
+            cull_face: CullFace::Back,
+            polygon_mode_front: PolygonMode::Fill,
+            polygon_mode_back: PolygonMode::Fill,
+            line_width_smooth: 1.0,
+            line_width_aliased: 1.0,
+            depth_bias: 0.0,
+            slope_scale_depth_bias: 0.0,
+            depth_bias_clamp: 0.0,
+        }
+    }
 }
 
 /// A constant buffer binding for one slot of one shader stage.
@@ -1875,6 +1932,11 @@ impl Maxwell3D {
         draw_state.shader_program_addresses = shader_program_addresses;
         draw_state.index_buffer_gpu_addr = index_buffer_gpu_addr;
         draw_state.index_buffer_gpu_addr_end = index_buffer_gpu_addr_end;
+        draw_state.vertex_streams = std::array::from_fn(|i| self.vertex_stream_info(i as u32));
+        draw_state.vertex_stream_limits =
+            std::array::from_fn(|i| self.vertex_stream_limit(i as u32));
+        draw_state.vertex_attribs_snapshot =
+            std::array::from_fn(|i| self.vertex_attrib_info(i as u32));
     }
 
     fn with_draw_manager<R>(&mut self, f: impl FnOnce(&mut dm::DrawManager, &mut Self) -> R) -> R {
@@ -2411,6 +2473,16 @@ impl Maxwell3D {
             address: (addr_high << 32) | addr_low,
             stride: word0 & 0xFFF,
             enabled: (word0 & (1 << 12)) != 0,
+        }
+    }
+
+    /// Read vertex stream limit `index` (0..31) from registers.
+    pub fn vertex_stream_limit(&self, index: u32) -> dm::VertexStreamLimit {
+        let base = VERTEX_STREAM_LIMIT_BASE as usize + index as usize * 2;
+        let high = self.regs[base] as u64;
+        let low = self.regs[base + 1] as u64;
+        dm::VertexStreamLimit {
+            address: (high << 32) | low,
         }
     }
 
@@ -3119,6 +3191,10 @@ impl dm::Maxwell3DAccess for Maxwell3D {
         self.vertex_stream_info(index)
     }
 
+    fn vertex_stream_limit(&self, index: u32) -> dm::VertexStreamLimit {
+        self.vertex_stream_limit(index)
+    }
+
     fn viewport_info(&self, index: u32) -> ViewportInfo {
         self.viewport_info(index)
     }
@@ -3244,7 +3320,7 @@ impl Maxwell3D {
                 argument
             }
             ShadowRamControl::Replay => self.shadow_state[method as usize],
-            ShadowRamControl::MethodTrack => argument,
+            ShadowRamControl::Passthrough => argument,
         }
     }
 
@@ -3377,9 +3453,51 @@ impl Maxwell3D {
                 let _ = self.with_rasterizer_mut(|rasterizer| rasterizer.tiled_cache_barrier());
             }
             _ => {
+                let trace_draw_method = std::env::var_os("RUZU_TRACE_DRAW_METHODS").is_some()
+                    && (method == DRAW_BEGIN
+                        || method == DRAW_END
+                        || method == VB_FIRST
+                        || method == VB_COUNT
+                        || method == IB_BASE
+                        || method == IB_BASE + IB_OFF_FIRST
+                        || method == IB_BASE + IB_OFF_COUNT);
+                if trace_draw_method {
+                    let state = self.draw_manager.get_draw_state();
+                    eprintln!(
+                        "[DRAW_METHOD_BEFORE] method=0x{:X} arg=0x{:X} last={} mode={:?} inst_count={} indexed={} vb_first={} vb_count={} ib_first={} ib_count={} execute_on={} shader_addrs={:X?}",
+                        method,
+                        argument,
+                        is_last_call,
+                        state.draw_mode,
+                        state.instance_count,
+                        state.draw_indexed,
+                        state.vertex_buffer.first,
+                        state.vertex_buffer.count,
+                        state.index_buffer.first,
+                        state.index_buffer.count,
+                        self.execute_on,
+                        self.shader_program_addresses(),
+                    );
+                }
                 self.with_draw_manager(|draw_manager, this| {
                     draw_manager.process_method_call(method, argument, this);
                 });
+                if trace_draw_method {
+                    let state = self.draw_manager.get_draw_state();
+                    eprintln!(
+                        "[DRAW_METHOD_AFTER] method=0x{:X} mode={:?} inst_count={} indexed={} vb_first={} vb_count={} ib_first={} ib_count={} execute_on={} shader_addrs={:X?}",
+                        method,
+                        state.draw_mode,
+                        state.instance_count,
+                        state.draw_indexed,
+                        state.vertex_buffer.first,
+                        state.vertex_buffer.count,
+                        state.index_buffer.first,
+                        state.index_buffer.count,
+                        self.execute_on,
+                        self.shader_program_addresses(),
+                    );
+                }
             }
         }
     }
@@ -3796,8 +3914,21 @@ impl Maxwell3D {
         self.executing_macro = 0;
 
         let entry = ((method - MACRO_REGISTERS_START) >> 1) % 128;
-        let params = std::mem::take(&mut self.macro_params);
+        let params = self.macro_params.clone();
         let macro_method = self.macro_positions[entry as usize];
+        if std::env::var_os("RUZU_TRACE_MACRO_CALL").is_some() {
+            eprintln!(
+                "[MACRO_CALL] trigger=0x{:X} entry={} macro_start=0x{:X} param_count={} params={:08X?} addrs={:X?} segments={:X?} dirty={}",
+                method,
+                entry,
+                macro_method,
+                params.len(),
+                params,
+                self.macro_addresses,
+                self.macro_segments,
+                self.current_macro_dirty,
+            );
+        }
         if should_trace_dma_flow() {
             let trace_idx = MAXWELL3D_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
             if trace_idx < 128 {
@@ -3830,24 +3961,25 @@ impl Maxwell3D {
         // MK8D — see project_mk8d_shader_uninitialized_2026_05_14.md.
         let trace_macro_writes = std::env::var_os("RUZU_TRACE_MACRO_WRITE").is_some();
         let macro_start_for_trace = macro_method;
-        let compile = move |code: &[u32]| -> Box<dyn crate::macro_engine::macro_engine::CachedMacro> {
-            let mut program = MacroInterpreterImpl::new(code.to_vec());
-            let writer_ptr = self_ptr;
-            program.set_method_writer(move |address, value, _is_last_call| {
-                if trace_macro_writes {
-                    eprintln!(
-                        "[MACRO_WRITE] macro_start=0x{:X} method=0x{:X} value=0x{:08X}",
-                        macro_start_for_trace, address, value
-                    );
-                }
-                unsafe {
-                    writer_ptr.call_method(address, value);
-                }
-            });
-            let reader_ptr = self_ptr;
-            program.set_method_reader(move |method| unsafe { reader_ptr.read_reg(method) });
-            Box::new(program)
-        };
+        let compile =
+            move |code: &[u32]| -> Box<dyn crate::macro_engine::macro_engine::CachedMacro> {
+                let mut program = MacroInterpreterImpl::new(code.to_vec());
+                let writer_ptr = self_ptr;
+                program.set_method_writer(move |address, value, _is_last_call| {
+                    if trace_macro_writes {
+                        eprintln!(
+                            "[MACRO_WRITE] macro_start=0x{:X} method=0x{:X} value=0x{:08X}",
+                            macro_start_for_trace, address, value
+                        );
+                    }
+                    unsafe {
+                        writer_ptr.call_method(address, value);
+                    }
+                });
+                let reader_ptr = self_ptr;
+                program.set_method_reader(move |method| unsafe { reader_ptr.read_reg(method) });
+                Box::new(program)
+            };
         self.macro_engine.execute(
             macro_method,
             &params,
@@ -3856,9 +3988,35 @@ impl Maxwell3D {
         );
 
         // Upstream calls draw_manager->DrawDeferred() here.
+        if std::env::var_os("RUZU_TRACE_DRAW_DEFERRED").is_some() {
+            let state = self.draw_manager.get_draw_state();
+            eprintln!(
+                "[DRAW_DEFERRED_BEFORE] macro_method=0x{:X} mode={:?} inst_count={} indexed={} vb_first={} vb_count={} ib_first={} ib_count={} shader_addrs={:X?}",
+                macro_method,
+                state.draw_mode,
+                state.instance_count,
+                state.draw_indexed,
+                state.vertex_buffer.first,
+                state.vertex_buffer.count,
+                state.index_buffer.first,
+                state.index_buffer.count,
+                self.shader_program_addresses(),
+            );
+        }
         self.with_draw_manager(|draw_manager, this| {
             draw_manager.draw_deferred(this);
         });
+        if std::env::var_os("RUZU_TRACE_DRAW_DEFERRED").is_some() {
+            let state = self.draw_manager.get_draw_state();
+            eprintln!(
+                "[DRAW_DEFERRED_AFTER] macro_method=0x{:X} mode={:?} inst_count={} indexed={} shader_addrs={:X?}",
+                macro_method,
+                state.draw_mode,
+                state.instance_count,
+                state.draw_indexed,
+                self.shader_program_addresses(),
+            );
+        }
 
         self.macro_params.clear();
         self.macro_addresses.clear();
@@ -3891,7 +4049,7 @@ impl Maxwell3D {
                     self.process_dirty_registers(*method, shadow_val);
                 }
             }
-            ShadowRamControl::MethodTrack => {
+            ShadowRamControl::Passthrough => {
                 for (method, value) in &sink {
                     self.process_dirty_registers(*method, *value);
                 }
@@ -3967,7 +4125,7 @@ impl Maxwell3D {
             return;
         }
         let method = self.executing_macro;
-        let params = std::mem::take(&mut self.macro_params);
+        let params = self.macro_params.clone();
         let entry = ((method - MACRO_METHODS_START) >> 1) % 128;
         let macro_method = self.macro_positions[entry as usize];
         let self_raw = std::ptr::from_mut(self);
@@ -4157,6 +4315,7 @@ mod tests {
         inline_to_memory: Vec<(u64, usize, Vec<u8>)>,
         /// (instance_count, draw_indexed, shader_program_addresses) per `draw` call.
         draws: Vec<(u32, bool, [u64; 6])>,
+        draw_states: Vec<crate::engines::draw_manager::DrawState>,
     }
 
     struct TestRasterizer {
@@ -4180,6 +4339,11 @@ mod tests {
                 draw_state.draw_indexed,
                 draw_state.shader_program_addresses,
             ));
+            self.calls
+                .lock()
+                .unwrap()
+                .draw_states
+                .push(draw_state.clone());
         }
         fn draw_texture(&mut self) {
             self.calls.lock().unwrap().draw_texture += 1;
@@ -6344,6 +6508,44 @@ mod tests {
     }
 
     #[test]
+    fn test_call_macro_keeps_params_alive_for_refresh_parameters() {
+        let gpu = crate::gpu::Gpu::new(false, false);
+        gpu.set_guest_memory_reader(std::sync::Arc::new(|addr, output| {
+            let backing = [0xEF, 0xBE, 0xAD, 0xDE];
+            let start = (addr - 0x2000) as usize;
+            output.copy_from_slice(&backing[start..start + output.len()]);
+        }));
+
+        let memory_manager = std::sync::Arc::new(parking_lot::Mutex::new(
+            crate::memory_manager::MemoryManager::default(),
+        ));
+        memory_manager.lock().map(0x1000, 0x2000, 4, 0, false);
+
+        let mut engine = Maxwell3D::new();
+        engine.set_memory_manager(std::sync::Arc::clone(&memory_manager));
+        let gpu_ptr = &gpu as *const crate::gpu::Gpu as usize;
+        engine.set_guest_memory_reader(std::sync::Arc::new(move |addr, output| unsafe {
+            let gpu = &*(gpu_ptr as *const crate::gpu::Gpu);
+            let _ = gpu.read_guest_memory(addr, output);
+        }));
+
+        let exit_nop = 0b1 | (0b001 << 4) | (1 << 7) | (1 << 8);
+        let nop = 0b1 | (0b001 << 4) | (1 << 8);
+        engine.macro_positions[0] = 0x100;
+        engine.macro_engine.add_code(0x100, exit_nop);
+        engine.macro_engine.add_code(0x100, nop);
+        engine.macro_params = vec![0];
+        engine.macro_segments.push((0x1000, 1));
+        engine.current_macro_dirty = true;
+
+        engine.call_macro_method(MACRO_REGISTERS_START);
+
+        assert!(engine.macro_params.is_empty());
+        assert!(engine.macro_segments.is_empty());
+        assert!(!engine.any_parameters_dirty());
+    }
+
+    #[test]
     fn test_load_mme_bind() {
         let mut engine = Maxwell3D::new();
 
@@ -7204,6 +7406,35 @@ mod tests {
         assert_eq!(draw.base_vertex, 7);
         assert_eq!(draw.base_instance, 3);
         assert_eq!(draw.instance_count, 1);
+    }
+
+    #[test]
+    fn test_draw_state_snapshots_vertex_streams_and_limits_for_buffer_cache() {
+        let mut engine = Maxwell3D::new();
+        let calls = Arc::new(Mutex::new(RasterizerCalls::default()));
+        let rasterizer = TestRasterizer::new(calls.clone());
+        engine.bind_rasterizer(&rasterizer);
+
+        let stream_base = VERTEX_STREAM_BASE as usize;
+        engine.regs[stream_base] = (1 << 12) | 0x20;
+        engine.regs[stream_base + 1] = 0x1;
+        engine.regs[stream_base + 2] = 0x2000;
+        let limit_base = VERTEX_STREAM_LIMIT_BASE as usize;
+        engine.regs[limit_base] = 0x1;
+        engine.regs[limit_base + 1] = 0x2FFF;
+
+        engine.write_reg(VB_FIRST, 0);
+        engine.write_reg(VB_COUNT, 4);
+        engine.write_reg(DRAW_BEGIN, PrimitiveTopology::Triangles as u32);
+        engine.write_reg(DRAW_END, 0);
+
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls.draw_states.len(), 1);
+        let state = &calls.draw_states[0];
+        assert_eq!(state.vertex_streams[0].address, 0x1_0000_2000);
+        assert_eq!(state.vertex_streams[0].stride, 0x20);
+        assert!(state.vertex_streams[0].enabled);
+        assert_eq!(state.vertex_stream_limits[0].address, 0x1_0000_2FFF);
     }
 
     #[test]

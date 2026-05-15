@@ -50,9 +50,7 @@ fn command_words_find_value() -> Option<u32> {
     *VALUE.get_or_init(|| {
         std::env::var("RUZU_FIND_COMMAND_WORD")
             .ok()
-            .and_then(|value| {
-                u32::from_str_radix(value.trim().trim_start_matches("0x"), 16).ok()
-            })
+            .and_then(|value| u32::from_str_radix(value.trim().trim_start_matches("0x"), 16).ok())
     })
 }
 
@@ -862,6 +860,15 @@ impl DmaPusher {
     /// Dispatch a single method call to an engine. Matches upstream
     /// `DmaPusher::CallMethod`.
     fn dispatch_method(&mut self, argument: u32) {
+        if std::env::var_os("RUZU_TRACE_PULLER").is_some() {
+            eprintln!(
+                "[PULL] m=0x{:X} arg=0x{:08X} subch={} count={}",
+                self.dma_state.method,
+                argument,
+                self.dma_state.subchannel,
+                self.dma_state.method_count,
+            );
+        }
         if self.dma_state.method < NON_PULLER_METHODS {
             let trace_idx = DISPATCH_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
             if trace_idx < 48 {

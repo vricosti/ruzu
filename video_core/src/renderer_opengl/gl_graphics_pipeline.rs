@@ -8,8 +8,10 @@
 use std::hash::{Hash, Hasher};
 use std::sync::{Condvar, Mutex};
 
+use crate::buffer_cache::buffer_cache_base::UniformBufferSizes;
 use crate::transform_feedback::TransformFeedbackState;
 use common::cityhash::city_hash64;
+use shader_recompiler::shader_info::{num_descriptors, Info as ShaderInfo};
 
 /// Maximum number of textures bound to a graphics pipeline.
 pub const MAX_TEXTURES: u32 = 64;
@@ -74,6 +76,22 @@ impl GraphicsPipelineKey {
     /// Returns the early_z bit.
     pub fn early_z(&self) -> bool {
         ((self.raw >> 1) & 1) != 0
+    }
+
+    pub fn gs_input_topology(&self) -> u32 {
+        (self.raw & Self::GS_INPUT_TOPOLOGY_MASK) >> Self::GS_INPUT_TOPOLOGY_SHIFT
+    }
+
+    pub fn tessellation_primitive(&self) -> u32 {
+        (self.raw & Self::TESSELLATION_PRIMITIVE_MASK) >> Self::TESSELLATION_PRIMITIVE_SHIFT
+    }
+
+    pub fn tessellation_spacing(&self) -> u32 {
+        (self.raw & Self::TESSELLATION_SPACING_MASK) >> Self::TESSELLATION_SPACING_SHIFT
+    }
+
+    pub fn tessellation_clockwise(&self) -> bool {
+        ((self.raw & Self::TESSELLATION_CLOCKWISE_MASK) >> Self::TESSELLATION_CLOCKWISE_SHIFT) != 0
     }
 
     pub fn set_xfb_enabled(&mut self, enabled: bool) {
@@ -154,6 +172,8 @@ pub struct GraphicsPipeline {
 
     /// Per-stage enabled uniform buffer masks.
     pub enabled_uniform_buffer_masks: [u32; NUM_STAGES],
+    /// Per-stage uniform buffer used sizes.
+    pub uniform_buffer_sizes: UniformBufferSizes,
     /// Per-stage base uniform bindings.
     pub base_uniform_bindings: [u32; NUM_STAGES],
     /// Per-stage base storage bindings.
@@ -214,6 +234,9 @@ impl GraphicsPipeline {
             assembly_programs: [0; NUM_STAGES],
             enabled_stages_mask: 0,
             enabled_uniform_buffer_masks: [0; NUM_STAGES],
+            uniform_buffer_sizes: [[0;
+                crate::buffer_cache::buffer_cache_base::NUM_GRAPHICS_UNIFORM_BUFFERS as usize];
+                NUM_STAGES],
             base_uniform_bindings: [0; NUM_STAGES],
             base_storage_bindings: [0; NUM_STAGES],
             num_texture_buffers: [0; NUM_STAGES],
@@ -229,6 +252,43 @@ impl GraphicsPipeline {
             built_fence: std::ptr::null(),
             is_built: true,
             program_pipeline: 0,
+        }
+    }
+
+    /// Populate per-stage descriptor metadata from translated shader infos.
+    ///
+    /// Port of the metadata loop in upstream
+    /// `GraphicsPipeline::GraphicsPipeline(...)` (`gl_graphics_pipeline.cpp`):
+    /// enabled stage mask, per-stage UBO mask/sizes, and cumulative base
+    /// bindings are derived from `Shader::Info`.
+    pub fn apply_shader_infos(&mut self, infos: &[Option<ShaderInfo>; NUM_STAGES]) {
+        self.enabled_stages_mask = 0;
+        self.enabled_uniform_buffer_masks = [0; NUM_STAGES];
+        self.uniform_buffer_sizes = [[0;
+            crate::buffer_cache::buffer_cache_base::NUM_GRAPHICS_UNIFORM_BUFFERS as usize];
+            NUM_STAGES];
+        self.base_uniform_bindings = [0; NUM_STAGES];
+        self.base_storage_bindings = [0; NUM_STAGES];
+        self.num_texture_buffers = [0; NUM_STAGES];
+        self.num_image_buffers = [0; NUM_STAGES];
+
+        for stage in 0..NUM_STAGES {
+            if let Some(info) = infos[stage].as_ref() {
+                self.enabled_stages_mask |= 1u32 << stage;
+                self.enabled_uniform_buffer_masks[stage] = info.constant_buffer_mask;
+                self.uniform_buffer_sizes[stage].copy_from_slice(&info.constant_buffer_used_sizes);
+            }
+
+            if stage < NUM_STAGES - 1 {
+                self.base_uniform_bindings[stage + 1] = self.base_uniform_bindings[stage];
+                self.base_storage_bindings[stage + 1] = self.base_storage_bindings[stage];
+                if let Some(info) = infos[stage].as_ref() {
+                    self.base_uniform_bindings[stage + 1] +=
+                        num_descriptors(&info.constant_buffer_descriptors);
+                    self.base_storage_bindings[stage + 1] +=
+                        num_descriptors(&info.storage_buffers_descriptors);
+                }
+            }
         }
     }
 
@@ -287,6 +347,10 @@ impl GraphicsPipeline {
     /// Whether any compiled GL program has been attached to this pipeline.
     pub fn has_gl_programs(&self) -> bool {
         self.source_programs.iter().any(|h| *h != 0)
+    }
+
+    pub fn program_pipeline_handle(&self) -> u32 {
+        self.program_pipeline
     }
 
     /// Compile and link the staged GLSL sources into per-stage separable
