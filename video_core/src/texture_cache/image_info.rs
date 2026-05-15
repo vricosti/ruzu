@@ -230,8 +230,71 @@ impl ImageInfo {
     /// Construct from a render target config.
     ///
     /// Port of `ImageInfo::ImageInfo(const RenderTargetConfig& ct, MsaaMode)`.
-    ///
-    /// Requires Maxwell3D register types not yet ported.
+    pub fn from_render_target_info(
+        config: &crate::engines::maxwell_3d::RenderTargetInfo,
+        msaa_mode: u32,
+    ) -> Self {
+        let format = crate::surface::pixel_format_from_render_target_format(config.format);
+        let is_pitch_linear = (config.tile_mode & (1 << 12)) != 0;
+        let dim_control_define_depth_size = (config.tile_mode & (1 << 16)) != 0;
+        let mut info = Self {
+            format,
+            image_type: ImageType::E2D,
+            resources: SubresourceExtent {
+                levels: 1,
+                layers: 1,
+            },
+            size: Extent3D {
+                width: config.width,
+                height: config.height,
+                depth: 1,
+            },
+            tiling: TilingMode::default(),
+            layer_stride: 0,
+            maybe_unaligned_layer_stride: 0,
+            // Ruzu's draw-state snapshot does not carry the AA mode yet.
+            // Preserve the current single-sample behavior until the
+            // Maxwell3D MSAA register is threaded through this call.
+            num_samples: if msaa_mode == 0 { 1 } else { 1 },
+            tile_width_spacing: 0,
+            rescaleable: false,
+            downscaleable: false,
+            forced_flushed: is_pitch_linear,
+            dma_downloaded: is_pitch_linear,
+            is_sparse: false,
+        };
+
+        if is_pitch_linear {
+            let pitch = config.width;
+            info.image_type = ImageType::Linear;
+            info.tiling = TilingMode::PitchLinear(pitch);
+            info.size.width = pitch / crate::surface::bytes_per_block(format);
+            return info;
+        }
+
+        info.layer_stride = config.array_pitch.saturating_mul(4);
+        info.maybe_unaligned_layer_stride = info.layer_stride;
+        info.tiling = TilingMode::BlockLinear(Extent3D {
+            width: config.tile_mode & 0xF,
+            height: (config.tile_mode >> 4) & 0xF,
+            depth: (config.tile_mode >> 8) & 0xF,
+        });
+        if dim_control_define_depth_size {
+            info.image_type = ImageType::E3D;
+            info.size.depth = config.depth & 0xFFFF;
+        } else {
+            info.image_type = ImageType::E2D;
+            info.resources.layers = (config.depth & 0xFFFF).max(1) as i32;
+            info.rescaleable =
+                info.block().depth == 0 && info.size.height > RESCALE_HEIGHT_THRESHOLD;
+            info.downscaleable = info.size.height > DOWNSCALE_HEIGHT_THRESHOLD;
+        }
+
+        info
+    }
+
+    /// Compatibility stub for older Rust call sites. New render-target paths
+    /// should use `from_render_target_info`.
     pub fn from_render_target_config(_ct: &(), _msaa_mode: u32) -> Self {
         log::warn!(
             "ImageInfo::from_render_target_config: Maxwell3D regs not yet ported — returning default"
@@ -252,11 +315,54 @@ impl ImageInfo {
     /// Construct from a Fermi2D surface.
     ///
     /// Port of `ImageInfo::ImageInfo(const Fermi2D::Surface& config)`.
-    ///
-    /// Requires Fermi2D engine types not yet ported.
-    pub fn from_fermi2d_surface(_config: &()) -> Self {
-        log::warn!("ImageInfo::from_fermi2d_surface: Fermi2D not yet ported — returning default");
-        Self::default()
+    pub fn from_fermi2d_surface(config: &crate::engines::fermi_2d::Surface) -> Self {
+        if config.layer != 0 {
+            log::warn!("ImageInfo::from_fermi2d_surface: surface layer is not zero");
+        }
+        let format = crate::surface::pixel_format_from_render_target_format(config.format as u32);
+        let forced_flushed = config.linear == crate::engines::fermi_2d::MemoryLayout::Pitch;
+        let mut info = Self {
+            format,
+            image_type: ImageType::E2D,
+            resources: SubresourceExtent {
+                levels: 1,
+                layers: 1,
+            },
+            size: Extent3D {
+                width: config.width,
+                height: config.height,
+                depth: 1,
+            },
+            tiling: TilingMode::default(),
+            layer_stride: 0,
+            maybe_unaligned_layer_stride: 0,
+            num_samples: 1,
+            tile_width_spacing: 0,
+            rescaleable: false,
+            downscaleable: false,
+            forced_flushed,
+            dma_downloaded: forced_flushed,
+            is_sparse: false,
+        };
+
+        if config.linear == crate::engines::fermi_2d::MemoryLayout::Pitch {
+            info.image_type = ImageType::Linear;
+            info.size.width = config.pitch / crate::surface::bytes_per_block(format);
+            info.tiling = TilingMode::PitchLinear(config.pitch);
+        } else {
+            info.image_type = if config.block_depth() > 0 {
+                ImageType::E3D
+            } else {
+                ImageType::E2D
+            };
+            info.tiling = TilingMode::BlockLinear(Extent3D {
+                width: config.block_width(),
+                height: config.block_height(),
+                depth: config.block_depth(),
+            });
+        }
+
+        info
     }
 
     /// Construct from a DMA image operand.
@@ -284,5 +390,63 @@ pub fn byte_size_to_format(bytes_per_pixel: u32) -> PixelFormat {
             log::error!("ByteSizeToFormat: unimplemented bpp={}", bytes_per_pixel);
             PixelFormat::Invalid
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engines::maxwell_3d::RenderTargetInfo;
+    use crate::surface::PixelFormat as SurfacePixelFormat;
+
+    #[test]
+    fn render_target_info_decodes_block_linear_layout() {
+        let info = ImageInfo::from_render_target_info(
+            &RenderTargetInfo {
+                address: 0x5000_0000,
+                width: 1920,
+                height: 1080,
+                format: 0xD5,
+                tile_mode: 2 | (3 << 4) | (1 << 8),
+                depth: 4,
+                array_pitch: 0x200,
+                base_layer: 0,
+            },
+            0,
+        );
+
+        assert_eq!(info.format, SurfacePixelFormat::A8B8G8R8Unorm);
+        assert_eq!(info.image_type, ImageType::E2D);
+        assert_eq!(info.size.width, 1920);
+        assert_eq!(info.size.height, 1080);
+        assert_eq!(info.resources.layers, 4);
+        assert_eq!(info.layer_stride, 0x800);
+        assert_eq!(info.block().width, 2);
+        assert_eq!(info.block().height, 3);
+        assert_eq!(info.block().depth, 1);
+    }
+
+    #[test]
+    fn render_target_info_decodes_pitch_linear_layout() {
+        let info = ImageInfo::from_render_target_info(
+            &RenderTargetInfo {
+                address: 0x5000_0000,
+                width: 256,
+                height: 16,
+                format: 0xD5,
+                tile_mode: 1 << 12,
+                depth: 1,
+                array_pitch: 0,
+                base_layer: 0,
+            },
+            0,
+        );
+
+        assert_eq!(info.image_type, ImageType::Linear);
+        assert_eq!(info.pitch(), 256);
+        assert_eq!(info.size.width, 64);
+        assert_eq!(info.size.height, 16);
+        assert!(info.forced_flushed);
+        assert!(info.dma_downloaded);
     }
 }

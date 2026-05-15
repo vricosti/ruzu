@@ -50,8 +50,40 @@ impl TextureCacheBase {
     /// Port of `TextureCache<P>::FillGraphicsImageViews`
     /// (texture_cache.h:192-197). Method wrapper around `fill_image_views`
     /// targeting the channel's graphics descriptor table + caches.
-    pub fn fill_graphics_image_views(&mut self, views: &mut [ImageViewInOut], has_blacklists: bool) {
+    pub fn fill_graphics_image_views(
+        &mut self,
+        views: &mut [ImageViewInOut],
+        has_blacklists: bool,
+    ) {
         self.fill_image_views(true, views, has_blacklists);
+    }
+
+    /// Same as `fill_graphics_image_views`, but reads TIC descriptors and
+    /// validates image addresses through a caller-provided channel GPU-VA
+    /// reader.
+    pub fn fill_graphics_image_views_with_gpu_reader(
+        &mut self,
+        views: &mut [ImageViewInOut],
+        has_blacklists: bool,
+        read_gpu: &mut dyn FnMut(GPUVAddr, &mut [u8]) -> bool,
+        addr_valid: &mut dyn FnMut(GPUVAddr) -> bool,
+    ) {
+        let mut has_blacklisted;
+        loop {
+            self.has_deleted_images = false;
+            has_blacklisted = false;
+            for view in views.iter_mut() {
+                view.id = self
+                    .visit_graphics_image_view_with_gpu_reader(view.index, read_gpu, addr_valid);
+                if has_blacklists && view.blacklist && view.id != NULL_IMAGE_VIEW_ID {
+                    // TODO: ScaleDown(slot_images[image_view.image_id]).
+                    has_blacklisted = false;
+                }
+            }
+            if !self.has_deleted_images && !(has_blacklists && has_blacklisted) {
+                break;
+            }
+        }
     }
 
     /// Port of `TextureCache<P>::FillComputeImageViews`
@@ -133,12 +165,49 @@ impl TextureCacheBase {
         cached_ids[index as usize]
     }
 
+    fn visit_graphics_image_view_with_gpu_reader(
+        &mut self,
+        index: u32,
+        read_gpu: &mut dyn FnMut(GPUVAddr, &mut [u8]) -> bool,
+        addr_valid: &mut dyn FnMut(GPUVAddr) -> bool,
+    ) -> ImageViewId {
+        let (descriptor, is_new) = {
+            let table = &mut self.channel_state.graphics_image_table;
+            if index > table.limit() {
+                return NULL_IMAGE_VIEW_ID;
+            }
+            table.read_with(index, |gpu_addr, out| read_gpu(gpu_addr, out))
+        };
+        if is_new {
+            let new_id = self.find_image_view_with_addr_valid(&descriptor, addr_valid);
+            self.channel_state.graphics_image_view_ids[index as usize] = new_id;
+        }
+        self.channel_state.graphics_image_view_ids[index as usize]
+    }
+
     /// Port of `TextureCache<P>::FindImageView` (texture_cache.h:1103-1113).
     /// Guards on `IsValidEntry`, then does a HashMap try_emplace against the
     /// descriptor; on cache miss, calls `create_image_view`.
     fn find_image_view(&mut self, descriptor: &crate::textures::texture::TicEntry) -> ImageViewId {
         let gpu_memory = self.device_memory.clone();
         if !super::util::is_valid_entry(&*gpu_memory, descriptor) {
+            return NULL_IMAGE_VIEW_ID;
+        }
+        if let Some(&id) = self.channel_state.image_views.get(descriptor) {
+            return id;
+        }
+        let new_id = self.create_image_view(descriptor);
+        self.channel_state.image_views.insert(*descriptor, new_id);
+        new_id
+    }
+
+    fn find_image_view_with_addr_valid(
+        &mut self,
+        descriptor: &crate::textures::texture::TicEntry,
+        addr_valid: &mut dyn FnMut(GPUVAddr) -> bool,
+    ) -> ImageViewId {
+        if !super::util::is_valid_entry_with_addr_valid(descriptor, |gpu_addr| addr_valid(gpu_addr))
+        {
             return NULL_IMAGE_VIEW_ID;
         }
         if let Some(&id) = self.channel_state.image_views.get(descriptor) {
@@ -157,11 +226,13 @@ impl TextureCacheBase {
     /// GL texture handle is still 0 — that's the next slice's problem; the
     /// renderer needs to walk `slot_image_views[id]` and lazy-create the GL
     /// texture from there.
-    fn create_image_view(&mut self, descriptor: &crate::textures::texture::TicEntry) -> ImageViewId {
+    fn create_image_view(
+        &mut self,
+        descriptor: &crate::textures::texture::TicEntry,
+    ) -> ImageViewId {
         let info = super::image_info::ImageInfo::from_tic_entry(descriptor);
         if info.image_type == ImageType::Buffer {
-            let view_info =
-                super::image_view_info::ImageViewInfo::from_tic_entry(descriptor, 0);
+            let view_info = super::image_view_info::ImageViewInfo::from_tic_entry(descriptor, 0);
             let view = ImageViewBase::new_buffer(&info, &view_info, descriptor.address());
             return self.slot_image_views.insert(view);
         }
@@ -177,8 +248,7 @@ impl TextureCacheBase {
         // aren't fully populated until CalculateLayerStride lands. Fall
         // back to `base.layer = 0` so the path is exercised end-to-end;
         // future slice swaps in the real `TryFindBase` result.
-        let view_info =
-            super::image_view_info::ImageViewInfo::from_tic_entry(descriptor, 0);
+        let view_info = super::image_view_info::ImageViewInfo::from_tic_entry(descriptor, 0);
         let parent_info = self.slot_images.get(image_id).info.clone();
         let view = ImageViewBase::new(&view_info, &parent_info, image_id, descriptor.address());
         let view_id = self.slot_image_views.insert(view);
@@ -196,7 +266,7 @@ impl TextureCacheBase {
     /// `FindImage` walks the page table for overlapping subresources —
     /// ruzu's minimal version matches by exact GPU address only and is
     /// sufficient until the page-table overlap port lands.
-    fn find_or_insert_image(
+    pub(crate) fn find_or_insert_image(
         &mut self,
         info: &super::image_info::ImageInfo,
         gpu_addr: GPUVAddr,
@@ -212,7 +282,7 @@ impl TextureCacheBase {
     /// touched by the gpu_addr's pages and applies view-compatibility
     /// rules — that requires the upstream subresource math which the
     /// rest of the texture cache hasn't grown yet.
-    fn find_image(&self, gpu_addr: GPUVAddr) -> Option<ImageId> {
+    pub(crate) fn find_image(&self, gpu_addr: GPUVAddr) -> Option<ImageId> {
         // Walk slot_images directly for now. There are typically few
         // images, so an O(n) scan is acceptable until the page-table
         // overlap search is ported.
@@ -229,7 +299,7 @@ impl TextureCacheBase {
     /// slot pool, and returns its `ImageId`. The CPU address is set to the
     /// GPU address as a placeholder until `gpu_memory.GpuToCpuAddress`
     /// returns a real host VAddr.
-    fn insert_image(
+    pub(crate) fn insert_image(
         &mut self,
         info: &super::image_info::ImageInfo,
         gpu_addr: GPUVAddr,
@@ -294,6 +364,130 @@ impl TextureCacheBase {
         log::warn!(
             "TextureCacheBase::synchronize_compute_descriptors: Kepler Compute regs not yet ported"
         );
+    }
+
+    // ── Sampler resolution ─────────────────────────────────────────────
+
+    /// Resolve a graphics-stage sampler index to a `SamplerId`.
+    ///
+    /// Port of `TextureCache<P>::GetGraphicsSamplerId` (texture_cache.h:256-267).
+    /// Reads the TSC table at `index`, dedupes via `channel_state.samplers`,
+    /// and caches the result in `channel_state.graphics_sampler_ids[index]`
+    /// so subsequent draws skip the lookup when the descriptor hasn't
+    /// changed.
+    ///
+    /// Returns `NULL_SAMPLER_ID` for out-of-range indices — upstream logs
+    /// `LOG_DEBUG("Invalid sampler index={}")` and does the same.
+    pub fn get_graphics_sampler_id(&mut self, index: u32) -> SamplerId {
+        use crate::texture_cache::types::NULL_SAMPLER_ID;
+        if index > self.channel_state.graphics_sampler_table.limit() {
+            log::debug!(
+                "TextureCacheBase::get_graphics_sampler_id: invalid index={}",
+                index
+            );
+            return NULL_SAMPLER_ID;
+        }
+        let gpu_memory_arc = self.device_memory.clone();
+        let (descriptor, is_new) = self
+            .channel_state
+            .graphics_sampler_table
+            .read(gpu_memory_arc.as_ref(), index);
+        let cached = self.channel_state.graphics_sampler_ids[index as usize];
+        if !is_new && cached.is_valid() && cached != CORRUPT_ID {
+            return cached;
+        }
+        let id = self.find_sampler(&descriptor);
+        self.channel_state.graphics_sampler_ids[index as usize] = id;
+        id
+    }
+
+    /// Resolve a graphics-stage sampler index using a caller-provided GPU-VA
+    /// reader for the TSC table.
+    ///
+    /// Same ownership as upstream `TextureCache<P>::GetGraphicsSamplerId`;
+    /// this Rust bridge exists because the current cache base stores the
+    /// Host1x SMMU device-memory manager, while graphics TSC table pointers
+    /// in MK8D are GPU virtual addresses that must go through the channel
+    /// `MemoryManager`.
+    pub fn get_graphics_sampler_id_with_gpu_reader(
+        &mut self,
+        index: u32,
+        table_addr: GPUVAddr,
+        table_limit: u32,
+        mut read_gpu: impl FnMut(GPUVAddr, &mut [u8]) -> bool,
+    ) -> SamplerId {
+        use crate::texture_cache::types::NULL_SAMPLER_ID;
+        if index > table_limit {
+            log::debug!(
+                "TextureCacheBase::get_graphics_sampler_id_with_gpu_reader: invalid index={}",
+                index
+            );
+            return NULL_SAMPLER_ID;
+        }
+        if index as usize >= self.channel_state.graphics_sampler_ids.len() {
+            self.channel_state
+                .graphics_sampler_ids
+                .resize(index as usize + 1, CORRUPT_ID);
+        }
+        let cached = self.channel_state.graphics_sampler_ids[index as usize];
+        if cached.is_valid() && cached != CORRUPT_ID {
+            return cached;
+        }
+
+        let descriptor_addr = table_addr
+            + index as u64 * std::mem::size_of::<crate::textures::texture::TscEntry>() as u64;
+        let mut buf = [0u8; std::mem::size_of::<crate::textures::texture::TscEntry>()];
+        if !read_gpu(descriptor_addr, &mut buf) {
+            if std::env::var_os("RUZU_TRACE_TSC_READ").is_some() {
+                log::warn!(
+                    "[TSC_READ] miss index={} table=0x{:X} limit={} addr=0x{:X}",
+                    index,
+                    table_addr,
+                    table_limit,
+                    descriptor_addr,
+                );
+            }
+            return NULL_SAMPLER_ID;
+        }
+        let descriptor = unsafe {
+            std::ptr::read_unaligned(buf.as_ptr() as *const crate::textures::texture::TscEntry)
+        };
+        if std::env::var_os("RUZU_TRACE_TSC_READ").is_some() {
+            log::warn!(
+                "[TSC_READ] index={} table=0x{:X} limit={} addr=0x{:X} raw={:016X} {:016X} {:016X} {:016X}",
+                index,
+                table_addr,
+                table_limit,
+                descriptor_addr,
+                descriptor.raw[0],
+                descriptor.raw[1],
+                descriptor.raw[2],
+                descriptor.raw[3],
+            );
+        }
+        let id = self.find_sampler(&descriptor);
+        self.channel_state.graphics_sampler_ids[index as usize] = id;
+        id
+    }
+
+    /// Look up or insert a sampler by its TSC descriptor.
+    ///
+    /// Port of `TextureCache<P>::FindSampler` (texture_cache.h:1735-1744):
+    /// all-zero TSC → `NULL_SAMPLER_ID`; otherwise `try_emplace` into the
+    /// `channel_state.samplers` HashMap and on first occurrence allocate
+    /// a fresh slot in `slot_samplers`.
+    pub fn find_sampler(&mut self, config: &crate::textures::texture::TscEntry) -> SamplerId {
+        use crate::texture_cache::types::NULL_SAMPLER_ID;
+        // Upstream `std::ranges::all_of(config.raw, [](u64 v){ return v == 0; })`.
+        if config.raw.iter().all(|&w| w == 0) {
+            return NULL_SAMPLER_ID;
+        }
+        if let Some(&id) = self.channel_state.samplers.get(config) {
+            return id;
+        }
+        let id = self.slot_samplers.insert(*config);
+        self.channel_state.samplers.insert(*config, id);
+        id
     }
 
     // ── Render targets ─────────────────────────────────────────────────
@@ -383,33 +577,7 @@ impl TextureCacheBase {
         rt: &RenderTargetInfo,
         cpu_addr: u64,
     ) -> ImageId {
-        let pixel_format = surface::pixel_format_from_render_target_format(rt.format);
-        let pitch = rt
-            .width
-            .saturating_mul(surface::bytes_per_block(pixel_format));
-        let info = ImageInfo {
-            format: pixel_format,
-            image_type: ImageType::Linear,
-            resources: SubresourceExtent {
-                levels: 1,
-                layers: 1,
-            },
-            size: Extent3D {
-                width: rt.width,
-                height: rt.height,
-                depth: 1,
-            },
-            tiling: TilingMode::PitchLinear(pitch),
-            layer_stride: 0,
-            maybe_unaligned_layer_stride: 0,
-            num_samples: 1,
-            tile_width_spacing: 0,
-            rescaleable: false,
-            downscaleable: false,
-            forced_flushed: false,
-            dma_downloaded: false,
-            is_sparse: false,
-        };
+        let info = ImageInfo::from_render_target_info(rt, 0);
 
         if let Some((image_id, _)) = self.slot_images.iter().find(|(_, image)| {
             image.gpu_addr == rt.address
@@ -666,7 +834,38 @@ impl TextureCacheBase {
 mod tests {
     use super::*;
     use crate::engines::maxwell_3d::{RenderTargetInfo, RtControlInfo};
-    use crate::framebuffer_config::FramebufferConfig;
+    use crate::framebuffer_config::{AndroidPixelFormat, FramebufferConfig};
+
+    #[test]
+    fn texture_cache_reserves_zero_for_null_resources() {
+        use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
+        use std::sync::Arc;
+        let mut cache = TextureCacheBase::new(Arc::new(MaxwellDeviceMemoryManager::default()));
+        let mut descriptor = crate::textures::texture::TscEntry::default();
+        descriptor.raw[0] = 0x0000_03A2_0002_6080;
+
+        let info = ImageInfo {
+            format: surface::PixelFormat::A8B8G8R8Unorm,
+            size: crate::texture_cache::types::Extent3D {
+                width: 16,
+                height: 16,
+                depth: 1,
+            },
+            ..ImageInfo::default()
+        };
+        let image_id = cache
+            .slot_images
+            .insert(crate::texture_cache::image_base::ImageBase::new(
+                info, 0x1000, 0x2000,
+            ));
+
+        let sampler_id = cache.find_sampler(&descriptor);
+
+        assert_ne!(image_id, crate::texture_cache::types::NULL_IMAGE_ID);
+        assert_eq!(image_id.index, 1);
+        assert_ne!(sampler_id, crate::texture_cache::types::NULL_SAMPLER_ID);
+        assert_eq!(sampler_id.index, 1);
+    }
 
     #[test]
     fn update_render_targets_from_draw_state_registers_presentable_view() {
@@ -683,6 +882,10 @@ mod tests {
             width: 64,
             height: 32,
             format: 0xD5,
+            tile_mode: 1 << 12,
+            array_pitch: 32 * 4,
+            depth: 1,
+            base_layer: 0,
         };
 
         cache.update_render_targets_from_draw_state(&draw_state, |gpu_addr| {
@@ -700,5 +903,61 @@ mod tests {
         assert!(view.is_some());
         assert_eq!(cache.slot_images.size(), 1);
         assert_eq!(cache.slot_image_views.size(), 1);
+    }
+
+    #[test]
+    fn try_find_framebuffer_image_view_emplaces_display_specific_view() {
+        use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
+        use crate::texture_cache::image_view_info::SwizzleSource;
+        use std::sync::Arc;
+
+        let mut cache = TextureCacheBase::new(Arc::new(MaxwellDeviceMemoryManager::default()));
+        let mut draw_state = DrawState::default();
+        draw_state.rt_control = RtControlInfo {
+            count: 1,
+            map: [0, 0, 0, 0, 0, 0, 0, 0],
+        };
+        draw_state.render_targets[0] = RenderTargetInfo {
+            address: 0x4000_0000,
+            width: 64,
+            height: 32,
+            format: 0xD5,
+            tile_mode: 1 << 12,
+            array_pitch: 32 * 4,
+            depth: 1,
+            base_layer: 0,
+        };
+
+        cache.update_render_targets_from_draw_state(&draw_state, |gpu_addr| {
+            (gpu_addr == 0x4000_0000).then_some(0x535B_5000)
+        });
+        let initial_view_count = cache.slot_image_views.size();
+
+        let config = FramebufferConfig {
+            address: 0x535B_5000,
+            width: 64,
+            height: 32,
+            stride: 64,
+            pixel_format: AndroidPixelFormat(5),
+            ..Default::default()
+        };
+        let view = cache
+            .try_find_framebuffer_image_view(&config, 0x535B_5000)
+            .expect("framebuffer view");
+
+        assert_eq!(cache.slot_image_views.size(), initial_view_count + 1);
+        assert_eq!(
+            cache.slot_image_views[view.view_id].format,
+            surface::PixelFormat::B8G8R8A8Unorm
+        );
+        let image = &cache.slot_images[view.view.image_id];
+        assert_eq!(
+            image
+                .image_view_infos
+                .last()
+                .expect("new view info")
+                .w_source,
+            SwizzleSource::OneFloat as u8
+        );
     }
 }

@@ -26,8 +26,10 @@ use crate::renderer_base::GuestMemoryWriter;
 
 use super::descriptor_table::DescriptorTable;
 use super::format_lookup_table::PixelFormat;
-use super::image_base::{GPUVAddr, ImageAllocBase, ImageBase, ImageFlagBits, ImageMapView};
-use super::image_view_base::ImageViewBase;
+use super::image_base::{
+    GPUVAddr, ImageAllocBase, ImageBase, ImageFlagBits, ImageMapView, NullImageParams,
+};
+use super::image_view_base::{ImageViewBase, NullImageViewParams};
 use super::image_view_info::{ImageViewInfo, SwizzleSource};
 use super::render_targets::RenderTargets;
 use super::types::*;
@@ -223,7 +225,13 @@ pub struct TextureCacheBase {
     pub slot_map_views: SlotVector<ImageMapView>,
     pub slot_image_views: SlotVector<ImageViewBase>,
     pub slot_image_allocs: SlotVector<ImageAllocBase>,
-    // slot_samplers, slot_framebuffers: need backend types
+    /// Slot pool of TSC descriptors keyed by `SamplerId`. Upstream stores
+    /// `P::Sampler` directly (the backend type); ruzu separates the
+    /// abstract `TscEntry` here from the backend `Sampler` which lives in
+    /// the GL wrapper's `HashMap<SamplerId, Sampler>`. Mirrors the
+    /// `slot_images` / `slot_image_views` split.
+    pub slot_samplers: SlotVector<crate::textures::texture::TscEntry>,
+    // slot_framebuffers: needs backend types
 
     // Render state
     pub render_targets: RenderTargets,
@@ -304,11 +312,12 @@ impl TextureCacheBase {
             crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager,
         >,
     ) -> Self {
-        Self {
+        let mut cache = Self {
             slot_images: SlotVector::new(),
             slot_map_views: SlotVector::new(),
             slot_image_views: SlotVector::new(),
             slot_image_allocs: SlotVector::new(),
+            slot_samplers: SlotVector::new(),
             render_targets: RenderTargets::default(),
             framebuffers: HashMap::new(),
             page_table: HashMap::new(),
@@ -340,7 +349,33 @@ impl TextureCacheBase {
             device_memory,
             channel_state: TextureCacheChannelInfo::new(),
             mutex: ReentrantMutex::new(()),
-        }
+        };
+
+        // Upstream reserves slot 0 for all null resources in
+        // `TextureCache<P>::TextureCache`, making NULL_*_ID{0} compile-time
+        // constants that are never returned for real resources.
+        let null_image_id = cache.slot_images.insert(ImageBase::null(NullImageParams));
+        debug_assert_eq!(null_image_id, crate::texture_cache::types::NULL_IMAGE_ID);
+        let null_view_id = cache
+            .slot_image_views
+            .insert(ImageViewBase::null(NullImageViewParams));
+        debug_assert_eq!(
+            null_view_id,
+            crate::texture_cache::types::NULL_IMAGE_VIEW_ID
+        );
+
+        // Ruzu's base stores raw `TSCEntry`s rather than backend `Sampler`s,
+        // so reserve sampler id 0 with the upstream null sampler descriptor.
+        let mut null_sampler = crate::textures::texture::TscEntry::default();
+        let word1 = (crate::textures::texture::TextureFilter::Linear as u32)
+            | ((crate::textures::texture::TextureFilter::Linear as u32) << 4)
+            | ((crate::textures::texture::TextureMipmapFilter::Linear as u32) << 6)
+            | (1 << 8);
+        null_sampler.raw[0] = (word1 as u64) << 32;
+        let null_id = cache.slot_samplers.insert(null_sampler);
+        debug_assert_eq!(null_id, crate::texture_cache::types::NULL_SAMPLER_ID);
+
+        cache
     }
 
     pub fn set_image_downloader(&mut self, downloader: ImageDownloader) {
@@ -487,12 +522,17 @@ impl TextureCacheBase {
             info.w_source = SwizzleSource::OneFloat as u8;
         }
 
+        let existing_view_id = self.slot_images[image_id].find_view(&info);
+        let view_id = if existing_view_id.is_valid() {
+            existing_view_id
+        } else {
+            let image = &self.slot_images[image_id];
+            let view = ImageViewBase::new(&info, &image.info, image_id, image.gpu_addr);
+            let view_id = self.slot_image_views.insert(view);
+            self.slot_images[image_id].insert_view(info, view_id);
+            view_id
+        };
         let image = &self.slot_images[image_id];
-        let view_id = image
-            .find_view(&info)
-            .is_valid()
-            .then(|| image.find_view(&info))
-            .unwrap_or_else(|| image.image_view_ids[0]);
         let view = self.slot_image_views[view_id].clone();
         Some(FramebufferImageView {
             view_id,

@@ -443,9 +443,68 @@ pub enum Opcode {
     /// Gradient texture sample.
     ImageGradient,
 
+    // ── Upstream pre-TexturePass texture ops ─────────────────────────
+    BoundImageSampleImplicitLod,
+    BindlessImageSampleImplicitLod,
+    BoundImageSampleExplicitLod,
+    BindlessImageSampleExplicitLod,
+    BoundImageSampleDrefImplicitLod,
+    BindlessImageSampleDrefImplicitLod,
+    BoundImageSampleDrefExplicitLod,
+    BindlessImageSampleDrefExplicitLod,
+    BoundImageGather,
+    BindlessImageGather,
+    BoundImageGatherDref,
+    BindlessImageGatherDref,
+    BoundImageFetch,
+    BindlessImageFetch,
+    BoundImageQueryDimensions,
+    BindlessImageQueryDimensions,
+    BoundImageQueryLod,
+    BindlessImageQueryLod,
+    BoundImageGradient,
+    BindlessImageGradient,
+
     // ── Image load/store ──────────────────────────────────────────────
     ImageRead,
     ImageWrite,
+    BoundImageRead,
+    BindlessImageRead,
+    BoundImageWrite,
+    BindlessImageWrite,
+    ImageAtomicIAdd32,
+    ImageAtomicSMin32,
+    ImageAtomicUMin32,
+    ImageAtomicSMax32,
+    ImageAtomicUMax32,
+    ImageAtomicInc32,
+    ImageAtomicDec32,
+    ImageAtomicAnd32,
+    ImageAtomicOr32,
+    ImageAtomicXor32,
+    ImageAtomicExchange32,
+    BoundImageAtomicIAdd32,
+    BindlessImageAtomicIAdd32,
+    BoundImageAtomicSMin32,
+    BindlessImageAtomicSMin32,
+    BoundImageAtomicUMin32,
+    BindlessImageAtomicUMin32,
+    BoundImageAtomicSMax32,
+    BindlessImageAtomicSMax32,
+    BoundImageAtomicUMax32,
+    BindlessImageAtomicUMax32,
+    BoundImageAtomicInc32,
+    BindlessImageAtomicInc32,
+    BoundImageAtomicDec32,
+    BindlessImageAtomicDec32,
+    BoundImageAtomicAnd32,
+    BindlessImageAtomicAnd32,
+    BoundImageAtomicOr32,
+    BindlessImageAtomicOr32,
+    BoundImageAtomicXor32,
+    BindlessImageAtomicXor32,
+    BoundImageAtomicExchange32,
+    BindlessImageAtomicExchange32,
 
     // ── Atomic memory ─────────────────────────────────────────────────
     GlobalAtomicIAdd32,
@@ -527,6 +586,69 @@ impl Opcode {
     /// Get the name of this opcode.
     pub fn name(self) -> &'static str {
         self.meta().name
+    }
+
+    fn texture_pass_opcode_name(self) -> &'static str {
+        match self {
+            Opcode::BoundImageSampleImplicitLod => "BoundImageSampleImplicitLod",
+            Opcode::BindlessImageSampleImplicitLod => "BindlessImageSampleImplicitLod",
+            Opcode::BoundImageSampleExplicitLod => "BoundImageSampleExplicitLod",
+            Opcode::BindlessImageSampleExplicitLod => "BindlessImageSampleExplicitLod",
+            Opcode::BoundImageSampleDrefImplicitLod => "BoundImageSampleDrefImplicitLod",
+            Opcode::BindlessImageSampleDrefImplicitLod => "BindlessImageSampleDrefImplicitLod",
+            Opcode::BoundImageSampleDrefExplicitLod => "BoundImageSampleDrefExplicitLod",
+            Opcode::BindlessImageSampleDrefExplicitLod => "BindlessImageSampleDrefExplicitLod",
+            Opcode::BoundImageGather => "BoundImageGather",
+            Opcode::BindlessImageGather => "BindlessImageGather",
+            Opcode::BoundImageGatherDref => "BoundImageGatherDref",
+            Opcode::BindlessImageGatherDref => "BindlessImageGatherDref",
+            Opcode::BoundImageFetch => "BoundImageFetch",
+            Opcode::BindlessImageFetch => "BindlessImageFetch",
+            Opcode::BoundImageQueryDimensions => "BoundImageQueryDimensions",
+            Opcode::BindlessImageQueryDimensions => "BindlessImageQueryDimensions",
+            Opcode::BoundImageQueryLod => "BoundImageQueryLod",
+            Opcode::BindlessImageQueryLod => "BindlessImageQueryLod",
+            Opcode::BoundImageGradient => "BoundImageGradient",
+            Opcode::BindlessImageGradient => "BindlessImageGradient",
+            Opcode::BoundImageRead => "BoundImageRead",
+            Opcode::BindlessImageRead => "BindlessImageRead",
+            Opcode::BoundImageWrite => "BoundImageWrite",
+            Opcode::BindlessImageWrite => "BindlessImageWrite",
+            Opcode::ImageAtomicIAdd32 => "ImageAtomicIAdd32",
+            Opcode::ImageAtomicSMin32 => "ImageAtomicSMin32",
+            Opcode::ImageAtomicUMin32 => "ImageAtomicUMin32",
+            Opcode::ImageAtomicSMax32 => "ImageAtomicSMax32",
+            Opcode::ImageAtomicUMax32 => "ImageAtomicUMax32",
+            Opcode::ImageAtomicInc32 => "ImageAtomicInc32",
+            Opcode::ImageAtomicDec32 => "ImageAtomicDec32",
+            Opcode::ImageAtomicAnd32 => "ImageAtomicAnd32",
+            Opcode::ImageAtomicOr32 => "ImageAtomicOr32",
+            Opcode::ImageAtomicXor32 => "ImageAtomicXor32",
+            Opcode::ImageAtomicExchange32 => "ImageAtomicExchange32",
+            Opcode::BoundImageAtomicIAdd32 => "BoundImageAtomicIAdd32",
+            Opcode::BindlessImageAtomicIAdd32 => "BindlessImageAtomicIAdd32",
+            Opcode::BoundImageAtomicSMin32 => "BoundImageAtomicSMin32",
+            Opcode::BindlessImageAtomicSMin32 => "BindlessImageAtomicSMin32",
+            Opcode::BoundImageAtomicUMin32 => "BoundImageAtomicUMin32",
+            Opcode::BindlessImageAtomicUMin32 => "BindlessImageAtomicUMin32",
+            Opcode::BoundImageAtomicSMax32 => "BoundImageAtomicSMax32",
+            Opcode::BindlessImageAtomicSMax32 => "BindlessImageAtomicSMax32",
+            Opcode::BoundImageAtomicUMax32 => "BoundImageAtomicUMax32",
+            Opcode::BindlessImageAtomicUMax32 => "BindlessImageAtomicUMax32",
+            Opcode::BoundImageAtomicInc32 => "BoundImageAtomicInc32",
+            Opcode::BindlessImageAtomicInc32 => "BindlessImageAtomicInc32",
+            Opcode::BoundImageAtomicDec32 => "BoundImageAtomicDec32",
+            Opcode::BindlessImageAtomicDec32 => "BindlessImageAtomicDec32",
+            Opcode::BoundImageAtomicAnd32 => "BoundImageAtomicAnd32",
+            Opcode::BindlessImageAtomicAnd32 => "BindlessImageAtomicAnd32",
+            Opcode::BoundImageAtomicOr32 => "BoundImageAtomicOr32",
+            Opcode::BindlessImageAtomicOr32 => "BindlessImageAtomicOr32",
+            Opcode::BoundImageAtomicXor32 => "BoundImageAtomicXor32",
+            Opcode::BindlessImageAtomicXor32 => "BindlessImageAtomicXor32",
+            Opcode::BoundImageAtomicExchange32 => "BoundImageAtomicExchange32",
+            Opcode::BindlessImageAtomicExchange32 => "BindlessImageAtomicExchange32",
+            _ => unreachable!("not a texture-pass opcode"),
+        }
     }
 
     /// Whether this is a pseudo-operation (GetZeroFromOp, etc.).
@@ -612,6 +734,41 @@ impl Opcode {
                 | Opcode::SharedAtomicXor32
                 | Opcode::SharedAtomicExchange32
                 | Opcode::ImageWrite
+                | Opcode::BoundImageWrite
+                | Opcode::BindlessImageWrite
+                | Opcode::ImageAtomicIAdd32
+                | Opcode::ImageAtomicSMin32
+                | Opcode::ImageAtomicUMin32
+                | Opcode::ImageAtomicSMax32
+                | Opcode::ImageAtomicUMax32
+                | Opcode::ImageAtomicInc32
+                | Opcode::ImageAtomicDec32
+                | Opcode::ImageAtomicAnd32
+                | Opcode::ImageAtomicOr32
+                | Opcode::ImageAtomicXor32
+                | Opcode::ImageAtomicExchange32
+                | Opcode::BoundImageAtomicIAdd32
+                | Opcode::BindlessImageAtomicIAdd32
+                | Opcode::BoundImageAtomicSMin32
+                | Opcode::BindlessImageAtomicSMin32
+                | Opcode::BoundImageAtomicUMin32
+                | Opcode::BindlessImageAtomicUMin32
+                | Opcode::BoundImageAtomicSMax32
+                | Opcode::BindlessImageAtomicSMax32
+                | Opcode::BoundImageAtomicUMax32
+                | Opcode::BindlessImageAtomicUMax32
+                | Opcode::BoundImageAtomicInc32
+                | Opcode::BindlessImageAtomicInc32
+                | Opcode::BoundImageAtomicDec32
+                | Opcode::BindlessImageAtomicDec32
+                | Opcode::BoundImageAtomicAnd32
+                | Opcode::BindlessImageAtomicAnd32
+                | Opcode::BoundImageAtomicOr32
+                | Opcode::BindlessImageAtomicOr32
+                | Opcode::BoundImageAtomicXor32
+                | Opcode::BindlessImageAtomicXor32
+                | Opcode::BoundImageAtomicExchange32
+                | Opcode::BindlessImageAtomicExchange32
         )
     }
 
@@ -2416,6 +2573,64 @@ impl Opcode {
                 return_type: F32x4,
                 arg_types: &[Opaque, Opaque, Opaque, Opaque],
             },
+            Opcode::BoundImageSampleImplicitLod | Opcode::BindlessImageSampleImplicitLod => {
+                OpcodeMeta {
+                    name: self.texture_pass_opcode_name(),
+                    return_type: F32x4,
+                    arg_types: &[Opaque, Opaque],
+                }
+            }
+            Opcode::BoundImageSampleExplicitLod | Opcode::BindlessImageSampleExplicitLod => {
+                OpcodeMeta {
+                    name: self.texture_pass_opcode_name(),
+                    return_type: F32x4,
+                    arg_types: &[Opaque, Opaque, F32],
+                }
+            }
+            Opcode::BoundImageSampleDrefImplicitLod
+            | Opcode::BindlessImageSampleDrefImplicitLod => OpcodeMeta {
+                name: self.texture_pass_opcode_name(),
+                return_type: F32,
+                arg_types: &[Opaque, Opaque, F32],
+            },
+            Opcode::BoundImageSampleDrefExplicitLod
+            | Opcode::BindlessImageSampleDrefExplicitLod => OpcodeMeta {
+                name: self.texture_pass_opcode_name(),
+                return_type: F32,
+                arg_types: &[Opaque, Opaque, F32, F32],
+            },
+            Opcode::BoundImageGather | Opcode::BindlessImageGather => OpcodeMeta {
+                name: self.texture_pass_opcode_name(),
+                return_type: F32x4,
+                arg_types: &[Opaque, Opaque],
+            },
+            Opcode::BoundImageGatherDref | Opcode::BindlessImageGatherDref => OpcodeMeta {
+                name: self.texture_pass_opcode_name(),
+                return_type: F32x4,
+                arg_types: &[Opaque, Opaque, F32],
+            },
+            Opcode::BoundImageFetch | Opcode::BindlessImageFetch => OpcodeMeta {
+                name: self.texture_pass_opcode_name(),
+                return_type: F32x4,
+                arg_types: &[Opaque, Opaque, U32],
+            },
+            Opcode::BoundImageQueryDimensions | Opcode::BindlessImageQueryDimensions => {
+                OpcodeMeta {
+                    name: self.texture_pass_opcode_name(),
+                    return_type: U32x4,
+                    arg_types: &[Opaque, U32],
+                }
+            }
+            Opcode::BoundImageQueryLod | Opcode::BindlessImageQueryLod => OpcodeMeta {
+                name: self.texture_pass_opcode_name(),
+                return_type: F32x2,
+                arg_types: &[Opaque, Opaque],
+            },
+            Opcode::BoundImageGradient | Opcode::BindlessImageGradient => OpcodeMeta {
+                name: self.texture_pass_opcode_name(),
+                return_type: F32x4,
+                arg_types: &[Opaque, Opaque, Opaque, Opaque],
+            },
 
             // Image load/store
             Opcode::ImageRead => OpcodeMeta {
@@ -2427,6 +2642,53 @@ impl Opcode {
                 name: "ImageWrite",
                 return_type: Type::Void,
                 arg_types: &[Opaque, Opaque, U32x4],
+            },
+            Opcode::BoundImageRead | Opcode::BindlessImageRead => OpcodeMeta {
+                name: self.texture_pass_opcode_name(),
+                return_type: U32x4,
+                arg_types: &[Opaque, Opaque],
+            },
+            Opcode::BoundImageWrite | Opcode::BindlessImageWrite => OpcodeMeta {
+                name: self.texture_pass_opcode_name(),
+                return_type: Type::Void,
+                arg_types: &[Opaque, Opaque, U32x4],
+            },
+            Opcode::ImageAtomicIAdd32
+            | Opcode::ImageAtomicSMin32
+            | Opcode::ImageAtomicUMin32
+            | Opcode::ImageAtomicSMax32
+            | Opcode::ImageAtomicUMax32
+            | Opcode::ImageAtomicInc32
+            | Opcode::ImageAtomicDec32
+            | Opcode::ImageAtomicAnd32
+            | Opcode::ImageAtomicOr32
+            | Opcode::ImageAtomicXor32
+            | Opcode::ImageAtomicExchange32
+            | Opcode::BoundImageAtomicIAdd32
+            | Opcode::BindlessImageAtomicIAdd32
+            | Opcode::BoundImageAtomicSMin32
+            | Opcode::BindlessImageAtomicSMin32
+            | Opcode::BoundImageAtomicUMin32
+            | Opcode::BindlessImageAtomicUMin32
+            | Opcode::BoundImageAtomicSMax32
+            | Opcode::BindlessImageAtomicSMax32
+            | Opcode::BoundImageAtomicUMax32
+            | Opcode::BindlessImageAtomicUMax32
+            | Opcode::BoundImageAtomicInc32
+            | Opcode::BindlessImageAtomicInc32
+            | Opcode::BoundImageAtomicDec32
+            | Opcode::BindlessImageAtomicDec32
+            | Opcode::BoundImageAtomicAnd32
+            | Opcode::BindlessImageAtomicAnd32
+            | Opcode::BoundImageAtomicOr32
+            | Opcode::BindlessImageAtomicOr32
+            | Opcode::BoundImageAtomicXor32
+            | Opcode::BindlessImageAtomicXor32
+            | Opcode::BoundImageAtomicExchange32
+            | Opcode::BindlessImageAtomicExchange32 => OpcodeMeta {
+                name: self.texture_pass_opcode_name(),
+                return_type: U32,
+                arg_types: &[Opaque, Opaque, U32],
             },
 
             // Atomic global

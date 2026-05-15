@@ -17,12 +17,12 @@ use crate::ir::value::Value;
 pub fn tex(tv: &mut TranslatorVisitor, insn: u64, _opcode: MaxwellOpcode) {
     let dst = tv.dst_reg(insn);
     let src_reg = tv.src_a_reg(insn);
-    let tex_index = field(insn, 36, 13);
+    let cbuf_offset = field(insn, 36, 13) * 4;
     let dim = field(insn, 28, 3);
     let lod_mode = field(insn, 55, 2);
 
     let info = TextureInstInfo {
-        descriptor_index: tex_index as u16,
+        descriptor_index: cbuf_offset as u16,
         texture_type: dim as u8,
         is_depth: false,
         has_bias: lod_mode == 2,
@@ -31,16 +31,17 @@ pub fn tex(tv: &mut TranslatorVisitor, insn: u64, _opcode: MaxwellOpcode) {
         num_derivatives: 0,
     };
 
-    tv.ir
-        .program
-        .info
-        .register_texture(tex_index, crate::shader_info::TextureType::Color2D, false);
+    tv.ir.program.info.register_texture(
+        cbuf_offset,
+        crate::shader_info::TextureType::Color2D,
+        false,
+    );
 
     // Build coordinate vector from source registers
     let coord_x = tv.f(src_reg);
     let coord_y = tv.f(src_reg + 1);
     let coords = tv.ir.composite_construct_f32x2(coord_x, coord_y);
-    let handle = Value::ImmU32(tex_index);
+    let handle = Value::ImmU32(cbuf_offset);
 
     let result = match lod_mode {
         0 => {

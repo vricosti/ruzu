@@ -39,6 +39,21 @@ pub fn optimize(program: &mut Program) {
     collect_info::collect_shader_info_pass(program);
 }
 
+/// Run the graphics-texture-aware subset of the upstream optimization order.
+///
+/// Upstream runs `TexturePass(env, program, host_info)` before DCE and
+/// `CollectShaderInfoPass`. This overload keeps the existing env-less
+/// `optimize` path intact while allowing OpenGL graphics compilation to
+/// resolve bound texture descriptors using `env.TextureBoundBuffer()`.
+pub fn optimize_with_bound_textures(program: &mut Program, texture_bound_buffer: u32) {
+    ssa_rewrite_pass::ssa_rewrite_pass(program);
+    identity_removal::identity_removal_pass(program);
+    constant_propagation::constant_propagation_pass(program);
+    texture_pass::texture_pass_bound_textures(program, texture_bound_buffer);
+    dead_code_elimination::dead_code_elimination_pass(program);
+    collect_info::collect_shader_info_pass(program);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -299,6 +299,17 @@ pub trait Maxwell3DAccess {
     /// Read render-target format.
     fn rt_format(&self, index: usize) -> u32;
 
+    /// Read the full render-target config snapshot.
+    fn rt_info(&self, index: usize) -> crate::engines::maxwell_3d::RenderTargetInfo {
+        crate::engines::maxwell_3d::RenderTargetInfo {
+            address: self.rt_address(index),
+            width: self.rt_width(index),
+            height: self.rt_height(index),
+            format: self.rt_format(index),
+            ..Default::default()
+        }
+    }
+
     /// Read clear color as RGBA floats.
     fn clear_color_rgba(&self) -> [f32; 4];
 
@@ -610,13 +621,7 @@ impl DrawManager {
             *mask = maxwell3d.color_mask_info(i);
         }
 
-        let render_targets =
-            std::array::from_fn(|i| crate::engines::maxwell_3d::RenderTargetInfo {
-                address: maxwell3d.rt_address(i),
-                width: maxwell3d.rt_width(i),
-                height: maxwell3d.rt_height(i),
-                format: maxwell3d.rt_format(i),
-            });
+        let render_targets = std::array::from_fn(|i| maxwell3d.rt_info(i));
 
         let mut blend = [crate::engines::maxwell_3d::BlendInfo::default(); 8];
         for (i, item) in blend.iter_mut().enumerate() {
@@ -728,13 +733,7 @@ impl DrawManager {
     pub fn clear(&mut self, layer_count: u32, maxwell3d: &mut dyn Maxwell3DAccess) {
         if maxwell3d.should_execute() {
             self.draw_state.rt_control = maxwell3d.rt_control_info();
-            self.draw_state.render_targets =
-                std::array::from_fn(|i| crate::engines::maxwell_3d::RenderTargetInfo {
-                    address: maxwell3d.rt_address(i),
-                    width: maxwell3d.rt_width(i),
-                    height: maxwell3d.rt_height(i),
-                    format: maxwell3d.rt_format(i),
-                });
+            self.draw_state.render_targets = std::array::from_fn(|i| maxwell3d.rt_info(i));
             self.draw_state.clear_state = ClearState {
                 flags: maxwell3d.clear_surface_flags(),
                 color: maxwell3d.clear_color_rgba(),
@@ -1104,13 +1103,7 @@ impl DrawManager {
             // back-reference of its own.
             self.draw_state.shader_program_addresses = maxwell3d.shader_program_addresses();
             self.draw_state.rt_control = maxwell3d.rt_control_info();
-            self.draw_state.render_targets =
-                std::array::from_fn(|i| crate::engines::maxwell_3d::RenderTargetInfo {
-                    address: maxwell3d.rt_address(i),
-                    width: maxwell3d.rt_width(i),
-                    height: maxwell3d.rt_height(i),
-                    format: maxwell3d.rt_format(i),
-                });
+            self.draw_state.render_targets = std::array::from_fn(|i| maxwell3d.rt_info(i));
             self.draw_state.cb_bindings = std::array::from_fn(|stage| {
                 std::array::from_fn(|slot| maxwell3d.const_buffer_binding(stage, slot))
             });

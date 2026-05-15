@@ -230,6 +230,7 @@ impl StateTracker {
     /// Port of `StateTracker::NotifyFramebuffer`.
     pub fn notify_framebuffer(&mut self) {
         self.flags[dirty::RENDER_TARGETS as usize] = true;
+        self.framebuffer = GLuint::MAX;
     }
 
     /// Port of `StateTracker::NotifyFrontFace`.

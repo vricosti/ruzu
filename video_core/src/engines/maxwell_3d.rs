@@ -80,6 +80,10 @@ pub(crate) const RT_OFF_ADDRESS_LOW: u32 = 0x01;
 pub(crate) const RT_OFF_WIDTH: u32 = 0x02;
 pub(crate) const RT_OFF_HEIGHT: u32 = 0x03;
 pub(crate) const RT_OFF_FORMAT: u32 = 0x04;
+pub(crate) const RT_OFF_TILE_MODE: u32 = 0x05;
+pub(crate) const RT_OFF_DEPTH: u32 = 0x06;
+pub(crate) const RT_OFF_ARRAY_PITCH: u32 = 0x07;
+pub(crate) const RT_OFF_BASE_LAYER: u32 = 0x08;
 
 /// Clear color RGBA: 4 consecutive f32-as-u32 registers.
 pub(crate) const CLEAR_COLOR_BASE: u32 = reg_index!(0x0D80);
@@ -1767,6 +1771,10 @@ pub struct RenderTargetInfo {
     pub width: u32,
     pub height: u32,
     pub format: u32,
+    pub tile_mode: u32,
+    pub depth: u32,
+    pub array_pitch: u32,
+    pub base_layer: u32,
 }
 
 /// A recorded draw call with all relevant state at the time of DRAW_END.
@@ -2447,6 +2455,23 @@ impl Maxwell3D {
     fn rt_format(&self, index: usize) -> u32 {
         let base = (RT_BASE + index as u32 * RT_STRIDE) as usize;
         self.regs[base + RT_OFF_FORMAT as usize]
+    }
+
+    /// Full render target config snapshot. Mirrors upstream
+    /// `Maxwell3D::Regs::RenderTargetConfig` fields consumed by
+    /// `ImageInfo(RenderTargetConfig, MsaaMode)`.
+    fn rt_info(&self, index: usize) -> RenderTargetInfo {
+        let base = (RT_BASE + index as u32 * RT_STRIDE) as usize;
+        RenderTargetInfo {
+            address: self.rt_address(index),
+            width: self.regs[base + RT_OFF_WIDTH as usize],
+            height: self.regs[base + RT_OFF_HEIGHT as usize],
+            format: self.regs[base + RT_OFF_FORMAT as usize],
+            tile_mode: self.regs[base + RT_OFF_TILE_MODE as usize],
+            depth: self.regs[base + RT_OFF_DEPTH as usize],
+            array_pitch: self.regs[base + RT_OFF_ARRAY_PITCH as usize],
+            base_layer: self.regs[base + RT_OFF_BASE_LAYER as usize],
+        }
     }
 
     /// Read the 4-component clear color as f32 values.
@@ -3175,6 +3200,10 @@ impl dm::Maxwell3DAccess for Maxwell3D {
         self.rt_format(index)
     }
 
+    fn rt_info(&self, index: usize) -> RenderTargetInfo {
+        self.rt_info(index)
+    }
+
     fn clear_color_rgba(&self) -> [f32; 4] {
         self.clear_color_rgba()
     }
@@ -3453,18 +3482,24 @@ impl Maxwell3D {
                 let _ = self.with_rasterizer_mut(|rasterizer| rasterizer.tiled_cache_barrier());
             }
             _ => {
-                let trace_draw_method = std::env::var_os("RUZU_TRACE_DRAW_METHODS").is_some()
+                let trace_all_draw_methods = std::env::var_os("RUZU_TRACE_DRAW_METHODS").is_some();
+                let trace_index_buffer_regs =
+                    std::env::var_os("RUZU_TRACE_INDEX_BUFFER_REGS").is_some();
+                let is_index_buffer_reg = (IB_BASE..=IB_BASE + IB_OFF_COUNT).contains(&method);
+                let trace_draw_method = (trace_all_draw_methods
                     && (method == DRAW_BEGIN
                         || method == DRAW_END
                         || method == VB_FIRST
                         || method == VB_COUNT
                         || method == IB_BASE
                         || method == IB_BASE + IB_OFF_FIRST
-                        || method == IB_BASE + IB_OFF_COUNT);
+                        || method == IB_BASE + IB_OFF_COUNT))
+                    || (trace_index_buffer_regs && (is_index_buffer_reg || method == DRAW_END));
                 if trace_draw_method {
                     let state = self.draw_manager.get_draw_state();
+                    let ib_base = IB_BASE as usize;
                     eprintln!(
-                        "[DRAW_METHOD_BEFORE] method=0x{:X} arg=0x{:X} last={} mode={:?} inst_count={} indexed={} vb_first={} vb_count={} ib_first={} ib_count={} execute_on={} shader_addrs={:X?}",
+                        "[DRAW_METHOD_BEFORE] method=0x{:X} arg=0x{:X} last={} mode={:?} inst_count={} indexed={} vb_first={} vb_count={} ib_first={} ib_count={} ib_regs=[addr={:08X}_{:08X} limit={:08X}_{:08X} fmt=0x{:X} first={} count={}] execute_on={} shader_addrs={:X?}",
                         method,
                         argument,
                         is_last_call,
@@ -3475,6 +3510,13 @@ impl Maxwell3D {
                         state.vertex_buffer.count,
                         state.index_buffer.first,
                         state.index_buffer.count,
+                        self.regs[ib_base + IB_OFF_ADDR_HIGH as usize],
+                        self.regs[ib_base + IB_OFF_ADDR_LOW as usize],
+                        self.regs[ib_base + IB_OFF_LIMIT_HIGH as usize],
+                        self.regs[ib_base + IB_OFF_LIMIT_LOW as usize],
+                        self.regs[ib_base + IB_OFF_FORMAT as usize],
+                        self.regs[ib_base + IB_OFF_FIRST as usize],
+                        self.regs[ib_base + IB_OFF_COUNT as usize],
                         self.execute_on,
                         self.shader_program_addresses(),
                     );
@@ -3484,8 +3526,9 @@ impl Maxwell3D {
                 });
                 if trace_draw_method {
                     let state = self.draw_manager.get_draw_state();
+                    let ib_base = IB_BASE as usize;
                     eprintln!(
-                        "[DRAW_METHOD_AFTER] method=0x{:X} mode={:?} inst_count={} indexed={} vb_first={} vb_count={} ib_first={} ib_count={} execute_on={} shader_addrs={:X?}",
+                        "[DRAW_METHOD_AFTER] method=0x{:X} mode={:?} inst_count={} indexed={} vb_first={} vb_count={} ib_first={} ib_count={} ib_state_fmt={:?} ib_regs=[addr={:08X}_{:08X} limit={:08X}_{:08X} fmt=0x{:X} first={} count={}] execute_on={} shader_addrs={:X?}",
                         method,
                         state.draw_mode,
                         state.instance_count,
@@ -3494,6 +3537,14 @@ impl Maxwell3D {
                         state.vertex_buffer.count,
                         state.index_buffer.first,
                         state.index_buffer.count,
+                        state.index_buffer.format,
+                        self.regs[ib_base + IB_OFF_ADDR_HIGH as usize],
+                        self.regs[ib_base + IB_OFF_ADDR_LOW as usize],
+                        self.regs[ib_base + IB_OFF_LIMIT_HIGH as usize],
+                        self.regs[ib_base + IB_OFF_LIMIT_LOW as usize],
+                        self.regs[ib_base + IB_OFF_FORMAT as usize],
+                        self.regs[ib_base + IB_OFF_FIRST as usize],
+                        self.regs[ib_base + IB_OFF_COUNT as usize],
                         self.execute_on,
                         self.shader_program_addresses(),
                     );

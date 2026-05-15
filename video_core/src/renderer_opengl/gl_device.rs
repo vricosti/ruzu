@@ -269,6 +269,27 @@ impl Device {
     pub fn can_report_memory(&self) -> bool {
         self.can_report_memory
     }
+
+    /// Port of upstream `Device::GetCurrentDedicatedVideoMemory()`
+    /// (gl_device.cpp:331-335). Queries
+    /// `GL_GPU_MEMORY_INFO_TOTAL_AVAILABLE_MEMORY_NVX = 0x9048` (the
+    /// NVX-extension total-available query) and returns it as bytes.
+    /// Returns 0 if the NVX extension is absent or the query fails.
+    pub fn get_current_dedicated_video_memory(&self) -> u64 {
+        const GL_GPU_MEMORY_INFO_TOTAL_AVAILABLE_MEMORY_NVX: u32 = 0x9048;
+        if !self.can_report_memory {
+            return 0;
+        }
+        let mut total_kb: i32 = 0;
+        unsafe {
+            gl::GetIntegerv(GL_GPU_MEMORY_INFO_TOTAL_AVAILABLE_MEMORY_NVX, &mut total_kb);
+        }
+        if total_kb <= 0 {
+            0
+        } else {
+            (total_kb as u64) * 1024
+        }
+    }
     pub fn must_emulate_bgr565(&self) -> bool {
         self.must_emulate_bgr565
     }

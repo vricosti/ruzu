@@ -52,7 +52,8 @@ pub use ir::types::ShaderStage;
 pub use pipeline_cache::{
     compile_dual_vertex_shader_glsl_at_offset,
     compile_dual_vertex_shader_glsl_at_offset_with_bindings, compile_shader, compile_shader_glsl,
-    compile_shader_glsl_at_offset, compile_shader_glsl_at_offset_with_bindings, CompiledGlslShader,
+    compile_shader_glsl_at_offset, compile_shader_glsl_at_offset_with_bindings,
+    compile_shader_glsl_at_offset_with_bindings_and_texture_bound, CompiledGlslShader,
     CompiledShader, PipelineCache, ShaderKey,
 };
 pub use profile::Profile;

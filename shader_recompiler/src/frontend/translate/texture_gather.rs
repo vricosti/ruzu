@@ -20,18 +20,18 @@ use crate::ir::value::Value;
 pub fn tld4(tv: &mut TranslatorVisitor, insn: u64, _opcode: MaxwellOpcode) {
     let dst = tv.dst_reg(insn);
     let src_reg = tv.src_a_reg(insn);
-    let tex_index = field(insn, 36, 13);
+    let cbuf_offset = field(insn, 36, 13) * 4;
     let component = field(insn, 56, 2);
 
     let info = TextureInstInfo {
-        descriptor_index: tex_index as u16,
+        descriptor_index: cbuf_offset as u16,
         texture_type: 1,
         gather_component: component as u8,
         ..Default::default()
     };
 
     tv.ir.program.info.register_texture(
-        tex_index,
+        cbuf_offset,
         crate::shader_info::TextureType::ColorArray1D,
         false,
     );
@@ -39,7 +39,7 @@ pub fn tld4(tv: &mut TranslatorVisitor, insn: u64, _opcode: MaxwellOpcode) {
     let coord_x = tv.f(src_reg);
     let coord_y = tv.f(src_reg + 1);
     let coords = tv.ir.composite_construct_f32x2(coord_x, coord_y);
-    let handle = Value::ImmU32(tex_index);
+    let handle = Value::ImmU32(cbuf_offset);
 
     let result = tv.ir.image_gather(handle, coords, info.to_u32());
 

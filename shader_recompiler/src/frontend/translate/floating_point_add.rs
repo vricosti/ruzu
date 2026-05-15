@@ -3,7 +3,7 @@
 
 //! Port of zuyu/src/shader_recompiler/frontend/maxwell/translate/impl/floating_point_add.cpp
 
-use super::{bit, field, TranslatorVisitor};
+use super::{bit, TranslatorVisitor};
 use crate::frontend::maxwell_opcodes::MaxwellOpcode;
 use crate::ir::value::Value;
 
@@ -14,7 +14,7 @@ pub fn fadd(tv: &mut TranslatorVisitor, insn: u64, opcode: MaxwellOpcode) {
 
     let abs_a = bit(insn, 46);
     let neg_a = bit(insn, 48);
-    let abs_b = bit(insn, 44);
+    let abs_b = bit(insn, 49);
     let neg_b = bit(insn, 45);
     let sat = bit(insn, 50);
 
@@ -37,7 +37,7 @@ pub fn fadd32i(tv: &mut TranslatorVisitor, insn: u64) {
 
     let abs_a = bit(insn, 54);
     let neg_a = bit(insn, 56);
-    let abs_b = bit(insn, 52);
+    let abs_b = bit(insn, 57);
     let neg_b = bit(insn, 53);
 
     let a = tv.ir.fp_abs_neg_32(src_a, abs_a, neg_a);
