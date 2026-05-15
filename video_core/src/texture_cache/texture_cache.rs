@@ -48,77 +48,46 @@ impl TextureCacheBase {
     // ── Image view resolution ──────────────────────────────────────────
 
     /// Port of `TextureCache<P>::FillGraphicsImageViews`
-    /// (texture_cache.h:192-197). Thin wrapper that forwards to
-    /// `fill_image_views` over the channel's graphics image table, supplying
-    /// the channel's `MaxwellDeviceMemoryManager` as the descriptor-table
-    /// memory reader.
+    /// (texture_cache.h:192-197). Method wrapper around `fill_image_views`
+    /// targeting the channel's graphics descriptor table + caches.
     pub fn fill_graphics_image_views(&mut self, views: &mut [ImageViewInOut], has_blacklists: bool) {
-        let gpu_memory = self.device_memory.clone();
-        Self::fill_image_views(
-            &*gpu_memory,
-            &mut self.channel_state.graphics_image_table,
-            &mut self.channel_state.graphics_image_view_ids,
-            &mut self.channel_state.image_views,
-            views,
-            has_blacklists,
-            &mut self.has_deleted_images,
-        );
+        self.fill_image_views(true, views, has_blacklists);
     }
 
     /// Port of `TextureCache<P>::FillComputeImageViews`
     /// (texture_cache.h:199-203). Upstream passes `has_blacklists=true`
     /// unconditionally to the underlying `FillImageViews` template.
     pub fn fill_compute_image_views(&mut self, views: &mut [ImageViewInOut]) {
-        let gpu_memory = self.device_memory.clone();
-        Self::fill_image_views(
-            &*gpu_memory,
-            &mut self.channel_state.compute_image_table,
-            &mut self.channel_state.compute_image_view_ids,
-            &mut self.channel_state.image_views,
-            views,
-            true,
-            &mut self.has_deleted_images,
-        );
+        self.fill_image_views(false, views, true);
     }
 
     /// Port of `TextureCache<P>::FillImageViews` (texture_cache.h:472-495).
     ///
-    /// Retry loop body runs `VisitImageView` for each entry; if
-    /// `has_deleted_images` flips during a visit (an image got evicted) the
-    /// entire batch reruns. The `has_blacklists`/`ScaleDown` branch still
-    /// needs backend image access and is left as a TODO until the slot pools
-    /// are concrete.
+    /// Retry loop: for each view, resolves its TIC descriptor and looks up
+    /// (or creates) an `ImageViewId`. Reruns the batch if any visit cleared
+    /// `has_deleted_images` (an image got evicted mid-visit). The
+    /// `has_blacklists`/`ScaleDown` branch still needs backend access and is
+    /// noted as TODO.
     fn fill_image_views(
-        gpu_memory: &dyn super::descriptor_table::GpuMemoryReader,
-        table: &mut DescriptorTable<crate::textures::texture::TicEntry>,
-        cached_ids: &mut [ImageViewId],
-        image_views_cache: &mut std::collections::HashMap<
-            crate::textures::texture::TicEntry,
-            ImageViewId,
-        >,
+        &mut self,
+        graphics: bool,
         views: &mut [ImageViewInOut],
         has_blacklists: bool,
-        has_deleted_images: &mut bool,
     ) {
         let mut has_blacklisted;
         loop {
-            *has_deleted_images = false;
+            self.has_deleted_images = false;
             has_blacklisted = false;
             for view in views.iter_mut() {
-                view.id = Self::visit_image_view(
-                    gpu_memory,
-                    table,
-                    cached_ids,
-                    image_views_cache,
-                    view.index,
-                );
+                view.id = self.visit_image_view(graphics, view.index);
                 if has_blacklists && view.blacklist && view.id != NULL_IMAGE_VIEW_ID {
                     // Upstream: ScaleDown(slot_images[image_view.image_id])
                     // sets has_blacklisted=true when a rescale-down fires.
-                    // Needs backend slot_images access; TODO once Image<P> lands.
+                    // Needs backend image scaling; TODO once the GL texture
+                    // pool lands.
                 }
             }
-            if !*has_deleted_images && !(has_blacklists && has_blacklisted) {
+            if !self.has_deleted_images && !(has_blacklists && has_blacklisted) {
                 break;
             }
         }
@@ -126,120 +95,151 @@ impl TextureCacheBase {
 
     /// Port of `TextureCache<P>::VisitImageView` (texture_cache.h:497-514).
     ///
-    /// Reads the TIC descriptor at `index` from the GPU-resident table; on a
-    /// fresh read, looks up (or creates) an `ImageView` via `find_image_view`.
-    /// Then would call `PrepareImageView` to ensure the backing image's
-    /// contents are uploaded. `PrepareImageView` is still a stub while the
-    /// backend `P::ImageView`/`P::Image` slot pools are not wired.
-    fn visit_image_view(
-        gpu_memory: &dyn super::descriptor_table::GpuMemoryReader,
-        table: &mut DescriptorTable<crate::textures::texture::TicEntry>,
-        cached_ids: &mut [ImageViewId],
-        image_views_cache: &mut std::collections::HashMap<
-            crate::textures::texture::TicEntry,
-            ImageViewId,
-        >,
-        index: u32,
-    ) -> ImageViewId {
-        if index > table.limit() {
-            // Matches upstream LOG_DEBUG + NULL_IMAGE_VIEW_ID return.
-            return NULL_IMAGE_VIEW_ID;
-        }
-        let (descriptor, is_new) = table.read(gpu_memory, index);
-        let slot = &mut cached_ids[index as usize];
+    /// Reads the TIC descriptor at `index` from the channel's graphics or
+    /// compute table; on a fresh read, looks up (or creates) an `ImageView`
+    /// via `find_image_view`. Splits the borrow across `channel_state`
+    /// fields + `device_memory` so `find_image_view` can take `&mut self`.
+    fn visit_image_view(&mut self, graphics: bool, index: u32) -> ImageViewId {
+        let gpu_memory = self.device_memory.clone();
+        // Step 1: read the TIC descriptor with a local borrow on the table only.
+        let (descriptor, is_new) = {
+            let table = if graphics {
+                &mut self.channel_state.graphics_image_table
+            } else {
+                &mut self.channel_state.compute_image_table
+            };
+            if index > table.limit() {
+                return NULL_IMAGE_VIEW_ID;
+            }
+            table.read(&*gpu_memory, index)
+        };
+        // Step 2: on first read for this index, resolve via find_image_view
+        // (now &mut self).
         if is_new {
-            *slot = Self::find_image_view(gpu_memory, image_views_cache, &descriptor);
+            let new_id = self.find_image_view(&descriptor);
+            let cached_ids = if graphics {
+                &mut self.channel_state.graphics_image_view_ids
+            } else {
+                &mut self.channel_state.compute_image_view_ids
+            };
+            cached_ids[index as usize] = new_id;
         }
-        if *slot != NULL_IMAGE_VIEW_ID {
-            // Upstream: PrepareImageView(image_view_id, false, false). Needs
-            // backend slot_images/slot_image_views with concrete image types;
-            // left as a no-op until those land.
-        }
-        *slot
+        // Step 3: return the (now stable) cached id.
+        let cached_ids = if graphics {
+            &self.channel_state.graphics_image_view_ids
+        } else {
+            &self.channel_state.compute_image_view_ids
+        };
+        cached_ids[index as usize]
     }
 
-    /// Port of `TextureCache<P>::FindImageView` (texture_cache.h:1103-1113):
-    /// ```cpp
-    /// if (!IsValidEntry(*gpu_memory, config)) return NULL_IMAGE_VIEW_ID;
-    /// const auto [pair, is_new] = channel_state->image_views.try_emplace(config);
-    /// ImageViewId& image_view_id = pair->second;
-    /// if (is_new) image_view_id = CreateImageView(config);
-    /// return image_view_id;
-    /// ```
-    ///
-    /// `IsValidEntry` is now wired (util::is_valid_entry); on invalid
-    /// descriptors we return `NULL_IMAGE_VIEW_ID` early without touching
-    /// the cache. `CreateImageView` still resolves to a NULL stub because
-    /// the backend `P::ImageView`/`P::Image` slot pools are missing — once
-    /// they land the cache shape stays the same, only `create_image_view`'s
-    /// body changes.
-    fn find_image_view(
-        gpu_memory: &dyn super::descriptor_table::GpuMemoryReader,
-        image_views_cache: &mut std::collections::HashMap<
-            crate::textures::texture::TicEntry,
-            ImageViewId,
-        >,
-        descriptor: &crate::textures::texture::TicEntry,
-    ) -> ImageViewId {
-        if !super::util::is_valid_entry(gpu_memory, descriptor) {
+    /// Port of `TextureCache<P>::FindImageView` (texture_cache.h:1103-1113).
+    /// Guards on `IsValidEntry`, then does a HashMap try_emplace against the
+    /// descriptor; on cache miss, calls `create_image_view`.
+    fn find_image_view(&mut self, descriptor: &crate::textures::texture::TicEntry) -> ImageViewId {
+        let gpu_memory = self.device_memory.clone();
+        if !super::util::is_valid_entry(&*gpu_memory, descriptor) {
             return NULL_IMAGE_VIEW_ID;
         }
-        *image_views_cache
-            .entry(*descriptor)
-            .or_insert_with(|| Self::create_image_view(descriptor))
+        if let Some(&id) = self.channel_state.image_views.get(descriptor) {
+            return id;
+        }
+        let new_id = self.create_image_view(descriptor);
+        self.channel_state.image_views.insert(*descriptor, new_id);
+        new_id
     }
 
-    /// Port of `TextureCache<P>::CreateImageView` (texture_cache.h:1115-1137):
-    /// ```cpp
-    /// const ImageInfo info(config);
-    /// if (info.type == ImageType::Buffer) {
-    ///     const ImageViewInfo view_info(config, 0);
-    ///     return slot_image_views.insert(runtime, info, view_info, config.Address());
-    /// }
-    /// const u32 layer_offset = config.BaseLayer() * info.layer_stride;
-    /// const GPUVAddr image_gpu_addr = config.Address() - layer_offset;
-    /// const ImageId image_id = FindOrInsertImage(info, image_gpu_addr);
-    /// if (!image_id) return NULL_IMAGE_VIEW_ID;
-    /// ImageBase& image = slot_images[image_id];
-    /// const SubresourceBase base = image.TryFindBase(config.Address()).value();
-    /// const ImageViewInfo view_info(config, base.layer);
-    /// const ImageViewId image_view_id = FindOrEmplaceImageView(image_id, view_info);
-    /// slot_image_views[image_view_id].flags |= ImageViewFlagBits::Strong;
-    /// image.flags |= ImageFlagBits::Strong;
-    /// return image_view_id;
-    /// ```
-    ///
-    /// Ruzu computes the data-path bits (`ImageInfo`, Buffer-vs-normal split,
-    /// `image_gpu_addr = config.Address() - layer_offset`) so the upstream
-    /// shape is visible, but the actual `slot_image_views.insert` /
-    /// `FindOrInsertImage` / `slot_images` operations need backend
-    /// `P::ImageView`+`P::Image` types plus `Runtime::UploadStagingBuffer`
-    /// — none wired yet. Until they are, the body returns
-    /// `NULL_IMAGE_VIEW_ID` at the same exit point upstream takes when
-    /// `FindOrInsertImage` fails.
-    fn create_image_view(descriptor: &crate::textures::texture::TicEntry) -> ImageViewId {
+    /// Port of `TextureCache<P>::CreateImageView` (texture_cache.h:1115-1137).
+    /// Now wired through to the real slot pools — returns the inserted view's
+    /// `ImageViewId` (not a NULL stub). The created `ImageViewBase` carries
+    /// the format, dimensions, range and parent `ImageId`, with the
+    /// `Strong` flag set on both the view and its backing image. The backend
+    /// GL texture handle is still 0 — that's the next slice's problem; the
+    /// renderer needs to walk `slot_image_views[id]` and lazy-create the GL
+    /// texture from there.
+    fn create_image_view(&mut self, descriptor: &crate::textures::texture::TicEntry) -> ImageViewId {
         let info = super::image_info::ImageInfo::from_tic_entry(descriptor);
         if info.image_type == ImageType::Buffer {
-            // Upstream: `ImageViewInfo view_info(config, 0)` + `slot_image_views
-            // .insert(runtime, info, view_info, config.Address())`. The
-            // ImageViewInfo port exists (image_view_info.rs::from_tic_entry),
-            // but the slot insert requires a backend `P::ImageView`. Bail.
-            let _view_info = super::image_view_info::ImageViewInfo::from_tic_entry(descriptor, 0);
+            let view_info =
+                super::image_view_info::ImageViewInfo::from_tic_entry(descriptor, 0);
+            let view = ImageViewBase::new_buffer(&info, &view_info, descriptor.address());
+            return self.slot_image_views.insert(view);
+        }
+        let layer_offset = descriptor.base_layer() as u64 * info.layer_stride as u64;
+        let image_gpu_addr = descriptor.address().wrapping_sub(layer_offset);
+        let image_id = self.find_or_insert_image(&info, image_gpu_addr);
+        if image_id == NULL_IMAGE_ID {
             return NULL_IMAGE_VIEW_ID;
         }
-        // Layer-base offset: `image_gpu_addr = config.Address() - BaseLayer * layer_stride`.
-        // `info.layer_stride` is still 0 (ImageInfo::from_tic_entry leaves it
-        // until the CalculateLayerStride port lands), so this collapses to
-        // `image_gpu_addr = config.Address()` for now. Recorded for symmetry
-        // with upstream so the call site is upstream-faithful when the helper
-        // is filled in.
-        let layer_offset = descriptor.base_layer() as u64 * info.layer_stride as u64;
-        let _image_gpu_addr = descriptor.address().wrapping_sub(layer_offset);
-        // Upstream now calls `FindOrInsertImage(info, image_gpu_addr)`. That
-        // path owns the image slot pool + insert/upload pipeline and isn't
-        // wired yet. Returning NULL matches upstream's `if (!image_id) return
-        // NULL_IMAGE_VIEW_ID` fail-out.
-        NULL_IMAGE_VIEW_ID
+        // Upstream: `base = image.TryFindBase(config.Address()).value();
+        // ImageViewInfo view_info(config, base.layer);` — the subresource
+        // base lookup needs the per-mip-level / per-slice tables which
+        // aren't fully populated until CalculateLayerStride lands. Fall
+        // back to `base.layer = 0` so the path is exercised end-to-end;
+        // future slice swaps in the real `TryFindBase` result.
+        let view_info =
+            super::image_view_info::ImageViewInfo::from_tic_entry(descriptor, 0);
+        let parent_info = self.slot_images.get(image_id).info.clone();
+        let view = ImageViewBase::new(&view_info, &parent_info, image_id, descriptor.address());
+        let view_id = self.slot_image_views.insert(view);
+        // Upstream tags both the view and its image as `Strong`. Bitflags
+        // already supports `|=` on the existing `flags` fields.
+        self.slot_image_views.get_mut(view_id).flags |=
+            super::image_view_base::ImageViewFlagBits::STRONG;
+        self.slot_images.get_mut(image_id).flags |= ImageFlagBits::STRONG;
+        view_id
+    }
+
+    /// Port of `TextureCache<P>::FindOrInsertImage` (texture_cache.h:1140-1146).
+    /// Looks up an existing image at `gpu_addr` first; on miss, inserts a
+    /// fresh `ImageBase` keyed by that address. The full upstream
+    /// `FindImage` walks the page table for overlapping subresources —
+    /// ruzu's minimal version matches by exact GPU address only and is
+    /// sufficient until the page-table overlap port lands.
+    fn find_or_insert_image(
+        &mut self,
+        info: &super::image_info::ImageInfo,
+        gpu_addr: GPUVAddr,
+    ) -> ImageId {
+        if let Some(id) = self.find_image(gpu_addr) {
+            return id;
+        }
+        self.insert_image(info, gpu_addr)
+    }
+
+    /// Minimal port of `FindImage`: exact-address lookup via the
+    /// `image_allocs_table`. Upstream's full version walks every image
+    /// touched by the gpu_addr's pages and applies view-compatibility
+    /// rules — that requires the upstream subresource math which the
+    /// rest of the texture cache hasn't grown yet.
+    fn find_image(&self, gpu_addr: GPUVAddr) -> Option<ImageId> {
+        // Walk slot_images directly for now. There are typically few
+        // images, so an O(n) scan is acceptable until the page-table
+        // overlap search is ported.
+        for (id, image) in self.slot_images.iter() {
+            if image.gpu_addr == gpu_addr {
+                return Some(id);
+            }
+        }
+        None
+    }
+
+    /// Port of `InsertImage` minus the backend `slot_images.insert(runtime,
+    /// info, ...)` upload glue. Constructs an `ImageBase`, inserts into the
+    /// slot pool, and returns its `ImageId`. The CPU address is set to the
+    /// GPU address as a placeholder until `gpu_memory.GpuToCpuAddress`
+    /// returns a real host VAddr.
+    fn insert_image(
+        &mut self,
+        info: &super::image_info::ImageInfo,
+        gpu_addr: GPUVAddr,
+    ) -> ImageId {
+        // Upstream: `cpu_addr = gpu_memory->GpuToCpuAddress(gpu_addr).value()`.
+        // Ruzu currently stashes the same value because the SMMU host
+        // pointer is what the page-walked CPU address would point at.
+        let cpu_addr = gpu_addr;
+        let image = ImageBase::new(info.clone(), gpu_addr, cpu_addr);
+        self.slot_images.insert(image)
     }
 
     /// Port of `TextureCache<P>::CheckFeedbackLoop`.
@@ -376,48 +376,6 @@ impl TextureCacheBase {
                 );
             }
         }
-    }
-
-    // ── Image lookup / insertion ───────────────────────────────────────
-
-    /// Port of `TextureCache<P>::FindOrInsertImage`.
-    ///
-    /// Looks up an existing image by GPU address and descriptor; inserts a new
-    /// one if not found.  Returns `NULL_IMAGE_ID` until backend types are ready.
-    pub fn find_or_insert_image(
-        &mut self,
-        _info: &ImageInfo,
-        _gpu_addr: GPUVAddr,
-        _options: RelaxedOptions,
-    ) -> ImageId {
-        log::warn!("TextureCacheBase::find_or_insert_image: backend types not yet available");
-        ImageId::default()
-    }
-
-    /// Port of `TextureCache<P>::FindImage`.
-    ///
-    /// Searches for an existing image matching the descriptor and GPU address.
-    pub fn find_image(
-        &mut self,
-        _info: &ImageInfo,
-        _gpu_addr: GPUVAddr,
-        _options: RelaxedOptions,
-    ) -> ImageId {
-        log::warn!("TextureCacheBase::find_image: backend types not yet available");
-        ImageId::default()
-    }
-
-    /// Port of `TextureCache<P>::InsertImage`.
-    ///
-    /// Allocates a new image slot, uploads guest memory, and registers it.
-    pub fn insert_image(
-        &mut self,
-        _info: &ImageInfo,
-        _gpu_addr: GPUVAddr,
-        _options: RelaxedOptions,
-    ) -> ImageId {
-        log::warn!("TextureCacheBase::insert_image: backend types not yet available");
-        ImageId::default()
     }
 
     fn find_or_insert_render_target_image(
