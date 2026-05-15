@@ -533,8 +533,7 @@ fn dump_cv_state(
                         .filter(|s| !s.is_empty())
                         .filter_map(|tok| {
                             let (a, n) = tok.split_once(':')?;
-                            let addr =
-                                u64::from_str_radix(a.trim_start_matches("0x"), 16).ok()?;
+                            let addr = u64::from_str_radix(a.trim_start_matches("0x"), 16).ok()?;
                             let len = n.parse::<u64>().ok()?;
                             Some((addr, len))
                         })

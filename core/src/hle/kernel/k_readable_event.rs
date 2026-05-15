@@ -7,10 +7,7 @@
 //! intrusive waiter list on the owning sync object.
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
 
-use super::k_process::ProcessLock;
-use crate::hle::kernel::k_scheduler::KScheduler;
 use crate::hle::kernel::k_scheduler_lock::KScopedSchedulerLock;
 use crate::hle::kernel::k_synchronization_object::SynchronizationObjectState;
 use crate::hle::kernel::svc::svc_results::RESULT_INVALID_STATE;
@@ -62,11 +59,14 @@ impl KReadableEvent {
     /// call from any context — guest syscall or host thread.
     pub fn signal(&mut self) -> u32 {
         let _scheduler_guard = Self::lock_scheduler();
-        self.is_signaled.store(true, Ordering::Relaxed);
-        if std::env::var_os("RUZU_TRACE_EVENTS").is_some() {
-            log::info!("EVENT_SIGNAL object_id={} via=signal", self.object_id);
+
+        if !self.is_signaled.load(Ordering::Relaxed) {
+            self.is_signaled.store(true, Ordering::Relaxed);
+            if std::env::var_os("RUZU_TRACE_EVENTS").is_some() {
+                log::info!("EVENT_SIGNAL object_id={} via=signal", self.object_id);
+            }
+            self.notify_available();
         }
-        self.notify_available();
         RESULT_SUCCESS.get_inner_value()
     }
 

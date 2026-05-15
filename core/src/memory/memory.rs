@@ -763,15 +763,13 @@ impl Memory {
                     }
                 } else {
                     if ptype == PageType::RasterizerCachedMemory {
-                        let pointer =
-                            self.get_pointer_from_rasterizer_cached_memory(current_vaddr);
+                        let pointer = self.get_pointer_from_rasterizer_cached_memory(current_vaddr);
                         if !pointer.is_null() {
                             // Encode pointer as `ptr - vaddr` so the fastmem
                             // path can recover the host address with one
                             // addition (matches the PageInfo layout used by
                             // `map_pages`).
-                            let encoded =
-                                (pointer as usize).wrapping_sub(current_vaddr as usize);
+                            let encoded = (pointer as usize).wrapping_sub(current_vaddr as usize);
                             entry.store(encoded, PageType::Memory);
                         } else {
                             // No backing recoverable — fall back to debug.
@@ -1140,7 +1138,9 @@ impl Memory {
                 dest[offset..offset + copy_amount].fill(0);
                 user_accessible = false;
             } else {
-                if trace_read_ptr.is_some_and(|target| vaddr <= target && target < vaddr + copy_amount as u64) {
+                if trace_read_ptr
+                    .is_some_and(|target| vaddr <= target && target < vaddr + copy_amount as u64)
+                {
                     log::info!(
                         "[READ_BLOCK_PTR] src=0x{:X} page_vaddr=0x{:X} ptr={:p} copy=0x{:X} size=0x{:X}",
                         src_addr,
