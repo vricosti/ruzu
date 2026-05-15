@@ -76,7 +76,7 @@ mod tests {
 
         assert!(result.is_inst());
         assert_eq!(program.blocks[0].instructions.len(), 1);
-        assert_eq!(program.blocks[0].instructions[0].opcode, Opcode::FPAdd32);
+        assert_eq!(program.blocks[0].inst(0).opcode, Opcode::FPAdd32);
     }
 
     #[test]
@@ -92,9 +92,9 @@ mod tests {
         }
 
         assert_eq!(program.blocks[0].instructions.len(), 3);
-        assert_eq!(program.blocks[0].instructions[0].opcode, Opcode::IAdd32);
-        assert_eq!(program.blocks[0].instructions[1].opcode, Opcode::IMul32);
-        assert_eq!(program.blocks[0].instructions[2].opcode, Opcode::ISub32);
+        assert_eq!(program.blocks[0].inst(0).opcode, Opcode::IAdd32);
+        assert_eq!(program.blocks[0].inst(1).opcode, Opcode::IMul32);
+        assert_eq!(program.blocks[0].inst(2).opcode, Opcode::ISub32);
     }
 
     #[test]
@@ -109,11 +109,8 @@ mod tests {
         }
 
         assert_eq!(program.blocks[0].instructions.len(), 2);
-        assert_eq!(
-            program.blocks[0].instructions[0].opcode,
-            Opcode::FPOrdLessThan32
-        );
-        assert_eq!(program.blocks[0].instructions[1].opcode, Opcode::SelectF32);
+        assert_eq!(program.blocks[0].inst(0).opcode, Opcode::FPOrdLessThan32);
+        assert_eq!(program.blocks[0].inst(1).opcode, Opcode::SelectF32);
     }
 
     #[test]

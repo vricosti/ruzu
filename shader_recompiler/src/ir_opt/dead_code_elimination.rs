@@ -22,13 +22,14 @@ pub fn dead_code_elimination_pass(program: &mut Program) {
     while changed {
         changed = false;
         for block in &mut program.blocks {
-            let mut i = block.instructions.len();
-            while i > 0 {
-                i -= 1;
-                if block.instructions[i].use_count == 0
-                    && !block.instructions[i].may_have_side_effects()
+            let slots: Vec<u32> = block.indexed_iter().map(|(idx, _)| idx).collect();
+            for idx in slots.into_iter().rev() {
+                let inst = block.inst(idx);
+                if inst.opcode != crate::ir::opcodes::Opcode::Void
+                    && inst.use_count == 0
+                    && !inst.may_have_side_effects()
                 {
-                    block.instructions.remove(i);
+                    block.erase_inst(idx);
                     changed = true;
                 }
             }
@@ -43,7 +44,7 @@ pub fn dead_code_elimination_pass(program: &mut Program) {
 fn recompute_use_counts(program: &mut Program) {
     // Reset all use counts to zero
     for block in &mut program.blocks {
-        for inst in &mut block.instructions {
+        for inst in block.iter_mut() {
             inst.use_count = 0;
         }
     }
@@ -56,7 +57,7 @@ fn recompute_use_counts(program: &mut Program) {
         .collect();
 
     for block in &program.blocks {
-        for inst in &block.instructions {
+        for inst in block.iter() {
             for arg in &inst.args {
                 if let Value::Inst(r) = arg {
                     if let Some(block_counts) = use_counts.get_mut(r.block as usize) {
@@ -71,12 +72,55 @@ fn recompute_use_counts(program: &mut Program) {
 
     // Apply computed counts
     for (block_idx, block) in program.blocks.iter_mut().enumerate() {
-        for (inst_idx, inst) in block.instructions.iter_mut().enumerate() {
+        for (inst_idx, inst) in block.indexed_iter_mut() {
             if let Some(block_counts) = use_counts.get(block_idx) {
-                if let Some(&count) = block_counts.get(inst_idx) {
+                if let Some(&count) = block_counts.get(inst_idx as usize) {
                     inst.use_count = count;
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::dead_code_elimination_pass;
+    use crate::ir::basic_block::Block;
+    use crate::ir::instruction::Inst;
+    use crate::ir::opcodes::Opcode;
+    use crate::ir::program::Program;
+    use crate::ir::types::ShaderStage;
+    use crate::ir::value::{InstRef, Value};
+
+    #[test]
+    fn dce_preserves_instref_indices_with_tombstones() {
+        let mut program = Program::new(ShaderStage::VertexB);
+        program.blocks.push(Block::new());
+        program.blocks[0].append_inst(Inst::new(
+            Opcode::IAdd32,
+            vec![Value::ImmU32(1), Value::ImmU32(2)],
+        ));
+        program.blocks[0].append_inst(Inst::new(
+            Opcode::IAdd32,
+            vec![Value::ImmU32(3), Value::ImmU32(4)],
+        ));
+        program.blocks[0].append_inst(Inst::new(
+            Opcode::SetAttribute,
+            vec![
+                Value::Attribute(crate::ir::value::Attribute::POSITION_X),
+                Value::Inst(InstRef { block: 0, inst: 1 }),
+                Value::ImmU32(0),
+            ],
+        ));
+
+        dead_code_elimination_pass(&mut program);
+
+        assert_eq!(program.blocks[0].instructions.len(), 3);
+        assert!(program.blocks[0].instructions[0].is_none());
+        assert_eq!(program.blocks[0].inst(1).opcode, Opcode::IAdd32);
+        assert_eq!(
+            program.blocks[0].inst(2).args[1],
+            Value::Inst(InstRef { block: 0, inst: 1 })
+        );
     }
 }

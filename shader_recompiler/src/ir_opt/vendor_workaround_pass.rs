@@ -18,10 +18,10 @@ use crate::ir::value::Value;
 pub fn vendor_workaround_pass(program: &mut Program) {
     // Collect indices of IAdd32 instructions to patch.
     // We collect first to avoid borrow issues when mutating.
-    let mut patches: Vec<(usize, usize)> = Vec::new();
+    let mut patches: Vec<(usize, u32)> = Vec::new();
 
     for (block_idx, block) in program.blocks.iter().enumerate() {
-        for (inst_idx, inst) in block.instructions.iter().enumerate() {
+        for (inst_idx, inst) in block.indexed_iter() {
             if inst.opcode == Opcode::IAdd32 {
                 if should_replace_with_or(program, inst) {
                     patches.push((block_idx, inst_idx));
@@ -31,7 +31,7 @@ pub fn vendor_workaround_pass(program: &mut Program) {
     }
 
     for (block_idx, inst_idx) in patches {
-        program.blocks[block_idx].instructions[inst_idx].opcode = Opcode::BitwiseOr32;
+        program.blocks[block_idx].inst_mut(inst_idx).opcode = Opcode::BitwiseOr32;
     }
 }
 
@@ -47,7 +47,7 @@ fn try_inst_recursive<'a>(program: &'a Program, val: &Value) -> Option<&'a Inst>
     // Follow Identity chains.
     loop {
         let block = program.blocks.get(inst_ref.block as usize)?;
-        let inst = block.instructions.get(inst_ref.inst as usize)?;
+        let inst = block.instructions.get(inst_ref.inst as usize)?.as_ref()?;
         if inst.opcode == Opcode::Identity && !inst.args.is_empty() {
             if let Value::Inst(next) = &inst.args[0] {
                 inst_ref = *next;

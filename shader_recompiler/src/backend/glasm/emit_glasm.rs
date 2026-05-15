@@ -16,7 +16,7 @@ use super::glasm_emit_context::EmitContext;
 /// Matches the main loop in upstream `EmitGLASM`.
 pub fn emit_program(ctx: &mut EmitContext, program: &ir::Program) {
     for block in &program.blocks {
-        for inst in &block.instructions {
+        for inst in block.iter() {
             emit_inst(ctx, inst);
         }
     }

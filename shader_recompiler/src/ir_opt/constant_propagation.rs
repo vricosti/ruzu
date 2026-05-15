@@ -17,7 +17,7 @@ use crate::ir::value::{Pred, Reg, Value};
 /// Run constant propagation on all instructions.
 pub fn constant_propagation_pass(program: &mut Program) {
     for block in &mut program.blocks {
-        for inst in &mut block.instructions {
+        for inst in block.iter_mut() {
             propagate(inst);
         }
     }

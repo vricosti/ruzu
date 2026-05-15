@@ -539,8 +539,8 @@ impl SpirvEmitContext {
 
         // Emit instructions from all blocks
         for (block_idx, block) in program.blocks.iter().enumerate() {
-            for (inst_idx, inst) in block.instructions.iter().enumerate() {
-                self.emit_instruction(inst, block_idx as u32, inst_idx as u32);
+            for (inst_idx, inst) in block.indexed_iter() {
+                self.emit_instruction(inst, block_idx as u32, inst_idx);
             }
         }
 

@@ -18,7 +18,7 @@ use crate::ir::program::Program;
 /// Upstream: `VertexATransformPass` in `dual_vertex_pass.cpp`.
 pub fn vertex_a_transform_pass(program: &mut Program) {
     for block in &mut program.blocks {
-        for inst in &mut block.instructions {
+        for inst in block.iter_mut() {
             if inst.opcode == Opcode::Epilogue {
                 inst.opcode = Opcode::Identity;
                 inst.args.clear();
@@ -33,7 +33,7 @@ pub fn vertex_a_transform_pass(program: &mut Program) {
 /// Upstream: `VertexBTransformPass` in `dual_vertex_pass.cpp`.
 pub fn vertex_b_transform_pass(program: &mut Program) {
     for block in &mut program.blocks {
-        for inst in &mut block.instructions {
+        for inst in block.iter_mut() {
             if inst.opcode == Opcode::Prologue {
                 inst.opcode = Opcode::Identity;
                 inst.args.clear();

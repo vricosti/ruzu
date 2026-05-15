@@ -108,13 +108,16 @@ impl Pass {
     /// `replace_uses_with` calls reach them.
     fn build_initial_users(&mut self, program: &Program) {
         for block_idx in 0..program.blocks.len() as u32 {
-            let inst_count = program.block(block_idx).instructions.len() as u32;
-            for inst_idx in 0..inst_count {
-                let user_ref = InstRef {
+            let inst_refs: Vec<InstRef> = program
+                .block(block_idx)
+                .indexed_iter()
+                .map(|(inst_idx, _)| InstRef {
                     block: block_idx,
                     inst: inst_idx,
-                };
-                let inst = program.block(block_idx).inst(inst_idx);
+                })
+                .collect();
+            for user_ref in inst_refs {
+                let inst = program.block(user_ref.block).inst(user_ref.inst);
                 for arg in &inst.args {
                     self.register_use(*arg, user_ref);
                 }
@@ -468,8 +471,12 @@ fn visit_block(pass: &mut Pass, program: &mut Program, block: u32) {
     // Snapshot the original instruction count so that phi nodes appended by
     // ReadVariable during this loop are not iterated as if they were part of
     // the original block.
-    let inst_count = program.block(block).instructions.len() as u32;
-    for inst_idx in 0..inst_count {
+    let inst_refs: Vec<u32> = program
+        .block(block)
+        .indexed_iter()
+        .map(|(inst_idx, _)| inst_idx)
+        .collect();
+    for inst_idx in inst_refs {
         visit_inst(pass, program, block, inst_idx);
     }
     pass.seal_block(program, block);
@@ -502,7 +509,7 @@ pub fn ssa_rewrite_pass(program: &mut Program) {
     // Rust port sets the phi's flags at creation time via `undef_type`, so
     // the type is already concrete and no walk is needed.
     for &block in post.iter().rev() {
-        for inst in program.block_mut(block).instructions.iter_mut() {
+        for inst in program.block_mut(block).iter_mut() {
             if inst.opcode == Opcode::Phi {
                 inst.phi_args.sort_by_key(|(b, _)| *b);
             }

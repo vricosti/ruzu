@@ -15,7 +15,7 @@ use super::backend;
 use super::frontend::control_flow;
 use super::frontend::structured_control_flow;
 use super::frontend::translate::TranslatorVisitor;
-use super::frontend::translate_program::merge_dual_vertex_programs;
+use super::frontend::translate_program::{convert_legacy_to_generic, merge_dual_vertex_programs};
 use super::ir::basic_block::Block;
 use super::ir::post_order::post_order;
 use super::ir::program::{Program, ShaderInfo};
@@ -119,9 +119,35 @@ fn translate_cfg_to_program(
 
     if !program.blocks.is_empty() {
         program.post_order_blocks = post_order(&program.blocks, 0);
+        clear_unreachable_blocks(&mut program);
     }
 
     program
+}
+
+/// Rust adaptation of upstream `RemoveUnreachableBlocks`.
+///
+/// Upstream erases unreachable `IR::Block*` entries after computing
+/// `post_order_blocks`. Rust `Value::Inst` stores block indices rather than
+/// pointers, so erasing from `program.blocks` would shift indices and corrupt
+/// instruction references. Clearing unreachable blocks preserves indices while
+/// preventing stale instructions from reaching optimization/emission.
+fn clear_unreachable_blocks(program: &mut Program) {
+    if program.blocks.len() == program.post_order_blocks.len() {
+        return;
+    }
+    let reachable: std::collections::BTreeSet<u32> =
+        program.post_order_blocks.iter().copied().collect();
+    for (index, block) in program.blocks.iter_mut().enumerate().skip(1) {
+        if reachable.contains(&(index as u32)) {
+            continue;
+        }
+        for inst in &mut block.instructions {
+            *inst = None;
+        }
+        block.imm_predecessors.clear();
+        block.imm_successors.clear();
+    }
 }
 
 fn is_sched_control_word(base_offset: u32, word_index: usize) -> bool {
@@ -260,6 +286,7 @@ pub fn compile_shader_glsl(
     ir_opt::optimize(&mut program);
 
     let mut bindings = backend::bindings::Bindings::default();
+    convert_legacy_to_generic(&mut program, runtime_info);
     let source = backend::glsl::emit_glsl(profile, runtime_info, &mut program, &mut bindings);
     log::debug!("  GLSL: {} bytes", source.len());
     if std::env::var_os("RUZU_DUMP_GLSL").is_some() {
@@ -283,6 +310,41 @@ pub fn compile_shader_glsl_at_offset(
     profile: &Profile,
     runtime_info: &RuntimeInfo,
 ) -> CompiledGlslShader {
+    let mut bindings = backend::bindings::Bindings::default();
+    emit_glsl_program_at_offset(
+        code,
+        stage,
+        base_offset,
+        profile,
+        runtime_info,
+        &mut bindings,
+    )
+}
+
+/// Same as [`compile_shader_glsl_at_offset`], but reuses the caller-owned
+/// GLSL binding allocator across stages. Upstream `gl_shader_cache.cpp`
+/// keeps one `Shader::Backend::Bindings binding` for the whole graphics
+/// pipeline so vertex/fragment UBOs and textures receive distinct GL binding
+/// points.
+pub fn compile_shader_glsl_at_offset_with_bindings(
+    code: &[u64],
+    stage: ShaderStage,
+    base_offset: u32,
+    profile: &Profile,
+    runtime_info: &RuntimeInfo,
+    bindings: &mut backend::bindings::Bindings,
+) -> CompiledGlslShader {
+    emit_glsl_program_at_offset(code, stage, base_offset, profile, runtime_info, bindings)
+}
+
+fn emit_glsl_program_at_offset(
+    code: &[u64],
+    stage: ShaderStage,
+    base_offset: u32,
+    profile: &Profile,
+    runtime_info: &RuntimeInfo,
+    bindings: &mut backend::bindings::Bindings,
+) -> CompiledGlslShader {
     log::debug!(
         "Compiling {:?} shader to GLSL ({} instructions, base_offset=0x{:X})",
         stage,
@@ -290,22 +352,7 @@ pub fn compile_shader_glsl_at_offset(
         base_offset
     );
     if std::env::var_os("RUZU_TRACE_SHADER_WORDS").is_some() {
-        eprintln!(
-            "[SHADER_CODE] stage={:?} base=0x{:X} words={}",
-            stage,
-            base_offset,
-            code.len()
-        );
-        for (i, &word) in code.iter().take(32).enumerate() {
-            eprintln!(
-                "[SHADER_CODE_WORD] stage={:?} abs=0x{:X} index={} sched={} word=0x{:016X}",
-                stage,
-                base_offset + (i as u32 * 8),
-                i,
-                is_sched_control_word(base_offset, i),
-                word
-            );
-        }
+        trace_shader_words(stage, base_offset, code);
     }
 
     let cfg_blocks = control_flow::build_cfg(code);
@@ -313,8 +360,8 @@ pub fn compile_shader_glsl_at_offset(
 
     ir_opt::optimize(&mut program);
 
-    let mut bindings = backend::bindings::Bindings::default();
-    let source = backend::glsl::emit_glsl(profile, runtime_info, &mut program, &mut bindings);
+    convert_legacy_to_generic(&mut program, runtime_info);
+    let source = backend::glsl::emit_glsl(profile, runtime_info, &mut program, bindings);
     if std::env::var_os("RUZU_DUMP_GLSL").is_some() {
         eprintln!("[RUZU_DUMP_GLSL {:?}]\n{}", stage, source);
     }
@@ -336,6 +383,27 @@ pub fn compile_dual_vertex_shader_glsl_at_offset(
     profile: &Profile,
     runtime_info: &RuntimeInfo,
 ) -> CompiledGlslShader {
+    let mut bindings = backend::bindings::Bindings::default();
+    compile_dual_vertex_shader_glsl_at_offset_with_bindings(
+        vertex_a_code,
+        vertex_a_base_offset,
+        vertex_b_code,
+        vertex_b_base_offset,
+        profile,
+        runtime_info,
+        &mut bindings,
+    )
+}
+
+pub fn compile_dual_vertex_shader_glsl_at_offset_with_bindings(
+    vertex_a_code: &[u64],
+    vertex_a_base_offset: u32,
+    vertex_b_code: &[u64],
+    vertex_b_base_offset: u32,
+    profile: &Profile,
+    runtime_info: &RuntimeInfo,
+    bindings: &mut backend::bindings::Bindings,
+) -> CompiledGlslShader {
     log::debug!(
         "Compiling dual vertex shader to GLSL (va={} words @0x{:X}, vb={} words @0x{:X})",
         vertex_a_code.len(),
@@ -354,8 +422,8 @@ pub fn compile_dual_vertex_shader_glsl_at_offset(
         translate_and_optimize(vertex_b_code, ShaderStage::VertexB, vertex_b_base_offset);
     let mut program = merge_dual_vertex_programs(&mut vertex_a, &mut vertex_b);
 
-    let mut bindings = backend::bindings::Bindings::default();
-    let source = backend::glsl::emit_glsl(profile, runtime_info, &mut program, &mut bindings);
+    convert_legacy_to_generic(&mut program, runtime_info);
+    let source = backend::glsl::emit_glsl(profile, runtime_info, &mut program, bindings);
     if std::env::var_os("RUZU_DUMP_GLSL").is_some() {
         eprintln!("[RUZU_DUMP_GLSL DualVertex]\n{}", source);
     }
@@ -495,6 +563,28 @@ mod tests {
                 .any(|node| matches!(node, SyntaxNode::Block(1))),
             "syntax block indices must have matching IR blocks"
         );
+    }
+
+    #[test]
+    fn clear_unreachable_blocks_preserves_indices_but_drops_stale_instructions() {
+        use crate::ir::basic_block::Block;
+        use crate::ir::instruction::Inst;
+        use crate::ir::opcodes::Opcode;
+        use crate::ir::value::{Reg, Value};
+
+        let mut program = Program::new(ShaderStage::VertexB);
+        program.blocks.push(Block::new());
+        program.blocks.push(Block::new());
+        program
+            .block_mut(1)
+            .append_inst(Inst::new(Opcode::GetRegister, vec![Value::Reg(Reg(3))]));
+        program.post_order_blocks = vec![0];
+
+        clear_unreachable_blocks(&mut program);
+
+        assert_eq!(program.blocks.len(), 2);
+        assert!(program.block(1).is_empty());
+        assert_eq!(program.post_order_blocks, vec![0]);
     }
 
     #[test]

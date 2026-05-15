@@ -68,8 +68,8 @@ mod tests {
         constant_propagation::constant_propagation_pass(&mut program);
 
         // After const prop, the IAdd should become Identity(30)
-        assert_eq!(program.blocks[0].instructions[0].opcode, Opcode::Identity);
-        assert_eq!(program.blocks[0].instructions[0].args[0], Value::ImmU32(30));
+        assert_eq!(program.blocks[0].inst(0).opcode, Opcode::Identity);
+        assert_eq!(program.blocks[0].inst(0).args[0], Value::ImmU32(30));
     }
 
     #[test]
@@ -82,8 +82,8 @@ mod tests {
 
         constant_propagation::constant_propagation_pass(&mut program);
 
-        assert_eq!(program.blocks[0].instructions[0].opcode, Opcode::Identity);
-        assert_eq!(program.blocks[0].instructions[0].args[0], Value::ImmU32(42));
+        assert_eq!(program.blocks[0].inst(0).opcode, Opcode::Identity);
+        assert_eq!(program.blocks[0].inst(0).args[0], Value::ImmU32(42));
     }
 
     #[test]
@@ -96,11 +96,8 @@ mod tests {
 
         constant_propagation::constant_propagation_pass(&mut program);
 
-        assert_eq!(program.blocks[0].instructions[0].opcode, Opcode::Identity);
-        assert_eq!(
-            program.blocks[0].instructions[0].args[0],
-            Value::ImmF32(4.0)
-        );
+        assert_eq!(program.blocks[0].inst(0).opcode, Opcode::Identity);
+        assert_eq!(program.blocks[0].inst(0).args[0], Value::ImmF32(4.0));
     }
 
     #[test]
@@ -113,11 +110,8 @@ mod tests {
 
         constant_propagation::constant_propagation_pass(&mut program);
 
-        assert_eq!(program.blocks[0].instructions[0].opcode, Opcode::Identity);
-        assert_eq!(
-            program.blocks[0].instructions[0].args[0],
-            Value::ImmU32(0x0F00)
-        );
+        assert_eq!(program.blocks[0].inst(0).opcode, Opcode::Identity);
+        assert_eq!(program.blocks[0].inst(0).args[0], Value::ImmU32(0x0F00));
     }
 
     #[test]
@@ -130,9 +124,9 @@ mod tests {
 
         constant_propagation::constant_propagation_pass(&mut program);
 
-        assert_eq!(program.blocks[0].instructions[0].opcode, Opcode::Identity);
+        assert_eq!(program.blocks[0].inst(0).opcode, Opcode::Identity);
         assert_eq!(
-            program.blocks[0].instructions[0].args[0],
+            program.blocks[0].inst(0).args[0],
             Value::ImmU32(0x3F800000) // IEEE 754 encoding of 1.0
         );
     }
@@ -147,11 +141,8 @@ mod tests {
 
         constant_propagation::constant_propagation_pass(&mut program);
 
-        assert_eq!(program.blocks[0].instructions[0].opcode, Opcode::Identity);
-        assert_eq!(
-            program.blocks[0].instructions[0].args[0],
-            Value::ImmU32(100)
-        );
+        assert_eq!(program.blocks[0].inst(0).opcode, Opcode::Identity);
+        assert_eq!(program.blocks[0].inst(0).args[0], Value::ImmU32(100));
     }
 
     // ── Identity Removal ─────────────────────────────────────────────
@@ -160,10 +151,8 @@ mod tests {
     fn test_identity_removal() {
         let mut program = make_test_program();
         // Manually insert an Identity instruction
-        program.blocks[0]
-            .instructions
-            .push(Inst::new(Opcode::Identity, vec![Value::ImmU32(42)]));
-        program.blocks[0].instructions.push(Inst::new(
+        program.blocks[0].append_inst(Inst::new(Opcode::Identity, vec![Value::ImmU32(42)]));
+        program.blocks[0].append_inst(Inst::new(
             Opcode::FPAdd32,
             vec![Value::ImmF32(1.0), Value::ImmF32(2.0)],
         ));
@@ -172,9 +161,10 @@ mod tests {
 
         identity_removal::identity_removal_pass(&mut program);
 
-        // Identity should be removed, only FPAdd32 remains
-        assert_eq!(program.blocks[0].instructions.len(), 1);
-        assert_eq!(program.blocks[0].instructions[0].opcode, Opcode::FPAdd32);
+        // Rust erases the stable slot without shifting later InstRefs.
+        assert_eq!(program.blocks[0].instructions.len(), 2);
+        assert!(program.blocks[0].instructions[0].is_none());
+        assert_eq!(program.blocks[0].inst(1).opcode, Opcode::FPAdd32);
     }
 
     // ── Dead Code Elimination ────────────────────────────────────────
@@ -193,15 +183,17 @@ mod tests {
 
         dead_code_elimination::dead_code_elimination_pass(&mut program);
 
-        // Both should be removed since they have no uses and no side effects
-        assert_eq!(program.blocks[0].instructions.len(), 0);
+        // Both stable slots are erased without shifting InstRefs.
+        assert_eq!(program.blocks[0].instructions.len(), 2);
+        assert!(program.blocks[0].instructions[0].is_none());
+        assert!(program.blocks[0].instructions[1].is_none());
     }
 
     #[test]
     fn test_dce_keeps_side_effects() {
         let mut program = make_test_program();
         // SetAttribute has side effects and should NOT be removed
-        program.blocks[0].instructions.push(Inst::new(
+        program.blocks[0].append_inst(Inst::new(
             Opcode::SetAttribute,
             vec![Value::Attribute(Attribute::position(0)), Value::ImmF32(1.0)],
         ));
@@ -228,18 +220,19 @@ mod tests {
         assert_eq!(program.info.constant_buffer_descriptors.len(), 2);
         assert_eq!(program.info.constant_buffer_descriptors[0].index, 0);
         assert_eq!(program.info.constant_buffer_descriptors[1].index, 2);
+        assert_eq!(program.info.constant_buffer_mask, (1 << 0) | (1 << 2));
     }
 
     #[test]
     fn test_collect_info_attributes() {
         let mut program = make_test_program();
         // Simulate loading generic attribute 3
-        program.blocks[0].instructions.push(Inst::new(
+        program.blocks[0].append_inst(Inst::new(
             Opcode::GetAttribute,
             vec![Value::Attribute(Attribute::generic(3, 0))],
         ));
         // Simulate storing to position
-        program.blocks[0].instructions.push(Inst::new(
+        program.blocks[0].append_inst(Inst::new(
             Opcode::SetAttribute,
             vec![Value::Attribute(Attribute::position(0)), Value::ImmF32(1.0)],
         ));
@@ -275,7 +268,7 @@ mod tests {
 
         // After optimization:
         // - IAdd(5, 10) is const-propagated to Identity(15)
-        // - Identity is removed by identity removal
+        // - Identity is left as a no-op tombstone to preserve InstRef indices
         // - SetAttribute should remain (side effect)
         // The exact result depends on pass ordering, but we should have
         // at most 2 instructions and the program should be valid
