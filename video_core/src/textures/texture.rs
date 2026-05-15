@@ -395,7 +395,11 @@ pub fn texture_pair(raw: u32, via_header_index: bool) -> (u32, u32) {
 ///
 /// This is a raw bitfield union in C++; we store the backing `[u64; 4]` and
 /// provide accessor methods that extract fields via bit manipulation.
-#[derive(Clone, Copy)]
+///
+/// `Default` is needed for `DescriptorTable<TicEntry>` (zero-initialized
+/// sentinel). `PartialEq`/`Eq`/`Hash` are provided as manual impls below
+/// because they compare on the `raw` field with a custom hash.
+#[derive(Clone, Copy, Default)]
 #[repr(C)]
 pub struct TicEntry {
     pub raw: [u64; 4],
@@ -790,7 +794,10 @@ pub enum Anisotropy {
 /// Texture Sampler Control entry — 32 bytes (0x20).
 ///
 /// Port of `Tegra::Texture::TSCEntry`.
-#[derive(Clone, Copy)]
+///
+/// `Default` is needed for `DescriptorTable<TscEntry>` (zero-initialized
+/// sentinel). `PartialEq`/`Eq`/`Hash` are provided as manual impls below.
+#[derive(Clone, Copy, Default)]
 #[repr(C)]
 pub struct TscEntry {
     pub raw: [u64; 4],

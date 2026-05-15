@@ -9,14 +9,14 @@
 
 use crate::dirty_flags::flags as Dirty;
 use crate::engines::maxwell_3d::{
-    DrawCall, RenderTargetInfo, RtControlInfo, CLEAR_SURFACE, DRAW_BEGIN, DRAW_END,
-    DRAW_INLINE_INDEX, DRAW_TEXTURE_SRC_Y0, IB_BASE, IB_OFF_COUNT, IB_OFF_FIRST,
+    ConstBufferBinding, DrawCall, RenderTargetInfo, RtControlInfo, CLEAR_SURFACE, DRAW_BEGIN,
+    DRAW_END, DRAW_INLINE_INDEX, DRAW_TEXTURE_SRC_Y0, IB_BASE, IB_OFF_COUNT, IB_OFF_FIRST,
     INDEX_BUFFER16_FIRST, INDEX_BUFFER16_SUBSEQUENT, INDEX_BUFFER32_FIRST,
     INDEX_BUFFER32_SUBSEQUENT, INDEX_BUFFER8_FIRST, INDEX_BUFFER8_SUBSEQUENT,
-    INLINE_INDEX_2X16_EVEN, INLINE_INDEX_4X8_INDEX0, NUM_SHADER_PROGRAMS, NUM_VERTEX_ATTRIBS,
-    RT_FORMAT_A8B8G8R8_SRGB, RT_FORMAT_A8B8G8R8_UNORM, RT_FORMAT_B5G6R5_UNORM, RT_FORMAT_R8_UNORM,
-    TOPOLOGY_OVERRIDE, VB_COUNT, VB_FIRST, VERTEX_ARRAY_INSTANCE_FIRST,
-    VERTEX_ARRAY_INSTANCE_SUBSEQUENT,
+    INLINE_INDEX_2X16_EVEN, INLINE_INDEX_4X8_INDEX0, MAX_CB_SLOTS, NUM_SHADER_PROGRAMS,
+    NUM_SHADER_STAGES, NUM_VERTEX_ATTRIBS, RT_FORMAT_A8B8G8R8_SRGB, RT_FORMAT_A8B8G8R8_UNORM,
+    RT_FORMAT_B5G6R5_UNORM, RT_FORMAT_R8_UNORM, TOPOLOGY_OVERRIDE, VB_COUNT, VB_FIRST,
+    VERTEX_ARRAY_INSTANCE_FIRST, VERTEX_ARRAY_INSTANCE_SUBSEQUENT,
 };
 use crate::engines::Framebuffer;
 use crate::rasterizer_interface::RasterizerInterface;
@@ -321,6 +321,9 @@ pub trait Maxwell3DAccess {
     /// Read vertex stream info for one stream slot.
     fn vertex_stream_info(&self, index: u32) -> crate::engines::maxwell_3d::VertexStreamInfo;
 
+    /// Read vertex stream limit info for one stream slot.
+    fn vertex_stream_limit(&self, index: u32) -> VertexStreamLimit;
+
     /// Read viewport info for one viewport slot.
     fn viewport_info(&self, index: u32) -> crate::engines::maxwell_3d::ViewportInfo;
 
@@ -419,8 +422,44 @@ pub struct DrawState {
     pub rt_control: RtControlInfo,
     /// Render target configurations for up to 8 color targets.
     pub render_targets: [RenderTargetInfo; 8],
+    /// Per-stage constant-buffer binding snapshot at draw-dispatch time.
+    pub cb_bindings: [[ConstBufferBinding; MAX_CB_SLOTS]; NUM_SHADER_STAGES],
+    /// Vertex stream register snapshot at draw-dispatch time.
+    pub vertex_streams: [crate::engines::maxwell_3d::VertexStreamInfo; 32],
+    /// Vertex stream limit register snapshot at draw-dispatch time.
+    pub vertex_stream_limits: [VertexStreamLimit; 32],
+    /// Vertex attribute format register snapshot at draw-dispatch time.
+    pub vertex_attribs_snapshot: [crate::engines::maxwell_3d::VertexAttribInfo; 32],
+    /// Fixed-function viewport state snapshot at draw-dispatch time.
+    pub viewports:
+        [crate::engines::maxwell_3d::ViewportInfo; crate::engines::maxwell_3d::NUM_VIEWPORTS],
+    /// Fixed-function scissor state snapshot at draw-dispatch time.
+    pub scissors:
+        [crate::engines::maxwell_3d::ScissorInfo; crate::engines::maxwell_3d::NUM_VIEWPORTS],
+    /// Fixed-function blend state snapshot at draw-dispatch time.
+    pub blend: [crate::engines::maxwell_3d::BlendInfo; 8],
+    /// Blend constant color snapshot at draw-dispatch time.
+    pub blend_color: crate::engines::maxwell_3d::BlendColorInfo,
+    /// Depth/stencil state snapshot at draw-dispatch time.
+    pub depth_stencil: crate::engines::maxwell_3d::DepthStencilInfo,
+    /// Rasterizer state snapshot at draw-dispatch time.
+    pub rasterizer: crate::engines::maxwell_3d::RasterizerInfo,
+    /// Per-render-target color write mask snapshot at draw-dispatch time.
+    pub color_masks: [crate::engines::maxwell_3d::ColorMaskInfo; 8],
     /// Clear-register snapshot captured before dispatching to the rasterizer.
     pub clear_state: ClearState,
+    /// TIC/TSC table address+limit snapshot read by `TextureCacheBase::
+    /// synchronize_graphics_descriptors` at draw-dispatch time. Upstream's
+    /// `ConfigureImpl` reads these straight off `maxwell3d->regs`; the Rust
+    /// rasterizer has no Maxwell3D back-reference, so the values are
+    /// snapshotted into `DrawState` alongside the rest of the registers.
+    pub descriptor_sync_regs: crate::texture_cache::texture_cache_base::DescriptorSyncRegs,
+}
+
+/// Vertex stream limit state captured from Maxwell3D registers.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct VertexStreamLimit {
+    pub address: u64,
 }
 
 /// Clear state captured from Maxwell3D registers.
@@ -1072,6 +1111,38 @@ impl DrawManager {
                     height: maxwell3d.rt_height(i),
                     format: maxwell3d.rt_format(i),
                 });
+            self.draw_state.cb_bindings = std::array::from_fn(|stage| {
+                std::array::from_fn(|slot| maxwell3d.const_buffer_binding(stage, slot))
+            });
+            self.draw_state.vertex_streams =
+                std::array::from_fn(|i| maxwell3d.vertex_stream_info(i as u32));
+            self.draw_state.vertex_stream_limits =
+                std::array::from_fn(|i| maxwell3d.vertex_stream_limit(i as u32));
+            self.draw_state.vertex_attribs_snapshot =
+                std::array::from_fn(|i| maxwell3d.vertex_attrib_info(i as u32));
+            self.draw_state.viewports = std::array::from_fn(|i| maxwell3d.viewport_info(i as u32));
+            self.draw_state.scissors = std::array::from_fn(|i| maxwell3d.scissor_info(i as u32));
+            self.draw_state.blend = std::array::from_fn(|i| maxwell3d.effective_blend_info(i));
+            self.draw_state.blend_color = maxwell3d.blend_color_info();
+            self.draw_state.depth_stencil = maxwell3d.depth_stencil_info();
+            self.draw_state.rasterizer = maxwell3d.rasterizer_info();
+            self.draw_state.color_masks = std::array::from_fn(|i| maxwell3d.color_mask_info(i));
+            // Snapshot TIC/TSC table state so the rasterizer can drive
+            // `texture_cache.synchronize_graphics_descriptors` without a
+            // Maxwell3D back-reference. Mirrors upstream's reads off
+            // `maxwell3d->regs.{tex_header, tex_sampler, sampler_binding}`
+            // at the top of `GraphicsPipeline::ConfigureImpl`.
+            self.draw_state.descriptor_sync_regs =
+                crate::texture_cache::texture_cache_base::DescriptorSyncRegs {
+                    sampler_binding_via_header: matches!(
+                        maxwell3d.sampler_binding(),
+                        crate::engines::maxwell_3d::SamplerBinding::ViaHeaderBinding
+                    ),
+                    tex_header_addr: maxwell3d.tex_header_pool_address(),
+                    tex_header_limit: maxwell3d.tex_header_pool_limit(),
+                    tex_sampler_addr: maxwell3d.tex_sampler_pool_address(),
+                    tex_sampler_limit: maxwell3d.tex_sampler_pool_limit(),
+                };
             if let Some(rasterizer) = maxwell3d.rasterizer_mut() {
                 rasterizer.draw(&self.draw_state, instance_count);
             }

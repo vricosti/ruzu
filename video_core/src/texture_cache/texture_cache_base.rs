@@ -84,6 +84,28 @@ pub struct AsyncDecodeContext {
 /// Port of `VideoCommon::TextureCacheGPUMap`.
 pub type TextureCacheGPUMap = HashMap<u64, Vec<ImageId>>;
 
+// ── DescriptorSyncRegs ─────────────────────────────────────────────────
+
+/// Snapshot of the Maxwell3D registers consumed by
+/// `TextureCacheBase::synchronize_graphics_descriptors`.
+///
+/// Mirrors the fields upstream `KConditionVariable<P>::SynchronizeGraphicsDescriptors`
+/// reads off `maxwell3d->regs`:
+/// * `regs.sampler_binding == SamplerBinding::ViaHeaderBinding`
+/// * `regs.tex_header.limit` / `regs.tex_header.Address()`
+/// * `regs.tex_sampler.limit` / `regs.tex_sampler.Address()`
+///
+/// Passing a snapshot keeps the texture cache from needing a back-reference
+/// to `Maxwell3D` (which is owned by the GPU side of the channel).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DescriptorSyncRegs {
+    pub sampler_binding_via_header: bool,
+    pub tex_header_addr: GPUVAddr,
+    pub tex_header_limit: u32,
+    pub tex_sampler_addr: GPUVAddr,
+    pub tex_sampler_limit: u32,
+}
+
 // ── TextureCacheChannelInfo ────────────────────────────────────────────
 
 /// Per-channel state for the texture cache.
@@ -93,21 +115,30 @@ pub type TextureCacheGPUMap = HashMap<u64, Vec<ImageId>>;
 /// The upstream class inherits from `ChannelInfo` and holds descriptor
 /// tables plus cached sampler/image-view mappings.
 pub struct TextureCacheChannelInfo {
-    // Descriptor tables — using a dummy `u64` descriptor type as a
-    // placeholder until TICEntry / TSCEntry are ported.
-    pub graphics_image_table: DescriptorTable<u64>,
-    pub graphics_sampler_table: DescriptorTable<u64>,
+    // Descriptor tables — typed against the real `TicEntry`/`TscEntry`
+    // structs from `video_core::textures::texture`. `DescriptorTable::read`
+    // is still stubbed (returns `T::default()` until the GPU memory reader
+    // is wired in), so `VisitImageView` will see all-zero descriptors and
+    // never produce a non-NULL image view yet.
+    pub graphics_image_table: DescriptorTable<crate::textures::texture::TicEntry>,
+    pub graphics_sampler_table: DescriptorTable<crate::textures::texture::TscEntry>,
     pub graphics_sampler_ids: Vec<SamplerId>,
     pub graphics_image_view_ids: Vec<ImageViewId>,
 
-    pub compute_image_table: DescriptorTable<u64>,
-    pub compute_sampler_table: DescriptorTable<u64>,
+    pub compute_image_table: DescriptorTable<crate::textures::texture::TicEntry>,
+    pub compute_sampler_table: DescriptorTable<crate::textures::texture::TscEntry>,
     pub compute_sampler_ids: Vec<SamplerId>,
     pub compute_image_view_ids: Vec<ImageViewId>,
 
-    // Per-channel caches
-    pub image_views: HashMap<u64, ImageViewId>, // keyed by TICEntry hash
-    pub samplers: HashMap<u64, SamplerId>,      // keyed by TSCEntry hash
+    // Per-channel caches. Upstream uses
+    //   std::unordered_map<TICEntry, ImageViewId> image_views;
+    //   std::unordered_map<TSCEntry, SamplerId>   samplers;
+    // keyed by descriptor identity (raw `[u64; 4]`). `TicEntry`/`TscEntry`
+    // expose manual `Hash`+`PartialEq` impls over `raw`, so the Rust
+    // `HashMap` keys them directly — same lookup semantics as upstream's
+    // `try_emplace(descriptor)`.
+    pub image_views: HashMap<crate::textures::texture::TicEntry, ImageViewId>,
+    pub samplers: HashMap<crate::textures::texture::TscEntry, SamplerId>,
 
     pub gpu_page_table: Option<Box<TextureCacheGPUMap>>,
     pub sparse_page_table: Option<Box<TextureCacheGPUMap>>,
@@ -247,7 +278,17 @@ pub struct TextureCacheBase {
     /// `MaxwellDeviceMemoryManager& device_memory` member used by
     /// `TrackImage` / `UntrackImage` to drive `UpdatePagesCachedCount`.
     /// Same `Arc` as `Host1x::memory_manager()` and `ShaderCache::device_memory()`.
-    pub device_memory: std::sync::Arc<crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager>,
+    pub device_memory:
+        std::sync::Arc<crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager>,
+
+    /// Per-channel descriptor state (TIC/TSC tables + cached id arrays).
+    /// Upstream: `TextureCache<P>` inherits from
+    /// `VideoCommon::ChannelSetupCaches<TextureCacheChannelInfo>` which
+    /// owns `channel_state` as a pointer to the currently-active channel.
+    /// Ruzu currently models a single graphics channel, so the info is held
+    /// inline; promote to `Option<Box<...>>` keyed by channel id when
+    /// multi-channel support lands.
+    pub channel_state: TextureCacheChannelInfo,
 
     // Mutex
     pub mutex: ReentrantMutex<()>,
@@ -259,7 +300,9 @@ impl TextureCacheBase {
     /// Port of `TextureCache<P>::TextureCache(Runtime&, MaxwellDeviceMemoryManager&)`.
     /// `device_memory` is the shared `Arc` from `Host1x::memory_manager()`.
     pub fn new(
-        device_memory: std::sync::Arc<crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager>,
+        device_memory: std::sync::Arc<
+            crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager,
+        >,
     ) -> Self {
         Self {
             slot_images: SlotVector::new(),
@@ -295,6 +338,7 @@ impl TextureCacheBase {
             image_downloader: None,
             guest_memory_writer: None,
             device_memory,
+            channel_state: TextureCacheChannelInfo::new(),
             mutex: ReentrantMutex::new(()),
         }
     }

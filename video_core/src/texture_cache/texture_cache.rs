@@ -20,6 +20,7 @@ use crate::engines::draw_manager::DrawState;
 use crate::engines::maxwell_3d::RenderTargetInfo;
 use crate::surface;
 
+use super::descriptor_table::DescriptorTable;
 use super::image_base::{GPUVAddr, ImageBase, ImageFlagBits, ImageMapView};
 use super::image_info::{ImageInfo, TilingMode};
 use super::image_view_base::ImageViewBase;
@@ -46,22 +47,151 @@ impl TextureCacheBase {
 
     // ── Image view resolution ──────────────────────────────────────────
 
-    /// Port of `TextureCache<P>::FillGraphicsImageViews`.
-    ///
-    /// Iterates `views`, resolves each TIC descriptor via `VisitImageView`,
-    /// and optionally applies blacklist rescale-down logic.  Requires
-    /// TICEntry, descriptor tables, and backend image types.
-    pub fn fill_graphics_image_views(
-        &mut self,
-        _views: &mut [ImageViewInOut],
-        _has_blacklists: bool,
-    ) {
-        log::warn!("TextureCacheBase::fill_graphics_image_views: backend types not yet available");
+    /// Port of `TextureCache<P>::FillGraphicsImageViews`
+    /// (texture_cache.h:192-197). Thin wrapper that forwards to
+    /// `fill_image_views` over the channel's graphics image table.
+    pub fn fill_graphics_image_views(&mut self, views: &mut [ImageViewInOut], has_blacklists: bool) {
+        Self::fill_image_views(
+            &mut self.channel_state.graphics_image_table,
+            &mut self.channel_state.graphics_image_view_ids,
+            &mut self.channel_state.image_views,
+            views,
+            has_blacklists,
+            &mut self.has_deleted_images,
+        );
     }
 
-    /// Port of `TextureCache<P>::FillComputeImageViews`.
-    pub fn fill_compute_image_views(&mut self, _views: &mut [ImageViewInOut]) {
-        log::warn!("TextureCacheBase::fill_compute_image_views: backend types not yet available");
+    /// Port of `TextureCache<P>::FillComputeImageViews`
+    /// (texture_cache.h:199-203). Upstream passes `has_blacklists=true`
+    /// unconditionally to the underlying `FillImageViews` template.
+    pub fn fill_compute_image_views(&mut self, views: &mut [ImageViewInOut]) {
+        Self::fill_image_views(
+            &mut self.channel_state.compute_image_table,
+            &mut self.channel_state.compute_image_view_ids,
+            &mut self.channel_state.image_views,
+            views,
+            true,
+            &mut self.has_deleted_images,
+        );
+    }
+
+    /// Port of `TextureCache<P>::FillImageViews` (texture_cache.h:472-495).
+    ///
+    /// Retry loop body runs `VisitImageView` for each entry; if
+    /// `has_deleted_images` flips during a visit (an image got evicted) the
+    /// entire batch reruns. The `has_blacklists`/`ScaleDown` branch still
+    /// needs backend image access and is left as a TODO until the slot pools
+    /// are concrete.
+    fn fill_image_views(
+        table: &mut DescriptorTable<crate::textures::texture::TicEntry>,
+        cached_ids: &mut [ImageViewId],
+        image_views_cache: &mut std::collections::HashMap<
+            crate::textures::texture::TicEntry,
+            ImageViewId,
+        >,
+        views: &mut [ImageViewInOut],
+        has_blacklists: bool,
+        has_deleted_images: &mut bool,
+    ) {
+        let mut has_blacklisted;
+        loop {
+            *has_deleted_images = false;
+            has_blacklisted = false;
+            for view in views.iter_mut() {
+                view.id = Self::visit_image_view(table, cached_ids, image_views_cache, view.index);
+                if has_blacklists && view.blacklist && view.id != NULL_IMAGE_VIEW_ID {
+                    // Upstream: ScaleDown(slot_images[image_view.image_id])
+                    // sets has_blacklisted=true when a rescale-down fires.
+                    // Needs backend slot_images access; TODO once Image<P> lands.
+                }
+            }
+            if !*has_deleted_images && !(has_blacklists && has_blacklisted) {
+                break;
+            }
+        }
+    }
+
+    /// Port of `TextureCache<P>::VisitImageView` (texture_cache.h:497-514).
+    ///
+    /// Reads the TIC descriptor at `index` from the GPU-resident table; on a
+    /// fresh read, looks up (or creates) an `ImageView` via `find_image_view`.
+    /// Then would call `PrepareImageView` to ensure the backing image's
+    /// contents are uploaded. `PrepareImageView` is still a stub while the
+    /// backend `P::ImageView`/`P::Image` slot pools are not wired.
+    fn visit_image_view(
+        table: &mut DescriptorTable<crate::textures::texture::TicEntry>,
+        cached_ids: &mut [ImageViewId],
+        image_views_cache: &mut std::collections::HashMap<
+            crate::textures::texture::TicEntry,
+            ImageViewId,
+        >,
+        index: u32,
+    ) -> ImageViewId {
+        if index > table.limit() {
+            // Matches upstream LOG_DEBUG + NULL_IMAGE_VIEW_ID return.
+            return NULL_IMAGE_VIEW_ID;
+        }
+        let (descriptor, is_new) = table.read(index);
+        let slot = &mut cached_ids[index as usize];
+        if is_new {
+            *slot = Self::find_image_view(image_views_cache, &descriptor);
+        }
+        if *slot != NULL_IMAGE_VIEW_ID {
+            // Upstream: PrepareImageView(image_view_id, false, false). Needs
+            // backend slot_images/slot_image_views with concrete image types;
+            // left as a no-op until those land.
+        }
+        *slot
+    }
+
+    /// Port of `TextureCache<P>::FindImageView` (texture_cache.h:1103-1113):
+    /// ```cpp
+    /// if (!IsValidEntry(*gpu_memory, config)) return NULL_IMAGE_VIEW_ID;
+    /// const auto [pair, is_new] = channel_state->image_views.try_emplace(config);
+    /// ImageViewId& image_view_id = pair->second;
+    /// if (is_new) image_view_id = CreateImageView(config);
+    /// return image_view_id;
+    /// ```
+    ///
+    /// The `try_emplace` semantics map to Rust's `HashMap::entry(..).or_insert_with(..)`.
+    /// The `IsValidEntry` GPU-memory check and `CreateImageView` (which builds
+    /// a backend `P::ImageView` via `Runtime::UploadStagingBuffer` +
+    /// `Image::UploadMemory`) are not yet implemented; until they are, the
+    /// cache caches a `NULL_IMAGE_VIEW_ID` per unique descriptor — same
+    /// observable behaviour as the previous stub, but with the cache shape
+    /// in place so plugging in `create_image_view` is a one-line swap.
+    fn find_image_view(
+        image_views_cache: &mut std::collections::HashMap<
+            crate::textures::texture::TicEntry,
+            ImageViewId,
+        >,
+        descriptor: &crate::textures::texture::TicEntry,
+    ) -> ImageViewId {
+        // TODO(texture_cache): upstream first guards on
+        //   `IsValidEntry(*gpu_memory, *descriptor)` — needs a GPU memory
+        //   reader on the channel before the GPU virtual address can be
+        //   validated. Until then we proceed to the cache lookup; misses
+        //   still resolve to NULL via the create-image-view stub.
+        *image_views_cache
+            .entry(*descriptor)
+            .or_insert_with(|| Self::create_image_view(descriptor))
+    }
+
+    /// Port of `TextureCache<P>::CreateImageView` (texture_cache.h:1115-1137).
+    ///
+    /// Upstream constructs an `ImageInfo` from the TIC, either:
+    ///   * for `ImageType::Buffer`: inserts a fresh `slot_image_views` entry
+    ///     bound to `descriptor.Address()`, OR
+    ///   * for normal images: resolves the backing image (`FindOrInsertImage`),
+    ///     reads `image.TryFindBase(descriptor.Address())`, and emplaces an
+    ///     `ImageViewInfo` view via `FindOrEmplaceImageView`.
+    ///
+    /// Both branches require concrete backend `P::ImageView`/`P::Image` types
+    /// plus `Runtime::UploadStagingBuffer` for the upload path — none of
+    /// which exist yet in ruzu. The stub returns `NULL_IMAGE_VIEW_ID` so the
+    /// outer scaffolding skips the slot.
+    fn create_image_view(_descriptor: &crate::textures::texture::TicEntry) -> ImageViewId {
+        NULL_IMAGE_VIEW_ID
     }
 
     /// Port of `TextureCache<P>::CheckFeedbackLoop`.
@@ -74,14 +204,41 @@ impl TextureCacheBase {
 
     // ── Descriptor synchronisation ─────────────────────────────────────
 
-    /// Port of `TextureCache<P>::SynchronizeGraphicsDescriptors`.
+    /// Port of `TextureCache<P>::SynchronizeGraphicsDescriptors`
+    /// (texture_cache.h:294-307).
     ///
-    /// Reads current Maxwell3D TIC/TSC addresses and limits; resizes cached
-    /// sampler/image-view id arrays when the table limits change.
-    pub fn synchronize_graphics_descriptors(&mut self) {
-        log::warn!(
-            "TextureCacheBase::synchronize_graphics_descriptors: Maxwell3D regs not yet ported"
-        );
+    /// Upstream reads `maxwell3d->regs` directly; ruzu can't borrow Maxwell3D
+    /// from the texture cache so the caller hands in a `DescriptorSyncRegs`
+    /// snapshot captured at draw-time. The body otherwise mirrors upstream
+    /// step-for-step: pick TIC/TSC table limits (collapsing TSC limit onto
+    /// TIC's when `sampler_binding == ViaHeaderBinding`), call
+    /// `DescriptorTable::synchronize` on each, and grow the cached
+    /// `*_ids` arrays when a table's limit changed.
+    pub fn synchronize_graphics_descriptors(&mut self, regs: DescriptorSyncRegs) {
+        let tic_limit = regs.tex_header_limit;
+        let tsc_limit = if regs.sampler_binding_via_header {
+            tic_limit
+        } else {
+            regs.tex_sampler_limit
+        };
+
+        let channel = &mut self.channel_state;
+        if channel
+            .graphics_sampler_table
+            .synchronize(regs.tex_sampler_addr, tsc_limit)
+        {
+            channel
+                .graphics_sampler_ids
+                .resize(tsc_limit as usize + 1, CORRUPT_ID);
+        }
+        if channel
+            .graphics_image_table
+            .synchronize(regs.tex_header_addr, tic_limit)
+        {
+            channel
+                .graphics_image_view_ids
+                .resize(tic_limit as usize + 1, CORRUPT_ID);
+        }
     }
 
     /// Port of `TextureCache<P>::SynchronizeComputeDescriptors`.
@@ -358,8 +515,11 @@ impl TextureCacheBase {
             // Upstream guard: skip the "kernel" sentinel range
             // (`cpu_addr >= ~(1ULL << 40)`).
             if cpu_addr < !(1u64 << 40) {
-                self.device_memory
-                    .update_pages_cached_count(cpu_addr, guest_size_bytes as usize, 1);
+                self.device_memory.update_pages_cached_count(
+                    cpu_addr,
+                    guest_size_bytes as usize,
+                    1,
+                );
             }
             return;
         }
@@ -396,8 +556,11 @@ impl TextureCacheBase {
         let guest_size_bytes = image.guest_size_bytes;
         if !is_sparse {
             if cpu_addr < !(1u64 << 40) {
-                self.device_memory
-                    .update_pages_cached_count(cpu_addr, guest_size_bytes as usize, -1);
+                self.device_memory.update_pages_cached_count(
+                    cpu_addr,
+                    guest_size_bytes as usize,
+                    -1,
+                );
             }
             return;
         }
@@ -503,8 +666,7 @@ mod tests {
     fn update_render_targets_from_draw_state_registers_presentable_view() {
         use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
         use std::sync::Arc;
-        let mut cache =
-            TextureCacheBase::new(Arc::new(MaxwellDeviceMemoryManager::default()));
+        let mut cache = TextureCacheBase::new(Arc::new(MaxwellDeviceMemoryManager::default()));
         let mut draw_state = DrawState::default();
         draw_state.rt_control = RtControlInfo {
             count: 1,
