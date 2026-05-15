@@ -1246,12 +1246,18 @@ impl KThread {
     /// Public AddWaiter: adds waiter then triggers priority inheritance.
     /// Matches upstream `KThread::AddWaiter()` (k_thread.cpp:1063-1070).
     ///
+    /// The waiter's lock-owner back-pointer is set automatically here, matching
+    /// upstream `LockWithPriorityInheritanceInfo::AddWaiter` which internally
+    /// calls `waiter->SetWaitingLockInfo(this)` (k_thread.h:801). Callers no
+    /// longer need a separate `set_waiting_lock_owner_thread_id` step.
+    ///
     /// NOTE: Priority inheritance (RestorePriority) is simplified here —
     /// full chain-walking requires access to other threads' mutexes.
     /// Callers that need full priority inheritance should call
     /// `restore_priority_simplified()` after this.
     pub fn add_waiter(
         &mut self,
+        waiter: &Arc<KThreadLock>,
         waiter_thread_id: u64,
         waiter_priority: i32,
         waiter_address_key: KProcessAddress,
@@ -1275,6 +1281,18 @@ impl KThread {
             waiter_address_key,
             waiter_is_kernel_address_key,
         );
+
+        // Set the waiter's lock-owner back-pointer. Matches the
+        // `waiter->SetWaitingLockInfo(this)` step that upstream's
+        // `LockWithPriorityInheritanceInfo::AddWaiter` performs.
+        // `self` is the owner; compute its raw pointer for cancel_wait paths
+        // that need a `*mut KThread` matching upstream's stored owner pointer.
+        let owner_id = self.thread_id;
+        let owner_ptr = (self as *mut KThread) as usize;
+        waiter
+            .lock()
+            .unwrap()
+            .set_waiting_lock_owner_thread_id(Some(owner_id), owner_ptr);
 
         // If the waiter has higher priority than us, inherit it.
         if waiter_priority < self.priority {
@@ -1425,25 +1443,6 @@ impl KThread {
             }
         }
         Vec::new()
-    }
-
-    /// Legacy compatibility: add_waiter with just a thread_id.
-    /// Used by callers that set the waiter's address key separately.
-    /// The waiter_priority must be provided. For callers that don't have it,
-    /// use a default of 0 (highest) — they should be updated to pass the real priority.
-    pub fn add_waiter_by_id(
-        &mut self,
-        waiter_thread_id: u64,
-        waiter_priority: i32,
-        waiter_address_key: KProcessAddress,
-        waiter_is_kernel_address_key: bool,
-    ) {
-        self.add_waiter(
-            waiter_thread_id,
-            waiter_priority,
-            waiter_address_key,
-            waiter_is_kernel_address_key,
-        );
     }
 
     /// Legacy compatibility: remove_waiter with a thread_id.
@@ -2981,6 +2980,13 @@ impl KThread {
         if self.get_state() != ThreadState::WAITING {
             return;
         }
+
+        // RUZU_PROFILE_WAKE — capture wake-emit timestamp. The woken thread's
+        // next supervisor-call entry will compute the latency from this point
+        // until it actually runs. Captures every wake source (cv signal,
+        // address arbiter unlock, synchronization-object signal, etc.) by
+        // hooking at the kernel-level wake boundary, not per-call-site.
+        crate::hle::kernel::svc_dispatch::record_wake_emit(self.thread_id);
 
         if should_trace_end_wait() {
             log::info!(
