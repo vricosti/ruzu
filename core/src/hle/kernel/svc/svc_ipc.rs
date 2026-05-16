@@ -147,6 +147,23 @@ fn send_sync_request_impl(
     session_handle: Handle,
     message_address: u64,
 ) -> ResultCode {
+    // `RUZU_PROFILE_IPC_PHASES=1` — time each phase of send_sync_request_impl
+    // so we can see which Mutex acquisition or sub-step is the bottleneck.
+    // Used in the MK8D wedge investigation to localize where 7ms/call goes
+    // when the handler itself is <100us.
+    let profile_phases = std::env::var_os("RUZU_PROFILE_IPC_PHASES").is_some();
+    let phase_t0 = if profile_phases {
+        Some(std::time::Instant::now())
+    } else {
+        None
+    };
+    let mut phase_last = phase_t0;
+    let mut record_phase = |label: &'static str, last: &mut Option<std::time::Instant>| {
+        if let Some(t) = last {
+            record_ipc_phase(label, t.elapsed());
+            *last = Some(std::time::Instant::now());
+        }
+    };
     trace_ipc_buffer(system, "TLS_REQ", message_address);
     let trace_sync = should_trace_sync_handle(session_handle);
     let (client_session, session_object_id) = {
@@ -170,6 +187,7 @@ fn send_sync_request_impl(
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         (client_session, object_id)
     };
+    record_phase("01_resolve_client_session", &mut phase_last);
     if trace_sync {
         log::info!("svc::SendSyncRequest stage=resolved_client_session");
     }
@@ -177,6 +195,7 @@ fn send_sync_request_impl(
     let (request_manager, mut context, request_message_address) = {
         let (server_session, manager) = {
             let mut process = system.current_process_arc().lock().unwrap();
+            record_phase("02_process_lock_2", &mut phase_last);
             if trace_sync {
                 log::info!("svc::SendSyncRequest stage=enqueue_request");
             }
@@ -184,6 +203,7 @@ fn send_sync_request_impl(
                 .lock()
                 .unwrap()
                 .send_sync_request_with_process(&mut process, message_address as usize, 0);
+            record_phase("03_send_sync_request_with_process", &mut phase_last);
             if send_result != 0 {
                 return ResultCode::new(send_result);
             }
@@ -229,10 +249,12 @@ fn send_sync_request_impl(
         // That path resolves the request client thread through kernel process
         // lookup, which would re-enter the same process mutex and deadlock on
         // the first synchronous IPC to services like "sm:".
+        record_phase("04_resolve_server_session_manager", &mut phase_last);
         let receive_result = {
             let mut server_session = server_session.lock().unwrap();
             server_session.receive_request_hle(Arc::clone(&manager))
         };
+        record_phase("05_receive_request_hle", &mut phase_last);
         match receive_result {
             Ok((context, manager, request_message_address)) => {
                 if trace_sync {
@@ -307,6 +329,7 @@ fn send_sync_request_impl(
         log::info!("svc::SendSyncRequest stage=complete_sync_request_begin");
     }
     let result = complete_sync_request(&request_manager, &mut context);
+    record_phase("06_complete_sync_request_handler", &mut phase_last);
     if trace_sync {
         log::info!(
             "svc::SendSyncRequest stage=complete_sync_request_end result={:#x}",
@@ -344,6 +367,7 @@ fn send_sync_request_impl(
             log::info!("svc::SendSyncRequest stage=send_reply_end");
         }
     }
+    record_phase("07_send_reply", &mut phase_last);
 
     if result == crate::hle::service::ipc_helpers::RESULT_SESSION_CLOSED {
         return RESULT_SUCCESS;
@@ -402,6 +426,50 @@ fn record_ipc_profile(session_handle: u32, elapsed: std::time::Duration) {
     entry.total_ns += ns;
     if ns > entry.max_ns {
         entry.max_ns = ns;
+    }
+}
+
+/// Per-phase aggregator for `RUZU_PROFILE_IPC_PHASES`. Keyed by phase label.
+static IPC_PHASE_PROFILE: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<&'static str, IpcProfileEntry>>,
+> = std::sync::OnceLock::new();
+
+pub(crate) fn record_ipc_phase(label: &'static str, elapsed: std::time::Duration) {
+    let map = IPC_PHASE_PROFILE
+        .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    let ns = elapsed.as_nanos() as u64;
+    let mut guard = map.lock().unwrap();
+    let entry = guard.entry(label).or_default();
+    entry.count += 1;
+    entry.total_ns = entry.total_ns.saturating_add(ns);
+    if ns > entry.max_ns {
+        entry.max_ns = ns;
+    }
+}
+
+pub fn dump_ipc_phase_profile() {
+    let Some(map) = IPC_PHASE_PROFILE.get() else {
+        return;
+    };
+    let entries: Vec<(&'static str, IpcProfileEntry)> = {
+        let guard = map.lock().unwrap();
+        guard.iter().map(|(k, v)| (*k, v.clone())).collect()
+    };
+    if entries.is_empty() {
+        return;
+    }
+    let mut entries = entries;
+    entries.sort_by_key(|(k, _)| *k); // alphabetical by phase label for ordered output
+    eprintln!("[IPC_PHASE_PROFILE] per-phase wall-clock (sorted by label):");
+    for (label, e) in entries.iter() {
+        eprintln!(
+            "[IPC_PHASE_PROFILE]   phase={:<36} count={:<7} total={:>9.2}ms avg={:>8.2}us max={:>8.2}us",
+            label,
+            e.count,
+            e.total_ns as f64 / 1e6,
+            e.total_ns as f64 / e.count as f64 / 1e3,
+            e.max_ns as f64 / 1e3,
+        );
     }
 }
 

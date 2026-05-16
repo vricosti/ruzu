@@ -426,14 +426,84 @@ fn trace_out_buf(address: u64, data: &[u8]) {
     );
 }
 
+/// Per-(service_name, cmd) wall-clock aggregator. Populated by
+/// `RUZU_PROFILE_IPC_PHASES=1` (we piggyback on the same flag because both
+/// profilers answer the same question: "where does IPC time go"). Dumped
+/// by `dump_hle_handler_profile()`.
+static HLE_HANDLER_PROFILE: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<(String, u32), HleHandlerAgg>>,
+> = std::sync::OnceLock::new();
+
+#[derive(Default, Clone)]
+struct HleHandlerAgg {
+    count: u64,
+    total_ns: u64,
+    max_ns: u64,
+}
+
+fn record_hle_handler_profile(
+    service_name: &str,
+    cmd: u32,
+    elapsed: std::time::Duration,
+) {
+    let map = HLE_HANDLER_PROFILE
+        .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    let ns = elapsed.as_nanos() as u64;
+    let mut guard = map.lock().unwrap();
+    let entry = guard.entry((service_name.to_string(), cmd)).or_default();
+    entry.count += 1;
+    entry.total_ns = entry.total_ns.saturating_add(ns);
+    if ns > entry.max_ns {
+        entry.max_ns = ns;
+    }
+}
+
+pub fn dump_hle_handler_profile() {
+    let Some(map) = HLE_HANDLER_PROFILE.get() else {
+        return;
+    };
+    let entries: Vec<((String, u32), HleHandlerAgg)> = {
+        let g = map.lock().unwrap();
+        g.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+    };
+    if entries.is_empty() {
+        return;
+    }
+    let mut entries = entries;
+    entries.sort_by_key(|(_, e)| std::cmp::Reverse(e.total_ns));
+    eprintln!("[HLE_HANDLER_PROFILE] top (service, cmd) by total time:");
+    for ((svc, cmd), e) in entries.iter().take(20) {
+        eprintln!(
+            "[HLE_HANDLER_PROFILE]   service={:<48} cmd={:<4} count={:<6} total={:>9.2}ms avg={:>9.2}us max={:>9.2}us",
+            svc,
+            cmd,
+            e.count,
+            e.total_ns as f64 / 1e6,
+            e.total_ns as f64 / e.count as f64 / 1e3,
+            e.max_ns as f64 / 1e3,
+        );
+    }
+}
+
 pub fn complete_sync_request(
     manager: &Arc<Mutex<SessionRequestManager>>,
     context: &mut HLERequestContext,
 ) -> ResultCode {
+    let profile_phases = std::env::var_os("RUZU_PROFILE_IPC_PHASES").is_some();
+    let p_t0 = if profile_phases {
+        Some(std::time::Instant::now())
+    } else {
+        None
+    };
     let dispatch = {
         let guard = manager.lock().unwrap();
         guard.prepare_sync_request(context)
     };
+    let p_after_prepare = p_t0.map(|t0| {
+        let elapsed = t0.elapsed();
+        crate::hle::kernel::svc::svc_ipc::record_ipc_phase("06a_prepare_sync_request", elapsed);
+        std::time::Instant::now()
+    });
 
     let trace_dispatch = std::env::var_os("RUZU_HLE_DISPATCH_TRACE").is_some();
 
@@ -456,7 +526,22 @@ pub fn complete_sync_request(
             IPC_TRACE_CURRENT.with(|c| {
                 *c.borrow_mut() = (handler.service_name().to_string(), context.get_command(), 0);
             });
+            let handler_t0 = p_after_prepare.map(|_| std::time::Instant::now());
             let result = handler.handle_sync_request(context);
+            if let Some(t0) = handler_t0 {
+                let elapsed = t0.elapsed();
+                crate::hle::kernel::svc::svc_ipc::record_ipc_phase(
+                    "06b_handle_sync_request_dispatch",
+                    elapsed,
+                );
+                if std::env::var_os("RUZU_PROFILE_IPC_PHASES").is_some() {
+                    record_hle_handler_profile(
+                        handler.service_name(),
+                        context.get_command(),
+                        elapsed,
+                    );
+                }
+            }
             if trace_dispatch {
                 log::warn!(
                     "HLE dispatch leave service={} cmd={} result={:#x}",
