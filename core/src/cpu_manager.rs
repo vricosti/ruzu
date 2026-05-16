@@ -126,6 +126,44 @@ fn parse_hex_env_u64(name: &str) -> Option<u64> {
     u64::from_str_radix(hex, 16).ok()
 }
 
+/// Returns true when `RUZU_TRACE_CORE_DISPATCH` is set AND the given core
+/// index is in the (optional) comma-separated allow list. `RUZU_TRACE_CORE_DISPATCH=1`
+/// (or any non-numeric value) enables all cores. `RUZU_TRACE_CORE_DISPATCH=1,2`
+/// enables cores 1 and 2 only.
+fn should_trace_core_dispatch(core_index: usize) -> bool {
+    let Some(raw) = std::env::var_os("RUZU_TRACE_CORE_DISPATCH") else {
+        return false;
+    };
+    let raw = raw.to_string_lossy();
+    let raw = raw.trim();
+    // "1" enables all cores (common shorthand). Empty also enables all.
+    if raw.is_empty() || raw == "1" || raw.eq_ignore_ascii_case("all") {
+        return true;
+    }
+    // Otherwise treat as comma-separated allow list of core indices.
+    raw.split(',')
+        .filter_map(|s| s.trim().parse::<usize>().ok())
+        .any(|c| c == core_index)
+}
+
+/// Emit one `[CORE_DISPATCH]` line tagged with the dispatch-loop phase and the
+/// guest thread the loop is currently running. Lightweight (single
+/// `eprintln!`); gated by `RUZU_TRACE_CORE_DISPATCH`. Used to diagnose the
+/// MK8D wedge where tid=99's wakes take ~1 second despite end_wait firing
+/// promptly — we want to see, per core, when the JIT inner-loop exits and
+/// when reschedule actually swaps threads.
+fn trace_core_dispatch(core_index: usize, phase: &str, thread: &Arc<crate::hle::kernel::k_thread::KThreadLock>) {
+    if !should_trace_core_dispatch(core_index) {
+        return;
+    }
+    let tid = thread.lock().ok().map(|t| t.get_thread_id()).unwrap_or(0);
+    let t = crate::hle::kernel::trace_format::elapsed_secs();
+    eprintln!(
+        "[{:>10.6}] [CORE_DISPATCH] core={} phase={} fiber_tid={}",
+        t, core_index, phase, tid
+    );
+}
+
 impl CpuManager {
     /// Creates a new CpuManager.
     /// Upstream: `CpuManager::CpuManager(System& system_) : system{system_} {}`
@@ -487,6 +525,8 @@ impl CpuManager {
     // MultiCore guest/idle thread loops
     // =========================================================================
 
+    // (trace_core_dispatch is a free function defined below at module scope)
+
     /// Multicore guest thread loop.
     ///
     /// Upstream: `CpuManager::MultiCoreRunGuestThread()` (cpu_manager.cpp:73-88).
@@ -560,8 +600,10 @@ impl CpuManager {
             // Clear any stale interrupt before entering the JIT loop.
             // The preemption timer may have fired while we were in the scheduler.
             if physical_core.is_interrupted() {
+                trace_core_dispatch(physical_core.core_index(), "pre_inner stale_interrupt", &thread_arc);
                 Self::handle_interrupt(kernel);
             }
+            trace_core_dispatch(physical_core.core_index(), "enter_inner_loop", &thread_arc);
             while !physical_core.is_interrupted() {
                 Self::run_guest_thread_once(
                     kernel,
@@ -574,12 +616,15 @@ impl CpuManager {
                 // Upstream: physical_core = &kernel.CurrentPhysicalCore();
                 physical_core = kernel.current_physical_core();
             }
+            trace_core_dispatch(physical_core.core_index(), "exit_inner_loop", &thread_arc);
 
             Self::handle_interrupt(kernel);
+            trace_core_dispatch(physical_core.core_index(), "after_handle_interrupt", &thread_arc);
             Self::shutdown_if_requested(kernel);
             // Upstream: RequestScheduleOnInterrupt → ScheduleOnInterrupt → fiber yield.
             // Done outside any Mutex lock to avoid deadlock (see reschedule_current_core_raw).
             Self::reschedule_current_core_raw(kernel);
+            trace_core_dispatch(physical_core.core_index(), "after_reschedule", &thread_arc);
         }
     }
 
