@@ -121,7 +121,9 @@ impl SurfaceFlinger {
         };
         if !display.stack.has_layers() {
             let c = NO_LAYERS.fetch_add(1, Ordering::Relaxed);
-            if c < 8 || c.is_power_of_two() {
+            // Log first 8, every power-of-2, AND every 60 ticks (~1s at 60Hz
+            // vsync) so we can detect post-add NO_LAYERS regressions.
+            if c < 8 || c.is_power_of_two() || c % 60 == 0 {
                 log::info!(
                     "[SF_COMPOSE] #{} NO_LAYERS display_id={} display_layers_count={}",
                     n,
@@ -131,7 +133,7 @@ impl SurfaceFlinger {
             }
             return false;
         }
-        if n < 8 || n.is_power_of_two() {
+        if n < 8 || n.is_power_of_two() || n % 60 == 0 {
             log::info!(
                 "[SF_COMPOSE] #{} COMPOSING display_id={} layers={}",
                 n,
@@ -217,7 +219,17 @@ impl SurfaceFlinger {
 
     pub fn remove_layer_from_display_stack(&self, display_id: u64, consumer_binder_id: i32) {
         let mut inner = self.inner.lock().unwrap();
+        let stack_len_before = inner
+            .displays
+            .iter()
+            .find(|d| d.id == display_id)
+            .map(|d| d.stack.layers.len())
+            .unwrap_or(0);
         let Some(display) = Self::find_display_mut(&mut inner.displays, display_id) else {
+            log::info!(
+                "[SF_REMOVE_LAYER] NO_DISPLAY display_id={} consumer_id={}",
+                display_id, consumer_binder_id
+            );
             return;
         };
 
@@ -229,6 +241,13 @@ impl SurfaceFlinger {
             .stack
             .layers
             .retain(|layer| layer.lock().unwrap().consumer_id != consumer_binder_id);
+        log::info!(
+            "[SF_REMOVE_LAYER] display_id={} consumer_id={} stack_len_before={} stack_len_after={}",
+            display_id,
+            consumer_binder_id,
+            stack_len_before,
+            display.stack.layers.len()
+        );
     }
 
     pub fn set_layer_visibility(&self, consumer_binder_id: i32, visible: bool) {
