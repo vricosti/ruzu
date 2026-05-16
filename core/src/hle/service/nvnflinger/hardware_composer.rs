@@ -223,25 +223,97 @@ impl HardwareComposer {
         layer: &Arc<Mutex<Layer>>,
         consumer_id: ConsumerId,
     ) -> CacheStatus {
-        if let Some(framebuffer) = self.framebuffers.get_mut(&consumer_id) {
+        let result = if let Some(framebuffer) = self.framebuffers.get_mut(&consumer_id) {
             if framebuffer.is_acquired {
-                return CacheStatus::CachedBufferReused;
+                CacheStatus::CachedBufferReused
+            } else if Self::try_acquire_framebuffer_locked(layer, framebuffer) {
+                CacheStatus::BufferAcquired
+            } else {
+                CacheStatus::CachedBufferReused
             }
-
-            if Self::try_acquire_framebuffer_locked(layer, framebuffer) {
-                return CacheStatus::BufferAcquired;
+        } else {
+            let mut framebuffer = Framebuffer::default();
+            if Self::try_acquire_framebuffer_locked(layer, &mut framebuffer) {
+                self.framebuffers.insert(consumer_id, framebuffer);
+                CacheStatus::BufferAcquired
+            } else {
+                CacheStatus::NoBufferAvailable
             }
+        };
+        record_hwc_cache_status(consumer_id, result);
+        result
+    }
+}
 
-            return CacheStatus::CachedBufferReused;
+// =============================================================================
+// RUZU_PROFILE_HWC_CACHE: per-consumer histogram of cache_framebuffer_locked
+// CacheStatus returns. Pinpoints whether the compositor is actually consuming
+// new buffers (BufferAcquired) or stuck reusing cached entries
+// (CachedBufferReused) -- the latter means the producer's DequeueBuffer can't
+// proceed because buffers aren't being released back to it.
+// =============================================================================
+
+#[derive(Default, Clone, Copy)]
+struct HwcCacheCounters {
+    no_buffer_available: u64,
+    buffer_acquired: u64,
+    cached_buffer_reused: u64,
+}
+
+static HWC_CACHE_PROFILE: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<ConsumerId, HwcCacheCounters>>,
+> = std::sync::OnceLock::new();
+
+fn hwc_cache_profile_enabled() -> bool {
+    std::env::var_os("RUZU_PROFILE_HWC_CACHE").is_some()
+}
+
+fn record_hwc_cache_status(consumer_id: ConsumerId, status: CacheStatus) {
+    if !hwc_cache_profile_enabled() {
+        return;
+    }
+    let map = HWC_CACHE_PROFILE
+        .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    let mut g = map.lock().unwrap();
+    let entry = g.entry(consumer_id).or_default();
+    match status {
+        CacheStatus::NoBufferAvailable => entry.no_buffer_available += 1,
+        CacheStatus::BufferAcquired => entry.buffer_acquired += 1,
+        CacheStatus::CachedBufferReused => entry.cached_buffer_reused += 1,
+    }
+}
+
+pub fn dump_hwc_cache_profile() {
+    let Some(map) = HWC_CACHE_PROFILE.get() else {
+        return;
+    };
+    let entries: Vec<(ConsumerId, HwcCacheCounters)> = {
+        let g = map.lock().unwrap();
+        g.iter().map(|(k, v)| (*k, *v)).collect()
+    };
+    if entries.is_empty() {
+        return;
+    }
+    eprintln!("[HWC_CACHE_PROFILE] per-consumer CacheStatus distribution:");
+    for (cid, c) in entries.iter() {
+        let total = c.no_buffer_available + c.buffer_acquired + c.cached_buffer_reused;
+        if total == 0 {
+            continue;
         }
-
-        let mut framebuffer = Framebuffer::default();
-        if Self::try_acquire_framebuffer_locked(layer, &mut framebuffer) {
-            self.framebuffers.insert(consumer_id, framebuffer);
-            return CacheStatus::BufferAcquired;
-        }
-
-        CacheStatus::NoBufferAvailable
+        let pct_acquired = 100.0 * c.buffer_acquired as f64 / total as f64;
+        let pct_reused = 100.0 * c.cached_buffer_reused as f64 / total as f64;
+        let pct_none = 100.0 * c.no_buffer_available as f64 / total as f64;
+        eprintln!(
+            "[HWC_CACHE_PROFILE]   consumer={:<3} total={:<7} BufferAcquired={:<7} ({:.1}%)  CachedBufferReused={:<7} ({:.1}%)  NoBufferAvailable={:<7} ({:.1}%)",
+            cid,
+            total,
+            c.buffer_acquired,
+            pct_acquired,
+            c.cached_buffer_reused,
+            pct_reused,
+            c.no_buffer_available,
+            pct_none,
+        );
     }
 }
 
