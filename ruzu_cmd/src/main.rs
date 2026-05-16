@@ -445,6 +445,7 @@ fn main() {
     let want_nvdrv_ioctl_profile = std::env::var_os("RUZU_PROFILE_NVDRV_IOCTL").is_some();
     let want_ipc_phase_profile = std::env::var_os("RUZU_PROFILE_IPC_PHASES").is_some();
     let want_bqp_slot_profile = std::env::var_os("RUZU_PROFILE_BQP_SLOTS").is_some();
+    let want_hwc_cache_profile = std::env::var_os("RUZU_PROFILE_HWC_CACHE").is_some();
     if want_ipc_profile
         || want_svc_profile
         || want_wake_profile
@@ -453,6 +454,7 @@ fn main() {
         || want_nvdrv_ioctl_profile
         || want_ipc_phase_profile
         || want_bqp_slot_profile
+        || want_hwc_cache_profile
     {
         extern "C" fn profile_signal(_signum: libc::c_int) {
             ruzu_core::hle::kernel::svc::svc_ipc::dump_ipc_profile();
@@ -464,6 +466,7 @@ fn main() {
             ruzu_core::hle::kernel::svc::svc_ipc::dump_ipc_phase_profile();
             ruzu_core::hle::service::hle_ipc::dump_hle_handler_profile();
             ruzu_core::hle::service::nvnflinger::buffer_queue_producer::dump_bqp_slot_profile();
+            ruzu_core::hle::service::nvnflinger::hardware_composer::dump_hwc_cache_profile();
         }
         unsafe {
             let mut sa: sdl2::libc::sigaction = std::mem::zeroed();
@@ -481,6 +484,7 @@ fn main() {
             ruzu_core::hle::kernel::svc::svc_ipc::dump_ipc_phase_profile();
             ruzu_core::hle::service::hle_ipc::dump_hle_handler_profile();
             ruzu_core::hle::service::nvnflinger::buffer_queue_producer::dump_bqp_slot_profile();
+            ruzu_core::hle::service::nvnflinger::hardware_composer::dump_hwc_cache_profile();
         }
         unsafe {
             libc::atexit(profile_atexit);
