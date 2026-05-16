@@ -82,6 +82,26 @@ unsafe impl Sync for Fiber {}
 
 impl Fiber {
     extern "C" fn fiber_start_func(transfer: Transfer) -> ! {
+        // Optional alignment trace. SysV x86-64 ABI requires RSP at function
+        // entry to satisfy `RSP mod 16 == 8` (after a `call` pushes the
+        // return address from a 16-aligned RSP). The context crate's
+        // trampoline ends with `push %rbp; jmp *%rbx` which preserves that
+        // invariant, so fiber-entry alignment is correct here.
+        //
+        // Verified 2026-05-16: the MK8D ~60s SIGSEGV in `hash_one` came from
+        // a downstream misalignment, NOT from this entry point. The fiber
+        // stack itself is correctly aligned. Trace kept as a sanity check
+        // for future fiber-related investigations.
+        #[cfg(target_arch = "x86_64")]
+        if std::env::var_os("RUZU_TRACE_FIBER_ENTRY").is_some() {
+            let rsp: u64;
+            unsafe { core::arch::asm!("mov {}, rsp", out(reg) rsp, options(nomem, nostack)); }
+            eprintln!(
+                "[FIBER_ENTRY] post-prologue rsp=0x{:016x} rsp_mod_16={:#x} (expected 0x0 if ABI entry RSP mod 16 == 8 and prologue subtracts 0x88)",
+                rsp,
+                rsp & 0xF
+            );
+        }
         let fiber = unsafe { &*(transfer.data as *const Fiber) };
         fiber.start(transfer)
     }
