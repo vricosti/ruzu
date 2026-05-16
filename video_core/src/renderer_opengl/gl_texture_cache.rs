@@ -451,8 +451,61 @@ impl Image {
         let texture = make_image(&base.info, tuple.internal_format, gl_num_levels, target);
 
         if std::env::var_os("RUZU_TRACE_IMAGE_LIFECYCLE").is_some() {
+            let mut sample = [0u8; 16];
+            if texture != 0 {
+                unsafe {
+                    gl::GetTextureSubImage(
+                        texture,
+                        0,
+                        0,
+                        0,
+                        0,
+                        2,
+                        2,
+                        1,
+                        gl::RGBA,
+                        gl::UNSIGNED_BYTE,
+                        sample.len() as i32,
+                        sample.as_mut_ptr() as *mut _,
+                    );
+                }
+            }
+            // Optional storage-functionality test:
+            // - Force the storage to a known value via glClearTexImage, then
+            //   re-read it. If the texture's storage is functional, the read
+            //   should return the clear value. If broken, the read returns 0.
+            let mut after_clear = [0u8; 16];
+            let mut clear_err: u32 = 0;
+            if std::env::var_os("RUZU_PROBE_IMAGE_STORAGE").is_some() && texture != 0 {
+                let red: [u8; 4] = [0xAB, 0xCD, 0xEF, 0x42];
+                unsafe {
+                    while gl::GetError() != gl::NO_ERROR {}
+                    gl::ClearTexImage(
+                        texture,
+                        0,
+                        gl::RGBA,
+                        gl::UNSIGNED_BYTE,
+                        red.as_ptr() as *const _,
+                    );
+                    clear_err = gl::GetError();
+                    gl::GetTextureSubImage(
+                        texture,
+                        0,
+                        0,
+                        0,
+                        0,
+                        2,
+                        2,
+                        1,
+                        gl::RGBA,
+                        gl::UNSIGNED_BYTE,
+                        after_clear.len() as i32,
+                        after_clear.as_mut_ptr() as *mut _,
+                    );
+                }
+            }
             log::warn!(
-                "[IMAGE_NEW] gpu=0x{:X} cpu=0x{:X} {}x{} fmt={:?} texture={} levels={} target=0x{:X}",
+                "[IMAGE_NEW] gpu=0x{:X} cpu=0x{:X} {}x{} fmt={:?} texture={} levels={} target=0x{:X} initial_bytes={:02X?} after_red_clear={:02X?} clear_err=0x{:X}",
                 base.gpu_addr,
                 base.cpu_addr,
                 base.info.size.width,
@@ -461,6 +514,9 @@ impl Image {
                 texture,
                 gl_num_levels,
                 target,
+                sample,
+                after_clear,
+                clear_err,
             );
         }
 
@@ -2125,14 +2181,31 @@ impl TextureCache {
             return None;
         }
 
+        let view_w = view_base.size.width as i32;
+        let view_h = view_base.size.height as i32;
         let framebuffer = self.framebuffers.entry(view_id).or_insert_with(|| {
             let mut framebuffer = 0;
             unsafe {
                 gl::CreateFramebuffers(1, &mut framebuffer);
                 if framebuffer != 0 {
                     gl::NamedFramebufferTexture(framebuffer, gl::COLOR_ATTACHMENT0, texture, 0);
-                    gl::BindFramebuffer(gl::DRAW_FRAMEBUFFER, framebuffer);
-                    gl::DrawBuffer(gl::COLOR_ATTACHMENT0);
+                    // Upstream `Framebuffer::Framebuffer` (gl_texture_cache.cpp:1326)
+                    // uses `glNamedFramebufferDrawBuffer` (direct state access)
+                    // and sets GL_FRAMEBUFFER_DEFAULT_WIDTH/HEIGHT. Match upstream
+                    // exactly so radeonsi's FBO-setup fast path sees the same call
+                    // sequence as zuyu produces.
+                    gl::NamedFramebufferDrawBuffer(framebuffer, gl::COLOR_ATTACHMENT0);
+                    gl::NamedFramebufferReadBuffer(framebuffer, gl::COLOR_ATTACHMENT0);
+                    gl::NamedFramebufferParameteri(
+                        framebuffer,
+                        gl::FRAMEBUFFER_DEFAULT_WIDTH,
+                        view_w,
+                    );
+                    gl::NamedFramebufferParameteri(
+                        framebuffer,
+                        gl::FRAMEBUFFER_DEFAULT_HEIGHT,
+                        view_h,
+                    );
                 }
             }
             TextureCacheFramebuffer {
@@ -2141,24 +2214,155 @@ impl TextureCache {
             }
         });
         if std::env::var_os("RUZU_TRACE_RT_FBO").is_some() {
+            let fbo = framebuffer.framebuffer;
             let mut attached: i32 = 0;
+            let mut atype: i32 = 0;
+            let mut alevel: i32 = 0;
+            let mut alayer: i32 = 0;
+            let mut alayered: i32 = 0;
+            let mut acubeface: i32 = 0;
+            let mut afmt: i32 = 0;
+            let mut acolor_encoding: i32 = 0;
+            let mut acomp_type: i32 = 0;
+            let mut tex_internal_format: i32 = 0;
+            let mut tex_width: i32 = 0;
+            let mut tex_height: i32 = 0;
+            let mut tex_depth: i32 = 0;
+            let mut tex_immutable: i32 = 0;
+            let mut tex_view_min_level: i32 = 0;
+            let mut tex_view_num_levels: i32 = 0;
+            let mut tex_view_min_layer: i32 = 0;
+            let mut tex_view_num_layers: i32 = 0;
+            const GL_TEXTURE_VIEW_MIN_LEVEL: u32 = 0x82DB;
+            const GL_TEXTURE_VIEW_NUM_LEVELS: u32 = 0x82DC;
+            const GL_TEXTURE_VIEW_MIN_LAYER: u32 = 0x82DD;
+            const GL_TEXTURE_VIEW_NUM_LAYERS: u32 = 0x82DE;
             unsafe {
-                if framebuffer.framebuffer != 0 {
+                if fbo != 0 {
                     gl::GetNamedFramebufferAttachmentParameteriv(
-                        framebuffer.framebuffer,
+                        fbo,
                         gl::COLOR_ATTACHMENT0,
                         gl::FRAMEBUFFER_ATTACHMENT_OBJECT_NAME,
                         &mut attached,
                     );
+                    gl::GetNamedFramebufferAttachmentParameteriv(
+                        fbo,
+                        gl::COLOR_ATTACHMENT0,
+                        gl::FRAMEBUFFER_ATTACHMENT_OBJECT_TYPE,
+                        &mut atype,
+                    );
+                    gl::GetNamedFramebufferAttachmentParameteriv(
+                        fbo,
+                        gl::COLOR_ATTACHMENT0,
+                        gl::FRAMEBUFFER_ATTACHMENT_TEXTURE_LEVEL,
+                        &mut alevel,
+                    );
+                    gl::GetNamedFramebufferAttachmentParameteriv(
+                        fbo,
+                        gl::COLOR_ATTACHMENT0,
+                        gl::FRAMEBUFFER_ATTACHMENT_TEXTURE_LAYER,
+                        &mut alayer,
+                    );
+                    gl::GetNamedFramebufferAttachmentParameteriv(
+                        fbo,
+                        gl::COLOR_ATTACHMENT0,
+                        gl::FRAMEBUFFER_ATTACHMENT_LAYERED,
+                        &mut alayered,
+                    );
+                    gl::GetNamedFramebufferAttachmentParameteriv(
+                        fbo,
+                        gl::COLOR_ATTACHMENT0,
+                        gl::FRAMEBUFFER_ATTACHMENT_TEXTURE_CUBE_MAP_FACE,
+                        &mut acubeface,
+                    );
+                    gl::GetNamedFramebufferAttachmentParameteriv(
+                        fbo,
+                        gl::COLOR_ATTACHMENT0,
+                        gl::FRAMEBUFFER_ATTACHMENT_COLOR_ENCODING,
+                        &mut acolor_encoding,
+                    );
+                    gl::GetNamedFramebufferAttachmentParameteriv(
+                        fbo,
+                        gl::COLOR_ATTACHMENT0,
+                        gl::FRAMEBUFFER_ATTACHMENT_COMPONENT_TYPE,
+                        &mut acomp_type,
+                    );
+                    if attached > 0 {
+                        gl::GetTextureLevelParameteriv(
+                            attached as u32,
+                            alevel,
+                            gl::TEXTURE_INTERNAL_FORMAT,
+                            &mut tex_internal_format,
+                        );
+                        gl::GetTextureLevelParameteriv(
+                            attached as u32,
+                            alevel,
+                            gl::TEXTURE_WIDTH,
+                            &mut tex_width,
+                        );
+                        gl::GetTextureLevelParameteriv(
+                            attached as u32,
+                            alevel,
+                            gl::TEXTURE_HEIGHT,
+                            &mut tex_height,
+                        );
+                        gl::GetTextureLevelParameteriv(
+                            attached as u32,
+                            alevel,
+                            gl::TEXTURE_DEPTH,
+                            &mut tex_depth,
+                        );
+                        gl::GetTextureParameteriv(
+                            attached as u32,
+                            gl::TEXTURE_IMMUTABLE_FORMAT,
+                            &mut tex_immutable,
+                        );
+                        gl::GetTextureParameteriv(
+                            attached as u32,
+                            GL_TEXTURE_VIEW_MIN_LEVEL,
+                            &mut tex_view_min_level,
+                        );
+                        gl::GetTextureParameteriv(
+                            attached as u32,
+                            GL_TEXTURE_VIEW_NUM_LEVELS,
+                            &mut tex_view_num_levels,
+                        );
+                        gl::GetTextureParameteriv(
+                            attached as u32,
+                            GL_TEXTURE_VIEW_MIN_LAYER,
+                            &mut tex_view_min_layer,
+                        );
+                        gl::GetTextureParameteriv(
+                            attached as u32,
+                            GL_TEXTURE_VIEW_NUM_LAYERS,
+                            &mut tex_view_num_layers,
+                        );
+                    }
                 }
             }
             log::warn!(
-                "[RT_FBO_ATTACH] view={} fbo={} attached_texture={} expected_view_texture={} backend_original={}",
+                "[RT_FBO_ATTACH] view={} fbo={} attached={} expected={} backend_original={} atype=0x{:X} alevel={} alayer={} alayered={} cubeface=0x{:X} fmt=0x{:X} comp=0x{:X} enc=0x{:X} tex_size={}x{}x{} immutable={} view_lvl={}+{} view_layer={}+{}",
                 view_id.index,
-                framebuffer.framebuffer,
+                fbo,
                 attached,
                 texture,
                 backend_image.handle(),
+                atype,
+                alevel,
+                alayer,
+                alayered,
+                acubeface,
+                tex_internal_format,
+                acomp_type,
+                acolor_encoding,
+                tex_width,
+                tex_height,
+                tex_depth,
+                tex_immutable,
+                tex_view_min_level,
+                tex_view_num_levels,
+                tex_view_min_layer,
+                tex_view_num_layers,
             );
         }
         let handle = framebuffer.handle();
