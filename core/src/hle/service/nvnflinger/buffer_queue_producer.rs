@@ -457,6 +457,7 @@ impl BufferQueueProducer {
                 log::info!("[BQP_QUEUE] #{} queue_buffer slot={}", n, slot);
             }
         }
+        record_bqp_slot(slot);
         let (
             timestamp,
             is_auto_timestamp,
@@ -1092,6 +1093,50 @@ impl Drop for BufferQueueProducer {
             .lock()
             .unwrap()
             .close_event(self.buffer_wait_event_handle);
+    }
+}
+
+// =============================================================================
+// BQP slot histogram (RUZU_PROFILE_BQP_SLOTS=1)
+// =============================================================================
+//
+// Tracks which slot indices are passed to queue_buffer. If the same slot is
+// queued over and over, the game is pumping cached frames (e.g. stuck on a
+// loading screen) rather than producing new content. Used to confirm the MK8D
+// wedge diagnosis from project_mk8d_deterministic_wedge_2026_05_16.
+
+static BQP_SLOT_COUNTS: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<i32, u64>>,
+> = std::sync::OnceLock::new();
+
+pub(crate) fn record_bqp_slot(slot: i32) {
+    if std::env::var_os("RUZU_PROFILE_BQP_SLOTS").is_none() {
+        return;
+    }
+    let map = BQP_SLOT_COUNTS
+        .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    let mut g = map.lock().unwrap();
+    *g.entry(slot).or_insert(0) += 1;
+}
+
+pub fn dump_bqp_slot_profile() {
+    let Some(map) = BQP_SLOT_COUNTS.get() else {
+        return;
+    };
+    let entries: Vec<(i32, u64)> = {
+        let g = map.lock().unwrap();
+        g.iter().map(|(k, v)| (*k, *v)).collect()
+    };
+    if entries.is_empty() {
+        return;
+    }
+    let mut entries = entries;
+    entries.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
+    let total: u64 = entries.iter().map(|(_, n)| n).sum();
+    eprintln!("[BQP_SLOT_PROFILE] {} QueueBuffer calls across {} unique slots:", total, entries.len());
+    for (slot, n) in entries.iter() {
+        let pct = (*n as f64 / total as f64) * 100.0;
+        eprintln!("[BQP_SLOT_PROFILE]   slot={:<4} count={:<6} ({:.1}%)", slot, n, pct);
     }
 }
 
