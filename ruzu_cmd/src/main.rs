@@ -442,11 +442,13 @@ fn main() {
     let want_wake_profile = std::env::var_os("RUZU_PROFILE_WAKE").is_some();
     let want_gap_profile = std::env::var_os("RUZU_PROFILE_GAP").is_some();
     let want_svc_per_tid = std::env::var_os("RUZU_PROFILE_SVC_PER_TID").is_some();
+    let want_nvdrv_ioctl_profile = std::env::var_os("RUZU_PROFILE_NVDRV_IOCTL").is_some();
     if want_ipc_profile
         || want_svc_profile
         || want_wake_profile
         || want_gap_profile
         || want_svc_per_tid
+        || want_nvdrv_ioctl_profile
     {
         extern "C" fn profile_signal(_signum: libc::c_int) {
             ruzu_core::hle::kernel::svc::svc_ipc::dump_ipc_profile();
@@ -454,6 +456,7 @@ fn main() {
             ruzu_core::hle::kernel::svc_dispatch::dump_svc_per_tid_profile();
             ruzu_core::hle::kernel::svc_dispatch::dump_wake_latency();
             ruzu_core::hle::kernel::svc_dispatch::dump_gap_profile();
+            ruzu_core::hle::service::nvdrv::nvdrv_interface::dump_nvdrv_ioctl_profile();
         }
         unsafe {
             let mut sa: sdl2::libc::sigaction = std::mem::zeroed();
@@ -467,6 +470,7 @@ fn main() {
             ruzu_core::hle::kernel::svc_dispatch::dump_svc_per_tid_profile();
             ruzu_core::hle::kernel::svc_dispatch::dump_wake_latency();
             ruzu_core::hle::kernel::svc_dispatch::dump_gap_profile();
+            ruzu_core::hle::service::nvdrv::nvdrv_interface::dump_nvdrv_ioctl_profile();
         }
         unsafe {
             libc::atexit(profile_atexit);

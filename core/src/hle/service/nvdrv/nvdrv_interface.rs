@@ -577,11 +577,19 @@ impl NvdrvService {
             let mut slot = c.borrow_mut();
             slot.2 = command.raw;
         });
+        let _ioctl_t0 = if nvdrv_ioctl_profile_enabled() {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
         let nv_result = service
             .interface
             .lock()
             .unwrap()
             .ioctl1(fd, command, &input, &mut output);
+        if let Some(t0) = _ioctl_t0 {
+            record_nvdrv_ioctl(command.raw, fd, 1, t0.elapsed());
+        }
         log::trace!(
             "NVDRV::ioctl1_handler return fd={} ioctl=0x{:08X} nv_result={:?}",
             fd,
@@ -706,6 +714,11 @@ impl NvdrvService {
             let mut slot = c.borrow_mut();
             slot.2 = command.raw;
         });
+        let _ioctl_t0 = if nvdrv_ioctl_profile_enabled() {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
         let nv_result = service.interface.lock().unwrap().ioctl2(
             fd,
             command,
@@ -713,6 +726,9 @@ impl NvdrvService {
             &inline_input,
             &mut output,
         );
+        if let Some(t0) = _ioctl_t0 {
+            record_nvdrv_ioctl(command.raw, fd, 2, t0.elapsed());
+        }
         log::trace!(
             "NVDRV::ioctl2_handler return fd={} ioctl=0x{:08X} nv_result={:?}",
             fd,
@@ -752,6 +768,11 @@ impl NvdrvService {
             let mut slot = c.borrow_mut();
             slot.2 = command.raw;
         });
+        let _ioctl_t0 = if nvdrv_ioctl_profile_enabled() {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
         let nv_result = service.interface.lock().unwrap().ioctl3(
             fd,
             command,
@@ -759,6 +780,9 @@ impl NvdrvService {
             &mut output,
             &mut inline_output,
         );
+        if let Some(t0) = _ioctl_t0 {
+            record_nvdrv_ioctl(command.raw, fd, 3, t0.elapsed());
+        }
         log::trace!(
             "NVDRV::ioctl3_handler return fd={} ioctl=0x{:08X} nv_result={:?}",
             fd,
@@ -951,5 +975,99 @@ impl ServiceFramework for NvdrvService {
 
     fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
         &self.handlers_tipc
+    }
+}
+
+// =============================================================================
+// RUZU_PROFILE_NVDRV_IOCTL: per-(ioctl_nr, fd, kind) wall-clock profile
+// =============================================================================
+//
+// Identifies which nvdrv Ioctl handler is the per-call latency hot path. Set
+// `RUZU_PROFILE_NVDRV_IOCTL=1` and send `SIGUSR2` (or rely on atexit) to dump.
+//
+// Output (top entries by total time):
+//   [NVDRV_IOCTL_PROFILE] ioctl=0xC0304808 kind=1 count=691 total=4836.7ms avg=7000us max=20100us
+//
+// Built in response to the MK8D wedge investigation closing on
+// "nvdrv handle 0xB01EC consumes 66% of game runtime at avg 7ms/call". This
+// profiler answers "which specific ioctl_nr blows the budget".
+
+#[derive(Default, Clone)]
+struct NvdrvIoctlAgg {
+    count: u64,
+    total_ns: u64,
+    max_ns: u64,
+}
+
+static NVDRV_IOCTL_PROFILE: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<(u32, i32, u8), NvdrvIoctlAgg>>,
+> = std::sync::OnceLock::new();
+
+fn nvdrv_ioctl_profile_enabled() -> bool {
+    std::env::var_os("RUZU_PROFILE_NVDRV_IOCTL").is_some()
+}
+
+fn record_nvdrv_ioctl(ioctl_nr: u32, fd: i32, kind: u8, elapsed: std::time::Duration) {
+    let agg = NVDRV_IOCTL_PROFILE
+        .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    let ns = elapsed.as_nanos() as u64;
+    let mut g = agg.lock().unwrap();
+    let entry = g.entry((ioctl_nr, fd, kind)).or_default();
+    entry.count += 1;
+    entry.total_ns = entry.total_ns.saturating_add(ns);
+    if ns > entry.max_ns {
+        entry.max_ns = ns;
+    }
+}
+
+pub fn dump_nvdrv_ioctl_profile() {
+    let Some(agg) = NVDRV_IOCTL_PROFILE.get() else {
+        return;
+    };
+    let entries: Vec<((u32, i32, u8), NvdrvIoctlAgg)> = {
+        let g = agg.lock().unwrap();
+        g.iter().map(|(k, v)| (*k, v.clone())).collect()
+    };
+    if entries.is_empty() {
+        eprintln!("[NVDRV_IOCTL_PROFILE] no samples (RUZU_PROFILE_NVDRV_IOCTL=1?)");
+        return;
+    }
+    let mut by_ioctl: std::collections::HashMap<u32, NvdrvIoctlAgg> = std::collections::HashMap::new();
+    for ((nr, _fd, _kind), e) in entries.iter() {
+        let merged = by_ioctl.entry(*nr).or_default();
+        merged.count += e.count;
+        merged.total_ns = merged.total_ns.saturating_add(e.total_ns);
+        if e.max_ns > merged.max_ns {
+            merged.max_ns = e.max_ns;
+        }
+    }
+    let mut by_ioctl: Vec<(u32, NvdrvIoctlAgg)> = by_ioctl.into_iter().collect();
+    by_ioctl.sort_by_key(|(_, e)| std::cmp::Reverse(e.total_ns));
+    eprintln!("[NVDRV_IOCTL_PROFILE] top ioctl_nr by total time:");
+    for (nr, e) in by_ioctl.iter().take(20) {
+        eprintln!(
+            "[NVDRV_IOCTL_PROFILE]   ioctl=0x{:08X} count={:<5} total={:>8.2}ms avg={:>8.1}us max={:>8.1}us",
+            nr,
+            e.count,
+            e.total_ns as f64 / 1e6,
+            e.total_ns as f64 / e.count as f64 / 1e3,
+            e.max_ns as f64 / 1e3,
+        );
+    }
+
+    let mut entries = entries;
+    entries.sort_by_key(|(_, e)| std::cmp::Reverse(e.total_ns));
+    eprintln!("[NVDRV_IOCTL_PROFILE] top 20 (ioctl_nr, fd, kind) by total time:");
+    for ((nr, fd, kind), e) in entries.iter().take(20) {
+        eprintln!(
+            "[NVDRV_IOCTL_PROFILE]   ioctl=0x{:08X} fd={:<3} kind={} count={:<5} total={:>8.2}ms avg={:>8.1}us max={:>8.1}us",
+            nr,
+            fd,
+            kind,
+            e.count,
+            e.total_ns as f64 / 1e6,
+            e.total_ns as f64 / e.count as f64 / 1e3,
+            e.max_ns as f64 / 1e3,
+        );
     }
 }
