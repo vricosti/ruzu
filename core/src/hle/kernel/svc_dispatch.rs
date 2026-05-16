@@ -2186,7 +2186,16 @@ static WAKE_PENDING: std::sync::OnceLock<
 static WAKE_LATENCY: std::sync::OnceLock<std::sync::Mutex<WakeLatencyAgg>> =
     std::sync::OnceLock::new();
 
-#[derive(Default)]
+/// Per-tid wake-latency aggregator. Same shape as `WAKE_LATENCY` but keyed by
+/// the tid of the woken thread. Enabled by `RUZU_PROFILE_WAKE_PER_TID=1`
+/// (independent of the aggregate `RUZU_PROFILE_WAKE`). Helps identify which
+/// thread suffers the slow-wake tail (e.g., the 26 ~1-sec wakes seen in
+/// project_mk8d_deterministic_wedge_2026_05_16).
+static WAKE_LATENCY_PER_TID: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<u64, WakeLatencyAgg>>,
+> = std::sync::OnceLock::new();
+
+#[derive(Default, Clone)]
 struct WakeLatencyAgg {
     count: u64,
     total_ns: u64,
@@ -2219,20 +2228,36 @@ fn consume_wake_latency(tid: u64) {
     let Some(emit_ts) = emit else { return };
     let delta = emit_ts.elapsed();
     let ns = delta.as_nanos() as u64;
-    let agg = WAKE_LATENCY.get_or_init(|| std::sync::Mutex::new(WakeLatencyAgg::default()));
-    let mut g = agg.lock().unwrap();
-    g.count += 1;
-    g.total_ns = g.total_ns.saturating_add(ns);
-    if ns > g.max_ns {
-        g.max_ns = ns;
-    }
-    let bucket = if ns == 0 {
+    let bucket_idx = if ns == 0 {
         0
     } else {
-        (63 - ns.leading_zeros()) as usize
+        ((63 - ns.leading_zeros()) as usize).min(31)
     };
-    let bucket = bucket.min(g.buckets.len() - 1);
-    g.buckets[bucket] += 1;
+
+    {
+        let agg = WAKE_LATENCY.get_or_init(|| std::sync::Mutex::new(WakeLatencyAgg::default()));
+        let mut g = agg.lock().unwrap();
+        g.count += 1;
+        g.total_ns = g.total_ns.saturating_add(ns);
+        if ns > g.max_ns {
+            g.max_ns = ns;
+        }
+        g.buckets[bucket_idx] += 1;
+    }
+
+    // Per-tid breakdown (lets us find which thread suffers the slow-wake tail).
+    if std::env::var_os("RUZU_PROFILE_WAKE_PER_TID").is_some() {
+        let agg = WAKE_LATENCY_PER_TID
+            .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+        let mut g = agg.lock().unwrap();
+        let entry = g.entry(tid).or_default();
+        entry.count += 1;
+        entry.total_ns = entry.total_ns.saturating_add(ns);
+        if ns > entry.max_ns {
+            entry.max_ns = ns;
+        }
+        entry.buckets[bucket_idx] += 1;
+    }
 }
 
 pub fn dump_wake_latency() {
@@ -2269,6 +2294,47 @@ pub fn dump_wake_latency() {
         let lo_str = format_ns_short(lo);
         let hi_str = format_ns_short(hi);
         eprintln!("[WAKE_LATENCY]   [{:>9}, {:>9})  {}", lo_str, hi_str, c);
+    }
+
+    // Per-tid breakdown if RUZU_PROFILE_WAKE_PER_TID=1.
+    if let Some(per_tid_agg) = WAKE_LATENCY_PER_TID.get() {
+        let entries: Vec<(u64, WakeLatencyAgg)> = {
+            let g = per_tid_agg.lock().unwrap();
+            g.iter().map(|(k, v)| (*k, v.clone())).collect()
+        };
+        if !entries.is_empty() {
+            let mut entries = entries;
+            entries.sort_by_key(|(_, e)| std::cmp::Reverse(e.total_ns));
+            eprintln!("[WAKE_LATENCY_PER_TID] top tids by total wait time:");
+            for (tid, e) in entries.iter().take(10) {
+                eprintln!(
+                    "[WAKE_LATENCY_PER_TID] tid={:<4} count={:<5} total={:>8.2}ms avg={:>7.1}us max={:>7.1}us",
+                    tid,
+                    e.count,
+                    e.total_ns as f64 / 1e6,
+                    e.total_ns as f64 / e.count as f64 / 1e3,
+                    e.max_ns as f64 / 1e3,
+                );
+                let mut printed = false;
+                for (k, &c) in e.buckets.iter().enumerate() {
+                    if c == 0 {
+                        continue;
+                    }
+                    if !printed {
+                        eprintln!("[WAKE_LATENCY_PER_TID]   histogram:");
+                        printed = true;
+                    }
+                    let lo = 1u64 << k;
+                    let hi = if k + 1 < 64 { 1u64 << (k + 1) } else { u64::MAX };
+                    eprintln!(
+                        "[WAKE_LATENCY_PER_TID]     [{:>9}, {:>9})  {}",
+                        format_ns_short(lo),
+                        format_ns_short(hi),
+                        c
+                    );
+                }
+            }
+        }
     }
 }
 
