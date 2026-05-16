@@ -51,6 +51,22 @@ fn should_trace_kcv_wake() -> bool {
     std::env::var_os("RUZU_TRACE_KCV_WAKE").is_some()
 }
 
+/// Returns Some(key) if the env var `RUZU_TRACE_CV_KEY=0xHEX` matches the
+/// given `cv_key`. Used to focus tracing on one specific cv address (e.g.
+/// the lost-wakeup target 0x808EA038) without paying the 256-entry limit
+/// of `RUZU_TRACE_KCV`. When set, every signal/wait/end_wait on that key
+/// is logged unconditionally.
+fn cv_key_trace_target() -> Option<u64> {
+    let raw = std::env::var("RUZU_TRACE_CV_KEY").ok()?;
+    let trimmed = raw.trim();
+    let trimmed = trimmed.strip_prefix("0x").or_else(|| trimmed.strip_prefix("0X")).unwrap_or(trimmed);
+    u64::from_str_radix(trimmed, 16).ok()
+}
+
+fn should_trace_cv_key(cv_key: u64) -> bool {
+    matches!(cv_key_trace_target(), Some(target) if target == cv_key)
+}
+
 fn current_trace_owner() -> (Option<u64>, i32) {
     let tid = super::kernel::get_current_thread_id_fast();
     let core = super::kernel::get_kernel_ref()
@@ -538,6 +554,22 @@ impl KConditionVariable {
             .expect("scheduler_lock must exist — kernel not initialized?");
         let _scheduler_guard = super::k_scheduler_lock::KScopedSchedulerLock::new(scheduler_lock);
 
+        let trace_this_key = should_trace_cv_key(cv_key);
+        if trace_this_key {
+            let (issuer_tid, issuer_core) = current_trace_owner();
+            let waiters: Vec<u64> = self
+                .waiting_threads
+                .ordered
+                .iter()
+                .filter(|((k, _), _)| *k == cv_key)
+                .flat_map(|(_, ids)| ids.iter().copied())
+                .collect();
+            log::info!(
+                "[CV_KEY_TRACE] signal_enter cv_key=0x{:X} count={} issuer_tid={:?} issuer_core={} waiters_in_tree={:?}",
+                cv_key, count, issuer_tid, issuer_core, waiters
+            );
+        }
+
         let mut num_waiters = 0i32;
         log::trace!(
             "KConditionVariable::signal begin cv_key=0x{:X} count={} first_waiter={:?}",
@@ -588,6 +620,13 @@ impl KConditionVariable {
             // Signal the thread.
             // Matches upstream: this->SignalImpl(target_thread);
             self.signal_impl(process_guard, &waiting_thread);
+            if trace_this_key {
+                let woke_state = waiting_thread.lock().unwrap().get_state();
+                log::info!(
+                    "[CV_KEY_TRACE] signal_impl_done cv_key=0x{:X} waiter_tid={} new_state={:?}",
+                    cv_key, waiting_thread_id, woke_state
+                );
+            }
             let (issuer_tid, issuer_core) = current_trace_owner();
             trace_kcv(format_args!(
                 "KCV::signal issuer_tid={:?} issuer_core={} cv_key=0x{:X} woke_tid={} remaining_first={:?}",
@@ -856,6 +895,12 @@ impl KConditionVariable {
             t.condition_variable_tree_key()
         };
         self.waiting_threads.insert(thread_key);
+        if should_trace_cv_key(key) {
+            log::info!(
+                "[CV_KEY_TRACE] wait_insert cv_key=0x{:X} tid={} addr=0x{:X} tag=0x{:08X} timeout={}",
+                key, current_thread_id, addr, value, timeout
+            );
+        }
 
         if let Some(timer) = timer {
             wait_queue.set_hardware_timer(timer);
