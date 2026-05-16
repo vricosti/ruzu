@@ -3116,8 +3116,26 @@ impl RasterizerInterface for RasterizerOpenGL {
         if addr == 0 || size == 0 {
             return;
         }
-        self.texture_cache.write_memory(addr, size as usize);
-        self.buffer_cache.write_memory(addr, size);
+        // Mirrors upstream `RasterizerOpenGL::OnCacheInvalidation`
+        // (gl_rasterizer.cpp:693-707): take per-cache mutexes in order
+        // (texture_cache, buffer_cache) before mutating cache state.
+        //
+        // The sentinel `Mutex<()>` lives INSIDE the cache it protects,
+        // so we acquire it through a raw pointer to avoid Rust's borrow
+        // checker rejecting `&mut self.texture_cache` while a guard
+        // borrows `&self.texture_cache.base.mutex` immutably. Upstream
+        // C++ does this trivially (`std::scoped_lock lock{cache.mutex}`)
+        // — the unsafe block matches that semantics.
+        unsafe {
+            let texture_mutex: *const _ = &self.texture_cache.base.mutex;
+            let _texture_guard = (*texture_mutex).lock();
+            self.texture_cache.write_memory(addr, size as usize);
+        }
+        unsafe {
+            let buffer_mutex: *const _ = &self.buffer_cache.mutex;
+            let _buffer_guard = (*buffer_mutex).lock();
+            self.buffer_cache.write_memory(addr, size);
+        }
         self.shader_cache.on_cache_invalidation(addr, size as usize);
     }
 
@@ -3125,10 +3143,29 @@ impl RasterizerInterface for RasterizerOpenGL {
         if addr == 0 || size == 0 {
             return false;
         }
-        if self.buffer_cache.on_cpu_write(addr, size) {
+        // Mirrors upstream `RasterizerOpenGL::OnCPUWrite`
+        // (gl_rasterizer.cpp:671-691): take per-cache mutexes before
+        // mutating cache state. Without these locks, CPU emulation
+        // threads invoking on_cpu_write via the JIT memory-write
+        // trampoline race with the GPU thread using the same caches
+        // for rendering — observed as a `hashbrown::Tag::full` SIGSEGV
+        // ~60s into MK8D (see project_mk8d_deterministic_wedge_2026_05_16).
+        //
+        // See on_cache_invalidation above for why the locks are taken
+        // through raw pointers.
+        let buffer_handled = unsafe {
+            let buffer_mutex: *const _ = &self.buffer_cache.mutex;
+            let _buffer_guard = (*buffer_mutex).lock();
+            self.buffer_cache.on_cpu_write(addr, size)
+        };
+        if buffer_handled {
             return true;
         }
-        self.texture_cache.write_memory(addr, size as usize);
+        unsafe {
+            let texture_mutex: *const _ = &self.texture_cache.base.mutex;
+            let _texture_guard = (*texture_mutex).lock();
+            self.texture_cache.write_memory(addr, size as usize);
+        }
         self.shader_cache.invalidate_region(addr, size as usize);
         false
     }
