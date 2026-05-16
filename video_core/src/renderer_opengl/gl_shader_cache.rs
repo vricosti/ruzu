@@ -80,6 +80,14 @@ pub struct ShaderCache {
     /// A zero entry means "stage disabled" and produces a zero hash, matching
     /// upstream's `unique_hashes[i] == 0` semantics.
     pending_program_addresses: [u64; 6],
+
+    /// Owning thread for this cache instance. First call to a mutating method
+    /// stores the current thread id; subsequent calls assert it hasn't changed.
+    /// Used to verify the "concurrent HashMap access" hypothesis behind the
+    /// MK8D ~60s SIGSEGV in `hash_one<GraphicsPipelineKey>` — if multiple
+    /// thread ids touch the cache, the plain `HashMap` is unsafe.
+    /// 0 = unowned; otherwise hash of `ThreadId`.
+    owner_tid_hash: std::sync::atomic::AtomicU64,
 }
 
 impl ShaderCache {
@@ -97,6 +105,54 @@ impl ShaderCache {
             shader_cache_filename: PathBuf::new(),
             gpu_memory_reader: None,
             pending_program_addresses: [0; 6],
+            owner_tid_hash: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    /// Assert that this cache is only ever accessed from a single thread.
+    /// If a second thread touches the cache, panic with both thread ids so
+    /// we can identify the concurrent caller.
+    ///
+    /// This is the verification step for the MK8D `hash_one<GraphicsPipelineKey>`
+    /// SIGSEGV hypothesis: if multiple threads access `graphics_cache`/`compute_cache`,
+    /// the plain `HashMap` corrupts under concurrent insert/get, eventually
+    /// jumping into stale code with wrong stack alignment.
+    ///
+    /// Gated behind `RUZU_ASSERT_SHADER_CACHE_OWNER=1` so it can be enabled
+    /// only for diagnostic runs (no overhead in normal use).
+    fn assert_single_owner(&self, site: &'static str) {
+        if std::env::var_os("RUZU_ASSERT_SHADER_CACHE_OWNER").is_none() {
+            return;
+        }
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        use std::sync::atomic::Ordering;
+        let mut h = DefaultHasher::new();
+        std::thread::current().id().hash(&mut h);
+        let tid_hash = h.finish().max(1); // 0 = unowned sentinel
+        // Try to publish ownership on first call (compare_exchange 0 -> tid_hash).
+        let prev = self
+            .owner_tid_hash
+            .compare_exchange(0, tid_hash, Ordering::AcqRel, Ordering::Acquire)
+            .unwrap_or_else(|x| x);
+        if prev == 0 {
+            // We became the owner. First access; nothing to assert.
+            eprintln!(
+                "[SHADER_CACHE_OWNER] claim site={} thread={:?} tid_hash=0x{:x}",
+                site,
+                std::thread::current().id(),
+                tid_hash
+            );
+            return;
+        }
+        if prev != tid_hash {
+            panic!(
+                "[SHADER_CACHE_OWNER] violation: site={} expected_tid_hash=0x{:x} this_thread={:?} this_tid_hash=0x{:x}",
+                site,
+                prev,
+                std::thread::current().id(),
+                tid_hash
+            );
         }
     }
 
@@ -169,6 +225,7 @@ impl ShaderCache {
     /// key as valid so the first draw of a fresh boot gets a placeholder
     /// pipeline to exercise the hot path.
     pub fn current_graphics_pipeline(&mut self) -> Option<&mut GraphicsPipeline> {
+        self.assert_single_owner("current_graphics_pipeline");
         // Mirror upstream `ShaderCache::CurrentGraphicsPipeline`: rebuild the
         // key from live engine state every call, and only short-circuit when
         // the freshly-built key matches the previously-bound pipeline. This
@@ -194,6 +251,7 @@ impl ShaderCache {
         &mut self,
         shared_cache: &mut SharedShaderCache,
     ) -> Option<&mut GraphicsPipeline> {
+        self.assert_single_owner("current_graphics_pipeline_with_shared_cache");
         if !shared_cache.refresh_stages(&mut self.graphics_key.unique_hashes) {
             self.current_pipeline = None;
             return None;
@@ -234,6 +292,7 @@ impl ShaderCache {
     ///
     /// Port of `ShaderCache::CurrentComputePipeline()`.
     pub fn current_compute_pipeline(&mut self) -> Option<&mut ComputePipeline> {
+        self.assert_single_owner("current_compute_pipeline");
         // In the full implementation:
         // 1. Build compute key from KeplerCompute engine state
         // 2. Look up in compute_cache
@@ -254,6 +313,7 @@ impl ShaderCache {
     /// so `current_graphics_pipeline` returns a real `&mut GraphicsPipeline`
     /// instead of `None`.
     fn current_graphics_pipeline_slow_path(&mut self) -> Option<&mut GraphicsPipeline> {
+        self.assert_single_owner("current_graphics_pipeline_slow_path");
         let key = self.build_graphics_key();
         self.graphics_key = key;
         self.current_pipeline = Some(key);
@@ -280,6 +340,7 @@ impl ShaderCache {
         &mut self,
         shared_cache: &mut SharedShaderCache,
     ) -> Option<&mut GraphicsPipeline> {
+        self.assert_single_owner("current_graphics_pipeline_slow_path_with_shared_cache");
         let key = self.graphics_key;
         self.current_pipeline = Some(key);
         let maxwell3d = shared_cache.current_maxwell3d();
