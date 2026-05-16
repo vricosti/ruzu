@@ -447,6 +447,20 @@ impl ShaderCache {
                         stage,
                         compiled.source.len()
                     );
+                    if std::env::var_os("RUZU_DUMP_GLSL").is_some() {
+                        use std::sync::atomic::{AtomicUsize, Ordering};
+                        static COUNT: AtomicUsize = AtomicUsize::new(0);
+                        let idx = COUNT.fetch_add(1, Ordering::Relaxed);
+                        let path = format!("/tmp/ruzu_glsl_{:04}_{:?}.glsl", idx, stage);
+                        let _ = std::fs::write(&path, &compiled.source);
+                        log::warn!(
+                            "[GLSL_DUMP] stage={:?} idx={} bytes={} path={}",
+                            stage,
+                            idx,
+                            compiled.source.len(),
+                            path
+                        );
+                    }
                     previous_info = compiled.info.clone();
                     pipeline.glsl_sources[gl_slot] = Some(compiled.source);
                     infos[gl_slot] = Some(previous_info.clone());
@@ -512,6 +526,20 @@ impl ShaderCache {
                 stage,
                 compiled.source.len()
             );
+            if std::env::var_os("RUZU_DUMP_GLSL").is_some() {
+                use std::sync::atomic::{AtomicUsize, Ordering};
+                static COUNT: AtomicUsize = AtomicUsize::new(0);
+                let idx = COUNT.fetch_add(1, Ordering::Relaxed);
+                let path = format!("/tmp/ruzu_glsl_{:04}_{:?}.glsl", idx, stage);
+                let _ = std::fs::write(&path, &compiled.source);
+                log::warn!(
+                    "[GLSL_DUMP] stage={:?} idx={} bytes={} path={}",
+                    stage,
+                    idx,
+                    compiled.source.len(),
+                    path
+                );
+            }
             previous_info = Some(compiled.info.clone());
             infos[gl_slot] = previous_info.clone();
             pipeline.glsl_sources[gl_slot] = Some(compiled.source);
@@ -748,7 +776,7 @@ impl ShaderCache {
         bindings: &mut shader_recompiler::backend::bindings::Bindings,
     ) -> CompiledGlslShader {
         let profile = ShaderProfile::default();
-        if let Some(texture_bound_buffer) = texture_bound_buffer {
+        let compiled = if let Some(texture_bound_buffer) = texture_bound_buffer {
             compile_shader_glsl_at_offset_with_bindings_and_texture_bound(
                 code,
                 stage,
@@ -767,7 +795,22 @@ impl ShaderCache {
                 runtime_info,
                 bindings,
             )
+        };
+        if std::env::var_os("RUZU_DUMP_GLSL").is_some() {
+            use std::sync::atomic::{AtomicUsize, Ordering};
+            static COUNT: AtomicUsize = AtomicUsize::new(0);
+            let idx = COUNT.fetch_add(1, Ordering::Relaxed);
+            let path = format!("/tmp/ruzu_glsl_{:04}_{:?}.glsl", idx, stage);
+            let _ = std::fs::write(&path, &compiled.source);
+            log::warn!(
+                "[GLSL_DUMP] stage={:?} idx={} bytes={} path={}",
+                stage,
+                idx,
+                compiled.source.len(),
+                path
+            );
         }
+        compiled
     }
 
     /// Create a new compute pipeline.

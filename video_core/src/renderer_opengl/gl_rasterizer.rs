@@ -2001,6 +2001,148 @@ impl RasterizerInterface for RasterizerOpenGL {
                     gl::BindImageTextures(0, image_binding as i32, images.as_ptr());
                 }
             }
+            if std::env::var_os("RUZU_TRACE_PER_DRAW_BIND").is_some() {
+                let mut samples: [[u8; 4]; 4] = [[0; 4]; 4];
+                let mut samples_far: [[u8; 4]; 4] = [[0; 4]; 4];
+                let mut samples_mid: [[u8; 4]; 4] = [[0; 4]; 4];
+                let mut sizes: [[i32; 2]; 4] = [[0; 2]; 4];
+                let unit_count = texture_binding.min(4);
+                for unit in 0..unit_count {
+                    let tex = textures[unit];
+                    if tex == 0 {
+                        continue;
+                    }
+                    unsafe {
+                        let mut w = 0i32;
+                        let mut h = 0i32;
+                        gl::GetTextureLevelParameteriv(tex, 0, gl::TEXTURE_WIDTH, &mut w);
+                        gl::GetTextureLevelParameteriv(tex, 0, gl::TEXTURE_HEIGHT, &mut h);
+                        sizes[unit] = [w, h];
+                        gl::GetTextureSubImage(
+                            tex,
+                            0,
+                            0,
+                            0,
+                            0,
+                            1,
+                            1,
+                            1,
+                            gl::RGBA,
+                            gl::UNSIGNED_BYTE,
+                            4,
+                            samples[unit].as_mut_ptr() as *mut _,
+                        );
+                        if w > 1 && h > 1 {
+                            let mx = (w / 2).max(1);
+                            let my = (h / 2).max(1);
+                            gl::GetTextureSubImage(
+                                tex,
+                                0,
+                                mx,
+                                my,
+                                0,
+                                1,
+                                1,
+                                1,
+                                gl::RGBA,
+                                gl::UNSIGNED_BYTE,
+                                4,
+                                samples_mid[unit].as_mut_ptr() as *mut _,
+                            );
+                            gl::GetTextureSubImage(
+                                tex,
+                                0,
+                                w - 1,
+                                h - 1,
+                                0,
+                                1,
+                                1,
+                                1,
+                                gl::RGBA,
+                                gl::UNSIGNED_BYTE,
+                                4,
+                                samples_far[unit].as_mut_ptr() as *mut _,
+                            );
+                        }
+                    }
+                }
+                let mut summary = String::new();
+                for unit in 0..unit_count {
+                    if !summary.is_empty() {
+                        summary.push(' ');
+                    }
+                    summary.push_str(&format!(
+                        "u{}=tex{}({}x{})/c{:02X?}/m{:02X?}/f{:02X?}",
+                        unit, textures[unit], sizes[unit][0], sizes[unit][1],
+                        samples[unit], samples_mid[unit], samples_far[unit]
+                    ));
+                }
+                let mut fb_srgb: u8 = 0;
+                let mut blend_enabled: u8 = 0;
+                let mut blend_eq_rgb: i32 = 0;
+                let mut blend_src_rgb: i32 = 0;
+                let mut blend_dst_rgb: i32 = 0;
+                let mut color_mask: [u8; 4] = [0; 4];
+                let mut draw_fb: i32 = 0;
+                let mut depth_test: u8 = 0;
+                let mut stencil_test: u8 = 0;
+                let mut sample_alpha_to_coverage: u8 = 0;
+                let mut rasterizer_discard: u8 = 0;
+                unsafe {
+                    fb_srgb = gl::IsEnabled(gl::FRAMEBUFFER_SRGB);
+                    blend_enabled = gl::IsEnabledi(gl::BLEND, 0);
+                    gl::GetIntegeri_v(gl::BLEND_EQUATION_RGB, 0, &mut blend_eq_rgb);
+                    gl::GetIntegeri_v(gl::BLEND_SRC_RGB, 0, &mut blend_src_rgb);
+                    gl::GetIntegeri_v(gl::BLEND_DST_RGB, 0, &mut blend_dst_rgb);
+                    gl::GetBooleani_v(gl::COLOR_WRITEMASK, 0, color_mask.as_mut_ptr());
+                    gl::GetIntegerv(gl::DRAW_FRAMEBUFFER_BINDING, &mut draw_fb);
+                    depth_test = gl::IsEnabled(gl::DEPTH_TEST);
+                    stencil_test = gl::IsEnabled(gl::STENCIL_TEST);
+                    sample_alpha_to_coverage = gl::IsEnabled(gl::SAMPLE_ALPHA_TO_COVERAGE);
+                    rasterizer_discard = gl::IsEnabled(gl::RASTERIZER_DISCARD);
+                }
+                let mut ubo_handle: i32 = 0;
+                let mut ubo_offset: i64 = 0;
+                let mut ubo_size: i64 = 0;
+                let mut ubo_bytes = [0u8; 96];
+                unsafe {
+                    gl::GetIntegeri_v(gl::UNIFORM_BUFFER_BINDING, 0, &mut ubo_handle);
+                    gl::GetInteger64i_v(gl::UNIFORM_BUFFER_START, 0, &mut ubo_offset);
+                    gl::GetInteger64i_v(gl::UNIFORM_BUFFER_SIZE, 0, &mut ubo_size);
+                    if ubo_handle > 0 {
+                        gl::GetNamedBufferSubData(
+                            ubo_handle as u32,
+                            ubo_offset as isize,
+                            ubo_bytes.len() as isize,
+                            ubo_bytes.as_mut_ptr() as *mut _,
+                        );
+                    }
+                }
+                let ubo_floats: [f32; 24] = unsafe {
+                    std::mem::transmute(ubo_bytes)
+                };
+                log::warn!(
+                    "[PER_DRAW_BIND] draw_fb={} fb_srgb={} blend_en={} eq=0x{:X} src=0x{:X} dst=0x{:X} cmask={:?} depth={} sten={} a2c={} disc={} texture_binding={} image_binding={} samples=[{}] ubo0=h{}/off{}/size{} ubo0_floats[0..24]={:?}",
+                    draw_fb,
+                    fb_srgb,
+                    blend_enabled,
+                    blend_eq_rgb,
+                    blend_src_rgb,
+                    blend_dst_rgb,
+                    color_mask,
+                    depth_test,
+                    stencil_test,
+                    sample_alpha_to_coverage,
+                    rasterizer_discard,
+                    texture_binding,
+                    image_binding,
+                    summary,
+                    ubo_handle,
+                    ubo_offset,
+                    ubo_size,
+                    ubo_floats,
+                );
+            }
         }
         self.buffer_cache
             .set_graphics_base_uniform_bindings(&pipeline.base_uniform_bindings);
@@ -2093,6 +2235,119 @@ impl RasterizerInterface for RasterizerOpenGL {
         if can_draw_gl {
             sync_fixed_function_state(draw_state);
             sync_vertex_formats(self.transient_vao, draw_state);
+            if std::env::var_os("RUZU_FORCE_DISABLE_BLEND").is_some() {
+                unsafe {
+                    for i in 0..8 {
+                        gl::Disablei(gl::BLEND, i);
+                    }
+                }
+            }
+            if std::env::var_os("RUZU_FORCE_BARRIER").is_some() {
+                unsafe {
+                    gl::MemoryBarrier(gl::ALL_BARRIER_BITS);
+                }
+            }
+            if std::env::var_os("RUZU_TRACE_PRE_DRAW_STATE").is_some() {
+                let mut blend_en: u8 = 0;
+                let mut blend_eq_rgb: i32 = 0;
+                let mut blend_src_rgb: i32 = 0;
+                let mut blend_dst_rgb: i32 = 0;
+                let mut blend_eq_a: i32 = 0;
+                let mut blend_src_a: i32 = 0;
+                let mut blend_dst_a: i32 = 0;
+                let mut color_mask: [u8; 4] = [0; 4];
+                let mut depth_test: u8 = 0;
+                let mut depth_mask: u8 = 0;
+                let mut stencil_test: u8 = 0;
+                let mut sample_alpha_to_coverage: u8 = 0;
+                let mut rasterizer_discard: u8 = 0;
+                let mut viewport0 = [0i32; 4];
+                let mut scissor_box = [0i32; 4];
+                let mut scissor_en: u8 = 0;
+                let mut draw_fb = 0i32;
+                let mut fb_srgb: u8 = 0;
+                unsafe {
+                    blend_en = gl::IsEnabledi(gl::BLEND, 0);
+                    gl::GetIntegeri_v(gl::BLEND_EQUATION_RGB, 0, &mut blend_eq_rgb);
+                    gl::GetIntegeri_v(gl::BLEND_SRC_RGB, 0, &mut blend_src_rgb);
+                    gl::GetIntegeri_v(gl::BLEND_DST_RGB, 0, &mut blend_dst_rgb);
+                    gl::GetIntegeri_v(gl::BLEND_EQUATION_ALPHA, 0, &mut blend_eq_a);
+                    gl::GetIntegeri_v(gl::BLEND_SRC_ALPHA, 0, &mut blend_src_a);
+                    gl::GetIntegeri_v(gl::BLEND_DST_ALPHA, 0, &mut blend_dst_a);
+                    gl::GetBooleani_v(gl::COLOR_WRITEMASK, 0, color_mask.as_mut_ptr());
+                    depth_test = gl::IsEnabled(gl::DEPTH_TEST);
+                    let mut dm = gl::FALSE;
+                    gl::GetBooleanv(gl::DEPTH_WRITEMASK, &mut dm);
+                    depth_mask = dm;
+                    stencil_test = gl::IsEnabled(gl::STENCIL_TEST);
+                    sample_alpha_to_coverage = gl::IsEnabled(gl::SAMPLE_ALPHA_TO_COVERAGE);
+                    rasterizer_discard = gl::IsEnabled(gl::RASTERIZER_DISCARD);
+                    gl::GetIntegeri_v(gl::VIEWPORT, 0, viewport0.as_mut_ptr());
+                    scissor_en = gl::IsEnabledi(gl::SCISSOR_TEST, 0);
+                    gl::GetIntegeri_v(gl::SCISSOR_BOX, 0, scissor_box.as_mut_ptr());
+                    gl::GetIntegerv(gl::DRAW_FRAMEBUFFER_BINDING, &mut draw_fb);
+                    fb_srgb = gl::IsEnabled(gl::FRAMEBUFFER_SRGB);
+                }
+                let mut cull_face_en: u8 = 0;
+                let mut cull_face_mode: i32 = 0;
+                let mut front_face: i32 = 0;
+                let mut polygon_mode: [i32; 2] = [0; 2];
+                let mut primitive_restart_en: u8 = 0;
+                let mut primitive_restart_idx: i32 = 0;
+                let mut pipeline_bind: i32 = 0;
+                let mut vao: i32 = 0;
+                let mut active_tex: i32 = 0;
+                let mut fbo_status: u32 = 0;
+                let mut sample_coverage_en: u8 = 0;
+                let mut multi_sample_en: u8 = 0;
+                unsafe {
+                    cull_face_en = gl::IsEnabled(gl::CULL_FACE);
+                    gl::GetIntegerv(gl::CULL_FACE_MODE, &mut cull_face_mode);
+                    gl::GetIntegerv(gl::FRONT_FACE, &mut front_face);
+                    gl::GetIntegerv(gl::POLYGON_MODE, polygon_mode.as_mut_ptr());
+                    primitive_restart_en = gl::IsEnabled(gl::PRIMITIVE_RESTART);
+                    gl::GetIntegerv(gl::PRIMITIVE_RESTART_INDEX, &mut primitive_restart_idx);
+                    gl::GetIntegerv(gl::PROGRAM_PIPELINE_BINDING, &mut pipeline_bind);
+                    gl::GetIntegerv(gl::VERTEX_ARRAY_BINDING, &mut vao);
+                    gl::GetIntegerv(gl::ACTIVE_TEXTURE, &mut active_tex);
+                    fbo_status = gl::CheckNamedFramebufferStatus(draw_fb as u32, gl::DRAW_FRAMEBUFFER);
+                    sample_coverage_en = gl::IsEnabled(gl::SAMPLE_COVERAGE);
+                    multi_sample_en = gl::IsEnabled(gl::MULTISAMPLE);
+                }
+                log::warn!(
+                    "[PRE_DRAW] draw_fb={} fbo_status=0x{:X} fb_srgb={} blend_en={} eq_rgb=0x{:X} eq_a=0x{:X} src_rgb=0x{:X} dst_rgb=0x{:X} src_a=0x{:X} dst_a=0x{:X} cmask={:?} depth_test={} depth_mask={} sten={} a2c={} disc={} viewport0={:?} scissor0_en={} scissor_box={:?} cull_en={} cull_mode=0x{:X} front_face=0x{:X} poly_mode={:?} prim_restart_en={} prim_restart_idx=0x{:X} pipeline={} vao={} active_tex=0x{:X} samp_cov_en={} multisample={}",
+                    draw_fb,
+                    fbo_status,
+                    fb_srgb,
+                    blend_en,
+                    blend_eq_rgb,
+                    blend_eq_a,
+                    blend_src_rgb,
+                    blend_dst_rgb,
+                    blend_src_a,
+                    blend_dst_a,
+                    color_mask,
+                    depth_test,
+                    depth_mask,
+                    stencil_test,
+                    sample_alpha_to_coverage,
+                    rasterizer_discard,
+                    viewport0,
+                    scissor_en,
+                    scissor_box,
+                    cull_face_en,
+                    cull_face_mode,
+                    front_face,
+                    polygon_mode,
+                    primitive_restart_en,
+                    primitive_restart_idx,
+                    pipeline_bind,
+                    vao,
+                    active_tex,
+                    sample_coverage_en,
+                    multi_sample_en,
+                );
+            }
         }
 
         if is_indexed {
@@ -2357,15 +2612,15 @@ impl RasterizerInterface for RasterizerOpenGL {
                                 log::warn!("[DRAW_GUEST] {} gpu=0x{:X} unmapped", label, gpu_addr);
                             }
                         };
-                        dump_guest_gpu("index", draw_state.index_buffer_gpu_addr, 64);
-                        dump_guest_gpu("vertex0", draw_state.vertex_streams[0].address, 64);
+                        dump_guest_gpu("index", draw_state.index_buffer_gpu_addr, 32);
+                        dump_guest_gpu("vertex0", draw_state.vertex_streams[0].address, 192);
                     }
                     dump_gl_buffer_prefix(
                         "attrib0",
                         attrib_buffer[0] as u32,
                         vertex_binding_offset[0] as isize
                             + draw_state.vertex_attribs_snapshot[0].offset as isize,
-                        64,
+                        192,
                     );
                     dump_gl_buffer_prefix(
                         "element",
