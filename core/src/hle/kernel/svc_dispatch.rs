@@ -1849,6 +1849,12 @@ pub fn call(system: &System, imm: u32, is_64bit: bool, args: &mut SvcArgs) {
         // threads. `RUZU_TRACE_TID_SVC=N,M,...` logs the listed thread ids.
         // Used to figure out what a "silent" game-main thread is actually
         // doing when it appears wedged but is still being scheduled.
+        //
+        // Each line also carries a nanosecond timestamp `t_ns=...` measured
+        // from a process-lifetime anchor (first call to `race_anchor`). Use
+        // it to compute relative timing between SVCs across threads when
+        // analyzing parent/worker dispatch races (see
+        // project_mk8d_jit_not_the_problem_2026_05_17).
         if let Some(target_str) = std::env::var_os("RUZU_TRACE_TID_SVC") {
             let target_str = target_str.to_string_lossy();
             let want = target_str == "*"
@@ -1861,8 +1867,10 @@ pub fn call(system: &System, imm: u32, is_64bit: bool, args: &mut SvcArgs) {
                 let name = SvcId::from_u32(imm)
                     .map(|id| format!("{:?}", id))
                     .unwrap_or_else(|| format!("svc#0x{:02X}", imm));
+                let t_ns = super::race_anchor::elapsed_ns();
                 log::info!(
-                    "[TID_SVC] tid={} core={} svc={} args=[0x{:X}, 0x{:X}, 0x{:X}, 0x{:X}]",
+                    "[TID_SVC] t_ns={} tid={} core={} svc={} args=[0x{:X}, 0x{:X}, 0x{:X}, 0x{:X}]",
+                    t_ns,
                     tid,
                     core_id,
                     name,

@@ -43,6 +43,19 @@ impl SystemManager {
                 .spawn(move || {
                     log::info!("AudioRenderSystemManager thread started");
                     let profile = std::env::var_os("RUZU_PROFILE_SYSMGR").is_some();
+                    // `RUZU_PROFILE_SYSMGR_RATE=1` — unfiltered version that
+                    // periodically dumps the cumulative iter count + summed
+                    // time breakdown. Catches fast iters that the per-iter
+                    // filtered log skips. Use to confirm the manager loop's
+                    // actual frequency (target: 200 Hz for 5ms audio frames).
+                    let profile_rate = std::env::var_os("RUZU_PROFILE_SYSMGR_RATE").is_some();
+                    let rate_start = std::time::Instant::now();
+                    let mut rate_iter_count: u64 = 0;
+                    let mut rate_send_us: u64 = 0;
+                    let mut rate_lock_us: u64 = 0;
+                    let mut rate_signal_us: u64 = 0;
+                    let mut rate_wait_us: u64 = 0;
+                    let mut rate_last_dump = std::time::Instant::now();
                     while active.load(Ordering::SeqCst) {
                         let t_iter = std::time::Instant::now();
                         let t = std::time::Instant::now();
@@ -77,6 +90,29 @@ impl SystemManager {
                                     "PROFILE_SYSMGR total_us={} send_cmds_us={} render_lock_us={} signal_us={} wait_us={}",
                                     total, t_sendcmds, t_renderlock, t_signal, t_wait
                                 );
+                            }
+                        }
+                        if profile_rate {
+                            rate_iter_count += 1;
+                            rate_send_us += t_sendcmds as u64;
+                            rate_lock_us += t_renderlock as u64;
+                            rate_signal_us += t_signal as u64;
+                            rate_wait_us += t_wait as u64;
+                            // Dump every ~500ms so we see the rate evolve.
+                            if rate_last_dump.elapsed().as_millis() >= 500 {
+                                let elapsed_s = rate_start.elapsed().as_secs_f64();
+                                log::info!(
+                                    "PROFILE_SYSMGR_RATE t={:.2}s iters={} hz_total={:.1} \
+                                     sum_send_ms={} sum_lock_ms={} sum_signal_ms={} sum_wait_ms={}",
+                                    elapsed_s,
+                                    rate_iter_count,
+                                    rate_iter_count as f64 / elapsed_s.max(0.001),
+                                    rate_send_us / 1000,
+                                    rate_lock_us / 1000,
+                                    rate_signal_us / 1000,
+                                    rate_wait_us / 1000,
+                                );
+                                rate_last_dump = std::time::Instant::now();
                             }
                         }
                     }
