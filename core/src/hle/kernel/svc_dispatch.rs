@@ -2325,7 +2325,11 @@ pub fn dump_wake_latency() {
                         printed = true;
                     }
                     let lo = 1u64 << k;
-                    let hi = if k + 1 < 64 { 1u64 << (k + 1) } else { u64::MAX };
+                    let hi = if k + 1 < 64 {
+                        1u64 << (k + 1)
+                    } else {
+                        u64::MAX
+                    };
                     eprintln!(
                         "[WAKE_LATENCY_PER_TID]     [{:>9}, {:>9})  {}",
                         format_ns_short(lo),

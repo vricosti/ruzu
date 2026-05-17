@@ -272,8 +272,8 @@ fn record_hwc_cache_status(consumer_id: ConsumerId, status: CacheStatus) {
     if !hwc_cache_profile_enabled() {
         return;
     }
-    let map = HWC_CACHE_PROFILE
-        .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    let map =
+        HWC_CACHE_PROFILE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
     let mut g = map.lock().unwrap();
     let entry = g.entry(consumer_id).or_default();
     match status {

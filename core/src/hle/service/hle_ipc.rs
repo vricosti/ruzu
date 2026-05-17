@@ -441,13 +441,9 @@ struct HleHandlerAgg {
     max_ns: u64,
 }
 
-fn record_hle_handler_profile(
-    service_name: &str,
-    cmd: u32,
-    elapsed: std::time::Duration,
-) {
-    let map = HLE_HANDLER_PROFILE
-        .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+fn record_hle_handler_profile(service_name: &str, cmd: u32, elapsed: std::time::Duration) {
+    let map =
+        HLE_HANDLER_PROFILE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
     let ns = elapsed.as_nanos() as u64;
     let mut guard = map.lock().unwrap();
     let entry = guard.entry((service_name.to_string(), cmd)).or_default();

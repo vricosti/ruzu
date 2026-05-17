@@ -7,7 +7,8 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::sync::Mutex;
+
+use parking_lot::Mutex;
 
 use crate::control::channel_state::ChannelState;
 use crate::control::channel_state_cache::{ChannelInfo, ChannelSetupCaches};
@@ -370,24 +371,42 @@ impl ShaderCache {
 
     /// Removes shaders inside a given region.
     pub fn invalidate_region(&mut self, addr: VAddr, size: usize) {
-        // Note: upstream locks invalidation_mutex here, but &mut self already
-        // guarantees exclusive access in Rust.
+        // Port of `ShaderCache::InvalidateRegion`: upstream takes
+        // `invalidation_mutex` before touching invalidation_cache and
+        // marked_for_removal. Ruzu reaches this object through raw rasterizer
+        // pointers from multiple CPU threads, so `&mut self` is not enough to
+        // serialize the host HashMaps.
+        let invalidation_mutex: *const Mutex<()> = &self.invalidation_mutex;
+        let _invalidation_guard = unsafe { (*invalidation_mutex).lock() };
         self.invalidate_pages_in_region(addr, size);
         self.remove_pending_shaders();
     }
 
     /// Unmarks a memory region as cached and marks it for removal.
     pub fn on_cache_invalidation(&mut self, addr: VAddr, size: usize) {
+        // Port of `ShaderCache::OnCacheInvalidation`.
+        let invalidation_mutex: *const Mutex<()> = &self.invalidation_mutex;
+        let _invalidation_guard = unsafe { (*invalidation_mutex).lock() };
         self.invalidate_pages_in_region(addr, size);
     }
 
     /// Flushes delayed removal operations.
     pub fn sync_guest_host(&mut self) {
+        // Port of `ShaderCache::SyncGuestHost`.
+        let invalidation_mutex: *const Mutex<()> = &self.invalidation_mutex;
+        let _invalidation_guard = unsafe { (*invalidation_mutex).lock() };
         self.remove_pending_shaders();
     }
 
     /// Port of `ShaderCache::Register`.
     pub fn register(&mut self, data: Box<ShaderInfo>, addr: VAddr, size: usize) {
+        // Upstream takes both mutexes here:
+        // `std::scoped_lock lock{invalidation_mutex, lookup_mutex}`.
+        let invalidation_mutex: *const Mutex<()> = &self.invalidation_mutex;
+        let lookup_mutex: *const Mutex<()> = &self.lookup_mutex;
+        let _invalidation_guard = unsafe { (*invalidation_mutex).lock() };
+        let _lookup_guard = unsafe { (*lookup_mutex).lock() };
+
         let addr_end = addr + size as u64;
         let data_ptr = (&*data as *const ShaderInfo).cast_mut();
         let entry = self.new_entry(addr, addr_end, data_ptr);
@@ -405,13 +424,7 @@ impl ShaderCache {
         let addr_end = addr + size as u64;
         let page_end = (addr_end + YUZU_PAGESIZE - 1) >> YUZU_PAGEBITS;
         for page in (addr >> YUZU_PAGEBITS)..page_end {
-            let Some(mut entries) = self.invalidation_cache.remove(&page) else {
-                continue;
-            };
-            self.invalidate_page_entries(&mut entries, addr, addr_end);
-            if !entries.is_empty() {
-                self.invalidation_cache.insert(page, entries);
-            }
+            self.invalidate_page_entries(page, addr, addr_end);
         }
     }
 
@@ -426,20 +439,13 @@ impl ShaderCache {
 
         let mut removed_shaders: Vec<*mut ShaderInfo> = Vec::new();
 
+        // Upstream `RemovePendingShaders` takes lookup_mutex while removing
+        // entries from lookup_cache. Callers already hold invalidation_mutex.
+        let lookup_mutex: *const Mutex<()> = &self.lookup_mutex;
+        let _lookup_guard = unsafe { (*lookup_mutex).lock() };
+
         for &entry_ptr in &self.marked_for_removal {
             let entry = unsafe { &*entry_ptr };
-
-            // Remove this entry from all invalidation cache pages it spans.
-            let entry_page_start = entry.addr_start >> YUZU_PAGEBITS;
-            let entry_page_end = (entry.addr_end + YUZU_PAGESIZE - 1) >> YUZU_PAGEBITS;
-            for pg in entry_page_start..entry_page_end {
-                if let Some(page_entries) = self.invalidation_cache.get_mut(&pg) {
-                    if let Some(pos) = page_entries.iter().position(|&e| e == entry_ptr) {
-                        page_entries.swap_remove(pos);
-                    }
-                }
-            }
-
             removed_shaders.push(entry.data);
 
             // Remove from lookup cache.
@@ -454,21 +460,17 @@ impl ShaderCache {
     }
 
     /// Port of `ShaderCache::InvalidatePageEntries`.
-    fn invalidate_page_entries(
-        &mut self,
-        entries: &mut Vec<*mut Entry>,
-        addr: VAddr,
-        addr_end: VAddr,
-    ) {
-        let mut index = 0;
-        while index < entries.len() {
-            let entry_ptr = entries[index];
+    fn invalidate_page_entries(&mut self, page: u64, addr: VAddr, addr_end: VAddr) {
+        loop {
+            let Some(entry_ptr) = self.invalidation_cache.get(&page).and_then(|entries| {
+                entries
+                    .iter()
+                    .copied()
+                    .find(|&entry| unsafe { (*entry).overlaps(addr, addr_end) })
+            }) else {
+                break;
+            };
             let entry = unsafe { &mut *entry_ptr };
-            if !entry.overlaps(addr, addr_end) {
-                index += 1;
-                continue;
-            }
-
             self.unmark_memory(entry);
             self.remove_entry_from_invalidation_cache(entry);
             self.marked_for_removal.push(entry_ptr);
@@ -487,9 +489,6 @@ impl ShaderCache {
                 .position(|existing| std::ptr::eq(*existing, entry))
             {
                 entries.remove(position);
-            }
-            if entries.is_empty() {
-                self.invalidation_cache.remove(&page);
             }
         }
     }
@@ -530,7 +529,7 @@ impl ShaderCache {
 
     /// Try to get a cached shader at the given address.
     pub fn try_get(&self, addr: VAddr) -> Option<&ShaderInfo> {
-        let _lock = self.lookup_mutex.lock().unwrap();
+        let _lock = self.lookup_mutex.lock();
         self.lookup_cache
             .get(&addr)
             .map(|entry| unsafe { &*entry.data })
@@ -958,6 +957,41 @@ mod tests {
             .invalidation_cache
             .values()
             .any(|entries| !entries.is_empty()));
+    }
+
+    #[test]
+    fn invalidate_region_erases_current_page_entry_in_place() {
+        let mut cache = ShaderCache::default();
+        cache.register(
+            Box::new(ShaderInfo {
+                unique_hash: 0x1234,
+                size_bytes: 0x40,
+            }),
+            0x4000,
+            0x40,
+        );
+
+        assert!(cache.try_get(0x4000).is_some());
+        assert_eq!(
+            cache
+                .invalidation_cache
+                .get(&(0x4000 >> YUZU_PAGEBITS))
+                .map(Vec::len),
+            Some(1)
+        );
+
+        cache.invalidate_region(0x4000, 4);
+
+        assert!(cache.try_get(0x4000).is_none());
+        assert!(cache.marked_for_removal.is_empty());
+        assert!(cache.storage.is_empty());
+        assert_eq!(
+            cache
+                .invalidation_cache
+                .get(&(0x4000 >> YUZU_PAGEBITS))
+                .map(Vec::len),
+            Some(0)
+        );
     }
 
     #[test]

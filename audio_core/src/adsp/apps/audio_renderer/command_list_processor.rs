@@ -7,7 +7,7 @@ use crate::renderer::command::{CommandListHeader, COMMAND_LIST_HEADER_SIZE};
 use crate::renderer::effect::light_limiter::StatisticsInternal;
 use crate::sink::sink_stream::SinkStreamHandle;
 use crate::SharedSystem;
-use log::error;
+use log::{error, warn};
 // Stub: ruzu_kernel has been removed. MemoryManager and KProcess are replaced
 // with opaque pointers (*mut ()). Restore when ruzu_kernel is brought back.
 use std::fmt::Write;
@@ -72,19 +72,19 @@ impl CommandListProcessor {
 
         self.system = Some(system.clone());
         self.process = ProcessHandle::from_ptr(process);
-        // Stub: previously extracted MemoryManager from KProcess.
-        // With ruzu_kernel removed, memory handle is left as null.
+        // Upstream stores `memory = &process.GetMemory()`.
         self.memory = MemoryHandle::default();
-        // Set the global guest memory accessor used by the decode path
-        // to translate guest virtual wave-buffer addresses to host bytes.
-        // See `audio_core/src/lib.rs::GUEST_MEMORY_ACCESSOR`.
         if crate::GUEST_MEMORY_ACCESSOR.get().is_none() {
-            if let Some(mem) = system.lock().memory_shared() {
-                if crate::GUEST_MEMORY_ACCESSOR.set(mem).is_ok() {
-                    log::info!("audio_core: GUEST_MEMORY_ACCESSOR initialized");
+            let process =
+                process as *mut ruzu_core::hle::kernel::k_process::KProcess;
+            if !process.is_null() {
+                if let Some(mem) = unsafe { (*process).get_memory() } {
+                    crate::init_guest_memory_accessor(mem);
+                } else {
+                    warn!("audio_core: process.get_memory() returned None, GUEST_MEMORY_ACCESSOR not set");
                 }
             } else {
-                log::warn!("audio_core: system.memory_shared() returned None, GUEST_MEMORY_ACCESSOR not set");
+                warn!("audio_core: null process, GUEST_MEMORY_ACCESSOR not set");
             }
         }
         self.stream = Some(stream);

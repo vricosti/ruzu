@@ -239,6 +239,18 @@ pub fn create_thread(
     match process.handle_table.add(object_id) {
         Ok(handle) => {
             *out_handle = handle;
+            // RUZU_SVC_TRACE_THREAD: matches zuyu's [SVC_CREATE_THREAD] line
+            // so the cross-emulator diff can count creations 1:1.
+            if std::env::var_os("RUZU_SVC_TRACE_THREAD").is_some() {
+                let parent_tid = system
+                    .current_thread()
+                    .map(|t| t.lock().unwrap().get_thread_id())
+                    .unwrap_or(0);
+                log::warn!(
+                    "[SVC_CREATE_THREAD] tid={} parent_tid={} entry=0x{:X} prio={} core={}",
+                    thread_id, parent_tid, entry_point, priority, core_id
+                );
+            }
             RESULT_SUCCESS
         }
         Err(_) => {
@@ -365,16 +377,24 @@ pub fn start_thread(system: &System, thread_handle: Handle) -> ResultCode {
     let result = KThread::run_thread(&thread);
     {
         let thread_guard = thread.lock().unwrap();
+        let tid = thread_guard.get_thread_id();
+        let state = thread_guard.get_state();
+        let active_core = thread_guard.get_active_core();
+        let current_core = thread_guard.get_current_core();
+        let affinity = thread_guard.physical_affinity_mask.get_affinity_mask();
         log::trace!(
             "svc::StartThread result handle=0x{:08X} tid={} state={:?} core_id={} current_core={} affinity=0x{:X} result={:#x}",
-            thread_handle,
-            thread_guard.get_thread_id(),
-            thread_guard.get_state(),
-            thread_guard.get_active_core(),
-            thread_guard.get_current_core(),
-            thread_guard.physical_affinity_mask.get_affinity_mask(),
-            result,
+            thread_handle, tid, state, active_core, current_core, affinity, result,
         );
+        // `RUZU_SVC_TRACE_THREAD=1` — counterpart to zuyu's `StartThread
+        // result` info log so the cross-emulator diff can confirm each
+        // created thread actually receives a StartThread.
+        if std::env::var_os("RUZU_SVC_TRACE_THREAD").is_some() {
+            log::warn!(
+                "[SVC_START_THREAD] tid={} state={:?} core_id={} current_core={} affinity=0x{:X} result={:#x}",
+                tid, state, active_core, current_core, affinity, result,
+            );
+        }
     }
 
     // EXPERIMENT (RUZU_STARTTHREAD_DELAY_US=N): pause the parent for N

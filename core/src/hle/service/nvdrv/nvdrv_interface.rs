@@ -1008,8 +1008,8 @@ fn nvdrv_ioctl_profile_enabled() -> bool {
 }
 
 fn record_nvdrv_ioctl(ioctl_nr: u32, fd: i32, kind: u8, elapsed: std::time::Duration) {
-    let agg = NVDRV_IOCTL_PROFILE
-        .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    let agg =
+        NVDRV_IOCTL_PROFILE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
     let ns = elapsed.as_nanos() as u64;
     let mut g = agg.lock().unwrap();
     let entry = g.entry((ioctl_nr, fd, kind)).or_default();
@@ -1032,7 +1032,8 @@ pub fn dump_nvdrv_ioctl_profile() {
         eprintln!("[NVDRV_IOCTL_PROFILE] no samples (RUZU_PROFILE_NVDRV_IOCTL=1?)");
         return;
     }
-    let mut by_ioctl: std::collections::HashMap<u32, NvdrvIoctlAgg> = std::collections::HashMap::new();
+    let mut by_ioctl: std::collections::HashMap<u32, NvdrvIoctlAgg> =
+        std::collections::HashMap::new();
     for ((nr, _fd, _kind), e) in entries.iter() {
         let merged = by_ioctl.entry(*nr).or_default();
         merged.count += e.count;
