@@ -63,6 +63,27 @@ fn process_stream_callback(
     }
     let queue_after = stream.get_queue_size();
 
+    if std::env::var_os("RUZU_PROFILE_CUBEB_CB").is_some() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::sync::OnceLock;
+        use std::time::Instant;
+        static CALLS: AtomicU64 = AtomicU64::new(0);
+        static FRAMES: AtomicU64 = AtomicU64::new(0);
+        static START: OnceLock<Instant> = OnceLock::new();
+        let start = START.get_or_init(Instant::now);
+        let n = CALLS.fetch_add(1, Ordering::Relaxed) + 1;
+        let f = FRAMES.fetch_add(num_frames as u64, Ordering::Relaxed) + num_frames as u64;
+        if n % 20 == 0 {
+            let elapsed = start.elapsed().as_secs_f64();
+            eprintln!(
+                "[CUBEB_CB] type={:?} calls={} total_frames={} t={:.2}s callback_Hz={:.1} frames_Hz={:.0} queue_before={} queue_after={}",
+                stream_type, n, f, elapsed,
+                n as f64 / elapsed, f as f64 / elapsed,
+                queue_before, queue_after
+            );
+        }
+    }
+
     if should_trace_cubeb_callback() {
         let count = CUBEB_CALLBACK_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
         if count < 32 {
@@ -83,10 +104,17 @@ fn process_stream_callback(
 
 impl CubebSink {
     pub fn new(target_device_name: &str) -> Self {
-        let ctx = match Context::init(Some(c"ruzu"), None) {
+        // RUZU_CUBEB_BACKEND env override — useful to bypass pulse-rust on
+        // pipewire-pulse systems where it oscillates Drained↔Started (see
+        // project_mk8d_audio_pipewire_drain_2026_05_17).
+        let backend_cstring = std::env::var("RUZU_CUBEB_BACKEND")
+            .ok()
+            .and_then(|s| std::ffi::CString::new(s).ok());
+        let backend_name = backend_cstring.as_deref();
+        let ctx = match Context::init(Some(c"ruzu"), backend_name) {
             Ok(ctx) => Some(ctx),
             Err(e) => {
-                error!("cubeb_init failed: {:?}", e);
+                error!("cubeb_init failed (backend={:?}): {:?}", backend_name, e);
                 None
             }
         };
@@ -96,6 +124,8 @@ impl CubebSink {
         let mut device_channels = 2u32;
 
         if let Some(ref ctx) = ctx {
+            info!("cubeb backend_id: {}", ctx.backend_id());
+
             // Query max channel count
             if let Ok(max_channels) = ctx.max_channel_count() {
                 device_channels = if max_channels >= 6 { 6 } else { 2 };

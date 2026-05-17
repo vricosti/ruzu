@@ -210,6 +210,38 @@ impl System {
 
     fn signal_rendered_event(&self) {
         let rendered_event_initialized = self.rendered_event.lock().unwrap().is_initialized();
+        // RUZU_PROFILE_AUDIO_EVENT=1: count fires + skips, log rate every 100 calls.
+        // Measures whether `send_command_to_dsp` reaches this signal often enough
+        // (target ~200 Hz for 5ms audio periods). 50× too low here would explain
+        // the MK8D wedge — see project_mk8d_audio_renderer_rate_2026_05_17.
+        if std::env::var_os("RUZU_PROFILE_AUDIO_EVENT").is_some() {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            use std::sync::OnceLock;
+            use std::time::Instant;
+            static FIRES: AtomicU64 = AtomicU64::new(0);
+            static SKIPS: AtomicU64 = AtomicU64::new(0);
+            static START: OnceLock<Instant> = OnceLock::new();
+            let start = START.get_or_init(Instant::now);
+            if rendered_event_initialized {
+                let n = FIRES.fetch_add(1, Ordering::Relaxed) + 1;
+                if n % 10 == 0 {
+                    let elapsed = start.elapsed().as_secs_f64();
+                    let skips = SKIPS.load(Ordering::Relaxed);
+                    eprintln!(
+                        "[AUDIO_EVENT] fires={} skips={} t={:.2}s rate_fire={:.1}Hz",
+                        n, skips, elapsed, n as f64 / elapsed
+                    );
+                }
+            } else {
+                let n = SKIPS.fetch_add(1, Ordering::Relaxed) + 1;
+                if n % 50 == 0 {
+                    eprintln!(
+                        "[AUDIO_EVENT] skip-only count={} (rendered_event not initialized)",
+                        n
+                    );
+                }
+            }
+        }
         if std::env::var_os("RUZU_TRACE_AUDIO_EVENT").is_some() {
             log::info!(
                 "signal_rendered_event: initialized={} readable_event_present={} session_id={}",

@@ -571,6 +571,24 @@ impl NvdrvService {
             input.len(),
             write_size
         );
+        // `RUZU_TRACE_IOCTL_TID=N` — log each Ioctl1 invocation from tid=N with
+        // the resolved ioctl_nr. Used in Phase-2 zuyu/ruzu diff to identify
+        // which exact nvdrv command MK8D's main thread calls in ruzu but not
+        // in zuyu. One-liner per call; env-gated so default has zero cost.
+        if let Some(filter) = std::env::var_os("RUZU_TRACE_IOCTL_TID") {
+            if let Ok(target_tid) = filter.to_string_lossy().parse::<u64>() {
+                let tid = ctx
+                    .get_thread()
+                    .map(|t| t.lock().unwrap().get_thread_id())
+                    .unwrap_or(0);
+                if tid == target_tid {
+                    log::warn!(
+                        "[IOCTL_TID] tid={} fd={} ioctl=0x{:08X} in_len=0x{:X} out_len=0x{:X}",
+                        tid, fd, command.raw, input.len(), write_size
+                    );
+                }
+            }
+        }
         // Stash the ioctl number into IPC_TRACE_CURRENT so the IPC_REPLY hex-dump
         // can attribute this reply to the specific nvdrv ioctl (not just "cmd=1").
         super::super::hle_ipc::IPC_TRACE_CURRENT.with(|c| {

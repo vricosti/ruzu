@@ -98,14 +98,35 @@ pub fn query_process_memory(
 
     *out_page_info = PageInfo::default();
 
-    log::error!(
-        "QueryMemory(addr=0x{:X}) -> base=0x{:X} size=0x{:X} state={} perm={}",
-        address,
-        svc_mem_info.base_address,
-        svc_mem_info.size,
-        svc_mem_info.state,
-        svc_mem_info.permission
-    );
+    // RUZU_TRACE_QUERY_RET=N (or comma list, or "*"/"all") — log QueryMemory return values
+    // for the matching tid(s). Used to compare against zuyu's equivalent trace and find
+    // why MK8D walks the memory map in ruzu but not zuyu.
+    if let Some(target_str) = std::env::var_os("RUZU_TRACE_QUERY_RET") {
+        let tid = system
+            .current_thread()
+            .and_then(|t| t.lock().ok().map(|g| g.get_thread_id()))
+            .unwrap_or(0);
+        let s = target_str.to_string_lossy();
+        let want = s == "*"
+            || s == "all"
+            || s.split(',')
+                .filter_map(|p| p.trim().parse::<u64>().ok())
+                .any(|t| t == tid);
+        if want {
+            log::info!(
+                "[QUERY_RET] tid={} QueryMemory(addr=0x{:X}) -> base=0x{:X} size=0x{:X} state=0x{:X} attr=0x{:X} perm=0x{:X} ipc={} dev={}",
+                tid,
+                address,
+                svc_mem_info.base_address,
+                svc_mem_info.size,
+                svc_mem_info.state,
+                svc_mem_info.attribute,
+                svc_mem_info.permission,
+                svc_mem_info.ipc_count,
+                svc_mem_info.device_count,
+            );
+        }
+    }
 
     // Write svc_mem_info to user memory at out_memory_info.
     write_memory_info(system, out_memory_info, &svc_mem_info);

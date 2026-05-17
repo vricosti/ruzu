@@ -848,11 +848,15 @@ impl System {
             .get_value();
 
         self.core_timing.set_multicore(self.is_multicore);
-        // In C++: core_timing.Initialize([&system]() { system.RegisterHostThread(); });
-        let system_ref = SystemRef::from_ref(self);
+        // Upstream order: core_timing.Initialize() runs BEFORE kernel.Initialize().
+        // The worker thread spawned here calls register_host_thread() which
+        // allocates tid=1 as a Dummy — matching zuyu's startup ordering.
+        // (Earlier we tried moving this after kernel.initialize() to avoid the
+        //  race, but that placed dummies at tid 13-14 instead of zuyu's 1-2.
+        //  Restoring upstream order — see project_mk8d_thread_id_order_fix.)
+        let system_ref_for_ct = SystemRef::from_ref(self);
         self.core_timing.initialize(move || {
-            // Upstream: core_timing.Initialize([&system]() { system.RegisterHostThread(); });
-            system_ref.get().register_host_thread();
+            system_ref_for_ct.get().register_host_thread();
         });
 
         // Ensure VFS exists. Upstream does this in Initialize().

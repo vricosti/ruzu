@@ -28,6 +28,45 @@ pub fn get_info(
         handle
     );
 
+    let rc = get_info_impl(system, result, info_id_type, handle, info_sub_id);
+
+    // RUZU_TRACE_QUERY_RET=N (or comma list, or "*"/"all") — log GetInfo return values
+    // for the matching tid(s). Same env var as QueryMemory so we get a unified return-value
+    // log against the zuyu side.
+    if let Some(target_str) = std::env::var_os("RUZU_TRACE_QUERY_RET") {
+        let tid = system
+            .current_thread()
+            .and_then(|t| t.lock().ok().map(|g| g.get_thread_id()))
+            .unwrap_or(0);
+        let s = target_str.to_string_lossy();
+        let want = s == "*"
+            || s == "all"
+            || s.split(',')
+                .filter_map(|p| p.trim().parse::<u64>().ok())
+                .any(|t| t == tid);
+        if want {
+            log::info!(
+                "[QUERY_RET] tid={} GetInfo(id={:?}, handle=0x{:08X}, sub=0x{:X}) -> rc=0x{:X} result=0x{:X}",
+                tid,
+                info_id_type,
+                handle,
+                info_sub_id,
+                rc.0,
+                *result,
+            );
+        }
+    }
+
+    rc
+}
+
+fn get_info_impl(
+    system: &System,
+    result: &mut u64,
+    info_id_type: InfoType,
+    handle: Handle,
+    info_sub_id: u64,
+) -> ResultCode {
     match info_id_type {
         InfoType::CoreMask
         | InfoType::PriorityMask
