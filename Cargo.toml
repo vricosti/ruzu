@@ -80,3 +80,26 @@ context = "3.0"
 
 [profile.release]
 debug = 1
+
+# Opt-in profile for shipped / benchmarked binaries. Same three knobs as
+# rdynarmic's release profile (commit f2a4cb8): cross-crate inlining so
+# rxbyak's emit primitives flatten through rdynarmic's emit_* handlers, a
+# single codegen unit for whole-crate optimization, and panic=abort to drop
+# unwind tables from the hot JIT path.
+#
+# Build with:
+#   cargo build --profile release-lto --bin ruzu-cmd
+#
+# Cost: full ruzu-cmd build climbs from ~35 s → several minutes (LTO links
+# the whole transitive graph). Default `cargo build --release` is unchanged
+# so daily dev loops are unaffected.
+#
+# Caveat: `panic = "abort"` skips unwinding. Any `catch_unwind` /
+# `thread::join` paths that today recover from a worker panic will instead
+# see the whole process abort. Re-check audio_core/GPU workers before
+# shipping binaries built with this profile.
+[profile.release-lto]
+inherits = "release"
+lto = "fat"
+codegen-units = 1
+panic = "abort"
