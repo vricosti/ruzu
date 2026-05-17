@@ -198,11 +198,24 @@ impl Sink for CubebSink {
             .layout(layout)
             .take();
 
-        let minimum_latency = match ctx.min_latency(&params) {
-            Ok(latency) => latency.max(TARGET_SAMPLE_COUNT * 2),
-            Err(e) => {
-                error!("Error getting minimum latency: {:?}", e);
-                TARGET_SAMPLE_COUNT * 2
+        // RUZU_AUDIO_LATENCY_FRAMES=N — override the cubeb-reported minimum
+        // latency at runtime. Useful for diagnosing the audio-event-rate
+        // collapse on PipeWire-pulse hosts where cubeb's C pulse backend
+        // reports 1200 frames (25 ms ≈ 40 Hz callback) which throttles the
+        // audio renderer to ~65 Hz, ~3x below the ~200 Hz target. Default
+        // behavior matches upstream (no clamp below what cubeb says).
+        let env_latency = std::env::var("RUZU_AUDIO_LATENCY_FRAMES")
+            .ok()
+            .and_then(|s| s.parse::<u32>().ok());
+        let minimum_latency = if let Some(v) = env_latency {
+            v
+        } else {
+            match ctx.min_latency(&params) {
+                Ok(latency) => latency.max(TARGET_SAMPLE_COUNT * 2),
+                Err(e) => {
+                    error!("Error getting minimum latency: {:?}", e);
+                    TARGET_SAMPLE_COUNT * 2
+                }
             }
         };
 
@@ -215,8 +228,38 @@ impl Sink for CubebSink {
         let device_channels = self.device_channels;
         let st = stream_type;
 
+        // cubeb-rs's `StreamBuilder<F>` treats `F` as a FRAME type, not a
+        // sample type. Its internal `data_cb_c` slices the raw output buffer
+        // as `nframes` elements of size `sizeof(F)`. With `F = i16` for a
+        // stereo stream we only see/fill half the bytes cubeb actually
+        // allocated, return `nframes/channels` to cubeb, and produce audio
+        // at `1/channels` of real-time — observed as ~65 Hz audio-event rate
+        // instead of zuyu's ~200 Hz on this host. (See
+        // project_mk8d_real_cause_cubeb_backend_2026_05_17.)
+        //
+        // Fix: extend the slice from `nframes` elements to the real
+        // `nframes * device_channels` elements via raw pointer reslice. This
+        // requires no F-type change because the underlying pointer is the
+        // same; we're just correcting the slice length cubeb-rs got wrong
+        // for any non-mono stream.
         let data_callback = move |input: &[i16], output: &mut [i16]| -> isize {
-            process_stream_callback(&stream_handle, st, device_channels, input, output)
+            let chans = device_channels as usize;
+            // cubeb-rs gave us `nframes`-long slices; cubeb's real
+            // allocation is `nframes * chans` samples. Re-slice to the
+            // correct length.
+            let in_full: &[i16] = if input.is_empty() {
+                &[]
+            } else {
+                unsafe { std::slice::from_raw_parts(input.as_ptr(), input.len() * chans) }
+            };
+            let out_full: &mut [i16] = if output.is_empty() {
+                &mut []
+            } else {
+                unsafe {
+                    std::slice::from_raw_parts_mut(output.as_mut_ptr(), output.len() * chans)
+                }
+            };
+            process_stream_callback(&stream_handle, st, device_channels, in_full, out_full)
         };
 
         let callback_name = name.to_string();
