@@ -1379,6 +1379,9 @@ impl KernelCore {
         let thread = Arc::new(KThreadLock::new(super::k_thread::KThread::new()));
         let thread_id = self.create_new_thread_id();
         let object_id = self.create_new_object_id() as u64;
+        if std::env::var_os("RUZU_TRACE_THREAD_ID").is_some() {
+            log::info!("[THREAD_ID_NAME] tid={} name=service:{}", thread_id, name);
+        }
 
         // Give the process a scheduler reference for the target core.
         // Upstream: service threads run on core 3, so use core 3's scheduler.
@@ -1440,6 +1443,34 @@ impl KernelCore {
                 name, thread_id, SERVICE_THREAD_CORE, SERVICE_THREAD_PRIORITY, front
             );
         }
+
+        // Match zuyu: just after spawning the FIRST TWO guest services (sm and
+        // account), zuyu also allocates a Dummy thread per service. This comes
+        // from host service threads (audio/nvservices/etc.) that were spawned
+        // earlier finally getting OS-scheduled and registering child host
+        // threads. The 2 extras land at zuyu tids 24 and 26. Without these,
+        // ruzu's MK8D main thread is +2 lower than zuyu's.
+        // Allocate matching dummies for the first 2 services only.
+        let is_sm_or_account = name == "sm" || name == "account";
+        if is_sm_or_account {
+            let dummy = Arc::new(KThreadLock::new(super::k_thread::KThread::new()));
+            let dummy_tid = self.create_new_thread_id();
+            let dummy_oid = self.create_new_object_id() as u64;
+            {
+                let mut g = dummy.lock().unwrap();
+                let rc = g.initialize_dummy_thread(Some(&process), dummy_tid, dummy_oid);
+                assert_eq!(rc, crate::hle::result::RESULT_SUCCESS.get_inner_value());
+                g.bind_self_reference(&dummy);
+            }
+            process
+                .lock()
+                .unwrap()
+                .register_thread_object(Arc::clone(&dummy));
+            log::info!(
+                "[THREAD_ID_NAME] tid={} name=process_dummy:{}",
+                dummy_tid, name
+            );
+        }
     }
 
     /// Run a service function on a host thread with a dummy KThread for tracking.
@@ -1464,6 +1495,9 @@ impl KernelCore {
         {
             let thread_id = self.create_new_thread_id();
             let object_id = self.create_new_object_id() as u64;
+            if std::env::var_os("RUZU_TRACE_THREAD_ID").is_some() {
+                log::info!("[THREAD_ID_NAME] tid={} name=host:{}", thread_id, thread_name);
+            }
             let mut thread_guard = thread.lock().unwrap();
             let rc = thread_guard.initialize_dummy_thread(Some(process), thread_id, object_id);
             assert_eq!(rc, crate::hle::result::RESULT_SUCCESS.get_inner_value());
@@ -2141,8 +2175,21 @@ impl KernelCore {
     }
 
     /// Create a new thread ID.
+    #[track_caller]
     pub fn create_new_thread_id(&self) -> u64 {
-        self.next_thread_id.fetch_add(1, Ordering::Relaxed)
+        let id = self.next_thread_id.fetch_add(1, Ordering::Relaxed);
+        // RUZU_TRACE_THREAD_ID=1 — log every thread id allocation with caller
+        // location. Used to find why ruzu's MK8D main thread gets tid=73 vs
+        // zuyu's tid=75 (delta +2). See project_mk8d_ruzu_det_wedge_vs_zuyu_2026_05_17.
+        if std::env::var_os("RUZU_TRACE_THREAD_ID").is_some() {
+            let caller = std::panic::Location::caller();
+            let bt = std::backtrace::Backtrace::force_capture();
+            log::info!(
+                "[THREAD_ID] alloc tid={} caller={}:{}\nBacktrace:\n{}",
+                id, caller.file(), caller.line(), bt
+            );
+        }
+        id
     }
 
     /// Get the memory manager.

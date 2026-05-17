@@ -427,6 +427,11 @@ impl Services {
         });
 
         log::info!("Services: all service processes launched");
+        // Signal that all initial services have been spawned. The bsdsocket
+        // host thread waits on this flag before calling start_additional_host_threads,
+        // so its 2 extra dummy threads get tids AFTER all service init — matching
+        // zuyu's startup order (project_mk8d_thread_id_order_fix_2026_05_17).
+        SERVICES_INIT_DONE.store(true, std::sync::atomic::Ordering::Release);
         Self {}
     }
 
@@ -708,6 +713,13 @@ impl Drop for Services {
     /// Matches upstream `Services::~Services() = default`.
     fn drop(&mut self) {}
 }
+
+/// Flag signaled by `Services::new` after all initial host+guest services are
+/// spawned. Used by `sockets::loop_process` to defer
+/// `start_additional_host_threads` until all other services are launched,
+/// matching zuyu's thread-id allocation order.
+pub static SERVICES_INIT_DONE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 /// Registers stub services on a ServerManager.
 ///

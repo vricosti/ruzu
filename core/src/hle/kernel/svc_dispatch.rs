@@ -2034,6 +2034,36 @@ pub fn call(system: &System, imm: u32, is_64bit: bool, args: &mut SvcArgs) {
         }
     }
 
+    // RUZU_TRACE_TID_SVC_RET=N (or comma list, or *) — log SVC RETURN values
+    // (the dispatch_args after handler completion) for matching tid(s).
+    // Pairs with RUZU_TRACE_TID_SVC (which logs ENTRY args). Diffing both
+    // sides between ruzu and zuyu localizes the bug per
+    // project_mk8d_ruzu_det_wedge_vs_zuyu_2026_05_17.
+    if let Some(target_str) = std::env::var_os("RUZU_TRACE_TID_SVC_RET") {
+        let tid_ret = system
+            .current_thread()
+            .and_then(|t| t.lock().ok().map(|g| g.get_thread_id()))
+            .unwrap_or(0);
+        let s = target_str.to_string_lossy();
+        let want = s == "*"
+            || s == "all"
+            || s.split(',')
+                .filter_map(|p| p.trim().parse::<u64>().ok())
+                .any(|t| t == tid_ret);
+        if want {
+            // Use raw hex for SVC id to match zuyu's symmetric trace format.
+            log::info!(
+                "[TID_SVC_RET] tid={} svc=0x{:02X} ret=[0x{:X}, 0x{:X}, 0x{:X}, 0x{:X}]",
+                tid_ret,
+                imm,
+                dispatch_args[0],
+                dispatch_args[1],
+                dispatch_args[2],
+                dispatch_args[3],
+            );
+        }
+    }
+
     if let Some(kernel) = system.kernel() {
         if let Some(process_arc) = system.current_process_arc.as_ref().cloned() {
             let mut process = process_arc.lock().unwrap();

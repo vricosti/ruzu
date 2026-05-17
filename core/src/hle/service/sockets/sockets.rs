@@ -207,6 +207,17 @@ pub fn loop_process(system: crate::core::SystemRef) {
         16,
     );
 
+    // Wait for the main thread to finish spawning all initial services before
+    // calling start_additional_host_threads. Without this gate, ruzu's
+    // bsdsocket host thread can race ahead and allocate its 2 dummy tids
+    // between host services and sm — placing them at tid 23/25 instead of
+    // 73/74 (matching zuyu's order). See project_mk8d_thread_id_order_fix.
+    while !crate::hle::service::services::SERVICES_INIT_DONE
+        .load(std::sync::atomic::Ordering::Acquire)
+    {
+        std::thread::yield_now();
+    }
+
     server_manager.start_additional_host_threads("bsdsocket", 2);
 
     ServerManager::run_server(server_manager);
