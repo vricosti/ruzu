@@ -435,8 +435,8 @@ static IPC_PHASE_PROFILE: std::sync::OnceLock<
 > = std::sync::OnceLock::new();
 
 pub(crate) fn record_ipc_phase(label: &'static str, elapsed: std::time::Duration) {
-    let map = IPC_PHASE_PROFILE
-        .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    let map =
+        IPC_PHASE_PROFILE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
     let ns = elapsed.as_nanos() as u64;
     let mut guard = map.lock().unwrap();
     let entry = guard.entry(label).or_default();

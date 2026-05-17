@@ -15633,3 +15633,41 @@
 
 ### Binary layout verification
 - N/A: GLSL text emission only; no guest-visible raw struct or serialized payload layout changed.
+
+## 2026-05-16 — `video_core/src/renderer_opengl/gl_rasterizer.rs` and `video_core/src/shader_cache.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_rasterizer.cpp` and `/home/vricosti/Dev/emulators/zuyu/src/video_core/shader_cache.{h,cpp}`
+
+### Intentional differences
+- Rust still takes per-cache mutexes through raw pointers because `buffer_cache.mutex`, `texture_cache.base.mutex`, and `ShaderCache` mutexes are fields inside the object being mutably accessed. This preserves upstream scoped-lock ownership while working around Rust borrow-checker aliasing in the current raw-rasterizer-pointer design.
+- `RasterizerOpenGL::draw` keeps shader-cache lookup and lazy GL program materialization outside the buffer/texture cache lock. This matches upstream `PrepareDraw`, where `CurrentGraphicsPipeline()` runs before `std::scoped_lock lock{buffer_cache.mutex, texture_cache.mutex}`. The current Rust lazy-build step is also left outside that lock to avoid covering Rust-only compilation/linkage work that upstream does not hold under these cache locks.
+- Rust uses `parking_lot::Mutex` for `ShaderCache::{lookup_mutex,invalidation_mutex}` instead of `std::mutex`. This is a Rust synchronization primitive adaptation; ownership and lock ordering match upstream.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `RasterizerOpenGL::flush_region`, `invalidate_region`, `unmap_memory`, and `tick_frame` mutated texture/buffer caches without the scoped locks used by upstream. Rust now locks texture and buffer caches in the same per-method order as `gl_rasterizer.cpp`.
+- Fixed in this pass: `RasterizerOpenGL::draw` previously left the main configure/cache-sync/draw body without the upstream `buffer_cache.mutex + texture_cache.mutex` scoped lock. Rust now takes both locks after pipeline lookup/build and keeps them through the draw body.
+- Fixed in this pass: `ShaderCache::{InvalidateRegion,OnCacheInvalidation,SyncGuestHost,Register}` did not take the upstream `invalidation_mutex` / `lookup_mutex` locks. The old Rust comment claimed `&mut self` was sufficient, but this object is reachable through raw rasterizer pointers from multiple CPU emulation threads. Rust now mirrors upstream locking around invalidation and registration.
+- Fixed in this pass: `ShaderCache::RemovePendingShaders` removed entries from `lookup_cache` without `lookup_mutex`. Rust now locks `lookup_mutex` while removing pending entries, matching upstream.
+- Fixed in this pass: `ShaderCache::InvalidatePagesInRegion` removed the page vector from `invalidation_cache` before calling `InvalidatePageEntries`. Upstream passes the stored vector in place, and `InvalidatePageEntries` relies on `RemoveEntryFromInvalidationCache` erasing from that same vector before continuing at the same index. Rust now keeps the vector in place and preserves empty per-page vectors like upstream.
+
+### Missing items
+- `RasterizerOpenGL::clear` still only partially mirrors upstream locking/state order; upstream locks `texture_cache.mutex` around `UpdateRenderTargets(true)` and framebuffer binding, not a broad buffer+texture lock.
+- Several channel/DMA helper paths still need a lock-by-lock audit against `gl_rasterizer.cpp`, especially channel lifecycle, `AccelerateDMA`, and any remaining helper that touches buffer/texture caches outside the main draw/cache-management paths.
+- The current raw-pointer rasterizer access in `Gpu::on_cpu_write` remains a structural risk. Long term, mirror upstream ownership more closely with a synchronized rasterizer/cache access model rather than relying on per-method raw-pointer locking.
+
+### Binary layout verification
+- N/A: host-side OpenGL/cache synchronization only; no guest-visible raw struct or serialized payload layout changed.
+
+## 2026-05-16 — `audio_core/src/audio_core.rs` and `audio_core/src/adsp/apps/audio_renderer/command_list_processor.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/hle/service/audio/audio_renderer_manager.cpp`, `/home/vricosti/Dev/emulators/zuyu/src/audio_core/renderer/system.cpp`, and `/home/vricosti/Dev/emulators/zuyu/src/audio_core/adsp/apps/audio_renderer/command_list_processor.cpp`
+
+### Intentional differences
+- Rust still uses the global `GUEST_MEMORY_ACCESSOR` bridge for decode-path guest-memory reads instead of plumbing `Core::Memory::Memory&` through every audio renderer command helper. This is existing Rust architecture debt; the source of the accessor now matches upstream ownership by coming from the `KProcess` passed to `OpenAudioRenderer` / `CommandListProcessor::Initialize`.
+- `CommandListProcessor::memory` remains an opaque `MemoryHandle` placeholder because the full upstream `Core::Memory::Memory*` ownership is not yet represented in this Rust struct.
+
+### Unintentional differences (to fix)
+- Fixed in this pass: `AudioCore::open_audio_renderer` initialized the decode memory accessor from `System::memory_shared()`, which can be `None` during applet/process startup. Upstream carries `Kernel::KProcess* process_handle` and later reads `process.GetMemory()`. Rust now initializes from the `process` argument directly.
+- Fixed in this pass: `CommandListProcessor::initialize` also fell back to `system.memory_shared()` instead of the `process` argument. Rust now mirrors upstream `memory = &process.GetMemory()` for the global decode accessor initialization.
+
+### Missing items
+- Full upstream memory ownership in `CommandListProcessor` is still missing; the current global accessor should eventually be replaced by a real per-processor/per-session memory reference.
+
+### Binary layout verification
+- N/A: host-side audio memory accessor wiring only; no serialized audio command layout changed.

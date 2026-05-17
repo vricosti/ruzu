@@ -59,7 +59,10 @@ fn should_trace_kcv_wake() -> bool {
 fn cv_key_trace_target() -> Option<u64> {
     let raw = std::env::var("RUZU_TRACE_CV_KEY").ok()?;
     let trimmed = raw.trim();
-    let trimmed = trimmed.strip_prefix("0x").or_else(|| trimmed.strip_prefix("0X")).unwrap_or(trimmed);
+    let trimmed = trimmed
+        .strip_prefix("0x")
+        .or_else(|| trimmed.strip_prefix("0X"))
+        .unwrap_or(trimmed);
     u64::from_str_radix(trimmed, 16).ok()
 }
 
@@ -624,7 +627,9 @@ impl KConditionVariable {
                 let woke_state = waiting_thread.lock().unwrap().get_state();
                 log::info!(
                     "[CV_KEY_TRACE] signal_impl_done cv_key=0x{:X} waiter_tid={} new_state={:?}",
-                    cv_key, waiting_thread_id, woke_state
+                    cv_key,
+                    waiting_thread_id,
+                    woke_state
                 );
             }
             let (issuer_tid, issuer_core) = current_trace_owner();

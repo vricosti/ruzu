@@ -228,7 +228,8 @@ impl SurfaceFlinger {
         let Some(display) = Self::find_display_mut(&mut inner.displays, display_id) else {
             log::info!(
                 "[SF_REMOVE_LAYER] NO_DISPLAY display_id={} consumer_id={}",
-                display_id, consumer_binder_id
+                display_id,
+                consumer_binder_id
             );
             return;
         };

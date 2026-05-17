@@ -1268,6 +1268,21 @@ impl RasterizerInterface for RasterizerOpenGL {
         let is_indexed = draw_state.draw_indexed;
         let pipeline_has_programs = pipeline.has_gl_programs();
         let step = Instant::now();
+        // Mirrors upstream `RasterizerOpenGL::PrepareDraw`
+        // (gl_rasterizer.cpp:248): after pipeline lookup/build, hold
+        // buffer_cache.mutex + texture_cache.mutex through pipeline
+        // configuration, cache synchronization, and the draw call. Do not move
+        // this above shader-cache lookup/build; upstream does not hold these
+        // cache locks while finding the graphics pipeline.
+        let _buffer_mutex_guard;
+        let _texture_mutex_guard;
+        unsafe {
+            let buffer_mutex: *const _ = &self.buffer_cache.mutex;
+            _buffer_mutex_guard = (*buffer_mutex).lock();
+            let texture_mutex: *const _ = &self.texture_cache.base.mutex;
+            _texture_mutex_guard = (*texture_mutex).lock();
+        }
+
         // Mirrors upstream `GraphicsPipeline::ConfigureImpl`
         // (gl_graphics_pipeline.cpp:278-284): the very first thing the
         // pipeline configure does is `texture_cache.SynchronizeGraphicsDescriptors`
@@ -3077,8 +3092,16 @@ impl RasterizerInterface for RasterizerOpenGL {
         if addr == 0 || size == 0 {
             return;
         }
-        self.texture_cache.download_memory(addr, size as usize);
-        self.buffer_cache.download_memory(addr, size);
+        unsafe {
+            let texture_mutex: *const _ = &self.texture_cache.base.mutex;
+            let _texture_guard = (*texture_mutex).lock();
+            self.texture_cache.download_memory(addr, size as usize);
+        }
+        unsafe {
+            let buffer_mutex: *const _ = &self.buffer_cache.mutex;
+            let _buffer_guard = (*buffer_mutex).lock();
+            self.buffer_cache.download_memory(addr, size);
+        }
         self.query_cache
             .set_commands_queued(self.num_queued_commands != 0);
         self.query_cache.flush_region(addr, size as usize);
@@ -3104,8 +3127,16 @@ impl RasterizerInterface for RasterizerOpenGL {
         if addr == 0 || size == 0 {
             return;
         }
-        self.texture_cache.write_memory(addr, size as usize);
-        self.buffer_cache.write_memory(addr, size);
+        unsafe {
+            let texture_mutex: *const _ = &self.texture_cache.base.mutex;
+            let _texture_guard = (*texture_mutex).lock();
+            self.texture_cache.write_memory(addr, size as usize);
+        }
+        unsafe {
+            let buffer_mutex: *const _ = &self.buffer_cache.mutex;
+            let _buffer_guard = (*buffer_mutex).lock();
+            self.buffer_cache.write_memory(addr, size);
+        }
         self.shader_cache.invalidate_region(addr, size as usize);
         self.query_cache
             .set_commands_queued(self.num_queued_commands != 0);
@@ -3180,8 +3211,16 @@ impl RasterizerInterface for RasterizerOpenGL {
         if addr == 0 || size == 0 {
             return;
         }
-        self.texture_cache.unmap_memory(addr, size as usize);
-        self.buffer_cache.write_memory(addr, size);
+        unsafe {
+            let texture_mutex: *const _ = &self.texture_cache.base.mutex;
+            let _texture_guard = (*texture_mutex).lock();
+            self.texture_cache.unmap_memory(addr, size as usize);
+        }
+        unsafe {
+            let buffer_mutex: *const _ = &self.buffer_cache.mutex;
+            let _buffer_guard = (*buffer_mutex).lock();
+            self.buffer_cache.write_memory(addr, size);
+        }
         self.shader_cache.on_cache_invalidation(addr, size as usize);
     }
 
@@ -3228,8 +3267,16 @@ impl RasterizerInterface for RasterizerOpenGL {
         self.frame_count += 1;
         self.num_queued_commands = 0;
         self.fence_manager.tick_frame();
-        self.texture_cache.tick_frame();
-        self.buffer_cache.tick_frame();
+        unsafe {
+            let texture_mutex: *const _ = &self.texture_cache.base.mutex;
+            let _texture_guard = (*texture_mutex).lock();
+            self.texture_cache.tick_frame();
+        }
+        unsafe {
+            let buffer_mutex: *const _ = &self.buffer_cache.mutex;
+            let _buffer_guard = (*buffer_mutex).lock();
+            self.buffer_cache.tick_frame();
+        }
     }
 
     fn accelerate_surface_copy(
