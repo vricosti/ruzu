@@ -81,25 +81,30 @@ context = "3.0"
 [profile.release]
 debug = 1
 
-# Opt-in profile for shipped / benchmarked binaries. Same three knobs as
-# rdynarmic's release profile (commit f2a4cb8): cross-crate inlining so
-# rxbyak's emit primitives flatten through rdynarmic's emit_* handlers, a
-# single codegen unit for whole-crate optimization, and panic=abort to drop
-# unwind tables from the hot JIT path.
+# Opt-in profile for shipped / benchmarked binaries. Two knobs that match
+# the corresponding rdynarmic release profile (commit f2a4cb8) MINUS the
+# `lto` setting — see note below.
 #
 # Build with:
 #   cargo build --profile release-lto --bin ruzu-cmd
 #
-# Cost: full ruzu-cmd build climbs from ~35 s → several minutes (LTO links
-# the whole transitive graph). Default `cargo build --release` is unchanged
-# so daily dev loops are unaffected.
-#
-# Caveat: `panic = "abort"` skips unwinding. Any `catch_unwind` /
-# `thread::join` paths that today recover from a worker panic will instead
-# see the whole process abort. Re-check audio_core/GPU workers before
-# shipping binaries built with this profile.
+# Caveats:
+# - `panic = "abort"` skips unwinding. Any `catch_unwind` / `thread::join`
+#   paths that today recover from a worker panic will instead see the whole
+#   process abort. Re-check audio_core / GPU workers before shipping
+#   binaries built with this profile.
+# - LTO disabled: both `lto = "fat"` and `lto = "thin"` fail at the final
+#   ruzu-cmd link with `failed to get bitcode from object file for LTO
+#   (Can't find section .llvmbc)`. One of ruzu's C-linked transitive deps
+#   (openssl-sys / ring / cubeb-sys / gl bindings via cc-rs?) ships a
+#   static `.a` archive without embedded LLVM bitcode, which trips the LTO
+#   linker. Fixing this would require identifying the offending crate and
+#   either (a) adding `[profile.release-lto.package."NAME"] codegen-units
+#   = 1` overrides to recompile its Rust glue, or (b) patching its
+#   build.rs to pass `-fembed-bitcode` to its cc invocation. Until then,
+#   ship without LTO — the CGU=1 + panic=abort pair still cuts unwind
+#   tables and gives LLVM whole-crate visibility for the Rust portions.
 [profile.release-lto]
 inherits = "release"
-lto = "fat"
 codegen-units = 1
 panic = "abort"
