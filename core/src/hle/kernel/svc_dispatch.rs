@@ -1873,6 +1873,20 @@ pub fn call(system: &System, imm: u32, is_64bit: bool, args: &mut SvcArgs) {
                 );
             }
         }
+        // RUZU_PROFILE_STARTTHREAD_GAP: log the elapsed time from
+        // svc::StartThread (parent) to the child's first SVC. Measures
+        // JIT-startup latency for the MK8D wedge investigation.
+        if std::env::var_os("RUZU_PROFILE_STARTTHREAD_GAP").is_some() {
+            if let Some(us) = super::startthread_gap::take_elapsed_us(tid) {
+                let name = SvcId::from_u32(imm)
+                    .map(|id| format!("{:?}", id))
+                    .unwrap_or_else(|| format!("svc#0x{:02X}", imm));
+                log::warn!(
+                    "[STARTTHREAD_GAP] child_tid={} first_svc={} gap_us={}",
+                    tid, name, us
+                );
+            }
+        }
         if core_id < hardware_properties::NUM_CPU_CORES as usize {
             super::kernel::mark_svc_enter(core_id, tid, imm);
             core_id

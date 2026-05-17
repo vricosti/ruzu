@@ -374,6 +374,17 @@ pub fn start_thread(system: &System, thread_handle: Handle) -> ResultCode {
         return RESULT_INVALID_HANDLE;
     };
 
+    // RUZU_PROFILE_STARTTHREAD_GAP=1 — record StartThread timestamp keyed by
+    // child tid. Pairs with svc_dispatch.rs:first-SVC log to measure the JIT
+    // startup gap (parent unlocks faster than child contends → no WAIT_MASK
+    // → missing svcArbitrateUnlock at SVC #745, see
+    // project_mk8d_thread_id_order_fix_2026_05_17).
+    if std::env::var_os("RUZU_PROFILE_STARTTHREAD_GAP").is_some() {
+        let child_tid = thread.lock().unwrap().get_thread_id();
+        let now_ns = std::time::Instant::now();
+        crate::hle::kernel::startthread_gap::set_start(child_tid, now_ns);
+    }
+
     let result = KThread::run_thread(&thread);
     {
         let thread_guard = thread.lock().unwrap();
