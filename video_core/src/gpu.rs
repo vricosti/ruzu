@@ -383,8 +383,20 @@ impl Gpu {
 
     /// Write guest memory at the given CPU/device address.
     pub fn write_guest_memory(&self, addr: u64, data: &[u8]) {
+        // Cache env-var lookups behind OnceLock — `write_guest_memory` runs
+        // on the GPU hot path; before this fix `getenv` showed 7%+ CPU.
+        fn trace_guest_write() -> bool {
+            use std::sync::OnceLock;
+            static CACHED: OnceLock<bool> = OnceLock::new();
+            *CACHED.get_or_init(|| std::env::var_os("RUZU_TRACE_GUEST_WRITE").is_some())
+        }
+        fn trace_guest_write_40037000() -> bool {
+            use std::sync::OnceLock;
+            static CACHED: OnceLock<bool> = OnceLock::new();
+            *CACHED.get_or_init(|| std::env::var_os("RUZU_TRACE_GUEST_WRITE_40037000").is_some())
+        }
         let Some(writer) = self.guest_memory_writer.lock().unwrap().clone() else {
-            if std::env::var_os("RUZU_TRACE_GUEST_WRITE").is_some() {
+            if trace_guest_write() {
                 log::info!(
                     "GPU_WRITE DROPPED addr=0x{:X} size={} (no writer set)",
                     addr,
@@ -393,7 +405,7 @@ impl Gpu {
             }
             return;
         };
-        if std::env::var_os("RUZU_TRACE_GUEST_WRITE").is_some() {
+        if trace_guest_write() {
             let head: Vec<String> = data.iter().take(16).map(|b| format!("{:02x}", b)).collect();
             log::info!(
                 "GPU_WRITE addr=0x{:X} size={} head={}",
@@ -402,7 +414,7 @@ impl Gpu {
                 head.join("")
             );
         }
-        if std::env::var_os("RUZU_TRACE_GUEST_WRITE_40037000").is_some()
+        if trace_guest_write_40037000()
             && addr <= 0x4003_7000
             && addr.saturating_add(data.len() as u64) > 0x4003_7000
         {

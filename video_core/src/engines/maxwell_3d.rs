@@ -38,7 +38,9 @@ unsafe impl Send for Maxwell3DPtr {}
 static MAXWELL3D_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
 
 fn should_trace_dma_flow() -> bool {
-    std::env::var_os("RUZU_TRACE_DMA_FLOW").is_some()
+    use std::sync::OnceLock;
+    static CACHED: OnceLock<bool> = OnceLock::new();
+    *CACHED.get_or_init(|| std::env::var_os("RUZU_TRACE_DMA_FLOW").is_some())
 }
 
 impl Maxwell3DPtr {

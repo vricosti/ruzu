@@ -1975,7 +1975,16 @@ pub fn call(system: &System, imm: u32, is_64bit: bool, args: &mut SvcArgs) {
         // it to compute relative timing between SVCs across threads when
         // analyzing parent/worker dispatch races (see
         // project_mk8d_jit_not_the_problem_2026_05_17).
-        if let Some(target_str) = std::env::var_os("RUZU_TRACE_TID_SVC") {
+        // Cache the env-var lookup. Cost was visible in perf samples on the
+        // SVC dispatch hot path.
+        fn trace_tid_svc_env() -> Option<&'static std::ffi::OsString> {
+            use std::sync::OnceLock;
+            static CACHED: OnceLock<Option<std::ffi::OsString>> = OnceLock::new();
+            CACHED
+                .get_or_init(|| std::env::var_os("RUZU_TRACE_TID_SVC"))
+                .as_ref()
+        }
+        if let Some(target_str) = trace_tid_svc_env() {
             let target_str = target_str.to_string_lossy();
             let want = target_str == "*"
                 || target_str == "all"
@@ -2110,8 +2119,21 @@ pub fn call(system: &System, imm: u32, is_64bit: bool, args: &mut SvcArgs) {
         gap_on_svc_entry(tid as u64);
     }
 
-    let profile_svc = std::env::var_os("RUZU_PROFILE_SVC").is_some();
-    let profile_svc_per_tid = std::env::var_os("RUZU_PROFILE_SVC_PER_TID").is_some();
+    // Cache env-var lookups behind OnceLock — profile showed getenv at 7%+
+    // of CPU when the SVC dispatch hot path re-reads on every call. Mirrors
+    // the same pattern in rdynarmic's emit::emit_block (RDYNARMIC_PROFILE_OPCODES).
+    fn profile_svc_enabled() -> bool {
+        use std::sync::OnceLock;
+        static CACHED: OnceLock<bool> = OnceLock::new();
+        *CACHED.get_or_init(|| std::env::var_os("RUZU_PROFILE_SVC").is_some())
+    }
+    fn profile_svc_per_tid_enabled() -> bool {
+        use std::sync::OnceLock;
+        static CACHED: OnceLock<bool> = OnceLock::new();
+        *CACHED.get_or_init(|| std::env::var_os("RUZU_PROFILE_SVC_PER_TID").is_some())
+    }
+    let profile_svc = profile_svc_enabled();
+    let profile_svc_per_tid = profile_svc_per_tid_enabled();
     let svc_start = if profile_svc || profile_svc_per_tid {
         Some(std::time::Instant::now())
     } else {

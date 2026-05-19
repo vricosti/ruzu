@@ -22,7 +22,18 @@ static DMA_FLOW_DISPATCH_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
 static COMMAND_WORDS_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
 
 fn should_trace_dma_flow() -> bool {
-    std::env::var_os("RUZU_TRACE_DMA_FLOW").is_some()
+    static CACHED: OnceLock<bool> = OnceLock::new();
+    *CACHED.get_or_init(|| std::env::var_os("RUZU_TRACE_DMA_FLOW").is_some())
+}
+
+fn should_trace_puller() -> bool {
+    static CACHED: OnceLock<bool> = OnceLock::new();
+    *CACHED.get_or_init(|| std::env::var_os("RUZU_TRACE_PULLER").is_some())
+}
+
+fn should_trace_dma_count() -> bool {
+    static CACHED: OnceLock<bool> = OnceLock::new();
+    *CACHED.get_or_init(|| std::env::var_os("RUZU_TRACE_DMA_COUNT").is_some())
 }
 
 fn command_words_trace_limit() -> Option<u32> {
@@ -772,7 +783,7 @@ impl DmaPusher {
             }
             index += 1;
         }
-        if std::env::var_os("RUZU_TRACE_DMA_COUNT").is_some() {
+        if should_trace_dma_count() {
             log::info!(
                 "DmaPusher::process_commands DONE headers={} dispatches={}",
                 commands.len(),
@@ -860,7 +871,7 @@ impl DmaPusher {
     /// Dispatch a single method call to an engine. Matches upstream
     /// `DmaPusher::CallMethod`.
     fn dispatch_method(&mut self, argument: u32) {
-        if std::env::var_os("RUZU_TRACE_PULLER").is_some() {
+        if should_trace_puller() {
             eprintln!(
                 "[PULL] m=0x{:X} arg=0x{:08X} subch={} count={}",
                 self.dma_state.method,
