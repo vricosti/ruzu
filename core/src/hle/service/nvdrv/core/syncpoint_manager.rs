@@ -5,7 +5,7 @@
 //! Port of zuyu/src/core/hle/service/nvdrv/core/syncpoint_manager.h
 //! Port of zuyu/src/core/hle/service/nvdrv/core/syncpoint_manager.cpp
 
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Mutex;
 
 use crate::core::SystemRef;
@@ -40,8 +40,8 @@ const SYNCPOINT_COUNT: usize = 192;
 struct SyncpointInfo {
     counter_min: AtomicU32,
     counter_max: AtomicU32,
-    interface_managed: bool,
-    reserved: bool,
+    interface_managed: AtomicBool,
+    reserved: AtomicBool,
 }
 
 impl Default for SyncpointInfo {
@@ -49,8 +49,8 @@ impl Default for SyncpointInfo {
         Self {
             counter_min: AtomicU32::new(0),
             counter_max: AtomicU32::new(0),
-            interface_managed: false,
-            reserved: false,
+            interface_managed: AtomicBool::new(false),
+            reserved: AtomicBool::new(false),
         }
     }
 }
@@ -62,9 +62,8 @@ impl Default for SyncpointInfo {
 /// https://http.download.nvidia.com/tegra-public-appnotes/host1x.html
 pub struct SyncpointManager {
     system: SystemRef,
-    /// Uses Mutex for interior mutability since `reserved` and `interface_managed` need mutation.
-    /// The AtomicU32 fields (counter_min, counter_max) can be accessed without the lock.
-    syncpoints: Mutex<Vec<SyncpointInfo>>,
+    syncpoints: [SyncpointInfo; SYNCPOINT_COUNT],
+    reservation_lock: Mutex<()>,
 }
 
 impl SyncpointManager {
@@ -73,70 +72,88 @@ impl SyncpointManager {
     }
 
     pub fn new_with_system(system: SystemRef) -> Self {
-        let mut syncpoints: Vec<SyncpointInfo> = (0..SYNCPOINT_COUNT)
-            .map(|_| SyncpointInfo::default())
-            .collect();
+        let syncpoints = std::array::from_fn(|_| SyncpointInfo::default());
 
         const VBLANK0_SYNCPOINT_ID: usize = 26;
         const VBLANK1_SYNCPOINT_ID: usize = 27;
 
         // Reserve both vblank syncpoints as client managed as they use Continuous Mode.
         // Refer to section 14.3.5.3 of the TRM for more information on Continuous Mode.
-        syncpoints[VBLANK0_SYNCPOINT_ID].reserved = true;
-        syncpoints[VBLANK0_SYNCPOINT_ID].interface_managed = true;
-        syncpoints[VBLANK1_SYNCPOINT_ID].reserved = true;
-        syncpoints[VBLANK1_SYNCPOINT_ID].interface_managed = true;
+        syncpoints[VBLANK0_SYNCPOINT_ID]
+            .reserved
+            .store(true, Ordering::Relaxed);
+        syncpoints[VBLANK0_SYNCPOINT_ID]
+            .interface_managed
+            .store(true, Ordering::Relaxed);
+        syncpoints[VBLANK1_SYNCPOINT_ID]
+            .reserved
+            .store(true, Ordering::Relaxed);
+        syncpoints[VBLANK1_SYNCPOINT_ID]
+            .interface_managed
+            .store(true, Ordering::Relaxed);
 
         for &syncpoint_id in &CHANNEL_SYNCPOINTS {
             if syncpoint_id != 0 {
-                syncpoints[syncpoint_id as usize].reserved = true;
-                syncpoints[syncpoint_id as usize].interface_managed = false;
+                syncpoints[syncpoint_id as usize]
+                    .reserved
+                    .store(true, Ordering::Relaxed);
+                syncpoints[syncpoint_id as usize]
+                    .interface_managed
+                    .store(false, Ordering::Relaxed);
             }
         }
 
         Self {
             system,
-            syncpoints: Mutex::new(syncpoints),
+            syncpoints,
+            reservation_lock: Mutex::new(()),
         }
     }
 
     /// Checks if the given syncpoint is both allocated and below the number of HW syncpoints.
     pub fn is_syncpoint_allocated(&self, id: u32) -> bool {
-        let syncpoints = self.syncpoints.lock().unwrap();
-        (id as usize) < SYNCPOINT_COUNT && syncpoints[id as usize].reserved
+        self.syncpoints
+            .get(id as usize)
+            .map(|syncpoint| syncpoint.reserved.load(Ordering::Relaxed))
+            .unwrap_or(false)
     }
 
     /// Finds a free syncpoint and reserves it.
     /// Returns the ID of the reserved syncpoint.
     pub fn allocate_syncpoint(&self, client_managed: bool) -> u32 {
-        let mut syncpoints = self.syncpoints.lock().unwrap();
-        let id = Self::find_free_syncpoint_inner(&syncpoints);
-        Self::reserve_syncpoint_inner(&mut syncpoints, id, client_managed)
+        let _lock = self.reservation_lock.lock().unwrap();
+        self.reserve_syncpoint_inner(self.find_free_syncpoint_inner(), client_managed)
     }
 
     /// Frees the usage of a syncpoint.
     pub fn free_syncpoint(&self, id: u32) {
-        let mut syncpoints = self.syncpoints.lock().unwrap();
-        let syncpoint = &mut syncpoints[id as usize];
-        assert!(syncpoint.reserved, "Syncpoint {} is not reserved", id);
-        syncpoint.reserved = false;
+        let _lock = self.reservation_lock.lock().unwrap();
+        let syncpoint = &self.syncpoints[id as usize];
+        assert!(
+            syncpoint.reserved.load(Ordering::Relaxed),
+            "Syncpoint {} is not reserved",
+            id
+        );
+        syncpoint.reserved.store(false, Ordering::Relaxed);
     }
 
     /// Checks if a syncpoint has expired relative to a threshold.
     ///
     /// https://github.com/Jetson-TX1-AndroidTV/android_kernel_jetson_tx1_hdmi_primary/blob/8f74a72394efb871cb3f886a3de2998cd7ff2990/drivers/gpu/host1x/syncpt.c#L259
     pub fn has_syncpoint_expired(&self, id: u32, threshold: u32) -> bool {
-        let syncpoints = self.syncpoints.lock().unwrap();
-        let syncpoint = &syncpoints[id as usize];
+        let Some(syncpoint) = self.syncpoints.get(id as usize) else {
+            debug_assert!(false, "Syncpoint {} is out of range", id);
+            return false;
+        };
 
-        if !syncpoint.reserved {
+        if !syncpoint.reserved.load(Ordering::Relaxed) {
             debug_assert!(false, "Syncpoint {} is not reserved", id);
             return false;
         }
 
         // If the interface manages counters then we don't keep track of the maximum value as it
         // handles sanity checking the values then
-        if syncpoint.interface_managed {
+        if syncpoint.interface_managed.load(Ordering::Relaxed) {
             (syncpoint
                 .counter_min
                 .load(Ordering::Relaxed)
@@ -179,10 +196,12 @@ impl SyncpointManager {
     /// Atomically increments the maximum value of a syncpoint by the given amount.
     /// Returns the new max value of the syncpoint.
     pub fn increment_syncpoint_max_ext(&self, id: u32, amount: u32) -> u32 {
-        let syncpoints = self.syncpoints.lock().unwrap();
-        let syncpoint = &syncpoints[id as usize];
+        let Some(syncpoint) = self.syncpoints.get(id as usize) else {
+            debug_assert!(false, "Syncpoint {} is out of range", id);
+            return 0;
+        };
 
-        if !syncpoint.reserved {
+        if !syncpoint.reserved.load(Ordering::Relaxed) {
             debug_assert!(false, "Syncpoint {} is not reserved", id);
             return 0;
         }
@@ -201,8 +220,9 @@ impl SyncpointManager {
 
     /// Returns the maximum (predicted) value of the syncpoint.
     pub fn read_syncpoint_max_value(&self, id: u32) -> u32 {
-        let syncpoints = self.syncpoints.lock().unwrap();
-        syncpoints[id as usize].counter_max.load(Ordering::Relaxed)
+        self.syncpoints[id as usize]
+            .counter_max
+            .load(Ordering::Relaxed)
     }
 
     /// Returns the minimum value of the syncpoint.
@@ -220,14 +240,14 @@ impl SyncpointManager {
     /// Performance-wise this adds one host1x atomic load + one `counter_min`
     /// atomic store per read; negligible compared to an ioctl roundtrip.
     pub fn read_syncpoint_min_value(&self, id: u32) -> u32 {
-        // Pre-refresh from host1x — does its own locking. Done before we
-        // take the syncpoints lock to avoid holding two locks at once.
         let _ = self.update_min(id);
 
-        let syncpoints = self.syncpoints.lock().unwrap();
-        let syncpoint = &syncpoints[id as usize];
+        let Some(syncpoint) = self.syncpoints.get(id as usize) else {
+            debug_assert!(false, "Syncpoint {} is out of range", id);
+            return 0;
+        };
 
-        if !syncpoint.reserved {
+        if !syncpoint.reserved.load(Ordering::Relaxed) {
             debug_assert!(false, "Syncpoint {} is not reserved", id);
             return 0;
         }
@@ -248,12 +268,14 @@ impl SyncpointManager {
     ///
     /// Note: In the C++ code, this reads from host1x hardware via
     /// `host1x.GetSyncpointManager().GetHostSyncpointValue(id)`.
-    /// Since we don't have host1x integration yet, we return the current counter_min.
+    /// If ruzu is constructed without a host1x core, this returns the current counter_min.
     pub fn update_min(&self, id: u32) -> u32 {
-        let syncpoints = self.syncpoints.lock().unwrap();
-        let syncpoint = &syncpoints[id as usize];
+        let Some(syncpoint) = self.syncpoints.get(id as usize) else {
+            debug_assert!(false, "Syncpoint {} is out of range", id);
+            return 0;
+        };
 
-        if !syncpoint.reserved {
+        if !syncpoint.reserved.load(Ordering::Relaxed) {
             debug_assert!(false, "Syncpoint {} is not reserved", id);
             return 0;
         }
@@ -279,10 +301,12 @@ impl SyncpointManager {
 
     /// Returns a fence that will be signalled once this syncpoint hits its maximum value.
     pub fn get_syncpoint_fence(&self, id: u32) -> NvFence {
-        let syncpoints = self.syncpoints.lock().unwrap();
-        let syncpoint = &syncpoints[id as usize];
+        let Some(syncpoint) = self.syncpoints.get(id as usize) else {
+            debug_assert!(false, "Syncpoint {} is out of range", id);
+            return NvFence::default();
+        };
 
-        if !syncpoint.reserved {
+        if !syncpoint.reserved.load(Ordering::Relaxed) {
             debug_assert!(false, "Syncpoint {} is not reserved", id);
             return NvFence::default();
         }
@@ -299,10 +323,12 @@ impl SyncpointManager {
     /// lacks that bridge on this path, so synchronous nvdrv stubs use this helper to keep
     /// min/max coherent after they complete work immediately.
     pub fn signal_syncpoint(&self, id: u32) -> u32 {
-        let syncpoints = self.syncpoints.lock().unwrap();
-        let syncpoint = &syncpoints[id as usize];
+        let Some(syncpoint) = self.syncpoints.get(id as usize) else {
+            debug_assert!(false, "Syncpoint {} is out of range", id);
+            return 0;
+        };
 
-        if !syncpoint.reserved {
+        if !syncpoint.reserved.load(Ordering::Relaxed) {
             debug_assert!(false, "Syncpoint {} is not reserved", id);
             return 0;
         }
@@ -351,10 +377,10 @@ impl SyncpointManager {
     }
 
     /// Finds the first free syncpoint.
-    /// Note: reservation_lock (the Mutex) should be held when calling this.
-    fn find_free_syncpoint_inner(syncpoints: &[SyncpointInfo]) -> u32 {
-        for i in 1..syncpoints.len() {
-            if !syncpoints[i].reserved {
+    /// Note: reservation_lock should be held when calling this.
+    fn find_free_syncpoint_inner(&self) -> u32 {
+        for i in 1..self.syncpoints.len() {
+            if !self.syncpoints[i].reserved.load(Ordering::Relaxed) {
                 return i as u32;
             }
         }
@@ -363,22 +389,70 @@ impl SyncpointManager {
     }
 
     /// Reserves a syncpoint by ID.
-    /// Note: reservation_lock (the Mutex) should be held when calling this.
-    fn reserve_syncpoint_inner(
-        syncpoints: &mut [SyncpointInfo],
-        id: u32,
-        client_managed: bool,
-    ) -> u32 {
-        let syncpoint = &mut syncpoints[id as usize];
+    /// Note: reservation_lock should be held when calling this.
+    fn reserve_syncpoint_inner(&self, id: u32, client_managed: bool) -> u32 {
+        let syncpoint = &self.syncpoints[id as usize];
 
-        if syncpoint.reserved {
+        if syncpoint.reserved.load(Ordering::Relaxed) {
             debug_assert!(false, "Requested syncpoint {} is in use", id);
             return 0;
         }
 
-        syncpoint.reserved = true;
-        syncpoint.interface_managed = client_managed;
+        syncpoint.reserved.store(true, Ordering::Relaxed);
+        syncpoint
+            .interface_managed
+            .store(client_managed, Ordering::Relaxed);
 
         id
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn constructor_reserves_upstream_static_syncpoints() {
+        let manager = SyncpointManager::new();
+
+        assert!(manager.is_syncpoint_allocated(26));
+        assert!(manager.is_syncpoint_allocated(27));
+        assert!(manager.is_syncpoint_allocated(CHANNEL_SYNCPOINTS[ChannelType::VIC as usize] as u32));
+        assert!(
+            manager.is_syncpoint_allocated(CHANNEL_SYNCPOINTS[ChannelType::NvDec as usize] as u32)
+        );
+        assert!(
+            manager.is_syncpoint_allocated(CHANNEL_SYNCPOINTS[ChannelType::NvJpg as usize] as u32)
+        );
+    }
+
+    #[test]
+    fn allocate_and_free_only_change_reservation_state() {
+        let manager = SyncpointManager::new();
+
+        let id = manager.allocate_syncpoint(false);
+        assert_ne!(id, 0);
+        assert!(manager.is_syncpoint_allocated(id));
+
+        manager.increment_syncpoint_max_ext(id, 5);
+        assert_eq!(manager.read_syncpoint_max_value(id), 5);
+
+        manager.free_syncpoint(id);
+        assert!(!manager.is_syncpoint_allocated(id));
+    }
+
+    #[test]
+    fn has_syncpoint_expired_matches_upstream_counter_math() {
+        let manager = SyncpointManager::new();
+        let id = manager.allocate_syncpoint(false);
+
+        manager.increment_syncpoint_max_ext(id, 10);
+        assert!(manager.has_syncpoint_expired(id, 5));
+        assert!(manager.has_syncpoint_expired(id, 10));
+        assert!(!manager.has_syncpoint_expired(id, 11));
+
+        manager.signal_syncpoint(id);
+        assert!(manager.has_syncpoint_expired(id, 10));
+        assert!(!manager.has_syncpoint_expired(id, 11));
     }
 }
