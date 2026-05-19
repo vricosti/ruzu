@@ -1868,12 +1868,39 @@ pub fn call(system: &System, imm: u32, is_64bit: bool, args: &mut SvcArgs) {
                     .map(|id| format!("{:?}", id))
                     .unwrap_or_else(|| format!("svc#0x{:02X}", imm));
                 let t_ns = super::race_anchor::elapsed_ns();
+                // RUZU_TRACE_TID_SVC_PC=1: extra PC field from the JIT's current
+                // thread context. Read at the SVC trap point — for ARM32 this
+                // is the SVC instruction's PC. Useful for side-by-side compare
+                // with zuyu's `RunThread svc tid=X pc=...` log lines.
+                let pc_str = if std::env::var_os("RUZU_TRACE_TID_SVC_PC").is_some() {
+                    if let Some(kernel) = system.kernel() {
+                        let core_index = kernel.current_physical_core_index() as usize;
+                        if let Some(process_arc) = system.current_process_arc.as_ref().cloned() {
+                            let process = process_arc.lock().unwrap();
+                            if let Some(jit) = process.get_arm_interface(core_index) {
+                                use crate::arm::arm_interface::ThreadContext;
+                                let mut ctx = ThreadContext::default();
+                                jit.get_context(&mut ctx);
+                                format!(" pc=0x{:08X}", ctx.r[15] as u32)
+                            } else {
+                                String::new()
+                            }
+                        } else {
+                            String::new()
+                        }
+                    } else {
+                        String::new()
+                    }
+                } else {
+                    String::new()
+                };
                 log::info!(
-                    "[TID_SVC] t_ns={} tid={} core={} svc={} args=[0x{:X}, 0x{:X}, 0x{:X}, 0x{:X}]",
+                    "[TID_SVC] t_ns={} tid={} core={} svc={}{} args=[0x{:X}, 0x{:X}, 0x{:X}, 0x{:X}]",
                     t_ns,
                     tid,
                     core_id,
                     name,
+                    pc_str,
                     dispatch_args[0],
                     dispatch_args[1],
                     dispatch_args[2],
