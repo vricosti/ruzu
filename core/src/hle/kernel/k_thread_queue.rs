@@ -103,10 +103,26 @@ impl KThreadQueue {
     }
 
     pub fn end_wait(&self, thread: &mut KThread, wait_result: u32) {
-        assert!(
-            self.end_wait_allowed,
-            "KThreadQueueWithoutEndWait::end_wait should never be called"
-        );
+        if !self.end_wait_allowed {
+            // Upstream's KThreadQueueWithoutEndWait::EndWait is [[noreturn]]
+            // and calls UNREACHABLE(). Hitting this in ruzu indicates a real
+            // bug — a thread waiting on a sync-object (without_end_wait) queue
+            // got woken via the wrong path. Log the context (thread id, wait
+            // reason, result, caller backtrace) so we can identify the caller
+            // without aborting the whole process; clear the wait via
+            // base_end_wait so kernel state stays consistent.
+            log::error!(
+                "[KTHREAD_QUEUE_WITHOUT_END_WAIT] thread_id={} wait_result=0x{:X} state={:?} wait_reason={:?} addr_key=0x{:X}",
+                thread.get_thread_id(),
+                wait_result,
+                thread.get_state(),
+                thread.wait_reason_for_debugging,
+                thread.address_key.get(),
+            );
+            if std::env::var_os("RUZU_PANIC_ON_WITHOUT_END_WAIT").is_some() {
+                panic!("KThreadQueueWithoutEndWait::end_wait should never be called");
+            }
+        }
         self.base_end_wait(thread, wait_result);
     }
 

@@ -53,8 +53,30 @@ impl<State: Copy + Default, const MAX_BUFFER_SIZE: usize> Clone for Lifo<State, 
 impl<State: Copy + Default, const MAX_BUFFER_SIZE: usize> Copy for Lifo<State, MAX_BUFFER_SIZE> {}
 
 impl<State: Copy + Default, const MAX_BUFFER_SIZE: usize> Lifo<State, MAX_BUFFER_SIZE> {
+    /// Read the entry at `buffer_tail`. Upstream uses `entries[buffer_tail]`
+    /// directly; if `buffer_tail` is corrupt this is UB in C++ but silently
+    /// reads adjacent memory. Rust would otherwise panic, so we mask by
+    /// MAX_BUFFER_SIZE to keep the game running with the closest legal entry.
+    /// Set `RUZU_TRACE_LIFO_CORRUPTION=1` to log occurrences (one-shot per
+    /// process) for diagnosis.
     pub fn read_current_entry(&self) -> &AtomicStorage<State> {
-        &self.entries[self.buffer_tail as usize]
+        let raw_tail = self.buffer_tail as usize;
+        let tail = raw_tail % MAX_BUFFER_SIZE;
+        if raw_tail >= MAX_BUFFER_SIZE && std::env::var_os("RUZU_TRACE_LIFO_CORRUPTION").is_some() {
+            use std::sync::atomic::{AtomicBool, Ordering};
+            static REPORTED: AtomicBool = AtomicBool::new(false);
+            if !REPORTED.swap(true, Ordering::Relaxed) {
+                log::error!(
+                    "[LIFO_CORRUPTION] read_current_entry: buffer_tail={} (raw i64={:#x}) max={} self_addr={:p} masked_tail={}",
+                    raw_tail,
+                    self.buffer_tail,
+                    MAX_BUFFER_SIZE,
+                    self,
+                    tail,
+                );
+            }
+        }
+        &self.entries[tail]
     }
 
     pub fn read_previous_entry(&self) -> &AtomicStorage<State> {
@@ -62,11 +84,13 @@ impl<State: Copy + Default, const MAX_BUFFER_SIZE: usize> Lifo<State, MAX_BUFFER
     }
 
     pub fn get_previous_entry_index(&self) -> usize {
-        ((self.buffer_tail as usize) + MAX_BUFFER_SIZE - 1) % MAX_BUFFER_SIZE
+        let tail = (self.buffer_tail as usize) % MAX_BUFFER_SIZE;
+        (tail + MAX_BUFFER_SIZE - 1) % MAX_BUFFER_SIZE
     }
 
     pub fn get_next_entry_index(&self) -> usize {
-        ((self.buffer_tail as usize) + 1) % MAX_BUFFER_SIZE
+        let tail = (self.buffer_tail as usize) % MAX_BUFFER_SIZE;
+        (tail + 1) % MAX_BUFFER_SIZE
     }
 
     pub fn write_next_entry(&mut self, new_state: State) {
