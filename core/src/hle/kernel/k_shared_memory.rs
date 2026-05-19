@@ -11,6 +11,7 @@ use crate::hle::kernel::k_memory_block::{KMemoryPermission, KMemoryState, PAGE_S
 use crate::hle::kernel::k_memory_manager::KMemoryManager;
 use crate::hle::kernel::k_page_group::KPageGroup;
 use crate::hle::kernel::k_process_page_table::KProcessPageTable;
+use crate::hle::kernel::svc::svc_results::RESULT_INVALID_NEW_MEMORY_PERMISSION;
 use crate::hle::kernel::k_typed_address::KProcessAddress;
 use crate::hle::result::ResultCode;
 
@@ -41,6 +42,20 @@ fn convert_to_k_memory_permission(perm: MemoryPermission) -> KMemoryPermission {
             KMemoryPermission::USER_READ | KMemoryPermission::USER_EXECUTE
         }
         MemoryPermission::DontCare => KMemoryPermission::USER_READ,
+    }
+}
+
+fn validate_map_permission(test_perm: MemoryPermission, map_perm: MemoryPermission) -> ResultCode {
+    if test_perm == MemoryPermission::DontCare {
+        debug_assert!(matches!(
+            map_perm,
+            MemoryPermission::Read | MemoryPermission::Write
+        ));
+        ResultCode::new(0)
+    } else if map_perm == test_perm {
+        ResultCode::new(0)
+    } else {
+        RESULT_INVALID_NEW_MEMORY_PERMISSION
     }
 }
 
@@ -186,10 +201,14 @@ impl KSharedMemory {
             return crate::hle::kernel::svc::svc_results::RESULT_INVALID_SIZE;
         }
 
-        // Upstream selects permission based on whether target_process == m_owner_process.
-        // Owner gets m_owner_permission, others get m_user_permission.
-        // No m_owner_process field is stored yet; default to user_permission.
-        let _test_perm = self.m_user_permission;
+        // Upstream selects owner/user permission based on the target process.
+        // Ruzu does not store m_owner_process yet, so MapSharedMemory callers
+        // take the user-permission path. This is the critical check for HID
+        // shared memory, whose user mapping is read-only.
+        let result = validate_map_permission(self.m_user_permission, map_perm);
+        if !result.is_success() {
+            return result;
+        }
 
         let pg = match &self.m_page_group {
             Some(pg) => pg,
@@ -246,5 +265,30 @@ impl KSharedMemory {
 impl Default for KSharedMemory {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn map_permission_must_match_shared_memory_user_permission() {
+        assert!(validate_map_permission(MemoryPermission::Read, MemoryPermission::Read)
+            .is_success());
+        assert_eq!(
+            validate_map_permission(MemoryPermission::Read, MemoryPermission::ReadWrite),
+            RESULT_INVALID_NEW_MEMORY_PERMISSION
+        );
+        assert!(validate_map_permission(MemoryPermission::ReadWrite, MemoryPermission::ReadWrite)
+            .is_success());
+    }
+
+    #[test]
+    fn dont_care_permission_accepts_upstream_asserted_read_write_cases() {
+        assert!(validate_map_permission(MemoryPermission::DontCare, MemoryPermission::Read)
+            .is_success());
+        assert!(validate_map_permission(MemoryPermission::DontCare, MemoryPermission::Write)
+            .is_success());
     }
 }

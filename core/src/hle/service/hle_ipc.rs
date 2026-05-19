@@ -1291,7 +1291,7 @@ impl HLERequestContext {
             return;
         }
         if let Some(ref memory) = self.memory {
-            memory.lock().unwrap().write_block(address, data);
+            memory.lock().unwrap().write_block_no_rasterizer(address, data);
         } else {
             log::error!(
                 "write_guest_memory: no Memory available for addr={:#x} size={:#x}",
@@ -1475,7 +1475,7 @@ impl HLERequestContext {
                     if let Some(ref memory) = self.memory {
                         let m = memory.lock().unwrap();
                         for i in 0..pad_count {
-                            m.write_32(self.tls_address + ((index + i) as u64 * 4), 0);
+                            m.write_32_no_rasterizer(self.tls_address + ((index + i) as u64 * 4), 0);
                         }
                     }
                 }
@@ -1697,7 +1697,7 @@ impl HLERequestContext {
         if let Some(ref memory) = self.memory {
             let m = memory.lock().unwrap();
             for i in 0..write_words {
-                m.write_32(self.tls_address + (i as u64 * 4), self.cmd_buf[i]);
+                m.write_32_no_rasterizer(self.tls_address + (i as u64 * 4), self.cmd_buf[i]);
             }
         }
 
