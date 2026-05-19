@@ -121,6 +121,61 @@ fn trace_get_pointer_page(kind: &str, vaddr: u64) {
     }
 }
 
+/// Env-gated range tracer used by `write_8`/`write_16`/`write_32` to log every
+/// host-side guest-memory write whose vaddr falls in a target range.
+///
+/// `RUZU_TRACE_MEMORY_W_RANGE="0xSTART:0xEND,..."` — log every write whose
+/// `[vaddr, vaddr+size)` intersects any listed `[START, END)` half-open range.
+/// Catches host-issued writes from any of the write_N helpers (the kernel /
+/// HLE writers, plus the JIT memory-write callback path through write_32).
+/// Combine with `RUZU_NO_FASTMEM_W32=1`/`_W16`/`_W8` to also catch the JIT
+/// fastmem path (otherwise guest stores via fastmem bypass these helpers).
+fn maybe_trace_write_in_range(vaddr: u64, size: u64, data: u64) {
+    use std::sync::OnceLock;
+    static RANGES: OnceLock<Vec<(u64, u64)>> = OnceLock::new();
+    let ranges = RANGES.get_or_init(|| {
+        let raw = match std::env::var("RUZU_TRACE_MEMORY_W_RANGE") {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+        raw.split(',')
+            .filter_map(|tok| {
+                let tok = tok.trim();
+                let mut parts = tok.split(':');
+                let start = u64::from_str_radix(
+                    parts.next()?.trim().trim_start_matches("0x"),
+                    16,
+                )
+                .ok()?;
+                let end = u64::from_str_radix(
+                    parts.next()?.trim().trim_start_matches("0x"),
+                    16,
+                )
+                .ok()?;
+                Some((start, end))
+            })
+            .collect()
+    });
+    if ranges.is_empty() {
+        return;
+    }
+    let write_end = vaddr + size;
+    for &(s, e) in ranges {
+        if vaddr < e && s < write_end {
+            let bt = std::backtrace::Backtrace::force_capture();
+            eprintln!(
+                "[MEMORY_W{:01}] vaddr=0x{:016X} data=0x{:0width$X}\n{}",
+                size * 8,
+                vaddr,
+                data,
+                bt,
+                width = (size as usize) * 2
+            );
+            break;
+        }
+    }
+}
+
 // SAFETY: Memory is used behind Arc<Mutex<>> and all raw pointers are
 // to long-lived objects (DeviceMemory, HostMemory, PageTable) that outlive Memory.
 unsafe impl Send for Memory {}
@@ -1015,12 +1070,14 @@ impl Memory {
 
     /// Write a u8. Matches upstream `Memory::Write8`.
     pub fn write_8(&self, vaddr: u64, data: u8) {
+        maybe_trace_write_in_range(vaddr, 1, data as u64);
         self.handle_rasterizer_write(vaddr, std::mem::size_of::<u8>());
         unsafe { self.write_raw::<u8>(vaddr, data) }
     }
 
     /// Write a u16 (LE). Matches upstream `Memory::Write16`.
     pub fn write_16(&self, vaddr: u64, data: u16) {
+        maybe_trace_write_in_range(vaddr, 2, data as u64);
         self.handle_rasterizer_write(vaddr, std::mem::size_of::<u16>());
         if (vaddr & 1) == 0 {
             unsafe { self.write_raw::<u16>(vaddr, data) }
@@ -1032,6 +1089,7 @@ impl Memory {
 
     /// Write a u32 (LE). Matches upstream `Memory::Write32`.
     pub fn write_32(&self, vaddr: u64, data: u32) {
+        maybe_trace_write_in_range(vaddr, 4, data as u64);
         // `RUZU_TRACE_MEMORY_W32_AT_VADDR=0xVADDR` — log every Rust-side
         // `Memory::write_32` call whose vaddr matches. Counterpart to the
         // existing `RUZU_TRACE_MEMORY_W64_AT_VADDR`. Catches HLE / kernel
