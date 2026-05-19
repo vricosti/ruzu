@@ -421,8 +421,15 @@ impl SinkStream {
                 as usize;
             let samples_to_pop = frames_available * frame_size;
             let base = frames_written * frame_size;
+            // Fall back to silence (0) rather than `last_frame[0]` when the
+            // sample queue runs short. Replicating `last_frame[0]` across all
+            // channels for many missing samples produces a DC tone / strident
+            // warble (user-reported "modem sound" after underruns). Upstream
+            // zuyu's `Pop` leaves remaining output_buffer slots untouched (i.e.
+            // cubeb's prior buffer contents, often zero); filling with explicit
+            // zeros is safer and deterministic.
             for sample in &mut output_buffer[base..base + samples_to_pop] {
-                *sample = self.samples.pop_front().unwrap_or(self.last_frame[0]);
+                *sample = self.samples.pop_front().unwrap_or(0);
             }
 
             frames_written += frames_available;
