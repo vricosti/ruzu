@@ -141,9 +141,10 @@ impl BufferQueueConsumer {
             out_buffer.graphic_buffer = None;
         }
 
-        // Signal that a slot might be free
-        drop(inner);
+        // Signal that a slot might be free. Upstream calls SignalDequeueCondition
+        // while core->mutex is still held in AcquireBuffer.
         self.core.signal_dequeue_condition();
+        drop(inner);
 
         Status::NoError
     }
@@ -248,8 +249,8 @@ impl BufferQueueConsumer {
         inner.consumer_listener = None;
         inner.queue.clear();
         inner.free_all_buffers_locked();
-        drop(inner);
         self.core.signal_dequeue_condition();
+        drop(inner);
         Status::NoError
     }
 

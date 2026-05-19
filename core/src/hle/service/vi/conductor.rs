@@ -12,7 +12,7 @@
 //! callback directly calls process_vsync().
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
@@ -32,6 +32,27 @@ fn should_trace_vsync_debug() -> bool {
     std::env::var_os("RUZU_TRACE_VSYNC").is_some()
 }
 
+static VSYNC_CALLBACK_COUNT: AtomicU64 = AtomicU64::new(0);
+static VSYNC_SIGNAL_ALREADY_SET_COUNT: AtomicU64 = AtomicU64::new(0);
+static VSYNC_THREAD_WAKE_COUNT: AtomicU64 = AtomicU64::new(0);
+static VSYNC_PROCESS_COUNT: AtomicU64 = AtomicU64::new(0);
+static VSYNC_PROCESS_TOTAL_US: AtomicU64 = AtomicU64::new(0);
+static VSYNC_PROCESS_MAX_US: AtomicU64 = AtomicU64::new(0);
+
+fn vsync_profile_enabled() -> bool {
+    std::env::var_os("RUZU_PROFILE_VSYNC").is_some()
+}
+
+fn update_max(target: &AtomicU64, value: u64) {
+    let mut current = target.load(Ordering::Relaxed);
+    while value > current {
+        match target.compare_exchange_weak(current, value, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => break,
+            Err(next) => current = next,
+        }
+    }
+}
+
 /// Thread-safe event primitive matching upstream `Common::Event`.
 /// Uses a condvar + bool: Set() signals, Wait() blocks until signaled then auto-resets.
 struct ThreadEvent {
@@ -49,6 +70,9 @@ impl ThreadEvent {
 
     fn set(&self) {
         let mut signaled = self.mutex.lock().unwrap();
+        if vsync_profile_enabled() && *signaled {
+            VSYNC_SIGNAL_ALREADY_SET_COUNT.fetch_add(1, Ordering::Relaxed);
+        }
         if !*signaled {
             *signaled = true;
             self.condvar.notify_one();
@@ -209,6 +233,9 @@ impl Conductor {
                     if sc < 3 {
                         log::info!("[SC_CB] #{} signal_ptr={:p}", sc, &*signal_for_callback);
                     }
+                    if vsync_profile_enabled() {
+                        VSYNC_CALLBACK_COUNT.fetch_add(1, Ordering::Relaxed);
+                    }
                     signal_for_callback.set();
                     let next_ns = tick_state.get_next_ticks(system_for_callback);
                     Some(Duration::from_nanos(next_ns as u64))
@@ -289,6 +316,9 @@ impl Conductor {
             signal.wait();
 
             let vt = VT_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if vsync_profile_enabled() {
+                VSYNC_THREAD_WAKE_COUNT.fetch_add(1, Ordering::Relaxed);
+            }
             if vt < 10 || vt % 60 == 0 {
                 log::info!("[VSYNC_THREAD] woke #{}", vt);
             }
@@ -335,6 +365,11 @@ impl Conductor {
     /// Process a vsync tick: compose each display, then signal vsync events.
     /// Port of upstream `Conductor::ProcessVsync`.
     fn process_vsync(&mut self) {
+        let start = if vsync_profile_enabled() {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
         static VSYNC_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let vc = VSYNC_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if vc % 300 == 0 || (should_trace_vsync_debug() && vc % 60 == 0) {
@@ -353,6 +388,12 @@ impl Conductor {
         // Update shared tick state so the CoreTiming callback uses current values.
         self.tick_state
             .update(self.swap_interval, self.compose_speed_scale);
+        if let Some(start) = start {
+            let elapsed_us = start.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
+            VSYNC_PROCESS_COUNT.fetch_add(1, Ordering::Relaxed);
+            VSYNC_PROCESS_TOTAL_US.fetch_add(elapsed_us, Ordering::Relaxed);
+            update_max(&VSYNC_PROCESS_MAX_US, elapsed_us);
+        }
     }
 
     /// Calculate the next tick interval in nanoseconds.
@@ -368,6 +409,23 @@ impl Conductor {
             *settings::values().use_video_framerate.get_value(),
         )
     }
+}
+
+pub fn dump_vsync_profile() {
+    if !vsync_profile_enabled() {
+        return;
+    }
+    let callbacks = VSYNC_CALLBACK_COUNT.load(Ordering::Relaxed);
+    let already_set = VSYNC_SIGNAL_ALREADY_SET_COUNT.load(Ordering::Relaxed);
+    let wakes = VSYNC_THREAD_WAKE_COUNT.load(Ordering::Relaxed);
+    let process = VSYNC_PROCESS_COUNT.load(Ordering::Relaxed);
+    let total_us = VSYNC_PROCESS_TOTAL_US.load(Ordering::Relaxed);
+    let max_us = VSYNC_PROCESS_MAX_US.load(Ordering::Relaxed);
+    let avg_us = if process != 0 { total_us / process } else { 0 };
+    eprintln!(
+        "[VSYNC_PROFILE] callbacks={} already_set={} thread_wakes={} process={} total_us={} avg_us={} max_us={}",
+        callbacks, already_set, wakes, process, total_us, avg_us, max_us
+    );
 }
 
 impl Drop for Conductor {

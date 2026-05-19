@@ -42,6 +42,8 @@ pub mod renderer_opengl;
 pub mod util_shaders;
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
 
 use log::{debug, info};
 use thiserror::Error;
@@ -64,6 +66,56 @@ use ruzu_core::frontend::framebuffer_layout::{
     default_frame_layout, FramebufferLayout, ScreenUndocked,
 };
 use ruzu_core::frontend::graphics_context::GraphicsContext;
+
+static PRESENT_COUNT: AtomicU64 = AtomicU64::new(0);
+static PRESENT_TOTAL_US: AtomicU64 = AtomicU64::new(0);
+static PRESENT_MAX_US: AtomicU64 = AtomicU64::new(0);
+static PRESENT_MAKE_CURRENT_US: AtomicU64 = AtomicU64::new(0);
+static PRESENT_CAPTURE_US: AtomicU64 = AtomicU64::new(0);
+static PRESENT_SCREENSHOT_US: AtomicU64 = AtomicU64::new(0);
+static PRESENT_DRAW_SCREEN_US: AtomicU64 = AtomicU64::new(0);
+static PRESENT_TICK_FRAME_US: AtomicU64 = AtomicU64::new(0);
+static PRESENT_SWAP_BUFFERS_US: AtomicU64 = AtomicU64::new(0);
+
+fn present_profile_enabled() -> bool {
+    std::env::var_os("RUZU_PROFILE_PRESENT").is_some()
+}
+
+fn update_max(target: &AtomicU64, value: u64) {
+    let mut current = target.load(Ordering::Relaxed);
+    while value > current {
+        match target.compare_exchange_weak(current, value, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => break,
+            Err(next) => current = next,
+        }
+    }
+}
+
+fn elapsed_us(start: Instant) -> u64 {
+    start.elapsed().as_micros().min(u128::from(u64::MAX)) as u64
+}
+
+pub fn dump_present_profile() {
+    if !present_profile_enabled() {
+        return;
+    }
+    let count = PRESENT_COUNT.load(Ordering::Relaxed);
+    let total = PRESENT_TOTAL_US.load(Ordering::Relaxed);
+    let avg = if count != 0 { total / count } else { 0 };
+    eprintln!(
+        "[PRESENT_PROFILE] count={} total_us={} avg_us={} max_us={} make_current_us={} capture_us={} screenshot_us={} draw_screen_us={} tick_frame_us={} swap_buffers_us={}",
+        count,
+        total,
+        avg,
+        PRESENT_MAX_US.load(Ordering::Relaxed),
+        PRESENT_MAKE_CURRENT_US.load(Ordering::Relaxed),
+        PRESENT_CAPTURE_US.load(Ordering::Relaxed),
+        PRESENT_SCREENSHOT_US.load(Ordering::Relaxed),
+        PRESENT_DRAW_SCREEN_US.load(Ordering::Relaxed),
+        PRESENT_TICK_FRAME_US.load(Ordering::Relaxed),
+        PRESENT_SWAP_BUFFERS_US.load(Ordering::Relaxed),
+    );
+}
 
 #[derive(Debug, Error)]
 pub enum OpenGLError {
@@ -239,7 +291,13 @@ impl RendererOpenGL {
     /// 8. context->SwapBuffers()
     /// 9. render_window.OnFrameDisplayed()
     pub fn composite_impl(&mut self, framebuffers: &[FramebufferConfig]) {
+        let profile = present_profile_enabled();
+        let total_start = if profile { Some(Instant::now()) } else { None };
+        let phase_start = if profile { Some(Instant::now()) } else { None };
         self.context.make_current();
+        if let Some(start) = phase_start {
+            PRESENT_MAKE_CURRENT_US.fetch_add(elapsed_us(start), Ordering::Relaxed);
+        }
 
         if std::env::var_os("RUZU_TRACE_PRESENT").is_some() {
             log::info!(
@@ -252,8 +310,16 @@ impl RendererOpenGL {
             return;
         }
 
+        let phase_start = if profile { Some(Instant::now()) } else { None };
         self.render_applet_capture_layer(framebuffers);
+        if let Some(start) = phase_start {
+            PRESENT_CAPTURE_US.fetch_add(elapsed_us(start), Ordering::Relaxed);
+        }
+        let phase_start = if profile { Some(Instant::now()) } else { None };
         self.render_screenshot(framebuffers);
+        if let Some(start) = phase_start {
+            PRESENT_SCREENSHOT_US.fetch_add(elapsed_us(start), Ordering::Relaxed);
+        }
 
         // Several Rust-side helper paths still bind framebuffers directly
         // while upstream routes render-target state through StateTracker.
@@ -261,6 +327,7 @@ impl RendererOpenGL {
         // cannot be skipped because of a stale cached value.
         self.state_tracker.notify_framebuffer();
         self.state_tracker.bind_framebuffer(0);
+        let phase_start = if profile { Some(Instant::now()) } else { None };
         self.blit_screen.draw_screen(
             framebuffers,
             &self.framebuffer_layout,
@@ -269,6 +336,9 @@ impl RendererOpenGL {
             false,
             self.device_memory.as_ref(),
         );
+        if let Some(start) = phase_start {
+            PRESENT_DRAW_SCREEN_US.fetch_add(elapsed_us(start), Ordering::Relaxed);
+        }
 
         if std::env::var_os("RUZU_TRACE_PRESENT_READBACK").is_some() {
             unsafe {
@@ -347,9 +417,23 @@ impl RendererOpenGL {
 
         // Upstream: gpu.RendererFrameEndNotify() -> system.GetPerfStats().EndGameFrame()
         // PerfStats not yet integrated.
+        let phase_start = if profile { Some(Instant::now()) } else { None };
         self.rasterizer.tick_frame();
+        if let Some(start) = phase_start {
+            PRESENT_TICK_FRAME_US.fetch_add(elapsed_us(start), Ordering::Relaxed);
+        }
 
+        let phase_start = if profile { Some(Instant::now()) } else { None };
         self.context.swap_buffers();
+        if let Some(start) = phase_start {
+            PRESENT_SWAP_BUFFERS_US.fetch_add(elapsed_us(start), Ordering::Relaxed);
+        }
+        if let Some(start) = total_start {
+            let total = elapsed_us(start);
+            PRESENT_COUNT.fetch_add(1, Ordering::Relaxed);
+            PRESENT_TOTAL_US.fetch_add(total, Ordering::Relaxed);
+            update_max(&PRESENT_MAX_US, total);
+        }
         if std::env::var_os("RUZU_TRACE_PRESENT").is_some() {
             log::info!(
                 "[PRESENT] RendererOpenGL::composite_impl swapped current_frame={}",

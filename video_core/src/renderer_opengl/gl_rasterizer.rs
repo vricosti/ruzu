@@ -40,6 +40,32 @@ use crate::renderer_base::GuestMemoryWriter;
 use crate::renderer_opengl::present::layer::FramebufferTextureInfo;
 use crate::shader_cache::ShaderCache;
 
+macro_rules! lock_two_reentrant_mutexes {
+    ($first_mutex:expr, $second_mutex:expr, $first_guard:ident, $second_guard:ident) => {
+        let $first_guard;
+        let $second_guard;
+        loop {
+            let first_candidate = unsafe { (*$first_mutex).lock() };
+            if let Some(second_candidate) = unsafe { (*$second_mutex).try_lock() } {
+                $first_guard = first_candidate;
+                $second_guard = second_candidate;
+                break;
+            }
+            drop(first_candidate);
+            std::thread::yield_now();
+
+            let second_candidate = unsafe { (*$second_mutex).lock() };
+            if let Some(first_candidate) = unsafe { (*$first_mutex).try_lock() } {
+                $first_guard = first_candidate;
+                $second_guard = second_candidate;
+                break;
+            }
+            drop(second_candidate);
+            std::thread::yield_now();
+        }
+    };
+}
+
 struct OpenGLDeviceTracker;
 static OPENGL_DEVICE_TRACKER: OpenGLDeviceTracker = OpenGLDeviceTracker;
 
@@ -1077,9 +1103,10 @@ impl RasterizerOpenGL {
         let buffer_cache: *mut CommonBufferCache<OpenGLBufferCacheParams, OpenGLDeviceTracker> =
             &mut self.buffer_cache;
         let texture_cache: *mut OpenGLTextureCache = &mut self.texture_cache;
+        let buffer_mutex: *const _ = unsafe { &(*buffer_cache).mutex };
+        let texture_mutex: *const _ = unsafe { &(*texture_cache).base.mutex };
+        lock_two_reentrant_mutexes!(buffer_mutex, texture_mutex, _buffer_lock, _texture_lock);
         unsafe {
-            let _buffer_lock = (*buffer_cache).mutex.lock();
-            let _texture_lock = (*texture_cache).base.mutex.lock();
             (*texture_cache).should_wait_async_flushes()
                 || (*buffer_cache).should_wait_async_flushes()
                 || self.query_cache.should_wait_async_flushes()
@@ -1090,9 +1117,10 @@ impl RasterizerOpenGL {
         let buffer_cache: *mut CommonBufferCache<OpenGLBufferCacheParams, OpenGLDeviceTracker> =
             &mut self.buffer_cache;
         let texture_cache: *mut OpenGLTextureCache = &mut self.texture_cache;
+        let buffer_mutex: *const _ = unsafe { &(*buffer_cache).mutex };
+        let texture_mutex: *const _ = unsafe { &(*texture_cache).base.mutex };
+        lock_two_reentrant_mutexes!(buffer_mutex, texture_mutex, _buffer_lock, _texture_lock);
         unsafe {
-            let _buffer_lock = (*buffer_cache).mutex.lock();
-            let _texture_lock = (*texture_cache).base.mutex.lock();
             (*texture_cache).has_uncommitted_flushes()
                 || (*buffer_cache).has_uncommitted_flushes()
                 || self.query_cache.has_uncommitted_flushes()
@@ -1103,9 +1131,10 @@ impl RasterizerOpenGL {
         let buffer_cache: *mut CommonBufferCache<OpenGLBufferCacheParams, OpenGLDeviceTracker> =
             &mut self.buffer_cache;
         let texture_cache: *mut OpenGLTextureCache = &mut self.texture_cache;
+        let buffer_mutex: *const _ = unsafe { &(*buffer_cache).mutex };
+        let texture_mutex: *const _ = unsafe { &(*texture_cache).base.mutex };
+        lock_two_reentrant_mutexes!(buffer_mutex, texture_mutex, _buffer_lock, _texture_lock);
         unsafe {
-            let _buffer_lock = (*buffer_cache).mutex.lock();
-            let _texture_lock = (*texture_cache).base.mutex.lock();
             (*texture_cache).pop_async_flushes();
             (*buffer_cache).pop_async_flushes();
         }
@@ -1116,9 +1145,10 @@ impl RasterizerOpenGL {
         let buffer_cache: *mut CommonBufferCache<OpenGLBufferCacheParams, OpenGLDeviceTracker> =
             &mut self.buffer_cache;
         let texture_cache: *mut OpenGLTextureCache = &mut self.texture_cache;
+        let buffer_mutex: *const _ = unsafe { &(*buffer_cache).mutex };
+        let texture_mutex: *const _ = unsafe { &(*texture_cache).base.mutex };
+        lock_two_reentrant_mutexes!(buffer_mutex, texture_mutex, _buffer_lock, _texture_lock);
         unsafe {
-            let _buffer_lock = (*buffer_cache).mutex.lock();
-            let _texture_lock = (*texture_cache).base.mutex.lock();
             (*texture_cache).commit_async_flushes();
             (*buffer_cache).commit_async_flushes();
         }
@@ -1274,14 +1304,14 @@ impl RasterizerInterface for RasterizerOpenGL {
         // configuration, cache synchronization, and the draw call. Do not move
         // this above shader-cache lookup/build; upstream does not hold these
         // cache locks while finding the graphics pipeline.
-        let _buffer_mutex_guard;
-        let _texture_mutex_guard;
-        unsafe {
-            let buffer_mutex: *const _ = &self.buffer_cache.mutex;
-            _buffer_mutex_guard = (*buffer_mutex).lock();
-            let texture_mutex: *const _ = &self.texture_cache.base.mutex;
-            _texture_mutex_guard = (*texture_mutex).lock();
-        }
+        let buffer_mutex: *const _ = &self.buffer_cache.mutex;
+        let texture_mutex: *const _ = &self.texture_cache.base.mutex;
+        lock_two_reentrant_mutexes!(
+            buffer_mutex,
+            texture_mutex,
+            _buffer_mutex_guard,
+            _texture_mutex_guard
+        );
 
         // Mirrors upstream `GraphicsPipeline::ConfigureImpl`
         // (gl_graphics_pipeline.cpp:278-284): the very first thing the

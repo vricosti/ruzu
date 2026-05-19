@@ -1088,7 +1088,21 @@ impl DrawManager {
             self.build_compat_draw_call(&self.draw_state, draw_indexed, instance_count, maxwell3d);
         self.compat_draw_calls.push(draw_call);
 
-        if maxwell3d.should_execute() {
+        let should_execute = maxwell3d.should_execute();
+        let trace_process_draw = std::env::var_os("RUZU_TRACE_PROCESS_DRAW").is_some();
+        if trace_process_draw {
+            eprintln!(
+                "[PROCESS_DRAW] indexed={} instances={} should_execute={} ib_count={} vb_count={} shader_addrs={:X?}",
+                draw_indexed,
+                instance_count,
+                should_execute,
+                self.draw_state.index_buffer.count,
+                self.draw_state.vertex_buffer.count,
+                maxwell3d.shader_program_addresses(),
+            );
+        }
+
+        if should_execute {
             // `draw_state.draw_indexed` is already kept in sync with the
             // Maxwell3D register file by the caller chains that lead into
             // `process_draw` (draw_index_small, draw_index_array, etc.).
@@ -1136,7 +1150,14 @@ impl DrawManager {
                     tex_sampler_addr: maxwell3d.tex_sampler_pool_address(),
                     tex_sampler_limit: maxwell3d.tex_sampler_pool_limit(),
                 };
-            if let Some(rasterizer) = maxwell3d.rasterizer_mut() {
+            let rasterizer = maxwell3d.rasterizer_mut();
+            if trace_process_draw {
+                eprintln!(
+                    "[PROCESS_DRAW] rasterizer_present={}",
+                    rasterizer.is_some()
+                );
+            }
+            if let Some(rasterizer) = rasterizer {
                 rasterizer.draw(&self.draw_state, instance_count);
             }
         }

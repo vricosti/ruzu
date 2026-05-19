@@ -8,8 +8,9 @@
 //! Port of zuyu/src/core/hle/service/nvnflinger/buffer_queue_core.h
 //! Port of zuyu/src/core/hle/service/nvnflinger/buffer_queue_core.cpp
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
+use std::time::Instant;
 
 use super::buffer_item::BufferItem;
 use super::buffer_queue_defs::{self, SlotsType, NUM_BUFFER_SLOTS};
@@ -53,6 +54,27 @@ pub struct BufferQueueCoreInner {
     pub is_allocating: bool,
 }
 
+static BQP_WAIT_SIGNAL_COUNT: AtomicU64 = AtomicU64::new(0);
+static BQP_WAIT_ENTER_COUNT: AtomicU64 = AtomicU64::new(0);
+static BQP_WAIT_RETURN_COUNT: AtomicU64 = AtomicU64::new(0);
+static BQP_WAIT_PRE_TRUE_COUNT: AtomicU64 = AtomicU64::new(0);
+static BQP_WAIT_TOTAL_US: AtomicU64 = AtomicU64::new(0);
+static BQP_WAIT_MAX_US: AtomicU64 = AtomicU64::new(0);
+
+fn bqp_wait_profile_enabled() -> bool {
+    std::env::var_os("RUZU_PROFILE_BQP_WAIT").is_some()
+}
+
+fn update_max(target: &AtomicU64, value: u64) {
+    let mut current = target.load(Ordering::Relaxed);
+    while value > current {
+        match target.compare_exchange_weak(current, value, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => break,
+            Err(next) => current = next,
+        }
+    }
+}
+
 impl BufferQueueCore {
     pub const INVALID_BUFFER_SLOT: i32 = BufferItem::INVALID_BUFFER_SLOT;
 
@@ -87,6 +109,9 @@ impl BufferQueueCore {
     }
 
     pub fn signal_dequeue_condition(&self) {
+        if bqp_wait_profile_enabled() {
+            BQP_WAIT_SIGNAL_COUNT.fetch_add(1, Ordering::Relaxed);
+        }
         self.dequeue_possible.store(true, Ordering::Release);
         self.dequeue_condition.notify_all();
     }
@@ -95,13 +120,46 @@ impl BufferQueueCore {
         &self,
         guard: std::sync::MutexGuard<'a, BufferQueueCoreInner>,
     ) -> std::sync::MutexGuard<'a, BufferQueueCoreInner> {
+        let profile = bqp_wait_profile_enabled();
+        let start = if profile {
+            BQP_WAIT_ENTER_COUNT.fetch_add(1, Ordering::Relaxed);
+            if self.dequeue_possible.load(Ordering::Acquire) {
+                BQP_WAIT_PRE_TRUE_COUNT.fetch_add(1, Ordering::Relaxed);
+            }
+            Some(Instant::now())
+        } else {
+            None
+        };
         let guard = self
             .dequeue_condition
             .wait_while(guard, |_| !self.dequeue_possible.load(Ordering::Acquire))
             .unwrap();
         self.dequeue_possible.store(false, Ordering::Release);
+        if let Some(start) = start {
+            let elapsed_us = start.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
+            BQP_WAIT_RETURN_COUNT.fetch_add(1, Ordering::Relaxed);
+            BQP_WAIT_TOTAL_US.fetch_add(elapsed_us, Ordering::Relaxed);
+            update_max(&BQP_WAIT_MAX_US, elapsed_us);
+        }
         guard
     }
+}
+
+pub fn dump_bqp_wait_profile() {
+    if !bqp_wait_profile_enabled() {
+        return;
+    }
+    let signals = BQP_WAIT_SIGNAL_COUNT.load(Ordering::Relaxed);
+    let enters = BQP_WAIT_ENTER_COUNT.load(Ordering::Relaxed);
+    let returns = BQP_WAIT_RETURN_COUNT.load(Ordering::Relaxed);
+    let pre_true = BQP_WAIT_PRE_TRUE_COUNT.load(Ordering::Relaxed);
+    let total_us = BQP_WAIT_TOTAL_US.load(Ordering::Relaxed);
+    let max_us = BQP_WAIT_MAX_US.load(Ordering::Relaxed);
+    let avg_us = if returns != 0 { total_us / returns } else { 0 };
+    eprintln!(
+        "[BQP_WAIT_PROFILE] signals={} wait_enters={} wait_returns={} pre_true={} total_us={} avg_us={} max_us={}",
+        signals, enters, returns, pre_true, total_us, avg_us, max_us
+    );
 }
 
 impl BufferQueueCoreInner {

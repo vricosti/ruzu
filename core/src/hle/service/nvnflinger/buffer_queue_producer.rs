@@ -215,6 +215,7 @@ impl BufferQueueProducer {
     }
 
     pub fn request_buffer(&self, slot: i32) -> (Status, Option<Arc<GraphicBuffer>>) {
+        record_bqp_event(BqpEvent::RequestBuffer);
         trace_bqp(format_args!("BQP::request_buffer slot={}", slot));
         let mut inner = self.core.mutex.lock().unwrap();
         if inner.is_abandoned {
@@ -257,6 +258,7 @@ impl BufferQueueProducer {
     }
 
     pub fn set_buffer_count(&self, buffer_count: i32) -> Status {
+        record_bqp_event(BqpEvent::SetBufferCount);
         trace_bqp(format_args!("BQP::set_buffer_count count={}", buffer_count));
         log::info!("[BQP_SET_COUNT] buffer_count={}", buffer_count);
         let mut inner = self.core.mutex.lock().unwrap();
@@ -284,8 +286,8 @@ impl BufferQueueProducer {
 
         if buffer_count == 0 {
             inner.override_max_buffer_count = 0;
-            drop(inner);
             self.core.signal_dequeue_condition();
+            drop(inner);
             return Status::NoError;
         }
 
@@ -305,9 +307,9 @@ impl BufferQueueProducer {
 
         inner.override_max_buffer_count = buffer_count;
         let listener = inner.consumer_listener.clone();
-        drop(inner);
         self.core.signal_dequeue_condition();
         self.signal_buffer_wait_event();
+        drop(inner);
         if let Some(listener) = listener {
             listener.on_buffers_released();
         }
@@ -323,6 +325,7 @@ impl BufferQueueProducer {
         mut format: PixelFormat,
         mut usage: u32,
     ) -> (i32, i32, Fence) {
+        record_bqp_event(BqpEvent::DequeueBuffer);
         trace_bqp(format_args!(
             "BQP::dequeue_buffer async={} w={} h={} format={:?} usage=0x{:X}",
             async_flag, width, height, format, usage
@@ -448,6 +451,7 @@ impl BufferQueueProducer {
     }
 
     pub fn queue_buffer(&self, slot: i32, input: &QueueBufferInput) -> (Status, QueueBufferOutput) {
+        record_bqp_event(BqpEvent::QueueBuffer);
         trace_bqp(format_args!("BQP::queue_buffer slot={}", slot));
         {
             use std::sync::atomic::{AtomicU64, Ordering};
@@ -620,8 +624,8 @@ impl BufferQueueProducer {
             ticket
         };
 
-        drop(inner);
         self.core.signal_dequeue_condition();
+        drop(inner);
         callback_item.graphic_buffer = None;
         callback_item.slot = super::buffer_item::BufferItem::INVALID_BUFFER_SLOT;
 
@@ -657,6 +661,7 @@ impl BufferQueueProducer {
     }
 
     pub fn cancel_buffer(&self, slot: i32, fence: &Fence) {
+        record_bqp_event(BqpEvent::CancelBuffer);
         let mut inner = self.core.mutex.lock().unwrap();
         if inner.is_abandoned {
             return;
@@ -667,12 +672,13 @@ impl BufferQueueProducer {
         inner.slots[slot as usize].buffer_state = super::buffer_slot::BufferState::Free;
         inner.slots[slot as usize].frame_number = 0;
         inner.slots[slot as usize].fence = *fence;
-        drop(inner);
         self.core.signal_dequeue_condition();
         self.signal_buffer_wait_event();
+        drop(inner);
     }
 
     pub fn query(&self, what: NativeWindow) -> (Status, i32) {
+        record_bqp_event(BqpEvent::Query);
         let inner = self.core.mutex.lock().unwrap();
 
         if inner.is_abandoned {
@@ -704,6 +710,7 @@ impl BufferQueueProducer {
         api: NativeWindowApi,
         producer_controlled_by_app: bool,
     ) -> (Status, QueueBufferOutput) {
+        record_bqp_event(BqpEvent::Connect);
         trace_bqp(format_args!(
             "BQP::connect api={:?} producer_controlled_by_app={}",
             api, producer_controlled_by_app
@@ -756,6 +763,7 @@ impl BufferQueueProducer {
     }
 
     pub fn disconnect(&self, api: NativeWindowApi) -> Status {
+        record_bqp_event(BqpEvent::Disconnect);
         let mut inner = self.core.mutex.lock().unwrap();
 
         if inner.is_abandoned {
@@ -775,9 +783,9 @@ impl BufferQueueProducer {
         inner.connected_producer_listener = None;
         inner.queue.clear();
         inner.free_all_buffers_locked();
-        drop(inner);
         self.core.signal_dequeue_condition();
         self.signal_buffer_wait_event();
+        drop(inner);
 
         Status::NoError
     }
@@ -787,6 +795,7 @@ impl BufferQueueProducer {
         slot: i32,
         buffer: Option<Arc<NvGraphicBuffer>>,
     ) -> Status {
+        record_bqp_event(BqpEvent::SetPreallocatedBuffer);
         if let Some(buf) = buffer.as_ref() {
             trace_bqp(format_args!(
                 "BQP::set_preallocated_buffer slot={} magic=0x{:08X} w={} h={} stride={} fmt={:?} usage=0x{:X} buffer_id={} ext_fmt={:?} handle={} offset={}",
@@ -830,9 +839,9 @@ impl BufferQueueProducer {
             inner.default_buffer_format = buf.get_format();
         }
 
-        drop(inner);
         self.core.signal_dequeue_condition();
         self.signal_buffer_wait_event();
+        drop(inner);
 
         Status::NoError
     }
@@ -1107,6 +1116,66 @@ impl Drop for BufferQueueProducer {
 
 static BQP_SLOT_COUNTS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<i32, u64>>> =
     std::sync::OnceLock::new();
+static BQP_EVENT_COUNTS: [std::sync::atomic::AtomicU64; 9] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+
+#[repr(usize)]
+#[derive(Clone, Copy)]
+enum BqpEvent {
+    Connect = 0,
+    SetPreallocatedBuffer = 1,
+    SetBufferCount = 2,
+    DequeueBuffer = 3,
+    RequestBuffer = 4,
+    QueueBuffer = 5,
+    CancelBuffer = 6,
+    Query = 7,
+    Disconnect = 8,
+}
+
+impl BqpEvent {
+    const ALL: [Self; 9] = [
+        Self::Connect,
+        Self::SetPreallocatedBuffer,
+        Self::SetBufferCount,
+        Self::DequeueBuffer,
+        Self::RequestBuffer,
+        Self::QueueBuffer,
+        Self::CancelBuffer,
+        Self::Query,
+        Self::Disconnect,
+    ];
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Connect => "Connect",
+            Self::SetPreallocatedBuffer => "SetPreallocatedBuffer",
+            Self::SetBufferCount => "SetBufferCount",
+            Self::DequeueBuffer => "DequeueBuffer",
+            Self::RequestBuffer => "RequestBuffer",
+            Self::QueueBuffer => "QueueBuffer",
+            Self::CancelBuffer => "CancelBuffer",
+            Self::Query => "Query",
+            Self::Disconnect => "Disconnect",
+        }
+    }
+}
+
+fn record_bqp_event(event: BqpEvent) {
+    if std::env::var_os("RUZU_PROFILE_BQP_SLOTS").is_none() {
+        return;
+    }
+    BQP_EVENT_COUNTS[event as usize].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
 
 pub(crate) fn record_bqp_slot(slot: i32) {
     if std::env::var_os("RUZU_PROFILE_BQP_SLOTS").is_none() {
@@ -1119,6 +1188,14 @@ pub(crate) fn record_bqp_slot(slot: i32) {
 }
 
 pub fn dump_bqp_slot_profile() {
+    if std::env::var_os("RUZU_PROFILE_BQP_SLOTS").is_none() {
+        return;
+    }
+    eprintln!("[BQP_PROFILE] call counts:");
+    for event in BqpEvent::ALL {
+        let count = BQP_EVENT_COUNTS[event as usize].load(std::sync::atomic::Ordering::Relaxed);
+        eprintln!("[BQP_PROFILE]   {:<24} {}", event.name(), count);
+    }
     let Some(map) = BQP_SLOT_COUNTS.get() else {
         return;
     };
