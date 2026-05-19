@@ -449,6 +449,7 @@ fn main() {
     let want_hwc_cache_profile = std::env::var_os("RUZU_PROFILE_HWC_CACHE").is_some();
     let want_vsync_profile = std::env::var_os("RUZU_PROFILE_VSYNC").is_some();
     let want_present_profile = std::env::var_os("RUZU_PROFILE_PRESENT").is_some();
+    let want_submit_gpfifo_profile = std::env::var_os("RUZU_PROFILE_SUBMIT_GPFIFO").is_some();
     if want_ipc_profile
         || want_svc_profile
         || want_wake_profile
@@ -461,6 +462,7 @@ fn main() {
         || want_hwc_cache_profile
         || want_vsync_profile
         || want_present_profile
+        || want_submit_gpfifo_profile
     {
         extern "C" fn profile_signal(_signum: libc::c_int) {
             ruzu_core::hle::kernel::svc::svc_ipc::dump_ipc_profile();
@@ -469,6 +471,7 @@ fn main() {
             ruzu_core::hle::kernel::svc_dispatch::dump_wake_latency();
             ruzu_core::hle::kernel::svc_dispatch::dump_gap_profile();
             ruzu_core::hle::service::nvdrv::nvdrv_interface::dump_nvdrv_ioctl_profile();
+            ruzu_core::hle::service::nvdrv::devices::nvhost_gpu::dump_submit_gpfifo_profile();
             ruzu_core::hle::kernel::svc::svc_ipc::dump_ipc_phase_profile();
             ruzu_core::hle::service::hle_ipc::dump_hle_handler_profile();
             ruzu_core::hle::service::nvnflinger::buffer_queue_producer::dump_bqp_slot_profile();
@@ -490,6 +493,7 @@ fn main() {
             ruzu_core::hle::kernel::svc_dispatch::dump_wake_latency();
             ruzu_core::hle::kernel::svc_dispatch::dump_gap_profile();
             ruzu_core::hle::service::nvdrv::nvdrv_interface::dump_nvdrv_ioctl_profile();
+            ruzu_core::hle::service::nvdrv::devices::nvhost_gpu::dump_submit_gpfifo_profile();
             ruzu_core::hle::kernel::svc::svc_ipc::dump_ipc_phase_profile();
             ruzu_core::hle::service::hle_ipc::dump_hle_handler_profile();
             ruzu_core::hle::service::nvnflinger::buffer_queue_producer::dump_bqp_slot_profile();

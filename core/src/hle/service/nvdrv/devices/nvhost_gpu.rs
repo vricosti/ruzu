@@ -186,6 +186,61 @@ fn build_increment_command_list(fence: NvFence) -> GpuCommandList {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Fine-grained submit_gpfifo profile (RUZU_PROFILE_SUBMIT_GPFIFO=1)
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Default)]
+struct SubmitGpfifoPhaseAgg {
+    count: u64,
+    total_ns: u64,
+    max_ns: u64,
+}
+
+static SUBMIT_GPFIFO_PROFILE: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<&'static str, SubmitGpfifoPhaseAgg>>,
+> = std::sync::OnceLock::new();
+
+fn record_submit_gpfifo_phase(label: &'static str, elapsed: std::time::Duration) {
+    let agg = SUBMIT_GPFIFO_PROFILE
+        .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    let ns = elapsed.as_nanos() as u64;
+    let mut g = agg.lock().unwrap();
+    let entry = g.entry(label).or_default();
+    entry.count += 1;
+    entry.total_ns = entry.total_ns.saturating_add(ns);
+    if ns > entry.max_ns {
+        entry.max_ns = ns;
+    }
+}
+
+pub fn dump_submit_gpfifo_profile() {
+    let Some(agg) = SUBMIT_GPFIFO_PROFILE.get() else {
+        return;
+    };
+    let entries: Vec<(&'static str, SubmitGpfifoPhaseAgg)> = {
+        let g = agg.lock().unwrap();
+        g.iter().map(|(k, v)| (*k, v.clone())).collect()
+    };
+    if entries.is_empty() {
+        return;
+    }
+    let mut sorted = entries;
+    sorted.sort_by(|a, b| a.0.cmp(b.0));
+    eprintln!("[SUBMIT_GPFIFO_PROFILE] per-phase timing (RUZU_PROFILE_SUBMIT_GPFIFO=1):");
+    for (label, agg) in &sorted {
+        let avg = if agg.count != 0 { agg.total_ns / agg.count } else { 0 };
+        eprintln!(
+            "[SUBMIT_GPFIFO_PROFILE]   {:24} count={:<5} total={:>8.2}ms avg={:>8.1}us max={:>8.1}us",
+            label,
+            agg.count,
+            agg.total_ns as f64 / 1_000_000.0,
+            avg as f64 / 1_000.0,
+            agg.max_ns as f64 / 1_000.0,
+        );
+    }
+}
+
 fn build_increment_with_wfi_command_list(fence: NvFence) -> GpuCommandList {
     let mut result = GpuCommandList {
         command_lists: Vec::new(),
@@ -451,25 +506,58 @@ impl NvHostGpu {
             );
         }
 
+        // RUZU_PROFILE_SUBMIT_GPFIFO=1: env-gated fine-grained timing of each
+        // sub-step. Dumped via the same SIGUSR2 handler as the other profiles.
+        let profile = std::env::var_os("RUZU_PROFILE_SUBMIT_GPFIFO").is_some();
+        let mark = |label: &'static str, start: &mut Option<std::time::Instant>| {
+            if let Some(t0) = start.take() {
+                record_submit_gpfifo_phase(label, t0.elapsed());
+            }
+            if profile {
+                *start = Some(std::time::Instant::now());
+            }
+        };
+
+        let mut phase_start = if profile {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
+
         let gpu = self
             .system
             .get()
             .gpu_core()
             .expect("GPU core must remain available while nvhost_gpu is alive");
+        mark("01_gpu_lookup", &mut phase_start);
 
         let _channel_guard = self.channel_mutex.lock().unwrap();
+        mark("02_channel_mutex_lock", &mut phase_start);
+
         let channel_syncpoint = self.channel_syncpoint.load(Ordering::Acquire);
         let bind_id = self.channel_state.bind_id();
 
-        if params.fence_wait() {
+        let entered_fence_wait_branch = if params.fence_wait() {
             if params.increment_value() {
                 return NvResult::BadParameter;
             }
+            mark("03a_fence_wait_check", &mut phase_start);
 
-            if !self.syncpoint_manager().is_fence_signalled(&params.fence) {
+            let signalled = self.syncpoint_manager().is_fence_signalled(&params.fence);
+            mark("03b_is_fence_signalled", &mut phase_start);
+
+            if !signalled {
                 gpu.push_gpu_entries(bind_id, build_wait_command_list(params.fence));
+                mark("03c_push_wait_command", &mut phase_start);
+            } else {
+                mark("03d_fence_already_signalled", &mut phase_start);
             }
-        }
+            true
+        } else {
+            mark("03e_no_fence_wait", &mut phase_start);
+            false
+        };
+        let _ = entered_fence_wait_branch;
 
         params.fence.id = channel_syncpoint as i32;
         let increment = (if params.fence_increment() { 2 } else { 0 })
@@ -481,7 +569,10 @@ impl NvHostGpu {
         params.fence.value = self
             .syncpoint_manager()
             .increment_syncpoint_max_ext(channel_syncpoint, increment);
+        mark("04_syncpoint_increment", &mut phase_start);
+
         gpu.push_gpu_entries(bind_id, entries);
+        mark("05_push_main_entries", &mut phase_start);
 
         if params.fence_increment() {
             if params.suppress_wfi() {
@@ -490,6 +581,7 @@ impl NvHostGpu {
                 gpu.push_gpu_entries(bind_id, build_increment_with_wfi_command_list(params.fence));
             }
         }
+        mark("06_push_fence_increment", &mut phase_start);
         // [SP_TRACE] log MAX vs MIN of the channel syncpoint after each
         // submit. If MAX advances but MIN doesn't catch up, the GPU is
         // dropping syncpoint-increment commands and game waits stall.
