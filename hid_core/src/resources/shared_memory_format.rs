@@ -447,4 +447,85 @@ mod tests {
             HID_ENTRY_COUNT as i64
         );
     }
+
+    #[test]
+    fn shared_memory_layout_matches_upstream() {
+        assert_eq!(
+            std::mem::offset_of!(SharedMemoryFormat, npad)
+                + std::mem::offset_of!(NpadSharedMemoryFormat, npad_entry)
+                + std::mem::offset_of!(NpadSharedMemoryEntry, internal_state)
+                + std::mem::offset_of!(NpadInternalState, fullkey_lifo)
+                + std::mem::offset_of!(Lifo<NPadGenericState, HID_ENTRY_COUNT>, buffer_tail),
+            0x9A38
+        );
+        assert_eq!(
+            std::mem::size_of::<DebugPadSharedMemoryFormat>(),
+            0x400
+        );
+        assert_eq!(
+            std::mem::size_of::<TouchScreenSharedMemoryFormat>(),
+            0x3000
+        );
+        assert_eq!(std::mem::size_of::<MouseSharedMemoryFormat>(), 0x400);
+        assert_eq!(std::mem::size_of::<KeyboardSharedMemoryFormat>(), 0x400);
+        assert_eq!(std::mem::size_of::<DigitizerSharedMemoryFormat>(), 0x1000);
+        assert_eq!(
+            std::mem::size_of::<HomeButtonSharedMemoryFormat>(),
+            0x200
+        );
+        assert_eq!(
+            std::mem::size_of::<SleepButtonSharedMemoryFormat>(),
+            0x200
+        );
+        assert_eq!(
+            std::mem::size_of::<CaptureButtonSharedMemoryFormat>(),
+            0x200
+        );
+        assert_eq!(
+            std::mem::size_of::<InputDetectorSharedMemoryFormat>(),
+            0x800
+        );
+        assert_eq!(std::mem::size_of::<UniquePadSharedMemoryFormat>(), 0x4000);
+        assert_eq!(std::mem::size_of::<NpadInternalState>(), 0x43F8);
+        assert_eq!(std::mem::size_of::<NpadSharedMemoryEntry>(), 0x5000);
+        assert_eq!(std::mem::size_of::<NpadSharedMemoryFormat>(), 0x32000);
+        assert_eq!(std::mem::size_of::<GestureSharedMemoryFormat>(), 0x800);
+        assert_eq!(
+            std::mem::size_of::<ConsoleSixAxisSensorSharedMemoryFormat>(),
+            0x20
+        );
+        assert_eq!(std::mem::size_of::<SharedMemoryFormat>(), 0x40000);
+
+        assert_eq!(std::mem::offset_of!(SharedMemoryFormat, debug_pad), 0x0);
+        assert_eq!(
+            std::mem::offset_of!(SharedMemoryFormat, touch_screen),
+            0x400
+        );
+        assert_eq!(std::mem::offset_of!(SharedMemoryFormat, mouse), 0x3400);
+        assert_eq!(std::mem::offset_of!(SharedMemoryFormat, keyboard), 0x3800);
+        assert_eq!(std::mem::offset_of!(SharedMemoryFormat, digitizer), 0x3C00);
+        assert_eq!(
+            std::mem::offset_of!(SharedMemoryFormat, home_button),
+            0x4C00
+        );
+        assert_eq!(
+            std::mem::offset_of!(SharedMemoryFormat, sleep_button),
+            0x4E00
+        );
+        assert_eq!(
+            std::mem::offset_of!(SharedMemoryFormat, capture_button),
+            0x5000
+        );
+        assert_eq!(
+            std::mem::offset_of!(SharedMemoryFormat, input_detector),
+            0x5200
+        );
+        assert_eq!(std::mem::offset_of!(SharedMemoryFormat, npad), 0x9A00);
+        assert_eq!(std::mem::offset_of!(SharedMemoryFormat, gesture), 0x3BA00);
+        assert_eq!(std::mem::offset_of!(SharedMemoryFormat, console), 0x3C200);
+        assert_eq!(
+            std::mem::offset_of!(SharedMemoryFormat, debug_mouse),
+            0x3DC00
+        );
+    }
 }

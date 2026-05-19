@@ -1058,6 +1058,66 @@ impl Memory {
         }
     }
 
+    /// Write a u32 (LE) without notifying the rasterizer.
+    ///
+    /// Kernel synchronization helpers use this for guest mutex/CV words while
+    /// holding the global scheduler lock. Calling the rasterizer from there can
+    /// invert Rust host locks (`Memory` -> shader cache) against the GPU thread
+    /// (shader cache -> `Memory`). Guest/JIT writes must keep using `write_32`.
+    pub fn write_32_no_rasterizer(&self, vaddr: u64, data: u32) {
+        if (vaddr & 3) == 0 {
+            unsafe { self.write_raw::<u32>(vaddr, data) }
+        } else {
+            unsafe {
+                self.write_raw::<u8>(vaddr, data as u8);
+                self.write_raw::<u8>(vaddr + 1, (data >> 8) as u8);
+                self.write_raw::<u8>(vaddr + 2, (data >> 16) as u8);
+                self.write_raw::<u8>(vaddr + 3, (data >> 24) as u8);
+            }
+        }
+    }
+
+    /// Write a byte block without notifying the rasterizer.
+    ///
+    /// Used for host-side HLE/service writes where ruzu already holds the global
+    /// `Mutex<Memory>`. Guest/JIT writes must keep using `write_block`.
+    pub fn write_block_no_rasterizer(&self, dest_addr: u64, src: &[u8]) -> bool {
+        let size = src.len();
+        if size == 0 {
+            return true;
+        }
+
+        if !self.address_space_contains(dest_addr, size) {
+            log::error!("Unmapped WriteBlock @ {:#018x} size={:#x}", dest_addr, size);
+            return false;
+        }
+
+        let mut remaining = size;
+        let mut offset = 0usize;
+        let mut vaddr = dest_addr;
+        let mut user_accessible = true;
+
+        while remaining > 0 {
+            let page_offset = (vaddr & PAGE_MASK) as usize;
+            let copy_amount = ((PAGE_SIZE as usize) - page_offset).min(remaining);
+
+            let ptr = self.get_pointer_impl(vaddr);
+            if ptr.is_null() {
+                log::error!("Unmapped WriteBlock @ {:#018x}", vaddr);
+                user_accessible = false;
+            } else {
+                unsafe {
+                    std::ptr::copy_nonoverlapping(src[offset..].as_ptr(), ptr, copy_amount);
+                }
+            }
+
+            vaddr += copy_amount as u64;
+            offset += copy_amount;
+            remaining -= copy_amount;
+        }
+        user_accessible
+    }
+
     /// Write a u64 (LE). Matches upstream `Memory::Write64`.
     pub fn write_64(&self, vaddr: u64, data: u64) {
         // RUZU_TRACE_MEMORY_W64_AT_VADDR=0xVADDR — log every call into
