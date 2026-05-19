@@ -2708,7 +2708,9 @@ impl KThread {
         let new_base = new_state & ThreadState::MASK;
 
         // Upstream: KScheduler::OnThreadStateChanged(kernel, this, old_state)
-        // Updates the PQ directly via GetPriorityQueue(kernel).
+        // compares the raw state against ThreadState::Runnable. Suspend-bit
+        // transitions like RUNNABLE -> DEBUG_SUSPENDED|RUNNABLE must therefore
+        // be visible to the scheduler so it removes the thread from the PQ.
         // We access the GSC directly (bypassing the process lock) to match upstream.
         let mut notified_gsc = false;
         if let Some(gsc_arc) = self
@@ -2732,8 +2734,8 @@ impl KThread {
             }
             gsc_arc.lock().unwrap().on_thread_state_changed(
                 thread_id,
-                old_base,
-                new_base,
+                old_state,
+                new_state,
                 priority,
                 active_core,
                 affinity,
@@ -2756,8 +2758,8 @@ impl KThread {
             if let Some(scheduler) = self.scheduler.as_ref().and_then(Weak::upgrade) {
                 scheduler.lock().unwrap().on_thread_state_changed(
                     self.thread_id,
-                    old_base,
-                    new_base,
+                    old_state,
+                    new_state,
                 );
             }
         }

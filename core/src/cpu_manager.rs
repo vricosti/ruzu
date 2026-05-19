@@ -845,7 +845,7 @@ impl CpuManager {
                         };
                         let current_thread_blocked = {
                             let thread = thread_arc.lock().unwrap();
-                            thread.get_state()
+                            thread.get_raw_state()
                                 != crate::hle::kernel::k_thread::ThreadState::RUNNABLE
                         };
                         if current_thread_blocked {

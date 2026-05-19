@@ -684,6 +684,12 @@ impl KPriorityQueue {
         if is_dummy {
             return;
         }
+        let (priority, active_core, affinity) =
+            if let Some(existing) = self.thread_props.get(&member_id) {
+                (existing.priority, existing.active_core, existing.affinity)
+            } else {
+                (priority, active_core, affinity)
+            };
         self.remove_impl(priority, member_id, active_core, affinity);
         // Keep entries around (they'll be reused on next push).
         // Remove props since thread is no longer in PQ.

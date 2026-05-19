@@ -28,6 +28,7 @@ use crate::hle::kernel::svc::svc_memory;
 use crate::hle::kernel::svc::svc_physical_memory;
 use crate::hle::kernel::svc::svc_port;
 use crate::hle::kernel::svc::svc_process;
+use crate::hle::kernel::svc::svc_process_memory;
 use crate::hle::kernel::svc::svc_processor;
 use crate::hle::kernel::svc::svc_shared_memory;
 use crate::hle::kernel::svc::svc_synchronization;
@@ -61,6 +62,91 @@ fn drain_current_thread_termination(system: &System) {
     } {
         current_thread.lock().unwrap().exit();
         system.scheduler_arc().lock().unwrap().request_schedule();
+    }
+}
+
+fn log_unknown_svc_context(system: &System, imm: u32, is_64bit: bool) {
+    use crate::arm::arm_interface::ThreadContext;
+    use std::fmt::Write;
+    use std::sync::atomic::Ordering;
+
+    let n = UNKNOWN_SVC_CONTEXT_COUNT.fetch_add(1, Ordering::Relaxed);
+    if n >= 32 {
+        log::error!(
+            "Unknown SVC 0x{:02X} in {}-bit mode (context suppressed after 32 reports)",
+            imm,
+            if is_64bit { 64 } else { 32 }
+        );
+        return;
+    }
+
+    let (core_id, tid) = system
+        .current_thread()
+        .and_then(|thread| {
+            thread
+                .lock()
+                .ok()
+                .map(|thread| (thread.get_current_core(), thread.get_thread_id()))
+        })
+        .unwrap_or((-1, 0));
+
+    let mut ctx = ThreadContext::default();
+    let mut have_ctx = false;
+    if let Some(kernel) = system.kernel() {
+        let core_index = kernel.current_physical_core_index() as usize;
+        if let Some(process_arc) = system.current_process_arc.as_ref().cloned() {
+            let process = process_arc.lock().unwrap();
+            if let Some(jit) = process.get_arm_interface(core_index) {
+                jit.get_context(&mut ctx);
+                have_ctx = true;
+            }
+        }
+    }
+
+    let mut code_words = String::new();
+    if have_ctx {
+        if let Some(process_arc) = system.current_process_arc.as_ref().cloned() {
+            let process = process_arc.lock().unwrap();
+            let memory = process.process_memory.read().unwrap();
+            let base = ctx.pc.saturating_sub(8);
+            for i in 0..5u64 {
+                let addr = base + i * 4;
+                let word = if memory.is_valid_range(addr, 4) {
+                    memory.read_32(addr)
+                } else {
+                    0xDEADBEEF
+                };
+                let _ = write!(code_words, " [{:#010x}]={:#010x}", addr as u32, word);
+            }
+        }
+    }
+
+    if have_ctx {
+        log::error!(
+            "Unknown SVC 0x{:02X} in {}-bit mode tid={} core={} pc={:#010x} r15={:#010x} lr={:#010x} sp={:#010x} r0={:#010x} r1={:#010x} r2={:#010x} r3={:#010x} cpsr={:#010x} code:{}",
+            imm,
+            if is_64bit { 64 } else { 32 },
+            tid,
+            core_id,
+            ctx.pc as u32,
+            ctx.r[15] as u32,
+            ctx.r[14] as u32,
+            ctx.r[13] as u32,
+            ctx.r[0] as u32,
+            ctx.r[1] as u32,
+            ctx.r[2] as u32,
+            ctx.r[3] as u32,
+            ctx.pstate,
+            code_words,
+        );
+    } else {
+        log::error!(
+            "Unknown SVC 0x{:02X} in {}-bit mode tid={} core={} (no JIT context)",
+            imm,
+            if is_64bit { 64 } else { 32 },
+            tid,
+            core_id
+        );
     }
 }
 
@@ -1397,10 +1483,24 @@ fn call32(system: &System, imm: u32, args: &mut SvcArgs) {
             set_arg32(args, 1, 0);
         }
         Some(SvcId::MapProcessCodeMemory) => {
-            set_arg32(args, 0, STUB_SUCCESS);
+            let result = svc_process_memory::map_process_code_memory(
+                system,
+                get_arg32(args, 0),
+                gather64(args, 2, 3),
+                gather64(args, 1, 4),
+                gather64(args, 5, 6),
+            );
+            set_arg32(args, 0, result.get_inner_value());
         }
         Some(SvcId::UnmapProcessCodeMemory) => {
-            set_arg32(args, 0, STUB_SUCCESS);
+            let result = svc_process_memory::unmap_process_code_memory(
+                system,
+                get_arg32(args, 0),
+                gather64(args, 2, 3),
+                gather64(args, 1, 4),
+                gather64(args, 5, 6),
+            );
+            set_arg32(args, 0, result.get_inner_value());
         }
 
         // =====================================================================
@@ -1418,7 +1518,7 @@ fn call32(system: &System, imm: u32, args: &mut SvcArgs) {
         }
 
         None => {
-            log::error!("Unknown SVC 0x{:02X} in 32-bit mode", imm);
+            log_unknown_svc_context(system, imm, false);
             set_arg32(args, 0, 0xF001); // Generic error
         }
     }
@@ -1794,6 +1894,26 @@ fn call64(system: &System, imm: u32, args: &mut SvcArgs) {
             let result = svc_transfer_memory::unmap_transfer_memory(system, handle, address, size);
             set_arg64(args, 0, result.get_inner_value() as u64);
         }
+        Some(SvcId::MapProcessCodeMemory) => {
+            let result = svc_process_memory::map_process_code_memory(
+                system,
+                get_arg64(args, 0) as u32,
+                get_arg64(args, 1),
+                get_arg64(args, 2),
+                get_arg64(args, 3),
+            );
+            set_arg64(args, 0, result.get_inner_value() as u64);
+        }
+        Some(SvcId::UnmapProcessCodeMemory) => {
+            let result = svc_process_memory::unmap_process_code_memory(
+                system,
+                get_arg64(args, 0) as u32,
+                get_arg64(args, 1),
+                get_arg64(args, 2),
+                get_arg64(args, 3),
+            );
+            set_arg64(args, 0, result.get_inner_value() as u64);
+        }
         Some(SvcId::GetResourceLimitLimitValue) => {
             set_arg64(args, 0, STUB_SUCCESS as u64);
             set_arg64(args, 1, 0x1_0000_0000);
@@ -1808,7 +1928,7 @@ fn call64(system: &System, imm: u32, args: &mut SvcArgs) {
             set_arg64(args, 0, STUB_SUCCESS as u64);
         }
         None => {
-            log::error!("Unknown SVC 0x{:02X} in 64-bit mode", imm);
+            log_unknown_svc_context(system, imm, true);
             set_arg64(args, 0, 0xF001);
         }
     }
@@ -2561,6 +2681,12 @@ pub fn dump_svc_profile() {
 
 /// Per-tid SVC counter for the memory snapshot hook (RUZU_DUMP_AT_SVC=N).
 static SVC_COUNTER_TID73: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Rate-limit unknown-SVC context dumps. Unknown SVCs usually mean guest state
+/// is already corrupt, and rescheduling the same faulting thread can otherwise
+/// flood stderr before the scheduler parks it.
+static UNKNOWN_SVC_CONTEXT_COUNT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 
 /// Global SVC counter on the main thread (tid=73). Always increments on every
 /// SVC entry from tid=73 regardless of env-var state. Used to drive the
