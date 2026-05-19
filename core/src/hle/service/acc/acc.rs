@@ -17,8 +17,10 @@ use crate::hle::service::hle_ipc::{
     HLERequestContext, SessionRequestHandler, SessionRequestHandlerPtr,
 };
 use crate::hle::service::ipc_helpers::{RequestParser, ResponseBuilder};
+use crate::hle::service::os::event::Event;
 use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 /// Generate a random UUID. Upstream uses `Common::UUID::MakeRandom()`.
@@ -312,6 +314,8 @@ fn push_interface_response(ctx: &mut HLERequestContext, object: SessionRequestHa
 }
 
 struct EnsureTokenIdCacheAsyncInterface {
+    completion_event: Arc<Event>,
+    is_complete: AtomicBool,
     handlers: BTreeMap<u32, FunctionInfo>,
     handlers_tipc: BTreeMap<u32, FunctionInfo>,
 }
@@ -319,57 +323,62 @@ struct EnsureTokenIdCacheAsyncInterface {
 impl EnsureTokenIdCacheAsyncInterface {
     fn new() -> Self {
         let handlers = build_handler_map(&[
-            (0, Some(Self::unknown0_handler), "Unknown0"),
-            (
-                1,
-                Some(Self::load_id_token_cache_handler),
-                "LoadIdTokenCache",
-            ),
-            (2, Some(Self::unknown2_handler), "Unknown2"),
-            (3, Some(Self::unknown3_handler), "Unknown3"),
-            (100, Some(Self::cancel_handler), "Cancel"),
-            (101, Some(Self::get_result_handler), "GetResult"),
+            (0, Some(Self::get_system_event_handler), "GetSystemEvent"),
+            (1, Some(Self::cancel_handler), "Cancel"),
+            (2, Some(Self::has_done_handler), "HasDone"),
+            (3, Some(Self::get_result_handler), "GetResult"),
         ]);
+        let completion_event = Arc::new(Event::new());
+        completion_event.signal();
         Self {
+            completion_event,
+            is_complete: AtomicBool::new(true),
             handlers,
             handlers_tipc: BTreeMap::new(),
         }
     }
 
-    fn unknown0_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
-        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
-        rb.push_result(RESULT_SUCCESS);
-    }
-
-    fn load_id_token_cache_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn get_system_event_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         let svc = unsafe {
             &*(this as *const dyn ServiceFramework as *const EnsureTokenIdCacheAsyncInterface)
         };
-        svc.load_id_token_cache(ctx);
+        let handle = svc.completion_event.copy_handle(ctx).unwrap_or(0);
+        let mut rb = ResponseBuilder::new(ctx, 2, 1, 0);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_copy_objects(handle);
     }
 
-    fn unknown2_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn cancel_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let svc = unsafe {
+            &*(this as *const dyn ServiceFramework as *const EnsureTokenIdCacheAsyncInterface)
+        };
+        svc.is_complete.store(true, Ordering::Release);
+        svc.completion_event.signal();
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
     }
 
-    fn unknown3_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
-        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+    fn has_done_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let svc = unsafe {
+            &*(this as *const dyn ServiceFramework as *const EnsureTokenIdCacheAsyncInterface)
+        };
+        let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
         rb.push_result(RESULT_SUCCESS);
+        rb.push_bool(svc.is_complete.load(Ordering::Acquire));
     }
 
-    fn cancel_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
-        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
-        rb.push_result(RESULT_SUCCESS);
-    }
-
-    fn get_result_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn get_result_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let svc = unsafe {
+            &*(this as *const dyn ServiceFramework as *const EnsureTokenIdCacheAsyncInterface)
+        };
+        svc.is_complete.store(true, Ordering::Release);
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
     }
 
     fn load_id_token_cache(&self, ctx: &mut HLERequestContext) {
-        ctx.write_buffer(&[], 0);
+        self.is_complete.store(true, Ordering::Release);
+        self.completion_event.signal();
         let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
         rb.push_result(RESULT_SUCCESS);
         rb.push_u32(0);

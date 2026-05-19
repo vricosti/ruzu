@@ -1209,7 +1209,16 @@ impl HLERequestContext {
     /// Returns the number of bytes written.
     pub fn write_buffer(&self, data: &[u8], buffer_index: usize) -> usize {
         if data.is_empty() {
-            log::warn!("WriteBuffer: skip empty buffer write");
+            IPC_TRACE_CURRENT.with(|current| {
+                let current = current.borrow();
+                log::warn!(
+                    "WriteBuffer: skip empty buffer write service={} cmd={} ioctl=0x{:X} index={}",
+                    current.0,
+                    current.1,
+                    current.2,
+                    buffer_index
+                );
+            });
             return 0;
         }
 
