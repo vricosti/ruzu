@@ -16,6 +16,7 @@
 
 use sdl2::sys as sdl;
 use std::ffi::CStr;
+use std::sync::Mutex;
 
 use super::emu_window_sdl2::EmuWindowSdl2;
 
@@ -23,6 +24,10 @@ use super::emu_window_sdl2::EmuWindowSdl2;
 // Maps to C++ `Layout::ScreenUndocked::Width` / `Layout::ScreenUndocked::Height`.
 const SCREEN_UNDOCKED_WIDTH: i32 = 1280;
 const SCREEN_UNDOCKED_HEIGHT: i32 = 720;
+
+static SHARE_ANCHOR_MUTEX: Mutex<()> = Mutex::new(());
+static mut SHARE_ANCHOR_CONTEXT: sdl::SDL_GLContext = std::ptr::null_mut();
+static mut SHARE_ANCHOR_WINDOW: *mut sdl::SDL_Window = std::ptr::null_mut();
 
 // ---------------------------------------------------------------------------
 // SDLGLContext
@@ -48,8 +53,21 @@ impl SdlGlContext {
     ///
     /// Maps to C++ `SDLGLContext::SDLGLContext`.
     pub fn new(window: *mut sdl::SDL_Window) -> Self {
-        // Maps to: context = SDL_GL_CreateContext(window)
+        // Maps to upstream SDLGLContext: make the main window context current
+        // while creating shared contexts so strict drivers join the same GL
+        // share group.
+        let _anchor_lock = SHARE_ANCHOR_MUTEX.lock().unwrap();
+        let saved_current = unsafe { sdl::SDL_GL_GetCurrentContext() };
+        let saved_window = unsafe { sdl::SDL_GL_GetCurrentWindow() };
+        unsafe {
+            if !SHARE_ANCHOR_CONTEXT.is_null() && saved_current != SHARE_ANCHOR_CONTEXT {
+                sdl::SDL_GL_MakeCurrent(SHARE_ANCHOR_WINDOW, SHARE_ANCHOR_CONTEXT);
+            }
+        }
         let context = unsafe { sdl::SDL_GL_CreateContext(window) };
+        unsafe {
+            sdl::SDL_GL_MakeCurrent(saved_window, saved_current);
+        }
         SdlGlContext {
             window,
             context,
@@ -81,8 +99,13 @@ impl SdlGlContext {
         if ret != 0 {
             let err = unsafe { CStr::from_ptr(sdl::SDL_GetError()) }.to_string_lossy();
             log::error!("SDL_GL_MakeCurrent failed: {}", err);
-        } else if std::env::var_os("RUZU_TRACE_PRESENT").is_some() {
-            log::info!("[PRESENT] SDL_GL_MakeCurrent");
+        } else {
+            unsafe {
+                sdl::SDL_GL_SetSwapInterval(0);
+            }
+            if std::env::var_os("RUZU_TRACE_PRESENT").is_some() {
+                log::info!("[PRESENT] SDL_GL_MakeCurrent");
+            }
         }
     }
 
@@ -229,6 +252,18 @@ impl EmuWindowSdl2Gl {
             let err = unsafe { CStr::from_ptr(sdl::SDL_GetError()) }.to_string_lossy();
             log::error!("Failed to create SDL2 GL context: {}", err);
             std::process::exit(1);
+        }
+        let make_current_ret = unsafe { sdl::SDL_GL_MakeCurrent(render_window, window_context) };
+        if make_current_ret != 0 {
+            let err = unsafe { CStr::from_ptr(sdl::SDL_GetError()) }.to_string_lossy();
+            log::error!("Failed to make SDL2 GL context current: {}", err);
+            std::process::exit(1);
+        }
+        unsafe {
+            sdl::SDL_GL_SetSwapInterval(0);
+            let _anchor_lock = SHARE_ANCHOR_MUTEX.lock().unwrap();
+            SHARE_ANCHOR_WINDOW = render_window;
+            SHARE_ANCHOR_CONTEXT = window_context;
         }
 
         // Maps to: core_context = CreateSharedContext()

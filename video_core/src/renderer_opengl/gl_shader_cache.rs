@@ -252,9 +252,22 @@ impl ShaderCache {
         shared_cache: &mut SharedShaderCache,
     ) -> Option<&mut GraphicsPipeline> {
         self.assert_single_owner("current_graphics_pipeline_with_shared_cache");
+        let trace_pipeline = std::env::var_os("RUZU_TRACE_SHADER_PIPELINE").is_some();
+        if trace_pipeline {
+            eprintln!("[SHADER_PIPELINE] current_graphics begin");
+        }
         if !shared_cache.refresh_stages(&mut self.graphics_key.unique_hashes) {
+            if trace_pipeline {
+                eprintln!("[SHADER_PIPELINE] refresh_stages=false");
+            }
             self.current_pipeline = None;
             return None;
+        }
+        if trace_pipeline {
+            eprintln!(
+                "[SHADER_PIPELINE] refresh_stages=true hashes={:X?}",
+                self.graphics_key.unique_hashes
+            );
         }
 
         let maxwell3d = shared_cache.current_maxwell3d()?;
@@ -281,10 +294,16 @@ impl ShaderCache {
         let maxwell3d = shared_cache.current_maxwell3d();
 
         if self.graphics_cache.contains_key(&key) {
+            if trace_pipeline {
+                eprintln!("[SHADER_PIPELINE] graphics_cache hit");
+            }
             let pipeline = self.graphics_cache.get_mut(&key).unwrap();
             return Self::built_pipeline(self.use_asynchronous_shaders, maxwell3d, pipeline);
         }
 
+        if trace_pipeline {
+            eprintln!("[SHADER_PIPELINE] graphics_cache miss -> slow_path");
+        }
         self.current_graphics_pipeline_slow_path_with_shared_cache(shared_cache)
     }
 
@@ -341,16 +360,26 @@ impl ShaderCache {
         shared_cache: &mut SharedShaderCache,
     ) -> Option<&mut GraphicsPipeline> {
         self.assert_single_owner("current_graphics_pipeline_slow_path_with_shared_cache");
+        let trace_pipeline = std::env::var_os("RUZU_TRACE_SHADER_PIPELINE").is_some();
         let key = self.graphics_key;
         self.current_pipeline = Some(key);
         let maxwell3d = shared_cache.current_maxwell3d();
 
         if self.graphics_cache.contains_key(&key) {
+            if trace_pipeline {
+                eprintln!("[SHADER_PIPELINE] slow_path cache hit");
+            }
             let pipeline = self.graphics_cache.get_mut(&key).unwrap();
             return Self::built_pipeline(self.use_asynchronous_shaders, maxwell3d, pipeline);
         }
 
+        if trace_pipeline {
+            eprintln!("[SHADER_PIPELINE] create_graphics_pipeline_with_shared_cache begin");
+        }
         let pipeline = self.create_graphics_pipeline_with_shared_cache(shared_cache)?;
+        if trace_pipeline {
+            eprintln!("[SHADER_PIPELINE] create_graphics_pipeline_with_shared_cache end");
+        }
         self.graphics_cache.insert(key, pipeline);
         let inserted = self.graphics_cache.get_mut(&key).expect("just inserted");
         Self::built_pipeline(self.use_asynchronous_shaders, maxwell3d, inserted)
@@ -614,8 +643,18 @@ impl ShaderCache {
         &mut self,
         shared_cache: &SharedShaderCache,
     ) -> Option<GraphicsPipeline> {
+        let trace_pipeline = std::env::var_os("RUZU_TRACE_SHADER_PIPELINE").is_some();
+        if trace_pipeline {
+            eprintln!("[SHADER_PIPELINE] get_graphics_environments begin");
+        }
         let mut environments = GraphicsEnvironments::default();
         shared_cache.get_graphics_environments(&mut environments, &self.graphics_key.unique_hashes);
+        if trace_pipeline {
+            eprintln!(
+                "[SHADER_PIPELINE] get_graphics_environments end env_ptrs={:?}",
+                environments.env_ptrs
+            );
+        }
         self.create_graphics_pipeline_from_environments(&mut environments)
     }
 
@@ -623,6 +662,13 @@ impl ShaderCache {
         &mut self,
         environments: &mut GraphicsEnvironments,
     ) -> Option<GraphicsPipeline> {
+        let trace_pipeline = std::env::var_os("RUZU_TRACE_SHADER_PIPELINE").is_some();
+        if trace_pipeline {
+            eprintln!(
+                "[SHADER_PIPELINE] create_from_environments begin hashes={:X?}",
+                self.graphics_key.unique_hashes
+            );
+        }
         let mut pipeline = GraphicsPipeline::new(self.graphics_key);
         let uses_vertex_a = self.graphics_key.unique_hashes[0] != 0;
         let uses_vertex_b = self.graphics_key.unique_hashes[1] != 0;
@@ -638,6 +684,9 @@ impl ShaderCache {
         let mut infos: [Option<ShaderInfo>; 5] = Default::default();
 
         if uses_vertex_a && uses_vertex_b {
+            if trace_pipeline {
+                eprintln!("[SHADER_PIPELINE] compile dual vertex begin");
+            }
             let va_env = environments.envs[0].generic_environment_mut();
             if va_env.cached_code_slice().is_empty() && va_env.analyze().is_none() {
                 log::warn!("gl_shader_cache: shared environment analyze failed for VertexA");
@@ -662,6 +711,12 @@ impl ShaderCache {
                 &runtime_info,
                 &mut bindings,
             );
+            if trace_pipeline {
+                eprintln!(
+                    "[SHADER_PIPELINE] compile dual vertex end source_len={}",
+                    compiled.source.len()
+                );
+            }
             let mut previous_info = compiled.info.clone();
             infos[0] = Some(previous_info.clone());
             pipeline.glsl_sources[0] = Some(compiled.source);
@@ -673,6 +728,9 @@ impl ShaderCache {
 
                 let env = environments.envs[slot].generic_environment_mut();
                 let actual_stage = env.shader_stage();
+                if trace_pipeline {
+                    eprintln!("[SHADER_PIPELINE] stage {:?} analyze/compile begin", actual_stage);
+                }
                 if env.cached_code_slice().is_empty() && env.analyze().is_none() {
                     log::warn!(
                         "gl_shader_cache: shared environment analyze failed for stage {:?}",
@@ -692,12 +750,22 @@ impl ShaderCache {
                     &runtime_info,
                     &mut bindings,
                 );
+                if trace_pipeline {
+                    eprintln!(
+                        "[SHADER_PIPELINE] stage {:?} compile end source_len={}",
+                        actual_stage,
+                        compiled.source.len()
+                    );
+                }
                 previous_info = compiled.info.clone();
                 infos[gl_slot] = Some(previous_info.clone());
                 pipeline.glsl_sources[gl_slot] = Some(compiled.source);
             }
 
             pipeline.apply_shader_infos(&infos);
+            if trace_pipeline {
+                eprintln!("[SHADER_PIPELINE] create_from_environments end");
+            }
             return Some(pipeline);
         }
 
@@ -712,6 +780,9 @@ impl ShaderCache {
 
             let env = environments.envs[slot].generic_environment_mut();
             let actual_stage = env.shader_stage();
+            if trace_pipeline {
+                eprintln!("[SHADER_PIPELINE] stage {:?} analyze/compile begin", actual_stage);
+            }
             if env.cached_code_slice().is_empty() && env.analyze().is_none() {
                 log::warn!(
                     "gl_shader_cache: shared environment analyze failed for stage {:?}",
@@ -731,12 +802,22 @@ impl ShaderCache {
                 &runtime_info,
                 &mut bindings,
             );
+            if trace_pipeline {
+                eprintln!(
+                    "[SHADER_PIPELINE] stage {:?} compile end source_len={}",
+                    actual_stage,
+                    compiled.source.len()
+                );
+            }
             previous_info = Some(compiled.info.clone());
             infos[gl_slot] = previous_info.clone();
             pipeline.glsl_sources[gl_slot] = Some(compiled.source);
         }
 
         pipeline.apply_shader_infos(&infos);
+        if trace_pipeline {
+            eprintln!("[SHADER_PIPELINE] create_from_environments end");
+        }
         Some(pipeline)
     }
 
