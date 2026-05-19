@@ -24,6 +24,7 @@ use ruzu_core::hle::service::nvdrv::nvdata::NvFence;
 
 struct VideoGpuChannelHandle {
     gpu: *const Gpu,
+    bind_id: i32,
     channel_state: Arc<parking_lot::Mutex<crate::control::channel_state::ChannelState>>,
 }
 
@@ -840,7 +841,7 @@ impl GpuChannelHandle for VideoGpuChannelHandle {
     }
 
     fn bind_id(&self) -> i32 {
-        self.channel_state.lock().bind_id
+        self.bind_id
     }
 }
 
@@ -876,6 +877,7 @@ impl GpuCoreInterface for Gpu {
         let channel_state = self.create_channel(channel_id);
         Arc::new(VideoGpuChannelHandle {
             gpu: self as *const Gpu,
+            bind_id: channel_id,
             channel_state,
         })
     }
