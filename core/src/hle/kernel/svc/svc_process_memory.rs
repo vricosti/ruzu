@@ -282,12 +282,13 @@ pub fn map_process_code_memory(
         return RESULT_INVALID_CURRENT_MEMORY;
     }
 
-    // Upstream: page_table.MapCodeMemory(dst_address, src_address, size)
-    // Needs: KPageTableBase::map_code_memory
     let dst_kpa = crate::hle::kernel::k_typed_address::KProcessAddress::new(dst_address);
     let result = process
         .page_table
-        .map_memory(dst_kpa, src_kpa, size as usize);
+        .map_code_memory(dst_kpa, src_kpa, size as usize);
+    if result == 0 {
+        invalidate_process_instruction_cache(&mut process, dst_address, size);
+    }
     ResultCode::new(result)
 }
 
@@ -357,12 +358,26 @@ pub fn unmap_process_code_memory(
         return RESULT_INVALID_CURRENT_MEMORY;
     }
 
-    // Upstream: page_table.UnmapCodeMemory(dst_address, src_address, size)
     let dst_kpa = crate::hle::kernel::k_typed_address::KProcessAddress::new(dst_address);
     let result = process
         .page_table
-        .unmap_memory(dst_kpa, src_kpa, size as usize);
+        .unmap_code_memory(dst_kpa, src_kpa, size as usize);
+    if result == 0 {
+        invalidate_process_instruction_cache(&mut process, dst_address, size);
+    }
     ResultCode::new(result)
+}
+
+fn invalidate_process_instruction_cache(
+    process: &mut crate::hle::kernel::k_process::KProcess,
+    address: u64,
+    size: u64,
+) {
+    for core in 0..crate::hardware_properties::NUM_CPU_CORES as usize {
+        if let Some(cpu) = process.get_arm_interface_mut(core) {
+            cpu.invalidate_cache_range(address, size as usize);
+        }
+    }
 }
 
 /// Helper: resolve a process handle to the process Arc.

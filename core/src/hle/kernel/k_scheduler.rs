@@ -780,7 +780,7 @@ impl KScheduler {
             sched.reschedule_other_cores(cores_needing_scheduling);
         }
 
-        let current_state = super::kernel::with_current_thread_fast_mut(|t| t.get_state())
+        let current_state = super::kernel::with_current_thread_fast_mut(|t| t.get_raw_state())
             .unwrap_or(ThreadState::INITIALIZED);
 
         if current_state != ThreadState::RUNNABLE {
@@ -1163,7 +1163,7 @@ impl KScheduler {
 
         {
             let current_thread = current_thread.lock().unwrap();
-            if current_thread.get_state() != ThreadState::RUNNABLE {
+            if current_thread.get_raw_state() != ThreadState::RUNNABLE {
                 return;
             }
             if current_thread.get_yield_schedule_count() == process.get_scheduled_count() {
@@ -1451,7 +1451,7 @@ impl KScheduler {
                 continue;
             };
             let thread = thread.lock().unwrap();
-            if thread.get_state() != ThreadState::RUNNABLE {
+            if thread.get_raw_state() != ThreadState::RUNNABLE {
                 continue;
             }
             if thread.get_active_core() != self.core_id {
@@ -1870,7 +1870,7 @@ impl KScheduler {
             };
 
             let thread = thread.lock().unwrap();
-            if thread.get_state() != ThreadState::RUNNABLE {
+            if thread.get_raw_state() != ThreadState::RUNNABLE {
                 continue;
             }
 
