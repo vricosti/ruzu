@@ -262,16 +262,13 @@ pub fn build_cfg(instructions: &[u64]) -> Vec<CfgBlock> {
 /// The offset is a signed 24-bit value in bits [23:5] of the instruction word,
 /// or a different field depending on the encoding.
 fn decode_branch_offset(insn: u64) -> i32 {
-    // Maxwell branch offset: bits [23:5] sign-extended, relative to current PC.
-    // Actually the encoding varies: for BRA the offset is in bits [23:20]+[19:5].
-    // Simplified: extract bits [23:0] as signed offset.
-    let raw = (insn & 0x00FFFFFF) as u32;
-    // Sign-extend from 24 bits
-    if raw & 0x800000 != 0 {
-        (raw | 0xFF000000) as i32
-    } else {
-        raw as i32
-    }
+    // Upstream `Instruction::branch.offset` is `BitField<20, 24, s64>`.
+    // `BranchOffset(pc, inst)` computes `pc.Offset() + inst.branch.Offset() + 8`,
+    // where `Location` is byte-addressed. This Rust CFG is word-indexed, so
+    // return the signed word delta; callers add `pc + delta + 1`.
+    let raw = ((insn >> 20) & 0x00ff_ffff) as i32;
+    let offset_bytes = (raw << 8) >> 8;
+    offset_bytes / 8
 }
 
 /// Decode the predicate condition from bits [19:16] of the instruction.
@@ -280,4 +277,18 @@ fn decode_predicate(insn: u64) -> Condition {
     let pred = pred_bits & 0x7;
     let negated = pred_bits & 0x8 != 0;
     Condition { pred, negated }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn branch_offset_uses_upstream_signed_24_bit_field() {
+        let forward_two_words = 16u64 << 20;
+        assert_eq!(decode_branch_offset(forward_two_words), 2);
+
+        let backward_one_word = 0x00ff_fff8u64 << 20;
+        assert_eq!(decode_branch_offset(backward_one_word), -1);
+    }
 }

@@ -67,6 +67,15 @@ fn recompute_use_counts(program: &mut Program) {
                     }
                 }
             }
+            for (_, arg) in &inst.phi_args {
+                if let Value::Inst(r) = arg {
+                    if let Some(block_counts) = use_counts.get_mut(r.block as usize) {
+                        if let Some(count) = block_counts.get_mut(r.inst as usize) {
+                            *count += 1;
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -122,5 +131,34 @@ mod tests {
             program.blocks[0].inst(2).args[1],
             Value::Inst(InstRef { block: 0, inst: 1 })
         );
+    }
+
+    #[test]
+    fn dce_counts_phi_args_as_uses() {
+        let mut program = Program::new(ShaderStage::VertexB);
+        program.blocks.push(Block::new());
+        program.blocks[0].append_inst(Inst::new(
+            Opcode::IAdd32,
+            vec![Value::ImmU32(1), Value::ImmU32(2)],
+        ));
+        let mut phi = Inst::new(Opcode::Phi, Vec::new());
+        phi.add_phi_operand(0, Value::Inst(InstRef { block: 0, inst: 0 }));
+        let phi_ref = InstRef {
+            block: 0,
+            inst: program.blocks[0].append_inst(phi),
+        };
+        program.blocks[0].append_inst(Inst::new(
+            Opcode::SetAttribute,
+            vec![
+                Value::Attribute(crate::ir::value::Attribute::POSITION_X),
+                Value::Inst(phi_ref),
+                Value::ImmU32(0),
+            ],
+        ));
+
+        dead_code_elimination_pass(&mut program);
+
+        assert_eq!(program.blocks[0].inst(0).opcode, Opcode::IAdd32);
+        assert_eq!(program.blocks[0].inst(1).opcode, Opcode::Phi);
     }
 }
