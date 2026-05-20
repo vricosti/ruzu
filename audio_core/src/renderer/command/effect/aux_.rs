@@ -173,8 +173,8 @@ pub(crate) fn write_aux_buffer(
 
     if update_count != 0 {
         info.write_offset = (info.write_offset + update_count) % count_max;
-        write_aux_info(info_addr, &info);
     }
+    write_aux_info(info_addr, &info);
 
     write_count
 }
@@ -225,8 +225,8 @@ pub(crate) fn read_aux_buffer(
 
     if update_count != 0 {
         info.read_offset = (info.read_offset + update_count) % count_max;
-        write_aux_info(info_addr, &info);
     }
+    write_aux_info(info_addr, &info);
 
     read_count
 }
