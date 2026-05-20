@@ -2010,7 +2010,7 @@ pub fn call(system: &System, imm: u32, is_64bit: bool, args: &mut SvcArgs) {
                                 use crate::arm::arm_interface::ThreadContext;
                                 let mut ctx = ThreadContext::default();
                                 jit.get_context(&mut ctx);
-                                format!(" pc=0x{:08X}", ctx.r[15] as u32)
+                                format!(" pc=0x{:08X} lr=0x{:08X}", ctx.r[15] as u32, ctx.r[14] as u32)
                             } else {
                                 String::new()
                             }
