@@ -1,5 +1,6 @@
 use crate::common::common::{CpuAddr, MAX_CHANNELS};
 use crate::renderer::command::util::write_copy;
+use crate::{guest_read_block, guest_write_block};
 use std::fmt::Write;
 use std::mem::size_of;
 
@@ -55,7 +56,6 @@ impl CircularBufferSinkPayload {
         }
 
         let mut pos = (self.pos as usize) % ring_size;
-        let ring = unsafe { std::slice::from_raw_parts_mut(self.address as *mut u8, ring_size) };
         let mut output = vec![0i16; sample_count];
 
         for &input in self.inputs.iter().take(input_count) {
@@ -74,10 +74,13 @@ impl CircularBufferSinkPayload {
                 std::slice::from_raw_parts(output.as_ptr() as *const u8, bytes_per_channel)
             };
             let first_write = bytes_per_channel.min(ring_size.saturating_sub(pos));
-            ring[pos..pos + first_write].copy_from_slice(&output_bytes[..first_write]);
+            let _ = guest_write_block((self.address + pos) as u64, &output_bytes[..first_write]);
             if first_write < bytes_per_channel {
                 let remaining = bytes_per_channel - first_write;
-                ring[..remaining].copy_from_slice(&output_bytes[first_write..]);
+                let _ = guest_write_block(
+                    self.address as u64,
+                    &output_bytes[first_write..first_write + remaining],
+                );
             }
 
             pos = pos.saturating_add(bytes_per_channel);
@@ -87,7 +90,14 @@ impl CircularBufferSinkPayload {
         }
 
         self.pos = pos as u32;
-        unsafe { std::ptr::write_unaligned(payload_addr as *mut CircularBufferSinkPayload, self) };
+        // Write updated payload back to its location in the command list.
+        let bytes = unsafe {
+            std::slice::from_raw_parts(
+                &self as *const Self as *const u8,
+                size_of::<CircularBufferSinkPayload>(),
+            )
+        };
+        let _ = guest_write_block(payload_addr as u64, bytes);
     }
 
     pub fn verify(self) -> bool {
@@ -140,7 +150,6 @@ pub fn process_circular_buffer_command(
     }
 
     let mut pos = (payload.pos as usize) % ring_size;
-    let ring = unsafe { std::slice::from_raw_parts_mut(payload.address as *mut u8, ring_size) };
     let mut output = vec![0i16; sample_count];
 
     for &input in payload.inputs.iter().take(input_count) {
@@ -158,10 +167,13 @@ pub fn process_circular_buffer_command(
         let output_bytes =
             unsafe { std::slice::from_raw_parts(output.as_ptr() as *const u8, bytes_per_channel) };
         let first_write = bytes_per_channel.min(ring_size.saturating_sub(pos));
-        ring[pos..pos + first_write].copy_from_slice(&output_bytes[..first_write]);
+        let _ = guest_write_block((payload.address + pos) as u64, &output_bytes[..first_write]);
         if first_write < bytes_per_channel {
             let remaining = bytes_per_channel - first_write;
-            ring[..remaining].copy_from_slice(&output_bytes[first_write..]);
+            let _ = guest_write_block(
+                payload.address as u64,
+                &output_bytes[first_write..first_write + remaining],
+            );
         }
 
         pos = pos.saturating_add(bytes_per_channel);
@@ -171,7 +183,13 @@ pub fn process_circular_buffer_command(
     }
 
     payload.pos = pos as u32;
-    unsafe { std::ptr::write_unaligned(payload_addr as *mut CircularBufferSinkPayload, payload) };
+    let bytes = unsafe {
+        std::slice::from_raw_parts(
+            &payload as *const CircularBufferSinkPayload as *const u8,
+            size_of::<CircularBufferSinkPayload>(),
+        )
+    };
+    let _ = guest_write_block(payload_addr as u64, bytes);
 }
 
 pub fn verify_circular_buffer_command(payload: &CircularBufferSinkPayload) -> bool {
@@ -198,7 +216,12 @@ fn read_pod<T: Copy>(addr: CpuAddr) -> Option<T> {
     if addr == 0 {
         return None;
     }
-    Some(unsafe { (addr as *const T).read_unaligned() })
+    let size = std::mem::size_of::<T>();
+    let mut bytes = vec![0u8; size];
+    if !guest_read_block(addr as u64, &mut bytes) {
+        return None;
+    }
+    Some(unsafe { std::ptr::read_unaligned(bytes.as_ptr() as *const T) })
 }
 
 #[cfg(test)]
