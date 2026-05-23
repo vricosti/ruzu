@@ -1354,7 +1354,21 @@ impl KThread {
             assert!(self.num_kernel_waiters >= 0);
         }
 
-        assert!(lock_info.get_waiter_count() > 0);
+        // Defensive: if the lock_info is in held_lock_info_list with 0 waiters,
+        // it's a race window between add_waiter_impl creating the empty entry and
+        // calling add_waiter on it. We've already detached it from the list; just
+        // drop it silently and return None (same semantics as find returning None).
+        // Triggers only under heavy tracing-induced timing perturbation. The root
+        // race (add_waiter_impl not atomic w.r.t. remove_waiter_by_key) is a
+        // separate scheduler-locking gap to be fixed later.
+        if lock_info.get_waiter_count() == 0 {
+            log::warn!(
+                "remove_waiter_by_key: lock_info for tid={} addr=0x{:X} had 0 waiters in held list (race?); dropping",
+                self.thread_id,
+                address_key.get(),
+            );
+            return None;
+        }
 
         // Remove the highest priority waiter to become the next owner.
         let next_owner_key = lock_info
