@@ -16,7 +16,7 @@ use parking_lot::Mutex;
 use super::engine_interface::{EngineInterface, EngineInterfaceState};
 use super::engine_upload;
 use crate::memory_manager::MemoryManager;
-use crate::rasterizer_interface::RasterizerInterface;
+use crate::rasterizer_interface::{RasterizerHandle, RasterizerInterface};
 
 // ── Register layout constants ───────────────────────────────────────────────
 
@@ -89,7 +89,7 @@ pub struct KeplerMemory {
     pub upload_state: engine_upload::State,
     pub interface_state: EngineInterfaceState,
     memory_manager: Arc<Mutex<MemoryManager>>,
-    rasterizer: Option<[usize; 2]>,
+    rasterizer: Option<RasterizerHandle>,
     guest_memory_writer: Option<Arc<dyn Fn(u64, &[u8]) + Send + Sync>>,
 }
 
@@ -115,9 +115,7 @@ impl KeplerMemory {
     ///
     /// Corresponds to `KeplerMemory::BindRasterizer`.
     pub fn bind_rasterizer(&mut self, rasterizer: &dyn RasterizerInterface) {
-        self.rasterizer = Some(unsafe {
-            std::mem::transmute::<*const dyn RasterizerInterface, [usize; 2]>(rasterizer)
-        });
+        self.rasterizer = Some(RasterizerHandle::from_ref(rasterizer));
         // Reset and configure execution mask
         self.interface_state.execution_mask.fill(false);
         if EXEC_REG < self.interface_state.execution_mask.len() {
@@ -136,9 +134,7 @@ impl KeplerMemory {
     }
 
     fn process_upload_word(&mut self, data: u32, is_last_call: bool) {
-        let rasterizer_raw = self.rasterizer.map(|raw| unsafe {
-            std::mem::transmute::<[usize; 2], *mut dyn RasterizerInterface>(raw)
-        });
+        let rasterizer_handle = self.rasterizer;
         let writer = self.guest_memory_writer.as_ref().cloned();
         let mut write_cpu = move |addr: u64, bytes: &[u8]| {
             if let Some(writer) = writer.as_ref() {
@@ -146,7 +142,7 @@ impl KeplerMemory {
             }
         };
         let memory_manager = Arc::clone(&self.memory_manager);
-        let mut rasterizer = rasterizer_raw.map(|ptr| unsafe { &mut *ptr });
+        let mut rasterizer = rasterizer_handle.map(|handle| unsafe { handle.as_mut() });
         let mut ctx = engine_upload::FlushContext {
             rasterizer: rasterizer.as_deref_mut(),
             memory_manager,
@@ -157,9 +153,7 @@ impl KeplerMemory {
     }
 
     fn process_upload_multi(&mut self, data: &[u32]) {
-        let rasterizer_raw = self.rasterizer.map(|raw| unsafe {
-            std::mem::transmute::<[usize; 2], *mut dyn RasterizerInterface>(raw)
-        });
+        let rasterizer_handle = self.rasterizer;
         let writer = self.guest_memory_writer.as_ref().cloned();
         let mut write_cpu = move |addr: u64, bytes: &[u8]| {
             if let Some(writer) = writer.as_ref() {
@@ -167,7 +161,7 @@ impl KeplerMemory {
             }
         };
         let memory_manager = Arc::clone(&self.memory_manager);
-        let mut rasterizer = rasterizer_raw.map(|ptr| unsafe { &mut *ptr });
+        let mut rasterizer = rasterizer_handle.map(|handle| unsafe { handle.as_mut() });
         let mut ctx = engine_upload::FlushContext {
             rasterizer: rasterizer.as_deref_mut(),
             memory_manager,

@@ -16,7 +16,7 @@
 //! (Runtime, Image slot vectors, Maxwell3D registers, etc.) log a warning
 //! and return safe defaults until those types are ported.
 
-use crate::engines::draw_manager::DrawState;
+use crate::engines::draw_manager::Maxwell3DRenderTargets;
 use crate::engines::maxwell_3d::RenderTargetInfo;
 use crate::surface;
 
@@ -565,23 +565,23 @@ impl TextureCacheBase {
     ///
     /// Upstream reads `maxwell3d->regs.rt_control` and `maxwell3d->regs.rt[]`
     /// directly from this owner. The Rust draw path snapshots those registers
-    /// into `DrawState` and provides the channel GPU→CPU translator here.
-    pub fn update_render_targets_from_draw_state(
+    /// into `Maxwell3DRenderTargets` and provides the channel GPU->CPU translator here.
+    pub fn update_render_targets_from_snapshot(
         &mut self,
-        draw_state: &DrawState,
+        render_targets: &Maxwell3DRenderTargets,
         mut gpu_to_cpu: impl FnMut(GPUVAddr) -> Option<u64>,
     ) {
-        let count = draw_state.rt_control.count.min(NUM_RT as u32) as usize;
+        let count = render_targets.rt_control.count.min(NUM_RT as u32) as usize;
         if count == 0 {
             return;
         }
 
         for color_index in 0..count {
-            let target_index = draw_state.rt_control.map[color_index] as usize;
+            let target_index = render_targets.rt_control.map[color_index] as usize;
             if target_index >= NUM_RT {
                 continue;
             }
-            let rt = draw_state.render_targets[target_index];
+            let rt = render_targets.render_targets[target_index];
             if rt.address == 0 || rt.width == 0 || rt.height == 0 || rt.format == 0 {
                 continue;
             }
@@ -941,16 +941,16 @@ mod tests {
     }
 
     #[test]
-    fn update_render_targets_from_draw_state_registers_presentable_view() {
+    fn update_render_targets_from_snapshot_registers_presentable_view() {
         use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
         use std::sync::Arc;
         let mut cache = TextureCacheBase::new(Arc::new(MaxwellDeviceMemoryManager::default()));
-        let mut draw_state = DrawState::default();
-        draw_state.rt_control = RtControlInfo {
+        let mut render_targets = Maxwell3DRenderTargets::default();
+        render_targets.rt_control = RtControlInfo {
             count: 1,
             map: [0, 0, 0, 0, 0, 0, 0, 0],
         };
-        draw_state.render_targets[0] = RenderTargetInfo {
+        render_targets.render_targets[0] = RenderTargetInfo {
             address: 0x4000_0000,
             width: 64,
             height: 32,
@@ -961,7 +961,7 @@ mod tests {
             base_layer: 0,
         };
 
-        cache.update_render_targets_from_draw_state(&draw_state, |gpu_addr| {
+        cache.update_render_targets_from_snapshot(&render_targets, |gpu_addr| {
             (gpu_addr == 0x4000_0000).then_some(0x535B_5000)
         });
 
@@ -985,12 +985,12 @@ mod tests {
         use std::sync::Arc;
 
         let mut cache = TextureCacheBase::new(Arc::new(MaxwellDeviceMemoryManager::default()));
-        let mut draw_state = DrawState::default();
-        draw_state.rt_control = RtControlInfo {
+        let mut render_targets = Maxwell3DRenderTargets::default();
+        render_targets.rt_control = RtControlInfo {
             count: 1,
             map: [0, 0, 0, 0, 0, 0, 0, 0],
         };
-        draw_state.render_targets[0] = RenderTargetInfo {
+        render_targets.render_targets[0] = RenderTargetInfo {
             address: 0x4000_0000,
             width: 64,
             height: 32,
@@ -1001,7 +1001,7 @@ mod tests {
             base_layer: 0,
         };
 
-        cache.update_render_targets_from_draw_state(&draw_state, |gpu_addr| {
+        cache.update_render_targets_from_snapshot(&render_targets, |gpu_addr| {
             (gpu_addr == 0x4000_0000).then_some(0x535B_5000)
         });
         let initial_view_count = cache.slot_image_views.size();

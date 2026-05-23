@@ -12,7 +12,7 @@ use parking_lot::Mutex;
 use super::engine_interface::{EngineInterface, EngineInterfaceState};
 use super::{ClassId, Engine, PendingWrite, ENGINE_REG_COUNT};
 use crate::memory_manager::MemoryManager;
-use crate::rasterizer_interface::RasterizerInterface;
+use crate::rasterizer_interface::{RasterizerHandle, RasterizerInterface};
 
 // ── Register constants (method = byte_offset / 4) ──────────────────────────
 
@@ -34,7 +34,8 @@ pub struct MaxwellDMA {
     memory_manager: Arc<Mutex<MemoryManager>>,
     /// Set when a DMA launch trigger is detected; consumed by tests / future logic.
     pub pending_launch: bool,
-    rasterizer: Option<[usize; 2]>,
+    /// Upstream stores `VideoCore::RasterizerInterface* rasterizer`.
+    rasterizer: Option<RasterizerHandle>,
 }
 
 impl MaxwellDMA {
@@ -81,9 +82,7 @@ impl MaxwellDMA {
 
     /// Corresponds to `MaxwellDMA::BindRasterizer`.
     pub fn bind_rasterizer(&mut self, rasterizer: &dyn RasterizerInterface) {
-        self.rasterizer = Some(unsafe {
-            std::mem::transmute::<*const dyn RasterizerInterface, [usize; 2]>(rasterizer)
-        });
+        self.rasterizer = Some(RasterizerHandle::from_ref(rasterizer));
     }
 
     // ── Typed accessors ────────────────────────────────────────────────
@@ -120,11 +119,8 @@ impl MaxwellDMA {
         &mut self,
         f: impl FnOnce(&mut dyn RasterizerInterface) -> R,
     ) -> Option<R> {
-        let raw = self.rasterizer?;
-        // The command processor owns engines separately from the renderer,
-        // mirroring upstream's raw `RasterizerInterface*` stored by engines.
-        let ptr: *mut dyn RasterizerInterface = unsafe { std::mem::transmute(raw) };
-        Some(unsafe { f(&mut *ptr) })
+        let handle = self.rasterizer?;
+        Some(unsafe { handle.with_mut(f) })
     }
 
     fn handle_launch(&mut self) {
@@ -287,7 +283,7 @@ impl Engine for MaxwellDMA {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engines::draw_manager::DrawState;
+use crate::engines::draw_manager::Maxwell3DClearView;
     use crate::query_cache::types::QueryPropertiesFlags;
     use crate::rasterizer_interface::RasterizerDownloadArea;
 
@@ -308,9 +304,9 @@ mod tests {
     }
 
     impl RasterizerInterface for TestRasterizer {
-        fn draw(&mut self, _draw_state: &DrawState, _instance_count: u32) {}
+        fn draw(&mut self, _draw_view: crate::engines::draw_manager::Maxwell3DDrawView<'_>, _instance_count: u32) {}
         fn draw_texture(&mut self) {}
-        fn clear(&mut self, _draw_state: &DrawState, _layer_count: u32) {}
+        fn clear(&mut self, _clear_view: Maxwell3DClearView<'_>, _layer_count: u32) {}
         fn dispatch_compute(&mut self) {}
         fn reset_counter(&mut self, _query_type: u32) {}
         fn query(

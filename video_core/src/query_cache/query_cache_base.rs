@@ -1268,14 +1268,14 @@ mod tests {
     impl RasterizerInterface for CountingRasterizer {
         fn draw(
             &mut self,
-            _draw_state: &crate::engines::draw_manager::DrawState,
+            _draw_view: crate::engines::draw_manager::Maxwell3DDrawView<'_>,
             _instance_count: u32,
         ) {
         }
         fn draw_texture(&mut self) {}
         fn clear(
             &mut self,
-            _draw_state: &crate::engines::draw_manager::DrawState,
+            _clear_view: crate::engines::draw_manager::Maxwell3DClearView<'_>,
             _layer_count: u32,
         ) {
         }

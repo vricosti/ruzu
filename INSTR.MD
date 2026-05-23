@@ -53,3 +53,9 @@ closely enough
   Je ne vendrais pas Vec<Option<Inst>> comme version définitive. Je l’utiliserais pour stabiliser vite, ajouter les tests, puis
   migrer vers une InstArena intrusive propre si les passes IR continuent à diverger d’upstream ou si les tombstones deviennent
   visibles dans les profils.
+
+  --
+  Je ne passerais à la variante stricte que si on fait un chantier dédié: définir un owner handle sûr pour Rasterizer, Gpu, GpuThread, MemoryManager,
+  Puller, Maxwell3D, puis migrer tout le monde dessus. Pour faire marcher l’émulateur avec une architecture saine, la priorité reste plutôt: garder ce
+  compromis, finir les dirty flags/state tracker/texture path, et n’attaquer le modèle strict que quand les bugs fonctionnels visibles sont
+  stabilisés.
