@@ -9,7 +9,10 @@
 use common::heap_tracker::HeapTracker;
 use common::host_memory::HostMemory;
 use common::page_table::{PageInfo, PageTable, PageType};
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc, Mutex,
+};
 
 use crate::core::SystemRef;
 use crate::device_memory::{dram_memory_map, DeviceMemory};
@@ -21,6 +24,60 @@ use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 const PAGE_BITS: usize = 12;
 const PAGE_SIZE: u64 = 1 << PAGE_BITS;
 const PAGE_MASK: u64 = PAGE_SIZE - 1;
+
+static RASTERIZER_MARK_CACHED_LAST_STAGE: AtomicU64 = AtomicU64::new(0);
+static RASTERIZER_MARK_CACHED_COUNTS: [AtomicU64; 9] = [
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+];
+
+fn record_rasterizer_mark_cached_stage(stage: usize) {
+    if std::env::var_os("RUZU_PROFILE_RASTERIZER_MARK_CACHED_STALL").is_none() {
+        return;
+    }
+    RASTERIZER_MARK_CACHED_LAST_STAGE.store(stage as u64, Ordering::Relaxed);
+    if let Some(counter) = RASTERIZER_MARK_CACHED_COUNTS.get(stage) {
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+pub fn dump_rasterizer_mark_cached_stall_profile() {
+    if RASTERIZER_MARK_CACHED_COUNTS[0].load(Ordering::Relaxed) == 0 {
+        return;
+    }
+    const NAMES: [&str; 9] = [
+        "enter",
+        "after_guard",
+        "after_page_table",
+        "after_num_pages",
+        "before_page_loop",
+        "in_page_loop",
+        "after_page_loop",
+        "exit",
+        "early_return",
+    ];
+    let last_stage = RASTERIZER_MARK_CACHED_LAST_STAGE.load(Ordering::Relaxed) as usize;
+    let last_stage_name = NAMES.get(last_stage).copied().unwrap_or("unknown");
+    eprintln!(
+        "[RASTERIZER_MARK_CACHED_STALL_PROFILE] last_stage={} ({})",
+        last_stage, last_stage_name
+    );
+    for (index, name) in NAMES.iter().enumerate() {
+        eprintln!(
+            "[RASTERIZER_MARK_CACHED_STALL_PROFILE]   {:02} {:<24} {}",
+            index,
+            name,
+            RASTERIZER_MARK_CACHED_COUNTS[index].load(Ordering::Relaxed)
+        );
+    }
+}
 
 /// Memory permission for mapping operations.
 /// Matches upstream Common::MemoryPermission.
@@ -788,17 +845,24 @@ impl Memory {
     /// hook. Reactive flushing (the write-protect optimization) can be added
     /// in a follow-up.
     pub fn rasterizer_mark_region_cached(&self, vaddr: u64, size: u64, cached: bool) {
+        record_rasterizer_mark_cached_stage(0);
         if vaddr == 0 || size == 0 || self.current_page_table.is_null() {
+            record_rasterizer_mark_cached_stage(8);
             return;
         }
+        record_rasterizer_mark_cached_stage(1);
         let pt = unsafe { &*self.current_page_table };
+        record_rasterizer_mark_cached_stage(2);
         // Upstream computes `num_pages` as
         //   ((vaddr + size - 1) >> PAGEBITS) - (vaddr >> PAGEBITS) + 1
         // so single-byte writes still touch one page, and a write straddling
         // a page boundary touches two pages — even when `size < PAGE_SIZE`.
         let num_pages = ((vaddr + size - 1) >> PAGE_BITS) - (vaddr >> PAGE_BITS) + 1;
+        record_rasterizer_mark_cached_stage(3);
         let mut current_vaddr = vaddr;
+        record_rasterizer_mark_cached_stage(4);
         for _ in 0..num_pages {
+            record_rasterizer_mark_cached_stage(5);
             let page_idx = (current_vaddr >> PAGE_BITS) as usize;
             if page_idx < pt.pointers.size() {
                 let entry = &pt.pointers[page_idx];
@@ -835,6 +899,8 @@ impl Memory {
             }
             current_vaddr += PAGE_SIZE as u64;
         }
+        record_rasterizer_mark_cached_stage(6);
+        record_rasterizer_mark_cached_stage(7);
     }
 
     fn current_physical_address(&self, vaddr: u64) -> Option<u64> {

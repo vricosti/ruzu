@@ -368,8 +368,15 @@ impl NvHostCtrl {
 
         let fence_id = params.fence.id as u32;
         let existing_event_id = params.value.raw;
+        let reset_non_allocation_fails = |this: &Self| {
+            if !is_allocation && existing_event_id < MAX_NV_EVENTS {
+                let mut events = this.events.lock().unwrap();
+                events[existing_event_id as usize].fails = 0;
+            }
+        };
 
         if fence_id >= MAX_SYNC_POINTS {
+            reset_non_allocation_fails(self);
             return NvResult::BadParameter;
         }
 
@@ -389,6 +396,7 @@ impl NvHostCtrl {
                     params.value.raw
                 );
             }
+            reset_non_allocation_fails(self);
             return NvResult::Success;
         }
 
@@ -401,6 +409,7 @@ impl NvHostCtrl {
                     params.value.raw
                 );
             }
+            reset_non_allocation_fails(self);
             return NvResult::Success;
         }
 
@@ -414,6 +423,7 @@ impl NvHostCtrl {
                     params.value.raw
                 );
             }
+            reset_non_allocation_fails(self);
             return NvResult::Success;
         }
 
@@ -736,6 +746,49 @@ mod tests {
             let mut events = ctrl.events.lock().unwrap();
             events[2].fails = 3;
         }
+
+        let mut params = IocCtrlEventWaitParams {
+            fence: NvFence {
+                id: fence_id as i32,
+                value: 5,
+            },
+            timeout: 1,
+            value: super::SyncpointEventValue { raw: 2 },
+        };
+
+        let result = ctrl.ioc_ctrl_event_wait(&mut params, false);
+
+        assert_eq!(result, NvResult::Success);
+        assert_eq!(params.value.raw, 5);
+        {
+            let events = ctrl.events.lock().unwrap();
+            assert_eq!(events[2].fails, 0);
+        }
+
+        std::mem::forget(system);
+    }
+
+    #[test]
+    fn event_wait_non_allocation_immediate_success_resets_fails() {
+        let system = System::new_for_test();
+        let events = Arc::new(EventInterface::new(SystemRef::from_ref(&system)));
+        let syncpoints = SyncpointManager::new();
+        let ctrl = NvHostCtrl::new(events, &syncpoints);
+        let fence_id = syncpoints.allocate_syncpoint(false);
+
+        let mut register = IocCtrlEventRegisterParams { user_event_id: 2 };
+        assert_eq!(
+            ctrl.ioc_ctrl_event_register(&mut register),
+            NvResult::Success
+        );
+
+        {
+            let mut events = ctrl.events.lock().unwrap();
+            events[2].fails = 2;
+        }
+
+        syncpoints.increment_syncpoint_max_ext(fence_id, 5);
+        syncpoints.signal_syncpoint(fence_id);
 
         let mut params = IocCtrlEventWaitParams {
             fence: NvFence {

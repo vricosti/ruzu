@@ -50,7 +50,8 @@ use thiserror::Error;
 
 pub use gl_blit_screen::BlitScreen;
 pub use gl_device::Device;
-pub use gl_rasterizer::RasterizerOpenGL;
+pub use gl_rasterizer::{dump_gl_draw_stall_profile, RasterizerOpenGL};
+pub use gl_shader_cache::dump_shader_pipeline_stall_profile;
 #[allow(unused_imports)]
 pub use gl_state_tracker::StateTracker;
 
@@ -609,6 +610,10 @@ impl RendererBase for RendererOpenGL {
 
     fn set_gpu_ticks_getter(&mut self, getter: crate::renderer_base::GpuTicksGetter) {
         self.rasterizer.set_gpu_ticks_getter(getter);
+    }
+
+    fn set_gpu_tick_callback(&mut self, callback: crate::renderer_base::GpuTickCallback) {
+        self.rasterizer.set_gpu_tick_callback(callback);
     }
 
     fn get_applet_capture_buffer(&self) -> Vec<u8> {

@@ -16683,3 +16683,187 @@ Investigation focused on a "specific frame number" was misdirected. The real que
 
 ### Tests
 - Re-ran `cargo check -p video_core`.
+
+## 2026-05-23 — core/src/frontend/graphics_context.rs + video_core/src/gpu_thread.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/frontend/graphics_context.h and /home/vricosti/Dev/emulators/zuyu/src/video_core/gpu_thread.{h,cpp}
+
+### Intentional differences
+- Upstream `RunThread` creates `auto current_context = context.Acquire()` and keeps that RAII object alive for the GPU thread. Rust keeps the same lifetime shape through `ScopedGraphicsContext`, but the guard now stores `GraphicsContextHandle` instead of a long-lived `&mut dyn GraphicsContext`. This avoids manufacturing a Rust exclusive borrow for the whole GPU thread while still calling `make_current` on construction and `done_current` on drop.
+- Added `RUZU_PROFILE_GPU_THREAD=1` counters in `gpu_thread.rs`, dumped through the existing `SIGUSR2` profile path in `ruzu_cmd`. This is diagnostic-only and env-gated; upstream has MicroProfile instrumentation around the GPU thread instead.
+
+### Unintentional differences (to fix)
+- `GraphicsContextHandle` is still a Rust lifetime-erasure adaptation. Upstream has a direct `GraphicsContext&`; the long-term Rust model should keep the non-owning handle but avoid spreading raw trait-object transmute at call sites.
+
+### Missing items
+- Use the new GPU thread counters to decide whether the async regression is in queue wake/pop, scheduler command execution, syncpoint advancement, or guest-side producer state.
+- If the counters show correct push/pop parity, continue investigation in `Scheduler::Push` / `DmaPusher::DispatchCalls` rather than the queue.
+
+### Binary layout verification
+- N/A: host-only context guard and profiling counters; no guest-visible raw struct or serialized payload layout changed.
+
+## 2026-05-23 — core/src/hle/kernel/svc_dispatch.rs Break diagnostics vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/svc.cpp
+
+### Intentional differences
+- Added a minimal Rust-only diagnostic to `SvcId::Break` that logs the current guest PC/LR/SP/core from the active ARM interface. This is not an upstream behavior change; it only enriches an already fatal userspace break path so MK8D abort sites can be identified without enabling high-volume SVC tracing.
+
+### Unintentional differences (to fix)
+- None for guest behavior. The diagnostic should remain low-volume or be env-gated if it ever becomes noisy.
+
+### Missing items
+- Use the logged break PC/LR to identify which guest-side condition aborts before first `QueueBuffer` on `refactor/render-engine-rework`.
+
+### Binary layout verification
+- N/A: fatal-path logging only; no guest-visible raw struct or serialized payload layout changed.
+
+## 2026-05-23 — core/src/hle/service/nvdrv/devices/nvhost_ctrl.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/nvdrv/devices/nvhost_ctrl.{h,cpp}
+
+### Intentional differences
+- Rust uses a closure to emulate upstream `SCOPE_EXIT` in `nvhost_ctrl::IocCtrlEventWait`. On non-allocation waits that return before arming an event, upstream resets `events[event_id].fails = 0`; Rust now performs the same reset on the matching early-return paths while retaining bounds checks for host safety.
+- Rust still stores NV event state behind `Mutex<Vec<InternalEvent>>` and signals `KReadableEvent` through `signal_from_host`; upstream stores `NvEvent` objects inline and calls `event_.kevent->Signal()`. This is the existing Rust ownership adaptation, not changed by this pass.
+
+### Unintentional differences (to fix)
+- None in the `fails` reset behavior covered by this pass. The rest of `IocCtrlEventWait` still needs periodic comparison against upstream when investigating syncpoint/event regressions.
+
+### Missing items
+- Verify whether the Rust-only queried-event-owner latch path is still required after the sync-object refactor, since upstream `QueryEvent` only returns a copy handle and does not register an owner callback.
+
+### Binary layout verification
+- PASS: `IocCtrlEventWaitParams` remains `repr(C)` and size-checked at 16 bytes, matching upstream `static_assert(sizeof(IocCtrlEventWaitParams) == 16)`.
+
+### Tests
+- Added `event_wait_non_allocation_immediate_success_resets_fails` for the upstream `SCOPE_EXIT` reset on immediate success.
+
+## 2026-05-23 — core/src/hle/service/nvdrv/nvdrv_interface.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/nvdrv/nvdrv_interface.{h,cpp}
+
+### Intentional differences
+- Rust keeps the per-service state inside `NvdrvInterface` behind `Mutex<NvdrvInterface>` because service handlers receive `&dyn ServiceFramework`; upstream stores the same fields directly in `NVDRV`. This is an existing Rust object-model adaptation and was not broadened by this pass.
+- Rust exposes `NvdrvInterface::is_initialized()` so handlers can mirror upstream's early `!is_initialized` checks before reading IPC buffers.
+
+### Unintentional differences (to fix)
+- `NvdrvService` still serializes all commands for one service object through one `Mutex<NvdrvInterface>`. Upstream has no equivalent outer service mutex; state that needs protection should eventually be moved behind narrower locks if profiling proves contention here.
+- Rust keeps several env-gated ioctl payload diagnostics in this file. They are intentionally off by default, but should be removed or kept documented once the MK8D nvdrv investigation closes.
+
+### Missing items
+- Compare `Open`, `Ioctl1`, `Ioctl2`, `Ioctl3`, `Close`, and `QueryEvent` response construction against upstream after the remaining diagnostics are removed.
+
+### Binary layout verification
+- N/A: this pass changes command ordering and service-state checks only; no guest-visible raw struct layout changed.
+
+### Tests
+- Re-ran `cargo build --release --bin ruzu-cmd`.
+
+## 2026-05-23 — video_core/src/host1x/gpu_device_memory_manager.rs, ruzu_cmd/src/main.rs, core/src/memory/memory.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/device_memory_manager.inc, /home/vricosti/Dev/emulators/zuyu/src/video_core/host1x/gpu_device_memory_manager.cpp, /home/vricosti/Dev/emulators/zuyu/src/core/memory.cpp
+
+### Intentional differences
+- Upstream `DeviceMemoryManager<Traits>::UpdatePagesCachedCount` calls `MaxwellDeviceMethods::MarkRegionCaching(Core::Memory::Memory*, ...)` directly with a registered `Core::Memory::Memory*`. Rust now mirrors that ownership boundary by capturing a stable pointer to `Memory` once in `ruzu_cmd` and calling `Memory::rasterizer_mark_region_cached` directly from the GPU cache callback.
+- Rust keeps a fallback path through `SystemRef::memory_shared().lock()` if the direct pointer cannot be captured at setup. This fallback is not expected in normal emulator startup, but keeps the callback robust for partial/test construction.
+- `gpu_device_memory_manager.rs`, `memory.rs`, and `ruzu_cmd` include env-gated stall profilers (`RUZU_PROFILE_UPDATE_CACHED_STALL`, `RUZU_PROFILE_RASTERIZER_MARK_CACHED_STALL`, `RUZU_PROFILE_MARK_REGION_CALLBACK_STALL`). Upstream has no equivalent; these are inactive by default and document the diagnosed lock inversion.
+- Rust currently batches callback ranges into a temporary vector and drops `cached_pages` before invoking `mark_region_caching`. Upstream calls `MarkRegionCaching` inline while holding its range/counter guard, but upstream does not also take ruzu's coarse `Mutex<Memory>`. The Rust ordering avoids a host-side ABBA while preserving the externally visible cache/uncache transitions.
+
+### Unintentional differences (to fix)
+- Rust `MaxwellDeviceMemoryManager` still lacks upstream's ASID-aware `ExtractCPUBacking` / `registered_processes` path. It assumes the GPU cached region maps into the current process address space, matching current ruzu usage but not full upstream behavior.
+- Rust still lacks upstream's `Common::ScopedRangeLock counter_guard` granularity. It uses the existing `cached_pages` mutex for count mutation.
+- `Memory::rasterizer_mark_region_cached` still documents the missing upstream fastmem `Protect()` / reactive flushing path. Page-type transitions are present, but host write-protect behavior is not yet ported.
+
+### Missing items
+- Port ASID-backed CPU mapping extraction for `UpdatePagesCachedCount`.
+- Port range-lock granularity if the coarse `cached_pages` mutex becomes a contention point.
+- Port the reactive-flushing fastmem protection path in `Memory::RasterizerMarkRegionCached`.
+- Remove or keep explicitly documented the stall profilers once the async GPU startup regression is considered closed.
+
+### Binary layout verification
+- N/A: this changes host-side callback ownership and page-table state transitions, not a guest-visible raw payload layout.
+
+### Tests
+- Re-read upstream `device_memory_manager.inc`, `video_core/host1x/gpu_device_memory_manager.cpp`, and `core/memory.cpp`.
+- `cargo build --release --bin ruzu-cmd` passes.
+- `cargo test -p video_core gpu_device_memory_manager -- --nocapture` passes: 5 tests.
+- MK8D deterministic startup, 3 runs of 18s: `SubmitList done == pop` in all runs and `QueueBuffer` reached 865/873/873 instead of the previous blocked `QueueBuffer=0`.
+
+## 2026-05-23 — video_core/src/engines/draw_manager.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/engines/draw_manager.{h,cpp}
+
+### Intentional differences
+- Rust still passes a `Maxwell3DAccess` trait object into `DrawManager` methods instead of storing the raw `Maxwell3D*` member used upstream. This is the current safe Rust ownership adaptation for the render-engine rework.
+- Rust keeps a compatibility `DrawCall` side list for older tests/debug paths. Upstream does not have this list; it is not used for the OpenGL draw dispatch.
+
+### Unintentional differences (to fix)
+- None for the dirty-flag ownership corrected in this pass. Rust previously cleared OpenGL viewport/front-face/clip-control dirty flags in `DrawManager::process_draw` before calling the rasterizer; upstream `DrawManager::ProcessDraw` only calls `UpdateTopology()` then `rasterizer->Draw(...)`. The premature clears have been removed so `RasterizerOpenGL::SyncState` / `SyncViewport` remains the owner of consuming those dirty flags.
+
+### Missing items
+- Continue reducing the Rust-only compatibility draw-call path once all callers consume live Maxwell draw views like upstream.
+- `DrawManager` still depends on the safe `Maxwell3DAccess` abstraction rather than a direct `Maxwell3D` member; keep this documented until the long-term engine ownership model is complete.
+
+### Binary layout verification
+- N/A: draw dispatch ownership and dirty-flag ordering only; no guest-visible raw struct layout changed.
+
+### Tests
+- Re-ran `cargo build --release --bin ruzu-cmd`.
+
+## 2026-05-23 — video_core/src/gpu.rs, video_core/src/renderer_base.rs, video_core/src/renderer_opengl/{mod.rs,gl_rasterizer.rs} vs /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_rasterizer.{h,cpp}
+
+### Intentional differences
+- Upstream `RasterizerOpenGL` owns a `GPU&` and calls `gpu.TickWork()` directly from `PrepareDraw` and `DrawTexture`. Rust's rasterizer does not own a direct `Gpu` reference, so `RendererBase::set_gpu_tick_callback` installs a callback from `Gpu::bind_renderer`. This preserves the call sites without introducing a long-lived unsafe engine/GPU reference in `RasterizerOpenGL`.
+- The callback is optional and defaults to no-op for tests and non-OpenGL renderers, matching existing Rust trait-object construction constraints.
+
+### Unintentional differences (to fix)
+- Rust still lacks upstream's full `gpu_memory->FlushCaching()` at the start of `PrepareDraw`; the callback only ports the `gpu.TickWork()` side effect.
+- Rust's `PrepareDraw` body is not yet structurally split to match upstream's `PrepareDraw` helper plus `Draw` lambda exactly.
+
+### Missing items
+- Port the remaining `RasterizerOpenGL::PrepareDraw` structure, especially `gpu_memory->FlushCaching()` and full `SyncState()` ownership, once the live Maxwell view plumbing is stable.
+
+### Binary layout verification
+- N/A: renderer callback plumbing only.
+
+### Tests
+- Re-ran `cargo build --release --bin ruzu-cmd`.
+
+## 2026-05-23 — video_core/src/gpu_thread.rs diagnostic vs /home/vricosti/Dev/emulators/zuyu/src/video_core/gpu_thread.cpp
+
+### Intentional differences
+- Extended `RUZU_PROFILE_GPU_THREAD=1` with Rust-only completed-submit counters and per-submit `scheduler.push` timing. Upstream does not have this env-gated profiler; it is diagnostic-only and inactive by default.
+
+### Unintentional differences (to fix)
+- None for guest behavior; this is diagnostic-only. Remove or keep documented after the async submit stall is closed.
+
+### Missing items
+- Use the completed-submit counter to locate the remaining async stall inside Maxwell draw/rasterizer dispatch.
+
+### Binary layout verification
+- N/A: host-side profiling counters only.
+
+### Tests
+- Re-ran `cargo build --release --bin ruzu-cmd`.
+
+## 2026-05-23 — core/src/hle/kernel/k_server_session.rs receive-request diagnostic vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/k_server_session.cpp
+
+### Intentional differences
+- Added `RUZU_TRACE_RECEIVE_REQUEST_HLE=1`, a Rust-only low-volume diagnostic around `KServerSession::receive_request_hle` request pop, client thread resolution, TLS address resolution, and IPC context population. Upstream has trace/debug macros in adjacent IPC paths rather than this exact env gate.
+
+### Unintentional differences (to fix)
+- None for guest behavior; this is env-gated and inactive by default. Remove it after the current IPC/nvdrv stall is closed if it no longer provides value.
+
+### Missing items
+- Continue comparing Rust `receive_request_hle` with upstream's server-session request receive path if future traces show a stall before handler dispatch.
+
+### Binary layout verification
+- N/A: diagnostic logging only.
+
+### Tests
+- Re-ran `cargo build --release --bin ruzu-cmd`.
+
+## 2026-05-23 — core/src/hle/service/nvdrv/nvdrv.rs ioctl diagnostic vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/nvdrv/nvdrv.cpp
+
+### Intentional differences
+- Added `RUZU_TRACE_IOCTL_ENTER=1`, a Rust-only diagnostic at `Module::ioctl1` entry to print fd, ioctl id, buffer sizes, and a short input prefix. It is used to distinguish stalls before `Module::Ioctl1` from stalls inside individual nvdrv devices.
+
+### Unintentional differences (to fix)
+- None for guest behavior; the diagnostic is env-gated and inactive by default. Remove it when no longer needed.
+
+### Missing items
+- If MK8D still stalls before `Module::ioctl1`, continue the investigation in `nvdrv_interface.rs` / IPC buffer read / service mutex acquisition rather than per-device ioctl handlers.
+
+### Binary layout verification
+- N/A: diagnostic logging only.
+
+### Tests
+- Re-ran `cargo build --release --bin ruzu-cmd`.

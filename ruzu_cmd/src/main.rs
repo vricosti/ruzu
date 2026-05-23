@@ -25,6 +25,7 @@
 use clap::Parser;
 use sdl2::libc;
 use std::ffi::OsStr;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 pub mod emu_window;
 pub mod sdl_config;
@@ -34,6 +35,58 @@ use emu_window::{
     emu_window_sdl2_vk::EmuWindowSdl2Vk,
 };
 use sdl_config::SdlConfig;
+
+static MARK_REGION_CALLBACK_LAST_STAGE: AtomicU64 = AtomicU64::new(0);
+static MARK_REGION_CALLBACK_COUNTS: [AtomicU64; 8] = [
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+];
+
+fn record_mark_region_callback_stage(stage: usize) {
+    if std::env::var_os("RUZU_PROFILE_MARK_REGION_CALLBACK_STALL").is_none() {
+        return;
+    }
+    MARK_REGION_CALLBACK_LAST_STAGE.store(stage as u64, Ordering::Relaxed);
+    if let Some(counter) = MARK_REGION_CALLBACK_COUNTS.get(stage) {
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+fn dump_mark_region_callback_stall_profile() {
+    if MARK_REGION_CALLBACK_COUNTS[0].load(Ordering::Relaxed) == 0 {
+        return;
+    }
+    const NAMES: [&str; 8] = [
+        "enter",
+        "after_direct_or_system",
+        "before_memory_shared",
+        "after_memory_shared",
+        "before_memory_access",
+        "after_memory_access",
+        "after_mark_cached",
+        "exit",
+    ];
+    let last_stage = MARK_REGION_CALLBACK_LAST_STAGE.load(Ordering::Relaxed) as usize;
+    let last_stage_name = NAMES.get(last_stage).copied().unwrap_or("unknown");
+    eprintln!(
+        "[MARK_REGION_CALLBACK_STALL_PROFILE] last_stage={} ({})",
+        last_stage, last_stage_name
+    );
+    for (index, name) in NAMES.iter().enumerate() {
+        eprintln!(
+            "[MARK_REGION_CALLBACK_STALL_PROFILE]   {:02} {:<22} {}",
+            index,
+            name,
+            MARK_REGION_CALLBACK_COUNTS[index].load(Ordering::Relaxed)
+        );
+    }
+}
 
 // ---------------------------------------------------------------------------
 // CLI argument definitions
@@ -450,6 +503,21 @@ fn main() {
     let want_vsync_profile = std::env::var_os("RUZU_PROFILE_VSYNC").is_some();
     let want_present_profile = std::env::var_os("RUZU_PROFILE_PRESENT").is_some();
     let want_submit_gpfifo_profile = std::env::var_os("RUZU_PROFILE_SUBMIT_GPFIFO").is_some();
+    let want_gl_draw_stall_profile = std::env::var_os("RUZU_PROFILE_GL_DRAW_STALL").is_some();
+    let want_shader_pipeline_stall_profile =
+        std::env::var_os("RUZU_PROFILE_SHADER_PIPELINE_STALL").is_some();
+    let want_refresh_stages_stall_profile =
+        std::env::var_os("RUZU_PROFILE_REFRESH_STAGES_STALL").is_some();
+    let want_make_shader_info_stall_profile =
+        std::env::var_os("RUZU_PROFILE_MAKE_SHADER_INFO_STALL").is_some();
+    let want_shader_register_stall_profile =
+        std::env::var_os("RUZU_PROFILE_SHADER_REGISTER_STALL").is_some();
+    let want_update_cached_stall_profile =
+        std::env::var_os("RUZU_PROFILE_UPDATE_CACHED_STALL").is_some();
+    let want_rasterizer_mark_cached_stall_profile =
+        std::env::var_os("RUZU_PROFILE_RASTERIZER_MARK_CACHED_STALL").is_some();
+    let want_mark_region_callback_stall_profile =
+        std::env::var_os("RUZU_PROFILE_MARK_REGION_CALLBACK_STALL").is_some();
     if want_ipc_profile
         || want_svc_profile
         || want_wake_profile
@@ -463,6 +531,14 @@ fn main() {
         || want_vsync_profile
         || want_present_profile
         || want_submit_gpfifo_profile
+        || want_gl_draw_stall_profile
+        || want_shader_pipeline_stall_profile
+        || want_refresh_stages_stall_profile
+        || want_make_shader_info_stall_profile
+        || want_shader_register_stall_profile
+        || want_update_cached_stall_profile
+        || want_rasterizer_mark_cached_stall_profile
+        || want_mark_region_callback_stall_profile
     {
         extern "C" fn profile_signal(_signum: libc::c_int) {
             ruzu_core::hle::kernel::svc::svc_ipc::dump_ipc_profile();
@@ -472,6 +548,7 @@ fn main() {
             ruzu_core::hle::kernel::svc_dispatch::dump_gap_profile();
             ruzu_core::hle::service::nvdrv::nvdrv_interface::dump_nvdrv_ioctl_profile();
             ruzu_core::hle::service::nvdrv::devices::nvhost_gpu::dump_submit_gpfifo_profile();
+            video_core::gpu_thread::dump_gpu_thread_profile();
             ruzu_core::hle::kernel::svc::svc_ipc::dump_ipc_phase_profile();
             ruzu_core::hle::service::hle_ipc::dump_hle_handler_profile();
             ruzu_core::hle::service::nvnflinger::buffer_queue_producer::dump_bqp_slot_profile();
@@ -479,6 +556,14 @@ fn main() {
             ruzu_core::hle::service::nvnflinger::hardware_composer::dump_hwc_cache_profile();
             ruzu_core::hle::service::vi::conductor::dump_vsync_profile();
             video_core::renderer_opengl::dump_present_profile();
+            video_core::renderer_opengl::dump_gl_draw_stall_profile();
+            video_core::renderer_opengl::dump_shader_pipeline_stall_profile();
+            video_core::shader_cache::dump_refresh_stages_stall_profile();
+            video_core::shader_cache::dump_make_shader_info_stall_profile();
+            video_core::shader_cache::dump_shader_register_stall_profile();
+            video_core::host1x::gpu_device_memory_manager::dump_update_cached_stall_profile();
+            ruzu_core::memory::memory::dump_rasterizer_mark_cached_stall_profile();
+            dump_mark_region_callback_stall_profile();
         }
         unsafe {
             let mut sa: sdl2::libc::sigaction = std::mem::zeroed();
@@ -494,6 +579,7 @@ fn main() {
             ruzu_core::hle::kernel::svc_dispatch::dump_gap_profile();
             ruzu_core::hle::service::nvdrv::nvdrv_interface::dump_nvdrv_ioctl_profile();
             ruzu_core::hle::service::nvdrv::devices::nvhost_gpu::dump_submit_gpfifo_profile();
+            video_core::gpu_thread::dump_gpu_thread_profile();
             ruzu_core::hle::kernel::svc::svc_ipc::dump_ipc_phase_profile();
             ruzu_core::hle::service::hle_ipc::dump_hle_handler_profile();
             ruzu_core::hle::service::nvnflinger::buffer_queue_producer::dump_bqp_slot_profile();
@@ -501,6 +587,14 @@ fn main() {
             ruzu_core::hle::service::nvnflinger::hardware_composer::dump_hwc_cache_profile();
             ruzu_core::hle::service::vi::conductor::dump_vsync_profile();
             video_core::renderer_opengl::dump_present_profile();
+            video_core::renderer_opengl::dump_gl_draw_stall_profile();
+            video_core::renderer_opengl::dump_shader_pipeline_stall_profile();
+            video_core::shader_cache::dump_refresh_stages_stall_profile();
+            video_core::shader_cache::dump_make_shader_info_stall_profile();
+            video_core::shader_cache::dump_shader_register_stall_profile();
+            video_core::host1x::gpu_device_memory_manager::dump_update_cached_stall_profile();
+            ruzu_core::memory::memory::dump_rasterizer_mark_cached_stall_profile();
+            dump_mark_region_callback_stall_profile();
         }
         unsafe {
             libc::atexit(profile_atexit);
@@ -1000,12 +1094,45 @@ fn main() {
         // Installed once, applies to every cache that hands the device
         // memory manager an `UpdatePagesCachedCount` call.
         let system_ref3 = ruzu_core::core::SystemRef::from_ref(&system);
+        // Upstream `MaxwellDeviceMethods::MarkRegionCaching` stores a
+        // `Core::Memory::Memory*` and calls `RasterizerMarkRegionCached`
+        // directly. Do the same here: the page-table entries updated by that
+        // method are atomic, and taking ruzu's coarse `Mutex<Memory>` on the
+        // GPU thread creates a CPU↔GPU lock inversion during shader cache
+        // registration.
+        let mark_cached_memory_ptr = system
+            .memory_shared()
+            .map(|memory| {
+                let guard = memory.lock().unwrap();
+                &*guard as *const ruzu_core::memory::memory::Memory as usize
+            })
+            .unwrap_or(0);
         device_memory.set_mark_region_caching(Box::new(move |addr, size, cached| {
-            let sys = system_ref3.get();
-            if let Some(memory) = sys.memory_shared() {
-                let m = memory.lock().unwrap();
-                m.rasterizer_mark_region_cached(addr, size as u64, cached);
+            record_mark_region_callback_stage(0);
+            if mark_cached_memory_ptr != 0 {
+                record_mark_region_callback_stage(1);
+                record_mark_region_callback_stage(2);
+                record_mark_region_callback_stage(3);
+                record_mark_region_callback_stage(4);
+                record_mark_region_callback_stage(5);
+                let memory =
+                    unsafe { &*(mark_cached_memory_ptr as *const ruzu_core::memory::memory::Memory) };
+                memory.rasterizer_mark_region_cached(addr, size as u64, cached);
+                record_mark_region_callback_stage(6);
+            } else {
+                let sys = system_ref3.get();
+                record_mark_region_callback_stage(1);
+                record_mark_region_callback_stage(2);
+                if let Some(memory) = sys.memory_shared() {
+                    record_mark_region_callback_stage(3);
+                    record_mark_region_callback_stage(4);
+                    let m = memory.lock().unwrap();
+                    record_mark_region_callback_stage(5);
+                    m.rasterizer_mark_region_cached(addr, size as u64, cached);
+                    record_mark_region_callback_stage(6);
+                }
             }
+            record_mark_region_callback_stage(7);
         }));
 
         system.set_gpu_core(gpu);

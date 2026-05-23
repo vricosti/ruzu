@@ -81,6 +81,63 @@ pub const SMMU_BASE: u64 = 0x40000;
 pub const SMMU_PAGE_BITS: u32 = 12;
 pub const SMMU_PAGE_SIZE: u64 = 1 << SMMU_PAGE_BITS;
 
+static UPDATE_CACHED_LAST_STAGE: AtomicU64 = AtomicU64::new(0);
+static UPDATE_CACHED_COUNTS: [AtomicU64; 10] = [
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+];
+
+fn record_update_cached_stage(stage: usize) {
+    if std::env::var_os("RUZU_PROFILE_UPDATE_CACHED_STALL").is_none() {
+        return;
+    }
+    UPDATE_CACHED_LAST_STAGE.store(stage as u64, Ordering::Relaxed);
+    if let Some(counter) = UPDATE_CACHED_COUNTS.get(stage) {
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+pub fn dump_update_cached_stall_profile() {
+    if UPDATE_CACHED_COUNTS[0].load(Ordering::Relaxed) == 0 {
+        return;
+    }
+    const NAMES: [&str; 10] = [
+        "enter",
+        "after_range",
+        "before_cached_pages_lock",
+        "after_cached_pages_lock",
+        "after_page_loop",
+        "after_counts_drop",
+        "before_callback_lock",
+        "after_callback_lock",
+        "after_callbacks",
+        "exit",
+    ];
+    let last_stage = UPDATE_CACHED_LAST_STAGE.load(Ordering::Relaxed) as usize;
+    let last_stage_name = NAMES.get(last_stage).copied().unwrap_or("unknown");
+    eprintln!(
+        "[UPDATE_CACHED_STALL_PROFILE] last_stage={} ({})",
+        last_stage,
+        last_stage_name
+    );
+    for (index, name) in NAMES.iter().enumerate() {
+        eprintln!(
+            "[UPDATE_CACHED_STALL_PROFILE]   {:02} {:<28} {}",
+            index,
+            name,
+            UPDATE_CACHED_COUNTS[index].load(Ordering::Relaxed)
+        );
+    }
+}
+
 /// Implement the texture-cache `GpuMemoryReader` adapter so descriptor
 /// tables can read TIC/TSC entries directly via `smmu_read_block`. The
 /// texture cache holds an `Arc<MaxwellDeviceMemoryManager>`, so passing
@@ -317,12 +374,14 @@ impl MaxwellDeviceMemoryManager {
     ///   `CounterType = u8` semantics but uses `wrapping_add(delta as u8)`.
     ///   Upstream comment: "Assume delta is either -1 or 1" — same here.
     pub fn update_pages_cached_count(&self, addr: DAddr, size: usize, delta: i32) {
+        record_update_cached_stage(0);
         if size == 0 {
             return;
         }
 
         let page_begin = addr >> PAGE_BITS;
         let page_end = (addr + size as u64 + PAGE_SIZE - 1) >> PAGE_BITS;
+        record_update_cached_stage(1);
 
         // Pending-batch tracking for grouped MarkRegionCaching calls.
         // `uncache_*` accumulates pages that just transitioned to count==0.
@@ -332,29 +391,29 @@ impl MaxwellDeviceMemoryManager {
         let mut cache_begin: u64 = 0;
         let mut cache_bytes: u64 = 0;
 
+        let mut callbacks: Vec<(u64, usize, bool)> = Vec::new();
+        record_update_cached_stage(2);
         let mut counts = self.cached_pages.lock().unwrap();
-        let callback_guard = self.mark_region_caching.lock().unwrap();
-        let callback = callback_guard.as_ref();
+        record_update_cached_stage(3);
 
         // Helper to flush pending batches. Closes over locals via
         // explicit references so we can call it from inside the loop.
-        let flush = |uncache_begin: &mut u64,
-                     uncache_bytes: &mut u64,
-                     cache_begin: &mut u64,
-                     cache_bytes: &mut u64| {
+        fn flush_callbacks(
+            callbacks: &mut Vec<(u64, usize, bool)>,
+            uncache_begin: &mut u64,
+            uncache_bytes: &mut u64,
+            cache_begin: &mut u64,
+            cache_bytes: &mut u64,
+        ) {
             if *uncache_bytes > 0 {
-                if let Some(cb) = callback {
-                    cb(*uncache_begin << PAGE_BITS, *uncache_bytes as usize, false);
-                }
+                callbacks.push((*uncache_begin << PAGE_BITS, *uncache_bytes as usize, false));
                 *uncache_bytes = 0;
             }
             if *cache_bytes > 0 {
-                if let Some(cb) = callback {
-                    cb(*cache_begin << PAGE_BITS, *cache_bytes as usize, true);
-                }
+                callbacks.push((*cache_begin << PAGE_BITS, *cache_bytes as usize, true));
                 *cache_bytes = 0;
             }
-        };
+        }
 
         // Upstream tracks `old_vpage` to detect non-contiguous CPU vaddr
         // ranges (which force a batch flush). Without ASID translation
@@ -367,7 +426,8 @@ impl MaxwellDeviceMemoryManager {
         for page in page_begin..page_end {
             // Discontinuity detection (no-op for now; see comment above).
             if page != old_page.wrapping_add(1) {
-                flush(
+                flush_callbacks(
+                    &mut callbacks,
                     &mut uncache_begin,
                     &mut uncache_bytes,
                     &mut cache_begin,
@@ -390,9 +450,7 @@ impl MaxwellDeviceMemoryManager {
                 uncache_bytes += PAGE_SIZE;
             } else if uncache_bytes > 0 {
                 // Non-zero count interrupts an in-progress uncache batch.
-                if let Some(cb) = callback {
-                    cb(uncache_begin << PAGE_BITS, uncache_bytes as usize, false);
-                }
+                callbacks.push((uncache_begin << PAGE_BITS, uncache_bytes as usize, false));
                 uncache_bytes = 0;
             }
 
@@ -404,19 +462,36 @@ impl MaxwellDeviceMemoryManager {
                 cache_bytes += PAGE_SIZE;
             } else if cache_bytes > 0 {
                 // Anything else interrupts the cache batch.
-                if let Some(cb) = callback {
-                    cb(cache_begin << PAGE_BITS, cache_bytes as usize, true);
-                }
+                callbacks.push((cache_begin << PAGE_BITS, cache_bytes as usize, true));
                 cache_bytes = 0;
             }
         }
 
-        flush(
+        flush_callbacks(
+            &mut callbacks,
             &mut uncache_begin,
             &mut uncache_bytes,
             &mut cache_begin,
             &mut cache_bytes,
         );
+        record_update_cached_stage(4);
+        drop(counts);
+        record_update_cached_stage(5);
+
+        if callbacks.is_empty() {
+            record_update_cached_stage(9);
+            return;
+        }
+        record_update_cached_stage(6);
+        let callback_guard = self.mark_region_caching.lock().unwrap();
+        record_update_cached_stage(7);
+        if let Some(callback) = callback_guard.as_ref() {
+            for (address, size, caching) in callbacks {
+                callback(address, size, caching);
+            }
+        }
+        record_update_cached_stage(8);
+        record_update_cached_stage(9);
     }
 }
 

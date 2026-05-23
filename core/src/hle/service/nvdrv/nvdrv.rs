@@ -184,6 +184,25 @@ impl Module {
             log::error!("Invalid DeviceFD={}!", fd);
             return NvResult::InvalidState;
         }
+        if std::env::var_os("RUZU_TRACE_IOCTL_ENTER").is_some() {
+            let n = input.len().min(64);
+            let mut hex = String::new();
+            for (i, b) in input.iter().enumerate().take(n) {
+                if i > 0 && (i & 3) == 0 {
+                    hex.push(' ');
+                }
+                use std::fmt::Write;
+                let _ = write!(hex, "{:02x}", b);
+            }
+            eprintln!(
+                "[IOCTL_ENTER] fd={} ioctl=0x{:08X} in_sz=0x{:x} out_sz=0x{:x} head={}",
+                fd,
+                command.raw,
+                input.len(),
+                output.len(),
+                hex
+            );
+        }
         {
             use std::collections::HashMap;
             use std::sync::{Mutex, OnceLock};

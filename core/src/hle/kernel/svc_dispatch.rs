@@ -1211,6 +1211,24 @@ fn call32(system: &System, imm: u32, args: &mut SvcArgs) {
             for i in 0..args.len() {
                 log::error!("  r{:2} = {:#010x}", i, args[i]);
             }
+            if let Some(kernel) = system.kernel() {
+                let core_index = kernel.current_physical_core_index() as usize;
+                if let Some(process_arc) = system.current_process_arc.as_ref().cloned() {
+                    let process = process_arc.lock().unwrap();
+                    if let Some(jit) = process.get_arm_interface(core_index) {
+                        use crate::arm::arm_interface::ThreadContext;
+                        let mut ctx = ThreadContext::default();
+                        jit.get_context(&mut ctx);
+                        log::error!(
+                            "  break_pc=0x{:08X} break_lr=0x{:08X} break_sp=0x{:08X} core={}",
+                            ctx.r[15] as u32,
+                            ctx.r[14] as u32,
+                            ctx.r[13] as u32,
+                            core_index
+                        );
+                    }
+                }
+            }
             // Read abort message from guest memory if info1 points to a string.
             if info1 != 0 && info2 > 0 && info2 < 0x200 {
                 let len = info2 as usize;
