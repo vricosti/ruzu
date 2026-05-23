@@ -11,6 +11,7 @@
 
 use log::{debug, info};
 use std::ffi::c_void;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::time::Instant;
@@ -67,6 +68,84 @@ macro_rules! lock_two_reentrant_mutexes {
             std::thread::yield_now();
         }
     };
+}
+
+macro_rules! trace_gl_draw_stall {
+    ($($arg:tt)*) => {
+        if std::env::var_os("RUZU_TRACE_GL_DRAW_STALL").is_some() {
+            eprintln!($($arg)*);
+        }
+    };
+}
+
+static GL_DRAW_LAST_SEQ: AtomicU64 = AtomicU64::new(0);
+static GL_DRAW_LAST_STAGE: AtomicU64 = AtomicU64::new(0);
+static GL_DRAW_STAGE_COUNTS: [AtomicU64; 14] = [
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+];
+
+fn record_gl_draw_stage(seq: u64, stage: usize) {
+    if std::env::var_os("RUZU_PROFILE_GL_DRAW_STALL").is_none() {
+        return;
+    }
+    GL_DRAW_LAST_SEQ.store(seq, Ordering::Relaxed);
+    GL_DRAW_LAST_STAGE.store(stage as u64, Ordering::Relaxed);
+    if let Some(counter) = GL_DRAW_STAGE_COUNTS.get(stage) {
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+pub fn dump_gl_draw_stall_profile() {
+    if GL_DRAW_LAST_SEQ.load(Ordering::Relaxed) == 0
+        && GL_DRAW_STAGE_COUNTS[0].load(Ordering::Relaxed) == 0
+    {
+        return;
+    }
+    const NAMES: [&str; 14] = [
+        "enter",
+        "before_rt_prepare",
+        "after_rt_prepare",
+        "before_pipeline",
+        "after_pipeline",
+        "after_gpu_tick",
+        "before_build_programs",
+        "after_build_programs",
+        "before_cache_locks",
+        "after_cache_locks",
+        "after_descriptor_sync",
+        "after_pipeline_configure",
+        "before_draw_call",
+        "exit",
+    ];
+    let last_stage = GL_DRAW_LAST_STAGE.load(Ordering::Relaxed) as usize;
+    let last_stage_name = NAMES.get(last_stage).copied().unwrap_or("unknown");
+    eprintln!(
+        "[GL_DRAW_STALL_PROFILE] last_seq={} last_stage={} ({})",
+        GL_DRAW_LAST_SEQ.load(Ordering::Relaxed),
+        last_stage,
+        last_stage_name
+    );
+    for (index, name) in NAMES.iter().enumerate() {
+        eprintln!(
+            "[GL_DRAW_STALL_PROFILE]   {:02} {:<24} {}",
+            index,
+            name,
+            GL_DRAW_STAGE_COUNTS[index].load(Ordering::Relaxed)
+        );
+    }
 }
 
 type GlDepthRangeIndexeddNV = unsafe extern "system" fn(u32, f64, f64);
@@ -905,6 +984,13 @@ pub struct RasterizerOpenGL {
     device_memory_reader: Option<crate::renderer_base::DeviceMemoryReader>,
     /// GPU tick getter used for timestamped query writes.
     gpu_ticks_getter: Option<Arc<dyn Fn() -> u64 + Send + Sync>>,
+    /// Callback to process pending GPU sync work from draw paths.
+    ///
+    /// Upstream `RasterizerOpenGL` stores a `Tegra::GPU&` and calls
+    /// `gpu.TickWork()` directly in `PrepareDraw` / `DrawTexture`.
+    /// Rust keeps the owner boundary explicit by receiving the same operation
+    /// as a renderer-installed callback from `Gpu::bind_renderer`.
+    gpu_tick_callback: Option<Arc<dyn Fn() + Send + Sync>>,
     /// Transient Vertex Array Object that we bind before every `glDraw*` call
     /// to satisfy the GL core-profile requirement that "a VAO must be bound
     /// for any draw command". Attribute formats and vertex-buffer bindings are
@@ -1010,6 +1096,7 @@ impl RasterizerOpenGL {
             cpu_memory_reader: None,
             device_memory_reader: None,
             gpu_ticks_getter: None,
+            gpu_tick_callback: None,
             transient_vao,
         }
     }
@@ -1040,6 +1127,7 @@ impl RasterizerOpenGL {
             cpu_memory_reader: None,
             device_memory_reader: None,
             gpu_ticks_getter: None,
+            gpu_tick_callback: None,
             transient_vao: 0,
         }
     }
@@ -1084,6 +1172,16 @@ impl RasterizerOpenGL {
     pub fn set_gpu_ticks_getter(&mut self, getter: Arc<dyn Fn() -> u64 + Send + Sync>) {
         self.query_cache.set_gpu_ticks_getter(Arc::clone(&getter));
         self.gpu_ticks_getter = Some(getter);
+    }
+
+    pub fn set_gpu_tick_callback(&mut self, callback: Arc<dyn Fn() + Send + Sync>) {
+        self.gpu_tick_callback = Some(callback);
+    }
+
+    fn tick_gpu_work(&self) {
+        if let Some(callback) = self.gpu_tick_callback.as_ref() {
+            callback();
+        }
     }
 
     pub fn set_guest_memory_writer(&mut self, writer: GuestMemoryWriter) {
@@ -1431,6 +1529,16 @@ impl RasterizerInterface for RasterizerOpenGL {
         let draw_start = Instant::now();
         let draw_no = self.num_queued_commands;
         let draw_seq = self.total_draw_count;
+        let gpu_tick_callback = self.gpu_tick_callback.as_ref().cloned();
+        record_gl_draw_stage(draw_seq, 0);
+        trace_gl_draw_stall!(
+            "[GL_DRAW_STALL] seq={} enter indexed={} instances={} ib_count={} vb_count={}",
+            draw_seq,
+            draw_state.draw_indexed,
+            instance_count,
+            draw_state.index_buffer.count,
+            draw_state.vertex_buffer.count
+        );
         if trace_draw {
             info!(
                 "[GL_DRAW_PROFILE] begin indexed={} instances={} topology={:?} ib_count={} vb_count={} shader_addrs={:X?}",
@@ -1448,6 +1556,8 @@ impl RasterizerInterface for RasterizerOpenGL {
             let step = Instant::now();
             let texture_cache: *mut OpenGLTextureCache = &mut self.texture_cache;
             let render_targets = draw_view.render_targets();
+            record_gl_draw_stage(draw_seq, 1);
+            trace_gl_draw_stall!("[GL_DRAW_STALL] seq={} before_rt_prepare", draw_seq);
             bound_draw_framebuffer = unsafe {
                 let _texture_lock = (*texture_cache).base.mutex.lock();
                 (*texture_cache).update_render_targets_from_snapshot(&render_targets, |gpu_addr| {
@@ -1475,6 +1585,8 @@ impl RasterizerInterface for RasterizerOpenGL {
                     .filter_map(|&target| render_targets.render_targets.get(target as usize))
                     .find_map(|rt| (*texture_cache).framebuffer_for_render_target(rt))
             };
+            record_gl_draw_stage(draw_seq, 2);
+            trace_gl_draw_stall!("[GL_DRAW_STALL] seq={} after_rt_prepare", draw_seq);
             if trace_draw {
                 info!(
                     "[GL_DRAW_PROFILE] update_render_targets_us={}",
@@ -1499,15 +1611,27 @@ impl RasterizerInterface for RasterizerOpenGL {
         }
 
         let step = Instant::now();
+        record_gl_draw_stage(draw_seq, 3);
+        trace_gl_draw_stall!("[GL_DRAW_STALL] seq={} before_pipeline", draw_seq);
         let Some(pipeline) = self
             .gl_shader_cache
             .current_graphics_pipeline_with_shared_cache(&mut self.shader_cache)
         else {
             // No pipeline yet — either async compilation is in flight or
             // there is nothing to draw. Upstream silently skips in this case.
+            if let Some(callback) = gpu_tick_callback.as_ref() {
+                callback();
+            }
             debug!("RasterizerOpenGL::draw skipped — no graphics pipeline available");
             return;
         };
+        record_gl_draw_stage(draw_seq, 4);
+        trace_gl_draw_stall!("[GL_DRAW_STALL] seq={} after_pipeline", draw_seq);
+        if let Some(callback) = gpu_tick_callback.as_ref() {
+            callback();
+        }
+        record_gl_draw_stage(draw_seq, 5);
+        trace_gl_draw_stall!("[GL_DRAW_STALL] seq={} after_gpu_tick", draw_seq);
         if trace_draw {
             info!(
                 "[GL_DRAW_PROFILE] current_graphics_pipeline_us={}",
@@ -1523,6 +1647,8 @@ impl RasterizerInterface for RasterizerOpenGL {
         // every frame.
         if !pipeline.has_gl_programs() && pipeline.glsl_sources.iter().any(|s| s.is_some()) {
             let step = Instant::now();
+            record_gl_draw_stage(draw_seq, 6);
+            trace_gl_draw_stall!("[GL_DRAW_STALL] seq={} before_build_programs", draw_seq);
             if let Err((stage_index, msg)) = pipeline.build_from_sources() {
                 log::warn!(
                     "RasterizerOpenGL::draw: pipeline build failed at stage {}: {}",
@@ -1537,6 +1663,8 @@ impl RasterizerInterface for RasterizerOpenGL {
                     pipeline.has_gl_programs()
                 );
             }
+            record_gl_draw_stage(draw_seq, 7);
+            trace_gl_draw_stall!("[GL_DRAW_STALL] seq={} after_build_programs", draw_seq);
         }
 
         let is_indexed = draw_state.draw_indexed;
@@ -1550,12 +1678,16 @@ impl RasterizerInterface for RasterizerOpenGL {
         // cache locks while finding the graphics pipeline.
         let buffer_mutex: *const _ = &self.buffer_cache.mutex;
         let texture_mutex: *const _ = &self.texture_cache.base.mutex;
+        record_gl_draw_stage(draw_seq, 8);
+        trace_gl_draw_stall!("[GL_DRAW_STALL] seq={} before_cache_locks", draw_seq);
         lock_two_reentrant_mutexes!(
             buffer_mutex,
             texture_mutex,
             _buffer_mutex_guard,
             _texture_mutex_guard
         );
+        record_gl_draw_stage(draw_seq, 9);
+        trace_gl_draw_stall!("[GL_DRAW_STALL] seq={} after_cache_locks", draw_seq);
 
         // Mirrors upstream `GraphicsPipeline::ConfigureImpl`
         // (gl_graphics_pipeline.cpp:278-284): the very first thing the
@@ -1566,7 +1698,11 @@ impl RasterizerInterface for RasterizerOpenGL {
         self.texture_cache
             .base
             .synchronize_graphics_descriptors(draw_view.descriptor_sync_regs());
+        record_gl_draw_stage(draw_seq, 10);
+        trace_gl_draw_stall!("[GL_DRAW_STALL] seq={} after_descriptor_sync", draw_seq);
         pipeline.configure(is_indexed);
+        record_gl_draw_stage(draw_seq, 11);
+        trace_gl_draw_stall!("[GL_DRAW_STALL] seq={} after_pipeline_configure", draw_seq);
         let descriptor_sync_regs = draw_view.descriptor_sync_regs();
 
         // Per-stage texture / image descriptor collection — port of the
@@ -2544,6 +2680,7 @@ impl RasterizerInterface for RasterizerOpenGL {
                     gl::MemoryBarrier(gl::ALL_BARRIER_BITS);
                 }
             }
+            record_gl_draw_stage(draw_seq, 12);
             if std::env::var_os("RUZU_TRACE_PRE_DRAW_STATE").is_some() {
                 let mut blend_en: u8 = 0;
                 let mut blend_eq_rgb: i32 = 0;
@@ -3651,6 +3788,7 @@ impl RasterizerInterface for RasterizerOpenGL {
         }
         self.num_queued_commands = self.num_queued_commands.saturating_add(1);
         self.total_draw_count = self.total_draw_count.saturating_add(1);
+        record_gl_draw_stage(draw_seq, 13);
         if trace_draw {
             info!(
                 "[GL_DRAW_PROFILE] end total_us={} queued_commands={}",
@@ -3658,10 +3796,14 @@ impl RasterizerInterface for RasterizerOpenGL {
                 self.num_queued_commands
             );
         }
+        if let Some(callback) = gpu_tick_callback.as_ref() {
+            callback();
+        }
     }
 
     fn draw_texture(&mut self) {
         debug!("RasterizerOpenGL::draw_texture");
+        self.tick_gpu_work();
     }
 
     fn clear(&mut self, clear_view: Maxwell3DClearView<'_>, layer_count: u32) {

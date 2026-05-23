@@ -1600,20 +1600,6 @@ impl DrawManager {
             // reference to the rasterizer so the rasterizer never sees a
             // stale value.
             self.draw_state.draw_indexed = draw_indexed;
-            maxwell3d.clear_dirty_flag(crate::renderer_opengl::gl_state_tracker::dirty::FRONT_FACE);
-            maxwell3d.clear_dirty_flag(
-                crate::renderer_opengl::gl_state_tracker::dirty::CLIP_CONTROL,
-            );
-            maxwell3d.clear_dirty_flag(crate::renderer_opengl::gl_state_tracker::dirty::VIEWPORTS);
-            maxwell3d.clear_dirty_flag(
-                crate::renderer_opengl::gl_state_tracker::dirty::VIEWPORT_TRANSFORM,
-            );
-            maxwell3d.clear_dirty_flag(crate::dirty_flags::flags::RESCALE_VIEWPORTS);
-            for index in crate::renderer_opengl::gl_state_tracker::dirty::VIEWPORT_0
-                ..=crate::renderer_opengl::gl_state_tracker::dirty::VIEWPORT_15
-            {
-                maxwell3d.clear_dirty_flag(index);
-            }
             let rasterizer_present = maxwell3d.draw_rasterizer(&self.draw_state, instance_count);
             if trace_process_draw {
                 eprintln!(

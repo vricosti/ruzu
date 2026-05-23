@@ -22,6 +22,94 @@ use ruzu_core::frontend::graphics_context::{GraphicsContextHandle, ScopedGraphic
 /// Device address type.
 pub type DAddr = u64;
 
+#[derive(Default)]
+struct GpuThreadProfile {
+    push_submit: AtomicU64,
+    push_tick: AtomicU64,
+    push_flush: AtomicU64,
+    push_invalidate: AtomicU64,
+    pop_submit: AtomicU64,
+    pop_tick: AtomicU64,
+    pop_flush: AtomicU64,
+    pop_invalidate: AtomicU64,
+    done_submit: AtomicU64,
+    submit_total_us: AtomicU64,
+    submit_max_us: AtomicU64,
+}
+
+static GPU_THREAD_PROFILE: std::sync::OnceLock<GpuThreadProfile> = std::sync::OnceLock::new();
+
+fn profile_enabled() -> bool {
+    std::env::var_os("RUZU_PROFILE_GPU_THREAD").is_some()
+}
+
+fn profile() -> &'static GpuThreadProfile {
+    GPU_THREAD_PROFILE.get_or_init(GpuThreadProfile::default)
+}
+
+fn inc(counter: &AtomicU64) {
+    if profile_enabled() {
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+fn record_submit_elapsed(elapsed: std::time::Duration) {
+    if !profile_enabled() {
+        return;
+    }
+    let profile = profile();
+    let elapsed_us = elapsed.as_micros().min(u128::from(u64::MAX)) as u64;
+    profile.done_submit.fetch_add(1, Ordering::Relaxed);
+    profile.submit_total_us.fetch_add(elapsed_us, Ordering::Relaxed);
+    let mut current = profile.submit_max_us.load(Ordering::Relaxed);
+    while elapsed_us > current {
+        match profile.submit_max_us.compare_exchange_weak(
+            current,
+            elapsed_us,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => break,
+            Err(next) => current = next,
+        }
+    }
+}
+
+pub fn dump_gpu_thread_profile() {
+    let Some(profile) = GPU_THREAD_PROFILE.get() else {
+        return;
+    };
+    eprintln!("[GPU_THREAD_PROFILE] command counts:");
+    eprintln!(
+        "[GPU_THREAD_PROFILE]   push SubmitList={} GpuTick={} FlushRegion={} InvalidateRegion={}",
+        profile.push_submit.load(Ordering::Relaxed),
+        profile.push_tick.load(Ordering::Relaxed),
+        profile.push_flush.load(Ordering::Relaxed),
+        profile.push_invalidate.load(Ordering::Relaxed)
+    );
+    eprintln!(
+        "[GPU_THREAD_PROFILE]   pop  SubmitList={} GpuTick={} FlushRegion={} InvalidateRegion={}",
+        profile.pop_submit.load(Ordering::Relaxed),
+        profile.pop_tick.load(Ordering::Relaxed),
+        profile.pop_flush.load(Ordering::Relaxed),
+        profile.pop_invalidate.load(Ordering::Relaxed)
+    );
+    let done_submit = profile.done_submit.load(Ordering::Relaxed);
+    let total_submit_us = profile.submit_total_us.load(Ordering::Relaxed);
+    let avg_submit_us = if done_submit == 0 {
+        0
+    } else {
+        total_submit_us / done_submit
+    };
+    eprintln!(
+        "[GPU_THREAD_PROFILE]   done SubmitList={} total_us={} avg_us={} max_us={}",
+        done_submit,
+        total_submit_us,
+        avg_submit_us,
+        profile.submit_max_us.load(Ordering::Relaxed)
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Command types — matches upstream gpu_thread.h
 // ---------------------------------------------------------------------------
@@ -215,7 +303,7 @@ impl ThreadManager {
 
                 // Upstream: auto current_context = context.Acquire();
                 let _current_context =
-                    context.map(|context| unsafe { ScopedGraphicsContext::new(context.as_mut()) });
+                    context.map(|context| unsafe { ScopedGraphicsContext::new(context) });
 
                 run_thread(&state, &stop, gpu_ref, scheduler_ref, rasterizer);
             })
@@ -280,6 +368,16 @@ impl ThreadManager {
     /// Push a command to be executed by the GPU thread.
     /// Matches upstream `ThreadManager::PushCommand(CommandData&&, bool)`.
     fn push_command(&self, command_data: CommandData, mut block: bool) -> u64 {
+        if profile_enabled() {
+            match &command_data {
+                CommandData::SubmitList(_) => inc(&profile().push_submit),
+                CommandData::GpuTick(_) => inc(&profile().push_tick),
+                CommandData::FlushRegion(_) => inc(&profile().push_flush),
+                CommandData::InvalidateRegion(_) => inc(&profile().push_invalidate),
+                CommandData::FlushAndInvalidateRegion(_) | CommandData::None => {}
+            }
+        }
+
         if !self.is_async {
             block = true;
         }
@@ -362,18 +460,24 @@ fn run_thread(
 
         match next.data {
             CommandData::SubmitList(submit) => {
+                inc(&profile().pop_submit);
+                let start = std::time::Instant::now();
                 scheduler.push(submit.channel, submit.entries);
+                record_submit_elapsed(start.elapsed());
             }
             CommandData::GpuTick(_) => {
+                inc(&profile().pop_tick);
                 gpu.tick_work();
             }
             CommandData::FlushRegion(flush) => {
+                inc(&profile().pop_flush);
                 // Upstream: rasterizer->FlushRegion(flush.addr, flush.size)
                 if let Some(rasterizer) = rasterizer {
                     unsafe { rasterizer.as_mut() }.flush_region(flush.addr, flush.size);
                 }
             }
             CommandData::InvalidateRegion(inv) => {
+                inc(&profile().pop_invalidate);
                 // Upstream: rasterizer->OnCacheInvalidation(inv.addr, inv.size)
                 if let Some(rasterizer) = rasterizer {
                     unsafe { rasterizer.as_mut() }.on_cache_invalidation(inv.addr, inv.size);

@@ -7,6 +7,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use shader_recompiler::profile::Profile as ShaderProfile;
@@ -28,6 +29,67 @@ use super::gl_graphics_pipeline::{GraphicsPipeline, GraphicsPipelineKey};
 
 /// Cache version for serialized pipeline data.
 pub const CACHE_VERSION: u32 = 10;
+
+static SHADER_PIPELINE_LAST_STAGE: AtomicU64 = AtomicU64::new(0);
+static SHADER_PIPELINE_STAGE_COUNTS: [AtomicU64; 12] = [
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+];
+
+fn record_shader_pipeline_stage(stage: usize) {
+    if std::env::var_os("RUZU_PROFILE_SHADER_PIPELINE_STALL").is_none() {
+        return;
+    }
+    SHADER_PIPELINE_LAST_STAGE.store(stage as u64, Ordering::Relaxed);
+    if let Some(counter) = SHADER_PIPELINE_STAGE_COUNTS.get(stage) {
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+pub fn dump_shader_pipeline_stall_profile() {
+    if SHADER_PIPELINE_STAGE_COUNTS[0].load(Ordering::Relaxed) == 0 {
+        return;
+    }
+    const NAMES: [&str; 12] = [
+        "current_enter",
+        "before_refresh_stages",
+        "after_refresh_stages",
+        "after_maxwell_lookup",
+        "after_key_build",
+        "cache_hit",
+        "before_slow_path",
+        "slow_path_enter",
+        "slow_path_cache_hit",
+        "before_create_pipeline",
+        "after_create_pipeline",
+        "slow_path_exit",
+    ];
+    let last_stage = SHADER_PIPELINE_LAST_STAGE.load(Ordering::Relaxed) as usize;
+    let last_stage_name = NAMES.get(last_stage).copied().unwrap_or("unknown");
+    eprintln!(
+        "[SHADER_PIPELINE_STALL_PROFILE] last_stage={} ({})",
+        last_stage,
+        last_stage_name
+    );
+    for (index, name) in NAMES.iter().enumerate() {
+        eprintln!(
+            "[SHADER_PIPELINE_STALL_PROFILE]   {:02} {:<24} {}",
+            index,
+            name,
+            SHADER_PIPELINE_STAGE_COUNTS[index].load(Ordering::Relaxed)
+        );
+    }
+}
 
 /// OpenGL shader cache.
 ///
@@ -252,10 +314,12 @@ impl ShaderCache {
         shared_cache: &mut SharedShaderCache,
     ) -> Option<&mut GraphicsPipeline> {
         self.assert_single_owner("current_graphics_pipeline_with_shared_cache");
+        record_shader_pipeline_stage(0);
         let trace_pipeline = std::env::var_os("RUZU_TRACE_SHADER_PIPELINE").is_some();
         if trace_pipeline {
             eprintln!("[SHADER_PIPELINE] current_graphics begin");
         }
+        record_shader_pipeline_stage(1);
         if !shared_cache.refresh_stages(&mut self.graphics_key.unique_hashes) {
             if trace_pipeline {
                 eprintln!("[SHADER_PIPELINE] refresh_stages=false");
@@ -263,6 +327,7 @@ impl ShaderCache {
             self.current_pipeline = None;
             return None;
         }
+        record_shader_pipeline_stage(2);
         if trace_pipeline {
             eprintln!(
                 "[SHADER_PIPELINE] refresh_stages=true hashes={:X?}",
@@ -271,6 +336,7 @@ impl ShaderCache {
         }
 
         let maxwell3d = shared_cache.current_maxwell3d()?;
+        record_shader_pipeline_stage(3);
         self.graphics_key.raw = 0;
         self.graphics_key.set_early_z(maxwell3d.mandated_early_z());
         self.graphics_key
@@ -288,6 +354,7 @@ impl ShaderCache {
         if self.graphics_key.xfb_enabled() {
             self.graphics_key.xfb_state = maxwell3d.transform_feedback_state();
         }
+        record_shader_pipeline_stage(4);
 
         let key = self.graphics_key;
         self.current_pipeline = Some(key);
@@ -297,6 +364,7 @@ impl ShaderCache {
             if trace_pipeline {
                 eprintln!("[SHADER_PIPELINE] graphics_cache hit");
             }
+            record_shader_pipeline_stage(5);
             let pipeline = self.graphics_cache.get_mut(&key).unwrap();
             return Self::built_pipeline(self.use_asynchronous_shaders, maxwell3d, pipeline);
         }
@@ -304,6 +372,7 @@ impl ShaderCache {
         if trace_pipeline {
             eprintln!("[SHADER_PIPELINE] graphics_cache miss -> slow_path");
         }
+        record_shader_pipeline_stage(6);
         self.current_graphics_pipeline_slow_path_with_shared_cache(shared_cache)
     }
 
@@ -360,6 +429,7 @@ impl ShaderCache {
         shared_cache: &mut SharedShaderCache,
     ) -> Option<&mut GraphicsPipeline> {
         self.assert_single_owner("current_graphics_pipeline_slow_path_with_shared_cache");
+        record_shader_pipeline_stage(7);
         let trace_pipeline = std::env::var_os("RUZU_TRACE_SHADER_PIPELINE").is_some();
         let key = self.graphics_key;
         self.current_pipeline = Some(key);
@@ -369,6 +439,7 @@ impl ShaderCache {
             if trace_pipeline {
                 eprintln!("[SHADER_PIPELINE] slow_path cache hit");
             }
+            record_shader_pipeline_stage(8);
             let pipeline = self.graphics_cache.get_mut(&key).unwrap();
             return Self::built_pipeline(self.use_asynchronous_shaders, maxwell3d, pipeline);
         }
@@ -376,13 +447,17 @@ impl ShaderCache {
         if trace_pipeline {
             eprintln!("[SHADER_PIPELINE] create_graphics_pipeline_with_shared_cache begin");
         }
+        record_shader_pipeline_stage(9);
         let pipeline = self.create_graphics_pipeline_with_shared_cache(shared_cache)?;
         if trace_pipeline {
             eprintln!("[SHADER_PIPELINE] create_graphics_pipeline_with_shared_cache end");
         }
+        record_shader_pipeline_stage(10);
         self.graphics_cache.insert(key, pipeline);
         let inserted = self.graphics_cache.get_mut(&key).expect("just inserted");
-        Self::built_pipeline(self.use_asynchronous_shaders, maxwell3d, inserted)
+        let result = Self::built_pipeline(self.use_asynchronous_shaders, maxwell3d, inserted);
+        record_shader_pipeline_stage(11);
+        result
     }
 
     /// Build a `GraphicsPipelineKey` describing the current Maxwell3D state.

@@ -6,6 +6,7 @@
 //! Shader binary caching and invalidation.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use parking_lot::Mutex;
@@ -27,6 +28,187 @@ const YUZU_PAGEBITS: u64 = 14;
 const YUZU_PAGESIZE: u64 = 1 << YUZU_PAGEBITS;
 const NUM_PROGRAMS: usize = 6;
 const SHADER_INSTRUCTION_SIZE: u32 = 8;
+
+static REFRESH_STAGES_LAST_STAGE: AtomicU64 = AtomicU64::new(0);
+static REFRESH_STAGES_COUNTS: [AtomicU64; 16] = [
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+];
+static MAKE_SHADER_INFO_LAST_STAGE: AtomicU64 = AtomicU64::new(0);
+static MAKE_SHADER_INFO_COUNTS: [AtomicU64; 10] = [
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+];
+static SHADER_REGISTER_LAST_STAGE: AtomicU64 = AtomicU64::new(0);
+static SHADER_REGISTER_COUNTS: [AtomicU64; 10] = [
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+];
+
+fn record_refresh_stages_stage(stage: usize) {
+    if std::env::var_os("RUZU_PROFILE_REFRESH_STAGES_STALL").is_none() {
+        return;
+    }
+    REFRESH_STAGES_LAST_STAGE.store(stage as u64, Ordering::Relaxed);
+    if let Some(counter) = REFRESH_STAGES_COUNTS.get(stage) {
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+pub fn dump_refresh_stages_stall_profile() {
+    if REFRESH_STAGES_COUNTS[0].load(Ordering::Relaxed) == 0 {
+        return;
+    }
+    const NAMES: [&str; 16] = [
+        "enter",
+        "after_channel",
+        "after_maxwell_ptr",
+        "before_dirty_gate",
+        "after_dirty_gate",
+        "after_gpu_memory",
+        "after_stage_snapshot",
+        "stage_loop",
+        "before_gpu_to_cpu",
+        "after_gpu_to_cpu",
+        "before_try_get",
+        "after_try_get",
+        "before_make_shader_info",
+        "after_make_shader_info",
+        "loop_done",
+        "exit",
+    ];
+    let last_stage = REFRESH_STAGES_LAST_STAGE.load(Ordering::Relaxed) as usize;
+    let last_stage_name = NAMES.get(last_stage).copied().unwrap_or("unknown");
+    eprintln!(
+        "[REFRESH_STAGES_STALL_PROFILE] last_stage={} ({})",
+        last_stage,
+        last_stage_name
+    );
+    for (index, name) in NAMES.iter().enumerate() {
+        eprintln!(
+            "[REFRESH_STAGES_STALL_PROFILE]   {:02} {:<24} {}",
+            index,
+            name,
+            REFRESH_STAGES_COUNTS[index].load(Ordering::Relaxed)
+        );
+    }
+}
+
+fn record_make_shader_info_stage(stage: usize) {
+    if std::env::var_os("RUZU_PROFILE_MAKE_SHADER_INFO_STALL").is_none() {
+        return;
+    }
+    MAKE_SHADER_INFO_LAST_STAGE.store(stage as u64, Ordering::Relaxed);
+    if let Some(counter) = MAKE_SHADER_INFO_COUNTS.get(stage) {
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+pub fn dump_make_shader_info_stall_profile() {
+    if MAKE_SHADER_INFO_COUNTS[0].load(Ordering::Relaxed) == 0 {
+        return;
+    }
+    const NAMES: [&str; 10] = [
+        "enter",
+        "before_analyze",
+        "after_analyze",
+        "before_walk_cfg",
+        "after_walk_cfg",
+        "after_calculate_hash",
+        "after_read_size",
+        "before_register",
+        "after_register",
+        "exit",
+    ];
+    let last_stage = MAKE_SHADER_INFO_LAST_STAGE.load(Ordering::Relaxed) as usize;
+    let last_stage_name = NAMES.get(last_stage).copied().unwrap_or("unknown");
+    eprintln!(
+        "[MAKE_SHADER_INFO_STALL_PROFILE] last_stage={} ({})",
+        last_stage,
+        last_stage_name
+    );
+    for (index, name) in NAMES.iter().enumerate() {
+        eprintln!(
+            "[MAKE_SHADER_INFO_STALL_PROFILE]   {:02} {:<24} {}",
+            index,
+            name,
+            MAKE_SHADER_INFO_COUNTS[index].load(Ordering::Relaxed)
+        );
+    }
+}
+
+fn record_shader_register_stage(stage: usize) {
+    if std::env::var_os("RUZU_PROFILE_SHADER_REGISTER_STALL").is_none() {
+        return;
+    }
+    SHADER_REGISTER_LAST_STAGE.store(stage as u64, Ordering::Relaxed);
+    if let Some(counter) = SHADER_REGISTER_COUNTS.get(stage) {
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+pub fn dump_shader_register_stall_profile() {
+    if SHADER_REGISTER_COUNTS[0].load(Ordering::Relaxed) == 0 {
+        return;
+    }
+    const NAMES: [&str; 10] = [
+        "enter",
+        "before_invalidation_lock",
+        "after_invalidation_lock",
+        "before_lookup_lock",
+        "after_lookup_lock",
+        "after_new_entry",
+        "after_invalidation_pages",
+        "after_storage_push",
+        "after_update_pages_cached",
+        "exit",
+    ];
+    let last_stage = SHADER_REGISTER_LAST_STAGE.load(Ordering::Relaxed) as usize;
+    let last_stage_name = NAMES.get(last_stage).copied().unwrap_or("unknown");
+    eprintln!(
+        "[SHADER_REGISTER_STALL_PROFILE] last_stage={} ({})",
+        last_stage,
+        last_stage_name
+    );
+    for (index, name) in NAMES.iter().enumerate() {
+        eprintln!(
+            "[SHADER_REGISTER_STALL_PROFILE]   {:02} {:<28} {}",
+            index,
+            name,
+            SHADER_REGISTER_COUNTS[index].load(Ordering::Relaxed)
+        );
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum FlowStackToken {
@@ -195,19 +377,24 @@ impl ShaderCache {
 
     /// Port of `ShaderCache::RefreshStages`.
     pub fn refresh_stages(&mut self, unique_hashes: &mut [u64; NUM_PROGRAMS]) -> bool {
+        record_refresh_stages_stage(0);
         let Some(channel) = self.current_channel_info() else {
             self.last_shaders_valid = false;
             return false;
         };
+        record_refresh_stages_stage(1);
         let maxwell_ptr = channel.maxwell3d as *mut Maxwell3D;
         if maxwell_ptr.is_null() {
             self.last_shaders_valid = false;
             return false;
         }
+        record_refresh_stages_stage(2);
         let maxwell3d = unsafe { &mut *maxwell_ptr };
+        record_refresh_stages_stage(3);
         if !maxwell3d.consume_dirty_shaders() {
             return self.last_shaders_valid;
         }
+        record_refresh_stages_stage(4);
         let Some(gpu_memory) = channel.gpu_memory.as_ref().map(Arc::clone) else {
             self.last_shaders_valid = false;
             return false;
@@ -216,6 +403,7 @@ impl ShaderCache {
             self.last_shaders_valid = false;
             return false;
         }
+        record_refresh_stages_stage(5);
 
         let base_addr = maxwell3d.program_region_address();
         let rasterize_enable = maxwell3d.rasterize_enable();
@@ -223,7 +411,9 @@ impl ShaderCache {
             std::array::from_fn(|index| maxwell3d.shader_stage_info(index as u32));
         let stage_enabled: [bool; NUM_PROGRAMS] =
             std::array::from_fn(|index| maxwell3d.is_shader_stage_enabled(index as u32));
+        record_refresh_stages_stage(6);
         for (index, unique_hash) in unique_hashes.iter_mut().enumerate() {
+            record_refresh_stages_stage(7);
             let stage_info = stage_infos[index];
             let program_type = shader_stage_type_from_index(index);
             if !stage_enabled[index] {
@@ -245,10 +435,12 @@ impl ShaderCache {
             }
 
             let shader_addr = base_addr + stage_info.offset as u64;
+            record_refresh_stages_stage(8);
             let cpu_shader_addr = {
                 let memory = gpu_memory.lock();
                 memory.gpu_to_cpu_address(shader_addr)
             };
+            record_refresh_stages_stage(9);
             if std::env::var_os("RUZU_TRACE_SHADER_WORDS").is_some() {
                 match cpu_shader_addr {
                     Some(cpu) => {
@@ -265,9 +457,12 @@ impl ShaderCache {
                 return false;
             };
 
+            record_refresh_stages_stage(10);
             let shader_ptr = if let Some(shader_info) = self.try_get(cpu_shader_addr) {
+                record_refresh_stages_stage(11);
                 shader_info as *const ShaderInfo
             } else {
+                record_refresh_stages_stage(11);
                 if program_type == ShaderStageType::Invalid {
                     *unique_hash = 0;
                     self.shader_infos[index] = None;
@@ -279,16 +474,20 @@ impl ShaderCache {
                     base_addr,
                     stage_info.offset,
                 );
+                record_refresh_stages_stage(12);
                 self.make_shader_info(env.generic_environment_mut(), cpu_shader_addr)
                     as *const ShaderInfo
             };
+            record_refresh_stages_stage(13);
 
             let shader_info = unsafe { &*shader_ptr };
             self.shader_infos[index] = Some(shader_ptr);
             *unique_hash = shader_info.unique_hash;
         }
 
+        record_refresh_stages_stage(14);
         self.last_shaders_valid = true;
+        record_refresh_stages_stage(15);
         true
     }
 
@@ -402,22 +601,32 @@ impl ShaderCache {
     pub fn register(&mut self, data: Box<ShaderInfo>, addr: VAddr, size: usize) {
         // Upstream takes both mutexes here:
         // `std::scoped_lock lock{invalidation_mutex, lookup_mutex}`.
+        record_shader_register_stage(0);
         let invalidation_mutex: *const Mutex<()> = &self.invalidation_mutex;
         let lookup_mutex: *const Mutex<()> = &self.lookup_mutex;
+        record_shader_register_stage(1);
         let _invalidation_guard = unsafe { (*invalidation_mutex).lock() };
+        record_shader_register_stage(2);
+        record_shader_register_stage(3);
         let _lookup_guard = unsafe { (*lookup_mutex).lock() };
+        record_shader_register_stage(4);
 
         let addr_end = addr + size as u64;
         let data_ptr = (&*data as *const ShaderInfo).cast_mut();
         let entry = self.new_entry(addr, addr_end, data_ptr);
+        record_shader_register_stage(5);
 
         let page_end = (addr_end + YUZU_PAGESIZE - 1) >> YUZU_PAGEBITS;
         for page in (addr >> YUZU_PAGEBITS)..page_end {
             self.invalidation_cache.entry(page).or_default().push(entry);
         }
+        record_shader_register_stage(6);
 
         self.storage.push(data);
+        record_shader_register_stage(7);
         self.device_memory.update_pages_cached_count(addr, size, 1);
+        record_shader_register_stage(8);
+        record_shader_register_stage(9);
     }
 
     fn invalidate_pages_in_region(&mut self, addr: VAddr, size: usize) {
@@ -541,19 +750,32 @@ impl ShaderCache {
         env: &mut GenericEnvironment,
         cpu_addr: VAddr,
     ) -> &ShaderInfo {
+        record_make_shader_info_stage(0);
         let mut info = Box::new(ShaderInfo::default());
+        record_make_shader_info_stage(1);
         if let Some(cached_hash) = env.analyze() {
+            record_make_shader_info_stage(2);
             info.unique_hash = cached_hash;
             info.size_bytes = env.cached_size_bytes();
         } else {
+            record_make_shader_info_stage(2);
+            record_make_shader_info_stage(3);
             self.walk_shader_control_flow(env);
+            record_make_shader_info_stage(4);
             info.unique_hash = env.calculate_hash();
+            record_make_shader_info_stage(5);
             info.size_bytes = env.read_size_bytes();
+            record_make_shader_info_stage(6);
         }
         let size_bytes = info.size_bytes;
+        record_make_shader_info_stage(7);
         self.register(info, cpu_addr, size_bytes);
-        self.try_get(cpu_addr)
-            .expect("registered shader info must be reachable through lookup cache")
+        record_make_shader_info_stage(8);
+        let result = self
+            .try_get(cpu_addr)
+            .expect("registered shader info must be reachable through lookup cache");
+        record_make_shader_info_stage(9);
+        result
     }
 
     pub fn current_maxwell3d(&self) -> Option<&Maxwell3D> {

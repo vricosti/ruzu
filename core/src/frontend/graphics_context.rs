@@ -67,18 +67,22 @@ impl GraphicsContextHandle {
     }
 }
 
-/// RAII guard that makes a GraphicsContext current on creation
-/// and calls done_current on drop.
+/// RAII guard that makes a GraphicsContext current on creation and calls
+/// done_current on drop.
 ///
 /// Corresponds to upstream `GraphicsContext::Scoped`.
-pub struct ScopedGraphicsContext<'a> {
-    context: &'a mut dyn GraphicsContext,
+pub struct ScopedGraphicsContext {
+    context: GraphicsContextHandle,
     active: bool,
 }
 
-impl<'a> ScopedGraphicsContext<'a> {
-    pub fn new(context: &'a mut dyn GraphicsContext) -> Self {
-        context.make_current();
+impl ScopedGraphicsContext {
+    /// # Safety
+    ///
+    /// The caller must guarantee the context outlives this guard and that GL
+    /// context ownership follows the frontend's thread-affinity contract.
+    pub unsafe fn new(context: GraphicsContextHandle) -> Self {
+        unsafe { context.as_mut() }.make_current();
         Self {
             context,
             active: true,
@@ -94,10 +98,10 @@ impl<'a> ScopedGraphicsContext<'a> {
     }
 }
 
-impl<'a> Drop for ScopedGraphicsContext<'a> {
+impl Drop for ScopedGraphicsContext {
     fn drop(&mut self) {
         if self.active {
-            self.context.done_current();
+            unsafe { self.context.as_mut() }.done_current();
         }
     }
 }

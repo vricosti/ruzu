@@ -1892,6 +1892,10 @@ impl KServerSession {
         &mut self,
         manager: Arc<Mutex<SessionRequestManager>>,
     ) -> Result<(HLERequestContext, Arc<Mutex<SessionRequestManager>>, u64), u32> {
+        let trace = std::env::var_os("RUZU_TRACE_RECEIVE_REQUEST_HLE").is_some();
+        if trace {
+            eprintln!("[RECEIVE_HLE] enter");
+        }
         if self.client_closed {
             return Err(RESULT_SESSION_CLOSED.get_inner_value());
         }
@@ -1902,6 +1906,9 @@ impl KServerSession {
         let Some(current_request) = self.request_list.pop_front() else {
             return Err(RESULT_NOT_FOUND.get_inner_value());
         };
+        if trace {
+            eprintln!("[RECEIVE_HLE] popped_request");
+        }
         let Some(client_thread) = Self::resolve_request_client_thread(&current_request) else {
             {
                 let mut request = current_request.lock().unwrap();
@@ -1912,6 +1919,10 @@ impl KServerSession {
             }
             return Err(RESULT_SESSION_CLOSED.get_inner_value());
         };
+        if trace {
+            let tid = client_thread.lock().unwrap().thread_id;
+            eprintln!("[RECEIVE_HLE] resolved_client_thread tid={}", tid);
+        }
 
         self.current_request = Some(Arc::clone(&current_request));
         let request_message_address = {
@@ -1923,11 +1934,30 @@ impl KServerSession {
                 client_thread.lock().unwrap().get_tls_address().get()
             }
         };
+        if trace {
+            eprintln!(
+                "[RECEIVE_HLE] request_message_address=0x{:X}",
+                request_message_address
+            );
+        }
 
         let mut context =
             HLERequestContext::new_with_thread(client_thread, request_message_address);
+        if trace {
+            eprintln!("[RECEIVE_HLE] context_created");
+        }
         context.set_session_request_manager(Arc::clone(&manager));
+        if trace {
+            eprintln!("[RECEIVE_HLE] manager_set");
+        }
         context.populate_from_incoming_command_buffer(&[]);
+        if trace {
+            eprintln!(
+                "[RECEIVE_HLE] populated cmd={} type={:?}",
+                context.get_command(),
+                context.get_command_type()
+            );
+        }
         Ok((context, manager, request_message_address))
     }
 

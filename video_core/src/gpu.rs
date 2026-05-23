@@ -239,6 +239,11 @@ impl Gpu {
                 let gpu = &*(gpu_ptr as *const Self);
                 gpu.get_ticks()
             }));
+            let gpu_ptr = self as *const Self as usize;
+            renderer.set_gpu_tick_callback(Arc::new(move || unsafe {
+                let gpu = &*(gpu_ptr as *const Self);
+                gpu.tick_work();
+            }));
             if let Some(writer) = self.guest_memory_writer.lock().unwrap().clone() {
                 renderer.set_guest_memory_writer(writer);
             }

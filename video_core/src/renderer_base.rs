@@ -45,6 +45,7 @@ impl Default for RendererSettings {
 pub type DeviceMemoryReader = std::sync::Arc<dyn Fn(u64, &mut [u8]) + Send + Sync>;
 pub type GuestMemoryWriter = std::sync::Arc<dyn Fn(u64, &[u8]) + Send + Sync>;
 pub type GpuTicksGetter = std::sync::Arc<dyn Fn() -> u64 + Send + Sync>;
+pub type GpuTickCallback = std::sync::Arc<dyn Fn() + Send + Sync>;
 
 /// Abstract renderer base trait.
 ///
@@ -102,6 +103,9 @@ pub trait RendererBase: Send {
 
     /// Install the GPU tick getter used by rasterizer-side timestamped query writes.
     fn set_gpu_ticks_getter(&mut self, _getter: GpuTicksGetter) {}
+
+    /// Install the callback used by rasterizer draw paths to process pending GPU sync work.
+    fn set_gpu_tick_callback(&mut self, _callback: GpuTickCallback) {}
 
     /// Install a GPU VA → CPU VA translator used by rasterizer-side
     /// query writes. Mirrors upstream's `gpu_memory->Write<u64>(gpu_va,
