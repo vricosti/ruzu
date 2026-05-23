@@ -363,51 +363,6 @@ impl AppLoaderNso {
             }
         }
 
-        // RUZU_HACK_SKIP_ADDAUX: patch MK8D main NSO to skip the AddAux error
-        // branch in state-machine state 63's poll fn (PC=0x71EE84). This
-        // tests the hypothesis that the wedge is caused by nn::audio::AddAux
-        // returning an error code in ruzu (vs zuyu where it returns success
-        // after ~7 polls). The patch replaces `bne 0x71EE9C` (skip-on-error)
-        // with a 4-byte NOP (`mov r0, r0`) so MK8D always takes the success
-        // path: calls SetAuxEnabled, marks done_flag, advances state.
-        //
-        // If MK8D progresses past the wedge with this patch → AddAux is
-        // confirmed as the wedge cause and we have a workaround. If MK8D
-        // still wedges or crashes differently → the wedge is elsewhere.
-        //
-        // Only applies to MK8D's main NSO (load_base 0x206000, see bases.json
-        // entry for title 0100152000022000). Verifies the expected BNE bytes
-        // before patching to avoid corrupting different binaries.
-        if std::env::var_os("RUZU_HACK_SKIP_ADDAUX").is_some() && load_base == 0x206000 {
-            const PATCH_RUNTIME_ADDR: u64 = 0x71EE84;
-            let patch_off = (PATCH_RUNTIME_ADDR - load_base) as usize;
-            // Expected: bne +0x10 from PC 0x71EE84 → encoded as 0x1A000004
-            // (little-endian bytes: 04 00 00 1A).
-            const EXPECTED_BNE: [u8; 4] = [0x04, 0x00, 0x00, 0x1A];
-            // ARM32 4-byte NOP: mov r0, r0 = 0xE1A00000 → bytes 00 00 A0 E1.
-            const NOP_BYTES: [u8; 4] = [0x00, 0x00, 0xA0, 0xE1];
-            if patch_off + 4 <= program_image.len() {
-                let actual = &program_image[patch_off..patch_off + 4];
-                if actual == EXPECTED_BNE {
-                    program_image[patch_off..patch_off + 4].copy_from_slice(&NOP_BYTES);
-                    log::warn!(
-                        "[HACK_SKIP_ADDAUX] patched MK8D bne @ 0x{:X} with mov r0,r0 — state 63 poll will skip AddAux error path",
-                        PATCH_RUNTIME_ADDR
-                    );
-                } else {
-                    log::warn!(
-                        "[HACK_SKIP_ADDAUX] expected BNE bytes [04 00 00 1A] at offset 0x{:X}, got [{:02X} {:02X} {:02X} {:02X}] — NOT patched (binary changed?)",
-                        patch_off, actual[0], actual[1], actual[2], actual[3]
-                    );
-                }
-            } else {
-                log::warn!(
-                    "[HACK_SKIP_ADDAUX] image too small ({} bytes) for patch at offset 0x{:X}",
-                    program_image.len(), patch_off
-                );
-            }
-        }
-
         // Load codeset into process.
         code_set.memory = program_image;
         process.load_module(code_set, load_base);
