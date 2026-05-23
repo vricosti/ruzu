@@ -97,21 +97,23 @@ const CLEAR_DEPTH: u32 = reg_index!(0x0D90);
 const CLEAR_STENCIL: u32 = reg_index!(0x0DA0);
 /// Clear surface trigger register.
 pub(crate) const CLEAR_SURFACE: u32 = reg_index!(0x19D0);
-const RASTERIZE_ENABLE: u32 = reg_index!(0x037C);
+pub(crate) const RASTERIZE_ENABLE: u32 = reg_index!(0x037C);
 
 // ── Viewport registers ──────────────────────────────────────────────────────
 
 /// Viewport transform base. 16 viewports, 8 words each.
 /// Words: scale_x, scale_y, scale_z, translate_x, translate_y, translate_z, swizzle, snap.
-const VP_TRANSFORM_BASE: u32 = reg_index!(0x0A00);
-const VP_TRANSFORM_STRIDE: u32 = 8;
+pub(crate) const VP_TRANSFORM_BASE: u32 = reg_index!(0x0A00);
+pub(crate) const VP_TRANSFORM_STRIDE: u32 = 8;
+pub(crate) const VIEWPORT_BASE: u32 = reg_index!(0x0C00);
+pub(crate) const VIEWPORT_STRIDE: u32 = 4;
 
 // ── Scissor registers ───────────────────────────────────────────────────────
 
 /// Scissor base. 16 scissors, 4 words each.
 /// Words: enable, min_x|max_x(packed), min_y|max_y(packed), pad.
-const SCISSOR_BASE: u32 = reg_index!(0x0E00);
-const SCISSOR_STRIDE: u32 = 4;
+pub(crate) const SCISSOR_BASE: u32 = reg_index!(0x0E00);
+pub(crate) const SCISSOR_STRIDE: u32 = 4;
 
 // ── Vertex buffer registers ─────────────────────────────────────────────────
 
@@ -124,6 +126,8 @@ pub(crate) const VB_COUNT: u32 = reg_index!(0x0D78); // upstream byte 0x0D78
 /// Words: stride|enable, addr_high, addr_low, frequency.
 pub(crate) const VERTEX_STREAM_BASE: u32 = reg_index!(0x1C00);
 pub(crate) const VERTEX_STREAM_STRIDE: u32 = 4;
+/// Vertex stream instancing enable array. 32 words.
+pub(crate) const VERTEX_STREAM_INSTANCE_BASE: u32 = reg_index!(0x1880);
 
 /// Vertex stream limit array base. 32 streams, 2 words each.
 #[allow(dead_code)]
@@ -168,58 +172,76 @@ const REPORT_SEMAPHORE_TRIGGER: u32 = REPORT_SEMAPHORE_BASE + 3;
 
 // ── Depth/Stencil registers ─────────────────────────────────────────────────
 
-const DEPTH_MODE: u32 = reg_index!(0x0D7C);
-const DEPTH_TEST_ENABLE: u32 = reg_index!(0x12CC);
-const DEPTH_WRITE_ENABLE: u32 = reg_index!(0x12E8);
-const DEPTH_TEST_FUNC: u32 = reg_index!(0x130C);
-const POINT_SIZE: u32 = reg_index!(0x1518);
+pub(crate) const DEPTH_MODE: u32 = reg_index!(0x0D7C);
+pub(crate) const ALPHA_TEST_ENABLED: u32 = reg_index!(0x12EC);
+pub(crate) const ALPHA_TEST_REF: u32 = reg_index!(0x1310);
+pub(crate) const ALPHA_TEST_FUNC: u32 = reg_index!(0x1314);
+pub(crate) const DEPTH_TEST_ENABLE: u32 = reg_index!(0x12CC);
+pub(crate) const DEPTH_WRITE_ENABLE: u32 = reg_index!(0x12E8);
+pub(crate) const DEPTH_TEST_FUNC: u32 = reg_index!(0x130C);
+pub(crate) const POINT_SIZE: u32 = reg_index!(0x1518);
 
-const STENCIL_ENABLE: u32 = reg_index!(0x1380);
-const STENCIL_FRONT_OP_BASE: u32 = reg_index!(0x1384);
-const STENCIL_FRONT_REF: u32 = reg_index!(0x1394);
-const STENCIL_FRONT_FUNC_MASK: u32 = reg_index!(0x1398);
-const STENCIL_FRONT_MASK: u32 = reg_index!(0x139C);
+pub(crate) const STENCIL_ENABLE: u32 = reg_index!(0x1380);
+pub(crate) const STENCIL_FRONT_OP_BASE: u32 = reg_index!(0x1384);
+pub(crate) const STENCIL_FRONT_REF: u32 = reg_index!(0x1394);
+pub(crate) const STENCIL_FRONT_FUNC_MASK: u32 = reg_index!(0x1398);
+pub(crate) const STENCIL_FRONT_MASK: u32 = reg_index!(0x139C);
 
-const STENCIL_TWO_SIDE_ENABLE: u32 = reg_index!(0x1594);
-const STENCIL_BACK_OP_BASE: u32 = reg_index!(0x1598);
-const STENCIL_BACK_REF: u32 = reg_index!(0x0F54);
-const STENCIL_BACK_MASK: u32 = reg_index!(0x0F58);
-const STENCIL_BACK_FUNC_MASK: u32 = reg_index!(0x0F5C);
+pub(crate) const STENCIL_TWO_SIDE_ENABLE: u32 = reg_index!(0x1594);
+pub(crate) const STENCIL_BACK_OP_BASE: u32 = reg_index!(0x1598);
+pub(crate) const STENCIL_BACK_REF: u32 = reg_index!(0x0F54);
+pub(crate) const STENCIL_BACK_MASK: u32 = reg_index!(0x0F58);
+pub(crate) const STENCIL_BACK_FUNC_MASK: u32 = reg_index!(0x0F5C);
 
 // ── Blend registers ─────────────────────────────────────────────────────────
 
 /// 4 consecutive f32 registers: R, G, B, A blend constant color.
-const BLEND_COLOR_BASE: u32 = reg_index!(0x131C);
+pub(crate) const BLEND_COLOR_BASE: u32 = reg_index!(0x131C);
 
 /// Global blend struct base.
 /// +0 separate_alpha, +1 color_op, +2 color_src, +3 color_dst,
 /// +4 alpha_op, +5 alpha_src, +6 (color_key), +7 alpha_dst,
 /// +8 single_rop_ctrl, +9..+16 enable[0..7]
-const BLEND_BASE: u32 = reg_index!(0x133C);
+pub(crate) const BLEND_BASE: u32 = reg_index!(0x133C);
 
 /// Whether per-target blend overrides are active.
-const BLEND_PER_TARGET_ENABLED: u32 = reg_index!(0x12E4);
+pub(crate) const BLEND_PER_TARGET_ENABLED: u32 = reg_index!(0x12E4);
 
 /// Per-target blend base. 8 entries, stride 8.
 /// +0 sep_alpha, +1 color_op, +2 color_src, +3 color_dst,
 /// +4 alpha_op, +5 alpha_src, +6 alpha_dst
-const BLEND_PER_TARGET_BASE: u32 = reg_index!(0x1E00);
-const BLEND_PER_TARGET_STRIDE: u32 = 8;
+pub(crate) const BLEND_PER_TARGET_BASE: u32 = reg_index!(0x1E00);
+pub(crate) const BLEND_PER_TARGET_STRIDE: u32 = 8;
 
 // ── Rasterizer registers ────────────────────────────────────────────────────
 
-const POLYGON_MODE_FRONT: u32 = reg_index!(0x0DAC);
-const POLYGON_MODE_BACK: u32 = reg_index!(0x0DB0);
-const LINE_WIDTH_SMOOTH: u32 = reg_index!(0x13B0);
-const LINE_WIDTH_ALIASED: u32 = reg_index!(0x13B4);
-const SLOPE_SCALE_DEPTH_BIAS: u32 = reg_index!(0x156C);
-const DEPTH_BIAS: u32 = reg_index!(0x15BC);
-const DEPTH_BIAS_CLAMP: u32 = reg_index!(0x187C);
-const CULL_TEST_ENABLE: u32 = reg_index!(0x1918);
-const FRONT_FACE: u32 = reg_index!(0x191C);
-const CULL_FACE: u32 = reg_index!(0x1920);
-const FRAMEBUFFER_SRGB: u32 = reg_index!(0x15B8);
-const VIEWPORT_SCALE_OFFSET_ENABLED: u32 = reg_index!(0x192C);
+pub(crate) const POLYGON_MODE_FRONT: u32 = reg_index!(0x0DAC);
+pub(crate) const POLYGON_MODE_BACK: u32 = reg_index!(0x0DB0);
+pub(crate) const POLYGON_OFFSET_POINT_ENABLE: u32 = reg_index!(0x0DC0);
+pub(crate) const POLYGON_OFFSET_LINE_ENABLE: u32 = reg_index!(0x0DC4);
+pub(crate) const POLYGON_OFFSET_FILL_ENABLE: u32 = reg_index!(0x0DC8);
+pub(crate) const FILL_VIA_TRIANGLE_MODE: u32 = reg_index!(0x113C);
+pub(crate) const PRIMITIVE_RESTART_BASE: u32 = reg_index!(0x1644);
+pub(crate) const PRIMITIVE_RESTART_WORDS: u32 = 2;
+pub(crate) const ANTI_ALIAS_ALPHA_CONTROL: u32 = reg_index!(0x153C);
+pub(crate) const FRAG_COLOR_CLAMP: u32 = reg_index!(0x13A8);
+pub(crate) const POINT_SIZE_ATTRIBUTE: u32 = reg_index!(0x1910);
+pub(crate) const POINT_SPRITE_ENABLE: u32 = reg_index!(0x1520);
+pub(crate) const LINE_WIDTH_SMOOTH: u32 = reg_index!(0x13B0);
+pub(crate) const LINE_WIDTH_ALIASED: u32 = reg_index!(0x13B4);
+pub(crate) const LINE_ANTI_ALIAS_ENABLE: u32 = reg_index!(0x1570);
+pub(crate) const SLOPE_SCALE_DEPTH_BIAS: u32 = reg_index!(0x156C);
+pub(crate) const DEPTH_BIAS: u32 = reg_index!(0x15BC);
+pub(crate) const DEPTH_BIAS_CLAMP: u32 = reg_index!(0x187C);
+pub(crate) const CULL_TEST_ENABLE: u32 = reg_index!(0x1918);
+pub(crate) const FRONT_FACE: u32 = reg_index!(0x191C);
+pub(crate) const CULL_FACE: u32 = reg_index!(0x1920);
+pub(crate) const FRAMEBUFFER_SRGB: u32 = reg_index!(0x15B8);
+pub(crate) const VIEWPORT_SCALE_OFFSET_ENABLED: u32 = reg_index!(0x192C);
+pub(crate) const VIEWPORT_CLIP_CONTROL: u32 = reg_index!(0x193C);
+pub(crate) const USER_CLIP_ENABLE: u32 = reg_index!(0x1510);
+pub(crate) const LOGIC_OP: u32 = reg_index!(0x19C4);
+pub(crate) const LOGIC_OP_WORDS: u32 = 2;
 
 // ── Shader program registers ────────────────────────────────────────────────
 
@@ -237,7 +259,7 @@ const STREAM_OUT_LAYOUT_BASE: u32 = reg_index!(0x2800);
 /// Vertex attribute array base. 32 entries, 1 word each.
 /// Per entry: bits[4:0]=buffer, bit[6]=constant, bits[20:7]=offset,
 ///            bits[26:21]=size, bits[29:27]=type, bit[31]=bgra.
-const VERTEX_ATTRIB_BASE: u32 = reg_index!(0x1160);
+pub(crate) const VERTEX_ATTRIB_BASE: u32 = reg_index!(0x1160);
 pub(crate) const NUM_VERTEX_ATTRIBS: u32 = 32;
 
 // ── Shader pipeline registers ─────────────────────────────────────────────
@@ -258,11 +280,11 @@ const BINDLESS_TEXTURE_CONST_BUFFER_SLOT: u32 = reg_index!(0x2608);
 // ── Color write mask registers ────────────────────────────────────────────
 
 /// If nonzero, all RTs share color_mask[0].
-const COLOR_MASK_COMMON: u32 = reg_index!(0x0F90);
+pub(crate) const COLOR_MASK_COMMON: u32 = reg_index!(0x0F90);
 const COLOR_TARGET_MRT_ENABLE: u32 = reg_index!(0x0FAC);
 /// Per-RT color write mask array. 8 entries, 1 word each.
 /// Per RT: R=bit[0], G=bit[4], B=bit[8], A=bit[12].
-const COLOR_MASK_BASE: u32 = reg_index!(0x1A00);
+pub(crate) const COLOR_MASK_BASE: u32 = reg_index!(0x1A00);
 
 // ── Render target control register ────────────────────────────────────────
 
@@ -363,7 +385,7 @@ const DRAW_TEXTURE_SRC_TEXTURE_OFFSET: usize = 9;
 const DRAW_TEXTURE_SRC_X0_OFFSET: usize = 10;
 const DRAW_TEXTURE_SRC_Y0_OFFSET: usize = 11;
 /// `regs.window_origin`.
-const WINDOW_ORIGIN: u32 = reg_index!(0x13AC);
+pub(crate) const WINDOW_ORIGIN: u32 = reg_index!(0x13AC);
 /// Vertex array instance first (triggers instanced array draw).
 pub(crate) const VERTEX_ARRAY_INSTANCE_FIRST: u32 = reg_index!(0x1214);
 /// Vertex array instance subsequent (triggers subsequent instance draw).
@@ -749,14 +771,14 @@ impl BlendFactor {
             0x09 | 0x4306 => Self::DstColor,
             0x0A | 0x4307 => Self::OneMinusDstColor,
             0x0B | 0x4308 => Self::SrcAlphaSaturate,
-            0x0D | 0xC900 => Self::Src1Color,
-            0x0E | 0xC901 => Self::OneMinusSrc1Color,
-            0x0F | 0xC902 => Self::Src1Alpha,
-            0x10 | 0xC903 => Self::OneMinusSrc1Alpha,
-            0x11 | 0xC001 => Self::ConstantColor,
-            0x12 | 0xC002 => Self::OneMinusConstantColor,
-            0x13 | 0xC003 => Self::ConstantAlpha,
-            0x14 | 0xC004 => Self::OneMinusConstantAlpha,
+            0x0C | 0xC003 => Self::ConstantAlpha,
+            0x0D | 0xC004 => Self::OneMinusConstantAlpha,
+            0x0E | 0xC001 => Self::ConstantColor,
+            0x0F | 0xC002 => Self::OneMinusConstantColor,
+            0x10 | 0xC900 => Self::Src1Color,
+            0x11 | 0xC901 => Self::OneMinusSrc1Color,
+            0x12 | 0xC902 => Self::Src1Alpha,
+            0x13 | 0xC903 => Self::OneMinusSrc1Alpha,
             _ => {
                 log::warn!(
                     "Maxwell3D: unknown BlendFactor 0x{:X}, defaulting to One",
@@ -1505,6 +1527,7 @@ pub struct VertexStreamInfo {
     pub index: u32,
     pub address: u64,
     pub stride: u32,
+    pub frequency: u32,
     pub enabled: bool,
 }
 
@@ -1824,8 +1847,9 @@ pub struct DrawCall {
 /// Port of `Maxwell3D::DirtyState`.
 ///
 /// Upstream owns both the live dirty flags and the register-to-flag lookup
-/// tables inside the Maxwell3D owner. The Rust port still has reduced table
-/// population, but the owner boundary belongs here.
+/// tables inside the Maxwell3D owner. Until ruzu grows upstream's per-channel
+/// renderer setup hook, the OpenGL state tracker installs its full table set
+/// here so register writes reach the same dirty flags as upstream OpenGL.
 pub struct DirtyState {
     pub flags: [bool; 256],
     pub tables: dirty_flags::DirtyTables,
@@ -1837,7 +1861,7 @@ impl DirtyState {
         flags.fill(true);
         let mut tables =
             std::array::from_fn(|_| vec![dirty_flags::flags::NULL_ENTRY; ENGINE_REG_COUNT]);
-        dirty_flags::setup_dirty_flags(&mut tables);
+        crate::renderer_opengl::gl_state_tracker::StateTracker::setup_tables(&mut tables);
         Self { flags, tables }
     }
 }
@@ -1943,6 +1967,8 @@ impl Maxwell3D {
         draw_state.index_buffer_gpu_addr = index_buffer_gpu_addr;
         draw_state.index_buffer_gpu_addr_end = index_buffer_gpu_addr_end;
         draw_state.vertex_streams = std::array::from_fn(|i| self.vertex_stream_info(i as u32));
+        draw_state.vertex_stream_instances =
+            std::array::from_fn(|i| self.vertex_stream_instance(i as u32));
         draw_state.vertex_stream_limits =
             std::array::from_fn(|i| self.vertex_stream_limit(i as u32));
         draw_state.vertex_attribs_snapshot =
@@ -2495,12 +2521,19 @@ impl Maxwell3D {
         let word0 = self.regs[base]; // stride in bits[11:0], enable in bit 12
         let addr_high = self.regs[base + 1] as u64;
         let addr_low = self.regs[base + 2] as u64;
+        let frequency = self.regs[base + 3];
         VertexStreamInfo {
             index,
             address: (addr_high << 32) | addr_low,
             stride: word0 & 0xFFF,
+            frequency,
             enabled: (word0 & (1 << 12)) != 0,
         }
+    }
+
+    /// Read whether vertex stream `index` is accessed per instance.
+    pub fn vertex_stream_instance(&self, index: u32) -> u32 {
+        self.regs[(VERTEX_STREAM_INSTANCE_BASE + index) as usize]
     }
 
     /// Read vertex stream limit `index` (0..31) from registers.
@@ -2846,9 +2879,9 @@ impl Maxwell3D {
     /// 6 Maxwell shader stages. Disabled stages report `0`.
     ///
     /// Upstream rasterizers compute these inline as
-    /// `regs.program_region.Address() + regs.pipelines[i].offset`. The Rust
-    /// port snapshots them into `DrawState` so the rasterizer doesn't need
-    /// a Maxwell3D back-reference.
+    /// `regs.program_region.Address() + regs.pipelines[i].offset`. ruzu's
+    /// current draw entry point snapshots them into `DrawState` at the same
+    /// draw boundary.
     pub fn shader_program_addresses(&self) -> [u64; 6] {
         let base = self.program_region_address();
         let mut out = [0u64; 6];
@@ -3139,6 +3172,14 @@ impl dm::Maxwell3DAccess for Maxwell3D {
         self.interface_state.current_dirty = true;
     }
 
+    fn dirty_flags(&self) -> [bool; 256] {
+        self.dirty.flags
+    }
+
+    fn clear_dirty_flag(&mut self, index: u8) {
+        self.dirty.flags[index as usize] = false;
+    }
+
     fn rasterizer_mut(&mut self) -> Option<&mut dyn RasterizerInterface> {
         let raw = self.rasterizer?;
         let rasterizer =
@@ -3176,6 +3217,15 @@ impl dm::Maxwell3DAccess for Maxwell3D {
 
     fn window_origin_lower_left(&self) -> bool {
         (self.regs[WINDOW_ORIGIN as usize] & 1) != 0
+    }
+
+    fn window_origin_flip_y(&self) -> bool {
+        ((self.regs[WINDOW_ORIGIN as usize] >> 4) & 1) != 0
+    }
+
+    fn viewport_transform_scale_y(&self, index: u32) -> f32 {
+        let base = (VP_TRANSFORM_BASE + index * VP_TRANSFORM_STRIDE) as usize;
+        f32::from_bits(self.regs[base + 1])
     }
 
     fn surface_clip_height(&self) -> u32 {
@@ -3220,6 +3270,10 @@ impl dm::Maxwell3DAccess for Maxwell3D {
 
     fn vertex_stream_info(&self, index: u32) -> VertexStreamInfo {
         self.vertex_stream_info(index)
+    }
+
+    fn vertex_stream_instance(&self, index: u32) -> u32 {
+        self.vertex_stream_instance(index)
     }
 
     fn vertex_stream_limit(&self, index: u32) -> dm::VertexStreamLimit {
@@ -4730,10 +4784,12 @@ mod tests {
         engine.regs[base] = 64 | (1 << 12); // stride=64, enable bit 12
         engine.regs[base + 1] = 0x0000_1000; // addr_high
         engine.regs[base + 2] = 0x0000_2000; // addr_low
+        engine.regs[base + 3] = 7; // frequency
 
         let info = engine.vertex_stream_info(0);
         assert_eq!(info.index, 0);
         assert_eq!(info.stride, 64);
+        assert_eq!(info.frequency, 7);
         assert!(info.enabled);
         assert_eq!(info.address, 0x0000_1000_0000_2000);
     }
@@ -4750,7 +4806,18 @@ mod tests {
 
         let info = engine.vertex_stream_info(0);
         assert_eq!(info.stride, 32);
+        assert_eq!(info.frequency, 0);
         assert!(!info.enabled);
+    }
+
+    #[test]
+    fn test_vertex_stream_instance_accessor() {
+        let mut engine = Maxwell3D::new();
+
+        engine.regs[VERTEX_STREAM_INSTANCE_BASE as usize + 3] = 1;
+
+        assert_eq!(engine.vertex_stream_instance(0), 0);
+        assert_eq!(engine.vertex_stream_instance(3), 1);
     }
 
     #[test]
@@ -4952,6 +5019,15 @@ mod tests {
         assert_eq!(BlendFactor::from_raw(0x02), BlendFactor::One);
         assert_eq!(BlendFactor::from_raw(0x05), BlendFactor::SrcAlpha);
         assert_eq!(BlendFactor::from_raw(0x06), BlendFactor::OneMinusSrcAlpha);
+        assert_eq!(BlendFactor::from_raw(0x0B), BlendFactor::SrcAlphaSaturate);
+        assert_eq!(BlendFactor::from_raw(0x0C), BlendFactor::ConstantAlpha);
+        assert_eq!(BlendFactor::from_raw(0x0D), BlendFactor::OneMinusConstantAlpha);
+        assert_eq!(BlendFactor::from_raw(0x0E), BlendFactor::ConstantColor);
+        assert_eq!(BlendFactor::from_raw(0x0F), BlendFactor::OneMinusConstantColor);
+        assert_eq!(BlendFactor::from_raw(0x10), BlendFactor::Src1Color);
+        assert_eq!(BlendFactor::from_raw(0x11), BlendFactor::OneMinusSrc1Color);
+        assert_eq!(BlendFactor::from_raw(0x12), BlendFactor::Src1Alpha);
+        assert_eq!(BlendFactor::from_raw(0x13), BlendFactor::OneMinusSrc1Alpha);
         // GL encoding
         assert_eq!(BlendFactor::from_raw(0x4000), BlendFactor::Zero);
         assert_eq!(BlendFactor::from_raw(0x4001), BlendFactor::One);
@@ -7472,6 +7548,8 @@ mod tests {
         engine.regs[stream_base] = (1 << 12) | 0x20;
         engine.regs[stream_base + 1] = 0x1;
         engine.regs[stream_base + 2] = 0x2000;
+        engine.regs[stream_base + 3] = 5;
+        engine.regs[VERTEX_STREAM_INSTANCE_BASE as usize] = 1;
         let limit_base = VERTEX_STREAM_LIMIT_BASE as usize;
         engine.regs[limit_base] = 0x1;
         engine.regs[limit_base + 1] = 0x2FFF;
@@ -7486,7 +7564,9 @@ mod tests {
         let state = &calls.draw_states[0];
         assert_eq!(state.vertex_streams[0].address, 0x1_0000_2000);
         assert_eq!(state.vertex_streams[0].stride, 0x20);
+        assert_eq!(state.vertex_streams[0].frequency, 5);
         assert!(state.vertex_streams[0].enabled);
+        assert_eq!(state.vertex_stream_instances[0], 1);
         assert_eq!(state.vertex_stream_limits[0].address, 0x1_0000_2FFF);
     }
 

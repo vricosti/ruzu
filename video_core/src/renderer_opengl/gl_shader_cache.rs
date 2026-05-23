@@ -552,7 +552,119 @@ impl ShaderCache {
                         );
                     }
                     previous_info = compiled.info.clone();
-                    pipeline.glsl_sources[gl_slot] = Some(compiled.source);
+                    let mut final_source = compiled.source;
+                    if std::env::var_os("RUZU_FORCE_GREEN_FRAGMENT").is_some()
+                        && format!("{:?}", stage) == "Fragment"
+                    {
+                        if let Some(idx) = final_source.rfind("void main(){") {
+                            let head = &final_source[..idx];
+                            let new_body = "void main(){\nfrag_color0=vec4(0.0,1.0,0.0,1.0);\nreturn;\n}\n";
+                            let new_source = format!("{}{}", head, new_body);
+                            log::warn!("[FORCE_GREEN] patched fragment shader, new size {}", new_source.len());
+                            final_source = new_source;
+                        }
+                    }
+                    if std::env::var_os("RUZU_FORCE_BLACK_FRAGMENT").is_some()
+                        && format!("{:?}", stage) == "Fragment"
+                    {
+                        if let Some(idx) = final_source.rfind("void main(){") {
+                            let head = &final_source[..idx];
+                            let new_body = "void main(){\nfrag_color0=vec4(0.0,0.0,0.0,1.0);\nreturn;\n}\n";
+                            let new_source = format!("{}{}", head, new_body);
+                            log::warn!("[FORCE_BLACK] patched FS to opaque black");
+                            final_source = new_source;
+                        }
+                    }
+                    if std::env::var_os("RUZU_FORCE_BLUE_FRAGMENT").is_some()
+                        && format!("{:?}", stage) == "Fragment"
+                    {
+                        if let Some(idx) = final_source.rfind("void main(){") {
+                            let head = &final_source[..idx];
+                            let new_body = "void main(){\nfrag_color0=vec4(0.0,0.0,1.0,1.0);\nreturn;\n}\n";
+                            let new_source = format!("{}{}", head, new_body);
+                            log::warn!("[FORCE_BLUE] patched FS to opaque blue");
+                            final_source = new_source;
+                        }
+                    }
+                    if std::env::var_os("RUZU_PROBE_FRAGCOORD").is_some()
+                        && format!("{:?}", stage) == "Fragment"
+                    {
+                        // Encode gl_FragCoord.w (1=normal,0=bad) as red.
+                        // Encode normalized gl_FragCoord.xy as green/blue.
+                        if let Some(idx) = final_source.rfind("void main(){") {
+                            let head = &final_source[..idx];
+                            let new_body = "void main(){\nfloat fcw=gl_FragCoord.w;\nfloat zx=fcw==0.0?1.0:0.0;\nfrag_color0=vec4(zx,clamp(fcw,0.0,1.0),0.0,1.0);\nreturn;\n}\n";
+                            let new_source = format!("{}{}", head, new_body);
+                            log::warn!("[PROBE_FRAGCOORD] patched FS to dump gl_FragCoord.w");
+                            final_source = new_source;
+                        }
+                    }
+                    if std::env::var_os("RUZU_FORCE_FULLSCREEN_VS").is_some()
+                        && format!("{:?}", stage).contains("Vertex")
+                    {
+                        if let Some(idx) = final_source.rfind("void main(){") {
+                            let head = &final_source[..idx];
+                            let new_body = if std::env::var_os("RUZU_FORCE_FULLSCREEN_VS_READ_ATTR").is_some() {
+                                "void main(){\nvec4 ruzu_dummy=in_attr0;\nfloat ruzu_sink=ruzu_dummy.x*0.0;\nvec2 p=vec2(float((gl_VertexID<<1)&2),float(gl_VertexID&2));\ngl_Position=vec4(p*2.0-1.0+ruzu_sink,0.0,1.0);\nreturn;\n}\n"
+                            } else {
+                                "void main(){\nvec2 p=vec2(float((gl_VertexID<<1)&2),float(gl_VertexID&2));\ngl_Position=vec4(p*2.0-1.0,0.0,1.0);\nreturn;\n}\n"
+                            };
+                            let new_source = format!("{}{}", head, new_body);
+                            log::warn!("[FORCE_FS_VS] patched vertex shader");
+                            final_source = new_source;
+                        }
+                    }
+                    if std::env::var_os("RUZU_FORCE_VERTEX_ZW").is_some()
+                        && format!("{:?}", stage).contains("Vertex")
+                    {
+                        if let Some(idx) = final_source.rfind("return;") {
+                            let head = &final_source[..idx];
+                            let tail = &final_source[idx..];
+                            final_source = format!(
+                                "{}gl_Position.z=0.0;\ngl_Position.w=1.0;\n{}",
+                                head, tail
+                            );
+                            log::warn!("[FORCE_VERTEX_ZW] patched vertex shader");
+                        }
+                    }
+                    if std::env::var_os("RUZU_FORCE_VERTEX_XY").is_some()
+                        && format!("{:?}", stage).contains("Vertex")
+                    {
+                        if let Some(idx) = final_source.rfind("return;") {
+                            let head = &final_source[..idx];
+                            let tail = &final_source[idx..];
+                    final_source = format!(
+                        "{}vec2 ruzu_p=vec2(float((gl_VertexID<<1)&2),float(gl_VertexID&2));\ngl_Position.xy=ruzu_p*2.0-1.0;\n{}",
+                        head, tail
+                    );
+                    log::warn!("[FORCE_VERTEX_XY] patched vertex shader");
+                }
+            }
+                    if std::env::var_os("RUZU_FORCE_VERTEX_OUT_ZERO").is_some()
+                        && format!("{:?}", stage).contains("Vertex")
+                    {
+                        if let Some(idx) = final_source.rfind("return;") {
+                            let head = &final_source[..idx];
+                            let tail = &final_source[idx..];
+                            final_source = format!("{}out_attr0=vec4(0.0);\n{}", head, tail);
+                            log::warn!("[FORCE_VERTEX_OUT_ZERO] patched vertex shader");
+                        }
+                    }
+                    if std::env::var_os("RUZU_DUMP_GLSL_FINAL").is_some() {
+                        use std::sync::atomic::{AtomicUsize, Ordering};
+                        static FINAL_COUNT: AtomicUsize = AtomicUsize::new(0);
+                        let idx = FINAL_COUNT.fetch_add(1, Ordering::Relaxed);
+                        let path = format!("/tmp/ruzu_glsl_final_{:04}_{:?}.glsl", idx, stage);
+                        let _ = std::fs::write(&path, &final_source);
+                        log::warn!(
+                            "[GLSL_FINAL_DUMP] stage={:?} idx={} bytes={} path={}",
+                            stage,
+                            idx,
+                            final_source.len(),
+                            path
+                        );
+                    }
+                    pipeline.glsl_sources[gl_slot] = Some(final_source);
                     infos[gl_slot] = Some(previous_info.clone());
                 }
 
@@ -632,7 +744,106 @@ impl ShaderCache {
             }
             previous_info = Some(compiled.info.clone());
             infos[gl_slot] = previous_info.clone();
-            pipeline.glsl_sources[gl_slot] = Some(compiled.source);
+            let mut final_source = compiled.source;
+            if std::env::var_os("RUZU_FORCE_GREEN_FRAGMENT").is_some()
+                && format!("{:?}", stage) == "Fragment"
+            {
+                if let Some(idx) = final_source.rfind("void main(){") {
+                    let head = &final_source[..idx];
+                    let new_body = "void main(){\nfrag_color0=vec4(0.0,1.0,0.0,1.0);\nreturn;\n}\n";
+                    let new_source = format!("{}{}", head, new_body);
+                    log::warn!("[FORCE_GREEN] patched fragment shader (path 2), new size {}", new_source.len());
+                    final_source = new_source;
+                }
+            }
+            if std::env::var_os("RUZU_FORCE_BLACK_FRAGMENT").is_some()
+                && format!("{:?}", stage) == "Fragment"
+            {
+                if let Some(idx) = final_source.rfind("void main(){") {
+                    let head = &final_source[..idx];
+                    let new_body = "void main(){\nfrag_color0=vec4(0.0,0.0,0.0,1.0);\nreturn;\n}\n";
+                    let new_source = format!("{}{}", head, new_body);
+                    log::warn!("[FORCE_BLACK] patched FS (path 2)");
+                    final_source = new_source;
+                }
+            }
+            if std::env::var_os("RUZU_PROBE_FRAGCOORD").is_some()
+                && format!("{:?}", stage) == "Fragment"
+            {
+                if let Some(idx) = final_source.rfind("void main(){") {
+                    let head = &final_source[..idx];
+                    let new_body = "void main(){\nfloat fcw=gl_FragCoord.w;\nfloat zx=fcw==0.0?1.0:0.0;\nfrag_color0=vec4(zx,clamp(fcw,0.0,1.0),0.0,1.0);\nreturn;\n}\n";
+                    let new_source = format!("{}{}", head, new_body);
+                    log::warn!("[PROBE_FRAGCOORD] patched FS (path 2)");
+                    final_source = new_source;
+                }
+            }
+            if std::env::var_os("RUZU_FORCE_FULLSCREEN_VS").is_some()
+                && format!("{:?}", stage).contains("Vertex")
+            {
+                if let Some(idx) = final_source.rfind("void main(){") {
+                    let head = &final_source[..idx];
+                    let new_body = if std::env::var_os("RUZU_FORCE_FULLSCREEN_VS_READ_ATTR").is_some() {
+                        "void main(){\nvec4 ruzu_dummy=in_attr0;\nfloat ruzu_sink=ruzu_dummy.x*0.0;\nvec2 p=vec2(float((gl_VertexID<<1)&2),float(gl_VertexID&2));\ngl_Position=vec4(p*2.0-1.0+ruzu_sink,0.0,1.0);\nreturn;\n}\n"
+                    } else {
+                        "void main(){\nvec2 p=vec2(float((gl_VertexID<<1)&2),float(gl_VertexID&2));\ngl_Position=vec4(p*2.0-1.0,0.0,1.0);\nreturn;\n}\n"
+                    };
+                    let new_source = format!("{}{}", head, new_body);
+                    log::warn!("[FORCE_FS_VS] patched vertex shader (path 2)");
+                    final_source = new_source;
+                }
+            }
+            if std::env::var_os("RUZU_FORCE_VERTEX_ZW").is_some()
+                && format!("{:?}", stage).contains("Vertex")
+            {
+                if let Some(idx) = final_source.rfind("return;") {
+                    let head = &final_source[..idx];
+                    let tail = &final_source[idx..];
+                    final_source = format!(
+                        "{}gl_Position.z=0.0;\ngl_Position.w=1.0;\n{}",
+                        head, tail
+                    );
+                    log::warn!("[FORCE_VERTEX_ZW] patched vertex shader (path 2)");
+                }
+            }
+            if std::env::var_os("RUZU_FORCE_VERTEX_XY").is_some()
+                && format!("{:?}", stage).contains("Vertex")
+            {
+                if let Some(idx) = final_source.rfind("return;") {
+                    let head = &final_source[..idx];
+                    let tail = &final_source[idx..];
+                    final_source = format!(
+                        "{}vec2 ruzu_p=vec2(float((gl_VertexID<<1)&2),float(gl_VertexID&2));\ngl_Position.xy=ruzu_p*2.0-1.0;\n{}",
+                        head, tail
+                    );
+                    log::warn!("[FORCE_VERTEX_XY] patched vertex shader (path 2)");
+                }
+            }
+            if std::env::var_os("RUZU_FORCE_VERTEX_OUT_ZERO").is_some()
+                && format!("{:?}", stage).contains("Vertex")
+            {
+                if let Some(idx) = final_source.rfind("return;") {
+                    let head = &final_source[..idx];
+                    let tail = &final_source[idx..];
+                    final_source = format!("{}out_attr0=vec4(0.0);\n{}", head, tail);
+                    log::warn!("[FORCE_VERTEX_OUT_ZERO] patched vertex shader (path 2)");
+                }
+            }
+            if std::env::var_os("RUZU_DUMP_GLSL_FINAL").is_some() {
+                use std::sync::atomic::{AtomicUsize, Ordering};
+                static FINAL_COUNT: AtomicUsize = AtomicUsize::new(0);
+                let idx = FINAL_COUNT.fetch_add(1, Ordering::Relaxed);
+                let path = format!("/tmp/ruzu_glsl_final_{:04}_{:?}.glsl", idx, stage);
+                let _ = std::fs::write(&path, &final_source);
+                log::warn!(
+                    "[GLSL_FINAL_DUMP] stage={:?} idx={} bytes={} path={}",
+                    stage,
+                    idx,
+                    final_source.len(),
+                    path
+                );
+            }
+            pipeline.glsl_sources[gl_slot] = Some(final_source);
         }
 
         pipeline.apply_shader_infos(&infos);
@@ -719,7 +930,63 @@ impl ShaderCache {
             }
             let mut previous_info = compiled.info.clone();
             infos[0] = Some(previous_info.clone());
-            pipeline.glsl_sources[0] = Some(compiled.source);
+            let mut final_source = compiled.source;
+            if std::env::var_os("RUZU_FORCE_FULLSCREEN_VS").is_some() {
+                if let Some(idx) = final_source.rfind("void main(){") {
+                    let head = &final_source[..idx];
+                    let new_body = if std::env::var_os("RUZU_FORCE_FULLSCREEN_VS_READ_ATTR").is_some() {
+                        "void main(){\nvec4 ruzu_dummy=in_attr0;\nfloat ruzu_sink=ruzu_dummy.x*0.0;\nvec2 p=vec2(float((gl_VertexID<<1)&2),float(gl_VertexID&2));\ngl_Position=vec4(p*2.0-1.0+ruzu_sink,0.0,1.0);\nreturn;\n}\n"
+                    } else {
+                        "void main(){\nvec2 p=vec2(float((gl_VertexID<<1)&2),float(gl_VertexID&2));\ngl_Position=vec4(p*2.0-1.0,0.0,1.0);\nreturn;\n}\n"
+                    };
+                    final_source = format!("{}{}", head, new_body);
+                    log::warn!("[FORCE_FS_VS] patched dual vertex shader (envs path)");
+                }
+            }
+            if std::env::var_os("RUZU_FORCE_VERTEX_ZW").is_some() {
+                if let Some(idx) = final_source.rfind("return;") {
+                    let head = &final_source[..idx];
+                    let tail = &final_source[idx..];
+                    final_source = format!(
+                        "{}gl_Position.z=0.0;\ngl_Position.w=1.0;\n{}",
+                        head, tail
+                    );
+                    log::warn!("[FORCE_VERTEX_ZW] patched dual vertex shader (envs path)");
+                }
+            }
+            if std::env::var_os("RUZU_FORCE_VERTEX_XY").is_some() {
+                if let Some(idx) = final_source.rfind("return;") {
+                    let head = &final_source[..idx];
+                    let tail = &final_source[idx..];
+                    final_source = format!(
+                        "{}vec2 ruzu_p=vec2(float((gl_VertexID<<1)&2),float(gl_VertexID&2));\ngl_Position.xy=ruzu_p*2.0-1.0;\n{}",
+                        head, tail
+                    );
+                    log::warn!("[FORCE_VERTEX_XY] patched dual vertex shader (envs path)");
+                }
+            }
+            if std::env::var_os("RUZU_FORCE_VERTEX_OUT_ZERO").is_some() {
+                if let Some(idx) = final_source.rfind("return;") {
+                    let head = &final_source[..idx];
+                    let tail = &final_source[idx..];
+                    final_source = format!("{}out_attr0=vec4(0.0);\n{}", head, tail);
+                    log::warn!("[FORCE_VERTEX_OUT_ZERO] patched dual vertex shader (envs path)");
+                }
+            }
+            if std::env::var_os("RUZU_DUMP_GLSL_FINAL").is_some() {
+                use std::sync::atomic::{AtomicUsize, Ordering};
+                static FINAL_COUNT: AtomicUsize = AtomicUsize::new(0);
+                let idx = FINAL_COUNT.fetch_add(1, Ordering::Relaxed);
+                let path = format!("/tmp/ruzu_glsl_final_{:04}_VertexB.glsl", idx);
+                let _ = std::fs::write(&path, &final_source);
+                log::warn!(
+                    "[GLSL_FINAL_DUMP] stage=VertexB idx={} bytes={} path={}",
+                    idx,
+                    final_source.len(),
+                    path
+                );
+            }
+            pipeline.glsl_sources[0] = Some(final_source);
 
             for &(slot, _stage, gl_slot) in STAGE_LAYOUT {
                 if self.graphics_key.unique_hashes[slot] == 0 || slot == 1 {
@@ -759,7 +1026,106 @@ impl ShaderCache {
                 }
                 previous_info = compiled.info.clone();
                 infos[gl_slot] = Some(previous_info.clone());
-                pipeline.glsl_sources[gl_slot] = Some(compiled.source);
+                let mut final_source = compiled.source;
+                if std::env::var_os("RUZU_FORCE_GREEN_FRAGMENT").is_some()
+                    && format!("{:?}", actual_stage) == "Fragment"
+                {
+                    if let Some(idx) = final_source.rfind("void main(){") {
+                        let head = &final_source[..idx];
+                        let new_body = "void main(){\nfrag_color0=vec4(0.0,1.0,0.0,1.0);\nreturn;\n}\n";
+                        let new_source = format!("{}{}", head, new_body);
+                        log::warn!("[FORCE_GREEN] patched fragment shader (envs path)");
+                        final_source = new_source;
+                    }
+                }
+                if std::env::var_os("RUZU_FORCE_BLACK_FRAGMENT").is_some()
+                    && format!("{:?}", actual_stage) == "Fragment"
+                {
+                    if let Some(idx) = final_source.rfind("void main(){") {
+                        let head = &final_source[..idx];
+                        let new_body = "void main(){\nfrag_color0=vec4(0.0,0.0,0.0,1.0);\nreturn;\n}\n";
+                        let new_source = format!("{}{}", head, new_body);
+                        log::warn!("[FORCE_BLACK] patched FS (envs path)");
+                        final_source = new_source;
+                    }
+                }
+                if std::env::var_os("RUZU_PROBE_FRAGCOORD").is_some()
+                    && format!("{:?}", actual_stage) == "Fragment"
+                {
+                    if let Some(idx) = final_source.rfind("void main(){") {
+                        let head = &final_source[..idx];
+                        let new_body = "void main(){\nfloat fcw=gl_FragCoord.w;\nfloat zx=fcw==0.0?1.0:0.0;\nfrag_color0=vec4(zx,clamp(fcw,0.0,1.0),0.0,1.0);\nreturn;\n}\n";
+                        let new_source = format!("{}{}", head, new_body);
+                        log::warn!("[PROBE_FRAGCOORD] patched FS (envs path)");
+                        final_source = new_source;
+                    }
+                }
+                if std::env::var_os("RUZU_FORCE_FULLSCREEN_VS").is_some()
+                    && format!("{:?}", actual_stage).contains("Vertex")
+                {
+                    if let Some(idx) = final_source.rfind("void main(){") {
+                        let head = &final_source[..idx];
+                        let new_body = if std::env::var_os("RUZU_FORCE_FULLSCREEN_VS_READ_ATTR").is_some() {
+                            "void main(){\nvec4 ruzu_dummy=in_attr0;\nfloat ruzu_sink=ruzu_dummy.x*0.0;\nvec2 p=vec2(float((gl_VertexID<<1)&2),float(gl_VertexID&2));\ngl_Position=vec4(p*2.0-1.0+ruzu_sink,0.0,1.0);\nreturn;\n}\n"
+                        } else {
+                            "void main(){\nvec2 p=vec2(float((gl_VertexID<<1)&2),float(gl_VertexID&2));\ngl_Position=vec4(p*2.0-1.0,0.0,1.0);\nreturn;\n}\n"
+                        };
+                        let new_source = format!("{}{}", head, new_body);
+                        log::warn!("[FORCE_FS_VS] patched vertex shader (envs path)");
+                        final_source = new_source;
+                    }
+                }
+                if std::env::var_os("RUZU_FORCE_VERTEX_ZW").is_some()
+                    && format!("{:?}", actual_stage).contains("Vertex")
+                {
+                    if let Some(idx) = final_source.rfind("return;") {
+                        let head = &final_source[..idx];
+                        let tail = &final_source[idx..];
+                        final_source = format!(
+                            "{}gl_Position.z=0.0;\ngl_Position.w=1.0;\n{}",
+                            head, tail
+                        );
+                        log::warn!("[FORCE_VERTEX_ZW] patched vertex shader (envs path)");
+                    }
+                }
+                if std::env::var_os("RUZU_FORCE_VERTEX_XY").is_some()
+                    && format!("{:?}", actual_stage).contains("Vertex")
+                {
+                    if let Some(idx) = final_source.rfind("return;") {
+                        let head = &final_source[..idx];
+                        let tail = &final_source[idx..];
+                        final_source = format!(
+                            "{}vec2 ruzu_p=vec2(float((gl_VertexID<<1)&2),float(gl_VertexID&2));\ngl_Position.xy=ruzu_p*2.0-1.0;\n{}",
+                            head, tail
+                        );
+                        log::warn!("[FORCE_VERTEX_XY] patched vertex shader (envs path)");
+                    }
+                }
+                if std::env::var_os("RUZU_FORCE_VERTEX_OUT_ZERO").is_some()
+                    && format!("{:?}", actual_stage).contains("Vertex")
+                {
+                    if let Some(idx) = final_source.rfind("return;") {
+                        let head = &final_source[..idx];
+                        let tail = &final_source[idx..];
+                        final_source = format!("{}out_attr0=vec4(0.0);\n{}", head, tail);
+                        log::warn!("[FORCE_VERTEX_OUT_ZERO] patched vertex shader (envs path)");
+                    }
+                }
+                if std::env::var_os("RUZU_DUMP_GLSL_FINAL").is_some() {
+                    use std::sync::atomic::{AtomicUsize, Ordering};
+                    static FINAL_COUNT: AtomicUsize = AtomicUsize::new(0);
+                    let idx = FINAL_COUNT.fetch_add(1, Ordering::Relaxed);
+                    let path = format!("/tmp/ruzu_glsl_final_{:04}_{:?}.glsl", idx, actual_stage);
+                    let _ = std::fs::write(&path, &final_source);
+                    log::warn!(
+                        "[GLSL_FINAL_DUMP] stage={:?} idx={} bytes={} path={}",
+                        actual_stage,
+                        idx,
+                        final_source.len(),
+                        path
+                    );
+                }
+                pipeline.glsl_sources[gl_slot] = Some(final_source);
             }
 
             pipeline.apply_shader_infos(&infos);
@@ -811,7 +1177,106 @@ impl ShaderCache {
             }
             previous_info = Some(compiled.info.clone());
             infos[gl_slot] = previous_info.clone();
-            pipeline.glsl_sources[gl_slot] = Some(compiled.source);
+            let mut final_source = compiled.source;
+            if std::env::var_os("RUZU_FORCE_GREEN_FRAGMENT").is_some()
+                && format!("{:?}", actual_stage) == "Fragment"
+            {
+                if let Some(idx) = final_source.rfind("void main(){") {
+                    let head = &final_source[..idx];
+                    let new_body = "void main(){\nfrag_color0=vec4(0.0,1.0,0.0,1.0);\nreturn;\n}\n";
+                    let new_source = format!("{}{}", head, new_body);
+                    log::warn!("[FORCE_GREEN] patched fragment shader (envs path 2)");
+                    final_source = new_source;
+                }
+            }
+            if std::env::var_os("RUZU_FORCE_BLACK_FRAGMENT").is_some()
+                && format!("{:?}", actual_stage) == "Fragment"
+            {
+                if let Some(idx) = final_source.rfind("void main(){") {
+                    let head = &final_source[..idx];
+                    let new_body = "void main(){\nfrag_color0=vec4(0.0,0.0,0.0,1.0);\nreturn;\n}\n";
+                    let new_source = format!("{}{}", head, new_body);
+                    log::warn!("[FORCE_BLACK] patched FS (envs path 2)");
+                    final_source = new_source;
+                }
+            }
+            if std::env::var_os("RUZU_PROBE_FRAGCOORD").is_some()
+                && format!("{:?}", actual_stage) == "Fragment"
+            {
+                if let Some(idx) = final_source.rfind("void main(){") {
+                    let head = &final_source[..idx];
+                    let new_body = "void main(){\nfloat fcw=gl_FragCoord.w;\nfloat zx=fcw==0.0?1.0:0.0;\nfrag_color0=vec4(zx,clamp(fcw,0.0,1.0),0.0,1.0);\nreturn;\n}\n";
+                    let new_source = format!("{}{}", head, new_body);
+                    log::warn!("[PROBE_FRAGCOORD] patched FS (envs path 2)");
+                    final_source = new_source;
+                }
+            }
+            if std::env::var_os("RUZU_FORCE_FULLSCREEN_VS").is_some()
+                && format!("{:?}", actual_stage).contains("Vertex")
+            {
+                if let Some(idx) = final_source.rfind("void main(){") {
+                    let head = &final_source[..idx];
+                    let new_body = if std::env::var_os("RUZU_FORCE_FULLSCREEN_VS_READ_ATTR").is_some() {
+                        "void main(){\nvec4 ruzu_dummy=in_attr0;\nfloat ruzu_sink=ruzu_dummy.x*0.0;\nvec2 p=vec2(float((gl_VertexID<<1)&2),float(gl_VertexID&2));\ngl_Position=vec4(p*2.0-1.0+ruzu_sink,0.0,1.0);\nreturn;\n}\n"
+                    } else {
+                        "void main(){\nvec2 p=vec2(float((gl_VertexID<<1)&2),float(gl_VertexID&2));\ngl_Position=vec4(p*2.0-1.0,0.0,1.0);\nreturn;\n}\n"
+                    };
+                    let new_source = format!("{}{}", head, new_body);
+                    log::warn!("[FORCE_FS_VS] patched vertex shader (envs path 2)");
+                    final_source = new_source;
+                }
+            }
+            if std::env::var_os("RUZU_FORCE_VERTEX_ZW").is_some()
+                && format!("{:?}", actual_stage).contains("Vertex")
+            {
+                if let Some(idx) = final_source.rfind("return;") {
+                    let head = &final_source[..idx];
+                    let tail = &final_source[idx..];
+                    final_source = format!(
+                        "{}gl_Position.z=0.0;\ngl_Position.w=1.0;\n{}",
+                        head, tail
+                    );
+                    log::warn!("[FORCE_VERTEX_ZW] patched vertex shader (envs path 2)");
+                }
+            }
+            if std::env::var_os("RUZU_FORCE_VERTEX_XY").is_some()
+                && format!("{:?}", actual_stage).contains("Vertex")
+            {
+                if let Some(idx) = final_source.rfind("return;") {
+                    let head = &final_source[..idx];
+                    let tail = &final_source[idx..];
+                    final_source = format!(
+                        "{}vec2 ruzu_p=vec2(float((gl_VertexID<<1)&2),float(gl_VertexID&2));\ngl_Position.xy=ruzu_p*2.0-1.0;\n{}",
+                        head, tail
+                    );
+                    log::warn!("[FORCE_VERTEX_XY] patched vertex shader (envs path 2)");
+                }
+            }
+            if std::env::var_os("RUZU_FORCE_VERTEX_OUT_ZERO").is_some()
+                && format!("{:?}", actual_stage).contains("Vertex")
+            {
+                if let Some(idx) = final_source.rfind("return;") {
+                    let head = &final_source[..idx];
+                    let tail = &final_source[idx..];
+                    final_source = format!("{}out_attr0=vec4(0.0);\n{}", head, tail);
+                    log::warn!("[FORCE_VERTEX_OUT_ZERO] patched vertex shader (envs path 2)");
+                }
+            }
+            if std::env::var_os("RUZU_DUMP_GLSL_FINAL").is_some() {
+                use std::sync::atomic::{AtomicUsize, Ordering};
+                static FINAL_COUNT: AtomicUsize = AtomicUsize::new(0);
+                let idx = FINAL_COUNT.fetch_add(1, Ordering::Relaxed);
+                let path = format!("/tmp/ruzu_glsl_final_{:04}_{:?}.glsl", idx, actual_stage);
+                let _ = std::fs::write(&path, &final_source);
+                log::warn!(
+                    "[GLSL_FINAL_DUMP] stage={:?} idx={} bytes={} path={}",
+                    actual_stage,
+                    idx,
+                    final_source.len(),
+                    path
+                );
+            }
+            pipeline.glsl_sources[gl_slot] = Some(final_source);
         }
 
         pipeline.apply_shader_infos(&infos);

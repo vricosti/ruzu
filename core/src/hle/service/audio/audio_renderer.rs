@@ -274,6 +274,33 @@ impl IAudioRenderer {
                 }
             }
         }
+        // RUZU_DUMP_AUDIO_UPDATE_RANGE=start-end (inclusive): write both input and
+        // output buffers of calls in [start, end] to /tmp/ruzu-audio-update-N-{in,out}.bin
+        // for byte-diff against an equivalent zuyu capture.
+        if let Ok(range_str) = std::env::var("RUZU_DUMP_AUDIO_UPDATE_RANGE") {
+            if let Some((start_str, end_str)) = range_str.split_once('-') {
+                if let (Ok(start), Ok(end)) =
+                    (start_str.parse::<u64>(), end_str.parse::<u64>())
+                {
+                    use std::sync::atomic::{AtomicU64, Ordering};
+                    static RANGE_COUNT: AtomicU64 = AtomicU64::new(0);
+                    let n = RANGE_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+                    if n >= start && n <= end {
+                        let in_path = format!("/tmp/ruzu-audio-update-{}-in.bin", n);
+                        let out_path = format!("/tmp/ruzu-audio-update-{}-out.bin", n);
+                        let _ = std::fs::write(&in_path, &input);
+                        let _ = std::fs::write(&out_path, &output);
+                        log::info!(
+                            "RUZU_DUMP_AUDIO_UPDATE_RANGE: call={} in={}B out={}B result=0x{:08X}",
+                            n,
+                            input.len(),
+                            output.len(),
+                            result.get_inner_value()
+                        );
+                    }
+                }
+            }
+        }
         if std::env::var_os("RUZU_LOG_AUDIO_UPDATE_BYTES").is_some() && output.len() >= 0x1A00 {
             let words: Vec<u32> = output
                 .chunks_exact(4)

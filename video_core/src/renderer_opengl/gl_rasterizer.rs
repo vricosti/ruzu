@@ -10,6 +10,7 @@
 //! buffer/texture/shader caches are ported from zuyu.
 
 use log::{debug, info};
+use std::ptr::NonNull;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -20,13 +21,14 @@ use super::gl_device::Device;
 use super::gl_fence_manager::{Fence, FenceManagerOpenGL};
 use super::gl_query_cache::QueryCache;
 use super::gl_shader_cache::ShaderCache as OpenGLShaderCache;
+use super::gl_state_tracker::{dirty as GlDirty, StateTracker};
 use super::gl_texture_cache::TextureCache as OpenGLTextureCache;
 use crate::buffer_cache::buffer_cache::BufferCache as CommonBufferCache;
 use crate::buffer_cache::word_manager::DeviceTracker;
 use crate::engines::draw_manager::DrawState;
 use crate::engines::maxwell_3d::{
-    BlendEquation, BlendFactor, ComparisonOp, CullFace, DepthStencilInfo, DrawCall, FrontFace,
-    PolygonMode, RasterizerInfo, StencilFaceInfo, StencilOp,
+    BlendEquation, BlendFactor, ComparisonOp, CullFace, DepthMode, DepthStencilInfo, DrawCall,
+    FrontFace, PolygonMode, StencilFaceInfo, StencilOp,
 };
 use crate::engines::Framebuffer;
 use crate::fence_manager::FenceManager;
@@ -477,7 +479,31 @@ fn sync_depth_stencil_state(depth_stencil: &DepthStencilInfo) {
     }
 }
 
-fn sync_rasterizer_state(rasterizer: &RasterizerInfo) {
+fn viewport_front_face_to_gl(
+    front_face: FrontFace,
+    window_origin_flip_y: bool,
+    viewport0_scale_y: f32,
+) -> u32 {
+    let mode = front_face_to_gl(front_face);
+    let mut flip_faces = true;
+    if window_origin_flip_y {
+        flip_faces = !flip_faces;
+    }
+    if viewport0_scale_y < 0.0 {
+        flip_faces = !flip_faces;
+    }
+    if !flip_faces {
+        return mode;
+    }
+    match mode {
+        gl::CW => gl::CCW,
+        gl::CCW => gl::CW,
+        _ => mode,
+    }
+}
+
+fn sync_rasterizer_state(draw_state: &DrawState) {
+    let rasterizer = &draw_state.rasterizer;
     unsafe {
         if rasterizer.cull_enable {
             gl::Enable(gl::CULL_FACE);
@@ -485,7 +511,6 @@ fn sync_rasterizer_state(rasterizer: &RasterizerInfo) {
         } else {
             gl::Disable(gl::CULL_FACE);
         }
-        gl::FrontFace(front_face_to_gl(rasterizer.front_face));
         gl::PolygonMode(gl::FRONT, polygon_mode_to_gl(rasterizer.polygon_mode_front));
         gl::PolygonMode(gl::BACK, polygon_mode_to_gl(rasterizer.polygon_mode_back));
         gl::LineWidth(rasterizer.line_width_aliased.max(1.0));
@@ -496,10 +521,85 @@ fn sync_rasterizer_state(rasterizer: &RasterizerInfo) {
     }
 }
 
-fn sync_fixed_function_state(draw_state: &DrawState) {
+fn clip_control_depth(depth_mode: DepthMode) -> u32 {
+    match depth_mode {
+        DepthMode::ZeroToOne => gl::ZERO_TO_ONE,
+        DepthMode::MinusOneToOne => gl::NEGATIVE_ONE_TO_ONE,
+    }
+}
+
+fn clip_control_origin(window_origin_lower_left: bool, viewport0_scale_y: f32) -> u32 {
+    let mut flip_y = false;
+    if viewport0_scale_y < 0.0 {
+        flip_y = !flip_y;
+    }
+    if window_origin_lower_left {
+        flip_y = !flip_y;
+    }
+    if flip_y {
+        gl::UPPER_LEFT
+    } else {
+        gl::LOWER_LEFT
+    }
+}
+
+fn sync_viewport(draw_state: &DrawState, mut state_tracker: Option<&mut StateTracker>) {
+    let flags = &draw_state.dirty_flags;
+    let rescale_viewports = flags[crate::dirty_flags::flags::RESCALE_VIEWPORTS as usize];
+    let mut tracker_dirty_viewport = false;
+    let mut tracker_dirty_clip_control = false;
+    let mut tracker_dirty_front_face = false;
+    let mut tracker_dirty_viewport_transform = false;
+    if let Some(tracker) = state_tracker.as_deref_mut() {
+        tracker_dirty_viewport =
+            tracker.exchange(GlDirty::VIEWPORTS) || tracker.exchange(GlDirty::RESCALE_VIEWPORTS);
+        tracker_dirty_clip_control = tracker.exchange(GlDirty::CLIP_CONTROL);
+        tracker_dirty_front_face = tracker.exchange(GlDirty::FRONT_FACE);
+        tracker_dirty_viewport_transform = tracker.exchange(GlDirty::VIEWPORT_TRANSFORM);
+    }
+    let dirty_viewport = flags[GlDirty::VIEWPORTS as usize]
+        || rescale_viewports
+        || tracker_dirty_viewport;
+    let dirty_clip_control =
+        flags[GlDirty::CLIP_CONTROL as usize] || tracker_dirty_clip_control;
+
     unsafe {
+        if dirty_viewport
+            || dirty_clip_control
+            || flags[GlDirty::FRONT_FACE as usize]
+            || tracker_dirty_front_face
+        {
+            gl::FrontFace(viewport_front_face_to_gl(
+                draw_state.rasterizer.front_face,
+                draw_state.window_origin_flip_y,
+                draw_state.viewport0_scale_y,
+            ));
+        }
+
+        if dirty_viewport || dirty_clip_control {
+            let clip_origin = clip_control_origin(
+                draw_state.window_origin_lower_left,
+                draw_state.viewport0_scale_y,
+            );
+            let clip_depth = clip_control_depth(draw_state.depth_stencil.depth_mode);
+            if let Some(tracker) = state_tracker.as_deref_mut() {
+                tracker.clip_control(clip_origin, clip_depth);
+                tracker.set_y_negate(draw_state.window_origin_lower_left);
+            } else {
+                gl::ClipControl(clip_origin, clip_depth);
+            }
+        }
+
         gl::Disable(gl::RASTERIZER_DISCARD);
+        if !dirty_viewport {
+            return;
+        }
+        let force =
+            flags[GlDirty::VIEWPORT_TRANSFORM as usize] || rescale_viewports || tracker_dirty_viewport_transform || tracker_dirty_viewport;
         for (index, viewport) in draw_state.viewports.iter().enumerate() {
+            if !force && !flags[(GlDirty::VIEWPORT_0 as usize) + index] {
+                continue;
+            }
             gl::ViewportIndexedf(
                 index as u32,
                 viewport.x,
@@ -566,7 +666,7 @@ fn sync_fixed_function_state(draw_state: &DrawState) {
         }
     }
     sync_depth_stencil_state(&draw_state.depth_stencil);
-    sync_rasterizer_state(&draw_state.rasterizer);
+    sync_rasterizer_state(draw_state);
 }
 
 fn sync_vertex_formats(vao: u32, draw_state: &DrawState) {
@@ -587,7 +687,7 @@ fn sync_vertex_formats(vao: u32, draw_state: &DrawState) {
             if attrib.constant
                 || attrib.size == crate::engines::maxwell_3d::VertexAttribSize::Invalid
             {
-                gl::DisableVertexArrayAttrib(vao, gl_index);
+                gl::DisableVertexAttribArray(gl_index);
                 if trace_attribs {
                     info!(
                         "[VERTEX_ATTRIB] index={} disabled constant={} size={:?} type={:?} buffer={} offset=0x{:X}",
@@ -602,23 +702,21 @@ fn sync_vertex_formats(vao: u32, draw_state: &DrawState) {
                 continue;
             }
 
-            gl::EnableVertexArrayAttrib(vao, gl_index);
+            gl::EnableVertexAttribArray(gl_index);
             let component_count = attrib.size.component_count() as i32;
             let gl_format = crate::renderer_opengl::maxwell_to_gl::vertex_format(
                 vertex_attrib_type_raw(attrib.attrib_type),
                 vertex_attrib_size_raw(attrib.size),
             );
             if vertex_attrib_is_integer(attrib.attrib_type) {
-                gl::VertexArrayAttribIFormat(
-                    vao,
+                gl::VertexAttribIFormat(
                     gl_index,
                     component_count,
                     gl_format,
                     attrib.offset,
                 );
             } else {
-                gl::VertexArrayAttribFormat(
-                    vao,
+                gl::VertexAttribFormat(
                     gl_index,
                     component_count,
                     gl_format,
@@ -630,8 +728,7 @@ fn sync_vertex_formats(vao: u32, draw_state: &DrawState) {
                     attrib.offset,
                 );
             }
-            gl::VertexArrayAttribBinding(vao, gl_index, attrib.buffer_index);
-            gl::VertexArrayBindingDivisor(vao, gl_index, 0);
+            gl::VertexAttribBinding(gl_index, attrib.buffer_index);
             if trace_attribs {
                 info!(
                     "[VERTEX_ATTRIB] index={} enabled size={:?} type={:?} buffer={} offset=0x{:X} components={} gl_format=0x{:X}",
@@ -644,6 +741,21 @@ fn sync_vertex_formats(vao: u32, draw_state: &DrawState) {
                     gl_format
                 );
             }
+        }
+    }
+}
+
+fn sync_vertex_instances(draw_state: &DrawState) {
+    for index in 0..16 {
+        let stream = draw_state.vertex_streams[index];
+        let instancing_enabled = draw_state.vertex_stream_instances[index] != 0;
+        let divisor = if instancing_enabled {
+            stream.frequency
+        } else {
+            0
+        };
+        unsafe {
+            gl::VertexBindingDivisor(index as u32, divisor);
         }
     }
 }
@@ -672,6 +784,12 @@ pub struct RasterizerOpenGL {
     /// objects and is the entry point for the draw hot path.
     gl_shader_cache: OpenGLShaderCache,
     query_cache: QueryCache,
+    /// Non-owning reference to RendererOpenGL's shared state tracker.
+    ///
+    /// Upstream stores `StateTracker& state_tracker` in RasterizerOpenGL and
+    /// shares the same object with screen blit. ruzu mirrors that ownership
+    /// using a stable pointer to the renderer-owned Box<StateTracker>.
+    state_tracker: Option<NonNull<StateTracker>>,
     invalidate_gpu_cache_callback: Option<Arc<dyn Fn() + Send + Sync>>,
     /// Per-channel GPU memory manager, extracted from `ChannelState` in
     /// `bind_channel`. Used to build the `GpuMemoryAccess` adapter for the
@@ -761,6 +879,7 @@ impl RasterizerOpenGL {
         device: &Device,
         syncpoints: Arc<SyncpointManager>,
         device_memory: Arc<crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager>,
+        state_tracker: *mut StateTracker,
     ) -> Self {
         let mut transient_vao: u32 = 0;
         unsafe {
@@ -785,6 +904,7 @@ impl RasterizerOpenGL {
             shader_cache: ShaderCache::new(device_memory),
             gl_shader_cache: OpenGLShaderCache::new(),
             query_cache: QueryCache::new(),
+            state_tracker: NonNull::new(state_tracker),
             invalidate_gpu_cache_callback: None,
             channel_memory_manager: None,
             cpu_memory_reader: None,
@@ -812,6 +932,7 @@ impl RasterizerOpenGL {
             shader_cache: ShaderCache::default(),
             gl_shader_cache: OpenGLShaderCache::new(),
             query_cache: QueryCache::new(),
+            state_tracker: None,
             invalidate_gpu_cache_callback: None,
             channel_memory_manager: None,
             cpu_memory_reader: None,
@@ -1223,6 +1344,20 @@ impl RasterizerInterface for RasterizerOpenGL {
                 (*texture_cache).update_render_targets_from_draw_state(draw_state, |gpu_addr| {
                     mm.lock().gpu_to_cpu_address(gpu_addr)
                 });
+                if let Some(reader) = self.device_memory_reader.as_ref().cloned() {
+                    (*texture_cache).prepare_render_targets_from_draw_state(
+                        draw_state,
+                        Some(&mut |gpu_addr, out| {
+                            if mm.lock().gpu_to_cpu_address(gpu_addr).is_none() {
+                                return false;
+                            }
+                            mm.lock().read_block(gpu_addr, out, reader.as_ref());
+                            true
+                        }),
+                    );
+                } else {
+                    (*texture_cache).prepare_render_targets_from_draw_state(draw_state, None);
+                }
                 draw_state
                     .rt_control
                     .map
@@ -1254,6 +1389,7 @@ impl RasterizerInterface for RasterizerOpenGL {
             info!("[RT] draw no framebuffer bound");
         }
 
+        let state_tracker_ptr = self.state_tracker;
         let step = Instant::now();
         let Some(pipeline) = self
             .gl_shader_cache
@@ -2278,8 +2414,12 @@ impl RasterizerInterface for RasterizerOpenGL {
         // (`new_for_test`, no GL context, placeholder pipelines) safe.
         let can_draw_gl = pipeline_has_programs && self.transient_vao != 0;
         if can_draw_gl {
-            sync_fixed_function_state(draw_state);
+            let state_tracker = state_tracker_ptr.map(|mut state_tracker| unsafe {
+                state_tracker.as_mut()
+            });
+            sync_viewport(draw_state, state_tracker);
             sync_vertex_formats(self.transient_vao, draw_state);
+            sync_vertex_instances(draw_state);
             if std::env::var_os("RUZU_FORCE_DISABLE_BLEND").is_some() {
                 unsafe {
                     for i in 0..8 {
@@ -2395,12 +2535,520 @@ impl RasterizerInterface for RasterizerOpenGL {
             }
         }
 
+        let trace_samples = can_draw_gl && std::env::var_os("RUZU_TRACE_SAMPLES_PASSED").is_some();
+        let mut samples_query = 0u32;
+        if trace_samples {
+            unsafe {
+                gl::GenQueries(1, &mut samples_query);
+                gl::BeginQuery(gl::SAMPLES_PASSED, samples_query);
+            }
+        }
+
         if is_indexed {
             let base_vertex = draw_state.base_index as i32;
             let num_vertices = draw_state.index_buffer.count;
             if can_draw_gl {
                 let index_format = index_format_to_gl(draw_state.index_buffer.format);
                 let index_offset = self.buffer_cache.index_offset();
+                if std::env::var_os("RUZU_PREDRAW_CLEAR_RED").is_some() {
+                    if let Some((framebuffer, _, _)) = bound_draw_framebuffer {
+                        unsafe {
+                            let red = [1.0f32, 0.0, 0.0, 1.0];
+                            gl::ClearNamedFramebufferfv(framebuffer, gl::COLOR, 0, red.as_ptr());
+                        }
+                    }
+                }
+                if std::env::var_os("RUZU_FORCE_NO_CULL").is_some() {
+                    unsafe {
+                        gl::Disable(gl::CULL_FACE);
+                    }
+                }
+                if std::env::var_os("RUZU_FORCE_SIMPLE_DRAW_STATE").is_some() {
+                    if let Some((_, width, height)) = bound_draw_framebuffer {
+                        unsafe {
+                            gl::Disable(gl::DEPTH_TEST);
+                            gl::Disable(gl::STENCIL_TEST);
+                            gl::Disable(gl::SCISSOR_TEST);
+                            gl::Disable(gl::BLEND);
+                            gl::Disable(gl::CULL_FACE);
+                            gl::Disable(gl::RASTERIZER_DISCARD);
+                            for index in 0..8 {
+                                gl::Disable(gl::CLIP_DISTANCE0 + index);
+                            }
+                            gl::ColorMask(gl::TRUE, gl::TRUE, gl::TRUE, gl::TRUE);
+                            gl::Viewport(0, 0, width as i32, height as i32);
+                        }
+                    }
+                }
+                if std::env::var_os("RUZU_FORCE_REBIND_FBO").is_some() {
+                    if let Some((fb, _, _)) = bound_draw_framebuffer {
+                        unsafe {
+                            gl::BindFramebuffer(gl::DRAW_FRAMEBUFFER, 0);
+                            gl::BindFramebuffer(gl::DRAW_FRAMEBUFFER, fb);
+                        }
+                    }
+                }
+                if std::env::var_os("RUZU_FORCE_DRAW_FBO_VALIDATE").is_some() {
+                    unsafe {
+                        let _ = gl::CheckFramebufferStatus(gl::DRAW_FRAMEBUFFER);
+                    }
+                }
+                if std::env::var_os("RUZU_FORCE_DRAW_ATTACHMENT_VALIDATE").is_some() {
+                    if let Some((fb, _, _)) = bound_draw_framebuffer {
+                        unsafe {
+                            let mut attached = 0i32;
+                            gl::GetNamedFramebufferAttachmentParameteriv(
+                                fb,
+                                gl::COLOR_ATTACHMENT0,
+                                gl::FRAMEBUFFER_ATTACHMENT_OBJECT_NAME,
+                                &mut attached,
+                            );
+                            if attached > 0 {
+                                let mut width = 0i32;
+                                gl::GetTextureLevelParameteriv(
+                                    attached as u32,
+                                    0,
+                                    gl::TEXTURE_WIDTH,
+                                    &mut width,
+                                );
+                            }
+                        }
+                    }
+                }
+                if std::env::var_os("RUZU_TRACE_DRAW_STATE_FULL").is_some() {
+                    unsafe {
+                        let mut draw_buf0 = 0i32;
+                        gl::GetIntegerv(gl::DRAW_BUFFER0, &mut draw_buf0);
+                        let status = gl::CheckFramebufferStatus(gl::DRAW_FRAMEBUFFER);
+                        let mut wm = [0i32; 4];
+                        gl::GetIntegeri_v(gl::COLOR_WRITEMASK, 0, wm.as_mut_ptr());
+                        let mut viewport = [0i32; 4];
+                        gl::GetIntegerv(gl::VIEWPORT, viewport.as_mut_ptr());
+                        let mut scissor_box = [0i32; 4];
+                        gl::GetIntegerv(gl::SCISSOR_BOX, scissor_box.as_mut_ptr());
+                        let scissor_enabled = gl::IsEnabled(gl::SCISSOR_TEST);
+                        let depth_enabled = gl::IsEnabled(gl::DEPTH_TEST);
+                        let cull_enabled = gl::IsEnabled(gl::CULL_FACE);
+                        let mut cull_face = 0i32;
+                        gl::GetIntegerv(gl::CULL_FACE_MODE, &mut cull_face);
+                        let mut front_face = 0i32;
+                        gl::GetIntegerv(gl::FRONT_FACE, &mut front_face);
+                        let blend_enabled = gl::IsEnabled(gl::BLEND);
+                        let mut pipeline_handle = 0i32;
+                        gl::GetIntegerv(gl::PROGRAM_PIPELINE_BINDING, &mut pipeline_handle);
+                        let mut program = 0i32;
+                        gl::GetIntegerv(gl::CURRENT_PROGRAM, &mut program);
+                        let mut rasterizer_discard = gl::IsEnabled(gl::RASTERIZER_DISCARD);
+                        let mut multisample = gl::IsEnabled(gl::MULTISAMPLE);
+                        let a2c_enabled = gl::IsEnabled(gl::SAMPLE_ALPHA_TO_COVERAGE);
+                        let a2one_enabled = gl::IsEnabled(gl::SAMPLE_ALPHA_TO_ONE);
+                        let sample_coverage = gl::IsEnabled(gl::SAMPLE_COVERAGE);
+                        let sample_shading = gl::IsEnabled(gl::SAMPLE_SHADING);
+                        let depth_clamp = gl::IsEnabled(gl::DEPTH_CLAMP);
+                        let mut blend0 = gl::IsEnabledi(gl::BLEND, 0);
+                        let mut depth_mask = 0i32;
+                        gl::GetIntegerv(gl::DEPTH_WRITEMASK, &mut depth_mask);
+                        let bound_fb = bound_draw_framebuffer.map(|(fb, _, _)| fb).unwrap_or(0);
+                        let srgb_enabled = gl::IsEnabled(gl::FRAMEBUFFER_SRGB);
+                        let mut vao = 0i32;
+                        gl::GetIntegerv(gl::VERTEX_ARRAY_BINDING, &mut vao);
+                        let polygon_offset_fill = gl::IsEnabled(gl::POLYGON_OFFSET_FILL);
+                        let stencil_test = gl::IsEnabled(gl::STENCIL_TEST);
+                        let primitive_restart = gl::IsEnabled(gl::PRIMITIVE_RESTART);
+                        let primitive_restart_fixed = gl::IsEnabled(gl::PRIMITIVE_RESTART_FIXED_INDEX);
+                        let mut attached_obj_at_draw = 0i32;
+                        gl::GetNamedFramebufferAttachmentParameteriv(
+                            bound_fb,
+                            gl::COLOR_ATTACHMENT0,
+                            gl::FRAMEBUFFER_ATTACHMENT_OBJECT_NAME,
+                            &mut attached_obj_at_draw,
+                        );
+                        // verify the attached texture itself
+                        let mut tex_width = 0i32;
+                        if attached_obj_at_draw > 0 {
+                            gl::GetTextureLevelParameteriv(
+                                attached_obj_at_draw as u32,
+                                0,
+                                gl::TEXTURE_WIDTH,
+                                &mut tex_width,
+                            );
+                        }
+                        log::warn!(
+                            "[DRAW_STATE_EXT] seq={} fb={} srgb={} vao={} polyoff={} stencil={} prest={} prest_fix={} attached={} tex_w={}",
+                            draw_seq, bound_fb, srgb_enabled, vao,
+                            polygon_offset_fill, stencil_test,
+                            primitive_restart, primitive_restart_fixed,
+                            attached_obj_at_draw, tex_width,
+                        );
+                        log::warn!(
+                            "[DRAW_STATE_FULL] seq={} fb={} drawbuf0=0x{:X} status=0x{:X} wm=[{},{},{},{}] vp=[{},{},{},{}] sc_en={} sc_box=[{},{},{},{}] depth={} dw={} cull={}+0x{:X}/0x{:X} blend={} blend0={} a2c={} a2one={} sc={} ss={} dclamp={} pipeline={} program={} rast_disc={} ms={}",
+                            draw_seq, bound_fb, draw_buf0, status,
+                            wm[0], wm[1], wm[2], wm[3],
+                            viewport[0], viewport[1], viewport[2], viewport[3],
+                            scissor_enabled, scissor_box[0], scissor_box[1], scissor_box[2], scissor_box[3],
+                            depth_enabled, depth_mask, cull_enabled, cull_face, front_face,
+                            blend_enabled, blend0, a2c_enabled, a2one_enabled,
+                            sample_coverage, sample_shading, depth_clamp,
+                            pipeline_handle, program, rasterizer_discard, multisample,
+                        );
+                    }
+                }
+                if std::env::var_os("RUZU_TRACE_FBO_ATTACH_AT_DRAW").is_some() {
+                    if let Some((fb, _, _)) = bound_draw_framebuffer {
+                        unsafe {
+                            let mut attached_obj = 0i32;
+                            let mut attached_type = 0i32;
+                            let mut attached_lvl = 0i32;
+                            let mut attached_layer = 0i32;
+                            let mut attached_layered = 0i32;
+                            gl::GetNamedFramebufferAttachmentParameteriv(
+                                fb,
+                                gl::COLOR_ATTACHMENT0,
+                                gl::FRAMEBUFFER_ATTACHMENT_OBJECT_NAME,
+                                &mut attached_obj,
+                            );
+                            gl::GetNamedFramebufferAttachmentParameteriv(
+                                fb,
+                                gl::COLOR_ATTACHMENT0,
+                                gl::FRAMEBUFFER_ATTACHMENT_OBJECT_TYPE,
+                                &mut attached_type,
+                            );
+                            gl::GetNamedFramebufferAttachmentParameteriv(
+                                fb,
+                                gl::COLOR_ATTACHMENT0,
+                                gl::FRAMEBUFFER_ATTACHMENT_TEXTURE_LEVEL,
+                                &mut attached_lvl,
+                            );
+                            gl::GetNamedFramebufferAttachmentParameteriv(
+                                fb,
+                                gl::COLOR_ATTACHMENT0,
+                                gl::FRAMEBUFFER_ATTACHMENT_TEXTURE_LAYER,
+                                &mut attached_layer,
+                            );
+                            gl::GetNamedFramebufferAttachmentParameteriv(
+                                fb,
+                                gl::COLOR_ATTACHMENT0,
+                                gl::FRAMEBUFFER_ATTACHMENT_LAYERED,
+                                &mut attached_layered,
+                            );
+                            let mut draw_buf0 = 0i32;
+                            gl::GetNamedFramebufferParameteriv(
+                                fb,
+                                gl::DRAW_BUFFER0 as u32,
+                                &mut draw_buf0,
+                            );
+                            let mut default_width = 0i32;
+                            let mut default_height = 0i32;
+                            gl::GetNamedFramebufferParameteriv(fb, gl::FRAMEBUFFER_DEFAULT_WIDTH, &mut default_width);
+                            gl::GetNamedFramebufferParameteriv(fb, gl::FRAMEBUFFER_DEFAULT_HEIGHT, &mut default_height);
+                            let status = gl::CheckNamedFramebufferStatus(fb, gl::DRAW_FRAMEBUFFER);
+                            log::warn!(
+                                "[FBO_ATTACH_AT_DRAW] seq={} fb={} attached_obj={} attached_type=0x{:X} lvl={} layer={} layered={} draw_buf0=0x{:X} default={}x{} status=0x{:X}",
+                                draw_seq, fb,
+                                attached_obj, attached_type, attached_lvl, attached_layer,
+                                attached_layered, draw_buf0, default_width, default_height, status,
+                            );
+                        }
+                    }
+                }
+                if std::env::var_os("RUZU_TRACE_DRAW_BIND_RECHECK").is_some() {
+                    unsafe {
+                        let mut actual_draw_fb = 0i32;
+                        gl::GetIntegerv(gl::DRAW_FRAMEBUFFER_BINDING, &mut actual_draw_fb);
+                        let expected = bound_draw_framebuffer.map(|(fb, _, _)| fb).unwrap_or(0);
+                        if (actual_draw_fb as u32) != expected {
+                            log::warn!(
+                                "[DRAW_BIND_MISMATCH] seq={} expected_fb={} actual_fb={}",
+                                draw_seq, expected, actual_draw_fb,
+                            );
+                        }
+                    }
+                }
+                if std::env::var_os("RUZU_FORCE_VERTEX_BINDING_VALIDATE").is_some() {
+                    unsafe {
+                        let mut buffer = 0i32;
+                        gl::GetIntegeri_v(gl::VERTEX_BINDING_BUFFER, 0, &mut buffer);
+                    }
+                }
+                if std::env::var_os("RUZU_FORCE_VERTEX_ATTRIB_VALIDATE").is_some() {
+                    unsafe {
+                        let mut binding = 0i32;
+                        gl::GetVertexAttribiv(0, gl::VERTEX_ATTRIB_BINDING, &mut binding);
+                    }
+                }
+                if std::env::var_os("RUZU_TRACE_GUEST_EBO_DUMP").is_some() {
+                    let bound_fb_id = bound_draw_framebuffer
+                        .map(|(fb, _, _)| fb)
+                        .unwrap_or(0);
+                    let ib_gpu = draw_state.index_buffer_gpu_addr;
+                    let ib_format = draw_state.index_buffer.format;
+                    let format_size = ib_format.size_bytes() as usize;
+                    let ib_first = draw_state.index_buffer.first;
+                    let ib_count = draw_state.index_buffer.count.min(6);
+                    if let (Some(mm), Some(reader)) = (
+                        self.channel_memory_manager.as_ref(),
+                        self.device_memory_reader.as_ref(),
+                    ) {
+                        let read_addr = ib_gpu + (ib_first as u64) * (format_size as u64);
+                        let read_bytes = ib_count as usize * format_size;
+                        if read_bytes > 0 && read_bytes <= 64 {
+                            let mut buf = vec![0u8; read_bytes];
+                            mm.lock().read_block(read_addr, &mut buf, &**reader);
+                            let mut indices = [0u64; 6];
+                            for i in 0..ib_count as usize {
+                                let off = i * format_size;
+                                indices[i] = match format_size {
+                                    1 => buf[off] as u64,
+                                    2 => u16::from_le_bytes([buf[off], buf[off+1]]) as u64,
+                                    4 => u32::from_le_bytes([buf[off], buf[off+1], buf[off+2], buf[off+3]]) as u64,
+                                    _ => 0,
+                                };
+                            }
+                            log::warn!(
+                                "[GUEST_EBO] seq={} fbo={} ib_gpu=0x{:X} first={} count={} fmt={:?} sz={} indices=[{},{},{},{},{},{}]",
+                                draw_seq, bound_fb_id, ib_gpu, ib_first, ib_count, ib_format, format_size,
+                                indices[0], indices[1], indices[2], indices[3], indices[4], indices[5],
+                            );
+                        }
+                    }
+                }
+                if std::env::var_os("RUZU_TRACE_EBO_DUMP").is_some() {
+                    let bound_fb_id = bound_draw_framebuffer
+                        .map(|(fb, _, _)| fb)
+                        .unwrap_or(0);
+                    unsafe {
+                        let mut ebo = 0i32;
+                        gl::GetIntegerv(gl::ELEMENT_ARRAY_BUFFER_BINDING, &mut ebo);
+                        if ebo != 0 {
+                            let mut indices = [0u32; 6];
+                            gl::GetNamedBufferSubData(
+                                ebo as u32,
+                                index_offset as isize,
+                                (indices.len() * 4) as isize,
+                                indices.as_mut_ptr() as *mut _,
+                            );
+                            log::warn!(
+                                "[EBO_DUMP] seq={} fbo={} ebo={} index_offset={} indices=[{},{},{},{},{},{}]",
+                                draw_seq, bound_fb_id, ebo, index_offset,
+                                indices[0], indices[1], indices[2], indices[3], indices[4], indices[5],
+                            );
+                        }
+                    }
+                }
+                if std::env::var_os("RUZU_TRACE_VBO_DUMP").is_some() {
+                    let bound_fb_id = bound_draw_framebuffer
+                        .map(|(fb, _, _)| fb)
+                        .unwrap_or(0);
+                    unsafe {
+                        // Get current VAO + bind state for attribute 0
+                        let mut vao = 0i32;
+                        gl::GetIntegerv(gl::VERTEX_ARRAY_BINDING, &mut vao);
+                        let mut vbo = 0i32;
+                        gl::GetVertexAttribiv(
+                            0,
+                            gl::VERTEX_ATTRIB_ARRAY_BUFFER_BINDING,
+                            &mut vbo,
+                        );
+                        let mut stride = 0i32;
+                        gl::GetVertexAttribiv(0, gl::VERTEX_ATTRIB_ARRAY_STRIDE, &mut stride);
+                        let mut binding_stride = 0i32;
+                        gl::GetIntegeri_v(GL_VERTEX_BINDING_STRIDE, 0, &mut binding_stride);
+                        let mut size_attr = 0i32;
+                        gl::GetVertexAttribiv(0, gl::VERTEX_ATTRIB_ARRAY_SIZE, &mut size_attr);
+                        let mut type_attr = 0i32;
+                        gl::GetVertexAttribiv(0, gl::VERTEX_ATTRIB_ARRAY_TYPE, &mut type_attr);
+                        let mut binding_offset = 0i64;
+                        gl::GetInteger64i_v(
+                            gl::VERTEX_BINDING_OFFSET,
+                            0,
+                            &mut binding_offset,
+                        );
+                        let mut ebo = 0i32;
+                        gl::GetIntegerv(gl::ELEMENT_ARRAY_BUFFER_BINDING, &mut ebo);
+                        let read_bytes = 48usize;
+                        let mut data = vec![0u8; read_bytes];
+                        if vbo != 0 {
+                            gl::GetNamedBufferSubData(
+                                vbo as u32,
+                                binding_offset as isize,
+                                read_bytes as isize,
+                                data.as_mut_ptr() as *mut _,
+                            );
+                        }
+                        let nonzero = data.iter().filter(|&&b| b != 0).count();
+                        let mut floats = [0.0f32; 12];
+                        for (i, chunk) in data.chunks_exact(4).take(12).enumerate() {
+                            floats[i] = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+                        }
+                        let mut strided_pos = [[0.0f32; 3]; 4];
+                        if vbo != 0 && binding_stride > 0 {
+                            for vertex in 0..4 {
+                                let mut bytes = [0u8; 12];
+                                gl::GetNamedBufferSubData(
+                                    vbo as u32,
+                                    (binding_offset + (vertex as i64 * binding_stride as i64)) as isize,
+                                    bytes.len() as isize,
+                                    bytes.as_mut_ptr() as *mut _,
+                                );
+                                for component in 0..3 {
+                                    let start = component * 4;
+                                    strided_pos[vertex][component] = f32::from_le_bytes([
+                                        bytes[start],
+                                        bytes[start + 1],
+                                        bytes[start + 2],
+                                        bytes[start + 3],
+                                    ]);
+                                }
+                            }
+                        }
+                        log::warn!(
+                            "[VBO_DUMP] seq={} fbo={} vao={} vbo={} ebo={} attrib_stride={} binding_stride={} size={} type=0x{:X} offset={} nonzero={}/{} raw0=[{:.2},{:.2}] raw1=[{:.2},{:.2}] pos0=[{:.2},{:.2},{:.2}] pos1=[{:.2},{:.2},{:.2}] pos2=[{:.2},{:.2},{:.2}] pos3=[{:.2},{:.2},{:.2}]",
+                            draw_seq, bound_fb_id, vao, vbo, ebo, stride, binding_stride, size_attr, type_attr, binding_offset,
+                            nonzero, read_bytes,
+                            floats[0], floats[1],
+                            floats[2], floats[3],
+                            strided_pos[0][0], strided_pos[0][1], strided_pos[0][2],
+                            strided_pos[1][0], strided_pos[1][1], strided_pos[1][2],
+                            strided_pos[2][0], strided_pos[2][1], strided_pos[2][2],
+                            strided_pos[3][0], strided_pos[3][1], strided_pos[3][2],
+                        );
+                    }
+                }
+                if std::env::var_os("RUZU_TRACE_VAO_DUMP").is_some() {
+                    let bound_fb_id = bound_draw_framebuffer
+                        .map(|(fb, _, _)| fb)
+                        .unwrap_or(0);
+                    unsafe {
+                        let mut vao = 0i32;
+                        gl::GetIntegerv(gl::VERTEX_ARRAY_BINDING, &mut vao);
+                        for attrib in 0..8 {
+                            let mut enabled = 0i32;
+                            let mut size = 0i32;
+                            let mut ty = 0i32;
+                            let mut normalized = 0i32;
+                            let mut relative_offset = 0i32;
+                            let mut binding = 0i32;
+                            gl::GetVertexAttribiv(attrib, gl::VERTEX_ATTRIB_ARRAY_ENABLED, &mut enabled);
+                            gl::GetVertexAttribiv(attrib, gl::VERTEX_ATTRIB_ARRAY_SIZE, &mut size);
+                            gl::GetVertexAttribiv(attrib, gl::VERTEX_ATTRIB_ARRAY_TYPE, &mut ty);
+                            gl::GetVertexAttribiv(attrib, gl::VERTEX_ATTRIB_ARRAY_NORMALIZED, &mut normalized);
+                            gl::GetVertexAttribiv(attrib, gl::VERTEX_ATTRIB_RELATIVE_OFFSET, &mut relative_offset);
+                            gl::GetVertexAttribiv(attrib, gl::VERTEX_ATTRIB_BINDING, &mut binding);
+                            if enabled == 0 {
+                                continue;
+                            }
+                            let mut buffer = 0i32;
+                            let mut offset = 0i64;
+                            let mut stride = 0i32;
+                            let mut divisor = 0i32;
+                            gl::GetIntegeri_v(gl::VERTEX_BINDING_BUFFER, binding as u32, &mut buffer);
+                            gl::GetInteger64i_v(gl::VERTEX_BINDING_OFFSET, binding as u32, &mut offset);
+                            gl::GetIntegeri_v(gl::VERTEX_BINDING_STRIDE, binding as u32, &mut stride);
+                            gl::GetIntegeri_v(gl::VERTEX_BINDING_DIVISOR, binding as u32, &mut divisor);
+                            log::warn!(
+                                "[VAO_DUMP] seq={} fbo={} vao={} attrib={} binding={} buffer={} offset={} stride={} divisor={} size={} type=0x{:X} norm={} rel_off={}",
+                                draw_seq,
+                                bound_fb_id,
+                                vao,
+                                attrib,
+                                binding,
+                                buffer,
+                                offset,
+                                stride,
+                                divisor,
+                                size,
+                                ty,
+                                normalized,
+                                relative_offset
+                            );
+                        }
+                    }
+                }
+                if std::env::var_os("RUZU_TRACE_SAMPLER_DUMP").is_some() {
+                    let bound_fb_id = bound_draw_framebuffer
+                        .map(|(fb, _, _)| fb)
+                        .unwrap_or(0);
+                    unsafe {
+                        for unit in 0..4 {
+                            gl::ActiveTexture(gl::TEXTURE0 + unit);
+                            let mut t2d = 0i32;
+                            gl::GetIntegerv(gl::TEXTURE_BINDING_2D, &mut t2d);
+                            let mut t2da = 0i32;
+                            gl::GetIntegerv(gl::TEXTURE_BINDING_2D_ARRAY, &mut t2da);
+                            let mut sampler = 0i32;
+                            gl::GetIntegerv(gl::SAMPLER_BINDING, &mut sampler);
+                            if t2d != 0 || t2da != 0 {
+                                log::warn!(
+                                    "[SAMPLER] seq={} fb={} unit={} tex_2d={} tex_2d_array={} sampler={}",
+                                    draw_seq, bound_fb_id, unit, t2d, t2da, sampler,
+                                );
+                            }
+                        }
+                    }
+                }
+                if std::env::var_os("RUZU_TRACE_UBO_DUMP").is_some() {
+                    let bound_fb_id = bound_draw_framebuffer
+                        .map(|(fb, _, _)| fb)
+                        .unwrap_or(0);
+                    unsafe {
+                        for binding_idx in 0..4 {
+                            let mut ubo_handle = 0i32;
+                            let mut offset = 0i64;
+                            let mut size = 0i64;
+                            gl::GetIntegeri_v(
+                                gl::UNIFORM_BUFFER_BINDING,
+                                binding_idx,
+                                &mut ubo_handle,
+                            );
+                            if ubo_handle == 0 {
+                                continue;
+                            }
+                            gl::GetInteger64i_v(
+                                gl::UNIFORM_BUFFER_START,
+                                binding_idx,
+                                &mut offset,
+                            );
+                            gl::GetInteger64i_v(
+                                gl::UNIFORM_BUFFER_SIZE,
+                                binding_idx,
+                                &mut size,
+                            );
+                            let read_bytes = (size as usize).min(544);
+                            let mut data = vec![0u8; read_bytes];
+                            if read_bytes > 0 {
+                                gl::GetNamedBufferSubData(
+                                    ubo_handle as u32,
+                                    offset as isize,
+                                    read_bytes as isize,
+                                    data.as_mut_ptr() as *mut _,
+                                );
+                            }
+                            let nonzero = data.iter().filter(|&&b| b != 0).count();
+                            let mut floats = [0.0f32; 136];
+                            for (i, chunk) in data.chunks_exact(4).take(136).enumerate() {
+                                floats[i] = f32::from_le_bytes([
+                                    chunk[0], chunk[1], chunk[2], chunk[3],
+                                ]);
+                            }
+                            log::warn!(
+                                "[UBO_DUMP] seq={} fbo={} binding={} ubo={} offset={} size={} nonzero={}/{} f4[0]=[{:.3},{:.3},{:.3},{:.3}] f4[1]=[{:.3},{:.3},{:.3},{:.3}] f4[2]=[{:.3},{:.3},{:.3},{:.3}] f4[3]=[{:.3},{:.3},{:.3},{:.3}] f4[4]=[{:.3},{:.3},{:.3},{:.3}] f4[28]=[{:.3},{:.3},{:.3},{:.3}] f4[29]=[{:.3},{:.3},{:.3},{:.3}] f4[30]=[{:.3},{:.3},{:.3},{:.3}] f4[31]=[{:.3},{:.3},{:.3},{:.3}] f4[32]=[{:.3},{:.3},{:.3},{:.3}] f4[33]=[{:.3},{:.3},{:.3},{:.3}]",
+                                draw_seq, bound_fb_id, binding_idx, ubo_handle, offset, size,
+                                nonzero, read_bytes,
+                                floats[0], floats[1], floats[2], floats[3],
+                                floats[4], floats[5], floats[6], floats[7],
+                                floats[8], floats[9], floats[10], floats[11],
+                                floats[12], floats[13], floats[14], floats[15],
+                                floats[16], floats[17], floats[18], floats[19],
+                                floats[112], floats[113], floats[114], floats[115],
+                                floats[116], floats[117], floats[118], floats[119],
+                                floats[120], floats[121], floats[122], floats[123],
+                                floats[124], floats[125], floats[126], floats[127],
+                                floats[128], floats[129], floats[130], floats[131],
+                                floats[132], floats[133], floats[134], floats[135],
+                            );
+                        }
+                    }
+                }
                 unsafe {
                     gl::BindVertexArray(self.transient_vao);
                     gl::DrawElementsInstancedBaseVertexBaseInstance(
@@ -2440,6 +3088,110 @@ impl RasterizerInterface for RasterizerOpenGL {
                      base_vertex={} base_instance={} — placeholder pipeline, no GL draw",
                     primitive_mode, num_vertices, num_instances, base_vertex, base_instance
                 );
+            }
+        }
+        if trace_samples {
+            unsafe {
+                gl::EndQuery(gl::SAMPLES_PASSED);
+                let mut samples = 0u64;
+                gl::GetQueryObjectui64v(samples_query, gl::QUERY_RESULT, &mut samples);
+                gl::DeleteQueries(1, &samples_query);
+                let bound_fb_id = bound_draw_framebuffer
+                    .map(|(fb, _, _)| fb)
+                    .unwrap_or(0);
+                log::warn!(
+                    "[SAMPLES_PASSED] seq={} fbo={} samples={} indexed={} verts={} instances={} base_instance={}",
+                    draw_seq,
+                    bound_fb_id,
+                    samples,
+                    is_indexed,
+                    if is_indexed {
+                        draw_state.index_buffer.count
+                    } else {
+                        draw_state.vertex_buffer.count
+                    },
+                    num_instances,
+                    base_instance
+                );
+            }
+        }
+        if can_draw_gl && std::env::var_os("RUZU_TRACE_DIRECT_TEX_READ").is_some() {
+            if let Some((framebuffer, _, _)) = bound_draw_framebuffer {
+                unsafe {
+                    gl::Finish();
+                    let mut attached = 0i32;
+                    gl::GetNamedFramebufferAttachmentParameteriv(
+                        framebuffer,
+                        gl::COLOR_ATTACHMENT0,
+                        gl::FRAMEBUFFER_ATTACHMENT_OBJECT_NAME,
+                        &mut attached,
+                    );
+                    if attached > 0 {
+                        let mut pixels = [0u8; 16]; // 4 pixels worth
+                        gl::GetTextureSubImage(
+                            attached as u32,
+                            0,
+                            0, 0, 0,
+                            2, 2, 1,
+                            gl::RGBA, gl::UNSIGNED_BYTE,
+                            pixels.len() as i32,
+                            pixels.as_mut_ptr() as *mut _,
+                        );
+                        let err = gl::GetError();
+                        let nz = pixels.iter().filter(|&&b| b != 0).count();
+                        log::warn!(
+                            "[DIRECT_TEX] seq={} fb={} attached={} px=[{:02X?}] nonzero={} err=0x{:X}",
+                            draw_seq, framebuffer, attached, &pixels[..8], nz, err,
+                        );
+                    }
+                }
+            }
+        }
+        if can_draw_gl && std::env::var_os("RUZU_TRACE_DRAW_READBACK").is_some() {
+            if let Some((framebuffer, w, h)) = bound_draw_framebuffer {
+                unsafe {
+                    gl::Finish();
+                    let mut prev_read_fb = 0i32;
+                    gl::GetIntegerv(gl::READ_FRAMEBUFFER_BINDING, &mut prev_read_fb);
+                    gl::BindFramebuffer(gl::READ_FRAMEBUFFER, framebuffer);
+                    let mut grid_nonzero_cells = 0u32;
+                    let mut first_hit: (i32, i32, [u8; 4]) = (-1, -1, [0; 4]);
+                    let mut last_hit: (i32, i32, [u8; 4]) = (-1, -1, [0; 4]);
+                    let mut total_grid_nonzero_bytes = 0u32;
+                    for gy in 0..8 {
+                        for gx in 0..8 {
+                            let x = (gx * (w as i32) / 8).max(0);
+                            let y = (gy * (h as i32) / 8).max(0);
+                            let mut px = [0u8; 4];
+                            gl::ReadPixels(
+                                x, y, 1, 1,
+                                gl::RGBA, gl::UNSIGNED_BYTE,
+                                px.as_mut_ptr() as *mut _,
+                            );
+                            let nz_bytes = px.iter().filter(|&&b| b != 0).count() as u32;
+                            if nz_bytes > 0 {
+                                grid_nonzero_cells += 1;
+                                total_grid_nonzero_bytes += nz_bytes;
+                                if first_hit.0 < 0 {
+                                    first_hit = (x, y, px);
+                                }
+                                last_hit = (x, y, px);
+                            }
+                        }
+                    }
+                    let err = gl::GetError();
+                    log::warn!(
+                        "[DRAW_READBACK] seq={} fbo={} grid_cells_with_pixels={}/64 nz_bytes={} first_hit=({},{}):[{:02X}{:02X}{:02X}{:02X}] last_hit=({},{}):[{:02X}{:02X}{:02X}{:02X}] err=0x{:X}",
+                        draw_seq, framebuffer,
+                        grid_nonzero_cells, total_grid_nonzero_bytes,
+                        first_hit.0, first_hit.1,
+                        first_hit.2[0], first_hit.2[1], first_hit.2[2], first_hit.2[3],
+                        last_hit.0, last_hit.1,
+                        last_hit.2[0], last_hit.2[1], last_hit.2[2], last_hit.2[3],
+                        err,
+                    );
+                    gl::BindFramebuffer(gl::READ_FRAMEBUFFER, prev_read_fb as u32);
+                }
             }
         }
         if can_draw_gl && std::env::var_os("RUZU_TRACE_GL_DRAW_ERROR").is_some() {
@@ -2843,6 +3595,7 @@ impl RasterizerInterface for RasterizerOpenGL {
             (*texture_cache).update_render_targets_from_draw_state(draw_state, |gpu_addr| {
                 mm.lock().gpu_to_cpu_address(gpu_addr)
             });
+            (*texture_cache).prepare_render_targets_from_draw_state(draw_state, None);
             (*texture_cache).framebuffer_for_render_target(&rt)
         };
         let Some((framebuffer, width, height)) = framebuffer else {
@@ -3646,5 +4399,30 @@ mod tests {
 
         assert_eq!(rast.num_queued_commands, 0);
         assert_eq!(rast.frame_count, 1);
+    }
+
+    #[test]
+    fn clip_control_depth_matches_maxwell_depth_mode() {
+        assert_eq!(clip_control_depth(DepthMode::ZeroToOne), gl::ZERO_TO_ONE);
+        assert_eq!(
+            clip_control_depth(DepthMode::MinusOneToOne),
+            gl::NEGATIVE_ONE_TO_ONE
+        );
+    }
+
+    #[test]
+    fn clip_control_origin_matches_upstream_flip_rules() {
+        assert_eq!(clip_control_origin(false, 1.0), gl::LOWER_LEFT);
+        assert_eq!(clip_control_origin(false, -1.0), gl::UPPER_LEFT);
+        assert_eq!(clip_control_origin(true, 1.0), gl::UPPER_LEFT);
+        assert_eq!(clip_control_origin(true, -1.0), gl::LOWER_LEFT);
+    }
+
+    #[test]
+    fn viewport_front_face_matches_upstream_flip_rules() {
+        assert_eq!(viewport_front_face_to_gl(FrontFace::CCW, false, 1.0), gl::CW);
+        assert_eq!(viewport_front_face_to_gl(FrontFace::CCW, false, -1.0), gl::CCW);
+        assert_eq!(viewport_front_face_to_gl(FrontFace::CCW, true, 1.0), gl::CCW);
+        assert_eq!(viewport_front_face_to_gl(FrontFace::CCW, true, -1.0), gl::CW);
     }
 }

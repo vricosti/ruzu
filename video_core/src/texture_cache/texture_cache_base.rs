@@ -532,6 +532,18 @@ impl TextureCacheBase {
             self.slot_images[image_id].insert_view(info, view_id);
             view_id
         };
+        if std::env::var_os("RUZU_TRACE_PRESENT_IMG").is_some() {
+            let image = &self.slot_images[image_id];
+            log::warn!(
+                "[PRESENT_IMG] cpu=0x{:X} candidates={} chosen_image={} view_id={} num_views_on_image={} all_image_ids={:?}",
+                cpu_addr,
+                valid_image_ids.len(),
+                image_id.index,
+                view_id.index,
+                image.image_view_ids.len(),
+                valid_image_ids.iter().map(|i| i.index).collect::<Vec<_>>(),
+            );
+        }
         let image = &self.slot_images[image_id];
         let view = self.slot_image_views[view_id].clone();
         Some(FramebufferImageView {
@@ -588,7 +600,9 @@ impl TextureCacheBase {
 
     /// Return true when the caller should wait for async downloads.
     pub fn should_wait_async_flushes(&self) -> bool {
-        !self.committed_downloads.is_empty()
+        self.committed_downloads
+            .front()
+            .is_some_and(|downloads| !downloads.is_empty())
     }
 
     /// Commit asynchronous downloads.
@@ -649,5 +663,14 @@ mod tests {
         let cache = TextureCacheBase::new(Arc::new(MaxwellDeviceMemoryManager::default()));
         let _lock_a = cache.mutex.lock();
         let _lock_b = cache.mutex.lock();
+    }
+
+    #[test]
+    fn empty_committed_download_batch_does_not_require_wait() {
+        let mut cache = TextureCacheBase::new(Arc::new(MaxwellDeviceMemoryManager::default()));
+
+        cache.commit_async_flushes();
+
+        assert!(!cache.should_wait_async_flushes());
     }
 }

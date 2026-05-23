@@ -6,7 +6,6 @@ pub mod circular_buffer;
 pub mod device;
 
 pub use circular_buffer::{
-    dump_circular_buffer_command, process_circular_buffer_command, verify_circular_buffer_command,
     write_circular_buffer_payload, CircularBufferSinkCommand, CircularBufferSinkPayload,
 };
 pub use device::{

@@ -132,6 +132,23 @@ impl TextureCacheBase {
     /// via `find_image_view`. Splits the borrow across `channel_state`
     /// fields + `device_memory` so `find_image_view` can take `&mut self`.
     fn visit_image_view(&mut self, graphics: bool, index: u32) -> ImageViewId {
+        if std::env::var_os("RUZU_TRACE_VISIT_TIC").is_some() {
+            let table = if graphics {
+                &self.channel_state.graphics_image_table
+            } else {
+                &self.channel_state.compute_image_table
+            };
+            // Use cached descriptor without reading guest memory
+            let desc = table.cached(index);
+            if let Some(d) = desc {
+                log::warn!(
+                    "[VISIT_TIC] graphics={} index={} cached_addr=0x{:X}",
+                    graphics, index, d.address()
+                );
+            } else {
+                log::warn!("[VISIT_TIC] graphics={} index={} cached=None", graphics, index);
+            }
+        }
         let gpu_memory = self.device_memory.clone();
         // Step 1: read the TIC descriptor with a local borrow on the table only.
         let (descriptor, is_new) = {
@@ -178,6 +195,26 @@ impl TextureCacheBase {
             }
             table.read_with(index, |gpu_addr, out| read_gpu(gpu_addr, out))
         };
+        if std::env::var_os("RUZU_TRACE_VISIT_TIC").is_some() {
+            log::warn!(
+                "[VISIT_TIC_GPU] index={} tic_gpu=0x{:X} fmt=0x{:X} width={} height={} is_new={}",
+                index, descriptor.address(),
+                {
+                    let raw = descriptor.raw[0];
+                    raw as u32 & 0xFFFFFF // approximation of format bits
+                },
+                {
+                    // width is in word4 bits[16:0] for pitch, varies by layout
+                    let w = (descriptor.raw[2] >> 0) as u32 & 0xFFFF;
+                    w
+                },
+                {
+                    let h = (descriptor.raw[2] >> 16) as u32 & 0xFFFF;
+                    h
+                },
+                is_new,
+            );
+        }
         if is_new {
             let new_id = self.find_image_view_with_addr_valid(&descriptor, addr_valid);
             self.channel_state.graphics_image_view_ids[index as usize] = new_id;
@@ -194,9 +231,22 @@ impl TextureCacheBase {
             return NULL_IMAGE_VIEW_ID;
         }
         if let Some(&id) = self.channel_state.image_views.get(descriptor) {
+            if std::env::var_os("RUZU_TRACE_TIC_LOOKUP").is_some() {
+                log::warn!(
+                    "[TIC_LOOKUP] cached gpu=0x{:X} view_id={} (cached)",
+                    descriptor.address(), id.index
+                );
+            }
             return id;
         }
+        let addr = descriptor.address();
         let new_id = self.create_image_view(descriptor);
+        if std::env::var_os("RUZU_TRACE_TIC_LOOKUP").is_some() {
+            log::warn!(
+                "[TIC_LOOKUP] new gpu=0x{:X} view_id={} (created)",
+                addr, new_id.index
+            );
+        }
         self.channel_state.image_views.insert(*descriptor, new_id);
         new_id
     }
@@ -551,8 +601,7 @@ impl TextureCacheBase {
             };
 
             let image_id = self.find_or_insert_render_target_image(&rt, cpu_addr);
-            self.ensure_render_target_view(image_id);
-            self.mark_modification_by_id(image_id);
+            self.find_render_target_view_from_image(image_id, &rt, rt.address);
 
             if std::env::var_os("RUZU_TRACE_RT").is_some() {
                 let image = &self.slot_images[image_id];
@@ -601,19 +650,43 @@ impl TextureCacheBase {
         image_id
     }
 
-    fn ensure_render_target_view(&mut self, image_id: ImageId) -> ImageViewId {
+    /// Port of `TextureCache<P>::FindRenderTargetView` after the target image
+    /// has been found or inserted.
+    pub fn find_render_target_view_from_image(
+        &mut self,
+        image_id: ImageId,
+        rt: &RenderTargetInfo,
+        gpu_addr: GPUVAddr,
+    ) -> ImageViewId {
+        let rt_info = ImageInfo::from_render_target_info(rt, 0);
         let image = &self.slot_images[image_id];
+        let view_type = super::util::render_target_image_view_type(&rt_info);
+        let base = if image.info.image_type == ImageType::Linear {
+            SubresourceBase { level: 0, layer: 0 }
+        } else {
+            match image.try_find_base(gpu_addr) {
+                Some(base) => base,
+                None => return NULL_IMAGE_VIEW_ID,
+            }
+        };
+        let layers = if image.info.image_type == ImageType::E3D {
+            rt_info.size.depth as i32
+        } else {
+            rt_info.resources.layers
+        };
         let info = ImageViewInfo::for_render_target(
-            ImageViewType::E2D,
-            image.info.format,
-            SubresourceRange::default(),
+            view_type,
+            rt_info.format,
+            SubresourceRange {
+                base,
+                extent: SubresourceExtent { levels: 1, layers },
+            },
         );
         let existing = image.find_view(&info);
         if existing.is_valid() {
             return existing;
         }
 
-        let gpu_addr = image.gpu_addr;
         let image_info = image.info.clone();
         let view = ImageViewBase::new(&info, &image_info, image_id, gpu_addr);
         let view_id = self.slot_image_views.insert(view);
@@ -901,8 +974,8 @@ mod tests {
         };
         let view = cache.try_find_framebuffer_image_view(&config, 0x535B_5000);
         assert!(view.is_some());
-        assert_eq!(cache.slot_images.size(), 1);
-        assert_eq!(cache.slot_image_views.size(), 1);
+        assert_eq!(cache.slot_images.size(), 2);
+        assert_eq!(cache.slot_image_views.size(), 3);
     }
 
     #[test]

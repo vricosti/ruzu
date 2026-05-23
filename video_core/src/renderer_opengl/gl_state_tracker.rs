@@ -7,7 +7,333 @@
 //! Uses dirty flags indexed by the `Dirty` enum constants to selectively
 //! re-apply state per draw call.
 
+use std::ffi::c_void;
+use std::sync::OnceLock;
+
 use gl::types::{GLenum, GLuint};
+
+use crate::dirty_flags::{fill_block, setup_dirty_flags, DirtyTables};
+use crate::engines::maxwell_3d::{
+    ALPHA_TEST_ENABLED, ALPHA_TEST_FUNC, ALPHA_TEST_REF, ANTI_ALIAS_ALPHA_CONTROL, BLEND_BASE,
+    BLEND_COLOR_BASE, BLEND_PER_TARGET_BASE, BLEND_PER_TARGET_ENABLED, BLEND_PER_TARGET_STRIDE,
+    COLOR_MASK_BASE, COLOR_MASK_COMMON, CULL_FACE, CULL_TEST_ENABLE, DEPTH_BIAS,
+    DEPTH_BIAS_CLAMP, DEPTH_MODE, DEPTH_TEST_ENABLE, DEPTH_TEST_FUNC, DEPTH_WRITE_ENABLE,
+    FILL_VIA_TRIANGLE_MODE, FRAG_COLOR_CLAMP, FRAMEBUFFER_SRGB, FRONT_FACE, LINE_ANTI_ALIAS_ENABLE,
+    LINE_WIDTH_ALIASED, LINE_WIDTH_SMOOTH, LOGIC_OP, LOGIC_OP_WORDS, NUM_VERTEX_ATTRIBS, POINT_SIZE,
+    POINT_SIZE_ATTRIBUTE, POINT_SPRITE_ENABLE, POLYGON_MODE_BACK, POLYGON_MODE_FRONT,
+    POLYGON_OFFSET_FILL_ENABLE, POLYGON_OFFSET_LINE_ENABLE, POLYGON_OFFSET_POINT_ENABLE,
+    PRIMITIVE_RESTART_BASE, PRIMITIVE_RESTART_WORDS, RASTERIZE_ENABLE, SCISSOR_BASE,
+    SCISSOR_STRIDE, SLOPE_SCALE_DEPTH_BIAS, STENCIL_BACK_FUNC_MASK, STENCIL_BACK_MASK,
+    STENCIL_BACK_OP_BASE, STENCIL_BACK_REF, STENCIL_ENABLE, STENCIL_FRONT_FUNC_MASK,
+    STENCIL_FRONT_MASK, STENCIL_FRONT_OP_BASE, STENCIL_FRONT_REF, STENCIL_TWO_SIDE_ENABLE,
+    USER_CLIP_ENABLE, VERTEX_ATTRIB_BASE, VERTEX_STREAM_BASE, VERTEX_STREAM_INSTANCE_BASE,
+    VERTEX_STREAM_STRIDE, VIEWPORT_BASE, VIEWPORT_CLIP_CONTROL, VIEWPORT_SCALE_OFFSET_ENABLED,
+    VIEWPORT_STRIDE, VP_TRANSFORM_BASE, VP_TRANSFORM_STRIDE, WINDOW_ORIGIN,
+};
+
+type GlMaterialfv = unsafe extern "system" fn(GLenum, GLenum, *const f32);
+
+const GL_AMBIENT: GLenum = 0x1200;
+
+static GL_MATERIALFV: OnceLock<Option<GlMaterialfv>> = OnceLock::new();
+
+fn set_table(table: &mut [u8], offset: u32, dirty_index: u8) {
+    if let Some(entry) = table.get_mut(offset as usize) {
+        *entry = dirty_index;
+    }
+}
+
+fn setup_dirty_color_masks(tables: &mut DirtyTables) {
+    const NUM_RENDER_TARGETS: usize = 8;
+    set_table(&mut tables[0], COLOR_MASK_COMMON, dirty::COLOR_MASK_COMMON);
+    for rt in 0..NUM_RENDER_TARGETS {
+        fill_block(
+            &mut tables[0],
+            COLOR_MASK_BASE as usize + rt,
+            1,
+            dirty::COLOR_MASK_0 + rt as u8,
+        );
+    }
+    fill_block(
+        &mut tables[1],
+        COLOR_MASK_BASE as usize,
+        NUM_RENDER_TARGETS,
+        dirty::COLOR_MASKS,
+    );
+}
+
+fn setup_dirty_vertex_instances(tables: &mut DirtyTables) {
+    const NUM_VERTEX_ARRAYS: usize = 32;
+    const INSTANCE_BASE_OFFSET: usize = 3;
+    for index in 0..NUM_VERTEX_ARRAYS {
+        let array_offset =
+            VERTEX_STREAM_BASE as usize + index * VERTEX_STREAM_STRIDE as usize;
+        let instance_array_offset = array_offset + INSTANCE_BASE_OFFSET;
+        let dirty_index = dirty::VERTEX_INSTANCE_0 + index as u8;
+        set_table(&mut tables[0], instance_array_offset as u32, dirty_index);
+        set_table(&mut tables[1], instance_array_offset as u32, dirty::VERTEX_INSTANCES);
+
+        let instance_offset = VERTEX_STREAM_INSTANCE_BASE as usize + index;
+        set_table(&mut tables[0], instance_offset as u32, dirty_index);
+        set_table(&mut tables[1], instance_offset as u32, dirty::VERTEX_INSTANCES);
+    }
+}
+
+fn setup_dirty_vertex_format(tables: &mut DirtyTables) {
+    for index in 0..NUM_VERTEX_ATTRIBS as usize {
+        fill_block(
+            &mut tables[0],
+            VERTEX_ATTRIB_BASE as usize + index,
+            1,
+            dirty::VERTEX_FORMAT_0 + index as u8,
+        );
+    }
+    fill_block(
+        &mut tables[1],
+        VERTEX_ATTRIB_BASE as usize,
+        NUM_VERTEX_ATTRIBS as usize,
+        dirty::VERTEX_FORMATS,
+    );
+}
+
+fn setup_dirty_viewports(tables: &mut DirtyTables) {
+    const NUM_VIEWPORTS: usize = 16;
+    for index in 0..NUM_VIEWPORTS {
+        let transform_offset = VP_TRANSFORM_BASE as usize + index * VP_TRANSFORM_STRIDE as usize;
+        let viewport_offset = VIEWPORT_BASE as usize + index * VIEWPORT_STRIDE as usize;
+        fill_block(
+            &mut tables[0],
+            transform_offset,
+            VP_TRANSFORM_STRIDE as usize,
+            dirty::VIEWPORT_0 + index as u8,
+        );
+        fill_block(
+            &mut tables[0],
+            viewport_offset,
+            VIEWPORT_STRIDE as usize,
+            dirty::VIEWPORT_0 + index as u8,
+        );
+    }
+    fill_block(
+        &mut tables[1],
+        VP_TRANSFORM_BASE as usize,
+        NUM_VIEWPORTS * VP_TRANSFORM_STRIDE as usize,
+        dirty::VIEWPORTS,
+    );
+    fill_block(
+        &mut tables[1],
+        VIEWPORT_BASE as usize,
+        NUM_VIEWPORTS * VIEWPORT_STRIDE as usize,
+        dirty::VIEWPORTS,
+    );
+    set_table(
+        &mut tables[0],
+        VIEWPORT_SCALE_OFFSET_ENABLED,
+        dirty::VIEWPORT_TRANSFORM,
+    );
+    set_table(
+        &mut tables[1],
+        VIEWPORT_SCALE_OFFSET_ENABLED,
+        dirty::VIEWPORTS,
+    );
+}
+
+fn setup_dirty_scissors(tables: &mut DirtyTables) {
+    const NUM_VIEWPORTS: usize = 16;
+    for index in 0..NUM_VIEWPORTS {
+        let offset = SCISSOR_BASE as usize + index * SCISSOR_STRIDE as usize;
+        fill_block(
+            &mut tables[0],
+            offset,
+            SCISSOR_STRIDE as usize,
+            dirty::SCISSOR_0 + index as u8,
+        );
+    }
+    fill_block(
+        &mut tables[1],
+        SCISSOR_BASE as usize,
+        NUM_VIEWPORTS * SCISSOR_STRIDE as usize,
+        dirty::SCISSORS,
+    );
+}
+
+fn setup_dirty_polygon_modes(tables: &mut DirtyTables) {
+    set_table(&mut tables[0], POLYGON_MODE_FRONT, dirty::POLYGON_MODE_FRONT);
+    set_table(&mut tables[0], POLYGON_MODE_BACK, dirty::POLYGON_MODE_BACK);
+    set_table(&mut tables[1], POLYGON_MODE_FRONT, dirty::POLYGON_MODES);
+    set_table(&mut tables[1], POLYGON_MODE_BACK, dirty::POLYGON_MODES);
+    set_table(&mut tables[0], FILL_VIA_TRIANGLE_MODE, dirty::POLYGON_MODES);
+}
+
+fn setup_dirty_depth_test(tables: &mut DirtyTables) {
+    set_table(&mut tables[0], DEPTH_TEST_ENABLE, dirty::DEPTH_TEST);
+    set_table(&mut tables[0], DEPTH_WRITE_ENABLE, dirty::DEPTH_MASK);
+    set_table(&mut tables[0], DEPTH_TEST_FUNC, dirty::DEPTH_TEST);
+}
+
+fn setup_dirty_stencil_test(tables: &mut DirtyTables) {
+    const STENCIL_OP_WORDS: usize = 4;
+    let offsets = [
+        STENCIL_ENABLE,
+        STENCIL_FRONT_OP_BASE,
+        STENCIL_FRONT_OP_BASE + 1,
+        STENCIL_FRONT_OP_BASE + 2,
+        STENCIL_FRONT_OP_BASE + 3,
+        STENCIL_FRONT_REF,
+        STENCIL_FRONT_FUNC_MASK,
+        STENCIL_FRONT_MASK,
+        STENCIL_TWO_SIDE_ENABLE,
+        STENCIL_BACK_OP_BASE,
+        STENCIL_BACK_OP_BASE + 1,
+        STENCIL_BACK_OP_BASE + 2,
+        STENCIL_BACK_OP_BASE + 3,
+        STENCIL_BACK_REF,
+        STENCIL_BACK_FUNC_MASK,
+        STENCIL_BACK_MASK,
+    ];
+    debug_assert_eq!(STENCIL_OP_WORDS, 4);
+    for offset in offsets {
+        set_table(&mut tables[0], offset, dirty::STENCIL_TEST);
+    }
+}
+
+fn setup_dirty_alpha_test(tables: &mut DirtyTables) {
+    set_table(&mut tables[0], ALPHA_TEST_REF, dirty::ALPHA_TEST);
+    set_table(&mut tables[0], ALPHA_TEST_FUNC, dirty::ALPHA_TEST);
+    set_table(&mut tables[0], ALPHA_TEST_ENABLED, dirty::ALPHA_TEST);
+}
+
+fn setup_dirty_blend(tables: &mut DirtyTables) {
+    const NUM_RENDER_TARGETS: usize = 8;
+    const BLEND_COLOR_WORDS: usize = 4;
+    const BLEND_WORDS: usize = 16;
+    fill_block(
+        &mut tables[0],
+        BLEND_COLOR_BASE as usize,
+        BLEND_COLOR_WORDS,
+        dirty::BLEND_COLOR,
+    );
+    set_table(
+        &mut tables[0],
+        BLEND_PER_TARGET_ENABLED,
+        dirty::BLEND_INDEPENDENT_ENABLED,
+    );
+    for index in 0..NUM_RENDER_TARGETS {
+        let offset = BLEND_PER_TARGET_BASE as usize + index * BLEND_PER_TARGET_STRIDE as usize;
+        fill_block(
+            &mut tables[0],
+            offset,
+            BLEND_PER_TARGET_STRIDE as usize,
+            dirty::BLEND_STATE_0 + index as u8,
+        );
+        set_table(
+            &mut tables[0],
+            BLEND_BASE + 9 + index as u32,
+            dirty::BLEND_STATE_0 + index as u8,
+        );
+    }
+    fill_block(
+        &mut tables[1],
+        BLEND_PER_TARGET_BASE as usize,
+        NUM_RENDER_TARGETS * BLEND_PER_TARGET_STRIDE as usize,
+        dirty::BLEND_STATES,
+    );
+    fill_block(
+        &mut tables[1],
+        BLEND_BASE as usize,
+        BLEND_WORDS,
+        dirty::BLEND_STATES,
+    );
+}
+
+fn setup_dirty_primitive_restart(tables: &mut DirtyTables) {
+    fill_block(
+        &mut tables[0],
+        PRIMITIVE_RESTART_BASE as usize,
+        PRIMITIVE_RESTART_WORDS as usize,
+        dirty::PRIMITIVE_RESTART,
+    );
+}
+
+fn setup_dirty_polygon_offset(tables: &mut DirtyTables) {
+    set_table(
+        &mut tables[0],
+        POLYGON_OFFSET_FILL_ENABLE,
+        dirty::POLYGON_OFFSET,
+    );
+    set_table(
+        &mut tables[0],
+        POLYGON_OFFSET_LINE_ENABLE,
+        dirty::POLYGON_OFFSET,
+    );
+    set_table(
+        &mut tables[0],
+        POLYGON_OFFSET_POINT_ENABLE,
+        dirty::POLYGON_OFFSET,
+    );
+    set_table(&mut tables[0], SLOPE_SCALE_DEPTH_BIAS, dirty::POLYGON_OFFSET);
+    set_table(&mut tables[0], DEPTH_BIAS, dirty::POLYGON_OFFSET);
+    set_table(&mut tables[0], DEPTH_BIAS_CLAMP, dirty::POLYGON_OFFSET);
+}
+
+fn setup_dirty_multisample_control(tables: &mut DirtyTables) {
+    const ANTI_ALIAS_ALPHA_CONTROL_WORDS: usize = 1;
+    fill_block(
+        &mut tables[0],
+        ANTI_ALIAS_ALPHA_CONTROL as usize,
+        ANTI_ALIAS_ALPHA_CONTROL_WORDS,
+        dirty::MULTISAMPLE_CONTROL,
+    );
+}
+
+fn setup_dirty_rasterize_enable(tables: &mut DirtyTables) {
+    set_table(&mut tables[0], RASTERIZE_ENABLE, dirty::RASTERIZE_ENABLE);
+}
+
+fn setup_dirty_framebuffer_srgb(tables: &mut DirtyTables) {
+    set_table(&mut tables[0], FRAMEBUFFER_SRGB, dirty::FRAMEBUFFER_SRGB);
+}
+
+fn setup_dirty_logic_op(tables: &mut DirtyTables) {
+    fill_block(
+        &mut tables[0],
+        LOGIC_OP as usize,
+        LOGIC_OP_WORDS as usize,
+        dirty::LOGIC_OP,
+    );
+}
+
+fn setup_dirty_fragment_clamp_color(tables: &mut DirtyTables) {
+    set_table(&mut tables[0], FRAG_COLOR_CLAMP, dirty::FRAGMENT_CLAMP_COLOR);
+}
+
+fn setup_dirty_point_size(tables: &mut DirtyTables) {
+    set_table(&mut tables[0], POINT_SIZE_ATTRIBUTE, dirty::POINT_SIZE);
+    set_table(&mut tables[0], POINT_SIZE, dirty::POINT_SIZE);
+    set_table(&mut tables[0], POINT_SPRITE_ENABLE, dirty::POINT_SIZE);
+}
+
+fn setup_dirty_line_width(tables: &mut DirtyTables) {
+    set_table(&mut tables[0], LINE_WIDTH_SMOOTH, dirty::LINE_WIDTH);
+    set_table(&mut tables[0], LINE_WIDTH_ALIASED, dirty::LINE_WIDTH);
+    set_table(&mut tables[0], LINE_ANTI_ALIAS_ENABLE, dirty::LINE_WIDTH);
+}
+
+fn setup_dirty_clip_control(tables: &mut DirtyTables) {
+    set_table(&mut tables[0], WINDOW_ORIGIN, dirty::CLIP_CONTROL);
+    set_table(&mut tables[0], DEPTH_MODE, dirty::CLIP_CONTROL);
+}
+
+fn setup_dirty_depth_clamp_enabled(tables: &mut DirtyTables) {
+    set_table(&mut tables[0], VIEWPORT_CLIP_CONTROL, dirty::DEPTH_CLAMP_ENABLED);
+}
+
+fn setup_dirty_misc(tables: &mut DirtyTables) {
+    set_table(&mut tables[0], USER_CLIP_ENABLE, dirty::CLIP_DISTANCES);
+    set_table(&mut tables[0], FRONT_FACE, dirty::FRONT_FACE);
+    set_table(&mut tables[0], CULL_TEST_ENABLE, dirty::CULL_TEST);
+    set_table(&mut tables[0], CULL_FACE, dirty::CULL_TEST);
+}
 
 // ---------------------------------------------------------------------------
 // Dirty flag indices — port of OpenGL::Dirty enum
@@ -19,13 +345,13 @@ use gl::types::{GLenum, GLuint};
 /// flags continue from `First`.
 pub mod dirty {
     // Common entries (from VideoCommon::Dirty, shared with Vulkan)
-    pub const RENDER_TARGETS: u8 = 0;
-    pub const VERTEX_BUFFERS: u8 = 10;
-    pub const VERTEX_BUFFER_0: u8 = 11;
-    pub const RESCALE_VIEWPORTS: u8 = 43;
-    pub const RESCALE_SCISSORS: u8 = 44;
-    pub const DEPTH_BIAS_GLOBAL: u8 = 45;
-    pub const LAST_COMMON_ENTRY: u8 = 46;
+    pub const RENDER_TARGETS: u8 = crate::dirty_flags::flags::RENDER_TARGETS;
+    pub const VERTEX_BUFFERS: u8 = crate::dirty_flags::flags::VERTEX_BUFFERS;
+    pub const VERTEX_BUFFER_0: u8 = crate::dirty_flags::flags::VERTEX_BUFFER0;
+    pub const RESCALE_VIEWPORTS: u8 = crate::dirty_flags::flags::RESCALE_VIEWPORTS;
+    pub const RESCALE_SCISSORS: u8 = crate::dirty_flags::flags::RESCALE_SCISSORS;
+    pub const DEPTH_BIAS_GLOBAL: u8 = crate::dirty_flags::flags::DEPTH_BIAS_GLOBAL;
+    pub const LAST_COMMON_ENTRY: u8 = crate::dirty_flags::flags::LAST_COMMON_ENTRY;
 
     // OpenGL-specific entries
     pub const FIRST: u8 = LAST_COMMON_ENTRY;
@@ -128,6 +454,49 @@ impl StateTracker {
         }
     }
 
+    /// Load compatibility-profile fixed-function entry points that the generated
+    /// `gl` bindings omit. Upstream keeps GLSL Y direction dynamic through
+    /// `glMaterialfv(GL_FRONT, GL_AMBIENT, ...)`.
+    pub fn load_compat_functions<F>(mut load_fn: F)
+    where
+        F: FnMut(&'static str) -> *const c_void,
+    {
+        let ptr = load_fn("glMaterialfv");
+        let func = if ptr.is_null() {
+            None
+        } else {
+            Some(unsafe { std::mem::transmute::<*const c_void, GlMaterialfv>(ptr) })
+        };
+        let _ = GL_MATERIALFV.set(func);
+    }
+
+    /// Port of `StateTracker::SetupTables`.
+    pub fn setup_tables(tables: &mut DirtyTables) {
+        setup_dirty_flags(tables);
+        setup_dirty_color_masks(tables);
+        setup_dirty_viewports(tables);
+        setup_dirty_scissors(tables);
+        setup_dirty_vertex_instances(tables);
+        setup_dirty_vertex_format(tables);
+        setup_dirty_polygon_modes(tables);
+        setup_dirty_depth_test(tables);
+        setup_dirty_stencil_test(tables);
+        setup_dirty_alpha_test(tables);
+        setup_dirty_blend(tables);
+        setup_dirty_primitive_restart(tables);
+        setup_dirty_polygon_offset(tables);
+        setup_dirty_multisample_control(tables);
+        setup_dirty_rasterize_enable(tables);
+        setup_dirty_framebuffer_srgb(tables);
+        setup_dirty_logic_op(tables);
+        setup_dirty_fragment_clamp_color(tables);
+        setup_dirty_point_size(tables);
+        setup_dirty_line_width(tables);
+        setup_dirty_clip_control(tables);
+        setup_dirty_depth_clamp_enabled(tables);
+        setup_dirty_misc(tables);
+    }
+
     /// Port of `StateTracker::BindIndexBuffer`.
     pub fn bind_index_buffer(&mut self, new_index_buffer: GLuint) {
         if self.index_buffer == new_index_buffer {
@@ -165,16 +534,17 @@ impl StateTracker {
     /// Port of `StateTracker::SetYNegate`.
     ///
     /// Upstream maps Y_NEGATE to `gl_FrontMaterial.ambient.a` via `glMaterialfv`.
-    /// The `gl` crate may not expose the legacy fixed-function `glMaterialfv`;
-    /// if unavailable we store the flag and let the shader uniform path handle it.
     pub fn set_y_negate(&mut self, new_y_negate: bool) {
         if new_y_negate == self.y_negate {
             return;
         }
         self.y_negate = new_y_negate;
-        // Legacy GL path: glMaterialfv(GL_FRONT, GL_AMBIENT, [0,0,0, y_negate ? -1 : 1])
-        // Skipped here because the gl crate does not expose glMaterialfv.
-        // The y_negate value is tracked and can be forwarded to shaders via uniforms.
+        let ambient = [0.0f32, 0.0, 0.0, if self.y_negate { -1.0 } else { 1.0 }];
+        if let Some(Some(materialfv)) = GL_MATERIALFV.get() {
+            unsafe {
+                materialfv(gl::FRONT, GL_AMBIENT, ambient.as_ptr());
+            }
+        }
     }
 
     /// Returns the current Y-negate state.
@@ -377,5 +747,87 @@ mod tests {
         for i in dirty::VIEWPORT_0..=dirty::VIEWPORT_15 {
             assert!(tracker.is_dirty(i));
         }
+    }
+
+    #[test]
+    fn set_y_negate_updates_cached_value_without_loaded_compat_function() {
+        let mut tracker = StateTracker::new();
+        assert!(!tracker.y_negate());
+        tracker.set_y_negate(true);
+        assert!(tracker.y_negate());
+        tracker.set_y_negate(false);
+        assert!(!tracker.y_negate());
+    }
+
+    #[test]
+    fn setup_tables_marks_upstream_opengl_dirty_ranges() {
+        let mut tables = [
+            vec![crate::dirty_flags::flags::NULL_ENTRY; crate::engines::ENGINE_REG_COUNT],
+            vec![crate::dirty_flags::flags::NULL_ENTRY; crate::engines::ENGINE_REG_COUNT],
+        ];
+
+        StateTracker::setup_tables(&mut tables);
+
+        assert_eq!(dirty::FIRST, crate::dirty_flags::flags::LAST_COMMON_ENTRY);
+        assert_eq!(tables[0][COLOR_MASK_COMMON as usize], dirty::COLOR_MASK_COMMON);
+        assert_eq!(tables[0][COLOR_MASK_BASE as usize], dirty::COLOR_MASK_0);
+        assert_eq!(tables[1][COLOR_MASK_BASE as usize], dirty::COLOR_MASKS);
+        assert_eq!(
+            tables[0][VERTEX_STREAM_BASE as usize + 3],
+            dirty::VERTEX_INSTANCE_0
+        );
+        assert_eq!(
+            tables[0][VERTEX_STREAM_INSTANCE_BASE as usize],
+            dirty::VERTEX_INSTANCE_0
+        );
+        assert_eq!(tables[0][VERTEX_ATTRIB_BASE as usize], dirty::VERTEX_FORMAT_0);
+        assert_eq!(tables[1][VERTEX_ATTRIB_BASE as usize], dirty::VERTEX_FORMATS);
+        assert_eq!(tables[0][VP_TRANSFORM_BASE as usize], dirty::VIEWPORT_0);
+        assert_eq!(tables[1][VP_TRANSFORM_BASE as usize], dirty::VIEWPORTS);
+        assert_eq!(tables[0][VIEWPORT_BASE as usize], dirty::VIEWPORT_0);
+        assert_eq!(tables[1][VIEWPORT_BASE as usize], dirty::VIEWPORTS);
+        assert_eq!(tables[0][SCISSOR_BASE as usize], dirty::SCISSOR_0);
+        assert_eq!(tables[1][SCISSOR_BASE as usize], dirty::SCISSORS);
+        assert_eq!(tables[0][POLYGON_MODE_FRONT as usize], dirty::POLYGON_MODE_FRONT);
+        assert_eq!(tables[1][POLYGON_MODE_BACK as usize], dirty::POLYGON_MODES);
+        assert_eq!(tables[0][DEPTH_TEST_ENABLE as usize], dirty::DEPTH_TEST);
+        assert_eq!(tables[0][DEPTH_WRITE_ENABLE as usize], dirty::DEPTH_MASK);
+        assert_eq!(tables[0][STENCIL_ENABLE as usize], dirty::STENCIL_TEST);
+        assert_eq!(tables[0][ALPHA_TEST_ENABLED as usize], dirty::ALPHA_TEST);
+        assert_eq!(tables[0][BLEND_COLOR_BASE as usize], dirty::BLEND_COLOR);
+        assert_eq!(
+            tables[0][BLEND_PER_TARGET_ENABLED as usize],
+            dirty::BLEND_INDEPENDENT_ENABLED
+        );
+        assert_eq!(tables[0][BLEND_PER_TARGET_BASE as usize], dirty::BLEND_STATE_0);
+        assert_eq!(tables[1][BLEND_PER_TARGET_BASE as usize], dirty::BLEND_STATES);
+        assert_eq!(tables[0][PRIMITIVE_RESTART_BASE as usize], dirty::PRIMITIVE_RESTART);
+        assert_eq!(
+            tables[0][POLYGON_OFFSET_FILL_ENABLE as usize],
+            dirty::POLYGON_OFFSET
+        );
+        assert_eq!(
+            tables[0][POLYGON_OFFSET_LINE_ENABLE as usize],
+            dirty::POLYGON_OFFSET
+        );
+        assert_eq!(
+            tables[0][POLYGON_OFFSET_POINT_ENABLE as usize],
+            dirty::POLYGON_OFFSET
+        );
+        assert_eq!(tables[0][SLOPE_SCALE_DEPTH_BIAS as usize], dirty::POLYGON_OFFSET);
+        assert_eq!(tables[0][ANTI_ALIAS_ALPHA_CONTROL as usize], dirty::MULTISAMPLE_CONTROL);
+        assert_eq!(tables[0][RASTERIZE_ENABLE as usize], dirty::RASTERIZE_ENABLE);
+        assert_eq!(tables[0][FRAMEBUFFER_SRGB as usize], dirty::FRAMEBUFFER_SRGB);
+        assert_eq!(tables[0][LOGIC_OP as usize], dirty::LOGIC_OP);
+        assert_eq!(tables[0][LOGIC_OP as usize + 1], dirty::LOGIC_OP);
+        assert_eq!(tables[0][FRAG_COLOR_CLAMP as usize], dirty::FRAGMENT_CLAMP_COLOR);
+        assert_eq!(tables[0][POINT_SIZE as usize], dirty::POINT_SIZE);
+        assert_eq!(tables[0][LINE_WIDTH_SMOOTH as usize], dirty::LINE_WIDTH);
+        assert_eq!(tables[0][WINDOW_ORIGIN as usize], dirty::CLIP_CONTROL);
+        assert_eq!(tables[0][DEPTH_MODE as usize], dirty::CLIP_CONTROL);
+        assert_eq!(tables[0][VIEWPORT_CLIP_CONTROL as usize], dirty::DEPTH_CLAMP_ENABLED);
+        assert_eq!(tables[0][USER_CLIP_ENABLE as usize], dirty::CLIP_DISTANCES);
+        assert_eq!(tables[0][FRONT_FACE as usize], dirty::FRONT_FACE);
+        assert_eq!(tables[0][CULL_TEST_ENABLE as usize], dirty::CULL_TEST);
     }
 }

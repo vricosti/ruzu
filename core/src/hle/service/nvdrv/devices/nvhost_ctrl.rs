@@ -264,23 +264,14 @@ impl NvHostCtrl {
     }
 
     fn signal_event_from_slot(events: &Arc<Mutex<Vec<InternalEvent>>>, slot: u32) {
-        let owner_and_event = {
+        let readable_event = {
             let events_guard = events.lock().unwrap();
-            let event = &events_guard[slot as usize];
-            (
-                event
-                    .owner
-                    .as_ref()
-                    .and_then(|owner| Some((owner.process.upgrade()?, owner.scheduler.upgrade()?))),
-                event.readable_event.clone(),
-            )
+            events_guard[slot as usize].readable_event.clone()
         };
 
-        let (Some((_process, _scheduler)), Some(readable_event)) = owner_and_event else {
-            return;
-        };
-
-        readable_event.lock().unwrap().signal();
+        if let Some(readable_event) = readable_event {
+            readable_event.lock().unwrap().signal_from_host();
+        }
     }
 
     fn free_event_locked(
@@ -763,6 +754,30 @@ mod tests {
             let events = ctrl.events.lock().unwrap();
             assert_eq!(events[2].fails, 0);
         }
+
+        std::mem::forget(system);
+    }
+
+    #[test]
+    fn host_action_signal_is_latched_before_query_owner_registration() {
+        let system = System::new_for_test();
+        let events = Arc::new(EventInterface::new(SystemRef::from_ref(&system)));
+        let syncpoints = SyncpointManager::new();
+        let ctrl = NvHostCtrl::new(events, &syncpoints);
+
+        {
+            let mut events_guard = ctrl.events.lock().unwrap();
+            let mut mask = ctrl.events_mask.lock().unwrap();
+            ctrl.create_nv_event(&mut events_guard, &mut mask, 0);
+            events_guard[0].assigned_syncpt = 1;
+        }
+
+        NvHostCtrl::signal_event_from_slot(&ctrl.events, 0);
+
+        let readable = ctrl
+            .query_event(0)
+            .expect("registered NV event should be queryable");
+        assert!(readable.lock().unwrap().is_signaled());
 
         std::mem::forget(system);
     }

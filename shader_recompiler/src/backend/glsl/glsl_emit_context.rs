@@ -8,9 +8,10 @@
 
 use crate::backend::bindings::Bindings;
 use crate::ir;
+use crate::ir::attribute::Attribute;
 use crate::profile::Profile;
 use crate::runtime_info::RuntimeInfo;
-use crate::shader_info::{ImageFormat, TextureType};
+use crate::shader_info::{ImageFormat, Interpolation, TextureType};
 use crate::stage::Stage;
 
 use super::var_alloc::{glsl_type_str, GlslVarType, VarAlloc};
@@ -110,6 +111,21 @@ fn image_access_qualifier(is_written: bool, is_read: bool) -> &'static str {
     }
 }
 
+fn interp_decorator(interp: Interpolation) -> &'static str {
+    match interp {
+        Interpolation::Smooth => "",
+        Interpolation::Flat => "flat ",
+        Interpolation::NoPerspective => "noperspective ",
+    }
+}
+
+fn stores_per_vertex_attributes(stage: Stage) -> bool {
+    matches!(
+        stage,
+        Stage::VertexA | Stage::VertexB | Stage::Geometry | Stage::TessellationEval
+    )
+}
+
 impl<'a> EmitContext<'a> {
     pub fn new(
         program: &ir::Program,
@@ -134,7 +150,8 @@ impl<'a> EmitContext<'a> {
             num_safety_loop_vars: 0,
             uses_y_direction: false,
             uses_cc_carry: false,
-            uses_geometry_passthrough: false,
+            uses_geometry_passthrough: program.is_geometry_passthrough
+                && profile.support_geometry_shader_passthrough,
         };
 
         // Set GLSL version header
@@ -165,6 +182,8 @@ impl<'a> EmitContext<'a> {
             }
         }
 
+        ctx.setup_out_per_vertex(program);
+        ctx.setup_in_per_vertex(program);
         ctx.define_generic_inputs(program);
         ctx.define_generic_outputs(program);
         ctx.define_fragment_outputs(program);
@@ -309,6 +328,54 @@ impl<'a> EmitContext<'a> {
         }
     }
 
+    fn setup_out_per_vertex(&mut self, program: &ir::Program) {
+        if !stores_per_vertex_attributes(self.stage) || self.uses_geometry_passthrough {
+            return;
+        }
+        self.header.push_str("out gl_PerVertex{vec4 gl_Position;");
+        if program.info.stores.get(Attribute::PointSize as usize) {
+            self.header.push_str("float gl_PointSize;");
+        }
+        if program.info.stores.clip_distances() {
+            self.header.push_str("float gl_ClipDistance[];");
+        }
+        if program.info.stores.get(Attribute::ViewportIndex as usize)
+            && self.profile.support_viewport_index_layer_non_geometry
+            && self.stage != Stage::Geometry
+        {
+            self.header.push_str("int gl_ViewportIndex;");
+        }
+        self.header.push_str("};\n");
+        if program.info.stores.get(Attribute::ViewportIndex as usize)
+            && self.stage == Stage::Geometry
+        {
+            self.header.push_str("out int gl_ViewportIndex;\n");
+        }
+    }
+
+    fn setup_in_per_vertex(&mut self, program: &ir::Program) {
+        if self.stage != Stage::TessellationControl {
+            return;
+        }
+        let loads_position = program.info.loads.any_component(Attribute::PositionX as usize);
+        let loads_point_size = program.info.loads.get(Attribute::PointSize as usize);
+        let loads_clip_distance = program.info.loads.clip_distances();
+        if !(loads_position || loads_point_size || loads_clip_distance) {
+            return;
+        }
+        self.header.push_str("in gl_PerVertex{");
+        if loads_position {
+            self.header.push_str("vec4 gl_Position;");
+        }
+        if loads_point_size {
+            self.header.push_str("float gl_PointSize;");
+        }
+        if loads_clip_distance {
+            self.header.push_str("float gl_ClipDistance[];");
+        }
+        self.header.push_str("}gl_in[gl_MaxPatchVertices];\n");
+    }
+
     fn define_generic_inputs(&mut self, program: &ir::Program) {
         for index in 0..32usize {
             if !program.info.loads.generic_any(index)
@@ -317,8 +384,9 @@ impl<'a> EmitContext<'a> {
                 continue;
             }
             self.header.push_str(&format!(
-                "layout(location={})in vec4 in_attr{}{};\n",
+                "layout(location={}){}in vec4 in_attr{}{};\n",
                 index,
+                interp_decorator(program.info.interpolation[index]),
                 index,
                 self.input_array_decorator()
             ));
@@ -440,5 +508,47 @@ impl<'a> EmitContext<'a> {
         for index in 0..self.num_safety_loop_vars {
             header.push_str(&format!("int loop{}=0x2000;\n", index));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn vertex_stage_declares_out_per_vertex() {
+        let mut program = ir::Program::new(Stage::VertexB);
+        program
+            .info
+            .stores
+            .set(Attribute::PointSize as usize, true);
+        let mut bindings = Bindings::default();
+        let profile = Profile::default();
+        let runtime_info = RuntimeInfo::default();
+
+        let ctx = EmitContext::new(&program, &mut bindings, &profile, &runtime_info);
+
+        assert!(ctx.header.contains(
+            "out gl_PerVertex{vec4 gl_Position;float gl_PointSize;};"
+        ));
+    }
+
+    #[test]
+    fn generic_inputs_use_interpolation_decorator() {
+        let mut program = ir::Program::new(Stage::Fragment);
+        program.info.loads.set(Attribute::Generic0X as usize, true);
+        program.info.interpolation[0] = Interpolation::Flat;
+        let mut runtime_info = RuntimeInfo::default();
+        runtime_info
+            .previous_stage_stores
+            .set(Attribute::Generic0X as usize, true);
+        let mut bindings = Bindings::default();
+        let profile = Profile::default();
+
+        let ctx = EmitContext::new(&program, &mut bindings, &profile, &runtime_info);
+
+        assert!(ctx
+            .header
+            .contains("layout(location=0)flat in vec4 in_attr0;"));
     }
 }

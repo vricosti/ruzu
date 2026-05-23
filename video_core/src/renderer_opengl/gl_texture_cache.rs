@@ -14,7 +14,7 @@ use crate::shader_environment::TextureType;
 use crate::surface::PixelFormat;
 use crate::texture_cache::image_base::{ImageBase, ImageFlagBits, ImageMapView};
 use crate::texture_cache::image_info::ImageInfo;
-use crate::texture_cache::image_view_base::ImageViewBase;
+use crate::texture_cache::image_view_base::{ImageViewBase, ImageViewFlagBits};
 use crate::texture_cache::image_view_info::ImageViewInfo;
 use crate::texture_cache::texture_cache_base::{
     FramebufferImageView, TextureCacheBase as CommonTextureCache,
@@ -450,6 +450,14 @@ impl Image {
         let target = image_target(&base.info);
         let texture = make_image(&base.info, tuple.internal_format, gl_num_levels, target);
 
+        if std::env::var_os("RUZU_FORCE_MAX_LEVEL_0").is_some() && texture != 0 {
+            unsafe {
+                let actual_levels = (gl_num_levels - 1).max(0);
+                gl::TextureParameteri(texture, gl::TEXTURE_BASE_LEVEL, 0);
+                gl::TextureParameteri(texture, gl::TEXTURE_MAX_LEVEL, actual_levels);
+            }
+        }
+
         if std::env::var_os("RUZU_TRACE_IMAGE_LIFECYCLE").is_some() {
             let mut sample = [0u8; 16];
             if texture != 0 {
@@ -867,8 +875,29 @@ impl ImageView {
         view.is_render_target = true;
         view.supports_anisotropy = base.supports_anisotropy();
 
-        view.setup_view(TextureType::Color2D);
-        view.default_handle = view.handle_for_texture_type(TextureType::Color2D);
+        if base.flags.contains(ImageViewFlagBits::SLICE) {
+            view.full_range = SubresourceRange {
+                base: crate::texture_cache::types::SubresourceBase {
+                    level: base.range.base.level,
+                    layer: 0,
+                },
+                extent: crate::texture_cache::types::SubresourceExtent {
+                    levels: 1,
+                    layers: 1,
+                },
+            };
+            view.setup_view(TextureType::Color3D);
+        } else {
+            if base.view_type == ImageViewType::E2DArray {
+                view.flat_range.extent.layers = 1;
+            }
+            view.setup_view(TextureType::Color2D);
+            view.setup_view(TextureType::ColorArray2D);
+        }
+        view.default_handle = match base.view_type {
+            ImageViewType::E2DArray => view.handle_for_texture_type(TextureType::ColorArray2D),
+            _ => view.handle_for_texture_type(TextureType::Color2D),
+        };
         view
     }
 
@@ -1006,10 +1035,47 @@ impl ImageView {
                     view_range.base.layer as u32,
                     view_range.extent.layers as u32,
                 );
+                let view_err = gl::GetError();
                 gl::TextureParameteri(view, gl::TEXTURE_MIN_FILTER, gl::NEAREST as i32);
                 gl::TextureParameteri(view, gl::TEXTURE_MAG_FILTER, gl::NEAREST as i32);
                 gl::TextureParameteri(view, gl::TEXTURE_WRAP_S, gl::CLAMP_TO_EDGE as i32);
                 gl::TextureParameteri(view, gl::TEXTURE_WRAP_T, gl::CLAMP_TO_EDGE as i32);
+                if std::env::var_os("RUZU_PROBE_VIEW_STORAGE").is_some() {
+                    while gl::GetError() != gl::NO_ERROR {}
+                    let red: [u8; 4] = [0xAB, 0xCD, 0xEF, 0x42];
+                    gl::ClearTexImage(
+                        view,
+                        0,
+                        gl::RGBA,
+                        gl::UNSIGNED_BYTE,
+                        red.as_ptr() as *const _,
+                    );
+                    let clear_err = gl::GetError();
+                    let mut via_view = [0u8; 16];
+                    gl::GetTextureSubImage(
+                        view, 0, 0, 0, 0, 2, 2, 1,
+                        gl::RGBA, gl::UNSIGNED_BYTE,
+                        via_view.len() as i32,
+                        via_view.as_mut_ptr() as *mut _,
+                    );
+                    let view_read_err = gl::GetError();
+                    let mut via_parent = [0u8; 16];
+                    gl::GetTextureSubImage(
+                        self.original_texture, 0, 0, 0, 0, 2, 2, 1,
+                        gl::RGBA, gl::UNSIGNED_BYTE,
+                        via_parent.len() as i32,
+                        via_parent.as_mut_ptr() as *mut _,
+                    );
+                    let parent_read_err = gl::GetError();
+                    log::warn!(
+                        "[VIEW_PROBE] view={} parent={} target=0x{:X} view_format=0x{:X} range=lvl{}+{}/lyr{}+{} view_err=0x{:X} clear_err=0x{:X} via_view={:02X?} via_parent={:02X?} v_read_err=0x{:X} p_read_err=0x{:X}",
+                        view, self.original_texture, target, view_format,
+                        view_range.base.level, view_range.extent.levels,
+                        view_range.base.layer, view_range.extent.layers,
+                        view_err, clear_err, via_view, via_parent,
+                        view_read_err, parent_read_err,
+                    );
+                }
             }
         }
         view
@@ -1750,6 +1816,45 @@ impl TextureCache {
         }
     }
 
+    pub fn prepare_render_targets_from_draw_state(
+        &mut self,
+        draw_state: &crate::engines::draw_manager::DrawState,
+        mut read_gpu: Option<&mut dyn FnMut(u64, &mut [u8]) -> bool>,
+    ) {
+        let mut image_ids = Vec::new();
+        for &target in draw_state
+            .rt_control
+            .map
+            .iter()
+            .take(draw_state.rt_control.count.min(8) as usize)
+        {
+            let Some(rt) = draw_state.render_targets.get(target as usize) else {
+                continue;
+            };
+            if rt.address == 0 || rt.width == 0 || rt.height == 0 {
+                continue;
+            }
+            if let Some((image_id, _)) = self.base.slot_images.iter().find(|(_, image)| {
+                image.gpu_addr == rt.address
+                    && image.info.size.width == rt.width
+                    && image.info.size.height == rt.height
+                    && !image.image_view_ids.is_empty()
+            }) {
+                image_ids.push(image_id);
+            }
+        }
+
+        image_ids.sort_by_key(|id| id.index);
+        image_ids.dedup_by_key(|id| id.index);
+        for image_id in image_ids {
+            if let Some(reader) = read_gpu.as_deref_mut() {
+                self.prepare_image_with_gpu_reader(image_id, true, false, reader);
+            } else {
+                self.base.mark_modification_by_id(image_id);
+            }
+        }
+    }
+
     /// OpenGL-backed port of `TextureCache<P>::BlitImage` for the currently
     /// implemented framebuffer-blit path (`TextureCacheParams::FRAMEBUFFER_BLITS`).
     pub fn blit_image(
@@ -1931,8 +2036,12 @@ impl TextureCache {
             .image_views
             .entry(view_id)
             .or_insert_with(|| ImageView::new_color_2d(&view_base, backend_image));
-        let texture = backend_view.handle_for_texture_type(TextureType::Color2D);
-        if texture == 0 {
+        let attachment_texture = if view_base.flags.contains(ImageViewFlagBits::SLICE) {
+            backend_view.handle_for_texture_type(TextureType::Color3D)
+        } else {
+            backend_view.default_handle()
+        };
+        if attachment_texture == 0 {
             return None;
         }
         let framebuffer = self.framebuffers.entry(view_id).or_insert_with(|| {
@@ -1940,7 +2049,12 @@ impl TextureCache {
             unsafe {
                 gl::CreateFramebuffers(1, &mut framebuffer);
                 if framebuffer != 0 {
-                    gl::NamedFramebufferTexture(framebuffer, gl::COLOR_ATTACHMENT0, texture, 0);
+                    gl::NamedFramebufferTexture(
+                        framebuffer,
+                        gl::COLOR_ATTACHMENT0,
+                        attachment_texture,
+                        0,
+                    );
                     gl::NamedFramebufferDrawBuffer(framebuffer, gl::COLOR_ATTACHMENT0);
                     gl::NamedFramebufferReadBuffer(framebuffer, gl::COLOR_ATTACHMENT0);
                 }
@@ -2147,13 +2261,38 @@ impl TextureCache {
             return None;
         }
 
+        // EXPERIMENT: when MK8D wants to draw to flinger buffer #2 or #3
+        // (0x502570000 / 0x502DE0000), redirect to the FIRST flinger buffer
+        // (0x501D00000) to test the "late parent textures reject FS writes"
+        // hypothesis from [[mk8d-black-screen-2026-05-21-evening]]. If MK8D
+        // ends up rendering visible content when we redirect, the bug is in
+        // the late-created parent textures.
+        let force_first_flinger = std::env::var_os("RUZU_FBO_FORCE_FIRST_FLINGER").is_some();
+        let lookup_addr = if force_first_flinger
+            && (rt.address == 0x502570000 || rt.address == 0x502DE0000)
+        {
+            log::warn!(
+                "[FBO_FORCE_FIRST] redirecting RT gpu=0x{:X} → 0x501D00000",
+                rt.address
+            );
+            0x501D00000
+        } else {
+            rt.address
+        };
         let (image_id, image_base) = self.base.slot_images.iter().find(|(_, image)| {
-            image.gpu_addr == rt.address
+            image.gpu_addr == lookup_addr
                 && image.info.size.width == rt.width
                 && image.info.size.height == rt.height
                 && !image.image_view_ids.is_empty()
         })?;
-        let view_id = image_base.image_view_ids[0];
+        let image_id = image_id;
+        let image_base = image_base.clone();
+        let view_id = self
+            .base
+            .find_render_target_view_from_image(image_id, rt, lookup_addr);
+        if !view_id.is_valid() {
+            return None;
+        }
         if std::env::var_os("RUZU_TRACE_RT_FBO").is_some() {
             log::warn!(
                 "[RT_FBO] image={} view={} cpu=0x{:X} gpu=0x{:X} {}x{} num_views={}",
@@ -2171,29 +2310,62 @@ impl TextureCache {
         let backend_image = self
             .images
             .entry(image_id)
-            .or_insert_with(|| Image::from_base(image_base));
+            .or_insert_with(|| Image::from_base(&image_base));
         let backend_view = self
             .image_views
             .entry(view_id)
             .or_insert_with(|| ImageView::new_color_2d(&view_base, backend_image));
-        let texture = backend_view.handle_for_texture_type(TextureType::Color2D);
-        if texture == 0 {
+        let attachment_texture = if view_base.flags.contains(ImageViewFlagBits::SLICE) {
+            backend_view.handle_for_texture_type(TextureType::Color3D)
+        } else {
+            backend_view.default_handle()
+        };
+        if attachment_texture == 0 {
             return None;
         }
 
         let view_w = view_base.size.width as i32;
         let view_h = view_base.size.height as i32;
+        let parent_handle = backend_image.handle();
         let framebuffer = self.framebuffers.entry(view_id).or_insert_with(|| {
             let mut framebuffer = 0;
             unsafe {
                 gl::CreateFramebuffers(1, &mut framebuffer);
                 if framebuffer != 0 {
-                    gl::NamedFramebufferTexture(framebuffer, gl::COLOR_ATTACHMENT0, texture, 0);
+                    if std::env::var_os("RUZU_FBO_ATTACH_PARENT").is_some() && parent_handle != 0 {
+                        // Attach the parent TEXTURE_2D_ARRAY directly at layer 0
+                        gl::NamedFramebufferTextureLayer(framebuffer, gl::COLOR_ATTACHMENT0, parent_handle, 0, 0);
+                        log::warn!("[FBO_ATTACH_PARENT] fbo={} parent={} layer=0", framebuffer, parent_handle);
+                    } else {
+                        if view_base.flags.contains(ImageViewFlagBits::SLICE) {
+                            if view_base.range.extent.layers > 1 {
+                                gl::NamedFramebufferTexture(
+                                    framebuffer,
+                                    gl::COLOR_ATTACHMENT0,
+                                    attachment_texture,
+                                    0,
+                                );
+                            } else {
+                                gl::NamedFramebufferTextureLayer(
+                                    framebuffer,
+                                    gl::COLOR_ATTACHMENT0,
+                                    attachment_texture,
+                                    0,
+                                    view_base.range.base.layer,
+                                );
+                            }
+                        } else {
+                            gl::NamedFramebufferTexture(
+                                framebuffer,
+                                gl::COLOR_ATTACHMENT0,
+                                attachment_texture,
+                                0,
+                            );
+                        }
+                    }
                     // Upstream `Framebuffer::Framebuffer` (gl_texture_cache.cpp:1326)
                     // uses `glNamedFramebufferDrawBuffer` (direct state access)
-                    // and sets GL_FRAMEBUFFER_DEFAULT_WIDTH/HEIGHT. Match upstream
-                    // exactly so radeonsi's FBO-setup fast path sees the same call
-                    // sequence as zuyu produces.
+                    // and sets GL_FRAMEBUFFER_DEFAULT_WIDTH/HEIGHT.
                     gl::NamedFramebufferDrawBuffer(framebuffer, gl::COLOR_ATTACHMENT0);
                     gl::NamedFramebufferReadBuffer(framebuffer, gl::COLOR_ATTACHMENT0);
                     gl::NamedFramebufferParameteri(
@@ -2206,6 +2378,12 @@ impl TextureCache {
                         gl::FRAMEBUFFER_DEFAULT_HEIGHT,
                         view_h,
                     );
+                    if std::env::var_os("RUZU_FBO_INIT_CLEAR").is_some() {
+                        let init_color = [0.0f32, 0.0, 0.0, 1.0];
+                        gl::ClearNamedFramebufferfv(framebuffer, gl::COLOR, 0, init_color.as_ptr());
+                        gl::Finish();
+                        log::warn!("[FBO_INIT_CLEAR] fbo={} cleared to black", framebuffer);
+                    }
                 }
             }
             TextureCacheFramebuffer {
@@ -2345,7 +2523,7 @@ impl TextureCache {
                 view_id.index,
                 fbo,
                 attached,
-                texture,
+                attachment_texture,
                 backend_image.handle(),
                 atype,
                 alevel,
