@@ -247,8 +247,8 @@ pub fn create_thread(
                     .map(|t| t.lock().unwrap().get_thread_id())
                     .unwrap_or(0);
                 log::warn!(
-                    "[SVC_CREATE_THREAD] tid={} parent_tid={} entry=0x{:X} prio={} core={}",
-                    thread_id, parent_tid, entry_point, priority, core_id
+                    "[SVC_CREATE_THREAD] tid={} parent_tid={} entry=0x{:X} stack=0x{:X} prio={} core={}",
+                    thread_id, parent_tid, entry_point, stack_bottom, priority, core_id
                 );
             }
             RESULT_SUCCESS

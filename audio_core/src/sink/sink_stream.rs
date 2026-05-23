@@ -446,6 +446,43 @@ impl SinkStream {
             }
         }
 
+        // Defensive glitch-mute: when the audio renderer goes haywire (e.g.,
+        // MK8D's state-machine wedge leads to voice wave-buffer addresses
+        // pointing at freed/corrupt memory, producing samples saturated at
+        // i16::MIN), the output buffer fills with high-amplitude noise that
+        // sounds strident. Signature: hit i16::MIN AND >= 1% of samples
+        // saturated to ±i16::MIN/MAX. Legitimate loud audio rarely pegs to
+        // i16::MIN for >1% of samples in a single callback.
+        if output_buffer.len() >= 100 {
+            let mut hit_min = false;
+            let mut clipped = 0usize;
+            for &s in output_buffer.iter() {
+                if s == i16::MIN {
+                    hit_min = true;
+                }
+                if s == i16::MIN || s == i16::MAX {
+                    clipped += 1;
+                }
+            }
+            if hit_min && clipped * 100 / output_buffer.len() >= 1 {
+                for sample in output_buffer.iter_mut() {
+                    *sample = 0;
+                }
+                use std::sync::atomic::{AtomicU64, Ordering};
+                static MUTE_COUNT: AtomicU64 = AtomicU64::new(0);
+                let n = MUTE_COUNT.fetch_add(1, Ordering::Relaxed);
+                if n < 5 || n.is_power_of_two() {
+                    log::warn!(
+                        "[AUDIO_GLITCH_MUTE] #{} muted {}-sample buffer with {} saturated samples ({}%) — renderer producing garbage",
+                        n,
+                        output_buffer.len(),
+                        clipped,
+                        clipped * 100 / output_buffer.len()
+                    );
+                }
+            }
+        }
+
         if num_frames > 0 {
             let last_frame_start = (num_frames - 1) * frame_size;
             let copy_len = frame_size.min(MAX_CHANNELS);
