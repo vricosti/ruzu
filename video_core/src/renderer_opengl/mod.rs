@@ -133,7 +133,6 @@ pub enum OpenGLError {
 /// graphics context, and base renderer data.
 pub struct RendererOpenGL {
     device: Device,
-    state_tracker: Arc<parking_lot::Mutex<StateTracker>>,
     blit_screen: BlitScreen,
     rasterizer: RasterizerOpenGL,
     /// Graphics context for swap buffers / make current.
@@ -183,20 +182,16 @@ impl RendererOpenGL {
 
         // Query device capabilities
         let device = Device::new();
-        let state_tracker = Arc::new(parking_lot::Mutex::new(StateTracker::new()));
 
         // Initialize blit screen pipeline
         let blit_screen = BlitScreen::new().map_err(|e| OpenGLError::ShaderCompileFailed(e))?;
 
         // Initialize rasterizer with the shared MaxwellDeviceMemoryManager.
-        // Mirrors upstream RendererOpenGL ctor: rasterizer(emu_window, gpu,
-        // device_memory, device, program_manager, state_tracker).
-        let rasterizer = RasterizerOpenGL::new(
-            &device,
-            syncpoints,
-            device_memory,
-            Arc::clone(&state_tracker),
-        );
+        // Upstream stores `StateTracker state_tracker` by value on
+        // `RendererOpenGL` and injects a reference into `RasterizerOpenGL`;
+        // Rust cannot express member references, so ruzu lets the rasterizer
+        // own the tracker directly (see `RasterizerOpenGL::state_tracker_mut`).
+        let rasterizer = RasterizerOpenGL::new(&device, syncpoints, device_memory);
 
         // Set up initial GL state (matching zuyu's RendererOpenGL constructor)
         unsafe {
@@ -266,7 +261,6 @@ impl RendererOpenGL {
 
         Ok(Self {
             device,
-            state_tracker,
             blit_screen,
             rasterizer,
             context,
@@ -332,19 +326,19 @@ impl RendererOpenGL {
         // while upstream routes render-target state through StateTracker.
         // Invalidate before binding the window framebuffer so BindFramebuffer(0)
         // cannot be skipped because of a stale cached value.
-        let mut state_tracker = self.state_tracker.lock();
-        state_tracker.notify_framebuffer();
-        state_tracker.bind_framebuffer(0);
+        {
+            let state_tracker = self.rasterizer.state_tracker_mut();
+            state_tracker.notify_framebuffer();
+            state_tracker.bind_framebuffer(0);
+        }
         let phase_start = if profile { Some(Instant::now()) } else { None };
         self.blit_screen.draw_screen(
             framebuffers,
             &self.framebuffer_layout,
-            &mut state_tracker,
             &mut self.rasterizer,
             false,
             self.device_memory.as_ref(),
         );
-        drop(state_tracker);
         if let Some(start) = phase_start {
             PRESENT_DRAW_SCREEN_US.fetch_add(elapsed_us(start), Ordering::Relaxed);
         }

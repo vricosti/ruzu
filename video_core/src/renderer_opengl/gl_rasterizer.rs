@@ -877,13 +877,16 @@ pub struct RasterizerOpenGL {
     /// objects and is the entry point for the draw hot path.
     gl_shader_cache: OpenGLShaderCache,
     query_cache: QueryCache,
-    /// Shared reference to RendererOpenGL's state tracker.
+    /// State tracker owned by the rasterizer.
     ///
-    /// Upstream stores `StateTracker& state_tracker` in RasterizerOpenGL and
-    /// shares the same object with screen blit. ruzu mirrors that ownership
-    /// with an `Arc<Mutex<_>>`, keeping one authoritative tracker without a
-    /// raw self-reference inside `RendererOpenGL`.
-    state_tracker: Arc<parking_lot::Mutex<StateTracker>>,
+    /// Upstream stores `StateTracker& state_tracker` as a member reference in
+    /// `RasterizerOpenGL`, with the concrete `StateTracker` owned by value in
+    /// `RendererOpenGL`. Rust cannot express member references; instead the
+    /// rasterizer owns the tracker directly and `RendererOpenGL` accesses it
+    /// via [`Self::state_tracker_mut`]. This avoids the ABBA deadlock that the
+    /// previous `Arc<Mutex<StateTracker>>` introduced against `texture_cache`
+    /// (present took state_tracker -> texture_cache; draw took the reverse).
+    state_tracker: Box<StateTracker>,
     has_depth_buffer_float: bool,
     has_viewport_swizzle: bool,
     invalidate_gpu_cache_callback: Option<Arc<dyn Fn() + Send + Sync>>,
@@ -975,7 +978,6 @@ impl RasterizerOpenGL {
         device: &Device,
         syncpoints: Arc<SyncpointManager>,
         device_memory: Arc<crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager>,
-        state_tracker: Arc<parking_lot::Mutex<StateTracker>>,
     ) -> Self {
         let mut transient_vao: u32 = 0;
         unsafe {
@@ -1000,7 +1002,7 @@ impl RasterizerOpenGL {
             shader_cache: ShaderCache::new(device_memory),
             gl_shader_cache: OpenGLShaderCache::new(),
             query_cache: QueryCache::new(),
-            state_tracker,
+            state_tracker: Box::new(StateTracker::new()),
             has_depth_buffer_float: device.has_depth_buffer_float(),
             has_viewport_swizzle: device.has_viewport_swizzle(),
             invalidate_gpu_cache_callback: None,
@@ -1030,7 +1032,7 @@ impl RasterizerOpenGL {
             shader_cache: ShaderCache::default(),
             gl_shader_cache: OpenGLShaderCache::new(),
             query_cache: QueryCache::new(),
-            state_tracker: Arc::new(parking_lot::Mutex::new(StateTracker::new())),
+            state_tracker: Box::new(StateTracker::new()),
             has_depth_buffer_float: false,
             has_viewport_swizzle: false,
             invalidate_gpu_cache_callback: None,
@@ -1086,6 +1088,12 @@ impl RasterizerOpenGL {
 
     pub fn set_guest_memory_writer(&mut self, writer: GuestMemoryWriter) {
         self.texture_cache.set_guest_memory_writer(writer);
+    }
+
+    /// Mutable access to the rasterizer-owned state tracker. Matches upstream
+    /// `RendererOpenGL`'s direct access to `rasterizer.state_tracker` member.
+    pub fn state_tracker_mut(&mut self) -> &mut StateTracker {
+        &mut self.state_tracker
     }
 
     /// Port of `RasterizerOpenGL::AccelerateDisplay`.
@@ -1490,7 +1498,6 @@ impl RasterizerInterface for RasterizerOpenGL {
             info!("[RT] draw no framebuffer bound");
         }
 
-        let state_tracker = Arc::clone(&self.state_tracker);
         let step = Instant::now();
         let Some(pipeline) = self
             .gl_shader_cache
@@ -2517,10 +2524,9 @@ impl RasterizerInterface for RasterizerOpenGL {
         // (`new_for_test`, no GL context, placeholder pipelines) safe.
         let can_draw_gl = pipeline_has_programs && self.transient_vao != 0;
         if can_draw_gl {
-            let mut state_tracker = state_tracker.lock();
             sync_viewport(
                 &draw_view,
-                Some(&mut state_tracker),
+                Some(&mut *self.state_tracker),
                 self.has_depth_buffer_float,
                 self.has_viewport_swizzle,
             );
