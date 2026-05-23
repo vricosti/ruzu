@@ -1129,6 +1129,7 @@ mod tests {
 
         let handle = VideoGpuChannelHandle {
             gpu: &gpu as *const Gpu,
+            bind_id: 7,
             channel_state: channel_state.clone(),
         };
         handle.init_channel(0x1234);

@@ -1731,7 +1731,9 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
         drop(cs);
 
         let device_addr = binding.device_addr;
-        let size = if let Some(ref sizes) = ub_sizes {
+        let size = if std::env::var_os("RUZU_FORCE_FULL_UBO_RANGE").is_some() {
+            binding.size
+        } else if let Some(ref sizes) = ub_sizes {
             binding.size.min(sizes[stage][index as usize])
         } else {
             binding.size
@@ -2768,12 +2770,15 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
         unsafe {
             gl::CreateBuffers(1, &mut new_buffer.gpu_handle);
             if new_buffer.gpu_handle != 0 {
-                // GL_DYNAMIC_STORAGE_BIT allows glBufferSubData / glNamedBufferSubData.
-                gl::NamedBufferStorage(
+                // Upstream OpenGL `Buffer::Buffer` uses glNamedBufferData with
+                // GL_DYNAMIC_DRAW. This cache uploads through glNamedBufferSubData;
+                // do not allocate persistent storage unless the mapped path is
+                // actually ported.
+                gl::NamedBufferData(
                     new_buffer.gpu_handle,
                     size as isize,
                     std::ptr::null(),
-                    gl::DYNAMIC_STORAGE_BIT | gl::MAP_WRITE_BIT | gl::MAP_PERSISTENT_BIT,
+                    gl::DYNAMIC_DRAW,
                 );
             }
         }

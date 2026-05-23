@@ -3095,6 +3095,7 @@ mod tests {
             index: 0,
             address: 0x5000,
             stride: 8,
+            frequency: 0,
             enabled: true,
         }];
         draw.vertex_attribs = vec![VertexAttribInfo {
@@ -3720,6 +3721,7 @@ mod tests {
             index: 0,
             address: 0x5000,
             stride: 8,
+            frequency: 0,
             enabled: true,
         }];
         draw.vertex_attribs = vec![VertexAttribInfo {

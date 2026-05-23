@@ -185,7 +185,7 @@ impl<F: FenceBase + Send + 'static> FenceManager<F> {
                     &mut should_wait_async_flushes,
                     &mut is_fence_signaled,
                     None::<&mut fn(&F)>,
-                    &mut || {},
+                    &mut pop_async_flushes,
                 )
             });
         }
@@ -214,9 +214,7 @@ impl<F: FenceBase + Send + 'static> FenceManager<F> {
                 .expect("fence callback must be consumed once")();
         }
         let mut pre_operations = VecDeque::new();
-        if !self.has_async_check {
-            pop_async_flushes();
-        } else {
+        if self.has_async_check {
             pre_operations.push_back(Box::new(move || pop_async_flushes()) as Operation);
         }
 

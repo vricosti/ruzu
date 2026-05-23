@@ -133,7 +133,7 @@ pub enum OpenGLError {
 /// graphics context, and base renderer data.
 pub struct RendererOpenGL {
     device: Device,
-    state_tracker: StateTracker,
+    state_tracker: Box<StateTracker>,
     blit_screen: BlitScreen,
     rasterizer: RasterizerOpenGL,
     /// Graphics context for swap buffers / make current.
@@ -166,7 +166,7 @@ impl RendererOpenGL {
     ///
     /// Upstream: `RendererOpenGL::RendererOpenGL(telemetry, emu_window, device_memory, gpu, context)`
     pub fn new<F>(
-        load_fn: F,
+        mut load_fn: F,
         syncpoints: Arc<SyncpointManager>,
         device_memory: Arc<crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager>,
         mut context: Box<dyn GraphicsContext + Send>,
@@ -177,11 +177,12 @@ impl RendererOpenGL {
         context.make_current();
 
         // Load GL function pointers
-        gl::load_with(load_fn);
+        gl::load_with(&mut load_fn);
+        StateTracker::load_compat_functions(load_fn);
 
         // Query device capabilities
         let device = Device::new();
-        let state_tracker = StateTracker::new();
+        let mut state_tracker = Box::new(StateTracker::new());
 
         // Initialize blit screen pipeline
         let blit_screen = BlitScreen::new().map_err(|e| OpenGLError::ShaderCompileFailed(e))?;
@@ -189,7 +190,12 @@ impl RendererOpenGL {
         // Initialize rasterizer with the shared MaxwellDeviceMemoryManager.
         // Mirrors upstream RendererOpenGL ctor: rasterizer(emu_window, gpu,
         // device_memory, device, program_manager, state_tracker).
-        let rasterizer = RasterizerOpenGL::new(&device, syncpoints, device_memory);
+        let rasterizer = RasterizerOpenGL::new(
+            &device,
+            syncpoints,
+            device_memory,
+            state_tracker.as_mut() as *mut StateTracker,
+        );
 
         // Set up initial GL state (matching zuyu's RendererOpenGL constructor)
         unsafe {
@@ -331,7 +337,7 @@ impl RendererOpenGL {
         self.blit_screen.draw_screen(
             framebuffers,
             &self.framebuffer_layout,
-            &mut self.state_tracker,
+            self.state_tracker.as_mut(),
             &mut self.rasterizer,
             false,
             self.device_memory.as_ref(),

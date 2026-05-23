@@ -403,11 +403,17 @@ impl SinkStream {
         while frames_written < num_frames {
             if self.playing_buffer.consumed || self.playing_buffer.frames == 0 {
                 let Some(buffer) = self.queue.pop_front() else {
-                    for frame in frames_written..num_frames {
-                        let base = frame * frame_size;
-                        let copy_len = frame_size.min(MAX_CHANNELS);
-                        output_buffer[base..base + copy_len]
-                            .copy_from_slice(&self.last_frame[..copy_len]);
+                    // Buffer-level underrun (no buffers in queue): fill remaining
+                    // output with silence rather than replicating `last_frame`.
+                    // Replicating `last_frame` across many missing frames produces
+                    // a sustained DC tone / strident warble (user-reported "modem
+                    // sound" when the audio renderer can't keep up with the host
+                    // callback rate). Matches the sample-level underrun fix in
+                    // commit b407b8b which made the same change.
+                    let base = frames_written * frame_size;
+                    let remaining = (num_frames - frames_written) * frame_size;
+                    for sample in &mut output_buffer[base..base + remaining] {
+                        *sample = 0;
                     }
                     break;
                 };

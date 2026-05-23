@@ -784,7 +784,8 @@ fn main() {
         //   gpu->BindRenderer(renderer);
         let system_ref = ruzu_core::core::SystemRef::from_ref(&system);
         let use_async_gpu =
-            *common::settings::values().use_asynchronous_gpu_emulation.get_value();
+            *common::settings::values().use_asynchronous_gpu_emulation.get_value()
+                && std::env::var_os("RUZU_DISABLE_ASYNC_GPU").is_none();
         let gpu = Box::new(video_core::gpu::Gpu::new(use_async_gpu, true));
         gpu.set_system_ref(system_ref);
         let gpu_ptr = gpu.as_ref() as *const video_core::gpu::Gpu as usize;
@@ -1068,6 +1069,17 @@ fn main() {
     // Step 8 (upstream): system.Run()
     // Starts CPU threads running in background via CpuManager.
     // -----------------------------------------------------------------------
+    // RUZU_BOOT_DELAY_MS=NNN: Diagnostic — sleep before starting the guest CPU
+    // threads. Investigating MK8D wedge per
+    // project_mk8d_lost_wakeup_cv_69a545ac_2026_05_21: ruzu starts tid=75
+    // ~595ms earlier than zuyu, causing pthread_create-child to skip the
+    // wait branch (state=READY already set by parent before child runs).
+    if let Ok(ms_str) = std::env::var("RUZU_BOOT_DELAY_MS") {
+        if let Ok(ms) = ms_str.parse::<u64>() {
+            log::info!("RUZU_BOOT_DELAY_MS={ms} — sleeping before system.run()");
+            std::thread::sleep(std::time::Duration::from_millis(ms));
+        }
+    }
     system.run();
 
     // -----------------------------------------------------------------------

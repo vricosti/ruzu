@@ -369,6 +369,36 @@ fn send_sync_request_impl(
     }
     record_phase("07_send_reply", &mut phase_last);
 
+    // RUZU_RESCHEDULE_AFTER_IPC=1 — Quick experiment for MK8D wedge investigation
+    // (project_mk8d_lost_wakeup_cv_69a545ac_2026_05_21). Upstream's
+    // KServerSession::OnRequest transitions the caller through ThreadState::WAITING
+    // during the IPC (via BeginWait inside KScopedSchedulerLock), which causes the
+    // scheduler to dispatch other RUNNABLE threads of equal-or-lower priority on
+    // the same core when the lock drops. ruzu's HLE IPC path runs synchronously
+    // with no thread state transition, so the scheduler is never invoked between
+    // SVCs. This experimental knob calls reschedule_current_core() at the end of
+    // each HLE IPC to give the scheduler a chance to dispatch waiting threads.
+    if std::env::var_os("RUZU_RESCHEDULE_AFTER_IPC").is_some() {
+        if let Some(kernel) = system.kernel() {
+            if let Some(scheduler) = kernel.current_scheduler() {
+                let sched_ptr = {
+                    let guard = scheduler.lock().unwrap();
+                    &*guard as *const crate::hle::kernel::k_scheduler::KScheduler
+                        as *mut crate::hle::kernel::k_scheduler::KScheduler
+                };
+                // preempt_single_core yields to the scheduler fiber and lets it
+                // pick the next runnable thread. Mirrors upstream's preemption
+                // tick behavior (RotateScheduledQueue) but on every HLE IPC
+                // rather than every 10ms. Heavy-handed but tests whether giving
+                // the scheduler an opportunity to run other threads is what we
+                // need for the MK8D tid=86 dispatch race.
+                unsafe {
+                    (*sched_ptr).preempt_single_core();
+                }
+            }
+        }
+    }
+
     if result == crate::hle::service::ipc_helpers::RESULT_SESSION_CLOSED {
         return RESULT_SUCCESS;
     }

@@ -154,6 +154,16 @@ impl<T: Copy + PartialEq + Default> DescriptorTable<T> {
         self.current_limit
     }
 
+    /// Read the currently-cached descriptor for `index` (without re-reading
+    /// guest memory). Returns None if the descriptor has never been read.
+    pub fn cached(&self, index: u32) -> Option<&T> {
+        if (index as usize) < self.descriptors.len() && self.is_descriptor_read(index) {
+            Some(&self.descriptors[index as usize])
+        } else {
+            None
+        }
+    }
+
     // ── Private helpers ────────────────────────────────────────────────
 
     /// Upstream's TIC/TSC table is bounded by Maxwell3D limits that fit in

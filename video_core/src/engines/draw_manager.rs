@@ -265,6 +265,13 @@ pub trait Maxwell3DAccess {
     /// Set a dirty flag. Upstream: `maxwell3d->dirty.flags[index] = true`.
     fn set_dirty_flag(&mut self, index: u8);
 
+    /// Snapshot all dirty flags before a draw, matching upstream rasterizer
+    /// reads of `maxwell3d->dirty.flags`.
+    fn dirty_flags(&self) -> [bool; 256];
+
+    /// Clear one dirty flag after the backend consumes it.
+    fn clear_dirty_flag(&mut self, index: u8);
+
     /// Get a mutable reference to the rasterizer, if bound.
     fn rasterizer_mut(&mut self) -> Option<&mut dyn RasterizerInterface>;
 
@@ -280,6 +287,12 @@ pub trait Maxwell3DAccess {
 
     /// Read whether `regs.window_origin.mode != UpperLeft`.
     fn window_origin_lower_left(&self) -> bool;
+
+    /// Read whether `regs.window_origin.flip_y != 0`.
+    fn window_origin_flip_y(&self) -> bool;
+
+    /// Read `regs.viewport_transform[index].scale_y`.
+    fn viewport_transform_scale_y(&self, index: u32) -> f32;
 
     /// Read `regs.surface_clip.height`.
     fn surface_clip_height(&self) -> u32;
@@ -331,6 +344,9 @@ pub trait Maxwell3DAccess {
 
     /// Read vertex stream info for one stream slot.
     fn vertex_stream_info(&self, index: u32) -> crate::engines::maxwell_3d::VertexStreamInfo;
+
+    /// Read vertex stream instancing enable for one stream slot.
+    fn vertex_stream_instance(&self, index: u32) -> u32;
 
     /// Read vertex stream limit info for one stream slot.
     fn vertex_stream_limit(&self, index: u32) -> VertexStreamLimit;
@@ -404,7 +420,7 @@ pub enum DrawMode {
 }
 
 /// Core draw state tracked across begin/end sequences.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct DrawState {
     pub topology: PrimitiveTopology,
     pub draw_mode: DrawMode,
@@ -420,10 +436,11 @@ pub struct DrawState {
     ///
     /// Upstream rasterizers reach the same data via
     /// `maxwell3d->regs.program_region.Address() + maxwell3d->regs.pipelines[i].offset`
-    /// directly off their Maxwell3D pointer. The Rust port has no Maxwell3D
-    /// reference inside the rasterizer, so `DrawManager::process_draw`
-    /// snapshots the addresses into `DrawState` before invoking
-    /// `RasterizerInterface::draw`.
+    /// directly off their Maxwell3D pointer. ruzu still routes draw dispatch
+    /// through `RasterizerInterface::draw(&DrawState, ...)`, so
+    /// `DrawManager::process_draw` snapshots the addresses at the same draw
+    /// boundary instead of making the rasterizer's public draw entry point
+    /// reach back through the engine owner.
     pub shader_program_addresses: [u64; 6],
     /// GPU virtual address of the index buffer start.
     pub index_buffer_gpu_addr: u64,
@@ -437,6 +454,8 @@ pub struct DrawState {
     pub cb_bindings: [[ConstBufferBinding; MAX_CB_SLOTS]; NUM_SHADER_STAGES],
     /// Vertex stream register snapshot at draw-dispatch time.
     pub vertex_streams: [crate::engines::maxwell_3d::VertexStreamInfo; 32],
+    /// Vertex stream instancing enable snapshot at draw-dispatch time.
+    pub vertex_stream_instances: [u32; 32],
     /// Vertex stream limit register snapshot at draw-dispatch time.
     pub vertex_stream_limits: [VertexStreamLimit; 32],
     /// Vertex attribute format register snapshot at draw-dispatch time.
@@ -455,16 +474,64 @@ pub struct DrawState {
     pub depth_stencil: crate::engines::maxwell_3d::DepthStencilInfo,
     /// Rasterizer state snapshot at draw-dispatch time.
     pub rasterizer: crate::engines::maxwell_3d::RasterizerInfo,
+    /// Window-origin mode snapshot used by OpenGL viewport/clip-control sync.
+    pub window_origin_lower_left: bool,
+    /// Window-origin Y-flip bit snapshot used by OpenGL front-face sync.
+    pub window_origin_flip_y: bool,
+    /// Raw `regs.viewport_transform[0].scale_y` snapshot used by upstream
+    /// `RasterizerOpenGL::SyncViewport` for clip-control and front-face flips.
+    pub viewport0_scale_y: f32,
+    /// Dirty-flag snapshot at draw-dispatch time.
+    pub dirty_flags: [bool; 256],
     /// Per-render-target color write mask snapshot at draw-dispatch time.
     pub color_masks: [crate::engines::maxwell_3d::ColorMaskInfo; 8],
     /// Clear-register snapshot captured before dispatching to the rasterizer.
     pub clear_state: ClearState,
     /// TIC/TSC table address+limit snapshot read by `TextureCacheBase::
     /// synchronize_graphics_descriptors` at draw-dispatch time. Upstream's
-    /// `ConfigureImpl` reads these straight off `maxwell3d->regs`; the Rust
-    /// rasterizer has no Maxwell3D back-reference, so the values are
-    /// snapshotted into `DrawState` alongside the rest of the registers.
+    /// `ConfigureImpl` reads these straight off `maxwell3d->regs`; ruzu's
+    /// current draw entry point passes a `DrawState`, so the values are
+    /// snapshotted at the draw boundary alongside the rest of the registers.
     pub descriptor_sync_regs: crate::texture_cache::texture_cache_base::DescriptorSyncRegs,
+}
+
+impl Default for DrawState {
+    fn default() -> Self {
+        Self {
+            topology: PrimitiveTopology::default(),
+            draw_mode: DrawMode::default(),
+            draw_indexed: false,
+            base_index: 0,
+            vertex_buffer: VertexBuffer::default(),
+            index_buffer: IndexBuffer::default(),
+            base_instance: 0,
+            instance_count: 0,
+            inline_index_draw_indexes: Vec::new(),
+            shader_program_addresses: [0; 6],
+            index_buffer_gpu_addr: 0,
+            index_buffer_gpu_addr_end: 0,
+            rt_control: RtControlInfo::default(),
+            render_targets: Default::default(),
+            cb_bindings: Default::default(),
+            vertex_streams: Default::default(),
+            vertex_stream_instances: [0; 32],
+            vertex_stream_limits: Default::default(),
+            vertex_attribs_snapshot: Default::default(),
+            viewports: Default::default(),
+            scissors: Default::default(),
+            blend: Default::default(),
+            blend_color: Default::default(),
+            depth_stencil: Default::default(),
+            rasterizer: Default::default(),
+            window_origin_lower_left: false,
+            window_origin_flip_y: false,
+            viewport0_scale_y: 0.0,
+            dirty_flags: [false; 256],
+            color_masks: Default::default(),
+            clear_state: Default::default(),
+            descriptor_sync_regs: Default::default(),
+        }
+    }
 }
 
 /// Vertex stream limit state captured from Maxwell3D registers.
@@ -1123,6 +1190,8 @@ impl DrawManager {
             });
             self.draw_state.vertex_streams =
                 std::array::from_fn(|i| maxwell3d.vertex_stream_info(i as u32));
+            self.draw_state.vertex_stream_instances =
+                std::array::from_fn(|i| maxwell3d.vertex_stream_instance(i as u32));
             self.draw_state.vertex_stream_limits =
                 std::array::from_fn(|i| maxwell3d.vertex_stream_limit(i as u32));
             self.draw_state.vertex_attribs_snapshot =
@@ -1133,6 +1202,24 @@ impl DrawManager {
             self.draw_state.blend_color = maxwell3d.blend_color_info();
             self.draw_state.depth_stencil = maxwell3d.depth_stencil_info();
             self.draw_state.rasterizer = maxwell3d.rasterizer_info();
+            self.draw_state.window_origin_lower_left = maxwell3d.window_origin_lower_left();
+            self.draw_state.window_origin_flip_y = maxwell3d.window_origin_flip_y();
+            self.draw_state.viewport0_scale_y = maxwell3d.viewport_transform_scale_y(0);
+            self.draw_state.dirty_flags = maxwell3d.dirty_flags();
+            maxwell3d.clear_dirty_flag(crate::renderer_opengl::gl_state_tracker::dirty::FRONT_FACE);
+            maxwell3d.clear_dirty_flag(
+                crate::renderer_opengl::gl_state_tracker::dirty::CLIP_CONTROL,
+            );
+            maxwell3d.clear_dirty_flag(crate::renderer_opengl::gl_state_tracker::dirty::VIEWPORTS);
+            maxwell3d.clear_dirty_flag(
+                crate::renderer_opengl::gl_state_tracker::dirty::VIEWPORT_TRANSFORM,
+            );
+            maxwell3d.clear_dirty_flag(crate::dirty_flags::flags::RESCALE_VIEWPORTS);
+            for index in crate::renderer_opengl::gl_state_tracker::dirty::VIEWPORT_0
+                ..=crate::renderer_opengl::gl_state_tracker::dirty::VIEWPORT_15
+            {
+                maxwell3d.clear_dirty_flag(index);
+            }
             self.draw_state.color_masks = std::array::from_fn(|i| maxwell3d.color_mask_info(i));
             // Snapshot TIC/TSC table state so the rasterizer can drive
             // `texture_cache.synchronize_graphics_descriptors` without a
