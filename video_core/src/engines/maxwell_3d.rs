@@ -26,7 +26,7 @@ use crate::memory_manager::MemoryManager;
 use crate::query_cache::query_cache::{RenderConditionState, RenderConditionStateSource};
 use crate::query_cache::types::ComparisonMode;
 use crate::query_cache::types::QueryPropertiesFlags;
-use crate::rasterizer_interface::RasterizerInterface;
+use crate::rasterizer_interface::{RasterizerHandle, RasterizerInterface};
 use crate::transform_feedback::{StreamOutLayout, TransformFeedbackLayout, TransformFeedbackState};
 use shader_recompiler::shader_info::ReplaceConstant;
 
@@ -1545,6 +1545,33 @@ pub struct ViewportInfo {
     pub depth_far: f32,
 }
 
+/// Raw `regs.viewport_transform[index]` snapshot.
+///
+/// Mirrors upstream `Maxwell3D::Regs::ViewportTransform`; the Rust port keeps
+/// the raw fields separate from `ViewportInfo` so OpenGL viewport sync can use
+/// upstream's signed scale/depth formulas instead of the older absolute-value
+/// helper.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct ViewportTransformInfo {
+    pub scale_x: f32,
+    pub scale_y: f32,
+    pub scale_z: f32,
+    pub translate_x: f32,
+    pub translate_y: f32,
+    pub translate_z: f32,
+    pub swizzle: u32,
+    pub snap_grid_precision: u32,
+}
+
+/// Raw `regs.surface_clip` snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SurfaceClipInfo {
+    pub x: u32,
+    pub y: u32,
+    pub width: u32,
+    pub height: u32,
+}
+
 /// Scissor rectangle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct ScissorInfo {
@@ -1887,7 +1914,12 @@ pub struct Maxwell3D {
     /// Pending semaphore writes to be returned by execute_pending.
     pending_semaphore_writes: Vec<PendingWrite>,
     /// Bound rasterizer backend.
-    rasterizer: Option<[usize; 2]>,
+    ///
+    /// Upstream stores `VideoCore::RasterizerInterface* rasterizer`.
+    ///
+    /// Rust uses `RasterizerHandle`, a centralized non-owning pointer wrapper
+    /// matching that upstream contract.
+    rasterizer: Option<RasterizerHandle>,
     /// Start offsets of each macro in macro memory.
     macro_positions: [u32; 0x80],
     /// MME macro engine for uploaded programmable macro execution.
@@ -1950,29 +1982,11 @@ impl Maxwell3D {
         };
         let base_instance = self.base_instance();
         let base_index = self.base_vertex() as u32;
-        let shader_program_addresses = self.shader_program_addresses();
-        let index_buffer_gpu_addr = self.index_buffer_addr();
-        let index_buffer_gpu_addr_end = {
-            let base = IB_BASE as usize;
-            let high = self.regs[base + IB_OFF_LIMIT_HIGH as usize] as u64;
-            let low = self.regs[base + IB_OFF_LIMIT_LOW as usize] as u64;
-            (high << 32) | low
-        };
         let draw_state = &mut draw_manager.draw_state;
         draw_state.vertex_buffer = vertex_buffer;
         draw_state.index_buffer = index_buffer;
         draw_state.base_instance = base_instance;
         draw_state.base_index = base_index;
-        draw_state.shader_program_addresses = shader_program_addresses;
-        draw_state.index_buffer_gpu_addr = index_buffer_gpu_addr;
-        draw_state.index_buffer_gpu_addr_end = index_buffer_gpu_addr_end;
-        draw_state.vertex_streams = std::array::from_fn(|i| self.vertex_stream_info(i as u32));
-        draw_state.vertex_stream_instances =
-            std::array::from_fn(|i| self.vertex_stream_instance(i as u32));
-        draw_state.vertex_stream_limits =
-            std::array::from_fn(|i| self.vertex_stream_limit(i as u32));
-        draw_state.vertex_attribs_snapshot =
-            std::array::from_fn(|i| self.vertex_attrib_info(i as u32));
     }
 
     fn with_draw_manager<R>(&mut self, f: impl FnOnce(&mut dm::DrawManager, &mut Self) -> R) -> R {
@@ -2101,9 +2115,7 @@ impl Maxwell3D {
             let ptr = rasterizer as *const dyn RasterizerInterface;
             log::info!("Maxwell3D::bind_rasterizer rasterizer_ptr={:p}", ptr);
         }
-        self.rasterizer = Some(unsafe {
-            std::mem::transmute::<*const dyn RasterizerInterface, [usize; 2]>(rasterizer)
-        });
+        self.rasterizer = Some(RasterizerHandle::from_ref(rasterizer));
     }
 
     pub fn set_memory_manager(&mut self, memory_manager: Arc<Mutex<MemoryManager>>) {
@@ -2301,10 +2313,8 @@ impl Maxwell3D {
         &mut self,
         f: impl FnOnce(&mut dyn RasterizerInterface) -> R,
     ) -> Option<R> {
-        let raw = self.rasterizer?;
-        let rasterizer =
-            unsafe { &mut *std::mem::transmute::<[usize; 2], *mut dyn RasterizerInterface>(raw) };
-        Some(f(rasterizer))
+        let handle = self.rasterizer?;
+        Some(unsafe { handle.with_mut(f) })
     }
 
     pub fn get_macro_address(&self, index: usize) -> u64 {
@@ -2402,16 +2412,14 @@ impl Maxwell3D {
         let Some(memory_manager) = self.memory_manager.as_ref().cloned() else {
             return;
         };
-        let rasterizer_raw = self.rasterizer.map(|raw| unsafe {
-            std::mem::transmute::<[usize; 2], *mut dyn RasterizerInterface>(raw)
-        });
+        let rasterizer_handle = self.rasterizer;
         let writer = self.guest_memory_writer.as_ref().cloned();
         let mut write_cpu = move |addr: u64, bytes: &[u8]| {
             if let Some(writer) = writer.as_ref() {
                 writer(addr, bytes);
             }
         };
-        let mut rasterizer = rasterizer_raw.map(|ptr| unsafe { &mut *ptr });
+        let mut rasterizer = rasterizer_handle.map(|handle| unsafe { handle.as_mut() });
         let mut ctx = engine_upload::FlushContext {
             rasterizer: rasterizer.as_deref_mut(),
             memory_manager,
@@ -2439,14 +2447,12 @@ impl Maxwell3D {
         let Some(memory_manager) = self.memory_manager.as_ref().cloned() else {
             return;
         };
-        let rasterizer_raw = self.rasterizer.map(|raw| unsafe {
-            std::mem::transmute::<[usize; 2], *mut dyn RasterizerInterface>(raw)
-        });
+        let rasterizer_handle = self.rasterizer;
         if std::env::var_os("RUZU_TRACE_INLINE_TO_MEMORY").is_some() {
             log::info!(
                 "Maxwell3D::process_inline_upload_multi rasterizer_present={} rasterizer_ptr={:?} target=0x{:X} words={}",
-                rasterizer_raw.is_some(),
-                rasterizer_raw.map(|ptr| ptr as *mut ()),
+                rasterizer_handle.is_some(),
+                rasterizer_handle.map(|handle| handle.debug_data_ptr()),
                 self.upload_registers().dest.address(),
                 data.len()
             );
@@ -2457,7 +2463,7 @@ impl Maxwell3D {
                 writer(addr, bytes);
             }
         };
-        let mut rasterizer = rasterizer_raw.map(|ptr| unsafe { &mut *ptr });
+        let mut rasterizer = rasterizer_handle.map(|handle| unsafe { handle.as_mut() });
         let mut ctx = engine_upload::FlushContext {
             rasterizer: rasterizer.as_deref_mut(),
             memory_manager,
@@ -2593,6 +2599,33 @@ impl Maxwell3D {
             height,
             depth_near: translate_z - scale_z.abs(),
             depth_far: translate_z + scale_z.abs(),
+        }
+    }
+
+    /// Read raw viewport transform state for viewport `index` (0..15).
+    pub fn viewport_transform_info(&self, index: u32) -> ViewportTransformInfo {
+        let base = (VP_TRANSFORM_BASE + index * VP_TRANSFORM_STRIDE) as usize;
+        ViewportTransformInfo {
+            scale_x: f32::from_bits(self.regs[base]),
+            scale_y: f32::from_bits(self.regs[base + 1]),
+            scale_z: f32::from_bits(self.regs[base + 2]),
+            translate_x: f32::from_bits(self.regs[base + 3]),
+            translate_y: f32::from_bits(self.regs[base + 4]),
+            translate_z: f32::from_bits(self.regs[base + 5]),
+            swizzle: self.regs[base + 6],
+            snap_grid_precision: self.regs[base + 7],
+        }
+    }
+
+    /// Read raw surface clip rectangle.
+    pub fn surface_clip_info(&self) -> SurfaceClipInfo {
+        let x_width = self.regs[SURFACE_CLIP_BASE as usize];
+        let y_height = self.regs[SURFACE_CLIP_BASE as usize + 1];
+        SurfaceClipInfo {
+            x: x_width & 0xFFFF,
+            width: (x_width >> 16) & 0xFFFF,
+            y: y_height & 0xFFFF,
+            height: (y_height >> 16) & 0xFFFF,
         }
     }
 
@@ -2875,13 +2908,13 @@ impl Maxwell3D {
         (high << 32) | low
     }
 
-    /// Snapshot the GPU virtual address of the entry point for each of the
+    /// Return the GPU virtual address of the entry point for each of the
     /// 6 Maxwell shader stages. Disabled stages report `0`.
     ///
     /// Upstream rasterizers compute these inline as
     /// `regs.program_region.Address() + regs.pipelines[i].offset`. ruzu's
-    /// current draw entry point snapshots them into `DrawState` at the same
-    /// draw boundary.
+    /// live draw view calls this through `Maxwell3DAccess` instead of storing
+    /// these values in `DrawState`.
     pub fn shader_program_addresses(&self) -> [u64; 6] {
         let base = self.program_region_address();
         let mut out = [0u64; 6];
@@ -3180,11 +3213,39 @@ impl dm::Maxwell3DAccess for Maxwell3D {
         self.dirty.flags[index as usize] = false;
     }
 
-    fn rasterizer_mut(&mut self) -> Option<&mut dyn RasterizerInterface> {
-        let raw = self.rasterizer?;
-        let rasterizer =
-            unsafe { &mut *std::mem::transmute::<[usize; 2], *mut dyn RasterizerInterface>(raw) };
-        Some(rasterizer)
+    fn with_rasterizer_mut(
+        &mut self,
+        f: &mut dyn FnMut(&mut dyn RasterizerInterface),
+    ) -> bool {
+        Maxwell3D::with_rasterizer_mut(self, |rasterizer| f(rasterizer)).is_some()
+    }
+
+    fn draw_rasterizer(
+        &mut self,
+        draw_state: &dm::DrawState,
+        instance_count: u32,
+    ) -> bool {
+        let Some(handle) = self.rasterizer else {
+            return false;
+        };
+        unsafe {
+            handle.with_mut(|rasterizer| {
+                rasterizer.draw(dm::Maxwell3DDrawView::live(draw_state, self), instance_count);
+            });
+        }
+        true
+    }
+
+    fn clear_rasterizer(&mut self, layer_count: u32) -> bool {
+        let Some(handle) = self.rasterizer else {
+            return false;
+        };
+        unsafe {
+            handle.with_mut(|rasterizer| {
+                rasterizer.clear(dm::Maxwell3DClearView::live(self), layer_count);
+            });
+        }
+        true
     }
 
     fn shader_program_addresses(&self) -> [u64; 6] {
@@ -3193,6 +3254,13 @@ impl dm::Maxwell3DAccess for Maxwell3D {
 
     fn index_buffer_addr(&self) -> u64 {
         self.index_buffer_addr()
+    }
+
+    fn index_buffer_addr_end(&self) -> u64 {
+        let base = IB_BASE as usize;
+        let high = self.regs[base + IB_OFF_LIMIT_HIGH as usize] as u64;
+        let low = self.regs[base + IB_OFF_LIMIT_LOW as usize] as u64;
+        (high << 32) | low
     }
 
     fn draw_texture_params(&self) -> dm::DrawTextureParams {
@@ -3226,6 +3294,18 @@ impl dm::Maxwell3DAccess for Maxwell3D {
     fn viewport_transform_scale_y(&self, index: u32) -> f32 {
         let base = (VP_TRANSFORM_BASE + index * VP_TRANSFORM_STRIDE) as usize;
         f32::from_bits(self.regs[base + 1])
+    }
+
+    fn viewport_transform_info(&self, index: u32) -> ViewportTransformInfo {
+        self.viewport_transform_info(index)
+    }
+
+    fn viewport_scale_offset_enabled(&self) -> bool {
+        self.viewport_transform_state() != 0
+    }
+
+    fn surface_clip_info(&self) -> SurfaceClipInfo {
+        self.surface_clip_info()
     }
 
     fn surface_clip_height(&self) -> u32 {
@@ -4423,6 +4503,7 @@ mod tests {
         /// (instance_count, draw_indexed, shader_program_addresses) per `draw` call.
         draws: Vec<(u32, bool, [u64; 6])>,
         draw_states: Vec<crate::engines::draw_manager::DrawState>,
+        draw_registers: Vec<crate::engines::draw_manager::Maxwell3DDrawRegisters>,
     }
 
     struct TestRasterizer {
@@ -4438,26 +4519,32 @@ mod tests {
     impl RasterizerInterface for TestRasterizer {
         fn draw(
             &mut self,
-            draw_state: &crate::engines::draw_manager::DrawState,
+            draw_view: crate::engines::draw_manager::Maxwell3DDrawView<'_>,
             instance_count: u32,
         ) {
+            let draw_state = draw_view.draw_state();
             self.calls.lock().unwrap().draws.push((
                 instance_count,
                 draw_state.draw_indexed,
-                draw_state.shader_program_addresses,
+                draw_view.shader_program_addresses(),
             ));
             self.calls
                 .lock()
                 .unwrap()
                 .draw_states
                 .push(draw_state.clone());
+            self.calls
+                .lock()
+                .unwrap()
+                .draw_registers
+                .push(draw_view.registers());
         }
         fn draw_texture(&mut self) {
             self.calls.lock().unwrap().draw_texture += 1;
         }
         fn clear(
             &mut self,
-            _draw_state: &crate::engines::draw_manager::DrawState,
+            _clear_view: crate::engines::draw_manager::Maxwell3DClearView<'_>,
             layer_count: u32,
         ) {
             self.calls.lock().unwrap().clear_layers.push(layer_count);
@@ -7561,13 +7648,14 @@ mod tests {
 
         let calls = calls.lock().unwrap();
         assert_eq!(calls.draw_states.len(), 1);
-        let state = &calls.draw_states[0];
-        assert_eq!(state.vertex_streams[0].address, 0x1_0000_2000);
-        assert_eq!(state.vertex_streams[0].stride, 0x20);
-        assert_eq!(state.vertex_streams[0].frequency, 5);
-        assert!(state.vertex_streams[0].enabled);
-        assert_eq!(state.vertex_stream_instances[0], 1);
-        assert_eq!(state.vertex_stream_limits[0].address, 0x1_0000_2FFF);
+        assert_eq!(calls.draw_registers.len(), 1);
+        let registers = &calls.draw_registers[0];
+        assert_eq!(registers.vertex_streams[0].address, 0x1_0000_2000);
+        assert_eq!(registers.vertex_streams[0].stride, 0x20);
+        assert_eq!(registers.vertex_streams[0].frequency, 5);
+        assert!(registers.vertex_streams[0].enabled);
+        assert_eq!(registers.vertex_stream_instances[0], 1);
+        assert_eq!(registers.vertex_stream_limits[0].address, 0x1_0000_2FFF);
     }
 
     #[test]

@@ -10,7 +10,7 @@ use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
-use crate::engines::engine_interface::EngineInterface;
+use crate::engines::engine_interface::{EngineHandle, EngineInterface};
 use crate::engines::engine_interface::EngineTypes;
 use crate::engines::puller::{EngineID, MethodCall, Puller};
 use common::settings;
@@ -293,7 +293,7 @@ pub struct DmaPusher {
     dma_increment_once: bool,
     ib_enable: bool,
     command_headers: Vec<CommandHeader>,
-    subchannels: [Option<[usize; 2]>; MAX_SUBCHANNELS],
+    subchannels: [Option<EngineHandle>; MAX_SUBCHANNELS],
     subchannel_type: [EngineTypes; MAX_SUBCHANNELS],
     gpu: *const crate::gpu::Gpu,
     system: SystemRef,
@@ -359,8 +359,7 @@ impl DmaPusher {
         subchannel_id: u32,
         engine_type: EngineTypes,
     ) {
-        self.subchannels[subchannel_id as usize] =
-            Some(unsafe { std::mem::transmute::<*mut dyn EngineInterface, [usize; 2]>(engine) });
+        self.subchannels[subchannel_id as usize] = Some(EngineHandle::from_ref(engine));
         self.subchannel_type[subchannel_id as usize] = engine_type;
     }
 
@@ -408,18 +407,16 @@ impl DmaPusher {
         };
         match engine_id {
             EngineID::MaxwellB => {
-                if let Some(raw) = self.subchannels[self.dma_state.subchannel as usize] {
-                    let engine: *mut dyn EngineInterface = unsafe { std::mem::transmute(raw) };
-                    unsafe { &mut *engine }.set_current_dirty(dirty);
+                if let Some(engine) = self.subchannels[self.dma_state.subchannel as usize] {
+                    unsafe { engine.as_mut() }.set_current_dirty(dirty);
                 }
             }
             EngineID::KeplerComputeB
             | EngineID::KeplerInlineToMemoryB
             | EngineID::FermiTwodA
             | EngineID::MaxwellDmaCopyA => {
-                if let Some(raw) = self.subchannels[self.dma_state.subchannel as usize] {
-                    let engine: *mut dyn EngineInterface = unsafe { std::mem::transmute(raw) };
-                    unsafe { &mut *engine }.set_current_dirty(dirty);
+                if let Some(engine) = self.subchannels[self.dma_state.subchannel as usize] {
+                    unsafe { engine.as_mut() }.set_current_dirty(dirty);
                 }
             }
         }
@@ -910,7 +907,7 @@ impl DmaPusher {
             return;
         }
 
-        let Some(raw) = self.subchannels[self.dma_state.subchannel as usize] else {
+        let Some(subchannel) = self.subchannels[self.dma_state.subchannel as usize] else {
             let trace_idx = DISPATCH_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
             if trace_idx < 48 {
                 log::warn!(
@@ -931,8 +928,7 @@ impl DmaPusher {
             }
             return;
         };
-        let subchannel: *mut dyn EngineInterface = unsafe { std::mem::transmute(raw) };
-        let subchannel = unsafe { &mut *subchannel };
+        let subchannel = unsafe { subchannel.as_mut() };
         if !subchannel.execution_mask()[self.dma_state.method as usize] {
             let trace_idx = DISPATCH_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
             if trace_idx < 48 {
@@ -1026,11 +1022,10 @@ impl DmaPusher {
             );
             return;
         }
-        let Some(raw) = self.subchannels[self.dma_state.subchannel as usize] else {
+        let Some(subchannel) = self.subchannels[self.dma_state.subchannel as usize] else {
             return;
         };
-        let subchannel: *mut dyn EngineInterface = unsafe { std::mem::transmute(raw) };
-        let subchannel = unsafe { &mut *subchannel };
+        let subchannel = unsafe { subchannel.as_mut() };
         subchannel.consume_sink();
         subchannel.set_current_dma_segment(
             self.dma_state

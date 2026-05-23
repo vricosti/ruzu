@@ -12,6 +12,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use crate::dma_pusher::CommandList;
 use crate::framebuffer_config::FramebufferConfig;
 use crate::rasterizer_download_area::RasterizerDownloadArea;
+use crate::rasterizer_interface::RasterizerHandle;
 use crate::renderer_base::RendererBase;
 use common::settings;
 use ruzu_core::core::SystemRef;
@@ -139,10 +140,7 @@ pub struct Gpu {
 
     /// Rasterizer extracted from renderer.
     /// Upstream: `VideoCore::RasterizerInterface* rasterizer` in GPU::Impl.
-    ///
-    /// Rust trait objects are fat pointers, so preserve both the data and
-    /// vtable words instead of truncating to a thin pointer.
-    rasterizer: Mutex<Option<[usize; 2]>>,
+    rasterizer: Mutex<Option<RasterizerHandle>>,
 
     /// GPU channel scheduler.
     /// Upstream: `std::unique_ptr<Tegra::Control::Scheduler> scheduler` in GPU::Impl.
@@ -225,7 +223,8 @@ impl Gpu {
         if std::env::var_os("RUZU_TRACE_RASTERIZER_BIND").is_some() {
             log::info!("Gpu::bind_renderer rasterizer_ptr={:p}", rasterizer_ptr);
         }
-        *self.rasterizer.lock().unwrap() = Some(unsafe { std::mem::transmute(rasterizer_ptr) });
+        *self.rasterizer.lock().unwrap() =
+            Some(RasterizerHandle::from_ref(unsafe { &*rasterizer_ptr }));
         // Upstream also does:
         // host1x.MemoryManager().BindInterface(rasterizer);
         // host1x.GMMU().BindRasterizer(rasterizer);
@@ -267,15 +266,15 @@ impl Gpu {
             panic!("Gpu::bind_channel missing channel {}", channel_id);
         };
 
-        if let Some(rasterizer) = self.rasterizer_ptr() {
-            let rasterizer = unsafe { &mut *rasterizer };
+        if let Some(rasterizer) = self.rasterizer_handle() {
+            let rasterizer = unsafe { rasterizer.as_mut() };
             let channel_state = channel_state.lock();
             rasterizer.bind_channel(&channel_state);
         }
     }
 
-    fn rasterizer_ptr(&self) -> Option<*mut dyn crate::rasterizer_interface::RasterizerInterface> {
-        (*self.rasterizer.lock().unwrap()).map(|raw| unsafe { std::mem::transmute(raw) })
+    fn rasterizer_handle(&self) -> Option<RasterizerHandle> {
+        *self.rasterizer.lock().unwrap()
     }
 
     pub fn set_guest_memory_reader(&self, reader: Arc<dyn Fn(u64, &mut [u8]) + Send + Sync>) {
@@ -469,14 +468,14 @@ impl Gpu {
 
     /// Flush all current written commands into the host GPU for execution.
     pub fn flush_commands(&self) {
-        if let Some(rasterizer) = self.rasterizer_ptr() {
-            unsafe { &mut *rasterizer }.flush_commands();
+        if let Some(rasterizer) = self.rasterizer_handle() {
+            unsafe { rasterizer.as_mut() }.flush_commands();
         }
     }
 
     /// Synchronizes CPU writes with Host GPU memory.
     pub fn invalidate_gpu_cache(&self) {
-        let Some(rasterizer) = self.rasterizer_ptr() else {
+        let Some(rasterizer) = self.rasterizer_handle() else {
             return;
         };
         let system = *self.system.lock().unwrap();
@@ -484,7 +483,7 @@ impl Gpu {
             log::warn!("Gpu::invalidate_gpu_cache: system ref not set");
             return;
         }
-        let rasterizer = unsafe { &mut *rasterizer };
+        let rasterizer = unsafe { rasterizer.as_mut() };
         system.get().gather_gpu_dirty_memory(&mut |addr, size| {
             rasterizer.on_cache_invalidation(addr, size as u64);
         });
@@ -492,8 +491,8 @@ impl Gpu {
 
     /// Signal the ending of command list.
     pub fn on_command_list_end(&self) {
-        if let Some(rasterizer) = self.rasterizer_ptr() {
-            unsafe { &mut *rasterizer }.release_fences(false);
+        if let Some(rasterizer) = self.rasterizer_handle() {
+            unsafe { rasterizer.as_mut() }.release_fences(false);
         }
         // Upstream also does Settings::UpdateGPUAccuracy().
     }
@@ -522,8 +521,8 @@ impl Gpu {
         let gpu_addr = self as *const Gpu as usize;
         self.request_sync_operation(Box::new(move || {
             let gpu = unsafe { &*(gpu_addr as *const Gpu) };
-            if let Some(rasterizer) = gpu.rasterizer_ptr() {
-                unsafe { &mut *rasterizer }.flush_region(addr, size as u64);
+            if let Some(rasterizer) = gpu.rasterizer_handle() {
+                unsafe { rasterizer.as_mut() }.flush_region(addr, size as u64);
             } else if std::env::var_os("RUZU_TRACE_PRESENT").is_some() {
                 log::info!("[PRESENT] Gpu::request_flush sync callback: no rasterizer bound");
             }
@@ -684,10 +683,10 @@ impl Gpu {
     /// Notify rasterizer of a CPU write.
     /// Matches upstream `GPU::Impl::OnCPUWrite(DAddr, u64)`.
     pub fn on_cpu_write(&self, _addr: DAddr, _size: u64) -> bool {
-        let Some(rasterizer) = self.rasterizer_ptr() else {
+        let Some(rasterizer) = self.rasterizer_handle() else {
             return false;
         };
-        unsafe { &mut *rasterizer }.on_cpu_write(_addr, _size)
+        unsafe { rasterizer.as_mut() }.on_cpu_write(_addr, _size)
     }
 
     /// Flush and invalidate a region.
@@ -845,8 +844,8 @@ impl GpuChannelHandle for VideoGpuChannelHandle {
             program_id,
             channel_state.maxwell_3d.is_some()
         );
-        if let Some(rasterizer) = gpu.rasterizer_ptr() {
-            let rasterizer = unsafe { &mut *rasterizer };
+        if let Some(rasterizer) = gpu.rasterizer_handle() {
+            let rasterizer = unsafe { rasterizer.as_mut() };
             channel_state.bind_rasterizer(rasterizer);
             rasterizer.initialize_channel(&channel_state);
         }
@@ -939,13 +938,13 @@ impl GpuCoreInterface for Gpu {
             .as_any()
             .downcast_ref::<VideoGpuMemoryManagerHandle>()
             .expect("GPU memory manager handle must originate from video_core::Gpu");
-        if self.rasterizer_ptr().is_none() {
+        if self.rasterizer_handle().is_none() {
             return;
         }
-        let Some(rasterizer) = self.rasterizer_ptr() else {
+        let Some(rasterizer) = self.rasterizer_handle() else {
             return;
         };
-        let rasterizer = unsafe { &mut *rasterizer };
+        let rasterizer = unsafe { rasterizer.as_mut() };
         handle.memory_manager.lock().bind_rasterizer(rasterizer);
     }
 
@@ -1018,7 +1017,9 @@ impl GpuCoreInterface for Gpu {
 mod tests {
     use super::*;
     use crate::memory_manager::MemoryManager;
-    use crate::rasterizer_interface::{RasterizerDownloadArea, RasterizerInterface};
+    use crate::rasterizer_interface::{
+        RasterizerDownloadArea, RasterizerHandle, RasterizerInterface,
+    };
     use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 
     struct FakeRasterizer {
@@ -1029,14 +1030,14 @@ mod tests {
     impl RasterizerInterface for FakeRasterizer {
         fn draw(
             &mut self,
-            _draw_state: &crate::engines::draw_manager::DrawState,
+            _draw_view: crate::engines::draw_manager::Maxwell3DDrawView<'_>,
             _instance_count: u32,
         ) {
         }
         fn draw_texture(&mut self) {}
         fn clear(
             &mut self,
-            _draw_state: &crate::engines::draw_manager::DrawState,
+            _clear_view: crate::engines::draw_manager::Maxwell3DClearView<'_>,
             _layer_count: u32,
         ) {
         }
@@ -1125,7 +1126,7 @@ mod tests {
         });
         let rasterizer_ptr: *mut FakeRasterizer = Box::into_raw(rasterizer);
         *gpu.rasterizer.lock().unwrap() =
-            Some(unsafe { std::mem::transmute(rasterizer_ptr as *mut dyn RasterizerInterface) });
+            Some(RasterizerHandle::from_ref(unsafe { &*rasterizer_ptr }));
 
         let handle = VideoGpuChannelHandle {
             gpu: &gpu as *const Gpu,
@@ -1162,7 +1163,7 @@ mod tests {
         });
         let rasterizer_ptr: *mut FakeRasterizer = Box::into_raw(rasterizer);
         *gpu.rasterizer.lock().unwrap() =
-            Some(unsafe { std::mem::transmute(rasterizer_ptr as *mut dyn RasterizerInterface) });
+            Some(RasterizerHandle::from_ref(unsafe { &*rasterizer_ptr }));
 
         gpu.bind_channel(7);
         gpu.bind_channel(7);

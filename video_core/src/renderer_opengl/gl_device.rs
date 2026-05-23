@@ -33,6 +33,7 @@ pub struct Device {
     has_astc: bool,
     has_variable_aoffi: bool,
     has_depth_buffer_float: bool,
+    has_viewport_swizzle: bool,
     has_geometry_shader_passthrough: bool,
     has_nv_gpu_shader5: bool,
     has_shader_int64: bool,
@@ -104,6 +105,7 @@ impl Device {
         let has_variable_aoffi =
             has_ext("GL_AMD_gpu_shader_half_float") || (is_nvidia && has_ext("GL_NV_gpu_shader5"));
         let has_depth_buffer_float = has_ext("GL_NV_depth_buffer_float");
+        let has_viewport_swizzle = has_ext("GL_NV_viewport_swizzle");
         let has_geometry_shader_passthrough = has_ext("GL_NV_geometry_shader_passthrough");
         let has_nv_gpu_shader5 = has_ext("GL_NV_gpu_shader5");
         let has_shader_int64 = has_ext("GL_ARB_gpu_shader_int64");
@@ -156,6 +158,7 @@ impl Device {
             has_astc,
             has_variable_aoffi,
             has_depth_buffer_float,
+            has_viewport_swizzle,
             has_geometry_shader_passthrough,
             has_nv_gpu_shader5,
             has_shader_int64,
@@ -229,6 +232,9 @@ impl Device {
     }
     pub fn has_depth_buffer_float(&self) -> bool {
         self.has_depth_buffer_float
+    }
+    pub fn has_viewport_swizzle(&self) -> bool {
+        self.has_viewport_swizzle
     }
     pub fn has_geometry_shader_passthrough(&self) -> bool {
         self.has_geometry_shader_passthrough

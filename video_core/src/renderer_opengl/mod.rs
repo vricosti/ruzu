@@ -41,8 +41,8 @@ pub mod present;
 pub mod renderer_opengl;
 pub mod util_shaders;
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Instant;
 
 use log::{debug, info};
@@ -133,7 +133,7 @@ pub enum OpenGLError {
 /// graphics context, and base renderer data.
 pub struct RendererOpenGL {
     device: Device,
-    state_tracker: Box<StateTracker>,
+    state_tracker: Arc<parking_lot::Mutex<StateTracker>>,
     blit_screen: BlitScreen,
     rasterizer: RasterizerOpenGL,
     /// Graphics context for swap buffers / make current.
@@ -178,11 +178,12 @@ impl RendererOpenGL {
 
         // Load GL function pointers
         gl::load_with(&mut load_fn);
+        gl_rasterizer::load_extra_functions(&mut load_fn);
         StateTracker::load_compat_functions(load_fn);
 
         // Query device capabilities
         let device = Device::new();
-        let mut state_tracker = Box::new(StateTracker::new());
+        let state_tracker = Arc::new(parking_lot::Mutex::new(StateTracker::new()));
 
         // Initialize blit screen pipeline
         let blit_screen = BlitScreen::new().map_err(|e| OpenGLError::ShaderCompileFailed(e))?;
@@ -194,7 +195,7 @@ impl RendererOpenGL {
             &device,
             syncpoints,
             device_memory,
-            state_tracker.as_mut() as *mut StateTracker,
+            Arc::clone(&state_tracker),
         );
 
         // Set up initial GL state (matching zuyu's RendererOpenGL constructor)
@@ -331,17 +332,19 @@ impl RendererOpenGL {
         // while upstream routes render-target state through StateTracker.
         // Invalidate before binding the window framebuffer so BindFramebuffer(0)
         // cannot be skipped because of a stale cached value.
-        self.state_tracker.notify_framebuffer();
-        self.state_tracker.bind_framebuffer(0);
+        let mut state_tracker = self.state_tracker.lock();
+        state_tracker.notify_framebuffer();
+        state_tracker.bind_framebuffer(0);
         let phase_start = if profile { Some(Instant::now()) } else { None };
         self.blit_screen.draw_screen(
             framebuffers,
             &self.framebuffer_layout,
-            self.state_tracker.as_mut(),
+            &mut state_tracker,
             &mut self.rasterizer,
             false,
             self.device_memory.as_ref(),
         );
+        drop(state_tracker);
         if let Some(start) = phase_start {
             PRESENT_DRAW_SCREEN_US.fetch_add(elapsed_us(start), Ordering::Relaxed);
         }

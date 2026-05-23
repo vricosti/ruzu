@@ -16213,18 +16213,46 @@ Investigation focused on a "specific frame number" was misdirected. The real que
 
 ### Intentional differences
 - Rust snapshots `window_origin.mode`, `window_origin.flip_y`, and `viewport_transform[0].scale_y` into `DrawState` at draw-dispatch time. Upstream `RasterizerOpenGL` reads these directly through its `Maxwell3D*`; ruzu's rasterizer has no Maxwell3D back-reference, so the snapshot preserves ownership boundaries already used for other draw state.
+- Added `Maxwell3DDrawView<'_>` as the rasterizer draw-entry parameter. It currently wraps the existing draw-boundary `DrawState`, but it is the safe migration point toward upstream's live `Maxwell3D*` model without adding a persistent unsafe engine pointer to `RasterizerOpenGL`.
+- `Maxwell3DDrawView<'_>` now owns a `Maxwell3DDrawRegisters` snapshot for shader program addresses, descriptor-sync registers, viewport origin/flip inputs, and dirty flags. OpenGL consumes those through the view instead of reaching into `DrawState`, matching the intended upstream-shaped ownership direction while preserving the current safe Rust call graph.
+- `Maxwell3DDrawRegisters::from_maxwell3d` centralizes the current snapshot list. This is still a Rust-side bridge, but it makes the remaining snapshot debt explicit and prevents `process_draw` from becoming the permanent register aggregation owner.
+- `DrawManager::process_draw` now dispatches through `Maxwell3DAccess::draw_rasterizer(...)` instead of calling `rasterizer_mut()` directly. Upstream keeps the rasterizer pointer on `Maxwell3D`, so this preserves the Rust trait seam while moving rasterizer ownership back toward the Maxwell3D side.
+- `DrawManager::draw_texture` and `DrawManager::process_draw_indirect` now use Maxwell3D-owned bridge methods (`draw_texture_rasterizer`, `draw_indirect_rasterizer`) for the same reason: draw dispatch stays conceptually owned by the Maxwell3D access object, not by ad-hoc direct rasterizer borrowing in DrawManager.
 
 ### Unintentional differences (to fix)
 - None introduced by this pass. The added snapshot fields are pass-through state needed to reproduce upstream `RasterizerOpenGL::SyncViewport`.
 
 ### Missing items
 - Longer-term parity should reduce the amount of ad-hoc `DrawState` snapshotting once ruzu has a clearer upstream-equivalent rasterizer/Maxwell3D ownership model.
+- Next long-term step: replace selected `Maxwell3DDrawView` owned snapshots with live register/dirty references provided by a safe `Maxwell3D::with_rasterizer_draw_view` closure once the rasterizer binding no longer depends on raw-pointer storage.
 
 ### Binary layout verification
 - N/A: `DrawState` is host-side Rust dispatch state only; no guest-visible raw struct or serialized payload layout changed.
 
 ### Tests
 - Covered indirectly by the OpenGL rasterizer helper tests that consume these snapshotted values.
+- Added `maxwell_draw_view_exposes_draw_boundary_state` for the new draw-view API seam.
+
+## 2026-05-23 — video_core/src/rasterizer_interface.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/rasterizer_interface.h
+
+### Intentional differences
+- Rust changed `RasterizerInterface::draw` from taking `&DrawState` to taking `Maxwell3DDrawView<'_>`. Upstream `RasterizerInterface::Draw` takes only draw mode/count and lets backend rasterizers read Maxwell3D state through their engine/channel pointer; ruzu does not yet have that safe ownership path, so this view is the explicit transition seam toward upstream parity.
+- Backend implementations still receive the same core draw-boundary data as before through `draw_view.draw_state()`. Register-derived OpenGL inputs now move through `Maxwell3DDrawRegisters` owned by the view (`shader_program_addresses`, descriptor sync regs, viewport origin/flip inputs, dirty flags), preventing further ad-hoc `DrawState` expansion from becoming the permanent API and giving later ports a place to expose live Maxwell3D accessors without changing every backend again.
+- `Maxwell3DAccess::draw_rasterizer(...)`, `draw_indirect_rasterizer(...)`, and `draw_texture_rasterizer(...)` are Rust-specific bridges for upstream `maxwell3d->rasterizer->Draw(...)`, `DrawIndirect()`, and `DrawTexture()`. They keep draw calls owned by the Maxwell3D access object while the backend signature migrates toward a live draw view.
+
+### Unintentional differences (to fix)
+- Rust still carries more draw-boundary snapshots than upstream because the rasterizer cannot yet read Maxwell3D registers directly from the channel owner. This is an existing architecture gap, now isolated behind `Maxwell3DDrawView`.
+
+### Missing items
+- Add a safe upstream-shaped channel/Maxwell3D draw closure, for example `Maxwell3D::with_rasterizer_draw_view`, so selected `Maxwell3DDrawView` accessors can read live register/dirty state instead of only wrapping `DrawState`.
+- Once the live view is in place, replace the view's owned snapshots with live Maxwell3D reads where doing so preserves Rust aliasing rules. Remaining snapshot groups include render targets, vertex/index buffers, constant buffers, blend/depth/rasterizer state, and color masks.
+
+### Binary layout verification
+- N/A: host-side trait/API boundary only; no guest-visible raw struct or serialized payload layout changed.
+
+### Tests
+- Added `maxwell_draw_view_exposes_draw_boundary_state`.
+- Updated null-renderer draw tests to call the new draw-view API.
 
 ## 2026-05-23 — video_core/src/engines/maxwell_3d.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/engines/maxwell_3d.h
 
@@ -16267,3 +16295,391 @@ Investigation focused on a "specific frame number" was misdirected. The real que
 - Re-ran focused `video_core` tests for `clip_control`, `state_tracker`, `setup_dirty_flags_marks_core_upstream_ranges`, `set_y_negate`, and `setup_tables_marks_upstream_opengl_dirty_ranges`.
 - `cargo build --release --bin ruzu-cmd` passes.
 - MK8D smoke with shared state tracker and draw readback produced pixels on FBO 3, 4, and 5 with no SIGSEGV/panic in the checked log.
+
+## 2026-05-23 — video_core/src/engines/maxwell_3d.rs + draw_manager.rs + renderer_opengl/gl_rasterizer.rs vs upstream ViewportTransform/SurfaceClip and RasterizerOpenGL::SyncViewport
+
+### Intentional differences
+- Added Rust `ViewportTransformInfo` and `SurfaceClipInfo` host-side snapshots corresponding to upstream `Maxwell3D::Regs::ViewportTransform` and `Maxwell3D::Regs::SurfaceClip`. These are not raw guest-visible structs; they are typed register snapshots for the current Rust draw boundary.
+- `Maxwell3DDrawRegisters` now carries the raw viewport-transform array, `viewport_scale_offset_enabled`, `surface_clip`, and `depth_mode`. Upstream `RasterizerOpenGL::SyncViewport` reads these directly from `maxwell3d->regs`; ruzu still passes them through `Maxwell3DDrawView` until a safe live Maxwell3D draw view exists.
+- `RasterizerOpenGL::sync_viewport` now uses the upstream viewport formulas: `surface_clip` when `viewport_scale_offset_enabled` is false, otherwise `translate - scale`, `scale * 2`, negative-height adjustment, and depth range based on `DepthMode::MinusOneToOne`.
+
+### Unintentional differences (to fix)
+- None introduced by this pass. The optional upstream `glViewportSwizzleNV` and `glDepthRangeIndexeddNV` paths are loaded manually because the generated GL bindings do not expose them.
+
+### Missing items
+- Replace the snapshot-backed `Maxwell3DDrawView` viewport fields with live reads once the safe `Maxwell3D::with_rasterizer_draw_view`-style owner boundary is available.
+- Move the optional OpenGL function loading into an upstream-shaped GL extension/function-loader owner if ruzu later grows one; today it lives next to `RasterizerOpenGL` because these entry points are only used by `SyncViewport`.
+
+### Binary layout verification
+- N/A: these are host-side typed register snapshots and GL state updates only; no guest-visible raw struct or serialized payload layout changed.
+
+### Tests
+- Added `maxwell_draw_view_exposes_raw_viewport_register_snapshot`.
+- Added `viewport_swizzle_components_match_upstream_bitfields`.
+- Re-ran `cargo check -p video_core`.
+
+## 2026-05-23 — video_core/src/engines/draw_manager.rs live Maxwell3D draw/clear views vs /home/vricosti/Dev/emulators/zuyu/src/video_core/engines/draw_manager.{h,cpp}
+
+### Intentional differences
+- Upstream `DrawManager::ProcessDraw` calls `maxwell3d->rasterizer->Draw(draw_indexed, instance_count)` and the OpenGL rasterizer reads `maxwell3d->regs` directly through its bound `Maxwell3D*`. Rust now follows the same ownership direction for the concrete Maxwell3D path: `DrawManager::process_draw` calls `maxwell3d.draw_rasterizer(...)`, and `Maxwell3D::draw_rasterizer` passes `Maxwell3DDrawView::live(draw_state, self)` to the rasterizer.
+- Upstream `DrawManager::Clear` calls `maxwell3d->rasterizer->Clear(layer_count)`. Rust now mirrors this through `Maxwell3D::clear_rasterizer`, which passes `Maxwell3DClearView::live(self)` so clear state and render targets are read from Maxwell3D at rasterizer dispatch time.
+- `Maxwell3DDrawView` and `Maxwell3DClearView` retain snapshot constructors for tests and default trait fallbacks. This is a Rust testability/object-safety adaptation; the real Maxwell3D draw/clear dispatch path no longer builds a full `Maxwell3DDrawRegisters` or `Maxwell3DClearView` snapshot in `DrawManager`.
+- Draw-view accessors return owned arrays/structs for register groups because Rust cannot return references into values produced by trait-method calls. This differs from upstream pointer/reference access shape but preserves the source of truth: the live Maxwell3D object.
+
+### Unintentional differences (to fix)
+- `RasterizerOpenGL` still receives a per-call view object instead of storing and dereferencing its own direct `Maxwell3D*` equivalent. The live view is closer to upstream and removes `DrawState` register debt from the main dispatch path, but it is not a literal port of the upstream rasterizer-owned pointer shape.
+- `Maxwell3DDrawRegisters` still exists for tests, diagnostics, and default trait fallback. It is no longer constructed by `DrawManager::process_draw`, but the type should be narrowed further once test fakes can use a dedicated fake `Maxwell3DAccess`.
+
+### Missing items
+- Replace the remaining per-call live view with a safe rasterizer-side Maxwell3D/channel owner handle if exact upstream rasterizer ownership is still required.
+- Narrow or remove the snapshot fallback once non-Maxwell test/fake paths are migrated to a smaller explicit fake view or live `Maxwell3DAccess`.
+
+### Binary layout verification
+- N/A: host-only draw/clear dispatch model; no guest-visible raw struct or serialized payload layout changed.
+
+### Tests
+- Re-read upstream `draw_manager.h` and `draw_manager.cpp` around `State`, `Clear`, `ProcessDraw`, and direct `maxwell3d->rasterizer` dispatch.
+- Re-ran `cargo check -p video_core`.
+- Re-ran `cargo test -p video_core test_draw_state_snapshots_vertex_streams_and_limits_for_buffer_cache -- --nocapture`.
+- Re-ran `cargo test -p video_core update_render_targets_from_snapshot -- --nocapture`.
+- Re-ran `cargo test -p video_core test_rasterizer_null_noop -- --nocapture`.
+- Re-ran `cargo test -p video_core test_trait_object -- --nocapture`.
+- Re-ran `git diff --check`.
+
+## 2026-05-23 — video_core/src/engines/draw_manager.rs DrawState cleanup vs /home/vricosti/Dev/emulators/zuyu/src/video_core/engines/draw_manager.{h,cpp}
+
+### Intentional differences
+- Rust `DrawState` now matches upstream `DrawManager::State`: `topology`, `draw_mode`, `draw_indexed`, `base_index`, `vertex_buffer`, `index_buffer`, `base_instance`, `instance_count`, and `inline_index_draw_indexes` only.
+- Maxwell3D register data previously appended to `DrawState` now lives in `Maxwell3DDrawRegisters` and is exposed through `Maxwell3DDrawView`. This preserves the current safe Rust draw boundary while removing non-upstream ownership from `DrawState`.
+- Render-target state shared by draw and clear paths is isolated in `Maxwell3DRenderTargets`, so texture-cache render-target synchronization no longer depends on extra `DrawState` fields.
+- Clear-specific state now uses `Maxwell3DClearView`. Upstream `RasterizerInterface::Clear(layer_count)` reads live Maxwell3D registers through the rasterizer's `maxwell3d` pointer; Rust still passes a clear view until the long-term live channel/Maxwell3D owner model is complete.
+- `TextureCacheBase::update_render_targets_from_snapshot` and the OpenGL wrapper now take `Maxwell3DRenderTargets` instead of `DrawState`, preserving the same data flow without polluting upstream draw-manager state.
+
+### Unintentional differences (to fix)
+- `Maxwell3DDrawRegisters` and `Maxwell3DClearView` are still snapshots, not live `maxwell3d->regs` reads like upstream `RasterizerOpenGL`. This is now isolated at the explicit view boundary and is the remaining long-term owner-model debt.
+- `RasterizerInterface::draw` and `clear` still receive Rust view objects, while upstream rasterizer methods read `maxwell3d` internally. This is a deliberate temporary Rust ownership bridge, not final structural parity.
+
+### Missing items
+- Replace snapshot-backed draw/clear views with live safe channel/Maxwell3D access once the rasterizer has an upstream-equivalent owner/reference path.
+- Continue auditing OpenGL call sites so new Maxwell3D register needs are added to the view boundary rather than reintroduced into `DrawState`.
+
+### Binary layout verification
+- N/A: host-only draw/clear state refactor; no guest-visible raw struct or serialized payload layout changed.
+
+### Tests
+- Re-read upstream `draw_manager.h` around `DrawManager::State`, `Clear`, `ProcessDraw`, and rasterizer dispatch.
+- Re-read upstream `draw_manager.cpp` around `DrawEnd`, `DrawIndexSmall`, `Clear`, and `ProcessDraw`.
+- Verified no remaining `draw_state.*` access to removed non-upstream fields under `video_core/src`.
+- Re-ran `cargo check -p video_core`.
+- Re-ran `cargo test -p video_core test_draw_state_snapshots_vertex_streams_and_limits_for_buffer_cache -- --nocapture`.
+- Re-ran `cargo test -p video_core update_render_targets_from_snapshot -- --nocapture`.
+- Re-ran `cargo test -p video_core test_rasterizer_null_noop -- --nocapture`.
+- Re-ran `cargo test -p video_core test_trait_object -- --nocapture`.
+- `cargo test -p video_core null_rasterizer -- --nocapture` still fails in pre-existing query/channel-lifecycle tests unrelated to this DrawState cleanup; the noop and trait-object tests covering this signature path pass.
+
+## 2026-05-23 — core/src/frontend/graphics_context.rs + video_core/src/gpu_thread.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/frontend/graphics_context.h and /home/vricosti/Dev/emulators/zuyu/src/video_core/gpu_thread.{h,cpp}
+
+### Intentional differences
+- Upstream `ThreadManager::StartThread` receives `Core::Frontend::GraphicsContext& context`, then `RunThread` keeps that reference and creates `auto current_context = context.Acquire()`. Rust now keeps the same non-owning relationship for the spawned GPU-thread closure through `GraphicsContextHandle`, centralizing trait-object lifetime erasure beside the `GraphicsContext` trait owner.
+- `GraphicsContextHandle` lives in `core/src/frontend/graphics_context.rs` because upstream owns the context interface in `core/frontend/graphics_context.h`; `gpu_thread.rs` only stores and uses the handle, matching upstream's ownership boundary.
+- `gpu_thread.rs` now creates `ScopedGraphicsContext` through the typed handle instead of reconstructing a trait-object fat pointer from raw `[usize; 2]` words at the call site. This mirrors upstream `auto current_context = context.Acquire()` and releases the context through RAII when the GPU thread exits.
+- `ThreadManager` and `run_thread` also keep the renderer rasterizer through `RasterizerHandle`, matching upstream's `VideoCore::RasterizerInterface* rasterizer` while avoiding call-site fat-pointer word storage.
+
+### Unintentional differences (to fix)
+- None introduced by this pass. The GPU-thread context lifetime now follows the existing Rust RAII guard, matching upstream `GraphicsContext::Scoped` ownership and drop ordering.
+
+### Missing items
+- Continue auditing remaining unsafe names like `notify_rasterizer_raw`; these are no longer `[usize; 2]` trait-object storage, but still mark call paths that should be reviewed against upstream ownership.
+
+### Binary layout verification
+- N/A: host-only graphics-context and rasterizer pointer bridge; no guest-visible raw struct or serialized payload layout changed.
+
+### Tests
+- Re-read upstream `core/frontend/graphics_context.h` around `GraphicsContext::Scoped` and `Acquire`.
+- Re-read upstream `video_core/gpu_thread.h` and `video_core/gpu_thread.cpp` around `ThreadManager::StartThread`, `RunThread`, `renderer.ReadRasterizer()`, and `context.Acquire()`.
+- Re-ran `cargo check -p core`.
+- Re-ran `cargo check -p video_core`.
+
+## 2026-05-23 — video_core/src/engines/maxwell_dma.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/engines/maxwell_dma.{h,cpp}
+
+### Intentional differences
+- Upstream stores `VideoCore::RasterizerInterface* rasterizer = nullptr` and assigns it in `MaxwellDMA::BindRasterizer`. Rust now stores the same non-owning relationship through `RasterizerHandle`, centralizing trait-object lifetime erasure in `rasterizer_interface.rs`.
+- DMA fallback flush/invalidate calls still route through the local `with_rasterizer_mut` helper. This pass only changes pointer representation; it does not change DMA launch behavior.
+
+### Unintentional differences (to fix)
+- None introduced by this pass. Broader DMA acceleration parity remains outside this pointer-ownership slice.
+
+### Missing items
+- Continue migrating remaining engine/GPU rasterizer pointer fields from `[usize; 2]` storage to `RasterizerHandle` or the stricter long-term owner model.
+
+### Binary layout verification
+- N/A: host-only rasterizer pointer ownership bridge; no guest-visible raw struct or serialized payload layout changed.
+
+### Tests
+- Re-read upstream `maxwell_dma.h` and `maxwell_dma.cpp` around `VideoCore::RasterizerInterface* rasterizer` and `BindRasterizer`.
+- Re-ran `cargo test -p video_core maxwell_dma -- --nocapture`.
+
+## 2026-05-23 — video_core/src/engines/kepler_memory.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/engines/kepler_memory.{h,cpp}
+
+### Intentional differences
+- Upstream `KeplerMemory::BindRasterizer` receives `VideoCore::RasterizerInterface*` and forwards it to `upload_state.BindRasterizer`. Rust keeps the same non-owning relationship through `RasterizerHandle` and uses it only when constructing the upload `FlushContext`.
+- The existing Rust `guest_memory_writer` callback remains a local bridge for host CPU writes; this pass does not alter that pre-existing Rust adaptation.
+
+### Unintentional differences (to fix)
+- None introduced by this pass. `engine_upload::State` still has its own Rust-specific context bridge rather than storing the rasterizer pointer exactly like upstream; that is a separate ownership slice.
+
+### Missing items
+- Continue migrating remaining engine/GPU rasterizer pointer fields from `[usize; 2]` storage.
+- Audit `engine_upload` after engine fields are migrated, because upstream `Upload::State::BindRasterizer` owns part of this relationship.
+
+### Binary layout verification
+- N/A: host-only rasterizer pointer ownership bridge; no guest-visible raw struct or serialized payload layout changed.
+
+### Tests
+- Re-read upstream `kepler_memory.h` and `kepler_memory.cpp` around `VideoCore::RasterizerInterface*`, `BindRasterizer`, `CallMethod`, and `CallMultiMethod`.
+- Re-ran `cargo test -p video_core kepler_memory -- --nocapture`.
+
+## 2026-05-23 — video_core/src/engines/kepler_compute.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/engines/kepler_compute.{h,cpp}
+
+### Intentional differences
+- Upstream stores `VideoCore::RasterizerInterface* rasterizer = nullptr` and assigns it in `KeplerCompute::BindRasterizer`, then forwards it to `upload_state.BindRasterizer`. Rust now stores the same non-owning relationship through `RasterizerHandle`.
+- Existing Rust compute launch handling remains QMD/dispatch-call based rather than the full upstream `ProcessLaunch -> rasterizer->DispatchCompute()` path. This pass only removes the raw `[usize; 2]` trait-object storage from the existing owner.
+
+### Unintentional differences (to fix)
+- `KeplerCompute::CallMethod`, upload tracking, `ProcessLaunch`, TIC/TSC reads, and rasterizer dispatch are still structurally divergent from upstream. They were not changed in this pointer-ownership slice.
+
+### Missing items
+- Port upstream `upload_state.ProcessExec/ProcessData` integration for compute uploads.
+- Port upstream `ProcessLaunch` ownership and dispatch path once the safe live rasterizer access model is available.
+- Audit `GetTICEntry` and `GetTSCEntry` parity after compute memory reads are moved closer to upstream.
+
+### Binary layout verification
+- N/A for this pass: host-only rasterizer pointer representation changed. Existing QMD parsing layout tests remain the local coverage for launch descriptor fields.
+
+### Tests
+- Re-read upstream `kepler_compute.h` and `kepler_compute.cpp` around `VideoCore::RasterizerInterface*`, `BindRasterizer`, `CallMethod`, `CallMultiMethod`, and `ProcessLaunch`.
+- Re-ran `cargo test -p video_core kepler_compute -- --nocapture`.
+
+## 2026-05-23 — video_core/src/engines/fermi_2d.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/engines/fermi_2d.{h,cpp}
+
+### Intentional differences
+- Upstream stores `VideoCore::RasterizerInterface* rasterizer = nullptr`, assigns it in `Fermi2D::BindRasterizer`, and uses it in `Blit` before falling back to `sw_blitter->Blit`. Rust now stores that same non-owning relationship through `RasterizerHandle` and preserves the accelerate-then-software-fallback order in `execute_pending`.
+- Rust still splits upstream immediate `Blit()` execution into `pending_blit` plus `execute_pending` for the existing `Engine` abstraction. This pass does not change that pre-existing scheduling adaptation.
+
+### Unintentional differences (to fix)
+- `Fermi2D::Blit` remains structurally split between `handle_blit`, `prepare_blit`, and `execute_pending`, whereas upstream keeps the full logic in `Fermi2D::Blit`. This was pre-existing and remains audit debt.
+
+### Missing items
+- Rejoin or document the `Blit` split against upstream once engine scheduling ownership is revisited.
+- Continue migrating the remaining rasterizer/engine pointer owners outside `Fermi2D`.
+
+### Binary layout verification
+- PASS for existing Fermi2D layout tests: surface/config/register-window tests still cover the guest-visible upstream register contracts. This pass only changed host pointer storage.
+
+### Tests
+- Re-read upstream `fermi_2d.h` and `fermi_2d.cpp` around `VideoCore::RasterizerInterface*`, `BindRasterizer`, `CallMethod`, `CallMultiMethod`, `ConsumeSinkImpl`, and `Blit`.
+- Re-ran `cargo test -p video_core fermi_2d -- --nocapture`.
+- Re-ran `cargo test -p video_core maxwell_draw_view_exposes_draw_boundary_state -- --nocapture`.
+
+## 2026-05-23 — video_core/src/engines/puller.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/engines/puller.{h,cpp}
+
+### Intentional differences
+- Upstream stores `VideoCore::RasterizerInterface* rasterizer = nullptr` and assigns it directly in `Puller::BindRasterizer`. Rust now stores the same non-owning relationship through `RasterizerHandle`, centralizing trait-object lifetime erasure in `rasterizer_interface.rs`.
+- Existing Rust `with_rasterizer_mut` remains the local dispatch helper for puller calls that need the rasterizer (`ReleaseFences`, `SignalSyncPoint`, `Query`, `SignalReference`, `WaitForIdle`, `InvalidateGPUCache`). This preserves the current call ordering while removing ad-hoc fat-pointer reconstruction from `Puller`.
+
+### Unintentional differences (to fix)
+- `Puller` still owns raw `gpu`, `dma_pusher`, and `channel_state` pointers. This pass only migrated the rasterizer pointer because upstream also models it as a separate `VideoCore::RasterizerInterface*`.
+- Full `cargo test -p video_core puller -- --nocapture` currently aborts in `semaphore_trigger_acquire_gequal_updates_acquire_registers_before_wait` because that test uses `Puller::default()` with a null GPU pointer and enters `read_gpu_u32`. This appears pre-existing and unrelated to the rasterizer storage migration, but it prevents full puller-suite validation.
+
+### Missing items
+- Fix or restructure the null-GPU puller semaphore acquire test without changing production behavior.
+- Continue long-term owner-model work for `Gpu`, `GpuThread`, and `DmaPusher`.
+
+### Binary layout verification
+- N/A: host-only rasterizer pointer ownership bridge; no guest-visible raw struct or serialized payload layout changed.
+
+### Tests
+- Re-read upstream `puller.h` and `puller.cpp` around `VideoCore::RasterizerInterface* rasterizer`, `BindRasterizer`, and rasterizer call sites.
+- Re-ran `cargo test -p video_core wait_for_idle_and_refcnt_call_rasterizer -- --nocapture`.
+- Re-ran `cargo test -p video_core semaphore_release_uses_payload_query_type -- --nocapture`.
+- Re-ran `cargo test -p video_core fence_ -- --nocapture`; relevant puller fence tests passed, but unrelated OpenGL tests matched by the filter failed because GL functions were not loaded.
+- Re-ran `cargo check -p video_core`.
+
+## 2026-05-23 — video_core/src/gpu.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/gpu.{h,cpp}
+
+### Intentional differences
+- Upstream `GPU::Impl` stores `VideoCore::RasterizerInterface* rasterizer = nullptr` after `renderer->ReadRasterizer()`. Rust now stores that same non-owning relationship as `Mutex<Option<RasterizerHandle>>` instead of reconstructing a trait object from `[usize; 2]` at every GPU call site.
+- `Gpu::rasterizer_handle()` is the Rust counterpart to upstream's direct `impl->rasterizer` member access. It returns a copy of the non-owning handle, and each call site dereferences through the centralized `RasterizerHandle` unsafe boundary.
+- Existing Rust mutexes around `renderer`, `rasterizer`, `gpu_thread`, and channel maps remain Rust ownership adaptations. This pass only changes the rasterizer pointer representation and leaves GPU command/lifetime ordering unchanged.
+
+### Unintentional differences (to fix)
+- `Gpu::on_cpu_read` still returns a preemptive empty-area placeholder instead of upstream's `rasterizer->GetFlushArea`, `RequestSyncOperation`, `TickGPU`, and `WaitForSyncOperation` path. This was pre-existing and remains behavioral debt.
+
+### Missing items
+- Audit `Gpu::OnCPURead` against upstream and port the full flush-area path now that GPU-thread rasterizer handle storage is unified.
+
+### Binary layout verification
+- N/A: host-only GPU/rasterizer pointer ownership bridge; no guest-visible raw struct or serialized payload layout changed.
+
+### Tests
+- Re-read upstream `gpu.h` and `gpu.cpp` around `GPU::Impl::rasterizer`, `BindRenderer`, `BindChannel`, `InitChannel`, `InitAddressSpace`, `FlushCommands`, `InvalidateGPUCache`, `RequestFlush`, and `OnCPUWrite`.
+- Re-ran `cargo test -p video_core init_channel_binds_rasterizer_and_initializes_channel -- --nocapture`.
+- Re-ran `cargo test -p video_core bind_channel_notifies_rasterizer_once_per_new_channel -- --nocapture`.
+- Re-ran `cargo check -p video_core`.
+
+## 2026-05-23 — video_core/src/gpu_thread.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/gpu_thread.{h,cpp}
+
+### Intentional differences
+- Upstream `VideoCommon::GPUThread::ThreadManager` stores `VideoCore::RasterizerInterface* rasterizer = nullptr` and assigns it from `renderer.ReadRasterizer()` in `StartThread`. Rust now stores the equivalent non-owning rasterizer relationship as `Option<RasterizerHandle>` instead of `[usize; 2]` fat-pointer words.
+- `RunThread` receives `Option<RasterizerHandle>` for queued `FlushRegion` / `InvalidateRegion` commands. This preserves upstream behavior while keeping rasterizer dereference/lifetime erasure centralized in `rasterizer_interface.rs`.
+- `GraphicsContext` storage has also moved to `GraphicsContextHandle`, and the GPU thread now uses `ScopedGraphicsContext`, matching upstream `auto current_context = context.Acquire()`.
+
+### Unintentional differences (to fix)
+- `ThreadManager::FlushRegion` still has the current Rust async/non-async behavior comments and does not fully port every upstream GPU-accuracy branch. This pass only removes rasterizer fat-pointer reconstruction.
+
+### Missing items
+- Audit `ThreadManager::FlushRegion` / async GPU accuracy behavior against upstream after the rasterizer pointer cleanup is complete.
+
+### Binary layout verification
+- N/A: host-only GPU-thread/rasterizer pointer ownership bridge; no guest-visible raw struct or serialized payload layout changed.
+
+### Tests
+- Re-read upstream `gpu_thread.h` and `gpu_thread.cpp` around `ThreadManager::rasterizer`, `StartThread`, `InvalidateRegion`, `FlushAndInvalidateRegion`, and `RunThread`.
+- Re-ran `cargo check -p video_core`.
+
+## 2026-05-23 — video_core/src/engines/engine_interface.rs + dma_pusher.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/engines/engine_interface.h and dma_pusher.{h,cpp}
+
+### Intentional differences
+- Upstream `DmaPusher` stores `std::array<Engines::EngineInterface*, max_subchannels> subchannels{}` and `BindSubchannel` assigns the raw engine pointer directly. Rust now stores the same non-owning relationship as `[Option<EngineHandle>; MAX_SUBCHANNELS]`, with the trait-object lifetime erasure centralized in `engine_interface.rs`.
+- `EngineHandle` lives next to the `EngineInterface` trait because that file maps to upstream `engine_interface.h`, the owner of the pointer target type. This mirrors the `RasterizerHandle` pattern and avoids per-call-site `[usize; 2]` reconstruction.
+- `DmaPusher::set_current_engine_dirty`, `dispatch_method`, and `dispatch_multi_method` now dereference through `EngineHandle::as_mut`, preserving upstream call ordering: dirty update, sink/consume logic, DMA segment update, then `CallMethod`/`CallMultiMethod`.
+
+### Unintentional differences (to fix)
+- `DmaPusher` still has broader structural differences from upstream command processing and memory-fetch integration. This pass only changes subchannel engine pointer representation.
+- `EngineHandle::as_mut` remains unsafe because it models upstream's non-owning raw pointer contract. A fully safe Rust owner model would need to express the lifetime between `ChannelState`, engines, and `DmaPusher`.
+
+### Missing items
+- Continue auditing `DmaPusher::Step`, `DispatchCalls`, and unsafe-read behavior against upstream after pointer cleanup.
+- Consider typed handles for the remaining non-engine fat pointers only if they become active behavioral risk; the current leftover `[usize; 2]` scan no longer includes rasterizer or engine subchannels.
+
+### Binary layout verification
+- N/A: host-only engine pointer ownership bridge; no guest-visible raw struct or serialized payload layout changed.
+
+### Tests
+- Re-read upstream `dma_pusher.h` and `dma_pusher.cpp` around `BindSubchannel`, `subchannels`, `CallMethod`, and `CallMultiMethod`.
+- Re-read upstream `engines/engine_interface.h`.
+- Re-ran `cargo test -p video_core dma_pusher -- --nocapture`.
+- Re-ran `cargo check -p video_core`.
+
+## 2026-05-23 — video_core/src/renderer_opengl/mod.rs + gl_rasterizer.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/renderer_opengl.h and gl_rasterizer.h
+
+### Intentional differences
+- Upstream owns `StateTracker state_tracker` directly in `RendererOpenGL` and passes it as `StateTracker&` into `RasterizerOpenGL` and `BlitScreen`. Rust now mirrors the single shared object with `Arc<parking_lot::Mutex<StateTracker>>`, avoiding the previous `NonNull<StateTracker>` self-reference while preserving one authoritative tracker for screen blit and Maxwell rasterization.
+- `RendererOpenGL::composite_impl` locks the shared tracker while applying the upstream `BindFramebuffer(0)` / `BlitScreen::DrawScreen` state notifications. `RasterizerOpenGL::draw` locks the same tracker only for `sync_viewport`, where upstream consumes `state_tracker.ClipControl` / `SetYNegate`.
+- The mutex is a Rust ownership adaptation, not an upstream behavior change: upstream's renderer/rasterizer lifetime graph is static C++ references; Rust needs an explicit safe shared handle because `RendererOpenGL` owns both the tracker and the rasterizer.
+
+### Unintentional differences (to fix)
+- `RasterizerOpenGL` still does not receive a direct `Maxwell3D&`/channel reference like upstream. This pass only removes the unsafe state-tracker reference; the live Maxwell3D draw-view boundary remains separate work.
+
+### Missing items
+- Consider moving `BlitScreen` to hold the same shared tracker handle directly, matching upstream member ownership more closely. Today `draw_screen` still receives `&mut StateTracker` from `RendererOpenGL` to keep this pass narrowly scoped.
+- Continue replacing snapshot-backed `Maxwell3DDrawView` fields with live safe owner access once the Maxwell3D/rasterizer boundary is ready.
+
+### Binary layout verification
+- N/A: host-side OpenGL state tracker ownership only; no guest-visible raw struct or serialized payload layout changed.
+
+### Tests
+- Re-ran `cargo check -p video_core`.
+
+## 2026-05-23 — video_core/src/rasterizer_interface.rs + engines/maxwell_3d.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/rasterizer_interface.h and engines/maxwell_3d.{h,cpp}
+
+### Intentional differences
+- Upstream stores `VideoCore::RasterizerInterface* rasterizer = nullptr` directly in `Maxwell3D` and assigns it in `Maxwell3D::BindRasterizer`. Rust now centralizes the equivalent non-owning pointer shape in `RasterizerHandle` inside `rasterizer_interface.rs`, the file corresponding to upstream `rasterizer_interface.h`.
+- `RasterizerHandle` performs the one required lifetime erasure from `&dyn RasterizerInterface` to a stored trait-object pointer. This is a Rust ownership adaptation only: the safety contract remains upstream's renderer/channel lifetime graph, and `Maxwell3D` still does not own or free the rasterizer.
+- The previous broad `unsafe impl Send for Maxwell3D` was removed. The `Send`/`Sync` contract is now attached to the pointer wrapper that actually requires it, reducing the unsafe surface while preserving the upstream raw-pointer scheduling model.
+
+### Unintentional differences (to fix)
+- The owner graph is still not fully safe Rust. `RasterizerHandle::as_mut` remains unsafe because upstream's raw pointer can alias if the surrounding GPU/rasterizer scheduling model is wrong. This pass centralizes the unsafe boundary but does not yet replace it with a fully expressed lifetime/lock model.
+
+### Missing items
+- Migrate other rasterizer pointer users to `RasterizerHandle` or a stricter future owner type where they still reconstruct trait objects manually.
+- Continue shrinking draw-state snapshots after the safe live Maxwell3D/rasterizer path is complete enough for OpenGL pipeline code to read upstream-owned state directly.
+
+### Binary layout verification
+- N/A: host-only pointer ownership bridge; no guest-visible raw struct or serialized payload layout changed.
+
+### Tests
+- Re-read upstream `rasterizer_interface.h`, `maxwell_3d.h`, and `maxwell_3d.cpp` around `RasterizerInterface* rasterizer`, `Rasterizer()`, and `BindRasterizer`.
+- Re-ran `cargo check -p video_core`.
+- Re-ran `cargo test -p video_core maxwell_draw_view_exposes -- --nocapture`.
+- Re-ran `cargo test -p video_core state_tracker -- --nocapture`.
+- Re-ran `cargo test -p video_core viewport_swizzle_components_match_upstream_bitfields -- --nocapture`.
+
+## 2026-05-23 — video_core/src/memory_manager.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/memory_manager.{h,cpp}
+
+### Intentional differences
+- Upstream stores `VideoCore::RasterizerInterface* rasterizer = nullptr` in `Tegra::MemoryManager` and assigns it in `MemoryManager::BindRasterizer`. Rust now stores the same non-owning relationship through `RasterizerHandle`, centralizing the trait-object lifetime erasure in `rasterizer_interface.rs`.
+- `MemoryManager::Unmap` now calls `rasterizer.unmap_memory(map_addr, map_size)` over the translated submapped device ranges before freeing page-table entries. This matches upstream `MemoryManager::Unmap`, which computes `GetSubmappedRangeImpl<false>` and calls `rasterizer->UnmapMemory`.
+- Rust still wraps `GpuMemoryManager` in the outer `MemoryManager` owner type for existing crate API compatibility. The rasterizer pointer remains owned by the inner upstream-equivalent manager.
+
+### Unintentional differences (to fix)
+- None introduced by this pass. The broader memory-manager implementation still has pre-existing simplifications documented elsewhere, but the rasterizer pointer storage and `Unmap` callback ordering now match the upstream surface covered here.
+
+### Missing items
+- Continue migrating the remaining engine and GPU owner fields from `[usize; 2]` rasterizer storage to `RasterizerHandle` or a stricter future owner model.
+
+### Binary layout verification
+- N/A: host-side memory-manager/rasterizer pointer ownership only; no guest-visible raw struct or serialized payload layout changed.
+
+### Tests
+- Re-read upstream `memory_manager.h` and `memory_manager.cpp` around `VideoCore::RasterizerInterface* rasterizer`, `BindRasterizer`, `Unmap`, and rasterizer callback sites.
+- Re-ran `cargo check -p video_core`.
+- Re-ran `cargo test -p video_core memory_manager -- --nocapture`.
+- Re-ran `cargo test -p video_core maxwell_draw_view_exposes -- --nocapture`.
+- Re-ran `cargo test -p video_core state_tracker -- --nocapture`.
+- Re-ran `cargo test -p video_core viewport_swizzle_components_match_upstream_bitfields -- --nocapture`.
+- Re-ran `cargo test -p video_core maxwell_draw_view_exposes -- --nocapture`.
+- Re-ran `cargo test -p video_core viewport_swizzle_components_match_upstream_bitfields -- --nocapture`.
+- Re-ran `cargo test -p video_core state_tracker -- --nocapture`.
+
+## 2026-05-23 — video_core/src/engines/maxwell_3d.rs rasterizer pointer storage vs /home/vricosti/Dev/emulators/zuyu/src/video_core/engines/maxwell_3d.{h,cpp}
+
+### Intentional differences
+- Upstream stores `VideoCore::RasterizerInterface* rasterizer = nullptr` and `BindRasterizer` assigns that pointer directly. Rust now stores `Option<*const (dyn RasterizerInterface + 'static)>` in `Maxwell3D`, matching the non-owning pointer shape more directly than the previous `[usize; 2]` fat-pointer word storage.
+- Rust performs one lifetime erasure at `bind_rasterizer` because the renderer-owned rasterizer outlives channel engines by construction, but Rust cannot express that existing owner graph yet. Dereferencing remains centralized in `Maxwell3D::with_rasterizer_mut`, keeping the unsafe boundary local to the upstream owner.
+- `unsafe impl Send for Maxwell3D` is required because upstream freely moves/schedules channel state while holding non-owning rasterizer pointers. The safety contract is the same as upstream: `Maxwell3D` does not own or free the rasterizer, and the renderer lifetime dominates bound engine use.
+
+### Unintentional differences (to fix)
+- This is still not the final safe Rust owner model. It removes the `[usize; 2]` representation and scattered transmute-based reconstruction inside `Maxwell3D`, but the non-owning pointer remains unsafe by nature.
+
+### Missing items
+- Replace the broader renderer/rasterizer owner graph (`Gpu`, `GpuThread`, `Puller`, `MemoryManager`, other engines) with an explicit safe shared rasterizer handle before claiming the rasterizer lifetime model is fully safe.
+- Port the remaining engines away from `[usize; 2]` rasterizer storage only after the shared owner type exists, otherwise the same lifetime/`Send` issue will recur file by file.
+
+### Binary layout verification
+- N/A: host-only pointer storage; no guest-visible raw struct or serialized payload layout changed.
+
+### Tests
+- Re-ran `cargo check -p video_core`.
+- Re-ran `cargo test -p video_core state_tracker -- --nocapture`.
+- Re-ran `cargo test -p video_core maxwell_draw_view_exposes -- --nocapture`.
+- Re-ran `cargo test -p video_core viewport_swizzle_components_match_upstream_bitfields -- --nocapture`.
+
+## 2026-05-23 — video_core/src/engines/draw_manager.rs + maxwell_3d.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/engines/draw_manager.{h,cpp} and maxwell_3d.{h,cpp}
+
+### Intentional differences
+- Upstream `DrawManager` owns a `Maxwell3D*` and dispatches through `maxwell3d->rasterizer->Draw/Clear/DrawIndirect/DrawTexture`. Rust keeps `DrawManager` independent from a concrete `Maxwell3D` type through `Maxwell3DAccess`, but the rasterizer dispatch now happens through `with_rasterizer_mut`, so mutable rasterizer access remains owned by the Maxwell3D boundary instead of being exposed as a returned `&mut dyn RasterizerInterface`.
+- The callback is object-safe (`&mut dyn FnMut`) because `DrawManager` uses `&mut dyn Maxwell3DAccess` in the current Rust port. This is a Rust trait-bound adaptation only; the behavior remains the upstream call ordering: update draw state, check `ShouldExecute`, then dispatch to the bound rasterizer.
+
+### Unintentional differences (to fix)
+- `Maxwell3D` still stores the bound rasterizer through the existing raw trait-object representation and reconstructs it inside its private `with_rasterizer_mut` helper. This pass removes the rasterizer reference leak from `DrawManager`, but does not yet replace the internal storage with a fully safe upstream-equivalent owner handle.
+
+### Missing items
+- Replace the internal raw rasterizer storage in `Maxwell3D` with a safe lifetime/owner model that still mirrors upstream `BindRasterizer(VideoCore::RasterizerInterface*)` ownership.
+- Continue shrinking `Maxwell3DDrawRegisters` snapshots once the safe live Maxwell3D/rasterizer draw-view boundary exists.
+
+### Binary layout verification
+- N/A: engine/rasterizer host ownership only; no guest-visible raw struct or serialized payload layout changed.
+
+### Tests
+- Re-ran `cargo check -p video_core`.

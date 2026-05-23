@@ -7,6 +7,7 @@
 
 use std::collections::HashMap;
 
+use crate::engines::draw_manager::Maxwell3DRenderTargets;
 use crate::engines::maxwell_3d::RenderTargetInfo;
 use crate::framebuffer_config::FramebufferConfig;
 use crate::renderer_base::GuestMemoryWriter;
@@ -1607,7 +1608,7 @@ impl TextureCache {
 
         for image_id in images {
             // Make sure the backend image slot exists for this base image —
-            // `update_render_targets_from_draw_state` typically pre-populates
+            // `update_render_targets_from_snapshot` typically pre-populates
             // it, but defensive insertion here keeps offscreen downloads
             // working even before any draw has touched the slot.
             let base_image = self.base.slot_images[image_id].clone();
@@ -1799,13 +1800,13 @@ impl TextureCache {
         self.base.commit_async_flushes();
     }
 
-    pub fn update_render_targets_from_draw_state(
+    pub fn update_render_targets_from_snapshot(
         &mut self,
-        draw_state: &crate::engines::draw_manager::DrawState,
+        render_targets: &Maxwell3DRenderTargets,
         gpu_to_cpu: impl FnMut(crate::texture_cache::image_base::GPUVAddr) -> Option<u64>,
     ) {
         self.base
-            .update_render_targets_from_draw_state(draw_state, gpu_to_cpu);
+            .update_render_targets_from_snapshot(render_targets, gpu_to_cpu);
         for (image_id, image) in self.base.slot_images.iter() {
             if image_id == crate::texture_cache::types::NULL_IMAGE_ID {
                 continue;
@@ -1816,19 +1817,19 @@ impl TextureCache {
         }
     }
 
-    pub fn prepare_render_targets_from_draw_state(
+    pub fn prepare_render_targets_from_snapshot(
         &mut self,
-        draw_state: &crate::engines::draw_manager::DrawState,
+        render_targets: &Maxwell3DRenderTargets,
         mut read_gpu: Option<&mut dyn FnMut(u64, &mut [u8]) -> bool>,
     ) {
         let mut image_ids = Vec::new();
-        for &target in draw_state
+        for &target in render_targets
             .rt_control
             .map
             .iter()
-            .take(draw_state.rt_control.count.min(8) as usize)
+            .take(render_targets.rt_control.count.min(8) as usize)
         {
-            let Some(rt) = draw_state.render_targets.get(target as usize) else {
+            let Some(rt) = render_targets.render_targets.get(target as usize) else {
                 continue;
             };
             if rt.address == 0 || rt.width == 0 || rt.height == 0 {
