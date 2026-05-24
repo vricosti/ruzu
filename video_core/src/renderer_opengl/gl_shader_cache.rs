@@ -16,12 +16,14 @@ use shader_recompiler::shader_info::Info as ShaderInfo;
 use shader_recompiler::{
     compile_dual_vertex_shader_glsl_at_offset_with_bindings,
     compile_shader_glsl_at_offset_with_bindings,
-    compile_shader_glsl_at_offset_with_bindings_and_texture_bound, CompiledGlslShader, ShaderStage,
+    compile_shader_glsl_at_offset_with_bindings_and_texture_bound,
+    compile_shader_glsl_at_offset_with_bindings_and_texture_bound_and_sph, CompiledGlslShader,
+    ShaderStage,
 };
 
 use crate::shader_cache::{GraphicsEnvironments, ShaderCache as SharedShaderCache};
 use crate::shader_environment::{GenericEnvironment, GpuMemoryReader};
-use shader_recompiler::environment::Environment as ShaderEnvironment;
+use crate::transform_feedback;
 use shader_recompiler::program_header::ProgramHeader;
 
 use super::gl_compute_pipeline::{ComputePipeline, ComputePipelineKey};
@@ -604,6 +606,7 @@ impl ShaderCache {
                         stage,
                         env.cached_instruction_start(),
                         Some(texture_bound_buffer),
+                        Some(env.sph()),
                         &runtime_info,
                         &mut bindings,
                     );
@@ -795,6 +798,7 @@ impl ShaderCache {
                 stage,
                 env.cached_instruction_start(),
                 Some(texture_bound_buffer),
+                Some(env.sph()),
                 &runtime_info,
                 &mut bindings,
             );
@@ -1089,6 +1093,7 @@ impl ShaderCache {
                     actual_stage,
                     env.cached_instruction_start(),
                     Some(texture_bound_buffer),
+                    Some(env.sph()),
                     &runtime_info,
                     &mut bindings,
                 );
@@ -1240,6 +1245,7 @@ impl ShaderCache {
                 actual_stage,
                 env.cached_instruction_start(),
                 Some(texture_bound_buffer),
+                Some(env.sph()),
                 &runtime_info,
                 &mut bindings,
             );
@@ -1379,6 +1385,24 @@ impl ShaderCache {
         }
 
         match stage {
+            ShaderStage::VertexB | ShaderStage::Geometry => {
+                if key.xfb_enabled() {
+                    let (varyings, count) =
+                        transform_feedback::make_transform_feedback_varyings(&key.xfb_state);
+                    info.xfb_varyings = varyings
+                        .iter()
+                        .map(|varying| {
+                            shader_recompiler::runtime_info::TransformFeedbackVarying {
+                                buffer: varying.buffer,
+                                stride: varying.stride,
+                                offset: varying.offset,
+                                components: varying.components,
+                            }
+                        })
+                        .collect();
+                    info.xfb_count = count;
+                }
+            }
             ShaderStage::TessellationEval => {
                 info.tess_clockwise = !key.tessellation_clockwise();
                 info.tess_primitive = match key.tessellation_primitive() {
@@ -1443,6 +1467,7 @@ impl ShaderCache {
             stage,
             base_offset,
             None,
+            None,
             &runtime_info,
             &mut bindings,
         )
@@ -1454,20 +1479,34 @@ impl ShaderCache {
         stage: ShaderStage,
         base_offset: u32,
         texture_bound_buffer: Option<u32>,
+        sph: Option<&ProgramHeader>,
         runtime_info: &RuntimeInfo,
         bindings: &mut shader_recompiler::backend::bindings::Bindings,
     ) -> CompiledGlslShader {
         let profile = ShaderProfile::default();
         let compiled = if let Some(texture_bound_buffer) = texture_bound_buffer {
-            compile_shader_glsl_at_offset_with_bindings_and_texture_bound(
-                code,
-                stage,
-                base_offset,
-                texture_bound_buffer,
-                &profile,
-                runtime_info,
-                bindings,
-            )
+            if let Some(sph) = sph {
+                compile_shader_glsl_at_offset_with_bindings_and_texture_bound_and_sph(
+                    code,
+                    stage,
+                    base_offset,
+                    texture_bound_buffer,
+                    sph,
+                    &profile,
+                    runtime_info,
+                    bindings,
+                )
+            } else {
+                compile_shader_glsl_at_offset_with_bindings_and_texture_bound(
+                    code,
+                    stage,
+                    base_offset,
+                    texture_bound_buffer,
+                    &profile,
+                    runtime_info,
+                    bindings,
+                )
+            }
         } else {
             compile_shader_glsl_at_offset_with_bindings(
                 code,

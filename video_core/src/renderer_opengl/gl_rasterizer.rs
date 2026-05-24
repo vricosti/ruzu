@@ -1551,9 +1551,32 @@ impl RasterizerInterface for RasterizerOpenGL {
             );
         }
 
+        // Pipeline lookup MUST happen before any FBO/state binding. Upstream
+        // (`gl_rasterizer.cpp::PrepareDraw`) does this first: `if (!pipeline)
+        // return;` runs before `pipeline->Configure` (which is where the FBO
+        // is eventually bound via `state_tracker.BindFramebuffer`). If we bind
+        // the draw framebuffer first and then early-return on a pipeline miss,
+        // the next swap presents that FBO's stale (often black) texture —
+        // observed as MK8D's "1-of-3 flinger buffers stays black" symptom.
+        let step = Instant::now();
+        record_gl_draw_stage(draw_seq, 3);
+        trace_gl_draw_stall!("[GL_DRAW_STALL] seq={} before_pipeline", draw_seq);
+        let Some(pipeline) = self
+            .gl_shader_cache
+            .current_graphics_pipeline_with_shared_cache(&mut self.shader_cache)
+        else {
+            // No pipeline yet — either async compilation is in flight or
+            // there is nothing to draw. Upstream silently skips in this case.
+            if let Some(callback) = gpu_tick_callback.as_ref() {
+                callback();
+            }
+            debug!("RasterizerOpenGL::draw skipped — no graphics pipeline available");
+            return;
+        };
+
         let mut bound_draw_framebuffer = None;
         if let Some(mm) = self.channel_memory_manager.as_ref().cloned() {
-            let step = Instant::now();
+            let rt_step = Instant::now();
             let texture_cache: *mut OpenGLTextureCache = &mut self.texture_cache;
             let render_targets = draw_view.render_targets();
             record_gl_draw_stage(draw_seq, 1);
@@ -1590,7 +1613,7 @@ impl RasterizerInterface for RasterizerOpenGL {
             if trace_draw {
                 info!(
                     "[GL_DRAW_PROFILE] update_render_targets_us={}",
-                    step.elapsed().as_micros()
+                    rt_step.elapsed().as_micros()
                 );
             }
         } else if std::env::var_os("RUZU_TRACE_RT").is_some() {
@@ -1609,22 +1632,6 @@ impl RasterizerInterface for RasterizerOpenGL {
         } else if std::env::var_os("RUZU_TRACE_RT").is_some() {
             info!("[RT] draw no framebuffer bound");
         }
-
-        let step = Instant::now();
-        record_gl_draw_stage(draw_seq, 3);
-        trace_gl_draw_stall!("[GL_DRAW_STALL] seq={} before_pipeline", draw_seq);
-        let Some(pipeline) = self
-            .gl_shader_cache
-            .current_graphics_pipeline_with_shared_cache(&mut self.shader_cache)
-        else {
-            // No pipeline yet — either async compilation is in flight or
-            // there is nothing to draw. Upstream silently skips in this case.
-            if let Some(callback) = gpu_tick_callback.as_ref() {
-                callback();
-            }
-            debug!("RasterizerOpenGL::draw skipped — no graphics pipeline available");
-            return;
-        };
         record_gl_draw_stage(draw_seq, 4);
         trace_gl_draw_stall!("[GL_DRAW_STALL] seq={} after_pipeline", draw_seq);
         if let Some(callback) = gpu_tick_callback.as_ref() {

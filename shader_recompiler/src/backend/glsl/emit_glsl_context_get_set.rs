@@ -230,6 +230,77 @@ pub fn emit_get_cbuf(
             };
             get_cbuf(ctx, program, &ret, binding, offset, 32, cast, None);
         }
+        Opcode::GetCbufU32x2 => {
+            let cast = if ctx.profile.has_gl_cbuf_ftou_bug {
+                ""
+            } else {
+                "ftou"
+            };
+            let ret = ctx
+                .var_alloc
+                .define(inst_mut(program, inst_ref), GlslVarType::U32x2);
+            if offset.is_immediate() {
+                let u32_offset = offset.imm_u32();
+                let signed_offset = u32_offset as i32;
+                const CBUF_SIZE: u32 = 0x10000;
+                if signed_offset < 0 || u32_offset > CBUF_SIZE {
+                    ctx.add_fmt(format!("{}=uvec2(0u);", ret));
+                    return;
+                }
+                let cbuf = format!("{}_cbuf{}", ctx.stage_name, binding.imm_u32());
+                if u32_offset % 2 == 0 {
+                    ctx.add_fmt(format!(
+                        "{}={}({}[{}].{}{});",
+                        ret,
+                        cast,
+                        cbuf,
+                        u32_offset / 16,
+                        offset_swizzle(u32_offset),
+                        offset_swizzle(u32_offset + 4)
+                    ));
+                } else {
+                    ctx.add_fmt(format!(
+                        "{}=uvec2({}({}[{}].{}),{}({}[{}].{}));",
+                        ret,
+                        cast,
+                        cbuf,
+                        u32_offset / 16,
+                        offset_swizzle(u32_offset),
+                        cast,
+                        cbuf,
+                        (u32_offset + 4) / 16,
+                        offset_swizzle(u32_offset + 4)
+                    ));
+                }
+                return;
+            }
+
+            let offset_var = ctx.var_alloc.consume(program, offset);
+            let cbuf = choose_cbuf(ctx, program, binding, &format!("{}>>4", offset_var));
+            if !ctx.profile.has_gl_component_indexing_bug {
+                ctx.add_fmt(format!(
+                    "{}=uvec2({}({}[({}>>2)%4]),{}({}[(({}+4)>>2)%4]));",
+                    ret, cast, cbuf, offset_var, cast, cbuf, offset_var
+                ));
+                return;
+            }
+
+            let cbuf_offset = format!("{}>>2", offset_var);
+            for swizzle in 0..4 {
+                ctx.add_fmt(format!(
+                    "if(({}&3)=={}){}=uvec2({}({}.{}),{}({}.{}));",
+                    cbuf_offset,
+                    swizzle,
+                    ret,
+                    cast,
+                    cbuf,
+                    SWIZZLE[swizzle],
+                    cast,
+                    cbuf,
+                    SWIZZLE[(swizzle + 1) % 4]
+                ));
+            }
+        }
         _ => unreachable!("not a cbuf opcode: {:?}", opcode),
     }
 }
@@ -388,6 +459,31 @@ mod tests {
         assert!(source.contains("layout(location=0)out vec4 out_attr0;"));
         assert!(source.contains("out_attr0.x=f_0;"));
         assert!(!source.contains("b_0"));
+    }
+
+    #[test]
+    fn glsl_cbuf_u32x2_matches_upstream_vector_load_shape() {
+        let mut program = crate::ir::Program::new(ShaderStage::VertexB);
+        program.blocks.push(Block::new());
+        program.info.register_cbuf(0);
+        {
+            let mut emitter = Emitter::new(&mut program, 0);
+            let pair = emitter.get_cbuf_u32x2(Value::ImmU32(0), Value::ImmU32(16));
+            let x = emitter.composite_extract_u32x2(pair, Value::ImmU32(0));
+            emitter.set_attribute(Attribute::generic(0, 0), x, Value::ImmU32(0));
+        }
+        optimize(&mut program);
+
+        let mut bindings = Bindings::default();
+        let source = emit_glsl(
+            &Profile::default(),
+            &RuntimeInfo::default(),
+            &mut program,
+            &mut bindings,
+        );
+
+        assert!(source.contains("u2_0=ftou(vs_cbuf0[1].xy);"));
+        assert!(source.contains("u_0=u2_0.x;"));
     }
 
     #[test]
