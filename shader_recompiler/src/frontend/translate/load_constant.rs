@@ -105,13 +105,11 @@ pub fn ldc(tv: &mut TranslatorVisitor, insn: u64) {
             let final_index = tv.ir.iadd_32(seg_index, imm_index);
             (final_index, seg_offset)
         }
+        // Upstream `LDC` throws NotImplementedException for IL / ISL
+        // modes (indirect-load with size encoding) — they need NVN-style
+        // descriptor array support that isn't wired.
         LdcMode::Il | LdcMode::Isl => {
-            log::warn!(
-                "LDC: mode {:?} not implemented, using Default fallback",
-                mode
-            );
-            let offset = tv.ir.iadd_32(reg_val, imm_offset);
-            (imm_index, offset)
+            panic!("LDC: mode {:?} not implemented", mode);
         }
     };
 
@@ -124,10 +122,10 @@ pub fn ldc(tv: &mut TranslatorVisitor, insn: u64) {
         LdcSize::S16 => tv.ir.get_cbuf_s16(cb_index, byte_offset),
         LdcSize::B32 => tv.ir.get_cbuf_u32(cb_index, byte_offset),
         LdcSize::B64 => {
-            // 64-bit: load two consecutive 32-bit words into aligned register pair
+            // 64-bit: load two consecutive 32-bit words into aligned register pair.
+            // Upstream throws on unaligned dest_reg.
             if dest_reg & 1 != 0 {
-                log::warn!("LDC.B64: unaligned destination register {}", dest_reg);
-                return;
+                panic!("LDC.B64: unaligned destination register {}", dest_reg);
             }
             let lo = tv.ir.get_cbuf_u32(cb_index.clone(), byte_offset.clone());
             let offset_hi = tv.ir.iadd_32(byte_offset, Value::ImmU32(4));

@@ -590,6 +590,26 @@ fn sync_depth_stencil_state(depth_stencil: &DepthStencilInfo) {
     }
 }
 
+fn sync_framebuffer_srgb(
+    draw_view: &Maxwell3DDrawView<'_>,
+    mut state_tracker: Option<&mut StateTracker>,
+) {
+    let flags = draw_view.dirty_flags();
+    let tracker_dirty = state_tracker
+        .as_deref_mut()
+        .is_some_and(|tracker| tracker.exchange(GlDirty::FRAMEBUFFER_SRGB));
+    if !flags[GlDirty::FRAMEBUFFER_SRGB as usize] && !tracker_dirty {
+        return;
+    }
+    unsafe {
+        if draw_view.framebuffer_srgb() {
+            gl::Enable(gl::FRAMEBUFFER_SRGB);
+        } else {
+            gl::Disable(gl::FRAMEBUFFER_SRGB);
+        }
+    }
+}
+
 fn viewport_front_face_to_gl(
     front_face: FrontFace,
     window_origin_flip_y: bool,
@@ -839,6 +859,7 @@ fn sync_viewport(
     }
     sync_depth_stencil_state(&draw_view.depth_stencil());
     sync_rasterizer_state(draw_view.rasterizer());
+    sync_framebuffer_srgb(draw_view, state_tracker);
 }
 
 fn sync_vertex_formats(vao: u32, draw_view: &Maxwell3DDrawView<'_>) {

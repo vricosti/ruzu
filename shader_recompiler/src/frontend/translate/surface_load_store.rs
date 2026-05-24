@@ -3,35 +3,20 @@
 
 //! Port of zuyu/src/shader_recompiler/frontend/maxwell/translate/impl/surface_load_store.cpp
 //!
-//! Implements SULD and SUST (surface load and surface store).
+//! Upstream `SULD`/`SUST` translation throws `NotImplementedException`
+//! until the full storage-image dispatch is wired. The GLSL backend
+//! has `ImageRead`/`ImageWrite` emit handlers (see `emit_glsl_image.rs`)
+//! but the SULD/SUST → `ImageRead`/`ImageWrite` IR generation path is
+//! not yet bridged. Panic instead of silently storing 0 in the dst.
 
 use super::TranslatorVisitor;
 
 /// SULD — Surface Load.
-///
-/// Loads texel data from a surface (image) at given integer coordinates.
-///
-/// Not yet implemented: requires surface/image IR opcodes (ImageRead, etc.).
-/// Emits a no-op and logs a warning.
-pub fn suld(tv: &mut TranslatorVisitor, insn: u64) {
-    let _ = insn;
-    log::warn!(
-        "SULD: surface load IR not yet ported — emitting no-op (insn={:#018x})",
-        insn
-    );
-    let dst = tv.dst_reg(insn);
-    tv.set_x(dst, crate::ir::value::Value::ImmU32(0));
+pub fn suld(_tv: &mut TranslatorVisitor, _insn: u64) {
+    panic!("SULD: surface load not implemented");
 }
 
 /// SUST — Surface Store.
-///
-/// Stores texel data into a surface (image) at given integer coordinates.
-///
-/// Not yet implemented: requires surface/image IR opcodes (ImageWrite, etc.).
-/// Emits a no-op and logs a warning.
-pub fn sust(_tv: &mut TranslatorVisitor, insn: u64) {
-    log::warn!(
-        "SUST: surface store IR not yet ported — emitting no-op (insn={:#018x})",
-        insn
-    );
+pub fn sust(_tv: &mut TranslatorVisitor, _insn: u64) {
+    panic!("SUST: surface store not implemented");
 }

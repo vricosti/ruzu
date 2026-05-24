@@ -39,10 +39,10 @@ fn shf_impl(
     let max_shift = MaxShift::from_bits(field(insn, 37, 2));
     let wrap = bit(insn, 50);
 
-    // If max_shift is Undefined, emit a no-op (upstream throws).
+    // Upstream throws NotImplementedException for the reserved
+    // Undefined max_shift encoding.
     if max_shift == MaxShift::Undefined {
-        log::warn!("SHF: Undefined MaxShift value, emitting no-op");
-        return;
+        panic!("SHF: Undefined MaxShift value");
     }
 
     let low_bits = tv.x(lo_bits_reg);
@@ -64,15 +64,16 @@ fn shf_impl(
         tv.ir.u_min_32(shift, max_val)
     };
 
-    // Perform the 64-bit shift.
+    // Perform the 64-bit shift. Upstream `PackedShift` selects between
+    // `ShiftRightArithmetic64` (signed) and `ShiftRightLogical64`
+    // (unsigned) based on `max_shift == S64`.
+    let is_signed = max_shift == MaxShift::S64;
     let shifted = if !right_shift {
         tv.ir.shift_left_logical_64(packed_int, safe_shift)
+    } else if is_signed {
+        tv.ir.shift_right_arithmetic_64(packed_int, safe_shift)
     } else {
-        // We lack ShiftRightLogical64 / ShiftRightArithmetic64 in the emitter.
-        // Implement SHR via negate-left-shift approximation only for U32 max_shift.
-        // For 64-bit cases, emit a warn and return low bits unchanged.
-        log::warn!("SHF: right shift 64-bit — partial implementation");
-        packed_int
+        tv.ir.shift_right_logical_64(packed_int, safe_shift)
     };
 
     let unpacked = tv.ir.unpack_uint_2x32(shifted);

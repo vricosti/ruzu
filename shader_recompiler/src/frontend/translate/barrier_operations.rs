@@ -16,9 +16,12 @@ pub fn bar(v: &mut TranslatorVisitor<'_>, insn: u64) {
     // etc.
     let mode_bits = insn & 0x0000_009B_0000_0000u64;
     let is_sync = mode_bits == 0x0000_0080_0000_0000u64;
+    // Upstream `TranslatorVisitor::BAR` throws NotImplementedException
+    // for any mode other than SYNC and for any non-zero/non-immediate
+    // input A/B (only `BAR.SYNC 0x0, 0x0` is implemented). We panic to
+    // match.
     if !is_sync {
-        log::warn!("BAR: unsupported mode bits 0x{:016X}, skipping", insn);
-        return;
+        panic!("BAR: unsupported mode bits 0x{:016X}", insn);
     }
 
     let is_a_imm = bit(insn, 43);
@@ -27,20 +30,16 @@ pub fn bar(v: &mut TranslatorVisitor<'_>, insn: u64) {
     let imm_b = field(insn, 20, 12);
 
     if !is_a_imm {
-        log::warn!("BAR: non-immediate input A not implemented");
-        return;
+        panic!("BAR: non-immediate input A not implemented");
     }
     if imm_a != 0 {
-        log::warn!("BAR: non-zero input A not implemented");
-        return;
+        panic!("BAR: non-zero input A not implemented");
     }
     if !is_b_imm {
-        log::warn!("BAR: non-immediate input B not implemented");
-        return;
+        panic!("BAR: non-immediate input B not implemented");
     }
     if imm_b != 0 {
-        log::warn!("BAR: non-zero input B not implemented");
-        return;
+        panic!("BAR: non-zero input B not implemented");
     }
 
     v.ir.barrier();

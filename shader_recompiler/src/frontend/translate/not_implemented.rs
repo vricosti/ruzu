@@ -53,136 +53,136 @@ impl<'a> TranslatorVisitor<'a> {
 
     /// B2R — Not implemented in upstream.
     pub fn translate_b2r(&mut self, _insn: u64) {
-        log::error!("Instruction B2R is not implemented");
+        panic!("Instruction B2R not implemented (upstream throws NotImplementedException)");
     }
 
     /// BPT — Not implemented in upstream.
     pub fn translate_bpt(&mut self, _insn: u64) {
-        log::error!("Instruction BPT is not implemented");
+        panic!("Instruction BPT not implemented (upstream throws NotImplementedException)");
     }
 
     /// CCTL — Not implemented in upstream.
     pub fn translate_cctl(&mut self, _insn: u64) {
-        log::error!("Instruction CCTL is not implemented");
+        panic!("Instruction CCTL not implemented (upstream throws NotImplementedException)");
     }
 
     /// CCTLL — Not implemented in upstream.
     pub fn translate_cctll(&mut self, _insn: u64) {
-        log::error!("Instruction CCTLL is not implemented");
+        panic!("Instruction CCTLL not implemented (upstream throws NotImplementedException)");
     }
 
     /// CS2R — Not implemented in upstream.
     pub fn translate_cs2r(&mut self, _insn: u64) {
-        log::error!("Instruction CS2R is not implemented");
+        panic!("Instruction CS2R not implemented (upstream throws NotImplementedException)");
     }
 
     /// GETCRSPTR — Not implemented in upstream.
     pub fn translate_getcrsptr(&mut self, _insn: u64) {
-        log::error!("Instruction GETCRSPTR is not implemented");
+        panic!("Instruction GETCRSPTR not implemented (upstream throws NotImplementedException)");
     }
 
     /// GETLMEMBASE — Not implemented in upstream.
     pub fn translate_getlmembase(&mut self, _insn: u64) {
-        log::error!("Instruction GETLMEMBASE is not implemented");
+        panic!("Instruction GETLMEMBASE not implemented (upstream throws NotImplementedException)");
     }
 
     /// IDE — Not implemented in upstream.
     pub fn translate_ide(&mut self, _insn: u64) {
-        log::error!("Instruction IDE is not implemented");
+        panic!("Instruction IDE not implemented (upstream throws NotImplementedException)");
     }
 
     /// JCAL — Not implemented in upstream.
     pub fn translate_jcal(&mut self, _insn: u64) {
-        log::error!("Instruction JCAL is not implemented");
+        panic!("Instruction JCAL not implemented (upstream throws NotImplementedException)");
     }
 
     /// JMP — Not implemented in upstream.
     pub fn translate_jmp(&mut self, _insn: u64) {
-        log::error!("Instruction JMP is not implemented");
+        panic!("Instruction JMP not implemented (upstream throws NotImplementedException)");
     }
 
     /// LD — Not implemented in upstream.
     pub fn translate_ld(&mut self, _insn: u64) {
-        log::error!("Instruction LD is not implemented");
+        panic!("Instruction LD not implemented (upstream throws NotImplementedException)");
     }
 
     /// LEPC — Not implemented in upstream.
     pub fn translate_lepc(&mut self, _insn: u64) {
-        log::error!("Instruction LEPC is not implemented");
+        panic!("Instruction LEPC not implemented (upstream throws NotImplementedException)");
     }
 
     /// LONGJMP — Not implemented in upstream.
     pub fn translate_longjmp(&mut self, _insn: u64) {
-        log::error!("Instruction LONGJMP is not implemented");
+        panic!("Instruction LONGJMP not implemented (upstream throws NotImplementedException)");
     }
 
     /// PEXIT — Not implemented in upstream.
     pub fn translate_pexit(&mut self, _insn: u64) {
-        log::error!("Instruction PEXIT is not implemented");
+        panic!("Instruction PEXIT not implemented (upstream throws NotImplementedException)");
     }
 
     /// PLONGJMP — Not implemented in upstream.
     pub fn translate_plongjmp(&mut self, _insn: u64) {
-        log::error!("Instruction PLONGJMP is not implemented");
+        panic!("Instruction PLONGJMP not implemented (upstream throws NotImplementedException)");
     }
 
     /// PRET — Not implemented in upstream.
     pub fn translate_pret(&mut self, _insn: u64) {
-        log::error!("Instruction PRET is not implemented");
+        panic!("Instruction PRET not implemented (upstream throws NotImplementedException)");
     }
 
     /// R2B — Not implemented in upstream.
     pub fn translate_r2b(&mut self, _insn: u64) {
-        log::error!("Instruction R2B is not implemented");
+        panic!("Instruction R2B not implemented (upstream throws NotImplementedException)");
     }
 
     /// RET — Not implemented in upstream.
     pub fn translate_ret(&mut self, _insn: u64) {
-        log::error!("Instruction RET is not implemented");
+        panic!("Instruction RET not implemented (upstream throws NotImplementedException)");
     }
 
     /// RTT — Not implemented in upstream.
     pub fn translate_rtt(&mut self, _insn: u64) {
-        log::error!("Instruction RTT is not implemented");
+        panic!("Instruction RTT not implemented (upstream throws NotImplementedException)");
     }
 
     /// SETCRSPTR — Not implemented in upstream.
     pub fn translate_setcrsptr(&mut self, _insn: u64) {
-        log::error!("Instruction SETCRSPTR is not implemented");
+        panic!("Instruction SETCRSPTR not implemented (upstream throws NotImplementedException)");
     }
 
     /// SETLMEMBASE — Not implemented in upstream.
     pub fn translate_setlmembase(&mut self, _insn: u64) {
-        log::error!("Instruction SETLMEMBASE is not implemented");
+        panic!("Instruction SETLMEMBASE not implemented (upstream throws NotImplementedException)");
     }
 
     /// ST — Not implemented in upstream.
     pub fn translate_st(&mut self, _insn: u64) {
-        log::error!("Instruction ST is not implemented");
+        panic!("Instruction ST not implemented (upstream throws NotImplementedException)");
     }
 
     /// STP — Not implemented in upstream.
     pub fn translate_stp(&mut self, _insn: u64) {
-        log::error!("Instruction STP is not implemented");
+        panic!("Instruction STP not implemented (upstream throws NotImplementedException)");
     }
 
     /// SYNC — Not implemented in upstream.
     pub fn translate_sync(&mut self, _insn: u64) {
-        log::error!("Instruction SYNC is not implemented");
+        panic!("Instruction SYNC not implemented (upstream throws NotImplementedException)");
     }
 
     /// TXA — Not implemented in upstream.
     pub fn translate_txa(&mut self, _insn: u64) {
-        log::error!("Instruction TXA is not implemented");
+        panic!("Instruction TXA not implemented (upstream throws NotImplementedException)");
     }
 
     /// VABSDIFF — Not implemented in upstream.
     pub fn translate_vabsdiff(&mut self, _insn: u64) {
-        log::error!("Instruction VABSDIFF is not implemented");
+        panic!("Instruction VABSDIFF not implemented (upstream throws NotImplementedException)");
     }
 
     /// VABSDIFF4 — Not implemented in upstream.
     pub fn translate_vabsdiff4(&mut self, _insn: u64) {
-        log::error!("Instruction VABSDIFF4 is not implemented");
+        panic!("Instruction VABSDIFF4 not implemented (upstream throws NotImplementedException)");
     }
 }

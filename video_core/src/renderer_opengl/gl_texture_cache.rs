@@ -16,7 +16,7 @@ use crate::surface::PixelFormat;
 use crate::texture_cache::image_base::{ImageBase, ImageFlagBits, ImageMapView};
 use crate::texture_cache::image_info::ImageInfo;
 use crate::texture_cache::image_view_base::{ImageViewBase, ImageViewFlagBits};
-use crate::texture_cache::image_view_info::ImageViewInfo;
+use crate::texture_cache::image_view_info::{ImageViewInfo, SwizzleSource};
 use crate::texture_cache::texture_cache_base::{
     FramebufferImageView, TextureCacheBase as CommonTextureCache,
 };
@@ -300,6 +300,102 @@ fn image_view_target(view_type: TextureType, num_samples: i32) -> u32 {
         TextureType::Buffer => gl::TEXTURE_BUFFER,
         _ => gl::NONE,
     }
+}
+
+fn swizzle(source: SwizzleSource) -> i32 {
+    match source {
+        SwizzleSource::Zero => gl::ZERO as i32,
+        SwizzleSource::R => gl::RED as i32,
+        SwizzleSource::G => gl::GREEN as i32,
+        SwizzleSource::B => gl::BLUE as i32,
+        SwizzleSource::A => gl::ALPHA as i32,
+        SwizzleSource::OneInt | SwizzleSource::OneFloat => gl::ONE as i32,
+    }
+}
+
+fn convert_green_red(value: SwizzleSource) -> SwizzleSource {
+    match value {
+        SwizzleSource::G => SwizzleSource::R,
+        _ => value,
+    }
+}
+
+fn convert_a5b5g5r1_unorm(source: SwizzleSource) -> i32 {
+    match source {
+        SwizzleSource::Zero => gl::ZERO as i32,
+        SwizzleSource::R => gl::ALPHA as i32,
+        SwizzleSource::G => gl::BLUE as i32,
+        SwizzleSource::B => gl::GREEN as i32,
+        SwizzleSource::A => gl::RED as i32,
+        SwizzleSource::OneInt | SwizzleSource::OneFloat => gl::ONE as i32,
+    }
+}
+
+fn texture_mode(format: PixelFormat, swizzle: [SwizzleSource; 4]) -> u32 {
+    let any_r = swizzle.iter().any(|source| *source == SwizzleSource::R);
+    match format {
+        PixelFormat::D24UnormS8Uint | PixelFormat::D32FloatS8Uint => {
+            if any_r {
+                gl::DEPTH_COMPONENT
+            } else {
+                gl::STENCIL_INDEX
+            }
+        }
+        PixelFormat::S8UintD24Unorm => {
+            if any_r {
+                gl::STENCIL_INDEX
+            } else {
+                gl::DEPTH_COMPONENT
+            }
+        }
+        _ => gl::DEPTH_COMPONENT,
+    }
+}
+
+fn apply_swizzle(handle: u32, format: PixelFormat, mut source_swizzle: [SwizzleSource; 4]) {
+    unsafe {
+        match format {
+            PixelFormat::D24UnormS8Uint
+            | PixelFormat::D32FloatS8Uint
+            | PixelFormat::S8UintD24Unorm => {
+                gl::TextureParameteri(
+                    handle,
+                    gl::DEPTH_STENCIL_TEXTURE_MODE,
+                    texture_mode(format, source_swizzle) as i32,
+                );
+                source_swizzle = source_swizzle.map(convert_green_red);
+            }
+            PixelFormat::A5B5G5R1Unorm => {
+                let gl_swizzle = source_swizzle.map(convert_a5b5g5r1_unorm);
+                gl::TextureParameteriv(handle, gl::TEXTURE_SWIZZLE_RGBA, gl_swizzle.as_ptr());
+                return;
+            }
+            _ => {}
+        }
+        let gl_swizzle = source_swizzle.map(swizzle);
+        gl::TextureParameteriv(handle, gl::TEXTURE_SWIZZLE_RGBA, gl_swizzle.as_ptr());
+    }
+}
+
+fn decode_swizzle(raw: [u8; 4]) -> Option<[SwizzleSource; 4]> {
+    fn decode(value: u8) -> Option<SwizzleSource> {
+        match value {
+            0 => Some(SwizzleSource::Zero),
+            2 => Some(SwizzleSource::R),
+            3 => Some(SwizzleSource::G),
+            4 => Some(SwizzleSource::B),
+            5 => Some(SwizzleSource::A),
+            6 => Some(SwizzleSource::OneInt),
+            7 => Some(SwizzleSource::OneFloat),
+            _ => None,
+        }
+    }
+    Some([
+        decode(raw[0])?,
+        decode(raw[1])?,
+        decode(raw[2])?,
+        decode(raw[3])?,
+    ])
 }
 
 /// Port of upstream `OpenGL::MakeImage` (gl_texture_cache.cpp:363-406).
@@ -811,6 +907,8 @@ pub struct ImageView {
     pub default_handle: u32,
     pub internal_format: u32,
     pub buffer_size: u32,
+    format: PixelFormat,
+    swizzle: [u8; 4],
     original_texture: u32,
     num_samples: i32,
     flat_range: SubresourceRange,
@@ -834,6 +932,13 @@ impl ImageView {
             default_handle: 0,
             internal_format: gl::NONE,
             buffer_size: 0,
+            format: PixelFormat::Invalid,
+            swizzle: [
+                SwizzleSource::R as u8,
+                SwizzleSource::G as u8,
+                SwizzleSource::B as u8,
+                SwizzleSource::A as u8,
+            ],
             original_texture: 0,
             num_samples: 0,
             flat_range: SubresourceRange::default(),
@@ -869,6 +974,7 @@ impl ImageView {
     pub fn new_color_2d(base: &ImageViewBase, image: &Image) -> Self {
         let mut view = Self::new();
         view.internal_format = present_internal_format(base.format);
+        view.format = base.format;
         view.original_texture = image.handle();
         view.num_samples = image.num_samples;
         view.flat_range = base.range;
@@ -927,6 +1033,8 @@ impl ImageView {
 
         let mut view = Self::new();
         view.internal_format = present_internal_format(base.format);
+        view.format = base.format;
+        view.swizzle = base.swizzle;
         view.original_texture = image.handle();
         view.num_samples = image.num_samples;
         view.full_range = base.range;
@@ -1041,6 +1149,11 @@ impl ImageView {
                 gl::TextureParameteri(view, gl::TEXTURE_MAG_FILTER, gl::NEAREST as i32);
                 gl::TextureParameteri(view, gl::TEXTURE_WRAP_S, gl::CLAMP_TO_EDGE as i32);
                 gl::TextureParameteri(view, gl::TEXTURE_WRAP_T, gl::CLAMP_TO_EDGE as i32);
+                if !self.is_render_target {
+                    if let Some(swizzle) = decode_swizzle(self.swizzle) {
+                        apply_swizzle(view, self.format, swizzle);
+                    }
+                }
                 if std::env::var_os("RUZU_PROBE_VIEW_STORAGE").is_some() {
                     while gl::GetError() != gl::NO_ERROR {}
                     let red: [u8; 4] = [0xAB, 0xCD, 0xEF, 0x42];
@@ -2563,6 +2676,7 @@ impl Default for TextureCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::texture_cache::image_view_info::SwizzleSource;
 
     #[test]
     fn constants() {
@@ -2595,5 +2709,24 @@ mod tests {
             present_internal_format(PixelFormat::R5G6B5Unorm),
             gl::RGB565
         );
+    }
+
+    #[test]
+    fn decode_swizzle_matches_upstream_sources() {
+        assert_eq!(
+            decode_swizzle([
+                SwizzleSource::R as u8,
+                SwizzleSource::R as u8,
+                SwizzleSource::R as u8,
+                SwizzleSource::OneFloat as u8,
+            ]),
+            Some([
+                SwizzleSource::R,
+                SwizzleSource::R,
+                SwizzleSource::R,
+                SwizzleSource::OneFloat,
+            ])
+        );
+        assert_eq!(decode_swizzle([u8::MAX; 4]), None);
     }
 }

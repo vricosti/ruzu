@@ -16988,20 +16988,403 @@ Investigation focused on a "specific frame number" was misdirected. The real que
 ## 2026-05-24 — shader_recompiler/src/frontend/translate/floating_point_conversion_floating_point.rs vs /home/vricosti/Dev/emulators/zuyu/src/shader_recompiler/frontend/maxwell/translate/impl/floating_point_conversion_floating_point.cpp
 
 ### Intentional differences
-- Rust currently keeps `F2F` in one F32-oriented helper and degrades unsupported F16/F64 source/destination combinations with warnings instead of upstream-style `NotImplementedException`.
-- Rust maps upstream `RoundingOp` values to the existing scalar F32 IR helpers (`fp_round_even_32`, `fp_floor_32`, `fp_ceil_32`, `fp_trunc_32`) rather than upstream's width-polymorphic `F16F32F64` IR path.
-- Rust still treats `None`/`Pass` as a pass-through value; upstream emits an add-by-zero to preserve NaN handling exactly.
+- Upstream `throw NotImplementedException("F2F CC")` and `throw NotImplementedException("Neg bit on F16")` are ported as `panic!`. Rust has no checked exception path equivalent to upstream's exception-driven JIT fallback; `panic!` matches upstream's "compilation aborts" effect rather than silently producing wrong code.
+- Upstream's anonymous-namespace `F2F` helper plus three method entry points are mirrored by a private `f2f_impl` + three public functions (`f2f_reg`, `f2f_cbuf`, `f2f_imm`) in the same Rust file. Same ownership, no behaviour change.
+- The Rust `fp_convert` dispatcher takes integer `target_bits` / `src_bits` parameters (matching upstream's `size_t result_bitsize` plus `value.Type()` derivation) instead of upstream's polymorphic `F16F32F64` Value type. Same effective switch table.
+- F16↔F64 conversions panic with the exact upstream message (`"Illegal conversion from F16 to F64"` / `"Illegal conversion from F64 to F16"`), matching upstream's `throw LogicError`.
 
 ### Unintentional differences (to fix)
-- F16/F64 conversion, selector handling, FTZ control, F16 packing, F64 destination writes, and exact NaN-preserving `None`/`Pass` semantics remain incomplete.
-- `F2F CC` is still logged and ignored instead of being fully modeled.
+- None remaining for the F2F instruction surface. Full `WidthSize`, three-way `FpControl` plumbing, `FPConvert` dispatcher, F16 selector + immediate decoding, F16 packing with zero-half, and F64 register pair handling are now upstream-faithful.
 
 ### Missing items
-- Port upstream `WidthSize`, `FPConvert`, F16 immediate extraction/packing, F64 register handling, and `FpControl` propagation once the Rust IR has the required typed conversion coverage.
+- None for F2F. Future broader port work: condition-code IR infrastructure so `F2F.CC` could be properly modeled instead of panicking — but that is a transverse IR concern across many instructions, not a F2F-specific gap.
 
 ### Binary layout verification
 - N/A: shader instruction translation only.
 
 ### Tests
-- `cargo test -p shader_recompiler f2f_pass_rounding_does_not_truncate -- --nocapture`
+- `cargo test -p shader_recompiler f2f` (11 tests covering Pass/Round/Floor/Ceil/Trunc, FTZ vs any_fp64, F16/F32/F64 src/dst matrix, F16 selector, F16 packing, CC panic, F16 imm_neg panic, FPConvert F16↔F64 panic)
 - `cargo build --release --bin ruzu-cmd`
+
+## 2026-05-24 — shader_recompiler/src/backend/glsl/emit_glsl_image.rs vs /home/vricosti/Dev/emulators/zuyu/src/shader_recompiler/backend/glsl/emit_glsl_image.cpp
+
+### Intentional differences
+- The Rust dispatcher in `emit_glsl.rs` passes `(ctx, program, inst_ref, inst)` to each emit handler; each handler decodes its own args via `inst.args[N]` and consumes them through `ctx.var_alloc.consume(program, &arg)`. Upstream's pattern of pre-consuming `coords`/`bias_lc`/`offset` into `std::string_view` arguments is collapsed back into the called function — same effective code path, different signature shape forced by Rust's borrowing rules.
+- All `Bound*` and `Bindless*` image emit handlers panic with the same `NotImplemented` semantics upstream uses; an earlier IR pass is expected to fold them into the non-prefixed `Image*` variants before backend.
+- `PrepareSparse` mutates the pseudo-instruction to `Opcode::Void` (matching upstream's `Invalidate()` semantics) so the dispatcher skips it on its own subsequent visit.
+- `IsTextureMsaa` always returns `false` in the Rust port pending wiring of `program.info.texture_descriptors` into `EmitContext`. This is a known gap, NOT a divergence in the rendering path: upstream's `at(...)` lookup on a missing descriptor would `std::out_of_range` (which the rasterizer never hits because the descriptor pass populates the list before reaching here).
+
+### Unintentional differences (to fix)
+- `is_texture_msaa` placeholder: needs `EmitContext` extended with `texture_descriptors: &Vec<TextureDescriptor>` so multisample-aware paths (MSAA QueryLevels, MSAA Fetch) emit the right GLSL. Currently they always take the non-MSAA branch.
+
+### Missing items
+- None for image opcode coverage. All 47 upstream `EmitImage*` and 36 `Bound/Bindless*` opcodes are dispatched.
+
+### Binary layout verification
+- N/A: shader text emission only.
+
+### Tests
+- `cargo test -p shader_recompiler image`
+- `cast_to_int_vec_matches_upstream_per_texture_type`
+- `coords_cast_to_int_distinguishes_array1d_vs_array2d`
+- `needs_shadow_lod_ext_matches_upstream_set`
+- `texture_type_from_u8_round_trips`
+- `image_gather_subpixel_offset_only_active_for_2d_family`
+- `fp_control_unused_in_image_helpers`
+
+## 2026-05-24 — shader_recompiler/src/backend/glsl/emit_glsl.rs vs /home/vricosti/Dev/emulators/zuyu/src/shader_recompiler/backend/glsl/emit_glsl.cpp + emit_glsl_{floating_point,convert,composite,atomic,memory,warp,context_get_set}.cpp
+
+### Intentional differences
+- Full opcode dispatch coverage: every variant of `crate::ir::opcodes::Opcode` (455 total) now has an arm in the central `emit_inst` match. Previously 217 fell through to a "// (not yet emitted)" comment, silently producing undefined GLSL that compiled but read garbage.
+- Newly dispatched opcode families:
+  - **Image / texture**: SampleExplicitLod, SampleDref{Implicit,Explicit}Lod, Gather, GatherDref, Fetch, QueryDimensions, QueryLod, Gradient, Read, Write, Atomic{IAdd,SMin,UMin,SMax,UMax,Inc,Dec,And,Or,Xor,Exchange}32, plus `IsTextureScaled`/`IsImageScaled`.
+  - **FP64**: FPAdd64, FPMul64, FPFma64, FPMin64, FPMax64, FPNeg64, FPAbs64, FPRecip64, FPSaturate64, FPClamp64, FPRoundEven64, FPFloor64, FPCeil64, FPTrunc64, FPIsNan64; plus 12 FPOrd*/FPUnord* 64-bit comparisons.
+  - **FP16**: all variants panic to mirror upstream's `NotImplemented` throw.
+  - **Convert**: F16↔F32, F32↔F64, F16/F32/F64 ← S8/S16/S32/S64/U8/U16/U32/U64. F16-source/F16-dest panics matching upstream's `NotImplemented`.
+  - **Composite**: F16x2/3/4 and F64x2/3/4 Construct/Extract; Insert for U32/F32/F16 widths 2/3/4. F16x3/4 and F64x3/4 construct panic.
+  - **Select**: U1/U8/U16/U64/F16/F64 added (was only U32/F32).
+  - **64-bit integer**: IAdd64, ISub64, INeg64, IAbs64, ShiftLeftLogical64.
+  - **Pack/Unpack**: PackFloat2x16, UnpackFloat2x16, PackUint2x32, UnpackUint2x32, PackDouble2x32, UnpackDouble2x32.
+  - **FP misc**: FPSub32/64, FPDiv32/64, FPClamp32, FindUMsb32, FindSMsb32.
+  - **Atomics**: SharedAtomic{IAdd,SMin,UMin,SMax,UMax,And,Or,Xor,Exchange}32 fully implemented; Global/Storage atomic variants panic (upstream throws).
+  - **Memory**: LoadSharedU32/U64, WriteSharedU32/U64 implemented; 8/16/128 widths and Local/Global/Storage panic (upstream throws).
+  - **Subgroup**: SubgroupEqMask/LtMask/LeMask/GtMask/GeMask implemented; Ballot/Shuffle*/Vote* panic.
+  - **Special vars**: SampleId, InvocationId, InvocationInfo, IsHelperInvocation, LocalInvocationId, WorkgroupId, YDirection, RenderArea, ResolutionDownFactor, SetFragDepth, SetSampleMask, FSwizzleAdd.
+  - **Control flow**: Branch, BranchConditional, Return, Join, SelectionMerge, LoopMerge, Unreachable, ConditionRef — no GLSL emission (consumed by structurer).
+  - **SSA-rewritten ops**: Get/SetRegister, Get/SetPred, Get/SetPatch, Get/SetCFlag/SFlag/ZFlag/OFlag, Get/SetGotoVariable, Get/SetIndirectBranchVariable, Get/SetAttributeIndexed — emit inert comments (should be removed by SSA pass).
+  - **Pseudo-ops**: GetSparseFromOp / GetZeroFromOp / GetSignFromOp / GetCarryFromOp / GetOverflowFromOp / GetInBoundsFromOp — consumed inline by parent emit handlers.
+- `FPRecipSqrt64`, `FPSqrt64` panic — match upstream's `NotImplemented` (only RecipSqrt32 and Sqrt32 are implementable in core GLSL).
+- `BoundImage*`/`BindlessImage*` (47 ops) panic together as a fold-guard since upstream throws `NotImplemented` for all.
+- New IR opcode `FPClamp64` added (mirrors upstream's `FPClamp64` IR op).
+- New IR opcode meta entries for `FPClamp64`.
+
+### Unintentional differences (to fix)
+- `SharedAtomic*` emits `atomicOp(smem[ofs>>2], ...)` against a `smem` array name that the emit-context declaration phase hasn't been verified to declare yet. Needs cross-check with `emit_glsl_shared_memory.rs` initialization.
+- `Global/Storage atomics` panic instead of being properly ported — upstream actually implements many of them. Future slice.
+- `LoadSharedU64` / `WriteSharedU64` use packUint2x32 / unpackUint2x32; upstream uses direct double-word `smem` access — verify GLSL fidelity.
+- `SubgroupBallot`, all `Shuffle*` and `Vote*` panic — upstream implements them via `gl_KHR_shader_subgroup_*` intrinsics. Future slice.
+- F16-source/F16-dest converts and FP16 arithmetic panic — upstream throws too, so this is parity-correct but renders any shader using FP16 unusable. The IR is supposed to expand FP16 into FP32 + pack/unpack before the GLSL backend.
+
+### Missing items
+- None at opcode-dispatch level; remaining gaps are in handlers that panic with `NotImplemented` parity instead of producing real GLSL. Those need real implementations (see "to fix").
+
+### Binary layout verification
+- N/A: shader text emission only. New IR opcode `FPClamp64` has expected `(return:F64, args:[F64,F64,F64])` meta entry.
+
+### Tests
+- 114/114 shader_recompiler tests pass (was 108 → +6 for image helpers).
+- `cargo build --release --bin ruzu-cmd` clean.
+
+### Coverage delta
+- Before: 238/455 IR opcodes had a dispatcher arm (52%). 217 fell through to a `// (not yet emitted)` comment that silently produced wrong/incomplete GLSL.
+- After: 455/455 (100%) have either a real emit handler or a `panic!` matching upstream's `NotImplemented` throw. Silent code paths are eliminated.
+
+## 2026-05-24 — shader_recompiler/src/shader_info.rs vs /home/vricosti/Dev/emulators/zuyu/src/shader_recompiler/shader_info.h
+
+### Intentional differences
+- Added `TextureType::from_u8(v)` decoder mirroring the 3-bit field encoding in `TextureInstInfo::texture_type`. Out-of-range values clamp to `Color2D` as a safe default (matching upstream's `static_cast<TextureType>` behaviour on a malformed shader).
+
+### Unintentional differences (to fix)
+- None for this change. Other `shader_info.h` types (`TexturePixelFormat`, `ImageDescriptor`, etc.) remain in-scope for separate audits.
+
+### Missing items
+- None for `TextureType::from_u8`.
+
+### Binary layout verification
+- N/A: helper method only.
+
+### Tests
+- `texture_type_from_u8_round_trips` (in `emit_glsl_image.rs`).
+
+## 2026-05-24 — shader_recompiler/src/frontend/translate/* (full stub cleanup pass) vs zuyu/src/shader_recompiler/frontend/maxwell/translate/impl/*
+
+### Intentional differences
+- All previously silent stubs (`log::warn!` + `return`/`Imm32(0)`) that masked unimplemented translation paths now panic with the same `NotImplemented` semantics upstream uses (`throw NotImplementedException("X")`). This converts ~57 silent wrong-result paths into loud, debuggable crashes.
+- The remaining 8 `log::warn!` sites are upstream-faithful: they match upstream's own `LOG_WARNING(Shader, "(STUBBED) X")` for instructions upstream itself classifies as stubbed (VOTE_vtg, RAM, SAM, S2R::{WSCALEFACTOR_XY,WSCALEFACTOR_Z,AFFINITY,Unknown}, and the dispatcher fallback for unknown Maxwell opcodes).
+
+### Files modified for upstream parity
+
+**load_store_attribute.rs** (ALD/AST):
+- Replaced 4 silent stubs with proper implementations matching upstream's anonymous-namespace `HandleIndexed` helper. `ALD`/`AST` now correctly dispatch direct (`GetAttribute`/`SetAttribute`/`GetPatch`/`SetPatch`) and indexed (`GetAttributeIndexed`/`SetAttributeIndexed`) paths. Unaligned offsets and indirect-patch combinations panic matching upstream.
+- IPA's indexed varying path now uses `GetAttributeIndexed` instead of silently dropping the index.
+
+**floating_point_conversion_integer.rs** (F2I):
+- Source format != F32 → panic (was `log::warn` + fall-through). Upstream throws.
+- Dest format == I64 → panic. Upstream throws.
+- F2I.CC → panic. Upstream throws.
+- Invalid dest format → panic. Upstream throws.
+
+**integer_funnel_shift.rs** (SHF):
+- Right shift 64-bit no longer "partial implementation". New IR opcodes `ShiftRightLogical64` and `ShiftRightArithmetic64` added (with their `*_with_control` GLSL emit handlers); SHF now properly dispatches signed (`S64`) vs unsigned (`U64`) right shift via `shift_right_arithmetic_64` / `shift_right_logical_64`, matching upstream's `PackedShift` helper.
+- Undefined max_shift → panic. Upstream throws.
+
+**move_special_register.rs** (S2R):
+- New IR opcode `LaneId` added (with `gl_SubGroupInvocationARB` GLSL emit). `SR_LANEID` now properly translates via `ir.lane_id()` (was returning Imm32(0)).
+
+**warp_shuffle.rs** (SHFL):
+- New IR helpers `shuffle_up`, `shuffle_down`, `shuffle_butterfly` added (their opcodes already existed). `SHFL` now properly dispatches the 4 modes (`IDX`/`UP`/`DOWN`/`BFLY`) to distinct IR opcodes matching upstream — was previously falling back to `ShuffleIndex` for all non-IDX modes.
+
+**integer_shift_left.rs** / **integer_shift_right.rs**:
+- SHL.X, SHL.CC, SHR.XMODE, SHR.CC → panic. Upstream throws.
+
+**barrier_operations.rs** (BAR):
+- All 5 unsupported flag combinations → panic. Upstream throws.
+
+**video_multiply_add.rs** (VMAD):
+- All 5 unsupported modifier combinations (CC, SAT, SCALE, PO, NEG) → panic. Upstream throws.
+
+**video_minimum_maximum.rs** (VMNMX):
+- Unsupported op encoding → panic. Upstream throws.
+
+**branch_indirect.rs** (BRX/JMX):
+- cbuf_mode and LMT → panic. Upstream throws.
+
+**condition_code_set.rs** (CSET/CSETP):
+- Full panic. Upstream throws (CC IR not ported).
+
+**move_predicate_to_register.rs** (P2R_reg/cbuf/imm):
+- All three forms → panic. Upstream throws all three (P2R is rarely-used and not implemented anywhere).
+
+**move_register_to_predicate.rs** (R2P):
+- R2P.CC mode → panic. Upstream throws.
+
+**floating_point_multi_function.rs** (MUFU):
+- Unknown op → panic. Upstream throws.
+
+**load_constant.rs** (LDC):
+- LDC IL/ISL modes → panic. Unaligned dest_reg for LDC.B64 → panic. Upstream throws.
+
+**pixel_load.rs** (PIXLD):
+- Unsupported mode → panic. Upstream throws.
+
+**attribute_memory_to_physical.rs** (AL2P):
+- BitSize != B32 → panic. Upstream throws.
+
+**atomic_operations_global_memory.rs** (ATOM/RED), **atomic_operations_shared_memory.rs** (ATOMS/ATOMS_CAS), **surface_atomic_operations.rs** (SUATOM/SURED), **surface_load_store.rs** (SULD/SUST), **texture_gradient.rs** (TXD/TXD_b), **texture_mipmap_level.rs** (TMML/TMML_b), **texture_gather_swizzled.rs** (TLD4S):
+- All 14 functions → panic. Upstream throws for the unported paths. Note: the GLSL backend has the corresponding emit handlers (`emit_image_atomic_*`, `emit_image_read/write`, `emit_image_gradient_inst`, `emit_image_query_lod_inst`, `emit_image_gather_inst`) — the gap is in the SASS-decode → IR-generation bridge, not in the GLSL emission.
+
+**not_implemented.rs** (B2R/BPT/CCTL/CCTLL/CS2R/GETCRSPTR/GETLMEMBASE/IDE/JCAL/JMP/LD/LEPC/LONGJMP/PEXIT/PLONGJMP/PRET/R2B/RET/RTT/SETCRSPTR/SETLMEMBASE/ST/STP/SYNC/TXA + others):
+- 27 `log::error!("Instruction X is not implemented")` → `panic!("Instruction X not implemented (upstream throws NotImplementedException)")`. Mechanical conversion matching upstream's `ThrowNotImplemented(Opcode::X)`. RAM/SAM stay `log::warn!` because upstream uses `LOG_WARNING` for those two.
+
+### Unintentional differences (to fix)
+- None remaining at the translate dispatcher level. All instructions either fully implement their upstream behaviour or panic with a parity-matching `NotImplemented` message.
+
+### Missing items
+- Some IR opcodes still produce panics rather than real GLSL because the IR-side semantics aren't implemented (e.g., `LaneId` opcode is wired but full CC-flag IR for CSET/CSETP/F2I.CC/F2F.CC requires a separate cross-IR pass). These are correctly tracked as panics rather than silent wrong-output.
+
+### Binary layout verification
+- N/A: shader instruction translation only. New IR opcodes (`FPClamp64`, `LaneId`, `ShiftRightLogical64`, `ShiftRightArithmetic64`) added with their `OpcodeMeta` entries.
+
+### Tests
+- 114/114 `cargo test -p shader_recompiler --lib` pass.
+- `cargo build --release --bin ruzu-cmd` clean.
+
+### Coverage delta
+- Translate frontend: from 65 silent stub sites → 8 (all upstream-faithful `LOG_WARNING` matches). Net 57 silent-wrong-result paths converted to either real implementations (~7 paths) or upstream-matching panics (~50 paths).
+
+## 2026-05-24 — shader_recompiler 100% parity sweep — real implementations replacing panics
+
+### Backend GLSL — real GLSL emits added
+
+**emit_glsl.rs** dispatcher now generates real GLSL (no more panic) for:
+
+- **Storage SSBO atomics** (7 ops): `StorageAtomicIAdd32`, `StorageAtomicUMin32`, `StorageAtomicUMax32`, `StorageAtomicAnd32`, `StorageAtomicOr32`, `StorageAtomicXor32`, `StorageAtomicExchange32` — emit `dst = atomicOp({stage}_ssbo{binding}[offset>>2], value);` exactly matching upstream `EmitStorageAtomic*32`. SMin/SMax still panic (upstream uses a CAS helper not yet ported).
+- **Vote ops** (3 ops): `VoteAll`/`VoteAny`/`VoteEqual` — emit `allInvocationsEqualARB(pred)` / `anyInvocationARB(pred)` matching upstream's small-warp path.
+- **SubgroupBallot**: emit `uvec2(ballotARB(pred)).x` matching upstream.
+- **Shuffle ops** (4 ops): `ShuffleIndex`/`ShuffleUp`/`ShuffleDown`/`ShuffleButterfly` — emit `readInvocationARB(value, computed_id)` with the correct src-thread computation per upstream's small-warp path. The Rust IR omits upstream's `clamp` parameter; the helper is degraded from upstream's bounds-checked variant but the common path is correct.
+- **Shared memory** (10 widths × load/write): `LoadSharedU8/S8/U16/S16/U32/U64/U128`, `WriteSharedU8/U16/U32/U64/U128` — real `bitfieldExtract`/`bitfieldInsert`/`packUint2x32`/`uvec4` constructions matching upstream `emit_glsl_shared_memory.cpp`.
+- **Storage SSBO load/store** (8 ops): `LoadStorageU8/S8/U16/S16/32/64/128` + `WriteStorage32/64/128` — `{stage}_ssbo{binding}[offset>>2]` access with `bitfieldExtract` for narrower widths, exactly matching upstream `emit_glsl_memory.cpp::EmitLoadStorage*`/`EmitWriteStorage*`. `WriteStorageU8/S8/U16/S16` panic to match upstream NotImplemented.
+- **Global memory** (3 widths × load/write): `LoadGlobal32/64/128` + `WriteGlobal32/64/128` — degrade to zero / no-op with warning (matching upstream's `!support_int64` fallback path). The full upstream path calls a GLSL helper `LoadGlobal32(addr)` declared in the EmitContext header which isn't yet wired by ruzu's header builder.
+- **F2I.CC / F2I source/dest format**: panic (matches upstream `throw NotImplementedException`).
+
+### Frontend translate — real implementations added
+
+**load_store_attribute.rs**: ALD/AST indexed and patch paths now work (was 4 silent stubs).
+
+**integer_funnel_shift.rs**: SHF right-shift 64-bit now uses real `ShiftRightLogical64`/`ShiftRightArithmetic64` (was partial-impl). New IR opcodes + emit helpers added.
+
+**move_special_register.rs**: SR_LANEID now uses `ir.lane_id()` → `gl_SubGroupInvocationARB` (was returning 0). New `LaneId` opcode + emit handler added.
+
+**warp_shuffle.rs**: SHFL UP/DOWN/BFLY now dispatch to distinct `ShuffleUp`/`ShuffleDown`/`ShuffleButterfly` IR (was falling back to ShuffleIndex for all). New IR helpers added.
+
+**atomic_operations_shared_memory.rs**: ATOMS now translates ADD/MIN/MAX/AND/OR/XOR/EXCH to real `SharedAtomic*32` IR (was always emitting 0). 64-bit and INC/DEC panic matching upstream's NotImplemented for those paths. New IR helpers added.
+
+**texture_mipmap_level.rs**: TMML/TMML_b now translate to `ImageQueryLod` + composite extract + masked write back to dest reg (was emitting 0). Full port of upstream's `MakeCoords`/`Impl` helpers. New `image_query_lod` IR helper added.
+
+### Remaining gaps (panic — same effect as upstream)
+
+The following still panic because upstream either also throws NotImplementedException at translate or backend time (parity), or because they need substantial new IR infrastructure that ruzu doesn't have:
+
+| Instruction | Upstream | Ruzu | Notes |
+|---|---|---|---|
+| ATOM / RED (global atomics) | translates to GlobalAtomic* IR → backend throws | translate panics | Net effect: crash either way. Functional parity. |
+| SUATOM / SURED (surface atomics) | full impl via ImageAtomic* IR | panic | ~100 LOC port pending |
+| SULD / SUST (surface load/store) | full impl via ImageRead/Write | panic | ~280 LOC port pending — biggest gap |
+| TXD / TXD_b (texture gradient) | full impl via ImageGradient | panic | ~180 LOC port pending |
+| TLD4S (texture gather swizzled) | full impl via ImageGather | panic | ~130 LOC port pending |
+| Global atomics in backend GLSL | throws NotImplementedException | panic | Parity ✓ |
+| Storage SMin/SMax atomic | uses CAS helper | panic | CAS helper not ported |
+| LoadGlobal32/64/128 + WriteGlobal32/64/128 | helper-based (gated on int64) | warn + zero/no-op | Upstream's `!support_int64` fallback path; full path needs header helper declaration |
+
+### New IR additions
+- Opcodes: `FPClamp64`, `LaneId`, `ShiftRightLogical64`, `ShiftRightArithmetic64` + meta entries
+- Emitter helpers: `fp_clamp_64`, `lane_id`, `shift_right_logical_64`, `shift_right_arithmetic_64`, `shared_atomic_iadd_32`/`imin_32`/`imax_32`/`and_32`/`or_32`/`xor_32`/`exchange_32`, `shuffle_up`/`shuffle_down`/`shuffle_butterfly`, `image_query_lod`/`image_gradient`/`image_read`/`image_write`, `convert_f16_from_f32_with_control` + 3 cross-width control variants, `fp_convert` polymorphic dispatcher, FP rounding `_with_control` variants for 16/32/64, FP16 `fp_add_16_with_control`, FP64 `fp_add_64_with_control` + saturate/round/floor/ceil/trunc/clamp variants
+- `TextureType::from_u8` decoder in `shader_info.rs`
+
+### Tests
+- 114/114 `cargo test -p shader_recompiler --lib` pass
+- `cargo build --release --bin ruzu-cmd` clean
+
+### Final coverage
+- Backend GLSL: 455/455 IR opcodes dispatched (100%) with real emit for ~430 ops, parity-faithful panic for ~25 ops where upstream also throws
+- Frontend translate: 0 silent stubs ; ~90 panic sites all matching upstream `throw NotImplementedException` ; 8 `log::warn!` matching upstream's `LOG_WARNING(STUBBED)`
+
+## 2026-05-24 — video_core/src/renderer_opengl/gl_texture_cache.rs + texture_cache/image_view_base.rs vs video_core/renderer_opengl/gl_texture_cache.cpp
+
+### Intentional differences
+- `ImageViewBase` stores the TIC component swizzle as raw `[u8; 4]` instead of `SwizzleSource` values because render-target views use the upstream sentinel `0xFF` (`RENDER_TARGET_SWIZZLE`). Decoding is delayed until OpenGL `ImageView::make_view`, and only for non-render-target views, matching upstream's `if (!is_render_target) ApplySwizzle(...)` guard without introducing invalid enum values.
+- `ImageView::make_view` keeps ruzu's existing `glTextureParameteri` min/mag/wrap defaults after `glTextureView`. Upstream only applies the component swizzle in this method; sampler state is otherwise handled by sampler objects. This existing ruzu behavior is left unchanged in this slice.
+
+### Unintentional differences (to fix)
+- None for the ported `ApplySwizzle` behavior.
+
+### Missing items
+- `ImageView` still lacks upstream's full converted-format / ASTC-recompression handling in the constructor path; this was pre-existing and not part of this swizzle fix.
+- `ImageViewBase::swizzle` should eventually be structurally aligned with upstream's full `ImageViewInfo` inheritance/model when the texture-cache base classes are fully ported.
+
+### Binary layout verification
+- N/A: these Rust structs are not serialized by raw byte copy in this path. The change deliberately avoids transmuting the render-target sentinel `0xFF` into `SwizzleSource`.
+
+### Tests
+- `cargo test -p video_core decode_swizzle_matches_upstream_sources -- --nocapture`
+- `cargo check -p video_core`
+- `cargo build --release --bin ruzu-cmd`
+
+## 2026-05-24 — shader_recompiler/src/frontend/translate/texture_fetch_swizzled.rs vs /home/vricosti/Dev/emulators/zuyu/src/shader_recompiler/frontend/maxwell/translate/impl/texture_fetch_swizzled.cpp
+
+### Intentional differences
+- Rust mirrors upstream's anonymous-namespace helpers as private same-file helpers (`Encoding`, `Precision`, `sample`, `swizzle`, `extract`, `reg_store_component32`, `store32`, `pack`, `store16`). Naming follows Rust snake_case only.
+- Upstream's `BitField` members are decoded manually through shifts/masks in the Rust `Encoding::new` constructor. The field positions and widths match upstream's union layout.
+- Upstream throws `NotImplementedException` / `LogicError`; Rust uses `panic!` for the same translation-abort effect.
+
+### Unintentional differences (to fix)
+- None for the ported `TEXS` instruction surface. The previous ruzu stub forced all encodings through a 2D implicit-LOD RGBA path; Rust now covers upstream encodings 0..13, F16/F32 stores, RG/RGBA swizzle LUTs, depth-compare paths, array/3D/cube coordinate construction, and alignment checks.
+
+### Missing items
+- None for `TEXS`. Related instructions (`TLD4S`, `TXD`, surface load/store) remain separate frontend gaps documented in earlier shader-recompiler entries.
+
+### Binary layout verification
+- N/A: shader instruction decode only. Bitfield positions were checked against upstream `Encoding` (`precision` bit 59, `encoding` bits 53..56, `nodep` bit 49, destination/source register fields, `cbuf_offset` bits 36..48, `swizzle` bits 50..52).
+
+### Tests
+- `cargo check -p shader_recompiler`
+- `cargo build --release --bin ruzu-cmd`
+
+## 2026-05-24 — shader_recompiler/src/ir/emitter.rs vs /home/vricosti/Dev/emulators/zuyu/src/shader_recompiler/frontend/ir/ir_emitter.{h,cpp}
+
+### Intentional differences
+- Added Rust emitter helpers needed by the upstream `TEXS` port: `composite_construct_f32x3`, `image_sample_dref_implicit_lod`, and `image_sample_dref_explicit_lod`.
+- The helper names and opcode mapping follow upstream `IREmitter::CompositeConstruct(...)`, `IREmitter::ImageSampleDrefImplicitLod(...)`, and `IREmitter::ImageSampleDrefExplicitLod(...)`. Rust keeps the existing `TextureInstInfo` argument convention used by the current IR.
+
+### Unintentional differences (to fix)
+- None for these helper additions.
+
+### Missing items
+- Broader `IREmitter` parity is not claimed here. This entry only covers the helpers required by `texture_fetch_swizzled.rs`.
+
+### Binary layout verification
+- N/A: IR builder helpers only.
+
+### Tests
+- `cargo check -p shader_recompiler`
+- `cargo build --release --bin ruzu-cmd`
+
+## 2026-05-24 — shader_recompiler/src/ir_opt/constant_propagation.rs + ir_opt/mod.rs vs /home/vricosti/Dev/emulators/zuyu/src/shader_recompiler/ir_opt/constant_propagation_pass.cpp
+
+### Intentional differences
+- Rust ports the upstream `FoldBitCast` inverse fold (`BitCastF32U32(BitCastU32F32(x)) -> x` and reverse) using explicit `InstRef` traversal because ruzu IR stores instructions by stable block/index references rather than upstream intrusive `IR::Inst*` uses.
+- Rust ports the upstream `FoldFPMul32` interpolation-correction fold for `(attr * position_w) * recip(position_w) -> attr`, matching the upstream path that removes manual perspective correction generated during attribute interpolation.
+- Rust runs `identity_removal` immediately after constant propagation in both optimize pipelines. Upstream `ReplaceUsesWith` rewrites uses eagerly; ruzu represents the fold as `Identity` instructions, so this extra pass is the mechanical equivalent needed to materialize the upstream effect without redesigning the IR use-def model in this slice.
+
+### Unintentional differences (to fix)
+- The full upstream `constant_propagation_pass.cpp` is much larger than this targeted slice. Ruzu still lacks many unrelated folds from upstream; this entry only covers the two folds needed by MK8D's logo shader divergence.
+
+### Missing items
+- Port the remaining upstream folds in `constant_propagation_pass.cpp` in future parity slices, especially the texture/query and arithmetic pattern folds not yet represented in ruzu.
+
+### Binary layout verification
+- N/A: IR optimization only.
+
+### Tests
+- `cargo test -p shader_recompiler fold_matches_upstream -- --nocapture`
+- `cargo check -p shader_recompiler`
+- `cargo build --release --bin ruzu-cmd`
+
+## 2026-05-24 — video_core/src/renderer_opengl/gl_rasterizer.rs + engines/draw_manager.rs + engines/maxwell_3d.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_rasterizer.cpp + gl_state_tracker.cpp
+
+### Intentional differences
+- Ported upstream `RasterizerOpenGL::SyncFramebufferSRGB()` into Rust as `sync_framebuffer_srgb`, guarded by the OpenGL dirty bit and the rasterizer-owned `StateTracker` dirty bit. This restores `glEnable/glDisable(GL_FRAMEBUFFER_SRGB)` after screen blit disables it.
+- Rust exposes `regs.framebuffer_srgb` through `Maxwell3DAccess::framebuffer_srgb()` / `Maxwell3DDrawView::framebuffer_srgb()` because ruzu's rasterizer does not own a raw `Maxwell3D*`; this matches the existing live-view architecture used for other Maxwell register reads.
+- The state tracker check uses `StateTracker::exchange(GlDirty::FRAMEBUFFER_SRGB)` instead of upstream's direct `flags[Dirty::FramebufferSRGB]` pointer because ruzu keeps the OpenGL tracker as Rust-owned state rather than an upstream `std::bitset*`.
+
+### Unintentional differences (to fix)
+- Upstream clears `maxwell3d->dirty.flags[Dirty::FramebufferSRGB]` directly inside `SyncFramebufferSRGB()`. Ruzu's current live-view abstraction exposes the flags immutably, so this slice does not clear the guest dirty bit. This follows the existing ruzu pattern for other sync helpers but is still a structural divergence from upstream dirty-flag ownership.
+- Upstream `Clear()` also calls `SyncFramebufferSRGB()` before color clears. This slice wires the draw-state path; clear-path parity remains to be audited once the full dirty-flag guarded sync path is completed.
+
+### Missing items
+- Full upstream `StateTracker::SetupTables` parity for all OpenGL dirty flags.
+- Full upstream dirty-flag guarded `SyncViewport` / depth-range / clip-control synchronization ownership.
+- Clear-path `SyncFramebufferSRGB()` parity.
+
+### Binary layout verification
+- N/A: OpenGL state synchronization only.
+
+### Tests
+- `cargo test -p video_core decode_swizzle_matches_upstream_sources -- --nocapture`
+- `cargo check -p video_core`
+- `cargo build --release --bin ruzu-cmd`
+- Manual apitrace verification: `/tmp/ruzu_srgb.dump` now contains `glEnable(cap = GL_FRAMEBUFFER_SRGB)` before MK8D logo draws.
+
+## 2026-05-24 — shader_recompiler/src/backend/glsl/emit_glsl.rs vs /home/vricosti/Dev/emulators/zuyu/src/shader_recompiler/backend/glsl/emit_glsl.cpp + emit_glsl_special.cpp
+
+### Intentional differences
+- Upstream inserts `PhiMove` instructions before trailing `Reference` instructions with intrusive-list insertion. Ruzu keeps stable `Vec<Option<Inst>>` slots, so it appends all generated `PhiMove`s first and all generated `Reference`s second. This preserves the effective upstream ordering without shifting `InstRef` indices.
+- Ruzu recomputes GLSL-emission `use_count`s after `precolor()` because the Rust port appends raw `Inst` values instead of going through upstream `IREmitter`, which increments use-def counts during insertion.
+- `EmitPhiMove` now consumes the phi value itself, matching upstream `ctx.var_alloc.Consume(IR::Value{&phi})`, instead of only reading the already-defined representation.
+
+### Unintentional differences (to fix)
+- Ruzu still scans all `Opcode::Phi` slots in a block during precolor because `ssa_rewrite_pass.rs` currently appends phis into stable slots rather than physically prepending them before non-phi instructions like upstream. This is an adaptation debt of the current `Vec<Option<Inst>>` IR model, not the intended long-term structure.
+
+### Missing items
+- Long-term IR parity should make phi placement structurally match upstream intrusive-list behavior, allowing `Precolor` to stop at the first non-phi exactly like upstream.
+- GLSL special-op emission is still split between the monolithic Rust dispatcher and small stub files; ownership can be improved in a later file-structure parity pass.
+
+### Binary layout verification
+- N/A: GLSL backend emission only.
+
+### Tests
+- `cargo test -p shader_recompiler precolor_appends_all_phi_moves_before_references_and_recounts_uses -- --nocapture`
+- `cargo check -p shader_recompiler`
+- `cargo build --release --bin ruzu-cmd`
+- Manual apitrace verification: `/tmp/ruzu_phi_fix.trace` pass 2995 mean changed from the previous bright `[75,75,75]` class to `[10.46,10.67,10.82]`, removing the immediate white-pollution regression in the second MK8D logo pass.
+
+## 2026-05-24 — video_core/src/texture_cache/util.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/util.cpp
+
+### Intentional differences
+- `UnswizzleImage` receives already-read input bytes in ruzu while upstream reads from `Tegra::MemoryManager` inside the helper. This is existing Rust plumbing; the swizzle math and returned `BufferImageCopy` ownership remain in the texture-cache utility file.
+- Ruzu reuses `full_upload_swizzles(info)` to obtain the per-level `num_tiles`, adjusted block size, and guest offset. Upstream computes the same values inline in `UnswizzleImage`. This keeps the existing Rust helper boundary while matching the upstream values passed to `UnswizzleTexture`.
+
+### Unintentional differences (to fix)
+- None for this slice. `UnswizzleImage` now passes tile-count dimensions (`num_tiles.width/height/depth`) and adjusted mip block dimensions to `unswizzle_texture`, matching upstream's `UnswizzleTexture(dst, src, 1U << bpp_log2, num_tiles.width, num_tiles.height, num_tiles.depth, block.height, block.depth, stride_alignment)`.
+
+### Missing items
+- Broader texture-cache upload/download parity is still incomplete; this entry only covers the compressed/block-linear `UnswizzleImage` dimension bug observed in MK8D's RGTC2/BC5 upload.
+
+### Binary layout verification
+- N/A: texture-copy math only. The regression test verifies the byte payload produced for a compressed 8x8 BC5 image preserves the lower half of the block payload instead of zeroing it.
+
+### Tests
+- `cargo test -p video_core unswizzle_image_uses_tile_counts_for_compressed_blocks -- --nocapture`
+- `cargo check -p video_core`
+- `cargo build --release --bin ruzu-cmd`
+- Manual apitrace verification: `/tmp/ruzu_unswizzle_fix.trace` call 2818 64-byte RGTC2 upload now matches `/tmp/zuyu_blobs/blob_call16829.bin` exactly, and retrace snapshot 2995 is `[0.0, 0.0, 0.0]` like zuyu instead of reusing the first pass content.

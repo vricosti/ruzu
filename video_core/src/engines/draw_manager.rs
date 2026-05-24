@@ -359,6 +359,11 @@ pub trait Maxwell3DAccess {
     /// Read raw `regs.surface_clip`.
     fn surface_clip_info(&self) -> crate::engines::maxwell_3d::SurfaceClipInfo;
 
+    /// Read `regs.framebuffer_srgb`.
+    fn framebuffer_srgb(&self) -> bool {
+        false
+    }
+
     /// Read `regs.surface_clip.height`.
     fn surface_clip_height(&self) -> u32;
 
@@ -537,6 +542,7 @@ pub struct Maxwell3DDrawRegisters {
         [crate::engines::maxwell_3d::ViewportTransformInfo; crate::engines::maxwell_3d::NUM_VIEWPORTS],
     pub viewport_scale_offset_enabled: bool,
     pub surface_clip: crate::engines::maxwell_3d::SurfaceClipInfo,
+    pub framebuffer_srgb: bool,
     pub depth_mode: crate::engines::maxwell_3d::DepthMode,
     pub dirty_flags: [bool; 256],
     pub color_masks: [crate::engines::maxwell_3d::ColorMaskInfo; 8],
@@ -566,6 +572,7 @@ impl Default for Maxwell3DDrawRegisters {
             viewport_transforms: Default::default(),
             viewport_scale_offset_enabled: false,
             surface_clip: Default::default(),
+            framebuffer_srgb: false,
             depth_mode: crate::engines::maxwell_3d::DepthMode::ZeroToOne,
             dirty_flags: [false; 256],
             color_masks: Default::default(),
@@ -615,6 +622,7 @@ impl Maxwell3DDrawRegisters {
             }),
             viewport_scale_offset_enabled: maxwell3d.viewport_scale_offset_enabled(),
             surface_clip: maxwell3d.surface_clip_info(),
+            framebuffer_srgb: maxwell3d.framebuffer_srgb(),
             depth_mode: maxwell3d.depth_stencil_info().depth_mode,
             dirty_flags: maxwell3d.dirty_flags(),
             color_masks: std::array::from_fn(|i| maxwell3d.color_mask_info(i)),
@@ -867,6 +875,13 @@ impl<'a> Maxwell3DDrawView<'a> {
         match &self.source {
             Maxwell3DDrawSource::Live(maxwell3d) => maxwell3d.surface_clip_info(),
             Maxwell3DDrawSource::Snapshot(registers) => registers.surface_clip,
+        }
+    }
+
+    pub fn framebuffer_srgb(&self) -> bool {
+        match &self.source {
+            Maxwell3DDrawSource::Live(maxwell3d) => maxwell3d.framebuffer_srgb(),
+            Maxwell3DDrawSource::Snapshot(registers) => registers.framebuffer_srgb,
         }
     }
 
