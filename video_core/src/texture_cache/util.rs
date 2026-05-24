@@ -779,7 +779,6 @@ pub fn unswizzle_image(
     }
 
     let params = full_upload_swizzles(info);
-    let block = info.block();
     for (copy, param) in copies.iter().zip(params.iter()) {
         let dst_offset = copy.buffer_offset;
         if dst_offset >= output.len() || param.buffer_offset >= input.len() {
@@ -792,11 +791,11 @@ pub fn unswizzle_image(
             dst,
             src,
             bytes_per_block,
-            copy.image_extent.width,
-            copy.image_extent.height,
-            copy.image_extent.depth.max(1),
-            block.height,
-            block.depth,
+            param.num_tiles.width,
+            param.num_tiles.height,
+            param.num_tiles.depth.max(1),
+            param.block.height,
+            param.block.depth,
             calculate_level_stride_alignment(info, copy.image_subresource.base_level as u32),
         );
     }
@@ -1556,5 +1555,60 @@ mod tests {
         assert_eq!(writes.len(), 2);
         assert_eq!(writes[0], (0x1000, vec![0, 1, 2, 3, 4, 5, 6, 7]));
         assert_eq!(writes[1], (0x1010, vec![8, 9, 10, 11, 12, 13, 14, 15]));
+    }
+
+    #[test]
+    fn unswizzle_image_uses_tile_counts_for_compressed_blocks() {
+        let info = ImageInfo {
+            format: PixelFormat::Bc5Unorm,
+            image_type: ImageType::E2D,
+            resources: SubresourceExtent {
+                levels: 1,
+                layers: 1,
+            },
+            size: Extent3D {
+                width: 8,
+                height: 8,
+                depth: 1,
+            },
+            tiling: TilingMode::BlockLinear(Extent3D {
+                width: 0,
+                height: 0,
+                depth: 0,
+            }),
+            layer_stride: 0,
+            maybe_unaligned_layer_stride: 0,
+            num_samples: 1,
+            tile_width_spacing: 0,
+            rescaleable: false,
+            downscaleable: false,
+            forced_flushed: false,
+            dma_downloaded: false,
+            is_sparse: false,
+        };
+        let input: Vec<u8> = (0..64).map(|x| (x ^ 0x5a) as u8).collect();
+        let mut expected = vec![0; 64];
+        let params = full_upload_swizzles(&info);
+        let alignment = calculate_level_stride_alignment(&info, 0);
+        crate::textures::decoders::unswizzle_texture(
+            &mut expected,
+            &input,
+            surface::bytes_per_block(info.format),
+            params[0].num_tiles.width,
+            params[0].num_tiles.height,
+            params[0].num_tiles.depth,
+            params[0].block.height,
+            params[0].block.depth,
+            alignment,
+        );
+
+        let mut output = vec![0; 64];
+        let copies = unswizzle_image(&(), 0, &info, &input, &mut output);
+
+        assert_eq!(copies.len(), 1);
+        assert_eq!(copies[0].buffer_size, 64);
+        assert_eq!(params[0].num_tiles, Extent3D { width: 2, height: 2, depth: 1 });
+        assert_eq!(output, expected);
+        assert!(output[32..].iter().any(|&byte| byte != 0));
     }
 }

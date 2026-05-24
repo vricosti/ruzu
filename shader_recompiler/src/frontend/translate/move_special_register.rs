@@ -136,10 +136,7 @@ pub fn s2r(tv: &mut TranslatorVisitor, insn: u64) {
             let f = tv.ir.y_direction();
             tv.ir.bit_cast_u32_f32(f)
         }
-        SpecialRegister::LaneId => {
-            log::warn!("S2R: SR_LANEID not implemented, returning 0");
-            Value::ImmU32(0)
-        }
+        SpecialRegister::LaneId => tv.ir.lane_id(),
         SpecialRegister::Unknown(idx) => {
             log::warn!(
                 "S2R: unknown special register {} (0x{:X}), returning 0",

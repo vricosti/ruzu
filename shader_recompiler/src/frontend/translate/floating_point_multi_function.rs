@@ -28,10 +28,7 @@ pub fn mufu(tv: &mut TranslatorVisitor, insn: u64) {
             tv.ir.fp_recip_32(sqrt)
         } // RCP64H (approximate)
         7 => tv.ir.fp_sqrt_32(a),       // SQRT
-        _ => {
-            log::warn!("Unknown MUFU op: {}", op);
-            a
-        }
+        _ => panic!("Unknown MUFU op: {}", op),
     };
 
     if sat {

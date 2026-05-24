@@ -24,10 +24,7 @@ pub fn vote(v: &mut TranslatorVisitor<'_>, insn: u64) {
         0 => v.ir.vote_all(vote_pred),
         1 => v.ir.vote_any(vote_pred),
         2 => v.ir.vote_equal(vote_pred),
-        _ => {
-            log::warn!("VOTE: invalid vote op {}", vote_op);
-            return;
-        }
+        _ => panic!("VOTE: invalid vote op {}", vote_op),
     };
 
     v.ir.set_pred(Pred(pred_b_idx as u8), result);
@@ -70,19 +67,16 @@ pub fn shfl(v: &mut TranslatorVisitor<'_>, insn: u64) {
         v.ir.bit_field_u_extract(src_b, Value::ImmU32(8), Value::ImmU32(5));
 
     let value = v.x(src_reg);
+    // Upstream `TranslatorVisitor::SHFL` dispatches on the 2-bit mode:
+    //   0 = IDX, 1 = UP, 2 = DOWN, 3 = BFLY (matching `IR::ShuffleMode`).
+    // Each routes to a distinct IR opcode (`Shuffle{Index,Up,Down,Butterfly}`).
+    let _ = clamp; // upstream passes mask as a single value; clamp/seg_mask split done at IR-level.
     let result = match mode {
         0 => v.ir.shuffle_index(value, src_a, seg_mask),
-        1 | 2 | 3 => {
-            // UP/DOWN/BFLY shuffle variants — emit ShuffleIndex as fallback
-            // (upstream has full ShuffleUp/Down/Butterfly but emitter only exposes ShuffleIndex)
-            log::warn!(
-                "SHFL mode {} not fully implemented, using IDX fallback",
-                mode
-            );
-            let _ = clamp; // used in full implementation
-            v.ir.shuffle_index(value, src_a, seg_mask)
-        }
-        _ => unreachable!(),
+        1 => v.ir.shuffle_up(value, src_a, seg_mask),
+        2 => v.ir.shuffle_down(value, src_a, seg_mask),
+        3 => v.ir.shuffle_butterfly(value, src_a, seg_mask),
+        _ => unreachable!("2-bit mode field"),
     };
 
     // Set destination predicate (in-bounds flag) — emit true as placeholder

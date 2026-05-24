@@ -38,11 +38,16 @@ pub fn f2i(tv: &mut TranslatorVisitor, insn: u64, opcode: MaxwellOpcode) {
         _ => unreachable!("2-bit F2I rounding field"),
     };
 
+    // Upstream `F2I` (floating_point_conversion_integer.cpp): unsupported
+    // source/destination format combinations throw `NotImplementedException`.
+    // The Rust port mirrors that with a panic — silently downgrading to
+    // F32/I32 would produce wrong values for any F16/F64 input or I64
+    // output shader, which is harder to debug than a clear crash.
     if src_format != SRC_FORMAT_F32 {
-        log::warn!("F2I source format {} not fully ported; treating as F32", src_format);
+        panic!("F2I source format {} not implemented (F16/F64)", src_format);
     }
     if dest_format == DEST_FORMAT_I64 {
-        log::warn!("F2I I64 destination not fully ported; writing low 32 bits");
+        panic!("F2I I64 destination not implemented");
     }
 
     let (min_bound, max_bound) = clamp_bounds(dest_format, is_signed);
@@ -61,7 +66,8 @@ pub fn f2i(tv: &mut TranslatorVisitor, insn: u64, opcode: MaxwellOpcode) {
     tv.set_x(dst, result);
 
     if cc {
-        log::warn!("F2I CC is not implemented");
+        // Upstream throws NotImplementedException("F2I CC").
+        panic!("F2I CC not implemented");
     }
 }
 
@@ -73,10 +79,7 @@ fn clamp_bounds(dest_format: u32, is_signed: bool) -> (f32, f32) {
         (DEST_FORMAT_I32, false) => (u32::MIN as f32, u32::MAX as f32),
         (DEST_FORMAT_I64, true) => (i32::MIN as f32, i32::MAX as f32),
         (DEST_FORMAT_I64, false) => (u32::MIN as f32, u32::MAX as f32),
-        _ => {
-            log::warn!("Invalid F2I destination format {}; using I32 bounds", dest_format);
-            (i32::MIN as f32, i32::MAX as f32)
-        }
+        _ => panic!("Invalid F2I destination format {}", dest_format),
     }
 }
 

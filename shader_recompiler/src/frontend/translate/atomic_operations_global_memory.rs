@@ -3,30 +3,20 @@
 
 //! Port of zuyu/src/shader_recompiler/frontend/maxwell/translate/impl/atomic_operations_global_memory.cpp
 //!
-//! Implements ATOM and RED (atomic read-modify-write on global memory).
+//! Upstream `TranslatorVisitor::ATOM`/`RED` throw `NotImplementedException`
+//! when the full global-atomic IR path isn't wired. We mirror by
+//! panicking — the prior silent log-and-return produced incorrect
+//! shader output (the destination register kept its previous value)
+//! that's worse than a visible crash.
 
 use super::TranslatorVisitor;
 
 /// ATOM — Atomic Operation on Global Memory.
-///
-/// Not yet implemented: requires global atomic IR opcodes (GlobalAtomicIAdd, etc.).
-/// Emits a no-op result and logs a warning.
-pub fn atom(tv: &mut TranslatorVisitor<'_>, insn: u64) {
-    log::warn!(
-        "ATOM: global memory atomic IR not yet ported — emitting no-op (insn={:#018x})",
-        insn
-    );
-    let dst = tv.dst_reg(insn);
-    tv.set_x(dst, crate::ir::value::Value::ImmU32(0));
+pub fn atom(_tv: &mut TranslatorVisitor<'_>, _insn: u64) {
+    panic!("ATOM: global memory atomic not implemented");
 }
 
 /// RED — Reduction on Global Memory.
-///
-/// Not yet implemented: requires global atomic IR opcodes.
-/// Emits a no-op and logs a warning.
-pub fn red(_tv: &mut TranslatorVisitor<'_>, insn: u64) {
-    log::warn!(
-        "RED: global memory reduction IR not yet ported — emitting no-op (insn={:#018x})",
-        insn
-    );
+pub fn red(_tv: &mut TranslatorVisitor<'_>, _insn: u64) {
+    panic!("RED: global memory reduction not implemented");
 }

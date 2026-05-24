@@ -485,8 +485,14 @@ impl<'a> TranslatorVisitor<'a> {
             }
 
             // floating_point_conversion_floating_point.cpp
-            MaxwellOpcode::F2F_reg | MaxwellOpcode::F2F_cbuf | MaxwellOpcode::F2F_imm => {
-                self::floating_point_conversion_floating_point::f2f(self, insn, opcode);
+            MaxwellOpcode::F2F_reg => {
+                self::floating_point_conversion_floating_point::f2f_reg(self, insn);
+            }
+            MaxwellOpcode::F2F_cbuf => {
+                self::floating_point_conversion_floating_point::f2f_cbuf(self, insn);
+            }
+            MaxwellOpcode::F2F_imm => {
+                self::floating_point_conversion_floating_point::f2f_imm(self, insn);
             }
 
             // integer_to_integer_conversion.cpp

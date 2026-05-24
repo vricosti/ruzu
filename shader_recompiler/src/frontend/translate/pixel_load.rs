@@ -43,10 +43,9 @@ impl<'a> TranslatorVisitor<'a> {
                         .select_u32(not_helper, Value::ImmU32(0xFFFFFFFF), Value::ImmU32(0));
                 self.set_x(dst, result);
             }
-            _ => {
-                log::warn!("PIXLD mode {} not implemented, writing zero", mode_raw);
-                self.set_x(dst, Value::ImmU32(0));
-            }
+            // Upstream throws NotImplementedException for CoveredThreadCount,
+            // CoveredThreadIndex, StencilValue, and any reserved encoding.
+            _ => panic!("PIXLD mode {} not implemented", mode_raw),
         }
     }
 }

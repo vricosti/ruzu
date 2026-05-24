@@ -35,6 +35,7 @@ pub fn optimize(program: &mut Program) {
     ssa_rewrite_pass::ssa_rewrite_pass(program);
     identity_removal::identity_removal_pass(program);
     constant_propagation::constant_propagation_pass(program);
+    identity_removal::identity_removal_pass(program);
     dead_code_elimination::dead_code_elimination_pass(program);
     collect_info::collect_shader_info_pass(program);
 }
@@ -49,6 +50,7 @@ pub fn optimize_with_bound_textures(program: &mut Program, texture_bound_buffer:
     ssa_rewrite_pass::ssa_rewrite_pass(program);
     identity_removal::identity_removal_pass(program);
     constant_propagation::constant_propagation_pass(program);
+    identity_removal::identity_removal_pass(program);
     texture_pass::texture_pass_bound_textures(program, texture_bound_buffer);
     dead_code_elimination::dead_code_elimination_pass(program);
     collect_info::collect_shader_info_pass(program);

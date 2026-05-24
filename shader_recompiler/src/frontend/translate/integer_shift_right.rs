@@ -18,18 +18,14 @@ fn shr_inner(tv: &mut TranslatorVisitor, insn: u64, shift: Value) {
     let cc = bit(insn, 47);
     let is_signed = bit(insn, 48);
 
+    // Upstream throws NotImplementedException for SHR.XMODE and SHR.CC.
     if xmode {
-        log::warn!("SHR.XMODE not implemented");
-        let undef = tv.ir.undef_u32();
-        tv.set_x(dst, undef);
-        return;
+        panic!("SHR.XMODE not implemented");
     }
     if cc {
-        log::warn!("SHR.CC not implemented");
-        let undef = tv.ir.undef_u32();
-        tv.set_x(dst, undef);
-        return;
+        panic!("SHR.CC not implemented");
     }
+    let _ = dst;
 
     let mut base = tv.x(src_a_idx);
     if brev {
