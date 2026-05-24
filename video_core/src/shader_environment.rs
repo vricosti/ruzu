@@ -536,6 +536,11 @@ impl GenericEnvironment {
         );
     }
 
+    /// Borrow the parsed shader program header captured by `analyze`.
+    pub fn sph(&self) -> &ProgramHeader {
+        &self.sph
+    }
+
     /// Helper for `analyze`: borrow the first `size` bytes of `code` as a
     /// byte slice. The recompiler stores instructions as `Vec<u64>` and
     /// CityHash64 wants `&[u8]`, so we reinterpret in place rather than

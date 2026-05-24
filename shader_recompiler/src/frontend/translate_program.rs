@@ -13,7 +13,9 @@ use crate::ir::program::{Program, SyntaxNode};
 use crate::ir::types::ShaderStage;
 use crate::ir::value::{Attribute, InstRef, Value};
 use crate::ir_opt;
+use crate::program_header::{PixelImap, ProgramHeader};
 use crate::runtime_info::{AttributeType, RuntimeInfo};
+use crate::shader_info::Interpolation;
 use crate::varying_state::VaryingState;
 use std::collections::{BTreeMap, VecDeque};
 
@@ -185,6 +187,37 @@ pub fn convert_legacy_to_generic(program: &mut Program, runtime_info: &RuntimeIn
         for mapped_attr in mapped_load_attrs {
             program.info.loads.set(mapped_attr as usize, true);
         }
+    }
+}
+
+/// Port of upstream `CollectInterpolationInfo`.
+pub fn collect_interpolation_info(sph: &ProgramHeader, program: &mut Program) {
+    if program.stage != ShaderStage::Fragment {
+        return;
+    }
+    for index in 0..NUM_GENERICS {
+        let mut imap = None;
+        for value in sph.ps_generic_input_map(index as u32) {
+            if value == PixelImap::Unused {
+                continue;
+            }
+            if imap.is_some_and(|current| current != value) {
+                log::warn!(
+                    "Per-component interpolation not implemented for generic input {}",
+                    index
+                );
+                continue;
+            }
+            imap = Some(value);
+        }
+        let Some(imap) = imap else {
+            continue;
+        };
+        program.info.interpolation[index] = match imap {
+            PixelImap::Unused | PixelImap::Perspective => Interpolation::Smooth,
+            PixelImap::Constant => Interpolation::Flat,
+            PixelImap::ScreenLinear => Interpolation::NoPerspective,
+        };
     }
 }
 
@@ -415,6 +448,25 @@ mod convert_legacy_tests {
             program.blocks[0].inst(0).args[0],
             Value::Attribute(Attribute::generic(7, 0))
         );
+    }
+}
+
+#[cfg(test)]
+mod interpolation_tests {
+    use super::*;
+
+    #[test]
+    fn collect_interpolation_info_matches_ps_imap() {
+        let mut sph = ProgramHeader::default();
+        sph.raw[6] = 0b01_01_01_01 | (0b11_11_11_11 << 8) | (0b10_10_10_10 << 16);
+        let mut program = Program::new(ShaderStage::Fragment);
+
+        collect_interpolation_info(&sph, &mut program);
+
+        assert_eq!(program.info.interpolation[0], Interpolation::Flat);
+        assert_eq!(program.info.interpolation[1], Interpolation::NoPerspective);
+        assert_eq!(program.info.interpolation[2], Interpolation::Smooth);
+        assert_eq!(program.info.interpolation[3], Interpolation::Smooth);
     }
 }
 

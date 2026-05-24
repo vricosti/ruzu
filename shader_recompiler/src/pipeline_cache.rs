@@ -15,13 +15,16 @@ use super::backend;
 use super::frontend::control_flow;
 use super::frontend::structured_control_flow;
 use super::frontend::translate::TranslatorVisitor;
-use super::frontend::translate_program::{convert_legacy_to_generic, merge_dual_vertex_programs};
+use super::frontend::translate_program::{
+    collect_interpolation_info, convert_legacy_to_generic, merge_dual_vertex_programs,
+};
 use super::ir::basic_block::Block;
 use super::ir::post_order::post_order;
 use super::ir::program::{Program, ShaderInfo};
 use super::ir::types::ShaderStage;
 use super::ir_opt;
 use super::profile::Profile;
+use super::program_header::ProgramHeader;
 use super::runtime_info::RuntimeInfo;
 
 /// Key for looking up a cached shader.
@@ -68,6 +71,7 @@ fn translate_cfg_to_program(
     stage: ShaderStage,
     base_offset: u32,
     cfg_blocks: &[control_flow::CfgBlock],
+    sph: Option<&ProgramHeader>,
 ) -> Program {
     let syntax_list = structured_control_flow::structure_cfg(cfg_blocks);
     let mut program = Program::new(stage);
@@ -91,7 +95,7 @@ fn translate_cfg_to_program(
 
     for (idx, cfg_block) in cfg_blocks.iter().enumerate() {
         program.block_mut(idx as u32).order = idx as u32;
-        let mut tv = TranslatorVisitor::new(&mut program, idx as u32);
+        let mut tv = TranslatorVisitor::new_with_sph(&mut program, idx as u32, sph.cloned());
         for i in cfg_block.begin as usize..cfg_block.end as usize {
             if i >= code.len() {
                 break;
@@ -241,7 +245,7 @@ pub fn compile_shader(
 
     // Step 2/3: Convert flat CFG to structured control flow and translate
     // Maxwell instructions into matching IR blocks.
-    let mut program = translate_cfg_to_program(code, stage, 0, &cfg_blocks);
+    let mut program = translate_cfg_to_program(code, stage, 0, &cfg_blocks, None);
     log::trace!("  Syntax nodes: {}", program.syntax_list.len());
 
     // Step 4: Run optimization passes.
@@ -281,7 +285,7 @@ pub fn compile_shader_glsl(
     );
 
     let cfg_blocks = control_flow::build_cfg(code);
-    let mut program = translate_cfg_to_program(code, stage, 0, &cfg_blocks);
+    let mut program = translate_cfg_to_program(code, stage, 0, &cfg_blocks, None);
 
     ir_opt::optimize(&mut program);
 
@@ -319,6 +323,7 @@ pub fn compile_shader_glsl_at_offset(
         runtime_info,
         &mut bindings,
         None,
+        None,
     )
 }
 
@@ -343,6 +348,7 @@ pub fn compile_shader_glsl_at_offset_with_bindings(
         runtime_info,
         bindings,
         None,
+        None,
     )
 }
 
@@ -366,6 +372,32 @@ pub fn compile_shader_glsl_at_offset_with_bindings_and_texture_bound(
         runtime_info,
         bindings,
         Some(texture_bound_buffer),
+        None,
+    )
+}
+
+/// Same as [`compile_shader_glsl_at_offset_with_bindings_and_texture_bound`],
+/// but preserves the upstream environment-owned SPH for fragment interpolation
+/// and IPA perspective handling.
+pub fn compile_shader_glsl_at_offset_with_bindings_and_texture_bound_and_sph(
+    code: &[u64],
+    stage: ShaderStage,
+    base_offset: u32,
+    texture_bound_buffer: u32,
+    sph: &ProgramHeader,
+    profile: &Profile,
+    runtime_info: &RuntimeInfo,
+    bindings: &mut backend::bindings::Bindings,
+) -> CompiledGlslShader {
+    emit_glsl_program_at_offset(
+        code,
+        stage,
+        base_offset,
+        profile,
+        runtime_info,
+        bindings,
+        Some(texture_bound_buffer),
+        Some(sph),
     )
 }
 
@@ -377,6 +409,7 @@ fn emit_glsl_program_at_offset(
     runtime_info: &RuntimeInfo,
     bindings: &mut backend::bindings::Bindings,
     texture_bound_buffer: Option<u32>,
+    sph: Option<&ProgramHeader>,
 ) -> CompiledGlslShader {
     log::debug!(
         "Compiling {:?} shader to GLSL ({} instructions, base_offset=0x{:X})",
@@ -389,7 +422,7 @@ fn emit_glsl_program_at_offset(
     }
 
     let cfg_blocks = control_flow::build_cfg(code);
-    let mut program = translate_cfg_to_program(code, stage, base_offset, &cfg_blocks);
+    let mut program = translate_cfg_to_program(code, stage, base_offset, &cfg_blocks, sph);
 
     if let Some(texture_bound_buffer) = texture_bound_buffer {
         ir_opt::optimize_with_bound_textures(&mut program, texture_bound_buffer);
@@ -398,6 +431,9 @@ fn emit_glsl_program_at_offset(
     }
 
     convert_legacy_to_generic(&mut program, runtime_info);
+    if let Some(sph) = sph {
+        collect_interpolation_info(sph, &mut program);
+    }
     let source = backend::glsl::emit_glsl(profile, runtime_info, &mut program, bindings);
     if std::env::var_os("RUZU_DUMP_GLSL").is_some() {
         eprintln!("[RUZU_DUMP_GLSL {:?}]\n{}", stage, source);
@@ -488,7 +524,7 @@ fn hash_code(code: &[u64]) -> u64 {
 
 fn translate_and_optimize(code: &[u64], stage: ShaderStage, base_offset: u32) -> Program {
     let cfg_blocks = control_flow::build_cfg(code);
-    let mut program = translate_cfg_to_program(code, stage, base_offset, &cfg_blocks);
+    let mut program = translate_cfg_to_program(code, stage, base_offset, &cfg_blocks, None);
     ir_opt::optimize(&mut program);
     program
 }
@@ -586,8 +622,13 @@ mod tests {
             },
         ];
 
-        let program =
-            translate_cfg_to_program(&[0, 0], ShaderStage::VertexB, 0, cfg_blocks.as_slice());
+        let program = translate_cfg_to_program(
+            &[0, 0],
+            ShaderStage::VertexB,
+            0,
+            cfg_blocks.as_slice(),
+            None,
+        );
 
         assert_eq!(program.blocks.len(), 2);
         assert_eq!(program.block(0).imm_successors, vec![1]);

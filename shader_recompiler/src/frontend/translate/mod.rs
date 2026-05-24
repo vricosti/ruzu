@@ -103,6 +103,7 @@ use crate::ir::emitter::Emitter;
 use crate::ir::program::{Program, ShaderInfo};
 use crate::ir::types::ShaderStage;
 use crate::ir::value::{Reg, Value};
+use crate::program_header::ProgramHeader;
 
 /// Maxwell instruction bit field extraction helpers.
 pub fn field(insn: u64, start: u32, len: u32) -> u32 {
@@ -129,14 +130,20 @@ pub fn sfield(insn: u64, start: u32, len: u32) -> i32 {
 pub struct TranslatorVisitor<'a> {
     pub ir: Emitter<'a>,
     pub stage: ShaderStage,
+    pub sph: Option<ProgramHeader>,
 }
 
 impl<'a> TranslatorVisitor<'a> {
     pub fn new(program: &'a mut Program, block: u32) -> Self {
+        Self::new_with_sph(program, block, None)
+    }
+
+    pub fn new_with_sph(program: &'a mut Program, block: u32, sph: Option<ProgramHeader>) -> Self {
         let stage = program.stage;
         Self {
             ir: Emitter::new(program, block),
             stage,
+            sph,
         }
     }
 

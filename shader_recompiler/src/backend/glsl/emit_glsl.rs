@@ -811,7 +811,8 @@ fn emit_inst(ctx: &mut EmitContext, program: &mut ir::Program, inst_ref: InstRef
         | Opcode::GetCbufU16
         | Opcode::GetCbufS16
         | Opcode::GetCbufU32
-        | Opcode::GetCbufF32 => {
+        | Opcode::GetCbufF32
+        | Opcode::GetCbufU32x2 => {
             emit_glsl_context_get_set::emit_get_cbuf(
                 ctx,
                 program,

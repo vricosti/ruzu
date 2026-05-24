@@ -16867,3 +16867,141 @@ Investigation focused on a "specific frame number" was misdirected. The real que
 
 ### Tests
 - Re-ran `cargo build --release --bin ruzu-cmd`.
+
+## 2026-05-24 — shader_recompiler/src/{program_header.rs,pipeline_cache.rs,frontend/translate/load_store_attribute.rs,frontend/translate_program.rs}, video_core/src/renderer_opengl/gl_shader_cache.rs vs /home/vricosti/Dev/emulators/zuyu/src/shader_recompiler/{program_header.h,frontend/maxwell/translate/impl/load_store_attribute.cpp,frontend/maxwell/translate_program.cpp}
+
+### Intentional differences
+- Rust still passes shader bodies into the GLSL compiler as slices rather than recompiling directly from an `Environment&`. To preserve upstream SPH ownership without a larger API rewrite, the OpenGL shader-cache path forwards `GenericEnvironment::sph()` into a new SPH-aware GLSL compile helper.
+- `TranslatorVisitor` stores an optional cloned `ProgramHeader` instead of an upstream `Environment&`; this keeps the current Rust translation API safe while allowing `IPA` to inspect PS interpolation metadata.
+- `IPA` logs unsupported indexed varying reads instead of throwing `NotImplementedException`, matching the existing Rust translator convention for unported instruction submodes.
+
+### Unintentional differences (to fix)
+- The generic non-environment GLSL entry points still compile without SPH metadata; callers that need exact fragment interpolation should move to the SPH-aware path or the longer-term direct `Environment` translation API.
+- `IPA` still does not fully implement indexed varying reads or special handling for all interpolation modes beyond upstream's currently material behaviour (`Multiply` side effect, `SAT`, perspective pre-multiply).
+
+### Missing items
+- Continue porting `frontend/maxwell/translate_program.cpp` around direct environment ownership so `CollectInterpolationInfo` does not need a Rust-only helper parameter.
+- Investigate MK8D's remaining white output through the vertex shader `out_attr2` path; the IPA/interpolation fix is active but not sufficient to correct that varying.
+
+### Binary layout verification
+- PASS: `ProgramHeader` remains 0x50 bytes; added PS accessor methods only, no field layout change.
+
+### Tests
+- `cargo test -p shader_recompiler ps_generic_input_map_decodes_one_byte_per_attribute`
+- `cargo test -p shader_recompiler collect_interpolation_info_matches_ps_imap`
+- `cargo build --release --bin ruzu-cmd`
+
+## 2026-05-24 — video_core/src/renderer_opengl/gl_rasterizer.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_rasterizer.cpp
+
+### Intentional differences
+- Moved Rust's `current_graphics_pipeline_with_shared_cache` lookup before render-target/FBO binding to match upstream `RasterizerOpenGL::PrepareDraw`, where missing pipeline returns before later draw-state configuration.
+- Rust still uses the inlined draw body rather than upstream's exact `PrepareDraw` helper split; the ordering change is a parity step inside the existing structure.
+
+### Unintentional differences (to fix)
+- Rust still does not exactly mirror the full upstream `PrepareDraw` sequence (`gpu_memory->FlushCaching()`, `Configure`, `SyncState`, draw lambda boundaries).
+
+### Missing items
+- Complete the upstream `PrepareDraw` split once remaining live Maxwell view and cache-lock ownership work is stable.
+
+### Binary layout verification
+- N/A: OpenGL draw-ordering change only.
+
+### Tests
+- `cargo build --release --bin ruzu-cmd`
+
+## 2026-05-24 — shader_recompiler/src/backend/glsl/emit_glsl_context_get_set.rs vs /home/vricosti/Dev/emulators/zuyu/src/shader_recompiler/backend/glsl/emit_glsl_context_get_set.cpp
+
+### Intentional differences
+- Rust keeps the existing single `emit_get_cbuf` dispatcher instead of upstream's per-opcode free functions, but the newly ported `GetCbufU32x2` emission follows upstream's immediate and dynamic offset GLSL shapes.
+- Rust uses `format!` strings and `VarAlloc::define` rather than upstream `ctx.AddU32x2`; this preserves the same output-variable ownership in the current GLSL backend.
+
+### Unintentional differences (to fix)
+- None identified for `GetCbufU32x2` emission. Existing broader GLSL context get/set gaps outside this opcode remain separately auditable.
+
+### Missing items
+- Continue auditing the remaining GLSL context get/set helpers against upstream, especially non-CBUF attribute edge cases.
+
+### Binary layout verification
+- N/A: shader text emission only.
+
+### Tests
+- `cargo test -p shader_recompiler glsl_cbuf_u32x2_matches_upstream_vector_load_shape -- --nocapture`
+- `cargo build --release --bin ruzu-cmd`
+
+## 2026-05-24 — shader_recompiler/src/frontend/translate/floating_point_conversion_integer.rs vs /home/vricosti/Dev/emulators/zuyu/src/shader_recompiler/frontend/maxwell/translate/impl/floating_point_conversion_integer.cpp
+
+### Intentional differences
+- Rust still degrades unsupported I64 and non-F32 source formats with warnings instead of throwing upstream-style `NotImplementedException`.
+- Rust maps upstream helper calls through existing IR emitter helpers (`fp_abs_neg_32`, `fp_round_even_32`, `fp_clamp_32`, conversion opcodes) rather than C++ overload syntax.
+
+### Unintentional differences (to fix)
+- I64 destination handling is still incomplete.
+- F16/F64 source handling is still incomplete.
+
+### Missing items
+- Port the remaining upstream `F2I` source/destination format matrix once corresponding Rust IR conversion helpers exist.
+
+### Binary layout verification
+- N/A: shader instruction translation only.
+
+### Tests
+- `cargo test -p shader_recompiler f2i_uses_upstream_abs_neg_and_rounding_fields -- --nocapture`
+- `cargo build --release --bin ruzu-cmd`
+
+## 2026-05-24 — video_core/src/renderer_opengl/maxwell_to_gl.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/maxwell_to_gl.h
+
+### Intentional differences
+- Rust returns the OpenGL scalar type from a function rather than upstream's `constexpr` table style, matching existing Rust ownership while preserving the upstream bit-depth/type mapping.
+
+### Unintentional differences (to fix)
+- None identified for signed/unsigned vertex format scalar-type mapping.
+
+### Missing items
+- Continue auditing adjacent `maxwell_to_gl` conversions; only the vertex scalar-type mismatch was addressed in this slice.
+
+### Binary layout verification
+- N/A: OpenGL enum mapping only.
+
+### Tests
+- `cargo test -p video_core vertex_format_matches_upstream_bit_depth -- --nocapture`
+- `cargo build --release --bin ruzu-cmd`
+
+## 2026-05-24 — shader_recompiler/src/backend/glsl/glsl_emit_context.rs and video_core/src/renderer_opengl/gl_shader_cache.rs vs /home/vricosti/Dev/emulators/zuyu/src/shader_recompiler/backend/glsl/glsl_emit_context.cpp
+
+### Intentional differences
+- Rust builds transform-feedback varyings in `gl_shader_cache.rs` from the existing Rust `GraphicsPipelineKey`/`TransformFeedbackState` path, then forwards them through `RuntimeInfo`; upstream receives equivalent runtime info from its pipeline key path.
+- Rust's `define_generic_output` remains in one Rust method, but now follows upstream's component-split/`xfb_buffer`/`xfb_stride`/`xfb_offset` declaration strategy when XFB is active.
+
+### Unintentional differences (to fix)
+- No known XFB-specific declaration mismatch after this slice. Broader generic-output layout parity still depends on future GLSL backend audits.
+
+### Missing items
+- Continue comparing all generic output declaration modes, especially tessellation/geometry edge cases not exercised by MK8D.
+
+### Binary layout verification
+- N/A: shader text emission and pipeline runtime metadata only.
+
+### Tests
+- `cargo test -p shader_recompiler generic_outputs_use_transform_feedback_component_splits -- --nocapture`
+- `cargo build --release --bin ruzu-cmd`
+
+## 2026-05-24 — shader_recompiler/src/frontend/translate/floating_point_conversion_floating_point.rs vs /home/vricosti/Dev/emulators/zuyu/src/shader_recompiler/frontend/maxwell/translate/impl/floating_point_conversion_floating_point.cpp
+
+### Intentional differences
+- Rust currently keeps `F2F` in one F32-oriented helper and degrades unsupported F16/F64 source/destination combinations with warnings instead of upstream-style `NotImplementedException`.
+- Rust maps upstream `RoundingOp` values to the existing scalar F32 IR helpers (`fp_round_even_32`, `fp_floor_32`, `fp_ceil_32`, `fp_trunc_32`) rather than upstream's width-polymorphic `F16F32F64` IR path.
+- Rust still treats `None`/`Pass` as a pass-through value; upstream emits an add-by-zero to preserve NaN handling exactly.
+
+### Unintentional differences (to fix)
+- F16/F64 conversion, selector handling, FTZ control, F16 packing, F64 destination writes, and exact NaN-preserving `None`/`Pass` semantics remain incomplete.
+- `F2F CC` is still logged and ignored instead of being fully modeled.
+
+### Missing items
+- Port upstream `WidthSize`, `FPConvert`, F16 immediate extraction/packing, F64 register handling, and `FpControl` propagation once the Rust IR has the required typed conversion coverage.
+
+### Binary layout verification
+- N/A: shader instruction translation only.
+
+### Tests
+- `cargo test -p shader_recompiler f2f_pass_rounding_does_not_truncate -- --nocapture`
+- `cargo build --release --bin ruzu-cmd`

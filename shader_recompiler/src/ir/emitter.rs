@@ -156,6 +156,10 @@ impl<'a> Emitter<'a> {
         self.emit(Inst::new(Opcode::GetCbufU32, vec![binding, offset]))
     }
 
+    pub fn get_cbuf_u32x2(&mut self, binding: Value, offset: Value) -> Value {
+        self.emit(Inst::new(Opcode::GetCbufU32x2, vec![binding, offset]))
+    }
+
     pub fn get_cbuf_f32(&mut self, binding: Value, offset: Value) -> Value {
         self.emit(Inst::new(Opcode::GetCbufF32, vec![binding, offset]))
     }

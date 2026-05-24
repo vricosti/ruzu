@@ -402,21 +402,57 @@ impl<'a> EmitContext<'a> {
     }
 
     fn define_generic_output(&mut self, index: usize, invocations: u32) {
-        let num_components = 4u32;
-        let name = format!("out_attr{}", index);
-        self.header.push_str(&format!(
-            "layout(location={})out vec4 {}{};\n",
-            index,
-            name,
-            self.output_decorator(invocations)
-        ));
-        let info = GenericElementInfo {
-            name,
-            first_element: 0,
-            num_components,
-        };
-        for component in 0..4usize {
-            self.output_generics[index][component] = info.clone();
+        const SWIZZLE: &str = "xyzw";
+        let base_index = Attribute::Generic0X as usize + index * 4;
+        let mut element = 0usize;
+        while element < 4 {
+            let mut definition = format!("layout(location={}", index);
+            let remainder = 4 - element;
+            let xfb_varying = if base_index + element < self.runtime_info.xfb_count as usize {
+                let varying = self.runtime_info.xfb_varyings[base_index + element];
+                (varying.components > 0).then_some(varying)
+            } else {
+                None
+            };
+            let num_components = xfb_varying
+                .map(|varying| varying.components as usize)
+                .unwrap_or(remainder);
+            if element > 0 {
+                definition.push_str(&format!(",component={}", element));
+            }
+            if let Some(varying) = xfb_varying {
+                definition.push_str(&format!(
+                    ",xfb_buffer={},xfb_stride={},xfb_offset={}",
+                    varying.buffer, varying.stride, varying.offset
+                ));
+            }
+            let component_suffix = &SWIZZLE[element..element + num_components];
+            let name = if num_components < 4 || element > 0 {
+                format!("out_attr{}_{}", index, component_suffix)
+            } else {
+                format!("out_attr{}", index)
+            };
+            let type_name = if num_components == 1 {
+                "float".to_string()
+            } else {
+                format!("vec{}", num_components)
+            };
+            self.header.push_str(&format!(
+                "{})out {} {}{};\n",
+                definition,
+                type_name,
+                name,
+                self.output_decorator(invocations)
+            ));
+            let info = GenericElementInfo {
+                name,
+                first_element: element as u32,
+                num_components: num_components as u32,
+            };
+            for component in element..element + num_components {
+                self.output_generics[index][component] = info.clone();
+            }
+            element += num_components;
         }
     }
 
@@ -550,5 +586,41 @@ mod tests {
         assert!(ctx
             .header
             .contains("layout(location=0)flat in vec4 in_attr0;"));
+    }
+
+    #[test]
+    fn generic_outputs_use_transform_feedback_component_splits() {
+        let mut program = ir::Program::new(Stage::VertexB);
+        program.info.stores.set(Attribute::Generic0X as usize, true);
+
+        let mut runtime_info = RuntimeInfo::default();
+        runtime_info.xfb_varyings =
+            vec![crate::runtime_info::TransformFeedbackVarying::default(); 256];
+        runtime_info.xfb_varyings[Attribute::Generic0X as usize] =
+            crate::runtime_info::TransformFeedbackVarying {
+                buffer: 1,
+                stride: 16,
+                offset: 0,
+                components: 2,
+            };
+        runtime_info.xfb_varyings[Attribute::Generic0Z as usize] =
+            crate::runtime_info::TransformFeedbackVarying {
+                buffer: 1,
+                stride: 16,
+                offset: 8,
+                components: 2,
+            };
+        runtime_info.xfb_count = Attribute::Generic0W as u32 + 1;
+
+        let mut bindings = Bindings::default();
+        let profile = Profile::default();
+        let ctx = EmitContext::new(&program, &mut bindings, &profile, &runtime_info);
+
+        assert!(ctx.header.contains(
+            "layout(location=0,xfb_buffer=1,xfb_stride=16,xfb_offset=0)out vec2 out_attr0_xy;"
+        ));
+        assert!(ctx.header.contains(
+            "layout(location=0,component=2,xfb_buffer=1,xfb_stride=16,xfb_offset=8)out vec2 out_attr0_zw;"
+        ));
     }
 }
