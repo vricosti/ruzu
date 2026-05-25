@@ -1,3 +1,59 @@
+## 2026-05-25 — core/src/hle/service/acc/acc.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/acc/acc.cpp and /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/acc/acc.h
+
+### Intentional differences
+- Rust keeps `ApplicationInfo::launch_property` as a field because it mirrors upstream `Module::Interface::ApplicationInfo`; this field is currently not populated by `initialize_application_info_base`, matching upstream's TODO-only initialization behavior.
+- Rust IPC handlers return `ResultCode` through `ResponseBuilder` rather than upstream's CMIF helper wrappers; this is the existing mechanical Rust service-dispatch adaptation.
+
+### Unintentional differences (to fix)
+- None introduced by this slice. The previous Rust behavior assigned `launch_property` into `application_info`, causing repeated `InitializeApplicationInfo*` calls to return `RESULT_APPLICATION_INFO_ALREADY_INITIALIZED`; upstream does not assign `launch_property` and therefore does not mark the app info initialized in this stubbed implementation. Ruzu now matches upstream.
+
+### Missing items
+- Upstream TODO remains unimplemented in both projects: actual account `ApplicationInfo` initialization is still a stub beyond selecting `application_type`.
+
+### Binary layout verification
+- PASS: `ApplicationInfo` field order remains `ApplicationLaunchProperty` followed by `ApplicationType`, matching upstream `acc.h`; no raw payload is serialized by this change.
+
+### Tests
+- `cargo check -p core`
+
+## 2026-05-25 — core/src/arm/dynarmic/arm_dynarmic_32.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/arm/dynarmic/arm_dynarmic_32.cpp
+
+### Intentional differences
+- Extended ruzu's env-gated A32 memory watch diagnostics to include the current kernel TID in `[WATCH_READ]` / `[WATCH_WRITE]` lines. This is diagnostic-only and exists to distinguish same-thread stale-pointer reuse from cross-thread races during the MK8D progression investigation.
+- Added `RUZU_A32_TRACE_AFTER_WATCH`, an env-gated diagnostic trigger that arms the existing A32 step tracer only after a matching watchpoint fires. Optional `RUZU_A32_TRACE_AFTER_WATCH_VALUE=0x...` narrows arming to a specific written value, so MK8D can trace after the `0xBEEF2929` poison write instead of the earlier zeroing write. This avoids paying instruction-step overhead from boot while still allowing targeted tracing of guest code immediately after the observed poisoned-resource write.
+- Added `RUZU_A32_TRACE_SEARCH_QUIET`, an env-gated diagnostic option that suppresses per-instruction search logs before the requested trace range is reached. This keeps after-watch traces usable on multi-core A32 games without changing default execution.
+- Ruzu already has richer env-gated watchpoint diagnostics than upstream zuyu in this branch (`RUZU_WATCH_ADDR`, `RUZU_WATCH_PC`, instance dumps, code/stack dumps). The new TID field preserves that diagnostic ownership in the A32 Dynarmic backend.
+
+### Unintentional differences (to fix)
+- None introduced by this diagnostic slice. Default execution remains unchanged when watchpoint env vars are unset.
+
+### Missing items
+- None for this diagnostic slice.
+
+### Binary layout verification
+- N/A: diagnostic log formatting only. No guest-visible raw payload layout changed.
+
+### Tests
+- `cargo check -p core`
+
+## 2026-05-25 — core/src/hle/service/filesystem/fsp/fs_i_storage.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/filesystem/fsp/fs_i_storage.cpp
+
+### Intentional differences
+- Added `RUZU_TRACE_ISTORAGE_ANOMALY` and extended `RUZU_ISTORAGE_READ_CONTEXT` to report `buffer_size` and `read_size` for MK8D resource-loading investigation. This is diagnostic-only and env-gated; default `IStorage::Read` behavior is unchanged.
+- Ruzu still allocates a Rust buffer capped to the IPC write-buffer size before calling the backend, because the Rust VFS API takes `&mut [u8]`. Upstream receives an `OutBuffer` span and calls `backend->Read(out_bytes.data(), length, offset)` directly.
+
+### Unintentional differences (to fix)
+- Ruzu's `read_handler` caps the temporary output buffer to `min(length, buffer_size)` before `ctx.write_buffer`, while upstream assumes the supplied `OutBuffer` is valid for `length`. This is pre-existing safe-Rust behavior; the new anomaly trace exists to determine whether MK8D ever relies on the edge case.
+
+### Missing items
+- None for `IStorage::Read` command dispatch in this diagnostic slice.
+
+### Binary layout verification
+- N/A: service IPC diagnostics only. No guest-visible raw payload layout changed in default mode.
+
+### Tests
+- `cargo check -p core`
+
 ## 2026-03-23 — core/src/hle/service/vi/application_display_service.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/vi/application_display_service.cpp
 
 ### Intentional differences
@@ -17443,6 +17499,117 @@ The following still panic because upstream either also throws NotImplementedExce
 ### Tests
 - `cargo check -p video_core`
 
+## 2026-05-25 — video_core/src/renderer_opengl/gl_rasterizer.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_graphics_pipeline.cpp
+
+### Intentional differences
+- Ruzu resolves graphics texture descriptors inside `RasterizerOpenGL::draw` from `Maxwell3DDrawView` snapshots instead of upstream `GraphicsPipeline::ConfigureImpl` reading live `maxwell3d->state.shader_stages[stage].const_buffers`. This is the current Rust ownership model for draw-time Maxwell state; the descriptor arithmetic now mirrors upstream within that model.
+- Descriptor index offset arithmetic keeps the pre-existing Rust `checked_shl` / `checked_add` guards for `idx << size_shift` and cbuf offset addition. Upstream uses raw `u32` arithmetic; ruzu returns `None` for malformed descriptor metadata instead of wrapping into an unrelated cbuf address.
+
+### Unintentional differences (to fix)
+- None for texture and texture-buffer `has_secondary` handle composition in this slice. Ruzu now reads the primary cbuf word, reads the secondary cbuf word when present, applies `shift_left` / `secondary_shift_left`, ORs both words, then passes the raw handle through `texture_pair`, matching upstream `read_handle`.
+
+### Missing items
+- The descriptor binding code still lives inline in `RasterizerOpenGL::draw`; upstream owns it in `gl_graphics_pipeline.cpp::ConfigureImpl`. A future structural pass should split the Rust code into a matching OpenGL graphics-pipeline owner once the live Maxwell access model is settled.
+
+### Binary layout verification
+- N/A: GL descriptor binding policy only. No guest-visible raw payload layout changed.
+
+### Tests
+- `cargo check -p video_core`
+- `cargo build --release --bin ruzu-cmd`
+- Runtime MK8D/apitrace: `/tmp/ruzu_secondary_fix.trace` final default-framebuffer snapshot is no longer pure white (`mean ~= [103.48, 103.57, 103.63, 255]`), but gameplay progression still requires follow-up investigation.
+
+## 2026-05-25 — video_core/src/renderer_opengl/gl_texture_cache.rs and video_core/src/renderer_opengl/gl_rasterizer.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_texture_cache.cpp and /home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/texture_cache.h
+
+### Intentional differences
+- Added a Rust `render_target_framebuffers: HashMap<RenderTargets, TextureCacheFramebuffer>` side cache so draw FBO lookup can be keyed by the full upstream `RenderTargets` tuple instead of only the first color render-target view. This mirrors upstream `TextureCache<P>::GetFramebufferId(render_targets)` while preserving ruzu's current split backend-cache storage.
+- `RasterizerOpenGL::draw` now asks the texture cache for a framebuffer from the full `Maxwell3DRenderTargets` snapshot and `surface_clip` size. Upstream gets the same values through live `maxwell3d->regs` in `UpdateRenderTargets`.
+
+### Unintentional differences (to fix)
+- Depth/stencil attachment is not yet included in the new full render-target framebuffer helper. Upstream `Framebuffer::Framebuffer` attaches both color buffers and the depth/stencil image.
+- Ruzu still does not clear Maxwell dirty flags per upstream `UpdateRenderTargets`; it consumes draw snapshots and leaves dirty-flag lifecycle outside the texture cache.
+
+### Missing items
+- Full upstream framebuffer lifecycle: depth/stencil attachment, rescale metadata, dependency scanning equivalent to upstream `RemoveFramebuffers`, and slot-framebuffer ownership in the base texture cache.
+- Full `UpdateRenderTargets` structural port using live Maxwell dirty flags rather than draw-time snapshots.
+
+### Binary layout verification
+- N/A: OpenGL host framebuffer cache only. No guest-visible raw payload layout changed.
+
+### Tests
+- `cargo check -p video_core`
+- `cargo build --release --bin ruzu-cmd`
+- Runtime MK8D/apitrace: early MK8D still uses a single color render target before the current progression blocker, so this parity slice does not by itself fix the remaining white/progression issue.
+
+## 2026-05-25 — video_core/src/renderer_opengl/gl_shader_cache.rs and video_core/src/renderer_opengl/gl_device.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_shader_cache.cpp and gl_device.cpp
+
+### Intentional differences
+- `OpenGLShaderCache::new` now receives `&Device` and stores one OpenGL `ShaderProfile` built from that device, matching upstream `ShaderCache` ownership where profile policy is constructed in `gl_shader_cache.cpp` from `OpenGL::Device`.
+- Unit tests use `ShaderCache::new_for_test()` / `new_with_profile()` because constructing a real `Device` requires a current GL context. This is test-only scaffolding; production construction now goes through `RasterizerOpenGL::new(device, ...)`.
+- Ruzu keeps `Device::has_precise_bug` as `false` for now. Upstream computes this with `Device::TestPreciseBug()` by compiling a small GLSL program; ruzu does not yet have that exact probe wired into `gl_device.rs`.
+
+### Unintentional differences (to fix)
+- `Device::has_variable_aoffi` still uses the existing Rust extension/vendor approximation instead of upstream `Device::TestVariableAoffi()`.
+- `Device::has_precise_bug` still lacks upstream's runtime shader-compile probe.
+- Ruzu's `has_vertex_viewport_layer` currently includes `GL_NV_viewport_array2` in addition to `GL_ARB_shader_viewport_layer_array`; upstream keeps `HasVertexViewportLayer()` and `HasNvViewportArray2()` separate. The shader profile uses the upstream OR expression explicitly, but other users of `has_vertex_viewport_layer()` should be audited.
+
+### Missing items
+- Port upstream `Device::TestVariableAoffi()` and `Device::TestPreciseBug()` helper probes into `gl_device.rs`.
+- Audit non-shader-profile users of `Device::has_vertex_viewport_layer()` for the current ARB/NV conflation.
+
+### Binary layout verification
+- N/A: OpenGL host capability policy and generated GLSL source only. No guest-visible raw payload layout changed.
+
+### Tests
+- `cargo test -p video_core opengl_fragment_profile_declares_all_frag_colors -- --nocapture`
+- `cargo test -p video_core shader_cache_uses_stored_opengl_profile -- --nocapture`
+- `cargo check -p video_core`
+
+## 2026-05-25 — video_core/src/engines/draw_manager.rs, video_core/src/rasterizer_interface.rs, video_core/src/buffer_cache/buffer_cache.rs, video_core/src/renderer_opengl/gl_rasterizer.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/engines/draw_manager.{h,cpp}, /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_rasterizer.cpp, /home/vricosti/Dev/emulators/zuyu/src/video_core/buffer_cache/buffer_cache.h
+
+### Intentional differences
+- Ruzu passes indirect draw state through `Maxwell3DIndirectView` because `RasterizerOpenGL` does not yet own an upstream-style live `Maxwell3D*`. Upstream reads `maxwell3d->draw_manager->GetIndirectParams()` and `maxwell3d->regs` directly inside `RasterizerOpenGL::DrawIndirect()`.
+- `buffer_cache.rs` exposes `get_buffer_gpu_handle(BufferId)` as a Rust adapter for upstream's `Buffer* -> Handle()` path returned by `GetDrawIndirectBuffer()`.
+- The OpenGL implementation currently ports only the non-byte-count, non-count-buffer `glMultiDrawArraysIndirect` / `glMultiDrawElementsIndirect` cases. Unsupported paths return early with a warning rather than guessing behavior.
+
+### Unintentional differences (to fix)
+- Upstream wraps `DrawIndirect()` in the same `PrepareDraw(params.is_indexed, draw_func)` path as direct draws. Ruzu's current indirect path updates/binds buffers and emits `glMultiDraw*Indirect`, but it does not yet run the full pipeline lookup/configure, descriptor synchronization, render-target preparation, or `SyncState()` sequence through a shared `PrepareDraw` helper.
+- Upstream supports byte-count indirect draws via transform feedback (`glDrawTransformFeedback`) and count-buffer draws via `glMultiDraw*IndirectCount` with `GL_PARAMETER_BUFFER`; ruzu still lacks both paths.
+
+### Missing items
+- Extract a shared Rust `prepare_draw` helper matching upstream `RasterizerOpenGL::PrepareDraw` and route both direct `draw()` and `draw_indirect()` through it.
+- Port transform-feedback object lookup for byte-count indirect draws.
+- Add/load OpenGL bindings for `GL_PARAMETER_BUFFER` and `glMultiDrawArraysIndirectCount` / `glMultiDrawElementsIndirectCount`, then port the include-count path.
+
+### Binary layout verification
+- N/A: OpenGL host command submission and Rust view plumbing only. No guest-visible raw layout changed.
+
+### Tests
+- `cargo test -p video_core test_hle_draw_arrays_indirect_fallback_emits_instanced_draw -- --nocapture`
+- `cargo check -p video_core`
+- `cargo build --release --bin ruzu-cmd`
+- Runtime MK8D diagnostic: `RUZU_TRACE_PROCESS_DRAW=1` for 10 seconds still shows only indexed direct draws with `instances=1`; the current MK8D trace does not reach this indirect path yet.
+
+## 2026-05-25 — shader_recompiler/src/backend/glsl/emit_glsl.rs and video_core/src/renderer_opengl/gl_state_tracker.rs vs /home/vricosti/Dev/emulators/zuyu/src/shader_recompiler/backend/glsl/emit_glsl_context_get_set.cpp and /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_state_tracker.h
+
+### Intentional differences
+- GLSL `YDirection` now emits `gl_FrontMaterial.ambient.a`, matching upstream `EmitYDirection`.
+- Ruzu loads `glMaterialfv` dynamically in `gl_state_tracker.rs` because the generated Rust `gl` bindings do not expose this compatibility-profile entry point. Upstream calls `glMaterialfv(GL_FRONT, GL_AMBIENT, ...)` directly from `StateTracker::SetYNegate`.
+
+### Unintentional differences (to fix)
+- If the current platform fails to expose `glMaterialfv`, ruzu's `set_y_negate` currently leaves the previous fixed-function material value untouched. Upstream assumes the compatibility function is available.
+
+### Missing items
+- None for the OpenGL GLSL `YDirection` data path itself. Remaining risk is context/profile creation: compatibility fixed-function material state must be available for shaders using this path.
+
+### Binary layout verification
+- N/A: generated GLSL and host OpenGL fixed-function state only. No guest-visible raw payload layout changed.
+
+### Tests
+- `cargo test -p shader_recompiler glsl_y_direction_uses_fixed_function_material_state -- --nocapture`
+- `cargo check -p shader_recompiler`
+- `cargo build --release --bin ruzu-cmd`
+
 ## 2026-05-25 — shader_recompiler/src/frontend/translate/floating_point_fused_multiply_add.rs and shader_recompiler/src/frontend/translate/floating_point_multiply.rs vs /home/vricosti/Dev/emulators/zuyu/src/shader_recompiler/frontend/maxwell/translate/impl/floating_point_fused_multiply_add.cpp and /home/vricosti/Dev/emulators/zuyu/src/shader_recompiler/frontend/maxwell/translate/impl/floating_point_multiply.cpp
 
 ### Intentional differences
@@ -17462,6 +17629,66 @@ The following still panic because upstream either also throws NotImplementedExce
 ### Tests
 - `cargo test -p shader_recompiler fma -- --nocapture`
 - `cargo test -p shader_recompiler fmul -- --nocapture`
+- `cargo check -p shader_recompiler`
+
+## 2026-05-25 — shader_recompiler/src/backend/glsl/emit_glsl.rs vs /home/vricosti/Dev/emulators/zuyu/src/shader_recompiler/backend/glsl/emit_glsl_select.cpp
+
+### Intentional differences
+- The centralized Rust GLSL dispatcher now panics for `SelectU8`, `SelectU16`, and `SelectF16`, matching upstream `EmitSelectU8`, `EmitSelectU16`, and `EmitSelectF16` `NotImplemented()` behavior.
+- `SelectU32`, `SelectU64`, `SelectF32`, `SelectF64`, and `SelectU1` continue to emit ternary assignments through the shared Rust `emit_select` helper; this is a mechanical dispatcher difference only.
+
+### Unintentional differences (to fix)
+- None known in this slice. The prior Rust behavior silently treated `SelectU8`/`SelectU16` as `U32` and `SelectF16` as `F16x2`; upstream rejects those opcodes.
+
+### Missing items
+- No remaining missing select emitters relative to upstream GLSL. The unsupported cases are now explicitly unsupported like upstream.
+
+### Binary layout verification
+- N/A: GLSL emission only. No guest-visible raw payload layout changed.
+
+### Tests
+- `cargo test -p shader_recompiler glsl_select -- --nocapture`
+- `cargo test -p shader_recompiler compile_shader_glsl -- --nocapture`
+
+## 2026-05-25 — shader_recompiler/src/ir_opt/texture_pass.rs vs /home/vricosti/Dev/emulators/zuyu/src/shader_recompiler/ir_opt/texture_pass.cpp
+
+### Intentional differences
+- Rust passes `Option<&mut dyn Environment>` through `track`/`try_get_const_buffer` because the bound-texture test helper has no real environment. Full `texture_pass(env, ...)` now matches upstream `Track(..., env)`/`TryGetConstant(..., env)` behavior.
+- The Rust implementation still uses index references into `Program.blocks` instead of upstream intrusive `IR::Inst*`/`IR::Block*`; this is the existing Rust IR ownership model and is not changed by this slice.
+
+### Unintentional differences (to fix)
+- None in this slice. The previous Rust `try_get_constant` always returned `None`; upstream reads `env.ReadCbufValue(1, offset)` when both bank and offset are immediate and bank is 1.
+- The previous Rust `texture_type_from_flags` manually remapped enum values and treated several upstream values incorrectly (`ColorArray2D`, `Color3D`, `ColorCube`, `ColorArrayCube`, `Buffer`, `Color2DRect`). It now uses `TextureType::from_u8(flags.texture_type)` so descriptor type classification follows upstream `TextureInstInfo::type` directly.
+
+### Missing items
+- Upstream `PatchImageSampleImplicitLod` and `PatchTexelFetch` transformations remain only partially represented: ruzu still logs the SNORM texel-fetch case instead of rewriting the IR.
+- Dynamic descriptor arrays are still not fully upstream-equivalent: upstream rewrites the argument to `umin(asr(dynamic_offset, 3), 7)`, while ruzu keeps the dynamic SSA value visible because GLSL descriptor indexing support is incomplete.
+
+### Binary layout verification
+- N/A: IR optimization metadata only. No guest-visible raw payload layout changed.
+
+### Tests
+- `cargo test -p shader_recompiler texture_pass -- --nocapture`
+- `cargo check -p shader_recompiler`
+
+## 2026-05-25 — shader_recompiler/src/backend/glsl/glsl_emit_context.rs and shader_recompiler/src/backend/glsl/emit_glsl_image.rs vs /home/vricosti/Dev/emulators/zuyu/src/shader_recompiler/backend/glsl/glsl_emit_context.cpp and /home/vricosti/Dev/emulators/zuyu/src/shader_recompiler/backend/glsl/emit_glsl_image.cpp
+
+### Intentional differences
+- Rust stores `is_multisample` in `TextureImageDefinition` beside the GLSL binding/count tuple. Upstream stores the same information indirectly in `ctx.info.texture_descriptors` and `IsTextureMsaa` reads it by descriptor index.
+- Missing texture descriptor entries still fall back to non-MSAA instead of throwing `.at(...)`; this preserves the existing partially-ported fallback behavior outside the fully-populated descriptor path.
+
+### Unintentional differences (to fix)
+- None in this slice. The previous Rust `is_texture_msaa` always returned `false`; upstream returns `ctx.info.texture_descriptors.at(info.descriptor_index).is_multisample`.
+
+### Missing items
+- No remaining missing `IsTextureMsaa` data path for GLSL texture descriptors. Storage images and texture buffers correctly stay non-MSAA.
+
+### Binary layout verification
+- N/A: GLSL emission metadata only. No guest-visible raw payload layout changed.
+
+### Tests
+- `cargo test -p shader_recompiler glsl_emit_context -- --nocapture`
+- `cargo test -p shader_recompiler emit_glsl_image -- --nocapture`
 - `cargo check -p shader_recompiler`
 
 ## 2026-05-25 — shader_recompiler/src/frontend/structured_control_flow.rs, shader_recompiler/src/pipeline_cache.rs, and shader_recompiler/src/backend/glsl/emit_glsl.rs vs /home/vricosti/Dev/emulators/zuyu/src/shader_recompiler/frontend/maxwell/structured_control_flow.cpp, /home/vricosti/Dev/emulators/zuyu/src/shader_recompiler/frontend/ir/ir_emitter.cpp, and /home/vricosti/Dev/emulators/zuyu/src/shader_recompiler/backend/glsl/emit_glsl_bitwise_conversion.cpp
@@ -17604,6 +17831,80 @@ The following still panic because upstream either also throws NotImplementedExce
 ### Tests
 - `cargo test -p video_core texture_cache::texture_cache::tests::create_image_view_uses_try_find_base_layer -- --nocapture`
 - `cargo check -p video_core`
+
+## 2026-05-25 — shader_recompiler/src/ir/basic_block.rs vs /home/vricosti/Dev/emulators/zuyu/src/shader_recompiler/frontend/ir/basic_block.h and basic_block.cpp
+
+### Intentional differences
+- Upstream `Block` owns a `boost::intrusive::list<Inst>` allocated from `ObjectPool<Inst>`, so `PrependNewInst` gives both stable instruction identity and physical list insertion. Ruzu still stores instructions in `Vec<Option<Inst>>` stable slots; `instruction_order: Vec<u32>` is now a private side list so new slots can be logically inserted before an existing slot without shifting `InstRef` indices.
+- `insert_inst_before` is the Rust counterpart for the subset of upstream `PrependNewInst` needed by shader optimization passes. It allocates a new stable slot and inserts that slot into logical iteration order before the target slot.
+- `iter()`, `indexed_iter()`, `iter_mut()`, and `indexed_iter_mut()` now follow logical instruction order. Direct slot access through `inst()` / `inst_mut()` remains slot-indexed, preserving existing `InstRef` semantics.
+- `erase_inst` now removes the erased slot from logical order. The previous fallback repair path was removed so order bugs are not silently papered over.
+
+### Unintentional differences (to fix)
+- Ruzu still lacks a full intrusive-list/object-pool equivalent; `instruction_order` is a compatibility layer rather than the final upstream data structure.
+- `indexed_iter_mut()` uses a small unsafe iterator over a cloned private order vector to provide mutable references in logical order. This is safe under the private duplicate-free `instruction_order` invariant but remains less structurally faithful than upstream's intrusive list iterator.
+
+### Missing items
+- Full upstream `PrependNewInst(iterator, const Inst&)` clone helper.
+- Full upstream `DumpBlock` ordering/format parity after logical-order insertion.
+- Reverse iterators/front/back helpers matching upstream `Block` API.
+
+### Binary layout verification
+- N/A: compiler IR host data structure only. No guest-visible raw payload layout changed.
+
+### Tests
+- `cargo test -p shader_recompiler basic_block -- --nocapture`
+- `cargo test -p shader_recompiler texture_pass -- --nocapture`
+- `cargo test -p shader_recompiler insert_inst_before_preserves_slots_and_changes_logical_order -- --nocapture`
+- `cargo test -p shader_recompiler -- --nocapture`
+- `cargo check -p shader_recompiler`
+
+## 2026-05-25 — shader_recompiler/src/ir_opt/texture_pass.rs vs /home/vricosti/Dev/emulators/zuyu/src/shader_recompiler/ir_opt/texture_pass.cpp
+
+### Intentional differences
+- `TryGetConstant` parity was restored for tracked bank-1 constant loads: ruzu now asks `Environment::read_cbuf_value(1, offset)` when upstream would call `env.ReadCbufValue(1, offset)`.
+- Texture type decoding now preserves upstream enum bit patterns through `TextureType::from_u8(flags.texture_type)`. The previous manual mapping compressed several valid upstream enum values and could misclassify array/3D/cube textures.
+- `PatchImageSampleImplicitLod` is now ported for the upstream `Color2D` instruction bound to a `Color2DRect` descriptor: ruzu inserts `ImageQueryDimensions`, extracts X/Y size, converts to float, takes reciprocal, scales the coordinate, and replaces the sample coordinate with the normalized `vec2`.
+- `PatchTexelFetch` is now ported for upstream SNORM texture-buffer fetches: ruzu clones the original fetch before the current instruction, extracts RGBA components, bitcasts them to integer, converts signed integer to float, scales by the SNORM max value, constructs a `vec4`, and replaces uses of the original fetch.
+- Dynamic descriptor-array indices now match upstream: for `count > 1`, ruzu emits `UMin32(ShiftRightArithmetic32(dynamic_offset, DESCRIPTOR_SIZE_SHIFT), DESCRIPTOR_SIZE - 1)` before the texture instruction and uses that value as arg0. For `count == 1`, arg0 is reset to `Value::Void`, matching upstream `IR::Value{}`.
+- Because Rust instruction slots are stable, the inserted patch instructions are placed with `Block::insert_inst_before` logical ordering instead of physical vector insertion.
+
+### Unintentional differences (to fix)
+- None in this slice. The previous Rust path only logged the SNORM texel-fetch case; it now rewrites the IR like upstream.
+- The inserted `ImageQueryDimensions` follows upstream's descriptor-index assumptions, but ruzu's split descriptor bookkeeping is still less mature than upstream's full `Descriptors` helper model.
+
+### Missing items
+- Finish auditing all `TexturePass` descriptor merge behavior against upstream `Descriptors::Add`.
+
+### Binary layout verification
+- N/A: shader IR transformation and descriptor metadata only. No raw guest-visible payload layout changed.
+
+### Tests
+- `cargo test -p shader_recompiler texture_pass -- --nocapture`
+- `cargo test -p shader_recompiler texture_pass_patches_rect_implicit_lod_coords_before_sample -- --nocapture`
+- `cargo test -p shader_recompiler texture_pass_patches_snorm_texel_fetch_uses -- --nocapture`
+- `cargo test -p shader_recompiler -- --nocapture`
+- `cargo check -p shader_recompiler`
+
+## 2026-05-25 — core/src/arm/dynarmic/arm_dynarmic_32.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/arm/dynarmic/arm_dynarmic_32.cpp
+
+### Intentional differences
+- Ruzu keeps `DynarmicCallbacks32` as a Rust callback object around `SharedProcessMemory` / `Core::Memory::Memory`; upstream stores references directly in the C++ callback object.
+- A focused Rust unit test was added in the same file. It cannot currently be run through `cargo test -p core` because the crate's existing test configuration has unrelated compile errors, but the normal crate check/build path validates this file.
+
+### Unintentional differences (to fix)
+- None in this slice. Upstream `DynarmicCallbacks32::MemoryReadCode` checks `m_memory.IsValidVirtualAddressRange(vaddr, sizeof(u32))` and returns `std::nullopt` before reading invalid code. Ruzu's A32 callback previously used an unchecked fastmem read and could turn an invalid guest PC into a host SIGSEGV during translation; it now performs the same validity check as upstream. The A64 Rust callback already had this behavior.
+
+### Missing items
+- No remaining missing A32 `MemoryReadCode` validity check.
+
+### Binary layout verification
+- N/A: host JIT callback behavior only. No guest-visible raw payload layout changed.
+
+### Tests
+- `cargo check -p core`
+- `cargo build --release --bin ruzu-cmd`
+- `cargo test -p core memory_read_code_returns_none_for_invalid_fetch -- --nocapture` attempted but blocked by pre-existing unrelated `core` test-mode compile errors.
 
 ## 2026-05-25 — audio_core/src/renderer/command/effect/aux_.rs vs /home/vricosti/Dev/emulators/zuyu/src/audio_core/renderer/command/effect/aux_.cpp and aux_.h
 

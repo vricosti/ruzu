@@ -1388,6 +1388,14 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
         (binding.buffer_id, offset)
     }
 
+    /// Return the backend buffer handle for a cached buffer id.
+    pub fn get_buffer_gpu_handle(&self, buffer_id: BufferId) -> u32 {
+        if !buffer_id.is_valid() {
+            return 0;
+        }
+        self.slot_buffers[buffer_id].gpu_handle
+    }
+
     // -----------------------------------------------------------------------
     // Public API — buffer operations retry loop
     // -----------------------------------------------------------------------

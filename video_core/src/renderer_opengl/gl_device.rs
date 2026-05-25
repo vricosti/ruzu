@@ -35,12 +35,19 @@ pub struct Device {
     has_depth_buffer_float: bool,
     has_viewport_swizzle: bool,
     has_geometry_shader_passthrough: bool,
+    has_nv_viewport_array2: bool,
     has_nv_gpu_shader5: bool,
     has_shader_int64: bool,
     has_amd_shader_half_float: bool,
     has_sparse_texture2: bool,
     has_draw_texture: bool,
     has_derivative_control: bool,
+    has_component_indexing_bug: bool,
+    has_precise_bug: bool,
+    has_cbuf_ftou_bug: bool,
+    has_bool_ref_bug: bool,
+    warp_size_potentially_larger_than_guest: bool,
+    needs_fastmath_off: bool,
 
     use_assembly_shaders: bool,
     use_asynchronous_shaders: bool,
@@ -107,12 +114,20 @@ impl Device {
         let has_depth_buffer_float = has_ext("GL_NV_depth_buffer_float");
         let has_viewport_swizzle = has_ext("GL_NV_viewport_swizzle");
         let has_geometry_shader_passthrough = has_ext("GL_NV_geometry_shader_passthrough");
+        let has_nv_viewport_array2 = has_ext("GL_NV_viewport_array2");
         let has_nv_gpu_shader5 = has_ext("GL_NV_gpu_shader5");
         let has_shader_int64 = has_ext("GL_ARB_gpu_shader_int64");
         let has_amd_shader_half_float = has_ext("GL_AMD_gpu_shader_half_float");
         let has_sparse_texture2 = has_ext("GL_ARB_sparse_texture2");
         let has_draw_texture = has_ext("GL_NV_draw_texture");
         let has_derivative_control = has_ext("GL_ARB_derivative_control");
+        let has_component_indexing_bug = false;
+        let has_precise_bug = false;
+        let version_major = nvidia_driver_major_version(&gl_version);
+        let has_cbuf_ftou_bug = is_nvidia && version_major.is_some_and(|major| major >= 495);
+        let has_bool_ref_bug = has_cbuf_ftou_bug;
+        let warp_size_potentially_larger_than_guest = !is_nvidia && !is_intel;
+        let needs_fastmath_off = is_nvidia;
 
         let use_assembly_shaders = is_nvidia
             && has_ext("GL_NV_gpu_program5")
@@ -160,12 +175,19 @@ impl Device {
             has_depth_buffer_float,
             has_viewport_swizzle,
             has_geometry_shader_passthrough,
+            has_nv_viewport_array2,
             has_nv_gpu_shader5,
             has_shader_int64,
             has_amd_shader_half_float,
             has_sparse_texture2,
             has_draw_texture,
             has_derivative_control,
+            has_component_indexing_bug,
+            has_precise_bug,
+            has_cbuf_ftou_bug,
+            has_bool_ref_bug,
+            warp_size_potentially_larger_than_guest,
+            needs_fastmath_off,
             use_assembly_shaders,
             use_asynchronous_shaders,
             is_amd,
@@ -239,6 +261,9 @@ impl Device {
     pub fn has_geometry_shader_passthrough(&self) -> bool {
         self.has_geometry_shader_passthrough
     }
+    pub fn has_nv_viewport_array2(&self) -> bool {
+        self.has_nv_viewport_array2
+    }
     pub fn has_nv_gpu_shader5(&self) -> bool {
         self.has_nv_gpu_shader5
     }
@@ -256,6 +281,24 @@ impl Device {
     }
     pub fn has_derivative_control(&self) -> bool {
         self.has_derivative_control
+    }
+    pub fn has_component_indexing_bug(&self) -> bool {
+        self.has_component_indexing_bug
+    }
+    pub fn has_precise_bug(&self) -> bool {
+        self.has_precise_bug
+    }
+    pub fn has_cbuf_ftou_bug(&self) -> bool {
+        self.has_cbuf_ftou_bug
+    }
+    pub fn has_bool_ref_bug(&self) -> bool {
+        self.has_bool_ref_bug
+    }
+    pub fn is_warp_size_potentially_larger_than_guest(&self) -> bool {
+        self.warp_size_potentially_larger_than_guest
+    }
+    pub fn needs_fastmath_off(&self) -> bool {
+        self.needs_fastmath_off
     }
     pub fn use_assembly_shaders(&self) -> bool {
         self.use_assembly_shaders
@@ -345,4 +388,10 @@ fn get_extensions() -> Vec<String> {
         }
     }
     exts
+}
+
+fn nvidia_driver_major_version(gl_version: &str) -> Option<u32> {
+    let driver = gl_version.strip_prefix("4.6.0 NVIDIA ")?;
+    let major = driver.split('.').next()?;
+    major.parse().ok()
 }

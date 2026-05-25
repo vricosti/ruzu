@@ -8,7 +8,9 @@
 //! (Null, OpenGL, Vulkan) provides its own implementation.
 
 use crate::control::channel_state::ChannelState;
-use crate::engines::draw_manager::{Maxwell3DClearView, Maxwell3DDrawView};
+use crate::engines::draw_manager::{
+    Maxwell3DClearView, Maxwell3DDrawView, Maxwell3DIndirectView,
+};
 use crate::engines::fermi_2d::{Config as Fermi2DConfig, Surface as Fermi2DSurface};
 use crate::query_cache::types::QueryPropertiesFlags;
 
@@ -103,7 +105,7 @@ pub trait RasterizerInterface {
     fn draw(&mut self, draw_view: Maxwell3DDrawView<'_>, instance_count: u32);
 
     /// Dispatch an indirect draw invocation.
-    fn draw_indirect(&mut self) {}
+    fn draw_indirect(&mut self, _indirect_view: Maxwell3DIndirectView<'_>) {}
 
     /// Dispatch a draw texture invocation.
     fn draw_texture(&mut self);

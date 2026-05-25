@@ -29,6 +29,7 @@ pub struct GenericElementInfo {
 pub struct TextureImageDefinition {
     pub binding: u32,
     pub count: u32,
+    pub is_multisample: bool,
 }
 
 /// GLSL emission context.
@@ -201,6 +202,7 @@ impl<'a> EmitContext<'a> {
             self.texture_buffers.push(TextureImageDefinition {
                 binding,
                 count: desc.count,
+                is_multisample: false,
             });
             let array_decorator = if desc.count > 1 {
                 format!("[{}]", desc.count)
@@ -223,6 +225,7 @@ impl<'a> EmitContext<'a> {
             self.textures.push(TextureImageDefinition {
                 binding,
                 count: desc.count,
+                is_multisample: desc.is_multisample,
             });
             let array_decorator = if desc.count > 1 {
                 format!("[{}]", desc.count)
@@ -246,6 +249,7 @@ impl<'a> EmitContext<'a> {
             self.image_buffers.push(TextureImageDefinition {
                 binding,
                 count: desc.count,
+                is_multisample: false,
             });
             let array_decorator = if desc.count > 1 {
                 format!("[{}]", desc.count)
@@ -268,6 +272,7 @@ impl<'a> EmitContext<'a> {
             self.images.push(TextureImageDefinition {
                 binding,
                 count: desc.count,
+                is_multisample: false,
             });
             let array_decorator = if desc.count > 1 {
                 format!("[{}]", desc.count)
@@ -640,5 +645,33 @@ mod tests {
         assert!(ctx.header.contains(
             "layout(location=0,component=2,xfb_buffer=1,xfb_stride=16,xfb_offset=8)out vec2 out_attr0_zw;"
         ));
+    }
+
+    #[test]
+    fn texture_definitions_preserve_multisample_flag_for_image_queries() {
+        let mut program = ir::Program::new(Stage::Fragment);
+        program.info.texture_descriptors.push(crate::shader_info::TextureDescriptor {
+            texture_type: TextureType::Color2D,
+            is_depth: false,
+            is_multisample: true,
+            has_secondary: false,
+            cbuf_index: 2,
+            cbuf_offset: 0x40,
+            shift_left: 0,
+            secondary_cbuf_index: 0,
+            secondary_cbuf_offset: 0,
+            secondary_shift_left: 0,
+            count: 1,
+            size_shift: 3,
+        });
+        let mut bindings = Bindings::default();
+        let profile = Profile::default();
+        let runtime_info = RuntimeInfo::default();
+
+        let ctx = EmitContext::new(&program, &mut bindings, &profile, &runtime_info);
+
+        assert_eq!(ctx.textures.len(), 1);
+        assert!(ctx.textures[0].is_multisample);
+        assert!(ctx.header.contains("uniform sampler2DMS tex0;"));
     }
 }

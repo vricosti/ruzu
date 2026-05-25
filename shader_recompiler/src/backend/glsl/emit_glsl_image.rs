@@ -117,14 +117,10 @@ fn is_texture_msaa(ctx: &EmitContext, info: TextureInstInfo) -> bool {
     if ty == TextureType::Buffer {
         return false;
     }
-    // `texture_descriptors` may not have an entry for partially-ported
-    // shaders. Mirror upstream's `at(...)` semantics by treating missing
-    // descriptors as non-multisample (the safest default for code-gen).
-    // FIXME(port): wire to program.info.texture_descriptors once exposed
-    // through EmitContext.
-    let _ = info;
-    let _ = ctx;
-    false
+    ctx.textures
+        .get(info.descriptor_index as usize)
+        .map(|def| def.is_multisample)
+        .unwrap_or(false)
 }
 
 /// Port of upstream `CastToIntVec(std::string_view, TextureInstInfo)`.
@@ -1332,6 +1328,36 @@ mod tests {
         info.texture_type = TextureType::ColorArray2D as u8;
         let out = image_gather_subpixel_offset(info, "tex0", "co");
         assert!(out.contains(".xy") && out.contains("0.001953125"));
+    }
+
+    #[test]
+    fn is_texture_msaa_reads_texture_definition_like_upstream() {
+        let profile = crate::profile::Profile::default();
+        let runtime_info = crate::runtime_info::RuntimeInfo::default();
+        let mut bindings = crate::backend::bindings::Bindings::default();
+        let mut program = crate::ir::Program::new(crate::stage::Stage::Fragment);
+        program.info.texture_descriptors.push(crate::shader_info::TextureDescriptor {
+            texture_type: TextureType::Color2D,
+            is_depth: false,
+            is_multisample: true,
+            has_secondary: false,
+            cbuf_index: 0,
+            cbuf_offset: 0,
+            shift_left: 0,
+            secondary_cbuf_index: 0,
+            secondary_cbuf_offset: 0,
+            secondary_shift_left: 0,
+            count: 1,
+            size_shift: 3,
+        });
+        let ctx = EmitContext::new(&program, &mut bindings, &profile, &runtime_info);
+        let info = Tii {
+            descriptor_index: 0,
+            texture_type: TextureType::Color2D as u8,
+            ..Default::default()
+        };
+
+        assert!(is_texture_msaa(&ctx, info));
     }
 
     #[test]
