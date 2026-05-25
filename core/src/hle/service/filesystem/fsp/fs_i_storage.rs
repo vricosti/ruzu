@@ -136,6 +136,22 @@ impl IStorage {
         } else {
             0
         };
+        if std::env::var_os("RUZU_TRACE_ISTORAGE_ANOMALY").is_some()
+            && (length < 0 || buffer_size < length as usize)
+        {
+            let tid = ctx
+                .get_thread()
+                .map(|thread| thread.lock().unwrap().get_thread_id())
+                .unwrap_or(0);
+            log::warn!(
+                "IStorage::Read anomaly tid={} offset=0x{:X} length={} buffer_size={} read_size={}",
+                tid,
+                offset,
+                length,
+                buffer_size,
+                read_size
+            );
+        }
         let mut buffer = vec![0u8; read_size];
         let result = storage.read(&mut buffer, offset, length);
         if std::env::var_os("RUZU_ISTORAGE_READ_CONTEXT").is_some() {
@@ -163,13 +179,15 @@ impl IStorage {
                 })
                 .collect();
             log::warn!(
-                "IStorage::ReadContext tid={} thread_pc=0x{:X} thread_lr=0x{:X} thread_sp=0x{:X} offset=0x{:X} length={} result=0x{:08X} {}",
+                "IStorage::ReadContext tid={} thread_pc=0x{:X} thread_lr=0x{:X} thread_sp=0x{:X} offset=0x{:X} length={} buffer_size={} read_size={} result=0x{:08X} {}",
                 tid,
                 thread_pc,
                 thread_lr,
                 thread_sp,
                 offset,
                 length,
+                buffer_size,
+                read_size,
                 result.get_inner_value(),
                 pcs.join(" ")
             );

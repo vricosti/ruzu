@@ -999,12 +999,16 @@ fn emit_inst(ctx: &mut EmitContext, program: &mut ir::Program, inst_ref: InstRef
 
         // Select — port of upstream EmitSelect{U1,U8,U16,U32,U64,F16,F32,F64}.
         Opcode::SelectU1 => emit_select(ctx, program, inst_ref, &inst_snapshot, GlslVarType::U1),
-        Opcode::SelectU8 | Opcode::SelectU16 | Opcode::SelectU32 => {
-            emit_select(ctx, program, inst_ref, &inst_snapshot, GlslVarType::U32)
+        Opcode::SelectU8 | Opcode::SelectU16 => {
+            panic!(
+                "{:?} not implemented in GLSL backend (upstream NotImplemented)",
+                inst_snapshot.opcode
+            );
         }
+        Opcode::SelectU32 => emit_select(ctx, program, inst_ref, &inst_snapshot, GlslVarType::U32),
         Opcode::SelectU64 => emit_select(ctx, program, inst_ref, &inst_snapshot, GlslVarType::U64),
         Opcode::SelectF16 => {
-            emit_select(ctx, program, inst_ref, &inst_snapshot, GlslVarType::F16x2)
+            panic!("SelectF16 not implemented in GLSL backend (upstream NotImplemented)");
         }
         Opcode::SelectF32 => emit_select(ctx, program, inst_ref, &inst_snapshot, GlslVarType::F32),
         Opcode::SelectF64 => emit_select(ctx, program, inst_ref, &inst_snapshot, GlslVarType::F64),
@@ -1998,7 +2002,13 @@ fn emit_inst(ctx: &mut EmitContext, program: &mut ir::Program, inst_ref: InstRef
         }
         Opcode::YDirection => {
             ctx.uses_y_direction = true;
-            add_assign(ctx, program, inst_ref, GlslVarType::F32, "y_direction".to_string());
+            add_assign(
+                ctx,
+                program,
+                inst_ref,
+                GlslVarType::F32,
+                "gl_FrontMaterial.ambient.a".to_string(),
+            );
         }
         Opcode::RenderArea => {
             // Upstream: gl_FragCoord-style render-area uniform.
@@ -2355,6 +2365,66 @@ mod tests {
         assert!(source.contains("precise float pf_0=float(0);"));
         assert!(source.contains("pf_0=fma(1.f,2.f,3.f);"));
         assert!(source.contains("out_attr0.x=pf_0;"));
+    }
+
+    #[test]
+    #[should_panic(expected = "SelectF16 not implemented")]
+    fn glsl_select_f16_matches_upstream_not_implemented() {
+        let mut program = Program::new(ShaderStage::VertexB);
+        program.blocks.push(Block::new());
+        program.block_mut(0).append_inst(Inst::new(
+            Opcode::SelectF16,
+            vec![Value::ImmU1(true), Value::ImmF32(1.0), Value::ImmF32(0.0)],
+        ));
+
+        let mut bindings = Bindings::default();
+        let _ = emit_glsl(
+            &Profile::default(),
+            &RuntimeInfo::default(),
+            &mut program,
+            &mut bindings,
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "SelectU8 not implemented")]
+    fn glsl_select_u8_matches_upstream_not_implemented() {
+        let mut program = Program::new(ShaderStage::VertexB);
+        program.blocks.push(Block::new());
+        program.block_mut(0).append_inst(Inst::new(
+            Opcode::SelectU8,
+            vec![Value::ImmU1(true), Value::ImmU32(1), Value::ImmU32(0)],
+        ));
+
+        let mut bindings = Bindings::default();
+        let _ = emit_glsl(
+            &Profile::default(),
+            &RuntimeInfo::default(),
+            &mut program,
+            &mut bindings,
+        );
+    }
+
+    #[test]
+    fn glsl_y_direction_uses_fixed_function_material_state() {
+        let mut program = Program::new(ShaderStage::Fragment);
+        program.blocks.push(Block::new());
+        {
+            let mut emitter = Emitter::new(&mut program, 0);
+            let value = emitter.y_direction();
+            emitter.set_attribute(Attribute::generic(0, 0), value, Value::ImmU32(0));
+        }
+
+        let mut bindings = Bindings::default();
+        let source = emit_glsl(
+            &Profile::default(),
+            &RuntimeInfo::default(),
+            &mut program,
+            &mut bindings,
+        );
+
+        assert!(source.contains("gl_FrontMaterial.ambient.a"));
+        assert!(!source.contains("y_direction"));
     }
 }
 

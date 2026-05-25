@@ -259,7 +259,6 @@ impl Interface {
             }
         };
 
-        self.application_info.launch_property = launch_property;
         self.application_info.application_type = application_type;
 
         log::warn!("Account::InitializeApplicationInfoBase: ApplicationInfo init required");

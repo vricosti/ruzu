@@ -27,6 +27,7 @@ use crate::transform_feedback;
 use shader_recompiler::program_header::ProgramHeader;
 
 use super::gl_compute_pipeline::{ComputePipeline, ComputePipelineKey};
+use super::gl_device::Device;
 use super::gl_graphics_pipeline::{GraphicsPipeline, GraphicsPipelineKey};
 
 /// Cache version for serialized pipeline data.
@@ -50,13 +51,61 @@ static SHADER_PIPELINE_STAGE_COUNTS: [AtomicU64; 12] = [
 
 /// Port of the OpenGL-specific `Shader::Profile` construction in upstream
 /// `gl_shader_cache.cpp`.
-fn opengl_shader_profile() -> ShaderProfile {
+fn opengl_shader_profile(device: &Device) -> ShaderProfile {
     ShaderProfile {
+        support_int64: device.has_shader_int64(),
+        support_vertex_instance_id: true,
+        support_vote: true,
+        support_viewport_index_layer_non_geometry: device.has_nv_viewport_array2()
+            || device.has_vertex_viewport_layer(),
+        support_viewport_mask: device.has_nv_viewport_array2(),
+        support_typeless_image_loads: device.has_image_load_formatted(),
+        support_demote_to_helper_invocation: false,
+        support_derivative_control: device.has_derivative_control(),
+        support_geometry_shader_passthrough: device.has_geometry_shader_passthrough(),
+        support_native_ndc: true,
+        support_gl_nv_gpu_shader_5: device.has_nv_gpu_shader5(),
+        support_gl_amd_gpu_shader_half_float: device.has_amd_shader_half_float(),
+        support_gl_texture_shadow_lod: device.has_texture_shadow_lod(),
+        support_gl_warp_intrinsics: false,
+        support_gl_variable_aoffi: device.has_variable_aoffi(),
+        support_gl_sparse_textures: device.has_sparse_texture2(),
+        support_gl_derivative_control: device.has_derivative_control(),
+        support_geometry_streams: true,
+        warp_size_potentially_larger_than_guest: device
+            .is_warp_size_potentially_larger_than_guest(),
         lower_left_origin_mode: true,
         need_declared_frag_colors: true,
-        // Upstream derives this from `Device::HasPreciseBug()`. Ruzu does not
-        // yet have the GL device capability table wired into ShaderCache.
-        has_gl_precise_bug: false,
+        need_fastmath_off: device.needs_fastmath_off(),
+        need_gather_subpixel_offset: device.is_amd() || device.is_intel(),
+        has_broken_spirv_clamp: true,
+        has_broken_unsigned_image_offsets: true,
+        has_broken_signed_operations: true,
+        has_broken_fp16_float_controls: false,
+        has_gl_component_indexing_bug: device.has_component_indexing_bug(),
+        has_gl_precise_bug: device.has_precise_bug(),
+        has_gl_cbuf_ftou_bug: device.has_cbuf_ftou_bug(),
+        has_gl_bool_ref_bug: device.has_bool_ref_bug(),
+        ignore_nan_fp_comparisons: true,
+        gl_max_compute_smem_size: device.max_compute_shared_memory_size(),
+        min_ssbo_alignment: device.shader_storage_buffer_alignment() as u64,
+        max_user_clip_distances: 8,
+        ..ShaderProfile::default()
+    }
+}
+
+#[cfg(test)]
+fn test_opengl_shader_profile() -> ShaderProfile {
+    ShaderProfile {
+        support_vertex_instance_id: true,
+        support_vote: true,
+        support_native_ndc: true,
+        support_geometry_streams: true,
+        lower_left_origin_mode: true,
+        need_declared_frag_colors: true,
+        has_broken_spirv_clamp: true,
+        has_broken_unsigned_image_offsets: true,
+        has_broken_signed_operations: true,
         ignore_nan_fp_comparisons: true,
         max_user_clip_distances: 8,
         ..ShaderProfile::default()
@@ -116,6 +165,7 @@ pub struct ShaderCache {
     pub use_asynchronous_shaders: bool,
     /// Whether a strict GL context is required for compilation.
     pub strict_context_required: bool,
+    profile: ShaderProfile,
 
     /// Current graphics pipeline key.
     graphics_key: GraphicsPipelineKey,
@@ -173,10 +223,23 @@ impl ShaderCache {
     /// Create a new shader cache.
     ///
     /// Corresponds to `ShaderCache::ShaderCache()`.
-    pub fn new() -> Self {
+    pub fn new(device: &Device) -> Self {
+        Self::new_with_profile(
+            opengl_shader_profile(device),
+            device.use_asynchronous_shaders(),
+            device.strict_context_required(),
+        )
+    }
+
+    pub(crate) fn new_with_profile(
+        profile: ShaderProfile,
+        use_asynchronous_shaders: bool,
+        strict_context_required: bool,
+    ) -> Self {
         Self {
-            use_asynchronous_shaders: false,
-            strict_context_required: false,
+            use_asynchronous_shaders,
+            strict_context_required,
+            profile,
             graphics_key: GraphicsPipelineKey::default(),
             current_pipeline: None,
             graphics_cache: HashMap::new(),
@@ -186,6 +249,11 @@ impl ShaderCache {
             pending_program_addresses: [0; 6],
             owner_tid_hash: std::sync::atomic::AtomicU64::new(0),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_for_test() -> Self {
+        Self::new_with_profile(test_opengl_shader_profile(), false, false)
     }
 
     /// Assert that this cache is only ever accessed from a single thread.
@@ -584,7 +652,7 @@ impl ShaderCache {
                     va_env.cached_instruction_start(),
                     vb_env.cached_instruction_slice(),
                     vb_env.cached_instruction_start(),
-                    &opengl_shader_profile(),
+                    &self.profile,
                     &runtime_info,
                     &mut bindings,
                 );
@@ -1012,7 +1080,7 @@ impl ShaderCache {
                 va_start,
                 vb_env.cached_instruction_slice(),
                 vb_env.cached_instruction_start(),
-                &opengl_shader_profile(),
+                &self.profile,
                 &runtime_info,
                 &mut bindings,
             );
@@ -1498,7 +1566,6 @@ impl ShaderCache {
         runtime_info: &RuntimeInfo,
         bindings: &mut shader_recompiler::backend::bindings::Bindings,
     ) -> CompiledGlslShader {
-        let profile = opengl_shader_profile();
         let compiled = if let Some(texture_bound_buffer) = texture_bound_buffer {
             if let Some(sph) = sph {
                 compile_shader_glsl_at_offset_with_bindings_and_texture_bound_and_sph(
@@ -1507,7 +1574,7 @@ impl ShaderCache {
                     base_offset,
                     texture_bound_buffer,
                     sph,
-                    &profile,
+                    &self.profile,
                     runtime_info,
                     bindings,
                 )
@@ -1517,7 +1584,7 @@ impl ShaderCache {
                     stage,
                     base_offset,
                     texture_bound_buffer,
-                    &profile,
+                    &self.profile,
                     runtime_info,
                     bindings,
                 )
@@ -1527,7 +1594,7 @@ impl ShaderCache {
                 code,
                 stage,
                 base_offset,
-                &profile,
+                &self.profile,
                 runtime_info,
                 bindings,
             )
@@ -1615,7 +1682,7 @@ mod tests {
 
     #[test]
     fn shader_cache_creation() {
-        let cache = ShaderCache::new();
+        let cache = ShaderCache::new_for_test();
         assert_eq!(cache.graphics_pipeline_count(), 0);
         assert_eq!(cache.compute_pipeline_count(), 0);
         assert!(!cache.use_asynchronous_shaders);
@@ -1628,7 +1695,7 @@ mod tests {
 
     #[test]
     fn current_graphics_pipeline_populates_cache_on_first_call() {
-        let mut cache = ShaderCache::new();
+        let mut cache = ShaderCache::new_for_test();
         assert_eq!(cache.graphics_pipeline_count(), 0);
         assert!(cache.current_pipeline.is_none());
 
@@ -1648,7 +1715,7 @@ mod tests {
 
     #[test]
     fn current_graphics_pipeline_reuses_cached_entry() {
-        let mut cache = ShaderCache::new();
+        let mut cache = ShaderCache::new_for_test();
 
         // First call creates the entry.
         cache.current_graphics_pipeline();
@@ -1665,13 +1732,13 @@ mod tests {
 
     #[test]
     fn pending_program_addresses_default_to_zero() {
-        let cache = ShaderCache::new();
+        let cache = ShaderCache::new_for_test();
         assert_eq!(cache.pending_program_addresses(), [0u64; 6]);
     }
 
     #[test]
     fn build_graphics_key_uses_pending_program_addresses() {
-        let mut cache = ShaderCache::new();
+        let mut cache = ShaderCache::new_for_test();
         let addrs = [0x1000, 0x2000, 0x3000, 0x4000, 0x5000, 0x6000];
         cache.set_pending_program_addresses(addrs);
 
@@ -1710,7 +1777,7 @@ mod tests {
             dst[..n].copy_from_slice(&backing[offset..offset + n]);
         });
 
-        let mut cache = ShaderCache::new();
+        let mut cache = ShaderCache::new_for_test();
         cache.set_gpu_memory_reader(reader);
 
         // Slot 1 = VertexB; the rest are disabled.
@@ -1740,7 +1807,7 @@ mod tests {
 
     #[test]
     fn distinct_program_addresses_create_distinct_cache_entries() {
-        let mut cache = ShaderCache::new();
+        let mut cache = ShaderCache::new_for_test();
 
         cache.set_pending_program_addresses([0x1000, 0, 0, 0, 0, 0]);
         cache.current_graphics_pipeline().expect("first pipeline");
@@ -1780,7 +1847,7 @@ mod tests {
             dst[..n].copy_from_slice(&backing[offset..offset + n]);
         });
 
-        let mut cache = ShaderCache::new();
+        let mut cache = ShaderCache::new_for_test();
         cache.graphics_key.unique_hashes[1] = 0x1234;
 
         let mut environments = GraphicsEnvironments::default();
@@ -1850,7 +1917,7 @@ mod tests {
         shared_cache.create_channel(&channel);
         shared_cache.bind_to_channel(7);
 
-        let mut cache = ShaderCache::new();
+        let mut cache = ShaderCache::new_for_test();
         let pipeline = cache
             .current_graphics_pipeline_with_shared_cache(&mut shared_cache)
             .expect("shared path should build a pipeline");
@@ -1898,7 +1965,7 @@ mod tests {
 
     #[test]
     fn compile_stage_glsl_emits_non_empty_source_for_empty_code() {
-        let cache = ShaderCache::new();
+        let cache = ShaderCache::new_for_test();
         let compiled = cache.compile_stage_glsl(&[], ShaderStage::VertexB);
         assert!(
             !compiled.source.is_empty(),
@@ -1909,7 +1976,7 @@ mod tests {
 
     #[test]
     fn opengl_fragment_profile_declares_all_frag_colors() {
-        let cache = ShaderCache::new();
+        let cache = ShaderCache::new_for_test();
         let compiled = cache.compile_stage_glsl(&[], ShaderStage::Fragment);
 
         for index in 0..8 {
@@ -1924,8 +1991,21 @@ mod tests {
     }
 
     #[test]
+    fn shader_cache_uses_stored_opengl_profile() {
+        let mut profile = test_opengl_shader_profile();
+        profile.need_declared_frag_colors = false;
+        let cache = ShaderCache::new_with_profile(profile, false, false);
+        let compiled = cache.compile_stage_glsl(&[], ShaderStage::Fragment);
+
+        assert!(
+            !compiled.source.contains("frag_color7"),
+            "ShaderCache must pass its stored profile to GLSL compilation"
+        );
+    }
+
+    #[test]
     fn current_graphics_pipeline_placeholder_is_built() {
-        let mut cache = ShaderCache::new();
+        let mut cache = ShaderCache::new_for_test();
         let pipeline = cache
             .current_graphics_pipeline()
             .expect("placeholder pipeline");

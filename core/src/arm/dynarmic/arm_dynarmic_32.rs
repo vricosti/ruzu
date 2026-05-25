@@ -16,6 +16,8 @@ use crate::memory::memory::Memory;
 
 use rdynarmic::jit_config::{JitConfig, OptimizationFlag, UserCallbacks};
 
+static A32_TRACE_AFTER_WATCH_ARMED: AtomicBool = AtomicBool::new(false);
+
 /// Translate rdynarmic's HaltReason to core's HaltReason.
 ///
 /// Same mapping as in arm_dynarmic_64.rs.
@@ -210,6 +212,16 @@ fn watch_write(cb: &DynarmicCallbacks32, vaddr: u64, size: u64, value: u128) {
             return;
         }
     }
+    if std::env::var_os("RUZU_A32_TRACE_AFTER_WATCH").is_some() {
+        let value_matches = std::env::var("RUZU_A32_TRACE_AFTER_WATCH_VALUE")
+            .ok()
+            .and_then(|raw| u128::from_str_radix(raw.trim_start_matches("0x"), 16).ok())
+            .map(|expected| expected == value)
+            .unwrap_or(true);
+        if value_matches {
+            A32_TRACE_AFTER_WATCH_ARMED.store(true, Ordering::Relaxed);
+        }
+    }
     let pc_ptr = cb.jit_pc_ptr;
     let pc = pc_ptr.map(|p| unsafe { p.read_volatile() }).unwrap_or(0);
     if let Some((pc_lo, pc_hi)) = pc_range {
@@ -234,9 +246,10 @@ fn watch_write(cb: &DynarmicCallbacks32, vaddr: u64, size: u64, value: u128) {
     } else {
         unsafe { (*core).core_index() as i32 }
     };
+    let tid = crate::hle::kernel::kernel::get_current_thread_id_fast().unwrap_or(0);
     eprintln!(
-        "[WATCH_WRITE] core={} pc=0x{:08X} lr=0x{:08X} vaddr=0x{:X} size={} value=0x{:032X}",
-        core_id, pc, lr, vaddr, size, value
+        "[WATCH_WRITE] core={} tid={} pc=0x{:08X} lr=0x{:08X} vaddr=0x{:X} size={} value=0x{:032X}",
+        core_id, tid, pc, lr, vaddr, size, value
     );
     maybe_dump_code_once(cb);
     maybe_dump_instance_at_pc(cb, pc_ptr, pc);
@@ -275,9 +288,10 @@ fn watch_read(cb: &DynarmicCallbacks32, vaddr: u64, size: u64, value: u128) {
     let lr = pc_ptr
         .map(|p| unsafe { p.offset(-1).read_volatile() })
         .unwrap_or(0);
+    let tid = crate::hle::kernel::kernel::get_current_thread_id_fast().unwrap_or(0);
     eprintln!(
-        "[WATCH_READ ] pc=0x{:08X} lr=0x{:08X} vaddr=0x{:X} size={} value=0x{:032X}",
-        pc, lr, vaddr, size, value
+        "[WATCH_READ ] tid={} pc=0x{:08X} lr=0x{:08X} vaddr=0x{:X} size={} value=0x{:032X}",
+        tid, pc, lr, vaddr, size, value
     );
     maybe_dump_code_once(cb);
     maybe_dump_stack_once(cb, pc_ptr);
@@ -1072,17 +1086,13 @@ struct DynarmicCallbacks32 {
     /// Used as fallback when core_memory is None (tests).
     /// Not in upstream, but needed for Rust fallback path.
     memory: SharedProcessMemory,
-    /// Cached fastmem pointer for lock-free memory reads during code translation.
-    /// Matches upstream's direct `m_memory` reference (no synchronization).
-    /// Safety: valid for the lifetime of the DeviceMemory backing.
-    fastmem_ptr: *const u8,
     /// Raw pointer to jit_state.reg[15] (PC) for diagnostic logging.
     /// Set after jit creation via `set_pc_ptr()`.
     /// Not in upstream, but needed since we don't have debugger.
     jit_pc_ptr: Option<*const u32>,
 }
 
-// Safety: The raw pointers (parent, process, fastmem_ptr, jit_pc_ptr) all point to
+// Safety: The raw pointers (parent, process, jit_pc_ptr) all point to
 // objects that are stable for the JIT's lifetime. The JIT is single-threaded per core.
 unsafe impl Send for DynarmicCallbacks32 {}
 
@@ -1093,27 +1103,15 @@ impl DynarmicCallbacks32 {
         process: *const crate::hle::kernel::k_process::KProcess,
         parent_ptr: Arc<AtomicPtr<ArmDynarmic32>>,
     ) -> Self {
-        // Cache fastmem pointer for lock-free code reads during JIT compilation.
-        // Matches upstream's direct m_memory reference.
-        let fastmem_ptr = core_memory
-            .as_ref()
-            .map(|cm| cm.lock().unwrap().fastmem_pointer())
-            .unwrap_or(std::ptr::null_mut()) as *const u8;
         log::info!(
-            "DynarmicCallbacks32: core_memory={} fastmem_ptr={:?}",
-            if core_memory.is_some() {
-                "wired"
-            } else {
-                "fallback"
-            },
-            fastmem_ptr
+            "DynarmicCallbacks32: core_memory={}",
+            if core_memory.is_some() { "wired" } else { "fallback" }
         );
         Self {
             parent: parent_ptr,
             core_memory,
             process,
             memory,
-            fastmem_ptr,
             jit_pc_ptr: None,
         }
     }
@@ -1169,14 +1167,9 @@ impl DynarmicCallbacks32 {
 
 impl UserCallbacks for DynarmicCallbacks32 {
     fn memory_read_code(&self, vaddr: u64) -> Option<u32> {
-        // Lock-free fast path using cached fastmem pointer, matching upstream's
-        // direct m_memory.Read32(vaddr) without any synchronization.
-        if !self.fastmem_ptr.is_null() {
-            let value =
-                unsafe { (self.fastmem_ptr.add(vaddr as usize) as *const u32).read_unaligned() };
-            return Some(value);
-        }
-        // Fallback (tests without fastmem): lock and read
+        // Upstream returns nullopt when instruction fetch targets an invalid
+        // virtual range. Do not use fastmem here: an invalid guest PC must end
+        // translation, not turn into a host SIGSEGV while reading code bytes.
         if let Some(ref cm) = self.core_memory {
             let m = cm.lock().unwrap();
             if m.is_valid_virtual_address_range(vaddr, 4) {
@@ -2288,6 +2281,15 @@ impl ArmInterface for ArmDynarmic32 {
             });
         if let (Some(start), Some(end)) = (trace_start, trace_end) {
             let current_pc = jit.get_register(15);
+            let trace_after_watch = std::env::var_os("RUZU_A32_TRACE_AFTER_WATCH").is_some();
+            if trace_after_watch
+                && trace_search_limit > 0
+                && !A32_TRACE_AFTER_WATCH_ARMED.load(Ordering::Relaxed)
+                && !(current_pc >= start && current_pc < end)
+            {
+                let rdynarmic_hr = jit.run();
+                return translate_halt_reason(rdynarmic_hr);
+            }
             if trace_limit > 0
                 && (current_pc >= start && current_pc < end || trace_search_limit > 0)
             {
@@ -2302,18 +2304,22 @@ impl ArmInterface for ArmDynarmic32 {
                 for step in 0..total_limit {
                     let pc = jit.get_register(15);
                     if !entered_range {
-                        log::info!(
-                            "[A32TRACE] search_step={} pc=0x{:08x} cpsr=0x{:08x} r0=0x{:08x} r1=0x{:08x} r2=0x{:08x} r3=0x{:08x} sp=0x{:08x} lr=0x{:08x}",
-                            step,
-                            pc,
-                            jit.get_cpsr(),
-                            jit.get_register(0),
-                            jit.get_register(1),
-                            jit.get_register(2),
-                            jit.get_register(3),
-                            jit.get_register(13),
-                            jit.get_register(14),
-                        );
+                        let quiet_search =
+                            std::env::var_os("RUZU_A32_TRACE_SEARCH_QUIET").is_some();
+                        if !quiet_search {
+                            log::info!(
+                                "[A32TRACE] search_step={} pc=0x{:08x} cpsr=0x{:08x} r0=0x{:08x} r1=0x{:08x} r2=0x{:08x} r3=0x{:08x} sp=0x{:08x} lr=0x{:08x}",
+                                step,
+                                pc,
+                                jit.get_cpsr(),
+                                jit.get_register(0),
+                                jit.get_register(1),
+                                jit.get_register(2),
+                                jit.get_register(3),
+                                jit.get_register(13),
+                                jit.get_register(14),
+                            );
+                        }
                         if pc >= start && pc < end {
                             entered_range = true;
                             log::info!(
@@ -2326,7 +2332,9 @@ impl ArmInterface for ArmDynarmic32 {
                             if !last_hr.is_empty()
                                 && last_hr != rdynarmic::halt_reason::HaltReason::STEP
                             {
-                                log::info!("[A32TRACE] halt while searching: {:?}", last_hr);
+                                if !quiet_search {
+                                    log::info!("[A32TRACE] halt while searching: {:?}", last_hr);
+                                }
                                 break;
                             }
                             if step + 1 >= trace_search_limit {
@@ -2559,5 +2567,28 @@ impl ArmInterface for ArmDynarmic32 {
     fn rewind_breakpoint_instruction(&mut self) {
         let ctx = self.breakpoint_context.clone();
         self.set_context(&ctx);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::hle::kernel::k_process::ProcessMemoryData;
+    use std::sync::RwLock;
+
+    #[test]
+    fn memory_read_code_returns_none_for_invalid_fetch() {
+        let mut backing = ProcessMemoryData::new();
+        backing.base = 0x1000;
+        backing.data = vec![0x78, 0x56, 0x34, 0x12];
+        let callbacks = DynarmicCallbacks32::new(
+            Arc::new(RwLock::new(backing)),
+            None,
+            std::ptr::null(),
+            Arc::new(AtomicPtr::new(std::ptr::null_mut())),
+        );
+
+        assert_eq!(callbacks.memory_read_code(0x1000), Some(0x12345678));
+        assert_eq!(callbacks.memory_read_code(0x805A2D08), None);
     }
 }

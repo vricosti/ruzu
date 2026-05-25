@@ -181,7 +181,13 @@ impl Module {
         output: &mut [u8],
     ) -> NvResult {
         if fd < 0 {
-            log::error!("Invalid DeviceFD={}!", fd);
+            let tid = crate::hle::kernel::kernel::get_current_thread_id_fast().unwrap_or(0);
+            log::error!(
+                "Invalid DeviceFD={}! ioctl1=0x{:08X} tid={}",
+                fd,
+                command.raw,
+                tid
+            );
             return NvResult::InvalidState;
         }
         if std::env::var_os("RUZU_TRACE_IOCTL_ENTER").is_some() {
@@ -267,7 +273,13 @@ impl Module {
         output: &mut [u8],
     ) -> NvResult {
         if fd < 0 {
-            log::error!("Invalid DeviceFD={}!", fd);
+            let tid = crate::hle::kernel::kernel::get_current_thread_id_fast().unwrap_or(0);
+            log::error!(
+                "Invalid DeviceFD={}! ioctl2=0x{:08X} tid={}",
+                fd,
+                command.raw,
+                tid
+            );
             return NvResult::InvalidState;
         }
         let files = self.open_files.lock().unwrap();
@@ -290,7 +302,13 @@ impl Module {
         inline_output: &mut [u8],
     ) -> NvResult {
         if fd < 0 {
-            log::error!("Invalid DeviceFD={}!", fd);
+            let tid = crate::hle::kernel::kernel::get_current_thread_id_fast().unwrap_or(0);
+            log::error!(
+                "Invalid DeviceFD={}! ioctl3=0x{:08X} tid={}",
+                fd,
+                command.raw,
+                tid
+            );
             return NvResult::InvalidState;
         }
         let files = self.open_files.lock().unwrap();

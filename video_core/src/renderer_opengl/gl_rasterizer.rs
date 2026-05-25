@@ -27,7 +27,9 @@ use super::gl_state_tracker::{dirty as GlDirty, StateTracker};
 use super::gl_texture_cache::TextureCache as OpenGLTextureCache;
 use crate::buffer_cache::buffer_cache::BufferCache as CommonBufferCache;
 use crate::buffer_cache::word_manager::DeviceTracker;
-use crate::engines::draw_manager::{DrawState, Maxwell3DClearView, Maxwell3DDrawView};
+use crate::engines::draw_manager::{
+    DrawState, Maxwell3DClearView, Maxwell3DDrawView, Maxwell3DIndirectView,
+};
 use crate::engines::maxwell_3d::{
     BlendEquation, BlendFactor, ComparisonOp, CullFace, DepthMode, DepthStencilInfo, DrawCall,
     FrontFace, PolygonMode, StencilFaceInfo, StencilOp,
@@ -1109,7 +1111,7 @@ impl RasterizerOpenGL {
             buffer_cache,
             texture_cache: OpenGLTextureCache::new(device_memory.clone()),
             shader_cache: ShaderCache::new(device_memory),
-            gl_shader_cache: OpenGLShaderCache::new(),
+            gl_shader_cache: OpenGLShaderCache::new(device),
             query_cache: QueryCache::new(),
             state_tracker: Box::new(StateTracker::new()),
             has_depth_buffer_float: device.has_depth_buffer_float(),
@@ -1140,7 +1142,7 @@ impl RasterizerOpenGL {
             buffer_cache: CommonBufferCache::new(&OPENGL_DEVICE_TRACKER),
             texture_cache: OpenGLTextureCache::new(test_device_memory),
             shader_cache: ShaderCache::default(),
-            gl_shader_cache: OpenGLShaderCache::new(),
+            gl_shader_cache: OpenGLShaderCache::new_for_test(),
             query_cache: QueryCache::new(),
             state_tracker: Box::new(StateTracker::new()),
             has_depth_buffer_float: false,
@@ -1623,13 +1625,14 @@ impl RasterizerInterface for RasterizerOpenGL {
                 } else {
                     (*texture_cache).prepare_render_targets_from_snapshot(&render_targets, None);
                 }
-                render_targets
-                    .rt_control
-                    .map
-                    .iter()
-                    .take(render_targets.rt_control.count.min(8) as usize)
-                    .filter_map(|&target| render_targets.render_targets.get(target as usize))
-                    .find_map(|rt| (*texture_cache).framebuffer_for_render_target(rt))
+                let surface_clip = draw_view.surface_clip();
+                (*texture_cache).framebuffer_for_render_targets_from_snapshot(
+                    &render_targets,
+                    crate::texture_cache::types::Extent2D {
+                        width: surface_clip.width,
+                        height: surface_clip.height,
+                    },
+                )
             };
             record_gl_draw_stage(draw_seq, 2);
             trace_gl_draw_stall!("[GL_DRAW_STALL] seq={} after_rt_prepare", draw_seq);
@@ -1814,6 +1817,33 @@ impl RasterizerInterface for RasterizerOpenGL {
                 read_handle(stage, cbuf_index, offset)
             };
 
+            let resolve_texture_handle = |stage: usize,
+                                          has_secondary: bool,
+                                          cbuf_index: u32,
+                                          cbuf_offset: u32,
+                                          shift_left: u32,
+                                          secondary_cbuf_index: u32,
+                                          secondary_cbuf_offset: u32,
+                                          secondary_shift_left: u32,
+                                          size_shift: u32,
+                                          idx: u32|
+             -> Option<u32> {
+                let shift = size_shift.min(31);
+                let index_offset = idx.checked_shl(shift)?;
+                let offset = cbuf_offset.checked_add(index_offset)?;
+                if has_secondary {
+                    let second_offset = secondary_cbuf_offset.checked_add(index_offset)?;
+                    debug_assert!(shift_left < 32);
+                    debug_assert!(secondary_shift_left < 32);
+                    let lhs = read_handle(stage, cbuf_index, offset)? << shift_left;
+                    let rhs = read_handle(stage, secondary_cbuf_index, second_offset)?
+                        << secondary_shift_left;
+                    Some(lhs | rhs)
+                } else {
+                    read_handle(stage, cbuf_index, offset)
+                }
+            };
+
             for stage in 0..NUM_STAGES.min(num_shader_stages) {
                 let Some(info) = pipeline.stage_infos[stage].as_ref() else {
                     continue;
@@ -1832,10 +1862,15 @@ impl RasterizerInterface for RasterizerOpenGL {
                 for desc in &info.texture_buffer_descriptors {
                     let count = desc.count.min(MAX_DESC_COUNT);
                     for idx in 0..count {
-                        if let Some(raw) = resolve_handle(
+                        if let Some(raw) = resolve_texture_handle(
                             stage,
+                            desc.has_secondary,
                             desc.cbuf_index,
                             desc.cbuf_offset,
+                            desc.shift_left,
+                            desc.secondary_cbuf_index,
+                            desc.secondary_cbuf_offset,
+                            desc.secondary_shift_left,
                             desc.size_shift,
                             idx,
                         ) {
@@ -1879,10 +1914,15 @@ impl RasterizerInterface for RasterizerOpenGL {
                 for desc in &info.texture_descriptors {
                     let count = desc.count.min(MAX_DESC_COUNT);
                     for idx in 0..count {
-                        let raw = resolve_handle(
+                        let raw = resolve_texture_handle(
                             stage,
+                            desc.has_secondary,
                             desc.cbuf_index,
                             desc.cbuf_offset,
+                            desc.shift_left,
+                            desc.secondary_cbuf_index,
+                            desc.secondary_cbuf_offset,
+                            desc.secondary_shift_left,
                             desc.size_shift,
                             idx,
                         );
@@ -2859,14 +2899,6 @@ impl RasterizerInterface for RasterizerOpenGL {
                         }
                     }
                 }
-                if std::env::var_os("RUZU_FORCE_REBIND_FBO").is_some() {
-                    if let Some((fb, _, _)) = bound_draw_framebuffer {
-                        unsafe {
-                            gl::BindFramebuffer(gl::DRAW_FRAMEBUFFER, 0);
-                            gl::BindFramebuffer(gl::DRAW_FRAMEBUFFER, fb);
-                        }
-                    }
-                }
                 if std::env::var_os("RUZU_FORCE_DRAW_FBO_VALIDATE").is_some() {
                     unsafe {
                         let _ = gl::CheckFramebufferStatus(gl::DRAW_FRAMEBUFFER);
@@ -3829,6 +3861,75 @@ impl RasterizerInterface for RasterizerOpenGL {
         if let Some(callback) = gpu_tick_callback.as_ref() {
             callback();
         }
+    }
+
+    /// Port of `RasterizerOpenGL::DrawIndirect`.
+    fn draw_indirect(&mut self, indirect_view: Maxwell3DIndirectView<'_>) {
+        let params = *indirect_view.params();
+        let draw_state = indirect_view.draw_state();
+        let cache_params = crate::buffer_cache::buffer_cache_base::DrawIndirectParams {
+            indirect_start_address: params.indirect_start_address,
+            count_start_address: params.count_start_address,
+            buffer_size: params.buffer_size as u64,
+            max_draw_counts: params.max_draw_counts as u32,
+            stride: params.stride as u32,
+            include_count: params.include_count,
+        };
+
+        self.buffer_cache.set_draw_indirect(Some(cache_params));
+
+        if params.is_byte_count {
+            log::warn!("RasterizerOpenGL::draw_indirect byte-count path is not ported yet");
+            self.buffer_cache.set_draw_indirect(None);
+            return;
+        }
+        if params.include_count {
+            log::warn!("RasterizerOpenGL::draw_indirect count-buffer path is not ported yet");
+            self.buffer_cache.set_draw_indirect(None);
+            return;
+        }
+
+        self.buffer_cache.update_graphics_buffers(params.is_indexed);
+        self.buffer_cache.bind_host_geometry_buffers(params.is_indexed);
+        for stage in 0..crate::buffer_cache::buffer_cache_base::NUM_STAGES as usize {
+            self.buffer_cache.bind_host_stage_buffers(stage);
+        }
+
+        let (buffer_id, offset) = self.buffer_cache.get_draw_indirect_buffer();
+        let handle = self.buffer_cache.get_buffer_gpu_handle(buffer_id);
+        if handle == 0 {
+            log::warn!("RasterizerOpenGL::draw_indirect skipped: missing GL indirect buffer");
+            self.buffer_cache.set_draw_indirect(None);
+            return;
+        }
+
+        let primitive_mode = primitive_topology_to_gl(draw_state.topology);
+        unsafe {
+            gl::BindBuffer(gl::DRAW_INDIRECT_BUFFER, handle);
+            let gl_offset = offset as usize as *const c_void;
+            if params.is_indexed {
+                let format = index_format_to_gl(draw_state.index_buffer.format);
+                gl::MultiDrawElementsIndirect(
+                    primitive_mode,
+                    format,
+                    gl_offset,
+                    params.max_draw_counts as i32,
+                    params.stride as i32,
+                );
+            } else {
+                gl::MultiDrawArraysIndirect(
+                    primitive_mode,
+                    gl_offset,
+                    params.max_draw_counts as i32,
+                    params.stride as i32,
+                );
+            }
+        }
+
+        self.buffer_cache.set_draw_indirect(None);
+        self.num_queued_commands = self.num_queued_commands.saturating_add(1);
+        self.total_draw_count = self.total_draw_count.saturating_add(1);
+        self.tick_gpu_work();
     }
 
     fn draw_texture(&mut self) {

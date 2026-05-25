@@ -309,10 +309,14 @@ pub trait Maxwell3DAccess {
     }
 
     /// Dispatch an indirect draw through the bound rasterizer.
-    fn draw_indirect_rasterizer(&mut self) -> bool {
+    fn draw_indirect_rasterizer(
+        &mut self,
+        draw_state: &DrawState,
+        indirect_params: &IndirectParams,
+    ) -> bool {
         let mut dispatched = false;
         self.with_rasterizer_mut(&mut |rasterizer| {
-            rasterizer.draw_indirect();
+            rasterizer.draw_indirect(Maxwell3DIndirectView::new(draw_state, indirect_params));
             dispatched = true;
         });
         dispatched
@@ -965,6 +969,32 @@ impl<'a> Maxwell3DClearView<'a> {
 impl Default for Maxwell3DClearView<'static> {
     fn default() -> Self {
         Self::new(ClearState::default(), Maxwell3DRenderTargets::default())
+    }
+}
+
+/// View passed to `RasterizerOpenGL::DrawIndirect`.
+///
+/// Upstream reaches this through `maxwell3d->draw_manager->GetIndirectParams()`
+/// and `maxwell3d->regs` from the rasterizer's `Maxwell3D*`.
+pub struct Maxwell3DIndirectView<'a> {
+    draw_state: &'a DrawState,
+    indirect_params: &'a IndirectParams,
+}
+
+impl<'a> Maxwell3DIndirectView<'a> {
+    pub fn new(draw_state: &'a DrawState, indirect_params: &'a IndirectParams) -> Self {
+        Self {
+            draw_state,
+            indirect_params,
+        }
+    }
+
+    pub fn draw_state(&self) -> &'a DrawState {
+        self.draw_state
+    }
+
+    pub fn params(&self) -> &'a IndirectParams {
+        self.indirect_params
     }
 }
 
@@ -1640,7 +1670,7 @@ impl DrawManager {
         self.update_topology(maxwell3d);
 
         if maxwell3d.should_execute() {
-            maxwell3d.draw_indirect_rasterizer();
+            maxwell3d.draw_indirect_rasterizer(&self.draw_state, &self.indirect_state);
         }
     }
 }

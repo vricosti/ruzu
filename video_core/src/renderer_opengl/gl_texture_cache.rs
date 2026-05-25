@@ -17,11 +17,12 @@ use crate::texture_cache::image_base::{ImageBase, ImageFlagBits, ImageMapView};
 use crate::texture_cache::image_info::ImageInfo;
 use crate::texture_cache::image_view_base::{ImageViewBase, ImageViewFlagBits};
 use crate::texture_cache::image_view_info::{ImageViewInfo, SwizzleSource};
+use crate::texture_cache::render_targets::RenderTargets;
 use crate::texture_cache::texture_cache_base::{
     FramebufferImageView, TextureCacheBase as CommonTextureCache,
 };
 use crate::texture_cache::types::{
-    ImageId, ImageType, ImageViewId, ImageViewType, Offset2D, Region2D, SubresourceRange,
+    Extent2D, ImageId, ImageType, ImageViewId, ImageViewType, Offset2D, Region2D, SubresourceRange,
     NULL_IMAGE_ID,
 };
 use crate::texture_cache::util::{
@@ -547,14 +548,6 @@ impl Image {
 
         let target = image_target(&base.info);
         let texture = make_image(&base.info, tuple.internal_format, gl_num_levels, target);
-
-        if std::env::var_os("RUZU_FORCE_MAX_LEVEL_0").is_some() && texture != 0 {
-            unsafe {
-                let actual_levels = (gl_num_levels - 1).max(0);
-                gl::TextureParameteri(texture, gl::TEXTURE_BASE_LEVEL, 0);
-                gl::TextureParameteri(texture, gl::TEXTURE_MAX_LEVEL, actual_levels);
-            }
-        }
 
         if std::env::var_os("RUZU_TRACE_IMAGE_LIFECYCLE").is_some() {
             let mut sample = [0u8; 16];
@@ -1177,42 +1170,6 @@ impl ImageView {
                         apply_swizzle(view, self.format, swizzle);
                     }
                 }
-                if std::env::var_os("RUZU_PROBE_VIEW_STORAGE").is_some() {
-                    while gl::GetError() != gl::NO_ERROR {}
-                    let red: [u8; 4] = [0xAB, 0xCD, 0xEF, 0x42];
-                    gl::ClearTexImage(
-                        view,
-                        0,
-                        gl::RGBA,
-                        gl::UNSIGNED_BYTE,
-                        red.as_ptr() as *const _,
-                    );
-                    let clear_err = gl::GetError();
-                    let mut via_view = [0u8; 16];
-                    gl::GetTextureSubImage(
-                        view, 0, 0, 0, 0, 2, 2, 1,
-                        gl::RGBA, gl::UNSIGNED_BYTE,
-                        via_view.len() as i32,
-                        via_view.as_mut_ptr() as *mut _,
-                    );
-                    let view_read_err = gl::GetError();
-                    let mut via_parent = [0u8; 16];
-                    gl::GetTextureSubImage(
-                        self.original_texture, 0, 0, 0, 0, 2, 2, 1,
-                        gl::RGBA, gl::UNSIGNED_BYTE,
-                        via_parent.len() as i32,
-                        via_parent.as_mut_ptr() as *mut _,
-                    );
-                    let parent_read_err = gl::GetError();
-                    log::warn!(
-                        "[VIEW_PROBE] view={} parent={} target=0x{:X} view_format=0x{:X} range=lvl{}+{}/lyr{}+{} view_err=0x{:X} clear_err=0x{:X} via_view={:02X?} via_parent={:02X?} v_read_err=0x{:X} p_read_err=0x{:X}",
-                        view, self.original_texture, target, view_format,
-                        view_range.base.level, view_range.extent.levels,
-                        view_range.base.layer, view_range.extent.layers,
-                        view_err, clear_err, via_view, via_parent,
-                        view_read_err, parent_read_err,
-                    );
-                }
             }
         }
         if view != 0 {
@@ -1366,11 +1323,7 @@ impl Sampler {
         // for mag; ruzu's helper takes a u32 mipmap_filter so we pass 0
         // (TextureMipmapFilter::None == 0).
         let mag = super::maxwell_to_gl::texture_filter_mode(config.mag_filter(), 1) as i32;
-        let min_mipmap_filter = if std::env::var_os("RUZU_FORCE_NO_MIP_SAMPLERS").is_some() {
-            1
-        } else {
-            config.mipmap_filter()
-        };
+        let min_mipmap_filter = config.mipmap_filter();
         let min = super::maxwell_to_gl::texture_filter_mode(config.min_filter(), min_mipmap_filter)
             as i32;
         let reduction = super::maxwell_to_gl::reduction_filter(config.reduction_filter()) as i32;
@@ -1529,6 +1482,7 @@ pub struct TextureCache {
     image_views: HashMap<ImageViewId, ImageView>,
     samplers: HashMap<crate::texture_cache::types::SamplerId, Sampler>,
     framebuffers: HashMap<ImageViewId, TextureCacheFramebuffer>,
+    render_target_framebuffers: HashMap<RenderTargets, TextureCacheFramebuffer>,
     null_image_handles: [u32; 7],
     null_image_views: [u32; NUM_TEXTURE_TYPES],
 }
@@ -1629,6 +1583,7 @@ impl TextureCache {
             image_views: HashMap::new(),
             samplers: HashMap::new(),
             framebuffers: HashMap::new(),
+            render_target_framebuffers: HashMap::new(),
             null_image_handles,
             null_image_views,
         }
@@ -1915,19 +1870,24 @@ impl TextureCache {
                 // retry without leaving a stale ImageView handle behind.
                 continue;
             }
-            let image_ref = self
-                .images
-                .get(&image_id)
-                .expect("image inserted above must be present");
-            let view_matches = self
-                .image_views
-                .get(&view_id)
-                .is_some_and(|view| view.matches_base_image(&view_base, image_ref));
+            let view_matches = {
+                let image_ref = self
+                    .images
+                    .get(&image_id)
+                    .expect("image inserted above must be present");
+                self.image_views
+                    .get(&view_id)
+                    .is_some_and(|view| view.matches_base_image(&view_base, image_ref))
+            };
             if view_matches {
                 continue;
             }
             self.image_views.remove(&view_id);
-            self.framebuffers.remove(&view_id);
+            self.remove_framebuffers_for_view(view_id);
+            let image_ref = self
+                .images
+                .get(&image_id)
+                .expect("image inserted above must be present");
             let backend_view =
                 ImageView::from_image_view_info(&view_base, image_ref, self.null_image_views);
             self.image_views.insert(view_id, backend_view);
@@ -1998,6 +1958,7 @@ impl TextureCache {
 
     pub fn unmap_memory(&mut self, cpu_addr: u64, size: usize) {
         self.framebuffers.clear();
+        self.render_target_framebuffers.clear();
         self.image_views.clear();
         self.images.clear();
         self.base.unmap_memory(cpu_addr, size);
@@ -2021,6 +1982,12 @@ impl TextureCache {
 
     pub fn commit_async_flushes(&mut self) {
         self.base.commit_async_flushes();
+    }
+
+    fn remove_framebuffers_for_view(&mut self, view_id: ImageViewId) {
+        self.framebuffers.remove(&view_id);
+        self.render_target_framebuffers
+            .retain(|key, _| !key.contains(&[view_id]));
     }
 
     pub fn update_render_targets_from_snapshot(
@@ -2077,6 +2044,173 @@ impl TextureCache {
                 self.base.mark_modification_by_id(image_id);
             }
         }
+    }
+
+    /// OpenGL counterpart of upstream `TextureCache<P>::GetFramebuffer()`.
+    ///
+    /// Upstream keys framebuffers by the complete `RenderTargets` object and
+    /// attaches every color target before selecting draw buffers. The previous
+    /// Rust path bound only the first mapped render target, which is not
+    /// equivalent for MK8D's multi-pass composition.
+    pub fn framebuffer_for_render_targets_from_snapshot(
+        &mut self,
+        render_targets: &Maxwell3DRenderTargets,
+        size: Extent2D,
+    ) -> Option<(u32, u32, u32)> {
+        let mut key = RenderTargets {
+            size,
+            ..RenderTargets::default()
+        };
+        let mut attachment_textures = [0u32; NUM_RT];
+        let mut max_width = 0u32;
+        let mut max_height = 0u32;
+
+        for index in 0..NUM_RT {
+            key.draw_buffers[index] = render_targets.rt_control.map[index] as u8;
+
+            let rt = render_targets.render_targets[index];
+            if rt.address == 0 || rt.width == 0 || rt.height == 0 || rt.format == 0 {
+                continue;
+            }
+
+            let Some((image_id, image_base)) = self.base.slot_images.iter().find(|(_, image)| {
+                image.gpu_addr == rt.address
+                    && image.info.size.width == rt.width
+                    && image.info.size.height == rt.height
+                    && !image.image_view_ids.is_empty()
+            }) else {
+                continue;
+            };
+            let image_base = image_base.clone();
+            let view_id = self
+                .base
+                .find_render_target_view_from_image(image_id, &rt, rt.address);
+            if !view_id.is_valid() {
+                continue;
+            }
+            key.color_buffer_ids[index] = view_id;
+
+            let view_base = self.base.slot_image_views[view_id].clone();
+            self.images
+                .entry(image_id)
+                .or_insert_with(|| Image::from_base(&image_base));
+            let view_mismatch = {
+                let backend_image = self
+                    .images
+                    .get(&image_id)
+                    .expect("image inserted above must be present");
+                self.image_views
+                    .get(&view_id)
+                    .is_some_and(|view| !view.matches_base_image(&view_base, backend_image))
+            };
+            if view_mismatch {
+                self.image_views.remove(&view_id);
+                self.remove_framebuffers_for_view(view_id);
+            }
+            let backend_image = self
+                .images
+                .get(&image_id)
+                .expect("image inserted above must be present");
+            let backend_view = self
+                .image_views
+                .entry(view_id)
+                .or_insert_with(|| {
+                    ImageView::new_color_2d(&view_base, backend_image, self.null_image_views)
+                });
+            let attachment_texture = if view_base.flags.contains(ImageViewFlagBits::SLICE) {
+                backend_view.handle_for_texture_type(TextureType::Color3D)
+            } else {
+                backend_view.default_handle()
+            };
+            if attachment_texture == 0 {
+                key.color_buffer_ids[index] = ImageViewId::default();
+                continue;
+            }
+
+            attachment_textures[index] = attachment_texture;
+            max_width = max_width.max(view_base.size.width);
+            max_height = max_height.max(view_base.size.height);
+        }
+
+        if attachment_textures.iter().all(|&texture| texture == 0) {
+            return None;
+        }
+        if key.size.width == 0 {
+            key.size.width = max_width;
+        }
+        if key.size.height == 0 {
+            key.size.height = max_height;
+        }
+
+        let framebuffer = self
+            .render_target_framebuffers
+            .entry(key)
+            .or_insert_with(|| {
+                let mut framebuffer = 0;
+                let mut buffer_bits = gl::NONE;
+                unsafe {
+                    gl::CreateFramebuffers(1, &mut framebuffer);
+                    if framebuffer != 0 {
+                        let mut num_buffers = 0i32;
+                        let mut gl_draw_buffers = [gl::NONE; NUM_RT];
+                        for index in 0..NUM_RT {
+                            let texture = attachment_textures[index];
+                            if texture == 0 {
+                                continue;
+                            }
+                            buffer_bits |= gl::COLOR_BUFFER_BIT;
+                            gl_draw_buffers[index] =
+                                gl::COLOR_ATTACHMENT0 + key.draw_buffers[index] as u32;
+                            num_buffers = index as i32 + 1;
+
+                            let view_id = key.color_buffer_ids[index];
+                            let view_base = self.base.slot_image_views[view_id].clone();
+                            let attachment = gl::COLOR_ATTACHMENT0 + index as u32;
+                            if view_base.flags.contains(ImageViewFlagBits::SLICE)
+                                && view_base.range.extent.layers == 1
+                            {
+                                gl::NamedFramebufferTextureLayer(
+                                    framebuffer,
+                                    attachment,
+                                    texture,
+                                    0,
+                                    view_base.range.base.layer,
+                                );
+                            } else {
+                                gl::NamedFramebufferTexture(framebuffer, attachment, texture, 0);
+                            }
+                        }
+
+                        if num_buffers > 1 {
+                            gl::NamedFramebufferDrawBuffers(
+                                framebuffer,
+                                num_buffers,
+                                gl_draw_buffers.as_ptr(),
+                            );
+                        } else if num_buffers > 0 {
+                            gl::NamedFramebufferDrawBuffer(framebuffer, gl_draw_buffers[0]);
+                        } else {
+                            gl::NamedFramebufferDrawBuffer(framebuffer, gl::NONE);
+                        }
+                        gl::NamedFramebufferParameteri(
+                            framebuffer,
+                            gl::FRAMEBUFFER_DEFAULT_WIDTH,
+                            key.size.width as i32,
+                        );
+                        gl::NamedFramebufferParameteri(
+                            framebuffer,
+                            gl::FRAMEBUFFER_DEFAULT_HEIGHT,
+                            key.size.height as i32,
+                        );
+                    }
+                }
+                TextureCacheFramebuffer {
+                    framebuffer,
+                    buffer_bits,
+                }
+            });
+        let handle = framebuffer.handle();
+        (handle != 0).then_some((handle, key.size.width, key.size.height))
     }
 
     /// OpenGL-backed port of `TextureCache<P>::BlitImage` for the currently
@@ -2252,18 +2386,26 @@ impl TextureCache {
         if !image_id.is_valid() {
             return None;
         }
-        let backend_image = self
-            .images
+        self.images
             .entry(image_id)
             .or_insert_with(|| Image::from_base(&self.base.slot_images[image_id]));
-        if self
-            .image_views
-            .get(&view_id)
-            .is_some_and(|view| !view.matches_base_image(&view_base, backend_image))
-        {
+        let view_mismatch = {
+            let backend_image = self
+                .images
+                .get(&image_id)
+                .expect("image inserted above must be present");
+            self.image_views
+                .get(&view_id)
+                .is_some_and(|view| !view.matches_base_image(&view_base, backend_image))
+        };
+        if view_mismatch {
             self.image_views.remove(&view_id);
-            self.framebuffers.remove(&view_id);
+            self.remove_framebuffers_for_view(view_id);
         }
+        let backend_image = self
+            .images
+            .get(&image_id)
+            .expect("image inserted above must be present");
         let backend_view = self
             .image_views
             .entry(view_id)
@@ -2394,20 +2536,28 @@ impl TextureCache {
                 );
             }
         }
-        let backend_image = self.images.entry(image_id).or_insert_with(|| {
+        self.images.entry(image_id).or_insert_with(|| {
             let image = &self.base.slot_images[image_id];
             Image::from_base(image)
         });
+        let backend_image = self
+            .images
+            .get(&image_id)
+            .expect("image inserted above must be present");
         let original_texture = backend_image.handle();
         let current_texture = backend_image.current_texture;
-        if self
+        let view_mismatch = self
             .image_views
             .get(&view_id)
-            .is_some_and(|backend_view| !backend_view.matches_base_image(&view, backend_image))
-        {
+            .is_some_and(|backend_view| !backend_view.matches_base_image(&view, backend_image));
+        if view_mismatch {
             self.image_views.remove(&view_id);
-            self.framebuffers.remove(&view_id);
+            self.remove_framebuffers_for_view(view_id);
         }
+        let backend_image = self
+            .images
+            .get(&image_id)
+            .expect("image inserted above must be present");
         let backend_view = self
             .image_views
             .entry(view_id)
@@ -2551,18 +2701,26 @@ impl TextureCache {
         }
         let view_base = self.base.slot_image_views[view_id].clone();
 
-        let backend_image = self
-            .images
+        self.images
             .entry(image_id)
             .or_insert_with(|| Image::from_base(&image_base));
-        if self
-            .image_views
-            .get(&view_id)
-            .is_some_and(|view| !view.matches_base_image(&view_base, backend_image))
-        {
+        let view_mismatch = {
+            let backend_image = self
+                .images
+                .get(&image_id)
+                .expect("image inserted above must be present");
+            self.image_views
+                .get(&view_id)
+                .is_some_and(|view| !view.matches_base_image(&view_base, backend_image))
+        };
+        if view_mismatch {
             self.image_views.remove(&view_id);
-            self.framebuffers.remove(&view_id);
+            self.remove_framebuffers_for_view(view_id);
         }
+        let backend_image = self
+            .images
+            .get(&image_id)
+            .expect("image inserted above must be present");
         let backend_view = self
             .image_views
             .entry(view_id)
@@ -2580,42 +2738,35 @@ impl TextureCache {
 
         let view_w = view_base.size.width as i32;
         let view_h = view_base.size.height as i32;
-        let parent_handle = backend_image.handle();
         let framebuffer = self.framebuffers.entry(view_id).or_insert_with(|| {
             let mut framebuffer = 0;
             unsafe {
                 gl::CreateFramebuffers(1, &mut framebuffer);
                 if framebuffer != 0 {
-                    if std::env::var_os("RUZU_FBO_ATTACH_PARENT").is_some() && parent_handle != 0 {
-                        // Attach the parent TEXTURE_2D_ARRAY directly at layer 0
-                        gl::NamedFramebufferTextureLayer(framebuffer, gl::COLOR_ATTACHMENT0, parent_handle, 0, 0);
-                        log::warn!("[FBO_ATTACH_PARENT] fbo={} parent={} layer=0", framebuffer, parent_handle);
-                    } else {
-                        if view_base.flags.contains(ImageViewFlagBits::SLICE) {
-                            if view_base.range.extent.layers > 1 {
-                                gl::NamedFramebufferTexture(
-                                    framebuffer,
-                                    gl::COLOR_ATTACHMENT0,
-                                    attachment_texture,
-                                    0,
-                                );
-                            } else {
-                                gl::NamedFramebufferTextureLayer(
-                                    framebuffer,
-                                    gl::COLOR_ATTACHMENT0,
-                                    attachment_texture,
-                                    0,
-                                    view_base.range.base.layer,
-                                );
-                            }
-                        } else {
+                    if view_base.flags.contains(ImageViewFlagBits::SLICE) {
+                        if view_base.range.extent.layers > 1 {
                             gl::NamedFramebufferTexture(
                                 framebuffer,
                                 gl::COLOR_ATTACHMENT0,
                                 attachment_texture,
                                 0,
                             );
+                        } else {
+                            gl::NamedFramebufferTextureLayer(
+                                framebuffer,
+                                gl::COLOR_ATTACHMENT0,
+                                attachment_texture,
+                                0,
+                                view_base.range.base.layer,
+                            );
                         }
+                    } else {
+                        gl::NamedFramebufferTexture(
+                            framebuffer,
+                            gl::COLOR_ATTACHMENT0,
+                            attachment_texture,
+                            0,
+                        );
                     }
                     // Upstream `Framebuffer::Framebuffer` (gl_texture_cache.cpp:1326)
                     // uses `glNamedFramebufferDrawBuffer` (direct state access)
@@ -2632,12 +2783,6 @@ impl TextureCache {
                         gl::FRAMEBUFFER_DEFAULT_HEIGHT,
                         view_h,
                     );
-                    if std::env::var_os("RUZU_FBO_INIT_CLEAR").is_some() {
-                        let init_color = [0.0f32, 0.0, 0.0, 1.0];
-                        gl::ClearNamedFramebufferfv(framebuffer, gl::COLOR, 0, init_color.as_ptr());
-                        gl::Finish();
-                        log::warn!("[FBO_INIT_CLEAR] fbo={} cleared to black", framebuffer);
-                    }
                 }
             }
             TextureCacheFramebuffer {
