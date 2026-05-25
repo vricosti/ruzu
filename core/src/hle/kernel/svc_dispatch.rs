@@ -933,29 +933,37 @@ fn call32(system: &System, imm: u32, args: &mut SvcArgs) {
             set_arg32(args, 0, result.get_inner_value());
         }
         Some(SvcId::SignalProcessWideKey) => {
-            svc_condition_variable::signal_process_wide_key(
-                system,
-                get_arg32(args, 0) as u64,
-                get_arg32(args, 1) as i32,
-            );
-            // RUZU_YIELD_AFTER_SIGNAL_CV=1 — Experiment for MK8D wedge investigation
-            // (project_mk8d_unlock_site_found_2026_05_25). After signaling a cv,
-            // give the scheduler a chance to run other threads before the signaler
-            // returns to guest code and races into its user-mode mutex unlock at
-            // PC 0x01D334B8. If the signaled-and-now-waking thread (tid=86 in
-            // MK8D's case) gets CPU time before tid=75's unlock, it can register
-            // as a WAIT_MASK waiter and tid=75's libnx will take the slow-path
-            // unlock SVC instead of the silent fast-path CAS.
-            if std::env::var_os("RUZU_YIELD_AFTER_SIGNAL_CV").is_some() {
-                if let Some(kernel) = system.kernel() {
-                    if let Some(scheduler) = kernel.current_scheduler() {
-                        let sched_ptr = {
-                            let guard = scheduler.lock().unwrap();
-                            &*guard as *const crate::hle::kernel::k_scheduler::KScheduler
-                                as *mut crate::hle::kernel::k_scheduler::KScheduler
-                        };
-                        unsafe {
-                            (*sched_ptr).preempt_single_core();
+            let cv_key = get_arg32(args, 0) as u64;
+            svc_condition_variable::signal_process_wide_key(system, cv_key, get_arg32(args, 1) as i32);
+            // RUZU_FORCE_WAIT_MASK_AFTER_SIGNAL=1 — Experiment for MK8D wedge
+            // (project_mk8d_unlock_site_found_2026_05_25 option D).
+            // After signaling cv at `cv_key`, set WAIT_MASK (0x40000000) on the
+            // paired mutex word at `cv_key - 8` (libnx AuxBufferInfo layout:
+            // mutex@+0, padding@+4, cv@+8). This forces the next libnx
+            // __nx_arbiter_unlock fast-path CAS to FAIL (cur != self_handle
+            // because of WAIT_MASK), routing the unlock through the kernel
+            // ArbitrateUnlock SVC where any actually-waiting thread (registered
+            // after we set WAIT_MASK) gets woken correctly.
+            //
+            // Cost: every cv-signal forces a subsequent ArbitrateUnlock SVC
+            // even with no waiter (kernel finds nothing to wake, returns).
+            //
+            // Limitation: only fires for cv_key-8 layout; some games use
+            // separate mutex+cv addresses where -8 won't be the mutex.
+            if std::env::var_os("RUZU_FORCE_WAIT_MASK_AFTER_SIGNAL").is_some() && cv_key >= 8 {
+                let mutex_addr = cv_key - 8;
+                let process_arc = system.current_process_arc().clone();
+                {
+                    let process = process_arc.lock().unwrap();
+                    if let Some(memory) =
+                        process.page_table.get_base().m_memory.as_ref()
+                    {
+                        let mem = memory.lock().unwrap();
+                        let current = mem.read_32(mutex_addr);
+                        // Only OR if there's a holder (low 28 bits nonzero) and
+                        // WAIT_MASK isn't already set.
+                        if current != 0 && (current & 0x40000000) == 0 {
+                            mem.write_32_no_rasterizer(mutex_addr, current | 0x40000000);
                         }
                     }
                 }
