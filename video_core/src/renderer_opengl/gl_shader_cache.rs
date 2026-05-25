@@ -48,6 +48,21 @@ static SHADER_PIPELINE_STAGE_COUNTS: [AtomicU64; 12] = [
     AtomicU64::new(0),
 ];
 
+/// Port of the OpenGL-specific `Shader::Profile` construction in upstream
+/// `gl_shader_cache.cpp`.
+fn opengl_shader_profile() -> ShaderProfile {
+    ShaderProfile {
+        lower_left_origin_mode: true,
+        need_declared_frag_colors: true,
+        // Upstream derives this from `Device::HasPreciseBug()`. Ruzu does not
+        // yet have the GL device capability table wired into ShaderCache.
+        has_gl_precise_bug: false,
+        ignore_nan_fp_comparisons: true,
+        max_user_clip_distances: 8,
+        ..ShaderProfile::default()
+    }
+}
+
 fn record_shader_pipeline_stage(stage: usize) {
     if std::env::var_os("RUZU_PROFILE_SHADER_PIPELINE_STALL").is_none() {
         return;
@@ -569,7 +584,7 @@ impl ShaderCache {
                     va_env.cached_instruction_start(),
                     vb_env.cached_instruction_slice(),
                     vb_env.cached_instruction_start(),
-                    &ShaderProfile::default(),
+                    &opengl_shader_profile(),
                     &runtime_info,
                     &mut bindings,
                 );
@@ -997,7 +1012,7 @@ impl ShaderCache {
                 va_start,
                 vb_env.cached_instruction_slice(),
                 vb_env.cached_instruction_start(),
-                &ShaderProfile::default(),
+                &opengl_shader_profile(),
                 &runtime_info,
                 &mut bindings,
             );
@@ -1483,7 +1498,7 @@ impl ShaderCache {
         runtime_info: &RuntimeInfo,
         bindings: &mut shader_recompiler::backend::bindings::Bindings,
     ) -> CompiledGlslShader {
-        let profile = ShaderProfile::default();
+        let profile = opengl_shader_profile();
         let compiled = if let Some(texture_bound_buffer) = texture_bound_buffer {
             if let Some(sph) = sph {
                 compile_shader_glsl_at_offset_with_bindings_and_texture_bound_and_sph(
@@ -1890,6 +1905,22 @@ mod tests {
             "GLSL bridge should produce non-empty source even for empty bytecode"
         );
         assert_eq!(compiled.stage, ShaderStage::VertexB);
+    }
+
+    #[test]
+    fn opengl_fragment_profile_declares_all_frag_colors() {
+        let cache = ShaderCache::new();
+        let compiled = cache.compile_stage_glsl(&[], ShaderStage::Fragment);
+
+        for index in 0..8 {
+            assert!(
+                compiled
+                    .source
+                    .contains(&format!("layout(location={})out vec4 frag_color{};", index, index)),
+                "OpenGL profile must declare frag_color{} even when the shader does not write it",
+                index
+            );
+        }
     }
 
     #[test]

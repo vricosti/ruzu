@@ -18,16 +18,35 @@ pub enum MsaaMode {
     Msaa2x1 = 1,
     Msaa2x2 = 2,
     Msaa4x2 = 3,
-    Msaa4x4 = 4,
+    Msaa4x2D3D = 4,
     Msaa2x1D3D = 5,
-    Msaa2x2Vc4 = 6,
-    Msaa2x2Vc12 = 7,
-    Msaa4x2D3D = 8,
-    Msaa4x2Vc8 = 9,
-    Msaa4x2Vc24 = 10,
+    Msaa4x4 = 6,
+    Msaa2x2Vc4 = 8,
+    Msaa2x2Vc12 = 9,
+    Msaa4x2Vc8 = 10,
+    Msaa4x2Vc24 = 11,
 }
 
 // ── Public helpers ─────────────────────────────────────────────────────
+
+impl MsaaMode {
+    pub fn from_raw(value: u32) -> Option<Self> {
+        match value {
+            0 => Some(Self::Msaa1x1),
+            1 => Some(Self::Msaa2x1),
+            2 => Some(Self::Msaa2x2),
+            3 => Some(Self::Msaa4x2),
+            4 => Some(Self::Msaa4x2D3D),
+            5 => Some(Self::Msaa2x1D3D),
+            6 => Some(Self::Msaa4x4),
+            8 => Some(Self::Msaa2x2Vc4),
+            9 => Some(Self::Msaa2x2Vc12),
+            10 => Some(Self::Msaa4x2Vc8),
+            11 => Some(Self::Msaa4x2Vc24),
+            _ => None,
+        }
+    }
+}
 
 /// Returns (log2_x, log2_y) for a given sample count.
 ///

@@ -17373,18 +17373,338 @@ The following still panic because upstream either also throws NotImplementedExce
 ### Intentional differences
 - `UnswizzleImage` receives already-read input bytes in ruzu while upstream reads from `Tegra::MemoryManager` inside the helper. This is existing Rust plumbing; the swizzle math and returned `BufferImageCopy` ownership remain in the texture-cache utility file.
 - Ruzu reuses `full_upload_swizzles(info)` to obtain the per-level `num_tiles`, adjusted block size, and guest offset. Upstream computes the same values inline in `UnswizzleImage`. This keeps the existing Rust helper boundary while matching the upstream values passed to `UnswizzleTexture`.
+- Follow-up 2026-05-25: ruzu still reuses `full_upload_swizzles(info)` for the guest swizzle parameters, but now constructs the returned upload `BufferImageCopy` list with upstream's `UnswizzleImage` layout instead of reusing `FullDownloadCopies`. This preserves the Rust helper boundary while matching upstream's upload row/depth alignment semantics.
 
 ### Unintentional differences (to fix)
 - None for this slice. `UnswizzleImage` now passes tile-count dimensions (`num_tiles.width/height/depth`) and adjusted mip block dimensions to `unswizzle_texture`, matching upstream's `UnswizzleTexture(dst, src, 1U << bpp_log2, num_tiles.width, num_tiles.height, num_tiles.depth, block.height, block.depth, stride_alignment)`.
+- Follow-up 2026-05-25: fixed a second `UnswizzleImage` copy-layout mismatch. Upstream sets each upload copy's `buffer_row_length` / `buffer_image_height` to `AlignUp(level_size.width/height, tile_size.width/height)` and advances host offsets by aligned block counts per layer. Ruzu previously reused download copies, leaving small compressed mips with unaligned 2x2/1x1 row dimensions. The upload copies now match upstream for compressed BCn mips.
 
 ### Missing items
 - Broader texture-cache upload/download parity is still incomplete; this entry only covers the compressed/block-linear `UnswizzleImage` dimension bug observed in MK8D's RGTC2/BC5 upload.
+- `ConvertImage`, ASTC recompression, and broader accelerated upload/download paths still need separate line-by-line parity passes.
 
 ### Binary layout verification
 - N/A: texture-copy math only. The regression test verifies the byte payload produced for a compressed 8x8 BC5 image preserves the lower half of the block payload instead of zeroing it.
+- Follow-up 2026-05-25: the new BC1/BCn upload-copy regression verifies mip upload row length and image height stay aligned to the compressed tile dimensions, matching upstream's `Common::AlignUp(...)` behavior.
 
 ### Tests
 - `cargo test -p video_core unswizzle_image_uses_tile_counts_for_compressed_blocks -- --nocapture`
+- `cargo test -p video_core unswizzle_image_aligns_compressed_upload_rows_per_mip -- --nocapture`
 - `cargo check -p video_core`
 - `cargo build --release --bin ruzu-cmd`
 - Manual apitrace verification: `/tmp/ruzu_unswizzle_fix.trace` call 2818 64-byte RGTC2 upload now matches `/tmp/zuyu_blobs/blob_call16829.bin` exactly, and retrace snapshot 2995 is `[0.0, 0.0, 0.0]` like zuyu instead of reusing the first pass content.
+
+## 2026-05-25 — video_core/src/macro_engine/macro_hle.rs + video_core/src/engines/maxwell_3d.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/macro/macro_hle.cpp
+
+### Intentional differences
+- `HLE_DrawArraysIndirect`, `HLE_DrawIndexedIndirect`, `HLE_MultiDrawIndexedIndirectCount`, and `HLE_DrawIndirectByteCount` now hold the same `Maxwell3D` owner pointer plumbing already used by ruzu's ported HLE helpers, then delegate to owner-local `Maxwell3D::hle_*` methods. Upstream stores `Maxwell3D&` in `HLEMacroImpl`; ruzu keeps the existing non-owning pointer bridge in `macro_hle.rs`.
+- `HLE_MultiLayerClear`, `HLE_C713C83D8F63CCF3`, `HLE_SetRasterBoundingBox`, and `HLE_TransformFeedbackSetup` now also use the same `Maxwell3D` owner pointer plumbing and dispatch into owner-local `Maxwell3D::hle_*` methods. This removes the remaining known no-op HLE macro stubs while keeping the register side effects in the Maxwell3D owner, matching upstream responsibility boundaries.
+- The Rust implementation currently executes the upstream fallback paths directly for these draw macros. Upstream first attempts the indirect draw path when parameters are dirty and topology is safe, but ruzu's OpenGL `RasterizerInterface::draw_indirect` is still a no-op. Using the fallback path is a temporary, documented parity compromise that preserves the same register side effects and emits the same `DrawArray`/`DrawIndex` calls that upstream uses in its fallback branch.
+- Bounds checks on `parameters` are retained to avoid Rust panics on malformed macro payloads. Upstream relies on valid macro program payload sizes and uses unchecked vector indexing.
+- `PrimitiveTopology::is_hle_safe()` is the Rust counterpart of upstream file-local `IsTopologySafe()`. It lives on the enum because ruzu already owns the topology enum in `maxwell_3d.rs`; the helper still contains the same accepted/rejected topology set.
+- `HLE_TransformFeedbackSetup` calls the rasterizer through ruzu's optional `RasterizerInterface` plumbing. Backends that do not override `register_transform_feedback` keep the existing trait-default no-op; OpenGL can observe the same call site as upstream `Rasterizer().RegisterTransformFeedback(...)`.
+
+### Unintentional differences (to fix)
+- Full upstream indirect-draw execution is not ported for OpenGL. Once `RasterizerOpenGL::draw_indirect` and buffer-cache indirect binding are complete, these HLE macros should follow upstream's `Execute()` branch and only use fallback under the same `AnyParametersDirty()` / `IsTopologySafe()` / transform-feedback-force conditions.
+- `HLE_MultiDrawIndexedIndirectCount` fallback resets `vertex_id_base`, `engine_state`, and `replace_table` like upstream, but does not explicitly clear `global_base_vertex_index` / `global_base_instance_index` because upstream fallback only writes `vertex_id_base` before each `DrawIndex`.
+- `GetMaxCurrentVertices()` is ported only to the extent needed by `HLE_DrawArraysIndirect`'s unsafe-topology guard. It follows upstream register reads but does not yet have a dedicated parity test for every attribute/stream edge case.
+- `HLE_MultiLayerClear` uses a debug assertion for `layer == 0` and defaults missing RT depth to one layer if malformed state is encountered. Upstream asserts valid payload/register state directly.
+
+### Missing items
+- None for the known upstream `macro_hle.cpp` HLE macro classes: each registered HLE macro now has a non-stub Rust execution path.
+- Upstream `HLE_DrawArraysIndirect::Execute`, `HLE_DrawIndexedIndirect::Execute`, `HLE_MultiDrawIndexedIndirectCount::Execute`, and `HLE_DrawIndirectByteCount::Execute` indirect paths.
+- OpenGL backend implementation for `RasterizerInterface::draw_indirect`.
+
+### Binary layout verification
+- N/A: macro execution and Maxwell register side effects only.
+
+### Tests
+- `cargo test -p video_core hle_draw_ -- --nocapture`
+- `cargo test -p video_core hle_ -- --nocapture`
+- `cargo test -p video_core test_hle_multi_draw_indexed_indirect_count_fallback_emits_draw_sequence -- --nocapture`
+- `cargo check -p video_core`
+
+## 2026-05-25 — video_core/src/renderer_opengl/gl_texture_cache.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_texture_cache.cpp and gl_texture_cache.h
+
+### Intentional differences
+- Upstream stores null image textures and `null_image_views` in `TextureCacheRuntime`; ruzu's OpenGL port does not yet thread a runtime object through `TextureCache`, so the same handles currently live directly in `TextureCache`. The GL object creation order, R8 formats, zero swizzle, and `Shader::TextureType` mapping match upstream `TextureCacheRuntime::TextureCacheRuntime`.
+- `ImageView` now initializes its per-texture-type `views` array from the shared null image view table, matching upstream `views{runtime.null_image_views}`. Because Rust stores raw `u32` handles rather than upstream `OGLTextureView` RAII objects, owned per-view handles are tracked separately in `owned_views` so shared null handles are not deleted from each `ImageView::drop`.
+
+### Unintentional differences (to fix)
+- Null image ownership still belongs conceptually to `TextureCacheRuntime`; move the new fields back into a runtime object once ruzu wires upstream runtime ownership through the texture cache.
+- Debug object labels for null image views are not ported because ruzu's current `Device` wrapper does not expose the upstream `HasDebuggingToolAttached()` label path here.
+
+### Missing items
+- Broader `TextureCacheRuntime` parity remains incomplete: staging-buffer upload/download pools, accelerated upload helpers, image-copy/reinterpret paths, and runtime-owned format conversion are still partial.
+
+### Binary layout verification
+- N/A: GL runtime object creation only. No raw-serialized guest-visible layout is changed.
+
+### Tests
+- `cargo check -p video_core`
+
+## 2026-05-25 — shader_recompiler/src/frontend/translate/floating_point_fused_multiply_add.rs and shader_recompiler/src/frontend/translate/floating_point_multiply.rs vs /home/vricosti/Dev/emulators/zuyu/src/shader_recompiler/frontend/maxwell/translate/impl/floating_point_fused_multiply_add.cpp and /home/vricosti/Dev/emulators/zuyu/src/shader_recompiler/frontend/maxwell/translate/impl/floating_point_multiply.cpp
+
+### Intentional differences
+- Rust uses local `Scale::from_field` and `maxwell_fmz_mode` helpers instead of C++ `BitField<..., enum>` casts. The bit ranges and enum values match upstream exactly.
+- Upstream throws `NotImplementedException` for `FFMA CC`, `FMUL CC`, invalid FMZ, invalid scale, and unsupported scale modifier combinations. Ruzu now uses `panic!` for the same unsupported cases, matching existing shader translator convention.
+- Immediate zero and scale constants are represented as `Value::ImmF32`, matching the IR emitter's Rust immediate model instead of upstream `v.ir.Imm32(...)`.
+
+### Unintentional differences (to fix)
+- None known in this slice. `FFMA`/`FFMA32I` now apply upstream FMZ select semantics, and `FMUL`/`FMUL32I` now apply upstream scale, CC rejection, FpControl, and FMZ select semantics.
+
+### Missing items
+- No remaining missing items identified in these two instruction helpers. Broader floating-point translator parity still has unrelated files to audit, especially half-float and conversion helpers already documented elsewhere.
+
+### Binary layout verification
+- N/A: shader IR generation only. No guest-visible raw payload layout changed.
+
+### Tests
+- `cargo test -p shader_recompiler fma -- --nocapture`
+- `cargo test -p shader_recompiler fmul -- --nocapture`
+- `cargo check -p shader_recompiler`
+
+## 2026-05-25 — shader_recompiler/src/frontend/structured_control_flow.rs, shader_recompiler/src/pipeline_cache.rs, and shader_recompiler/src/backend/glsl/emit_glsl.rs vs /home/vricosti/Dev/emulators/zuyu/src/shader_recompiler/frontend/maxwell/structured_control_flow.cpp, /home/vricosti/Dev/emulators/zuyu/src/shader_recompiler/frontend/ir/ir_emitter.cpp, and /home/vricosti/Dev/emulators/zuyu/src/shader_recompiler/backend/glsl/emit_glsl_bitwise_conversion.cpp
+
+### Intentional differences
+- Upstream builds statement expressions and emits `ir.ConditionRef(VisitExpr(...))` directly while visiting `StatementType::If`, `StatementType::Loop`, and `StatementType::Break`. Ruzu's current CFG structurer still emits placeholder syntax conditions first, then `pipeline_cache.rs` materializes simple CFG predicate conditions into the matching IR header block and patches the syntax node. This preserves behavior for predicate branch conditions without yet porting the full upstream statement-expression tree.
+- GLSL `Opcode::ConditionRef` now follows upstream `EmitConditionRef`: it forces a real `bool` variable for syntax-node conditions, adds a synthetic use because syntax conditions are not consumed by the normal instruction-use walk, and applies the GL bool-reference workaround suffix when the profile requests it.
+
+### Unintentional differences (to fix)
+- Ruzu currently materializes only simple `CfgBlock::cond` predicate and negated-predicate conditions. Upstream supports full statement expressions through `Expr::Identity`, `Expr::Not`, `Expr::Or`, goto variables, and indirect branch conditions.
+- The Rust structurer remains a simplified flat-CFG adaptation. It does not yet match upstream's full `structured_control_flow.cpp` statement tree, label/goto handling, loop restructuring, and break/continue expression emission.
+
+### Missing items
+- Full port of upstream `structured_control_flow.cpp` statement-expression machinery and `VisitExpr`.
+- Full support for compound condition expressions beyond predicate and negated predicate materialization.
+
+### Binary layout verification
+- N/A: compiler IR and generated GLSL only. No guest-visible raw payload layout changed.
+
+### Tests
+- `cargo check -p shader_recompiler`
+- `cargo test -p shader_recompiler cfg_translation_materializes_conditional_branch_predicate -- --nocapture`
+- `cargo test -p shader_recompiler compile_shader_glsl -- --nocapture`
+- `cargo build --release --bin ruzu-cmd`
+
+## 2026-05-25 — shader_recompiler/src/frontend/translate/floating_point_fused_multiply_add.rs, shader_recompiler/src/frontend/translate/floating_point_multiply.rs, shader_recompiler/src/backend/glsl/emit_glsl.rs, and shader_recompiler/src/backend/glsl/glsl_emit_context.rs vs /home/vricosti/Dev/emulators/zuyu/src/shader_recompiler/frontend/maxwell/translate/impl/floating_point_fused_multiply_add.cpp, /home/vricosti/Dev/emulators/zuyu/src/shader_recompiler/frontend/maxwell/translate/impl/floating_point_multiply.cpp, /home/vricosti/Dev/emulators/zuyu/src/shader_recompiler/backend/glsl/emit_glsl_floating_point.cpp, and /home/vricosti/Dev/emulators/zuyu/src/shader_recompiler/backend/glsl/emit_glsl.cpp
+
+### Intentional differences
+- FFMA and FMUL now thread `FpControl { no_contraction: true, rounding, fmz_mode }` into the IR, matching upstream's use of `IR::FpControl` for these Maxwell instructions.
+- GLSL emission now allocates `PrecF32`/`PrecF64` variables for FP add/mul/fma instructions whose `FpControl.no_contraction` flag is set, and declares those variables with the `precise` qualifier unless the fragment-stage `has_gl_precise_bug` profile flag disables it. This matches upstream `EmitFPAdd*`, `EmitFPMul*`, `EmitFPFma*`, `IsPreciseType`, and `DefineVariables`.
+- `FFMA32I` uses `FpRounding::RN` with `no_contraction=true`, matching upstream's immediate variant.
+
+### Unintentional differences (to fix)
+- Upstream implements FMZ behavior for FFMA/FMUL by selecting zero or the addend when either multiply operand is zero. Ruzu now carries the upstream `FpControl.fmz_mode`, but the instruction-level FMZ select logic is still missing.
+- Upstream FMUL supports scale modifiers and rejects unsupported scale/non-RN combinations. Ruzu still ignores the FMUL scale field.
+- Upstream throws for FFMA/FMUL condition-code writes (`cc`). Ruzu still silently ignores the `cc` bit in these translators.
+
+### Missing items
+- Port FFMA/FMUL FMZ select behavior.
+- Port FMUL scale handling.
+- Port or explicitly reject FFMA/FMUL condition-code writes.
+
+### Binary layout verification
+- N/A: compiler IR flags and generated GLSL only. No guest-visible raw payload layout changed.
+
+### Tests
+- `cargo check -p shader_recompiler`
+- `cargo test -p shader_recompiler glsl_precise_float_ops_use_precise_variables -- --nocapture`
+- `cargo build --release --bin ruzu-cmd`
+- Runtime MK8D diagnostic with `RUZU_DUMP_GLSL_FINAL=1`: generated 8 GLSL files, `if(true)` count stayed 0, and `precise float` count became 43 with no shader/GL errors in the log.
+
+## 2026-05-25 — video_core/src/buffer_cache/buffer_cache.rs and video_core/src/renderer_opengl/gl_buffer_cache.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/buffer_cache/buffer_cache.h and /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_buffer_cache.cpp
+
+### Intentional differences
+- Ruzu's current OpenGL draw adapter reports every vertex-buffer dirty on every draw because the live Maxwell dirty flag ownership is still being ported. Under that current model, `bind_host_vertex_buffers` now builds the full vertex-buffer binding range and includes `NULL_BUFFER_ID` entries so OpenGL slots are explicitly rebound to zero, matching the upstream effect when all `Dirty::VertexBuffer0 + index` flags are set.
+- `BufferCacheRuntime::bind_vertex_buffers` now clamps the GL bind count to `max_attributes - min_index`, matching upstream `BufferCacheRuntime::BindVertexBuffers`.
+
+### Unintentional differences (to fix)
+- Upstream computes the host binding range from the actual Maxwell dirty flags and clears each `Dirty::VertexBuffer0 + index` as it consumes it. Ruzu still forces all vertex buffers dirty via `DrawStateEngineAdapter`, so this slice deliberately chooses the full-range equivalent rather than the final dirty-range implementation.
+- Upstream stores `Buffer*` in `HostBindings`; ruzu carries `BufferId` plus a parallel backend-handle slice because the backend buffer object is separated from the generic cache metadata.
+
+### Missing items
+- Replace `DrawStateEngineAdapter`'s unconditional dirty flags with real live Maxwell dirty-flag reads and clears.
+- Once real dirty flags are wired, shrink `bind_host_vertex_buffers` from full-range binding to upstream's exact dirty min/max range.
+- Add backend-independent unit coverage for `HostBindings` range construction once the dirty flag source is not a temporary all-dirty adapter.
+
+### Binary layout verification
+- N/A: host OpenGL buffer binding state only. No guest-visible raw payload layout changed.
+
+### Tests
+- `cargo check -p video_core`
+- `cargo build --release --bin ruzu-cmd`
+- Manual apitrace check: `/tmp/ruzu_nulltex.trace` now starts with upstream-like null R8 texture/view creation and retraces the last MK8D snapshot at 1280x720 instead of the prior 1920x1080 black-padded output. The title image remains mostly grayscale, so this fixes null-view/default-state parity but not the remaining texture-colour issue.
+
+## 2026-05-25 — video_core/src/texture_cache/texture_cache.rs + video_core/src/texture_cache/texture_cache_base.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/texture_cache.h
+
+### Intentional differences
+- `TextureCacheBase::insert_image` still uses `cpu_addr = gpu_addr` because ruzu's current texture-cache base does not own the channel `Tegra::MemoryManager` needed for upstream `gpu_memory->GpuToCpuAddress(gpu_addr)`. This is existing Rust plumbing; the change keeps registration and write-tracking behavior in the upstream owner while preserving the current address bridge.
+- `TextureCacheBase::register_image` creates a dense `ImageMapView` when the image does not already have one. Upstream always creates this mapping inside `RegisterImage`; ruzu also supports pre-created mappings from render-target/present helper paths, so the Rust method reuses an existing map when present and creates one only for the upstream insert-image path.
+
+### Unintentional differences (to fix)
+- `TextureCacheBase::insert_image` still does not implement upstream `JoinImages`, image allocation table insertion, overlap alias handling, sparse-page registration, or LRU insertion. The new behavior only closes the dense image registration gap required for CPU write invalidation.
+- `TextureCacheBase::write_memory` now matches upstream's `CpuModified` + `UntrackImage` side effect, but full parity still depends on real CPU addresses from `GpuToCpuAddress`; using GPU address as the CPU key remains a known bridge limitation.
+
+### Missing items
+- Upstream `FindImage` region/compatibility search and relaxed options are still partial; ruzu's current path mostly performs exact-address matching.
+- Upstream `JoinImages`, alias synchronization, LRU cache touch/eviction, sparse image map registration, and image allocation table ownership remain incomplete.
+
+### Binary layout verification
+- N/A: texture-cache metadata flags and page-table registration only. No guest-visible raw payload layout is changed.
+
+### Tests
+- `cargo test -p video_core texture_cache::texture_cache::tests::write_memory_marks_registered_image_cpu_modified_and_untracks -- --nocapture`
+- `cargo check -p video_core`
+- `cargo build --release --bin ruzu-cmd`
+
+## 2026-05-25 — video_core/src/texture_cache/image_info.rs + video_core/src/texture_cache/samples_helper.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/image_info.cpp and samples_helper.h
+
+### Intentional differences
+- `samples_helper.rs` still carries a local `MsaaMode` copy because that file already documented this as a temporary Rust dependency break; this slice corrects its discriminants to match upstream `Tegra::Texture::MsaaMode` and adds `from_raw` for TIC decoding.
+- `ImageInfo::from_tic_entry` still defaults invalid `msaa_mode` bits to `Msaa1x1` instead of asserting. Upstream asserts on invalid enum values through `NumSamples`; ruzu keeps the existing malformed-descriptor tolerance used elsewhere in the TIC path.
+- `forced_flushed` / `dma_downloaded` remain defaulted because `Settings::values.use_reactive_flushing` is still not threaded into this constructor.
+
+### Unintentional differences (to fix)
+- `ImageInfo::from_tic_entry` now ports upstream MSAA sample expansion, `tile_width_spacing`, `CalculateLayerStride`, `CalculateLayerSize`, rescaleable filtering, and downscaleable assignment. No known unintentional difference remains in this slice beyond the settings bridge above.
+- The broader texture-cache path still lacks upstream `TryFindBase` / subresource lookup; even with correct `layer_stride`, `create_image_view` currently falls back to `base.layer = 0` for views.
+
+### Missing items
+- Replace duplicated `samples_helper::MsaaMode` with the canonical `textures::texture::MsaaMode` once the module dependency can be untangled without moving upstream-owned helper logic.
+- Wire `Settings::values.use_reactive_flushing` equivalent into `ImageInfo::from_tic_entry` for `forced_flushed` / `dma_downloaded` parity.
+- Port real `ImageBase::TryFindBase` usage in `TextureCacheBase::create_image_view` so base-layer and mip-offset resolution can consume the newly-correct `layer_stride` metadata.
+
+### Binary layout verification
+- N/A: this changes decoded texture-cache metadata only. `TICEntry` raw layout is unchanged.
+
+### Tests
+- `cargo test -p video_core texture_cache::image_info::tests::tic_entry_decodes_mips_msaa_and_layer_stride -- --nocapture`
+- `cargo test -p video_core texture_cache::samples_helper -- --nocapture`
+- `cargo check -p video_core`
+
+## 2026-05-25 — video_core/src/texture_cache/texture_cache.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/texture_cache.h and /home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/image_base.cpp
+
+### Intentional differences
+- `TextureCacheBase::create_image_view` now consumes `ImageBase::try_find_base(descriptor.address())` and passes the resolved `base.layer` to `ImageViewInfo::from_tic_entry`, matching upstream `TextureCache<P>::CreateImageView` after `FindOrInsertImage`.
+- If `try_find_base` fails, ruzu returns `NULL_IMAGE_VIEW_ID` instead of panicking on upstream's `.value()`. This preserves the emulator's existing malformed-descriptor tolerance while keeping the successful path upstream-faithful.
+- The base image address is still computed as `descriptor.address() - base_layer * info.layer_stride`, matching upstream's `image_gpu_addr` calculation. This relies on the newly ported `ImageInfo::from_tic_entry` layer-stride decode.
+
+### Unintentional differences (to fix)
+- `FindOrInsertImage` remains materially simpler than upstream: compatibility search, relaxed options, alias joins, image allocation table insertion, sparse image behavior, and LRU interactions are still incomplete.
+- `create_image_view` directly creates and inserts `ImageViewBase` instead of routing through a complete `FindOrEmplaceImageView` helper. The observable view lookup/insert side effect now matches upstream for this slice, but the helper boundary is still not structurally identical.
+
+### Missing items
+- Full upstream `FindOrEmplaceImageView` ownership and helper structure.
+- Full upstream `FindOrInsertImage` alias/overlap/lifetime machinery.
+- Proper `GpuToCpuAddress` bridge remains missing for image registration outside render-target paths, as documented in the previous texture-cache entry.
+
+### Binary layout verification
+- N/A: this changes texture-cache metadata lookup and image-view ownership only. No raw guest-visible payload layout is changed.
+
+### Tests
+- `cargo test -p video_core texture_cache::texture_cache::tests::create_image_view_uses_try_find_base_layer -- --nocapture`
+- `cargo check -p video_core`
+
+## 2026-05-25 — audio_core/src/renderer/command/effect/aux_.rs vs /home/vricosti/Dev/emulators/zuyu/src/audio_core/renderer/command/effect/aux_.cpp and aux_.h
+
+### Intentional differences
+- The disabled AUX branch now matches upstream `AuxCommand::Process`: both AUX info blocks are reset, and the mix buffer copy is skipped when `input == output`. The previous Rust path always called `copy_mix_buffer`, which was harmless for equal channels but diverged from upstream control flow.
+- `RUZU_PROFILE_AUX_DSP=1` adds env-gated counters for process calls, full/partial guest buffer reads and writes, and AUX info write failures. This is diagnostic-only and does not change behavior when unset.
+- `write_aux_info` return values are explicitly ignored with `let _ =` at call sites. Upstream writes through mapped memory and does not expose a Rust `bool`; ruzu's guest-memory bridge can fail, so the env-gated profiler records failures without changing the upstream command result.
+
+### Unintentional differences (to fix)
+- `write_aux_buffer` / `read_aux_buffer` still use ruzu's Rust guest-memory bridge and defensive early returns. Upstream command processing assumes valid mapped buffers after renderer validation.
+- `verify_aux_command` remains a trivial `true`, matching the current Rust file but not a full audit of all upstream command verifier expectations.
+
+### Missing items
+- No missing AUX command processing item identified in this slice. Broader audio command-list verifier parity remains outside this file.
+
+### Binary layout verification
+- PASS: `AuxPayload` layout was not changed. The new counters are file-local statics and no guest-visible payload fields moved.
+
+### Tests
+- `cargo check -p audio_core`
+- Runtime MK8D diagnostic: `RUZU_PROFILE_AUX_DSP=1` showed full 240-sample AUX reads/writes and no AUX info write failures across repeated calls.
+
+## 2026-05-25 — video_core/src/renderer_opengl/gl_texture_cache.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_texture_cache.cpp, gl_texture_cache.h, and /home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/texture_cache.h
+
+### Intentional differences
+- Backend `ImageView` now stores the parent `ImageId` and original parent GL texture handle it was materialized from. Upstream stores backend image views directly in `slot_image_views`, so the backend view and `ImageViewBase` cannot diverge by construction. Ruzu currently splits backend `HashMap<ImageViewId, ImageView>` storage from base `slot_image_views`, so this guard restores the upstream invariant explicitly.
+- When a backend `ImageView` no longer matches the current `ImageViewBase` parent image or parent GL handle, ruzu drops and recreates the backend view. The associated cached FBO for the same `view_id` is also removed, matching upstream `RemoveFramebuffers` semantics when image views are removed or replaced.
+- `ImageView::new()` now funnels through `with_null_views`, preserving the null-view initialization path added in the earlier null-image parity slice.
+
+### Unintentional differences (to fix)
+- Upstream does not need a `matches_base_image` guard because slot ownership is unified. This remains a Rust split-storage compensation until `slot_image_views` owns backend `ImageView` objects directly like upstream.
+- Ruzu still has simplified framebuffer ownership: upstream framebuffers are keyed by full render-target tuples and removed by scanning dependencies in `RemoveFramebuffers`; ruzu's current OpenGL cache mostly uses a single `view_id` key for these helper paths.
+
+### Missing items
+- Full upstream `RemoveFramebuffers(std::span<const ImageViewId>)` dependency scanning across multi-attachment framebuffers.
+- Structural unification of backend `ImageView` storage with `TextureCacheBase::slot_image_views`, which would remove the need for this guard.
+
+### Binary layout verification
+- N/A: GL backend cache metadata only. No guest-visible raw layout changed.
+
+### Tests
+- `cargo test -p video_core image_view_parent_guard_rejects_stale_backend_view -- --nocapture`
+- `cargo check -p video_core`
+- Runtime MK8D diagnostic: `RUZU_TRACE_PRESENT_HANDLES=1 RUZU_DUMP_PRESENT_TEXTURE=1` now reports present display views whose `original_texture` matches the current backend parent handle; visual output remains white/dark, so the remaining issue is upstream of present-view selection.
+
+## 2026-05-25 — video_core/src/renderer_opengl/gl_shader_cache.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_shader_cache.cpp and /home/vricosti/Dev/emulators/zuyu/src/shader_recompiler/backend/glsl/glsl_emit_context.cpp
+
+### Intentional differences
+- Added an OpenGL-specific shader profile helper in `gl_shader_cache.rs` and routed all OpenGL GLSL compilation paths through it. This matches upstream `ShaderCache` ownership: GL backend profile policy lives in `renderer_opengl/gl_shader_cache.cpp`, not in the generic shader recompiler default profile.
+- The profile now sets `lower_left_origin_mode`, `need_declared_frag_colors`, `ignore_nan_fp_comparisons`, and `max_user_clip_distances` to the upstream OpenGL values. This restores the upstream GLSL behavior where fragment outputs are declared for every render target even when the shader does not explicitly write them.
+- `has_gl_precise_bug` remains `false` because ruzu does not yet pass an OpenGL `Device` capability object into `ShaderCache`. Upstream derives this from `device.HasPreciseBug()`.
+
+### Unintentional differences (to fix)
+- The full upstream OpenGL profile still depends on `Device` capability queries (`HasNvViewportArray2`, `HasImageLoadFormatted`, `NeedsFastmathOff`, `IsAmd`, `HasComponentIndexingBug`, etc.). Ruzu currently uses `ShaderProfile::default()` for those fields.
+
+### Missing items
+- Port the OpenGL `Device` capability table into ruzu's `ShaderCache` profile construction.
+
+### Binary layout verification
+- N/A: shader-profile policy and generated GLSL source only. No guest-visible raw payload layout changed.
+
+### Tests
+- `cargo test -p video_core opengl_fragment_profile_declares_all_frag_colors -- --nocapture`
+- `cargo check -p video_core`
+
+## 2026-05-25 — shader_recompiler/src/runtime_info.rs and shader_recompiler/src/backend/glsl/glsl_emit_context.rs vs /home/vricosti/Dev/emulators/zuyu/src/shader_recompiler/runtime_info.h and /home/vricosti/Dev/emulators/zuyu/src/shader_recompiler/backend/glsl/glsl_emit_context.cpp
+
+### Intentional differences
+- Added `RuntimeInfo::frag_color_types: [AttributeType; 8]`, matching upstream `RuntimeInfo::frag_color_types`.
+- GLSL fragment output declarations now select `vec4`, `uvec4`, or `ivec4` from `runtime_info.frag_color_types[index]`, matching upstream `EmitContext` output declaration logic.
+- The new field uses Rust array `Default`, so all render targets default to `AttributeType::Float`, matching upstream value-initialized `std::array<AttributeType, 8>`.
+
+### Unintentional differences (to fix)
+- Ruzu's OpenGL path does not yet populate non-float `frag_color_types` from render-target formats. Upstream currently populates this in the Vulkan pipeline cache; the OpenGL path defaults to float unless future backend-specific state wires it.
+- Related GLSL get/set paths for fragment color payload typing may still differ from upstream files `emit_glsl_context_get_set.cpp`; this slice only ports declaration typing.
+
+### Missing items
+- Audit and port `emit_glsl_context_get_set.cpp` fragment color typed get/set behavior if ruzu's current GLSL backend starts using integer color outputs beyond declarations.
+
+### Binary layout verification
+- N/A: compiler runtime metadata only. No guest-visible raw payload layout changed.
+
+### Tests
+- `cargo test -p shader_recompiler test_compile_shader_glsl_uses_fragment_color_types -- --nocapture`
+- `cargo check -p shader_recompiler`
+
+## 2026-05-25 — video_core/src/renderer_opengl/gl_rasterizer.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_rasterizer.cpp
+
+### Intentional differences
+- Ruzu still routes several upstream `SyncState()` sub-steps through one Rust helper because `RasterizerOpenGL` receives a `Maxwell3DDrawView` instead of owning a live `Maxwell3D*` reference. The ordering is kept closer to upstream by ensuring the viewport dirty guard only gates viewport/depth-range updates, not the later scissor, color-mask, blend, depth/stencil, rasterizer, and framebuffer-sRGB synchronization.
+
+### Unintentional differences (to fix)
+- Upstream has separate dirty-flag guarded methods (`SyncViewport`, `SyncColorMask`, `SyncBlendState`, `SyncScissorTest`, etc.) and clears Maxwell dirty flags inside each method. Ruzu still snapshots dirty flags through `Maxwell3DDrawView` and does not yet have per-method dirty clearing in the rasterizer.
+- Ruzu still applies scissor, color mask, blend, depth/stencil, and rasterizer state more broadly than upstream's per-flag guards. This is safer than stale state for now, but not the final upstream structure.
+
+### Missing items
+- Split the combined Rust state sync into upstream-owned helpers and route Maxwell dirty-flag clearing through the long-term live `Maxwell3D` access model.
+- Complete the remaining `SyncState()` parity audit for logic-op, primitive restart, multisample, point/line state, polygon offset, alpha test, and vertex instance dirty guards.
+
+### Binary layout verification
+- N/A: OpenGL host state only. No guest-visible raw payload layout changed.
+
+### Tests
+- `cargo check -p video_core`

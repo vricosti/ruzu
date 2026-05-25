@@ -9,7 +9,7 @@ use crate::ir;
 use crate::ir::instruction::Inst;
 use crate::ir::opcodes::Opcode;
 use crate::ir::program::SyntaxNode;
-use crate::ir::types::Type;
+use crate::ir::types::{FpControl, Type};
 use crate::ir::value::{InstRef, Value};
 
 use super::emit_glsl_context_get_set;
@@ -83,7 +83,7 @@ fn emit_inst(ctx: &mut EmitContext, program: &mut ir::Program, inst_ref: InstRef
             program,
             inst_ref,
             &inst_snapshot,
-            GlslVarType::F32,
+            precise_type(&inst_snapshot, GlslVarType::F32, GlslVarType::PrecF32),
             "+",
         ),
         Opcode::FPMul32 => emit_binary(
@@ -91,7 +91,7 @@ fn emit_inst(ctx: &mut EmitContext, program: &mut ir::Program, inst_ref: InstRef
             program,
             inst_ref,
             &inst_snapshot,
-            GlslVarType::F32,
+            precise_type(&inst_snapshot, GlslVarType::F32, GlslVarType::PrecF32),
             "*",
         ),
         Opcode::FPFma32 => emit_ternary_call(
@@ -99,7 +99,7 @@ fn emit_inst(ctx: &mut EmitContext, program: &mut ir::Program, inst_ref: InstRef
             program,
             inst_ref,
             &inst_snapshot,
-            GlslVarType::F32,
+            precise_type(&inst_snapshot, GlslVarType::F32, GlslVarType::PrecF32),
             "fma",
         ),
         Opcode::FPMax32 => emit_binary_call(
@@ -625,14 +625,28 @@ fn emit_inst(ctx: &mut EmitContext, program: &mut ir::Program, inst_ref: InstRef
         // ── FP64 arithmetic ────────────────────────────────────────────
         // Ports of upstream `EmitFP*64` from
         // `backend/glsl/emit_glsl_floating_point.cpp`.
-        Opcode::FPAdd64 => emit_binary(ctx, program, inst_ref, &inst_snapshot, GlslVarType::F64, "+"),
-        Opcode::FPMul64 => emit_binary(ctx, program, inst_ref, &inst_snapshot, GlslVarType::F64, "*"),
+        Opcode::FPAdd64 => emit_binary(
+            ctx,
+            program,
+            inst_ref,
+            &inst_snapshot,
+            precise_type(&inst_snapshot, GlslVarType::F64, GlslVarType::PrecF64),
+            "+",
+        ),
+        Opcode::FPMul64 => emit_binary(
+            ctx,
+            program,
+            inst_ref,
+            &inst_snapshot,
+            precise_type(&inst_snapshot, GlslVarType::F64, GlslVarType::PrecF64),
+            "*",
+        ),
         Opcode::FPFma64 => emit_ternary_call(
             ctx,
             program,
             inst_ref,
             &inst_snapshot,
-            GlslVarType::F64,
+            precise_type(&inst_snapshot, GlslVarType::F64, GlslVarType::PrecF64),
             "fma",
         ),
         Opcode::FPMax64 => emit_binary_call(
@@ -2009,14 +2023,33 @@ fn emit_inst(ctx: &mut EmitContext, program: &mut ir::Program, inst_ref: InstRef
         // `Branch`/`BranchConditional`/`Return`/`Join`/`SelectionMerge`/
         // `LoopMerge`/`Unreachable` come from the SPIR-V structurer and
         // are consumed at structure-CFG time, not emitted as text.
+        Opcode::ConditionRef => {
+            // Upstream `EmitConditionRef` forces a real boolean variable for
+            // structured control-flow conditions. Syntax-node conditions are
+            // not counted by the normal instruction-use walk, so add one
+            // synthetic use before defining the result.
+            let ret = {
+                let inst = program.block_mut(inst_ref.block).inst_mut(inst_ref.inst);
+                inst.use_count = inst.use_count.saturating_add(1);
+                ctx.var_alloc.add_define(inst, GlslVarType::U1)
+            };
+            let input = ctx.var_alloc.consume(program, &inst_snapshot.args[0]);
+            let suffix = if ctx.profile.has_gl_bool_ref_bug {
+                "?true:false"
+            } else {
+                ""
+            };
+            if !ret.is_empty() && ret != input {
+                ctx.add_fmt(format!("{}={}{};", ret, input, suffix));
+            }
+        }
         Opcode::Branch
         | Opcode::BranchConditional
         | Opcode::Return
         | Opcode::Join
         | Opcode::SelectionMerge
         | Opcode::LoopMerge
-        | Opcode::Unreachable
-        | Opcode::ConditionRef => {
+        | Opcode::Unreachable => {
             // No GLSL emission — the structurer produces if/else/while/
             // break statements directly. Reaching the dispatcher means
             // the structurer didn't consume the instruction.
@@ -2223,14 +2256,27 @@ fn add_assign(
     ctx.add_fmt(format!("{}={};", dst, expr));
 }
 
+fn precise_type(inst: &Inst, normal: GlslVarType, precise: GlslVarType) -> GlslVarType {
+    if FpControl::from_u32(inst.flags).no_contraction {
+        precise
+    } else {
+        normal
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use crate::backend::bindings::Bindings;
+    use crate::backend::glsl::emit_glsl;
     use crate::ir::basic_block::Block;
+    use crate::ir::emitter::Emitter;
     use crate::ir::instruction::Inst;
     use crate::ir::opcodes::Opcode;
     use crate::ir::program::Program;
-    use crate::ir::types::{ShaderStage, Type};
-    use crate::ir::value::{InstRef, Value};
+    use crate::ir::types::{FpControl, ShaderStage, Type};
+    use crate::ir::value::{Attribute, InstRef, Value};
+    use crate::profile::Profile;
+    use crate::runtime_info::RuntimeInfo;
 
     use super::{precolor, recompute_emit_use_counts};
 
@@ -2278,6 +2324,37 @@ mod tests {
         assert_eq!(program.block(0).inst(src1).use_count, 1);
         assert_eq!(program.block(1).inst(phi0).use_count, 2);
         assert_eq!(program.block(1).inst(phi1).use_count, 2);
+    }
+
+    #[test]
+    fn glsl_precise_float_ops_use_precise_variables() {
+        let mut program = Program::new(ShaderStage::VertexB);
+        program.blocks.push(Block::new());
+        {
+            let mut emitter = Emitter::new(&mut program, 0);
+            let value = emitter.fp_fma_32_with_control(
+                Value::ImmF32(1.0),
+                Value::ImmF32(2.0),
+                Value::ImmF32(3.0),
+                FpControl {
+                    no_contraction: true,
+                    ..FpControl::default()
+                },
+            );
+            emitter.set_attribute(Attribute::generic(0, 0), value, Value::ImmU32(0));
+        }
+
+        let mut bindings = Bindings::default();
+        let source = emit_glsl(
+            &Profile::default(),
+            &RuntimeInfo::default(),
+            &mut program,
+            &mut bindings,
+        );
+
+        assert!(source.contains("precise float pf_0=float(0);"));
+        assert!(source.contains("pf_0=fma(1.f,2.f,3.f);"));
+        assert!(source.contains("out_attr0.x=pf_0;"));
     }
 }
 

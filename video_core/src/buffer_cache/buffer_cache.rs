@@ -1579,9 +1579,6 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
             })
             .collect();
 
-        let mut host_bindings = HostBindings::default();
-        let mut gpu_handles = Vec::new();
-        let mut any_valid = false;
         for (index, binding) in bindings.iter().enumerate() {
             if !binding.buffer_id.is_valid() || binding.buffer_id == NULL_BUFFER_ID {
                 continue;
@@ -1597,16 +1594,19 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
             }
             self.touch_buffer(binding.buffer_id);
             self.synchronize_buffer(binding.buffer_id, binding.device_addr, binding.size);
-
-            host_bindings.min_index = host_bindings.min_index.min(index as u32);
-            host_bindings.max_index = host_bindings.max_index.max(index as u32);
-            any_valid = true;
-        }
-        if !any_valid {
-            return;
         }
 
-        for index in host_bindings.min_index as usize..=host_bindings.max_index as usize {
+        let mut host_bindings = HostBindings {
+            min_index: 0,
+            max_index: NUM_VERTEX_BUFFERS,
+            ..HostBindings::default()
+        };
+        let mut gpu_handles = Vec::new();
+
+        // The current OpenGL draw adapter reports every vertex-buffer dirty on
+        // every draw, so the upstream-equivalent host binding range is the full
+        // vertex-buffer table. Include NULL bindings to clear stale GL slots.
+        for index in 0..NUM_VERTEX_BUFFERS as usize {
             let binding = &bindings[index];
             if !binding.buffer_id.is_valid() || binding.buffer_id == NULL_BUFFER_ID {
                 host_bindings.buffer_ids.push(NULL_BUFFER_ID);

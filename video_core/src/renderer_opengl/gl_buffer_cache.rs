@@ -438,7 +438,9 @@ impl base::BufferCacheRuntime for BufferCacheRuntime {
     /// Port of upstream `BufferCacheRuntime::BindVertexBuffers`
     /// (`gl_buffer_cache.cpp:242`).
     fn bind_vertex_buffers(&mut self, bindings: &HostBindings, gpu_handles: &[u32]) {
-        let count = gpu_handles.len() as i32;
+        let count = (gpu_handles.len() as u32)
+            .min(self.max_attributes.saturating_sub(bindings.min_index))
+            as i32;
         if count == 0 {
             return;
         }

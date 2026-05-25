@@ -10,7 +10,7 @@ use crate::backend::bindings::Bindings;
 use crate::ir;
 use crate::ir::attribute::Attribute;
 use crate::profile::Profile;
-use crate::runtime_info::RuntimeInfo;
+use crate::runtime_info::{AttributeType, RuntimeInfo};
 use crate::shader_info::{ImageFormat, Interpolation, TextureType};
 use crate::stage::Stage;
 
@@ -462,9 +462,14 @@ impl<'a> EmitContext<'a> {
         }
         for (render_target, &enabled) in program.info.stores_frag_color.iter().enumerate() {
             if enabled || self.profile.need_declared_frag_colors {
+                let type_str = match self.runtime_info.frag_color_types[render_target] {
+                    AttributeType::UnsignedInt => "uvec4",
+                    AttributeType::SignedInt => "ivec4",
+                    _ => "vec4",
+                };
                 self.header.push_str(&format!(
-                    "layout(location={})out vec4 frag_color{};\n",
-                    render_target, render_target
+                    "layout(location={})out {} frag_color{};\n",
+                    render_target, type_str, render_target
                 ));
             }
         }
@@ -523,9 +528,17 @@ impl<'a> EmitContext<'a> {
         ] {
             let tracker = self.var_alloc.get_use_tracker(var_type);
             let type_name = glsl_type_str(var_type);
+            let has_precise_bug =
+                self.stage == Stage::Fragment && self.profile.has_gl_precise_bug;
+            let precise = if !has_precise_bug && is_precise_type(var_type) {
+                "precise "
+            } else {
+                ""
+            };
             if tracker.uses_temp {
                 header.push_str(&format!(
-                    "{} t{}={}(0);\n",
+                    "{}{} t{}={}(0);\n",
+                    precise,
                     type_name,
                     self.var_alloc.representation_indexed(0, var_type),
                     type_name
@@ -533,7 +546,8 @@ impl<'a> EmitContext<'a> {
             }
             for index in 0..tracker.num_used {
                 header.push_str(&format!(
-                    "{} {}={}(0);\n",
+                    "{}{} {}={}(0);\n",
+                    precise,
                     type_name,
                     self.var_alloc
                         .representation_indexed(index as u32, var_type),
@@ -545,6 +559,10 @@ impl<'a> EmitContext<'a> {
             header.push_str(&format!("int loop{}=0x2000;\n", index));
         }
     }
+}
+
+fn is_precise_type(var_type: GlslVarType) -> bool {
+    matches!(var_type, GlslVarType::PrecF32 | GlslVarType::PrecF64)
 }
 
 #[cfg(test)]
