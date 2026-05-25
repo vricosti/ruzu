@@ -22,6 +22,7 @@ use crate::texture_cache::texture_cache_base::{
 };
 use crate::texture_cache::types::{
     ImageId, ImageType, ImageViewId, ImageViewType, Offset2D, Region2D, SubresourceRange,
+    NULL_IMAGE_ID,
 };
 use crate::texture_cache::util::{
     full_download_copies, map_size_bytes, swizzle_image, unswizzle_image,
@@ -907,6 +908,7 @@ pub struct ImageView {
     pub default_handle: u32,
     pub internal_format: u32,
     pub buffer_size: u32,
+    image_id: ImageId,
     format: PixelFormat,
     swizzle: [u8; 4],
     original_texture: u32,
@@ -920,6 +922,7 @@ pub struct ImageView {
     /// descriptor's configured anisotropy (upstream
     /// gl_graphics_pipeline.cpp:490-493).
     supports_anisotropy: bool,
+    owned_views: Vec<u32>,
     /// Lazily-allocated storage-view cache. Upstream uses
     /// `std::unique_ptr<StorageViews>` — same lazy-alloc pattern.
     storage_views: Option<StorageViews>,
@@ -927,11 +930,16 @@ pub struct ImageView {
 
 impl ImageView {
     pub fn new() -> Self {
+        Self::with_null_views([0; NUM_TEXTURE_TYPES])
+    }
+
+    fn with_null_views(null_image_views: [u32; NUM_TEXTURE_TYPES]) -> Self {
         Self {
-            views: [0; NUM_TEXTURE_TYPES],
+            views: null_image_views,
             default_handle: 0,
             internal_format: gl::NONE,
             buffer_size: 0,
+            image_id: NULL_IMAGE_ID,
             format: PixelFormat::Invalid,
             swizzle: [
                 SwizzleSource::R as u8,
@@ -945,6 +953,7 @@ impl ImageView {
             full_range: SubresourceRange::default(),
             is_render_target: false,
             supports_anisotropy: false,
+            owned_views: Vec::new(),
             storage_views: None,
         }
     }
@@ -971,8 +980,13 @@ impl ImageView {
     /// Port of
     /// `ImageView::ImageView(TextureCacheRuntime&, const ImageViewInfo&, ImageId, Image&, ...)`
     /// for the currently ported Color2D render-target path.
-    pub fn new_color_2d(base: &ImageViewBase, image: &Image) -> Self {
-        let mut view = Self::new();
+    pub fn new_color_2d(
+        base: &ImageViewBase,
+        image: &Image,
+        null_image_views: [u32; NUM_TEXTURE_TYPES],
+    ) -> Self {
+        let mut view = Self::with_null_views(null_image_views);
+        view.image_id = base.image_id;
         view.internal_format = present_internal_format(base.format);
         view.format = base.format;
         view.original_texture = image.handle();
@@ -1012,6 +1026,10 @@ impl ImageView {
         self.handle(handle_type as usize)
     }
 
+    fn matches_base_image(&self, base: &ImageViewBase, image: &Image) -> bool {
+        self.image_id == base.image_id && self.original_texture == image.handle()
+    }
+
     /// Port of upstream `ImageView::ImageView(TextureCacheRuntime& runtime,
     /// const ImageViewInfo& info, ImageId image_id_, Image& image,
     /// const SlotVector<Image>&)` (gl_texture_cache.cpp:1101-1196).
@@ -1028,10 +1046,15 @@ impl ImageView {
     /// isn't ported yet, so the simple `MaxwellToGL::GetFormatTuple` branch
     /// is the only one wired up. That matches the path taken when the GL
     /// driver natively supports the format — which covers all of MK8D.
-    pub fn from_image_view_info(base: &ImageViewBase, image: &Image) -> Self {
+    pub fn from_image_view_info(
+        base: &ImageViewBase,
+        image: &Image,
+        null_image_views: [u32; NUM_TEXTURE_TYPES],
+    ) -> Self {
         use crate::texture_cache::types::ImageViewType;
 
-        let mut view = Self::new();
+        let mut view = Self::with_null_views(null_image_views);
+        view.image_id = base.image_id;
         view.internal_format = present_internal_format(base.format);
         view.format = base.format;
         view.swizzle = base.swizzle;
@@ -1111,7 +1134,7 @@ impl ImageView {
         self.views[view_type as usize] = view;
     }
 
-    fn make_view(&self, view_type: TextureType, view_format: u32) -> u32 {
+    fn make_view(&mut self, view_type: TextureType, view_format: u32) -> u32 {
         if self.original_texture == 0 {
             return 0;
         }
@@ -1191,6 +1214,9 @@ impl ImageView {
                     );
                 }
             }
+        }
+        if view != 0 {
+            self.owned_views.push(view);
         }
         view
     }
@@ -1279,7 +1305,7 @@ pub fn present_internal_format(format: PixelFormat) -> u32 {
 impl Drop for ImageView {
     fn drop(&mut self) {
         unsafe {
-            for &view in &self.views {
+            for &view in &self.owned_views {
                 if view != 0 {
                     gl::DeleteTextures(1, &view);
                 }
@@ -1503,6 +1529,8 @@ pub struct TextureCache {
     image_views: HashMap<ImageViewId, ImageView>,
     samplers: HashMap<crate::texture_cache::types::SamplerId, Sampler>,
     framebuffers: HashMap<ImageViewId, TextureCacheFramebuffer>,
+    null_image_handles: [u32; 7],
+    null_image_views: [u32; NUM_TEXTURE_TYPES],
 }
 
 /// OpenGL backend result of `TextureCache<P>::TryFindFramebufferImageView`.
@@ -1514,6 +1542,78 @@ pub struct FramebufferImageViewOpenGL {
     pub scaled: bool,
 }
 
+fn create_null_image_views() -> ([u32; 7], [u32; NUM_TEXTURE_TYPES]) {
+    let mut handles = [0u32; 7];
+    let mut views = [0u32; NUM_TEXTURE_TYPES];
+    unsafe {
+        gl::CreateTextures(gl::TEXTURE_1D_ARRAY, 1, &mut handles[0]);
+        gl::CreateTextures(gl::TEXTURE_CUBE_MAP_ARRAY, 1, &mut handles[1]);
+        gl::CreateTextures(gl::TEXTURE_3D, 1, &mut handles[2]);
+        if handles[0] != 0 {
+            gl::TextureStorage2D(handles[0], 1, gl::R8, 1, 1);
+        }
+        if handles[1] != 0 {
+            gl::TextureStorage3D(handles[1], 1, gl::R8, 1, 1, 6);
+        }
+        if handles[2] != 0 {
+            gl::TextureStorage3D(handles[2], 1, gl::R8, 1, 1, 1);
+        }
+
+        gl::GenTextures(4, handles[3..].as_mut_ptr());
+        if handles[3] != 0 && handles[0] != 0 {
+            gl::TextureView(handles[3], gl::TEXTURE_1D, handles[0], gl::R8, 0, 1, 0, 1);
+        }
+        if handles[4] != 0 && handles[1] != 0 {
+            gl::TextureView(handles[4], gl::TEXTURE_2D, handles[1], gl::R8, 0, 1, 0, 1);
+        }
+        if handles[5] != 0 && handles[1] != 0 {
+            gl::TextureView(
+                handles[5],
+                gl::TEXTURE_2D_ARRAY,
+                handles[1],
+                gl::R8,
+                0,
+                1,
+                0,
+                1,
+            );
+        }
+        if handles[6] != 0 && handles[1] != 0 {
+            gl::TextureView(
+                handles[6],
+                gl::TEXTURE_CUBE_MAP,
+                handles[1],
+                gl::R8,
+                0,
+                1,
+                0,
+                6,
+            );
+        }
+
+        let zero_swizzle = [gl::ZERO as i32; 4];
+        for &handle in &handles {
+            if handle != 0 {
+                gl::TextureParameteriv(
+                    handle,
+                    gl::TEXTURE_SWIZZLE_RGBA,
+                    zero_swizzle.as_ptr(),
+                );
+            }
+        }
+    }
+
+    views[TextureType::Color1D as usize] = handles[3];
+    views[TextureType::Color2D as usize] = handles[4];
+    views[TextureType::ColorCube as usize] = handles[6];
+    views[TextureType::Color3D as usize] = handles[2];
+    views[TextureType::ColorArray1D as usize] = handles[0];
+    views[TextureType::ColorArray2D as usize] = handles[5];
+    views[TextureType::ColorArrayCube as usize] = handles[1];
+    views[TextureType::Color2DRect as usize] = handles[4];
+    (handles, views)
+}
+
 impl TextureCache {
     /// Port of `OpenGL::TextureCache::TextureCache(Runtime&, MaxwellDeviceMemoryManager&)`.
     /// `device_memory` is the shared `Arc` from `Host1x::memory_manager()`.
@@ -1522,12 +1622,15 @@ impl TextureCache {
             crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager,
         >,
     ) -> Self {
+        let (null_image_handles, null_image_views) = create_null_image_views();
         Self {
             base: CommonTextureCache::new(device_memory),
             images: HashMap::new(),
             image_views: HashMap::new(),
             samplers: HashMap::new(),
             framebuffers: HashMap::new(),
+            null_image_handles,
+            null_image_views,
         }
     }
 
@@ -1812,14 +1915,21 @@ impl TextureCache {
                 // retry without leaving a stale ImageView handle behind.
                 continue;
             }
-            if self.image_views.contains_key(&view_id) {
-                continue;
-            }
             let image_ref = self
                 .images
                 .get(&image_id)
                 .expect("image inserted above must be present");
-            let backend_view = ImageView::from_image_view_info(&view_base, image_ref);
+            let view_matches = self
+                .image_views
+                .get(&view_id)
+                .is_some_and(|view| view.matches_base_image(&view_base, image_ref));
+            if view_matches {
+                continue;
+            }
+            self.image_views.remove(&view_id);
+            self.framebuffers.remove(&view_id);
+            let backend_view =
+                ImageView::from_image_view_info(&view_base, image_ref, self.null_image_views);
             self.image_views.insert(view_id, backend_view);
         }
     }
@@ -2146,10 +2256,20 @@ impl TextureCache {
             .images
             .entry(image_id)
             .or_insert_with(|| Image::from_base(&self.base.slot_images[image_id]));
+        if self
+            .image_views
+            .get(&view_id)
+            .is_some_and(|view| !view.matches_base_image(&view_base, backend_image))
+        {
+            self.image_views.remove(&view_id);
+            self.framebuffers.remove(&view_id);
+        }
         let backend_view = self
             .image_views
             .entry(view_id)
-            .or_insert_with(|| ImageView::new_color_2d(&view_base, backend_image));
+            .or_insert_with(|| {
+                ImageView::new_color_2d(&view_base, backend_image, self.null_image_views)
+            });
         let attachment_texture = if view_base.flags.contains(ImageViewFlagBits::SLICE) {
             backend_view.handle_for_texture_type(TextureType::Color3D)
         } else {
@@ -2280,10 +2400,20 @@ impl TextureCache {
         });
         let original_texture = backend_image.handle();
         let current_texture = backend_image.current_texture;
+        if self
+            .image_views
+            .get(&view_id)
+            .is_some_and(|backend_view| !backend_view.matches_base_image(&view, backend_image))
+        {
+            self.image_views.remove(&view_id);
+            self.framebuffers.remove(&view_id);
+        }
         let backend_view = self
             .image_views
             .entry(view_id)
-            .or_insert_with(|| ImageView::from_image_view_info(&view, backend_image));
+            .or_insert_with(|| {
+                ImageView::from_image_view_info(&view, backend_image, self.null_image_views)
+            });
         let display_texture = backend_view.handle_for_texture_type(TextureType::Color2D);
         if display_texture == 0 {
             return None;
@@ -2425,10 +2555,20 @@ impl TextureCache {
             .images
             .entry(image_id)
             .or_insert_with(|| Image::from_base(&image_base));
+        if self
+            .image_views
+            .get(&view_id)
+            .is_some_and(|view| !view.matches_base_image(&view_base, backend_image))
+        {
+            self.image_views.remove(&view_id);
+            self.framebuffers.remove(&view_id);
+        }
         let backend_view = self
             .image_views
             .entry(view_id)
-            .or_insert_with(|| ImageView::new_color_2d(&view_base, backend_image));
+            .or_insert_with(|| {
+                ImageView::new_color_2d(&view_base, backend_image, self.null_image_views)
+            });
         let attachment_texture = if view_base.flags.contains(ImageViewFlagBits::SLICE) {
             backend_view.handle_for_texture_type(TextureType::Color3D)
         } else {
@@ -2662,6 +2802,18 @@ impl TextureCache {
     }
 }
 
+impl Drop for TextureCache {
+    fn drop(&mut self) {
+        unsafe {
+            for &handle in &self.null_image_handles {
+                if handle != 0 {
+                    gl::DeleteTextures(1, &handle);
+                }
+            }
+        }
+    }
+}
+
 impl Default for TextureCache {
     /// Standalone default for tests / fallback paths. Production
     /// construction goes through `RasterizerOpenGL::new`, which threads
@@ -2728,5 +2880,39 @@ mod tests {
             ])
         );
         assert_eq!(decode_swizzle([u8::MAX; 4]), None);
+    }
+
+    #[test]
+    fn image_view_parent_guard_rejects_stale_backend_view() {
+        use crate::texture_cache::format_lookup_table::PixelFormat;
+        use crate::texture_cache::image_info::ImageInfo;
+        use crate::texture_cache::image_view_base::ImageViewBase;
+        use crate::texture_cache::image_view_info::ImageViewInfo;
+        use crate::texture_cache::types::ImageType;
+        use common::slot_vector::SlotId;
+
+        let image_id = SlotId { index: 42 };
+        let image_info = ImageInfo {
+            format: PixelFormat::A8B8G8R8Unorm,
+            image_type: ImageType::E2D,
+            ..ImageInfo::default()
+        };
+        let view_info = ImageViewInfo {
+            format: PixelFormat::A8B8G8R8Unorm,
+            ..ImageViewInfo::default()
+        };
+        let base = ImageViewBase::new(&view_info, &image_info, image_id, 0x1000);
+        let mut image = Image::new();
+        image.current_texture = 7;
+
+        let mut view = ImageView::new();
+        assert!(!view.matches_base_image(&base, &image));
+
+        view.image_id = image_id;
+        view.original_texture = 7;
+        assert!(view.matches_base_image(&base, &image));
+
+        image.current_texture = 8;
+        assert!(!view.matches_base_image(&base, &image));
     }
 }

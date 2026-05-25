@@ -83,11 +83,10 @@ fn structure_region(
                         // Conditional branch
                         if true_target > i {
                             // Forward branch → If/Then
-                            let cond = Value::ImmU1(true);
                             let merge = true_target as u32;
                             syntax.push(SyntaxNode::Block(block_idx));
                             syntax.push(SyntaxNode::If {
-                                cond,
+                                cond: Value::ImmU1(true),
                                 body: (i + 1) as u32,
                                 merge,
                             });
@@ -109,10 +108,9 @@ fn structure_region(
                             i = true_target;
                         } else if true_target < i {
                             // Backward branch → Loop
-                            let cond = Value::ImmU1(true);
                             syntax.push(SyntaxNode::Block(block_idx));
                             syntax.push(SyntaxNode::Repeat {
-                                cond,
+                                cond: Value::ImmU1(true),
                                 loop_header: true_target as u32,
                                 merge: (i + 1) as u32,
                             });

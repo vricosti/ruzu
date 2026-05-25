@@ -735,74 +735,76 @@ fn sync_viewport(
         }
 
         gl::Disable(gl::RASTERIZER_DISCARD);
-        if !dirty_viewport {
-            return;
-        }
-        let force =
-            flags[GlDirty::VIEWPORT_TRANSFORM as usize] || rescale_viewports || tracker_dirty_viewport_transform || tracker_dirty_viewport;
-        if !draw_view.viewport_scale_offset_enabled() {
-            let surface_clip = draw_view.surface_clip();
-            for index in 0..draw_view.viewport_transforms().len() {
-                if !force && !flags[(GlDirty::VIEWPORT_0 as usize) + index] {
-                    continue;
+        if dirty_viewport {
+            let force = flags[GlDirty::VIEWPORT_TRANSFORM as usize]
+                || rescale_viewports
+                || tracker_dirty_viewport_transform
+                || tracker_dirty_viewport;
+            if !draw_view.viewport_scale_offset_enabled() {
+                let surface_clip = draw_view.surface_clip();
+                for index in 0..draw_view.viewport_transforms().len() {
+                    if !force && !flags[(GlDirty::VIEWPORT_0 as usize) + index] {
+                        continue;
+                    }
+                    gl::ViewportIndexedf(
+                        index as u32,
+                        surface_clip.x as f32,
+                        surface_clip.y as f32,
+                        (surface_clip.width as f32).max(1.0),
+                        (surface_clip.height as f32).max(1.0),
+                    );
                 }
-                gl::ViewportIndexedf(
-                    index as u32,
-                    surface_clip.x as f32,
-                    surface_clip.y as f32,
-                    (surface_clip.width as f32).max(1.0),
-                    (surface_clip.height as f32).max(1.0),
-                );
-            }
-        } else {
-            let reduce_z = if draw_view.depth_mode() == DepthMode::MinusOneToOne {
-                1.0
             } else {
-                0.0
-            };
-            for (index, viewport) in draw_view.viewport_transforms().iter().enumerate() {
-                if !force && !flags[(GlDirty::VIEWPORT_0 as usize) + index] {
-                    continue;
-                }
-                let x = viewport.translate_x - viewport.scale_x;
-                let mut y = viewport.translate_y - viewport.scale_y;
-                let width = viewport.scale_x * 2.0;
-                let mut height = viewport.scale_y * 2.0;
-                if height < 0.0 {
-                    y += height;
-                    height = -height;
-                }
-                gl::ViewportIndexedf(
-                    index as u32,
-                    x,
-                    y,
-                    width.max(1.0),
-                    height.max(1.0),
-                );
-                let near_depth = viewport.translate_z as f64 - viewport.scale_z as f64 * reduce_z;
-                let far_depth = viewport.translate_z as f64 + viewport.scale_z as f64;
-                if has_depth_buffer_float {
-                    if let Some(Some(depth_range_indexed)) = GL_DEPTH_RANGE_INDEXEDDNV.get() {
-                        depth_range_indexed(index as u32, near_depth, far_depth);
+                let reduce_z = if draw_view.depth_mode() == DepthMode::MinusOneToOne {
+                    1.0
+                } else {
+                    0.0
+                };
+                for (index, viewport) in draw_view.viewport_transforms().iter().enumerate() {
+                    if !force && !flags[(GlDirty::VIEWPORT_0 as usize) + index] {
+                        continue;
+                    }
+                    let x = viewport.translate_x - viewport.scale_x;
+                    let mut y = viewport.translate_y - viewport.scale_y;
+                    let width = viewport.scale_x * 2.0;
+                    let mut height = viewport.scale_y * 2.0;
+                    if height < 0.0 {
+                        y += height;
+                        height = -height;
+                    }
+                    gl::ViewportIndexedf(
+                        index as u32,
+                        x,
+                        y,
+                        width.max(1.0),
+                        height.max(1.0),
+                    );
+                    let near_depth =
+                        viewport.translate_z as f64 - viewport.scale_z as f64 * reduce_z;
+                    let far_depth = viewport.translate_z as f64 + viewport.scale_z as f64;
+                    if has_depth_buffer_float {
+                        if let Some(Some(depth_range_indexed)) = GL_DEPTH_RANGE_INDEXEDDNV.get() {
+                            depth_range_indexed(index as u32, near_depth, far_depth);
+                        } else {
+                            gl::DepthRangeIndexed(index as u32, near_depth, far_depth);
+                        }
                     } else {
                         gl::DepthRangeIndexed(index as u32, near_depth, far_depth);
                     }
-                } else {
-                    gl::DepthRangeIndexed(index as u32, near_depth, far_depth);
-                }
-                if has_viewport_swizzle {
-                    if let Some(Some(viewport_swizzle)) = GL_VIEWPORT_SWIZZLE_NV.get() {
-                        let swizzle = viewport_swizzle_components(viewport.swizzle);
-                        viewport_swizzle(
-                            index as u32,
-                            swizzle[0],
-                            swizzle[1],
-                            swizzle[2],
-                            swizzle[3],
-                        );
+                    if has_viewport_swizzle {
+                        if let Some(Some(viewport_swizzle)) = GL_VIEWPORT_SWIZZLE_NV.get() {
+                            let swizzle = viewport_swizzle_components(viewport.swizzle);
+                            viewport_swizzle(
+                                index as u32,
+                                swizzle[0],
+                                swizzle[1],
+                                swizzle[2],
+                                swizzle[3],
+                            );
+                        }
                     }
+                    let _ = viewport.snap_grid_precision;
                 }
-                let _ = viewport.snap_grid_precision;
             }
         }
 

@@ -97,6 +97,7 @@ const CLEAR_DEPTH: u32 = reg_index!(0x0D90);
 const CLEAR_STENCIL: u32 = reg_index!(0x0DA0);
 /// Clear surface trigger register.
 pub(crate) const CLEAR_SURFACE: u32 = reg_index!(0x19D0);
+const RASTER_BOUNDING_BOX: u32 = reg_index!(0x02EC);
 pub(crate) const RASTERIZE_ENABLE: u32 = reg_index!(0x037C);
 
 // ── Viewport registers ──────────────────────────────────────────────────────
@@ -159,6 +160,14 @@ pub(crate) const DRAW_BEGIN: u32 = reg_index!(0x1618); // upstream byte 0x1618
 const GLOBAL_BASE_VERTEX_INDEX: u32 = reg_index!(0x1434);
 /// Base instance offset for instanced draws.
 const GLOBAL_BASE_INSTANCE_INDEX: u32 = reg_index!(0x1438);
+/// Base vertex value consumed by HLE indexed draw macros.
+const VERTEX_ID_BASE: u32 = reg_index!(0x1118);
+/// Conservative raster enable consumed by HLE raster bounding-box macro.
+const CONSERVATIVE_RASTER_ENABLE: u32 = reg_index!(0x1148);
+/// Automatic draw byte count consumed by HLE byte-count draw macros.
+const DRAW_AUTO_BYTE_COUNT: u32 = reg_index!(0x123C);
+/// Automatic draw stride consumed by HLE byte-count draw macros.
+const DRAW_AUTO_STRIDE: u32 = reg_index!(0x1318);
 /// Each write pushes 4 LE bytes of inline index data.
 pub(crate) const DRAW_INLINE_INDEX: u32 = reg_index!(0x15E8);
 
@@ -251,6 +260,9 @@ const MANDATED_EARLY_Z: u32 = reg_index!(0x0210);
 const TESSELLATION_PARAMS: u32 = reg_index!(0x0320);
 const TRANSFORM_FEEDBACK_CONTROLS_BASE: u32 = reg_index!(0x0700);
 const TRANSFORM_FEEDBACK_CONTROL_STRIDE: u32 = 0x10 / 4;
+const TRANSFORM_FEEDBACK_BUFFERS_BASE: u32 = reg_index!(0x0380);
+const TRANSFORM_FEEDBACK_BUFFER_STRIDE: u32 = 0x20 / 4;
+const TRANSFORM_FEEDBACK_BUFFER_START_OFFSET: u32 = 0x10 / 4;
 const TRANSFORM_FEEDBACK_ENABLED: u32 = reg_index!(0x0744);
 const STREAM_OUT_LAYOUT_BASE: u32 = reg_index!(0x2800);
 
@@ -521,6 +533,24 @@ impl PrimitiveTopology {
                 Self::Triangles
             }
         }
+    }
+
+    pub fn is_hle_safe(self) -> bool {
+        matches!(
+            self,
+            Self::Points
+                | Self::Lines
+                | Self::LineLoop
+                | Self::LineStrip
+                | Self::Triangles
+                | Self::TriangleStrip
+                | Self::TriangleFan
+                | Self::LinesAdjacency
+                | Self::LineStripAdjacency
+                | Self::TrianglesAdjacency
+                | Self::TriangleStripAdjacency
+                | Self::Patches
+        )
     }
 }
 
@@ -3826,6 +3856,71 @@ impl Maxwell3D {
         self.regs[SHADOW_SCRATCH_BASE as usize] = 1;
     }
 
+    fn max_current_vertices(&self) -> u32 {
+        let mut num_vertices = 0u32;
+        for index in 0..32u32 {
+            let array = self.vertex_stream_info(index);
+            if !array.enabled {
+                continue;
+            }
+
+            let attribute = self.vertex_attrib_info(index);
+            if attribute.constant {
+                num_vertices = num_vertices.max(1);
+                continue;
+            }
+
+            let limit = self.vertex_stream_limit(index);
+            let gpu_addr_begin = array.address;
+            let gpu_addr_end = limit.address.saturating_add(1);
+            let address_size = gpu_addr_end.saturating_sub(gpu_addr_begin) as u32;
+            let vertex_stride = attribute.size.size_bytes().max(array.stride).max(1);
+            num_vertices = num_vertices.max(address_size / vertex_stride);
+            break;
+        }
+        num_vertices
+    }
+
+    pub(crate) fn hle_multi_layer_clear(&mut self, parameters: &[u32]) {
+        self.refresh_parameters();
+        let Some(&clear_surface) = parameters.first() else {
+            return;
+        };
+        let rt_index = ((clear_surface >> 6) & 0xF) as usize;
+        let layer = (clear_surface >> 10) & 0xFFFF;
+        debug_assert_eq!(layer, 0);
+        let rt_depth_reg = RT_BASE as usize + rt_index * RT_STRIDE as usize + RT_OFF_DEPTH as usize;
+        let num_layers = self.regs.get(rt_depth_reg).copied().unwrap_or(1).max(1);
+        self.regs[CLEAR_SURFACE as usize] = clear_surface;
+        self.with_draw_manager(|draw_manager, this| {
+            draw_manager.clear(num_layers, this);
+        });
+    }
+
+    pub(crate) fn hle_c713c83d8f63ccf3(&mut self, parameters: &[u32]) {
+        self.refresh_parameters();
+        let Some(&param0) = parameters.first() else {
+            return;
+        };
+        let offset = (param0 & 0x3FFF_FFFF) << 2;
+        let address = self.regs[SHADOW_SCRATCH_BASE as usize + 24];
+        self.regs[CB_CONFIG_BASE as usize] = 0x7000;
+        self.regs[CB_CONFIG_BASE as usize + 1] = (address >> 24) & 0xFF;
+        self.regs[CB_CONFIG_BASE as usize + 2] = address << 8;
+        self.regs[CB_CONFIG_BASE as usize + 3] = offset;
+    }
+
+    pub(crate) fn hle_set_raster_bounding_box(&mut self, parameters: &[u32]) {
+        self.refresh_parameters();
+        let Some(&raster_mode) = parameters.first() else {
+            return;
+        };
+        let raster_enabled = self.regs[CONSERVATIVE_RASTER_ENABLE as usize];
+        let scratch_data = self.regs[SHADOW_SCRATCH_BASE as usize + 52];
+        let pad = (scratch_data & raster_enabled) & 0xFF;
+        self.regs[RASTER_BOUNDING_BOX as usize] = (raster_mode & 0xFFFF_F00F) | (pad << 4);
+    }
+
     pub(crate) fn hle_clear_const_buffer(&mut self, base_size: usize, parameters: &[u32]) {
         self.refresh_parameters();
         if parameters.len() < 3 {
@@ -3914,6 +4009,220 @@ impl Maxwell3D {
             needed_memory as u32,
             needed_memory as u32,
         );
+    }
+
+    pub(crate) fn hle_transform_feedback_setup(&mut self, parameters: &[u32]) {
+        self.refresh_parameters();
+        if parameters.len() < 2 {
+            return;
+        }
+
+        self.regs[TRANSFORM_FEEDBACK_ENABLED as usize] = 1;
+        for index in 0..4usize {
+            let base = TRANSFORM_FEEDBACK_BUFFERS_BASE as usize
+                + index * TRANSFORM_FEEDBACK_BUFFER_STRIDE as usize;
+            self.regs[base + TRANSFORM_FEEDBACK_BUFFER_START_OFFSET as usize] = 0;
+        }
+
+        self.regs[UPLOAD_REGS_BASE] = 4;
+        self.regs[UPLOAD_REGS_BASE + 1] = 1;
+        self.regs[UPLOAD_REGS_BASE + 2] = parameters[0];
+        self.regs[UPLOAD_REGS_BASE + 3] = parameters[1];
+        <Self as EngineInterface>::call_method(self, LAUNCH_DMA, 0x1011, true);
+        let stride = self.regs[TRANSFORM_FEEDBACK_CONTROLS_BASE as usize + 2];
+        <Self as EngineInterface>::call_method(self, INLINE_DATA, stride, true);
+
+        let address = ((self.regs[UPLOAD_REGS_BASE + 2] as u64) << 32)
+            | self.regs[UPLOAD_REGS_BASE + 3] as u64;
+        let _ = self.with_rasterizer_mut(|rasterizer| {
+            rasterizer.register_transform_feedback(address);
+        });
+    }
+
+    pub(crate) fn hle_draw_arrays_indirect(&mut self, extended: bool, parameters: &[u32]) {
+        if parameters.len() < 5 {
+            return;
+        }
+
+        self.refresh_parameters();
+        let topology = PrimitiveTopology::from_raw(parameters[0]);
+        let instance_count = self.regs[0xD1B] & parameters[2];
+        let vertex_first = parameters[3];
+        let vertex_count = parameters[1];
+        let base_instance = parameters[4];
+
+        if !topology.is_hle_safe()
+            && self.max_current_vertices() < vertex_first.saturating_add(vertex_count)
+        {
+            log::warn!("HLE_DrawArraysIndirect: faulty unsafe-topology draw");
+            return;
+        }
+
+        if extended {
+            self.regs[GLOBAL_BASE_INSTANCE_INDEX as usize] = base_instance;
+            self.engine_state = EngineHint::OnHleMacro;
+            self.set_hle_replacement_attribute_type(
+                0,
+                0x640,
+                HleReplacementAttributeType::BaseInstance,
+            );
+        }
+
+        self.with_draw_manager(|draw_manager, this| {
+            draw_manager.draw_array(
+                topology,
+                vertex_first,
+                vertex_count,
+                base_instance,
+                instance_count,
+                this,
+            );
+        });
+
+        if extended {
+            self.regs[GLOBAL_BASE_INSTANCE_INDEX as usize] = 0;
+            self.engine_state = EngineHint::None;
+            self.replace_table.clear();
+        }
+    }
+
+    pub(crate) fn hle_draw_indexed_indirect(&mut self, extended: bool, parameters: &[u32]) {
+        if parameters.len() < 6 {
+            return;
+        }
+
+        self.refresh_parameters();
+        let topology = PrimitiveTopology::from_raw(parameters[0]);
+        let instance_count = self.regs[0xD1B] & parameters[2];
+        let index_first = parameters[3];
+        let index_count = parameters[1];
+        let element_base = parameters[4];
+        let base_instance = parameters[5];
+
+        self.regs[VERTEX_ID_BASE as usize] = element_base;
+        self.regs[GLOBAL_BASE_VERTEX_INDEX as usize] = element_base;
+        self.regs[GLOBAL_BASE_INSTANCE_INDEX as usize] = base_instance;
+        self.dirty.flags[dirty_flags::flags::INDEX_BUFFER as usize] = true;
+        self.interface_state.current_dirty = true;
+
+        if extended {
+            self.engine_state = EngineHint::OnHleMacro;
+            self.set_hle_replacement_attribute_type(
+                0,
+                0x640,
+                HleReplacementAttributeType::BaseVertex,
+            );
+            self.set_hle_replacement_attribute_type(
+                0,
+                0x644,
+                HleReplacementAttributeType::BaseInstance,
+            );
+        }
+
+        self.with_draw_manager(|draw_manager, this| {
+            draw_manager.draw_index(
+                topology,
+                index_first,
+                index_count,
+                element_base,
+                base_instance,
+                instance_count,
+                this,
+            );
+        });
+
+        self.regs[VERTEX_ID_BASE as usize] = 0;
+        self.regs[GLOBAL_BASE_VERTEX_INDEX as usize] = 0;
+        self.regs[GLOBAL_BASE_INSTANCE_INDEX as usize] = 0;
+        if extended {
+            self.engine_state = EngineHint::None;
+            self.replace_table.clear();
+        }
+    }
+
+    pub(crate) fn hle_multi_draw_indexed_indirect_count(&mut self, parameters: &[u32]) {
+        if parameters.len() < 5 {
+            return;
+        }
+
+        self.refresh_parameters();
+        let start_indirect = parameters[0] as usize;
+        let end_indirect = parameters[1] as usize;
+        if start_indirect >= end_indirect {
+            return;
+        }
+
+        let topology = PrimitiveTopology::from_raw(parameters[2]);
+        let padding = parameters[3] as usize;
+        let max_draws = parameters[4] as usize;
+        let indirect_words = 5 + padding;
+        let first_draw = start_indirect;
+        let effective_draws = end_indirect - start_indirect;
+        let last_draw = start_indirect + effective_draws.min(max_draws);
+
+        self.engine_state = EngineHint::OnHleMacro;
+        self.set_hle_replacement_attribute_type(0, 0x640, HleReplacementAttributeType::BaseVertex);
+        self.set_hle_replacement_attribute_type(
+            0,
+            0x644,
+            HleReplacementAttributeType::BaseInstance,
+        );
+        self.set_hle_replacement_attribute_type(0, 0x648, HleReplacementAttributeType::DrawId);
+
+        for index in first_draw..last_draw {
+            let base = index * indirect_words + 5;
+            if parameters.len() < base + 5 {
+                break;
+            }
+
+            let index_count = parameters[base];
+            let instance_count = parameters[base + 1];
+            let index_first = parameters[base + 2];
+            let base_vertex = parameters[base + 3];
+            let base_instance = parameters[base + 4];
+
+            self.regs[VERTEX_ID_BASE as usize] = base_vertex;
+            self.dirty.flags[dirty_flags::flags::INDEX_BUFFER as usize] = true;
+            self.interface_state.current_dirty = true;
+            <Self as EngineInterface>::call_method(self, 0x8E3, 0x648, true);
+            <Self as EngineInterface>::call_method(self, 0x8E4, index as u32, true);
+
+            self.with_draw_manager(|draw_manager, this| {
+                draw_manager.draw_index(
+                    topology,
+                    index_first,
+                    index_count,
+                    base_vertex,
+                    base_instance,
+                    instance_count,
+                    this,
+                );
+            });
+        }
+
+        self.regs[VERTEX_ID_BASE as usize] = 0;
+        self.engine_state = EngineHint::None;
+        self.replace_table.clear();
+    }
+
+    pub(crate) fn hle_draw_indirect_byte_count(&mut self, parameters: &[u32]) {
+        if parameters.len() < 3 {
+            return;
+        }
+
+        self.refresh_parameters();
+        let topology = PrimitiveTopology::from_raw(parameters[0]);
+        self.regs[DRAW_BEGIN as usize] = parameters[0];
+        self.regs[DRAW_AUTO_STRIDE as usize] = parameters[1];
+        self.regs[DRAW_AUTO_BYTE_COUNT as usize] = parameters[2];
+
+        if parameters[1] == 0 {
+            return;
+        }
+
+        self.with_draw_manager(|draw_manager, this| {
+            draw_manager.draw_array(topology, 0, parameters[2] / parameters[1], 0, 1, this);
+        });
     }
 
     // ── Upstream ProcessQueryGet / ProcessQueryCondition / etc ───────────
@@ -4504,6 +4813,7 @@ mod tests {
         disabled_uniforms: Vec<(usize, u32)>,
         accelerate_conditional_rendering: bool,
         inline_to_memory: Vec<(u64, usize, Vec<u8>)>,
+        transform_feedback: Vec<u64>,
         /// (instance_count, draw_indexed, shader_program_addresses) per `draw` call.
         draws: Vec<(u32, bool, [u64; 6])>,
         draw_states: Vec<crate::engines::draw_manager::DrawState>,
@@ -4643,6 +4953,13 @@ mod tests {
                 .unwrap()
                 .inline_to_memory
                 .push((address, copy_size, memory.to_vec()));
+        }
+        fn register_transform_feedback(&mut self, tfb_object_addr: u64) {
+            self.calls
+                .lock()
+                .unwrap()
+                .transform_feedback
+                .push(tfb_object_addr);
         }
     }
 
@@ -7182,6 +7499,48 @@ mod tests {
     }
 
     #[test]
+    fn test_hle_c713c83d8f63ccf3_sets_const_buffer_from_shadow_scratch() {
+        let mut engine = Maxwell3D::new();
+        engine.regs[SHADOW_SCRATCH_BASE as usize + 24] = 0x89AB_CDEF;
+
+        engine.hle_c713c83d8f63ccf3(&[0xC000_0010]);
+
+        assert_eq!(engine.regs[CB_CONFIG_BASE as usize], 0x7000);
+        assert_eq!(engine.regs[(CB_CONFIG_BASE + 1) as usize], 0x89);
+        assert_eq!(engine.regs[(CB_CONFIG_BASE + 2) as usize], 0xABCD_EF00);
+        assert_eq!(engine.regs[(CB_CONFIG_BASE + 3) as usize], 0x40);
+    }
+
+    #[test]
+    fn test_hle_set_raster_bounding_box_sets_raw_and_pad_bits() {
+        let mut engine = Maxwell3D::new();
+        engine.regs[CONSERVATIVE_RASTER_ENABLE as usize] = 0xF3;
+        engine.regs[SHADOW_SCRATCH_BASE as usize + 52] = 0xA5;
+
+        engine.hle_set_raster_bounding_box(&[0x1234_5678]);
+
+        assert_eq!(
+            engine.regs[RASTER_BOUNDING_BOX as usize],
+            (0x1234_5678 & 0xFFFF_F00F) | ((0xA5 & 0xF3 & 0xFF) << 4)
+        );
+    }
+
+    #[test]
+    fn test_hle_multi_layer_clear_uses_rt_depth() {
+        let mut engine = Maxwell3D::new();
+        let calls = Arc::new(Mutex::new(RasterizerCalls::default()));
+        let rasterizer = TestRasterizer::new(calls.clone());
+        engine.bind_rasterizer(&rasterizer);
+        let rt_index = 2usize;
+        engine.regs[RT_BASE as usize + rt_index * RT_STRIDE as usize + RT_OFF_DEPTH as usize] = 3;
+
+        engine.hle_multi_layer_clear(&[(rt_index as u32) << 6]);
+
+        assert_eq!(engine.regs[CLEAR_SURFACE as usize], (rt_index as u32) << 6);
+        assert_eq!(calls.lock().unwrap().clear_layers, vec![3]);
+    }
+
+    #[test]
     fn test_hle_bind_shader_sets_pipeline_offset_and_cb_bind() {
         let mut engine = Maxwell3D::new();
         engine.dirty.flags.fill(false);
@@ -7260,6 +7619,146 @@ mod tests {
         assert_eq!(engine.regs[UPLOAD_REGS_BASE + 3], 0x5566);
         assert_eq!(engine.regs[LAUNCH_DMA as usize], 0x1011);
         assert_eq!(zero_memory.len(), 8);
+    }
+
+    #[test]
+    fn test_hle_transform_feedback_setup_uploads_stride_and_registers_tfb() {
+        let mut engine = Maxwell3D::new();
+        let calls = Arc::new(Mutex::new(RasterizerCalls::default()));
+        let rasterizer = TestRasterizer::new(calls.clone());
+        engine.bind_rasterizer(&rasterizer);
+        engine.regs[TRANSFORM_FEEDBACK_CONTROLS_BASE as usize + 2] = 0x30;
+        for index in 0..4usize {
+            let base = TRANSFORM_FEEDBACK_BUFFERS_BASE as usize
+                + index * TRANSFORM_FEEDBACK_BUFFER_STRIDE as usize;
+            engine.regs[base + TRANSFORM_FEEDBACK_BUFFER_START_OFFSET as usize] = 0x7FFF;
+        }
+
+        engine.hle_transform_feedback_setup(&[0x12, 0x3456_7800]);
+
+        assert_eq!(engine.regs[TRANSFORM_FEEDBACK_ENABLED as usize], 1);
+        for index in 0..4usize {
+            let base = TRANSFORM_FEEDBACK_BUFFERS_BASE as usize
+                + index * TRANSFORM_FEEDBACK_BUFFER_STRIDE as usize;
+            assert_eq!(
+                engine.regs[base + TRANSFORM_FEEDBACK_BUFFER_START_OFFSET as usize],
+                0
+            );
+        }
+        assert_eq!(engine.regs[UPLOAD_REGS_BASE], 4);
+        assert_eq!(engine.regs[UPLOAD_REGS_BASE + 1], 1);
+        assert_eq!(engine.regs[UPLOAD_REGS_BASE + 2], 0x12);
+        assert_eq!(engine.regs[UPLOAD_REGS_BASE + 3], 0x3456_7800);
+        assert_eq!(engine.regs[LAUNCH_DMA as usize], 0x1011);
+        assert_eq!(
+            calls.lock().unwrap().transform_feedback,
+            vec![0x12_3456_7800]
+        );
+    }
+
+    #[test]
+    fn test_hle_draw_arrays_indirect_fallback_emits_instanced_draw() {
+        let mut engine = Maxwell3D::new();
+        engine.regs[0xD1B] = 0xFF;
+
+        engine.hle_draw_arrays_indirect(true, &[PrimitiveTopology::Triangles as u32, 6, 0x22, 4, 7]);
+
+        let draws = engine.take_draw_calls();
+        assert_eq!(draws.len(), 1);
+        let draw = &draws[0];
+        assert_eq!(draw.topology, PrimitiveTopology::Triangles);
+        assert!(!draw.indexed);
+        assert_eq!(draw.vertex_first, 4);
+        assert_eq!(draw.vertex_count, 6);
+        assert_eq!(draw.base_instance, 7);
+        assert_eq!(draw.instance_count, 0x22);
+        assert_eq!(engine.regs[GLOBAL_BASE_INSTANCE_INDEX as usize], 0);
+        assert_eq!(engine.engine_state, EngineHint::None);
+        assert!(engine.replace_table.is_empty());
+    }
+
+    #[test]
+    fn test_hle_draw_indexed_indirect_fallback_emits_instanced_draw_and_resets_base_regs() {
+        let mut engine = Maxwell3D::new();
+        engine.regs[0xD1B] = 0x07;
+
+        engine.hle_draw_indexed_indirect(
+            true,
+            &[PrimitiveTopology::Triangles as u32, 12, 0x03, 5, 9, 11],
+        );
+
+        let draws = engine.take_draw_calls();
+        assert_eq!(draws.len(), 1);
+        let draw = &draws[0];
+        assert_eq!(draw.topology, PrimitiveTopology::Triangles);
+        assert!(draw.indexed);
+        assert_eq!(draw.index_buffer_first, 5);
+        assert_eq!(draw.index_buffer_count, 12);
+        assert_eq!(draw.base_vertex, 9);
+        assert_eq!(draw.base_instance, 11);
+        assert_eq!(draw.instance_count, 3);
+        assert_eq!(engine.regs[VERTEX_ID_BASE as usize], 0);
+        assert_eq!(engine.regs[GLOBAL_BASE_VERTEX_INDEX as usize], 0);
+        assert_eq!(engine.regs[GLOBAL_BASE_INSTANCE_INDEX as usize], 0);
+        assert_eq!(engine.engine_state, EngineHint::None);
+        assert!(engine.replace_table.is_empty());
+    }
+
+    #[test]
+    fn test_hle_multi_draw_indexed_indirect_count_fallback_emits_draw_sequence() {
+        let mut engine = Maxwell3D::new();
+
+        engine.hle_multi_draw_indexed_indirect_count(&[
+            0,
+            2,
+            PrimitiveTopology::Triangles as u32,
+            0,
+            2,
+            6,
+            17,
+            100,
+            3,
+            5,
+            12,
+            34,
+            200,
+            7,
+            9,
+        ]);
+
+        let draws = engine.take_draw_calls();
+        assert_eq!(draws.len(), 2);
+        assert_eq!(draws[0].index_buffer_count, 6);
+        assert_eq!(draws[0].index_buffer_first, 100);
+        assert_eq!(draws[0].base_vertex, 3);
+        assert_eq!(draws[0].base_instance, 5);
+        assert_eq!(draws[0].instance_count, 17);
+        assert_eq!(draws[1].index_buffer_count, 12);
+        assert_eq!(draws[1].index_buffer_first, 200);
+        assert_eq!(draws[1].base_vertex, 7);
+        assert_eq!(draws[1].base_instance, 9);
+        assert_eq!(draws[1].instance_count, 34);
+        assert_eq!(engine.regs[VERTEX_ID_BASE as usize], 0);
+        assert_eq!(engine.engine_state, EngineHint::None);
+        assert!(engine.replace_table.is_empty());
+    }
+
+    #[test]
+    fn test_hle_draw_indirect_byte_count_fallback_emits_draw_array() {
+        let mut engine = Maxwell3D::new();
+
+        engine.hle_draw_indirect_byte_count(&[PrimitiveTopology::TriangleStrip as u32, 4, 16]);
+
+        let draws = engine.take_draw_calls();
+        assert_eq!(draws.len(), 1);
+        let draw = &draws[0];
+        assert_eq!(draw.topology, PrimitiveTopology::TriangleStrip);
+        assert!(!draw.indexed);
+        assert_eq!(draw.vertex_first, 0);
+        assert_eq!(draw.vertex_count, 4);
+        assert_eq!(draw.instance_count, 1);
+        assert_eq!(engine.regs[DRAW_AUTO_STRIDE as usize], 4);
+        assert_eq!(engine.regs[DRAW_AUTO_BYTE_COUNT as usize], 16);
     }
 
     #[test]

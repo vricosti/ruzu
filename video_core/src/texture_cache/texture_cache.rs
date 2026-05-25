@@ -292,16 +292,23 @@ impl TextureCacheBase {
         if image_id == NULL_IMAGE_ID {
             return NULL_IMAGE_VIEW_ID;
         }
-        // Upstream: `base = image.TryFindBase(config.Address()).value();
-        // ImageViewInfo view_info(config, base.layer);` — the subresource
-        // base lookup needs the per-mip-level / per-slice tables which
-        // aren't fully populated until CalculateLayerStride lands. Fall
-        // back to `base.layer = 0` so the path is exercised end-to-end;
-        // future slice swaps in the real `TryFindBase` result.
-        let view_info = super::image_view_info::ImageViewInfo::from_tic_entry(descriptor, 0);
+        let base = match self.slot_images.get(image_id).try_find_base(descriptor.address()) {
+            Some(base) => base,
+            None => return NULL_IMAGE_VIEW_ID,
+        };
+        debug_assert_eq!(base.level, 0);
+        let view_info =
+            super::image_view_info::ImageViewInfo::from_tic_entry(descriptor, base.layer);
+        let existing = self.slot_images.get(image_id).find_view(&view_info);
+        if existing.is_valid() {
+            return existing;
+        }
         let parent_info = self.slot_images.get(image_id).info.clone();
         let view = ImageViewBase::new(&view_info, &parent_info, image_id, descriptor.address());
         let view_id = self.slot_image_views.insert(view);
+        self.slot_images
+            .get_mut(image_id)
+            .insert_view(view_info, view_id);
         // Upstream tags both the view and its image as `Strong`. Bitflags
         // already supports `|=` on the existing `flags` fields.
         self.slot_image_views.get_mut(view_id).flags |=
@@ -359,7 +366,9 @@ impl TextureCacheBase {
         // pointer is what the page-walked CPU address would point at.
         let cpu_addr = gpu_addr;
         let image = ImageBase::new(info.clone(), gpu_addr, cpu_addr);
-        self.slot_images.insert(image)
+        let image_id = self.slot_images.insert(image);
+        self.register_image(image_id);
+        image_id
     }
 
     /// Port of `TextureCache<P>::CheckFeedbackLoop`.
@@ -713,7 +722,21 @@ impl TextureCacheBase {
     ///
     /// Inserts the image into page tables and marks it for CPU write-tracking.
     pub fn register_image(&mut self, image_id: ImageId) {
-        let map_id = self.slot_images[image_id].map_view_id;
+        let mut map_id = self.slot_images[image_id].map_view_id;
+        if !map_id.is_valid()
+            && !self.slot_images[image_id]
+                .flags
+                .contains(ImageFlagBits::SPARSE)
+        {
+            let image = &self.slot_images[image_id];
+            map_id = self.slot_map_views.insert(ImageMapView::new(
+                image.gpu_addr,
+                image.cpu_addr,
+                image.guest_size_bytes as usize,
+                image_id,
+            ));
+            self.slot_images[image_id].map_view_id = map_id;
+        }
         if !map_id.is_valid() {
             log::warn!("TextureCacheBase::register_image: image has no map view");
             return;
@@ -908,6 +931,30 @@ mod tests {
     use super::*;
     use crate::engines::maxwell_3d::{RenderTargetInfo, RtControlInfo};
     use crate::framebuffer_config::{AndroidPixelFormat, FramebufferConfig};
+    use crate::textures::texture::{ComponentType, TextureFormat, TicEntry, TextureType};
+
+    fn color_2d_tic(address: u64, base_layer: u32) -> TicEntry {
+        let word0 = (TextureFormat::A8B8G8R8 as u32)
+            | ((ComponentType::Unorm as u32) << 7)
+            | ((ComponentType::Unorm as u32) << 10)
+            | ((ComponentType::Unorm as u32) << 13)
+            | ((ComponentType::Unorm as u32) << 16);
+        let word1 = address as u32;
+        let word2 = (((address >> 32) as u32) & 0xFFFF) | (3 << 21);
+        let word3 = 0;
+        let word4 =
+            63 | ((base_layer & 0x7) << 16) | ((TextureType::Texture2D as u32) << 23);
+        let word5 = 31 | (1 << 31);
+
+        TicEntry {
+            raw: [
+                word0 as u64 | ((word1 as u64) << 32),
+                word2 as u64 | ((word3 as u64) << 32),
+                word4 as u64 | ((word5 as u64) << 32),
+                0,
+            ],
+        }
+    }
 
     #[test]
     fn texture_cache_reserves_zero_for_null_resources() {
@@ -1032,5 +1079,51 @@ mod tests {
                 .w_source,
             SwizzleSource::OneFloat as u8
         );
+    }
+
+    #[test]
+    fn write_memory_marks_registered_image_cpu_modified_and_untracks() {
+        use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
+        use std::sync::Arc;
+
+        let mut cache = TextureCacheBase::new(Arc::new(MaxwellDeviceMemoryManager::default()));
+        let info = ImageInfo {
+            format: surface::PixelFormat::A8B8G8R8Unorm,
+            size: crate::texture_cache::types::Extent3D {
+                width: 16,
+                height: 16,
+                depth: 1,
+            },
+            ..ImageInfo::default()
+        };
+        let image_id = cache.insert_image(&info, 0x4000);
+        cache.slot_images[image_id]
+            .flags
+            .remove(ImageFlagBits::CPU_MODIFIED);
+        cache.track_image(image_id);
+
+        cache.write_memory(0x4000, 4);
+
+        let image = &cache.slot_images[image_id];
+        assert!(image.flags.contains(ImageFlagBits::CPU_MODIFIED));
+        assert!(!image.flags.contains(ImageFlagBits::TRACKED));
+    }
+
+    #[test]
+    fn create_image_view_uses_try_find_base_layer() {
+        use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
+        use std::sync::Arc;
+
+        let mut cache = TextureCacheBase::new(Arc::new(MaxwellDeviceMemoryManager::default()));
+        let mut descriptor = color_2d_tic(0, 2);
+        let layer_stride = ImageInfo::from_tic_entry(&descriptor).layer_stride as u64;
+        descriptor = color_2d_tic(0x5000_0000 + 2 * layer_stride, 2);
+
+        let view_id = cache.create_image_view(&descriptor);
+
+        assert!(view_id.is_valid());
+        let view = &cache.slot_image_views[view_id];
+        assert_eq!(view.range.base.layer, 2);
+        assert_eq!(cache.slot_images[view.image_id].gpu_addr, 0x5000_0000);
     }
 }

@@ -19,9 +19,12 @@ use super::frontend::translate_program::{
     collect_interpolation_info, convert_legacy_to_generic, merge_dual_vertex_programs,
 };
 use super::ir::basic_block::Block;
+use super::ir::instruction::Inst;
+use super::ir::opcodes::Opcode;
 use super::ir::post_order::post_order;
-use super::ir::program::{Program, ShaderInfo};
+use super::ir::program::{Program, ShaderInfo, SyntaxNode};
 use super::ir::types::ShaderStage;
+use super::ir::value::{InstRef, Pred, Value};
 use super::ir_opt;
 use super::profile::Profile;
 use super::program_header::ProgramHeader;
@@ -120,6 +123,7 @@ fn translate_cfg_to_program(
             tv.translate_instruction(code[i]);
         }
     }
+    materialize_syntax_conditions(&mut program, cfg_blocks);
 
     if !program.blocks.is_empty() {
         program.post_order_blocks = post_order(&program.blocks, 0);
@@ -127,6 +131,74 @@ fn translate_cfg_to_program(
     }
 
     program
+}
+
+/// Rust adaptation of upstream `Visit(StatementType::If/Loop/Break)`.
+///
+/// Upstream creates an `IR::IREmitter` in the syntax header block and stores
+/// `ir.ConditionRef(VisitExpr(...))` in the abstract syntax node. Ruzu's
+/// simplified structurer still owns only flat CFG blocks, so it first emits
+/// placeholder `true` conditions and this pass patches the syntax nodes after
+/// the corresponding IR blocks have been translated.
+fn materialize_syntax_conditions(program: &mut Program, cfg_blocks: &[control_flow::CfgBlock]) {
+    let mut current_block = None;
+    let mut replacements = Vec::new();
+    for (index, node) in program.syntax_list.iter().enumerate() {
+        match node {
+            SyntaxNode::Block(block) => current_block = Some(*block),
+            SyntaxNode::If { .. } | SyntaxNode::Repeat { .. } => {
+                let Some(block) = current_block else {
+                    continue;
+                };
+                let Some(cfg_block) = cfg_blocks.get(block as usize) else {
+                    continue;
+                };
+                if cfg_block.cond.is_always() {
+                    continue;
+                }
+                replacements.push((index, block, cfg_block.cond));
+            }
+            _ => {}
+        }
+    }
+    for (index, block, cond) in replacements {
+        let value = materialize_condition(program, block, cond);
+        match &mut program.syntax_list[index] {
+            SyntaxNode::If { cond, .. } | SyntaxNode::Repeat { cond, .. } => *cond = value,
+            _ => {}
+        }
+    }
+}
+
+fn materialize_condition(
+    program: &mut Program,
+    block: u32,
+    cond: control_flow::Condition,
+) -> Value {
+    let pred = Pred(cond.pred);
+    if pred.is_true() {
+        return Value::ImmU1(!cond.negated);
+    }
+
+    let get_pred = append_inst(
+        program,
+        block,
+        Inst::new(Opcode::GetPred, vec![Value::Pred(pred)]),
+    );
+    let value = if cond.negated {
+        append_inst(program, block, Inst::new(Opcode::LogicalNot, vec![get_pred]))
+    } else {
+        get_pred
+    };
+    append_inst(program, block, Inst::new(Opcode::ConditionRef, vec![value]))
+}
+
+fn append_inst(program: &mut Program, block: u32, inst: Inst) -> Value {
+    let inst_index = program.block_mut(block).append_inst(inst);
+    Value::Inst(InstRef {
+        block,
+        inst: inst_index,
+    })
 }
 
 /// Rust adaptation of upstream `RemoveUnreachableBlocks`.
@@ -600,6 +672,23 @@ mod tests {
     }
 
     #[test]
+    fn test_compile_shader_glsl_uses_fragment_color_types() {
+        let profile = Profile {
+            need_declared_frag_colors: true,
+            ..Profile::default()
+        };
+        let mut runtime_info = RuntimeInfo::default();
+        runtime_info.frag_color_types[1] = crate::runtime_info::AttributeType::UnsignedInt;
+        runtime_info.frag_color_types[2] = crate::runtime_info::AttributeType::SignedInt;
+
+        let compiled = compile_shader_glsl(&[], ShaderStage::Fragment, &profile, &runtime_info);
+
+        assert!(compiled.source.contains("layout(location=0)out vec4 frag_color0;"));
+        assert!(compiled.source.contains("layout(location=1)out uvec4 frag_color1;"));
+        assert!(compiled.source.contains("layout(location=2)out ivec4 frag_color2;"));
+    }
+
+    #[test]
     fn cfg_translation_creates_matching_ir_blocks_and_edges() {
         let cfg_blocks = vec![
             CfgBlock {
@@ -640,6 +729,73 @@ mod tests {
                 .iter()
                 .any(|node| matches!(node, SyntaxNode::Block(1))),
             "syntax block indices must have matching IR blocks"
+        );
+    }
+
+    #[test]
+    fn cfg_translation_materializes_conditional_branch_predicate() {
+        use crate::ir::opcodes::Opcode;
+
+        let cfg_blocks = vec![
+            CfgBlock {
+                begin: 0,
+                end: 1,
+                end_class: EndClass::Branch,
+                branch_true: Some(2),
+                branch_false: Some(1),
+                cond: Condition {
+                    pred: 2,
+                    negated: true,
+                },
+                stack_depth: 0,
+            },
+            CfgBlock {
+                begin: 1,
+                end: 2,
+                end_class: EndClass::Branch,
+                branch_true: Some(2),
+                branch_false: None,
+                cond: Condition::always(),
+                stack_depth: 0,
+            },
+            CfgBlock {
+                begin: 2,
+                end: 3,
+                end_class: EndClass::Return,
+                branch_true: None,
+                branch_false: None,
+                cond: Condition::always(),
+                stack_depth: 0,
+            },
+        ];
+
+        let program = translate_cfg_to_program(
+            &[0, 0, 0],
+            ShaderStage::VertexB,
+            0,
+            cfg_blocks.as_slice(),
+            None,
+        );
+
+        let cond = program
+            .syntax_list
+            .iter()
+            .find_map(|node| match node {
+                SyntaxNode::If { cond, .. } => Some(*cond),
+                _ => None,
+            })
+            .expect("conditional branch should produce an If syntax node");
+        let Value::Inst(cond_ref) = cond else {
+            panic!("If condition must be an IR value, got {cond:?}");
+        };
+        let cond_inst = program.block(cond_ref.block).inst(cond_ref.inst);
+        assert_eq!(cond_inst.opcode, Opcode::ConditionRef);
+        let Value::Inst(not_ref) = cond_inst.args[0] else {
+            panic!("negated predicate should feed ConditionRef through LogicalNot");
+        };
+        assert_eq!(
+            program.block(not_ref.block).inst(not_ref.inst).opcode,
+            Opcode::LogicalNot
         );
     }
 

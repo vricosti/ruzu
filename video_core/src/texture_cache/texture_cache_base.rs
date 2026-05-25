@@ -409,13 +409,24 @@ impl TextureCacheBase {
     /// the given CPU address range and marks them as CPU-modified, scheduling
     /// them for re-upload on next GPU access.
     pub fn write_memory(&mut self, cpu_addr: u64, size: usize) {
-        Self::for_each_cpu_page(cpu_addr, size, |page| {
-            if let Some(image_ids) = self.page_table.get(&page) {
-                for &_image_id in image_ids {
-                    // In full implementation: mark image as CPU-modified
-                }
+        let image_ids = self.collect_images_in_region(cpu_addr, size);
+        for image_id in image_ids {
+            if self.slot_images[image_id]
+                .flags
+                .contains(ImageFlagBits::CPU_MODIFIED)
+            {
+                continue;
             }
-        });
+            self.slot_images[image_id]
+                .flags
+                .insert(ImageFlagBits::CPU_MODIFIED);
+            if self.slot_images[image_id]
+                .flags
+                .contains(ImageFlagBits::TRACKED)
+            {
+                self.untrack_image(image_id);
+            }
+        }
     }
 
     /// Download contents of host images to guest memory in a region.
