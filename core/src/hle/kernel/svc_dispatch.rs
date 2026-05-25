@@ -938,6 +938,28 @@ fn call32(system: &System, imm: u32, args: &mut SvcArgs) {
                 get_arg32(args, 0) as u64,
                 get_arg32(args, 1) as i32,
             );
+            // RUZU_YIELD_AFTER_SIGNAL_CV=1 — Experiment for MK8D wedge investigation
+            // (project_mk8d_unlock_site_found_2026_05_25). After signaling a cv,
+            // give the scheduler a chance to run other threads before the signaler
+            // returns to guest code and races into its user-mode mutex unlock at
+            // PC 0x01D334B8. If the signaled-and-now-waking thread (tid=86 in
+            // MK8D's case) gets CPU time before tid=75's unlock, it can register
+            // as a WAIT_MASK waiter and tid=75's libnx will take the slow-path
+            // unlock SVC instead of the silent fast-path CAS.
+            if std::env::var_os("RUZU_YIELD_AFTER_SIGNAL_CV").is_some() {
+                if let Some(kernel) = system.kernel() {
+                    if let Some(scheduler) = kernel.current_scheduler() {
+                        let sched_ptr = {
+                            let guard = scheduler.lock().unwrap();
+                            &*guard as *const crate::hle::kernel::k_scheduler::KScheduler
+                                as *mut crate::hle::kernel::k_scheduler::KScheduler
+                        };
+                        unsafe {
+                            (*sched_ptr).preempt_single_core();
+                        }
+                    }
+                }
+            }
         }
         Some(SvcId::WaitForAddress) => {
             let result = svc_address_arbiter::wait_for_address(
