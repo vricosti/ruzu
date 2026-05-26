@@ -495,6 +495,12 @@ fn main() {
     let want_wake_profile = std::env::var_os("RUZU_PROFILE_WAKE").is_some();
     let want_gap_profile = std::env::var_os("RUZU_PROFILE_GAP").is_some();
     let want_svc_per_tid = std::env::var_os("RUZU_PROFILE_SVC_PER_TID").is_some();
+    let want_svc_summary = std::env::var_os("RUZU_PROFILE_SVC_SUMMARY").is_some();
+    let want_svc_ring = std::env::var_os("RUZU_PROFILE_SVC_RING").is_some();
+    let want_thread_lifecycle =
+        std::env::var_os("RUZU_PROFILE_THREAD_LIFECYCLE").is_some();
+    let want_startthread_sched_profile =
+        std::env::var_os("RUZU_PROFILE_STARTTHREAD_SCHED").is_some();
     let want_nvdrv_ioctl_profile = std::env::var_os("RUZU_PROFILE_NVDRV_IOCTL").is_some();
     let want_ipc_phase_profile = std::env::var_os("RUZU_PROFILE_IPC_PHASES").is_some();
     let want_bqp_slot_profile = std::env::var_os("RUZU_PROFILE_BQP_SLOTS").is_some();
@@ -523,6 +529,10 @@ fn main() {
         || want_wake_profile
         || want_gap_profile
         || want_svc_per_tid
+        || want_svc_summary
+        || want_svc_ring
+        || want_thread_lifecycle
+        || want_startthread_sched_profile
         || want_nvdrv_ioctl_profile
         || want_ipc_phase_profile
         || want_bqp_slot_profile
@@ -544,6 +554,10 @@ fn main() {
             ruzu_core::hle::kernel::svc::svc_ipc::dump_ipc_profile();
             ruzu_core::hle::kernel::svc_dispatch::dump_svc_profile();
             ruzu_core::hle::kernel::svc_dispatch::dump_svc_per_tid_profile();
+            ruzu_core::hle::kernel::svc_dispatch::dump_svc_summary_profile();
+            ruzu_core::hle::kernel::svc_dispatch::dump_svc_ring_profile();
+            ruzu_core::hle::kernel::svc::svc_thread::dump_thread_lifecycle_profile();
+            ruzu_core::hle::kernel::k_scheduler::dump_start_thread_sched_profile();
             ruzu_core::hle::kernel::svc_dispatch::dump_wake_latency();
             ruzu_core::hle::kernel::svc_dispatch::dump_gap_profile();
             ruzu_core::hle::service::nvdrv::nvdrv_interface::dump_nvdrv_ioctl_profile();
@@ -575,6 +589,10 @@ fn main() {
             ruzu_core::hle::kernel::svc::svc_ipc::dump_ipc_profile();
             ruzu_core::hle::kernel::svc_dispatch::dump_svc_profile();
             ruzu_core::hle::kernel::svc_dispatch::dump_svc_per_tid_profile();
+            ruzu_core::hle::kernel::svc_dispatch::dump_svc_summary_profile();
+            ruzu_core::hle::kernel::svc_dispatch::dump_svc_ring_profile();
+            ruzu_core::hle::kernel::svc::svc_thread::dump_thread_lifecycle_profile();
+            ruzu_core::hle::kernel::k_scheduler::dump_start_thread_sched_profile();
             ruzu_core::hle::kernel::svc_dispatch::dump_wake_latency();
             ruzu_core::hle::kernel::svc_dispatch::dump_gap_profile();
             ruzu_core::hle::service::nvdrv::nvdrv_interface::dump_nvdrv_ioctl_profile();

@@ -217,9 +217,9 @@ impl NvMapDevice {
             .get_session_process(session_id)
             .expect("nvmap::IocAlloc active session must own a process like upstream");
 
-        let handle_size = {
+        let (handle_address, handle_size) = {
             let inner = handle.lock_inner();
-            inner.size as usize
+            (inner.address as usize, inner.size as usize)
         };
         let lock_result = {
             let mut process_guard = process.lock().unwrap();
@@ -227,7 +227,7 @@ impl NvMapDevice {
                 .page_table
                 .get_base_mut()
                 .lock_for_map_device_address_space(
-                    params.address as usize,
+                    handle_address,
                     handle_size,
                     KMemoryPermission::NONE,
                     true,

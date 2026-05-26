@@ -12,6 +12,7 @@ static AUX_WRITE_PARTIAL_COUNT: AtomicU64 = AtomicU64::new(0);
 static AUX_READ_FULL_COUNT: AtomicU64 = AtomicU64::new(0);
 static AUX_READ_PARTIAL_COUNT: AtomicU64 = AtomicU64::new(0);
 static AUX_INFO_WRITE_FAIL_COUNT: AtomicU64 = AtomicU64::new(0);
+static AUX_READ_BAD_SAMPLE_COUNT: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Copy)]
 #[repr(C)]
@@ -101,6 +102,9 @@ pub fn process_aux_command(payload: &AuxPayload, mix_buffers: &mut [i32], sample
             payload.write_offset,
             payload.update_count,
         );
+        if std::env::var_os("RUZU_ZERO_AUX_OUTPUT").is_some() {
+            mix_buffers[output_range.clone()].fill(0);
+        }
         if read != sample_count as u32 {
             for sample in &mut mix_buffers[output_range.start + read as usize..output_range.end] {
                 *sample = 0;
@@ -233,6 +237,18 @@ pub(crate) fn read_aux_buffer(
                 profile_aux_read_result(read, read_count);
                 return read;
             }
+            trace_bad_aux_read(
+                info_addr,
+                buffer_addr,
+                read_addr,
+                count_max,
+                target_read_offset,
+                to_read as u32,
+                write_pos as u32,
+                out,
+                &info,
+            );
+            sanitize_bad_aux_return_samples(out);
         }
         target_read_offset = (target_read_offset + to_read as u32) % count_max;
         remaining -= to_read;
@@ -333,6 +349,61 @@ fn profile_aux_read_result(read: u32, expected: u32) {
             read,
             expected
         );
+    }
+}
+
+fn trace_bad_aux_read(
+    info_addr: CpuAddr,
+    buffer_addr: CpuAddr,
+    read_addr: CpuAddr,
+    count_max: u32,
+    target_read_offset: u32,
+    to_read: u32,
+    write_pos: u32,
+    samples: &[i32],
+    info: &AuxInfoDsp,
+) {
+    if std::env::var_os("RUZU_TRACE_AUX_READ_BAD").is_none() {
+        return;
+    }
+    let Some((index, value)) = samples
+        .iter()
+        .copied()
+        .enumerate()
+        .find(|(_, value)| *value == i32::MIN || *value == i32::MAX || value.abs() > 0x0100_0000)
+    else {
+        return;
+    };
+    let n = AUX_READ_BAD_SAMPLE_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+    if n <= 32 || n % 1000 == 0 {
+        let first: Vec<i32> = samples.iter().copied().take(16).collect();
+        log::warn!(
+            "AUX_READ_BAD #{} info=0x{:X} buffer=0x{:X} read_addr=0x{:X} count_max={} info_read={} info_write={} target_read={} to_read={} write_pos={} bad_index={} bad_value={} first={:?}",
+            n,
+            info_addr,
+            buffer_addr,
+            read_addr,
+            count_max,
+            info.read_offset,
+            info.write_offset,
+            target_read_offset,
+            to_read,
+            write_pos,
+            index,
+            value,
+            first
+        );
+    }
+}
+
+fn sanitize_bad_aux_return_samples(samples: &mut [i32]) {
+    if std::env::var_os("RUZU_SANITIZE_AUX_RETURN").is_none() {
+        return;
+    }
+    for sample in samples {
+        if *sample < i16::MIN as i32 || *sample > i16::MAX as i32 {
+            *sample = 0;
+        }
     }
 }
 

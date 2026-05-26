@@ -48,6 +48,45 @@ fn should_trace_sync_handle(session_handle: Handle) -> bool {
         .is_some_and(|target| target == session_handle)
 }
 
+static SERVER_THREAD_IPC_COUNT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+fn should_use_server_thread_ipc(session_handle: Handle) -> bool {
+    let Some(spec) = std::env::var_os("RUZU_SERVER_THREAD_IPC_HANDLE") else {
+        return false;
+    };
+    let spec = spec.to_string_lossy();
+    let matches = spec.split(',').any(|raw| {
+        let value = raw.trim();
+        if value.is_empty() {
+            return false;
+        }
+        let hex = value
+            .strip_prefix("0x")
+            .or_else(|| value.strip_prefix("0X"))
+            .unwrap_or(value);
+        u32::from_str_radix(hex, 16)
+            .ok()
+            .or_else(|| value.parse::<u32>().ok())
+            .is_some_and(|target| target == session_handle)
+    });
+    if !matches {
+        return false;
+    }
+    let count = SERVER_THREAD_IPC_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    let limit = std::env::var("RUZU_SERVER_THREAD_IPC_LIMIT")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(u64::MAX);
+    count <= limit
+}
+
+fn trace_server_thread_ipc(stage: &str, session_handle: Handle) {
+    if std::env::var_os("RUZU_TRACE_SERVER_THREAD_IPC").is_some() {
+        eprintln!("[SERVER_THREAD_IPC] handle=0x{session_handle:X} stage={stage}");
+    }
+}
+
 fn format_ipc_trace_words(system: &System, message_address: u64, words: usize) -> Option<String> {
     if message_address == 0 || words == 0 {
         return None;
@@ -190,6 +229,83 @@ fn send_sync_request_impl(
     record_phase("01_resolve_client_session", &mut phase_last);
     if trace_sync {
         log::info!("svc::SendSyncRequest stage=resolved_client_session");
+    }
+
+    if should_use_server_thread_ipc(session_handle) {
+        trace_server_thread_ipc("enqueue_begin", session_handle);
+        let (server_session, manager) = {
+            let mut process = system.current_process_arc().lock().unwrap();
+            let send_result = client_session
+                .lock()
+                .unwrap()
+                .send_sync_request_with_process(&mut process, message_address as usize, 0);
+            if send_result != 0 {
+                return ResultCode::new(send_result);
+            }
+
+            let parent_id = match client_session.lock().unwrap().get_parent_id() {
+                Some(parent_id) => parent_id,
+                None => return RESULT_INVALID_HANDLE,
+            };
+            let Some(parent_session) = process.get_session_by_object_id(parent_id) else {
+                return RESULT_INVALID_HANDLE;
+            };
+            let server_session = parent_session.lock().unwrap().get_server_session().clone();
+            let Some(manager) = server_session.lock().unwrap().get_manager().cloned() else {
+                return RESULT_INVALID_HANDLE;
+            };
+            (server_session, manager)
+        };
+        trace_server_thread_ipc("enqueue_end", session_handle);
+
+        if let Some(current_thread) = system.current_thread() {
+            let mut thread = current_thread.lock().unwrap();
+            thread.set_wait_reason_for_debugging(
+                crate::hle::kernel::k_thread::ThreadWaitReasonForDebugging::Ipc,
+            );
+            thread.begin_wait();
+        }
+        trace_server_thread_ipc("client_begin_wait", session_handle);
+
+        let service_manager = system.service_manager().unwrap();
+        std::thread::spawn(move || {
+            trace_server_thread_ipc("worker_receive_begin", session_handle);
+            let receive_result = {
+                let mut server_session = server_session.lock().unwrap();
+                server_session.receive_request_hle(Arc::clone(&manager))
+            };
+            let Ok((mut context, request_manager, _request_message_address)) = receive_result
+            else {
+                trace_server_thread_ipc("worker_receive_failed", session_handle);
+                return;
+            };
+            trace_server_thread_ipc("worker_dispatch_begin", session_handle);
+            context.set_service_manager(service_manager);
+            let _ = complete_sync_request(&request_manager, &mut context);
+            trace_server_thread_ipc("worker_reply_begin", session_handle);
+            let _ = server_session.lock().unwrap().send_reply();
+            trace_server_thread_ipc("worker_done", session_handle);
+        });
+        trace_server_thread_ipc("worker_spawned", session_handle);
+
+        if let Some(kernel) = system.kernel() {
+            if let Some(scheduler) = kernel.current_scheduler() {
+                let sched_ptr = {
+                    let mut scheduler = scheduler.lock().unwrap();
+                    &mut *scheduler as *mut crate::hle::kernel::k_scheduler::KScheduler
+                };
+                unsafe {
+                    crate::hle::kernel::k_scheduler::KScheduler::reschedule_current_core_raw(
+                        sched_ptr,
+                    );
+                }
+            }
+        }
+
+        return system
+            .current_thread()
+            .map(|thread| ResultCode::new(thread.lock().unwrap().get_wait_result()))
+            .unwrap_or(RESULT_INVALID_HANDLE);
     }
 
     let (request_manager, mut context, request_message_address) = {
@@ -395,6 +511,25 @@ fn send_sync_request_impl(
                 unsafe {
                     (*sched_ptr).preempt_single_core();
                 }
+            }
+        }
+    }
+
+    // RUZU_YIELD_AFTER_IPC=1 — diagnostic for the MK8D post-StartThread
+    // ordering divergence. Unlike RUZU_RESCHEDULE_AFTER_IPC, this uses the
+    // scheduler's queue-rotation yield path, approximating the visible effect
+    // of upstream `KServerSession::OnRequest` putting the client thread into
+    // IPC wait while the server handles the request.
+    if std::env::var_os("RUZU_YIELD_AFTER_IPC").is_some() {
+        let current_process = system.current_process_arc();
+        if let Some(current_thread_id) = system.current_thread_id() {
+            let sched_arc = system.scheduler_arc();
+            let scheduler_ptr = {
+                let mut scheduler = sched_arc.lock().unwrap();
+                &mut *scheduler as *mut crate::hle::kernel::k_scheduler::KScheduler
+            };
+            unsafe {
+                (*scheduler_ptr).yield_without_core_migration(current_process, current_thread_id);
             }
         }
     }
