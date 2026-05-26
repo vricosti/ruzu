@@ -12,6 +12,18 @@ use log::{error, warn};
 // with opaque pointers (*mut ()). Restore when ruzu_kernel is brought back.
 use std::fmt::Write;
 use std::mem::size_of;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static MIX_BUFFER_CLIP_LOGS: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct MixBufferTraceStats {
+    i32_min_count: usize,
+    clipped_count: usize,
+    min_value: i32,
+    max_value: i32,
+    first_i32_min_index: Option<usize>,
+}
 
 #[derive(Clone, Copy, Default)]
 struct MemoryHandle(usize);
@@ -223,10 +235,16 @@ impl CommandListProcessor {
             }
 
             if header.enabled != 0 {
+                let trace_mix_buffers =
+                    std::env::var_os("RUZU_TRACE_MIX_BUFFER_CLIP").is_some();
+                let before_mix_stats = trace_mix_buffers.then(|| self.mix_buffer_trace_stats());
                 self.process_command(
                     &header,
                     self.commands.saturating_add(size_of::<CommandHeader>()),
                 );
+                if trace_mix_buffers {
+                    self.trace_mix_buffer_transition(&header, before_mix_stats.flatten());
+                }
             } else {
                 if let Some(dump) = dump.as_mut() {
                     dump.push_str("\tDisabled!\n");
@@ -299,6 +317,70 @@ impl CommandListProcessor {
             }
         }
         process_command(self, header, payload_addr);
+    }
+
+    fn mix_buffer_trace_stats(&self) -> Option<MixBufferTraceStats> {
+        let mix_buffers = self.mix_buffers()?;
+        let mut stats = MixBufferTraceStats {
+            min_value: i32::MAX,
+            max_value: i32::MIN,
+            ..MixBufferTraceStats::default()
+        };
+
+        for (index, &sample) in mix_buffers.iter().enumerate() {
+            if sample == i32::MIN {
+                stats.i32_min_count += 1;
+                stats.first_i32_min_index.get_or_insert(index);
+            }
+            if sample < i16::MIN as i32 || sample > i16::MAX as i32 {
+                stats.clipped_count += 1;
+            }
+            stats.min_value = stats.min_value.min(sample);
+            stats.max_value = stats.max_value.max(sample);
+        }
+
+        if mix_buffers.is_empty() {
+            stats.min_value = 0;
+            stats.max_value = 0;
+        }
+
+        Some(stats)
+    }
+
+    fn trace_mix_buffer_transition(
+        &self,
+        header: &CommandHeader,
+        before: Option<MixBufferTraceStats>,
+    ) {
+        let after = self.mix_buffer_trace_stats();
+        let Some(after) = after else {
+            return;
+        };
+        let before = before.unwrap_or_default();
+        if before.i32_min_count == after.i32_min_count
+            && before.clipped_count == after.clipped_count
+            && after.i32_min_count == 0
+        {
+            return;
+        }
+
+        let n = MIX_BUFFER_CLIP_LOGS.fetch_add(1, Ordering::Relaxed);
+        if n < 128 || n.is_power_of_two() {
+            eprintln!(
+                "[MIX_BUFFER_CLIP] #{} process_index={} type={:?} node={} before_min={} after_min={} before_clip={} after_clip={} after_min_value={} after_max_value={} first_min_index={:?}",
+                n,
+                self.processed_command_count + 1,
+                header.type_,
+                header.node_id,
+                before.i32_min_count,
+                after.i32_min_count,
+                before.clipped_count,
+                after.clipped_count,
+                after.min_value,
+                after.max_value,
+                after.first_i32_min_index,
+            );
+        }
     }
 
     pub(crate) fn current_process_time_offset(&self) -> u64 {

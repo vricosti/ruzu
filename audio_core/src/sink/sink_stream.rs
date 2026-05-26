@@ -213,6 +213,41 @@ impl SinkStream {
             return;
         }
 
+        if std::env::var_os("RUZU_TRACE_AUDIO_APPEND_CLIP").is_some() && samples.len() >= 100 {
+            let mut min_sample = i16::MAX;
+            let mut max_sample = i16::MIN;
+            let mut clipped = 0usize;
+            for &sample in samples {
+                min_sample = min_sample.min(sample);
+                max_sample = max_sample.max(sample);
+                if sample == i16::MIN || sample == i16::MAX {
+                    clipped += 1;
+                }
+            }
+            if clipped * 100 / samples.len() >= 1 {
+                use std::sync::atomic::{AtomicU64, Ordering};
+                static TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
+                let n = TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
+                if n < 16 || n.is_power_of_two() {
+                    eprintln!(
+                        "[AUDIO_APPEND_CLIP] #{} stream={:?} name={} tag=0x{:X} frames={} samples={} sys_ch={} dev_ch={} min={} max={} clipped={} clipped_pct={}",
+                        n,
+                        self.stream_type,
+                        self.name,
+                        buffer.tag,
+                        buffer.frames,
+                        samples.len(),
+                        self.system_channels,
+                        self.device_channels,
+                        min_sample,
+                        max_sample,
+                        clipped,
+                        clipped * 100 / samples.len()
+                    );
+                }
+            }
+        }
+
         let queued_buffer = {
             buffer.consumed = false;
             buffer.frames_played = 0;

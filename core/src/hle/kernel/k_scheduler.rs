@@ -18,6 +18,181 @@ use super::k_thread::KThread;
 use super::k_thread::KThreadLock;
 use super::k_thread::ThreadState;
 
+#[derive(Clone)]
+struct StartThreadSchedEvent {
+    order: u64,
+    child_tid: u64,
+    parent_tid: u64,
+    child_priority: i32,
+    child_core: i32,
+    child_affinity: u64,
+    start: Instant,
+    run_result: u32,
+    first_update_us: u64,
+    first_top_us: u64,
+    first_needs_us: u64,
+    update_count: u32,
+    top_count: u32,
+    cores_needing_last: u64,
+    top_threads_last: [Option<u64>; crate::hardware_properties::NUM_CPU_CORES as usize],
+    first_svc_us: u64,
+    first_svc_imm: u32,
+    first_svc_core: i32,
+}
+
+static STARTTHREAD_SCHED_PROFILE: std::sync::OnceLock<
+    Mutex<Vec<StartThreadSchedEvent>>,
+> = std::sync::OnceLock::new();
+static STARTTHREAD_SCHED_ORDER: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+fn startthread_sched_profile_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("RUZU_PROFILE_STARTTHREAD_SCHED").is_some())
+}
+
+pub fn record_start_thread_sched_attempt(
+    child_tid: u64,
+    parent_tid: u64,
+    child_priority: i32,
+    child_core: i32,
+    child_affinity: u64,
+) {
+    if !startthread_sched_profile_enabled() {
+        return;
+    }
+
+    let order = STARTTHREAD_SCHED_ORDER.fetch_add(1, Ordering::Relaxed) + 1;
+    let events = STARTTHREAD_SCHED_PROFILE.get_or_init(|| Mutex::new(Vec::new()));
+    events.lock().unwrap().push(StartThreadSchedEvent {
+        order,
+        child_tid,
+        parent_tid,
+        child_priority,
+        child_core,
+        child_affinity,
+        start: Instant::now(),
+        run_result: u32::MAX,
+        first_update_us: 0,
+        first_top_us: 0,
+        first_needs_us: 0,
+        update_count: 0,
+        top_count: 0,
+        cores_needing_last: 0,
+        top_threads_last: [None; crate::hardware_properties::NUM_CPU_CORES as usize],
+        first_svc_us: 0,
+        first_svc_imm: 0,
+        first_svc_core: -1,
+    });
+}
+
+pub fn record_start_thread_sched_result(child_tid: u64, result: u32) {
+    if !startthread_sched_profile_enabled() {
+        return;
+    }
+
+    let Some(events) = STARTTHREAD_SCHED_PROFILE.get() else {
+        return;
+    };
+    let mut events = events.lock().unwrap();
+    if let Some(event) = events.iter_mut().rev().find(|event| event.child_tid == child_tid) {
+        event.run_result = result;
+    }
+}
+
+pub fn record_start_thread_sched_first_svc(child_tid: u64, core_id: i32, imm: u32) {
+    if !startthread_sched_profile_enabled() {
+        return;
+    }
+
+    let Some(events) = STARTTHREAD_SCHED_PROFILE.get() else {
+        return;
+    };
+    let mut events = events.lock().unwrap();
+    if let Some(event) = events
+        .iter_mut()
+        .rev()
+        .find(|event| event.child_tid == child_tid && event.first_svc_us == 0)
+    {
+        event.first_svc_us = event.start.elapsed().as_micros() as u64;
+        event.first_svc_imm = imm;
+        event.first_svc_core = core_id;
+    }
+}
+
+fn record_start_thread_sched_update(
+    cores_needing_scheduling: u64,
+    top_threads: [Option<u64>; crate::hardware_properties::NUM_CPU_CORES as usize],
+) {
+    if !startthread_sched_profile_enabled() {
+        return;
+    }
+
+    let Some(events) = STARTTHREAD_SCHED_PROFILE.get() else {
+        return;
+    };
+    let mut events = events.lock().unwrap();
+    for event in events
+        .iter_mut()
+        .filter(|event| event.first_svc_us == 0 && event.run_result != u32::MAX)
+    {
+        let elapsed_us = event.start.elapsed().as_micros() as u64;
+        event.update_count = event.update_count.saturating_add(1);
+        event.cores_needing_last = cores_needing_scheduling;
+        event.top_threads_last = top_threads;
+        if event.first_update_us == 0 {
+            event.first_update_us = elapsed_us;
+        }
+        if event.child_core >= 0
+            && (cores_needing_scheduling & (1u64 << event.child_core as u32)) != 0
+            && event.first_needs_us == 0
+        {
+            event.first_needs_us = elapsed_us;
+        }
+        if top_threads.contains(&Some(event.child_tid)) {
+            event.top_count = event.top_count.saturating_add(1);
+            if event.first_top_us == 0 {
+                event.first_top_us = elapsed_us;
+            }
+        }
+    }
+}
+
+pub fn dump_start_thread_sched_profile() {
+    if !startthread_sched_profile_enabled() {
+        return;
+    }
+
+    let Some(events) = STARTTHREAD_SCHED_PROFILE.get() else {
+        eprintln!("[STARTTHREAD_SCHED] no events");
+        return;
+    };
+    let events = events.lock().unwrap();
+    eprintln!("[STARTTHREAD_SCHED] events={}", events.len());
+    for event in events.iter() {
+        eprintln!(
+            "[STARTTHREAD_SCHED] order={} child_tid={} parent_tid={} prio={} core={} affinity=0x{:x} result=0x{:x} first_update_us={} first_top_us={} first_needs_us={} updates={} top_count={} first_svc_us={} first_svc_core={} first_svc_imm=0x{:x} cores_last=0x{:x} tops_last={:?}",
+            event.order,
+            event.child_tid,
+            event.parent_tid,
+            event.child_priority,
+            event.child_core,
+            event.child_affinity,
+            event.run_result,
+            event.first_update_us,
+            event.first_top_us,
+            event.first_needs_us,
+            event.update_count,
+            event.top_count,
+            event.first_svc_us,
+            event.first_svc_core,
+            event.first_svc_imm,
+            event.cores_needing_last,
+            event.top_threads_last,
+        );
+    }
+}
+
 /// Scheduling state held per-core.
 /// Matches upstream `KScheduler::SchedulingState` (k_scheduler.h).
 pub struct SchedulingState {
@@ -927,7 +1102,6 @@ impl KScheduler {
                 );
             }
         }
-
         while idle_cores != 0 {
             let core_id = idle_cores.trailing_zeros() as usize;
             if let Some(mut suggested_id) = gsc.m_priority_queue.get_suggested_front(core_id as i32)
@@ -1055,6 +1229,8 @@ impl KScheduler {
 
         // Wake up waiting dummy threads.
         gsc.wakeup_waiting_dummy_threads();
+
+        record_start_thread_sched_update(cores_needing_scheduling, top_threads);
 
         (cores_needing_scheduling, migrations)
     }

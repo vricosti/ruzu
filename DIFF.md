@@ -16,6 +16,59 @@
 ### Tests
 - `cargo check -p core`
 
+## 2026-05-25 — audio_core/src/sink/sink_stream.rs vs /home/vricosti/Dev/emulators/zuyu/src/audio_core/sink/sink_stream.cpp
+
+### Intentional differences
+- Added env-gated diagnostic `RUZU_TRACE_AUDIO_APPEND_CLIP` in `SinkStream::append_buffer`. Upstream has no equivalent tracepoint; this is intentionally diagnostic-only and leaves buffer queueing, volume, channel conversion, and sample data unchanged unless the env var is set.
+
+### Unintentional differences (to fix)
+- Existing ruzu sink behavior still differs from upstream in previously documented ways, including deterministic silence/mute handling for glitchy output. This slice does not change those behaviors.
+
+### Missing items
+- Root-cause the upstream renderer command or voice/effect state that produces saturated PCM before `SinkStream::append_buffer`.
+
+### Binary layout verification
+- N/A: diagnostic host logging only. No guest-visible raw payload layout changed.
+
+### Tests
+- `cargo check -p audio_core`
+
+## 2026-05-25 — audio_core/src/renderer/command/effect/aux_.rs vs /home/vricosti/Dev/emulators/zuyu/src/audio_core/renderer/command/effect/aux_.cpp and /home/vricosti/Dev/emulators/zuyu/src/audio_core/renderer/command/effect/aux_.h
+
+### Intentional differences
+- Added experimental env-gated diagnostic/workaround `RUZU_ZERO_AUX_OUTPUT`. When enabled, ruzu still executes the upstream-like AUX send/write and return/read path, then clears the output mix buffer to zero. This is used to validate whether MK8D's modem-like audio comes from uninitialized AUX return-buffer contents. Default behavior remains unchanged.
+
+### Unintentional differences (to fix)
+- The default AUX command path remains structurally close to upstream, but ruzu uses safe range helpers and guest-memory accessor wrappers rather than upstream direct `processor.mix_buffers.subspan(...)` and `memory.ReadBlockUnsafe/WriteBlockUnsafe`.
+- The new `RUZU_ZERO_AUX_OUTPUT` path is explicitly not upstream behavior and must not be left enabled by default.
+
+### Missing items
+- If the zero-output experiment confirms the issue, identify why the AUX return buffer contains invalid samples in ruzu before replacing this knob with an upstream-faithful fix.
+
+### Binary layout verification
+- N/A: command payload layout unchanged.
+
+### Tests
+- Pending runtime experiment with `RUZU_ZERO_AUX_OUTPUT=1`.
+
+## 2026-05-25 — audio_core/src/adsp/apps/audio_renderer/command_list_processor.rs vs /home/vricosti/Dev/emulators/zuyu/src/audio_core/adsp/apps/audio_renderer/command_list_processor.cpp
+
+### Intentional differences
+- Added env-gated diagnostic `RUZU_TRACE_MIX_BUFFER_CLIP` around the command execution loop. It records mix-buffer stats before and after each enabled command and logs transitions where `i32::MIN` or clipped sample counts change. This is diagnostic-only and inactive unless explicitly enabled; upstream has no equivalent runtime logging.
+
+### Unintentional differences (to fix)
+- Ruzu still parses command headers through copied POD payload readers and dispatch helpers instead of upstream's direct `reinterpret_cast<Renderer::ICommand*>` virtual dispatch structure.
+- Ruzu's command loop has additional size/negative checks (`try_from(header.size)`, minimum header size check) not present in upstream's loop. These are defensive and should be audited before declaring command processing structurally complete.
+
+### Missing items
+- Full command processor ownership parity audit after the audio corruption source is identified, especially around payload dispatch and `Verify()` behavior.
+
+### Binary layout verification
+- N/A for this diagnostic slice. No command list header or command payload layout changed.
+
+### Tests
+- `cargo check -p audio_core`
+
 ## 2026-05-25 — core/src/arm/dynarmic/arm_dynarmic_32.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/arm/dynarmic/arm_dynarmic_32.cpp
 
 ### Intentional differences
@@ -17498,6 +17551,142 @@ The following still panic because upstream either also throws NotImplementedExce
 
 ### Tests
 - `cargo check -p video_core`
+
+## 2026-05-26 — core/src/hle/kernel/svc_dispatch.rs, core/src/hle/kernel/svc/svc_thread.rs, core/src/hle/kernel/k_scheduler.rs, and core/src/cpu_manager.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/svc.cpp, /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/svc/svc_thread.cpp, /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/k_scheduler.cpp, and /home/vricosti/Dev/emulators/zuyu/src/core/cpu_manager.cpp
+
+### Intentional differences
+- Added env-gated diagnostic-only in-memory profiles: `RUZU_PROFILE_SVC_SUMMARY=1` and `RUZU_PROFILE_THREAD_LIFECYCLE=1`. Upstream has no equivalent production path; this is a ruzu investigation aid for MK8D side-by-side thread/SVC census without per-event stderr logging.
+- `RUZU_PROFILE_SVC_SUMMARY=1` records fixed-size atomic counters by `(tid, svc_imm)`, plus first/last timestamps and last core/imm per tid. This deliberately avoids `RUZU_SVC_TRACE=1` style per-SVC output because that changes guest timing.
+- Added `RUZU_PROFILE_SVC_RING=1`, a bounded in-memory chronological SVC ring captured from `CpuManager::multi_core_run_guest_thread` before dispatch. It records sequence, timestamp, tid, current priority, core, SVC imm, PC/LR/SP, and the first eight SVC args, then dumps only through the existing SIGUSR2/atexit profile path. This directly supports ruzu/zuyu chronology comparison without hot-path per-SVC stderr.
+- `RUZU_PROFILE_THREAD_LIFECYCLE=1` records `CreateThread`/`StartThread` metadata in memory and dumps it through the existing `SIGUSR2`/atexit profile path. The data mirrors upstream-visible SVC arguments and resolved thread start state without changing SVC behavior.
+- Added `RUZU_PROFILE_STARTTHREAD_SCHED=1`, an env-gated scheduler correlation profile that records `StartThread` attempts/results, first scheduler update, first time the child becomes a top thread, first core-needs-scheduling bit, and first child SVC. This is diagnostic-only and does not change upstream scheduler selection or migration logic.
+- Added `RUZU_DUMP_SVC_CONTEXT_LR=0x...[,0x...]`, an env-gated targeted context dump for SVCs whose ARM32 LR matches selected guest call sites. It prints registers and selected guest-memory words only on matching SVCs, avoiding full SVC stream logging. `RUZU_DUMP_SVC_CONTEXT_TID=75,86` can further restrict the dump to selected guest thread IDs so unrelated SDK call sites do not consume the dump limit.
+- Added experimental `RUZU_STARTTHREAD_RESCHEDULE=1`, which forces `KScheduler::reschedule_current_core_raw` immediately after a successful `StartThread`. This is diagnostic-only and tests whether ruzu is missing upstream's scheduler-lock unlock-time `RescheduleCurrentCore` behavior after `KThread::Run()`.
+
+### Unintentional differences (to fix)
+- None for default behavior. Both profiles are disabled unless the corresponding environment variable is set.
+
+### Missing items
+- Equivalent low-perturbation census/scheduler correlation support is not present in upstream zuyu; direct ruzu/zuyu comparison still needs either an existing upstream diagnostic build or an external trace source.
+- `RUZU_PROFILE_SVC_RING` preserves only the most recent bounded window, not a full unbounded trace. Increase `RUZU_PROFILE_SVC_RING_CAP` for longer windows if needed. The recorded priority is sampled from ruzu's `KThread` at SVC entry and is diagnostic metadata, not guest-visible state.
+- `RUZU_DUMP_SVC_CONTEXT_LR` and `RUZU_DUMP_SVC_CONTEXT_TID` are ruzu-only diagnostic plumbing and should remain disabled by default; they are not upstream behavior ports.
+- `RUZU_STARTTHREAD_RESCHEDULE` is a diagnostic workaround, not the final fix. If it matches zuyu timing, the upstream-faithful fix belongs in the scheduler-lock unlock / `KThread::Run()` reschedule path rather than permanently special-casing `svcStartThread`.
+
+### Binary layout verification
+- N/A: diagnostic host-side counters only. No guest-visible raw payload layout changed.
+
+### Tests
+- `cargo check -p core --lib`
+- `cargo check --bin ruzu-cmd`
+- Runtime MK8D smoke: `RUZU_PROFILE_SVC_SUMMARY=1 RUZU_PROFILE_THREAD_LIFECYCLE=1 RUZU_PROFILE_STARTTHREAD_SCHED=1`, dump via `SIGUSR2`; produced `threads_seen=30`, `created=35`, `started=29`, and showed `tid=86` first child SVC roughly 20ms after `StartThread` without per-SVC logging.
+- Pending follow-up runtime check for `RUZU_DUMP_SVC_CONTEXT_LR`, targeting MK8D SDK call sites `0x01D2B7E8`, `0x01D33100`, and `0x01D2B2D4`.
+
+## 2026-05-26 — core/src/hle/kernel/svc/svc_ipc.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/svc/svc_ipc.cpp, /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/k_client_session.cpp, /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/k_server_session.cpp, and /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/server_manager.cpp
+
+### Intentional differences
+- Added env-gated `RUZU_YIELD_AFTER_IPC=1`, which calls `KScheduler::yield_without_core_migration(...)` after an inline HLE IPC reply. This is diagnostic-only and verifies that simple queue rotation can run same-priority workers after IPC, but it does not match upstream because the client thread is still runnable while the HLE handler runs inline.
+- Added env-gated `RUZU_SERVER_THREAD_IPC_HANDLE=0x...[,0x...]` with optional `RUZU_SERVER_THREAD_IPC_LIMIT=N`. For selected handles only, ruzu enqueues the request, marks the client thread as IPC-waiting, processes the request on a one-shot host worker, sends the reply, and resumes through `KServerSession::send_reply()`. This is an investigation bridge toward upstream's `KClientSession::SendSyncRequest` → `KServerSession::OnRequest` → `ServerManager::OnSessionEvent` lifecycle, not a final architecture.
+- Added `RUZU_TRACE_SERVER_THREAD_IPC=1`, targeted only at the selected one-shot IPC path, to identify whether the experiment blocks in enqueue, receive, dispatch, or reply.
+
+### Unintentional differences (to fix)
+- Ruzu still defaults to inline HLE IPC in `svc_ipc.rs`. Upstream never completes normal HLE service dispatch directly inside `Svc::SendSyncRequestImpl`; it enqueues a `KSessionRequest`, transitions the client through `BeginWait`, and the server manager receives/completes/replies on the service side.
+- The one-shot worker is deliberately less faithful than upstream `ServerManager`: it is per-request, host-thread spawned, and selected by guest handle. It proved the scheduler ordering issue but should be replaced by real server-manager session processing.
+- `KServerSession::OnRequest` in ruzu still does not own the `BeginWait` transition by default. The experiment performs that transition in `svc_ipc.rs` because enabling it globally currently blocks early `sm:` IPC before the full service-thread path is ready.
+
+### Missing items
+- Port the default synchronous HLE IPC lifecycle so `KClientSession::send_sync_request_with_process(...)`/`KServerSession::on_request_with_process(...)` put the client thread into IPC wait and return only after `KServerSession::send_reply()` ends that wait, matching upstream ownership.
+- Wire all HLE sessions through `ServerManager::OnSessionEvent` instead of relying on `svc_ipc.rs` inline receive/complete/reply.
+- Fix the Rust scheduler-lock interaction observed during the experiment: wrapping `begin_wait()` in `KScopedSchedulerLock` inside the current inline SVC stack deadlocked, while upstream performs this under `KScopedSchedulerLock`.
+
+### Binary layout verification
+- N/A: kernel scheduling/IPC lifecycle only. No guest-visible raw payload layout changed.
+
+### Tests
+- `cargo build --release --bin ruzu-cmd`
+- Runtime chronology check: `RUZU_SERVER_THREAD_IPC_HANDLE=0x601F5 RUZU_PROFILE_SVC_RING=1` makes the MK8D post-thread-batch sequence match upstream shape: after the first `SendSyncRequest(0x601F5)`, the prio-44 workers enter their waits and the prio-45 worker reaches `WaitProcessWideKeyAtomic(cv=0x69A545AC)` before tid75 signals the queue.
+- Runtime progression check: `RUZU_SERVER_THREAD_IPC_HANDLE=0x601F5 RUZU_SERVER_THREAD_IPC_LIMIT=1 RUZU_PROFILE_BQP_SLOTS=1 RUZU_PROFILE_HWC_CACHE=1 timeout 35 ...` did not produce BQP/HWC progress, so this scheduler-ordering fix is necessary for parity but not sufficient to unblock MK8D visuals.
+
+## 2026-05-25 — audio_core/src/renderer/command/effect/capture.rs vs /home/vricosti/Dev/emulators/zuyu/src/audio_core/renderer/command/effect/capture.cpp and capture.h
+
+### Intentional differences
+- Rust still routes guest-memory access through `guest_read_block` / `guest_write_block` instead of upstream's explicit `Core::Memory::Memory&` parameter on `CommandListProcessor`. This preserves the existing ruzu audio command plumbing while matching the same guest-memory read/write targets.
+- Rust returns early if the guest-memory bridge read/write fails. Upstream uses `ReadBlockUnsafe` / `WriteBlockUnsafe` and does not expose failure through the helper.
+
+### Unintentional differences (to fix)
+- The capture command still uses Rust range validation for the input mix buffer before processing. Upstream directly takes a `subspan(input * sample_count, sample_count)`.
+- `verify_capture_command` remains a trivial `true`, matching upstream `CaptureCommand::Verify`, but broader command verifier dispatch parity is not audited in this slice.
+
+### Missing items
+- No missing `CaptureCommand::Process` helper identified in this slice. MK8D clipping diagnostics showed `Capture` was not present in the observed AUX corruption path, so this is a parity debt fix rather than the direct MK8D modem-audio fix.
+
+### Binary layout verification
+- PASS: `CapturePayload` layout was not changed. The new helper code only changes host-side processing of the existing payload.
+
+### Tests
+- `cargo check -p audio_core`
+- Runtime MK8D diagnostic: `RUZU_TRACE_MIX_BUFFER_CLIP=1` showed zero `type=Capture` entries in the observed clipping path; clipping starts at `type=Aux`.
+
+## 2026-05-25 — audio_core/src/renderer/command/effect/aux_.rs vs /home/vricosti/Dev/emulators/zuyu/src/audio_core/renderer/command/effect/aux_.cpp and aux_.h
+
+### Intentional differences
+- Added `RUZU_TRACE_AUX_READ_BAD=1`, an env-gated diagnostic that logs AUX return-buffer reads containing clearly invalid samples together with AUX ring metadata (`info_read`, `info_write`, target offset, and read address). This is diagnostic-only and does not change behavior when unset.
+- Added `RUZU_SANITIZE_AUX_RETURN=1`, an env-gated MK8D workaround that zeros samples read from the AUX return buffer when they are outside the final i16 output range before they re-enter the mix graph. Upstream `ReadAuxBufferDsp` copies return-buffer samples directly; this is intentionally not enabled by default and exists to avoid playing corrupted AUX return data while the upstream source of those samples is investigated.
+- `RUZU_ZERO_AUX_OUTPUT=1` remains a broader diagnostic workaround that zeros the whole AUX output mix buffer after readback. The new sanitize path is narrower and preserves non-extreme AUX samples.
+
+### Unintentional differences (to fix)
+- Ruzu can observe MK8D AUX return-buffer samples such as `i32::MIN` and `4194303`, which then saturate in `DeviceSink` and produce the reported modem-like audio. The equivalent upstream path does not sanitize these samples, so the real remaining divergence is earlier: why ruzu sees corrupted/invalid AUX return contents while zuyu does not.
+- `read_aux_buffer` still uses ruzu's global guest-memory bridge and defensive early returns. Upstream reads through `Core::Memory::Memory&` and assumes command generation validated the mapped buffers.
+
+### Missing items
+- Identify the writer/state-machine divergence that leaves MK8D's AUX return ring with invalid samples. Current write-watch attempts with full/partial fastmem disable were too slow to reach the bad AUX reads in the same timing window.
+
+### Binary layout verification
+- PASS: `AuxPayload` layout was not changed. New counters and helpers are file-local; no command payload fields moved.
+
+### Tests
+- `cargo check -p audio_core`
+- `cargo build --release --bin ruzu-cmd`
+- Runtime MK8D diagnostic: `RUZU_TRACE_AUX_READ_BAD=1` showed invalid samples read from return ring `0x814FD180..0x815041FF`, e.g. `info_read=5760`, `info_write=2880`, `bad_value=-2147483648`.
+- Runtime MK8D workaround validation: `RUZU_SANITIZE_AUX_RETURN=1 RUZU_TRACE_DEVICE_SINK_CLIP=1 RUZU_TRACE_MIX_BUFFER_CLIP=1` reduced `DEVICE_SINK_CLIP`, `MIX_BUFFER_CLIP`, and `AUDIO_GLITCH_MUTE` to zero over a 45s run.
+
+## 2026-05-25 — audio_core/src/renderer/command/sink/device.rs vs /home/vricosti/Dev/emulators/zuyu/src/audio_core/renderer/command/sink/device.cpp and /home/vricosti/Dev/emulators/zuyu/src/audio_core/renderer/command/sink/device.h
+
+### Intentional differences
+- Added env-gated diagnostic `RUZU_TRACE_DEVICE_SINK_CLIP` in the Rust `DeviceSinkCommand` counterpart file. It logs raw i32 mix-buffer min/max, clamp count, required sample range, and first per-channel values before conversion to i16. This is diagnostic-only and inactive unless explicitly enabled; upstream has no equivalent runtime logging.
+
+### Unintentional differences (to fix)
+- Ruzu still clamps `input_count` against `buffer_count` before processing. Upstream iterates the command's `input_count` directly.
+- Ruzu still rejects negative input indices in `Verify` and before processing. Upstream `DeviceSinkCommand::Verify` returns `true` and `Process` has no equivalent early return.
+- Ruzu duplicates payload processing through both `DeviceSinkPayload::process` and `process_device_command`; upstream owns the behavior in `DeviceSinkCommand::Process`.
+- Ruzu writes `SinkBuffer.tag = 0`; upstream sets `tag` to the stack sample buffer pointer before `AppendBuffer`.
+
+### Missing items
+- Decide whether to remove the Rust-side `input_count` clamp and negative-index rejection to match upstream exactly after the clipping trace identifies whether MK8D ever sends divergent command payloads.
+- Collapse the duplicate Rust processing paths if the command executor no longer requires both forms.
+
+### Binary layout verification
+- N/A for this diagnostic slice. No command payload fields changed.
+
+### Tests
+- `cargo check -p audio_core`
+
+## 2026-05-25 — core/src/hle/service/nvdrv/devices/nvmap.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/nvdrv/devices/nvmap.cpp
+
+### Intentional differences
+- Ruzu uses `ProcessLock`/Rust page-table access and `debug_assert_eq!(lock_result, 0)` instead of upstream's `ASSERT(...IsSuccess())`; this preserves the same success contract through the Rust kernel API.
+- Ruzu does not expose upstream's `is_out_io` out-parameter from `LockForMapDeviceAddressSpace`; the current Rust page-table method does not return that value.
+
+### Unintentional differences (to fix)
+- None for the `IocAlloc` address/size lock range touched by this slice. Ruzu now locks `HandleInner::address` and `HandleInner::size` after `Handle::alloc`, matching upstream `handle_description->address` and `handle_description->size`.
+
+### Missing items
+- Full `nvmap.cpp` parity audit remains open outside `IocAlloc`; this slice only corrects the device-address-space lock range.
+
+### Binary layout verification
+- PASS: no ioctl payload structs changed. `IocAllocParams` remains 32 bytes; only the host-side page-table lock address source changed.
+
+### Tests
+- `cargo check -p core`
 
 ## 2026-05-25 — video_core/src/renderer_opengl/gl_rasterizer.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_graphics_pipeline.cpp
 

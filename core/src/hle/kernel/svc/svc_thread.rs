@@ -20,6 +20,159 @@ use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 
 const FALLBACK_USER_THREAD_STACK_SIZE: u64 = 0x100000;
 
+#[derive(Clone)]
+struct ThreadLifecycleEntry {
+    tid: u64,
+    parent_tid: u64,
+    handle: Handle,
+    entry_point: u64,
+    arg: u64,
+    stack_bottom: u64,
+    priority: i32,
+    requested_core_id: i32,
+    effective_core_id: i32,
+    created_order: u64,
+    started_order: u64,
+    start_result: u32,
+    start_core_id: i32,
+    start_current_core: i32,
+    start_affinity: u64,
+}
+
+static THREAD_LIFECYCLE_PROFILE: std::sync::OnceLock<
+    Mutex<std::collections::BTreeMap<u64, ThreadLifecycleEntry>>,
+> = std::sync::OnceLock::new();
+static THREAD_LIFECYCLE_CREATE_ORDER: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+static THREAD_LIFECYCLE_START_ORDER: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+fn thread_lifecycle_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("RUZU_PROFILE_THREAD_LIFECYCLE").is_some())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_thread_create_profile(
+    tid: u64,
+    parent_tid: u64,
+    handle: Handle,
+    entry_point: u64,
+    arg: u64,
+    stack_bottom: u64,
+    priority: i32,
+    requested_core_id: i32,
+    effective_core_id: i32,
+) {
+    if !thread_lifecycle_enabled() {
+        return;
+    }
+
+    let order = THREAD_LIFECYCLE_CREATE_ORDER.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    let map = THREAD_LIFECYCLE_PROFILE.get_or_init(|| Mutex::new(std::collections::BTreeMap::new()));
+    map.lock().unwrap().insert(
+        tid,
+        ThreadLifecycleEntry {
+            tid,
+            parent_tid,
+            handle,
+            entry_point,
+            arg,
+            stack_bottom,
+            priority,
+            requested_core_id,
+            effective_core_id,
+            created_order: order,
+            started_order: 0,
+            start_result: u32::MAX,
+            start_core_id: -1,
+            start_current_core: -1,
+            start_affinity: 0,
+        },
+    );
+}
+
+fn record_thread_start_profile(
+    tid: u64,
+    result: u32,
+    core_id: i32,
+    current_core: i32,
+    affinity: u64,
+) {
+    if !thread_lifecycle_enabled() {
+        return;
+    }
+
+    let order = THREAD_LIFECYCLE_START_ORDER.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    let map = THREAD_LIFECYCLE_PROFILE.get_or_init(|| Mutex::new(std::collections::BTreeMap::new()));
+    let mut guard = map.lock().unwrap();
+    if let Some(entry) = guard.get_mut(&tid) {
+        entry.started_order = order;
+        entry.start_result = result;
+        entry.start_core_id = core_id;
+        entry.start_current_core = current_core;
+        entry.start_affinity = affinity;
+    } else {
+        guard.insert(
+            tid,
+            ThreadLifecycleEntry {
+                tid,
+                parent_tid: 0,
+                handle: INVALID_HANDLE,
+                entry_point: 0,
+                arg: 0,
+                stack_bottom: 0,
+                priority: 0,
+                requested_core_id: -1,
+                effective_core_id: -1,
+                created_order: 0,
+                started_order: order,
+                start_result: result,
+                start_core_id: core_id,
+                start_current_core: current_core,
+                start_affinity: affinity,
+            },
+        );
+    }
+}
+
+pub fn dump_thread_lifecycle_profile() {
+    let Some(map) = THREAD_LIFECYCLE_PROFILE.get() else {
+        return;
+    };
+    let mut rows: Vec<ThreadLifecycleEntry> = map.lock().unwrap().values().cloned().collect();
+    if rows.is_empty() {
+        return;
+    }
+    rows.sort_by_key(|entry| entry.created_order);
+    let started = rows.iter().filter(|entry| entry.started_order != 0).count();
+    eprintln!(
+        "[THREAD_LIFECYCLE] created={} started={}",
+        rows.len(),
+        started
+    );
+    for entry in rows {
+        eprintln!(
+            "[THREAD_LIFECYCLE] create#{:<3} start#{:<3} tid={:<4} parent={:<4} handle=0x{:X} entry=0x{:X} arg=0x{:X} stack=0x{:X} prio={} requested_core={} effective_core={} start_core={} current_core={} affinity=0x{:X} result=0x{:X}",
+            entry.created_order,
+            entry.started_order,
+            entry.tid,
+            entry.parent_tid,
+            entry.handle,
+            entry.entry_point,
+            entry.arg,
+            entry.stack_bottom,
+            entry.priority,
+            entry.requested_core_id,
+            entry.effective_core_id,
+            entry.start_core_id,
+            entry.start_current_core,
+            entry.start_affinity,
+            entry.start_result,
+        );
+    }
+}
+
 fn should_trace_sleep_debug() -> bool {
     std::env::var_os("RUZU_TRACE_SLEEP").is_some()
 }
@@ -239,13 +392,24 @@ pub fn create_thread(
     match process.handle_table.add(object_id) {
         Ok(handle) => {
             *out_handle = handle;
+            let parent_tid = system
+                .current_thread()
+                .map(|t| t.lock().unwrap().get_thread_id())
+                .unwrap_or(0);
+            record_thread_create_profile(
+                thread_id,
+                parent_tid,
+                handle,
+                entry_point,
+                arg,
+                stack_bottom,
+                priority,
+                requested_core_id,
+                core_id,
+            );
             // RUZU_SVC_TRACE_THREAD: matches zuyu's [SVC_CREATE_THREAD] line
             // so the cross-emulator diff can count creations 1:1.
             if std::env::var_os("RUZU_SVC_TRACE_THREAD").is_some() {
-                let parent_tid = system
-                    .current_thread()
-                    .map(|t| t.lock().unwrap().get_thread_id())
-                    .unwrap_or(0);
                 log::warn!(
                     "[SVC_CREATE_THREAD] tid={} parent_tid={} entry=0x{:X} stack=0x{:X} prio={} core={}",
                     thread_id, parent_tid, entry_point, stack_bottom, priority, core_id
@@ -385,6 +549,17 @@ pub fn start_thread(system: &System, thread_handle: Handle) -> ResultCode {
         crate::hle::kernel::startthread_gap::set_start(child_tid, now_ns);
     }
 
+    {
+        let thread_guard = thread.lock().unwrap();
+        crate::hle::kernel::k_scheduler::record_start_thread_sched_attempt(
+            thread_guard.get_thread_id(),
+            system.current_thread_id().unwrap_or(0),
+            thread_guard.priority,
+            thread_guard.get_active_core(),
+            thread_guard.physical_affinity_mask.get_affinity_mask(),
+        );
+    }
+
     let result = KThread::run_thread(&thread);
     {
         let thread_guard = thread.lock().unwrap();
@@ -393,6 +568,8 @@ pub fn start_thread(system: &System, thread_handle: Handle) -> ResultCode {
         let active_core = thread_guard.get_active_core();
         let current_core = thread_guard.get_current_core();
         let affinity = thread_guard.physical_affinity_mask.get_affinity_mask();
+        crate::hle::kernel::k_scheduler::record_start_thread_sched_result(tid, result);
+        record_thread_start_profile(tid, result, active_core, current_core, affinity);
         log::trace!(
             "svc::StartThread result handle=0x{:08X} tid={} state={:?} core_id={} current_core={} affinity=0x{:X} result={:#x}",
             thread_handle, tid, state, active_core, current_core, affinity, result,
@@ -437,6 +614,28 @@ pub fn start_thread(system: &System, thread_handle: Handle) -> ResultCode {
                     );
                 }
                 std::thread::sleep(std::time::Duration::from_micros(us));
+            }
+        }
+    }
+
+    // EXPERIMENT (RUZU_STARTTHREAD_RESCHEDULE=1): force an actual scheduler
+    // fiber handoff after making the child runnable. A host sleep above pauses
+    // the whole core OS thread; it does not necessarily run the child fiber.
+    // This tests whether ruzu is missing upstream's KScopedSchedulerLock
+    // unlock-time RescheduleCurrentCore path after KThread::Run().
+    if result == 0 && std::env::var_os("RUZU_STARTTHREAD_RESCHEDULE").is_some() {
+        if let Some(kernel) = system.kernel() {
+            if let Some(scheduler_arc) = kernel.current_scheduler() {
+                let sched_ptr = {
+                    let guard = scheduler_arc.lock().unwrap();
+                    &*guard as *const crate::hle::kernel::k_scheduler::KScheduler
+                        as *mut crate::hle::kernel::k_scheduler::KScheduler
+                };
+                unsafe {
+                    crate::hle::kernel::k_scheduler::KScheduler::reschedule_current_core_raw(
+                        sched_ptr,
+                    );
+                }
             }
         }
     }

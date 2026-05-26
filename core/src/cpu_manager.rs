@@ -770,7 +770,10 @@ impl CpuManager {
                     svc_num,
                     mut svc_args,
                 } => {
-                    let current_thread_id = thread_arc.lock().unwrap().get_thread_id();
+                    let (current_thread_id, current_thread_priority) = {
+                        let thread = thread_arc.lock().unwrap();
+                        (thread.get_thread_id(), thread.get_priority())
+                    };
                     if current_thread_id == 17 || current_thread_id >= 18 {
                         let mut tc = crate::arm::arm_interface::ThreadContext::default();
                         jit_ref.get_context(&mut tc);
@@ -818,6 +821,16 @@ impl CpuManager {
                         jit_ref.get_context(&mut tc_pc);
                         crate::hle::kernel::kernel::record_guest_full(
                             core_index, tc_pc.pc, tc_pc.lr, tc_pc.sp, &tc_pc.r,
+                        );
+                        crate::hle::kernel::svc_dispatch::record_svc_ring(
+                            current_thread_id,
+                            current_thread_priority,
+                            core_index as i32,
+                            svc_num,
+                            tc_pc.pc,
+                            tc_pc.lr,
+                            tc_pc.sp,
+                            &svc_args,
                         );
                     }
                     let system_ref = kernel.system();
