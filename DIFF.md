@@ -17552,6 +17552,36 @@ The following still panic because upstream either also throws NotImplementedExce
 ### Tests
 - `cargo check -p video_core`
 
+## 2026-05-27 — core/src/hle/service/server_manager.rs, core/src/hle/service/sm/sm.rs, core/src/hle/service/hle_ipc.rs, core/src/hle/kernel/svc/svc_ipc.rs, core/src/hle/kernel/k_scheduler.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/server_manager.cpp, sm.cpp, and /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/k_scheduler.cpp
+
+### Intentional differences
+- Ruzu keeps host-thread IPC routing behind a single env knob `RUZU_HOST_THREAD_IPC=1` instead of making it default. Upstream always routes through `ServerManager::LoopProcess`, but flipping the knob on by default exposes a pre-existing host-fiber boot-time readiness race (MK8D reaches `am::NotifyRunning` in ~33 % of runs vs ~80 % inline). Inline remains the default until that race is fixed.
+- `ServerManager::register_session` mirrors the session into the host fiber's KProcess via `register_session_object` so that the kernel-backed `MultiWait::wait_any` can resolve its parent id. Sessions created via `HLERequestContext::create_session_with_manager_object_id` get synthetic object ids (counter starting at `0x1000_0000`) registered only in the guest process; without this mirror the wait fails systematically with `RESULT_INVALID_HANDLE`. Upstream `MultiWait::WaitAny` works on native `KSession*` pointers and is process-agnostic — this bridges the gap until the wait path itself goes process-agnostic.
+- `ServerManager::wait_and_process_impl` performs a local non-blocking signaled-holder scan before entering the kernel wait, and on guest-core fibers falls back to a bounded `wakeup_event.wait_timeout(100 ms)` when `wait_any` returns `None`. Without the bound, that path spins at ~200 K iter/sec and starves every other guest-service fiber sharing the same core.
+- `ServerManager::complete_sync_request` installs a `ClientThreadImpersonationGuard` (RAII) that swaps the host fiber's `CURRENT_THREAD` thread-local with the IPC's client thread for the lifetime of one handler dispatch. Handlers that read `system.current_thread()` (and chase `parent`/`scheduler`) then see the guest fiber that issued the request rather than the host fiber's dummy KThread.
+- `SessionRequestManager::new_with_registration_queue` is a Rust lifecycle adapter for the window where `register_named_service` has published a port but `KernelCore::run_server` has not yet republished the final `Weak<ServerManager>`. It preserves the queue+wakeup endpoint needed for host-thread IPC until full ownership is available.
+- `KScheduler::{schedule_raw_if_needed,reschedule_current_core_impl}` disables dispatch on the thread captured before the fiber switch and only re-enables if the disable count is still positive. Upstream `GetCurrentThread().DisableDispatch(); Schedule(); GetCurrentThread().EnableDispatch();` assumes thread identity is stable across the call; ruzu's TLS/fiber handoff can otherwise re-read a different current thread.
+- Added env-gated diagnostics for `ServerManager` and host-thread IPC queue selection (`RUZU_TRACE_SERVER_MANAGER_IPC`, `RUZU_TRACE_SERVER_MANAGER_LOOP`, `RUZU_TRACE_HOST_THREAD_IPC`, `RUZU_TRACE_MULTI_WAIT`, `RUZU_TRACE_SM_OWNERSHIP`). All inactive by default and do not affect guest-visible payload layout.
+
+### Unintentional differences (to fix)
+- Ruzu still uses the inline IPC path by default; upstream `ServerManager::OnSessionEvent` owns HLE request dispatch. The host-thread route (`RUZU_HOST_THREAD_IPC=1`) is functional end-to-end (reaches `am::NotifyRunning` + audio loop) but flaky at boot.
+- The Rust service-registration lifecycle still publishes service ports before the final `ServerManager` weak reference is available; queue-only ownership is a compatibility bridge, not full upstream structural parity.
+
+### Missing items
+- Root-cause the host-fiber boot-time readiness race so `RUZU_HOST_THREAD_IPC=1` can become the default. Hypothesis: guest fibers start issuing IPCs before some host fibers reach `loop_process` → `wait_and_process_impl` → `wakeup_event.wait_timeout`, and the wakeup signal that arrives in that gap is missed by some service.
+- Remove the legacy spawn-based fallback (`host_thread_ipc_spawn_fallback`) once all sessions have reliable ServerManager ownership.
+- Replace the process-id based `MultiWait` resolution with an upstream-faithful wait model over stable kernel object references, so the per-process session mirror in `register_session` becomes unnecessary.
+
+### Binary layout verification
+- N/A: scheduler/service routing only. No guest-visible raw payload layout changed.
+
+### Tests
+- `cargo check --bin ruzu-cmd` clean.
+- `cargo build --release --bin ruzu-cmd` clean (4 pre-existing warnings).
+- `git diff --check` clean.
+- Runtime MK8D default inline smoke (`RUZU_DISABLE_ASLR=1 RUZU_RNG_SEED=0`, 25 s timeout): 4/5 runs reach `am::NotifyRunning`.
+- Runtime MK8D opt-in smoke (`RUZU_HOST_THREAD_IPC=1`, 30 s timeout): 1/3 runs reach `am::NotifyRunning` + audio glitch-mute (game loop entry). Flakiness tracked as the host-fiber boot race.
+
 ## 2026-05-26 — core/src/hle/kernel/svc_dispatch.rs, core/src/hle/kernel/svc/svc_thread.rs, core/src/hle/kernel/k_scheduler.rs, and core/src/cpu_manager.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/svc.cpp, /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/svc/svc_thread.cpp, /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/k_scheduler.cpp, and /home/vricosti/Dev/emulators/zuyu/src/core/cpu_manager.cpp
 
 ### Intentional differences

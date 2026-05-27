@@ -86,6 +86,19 @@ pub type SessionRequestHandlerPtr = Arc<dyn SessionRequestHandler>;
 pub type SessionRequestHandlerWeakPtr = Weak<dyn SessionRequestHandler>;
 pub type SessionRequestHandlerFactory = Box<dyn Fn() -> SessionRequestHandlerPtr + Send + Sync>;
 
+/// One queued session-registration request. Pushed by external handlers and
+/// drained by the owning `ServerManager`'s host thread at the start of each
+/// `wait_and_process_impl` iteration. Lets `sm.rs` / `sm_controller.rs` /
+/// `ipc_helpers.rs::push_ipc_interface` register new sessions without locking
+/// `Mutex<ServerManager>` — which is held for the lifetime of `loop_process`
+/// by the host thread itself, so external `lock()` would deadlock.
+pub type PendingRegistration = (
+    Arc<Mutex<crate::hle::kernel::k_server_session::KServerSession>>,
+    Arc<Mutex<SessionRequestManager>>,
+);
+
+pub type PendingRegistrationQueue = Arc<Mutex<Vec<PendingRegistration>>>;
+
 /// Manages the underlying HLE requests for a session, and whether (or not) the session should be
 /// treated as a domain. This is managed separately from server sessions, as this state is shared
 /// when objects are cloned.
@@ -100,6 +113,16 @@ pub struct SessionRequestManager {
     /// Reference to the owning ServerManager.
     /// Matches upstream: `Service::ServerManager& server_manager`.
     server_manager: Option<Arc<Mutex<super::server_manager::ServerManager>>>,
+    /// Cloned Arc to the ServerManager's pending-registration queue. Lets
+    /// handlers register new sessions without locking `Mutex<ServerManager>`
+    /// (which would deadlock — the host thread holds it for `loop_process`'s
+    /// lifetime). Cascades through `push_ipc_interface` / `clone_current_object`
+    /// so child SessionRequestManagers see the same queue as their parent.
+    pending_registrations: Option<PendingRegistrationQueue>,
+    /// Cloned Arc to the ServerManager's wakeup_event. Signaled after
+    /// pushing to `pending_registrations` so the host thread reacts in µs
+    /// instead of its 100 ms idle timeout.
+    server_wakeup: Option<Arc<super::os::event::Event>>,
 }
 
 #[derive(Clone)]
@@ -119,11 +142,20 @@ impl SessionRequestManager {
             session_handler: None,
             domain_handlers: Vec::new(),
             server_manager: None,
+            pending_registrations: None,
+            server_wakeup: None,
         }
     }
 
     /// Create with a ServerManager reference, matching upstream constructor:
     /// `SessionRequestManager(KernelCore& kernel, ServerManager& server_manager)`.
+    ///
+    /// This variant does NOT attempt to extract the pending-registration queue
+    /// from `server_manager` — that would require locking `Mutex<ServerManager>`,
+    /// which deadlocks if the host thread is in `loop_process`. Callers that
+    /// also have access to the parent SessionRequestManager (the common path
+    /// for nested IPC interfaces) should prefer `new_with_server_manager_full`
+    /// which propagates the queue and wakeup from the parent.
     pub fn new_with_server_manager(
         server_manager: Arc<Mutex<super::server_manager::ServerManager>>,
     ) -> Self {
@@ -134,7 +166,67 @@ impl SessionRequestManager {
             session_handler: None,
             domain_handlers: Vec::new(),
             server_manager: Some(server_manager),
+            pending_registrations: None,
+            server_wakeup: None,
         }
+    }
+
+    /// Create with full ServerManager wiring: the manager Arc plus pre-extracted
+    /// `pending_registrations` queue and `wakeup_event`. Callers extract these
+    /// once (either while already holding a lock, or directly from `&mut self`
+    /// inside `ServerManager`) and pass them in, avoiding a second
+    /// `Mutex<ServerManager>` lock.
+    pub fn new_with_server_manager_full(
+        server_manager: Arc<Mutex<super::server_manager::ServerManager>>,
+        pending_registrations: PendingRegistrationQueue,
+        wakeup: Arc<super::os::event::Event>,
+    ) -> Self {
+        Self {
+            convert_to_domain: false,
+            is_domain: false,
+            is_initialized_for_sm: false,
+            session_handler: None,
+            domain_handlers: Vec::new(),
+            server_manager: Some(server_manager),
+            pending_registrations: Some(pending_registrations),
+            server_wakeup: Some(wakeup),
+        }
+    }
+
+    /// Create with only the owning ServerManager's registration endpoints.
+    ///
+    /// Used during the short window where a service port has been published
+    /// but `KernelCore::run_server` has not yet installed the final
+    /// ServerManager weak reference. The queue+wakeup pair is sufficient for
+    /// host-thread IPC routing and is overwritten with the full manager wiring
+    /// once ownership is republished.
+    pub fn new_with_registration_queue(
+        pending_registrations: PendingRegistrationQueue,
+        wakeup: Arc<super::os::event::Event>,
+    ) -> Self {
+        Self {
+            convert_to_domain: false,
+            is_domain: false,
+            is_initialized_for_sm: false,
+            session_handler: None,
+            domain_handlers: Vec::new(),
+            server_manager: None,
+            pending_registrations: Some(pending_registrations),
+            server_wakeup: Some(wakeup),
+        }
+    }
+
+    /// Get the pending-registration queue for this session's owning
+    /// ServerManager. Used by handlers that need to register a freshly-created
+    /// session (push_ipc_interface, clone_current_object, sm::GetService)
+    /// without locking `Mutex<ServerManager>`.
+    pub fn pending_registrations(&self) -> Option<&PendingRegistrationQueue> {
+        self.pending_registrations.as_ref()
+    }
+
+    /// Get the wakeup_event of this session's owning ServerManager.
+    pub fn server_wakeup(&self) -> Option<&Arc<super::os::event::Event>> {
+        self.server_wakeup.as_ref()
     }
 
     /// Get the ServerManager reference. Matches upstream `GetServerManager()`.
@@ -871,7 +963,36 @@ impl HLERequestContext {
         &mut self,
         handler: SessionRequestHandlerPtr,
     ) -> Option<Handle> {
-        let manager = Arc::new(std::sync::Mutex::new(SessionRequestManager::new()));
+        // Inherit ServerManager + pending-registration queue + wakeup_event
+        // from the parent's SessionRequestManager, matching upstream
+        // `PushIpcInterface` / `CloneCurrentObject` semantics:
+        //   auto next_manager = make_shared<SessionRequestManager>(
+        //       kernel, manager->GetServerManager());
+        // Propagating the queue + wakeup along with the ServerManager Arc
+        // lets descendant sessions register themselves without locking
+        // `Mutex<ServerManager>` (which would deadlock against the host
+        // thread's `loop_process`).
+        let (parent_server_manager, parent_queue, parent_wakeup) = self
+            .manager
+            .as_ref()
+            .map(|m| {
+                let guard = m.lock().unwrap();
+                (
+                    guard.get_server_manager().cloned(),
+                    guard.pending_registrations().cloned(),
+                    guard.server_wakeup().cloned(),
+                )
+            })
+            .unwrap_or((None, None, None));
+        let manager = match (parent_server_manager, parent_queue, parent_wakeup) {
+            (Some(sm), Some(q), Some(w)) => Arc::new(std::sync::Mutex::new(
+                SessionRequestManager::new_with_server_manager_full(sm, q, w),
+            )),
+            (Some(sm), _, _) => Arc::new(std::sync::Mutex::new(
+                SessionRequestManager::new_with_server_manager(sm),
+            )),
+            _ => Arc::new(std::sync::Mutex::new(SessionRequestManager::new())),
+        };
         manager.lock().unwrap().set_session_handler(handler);
         self.create_session_with_manager(manager)
     }

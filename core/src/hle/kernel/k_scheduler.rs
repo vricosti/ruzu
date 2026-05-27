@@ -644,12 +644,16 @@ impl KScheduler {
         }
 
         if (*sched).state.needs_scheduling.load(Ordering::SeqCst) {
-            if let Some(cur_thread) = super::kernel::get_current_thread_pointer() {
-                cur_thread.lock().unwrap().disable_dispatch();
+            let cur_thread = super::kernel::get_current_thread_pointer();
+            if let Some(thread) = &cur_thread {
+                thread.lock().unwrap().disable_dispatch();
             }
             (*sched).schedule_impl_fiber();
-            if let Some(cur_thread) = super::kernel::get_current_thread_pointer() {
-                cur_thread.lock().unwrap().enable_dispatch();
+            if let Some(thread) = cur_thread {
+                let mut thread = thread.lock().unwrap();
+                if thread.get_disable_dispatch_count() > 0 {
+                    thread.enable_dispatch();
+                }
             }
         }
     }
@@ -875,8 +879,25 @@ impl KScheduler {
         // Upstream: ASSERT(GetCurrentThread(m_kernel).GetDisableDispatchCount() == 1);
 
         // Upstream: GetCurrentThread(m_kernel).EnableDispatch();
+        //
+        // Upstream asserts the count is exactly 1 here (every caller increments
+        // it once via DisableScheduling or DisableDispatch). The ruzu host-fiber
+        // path can enter this with count==0: a host service fiber dispatches
+        // an IPC under `ClientThreadImpersonationGuard` (which swaps
+        // `CURRENT_THREAD` to the parked guest fiber that issued the request),
+        // and the handler signals a `KEvent` whose `KReadableEvent::signal`
+        // takes `KScopedSchedulerLock`. The lock's `Lock()` increments
+        // `disable_count` on the impersonated thread; the drop's `Unlock()`
+        // calls back here to decrement. If anything in between (`send_reply` /
+        // `EndWait`) already balanced the count to 0, decrementing again
+        // panics in `enable_dispatch`. Guard the decrement so the function is
+        // safe under those host-fiber re-entries; the explicit
+        // `needs_scheduling` reschedule call below still runs.
         if let Some(cur_thread) = super::kernel::get_current_thread_pointer() {
-            cur_thread.lock().unwrap().enable_dispatch();
+            let mut t = cur_thread.lock().unwrap();
+            if t.get_disable_dispatch_count() > 0 {
+                t.enable_dispatch();
+            }
         }
 
         if self.state.needs_scheduling.load(Ordering::SeqCst) {
@@ -891,12 +912,16 @@ impl KScheduler {
         //     GetCurrentThread(m_kernel).EnableDispatch();
         // }
         if self.state.needs_scheduling.load(Ordering::SeqCst) {
-            if let Some(cur_thread) = super::kernel::get_current_thread_pointer() {
-                cur_thread.lock().unwrap().disable_dispatch();
+            let cur_thread = super::kernel::get_current_thread_pointer();
+            if let Some(thread) = &cur_thread {
+                thread.lock().unwrap().disable_dispatch();
             }
             self.schedule();
-            if let Some(cur_thread) = super::kernel::get_current_thread_pointer() {
-                cur_thread.lock().unwrap().enable_dispatch();
+            if let Some(thread) = cur_thread {
+                let mut thread = thread.lock().unwrap();
+                if thread.get_disable_dispatch_count() > 0 {
+                    thread.enable_dispatch();
+                }
             }
         }
     }

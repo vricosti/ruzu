@@ -25,6 +25,7 @@ use crate::hle::kernel::svc::svc_results::{
 use crate::hle::kernel::svc_common::INVALID_HANDLE;
 use crate::hle::result::ResultCode;
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestManager};
+use crate::hle::service::os::event::Event;
 
 const POINTER_TRANSFER_BUFFER_ALIGNMENT: usize = 0x10;
 
@@ -187,6 +188,14 @@ pub struct KServerSession {
     pub manager: Option<Arc<Mutex<SessionRequestManager>>>,
     /// Waitable synchronization state owned by KSynchronizationObject upstream.
     pub sync_object: SynchronizationObjectState,
+    /// Weak back-pointer to the owning ServerManager's wakeup_event. When
+    /// `notify_available` fires (request enqueued, client closed, etc.), the
+    /// ServerManager's host thread is signaled directly instead of waiting for
+    /// its `wait_timeout(100ms)` to expire. Upstream gets this reactivity for
+    /// free because `MultiWait::WaitAny` translates to `svcWaitSynchronization`
+    /// on the host thread; ruzu's host service threads use a host-side wait
+    /// path (no guest thread context) so we wire the wakeup explicitly.
+    pub manager_wakeup: Option<std::sync::Weak<Event>>,
 }
 
 impl KServerSession {
@@ -1569,7 +1578,15 @@ impl KServerSession {
             client_closed: false,
             manager: None,
             sync_object: SynchronizationObjectState::new(),
+            manager_wakeup: None,
         }
+    }
+
+    /// Wire the ServerManager's wakeup_event so that `notify_available` reacts
+    /// in microseconds instead of the host-thread loop's 100 ms idle timeout.
+    /// Called by `ServerManager::register_session`.
+    pub fn set_manager_wakeup(&mut self, wakeup: std::sync::Weak<Event>) {
+        self.manager_wakeup = Some(wakeup);
     }
 
     /// Initialize with a parent session.
@@ -1782,6 +1799,21 @@ impl KServerSession {
                     "KServerSession::send_reply_with_message stage=before_lock_client_thread"
                 );
             }
+            // Take the kernel scheduler lock around the WAITING-state check
+            // and the EndWait that flips it. `KThreadCell::lock()` is a no-op
+            // (the docs explicitly require the scheduler spin-lock be held by
+            // the caller as the real synchronization), so without it two host
+            // fibers can both observe `state == WAITING` and both call
+            // EndWait. The first EndWait sets state=RUNNABLE and clears
+            // `wait_queue`; the second then re-enters `end_wait`, finds
+            // state still cached as WAITING (atomic read may race), and asserts
+            // `wait_queue is None while state=Waiting` — the lost-wakeup that
+            // makes host-thread routing 1/16 unreliable.
+            //
+            // Upstream wraps this whole sequence in `KScopedSchedulerLock`
+            // inside `KServerSession::SendReplyHLE`.
+            let _scheduler_lock = crate::hle::kernel::kernel::scheduler_lock()
+                .map(super::k_scheduler_lock::KScopedSchedulerLock::new);
             let mut client_thread = client_thread.lock().unwrap();
             if trace_reply {
                 log::info!(
@@ -1992,9 +2024,22 @@ impl KServerSession {
         let Some(object_id) = self.parent_id else {
             return false;
         };
-        unsafe {
+        let woke_any = unsafe {
             k_synchronization_object::notify_waiters_on_state(&self.sync_object, object_id, result)
+        };
+        // Reactively wake the owning ServerManager's host thread. Upstream
+        // doesn't need this because `MultiWait::WaitAny` becomes a real kernel
+        // wait on the host thread, and `notify_waiters_on_state` walks that
+        // waiter list. Ruzu's host service threads use a Condvar-based wait
+        // and aren't on the synchronization object's waiter list — so without
+        // this signal, the service thread stays asleep for up to its 100 ms
+        // idle timeout before noticing `is_signaled()` flipped.
+        if let Some(weak) = self.manager_wakeup.as_ref() {
+            if let Some(event) = weak.upgrade() {
+                event.signal();
+            }
         }
+        woke_any
     }
 
     /// Destroy the server session.

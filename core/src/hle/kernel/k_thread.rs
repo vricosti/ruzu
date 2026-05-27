@@ -3021,7 +3021,9 @@ impl KThread {
         // Avoid a hard crash — log and return early like upstream.
         let Some(wait_queue) = self.wait_queue.clone() else {
             log::error!(
-                "KThread::end_wait: wait_queue is None while state=Waiting (upstream ASSERT)"
+                "KThread::end_wait: wait_queue is None while state=Waiting (upstream ASSERT) tid={} reason={:?}",
+                self.thread_id,
+                self.wait_reason_for_debugging
             );
             return;
         };

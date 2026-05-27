@@ -31,8 +31,8 @@ use crate::hle::kernel::k_scheduler::KScheduler;
 use crate::hle::kernel::k_server_session::KServerSession;
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 use crate::hle::service::hle_ipc::{
-    self, HLERequestContext, SessionRequestHandlerFactory, SessionRequestHandlerPtr,
-    SessionRequestManager,
+    self, HLERequestContext, PendingRegistrationQueue, SessionRequestHandlerFactory,
+    SessionRequestHandlerPtr, SessionRequestManager,
 };
 use crate::hle::service::os::event::Event;
 use crate::hle::service::os::multi_wait::MultiWait;
@@ -87,6 +87,30 @@ impl Session {
 
     fn holder_ptr(&self) -> *const MultiWaitHolder {
         &*self.holder as *const MultiWaitHolder
+    }
+}
+
+/// RAII guard that sets the calling host thread's CURRENT_THREAD to the IPC
+/// client thread for the lifetime of one HLE handler dispatch. Restores the
+/// previous value on drop. Used so service handlers that read
+/// `system.current_thread()` (and chase `parent`/`scheduler` from there) see
+/// the guest fiber that made the request — not the host service thread's
+/// dummy KThread (which has `parent: None` and would silently no-op).
+struct ClientThreadImpersonationGuard {
+    previous: Option<Arc<crate::hle::kernel::k_thread::KThreadLock>>,
+}
+
+impl ClientThreadImpersonationGuard {
+    fn install(client: Arc<crate::hle::kernel::k_thread::KThreadLock>) -> Self {
+        let previous = crate::hle::kernel::kernel::get_current_emu_thread();
+        crate::hle::kernel::kernel::set_current_emu_thread(Some(&client));
+        Self { previous }
+    }
+}
+
+impl Drop for ClientThreadImpersonationGuard {
+    fn drop(&mut self) {
+        crate::hle::kernel::kernel::set_current_emu_thread(self.previous.as_ref());
     }
 }
 
@@ -179,6 +203,25 @@ pub struct ServerManager {
     /// Upstream: `std::optional<MultiWaitHolder> m_deferral_holder`.
     deferral_holder: Option<Box<MultiWaitHolder>>,
 
+    /// Shared queue of pending session registrations. External handlers
+    /// push to this Arc instead of locking `Mutex<ServerManager>` (which is
+    /// held for the lifetime of `loop_process` by the host thread). The host
+    /// thread drains the queue at the start of `wait_and_process_impl`.
+    ///
+    /// Forward-compatible workaround for sm.rs / sm_controller.rs /
+    /// ipc_helpers.rs that previously called `register_session` directly on a
+    /// locked ServerManager (deadlock). Once ServerManager's master mutex is
+    /// fully refactored into per-field locks (upstream pattern), this queue
+    /// can be removed in favor of direct calls.
+    pending_registrations: PendingRegistrationQueue,
+
+    /// Service names registered via `register_named_service` /
+    /// `manage_named_port`, drained by `KernelCore::run_server` after
+    /// `bind_self_reference` to publish ownership (with a valid
+    /// `Weak<Mutex<ServerManager>>`) to `ServiceManager`. We can't publish at
+    /// registration time because `self_reference` isn't bound yet then.
+    pending_owned_service_names: Vec<String>,
+
     /// Stop flag. Upstream: `std::stop_source m_stop_source`.
     stop_requested: AtomicBool,
 
@@ -212,6 +255,31 @@ pub struct ServerManager {
 }
 
 impl ServerManager {
+    fn trace_ipc(&self, stage: &str) {
+        if std::env::var_os("RUZU_TRACE_SERVER_MANAGER_IPC").is_some() {
+            eprintln!("[SERVER_MANAGER_IPC] manager={} stage={stage}", self.name);
+        }
+    }
+
+    fn trace_ipc_counts(&self, stage: &str) {
+        if std::env::var_os("RUZU_TRACE_SERVER_MANAGER_IPC").is_some() {
+            let holders = self.multi_wait.holders_snapshot();
+            let signaled = holders
+                .iter()
+                .filter(|holder| unsafe { (*(**holder)).is_signaled() })
+                .count();
+            if signaled == 0 {
+                return;
+            }
+            eprintln!(
+                "[SERVER_MANAGER_IPC] manager={} stage={stage} holders={} signaled={}",
+                self.name,
+                holders.len(),
+                signaled
+            );
+        }
+    }
+
     fn boot_trace_enabled(&self) -> bool {
         std::env::var_os("RUZU_APPLET_BOOT_TRACE")
             .is_some_and(|value| value != std::ffi::OsStr::new("0"))
@@ -284,11 +352,49 @@ impl ServerManager {
             deferral_holder: None,
             stop_requested: AtomicBool::new(false),
             stopped: AtomicBool::new(false),
+            pending_registrations: Arc::new(Mutex::new(Vec::new())),
+            pending_owned_service_names: Vec::new(),
             pending_additional_host_threads: Vec::new(),
             host_threads: Vec::new(),
             additional_host_thread_stop: Arc::new(AtomicBool::new(false)),
             self_reference: None,
             loop_stats: LoopStats::default(),
+        }
+    }
+
+    /// Returns a clone of the pending-registration queue Arc. Used by code
+    /// that constructs a `SessionRequestManager` while it has direct access
+    /// to `&self` (e.g., `on_port_event` inside the host thread).
+    pub fn pending_registrations_arc(&self) -> PendingRegistrationQueue {
+        Arc::clone(&self.pending_registrations)
+    }
+
+    /// Returns a clone of the wakeup_event Arc. Used for the same wiring as
+    /// `pending_registrations_arc`.
+    pub fn wakeup_event_arc(&self) -> Arc<Event> {
+        Arc::clone(&self.wakeup_event)
+    }
+
+    /// Drain owned-service-name list. Called by `KernelCore::run_server`
+    /// after `bind_self_reference` to publish ownership to `ServiceManager`
+    /// with a valid `Weak<Mutex<ServerManager>>`.
+    pub fn take_owned_service_names(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.pending_owned_service_names)
+    }
+
+    /// Drain queued session registrations (called by host thread inside
+    /// `wait_and_process_impl`). External handlers can push to the queue
+    /// without locking `Mutex<ServerManager>`, then this drain runs them.
+    fn drain_pending_registrations(&mut self) {
+        let drained: Vec<_> = {
+            let mut queue = self.pending_registrations.lock().unwrap();
+            std::mem::take(&mut *queue)
+        };
+        if !drained.is_empty() {
+            self.trace_ipc("drain_pending_registrations");
+        }
+        for (server_session, manager) in drained {
+            let _ = self.register_session(server_session, manager);
         }
     }
 
@@ -386,10 +492,96 @@ impl ServerManager {
         manager: Arc<Mutex<SessionRequestManager>>,
     ) -> ResultCode {
         log::debug!("ServerManager({}): register_session", self.name);
+        // Idempotent: skip if this server_session is already registered.
+        // Drain callers (drain_pending_registrations) can push the same session
+        // multiple times if `svc_ipc.rs`'s host-thread routing path enqueues
+        // it on every IPC without checking whether it's already in
+        // self.sessions. Without this guard, the session would appear N times
+        // in `multi_wait` and `on_session_event` would be invoked N times for
+        // a single IPC arrival.
+        if self
+            .sessions
+            .iter()
+            .any(|s| Arc::ptr_eq(&s.server_session, &server_session))
+        {
+            return RESULT_SUCCESS;
+        }
+        // Mirror the session into the host fiber's KProcess so the kernel-
+        // backed `MultiWait::wait_any` can resolve its parent_id. Sessions are
+        // typically created via `push_ipc_interface` /
+        // `create_session_with_manager_object_id`, which registers the new
+        // `KSession` in the GUEST process (the caller's process). When the
+        // owning ServerManager's host fiber later calls `wait_any`, the
+        // resolver looks the parent_id up in *its* process — the host service
+        // KProcess — and gets `RESULT_INVALID_HANDLE` because the session is
+        // not registered there. The result is that `wait_any` returns `None`,
+        // the loop spins, and every other guest-service fiber sharing the
+        // same guest core starves.
+        //
+        // Upstream's `MultiWait::WaitAny` works on native `KSession*`
+        // pointers and is process-agnostic; the ruzu port resolves through
+        // object ids per-process. The least-invasive bridge is to also
+        // register the session in the current host fiber's KProcess so the
+        // kernel-backed wait succeeds.
+        if !self.system.is_null() {
+            if let Some(parent_id) = server_session.lock().unwrap().get_parent_id() {
+                if let Some(current_thread) = self.system.get().current_thread() {
+                    let process = current_thread
+                        .lock()
+                        .unwrap()
+                        .parent
+                        .as_ref()
+                        .and_then(|parent| parent.upgrade());
+                    if let Some(process) = process {
+                        let already_known = {
+                            let process_guard = process.lock().unwrap();
+                            process_guard
+                                .get_server_session_by_object_id(parent_id)
+                                .is_some()
+                        };
+                        if !already_known {
+                            // We need the owning KSession Arc (not just the
+                            // server-side). Find which process registered this
+                            // session object id, then pull the KSession Arc out
+                            // of that process so we can mirror it here.
+                            let kernel_session = self.system.get().kernel().and_then(|kernel| {
+                                kernel
+                                    .get_session_owner_process_id(parent_id)
+                                    .and_then(|owner_id| kernel.get_process_by_id(owner_id))
+                                    .and_then(|owner_process| {
+                                        owner_process
+                                            .lock()
+                                            .unwrap()
+                                            .get_session_by_object_id(parent_id)
+                                    })
+                            });
+                            if let Some(ksession) = kernel_session {
+                                process
+                                    .lock()
+                                    .unwrap()
+                                    .register_session_object(parent_id, ksession);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // Reactive wakeup wiring: only enable when the new host-thread IPC
+        // routing path will actually use it. With the default inline IPC path
+        // in svc_ipc.rs, the host thread and the guest thread would race for
+        // the session lock to call receive_request_hle, and the loser returns
+        // an error. The svc_ipc.rs path that will rely on this wakeup is
+        // responsible for ensuring the wire is set before begin_wait.
         let mut session = Session::new(server_session, manager);
         self.link_to_deferred_list_holder(&mut session.holder);
         self.sessions.push(session);
         RESULT_SUCCESS
+    }
+
+    /// Borrow the wakeup event as a Weak so that owners of `KServerSession`
+    /// can wire reactive wakeup without an Arc clone leak.
+    pub fn wakeup_event_weak(&self) -> std::sync::Weak<Event> {
+        Arc::downgrade(&self.wakeup_event)
     }
 
     /// Registers a named service with the global ServiceManager.
@@ -409,6 +601,11 @@ impl ServerManager {
             None => return RESULT_SUCCESS,
         };
 
+        // Defer publishing ownership to `ServiceManager` until after
+        // `bind_self_reference` (done by `KernelCore::run_server`) — at this
+        // point `self.self_reference` is None.
+        self.pending_owned_service_names
+            .push(service_name.to_string());
         let (port, deferral_event) = {
             let mut sm_guard = sm.lock().unwrap();
             let result = sm_guard.register_service_with_port(
@@ -429,6 +626,14 @@ impl ServerManager {
                     return result;
                 }
             };
+            sm_guard.set_service_ownership(
+                service_name,
+                crate::hle::service::sm::sm::ServiceOwnership {
+                    queue: self.pending_registrations_arc(),
+                    wakeup: self.wakeup_event_arc(),
+                    server_manager: Weak::new(),
+                },
+            );
             (port, deferral_event)
         };
         if let Some(event) = deferral_event {
@@ -507,6 +712,11 @@ impl ServerManager {
 
         let server_port_object_id = kernel.create_new_object_id() as u64;
         kernel.register_kernel_object(server_port_object_id);
+
+        // Defer publishing ownership to `ServiceManager` until after
+        // `bind_self_reference` (done by `KernelCore::run_server`). At this
+        // point `self.self_reference` is still None.
+        self.pending_owned_service_names.push(port_name.to_string());
 
         let mut server = Port::new(
             port,
@@ -628,6 +838,8 @@ impl ServerManager {
     fn link_deferred(&mut self) {
         let mut deferred_list = self.deferred_list.lock().unwrap();
         self.multi_wait.move_all(&mut deferred_list);
+        drop(deferred_list);
+        self.trace_ipc_counts("link_deferred");
     }
 
     /// Main loop for processing server events.
@@ -669,10 +881,39 @@ impl ServerManager {
     /// Wait for a signaled event and process it.
     /// Port of upstream `ServerManager::WaitAndProcessImpl`.
     fn wait_and_process_impl(&mut self) -> bool {
+        if std::env::var_os("RUZU_TRACE_SERVER_MANAGER_LOOP").is_some() {
+            let pending = self.pending_registrations.lock().unwrap().len();
+            eprintln!(
+                "[SERVER_MANAGER_LOOP] manager={} stage=iter pending_q={} wakeup_signaled={}",
+                self.name,
+                pending,
+                self.wakeup_event.is_signaled()
+            );
+        }
         self.ensure_kernel_port_registrations();
+        // Drain pending registrations queued by external handlers (sm.rs,
+        // sm_controller.rs, ipc_helpers.rs) before we wait — otherwise these
+        // sessions would not be in the multi_wait for try_wait_any_local to
+        // see, and their IPC would be invisible to the host thread.
+        self.drain_pending_registrations();
         self.link_deferred();
         if self.stop_requested.load(Ordering::Relaxed) {
             return false;
+        }
+
+        // Fast path for already-signaled holders before entering the kernel
+        // wait. Upstream `MultiWait::WaitAny` receives native object pointers;
+        // ruzu resolves object ids through the current guest process, which can
+        // be the wrong owner for ServerManager-internal port/session holders
+        // during early SM routing. The local scan preserves upstream behavior
+        // for signaled holders while still falling through to the kernel wait
+        // when nothing is immediately ready.
+        if let Some(selected) = self.multi_wait.try_wait_any_local() {
+            self.trace_ipc("try_wait_selected");
+            unsafe {
+                (*selected).unlink_from_multi_wait();
+            }
+            return self.process_holder(selected);
         }
 
         // Decide which wait path to use.
@@ -710,11 +951,27 @@ impl ServerManager {
                     return self.process_holder(selected);
                 }
             }
+            // `wait_any` returned None — either no holders are signaled, or the
+            // kernel-backed wait failed because the holders' object ids are not
+            // registered in this host service's KProcess (a known gap: the
+            // wakeup_event / sm:-port ids resolve via the GUEST process, not the
+            // service-owning KProcess). Without a bound, this turns into a tight
+            // spin (200K iter/sec) that starves every other guest_service fiber
+            // sharing the same guest core, which is what makes `LM` (or whoever
+            // loses the rotation) hang under `RUZU_SERVER_THREAD_IPC_ALL=1`.
+            // Falling back to the same 100 ms wakeup_event wait used by the host
+            // service thread path lets `signal_wakeup_event` (notify_available,
+            // link_to_deferred_list) still wake us promptly while bounding the
+            // idle cost.
+            self.wakeup_event.wait_timeout(Duration::from_millis(100));
+            self.loop_stats.idle_timeouts += 1;
+            self.log_loop_stats_if_needed("guest_core_idle_timeout");
             return false;
         }
 
         // Host service thread path.
         if let Some(selected) = self.multi_wait.try_wait_any_local() {
+            self.trace_ipc("host_try_wait_selected");
             unsafe {
                 (*selected).unlink_from_multi_wait();
             }
@@ -741,6 +998,7 @@ impl ServerManager {
             .is_some_and(|holder| std::ptr::eq(&**holder as *const MultiWaitHolder, selected))
         {
             self.loop_stats.wakeup_hits += 1;
+            self.trace_ipc("process_wakeup");
             self.log_loop_stats_if_needed("wakeup");
             self.wakeup_event.clear();
             unsafe {
@@ -788,7 +1046,7 @@ impl ServerManager {
         false
     }
 
-    fn signal_wakeup_event(&self) {
+    pub fn signal_wakeup_event(&self) {
         self.wakeup_event.signal();
     }
 
@@ -912,11 +1170,22 @@ impl ServerManager {
             manager
         } else {
             let handler = self.ports[port_index].create_handler();
+            // Use the *_full constructor and pass our own pending-registration
+            // queue + wakeup_event Arcs directly. We're inside `&mut self` on
+            // the host thread, so we can read these fields without locking
+            // anything. This makes child SessionRequestManagers propagate the
+            // queue down through push_ipc_interface / clone / sm::GetService.
+            let queue = self.pending_registrations_arc();
+            let wakeup = self.wakeup_event_arc();
             let manager = self
                 .self_reference
                 .as_ref()
                 .and_then(Weak::upgrade)
-                .map(SessionRequestManager::new_with_server_manager)
+                .map(|sm_arc| {
+                    SessionRequestManager::new_with_server_manager_full(
+                        sm_arc, queue, wakeup,
+                    )
+                })
                 .map(|manager| Arc::new(Mutex::new(manager)))
                 .unwrap_or_else(|| Arc::new(Mutex::new(SessionRequestManager::new())));
             manager.lock().unwrap().set_session_handler(handler);
@@ -932,6 +1201,7 @@ impl ServerManager {
     /// Handle a session event (incoming IPC request).
     /// Port of upstream `ServerManager::OnSessionEvent`.
     fn on_session_event(&mut self, session_index: usize) {
+        self.trace_ipc("on_session_event");
         let manager = self.sessions[session_index].manager.clone();
         let result = self.sessions[session_index]
             .server_session
@@ -1007,6 +1277,7 @@ impl ServerManager {
     /// sessions that flow through the ServerManager's event loop (e.g., from
     /// port accept or deferred retry).
     fn complete_sync_request(&mut self, session_index: usize) {
+        self.trace_ipc("complete_sync_request");
         if session_index >= self.sessions.len() {
             return;
         }
@@ -1026,6 +1297,35 @@ impl ServerManager {
             context.set_service_manager(sm);
         }
         context.set_is_deferred_value(false);
+
+        if std::env::var_os("RUZU_TRACE_HOST_THREAD_IPC").is_some() {
+            let (svc, dom) = {
+                let g = manager.lock().unwrap();
+                let svc = g
+                    .session_handler()
+                    .map(|h| h.service_name().to_string())
+                    .unwrap_or_else(|| "<none>".to_string());
+                (svc, g.is_domain())
+            };
+            eprintln!(
+                "[HOST_THREAD_IPC] dispatch manager={} service={} cmd={} dom={}",
+                self.name,
+                svc,
+                context.get_command(),
+                dom
+            );
+        }
+
+        // Impersonate the client thread on this host thread for the lifetime
+        // of the handler dispatch. Many service handlers read
+        // `system.current_thread()` expecting the guest fiber that made the
+        // IPC; without this swap they would see the host thread's dummy
+        // KThread (parent=None) and either silently no-op or fail. The guard
+        // restores the previous CURRENT_THREAD on drop so the host service
+        // thread reverts to its own dummy between IPCs.
+        let _client_thread_guard = context
+            .get_thread()
+            .map(ClientThreadImpersonationGuard::install);
 
         let service_result = hle_ipc::complete_sync_request(&manager, &mut context);
 
@@ -1050,6 +1350,7 @@ impl ServerManager {
             .lock()
             .unwrap()
             .send_reply();
+        self.trace_ipc("send_reply_done");
 
         // Check for session close.
         if reply_result == crate::hle::service::ipc_helpers::RESULT_SESSION_CLOSED.get_inner_value()
