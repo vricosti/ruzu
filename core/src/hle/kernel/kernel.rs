@@ -1734,6 +1734,35 @@ impl KernelCore {
         let manager = Arc::new(Mutex::new(server_manager));
         manager.lock().unwrap().bind_self_reference(&manager);
 
+        // Publish service ownership to ServiceManager now that
+        // bind_self_reference has set `self_reference`. connect_to_named_port
+        // can then look up (queue, wakeup, server_manager) by service name and
+        // wire the new session's SessionRequestManager non-orphan.
+        let (names, queue, wakeup) = {
+            let mut guard = manager.lock().unwrap();
+            (
+                guard.take_owned_service_names(),
+                guard.pending_registrations_arc(),
+                guard.wakeup_event_arc(),
+            )
+        };
+        if !names.is_empty() {
+            if let Some(service_manager) = self.system_ref.get().service_manager() {
+                let mut sm_guard = service_manager.lock().unwrap();
+                let server_weak = Arc::downgrade(&manager);
+                for name in names {
+                    sm_guard.set_service_ownership(
+                        &name,
+                        crate::hle::service::sm::sm::ServiceOwnership {
+                            queue: queue.clone(),
+                            wakeup: wakeup.clone(),
+                            server_manager: server_weak.clone(),
+                        },
+                    );
+                }
+            }
+        }
+
         {
             let mut managers = self.server_managers.lock().unwrap();
             if self.is_shutting_down.load(Ordering::Relaxed) {

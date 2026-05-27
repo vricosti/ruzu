@@ -141,6 +141,17 @@ impl MultiWaitHolder {
         }
     }
 
+    pub fn kind_name(&self) -> &'static str {
+        match &self.native_handle {
+            WaitableHandle::None => "none",
+            WaitableHandle::Event(_) => "evt",
+            WaitableHandle::ReadableEvent(_) => "rev",
+            WaitableHandle::Process(_) => "prc",
+            WaitableHandle::ServerPort { .. } => "prt",
+            WaitableHandle::ServerSession(_) => "ses",
+        }
+    }
+
     /// Link this holder to a MultiWait.
     pub fn link_to_multi_wait(&mut self, multi_wait: *mut MultiWait) {
         assert!(self.multi_wait.is_none(), "holder already linked");

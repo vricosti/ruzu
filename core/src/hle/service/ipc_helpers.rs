@@ -294,21 +294,40 @@ impl<'a> ResponseBuilder<'a> {
             //   manager->GetServerManager().RegisterSession(&session->GetServerSession(), next_manager);
             //   context->AddMoveObject(&session->GetClientSession());
 
-            // Get the parent manager's ServerManager reference.
-            let parent_server_manager = self
+            // Get the parent manager's ServerManager reference + pending-
+            // registration queue + wakeup_event, all in one lock acquisition.
+            let (parent_server_manager, parent_queue, parent_wakeup) = self
                 .context
                 .get_manager()
-                .and_then(|m| m.lock().unwrap().get_server_manager().cloned());
+                .map(|m| {
+                    let guard = m.lock().unwrap();
+                    (
+                        guard.get_server_manager().cloned(),
+                        guard.pending_registrations().cloned(),
+                        guard.server_wakeup().cloned(),
+                    )
+                })
+                .unwrap_or((None, None, None));
 
-            // Create child manager linked to same ServerManager.
-            let child_manager = if let Some(ref sm) = parent_server_manager {
-                std::sync::Arc::new(std::sync::Mutex::new(
-                    super::hle_ipc::SessionRequestManager::new_with_server_manager(sm.clone()),
-                ))
-            } else {
-                std::sync::Arc::new(std::sync::Mutex::new(
+            // Create child manager linked to same ServerManager. Propagate
+            // the queue + wakeup so this child can register grandchild
+            // sessions without locking `Mutex<ServerManager>`.
+            let child_manager = match (
+                parent_server_manager.clone(),
+                parent_queue.clone(),
+                parent_wakeup.clone(),
+            ) {
+                (Some(sm), Some(q), Some(w)) => std::sync::Arc::new(std::sync::Mutex::new(
+                    super::hle_ipc::SessionRequestManager::new_with_server_manager_full(
+                        sm, q, w,
+                    ),
+                )),
+                (Some(sm), _, _) => std::sync::Arc::new(std::sync::Mutex::new(
+                    super::hle_ipc::SessionRequestManager::new_with_server_manager(sm),
+                )),
+                _ => std::sync::Arc::new(std::sync::Mutex::new(
                     super::hle_ipc::SessionRequestManager::new(),
-                ))
+                )),
             };
             child_manager.lock().unwrap().set_session_handler(iface);
 
@@ -319,17 +338,34 @@ impl<'a> ResponseBuilder<'a> {
                 .create_session_with_manager_object_id(child_manager.clone())
                 .unwrap_or(0);
 
-            // Register with ServerManager (matching upstream line 164).
-            if let Some(sm) = parent_server_manager {
-                // Get server session from the context's last created session.
-                // The session was just created by create_session_with_manager.
-                if let Some(server_session) = self.context.last_created_server_session.take() {
-                    let _ = sm
-                        .lock()
-                        .unwrap()
-                        .register_session(server_session, child_manager);
+            // Register with ServerManager via its pending-registration queue
+            // (matching upstream RegisterSession ownership). Cannot lock
+            // `Mutex<ServerManager>` directly from this handler thread — the
+            // host thread holds it for its entire loop_process. The host
+            // thread drains the queue at the start of each iteration.
+            let (queue, wakeup) = self
+                .context
+                .get_manager()
+                .map(|m| {
+                    let guard = m.lock().unwrap();
+                    (
+                        guard.pending_registrations().cloned(),
+                        guard.server_wakeup().cloned(),
+                    )
+                })
+                .unwrap_or((None, None));
+            if let (Some(queue), Some(server_session)) =
+                (queue, self.context.last_created_server_session.take())
+            {
+                queue.lock().unwrap().push((server_session, child_manager));
+                if let Some(wakeup) = wakeup {
+                    wakeup.signal();
                 }
             }
+            // Suppress warning about unused parent_server_manager — we read it
+            // from the parent's SessionRequestManager above but the local
+            // variable computed earlier is no longer needed.
+            let _ = parent_server_manager;
 
             self.push_move_object_id(object_id);
         }
