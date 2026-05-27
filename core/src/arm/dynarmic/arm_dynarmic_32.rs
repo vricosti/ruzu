@@ -255,6 +255,52 @@ fn watch_write(cb: &DynarmicCallbacks32, vaddr: u64, size: u64, value: u128) {
     maybe_dump_instance_at_pc(cb, pc_ptr, pc);
 }
 
+/// `RUZU_TRACE_UNMAPPED_WRITE=1` — annotate every JIT-emitted memory write
+/// whose target address is not currently mapped in guest memory with
+/// `tid`, guest `PC`, `LR`, and the bad `vaddr`/`size`/`value`. Pairs with
+/// the existing `Unmapped Write{N} @ 0x...` log emitted from
+/// `Memory::write_raw`; that one only tells us the address, this one tells
+/// us *who* / *from where* in the guest. Used to trace the MK8D post-boot
+/// corruption back to a specific call site in guest code.
+#[inline(always)]
+fn trace_unmapped_write(cb: &DynarmicCallbacks32, vaddr: u64, size: u64, value: u128) {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    if !*ENABLED.get_or_init(|| std::env::var_os("RUZU_TRACE_UNMAPPED_WRITE").is_some()) {
+        return;
+    }
+    // Cheap pre-check: skip the trace path entirely when the address IS
+    // mapped — the unmapped-write log only fires on the slow path inside
+    // `Memory::write_raw`. We mirror the same validity probe here so the
+    // trace only emits on actual unmapped writes.
+    let mapped = if let Some(ref cm) = cb.core_memory {
+        cm.lock()
+            .unwrap()
+            .is_valid_virtual_address_range(vaddr, size)
+    } else {
+        cb.memory.read().unwrap().is_valid_range(vaddr, size as usize)
+    };
+    if mapped {
+        return;
+    }
+    let pc_ptr = cb.jit_pc_ptr;
+    let pc = pc_ptr.map(|p| unsafe { p.read_volatile() }).unwrap_or(0);
+    let lr = pc_ptr
+        .map(|p| unsafe { p.offset(-1).read_volatile() })
+        .unwrap_or(0);
+    let tid = crate::hle::kernel::kernel::get_current_thread_id_fast().unwrap_or(0);
+    eprintln!(
+        "[UNMAPPED_WRITE] tid={} pc=0x{:08X} lr=0x{:08X} vaddr=0x{:X} size={} value=0x{:0width$X}",
+        tid,
+        pc,
+        lr,
+        vaddr,
+        size,
+        value,
+        width = (size as usize) * 2
+    );
+}
+
 #[inline(always)]
 fn watch_read(cb: &DynarmicCallbacks32, vaddr: u64, size: u64, value: u128) {
     let ranges = watched_ranges();
@@ -1222,6 +1268,7 @@ impl UserCallbacks for DynarmicCallbacks32 {
     fn memory_write_8(&mut self, vaddr: u64, value: u8) {
         watch_write(self, vaddr, 1, value as u128);
         if self.check_memory_access(vaddr, 1) {
+            trace_unmapped_write(self, vaddr, 1, value as u128);
             self.mem().write_8(vaddr, value);
         }
     }
@@ -1229,6 +1276,7 @@ impl UserCallbacks for DynarmicCallbacks32 {
     fn memory_write_16(&mut self, vaddr: u64, value: u16) {
         watch_write(self, vaddr, 2, value as u128);
         if self.check_memory_access(vaddr, 2) {
+            trace_unmapped_write(self, vaddr, 2, value as u128);
             self.mem().write_16(vaddr, value);
         }
     }
@@ -1236,6 +1284,7 @@ impl UserCallbacks for DynarmicCallbacks32 {
     fn memory_write_32(&mut self, vaddr: u64, value: u32) {
         watch_write(self, vaddr, 4, value as u128);
         if self.check_memory_access(vaddr, 4) {
+            trace_unmapped_write(self, vaddr, 4, value as u128);
             self.mem().write_32(vaddr, value);
         }
     }
@@ -1243,6 +1292,7 @@ impl UserCallbacks for DynarmicCallbacks32 {
     fn memory_write_64(&mut self, vaddr: u64, value: u64) {
         watch_write(self, vaddr, 8, value as u128);
         if self.check_memory_access(vaddr, 8) {
+            trace_unmapped_write(self, vaddr, 8, value as u128);
             self.mem().write_64(vaddr, value);
         }
     }
