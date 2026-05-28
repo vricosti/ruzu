@@ -13,3 +13,4 @@ zstd = "0.13"
 libc = "0.2"
 parking_lot.workspace = true
 context.workspace = true
+toml.workspace = true

@@ -75,6 +75,7 @@ pub mod hex_util;
 pub mod input;
 pub mod logging;
 pub mod steady_clock;
+pub mod trace;
 pub mod string_util;
 pub mod telemetry;
 pub mod time_zone;
