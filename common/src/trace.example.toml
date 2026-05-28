@@ -1,0 +1,66 @@
+# Sample trace configuration.
+#
+# Place at one of:
+#   $RUZU_TRACE_CONFIG  (env var pointing to any path)
+#   $XDG_CONFIG_HOME/ruzu/trace.toml
+#   ~/.config/ruzu/trace.toml
+#
+# Each toggle maps to a pilot site wired through `common::trace`.
+# Legacy env vars (`RUZU_IPC_REPLY_DUMP`, `RUZU_TRACE_GPU_VA`, ...) keep
+# working as a fallback when this file is absent.
+
+# ---- IPC traces ------------------------------------------------------
+[ipc]
+# IPC_REPLY hex-dump (was RUZU_IPC_REPLY_DUMP=1)
+reply_dump = false
+# IPC_REQUEST hex-dump (was RUZU_IPC_REQUEST_DUMP=1)
+request_dump = false
+# Per-cmd raw-handle attribution. (was RUZU_IPC_HANDLE_OUT=1)
+handle_out = false
+# Domain-object id emission. (was RUZU_IPC_DOMAIN_OUT=1)
+domain_out = false
+
+# ---- nvdrv -----------------------------------------------------------
+[nvdrv]
+# nvhost_as_gpu MapBufferEx / UnmapBuffer trace (was RUZU_TRACE_GPU_VA=1)
+gpu_va_trace = false
+
+# ---- kernel SVC ------------------------------------------------------
+[svc]
+# SetHeapSize trace (was RUZU_TRACE_HEAP=1)
+heap_trace = false
+# Per-tid SVC tracer. (was RUZU_TRACE_TID_SVC=N or RUZU_TRACE_TID_SVC=*)
+# When true, traces ALL tids. To filter to specific ones, ALSO set the
+# legacy env var RUZU_TRACE_TID_SVC=75,86 (comma-separated tid list).
+tid_svc = false
+# Include guest PC/LR in TID_SVC records. (was RUZU_TRACE_TID_SVC_PC=1)
+tid_svc_pc = false
+
+# ---- dynarmic JIT instrumentation -----------------------------------
+[jit]
+# WATCH_READ / WATCH_WRITE memory watchpoints.
+# Setting this to true is not sufficient on its own — you also need to
+# set RUZU_WATCH_ADDR=0xADDR or RUZU_WATCH_PC=0xLO-0xHI for the JIT
+# callback to fire. The toggle gates the trace_ring emission.
+watch_read_write = false
+# STLEX (exclusive store) attempt tracing. (was guarded by RUZU_WATCH_PC)
+stlex = false
+# Unmapped guest-write attribution. (was RUZU_TRACE_UNMAPPED_WRITE=1)
+unmapped_write = false
+# BL_HIT scan summary. (was RUZU_FIND_BL=0xTARGET:...)
+bl_hit = false
+
+# ---- output ----------------------------------------------------------
+[output]
+# "stderr" (default) or "file"
+target = "stderr"
+# Path when target = "file". Ignored otherwise.
+file_path = ""
+# Per-thread ring capacity. 16384 records * 128 B = 2 MiB per emitter thread.
+ring_capacity = 16384
+# Drain thread idle wakeup. Lower = lower latency, higher CPU.
+drain_interval_us = 1000
+# If true, producers spin while ring is full instead of dropping.
+# Default: false. Set to true for "no-loss" debugging at the cost of
+# perturbing the producer thread.
+lossless = false
