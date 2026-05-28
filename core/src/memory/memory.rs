@@ -1084,6 +1084,51 @@ impl Memory {
     /// Matches upstream `Memory::Impl::Write<T>`.
     #[inline]
     unsafe fn write_raw<T: Copy>(&self, vaddr: u64, data: T) {
+        // `RUZU_TRACE_RAW_WRITE_AT=0xVADDR` — log a backtrace whenever the
+        // [vaddr, vaddr+sizeof(T)) range covers the target. `write_raw`
+        // is the lowest-level guest-memory writer; all of `write_8/16/
+        // 32/64`, `write_32_no_rasterizer`, `write_block_no_rasterizer`
+        // and `write_block` ultimately funnel through here, so this
+        // catches every Rust-side write regardless of the public entry
+        // point.
+        //
+        // The target is parsed once via `OnceLock` so the hot path is
+        // just an atomic load + range check; when unset, the cost is
+        // one extra branch.
+        {
+            use std::sync::OnceLock;
+            static TARGET: OnceLock<Option<u64>> = OnceLock::new();
+            let target = *TARGET.get_or_init(|| {
+                std::env::var("RUZU_TRACE_RAW_WRITE_AT")
+                    .ok()
+                    .and_then(|s| u64::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok())
+            });
+            if let Some(target) = target {
+                let size = std::mem::size_of::<T>() as u64;
+                if vaddr <= target && target < vaddr + size {
+                    let bt = std::backtrace::Backtrace::force_capture();
+                    // For sizes ≤ 8, we can read back the bytes from the
+                    // input data via raw memory copy to format them.
+                    let mut buf = [0u8; 8];
+                    let n = (size as usize).min(8);
+                    std::ptr::copy_nonoverlapping(
+                        &data as *const T as *const u8,
+                        buf.as_mut_ptr(),
+                        n,
+                    );
+                    let mut hex = String::new();
+                    for b in &buf[..n] {
+                        use std::fmt::Write;
+                        let _ = write!(hex, "{:02x}", b);
+                    }
+                    eprintln!(
+                        "[RAW_WRITE_AT] vaddr=0x{:016X} size={} bytes={}\n{}",
+                        vaddr, size, hex, bt
+                    );
+                }
+            }
+        }
+
         let ptr = self.get_pointer_impl(vaddr);
         if ptr.is_null() {
             log::error!(
