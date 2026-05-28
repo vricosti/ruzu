@@ -1150,6 +1150,117 @@ fn maybe_scan_bl(cb: &DynarmicCallbacks32) {
     );
 }
 
+/// `RUZU_FASTMEM_TRAP_PAGE=0xADDR[,0xADDR2,…]` — mprotect the 4-KiB host
+/// page(s) backing the given guest vaddr(s) in the fastmem arena as
+/// `PROT_READ`. JIT-emitted writes to those guest pages then take a
+/// SIGSEGV, the backend's exception handler patches the faulting MOV out
+/// of the fastmem path on first use, and subsequent stores to that
+/// instruction go through the slow `write_8/16/32/64` callback — where
+/// `RUZU_TRACE_W_AT_VADDR=…` / WATCH_WRITE diagnostics fire. Used to
+/// surface stores that would otherwise be invisible to memory callbacks
+/// (e.g. the unknown writer of `[struct+0x10]` in the MK8D matrix-init
+/// chain, task #112) without paying the global `RUZU_NO_FASTMEM`
+/// slowdown.
+///
+/// Idempotent across cores: the host page is shared between all JIT
+/// instances on the same process, so the mprotect on core 0 covers
+/// every core. Subsequent cores log "already trapped" and bail out.
+fn maybe_trap_fastmem_page(fastmem_pointer: Option<*mut u8>, core_index: usize) {
+    use std::sync::OnceLock;
+    static DONE: OnceLock<()> = OnceLock::new();
+    let Some(raw) = std::env::var("RUZU_FASTMEM_TRAP_PAGE").ok() else {
+        return;
+    };
+    if DONE.get().is_some() {
+        log::warn!(
+            "[FASTMEM_TRAP] core={} skipped — already trapped on an earlier core",
+            core_index
+        );
+        return;
+    }
+    let Some(fastmem_pointer) = fastmem_pointer else {
+        log::warn!(
+            "[FASTMEM_TRAP] core={} RUZU_FASTMEM_TRAP_PAGE set but fastmem is disabled (RUZU_NO_FASTMEM?); ignoring",
+            core_index
+        );
+        return;
+    };
+    if fastmem_pointer.is_null() {
+        log::warn!(
+            "[FASTMEM_TRAP] core={} fastmem_pointer is null; ignoring",
+            core_index
+        );
+        return;
+    }
+    let _ = DONE.set(());
+    const PAGE_SIZE: usize = 0x1000;
+    let mut pages: Vec<usize> = Vec::new();
+    for token in raw.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        let stripped = token.trim_start_matches("0x").trim_start_matches("0X");
+        let Ok(addr) = u64::from_str_radix(stripped, 16) else {
+            log::warn!("[FASTMEM_TRAP] cannot parse '{}'", token);
+            continue;
+        };
+        let page = (addr as usize) & !(PAGE_SIZE - 1);
+        pages.push(page);
+    }
+    if pages.is_empty() {
+        return;
+    }
+    // The guest page backing `addr` is often NOT yet allocated when the
+    // JIT is constructed (heap setup happens after the first SVCs). Our
+    // initial mprotect succeeds against the PROT_NONE-mapped fastmem
+    // arena, but as soon as the kernel maps the guest page on first
+    // touch it RE-applies PROT_READ|PROT_WRITE — undoing the trap. So we
+    // spawn a small re-applier thread that keeps the page PROT_READ for
+    // a configurable duration (default ~30 s) and bails out after that.
+    // 30 s is plenty for the MK8D matrix-init window to fire.
+    let fastmem_addr = fastmem_pointer as usize;
+    let duration_ms = std::env::var("RUZU_FASTMEM_TRAP_DURATION_MS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(30_000);
+    let interval_ms = std::env::var("RUZU_FASTMEM_TRAP_INTERVAL_MS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(50);
+    log::warn!(
+        "[FASTMEM_TRAP] re-apply loop: {} page(s), every {} ms for {} ms",
+        pages.len(),
+        interval_ms,
+        duration_ms
+    );
+    std::thread::Builder::new()
+        .name("ruzu-fastmem-trap".into())
+        .spawn(move || {
+            let start = std::time::Instant::now();
+            let mut tick: u64 = 0;
+            while start.elapsed().as_millis() < duration_ms as u128 {
+                for &page in &pages {
+                    let host_ptr = (fastmem_addr + page) as *mut libc::c_void;
+                    let ret = unsafe { libc::mprotect(host_ptr, PAGE_SIZE, libc::PROT_READ) };
+                    // Log the FIRST success per page so we know when the
+                    // trap "took" (the page is mapped) and every Nth
+                    // success after that. EAGAIN-equivalent quiet path:
+                    // ret != 0 just means the page isn't yet mapped, we
+                    // try again next tick.
+                    if ret == 0 && tick % 100 == 0 {
+                        log::warn!(
+                            "[FASTMEM_TRAP] re-applied guest=0x{:08X} host=0x{:X} tick={}",
+                            page,
+                            host_ptr as usize,
+                            tick
+                        );
+                    }
+                }
+                tick += 1;
+                std::thread::sleep(std::time::Duration::from_millis(interval_ms));
+            }
+            log::warn!("[FASTMEM_TRAP] re-apply loop ended after {} ms", duration_ms);
+        })
+        .expect("spawn ruzu-fastmem-trap");
+}
+
 /// PC-range filter from `RUZU_WATCH_PC=0xLO-0xHI` (inclusive..exclusive).
 /// Returns None when unset; pairs with `watch_read` / `watch_write` to
 /// limit log output to guest code within a specific PC window.
@@ -2286,6 +2397,18 @@ impl ArmDynarmic32 {
                 None
             }
         };
+
+        // RUZU_FASTMEM_TRAP_PAGE=0xADDR — mprotect the host page backing the
+        // given guest vaddr in the fastmem arena as PROT_READ, so any
+        // subsequent JIT-emitted write through fastmem faults. The
+        // backend's SIGSEGV handler then patches the faulting MOV and
+        // routes the write through the slow callback path, which makes the
+        // existing `RUZU_TRACE_W_AT_VADDR=…` / WATCH_WRITE diagnostics
+        // fire on stores that would otherwise be invisible. Used to
+        // identify the writer of `[struct+0x10]` in the MK8D matrix-init
+        // call chain (task #112) without paying the global `NO_FASTMEM`
+        // slowdown.
+        maybe_trap_fastmem_page(fastmem_pointer, core_index);
 
         let result = Self {
             base: ArmInterfaceBase::new(uses_wall_clock),
