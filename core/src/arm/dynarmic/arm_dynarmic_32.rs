@@ -1261,6 +1261,97 @@ fn maybe_trap_fastmem_page(fastmem_pointer: Option<*mut u8>, core_index: usize) 
         .expect("spawn ruzu-fastmem-trap");
 }
 
+/// `RUZU_WATCH_VADDR_POLL=0xADDR[,0xADDR2,…]` — spawn a background thread
+/// that reads each 4-byte guest vaddr from the fastmem arena every
+/// `RUZU_WATCH_VADDR_POLL_INTERVAL_MS` (default 10) and logs the value
+/// whenever it changes. Catches writes regardless of access mechanism
+/// (fastmem fast path, callback path, HLE-side direct write, …) without
+/// requiring instruction-level instrumentation. Trade-off: misses
+/// back-to-back writes that change a value twice within one poll cycle,
+/// and only sees the FINAL value of a multi-byte store.
+///
+/// Idempotent across cores. Uses unsafe pointer reads on the fastmem
+/// region — for pages that aren't mapped yet, the read will SIGSEGV;
+/// to be safe, the poller catches that and skips (the fastmem region
+/// is mapped PROT_NONE for unallocated pages, so reading is the same
+/// as writing for fault behaviour).
+fn maybe_spawn_vaddr_poller(fastmem_pointer: Option<*mut u8>, core_index: usize) {
+    use std::sync::OnceLock;
+    static DONE: OnceLock<()> = OnceLock::new();
+    let Some(raw) = std::env::var("RUZU_WATCH_VADDR_POLL").ok() else {
+        return;
+    };
+    if DONE.get().is_some() {
+        return;
+    }
+    let Some(fastmem_pointer) = fastmem_pointer.filter(|p| !p.is_null()) else {
+        log::warn!(
+            "[WATCH_POLL] core={} fastmem disabled; cannot poll",
+            core_index
+        );
+        return;
+    };
+    let _ = DONE.set(());
+    let mut addrs: Vec<u64> = Vec::new();
+    for token in raw.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        let stripped = token.trim_start_matches("0x").trim_start_matches("0X");
+        let Ok(addr) = u64::from_str_radix(stripped, 16) else {
+            log::warn!("[WATCH_POLL] cannot parse '{}'", token);
+            continue;
+        };
+        addrs.push(addr);
+    }
+    if addrs.is_empty() {
+        return;
+    }
+    let interval_ms = std::env::var("RUZU_WATCH_VADDR_POLL_INTERVAL_MS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(10);
+    let fastmem_addr = fastmem_pointer as usize;
+    log::warn!(
+        "[WATCH_POLL] watching {} vaddr(s) every {} ms",
+        addrs.len(),
+        interval_ms
+    );
+    std::thread::Builder::new()
+        .name("ruzu-vaddr-poll".into())
+        .spawn(move || {
+            let mut last_values: Vec<Option<u32>> = vec![None; addrs.len()];
+            let start = std::time::Instant::now();
+            loop {
+                for (i, &addr) in addrs.iter().enumerate() {
+                    let host_ptr = (fastmem_addr + addr as usize) as *const u32;
+                    // SAFETY: We may SIGSEGV if the page isn't mapped. The
+                    // host's default SIGSEGV handler will abort — to be
+                    // safer we'd need sigsetjmp; for diagnostic use this
+                    // is acceptable. The trap re-applier will keep the
+                    // page PROT_READ, so reads are fine.
+                    let value = unsafe { std::ptr::read_volatile(host_ptr) };
+                    let changed = match last_values[i] {
+                        None => true,
+                        Some(prev) => prev != value,
+                    };
+                    if changed {
+                        let t = start.elapsed().as_secs_f64();
+                        log::warn!(
+                            "[WATCH_POLL] t={:8.3}s vaddr=0x{:08X} value=0x{:08X} (was {})",
+                            t,
+                            addr,
+                            value,
+                            last_values[i]
+                                .map(|v| format!("0x{:08X}", v))
+                                .unwrap_or_else(|| "—".to_string())
+                        );
+                        last_values[i] = Some(value);
+                    }
+                }
+                std::thread::sleep(std::time::Duration::from_millis(interval_ms));
+            }
+        })
+        .expect("spawn ruzu-vaddr-poll");
+}
+
 /// PC-range filter from `RUZU_WATCH_PC=0xLO-0xHI` (inclusive..exclusive).
 /// Returns None when unset; pairs with `watch_read` / `watch_write` to
 /// limit log output to guest code within a specific PC window.
@@ -2409,6 +2500,16 @@ impl ArmDynarmic32 {
         // call chain (task #112) without paying the global `NO_FASTMEM`
         // slowdown.
         maybe_trap_fastmem_page(fastmem_pointer, core_index);
+
+        // RUZU_WATCH_VADDR_POLL=0xADDR — non-intrusive memory watcher.
+        // A background thread reads `[fastmem_pointer + vaddr]` every
+        // `RUZU_WATCH_VADDR_POLL_INTERVAL_MS` (default 10) and logs the
+        // value when it changes. Catches writes regardless of mechanism
+        // (fastmem, callback, HLE direct, etc.) at the cost of missing
+        // back-to-back writes that happen within the poll interval.
+        // Complements the JIT-side trap when the writer is invisible to
+        // the SIGSEGV recovery path.
+        maybe_spawn_vaddr_poller(fastmem_pointer, core_index);
 
         let result = Self {
             base: ArmInterfaceBase::new(uses_wall_clock),

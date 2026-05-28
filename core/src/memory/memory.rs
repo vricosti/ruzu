@@ -1206,6 +1206,30 @@ impl Memory {
     /// Used for host-side HLE/service writes where ruzu already holds the global
     /// `Mutex<Memory>`. Guest/JIT writes must keep using `write_block`.
     pub fn write_block_no_rasterizer(&self, dest_addr: u64, src: &[u8]) -> bool {
+        // `RUZU_TRACE_WRITE_BLOCK_AT=0xVADDR` — log every HLE-side
+        // `write_block_no_rasterizer` whose [dest, dest+len) range covers
+        // VADDR. Used to attribute non-fastmem writes (HLE WriteBuffer,
+        // etc.) that bypass both JIT memory callbacks and the per-u32
+        // `RUZU_TRACE_MEMORY_W32_AT_VADDR` hook in `write_32`.
+        if let Ok(spec) = std::env::var("RUZU_TRACE_WRITE_BLOCK_AT") {
+            if let Ok(target) = u64::from_str_radix(spec.trim_start_matches("0x"), 16) {
+                if dest_addr <= target && target < dest_addr + src.len() as u64 {
+                    let bt = std::backtrace::Backtrace::force_capture();
+                    let off = (target - dest_addr) as usize;
+                    let len = src.len();
+                    let preview_end = (off + 16).min(len);
+                    let mut preview = String::new();
+                    for &b in &src[off..preview_end] {
+                        use std::fmt::Write;
+                        let _ = write!(preview, "{:02x}", b);
+                    }
+                    eprintln!(
+                        "[WRITE_BLOCK_AT] dest=0x{:016X} len={:#x} off=0x{:X} preview={}\n{}",
+                        dest_addr, len, off, preview, bt
+                    );
+                }
+            }
+        }
         let size = src.len();
         if size == 0 {
             return true;
