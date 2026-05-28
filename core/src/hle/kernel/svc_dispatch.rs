@@ -2032,24 +2032,30 @@ pub fn call(system: &System, imm: u32, is_64bit: bool, args: &mut SvcArgs) {
                 .get_or_init(|| std::env::var_os("RUZU_TRACE_TID_SVC"))
                 .as_ref()
         }
-        if let Some(target_str) = trace_tid_svc_env() {
-            let target_str = target_str.to_string_lossy();
-            let want = target_str == "*"
-                || target_str == "all"
-                || target_str
-                    .split(',')
-                    .filter_map(|s| s.trim().parse::<u64>().ok())
-                    .any(|t| t == tid);
+        // TID_SVC tracer — routes through the non-blocking trace ring.
+        // Enabled via `[svc] tid_svc = true` in trace.toml, or via the
+        // legacy `RUZU_TRACE_TID_SVC` env var. The env var doubles as a
+        // tid filter: `RUZU_TRACE_TID_SVC=75,86` only traces those tids;
+        // `*` or `all` (or just the TOML flag) traces every tid.
+        if common::trace::is_enabled(common::trace::cat::TID_SVC) {
+            let want = match trace_tid_svc_env() {
+                Some(target_str) => {
+                    let s = target_str.to_string_lossy();
+                    s == "*"
+                        || s == "all"
+                        || s.split(',')
+                            .filter_map(|p| p.trim().parse::<u64>().ok())
+                            .any(|t| t == tid)
+                }
+                None => true, // TOML enabled with no env filter ⇒ trace all tids
+            };
             if want {
                 let name = SvcId::from_u32(imm)
                     .map(|id| format!("{:?}", id))
                     .unwrap_or_else(|| format!("svc#0x{:02X}", imm));
+                let name_id = common::trace::intern_svc_name(&name);
                 let t_ns = super::race_anchor::elapsed_ns();
-                // RUZU_TRACE_TID_SVC_PC=1: extra PC field from the JIT's current
-                // thread context. Read at the SVC trap point — for ARM32 this
-                // is the SVC instruction's PC. Useful for side-by-side compare
-                // with zuyu's `RunThread svc tid=X pc=...` log lines.
-                let pc_str = if std::env::var_os("RUZU_TRACE_TID_SVC_PC").is_some() {
+                let (pc, lr) = if common::trace::tid_svc_pc_enabled() {
                     if let Some(kernel) = system.kernel() {
                         let core_index = kernel.current_physical_core_index() as usize;
                         if let Some(process_arc) = system.current_process_arc.as_ref().cloned() {
@@ -2058,30 +2064,33 @@ pub fn call(system: &System, imm: u32, is_64bit: bool, args: &mut SvcArgs) {
                                 use crate::arm::arm_interface::ThreadContext;
                                 let mut ctx = ThreadContext::default();
                                 jit.get_context(&mut ctx);
-                                format!(" pc=0x{:08X} lr=0x{:08X}", ctx.r[15] as u32, ctx.r[14] as u32)
+                                (ctx.r[15] as u32, ctx.r[14] as u32)
                             } else {
-                                String::new()
+                                (0, 0)
                             }
                         } else {
-                            String::new()
+                            (0, 0)
                         }
                     } else {
-                        String::new()
+                        (0, 0)
                     }
                 } else {
-                    String::new()
+                    (0, 0)
                 };
-                log::info!(
-                    "[TID_SVC] t_ns={} tid={} core={} svc={}{} args=[0x{:X}, 0x{:X}, 0x{:X}, 0x{:X}]",
-                    t_ns,
-                    tid,
-                    core_id,
-                    name,
-                    pc_str,
-                    dispatch_args[0],
-                    dispatch_args[1],
-                    dispatch_args[2],
-                    dispatch_args[3],
+                common::trace::emit_raw(
+                    common::trace::cat::TID_SVC,
+                    &[
+                        t_ns,
+                        tid,
+                        core_id as u64,
+                        name_id as u64,
+                        pc as u64,
+                        lr as u64,
+                        dispatch_args[0],
+                        dispatch_args[1],
+                        dispatch_args[2],
+                        dispatch_args[3],
+                    ],
                 );
             }
         }
