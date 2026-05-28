@@ -614,8 +614,43 @@ pub fn complete_sync_request(
             IPC_TRACE_CURRENT.with(|c| {
                 *c.borrow_mut() = (handler.service_name().to_string(), context.get_command(), 0);
             });
+            // Snapshot the request words so we can emit IPC_REQUEST after the
+            // handler runs (handler will overwrite cmd_buf with the reply).
+            // Only paid when the IPC_REQUEST category is enabled.
+            let req_words = if common::trace::is_enabled(common::trace::cat::IPC_REQUEST) {
+                let n = ipc::COMMAND_BUFFER_LENGTH.min(16);
+                let mut buf = [0u32; 16];
+                buf[..n].copy_from_slice(&context.cmd_buf[..n]);
+                Some(buf)
+            } else {
+                None
+            };
             let handler_t0 = p_after_prepare.map(|_| std::time::Instant::now());
             let result = handler.handle_sync_request(context);
+            if let Some(buf) = req_words {
+                use std::sync::atomic::{AtomicUsize, Ordering};
+                static REQ_SEQ: AtomicUsize = AtomicUsize::new(0);
+                let seq = REQ_SEQ.fetch_add(1, Ordering::Relaxed);
+                if seq < 4000 {
+                    let (svc, cmd, ioctl) =
+                        IPC_TRACE_CURRENT.with(|c| c.borrow().clone());
+                    let svc_str = if svc.is_empty() { "?" } else { svc.as_str() };
+                    let svc_id = common::trace::intern_service(svc_str);
+                    let mut args: [u64; 14] = [0; 14];
+                    args[0] = seq as u64;
+                    args[1] = svc_id as u64;
+                    args[2] = cmd as u64;
+                    args[3] = ioctl as u64;
+                    const PAYLOAD_WORDS: usize = 10; // 14 - 4 fixed
+                    for i in 0..PAYLOAD_WORDS {
+                        args[4 + i] = buf[i] as u64;
+                    }
+                    common::trace::emit_raw(
+                        common::trace::cat::IPC_REQUEST,
+                        &args[..4 + PAYLOAD_WORDS],
+                    );
+                }
+            }
             if let Some(t0) = handler_t0 {
                 let elapsed = t0.elapsed();
                 crate::hle::kernel::svc::svc_ipc::record_ipc_phase(
@@ -1759,15 +1794,20 @@ impl HLERequestContext {
                             // domain_offset is the offset PAST the raw data
                             // section, so a non-domain client reads the value
                             // as the move/copy handle slot.
-                            if std::env::var_os("RUZU_IPC_DOMAIN_OUT").is_some() {
+                            if common::trace::is_enabled(common::trace::cat::IPC_DOMAIN_OUT) {
                                 let (svc, cmd, _ioctl) =
                                     IPC_TRACE_CURRENT.with(|c| c.borrow().clone());
-                                eprintln!(
-                                    "[IPC_DOMAIN_OUT] service={} cmd={} offset={} domain_object_id={} (libnx will read this as a handle if client thinks session is non-domain)",
-                                    if svc.is_empty() { "?" } else { svc.as_str() },
-                                    cmd,
-                                    current_offset,
-                                    count
+                                let svc_str =
+                                    if svc.is_empty() { "?" } else { svc.as_str() };
+                                let svc_id = common::trace::intern_service(svc_str);
+                                common::trace::emit_raw(
+                                    common::trace::cat::IPC_DOMAIN_OUT,
+                                    &[
+                                        svc_id as u64,
+                                        cmd as u64,
+                                        current_offset as u64,
+                                        count as u64,
+                                    ],
                                 );
                             }
                         } else {
@@ -1786,41 +1826,28 @@ impl HLERequestContext {
         // Matches upstream: memory.WriteBlock(thread->GetTlsAddress(), cmd_buf.data(), write_size * sizeof(u32))
         let write_words = (self.write_size as usize).min(ipc::COMMAND_BUFFER_LENGTH);
 
-        // Temporary investigation hook: bounded hex-dump of IPC reply buffer so ruzu/zuyu
-        // traces can be diffed to find the first divergent IPC response. Enabled via
-        // RUZU_IPC_REPLY_DUMP env var. Bounded to first 4000 replies.
-        if std::env::var_os("RUZU_IPC_REPLY_DUMP").is_some() {
+        // IPC reply hex-dump routed through the non-blocking trace ring. Cap at
+        // first 4000 replies so the ring isn't overwhelmed during long runs.
+        if common::trace::is_enabled(common::trace::cat::IPC_REPLY) {
             use std::sync::atomic::{AtomicUsize, Ordering};
             static SEQ: AtomicUsize = AtomicUsize::new(0);
             let seq = SEQ.fetch_add(1, Ordering::Relaxed);
             if seq < 4000 {
-                let n = write_words.min(16);
-                let mut hex = String::with_capacity(n * 9);
-                for i in 0..n {
-                    use std::fmt::Write;
-                    let _ = write!(hex, "{:08x} ", self.cmd_buf[i]);
-                }
                 let (svc, cmd, ioctl) = IPC_TRACE_CURRENT.with(|c| c.borrow().clone());
-                if ioctl != 0 {
-                    log::warn!(
-                        "IPC_REPLY seq={} service={} cmd={} ioctl=0x{:08X} words={} payload={}",
-                        seq,
-                        if svc.is_empty() { "?" } else { svc.as_str() },
-                        cmd,
-                        ioctl,
-                        write_words,
-                        hex.trim_end(),
-                    );
-                } else {
-                    log::warn!(
-                        "IPC_REPLY seq={} service={} cmd={} words={} payload={}",
-                        seq,
-                        if svc.is_empty() { "?" } else { svc.as_str() },
-                        cmd,
-                        write_words,
-                        hex.trim_end(),
-                    );
+                let svc_str = if svc.is_empty() { "?" } else { svc.as_str() };
+                let svc_id = common::trace::intern_service(svc_str);
+                let n = write_words.min(9); // 14 - 5 fixed args = 9 payload words
+                let mut args: [u64; 14] = [0; 14];
+                args[0] = seq as u64;
+                args[1] = svc_id as u64;
+                args[2] = cmd as u64;
+                args[3] = ioctl as u64;
+                args[4] = write_words as u64;
+                for i in 0..n {
+                    args[5 + i] = self.cmd_buf[i] as u64;
                 }
+                let used = 5 + n;
+                common::trace::emit_raw(common::trace::cat::IPC_REPLY, &args[..used]);
             }
         }
 
@@ -1848,18 +1875,24 @@ impl HLERequestContext {
             // next SendSyncRequest. Surfacing all raw-handle outputs lets us
             // see which service pushed a bad value (or whether the bug is
             // elsewhere — e.g. domain object ID or raw payload mis-parsed).
-            if std::env::var_os("RUZU_IPC_HANDLE_OUT").is_some() {
+            if common::trace::is_enabled(common::trace::cat::IPC_HANDLE_OUT) {
                 let valid = self
                     .owner_process_arc()
                     .map(|p| p.lock().unwrap().handle_table.is_valid_handle(handle))
                     .unwrap_or(false);
                 let (svc, cmd, _ioctl) = IPC_TRACE_CURRENT.with(|c| c.borrow().clone());
-                eprintln!(
-                    "[IPC_HANDLE_OUT] kind=raw service={} cmd={} handle=0x{:08X} client_valid={}",
-                    if svc.is_empty() { "?" } else { svc.as_str() },
-                    cmd,
-                    handle,
-                    valid
+                let svc_str = if svc.is_empty() { "?" } else { svc.as_str() };
+                let svc_id = common::trace::intern_service(svc_str);
+                common::trace::emit_raw(
+                    common::trace::cat::IPC_HANDLE_OUT,
+                    &[
+                        svc_id as u64,
+                        cmd as u64,
+                        handle as u64,
+                        valid as u64,
+                        0, // kind = raw
+                        0,
+                    ],
                 );
             }
             return Some(handle);
@@ -1875,14 +1908,24 @@ impl HLERequestContext {
             return None;
         }
         let result = process.handle_table.add(object_id).ok();
-        if std::env::var_os("RUZU_IPC_HANDLE_OUT").is_some() {
+        if common::trace::is_enabled(common::trace::cat::IPC_HANDLE_OUT) {
             let (svc, cmd, _ioctl) = IPC_TRACE_CURRENT.with(|c| c.borrow().clone());
-            eprintln!(
-                "[IPC_HANDLE_OUT] kind=add service={} cmd={} object_id=0x{:X} new_handle={:?}",
-                if svc.is_empty() { "?" } else { svc.as_str() },
-                cmd,
-                object_id,
-                result.map(|h| format!("0x{:08X}", h))
+            let svc_str = if svc.is_empty() { "?" } else { svc.as_str() };
+            let svc_id = common::trace::intern_service(svc_str);
+            let (new_handle, present) = match result {
+                Some(h) => (h as u64, 1u64),
+                None => (0u64, 0u64),
+            };
+            common::trace::emit_raw(
+                common::trace::cat::IPC_HANDLE_OUT,
+                &[
+                    svc_id as u64,
+                    cmd as u64,
+                    object_id,
+                    new_handle,
+                    1, // kind = add
+                    present,
+                ],
             );
         }
         result

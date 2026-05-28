@@ -247,9 +247,20 @@ fn watch_write(cb: &DynarmicCallbacks32, vaddr: u64, size: u64, value: u128) {
         unsafe { (*core).core_index() as i32 }
     };
     let tid = crate::hle::kernel::kernel::get_current_thread_id_fast().unwrap_or(0);
-    eprintln!(
-        "[WATCH_WRITE] core={} tid={} pc=0x{:08X} lr=0x{:08X} vaddr=0x{:X} size={} value=0x{:032X}",
-        core_id, tid, pc, lr, vaddr, size, value
+    let value_lo = value as u64;
+    let value_hi = (value >> 64) as u64;
+    common::trace::emit_raw(
+        common::trace::cat::WATCH_WRITE,
+        &[
+            core_id as u32 as u64,
+            tid,
+            pc as u64,
+            lr as u64,
+            vaddr,
+            size,
+            value_lo,
+            value_hi,
+        ],
     );
     maybe_dump_code_once(cb);
     maybe_dump_instance_at_pc(cb, pc_ptr, pc);
@@ -264,9 +275,7 @@ fn watch_write(cb: &DynarmicCallbacks32, vaddr: u64, size: u64, value: u128) {
 /// corruption back to a specific call site in guest code.
 #[inline(always)]
 fn trace_unmapped_write(cb: &DynarmicCallbacks32, vaddr: u64, size: u64, value: u128) {
-    use std::sync::OnceLock;
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    if !*ENABLED.get_or_init(|| std::env::var_os("RUZU_TRACE_UNMAPPED_WRITE").is_some()) {
+    if !common::trace::is_enabled(common::trace::cat::UNMAPPED_WRITE) {
         return;
     }
     // Cheap pre-check: skip the trace path entirely when the address IS
@@ -289,15 +298,11 @@ fn trace_unmapped_write(cb: &DynarmicCallbacks32, vaddr: u64, size: u64, value: 
         .map(|p| unsafe { p.offset(-1).read_volatile() })
         .unwrap_or(0);
     let tid = crate::hle::kernel::kernel::get_current_thread_id_fast().unwrap_or(0);
-    eprintln!(
-        "[UNMAPPED_WRITE] tid={} pc=0x{:08X} lr=0x{:08X} vaddr=0x{:X} size={} value=0x{:0width$X}",
-        tid,
-        pc,
-        lr,
-        vaddr,
-        size,
-        value,
-        width = (size as usize) * 2
+    let value_lo = value as u64;
+    let value_hi = (value >> 64) as u64;
+    common::trace::emit_raw(
+        common::trace::cat::UNMAPPED_WRITE,
+        &[tid, pc as u64, lr as u64, vaddr, size, value_lo, value_hi],
     );
     // Dump full GPRs + the struct backing memory at r6 (which holds the
     // off-by-3 pointer in `[r6+0x10]` for the MK8D matrix-init path).
@@ -332,16 +337,20 @@ fn trace_unmapped_write(cb: &DynarmicCallbacks32, vaddr: u64, size: u64, value: 
         }
         eprintln!("[UNMAPPED_WRITE_STRUCT] hit#{} r6=0x{:08X} +0..63={}", n, r[6], hex);
     }
-    // Dump stack words to walk LR chain — caller-of-caller etc.
+    // Dump stack words to walk LR chain — caller-of-caller etc. Width is
+    // 64 words (256 bytes) so it covers the prologue + locals area of a
+    // function ~3 frames up (e.g. matrix-init → wrapper → outer caller
+    // with `push {r4-r11, lr} + sub sp,sp,#0x4C` = 0x90 bytes from inner
+    // sp to outer saved-LR).
     let sp = r[13];
     if sp >= 0x1000 {
         let mut words = String::new();
-        for i in 0..32u64 {
+        for i in 0..64u64 {
             use std::fmt::Write as _;
             let w = mem.read_32(sp as u64 + i * 4);
             let _ = write!(words, "{:08x} ", w);
         }
-        eprintln!("[UNMAPPED_WRITE_STACK] hit#{} sp=0x{:08X} +0..127={}", n, sp, words.trim_end());
+        eprintln!("[UNMAPPED_WRITE_STACK] hit#{} sp=0x{:08X} +0..255={}", n, sp, words.trim_end());
     }
 }
 
@@ -379,9 +388,26 @@ fn watch_read(cb: &DynarmicCallbacks32, vaddr: u64, size: u64, value: u128) {
         .map(|p| unsafe { p.offset(-1).read_volatile() })
         .unwrap_or(0);
     let tid = crate::hle::kernel::kernel::get_current_thread_id_fast().unwrap_or(0);
-    eprintln!(
-        "[WATCH_READ ] tid={} pc=0x{:08X} lr=0x{:08X} vaddr=0x{:X} size={} value=0x{:032X}",
-        tid, pc, lr, vaddr, size, value
+    let core = cb.parent.load(std::sync::atomic::Ordering::Relaxed);
+    let core_id: i32 = if core.is_null() {
+        -1
+    } else {
+        unsafe { (*core).core_index() as i32 }
+    };
+    let value_lo = value as u64;
+    let value_hi = (value >> 64) as u64;
+    common::trace::emit_raw(
+        common::trace::cat::WATCH_READ,
+        &[
+            core_id as u32 as u64,
+            tid,
+            pc as u64,
+            lr as u64,
+            vaddr,
+            size,
+            value_lo,
+            value_hi,
+        ],
     );
     maybe_dump_code_once(cb);
     maybe_dump_stack_once(cb, pc_ptr);
@@ -1096,17 +1122,19 @@ fn maybe_scan_bl(cb: &DynarmicCallbacks32) {
             let match_target = computed_target & !1u64;
             if match_target >= target_lo && match_target <= target_hi {
                 let cond = (w3 >> 4) & 0xF;
-                let kind = if is_blx {
-                    "BLX"
+                let kind_id: u8 = if is_blx {
+                    2
                 } else if w3 & 0x01 != 0 {
-                    "BL "
+                    1
                 } else {
-                    "B  "
+                    0
                 };
-                eprintln!(
-                    "[BL_HIT] pc=0x{:08X} target=0x{:08X} kind={} cond=0x{:X}",
-                    pc, computed_target, kind, cond
-                );
+                if common::trace::is_enabled(common::trace::cat::BL_HIT) {
+                    common::trace::emit_raw(
+                        common::trace::cat::BL_HIT,
+                        &[pc, computed_target, kind_id as u64, cond as u64],
+                    );
+                }
                 hits += 1;
                 if hits > cap {
                     eprintln!("[BL_HIT] (more hits suppressed)");
@@ -1401,16 +1429,22 @@ impl UserCallbacks for DynarmicCallbacks32 {
         // Same PC-range filter as watch_read / watch_write. Reports STLEX
         // attempts (write_exclusive_32) so we can distinguish "lock never
         // tried" from "lock always fails exclusive-check".
-        if let Some((pc_lo, pc_hi)) = watched_pc_range() {
+        if common::trace::is_enabled(common::trace::cat::STLEX) {
             let pc = self
                 .jit_pc_ptr
                 .map(|p| unsafe { p.read_volatile() })
                 .unwrap_or(0);
-            let pc_u64 = pc as u64;
-            if pc_u64 >= pc_lo && pc_u64 < pc_hi {
-                eprintln!(
-                    "[STLEX      ] pc=0x{:08X} vaddr=0x{:X} value=0x{:08X} expected=0x{:08X} ok={}",
-                    pc, vaddr, value, expected, ok
+            // Optional pc-range filter via env (kept as opt-in alongside the TOML toggle).
+            let should = if let Some((pc_lo, pc_hi)) = watched_pc_range() {
+                let pc_u64 = pc as u64;
+                pc_u64 >= pc_lo && pc_u64 < pc_hi
+            } else {
+                true
+            };
+            if should {
+                common::trace::emit_raw(
+                    common::trace::cat::STLEX,
+                    &[pc as u64, vaddr, value as u64, expected as u64, ok as u64],
                 );
             }
         }
