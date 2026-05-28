@@ -299,6 +299,50 @@ fn trace_unmapped_write(cb: &DynarmicCallbacks32, vaddr: u64, size: u64, value: 
         value,
         width = (size as usize) * 2
     );
+    // Dump full GPRs + the struct backing memory at r6 (which holds the
+    // off-by-3 pointer in `[r6+0x10]` for the MK8D matrix-init path).
+    // This is the same idea as RUZU_DUMP_INSTANCE_AT_PC but hooked at
+    // unmapped-write time so we get the registers AT the faulting
+    // instruction. Bounded to 5 hits to keep log compact.
+    static DUMP_HITS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let n = DUMP_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if n >= 5 {
+        return;
+    }
+    let Some(p) = pc_ptr else { return };
+    let mut r = [0u32; 16];
+    for i in 0..16 {
+        let off = (i as isize) - 15;
+        r[i] = unsafe { p.offset(off).read_volatile() };
+    }
+    eprintln!(
+        "[UNMAPPED_WRITE_REGS] hit#{} r0=0x{:08X} r1=0x{:08X} r2=0x{:08X} r3=0x{:08X} r4=0x{:08X} r5=0x{:08X} r6=0x{:08X} r7=0x{:08X} r8=0x{:08X} r9=0x{:08X} r10=0x{:08X} r11=0x{:08X} r12=0x{:08X} sp=0x{:08X} lr=0x{:08X}",
+        n,
+        r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7],
+        r[8], r[9], r[10], r[11], r[12], r[13], r[14]
+    );
+    // Dump first 64 bytes of struct at r6 (which holds count at +0xC and
+    // the bad array_base ptr at +0x10 for the MK8D matrix-init path).
+    let mem = cb.mem();
+    if r[6] >= 0x1000 {
+        let mut hex = String::new();
+        for i in 0..64u64 {
+            use std::fmt::Write as _;
+            let _ = write!(hex, "{:02x}", mem.read_8(r[6] as u64 + i));
+        }
+        eprintln!("[UNMAPPED_WRITE_STRUCT] hit#{} r6=0x{:08X} +0..63={}", n, r[6], hex);
+    }
+    // Dump stack words to walk LR chain — caller-of-caller etc.
+    let sp = r[13];
+    if sp >= 0x1000 {
+        let mut words = String::new();
+        for i in 0..32u64 {
+            use std::fmt::Write as _;
+            let w = mem.read_32(sp as u64 + i * 4);
+            let _ = write!(words, "{:08x} ", w);
+        }
+        eprintln!("[UNMAPPED_WRITE_STACK] hit#{} sp=0x{:08X} +0..127={}", n, sp, words.trim_end());
+    }
 }
 
 #[inline(always)]
