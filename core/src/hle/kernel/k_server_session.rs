@@ -1821,21 +1821,35 @@ impl KServerSession {
                     client_thread.get_state()
                 );
             }
-            if !client_thread.is_termination_requested()
-                && client_thread.get_state() == crate::hle::kernel::k_thread::ThreadState::WAITING
-            {
+            if !client_thread.is_termination_requested() {
                 if trace_reply {
-                    log::info!("KServerSession::send_reply_with_message stage=before_end_wait");
+                    log::info!(
+                        "KServerSession::send_reply_with_message stage=before_end_wait state={:?}",
+                        client_thread.get_state()
+                    );
                 }
+                // Call end_wait UNCONDITIONALLY (do not gate on
+                // `state == WAITING`). If the client already parked, this wakes
+                // it as before. If the reply raced ahead of the park — the
+                // client is still RUNNABLE inside svc::SendSyncRequest, between
+                // `arm_wait_wake_guard()` and `begin_wait_guarded()` — then
+                // KThread::end_wait records the result into the armed wait-wake
+                // guard, and the upcoming `begin_wait_guarded` consumes it
+                // instead of parking into a lost wakeup. The previous
+                // `state == WAITING` gate silently dropped the wake in that
+                // race window, which left ~1/3 of MK8D boots wedged in `pl:u`
+                // shared-font init with tid=75 stuck in SendSyncRequest. The
+                // scheduler lock held above still serializes against any other
+                // waker, and end_wait early-returns harmlessly when the thread
+                // is neither WAITING nor guard-armed (upstream no-op).
                 client_thread.end_wait(client_result);
                 if trace_reply {
                     log::info!("KServerSession::send_reply_with_message stage=after_end_wait");
                 }
             } else if trace_reply {
                 log::info!(
-                    "KServerSession::send_reply_with_message stage=skip_end_wait state={:?} termination_requested={}",
+                    "KServerSession::send_reply_with_message stage=skip_end_wait_terminating state={:?}",
                     client_thread.get_state(),
-                    client_thread.is_termination_requested()
                 );
             }
         }
