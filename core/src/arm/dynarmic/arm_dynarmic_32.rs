@@ -2489,6 +2489,14 @@ impl ArmDynarmic32 {
             }
         };
 
+        // Expose the fastmem base to audio_core's direct-write tracer so it
+        // can translate host pointers back to guest vaddrs (the host base
+        // shifts per run due to ASLR; using guest vaddrs keeps env-var
+        // configuration stable across runs).
+        if let Some(p) = fastmem_pointer {
+            common::fastmem_registry::set(p as usize);
+        }
+
         // RUZU_FASTMEM_TRAP_PAGE=0xADDR — mprotect the host page backing the
         // given guest vaddr in the fastmem arena as PROT_READ, so any
         // subsequent JIT-emitted write through fastmem faults. The
