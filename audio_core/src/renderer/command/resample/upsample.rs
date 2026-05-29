@@ -45,6 +45,11 @@ impl UpsamplePayload {
             return;
         }
 
+        crate::raw_write_trace::maybe_trace_write_at(
+            "upsample:process:info",
+            self.upsampler_info as usize,
+            std::mem::size_of::<UpsamplerInfo>(),
+        );
         let info = unsafe { &mut *(self.upsampler_info as *mut UpsamplerInfo) };
         let input_count = info.input_count.min(self.buffer_count) as usize;
         let inputs = unsafe { std::slice::from_raw_parts(self.inputs as *const i16, input_count) };
@@ -55,6 +60,12 @@ impl UpsamplePayload {
             }
             let buffer_index = channel as usize;
             let output_offset = info.sample_count as usize * buffer_index;
+            crate::raw_write_trace::maybe_trace_write_at(
+                "upsample:process:samples",
+                (self.samples_buffer as usize)
+                    + output_offset * std::mem::size_of::<i32>(),
+                info.sample_count as usize * std::mem::size_of::<i32>(),
+            );
             let output = unsafe {
                 std::slice::from_raw_parts_mut(
                     (self.samples_buffer as *mut i32).add(output_offset),
@@ -96,6 +107,11 @@ pub fn process_upsample_command(
         return;
     }
 
+    crate::raw_write_trace::maybe_trace_write_at(
+        "upsample:command:info",
+        payload.upsampler_info as usize,
+        std::mem::size_of::<UpsamplerInfo>(),
+    );
     let info = unsafe { &mut *(payload.upsampler_info as *mut UpsamplerInfo) };
     let input_count = info.input_count.min(payload.buffer_count) as usize;
     let inputs = unsafe { std::slice::from_raw_parts(payload.inputs as *const i16, input_count) };
@@ -106,6 +122,11 @@ pub fn process_upsample_command(
         }
         let buffer_index = channel as usize;
         let output_offset = info.sample_count as usize * buffer_index;
+        crate::raw_write_trace::maybe_trace_write_at(
+            "upsample:command:samples",
+            (payload.samples_buffer as usize) + output_offset * std::mem::size_of::<i32>(),
+            info.sample_count as usize * std::mem::size_of::<i32>(),
+        );
         let output = unsafe {
             std::slice::from_raw_parts_mut(
                 (payload.samples_buffer as *mut i32).add(output_offset),

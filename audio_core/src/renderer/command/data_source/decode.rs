@@ -77,6 +77,11 @@ pub fn read_voice_state_mut(addr: CpuAddr) -> Option<&'static mut VoiceState> {
     if addr == 0 {
         return None;
     }
+    crate::raw_write_trace::maybe_trace_write_at(
+        "decode:voice_state_mut",
+        addr,
+        std::mem::size_of::<VoiceState>(),
+    );
     Some(unsafe { &mut *(addr as *mut VoiceState) })
 }
 

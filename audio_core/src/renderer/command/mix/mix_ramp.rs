@@ -103,5 +103,10 @@ fn read_i32_mut(addr: CpuAddr) -> Option<&'static mut i32> {
     if addr == 0 {
         return None;
     }
+    crate::raw_write_trace::maybe_trace_write_at(
+        "mix_ramp:i32_mut",
+        addr,
+        std::mem::size_of::<i32>(),
+    );
     Some(unsafe { &mut *(addr as *mut i32) })
 }

@@ -289,6 +289,11 @@ fn read_delay_state_mut(addr: CpuAddr) -> Option<&'static mut DelayState> {
     if addr == 0 {
         return None;
     }
+    crate::raw_write_trace::maybe_trace_write_at(
+        "delay:state_mut",
+        addr,
+        std::mem::size_of::<DelayState>(),
+    );
     Some(unsafe { &mut *(addr as *mut DelayState) })
 }
 

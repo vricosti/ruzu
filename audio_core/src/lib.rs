@@ -15,6 +15,7 @@ pub mod errors;
 pub mod r#in;
 pub mod opus;
 pub mod out;
+pub mod raw_write_trace;
 pub mod renderer;
 pub mod sink;
 

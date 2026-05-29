@@ -643,6 +643,11 @@ fn read_reverb_state_mut(addr: CpuAddr) -> Option<&'static mut ReverbState> {
     if addr == 0 {
         return None;
     }
+    crate::raw_write_trace::maybe_trace_write_at(
+        "reverb:state_mut",
+        addr,
+        std::mem::size_of::<ReverbState>(),
+    );
     Some(unsafe { &mut *(addr as *mut ReverbState) })
 }
 
@@ -650,5 +655,10 @@ fn read_f32_slice_mut(addr: CpuAddr, len: usize) -> Option<&'static mut [f32]> {
     if addr == 0 {
         return None;
     }
+    crate::raw_write_trace::maybe_trace_write_at(
+        "reverb:f32_slice_mut",
+        addr,
+        len * std::mem::size_of::<f32>(),
+    );
     Some(unsafe { std::slice::from_raw_parts_mut(addr as *mut f32, len) })
 }
