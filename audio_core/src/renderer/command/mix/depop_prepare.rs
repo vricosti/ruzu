@@ -114,5 +114,10 @@ fn read_i32_slice_mut(addr: CpuAddr, len: usize) -> Option<&'static mut [i32]> {
     if addr == 0 {
         return None;
     }
+    crate::raw_write_trace::maybe_trace_write_at(
+        "depop_prepare:i32_slice_mut",
+        addr,
+        len * std::mem::size_of::<i32>(),
+    );
     Some(unsafe { std::slice::from_raw_parts_mut(addr as *mut i32, len) })
 }

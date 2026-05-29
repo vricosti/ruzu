@@ -421,6 +421,11 @@ impl CommandListProcessor {
         if self.mix_buffers_addr == 0 {
             return None;
         }
+        crate::raw_write_trace::maybe_trace_write_at(
+            "command_list_processor:mix_buffers_mut",
+            self.mix_buffers_addr as usize,
+            self.mix_buffers_len * std::mem::size_of::<i32>(),
+        );
         Some(unsafe {
             std::slice::from_raw_parts_mut(self.mix_buffers_addr as *mut i32, self.mix_buffers_len)
         })
