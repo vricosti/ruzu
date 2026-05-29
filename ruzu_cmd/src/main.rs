@@ -1054,7 +1054,38 @@ fn main() {
             }
         }));
         let system_ref2 = ruzu_core::core::SystemRef::from_ref(&system);
+        // RUZU_TRACE_GPU_WRITE_VADDR=0xADDR — on each callback invocation
+        // log a backtrace if [addr, addr+data.len()) overlaps the target
+        // guest vaddr. Catches direct fastmem-bypassing host-pointer writes
+        // (SMMU path and DRAM-direct fallback below) that would otherwise
+        // miss the JIT trap, write_raw, and write_block instrumentation.
+        let trace_gpu_write_vaddr: Option<u64> = std::env::var("RUZU_TRACE_GPU_WRITE_VADDR")
+            .ok()
+            .and_then(|s| {
+                let s = s.trim();
+                s.strip_prefix("0x")
+                    .or_else(|| s.strip_prefix("0X"))
+                    .and_then(|d| u64::from_str_radix(d, 16).ok())
+                    .or_else(|| s.parse::<u64>().ok())
+            });
         gpu.set_guest_memory_writer(Arc::new(move |addr, data: &[u8]| {
+            if let Some(target) = trace_gpu_write_vaddr {
+                let end = addr.saturating_add(data.len() as u64);
+                if addr <= target && target < end {
+                    let off = (target - addr) as usize;
+                    let preview: Vec<String> = data
+                        .iter()
+                        .skip(off)
+                        .take(16)
+                        .map(|b| format!("{:02X}", b))
+                        .collect();
+                    let bt = std::backtrace::Backtrace::force_capture();
+                    eprintln!(
+                        "[GUEST_MEMORY_WRITER] target=0x{:016X} addr=0x{:016X} len={} off={} bytes=[{}]\n{}",
+                        target, addr, data.len(), off, preview.join(" "), bt
+                    );
+                }
+            }
             let sys = system_ref2.get();
             // Same resolution order as the reader — SMMU first, then guest
             // page table, then DRAM-direct.
