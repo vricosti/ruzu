@@ -311,18 +311,18 @@ impl ServerManager {
     }
 
     fn signal_kernel_event(&self, event: &Arc<Mutex<KEvent>>) {
-        let Some((process, scheduler)) = (!self.system.is_null())
-            .then(|| self.current_process_and_scheduler())
+        let Some(process) = (!self.system.is_null())
+            .then(|| self.current_process())
             .flatten()
         else {
             return;
         };
-        KEvent::signal_arc(event, &process, &scheduler);
+        KEvent::signal_arc(event, &process);
     }
 
     fn clear_kernel_event(&self, event: &Arc<Mutex<KEvent>>) {
-        let Some((process, _scheduler)) = (!self.system.is_null())
-            .then(|| self.current_process_and_scheduler())
+        let Some(process) = (!self.system.is_null())
+            .then(|| self.current_process())
             .flatten()
         else {
             return;

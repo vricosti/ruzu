@@ -98,11 +98,7 @@ impl KEvent {
     /// helper resolves the readable end from the owner process and signals it.
     /// After the sync-object refactor the signal path only needs the scheduler
     /// lock (acquired inside `signal`), not the `KProcess` Mutex.
-    pub fn signal_arc(
-        event: &Arc<Mutex<KEvent>>,
-        process: &Arc<ProcessLock>,
-        _scheduler: &Arc<Mutex<KScheduler>>,
-    ) -> u32 {
+    pub fn signal_arc(event: &Arc<Mutex<KEvent>>, process: &Arc<ProcessLock>) -> u32 {
         let readable_event_id = {
             let event = event.lock().unwrap();
             if event.readable_event_destroyed {
