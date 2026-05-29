@@ -1129,6 +1129,36 @@ impl Memory {
             }
         }
 
+        // `RUZU_TRACE_RAW_WRITE_VALUE=0xVALUE` — log a backtrace whenever
+        // `write_raw` is called with a 4-byte value equal to VALUE,
+        // regardless of address. Used to hunt for a "magic" sentinel
+        // value (e.g. 0x80000029 in MK8D task #112) without knowing
+        // where it lands. Hot-path cost: 1 atomic load + 1 size check
+        // + 1 value compare when enabled, 1 atomic load when not.
+        {
+            use std::sync::OnceLock;
+            static TARGET_VALUE: OnceLock<Option<u32>> = OnceLock::new();
+            let target_value = *TARGET_VALUE.get_or_init(|| {
+                std::env::var("RUZU_TRACE_RAW_WRITE_VALUE")
+                    .ok()
+                    .and_then(|s| u32::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok())
+            });
+            if let Some(target_value) = target_value {
+                let size = std::mem::size_of::<T>();
+                if size == 4 {
+                    let val_u32 =
+                        unsafe { std::ptr::read_unaligned(&data as *const T as *const u32) };
+                    if val_u32 == target_value {
+                        let bt = std::backtrace::Backtrace::force_capture();
+                        eprintln!(
+                            "[RAW_WRITE_VALUE] vaddr=0x{:016X} size={} value=0x{:08X}\n{}",
+                            vaddr, size, val_u32, bt
+                        );
+                    }
+                }
+            }
+        }
+
         let ptr = self.get_pointer_impl(vaddr);
         if ptr.is_null() {
             log::error!(
