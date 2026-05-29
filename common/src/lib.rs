@@ -73,6 +73,7 @@ pub mod cityhash;
 pub mod dynamic_library;
 pub mod hex_util;
 pub mod input;
+pub mod fastmem_registry;
 pub mod logging;
 pub mod steady_clock;
 pub mod trace;
