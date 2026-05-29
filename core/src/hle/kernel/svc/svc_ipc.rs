@@ -358,13 +358,28 @@ fn send_sync_request_impl(
         trace_host_thread_ipc("enqueue_begin", session_handle);
 
         // One-time wiring per KServerSession:
-        // One-time wiring per KServerSession:
         //  1. Push (server_session, manager) to the queue so the host fiber
         //     calls register_session on it (adds to multi_wait).
         //  2. Set manager_wakeup on the KServerSession so subsequent
         //     `notify_available` calls auto-signal the wakeup_event.
         // register_session is idempotent (no duplicate entry in multi_wait)
         // so re-pushing on every IPC is safe — but unnecessary work.
+        //
+        // LOST-WAKEUP NOTE: the client cannot be parked (begin_wait) here,
+        // before the enqueue, even though that would close the race below.
+        // The enqueue's `notify_available` performs scheduler work (acquires
+        // the scheduler lock, runs update_highest_priority_threads); doing
+        // that while the current thread is WAITING but not yet
+        // context-switched corrupts scheduler state and deterministically
+        // hangs very early in boot. So begin_wait must stay tightly coupled
+        // to the reschedule below. The race is instead closed by
+        // `KThread::arm_wait_wake_guard` / `begin_wait_guarded`: end_wait
+        // arriving before the park sets a pending-wake flag that the park
+        // consumes, so no wake is lost.
+        if let Some(current_thread) = system.current_thread() {
+            current_thread.lock().unwrap().arm_wait_wake_guard();
+        }
+
         let needs_setup = server_session.lock().unwrap().manager_wakeup.is_none();
         if needs_setup {
             server_session
@@ -406,14 +421,28 @@ fn send_sync_request_impl(
         // `KServerSession::OnRequest` does this inside the scheduler lock;
         // we approximate with explicit begin_wait + reschedule_current_core
         // below to drive the fiber switch.
+        //
+        // `begin_wait_guarded` consumes the pending-wake flag armed above: if
+        // the host fiber already replied (end_wait ran while this thread was
+        // still RUNNABLE, a no-op that recorded a pending wake), the park is
+        // skipped and we fall straight through to read the wait result —
+        // closing the signal-before-park lost-wakeup race that previously
+        // wedged ~50% of boots in `pl:u` shared-font init.
+        let mut already_woken = false;
         if let Some(current_thread) = system.current_thread() {
             let mut thread = current_thread.lock().unwrap();
             thread.set_wait_reason_for_debugging(
                 crate::hle::kernel::k_thread::ThreadWaitReasonForDebugging::Ipc,
             );
-            thread.begin_wait();
+            already_woken = !thread.begin_wait_guarded();
         }
         trace_host_thread_ipc("client_begin_wait", session_handle);
+        if already_woken {
+            return system
+                .current_thread()
+                .map(|thread| ResultCode::new(thread.lock().unwrap().get_wait_result()))
+                .unwrap_or(RESULT_INVALID_HANDLE);
+        }
 
         // Yield the current fiber. The owning ServerManager's host fiber
         // processes the request and `send_reply` ends the wait on the
