@@ -230,7 +230,7 @@ impl Event {
                 "Service::Event::signal bridging readable_object_id={}",
                 readable_object_id
             );
-            KEvent::signal_arc(&bridge.event, &bridge.process, &bridge.scheduler);
+            KEvent::signal_arc(&bridge.event, &bridge.process);
             if trace_boot {
                 log::info!(
                     "Service::Event::signal: bridge signal complete readable_object_id={}",

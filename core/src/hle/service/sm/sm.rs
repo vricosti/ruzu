@@ -345,10 +345,10 @@ impl Sm {
     }
 
     fn signal_deferral_event(&self, event: &Arc<Mutex<KEvent>>) {
-        let Some((process, scheduler)) = self.current_process_and_scheduler() else {
+        let Some((process, _scheduler)) = self.current_process_and_scheduler() else {
             return;
         };
-        KEvent::signal_arc(event, &process, &scheduler);
+        KEvent::signal_arc(event, &process);
     }
 
     /// Creates a new SM service.
