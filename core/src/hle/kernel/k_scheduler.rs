@@ -1115,18 +1115,15 @@ impl KScheduler {
             }
         }
 
-        {
-            use std::sync::atomic::{AtomicU32, Ordering as AO};
-            static UC: AtomicU32 = AtomicU32::new(0);
-            if UC.fetch_add(1, AO::Relaxed) < 20 || cores_needing_scheduling != 0 {
-                log::info!(
-                    "update_highest_prio: cores_needing=0x{:x} idle=0x{:x} tops={:?}",
-                    cores_needing_scheduling,
-                    idle_cores,
-                    top_threads
-                );
-            }
-        }
+        // Hot path: this runs on every scheduling decision. Keep at trace level
+        // so it is gated out at info/warn — emitting it at info throttled guest
+        // throughput (135k+ lines per MK8D run) and perturbed thread timing.
+        log::trace!(
+            "update_highest_prio: cores_needing=0x{:x} idle=0x{:x} tops={:?}",
+            cores_needing_scheduling,
+            idle_cores,
+            top_threads
+        );
         while idle_cores != 0 {
             let core_id = idle_cores.trailing_zeros() as usize;
             if let Some(mut suggested_id) = gsc.m_priority_queue.get_suggested_front(core_id as i32)
