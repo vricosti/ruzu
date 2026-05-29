@@ -90,30 +90,6 @@ impl Session {
     }
 }
 
-/// RAII guard that sets the calling host thread's CURRENT_THREAD to the IPC
-/// client thread for the lifetime of one HLE handler dispatch. Restores the
-/// previous value on drop. Used so service handlers that read
-/// `system.current_thread()` (and chase `parent`/`scheduler` from there) see
-/// the guest fiber that made the request — not the host service thread's
-/// dummy KThread (which has `parent: None` and would silently no-op).
-struct ClientThreadImpersonationGuard {
-    previous: Option<Arc<crate::hle::kernel::k_thread::KThreadLock>>,
-}
-
-impl ClientThreadImpersonationGuard {
-    fn install(client: Arc<crate::hle::kernel::k_thread::KThreadLock>) -> Self {
-        let previous = crate::hle::kernel::kernel::get_current_emu_thread();
-        crate::hle::kernel::kernel::set_current_emu_thread(Some(&client));
-        Self { previous }
-    }
-}
-
-impl Drop for ClientThreadImpersonationGuard {
-    fn drop(&mut self) {
-        crate::hle::kernel::kernel::set_current_emu_thread(self.previous.as_ref());
-    }
-}
-
 /// Port wrapper pairing a waited server port with its handler factory.
 ///
 /// Matches upstream `Service::Port` ownership in `server_manager.cpp`.
@@ -1316,17 +1292,26 @@ impl ServerManager {
             );
         }
 
-        // Impersonate the client thread on this host thread for the lifetime
-        // of the handler dispatch. Many service handlers read
-        // `system.current_thread()` expecting the guest fiber that made the
-        // IPC; without this swap they would see the host thread's dummy
-        // KThread (parent=None) and either silently no-op or fail. The guard
-        // restores the previous CURRENT_THREAD on drop so the host service
-        // thread reverts to its own dummy between IPCs.
-        let _client_thread_guard = context
-            .get_thread()
-            .map(ClientThreadImpersonationGuard::install);
-
+        // Upstream-faithful: the host service thread keeps its own dummy
+        // KThread as CURRENT_THREAD throughout handler dispatch. The IPC
+        // client thread is reachable explicitly via `context.get_thread()`
+        // for handlers that need it; the client's process memory is
+        // already wired into `context.memory` at construction (see
+        // `HLERequestContext::new_with_thread → owner_process_memory`).
+        //
+        // Earlier ports used a `ClientThreadImpersonationGuard` to swap
+        // CURRENT_THREAD to the client for the duration of the handler.
+        // That breaks every scheduler invariant tied to dispatch-count
+        // accounting: the client guest thread arrives with `count == 1`
+        // from the guest scheduler that issued the SVC, and the host
+        // thread's scheduler-lock cycle (`disable_scheduling` →
+        // `enable_scheduling` → `reschedule_current_hle_thread`)
+        // increments to `count == 2`, tripping the `count == 1` assertion
+        // in `KScheduler::reschedule_current_hle_thread`. Audit of every
+        // `system.current_thread()` / `system.current_process()` reader
+        // under `core/src/hle/service/` shows no handler-side code that
+        // actually depends on impersonation (only diagnostic logging in
+        // `audio/audio_renderer.rs`), so removal is safe.
         let service_result = hle_ipc::complete_sync_request(&manager, &mut context);
 
         // Check if the request was deferred.
