@@ -353,22 +353,34 @@ impl KHardwareTimer {
             .gsc
             .as_ref()
             .and_then(Weak::upgrade);
-        let scheduler_lock = gsc
-            .as_ref()
-            .map(|gsc| {
-                let guard = gsc.lock().unwrap();
-                std::ptr::addr_of!(guard.m_scheduler_lock)
-            })
-            .unwrap_or(std::ptr::null());
-
         if trace {
             log::info!("KHardwareTimer::do_task before_scheduler_lock");
         }
-        let _scheduler_guard = if scheduler_lock.is_null() {
-            None
-        } else {
-            Some(KScopedSchedulerLock::new(unsafe { &*scheduler_lock }))
-        };
+        // do_task MUST run under the scheduler lock — it mutates kernel
+        // wait/waiter state (on_timer -> cancel_wait -> remove_waiter*) that
+        // guest fibers also mutate under that same lock. Acquire the kernel's
+        // singleton scheduler lock (the very instance every guest SVC path and
+        // the audio/ServerManager host threads use); the timer's own `gsc` Weak
+        // frequently upgrades to None, which previously left do_task running
+        // unserialized and racing guest fibers on `held_lock_info_list` /
+        // waiter trees (OOB and BTreeSet-corruption panics — 0 panics after).
+        //
+        // Deadlock-free only because `CoreTiming::advance` now releases the
+        // EventType Mutex before invoking this callback (see core_timing.rs):
+        // otherwise a guest holding the scheduler lock while (un)scheduling a
+        // timer event would invert against the timing thread holding that Mutex.
+        //
+        // A/B-tested: this does NOT regress the pre-existing ~50% `pl:u`
+        // host-thread-IPC boot stall (committed baseline stalls at the same
+        // rate). The bounds-checked accessors in k_thread.rs remain as a safety
+        // net for the rare `scheduler_lock unavailable` startup window.
+        let _scheduler_guard = super::kernel::scheduler_lock().map(KScopedSchedulerLock::new);
+        if _scheduler_guard.is_none() {
+            log::error!(
+                "KHardwareTimer::do_task: kernel scheduler_lock unavailable — \
+                 kernel waiter state will be mutated unserialized"
+            );
+        }
         if trace {
             log::info!("KHardwareTimer::do_task after_scheduler_lock");
         }

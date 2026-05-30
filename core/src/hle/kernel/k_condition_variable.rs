@@ -126,8 +126,8 @@ impl ThreadQueueImplForKConditionVariableWaitForAddress {
     /// Upstream CancelWait: removes waiter from owner, then delegates to
     /// base KThreadQueue::CancelWait (which sets RUNNABLE + clears queue).
     /// Upstream: `waiting_thread->GetLockOwner()->RemoveWaiter(waiting_thread)`.
-    /// Callers hold the scheduler lock, so the raw owner pointer stored in
-    /// `WaitingLockRef` is safe to dereference (matching upstream's KThread*).
+    /// The caller (`do_task` / SVC paths) holds the scheduler lock, which
+    /// serializes this raw-pointer owner access against guest fibers.
     fn cancel_wait(waiting_thread: &mut KThread) {
         if let Some(owner_ptr) = waiting_thread.get_lock_owner_raw() {
             let owner = unsafe { &mut *owner_ptr };
@@ -147,9 +147,9 @@ impl ThreadQueueImplForKConditionVariableWaitConditionVariable {
     }
 
     fn cancel_wait(waiting_thread: &mut KThread) {
-        // Remove the thread as a waiter from its owner.
-        // Upstream: `waiting_thread->GetLockOwner()->RemoveWaiter(...)` via
-        // raw KThread*; we use the stored raw pointer for the same reason.
+        // Remove the thread as a waiter from its owner. Upstream:
+        // `waiting_thread->GetLockOwner()->RemoveWaiter(...)` via raw KThread*;
+        // safe because the caller holds the scheduler lock.
         if let Some(owner_ptr) = waiting_thread.get_lock_owner_raw() {
             let owner = unsafe { &mut *owner_ptr };
             owner.remove_waiter_by_thread_id(waiting_thread.thread_id);
