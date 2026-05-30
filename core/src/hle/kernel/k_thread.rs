@@ -1249,9 +1249,13 @@ impl KThread {
             .expect("RemoveWaiterImpl: lock info not found");
 
         // Remove the waiter; if the lock is now empty, remove it.
-        let is_empty =
-            self.held_lock_info_list[lock_idx].remove_waiter(waiter_priority, waiter_thread_id);
-        if is_empty {
+        // Bounds-checked against an unserialized concurrent shrink by the
+        // hardware timer (see `remove_waiter_by_key`).
+        let Some(lock_info) = self.held_lock_info_list.get_mut(lock_idx) else {
+            return;
+        };
+        let is_empty = lock_info.remove_waiter(waiter_priority, waiter_thread_id);
+        if is_empty && lock_idx < self.held_lock_info_list.len() {
             self.held_lock_info_list.remove(lock_idx);
         }
     }
@@ -1358,7 +1362,22 @@ impl KThread {
         // Find the lock info for this address.
         let lock_idx = self.find_held_lock_index(address_key, is_kernel_address_key)?;
 
-        // Remove the lock info from our held list.
+        // Remove the lock info from our held list. Bounds-checked: the hardware
+        // timer (do_task) can mutate this owner's `held_lock_info_list`
+        // unserialized (its gsc Weak is often dead, so it runs without the
+        // scheduler lock), shrinking the list between `find_held_lock_index`
+        // and here. Treat a stale index as "lock already gone" rather than
+        // aborting the emulator.
+        if lock_idx >= self.held_lock_info_list.len() {
+            log::error!(
+                "remove_waiter_by_key RACE: lock_idx={} >= len={} (owner_tid={} addr=0x{:X})",
+                lock_idx,
+                self.held_lock_info_list.len(),
+                self.thread_id,
+                address_key.get(),
+            );
+            return None;
+        }
         let mut lock_info = self.held_lock_info_list.remove(lock_idx);
 
         // Adjust kernel waiter count.
@@ -1475,38 +1494,73 @@ impl KThread {
     /// Legacy compatibility: remove_waiter with a thread_id.
     /// Searches all held locks for the given thread_id.
     pub fn remove_waiter_by_thread_id(&mut self, waiter_thread_id: u64) {
-        for i in 0..self.held_lock_info_list.len() {
-            let found = self.held_lock_info_list[i]
-                .tree
-                .iter()
-                .find(|k| k.thread_id == waiter_thread_id)
-                .copied();
-            if let Some(key) = found {
-                if should_trace_priority_inheritance() {
-                    log::info!(
-                        "PI remove_waiter_by_thread_id owner_tid={} owner_prio={} owner_base={} waiter_tid={} waiter_prio={} addr=0x{:X}",
-                        self.thread_id,
-                        self.priority,
-                        self.base_priority,
-                        waiter_thread_id,
-                        key.priority,
-                        self.held_lock_info_list[i].get_address_key().get(),
-                    );
-                }
-                let is_kernel = self.held_lock_info_list[i].get_is_kernel_address_key();
-                let is_empty =
-                    self.held_lock_info_list[i].remove_waiter(key.priority, key.thread_id);
-                if is_kernel {
-                    self.num_kernel_waiters -= 1;
-                }
-                if is_empty {
-                    self.held_lock_info_list.remove(i);
-                }
-                if self.priority == key.priority && self.priority < self.base_priority {
-                    self.restore_priority_simplified();
-                }
-                return;
+        // NOTE: this is reached from the hardware-timer's `on_timer` path
+        // (timeout fires for a still-WAITING thread) which mutates the *owner*
+        // thread through a raw `&mut` pointer, relying on the scheduler lock for
+        // exclusion. Use bounds-checked access (`get`/`get_mut`) so a concurrent
+        // shrink of `held_lock_info_list` cannot turn a stale index into an
+        // out-of-bounds panic that aborts the whole emulator. A one-shot
+        // diagnostic records the scheduler-lock ownership when the race is
+        // observed so the missing serialization can be pinned down.
+        let mut i = 0usize;
+        while i < self.held_lock_info_list.len() {
+            let key = match self.held_lock_info_list.get(i) {
+                Some(lock_info) => lock_info
+                    .tree
+                    .iter()
+                    .find(|k| k.thread_id == waiter_thread_id)
+                    .copied(),
+                None => break,
+            };
+            let Some(key) = key else {
+                i += 1;
+                continue;
+            };
+
+            if should_trace_priority_inheritance() {
+                log::info!(
+                    "PI remove_waiter_by_thread_id owner_tid={} owner_prio={} owner_base={} waiter_tid={} waiter_prio={} addr=0x{:X}",
+                    self.thread_id,
+                    self.priority,
+                    self.base_priority,
+                    waiter_thread_id,
+                    key.priority,
+                    self.held_lock_info_list
+                        .get(i)
+                        .map(|li| li.get_address_key().get())
+                        .unwrap_or(0),
+                );
             }
+
+            let Some(lock_info) = self.held_lock_info_list.get_mut(i) else {
+                // The list shrank underneath us between the find and the
+                // mutation — a genuine concurrent access. Log who (if anyone)
+                // owns the scheduler lock so the missing serialization can be
+                // identified, then bail without panicking.
+                let sched_held = super::kernel::scheduler_lock()
+                    .map(|l| l.is_locked_by_current_thread())
+                    .unwrap_or(false);
+                log::error!(
+                    "remove_waiter_by_thread_id RACE: held_lock_info_list shrank \
+                     (owner_tid={} waiter_tid={} scheduler_lock_held_by_current={})",
+                    self.thread_id,
+                    waiter_thread_id,
+                    sched_held,
+                );
+                return;
+            };
+            let is_kernel = lock_info.get_is_kernel_address_key();
+            let is_empty = lock_info.remove_waiter(key.priority, key.thread_id);
+            if is_kernel {
+                self.num_kernel_waiters -= 1;
+            }
+            if is_empty {
+                self.held_lock_info_list.remove(i);
+            }
+            if self.priority == key.priority && self.priority < self.base_priority {
+                self.restore_priority_simplified();
+            }
+            return;
         }
     }
 

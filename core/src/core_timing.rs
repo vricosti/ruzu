@@ -25,7 +25,16 @@ pub type TimedCallback = Box<dyn Fn(i64, Duration) -> Option<Duration> + Send + 
 /// Contains the characteristics of a particular event.
 pub struct EventType {
     /// The event's callback function.
-    pub callback: TimedCallback,
+    ///
+    /// Stored behind an `Arc` (it is immutable after construction) so the
+    /// timing loop can clone the handle and **release the `EventType` Mutex
+    /// before invoking the callback**. This is what lets a callback such as
+    /// `KHardwareTimer::do_task` acquire the scheduler lock without the
+    /// `event_type`-lock <-> scheduler-lock inversion (a guest holding the
+    /// scheduler lock that schedules/unschedules a timer event would otherwise
+    /// deadlock against the timing thread holding the `EventType` Mutex across
+    /// the callback).
+    pub callback: Arc<TimedCallback>,
     /// The name of the event (for debugging).
     pub name: String,
     /// A monotonic sequence number, incremented when this event is changed externally.
@@ -35,7 +44,7 @@ pub struct EventType {
 impl EventType {
     pub fn new(callback: TimedCallback, name: String) -> Self {
         Self {
-            callback,
+            callback: Arc::new(callback),
             name,
             sequence_number: 0,
         }
@@ -488,10 +497,16 @@ impl CoreTiming {
                         evt.reschedule_time
                     );
                 }
-                let callback_result = {
+                // Clone the callback handle and RELEASE the EventType Mutex
+                // before invoking it, so callbacks that take the scheduler lock
+                // (e.g. KHardwareTimer::do_task) cannot deadlock against guest
+                // threads scheduling/unscheduling timer events under that lock.
+                let callback = {
                     let et = event_type_arc.lock();
-                    (et.callback)(evt_time, Duration::from_nanos(ns_late.max(0) as u64))
+                    Arc::clone(&et.callback)
                 };
+                let callback_result =
+                    callback(evt_time, Duration::from_nanos(ns_late.max(0) as u64));
 
                 if evt.reschedule_time != 0 {
                     // Looping event: reschedule under basic_lock
