@@ -160,6 +160,69 @@ fn needs_shadow_lod_ext(ty: TextureType) -> bool {
     )
 }
 
+fn eval_const_offset_component(program: &ir::Program, value: &Value) -> Option<i32> {
+    match *value {
+        Value::ImmU32(value) => Some(value as i32),
+        Value::Inst(inst_ref) => {
+            let inst = program.block(inst_ref.block).inst(inst_ref.inst);
+            match inst.opcode {
+                Opcode::BitFieldSExtract | Opcode::BitFieldUExtract if inst.args.len() == 3 => {
+                    let base = eval_const_offset_component(program, &inst.args[0])? as u32;
+                    let offset = eval_const_offset_component(program, &inst.args[1])? as u32;
+                    let count = eval_const_offset_component(program, &inst.args[2])? as u32;
+                    if count == 0 || count > 32 || offset >= 32 {
+                        return None;
+                    }
+                    let shifted = base >> offset;
+                    let mask = if count == 32 {
+                        u32::MAX
+                    } else {
+                        (1u32 << count) - 1
+                    };
+                    let extracted = shifted & mask;
+                    if inst.opcode == Opcode::BitFieldSExtract && count < 32 {
+                        let sign = 1u32 << (count - 1);
+                        if extracted & sign != 0 {
+                            return Some((extracted | !mask) as i32);
+                        }
+                    }
+                    Some(extracted as i32)
+                }
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+fn eval_const_offset_vec(program: &ir::Program, offset: &Value) -> Option<String> {
+    match *offset {
+        Value::ImmU32(value) => Some(format!("int({})", value)),
+        Value::Inst(inst_ref) => {
+            let inst = program.block(inst_ref.block).inst(inst_ref.inst);
+            let args = inst
+                .args
+                .iter()
+                .map(|arg| eval_const_offset_component(program, arg))
+                .collect::<Option<Vec<_>>>()?;
+            match inst.opcode {
+                Opcode::CompositeConstructU32x2 if args.len() == 2 => {
+                    Some(format!("ivec2({},{})", args[0], args[1]))
+                }
+                Opcode::CompositeConstructU32x3 if args.len() == 3 => {
+                    Some(format!("ivec3({},{},{})", args[0], args[1], args[2]))
+                }
+                Opcode::CompositeConstructU32x4 if args.len() == 4 => Some(format!(
+                    "ivec4({},{},{},{})",
+                    args[0], args[1], args[2], args[3]
+                )),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
 /// Port of upstream `GetOffsetVec(EmitContext&, IR::Value)`.
 ///
 /// `offset` is a raw IR value, often an immediate U32 or a
@@ -170,10 +233,8 @@ fn get_offset_vec(
     program: &mut ir::Program,
     offset: &Value,
 ) -> String {
-    if offset.is_immediate() {
-        if let Value::ImmU32(u) = offset {
-            return format!("int({})", u);
-        }
+    if let Some(offset) = eval_const_offset_vec(program, offset) {
+        return offset;
     }
     if let Value::Inst(inst_ref) = offset {
         let opcode = program.block(inst_ref.block).inst(inst_ref.inst).opcode;
@@ -220,7 +281,15 @@ fn get_offset_vec(
     } else {
         "0".to_string()
     };
-    let ty = offset.ir_type();
+    let ty = match offset {
+        Value::Inst(inst_ref) => program
+            .block(inst_ref.block)
+            .inst(inst_ref.inst)
+            .opcode
+            .meta()
+            .return_type,
+        _ => offset.ir_type(),
+    };
     match ty {
         ir::types::Type::U32 => format!("int({})", offset_str),
         ir::types::Type::U32x2 => format!("ivec2({})", offset_str),
@@ -492,8 +561,7 @@ pub fn emit_image_sample_dref_implicit_lod_inst(
     } else {
         String::new()
     };
-    let offset_idx = if info.has_bias { 4 } else { 3 };
-    let offset = inst.args.get(offset_idx).cloned().unwrap_or(Value::Void);
+    let offset = inst.args.get(4).cloned().unwrap_or(Value::Void);
     let dst = ctx
         .var_alloc
         .define(inst_mut(program, inst_ref), GlslVarType::F32);
@@ -1274,6 +1342,8 @@ pub fn emit_bindless_image_inst(_ctx: &mut EmitContext) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ir::basic_block::Block;
+    use crate::ir::instruction::Inst;
     use crate::ir::types::{FmzMode, FpRounding, TextureInstInfo as Tii};
 
     #[test]
@@ -1328,6 +1398,33 @@ mod tests {
         info.texture_type = TextureType::ColorArray2D as u8;
         let out = image_gather_subpixel_offset(info, "tex0", "co");
         assert!(out.contains(".xy") && out.contains("0.001953125"));
+    }
+
+    #[test]
+    fn offset_vec_folds_signed_bitfield_extracts_from_immediates() {
+        let mut program = crate::ir::Program::new(crate::stage::Stage::Fragment);
+        program.blocks.push(Block::new());
+
+        let x = program.blocks[0].append_inst(Inst::new(
+            Opcode::BitFieldSExtract,
+            vec![Value::ImmU32(0x0000_00f1), Value::ImmU32(0), Value::ImmU32(4)],
+        ));
+        let y = program.blocks[0].append_inst(Inst::new(
+            Opcode::BitFieldSExtract,
+            vec![Value::ImmU32(0x0000_00f1), Value::ImmU32(4), Value::ImmU32(4)],
+        ));
+        let offset = program.blocks[0].append_inst(Inst::new(
+            Opcode::CompositeConstructU32x2,
+            vec![
+                Value::Inst(InstRef { block: 0, inst: x }),
+                Value::Inst(InstRef { block: 0, inst: y }),
+            ],
+        ));
+
+        assert_eq!(
+            eval_const_offset_vec(&program, &Value::Inst(InstRef { block: 0, inst: offset })),
+            Some("ivec2(1,-1)".to_string())
+        );
     }
 
     #[test]

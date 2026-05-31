@@ -1872,6 +1872,106 @@ impl KServerSession {
         self.send_reply_with_message(0, 0, 0, true)
     }
 
+    /// HLE reply helper for host-thread ServerManager dispatch.
+    ///
+    /// Upstream `KServerSession::SendReplyHLE` holds the session light-lock
+    /// while taking `KScopedSchedulerLock`, but `KServerSession::OnRequest`
+    /// does not take that same light-lock. In the Rust port the outer
+    /// `Mutex<KServerSession>` was standing in for both pieces of state, so
+    /// holding it across `EndWait` created an ABBA with concurrent
+    /// `SendSyncRequest`: reply path held `server_session` then waited for the
+    /// scheduler lock, while a client held the scheduler lock then waited for
+    /// `server_session`. Split the operation at the Rust mutex boundary: take
+    /// the current request and compute the result under the session lock, then
+    /// drop it before waking the client.
+    pub fn send_reply_hle_unlocked(session: &Arc<Mutex<Self>>) -> u32 {
+        let trace_reply = std::env::var_os("RUZU_LOG_SYNC_REPLY").is_some();
+        let (request, client_thread, event_id, client_process_id, client_message, client_buffer_size, client_result, result) = {
+            let mut server = session.lock().unwrap();
+            let Some(request) = server.current_request.take() else {
+                return RESULT_INVALID_STATE.get_inner_value();
+            };
+            if trace_reply {
+                log::info!("KServerSession::send_reply_hle_unlocked stage=took_current_request");
+            }
+            if server.current_request.is_none() {
+                server.clear_current_request_and_notify();
+            }
+
+            let client_thread = Self::resolve_request_client_thread(&request);
+            let (event_id, client_process_id, client_message, client_buffer_size) = {
+                let request = request.lock().unwrap();
+                (
+                    request.get_event_id(),
+                    request.get_client_process_id(),
+                    request.get_address(),
+                    request.get_size(),
+                )
+            };
+            let closed = client_thread.is_none() || server.client_closed;
+            let mut result = crate::hle::result::RESULT_SUCCESS.get_inner_value();
+            let mut client_result = result;
+            if closed {
+                result = RESULT_SESSION_CLOSED.get_inner_value();
+                client_result = RESULT_SESSION_CLOSED.get_inner_value();
+            }
+            (
+                request,
+                client_thread,
+                event_id,
+                client_process_id,
+                client_message,
+                client_buffer_size,
+                client_result,
+                result,
+            )
+        };
+
+        if let Some(event_id) = event_id {
+            if let Some(client_process_id) = client_process_id {
+                if let Some(kernel) = crate::hle::kernel::kernel::get_kernel_ref() {
+                    if let Some(process_arc) = kernel.get_process_by_id(client_process_id) {
+                        let mut process = process_arc.lock().unwrap();
+                        if client_result != crate::hle::result::RESULT_SUCCESS.get_inner_value() {
+                            Self::reply_async_error(
+                                &mut process,
+                                client_message,
+                                client_buffer_size,
+                                ResultCode::new(client_result),
+                            );
+                        }
+                        let _ = process.page_table.unlock_for_ipc_user_buffer(
+                            KProcessAddress::new(client_message as u64),
+                            client_buffer_size,
+                        );
+                        if let Some(event) = process.get_event_by_object_id(event_id) {
+                            let _ = event.lock().unwrap().signal(&process);
+                        }
+                    }
+                }
+            }
+        } else if let Some(client_thread) = &client_thread {
+            let _scheduler_lock = crate::hle::kernel::kernel::scheduler_lock()
+                .map(super::k_scheduler_lock::KScopedSchedulerLock::new);
+            let mut client_thread = client_thread.lock().unwrap();
+            if !client_thread.is_termination_requested() {
+                client_thread.end_wait(client_result);
+            }
+        }
+
+        {
+            let mut request = request.lock().unwrap();
+            request.clear_thread();
+            request.clear_event();
+            request.finalize();
+        }
+        if trace_reply {
+            log::info!("KServerSession::send_reply_hle_unlocked stage=finalized_request");
+        }
+
+        result
+    }
+
     /// Receive the next pending request.
     /// Port of upstream `KServerSession::ReceiveRequest`.
     ///
@@ -2038,9 +2138,15 @@ impl KServerSession {
         let Some(object_id) = self.parent_id else {
             return false;
         };
+        if common::trace::is_enabled(common::trace::cat::HOST_THREAD_IPC) {
+            common::trace::emit_raw(common::trace::cat::HOST_THREAD_IPC, &[27, object_id]);
+        }
         let woke_any = unsafe {
             k_synchronization_object::notify_waiters_on_state(&self.sync_object, object_id, result)
         };
+        if common::trace::is_enabled(common::trace::cat::HOST_THREAD_IPC) {
+            common::trace::emit_raw(common::trace::cat::HOST_THREAD_IPC, &[28, object_id]);
+        }
         // Reactively wake the owning ServerManager's host thread. Upstream
         // doesn't need this because `MultiWait::WaitAny` becomes a real kernel
         // wait on the host thread, and `notify_waiters_on_state` walks that
@@ -2049,8 +2155,18 @@ impl KServerSession {
         // this signal, the service thread stays asleep for up to its 100 ms
         // idle timeout before noticing `is_signaled()` flipped.
         if let Some(weak) = self.manager_wakeup.as_ref() {
+            if common::trace::is_enabled(common::trace::cat::HOST_THREAD_IPC) {
+                common::trace::emit_raw(common::trace::cat::HOST_THREAD_IPC, &[29, object_id]);
+            }
             if let Some(event) = weak.upgrade() {
-                event.signal();
+                if common::trace::is_enabled(common::trace::cat::HOST_THREAD_IPC) {
+                    common::trace::emit_raw(common::trace::cat::HOST_THREAD_IPC, &[30, object_id]);
+                    common::trace::emit_raw(common::trace::cat::HOST_THREAD_IPC, &[31, object_id]);
+                }
+                event.signal_host_only();
+                if common::trace::is_enabled(common::trace::cat::HOST_THREAD_IPC) {
+                    common::trace::emit_raw(common::trace::cat::HOST_THREAD_IPC, &[32, object_id]);
+                }
             }
         }
         woke_any

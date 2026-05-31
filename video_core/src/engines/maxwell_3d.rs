@@ -95,6 +95,8 @@ const CLEAR_DEPTH: u32 = reg_index!(0x0D90);
 /// Clear stencil value.
 #[allow(dead_code)]
 const CLEAR_STENCIL: u32 = reg_index!(0x0DA0);
+/// Clear control register.
+pub(crate) const CLEAR_CONTROL: u32 = reg_index!(0x10F8);
 /// Clear surface trigger register.
 pub(crate) const CLEAR_SURFACE: u32 = reg_index!(0x19D0);
 const RASTER_BOUNDING_BOX: u32 = reg_index!(0x02EC);
@@ -3348,6 +3350,10 @@ impl dm::Maxwell3DAccess for Maxwell3D {
 
     fn clear_surface_flags(&self) -> u32 {
         self.regs[CLEAR_SURFACE as usize]
+    }
+
+    fn clear_control_use_scissor(&self) -> bool {
+        ((self.regs[CLEAR_CONTROL as usize] >> 8) & 1) != 0
     }
 
     fn rt_address(&self, index: usize) -> u64 {

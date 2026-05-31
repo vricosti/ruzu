@@ -737,8 +737,31 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
         let binding = if let Some(ref es) = self.engine_state {
             let cbuf_info = es.get_const_buffer(stage, cbuf_index);
             let ssbo_addr = cbuf_info.address.wrapping_add(cbuf_offset as u64);
+            if std::env::var_os("RUZU_TRACE_SSBO_BIND").is_some() {
+                log::info!(
+                    "[SSBO_DESC] stage={} index={} cbuf={} cbuf_addr=0x{:X} cbuf_size=0x{:X} enabled={} desc_offset=0x{:X} ssbo_addr=0x{:X} written={}",
+                    stage,
+                    ssbo_index,
+                    cbuf_index,
+                    cbuf_info.address,
+                    cbuf_info.size,
+                    cbuf_info.enabled,
+                    cbuf_offset,
+                    ssbo_addr,
+                    is_written
+                );
+            }
             self.storage_buffer_binding(ssbo_addr, cbuf_index, is_written)
         } else {
+            if std::env::var_os("RUZU_TRACE_SSBO_BIND").is_some() {
+                log::warn!(
+                    "[SSBO_DESC] stage={} index={} cbuf={} desc_offset=0x{:X} missing_engine_state",
+                    stage,
+                    ssbo_index,
+                    cbuf_index,
+                    cbuf_offset
+                );
+            }
             NULL_BINDING
         };
         if let Some(ref mut cs) = self.channel_state {
@@ -1812,6 +1835,7 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
             cs.uniform_cache_shots[0] = cs.uniform_cache_shots[0].wrapping_add(1);
         }
 
+        let needs_stream_fallback_upload = P::IS_OPENGL;
         let has_fast_bound = self.has_fast_uniform_buffer_bound(stage, binding_index);
         let binding_size_differs = if P::HAS_PERSISTENT_UNIFORM_BUFFER_BINDINGS {
             self.channel_state.as_ref().map_or(false, |cs| {
@@ -1827,6 +1851,19 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
 
         let offset = self.slot_buffers[binding.buffer_id].offset(device_addr);
         let gpu_handle = self.slot_buffers[binding.buffer_id].gpu_handle;
+        if needs_stream_fallback_upload {
+            // Upstream routes small clean UBOs through a fast uniform stream
+            // buffer when cache skipping is preferred, and otherwise relies on
+            // precise buffer-cache tracking. Ruzu does not have the OpenGL
+            // uniform stream-buffer backend yet, and its cached path can miss
+            // small CPU-side cbuf updates. Refresh the exact UBO range before
+            // binding so shaders cannot observe stale constants.
+            if let Some(ref dm) = self.device_memory {
+                let mut bytes = vec![0u8; size as usize];
+                dm.read_block_unsafe(device_addr, &mut bytes);
+                self.slot_buffers[binding.buffer_id].immediate_upload(offset as u64, &bytes);
+            }
+        }
         if P::IS_OPENGL {
             if let Some(ref mut cs) = self.channel_state {
                 cs.fast_bound_uniform_buffers[stage] &= !(1u32 << binding_index);
@@ -1858,9 +1895,24 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
         }
     }
 
+    pub fn set_graphics_base_storage_bindings(
+        &mut self,
+        bindings: &[u32; super::buffer_cache_base::NUM_STAGES as usize],
+    ) {
+        if let Some(ref mut rt) = self.runtime {
+            rt.set_base_storage_bindings(bindings);
+        }
+    }
+
+    pub fn set_enable_storage_buffers(&mut self, enable: bool) {
+        if let Some(ref mut rt) = self.runtime {
+            rt.set_enable_storage_buffers(enable);
+        }
+    }
+
     fn bind_host_graphics_storage_buffers(&mut self, stage: usize) {
         // Upstream: iterates enabled storage buffers, synchronizes, then calls
-        // runtime.BindStorageBuffer. Runtime not yet available.
+        // runtime.BindStorageBuffer.
         let Some(ref cs) = self.channel_state else {
             return;
         };
@@ -1878,6 +1930,14 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
             bits >>= skip;
 
             let binding = bindings[idx as usize];
+            if !binding.buffer_id.is_valid() || binding.buffer_id == NULL_BUFFER_ID {
+                idx += 1;
+                bits >>= 1;
+                if P::NEEDS_BIND_STORAGE_INDEX {
+                    binding_index += 1;
+                }
+                continue;
+            }
             self.touch_buffer(binding.buffer_id);
             self.synchronize_buffer(binding.buffer_id, binding.device_addr, binding.size);
 
@@ -1887,11 +1947,13 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
             }
 
             let offset = self.slot_buffers[binding.buffer_id].offset(binding.device_addr);
+            let gpu_handle = self.slot_buffers[binding.buffer_id].gpu_handle;
             if let Some(ref mut rt) = self.runtime {
                 rt.bind_storage_buffer(
                     stage,
                     binding_index,
                     binding.buffer_id,
+                    gpu_handle,
                     offset,
                     binding.size,
                     is_written,
@@ -2056,6 +2118,14 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
             bits >>= skip;
 
             let binding = bindings[idx as usize];
+            if !binding.buffer_id.is_valid() || binding.buffer_id == NULL_BUFFER_ID {
+                idx += 1;
+                bits >>= 1;
+                if P::NEEDS_BIND_STORAGE_INDEX {
+                    binding_index += 1;
+                }
+                continue;
+            }
             self.touch_buffer(binding.buffer_id);
             self.synchronize_buffer(binding.buffer_id, binding.device_addr, binding.size);
 
@@ -2065,10 +2135,12 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
             }
 
             let offset = self.slot_buffers[binding.buffer_id].offset(binding.device_addr);
+            let gpu_handle = self.slot_buffers[binding.buffer_id].gpu_handle;
             if let Some(ref mut rt) = self.runtime {
                 rt.bind_compute_storage_buffer(
                     binding_index,
                     binding.buffer_id,
+                    gpu_handle,
                     offset,
                     binding.size,
                     is_written,
@@ -3285,18 +3357,57 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
             return NULL_BINDING;
         };
 
-        // Upstream: const GPUVAddr gpu_addr = gpu_memory->Read<u64>(ssbo_addr);
-        let gpu_addr = match gm.read_u64(ssbo_addr) {
-            Some(addr) => addr,
-            None => return NULL_BINDING,
+        let read_u64 = |gpu_addr: u64| -> Option<u64> {
+            if let (Some(device_addr), Some(device_memory)) =
+                (gm.gpu_to_cpu_address(gpu_addr), self.device_memory.as_ref())
+            {
+                let mut buf = [0u8; 8];
+                device_memory.read_block_unsafe(device_addr, &mut buf);
+                return Some(u64::from_le_bytes(buf));
+            }
+            gm.read_u64(gpu_addr)
         };
+        let read_u32 = |gpu_addr: u64| -> Option<u32> {
+            if let (Some(device_addr), Some(device_memory)) =
+                (gm.gpu_to_cpu_address(gpu_addr), self.device_memory.as_ref())
+            {
+                let mut buf = [0u8; 4];
+                device_memory.read_block_unsafe(device_addr, &mut buf);
+                return Some(u32::from_le_bytes(buf));
+            }
+            gm.read_u32(gpu_addr)
+        };
+
+        // Upstream: const GPUVAddr gpu_addr = gpu_memory->Read<u64>(ssbo_addr);
+        let gpu_addr = match read_u64(ssbo_addr) {
+            Some(addr) => addr,
+            None => {
+                if std::env::var_os("RUZU_TRACE_SSBO_BIND").is_some() {
+                    log::warn!(
+                        "[SSBO_BINDING_FAIL] cbuf={} ssbo_addr=0x{:X} reason=read_u64_failed",
+                        cbuf_index,
+                        ssbo_addr
+                    );
+                }
+                return NULL_BINDING;
+            }
+        };
+        if std::env::var_os("RUZU_TRACE_SSBO_BIND").is_some() {
+            log::info!(
+                "[SSBO_BINDING_SRC] cbuf={} ssbo_addr=0x{:X} gpu_addr=0x{:X} written={}",
+                cbuf_index,
+                ssbo_addr,
+                gpu_addr,
+                is_written
+            );
+        }
 
         // Upstream: determine SSBO size
         let size = {
             let is_nvn_cbuf = cbuf_index == 0;
             if is_nvn_cbuf {
                 // NVN driver buffer: address followed by size at offset +8.
-                let ssbo_size = gm.read_u32(ssbo_addr + 8).unwrap_or(0);
+                let ssbo_size = read_u32(ssbo_addr + 8).unwrap_or(0);
                 if ssbo_size != 0 {
                     ssbo_size
                 } else {

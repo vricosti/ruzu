@@ -29,14 +29,28 @@ pub mod vendor_workaround_pass;
 pub mod verification_pass;
 
 use crate::ir::program::Program;
+use crate::ir::program::SyntaxNode;
+use crate::ir::value::Value;
+use crate::host_translate_info::HostTranslateInfo;
 
 /// Run all optimization passes on the program in the correct order.
 pub fn optimize(program: &mut Program) {
+    optimize_with_host_info(program, &HostTranslateInfo::default());
+}
+
+pub fn optimize_with_host_info(program: &mut Program, host_info: &HostTranslateInfo) {
     ssa_rewrite_pass::ssa_rewrite_pass(program);
+    verify_no_erased_refs_if_requested(program, "after_ssa_rewrite");
     identity_removal::identity_removal_pass(program);
+    verify_no_erased_refs_if_requested(program, "after_identity_removal_1");
     constant_propagation::constant_propagation_pass(program);
+    verify_no_erased_refs_if_requested(program, "after_constant_propagation");
     identity_removal::identity_removal_pass(program);
+    verify_no_erased_refs_if_requested(program, "after_identity_removal_2");
+    global_memory_to_storage_buffer_pass::global_memory_to_storage_buffer_pass(program, host_info);
+    verify_no_erased_refs_if_requested(program, "after_global_memory_to_storage_buffer_pass");
     dead_code_elimination::dead_code_elimination_pass(program);
+    verify_no_erased_refs_if_requested(program, "after_dce");
     collect_info::collect_shader_info_pass(program);
 }
 
@@ -47,13 +61,91 @@ pub fn optimize(program: &mut Program) {
 /// `optimize` path intact while allowing OpenGL graphics compilation to
 /// resolve bound texture descriptors using `env.TextureBoundBuffer()`.
 pub fn optimize_with_bound_textures(program: &mut Program, texture_bound_buffer: u32) {
+    optimize_with_bound_textures_and_host_info(
+        program,
+        texture_bound_buffer,
+        &HostTranslateInfo::default(),
+    );
+}
+
+pub fn optimize_with_bound_textures_and_host_info(
+    program: &mut Program,
+    texture_bound_buffer: u32,
+    host_info: &HostTranslateInfo,
+) {
     ssa_rewrite_pass::ssa_rewrite_pass(program);
+    verify_no_erased_refs_if_requested(program, "after_ssa_rewrite");
     identity_removal::identity_removal_pass(program);
+    verify_no_erased_refs_if_requested(program, "after_identity_removal_1");
     constant_propagation::constant_propagation_pass(program);
+    verify_no_erased_refs_if_requested(program, "after_constant_propagation");
     identity_removal::identity_removal_pass(program);
+    verify_no_erased_refs_if_requested(program, "after_identity_removal_2");
+    global_memory_to_storage_buffer_pass::global_memory_to_storage_buffer_pass(program, host_info);
+    verify_no_erased_refs_if_requested(program, "after_global_memory_to_storage_buffer_pass");
     texture_pass::texture_pass_bound_textures(program, texture_bound_buffer);
+    verify_no_erased_refs_if_requested(program, "after_texture_pass");
     dead_code_elimination::dead_code_elimination_pass(program);
+    verify_no_erased_refs_if_requested(program, "after_dce");
     collect_info::collect_shader_info_pass(program);
+}
+
+fn verify_no_erased_refs_if_requested(program: &Program, phase: &str) {
+    if std::env::var_os("RUZU_VERIFY_IR_REFS").is_none() {
+        return;
+    }
+    for (block_idx, block) in program.blocks.iter().enumerate() {
+        for (inst_idx, inst) in block.indexed_iter() {
+            for (arg_idx, value) in inst.args.iter().enumerate() {
+                verify_live_value(
+                    program,
+                    value,
+                    phase,
+                    &format!("inst {}:{} arg {}", block_idx, inst_idx, arg_idx),
+                );
+            }
+            for (pred_idx, value) in &inst.phi_args {
+                verify_live_value(
+                    program,
+                    value,
+                    phase,
+                    &format!("inst {}:{} phi_pred {}", block_idx, inst_idx, pred_idx),
+                );
+            }
+        }
+    }
+    for (node_idx, node) in program.syntax_list.iter().enumerate() {
+        match node {
+            SyntaxNode::If { cond, .. }
+            | SyntaxNode::Repeat { cond, .. }
+            | SyntaxNode::Break { cond, .. } => {
+                verify_live_value(
+                    program,
+                    cond,
+                    phase,
+                    &format!("syntax node {} condition", node_idx),
+                );
+            }
+            _ => {}
+        }
+    }
+}
+
+fn verify_live_value(program: &Program, value: &Value, phase: &str, owner: &str) {
+    let Value::Inst(inst_ref) = value else {
+        return;
+    };
+    let live = program
+        .blocks
+        .get(inst_ref.block as usize)
+        .and_then(|block| block.instructions.get(inst_ref.inst as usize))
+        .is_some_and(|inst| inst.is_some());
+    if !live {
+        panic!(
+            "IR stale InstRef after {phase}: {owner} references erased {}:{}",
+            inst_ref.block, inst_ref.inst
+        );
+    }
 }
 
 #[cfg(test)]
@@ -238,6 +330,39 @@ mod tests {
         assert_eq!(program.info.constant_buffer_descriptors[0].index, 0);
         assert_eq!(program.info.constant_buffer_descriptors[1].index, 2);
         assert_eq!(program.info.constant_buffer_mask, (1 << 0) | (1 << 2));
+    }
+
+    #[test]
+    fn test_collect_info_drops_stale_registered_cbuf() {
+        use crate::ir::program::ShaderInfoExt;
+
+        let mut program = make_test_program();
+        program.info.register_cbuf(4);
+
+        collect_info::collect_shader_info_pass(&mut program);
+
+        assert_eq!(program.info.constant_buffer_mask, 0);
+        assert!(program.info.constant_buffer_descriptors.is_empty());
+        assert_eq!(program.info.constant_buffer_used_sizes[4], 0);
+    }
+
+    #[test]
+    fn test_collect_info_marks_global_memory_and_int64() {
+        let mut program = make_test_program();
+        program.blocks[0].append_inst(Inst::new(
+            Opcode::LoadGlobal32,
+            vec![Value::ImmU64(0x1000)],
+        ));
+        program.blocks[0].append_inst(Inst::new(
+            Opcode::WriteGlobal32,
+            vec![Value::ImmU64(0x1004), Value::ImmU32(7)],
+        ));
+
+        collect_info::collect_shader_info_pass(&mut program);
+
+        assert!(program.info.uses_int64);
+        assert!(program.info.uses_global_memory);
+        assert!(program.info.stores_global_memory);
     }
 
     #[test]

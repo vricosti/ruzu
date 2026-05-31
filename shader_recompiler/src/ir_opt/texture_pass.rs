@@ -13,7 +13,7 @@ use crate::host_translate_info::HostTranslateInfo;
 use crate::ir::basic_block::Block;
 use crate::ir::instruction::Inst;
 use crate::ir::opcodes::Opcode;
-use crate::ir::program::{Program, ShaderInfo};
+use crate::ir::program::{Program, ShaderInfo, SyntaxNode};
 use crate::ir::types::TextureInstInfo;
 use crate::ir::value::{InstRef, Value};
 use crate::shader_info::{
@@ -811,6 +811,18 @@ fn replace_uses_with(program: &mut Program, old: InstRef, replacement: Value) {
             }
         }
     }
+    for node in &mut program.syntax_list {
+        match node {
+            SyntaxNode::If { cond, .. }
+            | SyntaxNode::Repeat { cond, .. }
+            | SyntaxNode::Break { cond, .. } => {
+                if *cond == old_value {
+                    *cond = replacement;
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 fn patch_texel_fetch(
@@ -1504,6 +1516,33 @@ mod tests {
         assert!(ordered_opcodes.contains(&Opcode::BitCastU32F32));
         assert!(ordered_opcodes.contains(&Opcode::ConvertF32S32));
         assert!(ordered_opcodes.contains(&Opcode::FPMul32));
+    }
+
+    #[test]
+    fn replace_uses_with_rewrites_syntax_conditions() {
+        let mut program = Program::new(ShaderStage::Fragment);
+        program.blocks.push(Block::new());
+        let old = program.blocks[0].append_inst(Inst::new(
+            Opcode::ImageFetch,
+            vec![Value::ImmU32(0), Value::Void, Value::ImmU32(0)],
+        ));
+        let old_ref = InstRef {
+            block: 0,
+            inst: old,
+        };
+        let replacement = Value::ImmU1(true);
+        program.syntax_list.push(SyntaxNode::If {
+            cond: Value::Inst(old_ref),
+            body: 0,
+            merge: 0,
+        });
+
+        replace_uses_with(&mut program, old_ref, replacement);
+
+        let SyntaxNode::If { cond, .. } = program.syntax_list[0] else {
+            panic!("expected If node");
+        };
+        assert_eq!(cond, replacement);
     }
 
     #[test]

@@ -19,11 +19,44 @@ request_dump = false
 handle_out = false
 # Domain-object id emission. (was RUZU_IPC_DOMAIN_OUT=1)
 domain_out = false
+# Host-thread IPC routing stage trace. (was RUZU_TRACE_HOST_THREAD_IPC=1)
+host_thread_ipc = false
+# Fresh pl:u session IPC diagnostic. (was RUZU_TRACE_PLU_IPC=1)
+plu_ipc = false
 
 # ---- nvdrv -----------------------------------------------------------
 [nvdrv]
 # nvhost_as_gpu MapBufferEx / UnmapBuffer trace (was RUZU_TRACE_GPU_VA=1)
 gpu_va_trace = false
+# nvhost_ctrl::IocCtrlEventWait trace (was RUZU_TRACE_NVHOST_CTRL_WAIT=1)
+nvhost_ctrl_wait = false
+
+# ---- nvnflinger ------------------------------------------------------
+[nvnflinger]
+# Low-overhead HardwareComposer/nvdisp layer attribution. Emits acquired
+# buffer slot/frame and the final nvmap address handed to the renderer.
+hwc = false
+
+# ---- OpenGL ----------------------------------------------------------
+[opengl]
+# Low-overhead sampled texture binding attribution. Emits shader descriptor
+# type, image-view type, GL handle and two RGBA8 texture samples.
+texture_bind = false
+# Low-overhead graphics constant-buffer binding attribution. Emits guest GPU
+# address, resolved CPU address and first four f32 words for each used cbuf.
+cbuf_bind = false
+# Low-overhead render-target binding attribution per draw. Emits FBO, pipeline,
+# RT map and the first two Maxwell color render-target addresses/formats.
+rt_bind = false
+# Filtered render-target readback. Also set RUZU_TRACE_RT_SAMPLE_ADDRS to a
+# comma-separated GPU address list, or "*" to sample every RT0.
+rt_sample = false
+# Texture binding address attribution. Emits image/view id and guest GPU
+# address for bound sampled textures, without doing additional GL readback.
+texture_bind_addr = false
+# Filtered OpenGL draw-state attribution. Use RUZU_TRACE_DRAW_STATE_PIPELINE
+# to restrict this to one program pipeline, e.g. 28 for the MK8D p28 pass.
+draw_state = false
 
 # ---- kernel SVC ------------------------------------------------------
 [svc]
@@ -35,6 +68,15 @@ heap_trace = false
 tid_svc = false
 # Include guest PC/LR in TID_SVC records. (was RUZU_TRACE_TID_SVC_PC=1)
 tid_svc_pc = false
+# WaitSynchronization object attribution. Emits handle, object_id, object kind
+# and pre-wait signaled state through the trace ring.
+wait_sync = false
+
+# ---- scheduler ------------------------------------------------------
+[scheduler]
+# Low-overhead scheduler state/PQ updates through common::trace.
+# Use legacy RUZU_TRACE_SCHED_STATE=104,105 to filter specific guest tids.
+state = false
 
 # ---- dynarmic JIT instrumentation -----------------------------------
 [jit]

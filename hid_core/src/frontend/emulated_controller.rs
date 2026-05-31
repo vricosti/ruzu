@@ -4,6 +4,9 @@
 //! Port of hid_core/frontend/emulated_controller.h and emulated_controller.cpp
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::OnceLock;
+use std::time::Instant;
 
 use parking_lot::Mutex;
 
@@ -16,6 +19,88 @@ pub const OUTPUT_DEVICES_SIZE: usize = 5;
 pub const HID_JOYSTICK_MAX: i32 = 0x7fff;
 pub const HID_TRIGGER_MAX: i32 = 0x7fff;
 pub const TURBO_BUTTON_DELAY: u32 = 4;
+
+static SIMPLE_NPAD_BUTTON_STATE: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Debug, Clone, Copy)]
+struct ScriptedNpadPress {
+    start_ms: u64,
+    duration_ms: u64,
+    buttons: u64,
+}
+
+fn parse_u64_auto(value: &str) -> Option<u64> {
+    let value = value.trim();
+    if let Some(hex) = value
+        .strip_prefix("0x")
+        .or_else(|| value.strip_prefix("0X"))
+    {
+        u64::from_str_radix(hex, 16).ok()
+    } else {
+        value.parse::<u64>().ok()
+    }
+}
+
+fn scripted_npad_presses() -> &'static [ScriptedNpadPress] {
+    static PRESSES: OnceLock<Vec<ScriptedNpadPress>> = OnceLock::new();
+    PRESSES.get_or_init(|| {
+        let Some(spec) = std::env::var("RUZU_SCRIPTED_NPAD").ok() else {
+            return Vec::new();
+        };
+        spec.split(',')
+            .filter_map(|entry| {
+                let mut parts = entry.split(':');
+                let start_ms = parse_u64_auto(parts.next()?)?;
+                let buttons = parse_u64_auto(parts.next()?)?;
+                let duration_ms = parts
+                    .next()
+                    .and_then(parse_u64_auto)
+                    .unwrap_or(250);
+                Some(ScriptedNpadPress {
+                    start_ms,
+                    duration_ms,
+                    buttons,
+                })
+            })
+            .collect()
+    })
+}
+
+fn scripted_npad_button_bits() -> u64 {
+    static START: OnceLock<Instant> = OnceLock::new();
+    let presses = scripted_npad_presses();
+    if presses.is_empty() {
+        return 0;
+    }
+    let elapsed_ms = START.get_or_init(Instant::now).elapsed().as_millis() as u64;
+    presses.iter().fold(0u64, |bits, press| {
+        if elapsed_ms >= press.start_ms
+            && elapsed_ms < press.start_ms.saturating_add(press.duration_ms)
+        {
+            bits | press.buttons
+        } else {
+            bits
+        }
+    })
+}
+
+/// Temporary frontend bridge for the SDL command-line frontend while the full
+/// upstream InputSubsystem -> EmulatedController callback wiring is incomplete.
+pub fn set_simple_npad_button(button: NpadButton, pressed: bool) {
+    if pressed {
+        SIMPLE_NPAD_BUTTON_STATE.fetch_or(button.bits(), Ordering::Relaxed);
+    } else {
+        SIMPLE_NPAD_BUTTON_STATE.fetch_and(!button.bits(), Ordering::Relaxed);
+    }
+}
+
+pub fn get_simple_npad_button_state() -> NpadButtonState {
+    NpadButtonState {
+        raw: NpadButton::from_bits_truncate(
+            SIMPLE_NPAD_BUTTON_STATE.load(Ordering::Relaxed) | scripted_npad_button_bits(),
+        ),
+    }
+}
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct AnalogSticks {
@@ -527,5 +612,18 @@ impl EmulatedController {
         for (_key, callback) in &self.callback_list {
             (callback.on_change)(trigger_type);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_u64_auto;
+
+    #[test]
+    fn scripted_npad_parser_uses_decimal_unless_prefixed_hex() {
+        assert_eq!(parse_u64_auto("1000"), Some(1000));
+        assert_eq!(parse_u64_auto("0x1000"), Some(0x1000));
+        assert_eq!(parse_u64_auto("0X4C0"), Some(0x4C0));
+        assert_eq!(parse_u64_auto("not-a-number"), None);
     }
 }

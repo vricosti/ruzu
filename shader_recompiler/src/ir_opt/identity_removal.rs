@@ -11,7 +11,7 @@
 //! 2. Erase Identity slots after all users have been rewritten.
 
 use crate::ir::opcodes::Opcode;
-use crate::ir::program::Program;
+use crate::ir::program::{Program, SyntaxNode};
 use crate::ir::value::Value;
 
 /// Remove identity/void instructions and resolve identity chains in arguments.
@@ -53,19 +53,20 @@ pub fn identity_removal_pass(program: &mut Program) {
     for block in &mut program.blocks {
         for inst in block.iter_mut() {
             for arg in &mut inst.args {
-                if let Value::Inst(r) = arg {
-                    if let Some(&resolved) = identity_targets.get(&(r.block, r.inst)) {
-                        *arg = resolved;
-                    }
-                }
+                resolve_identity_arg(arg, &identity_targets);
             }
             for (_, val) in &mut inst.phi_args {
-                if let Value::Inst(r) = val {
-                    if let Some(&resolved) = identity_targets.get(&(r.block, r.inst)) {
-                        *val = resolved;
-                    }
-                }
+                resolve_identity_arg(val, &identity_targets);
             }
+        }
+    }
+
+    for node in &mut program.syntax_list {
+        match node {
+            SyntaxNode::If { cond, .. }
+            | SyntaxNode::Repeat { cond, .. }
+            | SyntaxNode::Break { cond, .. } => resolve_identity_arg(cond, &identity_targets),
+            _ => {}
         }
     }
 
@@ -79,5 +80,66 @@ pub fn identity_removal_pass(program: &mut Program) {
                 block.erase_inst(inst_idx);
             }
         }
+    }
+}
+
+fn resolve_identity_arg(
+    value: &mut Value,
+    identity_targets: &std::collections::HashMap<(u32, u32), Value>,
+) {
+    if let Value::Inst(r) = value {
+        if let Some(&resolved) = identity_targets.get(&(r.block, r.inst)) {
+            *value = resolved;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::identity_removal_pass;
+    use crate::ir::basic_block::Block;
+    use crate::ir::instruction::Inst;
+    use crate::ir::opcodes::Opcode;
+    use crate::ir::program::{Program, SyntaxNode};
+    use crate::ir::types::ShaderStage;
+    use crate::ir::value::{InstRef, Value};
+
+    #[test]
+    fn identity_removal_rewrites_syntax_conditions_before_erasing() {
+        let mut program = Program::new(ShaderStage::VertexB);
+        program.blocks.push(Block::new());
+        let source = program.blocks[0].append_inst(Inst::new(
+            Opcode::ConditionRef,
+            vec![Value::ImmU1(true)],
+        ));
+        let identity = program.blocks[0].append_inst(Inst::new(
+            Opcode::Identity,
+            vec![Value::Inst(InstRef {
+                block: 0,
+                inst: source,
+            })],
+        ));
+        program.syntax_list.push(SyntaxNode::If {
+            cond: Value::Inst(InstRef {
+                block: 0,
+                inst: identity,
+            }),
+            body: 0,
+            merge: 0,
+        });
+
+        identity_removal_pass(&mut program);
+
+        assert!(program.blocks[0].instructions[identity as usize].is_none());
+        let SyntaxNode::If { cond, .. } = program.syntax_list[0] else {
+            panic!("expected If syntax node");
+        };
+        assert_eq!(
+            cond,
+            Value::Inst(InstRef {
+                block: 0,
+                inst: source,
+            })
+        );
     }
 }

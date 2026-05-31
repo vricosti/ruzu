@@ -1029,6 +1029,7 @@ dependencies = [
  "env_logger",
  "frontend_common",
  "gl",
+ "hid_core",
  "input_common",
  "log",
  "parking_lot",

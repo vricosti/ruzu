@@ -25,6 +25,16 @@ impl NpadVibrationDevice {
         }
     }
 
+    /// ruzu fallback for the not-yet-ported `AbstractPad::Mount` path.
+    ///
+    /// Upstream mounts vibration devices when an abstracted pad is connected.
+    /// ruzu currently exposes a fixed connected Player1 fullkey controller in
+    /// `NPad::on_update`, so its two LRA vibration devices must be mounted too.
+    pub fn mount_virtual(&mut self, index: DeviceIndex) {
+        self.device_index = index;
+        self.is_mounted = true;
+    }
+
     /// Port of NpadVibrationDevice::Activate.
     /// When first activated while mounted, sends default vibration.
     pub fn activate(&mut self) -> ResultCode {

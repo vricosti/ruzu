@@ -114,6 +114,27 @@ impl HardwareComposer {
 
             let layer_guard = layer.lock().unwrap();
             if layer_guard.visible {
+                if common::trace::is_enabled(common::trace::cat::HWC) {
+                    common::trace::emit_raw(
+                        common::trace::cat::HWC,
+                        &[
+                            2,
+                            self.frame_number,
+                            consumer_id as u64,
+                            graphic_buffer.get_buffer_id() as u64,
+                            graphic_buffer.get_offset() as u64,
+                            graphic_buffer.get_width() as u64,
+                            graphic_buffer.get_height() as u64,
+                            graphic_buffer.get_stride() as u64,
+                            graphic_buffer.get_external_format() as u64,
+                            item.transform.bits() as u64,
+                            item.crop.left as u64,
+                            item.crop.top as u64,
+                            item.crop.right as u64,
+                            item.crop.bottom as u64,
+                        ],
+                    );
+                }
                 composition_stack.push(HwcLayer {
                     buffer_handle: graphic_buffer.get_buffer_id(),
                     offset: graphic_buffer.get_offset(),
@@ -209,12 +230,44 @@ impl HardwareComposer {
             }
         }
         if status != super::status::Status::NoError {
+            if common::trace::is_enabled(common::trace::cat::HWC) {
+                common::trace::emit_raw(
+                    common::trace::cat::HWC,
+                    &[
+                        1,
+                        0,
+                        consumer_id as u64,
+                        status as i32 as u64,
+                        framebuffer.item.slot as u64,
+                        framebuffer.item.frame_number,
+                        framebuffer.item.swap_interval as u64,
+                        framebuffer.release_frame_number,
+                        u64::from(framebuffer.is_acquired),
+                    ],
+                );
+            }
             return false;
         }
 
         framebuffer.release_frame_number =
             normalize_swap_interval(None, framebuffer.item.swap_interval) as u64;
         framebuffer.is_acquired = true;
+        if common::trace::is_enabled(common::trace::cat::HWC) {
+            common::trace::emit_raw(
+                common::trace::cat::HWC,
+                &[
+                    1,
+                    0,
+                    consumer_id as u64,
+                    status as i32 as u64,
+                    framebuffer.item.slot as u64,
+                    framebuffer.item.frame_number,
+                    framebuffer.item.swap_interval as u64,
+                    framebuffer.release_frame_number,
+                    u64::from(framebuffer.is_acquired),
+                ],
+            );
+        }
         true
     }
 

@@ -355,6 +355,8 @@ pub fn emit_get_attribute(
         Attribute::PRIMITIVE_ID => ctx.add_fmt(format!("{}=itof(gl_PrimitiveID);", ret)),
         Attribute::LAYER => ctx.add_fmt(format!("{}=itof(gl_Layer);", ret)),
         Attribute::POINT_SIZE => ctx.add_fmt(format!("{}=gl_PointSize;", ret)),
+        Attribute::INSTANCE_ID => ctx.add_fmt(format!("{}=itof(gl_InstanceID);", ret)),
+        Attribute::VERTEX_ID => ctx.add_fmt(format!("{}=itof(gl_VertexID);", ret)),
         Attribute::BASE_INSTANCE => ctx.add_fmt(format!("{}=itof(gl_BaseInstance);", ret)),
         Attribute::BASE_VERTEX => ctx.add_fmt(format!("{}=itof(gl_BaseVertex);", ret)),
         Attribute::DRAW_ID => ctx.add_fmt(format!("{}=itof(gl_DrawID);", ret)),
@@ -373,6 +375,8 @@ pub fn emit_get_attribute_u32(
         .define(inst_mut(program, inst_ref), GlslVarType::U32);
     match attr {
         Attribute::PRIMITIVE_ID => ctx.add_fmt(format!("{}=uint(gl_PrimitiveID);", ret)),
+        Attribute::INSTANCE_ID => ctx.add_fmt(format!("{}=uint(gl_InstanceID);", ret)),
+        Attribute::VERTEX_ID => ctx.add_fmt(format!("{}=uint(gl_VertexID);", ret)),
         Attribute::BASE_INSTANCE => ctx.add_fmt(format!("{}=uint(gl_BaseInstance);", ret)),
         Attribute::BASE_VERTEX => ctx.add_fmt(format!("{}=uint(gl_BaseVertex);", ret)),
         Attribute::DRAW_ID => ctx.add_fmt(format!("{}=uint(gl_DrawID);", ret)),
@@ -508,5 +512,33 @@ mod tests {
         assert!(source.contains("f_0=1.f;"));
         assert!(!source.contains("in_attr1"));
         assert!(source.contains("out_attr0.x=f_0;"));
+    }
+
+    #[test]
+    fn glsl_emits_vertex_and_instance_id_attributes() {
+        let mut program = crate::ir::Program::new(ShaderStage::VertexB);
+        program.blocks.push(Block::new());
+        {
+            let mut emitter = Emitter::new(&mut program, 0);
+            let instance = emitter.get_attribute(Attribute::INSTANCE_ID, Value::ImmU32(0));
+            let vertex = emitter.get_attribute_u32(Attribute::VERTEX_ID, Value::ImmU32(0));
+            let vertex = emitter.bit_cast_u32_f32(vertex);
+            emitter.set_attribute(Attribute::generic(0, 0), instance, Value::ImmU32(0));
+            emitter.set_attribute(Attribute::generic(0, 1), vertex, Value::ImmU32(0));
+        }
+        optimize(&mut program);
+
+        let mut bindings = Bindings::default();
+        let source = emit_glsl(
+            &Profile::default(),
+            &RuntimeInfo::default(),
+            &mut program,
+            &mut bindings,
+        );
+
+        assert!(source.contains("=itof(gl_InstanceID);"));
+        assert!(source.contains("=uint(gl_VertexID);"));
+        assert!(!source.contains("GetAttribute(190) not fully implemented"));
+        assert!(!source.contains("GetAttributeU32(191) not fully implemented"));
     }
 }

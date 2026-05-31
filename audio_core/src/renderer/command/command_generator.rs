@@ -203,7 +203,7 @@ impl<'a> CommandGenerator<'a> {
         }
 
         for voice_index in sorted_indices {
-            let Some(voice) = self
+            let Some(mut voice) = self
                 .voice_context
                 .update_info_for_command_generation(voice_index)
             else {
@@ -226,52 +226,29 @@ impl<'a> CommandGenerator<'a> {
                 | SampleFormat::PcmInt24
                 | SampleFormat::PcmInt32 => PerformanceDetailType::Invalid,
             };
-            let data_detail = self.begin_performance_detail(
-                node_id as i32,
-                PerformanceEntryType::Voice,
-                data_detail_type,
-            );
             for channel in 0..voice.channel_count.max(0) as usize {
                 let Some(resource_id) = voice.channel_resource_ids.get(channel).copied() else {
                     continue;
                 };
-                let dsp_state = self.voice_context.get_dsp_shared_state_ref(resource_id);
-                if dsp_state.is_none() && std::env::var_os("RUZU_TRACE_CMDGEN").is_some() {
+                let voice_state = self.voice_context.get_dsp_shared_state_ref(resource_id).copied();
+                if voice_state.is_none() && std::env::var_os("RUZU_TRACE_CMDGEN").is_some() {
                     log::warn!(
                         "build_data_source: NO dsp_shared_state for resource_id={}",
                         resource_id
                     );
                 }
-                let Some((depop_commands, data_command, voice_state)) = dsp_state
-                    .and_then(|voice_state_ref| {
-                        // Upstream zuyu passes `render_context.mix_buffer_count`
-                        // (the count of MIX buffers, not the total buffer_count
-                        // which also includes voice_channels). Voice scratch
-                        // slots live at indices [mix_buffer_count..buffer_count].
-                        // Passing the larger buffer_count produced output_index
-                        // values past the end of mix_buffers, causing
-                        // mix_buffer_range to bail and decode_from_wave_buffers
-                        // to never run. See voice_info.cpp::GenerateAdpcmVersion1Command call.
-                        let data_command = self.build_data_source_command(
-                            &voice,
-                            voice_state_ref,
-                            channel as i8,
-                            self.mix_buffer_count,
-                        );
-                        if data_command.is_none() && std::env::var_os("RUZU_TRACE_CMDGEN").is_some() {
-                            log::warn!(
-                                "build_data_source: NO data_command for voice node_id={} channel={} sample_format={:?}",
-                                voice.node_id, channel, voice.sample_format
-                            );
-                        }
-                        let data_command = data_command?;
-                        let depop_commands =
-                            self.build_voice_depop_prepare_commands(&voice, voice_state_ref);
-                        Some((depop_commands, data_command, *voice_state_ref))
-                    })
-                else {
+                let data_detail = self.begin_performance_detail(
+                    node_id as i32,
+                    PerformanceEntryType::Voice,
+                    data_detail_type,
+                );
+                let Some(voice_state) = voice_state else {
+                    if let Some(addresses) = data_detail {
+                        self.end_performance(node_id as i32, addresses);
+                    }
                     continue;
                 };
+                let depop_commands = self.build_voice_depop_prepare_commands(&voice, &voice_state);
                 if std::env::var_os("RUZU_TRACE_CMDGEN").is_some() {
                     use std::sync::atomic::{AtomicU64, Ordering};
                     static SEEN: AtomicU64 = AtomicU64::new(0);
@@ -290,7 +267,46 @@ impl<'a> CommandGenerator<'a> {
                         enabled,
                     );
                 }
-                if !voice.was_playing {
+                if voice.was_playing {
+                    if std::env::var_os("RUZU_TRACE_CMDGEN").is_some() {
+                        use std::sync::atomic::{AtomicU64, Ordering};
+                        static SKIP: AtomicU64 = AtomicU64::new(0);
+                        let n = SKIP.fetch_add(1, Ordering::Relaxed) + 1;
+                        if n <= 10 || n % 500 == 0 {
+                            log::info!(
+                                "data_source_SKIP #{} voice={} channel={} (was_playing=true)",
+                                n,
+                                voice.node_id,
+                                channel
+                            );
+                        }
+                    }
+                } else {
+                    // Upstream zuyu passes `render_context.mix_buffer_count`
+                    // (the count of MIX buffers, not the total buffer_count
+                    // which also includes voice_channels). Voice scratch
+                    // slots live at indices [mix_buffer_count..buffer_count].
+                    // Passing the larger buffer_count produced output_index
+                    // values past the end of mix_buffers, causing
+                    // mix_buffer_range to bail and decode_from_wave_buffers
+                    // to never run. See voice_info.cpp::GenerateAdpcmVersion1Command call.
+                    let Some(data_command) = self.build_data_source_command(
+                        &voice,
+                        &voice_state,
+                        channel as i8,
+                        self.mix_buffer_count,
+                    ) else {
+                        if std::env::var_os("RUZU_TRACE_CMDGEN").is_some() {
+                            log::warn!(
+                                "build_data_source: NO data_command for voice node_id={} channel={} sample_format={:?}",
+                                voice.node_id, channel, voice.sample_format
+                            );
+                        }
+                        if let Some(addresses) = data_detail {
+                            self.end_performance(node_id as i32, addresses);
+                        }
+                        continue;
+                    };
                     let _ = self.command_buffer.push(data_command, node_id);
                     if std::env::var_os("RUZU_TRACE_CMDGEN").is_some() {
                         use std::sync::atomic::{AtomicU64, Ordering};
@@ -306,24 +322,20 @@ impl<'a> CommandGenerator<'a> {
                             );
                         }
                     }
-                } else if std::env::var_os("RUZU_TRACE_CMDGEN").is_some() {
-                    use std::sync::atomic::{AtomicU64, Ordering};
-                    static SKIP: AtomicU64 = AtomicU64::new(0);
-                    let n = SKIP.fetch_add(1, Ordering::Relaxed) + 1;
-                    if n <= 10 || n % 500 == 0 {
-                        log::info!(
-                            "data_source_SKIP #{} voice={} channel={} (was_playing=true)",
-                            n,
-                            voice.node_id,
-                            channel
-                        );
+                }
+                if let Some(addresses) = data_detail {
+                    self.end_performance(node_id as i32, addresses);
+                }
+
+                if voice.was_playing {
+                    voice.prev_volume = 0.0;
+                    if let Some(stored_voice) = self.voice_context.get_info_mut(voice_index as u32) {
+                        stored_voice.prev_volume = 0.0;
                     }
+                    continue;
                 }
 
                 if voice.has_any_connection() {
-                    if voice.was_playing {
-                        continue;
-                    }
                     let biquad_detail = self.begin_performance_detail(
                         node_id as i32,
                         PerformanceEntryType::Voice,
@@ -351,6 +363,13 @@ impl<'a> CommandGenerator<'a> {
                         }),
                         node_id,
                     );
+                    if let Some(addresses) = volume_detail {
+                        self.end_performance(node_id as i32, addresses);
+                    }
+                    voice.prev_volume = voice.volume;
+                    if let Some(stored_voice) = self.voice_context.get_info_mut(voice_index as u32) {
+                        stored_voice.prev_volume = voice.volume;
+                    }
 
                     if voice.mix_id == UNUSED_MIX_ID {
                         if voice.splitter_id != UNUSED_SPLITTER_ID {
@@ -389,11 +408,19 @@ impl<'a> CommandGenerator<'a> {
                         }
                     } else if let Some(mix_info) = self.mix_context.get_info(voice.mix_id).cloned()
                     {
+                        let volume_mix_detail = self.begin_performance_detail(
+                            node_id as i32,
+                            PerformanceEntryType::Voice,
+                            PerformanceDetailType::Unk3,
+                        );
                         let Some(channel_resource) = self
                             .voice_context
                             .get_channel_resource_ref(resource_id)
                             .cloned()
                         else {
+                            if let Some(addresses) = volume_mix_detail {
+                                self.end_performance(node_id as i32, addresses);
+                            }
                             continue;
                         };
                         self.push_voice_mix_commands(
@@ -411,19 +438,15 @@ impl<'a> CommandGenerator<'a> {
                             channel_resource_mut.prev_mix_volumes =
                                 channel_resource_mut.mix_volumes;
                         }
+                        if let Some(addresses) = volume_mix_detail {
+                            self.end_performance(node_id as i32, addresses);
+                        }
                     }
-                    if let Some(addresses) = volume_detail {
-                        self.end_performance(node_id as i32, addresses);
+                    voice.biquad_initialized = voice.biquads.map(|biquad| biquad.enabled);
+                    if let Some(stored_voice) = self.voice_context.get_info_mut(voice_index as u32) {
+                        stored_voice.biquad_initialized = voice.biquad_initialized;
                     }
                 }
-            }
-            if let Some(addresses) = data_detail {
-                self.end_performance(node_id as i32, addresses);
-            }
-
-            if let Some(stored_voice) = self.voice_context.get_info_mut(voice_index as u32) {
-                stored_voice.prev_volume = if voice.was_playing { 0.0 } else { voice.volume };
-                stored_voice.biquad_initialized = stored_voice.biquads.map(|biquad| biquad.enabled);
             }
 
             if let Some(addresses) = entry_aspect {

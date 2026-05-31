@@ -16,6 +16,40 @@ fn should_trace_wait_sync() -> bool {
     std::env::var_os("RUZU_TRACE_WAIT_SYNC").is_some()
 }
 
+fn trace_wait_sync_record(
+    stage: u64,
+    current_thread_id: u64,
+    num_handles: i32,
+    timeout_ns: i64,
+    result: u32,
+    out_index: i32,
+    handles: &[Handle],
+    object_ids: &[u64],
+    object_kind_ids: &[u64],
+    object_signaled: &[bool],
+) {
+    if !common::trace::is_enabled(common::trace::cat::WAIT_SYNC) {
+        return;
+    }
+
+    let mut args = Vec::with_capacity(14);
+    args.extend_from_slice(&[
+        stage,
+        current_thread_id,
+        num_handles as u32 as u64,
+        timeout_ns as u64,
+        result as u64,
+        out_index as u32 as u64,
+    ]);
+    for i in 0..handles.len().min(2) {
+        args.push(handles[i] as u64);
+        args.push(object_ids.get(i).copied().unwrap_or_default());
+        args.push(object_kind_ids.get(i).copied().unwrap_or_default());
+        args.push(u64::from(object_signaled.get(i).copied().unwrap_or(false)));
+    }
+    common::trace::emit_raw(common::trace::cat::WAIT_SYNC, &args);
+}
+
 fn synchronization_timeout_tick_from_ns(current_tick: i64, timeout_ns: i64) -> i64 {
     debug_assert!(timeout_ns > 0);
 
@@ -141,25 +175,50 @@ pub fn wait_synchronization(
         return RESULT_INVALID_HANDLE;
     };
 
+    let trace_wait_sync_ring = common::trace::is_enabled(common::trace::cat::WAIT_SYNC);
     let mut object_ids = Vec::with_capacity(num_handles as usize);
     let mut object_kinds = Vec::with_capacity(num_handles as usize);
+    let mut object_kind_ids = Vec::with_capacity(num_handles as usize);
+    let mut object_signaled = Vec::with_capacity(num_handles as usize);
     for handle in &handles {
         let Some(object_id) = process.handle_table.get_object(*handle) else {
             return RESULT_INVALID_HANDLE;
         };
-        let kind = if process.get_readable_event_by_object_id(object_id).is_some() {
-            "readable_event"
+        let (kind, kind_id) = if process.get_readable_event_by_object_id(object_id).is_some() {
+            ("readable_event", 1)
         } else if process.get_thread_by_object_id(object_id).is_some() {
-            "thread"
+            ("thread", 2)
         } else if process.process_id == object_id {
-            "process"
+            ("process", 3)
         } else if process.get_event_by_object_id(object_id).is_some() {
-            "event"
+            ("event", 4)
+        } else if process.get_server_port_by_object_id(object_id).is_some() {
+            ("server_port", 5)
+        } else if process.get_server_session_by_object_id(object_id).is_some() {
+            ("server_session", 6)
         } else {
-            "unknown"
+            ("unknown", 0)
         };
+        let signaled = trace_wait_sync_ring
+            && k_synchronization_object::is_object_signaled(&process, object_id);
         object_ids.push(object_id);
         object_kinds.push(kind);
+        object_kind_ids.push(kind_id);
+        object_signaled.push(signaled);
+    }
+    if trace_wait_sync_ring {
+        trace_wait_sync_record(
+            1,
+            current_thread_id,
+            num_handles,
+            timeout_ns,
+            0,
+            -1,
+            &handles,
+            &object_ids,
+            &object_kind_ids,
+            &object_signaled,
+        );
     }
     if should_trace_wait_sync() {
         let process_id = process.get_process_id();
@@ -226,6 +285,20 @@ pub fn wait_synchronization(
         object_ids,
         timeout,
     );
+    if trace_wait_sync_ring {
+        trace_wait_sync_record(
+            2,
+            current_thread_id,
+            num_handles,
+            timeout_ns,
+            result.get_inner_value(),
+            *out_index,
+            &handles,
+            &[],
+            &[],
+            &[],
+        );
+    }
     if should_trace_wait_sync() {
         let process = process_arc.lock().unwrap();
         log::info!(

@@ -41,7 +41,7 @@ pub mod present;
 pub mod renderer_opengl;
 pub mod util_shaders;
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -77,6 +77,7 @@ static PRESENT_SCREENSHOT_US: AtomicU64 = AtomicU64::new(0);
 static PRESENT_DRAW_SCREEN_US: AtomicU64 = AtomicU64::new(0);
 static PRESENT_TICK_FRAME_US: AtomicU64 = AtomicU64::new(0);
 static PRESENT_SWAP_BUFFERS_US: AtomicU64 = AtomicU64::new(0);
+static PRESENT_PPM_DUMPED: AtomicBool = AtomicBool::new(false);
 
 fn present_profile_enabled() -> bool {
     std::env::var_os("RUZU_PROFILE_PRESENT").is_some()
@@ -94,6 +95,74 @@ fn update_max(target: &AtomicU64, value: u64) {
 
 fn elapsed_us(start: Instant) -> u64 {
     start.elapsed().as_micros().min(u128::from(u64::MAX)) as u64
+}
+
+fn dump_present_ppm_once(current_frame: u64, layout: &FramebufferLayout) {
+    let Some(path) = std::env::var_os("RUZU_DUMP_PRESENT_PPM") else {
+        return;
+    };
+    let target_frame = std::env::var("RUZU_DUMP_PRESENT_PPM_FRAME")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(0);
+    if current_frame < target_frame
+        || PRESENT_PPM_DUMPED.swap(true, Ordering::Relaxed)
+        || layout.width == 0
+        || layout.height == 0
+    {
+        return;
+    }
+
+    unsafe {
+        let width = layout.width as usize;
+        let height = layout.height as usize;
+        let mut old_pack_buffer = 0;
+        let mut old_pack_alignment = 0;
+        let mut old_pack_row_length = 0;
+        gl::GetIntegerv(gl::PIXEL_PACK_BUFFER_BINDING, &mut old_pack_buffer);
+        gl::GetIntegerv(gl::PACK_ALIGNMENT, &mut old_pack_alignment);
+        gl::GetIntegerv(gl::PACK_ROW_LENGTH, &mut old_pack_row_length);
+        gl::BindBuffer(gl::PIXEL_PACK_BUFFER, 0);
+        gl::PixelStorei(gl::PACK_ALIGNMENT, 1);
+        gl::PixelStorei(gl::PACK_ROW_LENGTH, 0);
+
+        let mut rgba = vec![0u8; width * height * 4];
+        gl::ReadPixels(
+            0,
+            0,
+            width as i32,
+            height as i32,
+            gl::RGBA,
+            gl::UNSIGNED_BYTE,
+            rgba.as_mut_ptr() as *mut _,
+        );
+        let gl_error = gl::GetError();
+
+        gl::BindBuffer(gl::PIXEL_PACK_BUFFER, old_pack_buffer as u32);
+        gl::PixelStorei(gl::PACK_ALIGNMENT, old_pack_alignment);
+        gl::PixelStorei(gl::PACK_ROW_LENGTH, old_pack_row_length);
+
+        let mut ppm = Vec::with_capacity(width * height * 3 + 64);
+        ppm.extend_from_slice(format!("P6\n{} {}\n255\n", width, height).as_bytes());
+        for row in (0..height).rev() {
+            for px in rgba[row * width * 4..(row + 1) * width * 4].chunks_exact(4) {
+                ppm.extend_from_slice(&px[..3]);
+            }
+        }
+        match std::fs::write(&path, ppm) {
+            Ok(()) => info!(
+                "[PRESENT_PPM] wrote {} frame={} gl_error=0x{:X}",
+                path.to_string_lossy(),
+                current_frame,
+                gl_error
+            ),
+            Err(err) => log::warn!(
+                "[PRESENT_PPM] failed to write {}: {}",
+                path.to_string_lossy(),
+                err
+            ),
+        }
+    }
 }
 
 pub fn dump_present_profile() {
@@ -343,6 +412,7 @@ impl RendererOpenGL {
         if let Some(start) = phase_start {
             PRESENT_DRAW_SCREEN_US.fetch_add(elapsed_us(start), Ordering::Relaxed);
         }
+        dump_present_ppm_once(self.base_data.current_frame.max(0) as u64, &self.framebuffer_layout);
 
         if std::env::var_os("RUZU_TRACE_PRESENT_READBACK").is_some() {
             unsafe {

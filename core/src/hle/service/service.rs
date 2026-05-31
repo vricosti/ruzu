@@ -196,7 +196,21 @@ pub trait ServiceFramework: SessionRequestHandler {
                 if ctx.is_tipc() {
                     self.invoke_request_tipc(ctx);
                 } else {
-                    log::warn!("Unimplemented command_type={:?}", ctx.get_command_type());
+                    let cmd_buf = ctx.command_buffer();
+                    log::warn!(
+                        "Unimplemented command_type={:?} service={} cmd={} cmd_buf={{[0]=0x{:X}, [1]=0x{:X}, [2]=0x{:X}, [3]=0x{:X}, [4]=0x{:X}, [5]=0x{:X}, [6]=0x{:X}, [7]=0x{:X}}}",
+                        ctx.get_command_type(),
+                        self.get_service_name(),
+                        ctx.get_command(),
+                        cmd_buf[0],
+                        cmd_buf[1],
+                        cmd_buf[2],
+                        cmd_buf[3],
+                        cmd_buf[4],
+                        cmd_buf[5],
+                        cmd_buf[6],
+                        cmd_buf[7],
+                    );
                     let mut rb = ipc_helpers::ResponseBuilder::new(ctx, 2, 0, 0);
                     rb.push_result(RESULT_SUCCESS);
                 }

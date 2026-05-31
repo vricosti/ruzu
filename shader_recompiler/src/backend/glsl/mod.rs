@@ -121,6 +121,17 @@ pub fn emit_glsl(
             header
         );
     }
+    if std::env::var_os("RUZU_FORCE_VERTEX_INDEXED_QUAD").is_some()
+        && matches!(
+            program.stage,
+            ir::types::ShaderStage::VertexA | ir::types::ShaderStage::VertexB
+        )
+    {
+        return format!(
+            "{}vec2 p[4]=vec2[4](vec2(-1.0,-1.0),vec2(1.0,-1.0),vec2(-1.0,1.0),vec2(1.0,1.0));gl_Position=vec4(p[gl_VertexID&3],0.0,1.0);return;}}\n",
+            header
+        );
+    }
     format!("{}{}{}", header, code, "}\n")
 }
 

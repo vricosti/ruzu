@@ -382,33 +382,21 @@ impl ThreadManager {
             block = true;
         }
 
-        let fence = {
-            let _lock = self.state.write_lock.lock().unwrap();
-            let fence = self.state.last_fence.fetch_add(1, Ordering::Relaxed) + 1;
+        let lock = self.state.write_lock.lock().unwrap();
+        let fence = self.state.last_fence.fetch_add(1, Ordering::Relaxed) + 1;
 
-            self.state.emplace(CommandDataContainer {
-                data: command_data,
-                fence,
-                block,
-            });
-
-            fence
-            // _lock dropped here before blocking wait
-        };
+        self.state.emplace(CommandDataContainer {
+            data: command_data,
+            fence,
+            block,
+        });
 
         if block {
-            // Wait for the command to be processed.
-            let signaled = self.state.signaled_fence.load(Ordering::Relaxed);
-            if fence <= signaled {
-                // Already processed (GPU thread was fast)
-                return fence;
-            }
             log::trace!(
                 "push_command: waiting for fence {} (signaled={})",
                 fence,
-                signaled
+                self.state.signaled_fence.load(Ordering::Relaxed)
             );
-            let lock = self.state.write_lock.lock().unwrap();
             let _guard = self
                 .state
                 .cv

@@ -374,6 +374,11 @@ pub trait Maxwell3DAccess {
     /// Read the current clear-surface flags register payload.
     fn clear_surface_flags(&self) -> u32;
 
+    /// Read `regs.clear_control.use_scissor`.
+    fn clear_control_use_scissor(&self) -> bool {
+        false
+    }
+
     /// Read render-target address.
     fn rt_address(&self, index: usize) -> u64;
 
@@ -962,6 +967,20 @@ impl<'a> Maxwell3DClearView<'a> {
                 render_targets: std::array::from_fn(|i| maxwell3d.rt_info(i)),
             },
             Maxwell3DClearSource::Snapshot { render_targets, .. } => render_targets,
+        }
+    }
+
+    pub fn use_scissor(&self) -> bool {
+        match self.source {
+            Maxwell3DClearSource::Live(maxwell3d) => maxwell3d.clear_control_use_scissor(),
+            Maxwell3DClearSource::Snapshot { .. } => false,
+        }
+    }
+
+    pub fn scissor(&self, index: u32) -> crate::engines::maxwell_3d::ScissorInfo {
+        match self.source {
+            Maxwell3DClearSource::Live(maxwell3d) => maxwell3d.scissor_info(index),
+            Maxwell3DClearSource::Snapshot { .. } => Default::default(),
         }
     }
 }

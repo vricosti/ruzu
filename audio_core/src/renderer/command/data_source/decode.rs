@@ -380,6 +380,73 @@ fn read_adpcm_coefficients(data_address: CpuAddr, data_size: u64) -> Option<[i16
     Some(unsafe { *(data_address as *const [i16; 16]) })
 }
 
+fn adpcm_coeff_pair(coefficients: &[i16; 16], coeff_index: usize) -> Option<(i32, i32)> {
+    let base = coeff_index.checked_mul(2)?;
+    let coeff0 = *coefficients.get(base)? as i32;
+    let coeff1 = *coefficients.get(base + 1)? as i32;
+    Some((coeff0, coeff1))
+}
+
+fn safe_adpcm_coeff_pair(
+    coefficients: &[i16; 16],
+    header: u16,
+    buffer: CpuAddr,
+    read_addr: CpuAddr,
+    read_size: usize,
+    read_index: usize,
+    position_in_frame: u32,
+) -> (i32, i32, bool) {
+    let coeff_index = ((header >> 4) & 0xF) as usize;
+    if let Some(pair) = adpcm_coeff_pair(coefficients, coeff_index) {
+        return (pair.0, pair.1, true);
+    }
+
+    trace_bad_adpcm_header(
+        header,
+        coeff_index,
+        buffer,
+        read_addr,
+        read_size,
+        read_index,
+        position_in_frame,
+    );
+
+    // Upstream assumes valid ADPCM data and always advances by
+    // samples_to_process. Returning 0 here makes the same corrupt header
+    // replay forever; decode silence for this frame instead.
+    (0, 0, false)
+}
+
+fn trace_bad_adpcm_header(
+    header: u16,
+    coeff_index: usize,
+    buffer: CpuAddr,
+    read_addr: CpuAddr,
+    read_size: usize,
+    read_index: usize,
+    position_in_frame: u32,
+) {
+    if std::env::var_os("RUZU_TRACE_AUDIO_ADPCM_BAD_HEADER").is_none() {
+        return;
+    }
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNT: AtomicU64 = AtomicU64::new(0);
+    let count = COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+    if count <= 32 || count.is_power_of_two() {
+        log::warn!(
+            "audio ADPCM invalid header #{} header=0x{:02X} coeff_index={} buffer=0x{:X} read_addr=0x{:X} read_size={} read_index={} position_in_frame={}",
+            count,
+            header,
+            coeff_index,
+            buffer,
+            read_addr,
+            read_size,
+            read_index,
+            position_in_frame,
+        );
+    }
+}
+
 fn decode_pcm_i16(output: &mut [i16], req: &DecodeArg<'_>) -> u32 {
     let buffer_is_guest = req.buffer != 0 && req.buffer < 0x1_0000_0000;
     decode_pcm(
@@ -510,7 +577,7 @@ fn decode_adpcm(output: &mut [i16], req: &mut DecodeArg<'_>) -> u32 {
         position_in_frame += 2;
     }
 
-    let size = ((samples_to_process / 8).max(1) * ADPCM_SAMPLES_PER_FRAME) as usize;
+    let size = ((samples_to_process / 8) * ADPCM_SAMPLES_PER_FRAME).max(8) as usize;
     let read_size = size.min(req.buffer_size as usize);
     let read_addr = req.buffer + (position_in_frame / 2) as usize;
     let buffer_is_guest = req.buffer != 0 && req.buffer < 0x1_0000_0000;
@@ -526,10 +593,19 @@ fn decode_adpcm(output: &mut [i16], req: &mut DecodeArg<'_>) -> u32 {
     };
 
     let mut header = context.header;
-    let mut coeff_index = ((header >> 4) & 0xF) as usize;
     let mut scale = (header & 0xF) as i32;
-    let mut coeff0 = req.coefficients[coeff_index * 2] as i32;
-    let mut coeff1 = req.coefficients[coeff_index * 2 + 1] as i32;
+    let (mut coeff0, mut coeff1, coeff_valid) = safe_adpcm_coeff_pair(
+        &req.coefficients,
+        header,
+        req.buffer,
+        read_addr,
+        read_size,
+        0,
+        position_in_frame,
+    );
+    if !coeff_valid {
+        scale = 0;
+    }
     let mut yn0 = context.yn0 as i32;
     let mut yn1 = context.yn1 as i32;
     let mut read_index = 0usize;
@@ -553,10 +629,21 @@ fn decode_adpcm(output: &mut [i16], req: &mut DecodeArg<'_>) -> u32 {
             }
             header = wavebuffer[read_index] as u16;
             read_index += 1;
-            coeff_index = ((header >> 4) & 0xF) as usize;
             scale = (header & 0xF) as i32;
-            coeff0 = req.coefficients[coeff_index * 2] as i32;
-            coeff1 = req.coefficients[coeff_index * 2 + 1] as i32;
+            let (next_coeff0, next_coeff1, coeff_valid) = safe_adpcm_coeff_pair(
+                &req.coefficients,
+                header,
+                req.buffer,
+                read_addr,
+                read_size,
+                read_index.saturating_sub(1),
+                position_in_frame,
+            );
+            coeff0 = next_coeff0;
+            coeff1 = next_coeff1;
+            if !coeff_valid {
+                scale = 0;
+            }
             position_in_frame += 2;
 
             if samples_to_read >= ADPCM_SAMPLES_PER_FRAME {
@@ -607,7 +694,7 @@ fn decode_adpcm(output: &mut [i16], req: &mut DecodeArg<'_>) -> u32 {
     context.header = header;
     context.yn0 = yn0 as i16;
     context.yn1 = yn1 as i16;
-    write_index as u32
+    samples_to_process
 }
 
 fn end_wave_buffer(
@@ -701,5 +788,30 @@ mod tests {
 
         assert_eq!(decoded, 0);
         assert_eq!(output, [0, 0]);
+    }
+
+    #[test]
+    fn decode_adpcm_invalid_header_advances_with_silence() {
+        let wavebuffer = [0xF0u8, 0, 0, 0, 0, 0, 0, 0];
+        let mut context = AdpcmContext::default();
+        let mut output = [123i16; ADPCM_SAMPLES_PER_FRAME as usize];
+        let mut req = DecodeArg {
+            buffer: wavebuffer.as_ptr() as CpuAddr,
+            buffer_size: wavebuffer.len() as u64,
+            start_offset: 0,
+            end_offset: ADPCM_SAMPLES_PER_FRAME,
+            channel_count: 1,
+            target_channel: 0,
+            offset: 0,
+            samples_to_read: ADPCM_SAMPLES_PER_FRAME,
+            coefficients: [0; 16],
+            adpcm_context: Some(&mut context),
+        };
+
+        let decoded = decode_adpcm(&mut output, &mut req);
+
+        assert_eq!(decoded, ADPCM_SAMPLES_PER_FRAME);
+        assert_eq!(output, [0; ADPCM_SAMPLES_PER_FRAME as usize]);
+        assert_eq!(context.header, 0xF0);
     }
 }

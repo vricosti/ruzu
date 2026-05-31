@@ -183,6 +183,30 @@ fn should_trace_sleep_backtrace_once(tid: u64) -> bool {
     tid == 73 && !DID_TRACE_TID73.swap(true, std::sync::atomic::Ordering::Relaxed)
 }
 
+fn zero_sleep_coerce_ns(tid: u64) -> Option<i64> {
+    let raw = std::env::var("RUZU_COERCE_ZERO_SLEEP_TID").ok()?;
+    let matches = raw.split(',').any(|value| {
+        let value = value.trim();
+        if value.is_empty() {
+            return false;
+        }
+        let parsed = value
+            .strip_prefix("0x")
+            .or_else(|| value.strip_prefix("0X"))
+            .and_then(|hex| u64::from_str_radix(hex, 16).ok())
+            .or_else(|| value.parse::<u64>().ok());
+        parsed == Some(tid)
+    });
+    if !matches {
+        return None;
+    }
+    std::env::var("RUZU_COERCE_ZERO_SLEEP_NS")
+        .ok()
+        .and_then(|value| value.parse::<i64>().ok())
+        .filter(|ns| *ns > 0)
+        .or(Some(1_000_000))
+}
+
 fn is_valid_virtual_core_id(core_id: i32) -> bool {
     (0..4).contains(&core_id)
 }
@@ -773,6 +797,12 @@ pub fn sleep_thread(system: &System, ns: i64) {
         log::warn!("svc::SleepThread(yield): current thread missing");
         return;
     };
+    if ns == YieldType::WithoutCoreMigration as i64 {
+        if let Some(coerced_ns) = zero_sleep_coerce_ns(current_thread_id) {
+            sleep_thread(system, coerced_ns);
+            return;
+        }
+    }
     if let Some(thread) = resolve_current_thread(system) {
         let thread = thread.lock().unwrap();
         log::trace!(

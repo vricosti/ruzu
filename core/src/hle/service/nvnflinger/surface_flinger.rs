@@ -119,6 +119,15 @@ impl SurfaceFlinger {
             }
             return false;
         };
+        if std::env::var_os("RUZU_TRACE_SF_COMPOSE_DENSE").is_some() {
+            log::info!(
+                "[SF_COMPOSE_DENSE] self=0x{:X} #{} display_id={} layers={}",
+                self as *const Self as usize,
+                n,
+                display_id,
+                display.stack.layers.len()
+            );
+        }
         if !display.stack.has_layers() {
             let c = NO_LAYERS.fetch_add(1, Ordering::Relaxed);
             // Log first 8, every power-of-2, AND every 60 ticks (~1s at 60Hz

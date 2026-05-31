@@ -10,7 +10,7 @@
 //! - HLERequestContext: in-flight IPC request context
 
 use std::cell::RefCell;
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use crate::hle::ipc;
 
@@ -21,6 +21,16 @@ use crate::hle::ipc;
 thread_local! {
     pub(crate) static IPC_TRACE_CURRENT: RefCell<(String, u32, u32)> =
         RefCell::new((String::new(), 0, 0));
+}
+
+fn ipc_trace_ring_limit() -> usize {
+    static LIMIT: OnceLock<usize> = OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        std::env::var("RUZU_TRACE_IPC_RING_LIMIT")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(4000)
+    })
 }
 use crate::hle::kernel::k_readable_event::KReadableEvent;
 use crate::hle::kernel::k_thread::KThreadLock;
@@ -631,7 +641,7 @@ pub fn complete_sync_request(
                 use std::sync::atomic::{AtomicUsize, Ordering};
                 static REQ_SEQ: AtomicUsize = AtomicUsize::new(0);
                 let seq = REQ_SEQ.fetch_add(1, Ordering::Relaxed);
-                if seq < 4000 {
+                if seq < ipc_trace_ring_limit() {
                     let (svc, cmd, ioctl) =
                         IPC_TRACE_CURRENT.with(|c| c.borrow().clone());
                     let svc_str = if svc.is_empty() { "?" } else { svc.as_str() };
@@ -1455,8 +1465,21 @@ impl HLERequestContext {
         if data.is_empty() || address == 0 {
             return;
         }
+        if !self.guest_range_is_user_writable(address, data.len()) {
+            log::error!(
+                "write_guest_memory: output buffer is not user-writable addr={:#x} size={:#x}",
+                address,
+                data.len()
+            );
+            return;
+        }
         if let Some(ref memory) = self.memory {
-            memory.lock().unwrap().write_block_no_rasterizer(address, data);
+            let memory = memory.lock().unwrap();
+            if data.len() >= 0x10000 {
+                memory.write_block_no_rasterizer_checked(address, data);
+            } else {
+                memory.write_block_no_rasterizer(address, data);
+            }
         } else {
             log::error!(
                 "write_guest_memory: no Memory available for addr={:#x} size={:#x}",
@@ -1464,6 +1487,48 @@ impl HLERequestContext {
                 data.len()
             );
         }
+    }
+
+    fn guest_range_is_user_writable(&self, address: u64, size: usize) -> bool {
+        if size == 0 {
+            return true;
+        }
+        let Some(thread) = self.thread.as_ref() else {
+            return true;
+        };
+        let Some(parent) = ({
+            let guard = thread.lock().unwrap();
+            guard.parent.as_ref().and_then(|parent| parent.upgrade())
+        }) else {
+            return true;
+        };
+
+        let start = address as usize;
+        let Some(end) = start.checked_add(size) else {
+            return false;
+        };
+        let process = parent.lock().unwrap();
+        let mut cur = start;
+        while cur < end {
+            let Some(info) = process.page_table.query_info(cur) else {
+                return false;
+            };
+            if !info
+                .m_permission
+                .contains(crate::hle::kernel::k_memory_block::KMemoryPermission::USER_WRITE)
+                || info
+                    .m_permission
+                    .contains(crate::hle::kernel::k_memory_block::KMemoryPermission::NOT_MAPPED)
+            {
+                return false;
+            }
+            let block_end = info.m_address.saturating_add(info.m_size);
+            if block_end <= cur {
+                return false;
+            }
+            cur = block_end.min(end);
+        }
+        true
     }
 
     /// Populates this context from the thread's TLS command buffer.
@@ -1826,13 +1891,13 @@ impl HLERequestContext {
         // Matches upstream: memory.WriteBlock(thread->GetTlsAddress(), cmd_buf.data(), write_size * sizeof(u32))
         let write_words = (self.write_size as usize).min(ipc::COMMAND_BUFFER_LENGTH);
 
-        // IPC reply hex-dump routed through the non-blocking trace ring. Cap at
-        // first 4000 replies so the ring isn't overwhelmed during long runs.
+        // IPC reply hex-dump routed through the non-blocking trace ring. Cap is
+        // configurable so long-run investigations can include late IPC traffic.
         if common::trace::is_enabled(common::trace::cat::IPC_REPLY) {
             use std::sync::atomic::{AtomicUsize, Ordering};
             static SEQ: AtomicUsize = AtomicUsize::new(0);
             let seq = SEQ.fetch_add(1, Ordering::Relaxed);
-            if seq < 4000 {
+            if seq < ipc_trace_ring_limit() {
                 let (svc, cmd, ioctl) = IPC_TRACE_CURRENT.with(|c| c.borrow().clone());
                 let svc_str = if svc.is_empty() { "?" } else { svc.as_str() };
                 let svc_id = common::trace::intern_service(svc_str);

@@ -100,6 +100,78 @@ pub mod cat {
     pub const IPC_HANDLE_OUT: u16 = 12;
     /// Domain object id emission. args = [svc_id, cmd, offset, domain_object_id]
     pub const IPC_DOMAIN_OUT: u16 = 13;
+    /// Host-thread IPC routing stages. args = [stage_id, session_handle]
+    pub const HOST_THREAD_IPC: u16 = 14;
+    /// Fresh-session IPC diagnostic. args = [kind, guest_tid, client_obj, ss_ptr, wakeup_ptr,
+    /// needs_setup, is_signaled, req_len, cur_req, mgr_wakeup_live]
+    pub const PLU_IPC: u16 = 15;
+    /// nvhost_ctrl::IocCtrlEventWait. args = [stage_id, syncpt_id, threshold, timeout,
+    /// is_allocation, slot, value_raw, result_id, min_value, target]
+    pub const NVHOST_CTRL_WAIT: u16 = 16;
+    /// Scheduler state/PQ update. args = [stage, tid, old_state, new_state, prio, active_core,
+    /// top0, top1, top2, top3]
+    pub const SCHED_STATE: u16 = 17;
+    /// WaitSynchronization object attribution. args =
+    /// [stage, guest_tid, num_handles, timeout_ns, result, out_index,
+    ///  h0, oid0, kind0, signaled0, h1, oid1, kind1, signaled1]
+    pub const WAIT_SYNC: u16 = 18;
+    /// nvnflinger hardware-composer / nvdisp present path. args are stage-specific:
+    /// stage=1 acquire [stage, frame, consumer, status, slot, item_frame, swap_interval, release_frame, is_acquired]
+    /// stage=2 hwc_layer [stage, frame, consumer, handle, offset, width, height, stride, format, transform, crop_l, crop_t, crop_r, crop_b]
+    /// stage=3 nvdisp_layer [stage, index, handle, address, offset, width, height, stride, format, transform, crop_l, crop_t, crop_r, crop_b]
+    pub const HWC: u16 = 19;
+    /// OpenGL sampled texture binding attribution. args =
+    /// [draw_seq, pipeline, stage, unit, desc_type, view_id, view_type, image_id,
+    ///  gl_handle, width, height, depth, sample0_rgba, sample_mid_rgba]
+    pub const TEXTURE_BIND: u16 = 20;
+    /// OpenGL graphics constant-buffer binding attribution. One record is emitted
+    /// per sampled vec4. args =
+    /// [draw_seq, pipeline, stage, slot, binding_index, vec4_index, gpu_addr, size,
+    ///  used_size, enabled, f32_0_bits, f32_1_bits, f32_2_bits, f32_3_bits]
+    pub const CBUF_BIND: u16 = 21;
+    /// OpenGL draw render-target attribution. args =
+    /// [draw_seq, pipeline, fbo, width, height, rt_count, rt_map_pack,
+    ///  rt0_gpu, rt0_format, rt0_size_pack, rt1_gpu, rt1_format, rt1_size_pack,
+    ///  surface_size_pack]
+    pub const RT_BIND: u16 = 22;
+    /// Filtered OpenGL render-target readback. args =
+    /// [draw_seq, pipeline, fbo, rt0_gpu, rt0_format, width, height,
+    ///  sample_width, sample_height, rgb_nonzero, alpha_nonzero, checksum,
+    ///  first_rgba, gl_error, center_rgba]
+    pub const RT_SAMPLE: u16 = 23;
+    /// OpenGL texture binding address attribution. args =
+    /// [draw_seq, pipeline, stage, unit, view_id, image_id, view_gpu_addr,
+    ///  width, height, sample0_rgba, sample_mid_rgba]
+    pub const TEXTURE_BIND_ADDR: u16 = 24;
+    /// Filtered OpenGL render-target sparse-grid readback. args =
+    /// [draw_seq, pipeline, fbo, rt0_gpu, width, height, grid_w, grid_h,
+    ///  hit_cells, nonzero_bytes, first_xy_pack, first_rgba, last_xy_pack, last_rgba]
+    pub const RT_GRID: u16 = 25;
+    /// OpenGL draw-state attribution. stage-specific args:
+    /// stage=1 fbo/attachment [stage, draw_seq, pipeline, fbo, status, drawbuf0, attached,
+    ///   attached_type, attached_level, attached_layer, attached_layered]
+    /// stage=2 kill-state [stage, draw_seq, pipeline, rasterizer_discard, color_logic_op,
+    ///   alpha_test, depth_clamp, primitive_restart, primitive_restart_fixed, sample_mask,
+    ///   sample_mask_value, clip_mask, transform_feedback_active, transform_feedback_paused]
+    /// stage=3 output-state [stage, draw_seq, pipeline, color_mask_pack, blend0, scissor0,
+    ///   depth_test, depth_mask, stencil_test, cull_face, front_face, cull_face_mode,
+    ///   polygon_offset_fill, framebuffer_srgb]
+    /// stage=4 draw-result [stage, draw_seq, pipeline, query_created, any_samples,
+    ///   gl_error_after_draw, indexed, primitive, vertices, instances]
+    /// stage=5 draw-params [stage, draw_seq, pipeline, indexed, primitive, vertices,
+    ///   instances, base_vertex, base_instance, index_offset, index_format,
+    ///   vertex_first, vertex_count, index_first]
+    pub const GL_DRAW_STATE: u16 = 26;
+    /// Filtered OpenGL render-target sparse-grid readback with explicit phase.
+    /// args = [phase, draw_seq, pipeline, fbo, rt0_gpu, width, height,
+    ///  hit_cells, nonzero_bytes, first_xy_pack, first_rgba, last_xy_pack,
+    ///  last_rgba, gl_error]
+    pub const RT_GRID_PHASE: u16 = 27;
+    /// OpenGL texture-cache image/view lifecycle attribution. args =
+    /// [stage, view_id, image_id, image_texture, current_texture, default_handle,
+    ///  color2d_handle, color_array2d_handle, view_type, format, size_pack,
+    ///  gpu_addr, range_pack, flags]
+    pub const IMAGE_VIEW: u16 = 28;
 }
 
 fn service_registry() -> &'static Mutex<Vec<String>> {
@@ -261,6 +333,19 @@ pub struct Config {
     pub bl_hit_trace: bool,
     pub ipc_handle_out: bool,
     pub ipc_domain_out: bool,
+    pub host_thread_ipc_trace: bool,
+    pub plu_ipc_trace: bool,
+    pub nvhost_ctrl_wait_trace: bool,
+    pub sched_state_trace: bool,
+    pub wait_sync_trace: bool,
+    pub hwc_trace: bool,
+    pub texture_bind_trace: bool,
+    pub cbuf_bind_trace: bool,
+    pub rt_bind_trace: bool,
+    pub rt_sample_trace: bool,
+    pub texture_bind_addr_trace: bool,
+    pub gl_draw_state_trace: bool,
+    pub image_view_trace: bool,
     /// Sink target: "stderr" or "file".
     pub output_target: String,
     /// File path when target == "file".
@@ -289,6 +374,19 @@ impl Default for Config {
             bl_hit_trace: false,
             ipc_handle_out: false,
             ipc_domain_out: false,
+            host_thread_ipc_trace: false,
+            plu_ipc_trace: false,
+            nvhost_ctrl_wait_trace: false,
+            sched_state_trace: false,
+            wait_sync_trace: false,
+            hwc_trace: false,
+            texture_bind_trace: false,
+            cbuf_bind_trace: false,
+            rt_bind_trace: false,
+            rt_sample_trace: false,
+            texture_bind_addr_trace: false,
+            gl_draw_state_trace: false,
+            image_view_trace: false,
             output_target: "stderr".to_string(),
             output_file: String::new(),
             ring_capacity: 16384,
@@ -379,6 +477,54 @@ fn build_config() -> Config {
         bl_hit_trace: get_bool("jit", "bl_hit", "RUZU_TRACE_BL_HIT", false),
         ipc_handle_out: get_bool("ipc", "handle_out", "RUZU_IPC_HANDLE_OUT", false),
         ipc_domain_out: get_bool("ipc", "domain_out", "RUZU_IPC_DOMAIN_OUT", false),
+        host_thread_ipc_trace: get_bool(
+            "ipc",
+            "host_thread_ipc",
+            "RUZU_TRACE_HOST_THREAD_IPC",
+            false,
+        ),
+        plu_ipc_trace: get_bool("ipc", "plu_ipc", "RUZU_TRACE_PLU_IPC", false),
+        nvhost_ctrl_wait_trace: get_bool(
+            "nvdrv",
+            "nvhost_ctrl_wait",
+            "RUZU_TRACE_NVHOST_CTRL_WAIT",
+            false,
+        ),
+        sched_state_trace: get_bool(
+            "scheduler",
+            "state",
+            "RUZU_TRACE_SCHED_STATE_FAST",
+            false,
+        ),
+        wait_sync_trace: get_bool("svc", "wait_sync", "RUZU_TRACE_WAIT_SYNC_RING", false),
+        hwc_trace: get_bool("nvnflinger", "hwc", "RUZU_TRACE_HWC_RING", false),
+        texture_bind_trace: get_bool(
+            "opengl",
+            "texture_bind",
+            "RUZU_TRACE_TEXTURE_BIND_RING",
+            false,
+        ),
+        cbuf_bind_trace: get_bool("opengl", "cbuf_bind", "RUZU_TRACE_CBUF_BIND_RING", false),
+        rt_bind_trace: get_bool("opengl", "rt_bind", "RUZU_TRACE_RT_BIND_RING", false),
+        rt_sample_trace: get_bool("opengl", "rt_sample", "RUZU_TRACE_RT_SAMPLE_RING", false),
+        texture_bind_addr_trace: get_bool(
+            "opengl",
+            "texture_bind_addr",
+            "RUZU_TRACE_TEXTURE_BIND_ADDR_RING",
+            false,
+        ),
+        gl_draw_state_trace: get_bool(
+            "opengl",
+            "draw_state",
+            "RUZU_TRACE_GL_DRAW_STATE_RING",
+            false,
+        ),
+        image_view_trace: get_bool(
+            "opengl",
+            "image_view",
+            "RUZU_TRACE_IMAGE_VIEW_RING",
+            false,
+        ),
         output_target: get_str("output", "target", "RUZU_TRACE_TARGET", "stderr"),
         output_file: get_str("output", "file_path", "RUZU_TRACE_FILE", ""),
         ring_capacity: get_u64("output", "ring_capacity", 16384) as usize,
@@ -414,6 +560,21 @@ pub fn is_enabled(category: u16) -> bool {
         cat::BL_HIT => c.bl_hit_trace,
         cat::IPC_HANDLE_OUT => c.ipc_handle_out,
         cat::IPC_DOMAIN_OUT => c.ipc_domain_out,
+        cat::HOST_THREAD_IPC => c.host_thread_ipc_trace,
+        cat::PLU_IPC => c.plu_ipc_trace,
+        cat::NVHOST_CTRL_WAIT => c.nvhost_ctrl_wait_trace,
+        cat::SCHED_STATE => c.sched_state_trace,
+        cat::WAIT_SYNC => c.wait_sync_trace,
+        cat::HWC => c.hwc_trace,
+        cat::TEXTURE_BIND => c.texture_bind_trace,
+        cat::CBUF_BIND => c.cbuf_bind_trace,
+        cat::RT_BIND => c.rt_bind_trace,
+        cat::RT_SAMPLE => c.rt_sample_trace,
+        cat::TEXTURE_BIND_ADDR => c.texture_bind_addr_trace,
+        cat::RT_GRID => c.rt_sample_trace,
+        cat::GL_DRAW_STATE => c.gl_draw_state_trace,
+        cat::RT_GRID_PHASE => c.rt_sample_trace,
+        cat::IMAGE_VIEW => c.image_view_trace,
         _ => false,
     }
 }
@@ -695,6 +856,598 @@ fn format_into(out: &mut String, rec: &LogRecord) {
                 out,
                 "[IPC_DOMAIN_OUT] service={} cmd={} offset={} domain_object_id={}",
                 svc, rec.args[1], rec.args[2], rec.args[3]
+            );
+        }
+        cat::HOST_THREAD_IPC => {
+            let stage = match rec.args[0] {
+                1 => "enqueue_begin",
+                2 => "registered_with_host_thread",
+                3 => "enqueue_end",
+                4 => "client_begin_wait",
+                5 => "client_resumed",
+                6 => "spawn_fallback_begin",
+                7 => "before_scheduler_lock",
+                8 => "after_scheduler_lock",
+                9 => "before_process_lock",
+                10 => "after_process_lock",
+                11 => "before_client_session_lock",
+                12 => "after_client_session_lock",
+                13 => "after_send_sync_request_with_process",
+                14 => "before_current_thread_lock",
+                15 => "after_current_thread_lock",
+                16 => "after_begin_wait_guarded",
+                17 => "before_parent_lookup",
+                18 => "after_parent_lookup",
+                19 => "before_parent_session_lock",
+                20 => "after_parent_session_lock",
+                21 => "before_on_request",
+                22 => "after_on_request",
+                23 => "before_server_session_lock",
+                24 => "after_server_session_lock",
+                25 => "before_server_on_request",
+                26 => "after_server_on_request",
+                27 => "before_notify_waiters",
+                28 => "after_notify_waiters",
+                29 => "before_manager_wakeup_upgrade",
+                30 => "after_manager_wakeup_upgrade",
+                31 => "before_manager_wakeup_signal",
+                32 => "after_manager_wakeup_signal",
+                33 => "before_notify_thread_lock",
+                34 => "after_notify_thread_lock",
+                35 => "before_locked_section_end",
+                36 => "after_locked_section_end",
+                37 => "before_belt_signal",
+                38 => "after_belt_signal",
+                _ => "unknown",
+            };
+            let _ = writeln!(
+                out,
+                "[HOST_THREAD_IPC] handle=0x{:X} stage={}",
+                rec.args[1] as u32,
+                stage,
+            );
+        }
+        cat::PLU_IPC => {
+            match rec.args[0] {
+                1 => {
+                    let _ = writeln!(
+                        out,
+                        "[PLU_IPC] tid={} client_obj={} ss_ptr=0x{:X} wakeup_ptr=0x{:X} needs_setup={} is_signaled={} req_len={} cur_req={} mgr_wakeup_live={}",
+                        rec.args[1],
+                        rec.args[2],
+                        rec.args[3],
+                        rec.args[4],
+                        rec.args[5] != 0,
+                        rec.args[6] != 0,
+                        rec.args[7],
+                        rec.args[8] != 0,
+                        rec.args[9] != 0,
+                    );
+                }
+                _ => {
+                    let _ = writeln!(out, "[PLU_IPC] kind={} args={:?}", rec.args[0], &rec.args[..rec.arg_count as usize]);
+                }
+            }
+        }
+        cat::NVHOST_CTRL_WAIT => {
+            let stage = match rec.args[0] {
+                1 => "begin",
+                2 => "zero-threshold",
+                3 => "signalled-immediate",
+                4 => "signalled-after-update",
+                5 => "timeout0-success",
+                6 => "timeout0-timeout",
+                7 => "wait-fallback-success",
+                8 => "armed",
+                9 => "bad-parameter",
+                10 => "busy",
+                _ => "unknown",
+            };
+            let result = match rec.args[7] {
+                0 => "success",
+                1 => "timeout",
+                2 => "bad-parameter",
+                3 => "busy",
+                _ => "unknown",
+            };
+            let _ = writeln!(
+                out,
+                "[NVHOST_CTRL_WAIT] stage={} syncpt_id={} threshold={} timeout={} is_allocation={} slot={} value_raw=0x{:08X} result={} min_value={} target={}",
+                stage,
+                rec.args[1],
+                rec.args[2],
+                rec.args[3] as u32,
+                rec.args[4] != 0,
+                rec.args[5],
+                rec.args[6] as u32,
+                result,
+                rec.args[8],
+                rec.args[9],
+            );
+        }
+        cat::SCHED_STATE => {
+            let stage = match rec.args[0] {
+                1 => "transition",
+                2 => "pq_remove",
+                3 => "pq_push",
+                _ => "unknown",
+            };
+            let top = |idx: usize| -> String {
+                let value = rec.args[idx];
+                if value == u64::MAX {
+                    "None".to_string()
+                } else {
+                    value.to_string()
+                }
+            };
+            let _ = writeln!(
+                out,
+                "[SCHED_STATE] stage={} tid={} old=0x{:X} new=0x{:X} prio={} core={} top=[{},{},{},{}]",
+                stage,
+                rec.args[1],
+                rec.args[2],
+                rec.args[3],
+                rec.args[4] as i32,
+                rec.args[5] as i32,
+                top(6),
+                top(7),
+                top(8),
+                top(9),
+            );
+        }
+        cat::WAIT_SYNC => {
+            let stage = match rec.args[0] {
+                1 => "enter",
+                2 => "return",
+                _ => "unknown",
+            };
+            let kind = |value: u64| -> &'static str {
+                match value {
+                    1 => "readable_event",
+                    2 => "thread",
+                    3 => "process",
+                    4 => "event",
+                    5 => "server_port",
+                    6 => "server_session",
+                    _ => "unknown",
+                }
+            };
+            let _ = write!(
+                out,
+                "[WAIT_SYNC] t_ns={} stage={} tid={} num={} timeout={} result=0x{:08X} out_index={}",
+                rec.timestamp_ns,
+                stage,
+                rec.args[1],
+                rec.args[2],
+                rec.args[3] as i64,
+                rec.args[4] as u32,
+                rec.args[5] as i32,
+            );
+            for base in [6usize, 10usize] {
+                if base + 3 >= rec.arg_count as usize {
+                    break;
+                }
+                let handle = rec.args[base] as u32;
+                let object_id = rec.args[base + 1];
+                if handle == 0 && object_id == 0 {
+                    continue;
+                }
+                let _ = write!(
+                    out,
+                    " h{}=0x{:08X}:oid=0x{:X}:kind={}:signaled={}",
+                    (base - 6) / 4,
+                    handle,
+                    object_id,
+                    kind(rec.args[base + 2]),
+                    rec.args[base + 3] != 0,
+                );
+            }
+            out.push('\n');
+        }
+        cat::HWC => {
+            match rec.args[0] {
+                1 => {
+                    let _ = writeln!(
+                        out,
+                        "[HWC] stage=acquire frame={} consumer={} status={} slot={} item_frame={} swap_interval={} release_frame={} is_acquired={}",
+                        rec.args[1],
+                        rec.args[2] as i32,
+                        rec.args[3] as i32,
+                        rec.args[4] as i32,
+                        rec.args[5],
+                        rec.args[6] as i32,
+                        rec.args[7],
+                        rec.args[8] != 0,
+                    );
+                }
+                2 => {
+                    let _ = writeln!(
+                        out,
+                        "[HWC] stage=compose_layer frame={} consumer={} handle=0x{:X} offset=0x{:X} size={}x{} stride={} format=0x{:X} transform=0x{:X} crop=({},{}..{},{})",
+                        rec.args[1],
+                        rec.args[2] as i32,
+                        rec.args[3],
+                        rec.args[4],
+                        rec.args[5],
+                        rec.args[6],
+                        rec.args[7],
+                        rec.args[8],
+                        rec.args[9],
+                        rec.args[10] as i32,
+                        rec.args[11] as i32,
+                        rec.args[12] as i32,
+                        rec.args[13] as i32,
+                    );
+                }
+                3 => {
+                    let _ = writeln!(
+                        out,
+                        "[HWC] stage=nvdisp_layer index={} handle=0x{:X} address=0x{:X} offset=0x{:X} size={}x{} stride={} format=0x{:X} transform=0x{:X} crop=({},{}..{},{})",
+                        rec.args[1],
+                        rec.args[2],
+                        rec.args[3],
+                        rec.args[4],
+                        rec.args[5],
+                        rec.args[6],
+                        rec.args[7],
+                        rec.args[8],
+                        rec.args[9],
+                        rec.args[10] as i32,
+                        rec.args[11] as i32,
+                        rec.args[12] as i32,
+                        rec.args[13] as i32,
+                    );
+                }
+                _ => {
+                    let _ = writeln!(out, "[HWC] stage={} args={:?}", rec.args[0], &rec.args[..rec.arg_count as usize]);
+                }
+            }
+        }
+        cat::TEXTURE_BIND => {
+            let texture_type = match rec.args[4] {
+                0 => "Color1D",
+                1 => "ColorArray1D",
+                2 => "Color2D",
+                3 => "ColorArray2D",
+                4 => "Color3D",
+                5 => "ColorCube",
+                6 => "ColorArrayCube",
+                7 => "Buffer",
+                8 => "Color2DRect",
+                _ => "unknown",
+            };
+            let view_type = match rec.args[6] {
+                0 => "E1D",
+                1 => "E2D",
+                2 => "Cube",
+                3 => "E3D",
+                4 => "E1DArray",
+                5 => "E2DArray",
+                6 => "CubeArray",
+                7 => "Rect",
+                8 => "Buffer",
+                _ => "unknown",
+            };
+            let _ = writeln!(
+                out,
+                "[TEXTURE_BIND] draw_seq={} pipeline={} stage={} unit={} desc_type={} view_id={} view_type={} image_id={} handle={} size={}x{}x{} sample0=0x{:08X} sample_mid=0x{:08X}",
+                rec.args[0],
+                rec.args[1],
+                rec.args[2],
+                rec.args[3],
+                texture_type,
+                rec.args[5],
+                view_type,
+                rec.args[7],
+                rec.args[8],
+                rec.args[9],
+                rec.args[10],
+                rec.args[11],
+                rec.args[12],
+                rec.args[13],
+            );
+        }
+        cat::CBUF_BIND => {
+            let _ = writeln!(
+                out,
+                "[CBUF_BIND] draw_seq={} pipeline={} stage={} slot={} binding_index={} vec4={} gpu=0x{:X} size={} used_size={} enabled={} f32=[{:.6},{:.6},{:.6},{:.6}]",
+                rec.args[0],
+                rec.args[1],
+                rec.args[2],
+                rec.args[3],
+                rec.args[4],
+                rec.args[5],
+                rec.args[6],
+                rec.args[7],
+                rec.args[8],
+                rec.args[9],
+                f32::from_bits(rec.args[10] as u32),
+                f32::from_bits(rec.args[11] as u32),
+                f32::from_bits(rec.args[12] as u32),
+                f32::from_bits(rec.args[13] as u32),
+            );
+        }
+        cat::RT_BIND => {
+            let unpack_size = |packed: u64| -> (u32, u32) {
+                ((packed >> 32) as u32, packed as u32)
+            };
+            let (rt0_w, rt0_h) = unpack_size(rec.args[9]);
+            let (rt1_w, rt1_h) = unpack_size(rec.args[12]);
+            let (surface_w, surface_h) = unpack_size(rec.args[13]);
+            let _ = writeln!(
+                out,
+                "[RT_BIND] draw_seq={} pipeline={} fbo={} size={}x{} rt_count={} rt_map=0x{:X} rt0=gpu=0x{:X}/fmt=0x{:X}/{}x{} rt1=gpu=0x{:X}/fmt=0x{:X}/{}x{} surface={}x{}",
+                rec.args[0],
+                rec.args[1],
+                rec.args[2],
+                rec.args[3],
+                rec.args[4],
+                rec.args[5],
+                rec.args[6],
+                rec.args[7],
+                rec.args[8],
+                rt0_w,
+                rt0_h,
+                rec.args[10],
+                rec.args[11],
+                rt1_w,
+                rt1_h,
+                surface_w,
+                surface_h,
+            );
+        }
+        cat::RT_SAMPLE => {
+            let _ = writeln!(
+                out,
+                "[RT_SAMPLE] draw_seq={} pipeline={} fbo={} rt0_gpu=0x{:X} fmt=0x{:X} size={}x{} sample={}x{} rgb_nonzero={} alpha_nonzero={} checksum=0x{:X} first_rgba=0x{:08X} gl_error=0x{:X}",
+                rec.args[0],
+                rec.args[1],
+                rec.args[2],
+                rec.args[3],
+                rec.args[4],
+                rec.args[5],
+                rec.args[6],
+                rec.args[7],
+                rec.args[8],
+                rec.args[9],
+                rec.args[10],
+                rec.args[11],
+                rec.args[12],
+                rec.args[13],
+            );
+        }
+        cat::RT_GRID => {
+            let unpack_xy = |packed: u64| -> (u32, u32) {
+                ((packed >> 32) as u32, packed as u32)
+            };
+            let (first_x, first_y) = unpack_xy(rec.args[10]);
+            let (last_x, last_y) = unpack_xy(rec.args[12]);
+            let _ = writeln!(
+                out,
+                "[RT_GRID] draw_seq={} pipeline={} fbo={} rt0_gpu=0x{:X} size={}x{} grid={}x{} hit_cells={} nonzero_bytes={} first=({},{}):0x{:08X} last=({},{}):0x{:08X}",
+                rec.args[0],
+                rec.args[1],
+                rec.args[2],
+                rec.args[3],
+                rec.args[4],
+                rec.args[5],
+                rec.args[6],
+                rec.args[7],
+                rec.args[8],
+                rec.args[9],
+                first_x,
+                first_y,
+                rec.args[11],
+                last_x,
+                last_y,
+                rec.args[13],
+            );
+        }
+        cat::GL_DRAW_STATE => {
+            match rec.args[0] {
+                1 => {
+                    let _ = writeln!(
+                        out,
+                        "[GL_DRAW_STATE] stage=fbo draw_seq={} pipeline={} fbo={} status=0x{:X} drawbuf0=0x{:X} attached={} type=0x{:X} level={} layer={} layered={}",
+                        rec.args[1],
+                        rec.args[2],
+                        rec.args[3],
+                        rec.args[4],
+                        rec.args[5],
+                        rec.args[6],
+                        rec.args[7],
+                        rec.args[8] as i32,
+                        rec.args[9] as i32,
+                        rec.args[10] != 0,
+                    );
+                }
+                2 => {
+                    let _ = writeln!(
+                        out,
+                        "[GL_DRAW_STATE] stage=kill draw_seq={} pipeline={} rast_disc={} logic_op={} alpha_test={} depth_clamp={} prim_restart={} prim_restart_fixed={} sample_mask={} sample_mask_value=0x{:X} clip_mask=0x{:X} tf_active={} tf_paused={}",
+                        rec.args[1],
+                        rec.args[2],
+                        rec.args[3] != 0,
+                        rec.args[4] != 0,
+                        rec.args[5] != 0,
+                        rec.args[6] != 0,
+                        rec.args[7] != 0,
+                        rec.args[8] != 0,
+                        rec.args[9] != 0,
+                        rec.args[10],
+                        rec.args[11],
+                        rec.args[12] != 0,
+                        rec.args[13] != 0,
+                    );
+                }
+                3 => {
+                    let mask = rec.args[3];
+                    let _ = writeln!(
+                        out,
+                        "[GL_DRAW_STATE] stage=output draw_seq={} pipeline={} cmask=[{},{},{},{}] blend0={} scissor0={} depth={} depth_mask={} stencil={} cull={} front_face=0x{:X} cull_face=0x{:X} polyoff={} srgb={}",
+                        rec.args[1],
+                        rec.args[2],
+                        (mask & 0xff) != 0,
+                        ((mask >> 8) & 0xff) != 0,
+                        ((mask >> 16) & 0xff) != 0,
+                        ((mask >> 24) & 0xff) != 0,
+                        rec.args[4] != 0,
+                        rec.args[5] != 0,
+                        rec.args[6] != 0,
+                        rec.args[7] != 0,
+                        rec.args[8] != 0,
+                        rec.args[9] != 0,
+                        rec.args[10],
+                        rec.args[11],
+                        rec.args[12] != 0,
+                        rec.args[13] != 0,
+                    );
+                }
+                4 => {
+                    let _ = writeln!(
+                        out,
+                        "[GL_DRAW_STATE] stage=draw_result draw_seq={} pipeline={} query={} any_samples={} gl_error=0x{:X} indexed={} primitive=0x{:X} vertices={} instances={}",
+                        rec.args[1],
+                        rec.args[2],
+                        rec.args[3] != 0,
+                        rec.args[4] != 0,
+                        rec.args[5],
+                        rec.args[6] != 0,
+                        rec.args[7],
+                        rec.args[8],
+                        rec.args[9],
+                    );
+                }
+                5 => {
+                    let _ = writeln!(
+                        out,
+                        "[GL_DRAW_STATE] stage=draw_params draw_seq={} pipeline={} indexed={} primitive=0x{:X} vertices={} instances={} base_vertex={} base_instance={} index_offset={} index_format=0x{:X} vertex_first={} vertex_count={} index_first={}",
+                        rec.args[1],
+                        rec.args[2],
+                        rec.args[3] != 0,
+                        rec.args[4],
+                        rec.args[5],
+                        rec.args[6],
+                        rec.args[7] as i64,
+                        rec.args[8],
+                        rec.args[9],
+                        rec.args[10],
+                        rec.args[11],
+                        rec.args[12],
+                        rec.args[13],
+                    );
+                }
+                _ => {
+                    let _ = writeln!(
+                        out,
+                        "[GL_DRAW_STATE] stage={} draw_seq={} pipeline={}",
+                        rec.args[0],
+                        rec.args[1],
+                        rec.args[2],
+                    );
+                }
+            }
+        }
+        cat::RT_GRID_PHASE => {
+            let unpack_xy = |packed: u64| -> (u32, u32) {
+                ((packed >> 32) as u32, packed as u32)
+            };
+            let (first_x, first_y) = unpack_xy(rec.args[9]);
+            let (last_x, last_y) = unpack_xy(rec.args[11]);
+            let phase = match rec.args[0] {
+                0 => "pre",
+                1 => "post",
+                _ => "unknown",
+            };
+            let _ = writeln!(
+                out,
+                "[RT_GRID_PHASE] phase={} draw_seq={} pipeline={} fbo={} rt0_gpu=0x{:X} size={}x{} hit_cells={} nonzero_bytes={} first=({},{}):0x{:08X} last=({},{}):0x{:08X} gl_error=0x{:X}",
+                phase,
+                rec.args[1],
+                rec.args[2],
+                rec.args[3],
+                rec.args[4],
+                rec.args[5],
+                rec.args[6],
+                rec.args[7],
+                rec.args[8],
+                first_x,
+                first_y,
+                rec.args[10],
+                last_x,
+                last_y,
+                rec.args[12],
+                rec.args[13],
+            );
+        }
+        cat::TEXTURE_BIND_ADDR => {
+            let _ = writeln!(
+                out,
+                "[TEXTURE_BIND_ADDR] draw_seq={} pipeline={} stage={} unit={} view_id={} image_id={} gpu=0x{:X} size={}x{} sample0=0x{:08X} sample_mid=0x{:08X}",
+                rec.args[0],
+                rec.args[1],
+                rec.args[2],
+                rec.args[3],
+                rec.args[4],
+                rec.args[5],
+                rec.args[6],
+                rec.args[7],
+                rec.args[8],
+                rec.args[9],
+                rec.args[10],
+            );
+        }
+        cat::IMAGE_VIEW => {
+            let stage = match rec.args[0] {
+                1 => "image_touch",
+                2 => "view_create",
+                3 => "view_mismatch",
+                4 => "fb_view_create",
+                5 => "fb_view_mismatch",
+                6 => "rt_view_create",
+                7 => "rt_view_mismatch",
+                8 => "cache_unmap_clear",
+                _ => "unknown",
+            };
+            let view_type = match rec.args[8] {
+                0 => "E1D",
+                1 => "E2D",
+                2 => "Cube",
+                3 => "E3D",
+                4 => "E1DArray",
+                5 => "E2DArray",
+                6 => "CubeArray",
+                7 => "Rect",
+                8 => "Buffer",
+                _ => "unknown",
+            };
+            let size_w = rec.args[10] & 0xffff_ffff;
+            let size_h = rec.args[10] >> 32;
+            let range_level = rec.args[12] & 0xffff;
+            let range_layer = (rec.args[12] >> 16) & 0xffff;
+            let range_levels = (rec.args[12] >> 32) & 0xffff;
+            let range_layers = (rec.args[12] >> 48) & 0xffff;
+            let _ = writeln!(
+                out,
+                "[IMAGE_VIEW] stage={} view_id={} image_id={} image_tex={} current_tex={} default={} color2d={} color_array2d={} view_type={} format={} size={}x{} gpu=0x{:X} range=l{} ly{} +{}x{} flags=0x{:X}",
+                stage,
+                rec.args[1],
+                rec.args[2],
+                rec.args[3],
+                rec.args[4],
+                rec.args[5],
+                rec.args[6],
+                rec.args[7],
+                view_type,
+                rec.args[9],
+                size_w,
+                size_h,
+                rec.args[11],
+                range_level,
+                range_layer,
+                range_levels,
+                range_layers,
+                rec.args[13],
             );
         }
         _ => {
