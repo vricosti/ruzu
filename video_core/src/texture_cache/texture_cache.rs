@@ -318,37 +318,51 @@ impl TextureCacheBase {
     }
 
     /// Port of `TextureCache<P>::FindOrInsertImage` (texture_cache.h:1140-1146).
-    /// Looks up an existing image at `gpu_addr` first; on miss, inserts a
-    /// fresh `ImageBase` keyed by that address. The full upstream
-    /// `FindImage` walks the page table for overlapping subresources —
-    /// ruzu's minimal version matches by exact GPU address only and is
-    /// sufficient until the page-table overlap port lands.
+    /// Looks up an existing image that can satisfy `info` at `gpu_addr`;
+    /// on miss, inserts a fresh `ImageBase` keyed by that address.
     pub(crate) fn find_or_insert_image(
         &mut self,
         info: &super::image_info::ImageInfo,
         gpu_addr: GPUVAddr,
     ) -> ImageId {
-        if let Some(id) = self.find_image(gpu_addr) {
+        if let Some(id) = self.find_image(info, gpu_addr) {
             return id;
         }
         self.insert_image(info, gpu_addr)
     }
 
-    /// Minimal port of `FindImage`: exact-address lookup via the
-    /// `image_allocs_table`. Upstream's full version walks every image
-    /// touched by the gpu_addr's pages and applies view-compatibility
-    /// rules — that requires the upstream subresource math which the
-    /// rest of the texture cache hasn't grown yet.
-    pub(crate) fn find_image(&self, gpu_addr: GPUVAddr) -> Option<ImageId> {
-        // Walk slot_images directly for now. There are typically few
-        // images, so an O(n) scan is acceptable until the page-table
-        // overlap search is ported.
-        for (id, image) in self.slot_images.iter() {
-            if image.gpu_addr == gpu_addr {
-                return Some(id);
-            }
-        }
-        None
+    /// Port of `TextureCache<P>::FindImage`'s compatibility predicate
+    /// (texture_cache.h:1149-1202), using a direct slot scan instead of
+    /// upstream's CPU page-table map. The important upstream contract is that
+    /// an existing image is reusable only when `IsSubresource` proves it
+    /// covers the requested image range; exact GPU address alone is
+    /// insufficient for cube/cube-array views.
+    pub(crate) fn find_image(
+        &self,
+        info: &super::image_info::ImageInfo,
+        gpu_addr: GPUVAddr,
+    ) -> Option<ImageId> {
+        let broken_views = false;
+        let native_bgr = false;
+        let options = RelaxedOptions::empty();
+        self.slot_images
+            .iter()
+            .filter_map(|(id, image)| {
+                if image.flags.contains(ImageFlagBits::REMAPPED) {
+                    return None;
+                }
+                super::util::is_subresource(
+                    info,
+                    image,
+                    gpu_addr,
+                    options,
+                    broken_views,
+                    native_bgr,
+                )
+                .then_some((id, image.modification_tick))
+            })
+            .max_by_key(|(_, modification_tick)| *modification_tick)
+            .map(|(id, _)| id)
     }
 
     /// Port of `InsertImage` minus the backend `slot_images.insert(runtime,

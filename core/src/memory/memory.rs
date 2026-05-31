@@ -1341,6 +1341,110 @@ impl Memory {
         user_accessible
     }
 
+    /// SEGV-safe variant for HLE IPC output buffers.
+    ///
+    /// `write_block_no_rasterizer` uses direct host pointers, matching the hot
+    /// memory path. IPC out-buffers can race with guest-side unmapping/protection
+    /// while the service thread is copying a large file chunk; using
+    /// process_vm_writev turns a temporarily inaccessible host page into `EFAULT`
+    /// instead of taking the emulator down with SIGSEGV.
+    pub fn write_block_no_rasterizer_checked(&self, dest_addr: u64, src: &[u8]) -> bool {
+        let size = src.len();
+        if size == 0 {
+            return true;
+        }
+
+        if !self.address_space_contains(dest_addr, size) {
+            log::error!(
+                "Unmapped checked WriteBlock @ {:#018x} size={:#x}",
+                dest_addr,
+                size
+            );
+            return false;
+        }
+
+        let self_pid = unsafe { libc::getpid() };
+        let first_ptr = self.get_pointer_impl(dest_addr);
+        if !first_ptr.is_null() {
+            let local_iov = libc::iovec {
+                iov_base: src.as_ptr() as *mut libc::c_void,
+                iov_len: size,
+            };
+            let remote_iov = libc::iovec {
+                iov_base: first_ptr as *mut libc::c_void,
+                iov_len: size,
+            };
+            let written = unsafe {
+                libc::process_vm_writev(
+                    self_pid,
+                    &local_iov as *const _,
+                    1,
+                    &remote_iov as *const _,
+                    1,
+                    0,
+                )
+            };
+            if written == size as isize {
+                return true;
+            }
+            log::error!(
+                "checked WriteBlock fast path failed @ {:#018x} size={:#x} written={}",
+                dest_addr,
+                size,
+                written
+            );
+        }
+
+        let mut remaining = size;
+        let mut offset = 0usize;
+        let mut vaddr = dest_addr;
+        let mut user_accessible = true;
+
+        while remaining > 0 {
+            let page_offset = (vaddr & PAGE_MASK) as usize;
+            let copy_amount = ((PAGE_SIZE as usize) - page_offset).min(remaining);
+
+            let ptr = self.get_pointer_impl(vaddr);
+            if ptr.is_null() {
+                log::error!("Unmapped checked WriteBlock @ {:#018x}", vaddr);
+                user_accessible = false;
+            } else {
+                let local_iov = libc::iovec {
+                    iov_base: src[offset..].as_ptr() as *mut libc::c_void,
+                    iov_len: copy_amount,
+                };
+                let remote_iov = libc::iovec {
+                    iov_base: ptr as *mut libc::c_void,
+                    iov_len: copy_amount,
+                };
+                let written = unsafe {
+                    libc::process_vm_writev(
+                        self_pid,
+                        &local_iov as *const _,
+                        1,
+                        &remote_iov as *const _,
+                        1,
+                        0,
+                    )
+                };
+                if written != copy_amount as isize {
+                    log::error!(
+                        "checked WriteBlock failed @ {:#018x} size={:#x} written={}",
+                        vaddr,
+                        copy_amount,
+                        written
+                    );
+                    user_accessible = false;
+                }
+            }
+
+            vaddr += copy_amount as u64;
+            offset += copy_amount;
+            remaining -= copy_amount;
+        }
+        user_accessible
+    }
+
     /// Write a u64 (LE). Matches upstream `Memory::Write64`.
     pub fn write_64(&self, vaddr: u64, data: u64) {
         // RUZU_TRACE_MEMORY_W64_AT_VADDR=0xVADDR — log every call into

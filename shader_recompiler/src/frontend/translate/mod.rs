@@ -616,8 +616,11 @@ impl<'a> TranslatorVisitor<'a> {
             }
 
             // texture_gather.cpp
-            MaxwellOpcode::TLD4 | MaxwellOpcode::TLD4_b => {
+            MaxwellOpcode::TLD4 => {
                 self::texture_gather::tld4(self, insn, opcode);
+            }
+            MaxwellOpcode::TLD4_b => {
+                self::texture_gather::tld4_b(self, insn, opcode);
             }
 
             // texture_query.cpp
@@ -661,10 +664,9 @@ impl<'a> TranslatorVisitor<'a> {
             // NOP / dependency barrier
             MaxwellOpcode::NOP | MaxwellOpcode::DEPBAR => {}
 
-            // Kill
+            // Kill. Upstream `TranslatorVisitor::KIL()` is a no-op; the
+            // structured control-flow pass owns demote/discard insertion.
             MaxwellOpcode::KIL => {
-                self.ir.demote_to_helper_invocation();
-                self.ir.program.info.uses_demote_to_helper_invocation = true;
             }
 
             // Memory barrier
@@ -681,5 +683,33 @@ impl<'a> TranslatorVisitor<'a> {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ir::basic_block::Block;
+    use crate::ir::opcodes::Opcode;
+    use crate::ir::program::Program;
+    use crate::ir::types::ShaderStage;
+
+    #[test]
+    fn kil_translate_is_noop_like_upstream() {
+        let mut program = Program::new(ShaderStage::Fragment);
+        program.blocks.push(Block::new());
+        let mut tv = TranslatorVisitor::new(&mut program, 0);
+
+        tv.translate_instruction(0xe330_0000_0000_0000);
+
+        let opcodes: Vec<_> = tv
+            .ir
+            .program
+            .blocks[0]
+            .iter()
+            .map(|inst| inst.opcode)
+            .collect();
+        assert!(!opcodes.contains(&Opcode::DemoteToHelperInvocation));
+        assert!(!tv.ir.program.info.uses_demote_to_helper_invocation);
     }
 }

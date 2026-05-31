@@ -504,6 +504,7 @@ fn main() {
     let want_nvdrv_ioctl_profile = std::env::var_os("RUZU_PROFILE_NVDRV_IOCTL").is_some();
     let want_ipc_phase_profile = std::env::var_os("RUZU_PROFILE_IPC_PHASES").is_some();
     let want_bqp_slot_profile = std::env::var_os("RUZU_PROFILE_BQP_SLOTS").is_some();
+    let want_binder_txn_profile = std::env::var_os("RUZU_PROFILE_BINDER_TXN").is_some();
     let want_bqp_wait_profile = std::env::var_os("RUZU_PROFILE_BQP_WAIT").is_some();
     let want_hwc_cache_profile = std::env::var_os("RUZU_PROFILE_HWC_CACHE").is_some();
     let want_vsync_profile = std::env::var_os("RUZU_PROFILE_VSYNC").is_some();
@@ -536,6 +537,7 @@ fn main() {
         || want_nvdrv_ioctl_profile
         || want_ipc_phase_profile
         || want_bqp_slot_profile
+        || want_binder_txn_profile
         || want_bqp_wait_profile
         || want_hwc_cache_profile
         || want_vsync_profile
@@ -566,6 +568,7 @@ fn main() {
             ruzu_core::hle::kernel::svc::svc_ipc::dump_ipc_phase_profile();
             ruzu_core::hle::service::hle_ipc::dump_hle_handler_profile();
             ruzu_core::hle::service::nvnflinger::buffer_queue_producer::dump_bqp_slot_profile();
+            ruzu_core::hle::service::nvnflinger::hos_binder_driver::dump_binder_txn_profile();
             ruzu_core::hle::service::nvnflinger::buffer_queue_core::dump_bqp_wait_profile();
             ruzu_core::hle::service::nvnflinger::hardware_composer::dump_hwc_cache_profile();
             ruzu_core::hle::service::vi::conductor::dump_vsync_profile();
@@ -601,6 +604,7 @@ fn main() {
             ruzu_core::hle::kernel::svc::svc_ipc::dump_ipc_phase_profile();
             ruzu_core::hle::service::hle_ipc::dump_hle_handler_profile();
             ruzu_core::hle::service::nvnflinger::buffer_queue_producer::dump_bqp_slot_profile();
+            ruzu_core::hle::service::nvnflinger::hos_binder_driver::dump_binder_txn_profile();
             ruzu_core::hle::service::nvnflinger::buffer_queue_core::dump_bqp_wait_profile();
             ruzu_core::hle::service::nvnflinger::hardware_composer::dump_hwc_cache_profile();
             ruzu_core::hle::service::vi::conductor::dump_vsync_profile();

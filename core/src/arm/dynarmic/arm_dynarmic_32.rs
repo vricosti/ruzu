@@ -2263,12 +2263,11 @@ impl UserCallbacks for DynarmicCallbacks32 {
                     self.parent().is_in_thumb_mode()
                 );
 
-                // Store exception info and halt. The run loop will advance PC
-                // past unimplemented instructions (e.g. NEON/SIMD).
-                self.parent()
-                    .last_exception_address
-                    .store(pc, Ordering::Relaxed);
-                self.halt_execution(rdynarmic::halt_reason::HaltReason::EXCEPTION_RAISED);
+                // Upstream logs non-NoExecute A32 exceptions but does not
+                // return a guest exception unless the debugger is active.
+                // Do not halt here; otherwise benign Dynarmic callbacks (for
+                // example around NEON-heavy MK8D code) suspend the guest
+                // thread as a fake PrefetchAbort.
             }
         }
     }
@@ -2641,6 +2640,14 @@ impl ArmInterface for ArmDynarmic32 {
             });
         if let (Some(start), Some(end)) = (trace_start, trace_end) {
             let current_pc = jit.get_register(15);
+            let trace_only_when_pc_window =
+                std::env::var_os("RUZU_A32_TRACE_ONLY_WHEN_PC_WINDOW").is_some();
+            let pc_window_active =
+                rdynarmic::jit::PC_TRACE_ACTIVE.load(std::sync::atomic::Ordering::Relaxed);
+            if trace_only_when_pc_window && !pc_window_active && !(current_pc >= start && current_pc < end) {
+                let rdynarmic_hr = jit.run();
+                return translate_halt_reason(rdynarmic_hr);
+            }
             let trace_after_watch = std::env::var_os("RUZU_A32_TRACE_AFTER_WATCH").is_some();
             if trace_after_watch
                 && trace_search_limit > 0

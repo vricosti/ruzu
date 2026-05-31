@@ -226,7 +226,21 @@ impl ResourceManager {
             return ResultCode::SUCCESS;
         }
 
-        let result = self.create_applet_resource_impl(aruid);
+        let mut result = self.create_applet_resource_impl(aruid);
+        if result == hid_result::RESULT_ARUID_NOT_REGISTERED {
+            // ruzu can construct AM applets before the hid service is reachable,
+            // so HidRegistration may miss its constructor-time registration.
+            // Preserve the upstream resource-manager ownership by repairing the
+            // missing ARUID registration here, before retrying CreateAppletResource.
+            let register_result = self.register_applet_resource_user_id(aruid, true);
+            if register_result.is_success()
+                || register_result == hid_result::RESULT_ARUID_ALREADY_REGISTERED
+            {
+                result = self.create_applet_resource_impl(aruid);
+            } else {
+                result = register_result;
+            }
+        }
         if result.is_error() {
             return result;
         }
@@ -453,6 +467,96 @@ impl ResourceManager {
             device_type,
             position,
         })
+    }
+
+    /// Port of `ResourceManager::GetVibrationDevice(...)->Activate()`.
+    pub fn activate_vibration_device(&self, handle: &VibrationDeviceHandle) -> ResultCode {
+        let is_valid = hid_util::is_vibration_handle_valid(handle);
+        if is_valid.is_error() {
+            return is_valid;
+        }
+        let Some(ref npad) = self.npad else {
+            return ResultCode::SUCCESS;
+        };
+        let mut npad = npad.lock();
+        match npad.get_vibration_device_mut(handle) {
+            Some(device) => device.activate(),
+            None => ResultCode::SUCCESS,
+        }
+    }
+
+    /// Port of `ResourceManager::SendVibrationValue`.
+    pub fn send_vibration_value(
+        &self,
+        aruid: u64,
+        handle: &VibrationDeviceHandle,
+        value: &VibrationValue,
+    ) -> ResultCode {
+        let has_active_aruid = match self.is_vibration_aruid_active(aruid) {
+            Ok(active) => active,
+            Err(result) => return result,
+        };
+        if !has_active_aruid {
+            return ResultCode::SUCCESS;
+        }
+        let is_valid = hid_util::is_vibration_handle_valid(handle);
+        if is_valid.is_error() {
+            return is_valid;
+        }
+        let Some(ref npad) = self.npad else {
+            return ResultCode::SUCCESS;
+        };
+        let mut npad = npad.lock();
+        let Some(device) = npad.get_vibration_device_mut(handle) else {
+            return ResultCode::SUCCESS;
+        };
+        if !device.is_active() {
+            return ResultCode::SUCCESS;
+        }
+        device.send_vibration_value(value)
+    }
+
+    /// Port of `NpadVibrationDevice::GetActualVibrationValue` through
+    /// `ResourceManager::GetNSVibrationDevice`.
+    pub fn get_actual_vibration_value(
+        &self,
+        aruid: u64,
+        handle: &VibrationDeviceHandle,
+    ) -> Result<VibrationValue, ResultCode> {
+        let has_active_aruid = self.is_vibration_aruid_active(aruid)?;
+        if !has_active_aruid {
+            return Ok(DEFAULT_VIBRATION_VALUE);
+        }
+        let is_valid = hid_util::is_vibration_handle_valid(handle);
+        if is_valid.is_error() {
+            return Err(is_valid);
+        }
+        let Some(ref npad) = self.npad else {
+            return Ok(DEFAULT_VIBRATION_VALUE);
+        };
+        let mut npad = npad.lock();
+        let Some(device) = npad.get_vibration_device_mut(handle) else {
+            return Ok(DEFAULT_VIBRATION_VALUE);
+        };
+        device.get_actual_vibration_value()
+    }
+
+    /// Port of `IHidServer::IsVibrationDeviceMounted`.
+    pub fn is_vibration_device_mounted(
+        &self,
+        handle: &VibrationDeviceHandle,
+    ) -> Result<bool, ResultCode> {
+        let is_valid = hid_util::is_vibration_handle_valid(handle);
+        if is_valid.is_error() {
+            return Err(is_valid);
+        }
+        let Some(ref npad) = self.npad else {
+            return Ok(false);
+        };
+        let mut npad = npad.lock();
+        Ok(npad
+            .get_vibration_device_mut(handle)
+            .is_some_and(|device| device.is_vibration_mounted()))
     }
 
     /// Port of ResourceManager::GetTouchScreenFirmwareVersion.

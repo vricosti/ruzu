@@ -1161,6 +1161,47 @@ impl ImageView {
                     view_range.extent.layers as u32,
                 );
                 let view_err = gl::GetError();
+                if view_err != gl::NO_ERROR
+                    || std::env::var_os("RUZU_TRACE_TEXTURE_VIEW_CREATE").is_some()
+                {
+                    let mut original_width = 0;
+                    let mut original_height = 0;
+                    let mut original_depth = 0;
+                    gl::GetTextureLevelParameteriv(
+                        self.original_texture,
+                        view_range.base.level,
+                        gl::TEXTURE_WIDTH,
+                        &mut original_width,
+                    );
+                    gl::GetTextureLevelParameteriv(
+                        self.original_texture,
+                        view_range.base.level,
+                        gl::TEXTURE_HEIGHT,
+                        &mut original_height,
+                    );
+                    gl::GetTextureLevelParameteriv(
+                        self.original_texture,
+                        view_range.base.level,
+                        gl::TEXTURE_DEPTH,
+                        &mut original_depth,
+                    );
+                    log::warn!(
+                        "[TEXTURE_VIEW_CREATE] err=0x{:X} view={} view_type={:?} target=0x{:X} original={} fmt=0x{:X} level={}+{} layer={}+{} original_size={}x{}x{}",
+                        view_err,
+                        view,
+                        view_type,
+                        target,
+                        self.original_texture,
+                        view_format,
+                        view_range.base.level,
+                        view_range.extent.levels,
+                        view_range.base.layer,
+                        view_range.extent.layers,
+                        original_width,
+                        original_height,
+                        original_depth,
+                    );
+                }
                 gl::TextureParameteri(view, gl::TEXTURE_MIN_FILTER, gl::NEAREST as i32);
                 gl::TextureParameteri(view, gl::TEXTURE_MAG_FILTER, gl::NEAREST as i32);
                 gl::TextureParameteri(view, gl::TEXTURE_WRAP_S, gl::CLAMP_TO_EDGE as i32);
@@ -1276,6 +1317,47 @@ impl Drop for ImageView {
             }
         }
     }
+}
+
+fn trace_image_view_event(
+    stage: u64,
+    view_id: ImageViewId,
+    view_base: &ImageViewBase,
+    image: &Image,
+    view: Option<&ImageView>,
+) {
+    if !common::trace::is_enabled(common::trace::cat::IMAGE_VIEW) {
+        return;
+    }
+    let range = view_base.range;
+    let pack_size = view_base.size.width as u64 | ((view_base.size.height as u64) << 32);
+    let pack_range = range.base.level as u64
+        | ((range.base.layer as u64) << 16)
+        | ((range.extent.levels as u64) << 32)
+        | ((range.extent.layers as u64) << 48);
+    let default_handle = view.map_or(0, ImageView::default_handle);
+    let color2d = view.map_or(0, |view| view.handle_for_texture_type(TextureType::Color2D));
+    let color_array2d =
+        view.map_or(0, |view| view.handle_for_texture_type(TextureType::ColorArray2D));
+    common::trace::emit_raw(
+        common::trace::cat::IMAGE_VIEW,
+        &[
+            stage,
+            view_id.index as u64,
+            view_base.image_id.index as u64,
+            image.texture as u64,
+            image.current_texture as u64,
+            default_handle as u64,
+            color2d as u64,
+            color_array2d as u64,
+            view_base.view_type as u64,
+            view_base.format as u64,
+            pack_size,
+            view_base.gpu_addr,
+            pack_range,
+            view_base.flags.bits() as u64,
+        ],
+    );
 }
 
 /// An OpenGL sampler.
@@ -1870,17 +1952,20 @@ impl TextureCache {
                 // retry without leaving a stale ImageView handle behind.
                 continue;
             }
-            let view_matches = {
-                let image_ref = self
-                    .images
-                    .get(&image_id)
-                    .expect("image inserted above must be present");
-                self.image_views
-                    .get(&view_id)
-                    .is_some_and(|view| view.matches_base_image(&view_base, image_ref))
-            };
+            let image_ref = self
+                .images
+                .get(&image_id)
+                .expect("image inserted above must be present");
+            let view_matches = self
+                .image_views
+                .get(&view_id)
+                .is_some_and(|view| view.matches_base_image(&view_base, image_ref));
             if view_matches {
                 continue;
+            }
+            let old_view = self.image_views.get(&view_id);
+            if old_view.is_some() {
+                trace_image_view_event(3, view_id, &view_base, image_ref, old_view);
             }
             self.image_views.remove(&view_id);
             self.remove_framebuffers_for_view(view_id);
@@ -1890,6 +1975,7 @@ impl TextureCache {
                 .expect("image inserted above must be present");
             let backend_view =
                 ImageView::from_image_view_info(&view_base, image_ref, self.null_image_views);
+            trace_image_view_event(2, view_id, &view_base, image_ref, Some(&backend_view));
             self.image_views.insert(view_id, backend_view);
         }
     }
@@ -1957,10 +2043,50 @@ impl TextureCache {
     }
 
     pub fn unmap_memory(&mut self, cpu_addr: u64, size: usize) {
-        self.framebuffers.clear();
-        self.render_target_framebuffers.clear();
-        self.image_views.clear();
-        self.images.clear();
+        let end = cpu_addr.saturating_add(size as u64);
+        let deleted_images: Vec<(ImageId, Vec<ImageViewId>)> = self
+            .base
+            .slot_images
+            .iter()
+            .filter_map(|(image_id, image)| {
+                if image_id == crate::texture_cache::types::NULL_IMAGE_ID {
+                    return None;
+                }
+                let image_end = image
+                    .cpu_addr_end
+                    .max(image.cpu_addr.saturating_add(map_size_bytes(image) as u64));
+                (image.cpu_addr < end && cpu_addr < image_end)
+                    .then(|| (image_id, image.image_view_ids.clone()))
+            })
+            .collect();
+        if common::trace::is_enabled(common::trace::cat::IMAGE_VIEW) {
+            common::trace::emit_raw(
+                common::trace::cat::IMAGE_VIEW,
+                &[
+                    8,
+                    u64::MAX,
+                    u64::MAX,
+                    self.images.len() as u64,
+                    self.image_views.len() as u64,
+                    self.framebuffers.len() as u64,
+                    self.render_target_framebuffers.len() as u64,
+                    deleted_images.len() as u64,
+                    0,
+                    0,
+                    size as u64,
+                    cpu_addr,
+                    0,
+                    0,
+                ],
+            );
+        }
+        for (image_id, view_ids) in deleted_images {
+            self.images.remove(&image_id);
+            for view_id in view_ids {
+                self.image_views.remove(&view_id);
+                self.remove_framebuffers_for_view(view_id);
+            }
+        }
         self.base.unmap_memory(cpu_addr, size);
     }
 
@@ -2104,6 +2230,12 @@ impl TextureCache {
                     .is_some_and(|view| !view.matches_base_image(&view_base, backend_image))
             };
             if view_mismatch {
+                let backend_image = self
+                    .images
+                    .get(&image_id)
+                    .expect("image inserted above must be present");
+                let old_view = self.image_views.get(&view_id);
+                trace_image_view_event(7, view_id, &view_base, backend_image, old_view);
                 self.image_views.remove(&view_id);
                 self.remove_framebuffers_for_view(view_id);
             }
@@ -2117,6 +2249,7 @@ impl TextureCache {
                 .or_insert_with(|| {
                     ImageView::new_color_2d(&view_base, backend_image, self.null_image_views)
                 });
+            trace_image_view_event(6, view_id, &view_base, backend_image, Some(backend_view));
             let attachment_texture = if view_base.flags.contains(ImageViewFlagBits::SLICE) {
                 backend_view.handle_for_texture_type(TextureType::Color3D)
             } else {
@@ -2229,8 +2362,8 @@ impl TextureCache {
         let can_be_depth_blit = dst_info.format == src_info.format
             && copy.filter == crate::engines::fermi_2d::Filter::Point;
 
-        let src_id = self.base.find_image(src_addr);
-        let dst_id = self.base.find_image(dst_addr);
+        let src_id = self.base.find_image(&src_info, src_addr);
+        let dst_id = self.base.find_image(&dst_info, dst_addr);
         if !copy.must_accelerate {
             let src_gpu_modified = src_id
                 .map(|id| {
@@ -2399,6 +2532,12 @@ impl TextureCache {
                 .is_some_and(|view| !view.matches_base_image(&view_base, backend_image))
         };
         if view_mismatch {
+            let backend_image = self
+                .images
+                .get(&image_id)
+                .expect("image inserted above must be present");
+            let old_view = self.image_views.get(&view_id);
+            trace_image_view_event(5, view_id, &view_base, backend_image, old_view);
             self.image_views.remove(&view_id);
             self.remove_framebuffers_for_view(view_id);
         }
@@ -2412,6 +2551,7 @@ impl TextureCache {
             .or_insert_with(|| {
                 ImageView::new_color_2d(&view_base, backend_image, self.null_image_views)
             });
+        trace_image_view_event(4, view_id, &view_base, backend_image, Some(backend_view));
         let attachment_texture = if view_base.flags.contains(ImageViewFlagBits::SLICE) {
             backend_view.handle_for_texture_type(TextureType::Color3D)
         } else {
@@ -2551,6 +2691,8 @@ impl TextureCache {
             .get(&view_id)
             .is_some_and(|backend_view| !backend_view.matches_base_image(&view, backend_image));
         if view_mismatch {
+            let old_view = self.image_views.get(&view_id);
+            trace_image_view_event(5, view_id, &view, backend_image, old_view);
             self.image_views.remove(&view_id);
             self.remove_framebuffers_for_view(view_id);
         }
@@ -2564,6 +2706,7 @@ impl TextureCache {
             .or_insert_with(|| {
                 ImageView::from_image_view_info(&view, backend_image, self.null_image_views)
             });
+        trace_image_view_event(4, view_id, &view, backend_image, Some(backend_view));
         let display_texture = backend_view.handle_for_texture_type(TextureType::Color2D);
         if display_texture == 0 {
             return None;
@@ -2714,6 +2857,12 @@ impl TextureCache {
                 .is_some_and(|view| !view.matches_base_image(&view_base, backend_image))
         };
         if view_mismatch {
+            let backend_image = self
+                .images
+                .get(&image_id)
+                .expect("image inserted above must be present");
+            let old_view = self.image_views.get(&view_id);
+            trace_image_view_event(7, view_id, &view_base, backend_image, old_view);
             self.image_views.remove(&view_id);
             self.remove_framebuffers_for_view(view_id);
         }
@@ -2727,6 +2876,7 @@ impl TextureCache {
             .or_insert_with(|| {
                 ImageView::new_color_2d(&view_base, backend_image, self.null_image_views)
             });
+        trace_image_view_event(6, view_id, &view_base, backend_image, Some(backend_view));
         let attachment_texture = if view_base.flags.contains(ImageViewFlagBits::SLICE) {
             backend_view.handle_for_texture_type(TextureType::Color3D)
         } else {

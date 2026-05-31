@@ -73,6 +73,10 @@ fn emit_block(ctx: &mut EmitContext, program: &mut ir::Program, block_index: u32
     }
 }
 
+fn global_address_expr(address: String) -> String {
+    format!("uint64_t({})", address)
+}
+
 /// Emit a single IR instruction as GLSL.
 fn emit_inst(ctx: &mut EmitContext, program: &mut ir::Program, inst_ref: InstRef) {
     let inst_snapshot = program.block(inst_ref.block).inst(inst_ref.inst).clone();
@@ -1826,30 +1830,105 @@ fn emit_inst(ctx: &mut EmitContext, program: &mut ir::Program, inst_ref: InstRef
             );
         }
 
-        // ── Global memory load/store (require int64 + GLSL helper decl) ─
+        // ── Global memory load/store ─────────────────────────────────
         // Port of upstream `EmitLoadGlobal32/64/128` and `EmitWriteGlobal*`.
-        // Upstream calls a `LoadGlobal32(address)` / `WriteGlobal32(...)`
-        // GLSL helper declared in the shader header (gated on
-        // `profile.support_int64`); the !support_int64 branch warns and
-        // emits zero / no-op. We follow the !support_int64 fallback
-        // since the helper declaration isn't yet wired by the ruzu
-        // EmitContext header builder.
         Opcode::LoadGlobal32 => {
-            log::warn!("Int64 not supported (helper not declared), emitting zero");
-            add_assign(ctx, program, inst_ref, GlslVarType::U32, "0u".to_string());
+            let address = global_address_expr(ctx.var_alloc.consume(program, &inst_snapshot.args[0]));
+            if ctx.profile.support_int64 {
+                add_assign(
+                    ctx,
+                    program,
+                    inst_ref,
+                    GlslVarType::U32,
+                    format!("LoadGlobal32({})", address),
+                );
+            } else {
+                log::warn!("Int64 not supported, ignoring memory operation");
+                add_assign(ctx, program, inst_ref, GlslVarType::U32, "0u".to_string());
+            }
         }
         Opcode::LoadGlobal64 => {
-            log::warn!("Int64 not supported (helper not declared), emitting zero");
-            add_assign(ctx, program, inst_ref, GlslVarType::U32x2, "uvec2(0)".to_string());
+            let address = global_address_expr(ctx.var_alloc.consume(program, &inst_snapshot.args[0]));
+            if ctx.profile.support_int64 {
+                add_assign(
+                    ctx,
+                    program,
+                    inst_ref,
+                    GlslVarType::U32x2,
+                    format!("LoadGlobal64({})", address),
+                );
+            } else {
+                log::warn!("Int64 not supported, ignoring memory operation");
+                add_assign(ctx, program, inst_ref, GlslVarType::U32x2, "uvec2(0)".to_string());
+            }
         }
         Opcode::LoadGlobal128 => {
-            log::warn!("Int64 not supported (helper not declared), emitting zero");
-            add_assign(ctx, program, inst_ref, GlslVarType::U32x4, "uvec4(0)".to_string());
+            let address = global_address_expr(ctx.var_alloc.consume(program, &inst_snapshot.args[0]));
+            if ctx.profile.support_int64 {
+                add_assign(
+                    ctx,
+                    program,
+                    inst_ref,
+                    GlslVarType::U32x4,
+                    format!("LoadGlobal128({})", address),
+                );
+            } else {
+                log::warn!("Int64 not supported, ignoring memory operation");
+                add_assign(ctx, program, inst_ref, GlslVarType::U32x4, "uvec4(0)".to_string());
+            }
         }
-        Opcode::WriteGlobal32 | Opcode::WriteGlobal64 | Opcode::WriteGlobal128 => {
-            log::warn!("Int64 not supported (helper not declared), ignoring write");
+        Opcode::WriteGlobal32 => {
+            if ctx.profile.support_int64 {
+                let address =
+                    global_address_expr(ctx.var_alloc.consume(program, &inst_snapshot.args[0]));
+                let value = ctx.var_alloc.consume(program, &inst_snapshot.args[1]);
+                ctx.add_fmt(format!("WriteGlobal32({},{});", address, value));
+            } else {
+                log::warn!("Int64 not supported, ignoring memory operation");
+            }
         }
-        // 8/16-bit Global / Local — upstream NotImplemented.
+        Opcode::WriteGlobal64 => {
+            if ctx.profile.support_int64 {
+                let address =
+                    global_address_expr(ctx.var_alloc.consume(program, &inst_snapshot.args[0]));
+                let value = ctx.var_alloc.consume(program, &inst_snapshot.args[1]);
+                ctx.add_fmt(format!("WriteGlobal64({},{});", address, value));
+            } else {
+                log::warn!("Int64 not supported, ignoring memory operation");
+            }
+        }
+        Opcode::WriteGlobal128 => {
+            if ctx.profile.support_int64 {
+                let address =
+                    global_address_expr(ctx.var_alloc.consume(program, &inst_snapshot.args[0]));
+                let value = ctx.var_alloc.consume(program, &inst_snapshot.args[1]);
+                ctx.add_fmt(format!("WriteGlobal128({},{});", address, value));
+            } else {
+                log::warn!("Int64 not supported, ignoring memory operation");
+            }
+        }
+        // ── Local memory ──────────────────────────────────────────────
+        // Port of upstream `EmitLoadLocal` / `EmitWriteLocal`
+        // (backend/glsl/emit_glsl_context_get_set.cpp):
+        //   dst = lmem[word_offset];
+        //   lmem[word_offset] = value;
+        Opcode::LoadLocal => {
+            let word_offset = ctx.var_alloc.consume(program, &inst_snapshot.args[0]);
+            add_assign(
+                ctx,
+                program,
+                inst_ref,
+                GlslVarType::U32,
+                format!("lmem[{}]", word_offset),
+            );
+        }
+        Opcode::WriteLocal => {
+            let word_offset = ctx.var_alloc.consume(program, &inst_snapshot.args[0]);
+            let value = ctx.var_alloc.consume(program, &inst_snapshot.args[1]);
+            ctx.add_fmt(format!("lmem[{}]={};", word_offset, value));
+        }
+
+        // 8/16-bit Global — upstream NotImplemented.
         Opcode::LoadGlobalS8
         | Opcode::LoadGlobalU8
         | Opcode::LoadGlobalS16
@@ -1857,9 +1936,7 @@ fn emit_inst(ctx: &mut EmitContext, program: &mut ir::Program, inst_ref: InstRef
         | Opcode::WriteGlobalS8
         | Opcode::WriteGlobalU8
         | Opcode::WriteGlobalS16
-        | Opcode::WriteGlobalU16
-        | Opcode::LoadLocal
-        | Opcode::WriteLocal => {
+        | Opcode::WriteGlobalU16 => {
             panic!(
                 "Memory op {:?} not implemented (upstream NotImplemented)",
                 inst_snapshot.opcode
@@ -2183,14 +2260,20 @@ fn recompute_emit_use_counts(program: &mut ir::Program) {
     for block in &program.blocks {
         for inst in block.iter() {
             for arg in &inst.args {
-                if let Value::Inst(inst_ref) = arg {
-                    if let Some(block_counts) = use_counts.get_mut(inst_ref.block as usize) {
-                        if let Some(count) = block_counts.get_mut(inst_ref.inst as usize) {
-                            *count += 1;
-                        }
-                    }
-                }
+                count_emit_value_use(&mut use_counts, arg);
             }
+            for (_, arg) in &inst.phi_args {
+                count_emit_value_use(&mut use_counts, arg);
+            }
+        }
+    }
+
+    for node in &program.syntax_list {
+        match node {
+            SyntaxNode::If { cond, .. }
+            | SyntaxNode::Repeat { cond, .. }
+            | SyntaxNode::Break { cond, .. } => count_emit_value_use(&mut use_counts, cond),
+            _ => {}
         }
     }
 
@@ -2201,6 +2284,16 @@ fn recompute_emit_use_counts(program: &mut ir::Program) {
                 .and_then(|counts| counts.get(inst_index as usize))
             {
                 inst.use_count = *count;
+            }
+        }
+    }
+}
+
+fn count_emit_value_use(use_counts: &mut [Vec<u32>], value: &Value) {
+    if let Value::Inst(inst_ref) = value {
+        if let Some(block_counts) = use_counts.get_mut(inst_ref.block as usize) {
+            if let Some(count) = block_counts.get_mut(inst_ref.inst as usize) {
+                *count += 1;
             }
         }
     }
@@ -2288,7 +2381,7 @@ mod tests {
     use crate::profile::Profile;
     use crate::runtime_info::RuntimeInfo;
 
-    use super::{precolor, recompute_emit_use_counts};
+    use super::{global_address_expr, precolor, recompute_emit_use_counts};
 
     #[test]
     fn precolor_appends_all_phi_moves_before_references_and_recounts_uses() {
@@ -2425,6 +2518,11 @@ mod tests {
 
         assert!(source.contains("gl_FrontMaterial.ambient.a"));
         assert!(!source.contains("y_direction"));
+    }
+
+    #[test]
+    fn global_memory_address_is_cast_to_uint64() {
+        assert_eq!(global_address_expr("addr".to_string()), "uint64_t(addr)");
     }
 }
 

@@ -447,7 +447,7 @@ fn dump_thread_state(kernel: &KernelCore) {
             }
         }
     }
-    let thread_ids: Vec<u64> = match acquired {
+    let thread_entries: Vec<(u64, std::sync::Arc<super::k_thread::KThreadLock>)> = match acquired {
         Some(guard) => {
             eprintln!(
                 "[DUMP] process threads: {} (process.lock() acquired after {} polls)",
@@ -585,7 +585,15 @@ fn dump_thread_state(kernel: &KernelCore) {
                     eprintln!("[POKE] addr=0x{:X}: no page_table memory — skipping", addr);
                 }
             }
-            guard.thread_list.clone()
+            guard
+                .thread_list
+                .iter()
+                .filter_map(|tid| {
+                    guard
+                        .get_thread_by_thread_id(*tid)
+                        .map(|thread| (*tid, thread))
+                })
+                .collect()
         }
         None => {
             eprintln!(
@@ -675,19 +683,10 @@ fn dump_thread_state(kernel: &KernelCore) {
         }
     };
 
-    // Walk each thread. try_lock() again on each thread to avoid blocking.
-    for tid in thread_ids {
-        let thread_arc_opt = match process_arc.try_lock() {
-            Ok(guard) => guard.thread_objects.get(&tid).cloned(),
-            Err(_) => None,
-        };
-        let thread_arc = match thread_arc_opt {
-            Some(a) => a,
-            None => {
-                eprintln!("[DUMP]   tid={} <process-lock-contended>", tid);
-                continue;
-            }
-        };
+    // Walk each thread. Thread Arcs were captured while holding the process lock
+    // above, so the dump does not reacquire process.lock() per-thread and hide
+    // useful state behind false `<process-lock-contended>` rows.
+    for (tid, thread_arc) in thread_entries {
         let try_result = thread_arc.try_lock();
         if let Ok(t) = try_result {
             let state = t.get_state();
@@ -1515,6 +1514,14 @@ impl KernelCore {
                 move || {
                     let kernel = unsafe { &*(kernel_ptr as *const KernelCore) };
                     kernel.register_host_thread_with_existing(Some(&thread));
+                    // Per-thread alternate signal stack so the rdynarmic SIGSEGV
+                    // handler (SA_ONSTACK; sigaltstack is per-thread) runs on a
+                    // dedicated 2MB stack rather than this host thread's stack —
+                    // otherwise a fault that reaches the handler's
+                    // FastmemPatchTable HashMap/SipHash lookup can overflow the
+                    // stack into a secondary SIGSEGV (silent exit 139). Mirrors
+                    // the CPU-core registration in cpu_manager.rs.
+                    rdynarmic::backend::x64::exception_handler::register_thread_signal_stack();
                     log::info!("Host service thread '{}' started", thread_name);
                     func();
                     log::info!("Host service thread '{}' exited", thread_name);

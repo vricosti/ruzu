@@ -12,6 +12,12 @@ use super::k_client_session::KClientSession;
 use super::k_server_session::KServerSession;
 use super::k_session_request::KSessionRequest;
 
+fn trace_host_thread_ipc_stage(stage_id: u64, object_id: u64) {
+    if common::trace::is_enabled(common::trace::cat::HOST_THREAD_IPC) {
+        common::trace::emit_raw(common::trace::cat::HOST_THREAD_IPC, &[stage_id, object_id]);
+    }
+}
+
 /// Session state.
 /// Matches upstream `KSession::State` (k_session.h).
 #[repr(u8)]
@@ -100,11 +106,15 @@ impl KSession {
         process: &mut super::k_process::KProcess,
         request: Arc<Mutex<KSessionRequest>>,
     ) -> u32 {
-        self.server
-            .lock()
-            .unwrap()
-            .on_request_with_process(process, request)
+        trace_host_thread_ipc_stage(23, self.name as u64);
+        let mut server = self.server.lock().unwrap();
+        trace_host_thread_ipc_stage(24, self.name as u64);
+        trace_host_thread_ipc_stage(25, self.name as u64);
+        let result = server.on_request_with_process(process, request);
+        trace_host_thread_ipc_stage(26, self.name as u64);
+        result
     }
+
 
     fn set_state(&self, state: SessionState) {
         self.atomic_state.store(state as u8, Ordering::Relaxed);

@@ -6,6 +6,7 @@
 //! OpenGL graphics pipeline management -- compiles and configures vertex/fragment/etc shaders.
 
 use std::hash::{Hash, Hasher};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex};
 
 use crate::buffer_cache::buffer_cache_base::UniformBufferSizes;
@@ -27,6 +28,8 @@ pub const NUM_TRANSFORM_FEEDBACK_BUFFERS: usize = 4;
 
 /// Stride of each XFB attribute entry (token, count, attrib).
 pub const XFB_ENTRY_STRIDE: usize = 3;
+
+static GLSL_ERROR_DUMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Key used to identify a unique graphics pipeline configuration.
 ///
@@ -280,12 +283,16 @@ impl GraphicsPipeline {
         self.base_storage_bindings = [0; NUM_STAGES];
         self.num_texture_buffers = [0; NUM_STAGES];
         self.num_image_buffers = [0; NUM_STAGES];
+        self.use_storage_buffers = false;
+        self.writes_global_memory = false;
+        self.uses_local_memory = false;
 
         // Keep a per-stage `Info` clone so the rasterizer-side ConfigureImpl
         // can iterate `texture_descriptors[]` etc. at draw time. Upstream
         // stores these inside `GraphicsPipeline` as `stage_infos`.
         self.stage_infos = std::array::from_fn(|stage| infos[stage].clone());
 
+        let mut num_storage_buffers = 0u32;
         for stage in 0..NUM_STAGES {
             if let Some(info) = infos[stage].as_ref() {
                 self.enabled_stages_mask |= 1u32 << stage;
@@ -293,6 +300,12 @@ impl GraphicsPipeline {
                 self.uniform_buffer_sizes[stage].copy_from_slice(&info.constant_buffer_used_sizes);
                 self.num_texture_buffers[stage] = num_descriptors(&info.texture_buffer_descriptors);
                 self.num_image_buffers[stage] = num_descriptors(&info.image_buffer_descriptors);
+                num_storage_buffers += num_descriptors(&info.storage_buffers_descriptors);
+                self.writes_global_memory |= info
+                    .storage_buffers_descriptors
+                    .iter()
+                    .any(|desc| desc.is_written);
+                self.uses_local_memory |= info.uses_local_memory;
             }
 
             if stage < NUM_STAGES - 1 {
@@ -305,6 +318,14 @@ impl GraphicsPipeline {
                         num_descriptors(&info.storage_buffers_descriptors);
                 }
             }
+        }
+
+        // Ruzu currently emits GLSL, not GLASM, for graphics pipelines. Match
+        // upstream's non-assembly path by using real GL shader-storage-buffer
+        // bindings whenever storage descriptors exist.
+        self.use_storage_buffers = num_storage_buffers != 0;
+        if self.use_storage_buffers {
+            self.writes_global_memory = false;
         }
     }
 
@@ -425,6 +446,7 @@ impl GraphicsPipeline {
                     }
                 }
                 Err(msg) => {
+                    dump_glsl_on_error(self.key.hash_key(), stage_index, source, &msg);
                     // Roll back any handles we already created.
                     self.delete_gl_programs();
                     return Err((stage_index, msg));
@@ -443,6 +465,14 @@ impl GraphicsPipeline {
                 }
                 gl::UseProgramStages(self.program_pipeline, stage_bit(stage_index), prog);
             }
+        }
+        if std::env::var_os("RUZU_TRACE_PIPELINE_BUILD").is_some() {
+            log::info!(
+                "[PIPELINE_BUILD] pipeline_key=0x{:016X} program_pipeline={} programs={:?}",
+                self.key.hash_key(),
+                self.program_pipeline,
+                self.source_programs,
+            );
         }
 
         Ok(())
@@ -570,6 +600,45 @@ fn stage_name(stage_index: usize) -> &'static str {
         3 => "Geometry",
         4 => "Fragment",
         _ => "Unknown",
+    }
+}
+
+fn dump_glsl_on_error(pipeline_hash: u64, stage_index: usize, source: &str, error: &str) {
+    let Some(dir) = std::env::var_os("RUZU_DUMP_GLSL_ON_ERROR") else {
+        return;
+    };
+    let dir = std::path::PathBuf::from(dir);
+    if let Err(err) = std::fs::create_dir_all(&dir) {
+        log::warn!(
+            "Failed to create RUZU_DUMP_GLSL_ON_ERROR dir {}: {}",
+            dir.display(),
+            err
+        );
+        return;
+    }
+
+    let counter = GLSL_ERROR_DUMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let stage = stage_name(stage_index);
+    let stem = format!(
+        "{:04}_pipeline_{:016X}_stage_{}",
+        counter, pipeline_hash, stage
+    );
+    let source_path = dir.join(format!("{}.glsl", stem));
+    let log_path = dir.join(format!("{}.log", stem));
+
+    if let Err(err) = std::fs::write(&source_path, source) {
+        log::warn!("Failed to dump GLSL source {}: {}", source_path.display(), err);
+    }
+    let log = format!(
+        "pipeline_hash=0x{:016X}\nstage_index={}\nstage={}\nsource_bytes={}\n\n{}",
+        pipeline_hash,
+        stage_index,
+        stage,
+        source.len(),
+        error
+    );
+    if let Err(err) = std::fs::write(&log_path, log) {
+        log::warn!("Failed to dump GLSL error log {}: {}", log_path.display(), err);
     }
 }
 

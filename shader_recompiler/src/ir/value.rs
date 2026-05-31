@@ -101,6 +101,8 @@ impl Attribute {
     pub const POSITION_Z: Attribute = Attribute(30);
     pub const POSITION_W: Attribute = Attribute(31);
     pub const FRONT_COLOR_DIFFUSE_R: Attribute = Attribute(160);
+    pub const INSTANCE_ID: Attribute = Attribute(190);
+    pub const VERTEX_ID: Attribute = Attribute(191);
     pub const BASE_INSTANCE: Attribute = Attribute(256);
     pub const BASE_VERTEX: Attribute = Attribute(257);
     pub const DRAW_ID: Attribute = Attribute(258);
@@ -160,6 +162,8 @@ impl fmt::Display for Attribute {
                 25 => write!(f, "Layer"),
                 26 => write!(f, "ViewportIndex"),
                 27 => write!(f, "PointSize"),
+                190 => write!(f, "InstanceId"),
+                191 => write!(f, "VertexId"),
                 _ => write!(f, "Attr({})", self.0),
             }
         }

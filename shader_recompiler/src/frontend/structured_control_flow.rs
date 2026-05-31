@@ -61,15 +61,23 @@ fn structure_region(
             EndClass::Exit => {
                 syntax.push(SyntaxNode::Block(block_idx));
                 if !block.cond.is_always() {
-                    // Conditional exit: emit as if { exit } else { continue }
-                    // For now, just emit the block and a return.
+                    // Predicated EXIT requires upstream's GotoPass/TranslatePass
+                    // merge/epilogue topology. This flat SCF pass cannot place
+                    // the guarded return safely: emitting it inline can cut off
+                    // later blocks that finish gl_Position/output writes.
+                    // Keep the block and fall through until the full SCF port.
+                    i += 1;
+                    continue;
                 }
                 syntax.push(SyntaxNode::Return);
                 i += 1;
             }
             EndClass::Kill => {
                 syntax.push(SyntaxNode::Block(block_idx));
-                syntax.push(SyntaxNode::Return);
+                // Upstream inserts a conditional demote-to-helper merge here.
+                // This simplified SCF pass cannot model that branch yet; do
+                // not lower KIL to an unconditional return, which discards all
+                // fragments in shaders whose KIL is predicate-guarded.
                 i += 1;
             }
             EndClass::Return => {
@@ -156,5 +164,51 @@ fn structure_region(
                 i += 1;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::frontend::control_flow::Condition;
+
+    fn block(end_class: EndClass, cond: Condition) -> CfgBlock {
+        CfgBlock {
+            begin: 0,
+            end: 1,
+            end_class,
+            branch_true: None,
+            branch_false: None,
+            cond,
+            stack_depth: 0,
+        }
+    }
+
+    #[test]
+    fn conditional_exit_does_not_emit_flat_return() {
+        let mut cfg_block = block(
+            EndClass::Exit,
+            Condition {
+                pred: 0,
+                negated: false,
+            },
+        );
+        cfg_block.branch_false = Some(1);
+        let syntax = structure_cfg(&[cfg_block, block(EndClass::Return, Condition::always())]);
+
+        assert!(matches!(
+            syntax.as_slice(),
+            [SyntaxNode::Block(0), SyntaxNode::Block(1), SyntaxNode::Return]
+        ));
+    }
+
+    #[test]
+    fn unconditional_exit_still_returns() {
+        let syntax = structure_cfg(&[block(EndClass::Exit, Condition::always())]);
+
+        assert!(matches!(
+            syntax.as_slice(),
+            [SyntaxNode::Block(0), SyntaxNode::Return]
+        ));
     }
 }

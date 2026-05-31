@@ -109,8 +109,7 @@ impl Device {
         let has_texture_shadow_lod = has_ext("GL_EXT_texture_shadow_lod");
         let has_vertex_buffer_unified_memory = has_ext("GL_NV_vertex_buffer_unified_memory");
         let has_astc = has_ext("GL_KHR_texture_compression_astc_ldr");
-        let has_variable_aoffi =
-            has_ext("GL_AMD_gpu_shader_half_float") || (is_nvidia && has_ext("GL_NV_gpu_shader5"));
+        let has_variable_aoffi = test_variable_aoffi();
         let has_depth_buffer_float = has_ext("GL_NV_depth_buffer_float");
         let has_viewport_swizzle = has_ext("GL_NV_viewport_swizzle");
         let has_geometry_shader_passthrough = has_ext("GL_NV_geometry_shader_passthrough");
@@ -122,7 +121,7 @@ impl Device {
         let has_draw_texture = has_ext("GL_NV_draw_texture");
         let has_derivative_control = has_ext("GL_ARB_derivative_control");
         let has_component_indexing_bug = false;
-        let has_precise_bug = false;
+        let has_precise_bug = test_precise_bug();
         let version_major = nvidia_driver_major_version(&gl_version);
         let has_cbuf_ftou_bug = is_nvidia && version_major.is_some_and(|major| major >= 495);
         let has_bool_ref_bug = has_cbuf_ftou_bug;
@@ -371,6 +370,44 @@ fn gl_get_integer(pname: gl::types::GLenum) -> i32 {
         gl::GetIntegerv(pname, &mut val);
     }
     val
+}
+
+fn test_program(glsl: &'static CStr) -> bool {
+    unsafe {
+        let source = glsl.as_ptr();
+        let program = gl::CreateShaderProgramv(gl::VERTEX_SHADER, 1, &source);
+        if program == 0 {
+            return false;
+        }
+        let mut link_status = 0;
+        gl::GetProgramiv(program, gl::LINK_STATUS, &mut link_status);
+        gl::DeleteProgram(program);
+        link_status == gl::TRUE as i32
+    }
+}
+
+fn test_variable_aoffi() -> bool {
+    test_program(c"#version 430 core
+// This is a unit test, please ignore me on apitrace bug reports.
+uniform sampler2D tex;
+uniform ivec2 variable_offset;
+out vec4 output_attribute;
+void main() {
+    output_attribute = textureOffset(tex, vec2(0), variable_offset);
+}
+")
+}
+
+fn test_precise_bug() -> bool {
+    !test_program(c"#version 430 core
+in vec3 coords;
+out float out_value;
+uniform sampler2DShadow tex;
+void main() {
+    precise float tmp_value = vec4(texture(tex, coords)).x;
+    out_value = tmp_value;
+}
+")
 }
 
 fn get_extensions() -> Vec<String> {

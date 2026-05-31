@@ -937,6 +937,10 @@ impl<'a> Emitter<'a> {
         self.emit(Inst::new(Opcode::CompositeConstructU32x2, vec![a, b]))
     }
 
+    pub fn composite_construct_u32x3(&mut self, a: Value, b: Value, c: Value) -> Value {
+        self.emit(Inst::new(Opcode::CompositeConstructU32x3, vec![a, b, c]))
+    }
+
     pub fn composite_construct_u32x4(&mut self, a: Value, b: Value, c: Value, d: Value) -> Value {
         self.emit(Inst::new(Opcode::CompositeConstructU32x4, vec![a, b, c, d]))
     }
@@ -980,8 +984,24 @@ impl<'a> Emitter<'a> {
         self.emit(Inst::new(Opcode::LoadGlobal32, vec![addr]))
     }
 
+    pub fn load_global_64(&mut self, addr: Value) -> Value {
+        self.emit(Inst::new(Opcode::LoadGlobal64, vec![addr]))
+    }
+
+    pub fn load_global_128(&mut self, addr: Value) -> Value {
+        self.emit(Inst::new(Opcode::LoadGlobal128, vec![addr]))
+    }
+
     pub fn write_global_32(&mut self, addr: Value, value: Value) {
         self.emit_void(Inst::new(Opcode::WriteGlobal32, vec![addr, value]));
+    }
+
+    pub fn write_global_64(&mut self, addr: Value, value: Value) {
+        self.emit_void(Inst::new(Opcode::WriteGlobal64, vec![addr, value]));
+    }
+
+    pub fn write_global_128(&mut self, addr: Value, value: Value) {
+        self.emit_void(Inst::new(Opcode::WriteGlobal128, vec![addr, value]));
     }
 
     pub fn load_local(&mut self, offset: Value) -> Value {
@@ -1005,10 +1025,36 @@ impl<'a> Emitter<'a> {
 
     // ── Texture ───────────────────────────────────────────────────────
 
-    pub fn image_sample_implicit_lod(&mut self, handle: Value, coords: Value, info: u32) -> Value {
+    pub fn image_sample_implicit_lod_full(
+        &mut self,
+        handle: Value,
+        coords: Value,
+        bias_lc: Value,
+        offset: Value,
+        info: u32,
+    ) -> Value {
         self.emit(Inst::with_flags(
             Opcode::ImageSampleImplicitLod,
-            vec![handle, coords],
+            vec![handle, coords, bias_lc, offset],
+            info,
+        ))
+    }
+
+    pub fn image_sample_implicit_lod(&mut self, handle: Value, coords: Value, info: u32) -> Value {
+        self.image_sample_implicit_lod_full(handle, coords, Value::Void, Value::Void, info)
+    }
+
+    pub fn image_sample_explicit_lod_full(
+        &mut self,
+        handle: Value,
+        coords: Value,
+        lod: Value,
+        offset: Value,
+        info: u32,
+    ) -> Value {
+        self.emit(Inst::with_flags(
+            Opcode::ImageSampleExplicitLod,
+            vec![handle, coords, lod, offset],
             info,
         ))
     }
@@ -1020,9 +1066,21 @@ impl<'a> Emitter<'a> {
         lod: Value,
         info: u32,
     ) -> Value {
+        self.image_sample_explicit_lod_full(handle, coords, lod, Value::Void, info)
+    }
+
+    pub fn image_sample_dref_implicit_lod_full(
+        &mut self,
+        handle: Value,
+        coords: Value,
+        dref: Value,
+        bias_lc: Value,
+        offset: Value,
+        info: u32,
+    ) -> Value {
         self.emit(Inst::with_flags(
-            Opcode::ImageSampleExplicitLod,
-            vec![handle, coords, lod],
+            Opcode::ImageSampleDrefImplicitLod,
+            vec![handle, coords, dref, bias_lc, offset],
             info,
         ))
     }
@@ -1034,9 +1092,28 @@ impl<'a> Emitter<'a> {
         dref: Value,
         info: u32,
     ) -> Value {
+        self.image_sample_dref_implicit_lod_full(
+            handle,
+            coords,
+            dref,
+            Value::Void,
+            Value::Void,
+            info,
+        )
+    }
+
+    pub fn image_sample_dref_explicit_lod_full(
+        &mut self,
+        handle: Value,
+        coords: Value,
+        dref: Value,
+        lod: Value,
+        offset: Value,
+        info: u32,
+    ) -> Value {
         self.emit(Inst::with_flags(
-            Opcode::ImageSampleDrefImplicitLod,
-            vec![handle, coords, dref],
+            Opcode::ImageSampleDrefExplicitLod,
+            vec![handle, coords, dref, lod, offset],
             info,
         ))
     }
@@ -1049,17 +1126,13 @@ impl<'a> Emitter<'a> {
         lod: Value,
         info: u32,
     ) -> Value {
-        self.emit(Inst::with_flags(
-            Opcode::ImageSampleDrefExplicitLod,
-            vec![handle, coords, dref, lod],
-            info,
-        ))
+        self.image_sample_dref_explicit_lod_full(handle, coords, dref, lod, Value::Void, info)
     }
 
     pub fn image_fetch(&mut self, handle: Value, coords: Value, lod: Value, info: u32) -> Value {
         self.emit(Inst::with_flags(
             Opcode::ImageFetch,
-            vec![handle, coords, lod],
+            vec![handle, coords, Value::Void, lod, Value::Void],
             info,
         ))
     }
@@ -1072,10 +1145,37 @@ impl<'a> Emitter<'a> {
         ))
     }
 
-    pub fn image_gather(&mut self, handle: Value, coords: Value, info: u32) -> Value {
+    pub fn image_gather_full(
+        &mut self,
+        handle: Value,
+        coords: Value,
+        offset: Value,
+        offset2: Value,
+        info: u32,
+    ) -> Value {
         self.emit(Inst::with_flags(
             Opcode::ImageGather,
-            vec![handle, coords],
+            vec![handle, coords, offset, offset2],
+            info,
+        ))
+    }
+
+    pub fn image_gather(&mut self, handle: Value, coords: Value, info: u32) -> Value {
+        self.image_gather_full(handle, coords, Value::Void, Value::Void, info)
+    }
+
+    pub fn image_gather_dref_full(
+        &mut self,
+        handle: Value,
+        coords: Value,
+        offset: Value,
+        offset2: Value,
+        dref: Value,
+        info: u32,
+    ) -> Value {
+        self.emit(Inst::with_flags(
+            Opcode::ImageGatherDref,
+            vec![handle, coords, offset, offset2, dref],
             info,
         ))
     }
@@ -1087,11 +1187,7 @@ impl<'a> Emitter<'a> {
         dref: Value,
         info: u32,
     ) -> Value {
-        self.emit(Inst::with_flags(
-            Opcode::ImageGatherDref,
-            vec![handle, coords, dref],
-            info,
-        ))
+        self.image_gather_dref_full(handle, coords, Value::Void, Value::Void, dref, info)
     }
 
     /// Port of `IREmitter::ImageQueryLod`.

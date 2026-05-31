@@ -80,14 +80,14 @@ impl IStorage {
         if offset < 0 {
             return to_ipc_result(errors::RESULT_INVALID_OFFSET);
         }
-        let bytes_read = self
-            .backend
-            .read(out_bytes, length as usize, offset as usize);
-        if bytes_read != length as usize {
+        let read_len = out_bytes.len().min(length as usize);
+        let bytes_read = self.backend.read(out_bytes, read_len, offset as usize);
+        if bytes_read != read_len {
             log::warn!(
-                "IStorage::Read short read, offset=0x{:X}, requested={}, read={}, backend_size={}",
+                "IStorage::Read short read, offset=0x{:X}, requested={}, buffer_size={}, read={}, backend_size={}",
                 offset,
                 length,
+                out_bytes.len(),
                 bytes_read,
                 backend_size
             );
@@ -271,5 +271,28 @@ impl ServiceFramework for IStorage {
         );
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::file_sys::vfs::vfs_vector::VectorVfsFile;
+    use std::sync::Arc;
+
+    #[test]
+    fn read_never_asks_backend_for_more_than_output_buffer() {
+        let backend = Arc::new(VectorVfsFile::new(
+            vec![1, 2, 3, 4],
+            "storage.bin".to_string(),
+            None,
+        ));
+        let storage = IStorage::new(backend);
+        let mut out = [0u8; 2];
+
+        let result = storage.read(&mut out, 0, 4);
+
+        assert_eq!(result, RESULT_SUCCESS);
+        assert_eq!(out, [1, 2]);
     }
 }

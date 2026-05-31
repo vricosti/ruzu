@@ -7,18 +7,24 @@
 //! style sets, vibration, six-axis sensors, and abstracted pad management.
 
 use common::ResultCode;
+use std::sync::atomic::{AtomicU64, Ordering};
 
+use crate::frontend::emulated_controller::get_simple_npad_button_state;
 use crate::hid_result;
 use crate::hid_types::*;
 use crate::resources::applet_resource::{AppletResourceHolder, ARUID_INDEX_MAX};
 use crate::resources::npad::npad_resource::NPadResource;
 use crate::resources::npad::npad_types::*;
 use crate::resources::npad::npad_vibration::NpadVibration;
+use crate::resources::vibration::vibration_device::NpadVibrationDevice;
+
+static NPAD_UPDATE_TRACE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Main NPad controller resource
 pub struct NPad {
     npad_resource: NPadResource,
     vibration: NpadVibration,
+    vibration_devices: [NpadVibrationDevice; 2],
     ref_counter: i32,
     applet_resource_holder: AppletResourceHolder,
 }
@@ -28,6 +34,13 @@ impl Default for NPad {
         Self {
             npad_resource: NPadResource::new(),
             vibration: NpadVibration::new(),
+            vibration_devices: {
+                let mut left = NpadVibrationDevice::new();
+                left.mount_virtual(DeviceIndex::Left);
+                let mut right = NpadVibrationDevice::new();
+                right.mount_virtual(DeviceIndex::Right);
+                [left, right]
+            },
             ref_counter: 0,
             applet_resource_holder: AppletResourceHolder::new(),
         }
@@ -51,6 +64,10 @@ impl NPad {
 
         self.ref_counter += 1;
         ResultCode::SUCCESS
+    }
+
+    pub fn is_active(&self) -> bool {
+        self.ref_counter != 0
     }
 
     /// Port of NPad::Activate(u64 aruid).
@@ -108,11 +125,23 @@ impl NPad {
     /// ported, this should be replaced by the full upstream loop (see
     /// `zuyu/src/hid_core/resources/npad/npad.cpp:461`).
     pub fn on_update(&mut self) {
+        let trace_update = std::env::var_os("RUZU_TRACE_NPAD_UPDATE").is_some();
+        let trace_index = if trace_update {
+            NPAD_UPDATE_TRACE_COUNTER.fetch_add(1, Ordering::Relaxed)
+        } else {
+            0
+        };
         if self.ref_counter == 0 {
+            if trace_update && trace_index % 1000 == 0 {
+                log::info!("[NPAD_UPDATE] skip ref_counter=0");
+            }
             return;
         }
 
         let Some(applet_resource) = self.applet_resource_holder.applet_resource.clone() else {
+            if trace_update && trace_index % 1000 == 0 {
+                log::info!("[NPAD_UPDATE] skip no_applet_resource");
+            }
             return;
         };
         let mut applet_resource = applet_resource.lock();
@@ -128,6 +157,13 @@ impl NPad {
                 )
             };
             if !assigned {
+                if trace_update && trace_index % 1000 == 0 && aruid != 0 {
+                    log::info!(
+                        "[NPAD_UPDATE] skip aruid=0x{:X} assigned=false enable_input={}",
+                        aruid,
+                        enable_input
+                    );
+                }
                 continue;
             }
 
@@ -137,12 +173,30 @@ impl NPad {
                 .is_supported_npad_style_set(aruid)
                 .unwrap_or(false);
             if !is_set {
+                if trace_update && trace_index % 1000 == 0 {
+                    log::info!(
+                        "[NPAD_UPDATE] skip aruid=0x{:X} is_supported_style_set=false enable_input={}",
+                        aruid,
+                        enable_input
+                    );
+                }
                 continue;
             }
 
             // Mirror upstream's enable_pad_input gate.
             if !enable_input {
+                if trace_update && trace_index % 1000 == 0 {
+                    log::info!("[NPAD_UPDATE] skip aruid=0x{:X} enable_input=false", aruid);
+                }
                 continue;
+            }
+            if trace_update && trace_index % 1000 == 0 {
+                log::info!(
+                    "[NPAD_UPDATE] active aruid=0x{:X} enable_input={} buttons=0x{:X}",
+                    aruid,
+                    enable_input,
+                    get_simple_npad_button_state().raw.bits()
+                );
             }
 
             // Get the npad shared-memory area for this aruid.
@@ -151,49 +205,63 @@ impl NPad {
                 continue;
             };
 
-            // Loop over 10 controller slots like upstream, but only npad[0]
-            // currently gets a populated header (see method docs above for
-            // why). All other slots are left as their zero-init state, which
-            // matches upstream's behavior when no controller is connected at
-            // that index.
-            let npad = &mut shared.npad.npad_entry[0].internal_state;
+            // ruzu's temporary controller model currently populates only
+            // Player1. The full upstream loop over controller_data[aruid][i]
+            // should replace this once per-NpadId controller state is ported.
+            for entry_index in 0..1 {
+                let npad = &mut shared.npad.npad_entry[entry_index].internal_state;
 
-            // Mirror upstream `NPad::InitNewlyAddedController` for the
-            // Pro Controller (Fullkey) case (npad.cpp:202-215). These fields
-            // are normally written ONCE on a connect event; ruzu has no
-            // EmulatedController connect-event plumbing yet, so we keep
-            // re-writing them here. The values are idempotent.
-            npad.style_tag.raw |= NpadStyleSet::FULLKEY;
-            // device_type.fullkey = bit 0 (upstream `BitField<0,1,s32> fullkey`).
-            npad.device_type.raw |= 1 << 0;
-            // system_properties bits 11 (is_vertical), 13 (use_plus), 14 (use_minus).
-            npad.system_properties.raw |= (1 << 11) | (1 << 13) | (1 << 14);
-            // ColorAttribute::Ok = 0 (default), so fullkey_color.attribute is
-            // already correct from zero-init. No need to set explicitly.
+                // Mirror upstream `NPad::InitNewlyAddedController` for the
+                // Pro Controller (Fullkey) case (npad.cpp:202-215). These fields
+                // are normally written ONCE on a connect event; ruzu has no
+                // EmulatedController connect-event plumbing yet, so we keep
+                // re-writing them here. The values are idempotent.
+                npad.style_tag.raw |= NpadStyleSet::FULLKEY;
+                // device_type.fullkey = bit 0 (upstream `BitField<0,1,s32> fullkey`).
+                npad.device_type.raw |= 1 << 0;
+                // system_properties bits 11 (is_vertical), 13 (use_plus), 14 (use_minus).
+                npad.system_properties.raw |= (1 << 11) | (1 << 13) | (1 << 14);
+                npad.fullkey_color.attribute = ColorAttribute::Ok;
+                npad.applet_footer_type = AppletFooterUiType::SwitchProController;
+                npad.sixaxis_fullkey_properties.set_is_newly_assigned(true);
 
-            // Build a Pro Controller / Fullkey `NPadGenericState`:
-            //   connection_status.raw bits: is_connected (0) | is_wired (1) = 0x3.
-            // Sampling number monotonically increases (upstream:
-            //   `npad->fullkey_lifo.ReadCurrentEntry().state.sampling_number + 1`).
-            let prev_sampling = npad.fullkey_lifo.read_current_entry().state.sampling_number;
-            let mut pad_state = NPadGenericState::default();
-            pad_state.connection_status.raw = 0x3;
-            pad_state.sampling_number = prev_sampling + 1;
-            npad.fullkey_lifo.write_next_entry(pad_state);
+                // Build a Pro Controller / Fullkey `NPadGenericState`:
+                //   connection_status.raw bits: is_connected (0) | is_wired (1) = 0x3.
+                // Sampling number monotonically increases (upstream:
+                //   `npad->fullkey_lifo.ReadCurrentEntry().state.sampling_number + 1`).
+                let prev_sampling = npad.fullkey_lifo.read_current_entry().state.sampling_number;
+                let mut pad_state = NPadGenericState::default();
+                pad_state.connection_status.raw = 0x3;
+                pad_state.npad_buttons = get_simple_npad_button_state();
+                pad_state.sampling_number = prev_sampling + 1;
+                if std::env::var_os("RUZU_TRACE_NPAD_STATE").is_some()
+                    && !pad_state.npad_buttons.raw.is_empty()
+                {
+                    log::info!(
+                        "[NPAD_STATE] aruid=0x{:X} entry={} buttons=0x{:X} sampling={}",
+                        aruid,
+                        entry_index,
+                        pad_state.npad_buttons.raw.bits(),
+                        pad_state.sampling_number
+                    );
+                }
+                npad.fullkey_lifo.write_next_entry(pad_state);
 
-            // Mirror the libnx-state write: upstream also updates
-            // `system_ext_lifo` with the `NpadCommonState` so libnx clients
-            // (which don't activate any specific style) still see a connected
-            // controller via that LIFO.
-            let prev_ext = npad
-                .system_ext_lifo
-                .read_current_entry()
-                .state
-                .sampling_number;
-            let mut libnx_state = NPadGenericState::default();
-            libnx_state.connection_status.raw = 0x3;
-            libnx_state.sampling_number = prev_ext + 1;
-            npad.system_ext_lifo.write_next_entry(libnx_state);
+                // Mirror the libnx-state write: upstream also updates
+                // `system_ext_lifo` with the `NpadCommonState` so libnx clients
+                // (which don't activate any specific style) still see a connected
+                // controller via that LIFO.
+                let prev_ext = npad
+                    .system_ext_lifo
+                    .read_current_entry()
+                    .state
+                    .sampling_number;
+                let mut libnx_state = NPadGenericState::default();
+                libnx_state.connection_status.raw = 0x3;
+                libnx_state.npad_buttons = pad_state.npad_buttons;
+                libnx_state.sampling_number = prev_ext + 1;
+                npad.system_ext_lifo.write_next_entry(libnx_state);
+            }
         }
     }
 
@@ -303,6 +371,32 @@ impl NPad {
 
     pub fn end_permit_vibration_session(&self) -> ResultCode {
         self.vibration.end_permit_vibration_session()
+    }
+
+    /// Port of `NPad::GetVibrationDevice` for standard LRA devices.
+    ///
+    /// ruzu does not yet model `AbstractPad`, so the default Player1 fullkey
+    /// controller owns two virtual mounted LRA devices. This mirrors the
+    /// controller state faked in `on_update`.
+    pub fn get_vibration_device_mut(
+        &mut self,
+        handle: &VibrationDeviceHandle,
+    ) -> Option<&mut NpadVibrationDevice> {
+        if crate::hid_util::is_vibration_handle_valid(handle).is_error() {
+            return None;
+        }
+        match handle.npad_type {
+            NpadStyleIndex::Fullkey
+            | NpadStyleIndex::Handheld
+            | NpadStyleIndex::JoyconDual
+            | NpadStyleIndex::JoyconLeft
+            | NpadStyleIndex::JoyconRight => match handle.device_index {
+                DeviceIndex::Left => Some(&mut self.vibration_devices[0]),
+                DeviceIndex::Right => Some(&mut self.vibration_devices[1]),
+                _ => None,
+            },
+            _ => None,
+        }
     }
 
     /// Port of NPad::AssigningSingleOnSlSrPress.

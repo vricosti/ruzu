@@ -1330,11 +1330,10 @@ impl ServerManager {
         // (or explicitly in the CloseVirtualHandle / StubSuccess branches), matching
         // upstream server_manager.cpp:385 which only calls SendReplyHLE here.
 
-        let reply_result = self.sessions[session_index]
-            .server_session
-            .lock()
-            .unwrap()
-            .send_reply();
+        let reply_result =
+            crate::hle::kernel::k_server_session::KServerSession::send_reply_hle_unlocked(
+                &self.sessions[session_index].server_session,
+            );
         self.trace_ipc("send_reply_done");
 
         // Check for session close.

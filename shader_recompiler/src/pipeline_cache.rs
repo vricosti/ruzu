@@ -214,6 +214,20 @@ fn clear_unreachable_blocks(program: &mut Program) {
     }
     let reachable: std::collections::BTreeSet<u32> =
         program.post_order_blocks.iter().copied().collect();
+    for node in &mut program.syntax_list {
+        match node {
+            SyntaxNode::If { cond, .. }
+            | SyntaxNode::Repeat { cond, .. }
+            | SyntaxNode::Break { cond, .. } => {
+                if let Value::Inst(inst_ref) = cond {
+                    if !reachable.contains(&inst_ref.block) {
+                        *cond = Value::ImmU1(false);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
     for (index, block) in program.blocks.iter_mut().enumerate().skip(1) {
         if reachable.contains(&(index as u32)) {
             continue;
@@ -496,10 +510,19 @@ fn emit_glsl_program_at_offset(
     let cfg_blocks = control_flow::build_cfg(code);
     let mut program = translate_cfg_to_program(code, stage, base_offset, &cfg_blocks, sph);
 
+    let host_info = crate::host_translate_info::HostTranslateInfo {
+        support_int64: profile.support_int64,
+        min_ssbo_alignment: profile.min_ssbo_alignment as u32,
+        ..Default::default()
+    };
     if let Some(texture_bound_buffer) = texture_bound_buffer {
-        ir_opt::optimize_with_bound_textures(&mut program, texture_bound_buffer);
+        ir_opt::optimize_with_bound_textures_and_host_info(
+            &mut program,
+            texture_bound_buffer,
+            &host_info,
+        );
     } else {
-        ir_opt::optimize(&mut program);
+        ir_opt::optimize_with_host_info(&mut program, &host_info);
     }
 
     convert_legacy_to_generic(&mut program, runtime_info);
@@ -804,14 +827,22 @@ mod tests {
         use crate::ir::basic_block::Block;
         use crate::ir::instruction::Inst;
         use crate::ir::opcodes::Opcode;
-        use crate::ir::value::{Reg, Value};
+        use crate::ir::value::{InstRef, Reg, Value};
 
         let mut program = Program::new(ShaderStage::VertexB);
         program.blocks.push(Block::new());
         program.blocks.push(Block::new());
-        program
+        let cond = program
             .block_mut(1)
             .append_inst(Inst::new(Opcode::GetRegister, vec![Value::Reg(Reg(3))]));
+        program.syntax_list.push(SyntaxNode::If {
+            cond: Value::Inst(InstRef {
+                block: 1,
+                inst: cond,
+            }),
+            body: 1,
+            merge: 0,
+        });
         program.post_order_blocks = vec![0];
 
         clear_unreachable_blocks(&mut program);
@@ -819,6 +850,10 @@ mod tests {
         assert_eq!(program.blocks.len(), 2);
         assert!(program.block(1).is_empty());
         assert_eq!(program.post_order_blocks, vec![0]);
+        let SyntaxNode::If { cond, .. } = program.syntax_list[0] else {
+            panic!("expected If syntax node");
+        };
+        assert_eq!(cond, Value::ImmU1(false));
     }
 
     #[test]

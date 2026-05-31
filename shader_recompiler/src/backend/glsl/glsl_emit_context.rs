@@ -120,6 +120,15 @@ fn interp_decorator(interp: Interpolation) -> &'static str {
     }
 }
 
+fn swizzle(offset: u32) -> &'static str {
+    match (offset % 16) / 4 {
+        0 => "x",
+        1 => "y",
+        2 => "z",
+        _ => "w",
+    }
+}
+
 fn stores_per_vertex_attributes(stage: Stage) -> bool {
     matches!(
         stage,
@@ -155,7 +164,6 @@ impl<'a> EmitContext<'a> {
                 && profile.support_geometry_shader_passthrough,
         };
 
-        // Set GLSL version header
         ctx.header.push_str("#version 460 core\n");
 
         match program.stage {
@@ -183,17 +191,28 @@ impl<'a> EmitContext<'a> {
             }
         }
 
+        ctx.setup_extensions(program);
         ctx.setup_out_per_vertex(program);
         ctx.setup_in_per_vertex(program);
         ctx.define_generic_inputs(program);
         ctx.define_generic_outputs(program);
         ctx.define_fragment_outputs(program);
         ctx.define_constant_buffers(bindings, program);
+        ctx.define_storage_buffers(bindings, program);
         ctx.setup_images(bindings, program);
         ctx.setup_textures(bindings, program);
-        ctx.define_helper_functions();
+        ctx.define_helper_functions(program);
 
         ctx
+    }
+
+    fn setup_extensions(&mut self, program: &ir::Program) {
+        self.header
+            .push_str("#extension GL_ARB_separate_shader_objects : enable\n");
+        if program.info.uses_int64 && self.profile.support_int64 {
+            self.header
+                .push_str("#extension GL_ARB_gpu_shader_int64 : enable\n");
+        }
     }
 
     fn setup_textures(&mut self, bindings: &mut Bindings, program: &ir::Program) {
@@ -508,10 +527,128 @@ impl<'a> EmitContext<'a> {
         }
     }
 
-    fn define_helper_functions(&mut self) {
+    fn define_storage_buffers(&mut self, bindings: &mut Bindings, program: &ir::Program) {
+        let mut index = 0u32;
+        for desc in &program.info.storage_buffers_descriptors {
+            self.header.push_str(&format!(
+                "layout(std430,binding={}) buffer {}_ssbo_{}{{uint {}_ssbo{}[];}};\n",
+                bindings.storage_buffer,
+                self.stage_name,
+                bindings.storage_buffer,
+                self.stage_name,
+                index
+            ));
+            bindings.storage_buffer += desc.count;
+            index += desc.count;
+        }
+    }
+
+    fn define_helper_functions(&mut self, program: &ir::Program) {
         self.header.push_str(
             "\n#define ftoi floatBitsToInt\n#define ftou floatBitsToUint\n#define itof intBitsToFloat\n#define utof uintBitsToFloat\n",
         );
+        if program.info.uses_global_memory && self.profile.support_int64 {
+            self.header.push_str(&self.define_global_memory_functions(program));
+        }
+    }
+
+    fn define_global_memory_functions(&self, program: &ir::Program) -> String {
+        let mut write_func = "void WriteGlobal32(uint64_t addr,uint data){".to_string();
+        let mut write_func_64 = "void WriteGlobal64(uint64_t addr,uvec2 data){".to_string();
+        let mut write_func_128 = "void WriteGlobal128(uint64_t addr,uvec4 data){".to_string();
+        let mut load_func = "uint LoadGlobal32(uint64_t addr){".to_string();
+        let mut load_func_64 = "uvec2 LoadGlobal64(uint64_t addr){".to_string();
+        let mut load_func_128 = "uvec4 LoadGlobal128(uint64_t addr){".to_string();
+
+        for (index, ssbo) in program.info.storage_buffers_descriptors.iter().enumerate() {
+            let used = index < u16::BITS as usize
+                && (program.info.nvn_buffer_used & (1u16 << index)) != 0;
+            if !used {
+                continue;
+            }
+            let size_cbuf_offset = ssbo.cbuf_offset + 8;
+            let ssbo_addr = format!("ssbo_addr{}", index);
+            let cbuf = format!("{}_cbuf{}", self.stage_name, ssbo.cbuf_index);
+            let addr_xy = [
+                format!(
+                    "ftou({}[{}].{})",
+                    cbuf,
+                    ssbo.cbuf_offset / 16,
+                    swizzle(ssbo.cbuf_offset)
+                ),
+                format!(
+                    "ftou({}[{}].{})",
+                    cbuf,
+                    (ssbo.cbuf_offset + 4) / 16,
+                    swizzle(ssbo.cbuf_offset + 4)
+                ),
+            ];
+            let size_xy = [
+                format!(
+                    "ftou({}[{}].{})",
+                    cbuf,
+                    size_cbuf_offset / 16,
+                    swizzle(size_cbuf_offset)
+                ),
+                format!(
+                    "ftou({}[{}].{})",
+                    cbuf,
+                    (size_cbuf_offset + 4) / 16,
+                    swizzle(size_cbuf_offset + 4)
+                ),
+            ];
+            let align = self.profile.min_ssbo_alignment.max(1) as u32;
+            let ssbo_align_mask = !align.wrapping_sub(1);
+            let aligned_low_addr = format!("{}&{}", addr_xy[0], ssbo_align_mask);
+            let aligned_addr = format!("uvec2({},{})", aligned_low_addr, addr_xy[1]);
+            let addr_pack = format!("packUint2x32({})", aligned_addr);
+            let addr_statement = format!("uint64_t {}={};", ssbo_addr, addr_pack);
+            let size_vec = format!("uvec2({},{})", size_xy[0], size_xy[1]);
+            let comparison = format!(
+                "if((addr>={})&&(addr<({}+uint64_t({})))){{",
+                ssbo_addr, ssbo_addr, size_vec
+            );
+            let ssbo_name = format!("{}_ssbo{}", self.stage_name, index);
+
+            let define_body = |func: &mut String, return_statement: &str| {
+                func.push_str(&addr_statement);
+                func.push_str(&comparison);
+                func.push_str(&return_statement.replace("{0}", &ssbo_name).replace("{1}", &ssbo_addr));
+            };
+
+            define_body(
+                &mut write_func,
+                "{0}[uint(addr-{1})>>2]=data;return;}",
+            );
+            define_body(
+                &mut write_func_64,
+                "{0}[uint(addr-{1})>>2]=data.x;{0}[uint(addr-{1}+4)>>2]=data.y;return;}",
+            );
+            define_body(
+                &mut write_func_128,
+                "{0}[uint(addr-{1})>>2]=data.x;{0}[uint(addr-{1}+4)>>2]=data.y;{0}[uint(addr-{1}+8)>>2]=data.z;{0}[uint(addr-{1}+12)>>2]=data.w;return;}",
+            );
+            define_body(&mut load_func, "return {0}[uint(addr-{1})>>2];}");
+            define_body(
+                &mut load_func_64,
+                "return uvec2({0}[uint(addr-{1})>>2],{0}[uint(addr-{1}+4)>>2]);}",
+            );
+            define_body(
+                &mut load_func_128,
+                "return uvec4({0}[uint(addr-{1})>>2],{0}[uint(addr-{1}+4)>>2],{0}[uint(addr-{1}+8)>>2],{0}[uint(addr-{1}+12)>>2]);}",
+            );
+        }
+
+        write_func.push('}');
+        write_func_64.push('}');
+        write_func_128.push('}');
+        load_func.push_str("return 0u;}");
+        load_func_64.push_str("return uvec2(0);}");
+        load_func_128.push_str("return uvec4(0);}");
+        format!(
+            "{}{}{}{}{}{}",
+            write_func, write_func_64, write_func_128, load_func, load_func_64, load_func_128
+        )
     }
 
     pub fn define_variables(&self, header: &mut String) {
@@ -673,5 +810,45 @@ mod tests {
         assert_eq!(ctx.textures.len(), 1);
         assert!(ctx.textures[0].is_multisample);
         assert!(ctx.header.contains("uniform sampler2DMS tex0;"));
+    }
+
+    #[test]
+    fn global_memory_header_declares_ssbo_and_helpers_when_int64_supported() {
+        let mut program = ir::Program::new(Stage::Fragment);
+        program.info.uses_int64 = true;
+        program.info.uses_global_memory = true;
+        program.info.nvn_buffer_used = 1;
+        program
+            .info
+            .constant_buffer_descriptors
+            .push(crate::shader_info::ConstantBufferDescriptor { index: 2, count: 1 });
+        program
+            .info
+            .storage_buffers_descriptors
+            .push(crate::shader_info::StorageBufferDescriptor {
+                cbuf_index: 2,
+                cbuf_offset: 0x20,
+                count: 1,
+                is_written: true,
+            });
+        let mut bindings = Bindings::default();
+        let mut profile = Profile::default();
+        profile.support_int64 = true;
+        profile.min_ssbo_alignment = 0x100;
+        let runtime_info = RuntimeInfo::default();
+
+        let ctx = EmitContext::new(&program, &mut bindings, &profile, &runtime_info);
+
+        assert!(ctx
+            .header
+            .contains("#extension GL_ARB_gpu_shader_int64 : enable"));
+        assert!(ctx
+            .header
+            .contains("layout(std430,binding=0) buffer fs_ssbo_0{uint fs_ssbo0[];}"));
+        assert!(ctx.header.contains("uint LoadGlobal32(uint64_t addr){"));
+        assert!(ctx
+            .header
+            .contains("void WriteGlobal32(uint64_t addr,uint data){"));
+        assert!(ctx.header.contains("uint64_t ssbo_addr0=packUint2x32"));
     }
 }

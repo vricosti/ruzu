@@ -12,6 +12,7 @@ use super::heap_mapper::HeapMapper;
 use super::nvmap::NvMap;
 use super::syncpoint_manager::SyncpointManager;
 use crate::core::SystemRef;
+use crate::hle::kernel::k_memory_block::KMemoryState;
 use crate::hle::kernel::k_process::KProcess;
 use crate::hle::kernel::k_process::ProcessLock;
 
@@ -73,6 +74,7 @@ pub struct Container {
     manager: SyncpointManager,
     device_file_data: Host1xDeviceFileData,
     inner: Mutex<ContainerInner>,
+    system: SystemRef,
 }
 
 impl Container {
@@ -90,6 +92,7 @@ impl Container {
                 new_ids: 0,
                 id_pool: VecDeque::new(),
             }),
+            system,
         }
     }
 
@@ -130,8 +133,83 @@ impl Container {
         let session = &mut inner.sessions[new_id];
         session.is_active = true;
         session.ref_count = 1;
+        self.try_create_preallocated_area(session, process);
 
         SessionId { id: new_id }
+    }
+
+    fn try_create_preallocated_area(
+        &self,
+        session: &mut Session,
+        process: &std::sync::Arc<ProcessLock>,
+    ) {
+        const MIN_PREALLOCATED_AREA_SIZE: usize = 32 * 1024 * 1024;
+
+        let Some(host1x) = self.system.get().host1x_core() else {
+            return;
+        };
+
+        let process = process.lock().unwrap();
+        if !process.is_application() {
+            return;
+        }
+
+        let page_table = &process.page_table;
+        let heap_start = page_table.get_heap_region_start().get() as usize;
+        let heap_end = heap_start.saturating_add(page_table.get_heap_region_size());
+        let mut cur_addr = heap_start;
+        let mut region_start = 0usize;
+        let mut region_size = 0usize;
+
+        while cur_addr < heap_end {
+            let Some(info) = page_table.query_info(cur_addr) else {
+                break;
+            };
+            let svc_state = info.get_state() & KMemoryState::MASK;
+            if svc_state == (KMemoryState::NORMAL & KMemoryState::MASK) {
+                if region_start.saturating_add(region_size) == info.get_address() {
+                    region_size = region_size.saturating_add(info.get_size());
+                } else if info.get_size() > region_size {
+                    region_start = info.get_address();
+                    region_size = info.get_size();
+                }
+            }
+
+            let next_addr = info.get_address().saturating_add(info.get_size());
+            if next_addr <= cur_addr {
+                break;
+            }
+            cur_addr = next_addr;
+        }
+
+        session.has_preallocated_area = false;
+        if region_size < MIN_PREALLOCATED_AREA_SIZE {
+            return;
+        }
+
+        let start_region = host1x.smmu_allocate(region_size);
+        if start_region == 0 {
+            return;
+        }
+
+        session.mapper = Some(HeapMapper::new(
+            region_start as u64,
+            start_region,
+            region_size,
+            0,
+            self.system,
+        ));
+        session.has_preallocated_area = true;
+
+        if std::env::var_os("RUZU_TRACE_NVMAP_PREALLOC").is_some() {
+            log::info!(
+                "nvdrv::Container preallocated heap session={} vaddr=0x{:X} daddr=0x{:X} size=0x{:X}",
+                session.id.id,
+                region_start,
+                start_region,
+                region_size
+            );
+        }
     }
 
     /// Closes a session by decrementing its ref count.
@@ -196,6 +274,24 @@ impl Container {
             return None;
         }
         session.process.as_ref()?.upgrade()
+    }
+
+    pub fn map_preallocated_area(
+        &self,
+        session_id: SessionId,
+        address: u64,
+        size: usize,
+    ) -> Option<u64> {
+        let inner = self.inner.lock().unwrap();
+        let session = inner.sessions.get(session_id.id)?;
+        if !session.is_active || !session.has_preallocated_area {
+            return None;
+        }
+        let mapper = session.mapper.as_ref()?;
+        if !mapper.is_in_bounds(address, size) {
+            return None;
+        }
+        Some(mapper.map(address, size))
     }
 
     pub fn get_nv_map_file(&self) -> &NvMap {
