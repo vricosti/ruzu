@@ -5,13 +5,14 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use hid_core::hid_types::NpadStyleSet;
+use hid_core::hid_types::{NpadIdType, NpadStyleSet};
 use hid_core::resource_manager::ResourceManager;
 use hid_core::resources::hid_firmware_settings::HidFirmwareSettings;
 
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
 use crate::hle::service::ipc_helpers::{RequestParser, ResponseBuilder};
+use crate::hle::service::os::event::Event;
 use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
 
 /// Convert `common::ResultCode` (used by hid_core) to `crate::hle::result::ResultCode`
@@ -27,6 +28,7 @@ pub struct IHidSystemServer {
     handlers_tipc: BTreeMap<u32, FunctionInfo>,
     resource_manager: Arc<parking_lot::Mutex<ResourceManager>>,
     firmware_settings: Arc<HidFirmwareSettings>,
+    acquire_device_registered_event: Arc<Event>,
 }
 
 impl IHidSystemServer {
@@ -424,21 +426,42 @@ impl IHidSystemServer {
 
     /// Upstream: IHidSystemServer::GetAppletDetailedUiType (cmd 315)
     fn get_applet_detailed_ui_type_handler(
-        _this: &dyn ServiceFramework,
+        this: &dyn ServiceFramework,
         ctx: &mut HLERequestContext,
     ) {
+        let server = unsafe { &*(this as *const dyn ServiceFramework as *const IHidSystemServer) };
         let mut rp = RequestParser::new(ctx);
         let npad_id = rp.pop_u32();
+        let npad_id_type = match npad_id {
+            0 => NpadIdType::Player1,
+            1 => NpadIdType::Player2,
+            2 => NpadIdType::Player3,
+            3 => NpadIdType::Player4,
+            4 => NpadIdType::Player5,
+            5 => NpadIdType::Player6,
+            6 => NpadIdType::Player7,
+            7 => NpadIdType::Player8,
+            0x10 => NpadIdType::Other,
+            0x20 => NpadIdType::Handheld,
+            _ => NpadIdType::Invalid,
+        };
+
+        let detailed_ui_type = server
+            .resource_manager
+            .lock()
+            .get_npad()
+            .map(|npad| npad.lock().get_applet_detailed_ui_type(npad_id_type))
+            .unwrap_or_default();
 
         log::debug!(
-            "(STUBBED) GetAppletDetailedUiType called, npad_id={}",
-            npad_id
+            "GetAppletDetailedUiType called, npad_id={} footer={:?}",
+            npad_id,
+            detailed_ui_type.footer
         );
 
-        // Stubbed: push default AppletDetailedUiType (0)
         let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
         rb.push_result(RESULT_SUCCESS);
-        rb.push_u32(0);
+        rb.push_raw(&detailed_ui_type);
     }
 
     /// Upstream: IHidSystemServer::GetNpadInterfaceType (cmd 316)
@@ -1010,15 +1033,19 @@ impl IHidSystemServer {
 
     /// Upstream: IHidSystemServer::AcquireConnectionTriggerTimeoutEvent (cmd 544)
     fn acquire_connection_trigger_timeout_event_handler(
-        _this: &dyn ServiceFramework,
+        this: &dyn ServiceFramework,
         ctx: &mut HLERequestContext,
     ) {
-        log::info!("(STUBBED) AcquireConnectionTriggerTimeoutEvent called");
+        let server = unsafe { &*(this as *const dyn ServiceFramework as *const IHidSystemServer) };
+        log::info!("AcquireConnectionTriggerTimeoutEvent called");
 
-        // Upstream: rb{ctx, 2, 1} + PushCopyObjects(event). Stubbed with handle=0.
+        let handle = server
+            .acquire_device_registered_event
+            .copy_handle(ctx)
+            .unwrap_or(0);
         let mut rb = ResponseBuilder::new(ctx, 2, 1, 0);
         rb.push_result(RESULT_SUCCESS);
-        rb.push_copy_objects(0);
+        rb.push_copy_objects(handle);
     }
 
     /// Upstream: nullptr (cmd 545)
@@ -1030,15 +1057,19 @@ impl IHidSystemServer {
 
     /// Upstream: IHidSystemServer::AcquireDeviceRegisteredEventForControllerSupport (cmd 546)
     fn acquire_device_registered_event_for_controller_support_handler(
-        _this: &dyn ServiceFramework,
+        this: &dyn ServiceFramework,
         ctx: &mut HLERequestContext,
     ) {
-        log::info!("(STUBBED) AcquireDeviceRegisteredEventForControllerSupport called");
+        let server = unsafe { &*(this as *const dyn ServiceFramework as *const IHidSystemServer) };
+        log::info!("AcquireDeviceRegisteredEventForControllerSupport called");
 
-        // Upstream: rb{ctx, 2, 1} + PushCopyObjects(event). Stubbed with handle=0.
+        let handle = server
+            .acquire_device_registered_event
+            .copy_handle(ctx)
+            .unwrap_or(0);
         let mut rb = ResponseBuilder::new(ctx, 2, 1, 0);
         rb.push_result(RESULT_SUCCESS);
-        rb.push_copy_objects(0);
+        rb.push_copy_objects(handle);
     }
 
     /// Upstream: nullptr (cmd 547)
@@ -3328,6 +3359,7 @@ impl IHidSystemServer {
             handlers_tipc: BTreeMap::new(),
             resource_manager,
             firmware_settings,
+            acquire_device_registered_event: Arc::new(Event::new()),
         }
     }
 }

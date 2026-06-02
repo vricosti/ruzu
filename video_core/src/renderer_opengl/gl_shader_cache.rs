@@ -10,8 +10,11 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
+use common::cityhash::city_hash64;
 use shader_recompiler::profile::Profile as ShaderProfile;
-use shader_recompiler::runtime_info::{InputTopology, RuntimeInfo, TessPrimitive, TessSpacing};
+use shader_recompiler::runtime_info::{
+    CompareFunction, InputTopology, RuntimeInfo, TessPrimitive, TessSpacing,
+};
 use shader_recompiler::shader_info::Info as ShaderInfo;
 use shader_recompiler::{
     compile_dual_vertex_shader_glsl_at_offset_with_bindings,
@@ -25,6 +28,102 @@ use crate::shader_cache::{GraphicsEnvironments, ShaderCache as SharedShaderCache
 use crate::shader_environment::{GenericEnvironment, GpuMemoryReader};
 use crate::transform_feedback;
 use shader_recompiler::program_header::ProgramHeader;
+
+fn comparison_op_to_runtime_func(
+    op: crate::engines::maxwell_3d::ComparisonOp,
+) -> CompareFunction {
+    match op {
+        crate::engines::maxwell_3d::ComparisonOp::Never => CompareFunction::Never,
+        crate::engines::maxwell_3d::ComparisonOp::Less => CompareFunction::Less,
+        crate::engines::maxwell_3d::ComparisonOp::Equal => CompareFunction::Equal,
+        crate::engines::maxwell_3d::ComparisonOp::LessEqual => CompareFunction::LessThanEqual,
+        crate::engines::maxwell_3d::ComparisonOp::Greater => CompareFunction::Greater,
+        crate::engines::maxwell_3d::ComparisonOp::NotEqual => CompareFunction::NotEqual,
+        crate::engines::maxwell_3d::ComparisonOp::GreaterEqual => CompareFunction::GreaterThanEqual,
+        crate::engines::maxwell_3d::ComparisonOp::Always => CompareFunction::Always,
+    }
+}
+
+fn comparison_func_to_key(func: CompareFunction) -> u32 {
+    match func {
+        CompareFunction::Never => 0,
+        CompareFunction::Less => 1,
+        CompareFunction::Equal => 2,
+        CompareFunction::LessThanEqual => 3,
+        CompareFunction::Greater => 4,
+        CompareFunction::NotEqual => 5,
+        CompareFunction::GreaterThanEqual => 6,
+        CompareFunction::Always => 7,
+    }
+}
+
+fn comparison_func_from_key(value: u32) -> CompareFunction {
+    match value {
+        0 => CompareFunction::Never,
+        1 => CompareFunction::Less,
+        2 => CompareFunction::Equal,
+        3 => CompareFunction::LessThanEqual,
+        4 => CompareFunction::Greater,
+        5 => CompareFunction::NotEqual,
+        6 => CompareFunction::GreaterThanEqual,
+        _ => CompareFunction::Always,
+    }
+}
+
+fn parse_hash_env(name: &str) -> Option<u64> {
+    std::env::var(name).ok().and_then(|value| {
+        let value = value.trim();
+        let hex = value
+            .strip_prefix("0x")
+            .or_else(|| value.strip_prefix("0X"));
+        match hex {
+            Some(hex) => u64::from_str_radix(hex, 16).ok(),
+            None => value.parse::<u64>().ok(),
+        }
+    })
+}
+
+fn patch_fragment_debug_by_source_hash(stage: ShaderStage, source: String) -> String {
+    if stage != ShaderStage::Fragment {
+        return source;
+    }
+    let Some(target_hash) = parse_hash_env("RUZU_FRAGMENT_DEBUG_SOURCE_HASH") else {
+        return source;
+    };
+    let source_hash = city_hash64(source.as_bytes());
+    if source_hash != target_hash {
+        return source;
+    }
+    let Some(main_index) = source.rfind("void main(){") else {
+        log::warn!(
+            "[FRAGMENT_DEBUG_HASH] hash=0x{:016X} matched but no main body was found",
+            source_hash
+        );
+        return source;
+    };
+
+    let mode =
+        std::env::var("RUZU_FRAGMENT_DEBUG_HASH_MODE").unwrap_or_else(|_| "green".to_string());
+    let replacement = match mode.as_str() {
+        "tex0_center" => {
+            "void main(){\nfrag_color0=texture(tex0,vec2(0.5,0.5));\nreturn;\n}\n"
+        }
+        "tex0_attr1" => "void main(){\nfrag_color0=texture(tex0,in_attr1.xy);\nreturn;\n}\n",
+        "uv" => {
+            "void main(){\nvec2 ruzu_uv=in_attr1.xy;\nfrag_color0=vec4(fract(ruzu_uv),0.0,1.0);\nreturn;\n}\n"
+        }
+        "alpha_one" => {
+            "void main(){\nvec4 c=texture(tex0,in_attr1.xy);\nfrag_color0=vec4(c.rgb,1.0);\nreturn;\n}\n"
+        }
+        _ => "void main(){\nfrag_color0=vec4(0.0,1.0,0.0,1.0);\nreturn;\n}\n",
+    };
+    log::warn!(
+        "[FRAGMENT_DEBUG_HASH] hash=0x{:016X} mode={} patched fragment shader",
+        source_hash,
+        mode
+    );
+    format!("{}{}", &source[..main_index], replacement)
+}
 
 use super::gl_compute_pipeline::{ComputePipeline, ComputePipelineKey};
 use super::gl_device::Device;
@@ -436,6 +535,14 @@ impl ShaderCache {
             .set_xfb_enabled(maxwell3d.transform_feedback_enabled());
         self.graphics_key
             .set_app_stage(maxwell3d.engine_state() as u32);
+        let alpha_func = if maxwell3d.alpha_test_enabled() {
+            comparison_op_to_runtime_func(maxwell3d.alpha_test_func())
+        } else {
+            CompareFunction::Always
+        };
+        self.graphics_key
+            .set_alpha_test_func(comparison_func_to_key(alpha_func));
+        self.graphics_key.alpha_test_ref = maxwell3d.alpha_test_ref().to_bits();
         if self.graphics_key.xfb_enabled() {
             self.graphics_key.xfb_state = maxwell3d.transform_feedback_state();
         }
@@ -713,7 +820,7 @@ impl ShaderCache {
                         );
                     }
                     previous_info = compiled.info.clone();
-                    let mut final_source = compiled.source;
+                    let mut final_source = patch_fragment_debug_by_source_hash(stage, compiled.source);
                     if std::env::var_os("RUZU_FORCE_GREEN_FRAGMENT").is_some()
                         && format!("{:?}", stage) == "Fragment"
                     {
@@ -906,7 +1013,8 @@ impl ShaderCache {
             }
             previous_info = Some(compiled.info.clone());
             infos[gl_slot] = previous_info.clone();
-            let mut final_source = compiled.source;
+            let mut final_source =
+                patch_fragment_debug_by_source_hash(ShaderStage::VertexB, compiled.source);
             if std::env::var_os("RUZU_FORCE_GREEN_FRAGMENT").is_some()
                 && format!("{:?}", stage) == "Fragment"
             {
@@ -1092,7 +1200,8 @@ impl ShaderCache {
             }
             let mut previous_info = compiled.info.clone();
             infos[0] = Some(previous_info.clone());
-            let mut final_source = compiled.source;
+            let mut final_source =
+                patch_fragment_debug_by_source_hash(ShaderStage::VertexB, compiled.source);
             if std::env::var_os("RUZU_FORCE_FULLSCREEN_VS").is_some() {
                 if let Some(idx) = final_source.rfind("void main(){") {
                     let head = &final_source[..idx];
@@ -1189,7 +1298,8 @@ impl ShaderCache {
                 }
                 previous_info = compiled.info.clone();
                 infos[gl_slot] = Some(previous_info.clone());
-                let mut final_source = compiled.source;
+                let mut final_source =
+                    patch_fragment_debug_by_source_hash(actual_stage, compiled.source);
                 if std::env::var_os("RUZU_FORCE_GREEN_FRAGMENT").is_some()
                     && format!("{:?}", actual_stage) == "Fragment"
                 {
@@ -1341,7 +1451,8 @@ impl ShaderCache {
             }
             previous_info = Some(compiled.info.clone());
             infos[gl_slot] = previous_info.clone();
-            let mut final_source = compiled.source;
+            let mut final_source =
+                patch_fragment_debug_by_source_hash(actual_stage, compiled.source);
             if std::env::var_os("RUZU_FORCE_GREEN_FRAGMENT").is_some()
                 && format!("{:?}", actual_stage) == "Fragment"
             {
@@ -1503,6 +1614,8 @@ impl ShaderCache {
             }
             ShaderStage::Fragment => {
                 info.force_early_z = key.early_z();
+                info.alpha_test_func = Some(comparison_func_from_key(key.alpha_test_func()));
+                info.alpha_test_reference = f32::from_bits(key.alpha_test_ref);
             }
             _ => {}
         }

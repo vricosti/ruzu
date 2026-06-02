@@ -172,6 +172,32 @@ pub mod cat {
     ///  color2d_handle, color_array2d_handle, view_type, format, size_pack,
     ///  gpu_addr, range_pack, flags]
     pub const IMAGE_VIEW: u16 = 28;
+    /// Audio renderer device-sink sample attribution. args =
+    /// [seq, sample_buffer, input_count, buffer_count, sample_count, frames,
+    ///  min_i32, max_i32, nonzero, clipped, visited, first0, first1, first2]
+    pub const AUDIO_DEVICE_SINK: u16 = 29;
+    /// Host1x/NVDEC/VIC video pipeline attribution. stage-specific args:
+    /// stage=1 nvdec submit [stage, fd, cmd_buffers, relocs, syncpts, fences, first_gpu, first_words]
+    /// stage=2 vic submit [stage, fd, cmd_buffers, relocs, syncpts, fences, first_gpu, first_words]
+    /// stage=3 nvdec execute [stage, id, codec, initialized]
+    /// stage=4 decode_api [stage, op, codec, result, packet_size]
+    /// stage=5 vic execute [stage, id, config_addr]
+    pub const HOST1X_VIDEO: u16 = 30;
+    /// Invalid IPC command buffer attribution. args =
+    /// [seq, service_id, cmd, guest_tid, tls, w0, w1, w2, w3, w4, w5, w6, w7, w8]
+    pub const IPC_INVALID: u16 = 31;
+    /// IPC reply wake attribution. args =
+    /// [seq, client_tid, state, wait_reason, wait_queue_present, guard_armed,
+    ///  guard_pending, result, request_addr, request_size]
+    pub const IPC_REPLY_WAKE: u16 = 32;
+    /// BufferQueueProducer attribution. stage-specific args:
+    /// stage=1 dequeue_enter [stage, seq, async, width, height, format, usage]
+    /// stage=2 dequeue_return [stage, seq, status, slot, flags]
+    /// stage=3 queue_enter [stage, seq, slot]
+    /// stage=4 queue_commit [stage, seq, slot, frame, queue_len, is_droppable, acquire_called]
+    /// stage=5 queue_return [stage, seq, status, slot]
+    /// stage=6 cancel [stage, seq, slot]
+    pub const BQP: u16 = 33;
 }
 
 fn service_registry() -> &'static Mutex<Vec<String>> {
@@ -323,6 +349,9 @@ fn my_ring() -> Arc<SpscRing> {
 pub struct Config {
     pub ipc_reply_dump: bool,
     pub ipc_request_dump: bool,
+    pub ipc_invalid_trace: bool,
+    pub ipc_reply_wake_trace: bool,
+    pub bqp_trace: bool,
     pub gpu_va_trace: bool,
     pub heap_trace: bool,
     pub tid_svc_trace: bool,
@@ -346,6 +375,8 @@ pub struct Config {
     pub texture_bind_addr_trace: bool,
     pub gl_draw_state_trace: bool,
     pub image_view_trace: bool,
+    pub audio_device_sink_trace: bool,
+    pub host1x_video_trace: bool,
     /// Sink target: "stderr" or "file".
     pub output_target: String,
     /// File path when target == "file".
@@ -364,6 +395,9 @@ impl Default for Config {
         Self {
             ipc_reply_dump: false,
             ipc_request_dump: false,
+            ipc_invalid_trace: false,
+            ipc_reply_wake_trace: false,
+            bqp_trace: false,
             gpu_va_trace: false,
             heap_trace: false,
             tid_svc_trace: false,
@@ -387,6 +421,8 @@ impl Default for Config {
             texture_bind_addr_trace: false,
             gl_draw_state_trace: false,
             image_view_trace: false,
+            audio_device_sink_trace: false,
+            host1x_video_trace: false,
             output_target: "stderr".to_string(),
             output_file: String::new(),
             ring_capacity: 16384,
@@ -467,6 +503,9 @@ fn build_config() -> Config {
     let cfg = Config {
         ipc_reply_dump: get_bool("ipc", "reply_dump", "RUZU_IPC_REPLY_DUMP", false),
         ipc_request_dump: get_bool("ipc", "request_dump", "RUZU_IPC_REQUEST_DUMP", false),
+        ipc_invalid_trace: get_bool("ipc", "invalid", "RUZU_TRACE_IPC_INVALID", false),
+        ipc_reply_wake_trace: get_bool("ipc", "reply_wake", "RUZU_TRACE_IPC_REPLY_WAKE", false),
+        bqp_trace: get_bool("nvnflinger", "bqp", "RUZU_TRACE_BQP_RING", false),
         gpu_va_trace: get_bool("nvdrv", "gpu_va_trace", "RUZU_TRACE_GPU_VA", false),
         heap_trace: get_bool("svc", "heap_trace", "RUZU_TRACE_HEAP", false),
         tid_svc_trace: get_bool("svc", "tid_svc", "RUZU_TRACE_TID_SVC", false),
@@ -525,6 +564,13 @@ fn build_config() -> Config {
             "RUZU_TRACE_IMAGE_VIEW_RING",
             false,
         ),
+        audio_device_sink_trace: get_bool(
+            "audio",
+            "device_sink",
+            "RUZU_TRACE_AUDIO_DEVICE_SINK",
+            false,
+        ),
+        host1x_video_trace: get_bool("host1x", "video", "RUZU_TRACE_HOST1X_VIDEO", false),
         output_target: get_str("output", "target", "RUZU_TRACE_TARGET", "stderr"),
         output_file: get_str("output", "file_path", "RUZU_TRACE_FILE", ""),
         ring_capacity: get_u64("output", "ring_capacity", 16384) as usize,
@@ -551,6 +597,9 @@ pub fn is_enabled(category: u16) -> bool {
     match category {
         cat::IPC_REPLY => c.ipc_reply_dump,
         cat::IPC_REQUEST => c.ipc_request_dump,
+        cat::IPC_INVALID => c.ipc_invalid_trace,
+        cat::IPC_REPLY_WAKE => c.ipc_reply_wake_trace,
+        cat::BQP => c.bqp_trace,
         cat::GPU_VA_MAP | cat::GPU_VA_UNMAP => c.gpu_va_trace,
         cat::HEAP => c.heap_trace,
         cat::TID_SVC => c.tid_svc_trace,
@@ -575,6 +624,8 @@ pub fn is_enabled(category: u16) -> bool {
         cat::GL_DRAW_STATE => c.gl_draw_state_trace,
         cat::RT_GRID_PHASE => c.rt_sample_trace,
         cat::IMAGE_VIEW => c.image_view_trace,
+        cat::AUDIO_DEVICE_SINK => c.audio_device_sink_trace,
+        cat::HOST1X_VIDEO => c.host1x_video_trace,
         _ => false,
     }
 }
@@ -718,6 +769,35 @@ fn format_into(out: &mut String, rec: &LogRecord) {
             }
             out.pop();
             out.push('\n');
+        }
+        cat::IPC_INVALID => {
+            let svc = service_name(rec.args[1] as u16);
+            let _ = write!(
+                out,
+                "IPC_INVALID seq={} service={} cmd={} tid={} tls=0x{:X} payload=",
+                rec.args[0], svc, rec.args[2], rec.args[3], rec.args[4]
+            );
+            for i in 5..rec.arg_count as usize {
+                let _ = write!(out, "{:08x} ", rec.args[i] as u32);
+            }
+            out.pop();
+            out.push('\n');
+        }
+        cat::IPC_REPLY_WAKE => {
+            let _ = writeln!(
+                out,
+                "IPC_REPLY_WAKE seq={} client_tid={} state={} wait_reason={} wait_queue={} guard_armed={} guard_pending={} result=0x{:X} request_addr=0x{:X} request_size=0x{:X}",
+                rec.args[0],
+                rec.args[1],
+                rec.args[2],
+                rec.args[3],
+                rec.args[4],
+                rec.args[5],
+                rec.args[6],
+                rec.args[7],
+                rec.args[8],
+                rec.args[9],
+            );
         }
         cat::GPU_VA_MAP => {
             let _ = writeln!(
@@ -1103,6 +1183,72 @@ fn format_into(out: &mut String, rec: &LogRecord) {
                 }
             }
         }
+        cat::BQP => {
+            match rec.args[0] {
+                1 => {
+                    let _ = writeln!(
+                        out,
+                        "[BQP] stage=dequeue_enter seq={} async={} size={}x{} format=0x{:X} usage=0x{:X}",
+                        rec.args[1],
+                        rec.args[2] != 0,
+                        rec.args[3],
+                        rec.args[4],
+                        rec.args[5],
+                        rec.args[6],
+                    );
+                }
+                2 => {
+                    let _ = writeln!(
+                        out,
+                        "[BQP] stage=dequeue_return seq={} status={} slot={} flags=0x{:X}",
+                        rec.args[1],
+                        rec.args[2] as i32,
+                        rec.args[3] as i32,
+                        rec.args[4],
+                    );
+                }
+                3 => {
+                    let _ = writeln!(
+                        out,
+                        "[BQP] stage=queue_enter seq={} slot={}",
+                        rec.args[1],
+                        rec.args[2] as i32,
+                    );
+                }
+                4 => {
+                    let _ = writeln!(
+                        out,
+                        "[BQP] stage=queue_commit seq={} slot={} frame={} queue_len={} droppable={} acquire_called={}",
+                        rec.args[1],
+                        rec.args[2] as i32,
+                        rec.args[3],
+                        rec.args[4],
+                        rec.args[5] != 0,
+                        rec.args[6] != 0,
+                    );
+                }
+                5 => {
+                    let _ = writeln!(
+                        out,
+                        "[BQP] stage=queue_return seq={} status={} slot={}",
+                        rec.args[1],
+                        rec.args[2] as i32,
+                        rec.args[3] as i32,
+                    );
+                }
+                6 => {
+                    let _ = writeln!(
+                        out,
+                        "[BQP] stage=cancel seq={} slot={}",
+                        rec.args[1],
+                        rec.args[2] as i32,
+                    );
+                }
+                _ => {
+                    let _ = writeln!(out, "[BQP] stage={} args={:?}", rec.args[0], &rec.args[..rec.arg_count as usize]);
+                }
+            }
+        }
         cat::TEXTURE_BIND => {
             let texture_type = match rec.args[4] {
                 0 => "Color1D",
@@ -1449,6 +1595,91 @@ fn format_into(out: &mut String, rec: &LogRecord) {
                 range_layers,
                 rec.args[13],
             );
+        }
+        cat::AUDIO_DEVICE_SINK => {
+            let min_value = rec.args[6] as u32 as i32;
+            let max_value = rec.args[7] as u32 as i32;
+            let first0 = rec.args[11] as u32 as i32;
+            let first1 = rec.args[12] as u32 as i32;
+            let first2 = rec.args[13] as u32 as i32;
+            let _ = writeln!(
+                out,
+                "[AUDIO_DEVICE_SINK] seq={} sample_buffer=0x{:X} input_count={} buffer_count={} sample_count={} frames={} min={} max={} nonzero={} clipped={} visited={} first=[{}, {}, {}]",
+                rec.args[0],
+                rec.args[1],
+                rec.args[2],
+                rec.args[3],
+                rec.args[4],
+                rec.args[5],
+                min_value,
+                max_value,
+                rec.args[8],
+                rec.args[9],
+                rec.args[10],
+                first0,
+                first1,
+                first2,
+            );
+        }
+        cat::HOST1X_VIDEO => {
+            match rec.args[0] {
+                1 | 2 => {
+                    let channel = if rec.args[0] == 1 { "nvdec" } else { "vic" };
+                    let _ = writeln!(
+                        out,
+                        "[HOST1X_VIDEO] stage=submit channel={} fd={} cmd_buffers={} relocs={} syncpts={} fences={} first_gpu=0x{:X} first_words={}",
+                        channel,
+                        rec.args[1] as i32,
+                        rec.args[2],
+                        rec.args[3],
+                        rec.args[4],
+                        rec.args[5],
+                        rec.args[6],
+                        rec.args[7],
+                    );
+                }
+                3 => {
+                    let _ = writeln!(
+                        out,
+                        "[HOST1X_VIDEO] stage=nvdec_execute id={} codec={} initialized={}",
+                        rec.args[1] as i32,
+                        rec.args[2],
+                        rec.args[3] != 0,
+                    );
+                }
+                4 => {
+                    let op = match rec.args[1] {
+                        1 => "initialize",
+                        2 => "send_packet",
+                        3 => "receive_frame",
+                        _ => "unknown",
+                    };
+                    let _ = writeln!(
+                        out,
+                        "[HOST1X_VIDEO] stage=decode_api op={} codec={} result={} packet_size={}",
+                        op,
+                        rec.args[2],
+                        rec.args[3] != 0,
+                        rec.args[4],
+                    );
+                }
+                5 => {
+                    let _ = writeln!(
+                        out,
+                        "[HOST1X_VIDEO] stage=vic_execute id={} config_addr=0x{:X}",
+                        rec.args[1] as i32,
+                        rec.args[2],
+                    );
+                }
+                _ => {
+                    let _ = writeln!(
+                        out,
+                        "[HOST1X_VIDEO] stage={} args={:?}",
+                        rec.args[0],
+                        &rec.args[..rec.arg_count as usize]
+                    );
+                }
+            }
         }
         _ => {
             let _ = writeln!(out, "TRACE cat={} args={:?}", rec.category, &rec.args[..rec.arg_count as usize]);

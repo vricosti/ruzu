@@ -1815,6 +1815,28 @@ impl KServerSession {
             let _scheduler_lock = crate::hle::kernel::kernel::scheduler_lock()
                 .map(super::k_scheduler_lock::KScopedSchedulerLock::new);
             let mut client_thread = client_thread.lock().unwrap();
+            if common::trace::is_enabled(common::trace::cat::IPC_REPLY_WAKE) {
+                static IPC_REPLY_WAKE_SEQ: std::sync::atomic::AtomicU64 =
+                    std::sync::atomic::AtomicU64::new(0);
+                let seq = IPC_REPLY_WAKE_SEQ
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                    .wrapping_add(1);
+                common::trace::emit_raw(
+                    common::trace::cat::IPC_REPLY_WAKE,
+                    &[
+                        seq,
+                        client_thread.get_thread_id(),
+                        client_thread.get_state().bits() as u64,
+                        client_thread.wait_reason_for_debugging as u64,
+                        client_thread.wait_queue.is_some() as u64,
+                        client_thread.wait_wake_guard_armed as u64,
+                        client_thread.wait_wake_guard_pending.is_some() as u64,
+                        client_result as u64,
+                        client_message as u64,
+                        client_buffer_size as u64,
+                    ],
+                );
+            }
             if trace_reply {
                 log::info!(
                     "KServerSession::send_reply_with_message stage=locked_client_thread state={:?}",

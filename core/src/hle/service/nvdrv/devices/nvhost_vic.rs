@@ -5,10 +5,12 @@
 //! Port of zuyu/src/core/hle/service/nvdrv/devices/nvhost_vic.cpp
 
 use crate::hle::service::nvdrv::core::container::SessionId;
+use crate::hle::service::nvdrv::core::container::Container;
 use crate::hle::service::nvdrv::core::syncpoint_manager::ChannelType;
 use crate::hle::service::nvdrv::devices::nvdevice::NvDevice;
 use crate::hle::service::nvdrv::devices::nvhost_nvdec_common::{self, NvHostNvDecCommon};
 use crate::hle::service::nvdrv::nvdata::{DeviceFD, Ioctl, NvResult};
+use crate::core::SystemRef;
 
 /// nvhost_vic device.
 pub struct NvHostVic {
@@ -16,9 +18,9 @@ pub struct NvHostVic {
 }
 
 impl NvHostVic {
-    pub fn new() -> Self {
+    pub fn new(system: SystemRef, container: &Container) -> Self {
         Self {
-            common: NvHostNvDecCommon::new(ChannelType::VIC),
+            common: NvHostNvDecCommon::new(system, container, ChannelType::VIC),
         }
     }
 }
@@ -55,11 +57,12 @@ impl NvDevice for NvHostVic {
     fn on_open(&self, session_id: SessionId, fd: DeviceFD) {
         let mut sessions = self.common.sessions.lock().unwrap();
         sessions.insert(fd, session_id);
-        // Stubbed: host1x.StartDevice(fd, ChannelType::VIC, channel_syncpoint)
+        drop(sessions);
+        self.common.start_host1x_device(fd);
     }
 
     fn on_close(&self, fd: DeviceFD) {
-        // Stubbed: host1x.StopDevice(fd, ChannelType::VIC)
+        self.common.stop_host1x_device(fd);
         let mut sessions = self.common.sessions.lock().unwrap();
         sessions.remove(&fd);
     }

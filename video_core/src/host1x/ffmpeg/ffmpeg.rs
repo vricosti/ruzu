@@ -217,6 +217,7 @@ impl DecodeApi {
         // acceleration via HardwareContext. This requires FFmpeg C bindings
         // (avcodec_open2, av_hwdevice_ctx_create, etc.) which are not linked in
         // the current build. Returns false to indicate initialization is stubbed.
+        let _ = common::trace::emit(common::trace::cat::HOST1X_VIDEO, &[4, 1, codec as u64, 0, 0]);
         false
     }
 
@@ -236,6 +237,10 @@ impl DecodeApi {
         // Stubbed — requires FFmpeg C bindings to wrap data in AVPacket and call
         // DecoderContext::send_packet().
         // Upstream: FFmpeg::DecodeApi::SendPacket() in ffmpeg.cpp
+        let _ = common::trace::emit(
+            common::trace::cat::HOST1X_VIDEO,
+            &[4, 2, 0, 0, _packet_data.len() as u64],
+        );
         log::warn!("FFmpeg::DecodeApi::send_packet: FFmpeg bindings not available");
         false
     }
@@ -243,6 +248,7 @@ impl DecodeApi {
     pub fn receive_frame(&mut self) -> Option<Arc<Frame>> {
         // Stubbed — requires FFmpeg C bindings to call DecoderContext::receive_frame().
         // Upstream: FFmpeg::DecodeApi::ReceiveFrame() in ffmpeg.cpp
+        let _ = common::trace::emit(common::trace::cat::HOST1X_VIDEO, &[4, 3, 0, 0, 0]);
         log::warn!("FFmpeg::DecodeApi::receive_frame: FFmpeg bindings not available");
         None
     }

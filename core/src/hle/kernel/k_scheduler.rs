@@ -313,6 +313,34 @@ mod tests {
     }
 
     #[test]
+    fn update_highest_priority_threads_impl_requests_wait_for_non_runnable_dummy_current_thread() {
+        let current_thread = Arc::new(KThreadLock::new(KThread::new()));
+        {
+            let mut guard = current_thread.lock().unwrap();
+            guard.initialize_dummy_thread(None, 99, 99);
+            guard.set_state(ThreadState::WAITING);
+            guard.dummy_thread_runnable.store(true, Ordering::Relaxed);
+        }
+        crate::hle::kernel::kernel::set_current_emu_thread(Some(&current_thread));
+
+        let mut gsc = GlobalSchedulerContext::new();
+        let scheduler_arcs: Vec<_> = (0..crate::hardware_properties::NUM_CPU_CORES)
+            .map(|core_id| Mutex::new(KScheduler::new(core_id as i32)))
+            .collect();
+        let mut schedulers: Vec<_> = scheduler_arcs.iter().map(|s| s.lock().unwrap()).collect();
+
+        let _ = KScheduler::update_highest_priority_threads_impl(&mut schedulers, &mut gsc);
+
+        assert!(!current_thread
+            .lock()
+            .unwrap()
+            .dummy_thread_runnable
+            .load(Ordering::Relaxed));
+
+        crate::hle::kernel::kernel::set_current_emu_thread(None);
+    }
+
+    #[test]
     fn scan_runnable_threads_respects_core_affinity() {
         let process = Arc::new(ProcessLock::from_value(KProcess::new()));
         let scheduler = KScheduler::new(0);
@@ -1251,6 +1279,15 @@ impl KScheduler {
 
         // Wake up waiting dummy threads.
         gsc.wakeup_waiting_dummy_threads();
+
+        // Upstream hack: if the current host dummy thread became non-runnable
+        // during this scheduling update, make it block when dispatch resumes.
+        if let Some(cur_thread) = super::kernel::get_current_thread_pointer() {
+            let cur_thread = cur_thread.lock().unwrap();
+            if cur_thread.is_dummy_thread() && cur_thread.get_state() != ThreadState::RUNNABLE {
+                cur_thread.request_dummy_thread_wait();
+            }
+        }
 
         record_start_thread_sched_update(cores_needing_scheduling, top_threads);
 

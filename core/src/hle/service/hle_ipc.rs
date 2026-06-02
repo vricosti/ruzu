@@ -861,6 +861,10 @@ impl HLERequestContext {
         self.thread.clone()
     }
 
+    pub fn tls_address(&self) -> u64 {
+        self.tls_address
+    }
+
     /// Returns a mutable pointer to the IPC command buffer.
     pub fn command_buffer_mut(&mut self) -> &mut [u32; ipc::COMMAND_BUFFER_LENGTH] {
         &mut self.cmd_buf

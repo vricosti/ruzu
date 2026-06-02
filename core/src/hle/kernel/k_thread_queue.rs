@@ -107,10 +107,12 @@ impl KThreadQueue {
             // Upstream's KThreadQueueWithoutEndWait::EndWait is [[noreturn]]
             // and calls UNREACHABLE(). Hitting this in ruzu indicates a real
             // bug — a thread waiting on a sync-object (without_end_wait) queue
-            // got woken via the wrong path. Log the context (thread id, wait
-            // reason, result, caller backtrace) so we can identify the caller
-            // without aborting the whole process; clear the wait via
-            // base_end_wait so kernel state stays consistent.
+            // got woken via the wrong path. Log the context, but do NOT clear
+            // the wait: doing so resumes a thread from the wrong wait object
+            // and can make it re-enter userspace with a stale TLS reply buffer
+            // (observed in MK8D as an nvdrv "SFCO" response being parsed as a
+            // fresh request). Upstream would abort here; ruzu keeps running by
+            // preserving the original wait.
             log::error!(
                 "[KTHREAD_QUEUE_WITHOUT_END_WAIT] thread_id={} wait_result=0x{:X} state={:?} wait_reason={:?} addr_key=0x{:X}",
                 thread.get_thread_id(),
@@ -122,6 +124,7 @@ impl KThreadQueue {
             if std::env::var_os("RUZU_PANIC_ON_WITHOUT_END_WAIT").is_some() {
                 panic!("KThreadQueueWithoutEndWait::end_wait should never be called");
             }
+            return;
         }
         self.base_end_wait(thread, wait_result);
     }

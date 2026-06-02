@@ -78,6 +78,7 @@ static PRESENT_DRAW_SCREEN_US: AtomicU64 = AtomicU64::new(0);
 static PRESENT_TICK_FRAME_US: AtomicU64 = AtomicU64::new(0);
 static PRESENT_SWAP_BUFFERS_US: AtomicU64 = AtomicU64::new(0);
 static PRESENT_PPM_DUMPED: AtomicBool = AtomicBool::new(false);
+static PRESENT_PPM_CALL_COUNT: AtomicU64 = AtomicU64::new(0);
 
 fn present_profile_enabled() -> bool {
     std::env::var_os("RUZU_PROFILE_PRESENT").is_some()
@@ -101,17 +102,54 @@ fn dump_present_ppm_once(current_frame: u64, layout: &FramebufferLayout) {
     let Some(path) = std::env::var_os("RUZU_DUMP_PRESENT_PPM") else {
         return;
     };
+    let present_index = PRESENT_PPM_CALL_COUNT.fetch_add(1, Ordering::Relaxed);
+    let target_present_indices = std::env::var("RUZU_DUMP_PRESENT_PPM_INDICES")
+        .ok()
+        .map(|spec| {
+            spec.split(',')
+                .filter_map(|value| value.trim().parse::<u64>().ok())
+                .collect::<Vec<_>>()
+        });
+    let target_present_index = std::env::var("RUZU_DUMP_PRESENT_PPM_INDEX")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok());
     let target_frame = std::env::var("RUZU_DUMP_PRESENT_PPM_FRAME")
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
         .unwrap_or(0);
-    if current_frame < target_frame
-        || PRESENT_PPM_DUMPED.swap(true, Ordering::Relaxed)
-        || layout.width == 0
-        || layout.height == 0
+    let multi_index_match = target_present_indices
+        .as_ref()
+        .is_some_and(|indices| indices.contains(&present_index));
+    if target_present_indices.is_some() && !multi_index_match {
+        return;
+    }
+    if target_present_indices.is_none()
+        && (target_present_index.is_some_and(|target| present_index < target)
+            || (target_present_index.is_none() && current_frame < target_frame)
+            || PRESENT_PPM_DUMPED.swap(true, Ordering::Relaxed))
     {
         return;
     }
+    if layout.width == 0 || layout.height == 0 {
+        return;
+    }
+    let path = if multi_index_match {
+        let mut output = std::path::PathBuf::from(&path);
+        let stem = output
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .unwrap_or("present")
+            .to_string();
+        let ext = output
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .unwrap_or("ppm")
+            .to_string();
+        output.set_file_name(format!("{stem}_{present_index}.{ext}"));
+        output.into_os_string()
+    } else {
+        path
+    };
 
     unsafe {
         let width = layout.width as usize;
@@ -151,9 +189,10 @@ fn dump_present_ppm_once(current_frame: u64, layout: &FramebufferLayout) {
         }
         match std::fs::write(&path, ppm) {
             Ok(()) => info!(
-                "[PRESENT_PPM] wrote {} frame={} gl_error=0x{:X}",
+                "[PRESENT_PPM] wrote {} frame={} present_index={} gl_error=0x{:X}",
                 path.to_string_lossy(),
                 current_frame,
+                present_index,
                 gl_error
             ),
             Err(err) => log::warn!(

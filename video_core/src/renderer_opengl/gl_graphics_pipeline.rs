@@ -40,9 +40,10 @@ pub struct GraphicsPipelineKey {
     pub unique_hashes: [u64; 6],
     /// Packed bitfield: xfb_enabled(1), early_z(1), gs_input_topology(4),
     /// tessellation_primitive(2), tessellation_spacing(2), tessellation_clockwise(1),
-    /// app_stage(3).
+    /// app_stage(3), alpha_test_func(3).
     pub raw: u32,
-    pub padding: [u32; 3],
+    pub alpha_test_ref: u32,
+    pub padding: [u32; 2],
     pub xfb_state: TransformFeedbackState,
 }
 
@@ -54,6 +55,7 @@ impl GraphicsPipelineKey {
     const TESSELLATION_SPACING_SHIFT: u32 = 8;
     const TESSELLATION_CLOCKWISE_SHIFT: u32 = 10;
     const APP_STAGE_SHIFT: u32 = 11;
+    const ALPHA_TEST_FUNC_SHIFT: u32 = 14;
 
     const XFB_ENABLED_MASK: u32 = 0x1 << Self::XFB_ENABLED_SHIFT;
     const EARLY_Z_MASK: u32 = 0x1 << Self::EARLY_Z_SHIFT;
@@ -62,6 +64,7 @@ impl GraphicsPipelineKey {
     const TESSELLATION_SPACING_MASK: u32 = 0x3 << Self::TESSELLATION_SPACING_SHIFT;
     const TESSELLATION_CLOCKWISE_MASK: u32 = 0x1 << Self::TESSELLATION_CLOCKWISE_SHIFT;
     const APP_STAGE_MASK: u32 = 0x7 << Self::APP_STAGE_SHIFT;
+    const ALPHA_TEST_FUNC_MASK: u32 = 0x7 << Self::ALPHA_TEST_FUNC_SHIFT;
 
     /// Hash the key, considering only relevant bytes (smaller if xfb not enabled).
     pub fn hash_key(&self) -> u64 {
@@ -129,6 +132,15 @@ impl GraphicsPipelineKey {
     pub fn set_app_stage(&mut self, app_stage: u32) {
         self.raw =
             (self.raw & !Self::APP_STAGE_MASK) | ((app_stage & 0x7) << Self::APP_STAGE_SHIFT);
+    }
+
+    pub fn alpha_test_func(&self) -> u32 {
+        (self.raw & Self::ALPHA_TEST_FUNC_MASK) >> Self::ALPHA_TEST_FUNC_SHIFT
+    }
+
+    pub fn set_alpha_test_func(&mut self, func: u32) {
+        self.raw = (self.raw & !Self::ALPHA_TEST_FUNC_MASK)
+            | ((func & 0x7) << Self::ALPHA_TEST_FUNC_SHIFT);
     }
 
     /// Returns the effective size in bytes for hashing/comparison.
@@ -814,6 +826,19 @@ mod tests {
         key.raw = 0b11; // xfb_enabled=1, early_z=1
         assert!(key.xfb_enabled());
         assert!(key.early_z());
+    }
+
+    #[test]
+    fn pipeline_key_alpha_test_bits_are_hashed_without_xfb() {
+        let mut key = GraphicsPipelineKey::default();
+        let baseline = key.hash_key();
+
+        key.set_alpha_test_func(4);
+        key.alpha_test_ref = 0x3F00_0000;
+
+        assert_eq!(key.alpha_test_func(), 4);
+        assert_ne!(key.hash_key(), baseline);
+        assert!(key.size() >= std::mem::offset_of!(GraphicsPipelineKey, padding));
     }
 
     #[test]

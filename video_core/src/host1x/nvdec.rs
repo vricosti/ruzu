@@ -10,6 +10,7 @@ use std::sync::Arc;
 
 use log::info;
 
+use crate::cdma_pusher::ProcessMethodHook;
 use crate::host1x::codecs::decoder::{self, DecoderImpl};
 use crate::host1x::codecs::h264::H264;
 use crate::host1x::codecs::vp8::Vp8;
@@ -104,6 +105,15 @@ impl Nvdec {
         // yet wired to video_core, so this check is omitted; decoding always proceeds.
 
         if let Some(ref mut dec) = self.decoder {
+            let _ = common::trace::emit(
+                common::trace::cat::HOST1X_VIDEO,
+                &[
+                    3,
+                    self.id as u64,
+                    dec.get_current_codec() as u64,
+                    dec.state().initialized as u64,
+                ],
+            );
             match dec.get_current_codec() {
                 VideoCodec::H264 | VideoCodec::VP8 | VideoCodec::VP9 => {
                     decoder::decode(dec.as_mut(), &self.frame_queue);
@@ -119,5 +129,11 @@ impl Nvdec {
 impl Drop for Nvdec {
     fn drop(&mut self) {
         info!("Destroying nvdec {}", self.id);
+    }
+}
+
+impl ProcessMethodHook for Nvdec {
+    fn process_method(&mut self, method: u32, arg: u32) {
+        Nvdec::process_method(self, method, arg);
     }
 }

@@ -2044,7 +2044,7 @@ impl KThread {
         self.virtual_affinity_mask = 1u64 << core;
         self.physical_affinity_mask.set_affinity_mask(1u64 << core);
         self.thread_state
-            .store(ThreadState::INITIALIZED.bits(), Ordering::Relaxed);
+            .store(ThreadState::RUNNABLE.bits(), Ordering::Relaxed);
         self.suspend_allowed_flags = ThreadState::SUSPEND_FLAG_MASK.bits() as u32;
         self.suspend_request_flags = 0;
         self.parent = owner.map(Arc::downgrade);
