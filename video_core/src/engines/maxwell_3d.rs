@@ -2237,6 +2237,21 @@ impl Maxwell3D {
         self.regs[MANDATED_EARLY_Z as usize] != 0
     }
 
+    /// Upstream reads `regs.alpha_test_enabled != 0` directly.
+    pub fn alpha_test_enabled(&self) -> bool {
+        self.regs[ALPHA_TEST_ENABLED as usize] != 0
+    }
+
+    /// Upstream reads `regs.alpha_test_func` directly.
+    pub fn alpha_test_func(&self) -> ComparisonOp {
+        ComparisonOp::from_raw(self.regs[ALPHA_TEST_FUNC as usize])
+    }
+
+    /// Upstream reads `regs.alpha_test_ref` directly.
+    pub fn alpha_test_ref(&self) -> f32 {
+        f32::from_bits(self.regs[ALPHA_TEST_REF as usize])
+    }
+
     /// Upstream reads `regs.tessellation.params.domain_type.Value()`.
     pub fn tessellation_domain_type(&self) -> u32 {
         self.regs[TESSELLATION_PARAMS as usize] & 0x3
@@ -2735,6 +2750,10 @@ impl Maxwell3D {
         }
     }
 
+    pub fn blend_per_target_enabled(&self) -> bool {
+        self.regs[BLEND_PER_TARGET_ENABLED as usize] != 0
+    }
+
     // ── Depth/Stencil accessors ──────────────────────────────────────────
 
     /// Read combined depth and stencil state.
@@ -2979,11 +2998,7 @@ impl Maxwell3D {
     /// Read color write mask for render target `rt` (0..7).
     /// If COLOR_MASK_COMMON is set, all RTs share mask[0].
     pub fn color_mask_info(&self, rt: usize) -> ColorMaskInfo {
-        let effective_rt = if self.regs[COLOR_MASK_COMMON as usize] != 0 {
-            0
-        } else {
-            rt
-        };
+        let effective_rt = if self.color_mask_common() { 0 } else { rt };
         let raw = self.regs[(COLOR_MASK_BASE + effective_rt as u32) as usize];
         ColorMaskInfo {
             r: (raw & (1 << 0)) != 0,
@@ -2991,6 +3006,10 @@ impl Maxwell3D {
             b: (raw & (1 << 8)) != 0,
             a: (raw & (1 << 12)) != 0,
         }
+    }
+
+    pub fn color_mask_common(&self) -> bool {
+        self.regs[COLOR_MASK_COMMON as usize] != 0
     }
 
     // ── Render target control accessors ──────────────────────────────────
@@ -3412,6 +3431,14 @@ impl dm::Maxwell3DAccess for Maxwell3D {
         self.effective_blend_info(rt)
     }
 
+    fn blend_per_target_enabled(&self) -> bool {
+        self.blend_per_target_enabled()
+    }
+
+    fn global_blend_info(&self, rt: usize) -> BlendInfo {
+        self.global_blend_info(rt)
+    }
+
     fn blend_color_info(&self) -> BlendColorInfo {
         self.blend_color_info()
     }
@@ -3442,6 +3469,10 @@ impl dm::Maxwell3DAccess for Maxwell3D {
 
     fn color_mask_info(&self, rt: usize) -> ColorMaskInfo {
         self.color_mask_info(rt)
+    }
+
+    fn color_mask_common(&self) -> bool {
+        self.color_mask_common()
     }
 
     fn rt_control_info(&self) -> RtControlInfo {

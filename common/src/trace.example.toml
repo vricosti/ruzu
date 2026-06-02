@@ -15,6 +15,8 @@
 reply_dump = false
 # IPC_REQUEST hex-dump (was RUZU_IPC_REQUEST_DUMP=1)
 request_dump = false
+# Invalid command-buffer attribution. (was RUZU_TRACE_IPC_INVALID=1)
+invalid = false
 # Per-cmd raw-handle attribution. (was RUZU_IPC_HANDLE_OUT=1)
 handle_out = false
 # Domain-object id emission. (was RUZU_IPC_DOMAIN_OUT=1)
@@ -36,6 +38,22 @@ nvhost_ctrl_wait = false
 # Low-overhead HardwareComposer/nvdisp layer attribution. Emits acquired
 # buffer slot/frame and the final nvmap address handed to the renderer.
 hwc = false
+# Low-overhead BufferQueueProducer attribution. Emits dequeue/queue/cancel
+# stages and frame numbers. (was RUZU_TRACE_BQP_RING=1)
+bqp = false
+
+# ---- audio -----------------------------------------------------------
+[audio]
+# Low-overhead device-sink sample attribution. Emits raw i32 mix-buffer
+# min/max/nonzero counts before conversion to i16. (was
+# RUZU_TRACE_AUDIO_DEVICE_SINK=1)
+device_sink = false
+
+# ---- Host1x video ----------------------------------------------------
+[host1x]
+# Low-overhead NVDEC/VIC video pipeline attribution. Emits nvhost submit,
+# NVDEC execute, FFmpeg DecodeApi, and VIC execute stages.
+video = false
 
 # ---- OpenGL ----------------------------------------------------------
 [opengl]

@@ -1875,24 +1875,31 @@ impl IHidServer {
 
     // cmd 123: SetNpadJoyAssignmentModeSingle
     fn set_npad_joy_assignment_mode_single(
-        _this: &dyn ServiceFramework,
+        this: &dyn ServiceFramework,
         ctx: &mut HLERequestContext,
     ) {
+        let server = Self::as_self(this);
         let mut rp = RequestParser::new(ctx);
         let npad_id_raw = rp.pop_u32();
         let _padding = rp.pop_u32();
         let aruid = rp.pop_u64();
         let npad_joy_device_type_raw = rp.pop_u64();
         let npad_id: NpadIdType = unsafe { core::mem::transmute(npad_id_raw) };
-        let _npad_joy_device_type: NpadJoyDeviceType =
+        let npad_joy_device_type: NpadJoyDeviceType =
             unsafe { core::mem::transmute(npad_joy_device_type_raw as i64) };
         log::info!(
             "IHidServer::SetNpadJoyAssignmentModeSingle called, npad_id={:?}, aruid={}",
             npad_id,
             aruid
         );
-        // Upstream: GetNpad()->SetNpadMode(aruid, new_npad_id, npad_id, npad_joy_device_type, Single)
-        // NPad::SetNpadMode is not yet ported. Return success matching upstream behavior.
+        let rm = server.resource_manager.lock();
+        if let Some(ref npad) = rm.get_npad() {
+            npad.lock().set_npad_joy_assignment_mode_single(
+                aruid,
+                npad_id,
+                npad_joy_device_type,
+            );
+        }
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
     }
@@ -2130,24 +2137,34 @@ impl IHidServer {
 
     // cmd 133: SetNpadJoyAssignmentModeSingleWithDestination
     fn set_npad_joy_assignment_mode_single_with_destination(
-        _this: &dyn ServiceFramework,
+        this: &dyn ServiceFramework,
         ctx: &mut HLERequestContext,
     ) {
+        let server = Self::as_self(this);
         let mut rp = RequestParser::new(ctx);
         let npad_id_raw = rp.pop_u32();
         let _padding = rp.pop_u32();
         let aruid = rp.pop_u64();
         let npad_joy_device_type_raw = rp.pop_u64();
         let npad_id: NpadIdType = unsafe { core::mem::transmute(npad_id_raw) };
-        let _npad_joy_device_type: NpadJoyDeviceType =
+        let npad_joy_device_type: NpadJoyDeviceType =
             unsafe { core::mem::transmute(npad_joy_device_type_raw as i64) };
         log::info!("IHidServer::SetNpadJoyAssignmentModeSingleWithDestination called, npad_id={:?}, aruid={}", npad_id, aruid);
-        // Upstream: SetNpadMode -> returns (is_reassigned, new_npad_id)
-        // NPad::SetNpadMode is not yet ported. Return is_reassigned=false, new_npad_id=0.
+        let mut is_reassigned = false;
+        let mut new_npad_id = NpadIdType::default();
+        let rm = server.resource_manager.lock();
+        if let Some(ref npad) = rm.get_npad() {
+            (is_reassigned, new_npad_id) = npad.lock().set_npad_mode(
+                aruid,
+                npad_id,
+                npad_joy_device_type,
+                NpadJoyAssignmentMode::Single,
+            );
+        }
         let mut rb = ResponseBuilder::new(ctx, 4, 0, 0);
         rb.push_result(RESULT_SUCCESS);
-        rb.push_bool(false); // out_is_reassigned
-                             // Padding to 8-byte boundary for out_new_npad_id would be handled by push
+        rb.push_bool(is_reassigned);
+        rb.push_u32(new_npad_id as u32);
     }
 
     // cmd 134: SetNpadAnalogStickUseCenterClamp

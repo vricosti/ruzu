@@ -71,7 +71,7 @@ struct ContainerInner {
 /// Container manages syncpoints on the host and provides access to NvMap and SyncpointManager.
 pub struct Container {
     file: Arc<NvMap>,
-    manager: SyncpointManager,
+    manager: Arc<SyncpointManager>,
     device_file_data: Host1xDeviceFileData,
     inner: Mutex<ContainerInner>,
     system: SystemRef,
@@ -85,7 +85,7 @@ impl Container {
     pub fn new_with_system(system: SystemRef) -> Self {
         Self {
             file: Arc::new(NvMap::new_with_system(system)),
-            manager: SyncpointManager::new_with_system(system),
+            manager: Arc::new(SyncpointManager::new_with_system(system)),
             device_file_data: Host1xDeviceFileData::default(),
             inner: Mutex::new(ContainerInner {
                 sessions: Vec::new(),
@@ -303,7 +303,11 @@ impl Container {
     }
 
     pub fn get_syncpoint_manager(&self) -> &SyncpointManager {
-        &self.manager
+        self.manager.as_ref()
+    }
+
+    pub fn get_syncpoint_manager_handle(&self) -> Arc<SyncpointManager> {
+        Arc::clone(&self.manager)
     }
 
     pub fn host1x_device_file(&self) -> &Host1xDeviceFileData {

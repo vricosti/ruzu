@@ -10,12 +10,14 @@ use common::ResultCode;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::frontend::emulated_controller::get_simple_npad_button_state;
+use crate::hid_util;
 use crate::hid_result;
 use crate::hid_types::*;
 use crate::resources::applet_resource::{AppletResourceHolder, ARUID_INDEX_MAX};
 use crate::resources::npad::npad_resource::NPadResource;
 use crate::resources::npad::npad_types::*;
 use crate::resources::npad::npad_vibration::NpadVibration;
+use crate::resources::shared_memory_format::NpadInternalState;
 use crate::resources::vibration::vibration_device::NpadVibrationDevice;
 
 static NPAD_UPDATE_TRACE_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -71,7 +73,40 @@ impl NPad {
     }
 
     /// Port of NPad::Activate(u64 aruid).
-    pub fn activate_for_aruid(&mut self, _aruid: u64) -> ResultCode {
+    pub fn activate_for_aruid(&mut self, aruid: u64) -> ResultCode {
+        let Some(applet_resource) = self.applet_resource_holder.applet_resource.clone() else {
+            return ResultCode::SUCCESS;
+        };
+        let mut applet_resource = applet_resource.lock();
+
+        let aruid_index = applet_resource.get_index_from_aruid(aruid);
+        if aruid_index >= ARUID_INDEX_MAX {
+            return ResultCode::SUCCESS;
+        }
+
+        {
+            let data = applet_resource.get_aruid_data_by_index(aruid_index);
+            if !data.flag.is_assigned() {
+                return ResultCode::SUCCESS;
+            }
+        }
+
+        let Some(shared) = applet_resource.get_shared_memory_format_by_index_mut(aruid_index)
+        else {
+            return ResultCode::SUCCESS;
+        };
+
+        for entry in &mut shared.npad.npad_entry {
+            let npad = &mut entry.internal_state;
+            npad.fullkey_color.attribute = ColorAttribute::NoController;
+            npad.joycon_color.attribute = ColorAttribute::NoController;
+
+            // HW seems to initialize the first 19 entries.
+            for _ in 0..19 {
+                Self::write_empty_entry(npad);
+            }
+        }
+
         ResultCode::SUCCESS
     }
 
@@ -275,8 +310,13 @@ impl NPad {
         aruid: u64,
         supported_style_set: NpadStyleSet,
     ) -> ResultCode {
-        self.npad_resource
-            .set_supported_npad_style_set(aruid, supported_style_set)
+        let result = self
+            .npad_resource
+            .set_supported_npad_style_set(aruid, supported_style_set);
+        if result.is_success() {
+            self.on_update();
+        }
+        result
     }
 
     pub fn get_supported_npad_style_set(&self, aruid: u64) -> Result<NpadStyleSet, ResultCode> {
@@ -288,8 +328,13 @@ impl NPad {
         aruid: u64,
         supported_npad_list: &[NpadIdType],
     ) -> ResultCode {
-        self.npad_resource
-            .set_supported_npad_id_type(aruid, supported_npad_list)
+        let result = self
+            .npad_resource
+            .set_supported_npad_id_type(aruid, supported_npad_list);
+        if result.is_success() {
+            self.on_update();
+        }
+        result
     }
 
     pub fn set_npad_joy_hold_type(&mut self, aruid: u64, hold_type: NpadJoyHoldType) -> ResultCode {
@@ -305,8 +350,13 @@ impl NPad {
         aruid: u64,
         mode: NpadHandheldActivationMode,
     ) -> ResultCode {
-        self.npad_resource
-            .set_npad_handheld_activation_mode(aruid, mode)
+        let result = self
+            .npad_resource
+            .set_npad_handheld_activation_mode(aruid, mode);
+        if result.is_success() {
+            self.on_update();
+        }
+        result
     }
 
     pub fn get_npad_handheld_activation_mode(
@@ -329,18 +379,88 @@ impl NPad {
 
     pub fn set_npad_joy_assignment_mode_single_by_default(
         &mut self,
-        _aruid: u64,
-        _npad_id: NpadIdType,
+        aruid: u64,
+        npad_id: NpadIdType,
     ) -> ResultCode {
+        self.set_npad_mode(
+            aruid,
+            npad_id,
+            NpadJoyDeviceType::Left,
+            NpadJoyAssignmentMode::Single,
+        );
+        ResultCode::SUCCESS
+    }
+
+    pub fn set_npad_joy_assignment_mode_single(
+        &mut self,
+        aruid: u64,
+        npad_id: NpadIdType,
+        npad_device_type: NpadJoyDeviceType,
+    ) -> ResultCode {
+        self.set_npad_mode(
+            aruid,
+            npad_id,
+            npad_device_type,
+            NpadJoyAssignmentMode::Single,
+        );
         ResultCode::SUCCESS
     }
 
     pub fn set_npad_joy_assignment_mode_dual(
         &mut self,
-        _aruid: u64,
-        _npad_id: NpadIdType,
+        aruid: u64,
+        npad_id: NpadIdType,
     ) -> ResultCode {
+        self.set_npad_mode(
+            aruid,
+            npad_id,
+            NpadJoyDeviceType::Left,
+            NpadJoyAssignmentMode::Dual,
+        );
         ResultCode::SUCCESS
+    }
+
+    /// Partial port of upstream `NPad::SetNpadMode`.
+    ///
+    /// Upstream first validates the npad id and writes
+    /// `shared_memory->assignment_mode` before any JoyCon split/merge logic.
+    /// ruzu does not yet have upstream's `controller_data[aruid][npad]`
+    /// device model, so it cannot faithfully decide connected JoyConDual
+    /// split/reassignment state here. Keep the guest-visible assignment-mode
+    /// write, then return "not reassigned" just like upstream does for
+    /// non-JoyConDual controllers.
+    pub fn set_npad_mode(
+        &mut self,
+        aruid: u64,
+        npad_id: NpadIdType,
+        _npad_device_type: NpadJoyDeviceType,
+        assignment_mode: NpadJoyAssignmentMode,
+    ) -> (bool, NpadIdType) {
+        if !hid_util::is_npad_id_valid(npad_id) {
+            log::error!("Invalid NpadIdType npad_id:{:?}", npad_id);
+            return (false, NpadIdType::default());
+        }
+
+        let Some(applet_resource) = self.applet_resource_holder.applet_resource.clone() else {
+            return (false, NpadIdType::default());
+        };
+        let mut applet_resource = applet_resource.lock();
+        let aruid_index = applet_resource.get_index_from_aruid(aruid);
+        if aruid_index >= ARUID_INDEX_MAX {
+            return (false, NpadIdType::default());
+        }
+
+        let Some(shared) = applet_resource.get_shared_memory_format_by_index_mut(aruid_index)
+        else {
+            return (false, NpadIdType::default());
+        };
+        let npad_index = hid_util::npad_id_type_to_index(npad_id);
+        let controller = &mut shared.npad.npad_entry[npad_index].internal_state;
+        if controller.assignment_mode != assignment_mode {
+            controller.assignment_mode = assignment_mode;
+        }
+
+        (false, NpadIdType::default())
     }
 
     pub fn apply_npad_system_common_policy(&mut self, aruid: u64) -> ResultCode {
@@ -469,11 +589,170 @@ impl NPad {
     /// Requires AbstractedPad array to be stored in NPad, which is not yet wired up.
     pub fn enable_applet_to_get_input(&mut self, _aruid: u64) {}
 
+    /// Port of NPad::GetAppletDetailedUiType.
+    pub fn get_applet_detailed_ui_type(&self, npad_id: NpadIdType) -> AppletDetailedUiType {
+        let Some(applet_resource) = self.applet_resource_holder.applet_resource.clone() else {
+            return AppletDetailedUiType::default();
+        };
+        let applet_resource = applet_resource.lock();
+        let aruid = applet_resource.get_active_aruid();
+        let Some(shared) = applet_resource.get_shared_memory_format(aruid) else {
+            return AppletDetailedUiType::default();
+        };
+
+        let npad_index = hid_util::npad_id_type_to_index(npad_id);
+        let shared_memory = &shared.npad.npad_entry[npad_index].internal_state;
+        AppletDetailedUiType {
+            ui_variant: 0,
+            _padding: [0; 2],
+            footer: shared_memory.applet_footer_type,
+        }
+    }
+
+    /// Port of NPad::WriteEmptyEntry.
+    fn write_empty_entry(npad: &mut NpadInternalState) {
+        let mut dummy_pad_state = NPadGenericState::default();
+        let mut dummy_gc_state = NpadGcTriggerState::default();
+
+        dummy_pad_state.sampling_number =
+            npad.fullkey_lifo.read_current_entry().sampling_number + 1;
+        npad.fullkey_lifo.write_next_entry(dummy_pad_state);
+
+        dummy_pad_state.sampling_number =
+            npad.handheld_lifo.read_current_entry().sampling_number + 1;
+        npad.handheld_lifo.write_next_entry(dummy_pad_state);
+
+        dummy_pad_state.sampling_number =
+            npad.joy_dual_lifo.read_current_entry().sampling_number + 1;
+        npad.joy_dual_lifo.write_next_entry(dummy_pad_state);
+
+        dummy_pad_state.sampling_number =
+            npad.joy_left_lifo.read_current_entry().sampling_number + 1;
+        npad.joy_left_lifo.write_next_entry(dummy_pad_state);
+
+        dummy_pad_state.sampling_number =
+            npad.joy_right_lifo.read_current_entry().sampling_number + 1;
+        npad.joy_right_lifo.write_next_entry(dummy_pad_state);
+
+        dummy_pad_state.sampling_number =
+            npad.palma_lifo.read_current_entry().sampling_number + 1;
+        npad.palma_lifo.write_next_entry(dummy_pad_state);
+
+        dummy_pad_state.sampling_number =
+            npad.system_ext_lifo.read_current_entry().sampling_number + 1;
+        npad.system_ext_lifo.write_next_entry(dummy_pad_state);
+
+        dummy_gc_state.sampling_number =
+            npad.gc_trigger_lifo.read_current_entry().sampling_number + 1;
+        npad.gc_trigger_lifo.write_next_entry(dummy_gc_state);
+    }
+
     pub fn npad_resource(&self) -> &NPadResource {
         &self.npad_resource
     }
 
     pub fn npad_resource_mut(&mut self) -> &mut NPadResource {
         &mut self.npad_resource
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::any::Any;
+    use std::sync::Arc;
+
+    use parking_lot::Mutex;
+
+    use super::NPad;
+    use crate::hid_types::NpadIdType;
+    use crate::resources::applet_resource::{AppletResource, AppletResourceHolder};
+    use crate::resources::npad::npad_types::{
+        NpadJoyAssignmentMode, NpadJoyDeviceType,
+    };
+    use crate::resources::shared_memory_holder::KSharedMemoryBacking;
+
+    struct TestSharedMemoryBacking;
+
+    impl KSharedMemoryBacking for TestSharedMemoryBacking {
+        fn create(&self, size: usize) -> Option<(*mut u8, Arc<dyn Any + Send + Sync>)> {
+            let mut bytes = vec![0u8; size].into_boxed_slice();
+            let ptr = bytes.as_mut_ptr();
+            let keepalive: Arc<dyn Any + Send + Sync> = Arc::new(bytes);
+            Some((ptr, keepalive))
+        }
+    }
+
+    #[test]
+    fn set_npad_mode_updates_shared_assignment_mode() {
+        const ARUID: u64 = 0x51;
+
+        let mut applet_resource = AppletResource::new();
+        applet_resource.set_shared_memory_backing(Arc::new(TestSharedMemoryBacking));
+        assert!(applet_resource
+            .register_applet_resource_user_id(ARUID, true)
+            .is_success());
+        assert!(applet_resource.create_applet_resource(ARUID).is_success());
+
+        let applet_resource = Arc::new(Mutex::new(applet_resource));
+        let mut npad = NPad::new();
+        npad.set_npad_externals(AppletResourceHolder {
+            applet_resource: Some(applet_resource.clone()),
+            handheld_config: None,
+        });
+
+        let (is_reassigned, new_npad_id) = npad.set_npad_mode(
+            ARUID,
+            NpadIdType::Player1,
+            NpadJoyDeviceType::Left,
+            NpadJoyAssignmentMode::Single,
+        );
+        assert!(!is_reassigned);
+        assert_eq!(new_npad_id, NpadIdType::default());
+
+        let resource = applet_resource.lock();
+        let shared = resource.get_shared_memory_format(ARUID).unwrap();
+        assert_eq!(
+            shared.npad.npad_entry[0].internal_state.assignment_mode,
+            NpadJoyAssignmentMode::Single
+        );
+    }
+
+    #[test]
+    fn activate_for_aruid_prefills_npad_lifos_like_upstream() {
+        const ARUID: u64 = 0x51;
+
+        let mut applet_resource = AppletResource::new();
+        applet_resource.set_shared_memory_backing(Arc::new(TestSharedMemoryBacking));
+        assert!(applet_resource
+            .register_applet_resource_user_id(ARUID, true)
+            .is_success());
+        assert!(applet_resource.create_applet_resource(ARUID).is_success());
+
+        let applet_resource = Arc::new(Mutex::new(applet_resource));
+        let mut npad = NPad::new();
+        npad.set_npad_externals(AppletResourceHolder {
+            applet_resource: Some(applet_resource.clone()),
+            handheld_config: None,
+        });
+
+        assert!(npad.activate_for_aruid(ARUID).is_success());
+
+        let resource = applet_resource.lock();
+        let shared = resource.get_shared_memory_format(ARUID).unwrap();
+        let state = &shared.npad.npad_entry[0].internal_state;
+        assert_eq!(state.fullkey_lifo.buffer_count, 16);
+        assert_eq!(state.fullkey_lifo.buffer_tail, 2);
+        assert_eq!(
+            state.fullkey_lifo.read_current_entry().state.sampling_number,
+            19
+        );
+        assert_eq!(
+            state.system_ext_lifo.read_current_entry().state.sampling_number,
+            19
+        );
+        assert_eq!(
+            state.gc_trigger_lifo.read_current_entry().state.sampling_number,
+            19
+        );
     }
 }

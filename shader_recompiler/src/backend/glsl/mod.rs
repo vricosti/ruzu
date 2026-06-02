@@ -46,6 +46,9 @@ pub fn emit_glsl(
 ) -> String {
     let mut ctx = glsl_emit_context::EmitContext::new(program, bindings, profile, runtime_info);
     emit_glsl::emit_program(&mut ctx, program);
+    if matches!(ctx.stage, crate::stage::Stage::Fragment) && program.info.stores_frag_color[0] {
+        emit_glsl_special::emit_fragment_alpha_test(&mut ctx);
+    }
     let mut header = std::mem::take(&mut ctx.header);
     header.push_str("void main(){\n");
     if program.local_memory_size > 0 {

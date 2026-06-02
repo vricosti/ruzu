@@ -13,6 +13,7 @@ use std::sync::Arc;
 
 use log::info;
 
+use crate::cdma_pusher::ProcessMethodHook;
 use crate::host1x::host1x::FrameQueue;
 
 // --------------------------------------------------------------------------
@@ -550,6 +551,14 @@ impl Vic {
         // frame_queue access to dequeue decoded FFmpeg frames, and a color-conversion/
         // blending pipeline to write the output surface.
         // Upstream: Vic::Execute() in video_core/host1x/vic.cpp
+        let _ = common::trace::emit(
+            common::trace::cat::HOST1X_VIDEO,
+            &[
+                5,
+                self.id as u64,
+                (self.regs.reg_array[VIC_REG_CONFIG_STRUCT_OFFSET] as u64) << 8,
+            ],
+        );
         log::warn!(
             "Vic::execute (id={}): not yet implemented (requires memory manager and frame integration)",
             self.id
@@ -560,5 +569,11 @@ impl Vic {
 impl Drop for Vic {
     fn drop(&mut self) {
         info!("Destroying VIC {}", self.id);
+    }
+}
+
+impl ProcessMethodHook for Vic {
+    fn process_method(&mut self, method: u32, arg: u32) {
+        Vic::process_method(self, method, arg);
     }
 }

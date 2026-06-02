@@ -9,6 +9,7 @@ use crate::ir;
 use crate::ir::instruction::Inst;
 use crate::ir::opcodes::Opcode;
 use crate::ir::value::{Attribute, InstRef, Value};
+use crate::runtime_info::AttributeType;
 
 use super::glsl_emit_context::EmitContext;
 use super::var_alloc::GlslVarType;
@@ -418,6 +419,11 @@ pub fn emit_set_attribute(ctx: &mut EmitContext, attr_raw: u32, value: &str) {
 
 pub fn emit_set_frag_color(ctx: &mut EmitContext, render_target: u32, component: u32, value: &str) {
     if component < 4 {
+        let value = match ctx.runtime_info.frag_color_types[render_target as usize] {
+            AttributeType::UnsignedInt => format!("floatBitsToUint({})", value),
+            AttributeType::SignedInt => format!("floatBitsToInt({})", value),
+            _ => value.to_string(),
+        };
         ctx.add_fmt(format!(
             "frag_color{}.{}={};",
             render_target, SWIZZLE[component as usize], value
@@ -436,7 +442,7 @@ mod tests {
     use crate::ir::value::{Attribute, Value};
     use crate::ir_opt::optimize;
     use crate::profile::Profile;
-    use crate::runtime_info::RuntimeInfo;
+    use crate::runtime_info::{AttributeType, CompareFunction, RuntimeInfo};
 
     #[test]
     fn glsl_cbuf_load_defines_ssa_value_and_declares_uniform() {
@@ -540,5 +546,65 @@ mod tests {
         assert!(source.contains("=uint(gl_VertexID);"));
         assert!(!source.contains("GetAttribute(190) not fully implemented"));
         assert!(!source.contains("GetAttributeU32(191) not fully implemented"));
+    }
+
+    #[test]
+    fn glsl_set_frag_color_casts_integer_render_targets() {
+        let mut program = crate::ir::Program::new(ShaderStage::Fragment);
+        program.blocks.push(Block::new());
+        {
+            let mut emitter = Emitter::new(&mut program, 0);
+            emitter.set_frag_color(Value::ImmU32(0), Value::ImmU32(0), Value::ImmF32(1.0));
+            emitter.set_frag_color(Value::ImmU32(1), Value::ImmU32(1), Value::ImmF32(2.0));
+            emitter.set_frag_color(Value::ImmU32(2), Value::ImmU32(2), Value::ImmF32(3.0));
+        }
+        optimize(&mut program);
+
+        let mut runtime_info = RuntimeInfo::default();
+        runtime_info.frag_color_types[1] = AttributeType::UnsignedInt;
+        runtime_info.frag_color_types[2] = AttributeType::SignedInt;
+
+        let mut bindings = Bindings::default();
+        let source = emit_glsl(
+            &Profile::default(),
+            &runtime_info,
+            &mut program,
+            &mut bindings,
+        );
+
+        assert!(source.contains("frag_color0.x=1.f;"));
+        assert!(source.contains("frag_color1.y=floatBitsToUint(2.f);"));
+        assert!(source.contains("frag_color2.z=floatBitsToInt(3.f);"));
+    }
+
+    #[test]
+    fn glsl_fragment_alpha_test_discards_after_color_write() {
+        let mut program = crate::ir::Program::new(ShaderStage::Fragment);
+        program.blocks.push(Block::new());
+        {
+            let mut emitter = Emitter::new(&mut program, 0);
+            emitter.set_frag_color(Value::ImmU32(0), Value::ImmU32(3), Value::ImmF32(0.25));
+        }
+        optimize(&mut program);
+
+        let runtime_info = RuntimeInfo {
+            alpha_test_func: Some(CompareFunction::Greater),
+            alpha_test_reference: 0.5,
+            ..RuntimeInfo::default()
+        };
+
+        let mut bindings = Bindings::default();
+        let source = emit_glsl(
+            &Profile::default(),
+            &runtime_info,
+            &mut program,
+            &mut bindings,
+        );
+
+        let write_pos = source.find("frag_color0.w=0.25f;").unwrap();
+        let test_pos = source
+            .find("if(!(frag_color0.a>0.5f)){discard;}")
+            .unwrap();
+        assert!(test_pos > write_pos);
     }
 }

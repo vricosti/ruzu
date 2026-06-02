@@ -149,9 +149,9 @@ impl Module {
                 Arc::clone(&self.events_interface),
                 self.container.get_syncpoint_manager(),
             )),
-            "/dev/nvhost-nvdec" => Arc::new(NvHostNvDec::new()),
+            "/dev/nvhost-nvdec" => Arc::new(NvHostNvDec::new(self.system, &self.container)),
             "/dev/nvhost-nvjpg" => Arc::new(NvHostNvJpg::new()),
-            "/dev/nvhost-vic" => Arc::new(NvHostVic::new()),
+            "/dev/nvhost-vic" => Arc::new(NvHostVic::new(self.system, &self.container)),
             _ => {
                 log::error!("Trying to open unknown device {}", device_name);
                 return INVALID_NVDRV_FD;

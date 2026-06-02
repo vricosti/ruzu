@@ -446,6 +446,16 @@ pub trait Maxwell3DAccess {
     /// Read effective blend state for one render target.
     fn effective_blend_info(&self, rt: usize) -> crate::engines::maxwell_3d::BlendInfo;
 
+    /// Read whether blending uses per-render-target state.
+    fn blend_per_target_enabled(&self) -> bool {
+        false
+    }
+
+    /// Read global blend state used when per-target blending is disabled.
+    fn global_blend_info(&self, rt: usize) -> crate::engines::maxwell_3d::BlendInfo {
+        self.effective_blend_info(rt)
+    }
+
     /// Read blend constant color.
     fn blend_color_info(&self) -> crate::engines::maxwell_3d::BlendColorInfo;
 
@@ -473,6 +483,11 @@ pub trait Maxwell3DAccess {
 
     /// Read color write mask for one render target.
     fn color_mask_info(&self, rt: usize) -> crate::engines::maxwell_3d::ColorMaskInfo;
+
+    /// Read whether color_mask[0] is shared by all render targets.
+    fn color_mask_common(&self) -> bool {
+        false
+    }
 
     /// Read render target control info.
     fn rt_control_info(&self) -> crate::engines::maxwell_3d::RtControlInfo;
@@ -540,6 +555,8 @@ pub struct Maxwell3DDrawRegisters {
     pub scissors:
         [crate::engines::maxwell_3d::ScissorInfo; crate::engines::maxwell_3d::NUM_VIEWPORTS],
     pub blend: [crate::engines::maxwell_3d::BlendInfo; 8],
+    pub blend_per_target_enabled: bool,
+    pub global_blend: crate::engines::maxwell_3d::BlendInfo,
     pub blend_color: crate::engines::maxwell_3d::BlendColorInfo,
     pub depth_stencil: crate::engines::maxwell_3d::DepthStencilInfo,
     pub rasterizer: crate::engines::maxwell_3d::RasterizerInfo,
@@ -555,6 +572,7 @@ pub struct Maxwell3DDrawRegisters {
     pub depth_mode: crate::engines::maxwell_3d::DepthMode,
     pub dirty_flags: [bool; 256],
     pub color_masks: [crate::engines::maxwell_3d::ColorMaskInfo; 8],
+    pub color_mask_common: bool,
 }
 
 impl Default for Maxwell3DDrawRegisters {
@@ -571,6 +589,8 @@ impl Default for Maxwell3DDrawRegisters {
             vertex_attribs: Default::default(),
             scissors: Default::default(),
             blend: Default::default(),
+            blend_per_target_enabled: false,
+            global_blend: Default::default(),
             blend_color: Default::default(),
             depth_stencil: Default::default(),
             rasterizer: Default::default(),
@@ -585,6 +605,7 @@ impl Default for Maxwell3DDrawRegisters {
             depth_mode: crate::engines::maxwell_3d::DepthMode::ZeroToOne,
             dirty_flags: [false; 256],
             color_masks: Default::default(),
+            color_mask_common: false,
         }
     }
 }
@@ -610,6 +631,8 @@ impl Maxwell3DDrawRegisters {
             vertex_attribs: std::array::from_fn(|i| maxwell3d.vertex_attrib_info(i as u32)),
             scissors: std::array::from_fn(|i| maxwell3d.scissor_info(i as u32)),
             blend: std::array::from_fn(|i| maxwell3d.effective_blend_info(i)),
+            blend_per_target_enabled: maxwell3d.blend_per_target_enabled(),
+            global_blend: maxwell3d.global_blend_info(0),
             blend_color: maxwell3d.blend_color_info(),
             depth_stencil: maxwell3d.depth_stencil_info(),
             rasterizer: maxwell3d.rasterizer_info(),
@@ -635,6 +658,7 @@ impl Maxwell3DDrawRegisters {
             depth_mode: maxwell3d.depth_stencil_info().depth_mode,
             dirty_flags: maxwell3d.dirty_flags(),
             color_masks: std::array::from_fn(|i| maxwell3d.color_mask_info(i)),
+            color_mask_common: maxwell3d.color_mask_common(),
         }
     }
 }
@@ -799,6 +823,20 @@ impl<'a> Maxwell3DDrawView<'a> {
         }
     }
 
+    pub fn blend_per_target_enabled(&self) -> bool {
+        match &self.source {
+            Maxwell3DDrawSource::Live(maxwell3d) => maxwell3d.blend_per_target_enabled(),
+            Maxwell3DDrawSource::Snapshot(registers) => registers.blend_per_target_enabled,
+        }
+    }
+
+    pub fn global_blend(&self) -> crate::engines::maxwell_3d::BlendInfo {
+        match &self.source {
+            Maxwell3DDrawSource::Live(maxwell3d) => maxwell3d.global_blend_info(0),
+            Maxwell3DDrawSource::Snapshot(registers) => registers.global_blend,
+        }
+    }
+
     pub fn blend_color(&self) -> crate::engines::maxwell_3d::BlendColorInfo {
         match &self.source {
             Maxwell3DDrawSource::Live(maxwell3d) => maxwell3d.blend_color_info(),
@@ -914,6 +952,13 @@ impl<'a> Maxwell3DDrawView<'a> {
                 std::array::from_fn(|i| maxwell3d.color_mask_info(i))
             }
             Maxwell3DDrawSource::Snapshot(registers) => registers.color_masks,
+        }
+    }
+
+    pub fn color_mask_common(&self) -> bool {
+        match &self.source {
+            Maxwell3DDrawSource::Live(maxwell3d) => maxwell3d.color_mask_common(),
+            Maxwell3DDrawSource::Snapshot(registers) => registers.color_mask_common,
         }
     }
 }

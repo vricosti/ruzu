@@ -518,8 +518,6 @@ impl FspSrv {
             title_id
         );
 
-        // Diagnostic: trace each step of the romfs lookup chain so we can see
-        // which one returns None for system archives (e.g. MiiModel 0x802).
         let ctrl_guard = service.romfs_controller.lock().unwrap();
         let controller = ctrl_guard.as_ref();
         log::info!(
@@ -528,16 +526,17 @@ impl FspSrv {
             title_id,
             storage_id as u8,
         );
+        let data =
+            controller.and_then(|c| c.open_romfs(title_id, storage_id, ContentRecordType::Data));
+        log::info!(
+            "FspSrv::OpenDataStorageByDataId trace: romfs_present={}",
+            data.is_some()
+        );
         let nca =
             controller.and_then(|c| c.open_base_nca(title_id, storage_id, ContentRecordType::Data));
         log::info!(
             "FspSrv::OpenDataStorageByDataId trace: nca_present={}",
             nca.is_some()
-        );
-        let data = nca.and_then(|n| n.get_romfs());
-        log::info!(
-            "FspSrv::OpenDataStorageByDataId trace: romfs_present={}",
-            data.is_some()
         );
         drop(ctrl_guard);
 

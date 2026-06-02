@@ -15,7 +15,7 @@ use crate::host1x::host1x::FrameQueue;
 use crate::host1x::nvdec_common::{NvdecRegisters, VideoCodec};
 
 /// Trait matching the virtual methods of the upstream `Tegra::Decoder` class.
-pub trait DecoderImpl {
+pub trait DecoderImpl: Send {
     /// Compose the frame bitstream for FFmpeg decoding.
     fn compose_frame(&mut self) -> Vec<u8>;
 
