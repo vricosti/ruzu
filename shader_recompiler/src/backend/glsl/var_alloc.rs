@@ -9,6 +9,7 @@ use std::fmt;
 
 use crate::ir;
 use crate::ir::instruction::Inst;
+use crate::ir::program::SyntaxNode;
 use crate::ir::types::Type;
 use crate::ir::value::{InstRef, Value};
 
@@ -442,7 +443,19 @@ impl Default for VarAlloc {
 }
 
 fn inst_recursive(program: &ir::Program, mut inst_ref: InstRef) -> InstRef {
+    let original = inst_ref;
     loop {
+        if program
+            .block(inst_ref.block)
+            .instructions
+            .get(inst_ref.inst as usize)
+            .is_none_or(|inst| inst.is_none())
+        {
+            panic!(
+                "accessed erased instruction slot while chasing Identity chain: original={}:{} current={}:{}",
+                original.block, original.inst, inst_ref.block, inst_ref.inst
+            );
+        }
         let inst = program.block(inst_ref.block).inst(inst_ref.inst);
         if inst.opcode != ir::opcodes::Opcode::Identity || inst.args.is_empty() {
             return inst_ref;
@@ -454,8 +467,64 @@ fn inst_recursive(program: &ir::Program, mut inst_ref: InstRef) -> InstRef {
     }
 }
 
+fn refs_to_value(program: &ir::Program, target: InstRef) -> Vec<String> {
+    let mut refs = Vec::new();
+    let target_value = Value::Inst(target);
+    for (block_index, block) in program.blocks.iter().enumerate() {
+        for (inst_index, inst) in block.indexed_iter() {
+            for (arg_index, arg) in inst.args.iter().enumerate() {
+                if *arg == target_value {
+                    refs.push(format!(
+                        "inst %{}:{} arg{} opcode={}",
+                        block_index,
+                        inst_index,
+                        arg_index,
+                        inst.opcode.name()
+                    ));
+                }
+            }
+            for (pred_index, value) in &inst.phi_args {
+                if *value == target_value {
+                    refs.push(format!(
+                        "inst %{}:{} phi_pred{} opcode={}",
+                        block_index,
+                        inst_index,
+                        pred_index,
+                        inst.opcode.name()
+                    ));
+                }
+            }
+        }
+    }
+    for (node_index, node) in program.syntax_list.iter().enumerate() {
+        let cond = match node {
+            SyntaxNode::If { cond, .. }
+            | SyntaxNode::Repeat { cond, .. }
+            | SyntaxNode::Break { cond, .. } => Some(cond),
+            _ => None,
+        };
+        if cond.is_some_and(|cond| *cond == target_value) {
+            refs.push(format!("syntax node{} {:?}", node_index, node));
+        }
+    }
+    refs
+}
+
 fn resolve_identity_value(program: &ir::Program, mut value: Value) -> Value {
+    let original = value;
     while let Value::Inst(inst_ref) = value {
+        if program
+            .block(inst_ref.block)
+            .instructions
+            .get(inst_ref.inst as usize)
+            .is_none_or(|inst| inst.is_none())
+        {
+            let refs = refs_to_value(program, inst_ref);
+            panic!(
+                "accessed erased instruction slot while resolving GLSL value: original={:?} current={}:{} refs={:?}",
+                original, inst_ref.block, inst_ref.inst, refs
+            );
+        }
         let inst = program.block(inst_ref.block).inst(inst_ref.inst);
         if inst.opcode != ir::opcodes::Opcode::Identity || inst.args.is_empty() {
             return value;

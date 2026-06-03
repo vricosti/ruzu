@@ -540,7 +540,19 @@ pub unsafe fn notify_waiters_on_state(
     }
     let mut woke_any = false;
     for thread in waiters {
+        if common::trace::is_enabled(common::trace::cat::HOST_THREAD_IPC) {
+            common::trace::emit_raw(
+                common::trace::cat::HOST_THREAD_IPC,
+                &[33, signaled_object_id],
+            );
+        }
         let mut guard = thread.lock().unwrap();
+        if common::trace::is_enabled(common::trace::cat::HOST_THREAD_IPC) {
+            common::trace::emit_raw(
+                common::trace::cat::HOST_THREAD_IPC,
+                &[34, signaled_object_id],
+            );
+        }
         if guard.notify_available(signaled_object_id, result) {
             woke_any = true;
         }

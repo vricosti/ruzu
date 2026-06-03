@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use log::error;
-use ruzu_core::host1x_core::Host1xCoreInterface;
+use ruzu_core::host1x_core::{Host1xChannelType, Host1xCoreInterface};
 
 use crate::host1x::ffmpeg::ffmpeg::Frame;
 use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
@@ -222,24 +222,36 @@ impl Host1x {
 
     /// Start a device (NvDec, VIC, etc.) on the given file descriptor.
     ///
-    /// Port of `Host1x::StartDevice`. Constructs a `CDmaPusher` for the channel
-    /// (with a `NullProcessor` subclass hook for now — Nvdec/Vic concrete
-    /// processors will be plugged in once their device emulation lands)
-    /// and stores it in `devices` keyed by fd.
-    pub fn start_device(&self, fd: i32, channel_type: ChannelType, _syncpt: u32) {
-        use crate::cdma_pusher::{CDmaPusher, ChClassId};
-        let class_id = match channel_type {
+    /// Port of `Host1x::StartDevice`. Constructs the concrete Host1x device
+    /// processor and stores its `CDmaPusher` in `devices` keyed by fd.
+    pub fn start_device(&self, fd: i32, channel_type: ChannelType, syncpt: u32) {
+        use crate::cdma_pusher::{CDmaPusher, ChClassId, ProcessMethodHook};
+        let (class_id, processor): (ChClassId, Box<dyn ProcessMethodHook>) = match channel_type {
             ChannelType::NvDec => {
-                // Upstream stores Nvdec(this, fd, syncpt, frame_queue); the CDmaPusher
-                // base class reads the class_id arg. NvDec class is 0xF0.
                 self.frame_queue.open(fd);
-                ChClassId::NvDec
+                (
+                    ChClassId::NvDec,
+                    Box::new(crate::host1x::nvdec::Nvdec::new(
+                        fd,
+                        syncpt,
+                        Arc::clone(&self.frame_queue),
+                        Arc::clone(&self.memory_manager),
+                    )),
+                )
             }
-            ChannelType::Vic => {
-                // Upstream Vic(this, fd, syncpt, frame_queue); class 0x5D.
-                ChClassId::GraphicsVic
-            }
-            ChannelType::NvJpg => ChClassId::NvJpg,
+            ChannelType::Vic => (
+                ChClassId::GraphicsVic,
+                Box::new(crate::host1x::vic::Vic::new(
+                    fd,
+                    syncpt,
+                    Arc::clone(&self.frame_queue),
+                    Arc::clone(&self.memory_manager),
+                )),
+            ),
+            ChannelType::NvJpg => (
+                ChClassId::NvJpg,
+                Box::new(crate::cdma_pusher::NullProcessor),
+            ),
             _ => {
                 error!(
                     "Unimplemented host1x device {:?} ({})",
@@ -248,9 +260,10 @@ impl Host1x {
                 return;
             }
         };
-        let pusher = Arc::new(CDmaPusher::new(
+        let pusher = Arc::new(CDmaPusher::new_with_processor(
             self.syncpoint_manager.clone(),
             class_id as i32,
+            processor,
         ));
         self.devices.lock().unwrap().insert(fd, pusher);
         log::info!("Started {:?} device fd={}", channel_type, fd);
@@ -338,5 +351,37 @@ impl Host1xCoreInterface for Host1x {
             .smmu_get_host_ptr(d_address)
             .map(|p| p as usize)
             .unwrap_or(0)
+    }
+
+    fn start_device(&self, fd: i32, channel_type: Host1xChannelType, syncpt: u32) {
+        let channel_type = match channel_type {
+            Host1xChannelType::MsEnc => ChannelType::MsEnc,
+            Host1xChannelType::Vic => ChannelType::Vic,
+            Host1xChannelType::Gpu => ChannelType::Gpu,
+            Host1xChannelType::NvDec => ChannelType::NvDec,
+            Host1xChannelType::Display => ChannelType::Display,
+            Host1xChannelType::NvJpg => ChannelType::NvJpg,
+            Host1xChannelType::TSec => ChannelType::TSec,
+            Host1xChannelType::Max => ChannelType::Max,
+        };
+        Host1x::start_device(self, fd, channel_type, syncpt);
+    }
+
+    fn stop_device(&self, fd: i32, channel_type: Host1xChannelType) {
+        let channel_type = match channel_type {
+            Host1xChannelType::MsEnc => ChannelType::MsEnc,
+            Host1xChannelType::Vic => ChannelType::Vic,
+            Host1xChannelType::Gpu => ChannelType::Gpu,
+            Host1xChannelType::NvDec => ChannelType::NvDec,
+            Host1xChannelType::Display => ChannelType::Display,
+            Host1xChannelType::NvJpg => ChannelType::NvJpg,
+            Host1xChannelType::TSec => ChannelType::TSec,
+            Host1xChannelType::Max => ChannelType::Max,
+        };
+        Host1x::stop_device(self, fd, channel_type);
+    }
+
+    fn push_entries(&self, fd: i32, entries: Vec<u32>) {
+        Host1x::push_entries(self, fd, entries);
     }
 }

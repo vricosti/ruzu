@@ -85,6 +85,7 @@ bitflags! {
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub struct KMemoryState: u32 {
         const NONE = 0;
+        const ALL = u32::MAX;
         const MASK = 0xFF;
 
         const FLAG_CAN_REPROTECT             = 1 << 8;

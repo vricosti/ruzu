@@ -10,7 +10,7 @@
 //! - HLERequestContext: in-flight IPC request context
 
 use std::cell::RefCell;
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use crate::hle::ipc;
 
@@ -21,6 +21,16 @@ use crate::hle::ipc;
 thread_local! {
     pub(crate) static IPC_TRACE_CURRENT: RefCell<(String, u32, u32)> =
         RefCell::new((String::new(), 0, 0));
+}
+
+fn ipc_trace_ring_limit() -> usize {
+    static LIMIT: OnceLock<usize> = OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        std::env::var("RUZU_TRACE_IPC_RING_LIMIT")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(4000)
+    })
 }
 use crate::hle::kernel::k_readable_event::KReadableEvent;
 use crate::hle::kernel::k_thread::KThreadLock;
@@ -86,6 +96,19 @@ pub type SessionRequestHandlerPtr = Arc<dyn SessionRequestHandler>;
 pub type SessionRequestHandlerWeakPtr = Weak<dyn SessionRequestHandler>;
 pub type SessionRequestHandlerFactory = Box<dyn Fn() -> SessionRequestHandlerPtr + Send + Sync>;
 
+/// One queued session-registration request. Pushed by external handlers and
+/// drained by the owning `ServerManager`'s host thread at the start of each
+/// `wait_and_process_impl` iteration. Lets `sm.rs` / `sm_controller.rs` /
+/// `ipc_helpers.rs::push_ipc_interface` register new sessions without locking
+/// `Mutex<ServerManager>` — which is held for the lifetime of `loop_process`
+/// by the host thread itself, so external `lock()` would deadlock.
+pub type PendingRegistration = (
+    Arc<Mutex<crate::hle::kernel::k_server_session::KServerSession>>,
+    Arc<Mutex<SessionRequestManager>>,
+);
+
+pub type PendingRegistrationQueue = Arc<Mutex<Vec<PendingRegistration>>>;
+
 /// Manages the underlying HLE requests for a session, and whether (or not) the session should be
 /// treated as a domain. This is managed separately from server sessions, as this state is shared
 /// when objects are cloned.
@@ -100,6 +123,16 @@ pub struct SessionRequestManager {
     /// Reference to the owning ServerManager.
     /// Matches upstream: `Service::ServerManager& server_manager`.
     server_manager: Option<Arc<Mutex<super::server_manager::ServerManager>>>,
+    /// Cloned Arc to the ServerManager's pending-registration queue. Lets
+    /// handlers register new sessions without locking `Mutex<ServerManager>`
+    /// (which would deadlock — the host thread holds it for `loop_process`'s
+    /// lifetime). Cascades through `push_ipc_interface` / `clone_current_object`
+    /// so child SessionRequestManagers see the same queue as their parent.
+    pending_registrations: Option<PendingRegistrationQueue>,
+    /// Cloned Arc to the ServerManager's wakeup_event. Signaled after
+    /// pushing to `pending_registrations` so the host thread reacts in µs
+    /// instead of its 100 ms idle timeout.
+    server_wakeup: Option<Arc<super::os::event::Event>>,
 }
 
 #[derive(Clone)]
@@ -119,11 +152,20 @@ impl SessionRequestManager {
             session_handler: None,
             domain_handlers: Vec::new(),
             server_manager: None,
+            pending_registrations: None,
+            server_wakeup: None,
         }
     }
 
     /// Create with a ServerManager reference, matching upstream constructor:
     /// `SessionRequestManager(KernelCore& kernel, ServerManager& server_manager)`.
+    ///
+    /// This variant does NOT attempt to extract the pending-registration queue
+    /// from `server_manager` — that would require locking `Mutex<ServerManager>`,
+    /// which deadlocks if the host thread is in `loop_process`. Callers that
+    /// also have access to the parent SessionRequestManager (the common path
+    /// for nested IPC interfaces) should prefer `new_with_server_manager_full`
+    /// which propagates the queue and wakeup from the parent.
     pub fn new_with_server_manager(
         server_manager: Arc<Mutex<super::server_manager::ServerManager>>,
     ) -> Self {
@@ -134,7 +176,67 @@ impl SessionRequestManager {
             session_handler: None,
             domain_handlers: Vec::new(),
             server_manager: Some(server_manager),
+            pending_registrations: None,
+            server_wakeup: None,
         }
+    }
+
+    /// Create with full ServerManager wiring: the manager Arc plus pre-extracted
+    /// `pending_registrations` queue and `wakeup_event`. Callers extract these
+    /// once (either while already holding a lock, or directly from `&mut self`
+    /// inside `ServerManager`) and pass them in, avoiding a second
+    /// `Mutex<ServerManager>` lock.
+    pub fn new_with_server_manager_full(
+        server_manager: Arc<Mutex<super::server_manager::ServerManager>>,
+        pending_registrations: PendingRegistrationQueue,
+        wakeup: Arc<super::os::event::Event>,
+    ) -> Self {
+        Self {
+            convert_to_domain: false,
+            is_domain: false,
+            is_initialized_for_sm: false,
+            session_handler: None,
+            domain_handlers: Vec::new(),
+            server_manager: Some(server_manager),
+            pending_registrations: Some(pending_registrations),
+            server_wakeup: Some(wakeup),
+        }
+    }
+
+    /// Create with only the owning ServerManager's registration endpoints.
+    ///
+    /// Used during the short window where a service port has been published
+    /// but `KernelCore::run_server` has not yet installed the final
+    /// ServerManager weak reference. The queue+wakeup pair is sufficient for
+    /// host-thread IPC routing and is overwritten with the full manager wiring
+    /// once ownership is republished.
+    pub fn new_with_registration_queue(
+        pending_registrations: PendingRegistrationQueue,
+        wakeup: Arc<super::os::event::Event>,
+    ) -> Self {
+        Self {
+            convert_to_domain: false,
+            is_domain: false,
+            is_initialized_for_sm: false,
+            session_handler: None,
+            domain_handlers: Vec::new(),
+            server_manager: None,
+            pending_registrations: Some(pending_registrations),
+            server_wakeup: Some(wakeup),
+        }
+    }
+
+    /// Get the pending-registration queue for this session's owning
+    /// ServerManager. Used by handlers that need to register a freshly-created
+    /// session (push_ipc_interface, clone_current_object, sm::GetService)
+    /// without locking `Mutex<ServerManager>`.
+    pub fn pending_registrations(&self) -> Option<&PendingRegistrationQueue> {
+        self.pending_registrations.as_ref()
+    }
+
+    /// Get the wakeup_event of this session's owning ServerManager.
+    pub fn server_wakeup(&self) -> Option<&Arc<super::os::event::Event>> {
+        self.server_wakeup.as_ref()
     }
 
     /// Get the ServerManager reference. Matches upstream `GetServerManager()`.
@@ -522,8 +624,49 @@ pub fn complete_sync_request(
             IPC_TRACE_CURRENT.with(|c| {
                 *c.borrow_mut() = (handler.service_name().to_string(), context.get_command(), 0);
             });
+            // Snapshot the request words so we can emit IPC_REQUEST after the
+            // handler runs (handler will overwrite cmd_buf with the reply).
+            // Only paid when the IPC_REQUEST category is enabled.
+            let req_words = if common::trace::is_enabled(common::trace::cat::IPC_REQUEST) {
+                let n = ipc::COMMAND_BUFFER_LENGTH.min(16);
+                let mut buf = [0u32; 16];
+                buf[..n].copy_from_slice(&context.cmd_buf[..n]);
+                Some(buf)
+            } else {
+                None
+            };
             let handler_t0 = p_after_prepare.map(|_| std::time::Instant::now());
             let result = handler.handle_sync_request(context);
+            if let Some(buf) = req_words {
+                use std::sync::atomic::{AtomicUsize, Ordering};
+                static REQ_SEQ: AtomicUsize = AtomicUsize::new(0);
+                let seq = REQ_SEQ.fetch_add(1, Ordering::Relaxed);
+                if seq < ipc_trace_ring_limit() {
+                    let (svc, cmd, ioctl) =
+                        IPC_TRACE_CURRENT.with(|c| c.borrow().clone());
+                    let svc_str = if svc.is_empty() { "?" } else { svc.as_str() };
+                    let svc_id = common::trace::intern_service(svc_str);
+                    let tid = context
+                        .thread
+                        .as_ref()
+                        .map(|t| t.lock().unwrap().get_thread_id())
+                        .unwrap_or(0);
+                    let mut args: [u64; 14] = [0; 14];
+                    args[0] = seq as u64;
+                    args[1] = svc_id as u64;
+                    args[2] = cmd as u64;
+                    args[3] = ioctl as u64;
+                    args[4] = tid;
+                    const PAYLOAD_WORDS: usize = 9; // 14 - 5 fixed
+                    for i in 0..PAYLOAD_WORDS {
+                        args[5 + i] = buf[i] as u64;
+                    }
+                    common::trace::emit_raw(
+                        common::trace::cat::IPC_REQUEST,
+                        &args[..5 + PAYLOAD_WORDS],
+                    );
+                }
+            }
             if let Some(t0) = handler_t0 {
                 let elapsed = t0.elapsed();
                 crate::hle::kernel::svc::svc_ipc::record_ipc_phase(
@@ -724,6 +867,10 @@ impl HLERequestContext {
         self.thread.clone()
     }
 
+    pub fn tls_address(&self) -> u64 {
+        self.tls_address
+    }
+
     /// Returns a mutable pointer to the IPC command buffer.
     pub fn command_buffer_mut(&mut self) -> &mut [u32; ipc::COMMAND_BUFFER_LENGTH] {
         &mut self.cmd_buf
@@ -871,7 +1018,36 @@ impl HLERequestContext {
         &mut self,
         handler: SessionRequestHandlerPtr,
     ) -> Option<Handle> {
-        let manager = Arc::new(std::sync::Mutex::new(SessionRequestManager::new()));
+        // Inherit ServerManager + pending-registration queue + wakeup_event
+        // from the parent's SessionRequestManager, matching upstream
+        // `PushIpcInterface` / `CloneCurrentObject` semantics:
+        //   auto next_manager = make_shared<SessionRequestManager>(
+        //       kernel, manager->GetServerManager());
+        // Propagating the queue + wakeup along with the ServerManager Arc
+        // lets descendant sessions register themselves without locking
+        // `Mutex<ServerManager>` (which would deadlock against the host
+        // thread's `loop_process`).
+        let (parent_server_manager, parent_queue, parent_wakeup) = self
+            .manager
+            .as_ref()
+            .map(|m| {
+                let guard = m.lock().unwrap();
+                (
+                    guard.get_server_manager().cloned(),
+                    guard.pending_registrations().cloned(),
+                    guard.server_wakeup().cloned(),
+                )
+            })
+            .unwrap_or((None, None, None));
+        let manager = match (parent_server_manager, parent_queue, parent_wakeup) {
+            (Some(sm), Some(q), Some(w)) => Arc::new(std::sync::Mutex::new(
+                SessionRequestManager::new_with_server_manager_full(sm, q, w),
+            )),
+            (Some(sm), _, _) => Arc::new(std::sync::Mutex::new(
+                SessionRequestManager::new_with_server_manager(sm),
+            )),
+            _ => Arc::new(std::sync::Mutex::new(SessionRequestManager::new())),
+        };
         manager.lock().unwrap().set_session_handler(handler);
         self.create_session_with_manager(manager)
     }
@@ -1299,8 +1475,21 @@ impl HLERequestContext {
         if data.is_empty() || address == 0 {
             return;
         }
+        if !self.guest_range_is_user_writable(address, data.len()) {
+            log::error!(
+                "write_guest_memory: output buffer is not user-writable addr={:#x} size={:#x}",
+                address,
+                data.len()
+            );
+            return;
+        }
         if let Some(ref memory) = self.memory {
-            memory.lock().unwrap().write_block_no_rasterizer(address, data);
+            let memory = memory.lock().unwrap();
+            if data.len() >= 0x10000 {
+                memory.write_block_no_rasterizer_checked(address, data);
+            } else {
+                memory.write_block_no_rasterizer(address, data);
+            }
         } else {
             log::error!(
                 "write_guest_memory: no Memory available for addr={:#x} size={:#x}",
@@ -1308,6 +1497,48 @@ impl HLERequestContext {
                 data.len()
             );
         }
+    }
+
+    fn guest_range_is_user_writable(&self, address: u64, size: usize) -> bool {
+        if size == 0 {
+            return true;
+        }
+        let Some(thread) = self.thread.as_ref() else {
+            return true;
+        };
+        let Some(parent) = ({
+            let guard = thread.lock().unwrap();
+            guard.parent.as_ref().and_then(|parent| parent.upgrade())
+        }) else {
+            return true;
+        };
+
+        let start = address as usize;
+        let Some(end) = start.checked_add(size) else {
+            return false;
+        };
+        let process = parent.lock().unwrap();
+        let mut cur = start;
+        while cur < end {
+            let Some(info) = process.page_table.query_info(cur) else {
+                return false;
+            };
+            if !info
+                .m_permission
+                .contains(crate::hle::kernel::k_memory_block::KMemoryPermission::USER_WRITE)
+                || info
+                    .m_permission
+                    .contains(crate::hle::kernel::k_memory_block::KMemoryPermission::NOT_MAPPED)
+            {
+                return false;
+            }
+            let block_end = info.m_address.saturating_add(info.m_size);
+            if block_end <= cur {
+                return false;
+            }
+            cur = block_end.min(end);
+        }
+        true
     }
 
     /// Populates this context from the thread's TLS command buffer.
@@ -1638,15 +1869,20 @@ impl HLERequestContext {
                             // domain_offset is the offset PAST the raw data
                             // section, so a non-domain client reads the value
                             // as the move/copy handle slot.
-                            if std::env::var_os("RUZU_IPC_DOMAIN_OUT").is_some() {
+                            if common::trace::is_enabled(common::trace::cat::IPC_DOMAIN_OUT) {
                                 let (svc, cmd, _ioctl) =
                                     IPC_TRACE_CURRENT.with(|c| c.borrow().clone());
-                                eprintln!(
-                                    "[IPC_DOMAIN_OUT] service={} cmd={} offset={} domain_object_id={} (libnx will read this as a handle if client thinks session is non-domain)",
-                                    if svc.is_empty() { "?" } else { svc.as_str() },
-                                    cmd,
-                                    current_offset,
-                                    count
+                                let svc_str =
+                                    if svc.is_empty() { "?" } else { svc.as_str() };
+                                let svc_id = common::trace::intern_service(svc_str);
+                                common::trace::emit_raw(
+                                    common::trace::cat::IPC_DOMAIN_OUT,
+                                    &[
+                                        svc_id as u64,
+                                        cmd as u64,
+                                        current_offset as u64,
+                                        count as u64,
+                                    ],
                                 );
                             }
                         } else {
@@ -1665,41 +1901,28 @@ impl HLERequestContext {
         // Matches upstream: memory.WriteBlock(thread->GetTlsAddress(), cmd_buf.data(), write_size * sizeof(u32))
         let write_words = (self.write_size as usize).min(ipc::COMMAND_BUFFER_LENGTH);
 
-        // Temporary investigation hook: bounded hex-dump of IPC reply buffer so ruzu/zuyu
-        // traces can be diffed to find the first divergent IPC response. Enabled via
-        // RUZU_IPC_REPLY_DUMP env var. Bounded to first 4000 replies.
-        if std::env::var_os("RUZU_IPC_REPLY_DUMP").is_some() {
+        // IPC reply hex-dump routed through the non-blocking trace ring. Cap is
+        // configurable so long-run investigations can include late IPC traffic.
+        if common::trace::is_enabled(common::trace::cat::IPC_REPLY) {
             use std::sync::atomic::{AtomicUsize, Ordering};
             static SEQ: AtomicUsize = AtomicUsize::new(0);
             let seq = SEQ.fetch_add(1, Ordering::Relaxed);
-            if seq < 4000 {
-                let n = write_words.min(16);
-                let mut hex = String::with_capacity(n * 9);
-                for i in 0..n {
-                    use std::fmt::Write;
-                    let _ = write!(hex, "{:08x} ", self.cmd_buf[i]);
-                }
+            if seq < ipc_trace_ring_limit() {
                 let (svc, cmd, ioctl) = IPC_TRACE_CURRENT.with(|c| c.borrow().clone());
-                if ioctl != 0 {
-                    log::warn!(
-                        "IPC_REPLY seq={} service={} cmd={} ioctl=0x{:08X} words={} payload={}",
-                        seq,
-                        if svc.is_empty() { "?" } else { svc.as_str() },
-                        cmd,
-                        ioctl,
-                        write_words,
-                        hex.trim_end(),
-                    );
-                } else {
-                    log::warn!(
-                        "IPC_REPLY seq={} service={} cmd={} words={} payload={}",
-                        seq,
-                        if svc.is_empty() { "?" } else { svc.as_str() },
-                        cmd,
-                        write_words,
-                        hex.trim_end(),
-                    );
+                let svc_str = if svc.is_empty() { "?" } else { svc.as_str() };
+                let svc_id = common::trace::intern_service(svc_str);
+                let n = write_words.min(9); // 14 - 5 fixed args = 9 payload words
+                let mut args: [u64; 14] = [0; 14];
+                args[0] = seq as u64;
+                args[1] = svc_id as u64;
+                args[2] = cmd as u64;
+                args[3] = ioctl as u64;
+                args[4] = write_words as u64;
+                for i in 0..n {
+                    args[5 + i] = self.cmd_buf[i] as u64;
                 }
+                let used = 5 + n;
+                common::trace::emit_raw(common::trace::cat::IPC_REPLY, &args[..used]);
             }
         }
 
@@ -1727,18 +1950,24 @@ impl HLERequestContext {
             // next SendSyncRequest. Surfacing all raw-handle outputs lets us
             // see which service pushed a bad value (or whether the bug is
             // elsewhere — e.g. domain object ID or raw payload mis-parsed).
-            if std::env::var_os("RUZU_IPC_HANDLE_OUT").is_some() {
+            if common::trace::is_enabled(common::trace::cat::IPC_HANDLE_OUT) {
                 let valid = self
                     .owner_process_arc()
                     .map(|p| p.lock().unwrap().handle_table.is_valid_handle(handle))
                     .unwrap_or(false);
                 let (svc, cmd, _ioctl) = IPC_TRACE_CURRENT.with(|c| c.borrow().clone());
-                eprintln!(
-                    "[IPC_HANDLE_OUT] kind=raw service={} cmd={} handle=0x{:08X} client_valid={}",
-                    if svc.is_empty() { "?" } else { svc.as_str() },
-                    cmd,
-                    handle,
-                    valid
+                let svc_str = if svc.is_empty() { "?" } else { svc.as_str() };
+                let svc_id = common::trace::intern_service(svc_str);
+                common::trace::emit_raw(
+                    common::trace::cat::IPC_HANDLE_OUT,
+                    &[
+                        svc_id as u64,
+                        cmd as u64,
+                        handle as u64,
+                        valid as u64,
+                        0, // kind = raw
+                        0,
+                    ],
                 );
             }
             return Some(handle);
@@ -1754,14 +1983,24 @@ impl HLERequestContext {
             return None;
         }
         let result = process.handle_table.add(object_id).ok();
-        if std::env::var_os("RUZU_IPC_HANDLE_OUT").is_some() {
+        if common::trace::is_enabled(common::trace::cat::IPC_HANDLE_OUT) {
             let (svc, cmd, _ioctl) = IPC_TRACE_CURRENT.with(|c| c.borrow().clone());
-            eprintln!(
-                "[IPC_HANDLE_OUT] kind=add service={} cmd={} object_id=0x{:X} new_handle={:?}",
-                if svc.is_empty() { "?" } else { svc.as_str() },
-                cmd,
-                object_id,
-                result.map(|h| format!("0x{:08X}", h))
+            let svc_str = if svc.is_empty() { "?" } else { svc.as_str() };
+            let svc_id = common::trace::intern_service(svc_str);
+            let (new_handle, present) = match result {
+                Some(h) => (h as u64, 1u64),
+                None => (0u64, 0u64),
+            };
+            common::trace::emit_raw(
+                common::trace::cat::IPC_HANDLE_OUT,
+                &[
+                    svc_id as u64,
+                    cmd as u64,
+                    object_id,
+                    new_handle,
+                    1, // kind = add
+                    present,
+                ],
             );
         }
         result

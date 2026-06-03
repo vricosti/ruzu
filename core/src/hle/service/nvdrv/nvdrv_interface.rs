@@ -109,6 +109,10 @@ impl NvdrvInterface {
         Arc::clone(&self.nvdrv)
     }
 
+    pub fn is_initialized(&self) -> bool {
+        self.is_initialized
+    }
+
     /// Port of NVDRV::Open
     pub fn open(&mut self, device_name: &str) -> (DeviceFD, NvResult) {
         if Self::should_trace_lifecycle() {
@@ -525,6 +529,10 @@ impl NvdrvService {
         rb.push_u32(nv_result as u32);
     }
 
+    fn service_error(ctx: &mut HLERequestContext, nv_result: NvResult) {
+        Self::push_nv_result(ctx, nv_result);
+    }
+
     fn open_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         let service = unsafe { &*(this as *const dyn ServiceFramework as *const NvdrvService) };
         if Self::should_trace_lifecycle() {
@@ -534,6 +542,12 @@ impl NvdrvService {
                 service.name
             );
         }
+        if !service.interface.lock().unwrap().is_initialized() {
+            Self::service_error(ctx, NvResult::NotInitialized);
+            log::error!("NvServices is not initialized!");
+            return;
+        }
+
         let device_name_bytes = ctx.read_buffer(0);
         let end = device_name_bytes
             .iter()
@@ -561,6 +575,17 @@ impl NvdrvService {
         let mut rp = RequestParser::new(ctx);
         let fd = rp.pop_i32();
         let command = rp.pop_raw::<Ioctl>();
+        super::super::hle_ipc::IPC_TRACE_CURRENT.with(|c| {
+            let mut slot = c.borrow_mut();
+            slot.2 = command.raw;
+        });
+
+        if !service.interface.lock().unwrap().is_initialized() {
+            Self::service_error(ctx, NvResult::NotInitialized);
+            log::error!("NvServices is not initialized!");
+            return;
+        }
+
         let input = ctx.read_buffer(0);
         let write_size = ctx.get_write_buffer_size(0);
         let mut output = vec![0; write_size];
@@ -591,10 +616,6 @@ impl NvdrvService {
         }
         // Stash the ioctl number into IPC_TRACE_CURRENT so the IPC_REPLY hex-dump
         // can attribute this reply to the specific nvdrv ioctl (not just "cmd=1").
-        super::super::hle_ipc::IPC_TRACE_CURRENT.with(|c| {
-            let mut slot = c.borrow_mut();
-            slot.2 = command.raw;
-        });
         let _ioctl_t0 = if nvdrv_ioctl_profile_enabled() {
             Some(std::time::Instant::now())
         } else {
@@ -717,6 +738,17 @@ impl NvdrvService {
         let mut rp = RequestParser::new(ctx);
         let fd = rp.pop_i32();
         let command = rp.pop_raw::<Ioctl>();
+        super::super::hle_ipc::IPC_TRACE_CURRENT.with(|c| {
+            let mut slot = c.borrow_mut();
+            slot.2 = command.raw;
+        });
+
+        if !service.interface.lock().unwrap().is_initialized() {
+            Self::service_error(ctx, NvResult::NotInitialized);
+            log::error!("NvServices is not initialized!");
+            return;
+        }
+
         let input = ctx.read_buffer(0);
         let inline_input = ctx.read_buffer(1);
         let mut output = vec![0; ctx.get_write_buffer_size(0)];
@@ -728,10 +760,6 @@ impl NvdrvService {
             inline_input.len(),
             output.len()
         );
-        super::super::hle_ipc::IPC_TRACE_CURRENT.with(|c| {
-            let mut slot = c.borrow_mut();
-            slot.2 = command.raw;
-        });
         let _ioctl_t0 = if nvdrv_ioctl_profile_enabled() {
             Some(std::time::Instant::now())
         } else {
@@ -771,6 +799,17 @@ impl NvdrvService {
         let mut rp = RequestParser::new(ctx);
         let fd = rp.pop_i32();
         let command = rp.pop_raw::<Ioctl>();
+        super::super::hle_ipc::IPC_TRACE_CURRENT.with(|c| {
+            let mut slot = c.borrow_mut();
+            slot.2 = command.raw;
+        });
+
+        if !service.interface.lock().unwrap().is_initialized() {
+            Self::service_error(ctx, NvResult::NotInitialized);
+            log::error!("NvServices is not initialized!");
+            return;
+        }
+
         let input = ctx.read_buffer(0);
         let mut output = vec![0; ctx.get_write_buffer_size(0)];
         let mut inline_output = vec![0; ctx.get_write_buffer_size(1)];
@@ -782,10 +821,6 @@ impl NvdrvService {
             output.len(),
             inline_output.len()
         );
-        super::super::hle_ipc::IPC_TRACE_CURRENT.with(|c| {
-            let mut slot = c.borrow_mut();
-            slot.2 = command.raw;
-        });
         let _ioctl_t0 = if nvdrv_ioctl_profile_enabled() {
             Some(std::time::Instant::now())
         } else {
@@ -823,6 +858,12 @@ impl NvdrvService {
                 service.name
             );
         }
+        if !service.interface.lock().unwrap().is_initialized() {
+            Self::service_error(ctx, NvResult::NotInitialized);
+            log::error!("NvServices is not initialized!");
+            return;
+        }
+
         let mut rp = RequestParser::new(ctx);
         let fd = rp.pop_i32();
         let nv_result = service.interface.lock().unwrap().close(fd);

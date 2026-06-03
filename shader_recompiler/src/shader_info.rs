@@ -38,6 +38,26 @@ pub enum TextureType {
 /// Number of texture types.
 pub const NUM_TEXTURE_TYPES: u32 = 9;
 
+impl TextureType {
+    /// Decode the 3-bit `texture_type` field of `TextureInstInfo`. Values
+    /// > 8 are clamped to `Color2D` (the safest default), matching upstream's
+    /// behaviour when a malformed shader produces an out-of-range field.
+    pub fn from_u8(v: u8) -> Self {
+        match v {
+            0 => TextureType::Color1D,
+            1 => TextureType::ColorArray1D,
+            2 => TextureType::Color2D,
+            3 => TextureType::ColorArray2D,
+            4 => TextureType::Color3D,
+            5 => TextureType::ColorCube,
+            6 => TextureType::ColorArrayCube,
+            7 => TextureType::Buffer,
+            8 => TextureType::Color2DRect,
+            _ => TextureType::Color2D,
+        }
+    }
+}
+
 /// Texture pixel format.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u32)]

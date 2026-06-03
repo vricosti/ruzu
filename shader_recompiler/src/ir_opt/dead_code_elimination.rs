@@ -9,6 +9,7 @@
 //! removed if it has no uses (`use_count == 0`) and may not have side effects.
 
 use crate::ir::program::Program;
+use crate::ir::program::SyntaxNode;
 use crate::ir::value::Value;
 
 /// Remove dead (unused, side-effect-free) instructions.
@@ -59,23 +60,20 @@ fn recompute_use_counts(program: &mut Program) {
     for block in &program.blocks {
         for inst in block.iter() {
             for arg in &inst.args {
-                if let Value::Inst(r) = arg {
-                    if let Some(block_counts) = use_counts.get_mut(r.block as usize) {
-                        if let Some(count) = block_counts.get_mut(r.inst as usize) {
-                            *count += 1;
-                        }
-                    }
-                }
+                count_value_use(&mut use_counts, arg);
             }
             for (_, arg) in &inst.phi_args {
-                if let Value::Inst(r) = arg {
-                    if let Some(block_counts) = use_counts.get_mut(r.block as usize) {
-                        if let Some(count) = block_counts.get_mut(r.inst as usize) {
-                            *count += 1;
-                        }
-                    }
-                }
+                count_value_use(&mut use_counts, arg);
             }
+        }
+    }
+
+    for node in &program.syntax_list {
+        match node {
+            SyntaxNode::If { cond, .. }
+            | SyntaxNode::Repeat { cond, .. }
+            | SyntaxNode::Break { cond, .. } => count_value_use(&mut use_counts, cond),
+            _ => {}
         }
     }
 
@@ -91,13 +89,23 @@ fn recompute_use_counts(program: &mut Program) {
     }
 }
 
+fn count_value_use(use_counts: &mut [Vec<u32>], value: &Value) {
+    if let Value::Inst(r) = value {
+        if let Some(block_counts) = use_counts.get_mut(r.block as usize) {
+            if let Some(count) = block_counts.get_mut(r.inst as usize) {
+                *count += 1;
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::dead_code_elimination_pass;
     use crate::ir::basic_block::Block;
     use crate::ir::instruction::Inst;
     use crate::ir::opcodes::Opcode;
-    use crate::ir::program::Program;
+    use crate::ir::program::{Program, SyntaxNode};
     use crate::ir::types::ShaderStage;
     use crate::ir::value::{InstRef, Value};
 
@@ -160,5 +168,25 @@ mod tests {
 
         assert_eq!(program.blocks[0].inst(0).opcode, Opcode::IAdd32);
         assert_eq!(program.blocks[0].inst(1).opcode, Opcode::Phi);
+    }
+
+    #[test]
+    fn dce_counts_syntax_conditions_as_uses() {
+        let mut program = Program::new(ShaderStage::VertexB);
+        program.blocks.push(Block::new());
+        let cond = program.blocks[0]
+            .append_inst(Inst::new(Opcode::ConditionRef, vec![Value::ImmU1(true)]));
+        program.syntax_list.push(SyntaxNode::If {
+            cond: Value::Inst(InstRef {
+                block: 0,
+                inst: cond,
+            }),
+            body: 0,
+            merge: 0,
+        });
+
+        dead_code_elimination_pass(&mut program);
+
+        assert_eq!(program.blocks[0].inst(cond).opcode, Opcode::ConditionRef);
     }
 }

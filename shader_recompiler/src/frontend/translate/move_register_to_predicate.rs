@@ -16,9 +16,8 @@ fn r2p_impl(tv: &mut TranslatorVisitor, insn: u64, mask: Value, src: Value) {
     let byte_selector = field(insn, 41, 2);
 
     if mode != 0 {
-        // CC mode requires condition-code flag IR — not yet ported.
-        log::warn!("R2P: CC mode not yet implemented (insn={:#018x})", insn);
-        return;
+        // Upstream throws NotImplementedException for R2P.CC.
+        panic!("R2P: CC mode not implemented");
     }
 
     let count = Value::ImmU32(1);

@@ -15,7 +15,7 @@
 //! - ResultNotRegistered (ErrorModule::SM, 7)
 
 use std::collections::{BTreeMap, HashMap};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 
 use crate::core::SystemRef;
 use crate::hle::kernel::k_event::KEvent;
@@ -56,6 +56,17 @@ pub const RESULT_NOT_REGISTERED: ResultCode =
 /// Upstream constructor: `ServiceManager::ServiceManager(Kernel::KernelCore& kernel_)`.
 /// Upstream stores: `kernel`, `controller_interface`, `registered_services`,
 /// `service_ports`, `deferral_event`.
+/// Endpoint Arcs published by a ServerManager when it registers a named
+/// service. Used by `svc_port::connect_to_named_port` to wire the new
+/// session's SessionRequestManager so descendants can register sessions via
+/// the queue (without locking `Mutex<ServerManager>`).
+#[derive(Clone)]
+pub struct ServiceOwnership {
+    pub queue: crate::hle::service::hle_ipc::PendingRegistrationQueue,
+    pub wakeup: Arc<crate::hle::service::os::event::Event>,
+    pub server_manager: Weak<Mutex<crate::hle::service::server_manager::ServerManager>>,
+}
+
 pub struct ServiceManager {
     controller_interface: Arc<Controller>,
 
@@ -69,6 +80,13 @@ pub struct ServiceManager {
     /// but the `KPort` owns both endpoints. We store the whole `KPort` wrapped
     /// in `Arc<Mutex<>>` so the caller can access both client and server sides.
     service_ports: HashMap<String, Arc<Mutex<KPort>>>,
+
+    /// Map of service name → owning ServerManager's endpoints. Published by
+    /// `ServerManager::register_named_service` / `manage_named_port` so
+    /// `svc_port::connect_to_named_port` can wire the new session's
+    /// SessionRequestManager with the pending-registration queue + wakeup
+    /// event of the service's host thread.
+    service_owners: HashMap<String, ServiceOwnership>,
 
     /// Deferral event for service registration.
     /// Upstream: `Kernel::KEvent* deferral_event{}`.
@@ -85,8 +103,22 @@ impl ServiceManager {
             controller_interface: Arc::new(Controller::new()),
             registered_services: HashMap::new(),
             service_ports: HashMap::new(),
+            service_owners: HashMap::new(),
             deferral_event: None,
         }
+    }
+
+    /// Publish the ServerManager endpoints for a service name. Called when
+    /// `ServerManager::register_named_service` / `manage_named_port` registers
+    /// a service so future `connect_to_named_port` calls can wire the new
+    /// session's SessionRequestManager with the queue + wakeup.
+    pub fn set_service_ownership(&mut self, name: &str, ownership: ServiceOwnership) {
+        self.service_owners.insert(name.to_string(), ownership);
+    }
+
+    /// Look up the ServerManager endpoints for a registered service name.
+    pub fn get_service_ownership(&self, name: &str) -> Option<&ServiceOwnership> {
+        self.service_owners.get(name)
     }
 
     /// Invokes a control request on the controller interface.
@@ -313,10 +345,10 @@ impl Sm {
     }
 
     fn signal_deferral_event(&self, event: &Arc<Mutex<KEvent>>) {
-        let Some((process, scheduler)) = self.current_process_and_scheduler() else {
+        let Some((process, _scheduler)) = self.current_process_and_scheduler() else {
             return;
         };
-        KEvent::signal_arc(event, &process, &scheduler);
+        KEvent::signal_arc(event, &process);
     }
 
     /// Creates a new SM service.
@@ -483,14 +515,65 @@ impl Sm {
         let name = Self::pop_service_name(&mut rp);
         log::info!("  GetService: looking up \"{}\"", name);
 
-        let (port, handler, parent_server_manager) = {
+        let (port, handler, parent_server_manager, parent_queue, parent_wakeup) = {
             let sm = self.service_manager.lock().unwrap();
             let port_result = sm.get_service_port(&name);
             let handler = sm.get_service(&name);
-            let parent_server_manager = ctx
-                .get_manager()
-                .and_then(|manager| manager.lock().unwrap().get_server_manager().cloned());
-            (port_result, handler, parent_server_manager)
+            // Use the TARGET service's owning ServerManager — not the caller's.
+            // Upstream routes the new session via the target port's
+            // `on_port_event`, which constructs the SessionRequestManager
+            // with the target ServerManager's reference. Ruzu shortcuts that
+            // here, but we still need to wire the SessionRequestManager to
+            // the right host thread; otherwise notify_available signals the
+            // wrong wakeup_event and the new session's IPCs would never be
+            // processed.
+            let target = sm.get_service_ownership(&name).cloned();
+            if std::env::var_os("RUZU_TRACE_SM_OWNERSHIP").is_some() {
+                let state = target
+                    .as_ref()
+                    .map(|t| {
+                        if t.server_manager.upgrade().is_some() {
+                            "full"
+                        } else {
+                            "queue_only"
+                        }
+                    })
+                    .unwrap_or("missing");
+                let queue = target
+                    .as_ref()
+                    .map(|t| Arc::as_ptr(&t.queue) as usize)
+                    .unwrap_or(0);
+                let wakeup = target
+                    .as_ref()
+                    .map(|t| Arc::as_ptr(&t.wakeup) as usize)
+                    .unwrap_or(0);
+                eprintln!(
+                    "[SM_OWNERSHIP] service={name} state={state} queue=0x{queue:X} wakeup=0x{wakeup:X}"
+                );
+            }
+            let (parent_server_manager, parent_queue, parent_wakeup) = match target {
+                Some(t) => (t.server_manager.upgrade(), Some(t.queue), Some(t.wakeup)),
+                // Fallback: inherit the caller's chain (preserves pre-fix
+                // behavior for any service that doesn't publish ownership).
+                None => ctx
+                    .get_manager()
+                    .map(|m| {
+                        let guard = m.lock().unwrap();
+                        (
+                            guard.get_server_manager().cloned(),
+                            guard.pending_registrations().cloned(),
+                            guard.server_wakeup().cloned(),
+                        )
+                    })
+                    .unwrap_or((None, None, None)),
+            };
+            (
+                port_result,
+                handler,
+                parent_server_manager,
+                parent_queue,
+                parent_wakeup,
+            )
         };
 
         match port {
@@ -555,14 +638,27 @@ impl Sm {
                 };
 
                 if let Some(handler) = handler {
-                    let manager = if let Some(parent_server_manager) = parent_server_manager {
-                        Arc::new(Mutex::new(
-                            crate::hle::service::hle_ipc::SessionRequestManager::new_with_server_manager(
-                                parent_server_manager,
+                    let manager = match (
+                        parent_server_manager,
+                        parent_queue.clone(),
+                        parent_wakeup.clone(),
+                    ) {
+                        (Some(sm_arc), Some(q), Some(w)) => Arc::new(Mutex::new(
+                            crate::hle::service::hle_ipc::SessionRequestManager::new_with_server_manager_full(
+                                sm_arc, q, w,
                             ),
-                        ))
-                    } else {
-                        Arc::new(Mutex::new(
+                        )),
+                        (Some(sm_arc), _, _) => Arc::new(Mutex::new(
+                            crate::hle::service::hle_ipc::SessionRequestManager::new_with_server_manager(
+                                sm_arc,
+                            ),
+                        )),
+                        (_, Some(q), Some(w)) => Arc::new(Mutex::new(
+                            crate::hle::service::hle_ipc::SessionRequestManager::new_with_registration_queue(
+                                q, w,
+                            ),
+                        )),
+                        _ => Arc::new(Mutex::new(
                             crate::hle::service::hle_ipc::SessionRequestManager::new(),
                         ))
                     };
@@ -578,14 +674,17 @@ impl Sm {
                     }
                     server_session.lock().unwrap().set_manager(manager.clone());
 
-                    if let Some(parent_server_manager) = ctx
-                        .get_manager()
-                        .and_then(|manager| manager.lock().unwrap().get_server_manager().cloned())
-                    {
-                        let _ = parent_server_manager
-                            .lock()
-                            .unwrap()
-                            .register_session(server_session, manager);
+                    // Register via the parent's ServerManager pending-
+                    // registration queue rather than locking
+                    // `Mutex<ServerManager>` directly — the parent's host
+                    // thread holds it for its loop_process lifetime, so a
+                    // direct lock would deadlock. The host thread drains the
+                    // queue at the start of each wait_and_process_impl.
+                    if let Some(queue) = parent_queue {
+                        queue.lock().unwrap().push((server_session, manager));
+                        if let Some(wakeup) = parent_wakeup {
+                            wakeup.signal();
+                        }
                     }
                 }
 

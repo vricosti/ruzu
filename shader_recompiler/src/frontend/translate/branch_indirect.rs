@@ -7,19 +7,17 @@ use super::TranslatorVisitor;
 
 /// Check the instruction for unsupported modes (cbuf_mode and LMT).
 ///
-/// Upstream throws `NotImplementedException` for both flags; we emit a warning instead.
+/// Upstream throws `NotImplementedException` for both flags; we panic
+/// to match.
 fn check(insn: u64) {
     let cbuf_mode = (insn >> 5) & 1 != 0;
     let lmt = (insn >> 6) & 1 != 0;
 
     if cbuf_mode {
-        log::warn!(
-            "BRX/JMX: constant buffer mode not implemented (insn={:#018x})",
-            insn
-        );
+        panic!("BRX/JMX: constant buffer mode not implemented");
     }
     if lmt {
-        log::warn!("BRX/JMX: LMT not implemented (insn={:#018x})", insn);
+        panic!("BRX/JMX: LMT not implemented");
     }
 }
 

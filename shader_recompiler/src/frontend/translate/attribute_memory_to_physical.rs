@@ -16,13 +16,13 @@ pub fn al2p(tv: &mut TranslatorVisitor, insn: u64) {
     let result_reg = field(insn, 0, 8);
     let indexing_reg = field(insn, 8, 8);
     let offset = sfield(insn, 20, 11) as i32;
-    // bitsize field at [47:48]: 0 = B32, others not yet implemented.
+    // bitsize field at [47:48]: 0 = B32. Upstream throws
+    // NotImplementedException for non-B32 sizes.
     let bitsize = field(insn, 47, 2);
     if bitsize != 0 {
-        log::warn!(
-            "AL2P: BitSize {} not B32 — approximating (insn={:#018x})",
-            bitsize,
-            insn
+        panic!(
+            "AL2P: BitSize {} not implemented (only B32 supported)",
+            bitsize
         );
     }
 

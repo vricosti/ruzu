@@ -1,0 +1,178 @@
+# Sample trace configuration.
+#
+# Place at one of:
+#   $RUZU_TRACE_CONFIG  (env var pointing to any path)
+#   $XDG_CONFIG_HOME/ruzu/trace.toml
+#   ~/.config/ruzu/trace.toml
+#
+# Each toggle maps to a pilot site wired through `common::trace`.
+# Legacy env vars (`RUZU_IPC_REPLY_DUMP`, `RUZU_TRACE_GPU_VA`, ...) keep
+# working as a fallback when this file is absent.
+
+# ---- IPC traces ------------------------------------------------------
+[ipc]
+# IPC_REPLY hex-dump (was RUZU_IPC_REPLY_DUMP=1)
+reply_dump = false
+# IPC_REQUEST hex-dump (was RUZU_IPC_REQUEST_DUMP=1)
+request_dump = false
+# Invalid command-buffer attribution. (was RUZU_TRACE_IPC_INVALID=1)
+invalid = false
+# Per-cmd raw-handle attribution. (was RUZU_IPC_HANDLE_OUT=1)
+handle_out = false
+# Domain-object id emission. (was RUZU_IPC_DOMAIN_OUT=1)
+domain_out = false
+# Host-thread IPC routing stage trace. (was RUZU_TRACE_HOST_THREAD_IPC=1)
+host_thread_ipc = false
+# Fresh pl:u session IPC diagnostic. (was RUZU_TRACE_PLU_IPC=1)
+plu_ipc = false
+# SendSyncRequest stage attribution. Use
+# RUZU_TRACE_SVC_IPC_PROGRESS_HANDLE=0x701F3 and/or
+# RUZU_TRACE_SVC_IPC_PROGRESS_TID=78 to keep late-game traces small.
+svc_progress = false
+
+# ---- nvdrv -----------------------------------------------------------
+[nvdrv]
+# nvhost_as_gpu MapBufferEx / UnmapBuffer trace (was RUZU_TRACE_GPU_VA=1)
+gpu_va_trace = false
+# nvhost_ctrl::IocCtrlEventWait trace (was RUZU_TRACE_NVHOST_CTRL_WAIT=1)
+nvhost_ctrl_wait = false
+# nvhost_gpu::SubmitGpfifo syncpoint attribution.
+submit_gpfifo = false
+
+# ---- GPU thread ------------------------------------------------------
+[gpu]
+# GPU-thread submit queue attribution. Emits push/pop/dispatch records for
+# SubmitList commands.
+thread = false
+# DmaPusher dispatch/step attribution. Emits command-list header boundaries to
+# locate submits that enter DispatchCalls but never return.
+dma_pusher = false
+
+# ---- nvnflinger ------------------------------------------------------
+[nvnflinger]
+# Low-overhead HardwareComposer/nvdisp layer attribution. Emits acquired
+# buffer slot/frame and the final nvmap address handed to the renderer.
+# Empty acquire polls are sampled by default; set
+# RUZU_TRACE_HWC_ACQUIRE_SPAM=1 to emit every failed acquire.
+hwc = false
+# Low-overhead BufferQueueProducer attribution. Emits dequeue/queue/cancel
+# stages and frame numbers. (was RUZU_TRACE_BQP_RING=1)
+bqp = false
+
+# ---- audio -----------------------------------------------------------
+[audio]
+# Low-overhead device-sink sample attribution. Emits raw i32 mix-buffer
+# min/max/nonzero counts before conversion to i16. (was
+# RUZU_TRACE_AUDIO_DEVICE_SINK=1)
+device_sink = false
+# Low-overhead voice-command generation summary. Emits counts for active voices,
+# data-source commands, skipped voices, and valid/nonzero wavebuffer addresses.
+voice = false
+
+# ---- Host1x video ----------------------------------------------------
+[host1x]
+# Low-overhead NVDEC/VIC video pipeline attribution. Emits nvhost submit,
+# NVDEC execute, FFmpeg DecodeApi, and VIC execute stages.
+video = false
+# Host1x guest/host syncpoint register/increment/wait attribution.
+syncpoint = false
+
+# ---- OpenGL ----------------------------------------------------------
+[opengl]
+# Low-overhead sampled texture binding attribution. Emits shader descriptor
+# type, image-view type, GL handle and two RGBA8 texture samples.
+texture_bind = false
+# Low-overhead graphics constant-buffer binding attribution. Emits guest GPU
+# address, resolved CPU address and first four f32 words for each used cbuf.
+cbuf_bind = false
+# Low-overhead render-target binding attribution per draw. Emits FBO, pipeline,
+# RT map and the first two Maxwell color render-target addresses/formats.
+rt_bind = false
+# Low-overhead FBO depth/zeta attachment attribution. Emits one record when a
+# render-target FBO is created with a depth/stencil attachment.
+rt_depth_attach = false
+# Low-overhead per-draw zeta snapshot attribution. Use
+# RUZU_TRACE_RT_ZETA_BIND_PIPELINE=4,20,21 to restrict to specific GL pipelines.
+rt_zeta_bind = false
+# Filtered render-target readback. Also set RUZU_TRACE_RT_SAMPLE_ADDRS to a
+# comma-separated GPU address list, or "*" to sample every RT0. Use
+# RUZU_TRACE_RT_SAMPLE_TIME_START_MS/END_MS to limit late-game readbacks.
+rt_sample = false
+# Texture binding address attribution. Emits image/view id and guest GPU
+# address for bound sampled textures, without doing additional GL readback.
+# Use RUZU_TRACE_TEXTURE_BIND_ADDRS=0x... to restrict this to specific
+# guest GPU image addresses.
+texture_bind_addr = false
+# Filtered OpenGL draw-state attribution. Use RUZU_TRACE_DRAW_STATE_PIPELINE
+# to restrict this to one program pipeline, e.g. 28 for the MK8D p28 pass.
+draw_state = false
+# Texture-cache image/view lifecycle attribution. Use
+# RUZU_TRACE_IMAGE_VIEW_ADDRS=0x... to restrict this to specific guest GPU
+# addresses.
+image_view = false
+    # Low-overhead draw phase timing for slow draws. Use
+    # RUZU_TRACE_GL_DRAW_PROFILE_MIN_US to raise/lower the default 500us threshold.
+    draw_profile = false
+# Present-time texture readback by guest GPU address. Use together with
+# RUZU_DUMP_PRESENT_EXTRA_GPU_ADDRS and optionally
+# RUZU_TRACE_PRESENT_TEXTURE_START/END to target a present-index window.
+present_texture = false
+# Present-time comparison between an image's current texture and materialized
+# GL texture views. Use with RUZU_DUMP_PRESENT_EXTRA_GPU_ADDRS.
+present_alias = false
+# Low-overhead texture-cache metadata for the framebuffer image selected by
+# AccelerateDisplay. No GL readback; useful around black-present transitions.
+present_image_select = false
+# Synchronous texture upload diagnostics are controlled by
+# RUZU_TRACE_TEXTURE_UPLOAD=1. Use RUZU_TRACE_TEXTURE_UPLOAD_ADDRS=0x...
+# to keep the diagnostic focused on one or more guest GPU addresses.
+
+# ---- kernel SVC ------------------------------------------------------
+[svc]
+# SetHeapSize trace (was RUZU_TRACE_HEAP=1)
+heap_trace = false
+# Per-tid SVC tracer. (was RUZU_TRACE_TID_SVC=N or RUZU_TRACE_TID_SVC=*)
+# When true, traces ALL tids. To filter to specific ones, ALSO set the
+# legacy env var RUZU_TRACE_TID_SVC=75,86 (comma-separated tid list).
+tid_svc = false
+# Include guest PC/LR in TID_SVC records. (was RUZU_TRACE_TID_SVC_PC=1)
+tid_svc_pc = false
+# WaitSynchronization object attribution. Emits handle, object_id, object kind
+# and pre-wait signaled state through the trace ring.
+wait_sync = false
+
+# ---- scheduler ------------------------------------------------------
+[scheduler]
+# Low-overhead scheduler state/PQ updates through common::trace.
+# Use legacy RUZU_TRACE_SCHED_STATE=104,105 to filter specific guest tids.
+# Also emits scheduler selection/switch decisions when enabled.
+state = false
+
+# ---- dynarmic JIT instrumentation -----------------------------------
+[jit]
+# WATCH_READ / WATCH_WRITE memory watchpoints.
+# Setting this to true is not sufficient on its own — you also need to
+# set RUZU_WATCH_ADDR=0xADDR or RUZU_WATCH_PC=0xLO-0xHI for the JIT
+# callback to fire. The toggle gates the trace_ring emission.
+watch_read_write = false
+# STLEX (exclusive store) attempt tracing. (was guarded by RUZU_WATCH_PC)
+stlex = false
+# Unmapped guest-write attribution. (was RUZU_TRACE_UNMAPPED_WRITE=1)
+unmapped_write = false
+# BL_HIT scan summary. (was RUZU_FIND_BL=0xTARGET:...)
+bl_hit = false
+
+# ---- output ----------------------------------------------------------
+[output]
+# "stderr" (default) or "file"
+target = "stderr"
+# Path when target = "file". Ignored otherwise.
+file_path = ""
+# Per-thread ring capacity. 16384 records * 128 B = 2 MiB per emitter thread.
+ring_capacity = 16384
+# Drain thread idle wakeup. Lower = lower latency, higher CPU.
+drain_interval_us = 1000
+# If true, producers spin while ring is full instead of dropping.
+# Default: false. Set to true for "no-loss" debugging at the cost of
+# perturbing the producer thread.
+lossless = false

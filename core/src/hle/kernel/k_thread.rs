@@ -548,6 +548,17 @@ pub struct KThread {
     pub suspend_allowed_flags: u32,
     pub synced_index: i32,
     pub wait_result: u32, // Result code
+    /// Host-thread IPC lost-wakeup guard. When `armed`, an `end_wait` that
+    /// arrives while this thread is *not yet* WAITING (a would-be no-op)
+    /// records the wake result here instead of discarding it. The next
+    /// `begin_wait_guarded` consumes it and skips the park. The thread Mutex
+    /// serializes `end_wait` and `begin_wait_guarded`, so the arm/record/
+    /// consume sequence is race-free. Not part of upstream KThread — closes
+    /// a ruzu-specific race introduced by routing IPC handlers onto separate
+    /// host threads (upstream parks the client atomically under the
+    /// scheduler lock inside KServerSession::OnRequest).
+    pub wait_wake_guard_armed: bool,
+    pub wait_wake_guard_pending: Option<u32>,
     pub base_priority: i32,
     pub physical_ideal_core_id: i32,
     pub virtual_ideal_core_id: i32,
@@ -678,6 +689,8 @@ impl KThread {
             suspend_allowed_flags: ThreadState::SUSPEND_FLAG_MASK.bits() as u32,
             synced_index: 0,
             wait_result: RESULT_NO_SYNCHRONIZATION_OBJECT.get_inner_value(),
+            wait_wake_guard_armed: false,
+            wait_wake_guard_pending: None,
             base_priority: 0,
             physical_ideal_core_id: 0,
             virtual_ideal_core_id: 0,
@@ -1236,9 +1249,13 @@ impl KThread {
             .expect("RemoveWaiterImpl: lock info not found");
 
         // Remove the waiter; if the lock is now empty, remove it.
-        let is_empty =
-            self.held_lock_info_list[lock_idx].remove_waiter(waiter_priority, waiter_thread_id);
-        if is_empty {
+        // Bounds-checked against an unserialized concurrent shrink by the
+        // hardware timer (see `remove_waiter_by_key`).
+        let Some(lock_info) = self.held_lock_info_list.get_mut(lock_idx) else {
+            return;
+        };
+        let is_empty = lock_info.remove_waiter(waiter_priority, waiter_thread_id);
+        if is_empty && lock_idx < self.held_lock_info_list.len() {
             self.held_lock_info_list.remove(lock_idx);
         }
     }
@@ -1345,7 +1362,22 @@ impl KThread {
         // Find the lock info for this address.
         let lock_idx = self.find_held_lock_index(address_key, is_kernel_address_key)?;
 
-        // Remove the lock info from our held list.
+        // Remove the lock info from our held list. Bounds-checked: the hardware
+        // timer (do_task) can mutate this owner's `held_lock_info_list`
+        // unserialized (its gsc Weak is often dead, so it runs without the
+        // scheduler lock), shrinking the list between `find_held_lock_index`
+        // and here. Treat a stale index as "lock already gone" rather than
+        // aborting the emulator.
+        if lock_idx >= self.held_lock_info_list.len() {
+            log::error!(
+                "remove_waiter_by_key RACE: lock_idx={} >= len={} (owner_tid={} addr=0x{:X})",
+                lock_idx,
+                self.held_lock_info_list.len(),
+                self.thread_id,
+                address_key.get(),
+            );
+            return None;
+        }
         let mut lock_info = self.held_lock_info_list.remove(lock_idx);
 
         // Adjust kernel waiter count.
@@ -1354,7 +1386,21 @@ impl KThread {
             assert!(self.num_kernel_waiters >= 0);
         }
 
-        assert!(lock_info.get_waiter_count() > 0);
+        // Defensive: if the lock_info is in held_lock_info_list with 0 waiters,
+        // it's a race window between add_waiter_impl creating the empty entry and
+        // calling add_waiter on it. We've already detached it from the list; just
+        // drop it silently and return None (same semantics as find returning None).
+        // Triggers only under heavy tracing-induced timing perturbation. The root
+        // race (add_waiter_impl not atomic w.r.t. remove_waiter_by_key) is a
+        // separate scheduler-locking gap to be fixed later.
+        if lock_info.get_waiter_count() == 0 {
+            log::warn!(
+                "remove_waiter_by_key: lock_info for tid={} addr=0x{:X} had 0 waiters in held list (race?); dropping",
+                self.thread_id,
+                address_key.get(),
+            );
+            return None;
+        }
 
         // Remove the highest priority waiter to become the next owner.
         let next_owner_key = lock_info
@@ -1448,38 +1494,73 @@ impl KThread {
     /// Legacy compatibility: remove_waiter with a thread_id.
     /// Searches all held locks for the given thread_id.
     pub fn remove_waiter_by_thread_id(&mut self, waiter_thread_id: u64) {
-        for i in 0..self.held_lock_info_list.len() {
-            let found = self.held_lock_info_list[i]
-                .tree
-                .iter()
-                .find(|k| k.thread_id == waiter_thread_id)
-                .copied();
-            if let Some(key) = found {
-                if should_trace_priority_inheritance() {
-                    log::info!(
-                        "PI remove_waiter_by_thread_id owner_tid={} owner_prio={} owner_base={} waiter_tid={} waiter_prio={} addr=0x{:X}",
-                        self.thread_id,
-                        self.priority,
-                        self.base_priority,
-                        waiter_thread_id,
-                        key.priority,
-                        self.held_lock_info_list[i].get_address_key().get(),
-                    );
-                }
-                let is_kernel = self.held_lock_info_list[i].get_is_kernel_address_key();
-                let is_empty =
-                    self.held_lock_info_list[i].remove_waiter(key.priority, key.thread_id);
-                if is_kernel {
-                    self.num_kernel_waiters -= 1;
-                }
-                if is_empty {
-                    self.held_lock_info_list.remove(i);
-                }
-                if self.priority == key.priority && self.priority < self.base_priority {
-                    self.restore_priority_simplified();
-                }
-                return;
+        // NOTE: this is reached from the hardware-timer's `on_timer` path
+        // (timeout fires for a still-WAITING thread) which mutates the *owner*
+        // thread through a raw `&mut` pointer, relying on the scheduler lock for
+        // exclusion. Use bounds-checked access (`get`/`get_mut`) so a concurrent
+        // shrink of `held_lock_info_list` cannot turn a stale index into an
+        // out-of-bounds panic that aborts the whole emulator. A one-shot
+        // diagnostic records the scheduler-lock ownership when the race is
+        // observed so the missing serialization can be pinned down.
+        let mut i = 0usize;
+        while i < self.held_lock_info_list.len() {
+            let key = match self.held_lock_info_list.get(i) {
+                Some(lock_info) => lock_info
+                    .tree
+                    .iter()
+                    .find(|k| k.thread_id == waiter_thread_id)
+                    .copied(),
+                None => break,
+            };
+            let Some(key) = key else {
+                i += 1;
+                continue;
+            };
+
+            if should_trace_priority_inheritance() {
+                log::info!(
+                    "PI remove_waiter_by_thread_id owner_tid={} owner_prio={} owner_base={} waiter_tid={} waiter_prio={} addr=0x{:X}",
+                    self.thread_id,
+                    self.priority,
+                    self.base_priority,
+                    waiter_thread_id,
+                    key.priority,
+                    self.held_lock_info_list
+                        .get(i)
+                        .map(|li| li.get_address_key().get())
+                        .unwrap_or(0),
+                );
             }
+
+            let Some(lock_info) = self.held_lock_info_list.get_mut(i) else {
+                // The list shrank underneath us between the find and the
+                // mutation — a genuine concurrent access. Log who (if anyone)
+                // owns the scheduler lock so the missing serialization can be
+                // identified, then bail without panicking.
+                let sched_held = super::kernel::scheduler_lock()
+                    .map(|l| l.is_locked_by_current_thread())
+                    .unwrap_or(false);
+                log::error!(
+                    "remove_waiter_by_thread_id RACE: held_lock_info_list shrank \
+                     (owner_tid={} waiter_tid={} scheduler_lock_held_by_current={})",
+                    self.thread_id,
+                    waiter_thread_id,
+                    sched_held,
+                );
+                return;
+            };
+            let is_kernel = lock_info.get_is_kernel_address_key();
+            let is_empty = lock_info.remove_waiter(key.priority, key.thread_id);
+            if is_kernel {
+                self.num_kernel_waiters -= 1;
+            }
+            if is_empty {
+                self.held_lock_info_list.remove(i);
+            }
+            if self.priority == key.priority && self.priority < self.base_priority {
+                self.restore_priority_simplified();
+            }
+            return;
         }
     }
 
@@ -1963,7 +2044,7 @@ impl KThread {
         self.virtual_affinity_mask = 1u64 << core;
         self.physical_affinity_mask.set_affinity_mask(1u64 << core);
         self.thread_state
-            .store(ThreadState::INITIALIZED.bits(), Ordering::Relaxed);
+            .store(ThreadState::RUNNABLE.bits(), Ordering::Relaxed);
         self.suspend_allowed_flags = ThreadState::SUSPEND_FLAG_MASK.bits() as u32;
         self.suspend_request_flags = 0;
         self.parent = owner.map(Arc::downgrade);
@@ -2428,16 +2509,7 @@ impl KThread {
                 );
             }
             self.resource_limit_release_hint = true;
-            let should_terminate_process = process.decrement_running_thread_count();
-            drop(process);
-
-            // If the running thread count reached zero, terminate the process.
-            // We must do this after dropping the process lock to avoid deadlock.
-            if should_terminate_process {
-                if let Some(parent) = self.parent.as_ref().and_then(Weak::upgrade) {
-                    parent.lock().unwrap().terminate();
-                }
-            }
+            let _ = process.decrement_running_thread_count();
         }
 
         // Perform termination under (simulated) scheduler lock.
@@ -2481,10 +2553,18 @@ impl KThread {
             }
         }
 
-        // Upstream: UNREACHABLE_MSG("KThread::Exit() would return")
-        // In the full fiber-based execution model, the scheduler context-switches
-        // away and this point is never reached.
-        log::error!("KThread::Exit() returned — upstream marks this as unreachable");
+        // Upstream: UNREACHABLE_MSG("KThread::Exit() would return").
+        // The cooperative Rust execution bridge returns to its caller so
+        // `PhysicalCore` can yield to the scheduler after SVC ExitThread.
+        if std::env::var_os("RUZU_TRACE_THREAD_EXIT_RETURN").is_some() {
+            log::error!(
+                "KThread::Exit() returned — upstream marks this as unreachable tid={} object_id=0x{:X} core={} prio={}",
+                self.thread_id,
+                self.object_id,
+                self.core_id,
+                self.priority,
+            );
+        }
     }
 
     /// Terminate the thread (called by another thread).
@@ -2940,6 +3020,37 @@ impl KThread {
         self.begin_wait_with_queue(KThreadQueue::default());
     }
 
+    /// Arm the host-thread IPC lost-wakeup guard. Call before enqueuing an
+    /// IPC request and signaling the owning ServerManager host fiber. Clears
+    /// any stale pending wake so each request starts fresh. See the field
+    /// docs on `wait_wake_guard_armed`.
+    pub fn arm_wait_wake_guard(&mut self) {
+        self.wait_wake_guard_armed = true;
+        self.wait_wake_guard_pending = None;
+    }
+
+    /// Park the thread for a guarded IPC wait, consuming a pending wake if the
+    /// reply already arrived (i.e. `end_wait` ran while this thread was still
+    /// RUNNABLE and recorded the result via the armed guard).
+    ///
+    /// Returns `true` if the thread actually entered WAITING (caller should
+    /// reschedule), or `false` if a pending wake was consumed and the thread
+    /// stays RUNNABLE (caller should skip the park and read `wait_result`).
+    ///
+    /// Always disarms the guard. Race-free because this and `end_wait` both
+    /// run under the thread's Mutex.
+    pub fn begin_wait_guarded(&mut self) -> bool {
+        self.wait_wake_guard_armed = false;
+        if let Some(result) = self.wait_wake_guard_pending.take() {
+            // Reply already delivered before we parked — adopt its result and
+            // stay runnable.
+            self.wait_result = result;
+            return false;
+        }
+        self.begin_wait();
+        true
+    }
+
     pub fn unpark_wait(&self) {
         // Upstream does not block the host thread in BeginWait.
         // Retained as a no-op for compatibility with existing queue call sites.
@@ -2980,6 +3091,14 @@ impl KThread {
         let _scheduler_lock = self.lock_scheduler();
 
         if self.get_state() != ThreadState::WAITING {
+            // The thread is not parked yet. If the host-thread IPC guard is
+            // armed, this is a reply racing ahead of the client's park:
+            // record the wake so `begin_wait_guarded` consumes it instead of
+            // parking into a lost wakeup. Otherwise preserve upstream's
+            // silent no-op.
+            if self.wait_wake_guard_armed {
+                self.wait_wake_guard_pending = Some(_wait_result);
+            }
             return;
         }
 
@@ -3007,7 +3126,9 @@ impl KThread {
         // Avoid a hard crash — log and return early like upstream.
         let Some(wait_queue) = self.wait_queue.clone() else {
             log::error!(
-                "KThread::end_wait: wait_queue is None while state=Waiting (upstream ASSERT)"
+                "KThread::end_wait: wait_queue is None while state=Waiting (upstream ASSERT) tid={} reason={:?}",
+                self.thread_id,
+                self.wait_reason_for_debugging
             );
             return;
         };

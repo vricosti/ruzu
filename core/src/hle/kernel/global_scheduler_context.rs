@@ -18,10 +18,26 @@ use super::k_thread::{KThread, KThreadLock, ThreadState, ThreadType};
 static TRACE_GSC_STATE_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 fn should_trace_sched_state(thread_id: u64) -> bool {
-    if std::env::var_os("RUZU_TRACE_SCHED_STATE").is_none() {
+    let Some(raw) = std::env::var_os("RUZU_TRACE_SCHED_STATE") else {
         return false;
+    };
+    let raw = raw.to_string_lossy();
+    let raw = raw.trim();
+    if raw.is_empty() || raw == "1" || raw.eq_ignore_ascii_case("all") {
+        return true;
     }
-    matches!(thread_id, 73 | 92 | 94 | 96 | 98 | 100)
+    raw.split(',').any(|value| {
+        let value = value.trim();
+        if value.is_empty() {
+            return false;
+        }
+        let parsed = value
+            .strip_prefix("0x")
+            .or_else(|| value.strip_prefix("0X"))
+            .and_then(|hex| u64::from_str_radix(hex, 16).ok())
+            .or_else(|| value.parse::<u64>().ok());
+        parsed.is_some_and(|tid| tid == thread_id)
+    })
 }
 
 fn trace_sched_state(args: std::fmt::Arguments<'_>) {
@@ -32,6 +48,42 @@ fn trace_sched_state(args: std::fmt::Arguments<'_>) {
     if idx < 1024 {
         log::info!("{}", args);
     }
+}
+
+fn encode_top(top: Option<u64>) -> u64 {
+    top.unwrap_or(u64::MAX)
+}
+
+fn trace_sched_state_fast(
+    stage: u64,
+    thread_id: u64,
+    old_state: ThreadState,
+    new_state: ThreadState,
+    priority: i32,
+    active_core: i32,
+    queue: &KPriorityQueue,
+) {
+    if !common::trace::is_enabled(common::trace::cat::SCHED_STATE) {
+        return;
+    }
+    if !should_trace_sched_state(thread_id) {
+        return;
+    }
+    common::trace::emit_raw(
+        common::trace::cat::SCHED_STATE,
+        &[
+            stage,
+            thread_id,
+            old_state.bits() as u64,
+            new_state.bits() as u64,
+            priority as u32 as u64,
+            active_core as u32 as u64,
+            encode_top(queue.get_scheduled_front(0)),
+            encode_top(queue.get_scheduled_front(1)),
+            encode_top(queue.get_scheduled_front(2)),
+            encode_top(queue.get_scheduled_front(3)),
+        ],
+    );
 }
 
 /// Priority at or above which core migration is allowed.
@@ -166,6 +218,15 @@ impl GlobalSchedulerContext {
         if old_state == new_state {
             return;
         }
+        trace_sched_state_fast(
+            1,
+            thread_id,
+            old_state,
+            new_state,
+            priority,
+            active_core,
+            &self.m_priority_queue,
+        );
 
         if old_state == ThreadState::RUNNABLE {
             // Was runnable, now not — remove from PQ.
@@ -191,6 +252,15 @@ impl GlobalSchedulerContext {
                     self.m_priority_queue.get_scheduled_front(3),
                 ));
             }
+            trace_sched_state_fast(
+                2,
+                thread_id,
+                old_state,
+                new_state,
+                priority,
+                active_core,
+                &self.m_priority_queue,
+            );
         } else if new_state == ThreadState::RUNNABLE {
             // Was not runnable, now is — add to PQ.
             self.m_priority_queue.push_back(
@@ -222,6 +292,15 @@ impl GlobalSchedulerContext {
                     self.m_priority_queue.get_scheduled_front(3),
                 ));
             }
+            trace_sched_state_fast(
+                3,
+                thread_id,
+                old_state,
+                new_state,
+                priority,
+                active_core,
+                &self.m_priority_queue,
+            );
         }
     }
 
@@ -436,5 +515,24 @@ mod tests {
         let _held = thread.lock().unwrap();
         let looked_up = gsc.get_thread_by_thread_id(0x1234);
         assert!(looked_up.is_some());
+    }
+
+    #[test]
+    fn remove_thread_only_removes_matching_thread_id() {
+        let gsc = GlobalSchedulerContext::new();
+        let exiting = Arc::new(KThreadLock::new(KThread::new()));
+        let survivor = Arc::new(KThreadLock::new(KThread::new()));
+        exiting.lock().unwrap().thread_id = 0x10;
+        survivor.lock().unwrap().thread_id = 0x20;
+
+        gsc.add_thread(Arc::clone(&exiting));
+        gsc.add_thread(Arc::clone(&survivor));
+        gsc.remove_thread(0x10);
+
+        assert!(gsc.get_thread_by_thread_id(0x10).is_none());
+        assert!(Arc::ptr_eq(
+            &gsc.get_thread_by_thread_id(0x20).unwrap(),
+            &survivor
+        ));
     }
 }

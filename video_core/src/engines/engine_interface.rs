@@ -64,6 +64,42 @@ pub trait EngineInterface: Send {
     fn set_current_dirty(&mut self, dirty: bool);
 }
 
+/// Non-owning handle corresponding to upstream `Engines::EngineInterface*`.
+///
+/// Rust trait objects are fat pointers, so storing them as raw integer pairs at
+/// each call site is easy to get wrong. This wrapper centralizes the one
+/// lifetime-erasing conversion needed for upstream-style engine binding.
+#[derive(Clone, Copy)]
+pub struct EngineHandle {
+    ptr: *const (dyn EngineInterface + 'static),
+}
+
+unsafe impl Send for EngineHandle {}
+unsafe impl Sync for EngineHandle {}
+
+impl EngineHandle {
+    pub fn from_ref(engine: &dyn EngineInterface) -> Self {
+        let ptr = engine as *const dyn EngineInterface;
+        Self {
+            ptr: unsafe {
+                std::mem::transmute::<
+                    *const dyn EngineInterface,
+                    *const (dyn EngineInterface + 'static),
+                >(ptr)
+            },
+        }
+    }
+
+    /// # Safety
+    ///
+    /// The caller must uphold upstream's non-owning pointer contract: the
+    /// engine object must outlive every handle use, and no aliasing mutable use
+    /// may happen concurrently.
+    pub unsafe fn as_mut<'a>(self) -> &'a mut dyn EngineInterface {
+        unsafe { &mut *(self.ptr as *mut (dyn EngineInterface + 'static)) }
+    }
+}
+
 /// State common to all engines that implement `EngineInterface`.
 ///
 /// Corresponds to the C++ `EngineInterface` member fields:

@@ -9,6 +9,9 @@ use std::sync::{Arc, Mutex};
 
 use crate::core::SystemRef;
 use crate::hle::result::{ResultCode, RESULT_SUCCESS, RESULT_UNKNOWN};
+use crate::hle::service::am::library_applet_storage::{
+    create_handle_storage, create_transfer_memory_storage,
+};
 use crate::hle::service::am::service::storage::IStorage;
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
 use crate::hle::service::ipc_helpers::{RequestParser, ResponseBuilder};
@@ -45,7 +48,11 @@ impl ILibraryAppletCreator {
                 Some(Self::create_transfer_memory_storage_handler),
                 "CreateTransferMemoryStorage",
             ),
-            (12, None, "CreateHandleStorage"),
+            (
+                12,
+                Some(Self::create_handle_storage_handler),
+                "CreateHandleStorage",
+            ),
         ]);
         Self {
             system,
@@ -98,20 +105,91 @@ impl ILibraryAppletCreator {
     }
 
     fn create_transfer_memory_storage_handler(
-        _this: &dyn ServiceFramework,
+        this: &dyn ServiceFramework,
         ctx: &mut HLERequestContext,
     ) {
+        let creator =
+            unsafe { &*(this as *const dyn ServiceFramework as *const ILibraryAppletCreator) };
         let mut rp = RequestParser::new(ctx);
-        let _is_writable = rp.pop_bool();
+        let is_writable = rp.pop_bool();
         let size = rp.pop_i64();
+        let transfer_memory_handle = ctx.get_copy_handle(0);
 
-        log::warn!(
-            "(STUBBED) CreateTransferMemoryStorage called, size={}",
+        log::debug!(
+            "ILibraryAppletCreator::CreateTransferMemoryStorage called, is_writable={} size={}",
+            is_writable,
             size
         );
 
-        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
-        rb.push_result(RESULT_UNKNOWN);
+        let Some((memory, transfer_memory, object_id)) =
+            Self::resolve_transfer_memory(ctx, transfer_memory_handle)
+        else {
+            let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+            rb.push_result(RESULT_UNKNOWN);
+            return;
+        };
+
+        if size <= 0 {
+            let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+            rb.push_result(RESULT_UNKNOWN);
+            return;
+        }
+
+        let backing =
+            create_transfer_memory_storage(memory, transfer_memory, object_id, is_writable, size);
+        let storage = Arc::new(IStorage::new_with_backing(creator.system, backing));
+        Self::push_interface_response(ctx, storage);
+    }
+
+    fn create_handle_storage_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let creator =
+            unsafe { &*(this as *const dyn ServiceFramework as *const ILibraryAppletCreator) };
+        let mut rp = RequestParser::new(ctx);
+        let size = rp.pop_i64();
+        let transfer_memory_handle = ctx.get_copy_handle(0);
+
+        log::debug!(
+            "ILibraryAppletCreator::CreateHandleStorage called, size={}",
+            size
+        );
+
+        let Some((memory, transfer_memory, object_id)) =
+            Self::resolve_transfer_memory(ctx, transfer_memory_handle)
+        else {
+            let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+            rb.push_result(RESULT_UNKNOWN);
+            return;
+        };
+
+        if size <= 0 {
+            let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+            rb.push_result(RESULT_UNKNOWN);
+            return;
+        }
+
+        let backing = create_handle_storage(memory, transfer_memory, object_id, size);
+        let storage = Arc::new(IStorage::new_with_backing(creator.system, backing));
+        Self::push_interface_response(ctx, storage);
+    }
+
+    fn resolve_transfer_memory(
+        ctx: &HLERequestContext,
+        handle: u32,
+    ) -> Option<(
+        Arc<Mutex<crate::memory::memory::Memory>>,
+        Arc<Mutex<crate::hle::kernel::k_transfer_memory::KTransferMemory>>,
+        u64,
+    )> {
+        let thread = ctx.get_thread()?;
+        let process = {
+            let thread = thread.lock().unwrap();
+            thread.parent.as_ref()?.upgrade()?
+        };
+        let process = process.lock().unwrap();
+        let object_id = process.handle_table.get_object(handle)?;
+        let transfer_memory = process.get_transfer_memory_by_object_id(object_id)?;
+        let memory = process.get_memory()?;
+        Some((memory, transfer_memory, object_id))
     }
 }
 

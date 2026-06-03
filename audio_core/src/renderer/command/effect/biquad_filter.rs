@@ -154,6 +154,11 @@ pub fn read_biquad_state_mut(addr: CpuAddr) -> Option<&'static mut BiquadFilterS
     if addr == 0 {
         return None;
     }
+    crate::raw_write_trace::maybe_trace_write_at(
+        "biquad_filter:state_mut",
+        addr,
+        std::mem::size_of::<BiquadFilterState>(),
+    );
     Some(unsafe { &mut *(addr as *mut BiquadFilterState) })
 }
 

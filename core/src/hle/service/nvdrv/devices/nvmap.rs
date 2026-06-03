@@ -217,9 +217,9 @@ impl NvMapDevice {
             .get_session_process(session_id)
             .expect("nvmap::IocAlloc active session must own a process like upstream");
 
-        let handle_size = {
+        let (handle_address, handle_size) = {
             let inner = handle.lock_inner();
-            inner.size as usize
+            (inner.address as usize, inner.size as usize)
         };
         let lock_result = {
             let mut process_guard = process.lock().unwrap();
@@ -227,13 +227,34 @@ impl NvMapDevice {
                 .page_table
                 .get_base_mut()
                 .lock_for_map_device_address_space(
-                    params.address as usize,
+                    handle_address,
                     handle_size,
                     KMemoryPermission::NONE,
                     true,
                 )
         };
         debug_assert_eq!(lock_result, 0);
+
+        {
+            let mut inner = handle.lock_inner();
+            if inner.d_address == 0 {
+                if let Some(d_address) = self.container().map_preallocated_area(
+                    session_id,
+                    inner.address,
+                    inner.size as usize,
+                ) {
+                    inner.d_address = d_address;
+                    inner.in_heap = true;
+                    if std::env::var_os("RUZU_TRACE_NVMAP_PIN").is_some() {
+                        eprintln!(
+                            "[NVMAP_PIN] handle=0x{:X} vaddr=0x{:X} size=0x{:X} -> prealloc d_address=0x{:X}",
+                            params.handle, inner.address, inner.size, d_address
+                        );
+                    }
+                }
+            }
+        }
+
         if Self::should_trace_alloc_loop() {
             let inner = handle.lock_inner();
             let host_ptr = process.lock().unwrap().get_memory().and_then(|memory| {

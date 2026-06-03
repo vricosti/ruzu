@@ -5,10 +5,12 @@
 //! Port of zuyu/src/core/hle/service/nvdrv/devices/nvhost_nvdec.cpp
 
 use crate::hle::service::nvdrv::core::container::SessionId;
+use crate::hle::service::nvdrv::core::container::Container;
 use crate::hle::service::nvdrv::core::syncpoint_manager::ChannelType;
 use crate::hle::service::nvdrv::devices::nvdevice::NvDevice;
 use crate::hle::service::nvdrv::devices::nvhost_nvdec_common::{self, NvHostNvDecCommon};
 use crate::hle::service::nvdrv::nvdata::{DeviceFD, Ioctl, NvResult};
+use crate::core::SystemRef;
 
 /// nvhost_nvdec device.
 pub struct NvHostNvDec {
@@ -16,9 +18,9 @@ pub struct NvHostNvDec {
 }
 
 impl NvHostNvDec {
-    pub fn new() -> Self {
+    pub fn new(system: SystemRef, container: &Container) -> Self {
         Self {
-            common: NvHostNvDecCommon::new(ChannelType::NvDec),
+            common: NvHostNvDecCommon::new(system, container, ChannelType::NvDec),
         }
     }
 }
@@ -54,14 +56,17 @@ impl NvDevice for NvHostNvDec {
 
     fn on_open(&self, session_id: SessionId, fd: DeviceFD) {
         log::info!("NVDEC video stream started");
+        self.common.system().get().set_nvdec_active(true);
         let mut sessions = self.common.sessions.lock().unwrap();
         sessions.insert(fd, session_id);
-        // Stubbed: host1x.StartDevice(fd, ChannelType::NvDec, channel_syncpoint)
+        drop(sessions);
+        self.common.start_host1x_device(fd);
     }
 
     fn on_close(&self, fd: DeviceFD) {
         log::info!("NVDEC video stream ended");
-        // Stubbed: host1x.StopDevice(fd, ChannelType::NvDec)
+        self.common.stop_host1x_device(fd);
+        self.common.system().get().set_nvdec_active(false);
         let mut sessions = self.common.sessions.lock().unwrap();
         sessions.remove(&fd);
     }

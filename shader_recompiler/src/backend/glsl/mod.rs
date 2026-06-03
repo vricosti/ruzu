@@ -46,6 +46,9 @@ pub fn emit_glsl(
 ) -> String {
     let mut ctx = glsl_emit_context::EmitContext::new(program, bindings, profile, runtime_info);
     emit_glsl::emit_program(&mut ctx, program);
+    if matches!(ctx.stage, crate::stage::Stage::Fragment) && program.info.stores_frag_color[0] {
+        emit_glsl_special::emit_fragment_alpha_test(&mut ctx);
+    }
     let mut header = std::mem::take(&mut ctx.header);
     header.push_str("void main(){\n");
     if program.local_memory_size > 0 {
@@ -118,6 +121,17 @@ pub fn emit_glsl(
     {
         return format!(
             "{}vec2 p[3]=vec2[3](vec2(-1.0,-1.0),vec2(3.0,-1.0),vec2(-1.0,3.0));gl_Position=vec4(p[gl_VertexID%3],0.0,1.0);return;}}\n",
+            header
+        );
+    }
+    if std::env::var_os("RUZU_FORCE_VERTEX_INDEXED_QUAD").is_some()
+        && matches!(
+            program.stage,
+            ir::types::ShaderStage::VertexA | ir::types::ShaderStage::VertexB
+        )
+    {
+        return format!(
+            "{}vec2 p[4]=vec2[4](vec2(-1.0,-1.0),vec2(1.0,-1.0),vec2(-1.0,1.0),vec2(1.0,1.0));gl_Position=vec4(p[gl_VertexID&3],0.0,1.0);return;}}\n",
             header
         );
     }

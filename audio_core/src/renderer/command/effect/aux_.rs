@@ -4,6 +4,15 @@ use crate::renderer::command::util::write_copy;
 use crate::renderer::effect::aux_::AuxInfoDsp;
 use crate::{guest_read_block, guest_write_block};
 use std::fmt::Write;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static AUX_PROCESS_COUNT: AtomicU64 = AtomicU64::new(0);
+static AUX_WRITE_FULL_COUNT: AtomicU64 = AtomicU64::new(0);
+static AUX_WRITE_PARTIAL_COUNT: AtomicU64 = AtomicU64::new(0);
+static AUX_READ_FULL_COUNT: AtomicU64 = AtomicU64::new(0);
+static AUX_READ_PARTIAL_COUNT: AtomicU64 = AtomicU64::new(0);
+static AUX_INFO_WRITE_FAIL_COUNT: AtomicU64 = AtomicU64::new(0);
+static AUX_READ_BAD_SAMPLE_COUNT: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Copy)]
 #[repr(C)]
@@ -66,6 +75,7 @@ pub fn write_aux_payload(cmd: &AuxCommand, output: &mut [u8]) -> usize {
 }
 
 pub fn process_aux_command(payload: &AuxPayload, mix_buffers: &mut [i32], sample_count: usize) {
+    profile_aux_process(payload, sample_count);
     let Some(input_range) = mix_buffer_range(mix_buffers, payload.input, sample_count) else {
         return;
     };
@@ -92,6 +102,9 @@ pub fn process_aux_command(payload: &AuxPayload, mix_buffers: &mut [i32], sample
             payload.write_offset,
             payload.update_count,
         );
+        if std::env::var_os("RUZU_ZERO_AUX_OUTPUT").is_some() {
+            mix_buffers[output_range.clone()].fill(0);
+        }
         if read != sample_count as u32 {
             for sample in &mut mix_buffers[output_range.start + read as usize..output_range.end] {
                 *sample = 0;
@@ -100,7 +113,9 @@ pub fn process_aux_command(payload: &AuxPayload, mix_buffers: &mut [i32], sample
     } else {
         reset_aux_info(payload.send_buffer_info);
         reset_aux_info(payload.return_buffer_info);
-        copy_mix_buffer(mix_buffers, sample_count, payload.output, payload.input);
+        if payload.input != payload.output {
+            copy_mix_buffer(mix_buffers, sample_count, payload.output, payload.input);
+        }
     }
 }
 
@@ -123,7 +138,7 @@ pub(crate) fn reset_aux_info(addr: CpuAddr) {
     info.read_offset = 0;
     info.write_offset = 0;
     info.total_sample_count = 0;
-    write_aux_info(addr, &info);
+    let _ = write_aux_info(addr, &info);
 }
 
 pub(crate) fn write_aux_buffer(
@@ -163,7 +178,9 @@ pub(crate) fn write_aux_buffer(
                 buffer_addr + target_write_offset as usize * std::mem::size_of::<i32>();
             let end = read_pos + to_write;
             if !guest_write_block(write_addr as u64, i32_slice_as_bytes(&input[read_pos..end])) {
-                return write_count.saturating_sub(remaining as u32);
+                let written = write_count.saturating_sub(remaining as u32);
+                profile_aux_write_result(written, write_count);
+                return written;
             }
         }
         target_write_offset = (target_write_offset + to_write as u32) % count_max;
@@ -174,8 +191,9 @@ pub(crate) fn write_aux_buffer(
     if update_count != 0 {
         info.write_offset = (info.write_offset + update_count) % count_max;
     }
-    write_aux_info(info_addr, &info);
+    let _ = write_aux_info(info_addr, &info);
 
+    profile_aux_write_result(write_count, write_count);
     write_count
 }
 
@@ -215,8 +233,22 @@ pub(crate) fn read_aux_buffer(
             let read_addr = buffer_addr + target_read_offset as usize * std::mem::size_of::<i32>();
             let out = &mut output[write_pos..write_pos + to_read];
             if !guest_read_block(read_addr as u64, i32_slice_as_bytes_mut(out)) {
-                return read_count.saturating_sub(remaining as u32);
+                let read = read_count.saturating_sub(remaining as u32);
+                profile_aux_read_result(read, read_count);
+                return read;
             }
+            trace_bad_aux_read(
+                info_addr,
+                buffer_addr,
+                read_addr,
+                count_max,
+                target_read_offset,
+                to_read as u32,
+                write_pos as u32,
+                out,
+                &info,
+            );
+            sanitize_bad_aux_return_samples(out);
         }
         target_read_offset = (target_read_offset + to_read as u32) % count_max;
         remaining -= to_read;
@@ -226,8 +258,9 @@ pub(crate) fn read_aux_buffer(
     if update_count != 0 {
         info.read_offset = (info.read_offset + update_count) % count_max;
     }
-    write_aux_info(info_addr, &info);
+    let _ = write_aux_info(info_addr, &info);
 
+    profile_aux_read_result(read_count, read_count);
     read_count
 }
 
@@ -243,7 +276,135 @@ fn write_aux_info(addr: CpuAddr, info: &AuxInfoDsp) -> bool {
     if addr == 0 {
         return false;
     }
-    guest_write_block(addr as u64, aux_info_as_bytes(info))
+    let ok = guest_write_block(addr as u64, aux_info_as_bytes(info));
+    if !ok && std::env::var_os("RUZU_PROFILE_AUX_DSP").is_some() {
+        let n = AUX_INFO_WRITE_FAIL_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+        if n == 1 || n % 5000 == 0 {
+            log::info!("AUX_DSP info_write_fail count={} addr=0x{:X}", n, addr);
+        }
+    }
+    ok
+}
+
+fn profile_aux_process(payload: &AuxPayload, sample_count: usize) {
+    if std::env::var_os("RUZU_PROFILE_AUX_DSP").is_none() {
+        return;
+    }
+    let n = AUX_PROCESS_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+    if n == 1 || n % 5000 == 0 {
+        log::info!(
+            "AUX_DSP process count={} enabled={} input={} output={} sample_count={} send_info=0x{:X} return_info=0x{:X} send=0x{:X} return=0x{:X} count_max={} write_offset={} update_count={}",
+            n,
+            payload.effect_enabled,
+            payload.input,
+            payload.output,
+            sample_count,
+            payload.send_buffer_info,
+            payload.return_buffer_info,
+            payload.send_buffer,
+            payload.return_buffer,
+            payload.count_max,
+            payload.write_offset,
+            payload.update_count
+        );
+    }
+}
+
+fn profile_aux_write_result(written: u32, expected: u32) {
+    if std::env::var_os("RUZU_PROFILE_AUX_DSP").is_none() {
+        return;
+    }
+    let counter = if written == expected {
+        &AUX_WRITE_FULL_COUNT
+    } else {
+        &AUX_WRITE_PARTIAL_COUNT
+    };
+    let n = counter.fetch_add(1, Ordering::Relaxed) + 1;
+    if n == 1 || n % 5000 == 0 {
+        log::info!(
+            "AUX_DSP write_result full={} count={} written={} expected={}",
+            written == expected,
+            n,
+            written,
+            expected
+        );
+    }
+}
+
+fn profile_aux_read_result(read: u32, expected: u32) {
+    if std::env::var_os("RUZU_PROFILE_AUX_DSP").is_none() {
+        return;
+    }
+    let counter = if read == expected {
+        &AUX_READ_FULL_COUNT
+    } else {
+        &AUX_READ_PARTIAL_COUNT
+    };
+    let n = counter.fetch_add(1, Ordering::Relaxed) + 1;
+    if n == 1 || n % 5000 == 0 {
+        log::info!(
+            "AUX_DSP read_result full={} count={} read={} expected={}",
+            read == expected,
+            n,
+            read,
+            expected
+        );
+    }
+}
+
+fn trace_bad_aux_read(
+    info_addr: CpuAddr,
+    buffer_addr: CpuAddr,
+    read_addr: CpuAddr,
+    count_max: u32,
+    target_read_offset: u32,
+    to_read: u32,
+    write_pos: u32,
+    samples: &[i32],
+    info: &AuxInfoDsp,
+) {
+    if std::env::var_os("RUZU_TRACE_AUX_READ_BAD").is_none() {
+        return;
+    }
+    let Some((index, value)) = samples
+        .iter()
+        .copied()
+        .enumerate()
+        .find(|(_, value)| *value == i32::MIN || *value == i32::MAX || value.abs() > 0x0100_0000)
+    else {
+        return;
+    };
+    let n = AUX_READ_BAD_SAMPLE_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+    if n <= 32 || n % 1000 == 0 {
+        let first: Vec<i32> = samples.iter().copied().take(16).collect();
+        log::warn!(
+            "AUX_READ_BAD #{} info=0x{:X} buffer=0x{:X} read_addr=0x{:X} count_max={} info_read={} info_write={} target_read={} to_read={} write_pos={} bad_index={} bad_value={} first={:?}",
+            n,
+            info_addr,
+            buffer_addr,
+            read_addr,
+            count_max,
+            info.read_offset,
+            info.write_offset,
+            target_read_offset,
+            to_read,
+            write_pos,
+            index,
+            value,
+            first
+        );
+    }
+}
+
+fn sanitize_bad_aux_return_samples(samples: &mut [i32]) {
+    if std::env::var_os("RUZU_SANITIZE_AUX_RETURN").is_none() {
+        return;
+    }
+    for sample in samples {
+        if *sample < i16::MIN as i32 || *sample > i16::MAX as i32 {
+            *sample = 0;
+        }
+    }
 }
 
 fn aux_info_as_bytes(info: &AuxInfoDsp) -> &[u8] {

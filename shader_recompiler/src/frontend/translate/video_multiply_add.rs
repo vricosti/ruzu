@@ -26,20 +26,23 @@ pub fn vmad(tv: &mut TranslatorVisitor, insn: u64) {
     let src_a_neg = bit(insn, 54);
     let sat = bit(insn, 55);
 
+    // Upstream `TranslatorVisitor::VMAD` throws `NotImplementedException`
+    // for all five of these modifier combinations (see upstream
+    // video_multiply_add.cpp). Panic to match.
     if cc {
-        log::warn!("VMAD: CC not supported (insn={:#018x})", insn);
+        panic!("VMAD: CC modifier not implemented");
     }
     if sat {
-        log::warn!("VMAD: SAT not supported (insn={:#018x})", insn);
+        panic!("VMAD: SAT modifier not implemented");
     }
     if scale != 0 {
-        log::warn!("VMAD: non-zero SCALE not supported (insn={:#018x})", insn);
+        panic!("VMAD: non-zero SCALE not implemented");
     }
     if src_a_neg && src_c_neg {
-        log::warn!("VMAD: PO (both neg) not supported (insn={:#018x})", insn);
+        panic!("VMAD: PO (both neg) not implemented");
     }
     if src_a_neg || src_c_neg {
-        log::warn!("VMAD: NEG modifier not supported (insn={:#018x})", insn);
+        panic!("VMAD: NEG modifier not implemented");
     }
 
     let is_b_imm = !is_src_b_reg;

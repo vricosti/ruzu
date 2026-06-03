@@ -373,8 +373,18 @@ impl Services {
         guest_service!("npns", move || {
             Self::loop_process_npns(&sm, system);
         });
+        // ns (serves pl:u, the shared-font service heavily used during boot)
+        // runs on a HOST thread rather than a guest-core fiber. Upstream runs
+        // all services on host threads; ruzu's guest-core-fiber substitute
+        // (RunOnGuestCoreProcess) has a wakeup race where a parked
+        // ServerManager fiber is not reliably woken/scheduled when a freshly
+        // created session's first request arrives — wedging MK8D at `pl:u`
+        // shared-font init in ~50% of boots (a RUNNABLE/parked fiber never
+        // dispatched while all guest cores idle). The 8 host_service! managers
+        // do not exhibit this; moving ns to a host thread removes the pl:u
+        // boot stall.
         let sm = service_manager.clone();
-        guest_service!("ns", move || {
+        host_service!("ns", move || {
             Self::loop_process_ns(&sm, system);
         });
         let sm = service_manager.clone();

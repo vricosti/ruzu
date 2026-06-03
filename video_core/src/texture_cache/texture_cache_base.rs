@@ -409,13 +409,24 @@ impl TextureCacheBase {
     /// the given CPU address range and marks them as CPU-modified, scheduling
     /// them for re-upload on next GPU access.
     pub fn write_memory(&mut self, cpu_addr: u64, size: usize) {
-        Self::for_each_cpu_page(cpu_addr, size, |page| {
-            if let Some(image_ids) = self.page_table.get(&page) {
-                for &_image_id in image_ids {
-                    // In full implementation: mark image as CPU-modified
-                }
+        let image_ids = self.collect_images_in_region(cpu_addr, size);
+        for image_id in image_ids {
+            if self.slot_images[image_id]
+                .flags
+                .contains(ImageFlagBits::CPU_MODIFIED)
+            {
+                continue;
             }
-        });
+            self.slot_images[image_id]
+                .flags
+                .insert(ImageFlagBits::CPU_MODIFIED);
+            if self.slot_images[image_id]
+                .flags
+                .contains(ImageFlagBits::TRACKED)
+            {
+                self.untrack_image(image_id);
+            }
+        }
     }
 
     /// Download contents of host images to guest memory in a region.
@@ -542,6 +553,33 @@ impl TextureCacheBase {
                 view_id.index,
                 image.image_view_ids.len(),
                 valid_image_ids.iter().map(|i| i.index).collect::<Vec<_>>(),
+            );
+        }
+        if common::trace::is_enabled(common::trace::cat::PRESENT_IMAGE_SELECT) {
+            let image = &self.slot_images[image_id];
+            let blending = match config.blending {
+                BlendMode::Opaque => 0,
+                BlendMode::Premultiplied => 1,
+                BlendMode::Coverage => 2,
+            };
+            common::trace::emit_raw(
+                common::trace::cat::PRESENT_IMAGE_SELECT,
+                &[
+                    cpu_addr,
+                    image.gpu_addr,
+                    image_id.index as u64,
+                    view_id.index as u64,
+                    valid_image_ids.len() as u64,
+                    image.flags.bits() as u64,
+                    image.modification_tick,
+                    image.aliased_images.len() as u64,
+                    image.overlapping_images.len() as u64,
+                    image.info.size.width as u64,
+                    image.info.size.height as u64,
+                    image.info.format as u64,
+                    config.pixel_format.0 as u64,
+                    blending,
+                ],
             );
         }
         let image = &self.slot_images[image_id];

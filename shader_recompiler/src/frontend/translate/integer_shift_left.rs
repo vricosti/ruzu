@@ -16,18 +16,14 @@ fn shl_inner(tv: &mut TranslatorVisitor, insn: u64, unsafe_shift: Value) {
     let x = bit(insn, 43);
     let cc = bit(insn, 47);
 
+    // Upstream throws NotImplementedException for SHL.X and SHL.CC.
     if x {
-        log::warn!("SHL.X not implemented");
-        let undef = tv.ir.undef_u32();
-        tv.set_x(dst, undef);
-        return;
+        panic!("SHL.X not implemented");
     }
     if cc {
-        log::warn!("SHL.CC not implemented");
-        let undef = tv.ir.undef_u32();
-        tv.set_x(dst, undef);
-        return;
+        panic!("SHL.CC not implemented");
     }
+    let _ = dst;
 
     let base = tv.x(src_a_idx);
     let result = if w {

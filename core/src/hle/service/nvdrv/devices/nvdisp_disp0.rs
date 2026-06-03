@@ -49,9 +49,31 @@ impl NvDispDisp0 {
         let mut output_layers = Vec::with_capacity(sorted_layers.len());
         let mut output_fences = Vec::new();
 
-        for layer in sorted_layers {
+        for (index, layer) in sorted_layers.iter().enumerate() {
+            let address = self.nvmap().get_handle_address(layer.buffer_handle);
+            if common::trace::is_enabled(common::trace::cat::HWC) {
+                common::trace::emit_raw(
+                    common::trace::cat::HWC,
+                    &[
+                        3,
+                        index as u64,
+                        layer.buffer_handle as u64,
+                        address,
+                        layer.offset as u64,
+                        layer.width as u64,
+                        layer.height as u64,
+                        layer.stride as u64,
+                        layer.format as u64,
+                        layer.transform.bits() as u64,
+                        layer.crop_rect.left as u64,
+                        layer.crop_rect.top as u64,
+                        layer.crop_rect.right as u64,
+                        layer.crop_rect.bottom as u64,
+                    ],
+                );
+            }
             output_layers.push(GpuFramebufferConfig {
-                address: self.nvmap().get_handle_address(layer.buffer_handle),
+                address,
                 offset: layer.offset,
                 width: layer.width,
                 height: layer.height,

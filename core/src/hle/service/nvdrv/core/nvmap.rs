@@ -286,22 +286,13 @@ impl NvMap {
                 }
             }
 
-            // Upstream allocates SMMU address space via
-            // `host1x.MemoryManager().Allocate(aligned_size)` then maps
-            // through `host1x.MemoryManager().Map(d_address, vaddress, size, smmu_id)`,
-            // installing an SMMU page-table entry that translates the
-            // device-physical address back to the same host backing the
-            // CPU page-table points to for `inner.address`.
-            //
-            // Port (2026-05-14): we now allocate a real SMMU d_address via
-            // `Host1xCoreInterface::smmu_allocate`, look up the host
-            // backing for the guest CPU VA via `Memory::get_pointer`, and
-            // install the mapping via `smmu_map`. This replaces the
-            // long-standing placeholder that just returned the guest CPU
-            // VA — that stub caused MK8D's GPU reads to land on a
-            // different host page than the ARM CPU's fastmem writes
-            // (project_mk8d_shader_uninitialized_2026_05_14.md).
             if inner.d_address == 0 && inner.address != 0 {
+                let size = inner.size as usize;
+                // Upstream fallback: allocate SMMU address space via
+                // `host1x.MemoryManager().Allocate(aligned_size)` and map the
+                // CPU VA through the device memory manager. The preallocated
+                // heap fast-path is installed by nvmap::IocAlloc, where the
+                // owning Container session is available.
                 let host_ptr = {
                     let sys = self.system.get();
                     sys.memory_shared().and_then(|memory| {
@@ -314,23 +305,25 @@ impl NvMap {
                         }
                     })
                 };
-                let size = inner.size as usize;
-                if let (Some(host_ptr), Some(host1x)) = (host_ptr, self.system.get().host1x_core())
-                {
-                    let d_address = host1x.smmu_allocate(size);
-                    host1x.smmu_map(d_address, host_ptr, size);
-                    inner.d_address = d_address;
-                    if std::env::var_os("RUZU_TRACE_NVMAP_PIN").is_some() {
-                        eprintln!(
-                            "[NVMAP_PIN] handle=0x{:X} vaddr=0x{:X} size=0x{:X} -> d_address=0x{:X} host_ptr=0x{:X}",
-                            handle_id, inner.address, size, d_address, host_ptr
-                        );
-                    }
-                } else {
-                    // Fallback path for tests / contexts without a live
-                    // System. Preserves prior behavior so existing tests
-                    // that don't exercise the GPU continue to pass.
+                let Some(host_ptr) = host_ptr else {
                     inner.d_address = inner.address;
+                    inner.pins += 1;
+                    return inner.d_address;
+                };
+                let Some(host1x) = self.system.get().host1x_core() else {
+                    inner.d_address = inner.address;
+                    inner.pins += 1;
+                    return inner.d_address;
+                };
+                let d_address = host1x.smmu_allocate(size);
+                host1x.smmu_map(d_address, host_ptr, size);
+                inner.d_address = d_address;
+                inner.in_heap = false;
+                if std::env::var_os("RUZU_TRACE_NVMAP_PIN").is_some() {
+                    eprintln!(
+                        "[NVMAP_PIN] handle=0x{:X} vaddr=0x{:X} size=0x{:X} -> d_address=0x{:X} host_ptr=0x{:X}",
+                        handle_id, inner.address, size, d_address, host_ptr
+                    );
                 }
             }
         }

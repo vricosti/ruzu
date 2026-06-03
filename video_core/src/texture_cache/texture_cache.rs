@@ -16,7 +16,7 @@
 //! (Runtime, Image slot vectors, Maxwell3D registers, etc.) log a warning
 //! and return safe defaults until those types are ported.
 
-use crate::engines::draw_manager::DrawState;
+use crate::engines::draw_manager::Maxwell3DRenderTargets;
 use crate::engines::maxwell_3d::RenderTargetInfo;
 use crate::surface;
 
@@ -292,16 +292,23 @@ impl TextureCacheBase {
         if image_id == NULL_IMAGE_ID {
             return NULL_IMAGE_VIEW_ID;
         }
-        // Upstream: `base = image.TryFindBase(config.Address()).value();
-        // ImageViewInfo view_info(config, base.layer);` — the subresource
-        // base lookup needs the per-mip-level / per-slice tables which
-        // aren't fully populated until CalculateLayerStride lands. Fall
-        // back to `base.layer = 0` so the path is exercised end-to-end;
-        // future slice swaps in the real `TryFindBase` result.
-        let view_info = super::image_view_info::ImageViewInfo::from_tic_entry(descriptor, 0);
+        let base = match self.slot_images.get(image_id).try_find_base(descriptor.address()) {
+            Some(base) => base,
+            None => return NULL_IMAGE_VIEW_ID,
+        };
+        debug_assert_eq!(base.level, 0);
+        let view_info =
+            super::image_view_info::ImageViewInfo::from_tic_entry(descriptor, base.layer);
+        let existing = self.slot_images.get(image_id).find_view(&view_info);
+        if existing.is_valid() {
+            return existing;
+        }
         let parent_info = self.slot_images.get(image_id).info.clone();
         let view = ImageViewBase::new(&view_info, &parent_info, image_id, descriptor.address());
         let view_id = self.slot_image_views.insert(view);
+        self.slot_images
+            .get_mut(image_id)
+            .insert_view(view_info, view_id);
         // Upstream tags both the view and its image as `Strong`. Bitflags
         // already supports `|=` on the existing `flags` fields.
         self.slot_image_views.get_mut(view_id).flags |=
@@ -311,37 +318,51 @@ impl TextureCacheBase {
     }
 
     /// Port of `TextureCache<P>::FindOrInsertImage` (texture_cache.h:1140-1146).
-    /// Looks up an existing image at `gpu_addr` first; on miss, inserts a
-    /// fresh `ImageBase` keyed by that address. The full upstream
-    /// `FindImage` walks the page table for overlapping subresources —
-    /// ruzu's minimal version matches by exact GPU address only and is
-    /// sufficient until the page-table overlap port lands.
+    /// Looks up an existing image that can satisfy `info` at `gpu_addr`;
+    /// on miss, inserts a fresh `ImageBase` keyed by that address.
     pub(crate) fn find_or_insert_image(
         &mut self,
         info: &super::image_info::ImageInfo,
         gpu_addr: GPUVAddr,
     ) -> ImageId {
-        if let Some(id) = self.find_image(gpu_addr) {
+        if let Some(id) = self.find_image(info, gpu_addr) {
             return id;
         }
         self.insert_image(info, gpu_addr)
     }
 
-    /// Minimal port of `FindImage`: exact-address lookup via the
-    /// `image_allocs_table`. Upstream's full version walks every image
-    /// touched by the gpu_addr's pages and applies view-compatibility
-    /// rules — that requires the upstream subresource math which the
-    /// rest of the texture cache hasn't grown yet.
-    pub(crate) fn find_image(&self, gpu_addr: GPUVAddr) -> Option<ImageId> {
-        // Walk slot_images directly for now. There are typically few
-        // images, so an O(n) scan is acceptable until the page-table
-        // overlap search is ported.
-        for (id, image) in self.slot_images.iter() {
-            if image.gpu_addr == gpu_addr {
-                return Some(id);
-            }
-        }
-        None
+    /// Port of `TextureCache<P>::FindImage`'s compatibility predicate
+    /// (texture_cache.h:1149-1202), using a direct slot scan instead of
+    /// upstream's CPU page-table map. The important upstream contract is that
+    /// an existing image is reusable only when `IsSubresource` proves it
+    /// covers the requested image range; exact GPU address alone is
+    /// insufficient for cube/cube-array views.
+    pub(crate) fn find_image(
+        &self,
+        info: &super::image_info::ImageInfo,
+        gpu_addr: GPUVAddr,
+    ) -> Option<ImageId> {
+        let broken_views = false;
+        let native_bgr = false;
+        let options = RelaxedOptions::empty();
+        self.slot_images
+            .iter()
+            .filter_map(|(id, image)| {
+                if image.flags.contains(ImageFlagBits::REMAPPED) {
+                    return None;
+                }
+                super::util::is_subresource(
+                    info,
+                    image,
+                    gpu_addr,
+                    options,
+                    broken_views,
+                    native_bgr,
+                )
+                .then_some((id, image.modification_tick))
+            })
+            .max_by_key(|(_, modification_tick)| *modification_tick)
+            .map(|(id, _)| id)
     }
 
     /// Port of `InsertImage` minus the backend `slot_images.insert(runtime,
@@ -359,7 +380,9 @@ impl TextureCacheBase {
         // pointer is what the page-walked CPU address would point at.
         let cpu_addr = gpu_addr;
         let image = ImageBase::new(info.clone(), gpu_addr, cpu_addr);
-        self.slot_images.insert(image)
+        let image_id = self.slot_images.insert(image);
+        self.register_image(image_id);
+        image_id
     }
 
     /// Port of `TextureCache<P>::CheckFeedbackLoop`.
@@ -565,23 +588,23 @@ impl TextureCacheBase {
     ///
     /// Upstream reads `maxwell3d->regs.rt_control` and `maxwell3d->regs.rt[]`
     /// directly from this owner. The Rust draw path snapshots those registers
-    /// into `DrawState` and provides the channel GPU→CPU translator here.
-    pub fn update_render_targets_from_draw_state(
+    /// into `Maxwell3DRenderTargets` and provides the channel GPU->CPU translator here.
+    pub fn update_render_targets_from_snapshot(
         &mut self,
-        draw_state: &DrawState,
+        render_targets: &Maxwell3DRenderTargets,
         mut gpu_to_cpu: impl FnMut(GPUVAddr) -> Option<u64>,
     ) {
-        let count = draw_state.rt_control.count.min(NUM_RT as u32) as usize;
+        let count = render_targets.rt_control.count.min(NUM_RT as u32) as usize;
         if count == 0 {
             return;
         }
 
         for color_index in 0..count {
-            let target_index = draw_state.rt_control.map[color_index] as usize;
+            let target_index = render_targets.rt_control.map[color_index] as usize;
             if target_index >= NUM_RT {
                 continue;
             }
-            let rt = draw_state.render_targets[target_index];
+            let rt = render_targets.render_targets[target_index];
             if rt.address == 0 || rt.width == 0 || rt.height == 0 || rt.format == 0 {
                 continue;
             }
@@ -619,6 +642,23 @@ impl TextureCacheBase {
                 );
             }
         }
+
+        let zeta = render_targets.zeta;
+        if zeta.enabled && zeta.address != 0 && zeta.width != 0 && zeta.height != 0 {
+            if let Some(cpu_addr) = gpu_to_cpu(zeta.address) {
+                let info = ImageInfo::from_zeta_info(&zeta, 0);
+                let image_id = self.find_or_insert_image_from_info(&info, zeta.address, cpu_addr);
+                self.find_image_view_from_image_info(image_id, &info, zeta.address);
+            } else if std::env::var_os("RUZU_TRACE_RT").is_some() {
+                log::info!(
+                    "[RT] miss translate zeta gpu=0x{:X} {}x{} fmt=0x{:X}",
+                    zeta.address,
+                    zeta.width,
+                    zeta.height,
+                    zeta.format
+                );
+            }
+        }
     }
 
     fn find_or_insert_render_target_image(
@@ -627,9 +667,17 @@ impl TextureCacheBase {
         cpu_addr: u64,
     ) -> ImageId {
         let info = ImageInfo::from_render_target_info(rt, 0);
+        self.find_or_insert_image_from_info(&info, rt.address, cpu_addr)
+    }
 
+    pub fn find_or_insert_image_from_info(
+        &mut self,
+        info: &ImageInfo,
+        gpu_addr: GPUVAddr,
+        cpu_addr: u64,
+    ) -> ImageId {
         if let Some((image_id, _)) = self.slot_images.iter().find(|(_, image)| {
-            image.gpu_addr == rt.address
+            image.gpu_addr == gpu_addr
                 && image.cpu_addr == cpu_addr
                 && image.info.size.width == info.size.width
                 && image.info.size.height == info.size.height
@@ -640,10 +688,10 @@ impl TextureCacheBase {
 
         let image_id = self
             .slot_images
-            .insert(ImageBase::new(info, rt.address, cpu_addr));
+            .insert(ImageBase::new(info.clone(), gpu_addr, cpu_addr));
         let image_size = self.slot_images[image_id].guest_size_bytes as usize;
         let map_id = self.slot_map_views.insert(ImageMapView::new(
-            rt.address, cpu_addr, image_size, image_id,
+            gpu_addr, cpu_addr, image_size, image_id,
         ));
         self.slot_images[image_id].map_view_id = map_id;
         self.register_image(image_id);
@@ -659,6 +707,15 @@ impl TextureCacheBase {
         gpu_addr: GPUVAddr,
     ) -> ImageViewId {
         let rt_info = ImageInfo::from_render_target_info(rt, 0);
+        self.find_image_view_from_image_info(image_id, &rt_info, gpu_addr)
+    }
+
+    pub fn find_image_view_from_image_info(
+        &mut self,
+        image_id: ImageId,
+        rt_info: &ImageInfo,
+        gpu_addr: GPUVAddr,
+    ) -> ImageViewId {
         let image = &self.slot_images[image_id];
         let view_type = super::util::render_target_image_view_type(&rt_info);
         let base = if image.info.image_type == ImageType::Linear {
@@ -713,7 +770,21 @@ impl TextureCacheBase {
     ///
     /// Inserts the image into page tables and marks it for CPU write-tracking.
     pub fn register_image(&mut self, image_id: ImageId) {
-        let map_id = self.slot_images[image_id].map_view_id;
+        let mut map_id = self.slot_images[image_id].map_view_id;
+        if !map_id.is_valid()
+            && !self.slot_images[image_id]
+                .flags
+                .contains(ImageFlagBits::SPARSE)
+        {
+            let image = &self.slot_images[image_id];
+            map_id = self.slot_map_views.insert(ImageMapView::new(
+                image.gpu_addr,
+                image.cpu_addr,
+                image.guest_size_bytes as usize,
+                image_id,
+            ));
+            self.slot_images[image_id].map_view_id = map_id;
+        }
         if !map_id.is_valid() {
             log::warn!("TextureCacheBase::register_image: image has no map view");
             return;
@@ -908,6 +979,30 @@ mod tests {
     use super::*;
     use crate::engines::maxwell_3d::{RenderTargetInfo, RtControlInfo};
     use crate::framebuffer_config::{AndroidPixelFormat, FramebufferConfig};
+    use crate::textures::texture::{ComponentType, TextureFormat, TicEntry, TextureType};
+
+    fn color_2d_tic(address: u64, base_layer: u32) -> TicEntry {
+        let word0 = (TextureFormat::A8B8G8R8 as u32)
+            | ((ComponentType::Unorm as u32) << 7)
+            | ((ComponentType::Unorm as u32) << 10)
+            | ((ComponentType::Unorm as u32) << 13)
+            | ((ComponentType::Unorm as u32) << 16);
+        let word1 = address as u32;
+        let word2 = (((address >> 32) as u32) & 0xFFFF) | (3 << 21);
+        let word3 = 0;
+        let word4 =
+            63 | ((base_layer & 0x7) << 16) | ((TextureType::Texture2D as u32) << 23);
+        let word5 = 31 | (1 << 31);
+
+        TicEntry {
+            raw: [
+                word0 as u64 | ((word1 as u64) << 32),
+                word2 as u64 | ((word3 as u64) << 32),
+                word4 as u64 | ((word5 as u64) << 32),
+                0,
+            ],
+        }
+    }
 
     #[test]
     fn texture_cache_reserves_zero_for_null_resources() {
@@ -941,16 +1036,16 @@ mod tests {
     }
 
     #[test]
-    fn update_render_targets_from_draw_state_registers_presentable_view() {
+    fn update_render_targets_from_snapshot_registers_presentable_view() {
         use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
         use std::sync::Arc;
         let mut cache = TextureCacheBase::new(Arc::new(MaxwellDeviceMemoryManager::default()));
-        let mut draw_state = DrawState::default();
-        draw_state.rt_control = RtControlInfo {
+        let mut render_targets = Maxwell3DRenderTargets::default();
+        render_targets.rt_control = RtControlInfo {
             count: 1,
             map: [0, 0, 0, 0, 0, 0, 0, 0],
         };
-        draw_state.render_targets[0] = RenderTargetInfo {
+        render_targets.render_targets[0] = RenderTargetInfo {
             address: 0x4000_0000,
             width: 64,
             height: 32,
@@ -961,7 +1056,7 @@ mod tests {
             base_layer: 0,
         };
 
-        cache.update_render_targets_from_draw_state(&draw_state, |gpu_addr| {
+        cache.update_render_targets_from_snapshot(&render_targets, |gpu_addr| {
             (gpu_addr == 0x4000_0000).then_some(0x535B_5000)
         });
 
@@ -985,12 +1080,12 @@ mod tests {
         use std::sync::Arc;
 
         let mut cache = TextureCacheBase::new(Arc::new(MaxwellDeviceMemoryManager::default()));
-        let mut draw_state = DrawState::default();
-        draw_state.rt_control = RtControlInfo {
+        let mut render_targets = Maxwell3DRenderTargets::default();
+        render_targets.rt_control = RtControlInfo {
             count: 1,
             map: [0, 0, 0, 0, 0, 0, 0, 0],
         };
-        draw_state.render_targets[0] = RenderTargetInfo {
+        render_targets.render_targets[0] = RenderTargetInfo {
             address: 0x4000_0000,
             width: 64,
             height: 32,
@@ -1001,7 +1096,7 @@ mod tests {
             base_layer: 0,
         };
 
-        cache.update_render_targets_from_draw_state(&draw_state, |gpu_addr| {
+        cache.update_render_targets_from_snapshot(&render_targets, |gpu_addr| {
             (gpu_addr == 0x4000_0000).then_some(0x535B_5000)
         });
         let initial_view_count = cache.slot_image_views.size();
@@ -1032,5 +1127,51 @@ mod tests {
                 .w_source,
             SwizzleSource::OneFloat as u8
         );
+    }
+
+    #[test]
+    fn write_memory_marks_registered_image_cpu_modified_and_untracks() {
+        use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
+        use std::sync::Arc;
+
+        let mut cache = TextureCacheBase::new(Arc::new(MaxwellDeviceMemoryManager::default()));
+        let info = ImageInfo {
+            format: surface::PixelFormat::A8B8G8R8Unorm,
+            size: crate::texture_cache::types::Extent3D {
+                width: 16,
+                height: 16,
+                depth: 1,
+            },
+            ..ImageInfo::default()
+        };
+        let image_id = cache.insert_image(&info, 0x4000);
+        cache.slot_images[image_id]
+            .flags
+            .remove(ImageFlagBits::CPU_MODIFIED);
+        cache.track_image(image_id);
+
+        cache.write_memory(0x4000, 4);
+
+        let image = &cache.slot_images[image_id];
+        assert!(image.flags.contains(ImageFlagBits::CPU_MODIFIED));
+        assert!(!image.flags.contains(ImageFlagBits::TRACKED));
+    }
+
+    #[test]
+    fn create_image_view_uses_try_find_base_layer() {
+        use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
+        use std::sync::Arc;
+
+        let mut cache = TextureCacheBase::new(Arc::new(MaxwellDeviceMemoryManager::default()));
+        let mut descriptor = color_2d_tic(0, 2);
+        let layer_stride = ImageInfo::from_tic_entry(&descriptor).layer_stride as u64;
+        descriptor = color_2d_tic(0x5000_0000 + 2 * layer_stride, 2);
+
+        let view_id = cache.create_image_view(&descriptor);
+
+        assert!(view_id.is_valid());
+        let view = &cache.slot_image_views[view_id];
+        assert_eq!(view.range.base.layer, 2);
+        assert_eq!(cache.slot_images[view.image_id].gpu_addr, 0x5000_0000);
     }
 }

@@ -13,12 +13,126 @@ use std::thread::JoinHandle;
 
 use crate::control::scheduler::Scheduler;
 use crate::dma_pusher::CommandList;
+use crate::rasterizer_interface::RasterizerHandle;
 use common::bounded_threadsafe_queue::BoundedMPSCQueue;
 use common::thread::{set_current_thread_name, set_current_thread_priority, ThreadPriority};
 use ruzu_core::core::SystemRef;
+use ruzu_core::frontend::graphics_context::{GraphicsContextHandle, ScopedGraphicsContext};
 
 /// Device address type.
 pub type DAddr = u64;
+
+#[derive(Default)]
+struct GpuThreadProfile {
+    push_submit: AtomicU64,
+    push_tick: AtomicU64,
+    push_flush: AtomicU64,
+    push_invalidate: AtomicU64,
+    pop_submit: AtomicU64,
+    pop_tick: AtomicU64,
+    pop_flush: AtomicU64,
+    pop_invalidate: AtomicU64,
+    done_submit: AtomicU64,
+    submit_total_us: AtomicU64,
+    submit_max_us: AtomicU64,
+}
+
+static GPU_THREAD_PROFILE: std::sync::OnceLock<GpuThreadProfile> = std::sync::OnceLock::new();
+
+fn trace_gpu_thread_submit(
+    stage: u64,
+    fence: u64,
+    channel: i32,
+    list_count: usize,
+    prefetch_count: usize,
+    elapsed_us: u64,
+) {
+    if !common::trace::is_enabled(common::trace::cat::GPU_THREAD) {
+        return;
+    }
+    common::trace::emit_raw(
+        common::trace::cat::GPU_THREAD,
+        &[
+            stage,
+            fence,
+            channel as i64 as u64,
+            list_count as u64,
+            prefetch_count as u64,
+            elapsed_us,
+        ],
+    );
+}
+
+fn profile_enabled() -> bool {
+    std::env::var_os("RUZU_PROFILE_GPU_THREAD").is_some()
+}
+
+fn profile() -> &'static GpuThreadProfile {
+    GPU_THREAD_PROFILE.get_or_init(GpuThreadProfile::default)
+}
+
+fn inc(counter: &AtomicU64) {
+    if profile_enabled() {
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+fn record_submit_elapsed(elapsed: std::time::Duration) {
+    if !profile_enabled() {
+        return;
+    }
+    let profile = profile();
+    let elapsed_us = elapsed.as_micros().min(u128::from(u64::MAX)) as u64;
+    profile.done_submit.fetch_add(1, Ordering::Relaxed);
+    profile.submit_total_us.fetch_add(elapsed_us, Ordering::Relaxed);
+    let mut current = profile.submit_max_us.load(Ordering::Relaxed);
+    while elapsed_us > current {
+        match profile.submit_max_us.compare_exchange_weak(
+            current,
+            elapsed_us,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => break,
+            Err(next) => current = next,
+        }
+    }
+}
+
+pub fn dump_gpu_thread_profile() {
+    let Some(profile) = GPU_THREAD_PROFILE.get() else {
+        return;
+    };
+    eprintln!("[GPU_THREAD_PROFILE] command counts:");
+    eprintln!(
+        "[GPU_THREAD_PROFILE]   push SubmitList={} GpuTick={} FlushRegion={} InvalidateRegion={}",
+        profile.push_submit.load(Ordering::Relaxed),
+        profile.push_tick.load(Ordering::Relaxed),
+        profile.push_flush.load(Ordering::Relaxed),
+        profile.push_invalidate.load(Ordering::Relaxed)
+    );
+    eprintln!(
+        "[GPU_THREAD_PROFILE]   pop  SubmitList={} GpuTick={} FlushRegion={} InvalidateRegion={}",
+        profile.pop_submit.load(Ordering::Relaxed),
+        profile.pop_tick.load(Ordering::Relaxed),
+        profile.pop_flush.load(Ordering::Relaxed),
+        profile.pop_invalidate.load(Ordering::Relaxed)
+    );
+    let done_submit = profile.done_submit.load(Ordering::Relaxed);
+    let total_submit_us = profile.submit_total_us.load(Ordering::Relaxed);
+    let avg_submit_us = if done_submit == 0 {
+        0
+    } else {
+        total_submit_us / done_submit
+    };
+    eprintln!(
+        "[GPU_THREAD_PROFILE]   done SubmitList={} total_us={} avg_us={} max_us={}",
+        done_submit,
+        total_submit_us,
+        avg_submit_us,
+        profile.submit_max_us.load(Ordering::Relaxed)
+    );
+}
 
 // ---------------------------------------------------------------------------
 // Command types — matches upstream gpu_thread.h
@@ -139,11 +253,8 @@ pub struct ThreadManager {
     state: Arc<SynchState>,
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
-    /// Rasterizer fat pointer as [usize; 2] for direct calls
-    /// (InvalidateRegion, FlushAndInvalidateRegion).
     /// Matches upstream `VideoCore::RasterizerInterface* rasterizer`.
-    /// [0, 0] means null. Set during start_thread from renderer.ReadRasterizer().
-    rasterizer_raw: [usize; 2],
+    rasterizer: Option<RasterizerHandle>,
 }
 
 // Safety: ThreadManager is accessed under Gpu's Mutex lock.
@@ -160,7 +271,7 @@ impl ThreadManager {
             state: Arc::new(SynchState::new()),
             stop: Arc::new(AtomicBool::new(false)),
             thread: None,
-            rasterizer_raw: [0, 0],
+            rasterizer: None,
         }
     }
 
@@ -169,12 +280,8 @@ impl ThreadManager {
     }
 
     /// Get the rasterizer pointer, or None if not set.
-    fn rasterizer(&self) -> Option<*mut dyn crate::rasterizer_interface::RasterizerInterface> {
-        if self.rasterizer_raw[0] == 0 {
-            None
-        } else {
-            Some(unsafe { std::mem::transmute(self.rasterizer_raw) })
-        }
+    fn rasterizer(&self) -> Option<RasterizerHandle> {
+        self.rasterizer
     }
 
     /// Creates and starts the GPU thread.
@@ -194,20 +301,19 @@ impl ThreadManager {
     ) {
         // Extract rasterizer from renderer, matching upstream:
         //   rasterizer = renderer.ReadRasterizer();
-        let rasterizer_fat = unsafe { &*renderer_ptr }.read_rasterizer();
-        self.rasterizer_raw = unsafe { std::mem::transmute(rasterizer_fat) };
+        let rasterizer_ptr = unsafe { &*renderer_ptr }.read_rasterizer();
+        self.rasterizer = Some(RasterizerHandle::from_ref(unsafe { &*rasterizer_ptr }));
 
         let state = self.state.clone();
         let stop = self.stop.clone();
         let system = self.system;
         let gpu = gpu_ptr as usize;
         let sched = scheduler_ptr as usize;
-        // Copy rasterizer fat pointer for the thread.
-        let rasterizer_vtable = self.rasterizer_raw;
-        let ctx_raw: [usize; 2] = if context_ptr.is_null() {
-            [0, 0]
+        let rasterizer = self.rasterizer;
+        let context = if context_ptr.is_null() {
+            None
         } else {
-            unsafe { std::mem::transmute(context_ptr) }
+            Some(GraphicsContextHandle::from_ref(unsafe { &*context_ptr }))
         };
 
         let handle = std::thread::Builder::new()
@@ -220,21 +326,10 @@ impl ThreadManager {
                 let scheduler_ref = unsafe { &*(sched as *const Scheduler) };
 
                 // Upstream: auto current_context = context.Acquire();
-                let has_context = ctx_raw[0] != 0;
-                if has_context {
-                    let context: *mut dyn ruzu_core::frontend::graphics_context::GraphicsContext =
-                        unsafe { std::mem::transmute(ctx_raw) };
-                    unsafe { &mut *context }.make_current();
-                }
+                let _current_context =
+                    context.map(|context| unsafe { ScopedGraphicsContext::new(context) });
 
-                run_thread(&state, &stop, gpu_ref, scheduler_ref, rasterizer_vtable);
-
-                // Release context on exit.
-                if has_context {
-                    let context: *mut dyn ruzu_core::frontend::graphics_context::GraphicsContext =
-                        unsafe { std::mem::transmute(ctx_raw) };
-                    unsafe { &mut *context }.done_current();
-                }
+                run_thread(&state, &stop, gpu_ref, scheduler_ref, rasterizer);
             })
             .expect("Failed to spawn GPU thread");
 
@@ -272,7 +367,7 @@ impl ThreadManager {
     pub fn invalidate_region(&self, addr: DAddr, size: u64) {
         if let Some(rasterizer) = self.rasterizer() {
             // Safety: rasterizer pointer is valid for the lifetime of the renderer.
-            unsafe { &mut *rasterizer }.on_cache_invalidation(addr, size);
+            unsafe { rasterizer.as_mut() }.on_cache_invalidation(addr, size);
         }
     }
 
@@ -284,7 +379,7 @@ impl ThreadManager {
     pub fn flush_and_invalidate_region(&self, addr: DAddr, size: u64) {
         if let Some(rasterizer) = self.rasterizer() {
             // Safety: rasterizer pointer is valid for the lifetime of the renderer.
-            unsafe { &mut *rasterizer }.on_cache_invalidation(addr, size);
+            unsafe { rasterizer.as_mut() }.on_cache_invalidation(addr, size);
         }
     }
 
@@ -297,37 +392,45 @@ impl ThreadManager {
     /// Push a command to be executed by the GPU thread.
     /// Matches upstream `ThreadManager::PushCommand(CommandData&&, bool)`.
     fn push_command(&self, command_data: CommandData, mut block: bool) -> u64 {
+        if profile_enabled() {
+            match &command_data {
+                CommandData::SubmitList(_) => inc(&profile().push_submit),
+                CommandData::GpuTick(_) => inc(&profile().push_tick),
+                CommandData::FlushRegion(_) => inc(&profile().push_flush),
+                CommandData::InvalidateRegion(_) => inc(&profile().push_invalidate),
+                CommandData::FlushAndInvalidateRegion(_) | CommandData::None => {}
+            }
+        }
+
         if !self.is_async {
             block = true;
         }
 
-        let fence = {
-            let _lock = self.state.write_lock.lock().unwrap();
-            let fence = self.state.last_fence.fetch_add(1, Ordering::Relaxed) + 1;
-
-            self.state.emplace(CommandDataContainer {
-                data: command_data,
+        let lock = self.state.write_lock.lock().unwrap();
+        let fence = self.state.last_fence.fetch_add(1, Ordering::Relaxed) + 1;
+        if let CommandData::SubmitList(submit) = &command_data {
+            trace_gpu_thread_submit(
+                1,
                 fence,
-                block,
-            });
+                submit.channel,
+                submit.entries.command_lists.len(),
+                submit.entries.prefetch_command_list.len(),
+                0,
+            );
+        }
 
-            fence
-            // _lock dropped here before blocking wait
-        };
+        self.state.emplace(CommandDataContainer {
+            data: command_data,
+            fence,
+            block,
+        });
 
         if block {
-            // Wait for the command to be processed.
-            let signaled = self.state.signaled_fence.load(Ordering::Relaxed);
-            if fence <= signaled {
-                // Already processed (GPU thread was fast)
-                return fence;
-            }
             log::trace!(
                 "push_command: waiting for fence {} (signaled={})",
                 fence,
-                signaled
+                self.state.signaled_fence.load(Ordering::Relaxed)
             );
-            let lock = self.state.write_lock.lock().unwrap();
             let _guard = self
                 .state
                 .cv
@@ -370,7 +473,7 @@ fn run_thread(
     stop: &AtomicBool,
     gpu: &crate::gpu::Gpu,
     scheduler: &Scheduler,
-    rasterizer_raw: [usize; 2],
+    rasterizer: Option<RasterizerHandle>,
 ) {
     while !stop.load(Ordering::Relaxed) {
         let Some(next) = state.pop_wait(stop) else {
@@ -379,25 +482,39 @@ fn run_thread(
 
         match next.data {
             CommandData::SubmitList(submit) => {
+                inc(&profile().pop_submit);
+                let list_count = submit.entries.command_lists.len();
+                let prefetch_count = submit.entries.prefetch_command_list.len();
+                trace_gpu_thread_submit(2, next.fence, submit.channel, list_count, prefetch_count, 0);
+                let start = std::time::Instant::now();
                 scheduler.push(submit.channel, submit.entries);
+                let elapsed = start.elapsed();
+                record_submit_elapsed(elapsed);
+                trace_gpu_thread_submit(
+                    3,
+                    next.fence,
+                    submit.channel,
+                    list_count,
+                    prefetch_count,
+                    elapsed.as_micros() as u64,
+                );
             }
             CommandData::GpuTick(_) => {
+                inc(&profile().pop_tick);
                 gpu.tick_work();
             }
             CommandData::FlushRegion(flush) => {
+                inc(&profile().pop_flush);
                 // Upstream: rasterizer->FlushRegion(flush.addr, flush.size)
-                if rasterizer_raw[0] != 0 {
-                    let rasterizer: *mut dyn crate::rasterizer_interface::RasterizerInterface =
-                        unsafe { std::mem::transmute(rasterizer_raw) };
-                    unsafe { &mut *rasterizer }.flush_region(flush.addr, flush.size);
+                if let Some(rasterizer) = rasterizer {
+                    unsafe { rasterizer.as_mut() }.flush_region(flush.addr, flush.size);
                 }
             }
             CommandData::InvalidateRegion(inv) => {
+                inc(&profile().pop_invalidate);
                 // Upstream: rasterizer->OnCacheInvalidation(inv.addr, inv.size)
-                if rasterizer_raw[0] != 0 {
-                    let rasterizer: *mut dyn crate::rasterizer_interface::RasterizerInterface =
-                        unsafe { std::mem::transmute(rasterizer_raw) };
-                    unsafe { &mut *rasterizer }.on_cache_invalidation(inv.addr, inv.size);
+                if let Some(rasterizer) = rasterizer {
+                    unsafe { rasterizer.as_mut() }.on_cache_invalidation(inv.addr, inv.size);
                 }
             }
             CommandData::FlushAndInvalidateRegion(_) => {

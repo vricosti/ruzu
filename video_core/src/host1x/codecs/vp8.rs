@@ -6,7 +6,8 @@
 //! VP8 video decoder implementation.
 
 use crate::host1x::codecs::decoder::{DecoderImpl, DecoderState};
-use crate::host1x::nvdec_common::VideoCodec;
+use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
+use crate::host1x::nvdec_common::{NvdecRegisters, VideoCodec};
 
 /// Surface indices used by the VP8 decoder.
 ///
@@ -85,7 +86,11 @@ impl Vp8 {
 }
 
 impl DecoderImpl for Vp8 {
-    fn compose_frame(&mut self) -> Vec<u8> {
+    fn compose_frame(
+        &mut self,
+        _regs: &NvdecRegisters,
+        _memory_manager: &MaxwellDeviceMemoryManager,
+    ) -> Vec<u8> {
         // Stubbed — requires memory manager integration to read VP8PictureInfo from
         // memory at picture_info_offset and compose the VP8 frame header per RFC 6386 p.30.
         // Upstream: VP8::ComposeFrame() in video_core/host1x/codecs/vp8.cpp
@@ -93,7 +98,7 @@ impl DecoderImpl for Vp8 {
         Vec::new()
     }
 
-    fn get_progressive_offsets(&self) -> (u64, u64) {
+    fn get_progressive_offsets(&self, _regs: &NvdecRegisters) -> (u64, u64) {
         // Upstream reads surface_luma_offsets[Current].Address() and
         // surface_chroma_offsets[Current].Address() from NvdecRegisters.
         // Stubbed until NvdecRegisters are wired into the decoder.
@@ -101,7 +106,7 @@ impl DecoderImpl for Vp8 {
         (0, 0)
     }
 
-    fn get_interlaced_offsets(&self) -> (u64, u64, u64, u64) {
+    fn get_interlaced_offsets(&self, _regs: &NvdecRegisters) -> (u64, u64, u64, u64) {
         // VP8 doesn't truly support interlacing; upstream returns the same Current surface
         // luma/chroma offsets for all four return values.
         // Stubbed until NvdecRegisters are wired into the decoder.

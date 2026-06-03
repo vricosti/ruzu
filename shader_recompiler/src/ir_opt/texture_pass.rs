@@ -10,9 +10,10 @@
 
 use crate::environment::Environment;
 use crate::host_translate_info::HostTranslateInfo;
+use crate::ir::basic_block::Block;
 use crate::ir::instruction::Inst;
 use crate::ir::opcodes::Opcode;
-use crate::ir::program::{Program, ShaderInfo};
+use crate::ir::program::{Program, ShaderInfo, SyntaxNode};
 use crate::ir::types::TextureInstInfo;
 use crate::ir::value::{InstRef, Value};
 use crate::shader_info::{
@@ -111,7 +112,7 @@ fn texture_pass_impl(
                         .unwrap_or(0);
                     ConstBufferAddr::bound(texture_bound_buffer, cbuf_offset)
                 }
-                value => match track(value, program) {
+                value => match track(value, program, &mut env) {
                     Some(cbuf) => cbuf,
                     None => {
                         log::warn!(
@@ -173,6 +174,18 @@ fn texture_pass_impl(
             );
         let is_multisample = image_fetch_can_be_multisample
             && !matches!(inst_snapshot.args.get(4), None | Some(Value::Void));
+
+        if indexed_opcode == Opcode::ImageSampleImplicitLod
+            && texture_type_from_flags(flags) == TextureType::Color2D
+            && texture_type == TextureType::Color2DRect
+        {
+            patch_image_sample_implicit_lod(
+                &mut program.blocks[texture_inst.block as usize],
+                texture_inst.block,
+                texture_inst.inst,
+                flags,
+            );
+        }
 
         let descriptor_index = if is_storage_image_instruction(indexed_opcode) {
             if cbuf.has_secondary {
@@ -258,14 +271,30 @@ fn texture_pass_impl(
                 inst.args[4] = Value::Void;
             }
         }
-        inst.args[0] = if cbuf.count > 1 {
-            // Upstream emits `umin(asr(dynamic_offset, 3), 7)` here. Ruzu's
-            // GLSL image emission does not consume dynamic descriptor indices
-            // yet, so keep the dynamic SSA value visible instead of erasing it.
-            cbuf.dynamic_offset
+        let dynamic_index = if cbuf.count > 1 {
+            let block = &mut program.blocks[texture_inst.block as usize];
+            let shifted = insert_before(
+                block,
+                texture_inst.block,
+                texture_inst.inst,
+                Opcode::ShiftRightArithmetic32,
+                vec![cbuf.dynamic_offset, Value::ImmU32(DESCRIPTOR_SIZE_SHIFT)],
+            );
+            insert_before(
+                block,
+                texture_inst.block,
+                texture_inst.inst,
+                Opcode::UMin32,
+                vec![shifted, Value::ImmU32(DESCRIPTOR_SIZE - 1)],
+            )
         } else {
-            Value::ImmU32(descriptor_index)
+            Value::Void
         };
+        let inst = program.blocks[texture_inst.block as usize].instructions
+            [texture_inst.inst as usize]
+            .as_mut()
+            .expect("texture inst collected from live slot");
+        inst.args[0] = dynamic_index;
 
         if !host_info.support_snorm_render_buffer
             && indexed_opcode == Opcode::ImageFetch
@@ -274,7 +303,7 @@ fn texture_pass_impl(
             if let Some(env) = env.as_deref_mut() {
                 let pixel_format = read_texture_pixel_format(env, &cbuf);
                 if is_pixel_format_snorm(pixel_format) {
-                    log::warn!("TexturePass: SNORM texel-fetch patch not yet ported");
+                    patch_texel_fetch(program, texture_inst.block, texture_inst.inst, pixel_format);
                 }
             }
         }
@@ -290,11 +319,20 @@ fn get_inst<'a>(program: &'a Program, inst_ref: InstRef) -> Option<&'a Inst> {
         .as_ref()
 }
 
-fn track(value: Value, program: &Program) -> Option<ConstBufferAddr> {
-    track_inner(value, program, 0)
+fn track(
+    value: Value,
+    program: &Program,
+    env: &mut Option<&mut dyn Environment>,
+) -> Option<ConstBufferAddr> {
+    track_inner(value, program, env, 0)
 }
 
-fn track_inner(value: Value, program: &Program, depth: u32) -> Option<ConstBufferAddr> {
+fn track_inner(
+    value: Value,
+    program: &Program,
+    env: &mut Option<&mut dyn Environment>,
+    depth: u32,
+) -> Option<ConstBufferAddr> {
     if depth > 16 {
         return None;
     }
@@ -302,14 +340,19 @@ fn track_inner(value: Value, program: &Program, depth: u32) -> Option<ConstBuffe
         return None;
     };
     let inst = get_inst(program, inst_ref)?;
-    try_get_const_buffer(inst, program, depth + 1)
+    try_get_const_buffer(inst, program, env, depth + 1)
 }
 
-fn try_get_const_buffer(inst: &Inst, program: &Program, depth: u32) -> Option<ConstBufferAddr> {
+fn try_get_const_buffer(
+    inst: &Inst,
+    program: &Program,
+    env: &mut Option<&mut dyn Environment>,
+    depth: u32,
+) -> Option<ConstBufferAddr> {
     match inst.opcode {
         Opcode::BitwiseOr32 => {
-            let mut lhs = track_inner(*inst.args.first()?, program, depth)?;
-            let mut rhs = track_inner(*inst.args.get(1)?, program, depth)?;
+            let mut lhs = track_inner(*inst.args.first()?, program, env, depth)?;
+            let mut rhs = track_inner(*inst.args.get(1)?, program, env, depth)?;
             if lhs.has_secondary || rhs.has_secondary || lhs.count > 1 || rhs.count > 1 {
                 return None;
             }
@@ -333,7 +376,7 @@ fn try_get_const_buffer(inst: &Inst, program: &Program, depth: u32) -> Option<Co
             if !shift.is_immediate() {
                 return None;
             }
-            let mut lhs = track_inner(*inst.args.first()?, program, depth)?;
+            let mut lhs = track_inner(*inst.args.first()?, program, env, depth)?;
             lhs.shift_left = shift.imm_u32();
             Some(lhs)
         }
@@ -344,10 +387,10 @@ fn try_get_const_buffer(inst: &Inst, program: &Program, depth: u32) -> Option<Co
                 std::mem::swap(&mut op1, &mut op2);
             }
             if !op2.is_immediate() && !op1.is_immediate() {
-                if let Some(value) = try_get_constant(op1, program) {
+                if let Some(value) = try_get_constant(op1, program, env) {
                     op1 = op2;
                     op2 = Value::ImmU32(value);
-                } else if let Some(value) = try_get_constant(op2, program) {
+                } else if let Some(value) = try_get_constant(op2, program, env) {
                     op2 = Value::ImmU32(value);
                 } else {
                     return None;
@@ -359,7 +402,7 @@ fn try_get_const_buffer(inst: &Inst, program: &Program, depth: u32) -> Option<Co
             if mask == 0 {
                 return None;
             }
-            let mut lhs = track_inner(op1, program, depth)?;
+            let mut lhs = track_inner(op1, program, env, depth)?;
             lhs.shift_left = mask.trailing_zeros();
             Some(lhs)
         }
@@ -401,7 +444,11 @@ fn try_get_const_buffer(inst: &Inst, program: &Program, depth: u32) -> Option<Co
     }
 }
 
-fn try_get_constant(value: Value, program: &Program) -> Option<u32> {
+fn try_get_constant(
+    value: Value,
+    program: &Program,
+    env: &mut Option<&mut dyn Environment>,
+) -> Option<u32> {
     let Value::Inst(inst_ref) = value else {
         return None;
     };
@@ -410,11 +457,12 @@ fn try_get_constant(value: Value, program: &Program) -> Option<u32> {
         return None;
     }
     let index = *inst.args.first()?;
-    let _offset = *inst.args.get(1)?;
-    if !index.is_immediate() || !_offset.is_immediate() || index.imm_u32() != 1 {
+    let offset = *inst.args.get(1)?;
+    if !index.is_immediate() || !offset.is_immediate() || index.imm_u32() != 1 {
         return None;
     }
-    None
+    let env = env.as_deref_mut()?;
+    Some(env.read_cbuf_value(index.imm_u32(), offset.imm_u32()))
 }
 
 fn is_texture_instruction(opcode: Opcode) -> bool {
@@ -552,15 +600,7 @@ fn is_storage_image_instruction(opcode: Opcode) -> bool {
 }
 
 fn texture_type_from_flags(flags: TextureInstInfo) -> TextureType {
-    match flags.texture_type {
-        0 => TextureType::Color1D,
-        1 | 2 => TextureType::Color2D,
-        3 => TextureType::Color3D,
-        4 => TextureType::ColorCube,
-        5 => TextureType::ColorArray1D,
-        6 => TextureType::ColorArray2D,
-        _ => TextureType::Color2D,
-    }
+    TextureType::from_u8(flags.texture_type)
 }
 
 fn image_format_from_flags(_flags: TextureInstInfo) -> ImageFormat {
@@ -612,6 +652,262 @@ fn is_pixel_format_snorm(format: TexturePixelFormat) -> bool {
             | TexturePixelFormat::R16G16Snorm
             | TexturePixelFormat::R16Snorm
     )
+}
+
+fn insert_before(
+    block: &mut Block,
+    block_index: u32,
+    before: u32,
+    opcode: Opcode,
+    args: Vec<Value>,
+) -> Value {
+    let inst = block.insert_inst_before(before, Inst::new(opcode, args));
+    Value::Inst(InstRef {
+        block: block_index,
+        inst,
+    })
+}
+
+fn insert_before_with_flags(
+    block: &mut Block,
+    block_index: u32,
+    before: u32,
+    opcode: Opcode,
+    args: Vec<Value>,
+    flags: u32,
+) -> Value {
+    let inst = block.insert_inst_before(before, Inst::with_flags(opcode, args, flags));
+    Value::Inst(InstRef {
+        block: block_index,
+        inst,
+    })
+}
+
+fn patch_image_sample_implicit_lod(
+    block: &mut Block,
+    block_index: u32,
+    inst_index: u32,
+    info: TextureInstInfo,
+) {
+    let coord = block.inst(inst_index).args[1];
+    let texture_size = insert_before_with_flags(
+        block,
+        block_index,
+        inst_index,
+        Opcode::ImageQueryDimensions,
+        vec![Value::ImmU32(0), Value::ImmU32(0), Value::ImmU1(true)],
+        info.to_u32(),
+    );
+    let coord_x = insert_before(
+        block,
+        block_index,
+        inst_index,
+        Opcode::CompositeExtractF32x2,
+        vec![coord, Value::ImmU32(0)],
+    );
+    let size_x = insert_before(
+        block,
+        block_index,
+        inst_index,
+        Opcode::CompositeExtractU32x4,
+        vec![texture_size, Value::ImmU32(0)],
+    );
+    let size_x_f32 = insert_before(
+        block,
+        block_index,
+        inst_index,
+        Opcode::ConvertF32U32,
+        vec![size_x],
+    );
+    let recip_x = insert_before(
+        block,
+        block_index,
+        inst_index,
+        Opcode::FPRecip32,
+        vec![size_x_f32],
+    );
+    let scaled_x = insert_before(
+        block,
+        block_index,
+        inst_index,
+        Opcode::FPMul32,
+        vec![coord_x, recip_x],
+    );
+    let coord_y = insert_before(
+        block,
+        block_index,
+        inst_index,
+        Opcode::CompositeExtractF32x2,
+        vec![coord, Value::ImmU32(1)],
+    );
+    let size_y = insert_before(
+        block,
+        block_index,
+        inst_index,
+        Opcode::CompositeExtractU32x4,
+        vec![texture_size, Value::ImmU32(1)],
+    );
+    let size_y_f32 = insert_before(
+        block,
+        block_index,
+        inst_index,
+        Opcode::ConvertF32U32,
+        vec![size_y],
+    );
+    let recip_y = insert_before(
+        block,
+        block_index,
+        inst_index,
+        Opcode::FPRecip32,
+        vec![size_y_f32],
+    );
+    let scaled_y = insert_before(
+        block,
+        block_index,
+        inst_index,
+        Opcode::FPMul32,
+        vec![coord_y, recip_y],
+    );
+    let scaled_coord = insert_before(
+        block,
+        block_index,
+        inst_index,
+        Opcode::CompositeConstructF32x2,
+        vec![scaled_x, scaled_y],
+    );
+    block.inst_mut(inst_index).args[1] = scaled_coord;
+}
+
+fn snorm_max_value(format: TexturePixelFormat) -> f32 {
+    match format {
+        TexturePixelFormat::A8B8G8R8Snorm
+        | TexturePixelFormat::R8G8Snorm
+        | TexturePixelFormat::R8Snorm => 1.0 / i8::MAX as f32,
+        TexturePixelFormat::R16G16B16A16Snorm
+        | TexturePixelFormat::R16G16Snorm
+        | TexturePixelFormat::R16Snorm => 1.0 / i16::MAX as f32,
+        _ => panic!("Invalid texture pixel format for SNORM patch: {:?}", format),
+    }
+}
+
+fn replace_uses_with(program: &mut Program, old: InstRef, replacement: Value) {
+    let old_value = Value::Inst(old);
+    for block in &mut program.blocks {
+        for inst in block.iter_mut() {
+            for arg in &mut inst.args {
+                if *arg == old_value {
+                    *arg = replacement;
+                }
+            }
+            for (_, value) in &mut inst.phi_args {
+                if *value == old_value {
+                    *value = replacement;
+                }
+            }
+        }
+    }
+    for node in &mut program.syntax_list {
+        match node {
+            SyntaxNode::If { cond, .. }
+            | SyntaxNode::Repeat { cond, .. }
+            | SyntaxNode::Break { cond, .. } => {
+                if *cond == old_value {
+                    *cond = replacement;
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn patch_texel_fetch(
+    program: &mut Program,
+    block_index: u32,
+    inst_index: u32,
+    pixel_format: TexturePixelFormat,
+) {
+    let base_inst = program.block(block_index).inst(inst_index).clone();
+    let block = program.block_mut(block_index);
+    let fetch = block.insert_inst_before(inst_index, base_inst);
+    let fetch_value = Value::Inst(InstRef {
+        block: block_index,
+        inst: fetch,
+    });
+
+    let x = insert_before(
+        block,
+        block_index,
+        inst_index,
+        Opcode::CompositeExtractF32x4,
+        vec![fetch_value, Value::ImmU32(0)],
+    );
+    let y = insert_before(
+        block,
+        block_index,
+        inst_index,
+        Opcode::CompositeExtractF32x4,
+        vec![fetch_value, Value::ImmU32(1)],
+    );
+    let z = insert_before(
+        block,
+        block_index,
+        inst_index,
+        Opcode::CompositeExtractF32x4,
+        vec![fetch_value, Value::ImmU32(2)],
+    );
+    let w = insert_before(
+        block,
+        block_index,
+        inst_index,
+        Opcode::CompositeExtractF32x4,
+        vec![fetch_value, Value::ImmU32(3)],
+    );
+    let max_value = Value::ImmF32(snorm_max_value(pixel_format));
+
+    let convert = |block: &mut Block, component: Value| {
+        let bits = insert_before(
+            block,
+            block_index,
+            inst_index,
+            Opcode::BitCastU32F32,
+            vec![component],
+        );
+        let as_float = insert_before(
+            block,
+            block_index,
+            inst_index,
+            Opcode::ConvertF32S32,
+            vec![bits],
+        );
+        insert_before(
+            block,
+            block_index,
+            inst_index,
+            Opcode::FPMul32,
+            vec![as_float, max_value],
+        )
+    };
+
+    let converted_x = convert(block, x);
+    let converted_y = convert(block, y);
+    let converted_z = convert(block, z);
+    let converted_w = convert(block, w);
+    let converted = insert_before(
+        block,
+        block_index,
+        inst_index,
+        Opcode::CompositeConstructF32x4,
+        vec![converted_x, converted_y, converted_z, converted_w],
+    );
+
+    replace_uses_with(
+        program,
+        InstRef {
+            block: block_index,
+            inst: inst_index,
+        },
+        converted,
+    );
 }
 
 fn add_texture_descriptor(
@@ -731,9 +1027,112 @@ pub fn join_texture_info(_base: &mut ShaderInfo, _source: &mut ShaderInfo) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::environment::Environment;
     use crate::ir::basic_block::Block;
     use crate::ir::instruction::Inst;
     use crate::ir::types::ShaderStage;
+    use crate::program_header::ProgramHeader;
+    use crate::shader_info::ReplaceConstant;
+    use crate::stage::Stage;
+
+    struct MockEnvironment {
+        sph: ProgramHeader,
+        texture_type: TextureType,
+        texture_pixel_format: TexturePixelFormat,
+    }
+
+    impl Default for MockEnvironment {
+        fn default() -> Self {
+            Self {
+                sph: ProgramHeader::default(),
+                texture_type: TextureType::Color2D,
+                texture_pixel_format: TexturePixelFormat::A8B8G8R8Unorm,
+            }
+        }
+    }
+
+    impl Environment for MockEnvironment {
+        fn read_instruction(&mut self, _address: u32) -> u64 {
+            0
+        }
+
+        fn read_cbuf_value(&mut self, cbuf_index: u32, cbuf_offset: u32) -> u32 {
+            match (cbuf_index, cbuf_offset) {
+                // Upstream TryGetConstant resolves only bank 1 constants.
+                (1, 0x10) => 0x38,
+                // The tracked handle source. Shifted by countr_zero(0x38) = 3.
+                (4, 0x40) => 1,
+                _ => 0,
+            }
+        }
+
+        fn read_texture_type(&mut self, _raw_handle: u32) -> TextureType {
+            self.texture_type
+        }
+
+        fn read_texture_pixel_format(&mut self, _raw_handle: u32) -> TexturePixelFormat {
+            self.texture_pixel_format
+        }
+
+        fn is_texture_pixel_format_integer(&mut self, _raw_handle: u32) -> bool {
+            false
+        }
+
+        fn read_viewport_transform_state(&mut self) -> u32 {
+            0
+        }
+
+        fn texture_bound_buffer(&self) -> u32 {
+            0
+        }
+
+        fn local_memory_size(&self) -> u32 {
+            0
+        }
+
+        fn shared_memory_size(&self) -> u32 {
+            0
+        }
+
+        fn workgroup_size(&self) -> [u32; 3] {
+            [1, 1, 1]
+        }
+
+        fn has_hle_macro_state(&self) -> bool {
+            false
+        }
+
+        fn get_replace_const_buffer(
+            &mut self,
+            _bank: u32,
+            _offset: u32,
+        ) -> Option<ReplaceConstant> {
+            None
+        }
+
+        fn dump(&mut self, _pipeline_hash: u64, _shader_hash: u64) {}
+
+        fn sph(&self) -> &ProgramHeader {
+            &self.sph
+        }
+
+        fn gp_passthrough_mask(&self) -> &[u32; 8] {
+            static MASK: [u32; 8] = [0; 8];
+            &MASK
+        }
+
+        fn shader_stage(&self) -> Stage {
+            Stage::Fragment
+        }
+
+        fn start_address(&self) -> u32 {
+            0
+        }
+
+        fn is_proprietary_driver(&self) -> bool {
+            false
+        }
+    }
 
     #[test]
     fn bound_texture_pass_rewrites_handle_to_descriptor_index() {
@@ -758,7 +1157,7 @@ mod tests {
         assert_eq!(desc.cbuf_offset, 0x28);
         assert_eq!(desc.size_shift, DESCRIPTOR_SIZE_SHIFT);
         let inst = program.blocks[0].instructions[0].as_ref().unwrap();
-        assert_eq!(inst.args[0], Value::ImmU32(0));
+        assert_eq!(inst.args[0], Value::Void);
         let flags = TextureInstInfo::from_u32(inst.flags);
         assert_eq!(flags.descriptor_index, 0);
     }
@@ -816,7 +1215,7 @@ mod tests {
         assert_eq!(desc.secondary_cbuf_offset, 0x40);
         assert_eq!(desc.secondary_shift_left, 8);
         let inst = program.blocks[0].instructions[4].as_ref().unwrap();
-        assert_eq!(inst.args[0], Value::ImmU32(0));
+        assert_eq!(inst.args[0], Value::Void);
         assert_eq!(TextureInstInfo::from_u32(inst.flags).descriptor_index, 0);
     }
 
@@ -825,30 +1224,30 @@ mod tests {
         let mut program = Program::new(ShaderStage::Fragment);
         program.blocks.push(Block::new());
         let block = &mut program.blocks[0];
-        block.instructions.push(Some(Inst::new(
+        block.append_inst(Inst::new(
             Opcode::IAdd32,
             vec![Value::ImmU32(0x80), Value::Reg(crate::ir::value::Reg(4))],
-        )));
-        block.instructions.push(Some(Inst::new(
+        ));
+        block.append_inst(Inst::new(
             Opcode::GetCbufU32,
             vec![
                 Value::ImmU32(5),
                 Value::Inst(crate::ir::value::InstRef { block: 0, inst: 0 }),
             ],
-        )));
+        ));
         let flags = TextureInstInfo {
             texture_type: 2,
             ..Default::default()
         }
         .to_u32();
-        block.instructions.push(Some(Inst::with_flags(
+        block.append_inst(Inst::with_flags(
             Opcode::ImageSampleImplicitLod,
             vec![
                 Value::Inst(crate::ir::value::InstRef { block: 0, inst: 1 }),
                 Value::Void,
             ],
             flags,
-        )));
+        ));
 
         texture_pass_bound_textures(&mut program, 0);
 
@@ -859,7 +1258,78 @@ mod tests {
         assert_eq!(desc.count, DESCRIPTOR_SIZE);
         assert_eq!(desc.size_shift, DESCRIPTOR_SIZE_SHIFT);
         let inst = program.blocks[0].instructions[2].as_ref().unwrap();
-        assert_eq!(inst.args[0], Value::Reg(crate::ir::value::Reg(4)));
+        let Value::Inst(dynamic_index) = inst.args[0] else {
+            panic!("expected dynamic descriptor index instruction");
+        };
+        assert_eq!(
+            program.blocks[0].inst(dynamic_index.inst).opcode,
+            Opcode::UMin32
+        );
+        let ordered_opcodes: Vec<Opcode> = program.blocks[0]
+            .indexed_iter()
+            .map(|(_, inst)| inst.opcode)
+            .collect();
+        let asr_pos = ordered_opcodes
+            .iter()
+            .position(|&opcode| opcode == Opcode::ShiftRightArithmetic32)
+            .unwrap();
+        let umin_pos = ordered_opcodes
+            .iter()
+            .position(|&opcode| opcode == Opcode::UMin32)
+            .unwrap();
+        let sample_pos = ordered_opcodes
+            .iter()
+            .position(|&opcode| opcode == Opcode::ImageSampleImplicitLod)
+            .unwrap();
+        assert!(asr_pos < umin_pos);
+        assert!(umin_pos < sample_pos);
+    }
+
+    #[test]
+    fn texture_pass_tracks_mask_constant_loaded_from_cbuf_bank_one() {
+        let mut program = Program::new(ShaderStage::Fragment);
+        program.blocks.push(Block::new());
+        let block = &mut program.blocks[0];
+        block.instructions.push(Some(Inst::new(
+            Opcode::GetCbufU32,
+            vec![Value::ImmU32(4), Value::ImmU32(0x40)],
+        )));
+        block.instructions.push(Some(Inst::new(
+            Opcode::GetCbufU32,
+            vec![Value::ImmU32(1), Value::ImmU32(0x10)],
+        )));
+        block.instructions.push(Some(Inst::new(
+            Opcode::BitwiseAnd32,
+            vec![
+                Value::Inst(crate::ir::value::InstRef { block: 0, inst: 0 }),
+                Value::Inst(crate::ir::value::InstRef { block: 0, inst: 1 }),
+            ],
+        )));
+        let flags = TextureInstInfo {
+            texture_type: TextureType::Color2D as u8,
+            ..Default::default()
+        }
+        .to_u32();
+        block.instructions.push(Some(Inst::with_flags(
+            Opcode::BindlessImageSampleImplicitLod,
+            vec![
+                Value::Inst(crate::ir::value::InstRef { block: 0, inst: 2 }),
+                Value::Void,
+            ],
+            flags,
+        )));
+
+        let mut env = MockEnvironment::default();
+        texture_pass(&mut env, &mut program, &HostTranslateInfo::default());
+
+        let inst = program.blocks[0].instructions[3].as_ref().unwrap();
+        assert_eq!(inst.opcode, Opcode::ImageSampleImplicitLod);
+        assert_eq!(inst.args[0], Value::Void);
+        assert_eq!(program.info.texture_descriptors.len(), 1);
+        let desc = &program.info.texture_descriptors[0];
+        assert_eq!(desc.cbuf_index, 4);
+        assert_eq!(desc.cbuf_offset, 0x40);
+        assert_eq!(desc.shift_left, 3);
     }
 
     #[test]
@@ -881,7 +1351,7 @@ mod tests {
 
         let inst = program.blocks[0].instructions[0].as_ref().unwrap();
         assert_eq!(inst.opcode, Opcode::ImageSampleImplicitLod);
-        assert_eq!(inst.args[0], Value::ImmU32(0));
+        assert_eq!(inst.args[0], Value::Void);
         assert_eq!(program.info.texture_descriptors[0].cbuf_index, 4);
         assert_eq!(program.info.texture_descriptors[0].cbuf_offset, 0x30);
     }
@@ -911,6 +1381,166 @@ mod tests {
         assert_eq!(desc.cbuf_offset, 0x38);
         assert!(desc.is_read);
         assert!(desc.is_written);
+    }
+
+    #[test]
+    fn texture_pass_preserves_upstream_texture_type_enum_values() {
+        let mut program = Program::new(ShaderStage::Fragment);
+        program.blocks.push(Block::new());
+        let flags = TextureInstInfo {
+            texture_type: TextureType::ColorArray2D as u8,
+            ..Default::default()
+        }
+        .to_u32();
+        program.blocks[0].instructions.push(Some(Inst::with_flags(
+            Opcode::BoundImageSampleImplicitLod,
+            vec![Value::ImmU32(0x50), Value::Void],
+            flags,
+        )));
+
+        texture_pass_bound_textures(&mut program, 6);
+
+        assert_eq!(program.info.texture_descriptors.len(), 1);
+        assert_eq!(
+            program.info.texture_descriptors[0].texture_type,
+            TextureType::ColorArray2D
+        );
+    }
+
+    #[test]
+    fn texture_pass_patches_rect_implicit_lod_coords_before_sample() {
+        let mut program = Program::new(ShaderStage::Fragment);
+        program.blocks.push(Block::new());
+        let coord = program.blocks[0].append_inst(Inst::new(
+            Opcode::CompositeConstructF32x2,
+            vec![Value::ImmF32(64.0), Value::ImmF32(32.0)],
+        ));
+        let flags = TextureInstInfo {
+            texture_type: TextureType::Color2D as u8,
+            ..Default::default()
+        }
+        .to_u32();
+        program.blocks[0].append_inst(Inst::with_flags(
+            Opcode::BoundImageSampleImplicitLod,
+            vec![
+                Value::ImmU32(0x50),
+                Value::Inst(InstRef {
+                    block: 0,
+                    inst: coord,
+                }),
+            ],
+            flags,
+        ));
+
+        let mut env = MockEnvironment {
+            texture_type: TextureType::Color2DRect,
+            ..Default::default()
+        };
+        texture_pass(&mut env, &mut program, &HostTranslateInfo::default());
+
+        let ordered_opcodes: Vec<Opcode> = program.blocks[0]
+            .indexed_iter()
+            .map(|(_, inst)| inst.opcode)
+            .collect();
+        let sample_pos = ordered_opcodes
+            .iter()
+            .position(|&opcode| opcode == Opcode::ImageSampleImplicitLod)
+            .unwrap();
+        let query_pos = ordered_opcodes
+            .iter()
+            .position(|&opcode| opcode == Opcode::ImageQueryDimensions)
+            .unwrap();
+        assert!(query_pos < sample_pos);
+
+        let sample = program.blocks[0].indexed_iter().last().unwrap().1;
+        assert_eq!(sample.opcode, Opcode::ImageSampleImplicitLod);
+        assert!(matches!(sample.args[1], Value::Inst(_)));
+        assert!(ordered_opcodes.contains(&Opcode::CompositeConstructF32x2));
+        assert!(ordered_opcodes.contains(&Opcode::FPRecip32));
+    }
+
+    #[test]
+    fn texture_pass_patches_snorm_texel_fetch_uses() {
+        let mut program = Program::new(ShaderStage::Fragment);
+        program.blocks.push(Block::new());
+        let flags = TextureInstInfo {
+            texture_type: TextureType::Color1D as u8,
+            ..Default::default()
+        }
+        .to_u32();
+        program.blocks[0].append_inst(Inst::with_flags(
+            Opcode::BoundImageFetch,
+            vec![Value::ImmU32(0x28), Value::Void, Value::ImmU32(0)],
+            flags,
+        ));
+        program.blocks[0].append_inst(Inst::new(
+            Opcode::CompositeExtractF32x4,
+            vec![Value::Inst(InstRef { block: 0, inst: 0 }), Value::ImmU32(0)],
+        ));
+
+        let mut env = MockEnvironment {
+            texture_type: TextureType::Buffer,
+            texture_pixel_format: TexturePixelFormat::R8Snorm,
+            ..Default::default()
+        };
+        texture_pass(&mut env, &mut program, &HostTranslateInfo::default());
+
+        let consumer = program.blocks[0].inst(1);
+        let Value::Inst(converted_ref) = consumer.args[0] else {
+            panic!("expected consumer to use converted SNORM value");
+        };
+        assert_eq!(
+            program.blocks[0].inst(converted_ref.inst).opcode,
+            Opcode::CompositeConstructF32x4
+        );
+        let ordered_opcodes: Vec<Opcode> = program.blocks[0]
+            .indexed_iter()
+            .map(|(_, inst)| inst.opcode)
+            .collect();
+        let first_fetch = ordered_opcodes
+            .iter()
+            .position(|&opcode| opcode == Opcode::ImageFetch)
+            .unwrap();
+        let construct = ordered_opcodes
+            .iter()
+            .position(|&opcode| opcode == Opcode::CompositeConstructF32x4)
+            .unwrap();
+        let original_fetch = ordered_opcodes
+            .iter()
+            .rposition(|&opcode| opcode == Opcode::ImageFetch)
+            .unwrap();
+        assert!(first_fetch < construct);
+        assert!(construct < original_fetch);
+        assert!(ordered_opcodes.contains(&Opcode::BitCastU32F32));
+        assert!(ordered_opcodes.contains(&Opcode::ConvertF32S32));
+        assert!(ordered_opcodes.contains(&Opcode::FPMul32));
+    }
+
+    #[test]
+    fn replace_uses_with_rewrites_syntax_conditions() {
+        let mut program = Program::new(ShaderStage::Fragment);
+        program.blocks.push(Block::new());
+        let old = program.blocks[0].append_inst(Inst::new(
+            Opcode::ImageFetch,
+            vec![Value::ImmU32(0), Value::Void, Value::ImmU32(0)],
+        ));
+        let old_ref = InstRef {
+            block: 0,
+            inst: old,
+        };
+        let replacement = Value::ImmU1(true);
+        program.syntax_list.push(SyntaxNode::If {
+            cond: Value::Inst(old_ref),
+            body: 0,
+            merge: 0,
+        });
+
+        replace_uses_with(&mut program, old_ref, replacement);
+
+        let SyntaxNode::If { cond, .. } = program.syntax_list[0] else {
+            panic!("expected If node");
+        };
+        assert_eq!(cond, replacement);
     }
 
     #[test]

@@ -13,7 +13,7 @@ use common::range_map::RangeMap;
 use common::virtual_buffer::VirtualBuffer;
 
 use crate::pte_kind::PteKind;
-use crate::rasterizer_interface::RasterizerInterface;
+use crate::rasterizer_interface::{RasterizerHandle, RasterizerInterface};
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -95,7 +95,8 @@ pub struct GpuMemoryManager {
 
     // Unique identifier for rasterizer callbacks
     unique_identifier: usize,
-    rasterizer: Option<[usize; 2]>,
+    /// Upstream stores `VideoCore::RasterizerInterface* rasterizer`.
+    rasterizer: Option<RasterizerHandle>,
 }
 
 impl GpuMemoryManager {
@@ -179,17 +180,13 @@ impl GpuMemoryManager {
         &mut self,
         f: impl FnOnce(&mut dyn RasterizerInterface) -> R,
     ) -> Option<R> {
-        let raw = self.rasterizer?;
-        let rasterizer =
-            unsafe { &mut *std::mem::transmute::<[usize; 2], *mut dyn RasterizerInterface>(raw) };
-        Some(f(rasterizer))
+        let handle = self.rasterizer?;
+        Some(unsafe { handle.with_mut(f) })
     }
 
     /// Upstream: `MemoryManager::BindRasterizer(rasterizer)`.
     pub fn bind_rasterizer(&mut self, rasterizer: &dyn RasterizerInterface) {
-        self.rasterizer = Some(unsafe {
-            std::mem::transmute::<*const dyn RasterizerInterface, [usize; 2]>(rasterizer)
-        });
+        self.rasterizer = Some(RasterizerHandle::from_ref(rasterizer));
     }
 
     // ── Entry access (bitpacked) ────────────────────────────────────────
@@ -413,8 +410,12 @@ impl GpuMemoryManager {
             return;
         }
         log::trace!("gpu_mm: unmap GPU {:#x}..{:#x}", gpu_addr, gpu_addr + size);
-        // Upstream calls GetSubmappedRangeImpl<false> + rasterizer->UnmapMemory here.
-        // Skipped until rasterizer is wired.
+        let ranges = self.get_submapped_device_ranges(gpu_addr, size);
+        let _ = self.with_rasterizer_mut(|rasterizer| {
+            for (map_addr, map_size) in ranges {
+                rasterizer.unmap_memory(map_addr, map_size);
+            }
+        });
         self.big_page_table_op(EntryType::Free, gpu_addr, 0, size, PteKind::Invalid);
         self.page_table_op(EntryType::Free, gpu_addr, 0, size, PteKind::Invalid);
     }
@@ -1663,14 +1664,14 @@ mod tests {
     impl RasterizerInterface for TestRasterizer {
         fn draw(
             &mut self,
-            _draw_state: &crate::engines::draw_manager::DrawState,
+            _draw_view: crate::engines::draw_manager::Maxwell3DDrawView<'_>,
             _instance_count: u32,
         ) {
         }
         fn draw_texture(&mut self) {}
         fn clear(
             &mut self,
-            _draw_state: &crate::engines::draw_manager::DrawState,
+            _clear_view: crate::engines::draw_manager::Maxwell3DClearView<'_>,
             _layer_count: u32,
         ) {
         }

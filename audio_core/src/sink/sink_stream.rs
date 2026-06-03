@@ -213,6 +213,41 @@ impl SinkStream {
             return;
         }
 
+        if std::env::var_os("RUZU_TRACE_AUDIO_APPEND_CLIP").is_some() && samples.len() >= 100 {
+            let mut min_sample = i16::MAX;
+            let mut max_sample = i16::MIN;
+            let mut clipped = 0usize;
+            for &sample in samples {
+                min_sample = min_sample.min(sample);
+                max_sample = max_sample.max(sample);
+                if sample == i16::MIN || sample == i16::MAX {
+                    clipped += 1;
+                }
+            }
+            if clipped * 100 / samples.len() >= 1 {
+                use std::sync::atomic::{AtomicU64, Ordering};
+                static TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
+                let n = TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
+                if n < 16 || n.is_power_of_two() {
+                    eprintln!(
+                        "[AUDIO_APPEND_CLIP] #{} stream={:?} name={} tag=0x{:X} frames={} samples={} sys_ch={} dev_ch={} min={} max={} clipped={} clipped_pct={}",
+                        n,
+                        self.stream_type,
+                        self.name,
+                        buffer.tag,
+                        buffer.frames,
+                        samples.len(),
+                        self.system_channels,
+                        self.device_channels,
+                        min_sample,
+                        max_sample,
+                        clipped,
+                        clipped * 100 / samples.len()
+                    );
+                }
+            }
+        }
+
         let queued_buffer = {
             buffer.consumed = false;
             buffer.frames_played = 0;
@@ -443,6 +478,43 @@ impl SinkStream {
             self.playing_buffer.frames_played += frames_available as u64;
             if self.playing_buffer.frames_played >= self.playing_buffer.frames {
                 self.playing_buffer.consumed = true;
+            }
+        }
+
+        // Defensive glitch-mute: when the audio renderer goes haywire (e.g.,
+        // MK8D's state-machine wedge leads to voice wave-buffer addresses
+        // pointing at freed/corrupt memory, producing samples saturated at
+        // i16::MIN), the output buffer fills with high-amplitude noise that
+        // sounds strident. Signature: hit i16::MIN AND >= 1% of samples
+        // saturated to ±i16::MIN/MAX. Legitimate loud audio rarely pegs to
+        // i16::MIN for >1% of samples in a single callback.
+        if output_buffer.len() >= 100 {
+            let mut hit_min = false;
+            let mut clipped = 0usize;
+            for &s in output_buffer.iter() {
+                if s == i16::MIN {
+                    hit_min = true;
+                }
+                if s == i16::MIN || s == i16::MAX {
+                    clipped += 1;
+                }
+            }
+            if hit_min && clipped * 100 / output_buffer.len() >= 1 {
+                for sample in output_buffer.iter_mut() {
+                    *sample = 0;
+                }
+                use std::sync::atomic::{AtomicU64, Ordering};
+                static MUTE_COUNT: AtomicU64 = AtomicU64::new(0);
+                let n = MUTE_COUNT.fetch_add(1, Ordering::Relaxed);
+                if n < 5 || n.is_power_of_two() {
+                    log::warn!(
+                        "[AUDIO_GLITCH_MUTE] #{} muted {}-sample buffer with {} saturated samples ({}%) — renderer producing garbage",
+                        n,
+                        output_buffer.len(),
+                        clipped,
+                        clipped * 100 / output_buffer.len()
+                    );
+                }
             }
         }
 

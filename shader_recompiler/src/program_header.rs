@@ -255,6 +255,30 @@ impl ProgramHeader {
         (bits & 0xf) != 0
     }
 
+    /// Get the PS generic input interpolation map for one generic attribute.
+    ///
+    /// Mirrors upstream `ProgramHeader::ps.GenericInputMap(attribute)`.
+    /// In the PS union, `imap_generic_vector[32]` starts immediately after
+    /// `ImapSystemValuesA` + `imap_systemb`, i.e. at raw word 6.
+    pub fn ps_generic_input_map(&self, attribute: u32) -> [PixelImap; 4] {
+        debug_assert!(attribute < 32);
+        let word = self.raw[6 + (attribute as usize / 4)];
+        let vector = ((word >> ((attribute % 4) * 8)) & 0xff) as u8;
+        [
+            PixelImap::from_u8(vector),
+            PixelImap::from_u8(vector >> 2),
+            PixelImap::from_u8(vector >> 4),
+            PixelImap::from_u8(vector >> 6),
+        ]
+    }
+
+    /// Whether a PS generic input vector has any active component.
+    pub fn ps_is_generic_vector_active(&self, attribute: u32) -> bool {
+        debug_assert!(attribute < 32);
+        let word = self.raw[6 + (attribute as usize / 4)];
+        ((word >> ((attribute % 4) * 8)) & 0xff) != 0
+    }
+
     /// Get the PS omap sample_mask bit.
     pub fn ps_omap_sample_mask(&self) -> bool {
         self.raw[19] & 1 != 0
@@ -263,5 +287,38 @@ impl ProgramHeader {
     /// Get the PS omap depth bit.
     pub fn ps_omap_depth(&self) -> bool {
         (self.raw[19] >> 1) & 1 != 0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{PixelImap, ProgramHeader};
+
+    #[test]
+    fn ps_generic_input_map_decodes_one_byte_per_attribute() {
+        let mut sph = ProgramHeader::default();
+        sph.raw[6] = 0b11_10_01_00 | (0b10_10_10_10 << 8);
+
+        assert_eq!(
+            sph.ps_generic_input_map(0),
+            [
+                PixelImap::Unused,
+                PixelImap::Constant,
+                PixelImap::Perspective,
+                PixelImap::ScreenLinear,
+            ]
+        );
+        assert_eq!(
+            sph.ps_generic_input_map(1),
+            [
+                PixelImap::Perspective,
+                PixelImap::Perspective,
+                PixelImap::Perspective,
+                PixelImap::Perspective,
+            ]
+        );
+        assert!(sph.ps_is_generic_vector_active(0));
+        assert!(sph.ps_is_generic_vector_active(1));
+        assert!(!sph.ps_is_generic_vector_active(2));
     }
 }

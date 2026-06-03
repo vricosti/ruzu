@@ -29,18 +29,60 @@ pub trait GraphicsContext {
     }
 }
 
-/// RAII guard that makes a GraphicsContext current on creation
-/// and calls done_current on drop.
+/// Non-owning handle corresponding to upstream `Core::Frontend::GraphicsContext&`.
+///
+/// `video_core::gpu_thread` keeps a graphics context reference across the GPU
+/// thread lifetime, like upstream `StartThread(..., GraphicsContext& context)`.
+/// Rust trait objects are fat pointers, so this wrapper centralizes the
+/// lifetime-erasing conversion instead of storing raw `[usize; 2]` words at
+/// the call site.
+#[derive(Clone, Copy)]
+pub struct GraphicsContextHandle {
+    ptr: *const (dyn GraphicsContext + 'static),
+}
+
+unsafe impl Send for GraphicsContextHandle {}
+unsafe impl Sync for GraphicsContextHandle {}
+
+impl GraphicsContextHandle {
+    pub fn from_ref(context: &dyn GraphicsContext) -> Self {
+        let ptr = context as *const dyn GraphicsContext;
+        Self {
+            ptr: unsafe {
+                std::mem::transmute::<
+                    *const dyn GraphicsContext,
+                    *const (dyn GraphicsContext + 'static),
+                >(ptr)
+            },
+        }
+    }
+
+    /// # Safety
+    ///
+    /// The caller must ensure the context outlives the handle and is not
+    /// mutably accessed elsewhere while this reference is live. This mirrors
+    /// upstream's non-owning `GraphicsContext&` contract.
+    pub unsafe fn as_mut<'a>(self) -> &'a mut dyn GraphicsContext {
+        unsafe { &mut *(self.ptr as *mut (dyn GraphicsContext + 'static)) }
+    }
+}
+
+/// RAII guard that makes a GraphicsContext current on creation and calls
+/// done_current on drop.
 ///
 /// Corresponds to upstream `GraphicsContext::Scoped`.
-pub struct ScopedGraphicsContext<'a> {
-    context: &'a mut dyn GraphicsContext,
+pub struct ScopedGraphicsContext {
+    context: GraphicsContextHandle,
     active: bool,
 }
 
-impl<'a> ScopedGraphicsContext<'a> {
-    pub fn new(context: &'a mut dyn GraphicsContext) -> Self {
-        context.make_current();
+impl ScopedGraphicsContext {
+    /// # Safety
+    ///
+    /// The caller must guarantee the context outlives this guard and that GL
+    /// context ownership follows the frontend's thread-affinity contract.
+    pub unsafe fn new(context: GraphicsContextHandle) -> Self {
+        unsafe { context.as_mut() }.make_current();
         Self {
             context,
             active: true,
@@ -56,10 +98,10 @@ impl<'a> ScopedGraphicsContext<'a> {
     }
 }
 
-impl<'a> Drop for ScopedGraphicsContext<'a> {
+impl Drop for ScopedGraphicsContext {
     fn drop(&mut self) {
         if self.active {
-            self.context.done_current();
+            unsafe { self.context.as_mut() }.done_current();
         }
     }
 }

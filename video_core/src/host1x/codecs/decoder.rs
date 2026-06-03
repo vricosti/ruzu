@@ -6,24 +6,27 @@
 //! Base decoder trait and common decode logic. In C++ this is an abstract class
 //! `Tegra::Decoder`; in Rust we use a trait plus a shared helper struct.
 
-use std::sync::Arc;
-
 use log::error;
 
-use crate::host1x::ffmpeg::ffmpeg::{DecodeApi, Frame};
+use crate::host1x::ffmpeg::ffmpeg::DecodeApi;
+use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
 use crate::host1x::host1x::FrameQueue;
 use crate::host1x::nvdec_common::{NvdecRegisters, VideoCodec};
 
 /// Trait matching the virtual methods of the upstream `Tegra::Decoder` class.
-pub trait DecoderImpl {
+pub trait DecoderImpl: Send {
     /// Compose the frame bitstream for FFmpeg decoding.
-    fn compose_frame(&mut self) -> Vec<u8>;
+    fn compose_frame(
+        &mut self,
+        regs: &NvdecRegisters,
+        memory_manager: &MaxwellDeviceMemoryManager,
+    ) -> Vec<u8>;
 
     /// Get progressive luma/chroma offsets.
-    fn get_progressive_offsets(&self) -> (u64, u64);
+    fn get_progressive_offsets(&self, regs: &NvdecRegisters) -> (u64, u64);
 
     /// Get interlaced luma_top, luma_bottom, chroma_top, chroma_bottom offsets.
-    fn get_interlaced_offsets(&self) -> (u64, u64, u64, u64);
+    fn get_interlaced_offsets(&self, regs: &NvdecRegisters) -> (u64, u64, u64, u64);
 
     /// Whether the current frame is interlaced.
     fn is_interlaced(&self) -> bool;
@@ -68,14 +71,19 @@ impl DecoderState {
 /// enqueue the result.
 ///
 /// Port of `Tegra::Decoder::Decode`.
-pub fn decode(decoder: &mut dyn DecoderImpl, frame_queue: &FrameQueue) {
+pub fn decode(
+    decoder: &mut dyn DecoderImpl,
+    regs: &NvdecRegisters,
+    memory_manager: &MaxwellDeviceMemoryManager,
+    frame_queue: &FrameQueue,
+) {
     let state = decoder.state();
     if !state.initialized {
         return;
     }
     let id = state.id;
 
-    let packet_data = decoder.compose_frame();
+    let packet_data = decoder.compose_frame(regs, memory_manager);
 
     // Send assembled bitstream to decoder.
     if !decoder.state_mut().decode_api.send_packet(&packet_data) {
@@ -91,7 +99,8 @@ pub fn decode(decoder: &mut dyn DecoderImpl, frame_queue: &FrameQueue) {
     let frame = decoder.state_mut().decode_api.receive_frame();
 
     if decoder.is_interlaced() {
-        let (luma_top, luma_bottom, _chroma_top, _chroma_bottom) = decoder.get_interlaced_offsets();
+        let (luma_top, luma_bottom, _chroma_top, _chroma_bottom) =
+            decoder.get_interlaced_offsets(regs);
 
         if frame.is_none() {
             error!(
@@ -117,7 +126,7 @@ pub fn decode(decoder: &mut dyn DecoderImpl, frame_queue: &FrameQueue) {
             }
         }
     } else {
-        let (luma_offset, _chroma_offset) = decoder.get_progressive_offsets();
+        let (luma_offset, _chroma_offset) = decoder.get_progressive_offsets(regs);
 
         if frame.is_none() {
             error!(

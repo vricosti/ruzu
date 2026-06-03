@@ -98,11 +98,13 @@ pub mod video_set_predicate;
 pub mod vote;
 pub mod warp_shuffle;
 
+use crate::frontend::instruction::{Instruction, Predicate as ExecPredicate};
 use crate::frontend::maxwell_opcodes::{self, MaxwellOpcode, SrcType};
 use crate::ir::emitter::Emitter;
 use crate::ir::program::{Program, ShaderInfo};
 use crate::ir::types::ShaderStage;
-use crate::ir::value::{Reg, Value};
+use crate::ir::value::{Pred, Reg, Value};
+use crate::program_header::ProgramHeader;
 
 /// Maxwell instruction bit field extraction helpers.
 pub fn field(insn: u64, start: u32, len: u32) -> u32 {
@@ -129,14 +131,22 @@ pub fn sfield(insn: u64, start: u32, len: u32) -> i32 {
 pub struct TranslatorVisitor<'a> {
     pub ir: Emitter<'a>,
     pub stage: ShaderStage,
+    pub sph: Option<ProgramHeader>,
+    current_exec_pred: Option<ExecPredicate>,
 }
 
 impl<'a> TranslatorVisitor<'a> {
     pub fn new(program: &'a mut Program, block: u32) -> Self {
+        Self::new_with_sph(program, block, None)
+    }
+
+    pub fn new_with_sph(program: &'a mut Program, block: u32, sph: Option<ProgramHeader>) -> Self {
         let stage = program.stage;
         Self {
             ir: Emitter::new(program, block),
             stage,
+            sph,
+            current_exec_pred: None,
         }
     }
 
@@ -160,6 +170,15 @@ impl<'a> TranslatorVisitor<'a> {
     pub fn set_x(&mut self, reg_idx: u32, value: Value) {
         let reg = Reg(reg_idx as u8);
         if !reg.is_zero() {
+            let value = if let Some(exec_pred) = self.current_exec_pred {
+                let old = self.x(reg_idx);
+                let cond = self
+                    .ir
+                    .get_pred(Pred(exec_pred.index as u8), exec_pred.negated);
+                self.ir.select_u32(cond, value, old)
+            } else {
+                value
+            };
             self.ir.set_reg(reg, value);
         }
     }
@@ -361,12 +380,23 @@ impl<'a> TranslatorVisitor<'a> {
     ///
     /// Corresponds to the dispatch table in upstream `impl.cpp`.
     pub fn translate_instruction(&mut self, insn: u64) {
+        let exec_pred = Instruction::new(insn).pred();
+        if exec_pred.index == 7 && exec_pred.negated {
+            return;
+        }
         let opcode = match maxwell_opcodes::decode_opcode(insn) {
             Some(op) => op,
             None => {
                 log::warn!("Unknown Maxwell opcode: 0x{:016X}", insn);
                 return;
             }
+        };
+
+        let previous_exec_pred = self.current_exec_pred;
+        self.current_exec_pred = if exec_pred.index == 7 && !exec_pred.negated {
+            None
+        } else {
+            Some(exec_pred)
         };
 
         match opcode {
@@ -478,8 +508,14 @@ impl<'a> TranslatorVisitor<'a> {
             }
 
             // floating_point_conversion_floating_point.cpp
-            MaxwellOpcode::F2F_reg | MaxwellOpcode::F2F_cbuf | MaxwellOpcode::F2F_imm => {
-                self::floating_point_conversion_floating_point::f2f(self, insn, opcode);
+            MaxwellOpcode::F2F_reg => {
+                self::floating_point_conversion_floating_point::f2f_reg(self, insn);
+            }
+            MaxwellOpcode::F2F_cbuf => {
+                self::floating_point_conversion_floating_point::f2f_cbuf(self, insn);
+            }
+            MaxwellOpcode::F2F_imm => {
+                self::floating_point_conversion_floating_point::f2f_imm(self, insn);
             }
 
             // integer_to_integer_conversion.cpp
@@ -603,8 +639,11 @@ impl<'a> TranslatorVisitor<'a> {
             }
 
             // texture_gather.cpp
-            MaxwellOpcode::TLD4 | MaxwellOpcode::TLD4_b => {
+            MaxwellOpcode::TLD4 => {
                 self::texture_gather::tld4(self, insn, opcode);
+            }
+            MaxwellOpcode::TLD4_b => {
+                self::texture_gather::tld4_b(self, insn, opcode);
             }
 
             // texture_query.cpp
@@ -648,11 +687,9 @@ impl<'a> TranslatorVisitor<'a> {
             // NOP / dependency barrier
             MaxwellOpcode::NOP | MaxwellOpcode::DEPBAR => {}
 
-            // Kill
-            MaxwellOpcode::KIL => {
-                self.ir.demote_to_helper_invocation();
-                self.ir.program.info.uses_demote_to_helper_invocation = true;
-            }
+            // Kill. Upstream `TranslatorVisitor::KIL()` is a no-op; the
+            // structured control-flow pass owns demote/discard insertion.
+            MaxwellOpcode::KIL => {}
 
             // Memory barrier
             MaxwellOpcode::MEMBAR => {
@@ -668,5 +705,31 @@ impl<'a> TranslatorVisitor<'a> {
                 );
             }
         }
+        self.current_exec_pred = previous_exec_pred;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ir::basic_block::Block;
+    use crate::ir::opcodes::Opcode;
+    use crate::ir::program::Program;
+    use crate::ir::types::ShaderStage;
+
+    #[test]
+    fn kil_translate_is_noop_like_upstream() {
+        let mut program = Program::new(ShaderStage::Fragment);
+        program.blocks.push(Block::new());
+        let mut tv = TranslatorVisitor::new(&mut program, 0);
+
+        tv.translate_instruction(0xe330_0000_0000_0000);
+
+        let opcodes: Vec<_> = tv.ir.program.blocks[0]
+            .iter()
+            .map(|inst| inst.opcode)
+            .collect();
+        assert!(!opcodes.contains(&Opcode::DemoteToHelperInvocation));
+        assert!(!tv.ir.program.info.uses_demote_to_helper_invocation);
     }
 }

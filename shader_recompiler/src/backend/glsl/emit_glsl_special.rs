@@ -6,6 +6,7 @@
 //! Maps to upstream `backend/glsl/emit_glsl_special.cpp`.
 
 use super::glsl_emit_context::EmitContext;
+use crate::runtime_info::CompareFunction;
 
 fn output_vertex_index(ctx: &EmitContext) -> &'static str {
     if ctx.stage == crate::stage::Stage::TessellationControl {
@@ -73,6 +74,32 @@ pub fn emit_prologue(ctx: &mut EmitContext) {
     initialize_output_varyings(ctx);
 }
 pub fn emit_epilogue(_ctx: &mut EmitContext) {}
+pub fn emit_fragment_alpha_test(ctx: &mut EmitContext) {
+    let Some(func) = ctx.runtime_info.alpha_test_func else {
+        return;
+    };
+    if func == CompareFunction::Always {
+        return;
+    }
+    let op = match func {
+        CompareFunction::Never => None,
+        CompareFunction::Less => Some("<"),
+        CompareFunction::Equal => Some("=="),
+        CompareFunction::LessThanEqual => Some("<="),
+        CompareFunction::Greater => Some(">"),
+        CompareFunction::NotEqual => Some("!="),
+        CompareFunction::GreaterThanEqual => Some(">="),
+        CompareFunction::Always => unreachable!(),
+    };
+    if let Some(op) = op {
+        ctx.add_fmt(format!(
+            "if(!(frag_color0.a{}{}f)){{discard;}}",
+            op, ctx.runtime_info.alpha_test_reference
+        ));
+    } else {
+        ctx.add_line("discard;");
+    }
+}
 pub fn emit_emit_vertex(ctx: &mut EmitContext) {
     ctx.add_line("EmitVertex();");
     initialize_output_varyings(ctx);

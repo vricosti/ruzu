@@ -14,6 +14,9 @@
 use sdl2::sys as sdl;
 use std::ffi::CStr;
 
+use hid_core::frontend::emulated_controller::set_simple_npad_button;
+use hid_core::hid_types::{KeyboardKeyIndex, NpadButton};
+
 // SDL_TOUCH_MOUSEID is defined in SDL_touch.h as ((Uint32)-1).
 // It is not exported by sdl2-sys as a Rust constant, so we define it here.
 const SDL_TOUCH_MOUSEID: u32 = u32::MAX;
@@ -285,16 +288,29 @@ impl EmuWindowSdl2 {
     /// Called when a key is pressed or released.
     ///
     /// Maps to C++ `EmuWindow_SDL2::OnKeyEvent`.
-    /// Note: InputSubsystem::GetKeyboard not yet ported — logs and returns.
+    /// Note: full InputSubsystem button mapping is not wired yet. Until then,
+    /// a small command-line frontend mapping forwards common keyboard keys to
+    /// Player1's NPad button state.
     pub(crate) fn on_key_event(&mut self, key: i32, state: u8) {
-        // Upstream: input_subsystem->GetKeyboard()->PressKey(key) / ReleaseKey(key)
-        // InputSubsystem not yet ported.
-        let _ = (key, state);
-        log::trace!(
-            "on_key_event: key={} state={} (InputSubsystem not yet ported)",
-            key,
-            state
-        );
+        let pressed = state == sdl::SDL_PRESSED as u8;
+        let released = state == sdl::SDL_RELEASED as u8;
+        if !pressed && !released {
+            return;
+        }
+
+        let Some(button) = keyboard_key_to_npad_button(key) else {
+            log::trace!("on_key_event: unmapped key={} state={}", key, state);
+            return;
+        };
+        set_simple_npad_button(button, pressed);
+        if std::env::var_os("RUZU_TRACE_SIMPLE_INPUT").is_some() {
+            log::info!(
+                "[SIMPLE_INPUT] key={} button=0x{:X} pressed={}",
+                key,
+                button.bits(),
+                pressed
+            );
+        }
     }
 
     /// Converts an SDL mouse button constant to the `MouseButton` enum used by
@@ -472,6 +488,28 @@ impl EmuWindowSdl2 {
                 )
             };
         }
+    }
+}
+
+fn keyboard_key_to_npad_button(key: i32) -> Option<NpadButton> {
+    use KeyboardKeyIndex as Key;
+
+    match key {
+        x if x == Key::Z as i32 || x == Key::Space as i32 => Some(NpadButton::A),
+        x if x == Key::X as i32 => Some(NpadButton::B),
+        x if x == Key::S as i32 => Some(NpadButton::X),
+        x if x == Key::A as i32 => Some(NpadButton::Y),
+        x if x == Key::Q as i32 => Some(NpadButton::L),
+        x if x == Key::W as i32 => Some(NpadButton::R),
+        x if x == Key::E as i32 => Some(NpadButton::ZL),
+        x if x == Key::R as i32 => Some(NpadButton::ZR),
+        x if x == Key::Return as i32 => Some(NpadButton::PLUS),
+        x if x == Key::Backspace as i32 => Some(NpadButton::MINUS),
+        x if x == Key::LeftArrow as i32 => Some(NpadButton::LEFT),
+        x if x == Key::RightArrow as i32 => Some(NpadButton::RIGHT),
+        x if x == Key::UpArrow as i32 => Some(NpadButton::UP),
+        x if x == Key::DownArrow as i32 => Some(NpadButton::DOWN),
+        _ => None,
     }
 }
 

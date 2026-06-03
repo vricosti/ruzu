@@ -182,7 +182,10 @@ pub fn build_cfg(instructions: &[u64]) -> Vec<CfgBlock> {
                 let c = decode_predicate(last_insn);
                 (EndClass::Exit, c)
             }
-            Some(MaxwellOpcode::KIL) => (EndClass::Kill, Condition::always()),
+            Some(MaxwellOpcode::KIL) => {
+                let c = decode_predicate(last_insn);
+                (EndClass::Kill, c)
+            }
             Some(MaxwellOpcode::SYNC) => {
                 let c = decode_predicate(last_insn);
                 (EndClass::Branch, c)
@@ -290,5 +293,16 @@ mod tests {
 
         let backward_one_word = 0x00ff_fff8u64 << 20;
         assert_eq!(decode_branch_offset(backward_one_word), -1);
+    }
+
+    #[test]
+    fn kil_uses_instruction_predicate_like_upstream() {
+        let kil_p2_neg = 0xe330_0000_0000_0000u64 | (0b1010u64 << 16);
+        let cfg = build_cfg(&[kil_p2_neg]);
+
+        assert_eq!(cfg.len(), 1);
+        assert_eq!(cfg[0].end_class, EndClass::Kill);
+        assert_eq!(cfg[0].cond.pred, 2);
+        assert!(cfg[0].cond.negated);
     }
 }

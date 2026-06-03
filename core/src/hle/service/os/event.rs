@@ -208,18 +208,13 @@ impl Event {
     /// Signal the event. Wakes all waiters.
     /// Port of upstream `Event::Signal()` → `m_event->Signal()`.
     pub fn signal(&self) {
-        let trace_boot = std::env::var_os("RUZU_APPLET_BOOT_TRACE")
-            .is_some_and(|value| value != std::ffi::OsStr::new("0"));
-        {
-            let mut signaled = self.signaled.lock().unwrap();
-            *signaled = true;
-            self.cv.notify_all();
-        }
-        // Drop signaled lock before acquiring kernel locks to avoid deadlock.
+        self.signal_host_only();
 
         // Bridge to kernel: signal the KEvent owner, which wakes the readable end.
         if let Some(ref bridge) = *self.kernel_bridge.lock().unwrap() {
             let readable_object_id = bridge.readable_event.lock().unwrap().object_id;
+            let trace_boot = std::env::var_os("RUZU_APPLET_BOOT_TRACE")
+                .is_some_and(|value| value != std::ffi::OsStr::new("0"));
             if trace_boot {
                 log::info!(
                     "Service::Event::signal: bridging readable_object_id={} begin",
@@ -230,13 +225,31 @@ impl Event {
                 "Service::Event::signal bridging readable_object_id={}",
                 readable_object_id
             );
-            KEvent::signal_arc(&bridge.event, &bridge.process, &bridge.scheduler);
+            KEvent::signal_arc(&bridge.event, &bridge.process);
             if trace_boot {
                 log::info!(
                     "Service::Event::signal: bridge signal complete readable_object_id={}",
                     readable_object_id
                 );
             }
+        }
+    }
+
+    /// Wake only host-side waiters on this service event.
+    ///
+    /// This is used by internal `ServerManager` wakeup paths that only need to
+    /// poke the host service thread's condvar. Calling full `signal()` there can
+    /// re-enter the owning `KProcess` while the caller already holds its mutex.
+    pub fn signal_host_only(&self) {
+        let trace_boot = std::env::var_os("RUZU_APPLET_BOOT_TRACE")
+            .is_some_and(|value| value != std::ffi::OsStr::new("0"));
+        {
+            let mut signaled = self.signaled.lock().unwrap();
+            *signaled = true;
+            self.cv.notify_all();
+        }
+        if trace_boot {
+            log::info!("Service::Event::signal_host_only: host condvar signaled");
         }
     }
 

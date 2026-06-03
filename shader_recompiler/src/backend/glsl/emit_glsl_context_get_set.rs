@@ -9,6 +9,7 @@ use crate::ir;
 use crate::ir::instruction::Inst;
 use crate::ir::opcodes::Opcode;
 use crate::ir::value::{Attribute, InstRef, Value};
+use crate::runtime_info::AttributeType;
 
 use super::glsl_emit_context::EmitContext;
 use super::var_alloc::GlslVarType;
@@ -230,6 +231,77 @@ pub fn emit_get_cbuf(
             };
             get_cbuf(ctx, program, &ret, binding, offset, 32, cast, None);
         }
+        Opcode::GetCbufU32x2 => {
+            let cast = if ctx.profile.has_gl_cbuf_ftou_bug {
+                ""
+            } else {
+                "ftou"
+            };
+            let ret = ctx
+                .var_alloc
+                .define(inst_mut(program, inst_ref), GlslVarType::U32x2);
+            if offset.is_immediate() {
+                let u32_offset = offset.imm_u32();
+                let signed_offset = u32_offset as i32;
+                const CBUF_SIZE: u32 = 0x10000;
+                if signed_offset < 0 || u32_offset > CBUF_SIZE {
+                    ctx.add_fmt(format!("{}=uvec2(0u);", ret));
+                    return;
+                }
+                let cbuf = format!("{}_cbuf{}", ctx.stage_name, binding.imm_u32());
+                if u32_offset % 2 == 0 {
+                    ctx.add_fmt(format!(
+                        "{}={}({}[{}].{}{});",
+                        ret,
+                        cast,
+                        cbuf,
+                        u32_offset / 16,
+                        offset_swizzle(u32_offset),
+                        offset_swizzle(u32_offset + 4)
+                    ));
+                } else {
+                    ctx.add_fmt(format!(
+                        "{}=uvec2({}({}[{}].{}),{}({}[{}].{}));",
+                        ret,
+                        cast,
+                        cbuf,
+                        u32_offset / 16,
+                        offset_swizzle(u32_offset),
+                        cast,
+                        cbuf,
+                        (u32_offset + 4) / 16,
+                        offset_swizzle(u32_offset + 4)
+                    ));
+                }
+                return;
+            }
+
+            let offset_var = ctx.var_alloc.consume(program, offset);
+            let cbuf = choose_cbuf(ctx, program, binding, &format!("{}>>4", offset_var));
+            if !ctx.profile.has_gl_component_indexing_bug {
+                ctx.add_fmt(format!(
+                    "{}=uvec2({}({}[({}>>2)%4]),{}({}[(({}+4)>>2)%4]));",
+                    ret, cast, cbuf, offset_var, cast, cbuf, offset_var
+                ));
+                return;
+            }
+
+            let cbuf_offset = format!("{}>>2", offset_var);
+            for swizzle in 0..4 {
+                ctx.add_fmt(format!(
+                    "if(({}&3)=={}){}=uvec2({}({}.{}),{}({}.{}));",
+                    cbuf_offset,
+                    swizzle,
+                    ret,
+                    cast,
+                    cbuf,
+                    SWIZZLE[swizzle],
+                    cast,
+                    cbuf,
+                    SWIZZLE[(swizzle + 1) % 4]
+                ));
+            }
+        }
         _ => unreachable!("not a cbuf opcode: {:?}", opcode),
     }
 }
@@ -284,6 +356,8 @@ pub fn emit_get_attribute(
         Attribute::PRIMITIVE_ID => ctx.add_fmt(format!("{}=itof(gl_PrimitiveID);", ret)),
         Attribute::LAYER => ctx.add_fmt(format!("{}=itof(gl_Layer);", ret)),
         Attribute::POINT_SIZE => ctx.add_fmt(format!("{}=gl_PointSize;", ret)),
+        Attribute::INSTANCE_ID => ctx.add_fmt(format!("{}=itof(gl_InstanceID);", ret)),
+        Attribute::VERTEX_ID => ctx.add_fmt(format!("{}=itof(gl_VertexID);", ret)),
         Attribute::BASE_INSTANCE => ctx.add_fmt(format!("{}=itof(gl_BaseInstance);", ret)),
         Attribute::BASE_VERTEX => ctx.add_fmt(format!("{}=itof(gl_BaseVertex);", ret)),
         Attribute::DRAW_ID => ctx.add_fmt(format!("{}=itof(gl_DrawID);", ret)),
@@ -302,6 +376,8 @@ pub fn emit_get_attribute_u32(
         .define(inst_mut(program, inst_ref), GlslVarType::U32);
     match attr {
         Attribute::PRIMITIVE_ID => ctx.add_fmt(format!("{}=uint(gl_PrimitiveID);", ret)),
+        Attribute::INSTANCE_ID => ctx.add_fmt(format!("{}=uint(gl_InstanceID);", ret)),
+        Attribute::VERTEX_ID => ctx.add_fmt(format!("{}=uint(gl_VertexID);", ret)),
         Attribute::BASE_INSTANCE => ctx.add_fmt(format!("{}=uint(gl_BaseInstance);", ret)),
         Attribute::BASE_VERTEX => ctx.add_fmt(format!("{}=uint(gl_BaseVertex);", ret)),
         Attribute::DRAW_ID => ctx.add_fmt(format!("{}=uint(gl_DrawID);", ret)),
@@ -343,6 +419,11 @@ pub fn emit_set_attribute(ctx: &mut EmitContext, attr_raw: u32, value: &str) {
 
 pub fn emit_set_frag_color(ctx: &mut EmitContext, render_target: u32, component: u32, value: &str) {
     if component < 4 {
+        let value = match ctx.runtime_info.frag_color_types[render_target as usize] {
+            AttributeType::UnsignedInt => format!("floatBitsToUint({})", value),
+            AttributeType::SignedInt => format!("floatBitsToInt({})", value),
+            _ => value.to_string(),
+        };
         ctx.add_fmt(format!(
             "frag_color{}.{}={};",
             render_target, SWIZZLE[component as usize], value
@@ -361,7 +442,7 @@ mod tests {
     use crate::ir::value::{Attribute, Value};
     use crate::ir_opt::optimize;
     use crate::profile::Profile;
-    use crate::runtime_info::RuntimeInfo;
+    use crate::runtime_info::{AttributeType, CompareFunction, RuntimeInfo};
 
     #[test]
     fn glsl_cbuf_load_defines_ssa_value_and_declares_uniform() {
@@ -391,6 +472,31 @@ mod tests {
     }
 
     #[test]
+    fn glsl_cbuf_u32x2_matches_upstream_vector_load_shape() {
+        let mut program = crate::ir::Program::new(ShaderStage::VertexB);
+        program.blocks.push(Block::new());
+        program.info.register_cbuf(0);
+        {
+            let mut emitter = Emitter::new(&mut program, 0);
+            let pair = emitter.get_cbuf_u32x2(Value::ImmU32(0), Value::ImmU32(16));
+            let x = emitter.composite_extract_u32x2(pair, Value::ImmU32(0));
+            emitter.set_attribute(Attribute::generic(0, 0), x, Value::ImmU32(0));
+        }
+        optimize(&mut program);
+
+        let mut bindings = Bindings::default();
+        let source = emit_glsl(
+            &Profile::default(),
+            &RuntimeInfo::default(),
+            &mut program,
+            &mut bindings,
+        );
+
+        assert!(source.contains("u2_0=ftou(vs_cbuf0[1].xy);"));
+        assert!(source.contains("u_0=u2_0.x;"));
+    }
+
+    #[test]
     fn glsl_generic_input_defaults_when_previous_stage_did_not_store() {
         let mut program = crate::ir::Program::new(ShaderStage::VertexB);
         program.blocks.push(Block::new());
@@ -412,5 +518,91 @@ mod tests {
         assert!(source.contains("f_0=1.f;"));
         assert!(!source.contains("in_attr1"));
         assert!(source.contains("out_attr0.x=f_0;"));
+    }
+
+    #[test]
+    fn glsl_emits_vertex_and_instance_id_attributes() {
+        let mut program = crate::ir::Program::new(ShaderStage::VertexB);
+        program.blocks.push(Block::new());
+        {
+            let mut emitter = Emitter::new(&mut program, 0);
+            let instance = emitter.get_attribute(Attribute::INSTANCE_ID, Value::ImmU32(0));
+            let vertex = emitter.get_attribute_u32(Attribute::VERTEX_ID, Value::ImmU32(0));
+            let vertex = emitter.bit_cast_u32_f32(vertex);
+            emitter.set_attribute(Attribute::generic(0, 0), instance, Value::ImmU32(0));
+            emitter.set_attribute(Attribute::generic(0, 1), vertex, Value::ImmU32(0));
+        }
+        optimize(&mut program);
+
+        let mut bindings = Bindings::default();
+        let source = emit_glsl(
+            &Profile::default(),
+            &RuntimeInfo::default(),
+            &mut program,
+            &mut bindings,
+        );
+
+        assert!(source.contains("=itof(gl_InstanceID);"));
+        assert!(source.contains("=uint(gl_VertexID);"));
+        assert!(!source.contains("GetAttribute(190) not fully implemented"));
+        assert!(!source.contains("GetAttributeU32(191) not fully implemented"));
+    }
+
+    #[test]
+    fn glsl_set_frag_color_casts_integer_render_targets() {
+        let mut program = crate::ir::Program::new(ShaderStage::Fragment);
+        program.blocks.push(Block::new());
+        {
+            let mut emitter = Emitter::new(&mut program, 0);
+            emitter.set_frag_color(Value::ImmU32(0), Value::ImmU32(0), Value::ImmF32(1.0));
+            emitter.set_frag_color(Value::ImmU32(1), Value::ImmU32(1), Value::ImmF32(2.0));
+            emitter.set_frag_color(Value::ImmU32(2), Value::ImmU32(2), Value::ImmF32(3.0));
+        }
+        optimize(&mut program);
+
+        let mut runtime_info = RuntimeInfo::default();
+        runtime_info.frag_color_types[1] = AttributeType::UnsignedInt;
+        runtime_info.frag_color_types[2] = AttributeType::SignedInt;
+
+        let mut bindings = Bindings::default();
+        let source = emit_glsl(
+            &Profile::default(),
+            &runtime_info,
+            &mut program,
+            &mut bindings,
+        );
+
+        assert!(source.contains("frag_color0.x=1.f;"));
+        assert!(source.contains("frag_color1.y=floatBitsToUint(2.f);"));
+        assert!(source.contains("frag_color2.z=floatBitsToInt(3.f);"));
+    }
+
+    #[test]
+    fn glsl_fragment_alpha_test_discards_after_color_write() {
+        let mut program = crate::ir::Program::new(ShaderStage::Fragment);
+        program.blocks.push(Block::new());
+        {
+            let mut emitter = Emitter::new(&mut program, 0);
+            emitter.set_frag_color(Value::ImmU32(0), Value::ImmU32(3), Value::ImmF32(0.25));
+        }
+        optimize(&mut program);
+
+        let runtime_info = RuntimeInfo {
+            alpha_test_func: Some(CompareFunction::Greater),
+            alpha_test_reference: 0.5,
+            ..RuntimeInfo::default()
+        };
+
+        let mut bindings = Bindings::default();
+        let source = emit_glsl(
+            &Profile::default(),
+            &runtime_info,
+            &mut program,
+            &mut bindings,
+        );
+
+        let write_pos = source.find("frag_color0.w=0.25f;").unwrap();
+        let test_pos = source.find("if(!(frag_color0.a>0.5f)){discard;}").unwrap();
+        assert!(test_pos > write_pos);
     }
 }

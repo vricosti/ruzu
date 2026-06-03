@@ -156,6 +156,10 @@ impl<'a> Emitter<'a> {
         self.emit(Inst::new(Opcode::GetCbufU32, vec![binding, offset]))
     }
 
+    pub fn get_cbuf_u32x2(&mut self, binding: Value, offset: Value) -> Value {
+        self.emit(Inst::new(Opcode::GetCbufU32x2, vec![binding, offset]))
+    }
+
     pub fn get_cbuf_f32(&mut self, binding: Value, offset: Value) -> Value {
         self.emit(Inst::new(Opcode::GetCbufF32, vec![binding, offset]))
     }
@@ -370,16 +374,48 @@ impl<'a> Emitter<'a> {
         self.emit(Inst::new(Opcode::FPRoundEven32, vec![a]))
     }
 
+    pub fn fp_round_even_32_with_control(&mut self, a: Value, control: FpControl) -> Value {
+        self.emit(Inst::with_flags(
+            Opcode::FPRoundEven32,
+            vec![a],
+            control.to_u32(),
+        ))
+    }
+
     pub fn fp_floor_32(&mut self, a: Value) -> Value {
         self.emit(Inst::new(Opcode::FPFloor32, vec![a]))
+    }
+
+    pub fn fp_floor_32_with_control(&mut self, a: Value, control: FpControl) -> Value {
+        self.emit(Inst::with_flags(
+            Opcode::FPFloor32,
+            vec![a],
+            control.to_u32(),
+        ))
     }
 
     pub fn fp_ceil_32(&mut self, a: Value) -> Value {
         self.emit(Inst::new(Opcode::FPCeil32, vec![a]))
     }
 
+    pub fn fp_ceil_32_with_control(&mut self, a: Value, control: FpControl) -> Value {
+        self.emit(Inst::with_flags(
+            Opcode::FPCeil32,
+            vec![a],
+            control.to_u32(),
+        ))
+    }
+
     pub fn fp_trunc_32(&mut self, a: Value) -> Value {
         self.emit(Inst::new(Opcode::FPTrunc32, vec![a]))
+    }
+
+    pub fn fp_trunc_32_with_control(&mut self, a: Value, control: FpControl) -> Value {
+        self.emit(Inst::with_flags(
+            Opcode::FPTrunc32,
+            vec![a],
+            control.to_u32(),
+        ))
     }
 
     pub fn fp_recip_32(&mut self, a: Value) -> Value {
@@ -484,6 +520,112 @@ impl<'a> Emitter<'a> {
 
     pub fn fp_abs_64(&mut self, a: Value) -> Value {
         self.emit(Inst::new(Opcode::FPAbs64, vec![a]))
+    }
+
+    pub fn fp_add_64_with_control(&mut self, a: Value, b: Value, control: FpControl) -> Value {
+        self.emit(Inst::with_flags(
+            Opcode::FPAdd64,
+            vec![a, b],
+            control.to_u32(),
+        ))
+    }
+
+    pub fn fp_saturate_64(&mut self, a: Value) -> Value {
+        self.emit(Inst::new(Opcode::FPSaturate64, vec![a]))
+    }
+
+    pub fn fp_clamp_64(&mut self, value: Value, min: Value, max: Value) -> Value {
+        self.emit(Inst::new(Opcode::FPClamp64, vec![value, min, max]))
+    }
+
+    /// Port of upstream `IREmitter::LaneId()` — subgroup invocation index.
+    pub fn lane_id(&mut self) -> Value {
+        self.emit(Inst::new(Opcode::LaneId, vec![]))
+    }
+
+    // ── Shared-memory atomic helpers (port of `IREmitter::SharedAtomic*`) ──
+
+    pub fn shared_atomic_iadd_32(&mut self, offset: Value, value: Value) -> Value {
+        self.emit(Inst::new(Opcode::SharedAtomicIAdd32, vec![offset, value]))
+    }
+    pub fn shared_atomic_imin_32(&mut self, offset: Value, value: Value, is_signed: bool) -> Value {
+        let op = if is_signed {
+            Opcode::SharedAtomicSMin32
+        } else {
+            Opcode::SharedAtomicUMin32
+        };
+        self.emit(Inst::new(op, vec![offset, value]))
+    }
+    pub fn shared_atomic_imax_32(&mut self, offset: Value, value: Value, is_signed: bool) -> Value {
+        let op = if is_signed {
+            Opcode::SharedAtomicSMax32
+        } else {
+            Opcode::SharedAtomicUMax32
+        };
+        self.emit(Inst::new(op, vec![offset, value]))
+    }
+    pub fn shared_atomic_and_32(&mut self, offset: Value, value: Value) -> Value {
+        self.emit(Inst::new(Opcode::SharedAtomicAnd32, vec![offset, value]))
+    }
+    pub fn shared_atomic_or_32(&mut self, offset: Value, value: Value) -> Value {
+        self.emit(Inst::new(Opcode::SharedAtomicOr32, vec![offset, value]))
+    }
+    pub fn shared_atomic_xor_32(&mut self, offset: Value, value: Value) -> Value {
+        self.emit(Inst::new(Opcode::SharedAtomicXor32, vec![offset, value]))
+    }
+    pub fn shared_atomic_exchange_32(&mut self, offset: Value, value: Value) -> Value {
+        self.emit(Inst::new(
+            Opcode::SharedAtomicExchange32,
+            vec![offset, value],
+        ))
+    }
+
+    pub fn fp_round_even_64(&mut self, a: Value) -> Value {
+        self.emit(Inst::new(Opcode::FPRoundEven64, vec![a]))
+    }
+
+    pub fn fp_round_even_64_with_control(&mut self, a: Value, control: FpControl) -> Value {
+        self.emit(Inst::with_flags(
+            Opcode::FPRoundEven64,
+            vec![a],
+            control.to_u32(),
+        ))
+    }
+
+    pub fn fp_floor_64(&mut self, a: Value) -> Value {
+        self.emit(Inst::new(Opcode::FPFloor64, vec![a]))
+    }
+
+    pub fn fp_floor_64_with_control(&mut self, a: Value, control: FpControl) -> Value {
+        self.emit(Inst::with_flags(
+            Opcode::FPFloor64,
+            vec![a],
+            control.to_u32(),
+        ))
+    }
+
+    pub fn fp_ceil_64(&mut self, a: Value) -> Value {
+        self.emit(Inst::new(Opcode::FPCeil64, vec![a]))
+    }
+
+    pub fn fp_ceil_64_with_control(&mut self, a: Value, control: FpControl) -> Value {
+        self.emit(Inst::with_flags(
+            Opcode::FPCeil64,
+            vec![a],
+            control.to_u32(),
+        ))
+    }
+
+    pub fn fp_trunc_64(&mut self, a: Value) -> Value {
+        self.emit(Inst::new(Opcode::FPTrunc64, vec![a]))
+    }
+
+    pub fn fp_trunc_64_with_control(&mut self, a: Value, control: FpControl) -> Value {
+        self.emit(Inst::with_flags(
+            Opcode::FPTrunc64,
+            vec![a],
+            control.to_u32(),
+        ))
     }
 
     // ── Integer arithmetic ────────────────────────────────────────────
@@ -721,22 +863,85 @@ impl<'a> Emitter<'a> {
         self.emit(Inst::new(Opcode::ConvertF16F32, vec![a]))
     }
 
+    pub fn convert_f16_from_f32_with_control(&mut self, a: Value, control: FpControl) -> Value {
+        self.emit(Inst::with_flags(
+            Opcode::ConvertF16F32,
+            vec![a],
+            control.to_u32(),
+        ))
+    }
+
     pub fn convert_f32_from_f16(&mut self, a: Value) -> Value {
         self.emit(Inst::new(Opcode::ConvertF32F16, vec![a]))
+    }
+
+    pub fn convert_f32_from_f16_with_control(&mut self, a: Value, control: FpControl) -> Value {
+        self.emit(Inst::with_flags(
+            Opcode::ConvertF32F16,
+            vec![a],
+            control.to_u32(),
+        ))
     }
 
     pub fn convert_f64_from_f32(&mut self, a: Value) -> Value {
         self.emit(Inst::new(Opcode::ConvertF64F32, vec![a]))
     }
 
+    pub fn convert_f64_from_f32_with_control(&mut self, a: Value, control: FpControl) -> Value {
+        self.emit(Inst::with_flags(
+            Opcode::ConvertF64F32,
+            vec![a],
+            control.to_u32(),
+        ))
+    }
+
     pub fn convert_f32_from_f64(&mut self, a: Value) -> Value {
         self.emit(Inst::new(Opcode::ConvertF32F64, vec![a]))
+    }
+
+    pub fn convert_f32_from_f64_with_control(&mut self, a: Value, control: FpControl) -> Value {
+        self.emit(Inst::with_flags(
+            Opcode::ConvertF32F64,
+            vec![a],
+            control.to_u32(),
+        ))
+    }
+
+    /// Polymorphic float conversion. Port of upstream
+    /// `IREmitter::FPConvert(size_t result_bitsize, const F16F32F64& value, FpControl control)`.
+    ///
+    /// Same-width inputs return `src` unchanged. F16↔F64 panics, matching
+    /// upstream's `throw LogicError("Illegal conversion from F64 to F16")`.
+    pub fn fp_convert(
+        &mut self,
+        target_bits: u32,
+        src: Value,
+        src_bits: u32,
+        control: FpControl,
+    ) -> Value {
+        match (target_bits, src_bits) {
+            (16, 16) | (32, 32) | (64, 64) => src,
+            (16, 32) => self.convert_f16_from_f32_with_control(src, control),
+            (32, 16) => self.convert_f32_from_f16_with_control(src, control),
+            (32, 64) => self.convert_f32_from_f64_with_control(src, control),
+            (64, 32) => self.convert_f64_from_f32_with_control(src, control),
+            (16, 64) => panic!("Illegal conversion from F64 to F16"),
+            (64, 16) => panic!("Illegal conversion from F16 to F64"),
+            _ => panic!(
+                "Conversion from {} to {} bits not implemented",
+                src_bits, target_bits
+            ),
+        }
     }
 
     // ── Composite (vector) ────────────────────────────────────────────
 
     pub fn composite_construct_u32x2(&mut self, a: Value, b: Value) -> Value {
         self.emit(Inst::new(Opcode::CompositeConstructU32x2, vec![a, b]))
+    }
+
+    pub fn composite_construct_u32x3(&mut self, a: Value, b: Value, c: Value) -> Value {
+        self.emit(Inst::new(Opcode::CompositeConstructU32x3, vec![a, b, c]))
     }
 
     pub fn composite_construct_u32x4(&mut self, a: Value, b: Value, c: Value, d: Value) -> Value {
@@ -761,6 +966,10 @@ impl<'a> Emitter<'a> {
         self.emit(Inst::new(Opcode::CompositeConstructF32x2, vec![a, b]))
     }
 
+    pub fn composite_construct_f32x3(&mut self, a: Value, b: Value, c: Value) -> Value {
+        self.emit(Inst::new(Opcode::CompositeConstructF32x3, vec![a, b, c]))
+    }
+
     pub fn composite_construct_f32x4(&mut self, a: Value, b: Value, c: Value, d: Value) -> Value {
         self.emit(Inst::new(Opcode::CompositeConstructF32x4, vec![a, b, c, d]))
     }
@@ -778,8 +987,24 @@ impl<'a> Emitter<'a> {
         self.emit(Inst::new(Opcode::LoadGlobal32, vec![addr]))
     }
 
+    pub fn load_global_64(&mut self, addr: Value) -> Value {
+        self.emit(Inst::new(Opcode::LoadGlobal64, vec![addr]))
+    }
+
+    pub fn load_global_128(&mut self, addr: Value) -> Value {
+        self.emit(Inst::new(Opcode::LoadGlobal128, vec![addr]))
+    }
+
     pub fn write_global_32(&mut self, addr: Value, value: Value) {
         self.emit_void(Inst::new(Opcode::WriteGlobal32, vec![addr, value]));
+    }
+
+    pub fn write_global_64(&mut self, addr: Value, value: Value) {
+        self.emit_void(Inst::new(Opcode::WriteGlobal64, vec![addr, value]));
+    }
+
+    pub fn write_global_128(&mut self, addr: Value, value: Value) {
+        self.emit_void(Inst::new(Opcode::WriteGlobal128, vec![addr, value]));
     }
 
     pub fn load_local(&mut self, offset: Value) -> Value {
@@ -803,10 +1028,36 @@ impl<'a> Emitter<'a> {
 
     // ── Texture ───────────────────────────────────────────────────────
 
-    pub fn image_sample_implicit_lod(&mut self, handle: Value, coords: Value, info: u32) -> Value {
+    pub fn image_sample_implicit_lod_full(
+        &mut self,
+        handle: Value,
+        coords: Value,
+        bias_lc: Value,
+        offset: Value,
+        info: u32,
+    ) -> Value {
         self.emit(Inst::with_flags(
             Opcode::ImageSampleImplicitLod,
-            vec![handle, coords],
+            vec![handle, coords, bias_lc, offset],
+            info,
+        ))
+    }
+
+    pub fn image_sample_implicit_lod(&mut self, handle: Value, coords: Value, info: u32) -> Value {
+        self.image_sample_implicit_lod_full(handle, coords, Value::Void, Value::Void, info)
+    }
+
+    pub fn image_sample_explicit_lod_full(
+        &mut self,
+        handle: Value,
+        coords: Value,
+        lod: Value,
+        offset: Value,
+        info: u32,
+    ) -> Value {
+        self.emit(Inst::with_flags(
+            Opcode::ImageSampleExplicitLod,
+            vec![handle, coords, lod, offset],
             info,
         ))
     }
@@ -818,17 +1069,73 @@ impl<'a> Emitter<'a> {
         lod: Value,
         info: u32,
     ) -> Value {
+        self.image_sample_explicit_lod_full(handle, coords, lod, Value::Void, info)
+    }
+
+    pub fn image_sample_dref_implicit_lod_full(
+        &mut self,
+        handle: Value,
+        coords: Value,
+        dref: Value,
+        bias_lc: Value,
+        offset: Value,
+        info: u32,
+    ) -> Value {
         self.emit(Inst::with_flags(
-            Opcode::ImageSampleExplicitLod,
-            vec![handle, coords, lod],
+            Opcode::ImageSampleDrefImplicitLod,
+            vec![handle, coords, dref, bias_lc, offset],
             info,
         ))
+    }
+
+    pub fn image_sample_dref_implicit_lod(
+        &mut self,
+        handle: Value,
+        coords: Value,
+        dref: Value,
+        info: u32,
+    ) -> Value {
+        self.image_sample_dref_implicit_lod_full(
+            handle,
+            coords,
+            dref,
+            Value::Void,
+            Value::Void,
+            info,
+        )
+    }
+
+    pub fn image_sample_dref_explicit_lod_full(
+        &mut self,
+        handle: Value,
+        coords: Value,
+        dref: Value,
+        lod: Value,
+        offset: Value,
+        info: u32,
+    ) -> Value {
+        self.emit(Inst::with_flags(
+            Opcode::ImageSampleDrefExplicitLod,
+            vec![handle, coords, dref, lod, offset],
+            info,
+        ))
+    }
+
+    pub fn image_sample_dref_explicit_lod(
+        &mut self,
+        handle: Value,
+        coords: Value,
+        dref: Value,
+        lod: Value,
+        info: u32,
+    ) -> Value {
+        self.image_sample_dref_explicit_lod_full(handle, coords, dref, lod, Value::Void, info)
     }
 
     pub fn image_fetch(&mut self, handle: Value, coords: Value, lod: Value, info: u32) -> Value {
         self.emit(Inst::with_flags(
             Opcode::ImageFetch,
-            vec![handle, coords, lod],
+            vec![handle, coords, Value::Void, lod, Value::Void],
             info,
         ))
     }
@@ -841,10 +1148,37 @@ impl<'a> Emitter<'a> {
         ))
     }
 
-    pub fn image_gather(&mut self, handle: Value, coords: Value, info: u32) -> Value {
+    pub fn image_gather_full(
+        &mut self,
+        handle: Value,
+        coords: Value,
+        offset: Value,
+        offset2: Value,
+        info: u32,
+    ) -> Value {
         self.emit(Inst::with_flags(
             Opcode::ImageGather,
-            vec![handle, coords],
+            vec![handle, coords, offset, offset2],
+            info,
+        ))
+    }
+
+    pub fn image_gather(&mut self, handle: Value, coords: Value, info: u32) -> Value {
+        self.image_gather_full(handle, coords, Value::Void, Value::Void, info)
+    }
+
+    pub fn image_gather_dref_full(
+        &mut self,
+        handle: Value,
+        coords: Value,
+        offset: Value,
+        offset2: Value,
+        dref: Value,
+        info: u32,
+    ) -> Value {
+        self.emit(Inst::with_flags(
+            Opcode::ImageGatherDref,
+            vec![handle, coords, offset, offset2, dref],
             info,
         ))
     }
@@ -856,11 +1190,49 @@ impl<'a> Emitter<'a> {
         dref: Value,
         info: u32,
     ) -> Value {
+        self.image_gather_dref_full(handle, coords, Value::Void, Value::Void, dref, info)
+    }
+
+    /// Port of `IREmitter::ImageQueryLod`.
+    pub fn image_query_lod(&mut self, handle: Value, coords: Value, info: u32) -> Value {
         self.emit(Inst::with_flags(
-            Opcode::ImageGatherDref,
-            vec![handle, coords, dref],
+            Opcode::ImageQueryLod,
+            vec![handle, coords],
             info,
         ))
+    }
+
+    /// Port of `IREmitter::ImageGradient`.
+    pub fn image_gradient(
+        &mut self,
+        handle: Value,
+        coords: Value,
+        derivatives: Value,
+        info: u32,
+    ) -> Value {
+        self.emit(Inst::with_flags(
+            Opcode::ImageGradient,
+            vec![handle, coords, derivatives],
+            info,
+        ))
+    }
+
+    /// Port of `IREmitter::ImageRead`.
+    pub fn image_read(&mut self, handle: Value, coords: Value, info: u32) -> Value {
+        self.emit(Inst::with_flags(
+            Opcode::ImageRead,
+            vec![handle, coords],
+            info,
+        ))
+    }
+
+    /// Port of `IREmitter::ImageWrite`.
+    pub fn image_write(&mut self, handle: Value, coords: Value, color: Value, info: u32) {
+        let _ = self.emit(Inst::with_flags(
+            Opcode::ImageWrite,
+            vec![handle, coords, color],
+            info,
+        ));
     }
 
     // ── Warp / Subgroup ───────────────────────────────────────────────
@@ -879,6 +1251,21 @@ impl<'a> Emitter<'a> {
 
     pub fn subgroup_ballot(&mut self, pred: Value) -> Value {
         self.emit(Inst::new(Opcode::SubgroupBallot, vec![pred]))
+    }
+
+    pub fn shuffle_up(&mut self, value: Value, index: Value, seg_mask: Value) -> Value {
+        self.emit(Inst::new(Opcode::ShuffleUp, vec![value, index, seg_mask]))
+    }
+
+    pub fn shuffle_down(&mut self, value: Value, index: Value, seg_mask: Value) -> Value {
+        self.emit(Inst::new(Opcode::ShuffleDown, vec![value, index, seg_mask]))
+    }
+
+    pub fn shuffle_butterfly(&mut self, value: Value, index: Value, seg_mask: Value) -> Value {
+        self.emit(Inst::new(
+            Opcode::ShuffleButterfly,
+            vec![value, index, seg_mask],
+        ))
     }
 
     pub fn shuffle_index(&mut self, value: Value, index: Value, seg_mask: Value) -> Value {
@@ -1019,6 +1406,62 @@ impl<'a> Emitter<'a> {
         self.emit(Inst::new(Opcode::FPAdd16, vec![a, b]))
     }
 
+    pub fn fp_add_16_with_control(&mut self, a: Value, b: Value, control: FpControl) -> Value {
+        self.emit(Inst::with_flags(
+            Opcode::FPAdd16,
+            vec![a, b],
+            control.to_u32(),
+        ))
+    }
+
+    pub fn fp_round_even_16(&mut self, a: Value) -> Value {
+        self.emit(Inst::new(Opcode::FPRoundEven16, vec![a]))
+    }
+
+    pub fn fp_round_even_16_with_control(&mut self, a: Value, control: FpControl) -> Value {
+        self.emit(Inst::with_flags(
+            Opcode::FPRoundEven16,
+            vec![a],
+            control.to_u32(),
+        ))
+    }
+
+    pub fn fp_floor_16(&mut self, a: Value) -> Value {
+        self.emit(Inst::new(Opcode::FPFloor16, vec![a]))
+    }
+
+    pub fn fp_floor_16_with_control(&mut self, a: Value, control: FpControl) -> Value {
+        self.emit(Inst::with_flags(
+            Opcode::FPFloor16,
+            vec![a],
+            control.to_u32(),
+        ))
+    }
+
+    pub fn fp_ceil_16(&mut self, a: Value) -> Value {
+        self.emit(Inst::new(Opcode::FPCeil16, vec![a]))
+    }
+
+    pub fn fp_ceil_16_with_control(&mut self, a: Value, control: FpControl) -> Value {
+        self.emit(Inst::with_flags(
+            Opcode::FPCeil16,
+            vec![a],
+            control.to_u32(),
+        ))
+    }
+
+    pub fn fp_trunc_16(&mut self, a: Value) -> Value {
+        self.emit(Inst::new(Opcode::FPTrunc16, vec![a]))
+    }
+
+    pub fn fp_trunc_16_with_control(&mut self, a: Value, control: FpControl) -> Value {
+        self.emit(Inst::with_flags(
+            Opcode::FPTrunc16,
+            vec![a],
+            control.to_u32(),
+        ))
+    }
+
     pub fn fp_mul_16(&mut self, a: Value, b: Value) -> Value {
         self.emit(Inst::new(Opcode::FPMul16, vec![a, b]))
     }
@@ -1153,6 +1596,14 @@ impl<'a> Emitter<'a> {
 
     pub fn shift_left_logical_64(&mut self, base: Value, shift: Value) -> Value {
         self.emit(Inst::new(Opcode::ShiftLeftLogical64, vec![base, shift]))
+    }
+
+    pub fn shift_right_logical_64(&mut self, base: Value, shift: Value) -> Value {
+        self.emit(Inst::new(Opcode::ShiftRightLogical64, vec![base, shift]))
+    }
+
+    pub fn shift_right_arithmetic_64(&mut self, base: Value, shift: Value) -> Value {
+        self.emit(Inst::new(Opcode::ShiftRightArithmetic64, vec![base, shift]))
     }
 
     // ── Integer negate 64 ────────────────────────────────────────────

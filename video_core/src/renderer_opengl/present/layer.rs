@@ -15,6 +15,33 @@ use crate::framebuffer_config::{self, FramebufferConfig};
 use crate::renderer_opengl::RasterizerOpenGL;
 use ruzu_core::frontend::framebuffer_layout::FramebufferLayout;
 
+const PRESENT_LAYER_SENTINEL: u64 = u64::MAX;
+
+fn trace_present_layer(stage: u64, framebuffer: &FramebufferConfig, gpu_addr: u64, aux: &[u64]) {
+    if !common::trace::is_enabled(common::trace::cat::PRESENT_TEXTURE) {
+        return;
+    }
+    let mut args = [
+        PRESENT_LAYER_SENTINEL,
+        stage,
+        gpu_addr,
+        framebuffer.address,
+        framebuffer.offset as u64,
+        framebuffer.width as u64,
+        framebuffer.height as u64,
+        framebuffer.stride as u64,
+        framebuffer.pixel_format.0 as u64,
+        0,
+        0,
+        0,
+        0,
+    ];
+    for (index, value) in aux.iter().take(4).enumerate() {
+        args[9 + index] = *value;
+    }
+    let _ = common::trace::emit_raw(common::trace::cat::PRESENT_TEXTURE, &args);
+}
+
 /// Information about a framebuffer texture for display.
 ///
 /// Corresponds to `OpenGL::FramebufferTextureInfo` (used in gl_blit_screen).
@@ -193,12 +220,25 @@ impl Layer {
         device_memory: Option<&crate::renderer_base::DeviceMemoryReader>,
     ) -> FramebufferTextureInfo {
         let framebuffer_addr = framebuffer.address + framebuffer.offset as u64;
+        trace_present_layer(1, framebuffer, framebuffer_addr, &[]);
 
         if let Some(info) =
             rasterizer.accelerate_display(framebuffer, framebuffer_addr, framebuffer.stride)
         {
+            trace_present_layer(
+                2,
+                framebuffer,
+                framebuffer_addr,
+                &[
+                    info.display_texture as u64,
+                    info.width as u64,
+                    info.height as u64,
+                    ((info.scaled_width as u64) << 32) | info.scaled_height as u64,
+                ],
+            );
             return info;
         }
+        trace_present_layer(3, framebuffer, framebuffer_addr, &[]);
 
         if framebuffer_addr == 0 {
             // No framebuffer address — return empty texture.
@@ -267,6 +307,35 @@ impl Layer {
                 1, // stride_alignment
             );
 
+            if common::trace::is_enabled(common::trace::cat::PRESENT_TEXTURE) {
+                let sample = &self.gl_framebuffer_data[..linear_size.min(4096)];
+                let nonzero = sample.iter().filter(|&&byte| byte != 0).count() as u64;
+                let checksum = sample
+                    .iter()
+                    .fold(0u64, |acc, &byte| acc.wrapping_mul(16777619) ^ byte as u64);
+                let first_rgba = self
+                    .gl_framebuffer_data
+                    .get(0..4)
+                    .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()) as u64)
+                    .unwrap_or(0);
+                let last_rgba = linear_size
+                    .checked_sub(4)
+                    .and_then(|start| self.gl_framebuffer_data.get(start..start + 4))
+                    .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()) as u64)
+                    .unwrap_or(0);
+                trace_present_layer(
+                    4,
+                    framebuffer,
+                    framebuffer_addr,
+                    &[
+                        size_in_bytes as u64,
+                        nonzero,
+                        checksum,
+                        (first_rgba << 32) | last_rgba,
+                    ],
+                );
+            }
+
             if std::env::var_os("RUZU_TRACE_PRESENT").is_some() {
                 let nonzero = self.gl_framebuffer_data[..linear_size]
                     .iter()
@@ -304,6 +373,8 @@ impl Layer {
                 );
                 gl::PixelStorei(gl::UNPACK_ROW_LENGTH, 0);
             }
+        } else {
+            trace_present_layer(5, framebuffer, framebuffer_addr, &[]);
         }
 
         FramebufferTextureInfo {

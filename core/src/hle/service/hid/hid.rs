@@ -214,6 +214,17 @@ pub fn loop_process(system: crate::core::SystemRef) {
         );
     }
 
+    if std::env::var_os("RUZU_HID_HOST_POLL_NPAD").is_some() {
+        let resource_manager = resource_manager.clone();
+        std::thread::Builder::new()
+            .name("ruzu-hid-npad-poll".to_string())
+            .spawn(move || loop {
+                std::thread::sleep(NPAD_UPDATE_NS);
+                resource_manager.lock().update_npad(Duration::ZERO);
+            })
+            .expect("spawn HID NPad polling thread");
+    }
+
     let _hid_update_events = [
         npad_update_event,
         default_update_event,

@@ -152,7 +152,11 @@ fn should_trace_core_dispatch(core_index: usize) -> bool {
 /// MK8D wedge where tid=99's wakes take ~1 second despite end_wait firing
 /// promptly — we want to see, per core, when the JIT inner-loop exits and
 /// when reschedule actually swaps threads.
-fn trace_core_dispatch(core_index: usize, phase: &str, thread: &Arc<crate::hle::kernel::k_thread::KThreadLock>) {
+fn trace_core_dispatch(
+    core_index: usize,
+    phase: &str,
+    thread: &Arc<crate::hle::kernel::k_thread::KThreadLock>,
+) {
     if !should_trace_core_dispatch(core_index) {
         return;
     }
@@ -600,7 +604,11 @@ impl CpuManager {
             // Clear any stale interrupt before entering the JIT loop.
             // The preemption timer may have fired while we were in the scheduler.
             if physical_core.is_interrupted() {
-                trace_core_dispatch(physical_core.core_index(), "pre_inner stale_interrupt", &thread_arc);
+                trace_core_dispatch(
+                    physical_core.core_index(),
+                    "pre_inner stale_interrupt",
+                    &thread_arc,
+                );
                 Self::handle_interrupt(kernel);
             }
             trace_core_dispatch(physical_core.core_index(), "enter_inner_loop", &thread_arc);
@@ -619,7 +627,11 @@ impl CpuManager {
             trace_core_dispatch(physical_core.core_index(), "exit_inner_loop", &thread_arc);
 
             Self::handle_interrupt(kernel);
-            trace_core_dispatch(physical_core.core_index(), "after_handle_interrupt", &thread_arc);
+            trace_core_dispatch(
+                physical_core.core_index(),
+                "after_handle_interrupt",
+                &thread_arc,
+            );
             Self::shutdown_if_requested(kernel);
             // Upstream: RequestScheduleOnInterrupt → ScheduleOnInterrupt → fiber yield.
             // Done outside any Mutex lock to avoid deadlock (see reschedule_current_core_raw).
@@ -770,7 +782,10 @@ impl CpuManager {
                     svc_num,
                     mut svc_args,
                 } => {
-                    let current_thread_id = thread_arc.lock().unwrap().get_thread_id();
+                    let (current_thread_id, current_thread_priority) = {
+                        let thread = thread_arc.lock().unwrap();
+                        (thread.get_thread_id(), thread.get_priority())
+                    };
                     if current_thread_id == 17 || current_thread_id >= 18 {
                         let mut tc = crate::arm::arm_interface::ThreadContext::default();
                         jit_ref.get_context(&mut tc);
@@ -819,11 +834,21 @@ impl CpuManager {
                         crate::hle::kernel::kernel::record_guest_full(
                             core_index, tc_pc.pc, tc_pc.lr, tc_pc.sp, &tc_pc.r,
                         );
+                        crate::hle::kernel::svc_dispatch::record_svc_ring(
+                            current_thread_id,
+                            current_thread_priority,
+                            core_index as i32,
+                            svc_num,
+                            tc_pc.pc,
+                            tc_pc.lr,
+                            tc_pc.sp,
+                            &svc_args,
+                        );
                     }
                     let system_ref = kernel.system();
                     if !system_ref.is_null() {
                         let system = system_ref.get();
-                        physical_core.dispatch_supervisor_call(
+                        let continue_thread = physical_core.dispatch_supervisor_call(
                             jit_ref,
                             &mut thread_context,
                             &scheduler,
@@ -835,6 +860,10 @@ impl CpuManager {
                             &mut svc_args,
                             system,
                         );
+                        if !continue_thread {
+                            Self::reschedule_current_core_raw(kernel);
+                            return;
+                        }
                         let (switched_scheduler_thread, needs_scheduling) = {
                             let scheduler = scheduler.lock().unwrap();
                             (
@@ -863,7 +892,7 @@ impl CpuManager {
                         }
                         if switched_scheduler_thread || needs_scheduling {
                             log::trace!(
-                                "multi_core_run_guest_thread: tid={} core={} svc=0x{:x} defer reschedule after SVC switched={} blocked={} needs_sched={}",
+                                "multi_core_run_guest_thread: tid={} core={} svc=0x{:x} reschedule after SVC switched={} blocked={} needs_sched={}",
                                 current_thread_id,
                                 core_index,
                                 svc_num,
@@ -871,6 +900,10 @@ impl CpuManager {
                                 current_thread_blocked,
                                 needs_scheduling,
                             );
+                            if std::env::var_os("RUZU_DISABLE_POST_SVC_RESCHEDULE").is_none() {
+                                Self::reschedule_current_core_raw(kernel);
+                                return;
+                            }
                         }
                         log::trace!(
                             "multi_core_run_guest_thread: tid={} core={} svc=0x{:x} returned from svc_dispatch r0=0x{:X} r1=0x{:X}",
@@ -967,21 +1000,148 @@ impl CpuManager {
                             breakpoint,
                         );
                     }
+                    let zero_pc_break_loop = interrupt && _spin_pc.pc == 0;
+
                     // Upstream: if (breakpoint || prefetch_abort) {
                     //     thread->RequestSuspend(SuspendType::Debug); return; }
+                    // Upstream then handles data_abort the same way. The Rust
+                    // Dynarmic bridge can currently surface a null-PC fetch as
+                    // BreakLoop instead of PrefetchAbort after an interrupt;
+                    // treat that as the same non-continuable state so the
+                    // guest thread does not spin forever at PC=0.
                     // Without this, the thread re-executes the faulting PC forever.
-                    if breakpoint || prefetch_abort {
+                    if breakpoint || prefetch_abort || data_abort || zero_pc_break_loop {
                         if breakpoint {
                             jit_ref.rewind_breakpoint_instruction();
                         }
                         {
                             let mut tc = crate::arm::arm_interface::ThreadContext::default();
                             jit_ref.get_context(&mut tc);
+                            let reason = if zero_pc_break_loop {
+                                "BreakLoopNullPc"
+                            } else if data_abort {
+                                "DataAbort"
+                            } else if prefetch_abort {
+                                "PrefetchAbort"
+                            } else {
+                                "Breakpoint"
+                            };
+                            if zero_pc_break_loop
+                                && std::env::var_os("RUZU_DUMP_NULL_PC_CONTEXT").is_some()
+                            {
+                                let system_ref = kernel.system();
+                                if !system_ref.is_null() {
+                                    if let Some(memory) = system_ref.get().memory_shared() {
+                                        use std::fmt::Write;
+
+                                        let mem = memory.lock().unwrap();
+                                        let mut regs = String::new();
+                                        for i in 0..13 {
+                                            let _ =
+                                                write!(regs, " r{}=0x{:08X}", i, tc.r[i] as u32);
+                                        }
+                                        log::error!(
+                                            "[NULL_PC_CONTEXT] tid={} core={} pstate=0x{:08X} lr=0x{:08X} sp=0x{:08X}{}",
+                                            current_thread_id,
+                                            core_index,
+                                            tc.pstate,
+                                            tc.lr as u32,
+                                            tc.sp as u32,
+                                            regs
+                                        );
+
+                                        let mut stack = String::new();
+                                        for i in 0..32u64 {
+                                            if i % 8 == 0 {
+                                                let _ = write!(
+                                                    stack,
+                                                    "\n  0x{:08X}:",
+                                                    tc.sp.wrapping_add(i * 4) as u32
+                                                );
+                                            }
+                                            let word = mem.read_32(tc.sp.wrapping_add(i * 4));
+                                            let _ = write!(stack, " {:08X}", word);
+                                        }
+                                        log::error!("[NULL_PC_STACK]{}", stack);
+
+                                        for &reg_index in
+                                            &[1usize, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+                                        {
+                                            let ptr = tc.r[reg_index];
+                                            if ptr < 0x10000 {
+                                                continue;
+                                            }
+                                            let mut words = String::new();
+                                            for i in 0..8u64 {
+                                                let word = mem.read_32(ptr.wrapping_add(i * 4));
+                                                let _ = write!(words, " {:08X}", word);
+                                            }
+                                            log::error!(
+                                                "[NULL_PC_PTR] r{}=0x{:08X}:{}",
+                                                reg_index,
+                                                ptr as u32,
+                                                words
+                                            );
+                                        }
+
+                                        if (tc.lr as u32) == 0x00A325B8 {
+                                            let trampoline_ptr_slot = mem.read_32(0x00ED6DB0);
+                                            let trampoline_target_slot =
+                                                mem.read_32(trampoline_ptr_slot as u64);
+                                            let mut slot_words = String::new();
+                                            for i in 0..8u64 {
+                                                let word = mem.read_32(
+                                                    (trampoline_ptr_slot as u64)
+                                                        .wrapping_add(i * 4),
+                                                );
+                                                let _ = write!(slot_words, " {:08X}", word);
+                                            }
+                                            log::error!(
+                                                "[NULL_PC_A325B8] ed6db0=0x{:08X} [ed6db0]=0x{:08X} slot_words:{}",
+                                                trampoline_ptr_slot,
+                                                trampoline_target_slot,
+                                                slot_words
+                                            );
+
+                                            let mut target_words = String::new();
+                                            for i in 0..8u64 {
+                                                let word = mem.read_32(
+                                                    (trampoline_target_slot as u64)
+                                                        .wrapping_add(i * 4),
+                                                );
+                                                let _ = write!(target_words, " {:08X}", word);
+                                            }
+                                            log::error!(
+                                                "[NULL_PC_A325B8_TARGET] target=0x{:08X} words:{}",
+                                                trampoline_target_slot,
+                                                target_words
+                                            );
+
+                                            let wrapper_arg = tc.r[4] as u32;
+                                            let first = mem.read_32(wrapper_arg as u64);
+                                            let second = mem.read_32(first as u64);
+                                            let mut first_words = String::new();
+                                            for i in 0..8u64 {
+                                                let word =
+                                                    mem.read_32((first as u64).wrapping_add(i * 4));
+                                                let _ = write!(first_words, " {:08X}", word);
+                                            }
+                                            log::error!(
+                                                "[NULL_PC_A325B8_ARG] r4=0x{:08X} [r4]=0x{:08X} [[r4]]=0x{:08X} first_words:{}",
+                                                wrapper_arg,
+                                                first,
+                                                second,
+                                                first_words
+                                            );
+                                        }
+                                    }
+                                }
+                            }
                             log::error!(
                                 "multi_core_run_guest_thread: tid={} core={} {} at pc=0x{:016X} lr=0x{:016X} sp=0x{:016X} r0=0x{:016X} r28=0x{:016X} — suspending thread",
                                 current_thread_id,
                                 core_index,
-                                if prefetch_abort { "PrefetchAbort" } else { "Breakpoint" },
+                                reason,
                                 tc.pc,
                                 tc.lr,
                                 tc.sp,
@@ -1340,6 +1500,17 @@ impl CpuManager {
         // Initialization.
         // Upstream: system.RegisterCoreThread(core);
         kernel.register_core_thread(core);
+
+        // Register a per-thread alternate signal stack for the rdynarmic SIGSEGV
+        // (fastmem) handler. The handler is installed with SA_ONSTACK, but
+        // sigaltstack is per-thread and rdynarmic only sets it once on the
+        // registering thread — so without this, a fastmem fault on a guest
+        // fiber runs the handler (FastmemPatchTable HashMap/SipHash lookup) on
+        // the small fiber stack and can overflow it, producing a secondary
+        // SIGSEGV that kills the process (silent exit 139 at the MK8D
+        // scene-transition texture burst). Each CPU-core OS thread needs its
+        // own altstack.
+        rdynarmic::backend::x64::exception_handler::register_thread_signal_stack();
 
         let name = if is_multicore {
             format!("CPUCore_{}", core)

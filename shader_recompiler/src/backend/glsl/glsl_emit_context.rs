@@ -10,7 +10,7 @@ use crate::backend::bindings::Bindings;
 use crate::ir;
 use crate::ir::attribute::Attribute;
 use crate::profile::Profile;
-use crate::runtime_info::RuntimeInfo;
+use crate::runtime_info::{AttributeType, RuntimeInfo};
 use crate::shader_info::{ImageFormat, Interpolation, TextureType};
 use crate::stage::Stage;
 
@@ -29,6 +29,7 @@ pub struct GenericElementInfo {
 pub struct TextureImageDefinition {
     pub binding: u32,
     pub count: u32,
+    pub is_multisample: bool,
 }
 
 /// GLSL emission context.
@@ -119,6 +120,15 @@ fn interp_decorator(interp: Interpolation) -> &'static str {
     }
 }
 
+fn swizzle(offset: u32) -> &'static str {
+    match (offset % 16) / 4 {
+        0 => "x",
+        1 => "y",
+        2 => "z",
+        _ => "w",
+    }
+}
+
 fn stores_per_vertex_attributes(stage: Stage) -> bool {
     matches!(
         stage,
@@ -154,7 +164,6 @@ impl<'a> EmitContext<'a> {
                 && profile.support_geometry_shader_passthrough,
         };
 
-        // Set GLSL version header
         ctx.header.push_str("#version 460 core\n");
 
         match program.stage {
@@ -182,17 +191,28 @@ impl<'a> EmitContext<'a> {
             }
         }
 
+        ctx.setup_extensions(program);
         ctx.setup_out_per_vertex(program);
         ctx.setup_in_per_vertex(program);
         ctx.define_generic_inputs(program);
         ctx.define_generic_outputs(program);
         ctx.define_fragment_outputs(program);
         ctx.define_constant_buffers(bindings, program);
+        ctx.define_storage_buffers(bindings, program);
         ctx.setup_images(bindings, program);
         ctx.setup_textures(bindings, program);
-        ctx.define_helper_functions();
+        ctx.define_helper_functions(program);
 
         ctx
+    }
+
+    fn setup_extensions(&mut self, program: &ir::Program) {
+        self.header
+            .push_str("#extension GL_ARB_separate_shader_objects : enable\n");
+        if program.info.uses_int64 && self.profile.support_int64 {
+            self.header
+                .push_str("#extension GL_ARB_gpu_shader_int64 : enable\n");
+        }
     }
 
     fn setup_textures(&mut self, bindings: &mut Bindings, program: &ir::Program) {
@@ -201,6 +221,7 @@ impl<'a> EmitContext<'a> {
             self.texture_buffers.push(TextureImageDefinition {
                 binding,
                 count: desc.count,
+                is_multisample: false,
             });
             let array_decorator = if desc.count > 1 {
                 format!("[{}]", desc.count)
@@ -223,6 +244,7 @@ impl<'a> EmitContext<'a> {
             self.textures.push(TextureImageDefinition {
                 binding,
                 count: desc.count,
+                is_multisample: desc.is_multisample,
             });
             let array_decorator = if desc.count > 1 {
                 format!("[{}]", desc.count)
@@ -246,6 +268,7 @@ impl<'a> EmitContext<'a> {
             self.image_buffers.push(TextureImageDefinition {
                 binding,
                 count: desc.count,
+                is_multisample: false,
             });
             let array_decorator = if desc.count > 1 {
                 format!("[{}]", desc.count)
@@ -268,6 +291,7 @@ impl<'a> EmitContext<'a> {
             self.images.push(TextureImageDefinition {
                 binding,
                 count: desc.count,
+                is_multisample: false,
             });
             let array_decorator = if desc.count > 1 {
                 format!("[{}]", desc.count)
@@ -357,7 +381,10 @@ impl<'a> EmitContext<'a> {
         if self.stage != Stage::TessellationControl {
             return;
         }
-        let loads_position = program.info.loads.any_component(Attribute::PositionX as usize);
+        let loads_position = program
+            .info
+            .loads
+            .any_component(Attribute::PositionX as usize);
         let loads_point_size = program.info.loads.get(Attribute::PointSize as usize);
         let loads_clip_distance = program.info.loads.clip_distances();
         if !(loads_position || loads_point_size || loads_clip_distance) {
@@ -402,21 +429,57 @@ impl<'a> EmitContext<'a> {
     }
 
     fn define_generic_output(&mut self, index: usize, invocations: u32) {
-        let num_components = 4u32;
-        let name = format!("out_attr{}", index);
-        self.header.push_str(&format!(
-            "layout(location={})out vec4 {}{};\n",
-            index,
-            name,
-            self.output_decorator(invocations)
-        ));
-        let info = GenericElementInfo {
-            name,
-            first_element: 0,
-            num_components,
-        };
-        for component in 0..4usize {
-            self.output_generics[index][component] = info.clone();
+        const SWIZZLE: &str = "xyzw";
+        let base_index = Attribute::Generic0X as usize + index * 4;
+        let mut element = 0usize;
+        while element < 4 {
+            let mut definition = format!("layout(location={}", index);
+            let remainder = 4 - element;
+            let xfb_varying = if base_index + element < self.runtime_info.xfb_count as usize {
+                let varying = self.runtime_info.xfb_varyings[base_index + element];
+                (varying.components > 0).then_some(varying)
+            } else {
+                None
+            };
+            let num_components = xfb_varying
+                .map(|varying| varying.components as usize)
+                .unwrap_or(remainder);
+            if element > 0 {
+                definition.push_str(&format!(",component={}", element));
+            }
+            if let Some(varying) = xfb_varying {
+                definition.push_str(&format!(
+                    ",xfb_buffer={},xfb_stride={},xfb_offset={}",
+                    varying.buffer, varying.stride, varying.offset
+                ));
+            }
+            let component_suffix = &SWIZZLE[element..element + num_components];
+            let name = if num_components < 4 || element > 0 {
+                format!("out_attr{}_{}", index, component_suffix)
+            } else {
+                format!("out_attr{}", index)
+            };
+            let type_name = if num_components == 1 {
+                "float".to_string()
+            } else {
+                format!("vec{}", num_components)
+            };
+            self.header.push_str(&format!(
+                "{})out {} {}{};\n",
+                definition,
+                type_name,
+                name,
+                self.output_decorator(invocations)
+            ));
+            let info = GenericElementInfo {
+                name,
+                first_element: element as u32,
+                num_components: num_components as u32,
+            };
+            for component in element..element + num_components {
+                self.output_generics[index][component] = info.clone();
+            }
+            element += num_components;
         }
     }
 
@@ -426,9 +489,14 @@ impl<'a> EmitContext<'a> {
         }
         for (render_target, &enabled) in program.info.stores_frag_color.iter().enumerate() {
             if enabled || self.profile.need_declared_frag_colors {
+                let type_str = match self.runtime_info.frag_color_types[render_target] {
+                    AttributeType::UnsignedInt => "uvec4",
+                    AttributeType::SignedInt => "ivec4",
+                    _ => "vec4",
+                };
                 self.header.push_str(&format!(
-                    "layout(location={})out vec4 frag_color{};\n",
-                    render_target, render_target
+                    "layout(location={})out {} frag_color{};\n",
+                    render_target, type_str, render_target
                 ));
             }
         }
@@ -462,10 +530,130 @@ impl<'a> EmitContext<'a> {
         }
     }
 
-    fn define_helper_functions(&mut self) {
+    fn define_storage_buffers(&mut self, bindings: &mut Bindings, program: &ir::Program) {
+        let mut index = 0u32;
+        for desc in &program.info.storage_buffers_descriptors {
+            self.header.push_str(&format!(
+                "layout(std430,binding={}) buffer {}_ssbo_{}{{uint {}_ssbo{}[];}};\n",
+                bindings.storage_buffer,
+                self.stage_name,
+                bindings.storage_buffer,
+                self.stage_name,
+                index
+            ));
+            bindings.storage_buffer += desc.count;
+            index += desc.count;
+        }
+    }
+
+    fn define_helper_functions(&mut self, program: &ir::Program) {
         self.header.push_str(
             "\n#define ftoi floatBitsToInt\n#define ftou floatBitsToUint\n#define itof intBitsToFloat\n#define utof uintBitsToFloat\n",
         );
+        if program.info.uses_global_memory && self.profile.support_int64 {
+            self.header
+                .push_str(&self.define_global_memory_functions(program));
+        }
+    }
+
+    fn define_global_memory_functions(&self, program: &ir::Program) -> String {
+        let mut write_func = "void WriteGlobal32(uint64_t addr,uint data){".to_string();
+        let mut write_func_64 = "void WriteGlobal64(uint64_t addr,uvec2 data){".to_string();
+        let mut write_func_128 = "void WriteGlobal128(uint64_t addr,uvec4 data){".to_string();
+        let mut load_func = "uint LoadGlobal32(uint64_t addr){".to_string();
+        let mut load_func_64 = "uvec2 LoadGlobal64(uint64_t addr){".to_string();
+        let mut load_func_128 = "uvec4 LoadGlobal128(uint64_t addr){".to_string();
+
+        for (index, ssbo) in program.info.storage_buffers_descriptors.iter().enumerate() {
+            let used =
+                index < u16::BITS as usize && (program.info.nvn_buffer_used & (1u16 << index)) != 0;
+            if !used {
+                continue;
+            }
+            let size_cbuf_offset = ssbo.cbuf_offset + 8;
+            let ssbo_addr = format!("ssbo_addr{}", index);
+            let cbuf = format!("{}_cbuf{}", self.stage_name, ssbo.cbuf_index);
+            let addr_xy = [
+                format!(
+                    "ftou({}[{}].{})",
+                    cbuf,
+                    ssbo.cbuf_offset / 16,
+                    swizzle(ssbo.cbuf_offset)
+                ),
+                format!(
+                    "ftou({}[{}].{})",
+                    cbuf,
+                    (ssbo.cbuf_offset + 4) / 16,
+                    swizzle(ssbo.cbuf_offset + 4)
+                ),
+            ];
+            let size_xy = [
+                format!(
+                    "ftou({}[{}].{})",
+                    cbuf,
+                    size_cbuf_offset / 16,
+                    swizzle(size_cbuf_offset)
+                ),
+                format!(
+                    "ftou({}[{}].{})",
+                    cbuf,
+                    (size_cbuf_offset + 4) / 16,
+                    swizzle(size_cbuf_offset + 4)
+                ),
+            ];
+            let align = self.profile.min_ssbo_alignment.max(1) as u32;
+            let ssbo_align_mask = !align.wrapping_sub(1);
+            let aligned_low_addr = format!("{}&{}", addr_xy[0], ssbo_align_mask);
+            let aligned_addr = format!("uvec2({},{})", aligned_low_addr, addr_xy[1]);
+            let addr_pack = format!("packUint2x32({})", aligned_addr);
+            let addr_statement = format!("uint64_t {}={};", ssbo_addr, addr_pack);
+            let size_vec = format!("uvec2({},{})", size_xy[0], size_xy[1]);
+            let comparison = format!(
+                "if((addr>={})&&(addr<({}+uint64_t({})))){{",
+                ssbo_addr, ssbo_addr, size_vec
+            );
+            let ssbo_name = format!("{}_ssbo{}", self.stage_name, index);
+
+            let define_body = |func: &mut String, return_statement: &str| {
+                func.push_str(&addr_statement);
+                func.push_str(&comparison);
+                func.push_str(
+                    &return_statement
+                        .replace("{0}", &ssbo_name)
+                        .replace("{1}", &ssbo_addr),
+                );
+            };
+
+            define_body(&mut write_func, "{0}[uint(addr-{1})>>2]=data;return;}");
+            define_body(
+                &mut write_func_64,
+                "{0}[uint(addr-{1})>>2]=data.x;{0}[uint(addr-{1}+4)>>2]=data.y;return;}",
+            );
+            define_body(
+                &mut write_func_128,
+                "{0}[uint(addr-{1})>>2]=data.x;{0}[uint(addr-{1}+4)>>2]=data.y;{0}[uint(addr-{1}+8)>>2]=data.z;{0}[uint(addr-{1}+12)>>2]=data.w;return;}",
+            );
+            define_body(&mut load_func, "return {0}[uint(addr-{1})>>2];}");
+            define_body(
+                &mut load_func_64,
+                "return uvec2({0}[uint(addr-{1})>>2],{0}[uint(addr-{1}+4)>>2]);}",
+            );
+            define_body(
+                &mut load_func_128,
+                "return uvec4({0}[uint(addr-{1})>>2],{0}[uint(addr-{1}+4)>>2],{0}[uint(addr-{1}+8)>>2],{0}[uint(addr-{1}+12)>>2]);}",
+            );
+        }
+
+        write_func.push('}');
+        write_func_64.push('}');
+        write_func_128.push('}');
+        load_func.push_str("return 0u;}");
+        load_func_64.push_str("return uvec2(0);}");
+        load_func_128.push_str("return uvec4(0);}");
+        format!(
+            "{}{}{}{}{}{}",
+            write_func, write_func_64, write_func_128, load_func, load_func_64, load_func_128
+        )
     }
 
     pub fn define_variables(&self, header: &mut String) {
@@ -487,9 +675,16 @@ impl<'a> EmitContext<'a> {
         ] {
             let tracker = self.var_alloc.get_use_tracker(var_type);
             let type_name = glsl_type_str(var_type);
+            let has_precise_bug = self.stage == Stage::Fragment && self.profile.has_gl_precise_bug;
+            let precise = if !has_precise_bug && is_precise_type(var_type) {
+                "precise "
+            } else {
+                ""
+            };
             if tracker.uses_temp {
                 header.push_str(&format!(
-                    "{} t{}={}(0);\n",
+                    "{}{} t{}={}(0);\n",
+                    precise,
                     type_name,
                     self.var_alloc.representation_indexed(0, var_type),
                     type_name
@@ -497,7 +692,8 @@ impl<'a> EmitContext<'a> {
             }
             for index in 0..tracker.num_used {
                 header.push_str(&format!(
-                    "{} {}={}(0);\n",
+                    "{}{} {}={}(0);\n",
+                    precise,
                     type_name,
                     self.var_alloc
                         .representation_indexed(index as u32, var_type),
@@ -511,6 +707,10 @@ impl<'a> EmitContext<'a> {
     }
 }
 
+fn is_precise_type(var_type: GlslVarType) -> bool {
+    matches!(var_type, GlslVarType::PrecF32 | GlslVarType::PrecF64)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -518,19 +718,16 @@ mod tests {
     #[test]
     fn vertex_stage_declares_out_per_vertex() {
         let mut program = ir::Program::new(Stage::VertexB);
-        program
-            .info
-            .stores
-            .set(Attribute::PointSize as usize, true);
+        program.info.stores.set(Attribute::PointSize as usize, true);
         let mut bindings = Bindings::default();
         let profile = Profile::default();
         let runtime_info = RuntimeInfo::default();
 
         let ctx = EmitContext::new(&program, &mut bindings, &profile, &runtime_info);
 
-        assert!(ctx.header.contains(
-            "out gl_PerVertex{vec4 gl_Position;float gl_PointSize;};"
-        ));
+        assert!(ctx
+            .header
+            .contains("out gl_PerVertex{vec4 gl_Position;float gl_PointSize;};"));
     }
 
     #[test]
@@ -550,5 +747,111 @@ mod tests {
         assert!(ctx
             .header
             .contains("layout(location=0)flat in vec4 in_attr0;"));
+    }
+
+    #[test]
+    fn generic_outputs_use_transform_feedback_component_splits() {
+        let mut program = ir::Program::new(Stage::VertexB);
+        program.info.stores.set(Attribute::Generic0X as usize, true);
+
+        let mut runtime_info = RuntimeInfo::default();
+        runtime_info.xfb_varyings =
+            vec![crate::runtime_info::TransformFeedbackVarying::default(); 256];
+        runtime_info.xfb_varyings[Attribute::Generic0X as usize] =
+            crate::runtime_info::TransformFeedbackVarying {
+                buffer: 1,
+                stride: 16,
+                offset: 0,
+                components: 2,
+            };
+        runtime_info.xfb_varyings[Attribute::Generic0Z as usize] =
+            crate::runtime_info::TransformFeedbackVarying {
+                buffer: 1,
+                stride: 16,
+                offset: 8,
+                components: 2,
+            };
+        runtime_info.xfb_count = Attribute::Generic0W as u32 + 1;
+
+        let mut bindings = Bindings::default();
+        let profile = Profile::default();
+        let ctx = EmitContext::new(&program, &mut bindings, &profile, &runtime_info);
+
+        assert!(ctx.header.contains(
+            "layout(location=0,xfb_buffer=1,xfb_stride=16,xfb_offset=0)out vec2 out_attr0_xy;"
+        ));
+        assert!(ctx.header.contains(
+            "layout(location=0,component=2,xfb_buffer=1,xfb_stride=16,xfb_offset=8)out vec2 out_attr0_zw;"
+        ));
+    }
+
+    #[test]
+    fn texture_definitions_preserve_multisample_flag_for_image_queries() {
+        let mut program = ir::Program::new(Stage::Fragment);
+        program
+            .info
+            .texture_descriptors
+            .push(crate::shader_info::TextureDescriptor {
+                texture_type: TextureType::Color2D,
+                is_depth: false,
+                is_multisample: true,
+                has_secondary: false,
+                cbuf_index: 2,
+                cbuf_offset: 0x40,
+                shift_left: 0,
+                secondary_cbuf_index: 0,
+                secondary_cbuf_offset: 0,
+                secondary_shift_left: 0,
+                count: 1,
+                size_shift: 3,
+            });
+        let mut bindings = Bindings::default();
+        let profile = Profile::default();
+        let runtime_info = RuntimeInfo::default();
+
+        let ctx = EmitContext::new(&program, &mut bindings, &profile, &runtime_info);
+
+        assert_eq!(ctx.textures.len(), 1);
+        assert!(ctx.textures[0].is_multisample);
+        assert!(ctx.header.contains("uniform sampler2DMS tex0;"));
+    }
+
+    #[test]
+    fn global_memory_header_declares_ssbo_and_helpers_when_int64_supported() {
+        let mut program = ir::Program::new(Stage::Fragment);
+        program.info.uses_int64 = true;
+        program.info.uses_global_memory = true;
+        program.info.nvn_buffer_used = 1;
+        program
+            .info
+            .constant_buffer_descriptors
+            .push(crate::shader_info::ConstantBufferDescriptor { index: 2, count: 1 });
+        program.info.storage_buffers_descriptors.push(
+            crate::shader_info::StorageBufferDescriptor {
+                cbuf_index: 2,
+                cbuf_offset: 0x20,
+                count: 1,
+                is_written: true,
+            },
+        );
+        let mut bindings = Bindings::default();
+        let mut profile = Profile::default();
+        profile.support_int64 = true;
+        profile.min_ssbo_alignment = 0x100;
+        let runtime_info = RuntimeInfo::default();
+
+        let ctx = EmitContext::new(&program, &mut bindings, &profile, &runtime_info);
+
+        assert!(ctx
+            .header
+            .contains("#extension GL_ARB_gpu_shader_int64 : enable"));
+        assert!(ctx
+            .header
+            .contains("layout(std430,binding=0) buffer fs_ssbo_0{uint fs_ssbo0[];}"));
+        assert!(ctx.header.contains("uint LoadGlobal32(uint64_t addr){"));
+        assert!(ctx
+            .header
+            .contains("void WriteGlobal32(uint64_t addr,uint data){"));
+        assert!(ctx.header.contains("uint64_t ssbo_addr0=packUint2x32"));
     }
 }

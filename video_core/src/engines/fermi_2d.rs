@@ -11,7 +11,7 @@ use super::sw_blitter::blitter::SoftwareBlitEngine;
 use super::{ClassId, Engine, PendingWrite, ENGINE_REG_COUNT};
 use crate::gpu::RenderTargetFormat;
 use crate::memory_manager::MemoryManager;
-use crate::rasterizer_interface::RasterizerInterface;
+use crate::rasterizer_interface::{RasterizerHandle, RasterizerInterface};
 use bytemuck::{Pod, Zeroable};
 use parking_lot::Mutex;
 use std::sync::Arc;
@@ -1213,7 +1213,7 @@ pub struct Fermi2D {
     memory_manager: Arc<Mutex<MemoryManager>>,
     /// Set when a blit trigger is detected; consumed by tests / future logic.
     pub pending_blit: bool,
-    rasterizer: Option<[usize; 2]>,
+    rasterizer: Option<RasterizerHandle>,
     sw_blitter: SoftwareBlitEngine,
     #[cfg(test)]
     call_method_last_flags: Vec<bool>,
@@ -1276,9 +1276,7 @@ impl Fermi2D {
 
     /// Corresponds to `Fermi2D::BindRasterizer`.
     pub fn bind_rasterizer(&mut self, rasterizer: &dyn RasterizerInterface) {
-        self.rasterizer = Some(unsafe {
-            std::mem::transmute::<*const dyn RasterizerInterface, [usize; 2]>(rasterizer)
-        });
+        self.rasterizer = Some(RasterizerHandle::from_ref(rasterizer));
     }
 
     // ── Typed accessors ────────────────────────────────────────────────
@@ -1669,11 +1667,8 @@ impl Engine for Fermi2D {
         let (src_surface, dst_surface, blit_config) = self.prepare_blit();
         self.memory_manager.lock().flush_caching();
 
-        if let Some(rasterizer_raw) = self.rasterizer {
-            let rasterizer = unsafe {
-                std::mem::transmute::<[usize; 2], *mut dyn RasterizerInterface>(rasterizer_raw)
-            };
-            let rasterizer = unsafe { &mut *rasterizer };
+        if let Some(rasterizer_handle) = self.rasterizer {
+            let rasterizer = unsafe { rasterizer_handle.as_mut() };
             if rasterizer.accelerate_surface_copy(&src_surface, &dst_surface, &blit_config) {
                 return vec![];
             }

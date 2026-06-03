@@ -60,6 +60,12 @@ pub fn set_heap_size_current_process(
         .unwrap()
         .set_heap_size(size as usize);
     *out_address = address.get();
+    if common::trace::is_enabled(common::trace::cat::HEAP) {
+        common::trace::emit_raw(
+            common::trace::cat::HEAP,
+            &[size, result as u64, *out_address],
+        );
+    }
     ResultCode::new(result)
 }
 

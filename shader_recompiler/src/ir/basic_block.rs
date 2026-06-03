@@ -21,6 +21,13 @@ pub struct Block {
     /// upstream pointer-stable instruction identity without requiring a full
     /// intrusive list yet.
     pub instructions: Vec<Option<Inst>>,
+    /// Logical instruction order.
+    ///
+    /// Slot indices stay stable because `Value::Inst(InstRef)` stores them.
+    /// This side list lets passes insert a newly allocated slot before an
+    /// existing slot, matching upstream's pointer-stable intrusive list model
+    /// without shifting `instructions`.
+    instruction_order: Vec<u32>,
     /// Immediate predecessor block indices.
     pub imm_predecessors: Vec<u32>,
     /// Immediate successor block indices.
@@ -41,6 +48,7 @@ impl Block {
     pub fn new() -> Self {
         Self {
             instructions: Vec::new(),
+            instruction_order: Vec::new(),
             imm_predecessors: Vec::new(),
             imm_successors: Vec::new(),
             ssa_reg_values: vec![Value::Void; Reg::NUM_REGS],
@@ -55,6 +63,7 @@ impl Block {
     pub fn append_inst(&mut self, inst: Inst) -> u32 {
         let idx = self.instructions.len() as u32;
         self.instructions.push(Some(inst));
+        self.instruction_order.push(idx);
         idx
     }
 
@@ -66,16 +75,30 @@ impl Block {
 
     /// Insert an instruction at the given position.
     pub fn insert_inst(&mut self, position: usize, inst: Inst) {
-        debug_assert!(
-            position >= self.instructions.len(),
-            "Block::insert_inst would shift stable InstRef slots"
-        );
+        if position < self.instructions.len() {
+            self.insert_inst_before(position as u32, inst);
+        } else {
+            self.append_inst(inst);
+        }
+    }
+
+    /// Allocate a new stable slot and place it before `before` in logical order.
+    pub fn insert_inst_before(&mut self, before: u32, inst: Inst) -> u32 {
+        let idx = self.instructions.len() as u32;
         self.instructions.push(Some(inst));
+        let insert_pos = self
+            .instruction_order
+            .iter()
+            .position(|&slot| slot == before)
+            .unwrap_or(self.instruction_order.len());
+        self.instruction_order.insert(insert_pos, idx);
+        idx
     }
 
     /// Physically erase an instruction while preserving every other slot index.
     pub fn erase_inst(&mut self, idx: u32) {
         self.instructions[idx as usize] = None;
+        self.instruction_order.retain(|&slot| slot != idx);
     }
 
     /// Add a successor block (CFG edge).
@@ -141,33 +164,130 @@ impl Block {
 
     /// Iterate over instructions.
     pub fn iter(&self) -> impl Iterator<Item = &Inst> {
-        self.instructions.iter().filter_map(Option::as_ref)
+        self.indexed_iter().map(|(_, inst)| inst)
     }
 
     /// Iterate over instructions mutably.
     pub fn iter_mut(&mut self) -> impl Iterator<Item = &mut Inst> {
-        self.instructions.iter_mut().filter_map(Option::as_mut)
+        self.indexed_iter_mut().map(|(_, inst)| inst)
     }
 
     /// Iterate over live instruction slots.
     pub fn indexed_iter(&self) -> impl Iterator<Item = (u32, &Inst)> {
-        self.instructions
-            .iter()
-            .enumerate()
-            .filter_map(|(index, inst)| inst.as_ref().map(|inst| (index as u32, inst)))
+        self.instruction_order.iter().copied().filter_map(|index| {
+            self.instructions
+                .get(index as usize)
+                .and_then(Option::as_ref)
+                .map(|inst| (index, inst))
+        })
     }
 
     /// Iterate over live instruction slots mutably.
     pub fn indexed_iter_mut(&mut self) -> impl Iterator<Item = (u32, &mut Inst)> {
-        self.instructions
-            .iter_mut()
-            .enumerate()
-            .filter_map(|(index, inst)| inst.as_mut().map(|inst| (index as u32, inst)))
+        let order = self.instruction_order.clone();
+        let len = self.instructions.len();
+        let instructions = self.instructions.as_mut_ptr();
+        order.into_iter().filter_map(move |index| {
+            if index as usize >= len {
+                return None;
+            }
+            // `instruction_order` is private and maintained as a duplicate-free
+            // list of live stable slots by `append_inst`, `insert_inst_before`,
+            // and `erase_inst`, so yielding mutable references in this order
+            // cannot alias.
+            unsafe {
+                (*instructions.add(index as usize))
+                    .as_mut()
+                    .map(|inst| (index, inst))
+            }
+        })
     }
 }
 
 impl Default for Block {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn insert_inst_before_preserves_slots_and_changes_logical_order() {
+        let mut block = Block::new();
+        let first = block.append_inst(Inst::new(Opcode::IAdd32, vec![]));
+        let second = block.append_inst(Inst::new(Opcode::IMul32, vec![]));
+
+        let inserted = block.insert_inst_before(second, Inst::new(Opcode::ISub32, vec![]));
+        let order: Vec<u32> = block.indexed_iter().map(|(index, _)| index).collect();
+
+        assert_eq!(first, 0);
+        assert_eq!(second, 1);
+        assert_eq!(inserted, 2);
+        assert_eq!(order, vec![0, 2, 1]);
+        assert_eq!(block.inst(second).opcode, Opcode::IMul32);
+    }
+
+    #[test]
+    fn insert_inst_before_first_inserts_at_logical_beginning() {
+        let mut block = Block::new();
+        let first = block.append_inst(Inst::new(Opcode::IAdd32, vec![]));
+        let second = block.append_inst(Inst::new(Opcode::IMul32, vec![]));
+
+        let inserted = block.insert_inst_before(first, Inst::new(Opcode::ISub32, vec![]));
+        let order: Vec<u32> = block.indexed_iter().map(|(index, _)| index).collect();
+
+        assert_eq!(inserted, 2);
+        assert_eq!(order, vec![2, 0, 1]);
+        assert_eq!(block.inst(second).opcode, Opcode::IMul32);
+    }
+
+    #[test]
+    fn repeated_insert_inst_before_same_slot_preserves_insertion_order() {
+        let mut block = Block::new();
+        let first = block.append_inst(Inst::new(Opcode::IAdd32, vec![]));
+        let second = block.append_inst(Inst::new(Opcode::IMul32, vec![]));
+
+        let a = block.insert_inst_before(second, Inst::new(Opcode::ISub32, vec![]));
+        let b = block.insert_inst_before(second, Inst::new(Opcode::BitwiseOr32, vec![]));
+        let c = block.insert_inst_before(second, Inst::new(Opcode::BitwiseAnd32, vec![]));
+        let order: Vec<u32> = block.indexed_iter().map(|(index, _)| index).collect();
+
+        assert_eq!(order, vec![first, a, b, c, second]);
+    }
+
+    #[test]
+    fn erase_inst_removes_slot_from_logical_order() {
+        let mut block = Block::new();
+        let first = block.append_inst(Inst::new(Opcode::IAdd32, vec![]));
+        let second = block.append_inst(Inst::new(Opcode::IMul32, vec![]));
+        let third = block.append_inst(Inst::new(Opcode::ISub32, vec![]));
+
+        block.erase_inst(second);
+        let order: Vec<u32> = block.indexed_iter().map(|(index, _)| index).collect();
+
+        assert_eq!(order, vec![first, third]);
+        assert!(block.instructions[second as usize].is_none());
+    }
+
+    #[test]
+    fn indexed_iter_mut_follows_logical_order() {
+        let mut block = Block::new();
+        let first = block.append_inst(Inst::new(Opcode::IAdd32, vec![]));
+        let second = block.append_inst(Inst::new(Opcode::IMul32, vec![]));
+        let inserted = block.insert_inst_before(second, Inst::new(Opcode::ISub32, vec![]));
+
+        let mut visited = Vec::new();
+        for (index, inst) in block.indexed_iter_mut() {
+            visited.push(index);
+            inst.flags = index;
+        }
+
+        assert_eq!(visited, vec![first, inserted, second]);
+        assert_eq!(block.inst(first).flags, first);
+        assert_eq!(block.inst(inserted).flags, inserted);
+        assert_eq!(block.inst(second).flags, second);
     }
 }

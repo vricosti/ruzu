@@ -17,6 +17,15 @@ PAT = re.compile(
     r"\s+words=(?P<words>\d+) payload=(?P<payload>[0-9a-fA-F ]+)"
 )
 
+# Mirror PAT for IPC_REQUEST. Request log line omits the `words=` token
+# because the snapshot is always 16 u32s — the trailing zeros are part of
+# the dump and useful for diffing.
+PAT_REQ = re.compile(
+    r"IPC_REQUEST seq=(?P<seq>\d+) service=(?P<service>[^ ]+) cmd=(?P<cmd>\d+)"
+    r"(?:\s+ioctl=0x(?P<ioctl>[0-9a-fA-F]+))?"
+    r"\s+payload=(?P<payload>[0-9a-fA-F ]+)"
+)
+
 
 # Manual mapping from ruzu's Rust class names to zuyu's wire/short names.
 # ruzu logs the IPC service via std::any::type_name (Rust path),
@@ -41,12 +50,12 @@ def _normalize_service(name):
     return _SERVICE_NAME_MAP.get(name, name)
 
 
-def parse(path):
+def parse(path, pattern=PAT):
     records = []
     per_key = defaultdict(int)
     with open(path, encoding="utf-8", errors="replace") as fh:
         for line in fh:
-            m = PAT.search(line)
+            m = pattern.search(line)
             if not m:
                 continue
             service = _normalize_service(m.group("service"))
@@ -62,11 +71,15 @@ def parse(path):
 
 
 def main():
-    if len(sys.argv) != 3:
-        print("usage: ipc_diff.py <ruzu.log> <zuyu.log>", file=sys.stderr)
+    if len(sys.argv) < 3 or len(sys.argv) > 4:
+        print("usage: ipc_diff.py <ruzu.log> <zuyu.log> [--request]", file=sys.stderr)
         sys.exit(2)
-    ruzu = parse(sys.argv[1])
-    zuyu = parse(sys.argv[2])
+    use_request = "--request" in sys.argv[3:]
+    pattern = PAT_REQ if use_request else PAT
+    label = "request" if use_request else "reply"
+    print(f"# comparing IPC_{label.upper()} records", file=sys.stderr)
+    ruzu = parse(sys.argv[1], pattern)
+    zuyu = parse(sys.argv[2], pattern)
 
     ruzu_idx = {k: (payload, seq) for k, payload, seq in ruzu}
     zuyu_idx = {k: (payload, seq) for k, payload, seq in zuyu}
@@ -74,12 +87,16 @@ def main():
     # Keys present in both, sorted by earliest zuyu seq so we report in time order.
     shared = sorted(set(ruzu_idx) & set(zuyu_idx), key=lambda k: zuyu_idx[k][1])
 
-    def trim_to_sfco(words):
-        # Align at SFCO magic so header descriptor diffs (handle ids) drop out.
+    def trim_to_magic(words):
+        # Align at SFCI magic for requests, SFCO for replies. This drops
+        # leftover cmd_buf bytes from prior IPCs and noisy descriptor diffs.
+        magic = "49434653" if use_request else "4f434653"
         for i, w in enumerate(words):
-            if w.lower() == "4f434653":
+            if w.lower() == magic:
                 return words[i:]
         return words
+
+    trim_to_sfco = trim_to_magic
 
     diffs = 0
     for key in shared:

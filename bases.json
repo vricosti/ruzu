@@ -1,0 +1,17 @@
+{
+  "_schema": {
+    "_notes": "Switch NSO load-base registry. Each entry maps a game/build to the verified base addresses of its NSOs. Always verify with `find_base.py` before adding — never guess."
+  },
+
+  "MK8D 0100152000022000 v0": {
+    "_notes": "Mario Kart 8 Deluxe — verified by byte-pattern match at runtime PC 0x71EE40 (pattern '00009fe7...' matches .text NSO offset 0x518E40).",
+    "main":   "0x00206000",
+    "_subsdk0": "TBD — measure when needed via find_base.py on a known subsdk PC",
+    "_subsdk1": "TBD",
+    "_subsdk2": "TBD",
+    "_subsdk3": "TBD",
+    "_subsdk4": "TBD",
+    "_sdk":    "TBD",
+    "_rtld":   "TBD"
+  }
+}

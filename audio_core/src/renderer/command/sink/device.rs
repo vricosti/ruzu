@@ -2,6 +2,10 @@ use crate::common::common::{CpuAddr, MAX_CHANNELS, TARGET_SAMPLE_COUNT};
 use crate::renderer::command::util::write_copy;
 use crate::sink::sink_stream::{SinkBuffer, SinkStreamHandle};
 use std::fmt::Write;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static DEVICE_SINK_CLIP_LOGS: AtomicU64 = AtomicU64::new(0);
+static DEVICE_SINK_SAMPLE_TRACES: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Copy)]
 #[repr(C)]
@@ -37,13 +41,179 @@ pub fn write_device_payload(cmd: &DeviceSinkCommand, output: &mut [u8]) -> usize
     write_copy(&payload, output)
 }
 
+fn trace_device_sink_input_clip(
+    payload: &DeviceSinkPayload,
+    input_count: usize,
+    buffer_count: i16,
+    frames: usize,
+) {
+    if std::env::var_os("RUZU_TRACE_DEVICE_SINK_CLIP").is_none() {
+        return;
+    }
+
+    let inputs: Vec<i16> = payload.inputs.iter().take(input_count).copied().collect();
+    let has_negative_input = inputs.iter().any(|&input| input < 0);
+    let max_input = inputs
+        .iter()
+        .filter_map(|&input| (input >= 0).then_some(input as usize))
+        .max()
+        .unwrap_or(0);
+    let required_samples = (max_input + 1).saturating_mul(frames);
+    let sample_count = payload.sample_count as usize;
+
+    if payload.sample_buffer == 0 {
+        let n = DEVICE_SINK_CLIP_LOGS.fetch_add(1, Ordering::Relaxed);
+        if n < 64 || n.is_power_of_two() {
+            eprintln!(
+                "[DEVICE_SINK_CLIP] #{} null sample_buffer input_count={} buffer_count={} sample_count={} inputs={:?}",
+                n, input_count, buffer_count, sample_count, inputs
+            );
+        }
+        return;
+    }
+
+    let src = unsafe { std::slice::from_raw_parts(payload.sample_buffer as *const i32, sample_count) };
+    let mut min_value = i32::MAX;
+    let mut max_value = i32::MIN;
+    let mut clipped = 0usize;
+    let mut visited = 0usize;
+    let mut out_of_range_reads = 0usize;
+    let mut first_values = Vec::new();
+
+    for &input in &inputs {
+        if input < 0 {
+            continue;
+        }
+        let base = (input as usize).saturating_mul(frames);
+        let mut channel_first = Vec::new();
+        for frame in 0..frames {
+            let index = base + frame;
+            let Some(&sample) = src.get(index) else {
+                out_of_range_reads += 1;
+                continue;
+            };
+            if frame < 8 {
+                channel_first.push(sample);
+            }
+            min_value = min_value.min(sample);
+            max_value = max_value.max(sample);
+            clipped += usize::from(sample < i16::MIN as i32 || sample > i16::MAX as i32);
+            visited += 1;
+        }
+        first_values.push(channel_first);
+    }
+
+    if visited == 0 {
+        min_value = 0;
+        max_value = 0;
+    }
+
+    if clipped > 0
+        || out_of_range_reads > 0
+        || has_negative_input
+        || sample_count < required_samples
+    {
+        let n = DEVICE_SINK_CLIP_LOGS.fetch_add(1, Ordering::Relaxed);
+        if n < 64 || n.is_power_of_two() {
+            eprintln!(
+                "[DEVICE_SINK_CLIP] #{} sample_buffer=0x{:X} input_count={} buffer_count={} sample_count={} required={} inputs={:?} min={} max={} clipped={} visited={} oor_reads={} first={:?}",
+                n,
+                payload.sample_buffer,
+                input_count,
+                buffer_count,
+                sample_count,
+                required_samples,
+                inputs,
+                min_value,
+                max_value,
+                clipped,
+                visited,
+                out_of_range_reads,
+                first_values
+            );
+        }
+    }
+}
+
+fn trace_device_sink_samples(
+    payload: &DeviceSinkPayload,
+    input_count: usize,
+    buffer_count: i16,
+    frames: usize,
+) {
+    if !::common::trace::is_enabled(::common::trace::cat::AUDIO_DEVICE_SINK) {
+        return;
+    }
+
+    let seq = DEVICE_SINK_SAMPLE_TRACES.fetch_add(1, Ordering::Relaxed);
+    let sample_count = payload.sample_count as usize;
+    let mut min_value = i32::MAX;
+    let mut max_value = i32::MIN;
+    let mut nonzero = 0usize;
+    let mut clipped = 0usize;
+    let mut visited = 0usize;
+    let mut first = [0i32; 3];
+
+    if payload.sample_buffer != 0 {
+        let src = unsafe {
+            std::slice::from_raw_parts(payload.sample_buffer as *const i32, sample_count)
+        };
+        for &input in payload.inputs.iter().take(input_count) {
+            if input < 0 {
+                continue;
+            }
+            let base = (input as usize).saturating_mul(frames);
+            for frame in 0..frames {
+                let Some(&sample) = src.get(base + frame) else {
+                    continue;
+                };
+                if visited < first.len() {
+                    first[visited] = sample;
+                }
+                min_value = min_value.min(sample);
+                max_value = max_value.max(sample);
+                nonzero += usize::from(sample != 0);
+                clipped += usize::from(sample < i16::MIN as i32 || sample > i16::MAX as i32);
+                visited += 1;
+            }
+        }
+    }
+
+    if visited == 0 {
+        min_value = 0;
+        max_value = 0;
+    }
+
+    ::common::trace::emit_raw(
+        ::common::trace::cat::AUDIO_DEVICE_SINK,
+        &[
+            seq,
+            payload.sample_buffer as u64,
+            input_count as u64,
+            buffer_count as i64 as u64,
+            sample_count as u64,
+            frames as u64,
+            min_value as u32 as u64,
+            max_value as u32 as u64,
+            nonzero as u64,
+            clipped as u64,
+            visited as u64,
+            first[0] as u32 as u64,
+            first[1] as u32 as u64,
+            first[2] as u32 as u64,
+        ],
+    );
+}
+
 impl DeviceSinkPayload {
     pub fn process(self, stream: &SinkStreamHandle, buffer_count: i16) {
         let input_count = self.input_count.max(1).min(buffer_count.max(1) as u32) as usize;
+        let frames = TARGET_SAMPLE_COUNT as usize;
+        trace_device_sink_input_clip(&self, input_count, buffer_count, frames);
+        trace_device_sink_samples(&self, input_count, buffer_count, frames);
         if self.inputs.iter().take(input_count).any(|&input| input < 0) {
             return;
         }
-        let frames = TARGET_SAMPLE_COUNT as usize;
         let src = unsafe {
             std::slice::from_raw_parts(self.sample_buffer as *const i32, self.sample_count as usize)
         };
@@ -120,6 +290,9 @@ pub fn process_device_command(
     buffer_count: i16,
 ) {
     let input_count = payload.input_count.max(1).min(buffer_count.max(1) as u32) as usize;
+    let frames = TARGET_SAMPLE_COUNT as usize;
+    trace_device_sink_input_clip(payload, input_count, buffer_count, frames);
+    trace_device_sink_samples(payload, input_count, buffer_count, frames);
     if payload
         .inputs
         .iter()
@@ -128,7 +301,6 @@ pub fn process_device_command(
     {
         return;
     }
-    let frames = TARGET_SAMPLE_COUNT as usize;
     let src = unsafe {
         std::slice::from_raw_parts(
             payload.sample_buffer as *const i32,

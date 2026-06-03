@@ -276,6 +276,7 @@ pub enum Opcode {
     FPMin64,
     FPMax64,
     FPSaturate64,
+    FPClamp64,
     FPRoundEven64,
     FPFloor64,
     FPCeil64,
@@ -342,7 +343,9 @@ pub enum Opcode {
     ShiftLeftLogical32,
     ShiftLeftLogical64,
     ShiftRightLogical32,
+    ShiftRightLogical64,
     ShiftRightArithmetic32,
+    ShiftRightArithmetic64,
     BitwiseAnd32,
     BitwiseOr32,
     BitwiseXor32,
@@ -539,6 +542,7 @@ pub enum Opcode {
     VoteAll,
     VoteAny,
     VoteEqual,
+    LaneId,
     SubgroupBallot,
     SubgroupEqMask,
     SubgroupLtMask,
@@ -1865,6 +1869,11 @@ impl Opcode {
                 return_type: F64,
                 arg_types: &[F64],
             },
+            Opcode::FPClamp64 => OpcodeMeta {
+                name: "FPClamp64",
+                return_type: F64,
+                arg_types: &[F64, F64, F64],
+            },
             Opcode::FPRoundEven64 => OpcodeMeta {
                 name: "FPRoundEven64",
                 return_type: F64,
@@ -2163,10 +2172,20 @@ impl Opcode {
                 return_type: U32,
                 arg_types: &[U32, U32],
             },
+            Opcode::ShiftRightLogical64 => OpcodeMeta {
+                name: "ShiftRightLogical64",
+                return_type: U64,
+                arg_types: &[U64, U32],
+            },
             Opcode::ShiftRightArithmetic32 => OpcodeMeta {
                 name: "ShiftRightArithmetic32",
                 return_type: U32,
                 arg_types: &[U32, U32],
+            },
+            Opcode::ShiftRightArithmetic64 => OpcodeMeta {
+                name: "ShiftRightArithmetic64",
+                return_type: U64,
+                arg_types: &[U64, U32],
             },
             Opcode::BitwiseAnd32 => OpcodeMeta {
                 name: "BitwiseAnd32",
@@ -2852,6 +2871,11 @@ impl Opcode {
                 name: "SubgroupBallot",
                 return_type: U32x4,
                 arg_types: &[U1],
+            },
+            Opcode::LaneId => OpcodeMeta {
+                name: "LaneId",
+                return_type: U32,
+                arg_types: &[],
             },
             Opcode::SubgroupEqMask => OpcodeMeta {
                 name: "SubgroupEqMask",

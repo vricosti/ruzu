@@ -416,6 +416,11 @@ fn read_light_limiter_state_mut(addr: CpuAddr) -> Option<&'static mut LightLimit
     if addr == 0 {
         return None;
     }
+    crate::raw_write_trace::maybe_trace_write_at(
+        "light_limiter:state_mut",
+        addr,
+        std::mem::size_of::<LightLimiterState>(),
+    );
     Some(unsafe { &mut *(addr as *mut LightLimiterState) })
 }
 
@@ -423,6 +428,11 @@ fn read_statistics_internal_mut(addr: CpuAddr) -> Option<&'static mut Statistics
     if addr == 0 {
         return None;
     }
+    crate::raw_write_trace::maybe_trace_write_at(
+        "light_limiter:statistics_internal_mut",
+        addr,
+        std::mem::size_of::<StatisticsInternal>(),
+    );
     Some(unsafe { &mut *(addr as *mut StatisticsInternal) })
 }
 
@@ -430,6 +440,11 @@ fn read_f32_slice_mut(addr: CpuAddr, len: usize) -> Option<&'static mut [f32]> {
     if addr == 0 {
         return None;
     }
+    crate::raw_write_trace::maybe_trace_write_at(
+        "light_limiter:f32_slice_mut",
+        addr,
+        len * std::mem::size_of::<f32>(),
+    );
     Some(unsafe { std::slice::from_raw_parts_mut(addr as *mut f32, len) })
 }
 

@@ -47,12 +47,44 @@ struct Maxwell3DPtr(*mut Maxwell3D);
 unsafe impl Send for Maxwell3DPtr {}
 
 impl Maxwell3DPtr {
+    unsafe fn draw_arrays_indirect(self, extended: bool, parameters: &[u32]) {
+        (&mut *self.0).hle_draw_arrays_indirect(extended, parameters);
+    }
+
+    unsafe fn draw_indexed_indirect(self, extended: bool, parameters: &[u32]) {
+        (&mut *self.0).hle_draw_indexed_indirect(extended, parameters);
+    }
+
+    unsafe fn multi_draw_indexed_indirect_count(self, parameters: &[u32]) {
+        (&mut *self.0).hle_multi_draw_indexed_indirect_count(parameters);
+    }
+
+    unsafe fn draw_indirect_byte_count(self, parameters: &[u32]) {
+        (&mut *self.0).hle_draw_indirect_byte_count(parameters);
+    }
+
+    unsafe fn multi_layer_clear(self, parameters: &[u32]) {
+        (&mut *self.0).hle_multi_layer_clear(parameters);
+    }
+
+    unsafe fn c713c83d8f63ccf3(self, parameters: &[u32]) {
+        (&mut *self.0).hle_c713c83d8f63ccf3(parameters);
+    }
+
+    unsafe fn set_raster_bounding_box(self, parameters: &[u32]) {
+        (&mut *self.0).hle_set_raster_bounding_box(parameters);
+    }
+
     unsafe fn clear_const_buffer(self, base_size: usize, parameters: &[u32]) {
         (&mut *self.0).hle_clear_const_buffer(base_size, parameters);
     }
 
     unsafe fn clear_memory(self, parameters: &[u32], zero_memory: &mut Vec<u32>) {
         (&mut *self.0).hle_clear_memory(parameters, zero_memory);
+    }
+
+    unsafe fn transform_feedback_setup(self, parameters: &[u32]) {
+        (&mut *self.0).hle_transform_feedback_setup(parameters);
     }
 
     unsafe fn d7333d26e0a93ede(self, parameters: &[u32]) {
@@ -69,17 +101,16 @@ impl Maxwell3DPtr {
 /// Port of `HLE_DrawArraysIndirect<false>`.
 struct HleDrawArraysIndirect {
     extended: bool,
+    maxwell3d: Option<Maxwell3DPtr>,
 }
 
 impl CachedMacro for HleDrawArraysIndirect {
-    fn execute(&mut self, _parameters: &[u32], _method: u32) {
-        // Stubbed — requires Maxwell3D reference to call draw_manager->DrawArrayIndirect()
-        // and set indirect draw parameters.
-        // Upstream: HLE_DrawArraysIndirect<extended>::Execute() in video_core/macro/macro_hle.cpp
-        log::warn!(
-            "HLE_DrawArraysIndirect(extended={}): not yet implemented (requires Maxwell3D integration)",
-            self.extended
-        );
+    fn execute(&mut self, parameters: &[u32], _method: u32) {
+        let Some(maxwell3d) = self.maxwell3d else {
+            log::warn!("HLE_DrawArraysIndirect: missing Maxwell3D owner");
+            return;
+        };
+        unsafe { maxwell3d.draw_arrays_indirect(self.extended, parameters) };
     }
 }
 
@@ -88,81 +119,84 @@ impl CachedMacro for HleDrawArraysIndirect {
 /// Port of `HLE_DrawIndexedIndirect<extended>`.
 struct HleDrawIndexedIndirect {
     extended: bool,
+    maxwell3d: Option<Maxwell3DPtr>,
 }
 
 impl CachedMacro for HleDrawIndexedIndirect {
-    fn execute(&mut self, _parameters: &[u32], _method: u32) {
-        // Stubbed — requires Maxwell3D reference to call draw_manager->DrawIndexedIndirect()
-        // and set element_base/base_instance registers.
-        // Upstream: HLE_DrawIndexedIndirect<extended>::Execute() in video_core/macro/macro_hle.cpp
-        log::warn!(
-            "HLE_DrawIndexedIndirect(extended={}): not yet implemented (requires Maxwell3D integration)",
-            self.extended
-        );
+    fn execute(&mut self, parameters: &[u32], _method: u32) {
+        let Some(maxwell3d) = self.maxwell3d else {
+            log::warn!("HLE_DrawIndexedIndirect: missing Maxwell3D owner");
+            return;
+        };
+        unsafe { maxwell3d.draw_indexed_indirect(self.extended, parameters) };
     }
 }
 
 /// HLE: MultiLayerClear.
 ///
 /// Port of `HLE_MultiLayerClear`.
-struct HleMultiLayerClear;
+struct HleMultiLayerClear {
+    maxwell3d: Option<Maxwell3DPtr>,
+}
 
 impl CachedMacro for HleMultiLayerClear {
-    fn execute(&mut self, _parameters: &[u32], _method: u32) {
-        // Stubbed — requires Maxwell3D reference to decode ClearSurface params and
-        // call draw_manager->Clear(num_layers).
-        // Upstream: HLE_MultiLayerClear::Execute() in video_core/macro/macro_hle.cpp
-        log::warn!("HLE_MultiLayerClear: not yet implemented (requires Maxwell3D integration)");
+    fn execute(&mut self, parameters: &[u32], _method: u32) {
+        let Some(maxwell3d) = self.maxwell3d else {
+            log::warn!("HLE_MultiLayerClear: missing Maxwell3D owner");
+            return;
+        };
+        unsafe { maxwell3d.multi_layer_clear(parameters) };
     }
 }
 
 /// HLE: MultiDrawIndexedIndirectCount.
 ///
 /// Port of `HLE_MultiDrawIndexedIndirectCount`.
-struct HleMultiDrawIndexedIndirectCount;
+struct HleMultiDrawIndexedIndirectCount {
+    maxwell3d: Option<Maxwell3DPtr>,
+}
 
 impl CachedMacro for HleMultiDrawIndexedIndirectCount {
-    fn execute(&mut self, _parameters: &[u32], _method: u32) {
-        // Stubbed — requires Maxwell3D reference to set indirect draw parameters and call
-        // draw_manager->DrawIndexedIndirect() with count/stride from parameters.
-        // Upstream: HLE_MultiDrawIndexedIndirectCount::Execute() in video_core/macro/macro_hle.cpp
-        log::warn!("HLE_MultiDrawIndexedIndirectCount: not yet implemented (requires Maxwell3D integration)");
+    fn execute(&mut self, parameters: &[u32], _method: u32) {
+        let Some(maxwell3d) = self.maxwell3d else {
+            log::warn!("HLE_MultiDrawIndexedIndirectCount: missing Maxwell3D owner");
+            return;
+        };
+        unsafe { maxwell3d.multi_draw_indexed_indirect_count(parameters) };
     }
 }
 
 /// HLE: DrawIndirectByteCount.
 ///
 /// Port of `HLE_DrawIndirectByteCount`.
-struct HleDrawIndirectByteCount;
+struct HleDrawIndirectByteCount {
+    maxwell3d: Option<Maxwell3DPtr>,
+}
 
 impl CachedMacro for HleDrawIndirectByteCount {
-    fn execute(&mut self, _parameters: &[u32], _method: u32) {
-        // Stubbed — requires Maxwell3D reference to set draw_auto_stride/byte_count registers
-        // and call draw_manager->DrawArrayIndirect(topology) with is_byte_count=true.
-        // Upstream: HLE_DrawIndirectByteCount::Execute() in video_core/macro/macro_hle.cpp
-        log::warn!(
-            "HLE_DrawIndirectByteCount: not yet implemented (requires Maxwell3D integration)"
-        );
+    fn execute(&mut self, parameters: &[u32], _method: u32) {
+        let Some(maxwell3d) = self.maxwell3d else {
+            log::warn!("HLE_DrawIndirectByteCount: missing Maxwell3D owner");
+            return;
+        };
+        unsafe { maxwell3d.draw_indirect_byte_count(parameters) };
     }
 }
 
 /// HLE: C713C83D8F63CCF3 — const buffer setup.
 ///
 /// Port of `HLE_C713C83D8F63CCF3`.
-struct HleC713C83d8f63Ccf3;
+struct HleC713C83d8f63Ccf3 {
+    maxwell3d: Option<Maxwell3DPtr>,
+}
 
 impl CachedMacro for HleC713C83d8f63Ccf3 {
-    fn execute(&mut self, _parameters: &[u32], _method: u32) {
-        // Stubbed — requires Maxwell3D register access to read shadow_scratch[24] and
-        // write const_buffer.{size, address_high, address_low, offset}.
-        // Upstream: HLE_C713C83D8F63CCF3::Execute() in video_core/macro/macro_hle.cpp:
-        //   offset = (params[0] & 0x3FFFFFFF) << 2
-        //   address = regs.shadow_scratch[24]
-        //   const_buffer.size = 0x7000
-        //   const_buffer.address_high = (address >> 24) & 0xFF
-        //   const_buffer.address_low = address << 8
-        //   const_buffer.offset = offset
-        log::warn!("HLE_C713C83D8F63CCF3: not yet implemented (requires Maxwell3D integration)");
+    fn execute(&mut self, parameters: &[u32], _method: u32) {
+        let Some(maxwell3d) = self.maxwell3d else {
+            log::warn!("HLE_C713C83D8F63CCF3: missing Maxwell3D owner");
+            return;
+        };
+        unsafe { maxwell3d.c713c83d8f63ccf3(parameters) };
     }
 }
 
@@ -203,21 +237,17 @@ impl CachedMacro for HleBindShader {
 /// HLE: SetRasterBoundingBox.
 ///
 /// Port of `HLE_SetRasterBoundingBox`.
-struct HleSetRasterBoundingBox;
+struct HleSetRasterBoundingBox {
+    maxwell3d: Option<Maxwell3DPtr>,
+}
 
 impl CachedMacro for HleSetRasterBoundingBox {
-    fn execute(&mut self, _parameters: &[u32], _method: u32) {
-        // Stubbed — requires Maxwell3D register access to read conservative_raster_enable
-        // and shadow_scratch[52], then write raster_bounding_box.
-        // Upstream: HLE_SetRasterBoundingBox::Execute() in video_core/macro/macro_hle.cpp:
-        //   raster_mode = params[0]
-        //   raster_enabled = regs.conservative_raster_enable
-        //   scratch_data = regs.shadow_scratch[52]
-        //   regs.raster_bounding_box.raw = raster_mode & 0xFFFFF00F
-        //   regs.raster_bounding_box.pad = scratch_data & raster_enabled
-        log::warn!(
-            "HLE_SetRasterBoundingBox: not yet implemented (requires Maxwell3D integration)"
-        );
+    fn execute(&mut self, parameters: &[u32], _method: u32) {
+        let Some(maxwell3d) = self.maxwell3d else {
+            log::warn!("HLE_SetRasterBoundingBox: missing Maxwell3D owner");
+            return;
+        };
+        unsafe { maxwell3d.set_raster_bounding_box(parameters) };
     }
 }
 
@@ -263,23 +293,17 @@ impl CachedMacro for HleClearMemory {
 /// HLE: TransformFeedbackSetup.
 ///
 /// Port of `HLE_TransformFeedbackSetup`.
-struct HleTransformFeedbackSetup;
+struct HleTransformFeedbackSetup {
+    maxwell3d: Option<Maxwell3DPtr>,
+}
 
 impl CachedMacro for HleTransformFeedbackSetup {
-    fn execute(&mut self, _parameters: &[u32], _method: u32) {
-        // Stubbed — requires Maxwell3D register access to set transform_feedback_enabled,
-        // clear buffer start_offsets, set upload dest address, call CallMethod(launch_dma)
-        // and CallMethod(inline_data) with the TF stride, then RegisterTransformFeedback.
-        // Upstream: HLE_TransformFeedbackSetup::Execute() in video_core/macro/macro_hle.cpp:
-        //   regs.transform_feedback_enabled = 1
-        //   regs.transform_feedback.buffers[0..3].start_offset = 0
-        //   regs.upload.{line_length_in=4, line_count=1, dest.{address_high=params[0], address_low=params[1]}}
-        //   CallMethod(launch_dma, 0x1011, true)
-        //   CallMethod(inline_data, tf.controls[0].stride, true)
-        //   Rasterizer().RegisterTransformFeedback(upload.dest.Address())
-        log::warn!(
-            "HLE_TransformFeedbackSetup: not yet implemented (requires Maxwell3D integration)"
-        );
+    fn execute(&mut self, parameters: &[u32], _method: u32) {
+        let Some(maxwell3d) = self.maxwell3d else {
+            log::warn!("HLE_TransformFeedbackSetup: missing Maxwell3D owner");
+            return;
+        };
+        unsafe { maxwell3d.transform_feedback_setup(parameters) };
     }
 }
 
@@ -303,31 +327,47 @@ impl HleMacro {
     pub fn new() -> Self {
         let mut builders: HashMap<u64, HleBuilder> = HashMap::new();
 
-        builders.insert(HASH_DRAW_ARRAYS_INDIRECT, |_| {
-            Box::new(HleDrawArraysIndirect { extended: false })
+        builders.insert(HASH_DRAW_ARRAYS_INDIRECT, |maxwell3d| {
+            Box::new(HleDrawArraysIndirect {
+                extended: false,
+                maxwell3d,
+            })
         });
-        builders.insert(HASH_DRAW_ARRAYS_INDIRECT_EXT, |_| {
-            Box::new(HleDrawArraysIndirect { extended: true })
+        builders.insert(HASH_DRAW_ARRAYS_INDIRECT_EXT, |maxwell3d| {
+            Box::new(HleDrawArraysIndirect {
+                extended: true,
+                maxwell3d,
+            })
         });
-        builders.insert(HASH_DRAW_INDEXED_INDIRECT, |_| {
-            Box::new(HleDrawIndexedIndirect { extended: false })
+        builders.insert(HASH_DRAW_INDEXED_INDIRECT, |maxwell3d| {
+            Box::new(HleDrawIndexedIndirect {
+                extended: false,
+                maxwell3d,
+            })
         });
-        builders.insert(HASH_DRAW_INDEXED_INDIRECT_EXT, |_| {
-            Box::new(HleDrawIndexedIndirect { extended: true })
+        builders.insert(HASH_DRAW_INDEXED_INDIRECT_EXT, |maxwell3d| {
+            Box::new(HleDrawIndexedIndirect {
+                extended: true,
+                maxwell3d,
+            })
         });
-        builders.insert(HASH_MULTI_DRAW_INDEXED_INDIRECT_COUNT, |_| {
-            Box::new(HleMultiDrawIndexedIndirectCount)
+        builders.insert(HASH_MULTI_DRAW_INDEXED_INDIRECT_COUNT, |maxwell3d| {
+            Box::new(HleMultiDrawIndexedIndirectCount { maxwell3d })
         });
-        builders.insert(HASH_MULTI_LAYER_CLEAR, |_| Box::new(HleMultiLayerClear));
-        builders.insert(HASH_C713C83D8F63CCF3, |_| Box::new(HleC713C83d8f63Ccf3));
+        builders.insert(HASH_MULTI_LAYER_CLEAR, |maxwell3d| {
+            Box::new(HleMultiLayerClear { maxwell3d })
+        });
+        builders.insert(HASH_C713C83D8F63CCF3, |maxwell3d| {
+            Box::new(HleC713C83d8f63Ccf3 { maxwell3d })
+        });
         builders.insert(HASH_D7333D26E0A93EDE, |maxwell3d| {
             Box::new(HleD7333d26e0a93Ede { maxwell3d })
         });
         builders.insert(HASH_BIND_SHADER, |maxwell3d| {
             Box::new(HleBindShader { maxwell3d })
         });
-        builders.insert(HASH_SET_RASTER_BOUNDING_BOX, |_| {
-            Box::new(HleSetRasterBoundingBox)
+        builders.insert(HASH_SET_RASTER_BOUNDING_BOX, |maxwell3d| {
+            Box::new(HleSetRasterBoundingBox { maxwell3d })
         });
         builders.insert(HASH_CLEAR_CONST_BUFFER_5F00, |maxwell3d| {
             Box::new(HleClearConstBuffer {
@@ -347,11 +387,11 @@ impl HleMacro {
                 maxwell3d,
             })
         });
-        builders.insert(HASH_TRANSFORM_FEEDBACK_SETUP, |_| {
-            Box::new(HleTransformFeedbackSetup)
+        builders.insert(HASH_TRANSFORM_FEEDBACK_SETUP, |maxwell3d| {
+            Box::new(HleTransformFeedbackSetup { maxwell3d })
         });
-        builders.insert(HASH_DRAW_INDIRECT_BYTE_COUNT, |_| {
-            Box::new(HleDrawIndirectByteCount)
+        builders.insert(HASH_DRAW_INDIRECT_BYTE_COUNT, |maxwell3d| {
+            Box::new(HleDrawIndirectByteCount { maxwell3d })
         });
 
         Self {

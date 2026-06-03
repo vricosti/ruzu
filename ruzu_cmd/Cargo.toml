@@ -16,6 +16,7 @@ path = "src/main.rs"
 common = { workspace = true }
 ruzu_core = { package = "core", path = "../core" }
 audio_core = { path = "../audio_core" }
+hid_core = { path = "../hid_core" }
 video_core = { workspace = true }
 input_common = { workspace = true }
 frontend_common = { workspace = true }
