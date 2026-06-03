@@ -372,7 +372,7 @@ impl base::BufferCacheRuntime for BufferCacheRuntime {
     }
 
     fn finish(&mut self) {
-        self.finish();
+        BufferCacheRuntime::finish(self);
     }
 
     fn upload_staging_buffer(&mut self, size: u64) -> StagingBufferRef {
@@ -398,11 +398,11 @@ impl base::BufferCacheRuntime for BufferCacheRuntime {
     }
 
     fn pre_copy_barrier(&mut self) {
-        self.pre_copy_barrier();
+        BufferCacheRuntime::pre_copy_barrier(self);
     }
 
     fn post_copy_barrier(&mut self) {
-        self.post_copy_barrier();
+        BufferCacheRuntime::post_copy_barrier(self);
     }
 
     fn copy_buffer(

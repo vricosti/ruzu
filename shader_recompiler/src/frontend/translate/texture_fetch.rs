@@ -82,9 +82,8 @@ fn get_type(type_: TextureType) -> ShaderTextureType {
 
 fn read_array(v: &mut TranslatorVisitor, reg: u32) -> Value {
     let raw = v.x(reg);
-    let extracted = v
-        .ir
-        .bit_field_u_extract(raw, Value::ImmU32(0), Value::ImmU32(16));
+    let extracted =
+        v.ir.bit_field_u_extract(raw, Value::ImmU32(0), Value::ImmU32(16));
     v.ir.convert_f32_from_u32(extracted)
 }
 
@@ -141,28 +140,22 @@ fn make_offset(v: &mut TranslatorVisitor, reg: &mut u32, type_: TextureType) -> 
     *reg += 1;
     match type_ {
         TextureType::D1 | TextureType::Array1D => {
-            v.ir
-                .bit_field_s_extract(value, Value::ImmU32(0), Value::ImmU32(4))
+            v.ir.bit_field_s_extract(value, Value::ImmU32(0), Value::ImmU32(4))
         }
         TextureType::D2 | TextureType::Array2D => {
-            let x = v
-                .ir
-                .bit_field_s_extract(value, Value::ImmU32(0), Value::ImmU32(4));
-            let y = v
-                .ir
-                .bit_field_s_extract(value, Value::ImmU32(4), Value::ImmU32(4));
+            let x =
+                v.ir.bit_field_s_extract(value, Value::ImmU32(0), Value::ImmU32(4));
+            let y =
+                v.ir.bit_field_s_extract(value, Value::ImmU32(4), Value::ImmU32(4));
             v.ir.composite_construct_u32x2(x, y)
         }
         TextureType::D3 | TextureType::Array3D => {
-            let x = v
-                .ir
-                .bit_field_s_extract(value, Value::ImmU32(0), Value::ImmU32(4));
-            let y = v
-                .ir
-                .bit_field_s_extract(value, Value::ImmU32(4), Value::ImmU32(4));
-            let z = v
-                .ir
-                .bit_field_s_extract(value, Value::ImmU32(8), Value::ImmU32(4));
+            let x =
+                v.ir.bit_field_s_extract(value, Value::ImmU32(0), Value::ImmU32(4));
+            let y =
+                v.ir.bit_field_s_extract(value, Value::ImmU32(4), Value::ImmU32(4));
+            let z =
+                v.ir.bit_field_s_extract(value, Value::ImmU32(8), Value::ImmU32(4));
             v.ir.composite_construct_u32x3(x, y, z)
         }
         TextureType::Cube | TextureType::ArrayCube => panic!("Illegal offset on CUBE sample"),
@@ -208,11 +201,7 @@ fn impl_tex(
     } else {
         Value::Void
     };
-    let dref = if dc {
-        v.f(meta_reg)
-    } else {
-        Value::Void
-    };
+    let dref = if dc { v.f(meta_reg) } else { Value::Void };
 
     let mut info = TextureInstInfo::default();
     info.texture_type = get_type(type_) as u8;
@@ -225,24 +214,14 @@ fn impl_tex(
 
     let sample = if !dc {
         if has_explicit_lod(blod) {
-            v.ir
-                .image_sample_explicit_lod_full(handle, coords, lod, offset, info.to_u32())
+            v.ir.image_sample_explicit_lod_full(handle, coords, lod, offset, info.to_u32())
         } else {
-            v.ir
-                .image_sample_implicit_lod_full(handle, coords, lod, offset, info.to_u32())
+            v.ir.image_sample_implicit_lod_full(handle, coords, lod, offset, info.to_u32())
         }
     } else if has_explicit_lod(blod) {
-        v.ir
-            .image_sample_dref_explicit_lod_full(handle, coords, dref, lod, offset, info.to_u32())
+        v.ir.image_sample_dref_explicit_lod_full(handle, coords, dref, lod, offset, info.to_u32())
     } else {
-        v.ir.image_sample_dref_implicit_lod_full(
-            handle,
-            coords,
-            dref,
-            lod,
-            offset,
-            info.to_u32(),
-        )
+        v.ir.image_sample_dref_implicit_lod_full(handle, coords, dref, lod, offset, info.to_u32())
     };
 
     let mut reg = dest_reg;
@@ -257,8 +236,7 @@ fn impl_tex(
                 Value::ImmF32(1.0)
             }
         } else {
-            v.ir
-                .composite_extract_f32x4(sample, Value::ImmU32(element))
+            v.ir.composite_extract_f32x4(sample, Value::ImmU32(element))
         };
         v.set_f(reg, value);
         reg += 1;

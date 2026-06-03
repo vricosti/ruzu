@@ -15,6 +15,7 @@ use crate::host1x::codecs::decoder::{self, DecoderImpl};
 use crate::host1x::codecs::h264::H264;
 use crate::host1x::codecs::vp8::Vp8;
 use crate::host1x::codecs::vp9::Vp9;
+use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
 use crate::host1x::host1x::FrameQueue;
 use crate::host1x::nvdec_common::{NvdecRegisters, VideoCodec, REG_EXECUTE, REG_SET_CODEC_ID};
 
@@ -25,19 +26,26 @@ pub struct Nvdec {
     id: i32,
     syncpoint: u32,
     frame_queue: Arc<FrameQueue>,
+    memory_manager: Arc<MaxwellDeviceMemoryManager>,
     regs: NvdecRegisters,
     decoder: Option<Box<dyn DecoderImpl>>,
     wait_needed: bool,
 }
 
 impl Nvdec {
-    pub fn new(id: i32, syncpt: u32, frame_queue: Arc<FrameQueue>) -> Self {
+    pub fn new(
+        id: i32,
+        syncpt: u32,
+        frame_queue: Arc<FrameQueue>,
+        memory_manager: Arc<MaxwellDeviceMemoryManager>,
+    ) -> Self {
         info!("Created nvdec {}", id);
         frame_queue.open(id);
         Self {
             id,
             syncpoint: syncpt,
             frame_queue,
+            memory_manager,
             regs: NvdecRegisters::default(),
             decoder: None,
             wait_needed: false,
@@ -116,7 +124,12 @@ impl Nvdec {
             );
             match dec.get_current_codec() {
                 VideoCodec::H264 | VideoCodec::VP8 | VideoCodec::VP9 => {
-                    decoder::decode(dec.as_mut(), &self.frame_queue);
+                    decoder::decode(
+                        dec.as_mut(),
+                        &self.regs,
+                        &self.memory_manager,
+                        &self.frame_queue,
+                    );
                 }
                 _ => {
                     log::error!("Unimplemented codec {}", dec.get_current_codec_name());

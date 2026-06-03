@@ -321,8 +321,64 @@ impl ImageInfo {
     /// Construct from depth/stencil config.
     ///
     /// Port of `ImageInfo::ImageInfo(const Zeta&, const ZetaSize&, MsaaMode)`.
-    ///
-    /// Requires Maxwell3D register types not yet ported.
+    pub fn from_zeta_info(config: &crate::engines::maxwell_3d::ZetaInfo, msaa_mode: u32) -> Self {
+        let format = crate::surface::pixel_format_from_depth_format(config.format);
+        let is_pitch_linear = (config.tile_mode & (1 << 12)) != 0;
+        let dim_control_define_depth_size = (config.tile_mode & (1 << 16)) != 0;
+        let mut info = Self {
+            format,
+            image_type: ImageType::E2D,
+            resources: SubresourceExtent {
+                levels: 1,
+                layers: 1,
+            },
+            size: Extent3D {
+                width: config.width,
+                height: config.height,
+                depth: 1,
+            },
+            tiling: TilingMode::default(),
+            layer_stride: config.array_pitch.saturating_mul(4),
+            maybe_unaligned_layer_stride: config.array_pitch.saturating_mul(4),
+            num_samples: if msaa_mode == 0 { 1 } else { 1 },
+            tile_width_spacing: 0,
+            rescaleable: false,
+            downscaleable: false,
+            forced_flushed: is_pitch_linear,
+            dma_downloaded: is_pitch_linear,
+            is_sparse: false,
+        };
+
+        if is_pitch_linear {
+            info.image_type = ImageType::Linear;
+            info.tiling = TilingMode::PitchLinear(config.width * crate::surface::bytes_per_block(format));
+            return info;
+        }
+
+        info.tiling = TilingMode::BlockLinear(Extent3D {
+            width: config.tile_mode & 0xF,
+            height: (config.tile_mode >> 4) & 0xF,
+            depth: (config.tile_mode >> 8) & 0xF,
+        });
+        if dim_control_define_depth_size {
+            info.image_type = ImageType::E3D;
+            info.size.depth = config.depth & 0xFFFF;
+        } else {
+            info.image_type = ImageType::E2D;
+            let array_size_is_one = ((config.depth >> 16) & 1) != 0;
+            info.resources.layers = if array_size_is_one {
+                1
+            } else {
+                (config.depth & 0xFFFF).max(1) as i32
+            };
+            info.rescaleable = info.block().depth == 0;
+            info.downscaleable = info.size.height > DOWNSCALE_HEIGHT_THRESHOLD;
+        }
+
+        info
+    }
+
+    /// Compatibility stub for older Rust call sites.
     pub fn from_zeta(_zt: &(), _zt_size: &(), _msaa_mode: u32) -> Self {
         log::warn!("ImageInfo::from_zeta: Maxwell3D regs not yet ported — returning default");
         Self::default()

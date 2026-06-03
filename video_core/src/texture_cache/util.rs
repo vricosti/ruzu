@@ -889,21 +889,16 @@ pub fn convert_image(
                 * copy.image_subresource.num_layers as u32
                 * surface::bytes_per_block(surface::PixelFormat::A8B8G8R8Unorm);
         } else {
-            // BCn decompression path
-            // Stubbed: requires BCn decoder crate (equivalent of bc_decoder.h)
-            log::warn!(
-                "ConvertImage: BCn decompression not yet implemented for format {:?}",
-                info.format
+            crate::texture_cache::decode_bc::decompress_bcn(
+                &input[input_offset..],
+                &mut output[output_offset as usize..],
+                copy,
+                info.format,
             );
             let bytes = copy.image_extent.width
                 * copy.image_extent.height
                 * copy.image_subresource.num_layers as u32
                 * crate::texture_cache::decode_bc::converted_bytes_per_block(info.format);
-            // Zero-fill the output for unsupported formats
-            let end = (output_offset + bytes) as usize;
-            if end <= output.len() {
-                output[output_offset as usize..end].fill(0);
-            }
             output_offset += bytes;
         }
 

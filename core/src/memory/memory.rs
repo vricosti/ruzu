@@ -17,7 +17,6 @@ use std::sync::{
 use crate::core::SystemRef;
 use crate::device_memory::{dram_memory_map, DeviceMemory};
 use crate::gpu_dirty_memory_manager::GpuDirtyMemoryManager;
-use crate::hle::kernel::svc::svc_results::RESULT_INVALID_CURRENT_MEMORY;
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 
 /// Page size constants matching upstream YUZU_PAGEBITS / YUZU_PAGESIZE.
@@ -971,8 +970,13 @@ impl Memory {
             let block_size = ((PAGE_SIZE as usize) - page_offset).min(remaining);
 
             if self.get_pointer_impl(vaddr).is_null() {
-                log::error!("Unmapped cache maintenance @ {:#018x}", vaddr);
-                return RESULT_INVALID_CURRENT_MEMORY;
+                // Upstream zuyu's cache helpers currently succeed without
+                // checking page mappings. Preserve that behaviour for guest
+                // cache-maintenance SVCs while still letting mapped
+                // rasterizer-cached pages trigger the Rust-side coherency hook.
+                vaddr += block_size as u64;
+                remaining -= block_size;
+                continue;
             }
 
             if self.page_type_at(vaddr) == Some(PageType::RasterizerCachedMemory) {

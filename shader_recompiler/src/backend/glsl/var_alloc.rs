@@ -8,8 +8,8 @@
 use std::fmt;
 
 use crate::ir;
-use crate::ir::program::SyntaxNode;
 use crate::ir::instruction::Inst;
+use crate::ir::program::SyntaxNode;
 use crate::ir::types::Type;
 use crate::ir::value::{InstRef, Value};
 

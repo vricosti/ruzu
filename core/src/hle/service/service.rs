@@ -249,8 +249,6 @@ pub trait ServiceFramework: SessionRequestHandler {
                         cmd_buf[6],
                         cmd_buf[7],
                     );
-                    let mut rb = ipc_helpers::ResponseBuilder::new(ctx, 2, 0, 0);
-                    rb.push_result(RESULT_SUCCESS);
                 }
             }
         }

@@ -167,10 +167,7 @@ mod tests {
         let insn = 1u64 | (0x3f80_0000u64 << 20) | (2u64 << 53);
         fmul32i(&mut tv, insn);
 
-        let opcodes: Vec<_> = tv
-            .ir
-            .program
-            .blocks[0]
+        let opcodes: Vec<_> = tv.ir.program.blocks[0]
             .iter()
             .map(|inst| inst.opcode)
             .collect();
@@ -187,10 +184,7 @@ mod tests {
         let insn = 1u64 | (2u64 << 20) | (Scale::D2 as u64) << 41 | (1u64 << 44);
         fmul(&mut tv, insn, MaxwellOpcode::FMUL_reg);
 
-        let fpmul_count = tv
-            .ir
-            .program
-            .blocks[0]
+        let fpmul_count = tv.ir.program.blocks[0]
             .iter()
             .filter(|inst| inst.opcode == Opcode::FPMul32)
             .count();

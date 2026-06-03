@@ -1256,6 +1256,21 @@ fn call32(system: &System, imm: u32, args: &mut SvcArgs) {
                             ctx.r[13] as u32,
                             core_index
                         );
+                        if std::env::var_os("RUZU_DUMP_BREAK_STACK").is_some() {
+                            let backtrace =
+                                crate::arm::debug::get_backtrace_from_context(&process, &ctx);
+                            for (index, entry) in backtrace.iter().enumerate().take(32) {
+                                log::error!(
+                                    "  break_bt[{}] addr=0x{:08X} orig=0x{:08X} module={} name={} offset=0x{:X}",
+                                    index,
+                                    entry.address as u32,
+                                    entry.original_address as u32,
+                                    entry.module,
+                                    entry.name,
+                                    entry.offset,
+                                );
+                            }
+                        }
                     }
                 }
             }

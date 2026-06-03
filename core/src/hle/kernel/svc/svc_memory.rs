@@ -206,6 +206,8 @@ pub fn map_memory(system: &System, dst_addr: u64, src_addr: u64, size: u64) -> R
         .page_table
         .map_memory(dst_kpa, src_kpa, size as usize);
     if r != RESULT_SUCCESS.get_inner_value() {
+        let src_info = process.page_table.query_info(src_addr as usize);
+        let dst_info = process.page_table.query_info(dst_addr as usize);
         log::error!(
             "svc::MapMemory failed, dst_addr=0x{:X}, src_addr=0x{:X}, size=0x{:X}, result=0x{:08X}",
             dst_addr,
@@ -213,6 +215,32 @@ pub fn map_memory(system: &System, dst_addr: u64, src_addr: u64, size: u64) -> R
             size,
             r
         );
+        if let Some(info) = src_info {
+            log::error!(
+                "svc::MapMemory source info: base=0x{:X} size=0x{:X} state={:?}/0x{:08X} perm={:?}/0x{:02X} attr={:?}/0x{:02X}",
+                info.m_address,
+                info.m_size,
+                info.m_state,
+                info.m_state.bits(),
+                info.m_permission,
+                info.m_permission.bits(),
+                info.m_attribute,
+                info.m_attribute.bits()
+            );
+        }
+        if let Some(info) = dst_info {
+            log::error!(
+                "svc::MapMemory destination info: base=0x{:X} size=0x{:X} state={:?}/0x{:08X} perm={:?}/0x{:02X} attr={:?}/0x{:02X}",
+                info.m_address,
+                info.m_size,
+                info.m_state,
+                info.m_state.bits(),
+                info.m_permission,
+                info.m_permission.bits(),
+                info.m_attribute,
+                info.m_attribute.bits()
+            );
+        }
     }
     ResultCode::new(r)
 }
@@ -237,5 +265,42 @@ pub fn unmap_memory(system: &System, dst_addr: u64, src_addr: u64, size: u64) ->
     let r = process
         .page_table
         .unmap_memory(dst_kpa, src_kpa, size as usize);
+    if r != RESULT_SUCCESS.get_inner_value() {
+        let src_info = process.page_table.query_info(src_addr as usize);
+        let dst_info = process.page_table.query_info(dst_addr as usize);
+        log::error!(
+            "svc::UnmapMemory failed, dst_addr=0x{:X}, src_addr=0x{:X}, size=0x{:X}, result=0x{:08X}",
+            dst_addr,
+            src_addr,
+            size,
+            r
+        );
+        if let Some(info) = src_info {
+            log::error!(
+                "svc::UnmapMemory source info: base=0x{:X} size=0x{:X} state={:?}/0x{:08X} perm={:?}/0x{:02X} attr={:?}/0x{:02X}",
+                info.m_address,
+                info.m_size,
+                info.m_state,
+                info.m_state.bits(),
+                info.m_permission,
+                info.m_permission.bits(),
+                info.m_attribute,
+                info.m_attribute.bits()
+            );
+        }
+        if let Some(info) = dst_info {
+            log::error!(
+                "svc::UnmapMemory destination info: base=0x{:X} size=0x{:X} state={:?}/0x{:08X} perm={:?}/0x{:02X} attr={:?}/0x{:02X}",
+                info.m_address,
+                info.m_size,
+                info.m_state,
+                info.m_state.bits(),
+                info.m_permission,
+                info.m_permission.bits(),
+                info.m_attribute,
+                info.m_attribute.bits()
+            );
+        }
+    }
     ResultCode::new(r)
 }

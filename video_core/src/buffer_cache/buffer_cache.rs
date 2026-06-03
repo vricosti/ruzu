@@ -506,15 +506,31 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
         gpu_addr: u64,
         size: u32,
     ) {
-        let Some(ref mut cs) = self.channel_state else {
-            return;
-        };
         // Upstream: const std::optional<DAddr> device_addr = gpu_memory->GpuToCpuAddress(gpu_addr);
         let device_addr = self
             .gpu_memory
             .as_ref()
             .and_then(|gm| gm.gpu_to_cpu_address(gpu_addr))
             .unwrap_or(gpu_addr);
+        self.bind_graphics_uniform_buffer_with_device_addr(stage, index, device_addr, size);
+    }
+
+    /// Bind a graphics uniform buffer with an already-resolved device address.
+    ///
+    /// This mirrors `BindGraphicsUniformBuffer` but lets the OpenGL rasterizer
+    /// reuse an already-held channel memory-manager guard while it holds the
+    /// cache mutexes. Upstream reads `gpu_memory->GpuToCpuAddress` through a
+    /// raw Maxwell/GPU pointer, not through an extra Rust mutex.
+    pub fn bind_graphics_uniform_buffer_with_device_addr(
+        &mut self,
+        stage: usize,
+        index: u32,
+        device_addr: u64,
+        size: u32,
+    ) {
+        let Some(ref mut cs) = self.channel_state else {
+            return;
+        };
         let binding = Binding {
             device_addr,
             size,
@@ -549,6 +565,42 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
                 cs.has_deleted_buffers = false;
             }
             self.do_update_graphics_buffers(is_indexed);
+            if let Some(ref cs) = self.channel_state {
+                if !cs.has_deleted_buffers {
+                    break;
+                }
+            } else {
+                break;
+            }
+        }
+    }
+
+    /// Update graphics buffer bindings using caller-provided GPU address helpers.
+    ///
+    /// This mirrors `UpdateGraphicsBuffers` but lets the OpenGL rasterizer reuse
+    /// an already-held channel memory-manager guard while cache mutexes are held.
+    /// Upstream reads these values through `gpu_memory` without an extra Rust
+    /// mutex, so this preserves ordering without re-entering the channel lock.
+    pub fn update_graphics_buffers_with_gpu_resolver(
+        &mut self,
+        is_indexed: bool,
+        mut gpu_to_cpu_address: impl FnMut(u64) -> Option<u64>,
+        mut is_within_gpu_address_range: impl FnMut(u64) -> bool,
+        mut max_continuous_range: impl FnMut(u64, u64) -> u64,
+    ) {
+        if self.channel_state.is_none() {
+            return;
+        }
+        loop {
+            if let Some(ref mut cs) = self.channel_state {
+                cs.has_deleted_buffers = false;
+            }
+            self.do_update_graphics_buffers_with_gpu_resolver(
+                is_indexed,
+                &mut gpu_to_cpu_address,
+                &mut is_within_gpu_address_range,
+                &mut max_continuous_range,
+            );
             if let Some(ref cs) = self.channel_state {
                 if !cs.has_deleted_buffers {
                     break;
@@ -762,6 +814,53 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
                     cbuf_offset
                 );
             }
+            NULL_BINDING
+        };
+        if let Some(ref mut cs) = self.channel_state {
+            cs.storage_buffers[stage][ssbo_index] = binding;
+        }
+    }
+
+    /// Bind a graphics storage buffer using a caller-provided GPU-memory reader.
+    ///
+    /// This mirrors `BindGraphicsStorageBuffer` but lets the OpenGL rasterizer
+    /// reuse an already-held channel memory-manager guard while it holds the
+    /// cache mutexes. Upstream reads through `gpu_memory->Read<T>` without an
+    /// extra Rust mutex; this path preserves the same behavior without
+    /// re-locking the channel memory manager.
+    pub fn bind_graphics_storage_buffer_with_gpu_reader(
+        &mut self,
+        stage: usize,
+        ssbo_index: usize,
+        cbuf_index: u32,
+        cbuf_offset: u32,
+        is_written: bool,
+        mut gpu_to_cpu_address: impl FnMut(u64) -> Option<u64>,
+        mut get_memory_layout_size: impl FnMut(u64) -> u64,
+        mut read_block: impl FnMut(u64, &mut [u8]) -> bool,
+    ) {
+        let Some(ref mut cs) = self.channel_state else {
+            return;
+        };
+        if stage >= NUM_STAGES as usize || ssbo_index >= NUM_STORAGE_BUFFERS as usize {
+            return;
+        }
+        cs.enabled_storage_buffers[stage] |= 1u32 << ssbo_index;
+        cs.written_storage_buffers[stage] |= if is_written { 1u32 } else { 0u32 } << ssbo_index;
+        drop(cs);
+
+        let binding = if let Some(ref es) = self.engine_state {
+            let cbuf_info = es.get_const_buffer(stage, cbuf_index);
+            let ssbo_addr = cbuf_info.address.wrapping_add(cbuf_offset as u64);
+            self.storage_buffer_binding_with_gpu_reader(
+                ssbo_addr,
+                cbuf_index,
+                is_written,
+                &mut gpu_to_cpu_address,
+                &mut get_memory_layout_size,
+                &mut read_block,
+            )
+        } else {
             NULL_BINDING
         };
         if let Some(ref mut cs) = self.channel_state {
@@ -2219,6 +2318,38 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
         });
     }
 
+    fn do_update_graphics_buffers_with_gpu_resolver<G, I, M>(
+        &mut self,
+        is_indexed: bool,
+        gpu_to_cpu_address: &mut G,
+        is_within_gpu_address_range: &mut I,
+        max_continuous_range: &mut M,
+    ) where
+        G: FnMut(u64) -> Option<u64>,
+        I: FnMut(u64) -> bool,
+        M: FnMut(u64, u64) -> u64,
+    {
+        self.buffer_operations(|cache| {
+            if is_indexed {
+                cache.update_index_buffer_with_gpu_resolver(gpu_to_cpu_address);
+            }
+            cache.update_vertex_buffers_with_gpu_resolver(
+                gpu_to_cpu_address,
+                is_within_gpu_address_range,
+                max_continuous_range,
+            );
+            cache.update_transform_feedback_buffers();
+            for stage in 0..NUM_STAGES as usize {
+                cache.update_uniform_buffers(stage);
+                cache.update_storage_buffers(stage);
+                cache.update_texture_buffers(stage);
+            }
+            if cache.current_draw_indirect.is_some() {
+                cache.update_draw_indirect_with_gpu_resolver(gpu_to_cpu_address);
+            }
+        });
+    }
+
     /// Upstream: `BufferCache<P>::DoUpdateComputeBuffers`
     fn do_update_compute_buffers(&mut self) {
         self.buffer_operations(|cache| {
@@ -2291,6 +2422,68 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
         }
     }
 
+    fn update_index_buffer_with_gpu_resolver(
+        &mut self,
+        gpu_to_cpu_address: &mut impl FnMut(u64) -> Option<u64>,
+    ) {
+        let Some(ref mut es) = self.engine_state else {
+            return;
+        };
+        if !es.is_dirty(DirtyFlag::IndexBuffer) {
+            return;
+        }
+        es.clear_dirty(DirtyFlag::IndexBuffer);
+
+        let inline_indexes = es.get_inline_index_draw_indexes().to_vec();
+        if !inline_indexes.is_empty() {
+            let inline_index_size = inline_indexes.len() as u32;
+            let buffer_size =
+                (inline_index_size + CACHING_PAGESIZE as u32 - 1) & !(CACHING_PAGESIZE as u32 - 1);
+            if self.inline_buffer_id == NULL_BUFFER_ID {
+                self.inline_buffer_id = self.create_buffer(0, buffer_size);
+            }
+            if (self.slot_buffers[self.inline_buffer_id].size_bytes() as u32) < buffer_size {
+                let old_id = self.inline_buffer_id;
+                self.inline_buffer_id = self.create_buffer(0, buffer_size);
+                let _ = old_id;
+            }
+            if let Some(ref mut cs) = self.channel_state {
+                cs.index_buffer = Binding {
+                    device_addr: 0,
+                    size: inline_index_size,
+                    buffer_id: self.inline_buffer_id,
+                };
+            }
+            return;
+        }
+
+        let index_buffer_ref = es.get_index_buffer();
+        drop(es);
+
+        let gpu_addr_begin = index_buffer_ref.start_address;
+        let gpu_addr_end = index_buffer_ref.end_address;
+        let device_addr = gpu_to_cpu_address(gpu_addr_begin);
+        let address_size = (gpu_addr_end - gpu_addr_begin) as u32;
+        let draw_size = (index_buffer_ref.count + index_buffer_ref.first)
+            * index_buffer_ref.format_size_in_bytes;
+        let size = address_size.min(draw_size);
+        if size == 0 || device_addr.is_none() {
+            if let Some(ref mut cs) = self.channel_state {
+                cs.index_buffer = NULL_BINDING;
+            }
+            return;
+        }
+        let device_addr = device_addr.unwrap();
+        let buffer_id = self.find_buffer(device_addr, size);
+        if let Some(ref mut cs) = self.channel_state {
+            cs.index_buffer = Binding {
+                device_addr,
+                size,
+                buffer_id,
+            };
+        }
+    }
+
     /// Upstream: `BufferCache<P>::UpdateVertexBuffers`
     fn update_vertex_buffers(&mut self) {
         // Upstream: auto& flags = maxwell3d->dirty.flags;
@@ -2306,6 +2499,78 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
         }
         for index in 0..NUM_VERTEX_BUFFERS {
             self.update_vertex_buffer(index);
+        }
+    }
+
+    fn update_vertex_buffers_with_gpu_resolver(
+        &mut self,
+        gpu_to_cpu_address: &mut impl FnMut(u64) -> Option<u64>,
+        is_within_gpu_address_range: &mut impl FnMut(u64) -> bool,
+        max_continuous_range: &mut impl FnMut(u64, u64) -> u64,
+    ) {
+        if let Some(ref mut es) = self.engine_state {
+            if !es.is_dirty(DirtyFlag::VertexBuffers) {
+                return;
+            }
+            es.clear_dirty(DirtyFlag::VertexBuffers);
+        } else {
+            return;
+        }
+        for index in 0..NUM_VERTEX_BUFFERS {
+            self.update_vertex_buffer_with_gpu_resolver(
+                index,
+                gpu_to_cpu_address,
+                is_within_gpu_address_range,
+                max_continuous_range,
+            );
+        }
+    }
+
+    fn update_vertex_buffer_with_gpu_resolver(
+        &mut self,
+        index: u32,
+        gpu_to_cpu_address: &mut impl FnMut(u64) -> Option<u64>,
+        is_within_gpu_address_range: &mut impl FnMut(u64) -> bool,
+        max_continuous_range: &mut impl FnMut(u64, u64) -> u64,
+    ) {
+        let Some(ref mut es) = self.engine_state else {
+            return;
+        };
+        if !es.is_dirty(DirtyFlag::VertexBuffer(index)) {
+            return;
+        }
+        es.clear_dirty(DirtyFlag::VertexBuffer(index));
+
+        let array = es.get_vertex_stream(index);
+        let limit = es.get_vertex_stream_limit(index);
+        drop(es);
+
+        let gpu_addr_begin = array.address;
+        let gpu_addr_end = limit.address + 1;
+        let device_addr = gpu_to_cpu_address(gpu_addr_begin);
+        let address_size = (gpu_addr_end - gpu_addr_begin) as u32;
+        let mut size = address_size;
+
+        if array.enable == 0 || size == 0 || device_addr.is_none() {
+            if let Some(ref mut cs) = self.channel_state {
+                cs.vertex_buffers[index as usize] = NULL_BINDING;
+            }
+            return;
+        }
+
+        let mib_64 = 64 * 1024 * 1024;
+        if !is_within_gpu_address_range(gpu_addr_end) || size >= mib_64 {
+            size = max_continuous_range(gpu_addr_begin, size as u64) as u32;
+        }
+
+        let device_addr = device_addr.unwrap();
+        let buffer_id = self.find_buffer(device_addr, size);
+        if let Some(ref mut cs) = self.channel_state {
+            cs.vertex_buffers[index as usize] = Binding {
+                device_addr,
+                size,
+                buffer_id,
+            };
         }
     }
 
@@ -2387,6 +2652,41 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
         // Upstream: if (current_draw_indirect->include_count) { update count binding }
         if params.include_count {
             let binding = resolve_binding(self, params.count_start_address, 4); // sizeof(u32)
+            if let Some(ref mut cs) = self.channel_state {
+                cs.count_buffer_binding = binding;
+            }
+        }
+
+        let binding = resolve_binding(self, params.indirect_start_address, params.buffer_size);
+        if let Some(ref mut cs) = self.channel_state {
+            cs.indirect_buffer_binding = binding;
+        }
+    }
+
+    fn update_draw_indirect_with_gpu_resolver(
+        &mut self,
+        gpu_to_cpu_address: &mut impl FnMut(u64) -> Option<u64>,
+    ) {
+        let Some(params) = self.current_draw_indirect else {
+            return;
+        };
+
+        let mut resolve_binding = |cache: &mut Self, gpu_addr: u64, size: u64| -> Binding {
+            match gpu_to_cpu_address(gpu_addr) {
+                Some(addr) => {
+                    let buffer_id = cache.find_buffer(addr, size as u32);
+                    Binding {
+                        device_addr: addr,
+                        size: size as u32,
+                        buffer_id,
+                    }
+                }
+                None => NULL_BINDING,
+            }
+        };
+
+        if params.include_count {
+            let binding = resolve_binding(self, params.count_start_address, 4);
             if let Some(ref mut cs) = self.channel_state {
                 cs.count_buffer_binding = binding;
             }
@@ -3379,9 +3679,47 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
         };
 
         // Upstream: const GPUVAddr gpu_addr = gpu_memory->Read<u64>(ssbo_addr);
-        let gpu_addr = match read_u64(ssbo_addr) {
-            Some(addr) => addr,
-            None => {
+        self.storage_buffer_binding_with_gpu_reader(
+            ssbo_addr,
+            cbuf_index,
+            is_written,
+            |gpu_addr| gm.gpu_to_cpu_address(gpu_addr),
+            |gpu_addr| gm.get_memory_layout_size(gpu_addr),
+            |gpu_addr, out| {
+                match out.len() {
+                    4 => {
+                        let Some(value) = read_u32(gpu_addr) else {
+                            return false;
+                        };
+                        out.copy_from_slice(&value.to_le_bytes());
+                        true
+                    }
+                    8 => {
+                        let Some(value) = read_u64(gpu_addr) else {
+                            return false;
+                        };
+                        out.copy_from_slice(&value.to_le_bytes());
+                        true
+                    }
+                    _ => false,
+                }
+            },
+        )
+    }
+
+    fn storage_buffer_binding_with_gpu_reader(
+        &self,
+        ssbo_addr: u64,
+        cbuf_index: u32,
+        is_written: bool,
+        mut gpu_to_cpu_address: impl FnMut(u64) -> Option<u64>,
+        mut get_memory_layout_size: impl FnMut(u64) -> u64,
+        mut read_block: impl FnMut(u64, &mut [u8]) -> bool,
+    ) -> Binding {
+        let mut gpu_addr_bytes = [0u8; 8];
+        let gpu_addr = match read_block(ssbo_addr, &mut gpu_addr_bytes) {
+            true => u64::from_le_bytes(gpu_addr_bytes),
+            false => {
                 if std::env::var_os("RUZU_TRACE_SSBO_BIND").is_some() {
                     log::warn!(
                         "[SSBO_BINDING_FAIL] cbuf={} ssbo_addr=0x{:X} reason=read_u64_failed",
@@ -3407,15 +3745,20 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
             let is_nvn_cbuf = cbuf_index == 0;
             if is_nvn_cbuf {
                 // NVN driver buffer: address followed by size at offset +8.
-                let ssbo_size = read_u32(ssbo_addr + 8).unwrap_or(0);
+                let mut size_bytes = [0u8; 4];
+                let ssbo_size = if read_block(ssbo_addr + 8, &mut size_bytes) {
+                    u32::from_le_bytes(size_bytes)
+                } else {
+                    0
+                };
                 if ssbo_size != 0 {
                     ssbo_size
                 } else {
-                    let memory_layout_size = gm.get_memory_layout_size(gpu_addr) as u32;
+                    let memory_layout_size = get_memory_layout_size(gpu_addr) as u32;
                     memory_layout_size.min(8 * 1024 * 1024) // 8 MiB
                 }
             } else {
-                let memory_layout_size = gm.get_memory_layout_size(gpu_addr) as u32;
+                let memory_layout_size = get_memory_layout_size(gpu_addr) as u32;
                 memory_layout_size.min(8 * 1024 * 1024) // 8 MiB
             }
         };
@@ -3429,7 +3772,7 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
         let aligned_gpu_addr = gpu_addr & !(alignment as u64 - 1);
         let aligned_size = (gpu_addr - aligned_gpu_addr) as u32 + size;
 
-        let aligned_device_addr = gm.gpu_to_cpu_address(aligned_gpu_addr);
+        let aligned_device_addr = gpu_to_cpu_address(aligned_gpu_addr);
         if aligned_device_addr.is_none() || size == 0 {
             log::warn!(
                 "storage_buffer_binding: Failed to find storage buffer for cbuf index {}",
@@ -3437,7 +3780,7 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
             );
             return NULL_BINDING;
         }
-        let device_addr = gm.gpu_to_cpu_address(gpu_addr);
+        let device_addr = gpu_to_cpu_address(gpu_addr);
         if device_addr.is_none() {
             log::warn!(
                 "storage_buffer_binding: Unaligned storage buffer address not found for cbuf index {}",

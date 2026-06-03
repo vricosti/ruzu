@@ -113,7 +113,8 @@ pub fn ast(tv: &mut TranslatorVisitor, insn: u64) {
     }
     handle_indexed(tv, index_reg, num, |tv, element, final_offset| {
         let value = tv.f(src_reg + element);
-        tv.ir.set_attribute_indexed(final_offset, value, vertex.clone());
+        tv.ir
+            .set_attribute_indexed(final_offset, value, vertex.clone());
     });
 }
 

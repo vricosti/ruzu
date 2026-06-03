@@ -3,8 +3,8 @@
 
 //! Port of zuyu/src/shader_recompiler/frontend/maxwell/translate/impl/floating_point_fused_multiply_add.cpp
 
-use super::{bit, field, TranslatorVisitor};
 use super::common_encoding::{cast_fmz_mode, cast_fp_rounding, MaxwellFmzMode, MaxwellFpRounding};
+use super::{bit, field, TranslatorVisitor};
 use crate::frontend::maxwell_opcodes::MaxwellOpcode;
 use crate::ir::types::FpControl;
 use crate::ir::value::Value;
@@ -129,10 +129,7 @@ mod tests {
         let insn = 1u64 | (0x3f80_0000u64 << 20) | (2u64 << 53);
         ffma32i(&mut tv, insn);
 
-        let opcodes: Vec<_> = tv
-            .ir
-            .program
-            .blocks[0]
+        let opcodes: Vec<_> = tv.ir.program.blocks[0]
             .iter()
             .map(|inst| inst.opcode)
             .collect();

@@ -174,10 +174,8 @@ mod tests {
     fn dce_counts_syntax_conditions_as_uses() {
         let mut program = Program::new(ShaderStage::VertexB);
         program.blocks.push(Block::new());
-        let cond = program.blocks[0].append_inst(Inst::new(
-            Opcode::ConditionRef,
-            vec![Value::ImmU1(true)],
-        ));
+        let cond = program.blocks[0]
+            .append_inst(Inst::new(Opcode::ConditionRef, vec![Value::ImmU1(true)]));
         program.syntax_list.push(SyntaxNode::If {
             cond: Value::Inst(InstRef {
                 block: 0,

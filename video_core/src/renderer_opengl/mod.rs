@@ -98,9 +98,13 @@ fn elapsed_us(start: Instant) -> u64 {
     start.elapsed().as_micros().min(u128::from(u64::MAX)) as u64
 }
 
-fn dump_present_ppm_once(current_frame: u64, layout: &FramebufferLayout) {
+fn dump_present_ppm_once(
+    current_frame: u64,
+    draw_count: u64,
+    layout: &FramebufferLayout,
+) -> Option<u64> {
     let Some(path) = std::env::var_os("RUZU_DUMP_PRESENT_PPM") else {
-        return;
+        return None;
     };
     let present_index = PRESENT_PPM_CALL_COUNT.fetch_add(1, Ordering::Relaxed);
     let target_present_indices = std::env::var("RUZU_DUMP_PRESENT_PPM_INDICES")
@@ -113,27 +117,92 @@ fn dump_present_ppm_once(current_frame: u64, layout: &FramebufferLayout) {
     let target_present_index = std::env::var("RUZU_DUMP_PRESENT_PPM_INDEX")
         .ok()
         .and_then(|value| value.parse::<u64>().ok());
+    let target_present_start = std::env::var("RUZU_DUMP_PRESENT_PPM_START")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok());
+    let target_present_end = std::env::var("RUZU_DUMP_PRESENT_PPM_END")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok());
+    let target_present_every = std::env::var("RUZU_DUMP_PRESENT_PPM_EVERY")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok());
     let target_frame = std::env::var("RUZU_DUMP_PRESENT_PPM_FRAME")
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
         .unwrap_or(0);
+    let target_draw_indices = std::env::var("RUZU_DUMP_PRESENT_PPM_DRAW_INDICES")
+        .ok()
+        .map(|spec| {
+            spec.split(',')
+                .filter_map(|value| value.trim().parse::<u64>().ok())
+                .collect::<Vec<_>>()
+        });
+    let target_draw_min = std::env::var("RUZU_DUMP_PRESENT_PPM_DRAW_MIN")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok());
+    let target_draw_max = std::env::var("RUZU_DUMP_PRESENT_PPM_DRAW_MAX")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok());
     let multi_index_match = target_present_indices
         .as_ref()
         .is_some_and(|indices| indices.contains(&present_index));
+    let range_index_match = target_present_start.is_some_and(|start| {
+        present_index >= start
+            && target_present_end.is_none_or(|end| present_index <= end)
+            && target_present_every.is_none_or(|every| every != 0 && (present_index - start) % every == 0)
+    });
+    let draw_index_match = target_draw_indices
+        .as_ref()
+        .is_some_and(|indices| indices.contains(&draw_count));
+    let draw_range_match = target_draw_min.is_some_and(|min| draw_count >= min)
+        && target_draw_max.is_none_or(|max| draw_count <= max);
+    let draw_selector_active = target_draw_indices.is_some() || target_draw_min.is_some();
+    let draw_match = draw_index_match || draw_range_match;
     if target_present_indices.is_some() && !multi_index_match {
-        return;
+        return None;
+    }
+    if target_present_start.is_some() && !range_index_match {
+        return None;
+    }
+    if draw_selector_active && !draw_match {
+        return None;
     }
     if target_present_indices.is_none()
+        && target_present_start.is_none()
+        && !draw_selector_active
         && (target_present_index.is_some_and(|target| present_index < target)
             || (target_present_index.is_none() && current_frame < target_frame)
             || PRESENT_PPM_DUMPED.swap(true, Ordering::Relaxed))
     {
-        return;
+        return None;
     }
     if layout.width == 0 || layout.height == 0 {
-        return;
+        return None;
     }
-    let path = if multi_index_match {
+    if std::env::var_os("RUZU_DUMP_PRESENT_PPM_LOG").is_some() {
+        eprintln!(
+            "[PRESENT_PPM_DUMP] present_index={} frame={} draw_count={} path={}",
+            present_index,
+            current_frame,
+            draw_count,
+            std::path::Path::new(&path).display()
+        );
+    }
+    let path = if draw_selector_active {
+        let mut output = std::path::PathBuf::from(&path);
+        let stem = output
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .unwrap_or("present")
+            .to_string();
+        let ext = output
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .unwrap_or("ppm")
+            .to_string();
+        output.set_file_name(format!("{stem}_{present_index}_draw_{draw_count}.{ext}"));
+        output.into_os_string()
+    } else if multi_index_match || range_index_match {
         let mut output = std::path::PathBuf::from(&path);
         let stem = output
             .file_stem()
@@ -202,6 +271,7 @@ fn dump_present_ppm_once(current_frame: u64, layout: &FramebufferLayout) {
             ),
         }
     }
+    Some(present_index)
 }
 
 pub fn dump_present_profile() {
@@ -451,7 +521,17 @@ impl RendererOpenGL {
         if let Some(start) = phase_start {
             PRESENT_DRAW_SCREEN_US.fetch_add(elapsed_us(start), Ordering::Relaxed);
         }
-        dump_present_ppm_once(self.base_data.current_frame.max(0) as u64, &self.framebuffer_layout);
+        let dumped_present_index = dump_present_ppm_once(
+            self.base_data.current_frame.max(0) as u64,
+            self.rasterizer.total_draw_count(),
+            &self.framebuffer_layout,
+        );
+        if let Some(present_index) = dumped_present_index {
+            if std::env::var_os("RUZU_DUMP_PRESENT_EXTRA_ON_PPM").is_some() {
+                self.rasterizer
+                    .trace_present_images_by_gpu_addr_env(present_index);
+            }
+        }
 
         if std::env::var_os("RUZU_TRACE_PRESENT_READBACK").is_some() {
             unsafe {

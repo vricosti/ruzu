@@ -40,6 +40,13 @@ impl IStorage {
     pub fn new_with_system(system: SystemRef, data: Vec<u8>) -> Self {
         let backing: Arc<Mutex<dyn LibraryAppletStorage>> =
             Arc::new(Mutex::new(BufferLibraryAppletStorage::new(data)));
+        Self::new_with_backing(system, backing)
+    }
+
+    pub fn new_with_backing(
+        system: SystemRef,
+        backing: Arc<Mutex<dyn LibraryAppletStorage>>,
+    ) -> Self {
         let handlers = build_handler_map(&[
             (0, Some(Self::open_handler), "Open"),
             (
@@ -90,7 +97,12 @@ impl IStorage {
 
         // Check that the backing storage does not have a transfer memory handle.
         // If it does, Open is invalid — use OpenTransferStorage instead.
-        let has_handle = storage.backing.lock().unwrap().has_handle();
+        let has_handle = storage
+            .backing
+            .lock()
+            .unwrap()
+            .get_handle_object_id()
+            .is_some();
         if has_handle {
             let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
             rb.push_result(am_results::RESULT_INVALID_STORAGE_TYPE);
@@ -109,7 +121,12 @@ impl IStorage {
         log::debug!("IStorage::OpenTransferStorage called");
 
         // Check that the backing storage has a transfer memory handle.
-        let has_handle = storage.backing.lock().unwrap().has_handle();
+        let has_handle = storage
+            .backing
+            .lock()
+            .unwrap()
+            .get_handle_object_id()
+            .is_some();
         if !has_handle {
             let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
             rb.push_result(am_results::RESULT_INVALID_STORAGE_TYPE);

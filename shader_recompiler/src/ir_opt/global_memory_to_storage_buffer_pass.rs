@@ -292,7 +292,12 @@ fn replace_uses_with(program: &mut Program, old: InstRef, replacement: Value) {
     }
 }
 
-fn insert_before(program: &mut Program, before: InstRef, opcode: Opcode, args: Vec<Value>) -> Value {
+fn insert_before(
+    program: &mut Program,
+    before: InstRef,
+    opcode: Opcode,
+    args: Vec<Value>,
+) -> Value {
     let inst_idx = program
         .block_mut(before.block)
         .insert_inst_before(before.inst, Inst::new(opcode, args));
@@ -404,9 +409,7 @@ pub fn global_memory_to_storage_buffer_pass(program: &mut Program, host_info: &H
         let inst_indices: Vec<u32> = program
             .block(block_idx)
             .indexed_iter()
-            .filter_map(|(inst_idx, inst)| {
-                is_global_memory(inst.opcode).then_some(inst_idx)
-            })
+            .filter_map(|(inst_idx, inst)| is_global_memory(inst.opcode).then_some(inst_idx))
             .collect();
         global_count += inst_indices.len();
         for inst_idx in inst_indices {
@@ -498,19 +501,28 @@ mod tests {
         let addr = program.block_mut(0).append_inst(Inst::new(
             Opcode::IAdd32,
             vec![
-                Value::Inst(InstRef { block: 0, inst: cbuf }),
+                Value::Inst(InstRef {
+                    block: 0,
+                    inst: cbuf,
+                }),
                 Value::ImmU32(0x20),
             ],
         ));
         let load = program.block_mut(0).append_inst(Inst::new(
             Opcode::LoadGlobal32,
-            vec![Value::Inst(InstRef { block: 0, inst: addr })],
+            vec![Value::Inst(InstRef {
+                block: 0,
+                inst: addr,
+            })],
         ));
         program.block_mut(0).append_inst(Inst::new(
             Opcode::SetAttribute,
             vec![
                 Value::Attribute(crate::ir::value::Attribute::generic(0, 0)),
-                Value::Inst(InstRef { block: 0, inst: load }),
+                Value::Inst(InstRef {
+                    block: 0,
+                    inst: load,
+                }),
                 Value::ImmU32(0),
             ],
         ));
@@ -525,7 +537,10 @@ mod tests {
 
         assert_eq!(program.info.storage_buffers_descriptors.len(), 1);
         assert_eq!(program.info.storage_buffers_descriptors[0].cbuf_index, 0);
-        assert_eq!(program.info.storage_buffers_descriptors[0].cbuf_offset, 0x110);
+        assert_eq!(
+            program.info.storage_buffers_descriptors[0].cbuf_offset,
+            0x110
+        );
         assert!(program
             .block(0)
             .iter()

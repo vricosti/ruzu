@@ -117,10 +117,14 @@ fn f2f_impl(tv: &mut TranslatorVisitor, insn: u64, src_a: Value, abs: bool) {
     if src_size != dst_size {
         // Width-change path: thread the rounding mode through `FpControl`
         // and dispatch via the polymorphic `fp_convert`.
-        fp_control.rounding = cast_fp_rounding(MaxwellFpRounding::from_field(rounding_field as u32));
-        input = tv
-            .ir
-            .fp_convert(dst_size.width_bits(), input, src_size.width_bits(), fp_control);
+        fp_control.rounding =
+            cast_fp_rounding(MaxwellFpRounding::from_field(rounding_field as u32));
+        input = tv.ir.fp_convert(
+            dst_size.width_bits(),
+            input,
+            src_size.width_bits(),
+            fp_control,
+        );
     } else {
         // Same-width path: select the rounding op and emit the matching
         // width-typed helper. `None`/`Pass` add zero so NaNs are
@@ -129,9 +133,9 @@ fn f2f_impl(tv: &mut TranslatorVisitor, insn: u64, src_a: Value, abs: bool) {
             RoundingOp::None | RoundingOp::Pass => {
                 input = match src_size {
                     FloatFormat::F16 => {
-                        let zero = tv
-                            .ir
-                            .fp_convert(16, Value::ImmF32(0.0), 32, FpControl::default());
+                        let zero =
+                            tv.ir
+                                .fp_convert(16, Value::ImmF32(0.0), 32, FpControl::default());
                         tv.ir.fp_add_16_with_control(input, zero, fp_control)
                     }
                     FloatFormat::F32 => {
@@ -448,12 +452,8 @@ mod tests {
         let mut program = fresh_program();
         let mut tv = TranslatorVisitor::new(&mut program, 0);
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            tv.ir.fp_convert(
-                64,
-                Value::ImmF32(0.0),
-                16,
-                FpControl::default(),
-            );
+            tv.ir
+                .fp_convert(64, Value::ImmF32(0.0), 16, FpControl::default());
         }));
         assert!(result.is_err(), "fp_convert(64, F16) should panic");
     }

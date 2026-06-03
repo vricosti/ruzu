@@ -20,7 +20,10 @@ pub fn al2p(tv: &mut TranslatorVisitor, insn: u64) {
     // NotImplementedException for non-B32 sizes.
     let bitsize = field(insn, 47, 2);
     if bitsize != 0 {
-        panic!("AL2P: BitSize {} not implemented (only B32 supported)", bitsize);
+        panic!(
+            "AL2P: BitSize {} not implemented (only B32 supported)",
+            bitsize
+        );
     }
 
     let converted_offset = Value::ImmU32(offset as u32);

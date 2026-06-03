@@ -51,6 +51,36 @@ fn startthread_sched_profile_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var_os("RUZU_PROFILE_STARTTHREAD_SCHED").is_some())
 }
 
+fn encode_trace_tid(thread_id: Option<u64>) -> u64 {
+    thread_id.unwrap_or(u64::MAX)
+}
+
+fn trace_tid_filter_matches(thread_id: Option<u64>) -> bool {
+    let Some(thread_id) = thread_id else {
+        return false;
+    };
+    let Some(raw) = std::env::var_os("RUZU_TRACE_SCHED_STATE") else {
+        return true;
+    };
+    let raw = raw.to_string_lossy();
+    let raw = raw.trim();
+    if raw.is_empty() || raw == "1" || raw.eq_ignore_ascii_case("all") {
+        return true;
+    }
+    raw.split(',').any(|value| {
+        let value = value.trim();
+        if value.is_empty() {
+            return false;
+        }
+        let parsed = value
+            .strip_prefix("0x")
+            .or_else(|| value.strip_prefix("0X"))
+            .and_then(|hex| u64::from_str_radix(hex, 16).ok())
+            .or_else(|| value.parse::<u64>().ok());
+        parsed.is_some_and(|tid| tid == thread_id)
+    })
+}
+
 pub fn record_start_thread_sched_attempt(
     child_tid: u64,
     parent_tid: u64,
@@ -1782,6 +1812,9 @@ impl KScheduler {
 
         let cur_thread = self.current_thread.as_ref().and_then(Weak::upgrade);
         let highest = self.state.highest_priority_thread_id;
+        let cur_thread_id = cur_thread
+            .as_ref()
+            .map(|thread| thread.lock().unwrap().get_thread_id());
 
         let target = if self.state.interrupt_task_runnable {
             self.idle_thread.as_ref().and_then(Weak::upgrade)
@@ -1794,6 +1827,40 @@ impl KScheduler {
         let target_id = target
             .as_ref()
             .map(|thread| thread.lock().unwrap().get_thread_id());
+        if common::trace::is_enabled(common::trace::cat::SCHED_STATE)
+            && (trace_tid_filter_matches(cur_thread_id)
+                || trace_tid_filter_matches(highest)
+                || trace_tid_filter_matches(target_id))
+        {
+            let tops = if let Some(gsc) = self.global_scheduler_context.as_ref() {
+                let gsc = gsc.lock().unwrap();
+                [
+                    gsc.get_scheduled_front(0),
+                    gsc.get_scheduled_front(1),
+                    gsc.get_scheduled_front(2),
+                    gsc.get_scheduled_front(3),
+                ]
+            } else {
+                [None, None, None, None]
+            };
+            common::trace::emit_raw(
+                common::trace::cat::SCHED_STATE,
+                &[
+                    4,
+                    encode_trace_tid(cur_thread_id),
+                    encode_trace_tid(highest),
+                    encode_trace_tid(target_id),
+                    self.core_id as u32 as u64,
+                    self.state.needs_scheduling.load(Ordering::Relaxed) as u64,
+                    self.state.interrupt_task_runnable as u64,
+                    self.switch_from_schedule as u64,
+                    encode_trace_tid(tops[0]),
+                    encode_trace_tid(tops[1]),
+                    encode_trace_tid(tops[2]),
+                    encode_trace_tid(tops[3]),
+                ],
+            );
+        }
         if self.core_id == 0 || self.core_id == 1 {
             log::trace!(
                 "schedule_impl_fiber: core={} cur={:?} highest={:?} target={:?} interrupted={}",
@@ -1995,6 +2062,23 @@ impl KScheduler {
 
         // Emit SCHED trace line (zuyu-compatible format).
         super::trace_format::trace_sched(self.core_id, cur_thread_id, next_thread_id);
+        if common::trace::is_enabled(common::trace::cat::SCHED_STATE)
+            && (trace_tid_filter_matches(cur_thread_id)
+                || trace_tid_filter_matches(Some(next_thread_id)))
+        {
+            common::trace::emit_raw(
+                common::trace::cat::SCHED_STATE,
+                &[
+                    5,
+                    encode_trace_tid(cur_thread_id),
+                    next_thread_id,
+                    0,
+                    self.core_id as u32 as u64,
+                    self.global_scheduler_context.is_some() as u64,
+                    encode_trace_tid(self.state.prev_thread_id),
+                ],
+            );
+        }
 
         // Update CPU time tracking.
         let prev_tick = self.last_context_switch_time;

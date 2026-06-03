@@ -10,11 +10,21 @@
 //! bodies that require FFmpeg frame data or SIMD (SSE4.1) are stubbed.
 
 use std::sync::Arc;
+use std::time::Instant;
 
 use log::info;
 
 use crate::cdma_pusher::ProcessMethodHook;
+use crate::host1x::ffmpeg::ffmpeg::Frame;
+use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
 use crate::host1x::host1x::FrameQueue;
+
+fn emit_vic_timing(id: i32, step: u64, elapsed_us: u64, aux0: u64, aux1: u64, aux2: u64) {
+    let _ = common::trace::emit(
+        common::trace::cat::HOST1X_VIDEO,
+        &[6, id as u64, step, elapsed_us, aux0, aux1, aux2],
+    );
+}
 
 // --------------------------------------------------------------------------
 // Pixel type
@@ -119,6 +129,17 @@ pub enum VideoPixelFormat {
     V8 = 74,
 }
 
+fn video_pixel_format_from_u32(value: u32) -> Option<VideoPixelFormat> {
+    match value {
+        31 => Some(VideoPixelFormat::A8B8G8R8),
+        32 => Some(VideoPixelFormat::A8R8G8B8),
+        35 => Some(VideoPixelFormat::X8B8G8R8),
+        67 => Some(VideoPixelFormat::Y8UvN420),
+        68 => Some(VideoPixelFormat::Y8VuN420),
+        _ => None,
+    }
+}
+
 // --------------------------------------------------------------------------
 // Offset (32-bit VIC variant)
 // --------------------------------------------------------------------------
@@ -139,6 +160,23 @@ impl VicOffset {
 }
 
 const _: () = assert!(std::mem::size_of::<VicOffset>() == 0x4);
+
+fn bits_u32(value: u32, shift: u32, width: u32) -> u32 {
+    (value >> shift) & ((1u32 << width) - 1)
+}
+
+fn bits_u64(value: u64, shift: u32, width: u32) -> u64 {
+    (value >> shift) & ((1u64 << width) - 1)
+}
+
+fn sign_extend_20(value: u64) -> i32 {
+    let value = (value & 0xFFFFF) as i32;
+    (value << 12) >> 12
+}
+
+fn align_up(value: u32, alignment: u32) -> u32 {
+    (value + alignment - 1) & !(alignment - 1)
+}
 
 // --------------------------------------------------------------------------
 // PlaneOffsets
@@ -213,6 +251,15 @@ pub enum DxvahdFrameFormat {
     SubpicBottomFieldChromaTop = 13,
 }
 
+fn frame_format_from_u64(value: u64) -> Option<DxvahdFrameFormat> {
+    match value {
+        0 => Some(DxvahdFrameFormat::Progressive),
+        3 => Some(DxvahdFrameFormat::TopField),
+        4 => Some(DxvahdFrameFormat::BottomField),
+        _ => None,
+    }
+}
+
 /// Port of `Tegra::Host1x::DXVAHD_DEINTERLACE_MODE_PRIVATE`.
 #[repr(u64)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -226,6 +273,15 @@ pub enum DxvahdDeinterlaceModePrivate {
     Max = 0xF,
 }
 
+fn deinterlace_mode_from_u64(value: u64) -> Option<DxvahdDeinterlaceModePrivate> {
+    match value {
+        0 => Some(DxvahdDeinterlaceModePrivate::Weave),
+        1 => Some(DxvahdDeinterlaceModePrivate::BobField),
+        4 => Some(DxvahdDeinterlaceModePrivate::Disi1),
+        _ => None,
+    }
+}
+
 /// Port of `Tegra::Host1x::BLK_KIND`.
 #[repr(u32)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -235,6 +291,17 @@ pub enum BlkKind {
     BlNaive = 2,
     BlKeplerXbarRaw = 3,
     Vp2Tiled = 15,
+}
+
+fn blk_kind_from_u32(value: u32) -> Option<BlkKind> {
+    match value {
+        0 => Some(BlkKind::Pitch),
+        1 => Some(BlkKind::Generic16Bx2),
+        2 => Some(BlkKind::BlNaive),
+        3 => Some(BlkKind::BlKeplerXbarRaw),
+        15 => Some(BlkKind::Vp2Tiled),
+        _ => None,
+    }
 }
 
 // --------------------------------------------------------------------------
@@ -314,6 +381,24 @@ pub struct OutputConfig {
 
 const _: () = assert!(std::mem::size_of::<OutputConfig>() == 0x10);
 
+impl OutputConfig {
+    fn target_rect_left(self) -> u32 {
+        bits_u32(self.target_rect_lr, 0, 14)
+    }
+
+    fn target_rect_right(self) -> u32 {
+        bits_u32(self.target_rect_lr, 16, 14)
+    }
+
+    fn target_rect_top(self) -> u32 {
+        bits_u32(self.target_rect_tb, 0, 14)
+    }
+
+    fn target_rect_bottom(self) -> u32 {
+        bits_u32(self.target_rect_tb, 16, 14)
+    }
+}
+
 /// Port of `Tegra::Host1x::OutputSurfaceConfig` — 0x10 bytes.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default)]
@@ -326,6 +411,44 @@ pub struct OutputSurfaceConfig {
 
 const _: () = assert!(std::mem::size_of::<OutputSurfaceConfig>() == 0x10);
 
+impl OutputSurfaceConfig {
+    fn out_pixel_format(self) -> Option<VideoPixelFormat> {
+        video_pixel_format_from_u32(bits_u32(self.format_flags, 0, 7))
+    }
+
+    fn out_block_kind(self) -> Option<BlkKind> {
+        blk_kind_from_u32(bits_u32(self.format_flags, 11, 4))
+    }
+
+    fn out_block_height(self) -> u32 {
+        bits_u32(self.format_flags, 15, 4)
+    }
+
+    fn out_surface_width(self) -> u32 {
+        bits_u32(self.surface_dims, 0, 14)
+    }
+
+    fn out_surface_height(self) -> u32 {
+        bits_u32(self.surface_dims, 14, 14)
+    }
+
+    fn out_luma_width(self) -> u32 {
+        bits_u32(self.luma_dims, 0, 14)
+    }
+
+    fn out_luma_height(self) -> u32 {
+        bits_u32(self.luma_dims, 14, 14)
+    }
+
+    fn out_chroma_width(self) -> u32 {
+        bits_u32(self.chroma_dims, 0, 14)
+    }
+
+    fn out_chroma_height(self) -> u32 {
+        bits_u32(self.chroma_dims, 14, 14)
+    }
+}
+
 /// Port of `Tegra::Host1x::MatrixStruct` — 0x20 bytes.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default)]
@@ -337,6 +460,64 @@ pub struct MatrixStruct {
 }
 
 const _: () = assert!(std::mem::size_of::<MatrixStruct>() == 0x20);
+
+impl MatrixStruct {
+    fn matrix_coeff00(self) -> i32 {
+        sign_extend_20(bits_u64(self.row0, 0, 20))
+    }
+
+    fn matrix_coeff10(self) -> i32 {
+        sign_extend_20(bits_u64(self.row0, 20, 20))
+    }
+
+    fn matrix_coeff20(self) -> i32 {
+        sign_extend_20(bits_u64(self.row0, 40, 20))
+    }
+
+    fn matrix_r_shift(self) -> i32 {
+        bits_u64(self.row0, 60, 4) as i32
+    }
+
+    fn matrix_coeff01(self) -> i32 {
+        sign_extend_20(bits_u64(self.row1, 0, 20))
+    }
+
+    fn matrix_coeff11(self) -> i32 {
+        sign_extend_20(bits_u64(self.row1, 20, 20))
+    }
+
+    fn matrix_coeff21(self) -> i32 {
+        sign_extend_20(bits_u64(self.row1, 40, 20))
+    }
+
+    fn matrix_enable(self) -> bool {
+        bits_u64(self.row1, 63, 1) != 0
+    }
+
+    fn matrix_coeff02(self) -> i32 {
+        sign_extend_20(bits_u64(self.row2, 0, 20))
+    }
+
+    fn matrix_coeff12(self) -> i32 {
+        sign_extend_20(bits_u64(self.row2, 20, 20))
+    }
+
+    fn matrix_coeff22(self) -> i32 {
+        sign_extend_20(bits_u64(self.row2, 40, 20))
+    }
+
+    fn matrix_coeff03(self) -> i32 {
+        sign_extend_20(bits_u64(self.row3, 0, 20))
+    }
+
+    fn matrix_coeff13(self) -> i32 {
+        sign_extend_20(bits_u64(self.row3, 20, 20))
+    }
+
+    fn matrix_coeff23(self) -> i32 {
+        sign_extend_20(bits_u64(self.row3, 40, 20))
+    }
+}
 
 /// Port of `Tegra::Host1x::ClearRectStruct` — 0x10 bytes.
 #[repr(C)]
@@ -361,6 +542,64 @@ pub struct SlotConfig {
 
 const _: () = assert!(std::mem::size_of::<SlotConfig>() == 0x40);
 
+impl SlotConfig {
+    fn slot_enable(self) -> bool {
+        bits_u64(self.data[0], 0, 1) != 0
+    }
+
+    fn frame_format(self) -> Option<DxvahdFrameFormat> {
+        frame_format_from_u64(bits_u64(self.data[0], 16, 4))
+    }
+
+    fn deinterlace_mode(self) -> Option<DxvahdDeinterlaceModePrivate> {
+        deinterlace_mode_from_u64(bits_u64(self.data[1], 40, 4))
+    }
+
+    fn soft_clamp_low(self) -> i32 {
+        bits_u64(self.data[2], 0, 10) as i32
+    }
+
+    fn soft_clamp_high(self) -> i32 {
+        bits_u64(self.data[2], 10, 10) as i32
+    }
+
+    fn planar_alpha(self) -> u16 {
+        bits_u64(self.data[2], 32, 10) as u16
+    }
+
+    fn source_rect_left(self) -> u32 {
+        bits_u64(self.data[4], 0, 30) as u32
+    }
+
+    fn source_rect_right(self) -> u32 {
+        bits_u64(self.data[4], 32, 30) as u32
+    }
+
+    fn source_rect_top(self) -> u32 {
+        bits_u64(self.data[5], 0, 30) as u32
+    }
+
+    fn source_rect_bottom(self) -> u32 {
+        bits_u64(self.data[5], 32, 30) as u32
+    }
+
+    fn dest_rect_left(self) -> u32 {
+        bits_u64(self.data[6], 0, 14) as u32
+    }
+
+    fn dest_rect_right(self) -> u32 {
+        bits_u64(self.data[6], 16, 14) as u32
+    }
+
+    fn dest_rect_top(self) -> u32 {
+        bits_u64(self.data[6], 32, 14) as u32
+    }
+
+    fn dest_rect_bottom(self) -> u32 {
+        bits_u64(self.data[6], 48, 14) as u32
+    }
+}
+
 /// Port of `Tegra::Host1x::SlotSurfaceConfig` — 0x10 bytes.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default)]
@@ -372,6 +611,20 @@ pub struct SlotSurfaceConfig {
 }
 
 const _: () = assert!(std::mem::size_of::<SlotSurfaceConfig>() == 0x10);
+
+impl SlotSurfaceConfig {
+    fn slot_pixel_format(self) -> Option<VideoPixelFormat> {
+        video_pixel_format_from_u32(bits_u32(self.format_flags, 0, 7))
+    }
+
+    fn slot_surface_width(self) -> u32 {
+        bits_u32(self.surface_dims, 0, 14)
+    }
+
+    fn slot_surface_height(self) -> u32 {
+        bits_u32(self.surface_dims, 14, 14)
+    }
+}
 
 /// Port of `Tegra::Host1x::LumaKeyStruct` — 0x10 bytes.
 #[repr(C)]
@@ -505,6 +758,7 @@ pub struct Vic {
     syncpoint: u32,
     regs: VicRegisters,
     frame_queue: Arc<FrameQueue>,
+    memory_manager: Arc<MaxwellDeviceMemoryManager>,
     output_surface: Vec<Pixel>,
     slot_surface: Vec<Pixel>,
     luma_scratch: Vec<u8>,
@@ -513,7 +767,12 @@ pub struct Vic {
 }
 
 impl Vic {
-    pub fn new(id: i32, syncpt: u32, frame_queue: Arc<FrameQueue>) -> Self {
+    pub fn new(
+        id: i32,
+        syncpt: u32,
+        frame_queue: Arc<FrameQueue>,
+        memory_manager: Arc<MaxwellDeviceMemoryManager>,
+    ) -> Self {
         info!("Created VIC {}", id);
         Self {
             id,
@@ -521,6 +780,7 @@ impl Vic {
             syncpoint: syncpt,
             regs: VicRegisters::default(),
             frame_queue,
+            memory_manager,
             output_surface: Vec::new(),
             slot_surface: Vec::new(),
             luma_scratch: Vec::new(),
@@ -547,22 +807,728 @@ impl Vic {
     ///
     /// Port of `Vic::Execute`.
     fn execute(&mut self) {
-        // Stubbed — requires memory manager to read ConfigStruct from config_struct_offset,
-        // frame_queue access to dequeue decoded FFmpeg frames, and a color-conversion/
-        // blending pipeline to write the output surface.
-        // Upstream: Vic::Execute() in video_core/host1x/vic.cpp
+        let trace_video = common::trace::is_enabled(common::trace::cat::HOST1X_VIDEO);
+        let total_start = trace_video.then(Instant::now);
+        let mut config = ConfigStruct::default();
+        let config_addr = self.config_struct_address();
+        let config_start = trace_video.then(Instant::now);
+        let config_bytes = unsafe {
+            std::slice::from_raw_parts_mut(
+                (&mut config as *mut ConfigStruct).cast::<u8>(),
+                std::mem::size_of::<ConfigStruct>(),
+            )
+        };
+        if !self.memory_manager.smmu_read_block(config_addr, config_bytes) {
+            log::error!(
+                "Vic {} failed to read ConfigStruct at 0x{:X}",
+                self.id,
+                config_addr
+            );
+            return;
+        }
+        if let Some(config_start) = config_start {
+            emit_vic_timing(
+                self.id,
+                1,
+                config_start.elapsed().as_micros() as u64,
+                config_addr,
+                std::mem::size_of::<ConfigStruct>() as u64,
+                0,
+            );
+        }
+
         let _ = common::trace::emit(
             common::trace::cat::HOST1X_VIDEO,
-            &[
+            &[5, self.id as u64, config_addr],
+        );
+
+        let output_width = config.output_surface_config.out_surface_width() + 1;
+        let output_height = config.output_surface_config.out_surface_height() + 1;
+        self.output_surface
+            .resize((output_width * output_height) as usize, Pixel::default());
+
+        for index in 0..config.slot_structs.len() {
+            let slot_config = config.slot_structs[index];
+            if !slot_config.config.slot_enable() {
+                continue;
+            }
+
+            let luma_offset = self.surface_luma_address(index, SurfaceIndex::Current);
+            if self.nvdec_id == -1 {
+                self.nvdec_id = self.frame_queue.vic_find_nvdec_fd_from_offset(luma_offset);
+            }
+
+            let frame_start = trace_video.then(Instant::now);
+            let Some(frame) = self.frame_queue.get_frame(self.nvdec_id, luma_offset) else {
+                log::error!(
+                    "Vic {} failed to get frame with offset 0x{:X}",
+                    self.id,
+                    luma_offset
+                );
+                continue;
+            };
+            if let Some(frame_start) = frame_start {
+                emit_vic_timing(
+                    self.id,
+                    2,
+                    frame_start.elapsed().as_micros() as u64,
+                    index as u64,
+                    self.nvdec_id as u64,
+                    luma_offset,
+                );
+            }
+
+            let read_start = trace_video.then(Instant::now);
+            match frame.get_pixel_format() {
+                AV_PIX_FMT_YUV420P => self.read_y8_v8u8_n420::<true>(&slot_config, &frame),
+                AV_PIX_FMT_NV12 => self.read_y8_v8u8_n420::<false>(&slot_config, &frame),
+                format => {
+                    log::warn!(
+                        "Vic {} unimplemented FFmpeg frame pixel format {} for slot format {:?}",
+                        self.id,
+                        format,
+                        slot_config.surface_config.slot_pixel_format()
+                    );
+                    continue;
+                }
+            }
+            if let Some(read_start) = read_start {
+                emit_vic_timing(
+                    self.id,
+                    3,
+                    read_start.elapsed().as_micros() as u64,
+                    index as u64,
+                    frame.get_pixel_format() as u64,
+                    self.slot_surface.len() as u64,
+                );
+            }
+
+            let blend_start = trace_video.then(Instant::now);
+            self.blend(&config, &slot_config);
+            if let Some(blend_start) = blend_start {
+                emit_vic_timing(
+                    self.id,
+                    4,
+                    blend_start.elapsed().as_micros() as u64,
+                    index as u64,
+                    self.output_surface.len() as u64,
+                    u64::from(slot_config.color_matrix.matrix_enable()),
+                );
+            }
+        }
+
+        let write_start = trace_video.then(Instant::now);
+        match config.output_surface_config.out_pixel_format() {
+            Some(VideoPixelFormat::A8B8G8R8) | Some(VideoPixelFormat::X8B8G8R8) => {
+                self.write_abgr(config.output_surface_config, VideoPixelFormat::A8B8G8R8)
+            }
+            Some(VideoPixelFormat::A8R8G8B8) => {
+                self.write_abgr(config.output_surface_config, VideoPixelFormat::A8R8G8B8)
+            }
+            Some(VideoPixelFormat::Y8VuN420) => {
+                self.write_y8_v8u8_n420(config.output_surface_config)
+            }
+            format => {
+                log::warn!(
+                    "Vic {} unknown/unimplemented output pixel format {:?}",
+                    self.id,
+                    format
+                );
+            }
+        }
+        if let Some(write_start) = write_start {
+            emit_vic_timing(
+                self.id,
                 5,
-                self.id as u64,
-                (self.regs.reg_array[VIC_REG_CONFIG_STRUCT_OFFSET] as u64) << 8,
-            ],
+                write_start.elapsed().as_micros() as u64,
+                config
+                    .output_surface_config
+                    .out_pixel_format()
+                    .map_or(u64::MAX, |f| f as u64),
+                output_width as u64,
+                output_height as u64,
+            );
+        }
+        if let Some(total_start) = total_start {
+            emit_vic_timing(
+                self.id,
+                6,
+                total_start.elapsed().as_micros() as u64,
+                output_width as u64,
+                output_height as u64,
+                self.output_surface.len() as u64,
+            );
+        }
+    }
+
+    fn config_struct_address(&self) -> u64 {
+        (self.regs.reg_array[VIC_REG_CONFIG_STRUCT_OFFSET] as u64) << 8
+    }
+
+    fn output_luma_address(&self) -> u64 {
+        (self.regs.reg_array[VIC_REG_OUTPUT_SURFACE_LUMA] as u64) << 8
+    }
+
+    fn output_chroma_address(&self) -> u64 {
+        (self.regs.reg_array[VIC_REG_OUTPUT_SURFACE_CHROMA_U] as u64) << 8
+    }
+
+    fn surface_luma_address(&self, slot: usize, surface: SurfaceIndex) -> u64 {
+        let index = VIC_REG_SURFACES + slot * 8 * 3 + surface as usize * 3;
+        (self.regs.reg_array[index] as u64) << 8
+    }
+
+    fn read_y8_v8u8_n420<const PLANAR: bool>(&mut self, slot: &SlotStruct, frame: &Frame) {
+        match slot.config.frame_format() {
+            Some(DxvahdFrameFormat::Progressive) => {
+                self.read_progressive_y8_v8u8_n420::<PLANAR, false>(slot, frame)
+            }
+            Some(DxvahdFrameFormat::TopField) => {
+                self.read_interlaced_y8_v8u8_n420::<PLANAR, true>(slot, frame)
+            }
+            Some(DxvahdFrameFormat::BottomField) => {
+                self.read_interlaced_y8_v8u8_n420::<PLANAR, false>(slot, frame)
+            }
+            format => log::error!(
+                "Vic {} unknown deinterlace frame format {:?}",
+                self.id,
+                format
+            ),
+        }
+    }
+
+    fn read_interlaced_y8_v8u8_n420<const PLANAR: bool, const TOP_FIELD: bool>(
+        &mut self,
+        slot: &SlotStruct,
+        frame: &Frame,
+    ) {
+        if !PLANAR {
+            self.read_progressive_y8_v8u8_n420::<PLANAR, true>(slot, frame);
+            return;
+        }
+
+        match slot.config.deinterlace_mode() {
+            Some(DxvahdDeinterlaceModePrivate::Weave)
+            | Some(DxvahdDeinterlaceModePrivate::BobField)
+            | Some(DxvahdDeinterlaceModePrivate::Disi1) => {}
+            mode => {
+                log::warn!("Vic {} unimplemented deinterlace mode {:?}", self.id, mode);
+                return;
+            }
+        }
+
+        let out_luma_width = slot.surface_config.slot_surface_width() + 1;
+        let out_luma_height = (slot.surface_config.slot_surface_height() + 1) * 2;
+        self.slot_surface
+            .resize((out_luma_width * out_luma_height) as usize, Pixel::default());
+
+        let in_luma_width = (frame.get_width().max(0) as u32).min(out_luma_width);
+        let in_luma_height = (frame.get_height().max(0) as u32).min(out_luma_height);
+        let in_luma_stride = frame.get_stride(0).max(0) as usize;
+        let in_chroma_stride = frame.get_stride(1).max(0) as usize;
+        let luma = unsafe { frame_plane(frame, 0, in_luma_stride.saturating_mul(in_luma_height as usize)) };
+        let chroma_u = unsafe {
+            frame_plane(
+                frame,
+                1,
+                in_chroma_stride.saturating_mul(((in_luma_height + 1) / 2) as usize),
+            )
+        };
+        let chroma_v = unsafe {
+            frame_plane(
+                frame,
+                2,
+                in_chroma_stride.saturating_mul(((in_luma_height + 1) / 2) as usize),
+            )
+        };
+        let (Some(luma), Some(chroma_u), Some(chroma_v)) = (luma, chroma_u, chroma_v) else {
+            return;
+        };
+
+        let alpha = slot.config.planar_alpha();
+        let start_y = u32::from(!TOP_FIELD);
+        for y in (start_y..((in_luma_height + 1) / 2) * 2).step_by(2) {
+            let src_luma = y as usize * in_luma_stride;
+            let src_chroma = (y / 2) as usize * in_chroma_stride;
+            let dst = y as usize * out_luma_width as usize;
+            for x in 0..in_luma_width as usize {
+                let l = luma.get(src_luma + x).copied().unwrap_or(0);
+                let u = chroma_u.get(src_chroma + x / 2).copied().unwrap_or(0);
+                let v = chroma_v.get(src_chroma + x / 2).copied().unwrap_or(0);
+                self.slot_surface[dst + x] = Pixel {
+                    r: (l as u16) << 2,
+                    g: (u as u16) << 2,
+                    b: (v as u16) << 2,
+                    a: alpha,
+                };
+            }
+            let other_y = if TOP_FIELD {
+                y + 1
+            } else {
+                y.saturating_sub(1)
+            };
+            if other_y < out_luma_height {
+                let other = other_y as usize * out_luma_width as usize;
+                let row_len = out_luma_width as usize;
+                self.slot_surface.copy_within(dst..dst + row_len, other);
+            }
+        }
+    }
+
+    fn read_progressive_y8_v8u8_n420<const PLANAR: bool, const INTERLACED: bool>(
+        &mut self,
+        slot: &SlotStruct,
+        frame: &Frame,
+    ) {
+        let out_luma_width = slot.surface_config.slot_surface_width() + 1;
+        let mut out_luma_height = slot.surface_config.slot_surface_height() + 1;
+        if INTERLACED {
+            out_luma_height *= 2;
+        }
+        self.slot_surface
+            .resize((out_luma_width * out_luma_height) as usize, Pixel::default());
+
+        let in_luma_width = (frame.get_width().max(0) as u32).min(out_luma_width);
+        let in_luma_height = (frame.get_height().max(0) as u32).min(out_luma_height);
+        let in_luma_stride = frame.get_stride(0).max(0) as usize;
+        let in_chroma_stride = frame.get_stride(1).max(0) as usize;
+        let luma = unsafe { frame_plane(frame, 0, in_luma_stride.saturating_mul(in_luma_height as usize)) };
+        let chroma_u = unsafe {
+            frame_plane(
+                frame,
+                1,
+                in_chroma_stride.saturating_mul(((in_luma_height + 1) / 2) as usize),
+            )
+        };
+        let chroma_v = if PLANAR {
+            unsafe {
+                frame_plane(
+                    frame,
+                    2,
+                    in_chroma_stride.saturating_mul(((in_luma_height + 1) / 2) as usize),
+                )
+            }
+        } else {
+            None
+        };
+        let Some(luma) = luma else {
+            return;
+        };
+        let Some(chroma_u) = chroma_u else {
+            return;
+        };
+        if PLANAR && chroma_v.is_none() {
+            return;
+        }
+
+        let alpha = slot.config.planar_alpha();
+        for y in 0..in_luma_height as usize {
+            let src_luma = y * in_luma_stride;
+            let src_chroma = (y / 2) * in_chroma_stride;
+            let dst = y * out_luma_width as usize;
+            for x in 0..in_luma_width as usize {
+                let l = luma.get(src_luma + x).copied().unwrap_or(0);
+                let (u, v) = if PLANAR {
+                    let v_plane = chroma_v.unwrap();
+                    (
+                        chroma_u.get(src_chroma + x / 2).copied().unwrap_or(0),
+                        v_plane.get(src_chroma + x / 2).copied().unwrap_or(0),
+                    )
+                } else {
+                    (
+                        chroma_u.get(src_chroma + (x & !1)).copied().unwrap_or(0),
+                        chroma_u
+                            .get(src_chroma + (x & !1) + 1)
+                            .copied()
+                            .unwrap_or(0),
+                    )
+                };
+                self.slot_surface[dst + x] = Pixel {
+                    r: (l as u16) << 2,
+                    g: (u as u16) << 2,
+                    b: (v as u16) << 2,
+                    a: alpha,
+                };
+            }
+        }
+    }
+
+    fn blend(&mut self, config: &ConfigStruct, slot: &SlotStruct) {
+        let add_one = |value: u32| if value != 0 { value + 1 } else { 0 };
+
+        let mut source_left = add_one(slot.config.source_rect_left());
+        let mut source_right = add_one(slot.config.source_rect_right());
+        let mut source_top = add_one(slot.config.source_rect_top());
+        let mut source_bottom = add_one(slot.config.source_rect_bottom());
+
+        let dest_left = add_one(slot.config.dest_rect_left());
+        let dest_right = add_one(slot.config.dest_rect_right());
+        let dest_top = add_one(slot.config.dest_rect_top());
+        let dest_bottom = add_one(slot.config.dest_rect_bottom());
+
+        let mut rect_left = add_one(config.output_config.target_rect_left());
+        let mut rect_right = add_one(config.output_config.target_rect_right());
+        let mut rect_top = add_one(config.output_config.target_rect_top());
+        let mut rect_bottom = add_one(config.output_config.target_rect_bottom());
+
+        rect_left = rect_left.max(dest_left);
+        rect_right = rect_right.min(dest_right);
+        rect_top = rect_top.max(dest_top);
+        rect_bottom = rect_bottom.min(dest_bottom);
+
+        source_left = source_left.max(rect_left);
+        source_right = source_right.min(rect_right);
+        source_top = source_top.max(rect_top);
+        source_bottom = source_bottom.min(rect_bottom);
+
+        if source_left >= source_right || source_top >= source_bottom {
+            return;
+        }
+
+        let out_surface_width = config.output_surface_config.out_surface_width() + 1;
+        let out_surface_height = config.output_surface_config.out_surface_height() + 1;
+        let in_surface_width = slot.surface_config.slot_surface_width() + 1;
+
+        source_bottom = source_bottom.min(out_surface_height);
+        source_right = source_right.min(out_surface_width);
+
+        if !slot.color_matrix.matrix_enable() {
+            let copy_width = (source_right - source_left).min(rect_right - rect_left) as usize;
+            for y in source_top..source_bottom {
+                let dst_line = y as usize * out_surface_width as usize;
+                let src_line = y as usize * in_surface_width as usize;
+                let dst = dst_line + rect_left as usize;
+                let src = src_line + source_left as usize;
+                if dst + copy_width <= self.output_surface.len()
+                    && src + copy_width <= self.slot_surface.len()
+                {
+                    self.output_surface[dst..dst + copy_width]
+                        .copy_from_slice(&self.slot_surface[src..src + copy_width]);
+                }
+            }
+            return;
+        }
+
+        let matrix = slot.color_matrix;
+        let shift = matrix.matrix_r_shift();
+        let clamp_min = slot.config.soft_clamp_low();
+        let clamp_max = slot.config.soft_clamp_high();
+        for y in source_top..source_bottom {
+            let src_base = y as usize * in_surface_width as usize + source_left as usize;
+            let dst_base = y as usize * out_surface_width as usize + rect_left as usize;
+            for x in source_left..source_right {
+                let src_index = src_base + x as usize;
+                let dst_index = dst_base + x as usize;
+                if src_index >= self.slot_surface.len() || dst_index >= self.output_surface.len() {
+                    continue;
+                }
+                let in_pixel = self.slot_surface[src_index];
+                let mut r = in_pixel.r as i32 * matrix.matrix_coeff00()
+                    + in_pixel.g as i32 * matrix.matrix_coeff01()
+                    + in_pixel.b as i32 * matrix.matrix_coeff02();
+                let mut g = in_pixel.r as i32 * matrix.matrix_coeff10()
+                    + in_pixel.g as i32 * matrix.matrix_coeff11()
+                    + in_pixel.b as i32 * matrix.matrix_coeff12();
+                let mut b = in_pixel.r as i32 * matrix.matrix_coeff20()
+                    + in_pixel.g as i32 * matrix.matrix_coeff21()
+                    + in_pixel.b as i32 * matrix.matrix_coeff22();
+                r >>= shift;
+                g >>= shift;
+                b >>= shift;
+                r = (r + matrix.matrix_coeff03()) >> 8;
+                g = (g + matrix.matrix_coeff13()) >> 8;
+                b = (b + matrix.matrix_coeff23()) >> 8;
+                self.output_surface[dst_index] = Pixel {
+                    r: r.clamp(clamp_min, clamp_max) as u16,
+                    g: g.clamp(clamp_min, clamp_max) as u16,
+                    b: b.clamp(clamp_min, clamp_max) as u16,
+                    a: (in_pixel.a as i32).clamp(clamp_min, clamp_max) as u16,
+                };
+            }
+        }
+    }
+
+    fn write_y8_v8u8_n420(&mut self, output_surface_config: OutputSurfaceConfig) {
+        const BYTES_PER_PIXEL: u32 = 1;
+        let mut surface_width = output_surface_config.out_surface_width() + 1;
+        let mut surface_height = output_surface_config.out_surface_height() + 1;
+        let surface_stride = surface_width;
+        let out_luma_width = output_surface_config.out_luma_width() + 1;
+        let out_luma_height = output_surface_config.out_luma_height() + 1;
+        let out_luma_stride = align_up(out_luma_width * BYTES_PER_PIXEL, 0x10);
+        let out_luma_size = out_luma_height * out_luma_stride;
+        let out_chroma_width = output_surface_config.out_chroma_width() + 1;
+        let out_chroma_height = output_surface_config.out_chroma_height() + 1;
+        let out_chroma_stride = align_up(out_chroma_width * BYTES_PER_PIXEL * 2, 0x10);
+        let out_chroma_size = out_chroma_height * out_chroma_stride;
+        surface_width = surface_width.min(out_luma_width);
+        surface_height = surface_height.min(out_luma_height);
+
+        self.luma_scratch.resize(out_luma_size as usize, 0);
+        self.chroma_scratch.resize(out_chroma_size as usize, 0);
+        for y in 0..surface_height {
+            let src_luma = y as usize * surface_stride as usize;
+            let dst_luma = y as usize * out_luma_stride as usize;
+            let src_chroma = y as usize * surface_stride as usize;
+            let dst_chroma = (y / 2) as usize * out_chroma_stride as usize;
+            let mut x = 0;
+            while x + 1 < surface_width {
+                let p0 = self.output_surface[src_luma + x as usize];
+                let p1 = self.output_surface[src_luma + x as usize + 1];
+                self.luma_scratch[dst_luma + x as usize] = (p0.r >> 2) as u8;
+                self.luma_scratch[dst_luma + x as usize + 1] = (p1.r >> 2) as u8;
+                let chroma = self.output_surface[src_chroma + x as usize];
+                self.chroma_scratch[dst_chroma + x as usize] = (chroma.g >> 2) as u8;
+                self.chroma_scratch[dst_chroma + x as usize + 1] = (chroma.b >> 2) as u8;
+                x += 2;
+            }
+        }
+
+        self.write_plane_pair(
+            output_surface_config,
+            BYTES_PER_PIXEL,
+            out_luma_width,
+            out_luma_height,
+            out_luma_stride,
+            out_chroma_width,
+            out_chroma_height,
+            out_chroma_stride,
         );
-        log::warn!(
-            "Vic::execute (id={}): not yet implemented (requires memory manager and frame integration)",
-            self.id
+    }
+
+    fn write_abgr(&mut self, output_surface_config: OutputSurfaceConfig, format: VideoPixelFormat) {
+        const BYTES_PER_PIXEL: u32 = 4;
+        let mut surface_width = output_surface_config.out_surface_width() + 1;
+        let mut surface_height = output_surface_config.out_surface_height() + 1;
+        let surface_stride = surface_width;
+        let out_luma_width = output_surface_config.out_luma_width() + 1;
+        let out_luma_height = output_surface_config.out_luma_height() + 1;
+        let out_luma_stride = align_up(out_luma_width * BYTES_PER_PIXEL, 0x10);
+        let out_luma_size = out_luma_height * out_luma_stride;
+        surface_width = surface_width.min(out_luma_width);
+        surface_height = surface_height.min(out_luma_height);
+        self.luma_scratch.resize(out_luma_size as usize, 0);
+
+        for y in 0..surface_height {
+            let src = y as usize * surface_stride as usize;
+            let dst = y as usize * out_luma_stride as usize;
+            for x in 0..surface_width as usize {
+                let pixel = self.output_surface[src + x];
+                let offset = dst + x * 4;
+                if format == VideoPixelFormat::A8R8G8B8 {
+                    self.luma_scratch[offset] = (pixel.b >> 2) as u8;
+                    self.luma_scratch[offset + 1] = (pixel.g >> 2) as u8;
+                    self.luma_scratch[offset + 2] = (pixel.r >> 2) as u8;
+                    self.luma_scratch[offset + 3] = (pixel.a >> 2) as u8;
+                } else {
+                    self.luma_scratch[offset] = (pixel.r >> 2) as u8;
+                    self.luma_scratch[offset + 1] = (pixel.g >> 2) as u8;
+                    self.luma_scratch[offset + 2] = (pixel.b >> 2) as u8;
+                    self.luma_scratch[offset + 3] = (pixel.a >> 2) as u8;
+                }
+            }
+        }
+
+        self.write_single_plane(
+            output_surface_config,
+            BYTES_PER_PIXEL,
+            out_luma_width,
+            out_luma_height,
+            out_luma_stride,
         );
+    }
+
+    fn write_single_plane(
+        &mut self,
+        output_surface_config: OutputSurfaceConfig,
+        bytes_per_pixel: u32,
+        width: u32,
+        height: u32,
+        stride: u32,
+    ) {
+        match output_surface_config.out_block_kind() {
+            Some(BlkKind::Pitch) => {
+                let _ = self
+                    .memory_manager
+                    .smmu_write_block(self.output_luma_address(), &self.luma_scratch);
+            }
+            Some(BlkKind::Generic16Bx2) => {
+                let block_height = output_surface_config.out_block_height();
+                let swizzled_size = crate::textures::decoders::calculate_size(
+                    true,
+                    bytes_per_pixel,
+                    width,
+                    height,
+                    1,
+                    block_height,
+                    0,
+                );
+                self.swizzle_scratch.resize(swizzled_size, 0);
+                if block_height == 1 {
+                    swizzle_surface(
+                        &mut self.swizzle_scratch,
+                        stride,
+                        &self.luma_scratch,
+                        stride,
+                        height,
+                    );
+                } else {
+                    crate::textures::decoders::swizzle_texture(
+                        &mut self.swizzle_scratch,
+                        &self.luma_scratch,
+                        bytes_per_pixel,
+                        width,
+                        height,
+                        1,
+                        block_height,
+                        0,
+                        1,
+                    );
+                }
+                let _ = self
+                    .memory_manager
+                    .smmu_write_block(self.output_luma_address(), &self.swizzle_scratch);
+            }
+            kind => log::warn!("Vic {} unimplemented output block kind {:?}", self.id, kind),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn write_plane_pair(
+        &mut self,
+        output_surface_config: OutputSurfaceConfig,
+        bytes_per_pixel: u32,
+        luma_width: u32,
+        luma_height: u32,
+        luma_stride: u32,
+        chroma_width: u32,
+        chroma_height: u32,
+        chroma_stride: u32,
+    ) {
+        match output_surface_config.out_block_kind() {
+            Some(BlkKind::Pitch) => {
+                let _ = self
+                    .memory_manager
+                    .smmu_write_block(self.output_luma_address(), &self.luma_scratch);
+                let _ = self
+                    .memory_manager
+                    .smmu_write_block(self.output_chroma_address(), &self.chroma_scratch);
+            }
+            Some(BlkKind::Generic16Bx2) => {
+                let block_height = output_surface_config.out_block_height();
+                let luma_size = crate::textures::decoders::calculate_size(
+                    true,
+                    bytes_per_pixel,
+                    luma_width,
+                    luma_height,
+                    1,
+                    block_height,
+                    0,
+                );
+                self.swizzle_scratch.resize(luma_size, 0);
+                if block_height == 1 {
+                    swizzle_surface(
+                        &mut self.swizzle_scratch,
+                        luma_stride,
+                        &self.luma_scratch,
+                        luma_stride,
+                        luma_height,
+                    );
+                } else {
+                    crate::textures::decoders::swizzle_texture(
+                        &mut self.swizzle_scratch,
+                        &self.luma_scratch,
+                        bytes_per_pixel,
+                        luma_width,
+                        luma_height,
+                        1,
+                        block_height,
+                        0,
+                        1,
+                    );
+                }
+                let _ = self
+                    .memory_manager
+                    .smmu_write_block(self.output_luma_address(), &self.swizzle_scratch);
+
+                let chroma_size = crate::textures::decoders::calculate_size(
+                    true,
+                    bytes_per_pixel * 2,
+                    chroma_width,
+                    chroma_height,
+                    1,
+                    block_height,
+                    0,
+                );
+                self.swizzle_scratch.resize(chroma_size, 0);
+                if block_height == 1 {
+                    swizzle_surface(
+                        &mut self.swizzle_scratch,
+                        chroma_stride,
+                        &self.chroma_scratch,
+                        chroma_stride,
+                        chroma_height,
+                    );
+                } else {
+                    crate::textures::decoders::swizzle_texture(
+                        &mut self.swizzle_scratch,
+                        &self.chroma_scratch,
+                        bytes_per_pixel * 2,
+                        chroma_width,
+                        chroma_height,
+                        1,
+                        block_height,
+                        0,
+                        1,
+                    );
+                }
+                let _ = self
+                    .memory_manager
+                    .smmu_write_block(self.output_chroma_address(), &self.swizzle_scratch);
+            }
+            kind => log::warn!("Vic {} unimplemented output block kind {:?}", self.id, kind),
+        }
+    }
+}
+
+const AV_PIX_FMT_YUV420P: i32 = 0;
+const AV_PIX_FMT_NV12: i32 = 23;
+
+unsafe fn frame_plane(frame: &Frame, plane: usize, len: usize) -> Option<&[u8]> {
+    let ptr = frame.get_plane_ptr(plane);
+    if ptr.is_null() {
+        return None;
+    }
+    Some(std::slice::from_raw_parts(ptr, len))
+}
+
+fn swizzle_surface(output: &mut [u8], out_stride: u32, input: &[u8], in_stride: u32, height: u32) {
+    let x_mask = 0xFFFFFFD2u32;
+    let y_mask = 0x2Cu32;
+    let mut offs_x = 0u32;
+    let mut offs_y = 0u32;
+
+    for y in (0..height).step_by(2) {
+        let dst_line = offs_y as usize * 16;
+        let src_line = y as usize * (in_stride as usize / 16) * 16;
+        let mut offs_line = offs_x;
+        for x in (0..in_stride as usize).step_by(16) {
+            let dst0 = dst_line + offs_line as usize * 16;
+            let src0 = src_line + x;
+            if dst0 + 16 <= output.len() && src0 + 16 <= input.len() {
+                output[dst0..dst0 + 16].copy_from_slice(&input[src0..src0 + 16]);
+            }
+            let dst1 = dst0 + 16;
+            let src1 = src0 + in_stride as usize;
+            if dst1 + 16 <= output.len() && src1 + 16 <= input.len() {
+                output[dst1..dst1 + 16].copy_from_slice(&input[src1..src1 + 16]);
+            }
+            offs_line = offs_line.wrapping_sub(x_mask) & x_mask;
+        }
+        offs_y = offs_y.wrapping_sub(y_mask) & y_mask;
+        if offs_y == 0 {
+            offs_x += out_stride;
+        }
     }
 }
 
@@ -575,5 +1541,56 @@ impl Drop for Vic {
 impl ProcessMethodHook for Vic {
     fn process_method(&mut self, method: u32, arg: u32) {
         Vic::process_method(self, method, arg);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn vic_bitfield_accessors_match_upstream_layout() {
+        let output = OutputSurfaceConfig {
+            format_flags: (VideoPixelFormat::Y8VuN420 as u32)
+                | ((BlkKind::Generic16Bx2 as u32) << 11)
+                | (3 << 15),
+            surface_dims: 1279 | (719 << 14),
+            luma_dims: 1279 | (719 << 14),
+            chroma_dims: 639 | (359 << 14),
+        };
+        assert_eq!(output.out_pixel_format(), Some(VideoPixelFormat::Y8VuN420));
+        assert_eq!(output.out_block_kind(), Some(BlkKind::Generic16Bx2));
+        assert_eq!(output.out_block_height(), 3);
+        assert_eq!(output.out_surface_width(), 1279);
+        assert_eq!(output.out_surface_height(), 719);
+        assert_eq!(output.out_chroma_width(), 639);
+        assert_eq!(output.out_chroma_height(), 359);
+
+        let slot = SlotConfig {
+            data: [
+                1 | ((DxvahdFrameFormat::TopField as u64) << 16),
+                (DxvahdDeinterlaceModePrivate::BobField as u64) << 40,
+                16 | (1000 << 10) | (0x3ff << 32),
+                0,
+                10 | (110 << 32),
+                20 | (220 << 32),
+                30 | (130 << 16) | (40 << 32) | (240 << 48),
+            ],
+            reserved22: 0,
+            reserved23: 0,
+        };
+        assert!(slot.slot_enable());
+        assert_eq!(slot.frame_format(), Some(DxvahdFrameFormat::TopField));
+        assert_eq!(
+            slot.deinterlace_mode(),
+            Some(DxvahdDeinterlaceModePrivate::BobField)
+        );
+        assert_eq!(slot.soft_clamp_low(), 16);
+        assert_eq!(slot.soft_clamp_high(), 1000);
+        assert_eq!(slot.planar_alpha(), 0x3ff);
+        assert_eq!(slot.source_rect_left(), 10);
+        assert_eq!(slot.source_rect_right(), 110);
+        assert_eq!(slot.dest_rect_left(), 30);
+        assert_eq!(slot.dest_rect_bottom(), 240);
     }
 }

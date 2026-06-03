@@ -56,6 +56,7 @@ impl NvDevice for NvHostNvDec {
 
     fn on_open(&self, session_id: SessionId, fd: DeviceFD) {
         log::info!("NVDEC video stream started");
+        self.common.system().get().set_nvdec_active(true);
         let mut sessions = self.common.sessions.lock().unwrap();
         sessions.insert(fd, session_id);
         drop(sessions);
@@ -65,6 +66,7 @@ impl NvDevice for NvHostNvDec {
     fn on_close(&self, fd: DeviceFD) {
         log::info!("NVDEC video stream ended");
         self.common.stop_host1x_device(fd);
+        self.common.system().get().set_nvdec_active(false);
         let mut sessions = self.common.sessions.lock().unwrap();
         sessions.remove(&fd);
     }

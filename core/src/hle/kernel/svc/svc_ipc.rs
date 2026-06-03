@@ -4,7 +4,7 @@
 //!
 //! SVC handlers for IPC (Inter-Process Communication) operations.
 
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use super::super::k_process::ProcessLock;
 use crate::core::System;
@@ -74,13 +74,70 @@ fn should_use_host_thread_ipc(session_handle: Handle) -> bool {
     })
 }
 
+fn parse_trace_filter_list(env_key: &str) -> Option<Vec<u64>> {
+    let spec = std::env::var(env_key).ok()?;
+    let mut values = Vec::new();
+    for raw in spec.split(',') {
+        let value = raw.trim();
+        if value.is_empty() || value == "*" {
+            return None;
+        }
+        let hex = value
+            .strip_prefix("0x")
+            .or_else(|| value.strip_prefix("0X"))
+            .unwrap_or(value);
+        let Some(parsed) = u64::from_str_radix(hex, 16)
+            .ok()
+            .or_else(|| value.parse::<u64>().ok())
+        else {
+            continue;
+        };
+        values.push(parsed);
+    }
+    if values.is_empty() {
+        None
+    } else {
+        Some(values)
+    }
+}
+
+fn trace_filter_matches(value: u64, filter: &Option<Vec<u64>>) -> bool {
+    filter
+        .as_ref()
+        .is_none_or(|values| values.iter().any(|&candidate| candidate == value))
+}
+
+fn should_emit_host_thread_ipc(session_handle: Handle) -> bool {
+    static HANDLE_FILTER: OnceLock<Option<Vec<u64>>> = OnceLock::new();
+    common::trace::is_enabled(common::trace::cat::HOST_THREAD_IPC)
+        && trace_filter_matches(
+            session_handle as u64,
+            HANDLE_FILTER.get_or_init(|| parse_trace_filter_list("RUZU_TRACE_HOST_THREAD_IPC_HANDLE")),
+        )
+}
+
+fn should_emit_svc_ipc_progress(session_handle: Handle, tid: u64) -> bool {
+    static HANDLE_FILTER: OnceLock<Option<Vec<u64>>> = OnceLock::new();
+    static TID_FILTER: OnceLock<Option<Vec<u64>>> = OnceLock::new();
+    common::trace::is_enabled(common::trace::cat::SVC_IPC_PROGRESS)
+        && trace_filter_matches(
+            session_handle as u64,
+            HANDLE_FILTER
+                .get_or_init(|| parse_trace_filter_list("RUZU_TRACE_SVC_IPC_PROGRESS_HANDLE")),
+        )
+        && trace_filter_matches(
+            tid,
+            TID_FILTER.get_or_init(|| parse_trace_filter_list("RUZU_TRACE_SVC_IPC_PROGRESS_TID")),
+        )
+}
+
 /// Diagnostic helper for the host-thread IPC routing path. Gated by
 /// `RUZU_TRACE_HOST_THREAD_IPC=1`. Each stage label corresponds to a step
 /// in the upstream `KClientSession::SendSyncRequest` →
 /// `KServerSession::OnRequest` → `ServerManager::OnSessionEvent` →
 /// `SendReplyHLE` pipeline.
 fn trace_host_thread_ipc(stage: &str, session_handle: Handle) {
-    if common::trace::is_enabled(common::trace::cat::HOST_THREAD_IPC) {
+    if should_emit_host_thread_ipc(session_handle) {
         let stage_id = match stage {
             "enqueue_begin" => 1,
             "registered_with_host_thread" => 2,
@@ -117,6 +174,34 @@ fn trace_host_thread_ipc(stage: &str, session_handle: Handle) {
     }
 }
 
+fn trace_svc_ipc_progress(
+    stage: u64,
+    session_handle: Handle,
+    client_object_id: u64,
+    message_address: u64,
+    aux0: u64,
+    aux1: u64,
+    aux2: u64,
+) {
+    let tid = crate::hle::kernel::kernel::get_current_thread_id_fast().unwrap_or(0);
+    if !should_emit_svc_ipc_progress(session_handle, tid) {
+        return;
+    }
+    common::trace::emit_raw(
+        common::trace::cat::SVC_IPC_PROGRESS,
+        &[
+            stage,
+            tid,
+            session_handle as u64,
+            client_object_id,
+            message_address,
+            aux0,
+            aux1,
+            aux2,
+        ],
+    );
+}
+
 fn yield_after_ipc_if_requested(system: &System) {
     // RUZU_YIELD_AFTER_IPC=1 — diagnostic for MK8D post-IPC ordering
     // divergence. Upstream `KServerSession::OnRequest` transitions the client
@@ -136,6 +221,25 @@ fn yield_after_ipc_if_requested(system: &System) {
                 (*scheduler_ptr).yield_without_core_migration(current_process, current_thread_id);
             }
         }
+    }
+}
+
+fn reschedule_after_inline_ipc_if_needed(system: &System) {
+    if std::env::var_os("RUZU_DISABLE_INLINE_IPC_RESCHEDULE").is_some() {
+        return;
+    }
+    let Some(kernel) = system.kernel() else {
+        return;
+    };
+    let Some(scheduler) = kernel.current_scheduler() else {
+        return;
+    };
+    let sched_ptr = {
+        let mut scheduler = scheduler.lock().unwrap();
+        &mut *scheduler as *mut crate::hle::kernel::k_scheduler::KScheduler
+    };
+    unsafe {
+        crate::hle::kernel::k_scheduler::KScheduler::schedule_raw_if_needed(sched_ptr);
     }
 }
 
@@ -333,6 +437,7 @@ fn send_sync_request_impl(
         }
     };
     trace_ipc_buffer(system, "TLS_REQ", message_address);
+    trace_svc_ipc_progress(1, session_handle, 0, message_address, 0, 0, 0);
     let trace_sync = should_trace_sync_handle(session_handle);
     let (client_session, session_object_id) = {
         let process = system.current_process_arc().lock().unwrap();
@@ -355,6 +460,15 @@ fn send_sync_request_impl(
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         (client_session, object_id)
     };
+    trace_svc_ipc_progress(
+        2,
+        session_handle,
+        session_object_id,
+        message_address,
+        0,
+        0,
+        0,
+    );
     record_phase("01_resolve_client_session", &mut phase_last);
     if trace_sync {
         log::info!("svc::SendSyncRequest stage=resolved_client_session");
@@ -400,15 +514,24 @@ fn send_sync_request_impl(
                     Some((server_session, manager))
                 })
         };
-        let with_queue_wakeup = server_session_and_manager
-            .as_ref()
-            .and_then(|(server_session, manager)| {
-                let (queue, wakeup) = {
-                    let g = manager.lock().unwrap();
-                    (g.pending_registrations().cloned(), g.server_wakeup().cloned())
-                };
-                Some((Arc::clone(server_session), Arc::clone(manager), queue?, wakeup?))
-            });
+        let with_queue_wakeup =
+            server_session_and_manager
+                .as_ref()
+                .and_then(|(server_session, manager)| {
+                    let (queue, wakeup) = {
+                        let g = manager.lock().unwrap();
+                        (
+                            g.pending_registrations().cloned(),
+                            g.server_wakeup().cloned(),
+                        )
+                    };
+                    Some((
+                        Arc::clone(server_session),
+                        Arc::clone(manager),
+                        queue?,
+                        wakeup?,
+                    ))
+                });
 
         if with_queue_wakeup.is_none() && server_session_and_manager.is_some() {
             // Orphan target under host-thread routing: park the client and
@@ -604,22 +727,94 @@ fn send_sync_request_impl(
     // unit tests that drive `send_sync_request` directly without spinning
     // up a host fiber. Behavior is non-upstream but converges with the
     // host-thread path because the same handler runs end-to-end.
-    let (request_manager, mut context, request_message_address) = {
+    let (request_manager, mut context, request_message_address) = if std::env::var_os(
+        "RUZU_LEGACY_INLINE_NOTIFY",
+    )
+    .is_some()
+    {
         let (server_session, manager) = {
             let mut process = system.current_process_arc().lock().unwrap();
-            record_phase("02_process_lock_2", &mut phase_last);
+            record_phase("02_process_lock_legacy_inline", &mut phase_last);
             if trace_sync {
-                log::info!("svc::SendSyncRequest stage=enqueue_request");
+                log::info!("svc::SendSyncRequest stage=legacy_enqueue_request");
             }
             let send_result = client_session
                 .lock()
                 .unwrap()
                 .send_sync_request_with_process(&mut process, message_address as usize, 0);
-            record_phase("03_send_sync_request_with_process", &mut phase_last);
+            record_phase("03_legacy_send_sync_request_with_process", &mut phase_last);
             if send_result != 0 {
                 return ResultCode::new(send_result);
             }
 
+            let parent_id = match client_session.lock().unwrap().get_parent_id() {
+                Some(parent_id) => parent_id,
+                None => {
+                    if trace_sync {
+                        log::info!("svc::SendSyncRequest stage=legacy_missing_parent_id");
+                    }
+                    return RESULT_INVALID_HANDLE;
+                }
+            };
+            let Some(parent_session) = process.get_session_by_object_id(parent_id) else {
+                if trace_sync {
+                    log::info!(
+                        "svc::SendSyncRequest stage=legacy_missing_parent_session parent_id={:#x}",
+                        parent_id
+                    );
+                }
+                return RESULT_INVALID_HANDLE;
+            };
+            let server_session = parent_session.lock().unwrap().get_server_session().clone();
+            let manager = match server_session.lock().unwrap().get_manager().cloned() {
+                Some(manager) => manager,
+                None => {
+                    if trace_sync {
+                        log::info!(
+                            "svc::SendSyncRequest stage=legacy_missing_server_manager parent_id={:#x}",
+                            parent_id
+                        );
+                    }
+                    return RESULT_INVALID_HANDLE;
+                }
+            };
+            (server_session, manager)
+        };
+        if trace_sync {
+            log::info!("svc::SendSyncRequest stage=legacy_receive_request_hle_begin");
+        }
+
+        record_phase("04_legacy_resolve_server_session_manager", &mut phase_last);
+        let receive_result = {
+            let mut server_session = server_session.lock().unwrap();
+            server_session.receive_request_hle(Arc::clone(&manager))
+        };
+        record_phase("05_legacy_receive_request_hle", &mut phase_last);
+        match receive_result {
+            Ok((context, manager, request_message_address)) => {
+                if trace_sync {
+                    log::info!("svc::SendSyncRequest stage=legacy_receive_request_hle_end");
+                }
+                (manager, context, request_message_address)
+            }
+            Err(_) => return RESULT_INVALID_HANDLE,
+        }
+    } else {
+        let (server_session, manager, request) = {
+            let mut process = system.current_process_arc().lock().unwrap();
+            record_phase("02_process_lock_2", &mut phase_last);
+            trace_svc_ipc_progress(
+                3,
+                session_handle,
+                session_object_id,
+                message_address,
+                0,
+                0,
+                0,
+            );
+            if trace_sync {
+                log::info!("svc::SendSyncRequest stage=enqueue_request");
+            }
             let parent_id = match client_session.lock().unwrap().get_parent_id() {
                 Some(parent_id) => parent_id,
                 None => {
@@ -629,6 +824,16 @@ fn send_sync_request_impl(
                     return RESULT_INVALID_HANDLE;
                 }
             };
+            let request = Arc::new(Mutex::new(
+                crate::hle::kernel::k_session_request::KSessionRequest::new(),
+            ));
+            request.lock().unwrap().initialize_with_process(
+                &mut process,
+                None,
+                message_address as usize,
+                0,
+            );
+            record_phase("03_prepare_inline_request", &mut phase_last);
             let Some(parent_session) = process.get_session_by_object_id(parent_id) else {
                 if trace_sync {
                     log::info!(
@@ -651,24 +856,45 @@ fn send_sync_request_impl(
                     return RESULT_INVALID_HANDLE;
                 }
             };
-            (server_session, manager)
+            (server_session, manager, request)
         };
         if trace_sync {
             log::info!("svc::SendSyncRequest stage=receive_request_hle_begin");
         }
 
-        // Do not hold the owner `KProcess` lock across `receive_request_hle()`.
-        // That path resolves the request client thread through kernel process
-        // lookup, which would re-enter the same process mutex and deadlock on
-        // the first synchronous IPC to services like "sm:".
+        // Do not notify the host ServerManager on the inline fallback path.
+        // This path consumes the request synchronously on the caller's host
+        // thread; waking the real ServerManager exposes the same request to two
+        // dispatch paths and can make a stale SFCO reply look like a new IPC.
+        // `receive_inline_request_hle` pushes and receives under the same
+        // `KServerSession` mutex, while the owner `KProcess` mutex is already
+        // released to avoid the current-thread parent lookup deadlock.
         record_phase("04_resolve_server_session_manager", &mut phase_last);
+        trace_svc_ipc_progress(
+            4,
+            session_handle,
+            session_object_id,
+            message_address,
+            0,
+            0,
+            0,
+        );
         let receive_result = {
             let mut server_session = server_session.lock().unwrap();
-            server_session.receive_request_hle(Arc::clone(&manager))
+            server_session.receive_inline_request_hle(request, Arc::clone(&manager))
         };
         record_phase("05_receive_request_hle", &mut phase_last);
         match receive_result {
             Ok((context, manager, request_message_address)) => {
+                trace_svc_ipc_progress(
+                    5,
+                    session_handle,
+                    session_object_id,
+                    message_address,
+                    request_message_address,
+                    0,
+                    0,
+                );
                 if trace_sync {
                     log::info!("svc::SendSyncRequest stage=receive_request_hle_end");
                 }
@@ -740,7 +966,25 @@ fn send_sync_request_impl(
     if trace_sync {
         log::info!("svc::SendSyncRequest stage=complete_sync_request_begin");
     }
+    trace_svc_ipc_progress(
+        6,
+        session_handle,
+        session_object_id,
+        message_address,
+        request_message_address,
+        context.get_command() as u64,
+        0,
+    );
     let result = complete_sync_request(&request_manager, &mut context);
+    trace_svc_ipc_progress(
+        7,
+        session_handle,
+        session_object_id,
+        message_address,
+        request_message_address,
+        context.get_command() as u64,
+        result.get_inner_value() as u64,
+    );
     record_phase("06_complete_sync_request_handler", &mut phase_last);
     if trace_sync {
         log::info!(
@@ -774,47 +1018,53 @@ fn send_sync_request_impl(
         if trace_sync {
             log::info!("svc::SendSyncRequest stage=send_reply_begin");
         }
+        trace_svc_ipc_progress(
+            8,
+            session_handle,
+            session_object_id,
+            message_address,
+            request_message_address,
+            0,
+            0,
+        );
         let _ = server_session.lock().unwrap().send_reply();
+        trace_svc_ipc_progress(
+            9,
+            session_handle,
+            session_object_id,
+            message_address,
+            request_message_address,
+            0,
+            0,
+        );
         if trace_sync {
             log::info!("svc::SendSyncRequest stage=send_reply_end");
         }
     }
     record_phase("07_send_reply", &mut phase_last);
 
-    // RUZU_RESCHEDULE_AFTER_IPC=1 — Quick experiment for MK8D wedge investigation
-    // (project_mk8d_lost_wakeup_cv_69a545ac_2026_05_21). Upstream's
-    // KServerSession::OnRequest transitions the caller through ThreadState::WAITING
-    // during the IPC (via BeginWait inside KScopedSchedulerLock), which causes the
-    // scheduler to dispatch other RUNNABLE threads of equal-or-lower priority on
-    // the same core when the lock drops. ruzu's HLE IPC path runs synchronously
-    // with no thread state transition, so the scheduler is never invoked between
-    // SVCs. This experimental knob calls reschedule_current_core() at the end of
-    // each HLE IPC to give the scheduler a chance to dispatch waiting threads.
-    if std::env::var_os("RUZU_RESCHEDULE_AFTER_IPC").is_some() {
-        if let Some(kernel) = system.kernel() {
-            if let Some(scheduler) = kernel.current_scheduler() {
-                let sched_ptr = {
-                    let guard = scheduler.lock().unwrap();
-                    &*guard as *const crate::hle::kernel::k_scheduler::KScheduler
-                        as *mut crate::hle::kernel::k_scheduler::KScheduler
-                };
-                // preempt_single_core yields to the scheduler fiber and lets it
-                // pick the next runnable thread. Mirrors upstream's preemption
-                // tick behavior (RotateScheduledQueue) but on every HLE IPC
-                // rather than every 10ms. Heavy-handed but tests whether giving
-                // the scheduler an opportunity to run other threads is what we
-                // need for the MK8D tid=86 dispatch race.
-                unsafe {
-                    (*sched_ptr).preempt_single_core();
-                }
-            }
-        }
-    }
+    // Upstream `PhysicalCore::RunThread` returns to the scheduler after every
+    // SVC, and the normal IPC path parks the caller while the server session
+    // handles the request. Ruzu's legacy inline HLE IPC fallback does not park
+    // the caller, so explicitly consume any pending same-core scheduling request
+    // once the inline handler and reply have completed. This keeps clean runs
+    // moving without the heavier experimental unconditional preemption that was
+    // previously guarded by `RUZU_RESCHEDULE_AFTER_IPC`.
+    reschedule_after_inline_ipc_if_needed(system);
 
     if result == crate::hle::service::ipc_helpers::RESULT_SESSION_CLOSED {
         return RESULT_SUCCESS;
     }
 
+    trace_svc_ipc_progress(
+        10,
+        session_handle,
+        session_object_id,
+        message_address,
+        result.get_inner_value() as u64,
+        0,
+        0,
+    );
     result
 }
 
@@ -881,13 +1131,16 @@ pub fn send_sync_request(system: &System, session_handle: Handle) -> ResultCode 
     // it only buys ~50 % success.
     //
     // Cost: ~50-100 µs per IPC × ~5 000 boot IPCs ≈ 250-500 ms added to
-    // boot. Negligible compared to MK8D's 11-second boot. Skipped under
-    // `RUZU_INLINE_IPC=1` — the inline path doesn't have the starvation
-    // because handlers run on the guest core OS thread itself.
+    // boot. Negligible compared to MK8D's 11-second boot when host-thread
+    // routing is explicitly enabled. Do not apply it to the inline path:
+    // handlers already run on the guest core OS thread there, and MK8D can
+    // issue hundreds of thousands of tight IPC polls during boot.
     //
     // `RUZU_HOST_THREAD_IPC_SLEEP_US=<n>` overrides the default 1 µs;
     // set to `0` to disable entirely (for performance investigation).
-    if std::env::var_os("RUZU_INLINE_IPC").is_none() {
+    let host_thread_ipc_enabled = std::env::var_os("RUZU_SERVER_THREAD_IPC_ALL").is_some()
+        || std::env::var_os("RUZU_SERVER_THREAD_IPC_HANDLE").is_some();
+    if host_thread_ipc_enabled && std::env::var_os("RUZU_INLINE_IPC").is_none() {
         let us = std::env::var("RUZU_HOST_THREAD_IPC_SLEEP_US")
             .ok()
             .and_then(|s| s.parse::<u64>().ok())

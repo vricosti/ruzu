@@ -7,7 +7,8 @@
 //! SPS/PPS headers, and the H264 decoder struct.
 
 use crate::host1x::codecs::decoder::{DecoderImpl, DecoderState};
-use crate::host1x::nvdec_common::VideoCodec;
+use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
+use crate::host1x::nvdec_common::{NvdecRegisters, VideoCodec};
 
 // --------------------------------------------------------------------------
 // ZigZag LUTs from libavcodec (same as upstream).
@@ -242,6 +243,54 @@ impl H264DecoderContext {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn h264_guest_context_layout_matches_upstream() {
+        assert_eq!(std::mem::size_of::<Offset>(), 0x4);
+        assert_eq!(std::mem::size_of::<H264ParameterSet>(), 0x60);
+        assert_eq!(std::mem::size_of::<DpbEntry>(), 0x10);
+        assert_eq!(std::mem::size_of::<DisplayParam>(), 0x1C);
+        assert_eq!(std::mem::size_of::<H264DecoderContext>(), 0x2FC);
+
+        assert_eq!(
+            std::mem::offset_of!(H264ParameterSet, log2_max_pic_order_cnt_lsb_minus4),
+            0x00
+        );
+        assert_eq!(std::mem::offset_of!(H264ParameterSet, surface_format), 0x14);
+        assert_eq!(
+            std::mem::offset_of!(H264ParameterSet, luma_top_offset),
+            0x3C
+        );
+        assert_eq!(
+            std::mem::offset_of!(H264ParameterSet, chroma_frame_offset),
+            0x50
+        );
+        assert_eq!(std::mem::offset_of!(H264ParameterSet, flags_raw), 0x58);
+
+        assert_eq!(std::mem::offset_of!(H264DecoderContext, stream_len), 0x48);
+        assert_eq!(
+            std::mem::offset_of!(H264DecoderContext, h264_parameter_set),
+            0x58
+        );
+        assert_eq!(std::mem::offset_of!(H264DecoderContext, dpb), 0xC0);
+        assert_eq!(
+            std::mem::offset_of!(H264DecoderContext, weight_scale_4x4),
+            0x1C0
+        );
+        assert_eq!(
+            std::mem::offset_of!(H264DecoderContext, weight_scale_8x8),
+            0x220
+        );
+        assert_eq!(
+            std::mem::offset_of!(H264DecoderContext, display_param),
+            0x2D4
+        );
+    }
+}
+
 // --------------------------------------------------------------------------
 // H264BitWriter
 // --------------------------------------------------------------------------
@@ -404,33 +453,191 @@ impl H264 {
 }
 
 impl DecoderImpl for H264 {
-    fn compose_frame(&mut self) -> Vec<u8> {
-        // Stubbed — requires memory manager integration to read H264DecoderContext from memory
-        // at picture_info_offset, compose SPS/PPS headers via H264BitWriter, and append
-        // the raw bitstream from frame_bitstream_offset.
-        // Upstream: H264::ComposeFrame() in video_core/host1x/codecs/h264.cpp
-        log::warn!(
-            "H264::compose_frame: not yet implemented (requires memory manager integration)"
+    fn compose_frame(
+        &mut self,
+        regs: &NvdecRegisters,
+        memory_manager: &MaxwellDeviceMemoryManager,
+    ) -> Vec<u8> {
+        let mut context_bytes = vec![0u8; std::mem::size_of::<H264DecoderContext>()];
+        if !memory_manager.smmu_read_block(regs.picture_info_offset().address(), &mut context_bytes)
+        {
+            log::error!(
+                "H264::compose_frame: failed to read picture info at 0x{:X}",
+                regs.picture_info_offset().address()
+            );
+            return Vec::new();
+        }
+        self.current_context = unsafe {
+            let mut context = H264DecoderContext::default();
+            std::ptr::copy_nonoverlapping(
+                context_bytes.as_ptr(),
+                (&mut context as *mut H264DecoderContext).cast::<u8>(),
+                context_bytes.len(),
+            );
+            context
+        };
+
+        let frame_number = self.current_context.h264_parameter_set.frame_number() as i64;
+        if !self.is_first_frame && frame_number != 0 {
+            self.frame_scratch
+                .resize(self.current_context.stream_len as usize, 0);
+            if !memory_manager.smmu_read_block(
+                regs.frame_bitstream_offset().address(),
+                &mut self.frame_scratch,
+            ) {
+                log::error!(
+                    "H264::compose_frame: failed to read frame bitstream at 0x{:X}",
+                    regs.frame_bitstream_offset().address()
+                );
+                self.frame_scratch.clear();
+            }
+            return self.frame_scratch.clone();
+        }
+
+        self.is_first_frame = false;
+
+        let params = &self.current_context.h264_parameter_set;
+        let mut writer = H264BitWriter::new();
+
+        writer.write_u(1, 24);
+        writer.write_u(0, 1);
+        writer.write_u(3, 2);
+        writer.write_u(7, 5);
+        writer.write_u(100, 8);
+        writer.write_u(0, 8);
+        writer.write_u(31, 8);
+        writer.write_ue(0);
+        let chroma_format_idc = params.chroma_format_idc() as u32;
+        writer.write_ue(chroma_format_idc);
+        if chroma_format_idc == 3 {
+            writer.write_bit(false);
+        }
+
+        writer.write_ue(0);
+        writer.write_ue(0);
+        writer.write_bit(self.current_context.qpprime_y_zero_transform_bypass_flag() != 0);
+        writer.write_bit(false);
+        writer.write_ue(params.log2_max_frame_num_minus4() as u32);
+
+        let order_cnt_type = params.pic_order_cnt_type() as u32;
+        writer.write_ue(order_cnt_type);
+        if order_cnt_type == 0 {
+            writer.write_ue(params.log2_max_pic_order_cnt_lsb_minus4 as u32);
+        } else if order_cnt_type == 1 {
+            writer.write_bit(params.delta_pic_order_always_zero_flag != 0);
+            writer.write_se(0);
+            writer.write_se(0);
+            writer.write_ue(0);
+        }
+
+        let pic_height = params.frame_height_in_mbs
+            / if params.frame_mbs_only_flag != 0 {
+                1
+            } else {
+                2
+            };
+        let max_num_ref_frames = (params
+            .num_refidx_l0_default_active
+            .max(params.num_refidx_l1_default_active)
+            + 1)
+        .max(4);
+        writer.write_ue(max_num_ref_frames as u32);
+        writer.write_bit(false);
+        writer.write_ue(params.pic_width_in_mbs - 1);
+        writer.write_ue(pic_height - 1);
+        writer.write_bit(params.frame_mbs_only_flag != 0);
+        if params.frame_mbs_only_flag == 0 {
+            writer.write_bit(params.mbaff_frame() != 0);
+        }
+        writer.write_bit(params.direct_8x8_inference() != 0);
+        writer.write_bit(false);
+        writer.write_bit(false);
+        writer.end();
+
+        writer.write_u(1, 24);
+        writer.write_u(0, 1);
+        writer.write_u(3, 2);
+        writer.write_u(8, 5);
+        writer.write_ue(0);
+        writer.write_ue(0);
+        writer.write_bit(params.entropy_coding_mode_flag != 0);
+        writer.write_bit(params.pic_order_present_flag != 0);
+        writer.write_ue(0);
+        writer.write_ue(params.num_refidx_l0_default_active as u32);
+        writer.write_ue(params.num_refidx_l1_default_active as u32);
+        writer.write_bit(params.weighted_pred() != 0);
+        writer.write_u(params.weighted_bipred_idc() as i32, 2);
+        writer.write_se(params.pic_init_qp_minus26() as i32);
+        writer.write_se(0);
+        writer.write_se(params.chroma_qp_index_offset() as i32);
+        writer.write_bit(params.deblocking_filter_control_present_flag != 0);
+        writer.write_bit(params.constrained_intra_pred() != 0);
+        writer.write_bit(params.redundant_pic_cnt_present_flag != 0);
+        writer.write_bit(params.transform_8x8_mode_flag != 0);
+        writer.write_bit(true);
+
+        for index in 0..6 {
+            writer.write_bit(true);
+            writer.write_scaling_list(&self.current_context.weight_scale_4x4, index * 16, 16);
+        }
+
+        if params.transform_8x8_mode_flag != 0 {
+            for index in 0..2 {
+                writer.write_bit(true);
+                writer.write_scaling_list(&self.current_context.weight_scale_8x8, index * 64, 64);
+            }
+        }
+
+        writer.write_se(params.second_chroma_qp_index_offset() as i32);
+        writer.end();
+
+        let encoded_header = writer.get_byte_array();
+        self.frame_scratch.resize(
+            encoded_header.len() + self.current_context.stream_len as usize,
+            0,
         );
-        Vec::new()
+        self.frame_scratch[..encoded_header.len()].copy_from_slice(encoded_header);
+        if !memory_manager.smmu_read_block(
+            regs.frame_bitstream_offset().address(),
+            &mut self.frame_scratch[encoded_header.len()..],
+        ) {
+            log::error!(
+                "H264::compose_frame: failed to read frame bitstream at 0x{:X}",
+                regs.frame_bitstream_offset().address()
+            );
+            self.frame_scratch.clear();
+        }
+        self.frame_scratch.clone()
     }
 
-    fn get_progressive_offsets(&self) -> (u64, u64) {
-        // Upstream: surface_luma_offsets[curr_pic_idx].Address() + luma_frame_offset.Address()
-        //           surface_chroma_offsets[curr_pic_idx].Address() + chroma_frame_offset.Address()
-        // Stubbed until NvdecRegisters are wired into the decoder.
+    fn get_progressive_offsets(&self, regs: &NvdecRegisters) -> (u64, u64) {
         let pic_idx = self.current_context.h264_parameter_set.curr_pic_idx() as usize;
-        let _ = pic_idx;
-        log::warn!("H264::get_progressive_offsets: not yet implemented (requires NvdecRegisters)");
-        (0, 0)
+        let luma = regs.surface_luma_offset(pic_idx).address()
+            + self
+                .current_context
+                .h264_parameter_set
+                .luma_frame_offset
+                .address() as u64;
+        let chroma = regs.surface_chroma_offset(pic_idx).address()
+            + self
+                .current_context
+                .h264_parameter_set
+                .chroma_frame_offset
+                .address() as u64;
+        (luma, chroma)
     }
 
-    fn get_interlaced_offsets(&self) -> (u64, u64, u64, u64) {
-        // Upstream: surface_luma_offsets[curr_pic_idx].Address() + luma_top/bot_offset.Address()
-        //           surface_chroma_offsets[curr_pic_idx].Address() + chroma_top/bot_offset.Address()
-        // Stubbed until NvdecRegisters are wired into the decoder.
-        log::warn!("H264::get_interlaced_offsets: not yet implemented (requires NvdecRegisters)");
-        (0, 0, 0, 0)
+    fn get_interlaced_offsets(&self, regs: &NvdecRegisters) -> (u64, u64, u64, u64) {
+        let pic_idx = self.current_context.h264_parameter_set.curr_pic_idx() as usize;
+        let luma_base = regs.surface_luma_offset(pic_idx).address();
+        let chroma_base = regs.surface_chroma_offset(pic_idx).address();
+        let params = &self.current_context.h264_parameter_set;
+        (
+            luma_base + params.luma_top_offset.address() as u64,
+            luma_base + params.luma_bot_offset.address() as u64,
+            chroma_base + params.chroma_top_offset.address() as u64,
+            chroma_base + params.chroma_bot_offset.address() as u64,
+        )
     }
 
     fn is_interlaced(&self) -> bool {

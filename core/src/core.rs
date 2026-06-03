@@ -663,7 +663,7 @@ pub struct System {
     exit_requested: bool,
 
     /// Whether NVDEC is active.
-    nvdec_active: bool,
+    nvdec_active: AtomicBool,
 
     // ── Configuration ──
     /// Whether multicore mode is enabled.
@@ -782,7 +782,7 @@ impl System {
             is_powered_on: AtomicBool::new(false),
             exit_locked: false,
             exit_requested: false,
-            nvdec_active: false,
+            nvdec_active: AtomicBool::new(false),
             is_multicore: false,
             is_async_gpu: false,
             extended_memory_layout: false,
@@ -1578,13 +1578,14 @@ impl System {
     }
 
     /// Set NVDEC active state.
-    pub fn set_nvdec_active(&mut self, is_nvdec_active: bool) {
-        self.nvdec_active = is_nvdec_active;
+    pub fn set_nvdec_active(&self, is_nvdec_active: bool) {
+        self.nvdec_active
+            .store(is_nvdec_active, Ordering::Relaxed);
     }
 
     /// Get NVDEC active state.
     pub fn get_nvdec_active(&self) -> bool {
-        self.nvdec_active
+        self.nvdec_active.load(Ordering::Relaxed)
     }
 
     /// Gets a reference to the core timing instance.

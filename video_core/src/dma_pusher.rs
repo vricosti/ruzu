@@ -9,6 +9,7 @@
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
+use std::time::Instant;
 
 use crate::engines::engine_interface::{EngineHandle, EngineInterface};
 use crate::engines::engine_interface::EngineTypes;
@@ -24,6 +25,151 @@ static COMMAND_WORDS_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
 fn should_trace_dma_flow() -> bool {
     static CACHED: OnceLock<bool> = OnceLock::new();
     *CACHED.get_or_init(|| std::env::var_os("RUZU_TRACE_DMA_FLOW").is_some())
+}
+
+fn elapsed_us(start: Instant) -> u64 {
+    start.elapsed().as_micros().min(u128::from(u64::MAX)) as u64
+}
+
+fn elapsed_us_opt(start: Option<Instant>) -> u64 {
+    start.map(elapsed_us).unwrap_or(0)
+}
+
+fn dma_method_trace_min_us() -> u64 {
+    static CACHED: OnceLock<u64> = OnceLock::new();
+    *CACHED.get_or_init(|| {
+        std::env::var("RUZU_TRACE_DMA_METHOD_MIN_US")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(500)
+    })
+}
+
+fn should_trace_dma_method_inflight() -> bool {
+    static CACHED: OnceLock<bool> = OnceLock::new();
+    *CACHED.get_or_init(|| std::env::var_os("RUZU_TRACE_DMA_METHOD_INFLIGHT").is_some())
+}
+
+fn trace_dma_pusher_method_inflight(
+    stage: u64,
+    dispatch_index: u64,
+    command_index: usize,
+    command_count: usize,
+    subchannel: u32,
+    method: u32,
+    argument_or_words: u32,
+    pending: u32,
+    dma_segment: u64,
+    elapsed_us: u64,
+) {
+    if !common::trace::is_enabled(common::trace::cat::DMA_PUSHER) {
+        return;
+    }
+    if !should_trace_dma_method_inflight() {
+        return;
+    }
+    common::trace::emit_raw(
+        common::trace::cat::DMA_PUSHER,
+        &[
+            stage,
+            dispatch_index,
+            command_index as u64,
+            command_count as u64,
+            subchannel as u64,
+            method as u64,
+            argument_or_words as u64,
+            pending as u64,
+            dma_segment,
+            elapsed_us,
+        ],
+    );
+}
+
+fn trace_dma_pusher_method_agg(
+    command_count: usize,
+    total_dispatches: u64,
+    subchannel: u32,
+    method: u32,
+    calls: u64,
+    words: u64,
+    elapsed_us: u64,
+    dma_get: u64,
+) {
+    if !common::trace::is_enabled(common::trace::cat::DMA_PUSHER) {
+        return;
+    }
+    if elapsed_us < dma_method_trace_min_us() {
+        return;
+    }
+    common::trace::emit_raw(
+        common::trace::cat::DMA_PUSHER,
+        &[
+            9,
+            command_count as u64,
+            total_dispatches,
+            subchannel as u64,
+            method as u64,
+            calls,
+            words,
+            elapsed_us,
+            dma_get,
+        ],
+    );
+}
+
+fn record_dma_method_time(
+    method_times: &mut Vec<(u32, u32, u64, u64, u64)>,
+    subchannel: u32,
+    method: u32,
+    calls: u64,
+    words: u64,
+    elapsed_us: u64,
+) {
+    if elapsed_us == 0 {
+        return;
+    }
+    if let Some((_, _, existing_calls, existing_words, existing_elapsed)) = method_times
+        .iter_mut()
+        .find(|(entry_subchannel, entry_method, _, _, _)| {
+            *entry_subchannel == subchannel && *entry_method == method
+        })
+    {
+        *existing_calls += calls;
+        *existing_words += words;
+        *existing_elapsed += elapsed_us;
+        return;
+    }
+    method_times.push((subchannel, method, calls, words, elapsed_us));
+}
+
+fn trace_dma_pusher_step(
+    stage: u64,
+    queue_len: usize,
+    subindex: usize,
+    addr: u64,
+    size: u32,
+    non_main: bool,
+    method_count: u32,
+    dma_get: u64,
+    elapsed_us: u64,
+) {
+    if !common::trace::is_enabled(common::trace::cat::DMA_PUSHER) {
+        return;
+    }
+    common::trace::emit_raw(
+        common::trace::cat::DMA_PUSHER,
+        &[
+            stage,
+            queue_len as u64,
+            subindex as u64,
+            addr,
+            size as u64,
+            non_main as u64,
+            method_count as u64,
+            dma_get,
+            elapsed_us,
+        ],
+    );
 }
 
 fn should_trace_puller() -> bool {
@@ -378,6 +524,17 @@ impl DmaPusher {
     /// processing and method dispatch are fully implemented; engine dispatch goes
     /// through the `subchannel` engine interface.
     pub fn dispatch_calls(&mut self) {
+        trace_dma_pusher_step(
+            1,
+            self.dma_pushbuffer.len(),
+            self.dma_pushbuffer_subindex,
+            0,
+            0,
+            false,
+            self.dma_state.method_count,
+            self.dma_state.dma_get,
+            0,
+        );
         self.dma_pushbuffer_subindex = 0;
         self.dma_state.is_last_call = true;
 
@@ -390,6 +547,17 @@ impl DmaPusher {
         let gpu = unsafe { &*self.gpu };
         gpu.flush_commands();
         gpu.on_command_list_end();
+        trace_dma_pusher_step(
+            2,
+            self.dma_pushbuffer.len(),
+            self.dma_pushbuffer_subindex,
+            0,
+            0,
+            false,
+            self.dma_state.method_count,
+            self.dma_state.dma_get,
+            0,
+        );
     }
 
     /// Dispatch all pending command lists with an engine to receive method calls.
@@ -448,6 +616,17 @@ impl DmaPusher {
         if !self.ib_enable || self.dma_pushbuffer.is_empty() {
             return false;
         }
+        trace_dma_pusher_step(
+            3,
+            self.dma_pushbuffer.len(),
+            self.dma_pushbuffer_subindex,
+            0,
+            0,
+            false,
+            self.dma_state.method_count,
+            self.dma_state.dma_get,
+            0,
+        );
 
         if should_trace_dma_flow() {
             let trace_idx = DMA_FLOW_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
@@ -468,6 +647,17 @@ impl DmaPusher {
         };
 
         if command_list.command_lists.is_empty() && command_list.prefetch_command_list.is_empty() {
+            trace_dma_pusher_step(
+                8,
+                self.dma_pushbuffer.len(),
+                self.dma_pushbuffer_subindex,
+                0,
+                0,
+                false,
+                self.dma_state.method_count,
+                self.dma_state.dma_get,
+                0,
+            );
             self.dma_pushbuffer.pop_front();
             self.dma_pushbuffer_subindex = 0;
             return true;
@@ -476,6 +666,17 @@ impl DmaPusher {
         if !command_list.prefetch_command_list.is_empty() {
             // Prefetched command list from nvdrv (synchronization etc.).
             let commands: Vec<CommandHeader> = command_list.prefetch_command_list.clone();
+            trace_dma_pusher_step(
+                4,
+                self.dma_pushbuffer.len(),
+                self.dma_pushbuffer_subindex,
+                0,
+                commands.len() as u32,
+                false,
+                self.dma_state.method_count,
+                self.dma_state.dma_get,
+                0,
+            );
             if should_trace_dma_flow() {
                 let trace_idx = DMA_FLOW_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
                 if trace_idx < 64 {
@@ -486,10 +687,34 @@ impl DmaPusher {
                     );
                 }
             }
+            let trace_dma_pusher = common::trace::is_enabled(common::trace::cat::DMA_PUSHER);
+            let process_start = trace_dma_pusher.then(Instant::now);
             self.process_commands(&commands);
+            trace_dma_pusher_step(
+                5,
+                self.dma_pushbuffer.len(),
+                self.dma_pushbuffer_subindex,
+                0,
+                commands.len() as u32,
+                false,
+                self.dma_state.method_count,
+                self.dma_state.dma_get,
+                elapsed_us_opt(process_start),
+            );
             self.dma_pushbuffer.pop_front();
         } else {
             let command_list_header = command_list.command_lists[self.dma_pushbuffer_subindex];
+            trace_dma_pusher_step(
+                6,
+                self.dma_pushbuffer.len(),
+                self.dma_pushbuffer_subindex,
+                command_list_header.addr(),
+                command_list_header.size(),
+                command_list_header.is_non_main(),
+                self.dma_state.method_count,
+                self.dma_state.dma_get,
+                0,
+            );
             if should_trace_dma_flow() {
                 let trace_idx = DMA_FLOW_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
                 if trace_idx < 64 {
@@ -556,7 +781,20 @@ impl DmaPusher {
                     );
                 }
             }
+            let trace_dma_pusher = common::trace::is_enabled(common::trace::cat::DMA_PUSHER);
+            let process_start = trace_dma_pusher.then(Instant::now);
             self.process_commands(&self.command_headers.clone());
+            trace_dma_pusher_step(
+                7,
+                self.dma_pushbuffer.len(),
+                self.dma_pushbuffer_subindex,
+                command_list_header.addr(),
+                command_list_header.size(),
+                command_list_header.is_non_main(),
+                self.dma_state.method_count,
+                self.dma_state.dma_get,
+                elapsed_us_opt(process_start),
+            );
         }
         true
     }
@@ -697,6 +935,8 @@ impl DmaPusher {
     fn process_commands(&mut self, commands: &[CommandHeader]) {
         let mut index = 0;
         let mut total_dispatches = 0u64;
+        let trace_methods = common::trace::is_enabled(common::trace::cat::DMA_PUSHER);
+        let mut method_times: Vec<(u32, u32, u64, u64, u64)> = Vec::new();
         while index < commands.len() {
             total_dispatches += 1;
             if should_trace_dma_flow() {
@@ -731,14 +971,94 @@ impl DmaPusher {
                     let max_write =
                         std::cmp::min(index + self.dma_state.method_count as usize, commands.len())
                             - index;
-                    self.dispatch_multi_method(&commands[index..index + max_write]);
+                    let method = self.dma_state.method;
+                    let subchannel = self.dma_state.subchannel;
+                    let dma_segment = self
+                        .dma_state
+                        .dma_get
+                        .wrapping_add(self.dma_state.dma_word_offset);
+                    trace_dma_pusher_method_inflight(
+                        12,
+                        total_dispatches,
+                        index,
+                        commands.len(),
+                        subchannel,
+                        method,
+                        max_write as u32,
+                        self.dma_state.method_count,
+                        dma_segment,
+                        0,
+                    );
+                    let elapsed = self.dispatch_multi_method(&commands[index..index + max_write]);
+                    trace_dma_pusher_method_inflight(
+                        13,
+                        total_dispatches,
+                        index,
+                        commands.len(),
+                        subchannel,
+                        method,
+                        max_write as u32,
+                        self.dma_state.method_count,
+                        dma_segment,
+                        elapsed,
+                    );
+                    if trace_methods {
+                        record_dma_method_time(
+                            &mut method_times,
+                            subchannel,
+                            method,
+                            1,
+                            max_write as u64,
+                            elapsed,
+                        );
+                    }
                     self.dma_state.method_count -= max_write as u32;
                     self.dma_state.is_last_call = true;
                     index += max_write;
                     continue;
                 } else {
                     self.dma_state.is_last_call = self.dma_state.method_count <= 1;
-                    self.dispatch_method(command_header.argument());
+                    let method = self.dma_state.method;
+                    let subchannel = self.dma_state.subchannel;
+                    let dma_segment = self
+                        .dma_state
+                        .dma_get
+                        .wrapping_add(self.dma_state.dma_word_offset);
+                    trace_dma_pusher_method_inflight(
+                        10,
+                        total_dispatches,
+                        index,
+                        commands.len(),
+                        subchannel,
+                        method,
+                        command_header.argument(),
+                        self.dma_state.method_count,
+                        dma_segment,
+                        0,
+                    );
+                    let elapsed = self.dispatch_method(command_header.argument());
+                    trace_dma_pusher_method_inflight(
+                        11,
+                        total_dispatches,
+                        index,
+                        commands.len(),
+                        subchannel,
+                        method,
+                        command_header.argument(),
+                        self.dma_state.method_count,
+                        dma_segment,
+                        elapsed,
+                    );
+                    if trace_methods {
+                        record_dma_method_time(
+                            &mut method_times,
+                            subchannel,
+                            method,
+                            1,
+                            1,
+                            elapsed,
+                        );
+                    }
                 }
 
                 if !self.dma_state.non_incrementing {
@@ -766,7 +1086,47 @@ impl DmaPusher {
                         self.dma_state.method = command_header.method();
                         self.dma_state.subchannel = command_header.subchannel();
                         self.dma_state.dma_word_offset = (-(self.dma_state.dma_get as i64)) as u64;
-                        self.dispatch_method(command_header.arg_count());
+                        let method = self.dma_state.method;
+                        let subchannel = self.dma_state.subchannel;
+                        let dma_segment = self
+                            .dma_state
+                            .dma_get
+                            .wrapping_add(self.dma_state.dma_word_offset);
+                        trace_dma_pusher_method_inflight(
+                            10,
+                            total_dispatches,
+                            index,
+                            commands.len(),
+                            subchannel,
+                            method,
+                            command_header.arg_count(),
+                            self.dma_state.method_count,
+                            dma_segment,
+                            0,
+                        );
+                        let elapsed = self.dispatch_method(command_header.arg_count());
+                        trace_dma_pusher_method_inflight(
+                            11,
+                            total_dispatches,
+                            index,
+                            commands.len(),
+                            subchannel,
+                            method,
+                            command_header.arg_count(),
+                            self.dma_state.method_count,
+                            dma_segment,
+                            elapsed,
+                        );
+                        if trace_methods {
+                            record_dma_method_time(
+                                &mut method_times,
+                                subchannel,
+                                method,
+                                1,
+                                1,
+                                elapsed,
+                            );
+                        }
                         self.dma_state.non_incrementing = true;
                         self.dma_increment_once = false;
                     }
@@ -786,6 +1146,21 @@ impl DmaPusher {
                 commands.len(),
                 total_dispatches
             );
+        }
+        if trace_methods {
+            method_times.sort_by(|lhs, rhs| rhs.4.cmp(&lhs.4));
+            for (subchannel, method, calls, words, elapsed) in method_times.into_iter().take(12) {
+                trace_dma_pusher_method_agg(
+                    commands.len(),
+                    total_dispatches,
+                    subchannel,
+                    method,
+                    calls,
+                    words,
+                    elapsed,
+                    self.dma_state.dma_get,
+                );
+            }
         }
     }
 
@@ -867,7 +1242,9 @@ impl DmaPusher {
 
     /// Dispatch a single method call to an engine. Matches upstream
     /// `DmaPusher::CallMethod`.
-    fn dispatch_method(&mut self, argument: u32) {
+    fn dispatch_method(&mut self, argument: u32) -> u64 {
+        let trace_start =
+            common::trace::is_enabled(common::trace::cat::DMA_PUSHER).then(Instant::now);
         if should_trace_puller() {
             eprintln!(
                 "[PULL] m=0x{:X} arg=0x{:08X} subch={} count={}",
@@ -904,7 +1281,7 @@ impl DmaPusher {
                 self.dma_state.subchannel,
                 self.dma_state.method_count,
             ));
-            return;
+            return elapsed_us_opt(trace_start);
         }
 
         let Some(subchannel) = self.subchannels[self.dma_state.subchannel as usize] else {
@@ -926,7 +1303,7 @@ impl DmaPusher {
                     self.dma_state.subchannel,
                 );
             }
-            return;
+            return elapsed_us_opt(trace_start);
         };
         let subchannel = unsafe { subchannel.as_mut() };
         if !subchannel.execution_mask()[self.dma_state.method as usize] {
@@ -949,7 +1326,7 @@ impl DmaPusher {
                 );
             }
             subchannel.push_method_sink(self.dma_state.method, argument);
-            return;
+            return elapsed_us_opt(trace_start);
         }
         let trace_idx = DISPATCH_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
         if trace_idx < 48 {
@@ -978,11 +1355,14 @@ impl DmaPusher {
                 .wrapping_add(self.dma_state.dma_word_offset),
         );
         subchannel.call_method(self.dma_state.method, argument, self.dma_state.is_last_call);
+        elapsed_us_opt(trace_start)
     }
 
     /// Dispatch a multi-method call to an engine. Matches upstream
     /// `DmaPusher::CallMultiMethod`.
-    fn dispatch_multi_method(&mut self, commands: &[CommandHeader]) {
+    fn dispatch_multi_method(&mut self, commands: &[CommandHeader]) -> u64 {
+        let trace_start =
+            common::trace::is_enabled(common::trace::cat::DMA_PUSHER).then(Instant::now);
         let args: Vec<u32> = commands.iter().map(|c| c.argument()).collect();
         if self.dma_state.method >= 0x45 && self.dma_state.method <= 0x48 {
             let preview: Vec<String> = args.iter().take(6).map(|v| format!("{:08X}", v)).collect();
@@ -1020,10 +1400,10 @@ impl DmaPusher {
                 args.len() as u32,
                 self.dma_state.method_count,
             );
-            return;
+            return elapsed_us_opt(trace_start);
         }
         let Some(subchannel) = self.subchannels[self.dma_state.subchannel as usize] else {
-            return;
+            return elapsed_us_opt(trace_start);
         };
         let subchannel = unsafe { subchannel.as_mut() };
         subchannel.consume_sink();
@@ -1038,6 +1418,7 @@ impl DmaPusher {
             args.len() as u32,
             self.dma_state.method_count,
         );
+        elapsed_us_opt(trace_start)
     }
 }
 

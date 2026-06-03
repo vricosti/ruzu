@@ -28,10 +28,10 @@ pub mod texture_pass;
 pub mod vendor_workaround_pass;
 pub mod verification_pass;
 
+use crate::host_translate_info::HostTranslateInfo;
 use crate::ir::program::Program;
 use crate::ir::program::SyntaxNode;
 use crate::ir::value::Value;
-use crate::host_translate_info::HostTranslateInfo;
 
 /// Run all optimization passes on the program in the correct order.
 pub fn optimize(program: &mut Program) {
@@ -349,10 +349,7 @@ mod tests {
     #[test]
     fn test_collect_info_marks_global_memory_and_int64() {
         let mut program = make_test_program();
-        program.blocks[0].append_inst(Inst::new(
-            Opcode::LoadGlobal32,
-            vec![Value::ImmU64(0x1000)],
-        ));
+        program.blocks[0].append_inst(Inst::new(Opcode::LoadGlobal32, vec![Value::ImmU64(0x1000)]));
         program.blocks[0].append_inst(Inst::new(
             Opcode::WriteGlobal32,
             vec![Value::ImmU64(0x1004), Value::ImmU32(7)],

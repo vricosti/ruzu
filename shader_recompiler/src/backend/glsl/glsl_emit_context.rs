@@ -381,7 +381,10 @@ impl<'a> EmitContext<'a> {
         if self.stage != Stage::TessellationControl {
             return;
         }
-        let loads_position = program.info.loads.any_component(Attribute::PositionX as usize);
+        let loads_position = program
+            .info
+            .loads
+            .any_component(Attribute::PositionX as usize);
         let loads_point_size = program.info.loads.get(Attribute::PointSize as usize);
         let loads_clip_distance = program.info.loads.clip_distances();
         if !(loads_position || loads_point_size || loads_clip_distance) {
@@ -548,7 +551,8 @@ impl<'a> EmitContext<'a> {
             "\n#define ftoi floatBitsToInt\n#define ftou floatBitsToUint\n#define itof intBitsToFloat\n#define utof uintBitsToFloat\n",
         );
         if program.info.uses_global_memory && self.profile.support_int64 {
-            self.header.push_str(&self.define_global_memory_functions(program));
+            self.header
+                .push_str(&self.define_global_memory_functions(program));
         }
     }
 
@@ -561,8 +565,8 @@ impl<'a> EmitContext<'a> {
         let mut load_func_128 = "uvec4 LoadGlobal128(uint64_t addr){".to_string();
 
         for (index, ssbo) in program.info.storage_buffers_descriptors.iter().enumerate() {
-            let used = index < u16::BITS as usize
-                && (program.info.nvn_buffer_used & (1u16 << index)) != 0;
+            let used =
+                index < u16::BITS as usize && (program.info.nvn_buffer_used & (1u16 << index)) != 0;
             if !used {
                 continue;
             }
@@ -613,13 +617,14 @@ impl<'a> EmitContext<'a> {
             let define_body = |func: &mut String, return_statement: &str| {
                 func.push_str(&addr_statement);
                 func.push_str(&comparison);
-                func.push_str(&return_statement.replace("{0}", &ssbo_name).replace("{1}", &ssbo_addr));
+                func.push_str(
+                    &return_statement
+                        .replace("{0}", &ssbo_name)
+                        .replace("{1}", &ssbo_addr),
+                );
             };
 
-            define_body(
-                &mut write_func,
-                "{0}[uint(addr-{1})>>2]=data;return;}",
-            );
+            define_body(&mut write_func, "{0}[uint(addr-{1})>>2]=data;return;}");
             define_body(
                 &mut write_func_64,
                 "{0}[uint(addr-{1})>>2]=data.x;{0}[uint(addr-{1}+4)>>2]=data.y;return;}",
@@ -670,8 +675,7 @@ impl<'a> EmitContext<'a> {
         ] {
             let tracker = self.var_alloc.get_use_tracker(var_type);
             let type_name = glsl_type_str(var_type);
-            let has_precise_bug =
-                self.stage == Stage::Fragment && self.profile.has_gl_precise_bug;
+            let has_precise_bug = self.stage == Stage::Fragment && self.profile.has_gl_precise_bug;
             let precise = if !has_precise_bug && is_precise_type(var_type) {
                 "precise "
             } else {
@@ -714,19 +718,16 @@ mod tests {
     #[test]
     fn vertex_stage_declares_out_per_vertex() {
         let mut program = ir::Program::new(Stage::VertexB);
-        program
-            .info
-            .stores
-            .set(Attribute::PointSize as usize, true);
+        program.info.stores.set(Attribute::PointSize as usize, true);
         let mut bindings = Bindings::default();
         let profile = Profile::default();
         let runtime_info = RuntimeInfo::default();
 
         let ctx = EmitContext::new(&program, &mut bindings, &profile, &runtime_info);
 
-        assert!(ctx.header.contains(
-            "out gl_PerVertex{vec4 gl_Position;float gl_PointSize;};"
-        ));
+        assert!(ctx
+            .header
+            .contains("out gl_PerVertex{vec4 gl_Position;float gl_PointSize;};"));
     }
 
     #[test]
@@ -787,20 +788,23 @@ mod tests {
     #[test]
     fn texture_definitions_preserve_multisample_flag_for_image_queries() {
         let mut program = ir::Program::new(Stage::Fragment);
-        program.info.texture_descriptors.push(crate::shader_info::TextureDescriptor {
-            texture_type: TextureType::Color2D,
-            is_depth: false,
-            is_multisample: true,
-            has_secondary: false,
-            cbuf_index: 2,
-            cbuf_offset: 0x40,
-            shift_left: 0,
-            secondary_cbuf_index: 0,
-            secondary_cbuf_offset: 0,
-            secondary_shift_left: 0,
-            count: 1,
-            size_shift: 3,
-        });
+        program
+            .info
+            .texture_descriptors
+            .push(crate::shader_info::TextureDescriptor {
+                texture_type: TextureType::Color2D,
+                is_depth: false,
+                is_multisample: true,
+                has_secondary: false,
+                cbuf_index: 2,
+                cbuf_offset: 0x40,
+                shift_left: 0,
+                secondary_cbuf_index: 0,
+                secondary_cbuf_offset: 0,
+                secondary_shift_left: 0,
+                count: 1,
+                size_shift: 3,
+            });
         let mut bindings = Bindings::default();
         let profile = Profile::default();
         let runtime_info = RuntimeInfo::default();
@@ -822,15 +826,14 @@ mod tests {
             .info
             .constant_buffer_descriptors
             .push(crate::shader_info::ConstantBufferDescriptor { index: 2, count: 1 });
-        program
-            .info
-            .storage_buffers_descriptors
-            .push(crate::shader_info::StorageBufferDescriptor {
+        program.info.storage_buffers_descriptors.push(
+            crate::shader_info::StorageBufferDescriptor {
                 cbuf_index: 2,
                 cbuf_offset: 0x20,
                 count: 1,
                 is_written: true,
-            });
+            },
+        );
         let mut bindings = Bindings::default();
         let mut profile = Profile::default();
         profile.support_int64 = true;

@@ -235,20 +235,23 @@ impl Host1x {
                         fd,
                         syncpt,
                         Arc::clone(&self.frame_queue),
+                        Arc::clone(&self.memory_manager),
                     )),
                 )
             }
-            ChannelType::Vic => {
-                (
-                    ChClassId::GraphicsVic,
-                    Box::new(crate::host1x::vic::Vic::new(
-                        fd,
-                        syncpt,
-                        Arc::clone(&self.frame_queue),
-                    )),
-                )
-            }
-            ChannelType::NvJpg => (ChClassId::NvJpg, Box::new(crate::cdma_pusher::NullProcessor)),
+            ChannelType::Vic => (
+                ChClassId::GraphicsVic,
+                Box::new(crate::host1x::vic::Vic::new(
+                    fd,
+                    syncpt,
+                    Arc::clone(&self.frame_queue),
+                    Arc::clone(&self.memory_manager),
+                )),
+            ),
+            ChannelType::NvJpg => (
+                ChClassId::NvJpg,
+                Box::new(crate::cdma_pusher::NullProcessor),
+            ),
             _ => {
                 error!(
                     "Unimplemented host1x device {:?} ({})",

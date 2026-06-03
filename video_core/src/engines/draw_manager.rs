@@ -492,6 +492,9 @@ pub trait Maxwell3DAccess {
     /// Read render target control info.
     fn rt_control_info(&self) -> crate::engines::maxwell_3d::RtControlInfo;
 
+    /// Read depth/stencil render target info.
+    fn zeta_info(&self) -> crate::engines::maxwell_3d::ZetaInfo;
+
     /// Read texture header pool base address.
     fn tex_header_pool_address(&self) -> u64;
 
@@ -539,6 +542,7 @@ pub struct DrawState {
 pub struct Maxwell3DRenderTargets {
     pub rt_control: RtControlInfo,
     pub render_targets: [RenderTargetInfo; 8],
+    pub zeta: crate::engines::maxwell_3d::ZetaInfo,
 }
 
 #[derive(Debug, Clone)]
@@ -619,6 +623,7 @@ impl Maxwell3DDrawRegisters {
             render_targets: Maxwell3DRenderTargets {
                 rt_control: maxwell3d.rt_control_info(),
                 render_targets: std::array::from_fn(|i| maxwell3d.rt_info(i)),
+                zeta: maxwell3d.zeta_info(),
             },
             cb_bindings: std::array::from_fn(|stage| {
                 std::array::from_fn(|slot| maxwell3d.const_buffer_binding(stage, slot))
@@ -752,6 +757,7 @@ impl<'a> Maxwell3DDrawView<'a> {
             Maxwell3DDrawSource::Live(maxwell3d) => Maxwell3DRenderTargets {
                 rt_control: maxwell3d.rt_control_info(),
                 render_targets: std::array::from_fn(|i| maxwell3d.rt_info(i)),
+                zeta: maxwell3d.zeta_info(),
             },
             Maxwell3DDrawSource::Snapshot(registers) => registers.render_targets,
         }
@@ -1010,6 +1016,7 @@ impl<'a> Maxwell3DClearView<'a> {
             Maxwell3DClearSource::Live(maxwell3d) => Maxwell3DRenderTargets {
                 rt_control: maxwell3d.rt_control_info(),
                 render_targets: std::array::from_fn(|i| maxwell3d.rt_info(i)),
+                zeta: maxwell3d.zeta_info(),
             },
             Maxwell3DClearSource::Snapshot { render_targets, .. } => render_targets,
         }
@@ -1025,6 +1032,13 @@ impl<'a> Maxwell3DClearView<'a> {
     pub fn scissor(&self, index: u32) -> crate::engines::maxwell_3d::ScissorInfo {
         match self.source {
             Maxwell3DClearSource::Live(maxwell3d) => maxwell3d.scissor_info(index),
+            Maxwell3DClearSource::Snapshot { .. } => Default::default(),
+        }
+    }
+
+    pub fn depth_stencil(&self) -> crate::engines::maxwell_3d::DepthStencilInfo {
+        match self.source {
+            Maxwell3DClearSource::Live(maxwell3d) => maxwell3d.depth_stencil_info(),
             Maxwell3DClearSource::Snapshot { .. } => Default::default(),
         }
     }

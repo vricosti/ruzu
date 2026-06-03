@@ -62,6 +62,26 @@ fn trace_scheduler_lock_context(label: &str, current_id: u64, owner: u64, elapse
     );
 }
 
+fn trace_scheduler_lock_ring(stage: u64, owner_sched_id: u64, cores: u64, lock_count: i32) {
+    if std::env::var_os("RUZU_TRACE_SCHED_LOCK_RING").is_none() {
+        return;
+    }
+    if !common::trace::is_enabled(common::trace::cat::SCHED_STATE) {
+        return;
+    }
+    let guest_tid = super::kernel::get_current_thread_id_fast().unwrap_or(u64::MAX);
+    common::trace::emit_raw(
+        common::trace::cat::SCHED_STATE,
+        &[
+            stage,
+            owner_sched_id,
+            guest_tid,
+            cores,
+            lock_count as u32 as u64,
+        ],
+    );
+}
+
 /// Counter for synthetic host-thread IDs. Reserved range: `>= 2^63` so it
 /// never collides with guest KThread IDs (those are allocated starting at
 /// small positive values by the kernel thread-id allocator).
@@ -343,13 +363,14 @@ impl KAbstractSchedulerLock {
             std::sync::atomic::fence(Ordering::SeqCst);
 
             let cores_needing_scheduling = (self.callbacks.update_highest_priority_threads)();
+            let previous_owner = current_sched_thread_id();
+            trace_scheduler_lock_ring(6, previous_owner, cores_needing_scheduling, new_count);
             log::trace!(
                 "KAbstractSchedulerLock::unlock zero-count cores_needing_scheduling=0x{:x}",
                 cores_needing_scheduling
             );
 
             self.m_owner_thread.store(0, Ordering::Relaxed);
-            let previous_owner = current_sched_thread_id();
             if should_trace_scheduler_lock_owner(previous_owner) {
                 trace_scheduler_lock_context(
                     "release-before-spin-unlock",
@@ -360,6 +381,7 @@ impl KAbstractSchedulerLock {
             }
             self.m_spin_lock.unlock();
             log::trace!("KAbstractSchedulerLock::unlock before enable_scheduling");
+            trace_scheduler_lock_ring(7, previous_owner, cores_needing_scheduling, new_count);
             (self.callbacks.enable_scheduling)(cores_needing_scheduling);
             log::trace!("KAbstractSchedulerLock::unlock after enable_scheduling");
         }

@@ -108,10 +108,8 @@ mod tests {
     fn identity_removal_rewrites_syntax_conditions_before_erasing() {
         let mut program = Program::new(ShaderStage::VertexB);
         program.blocks.push(Block::new());
-        let source = program.blocks[0].append_inst(Inst::new(
-            Opcode::ConditionRef,
-            vec![Value::ImmU1(true)],
-        ));
+        let source = program.blocks[0]
+            .append_inst(Inst::new(Opcode::ConditionRef, vec![Value::ImmU1(true)]));
         let identity = program.blocks[0].append_inst(Inst::new(
             Opcode::Identity,
             vec![Value::Inst(InstRef {

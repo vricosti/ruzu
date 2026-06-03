@@ -198,6 +198,21 @@ impl<'a> CommandGenerator<'a> {
     pub fn generate_voice_commands(&mut self) {
         self.voice_context.sort_info();
         let sorted_indices = self.voice_context.sorted_voice_indices().to_vec();
+        let trace_voice_ring = common::trace::is_enabled(common::trace::cat::AUDIO_VOICE);
+        let mut trace_in_use = 0u64;
+        let mut trace_skipped = 0u64;
+        if trace_voice_ring {
+            for &voice_index in &sorted_indices {
+                if let Some(voice) = self.voice_context.get_info(voice_index as u32) {
+                    if voice.in_use {
+                        trace_in_use += 1;
+                        if voice.should_skip() {
+                            trace_skipped += 1;
+                        }
+                    }
+                }
+            }
+        }
         if std::env::var_os("RUZU_TRACE_CMDGEN").is_some() {
             use std::sync::atomic::{AtomicU64, Ordering};
             static COUNT: AtomicU64 = AtomicU64::new(0);
@@ -223,7 +238,24 @@ impl<'a> CommandGenerator<'a> {
             }
         }
 
+        let mut trace_processed_voices = 0u64;
+        let mut trace_processed_channels = 0u64;
+        let mut trace_data_pushed = 0u64;
+        let mut trace_data_skip_was_playing = 0u64;
+        let mut trace_no_state = 0u64;
+        let mut trace_no_command = 0u64;
+        let mut trace_connected_channels = 0u64;
+        let mut trace_valid_wavebuffers = 0u64;
+        let mut trace_nonzero_wavebuffer_addr = 0u64;
+
         for voice_index in sorted_indices {
+            if self
+                .voice_context
+                .get_info(voice_index as u32)
+                .is_none_or(|voice| voice.should_skip())
+            {
+                continue;
+            }
             let Some(mut voice) = self
                 .voice_context
                 .update_info_for_command_generation(voice_index)
@@ -231,9 +263,10 @@ impl<'a> CommandGenerator<'a> {
                 continue;
             };
 
-            if !voice.in_use || voice.should_skip() {
+            if !voice.in_use {
                 continue;
             }
+            trace_processed_voices += u64::from(trace_voice_ring);
 
             let node_id = voice.node_id;
             let entry_aspect =
@@ -248,6 +281,20 @@ impl<'a> CommandGenerator<'a> {
                 | SampleFormat::PcmInt32 => PerformanceDetailType::Invalid,
             };
             for channel in 0..voice.channel_count.max(0) as usize {
+                trace_processed_channels += u64::from(trace_voice_ring);
+                if trace_voice_ring {
+                    if voice.has_any_connection() {
+                        trace_connected_channels += 1;
+                    }
+                    for wavebuffer in &voice.wavebuffers {
+                        if wavebuffer.sent_to_dsp {
+                            trace_valid_wavebuffers += 1;
+                        }
+                        if wavebuffer.buffer_address.get_cpu_addr() != 0 {
+                            trace_nonzero_wavebuffer_addr += 1;
+                        }
+                    }
+                }
                 let Some(resource_id) = voice.channel_resource_ids.get(channel).copied() else {
                     continue;
                 };
@@ -267,6 +314,7 @@ impl<'a> CommandGenerator<'a> {
                     data_detail_type,
                 );
                 let Some(voice_state) = voice_state else {
+                    trace_no_state += u64::from(trace_voice_ring);
                     if let Some(addresses) = data_detail {
                         self.end_performance(node_id as i32, addresses);
                     }
@@ -294,6 +342,7 @@ impl<'a> CommandGenerator<'a> {
                     );
                 }
                 if voice.was_playing {
+                    trace_data_skip_was_playing += u64::from(trace_voice_ring);
                     if std::env::var_os("RUZU_TRACE_CMDGEN").is_some() {
                         use std::sync::atomic::{AtomicU64, Ordering};
                         static SKIP: AtomicU64 = AtomicU64::new(0);
@@ -322,6 +371,7 @@ impl<'a> CommandGenerator<'a> {
                         channel as i8,
                         self.mix_buffer_count,
                     ) else {
+                        trace_no_command += u64::from(trace_voice_ring);
                         if std::env::var_os("RUZU_TRACE_CMDGEN").is_some() {
                             log::warn!(
                                 "build_data_source: NO data_command for voice node_id={} channel={} sample_format={:?}",
@@ -334,6 +384,7 @@ impl<'a> CommandGenerator<'a> {
                         continue;
                     };
                     let _ = self.command_buffer.push(data_command, node_id);
+                    trace_data_pushed += u64::from(trace_voice_ring);
                     if std::env::var_os("RUZU_TRACE_CMDGEN").is_some() {
                         use std::sync::atomic::{AtomicU64, Ordering};
                         static PUSHED: AtomicU64 = AtomicU64::new(0);
@@ -483,6 +534,30 @@ impl<'a> CommandGenerator<'a> {
             if let Some(addresses) = entry_aspect {
                 self.end_performance(node_id as i32, addresses);
             }
+        }
+        if trace_voice_ring {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static AUDIO_VOICE_SEQ: AtomicU64 = AtomicU64::new(0);
+            let seq = AUDIO_VOICE_SEQ.fetch_add(1, Ordering::Relaxed) + 1;
+            common::trace::emit_raw(
+                common::trace::cat::AUDIO_VOICE,
+                &[
+                    seq,
+                    self.voice_context.get_count() as u64,
+                    trace_in_use,
+                    trace_skipped,
+                    self.voice_context.get_active_count() as u64,
+                    trace_processed_voices,
+                    trace_processed_channels,
+                    trace_data_pushed,
+                    trace_data_skip_was_playing,
+                    trace_no_state,
+                    trace_no_command,
+                    trace_connected_channels,
+                    trace_valid_wavebuffers,
+                    trace_nonzero_wavebuffer_addr,
+                ],
+            );
         }
     }
 

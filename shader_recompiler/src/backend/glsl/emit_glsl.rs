@@ -476,13 +476,23 @@ fn emit_inst(ctx: &mut EmitContext, program: &mut ir::Program, inst_ref: InstRef
         // EmitCompositeConstructF16/F64 / EmitCompositeExtractF16/F64)
         // F16 is packed via F16x2 storage in GLSL.
         Opcode::CompositeConstructF16x2 => emit_composite_construct(
-            ctx, program, inst_ref, &inst_snapshot, GlslVarType::F16x2, "f16vec2", 2,
+            ctx,
+            program,
+            inst_ref,
+            &inst_snapshot,
+            GlslVarType::F16x2,
+            "f16vec2",
+            2,
         ),
         Opcode::CompositeConstructF16x3 => {
-            panic!("CompositeConstructF16x3 not implemented in GLSL backend (upstream NotImplemented)");
+            panic!(
+                "CompositeConstructF16x3 not implemented in GLSL backend (upstream NotImplemented)"
+            );
         }
         Opcode::CompositeConstructF16x4 => {
-            panic!("CompositeConstructF16x4 not implemented in GLSL backend (upstream NotImplemented)");
+            panic!(
+                "CompositeConstructF16x4 not implemented in GLSL backend (upstream NotImplemented)"
+            );
         }
         Opcode::CompositeExtractF16x2 => {
             emit_composite_extract(ctx, program, inst_ref, &inst_snapshot, GlslVarType::F16x2)
@@ -506,13 +516,23 @@ fn emit_inst(ctx: &mut EmitContext, program: &mut ir::Program, inst_ref: InstRef
             emit_composite_insert(ctx, program, inst_ref, &inst_snapshot)
         }
         Opcode::CompositeConstructF64x2 => emit_composite_construct(
-            ctx, program, inst_ref, &inst_snapshot, GlslVarType::F64, "dvec2", 2,
+            ctx,
+            program,
+            inst_ref,
+            &inst_snapshot,
+            GlslVarType::F64,
+            "dvec2",
+            2,
         ),
         Opcode::CompositeConstructF64x3 => {
-            panic!("CompositeConstructF64x3 not implemented in GLSL backend (upstream NotImplemented)");
+            panic!(
+                "CompositeConstructF64x3 not implemented in GLSL backend (upstream NotImplemented)"
+            );
         }
         Opcode::CompositeConstructF64x4 => {
-            panic!("CompositeConstructF64x4 not implemented in GLSL backend (upstream NotImplemented)");
+            panic!(
+                "CompositeConstructF64x4 not implemented in GLSL backend (upstream NotImplemented)"
+            );
         }
         Opcode::CompositeExtractF64x2
         | Opcode::CompositeExtractF64x3
@@ -709,9 +729,7 @@ fn emit_inst(ctx: &mut EmitContext, program: &mut ir::Program, inst_ref: InstRef
             inst_ref,
             &inst_snapshot,
             GlslVarType::F64,
-            |v, lo, hi| {
-                format!("min(max({},double({})),double({}))", v, lo, hi)
-            },
+            |v, lo, hi| format!("min(max({},double({})),double({}))", v, lo, hi),
         ),
         Opcode::FPRoundEven64 => emit_unary_call(
             ctx,
@@ -1254,22 +1272,34 @@ fn emit_inst(ctx: &mut EmitContext, program: &mut ir::Program, inst_ref: InstRef
         // `EmitImage*` (backend/glsl/emit_glsl_image.cpp).
         Opcode::ImageSampleImplicitLod => {
             emit_glsl_image::emit_image_sample_implicit_lod_inst(
-                ctx, program, inst_ref, &inst_snapshot,
+                ctx,
+                program,
+                inst_ref,
+                &inst_snapshot,
             );
         }
         Opcode::ImageSampleExplicitLod => {
             emit_glsl_image::emit_image_sample_explicit_lod_inst(
-                ctx, program, inst_ref, &inst_snapshot,
+                ctx,
+                program,
+                inst_ref,
+                &inst_snapshot,
             );
         }
         Opcode::ImageSampleDrefImplicitLod => {
             emit_glsl_image::emit_image_sample_dref_implicit_lod_inst(
-                ctx, program, inst_ref, &inst_snapshot,
+                ctx,
+                program,
+                inst_ref,
+                &inst_snapshot,
             );
         }
         Opcode::ImageSampleDrefExplicitLod => {
             emit_glsl_image::emit_image_sample_dref_explicit_lod_inst(
-                ctx, program, inst_ref, &inst_snapshot,
+                ctx,
+                program,
+                inst_ref,
+                &inst_snapshot,
             );
         }
         Opcode::ImageGather => {
@@ -1283,7 +1313,10 @@ fn emit_inst(ctx: &mut EmitContext, program: &mut ir::Program, inst_ref: InstRef
         }
         Opcode::ImageQueryDimensions => {
             emit_glsl_image::emit_image_query_dimensions_inst(
-                ctx, program, inst_ref, &inst_snapshot,
+                ctx,
+                program,
+                inst_ref,
+                &inst_snapshot,
             );
         }
         Opcode::ImageQueryLod => {
@@ -1299,58 +1332,41 @@ fn emit_inst(ctx: &mut EmitContext, program: &mut ir::Program, inst_ref: InstRef
             emit_glsl_image::emit_image_write_inst(ctx, program, inst_ref, &inst_snapshot);
         }
         Opcode::ImageAtomicIAdd32 => {
-            emit_glsl_image::emit_image_atomic_iadd32_inst(
-                ctx, program, inst_ref, &inst_snapshot,
-            );
+            emit_glsl_image::emit_image_atomic_iadd32_inst(ctx, program, inst_ref, &inst_snapshot);
         }
         Opcode::ImageAtomicSMin32 => {
-            emit_glsl_image::emit_image_atomic_smin32_inst(
-                ctx, program, inst_ref, &inst_snapshot,
-            );
+            emit_glsl_image::emit_image_atomic_smin32_inst(ctx, program, inst_ref, &inst_snapshot);
         }
         Opcode::ImageAtomicUMin32 => {
-            emit_glsl_image::emit_image_atomic_umin32_inst(
-                ctx, program, inst_ref, &inst_snapshot,
-            );
+            emit_glsl_image::emit_image_atomic_umin32_inst(ctx, program, inst_ref, &inst_snapshot);
         }
         Opcode::ImageAtomicSMax32 => {
-            emit_glsl_image::emit_image_atomic_smax32_inst(
-                ctx, program, inst_ref, &inst_snapshot,
-            );
+            emit_glsl_image::emit_image_atomic_smax32_inst(ctx, program, inst_ref, &inst_snapshot);
         }
         Opcode::ImageAtomicUMax32 => {
-            emit_glsl_image::emit_image_atomic_umax32_inst(
-                ctx, program, inst_ref, &inst_snapshot,
-            );
+            emit_glsl_image::emit_image_atomic_umax32_inst(ctx, program, inst_ref, &inst_snapshot);
         }
         Opcode::ImageAtomicInc32 => {
-            emit_glsl_image::emit_image_atomic_inc32_inst(
-                ctx, program, inst_ref, &inst_snapshot,
-            );
+            emit_glsl_image::emit_image_atomic_inc32_inst(ctx, program, inst_ref, &inst_snapshot);
         }
         Opcode::ImageAtomicDec32 => {
-            emit_glsl_image::emit_image_atomic_dec32_inst(
-                ctx, program, inst_ref, &inst_snapshot,
-            );
+            emit_glsl_image::emit_image_atomic_dec32_inst(ctx, program, inst_ref, &inst_snapshot);
         }
         Opcode::ImageAtomicAnd32 => {
-            emit_glsl_image::emit_image_atomic_and32_inst(
-                ctx, program, inst_ref, &inst_snapshot,
-            );
+            emit_glsl_image::emit_image_atomic_and32_inst(ctx, program, inst_ref, &inst_snapshot);
         }
         Opcode::ImageAtomicOr32 => {
-            emit_glsl_image::emit_image_atomic_or32_inst(
-                ctx, program, inst_ref, &inst_snapshot,
-            );
+            emit_glsl_image::emit_image_atomic_or32_inst(ctx, program, inst_ref, &inst_snapshot);
         }
         Opcode::ImageAtomicXor32 => {
-            emit_glsl_image::emit_image_atomic_xor32_inst(
-                ctx, program, inst_ref, &inst_snapshot,
-            );
+            emit_glsl_image::emit_image_atomic_xor32_inst(ctx, program, inst_ref, &inst_snapshot);
         }
         Opcode::ImageAtomicExchange32 => {
             emit_glsl_image::emit_image_atomic_exchange32_inst(
-                ctx, program, inst_ref, &inst_snapshot,
+                ctx,
+                program,
+                inst_ref,
+                &inst_snapshot,
             );
         }
 
@@ -1479,7 +1495,10 @@ fn emit_inst(ctx: &mut EmitContext, program: &mut ir::Program, inst_ref: InstRef
             |v| format!("float({})", v),
         ),
         // ── F64 from integer ──────────────────────────────────────────
-        Opcode::ConvertF64S8 | Opcode::ConvertF64U8 | Opcode::ConvertF64S16 | Opcode::ConvertF64U16 => {
+        Opcode::ConvertF64S8
+        | Opcode::ConvertF64U8
+        | Opcode::ConvertF64S16
+        | Opcode::ConvertF64U16 => {
             panic!(
                 "{:?} not implemented in GLSL backend (upstream NotImplemented)",
                 inst_snapshot.opcode
@@ -1696,32 +1715,57 @@ fn emit_inst(ctx: &mut EmitContext, program: &mut ir::Program, inst_ref: InstRef
         // per buffer/source; the GLSL functions used are the same
         // (`atomicAdd`, `atomicMin`, etc.) so we factor through a
         // shared helper.
-        Opcode::SharedAtomicIAdd32 => emit_shared_atomic_binop(
-            ctx, program, inst_ref, &inst_snapshot, "atomicAdd", None,
-        ),
+        Opcode::SharedAtomicIAdd32 => {
+            emit_shared_atomic_binop(ctx, program, inst_ref, &inst_snapshot, "atomicAdd", None)
+        }
         Opcode::SharedAtomicSMin32 => emit_shared_atomic_binop(
-            ctx, program, inst_ref, &inst_snapshot, "atomicMin", Some("int"),
+            ctx,
+            program,
+            inst_ref,
+            &inst_snapshot,
+            "atomicMin",
+            Some("int"),
         ),
         Opcode::SharedAtomicUMin32 => emit_shared_atomic_binop(
-            ctx, program, inst_ref, &inst_snapshot, "atomicMin", Some("uint"),
+            ctx,
+            program,
+            inst_ref,
+            &inst_snapshot,
+            "atomicMin",
+            Some("uint"),
         ),
         Opcode::SharedAtomicSMax32 => emit_shared_atomic_binop(
-            ctx, program, inst_ref, &inst_snapshot, "atomicMax", Some("int"),
+            ctx,
+            program,
+            inst_ref,
+            &inst_snapshot,
+            "atomicMax",
+            Some("int"),
         ),
         Opcode::SharedAtomicUMax32 => emit_shared_atomic_binop(
-            ctx, program, inst_ref, &inst_snapshot, "atomicMax", Some("uint"),
+            ctx,
+            program,
+            inst_ref,
+            &inst_snapshot,
+            "atomicMax",
+            Some("uint"),
         ),
-        Opcode::SharedAtomicAnd32 => emit_shared_atomic_binop(
-            ctx, program, inst_ref, &inst_snapshot, "atomicAnd", None,
-        ),
-        Opcode::SharedAtomicOr32 => emit_shared_atomic_binop(
-            ctx, program, inst_ref, &inst_snapshot, "atomicOr", None,
-        ),
-        Opcode::SharedAtomicXor32 => emit_shared_atomic_binop(
-            ctx, program, inst_ref, &inst_snapshot, "atomicXor", None,
-        ),
+        Opcode::SharedAtomicAnd32 => {
+            emit_shared_atomic_binop(ctx, program, inst_ref, &inst_snapshot, "atomicAnd", None)
+        }
+        Opcode::SharedAtomicOr32 => {
+            emit_shared_atomic_binop(ctx, program, inst_ref, &inst_snapshot, "atomicOr", None)
+        }
+        Opcode::SharedAtomicXor32 => {
+            emit_shared_atomic_binop(ctx, program, inst_ref, &inst_snapshot, "atomicXor", None)
+        }
         Opcode::SharedAtomicExchange32 => emit_shared_atomic_binop(
-            ctx, program, inst_ref, &inst_snapshot, "atomicExchange", None,
+            ctx,
+            program,
+            inst_ref,
+            &inst_snapshot,
+            "atomicExchange",
+            None,
         ),
         // ── Global atomics — upstream throws NotImplemented for all ───
         // (see upstream `EmitGlobalAtomic*` — all `throw NotImplementedException`).
@@ -1767,7 +1811,12 @@ fn emit_inst(ctx: &mut EmitContext, program: &mut ir::Program, inst_ref: InstRef
         }
         Opcode::StorageAtomicExchange32 => {
             emit_storage_atomic_native(
-                ctx, program, inst_ref, &inst_snapshot, "atomicExchange", None,
+                ctx,
+                program,
+                inst_ref,
+                &inst_snapshot,
+                "atomicExchange",
+                None,
             );
         }
         Opcode::StorageAtomicSMin32 | Opcode::StorageAtomicSMax32 => {
@@ -1814,15 +1863,22 @@ fn emit_inst(ctx: &mut EmitContext, program: &mut ir::Program, inst_ref: InstRef
         // (emit_glsl_memory.cpp). Format: `{stage}_ssbo{binding}[offset>>2]`.
         Opcode::LoadStorageU8 => emit_load_storage_8(ctx, program, inst_ref, &inst_snapshot, false),
         Opcode::LoadStorageS8 => emit_load_storage_8(ctx, program, inst_ref, &inst_snapshot, true),
-        Opcode::LoadStorageU16 => emit_load_storage_16(ctx, program, inst_ref, &inst_snapshot, false),
-        Opcode::LoadStorageS16 => emit_load_storage_16(ctx, program, inst_ref, &inst_snapshot, true),
+        Opcode::LoadStorageU16 => {
+            emit_load_storage_16(ctx, program, inst_ref, &inst_snapshot, false)
+        }
+        Opcode::LoadStorageS16 => {
+            emit_load_storage_16(ctx, program, inst_ref, &inst_snapshot, true)
+        }
         Opcode::LoadStorage32 => emit_load_storage_32(ctx, program, inst_ref, &inst_snapshot),
         Opcode::LoadStorage64 => emit_load_storage_64(ctx, program, inst_ref, &inst_snapshot),
         Opcode::LoadStorage128 => emit_load_storage_128(ctx, program, inst_ref, &inst_snapshot),
         Opcode::WriteStorage32 => emit_write_storage_32(ctx, program, &inst_snapshot),
         Opcode::WriteStorage64 => emit_write_storage_64(ctx, program, &inst_snapshot),
         Opcode::WriteStorage128 => emit_write_storage_128(ctx, program, &inst_snapshot),
-        Opcode::WriteStorageS8 | Opcode::WriteStorageU8 | Opcode::WriteStorageS16 | Opcode::WriteStorageU16 => {
+        Opcode::WriteStorageS8
+        | Opcode::WriteStorageU8
+        | Opcode::WriteStorageS16
+        | Opcode::WriteStorageU16 => {
             // Upstream `EmitWriteStorageU8/S8/U16/S16` are NotImplemented.
             panic!(
                 "Storage write op {:?} not implemented (upstream NotImplemented)",
@@ -1833,7 +1889,8 @@ fn emit_inst(ctx: &mut EmitContext, program: &mut ir::Program, inst_ref: InstRef
         // ── Global memory load/store ─────────────────────────────────
         // Port of upstream `EmitLoadGlobal32/64/128` and `EmitWriteGlobal*`.
         Opcode::LoadGlobal32 => {
-            let address = global_address_expr(ctx.var_alloc.consume(program, &inst_snapshot.args[0]));
+            let address =
+                global_address_expr(ctx.var_alloc.consume(program, &inst_snapshot.args[0]));
             if ctx.profile.support_int64 {
                 add_assign(
                     ctx,
@@ -1848,7 +1905,8 @@ fn emit_inst(ctx: &mut EmitContext, program: &mut ir::Program, inst_ref: InstRef
             }
         }
         Opcode::LoadGlobal64 => {
-            let address = global_address_expr(ctx.var_alloc.consume(program, &inst_snapshot.args[0]));
+            let address =
+                global_address_expr(ctx.var_alloc.consume(program, &inst_snapshot.args[0]));
             if ctx.profile.support_int64 {
                 add_assign(
                     ctx,
@@ -1859,11 +1917,18 @@ fn emit_inst(ctx: &mut EmitContext, program: &mut ir::Program, inst_ref: InstRef
                 );
             } else {
                 log::warn!("Int64 not supported, ignoring memory operation");
-                add_assign(ctx, program, inst_ref, GlslVarType::U32x2, "uvec2(0)".to_string());
+                add_assign(
+                    ctx,
+                    program,
+                    inst_ref,
+                    GlslVarType::U32x2,
+                    "uvec2(0)".to_string(),
+                );
             }
         }
         Opcode::LoadGlobal128 => {
-            let address = global_address_expr(ctx.var_alloc.consume(program, &inst_snapshot.args[0]));
+            let address =
+                global_address_expr(ctx.var_alloc.consume(program, &inst_snapshot.args[0]));
             if ctx.profile.support_int64 {
                 add_assign(
                     ctx,
@@ -1874,7 +1939,13 @@ fn emit_inst(ctx: &mut EmitContext, program: &mut ir::Program, inst_ref: InstRef
                 );
             } else {
                 log::warn!("Int64 not supported, ignoring memory operation");
-                add_assign(ctx, program, inst_ref, GlslVarType::U32x4, "uvec4(0)".to_string());
+                add_assign(
+                    ctx,
+                    program,
+                    inst_ref,
+                    GlslVarType::U32x4,
+                    "uvec4(0)".to_string(),
+                );
             }
         }
         Opcode::WriteGlobal32 => {
@@ -1947,48 +2018,87 @@ fn emit_inst(ctx: &mut EmitContext, program: &mut ir::Program, inst_ref: InstRef
         Opcode::LaneId => {
             // Port of upstream `IREmitter::LaneId()` (emit_glsl_warp.cpp).
             add_assign(
-                ctx, program, inst_ref, GlslVarType::U32,
+                ctx,
+                program,
+                inst_ref,
+                GlslVarType::U32,
                 "gl_SubGroupInvocationARB".to_string(),
             );
         }
         Opcode::SubgroupEqMask => emit_unary_expr(
-            ctx, program, inst_ref, &inst_snapshot, GlslVarType::U32x4,
+            ctx,
+            program,
+            inst_ref,
+            &inst_snapshot,
+            GlslVarType::U32x4,
             |_| "uvec4(gl_SubGroupEqMaskARB)".to_string(),
         ),
         Opcode::SubgroupLtMask => emit_unary_expr(
-            ctx, program, inst_ref, &inst_snapshot, GlslVarType::U32x4,
+            ctx,
+            program,
+            inst_ref,
+            &inst_snapshot,
+            GlslVarType::U32x4,
             |_| "uvec4(gl_SubGroupLtMaskARB)".to_string(),
         ),
         Opcode::SubgroupLeMask => emit_unary_expr(
-            ctx, program, inst_ref, &inst_snapshot, GlslVarType::U32x4,
+            ctx,
+            program,
+            inst_ref,
+            &inst_snapshot,
+            GlslVarType::U32x4,
             |_| "uvec4(gl_SubGroupLeMaskARB)".to_string(),
         ),
         Opcode::SubgroupGtMask => emit_unary_expr(
-            ctx, program, inst_ref, &inst_snapshot, GlslVarType::U32x4,
+            ctx,
+            program,
+            inst_ref,
+            &inst_snapshot,
+            GlslVarType::U32x4,
             |_| "uvec4(gl_SubGroupGtMaskARB)".to_string(),
         ),
         Opcode::SubgroupGeMask => emit_unary_expr(
-            ctx, program, inst_ref, &inst_snapshot, GlslVarType::U32x4,
+            ctx,
+            program,
+            inst_ref,
+            &inst_snapshot,
+            GlslVarType::U32x4,
             |_| "uvec4(gl_SubGroupGeMaskARB)".to_string(),
         ),
         // Port of upstream `EmitVoteAll/Any/Equal` (emit_glsl_warp.cpp).
         // Small-warp path (warp_size_potentially_larger_than_guest=false).
         // The big-warp path uses ballotARB+masking and isn't ported.
         Opcode::VoteAll => emit_unary_expr(
-            ctx, program, inst_ref, &inst_snapshot, GlslVarType::U1,
+            ctx,
+            program,
+            inst_ref,
+            &inst_snapshot,
+            GlslVarType::U1,
             |p| format!("allInvocationsEqualARB({})", p),
         ),
         Opcode::VoteAny => emit_unary_expr(
-            ctx, program, inst_ref, &inst_snapshot, GlslVarType::U1,
+            ctx,
+            program,
+            inst_ref,
+            &inst_snapshot,
+            GlslVarType::U1,
             |p| format!("anyInvocationARB({})", p),
         ),
         Opcode::VoteEqual => emit_unary_expr(
-            ctx, program, inst_ref, &inst_snapshot, GlslVarType::U1,
+            ctx,
+            program,
+            inst_ref,
+            &inst_snapshot,
+            GlslVarType::U1,
             |p| format!("allInvocationsEqualARB({})", p),
         ),
         // Port of upstream `EmitSubgroupBallot`.
         Opcode::SubgroupBallot => emit_unary_expr(
-            ctx, program, inst_ref, &inst_snapshot, GlslVarType::U32,
+            ctx,
+            program,
+            inst_ref,
+            &inst_snapshot,
+            GlslVarType::U32,
             |p| format!("uvec2(ballotARB({})).x", p),
         ),
         // Port of upstream `EmitShuffle{Index,Up,Down,Butterfly}` small-warp
@@ -2007,7 +2117,10 @@ fn emit_inst(ctx: &mut EmitContext, program: &mut ir::Program, inst_ref: InstRef
                 index, seg_mask, seg_mask
             );
             add_assign(
-                ctx, program, inst_ref, GlslVarType::U32,
+                ctx,
+                program,
+                inst_ref,
+                GlslVarType::U32,
                 format!("readInvocationARB({},{})", value, src_id),
             );
         }
@@ -2017,7 +2130,10 @@ fn emit_inst(ctx: &mut EmitContext, program: &mut ir::Program, inst_ref: InstRef
             let index = &args[1];
             let _seg_mask = &args[2];
             add_assign(
-                ctx, program, inst_ref, GlslVarType::U32,
+                ctx,
+                program,
+                inst_ref,
+                GlslVarType::U32,
                 format!(
                     "readInvocationARB({},uint(int(gl_SubGroupInvocationARB)-int({})))",
                     value, index
@@ -2030,7 +2146,10 @@ fn emit_inst(ctx: &mut EmitContext, program: &mut ir::Program, inst_ref: InstRef
             let index = &args[1];
             let _seg_mask = &args[2];
             add_assign(
-                ctx, program, inst_ref, GlslVarType::U32,
+                ctx,
+                program,
+                inst_ref,
+                GlslVarType::U32,
                 format!(
                     "readInvocationARB({},uint(gl_SubGroupInvocationARB+{}))",
                     value, index
@@ -2043,7 +2162,10 @@ fn emit_inst(ctx: &mut EmitContext, program: &mut ir::Program, inst_ref: InstRef
             let index = &args[1];
             let _seg_mask = &args[2];
             add_assign(
-                ctx, program, inst_ref, GlslVarType::U32,
+                ctx,
+                program,
+                inst_ref,
+                GlslVarType::U32,
                 format!(
                     "readInvocationARB({},uint(gl_SubGroupInvocationARB^{}))",
                     value, index
@@ -2053,27 +2175,51 @@ fn emit_inst(ctx: &mut EmitContext, program: &mut ir::Program, inst_ref: InstRef
 
         // ── Special variables (port of upstream EmitContext getters) ──
         Opcode::SampleId => {
-            add_assign(ctx, program, inst_ref, GlslVarType::U32, "uint(gl_SampleID)".to_string());
+            add_assign(
+                ctx,
+                program,
+                inst_ref,
+                GlslVarType::U32,
+                "uint(gl_SampleID)".to_string(),
+            );
         }
         Opcode::InvocationId => {
-            add_assign(ctx, program, inst_ref, GlslVarType::U32, "uint(gl_InvocationID)".to_string());
+            add_assign(
+                ctx,
+                program,
+                inst_ref,
+                GlslVarType::U32,
+                "uint(gl_InvocationID)".to_string(),
+            );
         }
         Opcode::InvocationInfo => {
             // Vertex info bits (per upstream emit_glsl_context_get_set.cpp).
             add_assign(ctx, program, inst_ref, GlslVarType::U32, "0u".to_string());
         }
         Opcode::IsHelperInvocation => {
-            add_assign(ctx, program, inst_ref, GlslVarType::U1, "gl_HelperInvocation".to_string());
+            add_assign(
+                ctx,
+                program,
+                inst_ref,
+                GlslVarType::U1,
+                "gl_HelperInvocation".to_string(),
+            );
         }
         Opcode::LocalInvocationId => {
             add_assign(
-                ctx, program, inst_ref, GlslVarType::U32x4,
+                ctx,
+                program,
+                inst_ref,
+                GlslVarType::U32x4,
                 "uvec4(gl_LocalInvocationID,0)".to_string(),
             );
         }
         Opcode::WorkgroupId => {
             add_assign(
-                ctx, program, inst_ref, GlslVarType::U32x4,
+                ctx,
+                program,
+                inst_ref,
+                GlslVarType::U32x4,
                 "uvec4(gl_WorkGroupID,0)".to_string(),
             );
         }
@@ -2089,7 +2235,13 @@ fn emit_inst(ctx: &mut EmitContext, program: &mut ir::Program, inst_ref: InstRef
         }
         Opcode::RenderArea => {
             // Upstream: gl_FragCoord-style render-area uniform.
-            add_assign(ctx, program, inst_ref, GlslVarType::F32x4, "vec4(0.0)".to_string());
+            add_assign(
+                ctx,
+                program,
+                inst_ref,
+                GlslVarType::F32x4,
+                "vec4(0.0)".to_string(),
+            );
         }
         Opcode::ResolutionDownFactor => {
             add_assign(ctx, program, inst_ref, GlslVarType::F32, "1.0".to_string());
@@ -2103,7 +2255,12 @@ fn emit_inst(ctx: &mut EmitContext, program: &mut ir::Program, inst_ref: InstRef
             ctx.add_fmt(format!("gl_SampleMask[0]=int({});", value));
         }
         Opcode::FSwizzleAdd => emit_ternary_call(
-            ctx, program, inst_ref, &inst_snapshot, GlslVarType::F32, "FSwizzleAdd",
+            ctx,
+            program,
+            inst_ref,
+            &inst_snapshot,
+            GlslVarType::F32,
+            "FSwizzleAdd",
         ),
 
         // ── Control-flow markers (handled by structurer) ──────────────
@@ -2173,9 +2330,7 @@ fn emit_inst(ctx: &mut EmitContext, program: &mut ir::Program, inst_ref: InstRef
         }
 
         // ── Misc ──────────────────────────────────────────────────────
-        Opcode::UndefU64 => {
-            add_assign(ctx, program, inst_ref, GlslVarType::U64, "0ul".to_string())
-        }
+        Opcode::UndefU64 => add_assign(ctx, program, inst_ref, GlslVarType::U64, "0ul".to_string()),
 
         // ── Reference / sparse / zero pseudo-ops (no output) ───────────
         Opcode::GetSparseFromOp
@@ -2395,18 +2550,28 @@ mod tests {
         let src1 = program
             .block_mut(0)
             .append_inst(Inst::new(Opcode::UndefU32, Vec::new()));
-        let phi0 = program.block_mut(1).append_new_inst(Opcode::Phi, Vec::new());
-        let phi1 = program.block_mut(1).append_new_inst(Opcode::Phi, Vec::new());
+        let phi0 = program
+            .block_mut(1)
+            .append_new_inst(Opcode::Phi, Vec::new());
+        let phi1 = program
+            .block_mut(1)
+            .append_new_inst(Opcode::Phi, Vec::new());
         program.block_mut(1).inst_mut(phi0).flags = Type::U32 as u32;
         program.block_mut(1).inst_mut(phi1).flags = Type::U32 as u32;
-        program
-            .block_mut(1)
-            .inst_mut(phi0)
-            .add_phi_operand(0, Value::Inst(InstRef { block: 0, inst: src0 }));
-        program
-            .block_mut(1)
-            .inst_mut(phi1)
-            .add_phi_operand(0, Value::Inst(InstRef { block: 0, inst: src1 }));
+        program.block_mut(1).inst_mut(phi0).add_phi_operand(
+            0,
+            Value::Inst(InstRef {
+                block: 0,
+                inst: src0,
+            }),
+        );
+        program.block_mut(1).inst_mut(phi1).add_phi_operand(
+            0,
+            Value::Inst(InstRef {
+                block: 0,
+                inst: src1,
+            }),
+        );
 
         precolor(&mut program);
         recompute_emit_use_counts(&mut program);
@@ -2732,16 +2897,13 @@ fn emit_composite_insert(
     };
     // Single fused emission: define dst, copy composite into it, then
     // overwrite one component. Matches upstream's multi-statement chain.
-    let dst = ctx
-        .var_alloc
-        .define(program.block_mut(inst_ref.block).inst_mut(inst_ref.inst), ty);
+    let dst = ctx.var_alloc.define(
+        program.block_mut(inst_ref.block).inst_mut(inst_ref.inst),
+        ty,
+    );
     ctx.add_fmt(format!(
         "{}={};{}.{}={};",
-        dst,
-        composite,
-        dst,
-        SWIZZLE[index],
-        value
+        dst, composite, dst, SWIZZLE[index], value
     ));
 }
 
@@ -2920,7 +3082,10 @@ fn emit_load_shared_8(
         format!("{}(smem[{}>>2])", cast, offset)
     };
     add_assign(
-        ctx, program, inst_ref, GlslVarType::U32,
+        ctx,
+        program,
+        inst_ref,
+        GlslVarType::U32,
         format!("bitfieldExtract({},int({}%4)*8,8)", target, offset),
     );
 }
@@ -2940,7 +3105,10 @@ fn emit_load_shared_16(
         format!("{}(smem[{}>>2])", cast, offset)
     };
     add_assign(
-        ctx, program, inst_ref, GlslVarType::U32,
+        ctx,
+        program,
+        inst_ref,
+        GlslVarType::U32,
         format!("bitfieldExtract({},int(({}>>1)%2)*16,16)", target, offset),
     );
 }
@@ -2953,7 +3121,10 @@ fn emit_load_shared_u128(
 ) {
     let offset = ctx.var_alloc.consume(program, &inst.args[0]);
     add_assign(
-        ctx, program, inst_ref, GlslVarType::U32x4,
+        ctx,
+        program,
+        inst_ref,
+        GlslVarType::U32x4,
         format!(
             "uvec4(smem[{0}>>2],smem[({0}>>2)+1u],smem[({0}>>2)+2u],smem[({0}>>2)+3u])",
             offset
@@ -3006,7 +3177,10 @@ fn emit_load_storage_8(
         format!("{}_ssbo{}[{}>>2]", stage, binding, offset)
     };
     add_assign(
-        ctx, program, inst_ref, GlslVarType::U32,
+        ctx,
+        program,
+        inst_ref,
+        GlslVarType::U32,
         format!("bitfieldExtract({},int({}%4)*8,8)", target, offset),
     );
 }
@@ -3027,7 +3201,10 @@ fn emit_load_storage_16(
         format!("{}_ssbo{}[{}>>2]", stage, binding, offset)
     };
     add_assign(
-        ctx, program, inst_ref, GlslVarType::U32,
+        ctx,
+        program,
+        inst_ref,
+        GlslVarType::U32,
         format!("bitfieldExtract({},int(({}>>1)%2)*16,16)", target, offset),
     );
 }
@@ -3042,7 +3219,10 @@ fn emit_load_storage_32(
     let offset = ctx.var_alloc.consume(program, &inst.args[1]);
     let stage = ctx.stage_name;
     add_assign(
-        ctx, program, inst_ref, GlslVarType::U32,
+        ctx,
+        program,
+        inst_ref,
+        GlslVarType::U32,
         format!("{}_ssbo{}[{}>>2]", stage, binding, offset),
     );
 }
@@ -3057,7 +3237,10 @@ fn emit_load_storage_64(
     let offset = ctx.var_alloc.consume(program, &inst.args[1]);
     let stage = ctx.stage_name;
     add_assign(
-        ctx, program, inst_ref, GlslVarType::U32x2,
+        ctx,
+        program,
+        inst_ref,
+        GlslVarType::U32x2,
         format!(
             "uvec2({0}_ssbo{1}[{2}>>2],{0}_ssbo{1}[({2}+4)>>2])",
             stage, binding, offset

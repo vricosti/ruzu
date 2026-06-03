@@ -10,7 +10,8 @@ use crate::host1x::codecs::decoder::{DecoderImpl, DecoderState};
 use crate::host1x::codecs::vp9_types::{
     PictureInfo, Segmentation, Vp9EntropyProbs, Vp9FrameContainer, Vp9PictureInfo,
 };
-use crate::host1x::nvdec_common::VideoCodec;
+use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
+use crate::host1x::nvdec_common::{NvdecRegisters, VideoCodec};
 
 // --------------------------------------------------------------------------
 // Constants from vp9.cpp
@@ -284,7 +285,11 @@ impl Vp9 {
 }
 
 impl DecoderImpl for Vp9 {
-    fn compose_frame(&mut self) -> Vec<u8> {
+    fn compose_frame(
+        &mut self,
+        _regs: &NvdecRegisters,
+        _memory_manager: &MaxwellDeviceMemoryManager,
+    ) -> Vec<u8> {
         // Stubbed — requires memory manager integration to read PictureInfo/EntropyProbs
         // from memory, compose compressed and uncompressed headers, and append the bitstream.
         // Upstream: VP9::ComposeFrame() in video_core/host1x/codecs/vp9.cpp
@@ -292,7 +297,7 @@ impl DecoderImpl for Vp9 {
         Vec::new()
     }
 
-    fn get_progressive_offsets(&self) -> (u64, u64) {
+    fn get_progressive_offsets(&self, _regs: &NvdecRegisters) -> (u64, u64) {
         // Upstream reads surface_luma_offsets[Current].Address() and
         // surface_chroma_offsets[Current].Address() from NvdecRegisters.
         // Stubbed until NvdecRegisters are wired into the decoder.
@@ -300,7 +305,7 @@ impl DecoderImpl for Vp9 {
         (0, 0)
     }
 
-    fn get_interlaced_offsets(&self) -> (u64, u64, u64, u64) {
+    fn get_interlaced_offsets(&self, _regs: &NvdecRegisters) -> (u64, u64, u64, u64) {
         // Upstream returns (luma_top, luma_bottom, chroma_top, chroma_bottom) all from
         // surface_luma_offsets[Current] / surface_chroma_offsets[Current].
         // Stubbed until NvdecRegisters are wired into the decoder.

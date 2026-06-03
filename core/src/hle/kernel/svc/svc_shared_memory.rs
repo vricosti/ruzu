@@ -26,6 +26,10 @@ fn to_shmem_perm(perm: MemoryPermission) -> crate::hle::kernel::k_shared_memory:
     }
 }
 
+fn invalid_shared_memory_region_result() -> ResultCode {
+    RESULT_INVALID_MEMORY_REGION
+}
+
 /// Maps shared memory into the current process.
 ///
 /// Upstream: `svc_shared_memory.cpp: MapSharedMemory(Core::System&, Handle, u64, u64, MemoryPermission)`.
@@ -55,7 +59,7 @@ pub fn map_shared_memory(
         return RESULT_INVALID_SIZE;
     }
     if address >= address.wrapping_add(size) {
-        return RESULT_INVALID_CURRENT_MEMORY;
+        return invalid_shared_memory_region_result();
     }
     if !is_valid_shared_memory_permission(map_perm) {
         return RESULT_INVALID_NEW_MEMORY_PERMISSION;
@@ -185,7 +189,7 @@ pub fn map_shared_memory(
             is_in_heap,
             is_in_alias
         );
-        return RESULT_INVALID_CURRENT_MEMORY;
+        return invalid_shared_memory_region_result();
     }
 
     // Map the shared memory into the process page table.
@@ -243,6 +247,14 @@ pub fn unmap_shared_memory(
         None => return RESULT_INVALID_HANDLE,
     };
 
+    if !process.page_table.can_contain(
+        crate::hle::kernel::k_typed_address::KProcessAddress::new(address),
+        size as usize,
+        KMemoryState::SHARED,
+    ) {
+        return invalid_shared_memory_region_result();
+    }
+
     shmem.unmap(&mut process.page_table, address, size as usize)
 }
 
@@ -255,4 +267,21 @@ pub fn create_shared_memory(
 ) -> ResultCode {
     log::warn!("svc::CreateSharedMemory: UNIMPLEMENTED");
     RESULT_NOT_IMPLEMENTED
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn failed_shared_memory_region_uses_upstream_result() {
+        assert_eq!(
+            invalid_shared_memory_region_result(),
+            RESULT_INVALID_MEMORY_REGION
+        );
+        assert_ne!(
+            invalid_shared_memory_region_result(),
+            RESULT_INVALID_CURRENT_MEMORY
+        );
+    }
 }

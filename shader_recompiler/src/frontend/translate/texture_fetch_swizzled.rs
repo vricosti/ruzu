@@ -88,9 +88,8 @@ fn composite3(v: &mut TranslatorVisitor, reg_a: u32, reg_b: u32, reg_c: u32) -> 
 }
 
 fn read_array(v: &mut TranslatorVisitor, value: Value) -> Value {
-    let extracted = v
-        .ir
-        .bit_field_u_extract(value, Value::ImmU32(0), Value::ImmU32(16));
+    let extracted =
+        v.ir.bit_field_u_extract(value, Value::ImmU32(0), Value::ImmU32(16));
     v.ir.convert_f32_from_u32(extracted)
 }
 
@@ -119,7 +118,10 @@ fn sample(v: &mut TranslatorVisitor, insn: u64) -> Sample {
         1 => {
             info.texture_type = TextureType::Color2D as u8;
             let coords = composite2(v, reg_a, reg_b);
-            (v.ir.image_sample_implicit_lod(handle, coords, info.to_u32()), false)
+            (
+                v.ir.image_sample_implicit_lod(handle, coords, info.to_u32()),
+                false,
+            )
         }
         2 => {
             info.texture_type = TextureType::Color2D as u8;
@@ -159,8 +161,7 @@ fn sample(v: &mut TranslatorVisitor, insn: u64) -> Sample {
             let dref = v.f(add_reg(reg_b, 1));
             let lod = v.f(reg_b);
             (
-                v.ir
-                    .image_sample_dref_explicit_lod(handle, coords, dref, lod, info.to_u32()),
+                v.ir.image_sample_dref_explicit_lod(handle, coords, dref, lod, info.to_u32()),
                 true,
             )
         }
@@ -171,8 +172,7 @@ fn sample(v: &mut TranslatorVisitor, insn: u64) -> Sample {
             let coords = composite2(v, reg_a, add_reg(reg_a, 1));
             let dref = v.f(reg_b);
             (
-                v.ir
-                    .image_sample_dref_explicit_lod(handle, coords, dref, zero, info.to_u32()),
+                v.ir.image_sample_dref_explicit_lod(handle, coords, dref, zero, info.to_u32()),
                 true,
             )
         }
@@ -184,7 +184,10 @@ fn sample(v: &mut TranslatorVisitor, insn: u64) -> Sample {
             let raw_array = v.x(reg_a);
             let arr = read_array(v, raw_array);
             let coords = v.ir.composite_construct_f32x3(y, z, arr);
-            (v.ir.image_sample_implicit_lod(handle, coords, info.to_u32()), false)
+            (
+                v.ir.image_sample_implicit_lod(handle, coords, info.to_u32()),
+                false,
+            )
         }
         8 => {
             check_alignment(reg_a, 2);
@@ -211,13 +214,7 @@ fn sample(v: &mut TranslatorVisitor, insn: u64) -> Sample {
             let coords = v.ir.composite_construct_f32x3(y, z, arr);
             let dref = v.f(add_reg(reg_b, 1));
             (
-                v.ir.image_sample_dref_explicit_lod(
-                    handle,
-                    coords,
-                    dref,
-                    zero,
-                    info.to_u32(),
-                ),
+                v.ir.image_sample_dref_explicit_lod(handle, coords, dref, zero, info.to_u32()),
                 true,
             )
         }
@@ -225,7 +222,10 @@ fn sample(v: &mut TranslatorVisitor, insn: u64) -> Sample {
             check_alignment(reg_a, 2);
             info.texture_type = TextureType::Color3D as u8;
             let coords = composite3(v, reg_a, add_reg(reg_a, 1), reg_b);
-            (v.ir.image_sample_implicit_lod(handle, coords, info.to_u32()), false)
+            (
+                v.ir.image_sample_implicit_lod(handle, coords, info.to_u32()),
+                false,
+            )
         }
         11 => {
             check_alignment(reg_a, 2);
@@ -240,7 +240,10 @@ fn sample(v: &mut TranslatorVisitor, insn: u64) -> Sample {
             check_alignment(reg_a, 2);
             info.texture_type = TextureType::ColorCube as u8;
             let coords = composite3(v, reg_a, add_reg(reg_a, 1), reg_b);
-            (v.ir.image_sample_implicit_lod(handle, coords, info.to_u32()), false)
+            (
+                v.ir.image_sample_implicit_lod(handle, coords, info.to_u32()),
+                false,
+            )
         }
         13 => {
             check_alignment(reg_a, 2);

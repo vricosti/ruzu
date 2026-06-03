@@ -364,7 +364,12 @@ fn replace_with_identity(program: &mut Program, inst_ref: InstRef, value: Value)
 }
 
 fn fold_bitcast(program: &mut Program, inst_ref: InstRef, reverse: Opcode) {
-    let arg = match program.block(inst_ref.block).inst(inst_ref.inst).args.first() {
+    let arg = match program
+        .block(inst_ref.block)
+        .inst(inst_ref.inst)
+        .args
+        .first()
+    {
         Some(value) => *value,
         None => return,
     };
@@ -382,7 +387,8 @@ fn fold_bitcast(program: &mut Program, inst_ref: InstRef, reverse: Opcode) {
 
 fn fold_fp_mul_interpolation(program: &mut Program, inst_ref: InstRef) {
     let inst = program.block(inst_ref.block).inst(inst_ref.inst).clone();
-    let (Some(lhs_value), Some(rhs_value)) = (inst.args.first().copied(), inst.args.get(1).copied())
+    let (Some(lhs_value), Some(rhs_value)) =
+        (inst.args.first().copied(), inst.args.get(1).copied())
     else {
         return;
     };
@@ -434,8 +440,8 @@ fn fold_fp_mul_interpolation(program: &mut Program, inst_ref: InstRef) {
 mod tests {
     use super::*;
     use crate::ir::basic_block::Block;
-    use crate::ir::value::Attribute;
     use crate::ir::types::ShaderStage;
+    use crate::ir::value::Attribute;
 
     fn inst(block: u32, inst: u32) -> Value {
         Value::Inst(InstRef { block, inst })
@@ -446,10 +452,10 @@ mod tests {
         let mut program = Program::new(ShaderStage::Fragment);
         program.blocks.push(Block::new());
         let block = program.block_mut(0);
-        block.append_inst(Inst::new(Opcode::GetAttribute, vec![
-            Value::Attribute(Attribute::generic(1, 0)),
-            Value::ImmU32(0),
-        ]));
+        block.append_inst(Inst::new(
+            Opcode::GetAttribute,
+            vec![Value::Attribute(Attribute::generic(1, 0)), Value::ImmU32(0)],
+        ));
         block.append_inst(Inst::new(Opcode::BitCastU32F32, vec![inst(0, 0)]));
         block.append_inst(Inst::new(Opcode::BitCastF32U32, vec![inst(0, 1)]));
 
@@ -465,14 +471,14 @@ mod tests {
         let mut program = Program::new(ShaderStage::Fragment);
         program.blocks.push(Block::new());
         let block = program.block_mut(0);
-        block.append_inst(Inst::new(Opcode::GetAttribute, vec![
-            Value::Attribute(Attribute::generic(2, 0)),
-            Value::ImmU32(0),
-        ]));
-        block.append_inst(Inst::new(Opcode::GetAttribute, vec![
-            Value::Attribute(Attribute::POSITION_W),
-            Value::ImmU32(0),
-        ]));
+        block.append_inst(Inst::new(
+            Opcode::GetAttribute,
+            vec![Value::Attribute(Attribute::generic(2, 0)), Value::ImmU32(0)],
+        ));
+        block.append_inst(Inst::new(
+            Opcode::GetAttribute,
+            vec![Value::Attribute(Attribute::POSITION_W), Value::ImmU32(0)],
+        ));
         block.append_inst(Inst::new(Opcode::FPMul32, vec![inst(0, 0), inst(0, 1)]));
         block.append_inst(Inst::new(Opcode::FPRecip32, vec![inst(0, 1)]));
         block.append_inst(Inst::new(Opcode::FPMul32, vec![inst(0, 2), inst(0, 3)]));

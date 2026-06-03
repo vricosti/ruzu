@@ -124,24 +124,14 @@ fn make_offset(v: &mut TranslatorVisitor, reg: &mut u32, texture_type: TextureTy
             v.ir.bit_field_s_extract(value, Value::ImmU32(0), bitsize)
         }
         TextureType::E2D | TextureType::Array2D => {
-            let x = v
-                .ir
-                .bit_field_s_extract(value, Value::ImmU32(0), bitsize);
-            let y = v
-                .ir
-                .bit_field_s_extract(value, Value::ImmU32(8), bitsize);
+            let x = v.ir.bit_field_s_extract(value, Value::ImmU32(0), bitsize);
+            let y = v.ir.bit_field_s_extract(value, Value::ImmU32(8), bitsize);
             v.ir.composite_construct_u32x2(x, y)
         }
         TextureType::E3D | TextureType::Array3D => {
-            let x = v
-                .ir
-                .bit_field_s_extract(value, Value::ImmU32(0), bitsize);
-            let y = v
-                .ir
-                .bit_field_s_extract(value, Value::ImmU32(8), bitsize);
-            let z = v
-                .ir
-                .bit_field_s_extract(value, Value::ImmU32(16), bitsize);
+            let x = v.ir.bit_field_s_extract(value, Value::ImmU32(0), bitsize);
+            let y = v.ir.bit_field_s_extract(value, Value::ImmU32(8), bitsize);
+            let z = v.ir.bit_field_s_extract(value, Value::ImmU32(16), bitsize);
             v.ir.composite_construct_u32x3(x, y, z)
         }
         TextureType::Cube | TextureType::ArrayCube => panic!("Illegal offset on CUBE sample"),
@@ -155,30 +145,14 @@ fn make_offset_ptp(v: &mut TranslatorVisitor, reg: &mut u32) -> (Value, Value) {
     *reg += 1;
     let bitsize = Value::ImmU32(6);
 
-    let a0 = v
-        .ir
-        .bit_field_s_extract(value1, Value::ImmU32(0), bitsize);
-    let a1 = v
-        .ir
-        .bit_field_s_extract(value1, Value::ImmU32(8), bitsize);
-    let a2 = v
-        .ir
-        .bit_field_s_extract(value1, Value::ImmU32(16), bitsize);
-    let a3 = v
-        .ir
-        .bit_field_s_extract(value1, Value::ImmU32(24), bitsize);
-    let b0 = v
-        .ir
-        .bit_field_s_extract(value2, Value::ImmU32(0), bitsize);
-    let b1 = v
-        .ir
-        .bit_field_s_extract(value2, Value::ImmU32(8), bitsize);
-    let b2 = v
-        .ir
-        .bit_field_s_extract(value2, Value::ImmU32(16), bitsize);
-    let b3 = v
-        .ir
-        .bit_field_s_extract(value2, Value::ImmU32(24), bitsize);
+    let a0 = v.ir.bit_field_s_extract(value1, Value::ImmU32(0), bitsize);
+    let a1 = v.ir.bit_field_s_extract(value1, Value::ImmU32(8), bitsize);
+    let a2 = v.ir.bit_field_s_extract(value1, Value::ImmU32(16), bitsize);
+    let a3 = v.ir.bit_field_s_extract(value1, Value::ImmU32(24), bitsize);
+    let b0 = v.ir.bit_field_s_extract(value2, Value::ImmU32(0), bitsize);
+    let b1 = v.ir.bit_field_s_extract(value2, Value::ImmU32(8), bitsize);
+    let b2 = v.ir.bit_field_s_extract(value2, Value::ImmU32(16), bitsize);
+    let b3 = v.ir.bit_field_s_extract(value2, Value::ImmU32(24), bitsize);
 
     (
         v.ir.composite_construct_u32x4(a0, a1, a2, a3),
@@ -248,11 +222,9 @@ fn impl_tld4(
     }
 
     let sample = if dc {
-        v.ir
-            .image_gather_dref_full(handle, coords, offset, offset2, dref, info.to_u32())
+        v.ir.image_gather_dref_full(handle, coords, offset, offset2, dref, info.to_u32())
     } else {
-        v.ir
-            .image_gather_full(handle, coords, offset, offset2, info.to_u32())
+        v.ir.image_gather_full(handle, coords, offset, offset2, info.to_u32())
     };
 
     let mut reg = dest_reg;
@@ -260,9 +232,7 @@ fn impl_tld4(
         if ((mask >> element) & 1) == 0 {
             continue;
         }
-        let value = v
-            .ir
-            .composite_extract_f32x4(sample, Value::ImmU32(element));
+        let value = v.ir.composite_extract_f32x4(sample, Value::ImmU32(element));
         v.set_f(reg, value);
         reg += 1;
     }
