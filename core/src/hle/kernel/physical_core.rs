@@ -6,13 +6,16 @@
 //! running guest threads and handling interrupts. Full implementation
 //! requires KernelCore, KThread, KProcess, ArmInterface, Debugger.
 
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc, Condvar, Mutex,
+};
 
 use crate::arm::arm_interface::{
     ArmInterface, HaltReason, KThread as OpaqueKThread, ThreadContext,
 };
 use crate::core::System;
-use crate::hle::kernel::svc_dispatch::{self, SvcArgs};
+use crate::hle::kernel::svc_dispatch::{self, SvcArgs, SvcId};
 
 use super::k_process::ProcessLock;
 #[cfg(feature = "debug-logs")]
@@ -22,6 +25,8 @@ use super::{
     k_scheduler::KScheduler,
     k_thread::{KThread, KThreadLock},
 };
+
+static ZERO_PC_SAVE_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
 
 pub enum PhysicalCoreExecutionControl {
     Continue,
@@ -172,8 +177,16 @@ impl PhysicalCore {
         is_64bit: bool,
         svc_args: &mut SvcArgs,
         system: &System,
-    ) {
+    ) -> bool {
         svc_dispatch::call(system, svc_num, is_64bit, svc_args);
+        if svc_num == SvcId::ExitThread as u32 {
+            // Upstream `svc::ExitThread` enters `KThread::Exit()` and never
+            // returns to guest code. The cooperative Rust port must therefore
+            // not reload SVC results or capture a post-SVC context for the
+            // terminated thread; yield to the scheduler instead.
+            scheduler.lock().unwrap().request_schedule();
+            return false;
+        }
         jit.set_svc_arguments(svc_args);
         log::trace!(
             "dispatch_supervisor_call: before handoff (svc=0x{:x})",
@@ -210,6 +223,7 @@ impl PhysicalCore {
             "dispatch_supervisor_call: after handoff (svc=0x{:x})",
             svc_num
         );
+        true
     }
 
     pub fn run_loop<FSvc, FHalt>(
@@ -325,19 +339,22 @@ impl PhysicalCore {
                         PhysicalCoreExecutionControl::Continue => {}
                     }
 
-                    self.dispatch_supervisor_call(
+                    let continue_thread = self.dispatch_supervisor_call(
                         jit,
                         thread_context,
                         scheduler,
                         process,
                         &super::kernel::get_current_thread_pointer()
                             .expect("current thread must exist during SVC dispatch"),
-                        svc_count,
                         svc_num,
+                        svc_count,
                         is_64bit,
                         &mut svc_args,
                         system,
                     );
+                    if !continue_thread {
+                        return (iteration, svc_count, PhysicalCoreExecutionControl::Yield);
+                    }
                 }
                 PhysicalCoreExecutionEvent::Halted(halt_reason) => {
                     jit.get_context(thread_context);
@@ -430,6 +447,25 @@ impl PhysicalCore {
                     as *mut crate::arm::arm_interface::ThreadContext)
             };
             jit.get_context(arm_ctx);
+            if arm_ctx.pc == 0 && std::env::var_os("RUZU_TRACE_ZERO_PC_SAVE").is_some() {
+                let n = ZERO_PC_SAVE_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
+                if n < 64 || n.is_multiple_of(1024) {
+                    eprintln!(
+                        "[ZERO_PC_SAVE] n={} core={} tid={} type={:?} state={:?} prio={} active_core={} lr=0x{:08X} sp=0x{:08X} r0=0x{:08X} r1=0x{:08X}",
+                        n,
+                        self.m_core_index,
+                        thread.get_thread_id(),
+                        thread.thread_type,
+                        thread.get_state(),
+                        thread.get_priority(),
+                        thread.get_active_core(),
+                        arm_ctx.lr as u32,
+                        arm_ctx.sp as u32,
+                        arm_ctx.r[0] as u32,
+                        arm_ctx.r[1] as u32,
+                    );
+                }
+            }
         }
     }
 

@@ -64,7 +64,9 @@ fn texture(
 ) -> String {
     let ty = TextureType::from_u8(info.texture_type);
     let def_opt = if ty == TextureType::Buffer {
-        ctx.texture_buffers.get(info.descriptor_index as usize).copied()
+        ctx.texture_buffers
+            .get(info.descriptor_index as usize)
+            .copied()
     } else {
         ctx.textures.get(info.descriptor_index as usize).copied()
     };
@@ -95,7 +97,9 @@ fn image(
 ) -> String {
     let ty = TextureType::from_u8(info.texture_type);
     let def_opt = if ty == TextureType::Buffer {
-        ctx.image_buffers.get(info.descriptor_index as usize).copied()
+        ctx.image_buffers
+            .get(info.descriptor_index as usize)
+            .copied()
     } else {
         ctx.images.get(info.descriptor_index as usize).copied()
     };
@@ -228,11 +232,7 @@ fn eval_const_offset_vec(program: &ir::Program, offset: &Value) -> Option<String
 /// `offset` is a raw IR value, often an immediate U32 or a
 /// `CompositeConstructU32x{2,3,4}` of immediates. Otherwise we consume
 /// it via `var_alloc` and cast to the matching integer vector width.
-fn get_offset_vec(
-    ctx: &mut EmitContext,
-    program: &mut ir::Program,
-    offset: &Value,
-) -> String {
+fn get_offset_vec(ctx: &mut EmitContext, program: &mut ir::Program, offset: &Value) -> String {
     if let Some(offset) = eval_const_offset_vec(program, offset) {
         return offset;
     }
@@ -263,10 +263,7 @@ fn get_offset_vec(
                     return format!("ivec3({},{},{})", args[0], args[1], args[2]);
                 }
                 Opcode::CompositeConstructU32x4 if args.len() == 4 => {
-                    return format!(
-                        "ivec4({},{},{},{})",
-                        args[0], args[1], args[2], args[3]
-                    );
+                    return format!("ivec4({},{},{},{})", args[0], args[1], args[2], args[3]);
                 }
                 _ => {}
             }
@@ -282,12 +279,14 @@ fn get_offset_vec(
         "0".to_string()
     };
     let ty = match offset {
-        Value::Inst(inst_ref) => program
-            .block(inst_ref.block)
-            .inst(inst_ref.inst)
-            .opcode
-            .meta()
-            .return_type,
+        Value::Inst(inst_ref) => {
+            program
+                .block(inst_ref.block)
+                .inst(inst_ref.inst)
+                .opcode
+                .meta()
+                .return_type
+        }
         _ => offset.ir_type(),
     };
     match ty {
@@ -351,10 +350,7 @@ fn prepare_sparse(program: &mut ir::Program, inst_ref: InstRef) -> Option<InstRe
         .inst(inst_ref.inst)
         .get_associated_pseudo(Opcode::GetSparseFromOp);
     if let Some(s) = sparse {
-        program
-            .block_mut(s.block)
-            .inst_mut(s.inst)
-            .opcode = Opcode::Void;
+        program.block_mut(s.block).inst_mut(s.inst).opcode = Opcode::Void;
     }
     sparse
 }
@@ -363,11 +359,7 @@ fn prepare_sparse(program: &mut ir::Program, inst_ref: InstRef) -> Option<InstRe
 ///
 /// Applies a 1/512 texel subpixel offset for AMD parity with Nvidia/Maxwell
 /// gather rounding behaviour. No-op for texture types that don't gather.
-fn image_gather_subpixel_offset(
-    info: TextureInstInfo,
-    texture_name: &str,
-    coords: &str,
-) -> String {
+fn image_gather_subpixel_offset(info: TextureInstInfo, texture_name: &str, coords: &str) -> String {
     match TextureType::from_u8(info.texture_type) {
         TextureType::Color2D | TextureType::Color2DRect => format!(
             "{}+vec2(0.001953125)/vec2(textureSize({}, 0))",
@@ -390,9 +382,7 @@ fn define_with_sparse(
     var_type: GlslVarType,
 ) -> (String, Option<String>) {
     let sparse = prepare_sparse(program, inst_ref);
-    let sparse_name = sparse.map(|s| {
-        var_alloc.define(inst_mut(program, s), GlslVarType::U1)
-    });
+    let sparse_name = sparse.map(|s| var_alloc.define(inst_mut(program, s), GlslVarType::U1));
     let dst = var_alloc.define(inst_mut(program, inst_ref), var_type);
     (dst, sparse_name)
 }
@@ -419,9 +409,8 @@ pub fn emit_image_sample_implicit_lod_inst(
     };
     let offset = inst.args.get(3).cloned().unwrap_or(Value::Void);
     let var_alloc = &mut ctx.var_alloc as *mut _;
-    let (texel, sparse_name) = unsafe {
-        define_with_sparse(program, &mut *var_alloc, inst_ref, GlslVarType::F32x4)
-    };
+    let (texel, sparse_name) =
+        unsafe { define_with_sparse(program, &mut *var_alloc, inst_ref, GlslVarType::F32x4) };
     let supports_sparse = ctx.profile.support_gl_sparse_textures;
     if let Some(ref sn) = sparse_name {
         if !supports_sparse {
@@ -449,7 +438,10 @@ pub fn emit_image_sample_implicit_lod_inst(
                 texel, texture_name, coords, bias_lc
             ));
         } else {
-            ctx.add_fmt(format!("{}=textureLod({},{},0.0);", texel, texture_name, coords));
+            ctx.add_fmt(format!(
+                "{}=textureLod({},{},0.0);",
+                texel, texture_name, coords
+            ));
         }
         return;
     }
@@ -487,9 +479,8 @@ pub fn emit_image_sample_explicit_lod_inst(
     let lod_lc = ctx.var_alloc.consume(program, &inst.args[2]);
     let offset = inst.args.get(3).cloned().unwrap_or(Value::Void);
     let var_alloc = &mut ctx.var_alloc as *mut _;
-    let (texel, sparse_name) = unsafe {
-        define_with_sparse(program, &mut *var_alloc, inst_ref, GlslVarType::F32x4)
-    };
+    let (texel, sparse_name) =
+        unsafe { define_with_sparse(program, &mut *var_alloc, inst_ref, GlslVarType::F32x4) };
     let supports_sparse = ctx.profile.support_gl_sparse_textures;
     if let Some(ref sn) = sparse_name {
         if !supports_sparse {
@@ -714,9 +705,8 @@ pub fn emit_image_gather_inst(
     let offset = inst.args.get(2).cloned().unwrap_or(Value::Void);
     let offset2 = inst.args.get(3).cloned().unwrap_or(Value::Void);
     let var_alloc = &mut ctx.var_alloc as *mut _;
-    let (texel, sparse_name) = unsafe {
-        define_with_sparse(program, &mut *var_alloc, inst_ref, GlslVarType::F32x4)
-    };
+    let (texel, sparse_name) =
+        unsafe { define_with_sparse(program, &mut *var_alloc, inst_ref, GlslVarType::F32x4) };
     let supports_sparse = ctx.profile.support_gl_sparse_textures;
     if let Some(ref sn) = sparse_name {
         if !supports_sparse {
@@ -799,9 +789,8 @@ pub fn emit_image_gather_dref_inst(
     let offset2 = inst.args.get(3).cloned().unwrap_or(Value::Void);
     let dref = ctx.var_alloc.consume(program, &inst.args[4]);
     let var_alloc = &mut ctx.var_alloc as *mut _;
-    let (texel, sparse_name) = unsafe {
-        define_with_sparse(program, &mut *var_alloc, inst_ref, GlslVarType::F32x4)
-    };
+    let (texel, sparse_name) =
+        unsafe { define_with_sparse(program, &mut *var_alloc, inst_ref, GlslVarType::F32x4) };
     let supports_sparse = ctx.profile.support_gl_sparse_textures;
     if let Some(ref sn) = sparse_name {
         if !supports_sparse {
@@ -896,9 +885,8 @@ pub fn emit_image_fetch_inst(
         .map(|a| ctx.var_alloc.consume(program, a))
         .unwrap_or_default();
     let var_alloc = &mut ctx.var_alloc as *mut _;
-    let (texel, sparse_name) = unsafe {
-        define_with_sparse(program, &mut *var_alloc, inst_ref, GlslVarType::F32x4)
-    };
+    let (texel, sparse_name) =
+        unsafe { define_with_sparse(program, &mut *var_alloc, inst_ref, GlslVarType::F32x4) };
     let supports_sparse = ctx.profile.support_gl_sparse_textures;
     if let Some(ref sn) = sparse_name {
         if !supports_sparse {
@@ -1407,11 +1395,19 @@ mod tests {
 
         let x = program.blocks[0].append_inst(Inst::new(
             Opcode::BitFieldSExtract,
-            vec![Value::ImmU32(0x0000_00f1), Value::ImmU32(0), Value::ImmU32(4)],
+            vec![
+                Value::ImmU32(0x0000_00f1),
+                Value::ImmU32(0),
+                Value::ImmU32(4),
+            ],
         ));
         let y = program.blocks[0].append_inst(Inst::new(
             Opcode::BitFieldSExtract,
-            vec![Value::ImmU32(0x0000_00f1), Value::ImmU32(4), Value::ImmU32(4)],
+            vec![
+                Value::ImmU32(0x0000_00f1),
+                Value::ImmU32(4),
+                Value::ImmU32(4),
+            ],
         ));
         let offset = program.blocks[0].append_inst(Inst::new(
             Opcode::CompositeConstructU32x2,
@@ -1422,7 +1418,13 @@ mod tests {
         ));
 
         assert_eq!(
-            eval_const_offset_vec(&program, &Value::Inst(InstRef { block: 0, inst: offset })),
+            eval_const_offset_vec(
+                &program,
+                &Value::Inst(InstRef {
+                    block: 0,
+                    inst: offset
+                })
+            ),
             Some("ivec2(1,-1)".to_string())
         );
     }
@@ -1433,20 +1435,23 @@ mod tests {
         let runtime_info = crate::runtime_info::RuntimeInfo::default();
         let mut bindings = crate::backend::bindings::Bindings::default();
         let mut program = crate::ir::Program::new(crate::stage::Stage::Fragment);
-        program.info.texture_descriptors.push(crate::shader_info::TextureDescriptor {
-            texture_type: TextureType::Color2D,
-            is_depth: false,
-            is_multisample: true,
-            has_secondary: false,
-            cbuf_index: 0,
-            cbuf_offset: 0,
-            shift_left: 0,
-            secondary_cbuf_index: 0,
-            secondary_cbuf_offset: 0,
-            secondary_shift_left: 0,
-            count: 1,
-            size_shift: 3,
-        });
+        program
+            .info
+            .texture_descriptors
+            .push(crate::shader_info::TextureDescriptor {
+                texture_type: TextureType::Color2D,
+                is_depth: false,
+                is_multisample: true,
+                has_secondary: false,
+                cbuf_index: 0,
+                cbuf_offset: 0,
+                shift_left: 0,
+                secondary_cbuf_index: 0,
+                secondary_cbuf_offset: 0,
+                secondary_shift_left: 0,
+                count: 1,
+                size_shift: 3,
+            });
         let ctx = EmitContext::new(&program, &mut bindings, &profile, &runtime_info);
         let info = Tii {
             descriptor_index: 0,

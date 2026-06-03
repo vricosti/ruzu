@@ -602,9 +602,7 @@ mod tests {
         );
 
         let write_pos = source.find("frag_color0.w=0.25f;").unwrap();
-        let test_pos = source
-            .find("if(!(frag_color0.a>0.5f)){discard;}")
-            .unwrap();
+        let test_pos = source.find("if(!(frag_color0.a>0.5f)){discard;}").unwrap();
         assert!(test_pos > write_pos);
     }
 }

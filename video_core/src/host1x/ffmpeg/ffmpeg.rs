@@ -4,24 +4,48 @@
 //! Port of `video_core/host1x/ffmpeg/ffmpeg.h` and `ffmpeg.cpp`.
 //!
 //! Wraps FFmpeg types (AVPacket, AVFrame, AVCodec, AVCodecContext) for video
-//! decoding. All bodies that depend on FFmpeg are stubbed with `log::warn!` and
-//! safe default returns since actual FFmpeg integration requires external C bindings.
+//! decoding.
 
 use std::sync::Arc;
 
 use crate::host1x::nvdec_common::VideoCodec;
 
+mod ffi {
+    use libc::{c_int, c_uchar, c_void, uintptr_t};
+
+    pub type RuzuFfmpegDecoder = c_void;
+    pub type AVFrame = c_void;
+
+    extern "C" {
+        pub fn ruzu_ffmpeg_decoder_create(codec: u64) -> *mut RuzuFfmpegDecoder;
+        pub fn ruzu_ffmpeg_decoder_destroy(decoder: *mut RuzuFfmpegDecoder);
+        pub fn ruzu_ffmpeg_decoder_send_packet(
+            decoder: *mut RuzuFfmpegDecoder,
+            data: *const c_uchar,
+            size: uintptr_t,
+        ) -> c_int;
+        pub fn ruzu_ffmpeg_decoder_receive_frame(decoder: *mut RuzuFfmpegDecoder) -> *mut AVFrame;
+        pub fn ruzu_ffmpeg_frame_destroy(frame: *mut AVFrame);
+        pub fn ruzu_ffmpeg_frame_width(frame: *const AVFrame) -> c_int;
+        pub fn ruzu_ffmpeg_frame_height(frame: *const AVFrame) -> c_int;
+        pub fn ruzu_ffmpeg_frame_format(frame: *const AVFrame) -> c_int;
+        pub fn ruzu_ffmpeg_frame_stride(frame: *const AVFrame, plane: c_int) -> c_int;
+        pub fn ruzu_ffmpeg_frame_plane(frame: *const AVFrame, plane: c_int) -> *const c_uchar;
+        pub fn ruzu_ffmpeg_frame_interlaced(frame: *const AVFrame) -> c_int;
+    }
+}
+
 /// Wraps an AVPacket — a container for compressed bitstream data.
 ///
 /// Port of `FFmpeg::Packet`.
 pub struct Packet {
-    _data: Vec<u8>,
+    data: Vec<u8>,
 }
 
 impl Packet {
     pub fn new(data: &[u8]) -> Self {
         Self {
-            _data: data.to_vec(),
+            data: data.to_vec(),
         }
     }
 }
@@ -30,46 +54,58 @@ impl Packet {
 ///
 /// Port of `FFmpeg::Frame`.
 pub struct Frame {
-    width: i32,
-    height: i32,
-    pixel_format: i32,
-    strides: [i32; 4],
-    interlaced: bool,
+    raw: *mut ffi::AVFrame,
 }
 
 impl Frame {
     pub fn new() -> Self {
         Self {
-            width: 0,
-            height: 0,
-            pixel_format: 0,
-            strides: [0; 4],
-            interlaced: false,
+            raw: std::ptr::null_mut(),
         }
     }
 
+    fn from_raw(raw: *mut ffi::AVFrame) -> Self {
+        Self { raw }
+    }
+
     pub fn get_width(&self) -> i32 {
-        self.width
+        unsafe { ffi::ruzu_ffmpeg_frame_width(self.raw.cast_const()) }
     }
 
     pub fn get_height(&self) -> i32 {
-        self.height
+        unsafe { ffi::ruzu_ffmpeg_frame_height(self.raw.cast_const()) }
     }
 
     pub fn get_pixel_format(&self) -> i32 {
-        self.pixel_format
+        unsafe { ffi::ruzu_ffmpeg_frame_format(self.raw.cast_const()) }
     }
 
     pub fn get_stride(&self, plane: usize) -> i32 {
-        self.strides[plane]
+        unsafe { ffi::ruzu_ffmpeg_frame_stride(self.raw.cast_const(), plane as i32) }
+    }
+
+    pub fn get_plane_ptr(&self, plane: usize) -> *const u8 {
+        unsafe { ffi::ruzu_ffmpeg_frame_plane(self.raw.cast_const(), plane as i32) }
     }
 
     pub fn is_interlaced(&self) -> bool {
-        self.interlaced
+        unsafe { ffi::ruzu_ffmpeg_frame_interlaced(self.raw.cast_const()) != 0 }
     }
 
     pub fn is_hardware_decoded(&self) -> bool {
         false
+    }
+}
+
+unsafe impl Send for Frame {}
+unsafe impl Sync for Frame {}
+
+impl Drop for Frame {
+    fn drop(&mut self) {
+        if !self.raw.is_null() {
+            unsafe { ffi::ruzu_ffmpeg_frame_destroy(self.raw) };
+            self.raw = std::ptr::null_mut();
+        }
     }
 }
 
@@ -83,12 +119,12 @@ impl Default for Frame {
 ///
 /// Port of `FFmpeg::Decoder`.
 pub struct Decoder {
-    _codec: VideoCodec,
+    codec: VideoCodec,
 }
 
 impl Decoder {
     pub fn new(codec: VideoCodec) -> Self {
-        Self { _codec: codec }
+        Self { codec }
     }
 
     pub fn supports_decoding_on_device(&self) -> bool {
@@ -143,13 +179,17 @@ impl Default for HardwareContext {
 ///
 /// Port of `FFmpeg::DecoderContext`.
 pub struct DecoderContext {
-    _decode_order: bool,
+    raw: *mut ffi::RuzuFfmpegDecoder,
+    codec: VideoCodec,
+    decode_order: bool,
 }
 
 impl DecoderContext {
-    pub fn new(_decoder: &Decoder) -> Self {
+    pub fn new(decoder: &Decoder) -> Self {
         Self {
-            _decode_order: false,
+            raw: std::ptr::null_mut(),
+            codec: decoder.codec,
+            decode_order: false,
         }
     }
 
@@ -163,28 +203,67 @@ impl DecoderContext {
     }
 
     pub fn open_context(&mut self, _decoder: &Decoder) -> bool {
-        // Stubbed — requires FFmpeg C bindings to call avcodec_open2().
-        // Upstream: FFmpeg::DecoderContext::OpenContext() in ffmpeg.cpp
-        log::warn!("FFmpeg::DecoderContext::open_context: FFmpeg bindings not available");
-        false
+        self.raw = unsafe { ffi::ruzu_ffmpeg_decoder_create(_decoder.codec as u64) };
+        if self.raw.is_null() {
+            log::error!(
+                "FFmpeg::DecoderContext::open_context: failed to open codec {:?}",
+                _decoder.codec
+            );
+            return false;
+        }
+        log::info!("Using FFmpeg software decoding");
+        // Upstream forces H264 software decoding through the decode-order queue.
+        // ruzu still uses avcodec_send_packet in the C shim, but VIC frame lookup
+        // must match upstream's offset-keyed queueing semantics.
+        self.decode_order = self.codec == VideoCodec::H264;
+        true
     }
 
     pub fn send_packet(&mut self, _packet: &Packet) -> bool {
-        // Stubbed — requires FFmpeg C bindings to call avcodec_send_packet().
-        // Upstream: FFmpeg::DecoderContext::SendPacket() in ffmpeg.cpp
-        log::warn!("FFmpeg::DecoderContext::send_packet: FFmpeg bindings not available");
-        false
+        if self.raw.is_null() {
+            return false;
+        }
+        let ret = unsafe {
+            ffi::ruzu_ffmpeg_decoder_send_packet(
+                self.raw,
+                _packet.data.as_ptr(),
+                _packet.data.len(),
+            )
+        };
+        if ret < 0 {
+            log::error!(
+                "FFmpeg::DecoderContext::send_packet: avcodec_send_packet error {}",
+                ret
+            );
+            return false;
+        }
+        true
     }
 
     pub fn receive_frame(&mut self) -> Option<Arc<Frame>> {
-        // Stubbed — requires FFmpeg C bindings to call avcodec_receive_frame().
-        // Upstream: FFmpeg::DecoderContext::ReceiveFrame() in ffmpeg.cpp
-        log::warn!("FFmpeg::DecoderContext::receive_frame: FFmpeg bindings not available");
-        None
+        if self.raw.is_null() {
+            return None;
+        }
+        let frame = unsafe { ffi::ruzu_ffmpeg_decoder_receive_frame(self.raw) };
+        if frame.is_null() {
+            return None;
+        }
+        Some(Arc::new(Frame::from_raw(frame)))
     }
 
     pub fn using_decode_order(&self) -> bool {
-        self._decode_order
+        self.decode_order
+    }
+}
+
+unsafe impl Send for DecoderContext {}
+
+impl Drop for DecoderContext {
+    fn drop(&mut self) {
+        if !self.raw.is_null() {
+            unsafe { ffi::ruzu_ffmpeg_decoder_destroy(self.raw) };
+            self.raw = std::ptr::null_mut();
+        }
     }
 }
 
@@ -210,15 +289,18 @@ impl DecodeApi {
     pub fn initialize(&mut self, codec: VideoCodec) -> bool {
         self.reset();
         let decoder = Decoder::new(codec);
-        let decoder_context = DecoderContext::new(&decoder);
+        let mut decoder_context = DecoderContext::new(&decoder);
+        let initialized = decoder_context.open_context(&decoder);
+        let _ = common::trace::emit(
+            common::trace::cat::HOST1X_VIDEO,
+            &[4, 1, codec as u64, initialized as u64, 0],
+        );
+        if !initialized {
+            return false;
+        }
         self.decoder = Some(decoder);
         self.decoder_context = Some(decoder_context);
-        // Upstream opens the decoder context and optionally initializes hardware
-        // acceleration via HardwareContext. This requires FFmpeg C bindings
-        // (avcodec_open2, av_hwdevice_ctx_create, etc.) which are not linked in
-        // the current build. Returns false to indicate initialization is stubbed.
-        let _ = common::trace::emit(common::trace::cat::HOST1X_VIDEO, &[4, 1, codec as u64, 0, 0]);
-        false
+        true
     }
 
     pub fn reset(&mut self) {
@@ -234,28 +316,39 @@ impl DecodeApi {
     }
 
     pub fn send_packet(&mut self, _packet_data: &[u8]) -> bool {
-        // Stubbed — requires FFmpeg C bindings to wrap data in AVPacket and call
-        // DecoderContext::send_packet().
-        // Upstream: FFmpeg::DecodeApi::SendPacket() in ffmpeg.cpp
         let _ = common::trace::emit(
             common::trace::cat::HOST1X_VIDEO,
             &[4, 2, 0, 0, _packet_data.len() as u64],
         );
-        log::warn!("FFmpeg::DecodeApi::send_packet: FFmpeg bindings not available");
-        false
+        let Some(decoder_context) = self.decoder_context.as_mut() else {
+            return false;
+        };
+        let packet = Packet::new(_packet_data);
+        decoder_context.send_packet(&packet)
     }
 
     pub fn receive_frame(&mut self) -> Option<Arc<Frame>> {
-        // Stubbed — requires FFmpeg C bindings to call DecoderContext::receive_frame().
-        // Upstream: FFmpeg::DecodeApi::ReceiveFrame() in ffmpeg.cpp
         let _ = common::trace::emit(common::trace::cat::HOST1X_VIDEO, &[4, 3, 0, 0, 0]);
-        log::warn!("FFmpeg::DecodeApi::receive_frame: FFmpeg bindings not available");
-        None
+        self.decoder_context.as_mut()?.receive_frame()
     }
 }
+
+unsafe impl Send for DecodeApi {}
 
 impl Default for DecodeApi {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decode_api_initializes_h264_software_decoder() {
+        let mut api = DecodeApi::new();
+        assert!(api.initialize(VideoCodec::H264));
+        assert!(api.using_decode_order());
     }
 }

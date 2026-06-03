@@ -1861,6 +1861,19 @@ pub struct RenderTargetInfo {
     pub base_layer: u32,
 }
 
+/// Depth/stencil target configuration (`regs.zeta` + `regs.zeta_size`).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ZetaInfo {
+    pub enabled: bool,
+    pub address: u64,
+    pub width: u32,
+    pub height: u32,
+    pub format: u32,
+    pub tile_mode: u32,
+    pub array_pitch: u32,
+    pub depth: u32,
+}
+
 /// A recorded draw call with all relevant state at the time of DRAW_END.
 #[derive(Debug, Clone)]
 pub struct DrawCall {
@@ -2221,6 +2234,23 @@ impl Maxwell3D {
     /// Upstream `maxwell3d->regs.zeta_enable`.
     pub fn zeta_enable(&self) -> bool {
         self.regs[ZETA_ENABLE as usize] != 0
+    }
+
+    pub fn zeta_info(&self) -> ZetaInfo {
+        let zeta = ZETA_BASE as usize;
+        let zeta_size = ZETA_SIZE_BASE as usize;
+        let address_high = self.regs[zeta] as u64;
+        let address_low = self.regs[zeta + 1] as u64;
+        ZetaInfo {
+            enabled: self.zeta_enable(),
+            address: (address_high << 32) | address_low,
+            format: self.regs[zeta + 2],
+            tile_mode: self.regs[zeta + 3],
+            array_pitch: self.regs[zeta + 4],
+            width: self.regs[zeta_size],
+            height: self.regs[zeta_size + 1],
+            depth: self.regs[zeta_size + 2],
+        }
     }
 
     /// Upstream `maxwell3d->draw_manager->GetDrawState()`.
@@ -3477,6 +3507,10 @@ impl dm::Maxwell3DAccess for Maxwell3D {
 
     fn rt_control_info(&self) -> RtControlInfo {
         self.rt_control_info()
+    }
+
+    fn zeta_info(&self) -> ZetaInfo {
+        self.zeta_info()
     }
 
     fn tex_header_pool_address(&self) -> u64 {

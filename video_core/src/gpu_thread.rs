@@ -39,6 +39,30 @@ struct GpuThreadProfile {
 
 static GPU_THREAD_PROFILE: std::sync::OnceLock<GpuThreadProfile> = std::sync::OnceLock::new();
 
+fn trace_gpu_thread_submit(
+    stage: u64,
+    fence: u64,
+    channel: i32,
+    list_count: usize,
+    prefetch_count: usize,
+    elapsed_us: u64,
+) {
+    if !common::trace::is_enabled(common::trace::cat::GPU_THREAD) {
+        return;
+    }
+    common::trace::emit_raw(
+        common::trace::cat::GPU_THREAD,
+        &[
+            stage,
+            fence,
+            channel as i64 as u64,
+            list_count as u64,
+            prefetch_count as u64,
+            elapsed_us,
+        ],
+    );
+}
+
 fn profile_enabled() -> bool {
     std::env::var_os("RUZU_PROFILE_GPU_THREAD").is_some()
 }
@@ -384,6 +408,16 @@ impl ThreadManager {
 
         let lock = self.state.write_lock.lock().unwrap();
         let fence = self.state.last_fence.fetch_add(1, Ordering::Relaxed) + 1;
+        if let CommandData::SubmitList(submit) = &command_data {
+            trace_gpu_thread_submit(
+                1,
+                fence,
+                submit.channel,
+                submit.entries.command_lists.len(),
+                submit.entries.prefetch_command_list.len(),
+                0,
+            );
+        }
 
         self.state.emplace(CommandDataContainer {
             data: command_data,
@@ -449,9 +483,21 @@ fn run_thread(
         match next.data {
             CommandData::SubmitList(submit) => {
                 inc(&profile().pop_submit);
+                let list_count = submit.entries.command_lists.len();
+                let prefetch_count = submit.entries.prefetch_command_list.len();
+                trace_gpu_thread_submit(2, next.fence, submit.channel, list_count, prefetch_count, 0);
                 let start = std::time::Instant::now();
                 scheduler.push(submit.channel, submit.entries);
-                record_submit_elapsed(start.elapsed());
+                let elapsed = start.elapsed();
+                record_submit_elapsed(elapsed);
+                trace_gpu_thread_submit(
+                    3,
+                    next.fence,
+                    submit.channel,
+                    list_count,
+                    prefetch_count,
+                    elapsed.as_micros() as u64,
+                );
             }
             CommandData::GpuTick(_) => {
                 inc(&profile().pop_tick);

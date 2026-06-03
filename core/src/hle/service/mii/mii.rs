@@ -989,6 +989,86 @@ impl SessionRequestHandler for IStaticService {
     }
 }
 
+// ---------------------------------------------------------------------------
+// IImageDatabaseService — port of upstream IImageDatabaseService (mii.cpp:322-359)
+// ---------------------------------------------------------------------------
+
+pub struct IImageDatabaseService {
+    handlers: BTreeMap<u32, FunctionInfo>,
+    handlers_tipc: BTreeMap<u32, FunctionInfo>,
+}
+
+impl IImageDatabaseService {
+    pub fn new() -> Self {
+        Self {
+            handlers: build_handler_map(&[
+                (0, Some(Self::initialize_handler), "Initialize"),
+                (10, None, "Reload"),
+                (11, Some(Self::get_count_handler), "GetCount"),
+                (12, None, "IsEmpty"),
+                (13, None, "IsFull"),
+                (14, None, "GetAttribute"),
+                (15, None, "LoadImage"),
+                (16, None, "AddOrUpdateImage"),
+                (17, None, "DeleteImages"),
+                (100, None, "DeleteFile"),
+                (101, None, "DestroyFile"),
+                (102, None, "ImportFile"),
+                (103, None, "ExportFile"),
+                (104, None, "ForceInitialize"),
+            ]),
+            handlers_tipc: BTreeMap::new(),
+        }
+    }
+
+    fn initialize_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        log::info!("IImageDatabaseService::Initialize called");
+        CmifResponse::result_only(ctx, RESULT_SUCCESS);
+    }
+
+    fn get_count_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        log::debug!("IImageDatabaseService::GetCount called");
+        let count = 0u32;
+        let mut response = CmifResponse::new(ctx, 3, 0, 0);
+        response.push_result(RESULT_SUCCESS);
+        response.push_raw(&count);
+    }
+}
+
+impl ServiceFramework for IImageDatabaseService {
+    fn get_service_name(&self) -> &str {
+        "miiimg"
+    }
+    fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers
+    }
+    fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers_tipc
+    }
+    fn invoke_request(&self, ctx: &mut HLERequestContext) {
+        let cmd = ctx.get_command();
+        if let Some(info) = self.handlers.get(&cmd) {
+            if let Some(handler) = info.handler_callback {
+                handler(self, ctx);
+            }
+        } else {
+            <Self as ServiceFramework>::report_unimplemented_function(self, ctx, None);
+        }
+    }
+}
+
+impl SessionRequestHandler for IImageDatabaseService {
+    fn handle_sync_request(&self, context: &mut HLERequestContext) -> ResultCode {
+        ServiceFramework::handle_sync_request_impl(self, context)
+    }
+    fn service_name(&self) -> &str {
+        "miiimg"
+    }
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1040,7 +1120,7 @@ mod tests {
 }
 
 // ---------------------------------------------------------------------------
-// LoopProcess — register mii:e and mii:u
+// LoopProcess — register mii:e, mii:u, and miiimg
 // ---------------------------------------------------------------------------
 
 /// Entry point for the Mii service module.
@@ -1067,6 +1147,12 @@ pub fn loop_process(system: crate::core::SystemRef) {
         Box::new(move || -> SessionRequestHandlerPtr {
             Arc::new(IStaticService::new(system, Arc::clone(&mgr_u), false))
         }),
+        64,
+    );
+
+    server_manager.register_named_service(
+        "miiimg",
+        Box::new(move || -> SessionRequestHandlerPtr { Arc::new(IImageDatabaseService::new()) }),
         64,
     );
 

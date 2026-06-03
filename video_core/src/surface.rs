@@ -143,6 +143,26 @@ pub fn pixel_format_from_render_target_format(format: u32) -> PixelFormat {
     }
 }
 
+/// Port of `PixelFormatFromDepthFormat` from `surface.cpp`.
+pub fn pixel_format_from_depth_format(format: u32) -> PixelFormat {
+    match format {
+        0x14 => PixelFormat::S8UintD24Unorm,
+        0x16 => PixelFormat::D24UnormS8Uint,
+        0x0A => PixelFormat::D32Float,
+        0x13 => PixelFormat::D16Unorm,
+        0x17 => PixelFormat::S8Uint,
+        0x19 => PixelFormat::D32FloatS8Uint,
+        0x15 => PixelFormat::X8D24Unorm,
+        _ => {
+            log::warn!(
+                "PixelFormatFromDepthFormat: unimplemented format=0x{:X}",
+                format
+            );
+            PixelFormat::S8UintD24Unorm
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Block width table
 // ---------------------------------------------------------------------------

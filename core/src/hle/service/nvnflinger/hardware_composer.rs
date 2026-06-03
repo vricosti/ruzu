@@ -12,15 +12,28 @@ use super::display::{Display, Layer};
 use super::hwc_layer::HwcLayer;
 use super::ui::fence::Fence;
 use crate::hle::service::nvdrv::devices::nvdisp_disp0::NvDispDisp0;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 type ConsumerId = i32;
 type ReleaseFrameNumber = u64;
 
 static HWC_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
+static HWC_EMPTY_ACQUIRE_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
 
 fn should_trace_hwc() -> bool {
     std::env::var_os("RUZU_TRACE_HWC").is_some()
+}
+
+fn should_emit_hwc_acquire_status(status: super::status::Status) -> bool {
+    if status == super::status::Status::NoError {
+        return true;
+    }
+    if std::env::var_os("RUZU_TRACE_HWC_ACQUIRE_SPAM").is_some() {
+        return true;
+    }
+
+    let count = HWC_EMPTY_ACQUIRE_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
+    count < 64 || count.is_power_of_two()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -230,7 +243,9 @@ impl HardwareComposer {
             }
         }
         if status != super::status::Status::NoError {
-            if common::trace::is_enabled(common::trace::cat::HWC) {
+            if common::trace::is_enabled(common::trace::cat::HWC)
+                && should_emit_hwc_acquire_status(status)
+            {
                 common::trace::emit_raw(
                     common::trace::cat::HWC,
                     &[

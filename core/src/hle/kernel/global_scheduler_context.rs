@@ -516,4 +516,23 @@ mod tests {
         let looked_up = gsc.get_thread_by_thread_id(0x1234);
         assert!(looked_up.is_some());
     }
+
+    #[test]
+    fn remove_thread_only_removes_matching_thread_id() {
+        let gsc = GlobalSchedulerContext::new();
+        let exiting = Arc::new(KThreadLock::new(KThread::new()));
+        let survivor = Arc::new(KThreadLock::new(KThread::new()));
+        exiting.lock().unwrap().thread_id = 0x10;
+        survivor.lock().unwrap().thread_id = 0x20;
+
+        gsc.add_thread(Arc::clone(&exiting));
+        gsc.add_thread(Arc::clone(&survivor));
+        gsc.remove_thread(0x10);
+
+        assert!(gsc.get_thread_by_thread_id(0x10).is_none());
+        assert!(Arc::ptr_eq(
+            &gsc.get_thread_by_thread_id(0x20).unwrap(),
+            &survivor
+        ));
+    }
 }

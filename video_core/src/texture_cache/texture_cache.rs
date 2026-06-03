@@ -642,6 +642,23 @@ impl TextureCacheBase {
                 );
             }
         }
+
+        let zeta = render_targets.zeta;
+        if zeta.enabled && zeta.address != 0 && zeta.width != 0 && zeta.height != 0 {
+            if let Some(cpu_addr) = gpu_to_cpu(zeta.address) {
+                let info = ImageInfo::from_zeta_info(&zeta, 0);
+                let image_id = self.find_or_insert_image_from_info(&info, zeta.address, cpu_addr);
+                self.find_image_view_from_image_info(image_id, &info, zeta.address);
+            } else if std::env::var_os("RUZU_TRACE_RT").is_some() {
+                log::info!(
+                    "[RT] miss translate zeta gpu=0x{:X} {}x{} fmt=0x{:X}",
+                    zeta.address,
+                    zeta.width,
+                    zeta.height,
+                    zeta.format
+                );
+            }
+        }
     }
 
     fn find_or_insert_render_target_image(
@@ -650,9 +667,17 @@ impl TextureCacheBase {
         cpu_addr: u64,
     ) -> ImageId {
         let info = ImageInfo::from_render_target_info(rt, 0);
+        self.find_or_insert_image_from_info(&info, rt.address, cpu_addr)
+    }
 
+    pub fn find_or_insert_image_from_info(
+        &mut self,
+        info: &ImageInfo,
+        gpu_addr: GPUVAddr,
+        cpu_addr: u64,
+    ) -> ImageId {
         if let Some((image_id, _)) = self.slot_images.iter().find(|(_, image)| {
-            image.gpu_addr == rt.address
+            image.gpu_addr == gpu_addr
                 && image.cpu_addr == cpu_addr
                 && image.info.size.width == info.size.width
                 && image.info.size.height == info.size.height
@@ -663,10 +688,10 @@ impl TextureCacheBase {
 
         let image_id = self
             .slot_images
-            .insert(ImageBase::new(info, rt.address, cpu_addr));
+            .insert(ImageBase::new(info.clone(), gpu_addr, cpu_addr));
         let image_size = self.slot_images[image_id].guest_size_bytes as usize;
         let map_id = self.slot_map_views.insert(ImageMapView::new(
-            rt.address, cpu_addr, image_size, image_id,
+            gpu_addr, cpu_addr, image_size, image_id,
         ));
         self.slot_images[image_id].map_view_id = map_id;
         self.register_image(image_id);
@@ -682,6 +707,15 @@ impl TextureCacheBase {
         gpu_addr: GPUVAddr,
     ) -> ImageViewId {
         let rt_info = ImageInfo::from_render_target_info(rt, 0);
+        self.find_image_view_from_image_info(image_id, &rt_info, gpu_addr)
+    }
+
+    pub fn find_image_view_from_image_info(
+        &mut self,
+        image_id: ImageId,
+        rt_info: &ImageInfo,
+        gpu_addr: GPUVAddr,
+    ) -> ImageViewId {
         let image = &self.slot_images[image_id];
         let view_type = super::util::render_target_image_view_type(&rt_info);
         let base = if image.info.image_type == ImageType::Linear {

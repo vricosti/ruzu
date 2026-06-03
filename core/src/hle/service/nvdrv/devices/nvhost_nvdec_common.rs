@@ -281,6 +281,10 @@ impl NvHostNvDecCommon {
         self.channel_type
     }
 
+    pub fn system(&self) -> SystemRef {
+        self.system
+    }
+
     pub fn host1x_channel_type(&self) -> Host1xChannelType {
         match self.channel_type {
             ChannelType::MsEnc => Host1xChannelType::MsEnc,

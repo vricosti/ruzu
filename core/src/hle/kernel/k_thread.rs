@@ -2509,16 +2509,7 @@ impl KThread {
                 );
             }
             self.resource_limit_release_hint = true;
-            let should_terminate_process = process.decrement_running_thread_count();
-            drop(process);
-
-            // If the running thread count reached zero, terminate the process.
-            // We must do this after dropping the process lock to avoid deadlock.
-            if should_terminate_process {
-                if let Some(parent) = self.parent.as_ref().and_then(Weak::upgrade) {
-                    parent.lock().unwrap().terminate();
-                }
-            }
+            let _ = process.decrement_running_thread_count();
         }
 
         // Perform termination under (simulated) scheduler lock.
@@ -2562,10 +2553,18 @@ impl KThread {
             }
         }
 
-        // Upstream: UNREACHABLE_MSG("KThread::Exit() would return")
-        // In the full fiber-based execution model, the scheduler context-switches
-        // away and this point is never reached.
-        log::error!("KThread::Exit() returned — upstream marks this as unreachable");
+        // Upstream: UNREACHABLE_MSG("KThread::Exit() would return").
+        // The cooperative Rust execution bridge returns to its caller so
+        // `PhysicalCore` can yield to the scheduler after SVC ExitThread.
+        if std::env::var_os("RUZU_TRACE_THREAD_EXIT_RETURN").is_some() {
+            log::error!(
+                "KThread::Exit() returned — upstream marks this as unreachable tid={} object_id=0x{:X} core={} prio={}",
+                self.thread_id,
+                self.object_id,
+                self.core_id,
+                self.priority,
+            );
+        }
     }
 
     /// Terminate the thread (called by another thread).

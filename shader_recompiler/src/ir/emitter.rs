@@ -574,7 +574,10 @@ impl<'a> Emitter<'a> {
         self.emit(Inst::new(Opcode::SharedAtomicXor32, vec![offset, value]))
     }
     pub fn shared_atomic_exchange_32(&mut self, offset: Value, value: Value) -> Value {
-        self.emit(Inst::new(Opcode::SharedAtomicExchange32, vec![offset, value]))
+        self.emit(Inst::new(
+            Opcode::SharedAtomicExchange32,
+            vec![offset, value],
+        ))
     }
 
     pub fn fp_round_even_64(&mut self, a: Value) -> Value {
@@ -1259,7 +1262,10 @@ impl<'a> Emitter<'a> {
     }
 
     pub fn shuffle_butterfly(&mut self, value: Value, index: Value, seg_mask: Value) -> Value {
-        self.emit(Inst::new(Opcode::ShuffleButterfly, vec![value, index, seg_mask]))
+        self.emit(Inst::new(
+            Opcode::ShuffleButterfly,
+            vec![value, index, seg_mask],
+        ))
     }
 
     pub fn shuffle_index(&mut self, value: Value, index: Value, seg_mask: Value) -> Value {

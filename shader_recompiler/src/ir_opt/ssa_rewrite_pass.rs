@@ -726,14 +726,16 @@ mod tests {
             block.append_inst(Inst::new(Opcode::SetPred, vec![pred, value]));
             block.append_inst(Inst::new(Opcode::GetPred, vec![pred]))
         };
-        program.syntax_list.push(crate::ir::program::SyntaxNode::If {
-            cond: Value::Inst(InstRef {
-                block: 0,
-                inst: get_idx,
-            }),
-            body: 0,
-            merge: 0,
-        });
+        program
+            .syntax_list
+            .push(crate::ir::program::SyntaxNode::If {
+                cond: Value::Inst(InstRef {
+                    block: 0,
+                    inst: get_idx,
+                }),
+                body: 0,
+                merge: 0,
+            });
 
         ssa_rewrite_pass(&mut program);
 

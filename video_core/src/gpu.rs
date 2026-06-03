@@ -43,6 +43,42 @@ static NEXT_MEMORY_MANAGER_ID: AtomicUsize = AtomicUsize::new(1);
 /// Device address type.
 pub type DAddr = u64;
 
+fn parse_trace_addr_list(name: &str) -> Option<Vec<u64>> {
+    let spec = std::env::var(name).ok()?;
+    let values = spec
+        .split(',')
+        .filter_map(|raw| {
+            let value = raw.trim();
+            if value.is_empty() {
+                return None;
+            }
+            if let Some(hex) = value
+                .strip_prefix("0x")
+                .or_else(|| value.strip_prefix("0X"))
+            {
+                u64::from_str_radix(hex, 16).ok()
+            } else {
+                value.parse::<u64>().ok()
+            }
+        })
+        .collect::<Vec<_>>();
+    (!values.is_empty()).then_some(values)
+}
+
+fn should_trace_cpu_write(addr: DAddr, size: u64) -> bool {
+    static TARGETS: std::sync::OnceLock<Option<Vec<u64>>> = std::sync::OnceLock::new();
+    let Some(targets) = TARGETS
+        .get_or_init(|| parse_trace_addr_list("RUZU_TRACE_CPU_WRITE_ADDRS"))
+        .as_deref()
+    else {
+        return false;
+    };
+    let end = addr.saturating_add(size);
+    targets
+        .iter()
+        .any(|&target| addr <= target && target < end)
+}
+
 /// Render target format enumeration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
@@ -688,10 +724,25 @@ impl Gpu {
     /// Notify rasterizer of a CPU write.
     /// Matches upstream `GPU::Impl::OnCPUWrite(DAddr, u64)`.
     pub fn on_cpu_write(&self, _addr: DAddr, _size: u64) -> bool {
+        let trace = should_trace_cpu_write(_addr, _size);
+        if trace {
+            log::warn!(
+                "[CPU_WRITE_TRACE] on_cpu_write begin addr=0x{:X} size=0x{:X}",
+                _addr,
+                _size
+            );
+        }
         let Some(rasterizer) = self.rasterizer_handle() else {
+            if trace {
+                log::warn!("[CPU_WRITE_TRACE] on_cpu_write no_rasterizer");
+            }
             return false;
         };
-        unsafe { rasterizer.as_mut() }.on_cpu_write(_addr, _size)
+        let result = unsafe { rasterizer.as_mut() }.on_cpu_write(_addr, _size);
+        if trace {
+            log::warn!("[CPU_WRITE_TRACE] on_cpu_write end result={}", result);
+        }
+        result
     }
 
     /// Flush and invalidate a region.

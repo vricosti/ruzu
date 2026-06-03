@@ -303,12 +303,7 @@ fn texture_pass_impl(
             if let Some(env) = env.as_deref_mut() {
                 let pixel_format = read_texture_pixel_format(env, &cbuf);
                 if is_pixel_format_snorm(pixel_format) {
-                    patch_texel_fetch(
-                        program,
-                        texture_inst.block,
-                        texture_inst.inst,
-                        pixel_format,
-                    );
+                    patch_texel_fetch(program, texture_inst.block, texture_inst.inst, pixel_format);
                 }
             }
         }
@@ -1429,7 +1424,10 @@ mod tests {
             Opcode::BoundImageSampleImplicitLod,
             vec![
                 Value::ImmU32(0x50),
-                Value::Inst(InstRef { block: 0, inst: coord }),
+                Value::Inst(InstRef {
+                    block: 0,
+                    inst: coord,
+                }),
             ],
             flags,
         ));

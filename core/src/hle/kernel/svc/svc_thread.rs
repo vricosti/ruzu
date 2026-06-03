@@ -674,6 +674,23 @@ pub fn exit_thread(system: &System) {
         return;
     };
 
+    // Upstream `ExitThread` removes the current thread from
+    // `GlobalSchedulerContext` before entering `KThread::Exit()`, so the global
+    // scheduler cannot pick it again while termination is being finalized.
+    let (thread_id, global_scheduler_context) = {
+        let thread_guard = thread.lock().unwrap();
+        (
+            thread_guard.get_thread_id(),
+            thread_guard
+                .global_scheduler_context
+                .as_ref()
+                .and_then(std::sync::Weak::upgrade),
+        )
+    };
+    if let Some(gsc) = global_scheduler_context {
+        gsc.lock().unwrap().remove_thread(thread_id);
+    }
+
     thread.lock().unwrap().exit();
     system.scheduler_arc().lock().unwrap().request_schedule();
 }

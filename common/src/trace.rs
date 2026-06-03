@@ -108,8 +108,16 @@ pub mod cat {
     /// nvhost_ctrl::IocCtrlEventWait. args = [stage_id, syncpt_id, threshold, timeout,
     /// is_allocation, slot, value_raw, result_id, min_value, target]
     pub const NVHOST_CTRL_WAIT: u16 = 16;
-    /// Scheduler state/PQ update. args = [stage, tid, old_state, new_state, prio, active_core,
-    /// top0, top1, top2, top3]
+    /// Scheduler state/PQ update.
+    /// stage=1..3 state/PQ args = [stage, tid, old_state, new_state, prio, active_core,
+    ///  top0, top1, top2, top3]
+    /// stage=4 schedule_select args = [stage, cur_tid, highest_tid, target_tid, core,
+    ///  needs_scheduling, interrupt_task, switch_from_schedule, top0, top1, top2, top3]
+    /// stage=5 switch args = [stage, cur_tid, next_tid, 0, core, has_gsc, prev_tid]
+    /// stage=6 scheduler_lock_unlock args = [stage, owner_sched_id, guest_tid, cores_needing,
+    ///  lock_count_after_decrement]
+    /// stage=7 scheduler_lock_enable args = [stage, owner_sched_id, guest_tid, cores_needing,
+    ///  lock_count_after_decrement]
     pub const SCHED_STATE: u16 = 17;
     /// WaitSynchronization object attribution. args =
     /// [stage, guest_tid, num_handles, timeout_ns, result, out_index,
@@ -141,7 +149,8 @@ pub mod cat {
     pub const RT_SAMPLE: u16 = 23;
     /// OpenGL texture binding address attribution. args =
     /// [draw_seq, pipeline, stage, unit, view_id, image_id, view_gpu_addr,
-    ///  width, height, sample0_rgba, sample_mid_rgba]
+    ///  width, height, gl_handle, desc_texture_type, desc_is_depth,
+    ///  desc_is_multisample]
     pub const TEXTURE_BIND_ADDR: u16 = 24;
     /// Filtered OpenGL render-target sparse-grid readback. args =
     /// [draw_seq, pipeline, fbo, rt0_gpu, width, height, grid_w, grid_h,
@@ -171,6 +180,9 @@ pub mod cat {
     /// [stage, view_id, image_id, image_texture, current_texture, default_handle,
     ///  color2d_handle, color_array2d_handle, view_type, format, size_pack,
     ///  gpu_addr, range_pack, flags]
+    /// stage=9 swizzle [stage, view_id, image_id, image_texture, gpu_addr, format,
+    ///  view_type, source_swizzle_pack, gl_swizzle_pack, default_handle,
+    ///  color2d_handle, color_array2d_handle]
     pub const IMAGE_VIEW: u16 = 28;
     /// Audio renderer device-sink sample attribution. args =
     /// [seq, sample_buffer, input_count, buffer_count, sample_count, frames,
@@ -182,6 +194,7 @@ pub mod cat {
     /// stage=3 nvdec execute [stage, id, codec, initialized]
     /// stage=4 decode_api [stage, op, codec, result, packet_size]
     /// stage=5 vic execute [stage, id, config_addr]
+    /// stage=6 vic timing [stage, id, step, elapsed_us, aux0, aux1, aux2]
     pub const HOST1X_VIDEO: u16 = 30;
     /// Invalid IPC command buffer attribution. args =
     /// [seq, service_id, cmd, guest_tid, tls, w0, w1, w2, w3, w4, w5, w6, w7, w8]
@@ -198,6 +211,58 @@ pub mod cat {
     /// stage=5 queue_return [stage, seq, status, slot]
     /// stage=6 cancel [stage, seq, slot]
     pub const BQP: u16 = 33;
+    /// Present-time OpenGL texture readback by guest GPU address. args =
+    /// [present_index, gpu_addr, image_id, texture, width, height, format,
+    ///  gl_error, samples, rgb_nonzero, alpha_nonzero, checksum, first_rgba, last_rgba]
+    pub const PRESENT_TEXTURE: u16 = 34;
+    /// Audio renderer voice-command generation summary. args =
+    /// [seq, sorted, in_use, skipped, active, processed_voices,
+    ///  processed_channels, data_pushed, data_skip_was_playing, no_state,
+    ///  no_command, connected_channels, valid_wavebuffers, nonzero_wavebuffer_addr]
+    pub const AUDIO_VOICE: u16 = 35;
+    /// OpenGL render-target depth/zeta attachment attribution. args =
+    /// [framebuffer, view_id, image_id, zeta_gpu_addr, format, size_pack,
+    ///  texture, attachment, buffer_bits, framebuffer_status, color0_view,
+    ///  color1_view, draw_buffers_pack]
+    pub const RT_DEPTH_ATTACH: u16 = 36;
+    /// OpenGL render-target zeta snapshot attribution. args =
+    /// [draw_seq, pipeline, framebuffer, zeta_enabled, zeta_gpu_addr,
+    ///  zeta_format, zeta_size_pack, rt0_gpu_addr, rt0_format, rt0_size_pack,
+    ///  depth_test_enable, depth_write_enable, depth_func, depth_mode]
+    pub const RT_ZETA_BIND: u16 = 37;
+    /// nvhost_gpu::SubmitGpfifo syncpoint attribution. args =
+    /// [stage, seq, tid, bind_id, syncpoint_id, flags, increment,
+    ///  fence_in_id, fence_in_value, fence_out_value, min_value, max_value]
+    pub const SUBMIT_GPFIFO: u16 = 38;
+    /// video_core Host1x syncpoint attribution. args =
+    /// [stage, is_guest, syncpoint_id, expected_or_new, current, action_count]
+    pub const HOST1X_SYNCPOINT: u16 = 39;
+    /// video_core GPU thread submit attribution. args =
+    /// [stage, fence, channel, list_count, prefetch_count, elapsed_us]
+    pub const GPU_THREAD: u16 = 40;
+    /// video_core DmaPusher step attribution. Stage 1-8 args =
+    /// [stage, queue_len, subindex, addr, size, non_main, method_count, dma_get,
+    ///  elapsed_us]. Stage 9 method aggregate args =
+    /// [stage, command_count, dispatch_count, subchannel, method, calls, words,
+    ///  elapsed_us, dma_get]
+    pub const DMA_PUSHER: u16 = 41;
+    /// OpenGL draw phase timing. args =
+    /// [draw_seq, pipeline, indexed, primitive, vertices, instances, total_us,
+    ///  pipeline_us, rt_us, build_us, configure_us, update_buffers_us,
+    ///  bind_buffers_us, sync_draw_us]
+    pub const GL_DRAW_PROFILE: u16 = 42;
+    /// Present-time GL texture-view alias comparison. args =
+    /// [present_index, gpu_addr, image_id, view_id, current_texture, view_texture,
+    ///  width, height, current_checksum, view_checksum, current_rgb_nonzero,
+    ///  view_rgb_nonzero, current_first_rgba, view_first_rgba]
+    pub const PRESENT_ALIAS: u16 = 43;
+    /// Texture-cache framebuffer image selection for presentation. args =
+    /// [cpu_addr, gpu_addr, image_id, view_id, candidates, flags, modification_tick,
+    ///  aliases, overlaps, width, height, image_format, fb_pixel_format, fb_blending]
+    pub const PRESENT_IMAGE_SELECT: u16 = 44;
+    /// SVC SendSyncRequest progress attribution. args =
+    /// [stage, tid, handle, client_obj, tls, aux0, aux1, aux2]
+    pub const SVC_IPC_PROGRESS: u16 = 45;
 }
 
 fn service_registry() -> &'static Mutex<Vec<String>> {
@@ -351,6 +416,7 @@ pub struct Config {
     pub ipc_request_dump: bool,
     pub ipc_invalid_trace: bool,
     pub ipc_reply_wake_trace: bool,
+    pub svc_ipc_progress_trace: bool,
     pub bqp_trace: bool,
     pub gpu_va_trace: bool,
     pub heap_trace: bool,
@@ -375,8 +441,19 @@ pub struct Config {
     pub texture_bind_addr_trace: bool,
     pub gl_draw_state_trace: bool,
     pub image_view_trace: bool,
+    pub present_texture_trace: bool,
     pub audio_device_sink_trace: bool,
+    pub audio_voice_trace: bool,
     pub host1x_video_trace: bool,
+    pub host1x_syncpoint_trace: bool,
+    pub gpu_thread_trace: bool,
+    pub dma_pusher_trace: bool,
+    pub gl_draw_profile_trace: bool,
+    pub present_alias_trace: bool,
+    pub present_image_select_trace: bool,
+    pub rt_depth_attach_trace: bool,
+    pub rt_zeta_bind_trace: bool,
+    pub submit_gpfifo_trace: bool,
     /// Sink target: "stderr" or "file".
     pub output_target: String,
     /// File path when target == "file".
@@ -397,6 +474,7 @@ impl Default for Config {
             ipc_request_dump: false,
             ipc_invalid_trace: false,
             ipc_reply_wake_trace: false,
+            svc_ipc_progress_trace: false,
             bqp_trace: false,
             gpu_va_trace: false,
             heap_trace: false,
@@ -421,14 +499,71 @@ impl Default for Config {
             texture_bind_addr_trace: false,
             gl_draw_state_trace: false,
             image_view_trace: false,
+            present_texture_trace: false,
             audio_device_sink_trace: false,
+            audio_voice_trace: false,
             host1x_video_trace: false,
+            host1x_syncpoint_trace: false,
+            gpu_thread_trace: false,
+            dma_pusher_trace: false,
+            gl_draw_profile_trace: false,
+            present_alias_trace: false,
+            present_image_select_trace: false,
+            rt_depth_attach_trace: false,
+            rt_zeta_bind_trace: false,
+            submit_gpfifo_trace: false,
             output_target: "stderr".to_string(),
             output_file: String::new(),
             ring_capacity: 16384,
             drain_interval_us: 1000,
             lossless: false,
         }
+    }
+}
+
+impl Config {
+    fn any_trace_enabled(&self) -> bool {
+        self.ipc_reply_dump
+            || self.ipc_request_dump
+            || self.ipc_invalid_trace
+            || self.ipc_reply_wake_trace
+            || self.svc_ipc_progress_trace
+            || self.bqp_trace
+            || self.gpu_va_trace
+            || self.heap_trace
+            || self.tid_svc_trace
+            || self.watch_read_write
+            || self.stlex_trace
+            || self.unmapped_write_trace
+            || self.bl_hit_trace
+            || self.ipc_handle_out
+            || self.ipc_domain_out
+            || self.host_thread_ipc_trace
+            || self.plu_ipc_trace
+            || self.nvhost_ctrl_wait_trace
+            || self.sched_state_trace
+            || self.wait_sync_trace
+            || self.hwc_trace
+            || self.texture_bind_trace
+            || self.cbuf_bind_trace
+            || self.rt_bind_trace
+            || self.rt_sample_trace
+            || self.texture_bind_addr_trace
+            || self.gl_draw_state_trace
+            || self.image_view_trace
+            || self.present_texture_trace
+            || self.audio_device_sink_trace
+            || self.audio_voice_trace
+            || self.host1x_video_trace
+            || self.host1x_syncpoint_trace
+            || self.gpu_thread_trace
+            || self.dma_pusher_trace
+            || self.gl_draw_profile_trace
+            || self.present_alias_trace
+            || self.present_image_select_trace
+            || self.rt_depth_attach_trace
+            || self.rt_zeta_bind_trace
+            || self.submit_gpfifo_trace
     }
 }
 
@@ -505,6 +640,12 @@ fn build_config() -> Config {
         ipc_request_dump: get_bool("ipc", "request_dump", "RUZU_IPC_REQUEST_DUMP", false),
         ipc_invalid_trace: get_bool("ipc", "invalid", "RUZU_TRACE_IPC_INVALID", false),
         ipc_reply_wake_trace: get_bool("ipc", "reply_wake", "RUZU_TRACE_IPC_REPLY_WAKE", false),
+        svc_ipc_progress_trace: get_bool(
+            "ipc",
+            "svc_progress",
+            "RUZU_TRACE_SVC_IPC_PROGRESS",
+            false,
+        ),
         bqp_trace: get_bool("nvnflinger", "bqp", "RUZU_TRACE_BQP_RING", false),
         gpu_va_trace: get_bool("nvdrv", "gpu_va_trace", "RUZU_TRACE_GPU_VA", false),
         heap_trace: get_bool("svc", "heap_trace", "RUZU_TRACE_HEAP", false),
@@ -564,13 +705,64 @@ fn build_config() -> Config {
             "RUZU_TRACE_IMAGE_VIEW_RING",
             false,
         ),
+        present_texture_trace: get_bool(
+            "opengl",
+            "present_texture",
+            "RUZU_TRACE_PRESENT_TEXTURE_RING",
+            false,
+        ),
         audio_device_sink_trace: get_bool(
             "audio",
             "device_sink",
             "RUZU_TRACE_AUDIO_DEVICE_SINK",
             false,
         ),
+        audio_voice_trace: get_bool("audio", "voice", "RUZU_TRACE_AUDIO_VOICE", false),
         host1x_video_trace: get_bool("host1x", "video", "RUZU_TRACE_HOST1X_VIDEO", false),
+        host1x_syncpoint_trace: get_bool(
+            "host1x",
+            "syncpoint",
+            "RUZU_TRACE_HOST1X_SYNCPOINT_RING",
+            false,
+        ),
+        gpu_thread_trace: get_bool("gpu", "thread", "RUZU_TRACE_GPU_THREAD_RING", false),
+        dma_pusher_trace: get_bool("gpu", "dma_pusher", "RUZU_TRACE_DMA_PUSHER_RING", false),
+        gl_draw_profile_trace: get_bool(
+            "opengl",
+            "draw_profile",
+            "RUZU_TRACE_GL_DRAW_PROFILE_RING",
+            false,
+        ),
+        present_alias_trace: get_bool(
+            "opengl",
+            "present_alias",
+            "RUZU_TRACE_PRESENT_ALIAS_RING",
+            false,
+        ),
+        present_image_select_trace: get_bool(
+            "opengl",
+            "present_image_select",
+            "RUZU_TRACE_PRESENT_IMAGE_SELECT_RING",
+            false,
+        ),
+        rt_depth_attach_trace: get_bool(
+            "opengl",
+            "rt_depth_attach",
+            "RUZU_TRACE_RT_DEPTH_ATTACH_RING",
+            false,
+        ),
+        rt_zeta_bind_trace: get_bool(
+            "opengl",
+            "rt_zeta_bind",
+            "RUZU_TRACE_RT_ZETA_BIND_RING",
+            false,
+        ),
+        submit_gpfifo_trace: get_bool(
+            "nvdrv",
+            "submit_gpfifo",
+            "RUZU_TRACE_SUBMIT_GPFIFO_RING",
+            false,
+        ),
         output_target: get_str("output", "target", "RUZU_TRACE_TARGET", "stderr"),
         output_file: get_str("output", "file_path", "RUZU_TRACE_FILE", ""),
         ring_capacity: get_u64("output", "ring_capacity", 16384) as usize,
@@ -584,8 +776,11 @@ pub fn config() -> &'static Config {
     static CFG: OnceLock<Config> = OnceLock::new();
     CFG.get_or_init(|| {
         let cfg = build_config();
-        // Spawn drain thread lazily, on first config access. Idempotent.
-        ensure_drain_thread(&cfg);
+        // Keep clean runs free of trace-thread wakeups; emitters only need the
+        // drain thread when a category is actually enabled.
+        if cfg.any_trace_enabled() {
+            ensure_drain_thread(&cfg);
+        }
         cfg
     })
 }
@@ -599,6 +794,7 @@ pub fn is_enabled(category: u16) -> bool {
         cat::IPC_REQUEST => c.ipc_request_dump,
         cat::IPC_INVALID => c.ipc_invalid_trace,
         cat::IPC_REPLY_WAKE => c.ipc_reply_wake_trace,
+        cat::SVC_IPC_PROGRESS => c.svc_ipc_progress_trace,
         cat::BQP => c.bqp_trace,
         cat::GPU_VA_MAP | cat::GPU_VA_UNMAP => c.gpu_va_trace,
         cat::HEAP => c.heap_trace,
@@ -624,8 +820,19 @@ pub fn is_enabled(category: u16) -> bool {
         cat::GL_DRAW_STATE => c.gl_draw_state_trace,
         cat::RT_GRID_PHASE => c.rt_sample_trace,
         cat::IMAGE_VIEW => c.image_view_trace,
+        cat::PRESENT_TEXTURE => c.present_texture_trace,
         cat::AUDIO_DEVICE_SINK => c.audio_device_sink_trace,
+        cat::AUDIO_VOICE => c.audio_voice_trace,
         cat::HOST1X_VIDEO => c.host1x_video_trace,
+        cat::HOST1X_SYNCPOINT => c.host1x_syncpoint_trace,
+        cat::GPU_THREAD => c.gpu_thread_trace,
+        cat::DMA_PUSHER => c.dma_pusher_trace,
+        cat::GL_DRAW_PROFILE => c.gl_draw_profile_trace,
+        cat::PRESENT_ALIAS => c.present_alias_trace,
+        cat::PRESENT_IMAGE_SELECT => c.present_image_select_trace,
+        cat::RT_DEPTH_ATTACH => c.rt_depth_attach_trace,
+        cat::RT_ZETA_BIND => c.rt_zeta_bind_trace,
+        cat::SUBMIT_GPFIFO => c.submit_gpfifo_trace,
         _ => false,
     }
 }
@@ -758,13 +965,17 @@ fn format_into(out: &mut String, rec: &LogRecord) {
         }
         cat::IPC_REQUEST => {
             let svc = service_name(rec.args[1] as u16);
-            let _ = write!(out, "IPC_REQUEST seq={} service={} cmd={}", rec.args[0], svc, rec.args[2]);
+            let _ = write!(
+                out,
+                "IPC_REQUEST seq={} service={} cmd={} tid={}",
+                rec.args[0], svc, rec.args[2], rec.args[4]
+            );
             let ioctl = rec.args[3] as u32;
             if ioctl != 0 {
                 let _ = write!(out, " ioctl=0x{:08X}", ioctl);
             }
             out.push_str(" payload=");
-            for i in 4..rec.arg_count as usize {
+            for i in 5..rec.arg_count as usize {
                 let _ = write!(out, "{:08x} ", rec.args[i] as u32);
             }
             out.pop();
@@ -1009,6 +1220,33 @@ fn format_into(out: &mut String, rec: &LogRecord) {
                 }
             }
         }
+        cat::SVC_IPC_PROGRESS => {
+            let stage = match rec.args[0] {
+                1 => "enter",
+                2 => "resolved_client",
+                3 => "inline_prepare",
+                4 => "inline_receive_begin",
+                5 => "inline_receive_end",
+                6 => "handler_begin",
+                7 => "handler_end",
+                8 => "reply_begin",
+                9 => "reply_end",
+                10 => "return",
+                _ => "unknown",
+            };
+            let _ = writeln!(
+                out,
+                "[SVC_IPC_PROGRESS] stage={} tid={} handle=0x{:X} client_obj={} tls=0x{:X} aux=[0x{:X},0x{:X},0x{:X}]",
+                stage,
+                rec.args[1],
+                rec.args[2] as u32,
+                rec.args[3],
+                rec.args[4],
+                rec.args[5],
+                rec.args[6],
+                rec.args[7],
+            );
+        }
         cat::NVHOST_CTRL_WAIT => {
             let stage = match rec.args[0] {
                 1 => "begin",
@@ -1046,12 +1284,6 @@ fn format_into(out: &mut String, rec: &LogRecord) {
             );
         }
         cat::SCHED_STATE => {
-            let stage = match rec.args[0] {
-                1 => "transition",
-                2 => "pq_remove",
-                3 => "pq_push",
-                _ => "unknown",
-            };
             let top = |idx: usize| -> String {
                 let value = rec.args[idx];
                 if value == u64::MAX {
@@ -1060,20 +1292,77 @@ fn format_into(out: &mut String, rec: &LogRecord) {
                     value.to_string()
                 }
             };
-            let _ = writeln!(
-                out,
-                "[SCHED_STATE] stage={} tid={} old=0x{:X} new=0x{:X} prio={} core={} top=[{},{},{},{}]",
-                stage,
-                rec.args[1],
-                rec.args[2],
-                rec.args[3],
-                rec.args[4] as i32,
-                rec.args[5] as i32,
-                top(6),
-                top(7),
-                top(8),
-                top(9),
-            );
+            match rec.args[0] {
+                1..=3 => {
+                    let stage = match rec.args[0] {
+                        1 => "transition",
+                        2 => "pq_remove",
+                        3 => "pq_push",
+                        _ => unreachable!(),
+                    };
+                    let _ = writeln!(
+                        out,
+                        "[SCHED_STATE] stage={} tid={} old=0x{:X} new=0x{:X} prio={} core={} top=[{},{},{},{}]",
+                        stage,
+                        rec.args[1],
+                        rec.args[2],
+                        rec.args[3],
+                        rec.args[4] as i32,
+                        rec.args[5] as i32,
+                        top(6),
+                        top(7),
+                        top(8),
+                        top(9),
+                    );
+                }
+                4 => {
+                    let _ = writeln!(
+                        out,
+                        "[SCHED_STATE] stage=schedule_select cur={} highest={} target={} core={} needs={} interrupt={} switch_from={} top=[{},{},{},{}]",
+                        top(1),
+                        top(2),
+                        top(3),
+                        rec.args[4] as i32,
+                        rec.args[5] != 0,
+                        rec.args[6] != 0,
+                        rec.args[7] != 0,
+                        top(8),
+                        top(9),
+                        top(10),
+                        top(11),
+                    );
+                }
+                5 => {
+                    let _ = writeln!(
+                        out,
+                        "[SCHED_STATE] stage=switch cur={} next={} core={} has_gsc={} prev={}",
+                        top(1),
+                        top(2),
+                        rec.args[4] as i32,
+                        rec.args[5] != 0,
+                        top(6),
+                    );
+                }
+                6 | 7 => {
+                    let stage = if rec.args[0] == 6 {
+                        "scheduler_lock_unlock"
+                    } else {
+                        "scheduler_lock_enable"
+                    };
+                    let _ = writeln!(
+                        out,
+                        "[SCHED_STATE] stage={} owner_sched_id={} guest_tid={} cores=0x{:X} lock_count={}",
+                        stage,
+                        rec.args[1],
+                        top(2),
+                        rec.args[3],
+                        rec.args[4] as i32,
+                    );
+                }
+                _ => {
+                    let _ = writeln!(out, "[SCHED_STATE] stage=unknown args={:?}", rec.args);
+                }
+            }
         }
         cat::WAIT_SYNC => {
             let stage = match rec.args[0] {
@@ -1188,60 +1477,66 @@ fn format_into(out: &mut String, rec: &LogRecord) {
                 1 => {
                     let _ = writeln!(
                         out,
-                        "[BQP] stage=dequeue_enter seq={} async={} size={}x{} format=0x{:X} usage=0x{:X}",
+                        "[BQP] stage=dequeue_enter seq={} async={} size={}x{} format=0x{:X} usage=0x{:X} tid={}",
                         rec.args[1],
                         rec.args[2] != 0,
                         rec.args[3],
                         rec.args[4],
                         rec.args[5],
                         rec.args[6],
+                        rec.args.get(7).copied().unwrap_or(0),
                     );
                 }
                 2 => {
                     let _ = writeln!(
                         out,
-                        "[BQP] stage=dequeue_return seq={} status={} slot={} flags=0x{:X}",
+                        "[BQP] stage=dequeue_return seq={} status={} slot={} flags=0x{:X} tid={}",
                         rec.args[1],
                         rec.args[2] as i32,
                         rec.args[3] as i32,
                         rec.args[4],
+                        rec.args.get(5).copied().unwrap_or(0),
                     );
                 }
                 3 => {
                     let _ = writeln!(
                         out,
-                        "[BQP] stage=queue_enter seq={} slot={}",
+                        "[BQP] stage=queue_enter seq={} slot={} tid={}",
                         rec.args[1],
                         rec.args[2] as i32,
+                        rec.args.get(3).copied().unwrap_or(0),
                     );
                 }
                 4 => {
                     let _ = writeln!(
                         out,
-                        "[BQP] stage=queue_commit seq={} slot={} frame={} queue_len={} droppable={} acquire_called={}",
+                        "[BQP] stage=queue_commit seq={} slot={} frame={} queue_len={} droppable={} acquire_called={} tid={}",
                         rec.args[1],
                         rec.args[2] as i32,
                         rec.args[3],
                         rec.args[4],
                         rec.args[5] != 0,
                         rec.args[6] != 0,
+                        rec.args.get(7).copied().unwrap_or(0),
                     );
                 }
                 5 => {
                     let _ = writeln!(
                         out,
-                        "[BQP] stage=queue_return seq={} status={} slot={}",
+                        "[BQP] stage=queue_return seq={} status={} slot={} tid={}",
                         rec.args[1],
                         rec.args[2] as i32,
                         rec.args[3] as i32,
+                        rec.args.get(4).copied().unwrap_or(0),
                     );
                 }
                 6 => {
                     let _ = writeln!(
                         out,
-                        "[BQP] stage=cancel seq={} slot={}",
+                        "[BQP] stage=cancel seq={} slot={} tid={}",
                         rec.args[1],
                         rec.args[2] as i32,
+                        rec.args.get(3).copied().unwrap_or(0),
                     );
                 }
                 _ => {
@@ -1340,6 +1635,78 @@ fn format_into(out: &mut String, rec: &LogRecord) {
                 rt1_h,
                 surface_w,
                 surface_h,
+            );
+        }
+        cat::RT_DEPTH_ATTACH => {
+            let width = rec.args[5] >> 32;
+            let height = rec.args[5] & 0xffff_ffff;
+            let _ = writeln!(
+                out,
+                "[RT_DEPTH_ATTACH] fbo={} view_id={} image_id={} zeta_gpu=0x{:X} fmt=0x{:X} size={}x{} texture={} attachment=0x{:X} buffer_bits=0x{:X} status=0x{:X} color0_view={} color1_view={} draw_buffers=0x{:X}",
+                rec.args[0],
+                rec.args[1],
+                rec.args[2],
+                rec.args[3],
+                rec.args[4],
+                width,
+                height,
+                rec.args[6],
+                rec.args[7],
+                rec.args[8],
+                rec.args[9],
+                rec.args[10],
+                rec.args[11],
+                rec.args[12],
+            );
+        }
+        cat::RT_ZETA_BIND => {
+            let zeta_width = rec.args[6] >> 32;
+            let zeta_height = rec.args[6] & 0xffff_ffff;
+            let rt0_width = rec.args[9] >> 32;
+            let rt0_height = rec.args[9] & 0xffff_ffff;
+            let _ = writeln!(
+                out,
+                "[RT_ZETA_BIND] draw_seq={} pipeline={} fbo={} zeta_enabled={} zeta_gpu=0x{:X} zeta_fmt=0x{:X} zeta_size={}x{} rt0_gpu=0x{:X} rt0_fmt=0x{:X} rt0_size={}x{} depth_test={} depth_write={} depth_func=0x{:X} depth_mode=0x{:X}",
+                rec.args[0],
+                rec.args[1],
+                rec.args[2],
+                rec.args[3],
+                rec.args[4],
+                rec.args[5],
+                zeta_width,
+                zeta_height,
+                rec.args[7],
+                rec.args[8],
+                rt0_width,
+                rt0_height,
+                rec.args[10],
+                rec.args[11],
+                rec.args[12],
+                rec.args[13],
+            );
+        }
+        cat::SUBMIT_GPFIFO => {
+            let stage = match rec.args[0] {
+                1 => "after-max",
+                2 => "after-push-main",
+                3 => "after-push-fence",
+                _ => "unknown",
+            };
+            let _ = writeln!(
+                out,
+                "[SUBMIT_GPFIFO] stage={} seq={} tid={} bind_id={} syncpt_id={} flags=0x{:X} increment={} fence_in={{id={}, value={}}} fence_out_value={} min={} max={}",
+                stage,
+                rec.args[1],
+                rec.args[2],
+                rec.args[3],
+                rec.args[4],
+                rec.args[5],
+                rec.args[6],
+                rec.args[7] as i32,
+                rec.args[8],
+                rec.args[9],
+                rec.args[10],
+                rec.args[11],
             );
         }
         cat::RT_SAMPLE => {
@@ -1529,7 +1896,7 @@ fn format_into(out: &mut String, rec: &LogRecord) {
         cat::TEXTURE_BIND_ADDR => {
             let _ = writeln!(
                 out,
-                "[TEXTURE_BIND_ADDR] draw_seq={} pipeline={} stage={} unit={} view_id={} image_id={} gpu=0x{:X} size={}x{} sample0=0x{:08X} sample_mid=0x{:08X}",
+                "[TEXTURE_BIND_ADDR] draw_seq={} pipeline={} stage={} unit={} view_id={} image_id={} gpu=0x{:X} size={}x{} handle={} desc_type={} is_depth={} is_msaa={}",
                 rec.args[0],
                 rec.args[1],
                 rec.args[2],
@@ -1541,6 +1908,8 @@ fn format_into(out: &mut String, rec: &LogRecord) {
                 rec.args[8],
                 rec.args[9],
                 rec.args[10],
+                rec.args[11],
+                rec.args[12],
             );
         }
         cat::IMAGE_VIEW => {
@@ -1553,6 +1922,7 @@ fn format_into(out: &mut String, rec: &LogRecord) {
                 6 => "rt_view_create",
                 7 => "rt_view_mismatch",
                 8 => "cache_unmap_clear",
+                9 => "swizzle",
                 _ => "unknown",
             };
             let view_type = match rec.args[8] {
@@ -1567,6 +1937,36 @@ fn format_into(out: &mut String, rec: &LogRecord) {
                 8 => "Buffer",
                 _ => "unknown",
             };
+            if rec.args[0] == 9 {
+                let view_type = match rec.args[6] {
+                    0 => "E1D",
+                    1 => "E2D",
+                    2 => "Cube",
+                    3 => "E3D",
+                    4 => "E1DArray",
+                    5 => "E2DArray",
+                    6 => "CubeArray",
+                    7 => "Rect",
+                    8 => "Buffer",
+                    _ => "unknown",
+                };
+                let _ = writeln!(
+                    out,
+                    "[IMAGE_VIEW] stage=swizzle view_id={} image_id={} image_tex={} gpu=0x{:X} format={} view_type={} source_swizzle=0x{:08X} gl_swizzle=0x{:016X} default={} color2d={} color_array2d={}",
+                    rec.args[1],
+                    rec.args[2],
+                    rec.args[3],
+                    rec.args[4],
+                    rec.args[5],
+                    view_type,
+                    rec.args[7],
+                    rec.args[8],
+                    rec.args[9],
+                    rec.args[10],
+                    rec.args[11],
+                );
+                return;
+            }
             let size_w = rec.args[10] & 0xffff_ffff;
             let size_h = rec.args[10] >> 32;
             let range_level = rec.args[12] & 0xffff;
@@ -1596,6 +1996,110 @@ fn format_into(out: &mut String, rec: &LogRecord) {
                 rec.args[13],
             );
         }
+        cat::PRESENT_TEXTURE => {
+            if rec.args[0] == u64::MAX {
+                let _ = writeln!(
+                    out,
+                    "[PRESENT_LAYER] stage={} gpu=0x{:X} base=0x{:X} offset=0x{:X} size={}x{} stride={} fmt=0x{:X} aux0=0x{:X} aux1=0x{:X} aux2=0x{:X} aux3=0x{:X}",
+                    rec.args[1],
+                    rec.args[2],
+                    rec.args[3],
+                    rec.args[4],
+                    rec.args[5],
+                    rec.args[6],
+                    rec.args[7],
+                    rec.args[8],
+                    rec.args[9],
+                    rec.args[10],
+                    rec.args[11],
+                    rec.args[12],
+                );
+                return;
+            }
+            let image_id = if rec.args[2] == u64::MAX {
+                "missing".to_string()
+            } else {
+                rec.args[2].to_string()
+            };
+            let _ = writeln!(
+                out,
+                "[PRESENT_TEXTURE] present={} gpu=0x{:X} image={} texture={} size={}x{} fmt=0x{:X} gl_error=0x{:X} samples={} rgb_nonzero={} alpha_nonzero={} checksum=0x{:X} first_rgba=0x{:08X} last_rgba=0x{:08X}",
+                rec.args[0],
+                rec.args[1],
+                image_id,
+                rec.args[3],
+                rec.args[4],
+                rec.args[5],
+                rec.args[6],
+                rec.args[7],
+                rec.args[8],
+                rec.args[9],
+                rec.args[10],
+                rec.args[11],
+                rec.args[12],
+                rec.args[13],
+            );
+        }
+        cat::PRESENT_ALIAS => {
+            let image_id = if rec.args[2] == u64::MAX {
+                "missing".to_string()
+            } else {
+                rec.args[2].to_string()
+            };
+            let view_id = if rec.args[3] == u64::MAX {
+                "missing".to_string()
+            } else {
+                rec.args[3].to_string()
+            };
+            let _ = writeln!(
+                out,
+                "[PRESENT_ALIAS] present={} gpu=0x{:X} image={} view={} current_texture={} view_texture={} size={}x{} current_checksum=0x{:X} view_checksum=0x{:X} current_rgb_nonzero={} view_rgb_nonzero={} current_first_rgba=0x{:08X} view_first_rgba=0x{:08X}",
+                rec.args[0],
+                rec.args[1],
+                image_id,
+                view_id,
+                rec.args[4],
+                rec.args[5],
+                rec.args[6],
+                rec.args[7],
+                rec.args[8],
+                rec.args[9],
+                rec.args[10],
+                rec.args[11],
+                rec.args[12],
+                rec.args[13],
+            );
+        }
+        cat::PRESENT_IMAGE_SELECT => {
+            let image_id = if rec.args[2] == u64::MAX {
+                "missing".to_string()
+            } else {
+                rec.args[2].to_string()
+            };
+            let view_id = if rec.args[3] == u64::MAX {
+                "missing".to_string()
+            } else {
+                rec.args[3].to_string()
+            };
+            let _ = writeln!(
+                out,
+                "[PRESENT_IMAGE_SELECT] cpu=0x{:X} gpu=0x{:X} image={} view={} candidates={} flags=0x{:X} tick={} aliases={} overlaps={} size={}x{} fmt=0x{:X} fb_fmt=0x{:X} blending={}",
+                rec.args[0],
+                rec.args[1],
+                image_id,
+                view_id,
+                rec.args[4],
+                rec.args[5],
+                rec.args[6],
+                rec.args[7],
+                rec.args[8],
+                rec.args[9],
+                rec.args[10],
+                rec.args[11],
+                rec.args[12],
+                rec.args[13],
+            );
+        }
         cat::AUDIO_DEVICE_SINK => {
             let min_value = rec.args[6] as u32 as i32;
             let max_value = rec.args[7] as u32 as i32;
@@ -1619,6 +2123,26 @@ fn format_into(out: &mut String, rec: &LogRecord) {
                 first0,
                 first1,
                 first2,
+            );
+        }
+        cat::AUDIO_VOICE => {
+            let _ = writeln!(
+                out,
+                "[AUDIO_VOICE] seq={} sorted={} in_use={} skipped={} active={} processed_voices={} processed_channels={} data_pushed={} data_skip_was_playing={} no_state={} no_command={} connected_channels={} valid_wavebuffers={} nonzero_wavebuffer_addr={}",
+                rec.args[0],
+                rec.args[1],
+                rec.args[2],
+                rec.args[3],
+                rec.args[4],
+                rec.args[5],
+                rec.args[6],
+                rec.args[7],
+                rec.args[8],
+                rec.args[9],
+                rec.args[10],
+                rec.args[11],
+                rec.args[12],
+                rec.args[13],
             );
         }
         cat::HOST1X_VIDEO => {
@@ -1671,6 +2195,27 @@ fn format_into(out: &mut String, rec: &LogRecord) {
                         rec.args[2],
                     );
                 }
+                6 => {
+                    let step = match rec.args[2] {
+                        1 => "config_read",
+                        2 => "get_frame",
+                        3 => "read_yuv",
+                        4 => "blend",
+                        5 => "write_surface",
+                        6 => "total",
+                        _ => "unknown",
+                    };
+                    let _ = writeln!(
+                        out,
+                        "[HOST1X_VIDEO] stage=vic_timing id={} step={} elapsed_us={} aux0=0x{:X} aux1={} aux2={}",
+                        rec.args[1] as i32,
+                        step,
+                        rec.args[3],
+                        rec.args[4],
+                        rec.args[5],
+                        rec.args[6],
+                    );
+                }
                 _ => {
                     let _ = writeln!(
                         out,
@@ -1680,6 +2225,128 @@ fn format_into(out: &mut String, rec: &LogRecord) {
                     );
                 }
             }
+        }
+        cat::HOST1X_SYNCPOINT => {
+            let stage = match rec.args[0] {
+                1 => "register",
+                2 => "register-immediate",
+                3 => "increment",
+                4 => "wait-begin",
+                5 => "wait-ready",
+                _ => "unknown",
+            };
+            let _ = writeln!(
+                out,
+                "[HOST1X_SYNCPOINT] stage={} kind={} id={} value={} current={} actions={}",
+                stage,
+                if rec.args[1] != 0 { "guest" } else { "host" },
+                rec.args[2],
+                rec.args[3],
+                rec.args[4],
+                rec.args[5],
+            );
+        }
+        cat::GPU_THREAD => {
+            let stage = match rec.args[0] {
+                1 => "push-submit",
+                2 => "pop-submit-begin",
+                3 => "pop-submit-end",
+                _ => "unknown",
+            };
+            let _ = writeln!(
+                out,
+                "[GPU_THREAD] stage={} fence={} channel={} lists={} prefetch={} elapsed_us={}",
+                stage,
+                rec.args[1],
+                rec.args[2] as i32,
+                rec.args[3],
+                rec.args[4],
+                rec.args[5],
+            );
+        }
+        cat::DMA_PUSHER => {
+            let stage = match rec.args[0] {
+                1 => "dispatch-begin",
+                2 => "dispatch-end",
+                3 => "step-begin",
+                4 => "prefetch-begin",
+                5 => "prefetch-end",
+                6 => "header-begin",
+                7 => "header-end",
+                8 => "empty",
+                9 => "method-agg",
+                10 => "method-begin",
+                11 => "method-end",
+                12 => "multi-method-begin",
+                13 => "multi-method-end",
+                _ => "unknown",
+            };
+            if rec.args[0] == 9 {
+                let _ = writeln!(
+                    out,
+                    "[DMA_PUSHER] stage={} command_count={} dispatches={} subch={} method=0x{:X} calls={} words={} elapsed_us={} dma_get=0x{:X}",
+                    stage,
+                    rec.args[1],
+                    rec.args[2],
+                    rec.args[3],
+                    rec.args[4],
+                    rec.args[5],
+                    rec.args[6],
+                    rec.args[7],
+                    rec.args.get(8).copied().unwrap_or(0),
+                );
+                return;
+            }
+            if (10..=13).contains(&rec.args[0]) {
+                let _ = writeln!(
+                    out,
+                    "[DMA_PUSHER] stage={} dispatch={} index={}/{} subch={} method=0x{:X} arg_or_words=0x{:X} pending={} dma_segment=0x{:X} elapsed_us={}",
+                    stage,
+                    rec.args[1],
+                    rec.args[2],
+                    rec.args[3],
+                    rec.args[4],
+                    rec.args[5],
+                    rec.args[6],
+                    rec.args[7],
+                    rec.args[8],
+                    rec.args.get(9).copied().unwrap_or(0),
+                );
+                return;
+            }
+            let _ = writeln!(
+                out,
+                "[DMA_PUSHER] stage={} queue_len={} subindex={} addr=0x{:X} size={} non_main={} method_count={} dma_get=0x{:X} elapsed_us={}",
+                stage,
+                rec.args[1],
+                rec.args[2],
+                rec.args[3],
+                rec.args[4],
+                rec.args[5],
+                rec.args[6],
+                rec.args[7],
+                rec.args.get(8).copied().unwrap_or(0),
+            );
+        }
+        cat::GL_DRAW_PROFILE => {
+            let _ = writeln!(
+                out,
+                "[GL_DRAW_PROFILE_RING] draw_seq={} pipeline={} indexed={} primitive=0x{:X} vertices={} instances={} total_us={} pipeline_us={} rt_us={} build_us={} configure_us={} update_buffers_us={} bind_buffers_us={} sync_draw_us={}",
+                rec.args[0],
+                rec.args[1],
+                rec.args[2] != 0,
+                rec.args[3],
+                rec.args[4],
+                rec.args[5],
+                rec.args[6],
+                rec.args[7],
+                rec.args[8],
+                rec.args[9],
+                rec.args[10],
+                rec.args[11],
+                rec.args[12],
+                rec.args[13],
+            );
         }
         _ => {
             let _ = writeln!(out, "TRACE cat={} args={:?}", rec.category, &rec.args[..rec.arg_count as usize]);

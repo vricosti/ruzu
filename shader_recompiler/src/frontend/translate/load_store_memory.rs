@@ -107,11 +107,7 @@ pub fn ldg(tv: &mut TranslatorVisitor, insn: u64) {
     let size = LoadSize::from_bits(field(insn, 48, 3));
 
     match size {
-        LoadSize::U8
-        | LoadSize::S8
-        | LoadSize::U16
-        | LoadSize::S16
-        | LoadSize::B32 => {
+        LoadSize::U8 | LoadSize::S8 | LoadSize::U16 | LoadSize::S16 | LoadSize::B32 => {
             let val = tv.ir.load_global_32(address);
             tv.set_x(dst, val);
         }
@@ -150,11 +146,7 @@ pub fn stg(tv: &mut TranslatorVisitor, insn: u64) {
     let size = StoreSize::from_bits(field(insn, 48, 3));
 
     match size {
-        StoreSize::U8
-        | StoreSize::S8
-        | StoreSize::U16
-        | StoreSize::S16
-        | StoreSize::B32 => {
+        StoreSize::U8 | StoreSize::S8 | StoreSize::U16 | StoreSize::S16 | StoreSize::B32 => {
             let data = tv.x(src_data_reg);
             tv.ir.write_global_32(address, data);
         }

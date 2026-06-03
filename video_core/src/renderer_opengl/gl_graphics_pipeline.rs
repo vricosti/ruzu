@@ -486,6 +486,7 @@ impl GraphicsPipeline {
                 self.source_programs,
             );
         }
+        dump_glsl_for_pipeline_handle(self.program_pipeline, self.key.hash_key(), &self.glsl_sources);
 
         Ok(())
     }
@@ -651,6 +652,68 @@ fn dump_glsl_on_error(pipeline_hash: u64, stage_index: usize, source: &str, erro
     );
     if let Err(err) = std::fs::write(&log_path, log) {
         log::warn!("Failed to dump GLSL error log {}: {}", log_path.display(), err);
+    }
+}
+
+fn should_dump_pipeline_handle(handle: u32) -> bool {
+    let Some(spec) = std::env::var_os("RUZU_DUMP_GLSL_PIPELINE_HANDLES") else {
+        return false;
+    };
+    let spec = spec.to_string_lossy();
+    spec.split(',').any(|raw| {
+        let value = raw.trim();
+        if value == "*" {
+            return true;
+        }
+        if let Some(hex) = value
+            .strip_prefix("0x")
+            .or_else(|| value.strip_prefix("0X"))
+        {
+            return u32::from_str_radix(hex, 16).is_ok_and(|target| target == handle);
+        }
+        value.parse::<u32>().is_ok_and(|target| target == handle)
+    })
+}
+
+fn dump_glsl_for_pipeline_handle(
+    handle: u32,
+    pipeline_hash: u64,
+    sources: &[Option<String>; NUM_STAGES],
+) {
+    if handle == 0 || !should_dump_pipeline_handle(handle) {
+        return;
+    }
+    let dir = std::env::var_os("RUZU_DUMP_GLSL_PIPELINE_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from("/tmp/ruzu_pipeline_glsl"));
+    if let Err(err) = std::fs::create_dir_all(&dir) {
+        log::warn!(
+            "Failed to create RUZU_DUMP_GLSL_PIPELINE_DIR {}: {}",
+            dir.display(),
+            err
+        );
+        return;
+    }
+    for (stage_index, source) in sources.iter().enumerate() {
+        let Some(source) = source else { continue };
+        if source.is_empty() {
+            continue;
+        }
+        let path = dir.join(format!(
+            "pipeline_{handle}_key_{pipeline_hash:016X}_stage_{}.glsl",
+            stage_name(stage_index)
+        ));
+        if let Err(err) = std::fs::write(&path, source) {
+            log::warn!("Failed to dump GLSL source {}: {}", path.display(), err);
+        } else {
+            log::info!(
+                "[GLSL_PIPELINE_DUMP] pipeline={} stage={} bytes={} path={}",
+                handle,
+                stage_name(stage_index),
+                source.len(),
+                path.display()
+            );
+        }
     }
 }
 

@@ -105,7 +105,8 @@ impl ActionStorage {
     }
 
     /// Fire all actions whose expected_value <= new_value, in order.
-    fn fire_up_to(&mut self, new_value: u32) {
+    fn fire_up_to(&mut self, new_value: u32) -> usize {
+        let mut fired = 0;
         while let Some(front) = self.entries.front() {
             if front.expected_value > new_value {
                 break;
@@ -113,9 +114,35 @@ impl ActionStorage {
             let mut entry = self.entries.pop_front().unwrap();
             if let Some(action) = entry.action.take() {
                 action();
+                fired += 1;
             }
         }
+        fired
     }
+}
+
+fn trace_syncpoint(
+    stage: u64,
+    is_guest: bool,
+    syncpoint_id: usize,
+    value: u32,
+    current: u32,
+    actions: usize,
+) {
+    if !common::trace::is_enabled(common::trace::cat::HOST1X_SYNCPOINT) {
+        return;
+    }
+    common::trace::emit_raw(
+        common::trace::cat::HOST1X_SYNCPOINT,
+        &[
+            stage,
+            is_guest as u64,
+            syncpoint_id as u64,
+            value as u64,
+            current as u64,
+            actions as u64,
+        ],
+    );
 }
 
 /// Manages syncpoint values and registered wait actions.
@@ -252,6 +279,8 @@ impl SyncpointManager {
         self.wait(
             &self.syncpoints_guest[syncpoint_id as usize],
             &self.wait_guest_cv,
+            syncpoint_id as usize,
+            true,
             expected_value,
         );
     }
@@ -268,6 +297,8 @@ impl SyncpointManager {
         self.wait(
             &self.syncpoints_host[syncpoint_id as usize],
             &self.wait_host_cv,
+            syncpoint_id as usize,
+            false,
             expected_value,
         );
     }
@@ -291,7 +322,9 @@ impl SyncpointManager {
         action: Box<dyn FnOnce() + Send>,
     ) -> Option<ActionHandle> {
         // Fast path: already reached.
-        if syncpoint.load(Ordering::Acquire) >= expected_value {
+        let current = syncpoint.load(Ordering::Acquire);
+        if current >= expected_value {
+            trace_syncpoint(2, is_guest, storage_idx, expected_value, current, 1);
             action();
             return None;
         }
@@ -299,7 +332,9 @@ impl SyncpointManager {
         let mut inner = self.guard.lock().unwrap();
 
         // Double-check under lock (relaxed is fine here, matching upstream).
-        if syncpoint.load(Ordering::Relaxed) >= expected_value {
+        let current = syncpoint.load(Ordering::Relaxed);
+        if current >= expected_value {
+            trace_syncpoint(2, is_guest, storage_idx, expected_value, current, 1);
             action();
             return None;
         }
@@ -310,7 +345,9 @@ impl SyncpointManager {
             &mut inner.host_action_storage[storage_idx]
         };
 
-        Some(storage.insert(expected_value, action))
+        let handle = storage.insert(expected_value, action);
+        trace_syncpoint(1, is_guest, storage_idx, expected_value, current, 0);
+        Some(handle)
     }
 
     fn increment(&self, syncpoint: &AtomicU32, storage_idx: usize, is_guest: bool) {
@@ -322,7 +359,8 @@ impl SyncpointManager {
         } else {
             &mut inner.host_action_storage[storage_idx]
         };
-        storage.fire_up_to(new_value);
+        let fired = storage.fire_up_to(new_value);
+        trace_syncpoint(3, is_guest, storage_idx, new_value, new_value, fired);
 
         // Notify waiters.
         if is_guest {
@@ -332,8 +370,18 @@ impl SyncpointManager {
         }
     }
 
-    fn wait(&self, syncpoint: &AtomicU32, cv: &Condvar, expected_value: u32) {
-        if syncpoint.load(Ordering::Acquire) >= expected_value {
+    fn wait(
+        &self,
+        syncpoint: &AtomicU32,
+        cv: &Condvar,
+        storage_idx: usize,
+        is_guest: bool,
+        expected_value: u32,
+    ) {
+        let current = syncpoint.load(Ordering::Acquire);
+        trace_syncpoint(4, is_guest, storage_idx, expected_value, current, 0);
+        if current >= expected_value {
+            trace_syncpoint(5, is_guest, storage_idx, expected_value, current, 0);
             return;
         }
 
@@ -341,6 +389,14 @@ impl SyncpointManager {
         while syncpoint.load(Ordering::Acquire) < expected_value {
             inner = cv.wait(inner).unwrap();
         }
+        trace_syncpoint(
+            5,
+            is_guest,
+            storage_idx,
+            expected_value,
+            syncpoint.load(Ordering::Acquire),
+            0,
+        );
     }
 }
 

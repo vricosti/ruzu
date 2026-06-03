@@ -107,10 +107,7 @@ mod tests {
             | 1u64 << 49;
 
         f2i(&mut tv, insn, MaxwellOpcode::F2I_reg);
-        let opcodes: Vec<_> = tv
-            .ir
-            .program
-            .blocks[0]
+        let opcodes: Vec<_> = tv.ir.program.blocks[0]
             .iter()
             .map(|inst| inst.opcode)
             .collect();

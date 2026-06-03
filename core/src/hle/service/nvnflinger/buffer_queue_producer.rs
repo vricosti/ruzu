@@ -65,6 +65,10 @@ fn trace_bqp_ring(args: &[u64]) {
     }
 }
 
+fn current_bqp_tid() -> u64 {
+    crate::hle::kernel::kernel::get_current_thread_id_fast().unwrap_or(0)
+}
+
 fn next_bqp_seq() -> u64 {
     BQP_RING_SEQ.fetch_add(1, Ordering::Relaxed)
 }
@@ -346,6 +350,7 @@ impl BufferQueueProducer {
             height as u64,
             format as u64,
             usage as u64,
+            current_bqp_tid(),
         ]);
         trace_bqp(format_args!(
             "BQP::dequeue_buffer async={} w={} h={} format={:?} usage=0x{:X}",
@@ -393,13 +398,27 @@ impl BufferQueueProducer {
                 inner,
             );
             if status != Status::NoError {
-                trace_bqp_ring(&[2, bqp_seq, status as i32 as u64, -1i64 as u64, 0]);
+                trace_bqp_ring(&[
+                    2,
+                    bqp_seq,
+                    status as i32 as u64,
+                    -1i64 as u64,
+                    0,
+                    current_bqp_tid(),
+                ]);
                 return (status as i32, -1, Fence::default());
             }
 
             if found == BufferQueueCore::INVALID_BUFFER_SLOT {
                 log::error!("BufferQueueProducer: no available buffer slots");
-                trace_bqp_ring(&[2, bqp_seq, Status::Busy as i32 as u64, -1i64 as u64, 0]);
+                trace_bqp_ring(&[
+                    2,
+                    bqp_seq,
+                    Status::Busy as i32 as u64,
+                    -1i64 as u64,
+                    0,
+                    current_bqp_tid(),
+                ]);
                 return (Status::Busy as i32, -1, Fence::default());
             }
 
@@ -445,7 +464,14 @@ impl BufferQueueProducer {
                 let mut inner = self.core.mutex.lock().unwrap();
                 if inner.is_abandoned {
                     log::error!("BufferQueueProducer: BufferQueue has been abandoned");
-                    trace_bqp_ring(&[2, bqp_seq, Status::NoInit as i32 as u64, -1i64 as u64, 0]);
+                    trace_bqp_ring(&[
+                        2,
+                        bqp_seq,
+                        Status::NoInit as i32 as u64,
+                        -1i64 as u64,
+                        0,
+                        current_bqp_tid(),
+                    ]);
                     return (Status::NoInit as i32, -1, Fence::default());
                 }
                 inner.slots[out_slot as usize].frame_number = u32::MAX as u64;
@@ -477,6 +503,7 @@ impl BufferQueueProducer {
             Status::NoError as i32 as u64,
             out_slot as i64 as u64,
             return_flags as i64 as u64,
+            current_bqp_tid(),
         ]);
         (return_flags, out_slot, out_fence)
     }
@@ -484,7 +511,7 @@ impl BufferQueueProducer {
     pub fn queue_buffer(&self, slot: i32, input: &QueueBufferInput) -> (Status, QueueBufferOutput) {
         record_bqp_event(BqpEvent::QueueBuffer);
         let bqp_seq = next_bqp_seq();
-        trace_bqp_ring(&[3, bqp_seq, slot as i64 as u64]);
+        trace_bqp_ring(&[3, bqp_seq, slot as i64 as u64, current_bqp_tid()]);
         trace_bqp(format_args!("BQP::queue_buffer slot={}", slot));
         {
             use std::sync::atomic::{AtomicU64, Ordering};
@@ -660,6 +687,7 @@ impl BufferQueueProducer {
             queue_len,
             u64::from(inner.dequeue_buffer_cannot_block || async_flag),
             u64::from(inner.slots[s].acquire_called),
+            current_bqp_tid(),
         ]);
 
         let mut output = QueueBufferOutput::new();
@@ -710,13 +738,19 @@ impl BufferQueueProducer {
             Status::NoError,
             slot
         ));
-        trace_bqp_ring(&[5, bqp_seq, Status::NoError as i32 as u64, slot as i64 as u64]);
+        trace_bqp_ring(&[
+            5,
+            bqp_seq,
+            Status::NoError as i32 as u64,
+            slot as i64 as u64,
+            current_bqp_tid(),
+        ]);
         (Status::NoError, output)
     }
 
     pub fn cancel_buffer(&self, slot: i32, fence: &Fence) {
         record_bqp_event(BqpEvent::CancelBuffer);
-        trace_bqp_ring(&[6, next_bqp_seq(), slot as i64 as u64]);
+        trace_bqp_ring(&[6, next_bqp_seq(), slot as i64 as u64, current_bqp_tid()]);
         let mut inner = self.core.mutex.lock().unwrap();
         if inner.is_abandoned {
             return;

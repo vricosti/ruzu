@@ -19,3 +19,8 @@ rspirv.workspace = true
 spirv.workspace = true
 bitflags.workspace = true
 bytemuck.workspace = true
+libc = "0.2"
+
+[build-dependencies]
+cc = "1"
+pkg-config = "0.3"

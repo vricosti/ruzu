@@ -646,18 +646,24 @@ pub fn complete_sync_request(
                         IPC_TRACE_CURRENT.with(|c| c.borrow().clone());
                     let svc_str = if svc.is_empty() { "?" } else { svc.as_str() };
                     let svc_id = common::trace::intern_service(svc_str);
+                    let tid = context
+                        .thread
+                        .as_ref()
+                        .map(|t| t.lock().unwrap().get_thread_id())
+                        .unwrap_or(0);
                     let mut args: [u64; 14] = [0; 14];
                     args[0] = seq as u64;
                     args[1] = svc_id as u64;
                     args[2] = cmd as u64;
                     args[3] = ioctl as u64;
-                    const PAYLOAD_WORDS: usize = 10; // 14 - 4 fixed
+                    args[4] = tid;
+                    const PAYLOAD_WORDS: usize = 9; // 14 - 5 fixed
                     for i in 0..PAYLOAD_WORDS {
-                        args[4 + i] = buf[i] as u64;
+                        args[5 + i] = buf[i] as u64;
                     }
                     common::trace::emit_raw(
                         common::trace::cat::IPC_REQUEST,
-                        &args[..4 + PAYLOAD_WORDS],
+                        &args[..5 + PAYLOAD_WORDS],
                     );
                 }
             }

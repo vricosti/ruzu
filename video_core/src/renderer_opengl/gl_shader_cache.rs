@@ -115,6 +115,7 @@ fn patch_fragment_debug_by_source_hash(stage: ShaderStage, source: String) -> St
         "alpha_one" => {
             "void main(){\nvec4 c=texture(tex0,in_attr1.xy);\nfrag_color0=vec4(c.rgb,1.0);\nreturn;\n}\n"
         }
+        "red" => "void main(){\nfrag_color0=vec4(1.0,0.0,0.0,1.0);\nreturn;\n}\n",
         _ => "void main(){\nfrag_color0=vec4(0.0,1.0,0.0,1.0);\nreturn;\n}\n",
     };
     log::warn!(

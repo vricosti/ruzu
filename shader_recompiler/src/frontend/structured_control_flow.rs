@@ -198,7 +198,11 @@ mod tests {
 
         assert!(matches!(
             syntax.as_slice(),
-            [SyntaxNode::Block(0), SyntaxNode::Block(1), SyntaxNode::Return]
+            [
+                SyntaxNode::Block(0),
+                SyntaxNode::Block(1),
+                SyntaxNode::Return
+            ]
         ));
     }
 

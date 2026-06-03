@@ -200,6 +200,8 @@ struct SubmitGpfifoPhaseAgg {
 static SUBMIT_GPFIFO_PROFILE: std::sync::OnceLock<
     std::sync::Mutex<std::collections::HashMap<&'static str, SubmitGpfifoPhaseAgg>>,
 > = std::sync::OnceLock::new();
+static SUBMIT_GPFIFO_TRACE_SEQ: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 
 fn record_submit_gpfifo_phase(label: &'static str, elapsed: std::time::Duration) {
     let agg = SUBMIT_GPFIFO_PROFILE
@@ -212,6 +214,42 @@ fn record_submit_gpfifo_phase(label: &'static str, elapsed: std::time::Duration)
     if ns > entry.max_ns {
         entry.max_ns = ns;
     }
+}
+
+fn trace_submit_gpfifo_ring(
+    stage: u64,
+    seq: u64,
+    bind_id: u64,
+    syncpoint_id: u32,
+    flags: u32,
+    increment: u32,
+    fence_in_id: i32,
+    fence_in_value: u32,
+    fence_out_value: u32,
+    min_value: u32,
+    max_value: u32,
+) {
+    if !common::trace::is_enabled(common::trace::cat::SUBMIT_GPFIFO) {
+        return;
+    }
+    let tid = crate::hle::kernel::kernel::get_current_thread_id_fast().unwrap_or(0);
+    common::trace::emit_raw(
+        common::trace::cat::SUBMIT_GPFIFO,
+        &[
+            stage,
+            seq,
+            tid,
+            bind_id,
+            syncpoint_id as u64,
+            flags as u64,
+            increment as u64,
+            fence_in_id as i64 as u64,
+            fence_in_value as u64,
+            fence_out_value as u64,
+            min_value as u64,
+            max_value as u64,
+        ],
+    );
 }
 
 pub fn dump_submit_gpfifo_profile() {
@@ -489,6 +527,11 @@ impl NvHostGpu {
         params: &mut IoctlSubmitGpfifo,
         entries: GpuCommandList,
     ) -> NvResult {
+        let submit_trace_seq =
+            SUBMIT_GPFIFO_TRACE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let fence_in_id = params.fence.id;
+        let fence_in_value = params.fence.value;
+        let flags_raw = params.flags;
         log::trace!(
             "nvhost_gpu::SubmitGPFIFOImpl called, gpfifo={:X}, num_entries={:X}, flags={:X}",
             params.address,
@@ -569,9 +612,39 @@ impl NvHostGpu {
         params.fence.value = self
             .syncpoint_manager()
             .increment_syncpoint_max_ext(channel_syncpoint, increment);
+        trace_submit_gpfifo_ring(
+            1,
+            submit_trace_seq,
+            bind_id as u64,
+            channel_syncpoint,
+            flags_raw,
+            increment,
+            fence_in_id,
+            fence_in_value,
+            params.fence.value,
+            self.syncpoint_manager()
+                .read_syncpoint_min_value(channel_syncpoint),
+            self.syncpoint_manager()
+                .read_syncpoint_max_value(channel_syncpoint),
+        );
         mark("04_syncpoint_increment", &mut phase_start);
 
         gpu.push_gpu_entries(bind_id, entries);
+        trace_submit_gpfifo_ring(
+            2,
+            submit_trace_seq,
+            bind_id as u64,
+            channel_syncpoint,
+            flags_raw,
+            increment,
+            fence_in_id,
+            fence_in_value,
+            params.fence.value,
+            self.syncpoint_manager()
+                .read_syncpoint_min_value(channel_syncpoint),
+            self.syncpoint_manager()
+                .read_syncpoint_max_value(channel_syncpoint),
+        );
         mark("05_push_main_entries", &mut phase_start);
 
         if params.fence_increment() {
@@ -581,6 +654,21 @@ impl NvHostGpu {
                 gpu.push_gpu_entries(bind_id, build_increment_with_wfi_command_list(params.fence));
             }
         }
+        trace_submit_gpfifo_ring(
+            3,
+            submit_trace_seq,
+            bind_id as u64,
+            channel_syncpoint,
+            flags_raw,
+            increment,
+            fence_in_id,
+            fence_in_value,
+            params.fence.value,
+            self.syncpoint_manager()
+                .read_syncpoint_min_value(channel_syncpoint),
+            self.syncpoint_manager()
+                .read_syncpoint_max_value(channel_syncpoint),
+        );
         mark("06_push_fence_increment", &mut phase_start);
         // [SP_TRACE] log MAX vs MIN of the channel syncpoint after each
         // submit. If MAX advances but MIN doesn't catch up, the GPU is

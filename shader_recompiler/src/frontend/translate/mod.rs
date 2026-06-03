@@ -98,11 +98,12 @@ pub mod video_set_predicate;
 pub mod vote;
 pub mod warp_shuffle;
 
+use crate::frontend::instruction::{Instruction, Predicate as ExecPredicate};
 use crate::frontend::maxwell_opcodes::{self, MaxwellOpcode, SrcType};
 use crate::ir::emitter::Emitter;
 use crate::ir::program::{Program, ShaderInfo};
 use crate::ir::types::ShaderStage;
-use crate::ir::value::{Reg, Value};
+use crate::ir::value::{Pred, Reg, Value};
 use crate::program_header::ProgramHeader;
 
 /// Maxwell instruction bit field extraction helpers.
@@ -131,6 +132,7 @@ pub struct TranslatorVisitor<'a> {
     pub ir: Emitter<'a>,
     pub stage: ShaderStage,
     pub sph: Option<ProgramHeader>,
+    current_exec_pred: Option<ExecPredicate>,
 }
 
 impl<'a> TranslatorVisitor<'a> {
@@ -144,6 +146,7 @@ impl<'a> TranslatorVisitor<'a> {
             ir: Emitter::new(program, block),
             stage,
             sph,
+            current_exec_pred: None,
         }
     }
 
@@ -167,6 +170,15 @@ impl<'a> TranslatorVisitor<'a> {
     pub fn set_x(&mut self, reg_idx: u32, value: Value) {
         let reg = Reg(reg_idx as u8);
         if !reg.is_zero() {
+            let value = if let Some(exec_pred) = self.current_exec_pred {
+                let old = self.x(reg_idx);
+                let cond = self
+                    .ir
+                    .get_pred(Pred(exec_pred.index as u8), exec_pred.negated);
+                self.ir.select_u32(cond, value, old)
+            } else {
+                value
+            };
             self.ir.set_reg(reg, value);
         }
     }
@@ -368,12 +380,23 @@ impl<'a> TranslatorVisitor<'a> {
     ///
     /// Corresponds to the dispatch table in upstream `impl.cpp`.
     pub fn translate_instruction(&mut self, insn: u64) {
+        let exec_pred = Instruction::new(insn).pred();
+        if exec_pred.index == 7 && exec_pred.negated {
+            return;
+        }
         let opcode = match maxwell_opcodes::decode_opcode(insn) {
             Some(op) => op,
             None => {
                 log::warn!("Unknown Maxwell opcode: 0x{:016X}", insn);
                 return;
             }
+        };
+
+        let previous_exec_pred = self.current_exec_pred;
+        self.current_exec_pred = if exec_pred.index == 7 && !exec_pred.negated {
+            None
+        } else {
+            Some(exec_pred)
         };
 
         match opcode {
@@ -666,8 +689,7 @@ impl<'a> TranslatorVisitor<'a> {
 
             // Kill. Upstream `TranslatorVisitor::KIL()` is a no-op; the
             // structured control-flow pass owns demote/discard insertion.
-            MaxwellOpcode::KIL => {
-            }
+            MaxwellOpcode::KIL => {}
 
             // Memory barrier
             MaxwellOpcode::MEMBAR => {
@@ -683,6 +705,7 @@ impl<'a> TranslatorVisitor<'a> {
                 );
             }
         }
+        self.current_exec_pred = previous_exec_pred;
     }
 }
 
@@ -702,10 +725,7 @@ mod tests {
 
         tv.translate_instruction(0xe330_0000_0000_0000);
 
-        let opcodes: Vec<_> = tv
-            .ir
-            .program
-            .blocks[0]
+        let opcodes: Vec<_> = tv.ir.program.blocks[0]
             .iter()
             .map(|inst| inst.opcode)
             .collect();
