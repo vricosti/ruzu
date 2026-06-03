@@ -8,7 +8,9 @@
 //! (Null, OpenGL, Vulkan) provides its own implementation.
 
 use crate::control::channel_state::ChannelState;
-use crate::engines::draw_manager::DrawState;
+use crate::engines::draw_manager::{
+    Maxwell3DClearView, Maxwell3DDrawView, Maxwell3DIndirectView,
+};
 use crate::engines::fermi_2d::{Config as Fermi2DConfig, Surface as Fermi2DSurface};
 use crate::query_cache::types::QueryPropertiesFlags;
 
@@ -22,6 +24,61 @@ pub enum LoadCallbackStage {
 
 /// Callback for disk resource loading progress.
 pub type DiskResourceLoadCallback = Box<dyn Fn(LoadCallbackStage, usize, usize)>;
+
+/// Non-owning rasterizer pointer matching upstream `VideoCore::RasterizerInterface*`.
+///
+/// Upstream stores raw rasterizer pointers in GPU engines and relies on the
+/// renderer/channel lifetime graph to keep them valid. Rust cannot express that
+/// lifetime in the current owner graph, so the lifetime erasure is centralized
+/// here instead of being reimplemented by each engine.
+#[derive(Clone, Copy)]
+pub struct RasterizerHandle {
+    ptr: *const (dyn RasterizerInterface + 'static),
+}
+
+// Safety: this is a non-owning pointer equivalent to upstream's
+// `RasterizerInterface*`. It does not provide synchronization or ownership; the
+// renderer/channel graph must keep the rasterizer alive and serialize access.
+unsafe impl Send for RasterizerHandle {}
+unsafe impl Sync for RasterizerHandle {}
+
+impl RasterizerHandle {
+    pub fn from_ref(rasterizer: &dyn RasterizerInterface) -> Self {
+        let raw = rasterizer as *const dyn RasterizerInterface;
+        let ptr = unsafe {
+            std::mem::transmute::<
+                *const dyn RasterizerInterface,
+                *const (dyn RasterizerInterface + 'static),
+            >(raw)
+        };
+        Self { ptr }
+    }
+
+    pub fn as_ptr(self) -> *const (dyn RasterizerInterface + 'static) {
+        self.ptr
+    }
+
+    pub fn debug_data_ptr(self) -> *const () {
+        self.ptr as *const ()
+    }
+
+    /// # Safety
+    ///
+    /// The caller must guarantee the pointed rasterizer is still alive and that
+    /// no aliasing mutable access exists for the duration of the returned
+    /// borrow. This is the Rust expression of upstream's raw-pointer contract.
+    pub unsafe fn as_mut<'a>(self) -> &'a mut dyn RasterizerInterface {
+        unsafe { &mut *(self.ptr as *mut dyn RasterizerInterface) }
+    }
+
+    /// # Safety
+    ///
+    /// Same safety contract as [`Self::as_mut`].
+    pub unsafe fn with_mut<R>(self, f: impl FnOnce(&mut dyn RasterizerInterface) -> R) -> R {
+        let rasterizer = unsafe { self.as_mut() };
+        f(rasterizer)
+    }
+}
 
 /// Download area for flushing GPU caches to CPU memory.
 #[derive(Debug, Clone)]
@@ -41,23 +98,20 @@ pub trait RasterizerInterface {
 
     /// Dispatch a draw invocation.
     ///
-    /// `draw_state` is a live reference to the Maxwell3D draw state captured
-    /// by `DrawManager` at the moment the draw was triggered: topology,
-    /// indexed vs non-indexed, vertex/index buffer bindings, base
-    /// vertex/instance, and per-primitive counts. Upstream reaches this state
-    /// via `maxwell3d->draw_manager->GetDrawState()` inside the rasterizer;
-    /// we plumb it through the call instead so the trait doesn't need to
-    /// carry a Maxwell3D reference.
-    fn draw(&mut self, draw_state: &DrawState, instance_count: u32);
+    /// `draw_view` is the draw-boundary Maxwell3D view consumed by the
+    /// rasterizer. Upstream reaches this data via the rasterizer's `Maxwell3D*`;
+    /// ruzu uses a temporary view so the interface can move toward that model
+    /// without storing an unsafe persistent engine pointer in the backend.
+    fn draw(&mut self, draw_view: Maxwell3DDrawView<'_>, instance_count: u32);
 
     /// Dispatch an indirect draw invocation.
-    fn draw_indirect(&mut self) {}
+    fn draw_indirect(&mut self, _indirect_view: Maxwell3DIndirectView<'_>) {}
 
     /// Dispatch a draw texture invocation.
     fn draw_texture(&mut self);
 
     /// Clear the current framebuffer.
-    fn clear(&mut self, draw_state: &DrawState, layer_count: u32);
+    fn clear(&mut self, clear_view: Maxwell3DClearView<'_>, layer_count: u32);
 
     /// Dispatch a compute shader invocation.
     fn dispatch_compute(&mut self);

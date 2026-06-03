@@ -23,11 +23,11 @@ pub fn vmnmx(tv: &mut TranslatorVisitor, insn: u64) {
     let op_bits = field(insn, 51, 3);
     let mx = bit(insn, 56);
 
-    // op_bits: MIN=5, MAX=6 from VideoMinMaxOps; anything else — warn and return zero
+    // op_bits: MIN=5, MAX=6 from VideoMinMaxOps. Upstream throws
+    // NotImplementedException for the other op-bit encodings (which
+    // map to merge/accumulate forms that aren't ported).
     if op_bits != 5 && op_bits != 6 {
-        log::warn!("VMNMX: unsupported op {} (insn={:#018x})", op_bits, insn);
-        tv.set_x(dst, Value::ImmU32(0));
-        return;
+        panic!("VMNMX: unsupported op {}", op_bits);
     }
 
     let src_a_reg = field(insn, 8, 8);

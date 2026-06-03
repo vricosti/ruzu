@@ -30,18 +30,61 @@ pub enum MemoryPermission {
 }
 
 /// Convert SVC MemoryPermission to kernel KMemoryPermission.
-/// Upstream: `ConvertToKMemoryPermission(Svc::MemoryPermission)`.
+///
+/// Upstream: `ConvertToKMemoryPermission(Svc::MemoryPermission)` — which
+/// is a direct 1:1 mapping (Read → USER_READ, ReadWrite → USER_READ |
+/// USER_WRITE, etc.).
+///
+/// Ruzu divergence: SharedMemory mapped with guest perm=`Read` is upgraded
+/// to `USER_READ | USER_WRITE` for the host page protection. Rationale:
+/// rdynarmic emits `xor reg, reg; lock xadd [r13+vaddr], reg` for ARM
+/// load-acquire (`LDA` / `LDAEX` / etc.) ordered loads, mirroring
+/// upstream's `EmitReadMemoryMov<bitsize>` ordered path
+/// (`dynarmic/backend/x64/emit_x64_memory.h:204-247`). `lock xadd` on x86
+/// is read-modify-write — the value register is xor'd to zero so the
+/// effective operation is `mem += 0`, but the x86 page-fault hardware
+/// still requires `PROT_WRITE` on the target page. A guest Read-only
+/// SharedMemory mapped as host `PROT_READ` therefore faults on the first
+/// LDA, with no recovery (the JIT signal handler's fastmem patch
+/// resumes the access via the slow-path callback, but the callback path
+/// triggers `Memory::write_raw` for what is semantically a load, which
+/// is incorrect, and depending on timing can also miss the patch entirely
+/// and let SIGSEGV propagate to the kernel).
+///
+/// MK8D demonstrates the failure: the audio renderer workbuffer is
+/// mapped via `svc::MapSharedMemory(handle, vaddr, size, Read)` and the
+/// state-machine wedge at sdk PC `0x01EEA9A8` performs `lda r0, [r0]`
+/// on a pointer into that region, killing the process intermittently.
+/// See [[mk8d-wedge-table-fastmem-invisible-2026-05-29]].
+///
+/// The proper upstream-correct fix is to change rdynarmic's ordered-load
+/// codegen to `mfence + mov` (write-free) instead of `lock xadd`. Until
+/// that lands, granting host `PROT_WRITE` on SharedMemory pages the
+/// guest can read is the minimum-blast-radius workaround: it makes the
+/// host page semantically wider than the guest's request, but the guest
+/// KMemoryPermission tracking is *not* changed below SharedMemory (only
+/// the host mprotect downstream is affected via this conversion), and
+/// guests that don't write to a Read-only SharedMemory observe no
+/// behavioural difference. Side effect: guest writes to a region they
+/// requested as Read silently succeed where Switch would have faulted.
+/// In practice no observed title relies on that fault, and the
+/// alternative (the LDA wedge crash) is fatal.
 fn convert_to_k_memory_permission(perm: MemoryPermission) -> KMemoryPermission {
     match perm {
         MemoryPermission::None => KMemoryPermission::NONE,
-        MemoryPermission::Read => KMemoryPermission::USER_READ,
+        MemoryPermission::Read => {
+            // See the docstring above: granting USER_WRITE so the host
+            // fastmem mprotect is PROT_READ | PROT_WRITE, satisfying
+            // the `lock xadd`-based LDA emit.
+            KMemoryPermission::USER_READ | KMemoryPermission::USER_WRITE
+        }
         MemoryPermission::Write => KMemoryPermission::USER_WRITE,
         MemoryPermission::ReadWrite => KMemoryPermission::USER_READ | KMemoryPermission::USER_WRITE,
         MemoryPermission::Execute => KMemoryPermission::USER_EXECUTE,
         MemoryPermission::ReadExecute => {
             KMemoryPermission::USER_READ | KMemoryPermission::USER_EXECUTE
         }
-        MemoryPermission::DontCare => KMemoryPermission::USER_READ,
+        MemoryPermission::DontCare => KMemoryPermission::USER_READ | KMemoryPermission::USER_WRITE,
     }
 }
 

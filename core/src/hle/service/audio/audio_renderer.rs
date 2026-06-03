@@ -214,7 +214,7 @@ impl IAudioRenderer {
 
     /// Port of upstream `IAudioRenderer::RequestUpdate` → delegates to RequestUpdateAuto.
     fn request_update_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
-        log::info!(
+        log::trace!(
             "IAudioRenderer::RequestUpdate tid={:?}",
             crate::hle::kernel::kernel::get_current_thread_pointer()
                 .map(|thread| thread.lock().unwrap().get_thread_id())
@@ -223,7 +223,7 @@ impl IAudioRenderer {
     }
 
     fn request_update_auto_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
-        log::info!(
+        log::trace!(
             "IAudioRenderer::RequestUpdateAuto tid={:?}",
             crate::hle::kernel::kernel::get_current_thread_pointer()
                 .map(|thread| thread.lock().unwrap().get_thread_id())
@@ -246,7 +246,7 @@ impl IAudioRenderer {
                 .lock()
                 .unwrap()
                 .request_update(&input, &mut performance, &mut output);
-        log::info!(
+        log::trace!(
             "IAudioRenderer::RequestUpdate buffers input={} output={} performance={} result=0x{:08X}",
             input.len(),
             output.len(),

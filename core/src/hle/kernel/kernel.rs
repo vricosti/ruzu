@@ -305,6 +305,17 @@ fn dump_thread_state(kernel: &KernelCore) {
     eprintln!("=========================================");
     eprintln!("[DUMP] === ruzu kernel thread dump ===");
 
+    fn parse_u64_auto(raw: &str) -> Option<u64> {
+        let raw = raw.trim();
+        let hex = raw
+            .strip_prefix("0x")
+            .or_else(|| raw.strip_prefix("0X"));
+        match hex {
+            Some(hex) => u64::from_str_radix(hex, 16).ok(),
+            None => raw.parse().ok(),
+        }
+    }
+
     // Per-core running thread + interrupt flag + in-progress SVC + last guest PC.
     let mut pcs_to_dump: Vec<u64> = Vec::new();
     let mut stacks_to_dump: Vec<(usize, u64)> = Vec::new();
@@ -385,20 +396,19 @@ fn dump_thread_state(kernel: &KernelCore) {
             if parts.len() != 3 {
                 return None;
             }
-            let a = parts[0].trim_start_matches("0x").trim_start_matches("0X");
-            let addr = u64::from_str_radix(a, 16).ok()?;
-            let size: u64 = parts[1].parse().ok()?;
+            let addr = parse_u64_auto(parts[0])?;
+            let size = parse_u64_auto(parts[1])?;
             if size != 4 {
                 return None;
             }
-            let v = parts[2].trim_start_matches("0x").trim_start_matches("0X");
-            let value = u32::from_str_radix(v, 16).ok()?;
+            let value = parse_u64_auto(parts[2])? as u32;
             Some((addr, value))
         })
         .collect();
 
-    // RUZU_DUMP_REGION=0x22C0000:24576 dumps a contiguous u32 range as raw
-    // hex (no per-PC context windows) — useful for whole-vtable snapshots.
+    // RUZU_DUMP_REGION=0x22C0000:24576 or 0x22C0000:0x6000 dumps a
+    // contiguous u32 range as raw hex (no per-PC context windows) — useful
+    // for whole-vtable snapshots.
     let region_dumps: Vec<(u64, u64)> = std::env::var("RUZU_DUMP_REGION")
         .ok()
         .iter()
@@ -409,9 +419,8 @@ fn dump_thread_state(kernel: &KernelCore) {
         })
         .filter_map(|tok| {
             let (a, n) = tok.split_once(':')?;
-            let a = a.trim_start_matches("0x").trim_start_matches("0X");
-            let addr = u64::from_str_radix(a, 16).ok()?;
-            let bytes: u64 = n.parse().ok()?;
+            let addr = parse_u64_auto(a)?;
+            let bytes = parse_u64_auto(n)?;
             Some((addr, bytes))
         })
         .collect();
@@ -430,6 +439,43 @@ fn dump_thread_state(kernel: &KernelCore) {
         return;
     };
 
+    let pq_fronts = kernel
+        .global_scheduler_context()
+        .and_then(|gsc| {
+            gsc.try_lock().ok().map(|gsc| {
+                [
+                    gsc.get_scheduled_front(0),
+                    gsc.get_scheduled_front(1),
+                    gsc.get_scheduled_front(2),
+                    gsc.get_scheduled_front(3),
+                ]
+            })
+        });
+    eprintln!("[DUMP] scheduler pq_fronts={:?}", pq_fronts);
+    for core_id in 0..crate::hardware_properties::NUM_CPU_CORES as usize {
+        let Some(scheduler) = kernel.scheduler(core_id) else {
+            eprintln!("[DUMP] scheduler core={} missing", core_id);
+            continue;
+        };
+        match scheduler.try_lock() {
+            Ok(scheduler) => {
+                eprintln!(
+                    "[DUMP] scheduler core={} current={:?} highest={:?} prev={:?} needs={} interrupt_task={} idle={}",
+                    core_id,
+                    scheduler.get_scheduler_current_thread_id(),
+                    scheduler.state.highest_priority_thread_id,
+                    scheduler.state.prev_thread_id,
+                    scheduler.needs_scheduling(),
+                    scheduler.state.interrupt_task_runnable,
+                    scheduler.is_idle(),
+                );
+            }
+            Err(_) => {
+                eprintln!("[DUMP] scheduler core={} <scheduler-lock-contended>", core_id);
+            }
+        }
+    }
+
     // Attempt the process lock with multi-second polling so a briefly-held
     // Mutex passes; if still contended after the timeout, it's a real hold.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
@@ -447,7 +493,7 @@ fn dump_thread_state(kernel: &KernelCore) {
             }
         }
     }
-    let thread_ids: Vec<u64> = match acquired {
+    let thread_entries: Vec<(u64, std::sync::Arc<super::k_thread::KThreadLock>)> = match acquired {
         Some(guard) => {
             eprintln!(
                 "[DUMP] process threads: {} (process.lock() acquired after {} polls)",
@@ -585,7 +631,15 @@ fn dump_thread_state(kernel: &KernelCore) {
                     eprintln!("[POKE] addr=0x{:X}: no page_table memory — skipping", addr);
                 }
             }
-            guard.thread_list.clone()
+            guard
+                .thread_list
+                .iter()
+                .filter_map(|tid| {
+                    guard
+                        .get_thread_by_thread_id(*tid)
+                        .map(|thread| (*tid, thread))
+                })
+                .collect()
         }
         None => {
             eprintln!(
@@ -675,24 +729,17 @@ fn dump_thread_state(kernel: &KernelCore) {
         }
     };
 
-    // Walk each thread. try_lock() again on each thread to avoid blocking.
-    for tid in thread_ids {
-        let thread_arc_opt = match process_arc.try_lock() {
-            Ok(guard) => guard.thread_objects.get(&tid).cloned(),
-            Err(_) => None,
-        };
-        let thread_arc = match thread_arc_opt {
-            Some(a) => a,
-            None => {
-                eprintln!("[DUMP]   tid={} <process-lock-contended>", tid);
-                continue;
-            }
-        };
+    // Walk each thread. Thread Arcs were captured while holding the process lock
+    // above, so the dump does not reacquire process.lock() per-thread and hide
+    // useful state behind false `<process-lock-contended>` rows.
+    for (tid, thread_arc) in thread_entries {
         let try_result = thread_arc.try_lock();
         if let Ok(t) = try_result {
             let state = t.get_state();
+            let thread_type = t.thread_type;
             let priority = t.get_priority();
             let current_core = t.get_current_core();
+            let active_core = t.get_active_core();
             let wait_reason = t.get_wait_reason_for_debugging();
             let addr_key = t.get_address_key();
             let addr_key_val = t.get_address_key_value();
@@ -702,13 +749,15 @@ fn dump_thread_state(kernel: &KernelCore) {
             let lr = t.thread_context.lr as u32;
             let sp = t.thread_context.sp as u32;
             eprintln!(
-                "[DUMP]   tid={} state={:?} prio={} core={} wait={:?} \
+                "[DUMP]   tid={} type={:?} state={:?} prio={} core={} active_core={} wait={:?} \
                  addr_key=0x{:X} addr_key_val=0x{:X} cv_key=0x{:X} \
                  waiting_lock={} pc=0x{:08X} lr=0x{:08X} sp=0x{:08X}",
                 tid,
+                thread_type,
                 state,
                 priority,
                 current_core,
+                active_core,
                 wait_reason,
                 addr_key.get(),
                 addr_key_val,
@@ -725,6 +774,7 @@ fn dump_thread_state(kernel: &KernelCore) {
             );
         }
     }
+    crate::hle::kernel::svc::svc_thread::dump_thread_lifecycle_profile();
     eprintln!("=========================================");
     DUMP_REQUESTED.store(false, Ordering::Relaxed);
 }
@@ -1515,6 +1565,14 @@ impl KernelCore {
                 move || {
                     let kernel = unsafe { &*(kernel_ptr as *const KernelCore) };
                     kernel.register_host_thread_with_existing(Some(&thread));
+                    // Per-thread alternate signal stack so the rdynarmic SIGSEGV
+                    // handler (SA_ONSTACK; sigaltstack is per-thread) runs on a
+                    // dedicated 2MB stack rather than this host thread's stack —
+                    // otherwise a fault that reaches the handler's
+                    // FastmemPatchTable HashMap/SipHash lookup can overflow the
+                    // stack into a secondary SIGSEGV (silent exit 139). Mirrors
+                    // the CPU-core registration in cpu_manager.rs.
+                    rdynarmic::backend::x64::exception_handler::register_thread_signal_stack();
                     log::info!("Host service thread '{}' started", thread_name);
                     func();
                     log::info!("Host service thread '{}' exited", thread_name);
@@ -1733,6 +1791,35 @@ impl KernelCore {
     pub fn run_server(&self, server_manager: ServerManager) {
         let manager = Arc::new(Mutex::new(server_manager));
         manager.lock().unwrap().bind_self_reference(&manager);
+
+        // Publish service ownership to ServiceManager now that
+        // bind_self_reference has set `self_reference`. connect_to_named_port
+        // can then look up (queue, wakeup, server_manager) by service name and
+        // wire the new session's SessionRequestManager non-orphan.
+        let (names, queue, wakeup) = {
+            let mut guard = manager.lock().unwrap();
+            (
+                guard.take_owned_service_names(),
+                guard.pending_registrations_arc(),
+                guard.wakeup_event_arc(),
+            )
+        };
+        if !names.is_empty() {
+            if let Some(service_manager) = self.system_ref.get().service_manager() {
+                let mut sm_guard = service_manager.lock().unwrap();
+                let server_weak = Arc::downgrade(&manager);
+                for name in names {
+                    sm_guard.set_service_ownership(
+                        &name,
+                        crate::hle::service::sm::sm::ServiceOwnership {
+                            queue: queue.clone(),
+                            wakeup: wakeup.clone(),
+                            server_manager: server_weak.clone(),
+                        },
+                    );
+                }
+            }
+        }
 
         {
             let mut managers = self.server_managers.lock().unwrap();

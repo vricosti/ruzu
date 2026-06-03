@@ -16,6 +16,8 @@ use crate::memory::memory::Memory;
 
 use rdynarmic::jit_config::{JitConfig, OptimizationFlag, UserCallbacks};
 
+static A32_TRACE_AFTER_WATCH_ARMED: AtomicBool = AtomicBool::new(false);
+
 /// Translate rdynarmic's HaltReason to core's HaltReason.
 ///
 /// Same mapping as in arm_dynarmic_64.rs.
@@ -210,6 +212,16 @@ fn watch_write(cb: &DynarmicCallbacks32, vaddr: u64, size: u64, value: u128) {
             return;
         }
     }
+    if std::env::var_os("RUZU_A32_TRACE_AFTER_WATCH").is_some() {
+        let value_matches = std::env::var("RUZU_A32_TRACE_AFTER_WATCH_VALUE")
+            .ok()
+            .and_then(|raw| u128::from_str_radix(raw.trim_start_matches("0x"), 16).ok())
+            .map(|expected| expected == value)
+            .unwrap_or(true);
+        if value_matches {
+            A32_TRACE_AFTER_WATCH_ARMED.store(true, Ordering::Relaxed);
+        }
+    }
     let pc_ptr = cb.jit_pc_ptr;
     let pc = pc_ptr.map(|p| unsafe { p.read_volatile() }).unwrap_or(0);
     if let Some((pc_lo, pc_hi)) = pc_range {
@@ -234,12 +246,112 @@ fn watch_write(cb: &DynarmicCallbacks32, vaddr: u64, size: u64, value: u128) {
     } else {
         unsafe { (*core).core_index() as i32 }
     };
-    eprintln!(
-        "[WATCH_WRITE] core={} pc=0x{:08X} lr=0x{:08X} vaddr=0x{:X} size={} value=0x{:032X}",
-        core_id, pc, lr, vaddr, size, value
+    let tid = crate::hle::kernel::kernel::get_current_thread_id_fast().unwrap_or(0);
+    let value_lo = value as u64;
+    let value_hi = (value >> 64) as u64;
+    common::trace::emit_raw(
+        common::trace::cat::WATCH_WRITE,
+        &[
+            core_id as u32 as u64,
+            tid,
+            pc as u64,
+            lr as u64,
+            vaddr,
+            size,
+            value_lo,
+            value_hi,
+        ],
     );
     maybe_dump_code_once(cb);
     maybe_dump_instance_at_pc(cb, pc_ptr, pc);
+}
+
+/// `RUZU_TRACE_UNMAPPED_WRITE=1` — annotate every JIT-emitted memory write
+/// whose target address is not currently mapped in guest memory with
+/// `tid`, guest `PC`, `LR`, and the bad `vaddr`/`size`/`value`. Pairs with
+/// the existing `Unmapped Write{N} @ 0x...` log emitted from
+/// `Memory::write_raw`; that one only tells us the address, this one tells
+/// us *who* / *from where* in the guest. Used to trace the MK8D post-boot
+/// corruption back to a specific call site in guest code.
+#[inline(always)]
+fn trace_unmapped_write(cb: &DynarmicCallbacks32, vaddr: u64, size: u64, value: u128) {
+    if !common::trace::is_enabled(common::trace::cat::UNMAPPED_WRITE) {
+        return;
+    }
+    // Cheap pre-check: skip the trace path entirely when the address IS
+    // mapped — the unmapped-write log only fires on the slow path inside
+    // `Memory::write_raw`. We mirror the same validity probe here so the
+    // trace only emits on actual unmapped writes.
+    let mapped = if let Some(ref cm) = cb.core_memory {
+        cm.lock()
+            .unwrap()
+            .is_valid_virtual_address_range(vaddr, size)
+    } else {
+        cb.memory.read().unwrap().is_valid_range(vaddr, size as usize)
+    };
+    if mapped {
+        return;
+    }
+    let pc_ptr = cb.jit_pc_ptr;
+    let pc = pc_ptr.map(|p| unsafe { p.read_volatile() }).unwrap_or(0);
+    let lr = pc_ptr
+        .map(|p| unsafe { p.offset(-1).read_volatile() })
+        .unwrap_or(0);
+    let tid = crate::hle::kernel::kernel::get_current_thread_id_fast().unwrap_or(0);
+    let value_lo = value as u64;
+    let value_hi = (value >> 64) as u64;
+    common::trace::emit_raw(
+        common::trace::cat::UNMAPPED_WRITE,
+        &[tid, pc as u64, lr as u64, vaddr, size, value_lo, value_hi],
+    );
+    // Dump full GPRs + the struct backing memory at r6 (which holds the
+    // off-by-3 pointer in `[r6+0x10]` for the MK8D matrix-init path).
+    // This is the same idea as RUZU_DUMP_INSTANCE_AT_PC but hooked at
+    // unmapped-write time so we get the registers AT the faulting
+    // instruction. Bounded to 5 hits to keep log compact.
+    static DUMP_HITS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let n = DUMP_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if n >= 5 {
+        return;
+    }
+    let Some(p) = pc_ptr else { return };
+    let mut r = [0u32; 16];
+    for i in 0..16 {
+        let off = (i as isize) - 15;
+        r[i] = unsafe { p.offset(off).read_volatile() };
+    }
+    eprintln!(
+        "[UNMAPPED_WRITE_REGS] hit#{} r0=0x{:08X} r1=0x{:08X} r2=0x{:08X} r3=0x{:08X} r4=0x{:08X} r5=0x{:08X} r6=0x{:08X} r7=0x{:08X} r8=0x{:08X} r9=0x{:08X} r10=0x{:08X} r11=0x{:08X} r12=0x{:08X} sp=0x{:08X} lr=0x{:08X}",
+        n,
+        r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7],
+        r[8], r[9], r[10], r[11], r[12], r[13], r[14]
+    );
+    // Dump first 64 bytes of struct at r6 (which holds count at +0xC and
+    // the bad array_base ptr at +0x10 for the MK8D matrix-init path).
+    let mem = cb.mem();
+    if r[6] >= 0x1000 {
+        let mut hex = String::new();
+        for i in 0..64u64 {
+            use std::fmt::Write as _;
+            let _ = write!(hex, "{:02x}", mem.read_8(r[6] as u64 + i));
+        }
+        eprintln!("[UNMAPPED_WRITE_STRUCT] hit#{} r6=0x{:08X} +0..63={}", n, r[6], hex);
+    }
+    // Dump stack words to walk LR chain — caller-of-caller etc. Width is
+    // 64 words (256 bytes) so it covers the prologue + locals area of a
+    // function ~3 frames up (e.g. matrix-init → wrapper → outer caller
+    // with `push {r4-r11, lr} + sub sp,sp,#0x4C` = 0x90 bytes from inner
+    // sp to outer saved-LR).
+    let sp = r[13];
+    if sp >= 0x1000 {
+        let mut words = String::new();
+        for i in 0..64u64 {
+            use std::fmt::Write as _;
+            let w = mem.read_32(sp as u64 + i * 4);
+            let _ = write!(words, "{:08x} ", w);
+        }
+        eprintln!("[UNMAPPED_WRITE_STACK] hit#{} sp=0x{:08X} +0..255={}", n, sp, words.trim_end());
+    }
 }
 
 #[inline(always)]
@@ -275,9 +387,27 @@ fn watch_read(cb: &DynarmicCallbacks32, vaddr: u64, size: u64, value: u128) {
     let lr = pc_ptr
         .map(|p| unsafe { p.offset(-1).read_volatile() })
         .unwrap_or(0);
-    eprintln!(
-        "[WATCH_READ ] pc=0x{:08X} lr=0x{:08X} vaddr=0x{:X} size={} value=0x{:032X}",
-        pc, lr, vaddr, size, value
+    let tid = crate::hle::kernel::kernel::get_current_thread_id_fast().unwrap_or(0);
+    let core = cb.parent.load(std::sync::atomic::Ordering::Relaxed);
+    let core_id: i32 = if core.is_null() {
+        -1
+    } else {
+        unsafe { (*core).core_index() as i32 }
+    };
+    let value_lo = value as u64;
+    let value_hi = (value >> 64) as u64;
+    common::trace::emit_raw(
+        common::trace::cat::WATCH_READ,
+        &[
+            core_id as u32 as u64,
+            tid,
+            pc as u64,
+            lr as u64,
+            vaddr,
+            size,
+            value_lo,
+            value_hi,
+        ],
     );
     maybe_dump_code_once(cb);
     maybe_dump_stack_once(cb, pc_ptr);
@@ -992,17 +1122,19 @@ fn maybe_scan_bl(cb: &DynarmicCallbacks32) {
             let match_target = computed_target & !1u64;
             if match_target >= target_lo && match_target <= target_hi {
                 let cond = (w3 >> 4) & 0xF;
-                let kind = if is_blx {
-                    "BLX"
+                let kind_id: u8 = if is_blx {
+                    2
                 } else if w3 & 0x01 != 0 {
-                    "BL "
+                    1
                 } else {
-                    "B  "
+                    0
                 };
-                eprintln!(
-                    "[BL_HIT] pc=0x{:08X} target=0x{:08X} kind={} cond=0x{:X}",
-                    pc, computed_target, kind, cond
-                );
+                if common::trace::is_enabled(common::trace::cat::BL_HIT) {
+                    common::trace::emit_raw(
+                        common::trace::cat::BL_HIT,
+                        &[pc, computed_target, kind_id as u64, cond as u64],
+                    );
+                }
                 hits += 1;
                 if hits > cap {
                     eprintln!("[BL_HIT] (more hits suppressed)");
@@ -1016,6 +1148,208 @@ fn maybe_scan_bl(cb: &DynarmicCallbacks32) {
         "[BL_HIT] scan done: {} hits in [0x{:X}..0x{:X}] target=[0x{:X}..0x{:X}]",
         hits, start, end, target_lo, target_hi
     );
+}
+
+/// `RUZU_FASTMEM_TRAP_PAGE=0xADDR[,0xADDR2,…]` — mprotect the 4-KiB host
+/// page(s) backing the given guest vaddr(s) in the fastmem arena as
+/// `PROT_READ`. JIT-emitted writes to those guest pages then take a
+/// SIGSEGV, the backend's exception handler patches the faulting MOV out
+/// of the fastmem path on first use, and subsequent stores to that
+/// instruction go through the slow `write_8/16/32/64` callback — where
+/// `RUZU_TRACE_W_AT_VADDR=…` / WATCH_WRITE diagnostics fire. Used to
+/// surface stores that would otherwise be invisible to memory callbacks
+/// (e.g. the unknown writer of `[struct+0x10]` in the MK8D matrix-init
+/// chain, task #112) without paying the global `RUZU_NO_FASTMEM`
+/// slowdown.
+///
+/// Idempotent across cores: the host page is shared between all JIT
+/// instances on the same process, so the mprotect on core 0 covers
+/// every core. Subsequent cores log "already trapped" and bail out.
+fn maybe_trap_fastmem_page(fastmem_pointer: Option<*mut u8>, core_index: usize) {
+    use std::sync::OnceLock;
+    static DONE: OnceLock<()> = OnceLock::new();
+    let Some(raw) = std::env::var("RUZU_FASTMEM_TRAP_PAGE").ok() else {
+        return;
+    };
+    if DONE.get().is_some() {
+        log::warn!(
+            "[FASTMEM_TRAP] core={} skipped — already trapped on an earlier core",
+            core_index
+        );
+        return;
+    }
+    let Some(fastmem_pointer) = fastmem_pointer else {
+        log::warn!(
+            "[FASTMEM_TRAP] core={} RUZU_FASTMEM_TRAP_PAGE set but fastmem is disabled (RUZU_NO_FASTMEM?); ignoring",
+            core_index
+        );
+        return;
+    };
+    if fastmem_pointer.is_null() {
+        log::warn!(
+            "[FASTMEM_TRAP] core={} fastmem_pointer is null; ignoring",
+            core_index
+        );
+        return;
+    }
+    let _ = DONE.set(());
+    const PAGE_SIZE: usize = 0x1000;
+    let mut pages: Vec<usize> = Vec::new();
+    for token in raw.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        let stripped = token.trim_start_matches("0x").trim_start_matches("0X");
+        let Ok(addr) = u64::from_str_radix(stripped, 16) else {
+            log::warn!("[FASTMEM_TRAP] cannot parse '{}'", token);
+            continue;
+        };
+        let page = (addr as usize) & !(PAGE_SIZE - 1);
+        pages.push(page);
+    }
+    if pages.is_empty() {
+        return;
+    }
+    // The guest page backing `addr` is often NOT yet allocated when the
+    // JIT is constructed (heap setup happens after the first SVCs). Our
+    // initial mprotect succeeds against the PROT_NONE-mapped fastmem
+    // arena, but as soon as the kernel maps the guest page on first
+    // touch it RE-applies PROT_READ|PROT_WRITE — undoing the trap. So we
+    // spawn a small re-applier thread that keeps the page PROT_READ for
+    // a configurable duration (default ~30 s) and bails out after that.
+    // 30 s is plenty for the MK8D matrix-init window to fire.
+    let fastmem_addr = fastmem_pointer as usize;
+    let duration_ms = std::env::var("RUZU_FASTMEM_TRAP_DURATION_MS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(30_000);
+    let interval_ms = std::env::var("RUZU_FASTMEM_TRAP_INTERVAL_MS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(50);
+    log::warn!(
+        "[FASTMEM_TRAP] re-apply loop: {} page(s), every {} ms for {} ms",
+        pages.len(),
+        interval_ms,
+        duration_ms
+    );
+    std::thread::Builder::new()
+        .name("ruzu-fastmem-trap".into())
+        .spawn(move || {
+            let start = std::time::Instant::now();
+            let mut tick: u64 = 0;
+            while start.elapsed().as_millis() < duration_ms as u128 {
+                for &page in &pages {
+                    let host_ptr = (fastmem_addr + page) as *mut libc::c_void;
+                    let ret = unsafe { libc::mprotect(host_ptr, PAGE_SIZE, libc::PROT_READ) };
+                    // Log the FIRST success per page so we know when the
+                    // trap "took" (the page is mapped) and every Nth
+                    // success after that. EAGAIN-equivalent quiet path:
+                    // ret != 0 just means the page isn't yet mapped, we
+                    // try again next tick.
+                    if ret == 0 && tick % 100 == 0 {
+                        log::warn!(
+                            "[FASTMEM_TRAP] re-applied guest=0x{:08X} host=0x{:X} tick={}",
+                            page,
+                            host_ptr as usize,
+                            tick
+                        );
+                    }
+                }
+                tick += 1;
+                std::thread::sleep(std::time::Duration::from_millis(interval_ms));
+            }
+            log::warn!("[FASTMEM_TRAP] re-apply loop ended after {} ms", duration_ms);
+        })
+        .expect("spawn ruzu-fastmem-trap");
+}
+
+/// `RUZU_WATCH_VADDR_POLL=0xADDR[,0xADDR2,…]` — spawn a background thread
+/// that reads each 4-byte guest vaddr from the fastmem arena every
+/// `RUZU_WATCH_VADDR_POLL_INTERVAL_MS` (default 10) and logs the value
+/// whenever it changes. Catches writes regardless of access mechanism
+/// (fastmem fast path, callback path, HLE-side direct write, …) without
+/// requiring instruction-level instrumentation. Trade-off: misses
+/// back-to-back writes that change a value twice within one poll cycle,
+/// and only sees the FINAL value of a multi-byte store.
+///
+/// Idempotent across cores. Uses unsafe pointer reads on the fastmem
+/// region — for pages that aren't mapped yet, the read will SIGSEGV;
+/// to be safe, the poller catches that and skips (the fastmem region
+/// is mapped PROT_NONE for unallocated pages, so reading is the same
+/// as writing for fault behaviour).
+fn maybe_spawn_vaddr_poller(fastmem_pointer: Option<*mut u8>, core_index: usize) {
+    use std::sync::OnceLock;
+    static DONE: OnceLock<()> = OnceLock::new();
+    let Some(raw) = std::env::var("RUZU_WATCH_VADDR_POLL").ok() else {
+        return;
+    };
+    if DONE.get().is_some() {
+        return;
+    }
+    let Some(fastmem_pointer) = fastmem_pointer.filter(|p| !p.is_null()) else {
+        log::warn!(
+            "[WATCH_POLL] core={} fastmem disabled; cannot poll",
+            core_index
+        );
+        return;
+    };
+    let _ = DONE.set(());
+    let mut addrs: Vec<u64> = Vec::new();
+    for token in raw.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        let stripped = token.trim_start_matches("0x").trim_start_matches("0X");
+        let Ok(addr) = u64::from_str_radix(stripped, 16) else {
+            log::warn!("[WATCH_POLL] cannot parse '{}'", token);
+            continue;
+        };
+        addrs.push(addr);
+    }
+    if addrs.is_empty() {
+        return;
+    }
+    let interval_ms = std::env::var("RUZU_WATCH_VADDR_POLL_INTERVAL_MS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(10);
+    let fastmem_addr = fastmem_pointer as usize;
+    log::warn!(
+        "[WATCH_POLL] watching {} vaddr(s) every {} ms",
+        addrs.len(),
+        interval_ms
+    );
+    std::thread::Builder::new()
+        .name("ruzu-vaddr-poll".into())
+        .spawn(move || {
+            let mut last_values: Vec<Option<u32>> = vec![None; addrs.len()];
+            let start = std::time::Instant::now();
+            loop {
+                for (i, &addr) in addrs.iter().enumerate() {
+                    let host_ptr = (fastmem_addr + addr as usize) as *const u32;
+                    // SAFETY: We may SIGSEGV if the page isn't mapped. The
+                    // host's default SIGSEGV handler will abort — to be
+                    // safer we'd need sigsetjmp; for diagnostic use this
+                    // is acceptable. The trap re-applier will keep the
+                    // page PROT_READ, so reads are fine.
+                    let value = unsafe { std::ptr::read_volatile(host_ptr) };
+                    let changed = match last_values[i] {
+                        None => true,
+                        Some(prev) => prev != value,
+                    };
+                    if changed {
+                        let t = start.elapsed().as_secs_f64();
+                        log::warn!(
+                            "[WATCH_POLL] t={:8.3}s vaddr=0x{:08X} value=0x{:08X} (was {})",
+                            t,
+                            addr,
+                            value,
+                            last_values[i]
+                                .map(|v| format!("0x{:08X}", v))
+                                .unwrap_or_else(|| "—".to_string())
+                        );
+                        last_values[i] = Some(value);
+                    }
+                }
+                std::thread::sleep(std::time::Duration::from_millis(interval_ms));
+            }
+        })
+        .expect("spawn ruzu-vaddr-poll");
 }
 
 /// PC-range filter from `RUZU_WATCH_PC=0xLO-0xHI` (inclusive..exclusive).
@@ -1072,17 +1406,13 @@ struct DynarmicCallbacks32 {
     /// Used as fallback when core_memory is None (tests).
     /// Not in upstream, but needed for Rust fallback path.
     memory: SharedProcessMemory,
-    /// Cached fastmem pointer for lock-free memory reads during code translation.
-    /// Matches upstream's direct `m_memory` reference (no synchronization).
-    /// Safety: valid for the lifetime of the DeviceMemory backing.
-    fastmem_ptr: *const u8,
     /// Raw pointer to jit_state.reg[15] (PC) for diagnostic logging.
     /// Set after jit creation via `set_pc_ptr()`.
     /// Not in upstream, but needed since we don't have debugger.
     jit_pc_ptr: Option<*const u32>,
 }
 
-// Safety: The raw pointers (parent, process, fastmem_ptr, jit_pc_ptr) all point to
+// Safety: The raw pointers (parent, process, jit_pc_ptr) all point to
 // objects that are stable for the JIT's lifetime. The JIT is single-threaded per core.
 unsafe impl Send for DynarmicCallbacks32 {}
 
@@ -1093,27 +1423,15 @@ impl DynarmicCallbacks32 {
         process: *const crate::hle::kernel::k_process::KProcess,
         parent_ptr: Arc<AtomicPtr<ArmDynarmic32>>,
     ) -> Self {
-        // Cache fastmem pointer for lock-free code reads during JIT compilation.
-        // Matches upstream's direct m_memory reference.
-        let fastmem_ptr = core_memory
-            .as_ref()
-            .map(|cm| cm.lock().unwrap().fastmem_pointer())
-            .unwrap_or(std::ptr::null_mut()) as *const u8;
         log::info!(
-            "DynarmicCallbacks32: core_memory={} fastmem_ptr={:?}",
-            if core_memory.is_some() {
-                "wired"
-            } else {
-                "fallback"
-            },
-            fastmem_ptr
+            "DynarmicCallbacks32: core_memory={}",
+            if core_memory.is_some() { "wired" } else { "fallback" }
         );
         Self {
             parent: parent_ptr,
             core_memory,
             process,
             memory,
-            fastmem_ptr,
             jit_pc_ptr: None,
         }
     }
@@ -1169,14 +1487,9 @@ impl DynarmicCallbacks32 {
 
 impl UserCallbacks for DynarmicCallbacks32 {
     fn memory_read_code(&self, vaddr: u64) -> Option<u32> {
-        // Lock-free fast path using cached fastmem pointer, matching upstream's
-        // direct m_memory.Read32(vaddr) without any synchronization.
-        if !self.fastmem_ptr.is_null() {
-            let value =
-                unsafe { (self.fastmem_ptr.add(vaddr as usize) as *const u32).read_unaligned() };
-            return Some(value);
-        }
-        // Fallback (tests without fastmem): lock and read
+        // Upstream returns nullopt when instruction fetch targets an invalid
+        // virtual range. Do not use fastmem here: an invalid guest PC must end
+        // translation, not turn into a host SIGSEGV while reading code bytes.
         if let Some(ref cm) = self.core_memory {
             let m = cm.lock().unwrap();
             if m.is_valid_virtual_address_range(vaddr, 4) {
@@ -1229,6 +1542,7 @@ impl UserCallbacks for DynarmicCallbacks32 {
     fn memory_write_8(&mut self, vaddr: u64, value: u8) {
         watch_write(self, vaddr, 1, value as u128);
         if self.check_memory_access(vaddr, 1) {
+            trace_unmapped_write(self, vaddr, 1, value as u128);
             self.mem().write_8(vaddr, value);
         }
     }
@@ -1236,6 +1550,7 @@ impl UserCallbacks for DynarmicCallbacks32 {
     fn memory_write_16(&mut self, vaddr: u64, value: u16) {
         watch_write(self, vaddr, 2, value as u128);
         if self.check_memory_access(vaddr, 2) {
+            trace_unmapped_write(self, vaddr, 2, value as u128);
             self.mem().write_16(vaddr, value);
         }
     }
@@ -1243,6 +1558,7 @@ impl UserCallbacks for DynarmicCallbacks32 {
     fn memory_write_32(&mut self, vaddr: u64, value: u32) {
         watch_write(self, vaddr, 4, value as u128);
         if self.check_memory_access(vaddr, 4) {
+            trace_unmapped_write(self, vaddr, 4, value as u128);
             self.mem().write_32(vaddr, value);
         }
     }
@@ -1250,6 +1566,7 @@ impl UserCallbacks for DynarmicCallbacks32 {
     fn memory_write_64(&mut self, vaddr: u64, value: u64) {
         watch_write(self, vaddr, 8, value as u128);
         if self.check_memory_access(vaddr, 8) {
+            trace_unmapped_write(self, vaddr, 8, value as u128);
             self.mem().write_64(vaddr, value);
         }
     }
@@ -1314,16 +1631,22 @@ impl UserCallbacks for DynarmicCallbacks32 {
         // Same PC-range filter as watch_read / watch_write. Reports STLEX
         // attempts (write_exclusive_32) so we can distinguish "lock never
         // tried" from "lock always fails exclusive-check".
-        if let Some((pc_lo, pc_hi)) = watched_pc_range() {
+        if common::trace::is_enabled(common::trace::cat::STLEX) {
             let pc = self
                 .jit_pc_ptr
                 .map(|p| unsafe { p.read_volatile() })
                 .unwrap_or(0);
-            let pc_u64 = pc as u64;
-            if pc_u64 >= pc_lo && pc_u64 < pc_hi {
-                eprintln!(
-                    "[STLEX      ] pc=0x{:08X} vaddr=0x{:X} value=0x{:08X} expected=0x{:08X} ok={}",
-                    pc, vaddr, value, expected, ok
+            // Optional pc-range filter via env (kept as opt-in alongside the TOML toggle).
+            let should = if let Some((pc_lo, pc_hi)) = watched_pc_range() {
+                let pc_u64 = pc as u64;
+                pc_u64 >= pc_lo && pc_u64 < pc_hi
+            } else {
+                true
+            };
+            if should {
+                common::trace::emit_raw(
+                    common::trace::cat::STLEX,
+                    &[pc as u64, vaddr, value as u64, expected as u64, ok as u64],
                 );
             }
         }
@@ -1940,12 +2263,11 @@ impl UserCallbacks for DynarmicCallbacks32 {
                     self.parent().is_in_thumb_mode()
                 );
 
-                // Store exception info and halt. The run loop will advance PC
-                // past unimplemented instructions (e.g. NEON/SIMD).
-                self.parent()
-                    .last_exception_address
-                    .store(pc, Ordering::Relaxed);
-                self.halt_execution(rdynarmic::halt_reason::HaltReason::EXCEPTION_RAISED);
+                // Upstream logs non-NoExecute A32 exceptions but does not
+                // return a guest exception unless the debugger is active.
+                // Do not halt here; otherwise benign Dynarmic callbacks (for
+                // example around NEON-heavy MK8D code) suspend the guest
+                // thread as a fake PrefetchAbort.
             }
         }
     }
@@ -2166,6 +2488,36 @@ impl ArmDynarmic32 {
             }
         };
 
+        // Expose the fastmem base to audio_core's direct-write tracer so it
+        // can translate host pointers back to guest vaddrs (the host base
+        // shifts per run due to ASLR; using guest vaddrs keeps env-var
+        // configuration stable across runs).
+        if let Some(p) = fastmem_pointer {
+            common::fastmem_registry::set(p as usize);
+        }
+
+        // RUZU_FASTMEM_TRAP_PAGE=0xADDR — mprotect the host page backing the
+        // given guest vaddr in the fastmem arena as PROT_READ, so any
+        // subsequent JIT-emitted write through fastmem faults. The
+        // backend's SIGSEGV handler then patches the faulting MOV and
+        // routes the write through the slow callback path, which makes the
+        // existing `RUZU_TRACE_W_AT_VADDR=…` / WATCH_WRITE diagnostics
+        // fire on stores that would otherwise be invisible. Used to
+        // identify the writer of `[struct+0x10]` in the MK8D matrix-init
+        // call chain (task #112) without paying the global `NO_FASTMEM`
+        // slowdown.
+        maybe_trap_fastmem_page(fastmem_pointer, core_index);
+
+        // RUZU_WATCH_VADDR_POLL=0xADDR — non-intrusive memory watcher.
+        // A background thread reads `[fastmem_pointer + vaddr]` every
+        // `RUZU_WATCH_VADDR_POLL_INTERVAL_MS` (default 10) and logs the
+        // value when it changes. Catches writes regardless of mechanism
+        // (fastmem, callback, HLE direct, etc.) at the cost of missing
+        // back-to-back writes that happen within the poll interval.
+        // Complements the JIT-side trap when the writer is invisible to
+        // the SIGSEGV recovery path.
+        maybe_spawn_vaddr_poller(fastmem_pointer, core_index);
+
         let result = Self {
             base: ArmInterfaceBase::new(uses_wall_clock),
             exclusive_monitor,
@@ -2288,6 +2640,23 @@ impl ArmInterface for ArmDynarmic32 {
             });
         if let (Some(start), Some(end)) = (trace_start, trace_end) {
             let current_pc = jit.get_register(15);
+            let trace_only_when_pc_window =
+                std::env::var_os("RUZU_A32_TRACE_ONLY_WHEN_PC_WINDOW").is_some();
+            let pc_window_active =
+                rdynarmic::jit::PC_TRACE_ACTIVE.load(std::sync::atomic::Ordering::Relaxed);
+            if trace_only_when_pc_window && !pc_window_active && !(current_pc >= start && current_pc < end) {
+                let rdynarmic_hr = jit.run();
+                return translate_halt_reason(rdynarmic_hr);
+            }
+            let trace_after_watch = std::env::var_os("RUZU_A32_TRACE_AFTER_WATCH").is_some();
+            if trace_after_watch
+                && trace_search_limit > 0
+                && !A32_TRACE_AFTER_WATCH_ARMED.load(Ordering::Relaxed)
+                && !(current_pc >= start && current_pc < end)
+            {
+                let rdynarmic_hr = jit.run();
+                return translate_halt_reason(rdynarmic_hr);
+            }
             if trace_limit > 0
                 && (current_pc >= start && current_pc < end || trace_search_limit > 0)
             {
@@ -2302,18 +2671,22 @@ impl ArmInterface for ArmDynarmic32 {
                 for step in 0..total_limit {
                     let pc = jit.get_register(15);
                     if !entered_range {
-                        log::info!(
-                            "[A32TRACE] search_step={} pc=0x{:08x} cpsr=0x{:08x} r0=0x{:08x} r1=0x{:08x} r2=0x{:08x} r3=0x{:08x} sp=0x{:08x} lr=0x{:08x}",
-                            step,
-                            pc,
-                            jit.get_cpsr(),
-                            jit.get_register(0),
-                            jit.get_register(1),
-                            jit.get_register(2),
-                            jit.get_register(3),
-                            jit.get_register(13),
-                            jit.get_register(14),
-                        );
+                        let quiet_search =
+                            std::env::var_os("RUZU_A32_TRACE_SEARCH_QUIET").is_some();
+                        if !quiet_search {
+                            log::info!(
+                                "[A32TRACE] search_step={} pc=0x{:08x} cpsr=0x{:08x} r0=0x{:08x} r1=0x{:08x} r2=0x{:08x} r3=0x{:08x} sp=0x{:08x} lr=0x{:08x}",
+                                step,
+                                pc,
+                                jit.get_cpsr(),
+                                jit.get_register(0),
+                                jit.get_register(1),
+                                jit.get_register(2),
+                                jit.get_register(3),
+                                jit.get_register(13),
+                                jit.get_register(14),
+                            );
+                        }
                         if pc >= start && pc < end {
                             entered_range = true;
                             log::info!(
@@ -2326,7 +2699,9 @@ impl ArmInterface for ArmDynarmic32 {
                             if !last_hr.is_empty()
                                 && last_hr != rdynarmic::halt_reason::HaltReason::STEP
                             {
-                                log::info!("[A32TRACE] halt while searching: {:?}", last_hr);
+                                if !quiet_search {
+                                    log::info!("[A32TRACE] halt while searching: {:?}", last_hr);
+                                }
                                 break;
                             }
                             if step + 1 >= trace_search_limit {
@@ -2559,5 +2934,28 @@ impl ArmInterface for ArmDynarmic32 {
     fn rewind_breakpoint_instruction(&mut self) {
         let ctx = self.breakpoint_context.clone();
         self.set_context(&ctx);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::hle::kernel::k_process::ProcessMemoryData;
+    use std::sync::RwLock;
+
+    #[test]
+    fn memory_read_code_returns_none_for_invalid_fetch() {
+        let mut backing = ProcessMemoryData::new();
+        backing.base = 0x1000;
+        backing.data = vec![0x78, 0x56, 0x34, 0x12];
+        let callbacks = DynarmicCallbacks32::new(
+            Arc::new(RwLock::new(backing)),
+            None,
+            std::ptr::null(),
+            Arc::new(AtomicPtr::new(std::ptr::null_mut())),
+        );
+
+        assert_eq!(callbacks.memory_read_code(0x1000), Some(0x12345678));
+        assert_eq!(callbacks.memory_read_code(0x805A2D08), None);
     }
 }

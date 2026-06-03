@@ -155,7 +155,41 @@ pub fn connect_to_named_port(system: &System, out: &mut Handle, user_name: u64) 
     };
 
     if let Some(handler) = handler {
-        let manager = Arc::new(Mutex::new(SessionRequestManager::new()));
+        // Look up the owning ServerManager's endpoints (queue + wakeup +
+        // server_manager Weak) so the new session's SessionRequestManager can
+        // propagate them to descendants. Without this, descendants would have
+        // no way to register themselves via the queue and would either
+        // deadlock (if they tried to lock `Mutex<ServerManager>`) or remain
+        // out of the host thread's multi_wait.
+        let ownership = service_manager
+            .lock()
+            .unwrap()
+            .get_service_ownership(&name)
+            .cloned();
+        let manager = if let Some(ownership) = ownership {
+            let queue = ownership.queue;
+            let wakeup = ownership.wakeup;
+            match ownership.server_manager.upgrade() {
+                Some(sm) => Arc::new(Mutex::new(
+                    SessionRequestManager::new_with_server_manager_full(sm, queue, wakeup),
+                )),
+                None => {
+                    // ServerManager was dropped after publication — fall back
+                    // to a manager without the back-pointer. queue + wakeup
+                    // are still alive (we hold Arcs) so future descendant
+                    // sub-sessions can still register via the queue, but the
+                    // direct server_manager link is absent.
+                    let manager = Arc::new(Mutex::new(SessionRequestManager::new()));
+                    // We can't call new_with_server_manager_full without a Some(sm).
+                    // For now, drop queue/wakeup; sub-sessions of this session will
+                    // become orphan too. This branch should be rare in practice.
+                    let _ = (queue, wakeup);
+                    manager
+                }
+            }
+        } else {
+            Arc::new(Mutex::new(SessionRequestManager::new()))
+        };
         manager.lock().unwrap().set_session_handler(handler);
         if let Some(client_session) =
             process.get_client_session_by_object_id(client_session_object_id)

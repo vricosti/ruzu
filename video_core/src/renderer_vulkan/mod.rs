@@ -794,7 +794,12 @@ impl RasterizerVulkan {
 }
 
 impl RasterizerInterface for RasterizerVulkan {
-    fn draw(&mut self, draw_state: &crate::engines::draw_manager::DrawState, instance_count: u32) {
+    fn draw(
+        &mut self,
+        draw_view: crate::engines::draw_manager::Maxwell3DDrawView<'_>,
+        instance_count: u32,
+    ) {
+        let draw_state = draw_view.draw_state();
         debug!(
             "RasterizerVulkan::draw indexed={} instances={}",
             draw_state.draw_indexed, instance_count
@@ -808,7 +813,11 @@ impl RasterizerInterface for RasterizerVulkan {
         debug!("RasterizerVulkan::draw_texture");
     }
 
-    fn clear(&mut self, _draw_state: &crate::engines::draw_manager::DrawState, layer_count: u32) {
+    fn clear(
+        &mut self,
+        _clear_view: crate::engines::draw_manager::Maxwell3DClearView<'_>,
+        layer_count: u32,
+    ) {
         trace!("RasterizerVulkan::clear layers={}", layer_count);
     }
 

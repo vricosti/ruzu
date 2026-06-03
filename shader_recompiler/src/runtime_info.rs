@@ -134,6 +134,9 @@ pub struct RuntimeInfo {
     /// Use storage buffers instead of global pointers on GLASM.
     pub glasm_use_storage_buffers: bool,
 
+    /// Fragment color output type per render target.
+    pub frag_color_types: [AttributeType; 8],
+
     /// Transform feedback state for each varying.
     pub xfb_varyings: Vec<TransformFeedbackVarying>,
     /// Number of transform feedback varyings.

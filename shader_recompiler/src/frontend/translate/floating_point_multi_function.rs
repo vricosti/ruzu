@@ -23,15 +23,10 @@ pub fn mufu(tv: &mut TranslatorVisitor, insn: u64) {
         3 => tv.ir.fp_log2(a),          // LG2
         4 => tv.ir.fp_recip_32(a),      // RCP
         5 => tv.ir.fp_recip_sqrt_32(a), // RSQ
-        6 => {
-            let sqrt = tv.ir.fp_sqrt_32(a);
-            tv.ir.fp_recip_32(sqrt)
-        } // RCP64H (approximate)
-        7 => tv.ir.fp_sqrt_32(a),       // SQRT
-        _ => {
-            log::warn!("Unknown MUFU op: {}", op);
-            a
-        }
+        6 => panic!("MUFU.RCP64H not implemented (upstream NotImplementedException)"),
+        7 => panic!("MUFU.RSQ64H not implemented (upstream NotImplementedException)"),
+        8 => tv.ir.fp_sqrt_32(a), // SQRT
+        _ => panic!("Unknown MUFU op: {}", op),
     };
 
     if sat {

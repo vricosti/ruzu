@@ -190,7 +190,7 @@ impl ITransferStorageAccessor {
     pub fn new(backing: Arc<Mutex<dyn LibraryAppletStorage>>) -> Self {
         let handlers = build_handler_map(&[
             (0, Some(Self::get_size_handler), "GetSize"),
-            (1, None, "GetHandle"), // Needs KTransferMemory support
+            (1, Some(Self::get_handle_handler), "GetHandle"),
         ]);
         Self {
             backing,
@@ -209,6 +209,25 @@ impl ITransferStorageAccessor {
         let mut rb = ResponseBuilder::new(ctx, 4, 0, 0);
         rb.push_result(RESULT_SUCCESS);
         rb.push_u64(size as u64);
+    }
+
+    /// Port of ITransferStorageAccessor::GetHandle.
+    fn get_handle_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let accessor =
+            unsafe { &*(this as *const dyn ServiceFramework as *const ITransferStorageAccessor) };
+        let backing = accessor.backing.lock().unwrap();
+        let size = backing.get_size();
+        let object_id = backing.get_handle_object_id();
+        drop(backing);
+
+        let mut rb = ResponseBuilder::new(ctx, 4, 1, 0);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_u64(size as u64);
+        if let Some(object_id) = object_id {
+            rb.push_copy_object_id(object_id);
+        } else {
+            rb.push_copy_objects(0);
+        }
     }
 }
 

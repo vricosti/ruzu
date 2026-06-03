@@ -372,7 +372,7 @@ impl base::BufferCacheRuntime for BufferCacheRuntime {
     }
 
     fn finish(&mut self) {
-        self.finish();
+        BufferCacheRuntime::finish(self);
     }
 
     fn upload_staging_buffer(&mut self, size: u64) -> StagingBufferRef {
@@ -398,11 +398,11 @@ impl base::BufferCacheRuntime for BufferCacheRuntime {
     }
 
     fn pre_copy_barrier(&mut self) {
-        self.pre_copy_barrier();
+        BufferCacheRuntime::pre_copy_barrier(self);
     }
 
     fn post_copy_barrier(&mut self) {
-        self.post_copy_barrier();
+        BufferCacheRuntime::post_copy_barrier(self);
     }
 
     fn copy_buffer(
@@ -438,7 +438,9 @@ impl base::BufferCacheRuntime for BufferCacheRuntime {
     /// Port of upstream `BufferCacheRuntime::BindVertexBuffers`
     /// (`gl_buffer_cache.cpp:242`).
     fn bind_vertex_buffers(&mut self, bindings: &HostBindings, gpu_handles: &[u32]) {
-        let count = gpu_handles.len() as i32;
+        let count = (gpu_handles.len() as u32)
+            .min(self.max_attributes.saturating_sub(bindings.min_index))
+            as i32;
         if count == 0 {
             return;
         }
@@ -535,16 +537,96 @@ impl base::BufferCacheRuntime for BufferCacheRuntime {
         BufferCacheRuntime::set_base_uniform_bindings(self, bindings);
     }
 
+    fn set_base_storage_bindings(&mut self, bindings: &[u32; NUM_STAGES]) {
+        BufferCacheRuntime::set_base_storage_bindings(self, bindings);
+    }
+
+    fn set_enable_storage_buffers(&mut self, enable: bool) {
+        BufferCacheRuntime::set_enable_storage_buffers(self, enable);
+    }
+
     fn bind_storage_buffer(
         &mut self,
-        _stage: usize,
+        stage: usize,
         binding_index: u32,
         _buffer: BufferId,
-        _offset: u32,
-        _size: u32,
-        _is_written: bool,
+        gpu_handle: u32,
+        offset: u32,
+        size: u32,
+        is_written: bool,
     ) {
-        log::trace!("GL bind_storage_buffer binding={}", binding_index);
+        if !self.use_storage_buffers {
+            log::trace!(
+                "GL bind_storage_buffer skipped bindless path stage={} binding={} written={}",
+                stage,
+                binding_index,
+                is_written
+            );
+            return;
+        }
+        let base_binding = self.graphics_base_storage_bindings[stage];
+        let binding = base_binding + binding_index;
+        unsafe {
+            if size != 0 && gpu_handle != 0 {
+                gl::BindBufferRange(
+                    gl::SHADER_STORAGE_BUFFER,
+                    binding,
+                    gpu_handle,
+                    offset as isize,
+                    size as isize,
+                );
+            } else {
+                gl::BindBufferRange(gl::SHADER_STORAGE_BUFFER, binding, 0, 0, 0);
+            }
+        }
+        if std::env::var_os("RUZU_TRACE_SSBO_BIND").is_some() {
+            log::info!(
+                "[SSBO_BIND] stage={} binding={} local_binding={} handle={} offset=0x{:X} size=0x{:X} written={}",
+                stage,
+                binding,
+                binding_index,
+                gpu_handle,
+                offset,
+                size,
+                is_written
+            );
+        }
+        if std::env::var_os("RUZU_DUMP_SSBO_BIND").is_some() && gpu_handle != 0 && size != 0 {
+            use std::sync::atomic::{AtomicUsize, Ordering};
+            static DUMPS: AtomicUsize = AtomicUsize::new(0);
+            let dump_index = DUMPS.fetch_add(1, Ordering::Relaxed);
+            if dump_index < 16 {
+                let dump_size = (size as usize).min(0x80);
+                let mut bytes = vec![0u8; dump_size];
+                unsafe {
+                    gl::GetNamedBufferSubData(
+                        gpu_handle,
+                        offset as isize,
+                        dump_size as isize,
+                        bytes.as_mut_ptr().cast(),
+                    );
+                }
+                let words: Vec<String> = bytes
+                    .chunks_exact(4)
+                    .map(|chunk| {
+                        format!(
+                            "{:08X}",
+                            u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]])
+                        )
+                    })
+                    .collect();
+                log::info!(
+                    "[SSBO_DUMP] #{} stage={} binding={} handle={} offset=0x{:X} size=0x{:X} words={}",
+                    dump_index,
+                    stage,
+                    binding,
+                    gpu_handle,
+                    offset,
+                    size,
+                    words.join(" ")
+                );
+            }
+        }
     }
 
     fn bind_texture_buffer(&mut self, _buffer: BufferId, _offset: u32, _size: u32, _format: u32) {}
@@ -562,12 +644,34 @@ impl base::BufferCacheRuntime for BufferCacheRuntime {
 
     fn bind_compute_storage_buffer(
         &mut self,
-        _binding: u32,
+        binding: u32,
         _buffer: BufferId,
-        _offset: u32,
-        _size: u32,
-        _is_written: bool,
+        gpu_handle: u32,
+        offset: u32,
+        size: u32,
+        is_written: bool,
     ) {
+        if !self.use_storage_buffers {
+            log::trace!(
+                "GL bind_compute_storage_buffer skipped bindless path binding={} written={}",
+                binding,
+                is_written
+            );
+            return;
+        }
+        unsafe {
+            if size != 0 && gpu_handle != 0 {
+                gl::BindBufferRange(
+                    gl::SHADER_STORAGE_BUFFER,
+                    binding,
+                    gpu_handle,
+                    offset as isize,
+                    size as isize,
+                );
+            } else {
+                gl::BindBufferRange(gl::SHADER_STORAGE_BUFFER, binding, 0, 0, 0);
+            }
+        }
     }
 
     fn has_fast_buffer_sub_data(&self) -> bool {

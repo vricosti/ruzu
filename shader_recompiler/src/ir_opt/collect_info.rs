@@ -10,7 +10,7 @@
 //! via `VaryingState` for loads/stores (upstream-faithful pattern).
 
 use crate::ir::opcodes::Opcode;
-use crate::ir::program::{CbufDescriptor, Program, StorageDescriptor, TexDescriptor};
+use crate::ir::program::{CbufDescriptor, Program, TexDescriptor};
 use crate::ir::types::Type;
 use crate::ir::value::Value;
 
@@ -38,6 +38,14 @@ fn cbuf_element_size(opcode: Opcode) -> u32 {
 /// Collect shader resource usage information.
 pub fn collect_shader_info_pass(program: &mut Program) {
     let mut uses_local_memory = false;
+
+    // Rebuild cbuf usage from the optimized IR. Frontend translation can
+    // conservatively register cbufs before DCE removes the actual load; keeping
+    // those stale mask bits makes OpenGL bind zero-sized UBO ranges.
+    program.info.constant_buffer_mask = 0;
+    program.info.constant_buffer_used_sizes = [0; crate::shader_info::Info::MAX_CBUFS];
+    program.info.constant_buffer_descriptors.clear();
+    program.info.used_constant_buffer_types = 0;
 
     let mut cbuf_set = std::collections::BTreeSet::<u32>::new();
     let mut tex_set = std::collections::BTreeSet::<u32>::new();
@@ -113,6 +121,37 @@ pub fn collect_shader_info_pass(program: &mut Program) {
                 // Local memory
                 Opcode::LoadLocal | Opcode::WriteLocal => {
                     uses_local_memory = true;
+                }
+
+                // Global memory
+                Opcode::LoadGlobalU8
+                | Opcode::LoadGlobalS8
+                | Opcode::LoadGlobalU16
+                | Opcode::LoadGlobalS16
+                | Opcode::LoadGlobal32
+                | Opcode::LoadGlobal64
+                | Opcode::LoadGlobal128 => {
+                    program.info.uses_int64 = true;
+                    program.info.uses_global_memory = true;
+                    program.info.used_constant_buffer_types |=
+                        (Type::U32 as u32) | (Type::U32x2 as u32);
+                    program.info.used_storage_buffer_types |=
+                        (Type::U32 as u32) | (Type::U32x2 as u32) | (Type::U32x4 as u32);
+                }
+                Opcode::WriteGlobalU8
+                | Opcode::WriteGlobalS8
+                | Opcode::WriteGlobalU16
+                | Opcode::WriteGlobalS16
+                | Opcode::WriteGlobal32
+                | Opcode::WriteGlobal64
+                | Opcode::WriteGlobal128 => {
+                    program.info.stores_global_memory = true;
+                    program.info.uses_int64 = true;
+                    program.info.uses_global_memory = true;
+                    program.info.used_constant_buffer_types |=
+                        (Type::U32 as u32) | (Type::U32x2 as u32);
+                    program.info.used_storage_buffer_types |=
+                        (Type::U32 as u32) | (Type::U32x2 as u32) | (Type::U32x4 as u32);
                 }
 
                 _ => {}

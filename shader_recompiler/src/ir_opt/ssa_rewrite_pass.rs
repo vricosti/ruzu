@@ -24,7 +24,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::ir::opcodes::Opcode;
 use crate::ir::post_order::post_order;
-use crate::ir::program::Program;
+use crate::ir::program::{Program, SyntaxNode};
 use crate::ir::types::Type;
 use crate::ir::value::{InstRef, Pred, Reg, Value};
 
@@ -335,6 +335,18 @@ impl Pass {
             }
             if changed {
                 self.register_use(replacement, user_ref);
+            }
+        }
+        for node in &mut program.syntax_list {
+            match node {
+                SyntaxNode::If { cond, .. }
+                | SyntaxNode::Repeat { cond, .. }
+                | SyntaxNode::Break { cond, .. } => {
+                    if *cond == Value::Inst(def_inst) {
+                        *cond = replacement;
+                    }
+                }
+                _ => {}
             }
         }
         // Convert def_inst to Identity(replacement) — defensive cleanup for
@@ -701,5 +713,35 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn replace_uses_with_rewrites_syntax_conditions() {
+        let mut program = Program::new(ShaderStage::VertexB);
+        program.blocks.push(Block::new());
+        let pred = Value::Pred(Pred(2));
+        let value = Value::ImmU1(true);
+        let get_idx = {
+            let block = program.block_mut(0);
+            block.append_inst(Inst::new(Opcode::SetPred, vec![pred, value]));
+            block.append_inst(Inst::new(Opcode::GetPred, vec![pred]))
+        };
+        program
+            .syntax_list
+            .push(crate::ir::program::SyntaxNode::If {
+                cond: Value::Inst(InstRef {
+                    block: 0,
+                    inst: get_idx,
+                }),
+                body: 0,
+                merge: 0,
+            });
+
+        ssa_rewrite_pass(&mut program);
+
+        let crate::ir::program::SyntaxNode::If { cond, .. } = program.syntax_list[0] else {
+            panic!("expected If node");
+        };
+        assert_eq!(cond, value);
     }
 }

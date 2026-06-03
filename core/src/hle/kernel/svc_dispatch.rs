@@ -933,11 +933,41 @@ fn call32(system: &System, imm: u32, args: &mut SvcArgs) {
             set_arg32(args, 0, result.get_inner_value());
         }
         Some(SvcId::SignalProcessWideKey) => {
-            svc_condition_variable::signal_process_wide_key(
-                system,
-                get_arg32(args, 0) as u64,
-                get_arg32(args, 1) as i32,
-            );
+            let cv_key = get_arg32(args, 0) as u64;
+            svc_condition_variable::signal_process_wide_key(system, cv_key, get_arg32(args, 1) as i32);
+            // RUZU_FORCE_WAIT_MASK_AFTER_SIGNAL=1 — Experiment for MK8D wedge
+            // (project_mk8d_unlock_site_found_2026_05_25 option D).
+            // After signaling cv at `cv_key`, set WAIT_MASK (0x40000000) on the
+            // paired mutex word at `cv_key - 8` (libnx AuxBufferInfo layout:
+            // mutex@+0, padding@+4, cv@+8). This forces the next libnx
+            // __nx_arbiter_unlock fast-path CAS to FAIL (cur != self_handle
+            // because of WAIT_MASK), routing the unlock through the kernel
+            // ArbitrateUnlock SVC where any actually-waiting thread (registered
+            // after we set WAIT_MASK) gets woken correctly.
+            //
+            // Cost: every cv-signal forces a subsequent ArbitrateUnlock SVC
+            // even with no waiter (kernel finds nothing to wake, returns).
+            //
+            // Limitation: only fires for cv_key-8 layout; some games use
+            // separate mutex+cv addresses where -8 won't be the mutex.
+            if std::env::var_os("RUZU_FORCE_WAIT_MASK_AFTER_SIGNAL").is_some() && cv_key >= 8 {
+                let mutex_addr = cv_key - 8;
+                let process_arc = system.current_process_arc().clone();
+                {
+                    let process = process_arc.lock().unwrap();
+                    if let Some(memory) =
+                        process.page_table.get_base().m_memory.as_ref()
+                    {
+                        let mem = memory.lock().unwrap();
+                        let current = mem.read_32(mutex_addr);
+                        // Only OR if there's a holder (low 28 bits nonzero) and
+                        // WAIT_MASK isn't already set.
+                        if current != 0 && (current & 0x40000000) == 0 {
+                            mem.write_32_no_rasterizer(mutex_addr, current | 0x40000000);
+                        }
+                    }
+                }
+            }
         }
         Some(SvcId::WaitForAddress) => {
             let result = svc_address_arbiter::wait_for_address(
@@ -1210,6 +1240,39 @@ fn call32(system: &System, imm: u32, args: &mut SvcArgs) {
             log::error!("=== GUEST REGISTER DUMP AT BREAK ===");
             for i in 0..args.len() {
                 log::error!("  r{:2} = {:#010x}", i, args[i]);
+            }
+            if let Some(kernel) = system.kernel() {
+                let core_index = kernel.current_physical_core_index() as usize;
+                if let Some(process_arc) = system.current_process_arc.as_ref().cloned() {
+                    let process = process_arc.lock().unwrap();
+                    if let Some(jit) = process.get_arm_interface(core_index) {
+                        use crate::arm::arm_interface::ThreadContext;
+                        let mut ctx = ThreadContext::default();
+                        jit.get_context(&mut ctx);
+                        log::error!(
+                            "  break_pc=0x{:08X} break_lr=0x{:08X} break_sp=0x{:08X} core={}",
+                            ctx.r[15] as u32,
+                            ctx.r[14] as u32,
+                            ctx.r[13] as u32,
+                            core_index
+                        );
+                        if std::env::var_os("RUZU_DUMP_BREAK_STACK").is_some() {
+                            let backtrace =
+                                crate::arm::debug::get_backtrace_from_context(&process, &ctx);
+                            for (index, entry) in backtrace.iter().enumerate().take(32) {
+                                log::error!(
+                                    "  break_bt[{}] addr=0x{:08X} orig=0x{:08X} module={} name={} offset=0x{:X}",
+                                    index,
+                                    entry.address as u32,
+                                    entry.original_address as u32,
+                                    entry.module,
+                                    entry.name,
+                                    entry.offset,
+                                );
+                            }
+                        }
+                    }
+                }
             }
             // Read abort message from guest memory if info1 points to a string.
             if info1 != 0 && info2 > 0 && info2 < 0x200 {
@@ -1984,24 +2047,30 @@ pub fn call(system: &System, imm: u32, is_64bit: bool, args: &mut SvcArgs) {
                 .get_or_init(|| std::env::var_os("RUZU_TRACE_TID_SVC"))
                 .as_ref()
         }
-        if let Some(target_str) = trace_tid_svc_env() {
-            let target_str = target_str.to_string_lossy();
-            let want = target_str == "*"
-                || target_str == "all"
-                || target_str
-                    .split(',')
-                    .filter_map(|s| s.trim().parse::<u64>().ok())
-                    .any(|t| t == tid);
+        // TID_SVC tracer — routes through the non-blocking trace ring.
+        // Enabled via `[svc] tid_svc = true` in trace.toml, or via the
+        // legacy `RUZU_TRACE_TID_SVC` env var. The env var doubles as a
+        // tid filter: `RUZU_TRACE_TID_SVC=75,86` only traces those tids;
+        // `*` or `all` (or just the TOML flag) traces every tid.
+        if common::trace::is_enabled(common::trace::cat::TID_SVC) {
+            let want = match trace_tid_svc_env() {
+                Some(target_str) => {
+                    let s = target_str.to_string_lossy();
+                    s == "*"
+                        || s == "all"
+                        || s.split(',')
+                            .filter_map(|p| p.trim().parse::<u64>().ok())
+                            .any(|t| t == tid)
+                }
+                None => true, // TOML enabled with no env filter ⇒ trace all tids
+            };
             if want {
                 let name = SvcId::from_u32(imm)
                     .map(|id| format!("{:?}", id))
                     .unwrap_or_else(|| format!("svc#0x{:02X}", imm));
+                let name_id = common::trace::intern_svc_name(&name);
                 let t_ns = super::race_anchor::elapsed_ns();
-                // RUZU_TRACE_TID_SVC_PC=1: extra PC field from the JIT's current
-                // thread context. Read at the SVC trap point — for ARM32 this
-                // is the SVC instruction's PC. Useful for side-by-side compare
-                // with zuyu's `RunThread svc tid=X pc=...` log lines.
-                let pc_str = if std::env::var_os("RUZU_TRACE_TID_SVC_PC").is_some() {
+                let (pc, lr) = if common::trace::tid_svc_pc_enabled() {
                     if let Some(kernel) = system.kernel() {
                         let core_index = kernel.current_physical_core_index() as usize;
                         if let Some(process_arc) = system.current_process_arc.as_ref().cloned() {
@@ -2010,30 +2079,33 @@ pub fn call(system: &System, imm: u32, is_64bit: bool, args: &mut SvcArgs) {
                                 use crate::arm::arm_interface::ThreadContext;
                                 let mut ctx = ThreadContext::default();
                                 jit.get_context(&mut ctx);
-                                format!(" pc=0x{:08X} lr=0x{:08X}", ctx.r[15] as u32, ctx.r[14] as u32)
+                                (ctx.r[15] as u32, ctx.r[14] as u32)
                             } else {
-                                String::new()
+                                (0, 0)
                             }
                         } else {
-                            String::new()
+                            (0, 0)
                         }
                     } else {
-                        String::new()
+                        (0, 0)
                     }
                 } else {
-                    String::new()
+                    (0, 0)
                 };
-                log::info!(
-                    "[TID_SVC] t_ns={} tid={} core={} svc={}{} args=[0x{:X}, 0x{:X}, 0x{:X}, 0x{:X}]",
-                    t_ns,
-                    tid,
-                    core_id,
-                    name,
-                    pc_str,
-                    dispatch_args[0],
-                    dispatch_args[1],
-                    dispatch_args[2],
-                    dispatch_args[3],
+                common::trace::emit_raw(
+                    common::trace::cat::TID_SVC,
+                    &[
+                        t_ns,
+                        tid,
+                        core_id as u64,
+                        name_id as u64,
+                        pc as u64,
+                        lr as u64,
+                        dispatch_args[0],
+                        dispatch_args[1],
+                        dispatch_args[2],
+                        dispatch_args[3],
+                    ],
                 );
             }
         }
@@ -2091,6 +2163,15 @@ pub fn call(system: &System, imm: u32, is_64bit: bool, args: &mut SvcArgs) {
             (-1, -1)
         }
     };
+    record_svc_summary(tid, core_id, imm);
+    if tid >= 0 {
+        crate::hle::kernel::k_scheduler::record_start_thread_sched_first_svc(
+            tid as u64,
+            core_id,
+            imm,
+        );
+    }
+    maybe_dump_svc_context_by_lr(system, imm, tid, core_id, &dispatch_args);
 
     // PC-window SVC counter. By default counts on tid=73 (main game thread);
     // RUZU_TRACE_PC_TID=N overrides to count a different thread (e.g. tid=102
@@ -2701,6 +2782,308 @@ pub fn dump_svc_profile() {
     }
 }
 
+const SVC_SUMMARY_MAX_TID: usize = 4096;
+const SVC_SUMMARY_MAX_IMM: usize = 128;
+
+/// Low-perturbation SVC census for side-by-side ruzu/zuyu investigations.
+///
+/// `RUZU_PROFILE_SVC_SUMMARY=1` records only in-memory atomic counters on the
+/// hot path and dumps via `dump_svc_summary_profile()`. This is intentionally
+/// separate from `RUZU_SVC_TRACE=1`, whose per-SVC stderr output changes MK8D
+/// timing enough to create false scheduler/audio conclusions.
+struct SvcSummaryProfile {
+    start: std::time::Instant,
+    total: std::sync::atomic::AtomicU64,
+    tid_total: Vec<std::sync::atomic::AtomicU64>,
+    tid_first_ns: Vec<std::sync::atomic::AtomicU64>,
+    tid_last_ns: Vec<std::sync::atomic::AtomicU64>,
+    tid_last_core: Vec<std::sync::atomic::AtomicI32>,
+    tid_last_imm: Vec<std::sync::atomic::AtomicU32>,
+    tid_imm_counts: Vec<std::sync::atomic::AtomicU64>,
+}
+
+static SVC_SUMMARY_PROFILE: std::sync::OnceLock<SvcSummaryProfile> = std::sync::OnceLock::new();
+
+fn svc_summary_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("RUZU_PROFILE_SVC_SUMMARY").is_some())
+}
+
+fn svc_summary_profile() -> &'static SvcSummaryProfile {
+    SVC_SUMMARY_PROFILE.get_or_init(|| SvcSummaryProfile {
+        start: std::time::Instant::now(),
+        total: std::sync::atomic::AtomicU64::new(0),
+        tid_total: (0..SVC_SUMMARY_MAX_TID)
+            .map(|_| std::sync::atomic::AtomicU64::new(0))
+            .collect(),
+        tid_first_ns: (0..SVC_SUMMARY_MAX_TID)
+            .map(|_| std::sync::atomic::AtomicU64::new(0))
+            .collect(),
+        tid_last_ns: (0..SVC_SUMMARY_MAX_TID)
+            .map(|_| std::sync::atomic::AtomicU64::new(0))
+            .collect(),
+        tid_last_core: (0..SVC_SUMMARY_MAX_TID)
+            .map(|_| std::sync::atomic::AtomicI32::new(-1))
+            .collect(),
+        tid_last_imm: (0..SVC_SUMMARY_MAX_TID)
+            .map(|_| std::sync::atomic::AtomicU32::new(u32::MAX))
+            .collect(),
+        tid_imm_counts: (0..SVC_SUMMARY_MAX_TID * SVC_SUMMARY_MAX_IMM)
+            .map(|_| std::sync::atomic::AtomicU64::new(0))
+            .collect(),
+    })
+}
+
+fn record_svc_summary(tid: i64, core_id: i32, imm: u32) {
+    if !svc_summary_enabled() {
+        return;
+    }
+    if tid < 0 || tid as usize >= SVC_SUMMARY_MAX_TID || imm as usize >= SVC_SUMMARY_MAX_IMM {
+        return;
+    }
+
+    use std::sync::atomic::Ordering;
+
+    let profile = svc_summary_profile();
+    let tid = tid as usize;
+    let imm = imm as usize;
+    let now_ns = profile.start.elapsed().as_nanos() as u64;
+
+    profile.total.fetch_add(1, Ordering::Relaxed);
+    profile.tid_total[tid].fetch_add(1, Ordering::Relaxed);
+    let _ = profile.tid_first_ns[tid].compare_exchange(
+        0,
+        now_ns.max(1),
+        Ordering::Relaxed,
+        Ordering::Relaxed,
+    );
+    profile.tid_last_ns[tid].store(now_ns, Ordering::Relaxed);
+    profile.tid_last_core[tid].store(core_id, Ordering::Relaxed);
+    profile.tid_last_imm[tid].store(imm as u32, Ordering::Relaxed);
+    profile.tid_imm_counts[tid * SVC_SUMMARY_MAX_IMM + imm].fetch_add(1, Ordering::Relaxed);
+}
+
+pub fn dump_svc_summary_profile() {
+    let Some(profile) = SVC_SUMMARY_PROFILE.get() else {
+        return;
+    };
+
+    use std::sync::atomic::Ordering;
+
+    let total = profile.total.load(Ordering::Relaxed);
+    if total == 0 {
+        return;
+    }
+
+    eprintln!(
+        "[SVC_SUMMARY] total={} elapsed_ms={:.2}",
+        total,
+        profile.start.elapsed().as_secs_f64() * 1e3
+    );
+
+    let mut rows = Vec::new();
+    for tid in 0..SVC_SUMMARY_MAX_TID {
+        let count = profile.tid_total[tid].load(Ordering::Relaxed);
+        if count == 0 {
+            continue;
+        }
+        let first_ns = profile.tid_first_ns[tid].load(Ordering::Relaxed);
+        let last_ns = profile.tid_last_ns[tid].load(Ordering::Relaxed);
+        rows.push((tid, count, first_ns, last_ns));
+    }
+    rows.sort_by_key(|(_, _, first_ns, _)| *first_ns);
+
+    eprintln!("[SVC_SUMMARY] threads_seen={}", rows.len());
+    for (tid, count, first_ns, last_ns) in rows {
+        let last_core = profile.tid_last_core[tid].load(Ordering::Relaxed);
+        let last_imm = profile.tid_last_imm[tid].load(Ordering::Relaxed);
+        let mut top = Vec::new();
+        for imm in 0..SVC_SUMMARY_MAX_IMM {
+            let n = profile.tid_imm_counts[tid * SVC_SUMMARY_MAX_IMM + imm]
+                .load(Ordering::Relaxed);
+            if n != 0 {
+                top.push((imm as u32, n));
+            }
+        }
+        top.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
+        let top_desc = top
+            .iter()
+            .take(8)
+            .map(|(imm, n)| {
+                let name = SvcId::from_u32(*imm)
+                    .map(|id| format!("{:?}", id))
+                    .unwrap_or_else(|| format!("svc#0x{:02X}", imm));
+                format!("0x{:02X}:{}={}", imm, name, n)
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        eprintln!(
+            "[SVC_SUMMARY] tid={:<4} count={:<8} first_ms={:>9.3} last_ms={:>9.3} last_core={:<2} last_imm=0x{:02X} top=[{}]",
+            tid,
+            count,
+            first_ns as f64 / 1e6,
+            last_ns as f64 / 1e6,
+            last_core,
+            last_imm,
+            top_desc
+        );
+    }
+}
+
+const SVC_RING_DEFAULT_CAPACITY: usize = 131_072;
+
+struct SvcRingSlot {
+    seq: std::sync::atomic::AtomicU64,
+    time_us: std::sync::atomic::AtomicU64,
+    tid: std::sync::atomic::AtomicU64,
+    priority: std::sync::atomic::AtomicI32,
+    core_imm: std::sync::atomic::AtomicU64,
+    pc: std::sync::atomic::AtomicU64,
+    lr: std::sync::atomic::AtomicU64,
+    sp: std::sync::atomic::AtomicU64,
+    args: [std::sync::atomic::AtomicU64; 8],
+}
+
+struct SvcRingProfile {
+    start: std::time::Instant,
+    next: std::sync::atomic::AtomicU64,
+    slots: Vec<SvcRingSlot>,
+}
+
+static SVC_RING_PROFILE: std::sync::OnceLock<SvcRingProfile> = std::sync::OnceLock::new();
+
+fn svc_ring_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("RUZU_PROFILE_SVC_RING").is_some())
+}
+
+fn svc_ring_capacity() -> usize {
+    static CAPACITY: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *CAPACITY.get_or_init(|| {
+        std::env::var("RUZU_PROFILE_SVC_RING_CAP")
+            .ok()
+            .and_then(|raw| raw.parse::<usize>().ok())
+            .filter(|cap| *cap > 0)
+            .unwrap_or(SVC_RING_DEFAULT_CAPACITY)
+    })
+}
+
+fn svc_ring_profile() -> &'static SvcRingProfile {
+    SVC_RING_PROFILE.get_or_init(|| {
+        let slots = (0..svc_ring_capacity())
+            .map(|_| SvcRingSlot {
+                seq: std::sync::atomic::AtomicU64::new(0),
+                time_us: std::sync::atomic::AtomicU64::new(0),
+                tid: std::sync::atomic::AtomicU64::new(0),
+                priority: std::sync::atomic::AtomicI32::new(0),
+                core_imm: std::sync::atomic::AtomicU64::new(0),
+                pc: std::sync::atomic::AtomicU64::new(0),
+                lr: std::sync::atomic::AtomicU64::new(0),
+                sp: std::sync::atomic::AtomicU64::new(0),
+                args: std::array::from_fn(|_| std::sync::atomic::AtomicU64::new(0)),
+            })
+            .collect();
+        SvcRingProfile {
+            start: std::time::Instant::now(),
+            next: std::sync::atomic::AtomicU64::new(0),
+            slots,
+        }
+    })
+}
+
+pub fn record_svc_ring(
+    tid: u64,
+    priority: i32,
+    core_id: i32,
+    imm: u32,
+    pc: u64,
+    lr: u64,
+    sp: u64,
+    args: &[u64; 8],
+) {
+    if !svc_ring_enabled() {
+        return;
+    }
+
+    use std::sync::atomic::Ordering;
+
+    let profile = svc_ring_profile();
+    let seq = profile.next.fetch_add(1, Ordering::Relaxed) + 1;
+    let slot = &profile.slots[(seq as usize - 1) % profile.slots.len()];
+    slot.time_us
+        .store(profile.start.elapsed().as_micros() as u64, Ordering::Relaxed);
+    slot.tid.store(tid, Ordering::Relaxed);
+    slot.priority.store(priority, Ordering::Relaxed);
+    slot.core_imm.store(
+        ((core_id as u32 as u64) << 32) | imm as u64,
+        Ordering::Relaxed,
+    );
+    slot.pc.store(pc, Ordering::Relaxed);
+    slot.lr.store(lr, Ordering::Relaxed);
+    slot.sp.store(sp, Ordering::Relaxed);
+    for (dst, src) in slot.args.iter().zip(args.iter()) {
+        dst.store(*src, Ordering::Relaxed);
+    }
+    slot.seq.store(seq, Ordering::Release);
+}
+
+pub fn dump_svc_ring_profile() {
+    let Some(profile) = SVC_RING_PROFILE.get() else {
+        return;
+    };
+
+    use std::sync::atomic::Ordering;
+
+    let next = profile.next.load(Ordering::Acquire);
+    if next == 0 {
+        return;
+    }
+
+    let cap = profile.slots.len() as u64;
+    let first = next.saturating_sub(cap).saturating_add(1);
+    eprintln!(
+        "[SVC_RING] total={} dumping_seq={}..{} cap={}",
+        next,
+        first,
+        next,
+        cap
+    );
+    for seq in first..=next {
+        let slot = &profile.slots[(seq as usize - 1) % profile.slots.len()];
+        if slot.seq.load(Ordering::Acquire) != seq {
+            continue;
+        }
+        let core_imm = slot.core_imm.load(Ordering::Relaxed);
+        let core_id = (core_imm >> 32) as u32;
+        let imm = core_imm as u32;
+        let args = slot
+            .args
+            .iter()
+            .map(|arg| arg.load(Ordering::Relaxed))
+            .collect::<Vec<_>>();
+        eprintln!(
+            "[SVC_RING] seq={} t_us={} tid={} prio={} core={} imm=0x{:02X} pc=0x{:08X} lr=0x{:08X} sp=0x{:08X} args=[0x{:X},0x{:X},0x{:X},0x{:X},0x{:X},0x{:X},0x{:X},0x{:X}]",
+            seq,
+            slot.time_us.load(Ordering::Relaxed),
+            slot.tid.load(Ordering::Relaxed),
+            slot.priority.load(Ordering::Relaxed),
+            core_id,
+            imm,
+            slot.pc.load(Ordering::Relaxed),
+            slot.lr.load(Ordering::Relaxed),
+            slot.sp.load(Ordering::Relaxed),
+            args[0],
+            args[1],
+            args[2],
+            args[3],
+            args[4],
+            args[5],
+            args[6],
+            args[7],
+        );
+    }
+}
+
 /// Per-tid SVC counter for the memory snapshot hook (RUZU_DUMP_AT_SVC=N).
 static SVC_COUNTER_TID73: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
@@ -2827,6 +3210,209 @@ fn dump_svc_full_regs(system: &System, imm: u32, tid: i64, label: &str) {
             label,
             sp as u32,
             hex.trim()
+        );
+    }
+}
+
+fn svc_context_lr_filter() -> &'static [u32] {
+    static FILTER: std::sync::OnceLock<Vec<u32>> = std::sync::OnceLock::new();
+    FILTER.get_or_init(|| {
+        std::env::var("RUZU_DUMP_SVC_CONTEXT_LR")
+            .ok()
+            .map(|raw| {
+                raw.split(',')
+                    .filter_map(|part| {
+                        let part = part.trim();
+                        if part.is_empty() {
+                            return None;
+                        }
+                        u32::from_str_radix(part.trim_start_matches("0x").trim_start_matches("0X"), 16)
+                            .ok()
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    })
+}
+
+fn svc_context_tid_filter() -> &'static [u64] {
+    static FILTER: std::sync::OnceLock<Vec<u64>> = std::sync::OnceLock::new();
+    FILTER.get_or_init(|| {
+        std::env::var("RUZU_DUMP_SVC_CONTEXT_TID")
+            .ok()
+            .map(|raw| {
+                raw.split(',')
+                    .filter_map(|part| {
+                        let part = part.trim();
+                        if part.is_empty() {
+                            return None;
+                        }
+                        part.parse::<u64>().ok()
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    })
+}
+
+fn svc_context_dump_limit() -> u64 {
+    static LIMIT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        std::env::var("RUZU_DUMP_SVC_CONTEXT_LIMIT")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(64)
+    })
+}
+
+fn svc_context_explicit_regions() -> &'static [(u64, u64)] {
+    static REGIONS: std::sync::OnceLock<Vec<(u64, u64)>> = std::sync::OnceLock::new();
+    REGIONS.get_or_init(|| {
+        std::env::var("RUZU_DUMP_SVC_CONTEXT_ADDRS")
+            .ok()
+            .map(|raw| {
+                raw.split(',')
+                    .filter_map(|part| {
+                        let (addr, len) = part.split_once(':')?;
+                        let addr = u64::from_str_radix(
+                            addr.trim().trim_start_matches("0x").trim_start_matches("0X"),
+                            16,
+                        )
+                        .ok()?;
+                        let len = u64::from_str_radix(
+                            len.trim().trim_start_matches("0x").trim_start_matches("0X"),
+                            16,
+                        )
+                        .or_else(|_| len.trim().parse::<u64>())
+                        .ok()?;
+                        Some((addr, len))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    })
+}
+
+static SVC_CONTEXT_DUMP_COUNT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+fn maybe_dump_svc_context_by_lr(system: &System, imm: u32, tid: i64, core_id: i32, args: &SvcArgs) {
+    let lr_filter = svc_context_lr_filter();
+    if lr_filter.is_empty() {
+        return;
+    }
+    let tid_filter = svc_context_tid_filter();
+    if !tid_filter.is_empty() && (tid < 0 || !tid_filter.contains(&(tid as u64))) {
+        return;
+    }
+
+    use crate::arm::arm_interface::ThreadContext;
+    use std::sync::atomic::Ordering;
+
+    let kernel = match system.kernel() {
+        Some(kernel) => kernel,
+        None => return,
+    };
+    let core_index = kernel.current_physical_core_index() as usize;
+    let process_arc = match system.current_process_arc.as_ref().cloned() {
+        Some(process_arc) => process_arc,
+        None => return,
+    };
+    let process = process_arc.lock().unwrap();
+    let jit = match process.get_arm_interface(core_index) {
+        Some(jit) => jit,
+        None => return,
+    };
+    let mut ctx = ThreadContext::default();
+    jit.get_context(&mut ctx);
+    let lr = ctx.r[14] as u32;
+    if !lr_filter.contains(&lr) {
+        return;
+    }
+
+    let n = SVC_CONTEXT_DUMP_COUNT.fetch_add(1, Ordering::Relaxed);
+    if n >= svc_context_dump_limit() {
+        return;
+    }
+
+    eprintln!(
+        "[SVC_CONTEXT_LR] hit={} tid={} core={} imm=0x{:02X} pc=0x{:08X} lr=0x{:08X} sp=0x{:08X} cpsr=0x{:08X} args=[0x{:X},0x{:X},0x{:X},0x{:X},0x{:X},0x{:X},0x{:X},0x{:X}] r=[0x{:08X},0x{:08X},0x{:08X},0x{:08X},0x{:08X},0x{:08X},0x{:08X},0x{:08X},0x{:08X},0x{:08X},0x{:08X},0x{:08X},0x{:08X}]",
+        n + 1,
+        tid,
+        core_id,
+        imm,
+        ctx.r[15] as u32,
+        lr,
+        ctx.r[13] as u32,
+        ctx.pstate,
+        args[0],
+        args[1],
+        args[2],
+        args[3],
+        args[4],
+        args[5],
+        args[6],
+        args[7],
+        ctx.r[0] as u32,
+        ctx.r[1] as u32,
+        ctx.r[2] as u32,
+        ctx.r[3] as u32,
+        ctx.r[4] as u32,
+        ctx.r[5] as u32,
+        ctx.r[6] as u32,
+        ctx.r[7] as u32,
+        ctx.r[8] as u32,
+        ctx.r[9] as u32,
+        ctx.r[10] as u32,
+        ctx.r[11] as u32,
+        ctx.r[12] as u32,
+    );
+
+    let mem = process.process_memory.read().unwrap();
+    let explicit_regions = svc_context_explicit_regions();
+    if !explicit_regions.is_empty() {
+        for &(addr, len) in explicit_regions {
+            dump_svc_context_region(&mem, addr, len);
+        }
+        return;
+    }
+
+    let mut addrs = Vec::new();
+    for &addr in args.iter().take(4).chain(ctx.r.iter().take(13)) {
+        if addr >= 0x1000 && !addrs.contains(&addr) {
+            addrs.push(addr);
+        }
+        if addrs.len() >= 12 {
+            break;
+        }
+    }
+    for addr in addrs {
+        dump_svc_context_region(&mem, addr.saturating_sub(8), 0x20);
+    }
+
+    fn dump_svc_context_region(
+        mem: &crate::hle::kernel::k_process::ProcessMemoryData,
+        addr: u64,
+        len: u64,
+    ) {
+        use std::fmt::Write;
+
+        let mut words = String::new();
+        let word_count = ((len + 3) / 4).min(32);
+        for i in 0..word_count {
+            let cur = addr + i * 4;
+            let word = if mem.is_valid_range(cur, 4) {
+                mem.read_32(cur)
+            } else {
+                0xDEADBEEF
+            };
+            let _ = write!(words, " 0x{:08X}", word);
+        }
+        eprintln!(
+            "[SVC_CONTEXT_MEM] addr=0x{:08X} len=0x{:X} words={}",
+            addr,
+            len,
+            words.trim()
         );
     }
 }

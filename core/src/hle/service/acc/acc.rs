@@ -6,7 +6,8 @@
 //!
 //! Account module and Interface base class.
 
-use super::profile_manager::{ProfileBase, ProfileManager, UserData, UserIdArray, MAX_USERS};
+use super::profile_manager::{ProfileBase, ProfileManager, UserData, UserIdArray};
+use crate::constants::ACCOUNT_BACKUP_JPEG;
 use crate::file_sys::romfs_factory::StorageId;
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 use crate::hle::service::acc::errors::{
@@ -22,6 +23,33 @@ use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFrame
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+
+const MAX_JPEG_IMAGE_SIZE: usize = 0x20000;
+
+fn get_profile_image_path(user_id: u128) -> std::path::PathBuf {
+    let uuid = common::uuid::UUID::from_bytes(user_id.to_le_bytes());
+    common::fs::path_util::get_ruzu_path(common::fs::path_util::RuzuPath::NANDDir).join(format!(
+        "system/save/8000000000000010/su/avators/{}.jpg",
+        uuid.formatted_string()
+    ))
+}
+
+fn load_profile_image_or_backup(user_id: u128) -> Vec<u8> {
+    let path = get_profile_image_path(user_id);
+    match std::fs::read(&path) {
+        Ok(mut image) => {
+            image.truncate(MAX_JPEG_IMAGE_SIZE);
+            image
+        }
+        Err(_) => {
+            log::warn!(
+                "IProfileCommon: failed to load profile image at {}; falling back to backup JPEG",
+                path.display()
+            );
+            ACCOUNT_BACKUP_JPEG.to_vec()
+        }
+    }
+}
 
 /// Generate a random UUID. Upstream uses `Common::UUID::MakeRandom()`.
 fn generate_random_uuid() -> u128 {
@@ -259,7 +287,6 @@ impl Interface {
             }
         };
 
-        self.application_info.launch_property = launch_property;
         self.application_info.application_type = application_type;
 
         log::warn!("Account::InitializeApplicationInfoBase: ApplicationInfo init required");
@@ -652,20 +679,24 @@ impl IProfileCommon {
     }
 
     /// Upstream: IProfileCommon::GetImageSize (cmd 10)
-    fn get_image_size_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
-        log::debug!("(STUBBED) IProfileCommon::GetImageSize called");
-        // Return backup JPEG size. Upstream loads from file or falls back to backup.
+    fn get_image_size_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let svc = Self::as_self(this);
+        log::debug!("IProfileCommon::GetImageSize called");
+        let image = load_profile_image_or_backup(svc.user_id);
         let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
         rb.push_result(RESULT_SUCCESS);
-        rb.push_u32(0); // image size = 0 (no image available)
+        rb.push_u32(image.len() as u32);
     }
 
     /// Upstream: IProfileCommon::LoadImage (cmd 11)
-    fn load_image_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
-        log::debug!("(STUBBED) IProfileCommon::LoadImage called");
+    fn load_image_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let svc = Self::as_self(this);
+        log::debug!("IProfileCommon::LoadImage called");
+        let image = load_profile_image_or_backup(svc.user_id);
+        let written = ctx.write_buffer(&image, 0);
         let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
         rb.push_result(RESULT_SUCCESS);
-        rb.push_u32(0); // bytes written = 0
+        rb.push_u32(written as u32);
     }
 
     /// Upstream: IProfileCommon::Store (cmd 100, editor only)

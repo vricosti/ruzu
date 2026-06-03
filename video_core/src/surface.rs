@@ -143,6 +143,26 @@ pub fn pixel_format_from_render_target_format(format: u32) -> PixelFormat {
     }
 }
 
+/// Port of `PixelFormatFromDepthFormat` from `surface.cpp`.
+pub fn pixel_format_from_depth_format(format: u32) -> PixelFormat {
+    match format {
+        0x14 => PixelFormat::S8UintD24Unorm,
+        0x16 => PixelFormat::D24UnormS8Uint,
+        0x0A => PixelFormat::D32Float,
+        0x13 => PixelFormat::D16Unorm,
+        0x17 => PixelFormat::S8Uint,
+        0x19 => PixelFormat::D32FloatS8Uint,
+        0x15 => PixelFormat::X8D24Unorm,
+        _ => {
+            log::warn!(
+                "PixelFormatFromDepthFormat: unimplemented format=0x{:X}",
+                format
+            );
+            PixelFormat::S8UintD24Unorm
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Block width table
 // ---------------------------------------------------------------------------
@@ -764,25 +784,18 @@ pub fn transcoded_astc_size(base_size: u64, format: PixelFormat) -> u64 {
 /// Check if a view format is compatible with an image format.
 ///
 /// Port of `VideoCore::Surface::IsViewCompatible`.
-/// Simplified: checks if the two formats have the same bits-per-block
-/// and belong to the same format class. A full implementation would check
-/// the compatibility table from `compatible_formats.rs`.
 pub fn is_view_compatible(
     image_format: PixelFormat,
     view_format: PixelFormat,
-    _broken_views: bool,
-    _native_bgr: bool,
+    broken_views: bool,
+    native_bgr: bool,
 ) -> bool {
-    if image_format == view_format {
-        return true;
-    }
-    // Same bits per block is a necessary (but not sufficient) condition
-    let image_idx = image_format as usize;
-    let view_idx = view_format as usize;
-    if image_idx >= BITS_PER_BLOCK_TABLE.len() || view_idx >= BITS_PER_BLOCK_TABLE.len() {
-        return false;
-    }
-    BITS_PER_BLOCK_TABLE[image_idx] == BITS_PER_BLOCK_TABLE[view_idx]
+    crate::compatible_formats::is_view_compatible(
+        image_format,
+        view_format,
+        broken_views,
+        native_bgr,
+    )
 }
 
 #[cfg(test)]
@@ -903,6 +916,22 @@ mod tests {
     fn view_compatible_same_format() {
         assert!(is_view_compatible(
             PixelFormat::A8B8G8R8Unorm,
+            PixelFormat::A8B8G8R8Unorm,
+            false,
+            true,
+        ));
+    }
+
+    #[test]
+    fn view_compatible_respects_native_bgr_table() {
+        assert!(!is_view_compatible(
+            PixelFormat::B8G8R8A8Unorm,
+            PixelFormat::A8B8G8R8Unorm,
+            false,
+            false,
+        ));
+        assert!(is_view_compatible(
+            PixelFormat::B8G8R8A8Unorm,
             PixelFormat::A8B8G8R8Unorm,
             false,
             true,

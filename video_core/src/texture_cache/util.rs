@@ -766,20 +766,56 @@ pub fn unswizzle_image(
     input: &[u8],
     output: &mut [u8],
 ) -> Vec<BufferImageCopy> {
-    let copies = full_download_copies(info);
     let bytes_per_block = surface::bytes_per_block(info.format);
     if bytes_per_block == 0 {
         return Vec::new();
     }
+    let tile_size = default_block_size(info.format);
 
     if info.image_type == ImageType::Linear {
         let copy_size = input.len().min(output.len());
         output[..copy_size].copy_from_slice(&input[..copy_size]);
-        return copies;
+        return vec![BufferImageCopy {
+            buffer_offset: 0,
+            buffer_size: input.len(),
+            buffer_row_length: info.pitch() * tile_size.width / bytes_per_block,
+            buffer_image_height: info.size.height,
+            image_subresource: SubresourceLayers {
+                base_level: 0,
+                base_layer: 0,
+                num_layers: 1,
+            },
+            image_offset: Offset3D { x: 0, y: 0, z: 0 },
+            image_extent: info.size,
+        }];
+    }
+
+    let num_layers = info.resources.layers;
+    let num_levels = info.resources.levels;
+    let mut host_offset = 0u32;
+    let mut copies = Vec::with_capacity(num_levels as usize);
+    for level in 0..num_levels {
+        let level_size = adjust_mip_size_3d(info.size, level as u32);
+        let adj = adjust_tile_size_3d(level_size, tile_size);
+        let num_blocks_per_layer = adj.width * adj.height * adj.depth;
+        let host_bytes_per_layer = num_blocks_per_layer * bytes_per_block;
+        copies.push(BufferImageCopy {
+            buffer_offset: host_offset as usize,
+            buffer_size: (host_bytes_per_layer * num_layers as u32) as usize,
+            buffer_row_length: align_up(level_size.width, tile_size.width),
+            buffer_image_height: align_up(level_size.height, tile_size.height),
+            image_subresource: SubresourceLayers {
+                base_level: level,
+                base_layer: 0,
+                num_layers,
+            },
+            image_offset: Offset3D { x: 0, y: 0, z: 0 },
+            image_extent: level_size,
+        });
+        host_offset += host_bytes_per_layer * num_layers as u32;
     }
 
     let params = full_upload_swizzles(info);
-    let block = info.block();
     for (copy, param) in copies.iter().zip(params.iter()) {
         let dst_offset = copy.buffer_offset;
         if dst_offset >= output.len() || param.buffer_offset >= input.len() {
@@ -792,11 +828,11 @@ pub fn unswizzle_image(
             dst,
             src,
             bytes_per_block,
-            copy.image_extent.width,
-            copy.image_extent.height,
-            copy.image_extent.depth.max(1),
-            block.height,
-            block.depth,
+            param.num_tiles.width,
+            param.num_tiles.height,
+            param.num_tiles.depth.max(1),
+            param.block.height,
+            param.block.depth,
             calculate_level_stride_alignment(info, copy.image_subresource.base_level as u32),
         );
     }
@@ -853,21 +889,16 @@ pub fn convert_image(
                 * copy.image_subresource.num_layers as u32
                 * surface::bytes_per_block(surface::PixelFormat::A8B8G8R8Unorm);
         } else {
-            // BCn decompression path
-            // Stubbed: requires BCn decoder crate (equivalent of bc_decoder.h)
-            log::warn!(
-                "ConvertImage: BCn decompression not yet implemented for format {:?}",
-                info.format
+            crate::texture_cache::decode_bc::decompress_bcn(
+                &input[input_offset..],
+                &mut output[output_offset as usize..],
+                copy,
+                info.format,
             );
             let bytes = copy.image_extent.width
                 * copy.image_extent.height
                 * copy.image_subresource.num_layers as u32
                 * crate::texture_cache::decode_bc::converted_bytes_per_block(info.format);
-            // Zero-fill the output for unsupported formats
-            let end = (output_offset + bytes) as usize;
-            if end <= output.len() {
-                output[output_offset as usize..end].fill(0);
-            }
             output_offset += bytes;
         }
 
@@ -1556,5 +1587,108 @@ mod tests {
         assert_eq!(writes.len(), 2);
         assert_eq!(writes[0], (0x1000, vec![0, 1, 2, 3, 4, 5, 6, 7]));
         assert_eq!(writes[1], (0x1010, vec![8, 9, 10, 11, 12, 13, 14, 15]));
+    }
+
+    #[test]
+    fn unswizzle_image_uses_tile_counts_for_compressed_blocks() {
+        let info = ImageInfo {
+            format: PixelFormat::Bc5Unorm,
+            image_type: ImageType::E2D,
+            resources: SubresourceExtent {
+                levels: 1,
+                layers: 1,
+            },
+            size: Extent3D {
+                width: 8,
+                height: 8,
+                depth: 1,
+            },
+            tiling: TilingMode::BlockLinear(Extent3D {
+                width: 0,
+                height: 0,
+                depth: 0,
+            }),
+            layer_stride: 0,
+            maybe_unaligned_layer_stride: 0,
+            num_samples: 1,
+            tile_width_spacing: 0,
+            rescaleable: false,
+            downscaleable: false,
+            forced_flushed: false,
+            dma_downloaded: false,
+            is_sparse: false,
+        };
+        let input: Vec<u8> = (0..64).map(|x| (x ^ 0x5a) as u8).collect();
+        let mut expected = vec![0; 64];
+        let params = full_upload_swizzles(&info);
+        let alignment = calculate_level_stride_alignment(&info, 0);
+        crate::textures::decoders::unswizzle_texture(
+            &mut expected,
+            &input,
+            surface::bytes_per_block(info.format),
+            params[0].num_tiles.width,
+            params[0].num_tiles.height,
+            params[0].num_tiles.depth,
+            params[0].block.height,
+            params[0].block.depth,
+            alignment,
+        );
+
+        let mut output = vec![0; 64];
+        let copies = unswizzle_image(&(), 0, &info, &input, &mut output);
+
+        assert_eq!(copies.len(), 1);
+        assert_eq!(copies[0].buffer_size, 64);
+        assert_eq!(params[0].num_tiles, Extent3D { width: 2, height: 2, depth: 1 });
+        assert_eq!(output, expected);
+        assert!(output[32..].iter().any(|&byte| byte != 0));
+    }
+
+    #[test]
+    fn unswizzle_image_aligns_compressed_upload_rows_per_mip() {
+        let info = ImageInfo {
+            format: PixelFormat::Bc1RgbaSrgb,
+            image_type: ImageType::E2D,
+            resources: SubresourceExtent {
+                levels: 4,
+                layers: 1,
+            },
+            size: Extent3D {
+                width: 8,
+                height: 8,
+                depth: 1,
+            },
+            tiling: TilingMode::BlockLinear(Extent3D {
+                width: 0,
+                height: 0,
+                depth: 0,
+            }),
+            layer_stride: 0,
+            maybe_unaligned_layer_stride: 0,
+            num_samples: 1,
+            tile_width_spacing: 0,
+            rescaleable: false,
+            downscaleable: false,
+            forced_flushed: false,
+            dma_downloaded: false,
+            is_sparse: false,
+        };
+        let input = vec![0x5a; calculate_guest_size_in_bytes(&info) as usize];
+        let mut output = vec![0; calculate_unswizzled_size_bytes(&info) as usize];
+        let copies = unswizzle_image(&(), 0, &info, &input, &mut output);
+
+        assert_eq!(copies.len(), 4);
+        assert_eq!(copies[0].image_extent.width, 8);
+        assert_eq!(copies[1].image_extent.width, 4);
+        assert_eq!(copies[2].image_extent.width, 2);
+        assert_eq!(copies[3].image_extent.width, 1);
+        for copy in &copies {
+            assert_eq!(copy.buffer_row_length % 4, 0);
+            assert_eq!(copy.buffer_image_height % 4, 0);
+        }
+        assert_eq!(copies[2].buffer_row_length, 4);
+        assert_eq!(copies[2].buffer_image_height, 4);
+        assert_eq!(copies[3].buffer_row_length, 4);
+        assert_eq!(copies[3].buffer_image_height, 4);
     }
 }

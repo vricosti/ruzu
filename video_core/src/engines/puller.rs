@@ -11,6 +11,7 @@ use crate::control::channel_state::ChannelState;
 use crate::engines::engine_interface::EngineInterface;
 use crate::engines::engine_interface::EngineTypes;
 use crate::query_cache::types::{QueryPropertiesFlags, QueryType};
+use crate::rasterizer_interface::{RasterizerHandle, RasterizerInterface};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
@@ -330,7 +331,7 @@ pub struct Puller {
     gpu: *const crate::gpu::Gpu,
     memory_manager: Arc<parking_lot::Mutex<crate::memory_manager::MemoryManager>>,
     dma_pusher: *mut crate::dma_pusher::DmaPusher,
-    rasterizer: Option<[usize; 2]>,
+    rasterizer: Option<RasterizerHandle>,
     channel_state: *mut ChannelState,
 }
 
@@ -355,12 +356,8 @@ impl Puller {
     /// Bind a rasterizer interface to this puller.
     ///
     /// Corresponds to `Puller::BindRasterizer`.
-    pub fn bind_rasterizer(
-        &mut self,
-        rasterizer: &dyn crate::rasterizer_interface::RasterizerInterface,
-    ) {
-        let raw: *const dyn crate::rasterizer_interface::RasterizerInterface = rasterizer;
-        self.rasterizer = Some(unsafe { std::mem::transmute(raw) });
+    pub fn bind_rasterizer(&mut self, rasterizer: &dyn RasterizerInterface) {
+        self.rasterizer = Some(RasterizerHandle::from_ref(rasterizer));
     }
 
     pub fn channel_state_ptr(&self) -> *mut ChannelState {
@@ -378,14 +375,12 @@ impl Puller {
 
     fn with_rasterizer_mut(
         &mut self,
-        func: impl FnOnce(&mut dyn crate::rasterizer_interface::RasterizerInterface),
+        func: impl FnOnce(&mut dyn RasterizerInterface),
     ) {
-        let Some(raw) = self.rasterizer else {
+        let Some(handle) = self.rasterizer else {
             return;
         };
-        let rasterizer: *mut dyn crate::rasterizer_interface::RasterizerInterface =
-            unsafe { std::mem::transmute(raw) };
-        func(unsafe { &mut *rasterizer });
+        unsafe { handle.with_mut(func) };
     }
 
     fn read_gpu_u32(&self, gpu_va: u64) -> u32 {
@@ -969,14 +964,14 @@ mod tests {
     impl RasterizerInterface for FakeRasterizer {
         fn draw(
             &mut self,
-            _draw_state: &crate::engines::draw_manager::DrawState,
+            _draw_view: crate::engines::draw_manager::Maxwell3DDrawView<'_>,
             _instance_count: u32,
         ) {
         }
         fn draw_texture(&mut self) {}
         fn clear(
             &mut self,
-            _draw_state: &crate::engines::draw_manager::DrawState,
+            _clear_view: crate::engines::draw_manager::Maxwell3DClearView<'_>,
             _layer_count: u32,
         ) {
         }

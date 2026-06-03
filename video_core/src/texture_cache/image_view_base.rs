@@ -8,7 +8,7 @@
 use super::format_lookup_table::PixelFormat;
 use super::image_base::GPUVAddr;
 use super::image_info::ImageInfo;
-use super::image_view_info::ImageViewInfo;
+use super::image_view_info::{ImageViewInfo, SwizzleSource};
 use super::types::*;
 
 // ── ImageViewFlagBits ──────────────────────────────────────────────────
@@ -42,6 +42,7 @@ pub struct ImageViewBase {
     pub format: PixelFormat,
     pub view_type: ImageViewType,
     pub range: SubresourceRange,
+    pub swizzle: [u8; 4],
     pub size: Extent3D,
     pub flags: ImageViewFlagBits,
 
@@ -74,6 +75,7 @@ impl ImageViewBase {
             format: info.format,
             view_type: info.view_type,
             range: info.range,
+            swizzle: [info.x_source, info.y_source, info.z_source, info.w_source],
             size: Extent3D {
                 width: (image_info.size.width >> level).max(1),
                 height: (image_info.size.height >> level).max(1),
@@ -88,13 +90,19 @@ impl ImageViewBase {
     /// Construct a buffer-type view.
     ///
     /// Port of `ImageViewBase::ImageViewBase(const ImageInfo&, const ImageViewInfo&, GPUVAddr)`.
-    pub fn new_buffer(info: &ImageInfo, _view_info: &ImageViewInfo, addr: GPUVAddr) -> Self {
+    pub fn new_buffer(info: &ImageInfo, view_info: &ImageViewInfo, addr: GPUVAddr) -> Self {
         Self {
             image_id: NULL_IMAGE_ID,
             gpu_addr: addr,
             format: info.format,
             view_type: ImageViewType::Buffer,
             range: SubresourceRange::default(),
+            swizzle: [
+                view_info.x_source,
+                view_info.y_source,
+                view_info.z_source,
+                view_info.w_source,
+            ],
             size: Extent3D {
                 width: info.size.width,
                 height: 1,
@@ -116,6 +124,12 @@ impl ImageViewBase {
             format: PixelFormat::Invalid,
             view_type: ImageViewType::E1D,
             range: SubresourceRange::default(),
+            swizzle: [
+                SwizzleSource::R as u8,
+                SwizzleSource::G as u8,
+                SwizzleSource::B as u8,
+                SwizzleSource::A as u8,
+            ],
             size: Extent3D {
                 width: 0,
                 height: 0,

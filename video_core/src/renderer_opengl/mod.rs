@@ -41,8 +41,8 @@ pub mod present;
 pub mod renderer_opengl;
 pub mod util_shaders;
 
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use log::{debug, info};
@@ -50,7 +50,8 @@ use thiserror::Error;
 
 pub use gl_blit_screen::BlitScreen;
 pub use gl_device::Device;
-pub use gl_rasterizer::RasterizerOpenGL;
+pub use gl_rasterizer::{dump_gl_draw_stall_profile, RasterizerOpenGL};
+pub use gl_shader_cache::dump_shader_pipeline_stall_profile;
 #[allow(unused_imports)]
 pub use gl_state_tracker::StateTracker;
 
@@ -76,6 +77,8 @@ static PRESENT_SCREENSHOT_US: AtomicU64 = AtomicU64::new(0);
 static PRESENT_DRAW_SCREEN_US: AtomicU64 = AtomicU64::new(0);
 static PRESENT_TICK_FRAME_US: AtomicU64 = AtomicU64::new(0);
 static PRESENT_SWAP_BUFFERS_US: AtomicU64 = AtomicU64::new(0);
+static PRESENT_PPM_DUMPED: AtomicBool = AtomicBool::new(false);
+static PRESENT_PPM_CALL_COUNT: AtomicU64 = AtomicU64::new(0);
 
 fn present_profile_enabled() -> bool {
     std::env::var_os("RUZU_PROFILE_PRESENT").is_some()
@@ -93,6 +96,182 @@ fn update_max(target: &AtomicU64, value: u64) {
 
 fn elapsed_us(start: Instant) -> u64 {
     start.elapsed().as_micros().min(u128::from(u64::MAX)) as u64
+}
+
+fn dump_present_ppm_once(
+    current_frame: u64,
+    draw_count: u64,
+    layout: &FramebufferLayout,
+) -> Option<u64> {
+    let Some(path) = std::env::var_os("RUZU_DUMP_PRESENT_PPM") else {
+        return None;
+    };
+    let present_index = PRESENT_PPM_CALL_COUNT.fetch_add(1, Ordering::Relaxed);
+    let target_present_indices = std::env::var("RUZU_DUMP_PRESENT_PPM_INDICES")
+        .ok()
+        .map(|spec| {
+            spec.split(',')
+                .filter_map(|value| value.trim().parse::<u64>().ok())
+                .collect::<Vec<_>>()
+        });
+    let target_present_index = std::env::var("RUZU_DUMP_PRESENT_PPM_INDEX")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok());
+    let target_present_start = std::env::var("RUZU_DUMP_PRESENT_PPM_START")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok());
+    let target_present_end = std::env::var("RUZU_DUMP_PRESENT_PPM_END")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok());
+    let target_present_every = std::env::var("RUZU_DUMP_PRESENT_PPM_EVERY")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok());
+    let target_frame = std::env::var("RUZU_DUMP_PRESENT_PPM_FRAME")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(0);
+    let target_draw_indices = std::env::var("RUZU_DUMP_PRESENT_PPM_DRAW_INDICES")
+        .ok()
+        .map(|spec| {
+            spec.split(',')
+                .filter_map(|value| value.trim().parse::<u64>().ok())
+                .collect::<Vec<_>>()
+        });
+    let target_draw_min = std::env::var("RUZU_DUMP_PRESENT_PPM_DRAW_MIN")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok());
+    let target_draw_max = std::env::var("RUZU_DUMP_PRESENT_PPM_DRAW_MAX")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok());
+    let multi_index_match = target_present_indices
+        .as_ref()
+        .is_some_and(|indices| indices.contains(&present_index));
+    let range_index_match = target_present_start.is_some_and(|start| {
+        present_index >= start
+            && target_present_end.is_none_or(|end| present_index <= end)
+            && target_present_every.is_none_or(|every| every != 0 && (present_index - start) % every == 0)
+    });
+    let draw_index_match = target_draw_indices
+        .as_ref()
+        .is_some_and(|indices| indices.contains(&draw_count));
+    let draw_range_match = target_draw_min.is_some_and(|min| draw_count >= min)
+        && target_draw_max.is_none_or(|max| draw_count <= max);
+    let draw_selector_active = target_draw_indices.is_some() || target_draw_min.is_some();
+    let draw_match = draw_index_match || draw_range_match;
+    if target_present_indices.is_some() && !multi_index_match {
+        return None;
+    }
+    if target_present_start.is_some() && !range_index_match {
+        return None;
+    }
+    if draw_selector_active && !draw_match {
+        return None;
+    }
+    if target_present_indices.is_none()
+        && target_present_start.is_none()
+        && !draw_selector_active
+        && (target_present_index.is_some_and(|target| present_index < target)
+            || (target_present_index.is_none() && current_frame < target_frame)
+            || PRESENT_PPM_DUMPED.swap(true, Ordering::Relaxed))
+    {
+        return None;
+    }
+    if layout.width == 0 || layout.height == 0 {
+        return None;
+    }
+    if std::env::var_os("RUZU_DUMP_PRESENT_PPM_LOG").is_some() {
+        eprintln!(
+            "[PRESENT_PPM_DUMP] present_index={} frame={} draw_count={} path={}",
+            present_index,
+            current_frame,
+            draw_count,
+            std::path::Path::new(&path).display()
+        );
+    }
+    let path = if draw_selector_active {
+        let mut output = std::path::PathBuf::from(&path);
+        let stem = output
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .unwrap_or("present")
+            .to_string();
+        let ext = output
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .unwrap_or("ppm")
+            .to_string();
+        output.set_file_name(format!("{stem}_{present_index}_draw_{draw_count}.{ext}"));
+        output.into_os_string()
+    } else if multi_index_match || range_index_match {
+        let mut output = std::path::PathBuf::from(&path);
+        let stem = output
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .unwrap_or("present")
+            .to_string();
+        let ext = output
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .unwrap_or("ppm")
+            .to_string();
+        output.set_file_name(format!("{stem}_{present_index}.{ext}"));
+        output.into_os_string()
+    } else {
+        path
+    };
+
+    unsafe {
+        let width = layout.width as usize;
+        let height = layout.height as usize;
+        let mut old_pack_buffer = 0;
+        let mut old_pack_alignment = 0;
+        let mut old_pack_row_length = 0;
+        gl::GetIntegerv(gl::PIXEL_PACK_BUFFER_BINDING, &mut old_pack_buffer);
+        gl::GetIntegerv(gl::PACK_ALIGNMENT, &mut old_pack_alignment);
+        gl::GetIntegerv(gl::PACK_ROW_LENGTH, &mut old_pack_row_length);
+        gl::BindBuffer(gl::PIXEL_PACK_BUFFER, 0);
+        gl::PixelStorei(gl::PACK_ALIGNMENT, 1);
+        gl::PixelStorei(gl::PACK_ROW_LENGTH, 0);
+
+        let mut rgba = vec![0u8; width * height * 4];
+        gl::ReadPixels(
+            0,
+            0,
+            width as i32,
+            height as i32,
+            gl::RGBA,
+            gl::UNSIGNED_BYTE,
+            rgba.as_mut_ptr() as *mut _,
+        );
+        let gl_error = gl::GetError();
+
+        gl::BindBuffer(gl::PIXEL_PACK_BUFFER, old_pack_buffer as u32);
+        gl::PixelStorei(gl::PACK_ALIGNMENT, old_pack_alignment);
+        gl::PixelStorei(gl::PACK_ROW_LENGTH, old_pack_row_length);
+
+        let mut ppm = Vec::with_capacity(width * height * 3 + 64);
+        ppm.extend_from_slice(format!("P6\n{} {}\n255\n", width, height).as_bytes());
+        for row in (0..height).rev() {
+            for px in rgba[row * width * 4..(row + 1) * width * 4].chunks_exact(4) {
+                ppm.extend_from_slice(&px[..3]);
+            }
+        }
+        match std::fs::write(&path, ppm) {
+            Ok(()) => info!(
+                "[PRESENT_PPM] wrote {} frame={} present_index={} gl_error=0x{:X}",
+                path.to_string_lossy(),
+                current_frame,
+                present_index,
+                gl_error
+            ),
+            Err(err) => log::warn!(
+                "[PRESENT_PPM] failed to write {}: {}",
+                path.to_string_lossy(),
+                err
+            ),
+        }
+    }
+    Some(present_index)
 }
 
 pub fn dump_present_profile() {
@@ -133,7 +312,6 @@ pub enum OpenGLError {
 /// graphics context, and base renderer data.
 pub struct RendererOpenGL {
     device: Device,
-    state_tracker: Box<StateTracker>,
     blit_screen: BlitScreen,
     rasterizer: RasterizerOpenGL,
     /// Graphics context for swap buffers / make current.
@@ -178,24 +356,21 @@ impl RendererOpenGL {
 
         // Load GL function pointers
         gl::load_with(&mut load_fn);
+        gl_rasterizer::load_extra_functions(&mut load_fn);
         StateTracker::load_compat_functions(load_fn);
 
         // Query device capabilities
         let device = Device::new();
-        let mut state_tracker = Box::new(StateTracker::new());
 
         // Initialize blit screen pipeline
         let blit_screen = BlitScreen::new().map_err(|e| OpenGLError::ShaderCompileFailed(e))?;
 
         // Initialize rasterizer with the shared MaxwellDeviceMemoryManager.
-        // Mirrors upstream RendererOpenGL ctor: rasterizer(emu_window, gpu,
-        // device_memory, device, program_manager, state_tracker).
-        let rasterizer = RasterizerOpenGL::new(
-            &device,
-            syncpoints,
-            device_memory,
-            state_tracker.as_mut() as *mut StateTracker,
-        );
+        // Upstream stores `StateTracker state_tracker` by value on
+        // `RendererOpenGL` and injects a reference into `RasterizerOpenGL`;
+        // Rust cannot express member references, so ruzu lets the rasterizer
+        // own the tracker directly (see `RasterizerOpenGL::state_tracker_mut`).
+        let rasterizer = RasterizerOpenGL::new(&device, syncpoints, device_memory);
 
         // Set up initial GL state (matching zuyu's RendererOpenGL constructor)
         unsafe {
@@ -265,7 +440,6 @@ impl RendererOpenGL {
 
         Ok(Self {
             device,
-            state_tracker,
             blit_screen,
             rasterizer,
             context,
@@ -331,19 +505,32 @@ impl RendererOpenGL {
         // while upstream routes render-target state through StateTracker.
         // Invalidate before binding the window framebuffer so BindFramebuffer(0)
         // cannot be skipped because of a stale cached value.
-        self.state_tracker.notify_framebuffer();
-        self.state_tracker.bind_framebuffer(0);
+        {
+            let state_tracker = self.rasterizer.state_tracker_mut();
+            state_tracker.notify_framebuffer();
+            state_tracker.bind_framebuffer(0);
+        }
         let phase_start = if profile { Some(Instant::now()) } else { None };
         self.blit_screen.draw_screen(
             framebuffers,
             &self.framebuffer_layout,
-            self.state_tracker.as_mut(),
             &mut self.rasterizer,
             false,
             self.device_memory.as_ref(),
         );
         if let Some(start) = phase_start {
             PRESENT_DRAW_SCREEN_US.fetch_add(elapsed_us(start), Ordering::Relaxed);
+        }
+        let dumped_present_index = dump_present_ppm_once(
+            self.base_data.current_frame.max(0) as u64,
+            self.rasterizer.total_draw_count(),
+            &self.framebuffer_layout,
+        );
+        if let Some(present_index) = dumped_present_index {
+            if std::env::var_os("RUZU_DUMP_PRESENT_EXTRA_ON_PPM").is_some() {
+                self.rasterizer
+                    .trace_present_images_by_gpu_addr_env(present_index);
+            }
         }
 
         if std::env::var_os("RUZU_TRACE_PRESENT_READBACK").is_some() {
@@ -612,6 +799,10 @@ impl RendererBase for RendererOpenGL {
 
     fn set_gpu_ticks_getter(&mut self, getter: crate::renderer_base::GpuTicksGetter) {
         self.rasterizer.set_gpu_ticks_getter(getter);
+    }
+
+    fn set_gpu_tick_callback(&mut self, callback: crate::renderer_base::GpuTickCallback) {
+        self.rasterizer.set_gpu_tick_callback(callback);
     }
 
     fn get_applet_capture_buffer(&self) -> Vec<u8> {

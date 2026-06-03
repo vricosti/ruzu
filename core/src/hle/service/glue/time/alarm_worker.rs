@@ -82,14 +82,13 @@ impl AlarmWorker {
 
         // Create the timer timing event for CoreTiming scheduling.
         let timer_event_clone = self.timer_event.clone();
-        let timer_timing_event = Arc::new(ParkingMutex::new(EventType {
-            callback: Box::new(move |_late_ns, _time| {
+        let timer_timing_event = Arc::new(ParkingMutex::new(EventType::new(
+            Box::new(move |_late_ns, _time| {
                 timer_event_clone.signal();
                 None // no auto-reschedule
             }),
-            name: "Glue:AlarmWorker:TimerEvent".to_string(),
-            sequence_number: 0,
-        }));
+            "Glue:AlarmWorker:TimerEvent".to_string(),
+        )));
         self.timer_timing_event = Some(timer_timing_event);
 
         self.initialized = true;

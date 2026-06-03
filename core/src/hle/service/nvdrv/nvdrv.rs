@@ -149,9 +149,9 @@ impl Module {
                 Arc::clone(&self.events_interface),
                 self.container.get_syncpoint_manager(),
             )),
-            "/dev/nvhost-nvdec" => Arc::new(NvHostNvDec::new()),
+            "/dev/nvhost-nvdec" => Arc::new(NvHostNvDec::new(self.system, &self.container)),
             "/dev/nvhost-nvjpg" => Arc::new(NvHostNvJpg::new()),
-            "/dev/nvhost-vic" => Arc::new(NvHostVic::new()),
+            "/dev/nvhost-vic" => Arc::new(NvHostVic::new(self.system, &self.container)),
             _ => {
                 log::error!("Trying to open unknown device {}", device_name);
                 return INVALID_NVDRV_FD;
@@ -181,8 +181,33 @@ impl Module {
         output: &mut [u8],
     ) -> NvResult {
         if fd < 0 {
-            log::error!("Invalid DeviceFD={}!", fd);
+            let tid = crate::hle::kernel::kernel::get_current_thread_id_fast().unwrap_or(0);
+            log::error!(
+                "Invalid DeviceFD={}! ioctl1=0x{:08X} tid={}",
+                fd,
+                command.raw,
+                tid
+            );
             return NvResult::InvalidState;
+        }
+        if std::env::var_os("RUZU_TRACE_IOCTL_ENTER").is_some() {
+            let n = input.len().min(64);
+            let mut hex = String::new();
+            for (i, b) in input.iter().enumerate().take(n) {
+                if i > 0 && (i & 3) == 0 {
+                    hex.push(' ');
+                }
+                use std::fmt::Write;
+                let _ = write!(hex, "{:02x}", b);
+            }
+            eprintln!(
+                "[IOCTL_ENTER] fd={} ioctl=0x{:08X} in_sz=0x{:x} out_sz=0x{:x} head={}",
+                fd,
+                command.raw,
+                input.len(),
+                output.len(),
+                hex
+            );
         }
         {
             use std::collections::HashMap;
@@ -248,7 +273,13 @@ impl Module {
         output: &mut [u8],
     ) -> NvResult {
         if fd < 0 {
-            log::error!("Invalid DeviceFD={}!", fd);
+            let tid = crate::hle::kernel::kernel::get_current_thread_id_fast().unwrap_or(0);
+            log::error!(
+                "Invalid DeviceFD={}! ioctl2=0x{:08X} tid={}",
+                fd,
+                command.raw,
+                tid
+            );
             return NvResult::InvalidState;
         }
         let files = self.open_files.lock().unwrap();
@@ -271,7 +302,13 @@ impl Module {
         inline_output: &mut [u8],
     ) -> NvResult {
         if fd < 0 {
-            log::error!("Invalid DeviceFD={}!", fd);
+            let tid = crate::hle::kernel::kernel::get_current_thread_id_fast().unwrap_or(0);
+            log::error!(
+                "Invalid DeviceFD={}! ioctl3=0x{:08X} tid={}",
+                fd,
+                command.raw,
+                tid
+            );
             return NvResult::InvalidState;
         }
         let files = self.open_files.lock().unwrap();

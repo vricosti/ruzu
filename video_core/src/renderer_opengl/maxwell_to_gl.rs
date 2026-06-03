@@ -468,11 +468,9 @@ pub fn vertex_format(attrib_type: u32, size: u32) -> u32 {
     match attrib_type {
         // UNorm, UScaled, UInt
         2 | 5 | 4 => match size {
-            0x01 | 0x02 | 0x03 | 0x05 | 0x0A | 0x13 | 0x18 | 0x1D | 0x32 | 0x33 | 0x34 => {
-                gl::UNSIGNED_BYTE
-            }
-            0x0F | 0x1B => gl::UNSIGNED_SHORT,
-            0x04 | 0x12 => gl::UNSIGNED_INT,
+            0x0A | 0x13 | 0x18 | 0x1D | 0x32 | 0x33 | 0x34 => gl::UNSIGNED_BYTE,
+            0x03 | 0x05 | 0x0F | 0x1B => gl::UNSIGNED_SHORT,
+            0x01 | 0x02 | 0x04 | 0x12 => gl::UNSIGNED_INT,
             0x30 => gl::UNSIGNED_INT_2_10_10_10_REV,
             _ => {
                 log::warn!("Unknown unsigned vertex size: {:#x}", size);
@@ -481,9 +479,9 @@ pub fn vertex_format(attrib_type: u32, size: u32) -> u32 {
         },
         // SNorm, SScaled, SInt
         1 | 6 | 3 => match size {
-            0x01 | 0x02 | 0x03 | 0x05 | 0x0A | 0x13 | 0x18 | 0x1D | 0x32 | 0x33 | 0x34 => gl::BYTE,
-            0x0F | 0x1B => gl::SHORT,
-            0x04 | 0x12 => gl::INT,
+            0x0A | 0x13 | 0x18 | 0x1D | 0x32 | 0x33 | 0x34 => gl::BYTE,
+            0x03 | 0x05 | 0x0F | 0x1B => gl::SHORT,
+            0x01 | 0x02 | 0x04 | 0x12 => gl::INT,
             0x30 => gl::INT_2_10_10_10_REV,
             _ => {
                 log::warn!("Unknown signed vertex size: {:#x}", size);
@@ -588,5 +586,17 @@ mod tests {
             get_format_tuple(PixelFormat::D32FloatS8Uint as usize).gl_type,
             gl::FLOAT_32_UNSIGNED_INT_24_8_REV
         );
+    }
+
+    #[test]
+    fn vertex_format_matches_upstream_bit_depth() {
+        assert_eq!(vertex_format(4, 0x01), gl::UNSIGNED_INT);
+        assert_eq!(vertex_format(4, 0x03), gl::UNSIGNED_SHORT);
+        assert_eq!(vertex_format(4, 0x0A), gl::UNSIGNED_BYTE);
+        assert_eq!(vertex_format(3, 0x01), gl::INT);
+        assert_eq!(vertex_format(3, 0x03), gl::SHORT);
+        assert_eq!(vertex_format(3, 0x0A), gl::BYTE);
+        assert_eq!(vertex_format(7, 0x03), gl::HALF_FLOAT);
+        assert_eq!(vertex_format(7, 0x01), gl::FLOAT);
     }
 }

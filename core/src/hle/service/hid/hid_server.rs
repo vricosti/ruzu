@@ -14,6 +14,7 @@ use crate::core::SystemRef;
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
 use crate::hle::service::ipc_helpers::{RequestParser, ResponseBuilder};
+use crate::hle::service::os::event::Event;
 use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
 
 /// Convert `common::ResultCode` (used by hid_core) to `crate::hle::result::ResultCode`
@@ -29,6 +30,7 @@ pub struct IHidServer {
     handlers_tipc: BTreeMap<u32, FunctionInfo>,
     resource_manager: Arc<parking_lot::Mutex<ResourceManager>>,
     firmware_settings: Arc<HidFirmwareSettings>,
+    npad_style_set_events: parking_lot::Mutex<BTreeMap<(u64, u32), Arc<Event>>>,
 }
 
 impl IHidServer {
@@ -628,6 +630,7 @@ impl IHidServer {
             handlers_tipc: BTreeMap::new(),
             resource_manager,
             firmware_settings,
+            npad_style_set_events: parking_lot::Mutex::new(BTreeMap::new()),
         }
     }
 
@@ -639,6 +642,14 @@ impl IHidServer {
     /// Upstream: `IHidServer::GetResourceManager()`.
     pub fn get_resource_manager(&self) -> Arc<parking_lot::Mutex<ResourceManager>> {
         self.resource_manager.clone()
+    }
+
+    fn signal_npad_style_set_events(&self, aruid: u64) {
+        for ((event_aruid, _npad_id), event) in self.npad_style_set_events.lock().iter() {
+            if *event_aruid == aruid {
+                event.signal();
+            }
+        }
     }
 
     fn stub_success_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
@@ -1540,6 +1551,9 @@ impl IHidServer {
         } else {
             RESULT_SUCCESS
         };
+        if result.is_success() {
+            server.signal_npad_style_set_events(aruid);
+        }
 
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(result);
@@ -1593,6 +1607,15 @@ impl IHidServer {
                 npad_ids.push(npad_id);
             }
         }
+        if std::env::var_os("RUZU_TRACE_HID_RESOURCE").is_some() {
+            let raw_ids: Vec<u32> = npad_ids.iter().map(|id| *id as u32).collect();
+            log::info!(
+                "[HID_RESOURCE] SetSupportedNpadIdType aruid=0x{:X} count={} ids={:X?}",
+                aruid,
+                raw_ids.len(),
+                raw_ids
+            );
+        }
 
         let rm = server.resource_manager.lock();
         let result = if let Some(ref npad) = rm.get_npad() {
@@ -1613,14 +1636,32 @@ impl IHidServer {
         log::debug!("IHidServer::ActivateNpad called, aruid={}", aruid);
 
         let rm = server.resource_manager.lock();
+        let register_result = rm.register_applet_resource_user_id(aruid, true);
+        let create_result = rm.create_applet_resource(aruid);
         let result = if let Some(ref npad) = rm.get_npad() {
             let mut ng = npad.lock();
+            let _ = ng.register_applet_resource_user_id(aruid);
+            if !ng.is_active() {
+                let _ = ng.activate();
+            }
             ng.npad_resource_mut()
                 .set_npad_revision(aruid, NpadRevision::Revision0);
             to_ipc_result(ng.activate_for_aruid(aruid))
         } else {
             RESULT_SUCCESS
         };
+        if std::env::var_os("RUZU_TRACE_HID_RESOURCE").is_some() {
+            log::info!(
+                "[HID_RESOURCE] ActivateNpad aruid=0x{:X} register=0x{:08X} create=0x{:08X} activate=0x{:08X}",
+                aruid,
+                register_result.0,
+                create_result.0,
+                result.0
+            );
+        }
+        if result.is_success() {
+            server.signal_npad_style_set_events(aruid);
+        }
 
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(result);
@@ -1638,9 +1679,10 @@ impl IHidServer {
 
     // cmd 106: AcquireNpadStyleSetUpdateEventHandle
     fn acquire_npad_style_set_update_event_handle(
-        _this: &dyn ServiceFramework,
+        this: &dyn ServiceFramework,
         ctx: &mut HLERequestContext,
     ) {
+        let server = Self::as_self(this);
         let mut rp = RequestParser::new(ctx);
         let npad_id_raw = rp.pop_u32();
         let _padding = rp.pop_u32();
@@ -1649,11 +1691,20 @@ impl IHidServer {
         let _npad_id: NpadIdType = unsafe { core::mem::transmute(npad_id_raw) };
         log::debug!("IHidServer::AcquireNpadStyleSetUpdateEventHandle called, npad_id=0x{:X}, aruid={}, unknown={}",
             npad_id_raw, aruid, unknown);
-        // Upstream delegates to npad->AcquireNpadStyleSetUpdateEventHandle which is not
-        // yet fully ported (requires KReadableEvent). Return a null copy handle.
+        let event = {
+            let mut events = server.npad_style_set_events.lock();
+            Arc::clone(
+                events
+                    .entry((aruid, npad_id_raw))
+                    .or_insert_with(|| Arc::new(Event::new())),
+            )
+        };
+        // Upstream signals the event immediately after handing it out.
+        event.signal();
+        let handle = event.copy_handle(ctx).unwrap_or(0);
         let mut rb = ResponseBuilder::new(ctx, 2, 1, 0);
         rb.push_result(RESULT_SUCCESS);
-        rb.push_copy_objects(0);
+        rb.push_copy_objects(handle);
     }
 
     // cmd 107: DisconnectNpad
@@ -1716,13 +1767,31 @@ impl IHidServer {
         );
 
         let rm = server.resource_manager.lock();
+        let register_result = rm.register_applet_resource_user_id(aruid, true);
+        let create_result = rm.create_applet_resource(aruid);
         let result = if let Some(ref npad) = rm.get_npad() {
             let mut ng = npad.lock();
+            let _ = ng.register_applet_resource_user_id(aruid);
+            if !ng.is_active() {
+                let _ = ng.activate();
+            }
             ng.npad_resource_mut().set_npad_revision(aruid, revision);
             to_ipc_result(ng.activate_for_aruid(aruid))
         } else {
             RESULT_SUCCESS
         };
+        if std::env::var_os("RUZU_TRACE_HID_RESOURCE").is_some() {
+            log::info!(
+                "[HID_RESOURCE] ActivateNpadWithRevision aruid=0x{:X} register=0x{:08X} create=0x{:08X} activate=0x{:08X}",
+                aruid,
+                register_result.0,
+                create_result.0,
+                result.0
+            );
+        }
+        if result.is_success() {
+            server.signal_npad_style_set_events(aruid);
+        }
 
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(result);
@@ -1806,24 +1875,31 @@ impl IHidServer {
 
     // cmd 123: SetNpadJoyAssignmentModeSingle
     fn set_npad_joy_assignment_mode_single(
-        _this: &dyn ServiceFramework,
+        this: &dyn ServiceFramework,
         ctx: &mut HLERequestContext,
     ) {
+        let server = Self::as_self(this);
         let mut rp = RequestParser::new(ctx);
         let npad_id_raw = rp.pop_u32();
         let _padding = rp.pop_u32();
         let aruid = rp.pop_u64();
         let npad_joy_device_type_raw = rp.pop_u64();
         let npad_id: NpadIdType = unsafe { core::mem::transmute(npad_id_raw) };
-        let _npad_joy_device_type: NpadJoyDeviceType =
+        let npad_joy_device_type: NpadJoyDeviceType =
             unsafe { core::mem::transmute(npad_joy_device_type_raw as i64) };
         log::info!(
             "IHidServer::SetNpadJoyAssignmentModeSingle called, npad_id={:?}, aruid={}",
             npad_id,
             aruid
         );
-        // Upstream: GetNpad()->SetNpadMode(aruid, new_npad_id, npad_id, npad_joy_device_type, Single)
-        // NPad::SetNpadMode is not yet ported. Return success matching upstream behavior.
+        let rm = server.resource_manager.lock();
+        if let Some(ref npad) = rm.get_npad() {
+            npad.lock().set_npad_joy_assignment_mode_single(
+                aruid,
+                npad_id,
+                npad_joy_device_type,
+            );
+        }
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
     }
@@ -2061,24 +2137,34 @@ impl IHidServer {
 
     // cmd 133: SetNpadJoyAssignmentModeSingleWithDestination
     fn set_npad_joy_assignment_mode_single_with_destination(
-        _this: &dyn ServiceFramework,
+        this: &dyn ServiceFramework,
         ctx: &mut HLERequestContext,
     ) {
+        let server = Self::as_self(this);
         let mut rp = RequestParser::new(ctx);
         let npad_id_raw = rp.pop_u32();
         let _padding = rp.pop_u32();
         let aruid = rp.pop_u64();
         let npad_joy_device_type_raw = rp.pop_u64();
         let npad_id: NpadIdType = unsafe { core::mem::transmute(npad_id_raw) };
-        let _npad_joy_device_type: NpadJoyDeviceType =
+        let npad_joy_device_type: NpadJoyDeviceType =
             unsafe { core::mem::transmute(npad_joy_device_type_raw as i64) };
         log::info!("IHidServer::SetNpadJoyAssignmentModeSingleWithDestination called, npad_id={:?}, aruid={}", npad_id, aruid);
-        // Upstream: SetNpadMode -> returns (is_reassigned, new_npad_id)
-        // NPad::SetNpadMode is not yet ported. Return is_reassigned=false, new_npad_id=0.
+        let mut is_reassigned = false;
+        let mut new_npad_id = NpadIdType::default();
+        let rm = server.resource_manager.lock();
+        if let Some(ref npad) = rm.get_npad() {
+            (is_reassigned, new_npad_id) = npad.lock().set_npad_mode(
+                aruid,
+                npad_id,
+                npad_joy_device_type,
+                NpadJoyAssignmentMode::Single,
+            );
+        }
         let mut rb = ResponseBuilder::new(ctx, 4, 0, 0);
         rb.push_result(RESULT_SUCCESS);
-        rb.push_bool(false); // out_is_reassigned
-                             // Padding to 8-byte boundary for out_new_npad_id would be handled by push
+        rb.push_bool(is_reassigned);
+        rb.push_u32(new_npad_id as u32);
     }
 
     // cmd 134: SetNpadAnalogStickUseCenterClamp
@@ -2164,15 +2250,19 @@ impl IHidServer {
     }
 
     // cmd 201: SendVibrationValue
-    fn send_vibration_value(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn send_vibration_value(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let server = Self::as_self(this);
         let mut rp = RequestParser::new(ctx);
-        let _handle: VibrationDeviceHandle = rp.pop_raw();
-        let _value: VibrationValue = rp.pop_raw();
+        let handle: VibrationDeviceHandle = rp.pop_raw();
+        let value: VibrationValue = rp.pop_raw();
         let aruid = rp.pop_u64();
         log::debug!("IHidServer::SendVibrationValue called, aruid={}", aruid);
-        // ResourceManager::SendVibrationValue not yet ported.
+        let result = server
+            .resource_manager
+            .lock()
+            .send_vibration_value(aruid, &handle, &value);
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
-        rb.push_result(RESULT_SUCCESS);
+        rb.push_result(to_ipc_result(result));
     }
 
     // cmd 202: GetActualVibrationValue
@@ -2185,31 +2275,17 @@ impl IHidServer {
             vibration_device_handle.npad_type, vibration_device_handle.npad_id,
             vibration_device_handle.device_index, aruid);
 
-        // Upstream checks IsVibrationAruidActive, then gets the vibration device.
-        // NpadVibrationDevice::GetActualVibrationValue is not yet ported.
-        // Return DEFAULT_VIBRATION_VALUE matching upstream fallback.
-        let default_value = VibrationValue {
-            low_amplitude: 0.0,
-            low_frequency: 160.0,
-            high_amplitude: 0.0,
-            high_frequency: 320.0,
-        };
-
         let rm = server.resource_manager.lock();
-        let has_active_aruid = match rm.is_vibration_aruid_active(aruid) {
-            Ok(v) => v,
-            Err(_) => false,
-        };
-
-        let vibration_value = if !has_active_aruid {
-            default_value
-        } else {
-            // NpadVibrationDevice not yet ported, return default
-            default_value
+        let (result, vibration_value) = match rm.get_actual_vibration_value(
+            aruid,
+            &vibration_device_handle,
+        ) {
+            Ok(value) => (RESULT_SUCCESS, value),
+            Err(result) => (to_ipc_result(result), DEFAULT_VIBRATION_VALUE),
         };
 
         let mut rb = ResponseBuilder::new(ctx, 6, 0, 0);
-        rb.push_result(RESULT_SUCCESS);
+        rb.push_result(result);
         rb.push_raw(&vibration_value);
     }
 
@@ -2289,7 +2365,8 @@ impl IHidServer {
     }
 
     // cmd 206: SendVibrationValues
-    fn send_vibration_values(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn send_vibration_values(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let server = Self::as_self(this);
         let mut rp = RequestParser::new(ctx);
         let aruid = rp.pop_u64();
         log::debug!("IHidServer::SendVibrationValues called, aruid={}", aruid);
@@ -2316,9 +2393,29 @@ impl IHidServer {
             ));
             return;
         }
-        // ResourceManager::SendVibrationValue not yet ported; accept silently.
+        let rm = server.resource_manager.lock();
+        let mut result = RESULT_SUCCESS;
+        for index in 0..handle_count {
+            let handle_offset = index * handle_size;
+            let value_offset = index * value_size;
+            let handle = unsafe {
+                std::ptr::read_unaligned(
+                    handles_buf[handle_offset..].as_ptr() as *const VibrationDeviceHandle,
+                )
+            };
+            let value = unsafe {
+                std::ptr::read_unaligned(
+                    values_buf[value_offset..].as_ptr() as *const VibrationValue,
+                )
+            };
+            let send_result = rm.send_vibration_value(aruid, &handle, &value);
+            if send_result.is_error() {
+                result = to_ipc_result(send_result);
+                break;
+            }
+        }
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
-        rb.push_result(RESULT_SUCCESS);
+        rb.push_result(result);
     }
 
     // cmd 207: SendVibrationGcErmCommand
@@ -2419,19 +2516,26 @@ impl IHidServer {
     }
 
     // cmd 211: IsVibrationDeviceMounted
-    fn is_vibration_device_mounted(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn is_vibration_device_mounted(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let server = Self::as_self(this);
         let mut rp = RequestParser::new(ctx);
-        let _vibration_device_handle: VibrationDeviceHandle = rp.pop_raw();
+        let vibration_device_handle: VibrationDeviceHandle = rp.pop_raw();
         let aruid = rp.pop_u64();
         log::debug!(
             "IHidServer::IsVibrationDeviceMounted called, aruid={}",
             aruid
         );
-        // Upstream validates handle, gets VibrationDevice, calls IsVibrationMounted.
-        // VibrationDevice not yet ported. Return false.
+        let (result, is_mounted) = match server
+            .resource_manager
+            .lock()
+            .is_vibration_device_mounted(&vibration_device_handle)
+        {
+            Ok(is_mounted) => (RESULT_SUCCESS, is_mounted),
+            Err(result) => (to_ipc_result(result), false),
+        };
         let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
-        rb.push_result(RESULT_SUCCESS);
-        rb.push_bool(false);
+        rb.push_result(result);
+        rb.push_bool(is_mounted);
     }
 
     // cmd 212: SendVibrationValueInBool

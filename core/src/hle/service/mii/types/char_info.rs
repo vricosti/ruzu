@@ -26,9 +26,8 @@ use common::uuid::UUID;
 ///   Common::UUID create_id (16 bytes)
 ///   Nickname name (20 bytes)
 ///   u16 null_terminator (2 bytes)
-///   then individual u8 fields (46 bytes)
-///   Total: 16 + 20 + 2 + 46 = 84 = 0x54
-///   Note: upstream says 0x58 due to UUID alignment; we use a flat byte layout.
+///   then individual u8 fields (50 bytes)
+///   Total: 16 + 20 + 2 + 50 = 88 = 0x58.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(C)]
 pub struct CharInfo {
@@ -86,6 +85,8 @@ pub struct CharInfo {
     pub mole_y: u8,
     pub padding: u8,
 }
+
+const _: () = assert!(core::mem::size_of::<CharInfo>() == 0x58);
 
 impl Default for CharInfo {
     fn default() -> Self {

@@ -5,7 +5,10 @@
 //! Port of zuyu/src/core/hle/service/am/library_applet_storage.cpp
 
 use super::am_results;
-use crate::hle::result::ResultCode;
+use crate::hle::kernel::k_transfer_memory::KTransferMemory;
+use crate::hle::result::{ResultCode, RESULT_UNKNOWN};
+use crate::memory::memory::Memory;
+use std::sync::{Arc, Mutex};
 
 fn validate_offset(offset: i64, size: usize, data_size: usize) -> Result<(), ResultCode> {
     if offset < 0 {
@@ -24,8 +27,8 @@ pub trait LibraryAppletStorage: Send + Sync {
     fn read(&self, offset: i64, buffer: &mut [u8]) -> Result<(), ResultCode>;
     fn write(&mut self, offset: i64, buffer: &[u8]) -> Result<(), ResultCode>;
     fn get_size(&self) -> i64;
-    fn has_handle(&self) -> bool {
-        false
+    fn get_handle_object_id(&self) -> Option<u64> {
+        None
     }
 
     fn get_data(&self) -> Vec<u8> {
@@ -72,10 +75,136 @@ pub fn create_storage(data: Vec<u8>) -> Box<dyn LibraryAppletStorage> {
     Box::new(BufferLibraryAppletStorage::new(data))
 }
 
-// Upstream defines two additional LibraryAppletStorage implementations:
-//   - TransferMemoryLibraryAppletStorage: backed by KTransferMemory, implements Read/Write
-//     by mapping the transfer memory into the process address space.
-//   - HandleLibraryAppletStorage: wraps a KTransferMemory handle for direct handle passing
-//     via IPC (PushCopyObjects).
-// Both require KTransferMemory (exists at kernel/k_transfer_memory.rs) to be wired into the
-// IPC framework with copy handle support. Blocked on IPC copy handle integration.
+/// Port of upstream `TransferMemoryLibraryAppletStorage`.
+pub struct TransferMemoryLibraryAppletStorage {
+    memory: Arc<Mutex<Memory>>,
+    transfer_memory: Arc<Mutex<KTransferMemory>>,
+    object_id: u64,
+    is_writable: bool,
+    size: i64,
+}
+
+impl TransferMemoryLibraryAppletStorage {
+    pub fn new(
+        memory: Arc<Mutex<Memory>>,
+        transfer_memory: Arc<Mutex<KTransferMemory>>,
+        object_id: u64,
+        is_writable: bool,
+        size: i64,
+    ) -> Self {
+        Self {
+            memory,
+            transfer_memory,
+            object_id,
+            is_writable,
+            size,
+        }
+    }
+
+    fn source_address(&self) -> u64 {
+        self.transfer_memory.lock().unwrap().get_source_address()
+    }
+}
+
+impl LibraryAppletStorage for TransferMemoryLibraryAppletStorage {
+    fn read(&self, offset: i64, buffer: &mut [u8]) -> Result<(), ResultCode> {
+        validate_offset(offset, buffer.len(), self.size as usize)?;
+        self.memory
+            .lock()
+            .unwrap()
+            .read_block(self.source_address() + offset as u64, buffer);
+        Ok(())
+    }
+
+    fn write(&mut self, offset: i64, buffer: &[u8]) -> Result<(), ResultCode> {
+        if !self.is_writable {
+            return Err(RESULT_UNKNOWN);
+        }
+        validate_offset(offset, buffer.len(), self.size as usize)?;
+        self.memory
+            .lock()
+            .unwrap()
+            .write_block(self.source_address() + offset as u64, buffer);
+        Ok(())
+    }
+
+    fn get_size(&self) -> i64 {
+        self.size
+    }
+
+    fn get_handle_object_id(&self) -> Option<u64> {
+        Some(self.object_id)
+    }
+}
+
+/// Port of upstream `HandleLibraryAppletStorage`.
+pub struct HandleLibraryAppletStorage {
+    inner: TransferMemoryLibraryAppletStorage,
+}
+
+impl HandleLibraryAppletStorage {
+    pub fn new(
+        memory: Arc<Mutex<Memory>>,
+        transfer_memory: Arc<Mutex<KTransferMemory>>,
+        object_id: u64,
+        size: i64,
+    ) -> Self {
+        Self {
+            inner: TransferMemoryLibraryAppletStorage::new(
+                memory,
+                transfer_memory,
+                object_id,
+                true,
+                size,
+            ),
+        }
+    }
+}
+
+impl LibraryAppletStorage for HandleLibraryAppletStorage {
+    fn read(&self, offset: i64, buffer: &mut [u8]) -> Result<(), ResultCode> {
+        self.inner.read(offset, buffer)
+    }
+
+    fn write(&mut self, offset: i64, buffer: &[u8]) -> Result<(), ResultCode> {
+        self.inner.write(offset, buffer)
+    }
+
+    fn get_size(&self) -> i64 {
+        self.inner.get_size()
+    }
+
+    fn get_handle_object_id(&self) -> Option<u64> {
+        self.inner.get_handle_object_id()
+    }
+}
+
+pub fn create_transfer_memory_storage(
+    memory: Arc<Mutex<Memory>>,
+    transfer_memory: Arc<Mutex<KTransferMemory>>,
+    object_id: u64,
+    is_writable: bool,
+    size: i64,
+) -> Arc<Mutex<dyn LibraryAppletStorage>> {
+    Arc::new(Mutex::new(TransferMemoryLibraryAppletStorage::new(
+        memory,
+        transfer_memory,
+        object_id,
+        is_writable,
+        size,
+    )))
+}
+
+pub fn create_handle_storage(
+    memory: Arc<Mutex<Memory>>,
+    transfer_memory: Arc<Mutex<KTransferMemory>>,
+    object_id: u64,
+    size: i64,
+) -> Arc<Mutex<dyn LibraryAppletStorage>> {
+    Arc::new(Mutex::new(HandleLibraryAppletStorage::new(
+        memory,
+        transfer_memory,
+        object_id,
+        size,
+    )))
+}

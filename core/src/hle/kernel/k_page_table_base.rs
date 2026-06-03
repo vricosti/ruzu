@@ -2184,6 +2184,13 @@ impl KPageTableBase {
             Self::DEFAULT_MEMORY_IGNORE_ATTR,
         );
         if result != 0 {
+            log::error!(
+                "KPageTableBase::UnmapMemory source-state check failed, dst=0x{:X}, src=0x{:X}, size=0x{:X}, result=0x{:08X}",
+                dst,
+                src,
+                size,
+                result
+            );
             return result;
         }
         let src_state = out_src_state.unwrap_or(KMemoryState::NORMAL);
@@ -2192,7 +2199,7 @@ impl KPageTableBase {
         let result = self.check_memory_state(
             dst,
             size,
-            KMemoryState::MASK,
+            KMemoryState::ALL,
             KMemoryState::STACK,
             KMemoryPermission::NONE,
             KMemoryPermission::NONE,
@@ -2200,7 +2207,40 @@ impl KPageTableBase {
             KMemoryAttribute::NONE,
         );
         if result != 0 {
+            log::error!(
+                "KPageTableBase::UnmapMemory destination-state check failed, dst=0x{:X}, src=0x{:X}, size=0x{:X}, result=0x{:08X}",
+                dst,
+                src,
+                size,
+                result
+            );
             return result;
+        }
+
+        // Create the page group representing the destination and verify it is
+        // the same physical page group as the source. Upstream:
+        // `MakePageGroup(pg, dst_address, num_pages)` followed by
+        // `IsValidPageGroup(pg, src_address, num_pages)`.
+        let mut pg = super::k_page_group::KPageGroup::new();
+        let make_pg_result = self.make_page_group(&mut pg, dst, num_pages);
+        if make_pg_result != 0 {
+            log::error!(
+                "KPageTableBase::UnmapMemory destination page-group creation failed, dst=0x{:X}, src=0x{:X}, size=0x{:X}, result=0x{:08X}",
+                dst,
+                src,
+                size,
+                make_pg_result
+            );
+            return make_pg_result;
+        }
+        if !self.is_valid_page_group(&pg, src, num_pages) {
+            log::error!(
+                "KPageTableBase::UnmapMemory source/destination page-group mismatch, dst=0x{:X}, src=0x{:X}, size=0x{:X}",
+                dst,
+                src,
+                size
+            );
+            return svc_results::RESULT_INVALID_MEMORY_REGION.get_inner_value();
         }
 
         // Unmap the destination.
@@ -2220,6 +2260,13 @@ impl KPageTableBase {
             OperationType::Unmap,
         );
         if op_result != 0 {
+            log::error!(
+                "KPageTableBase::UnmapMemory destination unmap operation failed, dst=0x{:X}, src=0x{:X}, size=0x{:X}, result=0x{:08X}",
+                dst,
+                src,
+                size,
+                op_result
+            );
             return op_result;
         }
 
@@ -2240,6 +2287,13 @@ impl KPageTableBase {
             OperationType::ChangePermissions,
         );
         if op_result != 0 {
+            log::error!(
+                "KPageTableBase::UnmapMemory source restore operation failed, dst=0x{:X}, src=0x{:X}, size=0x{:X}, result=0x{:08X}",
+                dst,
+                src,
+                size,
+                op_result
+            );
             return op_result;
         }
 
@@ -5173,6 +5227,42 @@ impl KPageTableBase {
         }
 
         0
+    }
+
+    /// Validate that the current mapping at `addr` matches `pg`.
+    ///
+    /// Upstream `KPageTableBase::IsValidPageGroup` traverses the page table
+    /// directly and compares physical blocks. Ruzu's `make_page_group` already
+    /// normalizes the current physical mapping into `KPageGroup` blocks, so the
+    /// equivalent check is to build the expected group and compare blocks.
+    fn is_valid_page_group(
+        &self,
+        pg: &super::k_page_group::KPageGroup,
+        addr: usize,
+        num_pages: usize,
+    ) -> bool {
+        if pg.is_empty() {
+            return false;
+        }
+
+        let mut expected = super::k_page_group::KPageGroup::new();
+        if self.make_page_group(&mut expected, addr, num_pages) != 0 {
+            return false;
+        }
+
+        if pg.get_num_pages() != expected.get_num_pages() {
+            return false;
+        }
+
+        let mut actual_blocks = pg.iter();
+        let mut expected_blocks = expected.iter();
+        loop {
+            match (actual_blocks.next(), expected_blocks.next()) {
+                (None, None) => return true,
+                (Some(actual), Some(expected)) if actual.is_equivalent_to(expected) => {}
+                _ => return false,
+            }
+        }
     }
 
     /// Map a page group into the address space with the given state and permission.

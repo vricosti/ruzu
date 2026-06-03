@@ -6,6 +6,18 @@
 
 use std::any::Any;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Host1xChannelType {
+    MsEnc = 0,
+    Vic = 1,
+    Gpu = 2,
+    NvDec = 3,
+    Display = 4,
+    NvJpg = 5,
+    TSec = 6,
+    Max = 7,
+}
+
 pub trait Host1xCoreInterface: Any + Send + Sync {
     fn as_any(&self) -> &(dyn Any + Send + Sync);
     fn get_host_syncpoint_value(&self, id: u32) -> u32;
@@ -37,4 +49,8 @@ pub trait Host1xCoreInterface: Any + Send + Sync {
     /// Look up the host pointer for a device address via the SMMU page
     /// table. Returns 0 if no mapping exists.
     fn smmu_lookup(&self, d_address: u64) -> usize;
+
+    fn start_device(&self, fd: i32, channel_type: Host1xChannelType, syncpt: u32);
+    fn stop_device(&self, fd: i32, channel_type: Host1xChannelType);
+    fn push_entries(&self, fd: i32, entries: Vec<u32>);
 }

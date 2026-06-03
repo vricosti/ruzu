@@ -25,6 +25,7 @@ use crate::hle::kernel::svc::svc_results::{
 use crate::hle::kernel::svc_common::INVALID_HANDLE;
 use crate::hle::result::ResultCode;
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestManager};
+use crate::hle::service::os::event::Event;
 
 const POINTER_TRANSFER_BUFFER_ALIGNMENT: usize = 0x10;
 
@@ -187,6 +188,14 @@ pub struct KServerSession {
     pub manager: Option<Arc<Mutex<SessionRequestManager>>>,
     /// Waitable synchronization state owned by KSynchronizationObject upstream.
     pub sync_object: SynchronizationObjectState,
+    /// Weak back-pointer to the owning ServerManager's wakeup_event. When
+    /// `notify_available` fires (request enqueued, client closed, etc.), the
+    /// ServerManager's host thread is signaled directly instead of waiting for
+    /// its `wait_timeout(100ms)` to expire. Upstream gets this reactivity for
+    /// free because `MultiWait::WaitAny` translates to `svcWaitSynchronization`
+    /// on the host thread; ruzu's host service threads use a host-side wait
+    /// path (no guest thread context) so we wire the wakeup explicitly.
+    pub manager_wakeup: Option<std::sync::Weak<Event>>,
 }
 
 impl KServerSession {
@@ -1569,7 +1578,15 @@ impl KServerSession {
             client_closed: false,
             manager: None,
             sync_object: SynchronizationObjectState::new(),
+            manager_wakeup: None,
         }
+    }
+
+    /// Wire the ServerManager's wakeup_event so that `notify_available` reacts
+    /// in microseconds instead of the host-thread loop's 100 ms idle timeout.
+    /// Called by `ServerManager::register_session`.
+    pub fn set_manager_wakeup(&mut self, wakeup: std::sync::Weak<Event>) {
+        self.manager_wakeup = Some(wakeup);
     }
 
     /// Initialize with a parent session.
@@ -1782,28 +1799,88 @@ impl KServerSession {
                     "KServerSession::send_reply_with_message stage=before_lock_client_thread"
                 );
             }
+            // Take the kernel scheduler lock around the WAITING-state check
+            // and the EndWait that flips it. `KThreadCell::lock()` is a no-op
+            // (the docs explicitly require the scheduler spin-lock be held by
+            // the caller as the real synchronization), so without it two host
+            // fibers can both observe `state == WAITING` and both call
+            // EndWait. The first EndWait sets state=RUNNABLE and clears
+            // `wait_queue`; the second then re-enters `end_wait`, finds
+            // state still cached as WAITING (atomic read may race), and asserts
+            // `wait_queue is None while state=Waiting` — the lost-wakeup that
+            // makes host-thread routing 1/16 unreliable.
+            //
+            // Upstream wraps this whole sequence in `KScopedSchedulerLock`
+            // inside `KServerSession::SendReplyHLE`.
+            let _scheduler_lock = crate::hle::kernel::kernel::scheduler_lock()
+                .map(super::k_scheduler_lock::KScopedSchedulerLock::new);
             let mut client_thread = client_thread.lock().unwrap();
+            if common::trace::is_enabled(common::trace::cat::IPC_REPLY_WAKE) {
+                static IPC_REPLY_WAKE_SEQ: std::sync::atomic::AtomicU64 =
+                    std::sync::atomic::AtomicU64::new(0);
+                let seq = IPC_REPLY_WAKE_SEQ
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                    .wrapping_add(1);
+                common::trace::emit_raw(
+                    common::trace::cat::IPC_REPLY_WAKE,
+                    &[
+                        seq,
+                        client_thread.get_thread_id(),
+                        client_thread.get_state().bits() as u64,
+                        client_thread.wait_reason_for_debugging as u64,
+                        client_thread.wait_queue.is_some() as u64,
+                        client_thread.wait_wake_guard_armed as u64,
+                        client_thread.wait_wake_guard_pending.is_some() as u64,
+                        client_result as u64,
+                        client_message as u64,
+                        client_buffer_size as u64,
+                    ],
+                );
+            }
             if trace_reply {
                 log::info!(
                     "KServerSession::send_reply_with_message stage=locked_client_thread state={:?}",
                     client_thread.get_state()
                 );
             }
-            if !client_thread.is_termination_requested()
-                && client_thread.get_state() == crate::hle::kernel::k_thread::ThreadState::WAITING
-            {
+            if !client_thread.is_termination_requested() {
                 if trace_reply {
-                    log::info!("KServerSession::send_reply_with_message stage=before_end_wait");
+                    log::info!(
+                        "KServerSession::send_reply_with_message stage=before_end_wait state={:?}",
+                        client_thread.get_state()
+                    );
                 }
-                client_thread.end_wait(client_result);
+                // Accept the reply wake in two cases:
+                // 1. the client has not parked yet, so `end_wait` records the
+                //    result into the wait-wake guard armed by SendSyncRequest;
+                // 2. the client is parked specifically in an IPC wait.
+                //
+                // Do not wake arbitrary WAITING states. A stale/late reply can
+                // arrive after the client has moved on to WaitSynchronization
+                // or Sleep; calling `end_wait` there hits
+                // KThreadQueueWithoutEndWait and resumes the wrong wait object,
+                // leaving the old SFCO reply in TLS to be parsed as a fresh
+                // nvdrv request.
+                let should_wake_client = client_thread.get_state()
+                    != super::k_thread::ThreadState::WAITING
+                    || client_thread.get_wait_reason_for_debugging()
+                        == super::k_thread::ThreadWaitReasonForDebugging::Ipc;
+                if should_wake_client {
+                    client_thread.end_wait(client_result);
+                } else if trace_reply {
+                    log::info!(
+                        "KServerSession::send_reply_with_message stage=skip_stale_reply state={:?} reason={:?}",
+                        client_thread.get_state(),
+                        client_thread.get_wait_reason_for_debugging()
+                    );
+                }
                 if trace_reply {
                     log::info!("KServerSession::send_reply_with_message stage=after_end_wait");
                 }
             } else if trace_reply {
                 log::info!(
-                    "KServerSession::send_reply_with_message stage=skip_end_wait state={:?} termination_requested={}",
+                    "KServerSession::send_reply_with_message stage=skip_end_wait_terminating state={:?}",
                     client_thread.get_state(),
-                    client_thread.is_termination_requested()
                 );
             }
         }
@@ -1824,6 +1901,121 @@ impl KServerSession {
     /// HLE convenience wrapper matching upstream `SendReplyHLE()`.
     pub fn send_reply(&mut self) -> u32 {
         self.send_reply_with_message(0, 0, 0, true)
+    }
+
+    /// HLE reply helper for host-thread ServerManager dispatch.
+    ///
+    /// Upstream `KServerSession::SendReplyHLE` holds the session light-lock
+    /// while taking `KScopedSchedulerLock`, but `KServerSession::OnRequest`
+    /// does not take that same light-lock. In the Rust port the outer
+    /// `Mutex<KServerSession>` was standing in for both pieces of state, so
+    /// holding it across `EndWait` created an ABBA with concurrent
+    /// `SendSyncRequest`: reply path held `server_session` then waited for the
+    /// scheduler lock, while a client held the scheduler lock then waited for
+    /// `server_session`. Split the operation at the Rust mutex boundary: take
+    /// the current request and compute the result under the session lock, then
+    /// drop it before waking the client.
+    pub fn send_reply_hle_unlocked(session: &Arc<Mutex<Self>>) -> u32 {
+        let trace_reply = std::env::var_os("RUZU_LOG_SYNC_REPLY").is_some();
+        let (
+            request,
+            client_thread,
+            event_id,
+            client_process_id,
+            client_message,
+            client_buffer_size,
+            client_result,
+            result,
+        ) = {
+            let mut server = session.lock().unwrap();
+            let Some(request) = server.current_request.take() else {
+                return RESULT_INVALID_STATE.get_inner_value();
+            };
+            if trace_reply {
+                log::info!("KServerSession::send_reply_hle_unlocked stage=took_current_request");
+            }
+            if server.current_request.is_none() {
+                server.clear_current_request_and_notify();
+            }
+
+            let client_thread = Self::resolve_request_client_thread(&request);
+            let (event_id, client_process_id, client_message, client_buffer_size) = {
+                let request = request.lock().unwrap();
+                (
+                    request.get_event_id(),
+                    request.get_client_process_id(),
+                    request.get_address(),
+                    request.get_size(),
+                )
+            };
+            let closed = client_thread.is_none() || server.client_closed;
+            let mut result = crate::hle::result::RESULT_SUCCESS.get_inner_value();
+            let mut client_result = result;
+            if closed {
+                result = RESULT_SESSION_CLOSED.get_inner_value();
+                client_result = RESULT_SESSION_CLOSED.get_inner_value();
+            }
+            (
+                request,
+                client_thread,
+                event_id,
+                client_process_id,
+                client_message,
+                client_buffer_size,
+                client_result,
+                result,
+            )
+        };
+
+        if let Some(event_id) = event_id {
+            if let Some(client_process_id) = client_process_id {
+                if let Some(kernel) = crate::hle::kernel::kernel::get_kernel_ref() {
+                    if let Some(process_arc) = kernel.get_process_by_id(client_process_id) {
+                        let mut process = process_arc.lock().unwrap();
+                        if client_result != crate::hle::result::RESULT_SUCCESS.get_inner_value() {
+                            Self::reply_async_error(
+                                &mut process,
+                                client_message,
+                                client_buffer_size,
+                                ResultCode::new(client_result),
+                            );
+                        }
+                        let _ = process.page_table.unlock_for_ipc_user_buffer(
+                            KProcessAddress::new(client_message as u64),
+                            client_buffer_size,
+                        );
+                        if let Some(event) = process.get_event_by_object_id(event_id) {
+                            let _ = event.lock().unwrap().signal(&process);
+                        }
+                    }
+                }
+            }
+        } else if let Some(client_thread) = &client_thread {
+            let _scheduler_lock = crate::hle::kernel::kernel::scheduler_lock()
+                .map(super::k_scheduler_lock::KScopedSchedulerLock::new);
+            let mut client_thread = client_thread.lock().unwrap();
+            if !client_thread.is_termination_requested() {
+                let should_wake_client = client_thread.get_state()
+                    != super::k_thread::ThreadState::WAITING
+                    || client_thread.get_wait_reason_for_debugging()
+                        == super::k_thread::ThreadWaitReasonForDebugging::Ipc;
+                if should_wake_client {
+                    client_thread.end_wait(client_result);
+                }
+            }
+        }
+
+        {
+            let mut request = request.lock().unwrap();
+            request.clear_thread();
+            request.clear_event();
+            request.finalize();
+        }
+        if trace_reply {
+            log::info!("KServerSession::send_reply_hle_unlocked stage=finalized_request");
+        }
+
+        result
     }
 
     /// Receive the next pending request.
@@ -1892,6 +2084,10 @@ impl KServerSession {
         &mut self,
         manager: Arc<Mutex<SessionRequestManager>>,
     ) -> Result<(HLERequestContext, Arc<Mutex<SessionRequestManager>>, u64), u32> {
+        let trace = std::env::var_os("RUZU_TRACE_RECEIVE_REQUEST_HLE").is_some();
+        if trace {
+            eprintln!("[RECEIVE_HLE] enter");
+        }
         if self.client_closed {
             return Err(RESULT_SESSION_CLOSED.get_inner_value());
         }
@@ -1902,6 +2098,9 @@ impl KServerSession {
         let Some(current_request) = self.request_list.pop_front() else {
             return Err(RESULT_NOT_FOUND.get_inner_value());
         };
+        if trace {
+            eprintln!("[RECEIVE_HLE] popped_request");
+        }
         let Some(client_thread) = Self::resolve_request_client_thread(&current_request) else {
             {
                 let mut request = current_request.lock().unwrap();
@@ -1912,6 +2111,10 @@ impl KServerSession {
             }
             return Err(RESULT_SESSION_CLOSED.get_inner_value());
         };
+        if trace {
+            let tid = client_thread.lock().unwrap().thread_id;
+            eprintln!("[RECEIVE_HLE] resolved_client_thread tid={}", tid);
+        }
 
         self.current_request = Some(Arc::clone(&current_request));
         let request_message_address = {
@@ -1923,12 +2126,57 @@ impl KServerSession {
                 client_thread.lock().unwrap().get_tls_address().get()
             }
         };
+        if trace {
+            eprintln!(
+                "[RECEIVE_HLE] request_message_address=0x{:X}",
+                request_message_address
+            );
+        }
 
         let mut context =
             HLERequestContext::new_with_thread(client_thread, request_message_address);
+        if trace {
+            eprintln!("[RECEIVE_HLE] context_created");
+        }
         context.set_session_request_manager(Arc::clone(&manager));
+        if trace {
+            eprintln!("[RECEIVE_HLE] manager_set");
+        }
         context.populate_from_incoming_command_buffer(&[]);
+        if trace {
+            eprintln!(
+                "[RECEIVE_HLE] populated cmd={} type={:?}",
+                context.get_command(),
+                context.get_command_type()
+            );
+        }
         Ok((context, manager, request_message_address))
+    }
+
+    /// Rust inline-dispatch helper.
+    ///
+    /// Upstream never consumes a just-enqueued sync request on the caller's
+    /// thread: `KClientSession::SendSyncRequest` parks the client and the
+    /// owning `ServerManager` receives the request. Ruzu's legacy inline
+    /// fallback is intentionally non-upstream, but it must not expose the
+    /// request to the host `ServerManager` and then consume it itself. Doing so
+    /// lets two dispatch paths race on the same session, which can leave an old
+    /// SFCO reply in TLS to be parsed as a fresh request. Push the request
+    /// without `NotifyAvailable`, then receive it immediately while the caller
+    /// still holds the `KServerSession` mutex.
+    pub fn receive_inline_request_hle(
+        &mut self,
+        request: Arc<Mutex<KSessionRequest>>,
+        manager: Arc<Mutex<SessionRequestManager>>,
+    ) -> Result<(HLERequestContext, Arc<Mutex<SessionRequestManager>>, u64), u32> {
+        if self.client_closed {
+            return Err(RESULT_SESSION_CLOSED.get_inner_value());
+        }
+        if self.current_request.is_some() {
+            return Err(RESULT_NOT_FOUND.get_inner_value());
+        }
+        self.request_list.push_back(request);
+        self.receive_request_hle(manager)
     }
 
     /// HLE convenience wrapper matching upstream `ReceiveRequestHLE()`.
@@ -1962,9 +2210,38 @@ impl KServerSession {
         let Some(object_id) = self.parent_id else {
             return false;
         };
-        unsafe {
-            k_synchronization_object::notify_waiters_on_state(&self.sync_object, object_id, result)
+        if common::trace::is_enabled(common::trace::cat::HOST_THREAD_IPC) {
+            common::trace::emit_raw(common::trace::cat::HOST_THREAD_IPC, &[27, object_id]);
         }
+        let woke_any = unsafe {
+            k_synchronization_object::notify_waiters_on_state(&self.sync_object, object_id, result)
+        };
+        if common::trace::is_enabled(common::trace::cat::HOST_THREAD_IPC) {
+            common::trace::emit_raw(common::trace::cat::HOST_THREAD_IPC, &[28, object_id]);
+        }
+        // Reactively wake the owning ServerManager's host thread. Upstream
+        // doesn't need this because `MultiWait::WaitAny` becomes a real kernel
+        // wait on the host thread, and `notify_waiters_on_state` walks that
+        // waiter list. Ruzu's host service threads use a Condvar-based wait
+        // and aren't on the synchronization object's waiter list — so without
+        // this signal, the service thread stays asleep for up to its 100 ms
+        // idle timeout before noticing `is_signaled()` flipped.
+        if let Some(weak) = self.manager_wakeup.as_ref() {
+            if common::trace::is_enabled(common::trace::cat::HOST_THREAD_IPC) {
+                common::trace::emit_raw(common::trace::cat::HOST_THREAD_IPC, &[29, object_id]);
+            }
+            if let Some(event) = weak.upgrade() {
+                if common::trace::is_enabled(common::trace::cat::HOST_THREAD_IPC) {
+                    common::trace::emit_raw(common::trace::cat::HOST_THREAD_IPC, &[30, object_id]);
+                    common::trace::emit_raw(common::trace::cat::HOST_THREAD_IPC, &[31, object_id]);
+                }
+                event.signal_host_only();
+                if common::trace::is_enabled(common::trace::cat::HOST_THREAD_IPC) {
+                    common::trace::emit_raw(common::trace::cat::HOST_THREAD_IPC, &[32, object_id]);
+                }
+            }
+        }
+        woke_any
     }
 
     /// Destroy the server session.
@@ -2284,6 +2561,65 @@ mod tests {
             crate::hle::ipc::CommandType::Request as u32
         );
         assert_eq!(context.command_buffer()[6], 0x1111_2222);
+    }
+
+    #[test]
+    fn receive_inline_request_hle_consumes_without_pending_signal_window() {
+        let mut system = crate::core::System::new_for_test();
+        let mut process = crate::hle::kernel::k_process::KProcess::new();
+        process.process_id = 9;
+        process.initialize_handle_table();
+        process.create_memory(&system);
+        process.allocate_code_memory(0x200000, 0x40000);
+        let process = Arc::new(ProcessLock::from_value(process));
+
+        let thread = Arc::new(KThreadLock::new(
+            crate::hle::kernel::k_thread::KThread::new(),
+        ));
+        {
+            let mut thread_guard = thread.lock().unwrap();
+            thread_guard.thread_id = 7;
+            thread_guard.object_id = 8;
+            thread_guard.parent = Some(Arc::downgrade(&process));
+            thread_guard.tls_address =
+                crate::hle::kernel::k_typed_address::KProcessAddress::new(0x2395000);
+        }
+        process
+            .lock()
+            .unwrap()
+            .register_thread_object(Arc::clone(&thread));
+
+        system.set_current_process_arc(Arc::clone(&process));
+
+        let mut request_words = [0u32; crate::hle::ipc::COMMAND_BUFFER_LENGTH];
+        request_words[0] = crate::hle::ipc::CommandType::Request as u32;
+        request_words[1] = 4;
+        request_words[4] = 0x4943_4653;
+        request_words[6] = 0x5555_6666;
+        let request_bytes: Vec<u8> = request_words
+            .iter()
+            .flat_map(|word| word.to_le_bytes())
+            .collect();
+        process
+            .lock()
+            .unwrap()
+            .write_block(0x2395400, &request_bytes);
+
+        let mut request = KSessionRequest::new();
+        request.initialize_with_process(&process.lock().unwrap(), None, 0x2395400, 0);
+        let request = Arc::new(Mutex::new(request));
+
+        let mut server = KServerSession::new();
+        server.initialize(0x1000);
+        let manager = Arc::new(Mutex::new(SessionRequestManager::new()));
+        let (context, _, request_message_address) = server
+            .receive_inline_request_hle(request, Arc::clone(&manager))
+            .unwrap();
+
+        assert_eq!(request_message_address, 0x2395400);
+        assert_eq!(context.command_buffer()[6], 0x5555_6666);
+        assert!(server.request_list.is_empty());
+        assert!(server.current_request.is_some());
     }
 
     #[test]

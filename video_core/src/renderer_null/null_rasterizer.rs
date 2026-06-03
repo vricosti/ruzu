@@ -123,7 +123,7 @@ impl RasterizerInterface for RasterizerNull {
 
     fn draw(
         &mut self,
-        _draw_state: &crate::engines::draw_manager::DrawState,
+        _draw_view: crate::engines::draw_manager::Maxwell3DDrawView<'_>,
         _instance_count: u32,
     ) {
         trace!("RasterizerNull::draw (no-op)");
@@ -133,7 +133,11 @@ impl RasterizerInterface for RasterizerNull {
         trace!("RasterizerNull::draw_texture (no-op)");
     }
 
-    fn clear(&mut self, _draw_state: &crate::engines::draw_manager::DrawState, _layer_count: u32) {
+    fn clear(
+        &mut self,
+        _clear_view: crate::engines::draw_manager::Maxwell3DClearView<'_>,
+        _layer_count: u32,
+    ) {
         trace!("RasterizerNull::clear (no-op)");
     }
 
@@ -327,10 +331,16 @@ mod tests {
         let mut rast = RasterizerNull::new(sp);
 
         let ds = crate::engines::draw_manager::DrawState::default();
-        rast.draw(&ds, 1);
-        rast.draw(&ds, 4);
+        rast.draw(crate::engines::draw_manager::Maxwell3DDrawView::new(&ds), 1);
+        rast.draw(crate::engines::draw_manager::Maxwell3DDrawView::new(&ds), 4);
         rast.draw_texture();
-        rast.clear(&crate::engines::draw_manager::DrawState::default(), 1);
+        rast.clear(
+            crate::engines::draw_manager::Maxwell3DClearView::new(
+                crate::engines::draw_manager::ClearState::default(),
+                crate::engines::draw_manager::Maxwell3DRenderTargets::default(),
+            ),
+            1,
+        );
         rast.dispatch_compute();
         rast.flush_all();
         rast.wait_for_idle();
@@ -474,8 +484,14 @@ mod tests {
 
         // Should work through the trait object
         let ds = crate::engines::draw_manager::DrawState::default();
-        rast.draw(&ds, 1);
-        rast.clear(&crate::engines::draw_manager::DrawState::default(), 1);
+        rast.draw(crate::engines::draw_manager::Maxwell3DDrawView::new(&ds), 1);
+        rast.clear(
+            crate::engines::draw_manager::Maxwell3DClearView::new(
+                crate::engines::draw_manager::ClearState::default(),
+                crate::engines::draw_manager::Maxwell3DRenderTargets::default(),
+            ),
+            1,
+        );
         rast.flush_all();
         rast.tick_frame();
     }

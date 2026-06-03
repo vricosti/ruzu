@@ -524,6 +524,18 @@ pub trait BufferCacheRuntime {
     /// to each stage-local uniform binding index.
     fn set_base_uniform_bindings(&mut self, _bindings: &[u32; NUM_STAGES as usize]) {}
 
+    /// Set per-stage base storage binding points.
+    ///
+    /// Upstream OpenGL stores this on `BufferCacheRuntime` and adds the base
+    /// to each stage-local storage binding index.
+    fn set_base_storage_bindings(&mut self, _bindings: &[u32; NUM_STAGES as usize]) {}
+
+    /// Select GL SSBO binding mode for graphics/compute storage buffers.
+    ///
+    /// Upstream OpenGL uses real `GL_SHADER_STORAGE_BUFFER` bindings for GLSL
+    /// and bindless program-local parameters for GLASM when necessary.
+    fn set_enable_storage_buffers(&mut self, _enable: bool) {}
+
     // -- Storage buffer binding (graphics) --
 
     /// Bind a graphics-stage storage buffer.
@@ -535,6 +547,7 @@ pub trait BufferCacheRuntime {
         stage: usize,
         binding_index: u32,
         buffer: BufferId,
+        gpu_handle: u32,
         offset: u32,
         size: u32,
         is_written: bool,
@@ -579,6 +592,7 @@ pub trait BufferCacheRuntime {
         &mut self,
         binding_index: u32,
         buffer: BufferId,
+        gpu_handle: u32,
         offset: u32,
         size: u32,
         is_written: bool,

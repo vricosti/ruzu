@@ -191,6 +191,43 @@ impl NvHostCtrl {
         }
     }
 
+    fn trace_event_wait_record(
+        stage: u64,
+        params: &IocCtrlEventWaitParams,
+        is_allocation: bool,
+        slot: u32,
+        result: NvResult,
+        min_value: u32,
+        target: u32,
+    ) {
+        if !common::trace::is_enabled(common::trace::cat::NVHOST_CTRL_WAIT) {
+            return;
+        }
+
+        let result_id = match result {
+            NvResult::Success => 0,
+            NvResult::Timeout => 1,
+            NvResult::BadParameter => 2,
+            NvResult::Busy => 3,
+            _ => 0xFFFF,
+        };
+        common::trace::emit_raw(
+            common::trace::cat::NVHOST_CTRL_WAIT,
+            &[
+                stage,
+                params.fence.id as u32 as u64,
+                params.fence.value as u64,
+                params.timeout as u64,
+                u64::from(is_allocation),
+                slot as u64,
+                params.value.raw as u64,
+                result_id,
+                min_value as u64,
+                target as u64,
+            ],
+        );
+    }
+
     fn bytes_to_cstr(bytes: &[u8]) -> String {
         let len = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
         String::from_utf8_lossy(&bytes[..len]).into_owned()
@@ -358,6 +395,7 @@ impl NvHostCtrl {
                 params.value.raw
             );
         }
+        Self::trace_event_wait_record(1, params, is_allocation, u32::MAX, NvResult::Timeout, 0, 0);
         log::debug!(
             "nvhost_ctrl::IocCtrlEventWait syncpt_id={}, threshold={}, timeout={}, is_allocation={}",
             params.fence.id,
@@ -368,8 +406,24 @@ impl NvHostCtrl {
 
         let fence_id = params.fence.id as u32;
         let existing_event_id = params.value.raw;
+        let reset_non_allocation_fails = |this: &Self| {
+            if !is_allocation && existing_event_id < MAX_NV_EVENTS {
+                let mut events = this.events.lock().unwrap();
+                events[existing_event_id as usize].fails = 0;
+            }
+        };
 
         if fence_id >= MAX_SYNC_POINTS {
+            reset_non_allocation_fails(self);
+            Self::trace_event_wait_record(
+                9,
+                params,
+                is_allocation,
+                u32::MAX,
+                NvResult::BadParameter,
+                0,
+                params.fence.value,
+            );
             return NvResult::BadParameter;
         }
 
@@ -389,6 +443,16 @@ impl NvHostCtrl {
                     params.value.raw
                 );
             }
+            Self::trace_event_wait_record(
+                2,
+                params,
+                is_allocation,
+                u32::MAX,
+                NvResult::Success,
+                params.value.raw,
+                params.fence.value,
+            );
+            reset_non_allocation_fails(self);
             return NvResult::Success;
         }
 
@@ -401,6 +465,16 @@ impl NvHostCtrl {
                     params.value.raw
                 );
             }
+            Self::trace_event_wait_record(
+                3,
+                params,
+                is_allocation,
+                u32::MAX,
+                NvResult::Success,
+                params.value.raw,
+                params.fence.value,
+            );
+            reset_non_allocation_fails(self);
             return NvResult::Success;
         }
 
@@ -414,6 +488,16 @@ impl NvHostCtrl {
                     params.value.raw
                 );
             }
+            Self::trace_event_wait_record(
+                4,
+                params,
+                is_allocation,
+                u32::MAX,
+                NvResult::Success,
+                new_value,
+                params.fence.value,
+            );
+            reset_non_allocation_fails(self);
             return NvResult::Success;
         }
 
@@ -430,6 +514,15 @@ impl NvHostCtrl {
             let target_value = params.fence.value;
 
             if slot >= MAX_NV_EVENTS {
+                Self::trace_event_wait_record(
+                    9,
+                    params,
+                    is_allocation,
+                    slot,
+                    NvResult::BadParameter,
+                    new_value,
+                    target_value,
+                );
                 return NvResult::BadParameter;
             }
 
@@ -447,6 +540,15 @@ impl NvHostCtrl {
                             params.value.raw
                         );
                     }
+                    Self::trace_event_wait_record(
+                        5,
+                        params,
+                        is_allocation,
+                        slot,
+                        NvResult::Success,
+                        params.value.raw,
+                        target_value,
+                    );
                     NvResult::Success
                 } else {
                     if Self::should_trace_event_wait() {
@@ -457,13 +559,40 @@ impl NvHostCtrl {
                             target_value
                         );
                     }
+                    Self::trace_event_wait_record(
+                        6,
+                        params,
+                        is_allocation,
+                        slot,
+                        NvResult::Timeout,
+                        new_value,
+                        target_value,
+                    );
                     NvResult::Timeout
                 }
             } else {
                 if !events[slot as usize].registered {
+                    Self::trace_event_wait_record(
+                        9,
+                        params,
+                        is_allocation,
+                        slot,
+                        NvResult::BadParameter,
+                        new_value,
+                        target_value,
+                    );
                     return NvResult::BadParameter;
                 }
                 if events[slot as usize].is_being_used() {
+                    Self::trace_event_wait_record(
+                        10,
+                        params,
+                        is_allocation,
+                        slot,
+                        NvResult::Busy,
+                        new_value,
+                        target_value,
+                    );
                     return NvResult::BadParameter;
                 }
 
@@ -480,6 +609,15 @@ impl NvHostCtrl {
                             params.value.raw
                         );
                     }
+                    Self::trace_event_wait_record(
+                        7,
+                        params,
+                        is_allocation,
+                        slot,
+                        NvResult::Success,
+                        params.value.raw,
+                        target_value,
+                    );
                     NvResult::Success
                 } else {
                     let event = &mut events[slot as usize];
@@ -530,6 +668,16 @@ impl NvHostCtrl {
                             params.value.raw
                         );
                     }
+
+                    Self::trace_event_wait_record(
+                        8,
+                        params,
+                        is_allocation,
+                        slot,
+                        NvResult::Timeout,
+                        new_value,
+                        target_value,
+                    );
 
                     NvResult::Timeout
                 }
@@ -736,6 +884,49 @@ mod tests {
             let mut events = ctrl.events.lock().unwrap();
             events[2].fails = 3;
         }
+
+        let mut params = IocCtrlEventWaitParams {
+            fence: NvFence {
+                id: fence_id as i32,
+                value: 5,
+            },
+            timeout: 1,
+            value: super::SyncpointEventValue { raw: 2 },
+        };
+
+        let result = ctrl.ioc_ctrl_event_wait(&mut params, false);
+
+        assert_eq!(result, NvResult::Success);
+        assert_eq!(params.value.raw, 5);
+        {
+            let events = ctrl.events.lock().unwrap();
+            assert_eq!(events[2].fails, 0);
+        }
+
+        std::mem::forget(system);
+    }
+
+    #[test]
+    fn event_wait_non_allocation_immediate_success_resets_fails() {
+        let system = System::new_for_test();
+        let events = Arc::new(EventInterface::new(SystemRef::from_ref(&system)));
+        let syncpoints = SyncpointManager::new();
+        let ctrl = NvHostCtrl::new(events, &syncpoints);
+        let fence_id = syncpoints.allocate_syncpoint(false);
+
+        let mut register = IocCtrlEventRegisterParams { user_event_id: 2 };
+        assert_eq!(
+            ctrl.ioc_ctrl_event_register(&mut register),
+            NvResult::Success
+        );
+
+        {
+            let mut events = ctrl.events.lock().unwrap();
+            events[2].fails = 2;
+        }
+
+        syncpoints.increment_syncpoint_max_ext(fence_id, 5);
+        syncpoints.signal_syncpoint(fence_id);
 
         let mut params = IocCtrlEventWaitParams {
             fence: NvFence {

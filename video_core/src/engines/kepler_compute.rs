@@ -15,7 +15,7 @@ use parking_lot::Mutex;
 use super::engine_interface::{EngineInterface, EngineInterfaceState};
 use super::{ClassId, Engine, PendingWrite, ENGINE_REG_COUNT};
 use crate::memory_manager::MemoryManager;
-use crate::rasterizer_interface::RasterizerInterface;
+use crate::rasterizer_interface::{RasterizerHandle, RasterizerInterface};
 
 // ── Register offset constants (method addresses) ────────────────────────────
 
@@ -164,7 +164,7 @@ pub struct KeplerCompute {
     dispatch_calls: Vec<DispatchCall>,
     /// QMD GPU VA set on LAUNCH write, consumed by execute_pending.
     pending_launch: Option<u64>,
-    rasterizer: Option<[usize; 2]>,
+    rasterizer: Option<RasterizerHandle>,
 }
 
 impl KeplerCompute {
@@ -217,9 +217,7 @@ impl KeplerCompute {
 
     /// Corresponds to `KeplerCompute::BindRasterizer`.
     pub fn bind_rasterizer(&mut self, rasterizer: &dyn RasterizerInterface) {
-        self.rasterizer = Some(unsafe {
-            std::mem::transmute::<*const dyn RasterizerInterface, [usize; 2]>(rasterizer)
-        });
+        self.rasterizer = Some(RasterizerHandle::from_ref(rasterizer));
     }
 
     // ── Register accessors ──────────────────────────────────────────────

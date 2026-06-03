@@ -36,6 +36,27 @@ use super::commands::{
     ReverbCommand, UpsampleCommand, VolumeCommand, VolumeRampCommand,
 };
 
+#[derive(Clone, Copy)]
+struct VoiceStateAddresses {
+    voice_state: CpuAddr,
+    previous_samples: CpuAddr,
+    biquad_states: [CpuAddr; MAX_BIQUAD_FILTERS as usize],
+}
+
+impl VoiceStateAddresses {
+    fn from_state(state: &crate::renderer::voice::VoiceState) -> Self {
+        let mut biquad_states = [0; MAX_BIQUAD_FILTERS as usize];
+        for (index, target) in biquad_states.iter_mut().enumerate() {
+            *target = state.biquad_states[index].as_ptr() as CpuAddr;
+        }
+        Self {
+            voice_state: state as *const _ as CpuAddr,
+            previous_samples: state.previous_samples.as_ptr() as CpuAddr,
+            biquad_states,
+        }
+    }
+}
+
 pub struct CommandGenerator<'a> {
     command_buffer: &'a mut CommandBuffer,
     command_list_header: &'a mut CommandListHeader,
@@ -177,6 +198,21 @@ impl<'a> CommandGenerator<'a> {
     pub fn generate_voice_commands(&mut self) {
         self.voice_context.sort_info();
         let sorted_indices = self.voice_context.sorted_voice_indices().to_vec();
+        let trace_voice_ring = common::trace::is_enabled(common::trace::cat::AUDIO_VOICE);
+        let mut trace_in_use = 0u64;
+        let mut trace_skipped = 0u64;
+        if trace_voice_ring {
+            for &voice_index in &sorted_indices {
+                if let Some(voice) = self.voice_context.get_info(voice_index as u32) {
+                    if voice.in_use {
+                        trace_in_use += 1;
+                        if voice.should_skip() {
+                            trace_skipped += 1;
+                        }
+                    }
+                }
+            }
+        }
         if std::env::var_os("RUZU_TRACE_CMDGEN").is_some() {
             use std::sync::atomic::{AtomicU64, Ordering};
             static COUNT: AtomicU64 = AtomicU64::new(0);
@@ -202,17 +238,35 @@ impl<'a> CommandGenerator<'a> {
             }
         }
 
+        let mut trace_processed_voices = 0u64;
+        let mut trace_processed_channels = 0u64;
+        let mut trace_data_pushed = 0u64;
+        let mut trace_data_skip_was_playing = 0u64;
+        let mut trace_no_state = 0u64;
+        let mut trace_no_command = 0u64;
+        let mut trace_connected_channels = 0u64;
+        let mut trace_valid_wavebuffers = 0u64;
+        let mut trace_nonzero_wavebuffer_addr = 0u64;
+
         for voice_index in sorted_indices {
-            let Some(voice) = self
+            if self
+                .voice_context
+                .get_info(voice_index as u32)
+                .is_none_or(|voice| voice.should_skip())
+            {
+                continue;
+            }
+            let Some(mut voice) = self
                 .voice_context
                 .update_info_for_command_generation(voice_index)
             else {
                 continue;
             };
 
-            if !voice.in_use || voice.should_skip() {
+            if !voice.in_use {
                 continue;
             }
+            trace_processed_voices += u64::from(trace_voice_ring);
 
             let node_id = voice.node_id;
             let entry_aspect =
@@ -226,52 +280,49 @@ impl<'a> CommandGenerator<'a> {
                 | SampleFormat::PcmInt24
                 | SampleFormat::PcmInt32 => PerformanceDetailType::Invalid,
             };
-            let data_detail = self.begin_performance_detail(
-                node_id as i32,
-                PerformanceEntryType::Voice,
-                data_detail_type,
-            );
             for channel in 0..voice.channel_count.max(0) as usize {
+                trace_processed_channels += u64::from(trace_voice_ring);
+                if trace_voice_ring {
+                    if voice.has_any_connection() {
+                        trace_connected_channels += 1;
+                    }
+                    for wavebuffer in &voice.wavebuffers {
+                        if wavebuffer.sent_to_dsp {
+                            trace_valid_wavebuffers += 1;
+                        }
+                        if wavebuffer.buffer_address.get_cpu_addr() != 0 {
+                            trace_nonzero_wavebuffer_addr += 1;
+                        }
+                    }
+                }
                 let Some(resource_id) = voice.channel_resource_ids.get(channel).copied() else {
                     continue;
                 };
-                let dsp_state = self.voice_context.get_dsp_shared_state_ref(resource_id);
-                if dsp_state.is_none() && std::env::var_os("RUZU_TRACE_CMDGEN").is_some() {
+                let voice_state = self
+                    .voice_context
+                    .get_dsp_shared_state_ref(resource_id)
+                    .map(VoiceStateAddresses::from_state);
+                if voice_state.is_none() && std::env::var_os("RUZU_TRACE_CMDGEN").is_some() {
                     log::warn!(
                         "build_data_source: NO dsp_shared_state for resource_id={}",
                         resource_id
                     );
                 }
-                let Some((depop_commands, data_command, voice_state)) = dsp_state
-                    .and_then(|voice_state_ref| {
-                        // Upstream zuyu passes `render_context.mix_buffer_count`
-                        // (the count of MIX buffers, not the total buffer_count
-                        // which also includes voice_channels). Voice scratch
-                        // slots live at indices [mix_buffer_count..buffer_count].
-                        // Passing the larger buffer_count produced output_index
-                        // values past the end of mix_buffers, causing
-                        // mix_buffer_range to bail and decode_from_wave_buffers
-                        // to never run. See voice_info.cpp::GenerateAdpcmVersion1Command call.
-                        let data_command = self.build_data_source_command(
-                            &voice,
-                            voice_state_ref,
-                            channel as i8,
-                            self.mix_buffer_count,
-                        );
-                        if data_command.is_none() && std::env::var_os("RUZU_TRACE_CMDGEN").is_some() {
-                            log::warn!(
-                                "build_data_source: NO data_command for voice node_id={} channel={} sample_format={:?}",
-                                voice.node_id, channel, voice.sample_format
-                            );
-                        }
-                        let data_command = data_command?;
-                        let depop_commands =
-                            self.build_voice_depop_prepare_commands(&voice, voice_state_ref);
-                        Some((depop_commands, data_command, *voice_state_ref))
-                    })
-                else {
+                let data_detail = self.begin_performance_detail(
+                    node_id as i32,
+                    PerformanceEntryType::Voice,
+                    data_detail_type,
+                );
+                let Some(voice_state) = voice_state else {
+                    trace_no_state += u64::from(trace_voice_ring);
+                    if let Some(addresses) = data_detail {
+                        self.end_performance(node_id as i32, addresses);
+                    }
                     continue;
                 };
+                let voice_state_addresses = voice_state;
+                let depop_commands =
+                    self.build_voice_depop_prepare_commands(&voice, &voice_state_addresses);
                 if std::env::var_os("RUZU_TRACE_CMDGEN").is_some() {
                     use std::sync::atomic::{AtomicU64, Ordering};
                     static SEEN: AtomicU64 = AtomicU64::new(0);
@@ -290,8 +341,50 @@ impl<'a> CommandGenerator<'a> {
                         enabled,
                     );
                 }
-                if !voice.was_playing {
+                if voice.was_playing {
+                    trace_data_skip_was_playing += u64::from(trace_voice_ring);
+                    if std::env::var_os("RUZU_TRACE_CMDGEN").is_some() {
+                        use std::sync::atomic::{AtomicU64, Ordering};
+                        static SKIP: AtomicU64 = AtomicU64::new(0);
+                        let n = SKIP.fetch_add(1, Ordering::Relaxed) + 1;
+                        if n <= 10 || n % 500 == 0 {
+                            log::info!(
+                                "data_source_SKIP #{} voice={} channel={} (was_playing=true)",
+                                n,
+                                voice.node_id,
+                                channel
+                            );
+                        }
+                    }
+                } else {
+                    // Upstream zuyu passes `render_context.mix_buffer_count`
+                    // (the count of MIX buffers, not the total buffer_count
+                    // which also includes voice_channels). Voice scratch
+                    // slots live at indices [mix_buffer_count..buffer_count].
+                    // Passing the larger buffer_count produced output_index
+                    // values past the end of mix_buffers, causing
+                    // mix_buffer_range to bail and decode_from_wave_buffers
+                    // to never run. See voice_info.cpp::GenerateAdpcmVersion1Command call.
+                    let Some(data_command) = self.build_data_source_command(
+                        &voice,
+                        voice_state_addresses.voice_state,
+                        channel as i8,
+                        self.mix_buffer_count,
+                    ) else {
+                        trace_no_command += u64::from(trace_voice_ring);
+                        if std::env::var_os("RUZU_TRACE_CMDGEN").is_some() {
+                            log::warn!(
+                                "build_data_source: NO data_command for voice node_id={} channel={} sample_format={:?}",
+                                voice.node_id, channel, voice.sample_format
+                            );
+                        }
+                        if let Some(addresses) = data_detail {
+                            self.end_performance(node_id as i32, addresses);
+                        }
+                        continue;
+                    };
                     let _ = self.command_buffer.push(data_command, node_id);
+                    trace_data_pushed += u64::from(trace_voice_ring);
                     if std::env::var_os("RUZU_TRACE_CMDGEN").is_some() {
                         use std::sync::atomic::{AtomicU64, Ordering};
                         static PUSHED: AtomicU64 = AtomicU64::new(0);
@@ -306,30 +399,31 @@ impl<'a> CommandGenerator<'a> {
                             );
                         }
                     }
-                } else if std::env::var_os("RUZU_TRACE_CMDGEN").is_some() {
-                    use std::sync::atomic::{AtomicU64, Ordering};
-                    static SKIP: AtomicU64 = AtomicU64::new(0);
-                    let n = SKIP.fetch_add(1, Ordering::Relaxed) + 1;
-                    if n <= 10 || n % 500 == 0 {
-                        log::info!(
-                            "data_source_SKIP #{} voice={} channel={} (was_playing=true)",
-                            n,
-                            voice.node_id,
-                            channel
-                        );
+                }
+                if let Some(addresses) = data_detail {
+                    self.end_performance(node_id as i32, addresses);
+                }
+
+                if voice.was_playing {
+                    voice.prev_volume = 0.0;
+                    if let Some(stored_voice) = self.voice_context.get_info_mut(voice_index as u32) {
+                        stored_voice.prev_volume = 0.0;
                     }
+                    continue;
                 }
 
                 if voice.has_any_connection() {
-                    if voice.was_playing {
-                        continue;
-                    }
                     let biquad_detail = self.begin_performance_detail(
                         node_id as i32,
                         PerformanceEntryType::Voice,
                         PerformanceDetailType::Unk4,
                     );
-                    self.push_voice_biquad_commands(&voice, &voice_state, channel as i8, node_id);
+                    self.push_voice_biquad_commands(
+                        &voice,
+                        &voice_state_addresses,
+                        channel as i8,
+                        node_id,
+                    );
                     if let Some(addresses) = biquad_detail {
                         self.end_performance(node_id as i32, addresses);
                     }
@@ -340,7 +434,7 @@ impl<'a> CommandGenerator<'a> {
                         PerformanceDetailType::Unk3,
                     );
                     let precision = Self::mix_precision(self.behavior);
-                    let input_output = self.command_list_header.buffer_count + channel as i16;
+                    let input_output = self.mix_buffer_count + channel as i16;
                     let _ = self.command_buffer.push(
                         Command::VolumeRamp(VolumeRampCommand {
                             precision,
@@ -351,6 +445,13 @@ impl<'a> CommandGenerator<'a> {
                         }),
                         node_id,
                     );
+                    if let Some(addresses) = volume_detail {
+                        self.end_performance(node_id as i32, addresses);
+                    }
+                    voice.prev_volume = voice.volume;
+                    if let Some(stored_voice) = self.voice_context.get_info_mut(voice_index as u32) {
+                        stored_voice.prev_volume = voice.volume;
+                    }
 
                     if voice.mix_id == UNUSED_MIX_ID {
                         if voice.splitter_id != UNUSED_SPLITTER_ID {
@@ -368,7 +469,7 @@ impl<'a> CommandGenerator<'a> {
                                         self.push_voice_mix_commands(
                                             destination.get_mix_volume_slice(),
                                             destination.get_mix_volume_prev_slice(),
-                                            &voice_state,
+                                            &voice_state_addresses,
                                             mix_info.buffer_offset,
                                             mix_info.buffer_count,
                                             input_output,
@@ -389,17 +490,25 @@ impl<'a> CommandGenerator<'a> {
                         }
                     } else if let Some(mix_info) = self.mix_context.get_info(voice.mix_id).cloned()
                     {
+                        let volume_mix_detail = self.begin_performance_detail(
+                            node_id as i32,
+                            PerformanceEntryType::Voice,
+                            PerformanceDetailType::Unk3,
+                        );
                         let Some(channel_resource) = self
                             .voice_context
                             .get_channel_resource_ref(resource_id)
                             .cloned()
                         else {
+                            if let Some(addresses) = volume_mix_detail {
+                                self.end_performance(node_id as i32, addresses);
+                            }
                             continue;
                         };
                         self.push_voice_mix_commands(
                             &channel_resource.mix_volumes,
                             &channel_resource.prev_mix_volumes,
-                            &voice_state,
+                            &voice_state_addresses,
                             mix_info.buffer_offset,
                             mix_info.buffer_count,
                             input_output,
@@ -411,31 +520,51 @@ impl<'a> CommandGenerator<'a> {
                             channel_resource_mut.prev_mix_volumes =
                                 channel_resource_mut.mix_volumes;
                         }
+                        if let Some(addresses) = volume_mix_detail {
+                            self.end_performance(node_id as i32, addresses);
+                        }
                     }
-                    if let Some(addresses) = volume_detail {
-                        self.end_performance(node_id as i32, addresses);
+                    voice.biquad_initialized = voice.biquads.map(|biquad| biquad.enabled);
+                    if let Some(stored_voice) = self.voice_context.get_info_mut(voice_index as u32) {
+                        stored_voice.biquad_initialized = voice.biquad_initialized;
                     }
                 }
-            }
-            if let Some(addresses) = data_detail {
-                self.end_performance(node_id as i32, addresses);
-            }
-
-            if let Some(stored_voice) = self.voice_context.get_info_mut(voice_index as u32) {
-                stored_voice.prev_volume = if voice.was_playing { 0.0 } else { voice.volume };
-                stored_voice.biquad_initialized = stored_voice.biquads.map(|biquad| biquad.enabled);
             }
 
             if let Some(addresses) = entry_aspect {
                 self.end_performance(node_id as i32, addresses);
             }
         }
+        if trace_voice_ring {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static AUDIO_VOICE_SEQ: AtomicU64 = AtomicU64::new(0);
+            let seq = AUDIO_VOICE_SEQ.fetch_add(1, Ordering::Relaxed) + 1;
+            common::trace::emit_raw(
+                common::trace::cat::AUDIO_VOICE,
+                &[
+                    seq,
+                    self.voice_context.get_count() as u64,
+                    trace_in_use,
+                    trace_skipped,
+                    self.voice_context.get_active_count() as u64,
+                    trace_processed_voices,
+                    trace_processed_channels,
+                    trace_data_pushed,
+                    trace_data_skip_was_playing,
+                    trace_no_state,
+                    trace_no_command,
+                    trace_connected_channels,
+                    trace_valid_wavebuffers,
+                    trace_nonzero_wavebuffer_addr,
+                ],
+            );
+        }
     }
 
     fn build_data_source_command(
         &self,
         voice: &crate::renderer::voice::VoiceInfo,
-        voice_state: &crate::renderer::voice::VoiceState,
+        voice_state_addr: CpuAddr,
         channel: i8,
         buffer_count: i16,
     ) -> Option<Command> {
@@ -460,8 +589,8 @@ impl<'a> CommandGenerator<'a> {
             channel_count: voice.channel_count,
             wave_buffers,
             voice_state: self.voice_state_pool.translate(
-                voice_state as *const _ as CpuAddr,
-                size_of_val(voice_state) as u64,
+                voice_state_addr,
+                std::mem::size_of::<crate::renderer::voice::VoiceState>() as u64,
             ),
             data_address: data_address.get_reference(true),
             data_size: voice.data_address.get_size(),
@@ -499,7 +628,7 @@ impl<'a> CommandGenerator<'a> {
     fn build_voice_depop_prepare_commands(
         &self,
         voice: &crate::renderer::voice::VoiceInfo,
-        voice_state: &crate::renderer::voice::VoiceState,
+        voice_state_addresses: &VoiceStateAddresses,
     ) -> Vec<(DepopPrepareCommand, bool)> {
         let mut commands = Vec::new();
         if voice.mix_id == UNUSED_MIX_ID {
@@ -517,7 +646,7 @@ impl<'a> CommandGenerator<'a> {
                     let mix_id = destination.get_mix_id();
                     if let Some(mix_info) = self.mix_context.get_info(mix_id).cloned() {
                         if let Some(command) = self.build_depop_prepare_command(
-                            &voice_state.previous_samples,
+                            voice_state_addresses.previous_samples,
                             mix_info.buffer_count,
                             mix_info.buffer_offset,
                             voice.was_playing,
@@ -533,7 +662,7 @@ impl<'a> CommandGenerator<'a> {
 
         if let Some(mix_info) = self.mix_context.get_info(voice.mix_id).cloned() {
             if let Some(command) = self.build_depop_prepare_command(
-                &voice_state.previous_samples,
+                voice_state_addresses.previous_samples,
                 mix_info.buffer_count,
                 mix_info.buffer_offset,
                 voice.was_playing,
@@ -546,7 +675,7 @@ impl<'a> CommandGenerator<'a> {
 
     fn build_depop_prepare_command(
         &self,
-        previous_samples: &[i32; MAX_MIX_BUFFERS as usize],
+        previous_samples_addr: CpuAddr,
         buffer_count: i16,
         buffer_offset: i16,
         enabled: bool,
@@ -560,8 +689,8 @@ impl<'a> CommandGenerator<'a> {
             DepopPrepareCommand {
                 inputs,
                 previous_samples: self.voice_state_pool.translate(
-                    previous_samples.as_ptr() as CpuAddr,
-                    size_of_val(previous_samples) as u64,
+                    previous_samples_addr,
+                    (MAX_MIX_BUFFERS as u64) * std::mem::size_of::<i32>() as u64,
                 ),
                 buffer_count,
                 depop_buffer: self.depop_buffer_pool.translate(
@@ -1010,7 +1139,7 @@ impl<'a> CommandGenerator<'a> {
         &mut self,
         mix_volumes: &[f32],
         prev_mix_volumes: &[f32],
-        voice_state: &crate::renderer::voice::VoiceState,
+        voice_state_addresses: &VoiceStateAddresses,
         output_index: i16,
         buffer_count: i16,
         input_index: i16,
@@ -1040,8 +1169,8 @@ impl<'a> CommandGenerator<'a> {
                     prev_volumes,
                     volumes,
                     previous_samples: self.voice_state_pool.translate(
-                        voice_state.previous_samples.as_ptr() as CpuAddr,
-                        size_of_val(&voice_state.previous_samples) as u64,
+                        voice_state_addresses.previous_samples,
+                        (MAX_MIX_BUFFERS as u64) * std::mem::size_of::<i32>() as u64,
                     ),
                 }),
                 node_id,
@@ -1066,7 +1195,8 @@ impl<'a> CommandGenerator<'a> {
                     prev_volume,
                     volume,
                     previous_sample: self.voice_state_pool.translate(
-                        &voice_state.previous_samples[i] as *const i32 as CpuAddr,
+                        voice_state_addresses.previous_samples
+                            + i * std::mem::size_of::<i32>(),
                         std::mem::size_of::<i32>() as u64,
                     ),
                 }),
@@ -1078,13 +1208,13 @@ impl<'a> CommandGenerator<'a> {
     fn push_voice_biquad_commands(
         &mut self,
         voice: &crate::renderer::voice::VoiceInfo,
-        voice_state: &crate::renderer::voice::VoiceState,
+        voice_state_addresses: &VoiceStateAddresses,
         channel: i8,
         node_id: u32,
     ) {
         let both_biquads_enabled = voice.biquads[0].enabled && voice.biquads[1].enabled;
         let use_float_processing = self.behavior.use_biquad_filter_float_processing();
-        let input_output = self.command_list_header.buffer_count + i16::from(channel);
+        let input_output = self.mix_buffer_count + i16::from(channel);
 
         if both_biquads_enabled
             && self.behavior.use_multi_tap_biquad_filter_processing()
@@ -1097,12 +1227,14 @@ impl<'a> CommandGenerator<'a> {
                     biquads: voice.biquads,
                     states: [
                         self.voice_state_pool.translate(
-                            voice_state.biquad_states[0].as_ptr() as CpuAddr,
-                            size_of_val(&voice_state.biquad_states[0]) as u64,
+                            voice_state_addresses.biquad_states[0],
+                            (MAX_BIQUAD_FILTERS as u64)
+                                * std::mem::size_of::<BiquadFilterState>() as u64,
                         ),
                         self.voice_state_pool.translate(
-                            voice_state.biquad_states[1].as_ptr() as CpuAddr,
-                            size_of_val(&voice_state.biquad_states[1]) as u64,
+                            voice_state_addresses.biquad_states[1],
+                            (MAX_BIQUAD_FILTERS as u64)
+                                * std::mem::size_of::<BiquadFilterState>() as u64,
                         ),
                     ],
                     needs_init: [!voice.biquad_initialized[0], !voice.biquad_initialized[1]],
@@ -1124,8 +1256,9 @@ impl<'a> CommandGenerator<'a> {
                     output: input_output,
                     biquad,
                     state: self.voice_state_pool.translate(
-                        voice_state.biquad_states[biquad_index].as_ptr() as CpuAddr,
-                        size_of_val(&voice_state.biquad_states[biquad_index]) as u64,
+                        voice_state_addresses.biquad_states[biquad_index],
+                        (MAX_BIQUAD_FILTERS as u64)
+                            * std::mem::size_of::<BiquadFilterState>() as u64,
                     ),
                     needs_init: !voice.biquad_initialized[biquad_index],
                     use_float_processing,

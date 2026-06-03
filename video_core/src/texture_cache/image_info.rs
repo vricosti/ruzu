@@ -9,6 +9,7 @@
 //! Fermi2D surface, DMA operand).
 
 use super::types::*;
+use crate::surface::{self, SurfaceType};
 
 // ── PixelFormat placeholder ────────────────────────────────────────────
 // Upstream lives in video_core/surface.h.  Until that module is ported we
@@ -116,12 +117,9 @@ impl ImageInfo {
     /// (image_info.cpp:28-125). Decodes format, tiling, MSAA, type and
     /// per-dimension sizes off `TicEntry`'s bitfield accessors.
     ///
-    /// `CalculateLayerStride` / `CalculateLayerSize` (`layer_stride` and
-    /// `maybe_unaligned_layer_stride` upstream) plus the rescale/downscale
-    /// thresholds still require the surface-helper port and are left as
-    /// zero / `false` until those land. `forced_flushed` / `dma_downloaded`
-    /// need `Settings::values.use_reactive_flushing` from common::settings
-    /// which is not wired here yet, so default to the pre-flushing branch.
+    /// `forced_flushed` / `dma_downloaded` need
+    /// `Settings::values.use_reactive_flushing` from common::settings, which
+    /// is not wired here yet, so default to the pre-flushing branch.
     pub fn from_tic_entry(config: &crate::textures::texture::TicEntry) -> Self {
         // `format_lookup_table::{ComponentType,TextureFormat}` are the placeholder
         // enums the lookup table is keyed on. They're a strict subset of the
@@ -147,9 +145,10 @@ impl ImageInfo {
             format, r_type, g_type, b_type, a_type, is_srgb,
         );
 
-        // MSAA still requires a NumSamples-from-mode helper; for now treat
-        // every texture as single-sampled.
-        info.num_samples = 1;
+        info.num_samples = super::samples_helper::num_samples(
+            super::samples_helper::MsaaMode::from_raw(config.msaa_mode())
+                .unwrap_or(super::samples_helper::MsaaMode::Msaa1x1),
+        ) as u32;
         info.resources.levels = (config.max_mip_level() + 1) as i32;
 
         // Tiling: pitch- or block-linear branch.
@@ -164,7 +163,7 @@ impl ImageInfo {
         }
 
         info.is_sparse = config.is_sparse() != 0;
-        info.tile_width_spacing = 0; // bit accessor not yet exposed on TicEntry
+        info.tile_width_spacing = config.tile_width_spacing();
 
         // TextureType → ImageType + size.
         let texture_type =
@@ -222,6 +221,23 @@ impl ImageInfo {
                 info.size.width = config.width();
                 info.resources.layers = 1;
             }
+        }
+
+        if info.num_samples > 1 {
+            let msaa_mode = super::samples_helper::MsaaMode::from_raw(config.msaa_mode())
+                .unwrap_or(super::samples_helper::MsaaMode::Msaa1x1);
+            info.size.width *= super::samples_helper::num_samples_x(msaa_mode) as u32;
+            info.size.height *= super::samples_helper::num_samples_y(msaa_mode) as u32;
+        }
+
+        if info.image_type != ImageType::Linear {
+            info.layer_stride = super::util::calculate_layer_stride(&info);
+            info.maybe_unaligned_layer_stride = super::util::calculate_layer_size(&info);
+            let block = info.block();
+            info.rescaleable &= block.depth == 0 && info.resources.levels == 1;
+            info.rescaleable &= info.size.height > RESCALE_HEIGHT_THRESHOLD
+                || surface::get_format_type(info.format) != SurfaceType::ColorTexture;
+            info.downscaleable = info.size.height > DOWNSCALE_HEIGHT_THRESHOLD;
         }
 
         info
@@ -305,8 +321,64 @@ impl ImageInfo {
     /// Construct from depth/stencil config.
     ///
     /// Port of `ImageInfo::ImageInfo(const Zeta&, const ZetaSize&, MsaaMode)`.
-    ///
-    /// Requires Maxwell3D register types not yet ported.
+    pub fn from_zeta_info(config: &crate::engines::maxwell_3d::ZetaInfo, msaa_mode: u32) -> Self {
+        let format = crate::surface::pixel_format_from_depth_format(config.format);
+        let is_pitch_linear = (config.tile_mode & (1 << 12)) != 0;
+        let dim_control_define_depth_size = (config.tile_mode & (1 << 16)) != 0;
+        let mut info = Self {
+            format,
+            image_type: ImageType::E2D,
+            resources: SubresourceExtent {
+                levels: 1,
+                layers: 1,
+            },
+            size: Extent3D {
+                width: config.width,
+                height: config.height,
+                depth: 1,
+            },
+            tiling: TilingMode::default(),
+            layer_stride: config.array_pitch.saturating_mul(4),
+            maybe_unaligned_layer_stride: config.array_pitch.saturating_mul(4),
+            num_samples: if msaa_mode == 0 { 1 } else { 1 },
+            tile_width_spacing: 0,
+            rescaleable: false,
+            downscaleable: false,
+            forced_flushed: is_pitch_linear,
+            dma_downloaded: is_pitch_linear,
+            is_sparse: false,
+        };
+
+        if is_pitch_linear {
+            info.image_type = ImageType::Linear;
+            info.tiling = TilingMode::PitchLinear(config.width * crate::surface::bytes_per_block(format));
+            return info;
+        }
+
+        info.tiling = TilingMode::BlockLinear(Extent3D {
+            width: config.tile_mode & 0xF,
+            height: (config.tile_mode >> 4) & 0xF,
+            depth: (config.tile_mode >> 8) & 0xF,
+        });
+        if dim_control_define_depth_size {
+            info.image_type = ImageType::E3D;
+            info.size.depth = config.depth & 0xFFFF;
+        } else {
+            info.image_type = ImageType::E2D;
+            let array_size_is_one = ((config.depth >> 16) & 1) != 0;
+            info.resources.layers = if array_size_is_one {
+                1
+            } else {
+                (config.depth & 0xFFFF).max(1) as i32
+            };
+            info.rescaleable = info.block().depth == 0;
+            info.downscaleable = info.size.height > DOWNSCALE_HEIGHT_THRESHOLD;
+        }
+
+        info
+    }
+
+    /// Compatibility stub for older Rust call sites.
     pub fn from_zeta(_zt: &(), _zt_size: &(), _msaa_mode: u32) -> Self {
         log::warn!("ImageInfo::from_zeta: Maxwell3D regs not yet ported — returning default");
         Self::default()
@@ -398,6 +470,7 @@ mod tests {
     use super::*;
     use crate::engines::maxwell_3d::RenderTargetInfo;
     use crate::surface::PixelFormat as SurfacePixelFormat;
+    use crate::textures::texture::{ComponentType, TextureFormat, TicEntry, TextureType};
 
     #[test]
     fn render_target_info_decodes_block_linear_layout() {
@@ -448,5 +521,37 @@ mod tests {
         assert_eq!(info.size.height, 16);
         assert!(info.forced_flushed);
         assert!(info.dma_downloaded);
+    }
+
+    #[test]
+    fn tic_entry_decodes_mips_msaa_and_layer_stride() {
+        let word0 = (TextureFormat::A8B8G8R8 as u32)
+            | ((ComponentType::Unorm as u32) << 7)
+            | ((ComponentType::Unorm as u32) << 10)
+            | ((ComponentType::Unorm as u32) << 13)
+            | ((ComponentType::Unorm as u32) << 16);
+        let word3 = (2 << 10) | (3 << 28);
+        let word4 = 63 | ((TextureType::Texture2D as u32) << 23);
+        let word5 = 31 | (1 << 31);
+        let word7 = 2 << 8;
+        let word2 = 3 << 21;
+        let tic = TicEntry {
+            raw: [
+                word0 as u64,
+                ((word3 as u64) << 32) | word2 as u64,
+                ((word5 as u64) << 32) | word4 as u64,
+                (word7 as u64) << 32,
+            ],
+        };
+
+        let info = ImageInfo::from_tic_entry(&tic);
+
+        assert_eq!(info.resources.levels, 4);
+        assert_eq!(info.num_samples, 4);
+        assert_eq!(info.tile_width_spacing, 2);
+        assert_eq!(info.size.width, 128);
+        assert_eq!(info.size.height, 64);
+        assert_ne!(info.layer_stride, 0);
+        assert_ne!(info.maybe_unaligned_layer_stride, 0);
     }
 }

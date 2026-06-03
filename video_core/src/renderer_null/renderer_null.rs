@@ -210,7 +210,9 @@ mod tests {
 
         // Should be able to access the rasterizer and call methods
         let ds = crate::engines::draw_manager::DrawState::default();
-        renderer.rasterizer_mut().draw(&ds, 1);
+        renderer
+            .rasterizer_mut()
+            .draw(crate::engines::draw_manager::Maxwell3DDrawView::new(&ds), 1);
         renderer.rasterizer_mut().flush_all();
         assert!(!renderer.rasterizer().must_flush_region(0, 0));
     }

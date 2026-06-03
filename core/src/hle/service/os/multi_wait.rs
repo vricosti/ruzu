@@ -104,8 +104,12 @@ impl MultiWait {
         timeout_ns: i64,
     ) -> Option<*mut MultiWaitHolder> {
         let trace_boot = Self::boot_trace_enabled();
+        let trace_wait = std::env::var_os("RUZU_TRACE_MULTI_WAIT").is_some();
         let holders = self.holders_snapshot();
         if holders.is_empty() {
+            if trace_wait {
+                eprintln!("[MULTI_WAIT] timeout={} holders=empty → None", timeout_ns);
+            }
             return None;
         }
 
@@ -162,19 +166,25 @@ impl MultiWait {
         };
 
         let mut object_ids = Vec::with_capacity(holders.len());
+        let mut kinds: Vec<&'static str> = if trace_wait { Vec::with_capacity(holders.len()) } else { Vec::new() };
         for holder in &holders {
             let Some(object_id) = (unsafe { &**holder }).object_id() else {
-                if trace_boot {
-                    log::info!(
-                        "MultiWait::timed_wait_impl: falling back local (holder missing object_id)"
+                if trace_boot || trace_wait {
+                    eprintln!(
+                        "[MULTI_WAIT] holders={} → falling back local (holder missing object_id)",
+                        holders.len()
                     );
                 }
                 return self.local_timed_wait(&holders, timeout_ns);
             };
+            if trace_wait {
+                kinds.push((unsafe { &**holder }).kind_name());
+            }
             object_ids.push(object_id);
         }
 
         let mut out_index = -1;
+        let object_ids_copy = if trace_wait { object_ids.clone() } else { Vec::new() };
         let result = k_synchronization_object::wait(
             &process,
             &current_thread,
@@ -183,6 +193,22 @@ impl MultiWait {
             object_ids,
             timeout_ns,
         );
+
+        if trace_wait {
+            let pairs: Vec<String> = object_ids_copy
+                .iter()
+                .zip(kinds.iter())
+                .map(|(id, k)| format!("{}:{}", k, id))
+                .collect();
+            eprintln!(
+                "[MULTI_WAIT] timeout={} holders={} ids=[{}] result=0x{:X} out_index={}",
+                timeout_ns,
+                holders.len(),
+                pairs.join(","),
+                result.get_inner_value(),
+                out_index
+            );
+        }
 
         if result == RESULT_SUCCESS && out_index >= 0 {
             holders.get(out_index as usize).copied()

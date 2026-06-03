@@ -66,6 +66,11 @@ impl CircularBufferSinkPayload {
         }
 
         // Write updated payload back to the command list (work buffer, host-mapped).
+        crate::raw_write_trace::maybe_trace_write_at(
+            "circular_buffer:payload",
+            payload_addr as usize,
+            std::mem::size_of::<CircularBufferSinkPayload>(),
+        );
         unsafe { std::ptr::write_unaligned(payload_addr as *mut CircularBufferSinkPayload, self) };
     }
 

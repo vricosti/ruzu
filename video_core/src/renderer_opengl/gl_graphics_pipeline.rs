@@ -6,6 +6,7 @@
 //! OpenGL graphics pipeline management -- compiles and configures vertex/fragment/etc shaders.
 
 use std::hash::{Hash, Hasher};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex};
 
 use crate::buffer_cache::buffer_cache_base::UniformBufferSizes;
@@ -28,6 +29,8 @@ pub const NUM_TRANSFORM_FEEDBACK_BUFFERS: usize = 4;
 /// Stride of each XFB attribute entry (token, count, attrib).
 pub const XFB_ENTRY_STRIDE: usize = 3;
 
+static GLSL_ERROR_DUMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
 /// Key used to identify a unique graphics pipeline configuration.
 ///
 /// Corresponds to `OpenGL::GraphicsPipelineKey`.
@@ -37,9 +40,10 @@ pub struct GraphicsPipelineKey {
     pub unique_hashes: [u64; 6],
     /// Packed bitfield: xfb_enabled(1), early_z(1), gs_input_topology(4),
     /// tessellation_primitive(2), tessellation_spacing(2), tessellation_clockwise(1),
-    /// app_stage(3).
+    /// app_stage(3), alpha_test_func(3).
     pub raw: u32,
-    pub padding: [u32; 3],
+    pub alpha_test_ref: u32,
+    pub padding: [u32; 2],
     pub xfb_state: TransformFeedbackState,
 }
 
@@ -51,6 +55,7 @@ impl GraphicsPipelineKey {
     const TESSELLATION_SPACING_SHIFT: u32 = 8;
     const TESSELLATION_CLOCKWISE_SHIFT: u32 = 10;
     const APP_STAGE_SHIFT: u32 = 11;
+    const ALPHA_TEST_FUNC_SHIFT: u32 = 14;
 
     const XFB_ENABLED_MASK: u32 = 0x1 << Self::XFB_ENABLED_SHIFT;
     const EARLY_Z_MASK: u32 = 0x1 << Self::EARLY_Z_SHIFT;
@@ -59,6 +64,7 @@ impl GraphicsPipelineKey {
     const TESSELLATION_SPACING_MASK: u32 = 0x3 << Self::TESSELLATION_SPACING_SHIFT;
     const TESSELLATION_CLOCKWISE_MASK: u32 = 0x1 << Self::TESSELLATION_CLOCKWISE_SHIFT;
     const APP_STAGE_MASK: u32 = 0x7 << Self::APP_STAGE_SHIFT;
+    const ALPHA_TEST_FUNC_MASK: u32 = 0x7 << Self::ALPHA_TEST_FUNC_SHIFT;
 
     /// Hash the key, considering only relevant bytes (smaller if xfb not enabled).
     pub fn hash_key(&self) -> u64 {
@@ -126,6 +132,15 @@ impl GraphicsPipelineKey {
     pub fn set_app_stage(&mut self, app_stage: u32) {
         self.raw =
             (self.raw & !Self::APP_STAGE_MASK) | ((app_stage & 0x7) << Self::APP_STAGE_SHIFT);
+    }
+
+    pub fn alpha_test_func(&self) -> u32 {
+        (self.raw & Self::ALPHA_TEST_FUNC_MASK) >> Self::ALPHA_TEST_FUNC_SHIFT
+    }
+
+    pub fn set_alpha_test_func(&mut self, func: u32) {
+        self.raw = (self.raw & !Self::ALPHA_TEST_FUNC_MASK)
+            | ((func & 0x7) << Self::ALPHA_TEST_FUNC_SHIFT);
     }
 
     /// Returns the effective size in bytes for hashing/comparison.
@@ -280,12 +295,16 @@ impl GraphicsPipeline {
         self.base_storage_bindings = [0; NUM_STAGES];
         self.num_texture_buffers = [0; NUM_STAGES];
         self.num_image_buffers = [0; NUM_STAGES];
+        self.use_storage_buffers = false;
+        self.writes_global_memory = false;
+        self.uses_local_memory = false;
 
         // Keep a per-stage `Info` clone so the rasterizer-side ConfigureImpl
         // can iterate `texture_descriptors[]` etc. at draw time. Upstream
         // stores these inside `GraphicsPipeline` as `stage_infos`.
         self.stage_infos = std::array::from_fn(|stage| infos[stage].clone());
 
+        let mut num_storage_buffers = 0u32;
         for stage in 0..NUM_STAGES {
             if let Some(info) = infos[stage].as_ref() {
                 self.enabled_stages_mask |= 1u32 << stage;
@@ -293,6 +312,12 @@ impl GraphicsPipeline {
                 self.uniform_buffer_sizes[stage].copy_from_slice(&info.constant_buffer_used_sizes);
                 self.num_texture_buffers[stage] = num_descriptors(&info.texture_buffer_descriptors);
                 self.num_image_buffers[stage] = num_descriptors(&info.image_buffer_descriptors);
+                num_storage_buffers += num_descriptors(&info.storage_buffers_descriptors);
+                self.writes_global_memory |= info
+                    .storage_buffers_descriptors
+                    .iter()
+                    .any(|desc| desc.is_written);
+                self.uses_local_memory |= info.uses_local_memory;
             }
 
             if stage < NUM_STAGES - 1 {
@@ -305,6 +330,14 @@ impl GraphicsPipeline {
                         num_descriptors(&info.storage_buffers_descriptors);
                 }
             }
+        }
+
+        // Ruzu currently emits GLSL, not GLASM, for graphics pipelines. Match
+        // upstream's non-assembly path by using real GL shader-storage-buffer
+        // bindings whenever storage descriptors exist.
+        self.use_storage_buffers = num_storage_buffers != 0;
+        if self.use_storage_buffers {
+            self.writes_global_memory = false;
         }
     }
 
@@ -425,6 +458,7 @@ impl GraphicsPipeline {
                     }
                 }
                 Err(msg) => {
+                    dump_glsl_on_error(self.key.hash_key(), stage_index, source, &msg);
                     // Roll back any handles we already created.
                     self.delete_gl_programs();
                     return Err((stage_index, msg));
@@ -444,6 +478,15 @@ impl GraphicsPipeline {
                 gl::UseProgramStages(self.program_pipeline, stage_bit(stage_index), prog);
             }
         }
+        if std::env::var_os("RUZU_TRACE_PIPELINE_BUILD").is_some() {
+            log::info!(
+                "[PIPELINE_BUILD] pipeline_key=0x{:016X} program_pipeline={} programs={:?}",
+                self.key.hash_key(),
+                self.program_pipeline,
+                self.source_programs,
+            );
+        }
+        dump_glsl_for_pipeline_handle(self.program_pipeline, self.key.hash_key(), &self.glsl_sources);
 
         Ok(())
     }
@@ -570,6 +613,107 @@ fn stage_name(stage_index: usize) -> &'static str {
         3 => "Geometry",
         4 => "Fragment",
         _ => "Unknown",
+    }
+}
+
+fn dump_glsl_on_error(pipeline_hash: u64, stage_index: usize, source: &str, error: &str) {
+    let Some(dir) = std::env::var_os("RUZU_DUMP_GLSL_ON_ERROR") else {
+        return;
+    };
+    let dir = std::path::PathBuf::from(dir);
+    if let Err(err) = std::fs::create_dir_all(&dir) {
+        log::warn!(
+            "Failed to create RUZU_DUMP_GLSL_ON_ERROR dir {}: {}",
+            dir.display(),
+            err
+        );
+        return;
+    }
+
+    let counter = GLSL_ERROR_DUMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let stage = stage_name(stage_index);
+    let stem = format!(
+        "{:04}_pipeline_{:016X}_stage_{}",
+        counter, pipeline_hash, stage
+    );
+    let source_path = dir.join(format!("{}.glsl", stem));
+    let log_path = dir.join(format!("{}.log", stem));
+
+    if let Err(err) = std::fs::write(&source_path, source) {
+        log::warn!("Failed to dump GLSL source {}: {}", source_path.display(), err);
+    }
+    let log = format!(
+        "pipeline_hash=0x{:016X}\nstage_index={}\nstage={}\nsource_bytes={}\n\n{}",
+        pipeline_hash,
+        stage_index,
+        stage,
+        source.len(),
+        error
+    );
+    if let Err(err) = std::fs::write(&log_path, log) {
+        log::warn!("Failed to dump GLSL error log {}: {}", log_path.display(), err);
+    }
+}
+
+fn should_dump_pipeline_handle(handle: u32) -> bool {
+    let Some(spec) = std::env::var_os("RUZU_DUMP_GLSL_PIPELINE_HANDLES") else {
+        return false;
+    };
+    let spec = spec.to_string_lossy();
+    spec.split(',').any(|raw| {
+        let value = raw.trim();
+        if value == "*" {
+            return true;
+        }
+        if let Some(hex) = value
+            .strip_prefix("0x")
+            .or_else(|| value.strip_prefix("0X"))
+        {
+            return u32::from_str_radix(hex, 16).is_ok_and(|target| target == handle);
+        }
+        value.parse::<u32>().is_ok_and(|target| target == handle)
+    })
+}
+
+fn dump_glsl_for_pipeline_handle(
+    handle: u32,
+    pipeline_hash: u64,
+    sources: &[Option<String>; NUM_STAGES],
+) {
+    if handle == 0 || !should_dump_pipeline_handle(handle) {
+        return;
+    }
+    let dir = std::env::var_os("RUZU_DUMP_GLSL_PIPELINE_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from("/tmp/ruzu_pipeline_glsl"));
+    if let Err(err) = std::fs::create_dir_all(&dir) {
+        log::warn!(
+            "Failed to create RUZU_DUMP_GLSL_PIPELINE_DIR {}: {}",
+            dir.display(),
+            err
+        );
+        return;
+    }
+    for (stage_index, source) in sources.iter().enumerate() {
+        let Some(source) = source else { continue };
+        if source.is_empty() {
+            continue;
+        }
+        let path = dir.join(format!(
+            "pipeline_{handle}_key_{pipeline_hash:016X}_stage_{}.glsl",
+            stage_name(stage_index)
+        ));
+        if let Err(err) = std::fs::write(&path, source) {
+            log::warn!("Failed to dump GLSL source {}: {}", path.display(), err);
+        } else {
+            log::info!(
+                "[GLSL_PIPELINE_DUMP] pipeline={} stage={} bytes={} path={}",
+                handle,
+                stage_name(stage_index),
+                source.len(),
+                path.display()
+            );
+        }
     }
 }
 
@@ -745,6 +889,19 @@ mod tests {
         key.raw = 0b11; // xfb_enabled=1, early_z=1
         assert!(key.xfb_enabled());
         assert!(key.early_z());
+    }
+
+    #[test]
+    fn pipeline_key_alpha_test_bits_are_hashed_without_xfb() {
+        let mut key = GraphicsPipelineKey::default();
+        let baseline = key.hash_key();
+
+        key.set_alpha_test_func(4);
+        key.alpha_test_ref = 0x3F00_0000;
+
+        assert_eq!(key.alpha_test_func(), 4);
+        assert_ne!(key.hash_key(), baseline);
+        assert!(key.size() >= std::mem::offset_of!(GraphicsPipelineKey, padding));
     }
 
     #[test]

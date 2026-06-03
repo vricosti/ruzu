@@ -25,17 +25,24 @@ pub struct IActiveVibrationDeviceList {
     handlers: BTreeMap<u32, FunctionInfo>,
     handlers_tipc: BTreeMap<u32, FunctionInfo>,
     resource_manager: Arc<parking_lot::Mutex<ResourceManager>>,
+    vibration_device_list:
+        parking_lot::Mutex<Vec<hid_core::hid_types::VibrationDeviceHandle>>,
 }
 
 impl IActiveVibrationDeviceList {
+    const MAX_VIBRATION_DEVICE_HANDLES: usize = 0x100;
+
+    fn as_self(this: &dyn ServiceFramework) -> &Self {
+        unsafe { &*(this as *const dyn ServiceFramework as *const Self) }
+    }
+
     /// Upstream: IActiveVibrationDeviceList::ActivateVibrationDevice
     ///
     /// Reads a VibrationDeviceHandle, validates it, and activates the vibration device
     /// via resource_manager. Upstream also tracks handles in a list for deduplication.
     ///
-    /// Note: resource_manager.GetVibrationDevice().Activate() is not yet ported,
-    /// so the actual device activation is skipped. Handle validation matches upstream.
-    fn activate_vibration_device(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn activate_vibration_device(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let service = Self::as_self(this);
         use crate::hle::service::ipc_helpers::RequestParser;
         use hid_core::hid_types::VibrationDeviceHandle;
         use hid_core::hid_util;
@@ -58,11 +65,35 @@ impl IActiveVibrationDeviceList {
             return;
         }
 
-        // Upstream: resource_manager->GetVibrationDevice(handle)->Activate()
-        // GetVibrationDevice is not yet ported; skip the actual activation.
+        let mut list = service.vibration_device_list.lock();
+        if list.iter().any(|entry| {
+            entry.device_index == vibration_device_handle.device_index
+                && entry.npad_id == vibration_device_handle.npad_id
+                && entry.npad_type == vibration_device_handle.npad_type
+        }) {
+            let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+            rb.push_result(RESULT_SUCCESS);
+            return;
+        }
+
+        if list.len() >= Self::MAX_VIBRATION_DEVICE_HANDLES {
+            let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+            rb.push_result(to_ipc_result(
+                hid_core::hid_result::RESULT_VIBRATION_DEVICE_INDEX_OUT_OF_RANGE,
+            ));
+            return;
+        }
+
+        let result = service
+            .resource_manager
+            .lock()
+            .activate_vibration_device(&vibration_device_handle);
+        if result.is_success() {
+            list.push(vibration_device_handle);
+        }
 
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
-        rb.push_result(RESULT_SUCCESS);
+        rb.push_result(to_ipc_result(result));
     }
 
     pub fn new(resource_manager: Arc<parking_lot::Mutex<ResourceManager>>) -> Self {
@@ -76,6 +107,7 @@ impl IActiveVibrationDeviceList {
             handlers,
             handlers_tipc: BTreeMap::new(),
             resource_manager,
+            vibration_device_list: parking_lot::Mutex::new(Vec::new()),
         }
     }
 }

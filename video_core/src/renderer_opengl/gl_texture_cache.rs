@@ -6,21 +6,26 @@
 //! OpenGL texture cache -- manages GPU texture and image objects, framebuffers, and samplers.
 
 use std::collections::HashMap;
+use std::sync::OnceLock;
 
+use crate::engines::draw_manager::Maxwell3DRenderTargets;
 use crate::engines::maxwell_3d::RenderTargetInfo;
 use crate::framebuffer_config::FramebufferConfig;
 use crate::renderer_base::GuestMemoryWriter;
 use crate::shader_environment::TextureType;
-use crate::surface::PixelFormat;
+use crate::surface::{PixelFormat, SurfaceType};
 use crate::texture_cache::image_base::{ImageBase, ImageFlagBits, ImageMapView};
 use crate::texture_cache::image_info::ImageInfo;
 use crate::texture_cache::image_view_base::{ImageViewBase, ImageViewFlagBits};
-use crate::texture_cache::image_view_info::ImageViewInfo;
+use crate::texture_cache::image_view_info::{ImageViewInfo, SwizzleSource};
+use crate::texture_cache::render_targets::RenderTargets;
+use crate::texture_cache::types::BufferImageCopy;
 use crate::texture_cache::texture_cache_base::{
     FramebufferImageView, TextureCacheBase as CommonTextureCache,
 };
 use crate::texture_cache::types::{
-    ImageId, ImageType, ImageViewId, ImageViewType, Offset2D, Region2D, SubresourceRange,
+    Extent2D, ImageId, ImageType, ImageViewId, ImageViewType, Offset2D, Region2D, SubresourceRange,
+    NULL_IMAGE_ID,
 };
 use crate::texture_cache::util::{
     full_download_copies, map_size_bytes, swizzle_image, unswizzle_image,
@@ -28,6 +33,85 @@ use crate::texture_cache::util::{
 
 /// Number of render targets.
 pub const NUM_RT: usize = 8;
+
+fn parse_u64_env_list(name: &str) -> Option<Vec<u64>> {
+    let spec = std::env::var(name).ok()?;
+    let spec = spec.trim();
+    if spec.is_empty() {
+        return None;
+    }
+    if spec == "*" {
+        return Some(Vec::new());
+    }
+    let targets = spec
+        .split(',')
+        .filter_map(|raw| {
+            let value = raw.trim();
+            if value.is_empty() {
+                return None;
+            }
+            if let Some(hex) = value
+                .strip_prefix("0x")
+                .or_else(|| value.strip_prefix("0X"))
+            {
+                u64::from_str_radix(hex, 16).ok()
+            } else {
+                value.parse::<u64>().ok()
+            }
+        })
+        .collect::<Vec<_>>();
+    (!targets.is_empty()).then_some(targets)
+}
+
+fn texture_upload_trace_targets() -> Option<&'static [u64]> {
+    static TARGETS: OnceLock<Option<Vec<u64>>> = OnceLock::new();
+    TARGETS
+        .get_or_init(|| parse_u64_env_list("RUZU_TRACE_TEXTURE_UPLOAD_ADDRS"))
+        .as_deref()
+}
+
+fn should_trace_texture_upload(gpu_addr: u64) -> bool {
+    if std::env::var_os("RUZU_TRACE_TEXTURE_UPLOAD").is_none() {
+        return false;
+    }
+    let Some(targets) = texture_upload_trace_targets() else {
+        return true;
+    };
+    targets.is_empty() || targets.contains(&gpu_addr)
+}
+
+fn should_dump_texture_upload(gpu_addr: u64) -> bool {
+    if std::env::var_os("RUZU_DUMP_TEXTURE_UPLOAD_DIR").is_none() {
+        return false;
+    }
+    let Some(targets) = texture_upload_trace_targets() else {
+        return false;
+    };
+    targets.is_empty() || targets.contains(&gpu_addr)
+}
+
+fn image_view_trace_targets() -> Option<&'static [u64]> {
+    static TARGETS: OnceLock<Option<Vec<u64>>> = OnceLock::new();
+    TARGETS
+        .get_or_init(|| parse_u64_env_list("RUZU_TRACE_IMAGE_VIEW_ADDRS"))
+        .as_deref()
+}
+
+fn should_trace_image_view_address(gpu_addr: u64) -> bool {
+    let Some(targets) = image_view_trace_targets() else {
+        return true;
+    };
+    targets.is_empty() || targets.contains(&gpu_addr)
+}
+
+fn framebuffer_attachment_type(format: PixelFormat) -> u32 {
+    match crate::surface::get_format_type(format) {
+        SurfaceType::Depth => gl::DEPTH_ATTACHMENT,
+        SurfaceType::Stencil => gl::STENCIL_ATTACHMENT,
+        SurfaceType::DepthStencil => gl::DEPTH_STENCIL_ATTACHMENT,
+        _ => gl::DEPTH_ATTACHMENT,
+    }
+}
 
 /// Number of texture types (1D, 2D, 2DRect, 3D, Cube, 1DArray, 2DArray, Buffer, CubeArray).
 const NUM_TEXTURE_TYPES: usize = 9;
@@ -301,6 +385,129 @@ fn image_view_target(view_type: TextureType, num_samples: i32) -> u32 {
     }
 }
 
+fn swizzle(source: SwizzleSource) -> i32 {
+    match source {
+        SwizzleSource::Zero => gl::ZERO as i32,
+        SwizzleSource::R => gl::RED as i32,
+        SwizzleSource::G => gl::GREEN as i32,
+        SwizzleSource::B => gl::BLUE as i32,
+        SwizzleSource::A => gl::ALPHA as i32,
+        SwizzleSource::OneInt | SwizzleSource::OneFloat => gl::ONE as i32,
+    }
+}
+
+fn pack_u8x4(values: [u8; 4]) -> u64 {
+    values[0] as u64
+        | ((values[1] as u64) << 8)
+        | ((values[2] as u64) << 16)
+        | ((values[3] as u64) << 24)
+}
+
+fn pack_i32x4(values: [i32; 4]) -> u64 {
+    (values[0] as u32 as u64)
+        | ((values[1] as u32 as u64) << 16)
+        | ((values[2] as u32 as u64) << 32)
+        | ((values[3] as u32 as u64) << 48)
+}
+
+fn convert_green_red(value: SwizzleSource) -> SwizzleSource {
+    match value {
+        SwizzleSource::G => SwizzleSource::R,
+        _ => value,
+    }
+}
+
+fn convert_a5b5g5r1_unorm(source: SwizzleSource) -> i32 {
+    match source {
+        SwizzleSource::Zero => gl::ZERO as i32,
+        SwizzleSource::R => gl::ALPHA as i32,
+        SwizzleSource::G => gl::BLUE as i32,
+        SwizzleSource::B => gl::GREEN as i32,
+        SwizzleSource::A => gl::RED as i32,
+        SwizzleSource::OneInt | SwizzleSource::OneFloat => gl::ONE as i32,
+    }
+}
+
+fn texture_mode(format: PixelFormat, swizzle: [SwizzleSource; 4]) -> u32 {
+    let any_r = swizzle.iter().any(|source| *source == SwizzleSource::R);
+    match format {
+        PixelFormat::D24UnormS8Uint | PixelFormat::D32FloatS8Uint => {
+            if any_r {
+                gl::DEPTH_COMPONENT
+            } else {
+                gl::STENCIL_INDEX
+            }
+        }
+        PixelFormat::S8UintD24Unorm => {
+            if any_r {
+                gl::STENCIL_INDEX
+            } else {
+                gl::DEPTH_COMPONENT
+            }
+        }
+        _ => gl::DEPTH_COMPONENT,
+    }
+}
+
+fn apply_swizzle(handle: u32, format: PixelFormat, mut source_swizzle: [SwizzleSource; 4]) {
+    unsafe {
+        match format {
+            PixelFormat::D24UnormS8Uint
+            | PixelFormat::D32FloatS8Uint
+            | PixelFormat::S8UintD24Unorm => {
+                gl::TextureParameteri(
+                    handle,
+                    gl::DEPTH_STENCIL_TEXTURE_MODE,
+                    texture_mode(format, source_swizzle) as i32,
+                );
+                source_swizzle = source_swizzle.map(convert_green_red);
+            }
+            PixelFormat::A5B5G5R1Unorm => {
+                let gl_swizzle = source_swizzle.map(convert_a5b5g5r1_unorm);
+                gl::TextureParameteriv(handle, gl::TEXTURE_SWIZZLE_RGBA, gl_swizzle.as_ptr());
+                return;
+            }
+            _ => {}
+        }
+        let gl_swizzle = source_swizzle.map(swizzle);
+        gl::TextureParameteriv(handle, gl::TEXTURE_SWIZZLE_RGBA, gl_swizzle.as_ptr());
+    }
+}
+
+fn gl_swizzle_for_trace(format: PixelFormat, mut source_swizzle: [SwizzleSource; 4]) -> [i32; 4] {
+    match format {
+        PixelFormat::D24UnormS8Uint | PixelFormat::D32FloatS8Uint | PixelFormat::S8UintD24Unorm => {
+            source_swizzle = source_swizzle.map(convert_green_red);
+        }
+        PixelFormat::A5B5G5R1Unorm => {
+            return source_swizzle.map(convert_a5b5g5r1_unorm);
+        }
+        _ => {}
+    }
+    source_swizzle.map(swizzle)
+}
+
+fn decode_swizzle(raw: [u8; 4]) -> Option<[SwizzleSource; 4]> {
+    fn decode(value: u8) -> Option<SwizzleSource> {
+        match value {
+            0 => Some(SwizzleSource::Zero),
+            2 => Some(SwizzleSource::R),
+            3 => Some(SwizzleSource::G),
+            4 => Some(SwizzleSource::B),
+            5 => Some(SwizzleSource::A),
+            6 => Some(SwizzleSource::OneInt),
+            7 => Some(SwizzleSource::OneFloat),
+            _ => None,
+        }
+    }
+    Some([
+        decode(raw[0])?,
+        decode(raw[1])?,
+        decode(raw[2])?,
+        decode(raw[3])?,
+    ])
+}
+
 /// Port of upstream `OpenGL::MakeImage` (gl_texture_cache.cpp:363-406).
 /// Allocates a GL texture sized to `info` via `glCreateTextures(target)` +
 /// `glTextureStorage{2,3}D(...)`. Returns the GL handle (0 if `target ==
@@ -449,14 +656,6 @@ impl Image {
 
         let target = image_target(&base.info);
         let texture = make_image(&base.info, tuple.internal_format, gl_num_levels, target);
-
-        if std::env::var_os("RUZU_FORCE_MAX_LEVEL_0").is_some() && texture != 0 {
-            unsafe {
-                let actual_levels = (gl_num_levels - 1).max(0);
-                gl::TextureParameteri(texture, gl::TEXTURE_BASE_LEVEL, 0);
-                gl::TextureParameteri(texture, gl::TEXTURE_MAX_LEVEL, actual_levels);
-            }
-        }
 
         if std::env::var_os("RUZU_TRACE_IMAGE_LIFECYCLE").is_some() {
             let mut sample = [0u8; 16];
@@ -810,6 +1009,9 @@ pub struct ImageView {
     pub default_handle: u32,
     pub internal_format: u32,
     pub buffer_size: u32,
+    image_id: ImageId,
+    format: PixelFormat,
+    swizzle: [u8; 4],
     original_texture: u32,
     num_samples: i32,
     flat_range: SubresourceRange,
@@ -821,6 +1023,7 @@ pub struct ImageView {
     /// descriptor's configured anisotropy (upstream
     /// gl_graphics_pipeline.cpp:490-493).
     supports_anisotropy: bool,
+    owned_views: Vec<u32>,
     /// Lazily-allocated storage-view cache. Upstream uses
     /// `std::unique_ptr<StorageViews>` — same lazy-alloc pattern.
     storage_views: Option<StorageViews>,
@@ -828,17 +1031,30 @@ pub struct ImageView {
 
 impl ImageView {
     pub fn new() -> Self {
+        Self::with_null_views([0; NUM_TEXTURE_TYPES])
+    }
+
+    fn with_null_views(null_image_views: [u32; NUM_TEXTURE_TYPES]) -> Self {
         Self {
-            views: [0; NUM_TEXTURE_TYPES],
+            views: null_image_views,
             default_handle: 0,
             internal_format: gl::NONE,
             buffer_size: 0,
+            image_id: NULL_IMAGE_ID,
+            format: PixelFormat::Invalid,
+            swizzle: [
+                SwizzleSource::R as u8,
+                SwizzleSource::G as u8,
+                SwizzleSource::B as u8,
+                SwizzleSource::A as u8,
+            ],
             original_texture: 0,
             num_samples: 0,
             flat_range: SubresourceRange::default(),
             full_range: SubresourceRange::default(),
             is_render_target: false,
             supports_anisotropy: false,
+            owned_views: Vec::new(),
             storage_views: None,
         }
     }
@@ -865,9 +1081,15 @@ impl ImageView {
     /// Port of
     /// `ImageView::ImageView(TextureCacheRuntime&, const ImageViewInfo&, ImageId, Image&, ...)`
     /// for the currently ported Color2D render-target path.
-    pub fn new_color_2d(base: &ImageViewBase, image: &Image) -> Self {
-        let mut view = Self::new();
+    pub fn new_color_2d(
+        base: &ImageViewBase,
+        image: &Image,
+        null_image_views: [u32; NUM_TEXTURE_TYPES],
+    ) -> Self {
+        let mut view = Self::with_null_views(null_image_views);
+        view.image_id = base.image_id;
         view.internal_format = present_internal_format(base.format);
+        view.format = base.format;
         view.original_texture = image.handle();
         view.num_samples = image.num_samples;
         view.flat_range = base.range;
@@ -905,6 +1127,10 @@ impl ImageView {
         self.handle(handle_type as usize)
     }
 
+    fn matches_base_image(&self, base: &ImageViewBase, image: &Image) -> bool {
+        self.image_id == base.image_id && self.original_texture == image.handle()
+    }
+
     /// Port of upstream `ImageView::ImageView(TextureCacheRuntime& runtime,
     /// const ImageViewInfo& info, ImageId image_id_, Image& image,
     /// const SlotVector<Image>&)` (gl_texture_cache.cpp:1101-1196).
@@ -921,11 +1147,18 @@ impl ImageView {
     /// isn't ported yet, so the simple `MaxwellToGL::GetFormatTuple` branch
     /// is the only one wired up. That matches the path taken when the GL
     /// driver natively supports the format — which covers all of MK8D.
-    pub fn from_image_view_info(base: &ImageViewBase, image: &Image) -> Self {
+    pub fn from_image_view_info(
+        base: &ImageViewBase,
+        image: &Image,
+        null_image_views: [u32; NUM_TEXTURE_TYPES],
+    ) -> Self {
         use crate::texture_cache::types::ImageViewType;
 
-        let mut view = Self::new();
+        let mut view = Self::with_null_views(null_image_views);
+        view.image_id = base.image_id;
         view.internal_format = present_internal_format(base.format);
+        view.format = base.format;
+        view.swizzle = base.swizzle;
         view.original_texture = image.handle();
         view.num_samples = image.num_samples;
         view.full_range = base.range;
@@ -1002,7 +1235,7 @@ impl ImageView {
         self.views[view_type as usize] = view;
     }
 
-    fn make_view(&self, view_type: TextureType, view_format: u32) -> u32 {
+    fn make_view(&mut self, view_type: TextureType, view_format: u32) -> u32 {
         if self.original_texture == 0 {
             return 0;
         }
@@ -1036,47 +1269,60 @@ impl ImageView {
                     view_range.extent.layers as u32,
                 );
                 let view_err = gl::GetError();
+                if view_err != gl::NO_ERROR
+                    || std::env::var_os("RUZU_TRACE_TEXTURE_VIEW_CREATE").is_some()
+                {
+                    let mut original_width = 0;
+                    let mut original_height = 0;
+                    let mut original_depth = 0;
+                    gl::GetTextureLevelParameteriv(
+                        self.original_texture,
+                        view_range.base.level,
+                        gl::TEXTURE_WIDTH,
+                        &mut original_width,
+                    );
+                    gl::GetTextureLevelParameteriv(
+                        self.original_texture,
+                        view_range.base.level,
+                        gl::TEXTURE_HEIGHT,
+                        &mut original_height,
+                    );
+                    gl::GetTextureLevelParameteriv(
+                        self.original_texture,
+                        view_range.base.level,
+                        gl::TEXTURE_DEPTH,
+                        &mut original_depth,
+                    );
+                    log::warn!(
+                        "[TEXTURE_VIEW_CREATE] err=0x{:X} view={} view_type={:?} target=0x{:X} original={} fmt=0x{:X} level={}+{} layer={}+{} original_size={}x{}x{}",
+                        view_err,
+                        view,
+                        view_type,
+                        target,
+                        self.original_texture,
+                        view_format,
+                        view_range.base.level,
+                        view_range.extent.levels,
+                        view_range.base.layer,
+                        view_range.extent.layers,
+                        original_width,
+                        original_height,
+                        original_depth,
+                    );
+                }
                 gl::TextureParameteri(view, gl::TEXTURE_MIN_FILTER, gl::NEAREST as i32);
                 gl::TextureParameteri(view, gl::TEXTURE_MAG_FILTER, gl::NEAREST as i32);
                 gl::TextureParameteri(view, gl::TEXTURE_WRAP_S, gl::CLAMP_TO_EDGE as i32);
                 gl::TextureParameteri(view, gl::TEXTURE_WRAP_T, gl::CLAMP_TO_EDGE as i32);
-                if std::env::var_os("RUZU_PROBE_VIEW_STORAGE").is_some() {
-                    while gl::GetError() != gl::NO_ERROR {}
-                    let red: [u8; 4] = [0xAB, 0xCD, 0xEF, 0x42];
-                    gl::ClearTexImage(
-                        view,
-                        0,
-                        gl::RGBA,
-                        gl::UNSIGNED_BYTE,
-                        red.as_ptr() as *const _,
-                    );
-                    let clear_err = gl::GetError();
-                    let mut via_view = [0u8; 16];
-                    gl::GetTextureSubImage(
-                        view, 0, 0, 0, 0, 2, 2, 1,
-                        gl::RGBA, gl::UNSIGNED_BYTE,
-                        via_view.len() as i32,
-                        via_view.as_mut_ptr() as *mut _,
-                    );
-                    let view_read_err = gl::GetError();
-                    let mut via_parent = [0u8; 16];
-                    gl::GetTextureSubImage(
-                        self.original_texture, 0, 0, 0, 0, 2, 2, 1,
-                        gl::RGBA, gl::UNSIGNED_BYTE,
-                        via_parent.len() as i32,
-                        via_parent.as_mut_ptr() as *mut _,
-                    );
-                    let parent_read_err = gl::GetError();
-                    log::warn!(
-                        "[VIEW_PROBE] view={} parent={} target=0x{:X} view_format=0x{:X} range=lvl{}+{}/lyr{}+{} view_err=0x{:X} clear_err=0x{:X} via_view={:02X?} via_parent={:02X?} v_read_err=0x{:X} p_read_err=0x{:X}",
-                        view, self.original_texture, target, view_format,
-                        view_range.base.level, view_range.extent.levels,
-                        view_range.base.layer, view_range.extent.layers,
-                        view_err, clear_err, via_view, via_parent,
-                        view_read_err, parent_read_err,
-                    );
+                if !self.is_render_target {
+                    if let Some(swizzle) = decode_swizzle(self.swizzle) {
+                        apply_swizzle(view, self.format, swizzle);
+                    }
                 }
             }
+        }
+        if view != 0 {
+            self.owned_views.push(view);
         }
         view
     }
@@ -1165,7 +1411,7 @@ pub fn present_internal_format(format: PixelFormat) -> u32 {
 impl Drop for ImageView {
     fn drop(&mut self) {
         unsafe {
-            for &view in &self.views {
+            for &view in &self.owned_views {
                 if view != 0 {
                     gl::DeleteTextures(1, &view);
                 }
@@ -1179,6 +1425,72 @@ impl Drop for ImageView {
             }
         }
     }
+}
+
+fn trace_image_view_event(
+    stage: u64,
+    view_id: ImageViewId,
+    view_base: &ImageViewBase,
+    image: &Image,
+    view: Option<&ImageView>,
+) {
+    if !common::trace::is_enabled(common::trace::cat::IMAGE_VIEW) {
+        return;
+    }
+    if !should_trace_image_view_address(view_base.gpu_addr) {
+        return;
+    }
+    let range = view_base.range;
+    let pack_size = view_base.size.width as u64 | ((view_base.size.height as u64) << 32);
+    let pack_range = range.base.level as u64
+        | ((range.base.layer as u64) << 16)
+        | ((range.extent.levels as u64) << 32)
+        | ((range.extent.layers as u64) << 48);
+    let default_handle = view.map_or(0, ImageView::default_handle);
+    let color2d = view.map_or(0, |view| view.handle_for_texture_type(TextureType::Color2D));
+    let color_array2d = view.map_or(0, |view| {
+        view.handle_for_texture_type(TextureType::ColorArray2D)
+    });
+    common::trace::emit_raw(
+        common::trace::cat::IMAGE_VIEW,
+        &[
+            stage,
+            view_id.index as u64,
+            view_base.image_id.index as u64,
+            image.texture as u64,
+            image.current_texture as u64,
+            default_handle as u64,
+            color2d as u64,
+            color_array2d as u64,
+            view_base.view_type as u64,
+            view_base.format as u64,
+            pack_size,
+            view_base.gpu_addr,
+            pack_range,
+            view_base.flags.bits() as u64,
+        ],
+    );
+    let source_swizzle_pack = pack_u8x4(view_base.swizzle);
+    let gl_swizzle_pack = decode_swizzle(view_base.swizzle)
+        .map(|swizzle| pack_i32x4(gl_swizzle_for_trace(view_base.format, swizzle)))
+        .unwrap_or(u64::MAX);
+    common::trace::emit_raw(
+        common::trace::cat::IMAGE_VIEW,
+        &[
+            9,
+            view_id.index as u64,
+            view_base.image_id.index as u64,
+            image.texture as u64,
+            view_base.gpu_addr,
+            view_base.format as u64,
+            view_base.view_type as u64,
+            source_swizzle_pack,
+            gl_swizzle_pack,
+            default_handle as u64,
+            color2d as u64,
+            color_array2d as u64,
+        ],
+    );
 }
 
 /// An OpenGL sampler.
@@ -1226,11 +1538,7 @@ impl Sampler {
         // for mag; ruzu's helper takes a u32 mipmap_filter so we pass 0
         // (TextureMipmapFilter::None == 0).
         let mag = super::maxwell_to_gl::texture_filter_mode(config.mag_filter(), 1) as i32;
-        let min_mipmap_filter = if std::env::var_os("RUZU_FORCE_NO_MIP_SAMPLERS").is_some() {
-            1
-        } else {
-            config.mipmap_filter()
-        };
+        let min_mipmap_filter = config.mipmap_filter();
         let min = super::maxwell_to_gl::texture_filter_mode(config.min_filter(), min_mipmap_filter)
             as i32;
         let reduction = super::maxwell_to_gl::reduction_filter(config.reduction_filter()) as i32;
@@ -1389,6 +1697,9 @@ pub struct TextureCache {
     image_views: HashMap<ImageViewId, ImageView>,
     samplers: HashMap<crate::texture_cache::types::SamplerId, Sampler>,
     framebuffers: HashMap<ImageViewId, TextureCacheFramebuffer>,
+    render_target_framebuffers: HashMap<RenderTargets, TextureCacheFramebuffer>,
+    null_image_handles: [u32; 7],
+    null_image_views: [u32; NUM_TEXTURE_TYPES],
 }
 
 /// OpenGL backend result of `TextureCache<P>::TryFindFramebufferImageView`.
@@ -1400,6 +1711,468 @@ pub struct FramebufferImageViewOpenGL {
     pub scaled: bool,
 }
 
+fn create_null_image_views() -> ([u32; 7], [u32; NUM_TEXTURE_TYPES]) {
+    let mut handles = [0u32; 7];
+    let mut views = [0u32; NUM_TEXTURE_TYPES];
+    unsafe {
+        gl::CreateTextures(gl::TEXTURE_1D_ARRAY, 1, &mut handles[0]);
+        gl::CreateTextures(gl::TEXTURE_CUBE_MAP_ARRAY, 1, &mut handles[1]);
+        gl::CreateTextures(gl::TEXTURE_3D, 1, &mut handles[2]);
+        if handles[0] != 0 {
+            gl::TextureStorage2D(handles[0], 1, gl::R8, 1, 1);
+        }
+        if handles[1] != 0 {
+            gl::TextureStorage3D(handles[1], 1, gl::R8, 1, 1, 6);
+        }
+        if handles[2] != 0 {
+            gl::TextureStorage3D(handles[2], 1, gl::R8, 1, 1, 1);
+        }
+
+        gl::GenTextures(4, handles[3..].as_mut_ptr());
+        if handles[3] != 0 && handles[0] != 0 {
+            gl::TextureView(handles[3], gl::TEXTURE_1D, handles[0], gl::R8, 0, 1, 0, 1);
+        }
+        if handles[4] != 0 && handles[1] != 0 {
+            gl::TextureView(handles[4], gl::TEXTURE_2D, handles[1], gl::R8, 0, 1, 0, 1);
+        }
+        if handles[5] != 0 && handles[1] != 0 {
+            gl::TextureView(
+                handles[5],
+                gl::TEXTURE_2D_ARRAY,
+                handles[1],
+                gl::R8,
+                0,
+                1,
+                0,
+                1,
+            );
+        }
+        if handles[6] != 0 && handles[1] != 0 {
+            gl::TextureView(
+                handles[6],
+                gl::TEXTURE_CUBE_MAP,
+                handles[1],
+                gl::R8,
+                0,
+                1,
+                0,
+                6,
+            );
+        }
+
+        let zero_swizzle = [gl::ZERO as i32; 4];
+        for &handle in &handles {
+            if handle != 0 {
+                gl::TextureParameteriv(handle, gl::TEXTURE_SWIZZLE_RGBA, zero_swizzle.as_ptr());
+            }
+        }
+    }
+
+    views[TextureType::Color1D as usize] = handles[3];
+    views[TextureType::Color2D as usize] = handles[4];
+    views[TextureType::ColorCube as usize] = handles[6];
+    views[TextureType::Color3D as usize] = handles[2];
+    views[TextureType::ColorArray1D as usize] = handles[0];
+    views[TextureType::ColorArray2D as usize] = handles[5];
+    views[TextureType::ColorArrayCube as usize] = handles[1];
+    views[TextureType::Color2DRect as usize] = handles[4];
+    (handles, views)
+}
+
+unsafe fn trace_present_image_grid(
+    present_index: u64,
+    gpu_addr: u64,
+    image_id: u64,
+    image: &Image,
+    image_base: &ImageBase,
+) {
+    let texture = image.handle();
+    let width = image_base.info.size.width;
+    let height = image_base.info.size.height;
+    if texture == 0 || width == 0 || height == 0 {
+        common::trace::emit_raw(
+            common::trace::cat::PRESENT_TEXTURE,
+            &[
+                present_index,
+                gpu_addr,
+                image_id,
+                texture as u64,
+                width as u64,
+                height as u64,
+                image.gl_internal_format as u64,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+            ],
+        );
+        return;
+    }
+
+    let mut old_pack_buffer = 0;
+    let mut old_pack_alignment = 0;
+    let mut old_pack_row_length = 0;
+    gl::GetIntegerv(gl::PIXEL_PACK_BUFFER_BINDING, &mut old_pack_buffer);
+    gl::GetIntegerv(gl::PACK_ALIGNMENT, &mut old_pack_alignment);
+    gl::GetIntegerv(gl::PACK_ROW_LENGTH, &mut old_pack_row_length);
+    gl::BindBuffer(gl::PIXEL_PACK_BUFFER, 0);
+    gl::PixelStorei(gl::PACK_ALIGNMENT, 1);
+    gl::PixelStorei(gl::PACK_ROW_LENGTH, 0);
+
+    while gl::GetError() != gl::NO_ERROR {}
+    let mut gl_error = gl::NO_ERROR;
+    let mut samples = 0u64;
+    let mut rgb_nonzero = 0u64;
+    let mut alpha_nonzero = 0u64;
+    let mut checksum = 0u64;
+    let mut first_rgba = 0u64;
+    let mut last_rgba = 0u64;
+    for y_idx in 0..8 {
+        let y = ((height - 1) * y_idx / 7) as i32;
+        for x_idx in 0..8 {
+            let x = ((width - 1) * x_idx / 7) as i32;
+            let mut px = [0u8; 4];
+            gl::GetTextureSubImage(
+                texture,
+                0,
+                x,
+                y,
+                0,
+                1,
+                1,
+                1,
+                gl::RGBA,
+                gl::UNSIGNED_BYTE,
+                px.len() as i32,
+                px.as_mut_ptr().cast(),
+            );
+            let err = gl::GetError();
+            if err != gl::NO_ERROR {
+                gl_error = err;
+                break;
+            }
+            let rgba = u32::from_le_bytes(px) as u64;
+            if samples == 0 {
+                first_rgba = rgba;
+            }
+            last_rgba = rgba;
+            if px[0] != 0 || px[1] != 0 || px[2] != 0 {
+                rgb_nonzero += 1;
+            }
+            if px[3] != 0 {
+                alpha_nonzero += 1;
+            }
+            checksum = checksum.wrapping_mul(16777619).wrapping_add(rgba);
+            samples += 1;
+        }
+        if gl_error != gl::NO_ERROR {
+            break;
+        }
+    }
+
+    gl::BindBuffer(gl::PIXEL_PACK_BUFFER, old_pack_buffer as u32);
+    gl::PixelStorei(gl::PACK_ALIGNMENT, old_pack_alignment);
+    gl::PixelStorei(gl::PACK_ROW_LENGTH, old_pack_row_length);
+
+    common::trace::emit_raw(
+        common::trace::cat::PRESENT_TEXTURE,
+        &[
+            present_index,
+            gpu_addr,
+            image_id,
+            texture as u64,
+            width as u64,
+            height as u64,
+            image.gl_internal_format as u64,
+            gl_error as u64,
+            samples,
+            rgb_nonzero,
+            alpha_nonzero,
+            checksum,
+            first_rgba,
+            last_rgba,
+        ],
+    );
+}
+
+unsafe fn dump_present_image_ppm(
+    present_index: u64,
+    gpu_addr: u64,
+    image_id: u64,
+    image: &Image,
+    image_base: &ImageBase,
+) {
+    let Some(output_dir) = std::env::var_os("RUZU_DUMP_PRESENT_EXTRA_PPM_DIR") else {
+        return;
+    };
+
+    let texture = image.handle();
+    let width = image_base.info.size.width as usize;
+    let height = image_base.info.size.height as usize;
+    if texture == 0 || width == 0 || height == 0 {
+        return;
+    }
+
+    let byte_count = width.saturating_mul(height).saturating_mul(4);
+    if byte_count == 0 || byte_count > 256 * 1024 * 1024 {
+        log::warn!(
+            "[PRESENT_EXTRA_PPM] skipped present={} gpu=0x{:X} image={} size={}x{} bytes={}",
+            present_index,
+            gpu_addr,
+            image_id,
+            width,
+            height,
+            byte_count
+        );
+        return;
+    }
+
+    let mut old_pack_buffer = 0;
+    let mut old_pack_alignment = 0;
+    let mut old_pack_row_length = 0;
+    gl::GetIntegerv(gl::PIXEL_PACK_BUFFER_BINDING, &mut old_pack_buffer);
+    gl::GetIntegerv(gl::PACK_ALIGNMENT, &mut old_pack_alignment);
+    gl::GetIntegerv(gl::PACK_ROW_LENGTH, &mut old_pack_row_length);
+    gl::BindBuffer(gl::PIXEL_PACK_BUFFER, 0);
+    gl::PixelStorei(gl::PACK_ALIGNMENT, 1);
+    gl::PixelStorei(gl::PACK_ROW_LENGTH, 0);
+
+    while gl::GetError() != gl::NO_ERROR {}
+    let mut rgba = vec![0u8; byte_count];
+    gl::GetTextureImage(
+        texture,
+        0,
+        gl::RGBA,
+        gl::UNSIGNED_BYTE,
+        rgba.len() as i32,
+        rgba.as_mut_ptr().cast(),
+    );
+    let gl_error = gl::GetError();
+
+    gl::BindBuffer(gl::PIXEL_PACK_BUFFER, old_pack_buffer as u32);
+    gl::PixelStorei(gl::PACK_ALIGNMENT, old_pack_alignment);
+    gl::PixelStorei(gl::PACK_ROW_LENGTH, old_pack_row_length);
+
+    let mut ppm = Vec::with_capacity(width * height * 3 + 64);
+    ppm.extend_from_slice(format!("P6\n{} {}\n255\n", width, height).as_bytes());
+    let mut rgb_nonzero = 0usize;
+    let mut alpha_nonzero = 0usize;
+    let mut checksum = 0u64;
+    let mut first_rgba = 0u32;
+    let mut last_rgba = 0u32;
+    let mut samples = 0usize;
+    for row in (0..height).rev() {
+        let start = row * width * 4;
+        let end = start + width * 4;
+        for px in rgba[start..end].chunks_exact(4) {
+            let rgba = u32::from_le_bytes([px[0], px[1], px[2], px[3]]);
+            if samples == 0 {
+                first_rgba = rgba;
+            }
+            last_rgba = rgba;
+            if px[0] != 0 || px[1] != 0 || px[2] != 0 {
+                rgb_nonzero += 1;
+            }
+            if px[3] != 0 {
+                alpha_nonzero += 1;
+            }
+            checksum = checksum.wrapping_mul(16777619).wrapping_add(rgba as u64);
+            samples += 1;
+            ppm.extend_from_slice(&px[..3]);
+        }
+    }
+
+    let mut path = std::path::PathBuf::from(output_dir);
+    if let Err(err) = std::fs::create_dir_all(&path) {
+        log::warn!(
+            "[PRESENT_EXTRA_PPM] failed to create {}: {}",
+            path.display(),
+            err
+        );
+        return;
+    }
+    path.push(format!(
+        "present_{present_index}_gpu_{gpu_addr:016X}_image_{image_id}.ppm"
+    ));
+    match std::fs::write(&path, ppm) {
+        Ok(()) => log::info!(
+            "[PRESENT_EXTRA_PPM] wrote {} present={} gpu=0x{:X} image={} gl_error=0x{:X} samples={} rgb_nonzero={} alpha_nonzero={} checksum=0x{:X} first_rgba=0x{:08X} last_rgba=0x{:08X}",
+            path.display(),
+            present_index,
+            gpu_addr,
+            image_id,
+            gl_error,
+            samples,
+            rgb_nonzero,
+            alpha_nonzero,
+            checksum,
+            first_rgba,
+            last_rgba,
+        ),
+        Err(err) => log::warn!(
+            "[PRESENT_EXTRA_PPM] failed to write {}: {}",
+            path.display(),
+            err
+        ),
+    }
+}
+
+fn dump_texture_upload_staging(
+    image_id: ImageId,
+    base_image: &ImageBase,
+    staging: &[u8],
+    copies: &[BufferImageCopy],
+) {
+    let Some(output_dir) = std::env::var_os("RUZU_DUMP_TEXTURE_UPLOAD_DIR") else {
+        return;
+    };
+    let mut path = std::path::PathBuf::from(output_dir);
+    if let Err(err) = std::fs::create_dir_all(&path) {
+        log::warn!(
+            "[TEXTURE_UPLOAD_DUMP] failed to create {}: {}",
+            path.display(),
+            err
+        );
+        return;
+    }
+
+    let stem = format!(
+        "upload_gpu_{:016X}_image_{}_fmt_{:?}_{}x{}",
+        base_image.gpu_addr,
+        image_id.index,
+        base_image.info.format,
+        base_image.info.size.width,
+        base_image.info.size.height
+    );
+
+    path.push(format!("{stem}.bin"));
+    match std::fs::write(&path, staging) {
+        Ok(()) => log::warn!(
+            "[TEXTURE_UPLOAD_DUMP] wrote {} bytes={} gpu=0x{:X} image={}",
+            path.display(),
+            staging.len(),
+            base_image.gpu_addr,
+            image_id.index,
+        ),
+        Err(err) => log::warn!(
+            "[TEXTURE_UPLOAD_DUMP] failed to write {}: {}",
+            path.display(),
+            err
+        ),
+    }
+    path.pop();
+
+    if base_image.info.format != PixelFormat::Bc4Unorm {
+        return;
+    }
+    let Some(mut copy) = copies.first().cloned() else {
+        return;
+    };
+    let width = base_image.info.size.width as usize;
+    let height = base_image.info.size.height as usize;
+    let output_size = width.saturating_mul(height);
+    if output_size == 0 || output_size > 256 * 1024 * 1024 {
+        return;
+    }
+
+    let mut decoded = vec![0u8; output_size];
+    copy.image_extent.width = base_image.info.size.width;
+    copy.image_extent.height = base_image.info.size.height;
+    copy.image_extent.depth = 1;
+    copy.image_subresource.num_layers = 1;
+    crate::texture_cache::decode_bc::decompress_bcn(
+        staging,
+        &mut decoded,
+        &mut copy,
+        PixelFormat::Bc4Unorm,
+    );
+
+    let mut pgm = Vec::with_capacity(decoded.len() + 64);
+    pgm.extend_from_slice(format!("P5\n{} {}\n255\n", width, height).as_bytes());
+    pgm.extend_from_slice(&decoded);
+    path.push(format!("{stem}.pgm"));
+    match std::fs::write(&path, pgm) {
+        Ok(()) => log::warn!(
+            "[TEXTURE_UPLOAD_DUMP] wrote {} decoded_bc4_bytes={} gpu=0x{:X} image={}",
+            path.display(),
+            decoded.len(),
+            base_image.gpu_addr,
+            image_id.index,
+        ),
+        Err(err) => log::warn!(
+            "[TEXTURE_UPLOAD_DUMP] failed to write {}: {}",
+            path.display(),
+            err
+        ),
+    }
+}
+
+unsafe fn sample_present_texture(texture: u32, width: u32, height: u32) -> (u64, u64, u64, u64) {
+    if texture == 0 || width == 0 || height == 0 {
+        return (0, 0, 0, 0);
+    }
+
+    let mut old_pack_buffer = 0;
+    let mut old_pack_alignment = 0;
+    let mut old_pack_row_length = 0;
+    gl::GetIntegerv(gl::PIXEL_PACK_BUFFER_BINDING, &mut old_pack_buffer);
+    gl::GetIntegerv(gl::PACK_ALIGNMENT, &mut old_pack_alignment);
+    gl::GetIntegerv(gl::PACK_ROW_LENGTH, &mut old_pack_row_length);
+    gl::BindBuffer(gl::PIXEL_PACK_BUFFER, 0);
+    gl::PixelStorei(gl::PACK_ALIGNMENT, 1);
+    gl::PixelStorei(gl::PACK_ROW_LENGTH, 0);
+
+    while gl::GetError() != gl::NO_ERROR {}
+    let mut checksum = 0u64;
+    let mut rgb_nonzero = 0u64;
+    let mut first_rgba = 0u64;
+    let mut samples = 0u64;
+    for y_idx in 0..8 {
+        let y = ((height - 1) * y_idx / 7) as i32;
+        for x_idx in 0..8 {
+            let x = ((width - 1) * x_idx / 7) as i32;
+            let mut px = [0u8; 4];
+            gl::GetTextureSubImage(
+                texture,
+                0,
+                x,
+                y,
+                0,
+                1,
+                1,
+                1,
+                gl::RGBA,
+                gl::UNSIGNED_BYTE,
+                px.len() as i32,
+                px.as_mut_ptr().cast(),
+            );
+            if gl::GetError() != gl::NO_ERROR {
+                gl::BindBuffer(gl::PIXEL_PACK_BUFFER, old_pack_buffer as u32);
+                gl::PixelStorei(gl::PACK_ALIGNMENT, old_pack_alignment);
+                gl::PixelStorei(gl::PACK_ROW_LENGTH, old_pack_row_length);
+                return (checksum, rgb_nonzero, first_rgba, samples);
+            }
+            let rgba = u32::from_le_bytes(px) as u64;
+            if samples == 0 {
+                first_rgba = rgba;
+            }
+            if px[0] != 0 || px[1] != 0 || px[2] != 0 {
+                rgb_nonzero += 1;
+            }
+            checksum = checksum.wrapping_mul(16777619).wrapping_add(rgba);
+            samples += 1;
+        }
+    }
+
+    gl::BindBuffer(gl::PIXEL_PACK_BUFFER, old_pack_buffer as u32);
+    gl::PixelStorei(gl::PACK_ALIGNMENT, old_pack_alignment);
+    gl::PixelStorei(gl::PACK_ROW_LENGTH, old_pack_row_length);
+    (checksum, rgb_nonzero, first_rgba, samples)
+}
+
 impl TextureCache {
     /// Port of `OpenGL::TextureCache::TextureCache(Runtime&, MaxwellDeviceMemoryManager&)`.
     /// `device_memory` is the shared `Arc` from `Host1x::memory_manager()`.
@@ -1408,12 +2181,16 @@ impl TextureCache {
             crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager,
         >,
     ) -> Self {
+        let (null_image_handles, null_image_views) = create_null_image_views();
         Self {
             base: CommonTextureCache::new(device_memory),
             images: HashMap::new(),
             image_views: HashMap::new(),
             samplers: HashMap::new(),
             framebuffers: HashMap::new(),
+            render_target_framebuffers: HashMap::new(),
+            null_image_handles,
+            null_image_views,
         }
     }
 
@@ -1437,12 +2214,14 @@ impl TextureCache {
         if !image_id.is_valid() {
             return;
         }
-        if std::env::var_os("RUZU_TRACE_TEXTURE_UPLOAD").is_some() {
-            let image = &self.base.slot_images[image_id];
+        let image = &self.base.slot_images[image_id];
+        let trace_upload = should_trace_texture_upload(image.gpu_addr);
+        if trace_upload {
             log::warn!(
-                "[TEXTURE_UPLOAD] prepare id={} gpu=0x{:X} flags={:?} guest_size={} invalidate={} modification={}",
+                "[TEXTURE_UPLOAD] prepare id={} gpu=0x{:X} cpu=0x{:X} flags={:?} guest_size={} invalidate={} modification={}",
                 image_id.index,
                 image.gpu_addr,
+                image.cpu_addr,
                 image.flags,
                 image.guest_size_bytes,
                 invalidate,
@@ -1454,6 +2233,12 @@ impl TextureCache {
             image
                 .flags
                 .remove(ImageFlagBits::CPU_MODIFIED | ImageFlagBits::GPU_MODIFIED);
+            if !self.base.slot_images[image_id]
+                .flags
+                .contains(ImageFlagBits::TRACKED)
+            {
+                self.base.track_image(image_id);
+            }
         } else {
             self.refresh_contents_with_gpu_reader(image_id, read_gpu);
             // TODO: SynchronizeAliases(image_id) once alias tracking reaches
@@ -1488,9 +2273,26 @@ impl TextureCache {
             return;
         }
 
+        self.base.slot_images[image_id]
+            .flags
+            .remove(ImageFlagBits::CPU_MODIFIED);
+        debug_assert!(
+            !self.base.slot_images[image_id]
+                .flags
+                .contains(ImageFlagBits::TRACKED),
+            "TextureCache::refresh_contents: CPU-modified image should have been untracked"
+        );
+        if !self.base.slot_images[image_id]
+            .flags
+            .contains(ImageFlagBits::TRACKED)
+        {
+            self.base.track_image(image_id);
+        }
+
         let mut guest = vec![0u8; base_image.guest_size_bytes as usize];
+        let trace_upload = should_trace_texture_upload(base_image.gpu_addr);
         if !read_gpu(base_image.gpu_addr, &mut guest) {
-            if std::env::var_os("RUZU_TRACE_TEXTURE_UPLOAD").is_some() {
+            if trace_upload {
                 log::warn!(
                     "[TEXTURE_UPLOAD] read_miss id={} gpu=0x{:X} size={}",
                     image_id.index,
@@ -1516,7 +2318,10 @@ impl TextureCache {
         if copies.is_empty() {
             return;
         }
-        if std::env::var_os("RUZU_TRACE_TEXTURE_UPLOAD").is_some() {
+        if should_dump_texture_upload(base_image.gpu_addr) {
+            dump_texture_upload_staging(image_id, &base_image, &staging, &copies);
+        }
+        if trace_upload {
             let guest_nonzero = guest.iter().filter(|&&b| b != 0).take(1).count() != 0;
             let staging_nonzero = staging.iter().filter(|&&b| b != 0).take(1).count() != 0;
             let guest_checksum = guest.iter().take(4096).fold(0u64, |acc, &b| {
@@ -1526,8 +2331,10 @@ impl TextureCache {
                 acc.wrapping_mul(16777619).wrapping_add(b as u64)
             });
             log::warn!(
-                "[TEXTURE_UPLOAD] staging id={} guest_nonzero={} staging_nonzero={} guest_crc=0x{:X} staging_crc=0x{:X}",
+                "[TEXTURE_UPLOAD] staging id={} gpu=0x{:X} cpu=0x{:X} guest_nonzero={} staging_nonzero={} guest_crc=0x{:X} staging_crc=0x{:X}",
                 image_id.index,
+                base_image.gpu_addr,
+                base_image.cpu_addr,
                 guest_nonzero,
                 staging_nonzero,
                 guest_checksum,
@@ -1559,15 +2366,13 @@ impl TextureCache {
             gl::DeleteBuffers(1, &pbo);
             gl::MemoryBarrier(gl::TEXTURE_FETCH_BARRIER_BIT | gl::SHADER_IMAGE_ACCESS_BARRIER_BIT);
         }
-        self.base.slot_images[image_id]
-            .flags
-            .remove(ImageFlagBits::CPU_MODIFIED);
 
-        if std::env::var_os("RUZU_TRACE_TEXTURE_UPLOAD").is_some() {
+        if trace_upload {
             log::warn!(
-                "[TEXTURE_UPLOAD] uploaded id={} gpu=0x{:X} guest={} staging={} copies={}",
+                "[TEXTURE_UPLOAD] uploaded id={} gpu=0x{:X} cpu=0x{:X} guest={} staging={} copies={}",
                 image_id.index,
                 base_image.gpu_addr,
+                base_image.cpu_addr,
                 guest.len(),
                 staging.len(),
                 copies.len(),
@@ -1607,7 +2412,7 @@ impl TextureCache {
 
         for image_id in images {
             // Make sure the backend image slot exists for this base image —
-            // `update_render_targets_from_draw_state` typically pre-populates
+            // `update_render_targets_from_snapshot` typically pre-populates
             // it, but defensive insertion here keeps offscreen downloads
             // working even before any draw has touched the slot.
             let base_image = self.base.slot_images[image_id].clone();
@@ -1698,14 +2503,30 @@ impl TextureCache {
                 // retry without leaving a stale ImageView handle behind.
                 continue;
             }
-            if self.image_views.contains_key(&view_id) {
-                continue;
-            }
             let image_ref = self
                 .images
                 .get(&image_id)
                 .expect("image inserted above must be present");
-            let backend_view = ImageView::from_image_view_info(&view_base, image_ref);
+            let view_matches = self
+                .image_views
+                .get(&view_id)
+                .is_some_and(|view| view.matches_base_image(&view_base, image_ref));
+            if view_matches {
+                continue;
+            }
+            let old_view = self.image_views.get(&view_id);
+            if old_view.is_some() {
+                trace_image_view_event(3, view_id, &view_base, image_ref, old_view);
+            }
+            self.image_views.remove(&view_id);
+            self.remove_framebuffers_for_view(view_id);
+            let image_ref = self
+                .images
+                .get(&image_id)
+                .expect("image inserted above must be present");
+            let backend_view =
+                ImageView::from_image_view_info(&view_base, image_ref, self.null_image_views);
+            trace_image_view_event(2, view_id, &view_base, image_ref, Some(&backend_view));
             self.image_views.insert(view_id, backend_view);
         }
     }
@@ -1773,9 +2594,50 @@ impl TextureCache {
     }
 
     pub fn unmap_memory(&mut self, cpu_addr: u64, size: usize) {
-        self.framebuffers.clear();
-        self.image_views.clear();
-        self.images.clear();
+        let end = cpu_addr.saturating_add(size as u64);
+        let deleted_images: Vec<(ImageId, Vec<ImageViewId>)> = self
+            .base
+            .slot_images
+            .iter()
+            .filter_map(|(image_id, image)| {
+                if image_id == crate::texture_cache::types::NULL_IMAGE_ID {
+                    return None;
+                }
+                let image_end = image
+                    .cpu_addr_end
+                    .max(image.cpu_addr.saturating_add(map_size_bytes(image) as u64));
+                (image.cpu_addr < end && cpu_addr < image_end)
+                    .then(|| (image_id, image.image_view_ids.clone()))
+            })
+            .collect();
+        if common::trace::is_enabled(common::trace::cat::IMAGE_VIEW) {
+            common::trace::emit_raw(
+                common::trace::cat::IMAGE_VIEW,
+                &[
+                    8,
+                    u64::MAX,
+                    u64::MAX,
+                    self.images.len() as u64,
+                    self.image_views.len() as u64,
+                    self.framebuffers.len() as u64,
+                    self.render_target_framebuffers.len() as u64,
+                    deleted_images.len() as u64,
+                    0,
+                    0,
+                    size as u64,
+                    cpu_addr,
+                    0,
+                    0,
+                ],
+            );
+        }
+        for (image_id, view_ids) in deleted_images {
+            self.images.remove(&image_id);
+            for view_id in view_ids {
+                self.image_views.remove(&view_id);
+                self.remove_framebuffers_for_view(view_id);
+            }
+        }
         self.base.unmap_memory(cpu_addr, size);
     }
 
@@ -1799,13 +2661,19 @@ impl TextureCache {
         self.base.commit_async_flushes();
     }
 
-    pub fn update_render_targets_from_draw_state(
+    fn remove_framebuffers_for_view(&mut self, view_id: ImageViewId) {
+        self.framebuffers.remove(&view_id);
+        self.render_target_framebuffers
+            .retain(|key, _| !key.contains(&[view_id]));
+    }
+
+    pub fn update_render_targets_from_snapshot(
         &mut self,
-        draw_state: &crate::engines::draw_manager::DrawState,
+        render_targets: &Maxwell3DRenderTargets,
         gpu_to_cpu: impl FnMut(crate::texture_cache::image_base::GPUVAddr) -> Option<u64>,
     ) {
         self.base
-            .update_render_targets_from_draw_state(draw_state, gpu_to_cpu);
+            .update_render_targets_from_snapshot(render_targets, gpu_to_cpu);
         for (image_id, image) in self.base.slot_images.iter() {
             if image_id == crate::texture_cache::types::NULL_IMAGE_ID {
                 continue;
@@ -1816,19 +2684,19 @@ impl TextureCache {
         }
     }
 
-    pub fn prepare_render_targets_from_draw_state(
+    pub fn prepare_render_targets_from_snapshot(
         &mut self,
-        draw_state: &crate::engines::draw_manager::DrawState,
+        render_targets: &Maxwell3DRenderTargets,
         mut read_gpu: Option<&mut dyn FnMut(u64, &mut [u8]) -> bool>,
     ) {
         let mut image_ids = Vec::new();
-        for &target in draw_state
+        for &target in render_targets
             .rt_control
             .map
             .iter()
-            .take(draw_state.rt_control.count.min(8) as usize)
+            .take(render_targets.rt_control.count.min(8) as usize)
         {
-            let Some(rt) = draw_state.render_targets.get(target as usize) else {
+            let Some(rt) = render_targets.render_targets.get(target as usize) else {
                 continue;
             };
             if rt.address == 0 || rt.width == 0 || rt.height == 0 {
@@ -1844,6 +2712,20 @@ impl TextureCache {
             }
         }
 
+        let zeta = render_targets.zeta;
+        if zeta.enabled && zeta.address != 0 && zeta.width != 0 && zeta.height != 0 {
+            let zeta_info = ImageInfo::from_zeta_info(&zeta, 0);
+            if let Some((image_id, _)) = self.base.slot_images.iter().find(|(_, image)| {
+                image.gpu_addr == zeta.address
+                    && image.info.size.width == zeta_info.size.width
+                    && image.info.size.height == zeta_info.size.height
+                    && image.info.format == zeta_info.format
+                    && !image.image_view_ids.is_empty()
+            }) {
+                image_ids.push(image_id);
+            }
+        }
+
         image_ids.sort_by_key(|id| id.index);
         image_ids.dedup_by_key(|id| id.index);
         for image_id in image_ids {
@@ -1853,6 +2735,279 @@ impl TextureCache {
                 self.base.mark_modification_by_id(image_id);
             }
         }
+    }
+
+    /// OpenGL counterpart of upstream `TextureCache<P>::GetFramebuffer()`.
+    ///
+    /// Upstream keys framebuffers by the complete `RenderTargets` object and
+    /// attaches every color target before selecting draw buffers. The previous
+    /// Rust path bound only the first mapped render target, which is not
+    /// equivalent for MK8D's multi-pass composition.
+    pub fn framebuffer_for_render_targets_from_snapshot(
+        &mut self,
+        render_targets: &Maxwell3DRenderTargets,
+        size: Extent2D,
+    ) -> Option<(u32, u32, u32)> {
+        let mut key = RenderTargets {
+            size,
+            ..RenderTargets::default()
+        };
+        let mut attachment_textures = [0u32; NUM_RT];
+        let mut depth_attachment_texture = 0u32;
+        let mut depth_attachment_format = PixelFormat::Invalid;
+        let mut depth_attachment_view_id = ImageViewId::default();
+        let mut depth_attachment_image_id = ImageId::default();
+        let mut depth_attachment_gl = gl::NONE;
+        let mut max_width = 0u32;
+        let mut max_height = 0u32;
+
+        for index in 0..NUM_RT {
+            key.draw_buffers[index] = render_targets.rt_control.map[index] as u8;
+
+            let rt = render_targets.render_targets[index];
+            if rt.address == 0 || rt.width == 0 || rt.height == 0 || rt.format == 0 {
+                continue;
+            }
+
+            let Some((image_id, image_base)) = self.base.slot_images.iter().find(|(_, image)| {
+                image.gpu_addr == rt.address
+                    && image.info.size.width == rt.width
+                    && image.info.size.height == rt.height
+                    && !image.image_view_ids.is_empty()
+            }) else {
+                continue;
+            };
+            let image_base = image_base.clone();
+            let view_id = self
+                .base
+                .find_render_target_view_from_image(image_id, &rt, rt.address);
+            if !view_id.is_valid() {
+                continue;
+            }
+            key.color_buffer_ids[index] = view_id;
+
+            let view_base = self.base.slot_image_views[view_id].clone();
+            self.images
+                .entry(image_id)
+                .or_insert_with(|| Image::from_base(&image_base));
+            let view_mismatch = {
+                let backend_image = self
+                    .images
+                    .get(&image_id)
+                    .expect("image inserted above must be present");
+                self.image_views
+                    .get(&view_id)
+                    .is_some_and(|view| !view.matches_base_image(&view_base, backend_image))
+            };
+            if view_mismatch {
+                let backend_image = self
+                    .images
+                    .get(&image_id)
+                    .expect("image inserted above must be present");
+                let old_view = self.image_views.get(&view_id);
+                trace_image_view_event(7, view_id, &view_base, backend_image, old_view);
+                self.image_views.remove(&view_id);
+                self.remove_framebuffers_for_view(view_id);
+            }
+            let backend_image = self
+                .images
+                .get(&image_id)
+                .expect("image inserted above must be present");
+            let backend_view = self.image_views.entry(view_id).or_insert_with(|| {
+                ImageView::new_color_2d(&view_base, backend_image, self.null_image_views)
+            });
+            trace_image_view_event(6, view_id, &view_base, backend_image, Some(backend_view));
+            let attachment_texture = if view_base.flags.contains(ImageViewFlagBits::SLICE) {
+                backend_view.handle_for_texture_type(TextureType::Color3D)
+            } else {
+                backend_view.default_handle()
+            };
+            if attachment_texture == 0 {
+                key.color_buffer_ids[index] = ImageViewId::default();
+                continue;
+            }
+
+            attachment_textures[index] = attachment_texture;
+            max_width = max_width.max(view_base.size.width);
+            max_height = max_height.max(view_base.size.height);
+        }
+
+        let zeta = render_targets.zeta;
+        if zeta.enabled && zeta.address != 0 && zeta.width != 0 && zeta.height != 0 {
+            let zeta_info = ImageInfo::from_zeta_info(&zeta, 0);
+            if let Some((image_id, image_base)) = self.base.slot_images.iter().find(|(_, image)| {
+                image.gpu_addr == zeta.address
+                    && image.info.size.width == zeta_info.size.width
+                    && image.info.size.height == zeta_info.size.height
+                    && image.info.format == zeta_info.format
+            }) {
+                let image_id = image_id;
+                let image_base = image_base.clone();
+                let view_id =
+                    self.base
+                        .find_image_view_from_image_info(image_id, &zeta_info, zeta.address);
+                if view_id.is_valid() {
+                    key.depth_buffer_id = view_id;
+
+                    let view_base = self.base.slot_image_views[view_id].clone();
+                    self.images
+                        .entry(image_id)
+                        .or_insert_with(|| Image::from_base(&image_base));
+                    let backend_image = self
+                        .images
+                        .get(&image_id)
+                        .expect("depth image inserted above must be present");
+                    let backend_view = self.image_views.entry(view_id).or_insert_with(|| {
+                        ImageView::new_color_2d(&view_base, backend_image, self.null_image_views)
+                    });
+                    depth_attachment_texture = backend_view.default_handle();
+                    depth_attachment_format = zeta_info.format;
+                    depth_attachment_view_id = view_id;
+                    depth_attachment_image_id = image_id;
+                    max_width = max_width.max(view_base.size.width);
+                    max_height = max_height.max(view_base.size.height);
+                    trace_image_view_event(
+                        6,
+                        view_id,
+                        &view_base,
+                        backend_image,
+                        Some(backend_view),
+                    );
+                }
+            }
+        }
+
+        if attachment_textures.iter().all(|&texture| texture == 0) && depth_attachment_texture == 0
+        {
+            return None;
+        }
+        if key.size.width == 0 {
+            key.size.width = max_width;
+        }
+        if key.size.height == 0 {
+            key.size.height = max_height;
+        }
+
+        let framebuffer = self
+            .render_target_framebuffers
+            .entry(key)
+            .or_insert_with(|| {
+                let mut framebuffer = 0;
+                let mut buffer_bits = gl::NONE;
+                unsafe {
+                    gl::CreateFramebuffers(1, &mut framebuffer);
+                    if framebuffer != 0 {
+                        let mut num_buffers = 0i32;
+                        let mut gl_draw_buffers = [gl::NONE; NUM_RT];
+                        for index in 0..NUM_RT {
+                            let texture = attachment_textures[index];
+                            if texture == 0 {
+                                continue;
+                            }
+                            buffer_bits |= gl::COLOR_BUFFER_BIT;
+                            gl_draw_buffers[index] =
+                                gl::COLOR_ATTACHMENT0 + key.draw_buffers[index] as u32;
+                            num_buffers = index as i32 + 1;
+
+                            let view_id = key.color_buffer_ids[index];
+                            let view_base = self.base.slot_image_views[view_id].clone();
+                            let attachment = gl::COLOR_ATTACHMENT0 + index as u32;
+                            if view_base.flags.contains(ImageViewFlagBits::SLICE)
+                                && view_base.range.extent.layers == 1
+                            {
+                                gl::NamedFramebufferTextureLayer(
+                                    framebuffer,
+                                    attachment,
+                                    texture,
+                                    0,
+                                    view_base.range.base.layer,
+                                );
+                            } else {
+                                gl::NamedFramebufferTexture(framebuffer, attachment, texture, 0);
+                            }
+                        }
+                        if depth_attachment_texture != 0 {
+                            let attachment = framebuffer_attachment_type(depth_attachment_format);
+                            depth_attachment_gl = attachment;
+                            buffer_bits |=
+                                match crate::surface::get_format_type(depth_attachment_format) {
+                                    SurfaceType::Depth => gl::DEPTH_BUFFER_BIT,
+                                    SurfaceType::Stencil => gl::STENCIL_BUFFER_BIT,
+                                    SurfaceType::DepthStencil => {
+                                        gl::DEPTH_BUFFER_BIT | gl::STENCIL_BUFFER_BIT
+                                    }
+                                    _ => gl::DEPTH_BUFFER_BIT,
+                                };
+                            gl::NamedFramebufferTexture(
+                                framebuffer,
+                                attachment,
+                                depth_attachment_texture,
+                                0,
+                            );
+                        }
+
+                        if num_buffers > 1 {
+                            gl::NamedFramebufferDrawBuffers(
+                                framebuffer,
+                                num_buffers,
+                                gl_draw_buffers.as_ptr(),
+                            );
+                        } else if num_buffers > 0 {
+                            gl::NamedFramebufferDrawBuffer(framebuffer, gl_draw_buffers[0]);
+                        } else {
+                            gl::NamedFramebufferDrawBuffer(framebuffer, gl::NONE);
+                        }
+                        gl::NamedFramebufferParameteri(
+                            framebuffer,
+                            gl::FRAMEBUFFER_DEFAULT_WIDTH,
+                            key.size.width as i32,
+                        );
+                        gl::NamedFramebufferParameteri(
+                            framebuffer,
+                            gl::FRAMEBUFFER_DEFAULT_HEIGHT,
+                            key.size.height as i32,
+                        );
+                        if common::trace::is_enabled(common::trace::cat::RT_DEPTH_ATTACH)
+                            && depth_attachment_texture != 0
+                        {
+                            let draw_buffers_pack = key
+                                .draw_buffers
+                                .iter()
+                                .take(8)
+                                .enumerate()
+                                .fold(0u64, |acc, (index, &buffer)| {
+                                    acc | ((buffer as u64) << (index * 8))
+                                });
+                            let status =
+                                gl::CheckNamedFramebufferStatus(framebuffer, gl::DRAW_FRAMEBUFFER);
+                            common::trace::emit_raw(
+                                common::trace::cat::RT_DEPTH_ATTACH,
+                                &[
+                                    framebuffer as u64,
+                                    depth_attachment_view_id.index as u64,
+                                    depth_attachment_image_id.index as u64,
+                                    zeta.address,
+                                    depth_attachment_format as u64,
+                                    ((key.size.width as u64) << 32) | key.size.height as u64,
+                                    depth_attachment_texture as u64,
+                                    depth_attachment_gl as u64,
+                                    buffer_bits as u64,
+                                    status as u64,
+                                    key.color_buffer_ids[0].index as u64,
+                                    key.color_buffer_ids[1].index as u64,
+                                    draw_buffers_pack,
+                                ],
+                            );
+                        }
+                    }
+                }
+                TextureCacheFramebuffer {
+                    framebuffer,
+                    buffer_bits,
+                }
+            });
+        let handle = framebuffer.handle();
+        (handle != 0).then_some((handle, key.size.width, key.size.height))
     }
 
     /// OpenGL-backed port of `TextureCache<P>::BlitImage` for the currently
@@ -1871,8 +3026,8 @@ impl TextureCache {
         let can_be_depth_blit = dst_info.format == src_info.format
             && copy.filter == crate::engines::fermi_2d::Filter::Point;
 
-        let src_id = self.base.find_image(src_addr);
-        let dst_id = self.base.find_image(dst_addr);
+        let src_id = self.base.find_image(&src_info, src_addr);
+        let dst_id = self.base.find_image(&dst_info, dst_addr);
         if !copy.must_accelerate {
             let src_gpu_modified = src_id
                 .map(|id| {
@@ -2028,14 +3183,36 @@ impl TextureCache {
         if !image_id.is_valid() {
             return None;
         }
-        let backend_image = self
-            .images
+        self.images
             .entry(image_id)
             .or_insert_with(|| Image::from_base(&self.base.slot_images[image_id]));
-        let backend_view = self
-            .image_views
-            .entry(view_id)
-            .or_insert_with(|| ImageView::new_color_2d(&view_base, backend_image));
+        let view_mismatch = {
+            let backend_image = self
+                .images
+                .get(&image_id)
+                .expect("image inserted above must be present");
+            self.image_views
+                .get(&view_id)
+                .is_some_and(|view| !view.matches_base_image(&view_base, backend_image))
+        };
+        if view_mismatch {
+            let backend_image = self
+                .images
+                .get(&image_id)
+                .expect("image inserted above must be present");
+            let old_view = self.image_views.get(&view_id);
+            trace_image_view_event(5, view_id, &view_base, backend_image, old_view);
+            self.image_views.remove(&view_id);
+            self.remove_framebuffers_for_view(view_id);
+        }
+        let backend_image = self
+            .images
+            .get(&image_id)
+            .expect("image inserted above must be present");
+        let backend_view = self.image_views.entry(view_id).or_insert_with(|| {
+            ImageView::new_color_2d(&view_base, backend_image, self.null_image_views)
+        });
+        trace_image_view_event(4, view_id, &view_base, backend_image, Some(backend_view));
         let attachment_texture = if view_base.flags.contains(ImageViewFlagBits::SLICE) {
             backend_view.handle_for_texture_type(TextureType::Color3D)
         } else {
@@ -2081,6 +3258,11 @@ impl TextureCache {
             crate::engines::fermi_2d::Filter::Bilinear => gl::LINEAR,
         };
         unsafe {
+            // Matches upstream TextureCacheRuntime::BlitFramebuffer. Fermi2D
+            // copies must not inherit stale draw state from Maxwell rendering.
+            gl::Enable(gl::FRAMEBUFFER_SRGB);
+            gl::Disable(gl::RASTERIZER_DISCARD);
+            gl::Disablei(gl::SCISSOR_TEST, 0);
             gl::BlitNamedFramebuffer(
                 src_framebuffer,
                 dst_framebuffer,
@@ -2160,16 +3342,34 @@ impl TextureCache {
                 );
             }
         }
-        let backend_image = self.images.entry(image_id).or_insert_with(|| {
+        self.images.entry(image_id).or_insert_with(|| {
             let image = &self.base.slot_images[image_id];
             Image::from_base(image)
         });
+        let backend_image = self
+            .images
+            .get(&image_id)
+            .expect("image inserted above must be present");
         let original_texture = backend_image.handle();
         let current_texture = backend_image.current_texture;
-        let backend_view = self
+        let view_mismatch = self
             .image_views
-            .entry(view_id)
-            .or_insert_with(|| ImageView::from_image_view_info(&view, backend_image));
+            .get(&view_id)
+            .is_some_and(|backend_view| !backend_view.matches_base_image(&view, backend_image));
+        if view_mismatch {
+            let old_view = self.image_views.get(&view_id);
+            trace_image_view_event(5, view_id, &view, backend_image, old_view);
+            self.image_views.remove(&view_id);
+            self.remove_framebuffers_for_view(view_id);
+        }
+        let backend_image = self
+            .images
+            .get(&image_id)
+            .expect("image inserted above must be present");
+        let backend_view = self.image_views.entry(view_id).or_insert_with(|| {
+            ImageView::from_image_view_info(&view, backend_image, self.null_image_views)
+        });
+        trace_image_view_event(4, view_id, &view, backend_image, Some(backend_view));
         let display_texture = backend_view.handle_for_texture_type(TextureType::Color2D);
         if display_texture == 0 {
             return None;
@@ -2251,6 +3451,156 @@ impl TextureCache {
         })
     }
 
+    /// Diagnostic-only present-time readback of already-materialised GL
+    /// images by guest GPU address.
+    ///
+    /// Upstream has no equivalent production path; this mirrors the local
+    /// `AccelerateDisplay` debug hooks and is gated by
+    /// `RUZU_DUMP_PRESENT_EXTRA_GPU_ADDRS`; trace-ring emission still requires
+    /// `opengl.present_texture`, while PPM dumping only requires
+    /// `RUZU_DUMP_PRESENT_EXTRA_PPM_DIR`.
+    pub fn trace_present_images_by_gpu_addr(&self, present_index: u64, gpu_addrs: &[u64]) {
+        let trace_enabled = common::trace::is_enabled(common::trace::cat::PRESENT_TEXTURE);
+        let ppm_enabled = std::env::var_os("RUZU_DUMP_PRESENT_EXTRA_PPM_DIR").is_some();
+        if !trace_enabled && !ppm_enabled {
+            return;
+        }
+
+        let _texture_lock = self.base.mutex.lock();
+        for &gpu_addr in gpu_addrs {
+            let Some((image_id, image_base)) = self
+                .base
+                .slot_images
+                .iter()
+                .find(|(_, image)| image.gpu_addr == gpu_addr)
+            else {
+                if trace_enabled {
+                    common::trace::emit_raw(
+                        common::trace::cat::PRESENT_TEXTURE,
+                        &[
+                            present_index,
+                            gpu_addr,
+                            u64::MAX,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                        ],
+                    );
+                }
+                continue;
+            };
+
+            let Some(image) = self.images.get(&image_id) else {
+                if trace_enabled {
+                    common::trace::emit_raw(
+                        common::trace::cat::PRESENT_TEXTURE,
+                        &[
+                            present_index,
+                            gpu_addr,
+                            image_id.index as u64,
+                            0,
+                            image_base.info.size.width as u64,
+                            image_base.info.size.height as u64,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                        ],
+                    );
+                }
+                continue;
+            };
+
+            unsafe {
+                if trace_enabled {
+                    trace_present_image_grid(
+                        present_index,
+                        gpu_addr,
+                        image_id.index as u64,
+                        image,
+                        image_base,
+                    );
+                }
+                dump_present_image_ppm(
+                    present_index,
+                    gpu_addr,
+                    image_id.index as u64,
+                    image,
+                    image_base,
+                );
+                if common::trace::is_enabled(common::trace::cat::PRESENT_ALIAS) {
+                    let width = image_base.info.size.width;
+                    let height = image_base.info.size.height;
+                    let current_texture = image.current_texture;
+                    let (current_checksum, current_rgb_nonzero, current_first_rgba, _) =
+                        sample_present_texture(current_texture, width, height);
+                    let mut emitted = false;
+                    for view_id in &image_base.image_view_ids {
+                        let Some(view) = self.image_views.get(view_id) else {
+                            continue;
+                        };
+                        let view_texture = view.default_handle();
+                        let (view_checksum, view_rgb_nonzero, view_first_rgba, _) =
+                            sample_present_texture(view_texture, width, height);
+                        common::trace::emit_raw(
+                            common::trace::cat::PRESENT_ALIAS,
+                            &[
+                                present_index,
+                                gpu_addr,
+                                image_id.index as u64,
+                                view_id.index as u64,
+                                current_texture as u64,
+                                view_texture as u64,
+                                width as u64,
+                                height as u64,
+                                current_checksum,
+                                view_checksum,
+                                current_rgb_nonzero,
+                                view_rgb_nonzero,
+                                current_first_rgba,
+                                view_first_rgba,
+                            ],
+                        );
+                        emitted = true;
+                    }
+                    if !emitted {
+                        common::trace::emit_raw(
+                            common::trace::cat::PRESENT_ALIAS,
+                            &[
+                                present_index,
+                                gpu_addr,
+                                image_id.index as u64,
+                                u64::MAX,
+                                current_texture as u64,
+                                0,
+                                width as u64,
+                                height as u64,
+                                current_checksum,
+                                0,
+                                current_rgb_nonzero,
+                                0,
+                                current_first_rgba,
+                                0,
+                            ],
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     /// OpenGL counterpart of upstream `TextureCache<P>::GetFramebuffer()` for
     /// the currently ported single-color-target clear/present path.
     pub fn framebuffer_for_render_target(
@@ -2268,17 +3618,16 @@ impl TextureCache {
         // ends up rendering visible content when we redirect, the bug is in
         // the late-created parent textures.
         let force_first_flinger = std::env::var_os("RUZU_FBO_FORCE_FIRST_FLINGER").is_some();
-        let lookup_addr = if force_first_flinger
-            && (rt.address == 0x502570000 || rt.address == 0x502DE0000)
-        {
-            log::warn!(
-                "[FBO_FORCE_FIRST] redirecting RT gpu=0x{:X} → 0x501D00000",
+        let lookup_addr =
+            if force_first_flinger && (rt.address == 0x502570000 || rt.address == 0x502DE0000) {
+                log::warn!(
+                    "[FBO_FORCE_FIRST] redirecting RT gpu=0x{:X} → 0x501D00000",
+                    rt.address
+                );
+                0x501D00000
+            } else {
                 rt.address
-            );
-            0x501D00000
-        } else {
-            rt.address
-        };
+            };
         let (image_id, image_base) = self.base.slot_images.iter().find(|(_, image)| {
             image.gpu_addr == lookup_addr
                 && image.info.size.width == rt.width
@@ -2307,14 +3656,36 @@ impl TextureCache {
         }
         let view_base = self.base.slot_image_views[view_id].clone();
 
-        let backend_image = self
-            .images
+        self.images
             .entry(image_id)
             .or_insert_with(|| Image::from_base(&image_base));
-        let backend_view = self
-            .image_views
-            .entry(view_id)
-            .or_insert_with(|| ImageView::new_color_2d(&view_base, backend_image));
+        let view_mismatch = {
+            let backend_image = self
+                .images
+                .get(&image_id)
+                .expect("image inserted above must be present");
+            self.image_views
+                .get(&view_id)
+                .is_some_and(|view| !view.matches_base_image(&view_base, backend_image))
+        };
+        if view_mismatch {
+            let backend_image = self
+                .images
+                .get(&image_id)
+                .expect("image inserted above must be present");
+            let old_view = self.image_views.get(&view_id);
+            trace_image_view_event(7, view_id, &view_base, backend_image, old_view);
+            self.image_views.remove(&view_id);
+            self.remove_framebuffers_for_view(view_id);
+        }
+        let backend_image = self
+            .images
+            .get(&image_id)
+            .expect("image inserted above must be present");
+        let backend_view = self.image_views.entry(view_id).or_insert_with(|| {
+            ImageView::new_color_2d(&view_base, backend_image, self.null_image_views)
+        });
+        trace_image_view_event(6, view_id, &view_base, backend_image, Some(backend_view));
         let attachment_texture = if view_base.flags.contains(ImageViewFlagBits::SLICE) {
             backend_view.handle_for_texture_type(TextureType::Color3D)
         } else {
@@ -2326,42 +3697,35 @@ impl TextureCache {
 
         let view_w = view_base.size.width as i32;
         let view_h = view_base.size.height as i32;
-        let parent_handle = backend_image.handle();
         let framebuffer = self.framebuffers.entry(view_id).or_insert_with(|| {
             let mut framebuffer = 0;
             unsafe {
                 gl::CreateFramebuffers(1, &mut framebuffer);
                 if framebuffer != 0 {
-                    if std::env::var_os("RUZU_FBO_ATTACH_PARENT").is_some() && parent_handle != 0 {
-                        // Attach the parent TEXTURE_2D_ARRAY directly at layer 0
-                        gl::NamedFramebufferTextureLayer(framebuffer, gl::COLOR_ATTACHMENT0, parent_handle, 0, 0);
-                        log::warn!("[FBO_ATTACH_PARENT] fbo={} parent={} layer=0", framebuffer, parent_handle);
-                    } else {
-                        if view_base.flags.contains(ImageViewFlagBits::SLICE) {
-                            if view_base.range.extent.layers > 1 {
-                                gl::NamedFramebufferTexture(
-                                    framebuffer,
-                                    gl::COLOR_ATTACHMENT0,
-                                    attachment_texture,
-                                    0,
-                                );
-                            } else {
-                                gl::NamedFramebufferTextureLayer(
-                                    framebuffer,
-                                    gl::COLOR_ATTACHMENT0,
-                                    attachment_texture,
-                                    0,
-                                    view_base.range.base.layer,
-                                );
-                            }
-                        } else {
+                    if view_base.flags.contains(ImageViewFlagBits::SLICE) {
+                        if view_base.range.extent.layers > 1 {
                             gl::NamedFramebufferTexture(
                                 framebuffer,
                                 gl::COLOR_ATTACHMENT0,
                                 attachment_texture,
                                 0,
                             );
+                        } else {
+                            gl::NamedFramebufferTextureLayer(
+                                framebuffer,
+                                gl::COLOR_ATTACHMENT0,
+                                attachment_texture,
+                                0,
+                                view_base.range.base.layer,
+                            );
                         }
+                    } else {
+                        gl::NamedFramebufferTexture(
+                            framebuffer,
+                            gl::COLOR_ATTACHMENT0,
+                            attachment_texture,
+                            0,
+                        );
                     }
                     // Upstream `Framebuffer::Framebuffer` (gl_texture_cache.cpp:1326)
                     // uses `glNamedFramebufferDrawBuffer` (direct state access)
@@ -2378,12 +3742,6 @@ impl TextureCache {
                         gl::FRAMEBUFFER_DEFAULT_HEIGHT,
                         view_h,
                     );
-                    if std::env::var_os("RUZU_FBO_INIT_CLEAR").is_some() {
-                        let init_color = [0.0f32, 0.0, 0.0, 1.0];
-                        gl::ClearNamedFramebufferfv(framebuffer, gl::COLOR, 0, init_color.as_ptr());
-                        gl::Finish();
-                        log::warn!("[FBO_INIT_CLEAR] fbo={} cleared to black", framebuffer);
-                    }
                 }
             }
             TextureCacheFramebuffer {
@@ -2548,6 +3906,18 @@ impl TextureCache {
     }
 }
 
+impl Drop for TextureCache {
+    fn drop(&mut self) {
+        unsafe {
+            for &handle in &self.null_image_handles {
+                if handle != 0 {
+                    gl::DeleteTextures(1, &handle);
+                }
+            }
+        }
+    }
+}
+
 impl Default for TextureCache {
     /// Standalone default for tests / fallback paths. Production
     /// construction goes through `RasterizerOpenGL::new`, which threads
@@ -2562,6 +3932,7 @@ impl Default for TextureCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::texture_cache::image_view_info::SwizzleSource;
 
     #[test]
     fn constants() {
@@ -2594,5 +3965,58 @@ mod tests {
             present_internal_format(PixelFormat::R5G6B5Unorm),
             gl::RGB565
         );
+    }
+
+    #[test]
+    fn decode_swizzle_matches_upstream_sources() {
+        assert_eq!(
+            decode_swizzle([
+                SwizzleSource::R as u8,
+                SwizzleSource::R as u8,
+                SwizzleSource::R as u8,
+                SwizzleSource::OneFloat as u8,
+            ]),
+            Some([
+                SwizzleSource::R,
+                SwizzleSource::R,
+                SwizzleSource::R,
+                SwizzleSource::OneFloat,
+            ])
+        );
+        assert_eq!(decode_swizzle([u8::MAX; 4]), None);
+    }
+
+    #[test]
+    fn image_view_parent_guard_rejects_stale_backend_view() {
+        use crate::texture_cache::format_lookup_table::PixelFormat;
+        use crate::texture_cache::image_info::ImageInfo;
+        use crate::texture_cache::image_view_base::ImageViewBase;
+        use crate::texture_cache::image_view_info::ImageViewInfo;
+        use crate::texture_cache::types::ImageType;
+        use common::slot_vector::SlotId;
+
+        let image_id = SlotId { index: 42 };
+        let image_info = ImageInfo {
+            format: PixelFormat::A8B8G8R8Unorm,
+            image_type: ImageType::E2D,
+            ..ImageInfo::default()
+        };
+        let view_info = ImageViewInfo {
+            format: PixelFormat::A8B8G8R8Unorm,
+            ..ImageViewInfo::default()
+        };
+        let base = ImageViewBase::new(&view_info, &image_info, image_id, 0x1000);
+        let mut image = Image::new();
+        image.current_texture = 7;
+
+        let mut view = ImageView::new();
+        assert!(!view.matches_base_image(&base, &image));
+
+        view.image_id = image_id;
+        view.original_texture = 7;
+        assert!(view.matches_base_image(&base, &image));
+
+        image.current_texture = 8;
+        assert!(!view.matches_base_image(&base, &image));
     }
 }

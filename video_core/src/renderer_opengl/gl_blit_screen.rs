@@ -9,7 +9,6 @@
 use crate::framebuffer_config::FramebufferConfig;
 use ruzu_core::frontend::framebuffer_layout::FramebufferLayout;
 
-use super::gl_state_tracker::StateTracker;
 use super::present::filters::{self, ScalingFilter};
 use super::present::layer::Layer;
 use super::present::window_adapt_pass::WindowAdaptPass;
@@ -44,31 +43,34 @@ impl BlitScreen {
         &mut self,
         framebuffers: &[FramebufferConfig],
         layout: &FramebufferLayout,
-        state_tracker: &mut StateTracker,
         rasterizer: &mut RasterizerOpenGL,
         invert_y: bool,
         device_memory: Option<&crate::renderer_base::DeviceMemoryReader>,
     ) {
         // Notify state tracker about state changes we're about to make.
         // Port of the state_tracker.Notify*() calls in upstream DrawScreen.
-        state_tracker.notify_screen_draw_vertex_array();
-        state_tracker.notify_polygon_modes();
-        state_tracker.notify_viewport0();
-        state_tracker.notify_scissor0();
-        state_tracker.notify_color_mask(0);
-        state_tracker.notify_blend0();
-        state_tracker.notify_framebuffer();
-        state_tracker.notify_front_face();
-        state_tracker.notify_cull_test();
-        state_tracker.notify_depth_test();
-        state_tracker.notify_stencil_test();
-        state_tracker.notify_polygon_offset();
-        state_tracker.notify_rasterize_enable();
-        state_tracker.notify_framebuffer_srgb();
-        state_tracker.notify_logic_op();
-        state_tracker.notify_clip_control();
-        state_tracker.notify_alpha_test();
-        state_tracker.clip_control(gl::LOWER_LEFT, gl::ZERO_TO_ONE);
+        // Scoped so the rasterizer borrow ends before window_adapt reuses it.
+        {
+            let state_tracker = rasterizer.state_tracker_mut();
+            state_tracker.notify_screen_draw_vertex_array();
+            state_tracker.notify_polygon_modes();
+            state_tracker.notify_viewport0();
+            state_tracker.notify_scissor0();
+            state_tracker.notify_color_mask(0);
+            state_tracker.notify_blend0();
+            state_tracker.notify_framebuffer();
+            state_tracker.notify_front_face();
+            state_tracker.notify_cull_test();
+            state_tracker.notify_depth_test();
+            state_tracker.notify_stencil_test();
+            state_tracker.notify_polygon_offset();
+            state_tracker.notify_rasterize_enable();
+            state_tracker.notify_framebuffer_srgb();
+            state_tracker.notify_logic_op();
+            state_tracker.notify_clip_control();
+            state_tracker.notify_alpha_test();
+            state_tracker.clip_control(gl::LOWER_LEFT, gl::ZERO_TO_ONE);
+        }
 
         unsafe {
             gl::Enable(gl::CULL_FACE);

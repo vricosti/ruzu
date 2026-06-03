@@ -9,18 +9,74 @@
 use common::heap_tracker::HeapTracker;
 use common::host_memory::HostMemory;
 use common::page_table::{PageInfo, PageTable, PageType};
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc, Mutex,
+};
 
 use crate::core::SystemRef;
 use crate::device_memory::{dram_memory_map, DeviceMemory};
 use crate::gpu_dirty_memory_manager::GpuDirtyMemoryManager;
-use crate::hle::kernel::svc::svc_results::RESULT_INVALID_CURRENT_MEMORY;
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 
 /// Page size constants matching upstream YUZU_PAGEBITS / YUZU_PAGESIZE.
 const PAGE_BITS: usize = 12;
 const PAGE_SIZE: u64 = 1 << PAGE_BITS;
 const PAGE_MASK: u64 = PAGE_SIZE - 1;
+
+static RASTERIZER_MARK_CACHED_LAST_STAGE: AtomicU64 = AtomicU64::new(0);
+static RASTERIZER_MARK_CACHED_COUNTS: [AtomicU64; 9] = [
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+];
+
+fn record_rasterizer_mark_cached_stage(stage: usize) {
+    if std::env::var_os("RUZU_PROFILE_RASTERIZER_MARK_CACHED_STALL").is_none() {
+        return;
+    }
+    RASTERIZER_MARK_CACHED_LAST_STAGE.store(stage as u64, Ordering::Relaxed);
+    if let Some(counter) = RASTERIZER_MARK_CACHED_COUNTS.get(stage) {
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+pub fn dump_rasterizer_mark_cached_stall_profile() {
+    if RASTERIZER_MARK_CACHED_COUNTS[0].load(Ordering::Relaxed) == 0 {
+        return;
+    }
+    const NAMES: [&str; 9] = [
+        "enter",
+        "after_guard",
+        "after_page_table",
+        "after_num_pages",
+        "before_page_loop",
+        "in_page_loop",
+        "after_page_loop",
+        "exit",
+        "early_return",
+    ];
+    let last_stage = RASTERIZER_MARK_CACHED_LAST_STAGE.load(Ordering::Relaxed) as usize;
+    let last_stage_name = NAMES.get(last_stage).copied().unwrap_or("unknown");
+    eprintln!(
+        "[RASTERIZER_MARK_CACHED_STALL_PROFILE] last_stage={} ({})",
+        last_stage, last_stage_name
+    );
+    for (index, name) in NAMES.iter().enumerate() {
+        eprintln!(
+            "[RASTERIZER_MARK_CACHED_STALL_PROFILE]   {:02} {:<24} {}",
+            index,
+            name,
+            RASTERIZER_MARK_CACHED_COUNTS[index].load(Ordering::Relaxed)
+        );
+    }
+}
 
 /// Memory permission for mapping operations.
 /// Matches upstream Common::MemoryPermission.
@@ -788,17 +844,24 @@ impl Memory {
     /// hook. Reactive flushing (the write-protect optimization) can be added
     /// in a follow-up.
     pub fn rasterizer_mark_region_cached(&self, vaddr: u64, size: u64, cached: bool) {
+        record_rasterizer_mark_cached_stage(0);
         if vaddr == 0 || size == 0 || self.current_page_table.is_null() {
+            record_rasterizer_mark_cached_stage(8);
             return;
         }
+        record_rasterizer_mark_cached_stage(1);
         let pt = unsafe { &*self.current_page_table };
+        record_rasterizer_mark_cached_stage(2);
         // Upstream computes `num_pages` as
         //   ((vaddr + size - 1) >> PAGEBITS) - (vaddr >> PAGEBITS) + 1
         // so single-byte writes still touch one page, and a write straddling
         // a page boundary touches two pages — even when `size < PAGE_SIZE`.
         let num_pages = ((vaddr + size - 1) >> PAGE_BITS) - (vaddr >> PAGE_BITS) + 1;
+        record_rasterizer_mark_cached_stage(3);
         let mut current_vaddr = vaddr;
+        record_rasterizer_mark_cached_stage(4);
         for _ in 0..num_pages {
+            record_rasterizer_mark_cached_stage(5);
             let page_idx = (current_vaddr >> PAGE_BITS) as usize;
             if page_idx < pt.pointers.size() {
                 let entry = &pt.pointers[page_idx];
@@ -835,6 +898,8 @@ impl Memory {
             }
             current_vaddr += PAGE_SIZE as u64;
         }
+        record_rasterizer_mark_cached_stage(6);
+        record_rasterizer_mark_cached_stage(7);
     }
 
     fn current_physical_address(&self, vaddr: u64) -> Option<u64> {
@@ -905,8 +970,13 @@ impl Memory {
             let block_size = ((PAGE_SIZE as usize) - page_offset).min(remaining);
 
             if self.get_pointer_impl(vaddr).is_null() {
-                log::error!("Unmapped cache maintenance @ {:#018x}", vaddr);
-                return RESULT_INVALID_CURRENT_MEMORY;
+                // Upstream zuyu's cache helpers currently succeed without
+                // checking page mappings. Preserve that behaviour for guest
+                // cache-maintenance SVCs while still letting mapped
+                // rasterizer-cached pages trigger the Rust-side coherency hook.
+                vaddr += block_size as u64;
+                remaining -= block_size;
+                continue;
             }
 
             if self.page_type_at(vaddr) == Some(PageType::RasterizerCachedMemory) {
@@ -1018,6 +1088,81 @@ impl Memory {
     /// Matches upstream `Memory::Impl::Write<T>`.
     #[inline]
     unsafe fn write_raw<T: Copy>(&self, vaddr: u64, data: T) {
+        // `RUZU_TRACE_RAW_WRITE_AT=0xVADDR` — log a backtrace whenever the
+        // [vaddr, vaddr+sizeof(T)) range covers the target. `write_raw`
+        // is the lowest-level guest-memory writer; all of `write_8/16/
+        // 32/64`, `write_32_no_rasterizer`, `write_block_no_rasterizer`
+        // and `write_block` ultimately funnel through here, so this
+        // catches every Rust-side write regardless of the public entry
+        // point.
+        //
+        // The target is parsed once via `OnceLock` so the hot path is
+        // just an atomic load + range check; when unset, the cost is
+        // one extra branch.
+        {
+            use std::sync::OnceLock;
+            static TARGET: OnceLock<Option<u64>> = OnceLock::new();
+            let target = *TARGET.get_or_init(|| {
+                std::env::var("RUZU_TRACE_RAW_WRITE_AT")
+                    .ok()
+                    .and_then(|s| u64::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok())
+            });
+            if let Some(target) = target {
+                let size = std::mem::size_of::<T>() as u64;
+                if vaddr <= target && target < vaddr + size {
+                    let bt = std::backtrace::Backtrace::force_capture();
+                    // For sizes ≤ 8, we can read back the bytes from the
+                    // input data via raw memory copy to format them.
+                    let mut buf = [0u8; 8];
+                    let n = (size as usize).min(8);
+                    std::ptr::copy_nonoverlapping(
+                        &data as *const T as *const u8,
+                        buf.as_mut_ptr(),
+                        n,
+                    );
+                    let mut hex = String::new();
+                    for b in &buf[..n] {
+                        use std::fmt::Write;
+                        let _ = write!(hex, "{:02x}", b);
+                    }
+                    eprintln!(
+                        "[RAW_WRITE_AT] vaddr=0x{:016X} size={} bytes={}\n{}",
+                        vaddr, size, hex, bt
+                    );
+                }
+            }
+        }
+
+        // `RUZU_TRACE_RAW_WRITE_VALUE=0xVALUE` — log a backtrace whenever
+        // `write_raw` is called with a 4-byte value equal to VALUE,
+        // regardless of address. Used to hunt for a "magic" sentinel
+        // value (e.g. 0x80000029 in MK8D task #112) without knowing
+        // where it lands. Hot-path cost: 1 atomic load + 1 size check
+        // + 1 value compare when enabled, 1 atomic load when not.
+        {
+            use std::sync::OnceLock;
+            static TARGET_VALUE: OnceLock<Option<u32>> = OnceLock::new();
+            let target_value = *TARGET_VALUE.get_or_init(|| {
+                std::env::var("RUZU_TRACE_RAW_WRITE_VALUE")
+                    .ok()
+                    .and_then(|s| u32::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok())
+            });
+            if let Some(target_value) = target_value {
+                let size = std::mem::size_of::<T>();
+                if size == 4 {
+                    let val_u32 =
+                        unsafe { std::ptr::read_unaligned(&data as *const T as *const u32) };
+                    if val_u32 == target_value {
+                        let bt = std::backtrace::Backtrace::force_capture();
+                        eprintln!(
+                            "[RAW_WRITE_VALUE] vaddr=0x{:016X} size={} value=0x{:08X}\n{}",
+                            vaddr, size, val_u32, bt
+                        );
+                    }
+                }
+            }
+        }
+
         let ptr = self.get_pointer_impl(vaddr);
         if ptr.is_null() {
             log::error!(
@@ -1140,6 +1285,30 @@ impl Memory {
     /// Used for host-side HLE/service writes where ruzu already holds the global
     /// `Mutex<Memory>`. Guest/JIT writes must keep using `write_block`.
     pub fn write_block_no_rasterizer(&self, dest_addr: u64, src: &[u8]) -> bool {
+        // `RUZU_TRACE_WRITE_BLOCK_AT=0xVADDR` — log every HLE-side
+        // `write_block_no_rasterizer` whose [dest, dest+len) range covers
+        // VADDR. Used to attribute non-fastmem writes (HLE WriteBuffer,
+        // etc.) that bypass both JIT memory callbacks and the per-u32
+        // `RUZU_TRACE_MEMORY_W32_AT_VADDR` hook in `write_32`.
+        if let Ok(spec) = std::env::var("RUZU_TRACE_WRITE_BLOCK_AT") {
+            if let Ok(target) = u64::from_str_radix(spec.trim_start_matches("0x"), 16) {
+                if dest_addr <= target && target < dest_addr + src.len() as u64 {
+                    let bt = std::backtrace::Backtrace::force_capture();
+                    let off = (target - dest_addr) as usize;
+                    let len = src.len();
+                    let preview_end = (off + 16).min(len);
+                    let mut preview = String::new();
+                    for &b in &src[off..preview_end] {
+                        use std::fmt::Write;
+                        let _ = write!(preview, "{:02x}", b);
+                    }
+                    eprintln!(
+                        "[WRITE_BLOCK_AT] dest=0x{:016X} len={:#x} off=0x{:X} preview={}\n{}",
+                        dest_addr, len, off, preview, bt
+                    );
+                }
+            }
+        }
         let size = src.len();
         if size == 0 {
             return true;
@@ -1166,6 +1335,110 @@ impl Memory {
             } else {
                 unsafe {
                     std::ptr::copy_nonoverlapping(src[offset..].as_ptr(), ptr, copy_amount);
+                }
+            }
+
+            vaddr += copy_amount as u64;
+            offset += copy_amount;
+            remaining -= copy_amount;
+        }
+        user_accessible
+    }
+
+    /// SEGV-safe variant for HLE IPC output buffers.
+    ///
+    /// `write_block_no_rasterizer` uses direct host pointers, matching the hot
+    /// memory path. IPC out-buffers can race with guest-side unmapping/protection
+    /// while the service thread is copying a large file chunk; using
+    /// process_vm_writev turns a temporarily inaccessible host page into `EFAULT`
+    /// instead of taking the emulator down with SIGSEGV.
+    pub fn write_block_no_rasterizer_checked(&self, dest_addr: u64, src: &[u8]) -> bool {
+        let size = src.len();
+        if size == 0 {
+            return true;
+        }
+
+        if !self.address_space_contains(dest_addr, size) {
+            log::error!(
+                "Unmapped checked WriteBlock @ {:#018x} size={:#x}",
+                dest_addr,
+                size
+            );
+            return false;
+        }
+
+        let self_pid = unsafe { libc::getpid() };
+        let first_ptr = self.get_pointer_impl(dest_addr);
+        if !first_ptr.is_null() {
+            let local_iov = libc::iovec {
+                iov_base: src.as_ptr() as *mut libc::c_void,
+                iov_len: size,
+            };
+            let remote_iov = libc::iovec {
+                iov_base: first_ptr as *mut libc::c_void,
+                iov_len: size,
+            };
+            let written = unsafe {
+                libc::process_vm_writev(
+                    self_pid,
+                    &local_iov as *const _,
+                    1,
+                    &remote_iov as *const _,
+                    1,
+                    0,
+                )
+            };
+            if written == size as isize {
+                return true;
+            }
+            log::error!(
+                "checked WriteBlock fast path failed @ {:#018x} size={:#x} written={}",
+                dest_addr,
+                size,
+                written
+            );
+        }
+
+        let mut remaining = size;
+        let mut offset = 0usize;
+        let mut vaddr = dest_addr;
+        let mut user_accessible = true;
+
+        while remaining > 0 {
+            let page_offset = (vaddr & PAGE_MASK) as usize;
+            let copy_amount = ((PAGE_SIZE as usize) - page_offset).min(remaining);
+
+            let ptr = self.get_pointer_impl(vaddr);
+            if ptr.is_null() {
+                log::error!("Unmapped checked WriteBlock @ {:#018x}", vaddr);
+                user_accessible = false;
+            } else {
+                let local_iov = libc::iovec {
+                    iov_base: src[offset..].as_ptr() as *mut libc::c_void,
+                    iov_len: copy_amount,
+                };
+                let remote_iov = libc::iovec {
+                    iov_base: ptr as *mut libc::c_void,
+                    iov_len: copy_amount,
+                };
+                let written = unsafe {
+                    libc::process_vm_writev(
+                        self_pid,
+                        &local_iov as *const _,
+                        1,
+                        &remote_iov as *const _,
+                        1,
+                        0,
+                    )
+                };
+                if written != copy_amount as isize {
+                    log::error!(
+                        "checked WriteBlock failed @ {:#018x} size={:#x} written={}",
+                        vaddr,
+                        copy_amount,
+                        written
+                    );
+                    user_accessible = false;
                 }
             }
 
