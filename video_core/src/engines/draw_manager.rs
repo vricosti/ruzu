@@ -465,6 +465,11 @@ pub trait Maxwell3DAccess {
     /// Read rasterizer state.
     fn rasterizer_info(&self) -> crate::engines::maxwell_3d::RasterizerInfo;
 
+    /// Read `regs.rasterize_enable`, matching upstream `SyncRasterizeEnable`.
+    fn rasterize_enable(&self) -> bool {
+        true
+    }
+
     /// Read shader program region base address.
     fn program_base_address(&self) -> u64;
 
@@ -564,12 +569,13 @@ pub struct Maxwell3DDrawRegisters {
     pub blend_color: crate::engines::maxwell_3d::BlendColorInfo,
     pub depth_stencil: crate::engines::maxwell_3d::DepthStencilInfo,
     pub rasterizer: crate::engines::maxwell_3d::RasterizerInfo,
+    pub rasterize_enable: bool,
     pub descriptor_sync_regs: crate::texture_cache::texture_cache_base::DescriptorSyncRegs,
     pub window_origin_lower_left: bool,
     pub window_origin_flip_y: bool,
     pub viewport0_scale_y: f32,
-    pub viewport_transforms:
-        [crate::engines::maxwell_3d::ViewportTransformInfo; crate::engines::maxwell_3d::NUM_VIEWPORTS],
+    pub viewport_transforms: [crate::engines::maxwell_3d::ViewportTransformInfo;
+        crate::engines::maxwell_3d::NUM_VIEWPORTS],
     pub viewport_scale_offset_enabled: bool,
     pub surface_clip: crate::engines::maxwell_3d::SurfaceClipInfo,
     pub framebuffer_srgb: bool,
@@ -598,6 +604,7 @@ impl Default for Maxwell3DDrawRegisters {
             blend_color: Default::default(),
             depth_stencil: Default::default(),
             rasterizer: Default::default(),
+            rasterize_enable: true,
             descriptor_sync_regs: Default::default(),
             window_origin_lower_left: false,
             window_origin_flip_y: false,
@@ -641,6 +648,7 @@ impl Maxwell3DDrawRegisters {
             blend_color: maxwell3d.blend_color_info(),
             depth_stencil: maxwell3d.depth_stencil_info(),
             rasterizer: maxwell3d.rasterizer_info(),
+            rasterize_enable: maxwell3d.rasterize_enable(),
             descriptor_sync_regs: crate::texture_cache::texture_cache_base::DescriptorSyncRegs {
                 sampler_binding_via_header: matches!(
                     maxwell3d.sampler_binding(),
@@ -668,9 +676,8 @@ impl Maxwell3DDrawRegisters {
     }
 }
 
-#[derive(Clone)]
 enum Maxwell3DDrawSource<'a> {
-    Live(&'a dyn Maxwell3DAccess),
+    Live(&'a mut dyn Maxwell3DAccess),
     Snapshot(Maxwell3DDrawRegisters),
 }
 
@@ -681,7 +688,6 @@ enum Maxwell3DDrawSource<'a> {
 /// Maxwell view instead of a raw `DrawState`; the live path reads through
 /// `Maxwell3DAccess` so Maxwell register-derived values do not live in
 /// `DrawState`.
-#[derive(Clone)]
 pub struct Maxwell3DDrawView<'a> {
     draw_state: &'a DrawState,
     source: Maxwell3DDrawSource<'a>,
@@ -695,7 +701,7 @@ impl<'a> Maxwell3DDrawView<'a> {
         }
     }
 
-    pub fn live(draw_state: &'a DrawState, maxwell3d: &'a dyn Maxwell3DAccess) -> Self {
+    pub fn live(draw_state: &'a DrawState, maxwell3d: &'a mut dyn Maxwell3DAccess) -> Self {
         Self {
             draw_state,
             source: Maxwell3DDrawSource::Live(maxwell3d),
@@ -810,8 +816,7 @@ impl<'a> Maxwell3DDrawView<'a> {
 
     pub fn scissors(
         &self,
-    ) -> [crate::engines::maxwell_3d::ScissorInfo; crate::engines::maxwell_3d::NUM_VIEWPORTS]
-    {
+    ) -> [crate::engines::maxwell_3d::ScissorInfo; crate::engines::maxwell_3d::NUM_VIEWPORTS] {
         match &self.source {
             Maxwell3DDrawSource::Live(maxwell3d) => {
                 std::array::from_fn(|i| maxwell3d.scissor_info(i as u32))
@@ -864,6 +869,13 @@ impl<'a> Maxwell3DDrawView<'a> {
         }
     }
 
+    pub fn rasterize_enable(&self) -> bool {
+        match &self.source {
+            Maxwell3DDrawSource::Live(maxwell3d) => maxwell3d.rasterize_enable(),
+            Maxwell3DDrawSource::Snapshot(registers) => registers.rasterize_enable,
+        }
+    }
+
     pub fn descriptor_sync_regs(
         &self,
     ) -> crate::texture_cache::texture_cache_base::DescriptorSyncRegs {
@@ -907,8 +919,8 @@ impl<'a> Maxwell3DDrawView<'a> {
 
     pub fn viewport_transforms(
         &self,
-    ) -> [crate::engines::maxwell_3d::ViewportTransformInfo; crate::engines::maxwell_3d::NUM_VIEWPORTS]
-    {
+    ) -> [crate::engines::maxwell_3d::ViewportTransformInfo;
+           crate::engines::maxwell_3d::NUM_VIEWPORTS] {
         match &self.source {
             Maxwell3DDrawSource::Live(maxwell3d) => {
                 std::array::from_fn(|i| maxwell3d.viewport_transform_info(i as u32))
@@ -949,6 +961,20 @@ impl<'a> Maxwell3DDrawView<'a> {
         match &self.source {
             Maxwell3DDrawSource::Live(maxwell3d) => maxwell3d.dirty_flags(),
             Maxwell3DDrawSource::Snapshot(registers) => registers.dirty_flags,
+        }
+    }
+
+    /// Clear a consumed Maxwell dirty flag on the live draw source.
+    ///
+    /// Upstream OpenGL sync helpers clear `maxwell3d->dirty.flags[...]`
+    /// inside each `Sync*` method. Snapshot mode is retained for tests and
+    /// cannot mutate the source; clearing is therefore a no-op there.
+    pub fn clear_dirty_flag(&mut self, index: u8) {
+        match &mut self.source {
+            Maxwell3DDrawSource::Live(maxwell3d) => maxwell3d.clear_dirty_flag(index),
+            Maxwell3DDrawSource::Snapshot(registers) => {
+                registers.dirty_flags[index as usize] = false;
+            }
         }
     }
 
@@ -1725,10 +1751,7 @@ impl DrawManager {
             self.draw_state.draw_indexed = draw_indexed;
             let rasterizer_present = maxwell3d.draw_rasterizer(&self.draw_state, instance_count);
             if trace_process_draw {
-                eprintln!(
-                    "[PROCESS_DRAW] rasterizer_present={}",
-                    rasterizer_present
-                );
+                eprintln!("[PROCESS_DRAW] rasterizer_present={}", rasterizer_present);
             }
         }
     }
@@ -1810,13 +1833,16 @@ mod tests {
         registers.window_origin_lower_left = true;
         registers.window_origin_flip_y = true;
         registers.viewport0_scale_y = -1.0;
-        registers.dirty_flags[crate::renderer_opengl::gl_state_tracker::dirty::VIEWPORTS as usize] =
-            true;
+        registers.dirty_flags
+            [crate::renderer_opengl::gl_state_tracker::dirty::VIEWPORTS as usize] = true;
 
         let view = Maxwell3DDrawView::with_register_snapshot(&draw_state, registers);
 
         assert!(std::ptr::eq(view.draw_state(), &draw_state));
-        assert_eq!(view.shader_program_addresses(), [0x1000, 0x2000, 0, 0, 0, 0]);
+        assert_eq!(
+            view.shader_program_addresses(),
+            [0x1000, 0x2000, 0, 0, 0, 0]
+        );
         assert_eq!(view.descriptor_sync_regs().tex_header_addr, 0x3000);
         assert!(view.window_origin_lower_left());
         assert!(view.window_origin_flip_y());
@@ -1830,17 +1856,16 @@ mod tests {
     fn maxwell_draw_view_exposes_raw_viewport_register_snapshot() {
         let draw_state = DrawState::default();
         let mut registers = Maxwell3DDrawRegisters::default();
-        registers.viewport_transforms[0] =
-            crate::engines::maxwell_3d::ViewportTransformInfo {
-                scale_x: 10.0,
-                scale_y: -20.0,
-                scale_z: 0.25,
-                translate_x: 30.0,
-                translate_y: 40.0,
-                translate_z: 0.5,
-                swizzle: 0x3210,
-                snap_grid_precision: 0x0504,
-            };
+        registers.viewport_transforms[0] = crate::engines::maxwell_3d::ViewportTransformInfo {
+            scale_x: 10.0,
+            scale_y: -20.0,
+            scale_z: 0.25,
+            translate_x: 30.0,
+            translate_y: 40.0,
+            translate_z: 0.5,
+            swizzle: 0x3210,
+            snap_grid_precision: 0x0504,
+        };
         registers.viewport_scale_offset_enabled = true;
         registers.surface_clip = crate::engines::maxwell_3d::SurfaceClipInfo {
             x: 1,

@@ -103,8 +103,7 @@ impl Device {
 
         let has_warp_intrinsics = is_nvidia && has_ext("GL_NV_gpu_shader5");
         let has_shader_ballot = has_ext("GL_ARB_shader_ballot");
-        let has_vertex_viewport_layer =
-            has_ext("GL_ARB_shader_viewport_layer_array") || has_ext("GL_NV_viewport_array2");
+        let has_vertex_viewport_layer = has_ext("GL_ARB_shader_viewport_layer_array");
         let has_image_load_formatted = has_ext("GL_EXT_shader_image_load_formatted");
         let has_texture_shadow_lod = has_ext("GL_EXT_texture_shadow_lod");
         let has_vertex_buffer_unified_memory = has_ext("GL_NV_vertex_buffer_unified_memory");
@@ -387,7 +386,8 @@ fn test_program(glsl: &'static CStr) -> bool {
 }
 
 fn test_variable_aoffi() -> bool {
-    test_program(c"#version 430 core
+    test_program(
+        c"#version 430 core
 // This is a unit test, please ignore me on apitrace bug reports.
 uniform sampler2D tex;
 uniform ivec2 variable_offset;
@@ -395,11 +395,13 @@ out vec4 output_attribute;
 void main() {
     output_attribute = textureOffset(tex, vec2(0), variable_offset);
 }
-")
+",
+    )
 }
 
 fn test_precise_bug() -> bool {
-    !test_program(c"#version 430 core
+    !test_program(
+        c"#version 430 core
 in vec3 coords;
 out float out_value;
 uniform sampler2DShadow tex;
@@ -407,7 +409,8 @@ void main() {
     precise float tmp_value = vec4(texture(tex, coords)).x;
     out_value = tmp_value;
 }
-")
+",
+    )
 }
 
 fn get_extensions() -> Vec<String> {

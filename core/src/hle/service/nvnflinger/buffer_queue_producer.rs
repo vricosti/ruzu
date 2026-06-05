@@ -557,12 +557,22 @@ impl BufferQueueProducer {
             && inner.override_max_buffer_count != 0
             && inner.override_max_buffer_count < max_buffer_count
         {
-            trace_bqp_ring(&[5, bqp_seq, Status::BadValue as i32 as u64, slot as i64 as u64]);
+            trace_bqp_ring(&[
+                5,
+                bqp_seq,
+                Status::BadValue as i32 as u64,
+                slot as i64 as u64,
+            ]);
             return (Status::BadValue, QueueBufferOutput::new());
         }
 
         if slot < 0 || slot >= max_buffer_count {
-            trace_bqp_ring(&[5, bqp_seq, Status::BadValue as i32 as u64, slot as i64 as u64]);
+            trace_bqp_ring(&[
+                5,
+                bqp_seq,
+                Status::BadValue as i32 as u64,
+                slot as i64 as u64,
+            ]);
             return (Status::BadValue, QueueBufferOutput::new());
         }
 
@@ -573,7 +583,12 @@ impl BufferQueueProducer {
                 slot,
                 inner.slots[s].buffer_state
             );
-            trace_bqp_ring(&[5, bqp_seq, Status::BadValue as i32 as u64, slot as i64 as u64]);
+            trace_bqp_ring(&[
+                5,
+                bqp_seq,
+                Status::BadValue as i32 as u64,
+                slot as i64 as u64,
+            ]);
             return (Status::BadValue, QueueBufferOutput::new());
         }
         if !inner.slots[s].request_buffer_called {
@@ -581,7 +596,12 @@ impl BufferQueueProducer {
                 "BufferQueueProducer::queue_buffer: slot {} queued without RequestBuffer",
                 slot
             );
-            trace_bqp_ring(&[5, bqp_seq, Status::BadValue as i32 as u64, slot as i64 as u64]);
+            trace_bqp_ring(&[
+                5,
+                bqp_seq,
+                Status::BadValue as i32 as u64,
+                slot as i64 as u64,
+            ]);
             return (Status::BadValue, QueueBufferOutput::new());
         }
 
@@ -590,7 +610,12 @@ impl BufferQueueProducer {
                 "BufferQueueProducer::queue_buffer: slot {} missing graphic buffer",
                 slot
             );
-            trace_bqp_ring(&[5, bqp_seq, Status::BadValue as i32 as u64, slot as i64 as u64]);
+            trace_bqp_ring(&[
+                5,
+                bqp_seq,
+                Status::BadValue as i32 as u64,
+                slot as i64 as u64,
+            ]);
             return (Status::BadValue, QueueBufferOutput::new());
         };
         let buffer_rect = Rectangle::new(
@@ -608,7 +633,12 @@ impl BufferQueueProducer {
                     slot,
                     buffer_rect
                 );
-                trace_bqp_ring(&[5, bqp_seq, Status::BadValue as i32 as u64, slot as i64 as u64]);
+                trace_bqp_ring(&[
+                    5,
+                    bqp_seq,
+                    Status::BadValue as i32 as u64,
+                    slot as i64 as u64,
+                ]);
                 return (Status::BadValue, QueueBufferOutput::new());
             }
         }

@@ -23,7 +23,7 @@ use crate::hle::service::sm::sm::ServiceManager;
 use super::mii_manager::MiiManager;
 use super::mii_result::{RESULT_INVALID_ARGUMENT, RESULT_PERMISSION_DENIED, RESULT_TEST_MODE_ONLY};
 use super::mii_types::{Age, DatabaseSessionMetadata, Gender, Race, SourceFlag};
-use super::types::char_info::CharInfo;
+use super::types::char_info::{CharInfo, CharInfoElement};
 use super::types::core_data::CoreData;
 use super::types::store_data::{StoreData, StoreDataElement};
 use super::types::ver3_store_data::Ver3StoreData;
@@ -173,6 +173,67 @@ impl IDatabaseService {
         (source_flag & SourceFlag::Database as u32) != 0
     }
 
+    fn trace_char_info(
+        stage: u64,
+        cmd: u32,
+        result: ResultCode,
+        aux0: u64,
+        aux1: u64,
+        char_info: Option<&CharInfo>,
+    ) {
+        if !common::trace::is_enabled(common::trace::cat::MII_SERVICE) {
+            return;
+        }
+        let (create_lo, create_hi, name_0_3, name_4_7, traits0, traits1) =
+            if let Some(char_info) = char_info {
+                let create_lo =
+                    u64::from_le_bytes(char_info.create_id[0..8].try_into().unwrap());
+                let create_hi =
+                    u64::from_le_bytes(char_info.create_id[8..16].try_into().unwrap());
+                let pack_name = |base: usize| -> u64 {
+                    let mut packed = 0u64;
+                    for index in 0..4 {
+                        packed |= (char_info.name.data[base + index] as u64) << (index * 16);
+                    }
+                    packed
+                };
+                let traits0 = (char_info.font_region as u64)
+                    | ((char_info.favorite_color as u64) << 8)
+                    | ((char_info.gender as u64) << 16)
+                    | ((char_info.height as u64) << 24)
+                    | ((char_info.build as u64) << 32)
+                    | ((char_info.type_val as u64) << 40)
+                    | ((char_info.region_move as u64) << 48);
+                let traits1 = (char_info.faceline_type as u64)
+                    | ((char_info.hair_type as u64) << 8)
+                    | ((char_info.eye_type as u64) << 16)
+                    | ((char_info.eyebrow_type as u64) << 24)
+                    | ((char_info.nose_type as u64) << 32)
+                    | ((char_info.mouth_type as u64) << 40)
+                    | ((char_info.glass_type as u64) << 48)
+                    | ((char_info.mole_type as u64) << 56);
+                (create_lo, create_hi, pack_name(0), pack_name(4), traits0, traits1)
+            } else {
+                (0, 0, 0, 0, 0, 0)
+            };
+        common::trace::emit_raw(
+            common::trace::cat::MII_SERVICE,
+            &[
+                stage,
+                cmd as u64,
+                result.get_inner_value() as u64,
+                aux0,
+                aux1,
+                create_lo,
+                create_hi,
+                name_0_3,
+                name_4_7,
+                traits0,
+                traits1,
+            ],
+        );
+    }
+
     fn is_db_test_mode_enabled(&self) -> bool {
         Self::query_db_test_mode_enabled(&self.set_sys)
     }
@@ -229,13 +290,12 @@ impl IDatabaseService {
         response.push_raw(&count);
     }
 
-    /// Cmd 3: Get — returns CharInfoElement array (CharInfo + Source u32 per element).
+    /// Cmd 3: Get — returns upstream `CharInfoElement` array.
     fn get_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         let service = Self::as_self(this);
         let mut request = CmifRequest::new(ctx);
         let source_flag_raw = request.raw::<u32>();
-        let max_count = ctx.get_write_buffer_size(0)
-            / (core::mem::size_of::<CharInfo>() + core::mem::size_of::<u32>());
+        let max_count = ctx.get_write_buffer_size(0) / core::mem::size_of::<CharInfoElement>();
         let result = {
             let metadata = service.metadata.lock().unwrap();
             service
@@ -247,21 +307,26 @@ impl IDatabaseService {
         match result {
             Ok(elements) => {
                 let count = elements.len() as u32;
+                Self::trace_char_info(
+                    1,
+                    3,
+                    RESULT_SUCCESS,
+                    source_flag_raw as u64,
+                    count as u64,
+                    elements.first().map(|(char_info, _)| char_info),
+                );
 
                 if !elements.is_empty() {
-                    let mut bytes = Vec::with_capacity(
-                        elements.len()
-                            * (core::mem::size_of::<CharInfo>() + core::mem::size_of::<u32>()),
-                    );
-                    for (char_info, source) in elements {
-                        bytes.extend_from_slice(unsafe {
-                            core::slice::from_raw_parts(
-                                (&char_info as *const CharInfo).cast::<u8>(),
-                                core::mem::size_of::<CharInfo>(),
-                            )
-                        });
-                        bytes.extend_from_slice(&(source as u32).to_le_bytes());
-                    }
+                    let elements: Vec<CharInfoElement> = elements
+                        .into_iter()
+                        .map(|(char_info, source)| CharInfoElement { char_info, source })
+                        .collect();
+                    let bytes = unsafe {
+                        core::slice::from_raw_parts(
+                            elements.as_ptr().cast::<u8>(),
+                            elements.len() * core::mem::size_of::<CharInfoElement>(),
+                        )
+                    };
                     write_out_array_bytes(ctx, 0, &bytes);
                 }
 
@@ -275,6 +340,7 @@ impl IDatabaseService {
                 response.push_raw(&count);
             }
             Err(result) => {
+                Self::trace_char_info(1, 3, result, source_flag_raw as u64, 0, None);
                 CmifResponse::result_only(ctx, result);
             }
         }
@@ -298,6 +364,14 @@ impl IDatabaseService {
         match result {
             Ok(elements) => {
                 let count = elements.len() as u32;
+                Self::trace_char_info(
+                    2,
+                    4,
+                    RESULT_SUCCESS,
+                    source_flag_raw as u64,
+                    count as u64,
+                    elements.first(),
+                );
 
                 if !elements.is_empty() {
                     let mut bytes =
@@ -323,6 +397,7 @@ impl IDatabaseService {
                 response.push_raw(&count);
             }
             Err(result) => {
+                Self::trace_char_info(2, 4, result, source_flag_raw as u64, 0, None);
                 CmifResponse::result_only(ctx, result);
             }
         }
@@ -350,12 +425,21 @@ impl IDatabaseService {
 
         match result {
             Ok(latest_char_info) => {
+                Self::trace_char_info(
+                    3,
+                    5,
+                    RESULT_SUCCESS,
+                    source_flag_raw as u64,
+                    0,
+                    Some(&latest_char_info),
+                );
                 let words = (std::mem::size_of::<CharInfo>() + 3) / 4;
                 let mut response = CmifResponse::new(ctx, 2 + words as u32, 0, 0);
                 response.push_result(RESULT_SUCCESS);
                 response.push_raw(&latest_char_info);
             }
             Err(result) => {
+                Self::trace_char_info(3, 5, result, source_flag_raw as u64, 0, Some(&char_info));
                 CmifResponse::result_only(ctx, result);
             }
         }
@@ -379,6 +463,14 @@ impl IDatabaseService {
             match Self::validate_build_random_args(age_raw, gender_raw, race_raw) {
                 Ok(args) => args,
                 Err(result) => {
+                    Self::trace_char_info(
+                        4,
+                        6,
+                        result,
+                        (age_raw as u64) | ((gender_raw as u64) << 8) | ((race_raw as u64) << 16),
+                        0,
+                        None,
+                    );
                     CmifResponse::result_only(ctx, result);
                     return;
                 }
@@ -389,6 +481,14 @@ impl IDatabaseService {
             .lock()
             .unwrap()
             .build_random(age, gender, race);
+        Self::trace_char_info(
+            4,
+            6,
+            RESULT_SUCCESS,
+            (age_raw as u64) | ((gender_raw as u64) << 8) | ((race_raw as u64) << 16),
+            0,
+            Some(&char_info),
+        );
         let words = (std::mem::size_of::<CharInfo>() + 3) / 4;
         let mut response = CmifResponse::new(ctx, 2 + words as u32, 0, 0);
         response.push_result(RESULT_SUCCESS);
@@ -402,11 +502,20 @@ impl IDatabaseService {
         log::debug!("IDatabaseService::BuildDefault called, index={}", index);
 
         if index < 0 || index as usize >= super::mii_types::DEFAULT_MII_COUNT {
+            Self::trace_char_info(5, 7, RESULT_INVALID_ARGUMENT, index as u64, 0, None);
             CmifResponse::result_only(ctx, RESULT_INVALID_ARGUMENT);
             return;
         }
 
         let char_info = service.manager.lock().unwrap().build_default(index as u32);
+        Self::trace_char_info(
+            5,
+            7,
+            RESULT_SUCCESS,
+            index as u64,
+            0,
+            Some(&char_info),
+        );
         let words = (std::mem::size_of::<CharInfo>() + 3) / 4;
         let mut response = CmifResponse::new(ctx, 2 + words as u32, 0, 0);
         response.push_result(RESULT_SUCCESS);
@@ -429,6 +538,20 @@ impl IDatabaseService {
         match result {
             Ok(elements) => {
                 let count = elements.len() as u32;
+                let mut first_char_info = None;
+                if let Some(element) = elements.first() {
+                    let mut char_info = CharInfo::default();
+                    char_info.set_from_store_data(&element.store_data);
+                    first_char_info = Some(char_info);
+                }
+                Self::trace_char_info(
+                    6,
+                    8,
+                    RESULT_SUCCESS,
+                    source_flag_raw as u64,
+                    count as u64,
+                    first_char_info.as_ref(),
+                );
 
                 if !elements.is_empty() {
                     let mut bytes = Vec::with_capacity(
@@ -455,6 +578,7 @@ impl IDatabaseService {
                 response.push_raw(&count);
             }
             Err(result) => {
+                Self::trace_char_info(6, 8, result, source_flag_raw as u64, 0, None);
                 CmifResponse::result_only(ctx, result);
             }
         }
@@ -476,6 +600,20 @@ impl IDatabaseService {
         match result {
             Ok(elements) => {
                 let count = elements.len() as u32;
+                let mut first_char_info = None;
+                if let Some(store_data) = elements.first() {
+                    let mut char_info = CharInfo::default();
+                    char_info.set_from_store_data(store_data);
+                    first_char_info = Some(char_info);
+                }
+                Self::trace_char_info(
+                    7,
+                    9,
+                    RESULT_SUCCESS,
+                    source_flag_raw as u64,
+                    count as u64,
+                    first_char_info.as_ref(),
+                );
 
                 if !elements.is_empty() {
                     let mut bytes =
@@ -501,6 +639,7 @@ impl IDatabaseService {
                 response.push_raw(&count);
             }
             Err(result) => {
+                Self::trace_char_info(7, 9, result, source_flag_raw as u64, 0, None);
                 CmifResponse::result_only(ctx, result);
             }
         }
@@ -529,12 +668,32 @@ impl IDatabaseService {
 
         match result {
             Ok(latest) => {
+                let mut latest_char_info = CharInfo::default();
+                latest_char_info.set_from_store_data(&latest);
+                Self::trace_char_info(
+                    8,
+                    10,
+                    RESULT_SUCCESS,
+                    source_flag_raw as u64,
+                    0,
+                    Some(&latest_char_info),
+                );
                 let words = (std::mem::size_of::<StoreData>() + 3) / 4;
                 let mut response = CmifResponse::new(ctx, 2 + words as u32, 0, 0);
                 response.push_result(RESULT_SUCCESS);
                 response.push_raw(&latest);
             }
             Err(result) => {
+                let mut input_char_info = CharInfo::default();
+                input_char_info.set_from_store_data(&store_data);
+                Self::trace_char_info(
+                    8,
+                    10,
+                    result,
+                    source_flag_raw as u64,
+                    0,
+                    Some(&input_char_info),
+                );
                 CmifResponse::result_only(ctx, result);
             }
         }
@@ -806,12 +965,14 @@ impl IDatabaseService {
             .convert_core_data_to_char_info(&core_data)
         {
             Ok(char_info) => {
+                Self::trace_char_info(9, 24, RESULT_SUCCESS, 0, 0, Some(&char_info));
                 let words = (std::mem::size_of::<CharInfo>() + 3) / 4;
                 let mut response = CmifResponse::new(ctx, 2 + words as u32, 0, 0);
                 response.push_result(RESULT_SUCCESS);
                 response.push_raw(&char_info);
             }
             Err(result) => {
+                Self::trace_char_info(9, 24, result, 0, 0, None);
                 CmifResponse::result_only(ctx, result);
             }
         }
@@ -830,12 +991,14 @@ impl IDatabaseService {
             .convert_v3_to_char_info(&mii_v3)
         {
             Ok(char_info) => {
+                Self::trace_char_info(10, 23, RESULT_SUCCESS, 0, 0, Some(&char_info));
                 let words = (std::mem::size_of::<CharInfo>() + 3) / 4;
                 let mut response = CmifResponse::new(ctx, 2 + words as u32, 0, 0);
                 response.push_result(RESULT_SUCCESS);
                 response.push_raw(&char_info);
             }
             Err(result) => {
+                Self::trace_char_info(10, 23, result, 0, 0, None);
                 CmifResponse::result_only(ctx, result);
             }
         }
@@ -857,12 +1020,14 @@ impl IDatabaseService {
             .convert_char_info_to_core_data(&char_info)
         {
             Ok(core_data) => {
+                Self::trace_char_info(11, 25, RESULT_SUCCESS, 0, 0, Some(&char_info));
                 let words = (std::mem::size_of::<CoreData>() + 3) / 4;
                 let mut response = CmifResponse::new(ctx, 2 + words as u32, 0, 0);
                 response.push_result(RESULT_SUCCESS);
                 response.push_raw(&core_data);
             }
             Err(result) => {
+                Self::trace_char_info(11, 25, result, 0, 0, Some(&char_info));
                 CmifResponse::result_only(ctx, result);
             }
         }

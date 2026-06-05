@@ -15,6 +15,9 @@ use ruzu_core::host1x_core::{Host1xChannelType, Host1xCoreInterface};
 use crate::host1x::ffmpeg::ffmpeg::Frame;
 use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
 use crate::host1x::syncpoint_manager::SyncpointManager;
+use crate::memory_manager::MemoryManager;
+use crate::rasterizer_interface::RasterizerInterface;
+use common::address_space::FlatAllocator;
 
 // --------------------------------------------------------------------------
 // FrameQueue
@@ -190,9 +193,15 @@ pub struct Host1x {
     /// (shader, buffer, texture, query) holds a reference to this same
     /// instance via the GPU/renderer/rasterizer construction chain.
     memory_manager: Arc<MaxwellDeviceMemoryManager>,
-    // Upstream fields not yet wired:
-    // - gmmu_manager: MemoryManager — requires Core::System and device memory manager
-    // - allocator: FlatAllocator<u32, 0, 32> — requires Common::FlatAllocator port
+    /// Host1x-local GPU virtual address space.
+    ///
+    /// Upstream constructs this as
+    /// `gmmu_manager{system, memory_manager, 32, 0, 12}` and binds the
+    /// renderer rasterizer from `GPU::Impl::BindRenderer`.
+    gmmu_manager: parking_lot::Mutex<MemoryManager>,
+    /// Upstream `Common::FlatAllocator<u32, 0, 32>` used by NvMap low-area
+    /// pins before mapping through `gmmu_manager`.
+    allocator: parking_lot::Mutex<FlatAllocator>,
 }
 
 impl Host1x {
@@ -202,6 +211,10 @@ impl Host1x {
             frame_queue: Arc::new(FrameQueue::new()),
             devices: Mutex::new(HashMap::new()),
             memory_manager: Arc::new(MaxwellDeviceMemoryManager::default()),
+            gmmu_manager: parking_lot::Mutex::new(MemoryManager::new_with_geometry(
+                0, 32, 0, 12, 12,
+            )),
+            allocator: parking_lot::Mutex::new(FlatAllocator::new(1 << 12, u32::MAX)),
         }
     }
 
@@ -214,6 +227,45 @@ impl Host1x {
     /// that all GPU caches reference.
     pub fn memory_manager(&self) -> &Arc<MaxwellDeviceMemoryManager> {
         &self.memory_manager
+    }
+
+    /// Port of upstream `Tegra::Host1x::Host1x::GMMU()`.
+    pub fn bind_gmmu_rasterizer(&self, rasterizer: &dyn RasterizerInterface) {
+        self.gmmu_manager.lock().bind_rasterizer(rasterizer);
+    }
+
+    /// Port of the Host1x side of upstream `NvMap::PinHandle(low_area_pin)`.
+    pub fn gmmu_map_low(&self, d_address: u64, size: usize) -> u32 {
+        if size == 0 {
+            return 0;
+        }
+        let Ok(size32) = u32::try_from(size) else {
+            log::error!("Host1x::gmmu_map_low: size 0x{size:X} exceeds 32-bit allocator range");
+            return 0;
+        };
+        let Some(address) = self.allocator.lock().allocate(size32) else {
+            log::error!("Host1x::gmmu_map_low: allocator exhausted for size 0x{size:X}");
+            return 0;
+        };
+        self.gmmu_manager
+            .lock()
+            .map(address as u64, d_address, size as u64, 0xFF, true);
+        address
+    }
+
+    /// Port of the Host1x GMMU portion of upstream `NvMap::UnmapHandle`.
+    pub fn gmmu_unmap_low(&self, gpu_address: u32, size: usize) {
+        if gpu_address == 0 || size == 0 {
+            return;
+        }
+        let Ok(size32) = u32::try_from(size) else {
+            log::error!("Host1x::gmmu_unmap_low: size 0x{size:X} exceeds 32-bit allocator range");
+            return;
+        };
+        self.gmmu_manager
+            .lock()
+            .unmap(gpu_address as u64, size as u64);
+        self.allocator.lock().free(gpu_address, size32);
     }
 
     pub fn frame_queue(&self) -> &Arc<FrameQueue> {
@@ -351,6 +403,18 @@ impl Host1xCoreInterface for Host1x {
             .smmu_get_host_ptr(d_address)
             .map(|p| p as usize)
             .unwrap_or(0)
+    }
+
+    fn bind_device_memory_invalidator(&self, callback: Box<dyn Fn(u64, usize) + Send + Sync>) {
+        self.memory_manager.set_invalidate_region(callback);
+    }
+
+    fn host1x_gmmu_map_low(&self, d_address: u64, size: usize) -> u32 {
+        self.gmmu_map_low(d_address, size)
+    }
+
+    fn host1x_gmmu_unmap_low(&self, gpu_address: u32, size: usize) {
+        self.gmmu_unmap_low(gpu_address, size);
     }
 
     fn start_device(&self, fd: i32, channel_type: Host1xChannelType, syncpt: u32) {

@@ -406,7 +406,8 @@ impl<'a> CommandGenerator<'a> {
 
                 if voice.was_playing {
                     voice.prev_volume = 0.0;
-                    if let Some(stored_voice) = self.voice_context.get_info_mut(voice_index as u32) {
+                    if let Some(stored_voice) = self.voice_context.get_info_mut(voice_index as u32)
+                    {
                         stored_voice.prev_volume = 0.0;
                     }
                     continue;
@@ -449,7 +450,8 @@ impl<'a> CommandGenerator<'a> {
                         self.end_performance(node_id as i32, addresses);
                     }
                     voice.prev_volume = voice.volume;
-                    if let Some(stored_voice) = self.voice_context.get_info_mut(voice_index as u32) {
+                    if let Some(stored_voice) = self.voice_context.get_info_mut(voice_index as u32)
+                    {
                         stored_voice.prev_volume = voice.volume;
                     }
 
@@ -525,7 +527,8 @@ impl<'a> CommandGenerator<'a> {
                         }
                     }
                     voice.biquad_initialized = voice.biquads.map(|biquad| biquad.enabled);
-                    if let Some(stored_voice) = self.voice_context.get_info_mut(voice_index as u32) {
+                    if let Some(stored_voice) = self.voice_context.get_info_mut(voice_index as u32)
+                    {
                         stored_voice.biquad_initialized = voice.biquad_initialized;
                     }
                 }
@@ -1195,8 +1198,7 @@ impl<'a> CommandGenerator<'a> {
                     prev_volume,
                     volume,
                     previous_sample: self.voice_state_pool.translate(
-                        voice_state_addresses.previous_samples
-                            + i * std::mem::size_of::<i32>(),
+                        voice_state_addresses.previous_samples + i * std::mem::size_of::<i32>(),
                         std::mem::size_of::<i32>() as u64,
                     ),
                 }),

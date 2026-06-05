@@ -934,7 +934,11 @@ fn call32(system: &System, imm: u32, args: &mut SvcArgs) {
         }
         Some(SvcId::SignalProcessWideKey) => {
             let cv_key = get_arg32(args, 0) as u64;
-            svc_condition_variable::signal_process_wide_key(system, cv_key, get_arg32(args, 1) as i32);
+            svc_condition_variable::signal_process_wide_key(
+                system,
+                cv_key,
+                get_arg32(args, 1) as i32,
+            );
             // RUZU_FORCE_WAIT_MASK_AFTER_SIGNAL=1 — Experiment for MK8D wedge
             // (project_mk8d_unlock_site_found_2026_05_25 option D).
             // After signaling cv at `cv_key`, set WAIT_MASK (0x40000000) on the
@@ -955,9 +959,7 @@ fn call32(system: &System, imm: u32, args: &mut SvcArgs) {
                 let process_arc = system.current_process_arc().clone();
                 {
                     let process = process_arc.lock().unwrap();
-                    if let Some(memory) =
-                        process.page_table.get_base().m_memory.as_ref()
-                    {
+                    if let Some(memory) = process.page_table.get_base().m_memory.as_ref() {
                         let mem = memory.lock().unwrap();
                         let current = mem.read_32(mutex_addr);
                         // Only OR if there's a holder (low 28 bits nonzero) and
@@ -2119,7 +2121,9 @@ pub fn call(system: &System, imm: u32, is_64bit: bool, args: &mut SvcArgs) {
                     .unwrap_or_else(|| format!("svc#0x{:02X}", imm));
                 log::warn!(
                     "[STARTTHREAD_GAP] child_tid={} first_svc={} gap_us={}",
-                    tid, name, us
+                    tid,
+                    name,
+                    us
                 );
             }
         }
@@ -2166,9 +2170,7 @@ pub fn call(system: &System, imm: u32, is_64bit: bool, args: &mut SvcArgs) {
     record_svc_summary(tid, core_id, imm);
     if tid >= 0 {
         crate::hle::kernel::k_scheduler::record_start_thread_sched_first_svc(
-            tid as u64,
-            core_id,
-            imm,
+            tid as u64, core_id, imm,
         );
     }
     maybe_dump_svc_context_by_lr(system, imm, tid, core_id, &dispatch_args);
@@ -2899,8 +2901,7 @@ pub fn dump_svc_summary_profile() {
         let last_imm = profile.tid_last_imm[tid].load(Ordering::Relaxed);
         let mut top = Vec::new();
         for imm in 0..SVC_SUMMARY_MAX_IMM {
-            let n = profile.tid_imm_counts[tid * SVC_SUMMARY_MAX_IMM + imm]
-                .load(Ordering::Relaxed);
+            let n = profile.tid_imm_counts[tid * SVC_SUMMARY_MAX_IMM + imm].load(Ordering::Relaxed);
             if n != 0 {
                 top.push((imm as u32, n));
             }
@@ -3010,8 +3011,10 @@ pub fn record_svc_ring(
     let profile = svc_ring_profile();
     let seq = profile.next.fetch_add(1, Ordering::Relaxed) + 1;
     let slot = &profile.slots[(seq as usize - 1) % profile.slots.len()];
-    slot.time_us
-        .store(profile.start.elapsed().as_micros() as u64, Ordering::Relaxed);
+    slot.time_us.store(
+        profile.start.elapsed().as_micros() as u64,
+        Ordering::Relaxed,
+    );
     slot.tid.store(tid, Ordering::Relaxed);
     slot.priority.store(priority, Ordering::Relaxed);
     slot.core_imm.store(
@@ -3043,10 +3046,7 @@ pub fn dump_svc_ring_profile() {
     let first = next.saturating_sub(cap).saturating_add(1);
     eprintln!(
         "[SVC_RING] total={} dumping_seq={}..{} cap={}",
-        next,
-        first,
-        next,
-        cap
+        next, first, next, cap
     );
     for seq in first..=next {
         let slot = &profile.slots[(seq as usize - 1) % profile.slots.len()];
@@ -3226,8 +3226,11 @@ fn svc_context_lr_filter() -> &'static [u32] {
                         if part.is_empty() {
                             return None;
                         }
-                        u32::from_str_radix(part.trim_start_matches("0x").trim_start_matches("0X"), 16)
-                            .ok()
+                        u32::from_str_radix(
+                            part.trim_start_matches("0x").trim_start_matches("0X"),
+                            16,
+                        )
+                        .ok()
                     })
                     .collect()
             })
@@ -3275,7 +3278,9 @@ fn svc_context_explicit_regions() -> &'static [(u64, u64)] {
                     .filter_map(|part| {
                         let (addr, len) = part.split_once(':')?;
                         let addr = u64::from_str_radix(
-                            addr.trim().trim_start_matches("0x").trim_start_matches("0X"),
+                            addr.trim()
+                                .trim_start_matches("0x")
+                                .trim_start_matches("0X"),
                             16,
                         )
                         .ok()?;
@@ -3293,8 +3298,7 @@ fn svc_context_explicit_regions() -> &'static [(u64, u64)] {
     })
 }
 
-static SVC_CONTEXT_DUMP_COUNT: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
+static SVC_CONTEXT_DUMP_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 fn maybe_dump_svc_context_by_lr(system: &System, imm: u32, tid: i64, core_id: i32, args: &SvcArgs) {
     let lr_filter = svc_context_lr_filter();

@@ -71,16 +71,16 @@ pub mod zstd_compression;
 pub mod announce_multiplayer_room;
 pub mod cityhash;
 pub mod dynamic_library;
+pub mod fastmem_registry;
 pub mod hex_util;
 pub mod input;
-pub mod fastmem_registry;
 pub mod logging;
 pub mod steady_clock;
-pub mod trace;
 pub mod string_util;
 pub mod telemetry;
 pub mod time_zone;
 pub mod tiny_mt;
+pub mod trace;
 pub mod uuid;
 pub mod wall_clock;
 

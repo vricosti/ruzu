@@ -50,6 +50,25 @@ pub trait Host1xCoreInterface: Any + Send + Sync {
     /// table. Returns 0 if no mapping exists.
     fn smmu_lookup(&self, d_address: u64) -> usize;
 
+    /// Bind the callback used after Host1x device-memory writes.
+    ///
+    /// Upstream `GPU::Impl::BindRenderer` calls
+    /// `host1x.MemoryManager().BindInterface(rasterizer)`, and
+    /// `DeviceMemoryManager::WriteBlock` then invalidates the written device
+    /// range through that rasterizer. The trait keeps this dependency opaque
+    /// so `core` does not depend on `video_core`.
+    fn bind_device_memory_invalidator(&self, callback: Box<dyn Fn(u64, usize) + Send + Sync>);
+
+    /// Allocate a low 32-bit Host1x GMMU address and map it to an existing
+    /// SMMU/device address. Mirrors the `NvMap::PinHandle(low_area_pin)`
+    /// path:
+    /// `host1x.Allocator().Allocate(size); host1x.GMMU().Map(addr, daddr, size)`.
+    fn host1x_gmmu_map_low(&self, d_address: u64, size: usize) -> u32;
+
+    /// Undo `host1x_gmmu_map_low`, mirroring `NvMap::UnmapHandle`:
+    /// `host1x.GMMU().Unmap(addr, size); host1x.Allocator().Free(addr, size)`.
+    fn host1x_gmmu_unmap_low(&self, gpu_address: u32, size: usize);
+
     fn start_device(&self, fd: i32, channel_type: Host1xChannelType, syncpt: u32);
     fn stop_device(&self, fd: i32, channel_type: Host1xChannelType);
     fn push_entries(&self, fd: i32, entries: Vec<u32>);

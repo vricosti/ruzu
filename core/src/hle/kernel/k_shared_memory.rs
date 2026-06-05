@@ -11,8 +11,8 @@ use crate::hle::kernel::k_memory_block::{KMemoryPermission, KMemoryState, PAGE_S
 use crate::hle::kernel::k_memory_manager::KMemoryManager;
 use crate::hle::kernel::k_page_group::KPageGroup;
 use crate::hle::kernel::k_process_page_table::KProcessPageTable;
-use crate::hle::kernel::svc::svc_results::RESULT_INVALID_NEW_MEMORY_PERMISSION;
 use crate::hle::kernel::k_typed_address::KProcessAddress;
+use crate::hle::kernel::svc::svc_results::RESULT_INVALID_NEW_MEMORY_PERMISSION;
 use crate::hle::result::ResultCode;
 
 /// Memory permission for shared memory mapping.
@@ -317,21 +317,28 @@ mod tests {
 
     #[test]
     fn map_permission_must_match_shared_memory_user_permission() {
-        assert!(validate_map_permission(MemoryPermission::Read, MemoryPermission::Read)
-            .is_success());
+        assert!(
+            validate_map_permission(MemoryPermission::Read, MemoryPermission::Read).is_success()
+        );
         assert_eq!(
             validate_map_permission(MemoryPermission::Read, MemoryPermission::ReadWrite),
             RESULT_INVALID_NEW_MEMORY_PERMISSION
         );
-        assert!(validate_map_permission(MemoryPermission::ReadWrite, MemoryPermission::ReadWrite)
-            .is_success());
+        assert!(
+            validate_map_permission(MemoryPermission::ReadWrite, MemoryPermission::ReadWrite)
+                .is_success()
+        );
     }
 
     #[test]
     fn dont_care_permission_accepts_upstream_asserted_read_write_cases() {
-        assert!(validate_map_permission(MemoryPermission::DontCare, MemoryPermission::Read)
-            .is_success());
-        assert!(validate_map_permission(MemoryPermission::DontCare, MemoryPermission::Write)
-            .is_success());
+        assert!(
+            validate_map_permission(MemoryPermission::DontCare, MemoryPermission::Read)
+                .is_success()
+        );
+        assert!(
+            validate_map_permission(MemoryPermission::DontCare, MemoryPermission::Write)
+                .is_success()
+        );
     }
 }

@@ -25,8 +25,7 @@ pub struct IActiveVibrationDeviceList {
     handlers: BTreeMap<u32, FunctionInfo>,
     handlers_tipc: BTreeMap<u32, FunctionInfo>,
     resource_manager: Arc<parking_lot::Mutex<ResourceManager>>,
-    vibration_device_list:
-        parking_lot::Mutex<Vec<hid_core::hid_types::VibrationDeviceHandle>>,
+    vibration_device_list: parking_lot::Mutex<Vec<hid_core::hid_types::VibrationDeviceHandle>>,
 }
 
 impl IActiveVibrationDeviceList {

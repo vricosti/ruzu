@@ -1,16 +1,225 @@
+## 2026-06-05 — video_core/src/renderer_opengl/gl_texture_cache.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/texture_cache.h and /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_texture_cache.cpp
+
+### Intentional differences
+- `OpenGLTextureCache::blit_image` keeps ruzu's previous strict image lookup as the default path because the partial relaxed port did not improve MK8D's black cinematic and introduced new low-address `Unmapped ReadBlock` errors in the long run.
+- The non-upload parts of upstream `TextureCache<P>::GetBlitImages` / `BlitImage` remain available behind `RUZU_FERMI2D_RELAXED_LOOKUP=1` for diagnostics: image lookup uses `RelaxedOptions::Samples`, depth-compatible blits also use `RelaxedOptions::Format`, multisample sources retry with `ForceBrokenViews`, framebuffer image views are created from `TryFindBase(src.Address())` / `TryFindBase(dst.Address())`, and source/destination regions are shifted by `SamplesLog2`.
+- The opt-in relaxed image lookup is implemented as a local OpenGL helper because the common Rust texture-cache `find_image` API still only exposes the strict no-options form and the OpenGL wrapper owns mapped image insertion with real CPU addresses.
+
+### Unintentional differences (to fix)
+- Upstream `TextureCache<P>::BlitImage` still calls `PrepareImage(src, false, false)` and `PrepareImage(dst, true, false)` before creating framebuffer views. Ruzu does not do that in this path yet; a naive local attempt caused severe MK8D slowdown and low-address `ReadBlock` failures because the Rust image lifecycle still marks freshly inserted present images `CPU_MODIFIED`.
+- Upstream handles rescaled source/destination images (`ImageCanRescale`, `ScaleUp`, `ScaleDown`, resolution scaling). Ruzu still does not rescale Fermi2D blit regions.
+- Upstream reinserts images through `FindOrInsertImage(..., RelaxedOptions{})` when format/view compatibility does not match. Ruzu falls back to exact mapped insertion but does not loop on `has_deleted_images`.
+- Upstream `TextureCacheRuntime::BlitFramebuffer` receives `copy.operation`; ruzu's `blit_framebuffer` currently only uses the filter and always blits color bits.
+
+### Missing items
+- Port the full common `TextureCache<P>::BlitImage` ownership once backend hooks can call OpenGL upload/framebuffer operations without duplicating lifecycle in `gl_texture_cache.rs`.
+- Fix the Rust image lifecycle mismatch that makes upstream destination `PrepareImage(dst, true, false)` too expensive/incorrect for newly inserted present images.
+- Make relaxed Fermi2D image lookup safe enough to enable by default, or move the full upstream `GetBlitImages` logic into the common Rust texture-cache owner with matching deletion/lifecycle semantics.
+- Add focused tests for relaxed Fermi2D image selection, subresource view selection, and MSAA coordinate shifting.
+
+### Binary layout verification
+- N/A: OpenGL texture-cache image selection and host-side framebuffer blit behavior only. No guest-visible raw payload layout changed.
+
+### Tests
+- `cargo check -p video_core`
+- `cargo build --release --bin ruzu-cmd`
+- MK8D long run with relaxed lookup enabled reached the same black cinematic PPM output as the strict control (`present_4000/4200` mean 1.57) but produced 79 low-address `Unmapped ReadBlock` errors not present in control logs; relaxed lookup was therefore kept opt-in instead of default.
+- MK8D strict-default early run reached `present_0/300/600/900/1200` with no `Unmapped ReadBlock`, confirming the default path no longer carries the relaxed-lookup regression.
+- MK8D strict-default late run with `RUZU_TRACE_HOST1X_VIDEO=1` reached `present_3600/3800/4000/4200`; no Host1x video records were emitted, so the black title-cinematic phase is currently not explained by an observed NVDEC/VIC submission.
+
+## 2026-06-05 — common/src/trace.rs, common/src/trace.example.toml, and video_core/src/renderer_opengl/gl_shader_cache.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_shader_cache.cpp
+
+### Intentional differences
+- Added ruzu-only `GL_PIPELINE` ring-buffer instrumentation for OpenGL graphics-pipeline cache hits, misses, inserts, environment creation, per-stage analyze failures, and compile completion. Upstream logs `CreateGraphicsPipeline` through its logging framework; ruzu uses `common::trace` so late MK8D runs can be captured without the scheduling perturbation caused by `eprintln!`.
+- The trace records encode `GraphicsPipelineKey` raw bits, key hash, stage hashes, stage id, slot, GL slot, GLSL byte length, and GL link/build success/failure. Cache hit/entry spam is gated behind `RUZU_TRACE_GL_PIPELINE_HITS=1`, and `RUZU_TRACE_GL_PIPELINE_SKIP=N` can skip early shader-cache records so late MK8D transitions can be captured with less boot perturbation. Default tracing records miss/create/compile/analyze/build only. This is diagnostic-only metadata and does not alter shader-cache policy.
+
+### Unintentional differences (to fix)
+- Ruzu still keeps legacy `RUZU_TRACE_SHADER_PIPELINE` `eprintln!` diagnostics alongside the new ring-buffer trace. These should be removed once `GL_PIPELINE` captures the required MK8D evidence.
+
+### Missing items
+- Compare the new `GL_PIPELINE` timeline against zuyu's `Render.OpenGL CreateGraphicsPipeline` burst around the MK8D title-cinematic transition.
+- If ruzu compiles fewer or placeholder pipelines, audit `ShaderCache::refresh_stages`, `GraphicsPipelineKey` construction, and `GraphicsEnvironments` population against upstream.
+
+### Binary layout verification
+- N/A: diagnostic host-side tracing only. No guest-visible raw payload layout changed.
+
+### Tests
+- `cargo check -p video_core`
+- `cargo build --release --bin ruzu-cmd`
+- MK8D control run without `GL_PIPELINE` trace: reached `present_1800..4600`; `present_4200` and `present_4600` remain black with logo/spinner.
+- MK8D `RUZU_TRACE_GL_PIPELINE=1 RUZU_TRACE_GL_PIPELINE_SKIP=300` run: reached `present_4200`; captured 26 late pipeline misses/creates/inserts, 52 stage compiles, 0 analyze failures, all observed late pipelines using `VertexB + Fragment`.
+- MK8D `GL_PIPELINE` build trace run: captured `build_stage_success` for stage 0 and 4 plus `build_pipeline_success` on early pipelines before an intermittent post-`NotifyRunning` stall.
+
+## 2026-06-05 — video_core/src/renderer_opengl/gl_rasterizer.rs trace filtering vs /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_rasterizer.cpp
+
+### Intentional differences
+- Ruzu's diagnostic `RT_PIPELINE_STATUS` emission now obeys the existing `RUZU_TRACE_RT_BIND_SEQ_MIN/MAX` and `RUZU_TRACE_RT_BIND_TIME_START/END_MS` filters. Upstream has no equivalent ring-buffer diagnostic; this keeps late MK8D instrumentation from emitting every draw from boot.
+
+### Unintentional differences (to fix)
+- None for this diagnostic filtering slice.
+
+### Missing items
+- Use the filtered trace to capture late MK8D RT/pipeline state around the title-cinematic black-screen transition without perturbing boot timing.
+
+### Binary layout verification
+- N/A: diagnostic host-side tracing only. No guest-visible raw payload layout changed.
+
+### Tests
+- `cargo check -p video_core`
+
+## 2026-06-05 — video_core/src/engines/draw_manager.rs, video_core/src/engines/maxwell_3d.rs, and video_core/src/renderer_opengl/gl_rasterizer.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_rasterizer.cpp and /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_state_tracker.h
+
+### Intentional differences
+- `Maxwell3DDrawView::live` now carries a mutable `Maxwell3DAccess` reference during rasterizer dispatch so OpenGL sync helpers can clear consumed Maxwell dirty flags. Upstream does this directly through `maxwell3d->dirty.flags[...] = false`; Rust keeps the access behind the draw-view boundary instead of storing a raw `Maxwell3D*`.
+- `sync_viewport` still remains one Rust helper rather than separate Rust methods named `sync_viewport`, `sync_scissor_test`, `sync_color_mask`, `sync_blend_state`, etc. The guarded call/clear behavior is closer to upstream, but method ownership is not yet fully split.
+
+### Unintentional differences (to fix)
+- Upstream `RasterizerOpenGL::SyncState` owns separate helpers for rasterize enable, polygon modes, color mask, multisample, depth clamp, depth/stencil, blend, logic-op, cull, primitive restart, scissor, point/line, polygon offset, alpha test, framebuffer sRGB, vertex formats, and vertex instances. Ruzu now guards several of these families by dirty flags, but still groups viewport/scissor/color-mask/blend/depth/rasterizer/sRGB synchronization inside the Rust viewport helper.
+- Ruzu's grouped depth/stencil and rasterizer sync still applies some sub-state together once any related dirty flag is set. Upstream clears and applies individual sub-state paths more precisely.
+
+### Missing items
+- Split the grouped OpenGL fixed-function sync into upstream-owned Rust helpers matching `SyncState()` method boundaries.
+- Port the remaining dirty-flag guarded helpers not covered by this slice: logic-op, primitive restart, multisample, fragment clamp, depth clamp, alpha test, point state, and complete polygon mode/offset parity.
+- Complete tests for dirty-flag clearing through `Maxwell3DDrawView::live`; current validation is compile/runtime only.
+
+### Binary layout verification
+- N/A: draw-time state tracking and GL side effects only. No guest-visible raw payload layout changed.
+
+### Tests
+- `cargo check -p video_core`
+- `cargo build --release --bin ruzu-cmd`
+- MK8D OpenGL run with PPM dumps `present_1800..4200`: reached `NotifyRunning`; title artifact unchanged at `present_2200`; reached black cinematic phase at `present_4200`.
+
+## 2026-06-04 — video_core/src/renderer_opengl/gl_texture_cache.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/texture_cache.h and /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_texture_cache.cpp
+
+### Intentional differences
+- `TextureCache<P>::SynchronizeAliases` is implemented in the Rust OpenGL wrapper rather than the common Rust `texture_cache.rs` owner because materialized backend `Image` objects still live in `renderer_opengl/gl_texture_cache.rs`.
+- The port currently implements the upstream direct `TextureCacheRuntime::CopyImage` branch with `glCopyImageSubData`; unsupported rescale/reinterpret/convert branches log and return instead of attempting an approximate fallback.
+
+### Unintentional differences (to fix)
+- Upstream `TextureCache<P>::CopyImage` adjusts copy coordinates for rescaled aliases and can route through `ReinterpretImage`, `ConvertImage`, or `EmulateCopyImage`. Ruzu still only handles same-surface-type direct copies.
+- Upstream common `TextureCache<P>::PrepareImage` owns the entire lifecycle. Ruzu still splits backend upload/copy behavior into `OpenGLTextureCache::prepare_image_with_gpu_reader`.
+
+### Missing items
+- Port OpenGL `CanImageBeCopied` / `EmulateCopyImage`, reinterpret conversion, and framebuffer conversion paths used by non-direct alias copies.
+- Move alias synchronization back into the common texture-cache owner once Rust backend hooks can mirror upstream runtime calls without duplicating lifecycle code.
+
+### Binary layout verification
+- N/A: GL texture-cache lifecycle/copy behavior only. No guest-visible raw payload layout changed.
+
+### Tests
+- `cargo check -p video_core`
+
+## 2026-06-04 — video_core/src/host1x/gpu_device_memory_manager.rs and video_core/src/host1x/vic.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/device_memory_manager.inc and /home/vricosti/Dev/emulators/zuyu/src/video_core/host1x/vic.cpp
+
+### Intentional differences
+- Ruzu wires upstream `DeviceMemoryManager<Traits>::WriteBlock`'s `device_inter->InvalidateRegion(address, size)` side effect through an explicit `MaxwellDeviceMemoryManager::set_invalidate_region` callback. Upstream stores the device interface pointer inside `DeviceMemoryManager`; Rust keeps the callback in the shared Host1x device-memory manager to avoid cross-crate ownership cycles.
+- VIC still writes through `smmu_write_block` rather than constructing upstream `GpuGuestMemoryScoped<SafeWrite>` objects. The observable side effect is now closer to upstream: after the write to SMMU-backed guest memory, the rasterizer receives `GPU::InvalidateRegion(DAddr, size)`.
+
+### Unintentional differences (to fix)
+- Ruzu's Host1x SMMU page table still stores host pointers directly instead of upstream's compressed physical pointer / CPU backing metadata, so the device-memory manager cannot yet reproduce every `TrackContinuityImpl` edge case.
+- VIC writes through the SMMU helper use one invalidation per plane/write call. Upstream invalidates exactly the requested `WriteBlock` span too, but the Rust helper boundary is still lower-level than upstream's `MemoryManager::WriteBlock` owner.
+
+### Missing items
+- Port the full upstream `Core::DeviceMemoryManager<Traits>` mapping model so SMMU mappings track ASID and CPU backing addresses, not only host pointers.
+- Replace VIC's direct `smmu_write_block` calls with a Rust equivalent of upstream `GpuGuestMemoryScoped<SafeWrite>` / `MemoryManager::WriteBlock` once the device-memory manager owner is complete.
+
+### Binary layout verification
+- N/A: host-side device-memory invalidation and VIC cache-coherency behavior only. No guest-visible raw payload layout changed.
+
+### Tests
+- `cargo check -p video_core`
+- `cargo check --bin ruzu-cmd`
+
+## 2026-06-04 — video_core/src/host1x/ffmpeg/ffmpeg.rs and video_core/src/host1x/ffmpeg/ffmpeg_shim.c vs /home/vricosti/Dev/emulators/zuyu/src/video_core/host1x/ffmpeg/ffmpeg.cpp and /home/vricosti/Dev/emulators/zuyu/src/video_core/host1x/ffmpeg/ffmpeg.h
+
+### Intentional differences
+- Ruzu keeps FFmpeg C ABI interaction inside `ffmpeg_shim.c` rather than binding every upstream FFmpeg type directly in Rust. The shim now exposes upstream-equivalent `AVError` formatting through `av_make_error_string` and stores the last decoder error so Rust can log receive failures with the same human-readable error text.
+
+### Unintentional differences (to fix)
+- Upstream `DecoderContext::SendPacket` has a special non-Android H264 software path using `avcodec_send_frame` and `DecoderContext::ReceiveFrame` drains `avcodec_receive_packet`. Ruzu still sends H264 through `avcodec_send_packet`; only decode-order queueing policy and error formatting are matched.
+- Upstream exposes `GetData`, `GetPlane`, `GetPlanes`, and `GetStrides`; ruzu exposes only the plane/stride accessors currently consumed by VIC.
+- `Decoder::SupportsDecodingOnDevice`, `HardwareContext::GetSupportedDeviceTypes`, and `HardwareContext::InitializeForDecoder` remain stubbed despite FFmpeg being linked.
+
+### Missing items
+- Port the upstream hardware-decoder selection and fallback path, or explicitly gate it behind an upstream-equivalent NVDEC emulation setting.
+- Port the full upstream H264 software `avcodec_send_frame` / `avcodec_receive_packet` path if decode-order queueing alone is not sufficient for MK8D's title cinematic.
+- Finish `video_core/host1x/vic.cpp` parity so decoded FFmpeg frames are actually read from `FrameQueue`, converted, blended, and written to guest output surfaces.
+
+### Binary layout verification
+- N/A: host-side FFmpeg wrappers only. No guest-visible raw payload layout changed.
+
+### Tests
+- `cargo check -p video_core`
+
+## 2026-06-04 — core/src/hle/kernel/svc/svc_shared_memory.rs and core/src/hle/kernel/k_process.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/svc/svc_shared_memory.cpp and /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/k_process.cpp
+
+### Intentional differences
+- Upstream `KProcess::AddSharedMemory` opens the raw `KSharedMemory*`; ruzu stores shared-memory kernel objects in `Arc`, so the Rust port preserves the per-process `KSharedMemoryInfo` refcount but relies on existing Arc ownership for object lifetime.
+- `KProcess::AddSharedMemory` cannot currently fail allocation in ruzu because `KSharedMemoryInfo` is stored in a `BTreeMap` rather than a slab allocator. The method still returns `ResultCode` to preserve upstream call ordering.
+- Ruzu logs additional page-table region details when `MapSharedMemory` rejects a range. Upstream only traces the SVC call; the extra logging is host-side diagnostics and does not alter validation behavior.
+
+### Unintentional differences (to fix)
+- None for this shared-memory validation and process-tracking slice.
+
+### Missing items
+- If the Rust kernel object model later ports literal `KAutoObject::Open/Close` ownership for `KSharedMemory`, wire `KProcess::AddSharedMemory` / `RemoveSharedMemory` to those calls as upstream does.
+
+### Binary layout verification
+- N/A: kernel object lifecycle tracking only. No guest-visible raw payload layout changed.
+
+### Tests
+- `cargo check -p core`
+
+## 2026-06-04 — video_core/src/renderer_opengl/gl_device.rs and video_core/src/renderer_opengl/gl_shader_cache.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_device.cpp and /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_shader_cache.cpp
+
+### Intentional differences
+- Ruzu queries OpenGL extensions from `glGetStringi` strings instead of upstream GLAD feature booleans. This is the Rust OpenGL loader boundary; the resulting `Device` capability fields now preserve upstream's separate `HasVertexViewportLayer()` and `HasNvViewportArray2()` meanings.
+- Ruzu's shader profile uses `ShaderProfile { ..Default::default() }` syntax for fields that are not represented in the Rust profile type. The OpenGL-specific fields present in ruzu are populated from `Device` capability queries matching upstream `ShaderCache` construction.
+
+### Unintentional differences (to fix)
+- Ruzu does not yet carry upstream `host_info` as a separate OpenGL shader-cache object, so host-only policy such as `needs_demote_reorder = device.IsAmd()` and `support_conditional_barrier = device.SupportsConditionalBarriers()` has no one-to-one owner in `gl_shader_cache.rs`.
+
+### Missing items
+- Add the missing Rust equivalent for upstream OpenGL shader-cache `host_info` once the shader recompiler backend exposes those host fields.
+
+### Binary layout verification
+- N/A: OpenGL host capability policy and shader compilation metadata only. No guest-visible raw payload layout changed.
+
+### Tests
+- `cargo check -p video_core`
+
+## 2026-06-04 — core/src/hle/service/mii/mii.rs and core/src/hle/service/mii/types/char_info.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/mii/mii.cpp and /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/mii/types/char_info.h
+
+### Intentional differences
+- `CharInfoElement` is a Rust `repr(C)` struct in `types/char_info.rs`, matching upstream placement in `types/char_info.h`. `IDatabaseService::Get` builds a `Vec<CharInfoElement>` before writing bytes because ruzu's CMIF helpers accept raw byte slices instead of upstream typed `OutArray<CharInfoElement>`.
+
+### Unintentional differences (to fix)
+- None for this layout/serialization slice.
+
+### Missing items
+- Broader Mii database command parity remains as previously documented; this slice only fixes `CharInfoElement` ownership and output layout.
+
+### Binary layout verification
+- PASS: `CharInfo` is `0x58`.
+- PASS: `CharInfoElement` is `0x5c`.
+
+### Tests
+- `cargo check -p core`
+
 ## 2026-06-03 — video_core/src/renderer_opengl/gl_texture_cache.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/texture_cache.h
 
 ### Intentional differences
 - Ruzu keeps backend-independent `PrepareImage`/`RefreshContents` placeholders in `texture_cache.rs` and owns the OpenGL upload path in `gl_texture_cache.rs::prepare_image_with_gpu_reader` / `refresh_contents_with_gpu_reader`, because the common Rust cache cannot directly invoke OpenGL `Image::UploadMemory`.
 - The Rust implementation keeps a release `!Tracked` guard around `track_image` in addition to a `debug_assert!`. Upstream asserts the invariant directly; this preserves the expected path while avoiding double page-cache increments if transitional cache state violates the invariant.
 - Extended the existing env-gated `RUZU_TRACE_TEXTURE_UPLOAD` diagnostic to print the image CPU address alongside the GPU address. Upstream has no equivalent diagnostic hook; normal behavior is unchanged when the env var is unset.
+- `gl_texture_cache.rs` now implements the OpenGL direct-copy subset of upstream `TextureCache<P>::SynchronizeAliases` / `TextureCacheRuntime::CopyImage` because the Rust backend still owns materialized `Image` objects outside the common cache. The call ordering now matches upstream `PrepareImage`: `RefreshContents(image_id)`, `SynchronizeAliases(image_id)`, then optional `MarkModification`.
 
 ### Unintentional differences (to fix)
-- Alias synchronization after refresh remains TODO in the Rust OpenGL wrapper; upstream calls `SynchronizeAliases(image_id)` from `PrepareImage` after `RefreshContents`.
-- The zero-size early return in `refresh_contents_with_gpu_reader` clears `CpuModified` without tracking. Upstream clears `CpuModified` and calls `TrackImage` before upload-special-case handling; revisit this if zero-sized images become observable in real guest paths.
+- The alias copy path still skips upstream's rescaled-image coordinate adjustment, reinterpret/convert framebuffer path, and emulated copy fallback when `CanImageBeCopied` fails.
 
 ### Missing items
-- Port the remaining alias synchronization path used by upstream `TextureCache<P>::PrepareImage`.
+- Port the remaining non-direct alias copy branches from upstream `TextureCache<P>::CopyImage`: resolution-scaling adjustments, `ReinterpretImage`, `ConvertImage`, and `EmulateCopyImage`.
 - Move the backend hook boundary closer to upstream once the common Rust texture cache can express backend image upload/download operations without duplicating lifecycle logic in `gl_texture_cache.rs`.
 
 ### Binary layout verification
@@ -77,9 +286,10 @@
 ### Intentional differences
 - Extended the existing env-gated `RUZU_DUMP_PRESENT_PPM` diagnostic with `RUZU_DUMP_PRESENT_PPM_DRAW_INDICES`, `RUZU_DUMP_PRESENT_PPM_DRAW_MIN/MAX`, and present-index range sampling via `RUZU_DUMP_PRESENT_PPM_START/END/EVERY`. Upstream has no equivalent host framebuffer PPM hook; this is disabled by default and lets MK8D visual-corruption captures target either rasterizer `draw_count` or a sampled present-index window.
 - When a draw-count or present-index range selector is active, the PPM filename is suffixed with the selected present index, plus `draw_count` for draw-targeted captures, so captures can be correlated with `RT_BIND` / `TEXTURE_BIND_ADDR` trace windows. Normal presentation and the default one-shot PPM path remain unchanged when these env vars are unset.
+- Added `RUZU_DUMP_PRESENT_PPM_DIR` as a directory-form alias for the existing diagnostic path. It expands to `<dir>/present.ppm` before the existing index/draw suffix rules, so MK8D capture scripts can use the same directory-style convention as the present-extra texture dump hook.
 
 ### Unintentional differences (to fix)
-- N/A for default rendering behavior. This path is host-side diagnostics only and is inactive unless `RUZU_DUMP_PRESENT_PPM` plus draw-count selector env vars are set.
+- N/A for default rendering behavior. This path is host-side diagnostics only and is inactive unless `RUZU_DUMP_PRESENT_PPM` or `RUZU_DUMP_PRESENT_PPM_DIR` plus optional selector env vars are set.
 
 ### Missing items
 - Remove or keep strictly diagnostic-only after the MK8D title/cinematic corruption is isolated.
@@ -147,16 +357,13 @@
 ## 2026-06-03 — core/src/hle/kernel/svc/svc_shared_memory.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/svc/svc_shared_memory.cpp
 
 ### Intentional differences
-- Ruzu keeps the env-gated `RUZU_BYPASS_CAN_CONTAIN_SHARED` diagnostic around `MapSharedMemory`'s `CanContain(Shared)` failure path. Upstream has no bypass; this remains inactive unless explicitly requested during MK8D investigation.
 - Ruzu logs additional page-table region details when `MapSharedMemory` rejects a range. Upstream only traces the SVC call; the extra logging is host-side diagnostics and does not alter normal behavior.
 
 ### Unintentional differences (to fix)
-- `MapSharedMemory` still does not call upstream's `KProcess::AddSharedMemory` before `KSharedMemory::Map`, nor does it remove that process-tracking entry on map failure.
-- `UnmapSharedMemory` still does not call upstream's `KProcess::RemoveSharedMemory` after a successful unmap.
+- None for shared-memory validation ordering after the diagnostic bypass removal.
 
 ### Missing items
-- Port the full upstream shared-memory process tracking path: `KProcess::AddSharedMemory`, `KProcess::RemoveSharedMemory`, and the failure-cleanup ordering used by `MapSharedMemory`.
-- Remove the diagnostic `RUZU_BYPASS_CAN_CONTAIN_SHARED` path once the MK8D shared-memory/null-PC investigation is resolved.
+- None for this SVC validation slice.
 
 ### Binary layout verification
 - N/A: SVC validation and kernel object tracking only. No guest-visible raw payload layout changed.
@@ -189,13 +396,14 @@
 - Rust `CharInfo` keeps enum-typed upstream fields as raw `u8` fields in the IPC payload struct, matching the raw wire layout while avoiding enum invalid-value UB in copied guest data.
 
 ### Unintentional differences (to fix)
-- `IDatabaseService` still serializes `CharInfoElement` manually as `CharInfo` bytes plus a `Source` u32 instead of owning a dedicated Rust `CharInfoElement` struct next to upstream `types/char_info.h`.
+- None for the `CharInfoElement` layout/serialization slice. Remaining Mii service differences are tracked in missing items below.
 
 ### Missing items
 - The image database commands upstream registers as null handlers (`Reload`, `IsEmpty`, `IsFull`, `GetAttribute`, `LoadImage`, `AddOrUpdateImage`, `DeleteImages`, `DeleteFile`, `DestroyFile`, `ImportFile`, `ExportFile`, `ForceInitialize`) remain null handlers in Rust too.
 
 ### Binary layout verification
 - PASS: `CharInfo` now has an explicit Rust compile-time size assertion for `0x58`, matching upstream `static_assert(sizeof(CharInfo) == 0x58)`.
+- PASS: `CharInfoElement` now has an explicit Rust compile-time size assertion for `0x5c`, matching upstream `static_assert(sizeof(CharInfoElement) == 0x5c)`.
 - PASS: `IImageDatabaseService::GetCount` returns a u32 zero just like upstream.
 
 ### Tests
@@ -323,13 +531,10 @@
 - Ruzu keeps additional diagnostic logging around invalid shared-memory handles and rejected address regions. Upstream only emits trace-level SVC logging. These diagnostics are host-only and do not change default SVC semantics.
 
 ### Unintentional differences (to fix)
-- Ruzu still has an env-gated diagnostic bypass `RUZU_BYPASS_CAN_CONTAIN_SHARED=1` around the `CanContain(Shared)` check. Upstream has no such bypass; it must remain diagnostic-only and should be removed once the MK8D shared-memory investigation is complete.
-- `UnmapSharedMemory` still does not perform the upstream pre-unmap `page_table.CanContain(address, size, KMemoryState::Shared)` validation before calling into `KSharedMemory::Unmap`.
-- Ruzu does not call `process.AddSharedMemory` before mapping or `process.RemoveSharedMemory` on map failure / unmap completion. Upstream tracks shared-memory ownership through `KProcess::AddSharedMemory` and `RemoveSharedMemory`.
+- None for shared-memory validation ordering after the diagnostic bypass removal.
 
 ### Missing items
-- Port the full upstream shared-memory process tracking path: `KProcess::AddSharedMemory`, `KProcess::RemoveSharedMemory`, and the associated cleanup ordering in `MapSharedMemory`/`UnmapSharedMemory`.
-- Remove or quarantine the `RUZU_BYPASS_CAN_CONTAIN_SHARED` diagnostic after the current MK8D investigation.
+- None for this SVC validation slice.
 
 ### Binary layout verification
 - N/A: SVC validation/result-code behavior only. No guest-visible raw payload layout changed.
@@ -392,7 +597,7 @@
 ### Tests
 - `cargo check -p core`
 - `cargo build --release --bin ruzu-cmd`
-- MK8D control run: `RUST_LOG=warn RUZU_DISABLE_ASLR=1 RUZU_BYPASS_CAN_CONTAIN_SHARED=1 RUZU_RNG_SEED=0 timeout 120 ./target/release/ruzu-cmd -r opengl -g ...` reached `NotifyRunning` and the later `WriteBuffer` point, but still timed out before the title/cinematic progressed.
+- Historical MK8D control run used the now-removed shared-memory diagnostic bypass and reached `NotifyRunning`; this is retained only as old runtime context, not as current behavior.
 - MK8D SIGUSR1 run at ~80s: post-fix dump no longer showed threads 112-122 stuck in `WAITING | RUNNABLE`; remaining block state still has multiple waiting condition variables and runnable threads.
 
 ## 2026-06-03 — video_core/src/renderer_opengl/gl_rasterizer.rs and common/src/trace.example.toml vs /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_rasterizer.cpp
@@ -482,7 +687,7 @@
 
 ### Tests
 - `cargo check -p core`
-- MK8D runtime trace with `RUZU_BYPASS_CAN_CONTAIN_SHARED=1`: `Unmapped cache maintenance` log spam is expected to disappear; late-title progress must be rechecked with framebuffer PPM dumps.
+- MK8D late-title progress must be rechecked with framebuffer PPM dumps after cache-maintenance parity work.
 
 ## 2026-06-03 — video_core/src/host1x/{host1x.rs,nvdec.rs,codecs/decoder.rs,codecs/h264.rs,codecs/vp8.rs,codecs/vp9.rs} vs /home/vricosti/Dev/emulators/zuyu/src/video_core/host1x/{host1x.cpp,nvdec.cpp,codecs/decoder.cpp,codecs/h264.cpp,codecs/vp8.cpp,codecs/vp9.cpp}
 
@@ -493,12 +698,11 @@
 
 ### Unintentional differences (to fix)
 - Upstream `Decoder` owns live references to `Host1x`, `memory_manager`, `regs`, and `frame_queue`; ruzu still distributes those dependencies between `Nvdec` and per-call trait arguments. Behavior is closer than before, but the ownership shape is not yet a strict class-layout port.
-- Upstream `DecodeApi::Initialize` creates FFmpeg codec state and returns true for supported codecs. Ruzu's `video_core/src/host1x/ffmpeg/ffmpeg.rs` still returns false, so `decoder::decode` exits before H264 `compose_frame` is exercised at runtime.
 - VP8 and VP9 method signatures now receive live registers/memory, but their `ComposeFrame` and offset methods remain stubs instead of the upstream implementations.
 - H264 `compose_frame` returns an owned `Vec<u8>` clone, while upstream returns a span over `frame_scratch`. This is behaviorally acceptable for now but less faithful and adds allocation/copy overhead.
 
 ### Missing items
-- Port `video_core/host1x/ffmpeg/ffmpeg.cpp` so NVDEC decoding initializes, sends assembled packets, receives frames, and pushes actual decoded frames into `FrameQueue`.
+- Complete `video_core/host1x/ffmpeg/ffmpeg.cpp` parity for the remaining H264 software packet path and hardware-decoder selection. `DecodeApi::Initialize` now creates FFmpeg codec state and returns true for supported codecs.
 - Port `video_core/host1x/vic.cpp` execution path enough to consume `FrameQueue` FFmpeg frames and write the converted/blended output surface. The current late MK8D black cinematic is consistent with this missing decoded-video/VIC path.
 - Complete VP8 and VP9 `ComposeFrame`, `GetProgressiveOffsets`, and `GetInterlacedOffsets` parity once FFmpeg/VIC are wired.
 - Consider moving Rust decoder ownership closer to upstream by storing codec-local references/handles rather than passing `regs` and `memory_manager` through each trait method, if this can be done without unsafe self-references.
@@ -521,7 +725,6 @@
 
 ### Unintentional differences (to fix)
 - Upstream `DecoderContext::SendPacket` has a special non-Android H264 software path using `avcodec_send_frame` and `DecoderContext::ReceiveFrame` drains `avcodec_receive_packet`. Ruzu still sends H264 through `avcodec_send_packet`; only the decode-order queueing policy has been matched.
-- Upstream logs FFmpeg errors with `av_make_error_string`; ruzu currently logs raw negative return codes from the shim.
 - Upstream exposes `GetData`, `GetPlane`, `GetPlanes`, and `GetStrides`; ruzu exposes only `get_plane_ptr`, `get_stride`, width/height/format, and interlaced state. This is enough for the upcoming VIC port but not full API parity.
 - `Decoder::supports_decoding_on_device`, `HardwareContext::get_supported_device_types`, and `HardwareContext::initialize_for_decoder` remain stubbed despite FFmpeg now being linked.
 
@@ -18430,10 +18633,10 @@ The following still panic because upstream either also throws NotImplementedExce
 - `gl_device.rs` ports upstream `Device::TestVariableAoffi()` and `Device::TestPreciseBug()` as file-local Rust helpers using `glCreateShaderProgramv`, `GL_LINK_STATUS`, and `glDeleteProgram`. This keeps OpenGL capability policy in the same owner file as upstream.
 
 ### Unintentional differences (to fix)
-- Ruzu's `has_vertex_viewport_layer` currently includes `GL_NV_viewport_array2` in addition to `GL_ARB_shader_viewport_layer_array`; upstream keeps `HasVertexViewportLayer()` and `HasNvViewportArray2()` separate. The shader profile uses the upstream OR expression explicitly, but other users of `has_vertex_viewport_layer()` should be audited.
+- Ruzu does not yet carry upstream `host_info` as a separate OpenGL shader-cache object, so host-only policy such as `needs_demote_reorder = device.IsAmd()` and `support_conditional_barrier = device.SupportsConditionalBarriers()` has no one-to-one owner in `gl_shader_cache.rs`.
 
 ### Missing items
-- Audit non-shader-profile users of `Device::has_vertex_viewport_layer()` for the current ARB/NV conflation.
+- Add the missing Rust equivalent for upstream OpenGL shader-cache `host_info` once the shader recompiler backend exposes those host fields.
 
 ### Binary layout verification
 - N/A: OpenGL host capability policy and generated GLSL source only. No guest-visible raw payload layout changed.
@@ -18832,13 +19035,13 @@ The following still panic because upstream either also throws NotImplementedExce
 ### Intentional differences
 - Added an OpenGL-specific shader profile helper in `gl_shader_cache.rs` and routed all OpenGL GLSL compilation paths through it. This matches upstream `ShaderCache` ownership: GL backend profile policy lives in `renderer_opengl/gl_shader_cache.cpp`, not in the generic shader recompiler default profile.
 - The profile now sets `lower_left_origin_mode`, `need_declared_frag_colors`, `ignore_nan_fp_comparisons`, and `max_user_clip_distances` to the upstream OpenGL values. This restores the upstream GLSL behavior where fragment outputs are declared for every render target even when the shader does not explicitly write them.
-- `has_gl_precise_bug` remains `false` because ruzu does not yet pass an OpenGL `Device` capability object into `ShaderCache`. Upstream derives this from `device.HasPreciseBug()`.
+- The OpenGL profile now receives `Device` capability queries for upstream fields such as `HasNvViewportArray2`, `HasImageLoadFormatted`, `NeedsFastmathOff`, `IsAmd`, `HasComponentIndexingBug`, and `HasPreciseBug`.
 
 ### Unintentional differences (to fix)
-- The full upstream OpenGL profile still depends on `Device` capability queries (`HasNvViewportArray2`, `HasImageLoadFormatted`, `NeedsFastmathOff`, `IsAmd`, `HasComponentIndexingBug`, etc.). Ruzu currently uses `ShaderProfile::default()` for those fields.
+- Ruzu does not yet carry upstream `host_info` as a separate OpenGL shader-cache object, so host-only policy such as `needs_demote_reorder = device.IsAmd()` and `support_conditional_barrier = device.SupportsConditionalBarriers()` has no one-to-one owner in `gl_shader_cache.rs`.
 
 ### Missing items
-- Port the OpenGL `Device` capability table into ruzu's `ShaderCache` profile construction.
+- Add the missing Rust equivalent for upstream OpenGL shader-cache `host_info` once the shader recompiler backend exposes those host fields.
 
 ### Binary layout verification
 - N/A: shader-profile policy and generated GLSL source only. No guest-visible raw payload layout changed.
@@ -20345,3 +20548,337 @@ The following still panic because upstream either also throws NotImplementedExce
 - `cargo check -p core`
 - `cargo build --release --bin ruzu-cmd`
 - Manual MK8D clean run with SIGUSR1 at 80s, preserving real `XDG_DATA_HOME`: 105s timeout, no crash, `cpu=85%`, `maxrss=4879952`; scheduler dump shows `core=1 current=Some(78) highest=Some(78) needs=false`, fixing the prior `current=78 highest=104 needs=true` post-SVC scheduler lag.
+
+## 2026-06-04 — core/src/hle/service/am/service/storage.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/am/service/storage.cpp and /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/ipc_helpers.h
+
+### Intentional differences
+- Rust still has an explicit `push_interface_response` helper inside `storage.rs` because the CMIF `Out<SharedPointer<T>>` declarative serializer is not fully ported. The helper now delegates object emission to `ResponseBuilder::push_ipc_interface`, preserving upstream's `PushIpcInterface` ownership and late handle-table translation.
+
+### Unintentional differences (to fix)
+- Ruzu still spells the generated CMIF `IStorage::Open(Out<SharedPointer<IStorageAccessor>>)` response manually instead of routing through the same declarative serializer shape as upstream `cmif_serialization.h`.
+
+### Missing items
+- Port the broader CMIF shared-pointer output path so AM service methods no longer need local response helpers for `Out<SharedPointer<T>>`.
+- Audit the remaining local `push_interface_response` helpers that still call `create_session_for_service(...)` followed by `push_move_objects(handle)` and migrate them to `ResponseBuilder::push_ipc_interface(...)` where upstream returns `SharedPointer<T>`.
+
+### Binary layout verification
+- N/A: IPC object ownership/handle translation path only. No guest-visible raw payload struct layout changed.
+
+### Tests
+- `cargo check -p core`
+
+## 2026-06-04 — core/src/hle/service/acc/acc_u0.rs, core/src/hle/service/acc/acc_u1.rs, and core/src/hle/service/acc/acc_su.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/acc/acc.cpp, /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/acc/acc_u0.cpp, /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/acc/acc_u1.cpp, and /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/acc/acc_su.cpp
+
+### Intentional differences
+- Rust keeps the service entry tables split across `acc_u0.rs`, `acc_u1.rs`, and `acc_su.rs`, matching the upstream per-service `.cpp` files, while the shared `Module::Interface::GetProfile` behavior is represented through the existing Rust `AccountServiceInterface` helper.
+- `GetProfile`, `GetProfileEditor`, and `GetBaasAccountManagerForApplication` now keep the upstream response shape: `ResponseBuilder(ctx, 2, 0, 1)`, success result, then `push_ipc_interface(...)`. This preserves upstream `PushIpcInterface<T>` semantics while using Rust's already-ported helper for domain vs non-domain handle emission.
+
+### Unintentional differences (to fix)
+- The broader account service still has local helper and per-service wrapper duplication around shared `Module::Interface` behavior. Upstream centralizes much of that behavior in `Module::Interface`; Rust still routes through `AccU0`/`AccU1`/`AccSU` wrapper methods before reaching `AccountServiceInterface`.
+
+### Missing items
+- Audit the remaining account service object-returning commands and async-context returns against upstream `PushIpcInterface` / `PushCopyObjects` usage. This slice only corrected the profile and Baas manager object returns involved in the late MK8D IPC investigation.
+
+### Binary layout verification
+- N/A: IPC object ownership/handle translation path only. No guest-visible raw payload struct layout changed.
+
+### Tests
+- `cargo check -p core`
+
+## 2026-06-04 — video_core/src/gpu.rs, video_core/src/host1x/host1x.rs, core/src/host1x_core.rs, and video_core/src/host1x/gpu_device_memory_manager.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/gpu.cpp and /home/vricosti/Dev/emulators/zuyu/src/core/device_memory_manager.inc
+
+### Intentional differences
+- Upstream `GPU::Impl::BindRenderer` directly calls `host1x.MemoryManager().BindInterface(rasterizer)` because `GPU::Impl` owns a concrete `Host1x&`. Ruzu keeps `Host1x` behind `core::Host1xCoreInterface`, so the same ownership edge is represented by `Host1xCoreInterface::bind_device_memory_invalidator(...)`.
+- The Rust callback captures the existing non-owning `RasterizerHandle` and calls `RasterizerInterface::invalidate_region(addr, size)` after `MaxwellDeviceMemoryManager::smmu_write_block(...)`, matching upstream `DeviceMemoryManager<Traits>::WriteBlock(...) -> device_inter->InvalidateRegion(address, size)`.
+- `Host1x` now owns a Host1x-local `MemoryManager` with upstream constructor geometry `address_space_bits=32`, `split_address=0`, `big_page_bits=12`, `page_bits=12`; `Gpu::bind_renderer` can downcast the opaque `Host1xCoreInterface` back to `video_core::Host1x` and call `bind_gmmu_rasterizer(...)`.
+- `Host1x` now owns a `FlatAllocator` equivalent to upstream `Common::FlatAllocator<u32, 0, 32>` and exposes opaque core-facing helpers for the `NvMap::PinHandle(low_area_pin)` map/free sequence: allocate low Host1x GMMU VA, map it to the existing `d_address`, then unmap/free it on handle teardown.
+- Added diagnostic `RUZU_DISABLE_HOST1X_INVALIDATE_BIND=1` to isolate this new ownership edge during MK8D runtime testing. Upstream has no such knob; default behavior remains the upstream-equivalent binding.
+- The incomplete Host1x GMMU rasterizer binding is currently gated behind `RUZU_ENABLE_HOST1X_GMMU_BIND=1`. This deliberately diverges from upstream default behavior because a runtime A/B on MK8D showed that enabling the binding before porting NvMap's Host1x allocator-backed low-area map/free path stalls before presentation. The binding code is kept for the next ownership slice, but normal execution stays on the proven SMMU invalidation path.
+- The upstream-faithful low-area pin return path is currently gated behind `RUZU_ENABLE_NVMAP_LOW_AREA_PIN=1`. A runtime test with the new Host1x allocator/GMMU map code enabled crashed early with SIGSEGV, so the default still returns the stable `d_address` until the remaining Host1x GMMU users and lifetime ordering are audited.
+
+### Unintentional differences (to fix)
+- Upstream `GPU::Impl::BindRenderer` always calls `host1x.GMMU().BindRasterizer(rasterizer)` immediately after `host1x.MemoryManager().BindInterface(rasterizer)`. Ruzu has the Host1x `MemoryManager` instance and binding method, but does not enable that call by default until the matching `NvMap::PinHandle(low_area_pin)` / `UnmapHandle` GMMU map/free path is ported.
+- Host1x GMMU map/unmap ownership is partially present but not yet default-safe. Upstream `NvMap` low-area pins always return `pin_virt_address`; ruzu can do so under `RUZU_ENABLE_NVMAP_LOW_AREA_PIN=1`, but default execution still suppresses it because the rest of the Host1x GMMU lifetime/users are not yet proven.
+- `MaxwellDeviceMemoryManager` remains a partial Rust manager with SMMU map/read/write support rather than the full upstream `Core::DeviceMemoryManager<MaxwellDeviceTraits>` implementation.
+
+### Missing items
+- Audit and complete the Host1x GMMU lifetime path so `RUZU_ENABLE_NVMAP_LOW_AREA_PIN=1` and `RUZU_ENABLE_HOST1X_GMMU_BIND=1` can become the default upstream-equivalent behavior without crashing or stalling MK8D.
+- Continue the full `Core::DeviceMemoryManager<Traits>` parity work so SMMU allocation/free, registered-process ASIDs, and cache-page accounting match upstream structurally.
+
+### Binary layout verification
+- N/A: renderer/Host1x ownership callback only. No guest-visible raw payload layout changed.
+
+### Tests
+- `cargo check -p core`
+- `cargo check -p video_core`
+- MK8D default runtime after gating: reached `present_2520` with PPM dumps under `/tmp/mk8d_after_low_area_gate`.
+- MK8D opt-in runtime with `RUZU_ENABLE_NVMAP_LOW_AREA_PIN=1`: crashed early with host SIGSEGV, confirming the path is not default-safe yet.
+
+## 2026-06-04 — core/src/arm/dynarmic/arm_dynarmic_32.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/arm/dynarmic/arm_dynarmic_32.cpp
+
+### Intentional differences
+- Added env-gated diagnostic `RUZU_TRACE_W_VALUE=0x...` to trace A32 guest stores by written value through the existing `WATCH_WRITE` trace category. Upstream has no equivalent diagnostic hook; normal behavior is unchanged unless the variable is set.
+- Corrected the diagnostic record layout to emit the same `[core, tid, pc, lr, vaddr, size, value_lo, value_hi]` payload used by the normal `WATCH_WRITE` formatter. This only affects env-gated diagnostic output.
+- Added local rdynarmic diagnostic `RUZU_TRAP_FASTMEM_W_VALUE=0x...` in the A32 fastmem write emitter. It emits a SIGILL trap only when a 32-bit fastmem-direct store writes the selected value, reusing ruzu-cmd's existing A32 SIGILL register/vaddr dump path. Upstream Dynarmic has no equivalent diagnostic; normal code generation is unchanged unless the variable is set.
+- Extended the existing local `RUZU_TRAP_FASTMEM_ANY_VADDR_RANGE` diagnostic to handle A32 fastmem stores whose guest vaddr is held in `r11`, using `r10` as the temporary scratch in that case. This fixes a diagnostic blind spot only; default execution is unchanged.
+- Corrected the same diagnostic to test store-range overlap (`vaddr < hi && lo < vaddr + size`) and to compare `RUZU_TRAP_FASTMEM_ANY_VADDR_RANGE_VALUE` at the watched range start. This catches STRD/STM-style stores that begin before the watched word but overwrite it.
+
+### Unintentional differences (to fix)
+- None for normal execution. This is diagnostic-only and inactive by default.
+
+### Missing items
+- Remove or quarantine these diagnostics once the MK8D null-PC object-corruption writer is identified.
+
+### Binary layout verification
+- N/A: JIT diagnostic logging only. No guest-visible raw payload layout changed.
+
+### Tests
+- `cargo check -p core`
+
+## 2026-06-05 — video_core/src/renderer_opengl/gl_texture_cache.rs and video_core/src/renderer_opengl/gl_rasterizer.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/texture_cache.h and /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_rasterizer.cpp
+
+### Intentional differences
+- Upstream `TextureCache<P>::UpdateRenderTargets(bool is_clear)` reads `maxwell3d->regs` directly and calls `PrepareImageView(view, true, is_clear && IsFullClear(view))`. Ruzu's OpenGL cache still receives `Maxwell3DRenderTargets` snapshots from the rasterizer, so `RasterizerOpenGL::clear` now passes `is_clear=true` plus scissor 0 into `prepare_render_targets_from_snapshot(...)`.
+- `OpenGLTextureCache::is_full_clear_for_view(...)` ports upstream `IsFullClear`: null view is full, multi-level/layer images are not full, disabled scissor is full, and enabled scissor must cover the complete image-view size.
+
+### Unintentional differences (to fix)
+- Ruzu still splits upstream `UpdateRenderTargets(true)` across `update_render_targets_from_snapshot(...)` and `prepare_render_targets_from_snapshot(...)` because the texture cache does not yet own a live `Maxwell3D*`/channel reference. This preserves the behavior for the clear invalidation case but not the final upstream method ownership.
+- The Rust prepare helper currently discovers the active view from the parent image's first render-target view. Upstream prepares the exact `render_targets.color_buffer_ids[index]` and `depth_buffer_id` stored in the cache's `RenderTargets` object.
+
+### Missing items
+- Move the snapshot bridge closer to upstream by storing/filling `TextureCacheBase::render_targets` with the selected color/depth `ImageViewId`s, then prepare those exact ids instead of rediscovering image views by address.
+- Complete full `TextureCache<P>::UpdateRenderTargets` parity, including dirty-flag handling, rescale render-target updates, draw-buffer updates, and per-method Maxwell dirty flag clearing.
+
+### Binary layout verification
+- N/A: OpenGL cache state synchronization only. No guest-visible raw payload layout changed.
+
+### Tests
+- Re-read upstream `texture_cache.h::{UpdateRenderTargets,PrepareImageView,IsFullClear}` and `gl_rasterizer.cpp::Clear`.
+- `cargo check -p video_core`
+
+## 2026-06-05 — common/src/trace.rs and video_core/src/renderer_opengl/gl_rasterizer.rs diagnostic RT sampling vs /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_rasterizer.cpp
+
+### Intentional differences
+- Added an env-gated OpenGL render-target probe for the existing `RT_SAMPLE` trace category. `RUZU_TRACE_RT_PROBE_X/Y` read one selected pixel after the sparse RT sample readback so MK8D title-screen corruption can be localized without dumping full render targets each frame.
+- The `RT_SAMPLE` formatter now reports `probe=(x,y)` and `probe_rgba` instead of the previous first sampled pixel. Upstream has no equivalent ring-buffer diagnostic.
+
+### Unintentional differences (to fix)
+- None for normal execution. The probe only runs when the `RT_SAMPLE` category is enabled, and the additional pixel read only happens inside that diagnostic path.
+
+### Missing items
+- Remove or quarantine this diagnostic once the MK8D prompt/title corruption source is isolated.
+
+### Binary layout verification
+- N/A: host-side diagnostic trace only. No guest-visible raw payload layout changed.
+
+### Tests
+- `cargo check -p video_core`
+
+## 2026-06-05 — core/src/memory/memory.rs, core/src/hle/service/hle_ipc.rs, and audio_core/src/lib.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/memory.cpp, /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/hle_ipc.cpp, and /home/vricosti/Dev/emulators/zuyu/src/audio_core/renderer/command/data_source/decode.cpp
+
+### Intentional differences
+- Added `Memory::read_block_checked(...)`, a SEGV-safe host-side read helper mirroring ruzu's existing checked write path. It uses `process_vm_readv` to turn inaccessible translated host pages into an error return with zero-filled destination bytes instead of a process-wide SIGSEGV.
+- `audio_core::guest_read_block(...)` now uses `read_block_checked(...)` because ruzu currently routes audio decode reads through a global Rust accessor instead of upstream's direct `Core::Memory::Memory&` parameter threaded through `DecodeFromWaveBuffers`.
+- `HLERequestContext::read_guest_memory(...)` now uses `read_block_checked(...)` for copied IPC input buffers. Upstream `HLERequestContext::{ReadBufferCopy,ReadBufferA,ReadBufferX,ReadBuffer}` reads through `memory.ReadBlock` / `CpuGuestMemory<UnsafeRead>`; ruzu's current guest-memory mapping can expose inaccessible translated host pages, so the checked path prevents host aborts.
+- `HLERequestContext::write_guest_memory(...)` now uses `write_block_no_rasterizer_checked(...)` for all copied IPC output buffers, not just large writes. Upstream calls `memory.WriteBlock` / `CpuGuestMemory` with a stable per-context `Core::Memory::Memory&`; ruzu observed 8-byte IPC writes into inaccessible host mappings after rejected shared-memory state, so the checked write prevents host SIGSEGV.
+- IPC input-buffer reads now prefer the owner process' legacy `process_memory` view before falling back to the checked `Memory` bridge. This is intentionally different from upstream, but avoids ruzu's temporary raw `current_page_table` bridge during HLE request decoding; an MK8D IPC-ring run showed that `Memory::read_block_checked(...)` could still crash inside `get_pointer_impl` while resolving nvmap ioctl input buffers. If the legacy read returns a full-size all-zero buffer, ruzu probes the checked `Memory` bridge and uses it when it returns non-zero data; this preserves the legacy fast/safe path while avoiding false empty nvdrv device names from stale legacy mappings. IPC output writes keep the checked `Memory` bridge first, then fall back to `process_memory`.
+
+### Unintentional differences (to fix)
+- Upstream `DecodeFromWaveBuffers(Core::Memory::Memory& memory, ...)` owns the memory dependency explicitly and reads wave buffers through `CpuGuestMemory` / `ReadBlockUnsafe`. Ruzu still uses a global `GUEST_MEMORY_ACCESSOR`, so this checked helper is a defensive adaptation around that temporary architecture.
+- Upstream HLE IPC stores a `Core::Memory::Memory&` directly in `HLERequestContext` and relies on its memory helpers for buffer reads/writes. Ruzu stores an optional `Arc<Mutex<Memory>>` bridge and now adds checked guards plus legacy `process_memory` fallback because the surrounding memory/shared-memory lifecycle is not yet upstream-equivalent.
+- Upstream does not need a secondary legacy process-memory path for IPC buffers. Ruzu uses it temporarily, and now prioritizes it for IPC input reads with an all-zero guard, to avoid returning zeroed nvdrv inputs or dereferencing a stale `Memory.current_page_table` bridge while process-local memory can still serve the access. This should be removed once the `Memory` bridge and process-local memory ownership are unified.
+
+### Missing items
+- Thread a `Core::Memory::Memory`-equivalent handle through the Rust audio renderer command path so data-source decode can match upstream ownership without global state.
+- Audit why MK8D audio wave-buffer reads can target stale/protected host pages after `MapSharedMemory` failures; the checked read prevents host crashes but does not fix the underlying guest-memory lifecycle divergence.
+- Audit the `MapSharedMemory cannot contain Shared` / stale IPC-buffer read path observed in MK8D runs; the checked IPC read/write plus legacy fallback prevents host crashes and zeroed nvdrv buffers but does not fix the underlying guest address-space/shared-memory divergence.
+
+### Binary layout verification
+- N/A: host-side memory read safety only. No guest-visible raw payload layout changed.
+
+### Tests
+- `cargo check -p core`
+- `cargo check -p audio_core`
+- MK8D control after the all-zero guard no longer logs `Trying to open unknown device` and reaches `NotifyRunning`; with isolated `/tmp/ruzu-data`, system-data title `0100000000000802` still falls back to the synthetic 980-byte archive because the isolated System NAND registered cache is empty.
+
+## 2026-06-05 — common/src/trace.rs and core/src/hle/service/nvnflinger/hos_binder_driver.rs diagnostic Binder tracing vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/nvnflinger/hos_binder_driver.cpp and .h
+
+### Intentional differences
+- Added an env/TOML-gated `BINDER_TXN` ring-buffer trace category (`[nvnflinger] binder = true` / `RUZU_TRACE_BINDER_TXN_RING=1`) that records `IHOSBinderDriver::TransactParcel` entry/reply/missing-binder stages with binder id, transaction id, flags, and parcel sizes. Upstream only has normal logging in this path; ruzu needs low-overhead late-boot attribution for MK8D without perturbing scheduling.
+- `common/src/trace.example.toml` documents the new `[nvnflinger] binder` toggle alongside existing nvnflinger diagnostics.
+- `common/src/trace.rs` accepts both `[output] file_path` and the already-documented `[output] file` key for the trace sink path. Upstream has no equivalent Rust trace ring; this keeps ruzu's diagnostic configuration internally consistent.
+
+### Unintentional differences (to fix)
+- None for normal execution. The trace category is disabled by default and does not change Binder dispatch or parcel serialization.
+
+### Missing items
+- Remove or quarantine this diagnostic once the MK8D late cinematic / `BreakLoopNullPc` investigation no longer needs Binder transaction attribution.
+
+### Binary layout verification
+- N/A: host-side diagnostic trace only. No guest-visible raw payload layout changed.
+
+### Tests
+- Re-read upstream `hos_binder_driver.cpp/.h`; upstream `TransactParcel` still delegates to `TryGetBinder`/`binder->Transact` and succeeds when the binder is missing.
+- `cargo check -p common -p core`
+
+## 2026-06-05 — core/src/hle/kernel/svc/svc_synchronization.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/svc/svc_synchronization.cpp
+
+### Intentional differences
+- `WaitSynchronization` now copies the user handle array through `Memory::read_block_checked_quiet(...)` when the current process owns a `Memory` bridge. This matches upstream's structure more closely than the previous per-handle `read_32` loop: upstream calls `GetCurrentMemory(kernel).ReadBlock(user_handles, handles.data(), sizeof(Handle) * num_handles)` and returns `ResultInvalidPointer` if the block copy fails. The quiet checked variant avoids flooding logs when ruzu intentionally falls back to legacy `process_memory`.
+- If the checked `Memory` bridge read fails, ruzu falls back to the legacy `process_memory` path before returning `ResultInvalidPointer`. This is a temporary compatibility bridge for the current Rust memory ownership split; it avoids guest aborts caused by the bridge being inaccessible while the legacy process memory view can still read the handle array.
+
+### Unintentional differences (to fix)
+- Ruzu still has a secondary legacy `process_memory` fallback path for processes without the `Memory` bridge. Upstream always reaches `GetCurrentMemory(kernel)` from the kernel context.
+- The fallback after a failed `Memory` bridge read is not upstream behavior. Upstream can return `ResultInvalidPointer` directly because `GetCurrentMemory(kernel)` is the authoritative memory owner.
+
+### Missing items
+- Remove the legacy `process_memory` fallback once every process has the upstream-equivalent `Core::Memory::Memory` ownership edge.
+
+### Binary layout verification
+- N/A: SVC handle-array copy only. `Handle` remains a 32-bit raw value matching upstream.
+
+### Tests
+- `cargo check -p core`
+
+## 2026-06-05 — core/src/file_sys/patch_manager.rs, core/src/file_sys/romfs_factory.rs, core/src/hle/service/filesystem/fsp/fsp_srv.rs, and core/src/hle/service/filesystem/fsp/fs_i_storage.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/file_sys/patch_manager.cpp, /home/vricosti/Dev/emulators/zuyu/src/core/file_sys/romfs_factory.cpp, and /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/filesystem/fsp/fsp_srv.cpp
+
+### Intentional differences
+- `IStorage::new` has an env-gated diagnostic `RUZU_TRACE_ISTORAGE_OPEN=1` that logs backend name/path/size. Upstream has no constructor diagnostic; normal behavior is unchanged unless the variable is set.
+
+### Unintentional differences (to fix)
+- `PatchManager::patch_romfs` still takes borrowed Rust `Option<&NCA>`/`Option<VirtualFile>` instead of C++ raw/shared pointers, but the update gating and BKTR base-NCA behavior now match upstream: updates and packed updates are only applied when a base NCA is available.
+
+### Missing items
+- Audit remaining `PatchManager::PatchRomFS` parity beyond the base-NCA edge, especially disabled-addon settings, LayeredFS behavior, and update-version reporting.
+- Remove or quarantine `RUZU_TRACE_ISTORAGE_OPEN` once the MK8D system-data storage mismatch is resolved.
+
+### Binary layout verification
+- N/A: RomFS patch selection and diagnostic logging only. No guest-visible raw payload layout changed.
+
+### Tests
+- Re-read upstream `patch_manager.cpp::PatchRomFS`, `romfs_factory.cpp::{OpenCurrentProcess,OpenPatchedRomFS}`, and `fsp_srv.cpp::OpenDataStorageByDataId`.
+- `cargo check -p core`
+- MK8D non-isolated run with the existing legacy-yuzu-root compatibility opens `0100000000000802` from real System NAND (`romfs_present=true`, `nca_present=true`, `IStorage` size `5,773,460`), matching the zuyu IStorage size. The isolated `/tmp/ruzu-data` runs intentionally do not see that NAND and still use the synthetic fallback.
+
+## 2026-06-05 — video_core/src/renderer_opengl/gl_texture_cache.rs and video_core/src/renderer_opengl/gl_rasterizer.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_texture_cache.cpp and .h
+
+### Intentional differences
+- Ruzu still stores backend-independent `ImageBase` slots separately from backend `OpenGL::Image`, while upstream `OpenGL::Image` inherits `VideoCommon::ImageBase`. To preserve upstream behavior across that split, ruzu now mirrors converted-format state through both `ImageBase::flags` and a backend `Image::converted` snapshot.
+- `TextureCache::new_with_caps(..., has_native_astc)` exists for tests/default construction without a live OpenGL `Device`. Production construction goes through `RasterizerOpenGL::new(device, ...)`, matching upstream's runtime/device capability dependency.
+
+### Unintentional differences (to fix)
+- The async-decode and accelerated-upload flag decisions from upstream `Image::Image` (`CanBeDecodedAsync`, `CanBeAccelerated`) are still not fully wired in ruzu's OpenGL image construction. This pass only ports the `IsConverted` decision and converted GL format retargeting.
+- ASTC recompression settings are not ported. Upstream may retarget converted ASTC views through `SelectAstcFormat(...)` when ASTC recompression is enabled; ruzu currently retargets converted images to uncompressed `RGBA8`/`SRGB8_ALPHA8`.
+
+### Missing items
+- Port the remaining `Image::Image` constructor decisions for asynchronous decode and accelerated upload.
+- Port ASTC recompression settings and `SelectAstcFormat(...)` if ruzu enables ASTC recompression.
+- Continue the MK8D title-screen artifact investigation: this converted-format parity fix did not remove the horizontal corrupted band on the title screen.
+
+### Binary layout verification
+- N/A: OpenGL host texture creation and view format selection only. No guest-visible raw payload layout changed.
+
+### Tests
+- Re-read upstream `gl_texture_cache.cpp::IsConverted`, `OpenGL::Image::Image`, and `OpenGL::ImageView::ImageView`.
+- `cargo check -p video_core`
+- `cargo build --release --bin ruzu-cmd`
+- MK8D non-isolated OpenGL PPM run after the change still reaches `NotifyRunning` and dumps frames `1800..3800`; title screen remains rendered with the same horizontal corrupted band, so this patch is retained as upstream parity work but is not the visual fix.
+
+## 2026-06-05 — hid_core/src/resources/npad/npad_resource.rs and hid_core/src/resources/npad/npad_data.rs vs /home/vricosti/Dev/emulators/zuyu/src/hid_core/resources/npad/npad_resource.cpp/.h and npad_data.h
+
+### Intentional differences
+- Rust keeps `NPadResource` state in `Vec<NpadState>`/Rust arrays instead of C++ fixed arrays plus `KernelHelpers::ServiceContext`; this is the existing port shape and does not change the upstream ownership boundary for NPad resource policy.
+- `npad_style_mask_for_revision` is a private helper to avoid duplicating the exact upstream revision masks between `GetMaskedSupportedNpadStyleSet` and `GetAvailableStyleset`. The masks and result paths match upstream values.
+- `NPadData` derives `Clone` so `SetAppletResourceUserId` can copy the active ARUID data like upstream's `active_data = state[aruid_index].data` assignment.
+
+### Unintentional differences (to fix)
+- Several remaining `NPadResource` methods below the style/hold/id/activation slice still return `RESULT_ARUID_NOT_REGISTERED` where upstream returns `ResultNpadNotConnected`.
+- `active_data` synchronization is still incomplete for later resource methods such as home protection, analog-stick center clamp, system-ext state, and button config. Upstream mirrors more per-ARUID state when the active ARUID matches.
+
+### Missing items
+- Audit remaining `NPadResource` result-code parity and `active_data` mirroring.
+- Wire full `controller_data[aruid][npad_id]` ownership into `NPad::OnUpdate`; ruzu still writes a temporary fixed Player1 Fullkey state.
+
+### Binary layout verification
+- N/A: NPad resource policy and result-code behavior only. No shared-memory payload layout changed in this slice.
+
+### Tests
+- Re-read upstream `npad_resource.cpp::{SetSupportedNpadStyleSet,GetSupportedNpadStyleSet,GetMaskedSupportedNpadStyleSet,GetAvailableStyleset,SetNpadJoyHoldType,SetSupportedNpadIdType}` plus `npad_resource.h` and `npad_data.h`.
+- `cargo test -p hid_core resources::npad::npad_resource::tests -- --nocapture`
+
+## 2026-06-05 — common/src/trace.rs, common/src/trace.example.toml, and core/src/hle/service/mii/mii.rs diagnostics vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/mii/mii.cpp
+
+### Intentional differences
+- Added an env/TOML-gated `MII_SERVICE` ring-buffer trace category (`RUZU_TRACE_MII_SERVICE=1` / `[mii] service = true`) that records Mii `CharInfo`/`CoreData` IPC attribution with command id, result, source/index/count, create id, nickname words, and compact visible traits. Upstream has no equivalent trace ring; this is a disabled-by-default diagnostic for the MK8D late Mii/null-PC investigation.
+- `IDatabaseService::{Get,Get1,Get2,Get3,UpdateLatest,UpdateLatest1,BuildRandom,BuildDefault,Convert,ConvertCoreDataToCharInfo,ConvertCharInfoToCoreData}` now emits the diagnostic only after following the same upstream result path and before serializing the reply. Normal response layout and service behavior are unchanged when the category is disabled.
+
+### Unintentional differences (to fix)
+- None for normal execution in this slice. The diagnostic is disabled by default and should not change Mii service behavior.
+
+### Missing items
+- Remove or quarantine `MII_SERVICE` once the MK8D Mii path corruption / `nn::mii::ParamCharInfoAccessor` null-call investigation no longer needs it.
+- Continue the full Mii service parity audit against upstream `mii.cpp`, `mii_manager.cpp`, and `types/*`; this slice only adds low-overhead attribution and does not claim the subsystem is fully ported.
+
+### Binary layout verification
+- N/A: host-side diagnostic trace only. No guest-visible raw payload layout changed.
+
+### Tests
+- Re-read upstream `mii.cpp` handlers and `mii_manager.cpp` default/random/conversion paths while wiring the diagnostic points.
+- `cargo check -p core`
+- `cargo build --release --bin ruzu-cmd`
+
+## 2026-06-05 — video_core/src/renderer_opengl/gl_rasterizer.rs and video_core/src/renderer_opengl/gl_texture_cache.rs diagnostic present dumps vs /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_rasterizer.cpp and gl_texture_cache.cpp
+
+### Intentional differences
+- `RUZU_DUMP_PRESENT_TEXTURE` / `RUZU_DUMP_PRESENT_EXTRA_PPM_DIR` are local diagnostic hooks with no upstream production equivalent. When `RUZU_TRACE_PRESENT_TEXTURE_START` or `RUZU_TRACE_PRESENT_TEXTURE_END` is set, the extra present dump hook now respects the same present-index window before performing GL readback. This keeps late-MK8D cinematic diagnostics from forcing an early `present=0` readback that can perturb boot timing.
+- `RUZU_DUMP_PRESENT_EXTRA_PPM_EVERY=N` optionally throttles extra image PPM readback before any GL readback or disk write. This is diagnostic-only and avoids dumping every presented frame once the selected present window starts.
+
+### Unintentional differences (to fix)
+- None for normal execution in this slice. The change is gated behind diagnostic environment variables and leaves production `AccelerateDisplay` behavior unchanged.
+
+### Missing items
+- Remove or quarantine the present readback hooks once the MK8D black-cinematic render-target investigation is finished.
+
+### Binary layout verification
+- N/A: host-side OpenGL diagnostic readback policy only. No guest-visible raw payload layout changed.
+
+### Tests
+- Re-read upstream `gl_rasterizer.cpp` present/display path to confirm there is no production readback equivalent.
+- `cargo build --release --bin ruzu-cmd`
+
+## 2026-06-05 — common/src/trace.rs, common/src/trace.example.toml, video_core/src/renderer_opengl/mod.rs, and ruzu_cmd/src/emu_window/emu_window_sdl2_gl.rs present-composite diagnostics vs /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/renderer_opengl.cpp
+
+### Intentional differences
+- Added a disabled-by-default `PRESENT_COMPOSITE` trace category (`[opengl] present_composite = true` / `RUZU_TRACE_PRESENT_COMPOSITE=1`) to attribute final present progress without GL readback. It emits `RendererOpenGL::Composite` entry, empty-frame exit, after `DrawScreen`, before/after `SwapBuffers`, plus SDL `MakeCurrent`/`SwapWindow`/`DoneCurrent` markers. Upstream has normal logging/profiling facilities rather than this local ring-buffer diagnostic.
+- The diagnostic preserves upstream present ordering: draw screen first, optional diagnostic PPM/readback hooks, frame tick, then `context->SwapBuffers()`. It only observes the path when enabled.
+
+### Unintentional differences (to fix)
+- None for normal execution in this slice. The category is disabled by default and does not affect production composite behavior.
+
+### Missing items
+- Remove or quarantine `PRESENT_COMPOSITE` after resolving the MK8D case where backbuffer/PPM content is correct but the SDL window appears black or stale.
+
+### Binary layout verification
+- N/A: host-side trace attribution only. No guest-visible raw payload layout changed.
+
+### Tests
+- Re-read upstream `RendererOpenGL::Composite()` ordering in `renderer_opengl.cpp` and the SDL GL context swap path for parity context.
+- `cargo build --release --bin ruzu-cmd`
+
+## 2026-06-05 — ruzu_cmd/src/main.rs SDL OpenGL event-loop diagnostic vs /home/vricosti/Dev/emulators/zuyu/src/yuzu_cmd/yuzu.cpp
+
+### Intentional differences
+- Added `RUZU_POLL_EVENTS_LOOP=1` as a disabled-by-default SDL OpenGL frontend diagnostic. It replaces the blocking `WaitEvent()` loop with repeated non-blocking `PollEvents()` plus a short sleep, allowing A/B tests of SDL event pumping while preserving the default upstream-like `WaitEvent()` path.
+
+### Unintentional differences (to fix)
+- None for default execution in this slice. Follow-up A/B runs did not prove a stable improvement from polling (`default`: 2361/2050 presents in 45s; `legacy/wait`: 2180/2382), so the diagnostic remains opt-in rather than replacing upstream structure.
+
+### Missing items
+- Keep using `RUZU_POLL_EVENTS_LOOP=1` only as a diagnostic if a specific user-visible stale-window run needs event-loop discrimination.
+
+### Binary layout verification
+- N/A: frontend host event-loop diagnostic only. No guest-visible raw payload layout changed.
+
+### Tests
+- Re-read upstream command frontend event-loop shape before adding the gated diagnostic.
+- `cargo build --release --bin ruzu-cmd`

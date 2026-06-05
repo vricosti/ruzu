@@ -458,25 +458,13 @@ mod tests {
                 + std::mem::offset_of!(Lifo<NPadGenericState, HID_ENTRY_COUNT>, buffer_tail),
             0x9A38
         );
-        assert_eq!(
-            std::mem::size_of::<DebugPadSharedMemoryFormat>(),
-            0x400
-        );
-        assert_eq!(
-            std::mem::size_of::<TouchScreenSharedMemoryFormat>(),
-            0x3000
-        );
+        assert_eq!(std::mem::size_of::<DebugPadSharedMemoryFormat>(), 0x400);
+        assert_eq!(std::mem::size_of::<TouchScreenSharedMemoryFormat>(), 0x3000);
         assert_eq!(std::mem::size_of::<MouseSharedMemoryFormat>(), 0x400);
         assert_eq!(std::mem::size_of::<KeyboardSharedMemoryFormat>(), 0x400);
         assert_eq!(std::mem::size_of::<DigitizerSharedMemoryFormat>(), 0x1000);
-        assert_eq!(
-            std::mem::size_of::<HomeButtonSharedMemoryFormat>(),
-            0x200
-        );
-        assert_eq!(
-            std::mem::size_of::<SleepButtonSharedMemoryFormat>(),
-            0x200
-        );
+        assert_eq!(std::mem::size_of::<HomeButtonSharedMemoryFormat>(), 0x200);
+        assert_eq!(std::mem::size_of::<SleepButtonSharedMemoryFormat>(), 0x200);
         assert_eq!(
             std::mem::size_of::<CaptureButtonSharedMemoryFormat>(),
             0x200

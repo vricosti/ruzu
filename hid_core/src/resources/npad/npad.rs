@@ -10,9 +10,9 @@ use common::ResultCode;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::frontend::emulated_controller::get_simple_npad_button_state;
-use crate::hid_util;
 use crate::hid_result;
 use crate::hid_types::*;
+use crate::hid_util;
 use crate::resources::applet_resource::{AppletResourceHolder, ARUID_INDEX_MAX};
 use crate::resources::npad::npad_resource::NPadResource;
 use crate::resources::npad::npad_types::*;
@@ -634,8 +634,7 @@ impl NPad {
             npad.joy_right_lifo.read_current_entry().sampling_number + 1;
         npad.joy_right_lifo.write_next_entry(dummy_pad_state);
 
-        dummy_pad_state.sampling_number =
-            npad.palma_lifo.read_current_entry().sampling_number + 1;
+        dummy_pad_state.sampling_number = npad.palma_lifo.read_current_entry().sampling_number + 1;
         npad.palma_lifo.write_next_entry(dummy_pad_state);
 
         dummy_pad_state.sampling_number =
@@ -666,9 +665,7 @@ mod tests {
     use super::NPad;
     use crate::hid_types::NpadIdType;
     use crate::resources::applet_resource::{AppletResource, AppletResourceHolder};
-    use crate::resources::npad::npad_types::{
-        NpadJoyAssignmentMode, NpadJoyDeviceType,
-    };
+    use crate::resources::npad::npad_types::{NpadJoyAssignmentMode, NpadJoyDeviceType};
     use crate::resources::shared_memory_holder::KSharedMemoryBacking;
 
     struct TestSharedMemoryBacking;
@@ -743,15 +740,27 @@ mod tests {
         assert_eq!(state.fullkey_lifo.buffer_count, 16);
         assert_eq!(state.fullkey_lifo.buffer_tail, 2);
         assert_eq!(
-            state.fullkey_lifo.read_current_entry().state.sampling_number,
+            state
+                .fullkey_lifo
+                .read_current_entry()
+                .state
+                .sampling_number,
             19
         );
         assert_eq!(
-            state.system_ext_lifo.read_current_entry().state.sampling_number,
+            state
+                .system_ext_lifo
+                .read_current_entry()
+                .state
+                .sampling_number,
             19
         );
         assert_eq!(
-            state.gc_trigger_lifo.read_current_entry().state.sampling_number,
+            state
+                .gc_trigger_lifo
+                .read_current_entry()
+                .state
+                .sampling_number,
             19
         );
     }

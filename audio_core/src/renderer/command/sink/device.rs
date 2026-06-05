@@ -72,7 +72,8 @@ fn trace_device_sink_input_clip(
         return;
     }
 
-    let src = unsafe { std::slice::from_raw_parts(payload.sample_buffer as *const i32, sample_count) };
+    let src =
+        unsafe { std::slice::from_raw_parts(payload.sample_buffer as *const i32, sample_count) };
     let mut min_value = i32::MAX;
     let mut max_value = i32::MIN;
     let mut clipped = 0usize;

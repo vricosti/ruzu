@@ -198,16 +198,10 @@ fn maybe_trace_write_in_range(vaddr: u64, size: u64, data: u64) {
             .filter_map(|tok| {
                 let tok = tok.trim();
                 let mut parts = tok.split(':');
-                let start = u64::from_str_radix(
-                    parts.next()?.trim().trim_start_matches("0x"),
-                    16,
-                )
-                .ok()?;
-                let end = u64::from_str_radix(
-                    parts.next()?.trim().trim_start_matches("0x"),
-                    16,
-                )
-                .ok()?;
+                let start =
+                    u64::from_str_radix(parts.next()?.trim().trim_start_matches("0x"), 16).ok()?;
+                let end =
+                    u64::from_str_radix(parts.next()?.trim().trim_start_matches("0x"), 16).ok()?;
                 Some((start, end))
             })
             .collect()
@@ -1543,6 +1537,131 @@ impl Memory {
                 }
                 unsafe {
                     std::ptr::copy_nonoverlapping(ptr, dest[offset..].as_mut_ptr(), copy_amount);
+                }
+            }
+
+            vaddr += copy_amount as u64;
+            offset += copy_amount;
+            remaining -= copy_amount;
+        }
+        user_accessible
+    }
+
+    /// SEGV-safe variant for host-side HLE consumers that read guest buffers.
+    ///
+    /// The normal `read_block` path copies from raw translated host pointers,
+    /// matching upstream's fast path. Audio decode can observe transiently stale
+    /// or protected host pages while consuming guest wave buffers; use
+    /// `process_vm_readv` here so an inaccessible host page becomes `EFAULT`
+    /// instead of a process-wide SIGSEGV.
+    pub fn read_block_checked(&self, src_addr: u64, dest: &mut [u8]) -> bool {
+        self.read_block_checked_impl(src_addr, dest, true)
+    }
+
+    /// Same as `read_block_checked`, but suppresses diagnostics for callers
+    /// with an expected fallback path.
+    pub fn read_block_checked_quiet(&self, src_addr: u64, dest: &mut [u8]) -> bool {
+        self.read_block_checked_impl(src_addr, dest, false)
+    }
+
+    fn read_block_checked_impl(&self, src_addr: u64, dest: &mut [u8], log_errors: bool) -> bool {
+        let size = dest.len();
+        if size == 0 {
+            return true;
+        }
+
+        if !self.address_space_contains(src_addr, size) {
+            if log_errors {
+                log::error!(
+                    "Unmapped checked ReadBlock @ {:#018x} size={:#x}",
+                    src_addr,
+                    size
+                );
+            }
+            dest.fill(0);
+            return false;
+        }
+
+        let self_pid = unsafe { libc::getpid() };
+        let first_ptr = self.get_pointer_impl(src_addr);
+        if !first_ptr.is_null() {
+            let local_iov = libc::iovec {
+                iov_base: dest.as_mut_ptr() as *mut libc::c_void,
+                iov_len: size,
+            };
+            let remote_iov = libc::iovec {
+                iov_base: first_ptr as *mut libc::c_void,
+                iov_len: size,
+            };
+            let read = unsafe {
+                libc::process_vm_readv(
+                    self_pid,
+                    &local_iov as *const _,
+                    1,
+                    &remote_iov as *const _,
+                    1,
+                    0,
+                )
+            };
+            if read == size as isize {
+                return true;
+            }
+            if log_errors {
+                log::error!(
+                    "checked ReadBlock fast path failed @ {:#018x} size={:#x} read={}",
+                    src_addr,
+                    size,
+                    read
+                );
+            }
+        }
+
+        let mut remaining = size;
+        let mut offset = 0usize;
+        let mut vaddr = src_addr;
+        let mut user_accessible = true;
+
+        while remaining > 0 {
+            let page_offset = (vaddr & PAGE_MASK) as usize;
+            let copy_amount = ((PAGE_SIZE as usize) - page_offset).min(remaining);
+
+            let ptr = self.get_pointer_impl(vaddr);
+            if ptr.is_null() {
+                if log_errors {
+                    log::error!("Unmapped checked ReadBlock @ {:#018x}", vaddr);
+                }
+                dest[offset..offset + copy_amount].fill(0);
+                user_accessible = false;
+            } else {
+                let local_iov = libc::iovec {
+                    iov_base: dest[offset..].as_mut_ptr() as *mut libc::c_void,
+                    iov_len: copy_amount,
+                };
+                let remote_iov = libc::iovec {
+                    iov_base: ptr as *mut libc::c_void,
+                    iov_len: copy_amount,
+                };
+                let read = unsafe {
+                    libc::process_vm_readv(
+                        self_pid,
+                        &local_iov as *const _,
+                        1,
+                        &remote_iov as *const _,
+                        1,
+                        0,
+                    )
+                };
+                if read != copy_amount as isize {
+                    if log_errors {
+                        log::error!(
+                            "checked ReadBlock failed @ {:#018x} size={:#x} read={}",
+                            vaddr,
+                            copy_amount,
+                            read
+                        );
+                    }
+                    dest[offset..offset + copy_amount].fill(0);
+                    user_accessible = false;
                 }
             }
 

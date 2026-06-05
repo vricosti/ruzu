@@ -818,7 +818,10 @@ impl Vic {
                 std::mem::size_of::<ConfigStruct>(),
             )
         };
-        if !self.memory_manager.smmu_read_block(config_addr, config_bytes) {
+        if !self
+            .memory_manager
+            .smmu_read_block(config_addr, config_bytes)
+        {
             log::error!(
                 "Vic {} failed to read ConfigStruct at 0x{:X}",
                 self.id,
@@ -1019,14 +1022,22 @@ impl Vic {
 
         let out_luma_width = slot.surface_config.slot_surface_width() + 1;
         let out_luma_height = (slot.surface_config.slot_surface_height() + 1) * 2;
-        self.slot_surface
-            .resize((out_luma_width * out_luma_height) as usize, Pixel::default());
+        self.slot_surface.resize(
+            (out_luma_width * out_luma_height) as usize,
+            Pixel::default(),
+        );
 
         let in_luma_width = (frame.get_width().max(0) as u32).min(out_luma_width);
         let in_luma_height = (frame.get_height().max(0) as u32).min(out_luma_height);
         let in_luma_stride = frame.get_stride(0).max(0) as usize;
         let in_chroma_stride = frame.get_stride(1).max(0) as usize;
-        let luma = unsafe { frame_plane(frame, 0, in_luma_stride.saturating_mul(in_luma_height as usize)) };
+        let luma = unsafe {
+            frame_plane(
+                frame,
+                0,
+                in_luma_stride.saturating_mul(in_luma_height as usize),
+            )
+        };
         let chroma_u = unsafe {
             frame_plane(
                 frame,
@@ -1085,14 +1096,22 @@ impl Vic {
         if INTERLACED {
             out_luma_height *= 2;
         }
-        self.slot_surface
-            .resize((out_luma_width * out_luma_height) as usize, Pixel::default());
+        self.slot_surface.resize(
+            (out_luma_width * out_luma_height) as usize,
+            Pixel::default(),
+        );
 
         let in_luma_width = (frame.get_width().max(0) as u32).min(out_luma_width);
         let in_luma_height = (frame.get_height().max(0) as u32).min(out_luma_height);
         let in_luma_stride = frame.get_stride(0).max(0) as usize;
         let in_chroma_stride = frame.get_stride(1).max(0) as usize;
-        let luma = unsafe { frame_plane(frame, 0, in_luma_stride.saturating_mul(in_luma_height as usize)) };
+        let luma = unsafe {
+            frame_plane(
+                frame,
+                0,
+                in_luma_stride.saturating_mul(in_luma_height as usize),
+            )
+        };
         let chroma_u = unsafe {
             frame_plane(
                 frame,

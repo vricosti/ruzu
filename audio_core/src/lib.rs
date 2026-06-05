@@ -53,7 +53,7 @@ pub fn guest_read_block(guest_addr: u64, dest: &mut [u8]) -> bool {
     static MISS_LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     if let Some(mem) = GUEST_MEMORY_ACCESSOR.get() {
         if let Ok(guard) = mem.lock() {
-            return guard.read_block(guest_addr, dest);
+            return guard.read_block_checked(guest_addr, dest);
         }
     } else if !MISS_LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
         log::warn!(

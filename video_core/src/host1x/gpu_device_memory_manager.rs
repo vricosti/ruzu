@@ -31,6 +31,7 @@ pub type DAddr = u64;
 /// which routes to the active rasterizer. The Rust port stores it as a Box
 /// so callers can swap a no-op or a live rasterizer-bound closure.
 pub type MarkRegionCachingFn = Box<dyn Fn(u64, usize, bool) + Send + Sync>;
+pub type InvalidateRegionFn = Box<dyn Fn(DAddr, usize) + Send + Sync>;
 
 /// Port of `Core::DeviceMemoryManager<MaxwellDeviceTraits>`.
 ///
@@ -54,6 +55,11 @@ pub struct MaxwellDeviceMemoryManager {
     /// `update_pages_cached_count` then still maintains the ref counts
     /// (matches upstream when `memory_device_inter == nullptr`).
     mark_region_caching: Mutex<Option<MarkRegionCachingFn>>,
+
+    /// Optional callback invoked after device writes. Mirrors upstream
+    /// `DeviceMemoryManager<Traits>::WriteBlock`, which writes to backing
+    /// memory and then calls `device_inter->InvalidateRegion(address, size)`.
+    invalidate_region: Mutex<Option<InvalidateRegionFn>>,
 
     /// SMMU bump allocator — next free device address. Matches upstream's
     /// `Core::DeviceMemoryManager<MaxwellDeviceTraits>::Allocate` returning
@@ -125,8 +131,7 @@ pub fn dump_update_cached_stall_profile() {
     let last_stage_name = NAMES.get(last_stage).copied().unwrap_or("unknown");
     eprintln!(
         "[UPDATE_CACHED_STALL_PROFILE] last_stage={} ({})",
-        last_stage,
-        last_stage_name
+        last_stage, last_stage_name
     );
     for (index, name) in NAMES.iter().enumerate() {
         eprintln!(
@@ -157,6 +162,7 @@ impl Default for MaxwellDeviceMemoryManager {
         Self {
             cached_pages: Mutex::new(std::collections::HashMap::new()),
             mark_region_caching: Mutex::new(None),
+            invalidate_region: Mutex::new(None),
             smmu_next: AtomicU64::new(SMMU_BASE),
             smmu_page_table: Mutex::new(std::collections::HashMap::new()),
         }
@@ -229,6 +235,10 @@ impl MaxwellDeviceMemoryManager {
     /// `Core::Memory::Memory::RasterizerMarkRegionCached` path.
     pub fn set_mark_region_caching(&self, callback: MarkRegionCachingFn) {
         *self.mark_region_caching.lock().unwrap() = Some(callback);
+    }
+
+    pub fn set_invalidate_region(&self, callback: InvalidateRegionFn) {
+        *self.invalidate_region.lock().unwrap() = Some(callback);
     }
 
     /// Allocate `size` bytes of device-virtual address space. Returns a
@@ -325,7 +335,9 @@ impl MaxwellDeviceMemoryManager {
     /// the SMMU page table page-by-page. Returns `true` if every page was
     /// mapped.
     ///
-    /// Port of upstream `Core::DeviceMemoryManager<Traits>::WriteBlockUnsafe`.
+    /// Port of upstream `Core::DeviceMemoryManager<Traits>::WriteBlock` for the
+    /// current SMMU-backed Host1x write users: copy through mapped pages, then
+    /// invalidate the written device range through the installed GPU callback.
     pub fn smmu_write_block(&self, d_address: DAddr, data: &[u8]) -> bool {
         if data.is_empty() {
             return true;
@@ -348,6 +360,10 @@ impl MaxwellDeviceMemoryManager {
             in_off += bytes_in_page;
             remaining -= bytes_in_page;
             current += bytes_in_page as u64;
+        }
+        drop(table);
+        if let Some(callback) = self.invalidate_region.lock().unwrap().as_ref() {
+            callback(d_address, data.len());
         }
         true
     }

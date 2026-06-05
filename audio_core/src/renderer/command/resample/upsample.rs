@@ -62,8 +62,7 @@ impl UpsamplePayload {
             let output_offset = info.sample_count as usize * buffer_index;
             crate::raw_write_trace::maybe_trace_write_at(
                 "upsample:process:samples",
-                (self.samples_buffer as usize)
-                    + output_offset * std::mem::size_of::<i32>(),
+                (self.samples_buffer as usize) + output_offset * std::mem::size_of::<i32>(),
                 info.sample_count as usize * std::mem::size_of::<i32>(),
             );
             let output = unsafe {

@@ -642,8 +642,7 @@ pub fn complete_sync_request(
                 static REQ_SEQ: AtomicUsize = AtomicUsize::new(0);
                 let seq = REQ_SEQ.fetch_add(1, Ordering::Relaxed);
                 if seq < ipc_trace_ring_limit() {
-                    let (svc, cmd, ioctl) =
-                        IPC_TRACE_CURRENT.with(|c| c.borrow().clone());
+                    let (svc, cmd, ioctl) = IPC_TRACE_CURRENT.with(|c| c.borrow().clone());
                     let svc_str = if svc.is_empty() { "?" } else { svc.as_str() };
                     let svc_id = common::trace::intern_service(svc_str);
                     let tid = context
@@ -781,6 +780,18 @@ impl HLERequestContext {
         .upgrade()?;
         let process = parent.lock().unwrap();
         process.page_table.get_base().m_memory.clone()
+    }
+
+    fn owner_legacy_process_memory(
+        thread: &Arc<KThreadLock>,
+    ) -> Option<crate::hle::kernel::k_process::SharedProcessMemory> {
+        let parent = {
+            let thread_guard = thread.lock().unwrap();
+            thread_guard.parent.as_ref()?.clone()
+        }
+        .upgrade()?;
+        let process = parent.lock().unwrap();
+        Some(process.process_memory.clone())
     }
 
     /// Create a context with thread/memory access, matching upstream constructor.
@@ -1457,8 +1468,44 @@ impl HLERequestContext {
             return Vec::new();
         }
         let mut buf = vec![0u8; size];
+        if let Some(thread) = self.thread.as_ref() {
+            if let Some(process_memory) = Self::owner_legacy_process_memory(thread) {
+                let mem = process_memory.read().unwrap();
+                let bytes = mem.read_bytes(address, size);
+                if bytes.len() == size {
+                    if bytes.iter().all(|&byte| byte == 0) {
+                        if let Some(ref memory) = self.memory {
+                            let mut checked = vec![0u8; size];
+                            if memory
+                                .lock()
+                                .unwrap()
+                                .read_block_checked_quiet(address, &mut checked)
+                                && checked.iter().any(|&byte| byte != 0)
+                            {
+                                return checked;
+                            }
+                        }
+                    }
+                    return bytes;
+                }
+                log::warn!(
+                    "read_guest_memory: legacy read returned short buffer addr={:#x} size={:#x} read={:#x}",
+                    address,
+                    size,
+                    bytes.len()
+                );
+            }
+        }
         if let Some(ref memory) = self.memory {
-            memory.lock().unwrap().read_block(address, &mut buf);
+            let accessible = memory.lock().unwrap().read_block_checked(address, &mut buf);
+            if accessible {
+                return buf;
+            }
+            log::warn!(
+                "read_guest_memory: checked read filled inaccessible range addr={:#x} size={:#x}",
+                address,
+                size
+            );
             return buf;
         }
         log::error!(
@@ -1484,12 +1531,25 @@ impl HLERequestContext {
             return;
         }
         if let Some(ref memory) = self.memory {
-            let memory = memory.lock().unwrap();
-            if data.len() >= 0x10000 {
-                memory.write_block_no_rasterizer_checked(address, data);
-            } else {
-                memory.write_block_no_rasterizer(address, data);
+            let accessible = memory
+                .lock()
+                .unwrap()
+                .write_block_no_rasterizer_checked(address, data);
+            if accessible {
+                return;
             }
+            if let Some(thread) = self.thread.as_ref() {
+                if let Some(process_memory) = Self::owner_legacy_process_memory(thread) {
+                    let mut mem = process_memory.write().unwrap();
+                    mem.write_block(address, data);
+                    return;
+                }
+            }
+            log::warn!(
+                "write_guest_memory: checked write skipped inaccessible range addr={:#x} size={:#x}",
+                address,
+                data.len()
+            );
         } else {
             log::error!(
                 "write_guest_memory: no Memory available for addr={:#x} size={:#x}",
@@ -1715,7 +1775,10 @@ impl HLERequestContext {
                     if let Some(ref memory) = self.memory {
                         let m = memory.lock().unwrap();
                         for i in 0..pad_count {
-                            m.write_32_no_rasterizer(self.tls_address + ((index + i) as u64 * 4), 0);
+                            m.write_32_no_rasterizer(
+                                self.tls_address + ((index + i) as u64 * 4),
+                                0,
+                            );
                         }
                     }
                 }
@@ -1872,8 +1935,7 @@ impl HLERequestContext {
                             if common::trace::is_enabled(common::trace::cat::IPC_DOMAIN_OUT) {
                                 let (svc, cmd, _ioctl) =
                                     IPC_TRACE_CURRENT.with(|c| c.borrow().clone());
-                                let svc_str =
-                                    if svc.is_empty() { "?" } else { svc.as_str() };
+                                let svc_str = if svc.is_empty() { "?" } else { svc.as_str() };
                                 let svc_id = common::trace::intern_service(svc_str);
                                 common::trace::emit_raw(
                                     common::trace::cat::IPC_DOMAIN_OUT,

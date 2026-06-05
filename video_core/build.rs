@@ -11,7 +11,11 @@ fn main() {
     let mut build = cc::Build::new();
     build.file("src/host1x/ffmpeg/ffmpeg_shim.c");
     build.warnings(false);
-    for path in avcodec.include_paths.iter().chain(avutil.include_paths.iter()) {
+    for path in avcodec
+        .include_paths
+        .iter()
+        .chain(avutil.include_paths.iter())
+    {
         build.include(path);
     }
     build.compile("ruzu_video_core_ffmpeg_shim");

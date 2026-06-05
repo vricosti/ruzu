@@ -373,10 +373,7 @@ impl Puller {
         self.dma_pusher
     }
 
-    fn with_rasterizer_mut(
-        &mut self,
-        func: impl FnOnce(&mut dyn RasterizerInterface),
-    ) {
+    fn with_rasterizer_mut(&mut self, func: impl FnOnce(&mut dyn RasterizerInterface)) {
         let Some(handle) = self.rasterizer else {
             return;
         };

@@ -111,8 +111,7 @@ pub fn dump_refresh_stages_stall_profile() {
     let last_stage_name = NAMES.get(last_stage).copied().unwrap_or("unknown");
     eprintln!(
         "[REFRESH_STAGES_STALL_PROFILE] last_stage={} ({})",
-        last_stage,
-        last_stage_name
+        last_stage, last_stage_name
     );
     for (index, name) in NAMES.iter().enumerate() {
         eprintln!(
@@ -154,8 +153,7 @@ pub fn dump_make_shader_info_stall_profile() {
     let last_stage_name = NAMES.get(last_stage).copied().unwrap_or("unknown");
     eprintln!(
         "[MAKE_SHADER_INFO_STALL_PROFILE] last_stage={} ({})",
-        last_stage,
-        last_stage_name
+        last_stage, last_stage_name
     );
     for (index, name) in NAMES.iter().enumerate() {
         eprintln!(
@@ -197,8 +195,7 @@ pub fn dump_shader_register_stall_profile() {
     let last_stage_name = NAMES.get(last_stage).copied().unwrap_or("unknown");
     eprintln!(
         "[SHADER_REGISTER_STALL_PROFILE] last_stage={} ({})",
-        last_stage,
-        last_stage_name
+        last_stage, last_stage_name
     );
     for (index, name) in NAMES.iter().enumerate() {
         eprintln!(

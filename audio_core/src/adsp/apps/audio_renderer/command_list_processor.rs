@@ -87,8 +87,7 @@ impl CommandListProcessor {
         // Upstream stores `memory = &process.GetMemory()`.
         self.memory = MemoryHandle::default();
         if crate::GUEST_MEMORY_ACCESSOR.get().is_none() {
-            let process =
-                process as *mut ruzu_core::hle::kernel::k_process::KProcess;
+            let process = process as *mut ruzu_core::hle::kernel::k_process::KProcess;
             if !process.is_null() {
                 if let Some(mem) = unsafe { (*process).get_memory() } {
                     crate::init_guest_memory_accessor(mem);
@@ -235,8 +234,7 @@ impl CommandListProcessor {
             }
 
             if header.enabled != 0 {
-                let trace_mix_buffers =
-                    std::env::var_os("RUZU_TRACE_MIX_BUFFER_CLIP").is_some();
+                let trace_mix_buffers = std::env::var_os("RUZU_TRACE_MIX_BUFFER_CLIP").is_some();
                 let before_mix_stats = trace_mix_buffers.then(|| self.mix_buffer_trace_stats());
                 self.process_command(
                     &header,
