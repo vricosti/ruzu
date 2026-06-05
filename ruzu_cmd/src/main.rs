@@ -497,15 +497,16 @@ fn main() {
     let want_svc_per_tid = std::env::var_os("RUZU_PROFILE_SVC_PER_TID").is_some();
     let want_svc_summary = std::env::var_os("RUZU_PROFILE_SVC_SUMMARY").is_some();
     let want_svc_ring = std::env::var_os("RUZU_PROFILE_SVC_RING").is_some();
-    let want_thread_lifecycle =
-        std::env::var_os("RUZU_PROFILE_THREAD_LIFECYCLE").is_some();
+    let want_thread_lifecycle = std::env::var_os("RUZU_PROFILE_THREAD_LIFECYCLE").is_some();
     let want_startthread_sched_profile =
         std::env::var_os("RUZU_PROFILE_STARTTHREAD_SCHED").is_some();
     let want_nvdrv_ioctl_profile = std::env::var_os("RUZU_PROFILE_NVDRV_IOCTL").is_some();
+    let want_nvdrv_ioctl_history = std::env::var_os("RUZU_DUMP_NVDRV_IOCTL_HISTORY").is_some();
     let want_ipc_phase_profile = std::env::var_os("RUZU_PROFILE_IPC_PHASES").is_some();
     let want_bqp_slot_profile = std::env::var_os("RUZU_PROFILE_BQP_SLOTS").is_some();
     let want_binder_txn_profile = std::env::var_os("RUZU_PROFILE_BINDER_TXN").is_some();
     let want_bqp_wait_profile = std::env::var_os("RUZU_PROFILE_BQP_WAIT").is_some();
+    let want_nvnflinger_history = std::env::var_os("RUZU_DUMP_NVNFLINGER_HISTORY").is_some();
     let want_hwc_cache_profile = std::env::var_os("RUZU_PROFILE_HWC_CACHE").is_some();
     let want_vsync_profile = std::env::var_os("RUZU_PROFILE_VSYNC").is_some();
     let want_present_profile = std::env::var_os("RUZU_PROFILE_PRESENT").is_some();
@@ -535,10 +536,12 @@ fn main() {
         || want_thread_lifecycle
         || want_startthread_sched_profile
         || want_nvdrv_ioctl_profile
+        || want_nvdrv_ioctl_history
         || want_ipc_phase_profile
         || want_bqp_slot_profile
         || want_binder_txn_profile
         || want_bqp_wait_profile
+        || want_nvnflinger_history
         || want_hwc_cache_profile
         || want_vsync_profile
         || want_present_profile
@@ -563,6 +566,7 @@ fn main() {
             ruzu_core::hle::kernel::svc_dispatch::dump_wake_latency();
             ruzu_core::hle::kernel::svc_dispatch::dump_gap_profile();
             ruzu_core::hle::service::nvdrv::nvdrv_interface::dump_nvdrv_ioctl_profile();
+            ruzu_core::hle::service::nvdrv::nvdrv_interface::dump_nvdrv_ioctl_history("sigusr2");
             ruzu_core::hle::service::nvdrv::devices::nvhost_gpu::dump_submit_gpfifo_profile();
             video_core::gpu_thread::dump_gpu_thread_profile();
             ruzu_core::hle::kernel::svc::svc_ipc::dump_ipc_phase_profile();
@@ -570,6 +574,7 @@ fn main() {
             ruzu_core::hle::service::nvnflinger::buffer_queue_producer::dump_bqp_slot_profile();
             ruzu_core::hle::service::nvnflinger::hos_binder_driver::dump_binder_txn_profile();
             ruzu_core::hle::service::nvnflinger::buffer_queue_core::dump_bqp_wait_profile();
+            ruzu_core::hle::service::nvnflinger::diagnostics::dump("sigusr2");
             ruzu_core::hle::service::nvnflinger::hardware_composer::dump_hwc_cache_profile();
             ruzu_core::hle::service::vi::conductor::dump_vsync_profile();
             video_core::renderer_opengl::dump_present_profile();
@@ -599,6 +604,7 @@ fn main() {
             ruzu_core::hle::kernel::svc_dispatch::dump_wake_latency();
             ruzu_core::hle::kernel::svc_dispatch::dump_gap_profile();
             ruzu_core::hle::service::nvdrv::nvdrv_interface::dump_nvdrv_ioctl_profile();
+            ruzu_core::hle::service::nvdrv::nvdrv_interface::dump_nvdrv_ioctl_history("atexit");
             ruzu_core::hle::service::nvdrv::devices::nvhost_gpu::dump_submit_gpfifo_profile();
             video_core::gpu_thread::dump_gpu_thread_profile();
             ruzu_core::hle::kernel::svc::svc_ipc::dump_ipc_phase_profile();
@@ -606,6 +612,7 @@ fn main() {
             ruzu_core::hle::service::nvnflinger::buffer_queue_producer::dump_bqp_slot_profile();
             ruzu_core::hle::service::nvnflinger::hos_binder_driver::dump_binder_txn_profile();
             ruzu_core::hle::service::nvnflinger::buffer_queue_core::dump_bqp_wait_profile();
+            ruzu_core::hle::service::nvnflinger::diagnostics::dump("atexit");
             ruzu_core::hle::service::nvnflinger::hardware_composer::dump_hwc_cache_profile();
             ruzu_core::hle::service::vi::conductor::dump_vsync_profile();
             video_core::renderer_opengl::dump_present_profile();

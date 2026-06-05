@@ -14,6 +14,7 @@ pub mod buffer_slot;
 pub mod buffer_transform_flags;
 pub mod consumer_base;
 pub mod consumer_listener;
+pub mod diagnostics;
 pub mod display;
 pub mod graphic_buffer_producer;
 pub mod hardware_composer;

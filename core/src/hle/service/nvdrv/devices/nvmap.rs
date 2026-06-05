@@ -4,7 +4,7 @@
 //! Port of zuyu/src/core/hle/service/nvdrv/devices/nvmap.h
 //! Port of zuyu/src/core/hle/service/nvdrv/devices/nvmap.cpp
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
 
 use crate::hle::kernel::k_memory_block::KMemoryPermission;
@@ -81,6 +81,64 @@ pub struct IocGetIdParams {
 }
 const _: () = assert!(std::mem::size_of::<IocGetIdParams>() == 8);
 
+#[derive(Clone, Copy)]
+struct NvmapHistoryEvent {
+    sequence: u64,
+    kind: &'static str,
+    fd: DeviceFD,
+    handle: u32,
+    size: u64,
+    address: u64,
+    flags: u32,
+    align: u32,
+    heap_mask: u32,
+}
+
+static NVMAP_HISTORY: std::sync::OnceLock<Mutex<VecDeque<NvmapHistoryEvent>>> =
+    std::sync::OnceLock::new();
+static NVMAP_HISTORY_SEQUENCE: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+fn record_nvmap_history(event: NvmapHistoryEvent) {
+    let mut history = NVMAP_HISTORY
+        .get_or_init(|| Mutex::new(VecDeque::with_capacity(128)))
+        .lock()
+        .unwrap();
+    if history.len() == 128 {
+        history.pop_front();
+    }
+    history.push_back(NvmapHistoryEvent {
+        sequence: NVMAP_HISTORY_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1,
+        ..event
+    });
+}
+
+fn dump_nvmap_history(reason: &str) {
+    let Some(history) = NVMAP_HISTORY.get() else {
+        return;
+    };
+    let history = history.lock().unwrap();
+    eprintln!(
+        "[NVMAP_HISTORY] reason={} events={}",
+        reason,
+        history.len()
+    );
+    for event in history.iter() {
+        eprintln!(
+            "[NVMAP_HISTORY] #{:05} {} fd={} handle=0x{:X} size=0x{:X} addr=0x{:X} flags=0x{:X} align=0x{:X} heap_mask=0x{:X}",
+            event.sequence,
+            event.kind,
+            event.fd,
+            event.handle,
+            event.size,
+            event.address,
+            event.flags,
+            event.align,
+            event.heap_mask,
+        );
+    }
+}
+
 /// The nvmap device file.
 pub struct NvMapDevice {
     file: *const nvmap_core::NvMap,
@@ -128,6 +186,17 @@ impl NvMapDevice {
             Ok(handle) => {
                 handle.set_orig_size(params.size as u64);
                 params.handle = handle.id;
+                record_nvmap_history(NvmapHistoryEvent {
+                    sequence: 0,
+                    kind: "create",
+                    fd: 0,
+                    handle: params.handle,
+                    size: aligned_size,
+                    address: 0,
+                    flags: 0,
+                    align: 0,
+                    heap_mask: 0,
+                });
                 if Self::should_trace_alloc_loop() {
                     log::info!(
                         "nvmap::IocCreate size=0x{:X} aligned=0x{:X} handle=0x{:X}",
@@ -221,9 +290,20 @@ impl NvMapDevice {
             let inner = handle.lock_inner();
             (inner.address as usize, inner.size as usize)
         };
-        let lock_result = {
+        record_nvmap_history(NvmapHistoryEvent {
+            sequence: 0,
+            kind: "alloc",
+            fd,
+            handle: params.handle,
+            size: handle_size as u64,
+            address: handle_address as u64,
+            flags: params.flags.raw,
+            align: params.align,
+            heap_mask: params.heap_mask,
+        });
+        let (lock_result, lock_start_info, lock_end_info) = {
             let mut process_guard = process.lock().unwrap();
-            process_guard
+            let lock_result = process_guard
                 .page_table
                 .get_base_mut()
                 .lock_for_map_device_address_space(
@@ -231,24 +311,84 @@ impl NvMapDevice {
                     handle_size,
                     KMemoryPermission::NONE,
                     true,
-                )
+                );
+            let start_info = process_guard.page_table.query_info(handle_address);
+            let end_info = handle_size
+                .checked_sub(1)
+                .and_then(|last_offset| handle_address.checked_add(last_offset))
+                .and_then(|last_addr| process_guard.page_table.query_info(last_addr));
+            (lock_result, start_info, end_info)
         };
-        debug_assert_eq!(lock_result, 0);
+        if lock_result != 0 {
+            dump_nvmap_history("lock_for_map_device_address_space_failed");
+            crate::hle::service::nvdrv::nvdrv_interface::dump_nvdrv_ioctl_history(
+                "nvmap_lock_for_map_device_address_space_failed",
+            );
+            crate::hle::kernel::svc::svc_memory_history::dump(
+                "nvmap_lock_for_map_device_address_space_failed",
+            );
+            crate::hle::service::nvnflinger::diagnostics::dump(
+                "nvmap_lock_for_map_device_address_space_failed",
+            );
+            log::error!(
+                "nvmap::IocAlloc failed to lock CPU range for device mapping: handle=0x{:X} addr=0x{:X} size=0x{:X} result=0x{:08X}",
+                params.handle,
+                handle_address,
+                handle_size,
+                lock_result
+            );
+            if let Some(info) = lock_start_info {
+                log::error!(
+                    "nvmap::IocAlloc lock start state: base=0x{:X} size=0x{:X} state={:?} perm={:?} attr={:?} orig_perm={:?} ipc_locks={} device_use={}",
+                    info.m_address,
+                    info.m_size,
+                    info.m_state,
+                    info.m_permission,
+                    info.m_attribute,
+                    info.m_original_permission,
+                    info.m_ipc_lock_count,
+                    info.m_device_use_count
+                );
+            } else {
+                log::error!("nvmap::IocAlloc lock start state: <missing>");
+            }
+            if let Some(info) = lock_end_info {
+                log::error!(
+                    "nvmap::IocAlloc lock end state: base=0x{:X} size=0x{:X} state={:?} perm={:?} attr={:?} orig_perm={:?} ipc_locks={} device_use={}",
+                    info.m_address,
+                    info.m_size,
+                    info.m_state,
+                    info.m_permission,
+                    info.m_attribute,
+                    info.m_original_permission,
+                    info.m_ipc_lock_count,
+                    info.m_device_use_count
+                );
+            } else {
+                log::error!("nvmap::IocAlloc lock end state: <missing>");
+            }
+            // Upstream uses ASSERT(...IsSuccess()) here and still returns the
+            // original nvmap result to the guest if asserts are ignored. Do
+            // not turn this diagnostic into a guest-visible nvmap failure:
+            // MK8D's caller treats that path as fatal and jumps through a null
+            // callback. The page-table mismatch remains logged above.
+        }
 
         {
             let mut inner = handle.lock_inner();
             if inner.d_address == 0 {
+                let map_size = inner.aligned_size as usize;
                 if let Some(d_address) = self.container().map_preallocated_area(
                     session_id,
                     inner.address,
-                    inner.size as usize,
+                    map_size,
                 ) {
                     inner.d_address = d_address;
                     inner.in_heap = true;
                     if std::env::var_os("RUZU_TRACE_NVMAP_PIN").is_some() {
                         eprintln!(
                             "[NVMAP_PIN] handle=0x{:X} vaddr=0x{:X} size=0x{:X} -> prealloc d_address=0x{:X}",
-                            params.handle, inner.address, inner.size, d_address
+                            params.handle, inner.address, map_size, d_address
                         );
                     }
                 }

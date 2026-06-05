@@ -95,7 +95,9 @@ impl Fiber {
         #[cfg(target_arch = "x86_64")]
         if std::env::var_os("RUZU_TRACE_FIBER_ENTRY").is_some() {
             let rsp: u64;
-            unsafe { core::arch::asm!("mov {}, rsp", out(reg) rsp, options(nomem, nostack)); }
+            unsafe {
+                core::arch::asm!("mov {}, rsp", out(reg) rsp, options(nomem, nostack));
+            }
             eprintln!(
                 "[FIBER_ENTRY] post-prologue rsp=0x{:016x} rsp_mod_16={:#x} (expected 0x0 if ABI entry RSP mod 16 == 8 and prologue subtracts 0x88)",
                 rsp,

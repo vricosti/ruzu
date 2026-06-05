@@ -1,3 +1,230 @@
+## 2026-06-05 — core/src/hle/service/nvdrv/nvdrv_interface.rs and ruzu_cmd/src/main.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/nvdrv/nvdrv_interface.cpp
+
+### Intentional differences
+- Exposed the existing Rust-only `NVDRV_IOCTL_HISTORY` ring dump through `RUZU_DUMP_NVDRV_IOCTL_HISTORY=1` and the existing `SIGUSR2`/atexit profile path. The ring now keeps 4096 events and records both ioctl entry (`kind=1/2/3`) and ioctl return (`kind=0x81/0x82/0x83`, `words[0]=NvResult`) so a blocked MK8D run can distinguish a stuck nvdrv handler from a guest-side wait after handler return. Upstream has no equivalent host diagnostic ring; normal ioctl behavior and guest-visible replies are unchanged unless the env var is set.
+
+### Unintentional differences (to fix)
+- N/A for this diagnostic slice. It only changes inactive host-side diagnostic capture/dump behavior.
+
+### Missing items
+- Use the entry/return dump together with `NVNFLINGER_HISTORY` to identify whether MK8D's post-`RequestBuffer` stall is inside `nvhost_gpu::SubmitGPFIFO*` or in the guest wait path after the ioctl returns.
+
+### Binary layout verification
+- N/A: host-side diagnostic visibility only. No guest-visible raw payload layout changed.
+
+### Tests
+- `cargo check -p core`
+- `cargo build --release --bin ruzu-cmd`
+
+## 2026-06-05 — core/src/hle/kernel/svc/svc_ipc.rs and common/src/trace.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/svc/svc_ipc.cpp
+
+### Intentional differences
+- Extended the existing Rust-only `SVC_IPC_PROGRESS` trace category with stages 11-20 around the inline `SendSyncRequest` service-manager resolution path (`parent_session`, `server_session`, and `SessionRequestManager` locks). Upstream has no equivalent trace ring; default behavior is unchanged unless `RUZU_TRACE_SVC_IPC_PROGRESS=1` is set.
+- Gated the Rust-only `SessionRequestManager`/service-name lookup behind actual host-thread routing needs (`RUZU_SERVER_THREAD_IPC_*`) or the `SVC_IPC_PROGRESS` diagnostic trace. Upstream `svc_ipc.cpp` only gets the `KClientSession`, keeps its parent alive, then calls `session->SendSyncRequest(...)`; it does not lock a service manager on the normal inline SVC path.
+
+### Unintentional differences (to fix)
+- N/A for this diagnostic slice. It only emits additional non-blocking trace records when the diagnostic category is enabled.
+
+### Missing items
+- Re-run MK8D without `SVC_IPC_PROGRESS` to confirm removing the unnecessary manager-name lookup reduces the pre-frame stalls, then use the new stages only for targeted reproduction if the stall remains.
+
+### Binary layout verification
+- N/A: host-side diagnostic trace metadata only. No guest-visible raw payload layout changed.
+
+### Tests
+- `cargo check -p core`
+- `cargo build --release --bin ruzu-cmd`
+- Manual MK8D light-trace smoke without `SVC_IPC_PROGRESS`: reached HWC `frame=1416` in 25s with continuous BQP `queue_commit` and HWC `acquire status=0`.
+
+## 2026-06-05 — core/src/hle/service/nvnflinger/diagnostics.rs and ruzu_cmd/src/main.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/nvnflinger/*
+
+### Intentional differences
+- Exposed the existing Rust-only `NVNFLINGER_HISTORY` ring dump through `RUZU_DUMP_NVNFLINGER_HISTORY=1` and the existing `SIGUSR2`/atexit profile path. The ring now keeps 4096 events so HWC polling does not overwrite the first BQP events before a stall dump. Upstream has no equivalent host diagnostic ring; default behavior is unchanged unless the env var is set.
+
+### Unintentional differences (to fix)
+- N/A for this diagnostic slice. It only changes dump visibility for already-recorded host-side history.
+
+### Missing items
+- Use the dump to identify why MK8D producer thread sometimes stops after `dequeue_return` without reaching the following `queue_buffer`, then remove or fold the diagnostic into the common trace configuration once the root cause is fixed.
+
+### Binary layout verification
+- N/A: host-side diagnostic visibility only. No guest-visible raw payload layout changed.
+
+### Tests
+- `cargo check -p core`
+- `cargo build --release --bin ruzu-cmd`
+
+## 2026-06-05 — core/src/hle/kernel/svc/svc_ipc.rs and core/src/arm/dynarmic/arm_dynarmic_32.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/svc/svc_ipc.cpp and /home/vricosti/Dev/emulators/zuyu/src/core/arm/dynarmic/arm_dynarmic_32.cpp
+
+### Intentional differences
+- `IHOSBinderDriver` host-thread IPC routing is no longer enabled by default. It remains available through `RUZU_SERVER_THREAD_IPC_BINDER=1`, `RUZU_SERVER_THREAD_IPC_HANDLE=...`, or `RUZU_SERVER_THREAD_IPC_ALL=1`, but normal MK8D boots return to the inline IPC path until the Rust host-thread `ServerManager` lifecycle is complete. Upstream routes service work through server managers; this is a temporary safety divergence because the current Rust Binder host-thread path can leave MK8D after the first `dequeue_return` with no `queue_commit`, no audio, and only `HWC status=2` acquisitions.
+- Added optional filters to the existing A32 unmapped-write diagnostic: `RUZU_TRACE_UNMAPPED_WRITE_ADDR=0x...` and `RUZU_TRACE_UNMAPPED_WRITE_LIMIT=N`. Upstream has no equivalent diagnostic hook; default behavior is unchanged unless `RUZU_TRACE_UNMAPPED_WRITE` is enabled.
+
+### Unintentional differences (to fix)
+- `svc_ipc.rs` still contains Rust-only inline HLE fallback, host-thread routing experiments, parent-id caching, and lock-order diagnostics. Upstream `svc_ipc.cpp` remains a thin wrapper over `KClientSession`, `KServerSession`, and `KSynchronizationObject`.
+- The complete upstream-shaped `ServerManager`/host-thread IPC lifecycle is still not safe enough to be the default for Binder, despite being architecturally closer to upstream.
+
+### Missing items
+- Finish the host-thread IPC lifecycle audit so Binder can move back to the upstream-shaped ServerManager path without losing early MK8D buffer submission.
+- If the unmapped-write filters remain useful, move them into the common trace configuration documentation.
+
+### Binary layout verification
+- N/A: IPC routing policy and JIT diagnostics only. No guest-visible raw payload layout changed.
+
+### Tests
+- Manual MK8D comparison, same light trace set for 60s: default Binder host-thread routing stalled at `BQP dequeue_return seq=0`, `HWC status=2`, and no audio; `RUZU_INLINE_IPC=1` reached BQP frame ~2215, HWC frame ~2426, and non-zero audio.
+- `cargo check -p core`
+- `cargo build --release --bin ruzu-cmd`
+- Manual MK8D validation after reverting Binder host-thread default: default run without `RUZU_INLINE_IPC` reached BQP frame ~3177, HWC frame ~3508, and non-zero audio in 60s.
+
+## 2026-06-05 — core/src/hle/service/nvdrv/devices/nvmap.rs and core/src/hle/kernel/svc_dispatch.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/nvdrv/devices/nvmap.cpp and /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/svc/svc_cache.cpp
+
+### Intentional differences
+- Added a host-side `nvmap` allocation ring buffer that records the last 128 `IocCreate`/`IocAlloc` events in memory and dumps only when an allocation falls below the process heap region or when `LockForMapDeviceAddressSpace` fails. Upstream has no equivalent diagnostic hook; normal `nvmap` behavior and guest-visible ioctl results are unchanged.
+- Updated `SVC_CONTEXT_MEM` diagnostics to read via `KProcess::read_memory_vec(...)`, so dumps use the same `Core::Memory`/page-table path as IPC handlers and JIT-visible memory instead of the stale fallback `ProcessMemoryData`.
+- Recorded verified MK8D `sdk` base `0x01C9C000` in `bases.json` after matching runtime SVC wrapper bytes at `0x01D50460` to `sdk` NSO offset `0x000B4460`.
+
+### Unintentional differences (to fix)
+- `nvmap.rs` still keeps Rust-only diagnostic state in the device implementation file. This should be removed or moved to the common trace-ring system once the MK8D low-address allocator divergence is resolved.
+- `svc_dispatch.rs` still contains diagnostic LR/context dumping inside the dispatch file. Upstream has generated/typed SVC wrappers and no equivalent debug code.
+
+### Missing items
+- Use the `NVMAP_HISTORY` dump to identify why MK8D sometimes skips the `IocCreate size=0x21000` allocation before `IocCreate size=0x70000`, causing the latter to use `addr=0x068B0000` instead of the valid high heap sequence (`0x78055000`, `0x78080000`) seen in non-blocked ruzu runs and zuyu.
+- Continue tracing the upstream cause in the allocator/surface path rather than accepting `nvmap` locks on `Free` memory.
+
+### Binary layout verification
+- N/A: host-side diagnostics and NSO base registry only. No guest-visible raw payload layout changed.
+
+### Tests
+- `cargo check -p core`
+- Manual MK8D `nvmap=info` run reproduced the bad sequence: `AD0 size=0x140000 addr=0x8D17D000`, missing `size=0x21000`, then `AD4 size=0x70000 addr=0x068B0000` with `LockForMapDeviceAddressSpace` failure.
+- Manual comparison against a non-blocked ruzu run showed the expected sequence: `AD0 size=0x140000`, `AD4 size=0x21000 addr=0x78055000`, `AD8 size=0x70000 addr=0x78080000`.
+
+## 2026-06-05 — video_core/src/renderer_opengl/gl_texture_cache.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/texture_cache.h and /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_texture_cache.cpp
+
+### Intentional differences
+- `TextureCache::prepare_image_with_gpu_reader` now calls an OpenGL-owned `synchronize_aliases(image_id)` immediately after `refresh_contents_with_gpu_reader`, matching upstream `TextureCache<P>::PrepareImage` ordering (`RefreshContents` then `SynchronizeAliases`, before `MarkModification`).
+- Ported upstream `SynchronizeAliases` tick/flag propagation and modification-tick sorting for registered `aliased_images`. Rust clones the alias copy list before copying so the borrow model stays safe while preserving the upstream source/destination ordering.
+- Ported upstream OpenGL `MakeCopyOrigin`, `MakeCopyRegion`, and the direct `TextureCacheRuntime::CopyImage` path through `glCopyImageSubData` for ordinary same-format, same-sample-count texture aliases.
+- Added env-gated `RUZU_TRACE_ALIAS_SYNC=1` logging for alias-copy skips and GL copy errors. Upstream has no equivalent diagnostic hook; default execution is unchanged.
+
+### Unintentional differences (to fix)
+- Upstream `CopyImage` supports same format-type copies beyond exact `PixelFormat` equality when GL compatibility allows it. Ruzu currently restricts the direct path to exact format equality until the OpenGL format compatibility table is fully ported.
+- Upstream handles resolution scaling around alias copies (`ScaleUp` / `ScaleDown`) and copies rescaled aliases after adjusting offsets/extents. Ruzu does not yet port that rescale branch.
+- Upstream routes MSAA copies, BGR/BC4 emulated copies, and reinterpret/format-conversion copies through runtime helpers. Ruzu currently skips different sample-count and different-format alias copies.
+- Ruzu still depends on registered `aliased_images`; if the image insertion path failed to create aliases because `JoinImages` / `ResolveOverlap` parity is incomplete, this synchronization has no aliases to process.
+
+### Missing items
+- Port full `TextureCache<P>::CopyImage` policy including format-type compatibility, MSAA copy shader path, reinterpret/format-conversion fallback, and rescaled-copy offset adjustment.
+- Complete `JoinImages` / `ResolveOverlap` parity so all upstream alias relationships are registered before `SynchronizeAliases` runs.
+
+### Binary layout verification
+- N/A: host OpenGL texture-cache synchronization only. No guest-visible raw payload layout changed.
+
+### Tests
+- `cargo check -p video_core`
+
+## 2026-06-05 — video_core/src/renderer_opengl/gl_rasterizer.rs and common/src/trace.example.toml vs /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_rasterizer.cpp
+
+### Intentional differences
+- Added diagnostic-only `CBUF_BIND` sequence/time filters (`RUZU_TRACE_CBUF_BIND_SEQ_MIN/MAX`, `RUZU_TRACE_CBUF_BIND_TIME_START_MS/END_MS`) and cached `RUZU_TRACE_CBUF_VEC4_COUNT` parsing. Upstream has no equivalent trace-ring hook; default rendering behavior is unchanged because the path is gated by `[opengl].cbuf_bind = true`.
+- `common/src/trace.example.toml` now documents the constant-buffer trace filters so late MK8D pipeline investigations can target one draw window without flooding the ring or perturbing boot timing.
+
+### Unintentional differences (to fix)
+- N/A for this diagnostic slice. It does not change OpenGL state synchronization, shader generation, guest memory, or draw behavior.
+
+### Missing items
+- Use the filtered trace to compare `pipeline=4` constant-buffer values around MK8D's transition from title art to black background, then decide whether the next parity fix belongs in shader constants, texture view swizzles, or render-state synchronization.
+
+### Binary layout verification
+- N/A: host-side diagnostics only. No guest-visible raw payload layout changed.
+
+### Tests
+- `cargo check -p video_core`
+- Filtered MK8D cbuf trace run pending.
+
+## 2026-06-05 — core/src/hle/kernel/k_process.rs and core/src/hle/kernel/svc/svc_ipc.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/k_client_session.h and /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/k_client_session.cpp
+
+### Intentional differences
+- Upstream `KClientSession` stores a raw `KSession* m_parent` and `SendSyncRequest` forwards directly to `m_parent->OnRequest(request)` without taking a separate client-session mutex. Ruzu stores session endpoints by process object id, so `KProcess::client_session_parent_ids` caches the equivalent client-session-object-id -> parent-session-object-id relation at registration time. This lets the hot `svc::SendSyncRequest` path resolve the parent while it already holds the process table, avoiding a `KClientSession` mutex acquisition that can wedge MK8D under IPC fan-out.
+- `svc::SendSyncRequest` still keeps the `Arc<Mutex<KClientSession>>` handle for paths that need the actual endpoint object, but parent lookup for the normal SVC21 path now uses the process-side parent cache to match upstream's lock-free `m_parent` access pattern more closely.
+
+### Unintentional differences (to fix)
+- `host_thread_ipc_spawn_fallback` and the opt-in `RUZU_LEGACY_INLINE_NOTIFY` path still call `KClientSession::send_sync_request_with_process`, which locks the client endpoint and is less faithful than upstream's direct `m_parent` call. These paths are fallback/diagnostic, not the default MK8D hot path, but should be rewritten around a shared request enqueue helper.
+- `KClientSession` still stores `parent_id` internally in addition to the new `KProcess` cache. This duplication is transitional until the Rust object model can represent the upstream parent ownership without scattered process lookups.
+
+### Missing items
+- Refactor `KClientSession::send_sync_request_with_process` / `send_async_request_with_process` so the request creation/enqueue helper takes the already-resolved parent session, matching upstream ownership without re-locking the client endpoint.
+- Add a focused regression test proving `send_sync_request_impl` resolves parent id through `KProcess::get_client_session_parent_id` and does not lock `KClientSession` on the normal path.
+
+### Binary layout verification
+- N/A: kernel object bookkeeping only. No guest-visible raw payload layout changed.
+
+### Tests
+- `cargo check -p core`
+
+## 2026-06-05 — core/src/hle/service/hle_ipc.rs, core/src/hle/service/ipc_helpers.rs, and core/src/hle/service/sm/sm_controller.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/hle_ipc.h, /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/hle_ipc.cpp, /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/ipc_helpers.h, and /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/sm/sm_controller.cpp
+
+### Intentional differences
+- `HLERequestContext::register_last_created_session_with_manager` routes upstream `ServerManager::RegisterSession(&session->GetServerSession(), next_manager)` through ruzu's pending-registration queue and wakeup event. This preserves upstream ownership/order while avoiding direct `Mutex<ServerManager>` locking from an HLE handler thread.
+- Rust keeps `create_session_for_service` as a compatibility helper for already-ported services that return a concrete process handle immediately. The new helper makes that path register the server endpoint with the owning `ServerManager`, matching upstream lifecycle before the client endpoint is used.
+- `SM::Controller::CloneCurrentObject` now uses the same registration helper after `create_session_with_manager_object_id`, matching upstream's single conceptual `RegisterSession(&session->GetServerSession(), session_manager)` step instead of duplicating the pending-registration queue logic locally.
+
+### Unintentional differences (to fix)
+- Some Rust services still call `create_session_for_service` directly and therefore resolve a raw handle earlier than upstream's pointer/object deferred `AddMoveObject` / `WriteToOutgoingCommandBuffer` flow. `ResponseBuilder::push_ipc_interface` is closer to upstream because it stores the client-session object id and defers handle-table insertion.
+
+### Missing items
+- Audit direct `create_session_for_service` call sites and migrate service responses to `ResponseBuilder::push_ipc_interface` / `CmifResponse::push_interface` style where the upstream file uses `IPC::ResponseBuilder::PushIpcInterface`.
+- `cargo test -p core` currently does not compile unrelated existing tests (`core/src/hle/kernel/message_buffer.rs` borrow error plus other test-only errors), so the new registration regression test is present but cannot be executed until the test crate is repaired.
+
+### Binary layout verification
+- N/A: IPC lifecycle/registration behavior only. No guest-visible raw payload layout changed by this patch.
+
+### Tests
+- `cargo check -p core`
+- `cargo build --release --bin ruzu-cmd`
+- `cargo test -p core create_session_for_service_queues_server_manager_registration -- --nocapture` attempted; blocked by pre-existing core test compilation errors outside this slice.
+- Manual MK8D Mii check: `IDatabaseService::Get source_flag=0x1 count=0` and `source_flag=0x2 count=6`, matching the expected zuyu Mii count for the system source.
+
+## 2026-06-05 — video_core/src/renderer_opengl/gl_device.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_device.h and gl_device.cpp
+
+### Intentional differences
+- N/A for the vendor predicate change. Rust now matches upstream's exact `Device::IsAmd()`, `Device::IsIntel()`, and Nvidia constructor predicates instead of using broad substring matching.
+
+### Unintentional differences (to fix)
+- Ruzu still lacks some upstream `Device` capability fields and policy users (`has_broken_texture_view_formats`, `has_fast_buffer_sub_data`, `use_driver_cache`, `supports_conditional_barriers`, `has_lmem_perf_bug`, and the full ASTC software-driver blacklist). These should be ported in `gl_device.rs` before treating the OpenGL device table as complete.
+- `has_vertex_viewport_layer` still treats `GL_NV_viewport_array2` as equivalent to `GL_ARB_shader_viewport_layer_array`; upstream keeps those capabilities separate and combines them only at the shader-profile call site.
+
+### Missing items
+- Complete the remaining `Device` capability table parity against upstream `gl_device.h/cpp`.
+
+### Binary layout verification
+- N/A: OpenGL host capability policy only. No guest-visible raw payload layout changed.
+
+### Tests
+- `cargo check -p video_core`
+- `cargo build --release --bin ruzu-cmd`
+- Manual MK8D retest with fresh `XDG_CACHE_HOME` to force shader recompilation: reaches `present_2600` without guest break, but the title-screen UI band remains corrupted. The vendor predicate parity fix is not the cause of that visible bug.
+
+## 2026-06-05 — video_core/src/renderer_opengl/gl_rasterizer.rs and video_core/src/renderer_opengl/gl_texture_cache.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_rasterizer.cpp and /home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/texture_cache.h
+
+### Intentional differences
+- Added diagnostic-only present-time image metadata for `RUZU_DUMP_PRESENT_EXTRA_GPU_ADDRS` through the existing `PRESENT_IMAGE_SELECT` trace category. Unlike the heavier `PRESENT_TEXTURE` path, this records image flags, modification tick, registered alias/overlap counts, and dynamic CPU/GPU overlap counts without sampling OpenGL texture contents. Upstream has no equivalent trace-ring hook; default execution is unchanged unless `[opengl].present_image_select = true` is enabled.
+- Decoupled targeted image metadata collection from `PRESENT_TEXTURE` readback in `RasterizerOpenGL::AccelerateDisplay`. This keeps the probe low-perturbation while investigating MK8D's corrupted title-screen prompt texture.
+
+### Unintentional differences (to fix)
+- Ruzu's texture-cache image insertion path still does not port upstream `JoinImages` / `ResolveOverlap` fully, so registered `aliased_images` and `overlapping_images` may remain empty even when dynamic overlap scans find candidate images.
+- The OpenGL alias synchronization path is now present for same-format direct copies, but this diagnostic slice did not port upstream's full `CopyImage` policy for rescale/MSAA/reinterpret/emulated copies.
+
+### Missing items
+- Use the new metadata run to decide whether to port `JoinImages` / `ResolveOverlap` next, or pivot to descriptor/image-view cache invalidation if no overlaps are present.
+
+### Binary layout verification
+- N/A: host-side diagnostics only. No guest-visible raw payload layout changed.
+
+### Tests
+- `cargo check -p video_core`
+
 ## 2026-06-03 — video_core/src/renderer_opengl/gl_texture_cache.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/texture_cache.h
 
 ### Intentional differences
@@ -6,11 +233,11 @@
 - Extended the existing env-gated `RUZU_TRACE_TEXTURE_UPLOAD` diagnostic to print the image CPU address alongside the GPU address. Upstream has no equivalent diagnostic hook; normal behavior is unchanged when the env var is unset.
 
 ### Unintentional differences (to fix)
-- Alias synchronization after refresh remains TODO in the Rust OpenGL wrapper; upstream calls `SynchronizeAliases(image_id)` from `PrepareImage` after `RefreshContents`.
+- The OpenGL wrapper now calls alias synchronization after refresh, but only the direct same-format `glCopyImageSubData` copy path is ported. Upstream `CopyImage` still has additional rescale, MSAA, reinterpret, and emulated-copy branches.
 - The zero-size early return in `refresh_contents_with_gpu_reader` clears `CpuModified` without tracking. Upstream clears `CpuModified` and calls `TrackImage` before upload-special-case handling; revisit this if zero-sized images become observable in real guest paths.
 
 ### Missing items
-- Port the remaining alias synchronization path used by upstream `TextureCache<P>::PrepareImage`.
+- Port the remaining `TextureCache<P>::CopyImage` branches used by upstream alias synchronization.
 - Move the backend hook boundary closer to upstream once the common Rust texture cache can express backend image upload/download operations without duplicating lifecycle logic in `gl_texture_cache.rs`.
 
 ### Binary layout verification
@@ -5573,13 +5800,27 @@
 - `Common::UUID` remains represented internally as `u128` in this Rust file: this is an older structural divergence, but raw IPC/savefile byte order is still preserved through `to_le_bytes()` / `from_le_bytes()` on all current paths touched in this pass.
 
 ### Unintentional differences (to fix)
-- None currently documented.
+- `ProfileManager::AddUser` currently reuses ruzu's existing account error constants rather than upstream's local `ERROR_TOO_MANY_USERS`/`ERROR_USER_ALREADY_EXISTS` constants. Guest-visible result-code parity still needs a dedicated error audit for this file.
 
 ### Missing items
 - Re-audit `ProfileInfo.user_uuid`/`UserIDArray` against upstream `Common::UUID` ownership and placement.
 
 ### Binary layout verification
 - PASS: `ProfileBase` remains `0x38` and `UserData` remains `0x80`.
+
+## 2026-06-05 — core/src/hle/service/acc/profile_manager.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/acc/profile_manager.cpp and /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/acc/profile_manager.h
+
+### Intentional differences
+- `Common::UUID` is still represented as `u128` internally; raw IPC/savefile byte order remains preserved through explicit little-endian conversion at the boundaries.
+
+### Unintentional differences (to fix)
+- Account-specific local error-code constants still differ from upstream's `ERROR_TOO_MANY_USERS`, `ERROR_USER_ALREADY_EXISTS`, and `ERROR_ARGUMENT_IS_NULL`; the behavioral paths are now closer, but numeric result-code parity still needs a focused audit.
+
+### Missing items
+- Re-audit `ProfileInfo.user_uuid`/`UserIDArray` ownership against upstream `Common::UUID` once the broader account service is normalized.
+
+### Binary layout verification
+- PASS: `ProfileBase` remains `0x38`, `UserData` remains `0x80`, and `ProfileDataRaw` remains `0x650`. New tests verify savefile UUID duplication and default-profile timestamp parity.
 
 ## 2026-04-01 — core/src/hle/service/acc/acc.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/acc/acc.cpp and /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/acc/acc.h
 
@@ -20263,6 +20504,25 @@ The following still panic because upstream either also throws NotImplementedExce
 - `cargo build --release --bin ruzu-cmd`
 - Manual MK8D clean run: `BreakLoopNullPc` is detected and the host no longer spins indefinitely at the original 160%+ CPU rate, but the guest still reaches a null destination path around `lr=0x00A325B8`.
 
+## 2026-06-05 — core/src/hle/kernel/kernel.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/kernel.cpp and /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/physical_core.cpp
+
+### Intentional differences
+- Extended ruzu's SIGUSR1 dump harness to print `SVC21_MSG` records for cores interrupted inside `SendSyncRequest`: guest tid, handle, message-buffer pointer, size, and the first IPC words. Upstream has no equivalent operator dump harness; this is diagnostic-only and only runs after an explicit SIGUSR1 request.
+
+### Unintentional differences (to fix)
+- N/A for normal execution. The added memory read is only performed from the host-side dump path after a signal-triggered diagnostic snapshot.
+
+### Missing items
+- Remove or keep strictly diagnostic after the MK8D early `BQP=2` / missing `QueueBuffer` investigation is resolved.
+
+### Binary layout verification
+- N/A: host-side diagnostics only. No guest-visible raw payload layout changed.
+
+### Tests
+- `cargo check -p core`
+- `cargo build --release --bin ruzu-cmd`
+- Manual MK8D SIGUSR1 capture planned for early `BQP=2` stall to attribute the stuck `SendSyncRequest` command.
+
 ## 2026-06-03 — core/src/hle/kernel/kernel.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/kernel.cpp
 
 ### Intentional differences
@@ -20345,3 +20605,161 @@ The following still panic because upstream either also throws NotImplementedExce
 - `cargo check -p core`
 - `cargo build --release --bin ruzu-cmd`
 - Manual MK8D clean run with SIGUSR1 at 80s, preserving real `XDG_DATA_HOME`: 105s timeout, no crash, `cpu=85%`, `maxrss=4879952`; scheduler dump shows `core=1 current=Some(78) highest=Some(78) needs=false`, fixing the prior `current=78 highest=104 needs=true` post-SVC scheduler lag.
+
+## 2026-06-05 — audio_core/src/renderer/command/sink/device.rs vs /home/vricosti/Dev/emulators/zuyu/src/audio_core/renderer/command/sink/device.cpp and /home/vricosti/Dev/emulators/zuyu/src/audio_core/renderer/command/sink/device.h
+
+### Intentional differences
+- Rust keeps the serialized `DeviceSinkPayload` shape with `sample_buffer: CpuAddr` because command-list payloads are decoded from raw guest/ADSP command memory before processing. Upstream `DeviceSinkCommand` owns a `std::span<s32>` after C++ command decoding. Runtime processing now follows the same input-count and sample-indexing contract.
+- Rust has env-gated diagnostics (`RUZU_TRACE_DEVICE_SINK_CLIP`, trace-ring `AUDIO_DEVICE_SINK`) around the command. These are inactive by default and do not alter normal processing.
+
+### Unintentional differences (to fix)
+- N/A for `DeviceSinkCommand::Process` and `Verify`: Rust now uses `input_count` directly, indexes `inputs[channel]` for each channel, sets system channels to `input_count`, appends `TargetSampleCount * input_count` samples, starts the stream if paused, and `Verify` returns `true`, matching upstream.
+
+### Missing items
+- Audit the surrounding command-buffer decode path so the Rust raw `CpuAddr` payload is materialized from command memory in the same ownership layer as upstream's `std::span<s32>` construction.
+
+### Binary layout verification
+- PASS: `DeviceSinkPayload` is `repr(C)` and keeps the raw command-memory fields (`name[0x100]`, `session_id`, padding, `sample_buffer`, `sample_count`, `input_count`, `inputs`) deterministic for Rust's serialized payload path. Upstream's in-memory command object uses `std::span<s32>` and is not a raw guest-visible payload layout.
+
+### Tests
+- `cargo check -p audio_core`
+- `cargo test -p audio_core renderer::command::sink::device::tests -- --nocapture` currently fails before running this module because unrelated existing tests in `audio_core/src/renderer/system.rs` still call obsolete `System::initialize(...)` and `KReadableEvent::signal(...)` signatures.
+- Manual MK8D audio trace, ASLR disabled: first five `IAudioRenderer::RequestUpdate` input/output buffers are byte-identical between ruzu and local zuyu; ruzu `AUDIO_DEVICE_SINK` trace shows non-zero samples reaching the sink and Cubeb callbacks consuming the stream at about 47.8 kframes/s.
+
+## 2026-06-05 — core/src/hle/kernel/k_thread.rs and core/src/hle/kernel/svc/svc_ipc.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/k_thread.cpp, /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/k_server_session.cpp, and /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/svc/svc_ipc.cpp
+
+### Intentional differences
+- Ruzu still keeps the env-gated host-thread IPC rollout model instead of enabling upstream-shaped `KClientSession::SendSyncRequest` routing for every service at once. As a bounded parity step, `IHOSBinderDriver` now routes through the owning `ServerManager` by default, because MK8D exposed the inline Binder path leaving a guest core inside `SVC21` while a higher-priority thread was runnable. `RUZU_DISABLE_HOST_THREAD_BINDER_IPC=1` is a temporary kill switch.
+- Ruzu keeps the host-thread lost-wakeup guard around `begin_wait_guarded(...)`. Upstream does not need this because `KServerSession::OnRequest` owns the exact scheduler-locked `BeginWait` lifecycle. The guard remains a Rust-side safety net while the full session lifecycle is still being unwound service by service.
+- `KThread::finalize_wait_transition(...)` clears `wait_reason_for_debugging` after a wait completes. Upstream debug-reason lifetime is less explicit in this port slice; clearing at completion preserves the stale-reply guard intent while allowing `SetWaitReasonForDebugging(IPC) -> BeginWait()` to match upstream ordering.
+
+### Unintentional differences (to fix)
+- Full upstream parity still requires routing all synchronous IPC through `KClientSession::SendSyncRequest` / `KServerSession::OnRequest` / `ServerManager::LoopProcess` rather than keeping the legacy inline HLE fallback for most services.
+- `svc_ipc.rs` still contains Rust-only lock-order diagnostics and fallback helpers around session lookup, pending registration, and host-thread routing. These are useful for current races but remain structural divergence from upstream `svc_ipc.cpp`, which is only a thin SVC wrapper over `KClientSession`.
+- `send_reply_hle_unlocked(...)` remains a Rust mutex-boundary adaptation to avoid ABBA deadlocks between `KServerSession` mutexes and the scheduler lock. Upstream uses light locks/raw object ownership and does not need this split.
+
+### Missing items
+- Continue service-by-service conversion away from inline HLE IPC, using `IHOSBinderDriver` as the proven narrow path, then remove the inline fallback and the lost-wakeup guard once the upstream lifecycle is the default.
+- Audit `ThreadWaitReasonForDebugging` lifetime against upstream `KThread` after the remaining wait queues are ported, especially stale-reply filtering and non-IPC waits.
+- Investigate the next MK8D runtime issue observed after the Binder/scheduler fix: clean run reaches `NotifyRunning` and no longer shows `current=78 highest=104 needs=true`, but later logs `BreakLoopNullPc tid=96` followed by unmapped reads.
+
+### Binary layout verification
+- N/A: scheduler/IPC control flow and debug-wait metadata only. No guest-visible raw payload layout changed.
+
+### Tests
+- `cargo check -p core`
+- `cargo build --release --bin ruzu-cmd`
+- `cargo test -p core set_state_preserves_wait_reason_for_ipc_begin_wait -- --nocapture` could not run because the current `core` lib test target fails to compile before this test with unrelated existing errors, including `core/src/hle/kernel/message_buffer.rs` E0506 and 142 total test-target errors.
+- Manual MK8D Binder host-thread trace without `RUZU_SERVER_THREAD_IPC_HANDLE`: `IHOSBinderDriver` routes automatically, repeatedly reaches `enqueue_end -> client_begin_wait -> client_resumed`, and reaches `NotifyRunning`.
+- Manual MK8D clean run with no trace: reaches `NotifyRunning`; SIGUSR1 dump at 18s shows scheduler cores coherent/idle (`needs=false`) instead of the previous Binder inline wedge (`current=78 highest=104 needs=true`, `current_request=true`).
+
+## 2026-06-05 — core/src/hle/kernel/svc_dispatch.rs, core/src/hle/kernel/svc/svc_query_memory.rs, core/src/hle/kernel/k_memory_block.rs, core/src/hle/kernel/svc/svc_ipc.rs, core/src/hle/kernel/svc/svc_physical_memory.rs, and core/src/hle/service/nvdrv/nvdrv_interface.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/svc/svc_query_memory.cpp, /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/k_memory_block.h, /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/svc/svc_ipc.cpp, /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/svc/svc_physical_memory.cpp, and /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/nvdrv/nvdrv_interface.cpp
+
+### Intentional differences
+- `svc_dispatch.rs` now routes A32/A64 `QueryMemory` through `svc_query_memory::query_memory(...)`, and `svc_query_memory.rs` now serializes `KMemoryInfo::get_svc_memory_info()`. This matches upstream's `QueryMemory -> QueryProcessMemory -> KMemoryInfo::GetSvcMemoryInfo()` path and removes the older local partial `query_memory_info` conversion.
+- `KMemoryInfo::get_svc_memory_info()` masks memory attributes and permissions with the user masks, preserving ipc/device counts, matching upstream `KMemoryInfo::GetSvcMemoryInfo()`.
+- `svc_ipc.rs` keeps host-thread IPC routing env-gated. `IHOSBinderDriver` was temporarily routed through the owning `ServerManager` by default in this investigation, but the later 2026-06-05 IPC entry records why that default was reverted to opt-in.
+- Added env-gated diagnostics for MK8D investigation: `RUZU_TRACE_IOCALLOC_CTX=1` in `nvdrv_interface.rs` prints the nvmap alloc IPC buffer descriptors, and `RUZU_TRACE_PHYS_MEMORY=1` in `svc_physical_memory.rs` prints Map/UnmapPhysicalMemory calls and results. These are inactive by default and do not change guest-visible behavior.
+
+### Unintentional differences (to fix)
+- `svc_dispatch.rs` still owns A32/A64 SVC dispatch glue directly rather than matching upstream's generated/typed SVC wrapper layout.
+- `svc_ipc.rs` still contains Rust-only inline HLE fallback, host-thread routing experiments, parent-id caching, and lock-order diagnostics. Upstream `svc_ipc.cpp` remains a thin wrapper over `KClientSession`, `KServerSession`, and `KSynchronizationObject`.
+- `svc_physical_memory.rs` still skips upstream's `GetTotalSystemResourceSize() == 0` invalid-state check and relies on the page-table implementation for alias-region validation in `MapPhysicalMemory`/`UnmapPhysicalMemory`.
+- `nvdrv_interface.rs` still carries extra trace/profiling hooks and copies `ctx.ReadBuffer(0)` into a Rust `Vec<u8>` before dispatch; upstream keeps the same HLERequestContext ownership but uses C++ buffers/spans.
+
+### Missing items
+- Complete upstream-shaped IPC lifecycle so the legacy inline fallback and service-name routing knobs can be removed.
+- Port the missing `GetTotalSystemResourceSize()` validation path for physical-memory SVCs and verify alias-region failures match upstream result ordering.
+- Promote the useful nvmap alloc context diagnostic into the non-blocking trace category table if it remains part of the long-term investigation tooling.
+
+### Binary layout verification
+- PASS: SVC `MemoryInfo` serialization now uses the upstream field policy from `GetSvcMemoryInfo`; no guest-visible raw payload layout was changed.
+- N/A: IPC routing and diagnostics do not define raw guest payload layouts.
+
+### Tests
+- `cargo check -p core`
+- `cargo build --release --bin ruzu-cmd`
+- Manual MK8D run after rebuilding release with default Binder host-thread routing: the earlier Binder scheduler wedge is gone at the 8s SIGUSR1 snapshot (`pq_fronts=None`, all cores `needs=false`), and the run reaches the next blocker: `nvmap::IocAlloc(handle=0xACC, addr=0x068B0000, size=0x70000)` on `Free` memory followed by `BreakLoopNullPc tid=96`.
+- Manual MK8D run with `RUZU_TRACE_IOCALLOC=1`: reproduced the late block at `IocAlloc` with guest input buffer already containing `address=0x068B0000`.
+- Manual MK8D run with `RUZU_TRACE_TID_SVC=96 RUZU_TRACE_TID_SVC_PC=1`: captured the following post-failure guest SVC sequence from `tid=96`: `SendSyncRequest pc=0x01D50474 lr=0x01D3C7C0`, then `FlushProcessDataCache pc=0x01D50750 lr=0x01D299C0` over `0x068B0000`.
+
+## 2026-06-05 — core/src/hle/kernel/svc/svc_memory_history.rs, core/src/hle/kernel/svc/svc_query_memory.rs, core/src/hle/kernel/svc/svc_memory.rs, core/src/hle/kernel/svc/svc_physical_memory.rs, and core/src/hle/service/nvdrv/devices/nvmap.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/svc/svc_query_memory.cpp, /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/svc/svc_memory.cpp, /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/svc/svc_physical_memory.cpp, and /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/nvdrv/devices/nvmap.cpp
+
+### Intentional differences
+- Added Rust-only, env-gated diagnostic history for memory SVCs. `RUZU_TRACE_MEM_HISTORY_TARGET=0x...` records nearby `QueryMemory`, `SetHeapSize`, `MapMemory`, `UnmapMemory`, `MapPhysicalMemory`, and `UnmapPhysicalMemory` events into an in-memory ring and dumps it only when `nvmap::IocAlloc` detects a CPU range that cannot be locked for device mapping. This is investigation tooling for the MK8D late `0x068B0000` failure and does not alter guest-visible SVC or nvmap results.
+- The same memory-history ring is also dumped from the existing SIGUSR1 kernel thread dump path. This keeps normal runs free of hot-path I/O while allowing a blocked MK8D process to be inspected with `kill -USR1 <pid>` before it is terminated.
+- `nvmap.rs` still emits additional diagnostics before continuing after `lock_for_map_device_address_space` failure. Upstream asserts this condition; ruzu logs the page-table mismatch so the guest-side allocator failure can be investigated without losing the preceding trace context.
+
+### Unintentional differences (to fix)
+- None in guest-visible behavior for this slice; the new code is inactive unless `RUZU_TRACE_MEM_HISTORY_TARGET` is set.
+
+### Missing items
+- If this diagnostic remains useful after the MK8D memory-map mismatch is fixed, promote it into the non-blocking trace category table instead of keeping a local `Mutex<VecDeque<...>>`.
+- Continue comparing the low 32-bit address-space `QueryMemory` sequence against upstream to determine why MK8D selects an unmapped low CPU range for the Mii/system-data cache buffer.
+
+### Binary layout verification
+- N/A: diagnostic metadata only. No guest-visible raw payload layout changed.
+
+### Tests
+- `cargo check -p core`
+- `cargo check -p core` after wiring the SIGUSR1 memory-history dump
+- Manual MK8D run with `RUZU_TRACE_MEM_HISTORY_TARGET=0x068B0000`: reproduced the late failure and showed only `QueryMemory`/`SetHeapSize` records near the target before `IocAlloc(handle=0xACC, addr=0x068B0000, size=0x70000)`; there were still no `MapMemory`, `UnmapMemory`, `MapPhysicalMemory`, or `UnmapPhysicalMemory` records preparing that CPU range.
+
+## 2026-06-05 — core/src/cpu_manager.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/core.cpp and /home/vricosti/Dev/emulators/zuyu/src/core/arm/dynarmic/arm_dynarmic_32.cpp
+
+### Intentional differences
+- Added `RUZU_EXIT_ON_NULL_PC=1`, a Rust-only diagnostic escape hatch for MK8D runs that reach the known null-PC guest fatal path. When the env var is set and `BreakLoopNullPc` is detected, ruzu exits with code `101` after logging the existing context instead of leaving the host window alive with a suspended guest thread. This is inactive by default and is only test harness behavior.
+
+### Unintentional differences (to fix)
+- None in default behavior for this slice.
+
+### Missing items
+- Remove this diagnostic knob once the underlying `nvmap::IocAlloc(0x068B0000, 0x70000)` memory-state divergence is fixed and MK8D no longer reaches `BreakLoopNullPc` on the title-transition path.
+
+### Binary layout verification
+- N/A: host-side diagnostic control flow only. No guest-visible raw payload layout changed.
+
+### Tests
+- `cargo check -p core`
+
+## 2026-06-05 — core/src/hle/service/nvdrv/core/nvmap.rs and core/src/hle/service/nvdrv/devices/nvmap.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/nvdrv/core/nvmap.cpp and /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/nvdrv/devices/nvmap.cpp
+
+### Intentional differences
+- Ruzu still installs the preallocated-heap fast path from `nvmap::IocAlloc` because `NvMap` does not yet own a direct `Container&` like upstream. The mapped length now uses `Handle::aligned_size`, matching upstream `NvMap::PinHandle`'s `map_size = handle_description->aligned_size` before `session->mapper->Map(...)`.
+- Ruzu's non-preallocated `NvMap::pin_handle` fallback still maps host pointers directly through `Host1xCoreInterface::smmu_map` instead of upstream's process/asid-backed `MaxwellDeviceMemoryManager::Map(...)`. It now allocates the SMMU range with `AlignUp(aligned_size, 0x10000)` and maps `aligned_size` bytes, matching upstream's size/alignment policy.
+
+### Unintentional differences (to fix)
+- `NvMap` still lacks a direct owner-equivalent to upstream `Container& core`, so the preallocated-session decision is split between `devices/nvmap.rs` and `core/nvmap.rs`.
+- `NvMap::pin_handle` still ignores `low_area_pin`; upstream allocates a separate low-area GMMU VA and returns `pin_virt_address` when requested.
+- `NvMap::unpin_handle` / forced unmap still do not fully mirror upstream `UnmapHandle`, because the Rust Host1x bridge does not expose `GMMU().Unmap`, `Allocator().Free`, or SMMU `Free` through the same owner boundary.
+
+### Missing items
+- Move the preallocated-area decision into `NvMap::pin_handle` by giving `NvMap` an upstream-faithful `Container` owner reference without reintroducing unsafe lifetime drift.
+- Port low-area pin support for nvdec/vic users that call `PinHandle(..., true)`.
+- Expose enough Host1x device-memory-manager operations to port `UnmapHandle` literally.
+
+### Binary layout verification
+- N/A: nvmap handle lifecycle and host-side SMMU mapping policy only. No guest-visible ioctl payload layout changed.
+
+### Tests
+- `cargo check -p core`
+
+## 2026-06-05 — core/src/hle/service/hle_ipc.rs and core/src/memory/memory.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/hle_ipc.cpp and /home/vricosti/Dev/emulators/zuyu/src/core/memory.cpp
+
+### Intentional differences
+- Added `RUZU_TRACE_WRITE_BLOCK_AT=0x...` coverage to the Rust-only checked HLE output-buffer path. Upstream has no `write_block_no_rasterizer_checked`; it calls `memory.WriteBlock` directly from `HLERequestContext::WriteBufferB/C`. This diagnostic remains inactive by default and only emits when the selected output-buffer range covers the requested guest virtual address.
+- Added matching service/cmd/ioctl attribution in `HLERequestContext::write_guest_memory` for the same env-gated address filter. This is investigation-only metadata for identifying large IPC output-buffer writes that later fail in ruzu's checked memory path.
+
+### Unintentional differences (to fix)
+- Ruzu still routes large HLE output-buffer writes through `write_block_no_rasterizer_checked` instead of upstream's `Memory::WriteBlock` path. The checked path exists to avoid host SIGSEGV when guest memory is concurrently unmapped, but it can expose partial `process_vm_writev` failures that upstream would handle through page-table walking and rasterizer write callbacks.
+- `write_guest_memory` still pre-validates `guest_range_is_user_writable` before writing. Upstream `WriteBufferB/C` does not pre-query user writability; it delegates validity handling to `Memory::WriteBlock`.
+
+### Missing items
+- Decide whether ruzu should remove the checked large-buffer special case once the underlying guest-memory mapping/lifetime bug is fixed, or port an upstream-shaped `WriteBlock` implementation that can safely walk the Rust page table without host faults.
+- If the targeted write-block diagnostic remains useful, promote it into `common::trace` instead of keeping direct `eprintln!` output.
+
+### Binary layout verification
+- N/A: diagnostic attribution and host memory-copy policy only. No guest-visible raw payload layout changed.
+
+### Tests
+- `cargo check -p core`

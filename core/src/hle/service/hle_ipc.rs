@@ -642,8 +642,7 @@ pub fn complete_sync_request(
                 static REQ_SEQ: AtomicUsize = AtomicUsize::new(0);
                 let seq = REQ_SEQ.fetch_add(1, Ordering::Relaxed);
                 if seq < ipc_trace_ring_limit() {
-                    let (svc, cmd, ioctl) =
-                        IPC_TRACE_CURRENT.with(|c| c.borrow().clone());
+                    let (svc, cmd, ioctl) = IPC_TRACE_CURRENT.with(|c| c.borrow().clone());
                     let svc_str = if svc.is_empty() { "?" } else { svc.as_str() };
                     let svc_id = common::trace::intern_service(svc_str);
                     let tid = context
@@ -1049,7 +1048,43 @@ impl HLERequestContext {
             _ => Arc::new(std::sync::Mutex::new(SessionRequestManager::new())),
         };
         manager.lock().unwrap().set_session_handler(handler);
-        self.create_session_with_manager(manager)
+        let handle = self.create_session_with_manager(manager.clone())?;
+        self.register_last_created_session_with_manager(manager);
+        Some(handle)
+    }
+
+    /// Register the server endpoint produced by the most recent session
+    /// creation with its ServerManager owner.
+    ///
+    /// Upstream does this before exposing the client endpoint:
+    /// `manager->GetServerManager().RegisterSession(&session->GetServerSession(), next_manager)`.
+    /// Ruzu's host-thread manager owns its mutex while looping, so registration
+    /// is delivered through the manager's pending queue and wakeup event.
+    pub(crate) fn register_last_created_session_with_manager(
+        &mut self,
+        manager: Arc<std::sync::Mutex<SessionRequestManager>>,
+    ) -> bool {
+        let (queue, wakeup) = {
+            let guard = manager.lock().unwrap();
+            (
+                guard.pending_registrations().cloned(),
+                guard.server_wakeup().cloned(),
+            )
+        };
+
+        let Some(server_session) = self.last_created_server_session.take() else {
+            return false;
+        };
+
+        if let Some(queue) = queue {
+            queue.lock().unwrap().push((server_session, manager));
+            if let Some(wakeup) = wakeup {
+                wakeup.signal();
+            }
+            true
+        } else {
+            false
+        }
     }
 
     /// Creates a full KSession that shares an existing SessionRequestManager,
@@ -1110,7 +1145,7 @@ impl HLERequestContext {
             "HLERequestContext::create_session_with_manager_object_id: registering process objects"
         );
         process.register_session_object(object_id, session);
-        process.register_client_session_object(object_id, client_session);
+        process.register_client_session_object(object_id, client_session, object_id);
 
         log::info!(
             "HLERequestContext::create_session_with_manager_object_id: done object_id={:#x}",
@@ -1458,7 +1493,9 @@ impl HLERequestContext {
         }
         let mut buf = vec![0u8; size];
         if let Some(ref memory) = self.memory {
-            memory.lock().unwrap().read_block(address, &mut buf);
+            if !memory.lock().unwrap().read_block(address, &mut buf) {
+                buf.fill(0);
+            }
             return buf;
         }
         log::error!(
@@ -1474,6 +1511,19 @@ impl HLERequestContext {
     fn write_guest_memory(&self, address: u64, data: &[u8]) {
         if data.is_empty() || address == 0 {
             return;
+        }
+        if self.trace_write_block_target(address, data.len()) {
+            IPC_TRACE_CURRENT.with(|current| {
+                let current = current.borrow();
+                eprintln!(
+                    "[IPC_WRITE_BLOCK_AT] service={} cmd={} ioctl=0x{:X} addr=0x{:016X} size={:#x}",
+                    current.0,
+                    current.1,
+                    current.2,
+                    address,
+                    data.len()
+                );
+            });
         }
         if !self.guest_range_is_user_writable(address, data.len()) {
             log::error!(
@@ -1499,7 +1549,35 @@ impl HLERequestContext {
         }
     }
 
+    fn trace_write_block_target(&self, address: u64, size: usize) -> bool {
+        let Ok(spec) = std::env::var("RUZU_TRACE_WRITE_BLOCK_AT") else {
+            return false;
+        };
+        let trimmed = spec.trim();
+        let hex = trimmed
+            .strip_prefix("0x")
+            .or_else(|| trimmed.strip_prefix("0X"))
+            .unwrap_or(trimmed);
+        let Ok(target) = u64::from_str_radix(hex, 16) else {
+            return false;
+        };
+        address <= target && target < address.saturating_add(size as u64)
+    }
+
     fn guest_range_is_user_writable(&self, address: u64, size: usize) -> bool {
+        self.guest_range_has_user_permission(
+            address,
+            size,
+            crate::hle::kernel::k_memory_block::KMemoryPermission::USER_WRITE,
+        )
+    }
+
+    fn guest_range_has_user_permission(
+        &self,
+        address: u64,
+        size: usize,
+        required: crate::hle::kernel::k_memory_block::KMemoryPermission,
+    ) -> bool {
         if size == 0 {
             return true;
         }
@@ -1525,7 +1603,7 @@ impl HLERequestContext {
             };
             if !info
                 .m_permission
-                .contains(crate::hle::kernel::k_memory_block::KMemoryPermission::USER_WRITE)
+                .contains(required)
                 || info
                     .m_permission
                     .contains(crate::hle::kernel::k_memory_block::KMemoryPermission::NOT_MAPPED)
@@ -1715,7 +1793,10 @@ impl HLERequestContext {
                     if let Some(ref memory) = self.memory {
                         let m = memory.lock().unwrap();
                         for i in 0..pad_count {
-                            m.write_32_no_rasterizer(self.tls_address + ((index + i) as u64 * 4), 0);
+                            m.write_32_no_rasterizer(
+                                self.tls_address + ((index + i) as u64 * 4),
+                                0,
+                            );
                         }
                     }
                 }
@@ -1872,8 +1953,7 @@ impl HLERequestContext {
                             if common::trace::is_enabled(common::trace::cat::IPC_DOMAIN_OUT) {
                                 let (svc, cmd, _ioctl) =
                                     IPC_TRACE_CURRENT.with(|c| c.borrow().clone());
-                                let svc_str =
-                                    if svc.is_empty() { "?" } else { svc.as_str() };
+                                let svc_str = if svc.is_empty() { "?" } else { svc.as_str() };
                                 let svc_id = common::trace::intern_service(svc_str);
                                 common::trace::emit_raw(
                                     common::trace::cat::IPC_DOMAIN_OUT,
@@ -2135,6 +2215,29 @@ mod tests {
         let ctx = HLERequestContext::new_with_thread(thread, 0x2000);
 
         assert_eq!(ctx.read_guest_memory(0x3000, 1), vec![0x7a]);
+    }
+
+    #[test]
+    fn create_session_for_service_queues_server_manager_registration() {
+        let process = Arc::new(ProcessLock::from_value(KProcess::new()));
+        let thread = Arc::new(KThreadLock::new(KThread::new()));
+        thread.lock().unwrap().parent = Some(Arc::downgrade(&process));
+
+        let queue = Arc::new(Mutex::new(Vec::new()));
+        let wakeup = Arc::new(super::os::event::Event::new());
+        let manager = Arc::new(Mutex::new(
+            SessionRequestManager::new_with_registration_queue(queue.clone(), wakeup),
+        ));
+
+        let mut ctx = HLERequestContext::new_with_thread(thread, 0x2000);
+        ctx.set_session_request_manager(manager);
+
+        let handle = ctx
+            .create_session_for_service(Arc::new(DummyHandler))
+            .expect("client session handle");
+
+        assert!(process.lock().unwrap().handle_table.is_valid_handle(handle));
+        assert_eq!(queue.lock().unwrap().len(), 1);
     }
 
     #[test]

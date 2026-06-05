@@ -3685,24 +3685,22 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
             is_written,
             |gpu_addr| gm.gpu_to_cpu_address(gpu_addr),
             |gpu_addr| gm.get_memory_layout_size(gpu_addr),
-            |gpu_addr, out| {
-                match out.len() {
-                    4 => {
-                        let Some(value) = read_u32(gpu_addr) else {
-                            return false;
-                        };
-                        out.copy_from_slice(&value.to_le_bytes());
-                        true
-                    }
-                    8 => {
-                        let Some(value) = read_u64(gpu_addr) else {
-                            return false;
-                        };
-                        out.copy_from_slice(&value.to_le_bytes());
-                        true
-                    }
-                    _ => false,
+            |gpu_addr, out| match out.len() {
+                4 => {
+                    let Some(value) = read_u32(gpu_addr) else {
+                        return false;
+                    };
+                    out.copy_from_slice(&value.to_le_bytes());
+                    true
                 }
+                8 => {
+                    let Some(value) = read_u64(gpu_addr) else {
+                        return false;
+                    };
+                    out.copy_from_slice(&value.to_le_bytes());
+                    true
+                }
+                _ => false,
             },
         )
     }

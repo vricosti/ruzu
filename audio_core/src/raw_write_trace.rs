@@ -37,7 +37,9 @@ fn target_guest() -> Option<usize> {
 
 #[inline]
 pub fn maybe_trace_write_at(site: &'static str, host_addr: usize, size: usize) {
-    let Some(target_guest) = target_guest() else { return };
+    let Some(target_guest) = target_guest() else {
+        return;
+    };
     let base = common::fastmem_registry::base();
     if base == 0 {
         return; // not yet registered

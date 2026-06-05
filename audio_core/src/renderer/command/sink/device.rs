@@ -72,7 +72,8 @@ fn trace_device_sink_input_clip(
         return;
     }
 
-    let src = unsafe { std::slice::from_raw_parts(payload.sample_buffer as *const i32, sample_count) };
+    let src =
+        unsafe { std::slice::from_raw_parts(payload.sample_buffer as *const i32, sample_count) };
     let mut min_value = i32::MAX;
     let mut max_value = i32::MIN;
     let mut clipped = 0usize;
@@ -207,19 +208,17 @@ fn trace_device_sink_samples(
 
 impl DeviceSinkPayload {
     pub fn process(self, stream: &SinkStreamHandle, buffer_count: i16) {
-        let input_count = self.input_count.max(1).min(buffer_count.max(1) as u32) as usize;
+        let input_count = self.input_count as usize;
         let frames = TARGET_SAMPLE_COUNT as usize;
         trace_device_sink_input_clip(&self, input_count, buffer_count, frames);
         trace_device_sink_samples(&self, input_count, buffer_count, frames);
-        if self.inputs.iter().take(input_count).any(|&input| input < 0) {
-            return;
-        }
         let src = unsafe {
             std::slice::from_raw_parts(self.sample_buffer as *const i32, self.sample_count as usize)
         };
         let mut samples = Vec::with_capacity(frames.saturating_mul(input_count));
         for frame in 0..frames {
-            for &input in self.inputs.iter().take(input_count) {
+            for channel in 0..input_count {
+                let input = self.inputs[channel];
                 let buffer_index = input as usize;
                 let sample = src[buffer_index * frames + frame];
                 samples.push(sample.clamp(i16::MIN as i32, i16::MAX as i32) as i16);
@@ -258,11 +257,7 @@ impl DeviceSinkPayload {
     }
 
     pub fn verify(self) -> bool {
-        !self
-            .inputs
-            .iter()
-            .take(self.input_count as usize)
-            .any(|&input| input < 0)
+        true
     }
 
     pub fn dump(self, dump: &mut String) {
@@ -289,18 +284,10 @@ pub fn process_device_command(
     stream: &SinkStreamHandle,
     buffer_count: i16,
 ) {
-    let input_count = payload.input_count.max(1).min(buffer_count.max(1) as u32) as usize;
+    let input_count = payload.input_count as usize;
     let frames = TARGET_SAMPLE_COUNT as usize;
     trace_device_sink_input_clip(payload, input_count, buffer_count, frames);
     trace_device_sink_samples(payload, input_count, buffer_count, frames);
-    if payload
-        .inputs
-        .iter()
-        .take(input_count)
-        .any(|&input| input < 0)
-    {
-        return;
-    }
     let src = unsafe {
         std::slice::from_raw_parts(
             payload.sample_buffer as *const i32,
@@ -309,7 +296,8 @@ pub fn process_device_command(
     };
     let mut samples = Vec::with_capacity(frames.saturating_mul(input_count));
     for frame in 0..frames {
-        for &input in payload.inputs.iter().take(input_count) {
+        for channel in 0..input_count {
+            let input = payload.inputs[channel];
             let buffer_index = input as usize;
             let sample = src[buffer_index * frames + frame];
             samples.push(sample.clamp(i16::MIN as i32, i16::MAX as i32) as i16);
@@ -347,12 +335,8 @@ pub fn process_device_command(
     }
 }
 
-pub fn verify_device_command(payload: &DeviceSinkPayload) -> bool {
-    !payload
-        .inputs
-        .iter()
-        .take(payload.input_count as usize)
-        .any(|&input| input < 0)
+pub fn verify_device_command(_payload: &DeviceSinkPayload) -> bool {
+    true
 }
 
 pub fn dump_device_command(payload: &DeviceSinkPayload, dump: &mut String) {
@@ -386,15 +370,15 @@ mod tests {
     }
 
     #[test]
-    fn verify_rejects_negative_input_indices() {
+    fn verify_matches_upstream_and_accepts_payload_unconditionally() {
         let payload = DeviceSinkPayload {
             input_count: 2,
             inputs: [-1, 1, 0, 0, 0, 0],
             ..unsafe { std::mem::zeroed() }
         };
 
-        assert!(!payload.verify());
-        assert!(!verify_device_command(&payload));
+        assert!(payload.verify());
+        assert!(verify_device_command(&payload));
     }
 
     #[test]

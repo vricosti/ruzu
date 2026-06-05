@@ -205,6 +205,14 @@ pub fn map_memory(system: &System, dst_addr: u64, src_addr: u64, size: u64) -> R
     let r = process
         .page_table
         .map_memory(dst_kpa, src_kpa, size as usize);
+    super::svc_memory_history::record_map_memory(
+        system,
+        super::svc_memory_history::MemoryHistoryKind::MapMemory,
+        dst_addr,
+        src_addr,
+        size,
+        r,
+    );
     if r != RESULT_SUCCESS.get_inner_value() {
         let src_info = process.page_table.query_info(src_addr as usize);
         let dst_info = process.page_table.query_info(dst_addr as usize);
@@ -265,6 +273,14 @@ pub fn unmap_memory(system: &System, dst_addr: u64, src_addr: u64, size: u64) ->
     let r = process
         .page_table
         .unmap_memory(dst_kpa, src_kpa, size as usize);
+    super::svc_memory_history::record_map_memory(
+        system,
+        super::svc_memory_history::MemoryHistoryKind::UnmapMemory,
+        dst_addr,
+        src_addr,
+        size,
+        r,
+    );
     if r != RESULT_SUCCESS.get_inner_value() {
         let src_info = process.page_table.query_info(src_addr as usize);
         let dst_info = process.page_table.query_info(dst_addr as usize);

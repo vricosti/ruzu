@@ -74,6 +74,30 @@ fn should_use_host_thread_ipc(session_handle: Handle) -> bool {
     })
 }
 
+fn should_use_host_thread_ipc_for_service(session_handle: Handle, service_name: Option<&str>) -> bool {
+    if should_use_host_thread_ipc(session_handle) {
+        return true;
+    }
+    if std::env::var_os("RUZU_INLINE_IPC").is_some() {
+        return false;
+    }
+
+    if service_name != Some("IHOSBinderDriver") {
+        return false;
+    }
+
+    // Binder host-thread routing is closer to upstream's ServerManager model,
+    // but the current Rust path can lose MK8D's first queued buffer request
+    // before audio/render startup. Keep it available for targeted debugging
+    // without making normal boots depend on the incomplete host-thread path.
+    std::env::var_os("RUZU_SERVER_THREAD_IPC_BINDER").is_some()
+}
+
+fn should_resolve_host_thread_service_name() -> bool {
+    std::env::var_os("RUZU_INLINE_IPC").is_none()
+        && std::env::var_os("RUZU_SERVER_THREAD_IPC_BINDER").is_some()
+}
+
 fn parse_trace_filter_list(env_key: &str) -> Option<Vec<u64>> {
     let spec = std::env::var(env_key).ok()?;
     let mut values = Vec::new();
@@ -112,7 +136,8 @@ fn should_emit_host_thread_ipc(session_handle: Handle) -> bool {
     common::trace::is_enabled(common::trace::cat::HOST_THREAD_IPC)
         && trace_filter_matches(
             session_handle as u64,
-            HANDLE_FILTER.get_or_init(|| parse_trace_filter_list("RUZU_TRACE_HOST_THREAD_IPC_HANDLE")),
+            HANDLE_FILTER
+                .get_or_init(|| parse_trace_filter_list("RUZU_TRACE_HOST_THREAD_IPC_HANDLE")),
         )
 }
 
@@ -266,7 +291,7 @@ fn host_thread_ipc_spawn_fallback(
         if send_result != 0 {
             return ResultCode::new(send_result);
         }
-        let parent_id = match client_session.lock().unwrap().get_parent_id() {
+        let parent_id = match locked_get_parent_id(&client_session) {
             Some(parent_id) => parent_id,
             None => return RESULT_INVALID_HANDLE,
         };
@@ -414,6 +439,23 @@ fn trace_ipc_response_tls(system: &System, message_address: u64) {
     );
 }
 
+/// Lock `client_session`, recording the acquisition in the per-object wait-for
+/// graph (RUZU_LOCK_ORDER=1) keyed by the Mutex address, then read parent_id.
+/// At a wedge the graph shows who holds the exact client_session a blocked
+/// thread is waiting on.
+fn locked_get_parent_id(
+    cs: &Arc<Mutex<crate::hle::kernel::k_client_session::KClientSession>>,
+) -> Option<u64> {
+    let addr = Arc::as_ptr(cs) as usize;
+    let gtid = crate::hle::kernel::kernel::get_current_thread_id_fast()
+        .map(|t| t as i64)
+        .unwrap_or(0);
+    common::lock_order::obj_wait("client_session", addr, gtid);
+    let g = cs.lock().unwrap();
+    let _h = common::lock_order::obj_held("client_session", addr, gtid);
+    g.get_parent_id()
+}
+
 fn send_sync_request_impl(
     system: &System,
     session_handle: Handle,
@@ -439,7 +481,7 @@ fn send_sync_request_impl(
     trace_ipc_buffer(system, "TLS_REQ", message_address);
     trace_svc_ipc_progress(1, session_handle, 0, message_address, 0, 0, 0);
     let trace_sync = should_trace_sync_handle(session_handle);
-    let (client_session, session_object_id) = {
+    let (client_session, session_object_id, parent_id) = {
         let process = system.current_process_arc().lock().unwrap();
         let Some(object_id) = process.handle_table.get_object(session_handle) else {
             log::error!(
@@ -455,10 +497,16 @@ fn send_sync_request_impl(
             );
             return RESULT_INVALID_HANDLE;
         };
+        let Some(parent_id) = process.get_client_session_parent_id(object_id) else {
+            if trace_sync {
+                log::info!("svc::SendSyncRequest stage=missing_parent_id");
+            }
+            return RESULT_INVALID_HANDLE;
+        };
         process
             .num_ipc_messages
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        (client_session, object_id)
+        (client_session, object_id, parent_id)
     };
     trace_svc_ipc_progress(
         2,
@@ -473,6 +521,19 @@ fn send_sync_request_impl(
     if trace_sync {
         log::info!("svc::SendSyncRequest stage=resolved_client_session");
     }
+    // Upstream `KClientSession` owns a direct `m_parent` pointer. Ruzu stores
+    // the equivalent parent object id in `KProcess` next to the client-session
+    // object registration so the hot SVC path does not need to lock the client
+    // endpoint just to discover its parent.
+
+    let explicit_host_thread_routing = should_use_host_thread_ipc(session_handle);
+    let trace_manager_resolution = should_emit_svc_ipc_progress(
+        session_handle,
+        crate::hle::kernel::kernel::get_current_thread_id_fast().unwrap_or(0),
+    );
+    let needs_manager_resolution = explicit_host_thread_routing
+        || should_resolve_host_thread_service_name()
+        || trace_manager_resolution;
 
     // ---- Host-thread IPC routing (default, upstream-faithful) ----
     //
@@ -492,28 +553,132 @@ fn send_sync_request_impl(
     // host-thread routing entirely (legacy synchronous path) — kept as
     // a kill-switch for regressions and to preserve unit-test inline
     // execution where applicable.
-    let host_thread_routing = should_use_host_thread_ipc(session_handle);
+    let server_session_and_manager: Option<(
+        Arc<Mutex<crate::hle::kernel::k_server_session::KServerSession>>,
+        Arc<Mutex<crate::hle::service::hle_ipc::SessionRequestManager>>,
+    )> = if needs_manager_resolution {
+        trace_svc_ipc_progress(
+            11,
+            session_handle,
+            session_object_id,
+            message_address,
+            parent_id,
+            0,
+            0,
+        );
+        let process = system.current_process_arc().lock().unwrap();
+        trace_svc_ipc_progress(
+            12,
+            session_handle,
+            session_object_id,
+            message_address,
+            parent_id,
+            0,
+            0,
+        );
+        process
+            .get_session_by_object_id(parent_id)
+            .and_then(|parent_session| {
+                trace_svc_ipc_progress(
+                    13,
+                    session_handle,
+                    session_object_id,
+                    message_address,
+                    parent_id,
+                    0,
+                    0,
+                );
+                let guard = parent_session.lock().unwrap();
+                trace_svc_ipc_progress(
+                    14,
+                    session_handle,
+                    session_object_id,
+                    message_address,
+                    parent_id,
+                    0,
+                    0,
+                );
+                let server_session = Arc::clone(guard.get_server_session());
+                trace_svc_ipc_progress(
+                    15,
+                    session_handle,
+                    session_object_id,
+                    message_address,
+                    parent_id,
+                    Arc::as_ptr(&server_session) as u64,
+                    0,
+                );
+                let manager = server_session.lock().unwrap().get_manager().cloned()?;
+                trace_svc_ipc_progress(
+                    16,
+                    session_handle,
+                    session_object_id,
+                    message_address,
+                    parent_id,
+                    Arc::as_ptr(&server_session) as u64,
+                    Arc::as_ptr(&manager) as u64,
+                );
+                Some((server_session, manager))
+            })
+    } else {
+        None
+    };
+    trace_svc_ipc_progress(
+        17,
+        session_handle,
+        session_object_id,
+        message_address,
+        server_session_and_manager.is_some() as u64,
+        0,
+        0,
+    );
+    let host_thread_service_name = if should_resolve_host_thread_service_name()
+        || trace_manager_resolution
+    {
+        server_session_and_manager.as_ref().and_then(|(_, manager)| {
+            trace_svc_ipc_progress(
+                18,
+                session_handle,
+                session_object_id,
+                message_address,
+                Arc::as_ptr(manager) as u64,
+                0,
+                0,
+            );
+            let manager = manager.lock().unwrap();
+            trace_svc_ipc_progress(
+                19,
+                session_handle,
+                session_object_id,
+                message_address,
+                0,
+                0,
+                0,
+            );
+            manager
+                .session_handler()
+                .map(|handler| handler.service_name().to_string())
+        })
+    } else {
+        None
+    };
+    trace_svc_ipc_progress(
+        20,
+        session_handle,
+        session_object_id,
+        message_address,
+        host_thread_service_name.is_some() as u64,
+        0,
+        0,
+    );
+    let host_thread_routing = explicit_host_thread_routing
+        || should_use_host_thread_ipc_for_service(session_handle, host_thread_service_name.as_deref());
     let host_thread_targets: Option<(
         Arc<Mutex<crate::hle::kernel::k_server_session::KServerSession>>,
         Arc<Mutex<crate::hle::service::hle_ipc::SessionRequestManager>>,
         crate::hle::service::hle_ipc::PendingRegistrationQueue,
         Arc<crate::hle::service::os::event::Event>,
     )> = if host_thread_routing {
-        let server_session_and_manager: Option<(
-            Arc<Mutex<crate::hle::kernel::k_server_session::KServerSession>>,
-            Arc<Mutex<crate::hle::service::hle_ipc::SessionRequestManager>>,
-        )> = {
-            let process = system.current_process_arc().lock().unwrap();
-            let parent_id = client_session.lock().unwrap().get_parent_id();
-            parent_id
-                .and_then(|parent_id| process.get_session_by_object_id(parent_id))
-                .and_then(|parent_session| {
-                    let guard = parent_session.lock().unwrap();
-                    let server_session = Arc::clone(guard.get_server_session());
-                    let manager = server_session.lock().unwrap().get_manager().cloned()?;
-                    Some((server_session, manager))
-                })
-        };
         let with_queue_wakeup =
             server_session_and_manager
                 .as_ref()
@@ -565,10 +730,14 @@ fn send_sync_request_impl(
         // and WAITING transition are performed together under the scheduler
         // lock below, matching upstream `KServerSession::OnRequest`.
         if let Some(current_thread) = system.current_thread() {
+            let _lo_t = common::lock_order::guard("thread");
             current_thread.lock().unwrap().arm_wait_wake_guard();
         }
 
-        let needs_setup = server_session.lock().unwrap().manager_wakeup.is_none();
+        let needs_setup = {
+            let _lo_ss = common::lock_order::guard("server_session");
+            server_session.lock().unwrap().manager_wakeup.is_none()
+        };
         if needs_setup {
             server_session
                 .lock()
@@ -595,39 +764,30 @@ fn send_sync_request_impl(
                 .map(crate::hle::kernel::k_scheduler_lock::KScopedSchedulerLock::new);
             trace_host_thread_ipc("after_scheduler_lock", session_handle);
             trace_host_thread_ipc("before_process_lock", session_handle);
+            let _lo_p = common::lock_order::guard("process");
             let mut process = system.current_process_arc().lock().unwrap();
             trace_host_thread_ipc("after_process_lock", session_handle);
-            trace_host_thread_ipc("before_client_session_lock", session_handle);
-            let parent_id = {
-                let client_session = client_session.lock().unwrap();
-                trace_host_thread_ipc("after_client_session_lock", session_handle);
-                client_session.get_parent_id()
+            trace_host_thread_ipc("before_parent_lookup", session_handle);
+            let Some(parent_session) = process.get_session_by_object_id(parent_id) else {
+                return RESULT_INVALID_HANDLE;
             };
-            let send_result = if let Some(parent_id) = parent_id {
-                trace_host_thread_ipc("before_parent_lookup", session_handle);
-                let Some(parent_session) = process.get_session_by_object_id(parent_id) else {
-                    return RESULT_INVALID_HANDLE;
-                };
-                trace_host_thread_ipc("after_parent_lookup", session_handle);
-                let request = Arc::new(Mutex::new(
-                    crate::hle::kernel::k_session_request::KSessionRequest::new(),
-                ));
-                request.lock().unwrap().initialize_with_process(
-                    &mut process,
-                    None,
-                    message_address as usize,
-                    0,
-                );
-                trace_host_thread_ipc("before_parent_session_lock", session_handle);
-                let session = parent_session.lock().unwrap();
-                trace_host_thread_ipc("after_parent_session_lock", session_handle);
-                trace_host_thread_ipc("before_on_request", session_handle);
-                let result = session.on_request_with_process(&mut process, request);
-                trace_host_thread_ipc("after_on_request", session_handle);
-                result
-            } else {
-                RESULT_INVALID_HANDLE.get_inner_value()
-            };
+            trace_host_thread_ipc("after_parent_lookup", session_handle);
+            let request = Arc::new(Mutex::new(
+                crate::hle::kernel::k_session_request::KSessionRequest::new(),
+            ));
+            request.lock().unwrap().initialize_with_process(
+                &mut process,
+                None,
+                message_address as usize,
+                0,
+            );
+            trace_host_thread_ipc("before_parent_session_lock", session_handle);
+            let _lo_ps = common::lock_order::guard("parent_session");
+            let session = parent_session.lock().unwrap();
+            trace_host_thread_ipc("after_parent_session_lock", session_handle);
+            trace_host_thread_ipc("before_on_request", session_handle);
+            let send_result = session.on_request_with_process(&mut process, request);
+            trace_host_thread_ipc("after_on_request", session_handle);
             trace_host_thread_ipc("after_send_sync_request_with_process", session_handle);
             if send_result != 0 {
                 return ResultCode::new(send_result);
@@ -747,7 +907,7 @@ fn send_sync_request_impl(
                 return ResultCode::new(send_result);
             }
 
-            let parent_id = match client_session.lock().unwrap().get_parent_id() {
+            let parent_id = match locked_get_parent_id(&client_session) {
                 Some(parent_id) => parent_id,
                 None => {
                     if trace_sync {
@@ -801,6 +961,7 @@ fn send_sync_request_impl(
         }
     } else {
         let (server_session, manager, request) = {
+            let _lo_p = common::lock_order::guard("process");
             let mut process = system.current_process_arc().lock().unwrap();
             record_phase("02_process_lock_2", &mut phase_last);
             trace_svc_ipc_progress(
@@ -815,15 +976,6 @@ fn send_sync_request_impl(
             if trace_sync {
                 log::info!("svc::SendSyncRequest stage=enqueue_request");
             }
-            let parent_id = match client_session.lock().unwrap().get_parent_id() {
-                Some(parent_id) => parent_id,
-                None => {
-                    if trace_sync {
-                        log::info!("svc::SendSyncRequest stage=missing_parent_id");
-                    }
-                    return RESULT_INVALID_HANDLE;
-                }
-            };
             let request = Arc::new(Mutex::new(
                 crate::hle::kernel::k_session_request::KSessionRequest::new(),
             ));
@@ -1654,7 +1806,9 @@ mod tests {
         let client_session = process
             .get_client_session_by_object_id(client_session_object_id)
             .unwrap();
-        let parent_id = client_session.lock().unwrap().get_parent_id().unwrap();
+        let parent_id = process
+            .get_client_session_parent_id(client_session_object_id)
+            .unwrap();
         let parent_session = process.get_session_by_object_id(parent_id).unwrap();
         let server_session = parent_session.lock().unwrap().get_server_session().clone();
         drop(process);
@@ -1761,7 +1915,10 @@ pub fn send_async_request_with_user_buffer(
     let Some(client_session) = process.get_client_session_by_object_id(session_object_id) else {
         return RESULT_INVALID_HANDLE;
     };
-    if client_session.lock().unwrap().get_parent_id().is_none() {
+    if process
+        .get_client_session_parent_id(session_object_id)
+        .is_none()
+    {
         return RESULT_INVALID_HANDLE;
     }
 

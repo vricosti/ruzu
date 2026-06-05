@@ -304,12 +304,18 @@ fn install_sigusr1_handler() {
 fn dump_thread_state(kernel: &KernelCore) {
     eprintln!("=========================================");
     eprintln!("[DUMP] === ruzu kernel thread dump ===");
+    crate::hle::kernel::svc_dispatch::dump_svc_ring_profile();
+    crate::hle::kernel::svc_dispatch::dump_svc_summary_profile();
+    crate::hle::kernel::svc::svc_memory_history::dump("sigusr1_thread_dump");
+    // Who holds each coarse lock right now + the full observed nesting graph
+    // (RUZU_LOCK_ORDER=1).
+    common::lock_order::dump_owners();
+    common::lock_order::dump_graph();
+    common::lock_order::dump_wait_for();
 
     fn parse_u64_auto(raw: &str) -> Option<u64> {
         let raw = raw.trim();
-        let hex = raw
-            .strip_prefix("0x")
-            .or_else(|| raw.strip_prefix("0X"));
+        let hex = raw.strip_prefix("0x").or_else(|| raw.strip_prefix("0X"));
         match hex {
             Some(hex) => u64::from_str_radix(hex, 16).ok(),
             None => raw.parse().ok(),
@@ -319,6 +325,7 @@ fn dump_thread_state(kernel: &KernelCore) {
     // Per-core running thread + interrupt flag + in-progress SVC + last guest PC.
     let mut pcs_to_dump: Vec<u64> = Vec::new();
     let mut stacks_to_dump: Vec<(usize, u64)> = Vec::new();
+    let mut svc21_messages_to_dump: Vec<(usize, u32, u32, u32, u32)> = Vec::new();
     for core_id in 0..hardware_properties::NUM_CPU_CORES as usize {
         if let Some(core) = kernel.physical_core(core_id) {
             let interrupted = core.is_interrupted();
@@ -349,6 +356,9 @@ fn dump_thread_state(kernel: &KernelCore) {
                 "[DUMP]        regs r8-r11: {:08X} {:08X} {:08X} {:08X}",
                 regs[8], regs[9], regs[10], regs[11],
             );
+            if svc_num == 0x21 && regs[1] != 0 && regs[2] != 0 {
+                svc21_messages_to_dump.push((core_id, svc_tid, regs[0], regs[1], regs[2]));
+            }
             if last_sp != 0 {
                 stacks_to_dump.push((core_id, last_sp));
             }
@@ -439,18 +449,16 @@ fn dump_thread_state(kernel: &KernelCore) {
         return;
     };
 
-    let pq_fronts = kernel
-        .global_scheduler_context()
-        .and_then(|gsc| {
-            gsc.try_lock().ok().map(|gsc| {
-                [
-                    gsc.get_scheduled_front(0),
-                    gsc.get_scheduled_front(1),
-                    gsc.get_scheduled_front(2),
-                    gsc.get_scheduled_front(3),
-                ]
-            })
-        });
+    let pq_fronts = kernel.global_scheduler_context().and_then(|gsc| {
+        gsc.try_lock().ok().map(|gsc| {
+            [
+                gsc.get_scheduled_front(0),
+                gsc.get_scheduled_front(1),
+                gsc.get_scheduled_front(2),
+                gsc.get_scheduled_front(3),
+            ]
+        })
+    });
     eprintln!("[DUMP] scheduler pq_fronts={:?}", pq_fronts);
     for core_id in 0..crate::hardware_properties::NUM_CPU_CORES as usize {
         let Some(scheduler) = kernel.scheduler(core_id) else {
@@ -471,7 +479,10 @@ fn dump_thread_state(kernel: &KernelCore) {
                 );
             }
             Err(_) => {
-                eprintln!("[DUMP] scheduler core={} <scheduler-lock-contended>", core_id);
+                eprintln!(
+                    "[DUMP] scheduler core={} <scheduler-lock-contended>",
+                    core_id
+                );
             }
         }
     }
@@ -500,6 +511,119 @@ fn dump_thread_state(kernel: &KernelCore) {
                 guard.thread_list.len(),
                 poll_count,
             );
+            for (core_id, tid, handle, message_addr, size) in &svc21_messages_to_dump {
+                if let Some(object_id) = guard.handle_table.get_object(*handle) {
+                    let Some(client_session) = guard.get_client_session_by_object_id(object_id)
+                    else {
+                        eprintln!(
+                            "[DUMP]   SVC21_HANDLE core={} tid={} handle=0x{:08X} object_id=0x{:X} <not-client-session>",
+                            core_id, tid, handle, object_id
+                        );
+                        continue;
+                    };
+                    let handle_line = match client_session.try_lock() {
+                        Ok(client) => {
+                            let parent_id = client.get_parent_id();
+                            let manager_name = client
+                                .request_manager()
+                                .and_then(|manager| {
+                                    manager.lock().ok().and_then(|manager| {
+                                        manager
+                                            .session_handler()
+                                            .map(|handler| handler.service_name().to_string())
+                                    })
+                                })
+                                .unwrap_or_else(|| "<no-manager-handler>".to_string());
+                            let server_state = parent_id
+                                .and_then(|parent_id| guard.get_session_by_object_id(parent_id))
+                                .and_then(|session| {
+                                    session
+                                        .try_lock()
+                                        .ok()
+                                        .map(|session| session.get_server_session().clone())
+                                })
+                                .and_then(|server_session| {
+                                    server_session.try_lock().ok().map(|server| {
+                                        let server_manager_name = server
+                                            .get_manager()
+                                            .and_then(|manager| {
+                                                manager.lock().ok().and_then(|manager| {
+                                                    manager.session_handler().map(|handler| {
+                                                        handler.service_name().to_string()
+                                                    })
+                                                })
+                                            })
+                                            .unwrap_or_else(|| "<no-server-manager>".to_string());
+                                        format!(
+                                            "server_manager={} request_list={} current_request={}",
+                                            server_manager_name,
+                                            server.request_list.len(),
+                                            server.current_request.is_some()
+                                        )
+                                    })
+                                })
+                                .unwrap_or_else(|| {
+                                    "<server-session-lock-busy-or-missing>".to_string()
+                                });
+                            format!(
+                                "parent_id={:?} manager={} {}",
+                                parent_id, manager_name, server_state
+                            )
+                        }
+                        Err(_) => "<client-session-lock-busy>".to_string(),
+                    };
+                    eprintln!(
+                        "[DUMP]   SVC21_HANDLE core={} tid={} handle=0x{:08X} object_id=0x{:X} {}",
+                        core_id, tid, handle, object_id, handle_line
+                    );
+                } else {
+                    eprintln!(
+                        "[DUMP]   SVC21_HANDLE core={} tid={} handle=0x{:08X} <invalid-handle>",
+                        core_id, tid, handle
+                    );
+                }
+
+                let word_count = ((*size as usize).min(0x40) / 4).min(16);
+                let words: Option<Vec<u32>> =
+                    if let Some(memory) = guard.page_table.get_base().m_memory.as_ref() {
+                        match memory.try_lock() {
+                            Ok(m) => {
+                                let mut w = vec![0u32; word_count];
+                                for (i, slot) in w.iter_mut().enumerate() {
+                                    *slot = m.read_32(*message_addr as u64 + (i as u64) * 4);
+                                }
+                                Some(w)
+                            }
+                            Err(_) => None,
+                        }
+                    } else {
+                        let mem = guard.process_memory.read().unwrap();
+                        let bytes = mem.read_block(*message_addr as u64, word_count * 4);
+                        if bytes.len() >= word_count * 4 {
+                            Some(
+                                bytes
+                                    .chunks_exact(4)
+                                    .take(word_count)
+                                    .map(|chunk| {
+                                        u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]])
+                                    })
+                                    .collect(),
+                            )
+                        } else {
+                            None
+                        }
+                    };
+                match words {
+                    Some(words) => eprintln!(
+                        "[DUMP]   SVC21_MSG core={} tid={} handle=0x{:08X} msg=0x{:08X} size=0x{:X} words={:08X?}",
+                        core_id, tid, handle, message_addr, size, words
+                    ),
+                    None => eprintln!(
+                        "[DUMP]   SVC21_MSG core={} tid={} handle=0x{:08X} msg=0x{:08X} size=0x{:X} <guest-memory-lock-busy>",
+                        core_id, tid, handle, message_addr, size
+                    ),
+                }
+            }
             // Dump 32 bytes (8 ARM32 insns) around each interesting PC so the
             // SIGUSR1 operator can see exactly what's spinning. ARM32 insns
             // are 4 bytes; Thumb insns are 2 or 4. We print raw little-endian
@@ -514,12 +638,20 @@ fn dump_thread_state(kernel: &KernelCore) {
                 // not wired.
                 let words: Option<Vec<u32>> =
                     if let Some(memory) = guard.page_table.get_base().m_memory.as_ref() {
-                        let m = memory.lock().unwrap();
-                        let mut w = vec![0u32; TOTAL];
-                        for (i, slot) in w.iter_mut().enumerate() {
-                            *slot = m.read_32(start + (i as u64) * 4);
+                        // try_lock, never block: under a wedge the guest memory
+                        // Mutex may be held forever by a stuck thread. Blocking
+                        // here would hang the SIGUSR1 dumper before it reaches
+                        // the per-thread wait-state walk (the CV/owner data).
+                        match memory.try_lock() {
+                            Ok(m) => {
+                                let mut w = vec![0u32; TOTAL];
+                                for (i, slot) in w.iter_mut().enumerate() {
+                                    *slot = m.read_32(start + (i as u64) * 4);
+                                }
+                                Some(w)
+                            }
+                            Err(_) => None,
                         }
-                        Some(w)
                     } else {
                         let mem = guard.process_memory.read().unwrap();
                         let len = (TOTAL as u64) * 4;
@@ -557,9 +689,20 @@ fn dump_thread_state(kernel: &KernelCore) {
                 const STACK_WORDS: usize = 128;
                 let mut stack_words: Vec<u32> = Vec::with_capacity(STACK_WORDS);
                 if let Some(memory) = guard.page_table.get_base().m_memory.as_ref() {
-                    let m = memory.lock().unwrap();
-                    for i in 0..STACK_WORDS {
-                        stack_words.push(m.read_32(sp + (i as u64) * 4));
+                    // try_lock, never block (see pcs_to_dump rationale above).
+                    match memory.try_lock() {
+                        Ok(m) => {
+                            for i in 0..STACK_WORDS {
+                                stack_words.push(m.read_32(sp + (i as u64) * 4));
+                            }
+                        }
+                        Err(_) => {
+                            eprintln!(
+                                "[DUMP]   core={} sp=0x{:X}: <guest-memory-lock-busy>",
+                                core_id, sp
+                            );
+                            continue;
+                        }
                     }
                 } else {
                     let mem = guard.process_memory.read().unwrap();
@@ -767,11 +910,59 @@ fn dump_thread_state(kernel: &KernelCore) {
                 lr,
                 sp,
             );
+            // AArch32 GPRs r0-r12 (the join loop's subtask-array base is r7).
+            let r = &t.thread_context.r;
+            eprintln!(
+                "[DUMP]        tid={} r0-r12: {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X}",
+                tid,
+                r[0] as u32, r[1] as u32, r[2] as u32, r[3] as u32,
+                r[4] as u32, r[5] as u32, r[6] as u32, r[7] as u32,
+                r[8] as u32, r[9] as u32, r[10] as u32, r[11] as u32, r[12] as u32,
+            );
         } else {
             eprintln!(
                 "[DUMP]   tid={} <thread-lock-contended — held by someone>",
                 tid,
             );
+        }
+    }
+    // RUZU_DUMP_HOST_BT=1 — send SIGURG to every host worker thread so each
+    // prints its native Rust backtrace (libc::backtrace -> fd 2). Unlike the
+    // process-lock-contended branch this runs unconditionally, so we can see
+    // the Rust stack of a host thread blocked INSIDE a synchronous HLE IPC
+    // handler (the Sig-A SendSyncRequest wedge: guest tid RUNNABLE-but-frozen
+    // in SVC 0x21 while its host fiber is stuck in the handler).
+    if std::env::var_os("RUZU_DUMP_HOST_BT").is_some() {
+        eprintln!("[DUMP] RUZU_DUMP_HOST_BT: SIGURG backtrace on every worker thread...");
+        if let Ok(entries) = std::fs::read_dir("/proc/self/task") {
+            for ent in entries.flatten() {
+                let Ok(tid_str) = ent.file_name().into_string() else {
+                    continue;
+                };
+                let comm = std::fs::read_to_string(format!("/proc/self/task/{}/comm", tid_str))
+                    .unwrap_or_default()
+                    .trim()
+                    .to_string();
+                if comm.starts_with("CPUCore_")
+                    || comm.starts_with("HLE:")
+                    || comm.starts_with("DSP_")
+                    || comm == "CoreTiming"
+                {
+                    let host_tid: i32 = tid_str.parse().unwrap_or(-1);
+                    if host_tid > 0 {
+                        eprintln!("[DUMP] SIGURG -> host_tid={} comm={}", host_tid, comm);
+                        unsafe {
+                            libc::syscall(
+                                libc::SYS_tgkill,
+                                std::process::id() as i32,
+                                host_tid,
+                                libc::SIGURG,
+                            );
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(40));
+                    }
+                }
+            }
         }
     }
     crate::hle::kernel::svc::svc_thread::dump_thread_lifecycle_profile();
@@ -1518,7 +1709,8 @@ impl KernelCore {
                 .register_thread_object(Arc::clone(&dummy));
             log::info!(
                 "[THREAD_ID_NAME] tid={} name=process_dummy:{}",
-                dummy_tid, name
+                dummy_tid,
+                name
             );
         }
     }
@@ -1546,7 +1738,11 @@ impl KernelCore {
             let thread_id = self.create_new_thread_id();
             let object_id = self.create_new_object_id() as u64;
             if std::env::var_os("RUZU_TRACE_THREAD_ID").is_some() {
-                log::info!("[THREAD_ID_NAME] tid={} name=host:{}", thread_id, thread_name);
+                log::info!(
+                    "[THREAD_ID_NAME] tid={} name=host:{}",
+                    thread_id,
+                    thread_name
+                );
             }
             let mut thread_guard = thread.lock().unwrap();
             let rc = thread_guard.initialize_dummy_thread(Some(process), thread_id, object_id);
@@ -2273,7 +2469,10 @@ impl KernelCore {
             let bt = std::backtrace::Backtrace::force_capture();
             log::info!(
                 "[THREAD_ID] alloc tid={} caller={}:{}\nBacktrace:\n{}",
-                id, caller.file(), caller.line(), bt
+                id,
+                caller.file(),
+                caller.line(),
+                bt
             );
         }
         id

@@ -198,16 +198,10 @@ fn maybe_trace_write_in_range(vaddr: u64, size: u64, data: u64) {
             .filter_map(|tok| {
                 let tok = tok.trim();
                 let mut parts = tok.split(':');
-                let start = u64::from_str_radix(
-                    parts.next()?.trim().trim_start_matches("0x"),
-                    16,
-                )
-                .ok()?;
-                let end = u64::from_str_radix(
-                    parts.next()?.trim().trim_start_matches("0x"),
-                    16,
-                )
-                .ok()?;
+                let start =
+                    u64::from_str_radix(parts.next()?.trim().trim_start_matches("0x"), 16).ok()?;
+                let end =
+                    u64::from_str_radix(parts.next()?.trim().trim_start_matches("0x"), 16).ok()?;
                 Some((start, end))
             })
             .collect()
@@ -1353,6 +1347,25 @@ impl Memory {
     /// process_vm_writev turns a temporarily inaccessible host page into `EFAULT`
     /// instead of taking the emulator down with SIGSEGV.
     pub fn write_block_no_rasterizer_checked(&self, dest_addr: u64, src: &[u8]) -> bool {
+        if let Ok(spec) = std::env::var("RUZU_TRACE_WRITE_BLOCK_AT") {
+            if let Ok(target) = u64::from_str_radix(spec.trim_start_matches("0x"), 16) {
+                if dest_addr <= target && target < dest_addr + src.len() as u64 {
+                    let bt = std::backtrace::Backtrace::force_capture();
+                    let off = (target - dest_addr) as usize;
+                    let len = src.len();
+                    let preview_end = (off + 16).min(len);
+                    let mut preview = String::new();
+                    for &b in &src[off..preview_end] {
+                        use std::fmt::Write;
+                        let _ = write!(preview, "{:02x}", b);
+                    }
+                    eprintln!(
+                        "[WRITE_BLOCK_CHECKED_AT] dest=0x{:016X} len={:#x} off=0x{:X} preview={}\n{}",
+                        dest_addr, len, off, preview, bt
+                    );
+                }
+            }
+        }
         let size = src.len();
         if size == 0 {
             return true;

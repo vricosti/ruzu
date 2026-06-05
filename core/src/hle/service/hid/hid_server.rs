@@ -1894,11 +1894,8 @@ impl IHidServer {
         );
         let rm = server.resource_manager.lock();
         if let Some(ref npad) = rm.get_npad() {
-            npad.lock().set_npad_joy_assignment_mode_single(
-                aruid,
-                npad_id,
-                npad_joy_device_type,
-            );
+            npad.lock()
+                .set_npad_joy_assignment_mode_single(aruid, npad_id, npad_joy_device_type);
         }
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
@@ -2276,13 +2273,11 @@ impl IHidServer {
             vibration_device_handle.device_index, aruid);
 
         let rm = server.resource_manager.lock();
-        let (result, vibration_value) = match rm.get_actual_vibration_value(
-            aruid,
-            &vibration_device_handle,
-        ) {
-            Ok(value) => (RESULT_SUCCESS, value),
-            Err(result) => (to_ipc_result(result), DEFAULT_VIBRATION_VALUE),
-        };
+        let (result, vibration_value) =
+            match rm.get_actual_vibration_value(aruid, &vibration_device_handle) {
+                Ok(value) => (RESULT_SUCCESS, value),
+                Err(result) => (to_ipc_result(result), DEFAULT_VIBRATION_VALUE),
+            };
 
         let mut rb = ResponseBuilder::new(ctx, 6, 0, 0);
         rb.push_result(result);
@@ -2400,12 +2395,12 @@ impl IHidServer {
             let value_offset = index * value_size;
             let handle = unsafe {
                 std::ptr::read_unaligned(
-                    handles_buf[handle_offset..].as_ptr() as *const VibrationDeviceHandle,
+                    handles_buf[handle_offset..].as_ptr() as *const VibrationDeviceHandle
                 )
             };
             let value = unsafe {
                 std::ptr::read_unaligned(
-                    values_buf[value_offset..].as_ptr() as *const VibrationValue,
+                    values_buf[value_offset..].as_ptr() as *const VibrationValue
                 )
             };
             let send_result = rm.send_vibration_value(aruid, &handle, &value);

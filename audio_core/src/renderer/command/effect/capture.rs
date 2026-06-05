@@ -1,6 +1,6 @@
 use crate::common::common::CpuAddr;
-use crate::renderer::effect::aux_::{AuxBufferInfo, AuxInfoDsp};
 use crate::renderer::command::util::write_copy;
+use crate::renderer::effect::aux_::{AuxBufferInfo, AuxInfoDsp};
 use crate::{guest_read_block, guest_write_block};
 use std::fmt::Write;
 
@@ -150,7 +150,10 @@ fn write_capture_buffer(
             let write_addr =
                 buffer_addr + target_write_offset as usize * std::mem::size_of::<i32>();
             let end = write_pos + to_write;
-            if !guest_write_block(write_addr as u64, i32_slice_as_bytes(&input[write_pos..end])) {
+            if !guest_write_block(
+                write_addr as u64,
+                i32_slice_as_bytes(&input[write_pos..end]),
+            ) {
                 return write_count.saturating_sub(remaining as u32);
             }
         }

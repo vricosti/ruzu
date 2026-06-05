@@ -74,9 +74,7 @@ fn should_trace_cpu_write(addr: DAddr, size: u64) -> bool {
         return false;
     };
     let end = addr.saturating_add(size);
-    targets
-        .iter()
-        .any(|&target| addr <= target && target < end)
+    targets.iter().any(|&target| addr <= target && target < end)
 }
 
 /// Render target format enumeration.

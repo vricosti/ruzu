@@ -229,7 +229,10 @@ impl System {
                     let skips = SKIPS.load(Ordering::Relaxed);
                     eprintln!(
                         "[AUDIO_EVENT] fires={} skips={} t={:.2}s rate_fire={:.1}Hz",
-                        n, skips, elapsed, n as f64 / elapsed
+                        n,
+                        skips,
+                        elapsed,
+                        n as f64 / elapsed
                     );
                 }
             } else {

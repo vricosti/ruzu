@@ -80,10 +80,14 @@ syncpoint = false
 # ---- OpenGL ----------------------------------------------------------
 [opengl]
 # Low-overhead sampled texture binding attribution. Emits shader descriptor
-# type, image-view type, GL handle and two RGBA8 texture samples.
+# type, image-view type, GL handle and two RGBA8 texture samples. Use
+# RUZU_TRACE_TEXTURE_BIND_PIPELINE, RUZU_TRACE_TEXTURE_BIND_SEQ_MIN/MAX, or
+# RUZU_TRACE_TEXTURE_BIND_TIME_START_MS/END_MS to keep it targeted.
 texture_bind = false
 # Low-overhead graphics constant-buffer binding attribution. Emits guest GPU
-# address, resolved CPU address and first four f32 words for each used cbuf.
+# address, resolved CPU address and first f32 words for each used cbuf. Use
+# RUZU_TRACE_CBUF_BIND_PIPELINE, RUZU_TRACE_CBUF_BIND_SEQ_MIN/MAX, and
+# RUZU_TRACE_CBUF_VEC4_COUNT to keep late-game traces small.
 cbuf_bind = false
 # Low-overhead render-target binding attribution per draw. Emits FBO, pipeline,
 # RT map and the first two Maxwell color render-target addresses/formats.
@@ -101,7 +105,8 @@ rt_sample = false
 # Texture binding address attribution. Emits image/view id and guest GPU
 # address for bound sampled textures, without doing additional GL readback.
 # Use RUZU_TRACE_TEXTURE_BIND_ADDRS=0x... to restrict this to specific
-# guest GPU image addresses.
+# guest GPU image addresses, plus the same pipeline/seq/time filters as
+# texture_bind.
 texture_bind_addr = false
 # Filtered OpenGL draw-state attribution. Use RUZU_TRACE_DRAW_STATE_PIPELINE
 # to restrict this to one program pipeline, e.g. 28 for the MK8D p28 pass.

@@ -23,6 +23,17 @@ use crate::hle::kernel::svc::svc_results::{
     RESULT_RECEIVE_LIST_BROKEN, RESULT_SESSION_CLOSED,
 };
 use crate::hle::kernel::svc_common::INVALID_HANDLE;
+
+/// `RUZU_TRACE_CURREQ=1` — log every KServerSession `current_request` SET
+/// (receive_request_hle) and CLEAR (send_reply / clear_current_request_and_notify),
+/// keyed by session pointer. At a wedge, a session with a SET but no matching
+/// CLEAR is one whose handler never replied — its `is_signaled()` is stuck false
+/// so later IPC on it blocks forever.
+fn curreq_trace_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("RUZU_TRACE_CURREQ").is_some())
+}
 use crate::hle::result::ResultCode;
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestManager};
 use crate::hle::service::os::event::Event;
@@ -1455,6 +1466,13 @@ impl KServerSession {
     }
 
     fn clear_current_request_and_notify(&mut self) {
+        if curreq_trace_enabled() {
+            eprintln!(
+                "[CURREQ] CLEAR session={:p} pending={}",
+                self as *const Self,
+                self.request_list.len()
+            );
+        }
         self.current_request = None;
         if !self.request_list.is_empty() {
             self.notify_available(crate::hle::result::RESULT_SUCCESS.get_inner_value());
@@ -1769,6 +1787,7 @@ impl KServerSession {
             if let Some(client_process_id) = client_process_id {
                 if let Some(kernel) = crate::hle::kernel::kernel::get_kernel_ref() {
                     if let Some(process_arc) = kernel.get_process_by_id(client_process_id) {
+                        let _lo_p = common::lock_order::guard("process");
                         let mut process = process_arc.lock().unwrap();
                         if client_result != crate::hle::result::RESULT_SUCCESS.get_inner_value() {
                             Self::reply_async_error(
@@ -1971,6 +1990,7 @@ impl KServerSession {
             if let Some(client_process_id) = client_process_id {
                 if let Some(kernel) = crate::hle::kernel::kernel::get_kernel_ref() {
                     if let Some(process_arc) = kernel.get_process_by_id(client_process_id) {
+                        let _lo_p = common::lock_order::guard("process");
                         let mut process = process_arc.lock().unwrap();
                         if client_result != crate::hle::result::RESULT_SUCCESS.get_inner_value() {
                             Self::reply_async_error(
@@ -2117,6 +2137,13 @@ impl KServerSession {
         }
 
         self.current_request = Some(Arc::clone(&current_request));
+        if curreq_trace_enabled() {
+            eprintln!(
+                "[CURREQ] SET session={:p} pending_after={}",
+                self as *const Self,
+                self.request_list.len()
+            );
+        }
         let request_message_address = {
             let request = current_request.lock().unwrap();
             let request_address = request.get_address() as u64;

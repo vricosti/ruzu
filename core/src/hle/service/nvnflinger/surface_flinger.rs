@@ -74,6 +74,10 @@ impl SurfaceFlinger {
 
     pub fn add_display(&self, display_id: u64) {
         let mut inner = self.inner.lock().unwrap();
+        super::diagnostics::record_surface_flinger(
+            "add_display",
+            [display_id, inner.displays.len() as u64, 0, 0, 0, 0],
+        );
         log::info!(
             "[SF_ADD_DISPLAY] display_id={} existing_displays={:?}",
             display_id,
@@ -88,6 +92,10 @@ impl SurfaceFlinger {
 
     pub fn remove_display(&self, display_id: u64) {
         let mut inner = self.inner.lock().unwrap();
+        super::diagnostics::record_surface_flinger(
+            "remove_display",
+            [display_id, inner.displays.len() as u64, 0, 0, 0, 0],
+        );
         log::info!(
             "[SF_REMOVE_DISPLAY] display_id={} existing_displays={:?}",
             display_id,
@@ -114,6 +122,10 @@ impl SurfaceFlinger {
         let inner = self.inner.lock().unwrap();
         let Some(display) = Self::find_display(&inner.displays, display_id) else {
             let c = NO_DISPLAY.fetch_add(1, Ordering::Relaxed);
+            super::diagnostics::record_surface_flinger(
+                "compose_no_display",
+                [n, display_id, c, inner.displays.len() as u64, 0, 0],
+            );
             if c < 8 || c.is_power_of_two() {
                 log::info!("[SF_COMPOSE] #{} NO_DISPLAY display_id={}", n, display_id);
             }
@@ -130,6 +142,10 @@ impl SurfaceFlinger {
         }
         if !display.stack.has_layers() {
             let c = NO_LAYERS.fetch_add(1, Ordering::Relaxed);
+            super::diagnostics::record_surface_flinger(
+                "compose_no_layers",
+                [n, display_id, c, display.stack.layers.len() as u64, 0, 0],
+            );
             // Log first 8, every power-of-2, AND every 60 ticks (~1s at 60Hz
             // vsync) so we can detect post-add NO_LAYERS regressions.
             if c < 8 || c.is_power_of_two() || c % 60 == 0 {
@@ -150,6 +166,10 @@ impl SurfaceFlinger {
                 display.stack.layers.len()
             );
         }
+        super::diagnostics::record_surface_flinger(
+            "compose_layers",
+            [n, display_id, display.stack.layers.len() as u64, 0, 0, 0],
+        );
 
         let device = self
             .nvdrv
@@ -173,8 +193,16 @@ impl SurfaceFlinger {
                 .cloned()
         };
         let Some(consumer) = consumer else {
+            super::diagnostics::record_surface_flinger(
+                "create_layer_no_consumer",
+                [consumer_binder_id as i64 as u64, 0, 0, 0, 0, 0],
+            );
             return;
         };
+        super::diagnostics::record_surface_flinger(
+            "create_layer",
+            [consumer_binder_id as i64 as u64, 0, 0, 0, 0, 0],
+        );
         let buffer_item_consumer = Arc::new(BufferItemConsumer::new(consumer));
         let _ = buffer_item_consumer.connect(false);
 
@@ -202,6 +230,10 @@ impl SurfaceFlinger {
         let mut inner = self.inner.lock().unwrap();
         let layer = Self::find_layer(&inner.layers, consumer_binder_id);
         let Some(display) = Self::find_display_mut(&mut inner.displays, display_id) else {
+            super::diagnostics::record_surface_flinger(
+                "add_layer_no_display",
+                [display_id, consumer_binder_id as i64 as u64, 0, 0, 0, 0],
+            );
             log::info!(
                 "[SF_ADD_LAYER] NO_DISPLAY display_id={} consumer_id={}",
                 display_id,
@@ -210,6 +242,17 @@ impl SurfaceFlinger {
             return;
         };
         let Some(layer) = layer else {
+            super::diagnostics::record_surface_flinger(
+                "add_layer_no_layer",
+                [
+                    display_id,
+                    consumer_binder_id as i64 as u64,
+                    display.stack.layers.len() as u64,
+                    0,
+                    0,
+                    0,
+                ],
+            );
             log::info!(
                 "[SF_ADD_LAYER] NO_LAYER display_id={} consumer_id={}",
                 display_id,
@@ -222,6 +265,17 @@ impl SurfaceFlinger {
             display_id,
             consumer_binder_id,
             display.stack.layers.len() + 1,
+        );
+        super::diagnostics::record_surface_flinger(
+            "add_layer",
+            [
+                display_id,
+                consumer_binder_id as i64 as u64,
+                display.stack.layers.len() as u64,
+                display.stack.layers.len() as u64 + 1,
+                0,
+                0,
+            ],
         );
         display.stack.layers.push(layer);
     }
@@ -288,6 +342,17 @@ impl SurfaceFlinger {
 
         let consumer_binder_id = self.server.register_binder(consumer_binder);
         let producer_binder_id = self.server.register_buffer_queue_producer(producer_binder);
+        super::diagnostics::record_surface_flinger(
+            "create_buffer_queue",
+            [
+                consumer_binder_id as i64 as u64,
+                producer_binder_id as i64 as u64,
+                0,
+                0,
+                0,
+                0,
+            ],
+        );
         self.inner
             .lock()
             .unwrap()

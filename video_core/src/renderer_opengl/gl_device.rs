@@ -71,10 +71,12 @@ impl Device {
         info!("OpenGL Renderer: {}", renderer_name);
         info!("OpenGL Version: {}", gl_version);
 
-        let vendor_lower = vendor_name.to_lowercase();
-        let is_nvidia = vendor_lower.contains("nvidia");
-        let is_amd = vendor_lower.contains("amd") || vendor_lower.contains("ati");
-        let is_intel = vendor_lower.contains("intel");
+        // Match upstream's exact vendor predicates. In particular, Mesa
+        // radeonsi reports `AMD`; upstream does not treat that as `IsAmd()`
+        // for shader-profile policy such as gather subpixel offsets.
+        let is_nvidia = vendor_name == "NVIDIA Corporation";
+        let is_amd = vendor_name == "ATI Technologies Inc.";
+        let is_intel = vendor_name == "Intel";
 
         // Query limits
         let max_vertex_attributes = gl_get_integer(gl::MAX_VERTEX_ATTRIBS) as u32;
@@ -387,7 +389,8 @@ fn test_program(glsl: &'static CStr) -> bool {
 }
 
 fn test_variable_aoffi() -> bool {
-    test_program(c"#version 430 core
+    test_program(
+        c"#version 430 core
 // This is a unit test, please ignore me on apitrace bug reports.
 uniform sampler2D tex;
 uniform ivec2 variable_offset;
@@ -395,11 +398,13 @@ out vec4 output_attribute;
 void main() {
     output_attribute = textureOffset(tex, vec2(0), variable_offset);
 }
-")
+",
+    )
 }
 
 fn test_precise_bug() -> bool {
-    !test_program(c"#version 430 core
+    !test_program(
+        c"#version 430 core
 in vec3 coords;
 out float out_value;
 uniform sampler2DShadow tex;
@@ -407,7 +412,8 @@ void main() {
     precise float tmp_value = vec4(texture(tex, coords)).x;
     out_value = tmp_value;
 }
-")
+",
+    )
 }
 
 fn get_extensions() -> Vec<String> {

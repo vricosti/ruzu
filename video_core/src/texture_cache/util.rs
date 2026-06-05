@@ -1639,7 +1639,14 @@ mod tests {
 
         assert_eq!(copies.len(), 1);
         assert_eq!(copies[0].buffer_size, 64);
-        assert_eq!(params[0].num_tiles, Extent3D { width: 2, height: 2, depth: 1 });
+        assert_eq!(
+            params[0].num_tiles,
+            Extent3D {
+                width: 2,
+                height: 2,
+                depth: 1
+            }
+        );
         assert_eq!(output, expected);
         assert!(output[32..].iter().any(|&byte| byte != 0));
     }

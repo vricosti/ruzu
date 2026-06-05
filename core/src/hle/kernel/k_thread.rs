@@ -2770,7 +2770,6 @@ impl KThread {
     /// Matches upstream `KThread::SetState()`.
     pub fn set_state(&mut self, state: ThreadState) {
         let old_state = self.get_raw_state();
-        self.set_wait_reason_for_debugging(ThreadWaitReasonForDebugging::None);
         let new_state = (old_state & !ThreadState::MASK) | (state & ThreadState::MASK);
         self.thread_state.store(new_state.bits(), Ordering::Relaxed);
         if new_state != old_state {
@@ -3066,6 +3065,7 @@ impl KThread {
     fn finalize_wait_transition(&mut self) {
         self.sleep_deadline = None;
         self.waiting_lock_info = None;
+        self.set_wait_reason_for_debugging(ThreadWaitReasonForDebugging::None);
         self.apply_wait_result_to_context();
     }
 
@@ -3750,6 +3750,18 @@ mod tests {
         assert_eq!(ThreadState::BACKTRACE_SUSPENDED.bits(), 1 << 7);
         assert_eq!(ThreadState::INIT_SUSPENDED.bits(), 1 << 8);
         assert_eq!(ThreadState::SYSTEM_SUSPENDED.bits(), 1 << 9);
+    }
+
+    #[test]
+    fn set_state_preserves_wait_reason_for_ipc_begin_wait() {
+        let mut thread = KThread::new();
+        thread.set_wait_reason_for_debugging(ThreadWaitReasonForDebugging::Ipc);
+        thread.set_state(ThreadState::WAITING);
+
+        assert_eq!(
+            thread.get_wait_reason_for_debugging(),
+            ThreadWaitReasonForDebugging::Ipc
+        );
     }
 
     #[test]

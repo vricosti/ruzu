@@ -287,12 +287,10 @@ impl NvMap {
             }
 
             if inner.d_address == 0 && inner.address != 0 {
-                let size = inner.size as usize;
+                let map_size = inner.aligned_size as usize;
                 // Upstream fallback: allocate SMMU address space via
-                // `host1x.MemoryManager().Allocate(aligned_size)` and map the
-                // CPU VA through the device memory manager. The preallocated
-                // heap fast-path is installed by nvmap::IocAlloc, where the
-                // owning Container session is available.
+                // `host1x.MemoryManager().Allocate(AlignUp(aligned_size,
+                // BIG_PAGE_SIZE))` and map `aligned_size` bytes.
                 let host_ptr = {
                     let sys = self.system.get();
                     sys.memory_shared().and_then(|memory| {
@@ -315,14 +313,16 @@ impl NvMap {
                     inner.pins += 1;
                     return inner.d_address;
                 };
-                let d_address = host1x.smmu_allocate(size);
-                host1x.smmu_map(d_address, host_ptr, size);
+                const BIG_PAGE_SIZE: usize = PAGE_SIZE as usize * 16;
+                let aligned_up = (map_size + BIG_PAGE_SIZE - 1) & !(BIG_PAGE_SIZE - 1);
+                let d_address = host1x.smmu_allocate(aligned_up);
+                host1x.smmu_map(d_address, host_ptr, map_size);
                 inner.d_address = d_address;
                 inner.in_heap = false;
                 if std::env::var_os("RUZU_TRACE_NVMAP_PIN").is_some() {
                     eprintln!(
                         "[NVMAP_PIN] handle=0x{:X} vaddr=0x{:X} size=0x{:X} -> d_address=0x{:X} host_ptr=0x{:X}",
-                        handle_id, inner.address, size, d_address, host_ptr
+                        handle_id, inner.address, map_size, d_address, host_ptr
                     );
                 }
             }

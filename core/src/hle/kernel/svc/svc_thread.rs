@@ -68,8 +68,10 @@ fn record_thread_create_profile(
         return;
     }
 
-    let order = THREAD_LIFECYCLE_CREATE_ORDER.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-    let map = THREAD_LIFECYCLE_PROFILE.get_or_init(|| Mutex::new(std::collections::BTreeMap::new()));
+    let order =
+        THREAD_LIFECYCLE_CREATE_ORDER.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    let map =
+        THREAD_LIFECYCLE_PROFILE.get_or_init(|| Mutex::new(std::collections::BTreeMap::new()));
     map.lock().unwrap().insert(
         tid,
         ThreadLifecycleEntry {
@@ -104,7 +106,8 @@ fn record_thread_start_profile(
     }
 
     let order = THREAD_LIFECYCLE_START_ORDER.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-    let map = THREAD_LIFECYCLE_PROFILE.get_or_init(|| Mutex::new(std::collections::BTreeMap::new()));
+    let map =
+        THREAD_LIFECYCLE_PROFILE.get_or_init(|| Mutex::new(std::collections::BTreeMap::new()));
     let mut guard = map.lock().unwrap();
     if let Some(entry) = guard.get_mut(&tid) {
         entry.started_order = order;

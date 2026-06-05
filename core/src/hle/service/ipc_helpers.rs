@@ -318,9 +318,7 @@ impl<'a> ResponseBuilder<'a> {
                 parent_wakeup.clone(),
             ) {
                 (Some(sm), Some(q), Some(w)) => std::sync::Arc::new(std::sync::Mutex::new(
-                    super::hle_ipc::SessionRequestManager::new_with_server_manager_full(
-                        sm, q, w,
-                    ),
+                    super::hle_ipc::SessionRequestManager::new_with_server_manager_full(sm, q, w),
                 )),
                 (Some(sm), _, _) => std::sync::Arc::new(std::sync::Mutex::new(
                     super::hle_ipc::SessionRequestManager::new_with_server_manager(sm),
@@ -338,30 +336,8 @@ impl<'a> ResponseBuilder<'a> {
                 .create_session_with_manager_object_id(child_manager.clone())
                 .unwrap_or(0);
 
-            // Register with ServerManager via its pending-registration queue
-            // (matching upstream RegisterSession ownership). Cannot lock
-            // `Mutex<ServerManager>` directly from this handler thread — the
-            // host thread holds it for its entire loop_process. The host
-            // thread drains the queue at the start of each iteration.
-            let (queue, wakeup) = self
-                .context
-                .get_manager()
-                .map(|m| {
-                    let guard = m.lock().unwrap();
-                    (
-                        guard.pending_registrations().cloned(),
-                        guard.server_wakeup().cloned(),
-                    )
-                })
-                .unwrap_or((None, None));
-            if let (Some(queue), Some(server_session)) =
-                (queue, self.context.last_created_server_session.take())
-            {
-                queue.lock().unwrap().push((server_session, child_manager));
-                if let Some(wakeup) = wakeup {
-                    wakeup.signal();
-                }
-            }
+            self.context
+                .register_last_created_session_with_manager(child_manager);
             // Suppress warning about unused parent_server_manager — we read it
             // from the parent's SessionRequestManager above but the local
             // variable computed earlier is no longer needed.

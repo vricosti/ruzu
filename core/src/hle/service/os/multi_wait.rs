@@ -166,7 +166,11 @@ impl MultiWait {
         };
 
         let mut object_ids = Vec::with_capacity(holders.len());
-        let mut kinds: Vec<&'static str> = if trace_wait { Vec::with_capacity(holders.len()) } else { Vec::new() };
+        let mut kinds: Vec<&'static str> = if trace_wait {
+            Vec::with_capacity(holders.len())
+        } else {
+            Vec::new()
+        };
         for holder in &holders {
             let Some(object_id) = (unsafe { &**holder }).object_id() else {
                 if trace_boot || trace_wait {
@@ -184,7 +188,11 @@ impl MultiWait {
         }
 
         let mut out_index = -1;
-        let object_ids_copy = if trace_wait { object_ids.clone() } else { Vec::new() };
+        let object_ids_copy = if trace_wait {
+            object_ids.clone()
+        } else {
+            Vec::new()
+        };
         let result = k_synchronization_object::wait(
             &process,
             &current_thread,

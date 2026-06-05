@@ -212,7 +212,10 @@ fn read_from_user(process_guard: &KProcess, address: u64) -> Option<u32> {
 /// Matches upstream `WriteToUser(KernelCore&, KProcessAddress, const u32*)`.
 fn write_to_user(process_guard: &KProcess, address: u64, value: u32) -> bool {
     if let Some(memory) = process_guard.page_table.get_base().m_memory.as_ref() {
-        memory.lock().unwrap().write_32_no_rasterizer(address, value);
+        memory
+            .lock()
+            .unwrap()
+            .write_32_no_rasterizer(address, value);
         true
     } else if process_guard
         .process_memory

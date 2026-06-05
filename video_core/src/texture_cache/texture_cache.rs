@@ -143,10 +143,16 @@ impl TextureCacheBase {
             if let Some(d) = desc {
                 log::warn!(
                     "[VISIT_TIC] graphics={} index={} cached_addr=0x{:X}",
-                    graphics, index, d.address()
+                    graphics,
+                    index,
+                    d.address()
                 );
             } else {
-                log::warn!("[VISIT_TIC] graphics={} index={} cached=None", graphics, index);
+                log::warn!(
+                    "[VISIT_TIC] graphics={} index={} cached=None",
+                    graphics,
+                    index
+                );
             }
         }
         let gpu_memory = self.device_memory.clone();
@@ -198,7 +204,8 @@ impl TextureCacheBase {
         if std::env::var_os("RUZU_TRACE_VISIT_TIC").is_some() {
             log::warn!(
                 "[VISIT_TIC_GPU] index={} tic_gpu=0x{:X} fmt=0x{:X} width={} height={} is_new={}",
-                index, descriptor.address(),
+                index,
+                descriptor.address(),
                 {
                     let raw = descriptor.raw[0];
                     raw as u32 & 0xFFFFFF // approximation of format bits
@@ -234,7 +241,8 @@ impl TextureCacheBase {
             if std::env::var_os("RUZU_TRACE_TIC_LOOKUP").is_some() {
                 log::warn!(
                     "[TIC_LOOKUP] cached gpu=0x{:X} view_id={} (cached)",
-                    descriptor.address(), id.index
+                    descriptor.address(),
+                    id.index
                 );
             }
             return id;
@@ -244,7 +252,8 @@ impl TextureCacheBase {
         if std::env::var_os("RUZU_TRACE_TIC_LOOKUP").is_some() {
             log::warn!(
                 "[TIC_LOOKUP] new gpu=0x{:X} view_id={} (created)",
-                addr, new_id.index
+                addr,
+                new_id.index
             );
         }
         self.channel_state.image_views.insert(*descriptor, new_id);
@@ -292,7 +301,11 @@ impl TextureCacheBase {
         if image_id == NULL_IMAGE_ID {
             return NULL_IMAGE_VIEW_ID;
         }
-        let base = match self.slot_images.get(image_id).try_find_base(descriptor.address()) {
+        let base = match self
+            .slot_images
+            .get(image_id)
+            .try_find_base(descriptor.address())
+        {
             Some(base) => base,
             None => return NULL_IMAGE_VIEW_ID,
         };
@@ -690,9 +703,9 @@ impl TextureCacheBase {
             .slot_images
             .insert(ImageBase::new(info.clone(), gpu_addr, cpu_addr));
         let image_size = self.slot_images[image_id].guest_size_bytes as usize;
-        let map_id = self.slot_map_views.insert(ImageMapView::new(
-            gpu_addr, cpu_addr, image_size, image_id,
-        ));
+        let map_id = self
+            .slot_map_views
+            .insert(ImageMapView::new(gpu_addr, cpu_addr, image_size, image_id));
         self.slot_images[image_id].map_view_id = map_id;
         self.register_image(image_id);
         image_id
@@ -979,7 +992,7 @@ mod tests {
     use super::*;
     use crate::engines::maxwell_3d::{RenderTargetInfo, RtControlInfo};
     use crate::framebuffer_config::{AndroidPixelFormat, FramebufferConfig};
-    use crate::textures::texture::{ComponentType, TextureFormat, TicEntry, TextureType};
+    use crate::textures::texture::{ComponentType, TextureFormat, TextureType, TicEntry};
 
     fn color_2d_tic(address: u64, base_layer: u32) -> TicEntry {
         let word0 = (TextureFormat::A8B8G8R8 as u32)
@@ -990,8 +1003,7 @@ mod tests {
         let word1 = address as u32;
         let word2 = (((address >> 32) as u32) & 0xFFFF) | (3 << 21);
         let word3 = 0;
-        let word4 =
-            63 | ((base_layer & 0x7) << 16) | ((TextureType::Texture2D as u32) << 23);
+        let word4 = 63 | ((base_layer & 0x7) << 16) | ((TextureType::Texture2D as u32) << 23);
         let word5 = 31 | (1 << 31);
 
         TicEntry {
