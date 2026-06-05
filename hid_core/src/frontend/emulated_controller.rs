@@ -52,10 +52,7 @@ fn scripted_npad_presses() -> &'static [ScriptedNpadPress] {
                 let mut parts = entry.split(':');
                 let start_ms = parse_u64_auto(parts.next()?)?;
                 let buttons = parse_u64_auto(parts.next()?)?;
-                let duration_ms = parts
-                    .next()
-                    .and_then(parse_u64_auto)
-                    .unwrap_or(250);
+                let duration_ms = parts.next().and_then(parse_u64_auto).unwrap_or(250);
                 Some(ScriptedNpadPress {
                     start_ms,
                     duration_ms,

@@ -283,7 +283,7 @@ impl Engine for MaxwellDMA {
 #[cfg(test)]
 mod tests {
     use super::*;
-use crate::engines::draw_manager::Maxwell3DClearView;
+    use crate::engines::draw_manager::Maxwell3DClearView;
     use crate::query_cache::types::QueryPropertiesFlags;
     use crate::rasterizer_interface::RasterizerDownloadArea;
 
@@ -304,7 +304,12 @@ use crate::engines::draw_manager::Maxwell3DClearView;
     }
 
     impl RasterizerInterface for TestRasterizer {
-        fn draw(&mut self, _draw_view: crate::engines::draw_manager::Maxwell3DDrawView<'_>, _instance_count: u32) {}
+        fn draw(
+            &mut self,
+            _draw_view: crate::engines::draw_manager::Maxwell3DDrawView<'_>,
+            _instance_count: u32,
+        ) {
+        }
         fn draw_texture(&mut self) {}
         fn clear(&mut self, _clear_view: Maxwell3DClearView<'_>, _layer_count: u32) {}
         fn dispatch_compute(&mut self) {}

@@ -181,6 +181,11 @@ impl GpuMemoryManager {
         f: impl FnOnce(&mut dyn RasterizerInterface) -> R,
     ) -> Option<R> {
         let handle = self.rasterizer?;
+        // The GMMU `MemoryManager` mutex is held throughout this call (callers
+        // invoke `&mut self` methods under `Arc<Mutex<MemoryManager>>::lock()`),
+        // so a rasterizer cache lock taken inside `f` is nested under it.
+        // Record the edge for the lock-order tracer.
+        let _lo_mm = common::lock_order::guard("gpu_mm");
         Some(unsafe { handle.with_mut(f) })
     }
 

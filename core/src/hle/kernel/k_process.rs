@@ -529,6 +529,7 @@ pub struct KProcess {
     thread_objects_by_thread_id: BTreeMap<u64, Arc<KThreadLock>>,
     pub session_objects: BTreeMap<u64, Arc<Mutex<KSession>>>,
     pub client_session_objects: BTreeMap<u64, Arc<Mutex<KClientSession>>>,
+    pub client_session_parent_ids: BTreeMap<u64, u64>,
     pub client_port_objects: BTreeMap<u64, Arc<Mutex<KPort>>>,
     pub server_port_objects: BTreeMap<u64, Arc<Mutex<KPort>>>,
     pub event_objects: BTreeMap<u64, Arc<Mutex<KEvent>>>,
@@ -652,6 +653,7 @@ impl KProcess {
             thread_objects_by_thread_id: BTreeMap::new(),
             session_objects: BTreeMap::new(),
             client_session_objects: BTreeMap::new(),
+            client_session_parent_ids: BTreeMap::new(),
             client_port_objects: BTreeMap::new(),
             server_port_objects: BTreeMap::new(),
             event_objects: BTreeMap::new(),
@@ -2659,6 +2661,7 @@ impl KProcess {
         self.thread_objects_by_thread_id.clear();
         self.session_objects.clear();
         self.client_session_objects.clear();
+        self.client_session_parent_ids.clear();
         self.client_port_objects.clear();
         self.server_port_objects.clear();
         self.event_objects.clear();
@@ -2740,13 +2743,16 @@ impl KProcess {
         &mut self,
         object_id: u64,
         client_session: Arc<Mutex<KClientSession>>,
+        parent_id: u64,
     ) {
         self.client_session_objects
             .insert(object_id, client_session);
+        self.client_session_parent_ids.insert(object_id, parent_id);
     }
 
     pub fn unregister_client_session_object_by_object_id(&mut self, object_id: u64) {
         self.client_session_objects.remove(&object_id);
+        self.client_session_parent_ids.remove(&object_id);
     }
 
     pub fn get_client_session_by_object_id(
@@ -2754,6 +2760,10 @@ impl KProcess {
         object_id: u64,
     ) -> Option<Arc<Mutex<KClientSession>>> {
         self.client_session_objects.get(&object_id).cloned()
+    }
+
+    pub fn get_client_session_parent_id(&self, object_id: u64) -> Option<u64> {
+        self.client_session_parent_ids.get(&object_id).copied()
     }
 
     pub fn register_client_port_object(&mut self, object_id: u64, port: Arc<Mutex<KPort>>) {

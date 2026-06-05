@@ -30,6 +30,7 @@ use crate::hle::kernel::svc::svc_port;
 use crate::hle::kernel::svc::svc_process;
 use crate::hle::kernel::svc::svc_process_memory;
 use crate::hle::kernel::svc::svc_processor;
+use crate::hle::kernel::svc::svc_query_memory;
 use crate::hle::kernel::svc::svc_shared_memory;
 use crate::hle::kernel::svc::svc_synchronization;
 use crate::hle::kernel::svc::svc_thread;
@@ -491,44 +492,6 @@ fn alloc_stub_handle(system: &System) -> u32 {
 }
 
 // =============================================================================
-// QueryMemory helper
-// =============================================================================
-
-/// Resolve memory info for a given address using the page table's KMemoryBlockManager.
-/// Returns (base, size, svc_state, svc_permission).
-///
-/// Queries the block manager in KPageTableBase, matching upstream's
-/// KPageTableBase::QueryInfoImpl() behavior.
-fn query_memory_info(system: &System, query_addr: u64) -> (u64, u64, u32, u32) {
-    use crate::hle::kernel::k_memory_block::KMemoryPermission;
-
-    let process = system.current_process_arc().lock().unwrap();
-
-    if let Some(info) = process.page_table.query_info(query_addr as usize) {
-        let svc_state = info.get_svc_state();
-        // Convert KMemoryPermission to SVC permission (lower 3 bits = user R/W/X).
-        let svc_perm = (info.get_permission() & KMemoryPermission::USER_MASK).bits() as u32;
-        (
-            info.get_address() as u64,
-            info.get_size() as u64,
-            svc_state,
-            svc_perm,
-        )
-    } else {
-        // Address outside managed range — return Inaccessible.
-        // Upstream: creates fake block from address_space_end to max.
-        let addr_space_end = process.page_table.get_address_space_start().get()
-            + process.page_table.get_address_space_size() as u64;
-        (
-            addr_space_end,
-            u64::MAX - addr_space_end + 1,
-            0x10, // Inaccessible
-            0,    // None
-        )
-    }
-}
-
-// =============================================================================
 // 32-bit dispatch (AArch32 / ILP32)
 // =============================================================================
 
@@ -593,48 +556,25 @@ fn call32(system: &System, imm: u32, args: &mut SvcArgs) {
             // IN: out_memory_info=arg32[0], address=arg32[2]; OUT: ret=arg32[0], page_info=arg32[1]
             let mem_info_ptr = get_arg32(args, 0) as u64;
             let query_addr = get_arg32(args, 2) as u64;
-            let (base, size, state, perm) = query_memory_info(system, query_addr);
-            log::info!(
-                "  QueryMemory(info_ptr={:#x}, addr={:#x}) -> base={:#x} size={:#x} state={} perm={}",
-                mem_info_ptr, query_addr, base, size, state, perm
-            );
-            // Write MemoryInfo structure to guest memory.
-            // Upstream: current_memory.WriteBlock(out_memory_info, &svc_mem_info, sizeof(...))
-            {
-                if let Some(memory) = system.get_svc_memory() {
-                    let m = memory.lock().unwrap();
-                    m.write_64(mem_info_ptr, base);
-                    m.write_64(mem_info_ptr + 8, size);
-                    m.write_32(mem_info_ptr + 16, state);
-                    m.write_32(mem_info_ptr + 20, 0); // attribute
-                    m.write_32(mem_info_ptr + 24, perm);
-                    m.write_32(mem_info_ptr + 28, 0); // ipc_count
-                    m.write_32(mem_info_ptr + 32, 0); // device_count
-                    m.write_32(mem_info_ptr + 36, 0); // padding
-                } else {
-                    let mut mem = system.shared_process_memory().write().unwrap();
-                    if mem.is_valid_range(mem_info_ptr, 40) {
-                        mem.write_64(mem_info_ptr, base);
-                        mem.write_64(mem_info_ptr + 8, size);
-                        mem.write_32(mem_info_ptr + 16, state);
-                        mem.write_32(mem_info_ptr + 20, 0);
-                        mem.write_32(mem_info_ptr + 24, perm);
-                        mem.write_32(mem_info_ptr + 28, 0);
-                        mem.write_32(mem_info_ptr + 32, 0);
-                        mem.write_32(mem_info_ptr + 36, 0);
-                    }
-                }
-            }
-            set_arg32(args, 0, STUB_SUCCESS);
-            set_arg32(args, 1, 0); // page_info
+            let mut page_info = crate::hle::kernel::svc::svc_types::PageInfo::default();
+            let result =
+                svc_query_memory::query_memory(system, mem_info_ptr, &mut page_info, query_addr);
+            set_arg32(args, 0, result.get_inner_value());
+            set_arg32(args, 1, page_info.flags);
         }
         Some(SvcId::MapPhysicalMemory) => {
             // IN: address=arg32[0], size=arg32[1]; OUT: ret=arg32[0]
-            set_arg32(args, 0, STUB_SUCCESS);
+            let address = get_arg32(args, 0) as u64;
+            let size = get_arg32(args, 1) as u64;
+            let result = svc_physical_memory::map_physical_memory(system, address, size);
+            set_arg32(args, 0, result.get_inner_value());
         }
         Some(SvcId::UnmapPhysicalMemory) => {
             // IN: address=arg32[0], size=arg32[1]; OUT: ret=arg32[0]
-            set_arg32(args, 0, STUB_SUCCESS);
+            let address = get_arg32(args, 0) as u64;
+            let size = get_arg32(args, 1) as u64;
+            let result = svc_physical_memory::unmap_physical_memory(system, address, size);
+            set_arg32(args, 0, result.get_inner_value());
         }
         Some(SvcId::MapPhysicalMemoryUnsafe) => {
             set_arg32(args, 0, STUB_SUCCESS);
@@ -934,7 +874,11 @@ fn call32(system: &System, imm: u32, args: &mut SvcArgs) {
         }
         Some(SvcId::SignalProcessWideKey) => {
             let cv_key = get_arg32(args, 0) as u64;
-            svc_condition_variable::signal_process_wide_key(system, cv_key, get_arg32(args, 1) as i32);
+            svc_condition_variable::signal_process_wide_key(
+                system,
+                cv_key,
+                get_arg32(args, 1) as i32,
+            );
             // RUZU_FORCE_WAIT_MASK_AFTER_SIGNAL=1 — Experiment for MK8D wedge
             // (project_mk8d_unlock_site_found_2026_05_25 option D).
             // After signaling cv at `cv_key`, set WAIT_MASK (0x40000000) on the
@@ -955,9 +899,7 @@ fn call32(system: &System, imm: u32, args: &mut SvcArgs) {
                 let process_arc = system.current_process_arc().clone();
                 {
                     let process = process_arc.lock().unwrap();
-                    if let Some(memory) =
-                        process.page_table.get_base().m_memory.as_ref()
-                    {
+                    if let Some(memory) = process.page_table.get_base().m_memory.as_ref() {
                         let mem = memory.lock().unwrap();
                         let current = mem.read_32(mutex_addr);
                         // Only OR if there's a holder (low 28 bits nonzero) and
@@ -1642,36 +1584,11 @@ fn call64(system: &System, imm: u32, args: &mut SvcArgs) {
         Some(SvcId::QueryMemory) => {
             let mem_info_ptr = get_arg64(args, 0);
             let query_addr = get_arg64(args, 2);
-            let (base, size, state, perm) = query_memory_info(system, query_addr);
-            log::info!("  QueryMemory(info_ptr={:#x}, addr={:#x}) -> base={:#x} size={:#x} state={} perm={}",
-                mem_info_ptr, query_addr, base, size, state, perm);
-            {
-                if let Some(memory) = system.get_svc_memory() {
-                    let m = memory.lock().unwrap();
-                    m.write_64(mem_info_ptr, base);
-                    m.write_64(mem_info_ptr + 8, size);
-                    m.write_32(mem_info_ptr + 16, state);
-                    m.write_32(mem_info_ptr + 20, 0);
-                    m.write_32(mem_info_ptr + 24, perm);
-                    m.write_32(mem_info_ptr + 28, 0);
-                    m.write_32(mem_info_ptr + 32, 0);
-                    m.write_32(mem_info_ptr + 36, 0);
-                } else {
-                    let mut mem = system.shared_process_memory().write().unwrap();
-                    if mem.is_valid_range(mem_info_ptr, 40) {
-                        mem.write_64(mem_info_ptr, base);
-                        mem.write_64(mem_info_ptr + 8, size);
-                        mem.write_32(mem_info_ptr + 16, state);
-                        mem.write_32(mem_info_ptr + 20, 0);
-                        mem.write_32(mem_info_ptr + 24, perm);
-                        mem.write_32(mem_info_ptr + 28, 0);
-                        mem.write_32(mem_info_ptr + 32, 0);
-                        mem.write_32(mem_info_ptr + 36, 0);
-                    }
-                }
-            }
-            set_arg64(args, 0, STUB_SUCCESS as u64);
-            set_arg64(args, 1, 0); // page_info
+            let mut page_info = crate::hle::kernel::svc::svc_types::PageInfo::default();
+            let result =
+                svc_query_memory::query_memory(system, mem_info_ptr, &mut page_info, query_addr);
+            set_arg64(args, 0, result.get_inner_value() as u64);
+            set_arg64(args, 1, page_info.flags as u64);
         }
         Some(SvcId::ExitProcess) => {
             svc_process::exit_process(system);
@@ -1880,7 +1797,10 @@ fn call64(system: &System, imm: u32, args: &mut SvcArgs) {
             set_arg64(args, 1, value);
         }
         Some(SvcId::MapPhysicalMemory) => {
-            set_arg64(args, 0, STUB_SUCCESS as u64);
+            let address = get_arg64(args, 0);
+            let size = get_arg64(args, 1);
+            let result = svc_physical_memory::map_physical_memory(system, address, size);
+            set_arg64(args, 0, result.get_inner_value() as u64);
         }
         // ====================================================================
         // Cache (A64)
@@ -2119,7 +2039,9 @@ pub fn call(system: &System, imm: u32, is_64bit: bool, args: &mut SvcArgs) {
                     .unwrap_or_else(|| format!("svc#0x{:02X}", imm));
                 log::warn!(
                     "[STARTTHREAD_GAP] child_tid={} first_svc={} gap_us={}",
-                    tid, name, us
+                    tid,
+                    name,
+                    us
                 );
             }
         }
@@ -2166,9 +2088,7 @@ pub fn call(system: &System, imm: u32, is_64bit: bool, args: &mut SvcArgs) {
     record_svc_summary(tid, core_id, imm);
     if tid >= 0 {
         crate::hle::kernel::k_scheduler::record_start_thread_sched_first_svc(
-            tid as u64,
-            core_id,
-            imm,
+            tid as u64, core_id, imm,
         );
     }
     maybe_dump_svc_context_by_lr(system, imm, tid, core_id, &dispatch_args);
@@ -2899,8 +2819,7 @@ pub fn dump_svc_summary_profile() {
         let last_imm = profile.tid_last_imm[tid].load(Ordering::Relaxed);
         let mut top = Vec::new();
         for imm in 0..SVC_SUMMARY_MAX_IMM {
-            let n = profile.tid_imm_counts[tid * SVC_SUMMARY_MAX_IMM + imm]
-                .load(Ordering::Relaxed);
+            let n = profile.tid_imm_counts[tid * SVC_SUMMARY_MAX_IMM + imm].load(Ordering::Relaxed);
             if n != 0 {
                 top.push((imm as u32, n));
             }
@@ -3010,8 +2929,10 @@ pub fn record_svc_ring(
     let profile = svc_ring_profile();
     let seq = profile.next.fetch_add(1, Ordering::Relaxed) + 1;
     let slot = &profile.slots[(seq as usize - 1) % profile.slots.len()];
-    slot.time_us
-        .store(profile.start.elapsed().as_micros() as u64, Ordering::Relaxed);
+    slot.time_us.store(
+        profile.start.elapsed().as_micros() as u64,
+        Ordering::Relaxed,
+    );
     slot.tid.store(tid, Ordering::Relaxed);
     slot.priority.store(priority, Ordering::Relaxed);
     slot.core_imm.store(
@@ -3043,10 +2964,7 @@ pub fn dump_svc_ring_profile() {
     let first = next.saturating_sub(cap).saturating_add(1);
     eprintln!(
         "[SVC_RING] total={} dumping_seq={}..{} cap={}",
-        next,
-        first,
-        next,
-        cap
+        next, first, next, cap
     );
     for seq in first..=next {
         let slot = &profile.slots[(seq as usize - 1) % profile.slots.len()];
@@ -3226,8 +3144,11 @@ fn svc_context_lr_filter() -> &'static [u32] {
                         if part.is_empty() {
                             return None;
                         }
-                        u32::from_str_radix(part.trim_start_matches("0x").trim_start_matches("0X"), 16)
-                            .ok()
+                        u32::from_str_radix(
+                            part.trim_start_matches("0x").trim_start_matches("0X"),
+                            16,
+                        )
+                        .ok()
                     })
                     .collect()
             })
@@ -3275,7 +3196,9 @@ fn svc_context_explicit_regions() -> &'static [(u64, u64)] {
                     .filter_map(|part| {
                         let (addr, len) = part.split_once(':')?;
                         let addr = u64::from_str_radix(
-                            addr.trim().trim_start_matches("0x").trim_start_matches("0X"),
+                            addr.trim()
+                                .trim_start_matches("0x")
+                                .trim_start_matches("0X"),
                             16,
                         )
                         .ok()?;
@@ -3293,8 +3216,7 @@ fn svc_context_explicit_regions() -> &'static [(u64, u64)] {
     })
 }
 
-static SVC_CONTEXT_DUMP_COUNT: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
+static SVC_CONTEXT_DUMP_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 fn maybe_dump_svc_context_by_lr(system: &System, imm: u32, tid: i64, core_id: i32, args: &SvcArgs) {
     let lr_filter = svc_context_lr_filter();
@@ -3368,11 +3290,10 @@ fn maybe_dump_svc_context_by_lr(system: &System, imm: u32, tid: i64, core_id: i3
         ctx.r[12] as u32,
     );
 
-    let mem = process.process_memory.read().unwrap();
     let explicit_regions = svc_context_explicit_regions();
     if !explicit_regions.is_empty() {
         for &(addr, len) in explicit_regions {
-            dump_svc_context_region(&mem, addr, len);
+            dump_svc_context_region(&process, addr, len);
         }
         return;
     }
@@ -3387,11 +3308,11 @@ fn maybe_dump_svc_context_by_lr(system: &System, imm: u32, tid: i64, core_id: i3
         }
     }
     for addr in addrs {
-        dump_svc_context_region(&mem, addr.saturating_sub(8), 0x20);
+        dump_svc_context_region(&process, addr.saturating_sub(8), 0x20);
     }
 
     fn dump_svc_context_region(
-        mem: &crate::hle::kernel::k_process::ProcessMemoryData,
+        process: &crate::hle::kernel::k_process::KProcess,
         addr: u64,
         len: u64,
     ) {
@@ -3399,13 +3320,10 @@ fn maybe_dump_svc_context_by_lr(system: &System, imm: u32, tid: i64, core_id: i3
 
         let mut words = String::new();
         let word_count = ((len + 3) / 4).min(32);
+        let bytes = process.read_memory_vec(addr, (word_count * 4) as usize);
         for i in 0..word_count {
-            let cur = addr + i * 4;
-            let word = if mem.is_valid_range(cur, 4) {
-                mem.read_32(cur)
-            } else {
-                0xDEADBEEF
-            };
+            let offset = (i * 4) as usize;
+            let word = u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap());
             let _ = write!(words, " 0x{:08X}", word);
         }
         eprintln!(

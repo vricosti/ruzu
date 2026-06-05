@@ -10,8 +10,8 @@
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Mutex, OnceLock};
 use std::sync::Arc;
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use crate::hle::result::{ResultCode, RESULT_SUCCESS, RESULT_UNKNOWN};
@@ -41,8 +41,9 @@ struct BinderTxnProfileEntry {
     max_ns: u64,
 }
 
-static BINDER_TXN_PROFILE: OnceLock<Mutex<HashMap<(i32, u32, &'static str), BinderTxnProfileEntry>>> =
-    OnceLock::new();
+static BINDER_TXN_PROFILE: OnceLock<
+    Mutex<HashMap<(i32, u32, &'static str), BinderTxnProfileEntry>>,
+> = OnceLock::new();
 
 fn binder_txn_profile_enabled() -> bool {
     std::env::var_os("RUZU_PROFILE_BINDER_TXN").is_some()

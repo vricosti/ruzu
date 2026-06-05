@@ -411,12 +411,14 @@ impl Default for KAbstractSchedulerLock {
 /// Matches upstream `KScopedSchedulerLock` (typedef of KScopedLock<KSchedulerLockType>).
 pub struct KScopedSchedulerLock<'a> {
     lock: &'a KAbstractSchedulerLock,
+    _lo: common::lock_order::LockOrderGuard,
 }
 
 impl<'a> KScopedSchedulerLock<'a> {
     pub fn new(lock: &'a KAbstractSchedulerLock) -> Self {
+        let _lo = common::lock_order::guard("scheduler");
         lock.lock();
-        Self { lock }
+        Self { lock, _lo }
     }
 }
 

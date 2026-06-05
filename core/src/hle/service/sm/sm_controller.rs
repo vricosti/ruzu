@@ -121,30 +121,7 @@ impl Controller {
             let object_id = ctx
                 .create_session_with_manager_object_id(manager.clone())
                 .unwrap_or(0);
-            // Register the new session via the ServerManager's pending-
-            // registration queue instead of locking `Mutex<ServerManager>`
-            // (which is held for the lifetime of the host thread's
-            // loop_process, so locking from this handler thread would
-            // deadlock). The host thread drains the queue every iteration of
-            // wait_and_process_impl.
-            let (queue, wakeup) = {
-                let guard = manager.lock().unwrap();
-                (
-                    guard.pending_registrations().cloned(),
-                    guard.server_wakeup().cloned(),
-                )
-            };
-            if let (Some(queue), Some(server_session)) =
-                (queue, ctx.last_created_server_session.take())
-            {
-                queue
-                    .lock()
-                    .unwrap()
-                    .push((server_session, manager.clone()));
-                if let Some(wakeup) = wakeup {
-                    wakeup.signal();
-                }
-            }
+            ctx.register_last_created_session_with_manager(manager);
             object_id
         } else {
             log::warn!("CloneCurrentObject: no manager to clone");

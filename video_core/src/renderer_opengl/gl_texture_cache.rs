@@ -19,13 +19,13 @@ use crate::texture_cache::image_info::ImageInfo;
 use crate::texture_cache::image_view_base::{ImageViewBase, ImageViewFlagBits};
 use crate::texture_cache::image_view_info::{ImageViewInfo, SwizzleSource};
 use crate::texture_cache::render_targets::RenderTargets;
-use crate::texture_cache::types::BufferImageCopy;
 use crate::texture_cache::texture_cache_base::{
     FramebufferImageView, TextureCacheBase as CommonTextureCache,
 };
+use crate::texture_cache::types::{BufferImageCopy, ImageCopy};
 use crate::texture_cache::types::{
-    Extent2D, ImageId, ImageType, ImageViewId, ImageViewType, Offset2D, Region2D, SubresourceRange,
-    NULL_IMAGE_ID,
+    Extent2D, ImageId, ImageType, ImageViewId, ImageViewType, Offset2D, Region2D,
+    SubresourceLayers, SubresourceRange, NULL_IMAGE_ID,
 };
 use crate::texture_cache::util::{
     full_download_copies, map_size_bytes, swizzle_image, unswizzle_image,
@@ -382,6 +382,87 @@ fn image_view_target(view_type: TextureType, num_samples: i32) -> u32 {
         TextureType::ColorArrayCube => gl::TEXTURE_CUBE_MAP_ARRAY,
         TextureType::Buffer => gl::TEXTURE_BUFFER,
         _ => gl::NONE,
+    }
+}
+
+#[derive(Clone, Copy)]
+struct CopyOrigin {
+    level: i32,
+    x: i32,
+    y: i32,
+    z: i32,
+}
+
+#[derive(Clone, Copy)]
+struct CopyRegion {
+    width: i32,
+    height: i32,
+    depth: i32,
+}
+
+/// Port of upstream `MakeCopyOrigin` in `gl_texture_cache.cpp`.
+fn make_copy_origin(
+    offset: crate::texture_cache::types::Offset3D,
+    subresource: SubresourceLayers,
+    target: u32,
+) -> Option<CopyOrigin> {
+    match target {
+        gl::TEXTURE_1D => Some(CopyOrigin {
+            level: subresource.base_level,
+            x: offset.x,
+            y: 0,
+            z: 0,
+        }),
+        gl::TEXTURE_1D_ARRAY => Some(CopyOrigin {
+            level: subresource.base_level,
+            x: offset.x,
+            y: 0,
+            z: subresource.base_layer,
+        }),
+        gl::TEXTURE_2D_ARRAY | gl::TEXTURE_2D_MULTISAMPLE_ARRAY => Some(CopyOrigin {
+            level: subresource.base_level,
+            x: offset.x,
+            y: offset.y,
+            z: subresource.base_layer,
+        }),
+        gl::TEXTURE_3D => Some(CopyOrigin {
+            level: subresource.base_level,
+            x: offset.x,
+            y: offset.y,
+            z: offset.z,
+        }),
+        _ => None,
+    }
+}
+
+/// Port of upstream `MakeCopyRegion` in `gl_texture_cache.cpp`.
+fn make_copy_region(
+    extent: crate::texture_cache::types::Extent3D,
+    dst_subresource: SubresourceLayers,
+    target: u32,
+) -> Option<CopyRegion> {
+    match target {
+        gl::TEXTURE_1D => Some(CopyRegion {
+            width: extent.width as i32,
+            height: 1,
+            depth: 1,
+        }),
+        gl::TEXTURE_1D_ARRAY => Some(CopyRegion {
+            width: extent.width as i32,
+            height: 1,
+            depth: dst_subresource.num_layers,
+        }),
+        gl::TEXTURE_2D_ARRAY | gl::TEXTURE_2D_MULTISAMPLE_ARRAY => Some(CopyRegion {
+            width: extent.width as i32,
+            height: extent.height as i32,
+            depth: dst_subresource.num_layers,
+        }),
+        gl::TEXTURE_3D => Some(CopyRegion {
+            width: extent.width as i32,
+            height: extent.height as i32,
+            depth: extent.depth as i32,
+        }),
+        _ => None,
     }
 }
 
@@ -2241,11 +2322,185 @@ impl TextureCache {
             }
         } else {
             self.refresh_contents_with_gpu_reader(image_id, read_gpu);
-            // TODO: SynchronizeAliases(image_id) once alias tracking reaches
-            // upstream parity.
+            self.synchronize_aliases(image_id);
         }
         if is_modification {
             self.base.mark_modification_by_id(image_id);
+        }
+    }
+
+    fn ensure_backend_image(&mut self, image_id: ImageId) -> bool {
+        if !image_id.is_valid() {
+            return false;
+        }
+        if self.images.contains_key(&image_id) {
+            return true;
+        }
+        let base = self.base.slot_images[image_id].clone();
+        self.images.insert(image_id, Image::from_base(&base));
+        true
+    }
+
+    /// OpenGL-backed port of `TextureCache<P>::SynchronizeAliases`.
+    ///
+    /// The upstream method also handles resolution scaling and several
+    /// reinterpret/copy-emulation paths inside `CopyImage`. The Rust GL port
+    /// currently wires the direct same-format `glCopyImageSubData` path, which
+    /// is the upstream runtime path for ordinary render-target aliases.
+    fn synchronize_aliases(&mut self, image_id: ImageId) {
+        if !image_id.is_valid() {
+            return;
+        }
+        let image = self.base.slot_images[image_id].clone();
+        let mut alias_copies = Vec::new();
+        let mut any_modified = image.flags.contains(ImageFlagBits::GPU_MODIFIED);
+        let mut most_recent_tick = image.modification_tick;
+        for aliased in &image.aliased_images {
+            let aliased_image = &self.base.slot_images[aliased.id];
+            if image.modification_tick < aliased_image.modification_tick {
+                most_recent_tick = most_recent_tick.max(aliased_image.modification_tick);
+                any_modified |= aliased_image.flags.contains(ImageFlagBits::GPU_MODIFIED);
+                alias_copies.push((aliased.id, aliased.copies.clone()));
+            }
+        }
+        if alias_copies.is_empty() {
+            return;
+        }
+
+        alias_copies
+            .sort_by_key(|(alias_id, _)| self.base.slot_images[*alias_id].modification_tick);
+        {
+            let dst = &mut self.base.slot_images[image_id];
+            dst.modification_tick = most_recent_tick;
+            if any_modified {
+                dst.flags.insert(ImageFlagBits::GPU_MODIFIED);
+            }
+        }
+
+        for (alias_id, copies) in alias_copies {
+            self.copy_image(image_id, alias_id, &copies);
+        }
+    }
+
+    /// OpenGL direct-copy slice of upstream `TextureCache<P>::CopyImage`.
+    fn copy_image(&mut self, dst_id: ImageId, src_id: ImageId, copies: &[ImageCopy]) {
+        if copies.is_empty() {
+            return;
+        }
+        let dst_info = self.base.slot_images[dst_id].info.clone();
+        let src_info = self.base.slot_images[src_id].info.clone();
+        let trace_alias = std::env::var_os("RUZU_TRACE_ALIAS_SYNC").is_some();
+
+        if dst_info.image_type == ImageType::Buffer || src_info.image_type == ImageType::Buffer {
+            if trace_alias {
+                log::warn!(
+                    "[ALIAS_SYNC] skip_buffer dst={} src={} copies={}",
+                    dst_id.index,
+                    src_id.index,
+                    copies.len()
+                );
+            }
+            return;
+        }
+        if dst_info.num_samples != src_info.num_samples {
+            if trace_alias {
+                log::warn!(
+                    "[ALIAS_SYNC] skip_msaa dst={} src={} dst_samples={} src_samples={}",
+                    dst_id.index,
+                    src_id.index,
+                    dst_info.num_samples,
+                    src_info.num_samples
+                );
+            }
+            return;
+        }
+        if dst_info.format != src_info.format {
+            if trace_alias {
+                log::warn!(
+                    "[ALIAS_SYNC] skip_format dst={} src={} dst_fmt={:?} src_fmt={:?}",
+                    dst_id.index,
+                    src_id.index,
+                    dst_info.format,
+                    src_info.format
+                );
+            }
+            return;
+        }
+        if !self.ensure_backend_image(dst_id) || !self.ensure_backend_image(src_id) {
+            return;
+        }
+
+        let dst_handle = self.images.get(&dst_id).map(Image::handle).unwrap_or(0);
+        let src_handle = self.images.get(&src_id).map(Image::handle).unwrap_or(0);
+        if dst_handle == 0 || src_handle == 0 {
+            return;
+        }
+        let dst_target = image_target(&dst_info);
+        let src_target = image_target(&src_info);
+        if dst_target == gl::NONE || src_target == gl::NONE {
+            return;
+        }
+
+        unsafe {
+            while gl::GetError() != gl::NO_ERROR {}
+            for copy in copies {
+                let Some(src_origin) =
+                    make_copy_origin(copy.src_offset, copy.src_subresource, src_target)
+                else {
+                    continue;
+                };
+                let Some(dst_origin) =
+                    make_copy_origin(copy.dst_offset, copy.dst_subresource, dst_target)
+                else {
+                    continue;
+                };
+                let Some(region) = make_copy_region(copy.extent, copy.dst_subresource, dst_target)
+                else {
+                    continue;
+                };
+                gl::CopyImageSubData(
+                    src_handle,
+                    src_target,
+                    src_origin.level,
+                    src_origin.x,
+                    src_origin.y,
+                    src_origin.z,
+                    dst_handle,
+                    dst_target,
+                    dst_origin.level,
+                    dst_origin.x,
+                    dst_origin.y,
+                    dst_origin.z,
+                    region.width,
+                    region.height,
+                    region.depth,
+                );
+                if trace_alias {
+                    let err = gl::GetError();
+                    log::warn!(
+                        "[ALIAS_SYNC] copy dst={} src={} dst_tex={} src_tex={} target=0x{:X}->0x{:X} level {}->{} offset ({},{},{})<-({},{},{}) extent {}x{}x{} err=0x{:X}",
+                        dst_id.index,
+                        src_id.index,
+                        dst_handle,
+                        src_handle,
+                        src_target,
+                        dst_target,
+                        src_origin.level,
+                        dst_origin.level,
+                        dst_origin.x,
+                        dst_origin.y,
+                        dst_origin.z,
+                        src_origin.x,
+                        src_origin.y,
+                        src_origin.z,
+                        region.width,
+                        region.height,
+                        region.depth,
+                        err
+                    );
+                }
+            }
+            gl::MemoryBarrier(gl::TEXTURE_FETCH_BARRIER_BIT | gl::FRAMEBUFFER_BARRIER_BIT);
         }
     }
 
@@ -3462,7 +3717,8 @@ impl TextureCache {
     pub fn trace_present_images_by_gpu_addr(&self, present_index: u64, gpu_addrs: &[u64]) {
         let trace_enabled = common::trace::is_enabled(common::trace::cat::PRESENT_TEXTURE);
         let ppm_enabled = std::env::var_os("RUZU_DUMP_PRESENT_EXTRA_PPM_DIR").is_some();
-        if !trace_enabled && !ppm_enabled {
+        let metadata_enabled = common::trace::is_enabled(common::trace::cat::PRESENT_IMAGE_SELECT);
+        if !trace_enabled && !ppm_enabled && !metadata_enabled {
             return;
         }
 
@@ -3497,6 +3753,54 @@ impl TextureCache {
                 }
                 continue;
             };
+
+            if metadata_enabled {
+                let cpu_overlap_count = self
+                    .base
+                    .slot_images
+                    .iter()
+                    .filter(|(other_id, other)| {
+                        *other_id != image_id
+                            && other
+                                .overlaps(image_base.cpu_addr, image_base.guest_size_bytes as usize)
+                    })
+                    .count();
+                let gpu_overlap_count = self
+                    .base
+                    .slot_images
+                    .iter()
+                    .filter(|(other_id, other)| {
+                        *other_id != image_id
+                            && other.overlaps_gpu(
+                                image_base.gpu_addr,
+                                image_base.guest_size_bytes as usize,
+                            )
+                    })
+                    .count();
+                // Reuse PRESENT_IMAGE_SELECT's numeric shape for targeted
+                // present-time image metadata. `candidates` carries dynamic
+                // CPU-overlap count and `fb_blending` carries GPU-overlap
+                // count; view_id is missing because this is image-level data.
+                common::trace::emit_raw(
+                    common::trace::cat::PRESENT_IMAGE_SELECT,
+                    &[
+                        image_base.cpu_addr,
+                        image_base.gpu_addr,
+                        image_id.index as u64,
+                        u64::MAX,
+                        cpu_overlap_count as u64,
+                        image_base.flags.bits() as u64,
+                        image_base.modification_tick,
+                        image_base.aliased_images.len() as u64,
+                        image_base.overlapping_images.len() as u64,
+                        image_base.info.size.width as u64,
+                        image_base.info.size.height as u64,
+                        image_base.info.format as u64,
+                        image_base.info.image_type as u64,
+                        gpu_overlap_count as u64,
+                    ],
+                );
+            }
 
             let Some(image) = self.images.get(&image_id) else {
                 if trace_enabled {

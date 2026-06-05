@@ -29,9 +29,7 @@ use crate::shader_environment::{GenericEnvironment, GpuMemoryReader};
 use crate::transform_feedback;
 use shader_recompiler::program_header::ProgramHeader;
 
-fn comparison_op_to_runtime_func(
-    op: crate::engines::maxwell_3d::ComparisonOp,
-) -> CompareFunction {
+fn comparison_op_to_runtime_func(op: crate::engines::maxwell_3d::ComparisonOp) -> CompareFunction {
     match op {
         crate::engines::maxwell_3d::ComparisonOp::Never => CompareFunction::Never,
         crate::engines::maxwell_3d::ComparisonOp::Less => CompareFunction::Less,
@@ -244,8 +242,7 @@ pub fn dump_shader_pipeline_stall_profile() {
     let last_stage_name = NAMES.get(last_stage).copied().unwrap_or("unknown");
     eprintln!(
         "[SHADER_PIPELINE_STALL_PROFILE] last_stage={} ({})",
-        last_stage,
-        last_stage_name
+        last_stage, last_stage_name
     );
     for (index, name) in NAMES.iter().enumerate() {
         eprintln!(
@@ -377,7 +374,7 @@ impl ShaderCache {
         let mut h = DefaultHasher::new();
         std::thread::current().id().hash(&mut h);
         let tid_hash = h.finish().max(1); // 0 = unowned sentinel
-        // Try to publish ownership on first call (compare_exchange 0 -> tid_hash).
+                                          // Try to publish ownership on first call (compare_exchange 0 -> tid_hash).
         let prev = self
             .owner_tid_hash
             .compare_exchange(0, tid_hash, Ordering::AcqRel, Ordering::Acquire)
@@ -821,15 +818,20 @@ impl ShaderCache {
                         );
                     }
                     previous_info = compiled.info.clone();
-                    let mut final_source = patch_fragment_debug_by_source_hash(stage, compiled.source);
+                    let mut final_source =
+                        patch_fragment_debug_by_source_hash(stage, compiled.source);
                     if std::env::var_os("RUZU_FORCE_GREEN_FRAGMENT").is_some()
                         && format!("{:?}", stage) == "Fragment"
                     {
                         if let Some(idx) = final_source.rfind("void main(){") {
                             let head = &final_source[..idx];
-                            let new_body = "void main(){\nfrag_color0=vec4(0.0,1.0,0.0,1.0);\nreturn;\n}\n";
+                            let new_body =
+                                "void main(){\nfrag_color0=vec4(0.0,1.0,0.0,1.0);\nreturn;\n}\n";
                             let new_source = format!("{}{}", head, new_body);
-                            log::warn!("[FORCE_GREEN] patched fragment shader, new size {}", new_source.len());
+                            log::warn!(
+                                "[FORCE_GREEN] patched fragment shader, new size {}",
+                                new_source.len()
+                            );
                             final_source = new_source;
                         }
                     }
@@ -838,7 +840,8 @@ impl ShaderCache {
                     {
                         if let Some(idx) = final_source.rfind("void main(){") {
                             let head = &final_source[..idx];
-                            let new_body = "void main(){\nfrag_color0=vec4(0.0,0.0,0.0,1.0);\nreturn;\n}\n";
+                            let new_body =
+                                "void main(){\nfrag_color0=vec4(0.0,0.0,0.0,1.0);\nreturn;\n}\n";
                             let new_source = format!("{}{}", head, new_body);
                             log::warn!("[FORCE_BLACK] patched FS to opaque black");
                             final_source = new_source;
@@ -849,7 +852,8 @@ impl ShaderCache {
                     {
                         if let Some(idx) = final_source.rfind("void main(){") {
                             let head = &final_source[..idx];
-                            let new_body = "void main(){\nfrag_color0=vec4(0.0,0.0,1.0,1.0);\nreturn;\n}\n";
+                            let new_body =
+                                "void main(){\nfrag_color0=vec4(0.0,0.0,1.0,1.0);\nreturn;\n}\n";
                             let new_source = format!("{}{}", head, new_body);
                             log::warn!("[FORCE_BLUE] patched FS to opaque blue");
                             final_source = new_source;
@@ -873,7 +877,9 @@ impl ShaderCache {
                     {
                         if let Some(idx) = final_source.rfind("void main(){") {
                             let head = &final_source[..idx];
-                            let new_body = if std::env::var_os("RUZU_FORCE_FULLSCREEN_VS_READ_ATTR").is_some() {
+                            let new_body = if std::env::var_os("RUZU_FORCE_FULLSCREEN_VS_READ_ATTR")
+                                .is_some()
+                            {
                                 "void main(){\nvec4 ruzu_dummy=in_attr0;\nfloat ruzu_sink=ruzu_dummy.x*0.0;\nvec2 p=vec2(float((gl_VertexID<<1)&2),float(gl_VertexID&2));\ngl_Position=vec4(p*2.0-1.0+ruzu_sink,0.0,1.0);\nreturn;\n}\n"
                             } else {
                                 "void main(){\nvec2 p=vec2(float((gl_VertexID<<1)&2),float(gl_VertexID&2));\ngl_Position=vec4(p*2.0-1.0,0.0,1.0);\nreturn;\n}\n"
@@ -889,10 +895,8 @@ impl ShaderCache {
                         if let Some(idx) = final_source.rfind("return;") {
                             let head = &final_source[..idx];
                             let tail = &final_source[idx..];
-                            final_source = format!(
-                                "{}gl_Position.z=0.0;\ngl_Position.w=1.0;\n{}",
-                                head, tail
-                            );
+                            final_source =
+                                format!("{}gl_Position.z=0.0;\ngl_Position.w=1.0;\n{}", head, tail);
                             log::warn!("[FORCE_VERTEX_ZW] patched vertex shader");
                         }
                     }
@@ -902,13 +906,13 @@ impl ShaderCache {
                         if let Some(idx) = final_source.rfind("return;") {
                             let head = &final_source[..idx];
                             let tail = &final_source[idx..];
-                    final_source = format!(
+                            final_source = format!(
                         "{}vec2 ruzu_p=vec2(float((gl_VertexID<<1)&2),float(gl_VertexID&2));\ngl_Position.xy=ruzu_p*2.0-1.0;\n{}",
                         head, tail
                     );
-                    log::warn!("[FORCE_VERTEX_XY] patched vertex shader");
-                }
-            }
+                            log::warn!("[FORCE_VERTEX_XY] patched vertex shader");
+                        }
+                    }
                     if std::env::var_os("RUZU_FORCE_VERTEX_OUT_ZERO").is_some()
                         && format!("{:?}", stage).contains("Vertex")
                     {
@@ -1023,7 +1027,10 @@ impl ShaderCache {
                     let head = &final_source[..idx];
                     let new_body = "void main(){\nfrag_color0=vec4(0.0,1.0,0.0,1.0);\nreturn;\n}\n";
                     let new_source = format!("{}{}", head, new_body);
-                    log::warn!("[FORCE_GREEN] patched fragment shader (path 2), new size {}", new_source.len());
+                    log::warn!(
+                        "[FORCE_GREEN] patched fragment shader (path 2), new size {}",
+                        new_source.len()
+                    );
                     final_source = new_source;
                 }
             }
@@ -1054,7 +1061,9 @@ impl ShaderCache {
             {
                 if let Some(idx) = final_source.rfind("void main(){") {
                     let head = &final_source[..idx];
-                    let new_body = if std::env::var_os("RUZU_FORCE_FULLSCREEN_VS_READ_ATTR").is_some() {
+                    let new_body = if std::env::var_os("RUZU_FORCE_FULLSCREEN_VS_READ_ATTR")
+                        .is_some()
+                    {
                         "void main(){\nvec4 ruzu_dummy=in_attr0;\nfloat ruzu_sink=ruzu_dummy.x*0.0;\nvec2 p=vec2(float((gl_VertexID<<1)&2),float(gl_VertexID&2));\ngl_Position=vec4(p*2.0-1.0+ruzu_sink,0.0,1.0);\nreturn;\n}\n"
                     } else {
                         "void main(){\nvec2 p=vec2(float((gl_VertexID<<1)&2),float(gl_VertexID&2));\ngl_Position=vec4(p*2.0-1.0,0.0,1.0);\nreturn;\n}\n"
@@ -1070,10 +1079,8 @@ impl ShaderCache {
                 if let Some(idx) = final_source.rfind("return;") {
                     let head = &final_source[..idx];
                     let tail = &final_source[idx..];
-                    final_source = format!(
-                        "{}gl_Position.z=0.0;\ngl_Position.w=1.0;\n{}",
-                        head, tail
-                    );
+                    final_source =
+                        format!("{}gl_Position.z=0.0;\ngl_Position.w=1.0;\n{}", head, tail);
                     log::warn!("[FORCE_VERTEX_ZW] patched vertex shader (path 2)");
                 }
             }
@@ -1206,7 +1213,9 @@ impl ShaderCache {
             if std::env::var_os("RUZU_FORCE_FULLSCREEN_VS").is_some() {
                 if let Some(idx) = final_source.rfind("void main(){") {
                     let head = &final_source[..idx];
-                    let new_body = if std::env::var_os("RUZU_FORCE_FULLSCREEN_VS_READ_ATTR").is_some() {
+                    let new_body = if std::env::var_os("RUZU_FORCE_FULLSCREEN_VS_READ_ATTR")
+                        .is_some()
+                    {
                         "void main(){\nvec4 ruzu_dummy=in_attr0;\nfloat ruzu_sink=ruzu_dummy.x*0.0;\nvec2 p=vec2(float((gl_VertexID<<1)&2),float(gl_VertexID&2));\ngl_Position=vec4(p*2.0-1.0+ruzu_sink,0.0,1.0);\nreturn;\n}\n"
                     } else {
                         "void main(){\nvec2 p=vec2(float((gl_VertexID<<1)&2),float(gl_VertexID&2));\ngl_Position=vec4(p*2.0-1.0,0.0,1.0);\nreturn;\n}\n"
@@ -1219,10 +1228,8 @@ impl ShaderCache {
                 if let Some(idx) = final_source.rfind("return;") {
                     let head = &final_source[..idx];
                     let tail = &final_source[idx..];
-                    final_source = format!(
-                        "{}gl_Position.z=0.0;\ngl_Position.w=1.0;\n{}",
-                        head, tail
-                    );
+                    final_source =
+                        format!("{}gl_Position.z=0.0;\ngl_Position.w=1.0;\n{}", head, tail);
                     log::warn!("[FORCE_VERTEX_ZW] patched dual vertex shader (envs path)");
                 }
             }
@@ -1268,7 +1275,10 @@ impl ShaderCache {
                 let env = environments.envs[slot].generic_environment_mut();
                 let actual_stage = env.shader_stage();
                 if trace_pipeline {
-                    eprintln!("[SHADER_PIPELINE] stage {:?} analyze/compile begin", actual_stage);
+                    eprintln!(
+                        "[SHADER_PIPELINE] stage {:?} analyze/compile begin",
+                        actual_stage
+                    );
                 }
                 if env.cached_code_slice().is_empty() && env.analyze().is_none() {
                     log::warn!(
@@ -1306,7 +1316,8 @@ impl ShaderCache {
                 {
                     if let Some(idx) = final_source.rfind("void main(){") {
                         let head = &final_source[..idx];
-                        let new_body = "void main(){\nfrag_color0=vec4(0.0,1.0,0.0,1.0);\nreturn;\n}\n";
+                        let new_body =
+                            "void main(){\nfrag_color0=vec4(0.0,1.0,0.0,1.0);\nreturn;\n}\n";
                         let new_source = format!("{}{}", head, new_body);
                         log::warn!("[FORCE_GREEN] patched fragment shader (envs path)");
                         final_source = new_source;
@@ -1317,7 +1328,8 @@ impl ShaderCache {
                 {
                     if let Some(idx) = final_source.rfind("void main(){") {
                         let head = &final_source[..idx];
-                        let new_body = "void main(){\nfrag_color0=vec4(0.0,0.0,0.0,1.0);\nreturn;\n}\n";
+                        let new_body =
+                            "void main(){\nfrag_color0=vec4(0.0,0.0,0.0,1.0);\nreturn;\n}\n";
                         let new_source = format!("{}{}", head, new_body);
                         log::warn!("[FORCE_BLACK] patched FS (envs path)");
                         final_source = new_source;
@@ -1339,7 +1351,9 @@ impl ShaderCache {
                 {
                     if let Some(idx) = final_source.rfind("void main(){") {
                         let head = &final_source[..idx];
-                        let new_body = if std::env::var_os("RUZU_FORCE_FULLSCREEN_VS_READ_ATTR").is_some() {
+                        let new_body = if std::env::var_os("RUZU_FORCE_FULLSCREEN_VS_READ_ATTR")
+                            .is_some()
+                        {
                             "void main(){\nvec4 ruzu_dummy=in_attr0;\nfloat ruzu_sink=ruzu_dummy.x*0.0;\nvec2 p=vec2(float((gl_VertexID<<1)&2),float(gl_VertexID&2));\ngl_Position=vec4(p*2.0-1.0+ruzu_sink,0.0,1.0);\nreturn;\n}\n"
                         } else {
                             "void main(){\nvec2 p=vec2(float((gl_VertexID<<1)&2),float(gl_VertexID&2));\ngl_Position=vec4(p*2.0-1.0,0.0,1.0);\nreturn;\n}\n"
@@ -1355,10 +1369,8 @@ impl ShaderCache {
                     if let Some(idx) = final_source.rfind("return;") {
                         let head = &final_source[..idx];
                         let tail = &final_source[idx..];
-                        final_source = format!(
-                            "{}gl_Position.z=0.0;\ngl_Position.w=1.0;\n{}",
-                            head, tail
-                        );
+                        final_source =
+                            format!("{}gl_Position.z=0.0;\ngl_Position.w=1.0;\n{}", head, tail);
                         log::warn!("[FORCE_VERTEX_ZW] patched vertex shader (envs path)");
                     }
                 }
@@ -1421,7 +1433,10 @@ impl ShaderCache {
             let env = environments.envs[slot].generic_environment_mut();
             let actual_stage = env.shader_stage();
             if trace_pipeline {
-                eprintln!("[SHADER_PIPELINE] stage {:?} analyze/compile begin", actual_stage);
+                eprintln!(
+                    "[SHADER_PIPELINE] stage {:?} analyze/compile begin",
+                    actual_stage
+                );
             }
             if env.cached_code_slice().is_empty() && env.analyze().is_none() {
                 log::warn!(
@@ -1492,7 +1507,9 @@ impl ShaderCache {
             {
                 if let Some(idx) = final_source.rfind("void main(){") {
                     let head = &final_source[..idx];
-                    let new_body = if std::env::var_os("RUZU_FORCE_FULLSCREEN_VS_READ_ATTR").is_some() {
+                    let new_body = if std::env::var_os("RUZU_FORCE_FULLSCREEN_VS_READ_ATTR")
+                        .is_some()
+                    {
                         "void main(){\nvec4 ruzu_dummy=in_attr0;\nfloat ruzu_sink=ruzu_dummy.x*0.0;\nvec2 p=vec2(float((gl_VertexID<<1)&2),float(gl_VertexID&2));\ngl_Position=vec4(p*2.0-1.0+ruzu_sink,0.0,1.0);\nreturn;\n}\n"
                     } else {
                         "void main(){\nvec2 p=vec2(float((gl_VertexID<<1)&2),float(gl_VertexID&2));\ngl_Position=vec4(p*2.0-1.0,0.0,1.0);\nreturn;\n}\n"
@@ -1508,10 +1525,8 @@ impl ShaderCache {
                 if let Some(idx) = final_source.rfind("return;") {
                     let head = &final_source[..idx];
                     let tail = &final_source[idx..];
-                    final_source = format!(
-                        "{}gl_Position.z=0.0;\ngl_Position.w=1.0;\n{}",
-                        head, tail
-                    );
+                    final_source =
+                        format!("{}gl_Position.z=0.0;\ngl_Position.w=1.0;\n{}", head, tail);
                     log::warn!("[FORCE_VERTEX_ZW] patched vertex shader (envs path 2)");
                 }
             }
@@ -1586,14 +1601,14 @@ impl ShaderCache {
                         transform_feedback::make_transform_feedback_varyings(&key.xfb_state);
                     info.xfb_varyings = varyings
                         .iter()
-                        .map(|varying| {
-                            shader_recompiler::runtime_info::TransformFeedbackVarying {
+                        .map(
+                            |varying| shader_recompiler::runtime_info::TransformFeedbackVarying {
                                 buffer: varying.buffer,
                                 stride: varying.stride,
                                 offset: varying.offset,
                                 components: varying.components,
-                            }
-                        })
+                            },
+                        )
                         .collect();
                     info.xfb_count = count;
                 }
@@ -2095,9 +2110,10 @@ mod tests {
 
         for index in 0..8 {
             assert!(
-                compiled
-                    .source
-                    .contains(&format!("layout(location={})out vec4 frag_color{};", index, index)),
+                compiled.source.contains(&format!(
+                    "layout(location={})out vec4 frag_color{};",
+                    index, index
+                )),
                 "OpenGL profile must declare frag_color{} even when the shader does not write it",
                 index
             );

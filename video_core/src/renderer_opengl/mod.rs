@@ -149,7 +149,8 @@ fn dump_present_ppm_once(
     let range_index_match = target_present_start.is_some_and(|start| {
         present_index >= start
             && target_present_end.is_none_or(|end| present_index <= end)
-            && target_present_every.is_none_or(|every| every != 0 && (present_index - start) % every == 0)
+            && target_present_every
+                .is_none_or(|every| every != 0 && (present_index - start) % every == 0)
     });
     let draw_index_match = target_draw_indices
         .as_ref()

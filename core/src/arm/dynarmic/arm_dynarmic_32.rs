@@ -278,6 +278,30 @@ fn trace_unmapped_write(cb: &DynarmicCallbacks32, vaddr: u64, size: u64, value: 
     if !common::trace::is_enabled(common::trace::cat::UNMAPPED_WRITE) {
         return;
     }
+    static TARGET_ADDR: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    let target_addr = TARGET_ADDR.get_or_init(|| {
+        std::env::var("RUZU_TRACE_UNMAPPED_WRITE_ADDR")
+            .ok()
+            .and_then(|raw| u64::from_str_radix(raw.trim().trim_start_matches("0x"), 16).ok())
+    });
+    if let Some(target_addr) = target_addr {
+        if vaddr != *target_addr {
+            return;
+        }
+    }
+    static EMIT_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    static EMIT_LIMIT: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    let emit_limit = EMIT_LIMIT.get_or_init(|| {
+        std::env::var("RUZU_TRACE_UNMAPPED_WRITE_LIMIT")
+            .ok()
+            .and_then(|raw| raw.parse::<u64>().ok())
+    });
+    let emit_index = EMIT_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if let Some(limit) = emit_limit {
+        if emit_index >= *limit {
+            return;
+        }
+    }
     // Cheap pre-check: skip the trace path entirely when the address IS
     // mapped — the unmapped-write log only fires on the slow path inside
     // `Memory::write_raw`. We mirror the same validity probe here so the
@@ -287,7 +311,10 @@ fn trace_unmapped_write(cb: &DynarmicCallbacks32, vaddr: u64, size: u64, value: 
             .unwrap()
             .is_valid_virtual_address_range(vaddr, size)
     } else {
-        cb.memory.read().unwrap().is_valid_range(vaddr, size as usize)
+        cb.memory
+            .read()
+            .unwrap()
+            .is_valid_range(vaddr, size as usize)
     };
     if mapped {
         return;
@@ -335,7 +362,10 @@ fn trace_unmapped_write(cb: &DynarmicCallbacks32, vaddr: u64, size: u64, value: 
             use std::fmt::Write as _;
             let _ = write!(hex, "{:02x}", mem.read_8(r[6] as u64 + i));
         }
-        eprintln!("[UNMAPPED_WRITE_STRUCT] hit#{} r6=0x{:08X} +0..63={}", n, r[6], hex);
+        eprintln!(
+            "[UNMAPPED_WRITE_STRUCT] hit#{} r6=0x{:08X} +0..63={}",
+            n, r[6], hex
+        );
     }
     // Dump stack words to walk LR chain — caller-of-caller etc. Width is
     // 64 words (256 bytes) so it covers the prologue + locals area of a
@@ -350,7 +380,12 @@ fn trace_unmapped_write(cb: &DynarmicCallbacks32, vaddr: u64, size: u64, value: 
             let w = mem.read_32(sp as u64 + i * 4);
             let _ = write!(words, "{:08x} ", w);
         }
-        eprintln!("[UNMAPPED_WRITE_STACK] hit#{} sp=0x{:08X} +0..255={}", n, sp, words.trim_end());
+        eprintln!(
+            "[UNMAPPED_WRITE_STACK] hit#{} sp=0x{:08X} +0..255={}",
+            n,
+            sp,
+            words.trim_end()
+        );
     }
 }
 
@@ -1256,7 +1291,10 @@ fn maybe_trap_fastmem_page(fastmem_pointer: Option<*mut u8>, core_index: usize) 
                 tick += 1;
                 std::thread::sleep(std::time::Duration::from_millis(interval_ms));
             }
-            log::warn!("[FASTMEM_TRAP] re-apply loop ended after {} ms", duration_ms);
+            log::warn!(
+                "[FASTMEM_TRAP] re-apply loop ended after {} ms",
+                duration_ms
+            );
         })
         .expect("spawn ruzu-fastmem-trap");
 }
@@ -1425,7 +1463,11 @@ impl DynarmicCallbacks32 {
     ) -> Self {
         log::info!(
             "DynarmicCallbacks32: core_memory={}",
-            if core_memory.is_some() { "wired" } else { "fallback" }
+            if core_memory.is_some() {
+                "wired"
+            } else {
+                "fallback"
+            }
         );
         Self {
             parent: parent_ptr,
@@ -2644,7 +2686,10 @@ impl ArmInterface for ArmDynarmic32 {
                 std::env::var_os("RUZU_A32_TRACE_ONLY_WHEN_PC_WINDOW").is_some();
             let pc_window_active =
                 rdynarmic::jit::PC_TRACE_ACTIVE.load(std::sync::atomic::Ordering::Relaxed);
-            if trace_only_when_pc_window && !pc_window_active && !(current_pc >= start && current_pc < end) {
+            if trace_only_when_pc_window
+                && !pc_window_active
+                && !(current_pc >= start && current_pc < end)
+            {
                 let rdynarmic_hr = jit.run();
                 return translate_halt_reason(rdynarmic_hr);
             }

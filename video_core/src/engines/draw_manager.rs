@@ -568,8 +568,8 @@ pub struct Maxwell3DDrawRegisters {
     pub window_origin_lower_left: bool,
     pub window_origin_flip_y: bool,
     pub viewport0_scale_y: f32,
-    pub viewport_transforms:
-        [crate::engines::maxwell_3d::ViewportTransformInfo; crate::engines::maxwell_3d::NUM_VIEWPORTS],
+    pub viewport_transforms: [crate::engines::maxwell_3d::ViewportTransformInfo;
+        crate::engines::maxwell_3d::NUM_VIEWPORTS],
     pub viewport_scale_offset_enabled: bool,
     pub surface_clip: crate::engines::maxwell_3d::SurfaceClipInfo,
     pub framebuffer_srgb: bool,
@@ -810,8 +810,7 @@ impl<'a> Maxwell3DDrawView<'a> {
 
     pub fn scissors(
         &self,
-    ) -> [crate::engines::maxwell_3d::ScissorInfo; crate::engines::maxwell_3d::NUM_VIEWPORTS]
-    {
+    ) -> [crate::engines::maxwell_3d::ScissorInfo; crate::engines::maxwell_3d::NUM_VIEWPORTS] {
         match &self.source {
             Maxwell3DDrawSource::Live(maxwell3d) => {
                 std::array::from_fn(|i| maxwell3d.scissor_info(i as u32))
@@ -907,8 +906,8 @@ impl<'a> Maxwell3DDrawView<'a> {
 
     pub fn viewport_transforms(
         &self,
-    ) -> [crate::engines::maxwell_3d::ViewportTransformInfo; crate::engines::maxwell_3d::NUM_VIEWPORTS]
-    {
+    ) -> [crate::engines::maxwell_3d::ViewportTransformInfo;
+           crate::engines::maxwell_3d::NUM_VIEWPORTS] {
         match &self.source {
             Maxwell3DDrawSource::Live(maxwell3d) => {
                 std::array::from_fn(|i| maxwell3d.viewport_transform_info(i as u32))
@@ -1725,10 +1724,7 @@ impl DrawManager {
             self.draw_state.draw_indexed = draw_indexed;
             let rasterizer_present = maxwell3d.draw_rasterizer(&self.draw_state, instance_count);
             if trace_process_draw {
-                eprintln!(
-                    "[PROCESS_DRAW] rasterizer_present={}",
-                    rasterizer_present
-                );
+                eprintln!("[PROCESS_DRAW] rasterizer_present={}", rasterizer_present);
             }
         }
     }
@@ -1810,13 +1806,16 @@ mod tests {
         registers.window_origin_lower_left = true;
         registers.window_origin_flip_y = true;
         registers.viewport0_scale_y = -1.0;
-        registers.dirty_flags[crate::renderer_opengl::gl_state_tracker::dirty::VIEWPORTS as usize] =
-            true;
+        registers.dirty_flags
+            [crate::renderer_opengl::gl_state_tracker::dirty::VIEWPORTS as usize] = true;
 
         let view = Maxwell3DDrawView::with_register_snapshot(&draw_state, registers);
 
         assert!(std::ptr::eq(view.draw_state(), &draw_state));
-        assert_eq!(view.shader_program_addresses(), [0x1000, 0x2000, 0, 0, 0, 0]);
+        assert_eq!(
+            view.shader_program_addresses(),
+            [0x1000, 0x2000, 0, 0, 0, 0]
+        );
         assert_eq!(view.descriptor_sync_regs().tex_header_addr, 0x3000);
         assert!(view.window_origin_lower_left());
         assert!(view.window_origin_flip_y());
@@ -1830,17 +1829,16 @@ mod tests {
     fn maxwell_draw_view_exposes_raw_viewport_register_snapshot() {
         let draw_state = DrawState::default();
         let mut registers = Maxwell3DDrawRegisters::default();
-        registers.viewport_transforms[0] =
-            crate::engines::maxwell_3d::ViewportTransformInfo {
-                scale_x: 10.0,
-                scale_y: -20.0,
-                scale_z: 0.25,
-                translate_x: 30.0,
-                translate_y: 40.0,
-                translate_z: 0.5,
-                swizzle: 0x3210,
-                snap_grid_precision: 0x0504,
-            };
+        registers.viewport_transforms[0] = crate::engines::maxwell_3d::ViewportTransformInfo {
+            scale_x: 10.0,
+            scale_y: -20.0,
+            scale_z: 0.25,
+            translate_x: 30.0,
+            translate_y: 40.0,
+            translate_z: 0.5,
+            swizzle: 0x3210,
+            snap_grid_precision: 0x0504,
+        };
         registers.viewport_scale_offset_enabled = true;
         registers.surface_clip = crate::engines::maxwell_3d::SurfaceClipInfo {
             x: 1,

@@ -125,8 +125,7 @@ pub fn dump_update_cached_stall_profile() {
     let last_stage_name = NAMES.get(last_stage).copied().unwrap_or("unknown");
     eprintln!(
         "[UPDATE_CACHED_STALL_PROFILE] last_stage={} ({})",
-        last_stage,
-        last_stage_name
+        last_stage, last_stage_name
     );
     for (index, name) in NAMES.iter().enumerate() {
         eprintln!(

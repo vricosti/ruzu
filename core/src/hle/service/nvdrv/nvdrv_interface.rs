@@ -5,7 +5,7 @@
 //! Port of zuyu/src/core/hle/service/nvdrv/nvdrv_interface.h
 //! Port of zuyu/src/core/hle/service/nvdrv/nvdrv_interface.cpp
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
 use super::core::container::SessionId;
@@ -92,6 +92,22 @@ impl NvdrvInterface {
             hex.push_str(&format!("{:02x}", byte));
         }
         hex
+    }
+
+    fn read_le_u64_prefix(bytes: &[u8], offset: usize) -> Option<u64> {
+        let end = offset.checked_add(8)?;
+        let slice = bytes.get(offset..end)?;
+        Some(u64::from_le_bytes(slice.try_into().ok()?))
+    }
+
+    fn read_le_u32_prefix(bytes: &[u8], offset: usize) -> u32 {
+        let Some(slice) = bytes.get(offset..offset.saturating_add(4)) else {
+            return 0;
+        };
+        if slice.len() != 4 {
+            return 0;
+        }
+        u32::from_le_bytes(slice.try_into().unwrap())
     }
 
     pub fn new(nvdrv: Arc<Module>) -> Self {
@@ -589,6 +605,52 @@ impl NvdrvService {
         let input = ctx.read_buffer(0);
         let write_size = ctx.get_write_buffer_size(0);
         let mut output = vec![0; write_size];
+        record_nvdrv_ioctl_history(ctx, 1, fd, command, &input, write_size, 0);
+        let nvmap_alloc_address = if command.raw == 0xC020_0104 {
+            NvdrvInterface::read_le_u64_prefix(&input, 24)
+        } else {
+            None
+        };
+        let trace_iocalloc_context = std::env::var_os("RUZU_TRACE_IOCALLOC_CTX").is_some()
+            || nvmap_alloc_address.is_some_and(|address| address < 0x4000_0000);
+        if trace_iocalloc_context && command.raw == 0xC020_0104 {
+            let tid = ctx
+                .get_thread()
+                .map(|thread| thread.lock().unwrap().get_thread_id())
+                .unwrap_or(0);
+            let a_desc = ctx
+                .buffer_descriptor_a()
+                .get(0)
+                .map(|desc| (desc.address(), desc.size()));
+            let x_desc = ctx
+                .buffer_descriptor_x()
+                .get(0)
+                .map(|desc| (desc.address(), desc.size()));
+            let b_desc = ctx
+                .buffer_descriptor_b()
+                .get(0)
+                .map(|desc| (desc.address(), desc.size()));
+            let c_desc = ctx
+                .buffer_descriptor_c()
+                .get(0)
+                .map(|desc| (desc.address(), desc.size()));
+            eprintln!(
+                "[IOCALLOC_CTX] tid={} fd={} tls=0x{:X} ioctl=0x{:08X} in_addr=0x{:X} in_len=0x{:X} write_size=0x{:X} is_out={} A0={:?} X0={:?} B0={:?} C0={:?} input={}",
+                tid,
+                fd,
+                ctx.tls_address(),
+                command.raw,
+                nvmap_alloc_address.unwrap_or(0),
+                input.len(),
+                write_size,
+                command.is_out(),
+                a_desc,
+                x_desc,
+                b_desc,
+                c_desc,
+                NvdrvInterface::format_ioctl_fp_hex(&input),
+            );
+        }
         log::trace!(
             "NVDRV::ioctl1_handler dispatch fd={} ioctl=0x{:08X} in_len=0x{:X} out_len=0x{:X}",
             fd,
@@ -609,7 +671,11 @@ impl NvdrvService {
                 if tid == target_tid {
                     log::warn!(
                         "[IOCTL_TID] tid={} fd={} ioctl=0x{:08X} in_len=0x{:X} out_len=0x{:X}",
-                        tid, fd, command.raw, input.len(), write_size
+                        tid,
+                        fd,
+                        command.raw,
+                        input.len(),
+                        write_size
                     );
                 }
             }
@@ -626,6 +692,7 @@ impl NvdrvService {
             .lock()
             .unwrap()
             .ioctl1(fd, command, &input, &mut output);
+        record_nvdrv_ioctl_history_result(ctx, 1, fd, command, nv_result);
         if let Some(t0) = _ioctl_t0 {
             record_nvdrv_ioctl(command.raw, fd, 1, t0.elapsed());
         }
@@ -752,6 +819,7 @@ impl NvdrvService {
         let input = ctx.read_buffer(0);
         let inline_input = ctx.read_buffer(1);
         let mut output = vec![0; ctx.get_write_buffer_size(0)];
+        record_nvdrv_ioctl_history(ctx, 2, fd, command, &input, output.len(), inline_input.len());
         log::trace!(
             "NVDRV::ioctl2_handler dispatch fd={} ioctl=0x{:08X} in_len=0x{:X} inline_in_len=0x{:X} out_len=0x{:X}",
             fd,
@@ -772,6 +840,7 @@ impl NvdrvService {
             &inline_input,
             &mut output,
         );
+        record_nvdrv_ioctl_history_result(ctx, 2, fd, command, nv_result);
         if let Some(t0) = _ioctl_t0 {
             record_nvdrv_ioctl(command.raw, fd, 2, t0.elapsed());
         }
@@ -813,6 +882,7 @@ impl NvdrvService {
         let input = ctx.read_buffer(0);
         let mut output = vec![0; ctx.get_write_buffer_size(0)];
         let mut inline_output = vec![0; ctx.get_write_buffer_size(1)];
+        record_nvdrv_ioctl_history(ctx, 3, fd, command, &input, output.len(), inline_output.len());
         log::trace!(
             "NVDRV::ioctl3_handler dispatch fd={} ioctl=0x{:08X} in_len=0x{:X} out_len=0x{:X} inline_out_len=0x{:X}",
             fd,
@@ -833,6 +903,7 @@ impl NvdrvService {
             &mut output,
             &mut inline_output,
         );
+        record_nvdrv_ioctl_history_result(ctx, 3, fd, command, nv_result);
         if let Some(t0) = _ioctl_t0 {
             record_nvdrv_ioctl(command.raw, fd, 3, t0.elapsed());
         }
@@ -1034,6 +1105,149 @@ impl ServiceFramework for NvdrvService {
 
     fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
         &self.handlers_tipc
+    }
+}
+
+#[derive(Clone, Copy)]
+struct NvdrvIoctlHistoryEvent {
+    sequence: u64,
+    kind: u8,
+    fd: i32,
+    ioctl: u32,
+    guest_tid: u64,
+    pc: u64,
+    lr: u64,
+    input_len: usize,
+    output_len: usize,
+    inline_len: usize,
+    words: [u32; 8],
+}
+
+static NVDRV_IOCTL_HISTORY: std::sync::OnceLock<Mutex<VecDeque<NvdrvIoctlHistoryEvent>>> =
+    std::sync::OnceLock::new();
+static NVDRV_IOCTL_HISTORY_SEQUENCE: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+const NVDRV_IOCTL_HISTORY_CAPACITY: usize = 4096;
+
+fn record_nvdrv_ioctl_history(
+    ctx: &HLERequestContext,
+    kind: u8,
+    fd: i32,
+    command: Ioctl,
+    input: &[u8],
+    output_len: usize,
+    inline_len: usize,
+) {
+    let (guest_tid, pc, lr) = ctx
+        .get_thread()
+        .map(|thread| {
+            let guard = thread.lock().unwrap();
+            (
+                guard.get_thread_id(),
+                guard.thread_context.pc,
+                guard.thread_context.lr,
+            )
+        })
+        .unwrap_or((0, 0, 0));
+    let mut words = [0u32; 8];
+    for (i, word) in words.iter_mut().enumerate() {
+        *word = NvdrvInterface::read_le_u32_prefix(input, i * 4);
+    }
+    push_nvdrv_ioctl_history(NvdrvIoctlHistoryEvent {
+        sequence: NVDRV_IOCTL_HISTORY_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            + 1,
+        kind,
+        fd,
+        ioctl: command.raw,
+        guest_tid,
+        pc,
+        lr,
+        input_len: input.len(),
+        output_len,
+        inline_len,
+        words,
+    });
+}
+
+fn record_nvdrv_ioctl_history_result(
+    ctx: &HLERequestContext,
+    kind: u8,
+    fd: i32,
+    command: Ioctl,
+    result: NvResult,
+) {
+    let (guest_tid, pc, lr) = ctx
+        .get_thread()
+        .map(|thread| {
+            let guard = thread.lock().unwrap();
+            (
+                guard.get_thread_id(),
+                guard.thread_context.pc,
+                guard.thread_context.lr,
+            )
+        })
+        .unwrap_or((0, 0, 0));
+    let mut words = [0u32; 8];
+    words[0] = result as u32;
+    push_nvdrv_ioctl_history(NvdrvIoctlHistoryEvent {
+        sequence: NVDRV_IOCTL_HISTORY_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            + 1,
+        kind: kind | 0x80,
+        fd,
+        ioctl: command.raw,
+        guest_tid,
+        pc,
+        lr,
+        input_len: 0,
+        output_len: 0,
+        inline_len: 0,
+        words,
+    });
+}
+
+fn push_nvdrv_ioctl_history(event: NvdrvIoctlHistoryEvent) {
+    let mut history = NVDRV_IOCTL_HISTORY
+        .get_or_init(|| Mutex::new(VecDeque::with_capacity(NVDRV_IOCTL_HISTORY_CAPACITY)))
+        .lock()
+        .unwrap();
+    if history.len() == NVDRV_IOCTL_HISTORY_CAPACITY {
+        history.pop_front();
+    }
+    history.push_back(event);
+}
+
+pub fn dump_nvdrv_ioctl_history(reason: &str) {
+    let Some(history) = NVDRV_IOCTL_HISTORY.get() else {
+        return;
+    };
+    let history = history.lock().unwrap();
+    eprintln!(
+        "[NVDRV_IOCTL_HISTORY] reason={} events={}",
+        reason,
+        history.len()
+    );
+    for event in history.iter() {
+        eprintln!(
+            "[NVDRV_IOCTL_HISTORY] #{:05} kind={} fd={} ioctl=0x{:08X} tid={} pc=0x{:X} lr=0x{:X} in=0x{:X} out=0x{:X} inline=0x{:X} words={:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X}",
+            event.sequence,
+            event.kind,
+            event.fd,
+            event.ioctl,
+            event.guest_tid,
+            event.pc,
+            event.lr,
+            event.input_len,
+            event.output_len,
+            event.inline_len,
+            event.words[0],
+            event.words[1],
+            event.words[2],
+            event.words[3],
+            event.words[4],
+            event.words[5],
+            event.words[6],
+            event.words[7],
+        );
     }
 }
 

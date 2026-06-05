@@ -366,11 +366,10 @@ fn trace_bad_aux_read(
     if std::env::var_os("RUZU_TRACE_AUX_READ_BAD").is_none() {
         return;
     }
-    let Some((index, value)) = samples
-        .iter()
-        .copied()
-        .enumerate()
-        .find(|(_, value)| *value == i32::MIN || *value == i32::MAX || value.abs() > 0x0100_0000)
+    let Some((index, value)) =
+        samples.iter().copied().enumerate().find(|(_, value)| {
+            *value == i32::MIN || *value == i32::MAX || value.abs() > 0x0100_0000
+        })
     else {
         return;
     };

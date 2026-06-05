@@ -1579,8 +1579,7 @@ impl System {
 
     /// Set NVDEC active state.
     pub fn set_nvdec_active(&self, is_nvdec_active: bool) {
-        self.nvdec_active
-            .store(is_nvdec_active, Ordering::Relaxed);
+        self.nvdec_active.store(is_nvdec_active, Ordering::Relaxed);
     }
 
     /// Get NVDEC active state.

@@ -4,13 +4,13 @@
 //! Port of zuyu/src/core/hle/service/nvdrv/devices/nvhost_nvdec.h
 //! Port of zuyu/src/core/hle/service/nvdrv/devices/nvhost_nvdec.cpp
 
-use crate::hle::service::nvdrv::core::container::SessionId;
+use crate::core::SystemRef;
 use crate::hle::service::nvdrv::core::container::Container;
+use crate::hle::service::nvdrv::core::container::SessionId;
 use crate::hle::service::nvdrv::core::syncpoint_manager::ChannelType;
 use crate::hle::service::nvdrv::devices::nvdevice::NvDevice;
 use crate::hle::service::nvdrv::devices::nvhost_nvdec_common::{self, NvHostNvDecCommon};
 use crate::hle::service::nvdrv::nvdata::{DeviceFD, Ioctl, NvResult};
-use crate::core::SystemRef;
 
 /// nvhost_nvdec device.
 pub struct NvHostNvDec {

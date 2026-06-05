@@ -255,9 +255,7 @@ impl Sink for CubebSink {
             let out_full: &mut [i16] = if output.is_empty() {
                 &mut []
             } else {
-                unsafe {
-                    std::slice::from_raw_parts_mut(output.as_mut_ptr(), output.len() * chans)
-                }
+                unsafe { std::slice::from_raw_parts_mut(output.as_mut_ptr(), output.len() * chans) }
             };
             process_stream_callback(&stream_handle, st, device_channels, in_full, out_full)
         };

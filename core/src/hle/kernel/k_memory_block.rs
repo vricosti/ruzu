@@ -347,6 +347,20 @@ impl KMemoryInfo {
     pub fn get_disable_merge_attribute(&self) -> KMemoryBlockDisableMergeAttribute {
         self.m_disable_merge_attribute
     }
+
+    /// Port of upstream `KMemoryInfo::GetSvcMemoryInfo()`.
+    pub fn get_svc_memory_info(&self) -> crate::hle::kernel::svc::svc_types::MemoryInfo {
+        crate::hle::kernel::svc::svc_types::MemoryInfo {
+            base_address: self.m_address as u64,
+            size: self.m_size as u64,
+            state: self.get_svc_state(),
+            attribute: (self.m_attribute & KMemoryAttribute::USER_MASK).bits() as u32,
+            permission: (self.m_permission & KMemoryPermission::USER_MASK).bits() as u32,
+            ipc_count: self.m_ipc_lock_count as u32,
+            device_count: self.m_device_use_count as u32,
+            padding: 0,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

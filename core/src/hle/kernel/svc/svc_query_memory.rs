@@ -84,17 +84,8 @@ pub fn query_process_memory(
         .query_info(address as usize)
         .expect("KPageTableBase::query_info must synthesize the terminal inaccessible block");
 
-    // Convert KMemoryInfo to SVC MemoryInfo.
-    let svc_mem_info = MemoryInfo {
-        base_address: mem_info.m_address as u64,
-        size: mem_info.m_size as u64,
-        state: mem_info.get_svc_state(),
-        attribute: mem_info.get_attribute().bits() as u32,
-        permission: mem_info.get_permission().bits() as u32,
-        ipc_count: mem_info.m_ipc_lock_count as u32,
-        device_count: mem_info.m_device_use_count as u32,
-        padding: 0,
-    };
+    let svc_mem_info = mem_info.get_svc_memory_info();
+    super::svc_memory_history::record_query(system, address, &svc_mem_info);
 
     *out_page_info = PageInfo::default();
 
@@ -128,10 +119,50 @@ pub fn query_process_memory(
         }
     }
 
+    if let Some(target) = trace_query_address_target() {
+        let end = svc_mem_info.base_address.saturating_add(svc_mem_info.size);
+        let covers_target = svc_mem_info.base_address <= target && target < end;
+        let query_near_target = address.abs_diff(target) <= 0x20_0000;
+        if covers_target || query_near_target {
+            let tid = system
+                .current_thread()
+                .and_then(|t| t.lock().ok().map(|g| g.get_thread_id()))
+                .unwrap_or(0);
+            eprintln!(
+                "[QUERY_ADDR] tid={} query=0x{:X} target=0x{:X} -> base=0x{:X} size=0x{:X} state=0x{:X} attr=0x{:X} perm=0x{:X} ipc={} dev={}",
+                tid,
+                address,
+                target,
+                svc_mem_info.base_address,
+                svc_mem_info.size,
+                svc_mem_info.state,
+                svc_mem_info.attribute,
+                svc_mem_info.permission,
+                svc_mem_info.ipc_count,
+                svc_mem_info.device_count,
+            );
+        }
+    }
+
     // Write svc_mem_info to user memory at out_memory_info.
     write_memory_info(system, out_memory_info, &svc_mem_info);
 
     RESULT_SUCCESS
+}
+
+fn trace_query_address_target() -> Option<u64> {
+    static TARGET: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *TARGET.get_or_init(|| {
+        let raw = std::env::var("RUZU_TRACE_QUERY_ADDR").ok()?;
+        let raw = raw.trim();
+        let digits = raw
+            .strip_prefix("0x")
+            .or_else(|| raw.strip_prefix("0X"))
+            .unwrap_or(raw);
+        u64::from_str_radix(digits, 16)
+            .ok()
+            .or_else(|| raw.parse::<u64>().ok())
+    })
 }
 
 /// Writes a MemoryInfo struct to guest memory at the given address.

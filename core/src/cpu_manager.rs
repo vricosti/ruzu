@@ -1148,6 +1148,11 @@ impl CpuManager {
                                 tc.r[0],
                                 tc.r[28],
                             );
+                            if zero_pc_break_loop
+                                && std::env::var_os("RUZU_EXIT_ON_NULL_PC").is_some()
+                            {
+                                std::process::exit(101);
+                            }
                         }
                         thread_arc
                             .lock()

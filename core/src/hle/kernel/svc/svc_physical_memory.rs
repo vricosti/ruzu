@@ -14,6 +14,20 @@ fn is_4kb_aligned(val: u64) -> bool {
     val % 4096 == 0
 }
 
+fn trace_physical_memory_svc(system: &System, name: &str, addr: u64, size: u64, result: u32) {
+    if std::env::var_os("RUZU_TRACE_PHYS_MEMORY").is_none() {
+        return;
+    }
+    let tid = system
+        .current_thread()
+        .and_then(|thread| thread.lock().ok().map(|guard| guard.get_thread_id()))
+        .unwrap_or(0);
+    eprintln!(
+        "[PHYS_MEMORY] tid={} {} addr=0x{:X} size=0x{:X} result=0x{:08X}",
+        tid, name, addr, size, result
+    );
+}
+
 /// Set the process heap to a given size. Can both extend and shrink the heap.
 pub fn set_heap_size(out_address: &mut u64, size: u64) -> ResultCode {
     log::trace!("svc::SetHeapSize called, heap_size=0x{:X}", size);
@@ -60,6 +74,7 @@ pub fn set_heap_size_current_process(
         .unwrap()
         .set_heap_size(size as usize);
     *out_address = address.get();
+    super::svc_memory_history::record_heap(system, size, result, *out_address);
     if common::trace::is_enabled(common::trace::cat::HEAP) {
         common::trace::emit_raw(
             common::trace::cat::HEAP,
@@ -79,18 +94,46 @@ pub fn map_physical_memory(system: &System, addr: u64, size: u64) -> ResultCode 
 
     if !is_4kb_aligned(addr) {
         log::error!("Address is not aligned to 4KB, 0x{:016X}", addr);
+        trace_physical_memory_svc(
+            system,
+            "MapPhysicalMemory",
+            addr,
+            size,
+            RESULT_INVALID_ADDRESS.get_inner_value(),
+        );
         return RESULT_INVALID_ADDRESS;
     }
     if !is_4kb_aligned(size) {
         log::error!("Size is not aligned to 4KB, 0x{:X}", size);
+        trace_physical_memory_svc(
+            system,
+            "MapPhysicalMemory",
+            addr,
+            size,
+            RESULT_INVALID_SIZE.get_inner_value(),
+        );
         return RESULT_INVALID_SIZE;
     }
     if size == 0 {
         log::error!("Size is zero");
+        trace_physical_memory_svc(
+            system,
+            "MapPhysicalMemory",
+            addr,
+            size,
+            RESULT_INVALID_SIZE.get_inner_value(),
+        );
         return RESULT_INVALID_SIZE;
     }
     if addr >= addr.wrapping_add(size) {
         log::error!("Size causes 64-bit overflow of address");
+        trace_physical_memory_svc(
+            system,
+            "MapPhysicalMemory",
+            addr,
+            size,
+            RESULT_INVALID_MEMORY_REGION.get_inner_value(),
+        );
         return RESULT_INVALID_MEMORY_REGION;
     }
 
@@ -108,6 +151,13 @@ pub fn map_physical_memory(system: &System, addr: u64, size: u64) -> ResultCode 
             addr,
             size
         );
+        trace_physical_memory_svc(
+            system,
+            "MapPhysicalMemory",
+            addr,
+            size,
+            RESULT_INVALID_MEMORY_REGION.get_inner_value(),
+        );
         return RESULT_INVALID_MEMORY_REGION;
     }
 
@@ -115,6 +165,14 @@ pub fn map_physical_memory(system: &System, addr: u64, size: u64) -> ResultCode 
     let result = process
         .page_table
         .map_physical_memory(addr_kpa, size as usize);
+    super::svc_memory_history::record_physical(
+        system,
+        super::svc_memory_history::MemoryHistoryKind::MapPhysicalMemory,
+        addr,
+        size,
+        result,
+    );
+    trace_physical_memory_svc(system, "MapPhysicalMemory", addr, size, result);
     ResultCode::new(result)
 }
 
@@ -128,18 +186,46 @@ pub fn unmap_physical_memory(system: &System, addr: u64, size: u64) -> ResultCod
 
     if !is_4kb_aligned(addr) {
         log::error!("Address is not aligned to 4KB, 0x{:016X}", addr);
+        trace_physical_memory_svc(
+            system,
+            "UnmapPhysicalMemory",
+            addr,
+            size,
+            RESULT_INVALID_ADDRESS.get_inner_value(),
+        );
         return RESULT_INVALID_ADDRESS;
     }
     if !is_4kb_aligned(size) {
         log::error!("Size is not aligned to 4KB, 0x{:X}", size);
+        trace_physical_memory_svc(
+            system,
+            "UnmapPhysicalMemory",
+            addr,
+            size,
+            RESULT_INVALID_SIZE.get_inner_value(),
+        );
         return RESULT_INVALID_SIZE;
     }
     if size == 0 {
         log::error!("Size is zero");
+        trace_physical_memory_svc(
+            system,
+            "UnmapPhysicalMemory",
+            addr,
+            size,
+            RESULT_INVALID_SIZE.get_inner_value(),
+        );
         return RESULT_INVALID_SIZE;
     }
     if addr >= addr.wrapping_add(size) {
         log::error!("Size causes 64-bit overflow of address");
+        trace_physical_memory_svc(
+            system,
+            "UnmapPhysicalMemory",
+            addr,
+            size,
+            RESULT_INVALID_MEMORY_REGION.get_inner_value(),
+        );
         return RESULT_INVALID_MEMORY_REGION;
     }
 
@@ -154,6 +240,13 @@ pub fn unmap_physical_memory(system: &System, addr: u64, size: u64) -> ResultCod
             addr,
             size
         );
+        trace_physical_memory_svc(
+            system,
+            "UnmapPhysicalMemory",
+            addr,
+            size,
+            RESULT_INVALID_MEMORY_REGION.get_inner_value(),
+        );
         return RESULT_INVALID_MEMORY_REGION;
     }
 
@@ -161,6 +254,14 @@ pub fn unmap_physical_memory(system: &System, addr: u64, size: u64) -> ResultCod
     let result = process
         .page_table
         .unmap_physical_memory(addr_kpa, size as usize);
+    super::svc_memory_history::record_physical(
+        system,
+        super::svc_memory_history::MemoryHistoryKind::UnmapPhysicalMemory,
+        addr,
+        size,
+        result,
+    );
+    trace_physical_memory_svc(system, "UnmapPhysicalMemory", addr, size, result);
     ResultCode::new(result)
 }
 

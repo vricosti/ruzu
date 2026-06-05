@@ -28,6 +28,7 @@ pub mod svc_kernel_debug;
 pub mod svc_light_ipc;
 pub mod svc_lock;
 pub mod svc_memory;
+pub mod svc_memory_history;
 pub mod svc_physical_memory;
 pub mod svc_port;
 pub mod svc_power_management;

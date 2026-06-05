@@ -176,6 +176,17 @@ impl HardwareComposer {
 
         if has_acquired_buffer {
             composition_stack.sort_by_key(|layer| layer.z_index);
+            super::diagnostics::record_hwc(
+                "compose_submit",
+                [
+                    self.frame_number,
+                    composition_stack.len() as u64,
+                    display.id,
+                    swap_interval.unwrap_or(1) as u64,
+                    0,
+                    0,
+                ],
+            );
             nvdisp.composite(&composition_stack);
         }
 
@@ -243,6 +254,17 @@ impl HardwareComposer {
             }
         }
         if status != super::status::Status::NoError {
+            super::diagnostics::record_hwc(
+                "acquire_fail",
+                [
+                    consumer_id as i64 as u64,
+                    status as i32 as u64,
+                    framebuffer.item.slot as i64 as u64,
+                    framebuffer.item.frame_number,
+                    framebuffer.release_frame_number,
+                    u64::from(framebuffer.is_acquired),
+                ],
+            );
             if common::trace::is_enabled(common::trace::cat::HWC)
                 && should_emit_hwc_acquire_status(status)
             {
@@ -267,6 +289,17 @@ impl HardwareComposer {
         framebuffer.release_frame_number =
             normalize_swap_interval(None, framebuffer.item.swap_interval) as u64;
         framebuffer.is_acquired = true;
+        super::diagnostics::record_hwc(
+            "acquire_ok",
+            [
+                consumer_id as i64 as u64,
+                status as i32 as u64,
+                framebuffer.item.slot as i64 as u64,
+                framebuffer.item.frame_number,
+                framebuffer.release_frame_number,
+                framebuffer.item.swap_interval as u64,
+            ],
+        );
         if common::trace::is_enabled(common::trace::cat::HWC) {
             common::trace::emit_raw(
                 common::trace::cat::HWC,

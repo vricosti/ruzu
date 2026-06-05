@@ -8,9 +8,7 @@
 //! (Null, OpenGL, Vulkan) provides its own implementation.
 
 use crate::control::channel_state::ChannelState;
-use crate::engines::draw_manager::{
-    Maxwell3DClearView, Maxwell3DDrawView, Maxwell3DIndirectView,
-};
+use crate::engines::draw_manager::{Maxwell3DClearView, Maxwell3DDrawView, Maxwell3DIndirectView};
 use crate::engines::fermi_2d::{Config as Fermi2DConfig, Surface as Fermi2DSurface};
 use crate::query_cache::types::QueryPropertiesFlags;
 

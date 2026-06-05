@@ -173,19 +173,23 @@ impl ProfileManager {
     }
 
     pub fn create_new_user(&mut self, uuid: u128, username: &ProfileUsername) -> ResultCode {
+        if self.user_count == MAX_USERS {
+            return super::errors::RESULT_INVALID_ARRAY_LENGTH;
+        }
         if uuid == 0 {
             return super::errors::RESULT_INVALID_USER_ID;
         }
-        if self.user_exists(uuid) {
+        if username[0] == 0 {
+            return super::errors::RESULT_INVALID_USER_ID;
+        }
+        if self.profiles.iter().any(|profile| profile.user_uuid == uuid) {
             return super::errors::RESULT_ACCOUNT_UPDATE_FAILED;
         }
+        self.is_save_needed = true;
         let info = ProfileInfo {
             user_uuid: uuid,
             username: *username,
-            creation_time: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs(),
+            creation_time: 0,
             data: UserData::default(),
             is_open: false,
         };
@@ -193,7 +197,7 @@ impl ProfileManager {
     }
 
     pub fn get_user(&self, index: usize) -> Option<u128> {
-        if index >= self.user_count {
+        if index >= MAX_USERS {
             return None;
         }
         Some(self.profiles[index].user_uuid)
@@ -258,7 +262,7 @@ impl ProfileManager {
     }
 
     pub fn user_exists_index(&self, index: usize) -> bool {
-        index < self.user_count
+        index < MAX_USERS && self.profiles[index].user_uuid != 0
     }
 
     pub fn open_user(&mut self, uuid: u128) {
@@ -287,7 +291,7 @@ impl ProfileManager {
 
     pub fn get_all_users(&self) -> UserIdArray {
         let mut users = [0u128; MAX_USERS];
-        for (i, profile) in self.profiles[..self.user_count].iter().enumerate() {
+        for (i, profile) in self.profiles.iter().enumerate() {
             users[i] = profile.user_uuid;
         }
         users
@@ -309,11 +313,18 @@ impl ProfileManager {
     }
 
     pub fn store_opened_users(&mut self) {
-        self.stored_opened_profiles = self.profiles.clone();
+        self.stored_opened_profiles = Default::default();
+        let mut profile_index = 0;
+        for profile in self.profiles.iter() {
+            if profile.is_open {
+                self.stored_opened_profiles[profile_index] = profile.clone();
+                profile_index += 1;
+            }
+        }
     }
 
     pub fn can_system_register_user(&self) -> bool {
-        self.user_count < MAX_USERS
+        true
     }
 
     pub fn remove_user(&mut self, uuid: u128) -> bool {
@@ -326,6 +337,11 @@ impl ProfileManager {
 
     pub fn set_profile_base(&mut self, uuid: u128, profile_new: &ProfileBase) -> bool {
         if let Some(idx) = self.get_user_index(uuid) {
+            let new_uuid = u128::from_le_bytes(profile_new.user_uuid);
+            if new_uuid == 0 {
+                return false;
+            }
+            self.profiles[idx].user_uuid = new_uuid;
             self.profiles[idx].username = profile_new.username;
             self.profiles[idx].creation_time = profile_new.timestamp;
             self.is_save_needed = true;
@@ -342,11 +358,12 @@ impl ProfileManager {
         data_new: &UserData,
     ) -> bool {
         if let Some(idx) = self.get_user_index(uuid) {
-            self.profiles[idx].username = profile_new.username;
-            self.profiles[idx].creation_time = profile_new.timestamp;
-            self.profiles[idx].data = *data_new;
-            self.is_save_needed = true;
-            true
+            if self.set_profile_base(uuid, profile_new) {
+                self.profiles[idx].data = *data_new;
+                self.is_save_needed = true;
+                return true;
+            }
+            false
         } else {
             false
         }
@@ -453,21 +470,18 @@ impl ProfileManager {
         let idx = self.user_count;
         self.profiles[idx] = profile.clone();
         self.user_count += 1;
-        self.is_save_needed = true;
         Some(idx)
     }
 
     fn remove_profile_at_index(&mut self, index: usize) -> bool {
-        if index >= self.user_count {
+        if index >= MAX_USERS || index >= self.user_count {
             return false;
         }
-        self.profiles[index] = ProfileInfo::default();
-        self.profiles.sort_by_key(|profile| profile.user_uuid == 0);
-        self.user_count = self
-            .profiles
-            .iter()
-            .filter(|profile| profile.user_uuid != 0)
-            .count();
+        if index < self.user_count - 1 {
+            self.profiles[index..].rotate_left(1);
+        }
+        self.profiles[MAX_USERS - 1] = ProfileInfo::default();
+        self.user_count -= 1;
         self.is_save_needed = true;
         true
     }
@@ -475,7 +489,7 @@ impl ProfileManager {
 
 #[cfg(test)]
 mod tests {
-    use super::{ProfileManager, PROFILE_USERNAME_SIZE};
+    use super::{ProfileBase, ProfileManager, MAX_USERS, PROFILE_USERNAME_SIZE};
     use common::fs::path_util::{set_ruzu_path, RuzuPath};
     use common::uuid::UUID;
 
@@ -506,9 +520,64 @@ mod tests {
             manager.get_profile_base(Some(0)).unwrap().username,
             expected_name
         );
+        assert_eq!(manager.get_profile_base(Some(0)).unwrap().timestamp, 0);
 
         let user_bytes = user.to_le_bytes();
         assert_ne!(user_bytes, UUID::new().uuid);
+    }
+
+    #[test]
+    fn profile_manager_create_new_user_matches_upstream_validation() {
+        let base = std::env::temp_dir().join(format!(
+            "ruzu_profile_manager_create_validation_test_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&base).unwrap();
+        set_ruzu_path(RuzuPath::NANDDir, &base);
+        common::settings::values_mut().current_user.set_value(0);
+
+        let mut manager = ProfileManager::new();
+        let before_count = manager.get_user_count();
+        let empty_name = [0u8; PROFILE_USERNAME_SIZE];
+        let result = manager.create_new_user(0x1234, &empty_name);
+
+        assert_eq!(result, super::super::errors::RESULT_INVALID_USER_ID);
+        assert_eq!(manager.get_user_count(), before_count);
+        assert!(manager.get_user(MAX_USERS).is_none());
+        assert!(manager.get_user(before_count).is_some());
+    }
+
+    #[test]
+    fn profile_manager_set_profile_base_replaces_uuid() {
+        let base = std::env::temp_dir().join(format!(
+            "ruzu_profile_manager_set_base_test_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&base).unwrap();
+        set_ruzu_path(RuzuPath::NANDDir, &base);
+        common::settings::values_mut().current_user.set_value(0);
+
+        let mut manager = ProfileManager::new();
+        let old_uuid = manager.get_user(0).unwrap();
+        let new_uuid = 0x1122_3344_5566_7788_99AA_BBCC_DDEE_F001u128;
+        let mut profile = ProfileBase::default();
+        profile.user_uuid = new_uuid.to_le_bytes();
+        profile.timestamp = 0x55AA;
+        profile.username[..4].copy_from_slice(b"mii0");
+
+        assert!(manager.set_profile_base(old_uuid, &profile));
+        assert_eq!(manager.get_user(0), Some(new_uuid));
+        let updated = manager.get_profile_base_by_uuid(new_uuid).unwrap();
+        assert_eq!(updated.timestamp, 0x55AA);
+        assert_eq!(&updated.username[..4], b"mii0");
     }
 
     #[test]

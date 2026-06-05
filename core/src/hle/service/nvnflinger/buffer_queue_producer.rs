@@ -231,6 +231,7 @@ impl BufferQueueProducer {
 
     pub fn request_buffer(&self, slot: i32) -> (Status, Option<Arc<GraphicBuffer>>) {
         record_bqp_event(BqpEvent::RequestBuffer);
+        super::diagnostics::record_bqp("request_buffer", [slot as i64 as u64, 0, 0, 0, 0, 0]);
         trace_bqp(format_args!("BQP::request_buffer slot={}", slot));
         let mut inner = self.core.mutex.lock().unwrap();
         if inner.is_abandoned {
@@ -274,6 +275,10 @@ impl BufferQueueProducer {
 
     pub fn set_buffer_count(&self, buffer_count: i32) -> Status {
         record_bqp_event(BqpEvent::SetBufferCount);
+        super::diagnostics::record_bqp(
+            "set_buffer_count",
+            [buffer_count as i64 as u64, 0, 0, 0, 0, 0],
+        );
         trace_bqp(format_args!("BQP::set_buffer_count count={}", buffer_count));
         log::info!("[BQP_SET_COUNT] buffer_count={}", buffer_count);
         let mut inner = self.core.mutex.lock().unwrap();
@@ -342,6 +347,17 @@ impl BufferQueueProducer {
     ) -> (i32, i32, Fence) {
         record_bqp_event(BqpEvent::DequeueBuffer);
         let bqp_seq = next_bqp_seq();
+        super::diagnostics::record_bqp(
+            "dequeue_enter",
+            [
+                bqp_seq,
+                u64::from(async_flag),
+                width as u64,
+                height as u64,
+                format as u64,
+                usage as u64,
+            ],
+        );
         trace_bqp_ring(&[
             1,
             bqp_seq,
@@ -505,12 +521,27 @@ impl BufferQueueProducer {
             return_flags as i64 as u64,
             current_bqp_tid(),
         ]);
+        super::diagnostics::record_bqp(
+            "dequeue_return",
+            [
+                bqp_seq,
+                Status::NoError as i32 as u64,
+                out_slot as i64 as u64,
+                return_flags as i64 as u64,
+                current_bqp_tid(),
+                0,
+            ],
+        );
         (return_flags, out_slot, out_fence)
     }
 
     pub fn queue_buffer(&self, slot: i32, input: &QueueBufferInput) -> (Status, QueueBufferOutput) {
         record_bqp_event(BqpEvent::QueueBuffer);
         let bqp_seq = next_bqp_seq();
+        super::diagnostics::record_bqp(
+            "queue_enter",
+            [bqp_seq, slot as i64 as u64, current_bqp_tid(), 0, 0, 0],
+        );
         trace_bqp_ring(&[3, bqp_seq, slot as i64 as u64, current_bqp_tid()]);
         trace_bqp(format_args!("BQP::queue_buffer slot={}", slot));
         {
@@ -557,12 +588,22 @@ impl BufferQueueProducer {
             && inner.override_max_buffer_count != 0
             && inner.override_max_buffer_count < max_buffer_count
         {
-            trace_bqp_ring(&[5, bqp_seq, Status::BadValue as i32 as u64, slot as i64 as u64]);
+            trace_bqp_ring(&[
+                5,
+                bqp_seq,
+                Status::BadValue as i32 as u64,
+                slot as i64 as u64,
+            ]);
             return (Status::BadValue, QueueBufferOutput::new());
         }
 
         if slot < 0 || slot >= max_buffer_count {
-            trace_bqp_ring(&[5, bqp_seq, Status::BadValue as i32 as u64, slot as i64 as u64]);
+            trace_bqp_ring(&[
+                5,
+                bqp_seq,
+                Status::BadValue as i32 as u64,
+                slot as i64 as u64,
+            ]);
             return (Status::BadValue, QueueBufferOutput::new());
         }
 
@@ -573,7 +614,12 @@ impl BufferQueueProducer {
                 slot,
                 inner.slots[s].buffer_state
             );
-            trace_bqp_ring(&[5, bqp_seq, Status::BadValue as i32 as u64, slot as i64 as u64]);
+            trace_bqp_ring(&[
+                5,
+                bqp_seq,
+                Status::BadValue as i32 as u64,
+                slot as i64 as u64,
+            ]);
             return (Status::BadValue, QueueBufferOutput::new());
         }
         if !inner.slots[s].request_buffer_called {
@@ -581,7 +627,12 @@ impl BufferQueueProducer {
                 "BufferQueueProducer::queue_buffer: slot {} queued without RequestBuffer",
                 slot
             );
-            trace_bqp_ring(&[5, bqp_seq, Status::BadValue as i32 as u64, slot as i64 as u64]);
+            trace_bqp_ring(&[
+                5,
+                bqp_seq,
+                Status::BadValue as i32 as u64,
+                slot as i64 as u64,
+            ]);
             return (Status::BadValue, QueueBufferOutput::new());
         }
 
@@ -590,7 +641,12 @@ impl BufferQueueProducer {
                 "BufferQueueProducer::queue_buffer: slot {} missing graphic buffer",
                 slot
             );
-            trace_bqp_ring(&[5, bqp_seq, Status::BadValue as i32 as u64, slot as i64 as u64]);
+            trace_bqp_ring(&[
+                5,
+                bqp_seq,
+                Status::BadValue as i32 as u64,
+                slot as i64 as u64,
+            ]);
             return (Status::BadValue, QueueBufferOutput::new());
         };
         let buffer_rect = Rectangle::new(
@@ -608,7 +664,12 @@ impl BufferQueueProducer {
                     slot,
                     buffer_rect
                 );
-                trace_bqp_ring(&[5, bqp_seq, Status::BadValue as i32 as u64, slot as i64 as u64]);
+                trace_bqp_ring(&[
+                    5,
+                    bqp_seq,
+                    Status::BadValue as i32 as u64,
+                    slot as i64 as u64,
+                ]);
                 return (Status::BadValue, QueueBufferOutput::new());
             }
         }
@@ -689,6 +750,17 @@ impl BufferQueueProducer {
             u64::from(inner.slots[s].acquire_called),
             current_bqp_tid(),
         ]);
+        super::diagnostics::record_bqp(
+            "queue_commit",
+            [
+                bqp_seq,
+                slot as i64 as u64,
+                frame_num,
+                queue_len,
+                u64::from(inner.dequeue_buffer_cannot_block || async_flag),
+                u64::from(inner.slots[s].acquire_called),
+            ],
+        );
 
         let mut output = QueueBufferOutput::new();
         output.inflate(
@@ -745,11 +817,26 @@ impl BufferQueueProducer {
             slot as i64 as u64,
             current_bqp_tid(),
         ]);
+        super::diagnostics::record_bqp(
+            "queue_return",
+            [
+                bqp_seq,
+                Status::NoError as i32 as u64,
+                slot as i64 as u64,
+                current_bqp_tid(),
+                0,
+                0,
+            ],
+        );
         (Status::NoError, output)
     }
 
     pub fn cancel_buffer(&self, slot: i32, fence: &Fence) {
         record_bqp_event(BqpEvent::CancelBuffer);
+        super::diagnostics::record_bqp(
+            "cancel_buffer",
+            [slot as i64 as u64, current_bqp_tid(), 0, 0, 0, 0],
+        );
         trace_bqp_ring(&[6, next_bqp_seq(), slot as i64 as u64, current_bqp_tid()]);
         let mut inner = self.core.mutex.lock().unwrap();
         if inner.is_abandoned {
@@ -800,6 +887,17 @@ impl BufferQueueProducer {
         producer_controlled_by_app: bool,
     ) -> (Status, QueueBufferOutput) {
         record_bqp_event(BqpEvent::Connect);
+        super::diagnostics::record_bqp(
+            "connect",
+            [
+                api as i32 as u64,
+                u64::from(producer_controlled_by_app),
+                current_bqp_tid(),
+                0,
+                0,
+                0,
+            ],
+        );
         trace_bqp(format_args!(
             "BQP::connect api={:?} producer_controlled_by_app={}",
             api, producer_controlled_by_app
@@ -853,6 +951,10 @@ impl BufferQueueProducer {
 
     pub fn disconnect(&self, api: NativeWindowApi) -> Status {
         record_bqp_event(BqpEvent::Disconnect);
+        super::diagnostics::record_bqp(
+            "disconnect",
+            [api as i32 as u64, current_bqp_tid(), 0, 0, 0, 0],
+        );
         let mut inner = self.core.mutex.lock().unwrap();
 
         if inner.is_abandoned {
@@ -885,6 +987,26 @@ impl BufferQueueProducer {
         buffer: Option<Arc<NvGraphicBuffer>>,
     ) -> Status {
         record_bqp_event(BqpEvent::SetPreallocatedBuffer);
+        let (buffer_handle, buffer_width, buffer_height, buffer_size) =
+            buffer.as_ref().map_or((0, 0, 0, 0), |buf| {
+                (
+                    buf.get_handle() as u64,
+                    buf.get_width() as u64,
+                    buf.get_height() as u64,
+                    buf.get_stride() as u64,
+                )
+            });
+        super::diagnostics::record_bqp(
+            "set_preallocated",
+            [
+                slot as i64 as u64,
+                buffer_handle,
+                buffer_width,
+                buffer_height,
+                buffer_size,
+                current_bqp_tid(),
+            ],
+        );
         if let Some(buf) = buffer.as_ref() {
             trace_bqp(format_args!(
                 "BQP::set_preallocated_buffer slot={} magic=0x{:08X} w={} h={} stride={} fmt={:?} usage=0x{:X} buffer_id={} ext_fmt={:?} handle={} offset={}",

@@ -486,7 +486,12 @@ impl GraphicsPipeline {
                 self.source_programs,
             );
         }
-        dump_glsl_for_pipeline_handle(self.program_pipeline, self.key.hash_key(), &self.glsl_sources);
+        dump_glsl_for_pipeline_handle(
+            self.program_pipeline,
+            self.key.hash_key(),
+            &self.glsl_sources,
+        );
+        dump_pipeline_metadata_for_handle(self);
 
         Ok(())
     }
@@ -640,7 +645,11 @@ fn dump_glsl_on_error(pipeline_hash: u64, stage_index: usize, source: &str, erro
     let log_path = dir.join(format!("{}.log", stem));
 
     if let Err(err) = std::fs::write(&source_path, source) {
-        log::warn!("Failed to dump GLSL source {}: {}", source_path.display(), err);
+        log::warn!(
+            "Failed to dump GLSL source {}: {}",
+            source_path.display(),
+            err
+        );
     }
     let log = format!(
         "pipeline_hash=0x{:016X}\nstage_index={}\nstage={}\nsource_bytes={}\n\n{}",
@@ -651,7 +660,11 @@ fn dump_glsl_on_error(pipeline_hash: u64, stage_index: usize, source: &str, erro
         error
     );
     if let Err(err) = std::fs::write(&log_path, log) {
-        log::warn!("Failed to dump GLSL error log {}: {}", log_path.display(), err);
+        log::warn!(
+            "Failed to dump GLSL error log {}: {}",
+            log_path.display(),
+            err
+        );
     }
 }
 
@@ -714,6 +727,78 @@ fn dump_glsl_for_pipeline_handle(
                 path.display()
             );
         }
+    }
+}
+
+fn dump_pipeline_metadata_for_handle(pipeline: &GraphicsPipeline) {
+    let handle = pipeline.program_pipeline;
+    if handle == 0 || !should_dump_pipeline_handle(handle) {
+        return;
+    }
+    let dir = std::env::var_os("RUZU_DUMP_GLSL_PIPELINE_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from("/tmp/ruzu_pipeline_glsl"));
+    if let Err(err) = std::fs::create_dir_all(&dir) {
+        log::warn!(
+            "Failed to create RUZU_DUMP_GLSL_PIPELINE_DIR {}: {}",
+            dir.display(),
+            err
+        );
+        return;
+    }
+
+    let mut text = String::new();
+    use std::fmt::Write as _;
+    let _ = writeln!(text, "pipeline={}", handle);
+    let _ = writeln!(text, "pipeline_hash=0x{:016X}", pipeline.key.hash_key());
+    let _ = writeln!(
+        text,
+        "enabled_uniform_buffer_masks={:X?}",
+        pipeline.enabled_uniform_buffer_masks
+    );
+    let _ = writeln!(
+        text,
+        "base_uniform_bindings={:?}",
+        pipeline.base_uniform_bindings
+    );
+    let _ = writeln!(
+        text,
+        "base_storage_bindings={:?}",
+        pipeline.base_storage_bindings
+    );
+    let _ = writeln!(
+        text,
+        "enabled_stages_mask=0x{:X}",
+        pipeline.enabled_stages_mask
+    );
+    for stage in 0..NUM_STAGES {
+        let _ = writeln!(
+            text,
+            "stage{} uniform_sizes={:?}",
+            stage, pipeline.uniform_buffer_sizes[stage]
+        );
+        if let Some(info) = &pipeline.stage_infos[stage] {
+            let _ = writeln!(
+                text,
+                "stage{} info_cbuf_mask=0x{:X} descriptors={:?}",
+                stage, info.constant_buffer_mask, info.constant_buffer_descriptors
+            );
+        } else {
+            let _ = writeln!(text, "stage{} info=None", stage);
+        }
+    }
+
+    let path = dir.join(format!(
+        "pipeline_{}_key_{:016X}_metadata.txt",
+        handle,
+        pipeline.key.hash_key()
+    ));
+    if let Err(err) = std::fs::write(&path, text) {
+        log::warn!(
+            "Failed to dump pipeline metadata {}: {}",
+            path.display(),
+            err
+        );
     }
 }
 

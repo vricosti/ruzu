@@ -167,7 +167,11 @@ impl KClientPort {
 
         process.register_session_object(session_object_id, session.clone());
         let client_session = session.lock().unwrap().get_client_session().clone();
-        process.register_client_session_object(client_session_object_id, client_session);
+        process.register_client_session_object(
+            client_session_object_id,
+            client_session,
+            session_object_id,
+        );
 
         session_reservation.commit();
         Ok((session_object_id, client_session_object_id))

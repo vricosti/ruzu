@@ -144,8 +144,7 @@ fn decompress_bc4_unorm_blocks(input: &[u8], output: &mut [u8], copy: &BufferIma
                 src_offset += block_size as usize;
                 dst_offset += (block_width * out_bpp) as usize;
             }
-            input_offset +=
-                (copy.buffer_row_length * block_size / block_width) as usize;
+            input_offset += (copy.buffer_row_length * block_size / block_width) as usize;
             output_offset += (block_height * pitch) as usize;
         }
     }
@@ -251,9 +250,8 @@ mod tests {
         assert_eq!(
             output,
             [
-                0x11, 0x11, 0x11, 0x11, 0x22,
-                0x11, 0x11, 0x11, 0x11, 0x22,
-                0x11, 0x11, 0x11, 0x11, 0x22,
+                0x11, 0x11, 0x11, 0x11, 0x22, 0x11, 0x11, 0x11, 0x11, 0x22, 0x11, 0x11, 0x11, 0x11,
+                0x22,
             ]
         );
     }

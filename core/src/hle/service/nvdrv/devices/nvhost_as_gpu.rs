@@ -716,13 +716,7 @@ impl NvHostAsGpu {
                     alloc_big_pages
                 );
             }
-            Self::trace_gpu_va_map(
-                params.handle,
-                size,
-                offset,
-                params.flags,
-                params.kind,
-            );
+            Self::trace_gpu_va_map(params.handle, size, offset, params.flags, params.kind);
             return NvResult::Success;
         }
 
@@ -809,7 +803,14 @@ impl NvHostAsGpu {
         let seq = SEQ.fetch_add(1, Ordering::Relaxed);
         common::trace::emit_raw(
             common::trace::cat::GPU_VA_MAP,
-            &[seq as u64, handle as u64, size, gpu_va, flags as u64, kind as u64],
+            &[
+                seq as u64,
+                handle as u64,
+                size,
+                gpu_va,
+                flags as u64,
+                kind as u64,
+            ],
         );
     }
 
@@ -820,10 +821,7 @@ impl NvHostAsGpu {
         use std::sync::atomic::{AtomicUsize, Ordering};
         static SEQ: AtomicUsize = AtomicUsize::new(0);
         let seq = SEQ.fetch_add(1, Ordering::Relaxed);
-        common::trace::emit_raw(
-            common::trace::cat::GPU_VA_UNMAP,
-            &[seq as u64, offset],
-        );
+        common::trace::emit_raw(common::trace::cat::GPU_VA_UNMAP, &[seq as u64, offset]);
     }
 
     pub fn unmap_buffer(&self, params: &mut IoctlUnmapBuffer) -> NvResult {
