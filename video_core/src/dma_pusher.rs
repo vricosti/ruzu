@@ -11,8 +11,8 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
-use crate::engines::engine_interface::{EngineHandle, EngineInterface};
 use crate::engines::engine_interface::EngineTypes;
+use crate::engines::engine_interface::{EngineHandle, EngineInterface};
 use crate::engines::puller::{EngineID, MethodCall, Puller};
 use common::settings;
 use parking_lot::Mutex;

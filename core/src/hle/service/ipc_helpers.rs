@@ -318,9 +318,7 @@ impl<'a> ResponseBuilder<'a> {
                 parent_wakeup.clone(),
             ) {
                 (Some(sm), Some(q), Some(w)) => std::sync::Arc::new(std::sync::Mutex::new(
-                    super::hle_ipc::SessionRequestManager::new_with_server_manager_full(
-                        sm, q, w,
-                    ),
+                    super::hle_ipc::SessionRequestManager::new_with_server_manager_full(sm, q, w),
                 )),
                 (Some(sm), _, _) => std::sync::Arc::new(std::sync::Mutex::new(
                     super::hle_ipc::SessionRequestManager::new_with_server_manager(sm),

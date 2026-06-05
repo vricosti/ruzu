@@ -112,7 +112,8 @@ fn should_emit_host_thread_ipc(session_handle: Handle) -> bool {
     common::trace::is_enabled(common::trace::cat::HOST_THREAD_IPC)
         && trace_filter_matches(
             session_handle as u64,
-            HANDLE_FILTER.get_or_init(|| parse_trace_filter_list("RUZU_TRACE_HOST_THREAD_IPC_HANDLE")),
+            HANDLE_FILTER
+                .get_or_init(|| parse_trace_filter_list("RUZU_TRACE_HOST_THREAD_IPC_HANDLE")),
         )
 }
 

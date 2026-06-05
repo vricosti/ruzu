@@ -6,6 +6,7 @@
 //! Wraps FFmpeg types (AVPacket, AVFrame, AVCodec, AVCodecContext) for video
 //! decoding.
 
+use std::ffi::CStr;
 use std::sync::Arc;
 
 use crate::host1x::nvdec_common::VideoCodec;
@@ -25,6 +26,8 @@ mod ffi {
             size: uintptr_t,
         ) -> c_int;
         pub fn ruzu_ffmpeg_decoder_receive_frame(decoder: *mut RuzuFfmpegDecoder) -> *mut AVFrame;
+        pub fn ruzu_ffmpeg_decoder_last_error(decoder: *const RuzuFfmpegDecoder) -> c_int;
+        pub fn ruzu_ffmpeg_error_string(errnum: c_int, out: *mut i8, out_size: uintptr_t);
         pub fn ruzu_ffmpeg_frame_destroy(frame: *mut AVFrame);
         pub fn ruzu_ffmpeg_frame_width(frame: *const AVFrame) -> c_int;
         pub fn ruzu_ffmpeg_frame_height(frame: *const AVFrame) -> c_int;
@@ -32,6 +35,16 @@ mod ffi {
         pub fn ruzu_ffmpeg_frame_stride(frame: *const AVFrame, plane: c_int) -> c_int;
         pub fn ruzu_ffmpeg_frame_plane(frame: *const AVFrame, plane: c_int) -> *const c_uchar;
         pub fn ruzu_ffmpeg_frame_interlaced(frame: *const AVFrame) -> c_int;
+    }
+}
+
+fn av_error(ret: i32) -> String {
+    let mut buffer = [0i8; 128];
+    unsafe {
+        ffi::ruzu_ffmpeg_error_string(ret, buffer.as_mut_ptr(), buffer.len());
+        CStr::from_ptr(buffer.as_ptr())
+            .to_string_lossy()
+            .into_owned()
     }
 }
 
@@ -232,8 +245,8 @@ impl DecoderContext {
         };
         if ret < 0 {
             log::error!(
-                "FFmpeg::DecoderContext::send_packet: avcodec_send_packet error {}",
-                ret
+                "FFmpeg::DecoderContext::send_packet: avcodec_send_packet error: {}",
+                av_error(ret)
             );
             return false;
         }
@@ -246,6 +259,13 @@ impl DecoderContext {
         }
         let frame = unsafe { ffi::ruzu_ffmpeg_decoder_receive_frame(self.raw) };
         if frame.is_null() {
+            let ret = unsafe { ffi::ruzu_ffmpeg_decoder_last_error(self.raw.cast_const()) };
+            if ret < 0 {
+                log::error!(
+                    "FFmpeg::DecoderContext::receive_frame: avcodec_receive_frame error: {}",
+                    av_error(ret)
+                );
+            }
             return None;
         }
         Some(Arc::new(Frame::from_raw(frame)))

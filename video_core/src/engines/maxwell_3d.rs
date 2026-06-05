@@ -3294,24 +3294,20 @@ impl dm::Maxwell3DAccess for Maxwell3D {
         self.dirty.flags[index as usize] = false;
     }
 
-    fn with_rasterizer_mut(
-        &mut self,
-        f: &mut dyn FnMut(&mut dyn RasterizerInterface),
-    ) -> bool {
+    fn with_rasterizer_mut(&mut self, f: &mut dyn FnMut(&mut dyn RasterizerInterface)) -> bool {
         Maxwell3D::with_rasterizer_mut(self, |rasterizer| f(rasterizer)).is_some()
     }
 
-    fn draw_rasterizer(
-        &mut self,
-        draw_state: &dm::DrawState,
-        instance_count: u32,
-    ) -> bool {
+    fn draw_rasterizer(&mut self, draw_state: &dm::DrawState, instance_count: u32) -> bool {
         let Some(handle) = self.rasterizer else {
             return false;
         };
         unsafe {
             handle.with_mut(|rasterizer| {
-                rasterizer.draw(dm::Maxwell3DDrawView::live(draw_state, self), instance_count);
+                rasterizer.draw(
+                    dm::Maxwell3DDrawView::live(draw_state, self),
+                    instance_count,
+                );
             });
         }
         true
@@ -3479,6 +3475,10 @@ impl dm::Maxwell3DAccess for Maxwell3D {
 
     fn rasterizer_info(&self) -> RasterizerInfo {
         self.rasterizer_info()
+    }
+
+    fn rasterize_enable(&self) -> bool {
+        self.rasterize_enable()
     }
 
     fn program_base_address(&self) -> u64 {
@@ -5500,9 +5500,15 @@ mod tests {
         assert_eq!(BlendFactor::from_raw(0x06), BlendFactor::OneMinusSrcAlpha);
         assert_eq!(BlendFactor::from_raw(0x0B), BlendFactor::SrcAlphaSaturate);
         assert_eq!(BlendFactor::from_raw(0x0C), BlendFactor::ConstantAlpha);
-        assert_eq!(BlendFactor::from_raw(0x0D), BlendFactor::OneMinusConstantAlpha);
+        assert_eq!(
+            BlendFactor::from_raw(0x0D),
+            BlendFactor::OneMinusConstantAlpha
+        );
         assert_eq!(BlendFactor::from_raw(0x0E), BlendFactor::ConstantColor);
-        assert_eq!(BlendFactor::from_raw(0x0F), BlendFactor::OneMinusConstantColor);
+        assert_eq!(
+            BlendFactor::from_raw(0x0F),
+            BlendFactor::OneMinusConstantColor
+        );
         assert_eq!(BlendFactor::from_raw(0x10), BlendFactor::Src1Color);
         assert_eq!(BlendFactor::from_raw(0x11), BlendFactor::OneMinusSrc1Color);
         assert_eq!(BlendFactor::from_raw(0x12), BlendFactor::Src1Alpha);
@@ -7732,7 +7738,8 @@ mod tests {
         let mut engine = Maxwell3D::new();
         engine.regs[0xD1B] = 0xFF;
 
-        engine.hle_draw_arrays_indirect(true, &[PrimitiveTopology::Triangles as u32, 6, 0x22, 4, 7]);
+        engine
+            .hle_draw_arrays_indirect(true, &[PrimitiveTopology::Triangles as u32, 6, 0x22, 4, 7]);
 
         let draws = engine.take_draw_calls();
         assert_eq!(draws.len(), 1);

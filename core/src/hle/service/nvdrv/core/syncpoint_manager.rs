@@ -408,7 +408,9 @@ mod tests {
 
         assert!(manager.is_syncpoint_allocated(26));
         assert!(manager.is_syncpoint_allocated(27));
-        assert!(manager.is_syncpoint_allocated(CHANNEL_SYNCPOINTS[ChannelType::VIC as usize] as u32));
+        assert!(
+            manager.is_syncpoint_allocated(CHANNEL_SYNCPOINTS[ChannelType::VIC as usize] as u32)
+        );
         assert!(
             manager.is_syncpoint_allocated(CHANNEL_SYNCPOINTS[ChannelType::NvDec as usize] as u32)
         );

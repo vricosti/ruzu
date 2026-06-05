@@ -198,23 +198,9 @@ impl AccU0 {
         let uuid = rp.pop_raw::<u128>();
         let (_rc, iprofile) = svc.interface.get_profile(uuid);
 
-        let is_domain = ctx
-            .get_manager()
-            .map_or(false, |m| m.lock().unwrap().is_domain());
-        let move_handle = if is_domain {
-            0
-        } else {
-            ctx.create_session_for_service(iprofile.clone())
-                .unwrap_or(0)
-        };
-
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 1);
         rb.push_result(RESULT_SUCCESS);
-        if is_domain {
-            ctx.add_domain_object(iprofile);
-        } else {
-            rb.push_move_objects(move_handle);
-        }
+        rb.push_ipc_interface(iprofile);
     }
 
     fn is_user_registration_request_permitted_handler(
@@ -281,22 +267,10 @@ impl AccU0 {
     ) {
         let svc = unsafe { &*(this as *const dyn ServiceFramework as *const AccU0) };
         let (rc, object) = svc.interface.get_baas_account_manager_for_application();
-        let is_domain = ctx
-            .get_manager()
-            .map_or(false, |manager| manager.lock().unwrap().is_domain());
-        let move_handle = if is_domain {
-            0
-        } else {
-            ctx.create_session_for_service(object.clone()).unwrap_or(0)
-        };
 
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 1);
         rb.push_result(rc);
-        if is_domain {
-            ctx.add_domain_object(object);
-        } else {
-            rb.push_move_objects(move_handle);
-        }
+        rb.push_ipc_interface(object);
     }
 
     fn list_qualified_users_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {

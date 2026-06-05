@@ -74,9 +74,7 @@ fn should_trace_cpu_write(addr: DAddr, size: u64) -> bool {
         return false;
     };
     let end = addr.saturating_add(size);
-    targets
-        .iter()
-        .any(|&target| addr <= target && target < end)
+    targets.iter().any(|&target| addr <= target && target < end)
 }
 
 /// Render target format enumeration.
@@ -264,6 +262,33 @@ impl Gpu {
         // Upstream also does:
         // host1x.MemoryManager().BindInterface(rasterizer);
         // host1x.GMMU().BindRasterizer(rasterizer);
+        if let Some(rasterizer) = self.rasterizer_handle() {
+            if let Some(host1x) = self.system_ref().get().host1x_core() {
+                if std::env::var_os("RUZU_DISABLE_HOST1X_INVALIDATE_BIND").is_none() {
+                    host1x.bind_device_memory_invalidator(Box::new(move |addr, size| unsafe {
+                        rasterizer.as_mut().invalidate_region(addr, size as u64);
+                    }));
+                }
+                // Upstream binds `host1x.GMMU()` here too, but that is only
+                // correct together with NvMap's Host1x allocator-backed
+                // low-area map/free path. Keep the partial Rust path opt-in
+                // until that ownership slice is ported.
+                if std::env::var_os("RUZU_ENABLE_HOST1X_GMMU_BIND").is_some() {
+                    if let Some(host1x) = host1x
+                        .as_any()
+                        .downcast_ref::<crate::host1x::host1x::Host1x>()
+                    {
+                        unsafe {
+                            host1x.bind_gmmu_rasterizer(rasterizer.as_mut());
+                        }
+                    }
+                }
+            } else {
+                log::warn!(
+                    "Gpu::bind_renderer: host1x_core missing; Host1x device writes will not invalidate rasterizer caches"
+                );
+            }
+        }
         log::info!(
             "Gpu::bind_renderer: renderer bound (vendor: {})",
             renderer.get_device_vendor()

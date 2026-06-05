@@ -791,7 +791,7 @@ impl<'a> PatchManager<'a> {
             None => return (None, None),
         };
 
-        let romfs = self.patch_romfs(base_romfs, ContentRecordType::Control, None, true);
+        let romfs = self.patch_romfs(None, base_romfs, ContentRecordType::Control, None, true);
 
         let extracted = match extract_romfs(Some(romfs)) {
             Some(dir) => dir,
@@ -844,6 +844,7 @@ impl<'a> PatchManager<'a> {
     /// Corresponds to upstream `PatchManager::PatchRomFS`.
     pub fn patch_romfs(
         &self,
+        base_nca: Option<&NCA>,
         base_romfs: VirtualFile,
         record_type: ContentRecordType,
         packed_update_raw: Option<VirtualFile>,
@@ -871,12 +872,8 @@ impl<'a> PatchManager<'a> {
         let update_disabled = disabled.iter().any(|d| d == "Update");
 
         if !update_disabled {
-            if let Some(raw) = update_raw {
-                // Create update NCA with base_nca as BKTR base.
-                // Upstream: `const auto new_nca = std::make_shared<NCA>(update_raw, base_nca);`
-                // We pass None for base_nca since NCA::new takes Option<&NCA>.
-                // A full implementation would require passing the base NCA for BKTR patching.
-                let new_nca = NCA::new(raw, None);
+            if let (Some(raw), Some(base_nca)) = (update_raw, base_nca) {
+                let new_nca = NCA::new(raw, Some(base_nca));
                 if new_nca.get_status() == super::partition_filesystem::ResultStatus::Success {
                     if let Some(new_romfs) = new_nca.get_romfs() {
                         log::info!(
@@ -891,8 +888,8 @@ impl<'a> PatchManager<'a> {
                         romfs = new_romfs;
                     }
                 }
-            } else if let Some(packed_raw) = packed_update_raw {
-                let new_nca = NCA::new(packed_raw, None);
+            } else if let (Some(packed_raw), Some(base_nca)) = (packed_update_raw, base_nca) {
+                let new_nca = NCA::new(packed_raw, Some(base_nca));
                 if new_nca.get_status() == super::partition_filesystem::ResultStatus::Success {
                     if let Some(new_romfs) = new_nca.get_romfs() {
                         log::info!("    RomFS: Update (PACKED) applied successfully");

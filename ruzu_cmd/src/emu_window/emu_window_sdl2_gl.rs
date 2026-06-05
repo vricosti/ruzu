@@ -81,6 +81,12 @@ impl SdlGlContext {
     pub fn swap_buffers(&self) {
         // Maps to: SDL_GL_SwapWindow(window)
         unsafe { sdl::SDL_GL_SwapWindow(self.window) };
+        if common::trace::is_enabled(common::trace::cat::PRESENT_COMPOSITE) {
+            let _ = common::trace::emit_raw(
+                common::trace::cat::PRESENT_COMPOSITE,
+                &[5, 0, 0, 0, 0, 0, 0, 0],
+            );
+        }
         if std::env::var_os("RUZU_TRACE_PRESENT").is_some() {
             log::info!("[PRESENT] SDL_GL_SwapWindow");
         }
@@ -103,6 +109,12 @@ impl SdlGlContext {
             unsafe {
                 sdl::SDL_GL_SetSwapInterval(0);
             }
+            if common::trace::is_enabled(common::trace::cat::PRESENT_COMPOSITE) {
+                let _ = common::trace::emit_raw(
+                    common::trace::cat::PRESENT_COMPOSITE,
+                    &[6, 0, 0, 0, 0, 0, 0, 0],
+                );
+            }
             if std::env::var_os("RUZU_TRACE_PRESENT").is_some() {
                 log::info!("[PRESENT] SDL_GL_MakeCurrent");
             }
@@ -118,6 +130,12 @@ impl SdlGlContext {
             return;
         }
         unsafe { sdl::SDL_GL_MakeCurrent(self.window, std::ptr::null_mut()) };
+        if common::trace::is_enabled(common::trace::cat::PRESENT_COMPOSITE) {
+            let _ = common::trace::emit_raw(
+                common::trace::cat::PRESENT_COMPOSITE,
+                &[7, 0, 0, 0, 0, 0, 0, 0],
+            );
+        }
         self.is_current = false;
     }
 }

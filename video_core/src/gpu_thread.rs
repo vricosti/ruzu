@@ -84,7 +84,9 @@ fn record_submit_elapsed(elapsed: std::time::Duration) {
     let profile = profile();
     let elapsed_us = elapsed.as_micros().min(u128::from(u64::MAX)) as u64;
     profile.done_submit.fetch_add(1, Ordering::Relaxed);
-    profile.submit_total_us.fetch_add(elapsed_us, Ordering::Relaxed);
+    profile
+        .submit_total_us
+        .fetch_add(elapsed_us, Ordering::Relaxed);
     let mut current = profile.submit_max_us.load(Ordering::Relaxed);
     while elapsed_us > current {
         match profile.submit_max_us.compare_exchange_weak(
@@ -485,7 +487,14 @@ fn run_thread(
                 inc(&profile().pop_submit);
                 let list_count = submit.entries.command_lists.len();
                 let prefetch_count = submit.entries.prefetch_command_list.len();
-                trace_gpu_thread_submit(2, next.fence, submit.channel, list_count, prefetch_count, 0);
+                trace_gpu_thread_submit(
+                    2,
+                    next.fence,
+                    submit.channel,
+                    list_count,
+                    prefetch_count,
+                    0,
+                );
                 let start = std::time::Instant::now();
                 scheduler.push(submit.channel, submit.entries);
                 let elapsed = start.elapsed();

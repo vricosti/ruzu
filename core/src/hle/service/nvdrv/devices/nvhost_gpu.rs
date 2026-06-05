@@ -200,8 +200,7 @@ struct SubmitGpfifoPhaseAgg {
 static SUBMIT_GPFIFO_PROFILE: std::sync::OnceLock<
     std::sync::Mutex<std::collections::HashMap<&'static str, SubmitGpfifoPhaseAgg>>,
 > = std::sync::OnceLock::new();
-static SUBMIT_GPFIFO_TRACE_SEQ: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
+static SUBMIT_GPFIFO_TRACE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 fn record_submit_gpfifo_phase(label: &'static str, elapsed: std::time::Duration) {
     let agg = SUBMIT_GPFIFO_PROFILE
@@ -267,7 +266,11 @@ pub fn dump_submit_gpfifo_profile() {
     sorted.sort_by(|a, b| a.0.cmp(b.0));
     eprintln!("[SUBMIT_GPFIFO_PROFILE] per-phase timing (RUZU_PROFILE_SUBMIT_GPFIFO=1):");
     for (label, agg) in &sorted {
-        let avg = if agg.count != 0 { agg.total_ns / agg.count } else { 0 };
+        let avg = if agg.count != 0 {
+            agg.total_ns / agg.count
+        } else {
+            0
+        };
         eprintln!(
             "[SUBMIT_GPFIFO_PROFILE]   {:24} count={:<5} total={:>8.2}ms avg={:>8.1}us max={:>8.1}us",
             label,

@@ -351,7 +351,8 @@ impl ImageInfo {
 
         if is_pitch_linear {
             info.image_type = ImageType::Linear;
-            info.tiling = TilingMode::PitchLinear(config.width * crate::surface::bytes_per_block(format));
+            info.tiling =
+                TilingMode::PitchLinear(config.width * crate::surface::bytes_per_block(format));
             return info;
         }
 
@@ -470,7 +471,7 @@ mod tests {
     use super::*;
     use crate::engines::maxwell_3d::RenderTargetInfo;
     use crate::surface::PixelFormat as SurfacePixelFormat;
-    use crate::textures::texture::{ComponentType, TextureFormat, TicEntry, TextureType};
+    use crate::textures::texture::{ComponentType, TextureFormat, TextureType, TicEntry};
 
     #[test]
     fn render_target_info_decodes_block_linear_layout() {

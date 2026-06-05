@@ -115,7 +115,6 @@ impl KSession {
         result
     }
 
-
     fn set_state(&self, state: SessionState) {
         self.atomic_state.store(state as u8, Ordering::Relaxed);
     }

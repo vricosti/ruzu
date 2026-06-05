@@ -307,9 +307,7 @@ fn dump_thread_state(kernel: &KernelCore) {
 
     fn parse_u64_auto(raw: &str) -> Option<u64> {
         let raw = raw.trim();
-        let hex = raw
-            .strip_prefix("0x")
-            .or_else(|| raw.strip_prefix("0X"));
+        let hex = raw.strip_prefix("0x").or_else(|| raw.strip_prefix("0X"));
         match hex {
             Some(hex) => u64::from_str_radix(hex, 16).ok(),
             None => raw.parse().ok(),
@@ -439,18 +437,16 @@ fn dump_thread_state(kernel: &KernelCore) {
         return;
     };
 
-    let pq_fronts = kernel
-        .global_scheduler_context()
-        .and_then(|gsc| {
-            gsc.try_lock().ok().map(|gsc| {
-                [
-                    gsc.get_scheduled_front(0),
-                    gsc.get_scheduled_front(1),
-                    gsc.get_scheduled_front(2),
-                    gsc.get_scheduled_front(3),
-                ]
-            })
-        });
+    let pq_fronts = kernel.global_scheduler_context().and_then(|gsc| {
+        gsc.try_lock().ok().map(|gsc| {
+            [
+                gsc.get_scheduled_front(0),
+                gsc.get_scheduled_front(1),
+                gsc.get_scheduled_front(2),
+                gsc.get_scheduled_front(3),
+            ]
+        })
+    });
     eprintln!("[DUMP] scheduler pq_fronts={:?}", pq_fronts);
     for core_id in 0..crate::hardware_properties::NUM_CPU_CORES as usize {
         let Some(scheduler) = kernel.scheduler(core_id) else {
@@ -471,7 +467,10 @@ fn dump_thread_state(kernel: &KernelCore) {
                 );
             }
             Err(_) => {
-                eprintln!("[DUMP] scheduler core={} <scheduler-lock-contended>", core_id);
+                eprintln!(
+                    "[DUMP] scheduler core={} <scheduler-lock-contended>",
+                    core_id
+                );
             }
         }
     }
@@ -1518,7 +1517,8 @@ impl KernelCore {
                 .register_thread_object(Arc::clone(&dummy));
             log::info!(
                 "[THREAD_ID_NAME] tid={} name=process_dummy:{}",
-                dummy_tid, name
+                dummy_tid,
+                name
             );
         }
     }
@@ -1546,7 +1546,11 @@ impl KernelCore {
             let thread_id = self.create_new_thread_id();
             let object_id = self.create_new_object_id() as u64;
             if std::env::var_os("RUZU_TRACE_THREAD_ID").is_some() {
-                log::info!("[THREAD_ID_NAME] tid={} name=host:{}", thread_id, thread_name);
+                log::info!(
+                    "[THREAD_ID_NAME] tid={} name=host:{}",
+                    thread_id,
+                    thread_name
+                );
             }
             let mut thread_guard = thread.lock().unwrap();
             let rc = thread_guard.initialize_dummy_thread(Some(process), thread_id, object_id);
@@ -2273,7 +2277,10 @@ impl KernelCore {
             let bt = std::backtrace::Backtrace::force_capture();
             log::info!(
                 "[THREAD_ID] alloc tid={} caller={}:{}\nBacktrace:\n{}",
-                id, caller.file(), caller.line(), bt
+                id,
+                caller.file(),
+                caller.line(),
+                bt
             );
         }
         id

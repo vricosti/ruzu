@@ -7,7 +7,6 @@ use common::ResultCode;
 
 use crate::hid_result;
 use crate::hid_types::*;
-use crate::hid_util;
 use crate::resources::applet_resource::{
     DataStatusFlag, RegistrationStatus, ARUID_INDEX_MAX, SYSTEM_ARUID,
 };
@@ -95,8 +94,7 @@ impl NPadResource {
         self.active_data_aruid = aruid;
         // Upstream copies data from the matching state entry to active_data
         if let Some(idx) = self.get_index_from_aruid(aruid) {
-            // Copy data to active_data would happen here
-            let _ = idx;
+            self.active_data = self.state[idx].data.clone();
         }
     }
 
@@ -138,16 +136,25 @@ impl NPadResource {
     ) -> ResultCode {
         if let Some(idx) = self.get_index_from_aruid(aruid) {
             self.state[idx].data.set_supported_npad_style_set(style_set);
+            if self.active_data_aruid == aruid {
+                self.active_data.set_supported_npad_style_set(style_set);
+                let hold_type = self.state[idx].data.get_npad_joy_hold_type();
+                self.active_data.set_npad_joy_hold_type(hold_type);
+            }
             return ResultCode::SUCCESS;
         }
-        hid_result::RESULT_ARUID_NOT_REGISTERED
+        hid_result::RESULT_NPAD_NOT_CONNECTED
     }
 
     pub fn get_supported_npad_style_set(&self, aruid: u64) -> Result<NpadStyleSet, ResultCode> {
         if let Some(idx) = self.get_index_from_aruid(aruid) {
+            let data = &self.state[idx].data;
+            if !data.get_npad_status().is_supported_styleset_set() {
+                return Err(hid_result::RESULT_UNDEFINED_STYLESET);
+            }
             return Ok(self.state[idx].data.get_supported_npad_style_set());
         }
-        Err(hid_result::RESULT_ARUID_NOT_REGISTERED)
+        Err(hid_result::RESULT_NPAD_NOT_CONNECTED)
     }
 
     pub fn is_supported_npad_style_set(&self, aruid: u64) -> Result<bool, ResultCode> {
@@ -157,7 +164,60 @@ impl NPadResource {
                 .get_npad_status()
                 .is_supported_styleset_set());
         }
-        Err(hid_result::RESULT_ARUID_NOT_REGISTERED)
+        Err(hid_result::RESULT_NPAD_NOT_CONNECTED)
+    }
+
+    fn npad_style_mask_for_revision(&self, idx: usize) -> NpadStyleSet {
+        match self.state[idx].npad_revision {
+            NpadRevision::Revision1 => {
+                NpadStyleSet::FULLKEY
+                    | NpadStyleSet::HANDHELD
+                    | NpadStyleSet::JOY_DUAL
+                    | NpadStyleSet::JOY_LEFT
+                    | NpadStyleSet::JOY_RIGHT
+                    | NpadStyleSet::GC
+                    | NpadStyleSet::PALMA
+                    | NpadStyleSet::SYSTEM_EXT
+                    | NpadStyleSet::SYSTEM
+            }
+            NpadRevision::Revision2 => {
+                NpadStyleSet::FULLKEY
+                    | NpadStyleSet::HANDHELD
+                    | NpadStyleSet::JOY_DUAL
+                    | NpadStyleSet::JOY_LEFT
+                    | NpadStyleSet::JOY_RIGHT
+                    | NpadStyleSet::GC
+                    | NpadStyleSet::PALMA
+                    | NpadStyleSet::LARK
+                    | NpadStyleSet::SYSTEM_EXT
+                    | NpadStyleSet::SYSTEM
+            }
+            NpadRevision::Revision3 => {
+                NpadStyleSet::FULLKEY
+                    | NpadStyleSet::HANDHELD
+                    | NpadStyleSet::JOY_DUAL
+                    | NpadStyleSet::JOY_LEFT
+                    | NpadStyleSet::JOY_RIGHT
+                    | NpadStyleSet::GC
+                    | NpadStyleSet::PALMA
+                    | NpadStyleSet::LARK
+                    | NpadStyleSet::HANDHELD_LARK
+                    | NpadStyleSet::LUCIA
+                    | NpadStyleSet::LAGOON
+                    | NpadStyleSet::LAGER
+                    | NpadStyleSet::SYSTEM_EXT
+                    | NpadStyleSet::SYSTEM
+            }
+            _ => {
+                NpadStyleSet::FULLKEY
+                    | NpadStyleSet::HANDHELD
+                    | NpadStyleSet::JOY_DUAL
+                    | NpadStyleSet::JOY_LEFT
+                    | NpadStyleSet::JOY_RIGHT
+                    | NpadStyleSet::SYSTEM_EXT
+                    | NpadStyleSet::SYSTEM
+            }
+        }
     }
 
     pub fn get_npad_revision(&self, aruid: u64) -> NpadRevision {
@@ -176,16 +236,23 @@ impl NPadResource {
     pub fn set_npad_joy_hold_type(&mut self, aruid: u64, hold_type: NpadJoyHoldType) -> ResultCode {
         if let Some(idx) = self.get_index_from_aruid(aruid) {
             self.state[idx].data.set_npad_joy_hold_type(hold_type);
+            if self.active_data_aruid == aruid {
+                self.active_data.set_npad_joy_hold_type(hold_type);
+            }
             return ResultCode::SUCCESS;
         }
-        hid_result::RESULT_ARUID_NOT_REGISTERED
+        hid_result::RESULT_NPAD_NOT_CONNECTED
     }
 
     pub fn get_npad_joy_hold_type(&self, aruid: u64) -> Result<NpadJoyHoldType, ResultCode> {
         if let Some(idx) = self.get_index_from_aruid(aruid) {
-            return Ok(self.state[idx].data.get_npad_joy_hold_type());
+            let data = &self.state[idx].data;
+            if data.get_npad_status().is_policy() || data.get_npad_status().is_full_policy() {
+                return Ok(self.active_data.get_npad_joy_hold_type());
+            }
+            return Ok(data.get_npad_joy_hold_type());
         }
-        Err(hid_result::RESULT_ARUID_NOT_REGISTERED)
+        Err(hid_result::RESULT_NPAD_NOT_CONNECTED)
     }
 
     pub fn set_npad_handheld_activation_mode(
@@ -197,9 +264,13 @@ impl NPadResource {
             self.state[idx]
                 .data
                 .set_handheld_activation_mode(activation_mode);
+            if self.active_data_aruid == aruid {
+                self.active_data
+                    .set_handheld_activation_mode(activation_mode);
+            }
             return ResultCode::SUCCESS;
         }
-        hid_result::RESULT_ARUID_NOT_REGISTERED
+        hid_result::RESULT_NPAD_NOT_CONNECTED
     }
 
     pub fn get_npad_handheld_activation_mode(
@@ -209,7 +280,7 @@ impl NPadResource {
         if let Some(idx) = self.get_index_from_aruid(aruid) {
             return Ok(self.state[idx].data.get_handheld_activation_mode());
         }
-        Err(hid_result::RESULT_ARUID_NOT_REGISTERED)
+        Err(hid_result::RESULT_NPAD_NOT_CONNECTED)
     }
 
     pub fn set_supported_npad_id_type(
@@ -218,11 +289,17 @@ impl NPadResource {
         supported_npad_list: &[NpadIdType],
     ) -> ResultCode {
         if let Some(idx) = self.get_index_from_aruid(aruid) {
-            return self.state[idx]
+            let result = self.state[idx]
                 .data
                 .set_supported_npad_id_type(supported_npad_list);
+            if result.is_success() && self.active_data_aruid == aruid {
+                return self
+                    .active_data
+                    .set_supported_npad_id_type(supported_npad_list);
+            }
+            return result;
         }
-        hid_result::RESULT_ARUID_NOT_REGISTERED
+        hid_result::RESULT_NPAD_NOT_CONNECTED
     }
 
     pub fn is_controller_supported(&self, aruid: u64, style_index: NpadStyleIndex) -> bool {
@@ -237,16 +314,19 @@ impl NPadResource {
     pub fn set_lr_assignment_mode(&mut self, aruid: u64, is_enabled: bool) -> ResultCode {
         if let Some(idx) = self.get_index_from_aruid(aruid) {
             self.state[idx].data.set_lr_assignment_mode(is_enabled);
+            if self.active_data_aruid == aruid {
+                self.active_data.set_lr_assignment_mode(is_enabled);
+            }
             return ResultCode::SUCCESS;
         }
-        hid_result::RESULT_ARUID_NOT_REGISTERED
+        hid_result::RESULT_NPAD_NOT_CONNECTED
     }
 
     pub fn get_lr_assignment_mode(&self, aruid: u64) -> Result<bool, ResultCode> {
         if let Some(idx) = self.get_index_from_aruid(aruid) {
             return Ok(self.state[idx].data.get_lr_assignment_mode());
         }
-        Err(hid_result::RESULT_ARUID_NOT_REGISTERED)
+        Err(hid_result::RESULT_NPAD_NOT_CONNECTED)
     }
 
     pub fn set_assigning_single_on_sl_sr_press(
@@ -294,69 +374,26 @@ impl NPadResource {
                 | NpadStyleSet::SYSTEM);
         }
 
-        if let Some(idx) = self.get_index_from_aruid(aruid) {
-            let data = &self.state[idx].data;
-            if !data.get_npad_status().is_supported_styleset_set() {
-                return Err(hid_result::RESULT_UNDEFINED_STYLESET);
-            }
-
-            let mut out_style_set = data.get_supported_npad_style_set();
-
-            let mask = match self.state[idx].npad_revision {
-                NpadRevision::Revision1 => {
-                    NpadStyleSet::FULLKEY
-                        | NpadStyleSet::HANDHELD
-                        | NpadStyleSet::JOY_DUAL
-                        | NpadStyleSet::JOY_LEFT
-                        | NpadStyleSet::JOY_RIGHT
-                        | NpadStyleSet::GC
-                        | NpadStyleSet::PALMA
-                        | NpadStyleSet::SYSTEM_EXT
-                        | NpadStyleSet::SYSTEM
-                }
-                NpadRevision::Revision2 => {
-                    NpadStyleSet::FULLKEY
-                        | NpadStyleSet::HANDHELD
-                        | NpadStyleSet::JOY_DUAL
-                        | NpadStyleSet::JOY_LEFT
-                        | NpadStyleSet::JOY_RIGHT
-                        | NpadStyleSet::GC
-                        | NpadStyleSet::PALMA
-                        | NpadStyleSet::LARK
-                        | NpadStyleSet::SYSTEM_EXT
-                        | NpadStyleSet::SYSTEM
-                }
-                NpadRevision::Revision3 => {
-                    NpadStyleSet::FULLKEY
-                        | NpadStyleSet::HANDHELD
-                        | NpadStyleSet::JOY_DUAL
-                        | NpadStyleSet::JOY_LEFT
-                        | NpadStyleSet::JOY_RIGHT
-                        | NpadStyleSet::GC
-                        | NpadStyleSet::PALMA
-                        | NpadStyleSet::LARK
-                        | NpadStyleSet::HANDHELD_LARK
-                        | NpadStyleSet::LUCIA
-                        | NpadStyleSet::LAGOON
-                        | NpadStyleSet::LAGER
-                        | NpadStyleSet::SYSTEM_EXT
-                        | NpadStyleSet::SYSTEM
-                }
-                _ => {
-                    NpadStyleSet::FULLKEY
-                        | NpadStyleSet::HANDHELD
-                        | NpadStyleSet::JOY_DUAL
-                        | NpadStyleSet::JOY_LEFT
-                        | NpadStyleSet::JOY_RIGHT
-                        | NpadStyleSet::SYSTEM_EXT
-                        | NpadStyleSet::SYSTEM
-                }
-            };
-
-            out_style_set = out_style_set & mask;
-            return Ok(out_style_set);
+        let Some(idx) = self.get_index_from_aruid(aruid) else {
+            return Err(hid_result::RESULT_NPAD_NOT_CONNECTED);
+        };
+        let data = &self.state[idx].data;
+        if !data.get_npad_status().is_supported_styleset_set() {
+            return Err(hid_result::RESULT_UNDEFINED_STYLESET);
         }
-        Err(hid_result::RESULT_NPAD_NOT_CONNECTED)
+        Ok(data.get_supported_npad_style_set() & self.npad_style_mask_for_revision(idx))
+    }
+
+    /// Port of NPadResource::GetAvailableStyleset.
+    pub fn get_available_styleset(&self, aruid: u64) -> Result<NpadStyleSet, ResultCode> {
+        let Some(idx) = self.get_index_from_aruid(aruid) else {
+            return Err(hid_result::RESULT_NPAD_NOT_CONNECTED);
+        };
+        let data = &self.state[idx].data;
+        if !data.get_npad_status().is_supported_styleset_set() {
+            return Err(hid_result::RESULT_UNDEFINED_STYLESET);
+        }
+        Ok(data.get_supported_npad_style_set() & self.npad_style_mask_for_revision(idx))
     }
 
     pub fn get_home_protection_enabled(
@@ -526,5 +563,144 @@ impl NPadResource {
         }
         self.ref_counter += 1;
         ResultCode::SUCCESS
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::NPadResource;
+    use crate::hid_result;
+    use crate::hid_types::NpadStyleSet;
+    use crate::resources::applet_resource::SYSTEM_ARUID;
+    use crate::resources::npad::npad_types::{
+        NpadHandheldActivationMode, NpadJoyHoldType, NpadRevision,
+    };
+
+    const ARUID: u64 = 0x1234;
+
+    #[test]
+    fn supported_style_set_errors_match_upstream() {
+        let mut resource = NPadResource::new();
+
+        assert_eq!(
+            resource.get_supported_npad_style_set(ARUID).unwrap_err(),
+            hid_result::RESULT_NPAD_NOT_CONNECTED
+        );
+
+        assert!(resource
+            .register_applet_resource_user_id(ARUID)
+            .is_success());
+        assert_eq!(
+            resource.get_supported_npad_style_set(ARUID).unwrap_err(),
+            hid_result::RESULT_UNDEFINED_STYLESET
+        );
+    }
+
+    #[test]
+    fn masked_style_set_applies_revision_mask() {
+        let mut resource = NPadResource::new();
+        assert!(resource
+            .register_applet_resource_user_id(ARUID)
+            .is_success());
+        assert!(resource
+            .set_supported_npad_style_set(ARUID, NpadStyleSet::ALL)
+            .is_success());
+
+        assert_eq!(
+            resource.get_masked_supported_npad_style_set(ARUID).unwrap(),
+            NpadStyleSet::FULLKEY
+                | NpadStyleSet::HANDHELD
+                | NpadStyleSet::JOY_DUAL
+                | NpadStyleSet::JOY_LEFT
+                | NpadStyleSet::JOY_RIGHT
+                | NpadStyleSet::SYSTEM_EXT
+                | NpadStyleSet::SYSTEM
+        );
+
+        resource.set_npad_revision(ARUID, NpadRevision::Revision3);
+        assert_eq!(
+            resource.get_masked_supported_npad_style_set(ARUID).unwrap(),
+            NpadStyleSet::FULLKEY
+                | NpadStyleSet::HANDHELD
+                | NpadStyleSet::JOY_DUAL
+                | NpadStyleSet::JOY_LEFT
+                | NpadStyleSet::JOY_RIGHT
+                | NpadStyleSet::GC
+                | NpadStyleSet::PALMA
+                | NpadStyleSet::LARK
+                | NpadStyleSet::HANDHELD_LARK
+                | NpadStyleSet::LUCIA
+                | NpadStyleSet::LAGOON
+                | NpadStyleSet::LAGER
+                | NpadStyleSet::SYSTEM_EXT
+                | NpadStyleSet::SYSTEM
+        );
+    }
+
+    #[test]
+    fn available_styleset_matches_masked_revision_path() {
+        let mut resource = NPadResource::new();
+        assert!(resource
+            .register_applet_resource_user_id(ARUID)
+            .is_success());
+
+        assert_eq!(
+            resource.get_available_styleset(ARUID).unwrap_err(),
+            hid_result::RESULT_UNDEFINED_STYLESET
+        );
+
+        assert!(resource
+            .set_supported_npad_style_set(ARUID, NpadStyleSet::ALL)
+            .is_success());
+        resource.set_npad_revision(ARUID, NpadRevision::Revision1);
+
+        assert_eq!(
+            resource.get_available_styleset(ARUID).unwrap(),
+            resource.get_masked_supported_npad_style_set(ARUID).unwrap()
+        );
+    }
+
+    #[test]
+    fn active_data_tracks_upstream_mirrored_updates() {
+        let mut resource = NPadResource::new();
+        assert!(resource
+            .register_applet_resource_user_id(ARUID)
+            .is_success());
+        resource.set_app_resource_user_id(ARUID);
+
+        assert!(resource
+            .set_npad_joy_hold_type(ARUID, NpadJoyHoldType::Horizontal)
+            .is_success());
+        assert_eq!(
+            resource.get_active_data().get_npad_joy_hold_type(),
+            NpadJoyHoldType::Horizontal
+        );
+
+        assert!(resource
+            .set_npad_handheld_activation_mode(ARUID, NpadHandheldActivationMode::None)
+            .is_success());
+        assert_eq!(
+            resource.get_active_data().get_handheld_activation_mode(),
+            NpadHandheldActivationMode::None
+        );
+    }
+
+    #[test]
+    fn system_aruid_mask_matches_upstream_special_case() {
+        let resource = NPadResource::new();
+
+        assert_eq!(
+            resource
+                .get_masked_supported_npad_style_set(SYSTEM_ARUID)
+                .unwrap(),
+            NpadStyleSet::FULLKEY
+                | NpadStyleSet::HANDHELD
+                | NpadStyleSet::JOY_DUAL
+                | NpadStyleSet::JOY_LEFT
+                | NpadStyleSet::JOY_RIGHT
+                | NpadStyleSet::PALMA
+                | NpadStyleSet::SYSTEM_EXT
+                | NpadStyleSet::SYSTEM
+        );
     }
 }

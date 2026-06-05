@@ -1158,9 +1158,7 @@ impl ServerManager {
                 .as_ref()
                 .and_then(Weak::upgrade)
                 .map(|sm_arc| {
-                    SessionRequestManager::new_with_server_manager_full(
-                        sm_arc, queue, wakeup,
-                    )
+                    SessionRequestManager::new_with_server_manager_full(sm_arc, queue, wakeup)
                 })
                 .map(|manager| Arc::new(Mutex::new(manager)))
                 .unwrap_or_else(|| Arc::new(Mutex::new(SessionRequestManager::new())));

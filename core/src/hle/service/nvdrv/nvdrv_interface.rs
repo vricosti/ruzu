@@ -609,7 +609,11 @@ impl NvdrvService {
                 if tid == target_tid {
                     log::warn!(
                         "[IOCTL_TID] tid={} fd={} ioctl=0x{:08X} in_len=0x{:X} out_len=0x{:X}",
-                        tid, fd, command.raw, input.len(), write_size
+                        tid,
+                        fd,
+                        command.raw,
+                        input.len(),
+                        write_size
                     );
                 }
             }

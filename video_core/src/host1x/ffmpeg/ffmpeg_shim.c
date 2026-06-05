@@ -13,6 +13,7 @@
 typedef struct RuzuFfmpegDecoder {
     AVCodecContext* context;
     int decode_order;
+    int last_error;
 } RuzuFfmpegDecoder;
 
 static enum AVCodecID ruzu_codec_id(uint64_t codec) {
@@ -85,8 +86,23 @@ int ruzu_ffmpeg_decoder_send_packet(RuzuFfmpegDecoder* decoder, const uint8_t* d
     packet->size = (int)size;
 
     const int ret = avcodec_send_packet(decoder->context, packet);
+    decoder->last_error = ret;
     av_packet_free(&packet);
     return ret;
+}
+
+int ruzu_ffmpeg_decoder_last_error(const RuzuFfmpegDecoder* decoder) {
+    if (decoder == NULL) {
+        return -1;
+    }
+    return decoder->last_error;
+}
+
+void ruzu_ffmpeg_error_string(int errnum, char* out, uintptr_t out_size) {
+    if (out == NULL || out_size == 0) {
+        return;
+    }
+    av_make_error_string(out, out_size, errnum);
 }
 
 AVFrame* ruzu_ffmpeg_decoder_receive_frame(RuzuFfmpegDecoder* decoder) {
@@ -99,7 +115,9 @@ AVFrame* ruzu_ffmpeg_decoder_receive_frame(RuzuFfmpegDecoder* decoder) {
         return NULL;
     }
 
-    if (avcodec_receive_frame(decoder->context, frame) < 0) {
+    const int ret = avcodec_receive_frame(decoder->context, frame);
+    decoder->last_error = ret;
+    if (ret < 0) {
         av_frame_free(&frame);
         return NULL;
     }

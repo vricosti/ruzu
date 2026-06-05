@@ -497,8 +497,7 @@ fn main() {
     let want_svc_per_tid = std::env::var_os("RUZU_PROFILE_SVC_PER_TID").is_some();
     let want_svc_summary = std::env::var_os("RUZU_PROFILE_SVC_SUMMARY").is_some();
     let want_svc_ring = std::env::var_os("RUZU_PROFILE_SVC_RING").is_some();
-    let want_thread_lifecycle =
-        std::env::var_os("RUZU_PROFILE_THREAD_LIFECYCLE").is_some();
+    let want_thread_lifecycle = std::env::var_os("RUZU_PROFILE_THREAD_LIFECYCLE").is_some();
     let want_startthread_sched_profile =
         std::env::var_os("RUZU_PROFILE_STARTTHREAD_SCHED").is_some();
     let want_nvdrv_ioctl_profile = std::env::var_os("RUZU_PROFILE_NVDRV_IOCTL").is_some();
@@ -1279,10 +1278,18 @@ fn main() {
     }
 
     log::info!("Entering main event loop");
+    let poll_events_loop = std::env::var_os("RUZU_POLL_EVENTS_LOOP").is_some();
     match &mut emu_window {
         EmuWindow::Gl(w) => {
-            while w.is_open() {
-                w.wait_event();
+            if poll_events_loop {
+                while w.is_open() {
+                    w.poll_events();
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+            } else {
+                while w.is_open() {
+                    w.wait_event();
+                }
             }
         }
         EmuWindow::Vk(w) => {

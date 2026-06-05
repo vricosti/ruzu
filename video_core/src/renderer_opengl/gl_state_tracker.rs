@@ -16,10 +16,10 @@ use crate::dirty_flags::{fill_block, setup_dirty_flags, DirtyTables};
 use crate::engines::maxwell_3d::{
     ALPHA_TEST_ENABLED, ALPHA_TEST_FUNC, ALPHA_TEST_REF, ANTI_ALIAS_ALPHA_CONTROL, BLEND_BASE,
     BLEND_COLOR_BASE, BLEND_PER_TARGET_BASE, BLEND_PER_TARGET_ENABLED, BLEND_PER_TARGET_STRIDE,
-    COLOR_MASK_BASE, COLOR_MASK_COMMON, CULL_FACE, CULL_TEST_ENABLE, DEPTH_BIAS,
-    DEPTH_BIAS_CLAMP, DEPTH_MODE, DEPTH_TEST_ENABLE, DEPTH_TEST_FUNC, DEPTH_WRITE_ENABLE,
-    FILL_VIA_TRIANGLE_MODE, FRAG_COLOR_CLAMP, FRAMEBUFFER_SRGB, FRONT_FACE, LINE_ANTI_ALIAS_ENABLE,
-    LINE_WIDTH_ALIASED, LINE_WIDTH_SMOOTH, LOGIC_OP, LOGIC_OP_WORDS, NUM_VERTEX_ATTRIBS, POINT_SIZE,
+    COLOR_MASK_BASE, COLOR_MASK_COMMON, CULL_FACE, CULL_TEST_ENABLE, DEPTH_BIAS, DEPTH_BIAS_CLAMP,
+    DEPTH_MODE, DEPTH_TEST_ENABLE, DEPTH_TEST_FUNC, DEPTH_WRITE_ENABLE, FILL_VIA_TRIANGLE_MODE,
+    FRAG_COLOR_CLAMP, FRAMEBUFFER_SRGB, FRONT_FACE, LINE_ANTI_ALIAS_ENABLE, LINE_WIDTH_ALIASED,
+    LINE_WIDTH_SMOOTH, LOGIC_OP, LOGIC_OP_WORDS, NUM_VERTEX_ATTRIBS, POINT_SIZE,
     POINT_SIZE_ATTRIBUTE, POINT_SPRITE_ENABLE, POLYGON_MODE_BACK, POLYGON_MODE_FRONT,
     POLYGON_OFFSET_FILL_ENABLE, POLYGON_OFFSET_LINE_ENABLE, POLYGON_OFFSET_POINT_ENABLE,
     PRIMITIVE_RESTART_BASE, PRIMITIVE_RESTART_WORDS, RASTERIZE_ENABLE, SCISSOR_BASE,
@@ -66,16 +66,23 @@ fn setup_dirty_vertex_instances(tables: &mut DirtyTables) {
     const NUM_VERTEX_ARRAYS: usize = 32;
     const INSTANCE_BASE_OFFSET: usize = 3;
     for index in 0..NUM_VERTEX_ARRAYS {
-        let array_offset =
-            VERTEX_STREAM_BASE as usize + index * VERTEX_STREAM_STRIDE as usize;
+        let array_offset = VERTEX_STREAM_BASE as usize + index * VERTEX_STREAM_STRIDE as usize;
         let instance_array_offset = array_offset + INSTANCE_BASE_OFFSET;
         let dirty_index = dirty::VERTEX_INSTANCE_0 + index as u8;
         set_table(&mut tables[0], instance_array_offset as u32, dirty_index);
-        set_table(&mut tables[1], instance_array_offset as u32, dirty::VERTEX_INSTANCES);
+        set_table(
+            &mut tables[1],
+            instance_array_offset as u32,
+            dirty::VERTEX_INSTANCES,
+        );
 
         let instance_offset = VERTEX_STREAM_INSTANCE_BASE as usize + index;
         set_table(&mut tables[0], instance_offset as u32, dirty_index);
-        set_table(&mut tables[1], instance_offset as u32, dirty::VERTEX_INSTANCES);
+        set_table(
+            &mut tables[1],
+            instance_offset as u32,
+            dirty::VERTEX_INSTANCES,
+        );
     }
 }
 
@@ -158,7 +165,11 @@ fn setup_dirty_scissors(tables: &mut DirtyTables) {
 }
 
 fn setup_dirty_polygon_modes(tables: &mut DirtyTables) {
-    set_table(&mut tables[0], POLYGON_MODE_FRONT, dirty::POLYGON_MODE_FRONT);
+    set_table(
+        &mut tables[0],
+        POLYGON_MODE_FRONT,
+        dirty::POLYGON_MODE_FRONT,
+    );
     set_table(&mut tables[0], POLYGON_MODE_BACK, dirty::POLYGON_MODE_BACK);
     set_table(&mut tables[1], POLYGON_MODE_FRONT, dirty::POLYGON_MODES);
     set_table(&mut tables[1], POLYGON_MODE_BACK, dirty::POLYGON_MODES);
@@ -271,7 +282,11 @@ fn setup_dirty_polygon_offset(tables: &mut DirtyTables) {
         POLYGON_OFFSET_POINT_ENABLE,
         dirty::POLYGON_OFFSET,
     );
-    set_table(&mut tables[0], SLOPE_SCALE_DEPTH_BIAS, dirty::POLYGON_OFFSET);
+    set_table(
+        &mut tables[0],
+        SLOPE_SCALE_DEPTH_BIAS,
+        dirty::POLYGON_OFFSET,
+    );
     set_table(&mut tables[0], DEPTH_BIAS, dirty::POLYGON_OFFSET);
     set_table(&mut tables[0], DEPTH_BIAS_CLAMP, dirty::POLYGON_OFFSET);
 }
@@ -304,7 +319,11 @@ fn setup_dirty_logic_op(tables: &mut DirtyTables) {
 }
 
 fn setup_dirty_fragment_clamp_color(tables: &mut DirtyTables) {
-    set_table(&mut tables[0], FRAG_COLOR_CLAMP, dirty::FRAGMENT_CLAMP_COLOR);
+    set_table(
+        &mut tables[0],
+        FRAG_COLOR_CLAMP,
+        dirty::FRAGMENT_CLAMP_COLOR,
+    );
 }
 
 fn setup_dirty_point_size(tables: &mut DirtyTables) {
@@ -325,7 +344,11 @@ fn setup_dirty_clip_control(tables: &mut DirtyTables) {
 }
 
 fn setup_dirty_depth_clamp_enabled(tables: &mut DirtyTables) {
-    set_table(&mut tables[0], VIEWPORT_CLIP_CONTROL, dirty::DEPTH_CLAMP_ENABLED);
+    set_table(
+        &mut tables[0],
+        VIEWPORT_CLIP_CONTROL,
+        dirty::DEPTH_CLAMP_ENABLED,
+    );
 }
 
 fn setup_dirty_misc(tables: &mut DirtyTables) {
@@ -769,7 +792,10 @@ mod tests {
         StateTracker::setup_tables(&mut tables);
 
         assert_eq!(dirty::FIRST, crate::dirty_flags::flags::LAST_COMMON_ENTRY);
-        assert_eq!(tables[0][COLOR_MASK_COMMON as usize], dirty::COLOR_MASK_COMMON);
+        assert_eq!(
+            tables[0][COLOR_MASK_COMMON as usize],
+            dirty::COLOR_MASK_COMMON
+        );
         assert_eq!(tables[0][COLOR_MASK_BASE as usize], dirty::COLOR_MASK_0);
         assert_eq!(tables[1][COLOR_MASK_BASE as usize], dirty::COLOR_MASKS);
         assert_eq!(
@@ -780,15 +806,24 @@ mod tests {
             tables[0][VERTEX_STREAM_INSTANCE_BASE as usize],
             dirty::VERTEX_INSTANCE_0
         );
-        assert_eq!(tables[0][VERTEX_ATTRIB_BASE as usize], dirty::VERTEX_FORMAT_0);
-        assert_eq!(tables[1][VERTEX_ATTRIB_BASE as usize], dirty::VERTEX_FORMATS);
+        assert_eq!(
+            tables[0][VERTEX_ATTRIB_BASE as usize],
+            dirty::VERTEX_FORMAT_0
+        );
+        assert_eq!(
+            tables[1][VERTEX_ATTRIB_BASE as usize],
+            dirty::VERTEX_FORMATS
+        );
         assert_eq!(tables[0][VP_TRANSFORM_BASE as usize], dirty::VIEWPORT_0);
         assert_eq!(tables[1][VP_TRANSFORM_BASE as usize], dirty::VIEWPORTS);
         assert_eq!(tables[0][VIEWPORT_BASE as usize], dirty::VIEWPORT_0);
         assert_eq!(tables[1][VIEWPORT_BASE as usize], dirty::VIEWPORTS);
         assert_eq!(tables[0][SCISSOR_BASE as usize], dirty::SCISSOR_0);
         assert_eq!(tables[1][SCISSOR_BASE as usize], dirty::SCISSORS);
-        assert_eq!(tables[0][POLYGON_MODE_FRONT as usize], dirty::POLYGON_MODE_FRONT);
+        assert_eq!(
+            tables[0][POLYGON_MODE_FRONT as usize],
+            dirty::POLYGON_MODE_FRONT
+        );
         assert_eq!(tables[1][POLYGON_MODE_BACK as usize], dirty::POLYGON_MODES);
         assert_eq!(tables[0][DEPTH_TEST_ENABLE as usize], dirty::DEPTH_TEST);
         assert_eq!(tables[0][DEPTH_WRITE_ENABLE as usize], dirty::DEPTH_MASK);
@@ -799,9 +834,18 @@ mod tests {
             tables[0][BLEND_PER_TARGET_ENABLED as usize],
             dirty::BLEND_INDEPENDENT_ENABLED
         );
-        assert_eq!(tables[0][BLEND_PER_TARGET_BASE as usize], dirty::BLEND_STATE_0);
-        assert_eq!(tables[1][BLEND_PER_TARGET_BASE as usize], dirty::BLEND_STATES);
-        assert_eq!(tables[0][PRIMITIVE_RESTART_BASE as usize], dirty::PRIMITIVE_RESTART);
+        assert_eq!(
+            tables[0][BLEND_PER_TARGET_BASE as usize],
+            dirty::BLEND_STATE_0
+        );
+        assert_eq!(
+            tables[1][BLEND_PER_TARGET_BASE as usize],
+            dirty::BLEND_STATES
+        );
+        assert_eq!(
+            tables[0][PRIMITIVE_RESTART_BASE as usize],
+            dirty::PRIMITIVE_RESTART
+        );
         assert_eq!(
             tables[0][POLYGON_OFFSET_FILL_ENABLE as usize],
             dirty::POLYGON_OFFSET
@@ -814,18 +858,36 @@ mod tests {
             tables[0][POLYGON_OFFSET_POINT_ENABLE as usize],
             dirty::POLYGON_OFFSET
         );
-        assert_eq!(tables[0][SLOPE_SCALE_DEPTH_BIAS as usize], dirty::POLYGON_OFFSET);
-        assert_eq!(tables[0][ANTI_ALIAS_ALPHA_CONTROL as usize], dirty::MULTISAMPLE_CONTROL);
-        assert_eq!(tables[0][RASTERIZE_ENABLE as usize], dirty::RASTERIZE_ENABLE);
-        assert_eq!(tables[0][FRAMEBUFFER_SRGB as usize], dirty::FRAMEBUFFER_SRGB);
+        assert_eq!(
+            tables[0][SLOPE_SCALE_DEPTH_BIAS as usize],
+            dirty::POLYGON_OFFSET
+        );
+        assert_eq!(
+            tables[0][ANTI_ALIAS_ALPHA_CONTROL as usize],
+            dirty::MULTISAMPLE_CONTROL
+        );
+        assert_eq!(
+            tables[0][RASTERIZE_ENABLE as usize],
+            dirty::RASTERIZE_ENABLE
+        );
+        assert_eq!(
+            tables[0][FRAMEBUFFER_SRGB as usize],
+            dirty::FRAMEBUFFER_SRGB
+        );
         assert_eq!(tables[0][LOGIC_OP as usize], dirty::LOGIC_OP);
         assert_eq!(tables[0][LOGIC_OP as usize + 1], dirty::LOGIC_OP);
-        assert_eq!(tables[0][FRAG_COLOR_CLAMP as usize], dirty::FRAGMENT_CLAMP_COLOR);
+        assert_eq!(
+            tables[0][FRAG_COLOR_CLAMP as usize],
+            dirty::FRAGMENT_CLAMP_COLOR
+        );
         assert_eq!(tables[0][POINT_SIZE as usize], dirty::POINT_SIZE);
         assert_eq!(tables[0][LINE_WIDTH_SMOOTH as usize], dirty::LINE_WIDTH);
         assert_eq!(tables[0][WINDOW_ORIGIN as usize], dirty::CLIP_CONTROL);
         assert_eq!(tables[0][DEPTH_MODE as usize], dirty::CLIP_CONTROL);
-        assert_eq!(tables[0][VIEWPORT_CLIP_CONTROL as usize], dirty::DEPTH_CLAMP_ENABLED);
+        assert_eq!(
+            tables[0][VIEWPORT_CLIP_CONTROL as usize],
+            dirty::DEPTH_CLAMP_ENABLED
+        );
         assert_eq!(tables[0][USER_CLIP_ENABLE as usize], dirty::CLIP_DISTANCES);
         assert_eq!(tables[0][FRONT_FACE as usize], dirty::FRONT_FACE);
         assert_eq!(tables[0][CULL_TEST_ENABLE as usize], dirty::CULL_TEST);

@@ -279,9 +279,7 @@ impl IAudioRenderer {
         // for byte-diff against an equivalent zuyu capture.
         if let Ok(range_str) = std::env::var("RUZU_DUMP_AUDIO_UPDATE_RANGE") {
             if let Some((start_str, end_str)) = range_str.split_once('-') {
-                if let (Ok(start), Ok(end)) =
-                    (start_str.parse::<u64>(), end_str.parse::<u64>())
-                {
+                if let (Ok(start), Ok(end)) = (start_str.parse::<u64>(), end_str.parse::<u64>()) {
                     use std::sync::atomic::{AtomicU64, Ordering};
                     static RANGE_COUNT: AtomicU64 = AtomicU64::new(0);
                     let n = RANGE_COUNT.fetch_add(1, Ordering::Relaxed) + 1;

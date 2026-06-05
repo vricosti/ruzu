@@ -11,6 +11,7 @@ use crate::hid_util;
 use crate::resources::npad::npad_types::*;
 
 /// Handles Npad data state from HID interfaces
+#[derive(Clone)]
 pub struct NPadData {
     status: NpadStatus,
     supported_npad_style_set: NpadStyleSet,
