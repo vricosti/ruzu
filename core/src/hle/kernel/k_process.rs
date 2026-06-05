@@ -49,6 +49,7 @@ use super::k_resource_limit::{KResourceLimit, LimitableResource};
 use super::k_memory_manager;
 use super::k_scheduler::KScheduler;
 use super::k_session::KSession;
+use super::k_shared_memory_info::KSharedMemoryInfo;
 use super::k_synchronization_object;
 use super::k_synchronization_object::SynchronizationObjectState;
 use super::k_system_resource::KSecureSystemResource;
@@ -62,7 +63,7 @@ use crate::file_sys::program_metadata::{PoolPartition, ProgramAddressSpaceType, 
 use crate::hardware_properties::NUM_CPU_CORES;
 use crate::hle::kernel::svc::svc_results;
 use crate::hle::kernel::svc::svc_results::RESULT_INVALID_STATE;
-use crate::hle::result::RESULT_SUCCESS;
+use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 
 const MT19937_STATE_WORDS: usize = 624;
 const MT19937_PERIOD: usize = 397;
@@ -535,6 +536,7 @@ pub struct KProcess {
     pub event_objects: BTreeMap<u64, Arc<Mutex<KEvent>>>,
     pub readable_event_objects: BTreeMap<u64, Arc<Mutex<KReadableEvent>>>,
     pub shared_memory_objects: BTreeMap<u64, Arc<super::k_shared_memory::KSharedMemory>>,
+    pub shared_memory_infos: BTreeMap<usize, KSharedMemoryInfo>,
     pub transfer_memory_objects:
         BTreeMap<u64, Arc<Mutex<super::k_transfer_memory::KTransferMemory>>>,
     pub sync_object: SynchronizationObjectState,
@@ -659,6 +661,7 @@ impl KProcess {
             event_objects: BTreeMap::new(),
             readable_event_objects: BTreeMap::new(),
             shared_memory_objects: BTreeMap::new(),
+            shared_memory_infos: BTreeMap::new(),
             transfer_memory_objects: BTreeMap::new(),
             sync_object: SynchronizationObjectState::new(),
             self_reference: None,
@@ -2667,6 +2670,7 @@ impl KProcess {
         self.event_objects.clear();
         self.readable_event_objects.clear();
         self.shared_memory_objects.clear();
+        self.shared_memory_infos.clear();
         let transfer_memory_object_ids: Vec<u64> =
             self.transfer_memory_objects.keys().copied().collect();
         for object_id in transfer_memory_object_ids {
@@ -2838,6 +2842,49 @@ impl KProcess {
         shmem: Arc<super::k_shared_memory::KSharedMemory>,
     ) {
         self.shared_memory_objects.insert(object_id, shmem);
+    }
+
+    /// Port of upstream `KProcess::AddSharedMemory`.
+    ///
+    /// Upstream stores a slab-allocated `KSharedMemoryInfo` node in
+    /// `m_shared_memory_list` and opens both the info and the shared memory.
+    /// Ruzu's kernel objects are Arc-owned, so the explicit shared-memory
+    /// `Open()` is represented by the Arc held by the handle table; this map
+    /// preserves the per-process info refcount and lifecycle ordering.
+    pub fn add_shared_memory(
+        &mut self,
+        shmem: Arc<super::k_shared_memory::KSharedMemory>,
+        _address: u64,
+        _size: usize,
+    ) -> ResultCode {
+        let key = Arc::as_ptr(&shmem) as usize;
+        let info = self.shared_memory_infos.entry(key).or_insert_with(|| {
+            let mut info = KSharedMemoryInfo::new();
+            info.initialize(key);
+            info
+        });
+        info.open();
+        RESULT_SUCCESS
+    }
+
+    /// Port of upstream `KProcess::RemoveSharedMemory`.
+    pub fn remove_shared_memory(
+        &mut self,
+        shmem: &Arc<super::k_shared_memory::KSharedMemory>,
+        _address: u64,
+        _size: usize,
+    ) {
+        let key = Arc::as_ptr(shmem) as usize;
+        let should_remove = if let Some(info) = self.shared_memory_infos.get_mut(&key) {
+            debug_assert_eq!(info.get_shared_memory(), key);
+            info.close()
+        } else {
+            debug_assert!(false, "KProcess::remove_shared_memory: missing info");
+            false
+        };
+        if should_remove {
+            self.shared_memory_infos.remove(&key);
+        }
     }
 
     pub fn get_shared_memory_by_object_id(

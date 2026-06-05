@@ -144,8 +144,8 @@ pub mod cat {
     pub const RT_BIND: u16 = 22;
     /// Filtered OpenGL render-target readback. args =
     /// [draw_seq, pipeline, fbo, rt0_gpu, rt0_format, width, height,
-    ///  sample_width, sample_height, rgb_nonzero, alpha_nonzero, checksum,
-    ///  first_rgba, gl_error, center_rgba]
+    ///  probe_x, probe_y, rgb_nonzero, alpha_nonzero, checksum,
+    ///  probe_rgba, gl_error]
     pub const RT_SAMPLE: u16 = 23;
     /// OpenGL texture binding address attribution. args =
     /// [draw_seq, pipeline, stage, unit, view_id, image_id, view_gpu_addr,
@@ -263,6 +263,21 @@ pub mod cat {
     /// SVC SendSyncRequest progress attribution. args =
     /// [stage, tid, handle, client_obj, tls, aux0, aux1, aux2]
     pub const SVC_IPC_PROGRESS: u16 = 45;
+    /// IHOSBinderDriver transaction attribution. args =
+    /// [stage, seq, id, transaction_id, flags, in_len, out_len, status]
+    pub const BINDER_TXN: u16 = 46;
+    /// OpenGL graphics-pipeline cache/compile attribution. args =
+    /// [stage, seq, cache_len, key_raw, key_hash, h0, h1, h2, h3, h4, h5,
+    ///  aux0, aux1, aux2]
+    pub const GL_PIPELINE: u16 = 47;
+    /// Mii service CharInfo/CoreData attribution. args =
+    /// [stage, cmd, result, aux0, aux1, create_lo, create_hi, name0_3, name4_7,
+    ///  traits0, traits1]
+    pub const MII_SERVICE: u16 = 48;
+    /// Final OpenGL present/composite attribution. args =
+    /// [stage, frame, framebuffer_count, current_frame, draw_count, width,
+    ///  height, gl_error]
+    pub const PRESENT_COMPOSITE: u16 = 49;
 }
 
 fn service_registry() -> &'static Mutex<Vec<String>> {
@@ -418,6 +433,7 @@ pub struct Config {
     pub ipc_invalid_trace: bool,
     pub ipc_reply_wake_trace: bool,
     pub svc_ipc_progress_trace: bool,
+    pub binder_txn_trace: bool,
     pub bqp_trace: bool,
     pub gpu_va_trace: bool,
     pub heap_trace: bool,
@@ -450,11 +466,14 @@ pub struct Config {
     pub gpu_thread_trace: bool,
     pub dma_pusher_trace: bool,
     pub gl_draw_profile_trace: bool,
+    pub gl_pipeline_trace: bool,
+    pub present_composite_trace: bool,
     pub present_alias_trace: bool,
     pub present_image_select_trace: bool,
     pub rt_depth_attach_trace: bool,
     pub rt_zeta_bind_trace: bool,
     pub submit_gpfifo_trace: bool,
+    pub mii_service_trace: bool,
     /// Sink target: "stderr" or "file".
     pub output_target: String,
     /// File path when target == "file".
@@ -476,6 +495,7 @@ impl Default for Config {
             ipc_invalid_trace: false,
             ipc_reply_wake_trace: false,
             svc_ipc_progress_trace: false,
+            binder_txn_trace: false,
             bqp_trace: false,
             gpu_va_trace: false,
             heap_trace: false,
@@ -508,11 +528,14 @@ impl Default for Config {
             gpu_thread_trace: false,
             dma_pusher_trace: false,
             gl_draw_profile_trace: false,
+            gl_pipeline_trace: false,
+            present_composite_trace: false,
             present_alias_trace: false,
             present_image_select_trace: false,
             rt_depth_attach_trace: false,
             rt_zeta_bind_trace: false,
             submit_gpfifo_trace: false,
+            mii_service_trace: false,
             output_target: "stderr".to_string(),
             output_file: String::new(),
             ring_capacity: 16384,
@@ -529,6 +552,7 @@ impl Config {
             || self.ipc_invalid_trace
             || self.ipc_reply_wake_trace
             || self.svc_ipc_progress_trace
+            || self.binder_txn_trace
             || self.bqp_trace
             || self.gpu_va_trace
             || self.heap_trace
@@ -560,11 +584,14 @@ impl Config {
             || self.gpu_thread_trace
             || self.dma_pusher_trace
             || self.gl_draw_profile_trace
+            || self.gl_pipeline_trace
+            || self.present_composite_trace
             || self.present_alias_trace
             || self.present_image_select_trace
             || self.rt_depth_attach_trace
             || self.rt_zeta_bind_trace
             || self.submit_gpfifo_trace
+            || self.mii_service_trace
     }
 }
 
@@ -651,6 +678,7 @@ fn build_config() -> Config {
             "RUZU_TRACE_SVC_IPC_PROGRESS",
             false,
         ),
+        binder_txn_trace: get_bool("nvnflinger", "binder", "RUZU_TRACE_BINDER_TXN_RING", false),
         bqp_trace: get_bool("nvnflinger", "bqp", "RUZU_TRACE_BQP_RING", false),
         gpu_va_trace: get_bool("nvdrv", "gpu_va_trace", "RUZU_TRACE_GPU_VA", false),
         heap_trace: get_bool("svc", "heap_trace", "RUZU_TRACE_HEAP", false),
@@ -728,6 +756,13 @@ fn build_config() -> Config {
             "RUZU_TRACE_GL_DRAW_PROFILE_RING",
             false,
         ),
+        gl_pipeline_trace: get_bool("opengl", "pipeline", "RUZU_TRACE_GL_PIPELINE", false),
+        present_composite_trace: get_bool(
+            "opengl",
+            "present_composite",
+            "RUZU_TRACE_PRESENT_COMPOSITE",
+            false,
+        ),
         present_alias_trace: get_bool(
             "opengl",
             "present_alias",
@@ -758,8 +793,16 @@ fn build_config() -> Config {
             "RUZU_TRACE_SUBMIT_GPFIFO_RING",
             false,
         ),
+        mii_service_trace: get_bool("mii", "service", "RUZU_TRACE_MII_SERVICE", false),
         output_target: get_str("output", "target", "RUZU_TRACE_TARGET", "stderr"),
-        output_file: get_str("output", "file_path", "RUZU_TRACE_FILE", ""),
+        output_file: file
+            .as_ref()
+            .and_then(|t| t.get("output"))
+            .and_then(|s| s.get("file_path").or_else(|| s.get("file")))
+            .and_then(|x| x.as_str())
+            .map(str::to_string)
+            .or_else(|| env_string("RUZU_TRACE_FILE"))
+            .unwrap_or_default(),
         ring_capacity: get_u64("output", "ring_capacity", 16384) as usize,
         drain_interval_us: get_u64("output", "drain_interval_us", 1000),
         lossless: get_bool("output", "lossless", "RUZU_TRACE_LOSSLESS", false),
@@ -790,6 +833,7 @@ pub fn is_enabled(category: u16) -> bool {
         cat::IPC_INVALID => c.ipc_invalid_trace,
         cat::IPC_REPLY_WAKE => c.ipc_reply_wake_trace,
         cat::SVC_IPC_PROGRESS => c.svc_ipc_progress_trace,
+        cat::BINDER_TXN => c.binder_txn_trace,
         cat::BQP => c.bqp_trace,
         cat::GPU_VA_MAP | cat::GPU_VA_UNMAP => c.gpu_va_trace,
         cat::HEAP => c.heap_trace,
@@ -823,11 +867,14 @@ pub fn is_enabled(category: u16) -> bool {
         cat::GPU_THREAD => c.gpu_thread_trace,
         cat::DMA_PUSHER => c.dma_pusher_trace,
         cat::GL_DRAW_PROFILE => c.gl_draw_profile_trace,
+        cat::GL_PIPELINE => c.gl_pipeline_trace,
+        cat::PRESENT_COMPOSITE => c.present_composite_trace,
         cat::PRESENT_ALIAS => c.present_alias_trace,
         cat::PRESENT_IMAGE_SELECT => c.present_image_select_trace,
         cat::RT_DEPTH_ATTACH => c.rt_depth_attach_trace,
         cat::RT_ZETA_BIND => c.rt_zeta_bind_trace,
         cat::SUBMIT_GPFIFO => c.submit_gpfifo_trace,
+        cat::MII_SERVICE => c.mii_service_trace,
         _ => false,
     }
 }
@@ -1565,6 +1612,27 @@ fn format_into(out: &mut String, rec: &LogRecord) {
                 );
             }
         },
+        cat::BINDER_TXN => {
+            let stage = match rec.args[0] {
+                1 => "enter",
+                2 => "reply",
+                3 => "missing_binder",
+                _ => "unknown",
+            };
+            let status = rec.args.get(7).copied().unwrap_or(0) as i32;
+            let _ = writeln!(
+                out,
+                "[BINDER_TXN] stage={} seq={} id={} txn={} flags=0x{:X} in_len={} out_len={} status={}",
+                stage,
+                rec.args[1],
+                rec.args[2] as i32,
+                rec.args[3],
+                rec.args[4],
+                rec.args[5],
+                rec.args[6],
+                status,
+            );
+        }
         cat::TEXTURE_BIND => {
             let texture_type = match rec.args[4] {
                 0 => "Color1D",
@@ -1632,6 +1700,48 @@ fn format_into(out: &mut String, rec: &LogRecord) {
         cat::RT_BIND => {
             let unpack_size =
                 |packed: u64| -> (u32, u32) { ((packed >> 32) as u32, packed as u32) };
+            if rec.args[0] == u64::MAX - 1 {
+                let (width, height) = unpack_size(rec.args[10]);
+                let _ = writeln!(
+                        out,
+                        "[RT_DRAW_RESULT] draw_seq={} pipeline={} query={} any_samples={} gl_error=0x{:X} indexed={} primitive=0x{:X} vertices={} instances={} rt0=0x{:X}/{}x{} fbo={}",
+                        rec.args[1],
+                        rec.args[2],
+                        rec.args[3] != 0,
+                        rec.args[4] != 0,
+                        rec.args[5],
+                        rec.args[6] != 0,
+                        rec.args[7],
+                        rec.args[8],
+                        rec.args[9],
+                        rec.args[11],
+                        width,
+                        height,
+                        rec.args[12],
+                    );
+                return;
+            }
+            if rec.args[0] == u64::MAX {
+                let (width, height) = unpack_size(rec.args[9]);
+                let _ = writeln!(
+                        out,
+                        "[RT_PIPELINE_STATUS] draw_seq={} pipeline_before={} pipeline_after={} has_sources=0x{:X} has_programs={} can_draw={} rt0=0x{:X}/fmt=0x{:X}/{}x{} fbo={} build_attempted={} build_failed={}",
+                        rec.args[1],
+                        rec.args[2],
+                        rec.args[3],
+                        rec.args[4],
+                        rec.args[5] != 0,
+                        rec.args[6] != 0,
+                        rec.args[7],
+                        rec.args[8],
+                        width,
+                        height,
+                        rec.args[10],
+                        rec.args[11] != 0,
+                        rec.args[12] != 0,
+                    );
+                return;
+            }
             let (rt0_w, rt0_h) = unpack_size(rec.args[9]);
             let (rt1_w, rt1_h) = unpack_size(rec.args[12]);
             let (surface_w, surface_h) = unpack_size(rec.args[13]);
@@ -1732,7 +1842,7 @@ fn format_into(out: &mut String, rec: &LogRecord) {
         cat::RT_SAMPLE => {
             let _ = writeln!(
                 out,
-                "[RT_SAMPLE] draw_seq={} pipeline={} fbo={} rt0_gpu=0x{:X} fmt=0x{:X} size={}x{} sample={}x{} rgb_nonzero={} alpha_nonzero={} checksum=0x{:X} first_rgba=0x{:08X} gl_error=0x{:X}",
+                "[RT_SAMPLE] draw_seq={} pipeline={} fbo={} rt0_gpu=0x{:X} fmt=0x{:X} size={}x{} probe=({}, {}) rgb_nonzero={} alpha_nonzero={} checksum=0x{:X} probe_rgba=0x{:08X} gl_error=0x{:X}",
                 rec.args[0],
                 rec.args[1],
                 rec.args[2],
@@ -1865,6 +1975,25 @@ fn format_into(out: &mut String, rec: &LogRecord) {
                         rec.args[11],
                         rec.args[12],
                         rec.args[13],
+                    );
+            }
+            6 => {
+                let _ = writeln!(
+                        out,
+                        "[GL_DRAW_STATE] stage=pipeline_status draw_seq={} pipeline_before={} pipeline_after={} has_sources=0x{:X} has_programs={} can_draw={} rt0=0x{:X}/fmt=0x{:X}/{}x{} fbo={} build_attempted={} build_failed={}",
+                        rec.args[1],
+                        rec.args[2],
+                        rec.args[3],
+                        rec.args[4],
+                        rec.args[5] != 0,
+                        rec.args[6] != 0,
+                        rec.args[7],
+                        rec.args[8],
+                        rec.args[9] >> 32,
+                        rec.args[9] & 0xffff_ffff,
+                        rec.args[10],
+                        rec.args[11] != 0,
+                        rec.args[12] != 0,
                     );
             }
             _ => {
@@ -2080,6 +2209,31 @@ fn format_into(out: &mut String, rec: &LogRecord) {
                 rec.args[11],
                 rec.args[12],
                 rec.args[13],
+            );
+        }
+        cat::PRESENT_COMPOSITE => {
+            let stage = match rec.args[0] {
+                0 => "enter",
+                1 => "empty",
+                2 => "after_draw_screen",
+                3 => "before_swap",
+                4 => "after_swap",
+                5 => "sdl_swap",
+                6 => "sdl_make_current",
+                7 => "sdl_done_current",
+                _ => "unknown",
+            };
+            let _ = writeln!(
+                out,
+                "[PRESENT_COMPOSITE] stage={} frame={} framebuffers={} current_frame={} draw_count={} size={}x{} gl_error=0x{:X}",
+                stage,
+                rec.args[1],
+                rec.args[2],
+                rec.args[3],
+                rec.args[4],
+                rec.args[5],
+                rec.args[6],
+                rec.args[7],
             );
         }
         cat::PRESENT_IMAGE_SELECT => {
@@ -2350,6 +2504,74 @@ fn format_into(out: &mut String, rec: &LogRecord) {
                 rec.args[11],
                 rec.args[12],
                 rec.args[13],
+            );
+        }
+        cat::GL_PIPELINE => {
+            let stage = match rec.args[0] {
+                1 => "slow_enter",
+                2 => "cache_hit",
+                3 => "cache_miss",
+                4 => "create_begin",
+                5 => "create_end",
+                6 => "insert",
+                7 => "dual_vertex_begin",
+                8 => "dual_vertex_end",
+                9 => "stage_begin",
+                10 => "stage_analyze_failed",
+                11 => "stage_compile_end",
+                12 => "build_stage_success",
+                13 => "build_stage_failed",
+                14 => "build_pipeline_success",
+                _ => "unknown",
+            };
+            let _ = writeln!(
+                out,
+                "[GL_PIPELINE] stage={} seq={} cache_len={} key_raw=0x{:X} key_hash=0x{:016X} hashes=[0x{:016X},0x{:016X},0x{:016X},0x{:016X},0x{:016X},0x{:016X}] aux=[0x{:X},0x{:X},0x{:X}]",
+                stage,
+                rec.args[1],
+                rec.args[2],
+                rec.args[3],
+                rec.args[4],
+                rec.args[5],
+                rec.args[6],
+                rec.args[7],
+                rec.args[8],
+                rec.args[9],
+                rec.args[10],
+                rec.args[11],
+                rec.args[12],
+                rec.args[13],
+            );
+        }
+        cat::MII_SERVICE => {
+            let stage = match rec.args[0] {
+                1 => "get",
+                2 => "get1",
+                3 => "update_latest",
+                4 => "build_random",
+                5 => "build_default",
+                6 => "get2",
+                7 => "get3",
+                8 => "update_latest1",
+                9 => "convert_core_to_char",
+                10 => "convert_v3",
+                11 => "convert_char_to_core",
+                _ => "unknown",
+            };
+            let _ = writeln!(
+                out,
+                "[MII_SERVICE] stage={} cmd={} result=0x{:08X} aux0=0x{:X} aux1=0x{:X} create_id={:016X}{:016X} name_words=[{:016X},{:016X}] traits=[{:016X},{:016X}]",
+                stage,
+                rec.args[1],
+                rec.args[2] as u32,
+                rec.args[3],
+                rec.args[4],
+                rec.args[6],
+                rec.args[5],
+                rec.args[7],
+                rec.args[8],
+                rec.args[9],
+                rec.args[10],
             );
         }
         _ => {

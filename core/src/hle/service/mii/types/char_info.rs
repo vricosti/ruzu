@@ -11,11 +11,11 @@ use super::store_data::StoreData;
 use crate::hle::service::mii::mii_types::{
     BeardType, CommonColor, EyeType, EyebrowType, FacelineColor, FacelineMake, FacelineType,
     FacelineWrinkle, FavoriteColor, FontRegion, Gender, GlassType, HairFlip, HairType, MoleType,
-    MouthType, MustacheType, Nickname, NoseType, ValidationResult, MAX_BUILD, MAX_EYEBROW_ASPECT,
-    MAX_EYEBROW_ROTATE, MAX_EYEBROW_SCALE, MAX_EYEBROW_X, MAX_EYEBROW_Y, MAX_EYE_ASPECT,
-    MAX_EYE_SCALE, MAX_EYE_X, MAX_EYE_Y, MAX_GLASS_SCALE, MAX_GLASS_Y, MAX_HEIGHT, MAX_MOLE_SCALE,
-    MAX_MOLE_X, MAX_MOLE_Y, MAX_MOUTH_ASPECT, MAX_MOUTH_SCALE, MAX_MOUTH_Y, MAX_MUSTACHE_SCALE,
-    MAX_MUSTACHE_Y, MAX_NOSE_SCALE, MAX_NOSE_Y, MAX_REGION_MOVE, MAX_TYPE,
+    MouthType, MustacheType, Nickname, NoseType, Source, ValidationResult, MAX_BUILD,
+    MAX_EYEBROW_ASPECT, MAX_EYEBROW_ROTATE, MAX_EYEBROW_SCALE, MAX_EYEBROW_X, MAX_EYEBROW_Y,
+    MAX_EYE_ASPECT, MAX_EYE_SCALE, MAX_EYE_X, MAX_EYE_Y, MAX_GLASS_SCALE, MAX_GLASS_Y, MAX_HEIGHT,
+    MAX_MOLE_SCALE, MAX_MOLE_X, MAX_MOLE_Y, MAX_MOUTH_ASPECT, MAX_MOUTH_SCALE, MAX_MOUTH_Y,
+    MAX_MUSTACHE_SCALE, MAX_MUSTACHE_Y, MAX_NOSE_SCALE, MAX_NOSE_Y, MAX_REGION_MOVE, MAX_TYPE,
 };
 use common::uuid::UUID;
 
@@ -87,6 +87,16 @@ pub struct CharInfo {
 }
 
 const _: () = assert!(core::mem::size_of::<CharInfo>() == 0x58);
+
+/// Port of upstream `Service::Mii::CharInfoElement`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(C)]
+pub struct CharInfoElement {
+    pub char_info: CharInfo,
+    pub source: Source,
+}
+
+const _: () = assert!(core::mem::size_of::<CharInfoElement>() == 0x5c);
 
 impl Default for CharInfo {
     fn default() -> Self {

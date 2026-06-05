@@ -155,6 +155,26 @@ fn trace_write_targets() -> &'static [u64] {
     })
 }
 
+/// Trace values parsed from `RUZU_TRACE_W_VALUE=0xVALUE[,0xVALUE2,...]`.
+/// Used with `RUZU_NO_FASTMEM=1` when the interesting guest pointer is known
+/// but the destination address is not.
+fn trace_write_values() -> &'static [u128] {
+    use std::sync::OnceLock;
+    static VALUES: OnceLock<Vec<u128>> = OnceLock::new();
+    VALUES.get_or_init(|| {
+        std::env::var("RUZU_TRACE_W_VALUE")
+            .ok()
+            .map(|raw| {
+                raw.split(',')
+                    .map(|s| s.trim())
+                    .filter(|s| !s.is_empty())
+                    .filter_map(|tok| u128::from_str_radix(tok.trim_start_matches("0x"), 16).ok())
+                    .collect()
+            })
+            .unwrap_or_default()
+    })
+}
+
 #[inline(always)]
 fn maybe_trace_w_at_vaddr(cb: &DynarmicCallbacks32, vaddr: u64, size: u64, value: u128) {
     let targets = trace_write_targets();
@@ -194,6 +214,36 @@ fn maybe_trace_w_at_vaddr(cb: &DynarmicCallbacks32, vaddr: u64, size: u64, value
 #[inline(always)]
 fn watch_write(cb: &DynarmicCallbacks32, vaddr: u64, size: u64, value: u128) {
     maybe_trace_w_at_vaddr(cb, vaddr, size, value);
+    let value_targets = trace_write_values();
+    if !value_targets.is_empty() && value_targets.iter().any(|target| *target == value) {
+        let pc_ptr = cb.jit_pc_ptr;
+        let pc = pc_ptr.map(|p| unsafe { p.read_volatile() }).unwrap_or(0);
+        let lr = pc_ptr
+            .map(|p| unsafe { p.offset(-1).read_volatile() })
+            .unwrap_or(0);
+        let core = cb.parent.load(std::sync::atomic::Ordering::Relaxed);
+        let core_id = if core.is_null() {
+            -1i32
+        } else {
+            unsafe { (*core).core_index() as i32 }
+        };
+        let tid = crate::hle::kernel::kernel::get_current_thread_id_fast().unwrap_or(0);
+        let value_lo = value as u64;
+        let value_hi = (value >> 64) as u64;
+        common::trace::emit_raw(
+            common::trace::cat::WATCH_WRITE,
+            &[
+                core_id as u32 as u64,
+                tid,
+                pc as u64,
+                lr as u64,
+                vaddr,
+                size,
+                value_lo,
+                value_hi,
+            ],
+        );
+    }
     // Same filter semantics as watch_read: either filter alone is enough;
     // when both set, both must match. Lets us log writes from a PC window
     // regardless of address (useful for tracing helper function writes).

@@ -124,9 +124,11 @@ impl RomFSFactory {
         let fs_ctrl = self.filesystem_controller.as_ref()?;
         let fs_ctrl_guard = fs_ctrl.lock().unwrap();
         let content_prov = self.content_provider.as_ref()?.lock().unwrap();
+        let nca = content_prov.get_entry(current_process_title_id, ContentRecordType::Program);
         let patch_manager =
             PatchManager::new(current_process_title_id, &fs_ctrl_guard, &*content_prov);
         Some(patch_manager.patch_romfs(
+            nca.as_ref(),
             base,
             ContentRecordType::Program,
             self.packed_update_raw.clone(),
@@ -148,7 +150,7 @@ impl RomFSFactory {
         let fs_ctrl = self.filesystem_controller.as_ref()?;
         let fs_ctrl_guard = fs_ctrl.lock().unwrap();
         let patch_manager = PatchManager::new(title_id, &fs_ctrl_guard, &*provider);
-        Some(patch_manager.patch_romfs(romfs, type_, None, true))
+        Some(patch_manager.patch_romfs(Some(&nca), romfs, type_, None, true))
     }
 
     /// Open a patched RomFS with program index.

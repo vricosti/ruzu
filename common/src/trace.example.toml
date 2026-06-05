@@ -58,6 +58,9 @@ hwc = false
 # Low-overhead BufferQueueProducer attribution. Emits dequeue/queue/cancel
 # stages and frame numbers. (was RUZU_TRACE_BQP_RING=1)
 bqp = false
+# Low-overhead IHOSBinderDriver transaction attribution. Emits binder object id,
+# Android transaction id, flags, and parcel sizes.
+binder = false
 
 # ---- audio -----------------------------------------------------------
 [audio]
@@ -68,6 +71,13 @@ device_sink = false
 # Low-overhead voice-command generation summary. Emits counts for active voices,
 # data-source commands, skipped voices, and valid/nonzero wavebuffer addresses.
 voice = false
+
+# ---- Mii -------------------------------------------------------------
+[mii]
+# Low-overhead Mii service attribution for CharInfo/CoreData-producing IPCs.
+# Emits command id, result, count/source/index, create_id, nickname words, and
+# a compact set of visible traits. (env: RUZU_TRACE_MII_SERVICE=1)
+service = false
 
 # ---- Host1x video ----------------------------------------------------
 [host1x]
@@ -118,6 +128,8 @@ image_view = false
     # Low-overhead draw phase timing for slow draws. Use
     # RUZU_TRACE_GL_DRAW_PROFILE_MIN_US to raise/lower the default 500us threshold.
     draw_profile = false
+# Low-overhead OpenGL graphics-pipeline cache/compile attribution.
+pipeline = false
 # Present-time texture readback by guest GPU address. Use together with
 # RUZU_DUMP_PRESENT_EXTRA_GPU_ADDRS and optionally
 # RUZU_TRACE_PRESENT_TEXTURE_START/END to target a present-index window.
@@ -128,6 +140,9 @@ present_alias = false
 # Low-overhead texture-cache metadata for the framebuffer image selected by
 # AccelerateDisplay. No GL readback; useful around black-present transitions.
 present_image_select = false
+# Low-overhead final composite/swap attribution. No GL readback; useful when
+# PPM/backbuffer output is correct but the SDL window appears stale or black.
+present_composite = false
 # Synchronous texture upload diagnostics are controlled by
 # RUZU_TRACE_TEXTURE_UPLOAD=1. Use RUZU_TRACE_TEXTURE_UPLOAD_ADDRS=0x...
 # to keep the diagnostic focused on one or more guest GPU addresses.

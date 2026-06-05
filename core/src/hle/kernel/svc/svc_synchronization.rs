@@ -153,8 +153,24 @@ pub fn wait_synchronization(
             if !m.is_valid_virtual_address_range(user_handles, handle_bytes as u64) {
                 return RESULT_INVALID_POINTER;
             }
-            for i in 0..num_handles as usize {
-                handles.push(m.read_32(user_handles + (i * 4) as u64));
+            let mut handle_data = vec![0u8; handle_bytes];
+            let read_ok = m.read_block_checked_quiet(user_handles, &mut handle_data);
+            drop(m);
+            if !read_ok {
+                let mem = process.process_memory.read().unwrap();
+                if !mem.is_valid_range(user_handles, handle_bytes) {
+                    return RESULT_INVALID_POINTER;
+                }
+                for i in 0..num_handles as usize {
+                    handles.push(mem.read_32(user_handles + (i * 4) as u64));
+                }
+                drop(mem);
+                handle_data.clear();
+            }
+            for chunk in handle_data.chunks_exact(std::mem::size_of::<Handle>()) {
+                handles.push(Handle::from_le_bytes([
+                    chunk[0], chunk[1], chunk[2], chunk[3],
+                ]));
             }
         } else {
             let mem = process.process_memory.read().unwrap();

@@ -547,7 +547,13 @@ impl FspSrv {
                     let content_provider = content_provider.lock().unwrap();
                     let patch_manager =
                         PatchManager::new(title_id, &fs_controller, &*content_provider);
-                    patch_manager.patch_romfs(data, ContentRecordType::Data, None, true)
+                    patch_manager.patch_romfs(
+                        nca.as_ref(),
+                        data,
+                        ContentRecordType::Data,
+                        None,
+                        true,
+                    )
                 }
                 _ => data,
             };

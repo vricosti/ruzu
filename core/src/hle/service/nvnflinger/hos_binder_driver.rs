@@ -9,7 +9,7 @@
 
 use std::collections::BTreeMap;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -23,6 +23,7 @@ use super::hos_binder_driver_server::HosBinderDriverServer;
 use super::surface_flinger::SurfaceFlinger;
 
 static TRACE_BINDER_TXN_COUNT: AtomicUsize = AtomicUsize::new(0);
+static BINDER_TXN_RING_SEQ: AtomicU64 = AtomicU64::new(0);
 
 fn trace_binder_txn(args: std::fmt::Arguments<'_>) {
     if std::env::var_os("RUZU_TRACE_BINDER_TXN").is_none() {
@@ -171,6 +172,25 @@ impl IHosBinderDriver {
             record_binder_txn_phase(id, transaction_id, "read_buffer", t0.elapsed());
         }
         let write_size = ctx.get_write_buffer_size(0);
+        let binder_txn_seq = if common::trace::is_enabled(common::trace::cat::BINDER_TXN) {
+            let seq = BINDER_TXN_RING_SEQ.fetch_add(1, Ordering::Relaxed);
+            common::trace::emit_raw(
+                common::trace::cat::BINDER_TXN,
+                &[
+                    1,
+                    seq,
+                    id as i64 as u64,
+                    transaction_id as u64,
+                    flags as u64,
+                    parcel_data.len() as u64,
+                    write_size as u64,
+                    0,
+                ],
+            );
+            Some(seq)
+        } else {
+            None
+        };
         let t0 = profile.then(Instant::now);
         let mut parcel_reply = vec![0u8; write_size];
         if let Some(t0) = t0 {
@@ -198,6 +218,21 @@ impl IHosBinderDriver {
             if let Some(t0) = t0 {
                 record_binder_txn_phase(id, transaction_id, "binder_transact", t0.elapsed());
             }
+            if let Some(seq) = binder_txn_seq {
+                common::trace::emit_raw(
+                    common::trace::cat::BINDER_TXN,
+                    &[
+                        2,
+                        seq,
+                        id as i64 as u64,
+                        transaction_id as u64,
+                        flags as u64,
+                        parcel_data.len() as u64,
+                        parcel_reply.len() as u64,
+                        0,
+                    ],
+                );
+            }
             // For txn=1 (RequestBuffer) dump up to 400 bytes; the GraphicBuffer
             // payload is ~380 bytes and we want to byte-diff against zuyu.
             let dump_len = if transaction_id == 1 { 400 } else { 32 };
@@ -209,6 +244,21 @@ impl IHosBinderDriver {
                 &parcel_reply[..parcel_reply.len().min(dump_len)]
             ));
         } else {
+            if let Some(seq) = binder_txn_seq {
+                common::trace::emit_raw(
+                    common::trace::cat::BINDER_TXN,
+                    &[
+                        3,
+                        seq,
+                        id as i64 as u64,
+                        transaction_id as u64,
+                        flags as u64,
+                        parcel_data.len() as u64,
+                        write_size as u64,
+                        0,
+                    ],
+                );
+            }
             log::warn!("TransactParcel: binder id={} not found", id);
         }
         // Upstream: R_SUCCEED_IF(binder == nullptr) — silently succeeds if not found

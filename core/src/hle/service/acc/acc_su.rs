@@ -262,23 +262,9 @@ impl AccSU {
         let uuid = rp.pop_raw::<u128>();
         let (_rc, iprofile) = svc.interface.get_profile(uuid);
 
-        let is_domain = ctx
-            .get_manager()
-            .map_or(false, |m| m.lock().unwrap().is_domain());
-        let move_handle = if is_domain {
-            0
-        } else {
-            ctx.create_session_for_service(iprofile.clone())
-                .unwrap_or(0)
-        };
-
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 1);
         rb.push_result(RESULT_SUCCESS);
-        if is_domain {
-            ctx.add_domain_object(iprofile);
-        } else {
-            rb.push_move_objects(move_handle);
-        }
+        rb.push_ipc_interface(iprofile);
     }
 
     fn is_user_registration_request_permitted_handler(
@@ -359,22 +345,9 @@ impl AccSU {
         let uuid = rp.pop_raw::<u128>();
         let (_rc, editor) = svc.interface.get_profile_editor(uuid);
 
-        let is_domain = ctx
-            .get_manager()
-            .map_or(false, |m| m.lock().unwrap().is_domain());
-        let move_handle = if is_domain {
-            0
-        } else {
-            ctx.create_session_for_service(editor.clone()).unwrap_or(0)
-        };
-
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 1);
         rb.push_result(RESULT_SUCCESS);
-        if is_domain {
-            ctx.add_domain_object(editor);
-        } else {
-            rb.push_move_objects(move_handle);
-        }
+        rb.push_ipc_interface(editor);
     }
 }
 

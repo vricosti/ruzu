@@ -465,6 +465,11 @@ pub trait Maxwell3DAccess {
     /// Read rasterizer state.
     fn rasterizer_info(&self) -> crate::engines::maxwell_3d::RasterizerInfo;
 
+    /// Read `regs.rasterize_enable`, matching upstream `SyncRasterizeEnable`.
+    fn rasterize_enable(&self) -> bool {
+        true
+    }
+
     /// Read shader program region base address.
     fn program_base_address(&self) -> u64;
 
@@ -564,6 +569,7 @@ pub struct Maxwell3DDrawRegisters {
     pub blend_color: crate::engines::maxwell_3d::BlendColorInfo,
     pub depth_stencil: crate::engines::maxwell_3d::DepthStencilInfo,
     pub rasterizer: crate::engines::maxwell_3d::RasterizerInfo,
+    pub rasterize_enable: bool,
     pub descriptor_sync_regs: crate::texture_cache::texture_cache_base::DescriptorSyncRegs,
     pub window_origin_lower_left: bool,
     pub window_origin_flip_y: bool,
@@ -598,6 +604,7 @@ impl Default for Maxwell3DDrawRegisters {
             blend_color: Default::default(),
             depth_stencil: Default::default(),
             rasterizer: Default::default(),
+            rasterize_enable: true,
             descriptor_sync_regs: Default::default(),
             window_origin_lower_left: false,
             window_origin_flip_y: false,
@@ -641,6 +648,7 @@ impl Maxwell3DDrawRegisters {
             blend_color: maxwell3d.blend_color_info(),
             depth_stencil: maxwell3d.depth_stencil_info(),
             rasterizer: maxwell3d.rasterizer_info(),
+            rasterize_enable: maxwell3d.rasterize_enable(),
             descriptor_sync_regs: crate::texture_cache::texture_cache_base::DescriptorSyncRegs {
                 sampler_binding_via_header: matches!(
                     maxwell3d.sampler_binding(),
@@ -668,9 +676,8 @@ impl Maxwell3DDrawRegisters {
     }
 }
 
-#[derive(Clone)]
 enum Maxwell3DDrawSource<'a> {
-    Live(&'a dyn Maxwell3DAccess),
+    Live(&'a mut dyn Maxwell3DAccess),
     Snapshot(Maxwell3DDrawRegisters),
 }
 
@@ -681,7 +688,6 @@ enum Maxwell3DDrawSource<'a> {
 /// Maxwell view instead of a raw `DrawState`; the live path reads through
 /// `Maxwell3DAccess` so Maxwell register-derived values do not live in
 /// `DrawState`.
-#[derive(Clone)]
 pub struct Maxwell3DDrawView<'a> {
     draw_state: &'a DrawState,
     source: Maxwell3DDrawSource<'a>,
@@ -695,7 +701,7 @@ impl<'a> Maxwell3DDrawView<'a> {
         }
     }
 
-    pub fn live(draw_state: &'a DrawState, maxwell3d: &'a dyn Maxwell3DAccess) -> Self {
+    pub fn live(draw_state: &'a DrawState, maxwell3d: &'a mut dyn Maxwell3DAccess) -> Self {
         Self {
             draw_state,
             source: Maxwell3DDrawSource::Live(maxwell3d),
@@ -863,6 +869,13 @@ impl<'a> Maxwell3DDrawView<'a> {
         }
     }
 
+    pub fn rasterize_enable(&self) -> bool {
+        match &self.source {
+            Maxwell3DDrawSource::Live(maxwell3d) => maxwell3d.rasterize_enable(),
+            Maxwell3DDrawSource::Snapshot(registers) => registers.rasterize_enable,
+        }
+    }
+
     pub fn descriptor_sync_regs(
         &self,
     ) -> crate::texture_cache::texture_cache_base::DescriptorSyncRegs {
@@ -948,6 +961,20 @@ impl<'a> Maxwell3DDrawView<'a> {
         match &self.source {
             Maxwell3DDrawSource::Live(maxwell3d) => maxwell3d.dirty_flags(),
             Maxwell3DDrawSource::Snapshot(registers) => registers.dirty_flags,
+        }
+    }
+
+    /// Clear a consumed Maxwell dirty flag on the live draw source.
+    ///
+    /// Upstream OpenGL sync helpers clear `maxwell3d->dirty.flags[...]`
+    /// inside each `Sync*` method. Snapshot mode is retained for tests and
+    /// cannot mutate the source; clearing is therefore a no-op there.
+    pub fn clear_dirty_flag(&mut self, index: u8) {
+        match &mut self.source {
+            Maxwell3DDrawSource::Live(maxwell3d) => maxwell3d.clear_dirty_flag(index),
+            Maxwell3DDrawSource::Snapshot(registers) => {
+                registers.dirty_flags[index as usize] = false;
+            }
         }
     }
 

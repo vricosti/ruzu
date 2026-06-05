@@ -135,15 +135,7 @@ pub fn map_shared_memory(
         size as usize,
         KMemoryState::SHARED,
     );
-    // RUZU_BYPASS_CAN_CONTAIN_SHARED=1 — diagnostic: skip the CanContain
-    // check and allow the map even if the request overlaps the heap
-    // region. MK8D's first non-audio shared-memory map lands at an
-    // address inside its heap REGION's reserved 2 GB window (heap is
-    // only ~1.875 GB actual, but the region is bigger). Upstream's
-    // CanContain has the same logic — this bypass tests whether MK8D
-    // progresses past this point.
-    let bypass_check = std::env::var_os("RUZU_BYPASS_CAN_CONTAIN_SHARED").is_some();
-    if !can_contain && !bypass_check {
+    if !can_contain {
         log::error!(
             "svc::MapSharedMemory: address {:#x} size {:#x} cannot contain Shared",
             address,
@@ -192,6 +184,11 @@ pub fn map_shared_memory(
         return invalid_shared_memory_region_result();
     }
 
+    let result = process.add_shared_memory(shmem.clone(), address, size as usize);
+    if !result.is_success() {
+        return result;
+    }
+
     // Map the shared memory into the process page table.
     let result = shmem.map(
         &mut process.page_table,
@@ -209,6 +206,7 @@ pub fn map_shared_memory(
             map_perm
         );
     } else {
+        process.remove_shared_memory(&shmem, address, size as usize);
         log::error!("svc::MapSharedMemory: map failed, result={:?}", result);
     }
 
@@ -255,7 +253,11 @@ pub fn unmap_shared_memory(
         return invalid_shared_memory_region_result();
     }
 
-    shmem.unmap(&mut process.page_table, address, size as usize)
+    let result = shmem.unmap(&mut process.page_table, address, size as usize);
+    if result.is_success() {
+        process.remove_shared_memory(&shmem, address, size as usize);
+    }
+    result
 }
 
 /// Creates shared memory. (Unimplemented upstream.)

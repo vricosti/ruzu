@@ -1286,10 +1286,18 @@ fn main() {
     }
 
     log::info!("Entering main event loop");
+    let poll_events_loop = std::env::var_os("RUZU_POLL_EVENTS_LOOP").is_some();
     match &mut emu_window {
         EmuWindow::Gl(w) => {
-            while w.is_open() {
-                w.wait_event();
+            if poll_events_loop {
+                while w.is_open() {
+                    w.poll_events();
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+            } else {
+                while w.is_open() {
+                    w.wait_event();
+                }
             }
         }
         EmuWindow::Vk(w) => {

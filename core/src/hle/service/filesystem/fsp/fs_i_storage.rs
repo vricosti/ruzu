@@ -44,6 +44,14 @@ pub struct IStorage {
 
 impl IStorage {
     pub fn new(backend: VirtualFile) -> Self {
+        if std::env::var_os("RUZU_TRACE_ISTORAGE_OPEN").is_some() {
+            log::warn!(
+                "IStorage::Open backend name={} path={} size={}",
+                backend.get_name(),
+                backend.get_full_path(),
+                backend.get_size()
+            );
+        }
         Self {
             backend,
             handlers: build_handler_map(&[

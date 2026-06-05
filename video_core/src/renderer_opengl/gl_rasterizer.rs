@@ -882,7 +882,7 @@ fn sync_depth_stencil_state(depth_stencil: &DepthStencilInfo) {
 }
 
 fn sync_framebuffer_srgb(
-    draw_view: &Maxwell3DDrawView<'_>,
+    draw_view: &mut Maxwell3DDrawView<'_>,
     mut state_tracker: Option<&mut StateTracker>,
 ) {
     let flags = draw_view.dirty_flags();
@@ -892,6 +892,7 @@ fn sync_framebuffer_srgb(
     if !flags[GlDirty::FRAMEBUFFER_SRGB as usize] && !tracker_dirty {
         return;
     }
+    draw_view.clear_dirty_flag(GlDirty::FRAMEBUFFER_SRGB);
     unsafe {
         if draw_view.framebuffer_srgb() {
             gl::Enable(gl::FRAMEBUFFER_SRGB);
@@ -974,7 +975,7 @@ fn viewport_swizzle_components(swizzle: u32) -> [u32; 4] {
 }
 
 fn sync_viewport(
-    draw_view: &Maxwell3DDrawView<'_>,
+    draw_view: &mut Maxwell3DDrawView<'_>,
     mut state_tracker: Option<&mut StateTracker>,
     has_depth_buffer_float: bool,
     has_viewport_swizzle: bool,
@@ -1002,6 +1003,7 @@ fn sync_viewport(
             || flags[GlDirty::FRONT_FACE as usize]
             || tracker_dirty_front_face
         {
+            draw_view.clear_dirty_flag(GlDirty::FRONT_FACE);
             gl::FrontFace(viewport_front_face_to_gl(
                 draw_view.rasterizer().front_face,
                 draw_view.window_origin_flip_y(),
@@ -1010,6 +1012,7 @@ fn sync_viewport(
         }
 
         if dirty_viewport || dirty_clip_control {
+            draw_view.clear_dirty_flag(GlDirty::CLIP_CONTROL);
             let clip_origin = clip_control_origin(
                 draw_view.window_origin_lower_left(),
                 draw_view.viewport0_scale_y(),
@@ -1039,8 +1042,21 @@ fn sync_viewport(
             }
         }
 
-        gl::Disable(gl::RASTERIZER_DISCARD);
+        let tracker_dirty_rasterize_enable = state_tracker
+            .as_deref_mut()
+            .is_some_and(|tracker| tracker.exchange(GlDirty::RASTERIZE_ENABLE));
+        if flags[GlDirty::RASTERIZE_ENABLE as usize] || tracker_dirty_rasterize_enable {
+            draw_view.clear_dirty_flag(GlDirty::RASTERIZE_ENABLE);
+            if draw_view.rasterize_enable() {
+                gl::Disable(gl::RASTERIZER_DISCARD);
+            } else {
+                gl::Enable(gl::RASTERIZER_DISCARD);
+            }
+        }
         if dirty_viewport {
+            draw_view.clear_dirty_flag(GlDirty::VIEWPORTS);
+            draw_view.clear_dirty_flag(GlDirty::VIEWPORT_TRANSFORM);
+            draw_view.clear_dirty_flag(GlDirty::RESCALE_VIEWPORTS);
             let force = flags[GlDirty::VIEWPORT_TRANSFORM as usize]
                 || rescale_viewports
                 || tracker_dirty_viewport_transform
@@ -1051,6 +1067,7 @@ fn sync_viewport(
                     if !force && !flags[(GlDirty::VIEWPORT_0 as usize) + index] {
                         continue;
                     }
+                    draw_view.clear_dirty_flag(GlDirty::VIEWPORT_0 + index as u8);
                     gl::ViewportIndexedf(
                         index as u32,
                         surface_clip.x as f32,
@@ -1069,6 +1086,7 @@ fn sync_viewport(
                     if !force && !flags[(GlDirty::VIEWPORT_0 as usize) + index] {
                         continue;
                     }
+                    draw_view.clear_dirty_flag(GlDirty::VIEWPORT_0 + index as u8);
                     let x = viewport.translate_x - viewport.scale_x;
                     let mut y = viewport.translate_y - viewport.scale_y;
                     let width = viewport.scale_x * 2.0;
@@ -1107,90 +1125,179 @@ fn sync_viewport(
             }
         }
 
-        for (index, scissor) in draw_view.scissors().iter().enumerate() {
-            if scissor.enabled && scissor.max_x > scissor.min_x && scissor.max_y > scissor.min_y {
-                gl::Enablei(gl::SCISSOR_TEST, index as u32);
-                gl::ScissorIndexed(
-                    index as u32,
-                    scissor.min_x as i32,
-                    scissor.min_y as i32,
-                    (scissor.max_x - scissor.min_x) as i32,
-                    (scissor.max_y - scissor.min_y) as i32,
-                );
-            } else {
-                gl::Disablei(gl::SCISSOR_TEST, index as u32);
-            }
-        }
-
-        let color_masks = draw_view.color_masks();
-        if draw_view.color_mask_common() {
-            let mask = color_masks[0];
-            // Matches upstream `SyncColorMask` common-mask path exactly.
-            gl::ColorMask(
-                if mask.r { gl::TRUE } else { gl::FALSE },
-                if mask.b { gl::TRUE } else { gl::FALSE },
-                if mask.g { gl::TRUE } else { gl::FALSE },
-                if mask.a { gl::TRUE } else { gl::FALSE },
-            );
-        } else {
-            for (rt, mask) in color_masks.iter().enumerate() {
-                gl::ColorMaski(
-                    rt as u32,
-                    if mask.r { gl::TRUE } else { gl::FALSE },
-                    if mask.g { gl::TRUE } else { gl::FALSE },
-                    if mask.b { gl::TRUE } else { gl::FALSE },
-                    if mask.a { gl::TRUE } else { gl::FALSE },
-                );
-            }
-        }
-
-        gl::BlendColor(
-            draw_view.blend_color().r,
-            draw_view.blend_color().g,
-            draw_view.blend_color().b,
-            draw_view.blend_color().a,
-        );
-        if !draw_view.blend_per_target_enabled() {
-            let blend = draw_view.global_blend();
-            if !blend.enabled {
-                gl::Disable(gl::BLEND);
-            } else {
-                gl::Enable(gl::BLEND);
-                gl::BlendFuncSeparate(
-                    blend_factor_to_gl(blend.color_src),
-                    blend_factor_to_gl(blend.color_dst),
-                    blend_factor_to_gl(blend.alpha_src),
-                    blend_factor_to_gl(blend.alpha_dst),
-                );
-                gl::BlendEquationSeparate(
-                    blend_equation_to_gl(blend.color_op),
-                    blend_equation_to_gl(blend.alpha_op),
-                );
-            }
-        } else {
-            for (rt, blend) in draw_view.blend().iter().enumerate() {
-                if blend.enabled {
-                    gl::Enablei(gl::BLEND, rt as u32);
-                    gl::BlendEquationSeparatei(
-                        rt as u32,
-                        blend_equation_to_gl(blend.color_op),
-                        blend_equation_to_gl(blend.alpha_op),
+        let tracker_dirty_scissors = state_tracker
+            .as_deref_mut()
+            .is_some_and(|tracker| tracker.exchange(GlDirty::SCISSORS));
+        let dirty_scissors = flags[GlDirty::SCISSORS as usize]
+            || flags[GlDirty::RESCALE_SCISSORS as usize]
+            || tracker_dirty_scissors;
+        if dirty_scissors {
+            let force = flags[GlDirty::RESCALE_SCISSORS as usize] || tracker_dirty_scissors;
+            draw_view.clear_dirty_flag(GlDirty::SCISSORS);
+            draw_view.clear_dirty_flag(GlDirty::RESCALE_SCISSORS);
+            for (index, scissor) in draw_view.scissors().iter().enumerate() {
+                if !force && !flags[(GlDirty::SCISSOR_0 as usize) + index] {
+                    continue;
+                }
+                draw_view.clear_dirty_flag(GlDirty::SCISSOR_0 + index as u8);
+                if scissor.enabled && scissor.max_x > scissor.min_x && scissor.max_y > scissor.min_y
+                {
+                    gl::Enablei(gl::SCISSOR_TEST, index as u32);
+                    gl::ScissorIndexed(
+                        index as u32,
+                        scissor.min_x as i32,
+                        scissor.min_y as i32,
+                        (scissor.max_x - scissor.min_x) as i32,
+                        (scissor.max_y - scissor.min_y) as i32,
                     );
-                    gl::BlendFuncSeparatei(
+                } else {
+                    gl::Disablei(gl::SCISSOR_TEST, index as u32);
+                }
+            }
+        }
+
+        let tracker_dirty_color_masks = state_tracker
+            .as_deref_mut()
+            .is_some_and(|tracker| tracker.exchange(GlDirty::COLOR_MASKS));
+        if flags[GlDirty::COLOR_MASKS as usize] || tracker_dirty_color_masks {
+            draw_view.clear_dirty_flag(GlDirty::COLOR_MASKS);
+            let force = flags[GlDirty::COLOR_MASK_COMMON as usize] || tracker_dirty_color_masks;
+            draw_view.clear_dirty_flag(GlDirty::COLOR_MASK_COMMON);
+            let color_masks = draw_view.color_masks();
+            if draw_view.color_mask_common() {
+                if force || flags[GlDirty::COLOR_MASK_0 as usize] {
+                    draw_view.clear_dirty_flag(GlDirty::COLOR_MASK_0);
+                    let mask = color_masks[0];
+                    gl::ColorMask(
+                        if mask.r { gl::TRUE } else { gl::FALSE },
+                        if mask.b { gl::TRUE } else { gl::FALSE },
+                        if mask.g { gl::TRUE } else { gl::FALSE },
+                        if mask.a { gl::TRUE } else { gl::FALSE },
+                    );
+                }
+            } else {
+                for (rt, mask) in color_masks.iter().enumerate() {
+                    if !force && !flags[(GlDirty::COLOR_MASK_0 as usize) + rt] {
+                        continue;
+                    }
+                    draw_view.clear_dirty_flag(GlDirty::COLOR_MASK_0 + rt as u8);
+                    gl::ColorMaski(
                         rt as u32,
+                        if mask.r { gl::TRUE } else { gl::FALSE },
+                        if mask.g { gl::TRUE } else { gl::FALSE },
+                        if mask.b { gl::TRUE } else { gl::FALSE },
+                        if mask.a { gl::TRUE } else { gl::FALSE },
+                    );
+                }
+            }
+        }
+
+        let tracker_dirty_blend_color = state_tracker
+            .as_deref_mut()
+            .is_some_and(|tracker| tracker.exchange(GlDirty::BLEND_COLOR));
+        if flags[GlDirty::BLEND_COLOR as usize] || tracker_dirty_blend_color {
+            draw_view.clear_dirty_flag(GlDirty::BLEND_COLOR);
+            gl::BlendColor(
+                draw_view.blend_color().r,
+                draw_view.blend_color().g,
+                draw_view.blend_color().b,
+                draw_view.blend_color().a,
+            );
+        }
+        let tracker_dirty_blend_states = state_tracker
+            .as_deref_mut()
+            .is_some_and(|tracker| tracker.exchange(GlDirty::BLEND_STATES));
+        if flags[GlDirty::BLEND_STATES as usize] || tracker_dirty_blend_states {
+            draw_view.clear_dirty_flag(GlDirty::BLEND_STATES);
+            if !draw_view.blend_per_target_enabled() {
+                let blend = draw_view.global_blend();
+                if !blend.enabled {
+                    gl::Disable(gl::BLEND);
+                } else {
+                    gl::Enable(gl::BLEND);
+                    gl::BlendFuncSeparate(
                         blend_factor_to_gl(blend.color_src),
                         blend_factor_to_gl(blend.color_dst),
                         blend_factor_to_gl(blend.alpha_src),
                         blend_factor_to_gl(blend.alpha_dst),
                     );
-                } else {
-                    gl::Disablei(gl::BLEND, rt as u32);
+                    gl::BlendEquationSeparate(
+                        blend_equation_to_gl(blend.color_op),
+                        blend_equation_to_gl(blend.alpha_op),
+                    );
+                }
+            } else {
+                let force = flags[GlDirty::BLEND_INDEPENDENT_ENABLED as usize]
+                    || tracker_dirty_blend_states;
+                draw_view.clear_dirty_flag(GlDirty::BLEND_INDEPENDENT_ENABLED);
+                for (rt, blend) in draw_view.blend().iter().enumerate() {
+                    if !force && !flags[(GlDirty::BLEND_STATE_0 as usize) + rt] {
+                        continue;
+                    }
+                    draw_view.clear_dirty_flag(GlDirty::BLEND_STATE_0 + rt as u8);
+                    if blend.enabled {
+                        gl::Enablei(gl::BLEND, rt as u32);
+                        gl::BlendEquationSeparatei(
+                            rt as u32,
+                            blend_equation_to_gl(blend.color_op),
+                            blend_equation_to_gl(blend.alpha_op),
+                        );
+                        gl::BlendFuncSeparatei(
+                            rt as u32,
+                            blend_factor_to_gl(blend.color_src),
+                            blend_factor_to_gl(blend.color_dst),
+                            blend_factor_to_gl(blend.alpha_src),
+                            blend_factor_to_gl(blend.alpha_dst),
+                        );
+                    } else {
+                        gl::Disablei(gl::BLEND, rt as u32);
+                    }
                 }
             }
         }
     }
-    sync_depth_stencil_state(&draw_view.depth_stencil());
-    sync_rasterizer_state(draw_view.rasterizer());
+
+    let flags = draw_view.dirty_flags();
+    let depth_or_stencil_dirty = flags[GlDirty::DEPTH_MASK as usize]
+        || flags[GlDirty::DEPTH_TEST as usize]
+        || flags[GlDirty::STENCIL_TEST as usize]
+        || state_tracker.as_deref_mut().is_some_and(|tracker| {
+            tracker.exchange(GlDirty::DEPTH_MASK)
+                || tracker.exchange(GlDirty::DEPTH_TEST)
+                || tracker.exchange(GlDirty::STENCIL_TEST)
+        });
+    if depth_or_stencil_dirty {
+        draw_view.clear_dirty_flag(GlDirty::DEPTH_MASK);
+        draw_view.clear_dirty_flag(GlDirty::DEPTH_TEST);
+        draw_view.clear_dirty_flag(GlDirty::STENCIL_TEST);
+        sync_depth_stencil_state(&draw_view.depth_stencil());
+    }
+
+    let flags = draw_view.dirty_flags();
+    let rasterizer_dirty = flags[GlDirty::CULL_TEST as usize]
+        || flags[GlDirty::POLYGON_MODES as usize]
+        || flags[GlDirty::POLYGON_MODE_FRONT as usize]
+        || flags[GlDirty::POLYGON_MODE_BACK as usize]
+        || flags[GlDirty::LINE_WIDTH as usize]
+        || flags[GlDirty::POLYGON_OFFSET as usize]
+        || state_tracker.as_deref_mut().is_some_and(|tracker| {
+            tracker.exchange(GlDirty::CULL_TEST)
+                || tracker.exchange(GlDirty::POLYGON_MODES)
+                || tracker.exchange(GlDirty::POLYGON_MODE_FRONT)
+                || tracker.exchange(GlDirty::POLYGON_MODE_BACK)
+                || tracker.exchange(GlDirty::LINE_WIDTH)
+                || tracker.exchange(GlDirty::POLYGON_OFFSET)
+        });
+    if rasterizer_dirty {
+        draw_view.clear_dirty_flag(GlDirty::CULL_TEST);
+        draw_view.clear_dirty_flag(GlDirty::POLYGON_MODES);
+        draw_view.clear_dirty_flag(GlDirty::POLYGON_MODE_FRONT);
+        draw_view.clear_dirty_flag(GlDirty::POLYGON_MODE_BACK);
+        draw_view.clear_dirty_flag(GlDirty::LINE_WIDTH);
+        draw_view.clear_dirty_flag(GlDirty::POLYGON_OFFSET);
+        sync_rasterizer_state(draw_view.rasterizer());
+    }
+
     sync_framebuffer_srgb(draw_view, state_tracker);
 }
 
@@ -1561,6 +1668,11 @@ fn should_trace_present_texture_index(present_index: u64) -> bool {
     let start = trace_u64_env_cached(&START, "RUZU_TRACE_PRESENT_TEXTURE_START").unwrap_or(0);
     let end = trace_u64_env_cached(&END, "RUZU_TRACE_PRESENT_TEXTURE_END").unwrap_or(u64::MAX);
     present_index >= start && present_index <= end
+}
+
+fn has_present_texture_trace_window() -> bool {
+    std::env::var_os("RUZU_TRACE_PRESENT_TEXTURE_START").is_some()
+        || std::env::var_os("RUZU_TRACE_PRESENT_TEXTURE_END").is_some()
 }
 
 unsafe fn trace_present_display_texture(
@@ -2008,7 +2120,7 @@ impl RasterizerOpenGL {
             total_draw_count: 0,
             has_written_global_memory: false,
             buffer_cache,
-            texture_cache: OpenGLTextureCache::new(device_memory.clone()),
+            texture_cache: OpenGLTextureCache::new(device_memory.clone(), device),
             shader_cache: ShaderCache::new(device_memory),
             gl_shader_cache: OpenGLShaderCache::new(device),
             query_cache: QueryCache::new(),
@@ -2039,7 +2151,7 @@ impl RasterizerOpenGL {
             total_draw_count: 0,
             has_written_global_memory: false,
             buffer_cache: CommonBufferCache::new(&OPENGL_DEVICE_TRACKER),
-            texture_cache: OpenGLTextureCache::new(test_device_memory),
+            texture_cache: OpenGLTextureCache::new_with_caps(test_device_memory, true),
             shader_cache: ShaderCache::default(),
             gl_shader_cache: OpenGLShaderCache::new_for_test(),
             query_cache: QueryCache::new(),
@@ -2193,6 +2305,9 @@ impl RasterizerOpenGL {
                     || dump_index < 8
                     || dump_index.is_power_of_two()
             };
+            let should_dump = should_dump
+                && (!has_present_texture_trace_window()
+                    || should_trace_present_texture_index(dump_index));
             if should_dump {
                 if dump_present_texture {
                     let byte_count =
@@ -2506,7 +2621,7 @@ impl RasterizerInterface for RasterizerOpenGL {
     /// here (not on the pipeline) because upstream re-reads topology on
     /// every `Draw` — a single pipeline key may be drawn with multiple
     /// topologies in successive calls.
-    fn draw(&mut self, draw_view: Maxwell3DDrawView<'_>, instance_count: u32) {
+    fn draw(&mut self, mut draw_view: Maxwell3DDrawView<'_>, instance_count: u32) {
         let draw_state = draw_view.draw_state();
         let gl_debug = GlDrawDebugFlags::get();
         let trace_draw = gl_debug.profile_gl_draw;
@@ -2591,9 +2706,16 @@ impl RasterizerInterface for RasterizerOpenGL {
                             mm.lock().read_block(gpu_addr, out, reader.as_ref());
                             true
                         }),
+                        false,
+                        None,
                     );
                 } else {
-                    (*texture_cache).prepare_render_targets_from_snapshot(&render_targets, None);
+                    (*texture_cache).prepare_render_targets_from_snapshot(
+                        &render_targets,
+                        None,
+                        false,
+                        None,
+                    );
                 }
                 let surface_clip = draw_view.surface_clip();
                 (*texture_cache).framebuffer_for_render_targets_from_snapshot(
@@ -2742,11 +2864,28 @@ impl RasterizerInterface for RasterizerOpenGL {
         // separable per-stage programs here. Failures are logged once and
         // leave the pipeline in its placeholder state so we don't retry
         // every frame.
-        if !pipeline.has_gl_programs() && pipeline.glsl_sources.iter().any(|s| s.is_some()) {
+        let pipeline_handle_before_build = pipeline.program_pipeline_handle();
+        let pipeline_sources_mask =
+            pipeline
+                .glsl_sources
+                .iter()
+                .enumerate()
+                .fold(0u64, |mask, (index, source)| {
+                    if source.as_ref().is_some_and(|source| !source.is_empty()) {
+                        mask | (1u64 << index)
+                    } else {
+                        mask
+                    }
+                });
+        let mut pipeline_build_attempted = false;
+        let mut pipeline_build_failed = false;
+        if !pipeline.has_gl_programs() && pipeline_sources_mask != 0 {
+            pipeline_build_attempted = true;
             let step = profile_draw_timing.then(Instant::now);
             record_gl_draw_stage(draw_seq, 6);
             trace_gl_draw_stall!("[GL_DRAW_STALL] seq={} before_build_programs", draw_seq);
             if let Err((stage_index, msg)) = pipeline.build_from_sources() {
+                pipeline_build_failed = true;
                 log::warn!(
                     "RasterizerOpenGL::draw: pipeline build failed at stage {}: {}",
                     stage_index,
@@ -2769,6 +2908,7 @@ impl RasterizerInterface for RasterizerOpenGL {
 
         let is_indexed = draw_state.draw_indexed;
         let pipeline_has_programs = pipeline.has_gl_programs();
+        let pipeline_handle_after_build = pipeline.program_pipeline_handle();
         let step = profile_draw_timing.then(Instant::now);
         // Mirrors upstream `RasterizerOpenGL::PrepareDraw`
         // (gl_rasterizer.cpp:248): after pipeline lookup/build, hold
@@ -2801,6 +2941,63 @@ impl RasterizerInterface for RasterizerOpenGL {
         );
         record_gl_draw_stage(draw_seq, 9);
         trace_gl_draw_stall!("[GL_DRAW_STALL] seq={} after_cache_locks", draw_seq);
+        if common::trace::is_enabled(common::trace::cat::RT_BIND) {
+            static EARLY_RT_BIND_SEQ_MIN: OnceLock<Option<u64>> = OnceLock::new();
+            static EARLY_RT_BIND_SEQ_MAX: OnceLock<Option<u64>> = OnceLock::new();
+            static EARLY_RT_BIND_TIME_START: OnceLock<Option<u64>> = OnceLock::new();
+            static EARLY_RT_BIND_TIME_END: OnceLock<Option<u64>> = OnceLock::new();
+            let trace_rt_bind_seq_min =
+                trace_u64_env_cached(&EARLY_RT_BIND_SEQ_MIN, "RUZU_TRACE_RT_BIND_SEQ_MIN")
+                    .unwrap_or(0);
+            let trace_rt_bind_seq_max =
+                trace_u64_env_cached(&EARLY_RT_BIND_SEQ_MAX, "RUZU_TRACE_RT_BIND_SEQ_MAX")
+                    .unwrap_or(u64::MAX);
+            let trace_rt_bind_time_start = trace_u64_env_cached(
+                &EARLY_RT_BIND_TIME_START,
+                "RUZU_TRACE_RT_BIND_TIME_START_MS",
+            )
+            .unwrap_or(0);
+            let trace_rt_bind_time_end =
+                trace_u64_env_cached(&EARLY_RT_BIND_TIME_END, "RUZU_TRACE_RT_BIND_TIME_END_MS")
+                    .unwrap_or(u64::MAX);
+            let trace_rt_bind_elapsed = trace_elapsed_ms();
+            if let Some((framebuffer, width, height)) = bound_draw_framebuffer {
+                let rt0 = draw_view.render_targets().render_targets[0];
+                if draw_seq >= trace_rt_bind_seq_min
+                    && draw_seq <= trace_rt_bind_seq_max
+                    && trace_rt_bind_elapsed >= trace_rt_bind_time_start
+                    && trace_rt_bind_elapsed <= trace_rt_bind_time_end
+                    && rt0.address != 0
+                    && should_trace_rt_bind_address(rt0.address)
+                {
+                    common::trace::emit_raw(
+                        common::trace::cat::RT_BIND,
+                        &[
+                            u64::MAX,
+                            draw_seq,
+                            pipeline_handle_before_build as u64,
+                            pipeline_handle_after_build as u64,
+                            pipeline_sources_mask,
+                            pipeline_has_programs as u64,
+                            (pipeline_has_programs && self.transient_vao != 0) as u64,
+                            rt0.address,
+                            rt0.format as u64,
+                            ((width as u64) << 32) | height as u64,
+                            framebuffer as u64,
+                            pipeline_build_attempted as u64,
+                            pipeline_build_failed as u64,
+                        ],
+                    );
+                }
+            }
+        }
+        let trace_any_samples_rt = gl_debug.trace_any_samples_passed
+            && common::trace::is_enabled(common::trace::cat::RT_BIND)
+            && bound_draw_framebuffer.is_some()
+            && {
+                let rt0 = draw_view.render_targets().render_targets[0];
+                rt0.address != 0 && should_trace_rt_bind_address(rt0.address)
+            };
 
         // Mirrors upstream `GraphicsPipeline::ConfigureImpl`
         // (gl_graphics_pipeline.cpp:278-284): the very first thing the
@@ -4390,7 +4587,7 @@ impl RasterizerInterface for RasterizerOpenGL {
             record_gl_draw_stage(draw_seq, 31);
             trace_gl_draw_stall!("[GL_DRAW_STALL] seq={} before_fixed_state_sync", draw_seq);
             sync_viewport(
-                &draw_view,
+                &mut draw_view,
                 Some(&mut *self.state_tracker),
                 self.has_depth_buffer_float,
                 self.has_viewport_swizzle,
@@ -5286,8 +5483,8 @@ impl RasterizerInterface for RasterizerOpenGL {
                         }
                     }
                 }
-                let trace_any_samples =
-                    gl_debug.trace_any_samples_passed && trace_draw_state_for_pipeline;
+                let trace_any_samples = gl_debug.trace_any_samples_passed
+                    && (trace_draw_state_for_pipeline || trace_any_samples_rt);
                 if common::trace::is_enabled(common::trace::cat::GL_DRAW_STATE)
                     && trace_draw_state_for_pipeline
                 {
@@ -5380,6 +5577,29 @@ impl RasterizerInterface for RasterizerOpenGL {
                             ],
                         );
                     }
+                    if trace_any_samples_rt {
+                        if let Some((framebuffer, width, height)) = bound_draw_framebuffer {
+                            let rt0 = draw_view.render_targets().render_targets[0];
+                            common::trace::emit_raw(
+                                common::trace::cat::RT_BIND,
+                                &[
+                                    u64::MAX - 1,
+                                    draw_seq,
+                                    pipeline.program_pipeline_handle() as u64,
+                                    (any_samples_query != 0) as u64,
+                                    (any_samples != 0) as u64,
+                                    gl_error_after_draw as u64,
+                                    1,
+                                    primitive_mode as u64,
+                                    num_vertices as u64,
+                                    num_instances as u64,
+                                    ((width as u64) << 32) | height as u64,
+                                    rt0.address,
+                                    framebuffer as u64,
+                                ],
+                            );
+                        }
+                    }
                 }
             } else {
                 debug!(
@@ -5394,8 +5614,8 @@ impl RasterizerInterface for RasterizerOpenGL {
             if can_draw_gl {
                 let trace_draw_state_for_pipeline =
                     should_trace_draw_state(draw_seq, pipeline.program_pipeline_handle());
-                let trace_any_samples =
-                    gl_debug.trace_any_samples_passed && trace_draw_state_for_pipeline;
+                let trace_any_samples = gl_debug.trace_any_samples_passed
+                    && (trace_draw_state_for_pipeline || trace_any_samples_rt);
                 if common::trace::is_enabled(common::trace::cat::GL_DRAW_STATE)
                     && trace_draw_state_for_pipeline
                 {
@@ -5486,6 +5706,29 @@ impl RasterizerInterface for RasterizerOpenGL {
                             ],
                         );
                     }
+                    if trace_any_samples_rt {
+                        if let Some((framebuffer, width, height)) = bound_draw_framebuffer {
+                            let rt0 = draw_view.render_targets().render_targets[0];
+                            common::trace::emit_raw(
+                                common::trace::cat::RT_BIND,
+                                &[
+                                    u64::MAX - 1,
+                                    draw_seq,
+                                    pipeline.program_pipeline_handle() as u64,
+                                    (any_samples_query != 0) as u64,
+                                    (any_samples != 0) as u64,
+                                    gl_error_after_draw as u64,
+                                    0,
+                                    primitive_mode as u64,
+                                    num_vertices as u64,
+                                    num_instances as u64,
+                                    ((width as u64) << 32) | height as u64,
+                                    rt0.address,
+                                    framebuffer as u64,
+                                ],
+                            );
+                        }
+                    }
                 }
             } else {
                 debug!(
@@ -5545,6 +5788,31 @@ impl RasterizerInterface for RasterizerOpenGL {
                             pixels.as_mut_ptr() as *mut _,
                         );
                         let gl_error = gl::GetError();
+                        static RT_PROBE_X: OnceLock<Option<u64>> = OnceLock::new();
+                        static RT_PROBE_Y: OnceLock<Option<u64>> = OnceLock::new();
+                        let probe_x = trace_u64_env_cached(&RT_PROBE_X, "RUZU_TRACE_RT_PROBE_X")
+                            .unwrap_or(0) as u32;
+                        let probe_y = trace_u64_env_cached(&RT_PROBE_Y, "RUZU_TRACE_RT_PROBE_Y")
+                            .unwrap_or(0) as u32;
+                        let probe_x = probe_x.min(width.saturating_sub(1));
+                        let probe_y = probe_y.min(height.saturating_sub(1));
+                        let mut probe = [0u8; 4];
+                        if gl_error == gl::NO_ERROR && width != 0 && height != 0 {
+                            gl::ReadPixels(
+                                probe_x as i32,
+                                probe_y as i32,
+                                1,
+                                1,
+                                gl::RGBA,
+                                gl::UNSIGNED_BYTE,
+                                probe.as_mut_ptr() as *mut _,
+                            );
+                        }
+                        let gl_error = if gl_error == gl::NO_ERROR {
+                            gl::GetError()
+                        } else {
+                            gl_error
+                        };
                         let trace_grid = gl_debug.trace_rt_grid
                             && gl_error == gl::NO_ERROR
                             && width > 0
@@ -5608,11 +5876,7 @@ impl RasterizerInterface for RasterizerOpenGL {
                         let checksum = pixels[..sample_len]
                             .iter()
                             .fold(0u64, |acc, &byte| acc.wrapping_mul(16777619) ^ byte as u64);
-                        let first_rgba = if sample_len >= 4 {
-                            u32::from_le_bytes([pixels[0], pixels[1], pixels[2], pixels[3]])
-                        } else {
-                            0
-                        };
+                        let probe_rgba = u32::from_le_bytes(probe);
                         common::trace::emit_raw(
                             common::trace::cat::RT_SAMPLE,
                             &[
@@ -5623,12 +5887,12 @@ impl RasterizerInterface for RasterizerOpenGL {
                                 rt0.format as u64,
                                 width as u64,
                                 height as u64,
-                                sample_width as u64,
-                                sample_height as u64,
+                                probe_x as u64,
+                                probe_y as u64,
                                 rgb_nonzero,
                                 alpha_nonzero,
                                 checksum,
-                                first_rgba as u64,
+                                probe_rgba as u64,
                                 gl_error as u64,
                             ],
                         );
@@ -5837,6 +6101,10 @@ impl RasterizerInterface for RasterizerOpenGL {
         }
         let rt_readback = gl_debug.trace_rt_readback
             && should_trace_rt_sample_draw(pipeline.program_pipeline_handle() as u64, draw_seq);
+        static DUMP_RT_ADDR: OnceLock<Option<u64>> = OnceLock::new();
+        let rt0_addr_for_debug = draw_view.render_targets().render_targets[0].address;
+        let should_dump_rt_addr =
+            trace_u64_env_cached(&DUMP_RT_ADDR, "RUZU_DUMP_RT_ADDR") == Some(rt0_addr_for_debug);
         let should_trace_summary = if trace_draw_summary {
             static SUMMARY_LIMIT: OnceLock<Option<u64>> = OnceLock::new();
             static SUMMARY_SEQ_MIN: OnceLock<Option<u64>> = OnceLock::new();
@@ -6149,7 +6417,7 @@ impl RasterizerInterface for RasterizerOpenGL {
                 }
             }
         }
-        if can_draw_gl && (rt_readback || should_trace_summary) {
+        if can_draw_gl && (rt_readback || should_trace_summary || should_dump_rt_addr) {
             if let Some((framebuffer, width, height)) = bound_draw_framebuffer {
                 unsafe {
                     let sample_width = width.min(32) as i32;
@@ -6233,6 +6501,59 @@ impl RasterizerInterface for RasterizerOpenGL {
                             tex_bytes.len() as i32,
                             tex_bytes.as_mut_ptr() as *mut _,
                         );
+                    }
+                    static DUMP_RT_SEQ: OnceLock<Option<u64>> = OnceLock::new();
+                    let should_dump_rt_seq =
+                        trace_u64_env_cached(&DUMP_RT_SEQ, "RUZU_DUMP_RT_SEQ") == Some(draw_seq);
+                    if (should_dump_rt_seq || should_dump_rt_addr) && width != 0 && height != 0 {
+                        let mut pixels = vec![0u8; width as usize * height as usize * 4];
+                        gl::ReadPixels(
+                            0,
+                            0,
+                            width as i32,
+                            height as i32,
+                            gl::RGBA,
+                            gl::UNSIGNED_BYTE,
+                            pixels.as_mut_ptr() as *mut _,
+                        );
+                        gl_error |= gl::GetError();
+                        let dir = std::env::var("RUZU_DUMP_RT_DIR")
+                            .unwrap_or_else(|_| "/tmp/ruzu_rt_dumps".to_string());
+                        if let Err(err) = std::fs::create_dir_all(&dir) {
+                            log::warn!("[RT_DUMP] failed to create {}: {}", dir, err);
+                        } else {
+                            let path = format!(
+                                "{}/rt_seq_{}_gpu_{:X}_{}x{}.ppm",
+                                dir, draw_seq, rt0_addr_for_debug, width, height
+                            );
+                            let mut ppm = Vec::with_capacity(
+                                "P6\n4294967295 4294967295\n255\n".len()
+                                    + width as usize * height as usize * 3,
+                            );
+                            ppm.extend_from_slice(
+                                format!("P6\n{} {}\n255\n", width, height).as_bytes(),
+                            );
+                            for row in (0..height as usize).rev() {
+                                let row_start = row * width as usize * 4;
+                                for x in 0..width as usize {
+                                    let px = row_start + x * 4;
+                                    ppm.extend_from_slice(&pixels[px..px + 3]);
+                                }
+                            }
+                            match std::fs::write(&path, ppm) {
+                                Ok(()) => log::warn!(
+                                    "[RT_DUMP] seq={} fbo={} attached={} wrote {} gl_error=0x{:X}",
+                                    draw_seq,
+                                    framebuffer,
+                                    attached_tex,
+                                    path,
+                                    gl_error
+                                ),
+                                Err(err) => {
+                                    log::warn!("[RT_DUMP] failed to write {}: {}", path, err)
+                                }
+                            }
+                        }
                     }
 
                     gl::BindFramebuffer(gl::READ_FRAMEBUFFER, old_read_fb as u32);
@@ -6417,7 +6738,13 @@ impl RasterizerInterface for RasterizerOpenGL {
             (*texture_cache).update_render_targets_from_snapshot(&render_targets, |gpu_addr| {
                 mm.lock().gpu_to_cpu_address(gpu_addr)
             });
-            (*texture_cache).prepare_render_targets_from_snapshot(&render_targets, None);
+            let clear_scissor = clear_view.use_scissor().then(|| clear_view.scissor(0));
+            (*texture_cache).prepare_render_targets_from_snapshot(
+                &render_targets,
+                None,
+                true,
+                clear_scissor,
+            );
             if legacy_color_only_clear {
                 (*texture_cache)
                     .framebuffer_for_render_target(&render_targets.render_targets[rt_index])
