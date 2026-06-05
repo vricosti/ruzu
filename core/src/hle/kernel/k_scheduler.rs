@@ -40,11 +40,9 @@ struct StartThreadSchedEvent {
     first_svc_core: i32,
 }
 
-static STARTTHREAD_SCHED_PROFILE: std::sync::OnceLock<
-    Mutex<Vec<StartThreadSchedEvent>>,
-> = std::sync::OnceLock::new();
-static STARTTHREAD_SCHED_ORDER: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
+static STARTTHREAD_SCHED_PROFILE: std::sync::OnceLock<Mutex<Vec<StartThreadSchedEvent>>> =
+    std::sync::OnceLock::new();
+static STARTTHREAD_SCHED_ORDER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 fn startthread_sched_profile_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -125,7 +123,11 @@ pub fn record_start_thread_sched_result(child_tid: u64, result: u32) {
         return;
     };
     let mut events = events.lock().unwrap();
-    if let Some(event) = events.iter_mut().rev().find(|event| event.child_tid == child_tid) {
+    if let Some(event) = events
+        .iter_mut()
+        .rev()
+        .find(|event| event.child_tid == child_tid)
+    {
         event.run_result = result;
     }
 }

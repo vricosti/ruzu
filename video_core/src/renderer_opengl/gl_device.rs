@@ -105,8 +105,7 @@ impl Device {
 
         let has_warp_intrinsics = is_nvidia && has_ext("GL_NV_gpu_shader5");
         let has_shader_ballot = has_ext("GL_ARB_shader_ballot");
-        let has_vertex_viewport_layer =
-            has_ext("GL_ARB_shader_viewport_layer_array") || has_ext("GL_NV_viewport_array2");
+        let has_vertex_viewport_layer = has_ext("GL_ARB_shader_viewport_layer_array");
         let has_image_load_formatted = has_ext("GL_EXT_shader_image_load_formatted");
         let has_texture_shadow_lod = has_ext("GL_EXT_texture_shadow_lod");
         let has_vertex_buffer_unified_memory = has_ext("GL_NV_vertex_buffer_unified_memory");

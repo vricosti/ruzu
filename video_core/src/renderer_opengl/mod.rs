@@ -98,12 +98,53 @@ fn elapsed_us(start: Instant) -> u64 {
     start.elapsed().as_micros().min(u128::from(u64::MAX)) as u64
 }
 
+fn emit_present_composite(
+    stage: u64,
+    frame: u64,
+    framebuffers: u64,
+    current_frame: u64,
+    draw_count: u64,
+    width: u64,
+    height: u64,
+    gl_error: u64,
+) {
+    if !common::trace::is_enabled(common::trace::cat::PRESENT_COMPOSITE) {
+        return;
+    }
+    let _ = common::trace::emit_raw(
+        common::trace::cat::PRESENT_COMPOSITE,
+        &[
+            stage,
+            frame,
+            framebuffers,
+            current_frame,
+            draw_count,
+            width,
+            height,
+            gl_error,
+        ],
+    );
+}
+
 fn dump_present_ppm_once(
     current_frame: u64,
     draw_count: u64,
     layout: &FramebufferLayout,
 ) -> Option<u64> {
-    let Some(path) = std::env::var_os("RUZU_DUMP_PRESENT_PPM") else {
+    let path = if let Some(path) = std::env::var_os("RUZU_DUMP_PRESENT_PPM") {
+        path
+    } else if let Some(dir) = std::env::var_os("RUZU_DUMP_PRESENT_PPM_DIR") {
+        let dir = std::path::PathBuf::from(dir);
+        if let Err(err) = std::fs::create_dir_all(&dir) {
+            log::warn!(
+                "[PRESENT_PPM] failed to create {}: {}",
+                dir.display(),
+                err
+            );
+            return None;
+        }
+        dir.join("present.ppm").into_os_string()
+    } else {
         return None;
     };
     let present_index = PRESENT_PPM_CALL_COUNT.fetch_add(1, Ordering::Relaxed);
@@ -486,8 +527,28 @@ impl RendererOpenGL {
                 framebuffers.len()
             );
         }
+        emit_present_composite(
+            0,
+            self.base_data.current_frame.max(0) as u64,
+            framebuffers.len() as u64,
+            self.base_data.current_frame.max(0) as u64,
+            self.rasterizer.total_draw_count(),
+            self.framebuffer_layout.width as u64,
+            self.framebuffer_layout.height as u64,
+            0,
+        );
 
         if framebuffers.is_empty() {
+            emit_present_composite(
+                1,
+                self.base_data.current_frame.max(0) as u64,
+                0,
+                self.base_data.current_frame.max(0) as u64,
+                self.rasterizer.total_draw_count(),
+                self.framebuffer_layout.width as u64,
+                self.framebuffer_layout.height as u64,
+                0,
+            );
             return;
         }
 
@@ -522,6 +583,21 @@ impl RendererOpenGL {
         if let Some(start) = phase_start {
             PRESENT_DRAW_SCREEN_US.fetch_add(elapsed_us(start), Ordering::Relaxed);
         }
+        let draw_gl_error = if common::trace::is_enabled(common::trace::cat::PRESENT_COMPOSITE) {
+            unsafe { gl::GetError() as u64 }
+        } else {
+            0
+        };
+        emit_present_composite(
+            2,
+            self.base_data.current_frame.max(0) as u64,
+            framebuffers.len() as u64,
+            self.base_data.current_frame.max(0) as u64,
+            self.rasterizer.total_draw_count(),
+            self.framebuffer_layout.width as u64,
+            self.framebuffer_layout.height as u64,
+            draw_gl_error,
+        );
         let dumped_present_index = dump_present_ppm_once(
             self.base_data.current_frame.max(0) as u64,
             self.rasterizer.total_draw_count(),
@@ -618,7 +694,27 @@ impl RendererOpenGL {
         }
 
         let phase_start = if profile { Some(Instant::now()) } else { None };
+        emit_present_composite(
+            3,
+            self.base_data.current_frame.max(0) as u64,
+            framebuffers.len() as u64,
+            self.base_data.current_frame.max(0) as u64,
+            self.rasterizer.total_draw_count(),
+            self.framebuffer_layout.width as u64,
+            self.framebuffer_layout.height as u64,
+            0,
+        );
         self.context.swap_buffers();
+        emit_present_composite(
+            4,
+            self.base_data.current_frame.max(0) as u64,
+            framebuffers.len() as u64,
+            self.base_data.current_frame.max(0) as u64,
+            self.rasterizer.total_draw_count(),
+            self.framebuffer_layout.width as u64,
+            self.framebuffer_layout.height as u64,
+            0,
+        );
         if let Some(start) = phase_start {
             PRESENT_SWAP_BUFFERS_US.fetch_add(elapsed_us(start), Ordering::Relaxed);
         }

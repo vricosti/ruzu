@@ -11,7 +11,7 @@ use std::sync::{Condvar, Mutex};
 
 use crate::buffer_cache::buffer_cache_base::UniformBufferSizes;
 use crate::transform_feedback::TransformFeedbackState;
-use common::cityhash::city_hash64;
+use common::{cityhash::city_hash64, trace};
 use shader_recompiler::shader_info::{num_descriptors, Info as ShaderInfo};
 
 /// Maximum number of textures bound to a graphics pipeline.
@@ -30,6 +30,33 @@ pub const NUM_TRANSFORM_FEEDBACK_BUFFERS: usize = 4;
 pub const XFB_ENTRY_STRIDE: usize = 3;
 
 static GLSL_ERROR_DUMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+static GL_PIPELINE_BUILD_TRACE_SEQ: AtomicU64 = AtomicU64::new(0);
+
+fn trace_pipeline_build(stage: u64, key: &GraphicsPipelineKey, aux0: u64, aux1: u64, aux2: u64) {
+    if !trace::is_enabled(trace::cat::GL_PIPELINE) {
+        return;
+    }
+    let seq = GL_PIPELINE_BUILD_TRACE_SEQ.fetch_add(1, Ordering::Relaxed);
+    let _ = trace::emit_raw(
+        trace::cat::GL_PIPELINE,
+        &[
+            stage,
+            seq,
+            0,
+            key.raw as u64,
+            key.hash_key(),
+            key.unique_hashes[0],
+            key.unique_hashes[1],
+            key.unique_hashes[2],
+            key.unique_hashes[3],
+            key.unique_hashes[4],
+            key.unique_hashes[5],
+            aux0,
+            aux1,
+            aux2,
+        ],
+    );
+}
 
 /// Key used to identify a unique graphics pipeline configuration.
 ///
@@ -436,6 +463,13 @@ impl GraphicsPipeline {
                 Ok(program) => {
                     self.source_programs[stage_index] = program;
                     self.enabled_stages_mask |= 1 << stage_index;
+                    trace_pipeline_build(
+                        12,
+                        &self.key,
+                        stage_index as u64,
+                        program as u64,
+                        source.len() as u64,
+                    );
                     if std::env::var_os("RUZU_TRACE_PIPELINE_BUILD").is_some() {
                         let hash = city_hash64(source.as_bytes());
                         log::info!(
@@ -458,6 +492,7 @@ impl GraphicsPipeline {
                     }
                 }
                 Err(msg) => {
+                    trace_pipeline_build(13, &self.key, stage_index as u64, 0, source.len() as u64);
                     dump_glsl_on_error(self.key.hash_key(), stage_index, source, &msg);
                     // Roll back any handles we already created.
                     self.delete_gl_programs();
@@ -486,6 +521,13 @@ impl GraphicsPipeline {
                 self.source_programs,
             );
         }
+        trace_pipeline_build(
+            14,
+            &self.key,
+            self.program_pipeline as u64,
+            self.enabled_stages_mask as u64,
+            0,
+        );
         dump_glsl_for_pipeline_handle(
             self.program_pipeline,
             self.key.hash_key(),

@@ -3477,6 +3477,10 @@ impl dm::Maxwell3DAccess for Maxwell3D {
         self.rasterizer_info()
     }
 
+    fn rasterize_enable(&self) -> bool {
+        self.rasterize_enable()
+    }
+
     fn program_base_address(&self) -> u64 {
         self.program_base_address()
     }

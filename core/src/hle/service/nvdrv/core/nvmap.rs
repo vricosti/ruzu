@@ -254,13 +254,31 @@ impl NvMap {
     /// Note: Full pin logic requires host1x SMMU integration which is not yet available.
     /// This implementation handles the refcounting and unmap queue management faithfully,
     /// but the actual SMMU mapping is stubbed.
-    pub fn pin_handle(&self, handle_id: HandleId, _low_area_pin: bool) -> u64 {
+    pub fn pin_handle(&self, handle_id: HandleId, low_area_pin: bool) -> u64 {
+        let low_area_pin =
+            low_area_pin && std::env::var_os("RUZU_ENABLE_NVMAP_LOW_AREA_PIN").is_some();
         let handle = match self.get_handle(handle_id) {
             Some(h) => h,
             None => return 0,
         };
 
         let mut inner = handle.lock_inner();
+
+        let map_low_area = |inner: &mut HandleInner| {
+            if inner.pin_virt_address == 0 {
+                let Some(host1x) = self.system.get().host1x_core() else {
+                    return;
+                };
+                inner.pin_virt_address =
+                    host1x.host1x_gmmu_map_low(inner.d_address, inner.aligned_size as usize);
+                if std::env::var_os("RUZU_TRACE_NVMAP_PIN").is_some() {
+                    eprintln!(
+                        "[NVMAP_LOW_PIN] handle=0x{:X} d_address=0x{:X} size=0x{:X} -> gpu=0x{:X}",
+                        handle_id, inner.d_address, inner.aligned_size, inner.pin_virt_address
+                    );
+                }
+            }
+        };
 
         if inner.pins == 0 {
             // If we're in the unmap queue we can just remove ourselves and return since we're
@@ -281,8 +299,15 @@ impl NvMap {
                 *unmap_queue = new_queue;
 
                 if found {
+                    if low_area_pin {
+                        map_low_area(&mut inner);
+                    }
                     inner.pins += 1;
-                    return inner.d_address;
+                    return if low_area_pin {
+                        inner.pin_virt_address as u64
+                    } else {
+                        inner.d_address
+                    };
                 }
             }
 
@@ -328,8 +353,15 @@ impl NvMap {
             }
         }
 
+        if low_area_pin {
+            map_low_area(&mut inner);
+        }
         inner.pins += 1;
-        inner.d_address
+        if low_area_pin {
+            inner.pin_virt_address as u64
+        } else {
+            inner.d_address
+        }
     }
 
     /// When this has been called an equal number of times to `pin_handle` for the supplied
@@ -410,10 +442,14 @@ impl NvMap {
                         }
                         *unmap_queue = new_queue;
 
-                        // Upstream calls UnmapHandle which:
-                        //   host1x.GMMU().Unmap(pin_virt_address, aligned_size)
-                        //   host1x.Allocator().Free(pin_virt_address, aligned_size)
-                        // Until Host1x GMMU integration is available, just clear the addresses.
+                        if inner.pin_virt_address != 0 {
+                            if let Some(host1x) = self.system.get().host1x_core() {
+                                host1x.host1x_gmmu_unmap_low(
+                                    inner.pin_virt_address,
+                                    inner.aligned_size as usize,
+                                );
+                            }
+                        }
                         inner.pin_virt_address = 0;
                         inner.d_address = 0;
                         inner.in_heap = false;
