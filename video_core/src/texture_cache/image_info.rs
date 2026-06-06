@@ -309,15 +309,6 @@ impl ImageInfo {
         info
     }
 
-    /// Compatibility stub for older Rust call sites. New render-target paths
-    /// should use `from_render_target_info`.
-    pub fn from_render_target_config(_ct: &(), _msaa_mode: u32) -> Self {
-        log::warn!(
-            "ImageInfo::from_render_target_config: Maxwell3D regs not yet ported — returning default"
-        );
-        Self::default()
-    }
-
     /// Construct from depth/stencil config.
     ///
     /// Port of `ImageInfo::ImageInfo(const Zeta&, const ZetaSize&, MsaaMode)`.

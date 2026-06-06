@@ -2660,8 +2660,7 @@
 - Rust still routes query fallback writes through an injected callback instead of upstream direct `gpu_memory` access.
 
 ### Missing items
-- full `QueryCache` / `QueryFallback` split
-- full `query_cache.Query(...)` / `SyncOperation(...)` ownership remains unported; the current Rust fix is an owner-local timing bridge in `gl_rasterizer.rs`, not full query-cache parity
+- full upstream GPU-memory ownership remains unported; the current Rust query path still bridges cache invalidation through rasterizer-local callbacks.
 
 ### Binary layout verification
 - PASS: no raw struct layout; fence/query ordering covered by `query_fence_defers_guest_write_until_release`, `query_non_fence_defers_guest_write_until_next_fence_release_and_preserves_payload`, and `query_has_timeout_defers_guest_write_until_next_fence_release_and_preserves_payload`
@@ -2836,17 +2835,6 @@
 
 ### Binary layout verification
 - PASS: no guest-visible layout in this owner file.
-
-## 2026-03-30 — `video_core/src/renderer_opengl/gl_rasterizer.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_rasterizer.cpp`
-
-### Intentional differences
-- Rust still keeps the simplified fallback query path and does not yet own the upstream OpenGL query cache / `GPU&` integration needed for `gpu.GetTicks()` and typed query-cache backends.
-
-### Missing items
-- The typed `MaxwellToVideoCoreQuery()` / `query_cache.Query()` owner path is still not ported.
-
-### Binary layout verification
-- PASS: no guest-visible binary layout in this owner file.
 
 ## 2026-03-30 — `video_core/src/renderer_null/null_rasterizer.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_null/null_rasterizer.cpp`
 
@@ -7596,7 +7584,6 @@
 - Rust still routes the query path through `QueryCacheLegacy` rather than the exact upstream OpenGL `QueryCache` type.
 
 ### Missing items
-- Full OpenGL `query_cache.Query(...)` ownership through `gl_query_cache.rs`.
 - Upstream GPU-memory/device-memory ownership instead of the Rust callback bridge stored on the rasterizer.
 
 ### Binary layout verification
@@ -9028,7 +9015,6 @@
 
 ### Intentional differences
 - Rust still reconstructs the upstream `Regs` sub-views from flat `regs[]` words and local register constants instead of owning a literal `union Regs` layout. This keeps file ownership correct but not binary-identical at the struct-definition level.
-- Rust uses a local `bytes_per_pixel_from_render_target_format(...)` helper in this file because the upstream `PixelFormatFromRenderTargetFormat(...)` owner path is still not ported as a shared Rust helper.
 - Rust still logs the upstream `UNIMPLEMENTED_IF_MSG(...)` conditions in `handle_blit()` instead of asserting/stubbing them, because the active runtime still keeps a reduced software fallback path.
 
 ### Unintentional differences (to fix)
@@ -9093,7 +9079,6 @@
 ### Intentional differences
 - Rust does not store a literal upstream `MemoryManager&` owner in `SoftwareBlitEngine`. On this tree the active engine execution contract still passes `read_gpu` and expects `PendingWrite` results, so the matching owner file exposes `blit_to_pending_write(...)` as the narrow adaptation boundary.
 - Rust reuses the shared `Fermi2D::{Surface, Config, Filter, MemoryLayout}` owner types directly from `fermi_2d.rs` instead of maintaining a second reduced local copy in `blitter.rs`. This is closer to upstream ownership because the C++ owner includes `fermi_2d.h`.
-- Rust keeps `bytes_per_pixel_from_render_target_format(...)` as a local helper in this file because the upstream `PixelFormatFromRenderTargetFormat(...)` shared owner path is still not ported literally.
 
 ### Unintentional differences (to fix)
 - full source-surface read
@@ -9106,7 +9091,6 @@
 ### Missing items
 - `SoftwareBlitEngine` still does not own a literal `MemoryManager&` and still does not perform upstream `GpuGuestMemory` / `GpuGuestMemoryScoped` writeback in place.
 - the owner method is still named `blit_to_pending_write(...)` rather than the literal upstream `Blit(...)` because the surrounding Rust engine contract still returns pending writes.
-- the local `bytes_per_pixel_from_render_target_format(...)` helper should disappear once the shared upstream render-target-format owner path is ported.
 
 ### Binary layout verification
 - PASS: this file owns algorithm/control flow only; no guest-visible raw struct layout changed here.
@@ -9134,7 +9118,6 @@
 ### Missing items
 - `SoftwareBlitEngine` still does not own literal upstream `GpuGuestMemory` / `GpuGuestMemoryScoped` object types.
 - the file still does not mirror the literal upstream pImpl split between the public owner and `SoftwareBlitEngineImpl`.
-- the local `bytes_per_pixel_from_render_target_format(...)` helper should disappear once the shared upstream render-target-format owner path is ported.
 
 ### Binary layout verification
 - PASS: owner/control-flow change only; no guest-visible raw payload layout changed in this file.
@@ -9156,7 +9139,6 @@
 ## 2026-04-30 — `video_core/src/engines/fermi_2d.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/engines/fermi_2d.h` and `/home/vricosti/Dev/emulators/zuyu/src/video_core/engines/fermi_2d.cpp` (Surface layout follow-up)
 
 ### Intentional differences
-- Rust still represents `Surface::format` as `u32` instead of the literal upstream `RenderTargetFormat` field type, because the wider render-target-format owner path on this tree still routes through raw values.
 - Rust still reconstructs the wider upstream `Regs` owner from flat `regs[]` storage and method constants instead of storing a literal `union Regs`.
 
 ### Missing items
@@ -9320,7 +9302,6 @@
 
 ### Intentional differences
 - Rust still calls the converter factory with raw numeric format ids (`src.format as u32`, `dst.format as u32`) because the local converter-owner API still expects raw values instead of the upstream shared `PixelFormatFromRenderTargetFormat(...)` path.
-- Rust keeps a local `bytes_per_pixel_from_render_target_format(...)` helper in this file instead of consuming the upstream shared `BytesPerBlock(PixelFormatFromRenderTargetFormat(...))` owner chain directly.
 
 ### Missing items
 - the converter owner path still takes raw integer format ids rather than the literal upstream shared render-target-format mapping path.
@@ -11143,10 +11124,8 @@
 
 ### Intentional differences
 - `RUZU_TRACE_PRESENT_ALIASES` is env-gated diagnostic output only.
-- The old `from_render_target_config(&(), ...)` stub remains as a compatibility shim for unported call sites; real render-target paths now use `from_render_target_info`.
 
 ### Missing items
-- Include remaining `RenderTargetConfig` fields such as volume/mark_ieee_clean if future paths require them.
 - Full `FindRenderTargetView` parity is still incomplete: delete/retry loop, `TryFindBase`, true `FindOrEmplaceImageView` helper ownership, alias/overlap registration through `JoinImages`, and backend runtime interactions remain incomplete.
 
 ### Binary layout verification
