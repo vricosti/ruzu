@@ -2212,64 +2212,6 @@ impl KThread {
         }
     }
 
-    /// Run the thread.
-    /// Matches upstream `KThread::Run()`.
-    pub fn run(&mut self) -> u32 {
-        loop {
-            let _lk = if self.scheduler_lock_ptr != 0 {
-                Some(KScopedSchedulerLock::new(unsafe {
-                    &*(self.scheduler_lock_ptr
-                        as *const super::k_scheduler_lock::KAbstractSchedulerLock)
-                }))
-            } else {
-                None
-            };
-
-            if self.termination_requested.load(Ordering::Relaxed) {
-                return RESULT_TERMINATION_REQUESTED.get_inner_value();
-            }
-
-            let current_termination_requested =
-                super::kernel::with_current_thread_fast_mut(|t| t.is_termination_requested())
-                    .unwrap_or(false);
-            if current_termination_requested {
-                return RESULT_TERMINATION_REQUESTED.get_inner_value();
-            }
-
-            if self.get_state() != ThreadState::INITIALIZED {
-                return RESULT_INVALID_STATE.get_inner_value();
-            }
-
-            let current_suspended =
-                super::kernel::with_current_thread_fast_mut(|t| t.is_suspended()).unwrap_or(false);
-            if current_suspended {
-                super::kernel::with_current_thread_fast_mut(|t| t.update_state());
-                continue;
-            }
-
-            if self.is_user_thread() && self.is_suspended() {
-                self.update_state();
-            }
-
-            // Upstream increments the owning process running-thread count here.
-            // Runtime owners should prefer `run_thread(...)`, which releases
-            // the thread mutex before the scheduler lock unwinds and keeps this
-            // ownership step in the thread owner.
-            if let Some(parent) = self.parent.as_ref().and_then(Weak::upgrade) {
-                if let Ok(process) = parent.try_lock() {
-                    process.increment_running_thread_count();
-                }
-            }
-
-            // Upstream calls Open() here. Rust KThread still lacks literal
-            // KAutoObject inheritance, so there is no equivalent owner-local
-            // refcount operation to invoke yet.
-
-            self.set_state(ThreadState::RUNNABLE);
-            return RESULT_SUCCESS.get_inner_value();
-        }
-    }
-
     /// Arc-backed entry used by runtime owners that must not hold the thread
     /// mutex across scheduler-lock release.
     ///
@@ -3812,27 +3754,6 @@ mod tests {
         assert_eq!(thread.get_state(), ThreadState::RUNNABLE);
         assert!(thread.waiting_lock_info.is_none());
         assert_eq!(thread.get_wait_result(), RESULT_TIMED_OUT.get_inner_value());
-    }
-
-    #[test]
-    fn test_run_marks_thread_runnable_and_increments_parent_running_count() {
-        let process = Arc::new(ProcessLock::from_value(KProcess::new()));
-        let mut thread = KThread::new();
-        thread.parent = Some(Arc::downgrade(&process));
-        thread.thread_type = ThreadType::User;
-
-        let result = thread.run();
-
-        assert_eq!(result, RESULT_SUCCESS.get_inner_value());
-        assert_eq!(thread.get_state(), ThreadState::RUNNABLE);
-        assert_eq!(
-            process
-                .lock()
-                .unwrap()
-                .num_running_threads
-                .load(std::sync::atomic::Ordering::Relaxed),
-            1
-        );
     }
 
     #[test]
