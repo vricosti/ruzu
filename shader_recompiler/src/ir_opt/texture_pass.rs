@@ -994,27 +994,12 @@ fn add_image_buffer_descriptor(
 /// Join texture descriptors from `source` into `base`.
 ///
 /// Upstream: `JoinTextureInfo` in `texture_pass.cpp`.
-///
-/// Not yet implemented: requires the full texture descriptor tracking infrastructure.
 pub fn join_texture_info(_base: &mut ShaderInfo, _source: &mut ShaderInfo) {
     for desc in _source.texture_buffer_descriptors.drain(..) {
         add_texture_buffer_descriptor(&mut _base.texture_buffer_descriptors, desc);
     }
     for desc in _source.image_buffer_descriptors.drain(..) {
-        if let Some(index) = _base.image_buffer_descriptors.iter().position(|existing| {
-            existing.format == desc.format
-                && existing.cbuf_index == desc.cbuf_index
-                && existing.cbuf_offset == desc.cbuf_offset
-                && existing.count == desc.count
-                && existing.size_shift == desc.size_shift
-        }) {
-            let existing = &mut _base.image_buffer_descriptors[index];
-            existing.is_written |= desc.is_written;
-            existing.is_read |= desc.is_read;
-            existing.is_integer |= desc.is_integer;
-        } else {
-            _base.image_buffer_descriptors.push(desc);
-        }
+        add_image_buffer_descriptor(&mut _base.image_buffer_descriptors, desc);
     }
     for desc in _source.texture_descriptors.drain(..) {
         add_texture_descriptor(&mut _base.texture_descriptors, desc);

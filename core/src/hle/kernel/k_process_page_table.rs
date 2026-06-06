@@ -216,6 +216,13 @@ impl KProcessPageTable {
         self.base.query_info(addr)
     }
 
+    pub fn query_info_with_page_info(
+        &self,
+        addr: usize,
+    ) -> Option<(KMemoryInfo, super::svc::svc_types::PageInfo)> {
+        self.base.query_info_with_page_info(addr)
+    }
+
     pub fn dump_memory_blocks(&self) {
         self.base.m_memory_block_manager.dump_blocks();
     }

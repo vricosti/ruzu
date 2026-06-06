@@ -2662,6 +2662,52 @@ impl RasterizerOpenGL {
         }
     }
 
+    fn query_fallback(
+        &mut self,
+        gpu_addr: u64,
+        query_type: u32,
+        flags: QueryPropertiesFlags,
+        mut payload: u32,
+        _subreport: u32,
+    ) {
+        if query_type != crate::query_cache::types::QueryType::Payload as u32 {
+            payload = 1;
+        }
+        let Some(mm) = self.channel_memory_manager.as_ref().cloned() else {
+            if std::env::var_os("RUZU_TRACE_GL_QUERY").is_some() {
+                log::info!(
+                    "RasterizerOpenGL::query fallback drop gpu=0x{:X} type={} flags=0x{:X} payload=0x{:X}",
+                    gpu_addr,
+                    query_type,
+                    flags.bits(),
+                    payload
+                );
+            }
+            return;
+        };
+        let has_timeout = flags.contains(QueryPropertiesFlags::HAS_TIMEOUT);
+        let is_fence = flags.contains(QueryPropertiesFlags::IS_A_FENCE);
+        let gpu_ticks_getter = self.gpu_ticks_getter.as_ref().cloned();
+        let operation = Box::new(move || {
+            let mm = mm.lock();
+            if has_timeout {
+                let gpu_ticks = gpu_ticks_getter
+                    .as_ref()
+                    .map(|getter| getter())
+                    .unwrap_or(0);
+                mm.write_block_unsafe_owned(gpu_addr + 8, &gpu_ticks.to_le_bytes());
+                mm.write_block_unsafe_owned(gpu_addr, &(payload as u64).to_le_bytes());
+            } else {
+                mm.write_block_unsafe_owned(gpu_addr, &payload.to_le_bytes());
+            }
+        });
+        if is_fence {
+            RasterizerInterface::signal_fence(self, operation);
+        } else {
+            operation();
+        }
+    }
+
     pub fn set_guest_memory_writer(&mut self, writer: GuestMemoryWriter) {
         self.texture_cache.set_guest_memory_writer(writer);
     }
@@ -7333,42 +7379,7 @@ impl RasterizerInterface for RasterizerOpenGL {
             );
         }
         let Some(mapped_query_type) = maxwell_to_video_core_query(query_type) else {
-            if query_type != crate::query_cache::types::QueryType::Payload as u32 {
-                payload = 1;
-            }
-            let Some(mm) = self.channel_memory_manager.as_ref().cloned() else {
-                if std::env::var_os("RUZU_TRACE_GL_QUERY").is_some() {
-                    log::info!(
-                        "RasterizerOpenGL::query fallback drop gpu=0x{:X} type={} flags=0x{:X} payload=0x{:X}",
-                        gpu_addr,
-                        query_type,
-                        flags.bits(),
-                        payload
-                    );
-                }
-                return;
-            };
-            let has_timeout = flags.contains(QueryPropertiesFlags::HAS_TIMEOUT);
-            let is_fence = flags.contains(QueryPropertiesFlags::IS_A_FENCE);
-            let gpu_ticks_getter = self.gpu_ticks_getter.as_ref().cloned();
-            let operation = Box::new(move || {
-                let mm = mm.lock();
-                if has_timeout {
-                    let gpu_ticks = gpu_ticks_getter
-                        .as_ref()
-                        .map(|getter| getter())
-                        .unwrap_or(0);
-                    mm.write_block_unsafe_owned(gpu_addr + 8, &gpu_ticks.to_le_bytes());
-                    mm.write_block_unsafe_owned(gpu_addr, &(payload as u64).to_le_bytes());
-                } else {
-                    mm.write_block_unsafe_owned(gpu_addr, &payload.to_le_bytes());
-                }
-            });
-            if is_fence {
-                self.signal_fence(operation);
-            } else {
-                operation();
-            }
+            self.query_fallback(gpu_addr, query_type, flags, payload, _subreport);
             return;
         };
 
