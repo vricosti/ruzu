@@ -101,6 +101,7 @@ impl NvDispDisp0 {
             .gpu_core()
             .expect("GPU core must exist before nvdisp composite")
             .request_composite(output_layers, output_fences);
+        self.system.do_speed_limiting_now();
 
         if let Some(stats) = system.get_perf_stats() {
             stats.end_system_frame();
