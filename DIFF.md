@@ -13269,9 +13269,6 @@ The following still panic because upstream either also throws NotImplementedExce
 - Rust still routes guest-memory access through `guest_read_block` / `guest_write_block` instead of upstream's explicit `Core::Memory::Memory&` parameter on `CommandListProcessor`. This preserves the existing ruzu audio command plumbing while matching the same guest-memory read/write targets.
 - Rust returns early if the guest-memory bridge read/write fails. Upstream uses `ReadBlockUnsafe` / `WriteBlockUnsafe` and does not expose failure through the helper.
 
-### Unintentional differences (to fix)
-- The capture command still uses Rust range validation for the input mix buffer before processing. Upstream directly takes a `subspan(input * sample_count, sample_count)`.
-
 ### Binary layout verification
 - PASS: `CapturePayload` layout was not changed. The new helper code only changes host-side processing of the existing payload.
 
