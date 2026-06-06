@@ -4636,7 +4636,7 @@
 ## 2026-04-04 — core/src/hle/kernel/k_thread.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/k_thread.cpp
 
 ### Intentional differences
-- Rust `KThread` still does not literally inherit/embed `KAutoObject`, so `KThread::run()` cannot yet call upstream `Open()` at the exact owner boundary. The lifecycle gap is documented here instead of being hidden behind a Rust-only helper.
+- Rust `KThread` still does not literally inherit/embed `KAutoObject`, so `KThread::run_thread(...)` cannot yet call upstream `Open()` at the exact owner boundary. The lifecycle gap is documented here instead of being hidden behind a Rust-only helper.
 
 ### Missing items
 - Port literal `KAutoObject` ownership into `KThread` so `Run()` can call `Open()` exactly like upstream.
@@ -4834,7 +4834,7 @@
 - `KernelCore` still relies on `KERNEL_PTR` and Rust thread-locals to bridge scheduler callbacks into the kernel owner graph. Upstream uses raw pointers and inline thread-local state directly.
 
 ### Unintentional differences (to fix)
-- Deferred migration application in `real_update_highest_priority_threads()` cannot yet be done literally like upstream. Blocking on migrated thread mutexes can deadlock `svc::StartThread -> KThread::run()` while the target thread is still locked; the current fix uses `try_lock()` as a Rust-only mitigation.
+- Deferred migration application in `real_update_highest_priority_threads()` cannot yet be done literally like upstream. Blocking on migrated thread mutexes can deadlock `svc::StartThread -> KThread::run_thread(...)` while the target thread is still locked; the current fix uses `try_lock()` as a Rust-only mitigation.
 
 ### Missing items
 - Remove the deferred-migration `try_lock()` workaround by aligning thread/core ownership more closely with upstream scheduler semantics.
@@ -4864,11 +4864,9 @@
 - Runtime call sites now use `KThread::run_thread(&Arc<Mutex<KThread>>)` so the Rust object mutex is dropped before `KScopedSchedulerLock` unwinds. This preserves upstream `KThread::Run()` ordering while compensating for Rust `Arc<Mutex<KThread>>` ownership.
 
 ### Unintentional differences (to fix)
-- `KThread::run()` still exists as a direct `&mut self` variant for tests and older call paths; upstream has only the single raw-pointer owner method.
 - `Open()` is still not modeled literally because Rust `KThread` does not yet expose the upstream auto-object inheritance path.
 
 ### Missing items
-- Remove remaining direct `run()` call sites and collapse onto one owner path
 - Literal `Open()` parity during `Run()`
 
 ### Binary layout verification
@@ -5420,7 +5418,7 @@
 ## 2026-04-06 — `core/src/hle/kernel/kernel.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/kernel.cpp`
 
 ### Intentional differences
-- Rust still cannot perform the upstream `SetActiveCore()` migration literally under the same raw-pointer ownership model, because `KThread` is protected by `Arc<Mutex<KThread>>` and blocking on that mutex inside the scheduler callback can deadlock the unwind path of `KThread::run()`.
+- Rust still cannot perform the upstream `SetActiveCore()` migration literally under the same raw-pointer ownership model, because `KThread` is protected by `Arc<Mutex<KThread>>` and blocking on that mutex inside the scheduler callback can deadlock the unwind path of `KThread::run_thread(...)`.
 
 ### Unintentional differences (to fix)
 - `run_on_guest_core_process()` still differs from upstream service-thread construction/lifecycle in several Rust-only ways.

@@ -2116,7 +2116,7 @@ impl System {
         // Upstream: KProcess::Run() owns all scheduler registration for the
         // application thread (AddThread, PushBack, highest_priority_thread_id).
         // By the time we reach here the thread is already in the GSC thread list
-        // and the priority queue (done in k_process::run() before thread.run()).
+        // and the priority queue (done in k_process::run() before KThread::run_thread()).
         // All that remains is:
         //   1. Record the application thread in the kernel for later use.
         //   2. Interrupt core 0 to wake it from PhysicalCore::idle() so that
