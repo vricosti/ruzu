@@ -71,7 +71,6 @@ pub fn fill_block_both(
 ///
 /// This mirrors the upstream `SetupDirtyFlags` function. The actual register offsets
 /// depend on the Maxwell3D register layout which is defined in the engines module.
-/// This is a stub that will be filled in once the engine register definitions are ported.
 pub fn setup_dirty_flags(tables: &mut DirtyTables) {
     setup_dirty_vertex_buffers(tables);
     setup_index_buffer(tables);

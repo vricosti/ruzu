@@ -91,10 +91,21 @@ impl NPadResource {
     }
 
     pub fn set_app_resource_user_id(&mut self, aruid: u64) {
+        if self.active_data_aruid == aruid {
+            return;
+        }
         self.active_data_aruid = aruid;
-        // Upstream copies data from the matching state entry to active_data
+        self.default_hold_type = self.active_data.get_npad_joy_hold_type();
         if let Some(idx) = self.get_index_from_aruid(aruid) {
-            self.active_data = self.state[idx].data.clone();
+            let data = &mut self.state[idx].data;
+            if data.get_npad_status().is_policy() || data.get_npad_status().is_full_policy() {
+                data.set_npad_joy_hold_type(self.default_hold_type);
+            }
+            self.active_data = data.clone();
+            if data.get_npad_status().is_hold_type_set() {
+                self.active_data
+                    .set_npad_joy_hold_type(self.default_hold_type);
+            }
         }
     }
 
@@ -116,17 +127,29 @@ impl NPadResource {
             self.state[idx]
                 .data
                 .set_npad_system_common_policy(is_full_policy);
+            self.state[idx]
+                .data
+                .set_npad_joy_hold_type(self.default_hold_type);
+            if self.active_data_aruid == aruid {
+                self.active_data
+                    .set_npad_system_common_policy(is_full_policy);
+                self.active_data
+                    .set_npad_joy_hold_type(self.default_hold_type);
+            }
             return ResultCode::SUCCESS;
         }
-        hid_result::RESULT_ARUID_NOT_REGISTERED
+        hid_result::RESULT_NPAD_NOT_CONNECTED
     }
 
     pub fn clear_npad_system_common_policy(&mut self, aruid: u64) -> ResultCode {
         if let Some(idx) = self.get_index_from_aruid(aruid) {
             self.state[idx].data.clear_npad_system_common_policy();
+            if self.active_data_aruid == aruid {
+                self.active_data.clear_npad_system_common_policy();
+            }
             return ResultCode::SUCCESS;
         }
-        hid_result::RESULT_ARUID_NOT_REGISTERED
+        hid_result::RESULT_NPAD_NOT_CONNECTED
     }
 
     pub fn set_supported_npad_style_set(
@@ -344,7 +367,7 @@ impl NPadResource {
             }
             return ResultCode::SUCCESS;
         }
-        hid_result::RESULT_ARUID_NOT_REGISTERED
+        hid_result::RESULT_NPAD_NOT_CONNECTED
     }
 
     /// Port of NPadResource::IsAssigningSingleOnSlSrPressEnabled.
@@ -355,7 +378,7 @@ impl NPadResource {
         if let Some(idx) = self.get_index_from_aruid(aruid) {
             return Ok(self.state[idx].data.get_assigning_single_on_sl_sr_press());
         }
-        Err(hid_result::RESULT_ARUID_NOT_REGISTERED)
+        Err(hid_result::RESULT_NPAD_NOT_CONNECTED)
     }
 
     /// Port of NPadResource::GetMaskedSupportedNpadStyleSet.
@@ -404,7 +427,7 @@ impl NPadResource {
         if let Some(idx) = self.get_index_from_aruid(aruid) {
             return Ok(self.state[idx].data.get_home_protection_enabled(npad_id));
         }
-        Err(hid_result::RESULT_ARUID_NOT_REGISTERED)
+        Err(hid_result::RESULT_NPAD_NOT_CONNECTED)
     }
 
     pub fn set_home_protection_enabled(
@@ -417,9 +440,13 @@ impl NPadResource {
             self.state[idx]
                 .data
                 .set_home_protection_enabled(is_enabled, npad_id);
+            if self.active_data_aruid == aruid {
+                self.active_data
+                    .set_home_protection_enabled(is_enabled, npad_id);
+            }
             return ResultCode::SUCCESS;
         }
-        hid_result::RESULT_ARUID_NOT_REGISTERED
+        hid_result::RESULT_NPAD_NOT_CONNECTED
     }
 
     pub fn set_npad_analog_stick_use_center_clamp(
@@ -431,9 +458,13 @@ impl NPadResource {
             self.state[idx]
                 .data
                 .set_npad_analog_stick_use_center_clamp(is_enabled);
+            if self.active_data_aruid == aruid {
+                self.active_data
+                    .set_npad_analog_stick_use_center_clamp(is_enabled);
+            }
             return ResultCode::SUCCESS;
         }
-        hid_result::RESULT_ARUID_NOT_REGISTERED
+        hid_result::RESULT_NPAD_NOT_CONNECTED
     }
 
     pub fn set_npad_system_ext_state_enabled(
@@ -444,10 +475,14 @@ impl NPadResource {
         if let Some(idx) = self.get_index_from_aruid(aruid) {
             self.state[idx]
                 .data
-                .set_npad_system_ext_state_enabled(is_enabled);
+                .set_npad_analog_stick_use_center_clamp(is_enabled);
+            if self.active_data_aruid == aruid {
+                self.active_data
+                    .set_npad_analog_stick_use_center_clamp(is_enabled);
+            }
             return ResultCode::SUCCESS;
         }
-        hid_result::RESULT_ARUID_NOT_REGISTERED
+        hid_result::RESULT_NPAD_NOT_CONNECTED
     }
 
     /// Port of NPadResource::RegisterAppletResourceUserId.

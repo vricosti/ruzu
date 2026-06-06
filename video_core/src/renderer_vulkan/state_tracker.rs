@@ -165,10 +165,9 @@ impl StateTracker {
     /// Port of `StateTracker::SetupTables`.
     ///
     /// Upstream installs dirty-flag lookup tables into
-    /// `channel_state.maxwell_3d->dirty.tables`. The current Rust
-    /// `Maxwell3D` owner does not yet expose the upstream `dirty.tables`
-    /// storage, so this owner currently preserves only the method boundary
-    /// and channel association.
+    /// `channel_state.maxwell_3d->dirty.tables`. The Rust Maxwell3D owner now
+    /// has dirty table storage, but this Vulkan owner has not yet ported the
+    /// Vulkan-specific table population helpers.
     pub fn setup_tables(&mut self, channel_state: &ChannelState) {
         self.bound_channel_id = Some(channel_state.bind_id);
     }

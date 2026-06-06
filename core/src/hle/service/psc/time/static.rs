@@ -101,6 +101,8 @@ pub struct StaticService {
     /// Shared PSC::Time::TimeManager owner when this StaticService is created from
     /// the real time bootstrap path.
     shared_time: Option<Arc<Mutex<TimeManager>>>,
+    /// Cached handle returned by GetSharedMemoryNativeHandle.
+    shared_memory_handle: Mutex<Option<u32>>,
     /// Boot instant for CalculateMonotonicSystemClockBaseTimePoint.
     /// Matches upstream `m_system.CoreTiming().GetClockTicks()` converted to time.
     boot_instant: std::time::Instant,
@@ -143,6 +145,7 @@ impl StaticService {
             steady_clock_time_point: SteadyClockTimePoint::default(),
             time_zone: TimeZone::new(),
             shared_time: None,
+            shared_memory_handle: Mutex::new(None),
             boot_instant: std::time::Instant::now(),
             handlers,
             handlers_tipc: BTreeMap::new(),
@@ -333,15 +336,31 @@ impl StaticService {
     /// Corresponds to `StaticService::GetSharedMemoryNativeHandle` in upstream.
     /// Returns the kernel shared memory handle for lock-free time reads.
     ///
-    /// Upstream returns `&m_shared_memory.GetKSharedMemory()`. The
-    /// Glue::Time::StaticService handles this at the IPC handler level
-    /// (registering KSharedMemory in the process handle table). This PSC-level
-    /// wrapper is not called directly; the Glue layer bypasses it.
-    pub fn get_shared_memory_native_handle(&self) -> ResultCode {
-        log::debug!(
-            "PSC::Time::StaticService::GetSharedMemoryNativeHandle called. Not implemented!"
-        );
-        RESULT_NOT_IMPLEMENTED
+    /// Upstream returns `&m_shared_memory.GetKSharedMemory()` through a CMIF
+    /// `OutCopyHandle`. Rust materializes the equivalent guest handle at the IPC
+    /// boundary because `ResponseBuilder` stores raw handle values.
+    pub fn get_shared_memory_native_handle(&self, ctx: &mut HLERequestContext) -> Option<u32> {
+        log::debug!("PSC::Time::StaticService::GetSharedMemoryNativeHandle called");
+
+        let mut cached = self.shared_memory_handle.lock().unwrap();
+        if let Some(handle) = *cached {
+            return Some(handle);
+        }
+
+        let thread = ctx.get_thread()?;
+        let thread_guard = thread.lock().unwrap();
+        let parent = thread_guard.parent.as_ref()?.upgrade()?;
+        let mut process = parent.lock().unwrap();
+
+        static NEXT_SHMEM_ID: std::sync::atomic::AtomicU64 =
+            std::sync::atomic::AtomicU64::new(0x3100_0000);
+        let object_id = NEXT_SHMEM_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let shared_memory = self.get_shared_memory_arc()?;
+
+        process.register_shared_memory_object(object_id, shared_memory);
+        let handle = process.handle_table.add(object_id).ok()?;
+        *cached = Some(handle);
+        Some(handle)
     }
 
     pub fn get_shared_memory_arc(
@@ -575,23 +594,9 @@ impl StaticService {
 
     /// Helper to create a sub-service and push it as a domain object or move handle.
     fn push_sub_service(ctx: &mut HLERequestContext, sub_service: Arc<dyn SessionRequestHandler>) {
-        let is_domain = ctx
-            .get_manager()
-            .map_or(false, |manager| manager.lock().unwrap().is_domain());
-        let move_handle = if is_domain {
-            0
-        } else {
-            ctx.create_session_for_service(sub_service.clone())
-                .unwrap_or(0)
-        };
-
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 1);
         rb.push_result(RESULT_SUCCESS);
-        if is_domain {
-            ctx.add_domain_object(sub_service);
-        } else {
-            rb.push_move_objects(move_handle);
-        }
+        rb.push_ipc_interface(sub_service);
     }
 
     /// GetStandardUserSystemClock (cmd 0) handler.
@@ -654,9 +659,20 @@ impl StaticService {
         ctx: &mut HLERequestContext,
     ) {
         let service = Self::as_self(this);
-        let rc = service.get_shared_memory_native_handle();
-        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
-        rb.push_result(rc);
+        match service.get_shared_memory_native_handle(ctx) {
+            Some(handle) => {
+                let mut rb = ResponseBuilder::new(ctx, 2, 1, 0);
+                rb.push_result(RESULT_SUCCESS);
+                rb.push_copy_objects(handle);
+            }
+            None => {
+                log::error!(
+                    "PSC::Time::StaticService::GetSharedMemoryNativeHandle failed to create handle"
+                );
+                let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+                rb.push_result(RESULT_SUCCESS);
+            }
+        }
     }
 
     /// SetStandardSteadyClockInternalOffset (cmd 50) handler.

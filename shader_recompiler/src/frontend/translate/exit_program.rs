@@ -9,7 +9,7 @@
 
 use super::TranslatorVisitor;
 use crate::ir::types::ShaderStage;
-use crate::ir::value::{Reg, Value};
+use crate::ir::value::Value;
 
 impl<'a> TranslatorVisitor<'a> {
     /// Translate the EXIT instruction.
@@ -33,22 +33,84 @@ impl<'a> TranslatorVisitor<'a> {
     /// Reads the shader program header to determine which render targets are
     /// enabled and writes their color values, plus optional sample mask and depth.
     fn exit_fragment(&mut self) {
-        // In the full implementation, this reads the ProgramHeader to determine
-        // which render target components are enabled, then iterates over them
-        // writing SetFragColor for each component.
-        //
-        // For now, write a default single-RT output from R0..R3.
-        let r0 = self.f(0);
-        let r1 = self.f(1);
-        let r2 = self.f(2);
-        let r3 = self.f(3);
-        self.ir
-            .set_frag_color(Value::ImmU32(0), Value::ImmU32(0), r0);
-        self.ir
-            .set_frag_color(Value::ImmU32(0), Value::ImmU32(1), r1);
-        self.ir
-            .set_frag_color(Value::ImmU32(0), Value::ImmU32(2), r2);
-        self.ir
-            .set_frag_color(Value::ImmU32(0), Value::ImmU32(3), r3);
+        let Some(sph) = self.sph.clone() else {
+            for component in 0..4 {
+                let value = self.f(component);
+                self.ir
+                    .set_frag_color(Value::ImmU32(0), Value::ImmU32(component), value);
+            }
+            return;
+        };
+
+        let mut src_reg = 0;
+        for render_target in 0..8 {
+            if !sph.ps_has_output_components(render_target) {
+                continue;
+            }
+            let mask = sph.ps_enabled_output_components(render_target);
+            for (component, enabled) in mask.into_iter().enumerate() {
+                if enabled {
+                    let value = self.f(src_reg);
+                    self.ir.set_frag_color(
+                        Value::ImmU32(render_target),
+                        Value::ImmU32(component as u32),
+                        value,
+                    );
+                }
+                src_reg += 1;
+            }
+        }
+        if sph.ps_omap_sample_mask() {
+            let value = self.x(src_reg);
+            self.ir.set_sample_mask(value);
+        }
+        if sph.ps_omap_depth() {
+            let value = self.f(src_reg + 1);
+            self.ir.set_frag_depth(value);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ir::opcodes::Opcode;
+    use crate::ir::program::Program;
+    use crate::program_header::ProgramHeader;
+
+    #[test]
+    fn exit_fragment_uses_ps_omap_outputs_sample_mask_and_depth() {
+        let mut program = Program::new(ShaderStage::Fragment);
+        let block = program.add_block();
+        let mut sph = ProgramHeader::default();
+        sph.raw[18] = 0b0101 | (0b0010 << 4);
+        sph.raw[19] = 0b11;
+
+        {
+            let mut visitor = TranslatorVisitor::new_with_sph(&mut program, block, Some(sph));
+            visitor.translate_exit(0);
+        }
+
+        let opcodes: Vec<_> = program
+            .blocks
+            .iter()
+            .flat_map(|block| block.iter().map(|inst| inst.opcode))
+            .filter(|opcode| {
+                matches!(
+                    opcode,
+                    Opcode::SetFragColor | Opcode::SetSampleMask | Opcode::SetFragDepth
+                )
+            })
+            .collect();
+        assert_eq!(
+            opcodes,
+            vec![
+                Opcode::SetFragColor,
+                Opcode::SetFragColor,
+                Opcode::SetFragColor,
+                Opcode::SetSampleMask,
+                Opcode::SetFragDepth,
+            ]
+        );
     }
 }

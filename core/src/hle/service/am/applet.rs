@@ -9,6 +9,7 @@ use std::sync::{Arc, Mutex, Weak};
 use crate::core::SystemRef;
 use crate::hle::kernel::k_process::KProcess;
 use crate::hle::kernel::k_readable_event::KReadableEvent;
+use crate::hle::service::caps::caps_types::AlbumImageOrientation;
 use crate::hle::service::hle_ipc::{HLERequestContext, Handle};
 use crate::hle::service::os::process::Process;
 
@@ -84,6 +85,7 @@ pub struct Applet {
     pub fatal_section_count: i32,
     pub handles_request_to_display: bool,
     pub screenshot_permission: ScreenshotPermission,
+    pub album_image_orientation: AlbumImageOrientation,
     pub idle_time_detection_extension: IdleTimeDetectionExtension,
     pub auto_sleep_disabled: bool,
     pub suspended_ticks: u64,
@@ -102,6 +104,8 @@ pub struct Applet {
     pub health_warning_disappeared_system_event_handle: Option<Handle>,
     pub library_applet_launchable_event: Option<Arc<Mutex<KReadableEvent>>>,
     pub library_applet_launchable_event_handle: Option<Handle>,
+    pub accumulated_suspended_tick_changed_event: Option<Arc<Mutex<KReadableEvent>>>,
+    pub accumulated_suspended_tick_changed_event_handle: Option<Handle>,
     pub sleep_lock_event: Option<Arc<Mutex<KReadableEvent>>>,
     pub sleep_lock_event_handle: Option<Handle>,
     pub state_changed_event: Option<Arc<Mutex<KReadableEvent>>>,
@@ -162,6 +166,7 @@ impl Applet {
             fatal_section_count: 0,
             handles_request_to_display: false,
             screenshot_permission: ScreenshotPermission::default(),
+            album_image_orientation: AlbumImageOrientation::default(),
             idle_time_detection_extension: IdleTimeDetectionExtension::default(),
             auto_sleep_disabled: false,
             suspended_ticks: 0,
@@ -178,6 +183,8 @@ impl Applet {
             health_warning_disappeared_system_event_handle: None,
             library_applet_launchable_event: None,
             library_applet_launchable_event_handle: None,
+            accumulated_suspended_tick_changed_event: None,
+            accumulated_suspended_tick_changed_event_handle: None,
             sleep_lock_event: None,
             sleep_lock_event_handle: None,
             state_changed_event: None,
@@ -240,6 +247,18 @@ impl Applet {
         if let Some(event) = self.library_applet_launchable_event.as_ref() {
             Self::signal_persistent_readable_event(process, event);
         }
+    }
+
+    pub fn ensure_accumulated_suspended_tick_changed_event(
+        &mut self,
+        ctx: &HLERequestContext,
+    ) -> Option<Handle> {
+        Self::ensure_persistent_readable_event(
+            ctx,
+            &mut self.accumulated_suspended_tick_changed_event,
+            &mut self.accumulated_suspended_tick_changed_event_handle,
+            false,
+        )
     }
 
     pub fn ensure_gpu_error_detected_system_event(

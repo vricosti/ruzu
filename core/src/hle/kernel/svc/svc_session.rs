@@ -110,7 +110,7 @@ pub fn accept_session(system: &System, out: &mut Handle, port_handle: Handle) ->
     };
 
     let Some(server_session_object_id) = port.lock().unwrap().server.accept_session() else {
-        return RESULT_INVALID_STATE;
+        return RESULT_NOT_FOUND;
     };
 
     let handle = match process.handle_table.add(server_session_object_id) {

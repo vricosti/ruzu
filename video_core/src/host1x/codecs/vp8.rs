@@ -98,20 +98,19 @@ impl DecoderImpl for Vp8 {
         Vec::new()
     }
 
-    fn get_progressive_offsets(&self, _regs: &NvdecRegisters) -> (u64, u64) {
-        // Upstream reads surface_luma_offsets[Current].Address() and
-        // surface_chroma_offsets[Current].Address() from NvdecRegisters.
-        // Stubbed until NvdecRegisters are wired into the decoder.
-        log::warn!("VP8::get_progressive_offsets: not yet implemented (requires NvdecRegisters)");
-        (0, 0)
+    fn get_progressive_offsets(&self, regs: &NvdecRegisters) -> (u64, u64) {
+        let current = Vp8SurfaceIndex::Current as usize;
+        (
+            regs.surface_luma_offset(current).address(),
+            regs.surface_chroma_offset(current).address(),
+        )
     }
 
-    fn get_interlaced_offsets(&self, _regs: &NvdecRegisters) -> (u64, u64, u64, u64) {
-        // VP8 doesn't truly support interlacing; upstream returns the same Current surface
-        // luma/chroma offsets for all four return values.
-        // Stubbed until NvdecRegisters are wired into the decoder.
-        log::warn!("VP8::get_interlaced_offsets: not yet implemented (requires NvdecRegisters)");
-        (0, 0, 0, 0)
+    fn get_interlaced_offsets(&self, regs: &NvdecRegisters) -> (u64, u64, u64, u64) {
+        let current = Vp8SurfaceIndex::Current as usize;
+        let luma = regs.surface_luma_offset(current).address();
+        let chroma = regs.surface_chroma_offset(current).address();
+        (luma, luma, chroma, chroma)
     }
 
     fn is_interlaced(&self) -> bool {

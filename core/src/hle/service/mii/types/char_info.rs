@@ -28,7 +28,7 @@ use common::uuid::UUID;
 ///   u16 null_terminator (2 bytes)
 ///   then individual u8 fields (50 bytes)
 ///   Total: 16 + 20 + 2 + 50 = 88 = 0x58.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy)]
 #[repr(C)]
 pub struct CharInfo {
     pub create_id: [u8; 16],
@@ -526,9 +526,69 @@ impl CharInfo {
     }
 
     pub fn equals(&self, info: &CharInfo) -> bool {
-        self == info
+        let mut is_identical = info.verify() == ValidationResult::NoErrors;
+        is_identical &= self.name.data == info.get_nickname().data;
+        is_identical &= self.create_id == info.get_create_id();
+        is_identical &= self.font_region == info.get_font_region() as u8;
+        is_identical &= self.favorite_color == info.get_favorite_color() as u8;
+        is_identical &= self.gender == info.get_gender() as u8;
+        is_identical &= self.height == info.get_height();
+        is_identical &= self.build == info.get_build();
+        is_identical &= self.type_val == info.get_type();
+        is_identical &= self.region_move == info.get_region_move();
+        is_identical &= self.faceline_type == info.get_faceline_type() as u8;
+        is_identical &= self.faceline_color == info.get_faceline_color() as u8;
+        is_identical &= self.faceline_wrinkle == info.get_faceline_wrinkle() as u8;
+        is_identical &= self.faceline_make == info.get_faceline_make() as u8;
+        is_identical &= self.hair_type == info.get_hair_type() as u8;
+        is_identical &= self.hair_color == info.get_hair_color().0;
+        is_identical &= self.hair_flip == info.get_hair_flip() as u8;
+        is_identical &= self.eye_type == info.get_eye_type() as u8;
+        is_identical &= self.eye_color == info.get_eye_color().0;
+        is_identical &= self.eye_scale == info.get_eye_scale();
+        is_identical &= self.eye_aspect == info.get_eye_aspect();
+        is_identical &= self.eye_rotate == info.get_eye_rotate();
+        is_identical &= self.eye_x == info.get_eye_x();
+        is_identical &= self.eye_y == info.get_eye_y();
+        is_identical &= self.eyebrow_type == info.get_eyebrow_type() as u8;
+        is_identical &= self.eyebrow_color == info.get_eyebrow_color().0;
+        is_identical &= self.eyebrow_scale == info.get_eyebrow_scale();
+        is_identical &= self.eyebrow_aspect == info.get_eyebrow_aspect();
+        is_identical &= self.eyebrow_rotate == info.get_eyebrow_rotate();
+        is_identical &= self.eyebrow_x == info.get_eyebrow_x();
+        is_identical &= self.eyebrow_y == info.get_eyebrow_y();
+        is_identical &= self.nose_type == info.get_nose_type() as u8;
+        is_identical &= self.nose_scale == info.get_nose_scale();
+        is_identical &= self.nose_y == info.get_nose_y();
+        is_identical &= self.mouth_type == info.get_mouth_type() as u8;
+        is_identical &= self.mouth_color == info.get_mouth_color().0;
+        is_identical &= self.mouth_scale == info.get_mouth_scale();
+        is_identical &= self.mouth_aspect == info.get_mouth_aspect();
+        is_identical &= self.mouth_y == info.get_mouth_y();
+        is_identical &= self.beard_color == info.get_beard_color().0;
+        is_identical &= self.beard_type == info.get_beard_type() as u8;
+        is_identical &= self.mustache_type == info.get_mustache_type() as u8;
+        is_identical &= self.mustache_scale == info.get_mustache_scale();
+        is_identical &= self.mustache_y == info.get_mustache_y();
+        is_identical &= self.glass_type == info.get_glass_type() as u8;
+        is_identical &= self.glass_color == info.get_glass_color().0;
+        is_identical &= self.glass_scale == info.get_glass_scale();
+        is_identical &= self.glass_y == info.get_glass_y();
+        is_identical &= self.mole_type == info.get_mole_type() as u8;
+        is_identical &= self.mole_scale == info.get_mole_scale();
+        is_identical &= self.mole_x == info.get_mole_x();
+        is_identical &= self.mole_y == info.get_mole_y();
+        is_identical
     }
 }
+
+impl PartialEq for CharInfo {
+    fn eq(&self, other: &Self) -> bool {
+        self.equals(other)
+    }
+}
+
+impl Eq for CharInfo {}
 
 #[cfg(test)]
 mod tests {
@@ -580,6 +640,24 @@ mod tests {
             store_data.get_eyebrow_y().wrapping_add(3)
         );
         assert!(char_info.equals(&char_info));
+    }
+
+    #[test]
+    fn equals_matches_upstream_operator_policy() {
+        let mut store_data = StoreData::new();
+        store_data.build_default(0);
+
+        let mut lhs = CharInfo::default();
+        lhs.set_from_store_data(&store_data);
+        let mut rhs = lhs;
+        rhs.null_terminator = 0xFFFF;
+        rhs.padding = 0xFF;
+
+        assert!(lhs.equals(&rhs));
+        assert_eq!(lhs, rhs);
+
+        rhs.create_id = [0; 16];
+        assert!(!lhs.equals(&rhs));
     }
 
     #[test]

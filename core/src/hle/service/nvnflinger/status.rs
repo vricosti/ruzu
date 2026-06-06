@@ -33,6 +33,63 @@ impl Status {
     pub const RELEASE_ALL_BUFFERS: Status = Status::NoBufferAvailable;
 }
 
+/// Raw Android status value.
+///
+/// Upstream declares `Status` as an enum with flag operators, so some return
+/// paths can legally produce combined values such as
+/// `BufferNeedsReallocation | ReleaseAllBuffers == 3`. Keep `Status` for
+/// simple non-combined results and use this raw wrapper where upstream relies
+/// on bitwise status composition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct StatusCode(i32);
+
+impl StatusCode {
+    pub const NONE: Self = Self(0);
+    pub const NO_ERROR: Self = Self(Status::NoError as i32);
+    pub const BUFFER_NEEDS_REALLOCATION: Self = Self(Status::BUFFER_NEEDS_REALLOCATION as i32);
+    pub const RELEASE_ALL_BUFFERS: Self = Self(Status::RELEASE_ALL_BUFFERS as i32);
+
+    pub const fn from_raw(raw: i32) -> Self {
+        Self(raw)
+    }
+
+    pub const fn raw(self) -> i32 {
+        self.0
+    }
+
+    pub const fn contains(self, flag: Self) -> bool {
+        (self.0 & flag.0) != 0
+    }
+}
+
+impl From<Status> for StatusCode {
+    fn from(status: Status) -> Self {
+        Self(status as i32)
+    }
+}
+
+impl std::ops::BitOrAssign for StatusCode {
+    fn bitor_assign(&mut self, rhs: Self) {
+        self.0 |= rhs.0;
+    }
+}
+
+impl std::ops::BitOr for StatusCode {
+    type Output = Self;
+
+    fn bitor(self, rhs: Self) -> Self::Output {
+        Self(self.0 | rhs.0)
+    }
+}
+
+impl std::ops::BitAnd for StatusCode {
+    type Output = Self;
+
+    fn bitand(self, rhs: Self) -> Self::Output {
+        Self(self.0 & rhs.0)
+    }
+}
+
 impl Default for Status {
     fn default() -> Self {
         Status::NoError

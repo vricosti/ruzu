@@ -8,6 +8,8 @@
 use std::collections::HashMap;
 use std::sync::OnceLock;
 
+use common::settings;
+
 use crate::engines::draw_manager::Maxwell3DRenderTargets;
 use crate::engines::maxwell_3d::{RenderTargetInfo, ScissorInfo};
 use crate::framebuffer_config::FramebufferConfig;
@@ -61,6 +63,25 @@ fn parse_u64_env_list(name: &str) -> Option<Vec<u64>> {
         })
         .collect::<Vec<_>>();
     (!targets.is_empty()).then_some(targets)
+}
+
+fn scale_up_image_copies(copies: &[ImageCopy], both_2d: bool) -> Vec<ImageCopy> {
+    let resolution = settings::values().resolution_info.clone();
+    copies
+        .iter()
+        .copied()
+        .map(|mut copy| {
+            copy.src_offset.x = resolution.scale_up_i32(copy.src_offset.x);
+            copy.dst_offset.x = resolution.scale_up_i32(copy.dst_offset.x);
+            copy.extent.width = resolution.scale_up_u32(copy.extent.width);
+            if both_2d {
+                copy.src_offset.y = resolution.scale_up_i32(copy.src_offset.y);
+                copy.dst_offset.y = resolution.scale_up_i32(copy.dst_offset.y);
+                copy.extent.height = resolution.scale_up_u32(copy.extent.height);
+            }
+            copy
+        })
+        .collect()
 }
 
 fn texture_upload_trace_targets() -> Option<&'static [u64]> {
@@ -119,6 +140,64 @@ fn is_converted_image(has_native_astc: bool, format: PixelFormat, image_type: Im
         return true;
     }
     matches!(format, PixelFormat::Bc4Unorm | PixelFormat::Bc5Unorm) && image_type == ImageType::E3D
+}
+
+/// Port of upstream `CanBeAccelerated(const TextureCacheRuntime&, const ImageInfo&)`.
+fn can_be_accelerated(has_native_astc: bool, info: &ImageInfo) -> bool {
+    if crate::surface::is_pixel_format_astc(info.format) && info.size.depth == 1 && !has_native_astc
+    {
+        return *common::settings::values().accelerate_astc.get_value()
+            == common::settings_enums::AstcDecodeMode::Gpu
+            && *common::settings::values().astc_recompression.get_value()
+                == common::settings_enums::AstcRecompression::Uncompressed;
+    }
+    false
+}
+
+/// Port of upstream `CanBeDecodedAsync(const TextureCacheRuntime&, const ImageInfo&)`.
+fn can_be_decoded_async(has_native_astc: bool, info: &ImageInfo) -> bool {
+    crate::surface::is_pixel_format_astc(info.format)
+        && !has_native_astc
+        && *common::settings::values().accelerate_astc.get_value()
+            == common::settings_enums::AstcDecodeMode::CpuAsynchronous
+}
+
+const GL_COMPRESSED_RGBA_S3TC_DXT1_EXT: u32 = 0x83F1;
+const GL_COMPRESSED_RGBA_S3TC_DXT5_EXT: u32 = 0x83F3;
+const GL_COMPRESSED_SRGB_ALPHA_S3TC_DXT1_EXT: u32 = 0x8C4D;
+const GL_COMPRESSED_SRGB_ALPHA_S3TC_DXT5_EXT: u32 = 0x8C4F;
+
+/// Port of upstream `IsAstcRecompressionEnabled()`.
+fn is_astc_recompression_enabled() -> bool {
+    *common::settings::values().astc_recompression.get_value()
+        != common::settings_enums::AstcRecompression::Uncompressed
+}
+
+/// Port of upstream `SelectAstcFormat(PixelFormat format, bool is_srgb)`.
+fn select_astc_format(_format: PixelFormat, is_srgb: bool) -> u32 {
+    match *common::settings::values().astc_recompression.get_value() {
+        common::settings_enums::AstcRecompression::Bc1 => {
+            if is_srgb {
+                GL_COMPRESSED_SRGB_ALPHA_S3TC_DXT1_EXT
+            } else {
+                GL_COMPRESSED_RGBA_S3TC_DXT1_EXT
+            }
+        }
+        common::settings_enums::AstcRecompression::Bc3 => {
+            if is_srgb {
+                GL_COMPRESSED_SRGB_ALPHA_S3TC_DXT5_EXT
+            } else {
+                GL_COMPRESSED_RGBA_S3TC_DXT5_EXT
+            }
+        }
+        common::settings_enums::AstcRecompression::Uncompressed => {
+            if is_srgb {
+                gl::SRGB8_ALPHA8
+            } else {
+                gl::RGBA8
+            }
+        }
+    }
 }
 
 /// Number of texture types (1D, 2D, 2DRect, 3D, Cube, 1DArray, 2DArray, Buffer, CubeArray).
@@ -259,7 +338,7 @@ impl TextureCacheRuntime {
             2 * 1024 * 1024 * 1024
         };
         Self {
-            has_broken_texture_view_formats: false,
+            has_broken_texture_view_formats: device.has_broken_texture_view_formats(),
             device_access_memory,
         }
     }
@@ -748,12 +827,16 @@ impl Image {
     pub fn from_base(base: &ImageBase, has_native_astc: bool) -> Self {
         let converted = is_converted_image(has_native_astc, base.info.format, base.info.image_type);
         let (gl_internal_format, gl_format, gl_type) = if converted {
-            let internal_format = if crate::surface::is_pixel_format_srgb(base.info.format) {
-                gl::SRGB8_ALPHA8
-            } else {
-                gl::RGBA8
-            };
-            (internal_format, gl::RGBA, gl::UNSIGNED_INT_8_8_8_8_REV)
+            let is_srgb = crate::surface::is_pixel_format_srgb(base.info.format);
+            let mut internal_format = if is_srgb { gl::SRGB8_ALPHA8 } else { gl::RGBA8 };
+            let mut format = gl::RGBA;
+            if crate::surface::is_pixel_format_astc(base.info.format)
+                && is_astc_recompression_enabled()
+            {
+                internal_format = select_astc_format(base.info.format, is_srgb);
+                format = gl::NONE;
+            }
+            (internal_format, format, gl::UNSIGNED_INT_8_8_8_8_REV)
         } else {
             let tuple = super::maxwell_to_gl::get_format_tuple(base.info.format as usize);
             (tuple.internal_format, tuple.format, tuple.gl_type)
@@ -1270,11 +1353,13 @@ impl ImageView {
         let mut view = Self::with_null_views(null_image_views);
         view.image_id = base.image_id;
         view.internal_format = if image.converted {
-            if crate::surface::is_pixel_format_srgb(base.format) {
-                gl::SRGB8_ALPHA8
-            } else {
-                gl::RGBA8
+            let is_srgb = crate::surface::is_pixel_format_srgb(base.format);
+            let mut internal_format = if is_srgb { gl::SRGB8_ALPHA8 } else { gl::RGBA8 };
+            if crate::surface::is_pixel_format_astc(base.format) && is_astc_recompression_enabled()
+            {
+                internal_format = select_astc_format(base.format, is_srgb);
             }
+            internal_format
         } else {
             present_internal_format(base.format)
         };
@@ -1822,6 +1907,8 @@ pub struct TextureCache {
     null_image_handles: [u32; 7],
     null_image_views: [u32; NUM_TEXTURE_TYPES],
     has_native_astc: bool,
+    has_broken_texture_view_formats: bool,
+    has_native_bgr: bool,
 }
 
 /// OpenGL backend result of `TextureCache<P>::TryFindFramebufferImageView`.
@@ -1833,7 +1920,9 @@ pub struct FramebufferImageViewOpenGL {
     pub scaled: bool,
 }
 
-fn create_null_image_views() -> ([u32; 7], [u32; NUM_TEXTURE_TYPES]) {
+fn create_null_image_views(
+    has_debugging_tool_attached: bool,
+) -> ([u32; 7], [u32; NUM_TEXTURE_TYPES]) {
     let mut handles = [0u32; 7];
     let mut views = [0u32; NUM_TEXTURE_TYPES];
     unsafe {
@@ -1890,14 +1979,24 @@ fn create_null_image_views() -> ([u32; 7], [u32; NUM_TEXTURE_TYPES]) {
         }
     }
 
-    views[TextureType::Color1D as usize] = handles[3];
-    views[TextureType::Color2D as usize] = handles[4];
-    views[TextureType::ColorCube as usize] = handles[6];
-    views[TextureType::Color3D as usize] = handles[2];
-    views[TextureType::ColorArray1D as usize] = handles[0];
-    views[TextureType::ColorArray2D as usize] = handles[5];
-    views[TextureType::ColorArrayCube as usize] = handles[1];
-    views[TextureType::Color2DRect as usize] = handles[4];
+    let mut set_view = |texture_type: TextureType, handle: u32| {
+        if has_debugging_tool_attached && handle != 0 {
+            let name = format!("NullImage {texture_type:?}");
+            unsafe {
+                gl::ObjectLabel(gl::TEXTURE, handle, name.len() as i32, name.as_ptr().cast());
+            }
+        }
+        views[texture_type as usize] = handle;
+    };
+
+    set_view(TextureType::Color1D, handles[3]);
+    set_view(TextureType::Color2D, handles[4]);
+    set_view(TextureType::ColorCube, handles[6]);
+    set_view(TextureType::Color3D, handles[2]);
+    set_view(TextureType::ColorArray1D, handles[0]);
+    set_view(TextureType::ColorArray2D, handles[5]);
+    set_view(TextureType::ColorArrayCube, handles[1]);
+    set_view(TextureType::Color2DRect, handles[4]);
     (handles, views)
 }
 
@@ -2314,7 +2413,13 @@ impl TextureCache {
         >,
         device: &super::gl_device::Device,
     ) -> Self {
-        Self::new_with_caps(device_memory, device.has_astc())
+        Self::new_with_caps(
+            device_memory,
+            device.has_astc(),
+            device.has_broken_texture_view_formats(),
+            false,
+            device.has_debugging_tool_attached(),
+        )
     }
 
     pub(crate) fn new_with_caps(
@@ -2322,8 +2427,12 @@ impl TextureCache {
             crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager,
         >,
         has_native_astc: bool,
+        has_broken_texture_view_formats: bool,
+        has_native_bgr: bool,
+        has_debugging_tool_attached: bool,
     ) -> Self {
-        let (null_image_handles, null_image_views) = create_null_image_views();
+        let (null_image_handles, null_image_views) =
+            create_null_image_views(has_debugging_tool_attached);
         Self {
             base: CommonTextureCache::new(device_memory),
             images: HashMap::new(),
@@ -2334,7 +2443,14 @@ impl TextureCache {
             null_image_handles,
             null_image_views,
             has_native_astc,
+            has_broken_texture_view_formats,
+            has_native_bgr,
         }
+    }
+
+    /// Port of `TextureCache<P>::IsRescaling`.
+    pub fn is_rescaling_active(&self) -> bool {
+        self.base.is_rescaling_active()
     }
 
     fn ensure_backend_image_flags(&mut self, image_id: ImageId) {
@@ -2342,6 +2458,11 @@ impl TextureCache {
             return;
         }
         let image = &mut self.base.slot_images[image_id];
+        if can_be_decoded_async(self.has_native_astc, &image.info) {
+            image.flags.insert(ImageFlagBits::ASYNCHRONOUS_DECODE);
+        } else if can_be_accelerated(self.has_native_astc, &image.info) {
+            image.flags.insert(ImageFlagBits::ACCELERATED_UPLOAD);
+        }
         if is_converted_image(
             self.has_native_astc,
             image.info.format,
@@ -2615,6 +2736,8 @@ impl TextureCache {
 
         let dst_base = self.base.slot_images[dst_id].clone();
         let src_base = self.base.slot_images[src_id].clone();
+        let src_rescaled = src_base.flags.contains(ImageFlagBits::RESCALED);
+        let dst_rescaled = dst_base.flags.contains(ImageFlagBits::RESCALED);
         if crate::surface::get_format_type(dst_base.info.format)
             != crate::surface::get_format_type(src_base.info.format)
         {
@@ -2625,12 +2748,29 @@ impl TextureCache {
             );
             return;
         }
-        if src_base.flags.contains(ImageFlagBits::RESCALED)
-            || dst_base.flags.contains(ImageFlagBits::RESCALED)
-        {
-            log::warn!("TextureCache::copy_image_direct: rescaled alias copy path not ported");
+        if src_rescaled != dst_rescaled {
+            log::warn!(
+                "TextureCache::copy_image_direct: mismatched rescaled alias copy src={} dst={}",
+                src_rescaled,
+                dst_rescaled
+            );
             return;
         }
+        if src_base.info.num_samples != dst_base.info.num_samples {
+            log::warn!(
+                "TextureCache::copy_image_direct: MSAA copy path not ported src_samples={} dst_samples={}",
+                src_base.info.num_samples,
+                dst_base.info.num_samples
+            );
+            return;
+        }
+        let copies = if src_rescaled {
+            let both_2d = src_base.info.image_type == ImageType::E2D
+                && dst_base.info.image_type == ImageType::E2D;
+            scale_up_image_copies(copies, both_2d)
+        } else {
+            copies.to_vec()
+        };
 
         self.images
             .entry(dst_id)
@@ -2648,7 +2788,7 @@ impl TextureCache {
         let dst_target = image_target(&dst_base.info);
         let src_target = image_target(&src_base.info);
         unsafe {
-            for copy in copies {
+            for copy in &copies {
                 let src_origin =
                     make_copy_origin(copy.src_offset, copy.src_subresource, src_target);
                 let dst_origin =
@@ -3018,7 +3158,8 @@ impl TextureCache {
 
         let zeta = render_targets.zeta;
         if zeta.enabled && zeta.address != 0 && zeta.width != 0 && zeta.height != 0 {
-            let zeta_info = ImageInfo::from_zeta_info(&zeta, 0);
+            let zeta_info =
+                ImageInfo::from_zeta_info(&zeta, render_targets.anti_alias_samples_mode);
             if let Some((_, image)) = self.base.slot_images.iter().find(|(_, image)| {
                 image.gpu_addr == zeta.address
                     && image.info.size.width == zeta_info.size.width
@@ -3117,9 +3258,12 @@ impl TextureCache {
                 continue;
             };
             let image_base = image_base.clone();
-            let view_id = self
-                .base
-                .find_render_target_view_from_image(image_id, &rt, rt.address);
+            let view_id = self.base.find_render_target_view_from_image(
+                image_id,
+                &rt,
+                render_targets.anti_alias_samples_mode,
+                rt.address,
+            );
             if !view_id.is_valid() {
                 continue;
             }
@@ -3173,7 +3317,8 @@ impl TextureCache {
 
         let zeta = render_targets.zeta;
         if zeta.enabled && zeta.address != 0 && zeta.width != 0 && zeta.height != 0 {
-            let zeta_info = ImageInfo::from_zeta_info(&zeta, 0);
+            let zeta_info =
+                ImageInfo::from_zeta_info(&zeta, render_targets.anti_alias_samples_mode);
             if let Some((image_id, image_base)) = self.base.slot_images.iter().find(|(_, image)| {
                 image.gpu_addr == zeta.address
                     && image.info.size.width == zeta_info.size.width
@@ -3374,12 +3519,24 @@ impl TextureCache {
         let src_id = if use_relaxed_fermi2d_lookup {
             self.find_mapped_image_with_options(&src_info, src_addr, find_options)
         } else {
-            self.base.find_image(&src_info, src_addr)
+            self.base.find_image_with_caps(
+                &src_info,
+                src_addr,
+                RelaxedOptions::empty(),
+                self.has_broken_texture_view_formats,
+                self.has_native_bgr,
+            )
         };
         let dst_id = if use_relaxed_fermi2d_lookup {
             self.find_mapped_image_with_options(&dst_info, dst_addr, find_options)
         } else {
-            self.base.find_image(&dst_info, dst_addr)
+            self.base.find_image_with_caps(
+                &dst_info,
+                dst_addr,
+                RelaxedOptions::empty(),
+                self.has_broken_texture_view_formats,
+                self.has_native_bgr,
+            )
         };
         if !copy.must_accelerate {
             let src_gpu_modified = src_id
@@ -3467,7 +3624,8 @@ impl TextureCache {
                 );
             }
 
-            let native_bgr = false;
+            let broken_views = self.has_broken_texture_view_formats;
+            let native_bgr = self.has_native_bgr;
             if crate::surface::get_format_type(dst_info.format)
                 != crate::surface::get_format_type(self.base.slot_images[dst_id].info.format)
                 || crate::surface::get_format_type(src_info.format)
@@ -3475,13 +3633,13 @@ impl TextureCache {
                 || !crate::surface::is_view_compatible(
                     dst_info.format,
                     self.base.slot_images[dst_id].info.format,
-                    false,
+                    broken_views,
                     native_bgr,
                 )
                 || !crate::surface::is_view_compatible(
                     src_info.format,
                     self.base.slot_images[src_id].info.format,
-                    false,
+                    broken_views,
                     native_bgr,
                 )
             {
@@ -3556,7 +3714,16 @@ impl TextureCache {
                 y: copy.dst_y1 >> dst_samples_y,
             },
         };
-        self.blit_framebuffer(dst_fbo, src_fbo, dst_region, src_region, copy.filter);
+        self.blit_framebuffer(
+            dst_fbo,
+            src_fbo,
+            gl::COLOR_BUFFER_BIT,
+            gl::COLOR_BUFFER_BIT,
+            dst_region,
+            src_region,
+            copy.filter,
+            copy.operation,
+        );
         self.base.mark_modification_by_id(dst_id);
 
         if std::env::var_os("RUZU_TRACE_FERMI2D_BLIT").is_some() {
@@ -3609,8 +3776,9 @@ impl TextureCache {
         gpu_addr: u64,
         options: RelaxedOptions,
     ) -> Option<ImageId> {
-        let broken_views = options.contains(RelaxedOptions::FORCE_BROKEN_VIEWS);
-        let native_bgr = false;
+        let broken_views = self.has_broken_texture_view_formats
+            || options.contains(RelaxedOptions::FORCE_BROKEN_VIEWS);
+        let native_bgr = self.has_native_bgr;
         self.base
             .slot_images
             .iter()
@@ -3718,7 +3886,6 @@ impl TextureCache {
                         0,
                     );
                     gl::NamedFramebufferDrawBuffer(framebuffer, gl::COLOR_ATTACHMENT0);
-                    gl::NamedFramebufferReadBuffer(framebuffer, gl::COLOR_ATTACHMENT0);
                 }
             }
             TextureCacheFramebuffer {
@@ -3734,14 +3901,18 @@ impl TextureCache {
         &self,
         dst_framebuffer: u32,
         src_framebuffer: u32,
+        dst_buffer_bits: u32,
+        src_buffer_bits: u32,
         dst_region: Region2D,
         src_region: Region2D,
         filter: crate::engines::fermi_2d::Filter,
+        _operation: crate::engines::fermi_2d::Operation,
     ) {
-        let filter = match filter {
-            crate::engines::fermi_2d::Filter::Point => gl::NEAREST,
-            crate::engines::fermi_2d::Filter::Bilinear => gl::LINEAR,
-        };
+        debug_assert_eq!(dst_buffer_bits, src_buffer_bits);
+        let buffer_bits = dst_buffer_bits;
+        let has_depth = (buffer_bits & !gl::COLOR_BUFFER_BIT) != 0;
+        let is_linear = !has_depth && filter == crate::engines::fermi_2d::Filter::Bilinear;
+        let gl_filter = if is_linear { gl::LINEAR } else { gl::NEAREST };
         unsafe {
             // Matches upstream TextureCacheRuntime::BlitFramebuffer. Fermi2D
             // copies must not inherit stale draw state from Maxwell rendering.
@@ -3759,8 +3930,8 @@ impl TextureCache {
                 dst_region.start.y,
                 dst_region.end.x,
                 dst_region.end.y,
-                gl::COLOR_BUFFER_BIT,
-                filter,
+                buffer_bits,
+                gl_filter,
             );
         }
     }
@@ -4123,7 +4294,7 @@ impl TextureCache {
         let image_base = image_base.clone();
         let view_id = self
             .base
-            .find_render_target_view_from_image(image_id, rt, lookup_addr);
+            .find_render_target_view_from_image(image_id, rt, 0, lookup_addr);
         if !view_id.is_valid() {
             return None;
         }
@@ -4216,7 +4387,6 @@ impl TextureCache {
                     // uses `glNamedFramebufferDrawBuffer` (direct state access)
                     // and sets GL_FRAMEBUFFER_DEFAULT_WIDTH/HEIGHT.
                     gl::NamedFramebufferDrawBuffer(framebuffer, gl::COLOR_ATTACHMENT0);
-                    gl::NamedFramebufferReadBuffer(framebuffer, gl::COLOR_ATTACHMENT0);
                     gl::NamedFramebufferParameteri(
                         framebuffer,
                         gl::FRAMEBUFFER_DEFAULT_WIDTH,
@@ -4413,6 +4583,9 @@ impl Default for TextureCache {
                 crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager::default(),
             ),
             true,
+            false,
+            false,
+            false,
         )
     }
 }
@@ -4421,6 +4594,13 @@ impl Default for TextureCache {
 mod tests {
     use super::*;
     use crate::texture_cache::image_view_info::SwizzleSource;
+    use std::sync::{Mutex, MutexGuard};
+
+    static ASTC_SETTINGS_LOCK: Mutex<()> = Mutex::new(());
+
+    fn lock_astc_settings() -> MutexGuard<'static, ()> {
+        ASTC_SETTINGS_LOCK.lock().unwrap()
+    }
 
     #[test]
     fn constants() {
@@ -4453,6 +4633,126 @@ mod tests {
             present_internal_format(PixelFormat::R5G6B5Unorm),
             gl::RGB565
         );
+    }
+
+    #[test]
+    fn select_astc_format_follows_recompression_setting() {
+        use common::settings_enums::AstcRecompression;
+
+        let _lock = lock_astc_settings();
+
+        struct AstcRecompressionRestore(AstcRecompression);
+
+        impl Drop for AstcRecompressionRestore {
+            fn drop(&mut self) {
+                common::settings::values_mut()
+                    .astc_recompression
+                    .set_value(self.0);
+            }
+        }
+
+        let previous = *common::settings::values().astc_recompression.get_value();
+        let _restore = AstcRecompressionRestore(previous);
+
+        common::settings::values_mut()
+            .astc_recompression
+            .set_value(AstcRecompression::Uncompressed);
+        assert_eq!(
+            select_astc_format(PixelFormat::Astc2d4x4Unorm, false),
+            gl::RGBA8
+        );
+        assert_eq!(
+            select_astc_format(PixelFormat::Astc2d4x4Srgb, true),
+            gl::SRGB8_ALPHA8
+        );
+
+        common::settings::values_mut()
+            .astc_recompression
+            .set_value(AstcRecompression::Bc1);
+        assert_eq!(
+            select_astc_format(PixelFormat::Astc2d4x4Unorm, false),
+            GL_COMPRESSED_RGBA_S3TC_DXT1_EXT
+        );
+        assert_eq!(
+            select_astc_format(PixelFormat::Astc2d4x4Srgb, true),
+            GL_COMPRESSED_SRGB_ALPHA_S3TC_DXT1_EXT
+        );
+
+        common::settings::values_mut()
+            .astc_recompression
+            .set_value(AstcRecompression::Bc3);
+        assert_eq!(
+            select_astc_format(PixelFormat::Astc2d4x4Unorm, false),
+            GL_COMPRESSED_RGBA_S3TC_DXT5_EXT
+        );
+        assert_eq!(
+            select_astc_format(PixelFormat::Astc2d4x4Srgb, true),
+            GL_COMPRESSED_SRGB_ALPHA_S3TC_DXT5_EXT
+        );
+    }
+
+    #[test]
+    fn astc_upload_flags_follow_upstream_policy() {
+        use common::settings_enums::{AstcDecodeMode, AstcRecompression};
+
+        let _lock = lock_astc_settings();
+
+        struct AstcSettingsRestore {
+            decode: AstcDecodeMode,
+            recompression: AstcRecompression,
+        }
+
+        impl Drop for AstcSettingsRestore {
+            fn drop(&mut self) {
+                let mut values = common::settings::values_mut();
+                values.accelerate_astc.set_value(self.decode);
+                values.astc_recompression.set_value(self.recompression);
+            }
+        }
+
+        let _restore = AstcSettingsRestore {
+            decode: *common::settings::values().accelerate_astc.get_value(),
+            recompression: *common::settings::values().astc_recompression.get_value(),
+        };
+        let info = ImageInfo {
+            format: PixelFormat::Astc2d4x4Unorm,
+            image_type: ImageType::E2D,
+            size: crate::texture_cache::types::Extent3D {
+                width: 64,
+                height: 64,
+                depth: 1,
+            },
+            ..ImageInfo::default()
+        };
+
+        {
+            let mut values = common::settings::values_mut();
+            values
+                .accelerate_astc
+                .set_value(AstcDecodeMode::CpuAsynchronous);
+            values
+                .astc_recompression
+                .set_value(AstcRecompression::Uncompressed);
+        }
+        assert!(can_be_decoded_async(false, &info));
+        assert!(!can_be_accelerated(false, &info));
+
+        {
+            let mut values = common::settings::values_mut();
+            values.accelerate_astc.set_value(AstcDecodeMode::Gpu);
+            values
+                .astc_recompression
+                .set_value(AstcRecompression::Uncompressed);
+        }
+        assert!(!can_be_decoded_async(false, &info));
+        assert!(can_be_accelerated(false, &info));
+
+        common::settings::values_mut()
+            .astc_recompression
+            .set_value(AstcRecompression::Bc1);
+        assert!(!can_be_accelerated(false, &info));
+        assert!(!can_be_decoded_async(true, &info));
+        assert!(!can_be_accelerated(true, &info));
     }
 
     #[test]

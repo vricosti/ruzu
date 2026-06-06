@@ -72,7 +72,7 @@ struct ContainerInner {
 pub struct Container {
     file: Arc<NvMap>,
     manager: Arc<SyncpointManager>,
-    device_file_data: Host1xDeviceFileData,
+    device_file_data: Arc<Mutex<Host1xDeviceFileData>>,
     inner: Mutex<ContainerInner>,
     system: SystemRef,
 }
@@ -86,7 +86,7 @@ impl Container {
         Self {
             file: Arc::new(NvMap::new_with_system(system)),
             manager: Arc::new(SyncpointManager::new_with_system(system)),
-            device_file_data: Host1xDeviceFileData::default(),
+            device_file_data: Arc::new(Mutex::new(Host1xDeviceFileData::default())),
             inner: Mutex::new(ContainerInner {
                 sessions: Vec::new(),
                 new_ids: 0,
@@ -100,8 +100,8 @@ impl Container {
     /// increments its ref count and returns the existing session ID.
     ///
     /// Matches upstream `Container::OpenSession(KProcess* process)` for the
-    /// session reuse and ownership checks. ASID/SMMU registration and heap
-    /// preallocation remain unimplemented here.
+    /// session reuse and ownership checks. ASID registration remains part of
+    /// the broader Host1x device-memory parity work.
     pub fn open_session(&self, process: &std::sync::Arc<ProcessLock>) -> SessionId {
         let mut inner = self.inner.lock().unwrap();
         let process_identity = std::sync::Arc::as_ptr(process) as usize;
@@ -310,8 +310,24 @@ impl Container {
         Arc::clone(&self.manager)
     }
 
-    pub fn host1x_device_file(&self) -> &Host1xDeviceFileData {
-        &self.device_file_data
+    pub fn take_accumulated_syncpoint(&self) -> Option<u32> {
+        self.device_file_data
+            .lock()
+            .unwrap()
+            .syncpts_accumulated
+            .pop_front()
+    }
+
+    pub fn recycle_syncpoint(&self, syncpoint: u32) {
+        self.device_file_data
+            .lock()
+            .unwrap()
+            .syncpts_accumulated
+            .push_back(syncpoint);
+    }
+
+    pub fn host1x_device_file_handle(&self) -> Arc<Mutex<Host1xDeviceFileData>> {
+        Arc::clone(&self.device_file_data)
     }
 }
 

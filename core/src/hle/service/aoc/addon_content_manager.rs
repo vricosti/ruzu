@@ -339,11 +339,10 @@ impl IAddOnContentManager {
         let service =
             unsafe { &*(this as *const dyn ServiceFramework as *const IAddOnContentManager) };
         let manager = service.create_ec_purchased_event_manager();
-        let handle = ctx.create_session_for_service(manager).unwrap_or(0);
 
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 1);
         rb.push_result(RESULT_SUCCESS);
-        rb.push_move_objects(handle);
+        rb.push_ipc_interface(manager);
     }
 
     fn create_permanent_ec_purchased_event_manager_handler(
@@ -353,11 +352,10 @@ impl IAddOnContentManager {
         let service =
             unsafe { &*(this as *const dyn ServiceFramework as *const IAddOnContentManager) };
         let manager = service.create_permanent_ec_purchased_event_manager();
-        let handle = ctx.create_session_for_service(manager).unwrap_or(0);
 
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 1);
         rb.push_result(RESULT_SUCCESS);
-        rb.push_move_objects(handle);
+        rb.push_ipc_interface(manager);
     }
 }
 

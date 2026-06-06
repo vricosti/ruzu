@@ -420,6 +420,7 @@ pub fn compile_shader_glsl_at_offset(
     runtime_info: &RuntimeInfo,
 ) -> CompiledGlslShader {
     let mut bindings = backend::bindings::Bindings::default();
+    let host_info = host_info_from_profile(profile);
     emit_glsl_program_at_offset(
         code,
         stage,
@@ -429,6 +430,7 @@ pub fn compile_shader_glsl_at_offset(
         &mut bindings,
         None,
         None,
+        &host_info,
     )
 }
 
@@ -445,6 +447,7 @@ pub fn compile_shader_glsl_at_offset_with_bindings(
     runtime_info: &RuntimeInfo,
     bindings: &mut backend::bindings::Bindings,
 ) -> CompiledGlslShader {
+    let host_info = host_info_from_profile(profile);
     emit_glsl_program_at_offset(
         code,
         stage,
@@ -454,6 +457,29 @@ pub fn compile_shader_glsl_at_offset_with_bindings(
         bindings,
         None,
         None,
+        &host_info,
+    )
+}
+
+pub fn compile_shader_glsl_at_offset_with_bindings_and_host_info(
+    code: &[u64],
+    stage: ShaderStage,
+    base_offset: u32,
+    profile: &Profile,
+    runtime_info: &RuntimeInfo,
+    bindings: &mut backend::bindings::Bindings,
+    host_info: &crate::host_translate_info::HostTranslateInfo,
+) -> CompiledGlslShader {
+    emit_glsl_program_at_offset(
+        code,
+        stage,
+        base_offset,
+        profile,
+        runtime_info,
+        bindings,
+        None,
+        None,
+        host_info,
     )
 }
 
@@ -469,6 +495,7 @@ pub fn compile_shader_glsl_at_offset_with_bindings_and_texture_bound(
     runtime_info: &RuntimeInfo,
     bindings: &mut backend::bindings::Bindings,
 ) -> CompiledGlslShader {
+    let host_info = host_info_from_profile(profile);
     emit_glsl_program_at_offset(
         code,
         stage,
@@ -478,6 +505,30 @@ pub fn compile_shader_glsl_at_offset_with_bindings_and_texture_bound(
         bindings,
         Some(texture_bound_buffer),
         None,
+        &host_info,
+    )
+}
+
+pub fn compile_shader_glsl_at_offset_with_bindings_and_texture_bound_and_host_info(
+    code: &[u64],
+    stage: ShaderStage,
+    base_offset: u32,
+    texture_bound_buffer: u32,
+    profile: &Profile,
+    runtime_info: &RuntimeInfo,
+    bindings: &mut backend::bindings::Bindings,
+    host_info: &crate::host_translate_info::HostTranslateInfo,
+) -> CompiledGlslShader {
+    emit_glsl_program_at_offset(
+        code,
+        stage,
+        base_offset,
+        profile,
+        runtime_info,
+        bindings,
+        Some(texture_bound_buffer),
+        None,
+        host_info,
     )
 }
 
@@ -494,6 +545,7 @@ pub fn compile_shader_glsl_at_offset_with_bindings_and_texture_bound_and_sph(
     runtime_info: &RuntimeInfo,
     bindings: &mut backend::bindings::Bindings,
 ) -> CompiledGlslShader {
+    let host_info = host_info_from_profile(profile);
     emit_glsl_program_at_offset(
         code,
         stage,
@@ -503,6 +555,31 @@ pub fn compile_shader_glsl_at_offset_with_bindings_and_texture_bound_and_sph(
         bindings,
         Some(texture_bound_buffer),
         Some(sph),
+        &host_info,
+    )
+}
+
+pub fn compile_shader_glsl_at_offset_with_bindings_and_texture_bound_and_sph_and_host_info(
+    code: &[u64],
+    stage: ShaderStage,
+    base_offset: u32,
+    texture_bound_buffer: u32,
+    sph: &ProgramHeader,
+    profile: &Profile,
+    runtime_info: &RuntimeInfo,
+    bindings: &mut backend::bindings::Bindings,
+    host_info: &crate::host_translate_info::HostTranslateInfo,
+) -> CompiledGlslShader {
+    emit_glsl_program_at_offset(
+        code,
+        stage,
+        base_offset,
+        profile,
+        runtime_info,
+        bindings,
+        Some(texture_bound_buffer),
+        Some(sph),
+        host_info,
     )
 }
 
@@ -515,6 +592,7 @@ fn emit_glsl_program_at_offset(
     bindings: &mut backend::bindings::Bindings,
     texture_bound_buffer: Option<u32>,
     sph: Option<&ProgramHeader>,
+    host_info: &crate::host_translate_info::HostTranslateInfo,
 ) -> CompiledGlslShader {
     log::debug!(
         "Compiling {:?} shader to GLSL ({} instructions, base_offset=0x{:X})",
@@ -529,18 +607,14 @@ fn emit_glsl_program_at_offset(
     let cfg_blocks = control_flow::build_cfg(code);
     let mut program = translate_cfg_to_program(code, stage, base_offset, &cfg_blocks, sph);
 
-    let host_info = crate::host_translate_info::HostTranslateInfo {
-        support_int64: profile.support_int64,
-        min_ssbo_alignment: profile.min_ssbo_alignment as u32,
-        ..Default::default()
-    };
     optimize_glsl_with_optional_ir_dump(
         &mut program,
         stage,
         base_offset,
         code,
         texture_bound_buffer,
-        &host_info,
+        sph,
+        host_info,
     );
 
     convert_legacy_to_generic(&mut program, runtime_info);
@@ -556,6 +630,14 @@ fn emit_glsl_program_at_offset(
         source,
         info: program.info,
         stage,
+    }
+}
+
+fn host_info_from_profile(profile: &Profile) -> crate::host_translate_info::HostTranslateInfo {
+    crate::host_translate_info::HostTranslateInfo {
+        support_int64: profile.support_int64,
+        min_ssbo_alignment: profile.min_ssbo_alignment as u32,
+        ..Default::default()
     }
 }
 
@@ -590,6 +672,29 @@ pub fn compile_dual_vertex_shader_glsl_at_offset_with_bindings(
     runtime_info: &RuntimeInfo,
     bindings: &mut backend::bindings::Bindings,
 ) -> CompiledGlslShader {
+    let host_info = host_info_from_profile(profile);
+    compile_dual_vertex_shader_glsl_at_offset_with_bindings_and_host_info(
+        vertex_a_code,
+        vertex_a_base_offset,
+        vertex_b_code,
+        vertex_b_base_offset,
+        profile,
+        runtime_info,
+        bindings,
+        &host_info,
+    )
+}
+
+pub fn compile_dual_vertex_shader_glsl_at_offset_with_bindings_and_host_info(
+    vertex_a_code: &[u64],
+    vertex_a_base_offset: u32,
+    vertex_b_code: &[u64],
+    vertex_b_base_offset: u32,
+    profile: &Profile,
+    runtime_info: &RuntimeInfo,
+    bindings: &mut backend::bindings::Bindings,
+    host_info: &crate::host_translate_info::HostTranslateInfo,
+) -> CompiledGlslShader {
     log::debug!(
         "Compiling dual vertex shader to GLSL (va={} words @0x{:X}, vb={} words @0x{:X})",
         vertex_a_code.len(),
@@ -602,10 +707,18 @@ pub fn compile_dual_vertex_shader_glsl_at_offset_with_bindings(
         trace_shader_words(ShaderStage::VertexB, vertex_b_base_offset, vertex_b_code);
     }
 
-    let mut vertex_a =
-        translate_and_optimize(vertex_a_code, ShaderStage::VertexA, vertex_a_base_offset);
-    let mut vertex_b =
-        translate_and_optimize(vertex_b_code, ShaderStage::VertexB, vertex_b_base_offset);
+    let mut vertex_a = translate_and_optimize_with_host_info(
+        vertex_a_code,
+        ShaderStage::VertexA,
+        vertex_a_base_offset,
+        host_info,
+    );
+    let mut vertex_b = translate_and_optimize_with_host_info(
+        vertex_b_code,
+        ShaderStage::VertexB,
+        vertex_b_base_offset,
+        host_info,
+    );
     let mut program = merge_dual_vertex_programs(&mut vertex_a, &mut vertex_b);
 
     convert_legacy_to_generic(&mut program, runtime_info);
@@ -635,10 +748,15 @@ fn hash_code(code: &[u64]) -> u64 {
     hash
 }
 
-fn translate_and_optimize(code: &[u64], stage: ShaderStage, base_offset: u32) -> Program {
+fn translate_and_optimize_with_host_info(
+    code: &[u64],
+    stage: ShaderStage,
+    base_offset: u32,
+    host_info: &crate::host_translate_info::HostTranslateInfo,
+) -> Program {
     let cfg_blocks = control_flow::build_cfg(code);
     let mut program = translate_cfg_to_program(code, stage, base_offset, &cfg_blocks, None);
-    ir_opt::optimize(&mut program);
+    ir_opt::optimize_with_host_info(&mut program, host_info);
     program
 }
 
@@ -648,6 +766,7 @@ fn optimize_glsl_with_optional_ir_dump(
     base_offset: u32,
     code: &[u64],
     texture_bound_buffer: Option<u32>,
+    sph: Option<&ProgramHeader>,
     host_info: &crate::host_translate_info::HostTranslateInfo,
 ) {
     let dump = ShaderIrDumpConfig::from_env(stage, base_offset, code);
@@ -700,7 +819,11 @@ fn optimize_glsl_with_optional_ir_dump(
             dump.write(program, "07_dead_code_elimination");
         }
     }
-    ir_opt::collect_info::collect_shader_info_pass(program);
+    if let Some(sph) = sph {
+        ir_opt::collect_info::collect_shader_info_pass_with_sph(program, sph);
+    } else {
+        ir_opt::collect_info::collect_shader_info_pass(program);
+    }
     if let Some(dump) = dump.as_ref() {
         dump.write(program, "08_collect_shader_info");
     }

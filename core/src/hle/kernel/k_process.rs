@@ -562,6 +562,8 @@ pub struct KProcess {
     /// Each process owns its own Memory instance with its own `current_page_table`,
     /// sharing the backing `DeviceMemory` with all other processes via `System`.
     pub memory: Option<Arc<Mutex<crate::memory::memory::Memory>>>,
+    /// Snapshot of upstream `System::DebuggerEnabled()` for JIT construction.
+    debugger_enabled: bool,
     pub debug_page_refcounts: BTreeMap<u64, u64>,
     pub cpu_time: AtomicI64,
     pub num_process_switches: AtomicI64,
@@ -676,6 +678,7 @@ impl KProcess {
             watchpoints: [DebugWatchpoint::default(); NUM_WATCHPOINTS],
             process_memory: process_memory.clone(),
             memory: None,
+            debugger_enabled: false,
             debug_page_refcounts: BTreeMap::new(),
             cpu_time: AtomicI64::new(0),
             num_process_switches: AtomicI64::new(0),
@@ -709,6 +712,7 @@ impl KProcess {
         // Wire into page table so page-table-level operations can use it
         self.page_table.get_base_mut().m_memory = Some(memory_arc.clone());
         self.memory = Some(memory_arc);
+        self.debugger_enabled = system.debugger_enabled();
     }
 
     /// Get the per-process Memory bridge.
@@ -833,6 +837,7 @@ impl KProcess {
                     shared_memory.clone(),
                     core_timing.clone(),
                     Some(memory.clone()),
+                    self.debugger_enabled,
                 ));
                 // Set the parent pointer now that ArmDynarmic32 is at its final
                 // stable location inside the Box. Callbacks access parent fields
@@ -1160,11 +1165,11 @@ impl KProcess {
     pub fn attach_scheduler(&mut self, scheduler: &Arc<Mutex<KScheduler>>) {
         self.scheduler = Some(Arc::downgrade(scheduler));
         // Also wire the GSC from the scheduler so PQ operations work.
-        let sched = scheduler.lock().unwrap();
-        if let Some(ref gsc) = sched.global_scheduler_context {
-            self.global_scheduler_context = Some(Arc::clone(gsc));
+        let gsc = scheduler.lock().unwrap().global_scheduler_context.clone();
+        if let Some(gsc) = gsc {
+            self.set_global_scheduler_context(gsc);
+            return;
         }
-        drop(sched);
         self.refresh_registered_thread_scheduler_state();
     }
 

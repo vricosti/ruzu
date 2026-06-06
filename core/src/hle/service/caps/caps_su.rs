@@ -39,7 +39,7 @@ pub struct IScreenShotApplicationService {
     handlers: BTreeMap<u32, FunctionInfo>,
     handlers_tipc: BTreeMap<u32, FunctionInfo>,
     /// Internal buffer for CaptureAndSaveScreenshot.
-    image_data: Vec<u8>,
+    image_data: Mutex<Vec<u8>>,
     manager: Arc<Mutex<AlbumManager>>,
 }
 
@@ -56,7 +56,10 @@ impl IScreenShotApplicationService {
         Self {
             handlers,
             handlers_tipc: BTreeMap::new(),
-            image_data: vec![0u8; SCREENSHOT_WIDTH * SCREENSHOT_HEIGHT * BYTES_PER_PIXEL],
+            image_data: Mutex::new(vec![
+                0u8;
+                SCREENSHOT_WIDTH * SCREENSHOT_HEIGHT * BYTES_PER_PIXEL
+            ]),
             manager: album_manager,
         }
     }
@@ -150,7 +153,7 @@ impl IScreenShotApplicationService {
     /// CaptureAndSaveScreenshot — captures the current framebuffer and saves it.
     ///
     /// Corresponds to upstream `CaptureAndSaveScreenshot`.
-    pub fn capture_and_save_screenshot(&mut self, _report_option: AlbumReportOption) {
+    pub fn capture_and_save_screenshot(&self, _report_option: AlbumReportOption) {
         // In upstream, this:
         //   1. Creates a DefaultFrameLayout(1280, 720)
         //   2. Creates a default ScreenShotAttribute with AlbumImageOrientation::None
@@ -162,10 +165,11 @@ impl IScreenShotApplicationService {
         log::warn!("CaptureAndSaveScreenshot (STUBBED) called");
 
         // Convert BGRA to RGBA (matching upstream callback logic).
-        let len = self.image_data.len();
+        let mut image_data = self.image_data.lock().unwrap();
+        let len = image_data.len();
         let mut i = 0;
         while i < len {
-            self.image_data.swap(i, i + 2);
+            image_data.swap(i, i + 2);
             i += BYTES_PER_PIXEL;
         }
 
@@ -178,7 +182,7 @@ impl IScreenShotApplicationService {
             &mut entry,
             &attribute,
             _report_option,
-            &self.image_data,
+            &image_data,
             0, // aruid placeholder
         );
     }
@@ -191,6 +195,10 @@ impl SessionRequestHandler for IScreenShotApplicationService {
 
     fn service_name(&self) -> &str {
         "caps:su"
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
     }
 }
 

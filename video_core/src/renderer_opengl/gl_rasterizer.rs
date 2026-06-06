@@ -9,7 +9,7 @@
 //! to the software rasterizer; GL-accelerated rendering will be added as
 //! buffer/texture/shader caches are ported from zuyu.
 
-use log::{debug, info};
+use log::{debug, error, info, warn};
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -31,7 +31,7 @@ use crate::engines::draw_manager::{
     DrawState, Maxwell3DClearView, Maxwell3DDrawView, Maxwell3DIndirectView,
 };
 use crate::engines::maxwell_3d::{
-    BlendEquation, BlendFactor, ComparisonOp, CullFace, DepthMode, DepthStencilInfo, DrawCall,
+    BlendEquation, BlendFactor, ComparisonOp, CullFace, DepthMode, DrawCall, FillViaTriangleMode,
     FrontFace, PolygonMode, StencilFaceInfo, StencilOp,
 };
 use crate::engines::Framebuffer;
@@ -196,9 +196,15 @@ pub fn dump_gl_draw_stall_profile() {
 
 type GlDepthRangeIndexeddNV = unsafe extern "system" fn(u32, f64, f64);
 type GlViewportSwizzleNV = unsafe extern "system" fn(u32, u32, u32, u32, u32);
+type GlPolygonOffsetClamp = unsafe extern "system" fn(f32, f32, f32);
+type GlAlphaFunc = unsafe extern "system" fn(u32, f32);
 
 static GL_DEPTH_RANGE_INDEXEDDNV: OnceLock<Option<GlDepthRangeIndexeddNV>> = OnceLock::new();
 static GL_VIEWPORT_SWIZZLE_NV: OnceLock<Option<GlViewportSwizzleNV>> = OnceLock::new();
+static GL_POLYGON_OFFSET_CLAMP: OnceLock<Option<GlPolygonOffsetClamp>> = OnceLock::new();
+static GL_ALPHA_FUNC: OnceLock<Option<GlAlphaFunc>> = OnceLock::new();
+static GL_ALPHA_FUNC_MISSING_LOGGED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 fn load_optional_gl_function<T, F>(load_fn: &mut F, name: &'static str) -> Option<T>
 where
@@ -213,7 +219,7 @@ where
 }
 
 /// Load optional OpenGL entry points that are not emitted by the generated
-/// `gl` bindings but are used by upstream `RasterizerOpenGL::SyncViewport`.
+/// `gl` bindings but are used by upstream `RasterizerOpenGL::SyncState`.
 pub fn load_extra_functions<F>(load_fn: &mut F)
 where
     F: FnMut(&'static str) -> *const c_void,
@@ -221,6 +227,8 @@ where
     let _ =
         GL_DEPTH_RANGE_INDEXEDDNV.set(load_optional_gl_function(load_fn, "glDepthRangeIndexeddNV"));
     let _ = GL_VIEWPORT_SWIZZLE_NV.set(load_optional_gl_function(load_fn, "glViewportSwizzleNV"));
+    let _ = GL_POLYGON_OFFSET_CLAMP.set(load_optional_gl_function(load_fn, "glPolygonOffsetClamp"));
+    let _ = GL_ALPHA_FUNC.set(load_optional_gl_function(load_fn, "glAlphaFunc"));
 }
 
 struct OpenGLDeviceTracker;
@@ -851,44 +859,96 @@ fn sync_stencil_face(face: u32, info: StencilFaceInfo) {
     }
 }
 
-fn sync_depth_stencil_state(depth_stencil: &DepthStencilInfo) {
+fn sync_depth_test_state(
+    draw_view: &mut Maxwell3DDrawView<'_>,
+    state_tracker: &mut Option<&mut StateTracker>,
+) {
+    let flags = draw_view.dirty_flags();
+    let tracker_dirty_depth_mask = exchange_tracker_dirty(state_tracker, GlDirty::DEPTH_MASK);
     unsafe {
-        gl::DepthMask(if depth_stencil.depth_write_enable {
-            gl::TRUE
-        } else {
-            gl::FALSE
-        });
+        if flags[GlDirty::DEPTH_MASK as usize] || tracker_dirty_depth_mask {
+            draw_view.clear_dirty_flag(GlDirty::DEPTH_MASK);
+            gl::DepthMask(if draw_view.depth_stencil().depth_write_enable {
+                gl::TRUE
+            } else {
+                gl::FALSE
+            });
+        }
+    }
+
+    let flags = draw_view.dirty_flags();
+    let tracker_dirty_depth_test = exchange_tracker_dirty(state_tracker, GlDirty::DEPTH_TEST);
+    if !flags[GlDirty::DEPTH_TEST as usize] && !tracker_dirty_depth_test {
+        return;
+    }
+    draw_view.clear_dirty_flag(GlDirty::DEPTH_TEST);
+
+    let depth_stencil = draw_view.depth_stencil();
+    unsafe {
         if depth_stencil.depth_test_enable {
             gl::Enable(gl::DEPTH_TEST);
             gl::DepthFunc(comparison_op_to_gl(depth_stencil.depth_func));
         } else {
             gl::Disable(gl::DEPTH_TEST);
         }
+    }
+}
 
+fn sync_stencil_test_state(
+    draw_view: &mut Maxwell3DDrawView<'_>,
+    state_tracker: &mut Option<&mut StateTracker>,
+) {
+    let flags = draw_view.dirty_flags();
+    let tracker_dirty = exchange_tracker_dirty(state_tracker, GlDirty::STENCIL_TEST);
+    if !flags[GlDirty::STENCIL_TEST as usize] && !tracker_dirty {
+        return;
+    }
+    draw_view.clear_dirty_flag(GlDirty::STENCIL_TEST);
+
+    let depth_stencil = draw_view.depth_stencil();
+    unsafe {
         if depth_stencil.stencil_enable {
             gl::Enable(gl::STENCIL_TEST);
-            sync_stencil_face(gl::FRONT, depth_stencil.front);
-            if depth_stencil.stencil_two_side {
-                sync_stencil_face(gl::BACK, depth_stencil.back);
-            } else {
-                gl::StencilFuncSeparate(gl::BACK, gl::ALWAYS, 0, 0xFFFF_FFFF);
-                gl::StencilOpSeparate(gl::BACK, gl::KEEP, gl::KEEP, gl::KEEP);
-                gl::StencilMaskSeparate(gl::BACK, 0xFFFF_FFFF);
-            }
         } else {
             gl::Disable(gl::STENCIL_TEST);
+        }
+        sync_stencil_face(gl::FRONT, depth_stencil.front);
+        if depth_stencil.stencil_two_side {
+            sync_stencil_face(gl::BACK, depth_stencil.back);
+        } else {
+            gl::StencilFuncSeparate(gl::BACK, gl::ALWAYS, 0, 0xFFFF_FFFF);
+            gl::StencilOpSeparate(gl::BACK, gl::KEEP, gl::KEEP, gl::KEEP);
+            gl::StencilMaskSeparate(gl::BACK, 0xFFFF_FFFF);
+        }
+    }
+}
+
+fn sync_depth_clamp(
+    draw_view: &mut Maxwell3DDrawView<'_>,
+    state_tracker: &mut Option<&mut StateTracker>,
+) {
+    let flags = draw_view.dirty_flags();
+    let tracker_dirty = exchange_tracker_dirty(state_tracker, GlDirty::DEPTH_CLAMP_ENABLED);
+    if !flags[GlDirty::DEPTH_CLAMP_ENABLED as usize] && !tracker_dirty {
+        return;
+    }
+    draw_view.clear_dirty_flag(GlDirty::DEPTH_CLAMP_ENABLED);
+
+    unsafe {
+        if draw_view.depth_clamp_enabled() {
+            gl::Enable(gl::DEPTH_CLAMP);
+        } else {
+            gl::Disable(gl::DEPTH_CLAMP);
         }
     }
 }
 
 fn sync_framebuffer_srgb(
     draw_view: &mut Maxwell3DDrawView<'_>,
-    mut state_tracker: Option<&mut StateTracker>,
+    state_tracker: &mut Option<&mut StateTracker>,
 ) {
     let flags = draw_view.dirty_flags();
-    let tracker_dirty = state_tracker
-        .as_deref_mut()
-        .is_some_and(|tracker| tracker.exchange(GlDirty::FRAMEBUFFER_SRGB));
+    let tracker_dirty = exchange_tracker_dirty(state_tracker, GlDirty::FRAMEBUFFER_SRGB);
     if !flags[GlDirty::FRAMEBUFFER_SRGB as usize] && !tracker_dirty {
         return;
     }
@@ -925,24 +985,6 @@ fn viewport_front_face_to_gl(
     }
 }
 
-fn sync_rasterizer_state(rasterizer: crate::engines::maxwell_3d::RasterizerInfo) {
-    unsafe {
-        if rasterizer.cull_enable {
-            gl::Enable(gl::CULL_FACE);
-            gl::CullFace(cull_face_to_gl(rasterizer.cull_face));
-        } else {
-            gl::Disable(gl::CULL_FACE);
-        }
-        gl::PolygonMode(gl::FRONT, polygon_mode_to_gl(rasterizer.polygon_mode_front));
-        gl::PolygonMode(gl::BACK, polygon_mode_to_gl(rasterizer.polygon_mode_back));
-        gl::LineWidth(rasterizer.line_width_aliased.max(1.0));
-        // The generated GL bindings do not expose ARB_polygon_offset_clamp;
-        // keep the upstream-owned state sync here and use core
-        // glPolygonOffset until the extension wrapper is ported.
-        gl::PolygonOffset(rasterizer.slope_scale_depth_bias, rasterizer.depth_bias);
-    }
-}
-
 fn clip_control_depth(depth_mode: DepthMode) -> u32 {
     match depth_mode {
         DepthMode::ZeroToOne => gl::ZERO_TO_ONE,
@@ -974,11 +1016,498 @@ fn viewport_swizzle_components(swizzle: u32) -> [u32; 4] {
     ]
 }
 
+fn scale_viewport_value(value: f32, scale: f32) -> f32 {
+    let mut new_value = value * scale;
+    if scale < 1.0 {
+        new_value = new_value.abs().round().copysign(value);
+    }
+    new_value
+}
+
+fn exchange_tracker_dirty(state_tracker: &mut Option<&mut StateTracker>, flag: u8) -> bool {
+    state_tracker
+        .as_deref_mut()
+        .is_some_and(|tracker| tracker.exchange(flag))
+}
+
+fn sync_rasterize_enable(
+    draw_view: &mut Maxwell3DDrawView<'_>,
+    state_tracker: &mut Option<&mut StateTracker>,
+) {
+    let flags = draw_view.dirty_flags();
+    let tracker_dirty = exchange_tracker_dirty(state_tracker, GlDirty::RASTERIZE_ENABLE);
+    if !flags[GlDirty::RASTERIZE_ENABLE as usize] && !tracker_dirty {
+        return;
+    }
+    draw_view.clear_dirty_flag(GlDirty::RASTERIZE_ENABLE);
+    unsafe {
+        if draw_view.rasterize_enable() {
+            gl::Disable(gl::RASTERIZER_DISCARD);
+        } else {
+            gl::Enable(gl::RASTERIZER_DISCARD);
+        }
+    }
+}
+
+fn sync_scissor_test(
+    draw_view: &mut Maxwell3DDrawView<'_>,
+    state_tracker: &mut Option<&mut StateTracker>,
+) {
+    let flags = draw_view.dirty_flags();
+    let tracker_dirty = exchange_tracker_dirty(state_tracker, GlDirty::SCISSORS);
+    let dirty_scissors = flags[GlDirty::SCISSORS as usize]
+        || flags[GlDirty::RESCALE_SCISSORS as usize]
+        || tracker_dirty;
+    if !dirty_scissors {
+        return;
+    }
+
+    let force = flags[GlDirty::RESCALE_SCISSORS as usize] || tracker_dirty;
+    draw_view.clear_dirty_flag(GlDirty::SCISSORS);
+    draw_view.clear_dirty_flag(GlDirty::RESCALE_SCISSORS);
+    unsafe {
+        for (index, scissor) in draw_view.scissors().iter().enumerate() {
+            if !force && !flags[(GlDirty::SCISSOR_0 as usize) + index] {
+                continue;
+            }
+            draw_view.clear_dirty_flag(GlDirty::SCISSOR_0 + index as u8);
+            if scissor.enabled && scissor.max_x > scissor.min_x && scissor.max_y > scissor.min_y {
+                gl::Enablei(gl::SCISSOR_TEST, index as u32);
+                gl::ScissorIndexed(
+                    index as u32,
+                    scissor.min_x as i32,
+                    scissor.min_y as i32,
+                    (scissor.max_x - scissor.min_x) as i32,
+                    (scissor.max_y - scissor.min_y) as i32,
+                );
+            } else {
+                gl::Disablei(gl::SCISSOR_TEST, index as u32);
+            }
+        }
+    }
+}
+
+fn sync_color_mask(
+    draw_view: &mut Maxwell3DDrawView<'_>,
+    state_tracker: &mut Option<&mut StateTracker>,
+) {
+    let flags = draw_view.dirty_flags();
+    let tracker_dirty = exchange_tracker_dirty(state_tracker, GlDirty::COLOR_MASKS);
+    if !flags[GlDirty::COLOR_MASKS as usize] && !tracker_dirty {
+        return;
+    }
+
+    draw_view.clear_dirty_flag(GlDirty::COLOR_MASKS);
+    let force = flags[GlDirty::COLOR_MASK_COMMON as usize] || tracker_dirty;
+    draw_view.clear_dirty_flag(GlDirty::COLOR_MASK_COMMON);
+    let color_masks = draw_view.color_masks();
+    unsafe {
+        if draw_view.color_mask_common() {
+            if force || flags[GlDirty::COLOR_MASK_0 as usize] {
+                draw_view.clear_dirty_flag(GlDirty::COLOR_MASK_0);
+                let mask = color_masks[0];
+                gl::ColorMask(
+                    if mask.r { gl::TRUE } else { gl::FALSE },
+                    if mask.b { gl::TRUE } else { gl::FALSE },
+                    if mask.g { gl::TRUE } else { gl::FALSE },
+                    if mask.a { gl::TRUE } else { gl::FALSE },
+                );
+            }
+        } else {
+            for (rt, mask) in color_masks.iter().enumerate() {
+                if !force && !flags[(GlDirty::COLOR_MASK_0 as usize) + rt] {
+                    continue;
+                }
+                draw_view.clear_dirty_flag(GlDirty::COLOR_MASK_0 + rt as u8);
+                gl::ColorMaski(
+                    rt as u32,
+                    if mask.r { gl::TRUE } else { gl::FALSE },
+                    if mask.g { gl::TRUE } else { gl::FALSE },
+                    if mask.b { gl::TRUE } else { gl::FALSE },
+                    if mask.a { gl::TRUE } else { gl::FALSE },
+                );
+            }
+        }
+    }
+}
+
+fn sync_blend_state(
+    draw_view: &mut Maxwell3DDrawView<'_>,
+    state_tracker: &mut Option<&mut StateTracker>,
+) {
+    let flags = draw_view.dirty_flags();
+    let tracker_dirty_blend_color = exchange_tracker_dirty(state_tracker, GlDirty::BLEND_COLOR);
+    unsafe {
+        if flags[GlDirty::BLEND_COLOR as usize] || tracker_dirty_blend_color {
+            draw_view.clear_dirty_flag(GlDirty::BLEND_COLOR);
+            gl::BlendColor(
+                draw_view.blend_color().r,
+                draw_view.blend_color().g,
+                draw_view.blend_color().b,
+                draw_view.blend_color().a,
+            );
+        }
+    }
+
+    let flags = draw_view.dirty_flags();
+    let tracker_dirty_blend_states = exchange_tracker_dirty(state_tracker, GlDirty::BLEND_STATES);
+    if !flags[GlDirty::BLEND_STATES as usize] && !tracker_dirty_blend_states {
+        return;
+    }
+
+    draw_view.clear_dirty_flag(GlDirty::BLEND_STATES);
+    unsafe {
+        if !draw_view.blend_per_target_enabled() {
+            let blend = draw_view.global_blend();
+            if !blend.enabled {
+                gl::Disable(gl::BLEND);
+            } else {
+                gl::Enable(gl::BLEND);
+                gl::BlendFuncSeparate(
+                    blend_factor_to_gl(blend.color_src),
+                    blend_factor_to_gl(blend.color_dst),
+                    blend_factor_to_gl(blend.alpha_src),
+                    blend_factor_to_gl(blend.alpha_dst),
+                );
+                gl::BlendEquationSeparate(
+                    blend_equation_to_gl(blend.color_op),
+                    blend_equation_to_gl(blend.alpha_op),
+                );
+            }
+        } else {
+            let force =
+                flags[GlDirty::BLEND_INDEPENDENT_ENABLED as usize] || tracker_dirty_blend_states;
+            draw_view.clear_dirty_flag(GlDirty::BLEND_INDEPENDENT_ENABLED);
+            for (rt, blend) in draw_view.blend().iter().enumerate() {
+                if !force && !flags[(GlDirty::BLEND_STATE_0 as usize) + rt] {
+                    continue;
+                }
+                draw_view.clear_dirty_flag(GlDirty::BLEND_STATE_0 + rt as u8);
+                if blend.enabled {
+                    gl::Enablei(gl::BLEND, rt as u32);
+                    gl::BlendEquationSeparatei(
+                        rt as u32,
+                        blend_equation_to_gl(blend.color_op),
+                        blend_equation_to_gl(blend.alpha_op),
+                    );
+                    gl::BlendFuncSeparatei(
+                        rt as u32,
+                        blend_factor_to_gl(blend.color_src),
+                        blend_factor_to_gl(blend.color_dst),
+                        blend_factor_to_gl(blend.alpha_src),
+                        blend_factor_to_gl(blend.alpha_dst),
+                    );
+                } else {
+                    gl::Disablei(gl::BLEND, rt as u32);
+                }
+            }
+        }
+    }
+}
+
+fn sync_logic_op_state(
+    draw_view: &mut Maxwell3DDrawView<'_>,
+    state_tracker: &mut Option<&mut StateTracker>,
+) {
+    let flags = draw_view.dirty_flags();
+    let tracker_dirty = exchange_tracker_dirty(state_tracker, GlDirty::LOGIC_OP);
+    if !flags[GlDirty::LOGIC_OP as usize] && !tracker_dirty {
+        return;
+    }
+    draw_view.clear_dirty_flag(GlDirty::LOGIC_OP);
+
+    let logic_op = draw_view.logic_op();
+    unsafe {
+        if logic_op.enabled {
+            gl::Enable(gl::COLOR_LOGIC_OP);
+            gl::LogicOp(crate::renderer_opengl::maxwell_to_gl::logic_op(logic_op.op));
+        } else {
+            gl::Disable(gl::COLOR_LOGIC_OP);
+        }
+    }
+}
+
+fn sync_cull_mode(
+    draw_view: &mut Maxwell3DDrawView<'_>,
+    state_tracker: &mut Option<&mut StateTracker>,
+) {
+    let flags = draw_view.dirty_flags();
+    let tracker_dirty = exchange_tracker_dirty(state_tracker, GlDirty::CULL_TEST);
+    if !flags[GlDirty::CULL_TEST as usize] && !tracker_dirty {
+        return;
+    }
+    draw_view.clear_dirty_flag(GlDirty::CULL_TEST);
+
+    let rasterizer = draw_view.rasterizer();
+    unsafe {
+        if rasterizer.cull_enable {
+            gl::Enable(gl::CULL_FACE);
+            gl::CullFace(cull_face_to_gl(rasterizer.cull_face));
+        } else {
+            gl::Disable(gl::CULL_FACE);
+        }
+    }
+}
+
+fn sync_polygon_modes(
+    draw_view: &mut Maxwell3DDrawView<'_>,
+    state_tracker: &mut Option<&mut StateTracker>,
+    has_fill_rectangle: bool,
+) {
+    let flags = draw_view.dirty_flags();
+    let tracker_dirty = exchange_tracker_dirty(state_tracker, GlDirty::POLYGON_MODES);
+    if !flags[GlDirty::POLYGON_MODES as usize] && !tracker_dirty {
+        return;
+    }
+    draw_view.clear_dirty_flag(GlDirty::POLYGON_MODES);
+
+    let rasterizer = draw_view.rasterizer();
+    unsafe {
+        if rasterizer.fill_via_triangle_mode != FillViaTriangleMode::Disabled {
+            if !has_fill_rectangle {
+                error!("GL_NV_fill_rectangle used and not supported");
+                gl::PolygonMode(gl::FRONT_AND_BACK, gl::FILL);
+                return;
+            }
+
+            const GL_FILL_RECTANGLE_NV: u32 = 0x933C;
+            draw_view.set_dirty_flag(GlDirty::POLYGON_MODE_FRONT);
+            draw_view.set_dirty_flag(GlDirty::POLYGON_MODE_BACK);
+            gl::PolygonMode(gl::FRONT_AND_BACK, GL_FILL_RECTANGLE_NV);
+            return;
+        }
+
+        if rasterizer.polygon_mode_front == rasterizer.polygon_mode_back {
+            draw_view.clear_dirty_flag(GlDirty::POLYGON_MODE_FRONT);
+            draw_view.clear_dirty_flag(GlDirty::POLYGON_MODE_BACK);
+            gl::PolygonMode(
+                gl::FRONT_AND_BACK,
+                polygon_mode_to_gl(rasterizer.polygon_mode_front),
+            );
+            return;
+        }
+
+        if flags[GlDirty::POLYGON_MODE_FRONT as usize] || tracker_dirty {
+            draw_view.clear_dirty_flag(GlDirty::POLYGON_MODE_FRONT);
+            gl::PolygonMode(gl::FRONT, polygon_mode_to_gl(rasterizer.polygon_mode_front));
+        }
+
+        if flags[GlDirty::POLYGON_MODE_BACK as usize] || tracker_dirty {
+            draw_view.clear_dirty_flag(GlDirty::POLYGON_MODE_BACK);
+            gl::PolygonMode(gl::BACK, polygon_mode_to_gl(rasterizer.polygon_mode_back));
+        }
+    }
+}
+
+fn sync_fragment_color_clamp_state(
+    draw_view: &mut Maxwell3DDrawView<'_>,
+    state_tracker: &mut Option<&mut StateTracker>,
+) {
+    let flags = draw_view.dirty_flags();
+    let tracker_dirty = exchange_tracker_dirty(state_tracker, GlDirty::FRAGMENT_CLAMP_COLOR);
+    if !flags[GlDirty::FRAGMENT_CLAMP_COLOR as usize] && !tracker_dirty {
+        return;
+    }
+    draw_view.clear_dirty_flag(GlDirty::FRAGMENT_CLAMP_COLOR);
+
+    const GL_CLAMP_FRAGMENT_COLOR: u32 = 0x891B;
+    unsafe {
+        gl::ClampColor(
+            GL_CLAMP_FRAGMENT_COLOR,
+            if draw_view.frag_color_clamp_any_enabled() {
+                gl::TRUE as u32
+            } else {
+                gl::FALSE as u32
+            },
+        );
+    }
+}
+
+fn sync_multi_sample_state(
+    draw_view: &mut Maxwell3DDrawView<'_>,
+    state_tracker: &mut Option<&mut StateTracker>,
+) {
+    let flags = draw_view.dirty_flags();
+    let tracker_dirty = exchange_tracker_dirty(state_tracker, GlDirty::MULTISAMPLE_CONTROL);
+    if !flags[GlDirty::MULTISAMPLE_CONTROL as usize] && !tracker_dirty {
+        return;
+    }
+    draw_view.clear_dirty_flag(GlDirty::MULTISAMPLE_CONTROL);
+
+    let control = draw_view.anti_alias_alpha_control();
+    unsafe {
+        if control.alpha_to_coverage {
+            gl::Enable(gl::SAMPLE_ALPHA_TO_COVERAGE);
+        } else {
+            gl::Disable(gl::SAMPLE_ALPHA_TO_COVERAGE);
+        }
+        if control.alpha_to_one {
+            gl::Enable(gl::SAMPLE_ALPHA_TO_ONE);
+        } else {
+            gl::Disable(gl::SAMPLE_ALPHA_TO_ONE);
+        }
+    }
+}
+
+fn sync_point_state(
+    draw_view: &mut Maxwell3DDrawView<'_>,
+    state_tracker: &mut Option<&mut StateTracker>,
+    viewport_scale: f32,
+) {
+    let flags = draw_view.dirty_flags();
+    let tracker_dirty = exchange_tracker_dirty(state_tracker, GlDirty::POINT_SIZE);
+    if !flags[GlDirty::POINT_SIZE as usize] && !tracker_dirty {
+        return;
+    }
+    draw_view.clear_dirty_flag(GlDirty::POINT_SIZE);
+
+    const GL_POINT_SPRITE: u32 = 0x8861;
+    let point = draw_view.point_state();
+    unsafe {
+        if point.point_sprite_enable {
+            gl::Enable(GL_POINT_SPRITE);
+        } else {
+            gl::Disable(GL_POINT_SPRITE);
+        }
+        if point.point_size_attribute_enabled {
+            gl::Enable(gl::PROGRAM_POINT_SIZE);
+        } else {
+            gl::Disable(gl::PROGRAM_POINT_SIZE);
+        }
+        gl::PointSize((point.point_size * viewport_scale).max(1.0));
+    }
+}
+
+fn sync_line_state(
+    draw_view: &mut Maxwell3DDrawView<'_>,
+    state_tracker: &mut Option<&mut StateTracker>,
+) {
+    let flags = draw_view.dirty_flags();
+    let tracker_dirty = exchange_tracker_dirty(state_tracker, GlDirty::LINE_WIDTH);
+    if !flags[GlDirty::LINE_WIDTH as usize] && !tracker_dirty {
+        return;
+    }
+    draw_view.clear_dirty_flag(GlDirty::LINE_WIDTH);
+
+    let line = draw_view.line_state();
+    unsafe {
+        if line.line_anti_alias_enable {
+            gl::Enable(gl::LINE_SMOOTH);
+        } else {
+            gl::Disable(gl::LINE_SMOOTH);
+        }
+        gl::LineWidth(if line.line_anti_alias_enable {
+            line.line_width_smooth
+        } else {
+            line.line_width_aliased
+        });
+    }
+}
+
+fn sync_polygon_offset(
+    draw_view: &mut Maxwell3DDrawView<'_>,
+    state_tracker: &mut Option<&mut StateTracker>,
+) {
+    let flags = draw_view.dirty_flags();
+    let tracker_dirty = exchange_tracker_dirty(state_tracker, GlDirty::POLYGON_OFFSET);
+    if !flags[GlDirty::POLYGON_OFFSET as usize] && !tracker_dirty {
+        return;
+    }
+    draw_view.clear_dirty_flag(GlDirty::POLYGON_OFFSET);
+
+    let rasterizer = draw_view.rasterizer();
+    unsafe {
+        if rasterizer.polygon_offset_fill_enable {
+            gl::Enable(gl::POLYGON_OFFSET_FILL);
+        } else {
+            gl::Disable(gl::POLYGON_OFFSET_FILL);
+        }
+        if rasterizer.polygon_offset_line_enable {
+            gl::Enable(gl::POLYGON_OFFSET_LINE);
+        } else {
+            gl::Disable(gl::POLYGON_OFFSET_LINE);
+        }
+        if rasterizer.polygon_offset_point_enable {
+            gl::Enable(gl::POLYGON_OFFSET_POINT);
+        } else {
+            gl::Disable(gl::POLYGON_OFFSET_POINT);
+        }
+
+        if rasterizer.polygon_offset_fill_enable
+            || rasterizer.polygon_offset_line_enable
+            || rasterizer.polygon_offset_point_enable
+        {
+            let units = rasterizer.depth_bias / 2.0;
+            if let Some(Some(polygon_offset_clamp)) = GL_POLYGON_OFFSET_CLAMP.get() {
+                polygon_offset_clamp(
+                    rasterizer.slope_scale_depth_bias,
+                    units,
+                    rasterizer.depth_bias_clamp,
+                );
+            } else {
+                gl::PolygonOffset(rasterizer.slope_scale_depth_bias, units);
+            }
+        }
+    }
+}
+
+fn sync_alpha_test(
+    draw_view: &mut Maxwell3DDrawView<'_>,
+    state_tracker: &mut Option<&mut StateTracker>,
+) {
+    let flags = draw_view.dirty_flags();
+    let tracker_dirty = exchange_tracker_dirty(state_tracker, GlDirty::ALPHA_TEST);
+    if !flags[GlDirty::ALPHA_TEST as usize] && !tracker_dirty {
+        return;
+    }
+    draw_view.clear_dirty_flag(GlDirty::ALPHA_TEST);
+
+    const GL_ALPHA_TEST_COMPAT: u32 = 0x0BC0;
+    unsafe {
+        if draw_view.alpha_test_enabled() {
+            gl::Enable(GL_ALPHA_TEST_COMPAT);
+            if let Some(Some(alpha_func)) = GL_ALPHA_FUNC.get() {
+                alpha_func(
+                    comparison_op_to_gl(draw_view.alpha_test_func()),
+                    draw_view.alpha_test_ref(),
+                );
+            } else if !GL_ALPHA_FUNC_MISSING_LOGGED.swap(true, Ordering::Relaxed) {
+                warn!("glAlphaFunc unavailable; skipping fixed-function alpha-test func sync");
+            }
+        } else {
+            gl::Disable(GL_ALPHA_TEST_COMPAT);
+        }
+    }
+}
+
+fn sync_primitive_restart(
+    draw_view: &mut Maxwell3DDrawView<'_>,
+    state_tracker: &mut Option<&mut StateTracker>,
+) {
+    let flags = draw_view.dirty_flags();
+    let tracker_dirty = exchange_tracker_dirty(state_tracker, GlDirty::PRIMITIVE_RESTART);
+    if !flags[GlDirty::PRIMITIVE_RESTART as usize] && !tracker_dirty {
+        return;
+    }
+    draw_view.clear_dirty_flag(GlDirty::PRIMITIVE_RESTART);
+
+    let primitive_restart = draw_view.primitive_restart();
+    unsafe {
+        if primitive_restart.enabled {
+            gl::Enable(gl::PRIMITIVE_RESTART);
+            gl::PrimitiveRestartIndex(primitive_restart.index);
+        } else {
+            gl::Disable(gl::PRIMITIVE_RESTART);
+        }
+    }
+}
+
 fn sync_viewport(
     draw_view: &mut Maxwell3DDrawView<'_>,
-    mut state_tracker: Option<&mut StateTracker>,
+    state_tracker: &mut Option<&mut StateTracker>,
     has_depth_buffer_float: bool,
     has_viewport_swizzle: bool,
+    viewport_scale: f32,
 ) {
     let flags = draw_view.dirty_flags();
     let rescale_viewports = flags[crate::dirty_flags::flags::RESCALE_VIEWPORTS as usize];
@@ -1042,17 +1571,6 @@ fn sync_viewport(
             }
         }
 
-        let tracker_dirty_rasterize_enable = state_tracker
-            .as_deref_mut()
-            .is_some_and(|tracker| tracker.exchange(GlDirty::RASTERIZE_ENABLE));
-        if flags[GlDirty::RASTERIZE_ENABLE as usize] || tracker_dirty_rasterize_enable {
-            draw_view.clear_dirty_flag(GlDirty::RASTERIZE_ENABLE);
-            if draw_view.rasterize_enable() {
-                gl::Disable(gl::RASTERIZER_DISCARD);
-            } else {
-                gl::Enable(gl::RASTERIZER_DISCARD);
-            }
-        }
         if dirty_viewport {
             draw_view.clear_dirty_flag(GlDirty::VIEWPORTS);
             draw_view.clear_dirty_flag(GlDirty::VIEWPORT_TRANSFORM);
@@ -1087,10 +1605,16 @@ fn sync_viewport(
                         continue;
                     }
                     draw_view.clear_dirty_flag(GlDirty::VIEWPORT_0 + index as u8);
-                    let x = viewport.translate_x - viewport.scale_x;
-                    let mut y = viewport.translate_y - viewport.scale_y;
-                    let width = viewport.scale_x * 2.0;
-                    let mut height = viewport.scale_y * 2.0;
+                    let x = scale_viewport_value(
+                        viewport.translate_x - viewport.scale_x,
+                        viewport_scale,
+                    );
+                    let mut y = scale_viewport_value(
+                        viewport.translate_y - viewport.scale_y,
+                        viewport_scale,
+                    );
+                    let width = scale_viewport_value(viewport.scale_x * 2.0, viewport_scale);
+                    let mut height = scale_viewport_value(viewport.scale_y * 2.0, viewport_scale);
                     if height < 0.0 {
                         y += height;
                         height = -height;
@@ -1124,191 +1648,39 @@ fn sync_viewport(
                 }
             }
         }
-
-        let tracker_dirty_scissors = state_tracker
-            .as_deref_mut()
-            .is_some_and(|tracker| tracker.exchange(GlDirty::SCISSORS));
-        let dirty_scissors = flags[GlDirty::SCISSORS as usize]
-            || flags[GlDirty::RESCALE_SCISSORS as usize]
-            || tracker_dirty_scissors;
-        if dirty_scissors {
-            let force = flags[GlDirty::RESCALE_SCISSORS as usize] || tracker_dirty_scissors;
-            draw_view.clear_dirty_flag(GlDirty::SCISSORS);
-            draw_view.clear_dirty_flag(GlDirty::RESCALE_SCISSORS);
-            for (index, scissor) in draw_view.scissors().iter().enumerate() {
-                if !force && !flags[(GlDirty::SCISSOR_0 as usize) + index] {
-                    continue;
-                }
-                draw_view.clear_dirty_flag(GlDirty::SCISSOR_0 + index as u8);
-                if scissor.enabled && scissor.max_x > scissor.min_x && scissor.max_y > scissor.min_y
-                {
-                    gl::Enablei(gl::SCISSOR_TEST, index as u32);
-                    gl::ScissorIndexed(
-                        index as u32,
-                        scissor.min_x as i32,
-                        scissor.min_y as i32,
-                        (scissor.max_x - scissor.min_x) as i32,
-                        (scissor.max_y - scissor.min_y) as i32,
-                    );
-                } else {
-                    gl::Disablei(gl::SCISSOR_TEST, index as u32);
-                }
-            }
-        }
-
-        let tracker_dirty_color_masks = state_tracker
-            .as_deref_mut()
-            .is_some_and(|tracker| tracker.exchange(GlDirty::COLOR_MASKS));
-        if flags[GlDirty::COLOR_MASKS as usize] || tracker_dirty_color_masks {
-            draw_view.clear_dirty_flag(GlDirty::COLOR_MASKS);
-            let force = flags[GlDirty::COLOR_MASK_COMMON as usize] || tracker_dirty_color_masks;
-            draw_view.clear_dirty_flag(GlDirty::COLOR_MASK_COMMON);
-            let color_masks = draw_view.color_masks();
-            if draw_view.color_mask_common() {
-                if force || flags[GlDirty::COLOR_MASK_0 as usize] {
-                    draw_view.clear_dirty_flag(GlDirty::COLOR_MASK_0);
-                    let mask = color_masks[0];
-                    gl::ColorMask(
-                        if mask.r { gl::TRUE } else { gl::FALSE },
-                        if mask.b { gl::TRUE } else { gl::FALSE },
-                        if mask.g { gl::TRUE } else { gl::FALSE },
-                        if mask.a { gl::TRUE } else { gl::FALSE },
-                    );
-                }
-            } else {
-                for (rt, mask) in color_masks.iter().enumerate() {
-                    if !force && !flags[(GlDirty::COLOR_MASK_0 as usize) + rt] {
-                        continue;
-                    }
-                    draw_view.clear_dirty_flag(GlDirty::COLOR_MASK_0 + rt as u8);
-                    gl::ColorMaski(
-                        rt as u32,
-                        if mask.r { gl::TRUE } else { gl::FALSE },
-                        if mask.g { gl::TRUE } else { gl::FALSE },
-                        if mask.b { gl::TRUE } else { gl::FALSE },
-                        if mask.a { gl::TRUE } else { gl::FALSE },
-                    );
-                }
-            }
-        }
-
-        let tracker_dirty_blend_color = state_tracker
-            .as_deref_mut()
-            .is_some_and(|tracker| tracker.exchange(GlDirty::BLEND_COLOR));
-        if flags[GlDirty::BLEND_COLOR as usize] || tracker_dirty_blend_color {
-            draw_view.clear_dirty_flag(GlDirty::BLEND_COLOR);
-            gl::BlendColor(
-                draw_view.blend_color().r,
-                draw_view.blend_color().g,
-                draw_view.blend_color().b,
-                draw_view.blend_color().a,
-            );
-        }
-        let tracker_dirty_blend_states = state_tracker
-            .as_deref_mut()
-            .is_some_and(|tracker| tracker.exchange(GlDirty::BLEND_STATES));
-        if flags[GlDirty::BLEND_STATES as usize] || tracker_dirty_blend_states {
-            draw_view.clear_dirty_flag(GlDirty::BLEND_STATES);
-            if !draw_view.blend_per_target_enabled() {
-                let blend = draw_view.global_blend();
-                if !blend.enabled {
-                    gl::Disable(gl::BLEND);
-                } else {
-                    gl::Enable(gl::BLEND);
-                    gl::BlendFuncSeparate(
-                        blend_factor_to_gl(blend.color_src),
-                        blend_factor_to_gl(blend.color_dst),
-                        blend_factor_to_gl(blend.alpha_src),
-                        blend_factor_to_gl(blend.alpha_dst),
-                    );
-                    gl::BlendEquationSeparate(
-                        blend_equation_to_gl(blend.color_op),
-                        blend_equation_to_gl(blend.alpha_op),
-                    );
-                }
-            } else {
-                let force = flags[GlDirty::BLEND_INDEPENDENT_ENABLED as usize]
-                    || tracker_dirty_blend_states;
-                draw_view.clear_dirty_flag(GlDirty::BLEND_INDEPENDENT_ENABLED);
-                for (rt, blend) in draw_view.blend().iter().enumerate() {
-                    if !force && !flags[(GlDirty::BLEND_STATE_0 as usize) + rt] {
-                        continue;
-                    }
-                    draw_view.clear_dirty_flag(GlDirty::BLEND_STATE_0 + rt as u8);
-                    if blend.enabled {
-                        gl::Enablei(gl::BLEND, rt as u32);
-                        gl::BlendEquationSeparatei(
-                            rt as u32,
-                            blend_equation_to_gl(blend.color_op),
-                            blend_equation_to_gl(blend.alpha_op),
-                        );
-                        gl::BlendFuncSeparatei(
-                            rt as u32,
-                            blend_factor_to_gl(blend.color_src),
-                            blend_factor_to_gl(blend.color_dst),
-                            blend_factor_to_gl(blend.alpha_src),
-                            blend_factor_to_gl(blend.alpha_dst),
-                        );
-                    } else {
-                        gl::Disablei(gl::BLEND, rt as u32);
-                    }
-                }
-            }
-        }
     }
-
-    let flags = draw_view.dirty_flags();
-    let depth_or_stencil_dirty = flags[GlDirty::DEPTH_MASK as usize]
-        || flags[GlDirty::DEPTH_TEST as usize]
-        || flags[GlDirty::STENCIL_TEST as usize]
-        || state_tracker.as_deref_mut().is_some_and(|tracker| {
-            tracker.exchange(GlDirty::DEPTH_MASK)
-                || tracker.exchange(GlDirty::DEPTH_TEST)
-                || tracker.exchange(GlDirty::STENCIL_TEST)
-        });
-    if depth_or_stencil_dirty {
-        draw_view.clear_dirty_flag(GlDirty::DEPTH_MASK);
-        draw_view.clear_dirty_flag(GlDirty::DEPTH_TEST);
-        draw_view.clear_dirty_flag(GlDirty::STENCIL_TEST);
-        sync_depth_stencil_state(&draw_view.depth_stencil());
-    }
-
-    let flags = draw_view.dirty_flags();
-    let rasterizer_dirty = flags[GlDirty::CULL_TEST as usize]
-        || flags[GlDirty::POLYGON_MODES as usize]
-        || flags[GlDirty::POLYGON_MODE_FRONT as usize]
-        || flags[GlDirty::POLYGON_MODE_BACK as usize]
-        || flags[GlDirty::LINE_WIDTH as usize]
-        || flags[GlDirty::POLYGON_OFFSET as usize]
-        || state_tracker.as_deref_mut().is_some_and(|tracker| {
-            tracker.exchange(GlDirty::CULL_TEST)
-                || tracker.exchange(GlDirty::POLYGON_MODES)
-                || tracker.exchange(GlDirty::POLYGON_MODE_FRONT)
-                || tracker.exchange(GlDirty::POLYGON_MODE_BACK)
-                || tracker.exchange(GlDirty::LINE_WIDTH)
-                || tracker.exchange(GlDirty::POLYGON_OFFSET)
-        });
-    if rasterizer_dirty {
-        draw_view.clear_dirty_flag(GlDirty::CULL_TEST);
-        draw_view.clear_dirty_flag(GlDirty::POLYGON_MODES);
-        draw_view.clear_dirty_flag(GlDirty::POLYGON_MODE_FRONT);
-        draw_view.clear_dirty_flag(GlDirty::POLYGON_MODE_BACK);
-        draw_view.clear_dirty_flag(GlDirty::LINE_WIDTH);
-        draw_view.clear_dirty_flag(GlDirty::POLYGON_OFFSET);
-        sync_rasterizer_state(draw_view.rasterizer());
-    }
-
-    sync_framebuffer_srgb(draw_view, state_tracker);
 }
 
-fn sync_vertex_formats(vao: u32, draw_view: &Maxwell3DDrawView<'_>) {
+fn sync_vertex_formats(
+    vao: u32,
+    draw_view: &mut Maxwell3DDrawView<'_>,
+    state_tracker: &mut Option<&mut StateTracker>,
+) {
     if vao == 0 {
         return;
     }
+    let flags = draw_view.dirty_flags();
+    let tracker_dirty_group = exchange_tracker_dirty(state_tracker, GlDirty::VERTEX_FORMATS);
+    let mut tracker_dirty_formats = [false; 16];
+    for (index, dirty) in tracker_dirty_formats.iter_mut().enumerate() {
+        *dirty = exchange_tracker_dirty(state_tracker, GlDirty::VERTEX_FORMAT_0 + index as u8);
+    }
+    if !flags[GlDirty::VERTEX_FORMATS as usize] && !tracker_dirty_group {
+        if !tracker_dirty_formats.iter().any(|dirty| *dirty) {
+            return;
+        }
+    }
+    draw_view.clear_dirty_flag(GlDirty::VERTEX_FORMATS);
+
     let trace_attribs = std::env::var_os("RUZU_TRACE_VERTEX_ATTRIBS").is_some();
     // Upstream caps this at 16 to avoid OpenGL errors even though Maxwell
     // exposes 32 vertex attributes.
     for (index, attrib) in draw_view.vertex_attribs().iter().take(16).enumerate() {
+        if !flags[(GlDirty::VERTEX_FORMAT_0 as usize) + index] && !tracker_dirty_formats[index] {
+            continue;
+        }
+        draw_view.clear_dirty_flag(GlDirty::VERTEX_FORMAT_0 + index as u8);
+
         let gl_index = index as u32;
         unsafe {
             if attrib.constant
@@ -1367,8 +1739,30 @@ fn sync_vertex_formats(vao: u32, draw_view: &Maxwell3DDrawView<'_>) {
     }
 }
 
-fn sync_vertex_instances(draw_view: &Maxwell3DDrawView<'_>) {
+fn sync_vertex_instances(
+    draw_view: &mut Maxwell3DDrawView<'_>,
+    state_tracker: &mut Option<&mut StateTracker>,
+) {
+    let flags = draw_view.dirty_flags();
+    let tracker_dirty_group = exchange_tracker_dirty(state_tracker, GlDirty::VERTEX_INSTANCES);
+    let mut tracker_dirty_instances = [false; 16];
+    for (index, dirty) in tracker_dirty_instances.iter_mut().enumerate() {
+        *dirty = exchange_tracker_dirty(state_tracker, GlDirty::VERTEX_INSTANCE_0 + index as u8);
+    }
+    if !flags[GlDirty::VERTEX_INSTANCES as usize] && !tracker_dirty_group {
+        if !tracker_dirty_instances.iter().any(|dirty| *dirty) {
+            return;
+        }
+    }
+    draw_view.clear_dirty_flag(GlDirty::VERTEX_INSTANCES);
+
     for index in 0..16 {
+        if !flags[(GlDirty::VERTEX_INSTANCE_0 as usize) + index] && !tracker_dirty_instances[index]
+        {
+            continue;
+        }
+        draw_view.clear_dirty_flag(GlDirty::VERTEX_INSTANCE_0 + index as u8);
+
         let stream = draw_view.vertex_streams()[index];
         let instancing_enabled = draw_view.vertex_stream_instances()[index] != 0;
         let divisor = if instancing_enabled {
@@ -1418,6 +1812,7 @@ pub struct RasterizerOpenGL {
     state_tracker: Box<StateTracker>,
     has_depth_buffer_float: bool,
     has_viewport_swizzle: bool,
+    has_fill_rectangle: bool,
     invalidate_gpu_cache_callback: Option<Arc<dyn Fn() + Send + Sync>>,
     /// Per-channel GPU memory manager, extracted from `ChannelState` in
     /// `bind_channel`. Used to build the `GpuMemoryAccess` adapter for the
@@ -2091,6 +2486,45 @@ impl RasterizerOpenGL {
         self.total_draw_count
     }
 
+    fn sync_state(
+        draw_view: &mut Maxwell3DDrawView<'_>,
+        state_tracker: &mut StateTracker,
+        vao: u32,
+        has_depth_buffer_float: bool,
+        has_viewport_swizzle: bool,
+        has_fill_rectangle: bool,
+        viewport_scale: f32,
+    ) {
+        let mut state_tracker = Some(state_tracker);
+        sync_viewport(
+            draw_view,
+            &mut state_tracker,
+            has_depth_buffer_float,
+            has_viewport_swizzle,
+            viewport_scale,
+        );
+        sync_rasterize_enable(draw_view, &mut state_tracker);
+        sync_polygon_modes(draw_view, &mut state_tracker, has_fill_rectangle);
+        sync_color_mask(draw_view, &mut state_tracker);
+        sync_fragment_color_clamp_state(draw_view, &mut state_tracker);
+        sync_multi_sample_state(draw_view, &mut state_tracker);
+        sync_depth_test_state(draw_view, &mut state_tracker);
+        sync_depth_clamp(draw_view, &mut state_tracker);
+        sync_stencil_test_state(draw_view, &mut state_tracker);
+        sync_blend_state(draw_view, &mut state_tracker);
+        sync_logic_op_state(draw_view, &mut state_tracker);
+        sync_cull_mode(draw_view, &mut state_tracker);
+        sync_primitive_restart(draw_view, &mut state_tracker);
+        sync_scissor_test(draw_view, &mut state_tracker);
+        sync_point_state(draw_view, &mut state_tracker, viewport_scale);
+        sync_line_state(draw_view, &mut state_tracker);
+        sync_polygon_offset(draw_view, &mut state_tracker);
+        sync_alpha_test(draw_view, &mut state_tracker);
+        sync_framebuffer_srgb(draw_view, &mut state_tracker);
+        sync_vertex_formats(vao, draw_view, &mut state_tracker);
+        sync_vertex_instances(draw_view, &mut state_tracker);
+    }
+
     /// Create a new rasterizer. Must be called with a current GL context.
     ///
     /// `device_memory` is the single shared `MaxwellDeviceMemoryManager`
@@ -2127,6 +2561,7 @@ impl RasterizerOpenGL {
             state_tracker: Box::new(StateTracker::new()),
             has_depth_buffer_float: device.has_depth_buffer_float(),
             has_viewport_swizzle: device.has_viewport_swizzle(),
+            has_fill_rectangle: device.has_fill_rectangle(),
             invalidate_gpu_cache_callback: None,
             channel_memory_manager: None,
             cpu_memory_reader: None,
@@ -2151,13 +2586,20 @@ impl RasterizerOpenGL {
             total_draw_count: 0,
             has_written_global_memory: false,
             buffer_cache: CommonBufferCache::new(&OPENGL_DEVICE_TRACKER),
-            texture_cache: OpenGLTextureCache::new_with_caps(test_device_memory, true),
+            texture_cache: OpenGLTextureCache::new_with_caps(
+                test_device_memory,
+                true,
+                false,
+                false,
+                false,
+            ),
             shader_cache: ShaderCache::default(),
             gl_shader_cache: OpenGLShaderCache::new_for_test(),
             query_cache: QueryCache::new(),
             state_tracker: Box::new(StateTracker::new()),
             has_depth_buffer_float: false,
             has_viewport_swizzle: false,
+            has_fill_rectangle: false,
             invalidate_gpu_cache_callback: None,
             channel_memory_manager: None,
             cpu_memory_reader: None,
@@ -2487,12 +2929,23 @@ impl RasterizerOpenGL {
                 }
             }
         }
+        let resolution = settings::values().resolution_info.clone();
+        let scaled_width = if framebuffer_view.scaled {
+            resolution.scale_up_u32(framebuffer_view.width)
+        } else {
+            framebuffer_view.width
+        };
+        let scaled_height = if framebuffer_view.scaled {
+            resolution.scale_up_u32(framebuffer_view.height)
+        } else {
+            framebuffer_view.height
+        };
         Some(FramebufferTextureInfo {
             display_texture: framebuffer_view.display_texture,
             width: framebuffer_view.width,
             height: framebuffer_view.height,
-            scaled_width: framebuffer_view.width,
-            scaled_height: framebuffer_view.height,
+            scaled_width,
+            scaled_height,
         })
     }
 
@@ -4586,14 +5039,20 @@ impl RasterizerInterface for RasterizerOpenGL {
         if can_draw_gl {
             record_gl_draw_stage(draw_seq, 31);
             trace_gl_draw_stall!("[GL_DRAW_STALL] seq={} before_fixed_state_sync", draw_seq);
-            sync_viewport(
+            let viewport_scale = if self.texture_cache.is_rescaling_active() {
+                settings::values().resolution_info.up_factor
+            } else {
+                1.0
+            };
+            Self::sync_state(
                 &mut draw_view,
-                Some(&mut *self.state_tracker),
+                &mut self.state_tracker,
+                self.transient_vao,
                 self.has_depth_buffer_float,
                 self.has_viewport_swizzle,
+                self.has_fill_rectangle,
+                viewport_scale,
             );
-            sync_vertex_formats(self.transient_vao, &draw_view);
-            sync_vertex_instances(&draw_view);
             if gl_debug.force_disable_blend {
                 unsafe {
                     for i in 0..8 {
@@ -6707,18 +7166,11 @@ impl RasterizerInterface for RasterizerOpenGL {
         let clear_b = flags & (1 << 4) != 0;
         let clear_a = flags & (1 << 5) != 0;
         let use_color = clear_r || clear_g || clear_b || clear_a;
-        let legacy_color_only_clear = std::env::var_os("RUZU_LEGACY_COLOR_ONLY_CLEAR").is_some();
-        let use_depth = clear_z && !legacy_color_only_clear;
-        let use_stencil = clear_s && !legacy_color_only_clear;
+        let use_depth = clear_z;
+        let use_stencil = clear_s;
 
         if !use_color && !use_depth && !use_stencil {
             return;
-        }
-
-        if legacy_color_only_clear {
-            if !use_color {
-                return;
-            }
         }
 
         let rt_index = ((flags >> 6) & 0xF) as usize;
@@ -6745,15 +7197,10 @@ impl RasterizerInterface for RasterizerOpenGL {
                 true,
                 clear_scissor,
             );
-            if legacy_color_only_clear {
-                (*texture_cache)
-                    .framebuffer_for_render_target(&render_targets.render_targets[rt_index])
-            } else {
-                (*texture_cache).framebuffer_for_render_targets_from_snapshot(
-                    &render_targets,
-                    crate::texture_cache::types::Extent2D::default(),
-                )
-            }
+            (*texture_cache).framebuffer_for_render_targets_from_snapshot(
+                &render_targets,
+                crate::texture_cache::types::Extent2D::default(),
+            )
         };
         let Some((framebuffer, width, height)) = framebuffer else {
             if std::env::var_os("RUZU_TRACE_CLEAR").is_some() {
@@ -6766,9 +7213,11 @@ impl RasterizerInterface for RasterizerOpenGL {
         };
 
         unsafe {
-            gl::BindFramebuffer(gl::DRAW_FRAMEBUFFER, framebuffer);
+            self.state_tracker.bind_framebuffer(framebuffer);
+            self.state_tracker.notify_viewport0();
             gl::Viewport(0, 0, width as i32, height as i32);
             if clear_view.use_scissor() {
+                self.state_tracker.notify_scissor0();
                 let scissor = clear_view.scissor(0);
                 if scissor.enabled && scissor.max_x > scissor.min_x && scissor.max_y > scissor.min_y
                 {
@@ -6784,9 +7233,11 @@ impl RasterizerInterface for RasterizerOpenGL {
                     gl::Disablei(gl::SCISSOR_TEST, 0);
                 }
             } else {
+                self.state_tracker.notify_scissor0();
                 gl::Disablei(gl::SCISSOR_TEST, 0);
             }
             if use_color {
+                self.state_tracker.notify_color_mask(rt_index);
                 gl::ColorMaski(
                     rt_index as u32,
                     if clear_r { gl::TRUE } else { gl::FALSE },
@@ -6794,10 +7245,16 @@ impl RasterizerInterface for RasterizerOpenGL {
                     if clear_b { gl::TRUE } else { gl::FALSE },
                     if clear_a { gl::TRUE } else { gl::FALSE },
                 );
+                self.state_tracker.notify_framebuffer_srgb();
+                if clear_view.framebuffer_srgb() {
+                    gl::Enable(gl::FRAMEBUFFER_SRGB);
+                } else {
+                    gl::Disable(gl::FRAMEBUFFER_SRGB);
+                }
                 gl::ClearBufferfv(gl::COLOR, rt_index as i32, clear_state.color.as_ptr());
-                gl::ColorMaski(rt_index as u32, gl::TRUE, gl::TRUE, gl::TRUE, gl::TRUE);
             }
             if use_depth {
+                self.state_tracker.notify_depth_mask();
                 gl::DepthMask(gl::TRUE);
             }
             if use_depth && use_stencil {
@@ -6806,14 +7263,6 @@ impl RasterizerInterface for RasterizerOpenGL {
                 gl::ClearBufferfv(gl::DEPTH, 0, &clear_state.depth);
             } else if use_stencil {
                 gl::ClearBufferiv(gl::STENCIL, 0, &clear_state.stencil);
-            }
-            if use_depth {
-                let depth_stencil = clear_view.depth_stencil();
-                gl::DepthMask(if depth_stencil.depth_write_enable {
-                    gl::TRUE
-                } else {
-                    gl::FALSE
-                });
             }
         }
         if std::env::var_os("RUZU_TRACE_CLEAR_WARN").is_some() {
@@ -7648,6 +8097,13 @@ mod tests {
             viewport_front_face_to_gl(FrontFace::CCW, true, -1.0),
             gl::CW
         );
+    }
+
+    #[test]
+    fn viewport_scale_matches_upstream_rounding_rules() {
+        assert_eq!(scale_viewport_value(10.0, 2.0), 20.0);
+        assert_eq!(scale_viewport_value(10.25, 0.5), 5.0);
+        assert_eq!(scale_viewport_value(-10.25, 0.5), -5.0);
     }
 
     #[test]

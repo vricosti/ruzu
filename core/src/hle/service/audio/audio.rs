@@ -20,8 +20,13 @@ use crate::hle::service::server_manager::ServerManager;
 pub fn loop_process(system: crate::core::SystemRef) {
     let mut server_manager = ServerManager::new(system);
 
-    // audctl — IAudioController does not yet implement SessionRequestHandler, use stub
-    crate::hle::service::services::register_stub_services(&mut server_manager, &["audctl"]);
+    server_manager.register_named_service(
+        "audctl",
+        Box::new(|| -> SessionRequestHandlerPtr {
+            std::sync::Arc::new(super::audio_controller::IAudioController::new())
+        }),
+        16,
+    );
 
     server_manager.register_named_service(
         "audin:u",
@@ -33,8 +38,8 @@ pub fn loop_process(system: crate::core::SystemRef) {
 
     server_manager.register_named_service(
         "audout:u",
-        Box::new(|| -> SessionRequestHandlerPtr {
-            std::sync::Arc::new(super::audio_out_manager::IAudioOutManager::new())
+        Box::new(move || -> SessionRequestHandlerPtr {
+            std::sync::Arc::new(super::audio_out_manager::IAudioOutManager::new(system))
         }),
         16,
     );

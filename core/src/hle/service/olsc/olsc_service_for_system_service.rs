@@ -238,21 +238,9 @@ impl IOlscServiceForSystemService {
         log::info!("IOlscServiceForSystemService::OpenTransferTaskListController called");
         let service: std::sync::Arc<dyn SessionRequestHandler> =
             std::sync::Arc::new(ITransferTaskListController::new());
-        let is_domain = ctx
-            .get_manager()
-            .map_or(false, |manager| manager.lock().unwrap().is_domain());
-        let move_handle = if is_domain {
-            0
-        } else {
-            ctx.create_session_for_service(service.clone()).unwrap_or(0)
-        };
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 1);
         rb.push_result(RESULT_SUCCESS);
-        if is_domain {
-            ctx.add_domain_object(service);
-        } else {
-            rb.push_move_objects(move_handle);
-        }
+        rb.push_ipc_interface(service);
     }
 
     fn open_remote_storage_controller_handler(
@@ -265,42 +253,18 @@ impl IOlscServiceForSystemService {
         };
         let service: std::sync::Arc<dyn SessionRequestHandler> =
             std::sync::Arc::new(IRemoteStorageController::new(svc.system));
-        let is_domain = ctx
-            .get_manager()
-            .map_or(false, |manager| manager.lock().unwrap().is_domain());
-        let move_handle = if is_domain {
-            0
-        } else {
-            ctx.create_session_for_service(service.clone()).unwrap_or(0)
-        };
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 1);
         rb.push_result(RESULT_SUCCESS);
-        if is_domain {
-            ctx.add_domain_object(service);
-        } else {
-            rb.push_move_objects(move_handle);
-        }
+        rb.push_ipc_interface(service);
     }
 
     fn open_daemon_controller_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         log::info!("IOlscServiceForSystemService::OpenDaemonController called");
         let service: std::sync::Arc<dyn SessionRequestHandler> =
             std::sync::Arc::new(IDaemonController::new());
-        let is_domain = ctx
-            .get_manager()
-            .map_or(false, |manager| manager.lock().unwrap().is_domain());
-        let move_handle = if is_domain {
-            0
-        } else {
-            ctx.create_session_for_service(service.clone()).unwrap_or(0)
-        };
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 1);
         rb.push_result(RESULT_SUCCESS);
-        if is_domain {
-            ctx.add_domain_object(service);
-        } else {
-            rb.push_move_objects(move_handle);
-        }
+        rb.push_ipc_interface(service);
     }
 
     fn get_data_transfer_policy_info_handler(
@@ -322,21 +286,9 @@ impl IOlscServiceForSystemService {
         // Upstream returns shared_from_this(); we create a new instance since state is minimal.
         let service: std::sync::Arc<dyn SessionRequestHandler> =
             std::sync::Arc::new(IOlscServiceForSystemService::new(svc.system));
-        let is_domain = ctx
-            .get_manager()
-            .map_or(false, |manager| manager.lock().unwrap().is_domain());
-        let move_handle = if is_domain {
-            0
-        } else {
-            ctx.create_session_for_service(service.clone()).unwrap_or(0)
-        };
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 1);
         rb.push_result(RESULT_SUCCESS);
-        if is_domain {
-            ctx.add_domain_object(service);
-        } else {
-            rb.push_move_objects(move_handle);
-        }
+        rb.push_ipc_interface(service);
     }
 }
 

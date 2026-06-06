@@ -2815,6 +2815,7 @@ mod tests {
                 depth_bias: 0.0,
                 slope_scale_depth_bias: 0.0,
                 depth_bias_clamp: 0.0,
+                ..RasterizerInfo::default()
             },
             program_base_address: 0,
             cb_bindings: [[ConstBufferBinding::default(); 18]; 5],
@@ -3631,6 +3632,7 @@ mod tests {
             depth_bias: 0.0,
             slope_scale_depth_bias: 0.0,
             depth_bias_clamp: 0.0,
+            ..RasterizerInfo::default()
         };
         assert!(!should_cull(area, &rast_ccw_back));
 
@@ -3646,6 +3648,7 @@ mod tests {
             depth_bias: 0.0,
             slope_scale_depth_bias: 0.0,
             depth_bias_clamp: 0.0,
+            ..RasterizerInfo::default()
         };
         assert!(should_cull(area, &rast_cw_back));
 
@@ -3661,6 +3664,7 @@ mod tests {
             depth_bias: 0.0,
             slope_scale_depth_bias: 0.0,
             depth_bias_clamp: 0.0,
+            ..RasterizerInfo::default()
         };
         assert!(should_cull(area, &rast_ccw_front));
 
@@ -3676,6 +3680,7 @@ mod tests {
             depth_bias: 0.0,
             slope_scale_depth_bias: 0.0,
             depth_bias_clamp: 0.0,
+            ..RasterizerInfo::default()
         };
         assert!(!should_cull(area, &rast_off));
 
@@ -3691,6 +3696,7 @@ mod tests {
             depth_bias: 0.0,
             slope_scale_depth_bias: 0.0,
             depth_bias_clamp: 0.0,
+            ..RasterizerInfo::default()
         };
         assert!(should_cull(area, &rast_both));
     }

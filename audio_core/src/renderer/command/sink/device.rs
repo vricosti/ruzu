@@ -208,52 +208,7 @@ fn trace_device_sink_samples(
 
 impl DeviceSinkPayload {
     pub fn process(self, stream: &SinkStreamHandle, buffer_count: i16) {
-        let input_count = self.input_count as usize;
-        let frames = TARGET_SAMPLE_COUNT as usize;
-        trace_device_sink_input_clip(&self, input_count, buffer_count, frames);
-        trace_device_sink_samples(&self, input_count, buffer_count, frames);
-        let src = unsafe {
-            std::slice::from_raw_parts(self.sample_buffer as *const i32, self.sample_count as usize)
-        };
-        let mut samples = Vec::with_capacity(frames.saturating_mul(input_count));
-        for frame in 0..frames {
-            for channel in 0..input_count {
-                let input = self.inputs[channel];
-                let buffer_index = input as usize;
-                let sample = src[buffer_index * frames + frame];
-                samples.push(sample.clamp(i16::MIN as i32, i16::MAX as i32) as i16);
-            }
-        }
-        let profile = std::env::var_os("RUZU_PROFILE_DEVICE_SINK").is_some();
-        let t_lock = std::time::Instant::now();
-        let mut stream = stream.lock();
-        let lock_us = t_lock.elapsed().as_micros();
-        let t_work = std::time::Instant::now();
-        stream.set_system_channels(input_count as u32);
-        stream.append_buffer(
-            SinkBuffer {
-                frames: frames as u64,
-                frames_played: 0,
-                tag: 0,
-                consumed: false,
-            },
-            &samples,
-        );
-        if stream.is_paused() {
-            stream.start(false);
-        }
-        if profile {
-            let work_us = t_work.elapsed().as_micros();
-            if lock_us > 1000 || work_us > 1000 {
-                log::info!(
-                    "PROFILE_DEVICE_SINK lock_us={} work_us={} frames={} input_count={}",
-                    lock_us,
-                    work_us,
-                    frames,
-                    input_count
-                );
-            }
-        }
+        process_device_command(&self, stream, buffer_count);
     }
 
     pub fn verify(self) -> bool {
@@ -309,11 +264,12 @@ pub fn process_device_command(
     let lock_us = t_lock.elapsed().as_micros();
     let t_work = std::time::Instant::now();
     stream.set_system_channels(input_count as u32);
+    let sample_tag = samples.as_ptr() as u64;
     stream.append_buffer(
         SinkBuffer {
             frames: frames as u64,
             frames_played: 0,
-            tag: 0,
+            tag: sample_tag,
             consumed: false,
         },
         &samples,
@@ -403,5 +359,6 @@ mod tests {
             stream.queue.front().unwrap().frames,
             TARGET_SAMPLE_COUNT as u64
         );
+        assert_ne!(stream.queue.front().unwrap().tag, 0);
     }
 }

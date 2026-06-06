@@ -204,6 +204,9 @@ pub struct ServerManager {
     /// Whether the server has been stopped.
     stopped: AtomicBool,
 
+    /// Whether `LoopProcess` has entered the event loop at least once.
+    loop_started: AtomicBool,
+
     /// Additional host threads requested by upstream call sites such as
     /// `Sockets::LoopProcess`.
     ///
@@ -328,6 +331,7 @@ impl ServerManager {
             deferral_holder: None,
             stop_requested: AtomicBool::new(false),
             stopped: AtomicBool::new(false),
+            loop_started: AtomicBool::new(false),
             pending_registrations: Arc::new(Mutex::new(Vec::new())),
             pending_owned_service_names: Vec::new(),
             pending_additional_host_threads: Vec::new(),
@@ -336,6 +340,15 @@ impl ServerManager {
             self_reference: None,
             loop_stats: LoopStats::default(),
         }
+    }
+
+    /// Return the system owner for service-dispatch helpers.
+    ///
+    /// Upstream `ServiceFrameworkBase` stores `Core::System&` directly; ruzu
+    /// reaches the same owner through the `ServerManager` attached to the
+    /// request context.
+    pub fn system(&self) -> SystemRef {
+        self.system
     }
 
     /// Returns a clone of the pending-registration queue Arc. Used by code
@@ -821,6 +834,40 @@ impl ServerManager {
     /// Main loop for processing server events.
     /// Port of upstream `ServerManager::LoopProcess`.
     pub fn loop_process(&mut self) -> ResultCode {
+        self.prepare_loop_process();
+
+        while !self.stop_requested.load(Ordering::Relaxed) {
+            self.wait_and_process_impl();
+        }
+        self.finish_loop_process();
+        RESULT_SUCCESS
+    }
+
+    /// Runs `LoopProcess` from the shared owner without holding the
+    /// `ServerManager` mutex for the lifetime of the event loop.
+    pub fn loop_process_shared(manager: &Arc<Mutex<ServerManager>>) -> ResultCode {
+        manager.lock().unwrap().prepare_loop_process();
+        let result = Self::loop_process_impl_shared(manager);
+        manager.lock().unwrap().finish_loop_process();
+        result
+    }
+
+    /// Port of upstream `ServerManager::LoopProcessImpl` for the shared Rust owner.
+    ///
+    /// Additional host threads call this directly, matching upstream
+    /// `StartAdditionalHostThreads(... [&] { this->LoopProcessImpl(); })`.
+    /// Only the main `LoopProcess` caller runs the prepare/finish wrapper.
+    fn loop_process_impl_shared(manager: &Arc<Mutex<ServerManager>>) -> ResultCode {
+        loop {
+            let mut guard = manager.lock().unwrap();
+            if guard.stop_requested.load(Ordering::Relaxed) {
+                return RESULT_SUCCESS;
+            }
+            guard.wait_and_process_impl();
+        }
+    }
+
+    fn prepare_loop_process(&mut self) {
         if self.spin_trace_enabled() && !self.system.is_null() {
             if let Some(kernel) = self.system.get().kernel() {
                 log::warn!(
@@ -846,17 +893,25 @@ impl ServerManager {
         }
 
         log::info!("ServerManager({}): entering event loop", self.name);
-        while !self.stop_requested.load(Ordering::Relaxed) {
-            self.wait_and_process_impl();
-        }
+        self.loop_started.store(true, Ordering::Release);
+    }
+
+    fn finish_loop_process(&mut self) {
         self.stopped.store(true, Ordering::Release);
         log::info!("ServerManager({}): event loop exited", self.name);
-        RESULT_SUCCESS
     }
 
     /// Wait for a signaled event and process it.
     /// Port of upstream `ServerManager::WaitAndProcessImpl`.
     fn wait_and_process_impl(&mut self) -> bool {
+        let Some(signaled_holder) = self.wait_signaled() else {
+            return false;
+        };
+        self.process(signaled_holder)
+    }
+
+    /// Port of upstream `ServerManager::WaitSignaled`.
+    fn wait_signaled(&mut self) -> Option<*mut MultiWaitHolder> {
         if std::env::var_os("RUZU_TRACE_SERVER_MANAGER_LOOP").is_some() {
             let pending = self.pending_registrations.lock().unwrap().len();
             eprintln!(
@@ -874,7 +929,7 @@ impl ServerManager {
         self.drain_pending_registrations();
         self.link_deferred();
         if self.stop_requested.load(Ordering::Relaxed) {
-            return false;
+            return None;
         }
 
         // Fast path for already-signaled holders before entering the kernel
@@ -889,7 +944,7 @@ impl ServerManager {
             unsafe {
                 (*selected).unlink_from_multi_wait();
             }
-            return self.process_holder(selected);
+            return Some(selected);
         }
 
         // Decide which wait path to use.
@@ -924,7 +979,7 @@ impl ServerManager {
                     unsafe {
                         (*selected).unlink_from_multi_wait();
                     }
-                    return self.process_holder(selected);
+                    return Some(selected);
                 }
             }
             // `wait_any` returned None — either no holders are signaled, or the
@@ -942,7 +997,7 @@ impl ServerManager {
             self.wakeup_event.wait_timeout(Duration::from_millis(100));
             self.loop_stats.idle_timeouts += 1;
             self.log_loop_stats_if_needed("guest_core_idle_timeout");
-            return false;
+            return None;
         }
 
         // Host service thread path.
@@ -951,21 +1006,22 @@ impl ServerManager {
             unsafe {
                 (*selected).unlink_from_multi_wait();
             }
-            return self.process_holder(selected);
+            return Some(selected);
         }
 
         // Nothing signaled — block on the wakeup event. Do not pre-clear:
         // `Event` signaling is sticky, and clearing here would create a
         // lost-wakeup race with a signaler that fires between the last poll
-        // above and this wait. The sticky bit is cleared by `process_holder`
+        // above and this wait. The sticky bit is cleared by `process`
         // when it actually consumes the wakeup holder on the next iteration.
         self.wakeup_event.wait_timeout(Duration::from_millis(100));
         self.loop_stats.idle_timeouts += 1;
         self.log_loop_stats_if_needed("idle_timeout");
-        false
+        None
     }
 
-    fn process_holder(&mut self, selected: *mut MultiWaitHolder) -> bool {
+    /// Port of upstream `ServerManager::Process(MultiWaitHolder*)`.
+    fn process(&mut self, selected: *mut MultiWaitHolder) -> bool {
         let selected = selected as *const MultiWaitHolder;
 
         if self
@@ -1387,19 +1443,14 @@ impl ServerManager {
 
     /// Activate pending additional host threads once the manager has a shared owner.
     ///
-    /// This is a bounded Rust adaptation of upstream `StartAdditionalHostThreads`:
-    /// the extra host threads exist with real dummy `KThread` owners, but they do
-    /// not yet run the full concurrent `LoopProcessImpl()` model on the same
-    /// `ServerManager` instance.
+    /// Port of upstream `StartAdditionalHostThreads`: each requested thread
+    /// runs the same manager's `LoopProcessImpl` after the main loop has
+    /// prepared holder linkage.
     pub fn activate_additional_host_threads(manager: &Arc<Mutex<ServerManager>>) {
-        let (system, stop_flag, pending) = {
+        let (system, pending) = {
             let mut guard = manager.lock().unwrap();
             let pending = std::mem::take(&mut guard.pending_additional_host_threads);
-            (
-                guard.system,
-                Arc::clone(&guard.additional_host_thread_stop),
-                pending,
-            )
+            (guard.system, pending)
         };
 
         if system.is_null() {
@@ -1413,13 +1464,23 @@ impl ServerManager {
         for (name, num_threads) in pending {
             for i in 0..num_threads {
                 let thread_name = format!("{}:{}", name, i + 1);
-                let stop = Arc::clone(&stop_flag);
+                let manager_for_thread = Arc::clone(manager);
                 let handle = kernel.run_on_host_core_thread(
                     &thread_name,
                     Box::new(move || {
-                        while !stop.load(Ordering::Acquire) {
-                            std::thread::park_timeout(Duration::from_millis(50));
+                        loop {
+                            {
+                                let guard = manager_for_thread.lock().unwrap();
+                                if guard.stop_requested.load(Ordering::Acquire) {
+                                    return;
+                                }
+                                if guard.loop_started() {
+                                    break;
+                                }
+                            }
+                            std::thread::park_timeout(Duration::from_millis(1));
                         }
+                        let _ = ServerManager::loop_process_impl_shared(&manager_for_thread);
                     }),
                 );
                 manager.lock().unwrap().host_threads.push(handle);
@@ -1436,6 +1497,26 @@ impl ServerManager {
             handle.thread().unpark();
         }
         self.signal_wakeup_event();
+    }
+
+    pub fn loop_started(&self) -> bool {
+        self.loop_started.load(Ordering::Acquire)
+    }
+
+    pub fn is_stopped(&self) -> bool {
+        self.stopped.load(Ordering::Acquire)
+    }
+
+    pub fn join_host_threads(&mut self) {
+        for handle in self.host_threads.drain(..) {
+            if let Err(err) = handle.join() {
+                log::warn!(
+                    "ServerManager({}): additional host thread join failed: {:?}",
+                    self.name,
+                    err
+                );
+            }
+        }
     }
 
     #[cfg(test)]

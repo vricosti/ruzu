@@ -171,6 +171,115 @@ pub fn break_execution(system: &System, reason: u32, info1: u64, info2: u64) {
     // Debugger not yet ported — when available, wire up debugger notification here.
 }
 
+/// Upstream `Break64From32` forwards to `Break`, but the Rust AArch32 dispatch
+/// can also pass the captured guest argument registers for optional diagnostics.
+pub fn break64_from_32(system: &System, reason: u32, arg: u32, size: u32, args: &[u64]) {
+    dump_a32_break_context(system, arg as u64, size as u64, args);
+    break_execution(system, reason, arg as u64, size as u64);
+}
+
+/// Upstream `Break64` wrapper.
+pub fn break64(system: &System, reason: u32, arg: u64, size: u64) {
+    log::error!(
+        "!!! svcBreak(reason={:#x}, info1={:#x}, info2={:#x}) - GAME ABORTED !!!",
+        reason,
+        arg,
+        size
+    );
+    break_execution(system, reason, arg, size);
+}
+
+fn dump_a32_break_context(system: &System, info1: u64, info2: u64, args: &[u64]) {
+    log::error!("=== GUEST REGISTER DUMP AT BREAK ===");
+    for (index, value) in args.iter().enumerate() {
+        log::error!("  r{:2} = {:#010x}", index, value);
+    }
+
+    if let Some(kernel) = system.kernel() {
+        let core_index = kernel.current_physical_core_index() as usize;
+        if let Some(process_arc) = system.current_process_arc.as_ref().cloned() {
+            let process = process_arc.lock().unwrap();
+            if let Some(jit) = process.get_arm_interface(core_index) {
+                let mut ctx = crate::arm::arm_interface::ThreadContext::default();
+                jit.get_context(&mut ctx);
+                log::error!(
+                    "  break_pc=0x{:08X} break_lr=0x{:08X} break_sp=0x{:08X} core={}",
+                    ctx.r[15] as u32,
+                    ctx.r[14] as u32,
+                    ctx.r[13] as u32,
+                    core_index
+                );
+                if std::env::var_os("RUZU_DUMP_BREAK_STACK").is_some() {
+                    let backtrace = crate::arm::debug::get_backtrace_from_context(&process, &ctx);
+                    for (index, entry) in backtrace.iter().enumerate().take(32) {
+                        log::error!(
+                            "  break_bt[{}] addr=0x{:08X} orig=0x{:08X} module={} name={} offset=0x{:X}",
+                            index,
+                            entry.address as u32,
+                            entry.original_address as u32,
+                            entry.module,
+                            entry.name,
+                            entry.offset,
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    if info1 != 0 && info2 > 0 && info2 < 0x200 {
+        let len = info2 as usize;
+        let mut buf = vec![0u8; len];
+        if let Some(memory) = system.get_svc_memory() {
+            let m = memory.lock().unwrap();
+            m.read_block(info1, &mut buf);
+        } else {
+            let process = system.current_process_arc().lock().unwrap();
+            let mem = process.process_memory.read().unwrap();
+            if mem.is_valid_range(info1, len) {
+                for (index, byte) in buf.iter_mut().enumerate() {
+                    *byte = mem.read_8(info1 + index as u64);
+                }
+            }
+        }
+        if let Ok(msg) = String::from_utf8(buf) {
+            log::error!("  Break message: {}", msg.trim_end_matches('\0'));
+        }
+    }
+
+    if std::env::var_os("RUZU_DUMP_BREAK_STACK").is_some() {
+        dump_known_break_strings(system);
+    }
+
+    log::error!(
+        "!!! svcBreak(reason={:#x}, info1={:#x}, info2={:#x}) - GAME ABORTED !!!",
+        args.first().copied().unwrap_or_default() as u32,
+        info1,
+        info2
+    );
+}
+
+fn dump_known_break_strings(system: &System) {
+    let Some(memory) = system.get_svc_memory() else {
+        return;
+    };
+    let m = memory.lock().unwrap();
+    for addr in [0x20bc7fau64, 0x20bc827, 0x2244ec7] {
+        let mut buf = vec![0u8; 128];
+        for index in 0..128u64 {
+            buf[index as usize] = m.read_8(addr + index);
+        }
+        if let Some(end) = buf.iter().position(|&byte| byte == 0) {
+            buf.truncate(end);
+        }
+        if let Ok(value) = String::from_utf8(buf) {
+            if !value.is_empty() && value.len() < 120 {
+                log::error!("  [{addr:#x}] = \"{value}\"");
+            }
+        }
+    }
+}
+
 /// Return from exception.
 /// Upstream: UNIMPLEMENTED() — intentionally unimplemented.
 pub fn return_from_exception(_result: ResultCode) {

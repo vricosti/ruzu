@@ -316,7 +316,7 @@ mod tests {
     #[test]
     fn append_buffers_reads_output_samples_from_guest_memory() {
         let system = make_system();
-        let sink = new_sink_handle(Box::new(NullSink::new("null")));
+        let sink = new_sink_handle(Box::new(NullSink::new_recording_for_test("null")));
         let guest_memory = make_guest_memory();
         guest_memory
             .lock()
@@ -356,7 +356,7 @@ mod tests {
     #[test]
     fn release_buffer_writes_input_samples_back_to_guest_memory() {
         let system = make_system();
-        let sink = new_sink_handle(Box::new(NullSink::new("null")));
+        let sink = new_sink_handle(Box::new(NullSink::new_recording_for_test("null")));
         let guest_memory = make_guest_memory();
 
         let mut session = DeviceSession::new(system.clone());

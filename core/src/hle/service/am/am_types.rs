@@ -253,7 +253,7 @@ const _: () = assert!(std::mem::size_of::<CommonArguments>() == 0x20);
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default)]
 pub struct AppletIdentityInfo {
-    pub applet_id: AppletId,
+    pub applet_id: u32,
     pub _padding: [u8; 0x4],
     pub application_id: u64,
 }

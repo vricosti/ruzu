@@ -1555,43 +1555,6 @@ impl KScheduler {
         self.state.needs_scheduling.load(Ordering::Relaxed)
     }
 
-    pub fn wake_expired_sleeping_threads(&mut self, process: &Arc<ProcessLock>) -> bool {
-        let now = Instant::now();
-        let mut process = process.lock().unwrap();
-        let mut woke_any = false;
-        let mut woke_ids = Vec::new();
-
-        for thread_id in &process.thread_list {
-            let Some(thread) = process.get_thread_by_thread_id(*thread_id) else {
-                continue;
-            };
-
-            let mut thread = thread.lock().unwrap();
-            let Some(deadline) = thread.get_sleep_deadline() else {
-                continue;
-            };
-            if deadline > now {
-                continue;
-            }
-
-            let tid = thread.get_thread_id();
-            thread.on_timer();
-            woke_ids.push(tid);
-            woke_any = true;
-        }
-
-        // Push woken threads to PQ (they're now RUNNABLE).
-        for tid in woke_ids {
-            process.push_back_to_priority_queue(tid);
-        }
-
-        if woke_any {
-            self.request_schedule();
-        }
-
-        woke_any
-    }
-
     pub fn wake_signaled_synchronization_threads(&mut self, process: &Arc<ProcessLock>) -> bool {
         let mut process = process.lock().unwrap();
         let mut woke_any = false;
@@ -1644,29 +1607,6 @@ impl KScheduler {
         woke_any
     }
 
-    fn next_sleep_deadline(&self, process: &Arc<ProcessLock>) -> Option<Instant> {
-        let process = process.lock().unwrap();
-        let mut next_deadline = None;
-
-        for thread_id in &process.thread_list {
-            let Some(thread) = process.get_thread_by_thread_id(*thread_id) else {
-                continue;
-            };
-
-            let thread = thread.lock().unwrap();
-            let Some(deadline) = thread.get_sleep_deadline() else {
-                continue;
-            };
-
-            next_deadline = Some(match next_deadline {
-                Some(current) if current <= deadline => current,
-                _ => deadline,
-            });
-        }
-
-        next_deadline
-    }
-
     pub fn wait_for_next_runnable_thread(
         &mut self,
         process: &Arc<ProcessLock>,
@@ -1691,14 +1631,6 @@ impl KScheduler {
             // becomes unreachable.
             if let Some(next) = self.scan_runnable_threads(process) {
                 return next;
-            }
-
-            if let Some(deadline) = self.next_sleep_deadline(process) {
-                let now = Instant::now();
-                if deadline > now {
-                    thread::sleep(deadline.duration_since(now));
-                }
-                continue;
             }
 
             thread::sleep(Duration::from_millis(1));

@@ -57,6 +57,25 @@ impl VoiceStateAddresses {
     }
 }
 
+#[derive(Default)]
+struct VoiceTraceCounters {
+    processed_voices: u64,
+    processed_channels: u64,
+    data_pushed: u64,
+    data_skip_was_playing: u64,
+    no_state: u64,
+    no_command: u64,
+    connected_channels: u64,
+    valid_wavebuffers: u64,
+    nonzero_wavebuffer_addr: u64,
+}
+
+enum DataSourceCommandResult {
+    Pushed,
+    WasPlaying,
+    MissingCommand,
+}
+
 pub struct CommandGenerator<'a> {
     command_buffer: &'a mut CommandBuffer,
     command_list_header: &'a mut CommandListHeader,
@@ -168,31 +187,11 @@ impl<'a> CommandGenerator<'a> {
         let _ = self
             .command_buffer
             .generate_clear_mix_command(u32::MAX, mix_buffer_count);
-        let cmd_after_clear = self.command_buffer.count();
         self.generate_voice_commands();
-        let cmd_after_voice = self.command_buffer.count();
         self.generate_submix_commands();
         self.generate_final_mix_commands();
         self.generate_sink_commands();
         self.command_list_header.command_count = self.command_buffer.count();
-        if std::env::var_os("RUZU_TRACE_CMDGEN").is_some() {
-            use std::sync::atomic::{AtomicU64, Ordering};
-            static COUNT: AtomicU64 = AtomicU64::new(0);
-            let c = COUNT.fetch_add(1, Ordering::Relaxed) + 1;
-            if c <= 10 || c % 100 == 0 {
-                let voice_count = self.voice_context.get_count();
-                let active_count = self.voice_context.get_active_count();
-                log::info!(
-                    "command_generator::generate #{} total_cmds={} after_clear={} after_voice={} voice_total={} voice_active={}",
-                    c,
-                    self.command_list_header.command_count,
-                    cmd_after_clear,
-                    cmd_after_voice,
-                    voice_count,
-                    active_count,
-                );
-            }
-        }
     }
 
     pub fn generate_voice_commands(&mut self) {
@@ -213,40 +212,7 @@ impl<'a> CommandGenerator<'a> {
                 }
             }
         }
-        if std::env::var_os("RUZU_TRACE_CMDGEN").is_some() {
-            use std::sync::atomic::{AtomicU64, Ordering};
-            static COUNT: AtomicU64 = AtomicU64::new(0);
-            let c = COUNT.fetch_add(1, Ordering::Relaxed) + 1;
-            if c <= 5 || c % 200 == 0 {
-                let mut in_use = 0u32;
-                let mut skipped = 0u32;
-                for vidx in &sorted_indices {
-                    if let Some(v) = self.voice_context.infos_mut().get(*vidx) {
-                        if v.in_use {
-                            in_use += 1;
-                            if v.should_skip() {
-                                skipped += 1;
-                            }
-                        }
-                    }
-                }
-                let active = self.voice_context.get_active_count();
-                log::info!(
-                    "generate_voice_commands #{} sorted={} in_use={} skipped={} active_after_update={}",
-                    c, sorted_indices.len(), in_use, skipped, active
-                );
-            }
-        }
-
-        let mut trace_processed_voices = 0u64;
-        let mut trace_processed_channels = 0u64;
-        let mut trace_data_pushed = 0u64;
-        let mut trace_data_skip_was_playing = 0u64;
-        let mut trace_no_state = 0u64;
-        let mut trace_no_command = 0u64;
-        let mut trace_connected_channels = 0u64;
-        let mut trace_valid_wavebuffers = 0u64;
-        let mut trace_nonzero_wavebuffer_addr = 0u64;
+        let mut trace_counters = VoiceTraceCounters::default();
 
         for voice_index in sorted_indices {
             if self
@@ -266,277 +232,13 @@ impl<'a> CommandGenerator<'a> {
             if !voice.in_use {
                 continue;
             }
-            trace_processed_voices += u64::from(trace_voice_ring);
 
-            let node_id = voice.node_id;
-            let entry_aspect =
-                self.begin_performance_entry(node_id as i32, PerformanceEntryType::Voice);
-            let data_detail_type = match voice.sample_format {
-                SampleFormat::PcmInt16 => PerformanceDetailType::Unk1,
-                SampleFormat::PcmFloat => PerformanceDetailType::Unk10,
-                SampleFormat::Adpcm => PerformanceDetailType::Unk2,
-                SampleFormat::Invalid
-                | SampleFormat::PcmInt8
-                | SampleFormat::PcmInt24
-                | SampleFormat::PcmInt32 => PerformanceDetailType::Invalid,
-            };
-            for channel in 0..voice.channel_count.max(0) as usize {
-                trace_processed_channels += u64::from(trace_voice_ring);
-                if trace_voice_ring {
-                    if voice.has_any_connection() {
-                        trace_connected_channels += 1;
-                    }
-                    for wavebuffer in &voice.wavebuffers {
-                        if wavebuffer.sent_to_dsp {
-                            trace_valid_wavebuffers += 1;
-                        }
-                        if wavebuffer.buffer_address.get_cpu_addr() != 0 {
-                            trace_nonzero_wavebuffer_addr += 1;
-                        }
-                    }
-                }
-                let Some(resource_id) = voice.channel_resource_ids.get(channel).copied() else {
-                    continue;
-                };
-                let voice_state = self
-                    .voice_context
-                    .get_dsp_shared_state_ref(resource_id)
-                    .map(VoiceStateAddresses::from_state);
-                if voice_state.is_none() && std::env::var_os("RUZU_TRACE_CMDGEN").is_some() {
-                    log::warn!(
-                        "build_data_source: NO dsp_shared_state for resource_id={}",
-                        resource_id
-                    );
-                }
-                let data_detail = self.begin_performance_detail(
-                    node_id as i32,
-                    PerformanceEntryType::Voice,
-                    data_detail_type,
-                );
-                let Some(voice_state) = voice_state else {
-                    trace_no_state += u64::from(trace_voice_ring);
-                    if let Some(addresses) = data_detail {
-                        self.end_performance(node_id as i32, addresses);
-                    }
-                    continue;
-                };
-                let voice_state_addresses = voice_state;
-                let depop_commands =
-                    self.build_voice_depop_prepare_commands(&voice, &voice_state_addresses);
-                if std::env::var_os("RUZU_TRACE_CMDGEN").is_some() {
-                    use std::sync::atomic::{AtomicU64, Ordering};
-                    static SEEN: AtomicU64 = AtomicU64::new(0);
-                    let s = SEEN.fetch_add(1, Ordering::Relaxed) + 1;
-                    if s <= 5 {
-                        log::info!(
-                            "voice_data_path: voice_node_id={} channel={} was_playing={} has_connection={}",
-                            voice.node_id, channel, voice.was_playing, voice.has_any_connection()
-                        );
-                    }
-                }
-                for (command, enabled) in depop_commands {
-                    let _ = self.command_buffer.push_with_enabled(
-                        Command::DepopPrepare(command),
-                        node_id,
-                        enabled,
-                    );
-                }
-                if voice.was_playing {
-                    trace_data_skip_was_playing += u64::from(trace_voice_ring);
-                    if std::env::var_os("RUZU_TRACE_CMDGEN").is_some() {
-                        use std::sync::atomic::{AtomicU64, Ordering};
-                        static SKIP: AtomicU64 = AtomicU64::new(0);
-                        let n = SKIP.fetch_add(1, Ordering::Relaxed) + 1;
-                        if n <= 10 || n % 500 == 0 {
-                            log::info!(
-                                "data_source_SKIP #{} voice={} channel={} (was_playing=true)",
-                                n,
-                                voice.node_id,
-                                channel
-                            );
-                        }
-                    }
-                } else {
-                    // Upstream zuyu passes `render_context.mix_buffer_count`
-                    // (the count of MIX buffers, not the total buffer_count
-                    // which also includes voice_channels). Voice scratch
-                    // slots live at indices [mix_buffer_count..buffer_count].
-                    // Passing the larger buffer_count produced output_index
-                    // values past the end of mix_buffers, causing
-                    // mix_buffer_range to bail and decode_from_wave_buffers
-                    // to never run. See voice_info.cpp::GenerateAdpcmVersion1Command call.
-                    let Some(data_command) = self.build_data_source_command(
-                        &voice,
-                        voice_state_addresses.voice_state,
-                        channel as i8,
-                        self.mix_buffer_count,
-                    ) else {
-                        trace_no_command += u64::from(trace_voice_ring);
-                        if std::env::var_os("RUZU_TRACE_CMDGEN").is_some() {
-                            log::warn!(
-                                "build_data_source: NO data_command for voice node_id={} channel={} sample_format={:?}",
-                                voice.node_id, channel, voice.sample_format
-                            );
-                        }
-                        if let Some(addresses) = data_detail {
-                            self.end_performance(node_id as i32, addresses);
-                        }
-                        continue;
-                    };
-                    let _ = self.command_buffer.push(data_command, node_id);
-                    trace_data_pushed += u64::from(trace_voice_ring);
-                    if std::env::var_os("RUZU_TRACE_CMDGEN").is_some() {
-                        use std::sync::atomic::{AtomicU64, Ordering};
-                        static PUSHED: AtomicU64 = AtomicU64::new(0);
-                        let n = PUSHED.fetch_add(1, Ordering::Relaxed) + 1;
-                        if n <= 10 || n % 100 == 0 {
-                            log::info!(
-                                "data_source_push #{} voice={} channel={} fmt={:?}",
-                                n,
-                                voice.node_id,
-                                channel,
-                                voice.sample_format
-                            );
-                        }
-                    }
-                }
-                if let Some(addresses) = data_detail {
-                    self.end_performance(node_id as i32, addresses);
-                }
-
-                if voice.was_playing {
-                    voice.prev_volume = 0.0;
-                    if let Some(stored_voice) = self.voice_context.get_info_mut(voice_index as u32)
-                    {
-                        stored_voice.prev_volume = 0.0;
-                    }
-                    continue;
-                }
-
-                if voice.has_any_connection() {
-                    let biquad_detail = self.begin_performance_detail(
-                        node_id as i32,
-                        PerformanceEntryType::Voice,
-                        PerformanceDetailType::Unk4,
-                    );
-                    self.push_voice_biquad_commands(
-                        &voice,
-                        &voice_state_addresses,
-                        channel as i8,
-                        node_id,
-                    );
-                    if let Some(addresses) = biquad_detail {
-                        self.end_performance(node_id as i32, addresses);
-                    }
-
-                    let volume_detail = self.begin_performance_detail(
-                        node_id as i32,
-                        PerformanceEntryType::Voice,
-                        PerformanceDetailType::Unk3,
-                    );
-                    let precision = Self::mix_precision(self.behavior);
-                    let input_output = self.mix_buffer_count + channel as i16;
-                    let _ = self.command_buffer.push(
-                        Command::VolumeRamp(VolumeRampCommand {
-                            precision,
-                            input_index: input_output,
-                            output_index: input_output,
-                            volume: voice.volume,
-                            prev_volume: voice.prev_volume,
-                        }),
-                        node_id,
-                    );
-                    if let Some(addresses) = volume_detail {
-                        self.end_performance(node_id as i32, addresses);
-                    }
-                    voice.prev_volume = voice.volume;
-                    if let Some(stored_voice) = self.voice_context.get_info_mut(voice_index as u32)
-                    {
-                        stored_voice.prev_volume = voice.volume;
-                    }
-
-                    if voice.mix_id == UNUSED_MIX_ID {
-                        if voice.splitter_id != UNUSED_SPLITTER_ID {
-                            let mut destination_id = channel as i32;
-                            while let Some(destination) = self
-                                .splitter_context
-                                .get_destination_data(voice.splitter_id, destination_id)
-                                .cloned()
-                            {
-                                if destination.is_configured() {
-                                    let mix_id = destination.get_mix_id();
-                                    if let Some(mix_info) =
-                                        self.mix_context.get_info(mix_id).cloned()
-                                    {
-                                        self.push_voice_mix_commands(
-                                            destination.get_mix_volume_slice(),
-                                            destination.get_mix_volume_prev_slice(),
-                                            &voice_state_addresses,
-                                            mix_info.buffer_offset,
-                                            mix_info.buffer_count,
-                                            input_output,
-                                            node_id,
-                                        );
-                                        if let Some(destination_mut) =
-                                            self.splitter_context.get_destination_data_mut(
-                                                voice.splitter_id,
-                                                destination_id,
-                                            )
-                                        {
-                                            destination_mut.mark_as_need_to_update_internal_state();
-                                        }
-                                    }
-                                }
-                                destination_id += voice.channel_count as i32;
-                            }
-                        }
-                    } else if let Some(mix_info) = self.mix_context.get_info(voice.mix_id).cloned()
-                    {
-                        let volume_mix_detail = self.begin_performance_detail(
-                            node_id as i32,
-                            PerformanceEntryType::Voice,
-                            PerformanceDetailType::Unk3,
-                        );
-                        let Some(channel_resource) = self
-                            .voice_context
-                            .get_channel_resource_ref(resource_id)
-                            .cloned()
-                        else {
-                            if let Some(addresses) = volume_mix_detail {
-                                self.end_performance(node_id as i32, addresses);
-                            }
-                            continue;
-                        };
-                        self.push_voice_mix_commands(
-                            &channel_resource.mix_volumes,
-                            &channel_resource.prev_mix_volumes,
-                            &voice_state_addresses,
-                            mix_info.buffer_offset,
-                            mix_info.buffer_count,
-                            input_output,
-                            node_id,
-                        );
-                        if let Some(channel_resource_mut) =
-                            self.voice_context.get_channel_resource(resource_id)
-                        {
-                            channel_resource_mut.prev_mix_volumes =
-                                channel_resource_mut.mix_volumes;
-                        }
-                        if let Some(addresses) = volume_mix_detail {
-                            self.end_performance(node_id as i32, addresses);
-                        }
-                    }
-                    voice.biquad_initialized = voice.biquads.map(|biquad| biquad.enabled);
-                    if let Some(stored_voice) = self.voice_context.get_info_mut(voice_index as u32)
-                    {
-                        stored_voice.biquad_initialized = voice.biquad_initialized;
-                    }
-                }
-            }
-
-            if let Some(addresses) = entry_aspect {
-                self.end_performance(node_id as i32, addresses);
-            }
+            self.generate_voice_command(
+                voice_index,
+                &mut voice,
+                trace_voice_ring,
+                &mut trace_counters,
+            );
         }
         if trace_voice_ring {
             use std::sync::atomic::{AtomicU64, Ordering};
@@ -550,18 +252,258 @@ impl<'a> CommandGenerator<'a> {
                     trace_in_use,
                     trace_skipped,
                     self.voice_context.get_active_count() as u64,
-                    trace_processed_voices,
-                    trace_processed_channels,
-                    trace_data_pushed,
-                    trace_data_skip_was_playing,
-                    trace_no_state,
-                    trace_no_command,
-                    trace_connected_channels,
-                    trace_valid_wavebuffers,
-                    trace_nonzero_wavebuffer_addr,
+                    trace_counters.processed_voices,
+                    trace_counters.processed_channels,
+                    trace_counters.data_pushed,
+                    trace_counters.data_skip_was_playing,
+                    trace_counters.no_state,
+                    trace_counters.no_command,
+                    trace_counters.connected_channels,
+                    trace_counters.valid_wavebuffers,
+                    trace_counters.nonzero_wavebuffer_addr,
                 ],
             );
         }
+    }
+
+    fn generate_voice_command(
+        &mut self,
+        voice_index: usize,
+        voice: &mut crate::renderer::voice::VoiceInfo,
+        trace_voice_ring: bool,
+        trace_counters: &mut VoiceTraceCounters,
+    ) {
+        trace_counters.processed_voices += u64::from(trace_voice_ring);
+
+        let node_id = voice.node_id;
+        let entry_aspect =
+            self.begin_performance_entry(node_id as i32, PerformanceEntryType::Voice);
+        let data_detail_type = match voice.sample_format {
+            SampleFormat::PcmInt16 => PerformanceDetailType::Unk1,
+            SampleFormat::PcmFloat => PerformanceDetailType::Unk10,
+            SampleFormat::Adpcm => PerformanceDetailType::Unk2,
+            SampleFormat::Invalid
+            | SampleFormat::PcmInt8
+            | SampleFormat::PcmInt24
+            | SampleFormat::PcmInt32 => PerformanceDetailType::Invalid,
+        };
+
+        for channel in 0..voice.channel_count.max(0) as usize {
+            trace_counters.processed_channels += u64::from(trace_voice_ring);
+            if trace_voice_ring {
+                if voice.has_any_connection() {
+                    trace_counters.connected_channels += 1;
+                }
+                for wavebuffer in &voice.wavebuffers {
+                    if wavebuffer.sent_to_dsp {
+                        trace_counters.valid_wavebuffers += 1;
+                    }
+                    if wavebuffer.buffer_address.get_cpu_addr() != 0 {
+                        trace_counters.nonzero_wavebuffer_addr += 1;
+                    }
+                }
+            }
+
+            let Some(resource_id) = voice.channel_resource_ids.get(channel).copied() else {
+                continue;
+            };
+            let voice_state = self
+                .voice_context
+                .get_dsp_shared_state_ref(resource_id)
+                .map(VoiceStateAddresses::from_state);
+            let data_detail = self.begin_performance_detail(
+                node_id as i32,
+                PerformanceEntryType::Voice,
+                data_detail_type,
+            );
+            let Some(voice_state) = voice_state else {
+                trace_counters.no_state += u64::from(trace_voice_ring);
+                if let Some(addresses) = data_detail {
+                    self.end_performance(node_id as i32, addresses);
+                }
+                continue;
+            };
+            let voice_state_addresses = voice_state;
+            match self.generate_data_source_command(
+                voice,
+                &voice_state_addresses,
+                channel as i8,
+                node_id,
+            ) {
+                DataSourceCommandResult::Pushed => {
+                    trace_counters.data_pushed += u64::from(trace_voice_ring);
+                }
+                DataSourceCommandResult::WasPlaying => {
+                    trace_counters.data_skip_was_playing += u64::from(trace_voice_ring);
+                }
+                DataSourceCommandResult::MissingCommand => {
+                    trace_counters.no_command += u64::from(trace_voice_ring);
+                    if let Some(addresses) = data_detail {
+                        self.end_performance(node_id as i32, addresses);
+                    }
+                    continue;
+                }
+            }
+            if let Some(addresses) = data_detail {
+                self.end_performance(node_id as i32, addresses);
+            }
+
+            if voice.was_playing {
+                voice.prev_volume = 0.0;
+                if let Some(stored_voice) = self.voice_context.get_info_mut(voice_index as u32) {
+                    stored_voice.prev_volume = 0.0;
+                }
+                continue;
+            }
+
+            if !voice.has_any_connection() {
+                continue;
+            }
+
+            let biquad_detail = self.begin_performance_detail(
+                node_id as i32,
+                PerformanceEntryType::Voice,
+                PerformanceDetailType::Unk4,
+            );
+            self.push_voice_biquad_commands(voice, &voice_state_addresses, channel as i8, node_id);
+            if let Some(addresses) = biquad_detail {
+                self.end_performance(node_id as i32, addresses);
+            }
+
+            let volume_detail = self.begin_performance_detail(
+                node_id as i32,
+                PerformanceEntryType::Voice,
+                PerformanceDetailType::Unk3,
+            );
+            let precision = Self::mix_precision(self.behavior);
+            let input_output = self.mix_buffer_count + channel as i16;
+            let _ = self.command_buffer.push(
+                Command::VolumeRamp(VolumeRampCommand {
+                    precision,
+                    input_index: input_output,
+                    output_index: input_output,
+                    volume: voice.volume,
+                    prev_volume: voice.prev_volume,
+                }),
+                node_id,
+            );
+            if let Some(addresses) = volume_detail {
+                self.end_performance(node_id as i32, addresses);
+            }
+            voice.prev_volume = voice.volume;
+            if let Some(stored_voice) = self.voice_context.get_info_mut(voice_index as u32) {
+                stored_voice.prev_volume = voice.volume;
+            }
+
+            if voice.mix_id == UNUSED_MIX_ID {
+                if voice.splitter_id != UNUSED_SPLITTER_ID {
+                    let mut destination_id = channel as i32;
+                    while let Some(destination) = self
+                        .splitter_context
+                        .get_destination_data(voice.splitter_id, destination_id)
+                        .cloned()
+                    {
+                        if destination.is_configured() {
+                            let mix_id = destination.get_mix_id();
+                            if let Some(mix_info) = self.mix_context.get_info(mix_id).cloned() {
+                                self.push_voice_mix_commands(
+                                    destination.get_mix_volume_slice(),
+                                    destination.get_mix_volume_prev_slice(),
+                                    &voice_state_addresses,
+                                    mix_info.buffer_offset,
+                                    mix_info.buffer_count,
+                                    input_output,
+                                    node_id,
+                                );
+                                if let Some(destination_mut) = self
+                                    .splitter_context
+                                    .get_destination_data_mut(voice.splitter_id, destination_id)
+                                {
+                                    destination_mut.mark_as_need_to_update_internal_state();
+                                }
+                            }
+                        }
+                        destination_id += voice.channel_count as i32;
+                    }
+                }
+            } else if let Some(mix_info) = self.mix_context.get_info(voice.mix_id).cloned() {
+                let volume_mix_detail = self.begin_performance_detail(
+                    node_id as i32,
+                    PerformanceEntryType::Voice,
+                    PerformanceDetailType::Unk3,
+                );
+                let Some(channel_resource) = self
+                    .voice_context
+                    .get_channel_resource_ref(resource_id)
+                    .cloned()
+                else {
+                    if let Some(addresses) = volume_mix_detail {
+                        self.end_performance(node_id as i32, addresses);
+                    }
+                    continue;
+                };
+                self.push_voice_mix_commands(
+                    &channel_resource.mix_volumes,
+                    &channel_resource.prev_mix_volumes,
+                    &voice_state_addresses,
+                    mix_info.buffer_offset,
+                    mix_info.buffer_count,
+                    input_output,
+                    node_id,
+                );
+                if let Some(channel_resource_mut) =
+                    self.voice_context.get_channel_resource(resource_id)
+                {
+                    channel_resource_mut.prev_mix_volumes = channel_resource_mut.mix_volumes;
+                }
+                if let Some(addresses) = volume_mix_detail {
+                    self.end_performance(node_id as i32, addresses);
+                }
+            }
+            voice.biquad_initialized = voice.biquads.map(|biquad| biquad.enabled);
+            if let Some(stored_voice) = self.voice_context.get_info_mut(voice_index as u32) {
+                stored_voice.biquad_initialized = voice.biquad_initialized;
+            }
+        }
+
+        if let Some(addresses) = entry_aspect {
+            self.end_performance(node_id as i32, addresses);
+        }
+    }
+
+    fn generate_data_source_command(
+        &mut self,
+        voice: &crate::renderer::voice::VoiceInfo,
+        voice_state_addresses: &VoiceStateAddresses,
+        channel: i8,
+        node_id: u32,
+    ) -> DataSourceCommandResult {
+        let depop_commands = self.build_voice_depop_prepare_commands(voice, voice_state_addresses);
+        for (command, enabled) in depop_commands {
+            let _ = self.command_buffer.push_with_enabled(
+                Command::DepopPrepare(command),
+                node_id,
+                enabled,
+            );
+        }
+
+        if voice.was_playing {
+            return DataSourceCommandResult::WasPlaying;
+        }
+
+        // Upstream zuyu passes `render_context.mix_buffer_count` (the count
+        // of MIX buffers, not total buffer_count). Voice scratch slots live
+        // at indices [mix_buffer_count..buffer_count].
+        let Some(data_command) = self.build_data_source_command(
+            voice,
+            voice_state_addresses.voice_state,
+            channel,
+            self.mix_buffer_count,
+        ) else {
+            return DataSourceCommandResult::MissingCommand;
+        };
+        let _ = self.command_buffer.push(data_command, node_id);
+        DataSourceCommandResult::Pushed
     }
 
     fn build_data_source_command(

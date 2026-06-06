@@ -170,6 +170,59 @@ fn decrypt_shared_font(input: &[u32], output: &mut Vec<u8>, offset: &mut usize) 
     true
 }
 
+/// Port of upstream `DecryptSharedFontToTTF`.
+pub fn decrypt_shared_font_to_ttf(input: &[u32], output: &mut [u8]) -> bool {
+    if input.len() < 2 || input[0] != EXPECTED_MAGIC {
+        return false;
+    }
+    let byte_size = (input.len() - 2) * 4;
+    if output.len() < byte_size {
+        return false;
+    }
+
+    let key = input[0] ^ EXPECTED_RESULT;
+    for (index, word) in input[2..].iter().enumerate() {
+        let transformed = (*word ^ key).swap_bytes();
+        let dst = index * 4;
+        output[dst..dst + 4].copy_from_slice(&transformed.to_le_bytes());
+    }
+    true
+}
+
+/// Port of upstream `EncryptSharedFont`.
+pub fn encrypt_shared_font(input: &[u32], output: &mut [u8], offset: &mut usize) -> bool {
+    let total_words = input.len().saturating_add(2);
+    let total_bytes = total_words * 4;
+    let Some(end) = offset.checked_add(total_bytes) else {
+        return false;
+    };
+    if end > output.len() || end > SHARED_FONT_MEM_SIZE as usize {
+        return false;
+    }
+
+    let key = (EXPECTED_RESULT ^ EXPECTED_MAGIC).swap_bytes();
+    let header_magic = EXPECTED_MAGIC.swap_bytes();
+    let header_size = ((input.len() * 4) as u32).swap_bytes() ^ key;
+
+    let start = *offset;
+    output[start..start + 4].copy_from_slice(&header_magic.to_le_bytes());
+    output[start + 4..start + 8].copy_from_slice(&header_size.to_le_bytes());
+    for (index, word) in input.iter().enumerate() {
+        let encrypted = *word ^ key;
+        let dst = start + 8 + index * 4;
+        output[dst..dst + 4].copy_from_slice(&encrypted.to_le_bytes());
+    }
+    *offset += total_bytes;
+    true
+}
+
+/// Helper function matching upstream `GetU32Swapped`.
+#[allow(dead_code)]
+fn get_u32_swapped(data: &[u8]) -> Option<u32> {
+    let bytes: [u8; 4] = data.get(..4)?.try_into().ok()?;
+    Some(u32::from_le_bytes(bytes).swap_bytes())
+}
+
 /// Try to load a single shared font from the system NAND. Returns the
 /// big-endian-as-u32 file contents on success.
 fn try_load_font_from_nand(
@@ -277,20 +330,28 @@ fn build_shared_font_blob_with_system(system: &SystemRef) -> (Vec<u8>, Vec<FontR
                 offset = start;
             }
         }
-        // Path B: embedded fallback. Place raw font bytes into the blob and
-        // expose them at their natural offset/size (no header skip).
+        // Path B: embedded fallback. Re-encrypt into the same header-bearing
+        // BFTTF shared-memory layout upstream uses for system-archive fonts.
         let (_, font_bytes) = SHARED_FONTS[i];
-        let size = font_bytes.len();
-        if offset + size > blob.len() {
+        let font_words: Vec<u32> = font_bytes
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        let size = font_words.len() * 4;
+        if offset + size + 8 > blob.len() {
             log::error!("pl:u: blob overflow at font #{} fallback", i);
             break;
         }
-        blob[offset..offset + size].copy_from_slice(font_bytes);
+        let region_offset = offset + 8;
+        if !encrypt_shared_font(&font_words, &mut blob, &mut offset) {
+            log::error!("pl:u: encrypted fallback write failed at font #{}", i);
+            break;
+        }
         regions.push(FontRegion {
-            offset: offset as u32,
+            offset: region_offset as u32,
             size: size as u32,
         });
-        offset = align_up_8(offset + size);
+        offset = align_up_8(offset);
         fallback_count += 1;
     }
 
@@ -313,16 +374,23 @@ fn build_shared_font_blob() -> (Vec<u8>, Vec<FontRegion>) {
     let mut regions = Vec::with_capacity(SHARED_FONTS.len());
     let mut offset = 0usize;
     for (_, font_bytes) in SHARED_FONTS {
-        let size = font_bytes.len();
-        if offset + size > blob.len() {
+        let font_words: Vec<u32> = font_bytes
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        let size = font_words.len() * 4;
+        if offset + size + 8 > blob.len() {
             break;
         }
-        blob[offset..offset + size].copy_from_slice(font_bytes);
+        let region_offset = offset + 8;
+        if !encrypt_shared_font(&font_words, &mut blob, &mut offset) {
+            break;
+        }
         regions.push(FontRegion {
-            offset: offset as u32,
+            offset: region_offset as u32,
             size: size as u32,
         });
-        offset = align_up_8(offset + size);
+        offset = align_up_8(offset);
     }
     (blob, regions)
 }
@@ -648,5 +716,45 @@ mod tests {
         for pair in regions.windows(2) {
             assert!(pair[0].offset < pair[1].offset);
         }
+    }
+
+    #[test]
+    fn fallback_shared_font_blob_uses_encrypted_header_layout() {
+        let (blob, regions) = build_shared_font_blob();
+        let first = regions[0];
+        assert_eq!(first.offset, 8);
+        assert_eq!(get_u32_swapped(&blob[0..4]), Some(EXPECTED_MAGIC));
+        let key = EXPECTED_MAGIC ^ EXPECTED_RESULT;
+        assert_eq!(
+            get_u32_swapped(&blob[4..8]).map(|value| value ^ key),
+            Some(first.size)
+        );
+    }
+
+    #[test]
+    fn encrypt_shared_font_round_trips_to_ttf_bytes() {
+        let input_bytes = *b"0123456789ABCDEF";
+        let input_words: Vec<u32> = input_bytes
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        let mut encrypted = vec![0u8; 64];
+        let mut offset = 0usize;
+
+        assert!(encrypt_shared_font(
+            &input_words,
+            &mut encrypted,
+            &mut offset
+        ));
+        assert_eq!(offset, input_bytes.len() + 8);
+
+        let encrypted_words: Vec<u32> = encrypted[..offset]
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]).swap_bytes())
+            .collect();
+        let mut output = vec![0u8; input_bytes.len()];
+
+        assert!(decrypt_shared_font_to_ttf(&encrypted_words, &mut output));
+        assert_eq!(output, input_bytes);
     }
 }

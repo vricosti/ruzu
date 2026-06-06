@@ -101,7 +101,11 @@ impl AccU0 {
             ),
             (102, None, "AuthenticateApplicationAsync"),
             (103, None, "CheckNetworkServiceAvailabilityAsync"),
-            (110, None, "StoreSaveDataThumbnail"),
+            (
+                110,
+                Some(AccU0::store_save_data_thumbnail_handler),
+                "StoreSaveDataThumbnail",
+            ),
             (111, None, "ClearSaveDataThumbnail"),
             (120, None, "CreateGuestLoginRequest"),
             (130, None, "LoadOpenContext"),
@@ -271,6 +275,14 @@ impl AccU0 {
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 1);
         rb.push_result(rc);
         rb.push_ipc_interface(object);
+    }
+
+    fn store_save_data_thumbnail_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let svc = unsafe { &*(this as *const dyn ServiceFramework as *const AccU0) };
+        let mut rp = RequestParser::new(ctx);
+        let uuid = rp.pop_raw::<u128>();
+        svc.interface
+            .store_save_data_thumbnail_application(ctx, uuid);
     }
 
     fn list_qualified_users_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {

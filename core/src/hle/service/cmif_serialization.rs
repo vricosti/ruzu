@@ -281,7 +281,6 @@ impl<'a> CmifRequest<'a> {
 /// Minimal CMIF output wrapper for `Result + Out<T>` style responses.
 pub struct CmifResponse<'a> {
     builder: ResponseBuilder<'a>,
-    ctx: *mut HLERequestContext,
 }
 
 impl<'a> CmifResponse<'a> {
@@ -291,17 +290,13 @@ impl<'a> CmifResponse<'a> {
         num_handles_to_copy: u32,
         num_objects_to_move: u32,
     ) -> Self {
-        let ctx_ptr = ctx as *mut HLERequestContext;
         let builder = ResponseBuilder::new(
             ctx,
             normal_params_size,
             num_handles_to_copy,
             num_objects_to_move,
         );
-        Self {
-            builder,
-            ctx: ctx_ptr,
-        }
+        Self { builder }
     }
 
     pub fn result_only(ctx: &'a mut HLERequestContext, result: ResultCode) -> Self {
@@ -347,17 +342,7 @@ impl<'a> CmifResponse<'a> {
     }
 
     pub fn push_interface(&mut self, object: SessionRequestHandlerPtr) {
-        let ctx = unsafe { &mut *self.ctx };
-        let is_domain = match ctx.get_manager() {
-            Some(manager) => manager.lock().unwrap().is_domain(),
-            None => false,
-        };
-        if is_domain {
-            ctx.add_domain_object(object);
-        } else {
-            let move_handle = ctx.create_session_for_service(object).unwrap_or(0);
-            self.builder.push_move_objects(move_handle);
-        }
+        self.builder.push_ipc_interface(object);
     }
 }
 

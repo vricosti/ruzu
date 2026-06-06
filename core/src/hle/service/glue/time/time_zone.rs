@@ -8,8 +8,9 @@
 //! and adds timezone binary file loading support.
 
 use std::collections::BTreeMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
+use crate::hle::kernel::k_readable_event::KReadableEvent;
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
 use crate::hle::service::ipc_helpers::{RequestParser, ResponseBuilder};
@@ -65,6 +66,8 @@ pub struct TimeZoneService {
     time_zone_binary: Mutex<TimeZoneBinary>,
     /// Mutex for location changes. Upstream: `m_mutex`.
     mutex: Mutex<()>,
+    /// Upstream: `Service::PSC::Time::OperationEvent m_operation_event`.
+    operation_event: Mutex<Option<Arc<Mutex<KReadableEvent>>>>,
     handlers: BTreeMap<u32, FunctionInfo>,
     handlers_tipc: BTreeMap<u32, FunctionInfo>,
 }
@@ -161,6 +164,7 @@ impl TimeZoneService {
             )),
             time_zone_binary: Mutex::new(tz_binary),
             mutex: Mutex::new(()),
+            operation_event: Mutex::new(None),
             handlers: Self::build_handlers(),
             handlers_tipc: BTreeMap::new(),
         }
@@ -179,6 +183,7 @@ impl TimeZoneService {
             wrapped_service: Mutex::new(wrapped_service),
             time_zone_binary: Mutex::new(time_zone_binary),
             mutex: Mutex::new(()),
+            operation_event: Mutex::new(None),
             handlers: Self::build_handlers(),
             handlers_tipc: BTreeMap::new(),
         }
@@ -232,9 +237,11 @@ impl TimeZoneService {
             return rc;
         }
 
-        // Upstream also calls m_file_timestamp_worker.SetFilesystemPosixTime(),
-        // saves to set:sys, and signals operation events. Settings service
-        // integration is not yet wired.
+        // Upstream also updates filesystem timestamps and persists the new
+        // location through set:sys. Those owners are not wired here yet.
+        if let Some(readable_event) = self.operation_event.lock().unwrap().as_ref() {
+            let _ = readable_event.lock().unwrap().signal();
+        }
 
         RESULT_SUCCESS
     }
@@ -406,11 +413,25 @@ impl TimeZoneService {
         Ok((count, out_times))
     }
 
-    pub fn get_device_location_name_operation_event_readable_handle(&self) -> ResultCode {
+    pub fn get_device_location_name_operation_event_readable_handle(
+        &self,
+        ctx: &HLERequestContext,
+    ) -> Result<u32, ResultCode> {
         log::debug!(
-            "Glue::Time::TimeZoneService::GetDeviceLocationNameOperationEventReadableHandle called. Not implemented!"
+            "Glue::Time::TimeZoneService::GetDeviceLocationNameOperationEventReadableHandle called"
         );
-        crate::hle::service::psc::time::errors::RESULT_NOT_IMPLEMENTED
+        let mut operation_event = self.operation_event.lock().unwrap();
+        if let Some(readable_event) = operation_event.as_ref() {
+            return ctx
+                .copy_handle_for_readable_event(Arc::clone(readable_event))
+                .ok_or(crate::hle::service::psc::time::errors::RESULT_FAILED);
+        }
+
+        let Some((handle, readable_event)) = ctx.create_readable_event(false) else {
+            return Err(crate::hle::service::psc::time::errors::RESULT_FAILED);
+        };
+        *operation_event = Some(readable_event);
+        Ok(handle)
     }
 
     fn get_device_location_name_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
@@ -638,8 +659,17 @@ impl TimeZoneService {
         ctx: &mut HLERequestContext,
     ) {
         let service = Self::as_self(this);
-        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
-        rb.push_result(service.get_device_location_name_operation_event_readable_handle());
+        match service.get_device_location_name_operation_event_readable_handle(ctx) {
+            Ok(handle) => {
+                let mut rb = ResponseBuilder::new(ctx, 2, 1, 0);
+                rb.push_result(RESULT_SUCCESS);
+                rb.push_copy_objects(handle);
+            }
+            Err(rc) => {
+                let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+                rb.push_result(rc);
+            }
+        }
     }
 
     fn to_posix_time_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {

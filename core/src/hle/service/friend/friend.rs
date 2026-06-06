@@ -11,6 +11,7 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
+use crate::hle::service::acc::errors::RESULT_NO_NOTIFICATIONS;
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
 use crate::hle::service::ipc_helpers::{RequestParser, ResponseBuilder};
 use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
@@ -70,6 +71,7 @@ pub enum NotificationTypes {
 }
 
 /// SizedNotificationInfo. Upstream: `SizedNotificationInfo` in `friend.cpp`.
+#[derive(Clone, Copy)]
 #[repr(C)]
 pub struct SizedNotificationInfo {
     pub notification_type: NotificationTypes,
@@ -487,11 +489,14 @@ impl INotificationService {
 
     fn pop_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         let this = unsafe { &*(this as *const dyn ServiceFramework as *const Self) };
-        let notification = this.pop();
-        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
-        rb.push_result(RESULT_SUCCESS);
-        if let Some(_info) = notification {
-            // Buffer return not wired yet; keep success parity and state update.
+        if let Some(notification) = this.pop() {
+            let mut rb = ResponseBuilder::new(ctx, 6, 0, 0);
+            rb.push_result(RESULT_SUCCESS);
+            rb.push_raw(&notification);
+        } else {
+            log::error!("No notifications in queue!");
+            let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+            rb.push_result(RESULT_NO_NOTIFICATIONS);
         }
     }
 }

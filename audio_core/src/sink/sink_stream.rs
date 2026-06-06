@@ -260,7 +260,12 @@ impl SinkStream {
             return;
         }
 
-        let volume = self.system_volume * self.device_volume;
+        let settings = common::settings::values();
+        let mut yuzu_volume = common::settings::volume(&settings);
+        if yuzu_volume > 1.0 {
+            yuzu_volume = 0.6 + 20.0 * yuzu_volume.log10();
+        }
+        let volume = self.system_volume * self.device_volume * yuzu_volume;
         if self.system_channels == 6 && self.device_channels == 2 {
             // Match yuzu's 6ch->2ch sink downmix.
             const DOWN_MIX_COEFF: [f32; 4] = [1.0, 0.596, 0.354, 0.707];
@@ -307,6 +312,10 @@ impl SinkStream {
     }
 
     pub fn release_buffer(&mut self, num_samples: u64) -> Vec<i16> {
+        if self.discard_buffers {
+            return Vec::new();
+        }
+
         let count = min(num_samples as usize, self.samples.len());
         let mut out = Vec::with_capacity(num_samples as usize);
         for _ in 0..count {
@@ -438,19 +447,13 @@ impl SinkStream {
         while frames_written < num_frames {
             if self.playing_buffer.consumed || self.playing_buffer.frames == 0 {
                 let Some(buffer) = self.queue.pop_front() else {
-                    // Buffer-level underrun (no buffers in queue): fill remaining
-                    // output with silence rather than replicating `last_frame`.
-                    // Replicating `last_frame` across many missing frames produces
-                    // a sustained DC tone / strident warble (user-reported "modem
-                    // sound" when the audio renderer can't keep up with the host
-                    // callback rate). Matches the sample-level underrun fix in
-                    // commit b407b8b which made the same change.
-                    let base = frames_written * frame_size;
-                    let remaining = (num_frames - frames_written) * frame_size;
-                    for sample in &mut output_buffer[base..base + remaining] {
-                        *sample = 0;
+                    for frame in frames_written..num_frames {
+                        let base = frame * frame_size;
+                        output_buffer[base..base + frame_size]
+                            .copy_from_slice(&self.last_frame[..frame_size]);
                     }
-                    break;
+                    frames_written = num_frames;
+                    continue;
                 };
                 self.playing_buffer = buffer;
                 self.release.queued_buffers.fetch_sub(1, Ordering::Release);
@@ -462,13 +465,6 @@ impl SinkStream {
                 as usize;
             let samples_to_pop = frames_available * frame_size;
             let base = frames_written * frame_size;
-            // Fall back to silence (0) rather than `last_frame[0]` when the
-            // sample queue runs short. Replicating `last_frame[0]` across all
-            // channels for many missing samples produces a DC tone / strident
-            // warble (user-reported "modem sound" after underruns). Upstream
-            // zuyu's `Pop` leaves remaining output_buffer slots untouched (i.e.
-            // cubeb's prior buffer contents, often zero); filling with explicit
-            // zeros is safer and deterministic.
             for sample in &mut output_buffer[base..base + samples_to_pop] {
                 *sample = self.samples.pop_front().unwrap_or(0);
             }
@@ -478,43 +474,6 @@ impl SinkStream {
             self.playing_buffer.frames_played += frames_available as u64;
             if self.playing_buffer.frames_played >= self.playing_buffer.frames {
                 self.playing_buffer.consumed = true;
-            }
-        }
-
-        // Defensive glitch-mute: when the audio renderer goes haywire (e.g.,
-        // MK8D's state-machine wedge leads to voice wave-buffer addresses
-        // pointing at freed/corrupt memory, producing samples saturated at
-        // i16::MIN), the output buffer fills with high-amplitude noise that
-        // sounds strident. Signature: hit i16::MIN AND >= 1% of samples
-        // saturated to ±i16::MIN/MAX. Legitimate loud audio rarely pegs to
-        // i16::MIN for >1% of samples in a single callback.
-        if output_buffer.len() >= 100 {
-            let mut hit_min = false;
-            let mut clipped = 0usize;
-            for &s in output_buffer.iter() {
-                if s == i16::MIN {
-                    hit_min = true;
-                }
-                if s == i16::MIN || s == i16::MAX {
-                    clipped += 1;
-                }
-            }
-            if hit_min && clipped * 100 / output_buffer.len() >= 1 {
-                for sample in output_buffer.iter_mut() {
-                    *sample = 0;
-                }
-                use std::sync::atomic::{AtomicU64, Ordering};
-                static MUTE_COUNT: AtomicU64 = AtomicU64::new(0);
-                let n = MUTE_COUNT.fetch_add(1, Ordering::Relaxed);
-                if n < 5 || n.is_power_of_two() {
-                    log::warn!(
-                        "[AUDIO_GLITCH_MUTE] #{} muted {}-sample buffer with {} saturated samples ({}%) — renderer producing garbage",
-                        n,
-                        output_buffer.len(),
-                        clipped,
-                        clipped * 100 / output_buffer.len()
-                    );
-                }
             }
         }
 

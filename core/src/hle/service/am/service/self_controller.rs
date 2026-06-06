@@ -10,10 +10,16 @@ use std::sync::{Arc, Mutex};
 use crate::core::SystemRef;
 use crate::hle::kernel::k_process::KProcess;
 use crate::hle::kernel::k_process::ProcessLock;
-use crate::hle::result::{ResultCode, RESULT_SUCCESS};
+use crate::hle::result::{ErrorModule, ResultCode, RESULT_SUCCESS};
+use crate::hle::service::am::am_types::AppletIdentityInfo;
+use crate::hle::service::caps::caps_su::IScreenShotApplicationService;
+use crate::hle::service::caps::caps_types::{AlbumImageOrientation, AlbumReportOption};
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
 use crate::hle::service::ipc_helpers::{RequestParser, ResponseBuilder};
 use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
+
+const RESULT_FATAL_SECTION_COUNT_IMBALANCE: ResultCode =
+    ResultCode::from_module_description(ErrorModule::AM, 512);
 
 /// IPC command table for ISelfController:
 /// - 0: Exit
@@ -51,6 +57,8 @@ use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFrame
 /// - 120: SaveCurrentScreenshot
 /// - 130: SetRecordVolumeMuted
 pub struct ISelfController {
+    /// Matches upstream `Core::System& system`.
+    system: SystemRef,
     /// Reference to the applet.
     /// Matches upstream `const std::shared_ptr<Applet> m_applet`.
     applet: Arc<Mutex<crate::hle::service::am::applet::Applet>>,
@@ -87,6 +95,16 @@ impl ISelfController {
             (1, Some(Self::lock_exit_handler), "LockExit"),
             (2, Some(Self::unlock_exit_handler), "UnlockExit"),
             (
+                3,
+                Some(Self::enter_fatal_section_handler),
+                "EnterFatalSection",
+            ),
+            (
+                4,
+                Some(Self::leave_fatal_section_handler),
+                "LeaveFatalSection",
+            ),
+            (
                 9,
                 Some(Self::get_library_applet_launchable_event_handler),
                 "GetLibraryAppletLaunchableEvent",
@@ -117,10 +135,24 @@ impl ISelfController {
                 "SetRestartMessageEnabled",
             ),
             (
+                15,
+                Some(Self::set_screen_shot_applet_identity_info_handler),
+                "SetScreenShotAppletIdentityInfo",
+            ),
+            (
                 16,
                 Some(Self::set_out_of_focus_suspending_enabled_handler),
                 "SetOutOfFocusSuspendingEnabled",
             ),
+            (17, None, "SetControllerFirmwareUpdateSection"),
+            (18, None, "SetRequiresCaptureButtonShortPressedMessage"),
+            (
+                19,
+                Some(Self::set_album_image_orientation_handler),
+                "SetAlbumImageOrientation",
+            ),
+            (20, None, "SetDesirableKeyboardLayout"),
+            (21, None, "GetScreenShotProgramId"),
             (
                 40,
                 Some(Self::create_managed_display_layer_handler),
@@ -146,6 +178,28 @@ impl ISelfController {
                 Some(Self::create_managed_display_separable_layer_handler),
                 "CreateManagedDisplaySeparableLayer",
             ),
+            (45, None, "SetManagedDisplayLayerSeparationMode"),
+            (46, None, "SetRecordingLayerCompositionEnabled"),
+            (
+                50,
+                Some(Self::set_handles_request_to_display_handler),
+                "SetHandlesRequestToDisplay",
+            ),
+            (
+                51,
+                Some(Self::approve_to_display_handler),
+                "ApproveToDisplay",
+            ),
+            (
+                60,
+                Some(Self::override_auto_sleep_time_and_dimming_time_handler),
+                "OverrideAutoSleepTimeAndDimmingTime",
+            ),
+            (
+                61,
+                Some(Self::set_media_playback_state_handler),
+                "SetMediaPlaybackState",
+            ),
             (
                 62,
                 Some(Self::set_idle_time_detection_extension_handler),
@@ -156,18 +210,62 @@ impl ISelfController {
                 Some(Self::get_idle_time_detection_extension_handler),
                 "GetIdleTimeDetectionExtension",
             ),
+            (64, None, "SetInputDetectionSourceSet"),
+            (
+                65,
+                Some(Self::report_user_is_active_handler),
+                "ReportUserIsActive",
+            ),
+            (66, None, "GetCurrentIlluminance"),
+            (67, None, "IsIlluminanceAvailable"),
             (
                 68,
                 Some(Self::set_auto_sleep_disabled_handler),
                 "SetAutoSleepDisabled",
             ),
             (
+                69,
+                Some(Self::is_auto_sleep_disabled_handler),
+                "IsAutoSleepDisabled",
+            ),
+            (70, None, "ReportMultimediaError"),
+            (71, None, "GetCurrentIlluminanceEx"),
+            (
+                72,
+                Some(Self::set_input_detection_policy_handler),
+                "SetInputDetectionPolicy",
+            ),
+            (80, None, "SetWirelessPriorityMode"),
+            (
+                90,
+                Some(Self::get_accumulated_suspended_tick_value_handler),
+                "GetAccumulatedSuspendedTickValue",
+            ),
+            (
                 91,
                 Some(Self::get_accumulated_suspended_tick_changed_event_handler),
                 "GetAccumulatedSuspendedTickChangedEvent",
             ),
+            (
+                100,
+                Some(Self::set_album_image_taken_notification_enabled_handler),
+                "SetAlbumImageTakenNotificationEnabled",
+            ),
+            (110, None, "SetApplicationAlbumUserData"),
+            (
+                120,
+                Some(Self::save_current_screenshot_handler),
+                "SaveCurrentScreenshot",
+            ),
+            (
+                130,
+                Some(Self::set_record_volume_muted_handler),
+                "SetRecordVolumeMuted",
+            ),
+            (1000, None, "GetDebugStorageChannel"),
         ]);
         Self {
+            system,
             applet,
             process,
             handlers,
@@ -178,16 +276,28 @@ impl ISelfController {
     /// Port of ISelfController::Exit
     pub fn exit(&self) {
         log::debug!("Exit called");
+        self.applet.lock().unwrap().process.terminate();
     }
 
     /// Port of ISelfController::LockExit
     pub fn lock_exit(&self) {
         log::debug!("LockExit called");
+        let mut applet = self.applet.lock().unwrap();
+        if applet.lifecycle_manager.get_exit_requested() {
+            applet.process.terminate();
+        } else {
+            applet.exit_locked = true;
+        }
     }
 
     /// Port of ISelfController::UnlockExit
     pub fn unlock_exit(&self) {
         log::debug!("UnlockExit called");
+        let mut applet = self.applet.lock().unwrap();
+        applet.exit_locked = false;
+        if applet.lifecycle_manager.get_exit_requested() {
+            applet.process.terminate();
+        }
     }
 
     /// Port of ISelfController::SetOperationModeChangedNotification
@@ -291,6 +401,36 @@ impl ISelfController {
         service.unlock_exit();
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
+    }
+
+    fn enter_fatal_section_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const ISelfController) };
+        let mut applet = service.applet.lock().unwrap();
+        applet.fatal_section_count += 1;
+        log::debug!(
+            "EnterFatalSection: fatal_section_count={}",
+            applet.fatal_section_count
+        );
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+    }
+
+    fn leave_fatal_section_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const ISelfController) };
+        let mut applet = service.applet.lock().unwrap();
+        let result = if applet.fatal_section_count > 0 {
+            applet.fatal_section_count -= 1;
+            RESULT_SUCCESS
+        } else {
+            RESULT_FATAL_SECTION_COUNT_IMBALANCE
+        };
+        log::debug!(
+            "LeaveFatalSection: fatal_section_count={} result=0x{:08X}",
+            applet.fatal_section_count,
+            result.0
+        );
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(result);
     }
 
     fn set_operation_mode_changed_notification_handler(
@@ -420,6 +560,26 @@ impl ISelfController {
         rb.push_result(RESULT_SUCCESS);
     }
 
+    fn set_screen_shot_applet_identity_info_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const ISelfController) };
+        let mut rp = RequestParser::new(ctx);
+        let applet_id = rp.pop_u32();
+        let _padding = rp.pop_u32();
+        let application_id = rp.pop_u64();
+        let mut applet = service.applet.lock().unwrap();
+        applet.screen_shot_identity = AppletIdentityInfo {
+            applet_id,
+            _padding: [0; 0x4],
+            application_id,
+        };
+        log::warn!("(STUBBED) SetScreenShotAppletIdentityInfo called");
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+    }
+
     /// SetOutOfFocusSuspendingEnabled (cmd 16).
     /// Matches upstream: locks applet, sets out-of-focus suspending.
     fn set_out_of_focus_suspending_enabled_handler(
@@ -437,11 +597,29 @@ impl ISelfController {
         rb.push_result(RESULT_SUCCESS);
     }
 
+    fn set_album_image_orientation_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const ISelfController) };
+        let mut rp = RequestParser::new(ctx);
+        let orientation = match rp.pop_u32() {
+            1 => AlbumImageOrientation::Rotate90,
+            2 => AlbumImageOrientation::Rotate180,
+            3 => AlbumImageOrientation::Rotate270,
+            _ => AlbumImageOrientation::None,
+        };
+        service.applet.lock().unwrap().album_image_orientation = orientation;
+        log::warn!(
+            "(STUBBED) SetAlbumImageOrientation called, orientation={:?}",
+            orientation
+        );
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+    }
+
     /// CreateManagedDisplayLayer (cmd 40).
     /// Upstream calls `m_applet->display_layer_manager.CreateManagedDisplayLayer(&layer_id)`.
-    /// DisplayLayerManager is not yet implemented; returns a dummy layer_id=1 to allow
-    /// applets to proceed past initialization. This is sufficient for games that do not
-    /// depend on actual display layer management.
     fn create_managed_display_layer_handler(
         this: &dyn ServiceFramework,
         ctx: &mut HLERequestContext,
@@ -556,6 +734,53 @@ impl ISelfController {
         }
     }
 
+    fn set_handles_request_to_display_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const ISelfController) };
+        let mut rp = RequestParser::new(ctx);
+        let enable = rp.pop_bool();
+        service.set_handles_request_to_display(enable);
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+    }
+
+    fn approve_to_display_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const ISelfController) };
+        service.approve_to_display();
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+    }
+
+    fn override_auto_sleep_time_and_dimming_time_handler(
+        _this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        let mut rp = RequestParser::new(ctx);
+        let a = rp.pop_i32();
+        let b = rp.pop_i32();
+        let c = rp.pop_i32();
+        let d = rp.pop_i32();
+        log::warn!(
+            "(STUBBED) OverrideAutoSleepTimeAndDimmingTime called, a={} b={} c={} d={}",
+            a,
+            b,
+            c,
+            d
+        );
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+    }
+
+    fn set_media_playback_state_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let mut rp = RequestParser::new(ctx);
+        let state = rp.pop_bool();
+        log::warn!("(STUBBED) SetMediaPlaybackState called, state={}", state);
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+    }
+
     /// SetIdleTimeDetectionExtension (cmd 62).
     /// Matches upstream: locks applet, stores value.
     fn set_idle_time_detection_extension_handler(
@@ -595,6 +820,13 @@ impl ISelfController {
         rb.push_u32(extension);
     }
 
+    fn report_user_is_active_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const ISelfController) };
+        service.report_user_is_active();
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+    }
+
     /// SetAutoSleepDisabled (cmd 68).
     /// Matches upstream: locks applet, stores bool.
     fn set_auto_sleep_disabled_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
@@ -610,17 +842,119 @@ impl ISelfController {
         rb.push_result(RESULT_SUCCESS);
     }
 
-    /// GetAccumulatedSuspendedTickChangedEvent (cmd 91).
-    /// Matches upstream: returns event handle from applet.
-    fn get_accumulated_suspended_tick_changed_event_handler(
+    fn is_auto_sleep_disabled_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const ISelfController) };
+        let disabled = service.applet.lock().unwrap().auto_sleep_disabled;
+        let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_bool(disabled);
+    }
+
+    fn set_input_detection_policy_handler(
         _this: &dyn ServiceFramework,
         ctx: &mut HLERequestContext,
     ) {
+        let mut rp = RequestParser::new(ctx);
+        let policy = rp.pop_u32();
+        log::warn!(
+            "(STUBBED) SetInputDetectionPolicy called, policy={}",
+            policy
+        );
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+    }
+
+    fn get_accumulated_suspended_tick_value_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const ISelfController) };
+        let ticks = service.applet.lock().unwrap().suspended_ticks;
+        let mut rb = ResponseBuilder::new(ctx, 4, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_u64(ticks);
+    }
+
+    /// GetAccumulatedSuspendedTickChangedEvent (cmd 91).
+    /// Matches upstream: returns event handle from applet.
+    fn get_accumulated_suspended_tick_changed_event_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const ISelfController) };
         log::debug!("GetAccumulatedSuspendedTickChangedEvent called");
-        let handle = ctx.create_readable_event_handle(false).unwrap_or(0);
+        let handle = service
+            .applet
+            .lock()
+            .unwrap()
+            .ensure_accumulated_suspended_tick_changed_event(ctx)
+            .unwrap_or(0);
         let mut rb = ResponseBuilder::new(ctx, 2, 1, 0);
         rb.push_result(RESULT_SUCCESS);
         rb.push_copy_objects(handle);
+    }
+
+    fn set_album_image_taken_notification_enabled_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const ISelfController) };
+        let mut rp = RequestParser::new(ctx);
+        let enabled = rp.pop_bool();
+        service
+            .applet
+            .lock()
+            .unwrap()
+            .album_image_taken_notification_enabled = enabled;
+        log::warn!(
+            "(STUBBED) SetAlbumImageTakenNotificationEnabled called, enabled={}",
+            enabled
+        );
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+    }
+
+    fn save_current_screenshot_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const ISelfController) };
+        let mut rp = RequestParser::new(ctx);
+        let report_option = match rp.pop_i32() {
+            1 => AlbumReportOption::Enable,
+            2 => AlbumReportOption::Unknown2,
+            3 => AlbumReportOption::Unknown3,
+            _ => AlbumReportOption::Disable,
+        };
+        log::info!(
+            "SaveCurrentScreenshot called, report_option={:?}",
+            report_option
+        );
+
+        if !service.system.is_null() {
+            if let Some(service_manager) = service.system.get().service_manager() {
+                if let Some(screenshot_service) =
+                    service_manager.lock().unwrap().get_service("caps:su")
+                {
+                    if let Some(screenshot_service) = screenshot_service
+                        .as_any()
+                        .downcast_ref::<IScreenShotApplicationService>(
+                    ) {
+                        screenshot_service.capture_and_save_screenshot(report_option);
+                    }
+                }
+            }
+        }
+
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+    }
+
+    fn set_record_volume_muted_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const ISelfController) };
+        let mut rp = RequestParser::new(ctx);
+        let muted = rp.pop_bool();
+        service.applet.lock().unwrap().record_volume_muted = muted;
+        log::warn!("(STUBBED) SetRecordVolumeMuted called, muted={}", muted);
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
     }
 }
 

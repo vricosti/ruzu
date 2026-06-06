@@ -12,7 +12,6 @@ use crate::file_sys::vfs::vfs_types::VirtualFile;
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 use crate::hle::service::cmif_serialization::{CmifRequest, CmifResponse};
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
-use crate::hle::service::ipc_helpers::ResponseBuilder;
 use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
 use std::sync::atomic::Ordering;
 
@@ -56,11 +55,11 @@ impl IStorage {
             backend,
             handlers: build_handler_map(&[
                 (0, Some(Self::read_handler), "Read"),
-                (1, Some(Self::stub_success_handler), "Write"),
-                (2, Some(Self::stub_success_handler), "Flush"),
-                (3, Some(Self::stub_success_handler), "SetSize"),
+                (1, None, "Write"),
+                (2, None, "Flush"),
+                (3, None, "SetSize"),
                 (4, Some(Self::get_size_handler), "GetSize"),
-                (5, Some(Self::stub_success_handler), "OperateRange"),
+                (5, None, "OperateRange"),
             ]),
             handlers_tipc: BTreeMap::new(),
         }
@@ -231,10 +230,6 @@ impl IStorage {
         response.push_result(result);
         response.push_u64(size);
     }
-
-    fn stub_success_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
-        Self::reply_result_only(ctx, RESULT_SUCCESS);
-    }
 }
 
 impl SessionRequestHandler for IStorage {
@@ -258,27 +253,6 @@ impl ServiceFramework for IStorage {
 
     fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
         &self.handlers_tipc
-    }
-
-    fn invoke_request(&self, ctx: &mut HLERequestContext)
-    where
-        Self: Sized,
-    {
-        let cmd = ctx.get_command();
-        if let Some(fi) = self.handlers().get(&cmd) {
-            if let Some(callback) = fi.handler_callback {
-                log::trace!("Service::{}: {}", self.get_service_name(), fi.name);
-                callback(self, ctx);
-                return;
-            }
-        }
-
-        log::warn!(
-            "IStorage: unimplemented command '{}' returned stub success",
-            cmd
-        );
-        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
-        rb.push_result(RESULT_SUCCESS);
     }
 }
 

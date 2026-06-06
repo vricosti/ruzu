@@ -414,6 +414,8 @@ const TILED_CACHE_BARRIER: u32 = reg_index!(0x0F7C);
 const CLEAR_REPORT_VALUE: u32 = reg_index!(0x1530);
 /// Upstream `regs.zeta_enable`.
 pub(crate) const ZETA_ENABLE: u32 = reg_index!(0x1538);
+/// Upstream `regs.anti_alias_samples_mode`.
+pub(crate) const ANTI_ALIAS_SAMPLES_MODE: u32 = reg_index!(0x15D0);
 pub(crate) const ZETA_BASE: u32 = reg_index!(0x0FE0);
 pub(crate) const ZETA_SIZE_BASE: u32 = reg_index!(0x1228);
 /// Render enable block base: +0 addr_high, +1 addr_low, +2 mode.
@@ -927,6 +929,37 @@ impl PolygonMode {
                 Self::Fill
             }
         }
+    }
+}
+
+/// Upstream `Maxwell3D::Regs::FillViaTriangleMode`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FillViaTriangleMode {
+    Disabled,
+    FillAll,
+    FillBoundingBox,
+}
+
+impl FillViaTriangleMode {
+    pub fn from_raw(value: u32) -> Self {
+        match value {
+            0 => Self::Disabled,
+            1 => Self::FillAll,
+            2 => Self::FillBoundingBox,
+            _ => {
+                log::warn!(
+                    "Maxwell3D: unknown FillViaTriangleMode 0x{:X}, defaulting to Disabled",
+                    value
+                );
+                Self::Disabled
+            }
+        }
+    }
+}
+
+impl Default for FillViaTriangleMode {
+    fn default() -> Self {
+        Self::Disabled
     }
 }
 
@@ -1806,8 +1839,12 @@ pub struct RasterizerInfo {
     pub cull_face: CullFace,
     pub polygon_mode_front: PolygonMode,
     pub polygon_mode_back: PolygonMode,
+    pub fill_via_triangle_mode: FillViaTriangleMode,
     pub line_width_smooth: f32,
     pub line_width_aliased: f32,
+    pub polygon_offset_point_enable: bool,
+    pub polygon_offset_line_enable: bool,
+    pub polygon_offset_fill_enable: bool,
     pub depth_bias: f32,
     pub slope_scale_depth_bias: f32,
     pub depth_bias_clamp: f32,
@@ -1821,13 +1858,63 @@ impl Default for RasterizerInfo {
             cull_face: CullFace::Back,
             polygon_mode_front: PolygonMode::Fill,
             polygon_mode_back: PolygonMode::Fill,
+            fill_via_triangle_mode: FillViaTriangleMode::Disabled,
             line_width_smooth: 1.0,
             line_width_aliased: 1.0,
+            polygon_offset_point_enable: false,
+            polygon_offset_line_enable: false,
+            polygon_offset_fill_enable: false,
             depth_bias: 0.0,
             slope_scale_depth_bias: 0.0,
             depth_bias_clamp: 0.0,
         }
     }
+}
+
+/// Upstream `Maxwell3D::Regs::PrimitiveRestart`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct PrimitiveRestartInfo {
+    pub enabled: bool,
+    pub index: u32,
+}
+
+/// Upstream `Maxwell3D::Regs::LogicOp`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LogicOpInfo {
+    pub enabled: bool,
+    pub op: u32,
+}
+
+impl Default for LogicOpInfo {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            op: 0x1503,
+        }
+    }
+}
+
+/// Upstream `Maxwell3D::Regs::AntiAliasAlphaControl`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct AntiAliasAlphaControlInfo {
+    pub alpha_to_coverage: bool,
+    pub alpha_to_one: bool,
+}
+
+/// Upstream point-size state consumed by `RasterizerOpenGL::SyncPointState`.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct PointStateInfo {
+    pub point_sprite_enable: bool,
+    pub point_size_attribute_enabled: bool,
+    pub point_size: f32,
+}
+
+/// Upstream line-width state consumed by `RasterizerOpenGL::SyncLineState`.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct LineStateInfo {
+    pub line_anti_alias_enable: bool,
+    pub line_width_smooth: f32,
+    pub line_width_aliased: f32,
 }
 
 /// A constant buffer binding for one slot of one shader stage.
@@ -2251,6 +2338,11 @@ impl Maxwell3D {
             height: self.regs[zeta_size + 1],
             depth: self.regs[zeta_size + 2],
         }
+    }
+
+    /// Upstream `maxwell3d->regs.anti_alias_samples_mode`.
+    pub fn anti_alias_samples_mode(&self) -> u32 {
+        self.regs[ANTI_ALIAS_SAMPLES_MODE as usize]
     }
 
     /// Upstream `maxwell3d->draw_manager->GetDrawState()`.
@@ -2833,12 +2925,76 @@ impl Maxwell3D {
             cull_face: CullFace::from_raw(self.regs[CULL_FACE as usize]),
             polygon_mode_front: PolygonMode::from_raw(self.regs[POLYGON_MODE_FRONT as usize]),
             polygon_mode_back: PolygonMode::from_raw(self.regs[POLYGON_MODE_BACK as usize]),
+            fill_via_triangle_mode: FillViaTriangleMode::from_raw(
+                self.regs[FILL_VIA_TRIANGLE_MODE as usize],
+            ),
             line_width_smooth: f32::from_bits(self.regs[LINE_WIDTH_SMOOTH as usize]),
             line_width_aliased: f32::from_bits(self.regs[LINE_WIDTH_ALIASED as usize]),
+            polygon_offset_point_enable: self.regs[POLYGON_OFFSET_POINT_ENABLE as usize] != 0,
+            polygon_offset_line_enable: self.regs[POLYGON_OFFSET_LINE_ENABLE as usize] != 0,
+            polygon_offset_fill_enable: self.regs[POLYGON_OFFSET_FILL_ENABLE as usize] != 0,
             depth_bias: f32::from_bits(self.regs[DEPTH_BIAS as usize]),
             slope_scale_depth_bias: f32::from_bits(self.regs[SLOPE_SCALE_DEPTH_BIAS as usize]),
             depth_bias_clamp: f32::from_bits(self.regs[DEPTH_BIAS_CLAMP as usize]),
         }
+    }
+
+    /// Upstream `maxwell3d->regs.primitive_restart`.
+    pub fn primitive_restart_info(&self) -> PrimitiveRestartInfo {
+        let base = PRIMITIVE_RESTART_BASE as usize;
+        PrimitiveRestartInfo {
+            enabled: self.regs[base] != 0,
+            index: self.regs[base + 1],
+        }
+    }
+
+    /// Upstream `maxwell3d->regs.logic_op`.
+    pub fn logic_op_info(&self) -> LogicOpInfo {
+        let base = LOGIC_OP as usize;
+        LogicOpInfo {
+            enabled: self.regs[base] != 0,
+            op: self.regs[base + 1],
+        }
+    }
+
+    /// Upstream `maxwell3d->regs.frag_color_clamp.AnyEnabled()`.
+    pub fn frag_color_clamp_any_enabled(&self) -> bool {
+        let raw = self.regs[FRAG_COLOR_CLAMP as usize];
+        (0..8).any(|index| ((raw >> (index * 4)) & 1) != 0)
+    }
+
+    /// Upstream `maxwell3d->regs.anti_alias_alpha_control`.
+    pub fn anti_alias_alpha_control_info(&self) -> AntiAliasAlphaControlInfo {
+        let raw = self.regs[ANTI_ALIAS_ALPHA_CONTROL as usize];
+        AntiAliasAlphaControlInfo {
+            alpha_to_coverage: (raw & 0x1) != 0,
+            alpha_to_one: ((raw >> 4) & 0x1) != 0,
+        }
+    }
+
+    /// Upstream point-size registers read by `SyncPointState`.
+    pub fn point_state_info(&self) -> PointStateInfo {
+        PointStateInfo {
+            point_sprite_enable: self.regs[POINT_SPRITE_ENABLE as usize] != 0,
+            point_size_attribute_enabled: (self.regs[POINT_SIZE_ATTRIBUTE as usize] & 0x1) != 0,
+            point_size: f32::from_bits(self.regs[POINT_SIZE as usize]),
+        }
+    }
+
+    /// Upstream line-width registers read by `SyncLineState`.
+    pub fn line_state_info(&self) -> LineStateInfo {
+        LineStateInfo {
+            line_anti_alias_enable: self.regs[LINE_ANTI_ALIAS_ENABLE as usize] != 0,
+            line_width_smooth: f32::from_bits(self.regs[LINE_WIDTH_SMOOTH as usize]),
+            line_width_aliased: f32::from_bits(self.regs[LINE_WIDTH_ALIASED as usize]),
+        }
+    }
+
+    /// Upstream `SyncDepthClamp` interpretation of
+    /// `regs.viewport_clip_control.geometry_clip`.
+    pub fn depth_clamp_enabled(&self) -> bool {
+        let geometry_clip = (self.regs[VIEWPORT_CLIP_CONTROL as usize] >> 11) & 0x7;
+        !matches!(geometry_clip, 1 | 3 | 5)
     }
 
     // ── Shader program accessors ─────────────────────────────────────────
@@ -3481,6 +3637,46 @@ impl dm::Maxwell3DAccess for Maxwell3D {
         self.rasterize_enable()
     }
 
+    fn primitive_restart_info(&self) -> PrimitiveRestartInfo {
+        self.primitive_restart_info()
+    }
+
+    fn logic_op_info(&self) -> LogicOpInfo {
+        self.logic_op_info()
+    }
+
+    fn frag_color_clamp_any_enabled(&self) -> bool {
+        self.frag_color_clamp_any_enabled()
+    }
+
+    fn anti_alias_alpha_control_info(&self) -> AntiAliasAlphaControlInfo {
+        self.anti_alias_alpha_control_info()
+    }
+
+    fn point_state_info(&self) -> PointStateInfo {
+        self.point_state_info()
+    }
+
+    fn line_state_info(&self) -> LineStateInfo {
+        self.line_state_info()
+    }
+
+    fn depth_clamp_enabled(&self) -> bool {
+        self.depth_clamp_enabled()
+    }
+
+    fn alpha_test_enabled(&self) -> bool {
+        self.alpha_test_enabled()
+    }
+
+    fn alpha_test_func(&self) -> ComparisonOp {
+        self.alpha_test_func()
+    }
+
+    fn alpha_test_ref(&self) -> f32 {
+        self.alpha_test_ref()
+    }
+
     fn program_base_address(&self) -> u64 {
         self.program_base_address()
     }
@@ -3511,6 +3707,10 @@ impl dm::Maxwell3DAccess for Maxwell3D {
 
     fn zeta_info(&self) -> ZetaInfo {
         self.zeta_info()
+    }
+
+    fn anti_alias_samples_mode(&self) -> u32 {
+        self.anti_alias_samples_mode()
     }
 
     fn tex_header_pool_address(&self) -> u64 {
@@ -7214,6 +7414,23 @@ mod tests {
         assert!(engine.dirty.flags[dirty_flags::flags::INDEX_BUFFER as usize]);
         assert!(!engine.dirty.flags[dirty_flags::flags::SHADERS as usize]);
         assert!(engine.interface_state.current_dirty);
+    }
+
+    #[test]
+    fn maxwell_draw_view_live_clears_engine_dirty_flag() {
+        let mut engine = Maxwell3D::new();
+        engine.dirty.flags.fill(false);
+        let flag = crate::renderer_opengl::gl_state_tracker::dirty::VIEWPORTS;
+        engine.dirty.flags[flag as usize] = true;
+
+        let draw_state = dm::DrawState::default();
+        let mut view = dm::Maxwell3DDrawView::live(&draw_state, &mut engine);
+        assert!(view.dirty_flags()[flag as usize]);
+
+        view.clear_dirty_flag(flag);
+        drop(view);
+
+        assert!(!engine.dirty.flags[flag as usize]);
     }
 
     #[test]

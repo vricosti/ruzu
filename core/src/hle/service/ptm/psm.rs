@@ -233,11 +233,10 @@ impl PSM {
     fn open_session_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         let service = unsafe { &*(this as *const dyn ServiceFramework as *const PSM) };
         let session = Arc::new(service.open_session());
-        let handle = ctx.create_session_for_service(session).unwrap_or(0);
 
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 1);
         rb.push_result(RESULT_SUCCESS);
-        rb.push_move_objects(handle);
+        rb.push_ipc_interface(session);
     }
 }
 

@@ -7,6 +7,7 @@
 use std::sync::{Arc, Mutex};
 
 use crate::hle::kernel::k_process::KProcess;
+use crate::hle::kernel::k_session::KSession;
 use crate::hle::kernel::k_session_request::KSessionRequest;
 use crate::hle::service::hle_ipc::SessionRequestManager;
 
@@ -92,16 +93,18 @@ impl KClientSession {
         let Some(parent_session) = process.get_session_by_object_id(parent_id) else {
             return 1;
         };
-        let request = Arc::new(Mutex::new(KSessionRequest::new()));
-        request
-            .lock()
-            .unwrap()
-            .initialize_with_process(process, None, address, size);
-        let result = {
-            let session = parent_session.lock().unwrap();
-            session.on_request_with_process(process, request)
-        };
-        result
+        Self::send_sync_request_to_parent_with_process(process, parent_session, address, size)
+    }
+
+    /// Rust equivalent of upstream `m_parent->OnRequest(request)` once the
+    /// parent `KSession` has already been resolved by the caller.
+    pub fn send_sync_request_to_parent_with_process(
+        process: &mut KProcess,
+        parent_session: Arc<Mutex<KSession>>,
+        address: usize,
+        size: usize,
+    ) -> u32 {
+        Self::send_request_to_parent_with_process(process, parent_session, None, address, size)
     }
 
     /// Send an asynchronous IPC request.
@@ -138,11 +141,45 @@ impl KClientSession {
         let Some(parent_session) = process.get_session_by_object_id(parent_id) else {
             return 1;
         };
+        Self::send_async_request_to_parent_with_process(
+            process,
+            parent_session,
+            event_id,
+            address,
+            size,
+        )
+    }
+
+    /// Rust equivalent of upstream `m_parent->OnRequest(request)` for async
+    /// IPC once the parent `KSession` has already been resolved.
+    pub fn send_async_request_to_parent_with_process(
+        process: &mut KProcess,
+        parent_session: Arc<Mutex<KSession>>,
+        event_id: u64,
+        address: usize,
+        size: usize,
+    ) -> u32 {
+        Self::send_request_to_parent_with_process(
+            process,
+            parent_session,
+            Some(event_id),
+            address,
+            size,
+        )
+    }
+
+    fn send_request_to_parent_with_process(
+        process: &mut KProcess,
+        parent_session: Arc<Mutex<KSession>>,
+        event_id: Option<u64>,
+        address: usize,
+        size: usize,
+    ) -> u32 {
         let request = Arc::new(Mutex::new(KSessionRequest::new()));
         request
             .lock()
             .unwrap()
-            .initialize_with_process(process, Some(event_id), address, size);
+            .initialize_with_process(process, event_id, address, size);
         let session = parent_session.lock().unwrap();
         session.on_request_with_process(process, request)
     }
@@ -241,5 +278,42 @@ mod tests {
         let current_request = current_request.lock().unwrap();
         assert_eq!(current_request.get_event_id(), Some(0x2222));
         assert_eq!(current_request.get_address(), 0x2395000);
+    }
+
+    #[test]
+    fn enqueue_helper_uses_resolved_parent_without_locking_client_session() {
+        let mut process = KProcess::new();
+        let session = Arc::new(Mutex::new(KSession::new()));
+        {
+            let mut session_guard = session.lock().unwrap();
+            session_guard.initialize(None, 0);
+            session_guard.client.lock().unwrap().initialize(0x1000);
+            session_guard.server.lock().unwrap().initialize(0x1000);
+        }
+        process.register_session_object(0x1000, Arc::clone(&session));
+
+        let client_session = session.lock().unwrap().get_client_session().clone();
+        let _client_guard = client_session.lock().unwrap();
+
+        assert_eq!(
+            KClientSession::send_sync_request_to_parent_with_process(
+                &mut process,
+                Arc::clone(&session),
+                0x2395100,
+                0x40,
+            ),
+            0
+        );
+
+        let server_session = session.lock().unwrap().get_server_session().clone();
+        assert_eq!(server_session.lock().unwrap().receive_request(), 0);
+        let current_request = server_session
+            .lock()
+            .unwrap()
+            .get_current_request()
+            .expect("queued request");
+        let current_request = current_request.lock().unwrap();
+        assert_eq!(current_request.get_address(), 0x2395100);
+        assert_eq!(current_request.get_size(), 0x40);
     }
 }

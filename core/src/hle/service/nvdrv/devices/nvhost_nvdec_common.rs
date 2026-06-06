@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::Mutex;
 
-use crate::hle::service::nvdrv::core::container::SessionId;
+use crate::hle::service::nvdrv::core::container::{Host1xDeviceFileData, SessionId};
 use crate::hle::service::nvdrv::core::syncpoint_manager::ChannelType;
 use crate::hle::service::nvdrv::core::{
     container::Container, nvmap::NvMap, syncpoint_manager::SyncpointManager,
@@ -111,6 +111,7 @@ pub struct NvHostNvDecCommon {
     pub channel_syncpoint: u32,
     nvmap: Arc<NvMap>,
     syncpoint_manager: Arc<SyncpointManager>,
+    host1x_device_file: Arc<Mutex<Host1xDeviceFileData>>,
     nvmap_fd: Mutex<i32>,
     submit_timeout: Mutex<u32>,
     channel_type: ChannelType,
@@ -119,12 +120,15 @@ pub struct NvHostNvDecCommon {
 
 impl NvHostNvDecCommon {
     pub fn new(system: SystemRef, container: &Container, channel_type: ChannelType) -> Self {
-        let channel_syncpoint = container.get_syncpoint_manager().allocate_syncpoint(false);
+        let channel_syncpoint = container
+            .take_accumulated_syncpoint()
+            .unwrap_or_else(|| container.get_syncpoint_manager().allocate_syncpoint(false));
         Self {
             system,
             channel_syncpoint,
             nvmap: container.get_nv_map_file_handle(),
             syncpoint_manager: container.get_syncpoint_manager_handle(),
+            host1x_device_file: container.host1x_device_file_handle(),
             nvmap_fd: Mutex::new(0),
             submit_timeout: Mutex::new(0),
             channel_type,
@@ -313,6 +317,16 @@ impl NvHostNvDecCommon {
     }
 }
 
+impl Drop for NvHostNvDecCommon {
+    fn drop(&mut self) {
+        self.host1x_device_file
+            .lock()
+            .unwrap()
+            .syncpts_accumulated
+            .push_back(self.channel_syncpoint);
+    }
+}
+
 fn read_vec<T: Copy + Default>(input: &[u8], count: usize, offset: &mut usize) -> Vec<T> {
     let mut out = vec![T::default(); count];
     let bytes = count.saturating_mul(std::mem::size_of::<T>());
@@ -454,5 +468,24 @@ pub fn ioctl1_common(
             log::error!("Unimplemented ioctl={:08X}", command.raw);
             NvResult::NotImplemented
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn nvhost_nvdec_common_reuses_recycled_syncpoint_like_upstream() {
+        let container = Container::new();
+
+        let first_syncpoint = {
+            let common = NvHostNvDecCommon::new(SystemRef::null(), &container, ChannelType::NvDec);
+            common.channel_syncpoint
+        };
+
+        let second = NvHostNvDecCommon::new(SystemRef::null(), &container, ChannelType::NvDec);
+
+        assert_eq!(second.channel_syncpoint, first_syncpoint);
     }
 }

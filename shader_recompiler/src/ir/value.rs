@@ -87,7 +87,14 @@ impl fmt::Display for Pred {
 /// - 27: PointSize
 /// - 28-31: Position X/Y/Z/W
 /// - 32-159: Generic0..31 X/Y/Z/W (32 attrs × 4 components)
-/// - 160+: Implementation-specific
+/// - 160-175: Front/back fixed-function colors
+/// - 176-183: ClipDistance0..7
+/// - 184-185: Point sprite S/T
+/// - 188-189: Tessellation evaluation point U/V
+/// - 190-191: InstanceId/VertexId
+/// - 232: ViewportMask
+/// - 255: FrontFace
+/// - 256+: Implementation-specific
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Attribute(pub u32);
 
@@ -101,8 +108,16 @@ impl Attribute {
     pub const POSITION_Z: Attribute = Attribute(30);
     pub const POSITION_W: Attribute = Attribute(31);
     pub const FRONT_COLOR_DIFFUSE_R: Attribute = Attribute(160);
+    pub const CLIP_DISTANCE_0: Attribute = Attribute(176);
+    pub const CLIP_DISTANCE_7: Attribute = Attribute(183);
+    pub const POINT_SPRITE_S: Attribute = Attribute(184);
+    pub const POINT_SPRITE_T: Attribute = Attribute(185);
+    pub const TESSELLATION_EVALUATION_POINT_U: Attribute = Attribute(188);
+    pub const TESSELLATION_EVALUATION_POINT_V: Attribute = Attribute(189);
     pub const INSTANCE_ID: Attribute = Attribute(190);
     pub const VERTEX_ID: Attribute = Attribute(191);
+    pub const VIEWPORT_MASK: Attribute = Attribute(232);
+    pub const FRONT_FACE: Attribute = Attribute(255);
     pub const BASE_INSTANCE: Attribute = Attribute(256);
     pub const BASE_VERTEX: Attribute = Attribute(257);
     pub const DRAW_ID: Attribute = Attribute(258);
@@ -146,6 +161,15 @@ impl Attribute {
         debug_assert!(self.is_position());
         self.0 - 28
     }
+
+    pub fn is_clip_distance(self) -> bool {
+        (Self::CLIP_DISTANCE_0.0..=Self::CLIP_DISTANCE_7.0).contains(&self.0)
+    }
+
+    pub fn clip_distance_index(self) -> u32 {
+        debug_assert!(self.is_clip_distance());
+        self.0 - Self::CLIP_DISTANCE_0.0
+    }
 }
 
 impl fmt::Display for Attribute {
@@ -162,8 +186,15 @@ impl fmt::Display for Attribute {
                 25 => write!(f, "Layer"),
                 26 => write!(f, "ViewportIndex"),
                 27 => write!(f, "PointSize"),
+                176..=183 => write!(f, "ClipDistance[{}]", self.0 - 176),
+                184 => write!(f, "PointSprite.S"),
+                185 => write!(f, "PointSprite.T"),
+                188 => write!(f, "TessellationEvaluationPoint.U"),
+                189 => write!(f, "TessellationEvaluationPoint.V"),
                 190 => write!(f, "InstanceId"),
                 191 => write!(f, "VertexId"),
+                232 => write!(f, "ViewportMask"),
+                255 => write!(f, "FrontFace"),
                 _ => write!(f, "Attr({})", self.0),
             }
         }
@@ -185,6 +216,20 @@ impl Patch {
     pub fn generic(index: u32, component: u32) -> Self {
         debug_assert!(component < 4);
         Patch(6 + index * 4 + component)
+    }
+
+    pub fn is_generic(self) -> bool {
+        (6..=125).contains(&self.0)
+    }
+
+    pub fn generic_index(self) -> u32 {
+        debug_assert!(self.is_generic());
+        (self.0 - 6) / 4
+    }
+
+    pub fn generic_element(self) -> u32 {
+        debug_assert!(self.is_generic());
+        (self.0 - 6) % 4
     }
 }
 
