@@ -3892,7 +3892,6 @@
 - The fallback mapping preserves any preexisting bytes already present in the underlying guest memory backing. This intentionally avoids clearing startup metadata that user mode may already have written near `stack_top` before the page-table mapping became visible.
 
 ### Unintentional differences (to fix)
-- `CreateThread` still lacks the upstream resource-limit reservation path (`KScopedResourceReservation` waiting up to 100ms) before allocating the thread object.
 - The fallback stack mapping above indicates some earlier process/user-mode stack allocation path is still structurally wrong; once that owner is fixed, this eager mapping should be removed.
 
 ### Binary layout verification
@@ -3957,16 +3956,14 @@
 ## 2026-04-01 — core/src/hle/service/am/service/library_applet_creator.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/am/service/library_applet_creator.cpp and /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/am/service/library_applet_creator.h
 
 ### Intentional differences
-- Rust still keeps `CreateTransferMemoryStorage` and `CreateHandleStorage` stubbed because this owner does not yet have a faithful `KTransferMemory handle -> LibraryAppletStorage` bridge. This is documented debt, not an accepted end state.
+- Rust resolves the copied `KTransferMemory` handle through the current request thread's process/handle table before building transfer-memory-backed storage. Upstream receives `InCopyHandle<Kernel::KTransferMemory>` directly and calls `transfer_memory_handle->GetOwner()->GetMemory()`.
 - Rust returns a real `am::IStorage` via the existing service-session path instead of upstream typed CMIF `Out<SharedPointer<IStorage>>`, preserving service ownership while adapting to the Rust IPC layer.
 
 ### Missing items
 - Port `CreateLibraryApplet`.
-- Port `CreateTransferMemoryStorage`.
-- Port `CreateHandleStorage`.
 
 ### Binary layout verification
-- PASS: `CreateStorage` only allocates a zero-initialized `Vec<u8>` of the requested size, matching the upstream `std::vector<u8>(size)` payload semantics.
+- PASS: `CreateStorage` allocates a zero-initialized `Vec<u8>` of the requested size, matching the upstream `std::vector<u8>(size)` payload semantics. `CreateTransferMemoryStorage` and `CreateHandleStorage` now route to the Rust `LibraryAppletStorage` transfer-memory backends.
 
 ## 2026-04-01 — core/src/hle/service/am/service/storage.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/am/service/storage.cpp
 
@@ -4031,12 +4028,6 @@
 
 ### Intentional differences
 - `Common::UUID` is still represented through `u128` in the shared `Interface` methods: the new `IManagerForApplication` computes the upstream account hash through `UUID::from_bytes(uuid.to_le_bytes())` to preserve the same bit pattern.
-
-### Unintentional differences (to fix)
-- `InitializeApplicationInfoBase()` still derives storage validity from Rust `romfs_factory::StorageId` values because there is not yet a dedicated upstream-aligned `FileSys::StorageId` owner file in the target tree.
-
-### Missing items
-- Port `CreateAuthorizationRequest` and `LoadNetworkServiceLicenseKindAsync`.
 
 ### Binary layout verification
 - PASS: `ApplicationInfo` now carries the full `ApplicationLaunchProperty` owner payload; `ApplicationLaunchProperty` remains `0x10`.
@@ -4447,22 +4438,12 @@
 - Rust stores `Core::System` and `Module` explicitly on `Friend`, while upstream inherits the shared module owner through `Module::Interface`. Ownership still remains in `friend_interface.rs`.
 
 ### Binary layout verification
-- PASS: IPC control-flow only; no raw guest-visible struct layout changed.
+- PASS: `CreateNotificationService` now reads `common::uuid::UUID` through the raw IPC parser, matching upstream `rp.PopRaw<Common::UUID>()`.
 
 ## 2026-04-03 — core/src/hle/service/friend/friend.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/friend/friend.cpp
 
-### Intentional differences
-- Rust currently keeps only the exercised command subset from upstream in the handler table rather than registering every null entry. The implemented methods still live in the correct owner file.
-
-### Unintentional differences (to fix)
-- still simplified: UUID parsing uses raw `u128` words instead of an upstream `Common::UUID` owner type.
-
-### Missing items
-- Full upstream null-command table coverage for `IFriendService`.
-- Destructor-parity cleanup for friend service events if later required beyond handle-table lifetime ownership.
-
 ### Binary layout verification
-- PASS: no raw struct copy was introduced on an IPC payload boundary in this pass; event/object ownership only.
+- PASS: friend-service UUID IPC fields now use `common::uuid::UUID` through `RequestParser::pop_raw`, matching upstream `Common::UUID` raw parsing. `ServiceContext` owns event-handle cleanup through `Drop`, covering upstream `CloseEvent` destructor behavior.
 
 ## 2026-04-04 — core/src/hle/kernel/k_thread.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/k_thread.cpp
 
@@ -4517,18 +4498,16 @@
 
 ### Intentional differences
 - Rust implements upstream `IAudioController` as an owner-local `ServiceFramework` with the same CMIF command IDs and handler ownership in `audio_controller.rs`; C++ uses CRTP `ServiceFramework<IAudioController>`.
-- Rust uses `service::os::Event` for `AcquireTargetNotification` because the Rust service layer already lazily bridges service events to kernel readable-event copy handles instead of exposing upstream `KernelHelpers::ServiceContext` directly.
 - Rust keeps audio-output-mode and speaker-auto-mute state locally until the concrete `set:sys` `ISystemSettingsServer` owner can be referenced through the Rust service framework. The command behavior remains success-returning and stateful for the implemented calls.
 
 ### Unintentional differences (to fix)
 - Upstream `IAudioController` obtains `m_set_sys` from `system.ServiceManager().GetService<Service::Set::ISystemSettingsServer>("set:sys", true)` and delegates `GetAudioOutputMode`, `SetAudioOutputMode`, `SetSpeakerAutoMuteEnabled`, and `IsSpeakerAutoMuteEnabled`; Rust currently stores equivalent state locally.
-- Upstream creates and closes `notification_event` through `KernelHelpers::ServiceContext`; Rust uses the existing `Event` bridge and relies on `Arc`/`Drop` lifecycle instead of explicit `CloseEvent`.
 
 ### Missing items
-- Wire `IAudioController::new` to the full system-owned `set:sys` service and `KernelHelpers::ServiceContext` equivalent once those constructors are available in the Rust service framework.
+- Wire `IAudioController::new` to the full system-owned `set:sys` service once that constructor is available in the Rust service framework.
 
 ### Binary layout verification
-- PASS: `IAudioController` responses only serialize primitive `u32`/`i32`/`bool` values and copy handles; no raw guest-visible struct payload layout changed.
+- PASS: `IAudioController` responses only serialize primitive `u32`/`i32`/`bool` values and copy handles; the notification event is now owned through `KernelHelpers::ServiceContext`, matching upstream event lifecycle.
 
 ## 2026-04-04 — audio_core/src/audio_core.rs vs /home/vricosti/Dev/emulators/zuyu/src/audio_core/audio_core.cpp
 
@@ -5798,9 +5777,6 @@
 ### Intentional differences
 - Rust keeps the SVC wrapper switch inside `svc_dispatch.rs` instead of generated wrapper functions in `svc.cpp`. This is the standing Rust dispatcher adaptation for the SVC table.
 
-### Missing items
-- Port typed `KLightClientSession` / `KLightServerSession` registries and transport so `SendSyncRequestLight` / `ReplyAndReceiveLight` can call the upstream `KLight*Session` methods instead of returning `ResultInvalidHandle` after handle lookup.
-
 ### Binary layout verification
 - PASS: no raw serialized struct layout involved in this slice.
 
@@ -6388,7 +6364,6 @@
 - Rust still returns object ids instead of raw `KClientSession*` / `KLightClientSession*` pointers because the kernel object model is still id-backed.
 
 ### Missing items
-- Port `CreateLightSession(...)` literally; the light-session path is still not implemented.
 - Port the upstream parent-pointer lifecycle (`IsLight()`, `IsServerClosed()`, `Destroy()`, `OnSessionFinalized()->NotifyAvailable()`) more literally once `KClientPort` regains a parent owner reference.
 
 ### Binary layout verification
@@ -6410,13 +6385,12 @@
 ## 2026-04-11 — `core/src/hle/kernel/svc/svc_port.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/svc/svc_port.cpp`
 
 ### Intentional differences
-- `ConnectToPort(...)` currently rejects light ports because `KLightSession` / `KClientPort::CreateLightSession(...)` are not yet ported.
+- `ConnectToPort(...)` now routes light ports through `KClientPort::CreateLightSession(...)`, but the Rust path still returns object ids and stores pending light sessions in typed process registries rather than upstream raw `KLightClientSession*` / intrusive server-port lists.
 - `ConnectToNamedPort(...)` now resolves the named client-port object id through `KObjectName`, then uses a Rust `KernelCore` helper to find the owning `KPort` in the kernel process registries. This is still less literal than upstream `KObjectName::Find<KClientPort>(kernel, name)` because Rust does not yet expose a typed global auto-object lookup.
 
 ### Missing items
 - Rewire `ConnectToNamedPort(...)` to the literal upstream `KObjectName::Find<KClientPort>` typed auto-object lookup once Rust has a global typed kernel-object graph instead of process-registry scans.
 - Port the `ManageNamedPort(max_sessions == 0)` close/delete lifecycle more literally across all owning processes; the current delete path only unregisters the current process's client-port object if present.
-- Port the light-port/light-session path.
 
 ### Binary layout verification
 - PASS: SVC ABI unchanged; only kernel object creation/registration semantics changed.
@@ -6484,8 +6458,7 @@
 - Rust still does not implement upstream handle-table `Reserve/Unreserve/Register` literally; it uses direct `handle_table.add(object_id)` registration through the existing Rust handle table.
 
 ### Missing items
-- `CreateSession` still uses synthetic object id allocation instead of the literal upstream typed object creation/registration flow.
-- The light-session path is still not ported through real `KLightServerSession` / `KLightClientSession` object registries.
+- `CreateSession` still stores the created session endpoints through Rust process registries instead of the literal upstream `T::Create(...)` / `T::Register(...)` auto-object flow.
 
 ### Binary layout verification
 - PASS: SVC ABI unchanged; only kernel object resolution/registration semantics changed.

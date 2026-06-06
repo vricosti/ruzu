@@ -8,6 +8,7 @@ use std::hash::{Hash, Hasher};
 
 /// A 128-bit UUID matching the Switch/zuyu UUID type.
 #[derive(Clone, Copy, PartialEq, Eq)]
+#[repr(C)]
 pub struct UUID {
     pub uuid: [u8; 16],
 }

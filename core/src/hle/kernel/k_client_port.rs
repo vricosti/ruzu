@@ -10,6 +10,9 @@
 
 use std::sync::atomic::{AtomicI32, Ordering};
 
+use super::k_light_client_session::KLightClientSession;
+use super::k_light_server_session::KLightServerSession;
+use super::k_light_session::KLightSession;
 use super::k_process::KProcess;
 use super::k_process::ProcessLock;
 use super::k_resource_limit::LimitableResource;
@@ -177,6 +180,104 @@ impl KClientPort {
         Ok((session_object_id, client_session_object_id))
     }
 
+    /// Create a new light session via this client port.
+    /// Port of upstream `KClientPort::CreateLightSession`.
+    ///
+    /// The Rust kernel object table is id-based, so this returns the parent
+    /// light-session id, server endpoint id, and client endpoint id. The caller
+    /// still enqueues the returned server endpoint on the parent port.
+    pub fn create_light_session(
+        &self,
+        process: &mut KProcess,
+        kernel: &KernelCore,
+        port_name: usize,
+    ) -> Result<(u64, u64, u64), ResultCode> {
+        let mut session_reservation = KScopedResourceReservation::new(
+            process.resource_limit.clone(),
+            LimitableResource::SessionCountMax,
+            1,
+        );
+        if !session_reservation.succeeded() {
+            return Err(RESULT_LIMIT_REACHED);
+        }
+
+        let max = self.max_sessions;
+        let new_sessions = loop {
+            let cur_sessions = self.num_sessions.load(Ordering::Acquire);
+            if cur_sessions >= max {
+                return Err(RESULT_OUT_OF_SESSIONS);
+            }
+            let new_sessions = cur_sessions + 1;
+            if self
+                .num_sessions
+                .compare_exchange_weak(
+                    cur_sessions,
+                    new_sessions,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                )
+                .is_ok()
+            {
+                break new_sessions;
+            }
+        };
+
+        loop {
+            let peak = self.peak_sessions.load(Ordering::Acquire);
+            if peak >= new_sessions {
+                break;
+            }
+            if self
+                .peak_sessions
+                .compare_exchange_weak(peak, new_sessions, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+            {
+                break;
+            }
+        }
+
+        let light_session_object_id = kernel.create_new_object_id() as u64;
+        let server_session_object_id = kernel.create_new_object_id() as u64;
+        let client_session_object_id = kernel.create_new_object_id() as u64;
+
+        let light_session = std::sync::Arc::new(std::sync::Mutex::new(KLightSession::new()));
+        let light_server_session =
+            std::sync::Arc::new(std::sync::Mutex::new(KLightServerSession::new()));
+        let light_client_session =
+            std::sync::Arc::new(std::sync::Mutex::new(KLightClientSession::new()));
+
+        {
+            light_session.lock().unwrap().initialize_with_endpoints(
+                None,
+                port_name,
+                server_session_object_id,
+                client_session_object_id,
+                Some(process.process_id),
+            );
+            light_server_session
+                .lock()
+                .unwrap()
+                .initialize(light_session_object_id);
+            light_client_session
+                .lock()
+                .unwrap()
+                .initialize(light_session_object_id);
+        }
+
+        process.register_light_session_object(light_session_object_id, light_session);
+        process
+            .register_light_server_session_object(server_session_object_id, light_server_session);
+        process
+            .register_light_client_session_object(client_session_object_id, light_client_session);
+
+        session_reservation.commit();
+        Ok((
+            light_session_object_id,
+            server_session_object_id,
+            client_session_object_id,
+        ))
+    }
+
     /// Destroy the client port.
     /// Port of upstream `KClientPort::Destroy`.
     pub fn destroy(&mut self) {
@@ -222,6 +323,38 @@ mod tests {
             .is_some());
         assert!(process_guard
             .get_client_session_by_object_id(client_session_object_id)
+            .is_some());
+    }
+
+    #[test]
+    fn create_light_session_allocates_and_registers_light_endpoint_objects() {
+        let mut system = System::new_for_test();
+        let process = std::sync::Arc::new(ProcessLock::from_value(KProcess::new()));
+        {
+            let mut process_guard = process.lock().unwrap();
+            process_guard.process_id = 1;
+            process_guard.initialize_handle_table();
+        }
+        system.set_current_process_arc(process.clone());
+
+        let kernel = system.kernel().unwrap();
+        let mut port = KPort::new();
+        port.initialize(4, true, 0x55);
+
+        let (light_session_object_id, server_session_object_id, client_session_object_id) = port
+            .client
+            .create_light_session(&mut process.lock().unwrap(), kernel, port.get_name())
+            .unwrap();
+
+        let process_guard = process.lock().unwrap();
+        assert!(process_guard
+            .light_session_objects
+            .contains_key(&light_session_object_id));
+        assert!(process_guard
+            .get_light_server_session_by_object_id(server_session_object_id)
+            .is_some());
+        assert!(process_guard
+            .get_light_client_session_by_object_id(client_session_object_id)
             .is_some());
     }
 }

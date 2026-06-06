@@ -3,12 +3,12 @@
 //! IAudioController service ("audctl").
 
 use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 use crate::hle::service::cmif_serialization::{CmifRequest, CmifResponse};
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
-use crate::hle::service::os::event::Event;
+use crate::hle::service::kernel_helpers::ServiceContext;
 use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
 
 /// Port of IAudioController::ForceMutePolicy
@@ -174,9 +174,10 @@ pub struct IAudioController {
     //     system.ServiceManager().GetService<Service::Set::ISystemSettingsServer>("set:sys", true).
     //
     // The Rust service framework does not yet expose upstream's concrete
-    // KernelHelpers::ServiceContext / set:sys service owner here, so the event
-    // and settings state are represented with owner-local Rust equivalents.
-    notification_event: Arc<Event>,
+    // set:sys service owner here, so settings state is represented with an
+    // owner-local Rust equivalent.
+    service_context: ServiceContext,
+    notification_event_handle: u32,
     audio_output_modes: Mutex<AudioOutputModeState>,
     speaker_auto_mute_enabled: Mutex<bool>,
     handlers: BTreeMap<u32, FunctionInfo>,
@@ -318,8 +319,13 @@ impl IAudioController {
             (50000, None, "SetAnalogInputBoostGainForPrototyping"),
         ]);
 
+        let mut service_context = ServiceContext::new("audctl".to_string());
+        let notification_event_handle =
+            service_context.create_event("IAudioController:NotificationEvent".to_string());
+
         Self {
-            notification_event: Arc::new(Event::new()),
+            service_context,
+            notification_event_handle,
             audio_output_modes: Mutex::new(AudioOutputModeState::default()),
             speaker_auto_mute_enabled: Mutex::new(false),
             handlers,
@@ -525,7 +531,11 @@ impl IAudioController {
     ) {
         let service = Self::as_self(this);
         log::warn!("IAudioController::AcquireTargetNotification (STUBBED)");
-        let handle = service.notification_event.copy_handle(ctx).unwrap_or(0);
+        let handle = service
+            .service_context
+            .get_event(service.notification_event_handle)
+            .and_then(|event| event.copy_handle(ctx))
+            .unwrap_or(0);
         let mut response = CmifResponse::new(ctx, 2, 1, 0);
         response.push_result(RESULT_SUCCESS);
         response.push_copy_objects(handle);

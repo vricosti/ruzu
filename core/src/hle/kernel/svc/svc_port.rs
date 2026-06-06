@@ -280,6 +280,60 @@ pub fn create_port(
 pub fn connect_to_port(system: &System, out: &mut Handle, port: Handle) -> ResultCode {
     log::debug!("svc::ConnectToPort called, port_handle=0x{:08X}", port);
 
+    enum CreatedPortSession {
+        Normal {
+            session_object_id: u64,
+            client_session_object_id: u64,
+        },
+        Light {
+            light_session_object_id: u64,
+            server_session_object_id: u64,
+            client_session_object_id: u64,
+        },
+    }
+
+    impl CreatedPortSession {
+        fn client_session_object_id(&self) -> u64 {
+            match *self {
+                Self::Normal {
+                    client_session_object_id,
+                    ..
+                }
+                | Self::Light {
+                    client_session_object_id,
+                    ..
+                } => client_session_object_id,
+            }
+        }
+
+        fn cleanup(self, process: &mut crate::hle::kernel::k_process::KProcess) {
+            match self {
+                Self::Normal {
+                    session_object_id,
+                    client_session_object_id,
+                } => {
+                    process.unregister_client_session_object_by_object_id(client_session_object_id);
+                    process.unregister_session_object_by_object_id(session_object_id);
+                }
+                Self::Light {
+                    light_session_object_id,
+                    server_session_object_id,
+                    client_session_object_id,
+                } => {
+                    process
+                        .light_client_session_objects
+                        .remove(&client_session_object_id);
+                    process
+                        .light_server_session_objects
+                        .remove(&server_session_object_id);
+                    process
+                        .light_session_objects
+                        .remove(&light_session_object_id);
+                }
+            }
+        }
+    }
+
     let kernel = system.kernel().expect("kernel not initialized");
     let mut process = system.current_process_arc().lock().unwrap();
     let Some(object_id) = process.handle_table.get_object(port) else {
@@ -295,17 +349,45 @@ pub fn connect_to_port(system: &System, out: &mut Handle, port: Handle) -> Resul
         Err(_) => return RESULT_OUT_OF_HANDLES,
     };
 
-    let (session_object_id, client_session_object_id) = {
+    let created_session = {
         let mut port_guard = port.lock().unwrap();
         if port_guard.is_light() {
-            process.handle_table.unreserve(reserved_handle);
-            log::warn!("svc::ConnectToPort: light-session path not yet ported");
-            return RESULT_INVALID_HANDLE;
-        }
+            let port_name = port_guard.get_name();
+            let (light_session_object_id, server_session_object_id, client_session_object_id) =
+                match port_guard
+                    .client
+                    .create_light_session(&mut process, kernel, port_name)
+                {
+                    Ok(ids) => ids,
+                    Err(result) => {
+                        process.handle_table.unreserve(reserved_handle);
+                        return result;
+                    }
+                };
 
-        let port_name = port_guard.get_name();
-        let (session_object_id, client_session_object_id) =
-            match port_guard
+            let enqueue_result = port_guard.enqueue_light_session(server_session_object_id);
+            if enqueue_result.is_error() {
+                process.handle_table.unreserve(reserved_handle);
+                process
+                    .light_client_session_objects
+                    .remove(&client_session_object_id);
+                process
+                    .light_server_session_objects
+                    .remove(&server_session_object_id);
+                process
+                    .light_session_objects
+                    .remove(&light_session_object_id);
+                return enqueue_result;
+            }
+
+            CreatedPortSession::Light {
+                light_session_object_id,
+                server_session_object_id,
+                client_session_object_id,
+            }
+        } else {
+            let port_name = port_guard.get_name();
+            let (session_object_id, client_session_object_id) = match port_guard
                 .client
                 .create_session(&mut process, kernel, port_name)
             {
@@ -316,24 +398,27 @@ pub fn connect_to_port(system: &System, out: &mut Handle, port: Handle) -> Resul
                 }
             };
 
-        let enqueue_result = port_guard.enqueue_session(session_object_id);
-        if enqueue_result.is_error() {
-            process.handle_table.unreserve(reserved_handle);
-            process.unregister_client_session_object_by_object_id(client_session_object_id);
-            process.unregister_session_object_by_object_id(session_object_id);
-            return enqueue_result;
-        }
+            let enqueue_result = port_guard.enqueue_session(session_object_id);
+            if enqueue_result.is_error() {
+                process.handle_table.unreserve(reserved_handle);
+                process.unregister_client_session_object_by_object_id(client_session_object_id);
+                process.unregister_session_object_by_object_id(session_object_id);
+                return enqueue_result;
+            }
 
-        (session_object_id, client_session_object_id)
+            CreatedPortSession::Normal {
+                session_object_id,
+                client_session_object_id,
+            }
+        }
     };
 
     if !process
         .handle_table
-        .register(reserved_handle, client_session_object_id)
+        .register(reserved_handle, created_session.client_session_object_id())
     {
         process.handle_table.unreserve(reserved_handle);
-        process.unregister_client_session_object_by_object_id(client_session_object_id);
-        process.unregister_session_object_by_object_id(session_object_id);
+        created_session.cleanup(&mut process);
         return RESULT_OUT_OF_HANDLES;
     }
 
@@ -530,6 +615,44 @@ mod tests {
             port.lock().unwrap().server.accept_session(),
             Some(server_session_object_id)
         );
+    }
+
+    #[test]
+    fn connect_to_port_creates_light_client_session_for_light_port() {
+        let system = test_system();
+        let mut server = 0;
+        let mut client = 0;
+
+        assert_eq!(
+            create_port(&system, &mut server, &mut client, 4, true, 0x56),
+            RESULT_SUCCESS
+        );
+
+        let mut session_handle = 0;
+        assert_eq!(
+            connect_to_port(&system, &mut session_handle, client),
+            RESULT_SUCCESS
+        );
+
+        let process = system.current_process_arc().lock().unwrap();
+        let client_session_object_id = process.handle_table.get_object(session_handle).unwrap();
+        assert!(process
+            .get_light_client_session_by_object_id(client_session_object_id)
+            .is_some());
+
+        let server_port_object_id = process.handle_table.get_object(server).unwrap();
+        let port = process
+            .get_server_port_by_object_id(server_port_object_id)
+            .unwrap();
+        let server_session_object_id = port
+            .lock()
+            .unwrap()
+            .server
+            .accept_light_session()
+            .expect("light server session must be enqueued");
+        assert!(process
+            .get_light_server_session_by_object_id(server_session_object_id)
+            .is_some());
     }
 
     #[test]

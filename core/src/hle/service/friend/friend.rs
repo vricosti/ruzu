@@ -10,13 +10,15 @@ use std::collections::BTreeMap;
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
+use common::uuid::UUID;
+
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 use crate::hle::service::acc::errors::RESULT_NO_NOTIFICATIONS;
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
 use crate::hle::service::ipc_helpers::{RequestParser, ResponseBuilder};
 use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
 
-/// IPC command IDs for IFriendService (selected implemented commands)
+/// IPC command IDs for IFriendService handlers implemented in Rust.
 pub mod friend_service_commands {
     pub const GET_COMPLETION_EVENT: u32 = 0;
     pub const CANCEL: u32 = 1;
@@ -111,16 +113,23 @@ impl IFriendService {
                     Some(Self::get_completion_event_handler),
                     "GetCompletionEvent",
                 ),
+                (friend_service_commands::CANCEL, None, "Cancel"),
+                (10100, None, "GetFriendListIds"),
                 (
                     friend_service_commands::GET_FRIEND_LIST,
                     Some(Self::get_friend_list_handler),
                     "GetFriendList",
                 ),
+                (10102, None, "UpdateFriendInfo"),
+                (10110, None, "GetFriendProfileImage"),
                 (
                     friend_service_commands::CHECK_FRIEND_LIST_AVAILABILITY,
                     Some(Self::check_friend_list_availability_handler),
                     "CheckFriendListAvailability",
                 ),
+                (10121, None, "EnsureFriendListAvailable"),
+                (10200, None, "SendFriendRequestForApplication"),
+                (10211, None, "AddFacedFriendRequestForApplication"),
                 (
                     friend_service_commands::GET_BLOCKED_USER_LIST_IDS,
                     Some(Self::get_blocked_user_list_ids_handler),
@@ -131,6 +140,9 @@ impl IFriendService {
                     Some(Self::check_blocked_user_list_availability_handler),
                     "CheckBlockedUserListAvailability",
                 ),
+                (10421, None, "EnsureBlockedUserListAvailable"),
+                (10500, None, "GetProfileList"),
+                (10600, None, "DeclareOpenOnlinePlaySession"),
                 (
                     friend_service_commands::DECLARE_CLOSE_ONLINE_PLAY_SESSION,
                     Some(Self::declare_close_online_play_session_handler),
@@ -147,6 +159,13 @@ impl IFriendService {
                     "GetPlayHistoryRegistrationKey",
                 ),
                 (
+                    10701,
+                    None,
+                    "GetPlayHistoryRegistrationKeyWithNetworkServiceAccountId",
+                ),
+                (10702, None, "AddPlayHistory"),
+                (11000, None, "GetProfileImageUrl"),
+                (
                     friend_service_commands::GET_FRIEND_COUNT,
                     Some(Self::get_friend_count_handler),
                     "GetFriendCount",
@@ -156,21 +175,84 @@ impl IFriendService {
                     Some(Self::get_newly_friend_count_handler),
                     "GetNewlyFriendCount",
                 ),
+                (20102, None, "GetFriendDetailedInfo"),
+                (20103, None, "SyncFriendList"),
+                (20104, None, "RequestSyncFriendList"),
+                (20110, None, "LoadFriendSetting"),
                 (
                     friend_service_commands::GET_RECEIVED_FRIEND_REQUEST_COUNT,
                     Some(Self::get_received_friend_request_count_handler),
                     "GetReceivedFriendRequestCount",
                 ),
+                (20201, None, "GetFriendRequestList"),
+                (20300, None, "GetFriendCandidateList"),
+                (20301, None, "GetNintendoNetworkIdInfo"),
+                (20302, None, "GetSnsAccountLinkage"),
+                (20303, None, "GetSnsAccountProfile"),
+                (20304, None, "GetSnsAccountFriendList"),
+                (20400, None, "GetBlockedUserList"),
+                (20401, None, "SyncBlockedUserList"),
+                (20500, None, "GetProfileExtraList"),
+                (20501, None, "GetRelationship"),
+                (20600, None, "GetUserPresenceView"),
+                (20700, None, "GetPlayHistoryList"),
                 (
                     friend_service_commands::GET_PLAY_HISTORY_STATISTICS,
                     Some(Self::get_play_history_statistics_handler),
                     "GetPlayHistoryStatistics",
                 ),
+                (20800, None, "LoadUserSetting"),
+                (20801, None, "SyncUserSetting"),
+                (20900, None, "RequestListSummaryOverlayNotification"),
+                (21000, None, "GetExternalApplicationCatalog"),
+                (22000, None, "GetReceivedFriendInvitationList"),
+                (22001, None, "GetReceivedFriendInvitationDetailedInfo"),
                 (
                     friend_service_commands::GET_RECEIVED_FRIEND_INVITATION_COUNT_CACHE,
                     Some(Self::get_received_friend_invitation_count_cache_handler),
                     "GetReceivedFriendInvitationCountCache",
                 ),
+                (30100, None, "DropFriendNewlyFlags"),
+                (30101, None, "DeleteFriend"),
+                (30110, None, "DropFriendNewlyFlag"),
+                (30120, None, "ChangeFriendFavoriteFlag"),
+                (30121, None, "ChangeFriendOnlineNotificationFlag"),
+                (30200, None, "SendFriendRequest"),
+                (30201, None, "SendFriendRequestWithApplicationInfo"),
+                (30202, None, "CancelFriendRequest"),
+                (30203, None, "AcceptFriendRequest"),
+                (30204, None, "RejectFriendRequest"),
+                (30205, None, "ReadFriendRequest"),
+                (30210, None, "GetFacedFriendRequestRegistrationKey"),
+                (30211, None, "AddFacedFriendRequest"),
+                (30212, None, "CancelFacedFriendRequest"),
+                (30213, None, "GetFacedFriendRequestProfileImage"),
+                (30214, None, "GetFacedFriendRequestProfileImageFromPath"),
+                (
+                    30215,
+                    None,
+                    "SendFriendRequestWithExternalApplicationCatalogId",
+                ),
+                (30216, None, "ResendFacedFriendRequest"),
+                (30217, None, "SendFriendRequestWithNintendoNetworkIdInfo"),
+                (30300, None, "GetSnsAccountLinkPageUrl"),
+                (30301, None, "UnlinkSnsAccount"),
+                (30400, None, "BlockUser"),
+                (30401, None, "BlockUserWithApplicationInfo"),
+                (30402, None, "UnblockUser"),
+                (30500, None, "GetProfileExtraFromFriendCode"),
+                (30700, None, "DeletePlayHistory"),
+                (30810, None, "ChangePresencePermission"),
+                (30811, None, "ChangeFriendRequestReception"),
+                (30812, None, "ChangePlayLogPermission"),
+                (30820, None, "IssueFriendCode"),
+                (30830, None, "ClearPlayLog"),
+                (30900, None, "SendFriendInvitation"),
+                (30910, None, "ReadFriendInvitation"),
+                (30911, None, "ReadAllFriendInvitations"),
+                (40100, None, "DeleteFriendListCache"),
+                (40400, None, "DeleteBlockedUserListCache"),
+                (49900, None, "DeleteNetworkServiceAccountCache"),
             ]),
             handlers_tipc: BTreeMap::new(),
             service_context,
@@ -187,12 +269,12 @@ impl IFriendService {
         self.completion_event_handle
     }
 
-    pub fn get_friend_list(&self, _friend_offset: u32, _uuid: u128, _pid: u64) -> u32 {
+    pub fn get_friend_list(&self, _friend_offset: u32, _uuid: UUID, _pid: u64) -> u32 {
         log::warn!("(STUBBED) IFriendService::get_friend_list called");
         0 // friend count
     }
 
-    pub fn check_friend_list_availability(&self, _uuid: u128) -> bool {
+    pub fn check_friend_list_availability(&self, _uuid: UUID) -> bool {
         log::warn!("(STUBBED) IFriendService::check_friend_list_availability called");
         true
     }
@@ -202,7 +284,7 @@ impl IFriendService {
         0
     }
 
-    pub fn check_blocked_user_list_availability(&self, _uuid: u128) -> bool {
+    pub fn check_blocked_user_list_availability(&self, _uuid: UUID) -> bool {
         log::warn!("(STUBBED) IFriendService::check_blocked_user_list_availability called");
         true
     }
@@ -215,7 +297,7 @@ impl IFriendService {
         log::warn!("(STUBBED) IFriendService::update_user_presence called");
     }
 
-    pub fn get_play_history_registration_key(&self, _local_play: bool, _uuid: u128) {
+    pub fn get_play_history_registration_key(&self, _local_play: bool, _uuid: UUID) {
         log::warn!("(STUBBED) IFriendService::get_play_history_registration_key called");
     }
 
@@ -254,7 +336,7 @@ impl IFriendService {
         let this = Self::cast(this);
         let mut rp = RequestParser::new(ctx);
         let friend_offset = rp.pop_u32();
-        let uuid = rp.pop_u64() as u128 | ((rp.pop_u64() as u128) << 64);
+        let uuid = rp.pop_raw::<UUID>();
         rp.skip((core::mem::size_of::<SizedFriendFilter>() + 3) / 4);
         let pid = rp.pop_u64();
 
@@ -270,7 +352,7 @@ impl IFriendService {
     ) {
         let this = Self::cast(this);
         let mut rp = RequestParser::new(ctx);
-        let uuid = rp.pop_u64() as u128 | ((rp.pop_u64() as u128) << 64);
+        let uuid = rp.pop_raw::<UUID>();
         let available = this.check_friend_list_availability(uuid);
         let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
         rb.push_result(RESULT_SUCCESS);
@@ -291,7 +373,7 @@ impl IFriendService {
     ) {
         let this = Self::cast(this);
         let mut rp = RequestParser::new(ctx);
-        let uuid = rp.pop_u64() as u128 | ((rp.pop_u64() as u128) << 64);
+        let uuid = rp.pop_raw::<UUID>();
         let available = this.check_blocked_user_list_availability(uuid);
         let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
         rb.push_result(RESULT_SUCCESS);
@@ -320,7 +402,7 @@ impl IFriendService {
         let this = Self::cast(this);
         let mut rp = RequestParser::new(ctx);
         let local_play = rp.pop_bool();
-        let uuid = rp.pop_u64() as u128 | ((rp.pop_u64() as u128) << 64);
+        let uuid = rp.pop_raw::<UUID>();
         this.get_play_history_registration_key(local_play, uuid);
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
@@ -398,7 +480,7 @@ impl ServiceFramework for IFriendService {
 pub struct INotificationService {
     handlers: BTreeMap<u32, FunctionInfo>,
     handlers_tipc: BTreeMap<u32, FunctionInfo>,
-    uuid: u128,
+    uuid: UUID,
     notifications: Mutex<VecDeque<SizedNotificationInfo>>,
     states: Mutex<NotificationStates>,
     service_context: crate::hle::service::kernel_helpers::ServiceContext,
@@ -411,7 +493,7 @@ struct NotificationStates {
 }
 
 impl INotificationService {
-    pub fn new(uuid: u128) -> Self {
+    pub fn new(uuid: UUID) -> Self {
         let mut service_context = crate::hle::service::kernel_helpers::ServiceContext::new(
             "INotificationService".to_string(),
         );
