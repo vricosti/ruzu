@@ -728,7 +728,7 @@ impl ComparisonOp {
             7 | 0x206 => Self::GreaterEqual,
             8 | 0x207 => Self::Always,
             _ => {
-                log::warn!(
+                log::trace!(
                     "Maxwell3D: unknown ComparisonOp 0x{:X}, defaulting to Always",
                     value
                 );

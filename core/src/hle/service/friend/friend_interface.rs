@@ -9,6 +9,8 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use common::uuid::UUID;
+
 use super::friend::Module;
 use crate::hle::result::ResultCode;
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
@@ -69,11 +71,11 @@ impl Friend {
     }
 
     /// CreateNotificationService (cmd 1)
-    pub fn create_notification_service(&self, uuid: u128) -> super::friend::INotificationService {
+    pub fn create_notification_service(&self, uuid: UUID) -> super::friend::INotificationService {
         log::debug!(
-            "Friend({})::create_notification_service called, uuid={:#x}",
+            "Friend({})::create_notification_service called, uuid=0x{}",
             self.name,
-            uuid
+            uuid.raw_string()
         );
         super::friend::INotificationService::new(uuid)
     }
@@ -104,7 +106,7 @@ impl Friend {
     ) {
         let this = Self::cast(this);
         let mut rp = RequestParser::new(ctx);
-        let uuid = rp.pop_u64() as u128 | ((rp.pop_u64() as u128) << 64);
+        let uuid = rp.pop_raw::<UUID>();
         let service: Arc<dyn SessionRequestHandler> =
             Arc::new(this.create_notification_service(uuid));
         Self::push_interface_response(ctx, service);

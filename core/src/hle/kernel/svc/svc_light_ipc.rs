@@ -34,27 +34,18 @@ pub fn send_sync_request_light(
 
     // Get the light client session from its handle.
     // Upstream: GetCurrentProcess(kernel).GetHandleTable().GetObject<KLightClientSession>(session_handle)
-    let mut process = system.current_process_arc().lock().unwrap();
+    let process = system.current_process_arc().lock().unwrap();
     let Some(object_id) = process.handle_table.get_object(session_handle) else {
         return RESULT_INVALID_HANDLE;
     };
 
-    // Upstream needs: process.get_light_client_session_by_object_id(object_id)
-    // This typed object registry does not yet exist on KProcess.
-    // Once added, the call would be:
-    //   let Some(session) = process.get_light_client_session_by_object_id(object_id) else {
-    //       return RESULT_INVALID_HANDLE;
-    //   };
-    //   let result = session.lock().unwrap().send_sync_request(args);
-    //   ResultCode::new(result)
+    let Some(session) = process.get_light_client_session_by_object_id(object_id) else {
+        return RESULT_INVALID_HANDLE;
+    };
+    drop(process);
 
-    log::warn!(
-        "svc::SendSyncRequestLight: KProcess lacks light_client_session registry \
-         (needs get_light_client_session_by_object_id for object_id={}). \
-         Upstream type: KLightClientSession, method: SendSyncRequest(&mut [u32])",
-        object_id
-    );
-    RESULT_INVALID_HANDLE
+    let result = session.lock().unwrap().send_sync_request(args);
+    ResultCode::new(result)
 }
 
 /// Replies and receives on a light session.
@@ -72,27 +63,18 @@ pub fn reply_and_receive_light(
 
     // Get the light server session from its handle.
     // Upstream: GetCurrentProcess(kernel).GetHandleTable().GetObject<KLightServerSession>(session_handle)
-    let mut process = system.current_process_arc().lock().unwrap();
+    let process = system.current_process_arc().lock().unwrap();
     let Some(object_id) = process.handle_table.get_object(session_handle) else {
         return RESULT_INVALID_HANDLE;
     };
 
-    // Upstream needs: process.get_light_server_session_by_object_id(object_id)
-    // This typed object registry does not yet exist on KProcess.
-    // Once added, the call would be:
-    //   let Some(session) = process.get_light_server_session_by_object_id(object_id) else {
-    //       return RESULT_INVALID_HANDLE;
-    //   };
-    //   let result = session.lock().unwrap().reply_and_receive(args);
-    //   ResultCode::new(result)
+    let Some(session) = process.get_light_server_session_by_object_id(object_id) else {
+        return RESULT_INVALID_HANDLE;
+    };
+    drop(process);
 
-    log::warn!(
-        "svc::ReplyAndReceiveLight: KProcess lacks light_server_session registry \
-         (needs get_light_server_session_by_object_id for object_id={}). \
-         Upstream type: KLightServerSession, method: ReplyAndReceive(&mut [u32])",
-        object_id
-    );
-    RESULT_INVALID_HANDLE
+    let result = session.lock().unwrap().reply_and_receive(args);
+    ResultCode::new(result)
 }
 
 /// Custom ABI wrapper for light IPC send.

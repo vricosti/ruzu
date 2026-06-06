@@ -531,6 +531,11 @@ pub struct KProcess {
     pub session_objects: BTreeMap<u64, Arc<Mutex<KSession>>>,
     pub client_session_objects: BTreeMap<u64, Arc<Mutex<KClientSession>>>,
     pub client_session_parent_ids: BTreeMap<u64, u64>,
+    pub light_session_objects: BTreeMap<u64, Arc<Mutex<super::k_light_session::KLightSession>>>,
+    pub light_client_session_objects:
+        BTreeMap<u64, Arc<Mutex<super::k_light_client_session::KLightClientSession>>>,
+    pub light_server_session_objects:
+        BTreeMap<u64, Arc<Mutex<super::k_light_server_session::KLightServerSession>>>,
     pub client_port_objects: BTreeMap<u64, Arc<Mutex<KPort>>>,
     pub server_port_objects: BTreeMap<u64, Arc<Mutex<KPort>>>,
     pub event_objects: BTreeMap<u64, Arc<Mutex<KEvent>>>,
@@ -658,6 +663,9 @@ impl KProcess {
             session_objects: BTreeMap::new(),
             client_session_objects: BTreeMap::new(),
             client_session_parent_ids: BTreeMap::new(),
+            light_session_objects: BTreeMap::new(),
+            light_client_session_objects: BTreeMap::new(),
+            light_server_session_objects: BTreeMap::new(),
             client_port_objects: BTreeMap::new(),
             server_port_objects: BTreeMap::new(),
             event_objects: BTreeMap::new(),
@@ -2670,6 +2678,9 @@ impl KProcess {
         self.session_objects.clear();
         self.client_session_objects.clear();
         self.client_session_parent_ids.clear();
+        self.light_session_objects.clear();
+        self.light_client_session_objects.clear();
+        self.light_server_session_objects.clear();
         self.client_port_objects.clear();
         self.server_port_objects.clear();
         self.event_objects.clear();
@@ -2921,6 +2932,46 @@ impl KProcess {
         object_id: u64,
     ) -> Option<Arc<Mutex<super::k_transfer_memory::KTransferMemory>>> {
         self.transfer_memory_objects.get(&object_id).cloned()
+    }
+
+    pub fn register_light_session_object(
+        &mut self,
+        object_id: u64,
+        light_session: Arc<Mutex<super::k_light_session::KLightSession>>,
+    ) {
+        self.light_session_objects.insert(object_id, light_session);
+    }
+
+    pub fn register_light_client_session_object(
+        &mut self,
+        object_id: u64,
+        light_client_session: Arc<Mutex<super::k_light_client_session::KLightClientSession>>,
+    ) {
+        self.light_client_session_objects
+            .insert(object_id, light_client_session);
+    }
+
+    pub fn register_light_server_session_object(
+        &mut self,
+        object_id: u64,
+        light_server_session: Arc<Mutex<super::k_light_server_session::KLightServerSession>>,
+    ) {
+        self.light_server_session_objects
+            .insert(object_id, light_server_session);
+    }
+
+    pub fn get_light_client_session_by_object_id(
+        &self,
+        object_id: u64,
+    ) -> Option<Arc<Mutex<super::k_light_client_session::KLightClientSession>>> {
+        self.light_client_session_objects.get(&object_id).cloned()
+    }
+
+    pub fn get_light_server_session_by_object_id(
+        &self,
+        object_id: u64,
+    ) -> Option<Arc<Mutex<super::k_light_server_session::KLightServerSession>>> {
+        self.light_server_session_objects.get(&object_id).cloned()
     }
 
     /// Remove a handle and release any Rust-side owner registry entry that no
