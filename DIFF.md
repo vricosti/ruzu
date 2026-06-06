@@ -2505,14 +2505,6 @@
 ### Binary layout verification
 - PASS: `ChannelState` guest-invisible layout unchanged; only owner-local constructor wiring changed.
 
-## 2026-03-29 — `video_core/src/engines/fermi_2d.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/engines/fermi_2d.{h,cpp}`
-
-### Intentional differences
-- Rust still uses a simplified software blit path in this owner file instead of the upstream `SoftwareBlitEngine` + accelerated copy flow.
-
-### Binary layout verification
-- PASS: no guest-visible binary layout in this owner file.
-
 ## 2026-03-30 — video_core/src/renderer_opengl/gl_rasterizer.rs vs video_core/renderer_opengl/gl_rasterizer.cpp
 
 ### Intentional differences
@@ -2955,9 +2947,6 @@
 
 ## 2026-03-29 — video_core/src/engines/fermi_2d.rs vs video_core/engines/fermi_2d.cpp
 
-### Intentional differences
-- simplified software blit backend remains compared to upstream accelerated paths.
-
 ### Unintentional differences (to fix)
 - `Fermi2D` backend behavior is still heavily simplified beyond the `EngineInterface` ownership slice.
 
@@ -2970,7 +2959,6 @@
 ## 2026-04-30 — `video_core/src/engines/fermi_2d.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/engines/fermi_2d.h` and `/home/vricosti/Dev/emulators/zuyu/src/video_core/engines/fermi_2d.cpp` (CallMethod owner follow-up)
 
 ### Intentional differences
-- Rust still keeps a simplified software blit backend in this owner file instead of the upstream `SoftwareBlitEngine` plus `AccelerateSurfaceCopy(...)` path.
 - Rust still adapts the upstream rasterizer edge through a stored trait-object handle rather than a literal `RasterizerInterface*` owner field.
 
 ### Missing items
@@ -2982,7 +2970,6 @@
 ## 2026-04-30 — `video_core/src/engines/fermi_2d.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/engines/fermi_2d.h` and `/home/vricosti/Dev/emulators/zuyu/src/video_core/engines/fermi_2d.cpp` (CallMultiMethod last-call follow-up)
 
 ### Intentional differences
-- Rust still uses a simplified software blit backend in this owner file instead of the upstream `SoftwareBlitEngine` plus accelerated surface-copy path.
 - The regression for `is_last_call` propagation uses a `#[cfg(test)]` owner-local trace vector because `Fermi2D` does not otherwise expose that control-flow detail.
 
 ### Missing items
@@ -3006,12 +2993,9 @@
 
 ### Intentional differences
 - Rust still carries a reduced `Surface` / `Config` representation that only covers the active software-blit path and the restored rasterizer hook, not the entire upstream register union.
-- Rust still performs software fallback through `execute_pending(...)` because this tree models engine-side writes via `PendingWrite` rather than an in-place `MemoryManager` + `SoftwareBlitEngine` owner graph.
 
 ### Missing items
 - `Surface` and `Config` are still only partial ports of the upstream owner types.
-- `Blit()` behavior is still reduced: operation/filter/origin/layout decoding is not yet populated from the full register file.
-- the file still lacks the upstream `SoftwareBlitEngine` owner and `MemoryManager::FlushCaching()` edge.
 
 ### Binary layout verification
 - PASS: owner/helper additions only; no guest-visible binary payload layout changed.
@@ -9017,18 +9001,7 @@
 - Rust still reconstructs the upstream `Regs` sub-views from flat `regs[]` words and local register constants instead of owning a literal `union Regs` layout. This keeps file ownership correct but not binary-identical at the struct-definition level.
 - Rust still logs the upstream `UNIMPLEMENTED_IF_MSG(...)` conditions in `handle_blit()` instead of asserting/stubbing them, because the active runtime still keeps a reduced software fallback path.
 
-### Unintentional differences (to fix)
-- compute `delegate_to_gpu`
-- adjust corner-origin source coordinates
-- build `Config`
-- perform the pitch-alignment fixup on the source surface and source rectangle
-- then call `accelerate_surface_copy(...)`
-
 ### Missing items
-- `execute_pending(...)` still does not mirror upstream `Blit()` literally:
-  - no `memory_manager.FlushCaching()`
-  - no `SoftwareBlitEngine::Blit(src, regs.dst, config)` owner path
-  - the local software fallback still copies raw pitched rows and ignores the richer `Config`
 - `Surface` still does not preserve the literal upstream union layout for block dimensions (`repr(C)` plus packed bitfield word); it stores decoded `block_width/block_height/block_depth` fields only.
 - `Operation`, `CpuIndexWrap`, `SectorPromotion`, and the rest of the upstream register/file state are still only partially represented in the Rust owner.
 
@@ -9077,20 +9050,11 @@
 ## 2026-04-30 — `video_core/src/engines/sw_blitter/blitter.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/engines/sw_blitter/blitter.h` and `/home/vricosti/Dev/emulators/zuyu/src/video_core/engines/sw_blitter/blitter.cpp`
 
 ### Intentional differences
-- Rust does not store a literal upstream `MemoryManager&` owner in `SoftwareBlitEngine`. On this tree the active engine execution contract still passes `read_gpu` and expects `PendingWrite` results, so the matching owner file exposes `blit_to_pending_write(...)` as the narrow adaptation boundary.
+- Rust stores `Arc<Mutex<MemoryManager>>` instead of a literal upstream `MemoryManager&`, matching Rust shared-owner constraints while keeping ownership in `SoftwareBlitEngine`.
 - Rust reuses the shared `Fermi2D::{Surface, Config, Filter, MemoryLayout}` owner types directly from `fermi_2d.rs` instead of maintaining a second reduced local copy in `blitter.rs`. This is closer to upstream ownership because the C++ owner includes `fermi_2d.h`.
 
-### Unintentional differences (to fix)
-- full source-surface read
-- block-linear unswizzle or pitch-linear extraction
-- same-format nearest-neighbor path
-- IR conversion path through `ConverterFactory`
-- bilinear filtering when requested
-- destination-surface readback plus block-linear swizzle or pitch-linear pack
-
 ### Missing items
-- `SoftwareBlitEngine` still does not own a literal `MemoryManager&` and still does not perform upstream `GpuGuestMemory` / `GpuGuestMemoryScoped` writeback in place.
-- the owner method is still named `blit_to_pending_write(...)` rather than the literal upstream `Blit(...)` because the surrounding Rust engine contract still returns pending writes.
+- `SoftwareBlitEngine` still does not mirror the literal upstream pImpl split and `GpuGuestMemory` / `GpuGuestMemoryScoped` object types exactly.
 
 ### Binary layout verification
 - PASS: this file owns algorithm/control flow only; no guest-visible raw struct layout changed here.
@@ -9098,7 +9062,7 @@
 ## 2026-04-30 — `video_core/src/engines/fermi_2d.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/engines/fermi_2d.h` and `/home/vricosti/Dev/emulators/zuyu/src/video_core/engines/fermi_2d.cpp` (software-blitter ownership follow-up)
 
 ### Intentional differences
-- Rust still constructs `Fermi2D` without a literal upstream `MemoryManager&` constructor argument. The active tree still instantiates engines through a reduced owner graph, so the software blitter is owned directly and invoked through the `read_gpu -> PendingWrite` adaptation boundary.
+- Rust constructs `Fermi2D` with an `Arc<Mutex<MemoryManager>>` instead of a literal upstream `MemoryManager&` constructor argument. The software blitter is owned directly and invoked through the active Rust engine trait boundary.
 - `Fermi2D` still reconstructs the upstream `Regs` sub-views from flat `regs[]` words and local register constants instead of owning a literal `union Regs` layout.
 
 ### Missing items
@@ -9187,7 +9151,6 @@
 ### Missing items
 - the raw invalid-format bit pattern is still not preserved through the converted `Surface` owner view.
 - the wider `Regs` owner is still not a literal upstream nested struct/union graph.
-- `PixelFormatFromRenderTargetFormat(...)` is still not ported as the shared upstream owner path, so this file still keeps a local bytes-per-pixel helper.
 
 ### Binary layout verification
 - PASS: `SurfaceRaw` remains the raw `0x28` register-window snapshot, so the underlying decoded byte layout used for `Surface` extraction did not regress in this pass.
