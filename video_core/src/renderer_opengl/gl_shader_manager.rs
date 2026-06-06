@@ -5,6 +5,9 @@
 //!
 //! OpenGL program manager — manages binding of shader programs and assembly programs.
 
+use super::gl_shader_util::create_program_from_source;
+use crate::host_shaders::compute_shaders::OPENGL_LMEM_WARMUP_COMP;
+
 /// Number of shader stages.
 const NUM_STAGES: usize = 5;
 
@@ -59,11 +62,11 @@ impl ProgramManager {
             }
         }
 
-        // Upstream: if (device.HasLmemPerfBug()) { lmem_warmup_program = CreateProgram(...); }
-        // HasLmemPerfBug is not yet ported to gl_device::Device. When it is added, this
-        // should create the warmup program from OPENGL_LMEM_WARMUP_COMP. For now, the
-        // lmem_warmup_program stays 0 (no warmup needed).
-        let lmem_warmup_program = 0;
+        let lmem_warmup_program = if _device.has_lmem_perf_bug() {
+            create_program_from_source(OPENGL_LMEM_WARMUP_COMP, gl::COMPUTE_SHADER)
+        } else {
+            0
+        };
 
         Self {
             pipeline,

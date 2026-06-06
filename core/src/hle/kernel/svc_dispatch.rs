@@ -23,6 +23,7 @@ use crate::hle::kernel::svc::svc_event;
 use crate::hle::kernel::svc::svc_exception;
 use crate::hle::kernel::svc::svc_info;
 use crate::hle::kernel::svc::svc_ipc;
+use crate::hle::kernel::svc::svc_light_ipc;
 use crate::hle::kernel::svc::svc_lock;
 use crate::hle::kernel::svc::svc_memory;
 use crate::hle::kernel::svc::svc_physical_memory;
@@ -67,8 +68,6 @@ fn drain_current_thread_termination(system: &System) {
 }
 
 fn log_unknown_svc_context(system: &System, imm: u32, is_64bit: bool) {
-    use crate::arm::arm_interface::ThreadContext;
-    use std::fmt::Write;
     use std::sync::atomic::Ordering;
 
     let n = UNKNOWN_SVC_CONTEXT_COUNT.fetch_add(1, Ordering::Relaxed);
@@ -81,74 +80,12 @@ fn log_unknown_svc_context(system: &System, imm: u32, is_64bit: bool) {
         return;
     }
 
-    let (core_id, tid) = system
-        .current_thread()
-        .and_then(|thread| {
-            thread
-                .lock()
-                .ok()
-                .map(|thread| (thread.get_current_core(), thread.get_thread_id()))
-        })
-        .unwrap_or((-1, 0));
-
-    let mut ctx = ThreadContext::default();
-    let mut have_ctx = false;
-    if let Some(kernel) = system.kernel() {
-        let core_index = kernel.current_physical_core_index() as usize;
-        if let Some(process_arc) = system.current_process_arc.as_ref().cloned() {
-            let process = process_arc.lock().unwrap();
-            if let Some(jit) = process.get_arm_interface(core_index) {
-                jit.get_context(&mut ctx);
-                have_ctx = true;
-            }
-        }
-    }
-
-    let mut code_words = String::new();
-    if have_ctx {
-        if let Some(process_arc) = system.current_process_arc.as_ref().cloned() {
-            let process = process_arc.lock().unwrap();
-            let memory = process.process_memory.read().unwrap();
-            let base = ctx.pc.saturating_sub(8);
-            for i in 0..5u64 {
-                let addr = base + i * 4;
-                let word = if memory.is_valid_range(addr, 4) {
-                    memory.read_32(addr)
-                } else {
-                    0xDEADBEEF
-                };
-                let _ = write!(code_words, " [{:#010x}]={:#010x}", addr as u32, word);
-            }
-        }
-    }
-
-    if have_ctx {
-        log::error!(
-            "Unknown SVC 0x{:02X} in {}-bit mode tid={} core={} pc={:#010x} r15={:#010x} lr={:#010x} sp={:#010x} r0={:#010x} r1={:#010x} r2={:#010x} r3={:#010x} cpsr={:#010x} code:{}",
-            imm,
-            if is_64bit { 64 } else { 32 },
-            tid,
-            core_id,
-            ctx.pc as u32,
-            ctx.r[15] as u32,
-            ctx.r[14] as u32,
-            ctx.r[13] as u32,
-            ctx.r[0] as u32,
-            ctx.r[1] as u32,
-            ctx.r[2] as u32,
-            ctx.r[3] as u32,
-            ctx.pstate,
-            code_words,
-        );
-    } else {
-        log::error!(
-            "Unknown SVC 0x{:02X} in {}-bit mode tid={} core={} (no JIT context)",
-            imm,
-            if is_64bit { 64 } else { 32 },
-            tid,
-            core_id
-        );
-    }
+    let _ = system;
+    log::error!(
+        "Unknown SVC 0x{:02X} in {}-bit mode",
+        imm,
+        if is_64bit { 64 } else { 32 },
+    );
 }
 
 /// SVC identifier — maps to the immediate value in the SVC instruction.
@@ -964,7 +901,7 @@ fn call32(system: &System, imm: u32, args: &mut SvcArgs) {
             set_arg32(args, 1, out);
         }
         Some(SvcId::SendSyncRequestLight) => {
-            set_arg32(args, 0, STUB_SUCCESS);
+            svc_light_ipc::svc_wrap_send_sync_request_light(system, args);
         }
         Some(SvcId::SendSyncRequest) => {
             let session_handle = get_arg32(args, 0);
@@ -1035,7 +972,7 @@ fn call32(system: &System, imm: u32, args: &mut SvcArgs) {
             set_arg32(args, 1, out_event_handle);
         }
         Some(SvcId::ReplyAndReceiveLight) => {
-            set_arg32(args, 0, STUB_SUCCESS);
+            svc_light_ipc::svc_wrap_reply_and_receive_light(system, args);
         }
         Some(SvcId::ReplyAndReceive) => {
             let handles = get_arg32(args, 0) as u64;
@@ -1177,90 +1114,7 @@ fn call32(system: &System, imm: u32, args: &mut SvcArgs) {
             let reason = get_arg32(args, 0);
             let info1 = get_arg32(args, 1) as u64;
             let info2 = get_arg32(args, 2) as u64;
-
-            // Dump guest registers for diagnosis.
-            log::error!("=== GUEST REGISTER DUMP AT BREAK ===");
-            for i in 0..args.len() {
-                log::error!("  r{:2} = {:#010x}", i, args[i]);
-            }
-            if let Some(kernel) = system.kernel() {
-                let core_index = kernel.current_physical_core_index() as usize;
-                if let Some(process_arc) = system.current_process_arc.as_ref().cloned() {
-                    let process = process_arc.lock().unwrap();
-                    if let Some(jit) = process.get_arm_interface(core_index) {
-                        use crate::arm::arm_interface::ThreadContext;
-                        let mut ctx = ThreadContext::default();
-                        jit.get_context(&mut ctx);
-                        log::error!(
-                            "  break_pc=0x{:08X} break_lr=0x{:08X} break_sp=0x{:08X} core={}",
-                            ctx.r[15] as u32,
-                            ctx.r[14] as u32,
-                            ctx.r[13] as u32,
-                            core_index
-                        );
-                        if std::env::var_os("RUZU_DUMP_BREAK_STACK").is_some() {
-                            let backtrace =
-                                crate::arm::debug::get_backtrace_from_context(&process, &ctx);
-                            for (index, entry) in backtrace.iter().enumerate().take(32) {
-                                log::error!(
-                                    "  break_bt[{}] addr=0x{:08X} orig=0x{:08X} module={} name={} offset=0x{:X}",
-                                    index,
-                                    entry.address as u32,
-                                    entry.original_address as u32,
-                                    entry.module,
-                                    entry.name,
-                                    entry.offset,
-                                );
-                            }
-                        }
-                    }
-                }
-            }
-            // Read abort message from guest memory if info1 points to a string.
-            if info1 != 0 && info2 > 0 && info2 < 0x200 {
-                let len = info2 as usize;
-                let mut buf = vec![0u8; len];
-                if let Some(memory) = system.get_svc_memory() {
-                    let m = memory.lock().unwrap();
-                    m.read_block(info1, &mut buf);
-                } else {
-                    let process = system.current_process_arc().lock().unwrap();
-                    let mem = process.process_memory.read().unwrap();
-                    if mem.is_valid_range(info1, len) {
-                        for (i, byte) in buf.iter_mut().enumerate() {
-                            *byte = mem.read_8(info1 + i as u64);
-                        }
-                    }
-                }
-                if let Ok(msg) = String::from_utf8(buf) {
-                    log::error!("  Break message: {}", msg.trim_end_matches('\0'));
-                }
-            }
-
-            // Dump nearby memory strings for symbol resolution debugging
-            if let Some(memory) = system.get_svc_memory() {
-                let m = memory.lock().unwrap();
-                // Try reading strings at known addresses from the step trace
-                for addr in [0x20bc7fau64, 0x20bc827, 0x2244ec7] {
-                    let mut buf = vec![0u8; 128];
-                    for i in 0..128u64 {
-                        buf[i as usize] = m.read_8(addr + i);
-                    }
-                    if let Some(end) = buf.iter().position(|&b| b == 0) {
-                        buf.truncate(end);
-                    }
-                    if let Ok(s) = String::from_utf8(buf.clone()) {
-                        if !s.is_empty() && s.len() < 120 {
-                            eprintln!("  [{addr:#x}] = \"{s}\"");
-                        }
-                    }
-                }
-            }
-            eprintln!(
-                "!!! svcBreak(reason={:#x}, info1={:#x}, info2={:#x}) — GAME ABORTED !!!",
-                reason, info1, info2
-            );
-            svc_exception::break_execution(system, reason, info1, info2);
+            svc_exception::break64_from_32(system, reason, info1 as u32, info2 as u32, args);
         }
         Some(SvcId::OutputDebugString) => {
             // IN: str=arg32[0], len=arg32[1]; OUT: ret=arg32[0]
@@ -1774,11 +1628,7 @@ fn call64(system: &System, imm: u32, args: &mut SvcArgs) {
             let reason = get_arg64(args, 0) as u32;
             let info1 = get_arg64(args, 1);
             let info2 = get_arg64(args, 2);
-            eprintln!(
-                "!!! svcBreak(reason={:#x}, info1={:#x}, info2={:#x}) — GAME ABORTED !!!",
-                reason, info1, info2
-            );
-            svc_exception::break_execution(system, reason, info1, info2);
+            svc_exception::break64(system, reason, info1, info2);
         }
         Some(SvcId::OutputDebugString) => {
             let str_ptr = get_arg64(args, 0);
@@ -2091,8 +1941,6 @@ pub fn call(system: &System, imm: u32, is_64bit: bool, args: &mut SvcArgs) {
             tid as u64, core_id, imm,
         );
     }
-    maybe_dump_svc_context_by_lr(system, imm, tid, core_id, &dispatch_args);
-
     // PC-window SVC counter. By default counts on tid=73 (main game thread);
     // RUZU_TRACE_PC_TID=N overrides to count a different thread (e.g. tid=102
     // for the audio worker). Increment on every SVC entry and deactivate the
@@ -3128,209 +2976,6 @@ fn dump_svc_full_regs(system: &System, imm: u32, tid: i64, label: &str) {
             label,
             sp as u32,
             hex.trim()
-        );
-    }
-}
-
-fn svc_context_lr_filter() -> &'static [u32] {
-    static FILTER: std::sync::OnceLock<Vec<u32>> = std::sync::OnceLock::new();
-    FILTER.get_or_init(|| {
-        std::env::var("RUZU_DUMP_SVC_CONTEXT_LR")
-            .ok()
-            .map(|raw| {
-                raw.split(',')
-                    .filter_map(|part| {
-                        let part = part.trim();
-                        if part.is_empty() {
-                            return None;
-                        }
-                        u32::from_str_radix(
-                            part.trim_start_matches("0x").trim_start_matches("0X"),
-                            16,
-                        )
-                        .ok()
-                    })
-                    .collect()
-            })
-            .unwrap_or_default()
-    })
-}
-
-fn svc_context_tid_filter() -> &'static [u64] {
-    static FILTER: std::sync::OnceLock<Vec<u64>> = std::sync::OnceLock::new();
-    FILTER.get_or_init(|| {
-        std::env::var("RUZU_DUMP_SVC_CONTEXT_TID")
-            .ok()
-            .map(|raw| {
-                raw.split(',')
-                    .filter_map(|part| {
-                        let part = part.trim();
-                        if part.is_empty() {
-                            return None;
-                        }
-                        part.parse::<u64>().ok()
-                    })
-                    .collect()
-            })
-            .unwrap_or_default()
-    })
-}
-
-fn svc_context_dump_limit() -> u64 {
-    static LIMIT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    *LIMIT.get_or_init(|| {
-        std::env::var("RUZU_DUMP_SVC_CONTEXT_LIMIT")
-            .ok()
-            .and_then(|value| value.parse::<u64>().ok())
-            .unwrap_or(64)
-    })
-}
-
-fn svc_context_explicit_regions() -> &'static [(u64, u64)] {
-    static REGIONS: std::sync::OnceLock<Vec<(u64, u64)>> = std::sync::OnceLock::new();
-    REGIONS.get_or_init(|| {
-        std::env::var("RUZU_DUMP_SVC_CONTEXT_ADDRS")
-            .ok()
-            .map(|raw| {
-                raw.split(',')
-                    .filter_map(|part| {
-                        let (addr, len) = part.split_once(':')?;
-                        let addr = u64::from_str_radix(
-                            addr.trim()
-                                .trim_start_matches("0x")
-                                .trim_start_matches("0X"),
-                            16,
-                        )
-                        .ok()?;
-                        let len = u64::from_str_radix(
-                            len.trim().trim_start_matches("0x").trim_start_matches("0X"),
-                            16,
-                        )
-                        .or_else(|_| len.trim().parse::<u64>())
-                        .ok()?;
-                        Some((addr, len))
-                    })
-                    .collect()
-            })
-            .unwrap_or_default()
-    })
-}
-
-static SVC_CONTEXT_DUMP_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-fn maybe_dump_svc_context_by_lr(system: &System, imm: u32, tid: i64, core_id: i32, args: &SvcArgs) {
-    let lr_filter = svc_context_lr_filter();
-    if lr_filter.is_empty() {
-        return;
-    }
-    let tid_filter = svc_context_tid_filter();
-    if !tid_filter.is_empty() && (tid < 0 || !tid_filter.contains(&(tid as u64))) {
-        return;
-    }
-
-    use crate::arm::arm_interface::ThreadContext;
-    use std::sync::atomic::Ordering;
-
-    let kernel = match system.kernel() {
-        Some(kernel) => kernel,
-        None => return,
-    };
-    let core_index = kernel.current_physical_core_index() as usize;
-    let process_arc = match system.current_process_arc.as_ref().cloned() {
-        Some(process_arc) => process_arc,
-        None => return,
-    };
-    let process = process_arc.lock().unwrap();
-    let jit = match process.get_arm_interface(core_index) {
-        Some(jit) => jit,
-        None => return,
-    };
-    let mut ctx = ThreadContext::default();
-    jit.get_context(&mut ctx);
-    let lr = ctx.r[14] as u32;
-    if !lr_filter.contains(&lr) {
-        return;
-    }
-
-    let n = SVC_CONTEXT_DUMP_COUNT.fetch_add(1, Ordering::Relaxed);
-    if n >= svc_context_dump_limit() {
-        return;
-    }
-
-    eprintln!(
-        "[SVC_CONTEXT_LR] hit={} tid={} core={} imm=0x{:02X} pc=0x{:08X} lr=0x{:08X} sp=0x{:08X} cpsr=0x{:08X} args=[0x{:X},0x{:X},0x{:X},0x{:X},0x{:X},0x{:X},0x{:X},0x{:X}] r=[0x{:08X},0x{:08X},0x{:08X},0x{:08X},0x{:08X},0x{:08X},0x{:08X},0x{:08X},0x{:08X},0x{:08X},0x{:08X},0x{:08X},0x{:08X}]",
-        n + 1,
-        tid,
-        core_id,
-        imm,
-        ctx.r[15] as u32,
-        lr,
-        ctx.r[13] as u32,
-        ctx.pstate,
-        args[0],
-        args[1],
-        args[2],
-        args[3],
-        args[4],
-        args[5],
-        args[6],
-        args[7],
-        ctx.r[0] as u32,
-        ctx.r[1] as u32,
-        ctx.r[2] as u32,
-        ctx.r[3] as u32,
-        ctx.r[4] as u32,
-        ctx.r[5] as u32,
-        ctx.r[6] as u32,
-        ctx.r[7] as u32,
-        ctx.r[8] as u32,
-        ctx.r[9] as u32,
-        ctx.r[10] as u32,
-        ctx.r[11] as u32,
-        ctx.r[12] as u32,
-    );
-
-    let explicit_regions = svc_context_explicit_regions();
-    if !explicit_regions.is_empty() {
-        for &(addr, len) in explicit_regions {
-            dump_svc_context_region(&process, addr, len);
-        }
-        return;
-    }
-
-    let mut addrs = Vec::new();
-    for &addr in args.iter().take(4).chain(ctx.r.iter().take(13)) {
-        if addr >= 0x1000 && !addrs.contains(&addr) {
-            addrs.push(addr);
-        }
-        if addrs.len() >= 12 {
-            break;
-        }
-    }
-    for addr in addrs {
-        dump_svc_context_region(&process, addr.saturating_sub(8), 0x20);
-    }
-
-    fn dump_svc_context_region(
-        process: &crate::hle::kernel::k_process::KProcess,
-        addr: u64,
-        len: u64,
-    ) {
-        use std::fmt::Write;
-
-        let mut words = String::new();
-        let word_count = ((len + 3) / 4).min(32);
-        let bytes = process.read_memory_vec(addr, (word_count * 4) as usize);
-        for i in 0..word_count {
-            let offset = (i * 4) as usize;
-            let word = u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap());
-            let _ = write!(words, " 0x{:08X}", word);
-        }
-        eprintln!(
-            "[SVC_CONTEXT_MEM] addr=0x{:08X} len=0x{:X} words={}",
-            addr,
-            len,
-            words.trim()
         );
     }
 }

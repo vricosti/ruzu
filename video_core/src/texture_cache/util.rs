@@ -441,11 +441,26 @@ pub fn calculate_unswizzled_size_bytes(info: &ImageInfo) -> u32 {
 
 /// Port of `CalculateConvertedSizeBytes`.
 pub fn calculate_converted_size_bytes(info: &ImageInfo) -> u32 {
-    // For non-compressed or non-ASTC formats, same as unswizzled
     if !surface::is_pixel_format_astc(info.format) {
         return calculate_unswizzled_size_bytes(info);
     }
-    // ASTC: decompress block -> RGBA8 (4 bytes per pixel)
+
+    let recompression = *common::settings::values().astc_recompression.get_value();
+    if recompression != common::settings_enums::AstcRecompression::Uncompressed {
+        let bpp_div = if recompression == common::settings_enums::AstcRecompression::Bc1 {
+            2
+        } else {
+            1
+        };
+        let mut output_size = 0;
+        for level in 0..info.resources.levels as u32 {
+            let mip_size = adjust_mip_size_3d(info.size, level);
+            let plane_dim = align_up(mip_size.width, 4) * align_up(mip_size.height, 4);
+            output_size += (plane_dim * info.size.depth * info.resources.layers as u32) / bpp_div;
+        }
+        return output_size;
+    }
+
     let tile = default_block_size(info.format);
     let mut total: u32 = 0;
     for level in 0..info.resources.levels as u32 {
@@ -842,10 +857,7 @@ pub fn unswizzle_image(
 
 /// Port of `ConvertImage`.
 ///
-/// Decompresses ASTC or BCn compressed images into uncompressed output.
-/// Currently implements the ASTC uncompressed decompression path.
-/// BCn decompression and ASTC-to-BCn recompression are stubbed pending
-/// a BCn codec crate and Settings system integration.
+/// Decompresses ASTC or BCn compressed images into the host output format.
 pub fn convert_image(
     input: &[u8],
     info: &ImageInfo,
@@ -867,11 +879,9 @@ pub fn convert_image(
             unsafe { std::mem::transmute::<u32, surface::PixelFormat>(info.format as u32) },
         );
 
-        if astc {
-            // ASTC uncompressed decompression path.
-            // Note: The upstream also has ASTC-to-BC1/BC3 recompression paths
-            // gated behind Settings::values.astc_recompression. Those paths
-            // are not yet implemented (requires Settings system and BCN compressor).
+        let recompression = *common::settings::values().astc_recompression.get_value();
+
+        if astc && recompression == common::settings_enums::AstcRecompression::Uncompressed {
             let input_slice = &input[input_offset..];
             let depth_layers = copy.image_subresource.num_layers as u32 * copy.image_extent.depth;
             crate::textures::astc::decompress(
@@ -888,6 +898,55 @@ pub fn convert_image(
                 * copy.image_extent.height
                 * copy.image_subresource.num_layers as u32
                 * surface::bytes_per_block(surface::PixelFormat::A8B8G8R8Unorm);
+        } else if astc {
+            let bpp_div = if recompression == common::settings_enums::AstcRecompression::Bc1 {
+                2
+            } else {
+                1
+            };
+            let plane_dim = copy.image_extent.width * copy.image_extent.height;
+            let depth_layers = copy.image_subresource.num_layers as u32 * copy.image_extent.depth;
+            let level_size = plane_dim
+                * copy.image_extent.depth
+                * copy.image_subresource.num_layers as u32
+                * surface::bytes_per_block(surface::PixelFormat::A8B8G8R8Unorm);
+            let mut decode_scratch = vec![0; level_size as usize];
+
+            crate::textures::astc::decompress(
+                &input[input_offset..],
+                copy.image_extent.width,
+                copy.image_extent.height,
+                depth_layers,
+                tile_size.width,
+                tile_size.height,
+                &mut decode_scratch,
+            );
+
+            if recompression == common::settings_enums::AstcRecompression::Bc1 {
+                crate::textures::bcn::compress_bc1(
+                    &decode_scratch,
+                    copy.image_extent.width,
+                    copy.image_extent.height,
+                    depth_layers,
+                    &mut output[output_offset as usize..],
+                );
+            } else {
+                crate::textures::bcn::compress_bc3(
+                    &decode_scratch,
+                    copy.image_extent.width,
+                    copy.image_extent.height,
+                    depth_layers,
+                    &mut output[output_offset as usize..],
+                );
+            }
+
+            let aligned_plane_dim =
+                align_up(copy.image_extent.width, 4) * align_up(copy.image_extent.height, 4);
+            copy.buffer_size = ((aligned_plane_dim
+                * copy.image_extent.depth
+                * copy.image_subresource.num_layers as u32)
+                / bpp_div) as usize;
+            output_offset += copy.buffer_size as u32;
         } else {
             crate::texture_cache::decode_bc::decompress_bcn(
                 &input[input_offset..],

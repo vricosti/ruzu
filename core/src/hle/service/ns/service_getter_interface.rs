@@ -34,12 +34,14 @@ pub mod commands {
 /// Corresponds to `IServiceGetterInterface` in upstream.
 /// Each Get*Interface method creates and returns a new sub-interface object.
 pub struct IServiceGetterInterface {
+    system: crate::core::SystemRef,
+    service_name: &'static str,
     handlers: BTreeMap<u32, FunctionInfo>,
     handlers_tipc: BTreeMap<u32, FunctionInfo>,
 }
 
 impl IServiceGetterInterface {
-    pub fn new() -> Self {
+    pub fn new(system: crate::core::SystemRef, service_name: &'static str) -> Self {
         let handlers = build_handler_map(&[
             (
                 commands::GET_DYNAMIC_RIGHTS_INTERFACE,
@@ -98,6 +100,8 @@ impl IServiceGetterInterface {
             ),
         ]);
         Self {
+            system,
+            service_name,
             handlers,
             handlers_tipc: BTreeMap::new(),
         }
@@ -170,13 +174,13 @@ impl SessionRequestHandler for IServiceGetterInterface {
     }
 
     fn service_name(&self) -> &str {
-        "ns::IServiceGetterInterface"
+        self.service_name
     }
 }
 
 impl ServiceFramework for IServiceGetterInterface {
     fn get_service_name(&self) -> &str {
-        "ns::IServiceGetterInterface"
+        self.service_name
     }
 
     fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> {

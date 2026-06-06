@@ -66,9 +66,24 @@ impl IDisplayController {
                 "ClearCaptureBuffer",
             ),
             (
+                22,
+                Some(Self::acquire_last_application_capture_shared_buffer_handler),
+                "AcquireLastApplicationCaptureSharedBuffer",
+            ),
+            (
                 25,
                 Some(Self::release_last_foreground_capture_shared_buffer_handler),
                 "ReleaseLastForegroundCaptureSharedBuffer",
+            ),
+            (
+                24,
+                Some(Self::acquire_last_foreground_capture_shared_buffer_handler),
+                "AcquireLastForegroundCaptureSharedBuffer",
+            ),
+            (
+                26,
+                Some(Self::acquire_caller_applet_capture_shared_buffer_handler),
+                "AcquireCallerAppletCaptureSharedBuffer",
             ),
             (
                 27,
@@ -119,6 +134,14 @@ impl IDisplayController {
         log::warn!("(STUBBED) ReleaseLastApplicationCaptureSharedBuffer called");
     }
 
+    fn acquire_capture_shared_buffer(&self) -> Result<(bool, i32), ResultCode> {
+        self.applet
+            .lock()
+            .unwrap()
+            .display_layer_manager
+            .write_applet_capture_buffer()
+    }
+
     fn get_caller_applet_capture_image_ex_handler(
         this: &dyn ServiceFramework,
         ctx: &mut HLERequestContext,
@@ -162,6 +185,25 @@ impl IDisplayController {
         rb.push_result(RESULT_SUCCESS);
     }
 
+    fn acquire_last_foreground_capture_shared_buffer_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        let service =
+            unsafe { &*(this as *const dyn ServiceFramework as *const IDisplayController) };
+        log::warn!("(STUBBED) AcquireLastForegroundCaptureSharedBuffer called");
+        let result = service.acquire_capture_shared_buffer();
+        let mut rb = ResponseBuilder::new(ctx, 4, 0, 0);
+        match result {
+            Ok((was_written, fbshare_layer_index)) => {
+                rb.push_result(RESULT_SUCCESS);
+                rb.push_bool(was_written);
+                rb.push_i32(fbshare_layer_index);
+            }
+            Err(result) => rb.push_result(result),
+        }
+    }
+
     fn release_caller_applet_capture_shared_buffer_handler(
         this: &dyn ServiceFramework,
         ctx: &mut HLERequestContext,
@@ -173,6 +215,25 @@ impl IDisplayController {
         rb.push_result(RESULT_SUCCESS);
     }
 
+    fn acquire_caller_applet_capture_shared_buffer_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        let service =
+            unsafe { &*(this as *const dyn ServiceFramework as *const IDisplayController) };
+        log::warn!("(STUBBED) AcquireCallerAppletCaptureSharedBuffer called");
+        let result = service.acquire_capture_shared_buffer();
+        let mut rb = ResponseBuilder::new(ctx, 4, 0, 0);
+        match result {
+            Ok((was_written, fbshare_layer_index)) => {
+                rb.push_result(RESULT_SUCCESS);
+                rb.push_bool(was_written);
+                rb.push_i32(fbshare_layer_index);
+            }
+            Err(result) => rb.push_result(result),
+        }
+    }
+
     fn release_last_application_capture_shared_buffer_handler(
         this: &dyn ServiceFramework,
         ctx: &mut HLERequestContext,
@@ -182,6 +243,25 @@ impl IDisplayController {
         service.release_last_application_capture_shared_buffer();
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
+    }
+
+    fn acquire_last_application_capture_shared_buffer_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        let service =
+            unsafe { &*(this as *const dyn ServiceFramework as *const IDisplayController) };
+        log::warn!("(STUBBED) AcquireLastApplicationCaptureSharedBuffer called");
+        let result = service.acquire_capture_shared_buffer();
+        let mut rb = ResponseBuilder::new(ctx, 4, 0, 0);
+        match result {
+            Ok((was_written, fbshare_layer_index)) => {
+                rb.push_result(RESULT_SUCCESS);
+                rb.push_bool(was_written);
+                rb.push_i32(fbshare_layer_index);
+            }
+            Err(result) => rb.push_result(result),
+        }
     }
 }
 

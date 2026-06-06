@@ -38,6 +38,17 @@ impl<'a> Emitter<'a> {
         })
     }
 
+    fn emit_pseudo_from_op(&mut self, pseudo_op: Opcode, op: Value) -> Value {
+        let pseudo = self.emit(Inst::new(pseudo_op, vec![op]));
+        if let (Value::Inst(parent), Value::Inst(pseudo_ref)) = (op, pseudo) {
+            self.program
+                .block_mut(parent.block)
+                .inst_mut(parent.inst)
+                .set_associated_pseudo(pseudo_op, pseudo_ref);
+        }
+        pseudo
+    }
+
     /// Emit a void instruction (no result value used).
     fn emit_void(&mut self, inst: Inst) {
         self.program.block_mut(self.block).append_inst(inst);
@@ -243,19 +254,23 @@ impl<'a> Emitter<'a> {
     // ── Condition flags ───────────────────────────────────────────────
 
     pub fn get_zero_from_op(&mut self, op: Value) -> Value {
-        self.emit(Inst::new(Opcode::GetZeroFromOp, vec![op]))
+        self.emit_pseudo_from_op(Opcode::GetZeroFromOp, op)
     }
 
     pub fn get_sign_from_op(&mut self, op: Value) -> Value {
-        self.emit(Inst::new(Opcode::GetSignFromOp, vec![op]))
+        self.emit_pseudo_from_op(Opcode::GetSignFromOp, op)
     }
 
     pub fn get_carry_from_op(&mut self, op: Value) -> Value {
-        self.emit(Inst::new(Opcode::GetCarryFromOp, vec![op]))
+        self.emit_pseudo_from_op(Opcode::GetCarryFromOp, op)
     }
 
     pub fn get_overflow_from_op(&mut self, op: Value) -> Value {
-        self.emit(Inst::new(Opcode::GetOverflowFromOp, vec![op]))
+        self.emit_pseudo_from_op(Opcode::GetOverflowFromOp, op)
+    }
+
+    pub fn get_sparse_from_op(&mut self, op: Value) -> Value {
+        self.emit_pseudo_from_op(Opcode::GetSparseFromOp, op)
     }
 
     // ── System values ─────────────────────────────────────────────────
@@ -955,6 +970,13 @@ impl<'a> Emitter<'a> {
         ))
     }
 
+    pub fn composite_extract_u32x3(&mut self, vector: Value, index: Value) -> Value {
+        self.emit(Inst::new(
+            Opcode::CompositeExtractU32x3,
+            vec![vector, index],
+        ))
+    }
+
     pub fn composite_extract_u32x4(&mut self, vector: Value, index: Value) -> Value {
         self.emit(Inst::new(
             Opcode::CompositeExtractU32x4,
@@ -983,6 +1005,22 @@ impl<'a> Emitter<'a> {
 
     // ── Memory ────────────────────────────────────────────────────────
 
+    pub fn load_global_u8(&mut self, addr: Value) -> Value {
+        self.emit(Inst::new(Opcode::LoadGlobalU8, vec![addr]))
+    }
+
+    pub fn load_global_s8(&mut self, addr: Value) -> Value {
+        self.emit(Inst::new(Opcode::LoadGlobalS8, vec![addr]))
+    }
+
+    pub fn load_global_u16(&mut self, addr: Value) -> Value {
+        self.emit(Inst::new(Opcode::LoadGlobalU16, vec![addr]))
+    }
+
+    pub fn load_global_s16(&mut self, addr: Value) -> Value {
+        self.emit(Inst::new(Opcode::LoadGlobalS16, vec![addr]))
+    }
+
     pub fn load_global_32(&mut self, addr: Value) -> Value {
         self.emit(Inst::new(Opcode::LoadGlobal32, vec![addr]))
     }
@@ -997,6 +1035,22 @@ impl<'a> Emitter<'a> {
 
     pub fn write_global_32(&mut self, addr: Value, value: Value) {
         self.emit_void(Inst::new(Opcode::WriteGlobal32, vec![addr, value]));
+    }
+
+    pub fn write_global_u8(&mut self, addr: Value, value: Value) {
+        self.emit_void(Inst::new(Opcode::WriteGlobalU8, vec![addr, value]));
+    }
+
+    pub fn write_global_s8(&mut self, addr: Value, value: Value) {
+        self.emit_void(Inst::new(Opcode::WriteGlobalS8, vec![addr, value]));
+    }
+
+    pub fn write_global_u16(&mut self, addr: Value, value: Value) {
+        self.emit_void(Inst::new(Opcode::WriteGlobalU16, vec![addr, value]));
+    }
+
+    pub fn write_global_s16(&mut self, addr: Value, value: Value) {
+        self.emit_void(Inst::new(Opcode::WriteGlobalS16, vec![addr, value]));
     }
 
     pub fn write_global_64(&mut self, addr: Value, value: Value) {
@@ -1036,8 +1090,13 @@ impl<'a> Emitter<'a> {
         offset: Value,
         info: u32,
     ) -> Value {
+        let opcode = if handle.is_immediate() {
+            Opcode::BoundImageSampleImplicitLod
+        } else {
+            Opcode::BindlessImageSampleImplicitLod
+        };
         self.emit(Inst::with_flags(
-            Opcode::ImageSampleImplicitLod,
+            opcode,
             vec![handle, coords, bias_lc, offset],
             info,
         ))
@@ -1055,8 +1114,13 @@ impl<'a> Emitter<'a> {
         offset: Value,
         info: u32,
     ) -> Value {
+        let opcode = if handle.is_immediate() {
+            Opcode::BoundImageSampleExplicitLod
+        } else {
+            Opcode::BindlessImageSampleExplicitLod
+        };
         self.emit(Inst::with_flags(
-            Opcode::ImageSampleExplicitLod,
+            opcode,
             vec![handle, coords, lod, offset],
             info,
         ))
@@ -1081,8 +1145,13 @@ impl<'a> Emitter<'a> {
         offset: Value,
         info: u32,
     ) -> Value {
+        let opcode = if handle.is_immediate() {
+            Opcode::BoundImageSampleDrefImplicitLod
+        } else {
+            Opcode::BindlessImageSampleDrefImplicitLod
+        };
         self.emit(Inst::with_flags(
-            Opcode::ImageSampleDrefImplicitLod,
+            opcode,
             vec![handle, coords, dref, bias_lc, offset],
             info,
         ))
@@ -1114,8 +1183,13 @@ impl<'a> Emitter<'a> {
         offset: Value,
         info: u32,
     ) -> Value {
+        let opcode = if handle.is_immediate() {
+            Opcode::BoundImageSampleDrefExplicitLod
+        } else {
+            Opcode::BindlessImageSampleDrefExplicitLod
+        };
         self.emit(Inst::with_flags(
-            Opcode::ImageSampleDrefExplicitLod,
+            opcode,
             vec![handle, coords, dref, lod, offset],
             info,
         ))
@@ -1132,20 +1206,62 @@ impl<'a> Emitter<'a> {
         self.image_sample_dref_explicit_lod_full(handle, coords, dref, lod, Value::Void, info)
     }
 
-    pub fn image_fetch(&mut self, handle: Value, coords: Value, lod: Value, info: u32) -> Value {
+    pub fn image_fetch_full(
+        &mut self,
+        handle: Value,
+        coords: Value,
+        offset: Value,
+        lod: Value,
+        multisampling: Value,
+        info: u32,
+    ) -> Value {
+        let opcode = if handle.is_immediate() {
+            Opcode::BoundImageFetch
+        } else {
+            Opcode::BindlessImageFetch
+        };
         self.emit(Inst::with_flags(
-            Opcode::ImageFetch,
-            vec![handle, coords, Value::Void, lod, Value::Void],
+            opcode,
+            vec![handle, coords, offset, lod, multisampling],
             info,
         ))
     }
 
+    pub fn image_fetch(&mut self, handle: Value, coords: Value, lod: Value, info: u32) -> Value {
+        self.image_fetch_full(handle, coords, Value::Void, lod, Value::Void, info)
+    }
+
+    pub fn image_query_dimensions_full(
+        &mut self,
+        handle: Value,
+        lod: Value,
+        skip_mips: Value,
+        info: u32,
+    ) -> Value {
+        let opcode = if handle.is_immediate() {
+            Opcode::BoundImageQueryDimensions
+        } else {
+            Opcode::BindlessImageQueryDimensions
+        };
+        self.emit(Inst::with_flags(opcode, vec![handle, lod, skip_mips], info))
+    }
+
     pub fn image_query_dimensions(&mut self, handle: Value, lod: Value, info: u32) -> Value {
-        self.emit(Inst::with_flags(
-            Opcode::ImageQueryDimensions,
-            vec![handle, lod],
-            info,
-        ))
+        self.image_query_dimensions_full(handle, lod, Value::ImmU1(false), info)
+    }
+
+    pub fn image_query_dimension_full(
+        &mut self,
+        handle: Value,
+        lod: Value,
+        skip_mips: Value,
+        info: u32,
+    ) -> Value {
+        self.image_query_dimensions_full(handle, lod, skip_mips, info)
+    }
+
+    pub fn image_query_dimension(&mut self, handle: Value, lod: Value, info: u32) -> Value {
+        self.image_query_dimensions(handle, lod, info)
     }
 
     pub fn image_gather_full(
@@ -1156,8 +1272,13 @@ impl<'a> Emitter<'a> {
         offset2: Value,
         info: u32,
     ) -> Value {
+        let opcode = if handle.is_immediate() {
+            Opcode::BoundImageGather
+        } else {
+            Opcode::BindlessImageGather
+        };
         self.emit(Inst::with_flags(
-            Opcode::ImageGather,
+            opcode,
             vec![handle, coords, offset, offset2],
             info,
         ))
@@ -1176,8 +1297,13 @@ impl<'a> Emitter<'a> {
         dref: Value,
         info: u32,
     ) -> Value {
+        let opcode = if handle.is_immediate() {
+            Opcode::BoundImageGatherDref
+        } else {
+            Opcode::BindlessImageGatherDref
+        };
         self.emit(Inst::with_flags(
-            Opcode::ImageGatherDref,
+            opcode,
             vec![handle, coords, offset, offset2, dref],
             info,
         ))
@@ -1203,6 +1329,27 @@ impl<'a> Emitter<'a> {
     }
 
     /// Port of `IREmitter::ImageGradient`.
+    pub fn image_gradient_full(
+        &mut self,
+        handle: Value,
+        coords: Value,
+        derivatives: Value,
+        offset: Value,
+        lod_clamp: Value,
+        info: u32,
+    ) -> Value {
+        let opcode = if handle.is_immediate() {
+            Opcode::BoundImageGradient
+        } else {
+            Opcode::BindlessImageGradient
+        };
+        self.emit(Inst::with_flags(
+            opcode,
+            vec![handle, coords, derivatives, offset, lod_clamp],
+            info,
+        ))
+    }
+
     pub fn image_gradient(
         &mut self,
         handle: Value,
@@ -1210,29 +1357,261 @@ impl<'a> Emitter<'a> {
         derivatives: Value,
         info: u32,
     ) -> Value {
-        self.emit(Inst::with_flags(
-            Opcode::ImageGradient,
-            vec![handle, coords, derivatives],
-            info,
-        ))
+        self.image_gradient_full(handle, coords, derivatives, Value::Void, Value::Void, info)
     }
 
     /// Port of `IREmitter::ImageRead`.
     pub fn image_read(&mut self, handle: Value, coords: Value, info: u32) -> Value {
-        self.emit(Inst::with_flags(
-            Opcode::ImageRead,
-            vec![handle, coords],
-            info,
-        ))
+        let opcode = if handle.is_immediate() {
+            Opcode::BoundImageRead
+        } else {
+            Opcode::BindlessImageRead
+        };
+        self.emit(Inst::with_flags(opcode, vec![handle, coords], info))
     }
 
     /// Port of `IREmitter::ImageWrite`.
     pub fn image_write(&mut self, handle: Value, coords: Value, color: Value, info: u32) {
-        let _ = self.emit(Inst::with_flags(
-            Opcode::ImageWrite,
-            vec![handle, coords, color],
+        let opcode = if handle.is_immediate() {
+            Opcode::BoundImageWrite
+        } else {
+            Opcode::BindlessImageWrite
+        };
+        let _ = self.emit(Inst::with_flags(opcode, vec![handle, coords, color], info));
+    }
+
+    fn image_atomic(
+        &mut self,
+        bound_opcode: Opcode,
+        bindless_opcode: Opcode,
+        handle: Value,
+        coords: Value,
+        value: Value,
+        info: u32,
+    ) -> Value {
+        let opcode = if handle.is_immediate() {
+            bound_opcode
+        } else {
+            bindless_opcode
+        };
+        self.emit(Inst::with_flags(opcode, vec![handle, coords, value], info))
+    }
+
+    pub fn image_atomic_iadd_32(
+        &mut self,
+        handle: Value,
+        coords: Value,
+        value: Value,
+        info: u32,
+    ) -> Value {
+        self.image_atomic(
+            Opcode::BoundImageAtomicIAdd32,
+            Opcode::BindlessImageAtomicIAdd32,
+            handle,
+            coords,
+            value,
             info,
-        ));
+        )
+    }
+
+    pub fn image_atomic_smin_32(
+        &mut self,
+        handle: Value,
+        coords: Value,
+        value: Value,
+        info: u32,
+    ) -> Value {
+        self.image_atomic(
+            Opcode::BoundImageAtomicSMin32,
+            Opcode::BindlessImageAtomicSMin32,
+            handle,
+            coords,
+            value,
+            info,
+        )
+    }
+
+    pub fn image_atomic_umin_32(
+        &mut self,
+        handle: Value,
+        coords: Value,
+        value: Value,
+        info: u32,
+    ) -> Value {
+        self.image_atomic(
+            Opcode::BoundImageAtomicUMin32,
+            Opcode::BindlessImageAtomicUMin32,
+            handle,
+            coords,
+            value,
+            info,
+        )
+    }
+
+    pub fn image_atomic_imin_32(
+        &mut self,
+        handle: Value,
+        coords: Value,
+        value: Value,
+        is_signed: bool,
+        info: u32,
+    ) -> Value {
+        if is_signed {
+            self.image_atomic_smin_32(handle, coords, value, info)
+        } else {
+            self.image_atomic_umin_32(handle, coords, value, info)
+        }
+    }
+
+    pub fn image_atomic_smax_32(
+        &mut self,
+        handle: Value,
+        coords: Value,
+        value: Value,
+        info: u32,
+    ) -> Value {
+        self.image_atomic(
+            Opcode::BoundImageAtomicSMax32,
+            Opcode::BindlessImageAtomicSMax32,
+            handle,
+            coords,
+            value,
+            info,
+        )
+    }
+
+    pub fn image_atomic_umax_32(
+        &mut self,
+        handle: Value,
+        coords: Value,
+        value: Value,
+        info: u32,
+    ) -> Value {
+        self.image_atomic(
+            Opcode::BoundImageAtomicUMax32,
+            Opcode::BindlessImageAtomicUMax32,
+            handle,
+            coords,
+            value,
+            info,
+        )
+    }
+
+    pub fn image_atomic_imax_32(
+        &mut self,
+        handle: Value,
+        coords: Value,
+        value: Value,
+        is_signed: bool,
+        info: u32,
+    ) -> Value {
+        if is_signed {
+            self.image_atomic_smax_32(handle, coords, value, info)
+        } else {
+            self.image_atomic_umax_32(handle, coords, value, info)
+        }
+    }
+
+    pub fn image_atomic_inc_32(
+        &mut self,
+        handle: Value,
+        coords: Value,
+        value: Value,
+        info: u32,
+    ) -> Value {
+        self.image_atomic(
+            Opcode::BoundImageAtomicInc32,
+            Opcode::BindlessImageAtomicInc32,
+            handle,
+            coords,
+            value,
+            info,
+        )
+    }
+
+    pub fn image_atomic_dec_32(
+        &mut self,
+        handle: Value,
+        coords: Value,
+        value: Value,
+        info: u32,
+    ) -> Value {
+        self.image_atomic(
+            Opcode::BoundImageAtomicDec32,
+            Opcode::BindlessImageAtomicDec32,
+            handle,
+            coords,
+            value,
+            info,
+        )
+    }
+
+    pub fn image_atomic_and_32(
+        &mut self,
+        handle: Value,
+        coords: Value,
+        value: Value,
+        info: u32,
+    ) -> Value {
+        self.image_atomic(
+            Opcode::BoundImageAtomicAnd32,
+            Opcode::BindlessImageAtomicAnd32,
+            handle,
+            coords,
+            value,
+            info,
+        )
+    }
+
+    pub fn image_atomic_or_32(
+        &mut self,
+        handle: Value,
+        coords: Value,
+        value: Value,
+        info: u32,
+    ) -> Value {
+        self.image_atomic(
+            Opcode::BoundImageAtomicOr32,
+            Opcode::BindlessImageAtomicOr32,
+            handle,
+            coords,
+            value,
+            info,
+        )
+    }
+
+    pub fn image_atomic_xor_32(
+        &mut self,
+        handle: Value,
+        coords: Value,
+        value: Value,
+        info: u32,
+    ) -> Value {
+        self.image_atomic(
+            Opcode::BoundImageAtomicXor32,
+            Opcode::BindlessImageAtomicXor32,
+            handle,
+            coords,
+            value,
+            info,
+        )
+    }
+
+    pub fn image_atomic_exchange_32(
+        &mut self,
+        handle: Value,
+        coords: Value,
+        value: Value,
+        info: u32,
+    ) -> Value {
+        self.image_atomic(
+            Opcode::BoundImageAtomicExchange32,
+            Opcode::BindlessImageAtomicExchange32,
+            handle,
+            coords,
+            value,
+            info,
+        )
     }
 
     // ── Warp / Subgroup ───────────────────────────────────────────────
@@ -1630,5 +2009,36 @@ impl<'a> Emitter<'a> {
 
     pub fn unpack_double_2x32(&mut self, a: Value) -> Value {
         self.emit(Inst::new(Opcode::UnpackDouble2x32, vec![a]))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ir::types::ShaderStage;
+
+    #[test]
+    fn get_sparse_from_op_associates_pseudo_with_parent() {
+        let mut program = Program::new(ShaderStage::Fragment);
+        let block = program.add_block();
+        let mut emitter = Emitter::new(&mut program, block);
+
+        let sample = emitter.image_sample_implicit_lod(Value::ImmU32(0), Value::ImmF32(0.0), 0);
+        let sparse = emitter.get_sparse_from_op(sample);
+
+        let Value::Inst(sample_ref) = sample else {
+            panic!("sample should be an instruction value");
+        };
+        let Value::Inst(sparse_ref) = sparse else {
+            panic!("sparse should be an instruction value");
+        };
+        assert_eq!(
+            emitter
+                .program
+                .block(sample_ref.block)
+                .inst(sample_ref.inst)
+                .get_associated_pseudo(Opcode::GetSparseFromOp),
+            Some(sparse_ref)
+        );
     }
 }

@@ -88,6 +88,10 @@ impl KProcessPageTable {
         self.base.get_alias_region_size()
     }
 
+    pub fn is_in_alias_region(&self, addr: KProcessAddress, size: usize) -> bool {
+        self.base.is_in_alias_region(addr.get() as usize, size)
+    }
+
     pub fn get_stack_region_start(&self) -> KProcessAddress {
         KProcessAddress::new(self.base.get_stack_region_start() as u64)
     }
@@ -210,6 +214,13 @@ impl KProcessPageTable {
 
     pub fn query_info(&self, addr: usize) -> Option<KMemoryInfo> {
         self.base.query_info(addr)
+    }
+
+    pub fn query_info_with_page_info(
+        &self,
+        addr: usize,
+    ) -> Option<(KMemoryInfo, super::svc::svc_types::PageInfo)> {
+        self.base.query_info_with_page_info(addr)
     }
 
     pub fn dump_memory_blocks(&self) {

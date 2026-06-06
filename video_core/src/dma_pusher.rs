@@ -570,9 +570,7 @@ impl DmaPusher {
     }
 
     fn set_current_engine_dirty(&mut self, dirty: bool) {
-        let Some(engine_id) = self.puller.bound_engines[self.dma_state.subchannel as usize] else {
-            return;
-        };
+        let engine_id = self.puller.bound_engines[self.dma_state.subchannel as usize];
         match engine_id {
             EngineID::MaxwellB => {
                 if let Some(engine) = self.subchannels[self.dma_state.subchannel as usize] {
@@ -587,13 +585,14 @@ impl DmaPusher {
                     unsafe { engine.as_mut() }.set_current_dirty(dirty);
                 }
             }
+            _ => {}
         }
     }
 
     fn update_current_dirty_for_fetch(&mut self, command_gpu_addr: GPUVAddr, word_count: u32) {
         let needs_dirty_check = self.dma_state.method >= MACRO_REGISTERS_START
             || (self.puller.bound_engines[self.dma_state.subchannel as usize]
-                == Some(EngineID::KeplerComputeB)
+                == EngineID::KeplerComputeB
                 && self.dma_state.method == COMPUTE_INLINE);
         if !needs_dirty_check {
             return;
@@ -863,7 +862,7 @@ impl DmaPusher {
                 return true;
             }
             return self.puller.bound_engines[self.dma_state.subchannel as usize]
-                == Some(EngineID::KeplerComputeB)
+                == EngineID::KeplerComputeB
                 && self.dma_state.method == COMPUTE_INLINE;
         }
         true

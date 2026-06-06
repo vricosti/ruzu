@@ -470,54 +470,6 @@ impl DynarmicCallbacks64 {
         *ctx = thread_context_from_jit_state(jit_state, pc);
     }
 
-    fn try_read_guest_u64_for_diag(&self, vaddr: u64) -> Option<u64> {
-        if let Some(ref cm) = self.core_memory {
-            let memory = cm.lock().unwrap();
-            if !memory.is_valid_virtual_address_range(vaddr, 8) {
-                return None;
-            }
-            Some(memory.read_64(vaddr))
-        } else {
-            let memory = self.memory.read().unwrap();
-            if !memory.is_valid_range(vaddr, 8) {
-                return None;
-            }
-            Some(memory.read_64(vaddr))
-        }
-    }
-
-    fn format_guest_frame_chain_for_diag(&self, fp: u64) -> String {
-        if fp == 0 {
-            return "fp=<null>".to_string();
-        }
-
-        let prev_fp0 = self.try_read_guest_u64_for_diag(fp);
-        let ret0 = self.try_read_guest_u64_for_diag(fp.saturating_add(8));
-
-        let (prev_fp1, ret1) = if let Some(prev_fp0) = prev_fp0 {
-            (
-                self.try_read_guest_u64_for_diag(prev_fp0),
-                self.try_read_guest_u64_for_diag(prev_fp0.saturating_add(8)),
-            )
-        } else {
-            (None, None)
-        };
-
-        format!(
-            "fp0=0x{fp:016X} prev_fp0={} ret0={} prev_fp1={} ret1={}",
-            prev_fp0
-                .map(|value| format!("0x{value:016X}"))
-                .unwrap_or_else(|| "<invalid>".to_string()),
-            ret0.map(|value| format!("0x{value:016X}"))
-                .unwrap_or_else(|| "<invalid>".to_string()),
-            prev_fp1
-                .map(|value| format!("0x{value:016X}"))
-                .unwrap_or_else(|| "<invalid>".to_string()),
-            ret1.map(|value| format!("0x{value:016X}"))
-                .unwrap_or_else(|| "<invalid>".to_string()),
-        )
-    }
-
     /// Matches upstream `DynarmicCallbacks64::CheckMemoryAccess`.
     ///
     /// Upstream behavior: `m_check_memory_access` is only true when
@@ -760,11 +712,10 @@ x0=0x{:016X} x1=0x{:016X} x2=0x{:016X} x19=0x{:016X} x20=0x{:016X} x21=0x{:016X}
                         (pc_ptr as *const u8).sub(A64JitState::offset_of_pc()) as *const A64JitState
                     };
                     let jit_state = unsafe { &*jit_state_ptr };
-                    let frame_chain = self.format_guest_frame_chain_for_diag(jit_state.reg[29]);
                     eprintln!(
                         "[A64_INVALID_READ64] core={} vaddr=0x{:016X} pc=0x{:016X} lr=0x{:016X} sp=0x{:016X} \
 x29=0x{:016X} x0=0x{:016X} x1=0x{:016X} x2=0x{:016X} x3=0x{:016X} x4=0x{:016X} x5=0x{:016X} \
-x19=0x{:016X} x20=0x{:016X} x21=0x{:016X} x22=0x{:016X} x25=0x{:016X} {}",
+x19=0x{:016X} x20=0x{:016X} x21=0x{:016X} x22=0x{:016X} x25=0x{:016X}",
                         self.core_index,
                         vaddr,
                         jit_state.pc,
@@ -782,7 +733,6 @@ x19=0x{:016X} x20=0x{:016X} x21=0x{:016X} x22=0x{:016X} x25=0x{:016X} {}",
                         jit_state.reg[21],
                         jit_state.reg[22],
                         jit_state.reg[25],
-                        frame_chain,
                     );
                     if let Ok(spec) = std::env::var("RUZU_DUMP_ON_INVALID") {
                         use std::sync::atomic::{AtomicU32, Ordering};

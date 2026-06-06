@@ -8,7 +8,7 @@
 //! Two phases:
 //! 1. For each instruction argument, resolve chains of Identity instructions
 //!    so that `Identity(Identity(x))` becomes just `x`.
-//! 2. Erase Identity slots after all users have been rewritten.
+//! 2. Erase Identity/Void slots after all users have been rewritten.
 
 use crate::ir::opcodes::Opcode;
 use crate::ir::program::{Program, SyntaxNode};
@@ -20,11 +20,14 @@ pub fn identity_removal_pass(program: &mut Program) {
     // For each instruction that is Identity, record what it resolves to.
     let mut identity_targets: std::collections::HashMap<(u32, u32), Value> =
         std::collections::HashMap::new();
+    let mut void_insts = Vec::new();
 
     for (block_idx, block) in program.blocks.iter().enumerate() {
         for (inst_idx, inst) in block.indexed_iter() {
             if inst.opcode == Opcode::Identity && !inst.args.is_empty() {
                 identity_targets.insert((block_idx as u32, inst_idx), inst.args[0]);
+            } else if inst.opcode == Opcode::Void {
+                void_insts.push((block_idx as u32, inst_idx));
             }
         }
     }
@@ -73,7 +76,8 @@ pub fn identity_removal_pass(program: &mut Program) {
     // Phase 3: erase list nodes whose users have already been rewritten.
     // `Block` keeps stable slots, so this matches upstream physical erase
     // semantics without shifting later `InstRef` identities.
-    let erased: Vec<(u32, u32)> = identity_targets.keys().copied().collect();
+    let mut erased: Vec<(u32, u32)> = identity_targets.keys().copied().collect();
+    erased.extend(void_insts);
     for (block_idx, inst_idx) in erased {
         if let Some(block) = program.blocks.get_mut(block_idx as usize) {
             if (inst_idx as usize) < block.instructions.len() {
@@ -139,5 +143,22 @@ mod tests {
                 inst: source,
             })
         );
+    }
+
+    #[test]
+    fn identity_removal_erases_void_instructions() {
+        let mut program = Program::new(ShaderStage::VertexB);
+        program.blocks.push(Block::new());
+        let live = program.blocks[0].append_inst(Inst::new(Opcode::IAdd32, vec![]));
+        let void = program.blocks[0].append_inst(Inst::new(Opcode::Void, vec![]));
+
+        identity_removal_pass(&mut program);
+
+        assert!(program.blocks[0].instructions[void as usize].is_none());
+        let order: Vec<u32> = program.blocks[0]
+            .indexed_iter()
+            .map(|(index, _)| index)
+            .collect();
+        assert_eq!(order, vec![live]);
     }
 }

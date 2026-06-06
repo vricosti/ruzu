@@ -7,7 +7,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use crate::hle::result::ResultCode;
+use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
 use crate::hle::service::ipc_helpers::{RequestParser, ResponseBuilder};
 use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
@@ -34,6 +34,15 @@ impl IApplicationRootService {
         }
     }
 
+    fn push_interface_response(
+        ctx: &mut HLERequestContext,
+        object: Arc<dyn SessionRequestHandler>,
+    ) {
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 1);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_ipc_interface(object);
+    }
+
     fn get_display_service(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         let root = unsafe { &*(this as *const dyn ServiceFramework as *const Self) };
         log::debug!("IApplicationRootService::GetDisplayService called");
@@ -53,7 +62,7 @@ impl IApplicationRootService {
                         Arc::clone(&root.container),
                     );
                 let sub: Arc<dyn SessionRequestHandler> = Arc::new(display_service);
-                super::super::am::service::application_proxy::IApplicationProxy::push_interface_response(ctx, sub);
+                Self::push_interface_response(ctx, sub);
             }
             Err(_) => {
                 log::error!("GetDisplayService: permission denied");

@@ -59,6 +59,15 @@ pub struct FramebufferConfig {
     pub blending: BlendMode,
 }
 
+/// Mirrors upstream `VideoCore::RasterizerDownloadArea` across the `core` /
+/// `video_core` crate boundary.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RasterizerDownloadArea {
+    pub start_address: u64,
+    pub end_address: u64,
+    pub preemptive: bool,
+}
+
 /// Opaque GPU memory-manager state handle.
 pub trait GpuMemoryManagerHandle: Any + Send + Sync {
     fn as_any(&self) -> &(dyn Any + Send + Sync);
@@ -118,6 +127,17 @@ pub trait GpuCoreInterface: Any + Send {
     /// Mirrors the upstream `GPU::OnCPUWrite(DAddr, u64)`.
     fn on_cpu_write(&self, addr: u64, size: u64) -> bool;
 
+    /// Mirrors the upstream `GPU::OnCPURead(DAddr, u64)`.
+    fn on_cpu_read(&self, addr: u64, size: u64) -> RasterizerDownloadArea;
+
     /// Mirrors the upstream `GPU::FlushRegion(DAddr, u64)`.
     fn flush_region(&self, addr: u64, size: u64);
+
+    /// Mirrors the upstream `GPU::InvalidateRegion(DAddr, u64)`.
+    fn invalidate_region(&self, _addr: u64, _size: u64) {}
+
+    /// Mirrors the upstream `GPU::GetAppletCaptureBuffer()`.
+    fn get_applet_capture_buffer(&self) -> Vec<u8> {
+        Vec::new()
+    }
 }

@@ -107,10 +107,14 @@ impl Nvdec {
     ///
     /// Port of `Nvdec::Execute`.
     fn execute(&mut self) {
-        // Upstream checks Settings::values.nvdec_emulation for NvdecEmulation::Off.
-        // When off, it sleeps 8ms (half a 60fps frame) and returns to prevent games
-        // from getting stuck due to <1ms execution time. The Settings crate is not
-        // yet wired to video_core, so this check is omitted; decoding always proceeds.
+        if *common::settings::values().nvdec_emulation.get_value()
+            == common::settings_enums::NvdecEmulation::Off
+        {
+            // Upstream delays disabled NVDEC work so games do not observe an
+            // unrealistically fast syncpoint signal.
+            std::thread::sleep(std::time::Duration::from_millis(8));
+            return;
+        }
 
         if let Some(ref mut dec) = self.decoder {
             let _ = common::trace::emit(

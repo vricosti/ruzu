@@ -139,10 +139,17 @@ pub fn map_physical_memory(system: &System, addr: u64, size: u64) -> ResultCode 
 
     let mut process = system.current_process_arc().lock().unwrap();
 
-    // Upstream: R_UNLESS(current_process->GetTotalSystemResourceSize() == 0, ResultInvalidState)
-    // Note: upstream checks this is non-zero, which means if it IS zero, we fail.
-    // For now, skip this check since system_resource_size is not tracked yet on KProcess fields.
-    // Upstream note: Add total_system_resource_size field to KProcess and check here.
+    if process.get_total_system_resource_size() == 0 {
+        log::error!("System Resource Size is zero");
+        trace_physical_memory_svc(
+            system,
+            "MapPhysicalMemory",
+            addr,
+            size,
+            RESULT_INVALID_STATE.get_inner_value(),
+        );
+        return RESULT_INVALID_STATE;
+    }
 
     let addr_kpa = crate::hle::kernel::k_typed_address::KProcessAddress::new(addr);
     if !process.page_table.contains(addr_kpa, size as usize) {
@@ -160,8 +167,25 @@ pub fn map_physical_memory(system: &System, addr: u64, size: u64) -> ResultCode 
         );
         return RESULT_INVALID_MEMORY_REGION;
     }
+    if !process
+        .page_table
+        .is_in_alias_region(addr_kpa, size as usize)
+    {
+        log::error!(
+            "Address is not within the alias region, addr=0x{:016X}, size=0x{:016X}",
+            addr,
+            size
+        );
+        trace_physical_memory_svc(
+            system,
+            "MapPhysicalMemory",
+            addr,
+            size,
+            RESULT_INVALID_MEMORY_REGION.get_inner_value(),
+        );
+        return RESULT_INVALID_MEMORY_REGION;
+    }
 
-    // The base page table's map_physical_memory checks is_in_alias_region internally.
     let result = process
         .page_table
         .map_physical_memory(addr_kpa, size as usize);
@@ -231,7 +255,17 @@ pub fn unmap_physical_memory(system: &System, addr: u64, size: u64) -> ResultCod
 
     let mut process = system.current_process_arc().lock().unwrap();
 
-    // Upstream note: Check GetTotalSystemResourceSize() == 0 => ResultInvalidState
+    if process.get_total_system_resource_size() == 0 {
+        log::error!("System Resource Size is zero");
+        trace_physical_memory_svc(
+            system,
+            "UnmapPhysicalMemory",
+            addr,
+            size,
+            RESULT_INVALID_STATE.get_inner_value(),
+        );
+        return RESULT_INVALID_STATE;
+    }
 
     let addr_kpa = crate::hle::kernel::k_typed_address::KProcessAddress::new(addr);
     if !process.page_table.contains(addr_kpa, size as usize) {
@@ -249,8 +283,25 @@ pub fn unmap_physical_memory(system: &System, addr: u64, size: u64) -> ResultCod
         );
         return RESULT_INVALID_MEMORY_REGION;
     }
+    if !process
+        .page_table
+        .is_in_alias_region(addr_kpa, size as usize)
+    {
+        log::error!(
+            "Address is not within the alias region, addr=0x{:016X}, size=0x{:016X}",
+            addr,
+            size
+        );
+        trace_physical_memory_svc(
+            system,
+            "UnmapPhysicalMemory",
+            addr,
+            size,
+            RESULT_INVALID_MEMORY_REGION.get_inner_value(),
+        );
+        return RESULT_INVALID_MEMORY_REGION;
+    }
 
-    // The base page table's unmap_physical_memory checks is_in_alias_region internally.
     let result = process
         .page_table
         .unmap_physical_memory(addr_kpa, size as usize);

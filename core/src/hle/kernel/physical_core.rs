@@ -195,35 +195,11 @@ impl PhysicalCore {
         let _ = scheduler;
         let _ = process;
         self.handoff_after_svc(jit, thread_context, current_thread);
-        if let Some(threshold) = std::env::var("RUZU_LOG_AFTER_SVC")
-            .ok()
-            .and_then(|value| value.parse::<u32>().ok())
-        {
-            if svc_count >= threshold {
-                jit.get_context(thread_context);
-                let insn = process
-                    .lock()
-                    .unwrap()
-                    .process_memory
-                    .read()
-                    .unwrap()
-                    .read_32(thread_context.pc);
-                log::info!(
-                    "PhysicalCore::dispatch_supervisor_call after handoff: core={} svc_count={} svc=0x{:x} pc=0x{:08X} sp=0x{:08X} insn=0x{:08X}",
-                    self.m_core_index,
-                    svc_count,
-                    svc_num,
-                    thread_context.pc,
-                    thread_context.sp,
-                    insn,
-                );
-            }
-        }
         log::trace!(
             "dispatch_supervisor_call: after handoff (svc=0x{:x})",
             svc_num
         );
-        true
+        false
     }
 
     pub fn run_loop<FSvc, FHalt>(
@@ -250,64 +226,9 @@ impl PhysicalCore {
     {
         let mut svc_count = 0u32;
         let mut iteration = 0u32;
-        let mut step_after_svc = std::env::var("RUZU_STEP_AFTER_SVC")
-            .ok()
-            .and_then(|value| value.parse::<u32>().ok());
-        let log_step_interval = std::env::var("RUZU_LOG_STEP_INTERVAL")
-            .ok()
-            .and_then(|value| value.parse::<u32>().ok())
-            .filter(|value| *value > 0);
-
-        #[cfg(feature = "debug-logs")]
-        let mut ring_buf = physical_core_log::InstructionRingBuffer::new();
         loop {
-            let use_step = step_after_svc.is_some_and(|threshold| svc_count >= threshold);
-            let event = if use_step {
-                self.step_thread(jit, thread)
-            } else {
-                self.run_thread(jit, thread)
-            };
+            let event = self.run_thread(jit, thread);
             iteration += 1;
-
-            if use_step {
-                jit.get_context(thread_context);
-                if let Some(interval) = log_step_interval {
-                    if iteration % interval == 0 {
-                        let insn = process
-                            .lock()
-                            .unwrap()
-                            .process_memory
-                            .read()
-                            .unwrap()
-                            .read_32(thread_context.pc);
-                        log::info!(
-                            "PhysicalCore::run_loop step trace: core={} svc_count={} iteration={} pc=0x{:08X} sp=0x{:08X} insn=0x{:08X}",
-                            self.m_core_index,
-                            svc_count,
-                            iteration,
-                            thread_context.pc,
-                            thread_context.sp,
-                            insn,
-                        );
-                    }
-                }
-                #[cfg(feature = "debug-logs")]
-                {
-                    let insn = process
-                        .lock()
-                        .unwrap()
-                        .process_memory
-                        .read()
-                        .unwrap()
-                        .read_32(thread_context.pc);
-                    ring_buf.record(thread_context, insn);
-                    ring_buf.check_initlibc0_entry(thread_context);
-                    ring_buf.check_rtld_init_return(thread_context);
-                    if ring_buf.check_and_dump_abort(thread_context) {
-                        step_after_svc = None;
-                    }
-                }
-            }
 
             match event {
                 PhysicalCoreExecutionEvent::SupervisorCall {
@@ -692,6 +613,7 @@ mod tests {
         halt_reasons: VecDeque<HaltReason>,
         context: ThreadContext,
         tpidrro_el0: u64,
+        set_svc_arguments_count: usize,
     }
 
     impl TestArmInterface {
@@ -700,6 +622,7 @@ mod tests {
                 halt_reasons: halt_reasons.into(),
                 context: ThreadContext::default(),
                 tpidrro_el0: 0,
+                set_svc_arguments_count: 0,
             }
         }
     }
@@ -739,7 +662,9 @@ mod tests {
             *args = [0; 8];
         }
 
-        fn set_svc_arguments(&mut self, _args: &[u64; 8]) {}
+        fn set_svc_arguments(&mut self, _args: &[u64; 8]) {
+            self.set_svc_arguments_count += 1;
+        }
 
         fn get_svc_number(&self) -> u32 {
             0
@@ -922,6 +847,88 @@ mod tests {
         assert_eq!(
             scheduler.lock().unwrap().get_scheduler_current_thread_id(),
             Some(1)
+        );
+    }
+
+    #[test]
+    fn dispatch_supervisor_call_exit_thread_returns_false_without_handoff() {
+        let (physical_core, process, scheduler, current_thread, system) = test_context();
+        let mut thread_context = ThreadContext::default();
+        let mut jit = TestArmInterface::new(VecDeque::new());
+        physical_core.initialize_guest_runtime(
+            current_thread.clone(),
+            &mut jit,
+            &mut thread_context,
+        );
+        crate::hle::kernel::kernel::set_current_emu_thread(Some(&current_thread));
+
+        let original_thread_pc = current_thread.lock().unwrap().thread_context.r[15];
+        jit.context.pc = 0x200ABC;
+        jit.context.r[0] = 0x1122;
+        let mut svc_args: SvcArgs = [0xDEAD; 8];
+
+        let continue_thread = physical_core.dispatch_supervisor_call(
+            &mut jit,
+            &mut thread_context,
+            &scheduler,
+            &process,
+            &current_thread,
+            SvcId::ExitThread as u32,
+            1,
+            false,
+            &mut svc_args,
+            &system,
+        );
+        crate::hle::kernel::kernel::set_current_emu_thread(None);
+        KWorkerTaskManager::wait_for_global_idle();
+
+        assert!(!continue_thread);
+        assert_eq!(jit.set_svc_arguments_count, 0);
+        assert_eq!(
+            current_thread.lock().unwrap().thread_context.r[15],
+            original_thread_pc
+        );
+        assert_eq!(
+            current_thread.lock().unwrap().get_state(),
+            ThreadState::TERMINATED
+        );
+    }
+
+    #[test]
+    fn dispatch_supervisor_call_returns_false_after_non_exit_svc_handoff() {
+        let (physical_core, process, scheduler, current_thread, system) = test_context();
+        let mut thread_context = ThreadContext::default();
+        let mut jit = TestArmInterface::new(VecDeque::new());
+        physical_core.initialize_guest_runtime(
+            current_thread.clone(),
+            &mut jit,
+            &mut thread_context,
+        );
+        crate::hle::kernel::kernel::set_current_emu_thread(Some(&current_thread));
+
+        jit.context.pc = 0x200ABC;
+        jit.context.r[0] = 0x1122;
+        let mut svc_args: SvcArgs = [0; 8];
+
+        let continue_thread = physical_core.dispatch_supervisor_call(
+            &mut jit,
+            &mut thread_context,
+            &scheduler,
+            &process,
+            &current_thread,
+            SvcId::GetSystemTick as u32,
+            1,
+            false,
+            &mut svc_args,
+            &system,
+        );
+        crate::hle::kernel::kernel::set_current_emu_thread(None);
+
+        assert!(!continue_thread);
+        assert_eq!(jit.set_svc_arguments_count, 1);
+        assert_eq!(
+            current_thread.lock().unwrap().thread_context.r[15],
+            0x200ABC
         );
     }
 }

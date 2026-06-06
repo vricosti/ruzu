@@ -386,6 +386,7 @@ mod tests {
         rast.set_guest_memory_writer(Arc::new(move |addr, data| {
             written_cb.lock().unwrap().push((addr, data.to_vec()));
         }));
+        rast.set_gpu_to_cpu_translator(Arc::new(Some));
         rast.query(0x1000, 0, QueryPropertiesFlags::empty(), 42, 0);
 
         let w = written.lock().unwrap();
@@ -404,6 +405,7 @@ mod tests {
         rast.set_guest_memory_writer(Arc::new(move |addr, data| {
             written_cb.lock().unwrap().push((addr, data.to_vec()));
         }));
+        rast.set_gpu_to_cpu_translator(Arc::new(Some));
         rast.set_gpu_ticks_getter(Arc::new(|| 0x1234_5678_9ABC_DEF0));
         rast.query(0x2000, 0, QueryPropertiesFlags::HAS_TIMEOUT, 99, 0);
 
@@ -425,6 +427,7 @@ mod tests {
         rast.set_guest_memory_writer(Arc::new(move |addr, data| {
             written_cb.lock().unwrap().push((addr, data.to_vec()));
         }));
+        rast.set_gpu_to_cpu_translator(Arc::new(Some));
         rast.query(0x3000, 2, QueryPropertiesFlags::empty(), 0xDEAD_BEEF, 0);
 
         let w = written.lock().unwrap();
@@ -461,16 +464,18 @@ mod tests {
         let mut rast = RasterizerNull::new(sp);
         let gpu = crate::gpu::Gpu::new(false, false);
         let mut channel = ChannelState::new(9);
-        channel.memory_manager = Some(Arc::new(Mutex::new(
+        let memory_manager = Arc::new(Mutex::new(
             crate::memory_manager::MemoryManager::new_with_geometry(3, 32, 0x1_0000_0000, 17, 12),
-        )));
+        ));
+        let expected_memory_id = memory_manager.lock().get_id();
+        channel.memory_manager = Some(memory_manager);
         channel.init(&gpu, 0x1234);
 
         rast.initialize_channel(&channel);
         rast.bind_channel(&channel);
 
         assert_eq!(rast.channel_caches.program_id, 0x1234);
-        assert_eq!(rast.channel_caches.gpu_memory, Some(0));
+        assert_eq!(rast.channel_caches.gpu_memory, Some(expected_memory_id));
 
         rast.release_channel(9);
         assert_eq!(rast.channel_caches.program_id, 0);

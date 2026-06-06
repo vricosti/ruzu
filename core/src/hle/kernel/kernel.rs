@@ -1979,7 +1979,19 @@ impl KernelCore {
         };
 
         for manager in server_managers {
-            manager.lock().unwrap().request_stop();
+            let should_wait = {
+                let guard = manager.lock().unwrap();
+                guard.request_stop();
+                guard.loop_started()
+            };
+
+            if should_wait {
+                while !manager.lock().unwrap().is_stopped() {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+            }
+
+            manager.lock().unwrap().join_host_threads();
         }
     }
 
@@ -2029,7 +2041,7 @@ impl KernelCore {
             &manager,
         );
 
-        manager.lock().unwrap().loop_process();
+        crate::hle::service::server_manager::ServerManager::loop_process_shared(&manager);
     }
 
     #[cfg(test)]

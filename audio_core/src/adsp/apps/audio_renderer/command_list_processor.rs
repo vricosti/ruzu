@@ -520,7 +520,7 @@ mod tests {
         let written = command_buffer.serialize_into(&header, &mut bytes);
         bytes.truncate(written);
 
-        let sink = new_sink_handle(Box::new(NullSink::new("test")));
+        let sink = new_sink_handle(Box::new(NullSink::new_recording_for_test("test")));
         let stream = sink
             .lock()
             .acquire_sink_stream(system, 2, "processor", StreamType::Render);

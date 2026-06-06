@@ -531,6 +531,11 @@ pub struct KProcess {
     pub session_objects: BTreeMap<u64, Arc<Mutex<KSession>>>,
     pub client_session_objects: BTreeMap<u64, Arc<Mutex<KClientSession>>>,
     pub client_session_parent_ids: BTreeMap<u64, u64>,
+    pub light_session_objects: BTreeMap<u64, Arc<Mutex<super::k_light_session::KLightSession>>>,
+    pub light_client_session_objects:
+        BTreeMap<u64, Arc<Mutex<super::k_light_client_session::KLightClientSession>>>,
+    pub light_server_session_objects:
+        BTreeMap<u64, Arc<Mutex<super::k_light_server_session::KLightServerSession>>>,
     pub client_port_objects: BTreeMap<u64, Arc<Mutex<KPort>>>,
     pub server_port_objects: BTreeMap<u64, Arc<Mutex<KPort>>>,
     pub event_objects: BTreeMap<u64, Arc<Mutex<KEvent>>>,
@@ -562,6 +567,8 @@ pub struct KProcess {
     /// Each process owns its own Memory instance with its own `current_page_table`,
     /// sharing the backing `DeviceMemory` with all other processes via `System`.
     pub memory: Option<Arc<Mutex<crate::memory::memory::Memory>>>,
+    /// Snapshot of upstream `System::DebuggerEnabled()` for JIT construction.
+    debugger_enabled: bool,
     pub debug_page_refcounts: BTreeMap<u64, u64>,
     pub cpu_time: AtomicI64,
     pub num_process_switches: AtomicI64,
@@ -656,6 +663,9 @@ impl KProcess {
             session_objects: BTreeMap::new(),
             client_session_objects: BTreeMap::new(),
             client_session_parent_ids: BTreeMap::new(),
+            light_session_objects: BTreeMap::new(),
+            light_client_session_objects: BTreeMap::new(),
+            light_server_session_objects: BTreeMap::new(),
             client_port_objects: BTreeMap::new(),
             server_port_objects: BTreeMap::new(),
             event_objects: BTreeMap::new(),
@@ -676,6 +686,7 @@ impl KProcess {
             watchpoints: [DebugWatchpoint::default(); NUM_WATCHPOINTS],
             process_memory: process_memory.clone(),
             memory: None,
+            debugger_enabled: false,
             debug_page_refcounts: BTreeMap::new(),
             cpu_time: AtomicI64::new(0),
             num_process_switches: AtomicI64::new(0),
@@ -709,6 +720,7 @@ impl KProcess {
         // Wire into page table so page-table-level operations can use it
         self.page_table.get_base_mut().m_memory = Some(memory_arc.clone());
         self.memory = Some(memory_arc);
+        self.debugger_enabled = system.debugger_enabled();
     }
 
     /// Get the per-process Memory bridge.
@@ -833,6 +845,7 @@ impl KProcess {
                     shared_memory.clone(),
                     core_timing.clone(),
                     Some(memory.clone()),
+                    self.debugger_enabled,
                 ));
                 // Set the parent pointer now that ArmDynarmic32 is at its final
                 // stable location inside the Box. Callbacks access parent fields
@@ -1160,11 +1173,11 @@ impl KProcess {
     pub fn attach_scheduler(&mut self, scheduler: &Arc<Mutex<KScheduler>>) {
         self.scheduler = Some(Arc::downgrade(scheduler));
         // Also wire the GSC from the scheduler so PQ operations work.
-        let sched = scheduler.lock().unwrap();
-        if let Some(ref gsc) = sched.global_scheduler_context {
-            self.global_scheduler_context = Some(Arc::clone(gsc));
+        let gsc = scheduler.lock().unwrap().global_scheduler_context.clone();
+        if let Some(gsc) = gsc {
+            self.set_global_scheduler_context(gsc);
+            return;
         }
-        drop(sched);
         self.refresh_registered_thread_scheduler_state();
     }
 
@@ -2665,6 +2678,9 @@ impl KProcess {
         self.session_objects.clear();
         self.client_session_objects.clear();
         self.client_session_parent_ids.clear();
+        self.light_session_objects.clear();
+        self.light_client_session_objects.clear();
+        self.light_server_session_objects.clear();
         self.client_port_objects.clear();
         self.server_port_objects.clear();
         self.event_objects.clear();
@@ -2916,6 +2932,46 @@ impl KProcess {
         object_id: u64,
     ) -> Option<Arc<Mutex<super::k_transfer_memory::KTransferMemory>>> {
         self.transfer_memory_objects.get(&object_id).cloned()
+    }
+
+    pub fn register_light_session_object(
+        &mut self,
+        object_id: u64,
+        light_session: Arc<Mutex<super::k_light_session::KLightSession>>,
+    ) {
+        self.light_session_objects.insert(object_id, light_session);
+    }
+
+    pub fn register_light_client_session_object(
+        &mut self,
+        object_id: u64,
+        light_client_session: Arc<Mutex<super::k_light_client_session::KLightClientSession>>,
+    ) {
+        self.light_client_session_objects
+            .insert(object_id, light_client_session);
+    }
+
+    pub fn register_light_server_session_object(
+        &mut self,
+        object_id: u64,
+        light_server_session: Arc<Mutex<super::k_light_server_session::KLightServerSession>>,
+    ) {
+        self.light_server_session_objects
+            .insert(object_id, light_server_session);
+    }
+
+    pub fn get_light_client_session_by_object_id(
+        &self,
+        object_id: u64,
+    ) -> Option<Arc<Mutex<super::k_light_client_session::KLightClientSession>>> {
+        self.light_client_session_objects.get(&object_id).cloned()
+    }
+
+    pub fn get_light_server_session_by_object_id(
+        &self,
+        object_id: u64,
+    ) -> Option<Arc<Mutex<super::k_light_server_session::KLightServerSession>>> {
+        self.light_server_session_objects.get(&object_id).cloned()
     }
 
     /// Remove a handle and release any Rust-side owner registry entry that no

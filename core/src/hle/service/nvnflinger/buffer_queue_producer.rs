@@ -34,7 +34,7 @@ use super::graphic_buffer_producer::{QueueBufferInput, QueueBufferOutput};
 use super::parcel::{InputParcel, OutputParcel};
 use super::pixel_format::PixelFormat;
 use super::producer_listener::IProducerListener;
-use super::status::Status;
+use super::status::{Status, StatusCode};
 use super::ui::fence::Fence;
 use super::ui::graphic_buffer::{GraphicBuffer, NvGraphicBuffer};
 use super::window::{
@@ -128,7 +128,7 @@ impl BufferQueueProducer {
         &self,
         async_flag: bool,
         found: &mut i32,
-        return_flags: &mut i32,
+        return_flags: &mut StatusCode,
         mut inner: std::sync::MutexGuard<'a, super::buffer_queue_core::BufferQueueCoreInner>,
     ) -> (
         Status,
@@ -160,7 +160,7 @@ impl BufferQueueProducer {
                     && !inner.slots[slot].is_preallocated
                 {
                     inner.free_buffer_locked(slot as i32);
-                    *return_flags |= Status::RELEASE_ALL_BUFFERS as i32;
+                    *return_flags |= StatusCode::RELEASE_ALL_BUFFERS;
                 }
             }
 
@@ -344,7 +344,7 @@ impl BufferQueueProducer {
         mut height: u32,
         mut format: PixelFormat,
         mut usage: u32,
-    ) -> (i32, i32, Fence) {
+    ) -> (StatusCode, i32, Fence) {
         record_bqp_event(BqpEvent::DequeueBuffer);
         let bqp_seq = next_bqp_seq();
         super::diagnostics::record_bqp(
@@ -390,10 +390,10 @@ impl BufferQueueProducer {
                 width,
                 height
             );
-            return (Status::BadValue as i32, -1, Fence::default());
+            return (Status::BadValue.into(), -1, Fence::default());
         }
 
-        let mut return_flags = Status::NoError as i32;
+        let mut return_flags = StatusCode::NO_ERROR;
         let attached_by_consumer;
         let out_slot;
         let out_fence;
@@ -422,7 +422,7 @@ impl BufferQueueProducer {
                     0,
                     current_bqp_tid(),
                 ]);
-                return (status as i32, -1, Fence::default());
+                return (status.into(), -1, Fence::default());
             }
 
             if found == BufferQueueCore::INVALID_BUFFER_SLOT {
@@ -435,7 +435,7 @@ impl BufferQueueProducer {
                     0,
                     current_bqp_tid(),
                 ]);
-                return (Status::Busy as i32, -1, Fence::default());
+                return (Status::Busy.into(), -1, Fence::default());
             }
 
             out_slot = found;
@@ -463,14 +463,14 @@ impl BufferQueueProducer {
                 inner.slots[found as usize].graphic_buffer = None;
                 inner.slots[found as usize].request_buffer_called = false;
                 inner.slots[found as usize].fence = Fence::no_fence();
-                return_flags |= Status::BUFFER_NEEDS_REALLOCATION as i32;
+                return_flags |= StatusCode::BUFFER_NEEDS_REALLOCATION;
             }
 
             out_fence = inner.slots[found as usize].fence;
             inner.slots[found as usize].fence = Fence::no_fence();
         }
 
-        if (return_flags & Status::BUFFER_NEEDS_REALLOCATION as i32) != 0 {
+        if return_flags.contains(StatusCode::BUFFER_NEEDS_REALLOCATION) {
             log::debug!(
                 "BufferQueueProducer::dequeue_buffer allocating a new buffer for slot {}",
                 out_slot
@@ -488,7 +488,7 @@ impl BufferQueueProducer {
                         0,
                         current_bqp_tid(),
                     ]);
-                    return (Status::NoInit as i32, -1, Fence::default());
+                    return (Status::NoInit.into(), -1, Fence::default());
                 }
                 inner.slots[out_slot as usize].frame_number = u32::MAX as u64;
                 inner.slots[out_slot as usize].graphic_buffer = Some(graphic_buffer);
@@ -496,29 +496,30 @@ impl BufferQueueProducer {
         }
 
         if attached_by_consumer {
-            return_flags |= Status::BUFFER_NEEDS_REALLOCATION as i32;
+            return_flags |= StatusCode::BUFFER_NEEDS_REALLOCATION;
         }
 
         log::debug!(
             "BufferQueueProducer::dequeue_buffer returning slot={} flags={}",
             out_slot,
-            return_flags
+            return_flags.raw()
         );
         trace_bqp(format_args!(
             "BQP::dequeue_buffer -> slot={} flags={}",
-            out_slot, return_flags
+            out_slot,
+            return_flags.raw()
         ));
         log::info!(
             "[BQP_DEQUEUE_RET] slot={} flags=0x{:X}",
             out_slot,
-            return_flags
+            return_flags.raw()
         );
         trace_bqp_ring(&[
             2,
             bqp_seq,
             Status::NoError as i32 as u64,
             out_slot as i64 as u64,
-            return_flags as i64 as u64,
+            return_flags.raw() as i64 as u64,
             current_bqp_tid(),
         ]);
         super::diagnostics::record_bqp(
@@ -527,7 +528,7 @@ impl BufferQueueProducer {
                 bqp_seq,
                 Status::NoError as i32 as u64,
                 out_slot as i64 as u64,
-                return_flags as i64 as u64,
+                return_flags.raw() as i64 as u64,
                 current_bqp_tid(),
                 0,
             ],
@@ -1079,7 +1080,7 @@ impl IBinder for BufferQueueProducer {
         }
 
         let mut status = Status::NoError;
-        let mut raw_status: Option<i32> = None;
+        let mut dequeue_status: Option<StatusCode> = None;
         let mut parcel_in = InputParcel::new(parcel_data);
         let mut parcel_out = OutputParcel::new();
 
@@ -1118,8 +1119,8 @@ impl IBinder for BufferQueueProducer {
 
                 let (new_status, slot, fence) =
                     self.dequeue_buffer(is_async, width, height, pixel_format, usage);
-                raw_status = Some(new_status);
-                status = match new_status {
+                dequeue_status = Some(new_status);
+                status = match new_status.raw() {
                     0 => Status::NoError,
                     1 => Status::BUFFER_NEEDS_REALLOCATION,
                     2 => Status::RELEASE_ALL_BUFFERS,
@@ -1247,7 +1248,7 @@ impl IBinder for BufferQueueProducer {
             }
         }
 
-        let status_to_write = raw_status.unwrap_or(status as i32);
+        let status_to_write = dequeue_status.map_or(status as i32, StatusCode::raw);
         parcel_out.write(&status_to_write);
         let serialized = parcel_out.serialize();
         let copy_len = std::cmp::min(parcel_reply.len(), serialized.len());
@@ -1578,7 +1579,7 @@ mod tests {
 
         let (status, slot, _fence) =
             producer.dequeue_buffer(false, 16, 16, PixelFormat::Rgba8888, 0);
-        assert_eq!(status, Status::NoError as i32);
+        assert_eq!(status, Status::NoError.into());
         assert_eq!(slot, 0);
         let (status, _buffer) = producer.request_buffer(slot);
         assert_eq!(status, Status::NoError);
@@ -1601,7 +1602,7 @@ mod tests {
 
         let (status, slot, _fence) =
             producer.dequeue_buffer(false, 16, 16, PixelFormat::Rgba8888, 0);
-        assert_eq!(status, Status::NoError as i32);
+        assert_eq!(status, Status::NoError.into());
 
         let (status, _) = producer.queue_buffer(slot, &QueueBufferInput::default());
         assert_eq!(status, Status::BadValue);
@@ -1620,7 +1621,7 @@ mod tests {
 
         let (status, slot, _fence) =
             producer.dequeue_buffer(false, 16, 16, PixelFormat::Rgba8888, 0);
-        assert_eq!(status, Status::NoError as i32);
+        assert_eq!(status, Status::NoError.into());
         let (status, _buffer) = producer.request_buffer(slot);
         assert_eq!(status, Status::NoError);
 
@@ -1699,11 +1700,11 @@ mod tests {
         );
 
         let (status, slot, _) = producer.dequeue_buffer(false, 16, 16, PixelFormat::Rgba8888, 0);
-        assert_eq!(status, Status::NoError as i32);
+        assert_eq!(status, Status::NoError.into());
         assert_eq!(slot, 0);
 
         let (status, slot, _) = producer.dequeue_buffer(false, 16, 16, PixelFormat::Rgba8888, 0);
-        assert_eq!(status, Status::InvalidOperation as i32);
+        assert_eq!(status, Status::InvalidOperation.into());
         assert_eq!(slot, -1);
     }
 
@@ -1714,7 +1715,7 @@ mod tests {
         core.mutex.lock().unwrap().override_max_buffer_count = 1;
 
         let (status, slot, _) = producer.dequeue_buffer(false, 32, 32, PixelFormat::Rgba8888, 0);
-        assert_eq!(status, Status::BUFFER_NEEDS_REALLOCATION as i32);
+        assert_eq!(status, StatusCode::BUFFER_NEEDS_REALLOCATION);
         assert_eq!(slot, 0);
 
         let inner = core.mutex.lock().unwrap();

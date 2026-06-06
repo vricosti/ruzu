@@ -679,14 +679,6 @@ pub fn wait(
                 super::k_thread::ThreadWaitReasonForDebugging::Synchronization,
             );
 
-            if timeout_ns > 0 {
-                let current_tick = super::kernel::get_current_hardware_tick();
-                guard.sleep_deadline =
-                    super::k_thread::deadline_from_timeout_tick(timeout_ns, current_tick);
-            } else {
-                guard.sleep_deadline = None;
-            }
-
             let mut wait_queue = ThreadQueueImplForKSynchronizationObjectWait::queue();
             if let Some(timer) = timer {
                 wait_queue.set_hardware_timer(timer);

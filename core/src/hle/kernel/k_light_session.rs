@@ -57,8 +57,26 @@ impl KLightSession {
     /// Initialize the light session.
     /// Matches upstream `KLightSession::Initialize`.
     pub fn initialize(&mut self, client_port_id: Option<u64>, name: usize) {
+        self.initialize_with_endpoints(client_port_id, name, 0, 0, None);
+    }
+
+    /// Initialize with the Rust object ids for the embedded light endpoints.
+    ///
+    /// Upstream owns `m_server` and `m_client` inline; ruzu currently stores
+    /// kernel objects in process registries keyed by object id.
+    pub fn initialize_with_endpoints(
+        &mut self,
+        client_port_id: Option<u64>,
+        name: usize,
+        server_session_id: u64,
+        client_session_id: u64,
+        process_id: Option<u64>,
+    ) {
         self.port_id = client_port_id;
         self.name = name;
+        self.server_session_id = server_session_id;
+        self.client_session_id = client_session_id;
+        self.process_id = process_id;
         self.state = LightSessionState::Normal;
         self.initialized = true;
     }

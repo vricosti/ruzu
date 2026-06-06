@@ -65,9 +65,8 @@ pub fn process_sink_command(
             let Some(payload) = read_pod::<CircularBufferSinkPayload>(payload_addr) else {
                 return true;
             };
-            let buffer_count = processor.get_buffer_count_raw();
             let _ = processor.with_mix_buffers(|mix_buffers, sample_count, _| {
-                payload.process(payload_addr, sample_count, buffer_count, mix_buffers);
+                payload.process(payload_addr, sample_count, mix_buffers);
             });
             true
         }

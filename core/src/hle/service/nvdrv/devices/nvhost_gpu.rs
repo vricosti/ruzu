@@ -1151,6 +1151,14 @@ mod tests {
             false
         }
 
+        fn on_cpu_read(&self, addr: u64, _size: u64) -> crate::gpu_core::RasterizerDownloadArea {
+            crate::gpu_core::RasterizerDownloadArea {
+                start_address: addr,
+                end_address: addr,
+                preemptive: true,
+            }
+        }
+
         fn flush_region(&self, _addr: u64, _size: u64) {}
     }
 

@@ -798,6 +798,13 @@ pub fn is_view_compatible(
     )
 }
 
+/// Check if two image formats are compatible for copy operations.
+///
+/// Port of `VideoCore::Surface::IsCopyCompatible`.
+pub fn is_copy_compatible(format_a: PixelFormat, format_b: PixelFormat, native_bgr: bool) -> bool {
+    crate::compatible_formats::is_copy_compatible(format_a, format_b, native_bgr)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -935,6 +942,20 @@ mod tests {
             PixelFormat::A8B8G8R8Unorm,
             false,
             true,
+        ));
+    }
+
+    #[test]
+    fn copy_compatible_uses_compatible_formats_table() {
+        assert!(is_copy_compatible(
+            PixelFormat::Bc2Unorm,
+            PixelFormat::Bc3Unorm,
+            false,
+        ));
+        assert!(is_copy_compatible(
+            PixelFormat::B8G8R8A8Unorm,
+            PixelFormat::A8B8G8R8Unorm,
+            false,
         ));
     }
 

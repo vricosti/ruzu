@@ -35,13 +35,7 @@ pub fn write_circular_buffer_payload(cmd: &CircularBufferSinkCommand, output: &m
 
 impl CircularBufferSinkPayload {
     /// Port of upstream `CircularBufferSinkCommand::Process`.
-    pub fn process(
-        mut self,
-        payload_addr: CpuAddr,
-        sample_count: usize,
-        _buffer_count: i16,
-        mix_buffers: &[i32],
-    ) {
+    pub fn process(mut self, payload_addr: CpuAddr, sample_count: usize, mix_buffers: &[i32]) {
         let mut output = vec![0i16; sample_count];
 
         for channel in 0..self.input_count as usize {

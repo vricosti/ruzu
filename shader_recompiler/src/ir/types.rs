@@ -243,10 +243,16 @@ pub struct TextureInstInfo {
     pub has_bias: bool,
     /// Has LOD clamp.
     pub has_lod_clamp: bool,
+    /// Use relaxed precision for image/texture operations.
+    pub relaxed_precision: bool,
     /// Gather component.
     pub gather_component: u8,
     /// Number of derivatives.
     pub num_derivatives: u8,
+    /// Image format.
+    pub image_format: u8,
+    /// Whether TEX.NDV mode is active.
+    pub ndv_is_active: bool,
 }
 
 impl TextureInstInfo {
@@ -256,8 +262,11 @@ impl TextureInstInfo {
         v |= (self.is_depth as u32) << 19;
         v |= (self.has_bias as u32) << 20;
         v |= (self.has_lod_clamp as u32) << 21;
-        v |= (self.gather_component as u32 & 0x3) << 22;
-        v |= (self.num_derivatives as u32 & 0x3) << 24;
+        v |= (self.relaxed_precision as u32) << 22;
+        v |= (self.gather_component as u32 & 0x3) << 23;
+        v |= (self.num_derivatives as u32 & 0x3) << 25;
+        v |= (self.image_format as u32 & 0x7) << 27;
+        v |= (self.ndv_is_active as u32) << 30;
         v
     }
 
@@ -268,8 +277,11 @@ impl TextureInstInfo {
             is_depth: (v >> 19) & 1 != 0,
             has_bias: (v >> 20) & 1 != 0,
             has_lod_clamp: (v >> 21) & 1 != 0,
-            gather_component: ((v >> 22) & 0x3) as u8,
-            num_derivatives: ((v >> 24) & 0x3) as u8,
+            relaxed_precision: (v >> 22) & 1 != 0,
+            gather_component: ((v >> 23) & 0x3) as u8,
+            num_derivatives: ((v >> 25) & 0x3) as u8,
+            image_format: ((v >> 27) & 0x7) as u8,
+            ndv_is_active: (v >> 30) & 1 != 0,
         }
     }
 }
@@ -280,4 +292,38 @@ pub enum OutputTopology {
     PointList,
     LineStrip,
     TriangleStrip,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::TextureInstInfo;
+
+    #[test]
+    fn texture_inst_info_matches_upstream_bit_layout() {
+        let info = TextureInstInfo {
+            descriptor_index: 0x1234,
+            texture_type: 5,
+            is_depth: true,
+            has_bias: true,
+            has_lod_clamp: true,
+            relaxed_precision: true,
+            gather_component: 2,
+            num_derivatives: 3,
+            image_format: 6,
+            ndv_is_active: true,
+        };
+
+        let raw = info.to_u32();
+        assert_eq!(raw & 0xffff, 0x1234);
+        assert_eq!((raw >> 16) & 0x7, 5);
+        assert_eq!((raw >> 19) & 1, 1);
+        assert_eq!((raw >> 20) & 1, 1);
+        assert_eq!((raw >> 21) & 1, 1);
+        assert_eq!((raw >> 22) & 1, 1);
+        assert_eq!((raw >> 23) & 0x3, 2);
+        assert_eq!((raw >> 25) & 0x3, 3);
+        assert_eq!((raw >> 27) & 0x7, 6);
+        assert_eq!((raw >> 30) & 1, 1);
+        assert_eq!(TextureInstInfo::from_u32(raw), info);
+    }
 }

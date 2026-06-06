@@ -603,8 +603,8 @@ fn texture_type_from_flags(flags: TextureInstInfo) -> TextureType {
     TextureType::from_u8(flags.texture_type)
 }
 
-fn image_format_from_flags(_flags: TextureInstInfo) -> ImageFormat {
-    ImageFormat::Typeless
+fn image_format_from_flags(flags: TextureInstInfo) -> ImageFormat {
+    ImageFormat::from_u8(flags.image_format)
 }
 
 fn get_texture_handle(env: &mut dyn Environment, cbuf: &ConstBufferAddr) -> u32 {
@@ -994,27 +994,12 @@ fn add_image_buffer_descriptor(
 /// Join texture descriptors from `source` into `base`.
 ///
 /// Upstream: `JoinTextureInfo` in `texture_pass.cpp`.
-///
-/// Not yet implemented: requires the full texture descriptor tracking infrastructure.
 pub fn join_texture_info(_base: &mut ShaderInfo, _source: &mut ShaderInfo) {
     for desc in _source.texture_buffer_descriptors.drain(..) {
         add_texture_buffer_descriptor(&mut _base.texture_buffer_descriptors, desc);
     }
     for desc in _source.image_buffer_descriptors.drain(..) {
-        if let Some(index) = _base.image_buffer_descriptors.iter().position(|existing| {
-            existing.format == desc.format
-                && existing.cbuf_index == desc.cbuf_index
-                && existing.cbuf_offset == desc.cbuf_offset
-                && existing.count == desc.count
-                && existing.size_shift == desc.size_shift
-        }) {
-            let existing = &mut _base.image_buffer_descriptors[index];
-            existing.is_written |= desc.is_written;
-            existing.is_read |= desc.is_read;
-            existing.is_integer |= desc.is_integer;
-        } else {
-            _base.image_buffer_descriptors.push(desc);
-        }
+        add_image_buffer_descriptor(&mut _base.image_buffer_descriptors, desc);
     }
     for desc in _source.texture_descriptors.drain(..) {
         add_texture_descriptor(&mut _base.texture_descriptors, desc);
@@ -1381,6 +1366,31 @@ mod tests {
         assert_eq!(desc.cbuf_offset, 0x38);
         assert!(desc.is_read);
         assert!(desc.is_written);
+    }
+
+    #[test]
+    fn texture_pass_reads_storage_image_format_from_flags() {
+        let mut program = Program::new(ShaderStage::Fragment);
+        program.blocks.push(Block::new());
+        let flags = TextureInstInfo {
+            texture_type: TextureType::Color2D as u8,
+            image_format: ImageFormat::R32G32Uint as u8,
+            ..Default::default()
+        }
+        .to_u32();
+        program.blocks[0].instructions.push(Some(Inst::with_flags(
+            Opcode::BoundImageRead,
+            vec![Value::ImmU32(0x3c), Value::Void],
+            flags,
+        )));
+
+        texture_pass_bound_textures(&mut program, 6);
+
+        assert_eq!(program.info.image_descriptors.len(), 1);
+        assert_eq!(
+            program.info.image_descriptors[0].format,
+            ImageFormat::R32G32Uint
+        );
     }
 
     #[test]

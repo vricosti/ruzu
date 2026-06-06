@@ -11,21 +11,44 @@ use std::sync::Arc;
 
 use crate::host1x::nvdec_common::VideoCodec;
 
+const AV_NUM_DATA_POINTERS: usize = 8;
+
 mod ffi {
     use libc::{c_int, c_uchar, c_void, uintptr_t};
 
     pub type RuzuFfmpegDecoder = c_void;
+    pub type RuzuFfmpegHardwareContext = c_void;
     pub type AVFrame = c_void;
 
     extern "C" {
         pub fn ruzu_ffmpeg_decoder_create(codec: u64) -> *mut RuzuFfmpegDecoder;
+        pub fn ruzu_ffmpeg_decoder_open(decoder: *mut RuzuFfmpegDecoder) -> c_int;
         pub fn ruzu_ffmpeg_decoder_destroy(decoder: *mut RuzuFfmpegDecoder);
+        pub fn ruzu_ffmpeg_hardware_context_create() -> *mut RuzuFfmpegHardwareContext;
+        pub fn ruzu_ffmpeg_hardware_context_destroy(hardware: *mut RuzuFfmpegHardwareContext);
+        pub fn ruzu_ffmpeg_decoder_supports_decoding_on_device(
+            codec: u64,
+            device_type: c_int,
+            out_pix_fmt: *mut c_int,
+        ) -> c_int;
+        pub fn ruzu_ffmpeg_supported_device_types(
+            out: *mut c_int,
+            out_capacity: uintptr_t,
+        ) -> uintptr_t;
         pub fn ruzu_ffmpeg_decoder_send_packet(
             decoder: *mut RuzuFfmpegDecoder,
             data: *const c_uchar,
             size: uintptr_t,
         ) -> c_int;
         pub fn ruzu_ffmpeg_decoder_receive_frame(decoder: *mut RuzuFfmpegDecoder) -> *mut AVFrame;
+        pub fn ruzu_ffmpeg_decoder_receive_frame_with_hw_transfer(
+            decoder: *mut RuzuFfmpegDecoder,
+        ) -> *mut AVFrame;
+        pub fn ruzu_ffmpeg_hardware_initialize_for_decoder(
+            hardware: *mut RuzuFfmpegHardwareContext,
+            decoder: *mut RuzuFfmpegDecoder,
+            codec: u64,
+        ) -> c_int;
         pub fn ruzu_ffmpeg_decoder_last_error(decoder: *const RuzuFfmpegDecoder) -> c_int;
         pub fn ruzu_ffmpeg_error_string(errnum: c_int, out: *mut i8, out_size: uintptr_t);
         pub fn ruzu_ffmpeg_frame_destroy(frame: *mut AVFrame);
@@ -97,8 +120,32 @@ impl Frame {
         unsafe { ffi::ruzu_ffmpeg_frame_stride(self.raw.cast_const(), plane as i32) }
     }
 
+    pub fn get_strides(&self) -> [i32; AV_NUM_DATA_POINTERS] {
+        let mut strides = [0; AV_NUM_DATA_POINTERS];
+        for (plane, stride) in strides.iter_mut().enumerate() {
+            *stride = self.get_stride(plane);
+        }
+        strides
+    }
+
+    pub fn get_data(&self, plane: usize) -> *mut u8 {
+        self.get_plane_ptr(plane).cast_mut()
+    }
+
+    pub fn get_plane(&self, plane: usize) -> *const u8 {
+        self.get_plane_ptr(plane)
+    }
+
     pub fn get_plane_ptr(&self, plane: usize) -> *const u8 {
         unsafe { ffi::ruzu_ffmpeg_frame_plane(self.raw.cast_const(), plane as i32) }
+    }
+
+    pub fn get_planes(&self) -> [*mut u8; AV_NUM_DATA_POINTERS] {
+        let mut planes = [std::ptr::null_mut(); AV_NUM_DATA_POINTERS];
+        for (plane, data) in planes.iter_mut().enumerate() {
+            *data = self.get_data(plane);
+        }
+        planes
     }
 
     pub fn is_interlaced(&self) -> bool {
@@ -140,51 +187,82 @@ impl Decoder {
         Self { codec }
     }
 
-    pub fn supports_decoding_on_device(&self) -> bool {
-        // Stubbed — requires FFmpeg C bindings to query AVCodec hardware device support.
-        // Upstream: FFmpeg::Decoder::SupportDecodingOnDevice() in ffmpeg.cpp
-        log::warn!("FFmpeg::Decoder::supports_decoding_on_device: FFmpeg bindings not available");
-        false
+    pub fn supports_decoding_on_device(&self, device_type: u32) -> Option<i32> {
+        let mut pix_fmt = -1;
+        let supported = unsafe {
+            ffi::ruzu_ffmpeg_decoder_supports_decoding_on_device(
+                self.codec as u64,
+                device_type as i32,
+                &mut pix_fmt,
+            )
+        };
+        (supported != 0).then_some(pix_fmt)
     }
 }
 
 /// Wraps AVBufferRef for hardware-accelerated decoding.
 ///
 /// Port of `FFmpeg::HardwareContext`.
-pub struct HardwareContext;
+pub struct HardwareContext {
+    raw: *mut ffi::RuzuFfmpegHardwareContext,
+}
 
 impl HardwareContext {
     pub fn new() -> Self {
-        Self
+        Self {
+            raw: unsafe { ffi::ruzu_ffmpeg_hardware_context_create() },
+        }
     }
 
     pub fn get_supported_device_types() -> Vec<u32> {
-        // Stubbed — requires FFmpeg C bindings to enumerate AV_HWDEVICE_TYPE_* values.
-        // Upstream: FFmpeg::HardwareContext::GetSupportedDeviceTypes() in ffmpeg.cpp
-        log::warn!(
-            "FFmpeg::HardwareContext::get_supported_device_types: FFmpeg bindings not available"
-        );
-        Vec::new()
+        let count = unsafe { ffi::ruzu_ffmpeg_supported_device_types(std::ptr::null_mut(), 0) };
+        if count == 0 {
+            return Vec::new();
+        }
+
+        let mut types = vec![0i32; count as usize];
+        let written =
+            unsafe { ffi::ruzu_ffmpeg_supported_device_types(types.as_mut_ptr(), types.len()) };
+        types.truncate(written.min(types.len()) as usize);
+        types.into_iter().map(|value| value as u32).collect()
     }
 
     pub fn initialize_for_decoder(
         &mut self,
-        _decoder_context: &mut DecoderContext,
-        _decoder: &Decoder,
+        decoder_context: &mut DecoderContext,
+        decoder: &Decoder,
     ) -> bool {
-        // Stubbed — requires FFmpeg C bindings to create and attach an AVBufferRef
-        // hardware device context to the AVCodecContext.
-        // Upstream: FFmpeg::HardwareContext::InitializeForDecoder() in ffmpeg.cpp
-        log::warn!(
-            "FFmpeg::HardwareContext::initialize_for_decoder: FFmpeg bindings not available"
-        );
-        false
+        if self.raw.is_null() || decoder_context.raw.is_null() {
+            return false;
+        }
+        let initialized = unsafe {
+            ffi::ruzu_ffmpeg_hardware_initialize_for_decoder(
+                self.raw,
+                decoder_context.raw,
+                decoder.codec as u64,
+            )
+        } != 0;
+        if initialized {
+            log::info!("Using FFmpeg GPU decoding");
+        } else {
+            log::info!("Hardware decoding is disabled due to implementation issues, using CPU.");
+        }
+        initialized
     }
 }
 
 impl Default for HardwareContext {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl Drop for HardwareContext {
+    fn drop(&mut self) {
+        if !self.raw.is_null() {
+            unsafe { ffi::ruzu_ffmpeg_hardware_context_destroy(self.raw) };
+            self.raw = std::ptr::null_mut();
+        }
     }
 }
 
@@ -207,27 +285,38 @@ impl DecoderContext {
     }
 
     pub fn initialize_hardware_decoder(&mut self, _context: &HardwareContext, _hw_pix_fmt: i32) {
-        // Stubbed — requires FFmpeg C bindings to set AVCodecContext hw_device_ctx
-        // and get_format callback.
-        // Upstream: FFmpeg::DecoderContext::InitializeHardwareDecoder() in ffmpeg.cpp
-        log::warn!(
-            "FFmpeg::DecoderContext::initialize_hardware_decoder: FFmpeg bindings not available"
-        );
+        // The Rust shim applies the upstream hw_device_ctx/get_format/pix_fmt
+        // side effects inside HardwareContext::initialize_for_decoder.
     }
 
-    pub fn open_context(&mut self, _decoder: &Decoder) -> bool {
-        self.raw = unsafe { ffi::ruzu_ffmpeg_decoder_create(_decoder.codec as u64) };
+    fn prepare_context(&mut self, decoder: &Decoder) -> bool {
+        if !self.raw.is_null() {
+            return true;
+        }
+        self.raw = unsafe { ffi::ruzu_ffmpeg_decoder_create(decoder.codec as u64) };
         if self.raw.is_null() {
             log::error!(
-                "FFmpeg::DecoderContext::open_context: failed to open codec {:?}",
-                _decoder.codec
+                "FFmpeg::DecoderContext::prepare_context: failed to allocate codec {:?}",
+                decoder.codec
+            );
+            return false;
+        }
+        true
+    }
+
+    pub fn open_context(&mut self, decoder: &Decoder) -> bool {
+        if !self.prepare_context(decoder) {
+            return false;
+        }
+        let ret = unsafe { ffi::ruzu_ffmpeg_decoder_open(self.raw) };
+        if ret < 0 {
+            log::error!(
+                "FFmpeg::DecoderContext::open_context: avcodec_open2 error: {}",
+                av_error(ret)
             );
             return false;
         }
         log::info!("Using FFmpeg software decoding");
-        // Upstream forces H264 software decoding through the decode-order queue.
-        // ruzu still uses avcodec_send_packet in the C shim, but VIC frame lookup
-        // must match upstream's offset-keyed queueing semantics.
         self.decode_order = self.codec == VideoCodec::H264;
         true
     }
@@ -257,7 +346,7 @@ impl DecoderContext {
         if self.raw.is_null() {
             return None;
         }
-        let frame = unsafe { ffi::ruzu_ffmpeg_decoder_receive_frame(self.raw) };
+        let frame = unsafe { ffi::ruzu_ffmpeg_decoder_receive_frame_with_hw_transfer(self.raw) };
         if frame.is_null() {
             let ret = unsafe { ffi::ruzu_ffmpeg_decoder_last_error(self.raw.cast_const()) };
             if ret < 0 {
@@ -310,6 +399,17 @@ impl DecodeApi {
         self.reset();
         let decoder = Decoder::new(codec);
         let mut decoder_context = DecoderContext::new(&decoder);
+        if !decoder_context.prepare_context(&decoder) {
+            return false;
+        }
+        if *common::settings::values().nvdec_emulation.get_value()
+            == common::settings_enums::NvdecEmulation::Gpu
+        {
+            let mut hardware_context = HardwareContext::new();
+            if hardware_context.initialize_for_decoder(&mut decoder_context, &decoder) {
+                self.hardware_context = Some(hardware_context);
+            }
+        }
         let initialized = decoder_context.open_context(&decoder);
         let _ = common::trace::emit(
             common::trace::cat::HOST1X_VIDEO,
@@ -366,9 +466,26 @@ mod tests {
     use super::*;
 
     #[test]
+    fn default_frame_exposes_empty_planes_and_strides() {
+        let frame = Frame::new();
+        assert_eq!(frame.get_strides(), [0; AV_NUM_DATA_POINTERS]);
+        assert!(frame.get_planes().iter().all(|ptr| ptr.is_null()));
+        assert!(frame.get_plane(0).is_null());
+        assert!(frame.get_data(0).is_null());
+    }
+
+    #[test]
     fn decode_api_initializes_h264_software_decoder() {
         let mut api = DecodeApi::new();
         assert!(api.initialize(VideoCodec::H264));
         assert!(api.using_decode_order());
+    }
+
+    #[test]
+    fn ffmpeg_hardware_capability_queries_are_wired() {
+        let decoder = Decoder::new(VideoCodec::H264);
+        for device_type in HardwareContext::get_supported_device_types() {
+            let _ = decoder.supports_decoding_on_device(device_type);
+        }
     }
 }

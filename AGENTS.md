@@ -136,7 +136,7 @@ This document exists because earlier progress proved that a crate can be "substa
     1. READ the upstream C++ source again (both .h and .cpp).
     2. COMPARE the Rust implementation against the upstream line-by-line.
     3. IDENTIFY all differences: structural, behavioral, ordering, naming, constant placement, binary layout.
-    4. APPEND findings to `DIFF.md` at the project root.
+    4. APPEND findings to `DIFF.md` at the project root except when fixing task from this file.
 
     DIFF.md format per entry:
 

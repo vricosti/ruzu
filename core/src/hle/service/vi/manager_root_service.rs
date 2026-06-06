@@ -6,7 +6,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use crate::hle::result::ResultCode;
+use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
 use crate::hle::service::ipc_helpers::{RequestParser, ResponseBuilder};
 use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
@@ -27,11 +27,7 @@ impl IManagerRootService {
             container,
             handlers: build_handler_map(&[
                 (2, Some(Self::get_display_service), "GetDisplayService"),
-                (
-                    3,
-                    Some(Self::get_display_service),
-                    "GetDisplayServiceWithProxyNameExchange",
-                ),
+                (3, None, "GetDisplayServiceWithProxyNameExchange"),
                 (100, None, "PrepareFatal"),
                 (101, None, "ShowFatal"),
                 (102, None, "DrawFatalRectangle"),
@@ -54,6 +50,15 @@ impl IManagerRootService {
         ))
     }
 
+    fn push_interface_response(
+        ctx: &mut HLERequestContext,
+        object: Arc<dyn SessionRequestHandler>,
+    ) {
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 1);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_ipc_interface(object);
+    }
+
     fn get_display_service(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         let root = unsafe { &*(this as *const dyn ServiceFramework as *const Self) };
         log::debug!("IManagerRootService::GetDisplayService called");
@@ -69,7 +74,7 @@ impl IManagerRootService {
         match root.create_display_service(policy) {
             Ok(display_service) => {
                 let sub: Arc<dyn SessionRequestHandler> = display_service;
-                super::super::am::service::application_proxy::IApplicationProxy::push_interface_response(ctx, sub);
+                Self::push_interface_response(ctx, sub);
             }
             Err(_) => {
                 log::error!("GetDisplayService: permission denied");

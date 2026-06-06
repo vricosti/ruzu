@@ -11,17 +11,18 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use common::{cityhash::city_hash64, trace};
+use shader_recompiler::host_translate_info::HostTranslateInfo;
 use shader_recompiler::profile::Profile as ShaderProfile;
 use shader_recompiler::runtime_info::{
     CompareFunction, InputTopology, RuntimeInfo, TessPrimitive, TessSpacing,
 };
 use shader_recompiler::shader_info::Info as ShaderInfo;
 use shader_recompiler::{
-    compile_dual_vertex_shader_glsl_at_offset_with_bindings,
-    compile_shader_glsl_at_offset_with_bindings,
-    compile_shader_glsl_at_offset_with_bindings_and_texture_bound,
-    compile_shader_glsl_at_offset_with_bindings_and_texture_bound_and_sph, CompiledGlslShader,
-    ShaderStage,
+    compile_dual_vertex_shader_glsl_at_offset_with_bindings_and_host_info,
+    compile_shader_glsl_at_offset_with_bindings_and_host_info,
+    compile_shader_glsl_at_offset_with_bindings_and_texture_bound_and_host_info,
+    compile_shader_glsl_at_offset_with_bindings_and_texture_bound_and_sph_and_host_info,
+    CompiledGlslShader, ShaderStage,
 };
 
 use crate::shader_cache::{GraphicsEnvironments, ShaderCache as SharedShaderCache};
@@ -103,9 +104,7 @@ fn patch_fragment_debug_by_source_hash(stage: ShaderStage, source: String) -> St
     let mode =
         std::env::var("RUZU_FRAGMENT_DEBUG_HASH_MODE").unwrap_or_else(|_| "green".to_string());
     let replacement = match mode.as_str() {
-        "tex0_center" => {
-            "void main(){\nfrag_color0=texture(tex0,vec2(0.5,0.5));\nreturn;\n}\n"
-        }
+        "tex0_center" => "void main(){\nfrag_color0=texture(tex0,vec2(0.5,0.5));\nreturn;\n}\n",
         "tex0_attr1" => "void main(){\nfrag_color0=texture(tex0,in_attr1.xy);\nreturn;\n}\n",
         "uv" => {
             "void main(){\nvec2 ruzu_uv=in_attr1.xy;\nfrag_color0=vec4(fract(ruzu_uv),0.0,1.0);\nreturn;\n}\n"
@@ -238,6 +237,20 @@ fn opengl_shader_profile(device: &Device) -> ShaderProfile {
     }
 }
 
+fn opengl_host_translate_info(device: &Device) -> HostTranslateInfo {
+    HostTranslateInfo {
+        support_float64: true,
+        support_float16: false,
+        support_int64: device.has_shader_int64(),
+        needs_demote_reorder: device.is_amd(),
+        support_snorm_render_buffer: false,
+        support_viewport_index_layer: device.has_vertex_viewport_layer(),
+        min_ssbo_alignment: device.shader_storage_buffer_alignment(),
+        support_geometry_shader_passthrough: device.has_geometry_shader_passthrough(),
+        support_conditional_barrier: device.supports_conditional_barriers(),
+    }
+}
+
 #[cfg(test)]
 fn test_opengl_shader_profile() -> ShaderProfile {
     ShaderProfile {
@@ -309,6 +322,7 @@ pub struct ShaderCache {
     /// Whether a strict GL context is required for compilation.
     pub strict_context_required: bool,
     profile: ShaderProfile,
+    host_info: HostTranslateInfo,
 
     /// Current graphics pipeline key.
     graphics_key: GraphicsPipelineKey,
@@ -369,6 +383,7 @@ impl ShaderCache {
     pub fn new(device: &Device) -> Self {
         Self::new_with_profile(
             opengl_shader_profile(device),
+            opengl_host_translate_info(device),
             device.use_asynchronous_shaders(),
             device.strict_context_required(),
         )
@@ -376,6 +391,7 @@ impl ShaderCache {
 
     pub(crate) fn new_with_profile(
         profile: ShaderProfile,
+        host_info: HostTranslateInfo,
         use_asynchronous_shaders: bool,
         strict_context_required: bool,
     ) -> Self {
@@ -383,6 +399,7 @@ impl ShaderCache {
             use_asynchronous_shaders,
             strict_context_required,
             profile,
+            host_info,
             graphics_key: GraphicsPipelineKey::default(),
             current_pipeline: None,
             graphics_cache: HashMap::new(),
@@ -396,7 +413,12 @@ impl ShaderCache {
 
     #[cfg(test)]
     pub(crate) fn new_for_test() -> Self {
-        Self::new_with_profile(test_opengl_shader_profile(), false, false)
+        Self::new_with_profile(
+            test_opengl_shader_profile(),
+            HostTranslateInfo::default(),
+            false,
+            false,
+        )
     }
 
     /// Assert that this cache is only ever accessed from a single thread.
@@ -543,25 +565,12 @@ impl ShaderCache {
     ) -> Option<&mut GraphicsPipeline> {
         self.assert_single_owner("current_graphics_pipeline_with_shared_cache");
         record_shader_pipeline_stage(0);
-        let trace_pipeline = std::env::var_os("RUZU_TRACE_SHADER_PIPELINE").is_some();
-        if trace_pipeline {
-            eprintln!("[SHADER_PIPELINE] current_graphics begin");
-        }
         record_shader_pipeline_stage(1);
         if !shared_cache.refresh_stages(&mut self.graphics_key.unique_hashes) {
-            if trace_pipeline {
-                eprintln!("[SHADER_PIPELINE] refresh_stages=false");
-            }
             self.current_pipeline = None;
             return None;
         }
         record_shader_pipeline_stage(2);
-        if trace_pipeline {
-            eprintln!(
-                "[SHADER_PIPELINE] refresh_stages=true hashes={:X?}",
-                self.graphics_key.unique_hashes
-            );
-        }
 
         let maxwell3d = shared_cache.current_maxwell3d()?;
         record_shader_pipeline_stage(3);
@@ -598,18 +607,12 @@ impl ShaderCache {
         trace_gl_pipeline(1, &key, self.graphics_cache.len(), 0, 0, 0);
 
         if self.graphics_cache.contains_key(&key) {
-            if trace_pipeline {
-                eprintln!("[SHADER_PIPELINE] graphics_cache hit");
-            }
             trace_gl_pipeline(2, &key, self.graphics_cache.len(), 0, 0, 0);
             record_shader_pipeline_stage(5);
             let pipeline = self.graphics_cache.get_mut(&key).unwrap();
             return Self::built_pipeline(self.use_asynchronous_shaders, maxwell3d, pipeline);
         }
 
-        if trace_pipeline {
-            eprintln!("[SHADER_PIPELINE] graphics_cache miss -> slow_path");
-        }
         trace_gl_pipeline(3, &key, self.graphics_cache.len(), 0, 0, 0);
         record_shader_pipeline_stage(6);
         self.current_graphics_pipeline_slow_path_with_shared_cache(shared_cache)
@@ -673,31 +676,21 @@ impl ShaderCache {
     ) -> Option<&mut GraphicsPipeline> {
         self.assert_single_owner("current_graphics_pipeline_slow_path_with_shared_cache");
         record_shader_pipeline_stage(7);
-        let trace_pipeline = std::env::var_os("RUZU_TRACE_SHADER_PIPELINE").is_some();
         let key = self.graphics_key;
         self.current_pipeline = Some(key);
         let maxwell3d = shared_cache.current_maxwell3d();
         trace_gl_pipeline(1, &key, self.graphics_cache.len(), 2, 0, 0);
 
         if self.graphics_cache.contains_key(&key) {
-            if trace_pipeline {
-                eprintln!("[SHADER_PIPELINE] slow_path cache hit");
-            }
             trace_gl_pipeline(2, &key, self.graphics_cache.len(), 2, 0, 0);
             record_shader_pipeline_stage(8);
             let pipeline = self.graphics_cache.get_mut(&key).unwrap();
             return Self::built_pipeline(self.use_asynchronous_shaders, maxwell3d, pipeline);
         }
 
-        if trace_pipeline {
-            eprintln!("[SHADER_PIPELINE] create_graphics_pipeline_with_shared_cache begin");
-        }
         trace_gl_pipeline(4, &key, self.graphics_cache.len(), 2, 0, 0);
         record_shader_pipeline_stage(9);
         let pipeline = self.create_graphics_pipeline_with_shared_cache(shared_cache)?;
-        if trace_pipeline {
-            eprintln!("[SHADER_PIPELINE] create_graphics_pipeline_with_shared_cache end");
-        }
         trace_gl_pipeline(5, &key, self.graphics_cache.len(), 2, 0, 0);
         record_shader_pipeline_stage(10);
         self.graphics_cache.insert(key, pipeline);
@@ -810,15 +803,17 @@ impl ShaderCache {
             } else {
                 let runtime_info =
                     Self::make_runtime_info(&self.graphics_key, ShaderStage::VertexB, None);
-                let compiled = compile_dual_vertex_shader_glsl_at_offset_with_bindings(
-                    va_env.cached_instruction_slice(),
-                    va_env.cached_instruction_start(),
-                    vb_env.cached_instruction_slice(),
-                    vb_env.cached_instruction_start(),
-                    &self.profile,
-                    &runtime_info,
-                    &mut bindings,
-                );
+                let compiled =
+                    compile_dual_vertex_shader_glsl_at_offset_with_bindings_and_host_info(
+                        va_env.cached_instruction_slice(),
+                        va_env.cached_instruction_start(),
+                        vb_env.cached_instruction_slice(),
+                        vb_env.cached_instruction_start(),
+                        &self.profile,
+                        &runtime_info,
+                        &mut bindings,
+                        &self.host_info,
+                    );
                 let mut previous_info = compiled.info.clone();
                 infos[0] = Some(previous_info.clone());
                 pipeline.glsl_sources[0] = Some(compiled.source);
@@ -965,9 +960,9 @@ impl ShaderCache {
                             let head = &final_source[..idx];
                             let tail = &final_source[idx..];
                             final_source = format!(
-                        "{}vec2 ruzu_p=vec2(float((gl_VertexID<<1)&2),float(gl_VertexID&2));\ngl_Position.xy=ruzu_p*2.0-1.0;\n{}",
-                        head, tail
-                    );
+                                "{}vec2 ruzu_p=vec2(float((gl_VertexID<<1)&2),float(gl_VertexID&2));\ngl_Position.xy=ruzu_p*2.0-1.0;\n{}",
+                                head, tail
+                            );
                             log::warn!("[FORCE_VERTEX_XY] patched vertex shader");
                         }
                     }
@@ -1190,18 +1185,8 @@ impl ShaderCache {
         &mut self,
         shared_cache: &SharedShaderCache,
     ) -> Option<GraphicsPipeline> {
-        let trace_pipeline = std::env::var_os("RUZU_TRACE_SHADER_PIPELINE").is_some();
-        if trace_pipeline {
-            eprintln!("[SHADER_PIPELINE] get_graphics_environments begin");
-        }
         let mut environments = GraphicsEnvironments::default();
         shared_cache.get_graphics_environments(&mut environments, &self.graphics_key.unique_hashes);
-        if trace_pipeline {
-            eprintln!(
-                "[SHADER_PIPELINE] get_graphics_environments end env_ptrs={:?}",
-                environments.env_ptrs
-            );
-        }
         self.create_graphics_pipeline_from_environments(&mut environments)
     }
 
@@ -1209,13 +1194,6 @@ impl ShaderCache {
         &mut self,
         environments: &mut GraphicsEnvironments,
     ) -> Option<GraphicsPipeline> {
-        let trace_pipeline = std::env::var_os("RUZU_TRACE_SHADER_PIPELINE").is_some();
-        if trace_pipeline {
-            eprintln!(
-                "[SHADER_PIPELINE] create_from_environments begin hashes={:X?}",
-                self.graphics_key.unique_hashes
-            );
-        }
         trace_gl_pipeline(4, &self.graphics_key, self.graphics_cache.len(), 3, 0, 0);
         let mut pipeline = GraphicsPipeline::new(self.graphics_key);
         let uses_vertex_a = self.graphics_key.unique_hashes[0] != 0;
@@ -1232,9 +1210,6 @@ impl ShaderCache {
         let mut infos: [Option<ShaderInfo>; 5] = Default::default();
 
         if uses_vertex_a && uses_vertex_b {
-            if trace_pipeline {
-                eprintln!("[SHADER_PIPELINE] compile dual vertex begin");
-            }
             trace_gl_pipeline(
                 7,
                 &self.graphics_key,
@@ -1274,7 +1249,7 @@ impl ShaderCache {
             }
             let runtime_info =
                 Self::make_runtime_info(&self.graphics_key, ShaderStage::VertexB, None);
-            let compiled = compile_dual_vertex_shader_glsl_at_offset_with_bindings(
+            let compiled = compile_dual_vertex_shader_glsl_at_offset_with_bindings_and_host_info(
                 &va_code,
                 va_start,
                 vb_env.cached_instruction_slice(),
@@ -1282,13 +1257,8 @@ impl ShaderCache {
                 &self.profile,
                 &runtime_info,
                 &mut bindings,
+                &self.host_info,
             );
-            if trace_pipeline {
-                eprintln!(
-                    "[SHADER_PIPELINE] compile dual vertex end source_len={}",
-                    compiled.source.len()
-                );
-            }
             trace_gl_pipeline(
                 8,
                 &self.graphics_key,
@@ -1365,12 +1335,6 @@ impl ShaderCache {
 
                 let env = environments.envs[slot].generic_environment_mut();
                 let actual_stage = env.shader_stage();
-                if trace_pipeline {
-                    eprintln!(
-                        "[SHADER_PIPELINE] stage {:?} analyze/compile begin",
-                        actual_stage
-                    );
-                }
                 trace_gl_pipeline(
                     9,
                     &self.graphics_key,
@@ -1407,13 +1371,6 @@ impl ShaderCache {
                     &runtime_info,
                     &mut bindings,
                 );
-                if trace_pipeline {
-                    eprintln!(
-                        "[SHADER_PIPELINE] stage {:?} compile end source_len={}",
-                        actual_stage,
-                        compiled.source.len()
-                    );
-                }
                 trace_gl_pipeline(
                     11,
                     &self.graphics_key,
@@ -1530,9 +1487,6 @@ impl ShaderCache {
             }
 
             pipeline.apply_shader_infos(&infos);
-            if trace_pipeline {
-                eprintln!("[SHADER_PIPELINE] create_from_environments end");
-            }
             trace_gl_pipeline(5, &self.graphics_key, self.graphics_cache.len(), 3, 1, 0);
             return Some(pipeline);
         }
@@ -1548,12 +1502,6 @@ impl ShaderCache {
 
             let env = environments.envs[slot].generic_environment_mut();
             let actual_stage = env.shader_stage();
-            if trace_pipeline {
-                eprintln!(
-                    "[SHADER_PIPELINE] stage {:?} analyze/compile begin",
-                    actual_stage
-                );
-            }
             trace_gl_pipeline(
                 9,
                 &self.graphics_key,
@@ -1590,13 +1538,6 @@ impl ShaderCache {
                 &runtime_info,
                 &mut bindings,
             );
-            if trace_pipeline {
-                eprintln!(
-                    "[SHADER_PIPELINE] stage {:?} compile end source_len={}",
-                    actual_stage,
-                    compiled.source.len()
-                );
-            }
             trace_gl_pipeline(
                 11,
                 &self.graphics_key,
@@ -1711,9 +1652,6 @@ impl ShaderCache {
         }
 
         pipeline.apply_shader_infos(&infos);
-        if trace_pipeline {
-            eprintln!("[SHADER_PIPELINE] create_from_environments end");
-        }
         trace_gl_pipeline(5, &self.graphics_key, self.graphics_cache.len(), 3, 2, 0);
         Some(pipeline)
     }
@@ -1838,7 +1776,7 @@ impl ShaderCache {
     ) -> CompiledGlslShader {
         let compiled = if let Some(texture_bound_buffer) = texture_bound_buffer {
             if let Some(sph) = sph {
-                compile_shader_glsl_at_offset_with_bindings_and_texture_bound_and_sph(
+                compile_shader_glsl_at_offset_with_bindings_and_texture_bound_and_sph_and_host_info(
                     code,
                     stage,
                     base_offset,
@@ -1847,9 +1785,10 @@ impl ShaderCache {
                     &self.profile,
                     runtime_info,
                     bindings,
+                    &self.host_info,
                 )
             } else {
-                compile_shader_glsl_at_offset_with_bindings_and_texture_bound(
+                compile_shader_glsl_at_offset_with_bindings_and_texture_bound_and_host_info(
                     code,
                     stage,
                     base_offset,
@@ -1857,16 +1796,18 @@ impl ShaderCache {
                     &self.profile,
                     runtime_info,
                     bindings,
+                    &self.host_info,
                 )
             }
         } else {
-            compile_shader_glsl_at_offset_with_bindings(
+            compile_shader_glsl_at_offset_with_bindings_and_host_info(
                 code,
                 stage,
                 base_offset,
                 &self.profile,
                 runtime_info,
                 bindings,
+                &self.host_info,
             )
         };
         if std::env::var_os("RUZU_DUMP_GLSL").is_some() {
@@ -2265,7 +2206,8 @@ mod tests {
     fn shader_cache_uses_stored_opengl_profile() {
         let mut profile = test_opengl_shader_profile();
         profile.need_declared_frag_colors = false;
-        let cache = ShaderCache::new_with_profile(profile, false, false);
+        let cache =
+            ShaderCache::new_with_profile(profile, HostTranslateInfo::default(), false, false);
         let compiled = cache.compile_stage_glsl(&[], ShaderStage::Fragment);
 
         assert!(

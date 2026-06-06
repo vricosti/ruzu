@@ -44,6 +44,8 @@ struct FiberImpl {
     previous_fiber: Option<Arc<Fiber>>,
     is_thread_fiber: bool,
     released: bool,
+    stack_limit: usize,
+    rewind_stack_limit: usize,
     context: Option<RawContext>,
     rewind_context: Option<RawContext>,
 }
@@ -59,6 +61,8 @@ impl FiberImpl {
             previous_fiber: None,
             is_thread_fiber: false,
             released: false,
+            stack_limit: 0,
+            rewind_stack_limit: 0,
             context: None,
             rewind_context: None,
         }
@@ -133,7 +137,7 @@ impl Fiber {
             // FiberImpl so we don't briefly hold &mut to two FiberImpls
             // and risk aliasing if the second &mut narrowly overlaps with
             // another core's YieldTo on the previous fiber.
-            drop(imp);
+            let _ = imp;
             // Access previous fiber's FiberImpl via raw pointer so we
             // never create a `&mut FiberImpl` that could alias with a
             // concurrent YieldTo on the previous fiber after we unlock.
@@ -149,7 +153,7 @@ impl Fiber {
         };
 
         entry_point();
-        panic!("Fiber entry point returned");
+        unreachable!("Fiber entry point returned");
     }
 
     fn on_rewind(&self, _transfer: Transfer) -> ! {
@@ -160,13 +164,14 @@ impl Fiber {
             assert!(imp.context.is_some(), "Fiber::on_rewind missing context");
             imp.context = imp.rewind_context.take();
             std::mem::swap(&mut imp.stack, &mut imp.rewind_stack);
+            std::mem::swap(&mut imp.stack_limit, &mut imp.rewind_stack_limit);
             imp.rewind_point
                 .take()
                 .expect("Fiber::on_rewind missing rewind point")
         };
 
         rewind_point();
-        panic!("Fiber rewind point returned");
+        unreachable!("Fiber rewind point returned");
     }
 
     /// Create a new fiber with the given entry point function.
@@ -178,6 +183,8 @@ impl Fiber {
             FixedSizeStack::new(DEFAULT_STACK_SIZE).expect("failed to allocate rewind stack");
 
         let mut imp = FiberImpl::new_empty();
+        imp.stack_limit = stack.bottom() as usize;
+        imp.rewind_stack_limit = rewind_stack.bottom() as usize;
         imp.context = Some(context_to_raw(unsafe {
             Context::new(
                 &stack,
@@ -241,7 +248,7 @@ impl Fiber {
         // might have already unlocked our guard and started its own
         // yield_to with this fiber as the target; that would create a new
         // `&mut FiberImpl` and the OLD `to_imp` would be an aliased &mut.
-        drop(to_imp);
+        let _ = to_imp;
         let transfer = unsafe { raw_to_context(context).resume(Arc::as_ptr(to) as usize) };
 
         if let Some(from) = weak_from.upgrade() {
@@ -252,7 +259,7 @@ impl Fiber {
                 .previous_fiber
                 .take()
                 .expect("previous_fiber is nullptr!");
-            drop(from_imp);
+            let _ = from_imp;
             // Use raw pointer for the previous fiber — after the
             // force_unlock below, another thread can immediately take its
             // guard. Holding `&mut` past force_unlock would be the

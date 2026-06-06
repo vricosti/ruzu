@@ -10,6 +10,8 @@
 //! infrastructure available in ruzu.
 
 use crate::core::System;
+use crate::hle::kernel::k_resource_limit::LimitableResource;
+use crate::hle::kernel::k_scoped_resource_reservation::KScopedResourceReservation;
 use crate::hle::kernel::svc::svc_results::*;
 use crate::hle::kernel::svc_common::Handle;
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
@@ -29,31 +31,57 @@ pub fn create_session(
     let process_arc = system.current_process_arc();
     let mut process = process_arc.lock().unwrap();
 
-    // Upstream: Reserve session from resource limit.
-    if let Some(ref rl) = process.resource_limit {
-        let rl_guard = rl.lock().unwrap();
-        let current = rl_guard.get_current_value(
-            crate::hle::kernel::k_resource_limit::LimitableResource::SessionCountMax,
-        );
-        let limit = rl_guard.get_limit_value(
-            crate::hle::kernel::k_resource_limit::LimitableResource::SessionCountMax,
-        );
-        if current >= limit {
-            return RESULT_LIMIT_REACHED;
-        }
+    let mut session_reservation = KScopedResourceReservation::new(
+        process.resource_limit.clone(),
+        LimitableResource::SessionCountMax,
+        1,
+    );
+    if !session_reservation.succeeded() {
+        return RESULT_LIMIT_REACHED;
     }
 
-    // Use unique IDs for the server and client session objects in the handle table.
-    static NEXT_SESSION_OBJ_ID: std::sync::atomic::AtomicU64 =
-        std::sync::atomic::AtomicU64::new(0x8000_0000);
-    let server_object_id = NEXT_SESSION_OBJ_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let client_object_id = NEXT_SESSION_OBJ_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let Some(kernel) = system.kernel() else {
+        return RESULT_INVALID_STATE;
+    };
+    let server_object_id = kernel.create_new_object_id() as u64;
+    let client_object_id = kernel.create_new_object_id() as u64;
+    let light_session_object_id = if is_light {
+        Some(kernel.create_new_object_id() as u64)
+    } else {
+        None
+    };
 
     if is_light {
-        // Create and initialize a KLightSession.
-        let mut light_session = crate::hle::kernel::k_light_session::KLightSession::new();
-        light_session.initialize(None, _name as usize);
-        // Light sessions use the same handle table pattern.
+        let light_session_object_id = light_session_object_id.unwrap();
+        let light_session = std::sync::Arc::new(std::sync::Mutex::new(
+            crate::hle::kernel::k_light_session::KLightSession::new(),
+        ));
+        let light_server_session = std::sync::Arc::new(std::sync::Mutex::new(
+            crate::hle::kernel::k_light_server_session::KLightServerSession::new(),
+        ));
+        let light_client_session = std::sync::Arc::new(std::sync::Mutex::new(
+            crate::hle::kernel::k_light_client_session::KLightClientSession::new(),
+        ));
+        {
+            light_session.lock().unwrap().initialize_with_endpoints(
+                None,
+                _name as usize,
+                server_object_id,
+                client_object_id,
+                Some(process.process_id),
+            );
+            light_server_session
+                .lock()
+                .unwrap()
+                .initialize(light_session_object_id);
+            light_client_session
+                .lock()
+                .unwrap()
+                .initialize(light_session_object_id);
+        }
+        process.register_light_session_object(light_session_object_id, light_session);
+        process.register_light_server_session_object(server_object_id, light_server_session);
+        process.register_light_client_session_object(client_object_id, light_client_session);
     } else {
         // Create and initialize a KSession.
         let session = std::sync::Arc::new(std::sync::Mutex::new(
@@ -62,15 +90,42 @@ pub fn create_session(
         {
             let mut s = session.lock().unwrap();
             s.initialize(None, _name as usize);
+            s.get_client_session()
+                .lock()
+                .unwrap()
+                .initialize(server_object_id);
+            s.get_server_session()
+                .lock()
+                .unwrap()
+                .initialize(server_object_id);
         }
-        // Register the session in the process.
-        process.session_objects.insert(server_object_id, session);
+        let client_session = session.lock().unwrap().get_client_session().clone();
+        process.register_session_object(server_object_id, session);
+        process.register_client_session_object(client_object_id, client_session, server_object_id);
     }
 
     // Add server session to handle table.
     let server_handle = match process.handle_table.add(server_object_id) {
         Ok(h) => h,
-        Err(_) => return RESULT_OUT_OF_HANDLES,
+        Err(_) => {
+            if is_light {
+                process
+                    .light_server_session_objects
+                    .remove(&server_object_id);
+                process
+                    .light_client_session_objects
+                    .remove(&client_object_id);
+                if let Some(light_session_object_id) = light_session_object_id {
+                    process
+                        .light_session_objects
+                        .remove(&light_session_object_id);
+                }
+            } else {
+                process.unregister_client_session_object_by_object_id(client_object_id);
+                process.unregister_session_object_by_object_id(server_object_id);
+            }
+            return RESULT_OUT_OF_HANDLES;
+        }
     };
 
     // Add client session to handle table.
@@ -79,12 +134,29 @@ pub fn create_session(
         Err(_) => {
             // Clean up server handle on failure.
             process.handle_table.remove(server_handle);
+            if is_light {
+                process
+                    .light_server_session_objects
+                    .remove(&server_object_id);
+                process
+                    .light_client_session_objects
+                    .remove(&client_object_id);
+                if let Some(light_session_object_id) = light_session_object_id {
+                    process
+                        .light_session_objects
+                        .remove(&light_session_object_id);
+                }
+            } else {
+                process.unregister_client_session_object_by_object_id(client_object_id);
+                process.unregister_session_object_by_object_id(server_object_id);
+            }
             return RESULT_OUT_OF_HANDLES;
         }
     };
 
     *out_server = server_handle;
     *out_client = client_handle;
+    session_reservation.commit();
     RESULT_SUCCESS
 }
 
@@ -109,9 +181,16 @@ pub fn accept_session(system: &System, out: &mut Handle, port_handle: Handle) ->
         None => return RESULT_INVALID_HANDLE,
     };
 
-    let Some(server_session_object_id) = port.lock().unwrap().server.accept_session() else {
-        return RESULT_INVALID_STATE;
+    let mut port_guard = port.lock().unwrap();
+    let server_session_object_id = if port_guard.is_light() {
+        port_guard.server.accept_light_session()
+    } else {
+        port_guard.server.accept_session()
     };
+    let Some(server_session_object_id) = server_session_object_id else {
+        return RESULT_NOT_FOUND;
+    };
+    drop(port_guard);
 
     let handle = match process.handle_table.add(server_session_object_id) {
         Ok(h) => h,

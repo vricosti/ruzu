@@ -5,7 +5,7 @@
 //! ARM32 dynarmic backend.
 
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use crate::arm::arm_interface::{
     Architecture, ArmInterface, ArmInterfaceBase, DebugWatchpoint, HaltReason, KProcess, KThread,
@@ -1494,6 +1494,8 @@ struct DynarmicCallbacks32 {
     /// Used as fallback when core_memory is None (tests).
     /// Not in upstream, but needed for Rust fallback path.
     memory: SharedProcessMemory,
+    /// Upstream: `const bool m_debugger_enabled`.
+    debugger_enabled: bool,
     /// Raw pointer to jit_state.reg[15] (PC) for diagnostic logging.
     /// Set after jit creation via `set_pc_ptr()`.
     /// Not in upstream, but needed since we don't have debugger.
@@ -1510,6 +1512,7 @@ impl DynarmicCallbacks32 {
         core_memory: Option<Arc<std::sync::Mutex<Memory>>>,
         process: *const crate::hle::kernel::k_process::KProcess,
         parent_ptr: Arc<AtomicPtr<ArmDynarmic32>>,
+        debugger_enabled: bool,
     ) -> Self {
         log::info!(
             "DynarmicCallbacks32: core_memory={}",
@@ -1524,6 +1527,7 @@ impl DynarmicCallbacks32 {
             core_memory,
             process,
             memory,
+            debugger_enabled,
             jit_pc_ptr: None,
         }
     }
@@ -1548,6 +1552,17 @@ impl DynarmicCallbacks32 {
         if let Some(jit) = self.parent().jit.as_ref() {
             jit.halt_execution(reason);
         }
+    }
+
+    /// Matches upstream `DynarmicCallbacks32::ReturnException`.
+    fn return_exception(&self, pc: u32, reason: rdynarmic::halt_reason::HaltReason) {
+        let parent = self.parent();
+        let mut ctx = ThreadContext::default();
+        parent.get_context(&mut ctx);
+        ctx.pc = pc as u64;
+        ctx.r[15] = pc as u64;
+        *parent.breakpoint_context.lock().unwrap() = ctx;
+        self.halt_execution(reason);
     }
 
     /// Matches upstream `DynarmicCallbacks32::CheckMemoryAccess`.
@@ -1838,442 +1853,16 @@ impl UserCallbacks for DynarmicCallbacks32 {
                 self.halt_execution(rdynarmic::halt_reason::HaltReason::EXCEPTION_RAISED);
             }
             _ => {
-                static LOGGED_UDF_CONTEXT: AtomicBool = AtomicBool::new(false);
+                if self.debugger_enabled {
+                    self.return_exception(
+                        pc as u32,
+                        rdynarmic::halt_reason::HaltReason::BREAKPOINT,
+                    );
+                    return;
+                }
+
                 let mut ctx = ThreadContext::default();
                 self.parent().get_context(&mut ctx);
-
-                if pc as u32 == 0x01D1_DD20 && !LOGGED_UDF_CONTEXT.swap(true, Ordering::Relaxed) {
-                    let read32 = |addr: u64, this: &mut Self| -> u32 {
-                        if this.check_memory_access(addr, 4) {
-                            this.mem().read_32(addr)
-                        } else {
-                            0
-                        }
-                    };
-                    log::error!(
-                        "UDF context pc={:08X} sp={:08X} lr={:08X} fp={:08X} cpsr={:08X} r0={:08X} r1={:08X} r2={:08X} r3={:08X} r4={:08X} r5={:08X} r6={:08X} r7={:08X}",
-                        pc as u32,
-                        ctx.sp,
-                        ctx.lr,
-                        ctx.r[11],
-                        ctx.pstate,
-                        ctx.r[0],
-                        ctx.r[1],
-                        ctx.r[2],
-                        ctx.r[3],
-                        ctx.r[4],
-                        ctx.r[5],
-                        ctx.r[6],
-                        ctx.r[7],
-                    );
-                    log::error!(
-                        "UDF code window pc=[{:08X} {:08X} {:08X}] lr=[{:08X} {:08X} {:08X} {:08X}]",
-                        read32(pc.saturating_sub(4), self),
-                        read32(pc, self),
-                        read32(pc + 4, self),
-                        read32(ctx.lr.saturating_sub(8), self),
-                        read32(ctx.lr.saturating_sub(4), self),
-                        read32(ctx.lr, self),
-                        read32(ctx.lr + 4, self),
-                    );
-                    log::error!(
-                        "UDF lr-24..lr+8 [{:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X}]",
-                        read32(ctx.lr.saturating_sub(24), self),
-                        read32(ctx.lr.saturating_sub(20), self),
-                        read32(ctx.lr.saturating_sub(16), self),
-                        read32(ctx.lr.saturating_sub(12), self),
-                        read32(ctx.lr.saturating_sub(8), self),
-                        read32(ctx.lr.saturating_sub(4), self),
-                        read32(ctx.lr, self),
-                        read32(ctx.lr + 4, self),
-                        read32(ctx.lr + 8, self),
-                    );
-                    log::error!(
-                        "UDF lr-40..lr-28 [{:08X} {:08X} {:08X} {:08X}]",
-                        read32(ctx.lr.saturating_sub(40), self),
-                        read32(ctx.lr.saturating_sub(36), self),
-                        read32(ctx.lr.saturating_sub(32), self),
-                        read32(ctx.lr.saturating_sub(28), self),
-                    );
-                    log::error!(
-                        "UDF sp..sp+32 [{:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X}]",
-                        read32(ctx.sp as u64, self),
-                        read32(ctx.sp as u64 + 4, self),
-                        read32(ctx.sp as u64 + 8, self),
-                        read32(ctx.sp as u64 + 12, self),
-                        read32(ctx.sp as u64 + 16, self),
-                        read32(ctx.sp as u64 + 20, self),
-                        read32(ctx.sp as u64 + 24, self),
-                        read32(ctx.sp as u64 + 28, self),
-                        read32(ctx.sp as u64 + 32, self),
-                    );
-                    log::error!(
-                        "UDF r1..r1+32 [{:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X}]",
-                        read32(ctx.r[1] as u64, self),
-                        read32(ctx.r[1] as u64 + 4, self),
-                        read32(ctx.r[1] as u64 + 8, self),
-                        read32(ctx.r[1] as u64 + 12, self),
-                        read32(ctx.r[1] as u64 + 16, self),
-                        read32(ctx.r[1] as u64 + 20, self),
-                        read32(ctx.r[1] as u64 + 24, self),
-                        read32(ctx.r[1] as u64 + 28, self),
-                        read32(ctx.r[1] as u64 + 32, self),
-                    );
-                    log::error!(
-                        "UDF r4..r4+32 [{:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X}]",
-                        read32(ctx.r[4] as u64, self),
-                        read32(ctx.r[4] as u64 + 4, self),
-                        read32(ctx.r[4] as u64 + 8, self),
-                        read32(ctx.r[4] as u64 + 12, self),
-                        read32(ctx.r[4] as u64 + 16, self),
-                        read32(ctx.r[4] as u64 + 20, self),
-                        read32(ctx.r[4] as u64 + 24, self),
-                        read32(ctx.r[4] as u64 + 28, self),
-                        read32(ctx.r[4] as u64 + 32, self),
-                    );
-                    log::error!(
-                        "UDF r4 fields [r4+8]={:08X} [r4+18]={:02X} [r4+34]={:08X}",
-                        read32(ctx.r[4] as u64 + 8, self),
-                        if self.check_memory_access(ctx.r[4] as u64 + 0x18, 1) {
-                            self.mem().read_8(ctx.r[4] as u64 + 0x18)
-                        } else {
-                            0
-                        },
-                        read32(ctx.r[4] as u64 + 0x34, self),
-                    );
-                    log::error!(
-                        "UDF r6..r6+32 [{:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X}]",
-                        read32(ctx.r[6] as u64, self),
-                        read32(ctx.r[6] as u64 + 4, self),
-                        read32(ctx.r[6] as u64 + 8, self),
-                        read32(ctx.r[6] as u64 + 12, self),
-                        read32(ctx.r[6] as u64 + 16, self),
-                        read32(ctx.r[6] as u64 + 20, self),
-                        read32(ctx.r[6] as u64 + 24, self),
-                        read32(ctx.r[6] as u64 + 28, self),
-                        read32(ctx.r[6] as u64 + 32, self),
-                    );
-                    log::error!(
-                        "UDF fp-0x140..fp-0x100 [{:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X}]",
-                        read32(ctx.r[11] as u64 - 0x140, self),
-                        read32(ctx.r[11] as u64 - 0x13C, self),
-                        read32(ctx.r[11] as u64 - 0x138, self),
-                        read32(ctx.r[11] as u64 - 0x134, self),
-                        read32(ctx.r[11] as u64 - 0x130, self),
-                        read32(ctx.r[11] as u64 - 0x12C, self),
-                        read32(ctx.r[11] as u64 - 0x128, self),
-                        read32(ctx.r[11] as u64 - 0x124, self),
-                        read32(ctx.r[11] as u64 - 0x120, self),
-                        read32(ctx.r[11] as u64 - 0x11C, self),
-                        read32(ctx.r[11] as u64 - 0x118, self),
-                        read32(ctx.r[11] as u64 - 0x114, self),
-                        read32(ctx.r[11] as u64 - 0x110, self),
-                        read32(ctx.r[11] as u64 - 0x10C, self),
-                        read32(ctx.r[11] as u64 - 0x108, self),
-                        read32(ctx.r[11] as u64 - 0x104, self),
-                        read32(ctx.r[11] as u64 - 0x100, self),
-                    );
-                    log::error!(
-                        "UDF fp chain [fp]={:08X} [fp+4]={:08X} [fp+8]={:08X} [fp+12]={:08X}",
-                        read32(ctx.r[11] as u64, self),
-                        read32(ctx.r[11] as u64 + 4, self),
-                        read32(ctx.r[11] as u64 + 8, self),
-                        read32(ctx.r[11] as u64 + 12, self),
-                    );
-                    let caller_fp = read32(ctx.r[11] as u64, self) as u64;
-                    if caller_fp != 0 {
-                        log::error!(
-                            "UDF caller fp chain [caller_fp]={:08X} [caller_fp+4]={:08X} [caller_fp+8]={:08X} [caller_fp+12]={:08X}",
-                            read32(caller_fp, self),
-                            read32(caller_fp + 4, self),
-                            read32(caller_fp + 8, self),
-                            read32(caller_fp + 12, self),
-                        );
-                        let caller2_fp = read32(caller_fp, self) as u64;
-                        if caller2_fp != 0 {
-                            log::error!(
-                                "UDF caller2 fp chain [caller2_fp]={:08X} [caller2_fp+4]={:08X} [caller2_fp+8]={:08X} [caller2_fp+12]={:08X}",
-                                read32(caller2_fp, self),
-                                read32(caller2_fp + 4, self),
-                                read32(caller2_fp + 8, self),
-                                read32(caller2_fp + 12, self),
-                            );
-                        }
-                    }
-                    log::error!(
-                        "UDF guest 0x2499B70.. [{:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X}]",
-                        read32(0x0249_9B70, self),
-                        read32(0x0249_9B74, self),
-                        read32(0x0249_9B78, self),
-                        read32(0x0249_9B7C, self),
-                        read32(0x0249_9B80, self),
-                        read32(0x0249_9B84, self),
-                        read32(0x0249_9B88, self),
-                        read32(0x0249_9B8C, self),
-                    );
-                    log::error!(
-                        "UDF guest 0x2499B90.. [{:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X}]",
-                        read32(0x0249_9B90, self),
-                        read32(0x0249_9B94, self),
-                        read32(0x0249_9B98, self),
-                        read32(0x0249_9B9C, self),
-                        read32(0x0249_9BA0, self),
-                        read32(0x0249_9BA4, self),
-                        read32(0x0249_9BA8, self),
-                        read32(0x0249_9BAC, self),
-                    );
-                    log::error!(
-                        "UDF guest 0x2499BB0.. [{:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X}]",
-                        read32(0x0249_9BB0, self),
-                        read32(0x0249_9BB4, self),
-                        read32(0x0249_9BB8, self),
-                        read32(0x0249_9BBC, self),
-                        read32(0x0249_9BC0, self),
-                        read32(0x0249_9BC4, self),
-                        read32(0x0249_9BC8, self),
-                        read32(0x0249_9BCC, self),
-                    );
-                    log::error!(
-                        "UDF bl1 0x020202C8 [{:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X}]",
-                        read32(0x0202_02C8, self),
-                        read32(0x0202_02CC, self),
-                        read32(0x0202_02D0, self),
-                        read32(0x0202_02D4, self),
-                        read32(0x0202_02D8, self),
-                        read32(0x0202_02DC, self),
-                        read32(0x0202_02E0, self),
-                        read32(0x0202_02E4, self),
-                    );
-                    log::error!(
-                        "UDF bl2 0x02022014 [{:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X}]",
-                        read32(0x0202_2014, self),
-                        read32(0x0202_2018, self),
-                        read32(0x0202_201C, self),
-                        read32(0x0202_2020, self),
-                        read32(0x0202_2024, self),
-                        read32(0x0202_2028, self),
-                        read32(0x0202_202C, self),
-                        read32(0x0202_2030, self),
-                    );
-                    log::error!(
-                        "UDF bl slots [0x022C3380]={:08X} [0x022C3D44]={:08X}",
-                        read32(0x022C_3380, self),
-                        read32(0x022C_3D44, self),
-                    );
-                    log::error!(
-                        "UDF bl1 target 0x0201D5E4 [{:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X}]",
-                        read32(0x0201_D5E4, self),
-                        read32(0x0201_D5E8, self),
-                        read32(0x0201_D5EC, self),
-                        read32(0x0201_D5F0, self),
-                        read32(0x0201_D5F4, self),
-                        read32(0x0201_D5F8, self),
-                        read32(0x0201_D5FC, self),
-                        read32(0x0201_D600, self),
-                    );
-                    log::error!(
-                        "UDF pre-abort helper1 0x02020F1C [{:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X}]",
-                        read32(0x0202_0F1C, self),
-                        read32(0x0202_0F20, self),
-                        read32(0x0202_0F24, self),
-                        read32(0x0202_0F28, self),
-                        read32(0x0202_0F2C, self),
-                        read32(0x0202_0F30, self),
-                        read32(0x0202_0F34, self),
-                        read32(0x0202_0F38, self),
-                    );
-                    log::error!(
-                        "UDF pre-abort helper2 0x02020F24 [{:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X}]",
-                        read32(0x0202_0F24, self),
-                        read32(0x0202_0F28, self),
-                        read32(0x0202_0F2C, self),
-                        read32(0x0202_0F30, self),
-                        read32(0x0202_0F34, self),
-                        read32(0x0202_0F38, self),
-                        read32(0x0202_0F3C, self),
-                        read32(0x0202_0F40, self),
-                    );
-                    log::error!(
-                        "UDF pre-abort helper0 0x020293BC [{:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X}]",
-                        read32(0x0202_93BC, self),
-                        read32(0x0202_93C0, self),
-                        read32(0x0202_93C4, self),
-                        read32(0x0202_93C8, self),
-                        read32(0x0202_93CC, self),
-                        read32(0x0202_93D0, self),
-                        read32(0x0202_93D4, self),
-                        read32(0x0202_93D8, self),
-                    );
-                    let helper_slot_0 = read32(0x022C_379C, self);
-                    let helper_slot_1 = read32(0x022C_37A0, self);
-                    let helper_slot_2 = read32(0x022C_37A4, self);
-                    log::error!(
-                        "UDF pre-abort helper slots [0x022C379C]={:08X} [0x022C37A0]={:08X} [0x022C37A4]={:08X}",
-                        helper_slot_0,
-                        helper_slot_1,
-                        helper_slot_2,
-                    );
-                    log::error!(
-                        "UDF pre-abort helper slot0 target [{:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X}]",
-                        read32(helper_slot_0 as u64, self),
-                        read32(helper_slot_0 as u64 + 4, self),
-                        read32(helper_slot_0 as u64 + 8, self),
-                        read32(helper_slot_0 as u64 + 12, self),
-                        read32(helper_slot_0 as u64 + 16, self),
-                        read32(helper_slot_0 as u64 + 20, self),
-                        read32(helper_slot_0 as u64 + 24, self),
-                        read32(helper_slot_0 as u64 + 28, self),
-                    );
-                    log::error!(
-                        "UDF pre-abort helper slot1 target [{:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X}]",
-                        read32(helper_slot_1 as u64, self),
-                        read32(helper_slot_1 as u64 + 4, self),
-                        read32(helper_slot_1 as u64 + 8, self),
-                        read32(helper_slot_1 as u64 + 12, self),
-                        read32(helper_slot_1 as u64 + 16, self),
-                        read32(helper_slot_1 as u64 + 20, self),
-                        read32(helper_slot_1 as u64 + 24, self),
-                        read32(helper_slot_1 as u64 + 28, self),
-                    );
-                    log::error!(
-                        "UDF pre-abort helper slot2 target [{:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X}]",
-                        read32(helper_slot_2 as u64, self),
-                        read32(helper_slot_2 as u64 + 4, self),
-                        read32(helper_slot_2 as u64 + 8, self),
-                        read32(helper_slot_2 as u64 + 12, self),
-                        read32(helper_slot_2 as u64 + 16, self),
-                        read32(helper_slot_2 as u64 + 20, self),
-                        read32(helper_slot_2 as u64 + 24, self),
-                        read32(helper_slot_2 as u64 + 28, self),
-                    );
-                    let pre_check_slot = read32(0x022C_2F2C, self);
-                    let pre_abort_ctor_slot = read32(0x022C_63D4, self);
-                    log::error!(
-                        "UDF helper slots extra [0x022C2F2C]={:08X} [0x022C63D4]={:08X}",
-                        pre_check_slot,
-                        pre_abort_ctor_slot,
-                    );
-                    log::error!(
-                        "UDF helper 0x201F5CC target [{:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X}]",
-                        read32(pre_check_slot as u64, self),
-                        read32(pre_check_slot as u64 + 4, self),
-                        read32(pre_check_slot as u64 + 8, self),
-                        read32(pre_check_slot as u64 + 12, self),
-                        read32(pre_check_slot as u64 + 16, self),
-                        read32(pre_check_slot as u64 + 20, self),
-                        read32(pre_check_slot as u64 + 24, self),
-                        read32(pre_check_slot as u64 + 28, self),
-                    );
-                    log::error!(
-                        "UDF helper 0x20293C4 target [{:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X}]",
-                        read32(pre_abort_ctor_slot as u64, self),
-                        read32(pre_abort_ctor_slot as u64 + 4, self),
-                        read32(pre_abort_ctor_slot as u64 + 8, self),
-                        read32(pre_abort_ctor_slot as u64 + 12, self),
-                        read32(pre_abort_ctor_slot as u64 + 16, self),
-                        read32(pre_abort_ctor_slot as u64 + 20, self),
-                        read32(pre_abort_ctor_slot as u64 + 24, self),
-                        read32(pre_abort_ctor_slot as u64 + 28, self),
-                    );
-                    log::error!(
-                        "UDF pre-check helper 0x0201F5CC [{:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X}]",
-                        read32(0x0201_F5CC, self),
-                        read32(0x0201_F5D0, self),
-                        read32(0x0201_F5D4, self),
-                        read32(0x0201_F5D8, self),
-                        read32(0x0201_F5DC, self),
-                        read32(0x0201_F5E0, self),
-                        read32(0x0201_F5E4, self),
-                        read32(0x0201_F5E8, self),
-                    );
-                    let bl1_resolved = read32(0x022C_248C, self);
-                    log::error!(
-                        "UDF bl1 slot2 [0x022C248C]={:08X} target=[{:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X}]",
-                        bl1_resolved,
-                        read32(bl1_resolved as u64, self),
-                        read32(bl1_resolved as u64 + 4, self),
-                        read32(bl1_resolved as u64 + 8, self),
-                        read32(bl1_resolved as u64 + 12, self),
-                        read32(bl1_resolved as u64 + 16, self),
-                        read32(bl1_resolved as u64 + 20, self),
-                        read32(bl1_resolved as u64 + 24, self),
-                        read32(bl1_resolved as u64 + 28, self),
-                    );
-                    log::error!(
-                        "UDF bl1 callee 0x00200994 [{:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X}]",
-                        read32(0x0020_0994, self),
-                        read32(0x0020_0998, self),
-                        read32(0x0020_099C, self),
-                        read32(0x0020_09A0, self),
-                        read32(0x0020_09A4, self),
-                        read32(0x0020_09A8, self),
-                        read32(0x0020_09AC, self),
-                        read32(0x0020_09B0, self),
-                    );
-                    log::error!(
-                        "UDF bl1 real 0x00200D94 [{:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X}]",
-                        read32(0x0020_0D94, self),
-                        read32(0x0020_0D98, self),
-                        read32(0x0020_0D9C, self),
-                        read32(0x0020_0DA0, self),
-                        read32(0x0020_0DA4, self),
-                        read32(0x0020_0DA8, self),
-                        read32(0x0020_0DAC, self),
-                        read32(0x0020_0DB0, self),
-                    );
-                    for base in [
-                        0x01D2_2BA0u64,
-                        0x01D2_2BC0,
-                        0x01D2_2BE0,
-                        0x01D2_2C00u64,
-                        0x01D2_2C20u64,
-                        0x01D2_2C30,
-                        0x01D2_2C40,
-                        0x01D2_2C60,
-                        0x0202_18A0,
-                        0x0202_18C0,
-                        0x0201_F5CC,
-                        0x0020_0D94,
-                        0x0020_0DB4,
-                        0x0020_0DD4,
-                        0x0020_0F18,
-                        0x0020_0F38,
-                    ] {
-                        log::error!(
-                            "UDF code dump @{:08X} [{:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X}]",
-                            base as u32,
-                            read32(base, self),
-                            read32(base + 4, self),
-                            read32(base + 8, self),
-                            read32(base + 12, self),
-                            read32(base + 16, self),
-                            read32(base + 20, self),
-                            read32(base + 24, self),
-                            read32(base + 28, self),
-                        );
-                    }
-                    if self.check_memory_access(0x0020_0000, 4) {
-                        let syms = crate::arm::symbols::get_symbols_from_memory(
-                            0x0020_0000,
-                            &self.mem(),
-                            false,
-                        );
-                        for &addr in &[
-                            0x01D1_DD20u64,
-                            0x01D2_2C00,
-                            0x0201_F5CC,
-                            0x0202_0F28,
-                            0x0202_93C4,
-                        ] {
-                            log::error!(
-                                "UDF symbol {:08X} -> {}",
-                                addr as u32,
-                                crate::arm::symbols::get_symbol_name(&syms, addr)
-                                    .unwrap_or("<none>"),
-                            );
-                        }
-                    }
-                }
 
                 let process = unsafe { &*self.process };
                 log::error!(
@@ -2285,68 +1874,6 @@ impl UserCallbacks for DynarmicCallbacks32 {
                 self.parent().base.log_backtrace(process, &ctx);
 
                 let code = self.mem().read_32(pc);
-
-                // One-shot detailed dump at first exception
-                static FIRST_EXCEPTION: std::sync::atomic::AtomicBool =
-                    std::sync::atomic::AtomicBool::new(false);
-                if !FIRST_EXCEPTION.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                    log::error!(
-                        "=== FIRST EXCEPTION DUMP === pc={:08X} code={:08X} exception={}",
-                        pc as u32,
-                        code,
-                        exception
-                    );
-                    // Dump surrounding code
-                    let start = pc.saturating_sub(64);
-                    for offset in (0..128).step_by(4) {
-                        let addr = start + offset;
-                        let word = self.mem().read_32(addr);
-                        let marker = if addr == pc { " <-- CRASH" } else { "" };
-                        log::error!("  {:08X}: {:08X}{}", addr as u32, word, marker);
-                    }
-                    // Dump all GPRs
-                    log::error!(
-                        "  GPRs: R0={:08X} R1={:08X} R2={:08X} R3={:08X}",
-                        ctx.r[0] as u32,
-                        ctx.r[1] as u32,
-                        ctx.r[2] as u32,
-                        ctx.r[3] as u32
-                    );
-                    log::error!(
-                        "  GPRs: R4={:08X} R5={:08X} R6={:08X} R7={:08X}",
-                        ctx.r[4] as u32,
-                        ctx.r[5] as u32,
-                        ctx.r[6] as u32,
-                        ctx.r[7] as u32
-                    );
-                    log::error!(
-                        "  GPRs: R8={:08X} R9={:08X} R10={:08X} R11={:08X} R12={:08X}",
-                        ctx.r[8] as u32,
-                        ctx.r[9] as u32,
-                        ctx.r[10] as u32,
-                        ctx.r[11] as u32,
-                        ctx.r[12] as u32
-                    );
-                    log::error!(
-                        "  PC={:08X} LR={:08X} SP={:08X} CPSR={:08X}",
-                        ctx.pc as u32,
-                        ctx.lr as u32,
-                        ctx.sp as u32,
-                        ctx.pstate
-                    );
-                    // Dump NEON/VFP registers (Q0-Q15 from v[])
-                    for i in 0..16 {
-                        log::error!("  Q{:02}={:032X}", i, ctx.v[i]);
-                    }
-                    // Dump stack
-                    log::error!("  Stack dump around SP={:08X}:", ctx.sp as u32);
-                    for offset in (0..64).step_by(4) {
-                        let addr = ctx.sp + offset;
-                        let word = self.mem().read_32(addr);
-                        log::error!("    [{:08X}] = {:08X}", addr as u32, word);
-                    }
-                }
-
                 log::error!(
                     "ExceptionRaised(exception = {}, pc = {:08X}, code = {:08X}, thumb = {})",
                     exception,
@@ -2454,7 +1981,7 @@ pub struct ArmDynarmic32 {
     halted_watchpoint: Option<DebugWatchpoint>,
 
     /// Context saved at breakpoint
-    breakpoint_context: ThreadContext,
+    breakpoint_context: Arc<Mutex<ThreadContext>>,
 
     /// The rdynarmic A32 JIT instance
     jit: Option<rdynarmic::A32Jit>,
@@ -2488,6 +2015,7 @@ impl ArmDynarmic32 {
         shared_memory: SharedProcessMemory,
         core_timing: Arc<crate::core_timing::CoreTiming>,
         core_memory: Option<Arc<std::sync::Mutex<Memory>>>,
+        debugger_enabled: bool,
     ) -> Self {
         // Get fastmem pointer from core_memory before moving it into callbacks.
         // Matches upstream: process->GetPageTable().GetBasePageTable().GetImpl().fastmem_arena
@@ -2504,6 +2032,7 @@ impl ArmDynarmic32 {
             core_memory,
             process as *const _ as *const crate::hle::kernel::k_process::KProcess,
             parent_ptr.clone(),
+            debugger_enabled,
         );
 
         let optimizations = if let Some(mask) = std::env::var("RUZU_A32_OPTIMIZATION_MASK")
@@ -2618,7 +2147,7 @@ impl ArmDynarmic32 {
             core_timing,
             parent_ptr,
             halted_watchpoint: None,
-            breakpoint_context: ThreadContext::default(),
+            breakpoint_context: Arc::new(Mutex::new(ThreadContext::default())),
             jit,
             cp15_uro: 0,
             last_exception_address,
@@ -3027,7 +2556,7 @@ impl ArmInterface for ArmDynarmic32 {
     }
 
     fn rewind_breakpoint_instruction(&mut self) {
-        let ctx = self.breakpoint_context.clone();
+        let ctx = self.breakpoint_context.lock().unwrap().clone();
         self.set_context(&ctx);
     }
 }
@@ -3048,6 +2577,7 @@ mod tests {
             None,
             std::ptr::null(),
             Arc::new(AtomicPtr::new(std::ptr::null_mut())),
+            false,
         );
 
         assert_eq!(callbacks.memory_read_code(0x1000), Some(0x12345678));

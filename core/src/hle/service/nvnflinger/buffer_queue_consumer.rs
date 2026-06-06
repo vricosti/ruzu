@@ -362,11 +362,10 @@ impl IBinder for BufferQueueConsumer {
     }
 
     fn get_native_handle(&self, type_id: u32) -> Option<Arc<std::sync::Mutex<KReadableEvent>>> {
-        log::error!(
+        panic!(
             "BufferQueueConsumer::get_native_handle called type_id={}",
             type_id
         );
-        None
     }
 
     fn as_any(&self) -> &dyn std::any::Any {

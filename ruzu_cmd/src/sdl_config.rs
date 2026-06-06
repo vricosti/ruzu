@@ -180,6 +180,7 @@ pub struct SdlConfig {
     /// Whether this is a global (non-custom) config instance.
     /// Maps to C++ `Config::global`.
     is_global: bool,
+    config_path: std::path::PathBuf,
 }
 
 impl SdlConfig {
@@ -190,12 +191,11 @@ impl SdlConfig {
     pub fn new(config_path: Option<String>) -> Self {
         // Upstream: Initialize(config_path); ReadSdlValues(); SaveSdlValues();
         // frontend_common::Config::Initialize / ReadSdlValues / SaveSdlValues not yet ported.
-        log::warn!(
-            "SdlConfig::new: frontend_common Config not yet ported; \
-             config_path={:?} will be ignored",
-            config_path
-        );
-        let mut instance = SdlConfig { is_global: true };
+        let mut instance = SdlConfig {
+            is_global: true,
+            config_path: resolve_config_path(config_path),
+        };
+        instance.read_system_values();
         instance.read_sdl_values();
         instance.save_sdl_values();
         instance
@@ -229,6 +229,23 @@ impl SdlConfig {
     /// Maps to C++ `SdlConfig::ReadSdlValues`.
     fn read_sdl_values(&mut self) {
         self.read_sdl_control_values();
+    }
+
+    /// Reads the subset of global System settings needed by the SDL frontend.
+    ///
+    /// Upstream `Config::ReadSystemValues` calls `ReadCategory(System)`, which
+    /// includes `rng_seed_enabled` and `rng_seed`. The full frontend_common
+    /// Config layer is not ported yet, so keep this narrow bridge in the SDL
+    /// config owner instead of applying RNG policy in `main.rs`.
+    fn read_system_values(&mut self) {
+        let Ok(contents) = std::fs::read_to_string(&self.config_path) else {
+            log::debug!(
+                "SdlConfig::read_system_values: config_path={:?} not readable, using Settings defaults",
+                self.config_path
+            );
+            return;
+        };
+        read_rng_seed_settings_from_ini(&contents);
     }
 
     /// Reads SDL control (button/analog/motion) config values.
@@ -353,6 +370,85 @@ impl SdlConfig {
     }
 }
 
+fn resolve_config_path(config_path: Option<String>) -> std::path::PathBuf {
+    config_path
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| {
+            common::fs::path_util::get_ruzu_path(common::fs::path_util::RuzuPath::ConfigDir)
+                .join("sdl2-config.ini")
+        })
+}
+
+fn read_rng_seed_settings_from_ini(contents: &str) {
+    let rng_seed_enabled_default =
+        parse_ini_bool(contents, "System", "rng_seed_enabled\\default").unwrap_or(true);
+    let rng_seed_default = parse_ini_bool(contents, "System", "rng_seed\\default").unwrap_or(true);
+
+    let mut values = common::settings::values_mut();
+    if !rng_seed_enabled_default {
+        if let Some(enabled) = parse_ini_bool(contents, "System", "rng_seed_enabled") {
+            values.rng_seed_enabled.set_value(enabled);
+        }
+    } else {
+        values.rng_seed_enabled.set_value(false);
+    }
+
+    if !rng_seed_default {
+        if let Some(seed) = parse_ini_u32(contents, "System", "rng_seed") {
+            values.rng_seed.set_value(seed);
+        }
+    } else {
+        values.rng_seed.set_value(0);
+    }
+}
+
+fn parse_ini_bool(contents: &str, section: &str, key: &str) -> Option<bool> {
+    parse_ini_value(contents, section, key).and_then(|value| match value {
+        "true" | "1" => Some(true),
+        "false" | "0" => Some(false),
+        _ => None,
+    })
+}
+
+fn parse_ini_u32(contents: &str, section: &str, key: &str) -> Option<u32> {
+    parse_ini_value(contents, section, key).and_then(|value| {
+        let value = value
+            .strip_prefix("0x")
+            .or_else(|| value.strip_prefix("0X"))
+            .unwrap_or(value);
+        u32::from_str_radix(value, 16)
+            .or_else(|_| value.parse::<u32>())
+            .ok()
+    })
+}
+
+fn parse_ini_value<'a>(contents: &'a str, section: &str, key: &str) -> Option<&'a str> {
+    let mut in_section = false;
+    for raw_line in contents.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() || line.starts_with(';') || line.starts_with('#') {
+            continue;
+        }
+        if let Some(name) = line
+            .strip_prefix('[')
+            .and_then(|line| line.strip_suffix(']'))
+        {
+            in_section = name == section;
+            continue;
+        }
+        if !in_section {
+            continue;
+        }
+        let Some((found_key, value)) = line.split_once('=') else {
+            continue;
+        };
+        if found_key.trim() == key {
+            return Some(value.trim());
+        }
+    }
+    None
+}
+
 impl Drop for SdlConfig {
     /// If this is a global config, saves all values on drop.
     ///
@@ -362,5 +458,80 @@ impl Drop for SdlConfig {
         if self.is_global {
             self.save_all_values();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{read_rng_seed_settings_from_ini, resolve_config_path};
+
+    #[test]
+    fn reads_rng_seed_from_system_group_when_not_default() {
+        let old_enabled = *common::settings::values().rng_seed_enabled.get_value();
+        let old_seed = *common::settings::values().rng_seed.get_value();
+        {
+            let mut values = common::settings::values_mut();
+            values.rng_seed_enabled.set_value(false);
+            values.rng_seed.set_value(0);
+        }
+
+        read_rng_seed_settings_from_ini(
+            r#"
+            [System]
+            rng_seed_enabled\default=false
+            rng_seed_enabled=true
+            rng_seed\default=false
+            rng_seed=0x1234ABCD
+            "#,
+        );
+
+        {
+            let values = common::settings::values();
+            assert!(*values.rng_seed_enabled.get_value());
+            assert_eq!(*values.rng_seed.get_value(), 0x1234_ABCD);
+        }
+
+        let mut values = common::settings::values_mut();
+        values.rng_seed_enabled.set_value(old_enabled);
+        values.rng_seed.set_value(old_seed);
+    }
+
+    #[test]
+    fn default_rng_seed_entries_reset_to_upstream_defaults() {
+        let old_enabled = *common::settings::values().rng_seed_enabled.get_value();
+        let old_seed = *common::settings::values().rng_seed.get_value();
+        {
+            let mut values = common::settings::values_mut();
+            values.rng_seed_enabled.set_value(true);
+            values.rng_seed.set_value(0xFFFF_FFFF);
+        }
+
+        read_rng_seed_settings_from_ini(
+            r#"
+            [System]
+            rng_seed_enabled\default=true
+            rng_seed_enabled=true
+            rng_seed\default=true
+            rng_seed=0x1234ABCD
+            "#,
+        );
+
+        {
+            let values = common::settings::values();
+            assert!(!*values.rng_seed_enabled.get_value());
+            assert_eq!(*values.rng_seed.get_value(), 0);
+        }
+
+        let mut values = common::settings::values_mut();
+        values.rng_seed_enabled.set_value(old_enabled);
+        values.rng_seed.set_value(old_seed);
+    }
+
+    #[test]
+    fn explicit_config_path_is_used_verbatim() {
+        assert_eq!(
+            resolve_config_path(Some("/tmp/custom-sdl2-config.ini".to_string())),
+            std::path::PathBuf::from("/tmp/custom-sdl2-config.ini")
+        );
     }
 }

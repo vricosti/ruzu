@@ -63,11 +63,9 @@ pub fn process_capture_command(
     mix_buffers: &mut [i32],
     sample_count: usize,
 ) {
-    let Some(input_range) = mix_buffer_range(mix_buffers, payload.input, sample_count) else {
-        return;
-    };
     if payload.effect_enabled {
-        let input = mix_buffers[input_range].to_vec();
+        let input_start = payload.input as usize * sample_count;
+        let input = &mix_buffers[input_start..input_start + sample_count];
         let _ = write_capture_buffer(
             payload.send_buffer_info,
             payload.send_buffer,
@@ -92,19 +90,6 @@ pub fn dump_capture_command(payload: &CapturePayload, dump: &mut String) {
         "CaptureCommand\n\tenabled {} input {:02X} output {:02X}",
         payload.effect_enabled, payload.input, payload.output
     );
-}
-
-fn mix_buffer_range(
-    mix_buffers: &[i32],
-    buffer_index: i16,
-    sample_count: usize,
-) -> Option<std::ops::Range<usize>> {
-    if buffer_index < 0 {
-        return None;
-    }
-    let start = buffer_index as usize * sample_count;
-    let end = start.saturating_add(sample_count);
-    (end <= mix_buffers.len()).then_some(start..end)
 }
 
 fn reset_capture_info(addr: CpuAddr) {

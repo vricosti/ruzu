@@ -16,6 +16,7 @@ use super::engine_interface::{EngineInterface, EngineInterfaceState};
 use super::{ClassId, Engine, PendingWrite, ENGINE_REG_COUNT};
 use crate::memory_manager::MemoryManager;
 use crate::rasterizer_interface::{RasterizerHandle, RasterizerInterface};
+use crate::textures::texture::{TicEntry, TscEntry};
 
 // ── Register offset constants (method addresses) ────────────────────────────
 
@@ -164,6 +165,8 @@ pub struct KeplerCompute {
     dispatch_calls: Vec<DispatchCall>,
     /// QMD GPU VA set on LAUNCH write, consumed by execute_pending.
     pending_launch: Option<u64>,
+    /// Port of upstream owner-local `indirect_compute`.
+    indirect_compute: Option<u64>,
     rasterizer: Option<RasterizerHandle>,
 }
 
@@ -185,6 +188,7 @@ impl KeplerCompute {
             launch_description: QueueMetaData::default(),
             dispatch_calls: Vec::new(),
             pending_launch: None,
+            indirect_compute: None,
             rasterizer: None,
         }
     }
@@ -261,6 +265,33 @@ impl KeplerCompute {
     /// Texture constant buffer index.
     pub fn tex_cb_index(&self) -> u32 {
         self.regs[TEX_CB_INDEX as usize]
+    }
+
+    /// Port of upstream `KeplerCompute::GetIndirectComputeAddress`.
+    pub fn get_indirect_compute_address(&self) -> Option<u64> {
+        self.indirect_compute
+    }
+
+    /// Port of upstream `KeplerCompute::GetTICEntry`.
+    pub fn get_tic_entry(&self, tic_index: u32, read_cpu: &dyn Fn(u64, &mut [u8])) -> TicEntry {
+        let tic_address_gpu =
+            self.tic_address() + tic_index as u64 * std::mem::size_of::<TicEntry>() as u64;
+        let mut bytes = [0u8; std::mem::size_of::<TicEntry>()];
+        self.memory_manager
+            .lock()
+            .read_block_unsafe(tic_address_gpu, &mut bytes, read_cpu);
+        unsafe { std::ptr::read_unaligned(bytes.as_ptr() as *const TicEntry) }
+    }
+
+    /// Port of upstream `KeplerCompute::GetTSCEntry`.
+    pub fn get_tsc_entry(&self, tsc_index: u32, read_cpu: &dyn Fn(u64, &mut [u8])) -> TscEntry {
+        let tsc_address_gpu =
+            self.tsc_address() + tsc_index as u64 * std::mem::size_of::<TscEntry>() as u64;
+        let mut bytes = [0u8; std::mem::size_of::<TscEntry>()];
+        self.memory_manager
+            .lock()
+            .read_block_unsafe(tsc_address_gpu, &mut bytes, read_cpu);
+        unsafe { std::ptr::read_unaligned(bytes.as_ptr() as *const TscEntry) }
     }
 
     /// Drain and return all recorded dispatch calls.
@@ -445,6 +476,68 @@ mod tests {
         engine.regs[(TIC_BASE + 2) as usize] = 128; // limit
         assert_eq!(engine.tic_address(), 0x0003_0000_8000);
         assert_eq!(engine.tic_limit(), 128);
+    }
+
+    #[test]
+    fn test_get_indirect_compute_address_defaults_to_none() {
+        let engine = new_test_engine();
+        assert_eq!(engine.get_indirect_compute_address(), None);
+    }
+
+    #[test]
+    fn test_get_tic_entry_reads_from_tic_pool() {
+        let memory_manager = Arc::new(Mutex::new(MemoryManager::new(0)));
+        memory_manager
+            .lock()
+            .map(0x6000, 0x9000_0000, 0x1000, 0, false);
+        let mut engine = KeplerCompute::new(memory_manager);
+        engine.regs[TIC_BASE as usize] = 0;
+        engine.regs[(TIC_BASE + 1) as usize] = 0x6000;
+
+        let expected_addr = 0x9000_0000 + 3 * std::mem::size_of::<TicEntry>() as u64;
+        let mut raw = [0u8; std::mem::size_of::<TicEntry>()];
+        raw[0..8].copy_from_slice(&0x1111_2222_3333_4444u64.to_le_bytes());
+        raw[8..16].copy_from_slice(&0x5555_6666_7777_8888u64.to_le_bytes());
+        raw[16..24].copy_from_slice(&0x9999_AAAA_BBBB_CCCCu64.to_le_bytes());
+        raw[24..32].copy_from_slice(&0xDDDD_EEEE_FFFF_0001u64.to_le_bytes());
+
+        let entry = engine.get_tic_entry(3, &|addr, output| {
+            assert_eq!(addr, expected_addr);
+            output.copy_from_slice(&raw);
+        });
+
+        assert_eq!(entry.raw[0], 0x1111_2222_3333_4444);
+        assert_eq!(entry.raw[1], 0x5555_6666_7777_8888);
+        assert_eq!(entry.raw[2], 0x9999_AAAA_BBBB_CCCC);
+        assert_eq!(entry.raw[3], 0xDDDD_EEEE_FFFF_0001);
+    }
+
+    #[test]
+    fn test_get_tsc_entry_reads_from_tsc_pool() {
+        let memory_manager = Arc::new(Mutex::new(MemoryManager::new(0)));
+        memory_manager
+            .lock()
+            .map(0x5000, 0x9100_0000, 0x1000, 0, false);
+        let mut engine = KeplerCompute::new(memory_manager);
+        engine.regs[TSC_BASE as usize] = 0;
+        engine.regs[(TSC_BASE + 1) as usize] = 0x5000;
+
+        let expected_addr = 0x9100_0000 + 2 * std::mem::size_of::<TscEntry>() as u64;
+        let mut raw = [0u8; std::mem::size_of::<TscEntry>()];
+        raw[0..8].copy_from_slice(&0x0123_4567_89AB_CDEFu64.to_le_bytes());
+        raw[8..16].copy_from_slice(&0xFEDC_BA98_7654_3210u64.to_le_bytes());
+        raw[16..24].copy_from_slice(&0x0F0E_0D0C_0B0A_0908u64.to_le_bytes());
+        raw[24..32].copy_from_slice(&0x8070_6050_4030_2010u64.to_le_bytes());
+
+        let entry = engine.get_tsc_entry(2, &|addr, output| {
+            assert_eq!(addr, expected_addr);
+            output.copy_from_slice(&raw);
+        });
+
+        assert_eq!(entry.raw[0], 0x0123_4567_89AB_CDEF);
+        assert_eq!(entry.raw[1], 0xFEDC_BA98_7654_3210);
+        assert_eq!(entry.raw[2], 0x0F0E_0D0C_0B0A_0908);
+        assert_eq!(entry.raw[3], 0x8070_6050_4030_2010);
     }
 
     #[test]

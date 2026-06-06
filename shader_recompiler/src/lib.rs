@@ -51,11 +51,16 @@ pub mod varying_state;
 pub use ir::types::ShaderStage;
 pub use pipeline_cache::{
     compile_dual_vertex_shader_glsl_at_offset,
-    compile_dual_vertex_shader_glsl_at_offset_with_bindings, compile_shader, compile_shader_glsl,
-    compile_shader_glsl_at_offset, compile_shader_glsl_at_offset_with_bindings,
+    compile_dual_vertex_shader_glsl_at_offset_with_bindings,
+    compile_dual_vertex_shader_glsl_at_offset_with_bindings_and_host_info, compile_shader,
+    compile_shader_glsl, compile_shader_glsl_at_offset,
+    compile_shader_glsl_at_offset_with_bindings,
+    compile_shader_glsl_at_offset_with_bindings_and_host_info,
     compile_shader_glsl_at_offset_with_bindings_and_texture_bound,
-    compile_shader_glsl_at_offset_with_bindings_and_texture_bound_and_sph, CompiledGlslShader,
-    CompiledShader, PipelineCache, ShaderKey,
+    compile_shader_glsl_at_offset_with_bindings_and_texture_bound_and_host_info,
+    compile_shader_glsl_at_offset_with_bindings_and_texture_bound_and_sph,
+    compile_shader_glsl_at_offset_with_bindings_and_texture_bound_and_sph_and_host_info,
+    CompiledGlslShader, CompiledShader, PipelineCache, ShaderKey,
 };
 pub use profile::Profile;
 pub use runtime_info::RuntimeInfo;

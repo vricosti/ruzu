@@ -34,26 +34,47 @@ pub type GPUVAddr = u64;
 /// GPU engine class identifiers used during subchannel binding.
 ///
 /// Corresponds to the C++ `Tegra::EngineID` enum.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u32)]
-pub enum EngineID {
-    FermiTwodA = 0x902D,
-    MaxwellB = 0xB197,
-    KeplerComputeB = 0xB1C0,
-    KeplerInlineToMemoryB = 0xA140,
-    MaxwellDmaCopyA = 0xB0B5,
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[repr(transparent)]
+pub struct EngineID(u32);
+
+#[allow(non_upper_case_globals)]
+impl EngineID {
+    pub const FermiTwodA: Self = Self(0x902D);
+    pub const MaxwellB: Self = Self(0xB197);
+    pub const KeplerComputeB: Self = Self(0xB1C0);
+    pub const KeplerInlineToMemoryB: Self = Self(0xA140);
+    pub const MaxwellDmaCopyA: Self = Self(0xB0B5);
+
+    /// Convert a raw u32 value to an EngineID.
+    ///
+    /// Upstream stores `static_cast<EngineID>(method_call.argument)` in the
+    /// fixed subchannel array even when the value is not one of the known
+    /// engine classes. Preserve that raw value instead of using `Option`.
+    pub const fn from_raw(value: u32) -> Self {
+        Self(value)
+    }
+
+    pub const fn raw(self) -> u32 {
+        self.0
+    }
 }
 
-impl EngineID {
-    /// Try to convert a raw u32 value to an EngineID.
-    pub fn from_raw(value: u32) -> Option<Self> {
-        match value {
-            0x902D => Some(Self::FermiTwodA),
-            0xB197 => Some(Self::MaxwellB),
-            0xB1C0 => Some(Self::KeplerComputeB),
-            0xA140 => Some(Self::KeplerInlineToMemoryB),
-            0xB0B5 => Some(Self::MaxwellDmaCopyA),
-            _ => None,
+impl Default for EngineID {
+    fn default() -> Self {
+        Self(0)
+    }
+}
+
+impl std::fmt::Debug for EngineID {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match *self {
+            Self::FermiTwodA => f.write_str("FermiTwodA"),
+            Self::MaxwellB => f.write_str("MaxwellB"),
+            Self::KeplerComputeB => f.write_str("KeplerComputeB"),
+            Self::KeplerInlineToMemoryB => f.write_str("KeplerInlineToMemoryB"),
+            Self::MaxwellDmaCopyA => f.write_str("MaxwellDmaCopyA"),
+            _ => write!(f, "EngineID(0x{:04X})", self.0),
         }
     }
 }
@@ -327,7 +348,7 @@ static PULLER_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
 pub struct Puller {
     pub regs: PullerRegs,
     /// Mapping of subchannels to bound engine IDs.
-    pub bound_engines: [Option<EngineID>; NUM_SUBCHANNELS],
+    pub bound_engines: [EngineID; NUM_SUBCHANNELS],
     gpu: *const crate::gpu::Gpu,
     memory_manager: Arc<parking_lot::Mutex<crate::memory_manager::MemoryManager>>,
     dma_pusher: *mut crate::dma_pusher::DmaPusher,
@@ -344,7 +365,7 @@ impl Puller {
     ) -> Self {
         Self {
             regs: PullerRegs::default(),
-            bound_engines: [None; NUM_SUBCHANNELS],
+            bound_engines: [EngineID::default(); NUM_SUBCHANNELS],
             gpu,
             memory_manager,
             dma_pusher,
@@ -547,13 +568,7 @@ impl Puller {
     /// the subchannel and call engine->CallMethod(method_call).
     /// Upstream: Puller::CallEngineMethod() in video_core/engines/puller.cpp
     pub fn call_engine_method(&mut self, method_call: &MethodCall) {
-        let Some(engine) = self.bound_engines[method_call.subchannel as usize] else {
-            log::warn!(
-                "Puller::call_engine_method: no engine bound for subchannel {}",
-                method_call.subchannel
-            );
-            return;
-        };
+        let engine = self.bound_engines[method_call.subchannel as usize];
 
         let channel_state = unsafe { &mut *self.channel_state };
         let trace_idx = PULLER_ENGINE_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
@@ -630,6 +645,12 @@ impl Puller {
                     );
                 }
             }
+            _ => {
+                log::warn!(
+                    "Puller::call_engine_method: unimplemented engine 0x{:04X}",
+                    engine.raw()
+                );
+            }
         }
     }
 
@@ -644,13 +665,7 @@ impl Puller {
         amount: u32,
         methods_pending: u32,
     ) {
-        let Some(engine) = self.bound_engines[subchannel as usize] else {
-            log::warn!(
-                "Puller::call_engine_multi_method: no engine bound for subchannel {}",
-                subchannel
-            );
-            return;
-        };
+        let engine = self.bound_engines[subchannel as usize];
 
         let channel_state = unsafe { &mut *self.channel_state };
         match engine {
@@ -679,6 +694,12 @@ impl Puller {
                     engine.call_multi_method(method, base_start, amount, methods_pending);
                 }
             }
+            _ => {
+                log::warn!(
+                    "Puller::call_engine_multi_method: unimplemented engine 0x{:04X}",
+                    engine.raw()
+                );
+            }
         }
     }
 
@@ -701,75 +722,83 @@ impl Puller {
                 method_call.argument
             );
         }
-        let engine_id = EngineID::from_raw(method_call.argument);
-        if let Some(eid) = engine_id {
-            self.bound_engines[method_call.subchannel as usize] = Some(eid);
-            if should_trace_dma_flow() {
-                log::info!(
-                    "Puller::process_bind_method bound subch={} engine={:?}",
-                    method_call.subchannel,
-                    eid
-                );
-            } else {
-                log::trace!(
-                    "Puller::process_bind_method subch={} engine={:?}",
-                    method_call.subchannel,
-                    eid
-                );
-            }
-            let channel_state = unsafe { &mut *self.channel_state };
-            let dma_pusher = unsafe { self.dma_pusher.as_mut() };
-            if let Some(dma_pusher) = dma_pusher {
-                match eid {
-                    EngineID::FermiTwodA => {
-                        if let Some(engine) = channel_state.fermi_2d.as_mut() {
-                            dma_pusher.bind_subchannel(
-                                engine.as_mut(),
-                                method_call.subchannel,
-                                EngineTypes::Fermi2D,
-                            );
+        let eid = EngineID::from_raw(method_call.argument);
+        self.bound_engines[method_call.subchannel as usize] = eid;
+        match eid {
+            EngineID::FermiTwodA
+            | EngineID::MaxwellB
+            | EngineID::KeplerComputeB
+            | EngineID::KeplerInlineToMemoryB
+            | EngineID::MaxwellDmaCopyA => {
+                if should_trace_dma_flow() {
+                    log::info!(
+                        "Puller::process_bind_method bound subch={} engine={:?}",
+                        method_call.subchannel,
+                        eid
+                    );
+                } else {
+                    log::trace!(
+                        "Puller::process_bind_method subch={} engine={:?}",
+                        method_call.subchannel,
+                        eid
+                    );
+                }
+                let channel_state = unsafe { &mut *self.channel_state };
+                let dma_pusher = unsafe { self.dma_pusher.as_mut() };
+                if let Some(dma_pusher) = dma_pusher {
+                    match eid {
+                        EngineID::FermiTwodA => {
+                            if let Some(engine) = channel_state.fermi_2d.as_mut() {
+                                dma_pusher.bind_subchannel(
+                                    engine.as_mut(),
+                                    method_call.subchannel,
+                                    EngineTypes::Fermi2D,
+                                );
+                            }
                         }
-                    }
-                    EngineID::MaxwellB => {
-                        if let Some(engine) = channel_state.maxwell_3d.as_mut() {
-                            dma_pusher.bind_subchannel(
-                                engine.as_mut(),
-                                method_call.subchannel,
-                                EngineTypes::Maxwell3D,
-                            );
+                        EngineID::MaxwellB => {
+                            if let Some(engine) = channel_state.maxwell_3d.as_mut() {
+                                dma_pusher.bind_subchannel(
+                                    engine.as_mut(),
+                                    method_call.subchannel,
+                                    EngineTypes::Maxwell3D,
+                                );
+                            }
                         }
-                    }
-                    EngineID::KeplerComputeB => {
-                        if let Some(engine) = channel_state.kepler_compute.as_mut() {
-                            dma_pusher.bind_subchannel(
-                                engine.as_mut(),
-                                method_call.subchannel,
-                                EngineTypes::KeplerCompute,
-                            );
+                        EngineID::KeplerComputeB => {
+                            if let Some(engine) = channel_state.kepler_compute.as_mut() {
+                                dma_pusher.bind_subchannel(
+                                    engine.as_mut(),
+                                    method_call.subchannel,
+                                    EngineTypes::KeplerCompute,
+                                );
+                            }
                         }
-                    }
-                    EngineID::KeplerInlineToMemoryB => {
-                        if let Some(engine) = channel_state.kepler_memory.as_mut() {
-                            dma_pusher.bind_subchannel(
-                                engine.as_mut(),
-                                method_call.subchannel,
-                                EngineTypes::KeplerMemory,
-                            );
+                        EngineID::KeplerInlineToMemoryB => {
+                            if let Some(engine) = channel_state.kepler_memory.as_mut() {
+                                dma_pusher.bind_subchannel(
+                                    engine.as_mut(),
+                                    method_call.subchannel,
+                                    EngineTypes::KeplerMemory,
+                                );
+                            }
                         }
-                    }
-                    EngineID::MaxwellDmaCopyA => {
-                        if let Some(engine) = channel_state.maxwell_dma.as_mut() {
-                            dma_pusher.bind_subchannel(
-                                engine.as_mut(),
-                                method_call.subchannel,
-                                EngineTypes::MaxwellDMA,
-                            );
+                        EngineID::MaxwellDmaCopyA => {
+                            if let Some(engine) = channel_state.maxwell_dma.as_mut() {
+                                dma_pusher.bind_subchannel(
+                                    engine.as_mut(),
+                                    method_call.subchannel,
+                                    EngineTypes::MaxwellDMA,
+                                );
+                            }
                         }
+                        _ => unreachable!("known engine ids are handled by the outer match"),
                     }
                 }
             }
-        } else {
-            log::error!("Unimplemented engine {:04X}", method_call.argument);
+            _ => {
+                log::error!("Unimplemented engine {:04X}", method_call.argument);
+            }
         }
     }
 
@@ -1107,6 +1136,22 @@ mod tests {
         assert_eq!(calls[0].1, QueryType::Payload as u32);
         assert_eq!(calls[0].2, QueryPropertiesFlags::IS_A_FENCE);
         assert_eq!(calls[0].3, 0xDEAD_BEEF);
+    }
+
+    #[test]
+    fn bound_engines_store_raw_values_like_upstream_array() {
+        let mut puller = Puller::default();
+
+        assert_eq!(puller.bound_engines[0].raw(), 0);
+
+        puller.process_bind_method(&MethodCall::new(
+            BufferMethods::BindObject as u32,
+            0x1234,
+            2,
+            1,
+        ));
+
+        assert_eq!(puller.bound_engines[2].raw(), 0x1234);
     }
 
     #[test]

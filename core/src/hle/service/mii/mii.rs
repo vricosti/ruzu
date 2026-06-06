@@ -186,10 +186,8 @@ impl IDatabaseService {
         }
         let (create_lo, create_hi, name_0_3, name_4_7, traits0, traits1) =
             if let Some(char_info) = char_info {
-                let create_lo =
-                    u64::from_le_bytes(char_info.create_id[0..8].try_into().unwrap());
-                let create_hi =
-                    u64::from_le_bytes(char_info.create_id[8..16].try_into().unwrap());
+                let create_lo = u64::from_le_bytes(char_info.create_id[0..8].try_into().unwrap());
+                let create_hi = u64::from_le_bytes(char_info.create_id[8..16].try_into().unwrap());
                 let pack_name = |base: usize| -> u64 {
                     let mut packed = 0u64;
                     for index in 0..4 {
@@ -212,7 +210,14 @@ impl IDatabaseService {
                     | ((char_info.mouth_type as u64) << 40)
                     | ((char_info.glass_type as u64) << 48)
                     | ((char_info.mole_type as u64) << 56);
-                (create_lo, create_hi, pack_name(0), pack_name(4), traits0, traits1)
+                (
+                    create_lo,
+                    create_hi,
+                    pack_name(0),
+                    pack_name(4),
+                    traits0,
+                    traits1,
+                )
             } else {
                 (0, 0, 0, 0, 0, 0)
             };
@@ -508,14 +513,7 @@ impl IDatabaseService {
         }
 
         let char_info = service.manager.lock().unwrap().build_default(index as u32);
-        Self::trace_char_info(
-            5,
-            7,
-            RESULT_SUCCESS,
-            index as u64,
-            0,
-            Some(&char_info),
-        );
+        Self::trace_char_info(5, 7, RESULT_SUCCESS, index as u64, 0, Some(&char_info));
         let words = (std::mem::size_of::<CharInfo>() + 3) / 4;
         let mut response = CmifResponse::new(ctx, 2 + words as u32, 0, 0);
         response.push_result(RESULT_SUCCESS);

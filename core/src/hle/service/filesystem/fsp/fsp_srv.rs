@@ -20,6 +20,7 @@ use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
 use crate::hle::service::ipc_helpers::{RequestParser, ResponseBuilder};
 use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
 
+use super::super::filesystem::FileSystemController;
 use super::fs_i_filesystem::IFileSystem;
 use super::fs_i_storage::IStorage;
 use super::fsp_types::SizeGetter;
@@ -165,6 +166,28 @@ impl FspSrv {
         }
     }
 
+    fn make_size_getter_from_storage_id(
+        fsc: Arc<std::sync::Mutex<FileSystemController>>,
+        id: StorageId,
+    ) -> SizeGetter {
+        let fsc_for_free = Arc::clone(&fsc);
+        SizeGetter {
+            get_free_size: Box::new(move || fsc_for_free.lock().unwrap().get_free_space_size(id)),
+            get_total_size: Box::new(move || fsc.lock().unwrap().get_total_space_size(id)),
+        }
+    }
+
+    fn storage_id_for_save_data_space(space_id: SaveDataSpaceId) -> Option<StorageId> {
+        match space_id {
+            SaveDataSpaceId::User => Some(StorageId::NandUser),
+            SaveDataSpaceId::SdSystem | SaveDataSpaceId::SdUser => Some(StorageId::SdCard),
+            SaveDataSpaceId::System => Some(StorageId::NandSystem),
+            SaveDataSpaceId::Temporary
+            | SaveDataSpaceId::ProperSystem
+            | SaveDataSpaceId::SafeMode => None,
+        }
+    }
+
     fn make_empty_filesystem() -> IFileSystem {
         let dir: VirtualDir = Arc::new(VectorVfsDirectory::new(
             vec![],
@@ -203,6 +226,16 @@ impl FspSrv {
                     "OpenSaveDataFileSystem",
                 ),
                 (
+                    52,
+                    Some(Self::open_save_data_file_system_by_system_save_data_id_handler),
+                    "OpenSaveDataFileSystemBySystemSaveDataId",
+                ),
+                (
+                    53,
+                    Some(Self::open_read_only_save_data_file_system_handler),
+                    "OpenReadOnlySaveDataFileSystem",
+                ),
+                (
                     200,
                     Some(Self::open_data_storage_by_current_process_handler),
                     "OpenDataStorageByCurrentProcess",
@@ -216,6 +249,11 @@ impl FspSrv {
                     203,
                     Some(Self::open_patch_data_storage_by_current_process_handler),
                     "OpenPatchDataStorageByCurrentProcess",
+                ),
+                (
+                    205,
+                    Some(Self::open_data_storage_with_program_index_handler),
+                    "OpenDataStorageWithProgramIndex",
                 ),
                 (
                     1004,
@@ -276,21 +314,9 @@ impl FspSrv {
         ctx: &mut HLERequestContext,
         object: Arc<dyn SessionRequestHandler>,
     ) {
-        let is_domain = ctx
-            .get_manager()
-            .map_or(false, |manager| manager.lock().unwrap().is_domain());
-        let move_handle = if is_domain {
-            0
-        } else {
-            ctx.create_session_for_service(object.clone()).unwrap_or(0)
-        };
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 1);
         rb.push_result(RESULT_SUCCESS);
-        if is_domain {
-            ctx.add_domain_object(object);
-        } else {
-            rb.push_move_objects(move_handle);
-        }
+        rb.push_ipc_interface(object);
     }
 
     /// Port of upstream `FSP_SRV::SetCurrentProcess` (fsp_srv.cpp:186-193).
@@ -354,18 +380,8 @@ impl FspSrv {
             }
         };
 
-        let fsc_for_size = Arc::clone(fsc);
-        let size_getter = SizeGetter {
-            get_free_size: Box::new(move || {
-                fsc_for_size
-                    .lock()
-                    .unwrap()
-                    .get_free_space_size(StorageId::SdCard)
-            }),
-            get_total_size: Box::new(move || {
-                fsc.lock().unwrap().get_total_space_size(StorageId::SdCard)
-            }),
-        };
+        let size_getter =
+            Self::make_size_getter_from_storage_id(Arc::clone(fsc), StorageId::SdCard);
 
         Self::push_interface_response(ctx, Arc::new(IFileSystem::new(sdmc_dir, size_getter)));
     }
@@ -440,10 +456,36 @@ impl FspSrv {
             return;
         };
 
-        Self::push_interface_response(
-            ctx,
-            Arc::new(IFileSystem::new(dir, Self::make_default_size_getter())),
+        let size_getter = service
+            .fsc
+            .as_ref()
+            .and_then(|fsc| {
+                Self::storage_id_for_save_data_space(space_id)
+                    .map(|id| Self::make_size_getter_from_storage_id(Arc::clone(fsc), id))
+            })
+            .unwrap_or_else(Self::make_default_size_getter);
+
+        Self::push_interface_response(ctx, Arc::new(IFileSystem::new(dir, size_getter)));
+    }
+
+    fn open_save_data_file_system_by_system_save_data_id_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        log::warn!(
+            "(STUBBED) OpenSaveDataFileSystemBySystemSaveDataId called, delegating to OpenSaveDataFileSystem"
         );
+        Self::open_save_data_file_system_handler(this, ctx);
+    }
+
+    fn open_read_only_save_data_file_system_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        log::warn!(
+            "(STUBBED) OpenReadOnlySaveDataFileSystem called, delegating to OpenSaveDataFileSystem"
+        );
+        Self::open_save_data_file_system_handler(this, ctx);
     }
 
     fn open_data_storage_by_current_process_handler(
@@ -599,6 +641,43 @@ impl FspSrv {
         // Without this, the game reads past the result expecting a domain object ID,
         // gets garbage, and eventually crashes.
         Self::push_error_with_null_interface(ctx, RESULT_TARGET_NOT_FOUND.raw());
+    }
+
+    /// Port of upstream `FSP_SRV::OpenDataStorageWithProgramIndex`.
+    fn open_data_storage_with_program_index_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const FspSrv) };
+        let mut rp = RequestParser::new(ctx);
+        let program_index = rp.pop_raw::<u8>();
+        let program_id = *service.program_id.lock().unwrap();
+
+        log::info!(
+            "FspSrv::OpenDataStorageWithProgramIndex called, program_index={}",
+            program_index
+        );
+
+        let patched_romfs =
+            service
+                .romfs_controller
+                .lock()
+                .unwrap()
+                .as_ref()
+                .and_then(|controller| {
+                    controller.open_patched_romfs_with_program_index(program_id, program_index)
+                });
+
+        let Some(patched_romfs) = patched_romfs else {
+            log::error!(
+                "FspSrv::OpenDataStorageWithProgramIndex: could not open storage with program_index={}",
+                program_index
+            );
+            Self::push_error_with_null_interface(ctx, u32::MAX);
+            return;
+        };
+
+        Self::push_interface_response(ctx, Arc::new(IStorage::new(patched_romfs)));
     }
 
     fn set_global_access_log_mode_handler(

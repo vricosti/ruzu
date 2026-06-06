@@ -563,10 +563,12 @@ impl StateTracker {
         }
         self.y_negate = new_y_negate;
         let ambient = [0.0f32, 0.0, 0.0, if self.y_negate { -1.0 } else { 1.0 }];
-        if let Some(Some(materialfv)) = GL_MATERIALFV.get() {
-            unsafe {
-                materialfv(gl::FRONT, GL_AMBIENT, ambient.as_ptr());
-            }
+        let materialfv = GL_MATERIALFV
+            .get()
+            .and_then(|func| *func)
+            .expect("glMaterialfv must be available for OpenGL YDirection compatibility state");
+        unsafe {
+            materialfv(gl::FRONT, GL_AMBIENT, ambient.as_ptr());
         }
     }
 
@@ -773,13 +775,11 @@ mod tests {
     }
 
     #[test]
-    fn set_y_negate_updates_cached_value_without_loaded_compat_function() {
+    #[should_panic(expected = "glMaterialfv must be available")]
+    fn set_y_negate_requires_loaded_compat_function() {
         let mut tracker = StateTracker::new();
         assert!(!tracker.y_negate());
         tracker.set_y_negate(true);
-        assert!(tracker.y_negate());
-        tracker.set_y_negate(false);
-        assert!(!tracker.y_negate());
     }
 
     #[test]

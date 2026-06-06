@@ -123,6 +123,11 @@ impl ICommonStateGetter {
                 "PerformSystemButtonPressingIfInFocus",
             ),
             (
+                120,
+                Some(Self::get_applet_launched_history_handler),
+                "GetAppletLaunchedHistory",
+            ),
+            (
                 200,
                 Some(Self::get_operation_mode_system_info_handler),
                 "GetOperationModeSystemInfo",
@@ -244,6 +249,27 @@ impl ICommonStateGetter {
         0
     }
 
+    /// Port of ICommonStateGetter::GetAppletLaunchedHistory.
+    pub fn get_applet_launched_history(&self, max_count: usize) -> Vec<AppletId> {
+        log::info!("GetAppletLaunchedHistory called");
+        let mut history = Vec::new();
+        let mut current = Some(Arc::clone(&self.applet));
+
+        while history.len() < max_count {
+            let Some(applet) = current.take() else {
+                break;
+            };
+            let (applet_id, caller) = {
+                let applet = applet.lock().unwrap();
+                (applet.applet_id, applet.caller_applet.clone())
+            };
+            history.push(applet_id);
+            current = caller.upgrade();
+        }
+
+        history
+    }
+
     /// Port of ICommonStateGetter::GetSettingsPlatformRegion
     pub fn get_settings_platform_region(&self) -> PlatformRegion {
         log::info!("GetSettingsPlatformRegion called");
@@ -265,21 +291,9 @@ impl ICommonStateGetter {
         ctx: &mut HLERequestContext,
         object: Arc<dyn SessionRequestHandler>,
     ) {
-        let is_domain = ctx
-            .get_manager()
-            .map_or(false, |manager| manager.lock().unwrap().is_domain());
-        let move_handle = if is_domain {
-            0
-        } else {
-            ctx.create_session_for_service(object.clone()).unwrap_or(0)
-        };
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 1);
         rb.push_result(RESULT_SUCCESS);
-        if is_domain {
-            ctx.add_domain_object(object);
-        } else {
-            rb.push_move_objects(move_handle);
-        }
+        rb.push_ipc_interface(object);
     }
 
     /// GetEventHandle (cmd 0): returns a copy handle to the message event.
@@ -615,6 +629,28 @@ impl ICommonStateGetter {
         let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
         rb.push_result(RESULT_SUCCESS);
         rb.push_u32(service.get_operation_mode_system_info());
+    }
+
+    fn get_applet_launched_history_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        let service =
+            unsafe { &*(this as *const dyn ServiceFramework as *const ICommonStateGetter) };
+        let max_count = ctx.get_write_buffer_size(0) / core::mem::size_of::<AppletId>();
+        let history = service.get_applet_launched_history(max_count);
+        let raw: Vec<u32> = history.iter().map(|id| *id as u32).collect();
+        let bytes = unsafe {
+            core::slice::from_raw_parts(
+                raw.as_ptr() as *const u8,
+                raw.len() * core::mem::size_of::<u32>(),
+            )
+        };
+        ctx.write_buffer(bytes, 0);
+
+        let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_i32(history.len() as i32);
     }
 
     fn get_settings_platform_region_handler(
