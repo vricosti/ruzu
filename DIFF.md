@@ -5218,7 +5218,6 @@
 
 ### Unintentional differences (to fix)
 - `mount()` still reaches NAND through the Rust filesystem-controller API (`get_filesystem_controller().lock().unwrap()`) instead of the upstream direct `system.GetFileSystemController()`/`GetSystemNANDContents()` object graph.
-- `get_time_zone_version()` still uses a Rust copy-length clamp rather than the literal upstream `rule_version_buffer[bytes_read] = 0` write after `Read(...)`, although the resulting zero-termination behavior is equivalent for the exercised path.
 
 ### Binary layout verification
 - PASS: `LocationName` and `RuleVersion` remain defined in `psc/time/common.rs` with explicit fixed-size arrays; this file only fills those buffers and the 0x2800 scratch space deterministically.

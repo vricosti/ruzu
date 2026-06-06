@@ -184,7 +184,7 @@ impl TimeZoneBinary {
         let path = self.get_version_path().ok_or(self.mount_result)?;
         let bytes = self.read(core::mem::size_of::<RuleVersion>(), &path)?;
         let mut version = [0u8; 0x10];
-        let copy_len = bytes.len().min(version.len().saturating_sub(1));
+        let copy_len = bytes.len().min(version.len());
         version[..copy_len].copy_from_slice(&bytes[..copy_len]);
         Ok(version)
     }
