@@ -12,6 +12,7 @@ use crate::file_sys::romfs_factory::StorageId;
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 use crate::hle::service::acc::errors::{
     RESULT_APPLICATION_INFO_ALREADY_INITIALIZED, RESULT_INVALID_APPLICATION,
+    RESULT_INVALID_ARRAY_LENGTH, RESULT_INVALID_USER_ID,
 };
 use crate::hle::service::glue::glue_manager::ApplicationLaunchProperty;
 use crate::hle::service::hle_ipc::{
@@ -25,8 +26,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 const MAX_JPEG_IMAGE_SIZE: usize = 0x20000;
+const PROFILE_IMAGE_DIMENSIONS: u32 = 256;
+// Upstream hard-codes save-data thumbnails to this exact size.
+const THUMBNAIL_SIZE: usize = 0x24000;
 
-fn get_profile_image_path(user_id: u128) -> std::path::PathBuf {
+/// Port of upstream `GetImagePath`.
+fn get_image_path(user_id: u128) -> std::path::PathBuf {
     let uuid = common::uuid::UUID::from_bytes(user_id.to_le_bytes());
     common::fs::path_util::get_ruzu_path(common::fs::path_util::RuzuPath::NANDDir).join(format!(
         "system/save/8000000000000010/su/avators/{}.jpg",
@@ -34,11 +39,45 @@ fn get_profile_image_path(user_id: u128) -> std::path::PathBuf {
     ))
 }
 
+/// Port of upstream `JPEGImageSize` policy.
+fn jpeg_image_size(size: usize) -> usize {
+    size.min(MAX_JPEG_IMAGE_SIZE)
+}
+
+/// Port of upstream `SanitizeJPEGImageSize`.
+fn sanitize_jpeg_image_size(image: &mut Vec<u8>) {
+    match image::load_from_memory(image) {
+        Ok(decoded) => {
+            let rgb = decoded.to_rgb8();
+            if rgb.width() != PROFILE_IMAGE_DIMENSIONS || rgb.height() != PROFILE_IMAGE_DIMENSIONS {
+                let resized = image::imageops::resize(
+                    &rgb,
+                    PROFILE_IMAGE_DIMENSIONS,
+                    PROFILE_IMAGE_DIMENSIONS,
+                    image::imageops::FilterType::Triangle,
+                );
+                let mut encoded = Vec::new();
+                let mut encoder =
+                    image::codecs::jpeg::JpegEncoder::new_with_quality(&mut encoded, 90);
+                if let Err(err) = encoder.encode_image(&resized) {
+                    log::error!("Failed to resize the user provided image: {err}");
+                } else {
+                    *image = encoded;
+                }
+            }
+        }
+        Err(err) => {
+            log::error!("Failed to decode the user provided image: {err}");
+        }
+    }
+    image.truncate(jpeg_image_size(image.len()));
+}
+
 fn load_profile_image_or_backup(user_id: u128) -> Vec<u8> {
-    let path = get_profile_image_path(user_id);
+    let path = get_image_path(user_id);
     match std::fs::read(&path) {
         Ok(mut image) => {
-            image.truncate(MAX_JPEG_IMAGE_SIZE);
+            sanitize_jpeg_image_size(&mut image);
             image
         }
         Err(_) => {
@@ -320,24 +359,56 @@ impl Interface {
             )),
         )
     }
+
+    fn store_save_data_thumbnail_result(
+        &self,
+        uuid: u128,
+        title_id: u64,
+        thumbnail_size: usize,
+    ) -> ResultCode {
+        if title_id == 0 {
+            log::error!("Account::StoreSaveDataThumbnail: TitleID is not valid");
+            return RESULT_INVALID_APPLICATION;
+        }
+
+        if uuid == 0 {
+            log::error!("Account::StoreSaveDataThumbnail: User ID is not valid");
+            return RESULT_INVALID_USER_ID;
+        }
+
+        if thumbnail_size != THUMBNAIL_SIZE {
+            log::error!(
+                "Account::StoreSaveDataThumbnail: invalid buffer size {thumbnail_size:#X}, expecting {THUMBNAIL_SIZE:#X}"
+            );
+            return RESULT_INVALID_ARRAY_LENGTH;
+        }
+
+        // Upstream currently stubs thumbnail persistence after validation.
+        RESULT_SUCCESS
+    }
+
+    /// Port of upstream `Module::Interface::StoreSaveDataThumbnailApplication`.
+    pub fn store_save_data_thumbnail_application(&self, ctx: &mut HLERequestContext, uuid: u128) {
+        log::warn!(
+            "Account::StoreSaveDataThumbnailApplication: STUBBED called, uuid=0x{:032x}",
+            uuid
+        );
+
+        // Upstream uses a temporary non-zero TID because it cannot reliably confirm
+        // the application id in this path.
+        let title_id = 1;
+        let result =
+            self.store_save_data_thumbnail_result(uuid, title_id, ctx.get_read_buffer_size(0));
+
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(result);
+    }
 }
 
 fn push_interface_response(ctx: &mut HLERequestContext, object: SessionRequestHandlerPtr) {
-    let is_domain = ctx
-        .get_manager()
-        .map_or(false, |manager| manager.lock().unwrap().is_domain());
-    let move_handle = if is_domain {
-        0
-    } else {
-        ctx.create_session_for_service(object.clone()).unwrap_or(0)
-    };
     let mut rb = ResponseBuilder::new(ctx, 2, 0, 1);
     rb.push_result(RESULT_SUCCESS);
-    if is_domain {
-        ctx.add_domain_object(object);
-    } else {
-        rb.push_move_objects(move_handle);
-    }
+    rb.push_ipc_interface(object);
 }
 
 struct EnsureTokenIdCacheAsyncInterface {
@@ -743,7 +814,8 @@ impl IProfileCommon {
         let mut rp = RequestParser::new(ctx);
         let base = rp.pop_raw::<ProfileBase>();
 
-        let user_data_buf = ctx.read_buffer(0);
+        let image_data = ctx.read_buffer_a(0);
+        let user_data_buf = ctx.read_buffer_x(0);
         log::debug!("IProfileCommon::StoreWithImage called");
 
         if user_data_buf.len() < std::mem::size_of::<UserData>() {
@@ -762,14 +834,19 @@ impl IProfileCommon {
             );
         }
 
-        if !pm.set_profile_base_and_data(svc.user_id, &base, &data) {
-            log::error!("IProfileCommon::StoreWithImage: Failed to update profile data!");
+        let image_path = get_image_path(svc.user_id);
+        let write_image = image_path
+            .parent()
+            .is_some_and(|parent| std::fs::create_dir_all(parent).is_ok())
+            && std::fs::write(&image_path, &image_data).is_ok();
+
+        if !write_image || !pm.set_profile_base_and_data(svc.user_id, &base, &data) {
+            log::error!("IProfileCommon::StoreWithImage: Failed to update profile data and image!");
             let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
             rb.push_result(super::errors::RESULT_ACCOUNT_UPDATE_FAILED);
             return;
         }
 
-        // Upstream also writes image data to file; we skip that for now
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
     }
@@ -996,5 +1073,28 @@ mod tests {
         EnsureTokenIdCacheAsyncInterface::new().load_id_token_cache(&mut ctx);
 
         assert_eq!(ctx.write_size, 3);
+    }
+
+    #[test]
+    fn store_save_data_thumbnail_result_matches_upstream_validation() {
+        let system = crate::core::System::new();
+        let interface = make_interface(crate::core::SystemRef::from_ref(&system));
+
+        assert_eq!(
+            interface.store_save_data_thumbnail_result(1, 1, THUMBNAIL_SIZE),
+            RESULT_SUCCESS
+        );
+        assert_eq!(
+            interface.store_save_data_thumbnail_result(1, 0, THUMBNAIL_SIZE),
+            RESULT_INVALID_APPLICATION
+        );
+        assert_eq!(
+            interface.store_save_data_thumbnail_result(0, 1, THUMBNAIL_SIZE),
+            RESULT_INVALID_USER_ID
+        );
+        assert_eq!(
+            interface.store_save_data_thumbnail_result(1, 1, THUMBNAIL_SIZE - 1),
+            RESULT_INVALID_ARRAY_LENGTH
+        );
     }
 }

@@ -995,10 +995,7 @@ impl Memory {
             };
             if !self.system.is_null() {
                 if let Some(gpu) = self.system.get().gpu_core() {
-                    // Upstream routes this through GPU::OnCPURead. Ruzu's public
-                    // bridge does not expose OnCPURead yet, so use the existing
-                    // flush path that downloads rasterizer data for the region.
-                    gpu.flush_region(device_addr, block_size as u64);
+                    let _ = gpu.on_cpu_read(device_addr, block_size as u64);
                 }
             }
         })

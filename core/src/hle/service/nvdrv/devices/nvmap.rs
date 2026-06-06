@@ -4,7 +4,7 @@
 //! Port of zuyu/src/core/hle/service/nvdrv/devices/nvmap.h
 //! Port of zuyu/src/core/hle/service/nvdrv/devices/nvmap.cpp
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::sync::Mutex;
 
 use crate::hle::kernel::k_memory_block::KMemoryPermission;
@@ -83,8 +83,7 @@ const _: () = assert!(std::mem::size_of::<IocGetIdParams>() == 8);
 
 #[derive(Clone, Copy)]
 struct NvmapHistoryEvent {
-    sequence: u64,
-    kind: &'static str,
+    kind: u64,
     fd: DeviceFD,
     handle: u32,
     size: u64,
@@ -94,49 +93,24 @@ struct NvmapHistoryEvent {
     heap_mask: u32,
 }
 
-static NVMAP_HISTORY: std::sync::OnceLock<Mutex<VecDeque<NvmapHistoryEvent>>> =
-    std::sync::OnceLock::new();
-static NVMAP_HISTORY_SEQUENCE: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
+static NVMAP_HISTORY_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 fn record_nvmap_history(event: NvmapHistoryEvent) {
-    let mut history = NVMAP_HISTORY
-        .get_or_init(|| Mutex::new(VecDeque::with_capacity(128)))
-        .lock()
-        .unwrap();
-    if history.len() == 128 {
-        history.pop_front();
-    }
-    history.push_back(NvmapHistoryEvent {
-        sequence: NVMAP_HISTORY_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1,
-        ..event
-    });
-}
-
-fn dump_nvmap_history(reason: &str) {
-    let Some(history) = NVMAP_HISTORY.get() else {
-        return;
-    };
-    let history = history.lock().unwrap();
-    eprintln!(
-        "[NVMAP_HISTORY] reason={} events={}",
-        reason,
-        history.len()
-    );
-    for event in history.iter() {
-        eprintln!(
-            "[NVMAP_HISTORY] #{:05} {} fd={} handle=0x{:X} size=0x{:X} addr=0x{:X} flags=0x{:X} align=0x{:X} heap_mask=0x{:X}",
-            event.sequence,
+    let sequence = NVMAP_HISTORY_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    common::trace::emit(
+        common::trace::cat::NVMAP_ALLOC,
+        &[
+            sequence,
             event.kind,
-            event.fd,
-            event.handle,
+            event.fd as u64,
+            event.handle as u64,
             event.size,
             event.address,
-            event.flags,
-            event.align,
-            event.heap_mask,
-        );
-    }
+            event.flags as u64,
+            event.align as u64,
+            event.heap_mask as u64,
+        ],
+    );
 }
 
 /// The nvmap device file.
@@ -187,8 +161,7 @@ impl NvMapDevice {
                 handle.set_orig_size(params.size as u64);
                 params.handle = handle.id;
                 record_nvmap_history(NvmapHistoryEvent {
-                    sequence: 0,
-                    kind: "create",
+                    kind: 1,
                     fd: 0,
                     handle: params.handle,
                     size: aligned_size,
@@ -291,8 +264,7 @@ impl NvMapDevice {
             (inner.address as usize, inner.size as usize)
         };
         record_nvmap_history(NvmapHistoryEvent {
-            sequence: 0,
-            kind: "alloc",
+            kind: 2,
             fd,
             handle: params.handle,
             size: handle_size as u64,
@@ -320,7 +292,6 @@ impl NvMapDevice {
             (lock_result, start_info, end_info)
         };
         if lock_result != 0 {
-            dump_nvmap_history("lock_for_map_device_address_space_failed");
             crate::hle::service::nvdrv::nvdrv_interface::dump_nvdrv_ioctl_history(
                 "nvmap_lock_for_map_device_address_space_failed",
             );
@@ -378,11 +349,10 @@ impl NvMapDevice {
             let mut inner = handle.lock_inner();
             if inner.d_address == 0 {
                 let map_size = inner.aligned_size as usize;
-                if let Some(d_address) = self.container().map_preallocated_area(
-                    session_id,
-                    inner.address,
-                    map_size,
-                ) {
+                if let Some(d_address) =
+                    self.container()
+                        .map_preallocated_area(session_id, inner.address, map_size)
+                {
                     inner.d_address = d_address;
                     inner.in_heap = true;
                     if std::env::var_os("RUZU_TRACE_NVMAP_PIN").is_some() {
@@ -554,18 +524,20 @@ impl NvMapDevice {
                 let session_id = sessions.get(&fd).copied().unwrap_or_default();
                 drop(sessions);
 
-                if let Some(process) = self.container().get_session_process(session_id) {
-                    let unlock_result = process
-                        .lock()
-                        .unwrap()
-                        .page_table
-                        .get_base_mut()
-                        .unlock_for_device_address_space(
-                            free_info.address as usize,
-                            free_info.size as usize,
-                        );
-                    debug_assert_eq!(unlock_result, 0);
-                }
+                let process = self
+                    .container()
+                    .get_session_process(session_id)
+                    .expect("nvmap::IocFree active session must own a process like upstream");
+                let unlock_result = process
+                    .lock()
+                    .unwrap()
+                    .page_table
+                    .get_base_mut()
+                    .unlock_for_device_address_space(
+                        free_info.address as usize,
+                        free_info.size as usize,
+                    );
+                debug_assert_eq!(unlock_result, 0);
             }
             params.address = free_info.address;
             params.size = free_info.size as u32;

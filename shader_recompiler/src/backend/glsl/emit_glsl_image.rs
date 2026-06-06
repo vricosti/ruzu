@@ -164,8 +164,21 @@ fn needs_shadow_lod_ext(ty: TextureType) -> bool {
     )
 }
 
+fn inst_recursive_value(program: &ir::Program, mut value: Value) -> Value {
+    loop {
+        let Value::Inst(inst_ref) = value else {
+            return value;
+        };
+        let inst = program.block(inst_ref.block).inst(inst_ref.inst);
+        if inst.opcode != Opcode::Identity || inst.args.is_empty() {
+            return value;
+        }
+        value = inst.args[0];
+    }
+}
+
 fn eval_const_offset_component(program: &ir::Program, value: &Value) -> Option<i32> {
-    match *value {
+    match inst_recursive_value(program, *value) {
         Value::ImmU32(value) => Some(value as i32),
         Value::Inst(inst_ref) => {
             let inst = program.block(inst_ref.block).inst(inst_ref.inst);
@@ -200,7 +213,7 @@ fn eval_const_offset_component(program: &ir::Program, value: &Value) -> Option<i
 }
 
 fn eval_const_offset_vec(program: &ir::Program, offset: &Value) -> Option<String> {
-    match *offset {
+    match inst_recursive_value(program, *offset) {
         Value::ImmU32(value) => Some(format!("int({})", value)),
         Value::Inst(inst_ref) => {
             let inst = program.block(inst_ref.block).inst(inst_ref.inst);
@@ -236,7 +249,8 @@ fn get_offset_vec(ctx: &mut EmitContext, program: &mut ir::Program, offset: &Val
     if let Some(offset) = eval_const_offset_vec(program, offset) {
         return offset;
     }
-    if let Value::Inst(inst_ref) = offset {
+    let resolved_offset = inst_recursive_value(program, *offset);
+    if let Value::Inst(inst_ref) = resolved_offset {
         let opcode = program.block(inst_ref.block).inst(inst_ref.inst).opcode;
         let all_imm = program
             .block(inst_ref.block)
@@ -278,7 +292,7 @@ fn get_offset_vec(ctx: &mut EmitContext, program: &mut ir::Program, offset: &Val
     } else {
         "0".to_string()
     };
-    let ty = match offset {
+    let ty = match resolved_offset {
         Value::Inst(inst_ref) => {
             program
                 .block(inst_ref.block)
@@ -1426,6 +1440,35 @@ mod tests {
                 })
             ),
             Some("ivec2(1,-1)".to_string())
+        );
+    }
+
+    #[test]
+    fn offset_vec_chases_identity_like_inst_recursive() {
+        let mut program = crate::ir::Program::new(crate::stage::Stage::Fragment);
+        program.blocks.push(Block::new());
+
+        let construct = program.blocks[0].append_inst(Inst::new(
+            Opcode::CompositeConstructU32x2,
+            vec![Value::ImmU32(3), Value::ImmU32(7)],
+        ));
+        let identity = program.blocks[0].append_inst(Inst::new(
+            Opcode::Identity,
+            vec![Value::Inst(InstRef {
+                block: 0,
+                inst: construct,
+            })],
+        ));
+
+        assert_eq!(
+            eval_const_offset_vec(
+                &program,
+                &Value::Inst(InstRef {
+                    block: 0,
+                    inst: identity,
+                })
+            ),
+            Some("ivec2(3,7)".to_string())
         );
     }
 

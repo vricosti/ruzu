@@ -22,7 +22,6 @@ use crate::file_sys::vfs::vfs_types::{FileTimeStampRaw, VirtualDir};
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 use crate::hle::service::cmif_serialization::{CmifRequest, CmifResponse};
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
-use crate::hle::service::ipc_helpers::ResponseBuilder;
 use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
 
 use super::fs_i_directory::IDirectory;
@@ -683,48 +682,6 @@ impl ServiceFramework for IFileSystem {
 
     fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
         &self.handlers_tipc
-    }
-
-    fn invoke_request(&self, ctx: &mut HLERequestContext)
-    where
-        Self: Sized,
-    {
-        let cmd = ctx.get_command();
-        if std::env::var_os("RUZU_TRACE_IFS_DISPATCH").is_some() {
-            let fi_name = self
-                .handlers()
-                .get(&cmd)
-                .map(|fi| fi.name)
-                .unwrap_or("<unknown>");
-            // For path-bearing cmds (GetEntryType=7, OpenFile=8, OpenDirectory=9, GetFileTimeStampRaw=14),
-            // peek the X-buffer for the path. read_buffer_x is non-destructive.
-            let path_preview = match cmd {
-                0 | 1 | 2 | 3 | 4 | 7 | 8 | 9 | 10 | 14 => {
-                    let bytes = ctx.read_buffer_x(0);
-                    let nul = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
-                    String::from_utf8_lossy(&bytes[..nul.min(256)]).into_owned()
-                }
-                _ => String::new(),
-            };
-            eprintln!(
-                "[IFS_DISPATCH] cmd={} ({}) path={:?}",
-                cmd, fi_name, path_preview
-            );
-        }
-        if let Some(fi) = self.handlers().get(&cmd) {
-            if let Some(callback) = fi.handler_callback {
-                log::trace!("Service::{}: {}", self.get_service_name(), fi.name);
-                callback(self, ctx);
-                return;
-            }
-        }
-
-        log::warn!(
-            "IFileSystem: unimplemented command '{}' returned stub success",
-            cmd
-        );
-        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
-        rb.push_result(RESULT_SUCCESS);
     }
 }
 

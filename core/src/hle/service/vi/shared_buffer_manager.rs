@@ -14,10 +14,8 @@ use crate::hle::kernel::k_page_group::KPageGroup;
 use crate::hle::kernel::k_process::KProcess;
 use crate::hle::kernel::k_process::ProcessLock;
 use crate::hle::kernel::k_readable_event::KReadableEvent;
-use crate::hle::kernel::k_scheduler::KScheduler;
 use crate::hle::kernel::k_typed_address::KProcessAddress;
 use crate::hle::service::nvdrv::core::container::SessionId;
-use crate::hle::service::nvdrv::devices::nvmap::NvMapDevice;
 use crate::hle::service::nvdrv::devices::nvmap::{IocAllocParams, IocCreateParams, IocFreeParams};
 use crate::hle::service::nvdrv::nvdata::DeviceFD;
 use crate::hle::service::nvdrv::nvdrv::Module;
@@ -27,7 +25,7 @@ use crate::hle::service::nvnflinger::graphic_buffer_producer::{
     QueueBufferInput, QueueBufferOutput,
 };
 use crate::hle::service::nvnflinger::pixel_format::PixelFormat;
-use crate::hle::service::nvnflinger::status::Status;
+use crate::hle::service::nvnflinger::status::{Status, StatusCode};
 use crate::hle::service::nvnflinger::ui::fence::Fence;
 use crate::hle::service::nvnflinger::ui::graphic_buffer::NvGraphicBuffer;
 use crate::hle::service::nvnflinger::window::NativeWindowTransform;
@@ -371,7 +369,7 @@ impl SharedBufferManager {
             SHARED_BUFFER_BLOCK_LINEAR_FORMAT,
             0,
         );
-        if status != Status::NoError as i32 {
+        if status != StatusCode::NO_ERROR {
             return Err(vi_results::RESULT_OPERATION_FAILED);
         }
         Ok((fence, [0, 1, -1, -1], slot as i64))
@@ -425,5 +423,45 @@ impl SharedBufferManager {
         let container = self.container()?;
         let producer = container.get_layer_producer_handle(layer_id)?;
         IBinder::get_native_handle(&*producer, 0).ok_or(vi_results::RESULT_OPERATION_FAILED)
+    }
+
+    pub fn write_applet_capture_buffer(
+        &self,
+    ) -> Result<(bool, i32), crate::hle::result::ResultCode> {
+        let Some(gpu) = self.system.get().gpu_core() else {
+            return Err(vi_results::RESULT_OPERATION_FAILED);
+        };
+        let capture_buffer = gpu.get_applet_capture_buffer();
+        let system_ptr =
+            self.system.get() as *const crate::core::System as *mut crate::core::System;
+        let device_memory: *const crate::device_memory::DeviceMemory =
+            unsafe { (*system_ptr).device_memory() as *const crate::device_memory::DeviceMemory };
+
+        let mut e = -((SHARED_BUFFER_BLOCK_LINEAR_WIDTH
+            * SHARED_BUFFER_BLOCK_LINEAR_HEIGHT
+            * SHARED_BUFFER_BLOCK_LINEAR_BPP) as i64);
+        let inner = self.inner.lock().unwrap();
+        let Some(buffer_page_group) = inner.buffer_page_group.as_ref() else {
+            return Err(vi_results::RESULT_OPERATION_FAILED);
+        };
+        for block in buffer_page_group.iter() {
+            let start = unsafe { (*device_memory).get_pointer(block.get_address()) as *mut u8 };
+            let size = block.get_size();
+            for offset in 0..size {
+                let value = if e >= 0 && (e as usize) < capture_buffer.len() {
+                    capture_buffer[e as usize]
+                } else {
+                    0
+                };
+                unsafe {
+                    *start.add(offset) = value;
+                }
+                e += 1;
+            }
+
+            gpu.invalidate_region(block.get_address(), size as u64);
+        }
+
+        Ok((true, 1))
     }
 }

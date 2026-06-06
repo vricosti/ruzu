@@ -310,9 +310,9 @@ impl SyncpointManager {
 
     /// Marks all queued work for a syncpoint as completed.
     ///
-    /// Upstream updates `counter_min` from host1x hardware in `UpdateMin()`. The Rust port still
-    /// lacks that bridge on this path, so synchronous nvdrv stubs use this helper to keep
-    /// min/max coherent after they complete work immediately.
+    /// Local compatibility helper for callers that complete emulated work
+    /// synchronously and therefore need to mark the cached minimum as caught up
+    /// without waiting for a Host1x action callback.
     pub fn signal_syncpoint(&self, id: u32) -> u32 {
         let Some(syncpoint) = self.syncpoints.get(id as usize) else {
             debug_assert!(false, "Syncpoint {} is out of range", id);

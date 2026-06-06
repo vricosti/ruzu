@@ -14,7 +14,8 @@ use crate::hle::service::hle_ipc::{
 };
 use crate::hle::service::ipc_helpers::{RequestParser, ResponseBuilder};
 use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
-use crate::internal_network::network::get_host_ipv4_address;
+use crate::internal_network::network::{get_host_ipv4_address, translate_ipv4};
+use crate::internal_network::network_interface::get_selected_network_interface;
 
 /// Upstream: `ResultPendingConnection{ErrorModule::NIFM, 111}`
 pub const RESULT_PENDING_CONNECTION: ResultCode =
@@ -55,6 +56,171 @@ pub enum InternetConnectionStatus {
     Connected = 4,
 }
 
+/// NetworkProfileType enum. Upstream: `NetworkProfileType` in `nifm.cpp`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u32)]
+pub enum NetworkProfileType {
+    User = 0,
+    SsidList = 1,
+    Temporary = 2,
+}
+
+/// Upstream: `IpAddressSetting` in `nifm.cpp`.
+#[derive(Clone, Copy, Default)]
+#[repr(C)]
+struct IpAddressSetting {
+    is_automatic: u8,
+    ip_address: [u8; 4],
+    subnet_mask: [u8; 4],
+    default_gateway: [u8; 4],
+}
+
+const _: () = assert!(std::mem::size_of::<IpAddressSetting>() == 0xD);
+
+/// Upstream: `DnsSetting` in `nifm.cpp`.
+#[derive(Clone, Copy, Default)]
+#[repr(C)]
+struct DnsSetting {
+    is_automatic: u8,
+    primary_dns: [u8; 4],
+    secondary_dns: [u8; 4],
+}
+
+const _: () = assert!(std::mem::size_of::<DnsSetting>() == 0x9);
+
+/// Upstream: `AuthenticationSetting` in `nifm.cpp`.
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct AuthenticationSetting {
+    is_enabled: u8,
+    user: [u8; 0x20],
+    password: [u8; 0x20],
+}
+
+impl Default for AuthenticationSetting {
+    fn default() -> Self {
+        Self {
+            is_enabled: 0,
+            user: [0; 0x20],
+            password: [0; 0x20],
+        }
+    }
+}
+
+const _: () = assert!(std::mem::size_of::<AuthenticationSetting>() == 0x41);
+
+/// Upstream: `ProxySetting` in `nifm.cpp`.
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct ProxySetting {
+    is_enabled: u8,
+    _pad0: [u8; 1],
+    port: u16,
+    proxy_server: [u8; 0x64],
+    authentication: AuthenticationSetting,
+    _pad1: [u8; 1],
+}
+
+impl Default for ProxySetting {
+    fn default() -> Self {
+        Self {
+            is_enabled: 0,
+            _pad0: [0; 1],
+            port: 0,
+            proxy_server: [0; 0x64],
+            authentication: AuthenticationSetting::default(),
+            _pad1: [0; 1],
+        }
+    }
+}
+
+const _: () = assert!(std::mem::size_of::<ProxySetting>() == 0xAA);
+
+/// Upstream: `IpSettingData` in `nifm.cpp`.
+#[derive(Clone, Copy, Default)]
+#[repr(C)]
+struct IpSettingData {
+    ip_address_setting: IpAddressSetting,
+    dns_setting: DnsSetting,
+    proxy_setting: ProxySetting,
+    mtu: u16,
+}
+
+const _: () = assert!(std::mem::size_of::<IpSettingData>() == 0xC2);
+
+/// Upstream: `SfWirelessSettingData` in `nifm.cpp`.
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct SfWirelessSettingData {
+    ssid_length: u8,
+    ssid: [u8; 0x20],
+    unknown_1: u8,
+    unknown_2: u8,
+    unknown_3: u8,
+    passphrase: [u8; 0x41],
+}
+
+impl Default for SfWirelessSettingData {
+    fn default() -> Self {
+        Self {
+            ssid_length: 0,
+            ssid: [0; 0x20],
+            unknown_1: 0,
+            unknown_2: 0,
+            unknown_3: 0,
+            passphrase: [0; 0x41],
+        }
+    }
+}
+
+const _: () = assert!(std::mem::size_of::<SfWirelessSettingData>() == 0x65);
+
+/// Upstream: `SfNetworkProfileData` in `nifm.cpp`.
+#[derive(Clone, Copy)]
+#[repr(C, packed)]
+struct SfNetworkProfileData {
+    ip_setting_data: IpSettingData,
+    uuid: [u8; 0x10],
+    network_name: [u8; 0x40],
+    unknown_1: u8,
+    unknown_2: u8,
+    unknown_3: u8,
+    unknown_4: u8,
+    wireless_setting_data: SfWirelessSettingData,
+    _pad0: [u8; 1],
+}
+
+impl Default for SfNetworkProfileData {
+    fn default() -> Self {
+        Self {
+            ip_setting_data: IpSettingData::default(),
+            uuid: [0; 0x10],
+            network_name: [0; 0x40],
+            unknown_1: 0,
+            unknown_2: 0,
+            unknown_3: 0,
+            unknown_4: 0,
+            wireless_setting_data: SfWirelessSettingData::default(),
+            _pad0: [0; 1],
+        }
+    }
+}
+
+const _: () = assert!(std::mem::size_of::<SfNetworkProfileData>() == 0x17C);
+
+/// Upstream-local `IpConfigInfo` in `IGeneralService::GetCurrentIpConfigInfo`.
+#[derive(Clone, Copy, Default)]
+#[repr(C)]
+struct IpConfigInfo {
+    ip_address_setting: IpAddressSetting,
+    dns_setting: DnsSetting,
+}
+
+const _: () = assert!(
+    std::mem::size_of::<IpConfigInfo>()
+        == std::mem::size_of::<IpAddressSetting>() + std::mem::size_of::<DnsSetting>()
+);
+
 #[derive(Clone, Copy)]
 #[repr(C)]
 struct InternetConnectionStatusOutput {
@@ -64,6 +230,90 @@ struct InternetConnectionStatusOutput {
 }
 
 const _: () = assert!(std::mem::size_of::<InternetConnectionStatusOutput>() == 0x3);
+
+fn write_c_string<const N: usize>(out: &mut [u8; N], value: &[u8]) {
+    let count = value.len().min(N);
+    out[..count].copy_from_slice(&value[..count]);
+}
+
+fn current_ip_address_setting() -> Option<IpAddressSetting> {
+    let net_iface = get_selected_network_interface()?;
+    Some(IpAddressSetting {
+        is_automatic: 1,
+        ip_address: translate_ipv4(net_iface.ip_address),
+        subnet_mask: translate_ipv4(net_iface.subnet_mask),
+        default_gateway: translate_ipv4(net_iface.gateway),
+    })
+}
+
+fn upstream_dns_setting() -> DnsSetting {
+    DnsSetting {
+        is_automatic: 1,
+        primary_dns: [1, 1, 1, 1],
+        secondary_dns: [1, 0, 0, 1],
+    }
+}
+
+fn upstream_ip_setting_data() -> IpSettingData {
+    let Some(ip_address_setting) = current_ip_address_setting() else {
+        return IpSettingData::default();
+    };
+
+    IpSettingData {
+        ip_address_setting,
+        dns_setting: upstream_dns_setting(),
+        proxy_setting: ProxySetting::default(),
+        mtu: 1500,
+    }
+}
+
+fn upstream_sf_network_profile_data() -> SfNetworkProfileData {
+    let ip_setting_data = upstream_ip_setting_data();
+    if ip_setting_data.ip_address_setting.is_automatic == 0 {
+        return SfNetworkProfileData::default();
+    }
+
+    let mut network_name = [0u8; 0x40];
+    write_c_string(&mut network_name, b"yuzu Network");
+
+    let mut ssid = [0u8; 0x20];
+    write_c_string(&mut ssid, b"yuzu Network");
+
+    let mut passphrase = [0u8; 0x41];
+    write_c_string(&mut passphrase, b"yuzupassword");
+
+    SfNetworkProfileData {
+        ip_setting_data,
+        uuid: [
+            0xef, 0xbe, 0xad, 0xde, 0, 0, 0, 0, 0xef, 0xbe, 0xad, 0xde, 0, 0, 0, 0,
+        ],
+        network_name,
+        unknown_1: 0,
+        unknown_2: 0,
+        unknown_3: 0,
+        unknown_4: 0,
+        wireless_setting_data: SfWirelessSettingData {
+            ssid_length: 12,
+            ssid,
+            unknown_1: 0,
+            unknown_2: 0,
+            unknown_3: 0,
+            passphrase,
+        },
+        _pad0: [0; 1],
+    }
+}
+
+fn upstream_ip_config_info() -> IpConfigInfo {
+    let Some(ip_address_setting) = current_ip_address_setting() else {
+        return IpConfigInfo::default();
+    };
+
+    IpConfigInfo {
+        ip_address_setting,
+        dns_setting: upstream_dns_setting(),
+    }
+}
 
 /// IPC command IDs for IGeneralService
 pub mod general_service_commands {
@@ -566,8 +816,14 @@ impl IGeneralService {
         ctx: &mut HLERequestContext,
     ) {
         log::warn!("(STUBBED) IGeneralService::GetCurrentNetworkProfile called");
-        let out = vec![0u8; ctx.get_write_buffer_size(0)];
-        ctx.write_buffer(&out, 0);
+        let network_profile_data = upstream_sf_network_profile_data();
+        let out = unsafe {
+            core::slice::from_raw_parts(
+                (&network_profile_data as *const SfNetworkProfileData).cast::<u8>(),
+                core::mem::size_of::<SfNetworkProfileData>(),
+            )
+        };
+        ctx.write_buffer(out, 0);
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
     }
@@ -609,10 +865,15 @@ impl IGeneralService {
         ctx: &mut HLERequestContext,
     ) {
         log::warn!("(STUBBED) IGeneralService::GetCurrentIpConfigInfo called");
-        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        let ip_config_info = upstream_ip_config_info();
+        let mut rb = ResponseBuilder::new(
+            ctx,
+            (2 + (core::mem::size_of::<IpConfigInfo>() + 3) / core::mem::size_of::<u32>()) as u32,
+            0,
+            0,
+        );
         rb.push_result(RESULT_SUCCESS);
-        let zero = [0u8; 0x16];
-        rb.push_raw_bytes(&zero);
+        rb.push_raw(&ip_config_info);
     }
 
     fn is_wireless_communication_enabled_handler(

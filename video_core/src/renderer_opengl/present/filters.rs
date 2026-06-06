@@ -56,7 +56,8 @@ pub fn make_gaussian() -> WindowAdaptPass {
 /// Upstream prepends `#version 460\n` to the scaleforce shader source.
 pub fn make_scale_force() -> WindowAdaptPass {
     let sampler = util::create_bilinear_sampler();
-    WindowAdaptPass::new(sampler, OPENGL_PRESENT_SCALEFORCE_FRAG)
+    let source = format!("#version 460\n{}", OPENGL_PRESENT_SCALEFORCE_FRAG);
+    WindowAdaptPass::new(sampler, &source)
 }
 
 /// Scaling filter enum for dispatching.
@@ -67,13 +68,14 @@ pub enum ScalingFilter {
     Bicubic,
     Gaussian,
     ScaleForce,
+    Fsr,
 }
 
 /// Create the appropriate scaling filter based on the enum variant.
 pub fn make_filter(filter: ScalingFilter) -> WindowAdaptPass {
     match filter {
         ScalingFilter::NearestNeighbor => make_nearest_neighbor(),
-        ScalingFilter::Bilinear => make_bilinear(),
+        ScalingFilter::Bilinear | ScalingFilter::Fsr => make_bilinear(),
         ScalingFilter::Bicubic => make_bicubic(),
         ScalingFilter::Gaussian => make_gaussian(),
         ScalingFilter::ScaleForce => make_scale_force(),

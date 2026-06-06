@@ -1660,9 +1660,7 @@ impl HLERequestContext {
             let Some(info) = process.page_table.query_info(cur) else {
                 return false;
             };
-            if !info
-                .m_permission
-                .contains(required)
+            if !info.m_permission.contains(required)
                 || info
                     .m_permission
                     .contains(crate::hle::kernel::k_memory_block::KMemoryPermission::NOT_MAPPED)

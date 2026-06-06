@@ -216,17 +216,6 @@ impl CpuManager {
         } else {
             1
         };
-        if self.is_multicore {
-            if let Ok(raw_core_count) = std::env::var("RUZU_CORE_COUNT") {
-                if let Ok(core_count) = raw_core_count.parse::<usize>() {
-                    if (1..=hardware_properties::NUM_CPU_CORES as usize).contains(&core_count) {
-                        self.num_cores = core_count;
-                        log::warn!("RUZU_CORE_COUNT={} -> limiting CPU host cores", core_count);
-                    }
-                }
-            }
-        }
-
         // Create GPU barrier: num_cores + 1 (the +1 is for the GPU thread)
         self.gpu_barrier = Some(Arc::new(Barrier::new(self.num_cores + 1)));
         self.stop_requested.store(false, Ordering::Relaxed);
@@ -277,40 +266,6 @@ impl CpuManager {
                 .expect("Failed to spawn CPU thread");
 
             self.core_data[core].host_thread = Some(handle);
-        }
-
-        // RUZU_FORCE_SAMPLE_MS=N — spawn a debug sampler thread that calls
-        // PhysicalCore::interrupt() on every core every N ms. Forces the JIT
-        // to halt periodically (returning HaltReason::EXTERNAL_HALT), which
-        // surfaces a SPIN trace sample via `cpu_manager.rs:686-718`. Used to
-        // identify the spin location during a CPU-bound JIT run that makes
-        // 0 SVCs (block-cache misses, ticks check, and SVCs all fail to fire).
-        if let Ok(s) = std::env::var("RUZU_FORCE_SAMPLE_MS") {
-            if let Ok(period_ms) = s.parse::<u64>() {
-                if period_ms >= 1 {
-                    let stop = self.stop_requested.clone();
-                    let kp = kernel_ptr as usize;
-                    let num = self.num_cores;
-                    let _ = std::thread::Builder::new()
-                        .name("RUZU_FORCE_SAMPLE".into())
-                        .spawn(move || {
-                            let kernel = unsafe { &*(kp as *const KernelCore) };
-                            log::warn!(
-                                "RUZU_FORCE_SAMPLE: sampler thread started, period={}ms cores={}",
-                                period_ms,
-                                num
-                            );
-                            while !stop.load(Ordering::Relaxed) {
-                                std::thread::sleep(std::time::Duration::from_millis(period_ms));
-                                for c in 0..num {
-                                    if let Some(pc) = kernel.physical_core(c) {
-                                        pc.interrupt();
-                                    }
-                                }
-                            }
-                        });
-                }
-            }
         }
     }
 

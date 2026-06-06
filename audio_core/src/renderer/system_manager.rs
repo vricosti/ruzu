@@ -2,6 +2,7 @@ use crate::adsp::adsp::AudioRendererHandle;
 use crate::common::common::MAX_RENDERER_SESSIONS;
 use crate::renderer::system::System;
 use crate::SharedSystem;
+use common::thread::{set_current_thread_name, set_current_thread_priority, ThreadPriority};
 use log::error;
 use parking_lot::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -41,6 +42,8 @@ impl SystemManager {
             thread::Builder::new()
                 .name("AudioRenderSystemManager".to_string())
                 .spawn(move || {
+                    set_current_thread_name("AudioRenderSystemManager");
+                    set_current_thread_priority(ThreadPriority::High);
                     log::info!("AudioRenderSystemManager thread started");
                     let profile = std::env::var_os("RUZU_PROFILE_SYSMGR").is_some();
                     // `RUZU_PROFILE_SYSMGR_RATE=1` — unfiltered version that

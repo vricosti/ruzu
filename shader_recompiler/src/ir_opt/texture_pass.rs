@@ -603,8 +603,8 @@ fn texture_type_from_flags(flags: TextureInstInfo) -> TextureType {
     TextureType::from_u8(flags.texture_type)
 }
 
-fn image_format_from_flags(_flags: TextureInstInfo) -> ImageFormat {
-    ImageFormat::Typeless
+fn image_format_from_flags(flags: TextureInstInfo) -> ImageFormat {
+    ImageFormat::from_u8(flags.image_format)
 }
 
 fn get_texture_handle(env: &mut dyn Environment, cbuf: &ConstBufferAddr) -> u32 {
@@ -1381,6 +1381,31 @@ mod tests {
         assert_eq!(desc.cbuf_offset, 0x38);
         assert!(desc.is_read);
         assert!(desc.is_written);
+    }
+
+    #[test]
+    fn texture_pass_reads_storage_image_format_from_flags() {
+        let mut program = Program::new(ShaderStage::Fragment);
+        program.blocks.push(Block::new());
+        let flags = TextureInstInfo {
+            texture_type: TextureType::Color2D as u8,
+            image_format: ImageFormat::R32G32Uint as u8,
+            ..Default::default()
+        }
+        .to_u32();
+        program.blocks[0].instructions.push(Some(Inst::with_flags(
+            Opcode::BoundImageRead,
+            vec![Value::ImmU32(0x3c), Value::Void],
+            flags,
+        )));
+
+        texture_pass_bound_textures(&mut program, 6);
+
+        assert_eq!(program.info.image_descriptors.len(), 1);
+        assert_eq!(
+            program.info.image_descriptors[0].format,
+            ImageFormat::R32G32Uint
+        );
     }
 
     #[test]

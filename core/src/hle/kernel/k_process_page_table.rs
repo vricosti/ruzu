@@ -88,6 +88,10 @@ impl KProcessPageTable {
         self.base.get_alias_region_size()
     }
 
+    pub fn is_in_alias_region(&self, addr: KProcessAddress, size: usize) -> bool {
+        self.base.is_in_alias_region(addr.get() as usize, size)
+    }
+
     pub fn get_stack_region_start(&self) -> KProcessAddress {
         KProcessAddress::new(self.base.get_stack_region_start() as u64)
     }

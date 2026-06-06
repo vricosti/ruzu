@@ -139,16 +139,22 @@ impl IApplicationDisplayService {
         Arc::new(IManagerDisplayService::new(Arc::clone(&self.container)))
     }
 
+    fn push_interface_response(
+        ctx: &mut HLERequestContext,
+        object: Arc<dyn SessionRequestHandler>,
+    ) {
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 1);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_ipc_interface(object);
+    }
+
     /// cmd 100 / 103: GetRelayService / GetIndirectDisplayTransactionService
     /// Returns the real IHOSBinderDriver from the Container.
     fn get_relay_service_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         let svc = Self::as_self(this);
         log::info!("IApplicationDisplayService::GetRelayService called");
         let binder_driver = svc.container.get_binder_driver();
-        super::super::am::service::application_proxy::IApplicationProxy::push_interface_response(
-            ctx,
-            binder_driver,
-        );
+        Self::push_interface_response(ctx, binder_driver);
     }
 
     /// cmd 101: GetSystemDisplayService
@@ -160,9 +166,7 @@ impl IApplicationDisplayService {
         log::warn!("IApplicationDisplayService::GetSystemDisplayService (STUBBED)");
         let sub: Arc<dyn SessionRequestHandler> =
             Arc::new(ISystemDisplayService::new(Arc::clone(&svc.container)));
-        super::super::am::service::application_proxy::IApplicationProxy::push_interface_response(
-            ctx, sub,
-        );
+        Self::push_interface_response(ctx, sub);
     }
 
     /// cmd 102: GetManagerDisplayService
@@ -173,25 +177,28 @@ impl IApplicationDisplayService {
         let svc = Self::as_self(this);
         log::warn!("IApplicationDisplayService::GetManagerDisplayService (STUBBED)");
         let sub: Arc<dyn SessionRequestHandler> = svc.get_manager_display_service();
-        super::super::am::service::application_proxy::IApplicationProxy::push_interface_response(
-            ctx, sub,
-        );
+        Self::push_interface_response(ctx, sub);
     }
 
     /// cmd 1000: ListDisplays
     fn list_displays_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         log::warn!("IApplicationDisplayService::ListDisplays (STUBBED)");
-        let info = DisplayInfo::default();
-        let bytes = unsafe {
-            std::slice::from_raw_parts(
-                &info as *const DisplayInfo as *const u8,
-                std::mem::size_of::<DisplayInfo>(),
-            )
+        let count = if ctx.get_write_buffer_size(0) >= std::mem::size_of::<DisplayInfo>() {
+            let info = DisplayInfo::default();
+            let bytes = unsafe {
+                std::slice::from_raw_parts(
+                    &info as *const DisplayInfo as *const u8,
+                    std::mem::size_of::<DisplayInfo>(),
+                )
+            };
+            ctx.write_buffer(bytes, 0);
+            1
+        } else {
+            0
         };
-        ctx.write_buffer(bytes, 0);
         let mut rb = ResponseBuilder::new(ctx, 4, 0, 0);
         rb.push_result(RESULT_SUCCESS);
-        rb.push_u64(1); // count
+        rb.push_u64(count);
     }
 
     /// cmd 1010: OpenDisplay
@@ -402,9 +409,22 @@ impl IApplicationDisplayService {
 
     /// cmd 2101: SetLayerScalingMode
     fn set_layer_scaling_mode(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
-        log::debug!("IApplicationDisplayService::SetLayerScalingMode called");
+        let mut rp = RequestParser::new(ctx);
+        let scale_mode = rp.pop_u32();
+        let _padding = rp.pop_u32();
+        let layer_id = rp.pop_u64();
+        log::debug!(
+            "IApplicationDisplayService::SetLayerScalingMode called scale_mode={} layer_id={:#x}",
+            scale_mode,
+            layer_id
+        );
+        let result = match scale_mode {
+            0 | 1 | 3 => vi_results::RESULT_NOT_SUPPORTED,
+            2 | 4 => RESULT_SUCCESS,
+            _ => vi_results::RESULT_OPERATION_FAILED,
+        };
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
-        rb.push_result(RESULT_SUCCESS);
+        rb.push_result(result);
     }
 
     /// cmd 2102: ConvertScalingMode
@@ -539,11 +559,16 @@ impl IApplicationDisplayService {
 
 impl Drop for IApplicationDisplayService {
     fn drop(&mut self) {
-        // Unlink all vsync events from the Conductor.
         // Port of upstream `~IApplicationDisplayService()`.
         let events = self.display_vsync_events.lock().unwrap();
         for (&display_id, event) in events.iter() {
             self.container.unlink_vsync_event(display_id, event);
+        }
+        for layer_id in self.open_layer_ids.lock().unwrap().iter().copied() {
+            let _ = self.container.close_layer(layer_id);
+        }
+        for layer_id in self.stray_layer_ids.lock().unwrap().iter().copied() {
+            let _ = self.container.destroy_stray_layer(layer_id);
         }
     }
 }

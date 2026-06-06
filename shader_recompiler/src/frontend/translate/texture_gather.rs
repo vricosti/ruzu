@@ -238,9 +238,9 @@ fn impl_tld4(
     }
 
     if sparse_pred != Pred::PT {
-        // `GetSparseFromOp` pseudo-instruction wiring is still incomplete in
-        // ruzu; keep the same conservative placeholder used by TEX.
-        v.ir.set_pred(sparse_pred, Value::ImmU1(true));
+        let sparse = v.ir.get_sparse_from_op(sample);
+        let resident = v.ir.logical_not(sparse);
+        v.ir.set_pred(sparse_pred, resident);
     }
 }
 

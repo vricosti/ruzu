@@ -11,7 +11,6 @@ use crate::core_timing::CoreTiming;
 use crate::cpu_manager::CpuManager;
 use crate::device_memory::DeviceMemory;
 use crate::file_sys::fs_filesystem::OpenMode;
-use crate::file_sys::romfs_factory::StorageId;
 use crate::file_sys::vfs::vfs_real::RealVfsFilesystem;
 use crate::gpu_dirty_memory_manager::GpuDirtyMemoryManager;
 use crate::hardware_properties;
@@ -23,6 +22,7 @@ use crate::hle::service::am::am_types::{AppletId, AppletType};
 use crate::hle::service::am::applet_manager::{
     AppletManager, FrontendAppletParameters, LaunchType,
 };
+use crate::hle::service::am::process_creation::build_application_launch_property;
 use crate::hle::service::apm::apm_controller::Controller as ApmController;
 use crate::hle::service::glue::glue_manager::{ARPManager, ApplicationLaunchProperty};
 use crate::hle::service::server_manager::ServerManager;
@@ -101,6 +101,16 @@ impl SystemRef {
     pub fn get(&self) -> &System {
         assert!(!self.0.is_null(), "SystemRef is null");
         unsafe { &*self.0 }
+    }
+
+    /// Transfers and clears the current user channel through the non-owning
+    /// System reference.
+    ///
+    /// This is the narrow Rust counterpart to upstream callers that mutate
+    /// `Core::System&` to `swap(m_system.GetUserChannel())`.
+    pub fn take_user_channel(&self) -> VecDeque<Vec<u8>> {
+        assert!(!self.0.is_null(), "SystemRef is null");
+        unsafe { (&mut *(self.0 as *mut System)).take_user_channel() }
     }
 
     /// Get a reference to the Reporter.
@@ -444,6 +454,279 @@ pub struct AudioInOpenResponse {
     pub name: [u8; 0x100],
 }
 
+/// Raw `AudioOutBuffer` wire payload.
+///
+/// Mirrors `AudioCore::AudioOut::AudioOutBuffer` layout from upstream
+/// `audio_core/out/audio_out_system.h`.
+#[derive(Debug, Clone, Copy, Default)]
+#[repr(C)]
+pub struct AudioOutBufferWire {
+    pub next: u64,
+    pub samples: u64,
+    pub capacity: u64,
+    pub size: u64,
+    pub offset: u64,
+}
+
+/// Raw `AudioOutParameter` wire payload.
+///
+/// Mirrors `AudioCore::AudioOut::AudioOutParameter` layout from upstream
+/// `audio_core/out/audio_out_system.h`.
+#[derive(Debug, Clone, Copy, Default)]
+#[repr(C)]
+pub struct AudioOutParameterWire {
+    pub sample_rate: i32,
+    pub channel_count: u16,
+    pub reserved: u16,
+}
+
+/// Minimal bridge contract from `core` to an owned `audio_core::out::Out` session.
+pub trait AudioOutSessionImpl: Send + Sync + 'static {
+    fn get_state(&self) -> u32;
+    fn start(&self) -> crate::hle::result::ResultCode;
+    fn stop(&self) -> crate::hle::result::ResultCode;
+    fn append_buffer(
+        &self,
+        buffer: AudioOutBufferWire,
+        buffer_client_ptr: u64,
+    ) -> crate::hle::result::ResultCode;
+    fn get_released_buffers(&self, out_tags: &mut [u64]) -> u32;
+    fn contains_buffer(&self, buffer_client_ptr: u64) -> bool;
+    fn get_buffer_count(&self) -> u32;
+    fn get_played_sample_count(&self) -> u64;
+    fn flush_audio_out_buffers(&self) -> bool;
+    fn set_volume(&self, volume: f32);
+    fn get_volume(&self) -> f32;
+    fn set_buffer_readable_event(
+        &self,
+        _event: std::sync::Arc<
+            std::sync::Mutex<crate::hle::kernel::k_readable_event::KReadableEvent>,
+        >,
+    ) {
+    }
+    fn set_process_arc(
+        &self,
+        _process: std::sync::Arc<crate::hle::kernel::k_process::ProcessLock>,
+    ) {
+    }
+}
+
+/// Concrete owner-local session wrapper used by `IAudioOut`.
+pub struct AudioOutSession {
+    ptr: *const (),
+    clone_fn: unsafe fn(*const ()) -> *const (),
+    drop_fn: unsafe fn(*const ()),
+    get_state_fn: unsafe fn(*const ()) -> u32,
+    start_fn: unsafe fn(*const ()) -> crate::hle::result::ResultCode,
+    stop_fn: unsafe fn(*const ()) -> crate::hle::result::ResultCode,
+    append_buffer_fn:
+        unsafe fn(*const (), AudioOutBufferWire, u64) -> crate::hle::result::ResultCode,
+    get_released_buffers_fn: unsafe fn(*const (), &mut [u64]) -> u32,
+    contains_buffer_fn: unsafe fn(*const (), u64) -> bool,
+    get_buffer_count_fn: unsafe fn(*const ()) -> u32,
+    get_played_sample_count_fn: unsafe fn(*const ()) -> u64,
+    flush_audio_out_buffers_fn: unsafe fn(*const ()) -> bool,
+    set_volume_fn: unsafe fn(*const (), f32),
+    get_volume_fn: unsafe fn(*const ()) -> f32,
+    set_buffer_readable_event_fn: unsafe fn(
+        *const (),
+        std::sync::Arc<std::sync::Mutex<crate::hle::kernel::k_readable_event::KReadableEvent>>,
+    ),
+    set_process_arc_fn:
+        unsafe fn(*const (), std::sync::Arc<crate::hle::kernel::k_process::ProcessLock>),
+}
+
+impl AudioOutSession {
+    pub fn from_arc<T: AudioOutSessionImpl>(inner: std::sync::Arc<T>) -> Self {
+        Self {
+            ptr: std::sync::Arc::into_raw(inner) as *const (),
+            clone_fn: clone_audio_out_session_arc::<T>,
+            drop_fn: drop_audio_out_session_arc::<T>,
+            get_state_fn: get_audio_out_session_state::<T>,
+            start_fn: start_audio_out_session::<T>,
+            stop_fn: stop_audio_out_session::<T>,
+            append_buffer_fn: append_audio_out_session_buffer::<T>,
+            get_released_buffers_fn: get_audio_out_session_released_buffers::<T>,
+            contains_buffer_fn: contains_audio_out_session_buffer::<T>,
+            get_buffer_count_fn: get_audio_out_session_buffer_count::<T>,
+            get_played_sample_count_fn: get_audio_out_session_played_sample_count::<T>,
+            flush_audio_out_buffers_fn: flush_audio_out_session_buffers::<T>,
+            set_volume_fn: set_audio_out_session_volume::<T>,
+            get_volume_fn: get_audio_out_session_volume::<T>,
+            set_buffer_readable_event_fn: set_audio_out_session_buffer_readable_event::<T>,
+            set_process_arc_fn: set_audio_out_session_process_arc::<T>,
+        }
+    }
+
+    pub fn get_state(&self) -> u32 {
+        unsafe { (self.get_state_fn)(self.ptr) }
+    }
+    pub fn start(&self) -> crate::hle::result::ResultCode {
+        unsafe { (self.start_fn)(self.ptr) }
+    }
+    pub fn stop(&self) -> crate::hle::result::ResultCode {
+        unsafe { (self.stop_fn)(self.ptr) }
+    }
+    pub fn append_buffer(
+        &self,
+        buffer: AudioOutBufferWire,
+        buffer_client_ptr: u64,
+    ) -> crate::hle::result::ResultCode {
+        unsafe { (self.append_buffer_fn)(self.ptr, buffer, buffer_client_ptr) }
+    }
+    pub fn get_released_buffers(&self, out_tags: &mut [u64]) -> u32 {
+        unsafe { (self.get_released_buffers_fn)(self.ptr, out_tags) }
+    }
+    pub fn contains_buffer(&self, buffer_client_ptr: u64) -> bool {
+        unsafe { (self.contains_buffer_fn)(self.ptr, buffer_client_ptr) }
+    }
+    pub fn get_buffer_count(&self) -> u32 {
+        unsafe { (self.get_buffer_count_fn)(self.ptr) }
+    }
+    pub fn get_played_sample_count(&self) -> u64 {
+        unsafe { (self.get_played_sample_count_fn)(self.ptr) }
+    }
+    pub fn flush_audio_out_buffers(&self) -> bool {
+        unsafe { (self.flush_audio_out_buffers_fn)(self.ptr) }
+    }
+    pub fn set_volume(&self, volume: f32) {
+        unsafe { (self.set_volume_fn)(self.ptr, volume) }
+    }
+    pub fn get_volume(&self) -> f32 {
+        unsafe { (self.get_volume_fn)(self.ptr) }
+    }
+    pub fn set_buffer_readable_event(
+        &self,
+        event: std::sync::Arc<
+            std::sync::Mutex<crate::hle::kernel::k_readable_event::KReadableEvent>,
+        >,
+    ) {
+        unsafe { (self.set_buffer_readable_event_fn)(self.ptr, event) }
+    }
+    pub fn set_process_arc(
+        &self,
+        process: std::sync::Arc<crate::hle::kernel::k_process::ProcessLock>,
+    ) {
+        unsafe { (self.set_process_arc_fn)(self.ptr, process) }
+    }
+}
+
+impl Clone for AudioOutSession {
+    fn clone(&self) -> Self {
+        Self {
+            ptr: unsafe { (self.clone_fn)(self.ptr) },
+            clone_fn: self.clone_fn,
+            drop_fn: self.drop_fn,
+            get_state_fn: self.get_state_fn,
+            start_fn: self.start_fn,
+            stop_fn: self.stop_fn,
+            append_buffer_fn: self.append_buffer_fn,
+            get_released_buffers_fn: self.get_released_buffers_fn,
+            contains_buffer_fn: self.contains_buffer_fn,
+            get_buffer_count_fn: self.get_buffer_count_fn,
+            get_played_sample_count_fn: self.get_played_sample_count_fn,
+            flush_audio_out_buffers_fn: self.flush_audio_out_buffers_fn,
+            set_volume_fn: self.set_volume_fn,
+            get_volume_fn: self.get_volume_fn,
+            set_buffer_readable_event_fn: self.set_buffer_readable_event_fn,
+            set_process_arc_fn: self.set_process_arc_fn,
+        }
+    }
+}
+
+impl Drop for AudioOutSession {
+    fn drop(&mut self) {
+        unsafe { (self.drop_fn)(self.ptr) }
+    }
+}
+
+unsafe impl Send for AudioOutSession {}
+unsafe impl Sync for AudioOutSession {}
+
+unsafe fn clone_audio_out_session_arc<T: AudioOutSessionImpl>(ptr: *const ()) -> *const () {
+    let arc = std::sync::Arc::from_raw(ptr as *const T);
+    let cloned = std::sync::Arc::clone(&arc);
+    let _ = std::sync::Arc::into_raw(arc);
+    std::sync::Arc::into_raw(cloned) as *const ()
+}
+
+unsafe fn drop_audio_out_session_arc<T: AudioOutSessionImpl>(ptr: *const ()) {
+    drop(std::sync::Arc::from_raw(ptr as *const T));
+}
+
+unsafe fn get_audio_out_session_ref<T: AudioOutSessionImpl>(ptr: *const ()) -> &'static T {
+    &*(ptr as *const T)
+}
+
+unsafe fn get_audio_out_session_state<T: AudioOutSessionImpl>(ptr: *const ()) -> u32 {
+    get_audio_out_session_ref::<T>(ptr).get_state()
+}
+unsafe fn start_audio_out_session<T: AudioOutSessionImpl>(
+    ptr: *const (),
+) -> crate::hle::result::ResultCode {
+    get_audio_out_session_ref::<T>(ptr).start()
+}
+unsafe fn stop_audio_out_session<T: AudioOutSessionImpl>(
+    ptr: *const (),
+) -> crate::hle::result::ResultCode {
+    get_audio_out_session_ref::<T>(ptr).stop()
+}
+unsafe fn append_audio_out_session_buffer<T: AudioOutSessionImpl>(
+    ptr: *const (),
+    buffer: AudioOutBufferWire,
+    buffer_client_ptr: u64,
+) -> crate::hle::result::ResultCode {
+    get_audio_out_session_ref::<T>(ptr).append_buffer(buffer, buffer_client_ptr)
+}
+unsafe fn get_audio_out_session_released_buffers<T: AudioOutSessionImpl>(
+    ptr: *const (),
+    out_tags: &mut [u64],
+) -> u32 {
+    get_audio_out_session_ref::<T>(ptr).get_released_buffers(out_tags)
+}
+unsafe fn contains_audio_out_session_buffer<T: AudioOutSessionImpl>(
+    ptr: *const (),
+    buffer_client_ptr: u64,
+) -> bool {
+    get_audio_out_session_ref::<T>(ptr).contains_buffer(buffer_client_ptr)
+}
+unsafe fn get_audio_out_session_buffer_count<T: AudioOutSessionImpl>(ptr: *const ()) -> u32 {
+    get_audio_out_session_ref::<T>(ptr).get_buffer_count()
+}
+unsafe fn get_audio_out_session_played_sample_count<T: AudioOutSessionImpl>(ptr: *const ()) -> u64 {
+    get_audio_out_session_ref::<T>(ptr).get_played_sample_count()
+}
+unsafe fn flush_audio_out_session_buffers<T: AudioOutSessionImpl>(ptr: *const ()) -> bool {
+    get_audio_out_session_ref::<T>(ptr).flush_audio_out_buffers()
+}
+unsafe fn set_audio_out_session_volume<T: AudioOutSessionImpl>(ptr: *const (), volume: f32) {
+    get_audio_out_session_ref::<T>(ptr).set_volume(volume);
+}
+unsafe fn get_audio_out_session_volume<T: AudioOutSessionImpl>(ptr: *const ()) -> f32 {
+    get_audio_out_session_ref::<T>(ptr).get_volume()
+}
+unsafe fn set_audio_out_session_buffer_readable_event<T: AudioOutSessionImpl>(
+    ptr: *const (),
+    event: std::sync::Arc<std::sync::Mutex<crate::hle::kernel::k_readable_event::KReadableEvent>>,
+) {
+    get_audio_out_session_ref::<T>(ptr).set_buffer_readable_event(event);
+}
+unsafe fn set_audio_out_session_process_arc<T: AudioOutSessionImpl>(
+    ptr: *const (),
+    process: std::sync::Arc<crate::hle::kernel::k_process::ProcessLock>,
+) {
+    get_audio_out_session_ref::<T>(ptr).set_process_arc(process);
+}
+
+/// Result payload for `IAudioOutManager::OpenAudioOut*`.
+pub struct AudioOutOpenResponse {
+    pub session: AudioOutSession,
+    pub sample_rate: u32,
+    pub channel_count: u32,
+    pub sample_format: u32,
+    pub state: u32,
+}
+
 /// Minimal bridge from `core` to the concrete `audio_core` crate.
 ///
 /// Upstream `Core::System` owns `AudioCore::AudioCore` directly. Rust cannot do
@@ -494,6 +777,14 @@ pub trait AudioCoreInterface: Send {
         params: AudioInParameterWire,
         applet_resource_user_id: u64,
     ) -> std::result::Result<AudioInOpenResponse, crate::hle::result::ResultCode>;
+
+    /// Mirror `IAudioOutManager::OpenAudioOutAuto`.
+    fn open_audio_output(
+        &self,
+        name: &[u8; 0x100],
+        params: AudioOutParameterWire,
+        applet_resource_user_id: u64,
+    ) -> std::result::Result<AudioOutOpenResponse, crate::hle::result::ResultCode>;
 
     /// Mirror `IAudioRendererManager::OpenAudioRenderer` by creating an owned
     /// audio renderer session backed by the real audio_core renderer owners.
@@ -1152,14 +1443,20 @@ impl System {
 
         if let Some(ref process) = self.current_process {
             let program_id = process.get_program_id();
-            let launch = ApplicationLaunchProperty {
-                title_id: program_id,
-                version: 0,
-                base_game_storage_id: StorageId::Host as u8,
-                update_storage_id: StorageId::None as u8,
-                program_index: 0,
-                reserved: 0,
-            };
+            let launch = self.content_provider.as_ref().map_or_else(
+                || ApplicationLaunchProperty {
+                    title_id: program_id,
+                    ..ApplicationLaunchProperty::default()
+                },
+                |content_provider| {
+                    build_application_launch_property(
+                        program_id,
+                        0,
+                        &self.filesystem_controller,
+                        content_provider,
+                    )
+                },
+            );
             let control =
                 vec![0u8; std::mem::size_of::<crate::file_sys::control_metadata::RawNACP>()];
             let result = self
@@ -1715,6 +2012,11 @@ impl System {
         self.is_multicore
     }
 
+    /// Matches upstream `System::DebuggerEnabled()`.
+    pub fn debugger_enabled(&self) -> bool {
+        *common::settings::values().use_gdbstub.get_value()
+    }
+
     /// Sets multicore mode. Should be called before initialize().
     pub fn set_multicore(&mut self, multicore: bool) {
         self.is_multicore = multicore;
@@ -1759,6 +2061,12 @@ impl System {
     /// Used to transfer data between programs.
     pub fn get_user_channel(&mut self) -> &mut VecDeque<Vec<u8>> {
         &mut self.user_channel
+    }
+
+    /// Transfers and clears the current user channel.
+    /// Matches `std::deque::swap(m_system.GetUserChannel())` users.
+    pub fn take_user_channel(&mut self) -> VecDeque<Vec<u8>> {
+        std::mem::take(&mut self.user_channel)
     }
 
     /// Returns a snapshot (clone) of the user channel for reading from a

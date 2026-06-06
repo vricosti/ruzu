@@ -1,8 +1,11 @@
 use crate::adsp::ADSP;
 use crate::audio_in_manager::Manager as AudioInManager;
 use crate::audio_manager::AudioManager;
+use crate::audio_out_manager::Manager as AudioOutManager;
 use crate::audio_render_manager::Manager as AudioRenderManager;
 use crate::common::audio_renderer_parameter::AudioRendererParameterInternal;
+use crate::out::audio_out::Out as AudioOut;
+use crate::out::audio_out_system::AudioOutParameter;
 use crate::r#in::audio_in::In as AudioIn;
 use crate::r#in::audio_in_system::AudioInParameter;
 use crate::renderer::audio_device::AudioDevice;
@@ -20,6 +23,7 @@ pub struct AudioCore {
     system: SharedSystem,
     audio_manager: Arc<AudioManager>,
     audio_in_manager: Arc<Mutex<AudioInManager>>,
+    audio_out_manager: Arc<Mutex<AudioOutManager>>,
     audio_render_manager: Arc<Mutex<AudioRenderManager>>,
     output_sink: SinkHandle,
     input_sink: SinkHandle,
@@ -35,6 +39,10 @@ impl AudioCore {
             system.clone(),
             audio_manager.clone(),
         )));
+        let audio_out_manager = Arc::new(Mutex::new(AudioOutManager::new(
+            system.clone(),
+            audio_manager.clone(),
+        )));
         let audio_render_manager = Arc::new(Mutex::new(AudioRenderManager::new(
             system.clone(),
             adsp.audio_renderer(),
@@ -43,6 +51,7 @@ impl AudioCore {
             system,
             audio_manager,
             audio_in_manager,
+            audio_out_manager,
             audio_render_manager,
             output_sink,
             input_sink,
@@ -293,6 +302,86 @@ impl ruzu_core::core::AudioInSessionImpl for AudioInSession {
     }
 }
 
+struct AudioOutSession {
+    session: Arc<AudioOut>,
+}
+
+impl AudioOutSession {
+    fn new(session: Arc<AudioOut>) -> Self {
+        Self { session }
+    }
+}
+
+impl ruzu_core::core::AudioOutSessionImpl for AudioOutSession {
+    fn get_state(&self) -> u32 {
+        self.session.get_state() as u32
+    }
+
+    fn start(&self) -> ruzu_core::hle::result::ResultCode {
+        ruzu_core::hle::result::ResultCode::new(self.session.start_system().raw())
+    }
+
+    fn stop(&self) -> ruzu_core::hle::result::ResultCode {
+        ruzu_core::hle::result::ResultCode::new(self.session.stop_system().raw())
+    }
+
+    fn append_buffer(
+        &self,
+        buffer: ruzu_core::core::AudioOutBufferWire,
+        buffer_client_ptr: u64,
+    ) -> ruzu_core::hle::result::ResultCode {
+        let parsed = crate::out::AudioOutBuffer {
+            next: buffer.next,
+            samples: buffer.samples,
+            capacity: buffer.capacity,
+            size: buffer.size,
+            offset: buffer.offset,
+        };
+        ruzu_core::hle::result::ResultCode::new(
+            self.session.append_buffer(parsed, buffer_client_ptr).raw(),
+        )
+    }
+
+    fn get_released_buffers(&self, out_tags: &mut [u64]) -> u32 {
+        self.session.get_released_buffers(out_tags)
+    }
+
+    fn contains_buffer(&self, buffer_client_ptr: u64) -> bool {
+        self.session.contains_audio_buffer(buffer_client_ptr)
+    }
+
+    fn get_buffer_count(&self) -> u32 {
+        self.session.get_buffer_count()
+    }
+
+    fn get_played_sample_count(&self) -> u64 {
+        self.session.get_played_sample_count()
+    }
+
+    fn flush_audio_out_buffers(&self) -> bool {
+        self.session.flush_audio_out_buffers()
+    }
+
+    fn set_volume(&self, volume: f32) {
+        self.session.set_volume(volume);
+    }
+
+    fn get_volume(&self) -> f32 {
+        self.session.get_volume()
+    }
+
+    fn set_buffer_readable_event(
+        &self,
+        event: Arc<StdMutex<ruzu_core::hle::kernel::k_readable_event::KReadableEvent>>,
+    ) {
+        self.session.set_buffer_readable_event(event);
+    }
+
+    fn set_process_arc(&self, process: Arc<ruzu_core::hle::kernel::k_process::ProcessLock>) {
+        self.session.set_process_arc(process);
+    }
+}
+
 impl ruzu_core::core::AudioCoreInterface for AudioCore {
     fn get_audio_renderer_work_buffer_size(&self, params: &[u8; 0x34]) -> Option<u64> {
         let parsed = unsafe {
@@ -468,6 +557,97 @@ impl ruzu_core::core::AudioCoreInterface for AudioCore {
             sample_format,
             state,
             name: out_name,
+        })
+    }
+
+    fn open_audio_output(
+        &self,
+        name: &[u8; 0x100],
+        params: ruzu_core::core::AudioOutParameterWire,
+        applet_resource_user_id: u64,
+    ) -> std::result::Result<
+        ruzu_core::core::AudioOutOpenResponse,
+        ruzu_core::hle::result::ResultCode,
+    > {
+        let parsed = AudioOutParameter {
+            sample_rate: params.sample_rate,
+            channel_count: params.channel_count,
+            reserved: params.reserved,
+        };
+        let mut session_id = 0usize;
+        let manager_arc = Arc::clone(&self.audio_out_manager);
+        {
+            let mut manager = manager_arc.lock();
+            let result = manager.link_to_manager();
+            if result.is_error() {
+                return Err(ruzu_core::hle::result::ResultCode::new(result.raw()));
+            }
+            let result = manager.acquire_session_id(&mut session_id);
+            if result.is_error() {
+                return Err(ruzu_core::hle::result::ResultCode::new(result.raw()));
+            }
+        }
+
+        let device_name = {
+            let nul = name
+                .iter()
+                .position(|&byte| byte == 0)
+                .unwrap_or(name.len());
+            String::from_utf8_lossy(&name[..nul]).into_owned()
+        };
+
+        let buffer_event = Arc::new(AtomicBool::new(false));
+        let mut system = crate::out::System::new(
+            self.system.clone(),
+            self.get_output_sink(),
+            buffer_event.clone(),
+            session_id,
+        );
+        system.set_audio_manager(Some(self.audio_manager.clone()));
+        let result = system.initialize(device_name, &parsed, applet_resource_user_id);
+        if result.is_error() {
+            manager_arc.lock().release_session_id(session_id);
+            return Err(ruzu_core::hle::result::ResultCode::new(result.raw()));
+        }
+
+        let release_manager = Arc::clone(&manager_arc);
+        let session = Arc::new(AudioOut::new(
+            system,
+            buffer_event,
+            Arc::new(move |released_session_id| {
+                release_manager
+                    .lock()
+                    .release_session_id(released_session_id);
+            }),
+        ));
+
+        {
+            let manager = manager_arc.lock();
+            manager.set_session(session_id, Some(session.clone()));
+        }
+        {
+            let mut manager = manager_arc.lock();
+            manager.applet_resource_user_ids[session_id] = applet_resource_user_id as usize;
+        }
+
+        let out_system = session.get_system();
+        let sample_rate = out_system.get_sample_rate();
+        let channel_count = out_system.get_channel_count() as u32;
+        let sample_format = out_system.get_sample_format() as u32;
+        let state = match out_system.get_state() {
+            crate::out::State::Started => 0,
+            crate::out::State::Stopped => 1,
+        };
+        drop(out_system);
+
+        Ok(ruzu_core::core::AudioOutOpenResponse {
+            session: ruzu_core::core::AudioOutSession::from_arc(std::sync::Arc::new(
+                AudioOutSession::new(session),
+            )),
+            sample_rate,
+            channel_count,
+            sample_format,
+            state,
         })
     }
 

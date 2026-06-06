@@ -6,11 +6,10 @@
 //!
 //! Parental controls service registration.
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use crate::hle::service::hle_ipc::{SessionRequestHandlerFactory, SessionRequestHandlerPtr};
 use crate::hle::service::server_manager::ServerManager;
-use crate::hle::service::sm::sm::ServiceManager;
 
 /// Launches PCTL services.
 ///
@@ -25,7 +24,7 @@ use crate::hle::service::sm::sm::ServiceManager;
 ///     ServerManager::RunServer(std::move(server_manager));
 /// }
 /// ```
-pub fn loop_process(service_manager: &Arc<Mutex<ServiceManager>>, system: crate::core::SystemRef) {
+pub fn loop_process(system: crate::core::SystemRef) {
     let mut server_manager = ServerManager::new(system);
 
     register_named_service(

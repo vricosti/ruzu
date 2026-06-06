@@ -35,6 +35,7 @@ pub struct IWindowController {
 impl IWindowController {
     pub fn new(applet: Arc<Mutex<Applet>>, window_system: Arc<Mutex<WindowSystem>>) -> Self {
         let handlers = build_handler_map(&[
+            (0, None, "CreateWindow"),
             (
                 1,
                 Some(Self::get_applet_resource_user_id_handler),

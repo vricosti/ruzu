@@ -5,10 +5,9 @@
 //! Port of zuyu/src/core/hle/service/am/display_layer_manager.cpp
 
 use std::collections::BTreeSet;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use crate::core::SystemRef;
-use crate::hle::kernel::k_process::KProcess;
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 use crate::hle::service::vi::application_display_service::IApplicationDisplayService;
 use crate::hle::service::vi::manager_display_service::IManagerDisplayService;
@@ -22,7 +21,6 @@ use crate::hle::kernel::k_process::ProcessLock;
 /// Port of DisplayLayerManager
 ///
 /// Manages VI display layers for an applet.
-/// Stubbed: requires VI service integration.
 pub struct DisplayLayerManager {
     display_service: Option<Arc<IApplicationDisplayService>>,
     manager_display_service: Option<Arc<IManagerDisplayService>>,
@@ -214,6 +212,19 @@ impl DisplayLayerManager {
 
     pub fn get_window_visibility(&self) -> bool {
         self.visible
+    }
+
+    pub fn write_applet_capture_buffer(&mut self) -> Result<(bool, i32), ResultCode> {
+        if !self.buffer_sharing_enabled {
+            return Err(vi_results::RESULT_PERMISSION_DENIED);
+        }
+        let Some(display_service) = self.display_service.as_ref() else {
+            return Err(vi_results::RESULT_OPERATION_FAILED);
+        };
+        display_service
+            .get_container()
+            .get_shared_buffer_manager()
+            .write_applet_capture_buffer()
     }
 }
 

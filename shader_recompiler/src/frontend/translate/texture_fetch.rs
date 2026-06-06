@@ -208,9 +208,7 @@ fn impl_tex(
     info.is_depth = dc;
     info.has_bias = matches!(blod, Blod::Lb | Blod::Lba);
     info.has_lod_clamp = lc;
-
-    // TODO: ruzu's TextureInstInfo still lacks upstream `ndv_is_active`.
-    let _ = ndv;
+    info.ndv_is_active = ndv;
 
     let sample = if !dc {
         if has_explicit_lod(blod) {
@@ -243,8 +241,9 @@ fn impl_tex(
     }
 
     if sparse_pred != Pred::PT {
-        // ruzu does not yet wire `GetSparseFromOp` for texture samples.
-        v.ir.set_pred(sparse_pred, Value::ImmU1(true));
+        let sparse = v.ir.get_sparse_from_op(sample);
+        let resident = v.ir.logical_not(sparse);
+        v.ir.set_pred(sparse_pred, resident);
     }
 }
 

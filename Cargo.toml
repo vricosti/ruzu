@@ -78,6 +78,7 @@ toml = "0.8"
 tempfile = "3"
 openssl = "0.10"
 context = "3.0"
+image = { version = "0.25", default-features = false, features = ["jpeg"] }
 
 [profile.release]
 debug = 1

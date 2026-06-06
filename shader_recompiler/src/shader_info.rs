@@ -186,6 +186,23 @@ impl Default for ImageFormat {
     }
 }
 
+impl ImageFormat {
+    /// Decode the 3-bit `image_format` field of `TextureInstInfo`.
+    pub fn from_u8(v: u8) -> Self {
+        match v {
+            0 => ImageFormat::Typeless,
+            1 => ImageFormat::R8Uint,
+            2 => ImageFormat::R8Sint,
+            3 => ImageFormat::R16Uint,
+            4 => ImageFormat::R16Sint,
+            5 => ImageFormat::R32Uint,
+            6 => ImageFormat::R32G32Uint,
+            7 => ImageFormat::R32G32B32A32Uint,
+            _ => ImageFormat::Typeless,
+        }
+    }
+}
+
 /// Interpolation mode for fragment shader inputs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Interpolation {

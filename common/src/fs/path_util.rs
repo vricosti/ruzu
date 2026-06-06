@@ -94,9 +94,34 @@ fn has_populated_sdmc(root: &Path) -> bool {
         .any(|entry_path| is_meaningful_sdmc_entry(&entry_path))
 }
 
-fn should_use_legacy_yuzu_root(primary_root: &Path, legacy_root: &Path) -> bool {
-    (!has_populated_system_registered(primary_root) && has_populated_system_registered(legacy_root))
-        || (!has_populated_sdmc(primary_root) && has_populated_sdmc(legacy_root))
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LegacyYuzuRootReason {
+    NandEmpty,
+    SdmcEmpty,
+}
+
+impl LegacyYuzuRootReason {
+    fn as_log_reason(self) -> &'static str {
+        match self {
+            Self::NandEmpty => "ruzu NAND is empty",
+            Self::SdmcEmpty => "ruzu SDMC is empty",
+        }
+    }
+}
+
+fn legacy_yuzu_root_reason(
+    primary_root: &Path,
+    legacy_root: &Path,
+) -> Option<LegacyYuzuRootReason> {
+    if !has_populated_system_registered(primary_root)
+        && has_populated_system_registered(legacy_root)
+    {
+        return Some(LegacyYuzuRootReason::NandEmpty);
+    }
+    if !has_populated_sdmc(primary_root) && has_populated_sdmc(legacy_root) {
+        return Some(LegacyYuzuRootReason::SdmcEmpty);
+    }
+    None
 }
 
 impl PathManager {
@@ -146,10 +171,12 @@ impl PathManager {
                 ruzu_path_config = get_data_directory("XDG_CONFIG_HOME").join(RUZU_DIR);
             }
 
-            data_root = if should_use_legacy_yuzu_root(&ruzu_path, &legacy_candidate) {
+            data_root = if let Some(reason) = legacy_yuzu_root_reason(&ruzu_path, &legacy_candidate)
+            {
                 info!(
-                    "Using legacy yuzu data root at {} because ruzu NAND is empty",
-                    path_to_utf8_string(&legacy_candidate)
+                    "Using legacy yuzu data root at {} because {}",
+                    path_to_utf8_string(&legacy_candidate),
+                    reason.as_log_reason()
                 );
                 legacy_candidate
             } else {
@@ -706,7 +733,10 @@ mod tests {
         )
         .unwrap();
 
-        assert!(should_use_legacy_yuzu_root(&primary, &legacy));
+        assert_eq!(
+            legacy_yuzu_root_reason(&primary, &legacy),
+            Some(LegacyYuzuRootReason::NandEmpty)
+        );
 
         let _ = fs::remove_dir_all(base);
     }
@@ -732,7 +762,10 @@ mod tests {
         )
         .unwrap();
 
-        assert!(should_use_legacy_yuzu_root(&primary, &legacy));
+        assert_eq!(
+            legacy_yuzu_root_reason(&primary, &legacy),
+            Some(LegacyYuzuRootReason::SdmcEmpty)
+        );
 
         let _ = fs::remove_dir_all(base);
     }
@@ -764,7 +797,7 @@ mod tests {
         )
         .unwrap();
 
-        assert!(!should_use_legacy_yuzu_root(&primary, &legacy));
+        assert_eq!(legacy_yuzu_root_reason(&primary, &legacy), None);
 
         let _ = fs::remove_dir_all(base);
     }

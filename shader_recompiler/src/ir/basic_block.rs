@@ -95,6 +95,12 @@ impl Block {
         idx
     }
 
+    /// Allocate a new stable slot containing a copy of `base_inst` and place it
+    /// before `before` in logical order.
+    pub fn clone_inst_before(&mut self, before: u32, base_inst: &Inst) -> u32 {
+        self.insert_inst_before(before, base_inst.clone())
+    }
+
     /// Physically erase an instruction while preserving every other slot index.
     pub fn erase_inst(&mut self, idx: u32) {
         self.instructions[idx as usize] = None;
@@ -167,9 +173,19 @@ impl Block {
         self.indexed_iter().map(|(_, inst)| inst)
     }
 
+    /// Iterate over instructions in reverse logical order.
+    pub fn rev_iter(&self) -> impl Iterator<Item = &Inst> {
+        self.indexed_rev_iter().map(|(_, inst)| inst)
+    }
+
     /// Iterate over instructions mutably.
     pub fn iter_mut(&mut self) -> impl Iterator<Item = &mut Inst> {
         self.indexed_iter_mut().map(|(_, inst)| inst)
+    }
+
+    /// Iterate over instructions mutably in reverse logical order.
+    pub fn rev_iter_mut(&mut self) -> impl Iterator<Item = &mut Inst> {
+        self.indexed_rev_iter_mut().map(|(_, inst)| inst)
     }
 
     /// Iterate over live instruction slots.
@@ -201,6 +217,75 @@ impl Block {
                     .map(|inst| (index, inst))
             }
         })
+    }
+
+    /// Iterate over live instruction slots in reverse logical order.
+    pub fn indexed_rev_iter(&self) -> impl Iterator<Item = (u32, &Inst)> {
+        self.instruction_order
+            .iter()
+            .rev()
+            .copied()
+            .filter_map(|index| {
+                self.instructions
+                    .get(index as usize)
+                    .and_then(Option::as_ref)
+                    .map(|inst| (index, inst))
+            })
+    }
+
+    /// Iterate over live instruction slots mutably in reverse logical order.
+    pub fn indexed_rev_iter_mut(&mut self) -> impl Iterator<Item = (u32, &mut Inst)> {
+        let order = self.instruction_order.clone();
+        let len = self.instructions.len();
+        let instructions = self.instructions.as_mut_ptr();
+        order.into_iter().rev().filter_map(move |index| {
+            if index as usize >= len {
+                return None;
+            }
+            // See `indexed_iter_mut`: the same private duplicate-free order
+            // invariant applies when the traversal direction is reversed.
+            unsafe {
+                (*instructions.add(index as usize))
+                    .as_mut()
+                    .map(|inst| (index, inst))
+            }
+        })
+    }
+
+    /// First live instruction in logical order.
+    pub fn front(&self) -> &Inst {
+        let index = *self
+            .instruction_order
+            .first()
+            .expect("front() called on an empty block");
+        self.inst(index)
+    }
+
+    /// First live instruction in logical order.
+    pub fn front_mut(&mut self) -> &mut Inst {
+        let index = *self
+            .instruction_order
+            .first()
+            .expect("front_mut() called on an empty block");
+        self.inst_mut(index)
+    }
+
+    /// Last live instruction in logical order.
+    pub fn back(&self) -> &Inst {
+        let index = *self
+            .instruction_order
+            .last()
+            .expect("back() called on an empty block");
+        self.inst(index)
+    }
+
+    /// Last live instruction in logical order.
+    pub fn back_mut(&mut self) -> &mut Inst {
+        let index = *self
+            .instruction_order
+            .last()
+            .expect("back_mut() called on an empty block");
+        self.inst_mut(index)
     }
 }
 
@@ -259,6 +344,24 @@ mod tests {
     }
 
     #[test]
+    fn clone_inst_before_copies_instruction_before_target() {
+        let mut block = Block::new();
+        let first = block.append_inst(Inst::new(Opcode::IAdd32, vec![]));
+        let second = block.append_inst(Inst::new(Opcode::IMul32, vec![]));
+        block.inst_mut(second).flags = 0x42;
+
+        let cloned = {
+            let base = block.inst(second).clone();
+            block.clone_inst_before(first, &base)
+        };
+        let order: Vec<u32> = block.indexed_iter().map(|(index, _)| index).collect();
+
+        assert_eq!(order, vec![cloned, first, second]);
+        assert_eq!(block.inst(cloned).opcode, Opcode::IMul32);
+        assert_eq!(block.inst(cloned).flags, 0x42);
+    }
+
+    #[test]
     fn erase_inst_removes_slot_from_logical_order() {
         let mut block = Block::new();
         let first = block.append_inst(Inst::new(Opcode::IAdd32, vec![]));
@@ -287,6 +390,45 @@ mod tests {
 
         assert_eq!(visited, vec![first, inserted, second]);
         assert_eq!(block.inst(first).flags, first);
+        assert_eq!(block.inst(inserted).flags, inserted);
+        assert_eq!(block.inst(second).flags, second);
+    }
+
+    #[test]
+    fn reverse_iterators_follow_logical_order() {
+        let mut block = Block::new();
+        let first = block.append_inst(Inst::new(Opcode::IAdd32, vec![]));
+        let second = block.append_inst(Inst::new(Opcode::IMul32, vec![]));
+        let inserted = block.insert_inst_before(second, Inst::new(Opcode::ISub32, vec![]));
+
+        let order: Vec<u32> = block.indexed_rev_iter().map(|(index, _)| index).collect();
+        assert_eq!(order, vec![second, inserted, first]);
+
+        let mut mutable_order = Vec::new();
+        for (index, inst) in block.indexed_rev_iter_mut() {
+            mutable_order.push(index);
+            inst.flags = index + 10;
+        }
+
+        assert_eq!(mutable_order, vec![second, inserted, first]);
+        assert_eq!(block.inst(first).flags, first + 10);
+        assert_eq!(block.inst(inserted).flags, inserted + 10);
+        assert_eq!(block.inst(second).flags, second + 10);
+    }
+
+    #[test]
+    fn front_and_back_follow_logical_order() {
+        let mut block = Block::new();
+        let first = block.append_inst(Inst::new(Opcode::IAdd32, vec![]));
+        let second = block.append_inst(Inst::new(Opcode::IMul32, vec![]));
+        let inserted = block.insert_inst_before(first, Inst::new(Opcode::ISub32, vec![]));
+
+        assert_eq!(block.front().opcode, Opcode::ISub32);
+        assert_eq!(block.back().opcode, Opcode::IMul32);
+
+        block.front_mut().flags = inserted;
+        block.back_mut().flags = second;
+
         assert_eq!(block.inst(inserted).flags, inserted);
         assert_eq!(block.inst(second).flags, second);
     }

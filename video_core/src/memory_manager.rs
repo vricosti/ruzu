@@ -1433,6 +1433,10 @@ impl MemoryManager {
         self.inner.gpu_to_cpu_address(gpu_addr)
     }
 
+    pub fn gpu_to_cpu_address_range(&self, gpu_addr: u64, size: u64) -> Option<u64> {
+        self.inner.gpu_to_cpu_address_range(gpu_addr, size)
+    }
+
     pub fn is_continuous_range(&self, gpu_addr: u64, size: u64) -> bool {
         self.inner.is_continuous_range(gpu_addr, size)
     }
@@ -1867,6 +1871,10 @@ mod tests {
         assert_eq!(mm.map(0x10000, 0x9000_0000, 0x10000, 0xFF, true), 0x10000);
         assert_eq!(mm.gpu_to_cpu_address(0x10000), Some(0x9000_0000));
         assert_eq!(mm.gpu_to_cpu_address(0x10ABC), Some(0x9000_0ABC));
+        assert_eq!(
+            mm.gpu_to_cpu_address_range(0x0F000, 0x3000),
+            Some(0x9000_0000)
+        );
 
         mm.unmap(0x10000, 0x10000);
         assert_eq!(mm.gpu_to_cpu_address(0x10000), None);

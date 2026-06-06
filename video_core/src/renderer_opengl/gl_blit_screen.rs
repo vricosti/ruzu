@@ -14,6 +14,17 @@ use super::present::layer::Layer;
 use super::present::window_adapt_pass::WindowAdaptPass;
 use super::RasterizerOpenGL;
 
+fn to_opengl_scaling_filter(filter: crate::present::ScalingFilter) -> ScalingFilter {
+    match filter {
+        crate::present::ScalingFilter::NearestNeighbor => ScalingFilter::NearestNeighbor,
+        crate::present::ScalingFilter::Bilinear => ScalingFilter::Bilinear,
+        crate::present::ScalingFilter::Bicubic => ScalingFilter::Bicubic,
+        crate::present::ScalingFilter::Gaussian => ScalingFilter::Gaussian,
+        crate::present::ScalingFilter::ScaleForce => ScalingFilter::ScaleForce,
+        crate::present::ScalingFilter::Fsr => ScalingFilter::Fsr,
+    }
+}
+
 /// BlitScreen handles the final frame composition to the window.
 ///
 /// Corresponds to zuyu's `BlitScreen` class.
@@ -111,9 +122,7 @@ impl BlitScreen {
     ///
     /// Port of `BlitScreen::CreateWindowAdapt()`.
     fn create_window_adapt(&mut self) {
-        // For now, default to Bilinear. When Settings is fully ported,
-        // this should read from settings: filters.get_scaling_filter().
-        let desired = ScalingFilter::Bilinear;
+        let desired = to_opengl_scaling_filter(crate::present::get_scaling_filter());
 
         if self.window_adapt.is_some() && self.current_window_adapt == Some(desired) {
             return;
@@ -121,5 +130,38 @@ impl BlitScreen {
 
         self.current_window_adapt = Some(desired);
         self.window_adapt = Some(filters::make_filter(desired));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn opengl_scaling_filter_maps_present_filters() {
+        assert_eq!(
+            to_opengl_scaling_filter(crate::present::ScalingFilter::NearestNeighbor),
+            ScalingFilter::NearestNeighbor
+        );
+        assert_eq!(
+            to_opengl_scaling_filter(crate::present::ScalingFilter::Bilinear),
+            ScalingFilter::Bilinear
+        );
+        assert_eq!(
+            to_opengl_scaling_filter(crate::present::ScalingFilter::Bicubic),
+            ScalingFilter::Bicubic
+        );
+        assert_eq!(
+            to_opengl_scaling_filter(crate::present::ScalingFilter::Gaussian),
+            ScalingFilter::Gaussian
+        );
+        assert_eq!(
+            to_opengl_scaling_filter(crate::present::ScalingFilter::ScaleForce),
+            ScalingFilter::ScaleForce
+        );
+        assert_eq!(
+            to_opengl_scaling_filter(crate::present::ScalingFilter::Fsr),
+            ScalingFilter::Fsr
+        );
     }
 }

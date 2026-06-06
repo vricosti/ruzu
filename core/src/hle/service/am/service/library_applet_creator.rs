@@ -67,21 +67,9 @@ impl ILibraryAppletCreator {
         ctx: &mut HLERequestContext,
         object: Arc<dyn SessionRequestHandler>,
     ) {
-        let is_domain = ctx
-            .get_manager()
-            .map_or(false, |manager| manager.lock().unwrap().is_domain());
-        let move_handle = if is_domain {
-            0
-        } else {
-            ctx.create_session_for_service(object.clone()).unwrap_or(0)
-        };
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 1);
         rb.push_result(RESULT_SUCCESS);
-        if is_domain {
-            ctx.add_domain_object(object);
-        } else {
-            rb.push_move_objects(move_handle);
-        }
+        rb.push_ipc_interface(object);
     }
 
     fn create_storage_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {

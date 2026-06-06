@@ -157,7 +157,7 @@ pub trait ServiceFramework: SessionRequestHandler {
         }
     }
 
-    /// Reports an unimplemented function and writes a stub success response.
+    /// Reports an unimplemented function and optionally writes a stub success response.
     fn report_unimplemented_function(
         &self,
         ctx: &mut HLERequestContext,
@@ -182,12 +182,24 @@ pub trait ServiceFramework: SessionRequestHandler {
 
         log::warn!("Unknown / unimplemented {}", buf);
 
-        // Auto-stub: write a success response so the game doesn't read garbage
-        // from the TLS buffer. Matches upstream behavior when use_auto_stub is enabled.
-        // Without this, the request data stays in the buffer and the game misparses
-        // it as a response, leading to state corruption and crashes.
-        let mut rb = ipc_helpers::ResponseBuilder::new(ctx, 2, 0, 0);
-        rb.push_result(RESULT_SUCCESS);
+        if let Some(system) = ctx.get_manager().and_then(|manager| {
+            let server_manager = manager.lock().unwrap().get_server_manager()?.clone();
+            let system = server_manager.lock().unwrap().system();
+            (!system.is_null()).then_some(system)
+        }) {
+            system.get_reporter().save_unimplemented_function_report(
+                system.get().runtime_program_id(),
+                ctx.get_command(),
+                &function_name,
+                self.get_service_name(),
+            );
+        }
+
+        if *common::settings::values().use_auto_stub.get_value() {
+            log::warn!("Using auto stub fallback!");
+            let mut rb = ipc_helpers::ResponseBuilder::new(ctx, 2, 0, 0);
+            rb.push_result(RESULT_SUCCESS);
+        }
     }
 
     /// Handles a synchronization request for the service.

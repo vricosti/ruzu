@@ -763,7 +763,7 @@ pub fn sleep_thread(system: &System, ns: i64) {
         let current_tick = system
             .kernel()
             .and_then(|_| crate::hle::kernel::kernel::get_current_hardware_tick())
-            .unwrap_or(i64::MAX);
+            .expect("svc::SleepThread requires a live kernel hardware timer");
         let timeout = sleep_timeout_tick_from_ns(current_tick, ns);
         if should_trace_sleep_debug() {
             log::info!(

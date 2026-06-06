@@ -34,8 +34,10 @@ pub fn loop_process(system: crate::core::SystemRef) {
     for &name in NS_SERVICE_GETTER_NAMES {
         server_manager.register_named_service(
             name,
-            Box::new(|| -> SessionRequestHandlerPtr {
-                Arc::new(super::service_getter_interface::IServiceGetterInterface::new())
+            Box::new(move || -> SessionRequestHandlerPtr {
+                Arc::new(
+                    super::service_getter_interface::IServiceGetterInterface::new(system, name),
+                )
             }),
             64,
         );
@@ -68,19 +70,14 @@ pub fn loop_process(system: crate::core::SystemRef) {
         64,
     );
 
-    // pdm:qry -> IQueryService (stub — no SessionRequestHandler impl yet)
-    {
-        let svc_name = "pdm:qry".to_string();
-        server_manager.register_named_service(
-            "pdm:qry",
-            Box::new(move || -> SessionRequestHandlerPtr {
-                Arc::new(crate::hle::service::services::GenericStubService::new(
-                    &svc_name,
-                ))
-            }),
-            64,
-        );
-    }
+    // pdm:qry -> IQueryService
+    server_manager.register_named_service(
+        "pdm:qry",
+        Box::new(|| -> SessionRequestHandlerPtr {
+            Arc::new(super::query_service::IQueryService::new())
+        }),
+        64,
+    );
 
     // pl:s -> IPlatformServiceManager
     {

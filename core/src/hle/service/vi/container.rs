@@ -169,6 +169,22 @@ impl Container {
     pub fn on_terminate(&self) {
         let mut inner = self.inner.lock().unwrap();
         inner.is_shut_down = true;
+
+        let mut layer_ids = Vec::new();
+        inner.layers.for_each_layer(|layer| {
+            layer_ids.push(layer.get_id());
+        });
+        for layer_id in layer_ids {
+            let _ = Self::destroy_layer_locked(&self.surface_flinger, &mut inner, layer_id);
+        }
+
+        let mut display_ids = Vec::new();
+        inner.displays.for_each_display(|display| {
+            display_ids.push(display.get_id());
+        });
+        for display_id in display_ids {
+            self.surface_flinger.remove_display(display_id);
+        }
     }
 
     pub fn open_display(&self, display_name: &DisplayName) -> Result<u64, ResultCode> {
@@ -266,6 +282,17 @@ impl Container {
             .lock()
             .unwrap()
             .unlink_vsync_event(display_id, event);
+    }
+
+    pub fn compose_on_display(
+        &self,
+        out_swap_interval: &mut i32,
+        out_compose_speed_scale: &mut f32,
+        display_id: u64,
+    ) -> bool {
+        let _inner = self.inner.lock().unwrap();
+        self.surface_flinger
+            .compose_display(out_swap_interval, out_compose_speed_scale, display_id)
     }
 
     fn create_layer_locked(

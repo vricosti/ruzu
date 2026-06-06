@@ -427,7 +427,7 @@ impl AppletManager {
         // `if (params.launch_type == LaunchType::ApplicationInitiated)`
         if params.launch_type == LaunchType::ApplicationInitiated {
             if !self.system.is_null() {
-                let user_channel: VecDeque<Vec<u8>> = self.system.get().get_user_channel_snapshot();
+                let user_channel: VecDeque<Vec<u8>> = self.system.take_user_channel();
                 applet.user_channel_launch_parameter = user_channel;
             }
         }
@@ -566,7 +566,7 @@ impl AppletManager {
     /// Upstream: `void RequestExit()`
     pub fn request_exit(&self) {
         let inner = self.lock.lock().unwrap();
-        if let Some(ws) = inner.window_system.clone() {
+        if let Some(ws) = inner.window_system.as_ref() {
             ws.lock().unwrap().on_exit_requested();
         }
     }
@@ -574,7 +574,7 @@ impl AppletManager {
     /// Upstream: `void OperationModeChanged()`
     pub fn operation_mode_changed(&self) {
         let inner = self.lock.lock().unwrap();
-        if let Some(ws) = inner.window_system.clone() {
+        if let Some(ws) = inner.window_system.as_ref() {
             ws.lock().unwrap().on_operation_mode_changed();
         }
     }

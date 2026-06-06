@@ -6,7 +6,8 @@ use std::collections::BTreeMap;
 use std::sync::Mutex;
 
 use crate::core::SystemRef;
-use crate::hle::result::{ResultCode, RESULT_SUCCESS};
+use crate::hle::result::{ErrorModule, ResultCode, RESULT_SUCCESS};
+use crate::hle::service::audio::errors::RESULT_INSUFFICIENT_BUFFER;
 use crate::hle::service::cmif_serialization::{write_out_array_bytes, CmifRequest, CmifResponse};
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
 use crate::hle::service::kernel_helpers::ServiceContext;
@@ -172,8 +173,16 @@ impl IAudioDevice {
         bytes
     }
 
-    fn write_single_name(ctx: &mut HLERequestContext, name: &[u8; 0x100]) {
+    fn insufficient_buffer_result() -> ResultCode {
+        ResultCode::from_module_description(ErrorModule::Audio, RESULT_INSUFFICIENT_BUFFER.1)
+    }
+
+    fn write_single_name(ctx: &mut HLERequestContext, name: &[u8; 0x100]) -> ResultCode {
+        if Self::output_name_capacity(ctx) == 0 {
+            return Self::insufficient_buffer_result();
+        }
         ctx.write_buffer(name, 0);
+        RESULT_SUCCESS
     }
 
     fn read_first_name(ctx: &HLERequestContext) -> String {
@@ -200,6 +209,10 @@ impl IAudioDevice {
 
     fn output_name_capacity(ctx: &HLERequestContext) -> usize {
         ctx.get_write_buffer_size(0) / Self::AUDIO_DEVICE_NAME_SIZE
+    }
+
+    fn input_name_capacity(ctx: &HLERequestContext) -> usize {
+        ctx.get_read_buffer_size(0) / Self::AUDIO_DEVICE_NAME_SIZE
     }
 
     fn list_audio_device_names(&self, max_names: usize) -> Vec<[u8; 0x100]> {
@@ -273,6 +286,11 @@ impl IAudioDevice {
         let svc = Self::as_self(this);
         let mut request = CmifRequest::new(ctx);
         let volume = request.f32();
+        if Self::input_name_capacity(ctx) == 0 {
+            let mut response = CmifResponse::new(ctx, 2, 0, 0);
+            response.push_result(Self::insufficient_buffer_result());
+            return;
+        }
         let device_name = Self::read_first_name(ctx);
         if device_name == "AudioTvOutput" {
             if let Some(audio_core) = (!svc.system.is_null())
@@ -296,6 +314,11 @@ impl IAudioDevice {
     ) {
         log::debug!("IAudioDevice::GetAudioDeviceOutputVolume");
         let svc = Self::as_self(this);
+        if Self::input_name_capacity(ctx) == 0 {
+            let mut response = CmifResponse::new(ctx, 2, 0, 0);
+            response.push_result(Self::insufficient_buffer_result());
+            return;
+        }
         let device_name = Self::read_first_name(ctx);
         let volume = if device_name == "AudioTvOutput" {
             (!svc.system.is_null())
@@ -322,9 +345,9 @@ impl IAudioDevice {
         ctx: &mut HLERequestContext,
     ) {
         log::debug!("IAudioDevice::GetActiveAudioDeviceName");
-        Self::write_single_name(ctx, &Self::default_active_device_name());
+        let result = Self::write_single_name(ctx, &Self::default_active_device_name());
         let mut response = CmifResponse::new(ctx, 2, 0, 0);
-        response.push_result(RESULT_SUCCESS);
+        response.push_result(result);
     }
 
     /// Port of upstream `IAudioDevice::QueryAudioDeviceSystemEvent`.
@@ -396,9 +419,9 @@ impl IAudioDevice {
         ctx: &mut HLERequestContext,
     ) {
         log::info!("IAudioDevice::GetActiveAudioDeviceNameAuto");
-        Self::write_single_name(ctx, &Self::default_active_device_name());
+        let result = Self::write_single_name(ctx, &Self::default_active_device_name());
         let mut response = CmifResponse::new(ctx, 2, 0, 0);
-        response.push_result(RESULT_SUCCESS);
+        response.push_result(result);
     }
 
     /// Port of upstream `IAudioDevice::QueryAudioDeviceInputEvent`.
@@ -442,9 +465,9 @@ impl IAudioDevice {
         ctx: &mut HLERequestContext,
     ) {
         log::info!("IAudioDevice::GetActiveAudioOutputDeviceName");
-        Self::write_single_name(ctx, &Self::default_active_device_name());
+        let result = Self::write_single_name(ctx, &Self::default_active_device_name());
         let mut response = CmifResponse::new(ctx, 2, 0, 0);
-        response.push_result(RESULT_SUCCESS);
+        response.push_result(result);
     }
 
     fn list_audio_output_device_name_handler(

@@ -6,10 +6,7 @@
 //!
 //! Upstream delegates to GetCurrentProcess(kernel).WaitAddressArbiter / SignalAddressArbiter,
 //! which in turn delegate to KProcess::m_address_arbiter (a KAddressArbiter).
-//! The Rust KProcess does not yet have an address_arbiter field — its comment says:
-//!   // m_address_arbiter — KAddressArbiter
-//! The KAddressArbiter struct exists but its methods are stubs.
-//! Once KProcess gains an address_arbiter field, the delegation below will be complete.
+//! Rust mirrors that ownership through `KProcess::address_arbiter`.
 
 use crate::core::System;
 use crate::hle::kernel::k_address_arbiter::{ArbitrationType as KArbType, SignalType as KSigType};
