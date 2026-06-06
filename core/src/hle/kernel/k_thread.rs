@@ -2252,9 +2252,9 @@ impl KThread {
             }
 
             // Upstream increments the owning process running-thread count here.
-            // Rust still cannot do this literally in all call sites because
-            // KProcess::run() invokes thread.run() while holding the process mutex.
-            // The main-thread bootstrap owner compensates in KProcess::run().
+            // Runtime owners should prefer `run_thread(...)`, which releases
+            // the thread mutex before the scheduler lock unwinds and keeps this
+            // ownership step in the thread owner.
             if let Some(parent) = self.parent.as_ref().and_then(Weak::upgrade) {
                 if let Ok(process) = parent.try_lock() {
                     process.increment_running_thread_count();

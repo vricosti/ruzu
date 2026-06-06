@@ -2056,9 +2056,6 @@
 ### Intentional differences
 - Rust keeps `SynchronizationWaitSet` / process object-ID indirection instead of upstream raw `KSynchronizationObject**`: mechanical adaptation to the current object registry layout.
 
-### Missing items
-- Full upstream `KScopedSchedulerLockAndSleep` structure is still not ported literally; the Rust path still uses existing scheduler/timer helpers.
-
 ### Binary layout verification
 - PASS: no raw byte layout affected in this pass.
 
@@ -2173,9 +2170,6 @@
 
 ### Intentional differences
 - Rust still represents waited objects through process object IDs and `SynchronizationWaitSet` instead of upstream raw `KSynchronizationObject**`. This remains the current ownership adaptation for the Rust handle/object registry.
-
-### Missing items
-- Full literal `KScopedSchedulerLockAndSleep` parity is still not present; the Rust path still uses the existing scheduler/timer plumbing instead of the upstream RAII helper object.
 
 ### Binary layout verification
 - PASS: wait-control-flow change only; no raw payload or serialized layout changed.
@@ -4646,7 +4640,6 @@
 
 ### Missing items
 - Port literal `KAutoObject` ownership into `KThread` so `Run()` can call `Open()` exactly like upstream.
-- Remove the remaining `KProcess::run()` compensation once the main-thread bootstrap no longer invokes `thread.run()` under the process mutex.
 
 ### Binary layout verification
 - PASS: thread bootstrap/control-flow change only; no guest-visible raw struct layout changed.
@@ -4655,20 +4648,6 @@
 
 ### Binary layout verification
 - PASS: SVC control-flow only; no raw payload layout changed.
-
-## 2026-04-04 — core/src/hle/kernel/k_process.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/k_process.cpp
-
-### Intentional differences
-- Rust still keeps a temporary main-thread bootstrap compensation in `KProcess::run()` because this call path invokes `thread.run()` while already holding the process mutex, which prevents a fully literal upstream `KThread::Run() -> owner->IncrementRunningThreadCount()` move today.
-
-### Unintentional differences (to fix)
-- clarified in this pass: the running-thread-count increment belongs upstream to `KThread::Run()`, not `KProcess::Run()`. The current Rust compensation remains only for the main-thread bootstrap deadlock hazard and should be removed once ownership is fully restored.
-
-### Missing items
-- Remove the `KProcess::run()` running-thread-count compensation after refactoring the main-thread bootstrap to stop holding the process mutex across `thread.run()`.
-
-### Binary layout verification
-- PASS: process bootstrap/control-flow note only; no guest-visible raw struct layout changed.
 
 ## 2026-04-04 — core/src/hle/service/glue/time/manager.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/glue/time/manager.cpp
 
@@ -4913,12 +4892,6 @@
 
 ### Intentional differences
 - Main-thread bootstrap now uses `KThread::run_thread(&Arc<Mutex<KThread>>)` so the main-thread object mutex does not stay held through scheduler-lock release.
-
-### Unintentional differences (to fix)
-- `KProcess::run()` still compensates for upstream running-thread count ownership because Rust process bootstrap differs from the raw-pointer owner graph.
-
-### Missing items
-- Remove remaining main-thread bootstrap compensation once `KThread::Run()` ownership is literal end-to-end
 
 ### Binary layout verification
 - PASS: no raw serialized structs changed in this slice.
