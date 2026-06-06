@@ -20,6 +20,7 @@ use super::k_memory_block_manager::KMemoryBlockManager;
 use super::k_memory_layout::KERNEL_ASLR_ALIGNMENT;
 use super::k_memory_manager;
 use super::k_resource_limit::{KResourceLimit, LimitableResource};
+use super::svc::svc_types::PageInfo;
 use super::svc_types::{CreateProcessFlag, MemoryState as SvcMemoryState, ADDRESS_SPACE_MASK};
 use crate::hle::kernel::svc::svc_results;
 use crate::hle::result::ResultCode;
@@ -1871,26 +1872,42 @@ impl KPageTableBase {
     // -- QueryInfo --
 
     /// Query memory info at an address.
+    /// Port of upstream `KPageTableBase::QueryInfoImpl`.
+    fn query_info_impl(&self, addr: usize) -> Option<(KMemoryInfo, PageInfo)> {
+        let info = self.m_memory_block_manager.query_info(addr)?;
+        Some((info, PageInfo { flags: 0 }))
+    }
+
+    /// Query memory info and page info at an address.
     /// Matches upstream `KPageTableBase::QueryInfo`.
-    pub fn query_info(&self, addr: usize) -> Option<KMemoryInfo> {
+    pub fn query_info_with_page_info(&self, addr: usize) -> Option<(KMemoryInfo, PageInfo)> {
         if !self.contains(addr) {
-            return Some(KMemoryInfo {
-                m_address: self.m_address_space_end,
-                m_size: 0usize.wrapping_sub(self.m_address_space_end),
-                m_state: KMemoryState::INACCESSIBLE,
-                m_device_disable_merge_left_count: 0,
-                m_device_disable_merge_right_count: 0,
-                m_ipc_lock_count: 0,
-                m_device_use_count: 0,
-                m_ipc_disable_merge_count: 0,
-                m_permission: KMemoryPermission::NONE,
-                m_attribute: KMemoryAttribute::NONE,
-                m_original_permission: KMemoryPermission::NONE,
-                m_disable_merge_attribute: KMemoryBlockDisableMergeAttribute::NONE,
-            });
+            return Some((
+                KMemoryInfo {
+                    m_address: self.m_address_space_end,
+                    m_size: 0usize.wrapping_sub(self.m_address_space_end),
+                    m_state: KMemoryState::INACCESSIBLE,
+                    m_device_disable_merge_left_count: 0,
+                    m_device_disable_merge_right_count: 0,
+                    m_ipc_lock_count: 0,
+                    m_device_use_count: 0,
+                    m_ipc_disable_merge_count: 0,
+                    m_permission: KMemoryPermission::NONE,
+                    m_attribute: KMemoryAttribute::NONE,
+                    m_original_permission: KMemoryPermission::NONE,
+                    m_disable_merge_attribute: KMemoryBlockDisableMergeAttribute::NONE,
+                },
+                PageInfo { flags: 0 },
+            ));
         }
 
-        self.m_memory_block_manager.query_info(addr)
+        self.query_info_impl(addr)
+    }
+
+    /// Query memory info at an address.
+    /// Compatibility wrapper for owners that do not need upstream `PageInfo`.
+    pub fn query_info(&self, addr: usize) -> Option<KMemoryInfo> {
+        self.query_info_with_page_info(addr).map(|(info, _)| info)
     }
 
     // -- SetMemoryPermission --

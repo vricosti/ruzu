@@ -466,8 +466,6 @@ pub fn global_memory_to_storage_buffer_pass(program: &mut Program, host_info: &H
 /// Join storage buffer descriptors from `source` into `base`.
 ///
 /// Upstream: `JoinStorageInfo` in `global_memory_to_storage_buffer_pass.cpp`.
-///
-/// Not yet implemented: requires the full storage descriptor tracking infrastructure.
 pub fn join_storage_info(base: &mut ShaderInfo, source: &mut ShaderInfo) {
     let descriptors = &mut base.storage_buffers_descriptors;
     for desc in &source.storage_buffers_descriptors {

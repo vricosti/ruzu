@@ -2433,10 +2433,6 @@
 ### Intentional differences
 - Rust still lacks the full upstream `QueryInfoImpl` locking and page-table internals; this pass only realigns the public `QueryInfo` out-of-range contract.
 
-### Missing items
-- `QueryInfoImpl` is still not ported as a dedicated owner method; the in-range lookup still delegates straight to `KMemoryBlockManager`.
-- `out_page_info->flags = 0` parity still lives in the SVC caller path rather than a full `QueryInfo` owner implementation.
-
 ### Binary layout verification
 - PASS: `KMemoryInfo` layout unchanged; only the returned synthesized values changed.
 
@@ -7847,17 +7843,6 @@
 ### Binary layout verification
 - PASS: test-only change; no runtime struct layout involved.
 
-## 2026-04-28 — `video_core/src/renderer_opengl/gl_rasterizer.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_rasterizer.cpp`
-
-### Intentional differences
-- Rust still keeps the broader OpenGL rasterizer as a reduced port with composed helper objects instead of the literal upstream GL runtime/cache graph. This is an existing structural adaptation outside the query slice.
-
-### Missing items
-- Rust still lacks the upstream `QueryFallback(...)` helper as a separately named owner-local method; the fallback logic is still inlined inside `query(...)`.
-
-### Binary layout verification
-- PASS: behavior/order change only; no raw serialized struct layout involved. Added focused regressions for immediate fallback writes, timeout payload layout, and non-payload fence fallback payload forcing.
-
 ## 2026-04-28 — `video_core/src/renderer_opengl/gl_query_cache.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_query_cache.cpp` and `/home/vricosti/Dev/emulators/zuyu/src/video_core/query_cache.h`
 
 ### Intentional differences
@@ -10752,7 +10737,6 @@
 
 ### Missing items
 - Port upstream `BuildASL` / `GenerateBlocks` ownership more literally so `SyntaxNode::Block(n)` owns or maps to the actual IR block object instead of relying on integer index identity.
-- Port `RemoveUnreachableBlocks` once Rust block ownership no longer depends on raw CFG index identity.
 - The Rust control-flow builder still receives a word slice rather than an `Environment` + `Location`, so branch target arithmetic remains less literal than upstream. The absolute sched-word skip fixes translation-side alignment but does not fully port upstream `Location` ownership.
 
 ### Binary layout verification
@@ -10786,17 +10770,6 @@
 - N/A: this changes shader-code ownership slicing only; no guest-visible raw struct or IPC payload layout changed.
 - PASS: `cargo test -p video_core shader_environment::tests::cached_instruction_slice_skips_program_header_like_upstream_cfg`.
 
-## 2026-05-13 — `video_core/src/renderer_opengl/gl_shader_cache.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_shader_cache.cpp` (environment stage ownership)
-
-### Intentional differences
-- Rust still stores GLSL sources in fixed OpenGL stage slots, while upstream stores full `IR::Program` objects and later emits/links backend programs. This is the current Rust bridge shape until the full upstream pipeline object graph is ported.
-
-### Missing items
-- Dual-vertex merging (`MergeDualVertexPrograms`) is still not ported. This pass only fixes stage ownership for the single-environment GLSL bridge.
-
-### Binary layout verification
-- N/A: shader stage selection only; no guest-visible raw struct or IPC payload layout changed.
-
 ## 2026-05-13 — `shader_recompiler/src/frontend/translate_program.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/shader_recompiler/frontend/maxwell/translate_program.{h,cpp}` (`MergeDualVertexPrograms`)
 
 ### Intentional differences
@@ -10804,11 +10777,10 @@
 - Rust calls existing local pass owners (`dual_vertex_pass`, `dead_code_elimination`, `collect_info`, `texture_pass`, `global_memory_to_storage_buffer_pass`) from the same frontend owner method. Upstream calls the same conceptual passes from `MergeDualVertexPrograms`.
 
 ### Unintentional differences (to fix)
-- `JoinTextureInfo` and `JoinStorageInfo` are still stubs in their own upstream-matching Rust pass files, so descriptor merging is only structurally invoked here, not behaviorally complete.
 - Rust `CollectShaderInfoPass` does not take `Environment& env_vertex_b`, while upstream calls `CollectShaderInfoPass(env_vertex_b, result)`. Environment-dependent info collection remains incomplete.
 
 ### Missing items
-- Port full `JoinTextureInfo`, `JoinStorageInfo`, and environment-aware `CollectShaderInfoPass`.
+- Port full environment-aware `CollectShaderInfoPass`.
 - Port upstream `GenerateBlocks(result.syntax_list)` / block-pointer ASL ownership more literally so merge no longer needs explicit index remapping.
 
 ### Binary layout verification
