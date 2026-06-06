@@ -4136,10 +4136,6 @@
 
 ### Intentional differences
 - Rust stores `SystemRef` and `*const NvMap` directly in the device, mirroring upstream owner access without depending on the full C++ object graph. This is the same adaptation pattern already used by `NvMapDevice`.
-- `SpeedLimiter::DoSpeedLimiting(...)` is still not called here because `System` currently exposes only shared access on this path. Upstream performs speed limiting in this owner after `RequestComposite`.
-
-### Missing items
-- Reintroduce upstream `SpeedLimiter::DoSpeedLimiting(...)` in this owner once a safe mutable `System` path exists.
 
 ### Binary layout verification
 - PASS: no raw guest payload structs changed; the added conversion only repacks existing owner-local values.

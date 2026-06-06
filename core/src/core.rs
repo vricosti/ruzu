@@ -113,6 +113,22 @@ impl SystemRef {
         unsafe { (&mut *(self.0 as *mut System)).take_user_channel() }
     }
 
+    /// Run the speed limiter against the current CoreTiming timestamp.
+    ///
+    /// Narrow Rust counterpart to upstream callers that hold `Core::System&`
+    /// and call `system.SpeedLimiter().DoSpeedLimiting(system.CoreTiming().GetGlobalTimeUs())`.
+    pub fn do_speed_limiting_now(&self) {
+        assert!(!self.0.is_null(), "SystemRef is null");
+        let system = unsafe { &mut *(self.0 as *mut System) };
+        let settings = common::settings::values();
+        system.speed_limiter.do_speed_limiting(
+            system.core_timing.get_global_time_us(),
+            *settings.use_multi_core.get_value(),
+            *settings.use_speed_limit.get_value(),
+            *settings.speed_limit.get_value(),
+        );
+    }
+
     /// Get a reference to the Reporter.
     /// Upstream: `system.GetReporter()`.
     pub fn get_reporter(&self) -> &Arc<crate::reporter::Reporter> {
