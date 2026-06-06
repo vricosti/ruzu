@@ -617,18 +617,21 @@ impl TextureCacheBase {
     /// Remove images in a region.
     ///
     /// Port of `TextureCache<P>::UnmapMemory`.
-    ///
-    /// In the full implementation, this removes all images whose CPU address
-    /// falls within the given range, cleaning up both the page table and
-    /// slot vector entries.
     pub fn unmap_memory(&mut self, cpu_addr: u64, size: usize) {
-        Self::for_each_cpu_page(cpu_addr, size, |page| {
-            if let Some(image_ids) = self.page_table.get(&page) {
-                for &_image_id in image_ids {
-                    // In full implementation: unregister and destroy image
-                }
+        let deleted_images = self.collect_images_in_region(cpu_addr, size);
+        for image_id in deleted_images {
+            if image_id == crate::texture_cache::types::NULL_IMAGE_ID {
+                continue;
             }
-        });
+            if self.slot_images[image_id]
+                .flags
+                .contains(ImageFlagBits::TRACKED)
+            {
+                self.untrack_image(image_id);
+            }
+            self.unregister_image(image_id);
+            self.delete_image(image_id, false);
+        }
     }
 
     /// Return true when there are uncommitted images to be downloaded.

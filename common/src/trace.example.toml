@@ -34,6 +34,9 @@ svc_progress = false
 [nvdrv]
 # nvhost_as_gpu MapBufferEx / UnmapBuffer trace (was RUZU_TRACE_GPU_VA=1)
 gpu_va_trace = false
+# nvmap IocCreate/IocAlloc attribution through the common trace ring.
+# (env: RUZU_TRACE_NVMAP_ALLOC=1)
+nvmap_alloc = false
 # nvhost_ctrl::IocCtrlEventWait trace (was RUZU_TRACE_NVHOST_CTRL_WAIT=1)
 nvhost_ctrl_wait = false
 # nvhost_gpu::SubmitGpfifo syncpoint attribution.
@@ -178,6 +181,9 @@ watch_read_write = false
 # STLEX (exclusive store) attempt tracing. (was guarded by RUZU_WATCH_PC)
 stlex = false
 # Unmapped guest-write attribution. (was RUZU_TRACE_UNMAPPED_WRITE=1)
+# Optional env filters:
+# RUZU_TRACE_UNMAPPED_WRITE_ADDR=0xADDR
+# RUZU_TRACE_UNMAPPED_WRITE_LIMIT=N
 unmapped_write = false
 # BL_HIT scan summary. (was RUZU_FIND_BL=0xTARGET:...)
 bl_hit = false

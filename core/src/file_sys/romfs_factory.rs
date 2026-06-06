@@ -172,10 +172,8 @@ impl RomFSFactory {
     /// Internal helper: get the NCA entry for a given title/storage/type.
     /// Corresponds to upstream `RomFSFactory::GetEntry`.
     ///
-    /// Upstream dispatches based on StorageId to content_provider or
-    /// filesystem_controller caches. Since FileSystemController is not yet
-    /// ported, only StorageId::None (which uses content_provider directly)
-    /// is fully implemented.
+    /// Upstream dispatches based on `StorageId` to the process content
+    /// provider or `FileSystemController` caches.
     pub fn get_entry(
         &self,
         title_id: u64,
@@ -205,11 +203,12 @@ impl RomFSFactory {
             }
             StorageId::SdCard => {
                 // Upstream: filesystem_controller.GetSDMCContents()->GetEntry(...)
-                // SDMC factory not yet added to FileSystemController.
-                log::warn!(
-                    "RomFSFactory::get_entry: StorageId::SdCard requires FileSystemController"
-                );
-                None
+                if let Some(ref fsc) = self.filesystem_controller {
+                    let fsc = fsc.lock().unwrap();
+                    fsc.get_sdmc_contents()?.get_entry(title_id, type_)
+                } else {
+                    None
+                }
             }
             StorageId::Host | StorageId::GameCard => {
                 log::warn!(

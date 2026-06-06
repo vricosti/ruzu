@@ -136,11 +136,7 @@ fn dump_present_ppm_once(
     } else if let Some(dir) = std::env::var_os("RUZU_DUMP_PRESENT_PPM_DIR") {
         let dir = std::path::PathBuf::from(dir);
         if let Err(err) = std::fs::create_dir_all(&dir) {
-            log::warn!(
-                "[PRESENT_PPM] failed to create {}: {}",
-                dir.display(),
-                err
-            );
+            log::warn!("[PRESENT_PPM] failed to create {}: {}", dir.display(), err);
             return None;
         }
         dir.join("present.ppm").into_os_string()

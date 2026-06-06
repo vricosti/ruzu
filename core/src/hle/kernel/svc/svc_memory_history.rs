@@ -140,7 +140,13 @@ pub fn record_heap(system: &System, size: u64, result: u32, out_address: u64) {
     });
 }
 
-pub fn record_physical(system: &System, kind: MemoryHistoryKind, addr: u64, size: u64, result: u32) {
+pub fn record_physical(
+    system: &System,
+    kind: MemoryHistoryKind,
+    addr: u64,
+    size: u64,
+    result: u32,
+) {
     let Some(target) = target() else {
         return;
     };

@@ -19,7 +19,8 @@ use ruzu_core::core::SystemRef;
 use ruzu_core::gpu_core::{
     BlendMode as CoreBlendMode, BufferTransformFlags as CoreBufferTransformFlags,
     FramebufferConfig as CoreFramebufferConfig, GpuChannelHandle, GpuCommandList, GpuCoreInterface,
-    GpuMemoryManagerHandle, RectI as CoreRectI,
+    GpuMemoryManagerHandle, RasterizerDownloadArea as CoreRasterizerDownloadArea,
+    RectI as CoreRectI,
 };
 use ruzu_core::hle::service::nvdrv::nvdata::NvFence;
 
@@ -719,16 +720,40 @@ impl Gpu {
     }
 
     /// Notify rasterizer about a CPU read.
-    pub fn on_cpu_read(&self, addr: DAddr, _size: u64) -> RasterizerDownloadArea {
-        // NOTE: Full implementation calls rasterizer->GetFlushArea, then
-        // RequestSyncOperation to flush the area, then WaitForSyncOperation.
-        // Return a preemptive area covering the address.
-        log::warn!("Gpu::on_cpu_read: rasterizer not integrated, returning empty area");
-        RasterizerDownloadArea {
-            start_address: addr,
-            end_address: addr,
-            preemtive: true,
+    pub fn on_cpu_read(&self, addr: DAddr, size: u64) -> RasterizerDownloadArea {
+        let Some(rasterizer) = self.rasterizer_handle() else {
+            log::warn!("Gpu::on_cpu_read: no rasterizer bound, returning empty area");
+            return RasterizerDownloadArea {
+                start_address: addr,
+                end_address: addr,
+                preemtive: true,
+            };
+        };
+
+        let flush_area = unsafe { rasterizer.as_mut() }.get_flush_area(addr, size);
+        let mut raster_area = RasterizerDownloadArea {
+            start_address: flush_area.start_address,
+            end_address: flush_area.end_address,
+            preemtive: flush_area.preemptive,
+        };
+        if raster_area.preemtive {
+            return raster_area;
         }
+
+        raster_area.preemtive = true;
+        let start_address = raster_area.start_address;
+        let end_address = raster_area.end_address;
+        let gpu_addr = self as *const Gpu as usize;
+        let fence = self.request_sync_operation(Box::new(move || {
+            let gpu = unsafe { &*(gpu_addr as *const Gpu) };
+            if let Some(rasterizer) = gpu.rasterizer_handle() {
+                unsafe { rasterizer.as_mut() }
+                    .flush_region(start_address, end_address - start_address);
+            }
+        }));
+        self.gpu_thread.lock().unwrap().tick_gpu();
+        self.wait_for_sync_operation(fence);
+        raster_area
     }
 
     /// Flush a region.
@@ -1089,8 +1114,25 @@ impl GpuCoreInterface for Gpu {
         Gpu::on_cpu_write(self, addr, size)
     }
 
+    fn on_cpu_read(&self, addr: u64, size: u64) -> CoreRasterizerDownloadArea {
+        let area = Gpu::on_cpu_read(self, addr, size);
+        CoreRasterizerDownloadArea {
+            start_address: area.start_address,
+            end_address: area.end_address,
+            preemptive: area.preemtive,
+        }
+    }
+
     fn flush_region(&self, addr: u64, size: u64) {
         Gpu::flush_region(self, addr, size);
+    }
+
+    fn invalidate_region(&self, addr: u64, size: u64) {
+        Gpu::invalidate_region(self, addr, size);
+    }
+
+    fn get_applet_capture_buffer(&self) -> Vec<u8> {
+        Gpu::get_applet_capture_buffer(self)
     }
 }
 

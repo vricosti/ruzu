@@ -167,7 +167,7 @@ impl Default for State {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct EffectInfoBase {
     pub(crate) type_: EffectType,
     pub(crate) enabled: bool,
@@ -185,6 +185,7 @@ pub struct EffectInfoBase {
     pub(crate) send_buffer: CpuAddr,
     pub(crate) return_buffer_info: CpuAddr,
     pub(crate) return_buffer: CpuAddr,
+    owns_raw_state: bool,
 }
 
 impl Default for EffectInfoBase {
@@ -206,14 +207,56 @@ impl Default for EffectInfoBase {
             send_buffer: 0,
             return_buffer_info: 0,
             return_buffer: 0,
+            owns_raw_state: true,
         };
         out.cleanup();
         out
     }
 }
 
+impl Clone for EffectInfoBase {
+    fn clone(&self) -> Self {
+        Self {
+            type_: self.type_,
+            enabled: self.enabled,
+            mix_id: self.mix_id,
+            process_order: self.process_order,
+            buffer_unmapped: self.buffer_unmapped,
+            usage_state: self.usage_state,
+            out_status: self.out_status,
+            parameter_state: self.parameter_state,
+            parameter: self.parameter,
+            state: self.state,
+            state_address: self.state_address,
+            workbuffers: self.workbuffers,
+            send_buffer_info: self.send_buffer_info,
+            send_buffer: self.send_buffer,
+            return_buffer_info: self.return_buffer_info,
+            return_buffer: self.return_buffer,
+            owns_raw_state: false,
+        }
+    }
+}
+
 impl EffectInfoBase {
+    fn drop_owned_raw_state(&mut self) {
+        if !self.owns_raw_state {
+            return;
+        }
+        if self.type_ == EffectType::Delay {
+            crate::renderer::command::effect::delay::drop_delay_state_if_initialized(
+                self.state.buffer.as_ptr() as CpuAddr,
+            );
+            if self.state_address != self.state.buffer.as_ptr() as CpuAddr {
+                crate::renderer::command::effect::delay::drop_delay_state_if_initialized(
+                    self.state_address,
+                );
+            }
+        }
+    }
+
     pub fn cleanup(&mut self) {
+        self.drop_owned_raw_state();
         self.type_ = EffectType::Invalid;
         self.enabled = false;
         self.mix_id = UNUSED_MIX_ID;
@@ -586,5 +629,11 @@ impl EffectInfoBase {
             }
         }
         0
+    }
+}
+
+impl Drop for EffectInfoBase {
+    fn drop(&mut self) {
+        self.drop_owned_raw_state();
     }
 }

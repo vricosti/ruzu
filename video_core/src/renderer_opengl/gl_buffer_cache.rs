@@ -249,9 +249,9 @@ impl BufferCacheRuntime {
         };
 
         Self {
-            has_fast_buffer_sub_data: false,
-            use_assembly_shaders: false,
-            has_unified_vertex_buffers: false,
+            has_fast_buffer_sub_data: device.has_fast_buffer_sub_data(),
+            use_assembly_shaders: device.use_assembly_shaders(),
+            has_unified_vertex_buffers: device.has_vertex_buffer_unified_memory(),
             use_storage_buffers: false,
             max_attributes: max_attributes as u32,
             graphics_base_uniform_bindings: [0; NUM_STAGES],

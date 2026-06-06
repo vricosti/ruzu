@@ -128,15 +128,19 @@ pub fn get_thread_name(thread: &KThread) -> Option<String> {
     // then reads version and name pointer from the thread type struct.
     if is_64bit {
         let thread_type_addr = mem.read_64(tls_addr + 0x1F8);
+        let argument_thread_type = real.get_argument() as u64;
+        if argument_thread_type != 0 && thread_type_addr != argument_thread_type {
+            return None;
+        }
         if thread_type_addr == 0 {
             return None;
         }
-        // nnsdk ThreadType at offset 0x1A0: version (u16), then at offset 0x188: name_pointer
-        let version = mem.read_16(thread_type_addr + 0x1A0);
-        if version == 0 {
-            return None;
-        }
-        let name_pointer = mem.read_64(thread_type_addr + 0x188);
+        let version = mem.read_16(thread_type_addr + 0x46);
+        let name_pointer = if version == 1 {
+            mem.read_64(thread_type_addr + 0x1A0)
+        } else {
+            mem.read_64(thread_type_addr + 0x1A8)
+        };
         if name_pointer == 0 {
             return None;
         }
@@ -152,14 +156,19 @@ pub fn get_thread_name(thread: &KThread) -> Option<String> {
         Some(String::from_utf8_lossy(&name).to_string())
     } else {
         let thread_type_addr = mem.read_32(tls_addr + 0x1FC) as u64;
+        let argument_thread_type = real.get_argument() as u64;
+        if argument_thread_type != 0 && thread_type_addr != argument_thread_type {
+            return None;
+        }
         if thread_type_addr == 0 {
             return None;
         }
-        let version = mem.read_16(thread_type_addr + 0xF4);
-        if version == 0 {
-            return None;
-        }
-        let name_pointer = mem.read_32(thread_type_addr + 0xE4) as u64;
+        let version = mem.read_16(thread_type_addr + 0x26);
+        let name_pointer = if version == 1 {
+            mem.read_32(thread_type_addr + 0xE4) as u64
+        } else {
+            mem.read_32(thread_type_addr + 0xE8) as u64
+        };
         if name_pointer == 0 {
             return None;
         }

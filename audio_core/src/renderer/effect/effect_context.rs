@@ -15,7 +15,9 @@ impl EffectContext {
     }
 
     pub fn initialize(&mut self, effect_count: u32, dsp_state_count: usize) {
-        self.effect_infos = vec![EffectInfoBase::default(); effect_count as usize];
+        self.effect_infos = (0..effect_count)
+            .map(|_| EffectInfoBase::default())
+            .collect();
         self.effect_count = effect_count;
         self.result_states_cpu = vec![EffectResultState::default(); dsp_state_count];
         self.result_states_dsp = vec![EffectResultState::default(); dsp_state_count];
@@ -37,10 +39,8 @@ impl EffectContext {
     pub fn update_info_for_command_generation(&mut self, index: usize) -> Option<EffectInfoBase> {
         let source = self.effect_infos.get_mut(index)?;
         source.refresh_runtime_addresses();
-        let mut effect = source.clone();
-        effect.update_for_command_generation();
-        self.effect_infos[index] = effect.clone();
-        Some(effect)
+        source.update_for_command_generation();
+        Some(source.clone())
     }
 
     pub fn get_result_state(&self, index: u32) -> Option<&EffectResultState> {

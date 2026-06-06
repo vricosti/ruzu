@@ -850,73 +850,79 @@ impl Vic {
         self.output_surface
             .resize((output_width * output_height) as usize, Pixel::default());
 
-        for index in 0..config.slot_structs.len() {
-            let slot_config = config.slot_structs[index];
-            if !slot_config.config.slot_enable() {
-                continue;
-            }
+        if *common::settings::values().nvdec_emulation.get_value()
+            == common::settings_enums::NvdecEmulation::Off
+        {
+            self.output_surface.fill(Pixel::default());
+        } else {
+            for index in 0..config.slot_structs.len() {
+                let slot_config = config.slot_structs[index];
+                if !slot_config.config.slot_enable() {
+                    continue;
+                }
 
-            let luma_offset = self.surface_luma_address(index, SurfaceIndex::Current);
-            if self.nvdec_id == -1 {
-                self.nvdec_id = self.frame_queue.vic_find_nvdec_fd_from_offset(luma_offset);
-            }
+                let luma_offset = self.surface_luma_address(index, SurfaceIndex::Current);
+                if self.nvdec_id == -1 {
+                    self.nvdec_id = self.frame_queue.vic_find_nvdec_fd_from_offset(luma_offset);
+                }
 
-            let frame_start = trace_video.then(Instant::now);
-            let Some(frame) = self.frame_queue.get_frame(self.nvdec_id, luma_offset) else {
-                log::error!(
-                    "Vic {} failed to get frame with offset 0x{:X}",
-                    self.id,
-                    luma_offset
-                );
-                continue;
-            };
-            if let Some(frame_start) = frame_start {
-                emit_vic_timing(
-                    self.id,
-                    2,
-                    frame_start.elapsed().as_micros() as u64,
-                    index as u64,
-                    self.nvdec_id as u64,
-                    luma_offset,
-                );
-            }
+                let frame_start = trace_video.then(Instant::now);
+                let Some(frame) = self.frame_queue.get_frame(self.nvdec_id, luma_offset) else {
+                    log::error!(
+                        "Vic {} failed to get frame with offset 0x{:X}",
+                        self.id,
+                        luma_offset
+                    );
+                    continue;
+                };
+                if let Some(frame_start) = frame_start {
+                    emit_vic_timing(
+                        self.id,
+                        2,
+                        frame_start.elapsed().as_micros() as u64,
+                        index as u64,
+                        self.nvdec_id as u64,
+                        luma_offset,
+                    );
+                }
 
-            let read_start = trace_video.then(Instant::now);
-            match frame.get_pixel_format() {
-                AV_PIX_FMT_YUV420P => self.read_y8_v8u8_n420::<true>(&slot_config, &frame),
-                AV_PIX_FMT_NV12 => self.read_y8_v8u8_n420::<false>(&slot_config, &frame),
-                format => {
-                    log::warn!(
+                let read_start = trace_video.then(Instant::now);
+                match frame.get_pixel_format() {
+                    AV_PIX_FMT_YUV420P => self.read_y8_v8u8_n420::<true>(&slot_config, &frame),
+                    AV_PIX_FMT_NV12 => self.read_y8_v8u8_n420::<false>(&slot_config, &frame),
+                    format => {
+                        log::warn!(
                         "Vic {} unimplemented FFmpeg frame pixel format {} for slot format {:?}",
                         self.id,
                         format,
                         slot_config.surface_config.slot_pixel_format()
                     );
-                    continue;
+                        continue;
+                    }
                 }
-            }
-            if let Some(read_start) = read_start {
-                emit_vic_timing(
-                    self.id,
-                    3,
-                    read_start.elapsed().as_micros() as u64,
-                    index as u64,
-                    frame.get_pixel_format() as u64,
-                    self.slot_surface.len() as u64,
-                );
-            }
+                if let Some(read_start) = read_start {
+                    emit_vic_timing(
+                        self.id,
+                        3,
+                        read_start.elapsed().as_micros() as u64,
+                        index as u64,
+                        frame.get_pixel_format() as u64,
+                        self.slot_surface.len() as u64,
+                    );
+                }
 
-            let blend_start = trace_video.then(Instant::now);
-            self.blend(&config, &slot_config);
-            if let Some(blend_start) = blend_start {
-                emit_vic_timing(
-                    self.id,
-                    4,
-                    blend_start.elapsed().as_micros() as u64,
-                    index as u64,
-                    self.output_surface.len() as u64,
-                    u64::from(slot_config.color_matrix.matrix_enable()),
-                );
+                let blend_start = trace_video.then(Instant::now);
+                self.blend(&config, &slot_config);
+                if let Some(blend_start) = blend_start {
+                    emit_vic_timing(
+                        self.id,
+                        4,
+                        blend_start.elapsed().as_micros() as u64,
+                        index as u64,
+                        self.output_surface.len() as u64,
+                        u64::from(slot_config.color_matrix.matrix_enable()),
+                    );
+                }
             }
         }
 
@@ -1554,6 +1560,7 @@ fn swizzle_surface(output: &mut [u8], out_stride: u32, input: &[u8], in_stride: 
 impl Drop for Vic {
     fn drop(&mut self) {
         info!("Destroying VIC {}", self.id);
+        self.frame_queue.close(self.id);
     }
 }
 

@@ -2545,42 +2545,42 @@ impl Opcode {
             Opcode::ImageSampleImplicitLod => OpcodeMeta {
                 name: "ImageSampleImplicitLod",
                 return_type: F32x4,
-                arg_types: &[Opaque, Opaque],
+                arg_types: &[Opaque, Opaque, F32, Opaque],
             },
             Opcode::ImageSampleExplicitLod => OpcodeMeta {
                 name: "ImageSampleExplicitLod",
                 return_type: F32x4,
-                arg_types: &[Opaque, Opaque, F32],
+                arg_types: &[Opaque, Opaque, F32, Opaque],
             },
             Opcode::ImageSampleDrefImplicitLod => OpcodeMeta {
                 name: "ImageSampleDrefImplicitLod",
                 return_type: F32,
-                arg_types: &[Opaque, Opaque, F32],
+                arg_types: &[Opaque, Opaque, F32, F32, Opaque],
             },
             Opcode::ImageSampleDrefExplicitLod => OpcodeMeta {
                 name: "ImageSampleDrefExplicitLod",
                 return_type: F32,
-                arg_types: &[Opaque, Opaque, F32, F32],
+                arg_types: &[Opaque, Opaque, F32, F32, Opaque],
             },
             Opcode::ImageFetch => OpcodeMeta {
                 name: "ImageFetch",
                 return_type: F32x4,
-                arg_types: &[Opaque, Opaque, U32],
+                arg_types: &[Opaque, Opaque, Opaque, U32, U32],
             },
             Opcode::ImageQueryDimensions => OpcodeMeta {
                 name: "ImageQueryDimensions",
                 return_type: U32x4,
-                arg_types: &[Opaque, U32],
+                arg_types: &[Opaque, U32, U1],
             },
             Opcode::ImageGather => OpcodeMeta {
                 name: "ImageGather",
                 return_type: F32x4,
-                arg_types: &[Opaque, Opaque],
+                arg_types: &[Opaque, Opaque, Opaque, Opaque],
             },
             Opcode::ImageGatherDref => OpcodeMeta {
                 name: "ImageGatherDref",
                 return_type: F32x4,
-                arg_types: &[Opaque, Opaque, F32],
+                arg_types: &[Opaque, Opaque, Opaque, Opaque, F32],
             },
             Opcode::ImageQueryLod => OpcodeMeta {
                 name: "ImageQueryLod",
@@ -2590,54 +2590,54 @@ impl Opcode {
             Opcode::ImageGradient => OpcodeMeta {
                 name: "ImageGradient",
                 return_type: F32x4,
-                arg_types: &[Opaque, Opaque, Opaque, Opaque],
+                arg_types: &[Opaque, Opaque, Opaque, Opaque, F32],
             },
             Opcode::BoundImageSampleImplicitLod | Opcode::BindlessImageSampleImplicitLod => {
                 OpcodeMeta {
                     name: self.texture_pass_opcode_name(),
                     return_type: F32x4,
-                    arg_types: &[Opaque, Opaque],
+                    arg_types: &[Opaque, Opaque, F32, Opaque],
                 }
             }
             Opcode::BoundImageSampleExplicitLod | Opcode::BindlessImageSampleExplicitLod => {
                 OpcodeMeta {
                     name: self.texture_pass_opcode_name(),
                     return_type: F32x4,
-                    arg_types: &[Opaque, Opaque, F32],
+                    arg_types: &[Opaque, Opaque, F32, Opaque],
                 }
             }
             Opcode::BoundImageSampleDrefImplicitLod
             | Opcode::BindlessImageSampleDrefImplicitLod => OpcodeMeta {
                 name: self.texture_pass_opcode_name(),
                 return_type: F32,
-                arg_types: &[Opaque, Opaque, F32],
+                arg_types: &[Opaque, Opaque, F32, F32, Opaque],
             },
             Opcode::BoundImageSampleDrefExplicitLod
             | Opcode::BindlessImageSampleDrefExplicitLod => OpcodeMeta {
                 name: self.texture_pass_opcode_name(),
                 return_type: F32,
-                arg_types: &[Opaque, Opaque, F32, F32],
+                arg_types: &[Opaque, Opaque, F32, F32, Opaque],
             },
             Opcode::BoundImageGather | Opcode::BindlessImageGather => OpcodeMeta {
                 name: self.texture_pass_opcode_name(),
                 return_type: F32x4,
-                arg_types: &[Opaque, Opaque],
+                arg_types: &[Opaque, Opaque, Opaque, Opaque],
             },
             Opcode::BoundImageGatherDref | Opcode::BindlessImageGatherDref => OpcodeMeta {
                 name: self.texture_pass_opcode_name(),
                 return_type: F32x4,
-                arg_types: &[Opaque, Opaque, F32],
+                arg_types: &[Opaque, Opaque, Opaque, Opaque, F32],
             },
             Opcode::BoundImageFetch | Opcode::BindlessImageFetch => OpcodeMeta {
                 name: self.texture_pass_opcode_name(),
                 return_type: F32x4,
-                arg_types: &[Opaque, Opaque, U32],
+                arg_types: &[Opaque, Opaque, Opaque, U32, U32],
             },
             Opcode::BoundImageQueryDimensions | Opcode::BindlessImageQueryDimensions => {
                 OpcodeMeta {
                     name: self.texture_pass_opcode_name(),
                     return_type: U32x4,
-                    arg_types: &[Opaque, U32],
+                    arg_types: &[Opaque, U32, U1],
                 }
             }
             Opcode::BoundImageQueryLod | Opcode::BindlessImageQueryLod => OpcodeMeta {
@@ -2648,7 +2648,7 @@ impl Opcode {
             Opcode::BoundImageGradient | Opcode::BindlessImageGradient => OpcodeMeta {
                 name: self.texture_pass_opcode_name(),
                 return_type: F32x4,
-                arg_types: &[Opaque, Opaque, Opaque, Opaque],
+                arg_types: &[Opaque, Opaque, Opaque, Opaque, F32],
             },
 
             // Image load/store

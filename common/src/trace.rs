@@ -278,6 +278,10 @@ pub mod cat {
     /// [stage, frame, framebuffer_count, current_frame, draw_count, width,
     ///  height, gl_error]
     pub const PRESENT_COMPOSITE: u16 = 49;
+    /// nvmap allocation attribution. args =
+    /// [seq, kind, fd, handle, size, address, flags, align, heap_mask]
+    /// kind: 1=IocCreate, 2=IocAlloc.
+    pub const NVMAP_ALLOC: u16 = 50;
 }
 
 fn service_registry() -> &'static Mutex<Vec<String>> {
@@ -468,6 +472,7 @@ pub struct Config {
     pub gl_draw_profile_trace: bool,
     pub gl_pipeline_trace: bool,
     pub present_composite_trace: bool,
+    pub nvmap_alloc_trace: bool,
     pub present_alias_trace: bool,
     pub present_image_select_trace: bool,
     pub rt_depth_attach_trace: bool,
@@ -530,6 +535,7 @@ impl Default for Config {
             gl_draw_profile_trace: false,
             gl_pipeline_trace: false,
             present_composite_trace: false,
+            nvmap_alloc_trace: false,
             present_alias_trace: false,
             present_image_select_trace: false,
             rt_depth_attach_trace: false,
@@ -586,6 +592,7 @@ impl Config {
             || self.gl_draw_profile_trace
             || self.gl_pipeline_trace
             || self.present_composite_trace
+            || self.nvmap_alloc_trace
             || self.present_alias_trace
             || self.present_image_select_trace
             || self.rt_depth_attach_trace
@@ -763,6 +770,7 @@ fn build_config() -> Config {
             "RUZU_TRACE_PRESENT_COMPOSITE",
             false,
         ),
+        nvmap_alloc_trace: get_bool("nvdrv", "nvmap_alloc", "RUZU_TRACE_NVMAP_ALLOC", false),
         present_alias_trace: get_bool(
             "opengl",
             "present_alias",
@@ -869,6 +877,7 @@ pub fn is_enabled(category: u16) -> bool {
         cat::GL_DRAW_PROFILE => c.gl_draw_profile_trace,
         cat::GL_PIPELINE => c.gl_pipeline_trace,
         cat::PRESENT_COMPOSITE => c.present_composite_trace,
+        cat::NVMAP_ALLOC => c.nvmap_alloc_trace,
         cat::PRESENT_ALIAS => c.present_alias_trace,
         cat::PRESENT_IMAGE_SELECT => c.present_image_select_trace,
         cat::RT_DEPTH_ATTACH => c.rt_depth_attach_trace,
@@ -2234,6 +2243,26 @@ fn format_into(out: &mut String, rec: &LogRecord) {
                 rec.args[5],
                 rec.args[6],
                 rec.args[7],
+            );
+        }
+        cat::NVMAP_ALLOC => {
+            let kind = match rec.args[1] {
+                1 => "IocCreate",
+                2 => "IocAlloc",
+                _ => "unknown",
+            };
+            let _ = writeln!(
+                out,
+                "[NVMAP_ALLOC] seq={} kind={} fd={} handle=0x{:X} size=0x{:X} addr=0x{:X} flags=0x{:X} align=0x{:X} heap_mask=0x{:X}",
+                rec.args[0],
+                kind,
+                rec.args[2],
+                rec.args[3],
+                rec.args[4],
+                rec.args[5],
+                rec.args[6],
+                rec.args[7],
+                rec.args[8],
             );
         }
         cat::PRESENT_IMAGE_SELECT => {

@@ -81,16 +81,9 @@ impl crate::hle::service::hle_ipc::SessionRequestHandler for GenericStubService 
             let stub_obj: std::sync::Arc<dyn crate::hle::service::hle_ipc::SessionRequestHandler> =
                 std::sync::Arc::new(GenericStubService::new(&sub_name));
 
-            if is_domain {
-                let mut rb = crate::hle::service::ipc_helpers::ResponseBuilder::new(ctx, 2, 0, 1);
-                rb.push_result(crate::hle::result::RESULT_SUCCESS);
-                ctx.add_domain_object(stub_obj);
-            } else {
-                let move_handle = ctx.create_session_for_service(stub_obj).unwrap_or(0);
-                let mut rb = crate::hle::service::ipc_helpers::ResponseBuilder::new(ctx, 2, 0, 1);
-                rb.push_result(crate::hle::result::RESULT_SUCCESS);
-                rb.push_move_objects(move_handle);
-            }
+            let mut rb = crate::hle::service::ipc_helpers::ResponseBuilder::new(ctx, 2, 0, 1);
+            rb.push_result(crate::hle::result::RESULT_SUCCESS);
+            rb.push_ipc_interface(stub_obj);
         } else {
             let mut rb = crate::hle::service::ipc_helpers::ResponseBuilder::new(ctx, 2, 0, 0);
             rb.push_result(crate::hle::result::RESULT_SUCCESS);
@@ -401,7 +394,7 @@ impl Services {
         });
         let sm = service_manager.clone();
         guest_service!("pctl", move || {
-            crate::hle::service::pctl::pctl::loop_process(&sm, system);
+            crate::hle::service::pctl::pctl::loop_process(system);
         });
         let sm = service_manager.clone();
         guest_service!("pcv", move || {

@@ -7,10 +7,17 @@
 use common::fs::path_util::{get_ruzu_path, RuzuPath};
 use common::uuid::UUID;
 
-use crate::hle::result::{ResultCode, RESULT_SUCCESS};
+use crate::hle::result::{ErrorModule, ResultCode, RESULT_SUCCESS};
 
 pub const MAX_USERS: usize = 8;
 pub const PROFILE_USERNAME_SIZE: usize = 32;
+
+const ERROR_TOO_MANY_USERS: ResultCode =
+    ResultCode::from_module_description(ErrorModule::Account, u32::MAX);
+const ERROR_USER_ALREADY_EXISTS: ResultCode =
+    ResultCode::from_module_description(ErrorModule::Account, u32::MAX - 1);
+const ERROR_ARGUMENT_IS_NULL: ResultCode =
+    ResultCode::from_module_description(ErrorModule::Account, 20);
 
 pub type ProfileUsername = [u8; PROFILE_USERNAME_SIZE];
 pub type UserIdArray = [u128; MAX_USERS];
@@ -163,27 +170,28 @@ impl ProfileManager {
     }
 
     pub fn add_user(&mut self, user: &ProfileInfo) -> ResultCode {
-        if self.user_count >= MAX_USERS {
-            return super::errors::RESULT_INVALID_ARRAY_LENGTH;
-        }
         if self.add_to_profiles(user).is_none() {
-            return super::errors::RESULT_ACCOUNT_UPDATE_FAILED;
+            return ERROR_TOO_MANY_USERS;
         }
         RESULT_SUCCESS
     }
 
     pub fn create_new_user(&mut self, uuid: u128, username: &ProfileUsername) -> ResultCode {
         if self.user_count == MAX_USERS {
-            return super::errors::RESULT_INVALID_ARRAY_LENGTH;
+            return ERROR_TOO_MANY_USERS;
         }
         if uuid == 0 {
-            return super::errors::RESULT_INVALID_USER_ID;
+            return ERROR_ARGUMENT_IS_NULL;
         }
         if username[0] == 0 {
-            return super::errors::RESULT_INVALID_USER_ID;
+            return ERROR_ARGUMENT_IS_NULL;
         }
-        if self.profiles.iter().any(|profile| profile.user_uuid == uuid) {
-            return super::errors::RESULT_ACCOUNT_UPDATE_FAILED;
+        if self
+            .profiles
+            .iter()
+            .any(|profile| profile.user_uuid == uuid)
+        {
+            return ERROR_USER_ALREADY_EXISTS;
         }
         self.is_save_needed = true;
         let info = ProfileInfo {
@@ -489,7 +497,10 @@ impl ProfileManager {
 
 #[cfg(test)]
 mod tests {
-    use super::{ProfileBase, ProfileManager, MAX_USERS, PROFILE_USERNAME_SIZE};
+    use super::{
+        ProfileBase, ProfileManager, ERROR_ARGUMENT_IS_NULL, ERROR_TOO_MANY_USERS,
+        ERROR_USER_ALREADY_EXISTS, MAX_USERS, PROFILE_USERNAME_SIZE,
+    };
     use common::fs::path_util::{set_ruzu_path, RuzuPath};
     use common::uuid::UUID;
 
@@ -543,12 +554,36 @@ mod tests {
         let mut manager = ProfileManager::new();
         let before_count = manager.get_user_count();
         let empty_name = [0u8; PROFILE_USERNAME_SIZE];
-        let result = manager.create_new_user(0x1234, &empty_name);
+        let mut valid_name = [0u8; PROFILE_USERNAME_SIZE];
+        valid_name[..4].copy_from_slice(b"test");
 
-        assert_eq!(result, super::super::errors::RESULT_INVALID_USER_ID);
+        assert_eq!(
+            manager.create_new_user(0, &valid_name),
+            ERROR_ARGUMENT_IS_NULL
+        );
+        assert_eq!(
+            manager.create_new_user(0x1234, &empty_name),
+            ERROR_ARGUMENT_IS_NULL
+        );
         assert_eq!(manager.get_user_count(), before_count);
+
+        let existing_user = manager.get_user(0).unwrap();
+        assert_eq!(
+            manager.create_new_user(existing_user, &valid_name),
+            ERROR_USER_ALREADY_EXISTS
+        );
+
+        for index in before_count..MAX_USERS {
+            let uuid = 0x2000 + index as u128;
+            let mut name = [0u8; PROFILE_USERNAME_SIZE];
+            name[..4].copy_from_slice(b"fill");
+            assert!(manager.create_new_user(uuid, &name).is_success());
+        }
+        assert_eq!(
+            manager.create_new_user(0x3000, &valid_name),
+            ERROR_TOO_MANY_USERS
+        );
         assert!(manager.get_user(MAX_USERS).is_none());
-        assert!(manager.get_user(before_count).is_some());
     }
 
     #[test]

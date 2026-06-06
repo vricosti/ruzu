@@ -8,7 +8,7 @@
 
 use crate::host1x::codecs::decoder::{DecoderImpl, DecoderState};
 use crate::host1x::codecs::vp9_types::{
-    PictureInfo, Segmentation, Vp9EntropyProbs, Vp9FrameContainer, Vp9PictureInfo,
+    PictureInfo, Segmentation, Vp9EntropyProbs, Vp9FrameContainer, Vp9PictureInfo, Vp9SurfaceIndex,
 };
 use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
 use crate::host1x::nvdec_common::{NvdecRegisters, VideoCodec};
@@ -297,20 +297,19 @@ impl DecoderImpl for Vp9 {
         Vec::new()
     }
 
-    fn get_progressive_offsets(&self, _regs: &NvdecRegisters) -> (u64, u64) {
-        // Upstream reads surface_luma_offsets[Current].Address() and
-        // surface_chroma_offsets[Current].Address() from NvdecRegisters.
-        // Stubbed until NvdecRegisters are wired into the decoder.
-        log::warn!("VP9::get_progressive_offsets: not yet implemented (requires NvdecRegisters)");
-        (0, 0)
+    fn get_progressive_offsets(&self, regs: &NvdecRegisters) -> (u64, u64) {
+        let current = Vp9SurfaceIndex::Current as usize;
+        (
+            regs.surface_luma_offset(current).address(),
+            regs.surface_chroma_offset(current).address(),
+        )
     }
 
-    fn get_interlaced_offsets(&self, _regs: &NvdecRegisters) -> (u64, u64, u64, u64) {
-        // Upstream returns (luma_top, luma_bottom, chroma_top, chroma_bottom) all from
-        // surface_luma_offsets[Current] / surface_chroma_offsets[Current].
-        // Stubbed until NvdecRegisters are wired into the decoder.
-        log::warn!("VP9::get_interlaced_offsets: not yet implemented (requires NvdecRegisters)");
-        (0, 0, 0, 0)
+    fn get_interlaced_offsets(&self, regs: &NvdecRegisters) -> (u64, u64, u64, u64) {
+        let current = Vp9SurfaceIndex::Current as usize;
+        let luma = regs.surface_luma_offset(current).address();
+        let chroma = regs.surface_chroma_offset(current).address();
+        (luma, luma, chroma, chroma)
     }
 
     fn is_interlaced(&self) -> bool {

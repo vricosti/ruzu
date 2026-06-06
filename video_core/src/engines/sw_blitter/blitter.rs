@@ -11,6 +11,7 @@ use super::converter::ConverterFactory;
 use crate::engines::fermi_2d::{Config, Filter, MemoryLayout, Surface};
 use crate::gpu::RenderTargetFormat;
 use crate::memory_manager::MemoryManager;
+use crate::surface;
 use crate::textures::decoders;
 use parking_lot::Mutex;
 use std::sync::Arc;
@@ -202,66 +203,6 @@ impl SoftwareBlitEngine {
         }
     }
 
-    fn bytes_per_pixel_from_render_target_format(format: RenderTargetFormat) -> u32 {
-        match format {
-            RenderTargetFormat::R32G32B32A32Float
-            | RenderTargetFormat::R32G32B32A32Sint
-            | RenderTargetFormat::R32G32B32A32Uint
-            | RenderTargetFormat::R32G32B32X32Float
-            | RenderTargetFormat::R32G32B32X32Sint
-            | RenderTargetFormat::R32G32B32X32Uint => 16,
-            RenderTargetFormat::R16G16B16A16Unorm
-            | RenderTargetFormat::R16G16B16A16Snorm
-            | RenderTargetFormat::R16G16B16A16Sint
-            | RenderTargetFormat::R16G16B16A16Uint
-            | RenderTargetFormat::R16G16B16A16Float
-            | RenderTargetFormat::R32G32Float
-            | RenderTargetFormat::R32G32Sint
-            | RenderTargetFormat::R32G32Uint
-            | RenderTargetFormat::R16G16B16X16Float => 8,
-            RenderTargetFormat::A8R8G8B8Unorm
-            | RenderTargetFormat::A8R8G8B8Srgb
-            | RenderTargetFormat::A2B10G10R10Unorm
-            | RenderTargetFormat::A2B10G10R10Uint
-            | RenderTargetFormat::A8B8G8R8Unorm
-            | RenderTargetFormat::A8B8G8R8Srgb
-            | RenderTargetFormat::A8B8G8R8Snorm
-            | RenderTargetFormat::A8B8G8R8Sint
-            | RenderTargetFormat::A8B8G8R8Uint
-            | RenderTargetFormat::R16G16Unorm
-            | RenderTargetFormat::R16G16Snorm
-            | RenderTargetFormat::R16G16Sint
-            | RenderTargetFormat::R16G16Uint
-            | RenderTargetFormat::R16G16Float
-            | RenderTargetFormat::A2R10G10B10Unorm
-            | RenderTargetFormat::B10G11R11Float
-            | RenderTargetFormat::R32Sint
-            | RenderTargetFormat::R32Uint
-            | RenderTargetFormat::R32Float
-            | RenderTargetFormat::X8R8G8B8Unorm
-            | RenderTargetFormat::X8R8G8B8Srgb
-            | RenderTargetFormat::X1R5G5B5Unorm
-            | RenderTargetFormat::X8B8G8R8Unorm
-            | RenderTargetFormat::X8B8G8R8Srgb => 4,
-            RenderTargetFormat::R5G6B5Unorm
-            | RenderTargetFormat::A1R5G5B5Unorm
-            | RenderTargetFormat::R8G8Unorm
-            | RenderTargetFormat::R8G8Snorm
-            | RenderTargetFormat::R8G8Sint
-            | RenderTargetFormat::R8G8Uint
-            | RenderTargetFormat::R16Unorm
-            | RenderTargetFormat::R16Snorm
-            | RenderTargetFormat::R16Sint
-            | RenderTargetFormat::R16Uint
-            | RenderTargetFormat::R16Float => 2,
-            RenderTargetFormat::R8Unorm
-            | RenderTargetFormat::R8Snorm
-            | RenderTargetFormat::R8Sint
-            | RenderTargetFormat::R8Uint => 1,
-            RenderTargetFormat::None => 0,
-        }
-    }
-
     fn get_surface_size(surface: &Surface, bytes_per_pixel: u32) -> usize {
         if surface.linear == MemoryLayout::BlockLinear {
             decoders::calculate_size(
@@ -321,8 +262,20 @@ impl SoftwareBlitEngine {
             return false;
         };
 
-        let src_bytes_per_pixel = Self::bytes_per_pixel_from_render_target_format(src.format);
-        let dst_bytes_per_pixel = Self::bytes_per_pixel_from_render_target_format(dst.format);
+        let src_bytes_per_pixel = if src.format == RenderTargetFormat::None {
+            0
+        } else {
+            surface::bytes_per_block(surface::pixel_format_from_render_target_format(
+                src.format as u32,
+            ))
+        };
+        let dst_bytes_per_pixel = if dst.format == RenderTargetFormat::None {
+            0
+        } else {
+            surface::bytes_per_block(surface::pixel_format_from_render_target_format(
+                dst.format as u32,
+            ))
+        };
         if src_bytes_per_pixel == 0 || dst_bytes_per_pixel == 0 {
             return false;
         }

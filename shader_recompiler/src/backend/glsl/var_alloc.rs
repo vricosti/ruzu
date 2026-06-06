@@ -540,7 +540,7 @@ fn undefined_immediate(opcode: ir::opcodes::Opcode) -> Option<&'static str> {
         ir::opcodes::Opcode::UndefU8
         | ir::opcodes::Opcode::UndefU16
         | ir::opcodes::Opcode::UndefU32 => Some("0u"),
-        ir::opcodes::Opcode::UndefU64 => Some("0ul"),
+        ir::opcodes::Opcode::UndefU64 => Some("0u"),
         _ => None,
     }
 }

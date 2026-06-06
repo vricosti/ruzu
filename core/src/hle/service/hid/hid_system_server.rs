@@ -414,16 +414,6 @@ impl IHidSystemServer {
         rb.push_u64(0);
     }
 
-    /// Upstream: nullptr (cmd 314)
-    fn get_applet_footer_ui_type_handler(
-        _this: &dyn ServiceFramework,
-        ctx: &mut HLERequestContext,
-    ) {
-        log::debug!("(STUBBED) GetAppletFooterUiType called");
-        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
-        rb.push_result(RESULT_SUCCESS);
-    }
-
     /// Upstream: IHidSystemServer::GetAppletDetailedUiType (cmd 315)
     fn get_applet_detailed_ui_type_handler(
         this: &dyn ServiceFramework,
@@ -575,53 +565,6 @@ impl IHidSystemServer {
 
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(result);
-    }
-
-    /// Upstream: nullptr (cmd 323)
-    fn get_last_active_unique_pad_handler(
-        _this: &dyn ServiceFramework,
-        ctx: &mut HLERequestContext,
-    ) {
-        log::debug!("(STUBBED) GetLastActiveUniquePad called");
-        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
-        rb.push_result(RESULT_SUCCESS);
-    }
-
-    /// Upstream: nullptr (cmd 324)
-    fn get_unique_pad_button_set_handler(
-        _this: &dyn ServiceFramework,
-        ctx: &mut HLERequestContext,
-    ) {
-        log::debug!("(STUBBED) GetUniquePadButtonSet called");
-        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
-        rb.push_result(RESULT_SUCCESS);
-    }
-
-    /// Upstream: nullptr (cmd 325)
-    fn get_unique_pad_color_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
-        log::debug!("(STUBBED) GetUniquePadColor called");
-        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
-        rb.push_result(RESULT_SUCCESS);
-    }
-
-    /// Upstream: nullptr (cmd 326)
-    fn get_unique_pad_applet_detailed_ui_type_handler(
-        _this: &dyn ServiceFramework,
-        ctx: &mut HLERequestContext,
-    ) {
-        log::debug!("(STUBBED) GetUniquePadAppletDetailedUiType called");
-        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
-        rb.push_result(RESULT_SUCCESS);
-    }
-
-    /// Upstream: nullptr (cmd 327)
-    fn get_abstracted_pad_id_data_from_npad_handler(
-        _this: &dyn ServiceFramework,
-        ctx: &mut HLERequestContext,
-    ) {
-        log::debug!("(STUBBED) GetAbstractedPadIdDataFromNpad called");
-        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
-        rb.push_result(RESULT_SUCCESS);
     }
 
     /// Upstream: nullptr (cmd 328)
@@ -991,46 +934,6 @@ impl IHidSystemServer {
         rb.push_bool(is_attached);
     }
 
-    /// Upstream: nullptr (cmd 540)
-    fn acquire_play_report_controller_usage_update_event_handler(
-        _this: &dyn ServiceFramework,
-        ctx: &mut HLERequestContext,
-    ) {
-        log::debug!("(STUBBED) AcquirePlayReportControllerUsageUpdateEvent called");
-        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
-        rb.push_result(RESULT_SUCCESS);
-    }
-
-    /// Upstream: nullptr (cmd 541)
-    fn get_play_report_controller_usages_handler(
-        _this: &dyn ServiceFramework,
-        ctx: &mut HLERequestContext,
-    ) {
-        log::debug!("(STUBBED) GetPlayReportControllerUsages called");
-        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
-        rb.push_result(RESULT_SUCCESS);
-    }
-
-    /// Upstream: nullptr (cmd 542)
-    fn acquire_play_report_registered_device_update_event_handler(
-        _this: &dyn ServiceFramework,
-        ctx: &mut HLERequestContext,
-    ) {
-        log::debug!("(STUBBED) AcquirePlayReportRegisteredDeviceUpdateEvent called");
-        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
-        rb.push_result(RESULT_SUCCESS);
-    }
-
-    /// Upstream: nullptr (cmd 543)
-    fn get_registered_devices_old_handler(
-        _this: &dyn ServiceFramework,
-        ctx: &mut HLERequestContext,
-    ) {
-        log::debug!("(STUBBED) GetRegisteredDevicesOld called");
-        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
-        rb.push_result(RESULT_SUCCESS);
-    }
-
     /// Upstream: IHidSystemServer::AcquireConnectionTriggerTimeoutEvent (cmd 544)
     fn acquire_connection_trigger_timeout_event_handler(
         this: &dyn ServiceFramework,
@@ -1048,13 +951,6 @@ impl IHidSystemServer {
         rb.push_copy_objects(handle);
     }
 
-    /// Upstream: nullptr (cmd 545)
-    fn send_connection_trigger_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
-        log::debug!("(STUBBED) SendConnectionTrigger called");
-        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
-        rb.push_result(RESULT_SUCCESS);
-    }
-
     /// Upstream: IHidSystemServer::AcquireDeviceRegisteredEventForControllerSupport (cmd 546)
     fn acquire_device_registered_event_for_controller_support_handler(
         this: &dyn ServiceFramework,
@@ -1070,16 +966,6 @@ impl IHidSystemServer {
         let mut rb = ResponseBuilder::new(ctx, 2, 1, 0);
         rb.push_result(RESULT_SUCCESS);
         rb.push_copy_objects(handle);
-    }
-
-    /// Upstream: nullptr (cmd 547)
-    fn get_allowed_bluetooth_links_count_handler(
-        _this: &dyn ServiceFramework,
-        ctx: &mut HLERequestContext,
-    ) {
-        log::debug!("(STUBBED) GetAllowedBluetoothLinksCount called");
-        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
-        rb.push_result(RESULT_SUCCESS);
     }
 
     /// Upstream: IHidSystemServer::GetRegisteredDevices (cmd 548)
@@ -2513,11 +2399,7 @@ impl IHidSystemServer {
                 Some(Self::get_npad_capture_button_assignment_handler),
                 "GetNpadCaptureButtonAssignment",
             ),
-            (
-                314,
-                Some(Self::get_applet_footer_ui_type_handler),
-                "GetAppletFooterUiType",
-            ),
+            (314, None, "GetAppletFooterUiType"),
             (
                 315,
                 Some(Self::get_applet_detailed_ui_type_handler),
@@ -2549,31 +2431,11 @@ impl IHidSystemServer {
                 Some(Self::set_npad_system_ext_state_enabled_handler),
                 "SetNpadSystemExtStateEnabled",
             ),
-            (
-                323,
-                Some(Self::get_last_active_unique_pad_handler),
-                "GetLastActiveUniquePad",
-            ),
-            (
-                324,
-                Some(Self::get_unique_pad_button_set_handler),
-                "GetUniquePadButtonSet",
-            ),
-            (
-                325,
-                Some(Self::get_unique_pad_color_handler),
-                "GetUniquePadColor",
-            ),
-            (
-                326,
-                Some(Self::get_unique_pad_applet_detailed_ui_type_handler),
-                "GetUniquePadAppletDetailedUiType",
-            ),
-            (
-                327,
-                Some(Self::get_abstracted_pad_id_data_from_npad_handler),
-                "GetAbstractedPadIdDataFromNpad",
-            ),
+            (323, None, "GetLastActiveUniquePad"),
+            (324, None, "GetUniquePadButtonSet"),
+            (325, None, "GetUniquePadColor"),
+            (326, None, "GetUniquePadAppletDetailedUiType"),
+            (327, None, "GetAbstractedPadIdDataFromNpad"),
             (
                 328,
                 Some(Self::attach_abstracted_pad_to_npad_handler),
@@ -2680,46 +2542,22 @@ impl IHidSystemServer {
                 Some(Self::is_joy_con_attached_on_all_rail_handler),
                 "IsJoyConAttachedOnAllRail",
             ),
-            (
-                540,
-                Some(Self::acquire_play_report_controller_usage_update_event_handler),
-                "AcquirePlayReportControllerUsageUpdateEvent",
-            ),
-            (
-                541,
-                Some(Self::get_play_report_controller_usages_handler),
-                "GetPlayReportControllerUsages",
-            ),
-            (
-                542,
-                Some(Self::acquire_play_report_registered_device_update_event_handler),
-                "AcquirePlayReportRegisteredDeviceUpdateEvent",
-            ),
-            (
-                543,
-                Some(Self::get_registered_devices_old_handler),
-                "GetRegisteredDevicesOld",
-            ),
+            (540, None, "AcquirePlayReportControllerUsageUpdateEvent"),
+            (541, None, "GetPlayReportControllerUsages"),
+            (542, None, "AcquirePlayReportRegisteredDeviceUpdateEvent"),
+            (543, None, "GetRegisteredDevicesOld"),
             (
                 544,
                 Some(Self::acquire_connection_trigger_timeout_event_handler),
                 "AcquireConnectionTriggerTimeoutEvent",
             ),
-            (
-                545,
-                Some(Self::send_connection_trigger_handler),
-                "SendConnectionTrigger",
-            ),
+            (545, None, "SendConnectionTrigger"),
             (
                 546,
                 Some(Self::acquire_device_registered_event_for_controller_support_handler),
                 "AcquireDeviceRegisteredEventForControllerSupport",
             ),
-            (
-                547,
-                Some(Self::get_allowed_bluetooth_links_count_handler),
-                "GetAllowedBluetoothLinksCount",
-            ),
+            (547, None, "GetAllowedBluetoothLinksCount"),
             (
                 548,
                 Some(Self::get_registered_devices_handler),

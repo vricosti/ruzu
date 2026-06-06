@@ -7,8 +7,6 @@
 //! uses the `stb_dxt` library for the actual block compression; this port
 //! provides the same interface and dispatching logic.
 
-use super::workers;
-
 // ── Types ────────────────────────────────────────────────────────────────────
 
 /// Type alias for a BCN block compressor function.
@@ -17,6 +15,11 @@ use super::workers;
 ///
 /// Parameters: `(block_output, block_input, any_alpha)`
 type BcnCompressor = fn(block_output: &mut [u8], block_input: &[u8], any_alpha: bool);
+
+extern "C" {
+    fn ruzu_stb_compress_bc1_block(dest: *mut u8, src: *const u8, alpha: i32);
+    fn ruzu_stb_compress_bc3_block(dest: *mut u8, src: *const u8);
+}
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
@@ -107,24 +110,19 @@ fn compress_bcn<const BYTES_PER_BLOCK: u32, const THRESHOLD_ALPHA: bool>(
 /// Compress RGBA8 data into BC1 format.
 ///
 /// Port of `Tegra::Texture::BCN::CompressBC1`.
-///
-/// NOTE: Full implementation uses stb_compress_bc1_block from the stb_dxt library.
-/// Without that library, each output block is zeroed (invalid BC1 block).
 pub fn compress_bc1(data: &[u8], width: u32, height: u32, depth: u32, output: &mut [u8]) {
-    log::warn!("compress_bc1: stb_dxt not available, outputting zeroed BC1 blocks");
     compress_bcn::<8, true>(
         data,
         width,
         height,
         depth,
         output,
-        |block_output, _block_input, _any_alpha| {
-            // Zero-fill the 8-byte BC1 block. This produces a valid-but-wrong block
-            // (both endpoints = 0, all texels map to endpoint 0 = black).
-            // Full implementation: stb_compress_bc1_block(block_output, block_input, any_alpha, STB_DXT_NORMAL)
-            for b in block_output.iter_mut() {
-                *b = 0;
-            }
+        |block_output, block_input, any_alpha| unsafe {
+            ruzu_stb_compress_bc1_block(
+                block_output.as_mut_ptr(),
+                block_input.as_ptr(),
+                any_alpha as i32,
+            );
         },
     );
 }
@@ -132,23 +130,15 @@ pub fn compress_bc1(data: &[u8], width: u32, height: u32, depth: u32, output: &m
 /// Compress RGBA8 data into BC3 format.
 ///
 /// Port of `Tegra::Texture::BCN::CompressBC3`.
-///
-/// NOTE: Full implementation uses stb_compress_bc3_block from the stb_dxt library.
-/// Without that library, each output block is zeroed (invalid BC3 block).
 pub fn compress_bc3(data: &[u8], width: u32, height: u32, depth: u32, output: &mut [u8]) {
-    log::warn!("compress_bc3: stb_dxt not available, outputting zeroed BC3 blocks");
     compress_bcn::<16, false>(
         data,
         width,
         height,
         depth,
         output,
-        |block_output, _block_input, _any_alpha| {
-            // Zero-fill the 16-byte BC3 block.
-            // Full implementation: stb_compress_bc3_block(block_output, block_input, STB_DXT_NORMAL)
-            for b in block_output.iter_mut() {
-                *b = 0;
-            }
+        |block_output, block_input, _any_alpha| unsafe {
+            ruzu_stb_compress_bc3_block(block_output.as_mut_ptr(), block_input.as_ptr());
         },
     );
 }
@@ -165,5 +155,27 @@ mod tests {
         assert_eq!(divide_up(7, 4), 2);
         assert_eq!(divide_up(8, 4), 2);
         assert_eq!(divide_up(9, 4), 3);
+    }
+
+    #[test]
+    fn bc1_uses_stb_dxt_output() {
+        let mut rgba = vec![0u8; 4 * 4 * 4];
+        for pixel in rgba.chunks_exact_mut(4) {
+            pixel.copy_from_slice(&[255, 0, 0, 255]);
+        }
+        let mut output = [0u8; 8];
+        compress_bc1(&rgba, 4, 4, 1, &mut output);
+        assert_ne!(output, [0u8; 8]);
+    }
+
+    #[test]
+    fn bc3_uses_stb_dxt_output() {
+        let mut rgba = vec![0u8; 4 * 4 * 4];
+        for (index, pixel) in rgba.chunks_exact_mut(4).enumerate() {
+            pixel.copy_from_slice(&[0, 255, 0, (index * 17) as u8]);
+        }
+        let mut output = [0u8; 16];
+        compress_bc3(&rgba, 4, 4, 1, &mut output);
+        assert_ne!(output, [0u8; 16]);
     }
 }

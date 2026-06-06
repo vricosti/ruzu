@@ -704,9 +704,9 @@ impl KMemoryBlock {
         }
     }
 
-    // Device merge state helpers (private in upstream, pub here for flexibility)
+    // Device merge state helpers.
 
-    fn update_device_disable_merge_state_for_share(
+    pub(crate) fn update_device_disable_merge_state_for_share(
         &mut self,
         new_perm: KMemoryPermission,
         left: bool,
@@ -716,7 +716,7 @@ impl KMemoryBlock {
         self.update_device_disable_merge_state_for_share_right(new_perm, left, right);
     }
 
-    fn update_device_disable_merge_state_for_share_left(
+    pub(crate) fn update_device_disable_merge_state_for_share_left(
         &mut self,
         _new_perm: KMemoryPermission,
         left: bool,
@@ -729,7 +729,7 @@ impl KMemoryBlock {
         }
     }
 
-    fn update_device_disable_merge_state_for_share_right(
+    pub(crate) fn update_device_disable_merge_state_for_share_right(
         &mut self,
         _new_perm: KMemoryPermission,
         _left: bool,
@@ -742,7 +742,7 @@ impl KMemoryBlock {
         }
     }
 
-    fn update_device_disable_merge_state_for_unshare(
+    pub(crate) fn update_device_disable_merge_state_for_unshare(
         &mut self,
         new_perm: KMemoryPermission,
         left: bool,
@@ -752,7 +752,7 @@ impl KMemoryBlock {
         self.update_device_disable_merge_state_for_unshare_right(new_perm, left, right);
     }
 
-    fn update_device_disable_merge_state_for_unshare_left(
+    pub(crate) fn update_device_disable_merge_state_for_unshare_left(
         &mut self,
         _new_perm: KMemoryPermission,
         left: bool,
@@ -772,7 +772,7 @@ impl KMemoryBlock {
         }
     }
 
-    fn update_device_disable_merge_state_for_unshare_right(
+    pub(crate) fn update_device_disable_merge_state_for_unshare_right(
         &mut self,
         _new_perm: KMemoryPermission,
         _left: bool,

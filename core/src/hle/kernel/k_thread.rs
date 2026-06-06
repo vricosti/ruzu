@@ -9,7 +9,6 @@
 use bitflags::bitflags;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU16, AtomicU8, Ordering};
 use std::sync::{Arc, Condvar, Mutex, Weak};
-use std::time::{Duration, Instant};
 
 use super::k_process::KProcess;
 use super::k_scheduler::KScheduler;
@@ -49,26 +48,6 @@ use common::tree::RBEntry;
 // serialization is the scheduler spin-lock's job. Mirrors step 5a's
 // ProcessLock swap: `pub type ProcessLock = SyncCell<KProcess>`.
 pub type KThreadLock = super::sync_cell::KThreadCell;
-
-pub(crate) fn deadline_from_timeout_tick(
-    timeout_tick: i64,
-    current_tick: Option<i64>,
-) -> Option<Instant> {
-    if timeout_tick <= 0 {
-        return None;
-    }
-
-    let relative_ns = match current_tick {
-        Some(now_tick) => timeout_tick.saturating_sub(now_tick).max(0) as u64,
-        None => u64::try_from(timeout_tick).unwrap_or(u64::MAX),
-    };
-
-    Some(
-        Instant::now()
-            .checked_add(Duration::from_nanos(relative_ns))
-            .unwrap_or_else(|| Instant::now() + Duration::from_secs(365 * 24 * 60 * 60)),
-    )
-}
 
 fn should_trace_wait_debug() -> bool {
     std::env::var_os("RUZU_TRACE_WAIT_SYNC").is_some()
@@ -593,18 +572,12 @@ pub struct KThread {
     pub dummy_thread_runnable: AtomicBool,
     pub dummy_thread_mutex: Mutex<()>,
     pub dummy_thread_cv: Condvar,
-    /// Host-thread parking mechanism for kernel wait operations.
-    /// When begin_wait is called, the host thread parks on this condvar.
-    /// When end_wait/cancel_wait is called, the condvar is notified.
-    pub wait_park_mutex: Mutex<bool>,
-    pub wait_park_cv: Condvar,
 
     // Debugging fields
     pub wait_reason_for_debugging: ThreadWaitReasonForDebugging,
     pub argument: usize,
     pub stack_top: KProcessAddress,
     pub native_execution_parameters: NativeExecutionParameters,
-    pub sleep_deadline: Option<Instant>,
     /// Upstream: KTimerTask::m_time — absolute time in nanoseconds for
     /// the hardware timer. Set by KHardwareTimer::RegisterAbsoluteTask,
     /// cleared to 0 when the task fires or is cancelled.
@@ -719,13 +692,10 @@ impl KThread {
             dummy_thread_runnable: AtomicBool::new(true),
             dummy_thread_mutex: Mutex::new(()),
             dummy_thread_cv: Condvar::new(),
-            wait_park_mutex: Mutex::new(false),
-            wait_park_cv: Condvar::new(),
             wait_reason_for_debugging: ThreadWaitReasonForDebugging::default(),
             argument: 0,
             stack_top: KProcessAddress::default(),
             native_execution_parameters: NativeExecutionParameters::default(),
-            sleep_deadline: None,
             timer_task_time: 0,
             sync_wait_context: SynchronizationWaitContext::new(),
             sync_object: SynchronizationObjectState::new(),
@@ -894,7 +864,6 @@ impl KThread {
         self.last_scheduled_tick = 0;
         self.num_kernel_waiters = 0;
         self.resource_limit_release_hint = false;
-        self.sleep_deadline = None;
         self.sync_wait_context.clear();
         self.stack_parameters = stack_parameters;
         self.initialized = true;
@@ -1595,10 +1564,6 @@ impl KThread {
         &mut self.native_execution_parameters
     }
 
-    pub fn get_sleep_deadline(&self) -> Option<Instant> {
-        self.sleep_deadline
-    }
-
     pub fn is_waiting_on_synchronization(&self) -> bool {
         self.sync_wait_context.is_active()
     }
@@ -1622,7 +1587,6 @@ impl KThread {
         };
         self.clear_cancellable();
         wait_queue.base_end_wait(self, result);
-        self.sleep_deadline = None;
         self.waiting_lock_info = None;
         self.apply_wait_result_to_context();
     }
@@ -1752,7 +1716,6 @@ impl KThread {
         self.wait_result = RESULT_NO_SYNCHRONIZATION_OBJECT.get_inner_value();
         self.schedule_count = -1;
         self.initialized = true;
-        self.sleep_deadline = None;
         self.sync_wait_context.clear();
         self.stack_parameters.disable_count = 1;
         self.stack_parameters.is_in_exception_handler = true;
@@ -1997,7 +1960,6 @@ impl KThread {
         self.last_scheduled_tick = 0;
         self.num_kernel_waiters = 0;
         self.resource_limit_release_hint = false;
-        self.sleep_deadline = None;
         self.sync_wait_context.clear();
         self.stack_top = KProcessAddress::new(stack_top);
         self.argument = arg as usize;
@@ -2250,64 +2212,6 @@ impl KThread {
         }
     }
 
-    /// Run the thread.
-    /// Matches upstream `KThread::Run()`.
-    pub fn run(&mut self) -> u32 {
-        loop {
-            let _lk = if self.scheduler_lock_ptr != 0 {
-                Some(KScopedSchedulerLock::new(unsafe {
-                    &*(self.scheduler_lock_ptr
-                        as *const super::k_scheduler_lock::KAbstractSchedulerLock)
-                }))
-            } else {
-                None
-            };
-
-            if self.termination_requested.load(Ordering::Relaxed) {
-                return RESULT_TERMINATION_REQUESTED.get_inner_value();
-            }
-
-            let current_termination_requested =
-                super::kernel::with_current_thread_fast_mut(|t| t.is_termination_requested())
-                    .unwrap_or(false);
-            if current_termination_requested {
-                return RESULT_TERMINATION_REQUESTED.get_inner_value();
-            }
-
-            if self.get_state() != ThreadState::INITIALIZED {
-                return RESULT_INVALID_STATE.get_inner_value();
-            }
-
-            let current_suspended =
-                super::kernel::with_current_thread_fast_mut(|t| t.is_suspended()).unwrap_or(false);
-            if current_suspended {
-                super::kernel::with_current_thread_fast_mut(|t| t.update_state());
-                continue;
-            }
-
-            if self.is_user_thread() && self.is_suspended() {
-                self.update_state();
-            }
-
-            // Upstream increments the owning process running-thread count here.
-            // Rust still cannot do this literally in all call sites because
-            // KProcess::run() invokes thread.run() while holding the process mutex.
-            // The main-thread bootstrap owner compensates in KProcess::run().
-            if let Some(parent) = self.parent.as_ref().and_then(Weak::upgrade) {
-                if let Ok(process) = parent.try_lock() {
-                    process.increment_running_thread_count();
-                }
-            }
-
-            // Upstream calls Open() here. Rust KThread still lacks literal
-            // KAutoObject inheritance, so there is no equivalent owner-local
-            // refcount operation to invoke yet.
-
-            self.set_state(ThreadState::RUNNABLE);
-            return RESULT_SUCCESS.get_inner_value();
-        }
-    }
-
     /// Arc-backed entry used by runtime owners that must not hold the thread
     /// mutex across scheduler-lock release.
     ///
@@ -2528,29 +2432,14 @@ impl KThread {
                 .self_reference
                 .as_ref()
                 .and_then(Weak::upgrade)
-                .or_else(|| {
-                    self.parent
-                        .as_ref()
-                        .and_then(Weak::upgrade)
-                        .and_then(|parent| {
-                            parent
-                                .lock()
-                                .unwrap()
-                                .get_thread_by_object_id(self.object_id)
-                        })
-                });
-
-            if let Some(worker_thread) = worker_thread {
-                KWorkerTaskManager::add_task_static(
-                    0,
-                    WorkerType::Exit,
-                    Box::new(move || {
-                        worker_thread.lock().unwrap().do_worker_task_impl();
-                    }),
-                );
-            } else {
-                self.finish_termination();
-            }
+                .expect("KThread::exit requires a registered thread object");
+            KWorkerTaskManager::add_task_static(
+                0,
+                WorkerType::Exit,
+                Box::new(move || {
+                    worker_thread.lock().unwrap().do_worker_task_impl();
+                }),
+            );
         }
 
         // Upstream: UNREACHABLE_MSG("KThread::Exit() would return").
@@ -3063,7 +2952,6 @@ impl KThread {
     }
 
     fn finalize_wait_transition(&mut self) {
-        self.sleep_deadline = None;
         self.waiting_lock_info = None;
         self.set_wait_reason_for_debugging(ThreadWaitReasonForDebugging::None);
         self.apply_wait_result_to_context();
@@ -3210,8 +3098,6 @@ impl KThread {
             self.get_disable_dispatch_count()
         );
         self.wait_result = RESULT_SUCCESS.get_inner_value();
-        let current_tick = super::kernel::get_current_hardware_tick();
-        self.sleep_deadline = deadline_from_timeout_tick(timeout, current_tick);
         let hardware_timer = super::kernel::get_hardware_timer_arc();
         let mut wait_queue = KThreadQueueWithoutEndWait::new();
         let Some(scheduler_lock) = super::kernel::scheduler_lock() else {
@@ -3246,11 +3132,10 @@ impl KThread {
             self.set_wait_reason_for_debugging(ThreadWaitReasonForDebugging::Sleep);
             if should_trace_wait_debug() {
                 log::info!(
-                    "KThread::sleep tid={} timeout_tick={} current_tick={:?} deadline={:?}",
+                    "KThread::sleep tid={} timeout_tick={} current_tick={:?}",
                     self.thread_id,
                     timeout,
-                    current_tick,
-                    self.sleep_deadline
+                    super::kernel::get_current_hardware_tick()
                 );
             }
             log::trace!("KThread::sleep tid={} wait armed", self.thread_id);
@@ -3264,6 +3149,23 @@ impl KThread {
     /// Matches upstream `KThread::GetCoreMask()`.
     pub fn get_core_mask(&self) -> (i32, u64) {
         (self.virtual_ideal_core_id, self.virtual_affinity_mask)
+    }
+
+    /// Get physical core mask.
+    /// Matches upstream `KThread::GetPhysicalCoreMask()`.
+    pub fn get_physical_core_mask(&self) -> (i32, u64) {
+        debug_assert!(self.num_core_migration_disables >= 0);
+        if self.num_core_migration_disables == 0 {
+            (
+                self.physical_ideal_core_id,
+                self.physical_affinity_mask.get_affinity_mask(),
+            )
+        } else {
+            (
+                self.original_physical_ideal_core_id,
+                self.original_physical_affinity_mask.get_affinity_mask(),
+            )
+        }
     }
 
     /// Set core mask.
@@ -3435,12 +3337,11 @@ impl KThread {
     pub fn on_timer(&mut self) {
         if should_trace_wait_debug() {
             log::info!(
-                "KThread::on_timer tid={} state={:?} wait_queue={} wait_reason={:?} sleep_deadline={:?} wait_result=0x{:x}",
+                "KThread::on_timer tid={} state={:?} wait_queue={} wait_reason={:?} wait_result=0x{:x}",
                 self.thread_id,
                 self.get_state(),
                 self.wait_queue.is_some(),
                 self.get_wait_reason_for_debugging(),
-                self.sleep_deadline,
                 self.wait_result
             );
         }
@@ -3471,7 +3372,6 @@ impl KThread {
                 wait_queue.cancel_wait(self, RESULT_TIMED_OUT.get_inner_value(), false);
                 // Upstream leaves timeout completion to CancelWait(); keep only
                 // the Rust-local cleanup that has no direct C++ field owner.
-                self.sleep_deadline = None;
                 self.waiting_lock_info = None;
                 self.apply_wait_result_to_context();
                 if ct_trace {
@@ -3842,7 +3742,6 @@ mod tests {
 
         assert_eq!(thread.sleep(1), RESULT_SUCCESS.get_inner_value());
         assert_eq!(thread.get_state(), ThreadState::WAITING);
-        assert!(thread.get_sleep_deadline().is_some());
         thread.waiting_lock_info = Some(WaitingLockRef {
             owner_thread_id: 99,
             address_key: KProcessAddress::new(0x1234),
@@ -3853,30 +3752,8 @@ mod tests {
         thread.on_timer();
 
         assert_eq!(thread.get_state(), ThreadState::RUNNABLE);
-        assert!(thread.get_sleep_deadline().is_none());
         assert!(thread.waiting_lock_info.is_none());
         assert_eq!(thread.get_wait_result(), RESULT_TIMED_OUT.get_inner_value());
-    }
-
-    #[test]
-    fn test_run_marks_thread_runnable_and_increments_parent_running_count() {
-        let process = Arc::new(ProcessLock::from_value(KProcess::new()));
-        let mut thread = KThread::new();
-        thread.parent = Some(Arc::downgrade(&process));
-        thread.thread_type = ThreadType::User;
-
-        let result = thread.run();
-
-        assert_eq!(result, RESULT_SUCCESS.get_inner_value());
-        assert_eq!(thread.get_state(), ThreadState::RUNNABLE);
-        assert_eq!(
-            process
-                .lock()
-                .unwrap()
-                .num_running_threads
-                .load(std::sync::atomic::Ordering::Relaxed),
-            1
-        );
     }
 
     #[test]
@@ -4226,6 +4103,23 @@ mod tests {
     }
 
     #[test]
+    fn test_get_physical_core_mask_selects_current_or_original_mask() {
+        let mut thread = KThread::new();
+        thread.physical_ideal_core_id = 1;
+        thread.physical_affinity_mask.set_affinity_mask(0x2);
+        thread.original_physical_ideal_core_id = 3;
+        thread
+            .original_physical_affinity_mask
+            .set_affinity_mask(0x8);
+
+        thread.num_core_migration_disables = 0;
+        assert_eq!(thread.get_physical_core_mask(), (1, 0x2));
+
+        thread.num_core_migration_disables = 1;
+        assert_eq!(thread.get_physical_core_mask(), (3, 0x8));
+    }
+
+    #[test]
     fn test_activity_change_requests_schedule_via_thread_scheduler() {
         let process = Arc::new(ProcessLock::from_value(KProcess::new()));
         let scheduler = Arc::new(Mutex::new(KScheduler::new(0)));
@@ -4245,16 +4139,6 @@ mod tests {
 
         assert_eq!(thread.set_activity(1), RESULT_SUCCESS.get_inner_value());
         assert!(scheduler.lock().unwrap().needs_scheduling());
-    }
-
-    #[test]
-    fn deadline_from_timeout_tick_uses_absolute_tick_when_available() {
-        let start = Instant::now();
-        let deadline = deadline_from_timeout_tick(150, Some(100)).unwrap();
-        let remaining = deadline.saturating_duration_since(start);
-
-        assert!(remaining <= Duration::from_micros(100));
-        assert!(remaining <= Duration::from_nanos(50_000));
     }
 
     #[test]

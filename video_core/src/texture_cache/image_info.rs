@@ -268,10 +268,10 @@ impl ImageInfo {
             tiling: TilingMode::default(),
             layer_stride: 0,
             maybe_unaligned_layer_stride: 0,
-            // Ruzu's draw-state snapshot does not carry the AA mode yet.
-            // Preserve the current single-sample behavior until the
-            // Maxwell3D MSAA register is threaded through this call.
-            num_samples: if msaa_mode == 0 { 1 } else { 1 },
+            num_samples: super::samples_helper::num_samples(
+                super::samples_helper::MsaaMode::from_raw(msaa_mode)
+                    .unwrap_or(super::samples_helper::MsaaMode::Msaa1x1),
+            ) as u32,
             tile_width_spacing: 0,
             rescaleable: false,
             downscaleable: false,
@@ -309,15 +309,6 @@ impl ImageInfo {
         info
     }
 
-    /// Compatibility stub for older Rust call sites. New render-target paths
-    /// should use `from_render_target_info`.
-    pub fn from_render_target_config(_ct: &(), _msaa_mode: u32) -> Self {
-        log::warn!(
-            "ImageInfo::from_render_target_config: Maxwell3D regs not yet ported — returning default"
-        );
-        Self::default()
-    }
-
     /// Construct from depth/stencil config.
     ///
     /// Port of `ImageInfo::ImageInfo(const Zeta&, const ZetaSize&, MsaaMode)`.
@@ -340,7 +331,10 @@ impl ImageInfo {
             tiling: TilingMode::default(),
             layer_stride: config.array_pitch.saturating_mul(4),
             maybe_unaligned_layer_stride: config.array_pitch.saturating_mul(4),
-            num_samples: if msaa_mode == 0 { 1 } else { 1 },
+            num_samples: super::samples_helper::num_samples(
+                super::samples_helper::MsaaMode::from_raw(msaa_mode)
+                    .unwrap_or(super::samples_helper::MsaaMode::Msaa1x1),
+            ) as u32,
             tile_width_spacing: 0,
             rescaleable: false,
             downscaleable: false,
@@ -469,7 +463,7 @@ pub fn byte_size_to_format(bytes_per_pixel: u32) -> PixelFormat {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engines::maxwell_3d::RenderTargetInfo;
+    use crate::engines::maxwell_3d::{RenderTargetInfo, ZetaInfo};
     use crate::surface::PixelFormat as SurfacePixelFormat;
     use crate::textures::texture::{ComponentType, TextureFormat, TextureType, TicEntry};
 
@@ -522,6 +516,36 @@ mod tests {
         assert_eq!(info.size.height, 16);
         assert!(info.forced_flushed);
         assert!(info.dma_downloaded);
+    }
+
+    #[test]
+    fn render_target_and_zeta_info_use_msaa_mode() {
+        let render_target = RenderTargetInfo {
+            address: 0x5000_0000,
+            width: 1280,
+            height: 720,
+            format: 0xD5,
+            tile_mode: 2 | (1 << 4),
+            depth: 1,
+            array_pitch: 0x200,
+            base_layer: 0,
+        };
+        let zeta = ZetaInfo {
+            enabled: true,
+            address: 0x6000_0000,
+            format: 0xA,
+            tile_mode: 2 | (1 << 4),
+            array_pitch: 0x200,
+            width: 1280,
+            height: 720,
+            depth: 1,
+        };
+
+        assert_eq!(
+            ImageInfo::from_render_target_info(&render_target, 3).num_samples,
+            8
+        );
+        assert_eq!(ImageInfo::from_zeta_info(&zeta, 3).num_samples, 8);
     }
 
     #[test]

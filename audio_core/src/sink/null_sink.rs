@@ -16,6 +16,7 @@ pub struct NullSink {
     system_volume: f32,
     device_channels: u32,
     system_channels: u32,
+    discard_stream_buffers: bool,
 }
 
 impl NullSink {
@@ -26,7 +27,15 @@ impl NullSink {
             system_volume: 1.0,
             device_channels: 2,
             system_channels: 2,
+            discard_stream_buffers: true,
         }
+    }
+
+    #[cfg(test)]
+    pub fn new_recording_for_test(device_id: &str) -> Self {
+        let mut sink = Self::new(device_id);
+        sink.discard_stream_buffers = false;
+        sink
     }
 }
 
@@ -61,7 +70,7 @@ impl Sink for NullSink {
         stream.name = name.to_string();
         stream.set_device_volume(self.device_volume);
         stream.set_system_volume(self.system_volume);
-        stream.set_discard_buffers(true);
+        stream.set_discard_buffers(self.discard_stream_buffers);
         let handle = new_stream_handle(stream);
         self.streams.push(StreamEntry {
             name: name.to_string(),
@@ -118,5 +127,13 @@ mod tests {
         );
 
         assert_eq!(stream.lock().get_queue_size(), 0);
+    }
+
+    #[test]
+    fn null_sink_release_buffer_is_empty_like_upstream() {
+        let mut sink = NullSink::new("null");
+        let stream = sink.acquire_sink_stream(make_system(), 2, "null", StreamType::In);
+
+        assert!(stream.lock().release_buffer(240).is_empty());
     }
 }

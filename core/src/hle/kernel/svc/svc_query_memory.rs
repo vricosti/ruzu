@@ -79,15 +79,15 @@ pub fn query_process_memory(
     let process = process_arc.lock().unwrap();
 
     // Query the page table for memory info at the given address.
-    let mem_info = process
+    let (mem_info, page_info) = process
         .page_table
-        .query_info(address as usize)
-        .expect("KPageTableBase::query_info must synthesize the terminal inaccessible block");
+        .query_info_with_page_info(address as usize)
+        .expect("KPageTableBase::query_info_with_page_info must synthesize the terminal inaccessible block");
 
     let svc_mem_info = mem_info.get_svc_memory_info();
     super::svc_memory_history::record_query(system, address, &svc_mem_info);
 
-    *out_page_info = PageInfo::default();
+    *out_page_info = page_info;
 
     // RUZU_TRACE_QUERY_RET=N (or comma list, or "*"/"all") — log QueryMemory return values
     // for the matching tid(s). Used to compare against zuyu's equivalent trace and find

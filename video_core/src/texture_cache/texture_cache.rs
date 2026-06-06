@@ -355,9 +355,21 @@ impl TextureCacheBase {
         info: &super::image_info::ImageInfo,
         gpu_addr: GPUVAddr,
     ) -> Option<ImageId> {
-        let broken_views = false;
-        let native_bgr = false;
-        let options = RelaxedOptions::empty();
+        self.find_image_with_caps(info, gpu_addr, RelaxedOptions::empty(), false, false)
+    }
+
+    /// Same compatibility predicate as `find_image`, with backend runtime
+    /// flags supplied by the caller. Upstream `TextureCache<P>::FindImage`
+    /// derives these from `runtime.HasBrokenTextureViewFormats()` and
+    /// `runtime.HasNativeBgr()` before calling `IsSubresource`.
+    pub(crate) fn find_image_with_caps(
+        &self,
+        info: &super::image_info::ImageInfo,
+        gpu_addr: GPUVAddr,
+        options: RelaxedOptions,
+        broken_views: bool,
+        native_bgr: bool,
+    ) -> Option<ImageId> {
         self.slot_images
             .iter()
             .filter_map(|(id, image)| {
@@ -636,8 +648,17 @@ impl TextureCacheBase {
                 continue;
             };
 
-            let image_id = self.find_or_insert_render_target_image(&rt, cpu_addr);
-            self.find_render_target_view_from_image(image_id, &rt, rt.address);
+            let image_id = self.find_or_insert_render_target_image(
+                &rt,
+                render_targets.anti_alias_samples_mode,
+                cpu_addr,
+            );
+            self.find_render_target_view_from_image(
+                image_id,
+                &rt,
+                render_targets.anti_alias_samples_mode,
+                rt.address,
+            );
 
             if std::env::var_os("RUZU_TRACE_RT").is_some() {
                 let image = &self.slot_images[image_id];
@@ -659,7 +680,7 @@ impl TextureCacheBase {
         let zeta = render_targets.zeta;
         if zeta.enabled && zeta.address != 0 && zeta.width != 0 && zeta.height != 0 {
             if let Some(cpu_addr) = gpu_to_cpu(zeta.address) {
-                let info = ImageInfo::from_zeta_info(&zeta, 0);
+                let info = ImageInfo::from_zeta_info(&zeta, render_targets.anti_alias_samples_mode);
                 let image_id = self.find_or_insert_image_from_info(&info, zeta.address, cpu_addr);
                 self.find_image_view_from_image_info(image_id, &info, zeta.address);
             } else if std::env::var_os("RUZU_TRACE_RT").is_some() {
@@ -677,9 +698,10 @@ impl TextureCacheBase {
     fn find_or_insert_render_target_image(
         &mut self,
         rt: &RenderTargetInfo,
+        anti_alias_samples_mode: u32,
         cpu_addr: u64,
     ) -> ImageId {
-        let info = ImageInfo::from_render_target_info(rt, 0);
+        let info = ImageInfo::from_render_target_info(rt, anti_alias_samples_mode);
         self.find_or_insert_image_from_info(&info, rt.address, cpu_addr)
     }
 
@@ -717,9 +739,10 @@ impl TextureCacheBase {
         &mut self,
         image_id: ImageId,
         rt: &RenderTargetInfo,
+        anti_alias_samples_mode: u32,
         gpu_addr: GPUVAddr,
     ) -> ImageViewId {
-        let rt_info = ImageInfo::from_render_target_info(rt, 0);
+        let rt_info = ImageInfo::from_render_target_info(rt, anti_alias_samples_mode);
         self.find_image_view_from_image_info(image_id, &rt_info, gpu_addr)
     }
 
@@ -819,9 +842,52 @@ impl TextureCacheBase {
 
     /// Port of `TextureCache<P>::UnregisterImage`.
     ///
-    /// Removes the image from page tables and clears any image-view references.
-    pub fn unregister_image(&mut self, _image_id: ImageId) {
-        log::warn!("TextureCacheBase::unregister_image: backend types not yet available");
+    /// Removes the image from CPU page tables and clears registration state.
+    pub fn unregister_image(&mut self, image_id: ImageId) {
+        let image = &self.slot_images[image_id];
+        debug_assert!(
+            image.flags.contains(ImageFlagBits::REGISTERED),
+            "TextureCache::unregister_image: image not registered"
+        );
+        let is_sparse = image.flags.contains(ImageFlagBits::SPARSE);
+        let map_ids = if is_sparse {
+            self.sparse_views
+                .remove(&image_id)
+                .unwrap_or_default()
+                .into_iter()
+                .collect::<Vec<_>>()
+        } else {
+            let map_id = image.map_view_id;
+            if map_id.is_valid() {
+                vec![map_id]
+            } else {
+                Vec::new()
+            }
+        };
+
+        for map_id in &map_ids {
+            if !map_id.is_valid() {
+                continue;
+            }
+            let map = &self.slot_map_views[*map_id];
+            Self::for_each_cpu_page(map.cpu_addr, map.size, |page| {
+                if let Some(image_map_ids) = self.page_table.get_mut(&page) {
+                    image_map_ids.retain(|&id| id != *map_id);
+                    if image_map_ids.is_empty() {
+                        self.page_table.remove(&page);
+                    }
+                }
+            });
+        }
+        for map_id in map_ids {
+            if map_id.is_valid() {
+                self.slot_map_views.erase(map_id);
+            }
+        }
+
+        let image = &mut self.slot_images[image_id];
+        image.flags.remove(ImageFlagBits::REGISTERED);
+        image.flags.remove(ImageFlagBits::BAD_OVERLAP);
     }
 
     /// Port of `TextureCache<P>::TrackImage` (texture_cache.h:2113).
@@ -917,8 +983,75 @@ impl TextureCacheBase {
     /// `immediate_delete` corresponds to the upstream `bool immediate` parameter
     /// that determines whether the image is placed in the delayed-destruction
     /// ring or freed immediately.
-    pub fn delete_image(&mut self, _image_id: ImageId, _immediate_delete: bool) {
-        log::warn!("TextureCacheBase::delete_image: backend types not yet available");
+    pub fn delete_image(&mut self, image_id: ImageId, _immediate_delete: bool) {
+        let image_view_ids = self.slot_images[image_id].image_view_ids.clone();
+        let aliased_images = self.slot_images[image_id].aliased_images.clone();
+        let overlapping_images = self.slot_images[image_id].overlapping_images.clone();
+        let gpu_addr = self.slot_images[image_id].gpu_addr;
+
+        debug_assert!(
+            !self.slot_images[image_id]
+                .flags
+                .contains(ImageFlagBits::TRACKED),
+            "TextureCache::delete_image: image was not untracked"
+        );
+        debug_assert!(
+            !self.slot_images[image_id]
+                .flags
+                .contains(ImageFlagBits::REGISTERED),
+            "TextureCache::delete_image: image was not unregistered"
+        );
+
+        self.has_deleted_images = true;
+
+        for view_id in &image_view_ids {
+            for color_buffer_id in &mut self.render_targets.color_buffer_ids {
+                if *color_buffer_id == *view_id {
+                    *color_buffer_id = ImageViewId::default();
+                }
+            }
+            if self.render_targets.depth_buffer_id == *view_id {
+                self.render_targets.depth_buffer_id = ImageViewId::default();
+            }
+        }
+        self.framebuffers.clear();
+
+        for alias in aliased_images {
+            if alias.id == image_id {
+                continue;
+            }
+            let other_image = &mut self.slot_images[alias.id];
+            other_image
+                .aliased_images
+                .retain(|other_alias| other_alias.id != image_id);
+            other_image.check_alias_state();
+        }
+        for overlap_id in overlapping_images {
+            if overlap_id == image_id {
+                continue;
+            }
+            let other_image = &mut self.slot_images[overlap_id];
+            other_image
+                .overlapping_images
+                .retain(|&other_overlap_id| other_overlap_id != image_id);
+            other_image.check_bad_overlap_state();
+        }
+        for image_view_id in image_view_ids {
+            if image_view_id != NULL_IMAGE_VIEW_ID && image_view_id.is_valid() {
+                self.slot_image_views.erase(image_view_id);
+            }
+        }
+
+        self.slot_images.erase(image_id);
+
+        if let Some(alloc_id) = self.image_allocs_table.get(&gpu_addr).copied() {
+            let alloc_images = &mut self.slot_image_allocs[alloc_id].images;
+            alloc_images.retain(|&id| id != image_id);
+            if alloc_images.is_empty() {
+                self.slot_image_allocs.erase(alloc_id);
+                self.image_allocs_table.remove(&gpu_addr);
+            }
+        }
     }
 
     // ── Blit ───────────────────────────────────────────────────────────
@@ -1167,6 +1300,36 @@ mod tests {
         let image = &cache.slot_images[image_id];
         assert!(image.flags.contains(ImageFlagBits::CPU_MODIFIED));
         assert!(!image.flags.contains(ImageFlagBits::TRACKED));
+    }
+
+    #[test]
+    fn unmap_memory_unregisters_untracks_and_deletes_image() {
+        use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
+        use std::sync::Arc;
+
+        let mut cache = TextureCacheBase::new(Arc::new(MaxwellDeviceMemoryManager::default()));
+        let info = ImageInfo {
+            format: surface::PixelFormat::A8B8G8R8Unorm,
+            size: crate::texture_cache::types::Extent3D {
+                width: 16,
+                height: 16,
+                depth: 1,
+            },
+            ..ImageInfo::default()
+        };
+        let image_id = cache.insert_image(&info, 0x6000);
+        let map_id = cache.slot_images[image_id].map_view_id;
+        assert!(map_id.is_valid());
+        assert_eq!(cache.collect_images_in_region(0x6000, 4), vec![image_id]);
+
+        cache.track_image(image_id);
+        cache.unmap_memory(0x6000, 4);
+
+        assert_eq!(cache.collect_images_in_region(0x6000, 4), Vec::new());
+        assert_eq!(cache.slot_images.size(), 1);
+        assert_eq!(cache.slot_map_views.size(), 0);
+        assert!(cache.page_table.is_empty());
+        assert!(cache.has_deleted_images);
     }
 
     #[test]

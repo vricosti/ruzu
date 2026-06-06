@@ -12,7 +12,8 @@
 use crate::ir::opcodes::Opcode;
 use crate::ir::program::{CbufDescriptor, Program, TexDescriptor};
 use crate::ir::types::Type;
-use crate::ir::value::Value;
+use crate::ir::value::{Attribute, Value};
+use crate::program_header::{PixelImap, ProgramHeader};
 
 fn cbuf_type_bit(opcode: Opcode) -> u32 {
     match opcode {
@@ -88,6 +89,40 @@ pub fn collect_shader_info_pass(program: &mut Program) {
                         program.info.stores.set(attr.0 as usize, true);
                     }
                 }
+                Opcode::GetAttributeIndexed => {
+                    program.info.loads_indexed_attributes = true;
+                }
+                Opcode::SetAttributeIndexed => {
+                    program.info.stores_indexed_attributes = true;
+                }
+                Opcode::GetPatch => {
+                    if let Some(Value::Patch(patch)) = inst.args.first() {
+                        if patch.is_generic() {
+                            program.info.uses_patches[patch.generic_index() as usize] = true;
+                        }
+                    }
+                }
+                Opcode::SetPatch => {
+                    if let Some(Value::Patch(patch)) = inst.args.first() {
+                        if patch.is_generic() {
+                            program.info.uses_patches[patch.generic_index() as usize] = true;
+                        } else {
+                            match *patch {
+                                crate::ir::value::Patch::TESS_LOD_LEFT
+                                | crate::ir::value::Patch::TESS_LOD_TOP
+                                | crate::ir::value::Patch::TESS_LOD_RIGHT
+                                | crate::ir::value::Patch::TESS_LOD_BOTTOM => {
+                                    program.info.stores_tess_level_outer = true;
+                                }
+                                crate::ir::value::Patch::TESS_LOD_INTERIOR_U
+                                | crate::ir::value::Patch::TESS_LOD_INTERIOR_V => {
+                                    program.info.stores_tess_level_inner = true;
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                }
 
                 // Fragment color output
                 Opcode::SetFragColor => {
@@ -102,6 +137,30 @@ pub fn collect_shader_info_pass(program: &mut Program) {
                 }
                 Opcode::SetFragDepth => {
                     program.info.stores_frag_depth = true;
+                }
+                Opcode::WorkgroupId => {
+                    program.info.uses_workgroup_id = true;
+                }
+                Opcode::LocalInvocationId => {
+                    program.info.uses_local_invocation_id = true;
+                }
+                Opcode::InvocationId => {
+                    program.info.uses_invocation_id = true;
+                }
+                Opcode::InvocationInfo => {
+                    program.info.uses_invocation_info = true;
+                }
+                Opcode::SampleId => {
+                    program.info.uses_sample_id = true;
+                }
+                Opcode::IsHelperInvocation => {
+                    program.info.uses_is_helper_invocation = true;
+                }
+                Opcode::ResolutionDownFactor => {
+                    program.info.uses_rescaling_uniform = true;
+                }
+                Opcode::RenderArea => {
+                    program.info.uses_render_area = true;
                 }
 
                 // Texture access
@@ -153,6 +212,16 @@ pub fn collect_shader_info_pass(program: &mut Program) {
                     program.info.used_storage_buffer_types |=
                         (Type::U32 as u32) | (Type::U32x2 as u32) | (Type::U32x4 as u32);
                 }
+                Opcode::SharedAtomicSMin32
+                | Opcode::StorageAtomicSMin32
+                | Opcode::GlobalAtomicSMin32 => {
+                    program.info.uses_atomic_s32_min = true;
+                }
+                Opcode::SharedAtomicSMax32
+                | Opcode::StorageAtomicSMax32
+                | Opcode::GlobalAtomicSMax32 => {
+                    program.info.uses_atomic_s32_max = true;
+                }
 
                 _ => {}
             }
@@ -189,5 +258,224 @@ pub fn collect_shader_info_pass(program: &mut Program) {
         if program.local_memory_size == 0 {
             program.local_memory_size = 0x1000;
         }
+    }
+}
+
+/// Header-aware variant of upstream `CollectShaderInfoPass`.
+///
+/// Upstream calls `GatherInfoFromHeader(env, info)` after scanning IR. The
+/// Rust port keeps the env-less pass for tests and legacy call sites, while
+/// shader-cache paths that own the SPH call this variant.
+pub fn collect_shader_info_pass_with_sph(program: &mut Program, sph: &ProgramHeader) {
+    collect_shader_info_pass(program);
+    gather_info_from_header(program, sph);
+}
+
+fn gather_info_from_header(program: &mut Program, sph: &ProgramHeader) {
+    use crate::ir::types::ShaderStage;
+
+    if program.stage == ShaderStage::Compute {
+        return;
+    }
+
+    if program.stage == ShaderStage::Fragment {
+        if !program.info.loads_indexed_attributes {
+            return;
+        }
+        for index in 0..32 {
+            let mask = sph.ps_generic_input_map(index);
+            for (element, imap) in mask.iter().enumerate() {
+                program.info.loads.set(
+                    Attribute::generic(index, element as u32).0 as usize,
+                    *imap != PixelImap::Unused,
+                );
+            }
+        }
+        return;
+    }
+
+    if program.info.loads_indexed_attributes {
+        for index in 0..32 {
+            let mask = sph.vtg_input_generic(index as usize);
+            for (element, used) in mask.iter().enumerate() {
+                program
+                    .info
+                    .loads
+                    .set(Attribute::generic(index, element as u32).0 as usize, *used);
+            }
+        }
+        set_clip_distances(&mut program.info.loads, sph.vtg_imap_systemc());
+        set_systemb_attributes(&mut program.info.loads, sph.vtg_imap_systemb());
+        set_systemc_attributes(&mut program.info.loads, sph.vtg_imap_systemc());
+    }
+
+    if program.info.stores_indexed_attributes {
+        for index in 0..32 {
+            let mask = sph.vtg_output_generic(index as usize);
+            for (element, used) in mask.iter().enumerate() {
+                program
+                    .info
+                    .stores
+                    .set(Attribute::generic(index, element as u32).0 as usize, *used);
+            }
+        }
+        let clip_mask = sph.vtg_omap_systemc();
+        set_clip_distances(&mut program.info.stores, clip_mask);
+        for index in 0..8 {
+            if ((clip_mask >> index) & 1) != 0 {
+                program.info.used_clip_distances = index + 1;
+            }
+        }
+        set_systemb_attributes(&mut program.info.stores, sph.vtg_omap_systemb());
+        set_systemc_attributes(&mut program.info.stores, sph.vtg_omap_systemc());
+    }
+}
+
+fn set_clip_distances(state: &mut crate::varying_state::VaryingState, mask: u16) {
+    for index in 0..8 {
+        state.set(
+            (Attribute::CLIP_DISTANCE_0.0 + index) as usize,
+            ((mask >> index) & 1) != 0,
+        );
+    }
+}
+
+fn set_systemb_attributes(state: &mut crate::varying_state::VaryingState, mask: u8) {
+    const ATTRIBUTES: [Attribute; 8] = [
+        Attribute::PRIMITIVE_ID,
+        Attribute::LAYER,
+        Attribute::VIEWPORT_INDEX,
+        Attribute::POINT_SIZE,
+        Attribute::POSITION_X,
+        Attribute::POSITION_Y,
+        Attribute::POSITION_Z,
+        Attribute::POSITION_W,
+    ];
+    for (index, attribute) in ATTRIBUTES.iter().enumerate() {
+        state.set(attribute.0 as usize, ((mask >> index) & 1) != 0);
+    }
+}
+
+fn set_systemc_attributes(state: &mut crate::varying_state::VaryingState, mask: u16) {
+    const FOG_COORDINATE: Attribute = Attribute(186);
+    const ATTRIBUTES: [(Attribute, u16); 7] = [
+        (Attribute::POINT_SPRITE_S, 1 << 8),
+        (Attribute::POINT_SPRITE_T, 1 << 9),
+        (FOG_COORDINATE, 1 << 10),
+        (Attribute::TESSELLATION_EVALUATION_POINT_U, 1 << 12),
+        (Attribute::TESSELLATION_EVALUATION_POINT_V, 1 << 13),
+        (Attribute::INSTANCE_ID, 1 << 14),
+        (Attribute::VERTEX_ID, 1 << 15),
+    ];
+    for (attribute, bit) in ATTRIBUTES {
+        state.set(attribute.0 as usize, (mask & bit) != 0);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::collect_shader_info_pass_with_sph;
+    use crate::ir::basic_block::Block;
+    use crate::ir::instruction::Inst;
+    use crate::ir::opcodes::Opcode;
+    use crate::ir::program::Program;
+    use crate::ir::types::ShaderStage;
+    use crate::ir::value::{Attribute, Value};
+    use crate::program_header::ProgramHeader;
+
+    #[test]
+    fn collect_info_header_sets_fragment_indexed_generic_loads() {
+        let mut program = Program::new(ShaderStage::Fragment);
+        program.blocks.push(Block::new());
+        program.block_mut(0).append_inst(Inst::new(
+            Opcode::GetAttributeIndexed,
+            vec![Value::ImmU32(0), Value::ImmU32(0)],
+        ));
+
+        let mut sph = ProgramHeader::default();
+        sph.raw[6] = 0b11_10_01_00;
+
+        collect_shader_info_pass_with_sph(&mut program, &sph);
+
+        assert!(!program.info.loads.get(Attribute::generic(0, 0).0 as usize));
+        assert!(program.info.loads.get(Attribute::generic(0, 1).0 as usize));
+        assert!(program.info.loads.get(Attribute::generic(0, 2).0 as usize));
+        assert!(program.info.loads.get(Attribute::generic(0, 3).0 as usize));
+    }
+
+    #[test]
+    fn collect_info_sets_signed_atomic_helper_flags() {
+        let mut program = Program::new(ShaderStage::Compute);
+        program.blocks.push(Block::new());
+        program.block_mut(0).append_inst(Inst::new(
+            Opcode::StorageAtomicSMin32,
+            vec![Value::ImmU32(0), Value::ImmU32(16), Value::ImmU32(7)],
+        ));
+        program.block_mut(0).append_inst(Inst::new(
+            Opcode::SharedAtomicSMax32,
+            vec![Value::ImmU32(0), Value::ImmU32(7)],
+        ));
+
+        super::collect_shader_info_pass(&mut program);
+
+        assert!(program.info.uses_atomic_s32_min);
+        assert!(program.info.uses_atomic_s32_max);
+    }
+
+    #[test]
+    fn collect_info_header_sets_vtg_indexed_generic_loads_and_stores() {
+        let mut program = Program::new(ShaderStage::VertexB);
+        program.blocks.push(Block::new());
+        program.block_mut(0).append_inst(Inst::new(
+            Opcode::GetAttributeIndexed,
+            vec![Value::ImmU32(0), Value::ImmU32(0)],
+        ));
+        program.block_mut(0).append_inst(Inst::new(
+            Opcode::SetAttributeIndexed,
+            vec![Value::ImmU32(0), Value::ImmU32(0)],
+        ));
+
+        let mut sph = ProgramHeader::default();
+        sph.raw[5] = 0b0000_0010 << 24;
+        sph.raw[6] = 0b1010;
+        sph.raw[10] = (0b0000_0011 | (1 << 14)) << 16;
+        sph.raw[13] = (0b0000_1000 << 8) | (0b0101 << 16);
+        sph.raw[18] = 0b1000_0000 | (1 << 9) | (1 << 15);
+
+        collect_shader_info_pass_with_sph(&mut program, &sph);
+
+        assert!(!program.info.loads.get(Attribute::PRIMITIVE_ID.0 as usize));
+        assert!(program.info.loads.get(Attribute::LAYER.0 as usize));
+        assert!(program
+            .info
+            .loads
+            .get(Attribute::CLIP_DISTANCE_0.0 as usize));
+        assert!(program
+            .info
+            .loads
+            .get(Attribute::CLIP_DISTANCE_0.0 as usize + 1));
+        assert!(program.info.loads.get(Attribute::INSTANCE_ID.0 as usize));
+
+        assert!(!program.info.loads.get(Attribute::generic(0, 0).0 as usize));
+        assert!(program.info.loads.get(Attribute::generic(0, 1).0 as usize));
+        assert!(!program.info.loads.get(Attribute::generic(0, 2).0 as usize));
+        assert!(program.info.loads.get(Attribute::generic(0, 3).0 as usize));
+
+        assert!(program.info.stores.get(Attribute::POINT_SIZE.0 as usize));
+        assert!(program
+            .info
+            .stores
+            .get(Attribute::CLIP_DISTANCE_0.0 as usize + 7));
+        assert!(program
+            .info
+            .stores
+            .get(Attribute::POINT_SPRITE_T.0 as usize));
+        assert!(program.info.stores.get(Attribute::VERTEX_ID.0 as usize));
+        assert_eq!(program.info.used_clip_distances, 8);
+
+        assert!(program.info.stores.get(Attribute::generic(0, 0).0 as usize));
+        assert!(!program.info.stores.get(Attribute::generic(0, 1).0 as usize));
+        assert!(program.info.stores.get(Attribute::generic(0, 2).0 as usize));
+        assert!(!program.info.stores.get(Attribute::generic(0, 3).0 as usize));
     }
 }

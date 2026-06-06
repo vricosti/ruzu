@@ -6,6 +6,8 @@
 //! Maps to upstream `backend/glsl/emit_glsl_special.cpp`.
 
 use super::glsl_emit_context::EmitContext;
+use crate::ir;
+use crate::ir::instruction::Inst;
 use crate::runtime_info::CompareFunction;
 
 fn output_vertex_index(ctx: &EmitContext) -> &'static str {
@@ -100,10 +102,12 @@ pub fn emit_fragment_alpha_test(ctx: &mut EmitContext) {
         ctx.add_line("discard;");
     }
 }
-pub fn emit_emit_vertex(ctx: &mut EmitContext) {
-    ctx.add_line("EmitVertex();");
+pub fn emit_emit_vertex(ctx: &mut EmitContext, program: &mut ir::Program, inst: &Inst) {
+    let stream = ctx.var_alloc.consume(program, &inst.args[0]);
+    ctx.add_fmt(format!("EmitStreamVertex(int({}));", stream));
     initialize_output_varyings(ctx);
 }
-pub fn emit_end_primitive(ctx: &mut EmitContext) {
-    ctx.add_line("EndPrimitive();");
+pub fn emit_end_primitive(ctx: &mut EmitContext, program: &mut ir::Program, inst: &Inst) {
+    let stream = ctx.var_alloc.consume(program, &inst.args[0]);
+    ctx.add_fmt(format!("EndStreamPrimitive(int({}));", stream));
 }

@@ -95,6 +95,9 @@ impl KReadableEvent {
 
     /// Is the event signaled?
     pub fn is_signaled(&self) -> bool {
+        if let Some(scheduler_lock) = crate::hle::kernel::kernel::scheduler_lock() {
+            debug_assert!(scheduler_lock.is_locked_by_current_thread());
+        }
         self.is_signaled.load(Ordering::Relaxed)
     }
 

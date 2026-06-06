@@ -8,8 +8,9 @@
 use crate::ir;
 use crate::ir::instruction::Inst;
 use crate::ir::opcodes::Opcode;
-use crate::ir::value::{Attribute, InstRef, Value};
+use crate::ir::value::{Attribute, InstRef, Patch, Value};
 use crate::runtime_info::AttributeType;
+use crate::stage::Stage;
 
 use super::glsl_emit_context::EmitContext;
 use super::var_alloc::GlslVarType;
@@ -306,6 +307,30 @@ pub fn emit_get_cbuf(
     }
 }
 
+pub fn emit_load_local(
+    ctx: &mut EmitContext,
+    program: &mut ir::Program,
+    inst_ref: InstRef,
+    word_offset: &Value,
+) {
+    let word_offset = ctx.var_alloc.consume(program, word_offset);
+    let ret = ctx
+        .var_alloc
+        .define(inst_mut(program, inst_ref), GlslVarType::U32);
+    ctx.add_fmt(format!("{}=lmem[{}];", ret, word_offset));
+}
+
+pub fn emit_write_local(
+    ctx: &mut EmitContext,
+    program: &mut ir::Program,
+    word_offset: &Value,
+    value: &Value,
+) {
+    let word_offset = ctx.var_alloc.consume(program, word_offset);
+    let value = ctx.var_alloc.consume(program, value);
+    ctx.add_fmt(format!("lmem[{}]={};", word_offset, value));
+}
+
 pub fn emit_get_attribute(
     ctx: &mut EmitContext,
     program: &mut ir::Program,
@@ -356,8 +381,15 @@ pub fn emit_get_attribute(
         Attribute::PRIMITIVE_ID => ctx.add_fmt(format!("{}=itof(gl_PrimitiveID);", ret)),
         Attribute::LAYER => ctx.add_fmt(format!("{}=itof(gl_Layer);", ret)),
         Attribute::POINT_SIZE => ctx.add_fmt(format!("{}=gl_PointSize;", ret)),
+        Attribute::POINT_SPRITE_S | Attribute::POINT_SPRITE_T => {
+            ctx.add_fmt(format!("{}=gl_PointCoord.{};", ret, swizzle))
+        }
+        Attribute::TESSELLATION_EVALUATION_POINT_U | Attribute::TESSELLATION_EVALUATION_POINT_V => {
+            ctx.add_fmt(format!("{}=gl_TessCoord.{};", ret, swizzle))
+        }
         Attribute::INSTANCE_ID => ctx.add_fmt(format!("{}=itof(gl_InstanceID);", ret)),
         Attribute::VERTEX_ID => ctx.add_fmt(format!("{}=itof(gl_VertexID);", ret)),
+        Attribute::FRONT_FACE => ctx.add_fmt(format!("{}=itof(gl_FrontFacing?-1:0);", ret)),
         Attribute::BASE_INSTANCE => ctx.add_fmt(format!("{}=itof(gl_BaseInstance);", ret)),
         Attribute::BASE_VERTEX => ctx.add_fmt(format!("{}=itof(gl_BaseVertex);", ret)),
         Attribute::DRAW_ID => ctx.add_fmt(format!("{}=itof(gl_DrawID);", ret)),
@@ -388,6 +420,27 @@ pub fn emit_get_attribute_u32(
     }
 }
 
+pub fn emit_get_attribute_indexed(
+    ctx: &mut EmitContext,
+    program: &mut ir::Program,
+    inst_ref: InstRef,
+    offset: &str,
+    vertex: &str,
+) {
+    let ret = ctx
+        .var_alloc
+        .define(inst_mut(program, inst_ref), GlslVarType::F32);
+    let vertex_arg = if ctx.stage == Stage::Geometry {
+        format!(",{}", vertex)
+    } else {
+        String::new()
+    };
+    ctx.add_fmt(format!(
+        "{}=IndexedAttrLoad(int({}){});",
+        ret, offset, vertex_arg
+    ));
+}
+
 pub fn emit_set_attribute(ctx: &mut EmitContext, attr_raw: u32, value: &str) {
     let element = attr_raw % 4;
     let swizzle = SWIZZLE[element as usize];
@@ -411,10 +464,94 @@ pub fn emit_set_attribute(ctx: &mut EmitContext, attr_raw: u32, value: &str) {
         ctx.add_fmt(format!("gl_Position.{}={};", swizzle, value));
         return;
     }
+    match Attribute(attr_raw) {
+        Attribute::LAYER => {
+            if ctx.stage == Stage::Geometry || ctx.profile.support_viewport_index_layer_non_geometry
+            {
+                ctx.add_fmt(format!("gl_Layer=ftoi({});", value));
+            } else {
+                log::warn!(
+                    "Shader stores viewport layer but device does not support viewport layer extension"
+                );
+            }
+        }
+        Attribute::VIEWPORT_INDEX => {
+            if ctx.stage == Stage::Geometry || ctx.profile.support_viewport_index_layer_non_geometry
+            {
+                ctx.add_fmt(format!("gl_ViewportIndex=ftoi({});", value));
+            } else {
+                log::warn!(
+                    "Shader stores viewport index but device does not support viewport layer extension"
+                );
+            }
+        }
+        Attribute::VIEWPORT_MASK => {
+            if ctx.stage == Stage::Geometry || ctx.profile.support_viewport_mask {
+                ctx.add_fmt(format!("gl_ViewportMask[0]=ftoi({});", value));
+            } else {
+                log::warn!(
+                    "Shader stores viewport mask but device does not support viewport mask extension"
+                );
+            }
+        }
+        Attribute::POINT_SIZE => ctx.add_fmt(format!("gl_PointSize={};", value)),
+        attr if attr.is_clip_distance() => {
+            ctx.add_fmt(format!(
+                "gl_ClipDistance[{}]={};",
+                attr.clip_distance_index(),
+                value
+            ));
+        }
+        _ => ctx.add_fmt(format!(
+            "// SetAttribute({}) not fully implemented",
+            attr_raw
+        )),
+    }
+}
+
+pub fn emit_get_patch(
+    ctx: &mut EmitContext,
+    program: &mut ir::Program,
+    inst_ref: InstRef,
+    patch: Patch,
+) {
+    let ret = ctx
+        .var_alloc
+        .define(inst_mut(program, inst_ref), GlslVarType::F32);
+    if !patch.is_generic() {
+        panic!("Non-generic patch load");
+    }
+    let swizzle = SWIZZLE[patch.generic_element() as usize];
     ctx.add_fmt(format!(
-        "// SetAttribute({}) not fully implemented",
-        attr_raw
+        "{}=patch{}.{};",
+        ret,
+        patch.generic_index(),
+        swizzle
     ));
+}
+
+pub fn emit_set_patch(ctx: &mut EmitContext, patch: Patch, value: &str) {
+    if patch.is_generic() {
+        let swizzle = SWIZZLE[patch.generic_element() as usize];
+        ctx.add_fmt(format!(
+            "patch{}.{}={};",
+            patch.generic_index(),
+            swizzle,
+            value
+        ));
+        return;
+    }
+    match patch {
+        Patch::TESS_LOD_LEFT
+        | Patch::TESS_LOD_TOP
+        | Patch::TESS_LOD_RIGHT
+        | Patch::TESS_LOD_BOTTOM => {
+            ctx.add_fmt(format!("gl_TessLevelOuter[{}]={};", patch.0, value));
+        }
+        Patch::TESS_LOD_INTERIOR_U => ctx.add_fmt(format!("gl_TessLevelInner[0]={};", value)),
+        Patch::TESS_LOD_INTERIOR_V => ctx.add_fmt(format!("gl_TessLevelInner[1]={};", value)),
+        _ => panic!("Patch {}", patch.0),
+    }
 }
 
 pub fn emit_set_frag_color(ctx: &mut EmitContext, render_target: u32, component: u32, value: &str) {
@@ -437,9 +574,11 @@ mod tests {
     use crate::backend::glsl::emit_glsl;
     use crate::ir::basic_block::Block;
     use crate::ir::emitter::Emitter;
+    use crate::ir::instruction::Inst;
+    use crate::ir::opcodes::Opcode;
     use crate::ir::program::ShaderInfoExt;
     use crate::ir::types::ShaderStage;
-    use crate::ir::value::{Attribute, Value};
+    use crate::ir::value::{Attribute, InstRef, Value};
     use crate::ir_opt::optimize;
     use crate::profile::Profile;
     use crate::runtime_info::{AttributeType, CompareFunction, RuntimeInfo};
@@ -546,6 +685,225 @@ mod tests {
         assert!(source.contains("=uint(gl_VertexID);"));
         assert!(!source.contains("GetAttribute(190) not fully implemented"));
         assert!(!source.contains("GetAttributeU32(191) not fully implemented"));
+    }
+
+    #[test]
+    fn glsl_emits_fragment_fixed_function_inputs() {
+        let mut program = crate::ir::Program::new(ShaderStage::Fragment);
+        program.blocks.push(Block::new());
+        {
+            let mut emitter = Emitter::new(&mut program, 0);
+            let point_s = emitter.get_attribute(Attribute::POINT_SPRITE_S, Value::ImmU32(0));
+            let point_t = emitter.get_attribute(Attribute::POINT_SPRITE_T, Value::ImmU32(0));
+            let front_face = emitter.get_attribute(Attribute::FRONT_FACE, Value::ImmU32(0));
+            emitter.set_frag_color(Value::ImmU32(0), Value::ImmU32(0), point_s);
+            emitter.set_frag_color(Value::ImmU32(0), Value::ImmU32(1), point_t);
+            emitter.set_frag_color(Value::ImmU32(0), Value::ImmU32(2), front_face);
+        }
+        optimize(&mut program);
+
+        let mut bindings = Bindings::default();
+        let source = emit_glsl(
+            &Profile::default(),
+            &RuntimeInfo::default(),
+            &mut program,
+            &mut bindings,
+        );
+
+        assert!(source.contains("=gl_PointCoord.x;"));
+        assert!(source.contains("=gl_PointCoord.y;"));
+        assert!(source.contains("=itof(gl_FrontFacing?-1:0);"));
+        assert!(!source.contains("GetAttribute(184) not fully implemented"));
+        assert!(!source.contains("GetAttribute(185) not fully implemented"));
+        assert!(!source.contains("GetAttribute(255) not fully implemented"));
+    }
+
+    #[test]
+    fn glsl_emits_tessellation_evaluation_point_inputs() {
+        let mut program = crate::ir::Program::new(ShaderStage::TessellationEval);
+        program.blocks.push(Block::new());
+        {
+            let mut emitter = Emitter::new(&mut program, 0);
+            let point_u =
+                emitter.get_attribute(Attribute::TESSELLATION_EVALUATION_POINT_U, Value::ImmU32(0));
+            let point_v =
+                emitter.get_attribute(Attribute::TESSELLATION_EVALUATION_POINT_V, Value::ImmU32(0));
+            emitter.set_attribute(Attribute::generic(0, 0), point_u, Value::ImmU32(0));
+            emitter.set_attribute(Attribute::generic(0, 1), point_v, Value::ImmU32(0));
+        }
+        optimize(&mut program);
+
+        let mut bindings = Bindings::default();
+        let source = emit_glsl(
+            &Profile::default(),
+            &RuntimeInfo::default(),
+            &mut program,
+            &mut bindings,
+        );
+
+        assert!(source.contains("=gl_TessCoord.x;"));
+        assert!(source.contains("=gl_TessCoord.y;"));
+        assert!(!source.contains("GetAttribute(188) not fully implemented"));
+        assert!(!source.contains("GetAttribute(189) not fully implemented"));
+    }
+
+    #[test]
+    fn glsl_emits_fixed_function_attribute_stores() {
+        let mut program = crate::ir::Program::new(ShaderStage::Geometry);
+        program.blocks.push(Block::new());
+        {
+            let mut emitter = Emitter::new(&mut program, 0);
+            emitter.set_attribute(Attribute::LAYER, Value::ImmF32(1.0), Value::ImmU32(0));
+            emitter.set_attribute(
+                Attribute::VIEWPORT_INDEX,
+                Value::ImmF32(2.0),
+                Value::ImmU32(0),
+            );
+            emitter.set_attribute(
+                Attribute::VIEWPORT_MASK,
+                Value::ImmF32(3.0),
+                Value::ImmU32(0),
+            );
+            emitter.set_attribute(Attribute::POINT_SIZE, Value::ImmF32(4.0), Value::ImmU32(0));
+            emitter.set_attribute(
+                Attribute::CLIP_DISTANCE_0,
+                Value::ImmF32(5.0),
+                Value::ImmU32(0),
+            );
+        }
+        optimize(&mut program);
+
+        let mut bindings = Bindings::default();
+        let source = emit_glsl(
+            &Profile::default(),
+            &RuntimeInfo::default(),
+            &mut program,
+            &mut bindings,
+        );
+
+        assert!(source.contains("gl_Layer=ftoi(1.f);"));
+        assert!(source.contains("gl_ViewportIndex=ftoi(2.f);"));
+        assert!(source.contains("gl_ViewportMask[0]=ftoi(3.f);"));
+        assert!(source.contains("gl_PointSize=4.f;"));
+        assert!(source.contains("gl_ClipDistance[0]=5.f;"));
+        assert!(!source.contains("SetAttribute(25) not fully implemented"));
+        assert!(!source.contains("SetAttribute(26) not fully implemented"));
+        assert!(!source.contains("SetAttribute(27) not fully implemented"));
+        assert!(!source.contains("SetAttribute(176) not fully implemented"));
+        assert!(!source.contains("SetAttribute(232) not fully implemented"));
+    }
+
+    #[test]
+    fn glsl_emits_patch_io() {
+        let mut program = crate::ir::Program::new(ShaderStage::TessellationControl);
+        program.blocks.push(Block::new());
+        {
+            let mut emitter = Emitter::new(&mut program, 0);
+            emitter.set_patch(crate::ir::value::Patch::generic(2, 1), Value::ImmF32(3.0));
+            emitter.set_patch(
+                crate::ir::value::Patch::TESS_LOD_INTERIOR_V,
+                Value::ImmF32(4.0),
+            );
+            let value = emitter.get_patch(crate::ir::value::Patch::generic(2, 1));
+            emitter.set_attribute(Attribute::generic(0, 0), value, Value::ImmU32(0));
+        }
+        optimize(&mut program);
+
+        let mut bindings = Bindings::default();
+        let source = emit_glsl(
+            &Profile::default(),
+            &RuntimeInfo::default(),
+            &mut program,
+            &mut bindings,
+        );
+
+        assert!(source.contains("layout(location=2)patch out vec4 patch2;"));
+        assert!(source.contains("patch2.y=3.f;"));
+        assert!(source.contains("gl_TessLevelInner[1]=4.f;"));
+        assert!(source.contains("=patch2.y;"));
+        assert!(!source.contains("GetPatch should have been SSA-rewritten"));
+        assert!(!source.contains("SetPatch should have been SSA-rewritten"));
+    }
+
+    #[test]
+    fn glsl_emits_indexed_attribute_load() {
+        let mut program = crate::ir::Program::new(ShaderStage::Fragment);
+        program.blocks.push(Block::new());
+        {
+            let mut emitter = Emitter::new(&mut program, 0);
+            let value = emitter.get_attribute_indexed(Value::ImmU32(32), Value::ImmU32(0));
+            emitter.set_frag_color(Value::ImmU32(0), Value::ImmU32(0), value);
+        }
+        optimize(&mut program);
+        program
+            .info
+            .loads
+            .set(Attribute::generic(0, 0).0 as usize, true);
+        let mut runtime_info = RuntimeInfo::default();
+        runtime_info
+            .previous_stage_stores
+            .set(Attribute::generic(0, 0).0 as usize, true);
+
+        let mut bindings = Bindings::default();
+        let source = emit_glsl(
+            &Profile::default(),
+            &runtime_info,
+            &mut program,
+            &mut bindings,
+        );
+
+        assert!(source.contains("float IndexedAttrLoad(int offset)"));
+        assert!(source.contains("case 8:return in_attr0[masked_index];"));
+        assert!(source.contains("=IndexedAttrLoad(int(32u));"));
+        assert!(!source.contains("GetAttributeIndexed should have been SSA-rewritten"));
+    }
+
+    #[test]
+    fn glsl_emits_context_uniform_helpers() {
+        let mut program = crate::ir::Program::new(ShaderStage::Fragment);
+        let mut block = Block::new();
+        let resolution = InstRef {
+            block: 0,
+            inst: block.append_inst(Inst::new(Opcode::ResolutionDownFactor, vec![])),
+        };
+        let render_area = InstRef {
+            block: 0,
+            inst: block.append_inst(Inst::new(Opcode::RenderArea, vec![])),
+        };
+        let render_area_x = InstRef {
+            block: 0,
+            inst: block.append_inst(Inst::new(
+                Opcode::CompositeExtractF32x4,
+                vec![Value::Inst(render_area), Value::ImmU32(0)],
+            )),
+        };
+        block.append_inst(Inst::new(
+            Opcode::SetFragColor,
+            vec![Value::ImmU32(0), Value::ImmU32(0), Value::Inst(resolution)],
+        ));
+        block.append_inst(Inst::new(
+            Opcode::SetFragColor,
+            vec![
+                Value::ImmU32(0),
+                Value::ImmU32(1),
+                Value::Inst(render_area_x),
+            ],
+        ));
+        program.blocks.push(block);
+        optimize(&mut program);
+
+        let mut bindings = Bindings::default();
+        let source = emit_glsl(
+            &Profile::default(),
+            &RuntimeInfo::default(),
+            &mut program,
+            &mut bindings,
+        );
+
+        assert!(source.contains("layout(location=0) uniform vec4 scaling;"));
+        assert!(source.contains("layout(location=1) uniform vec4 render_area;"));
+        assert!(source.contains("=scaling.z;"));
+        assert!(source.contains("=render_area;"));
     }
 
     #[test]

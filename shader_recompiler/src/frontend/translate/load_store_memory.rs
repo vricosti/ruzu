@@ -107,7 +107,23 @@ pub fn ldg(tv: &mut TranslatorVisitor, insn: u64) {
     let size = LoadSize::from_bits(field(insn, 48, 3));
 
     match size {
-        LoadSize::U8 | LoadSize::S8 | LoadSize::U16 | LoadSize::S16 | LoadSize::B32 => {
+        LoadSize::U8 => {
+            let val = tv.ir.load_global_u8(address);
+            tv.set_x(dst, val);
+        }
+        LoadSize::S8 => {
+            let val = tv.ir.load_global_s8(address);
+            tv.set_x(dst, val);
+        }
+        LoadSize::U16 => {
+            let val = tv.ir.load_global_u16(address);
+            tv.set_x(dst, val);
+        }
+        LoadSize::S16 => {
+            let val = tv.ir.load_global_s16(address);
+            tv.set_x(dst, val);
+        }
+        LoadSize::B32 => {
             let val = tv.ir.load_global_32(address);
             tv.set_x(dst, val);
         }
@@ -146,7 +162,23 @@ pub fn stg(tv: &mut TranslatorVisitor, insn: u64) {
     let size = StoreSize::from_bits(field(insn, 48, 3));
 
     match size {
-        StoreSize::U8 | StoreSize::S8 | StoreSize::U16 | StoreSize::S16 | StoreSize::B32 => {
+        StoreSize::U8 => {
+            let data = tv.x(src_data_reg);
+            tv.ir.write_global_u8(address, data);
+        }
+        StoreSize::S8 => {
+            let data = tv.x(src_data_reg);
+            tv.ir.write_global_s8(address, data);
+        }
+        StoreSize::U16 => {
+            let data = tv.x(src_data_reg);
+            tv.ir.write_global_u16(address, data);
+        }
+        StoreSize::S16 => {
+            let data = tv.x(src_data_reg);
+            tv.ir.write_global_s16(address, data);
+        }
+        StoreSize::B32 => {
             let data = tv.x(src_data_reg);
             tv.ir.write_global_32(address, data);
         }
@@ -238,5 +270,83 @@ mod tests {
                 .count(),
             4
         );
+    }
+
+    #[test]
+    fn ldg_narrow_sizes_use_exact_global_load_opcodes() {
+        let cases = [
+            (0, Opcode::LoadGlobalU8),
+            (1, Opcode::LoadGlobalS8),
+            (2, Opcode::LoadGlobalU16),
+            (3, Opcode::LoadGlobalS16),
+            (4, Opcode::LoadGlobal32),
+        ];
+
+        for (size, opcode) in cases {
+            let mut program = fresh_program();
+            let mut tv = TranslatorVisitor::new(&mut program, 0);
+            ldg(&mut tv, encode_mem(2, 4, 0, true, size));
+
+            let opcodes = opcodes_emitted(&program);
+            assert!(
+                opcodes.contains(&opcode),
+                "size {} did not emit {:?}: {:?}",
+                size,
+                opcode,
+                opcodes
+            );
+        }
+    }
+
+    #[test]
+    fn stg_narrow_sizes_use_exact_global_write_opcodes() {
+        let cases = [
+            (0, Opcode::WriteGlobalU8),
+            (1, Opcode::WriteGlobalS8),
+            (2, Opcode::WriteGlobalU16),
+            (3, Opcode::WriteGlobalS16),
+            (4, Opcode::WriteGlobal32),
+        ];
+
+        for (size, opcode) in cases {
+            let mut program = fresh_program();
+            let mut tv = TranslatorVisitor::new(&mut program, 0);
+            stg(&mut tv, encode_mem(2, 4, 0, true, size));
+
+            let opcodes = opcodes_emitted(&program);
+            assert!(
+                opcodes.contains(&opcode),
+                "size {} did not emit {:?}: {:?}",
+                size,
+                opcode,
+                opcodes
+            );
+        }
+    }
+
+    #[test]
+    fn stg_b64_constructs_two_register_vector_and_writes_global_64() {
+        let mut program = fresh_program();
+        let mut tv = TranslatorVisitor::new(&mut program, 0);
+
+        // size=5 is upstream StoreSize::B64.
+        stg(&mut tv, encode_mem(2, 4, 0, true, 5));
+
+        let opcodes = opcodes_emitted(&program);
+        assert!(opcodes.contains(&Opcode::CompositeConstructU32x2));
+        assert!(opcodes.contains(&Opcode::WriteGlobal64));
+    }
+
+    #[test]
+    fn stg_b128_constructs_four_register_vector_and_writes_global_128() {
+        let mut program = fresh_program();
+        let mut tv = TranslatorVisitor::new(&mut program, 0);
+
+        // size=6 is upstream StoreSize::B128.
+        stg(&mut tv, encode_mem(4, 8, 0, true, 6));
+
+        let opcodes = opcodes_emitted(&program);
+        assert!(opcodes.contains(&Opcode::CompositeConstructU32x4));
+        assert!(opcodes.contains(&Opcode::WriteGlobal128));
     }
 }

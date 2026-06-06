@@ -367,3 +367,58 @@ pub fn texs(tv: &mut TranslatorVisitor, insn: u64) {
         store16(tv, insn, &sample);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ir::basic_block::Block;
+    use crate::ir::opcodes::Opcode;
+    use crate::ir::program::Program;
+    use crate::ir::types::ShaderStage;
+
+    fn fresh_program() -> Program {
+        let mut program = Program::new(ShaderStage::Fragment);
+        program.blocks.push(Block::new());
+        program
+    }
+
+    #[test]
+    fn texs_depth_explicit_lod_uses_bound_full_operand_opcode() {
+        let mut program = fresh_program();
+        let mut tv = TranslatorVisitor::new(&mut program, 0);
+        let insn = 4u64
+            | (8u64 << 8)
+            | (20u64 << 20)
+            | (12u64 << 28)
+            | (7u64 << 36)
+            | (5u64 << 53)
+            | (1u64 << 59);
+
+        texs(&mut tv, insn);
+
+        let sample = tv.ir.program.blocks[0]
+            .iter()
+            .find(|inst| inst.opcode == Opcode::BoundImageSampleDrefExplicitLod)
+            .expect("TEXS 2D.LL.DC should emit BoundImageSampleDrefExplicitLod");
+        assert_eq!(sample.args.len(), 5);
+        assert_eq!(sample.args[0], Value::ImmU32(28));
+        assert!(!sample.args[2].is_void(), "DREF operand must be preserved");
+        assert!(!sample.args[3].is_void(), "LOD operand must be preserved");
+        assert!(sample.args[4].is_void(), "TEXS has no offset operand");
+    }
+
+    #[test]
+    fn texs_f16_single_component_packs_with_zero() {
+        let mut program = fresh_program();
+        let mut tv = TranslatorVisitor::new(&mut program, 0);
+        let insn = 4u64 | (8u64 << 8) | (20u64 << 20) | (255u64 << 28);
+
+        texs(&mut tv, insn);
+
+        let pack_count = tv.ir.program.blocks[0]
+            .iter()
+            .filter(|inst| inst.opcode == Opcode::PackHalf2x16)
+            .count();
+        assert_eq!(pack_count, 1);
+    }
+}

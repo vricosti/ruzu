@@ -26,12 +26,12 @@ use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFrame
 /// - 2: Close
 /// - 3: Initialize
 /// - 4: QueryEvent
-/// - 5: MapSharedMem (unimplemented)
+/// - 5: MapSharedMem (nullptr upstream)
 /// - 6: GetStatus
-/// - 7: SetAruidForTest (unimplemented)
+/// - 7: SetAruidForTest (nullptr upstream)
 /// - 8: SetAruid
 /// - 9: DumpGraphicsMemoryInfo
-/// - 10: InitializeDevtools (unimplemented)
+/// - 10: InitializeDevtools (nullptr upstream)
 /// - 11: Ioctl2
 /// - 12: Ioctl3
 /// - 13: SetGraphicsFirmwareMemoryMarginEnabled
@@ -819,7 +819,15 @@ impl NvdrvService {
         let input = ctx.read_buffer(0);
         let inline_input = ctx.read_buffer(1);
         let mut output = vec![0; ctx.get_write_buffer_size(0)];
-        record_nvdrv_ioctl_history(ctx, 2, fd, command, &input, output.len(), inline_input.len());
+        record_nvdrv_ioctl_history(
+            ctx,
+            2,
+            fd,
+            command,
+            &input,
+            output.len(),
+            inline_input.len(),
+        );
         log::trace!(
             "NVDRV::ioctl2_handler dispatch fd={} ioctl=0x{:08X} in_len=0x{:X} inline_in_len=0x{:X} out_len=0x{:X}",
             fd,
@@ -882,7 +890,15 @@ impl NvdrvService {
         let input = ctx.read_buffer(0);
         let mut output = vec![0; ctx.get_write_buffer_size(0)];
         let mut inline_output = vec![0; ctx.get_write_buffer_size(1)];
-        record_nvdrv_ioctl_history(ctx, 3, fd, command, &input, output.len(), inline_output.len());
+        record_nvdrv_ioctl_history(
+            ctx,
+            3,
+            fd,
+            command,
+            &input,
+            output.len(),
+            inline_output.len(),
+        );
         log::trace!(
             "NVDRV::ioctl3_handler dispatch fd={} ioctl=0x{:08X} in_len=0x{:X} out_len=0x{:X} inline_out_len=0x{:X}",
             fd,

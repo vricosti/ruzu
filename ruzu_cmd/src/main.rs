@@ -909,7 +909,9 @@ fn main() {
         let use_async_gpu =
             *common::settings::values().use_asynchronous_gpu_emulation.get_value()
                 && std::env::var_os("RUZU_DISABLE_ASYNC_GPU").is_none();
-        let gpu = Box::new(video_core::gpu::Gpu::new(use_async_gpu, true));
+        let use_nvdec = *common::settings::values().nvdec_emulation.get_value()
+            != common::settings_enums::NvdecEmulation::Off;
+        let gpu = Box::new(video_core::gpu::Gpu::new(use_async_gpu, use_nvdec));
         gpu.set_system_ref(system_ref);
         let gpu_ptr = gpu.as_ref() as *const video_core::gpu::Gpu as usize;
 

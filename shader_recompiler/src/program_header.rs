@@ -84,6 +84,16 @@ impl std::fmt::Debug for ProgramHeader {
 }
 
 impl ProgramHeader {
+    fn vtg_byte(&self, offset: usize) -> u8 {
+        debug_assert!(offset < 0x3c);
+        let absolute = 0x14 + offset;
+        ((self.raw[absolute / 4] >> ((absolute % 4) * 8)) & 0xff) as u8
+    }
+
+    fn vtg_u16(&self, offset: usize) -> u16 {
+        u16::from_le_bytes([self.vtg_byte(offset), self.vtg_byte(offset + 1)])
+    }
+
     // ---- common0 (raw[0]) ----
     pub fn sph_type(&self) -> u32 {
         self.raw[0] & 0x1F
@@ -174,19 +184,18 @@ impl ProgramHeader {
 
     /// Get imap_systemb raw byte for VTG shaders.
     pub fn vtg_imap_systemb(&self) -> u8 {
-        // Byte 3 of raw[5] (big-endian layout: bytes [5*4+3])
-        ((self.raw[5] >> 24) & 0xFF) as u8
+        self.vtg_byte(3)
+    }
+
+    pub fn vtg_imap_systemc(&self) -> u16 {
+        self.vtg_u16(22)
     }
 
     /// Get the input generic vector bytes (16 bytes starting at offset 0x18).
     pub fn vtg_imap_generic_vector(&self) -> [u8; 16] {
         let mut result = [0u8; 16];
-        for i in 0..4 {
-            let word = self.raw[6 + i];
-            result[i * 4] = (word & 0xFF) as u8;
-            result[i * 4 + 1] = ((word >> 8) & 0xFF) as u8;
-            result[i * 4 + 2] = ((word >> 16) & 0xFF) as u8;
-            result[i * 4 + 3] = ((word >> 24) & 0xFF) as u8;
+        for (index, byte) in result.iter_mut().enumerate() {
+            *byte = self.vtg_byte(4 + index);
         }
         result
     }
@@ -205,17 +214,19 @@ impl ProgramHeader {
 
     /// Get omap_generic_vector bytes (16 bytes).
     pub fn vtg_omap_generic_vector(&self) -> [u8; 16] {
-        // omap_generic_vector starts at offset 0x38 in the VTG union
-        // which is raw[14..17]
         let mut result = [0u8; 16];
-        for i in 0..4 {
-            let word = self.raw[14 + i];
-            result[i * 4] = (word & 0xFF) as u8;
-            result[i * 4 + 1] = ((word >> 8) & 0xFF) as u8;
-            result[i * 4 + 2] = ((word >> 16) & 0xFF) as u8;
-            result[i * 4 + 3] = ((word >> 24) & 0xFF) as u8;
+        for (index, byte) in result.iter_mut().enumerate() {
+            *byte = self.vtg_byte(34 + index);
         }
         result
+    }
+
+    pub fn vtg_omap_systemb(&self) -> u8 {
+        self.vtg_byte(33)
+    }
+
+    pub fn vtg_omap_systemc(&self) -> u16 {
+        self.vtg_u16(52)
     }
 
     /// Check if an output generic attribute component is active (VTG).
@@ -320,5 +331,22 @@ mod tests {
         assert!(sph.ps_is_generic_vector_active(0));
         assert!(sph.ps_is_generic_vector_active(1));
         assert!(!sph.ps_is_generic_vector_active(2));
+    }
+
+    #[test]
+    fn vtg_accessors_decode_upstream_byte_offsets() {
+        let mut sph = ProgramHeader::default();
+        sph.raw[5] = 0xaa << 24;
+        sph.raw[6] = 0b1010;
+        sph.raw[10] = 0x55aa << 16;
+        sph.raw[13] = (0xbb << 8) | (0b0101 << 16);
+        sph.raw[18] = 0xaa55;
+
+        assert_eq!(sph.vtg_imap_systemb(), 0xaa);
+        assert_eq!(sph.vtg_imap_systemc(), 0x55aa);
+        assert_eq!(sph.vtg_omap_systemb(), 0xbb);
+        assert_eq!(sph.vtg_omap_systemc(), 0xaa55);
+        assert_eq!(sph.vtg_input_generic(0), [false, true, false, true]);
+        assert_eq!(sph.vtg_output_generic(0), [true, false, true, false]);
     }
 }

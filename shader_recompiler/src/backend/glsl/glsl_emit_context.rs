@@ -195,8 +195,10 @@ impl<'a> EmitContext<'a> {
         ctx.setup_out_per_vertex(program);
         ctx.setup_in_per_vertex(program);
         ctx.define_generic_inputs(program);
+        ctx.define_patches(program);
         ctx.define_generic_outputs(program);
         ctx.define_fragment_outputs(program);
+        ctx.define_context_uniforms(program);
         ctx.define_constant_buffers(bindings, program);
         ctx.define_storage_buffers(bindings, program);
         ctx.setup_images(bindings, program);
@@ -420,6 +422,23 @@ impl<'a> EmitContext<'a> {
         }
     }
 
+    fn define_patches(&mut self, program: &ir::Program) {
+        for (index, used) in program.info.uses_patches.iter().enumerate() {
+            if !used {
+                continue;
+            }
+            let qualifier = if self.stage == Stage::TessellationControl {
+                "out"
+            } else {
+                "in"
+            };
+            self.header.push_str(&format!(
+                "layout(location={})patch {} vec4 patch{};\n",
+                index, qualifier, index
+            ));
+        }
+    }
+
     fn define_generic_outputs(&mut self, program: &ir::Program) {
         for index in 0..32usize {
             if program.info.stores.generic_any(index) {
@@ -502,6 +521,17 @@ impl<'a> EmitContext<'a> {
         }
     }
 
+    fn define_context_uniforms(&mut self, program: &ir::Program) {
+        if program.info.uses_rescaling_uniform {
+            self.header
+                .push_str("layout(location=0) uniform vec4 scaling;\n");
+        }
+        if program.info.uses_render_area {
+            self.header
+                .push_str("layout(location=1) uniform vec4 render_area;\n");
+        }
+    }
+
     fn define_constant_buffers(&mut self, bindings: &mut Bindings, program: &ir::Program) {
         for desc in &program.info.constant_buffer_descriptors {
             let cbuf_type = if self.profile.has_gl_cbuf_ftou_bug {
@@ -550,10 +580,61 @@ impl<'a> EmitContext<'a> {
         self.header.push_str(
             "\n#define ftoi floatBitsToInt\n#define ftou floatBitsToUint\n#define itof intBitsToFloat\n#define utof uintBitsToFloat\n",
         );
+        if program.info.uses_atomic_s32_min {
+            self.header.push_str(
+                "uint CasMinS32(uint op_a,uint op_b){return uint(min(int(op_a),int(op_b)));}",
+            );
+        }
+        if program.info.uses_atomic_s32_max {
+            self.header.push_str(
+                "uint CasMaxS32(uint op_a,uint op_b){return uint(max(int(op_a),int(op_b)));}",
+            );
+        }
         if program.info.uses_global_memory && self.profile.support_int64 {
             self.header
                 .push_str(&self.define_global_memory_functions(program));
         }
+        if program.info.loads_indexed_attributes {
+            self.header
+                .push_str(&self.define_indexed_attr_load(program));
+        }
+    }
+
+    fn define_indexed_attr_load(&self, program: &ir::Program) -> String {
+        let is_array = self.stage == Stage::Geometry;
+        let vertex_arg = if is_array { ",uint vertex" } else { "" };
+        let mut func = format!(
+            "float IndexedAttrLoad(int offset{}){{int base_index=offset>>2;uint masked_index=uint(base_index)&3u;switch(base_index>>2){{",
+            vertex_arg
+        );
+        if program
+            .info
+            .loads
+            .any_component(Attribute::PositionX as usize)
+        {
+            let position_idx = if is_array { "gl_in[vertex]." } else { "" };
+            func.push_str(&format!(
+                "case {}:return {}{}[masked_index];",
+                (Attribute::PositionX as u32) >> 2,
+                position_idx,
+                self.position_name
+            ));
+        }
+        let base_attribute_value = (Attribute::Generic0X as u32) >> 2;
+        for index in 0..32u32 {
+            if !program.info.loads.generic_any(index as usize) {
+                continue;
+            }
+            let vertex_idx = if is_array { "[vertex]" } else { "" };
+            func.push_str(&format!(
+                "case {}:return in_attr{}{}[masked_index];",
+                base_attribute_value + index,
+                index,
+                vertex_idx
+            ));
+        }
+        func.push_str("default:return 0.0;}}");
+        func
     }
 
     fn define_global_memory_functions(&self, program: &ir::Program) -> String {
