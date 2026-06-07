@@ -182,7 +182,6 @@ fn trace_host_thread_ipc(stage: &str, session_handle: Handle) {
             "after_send_sync_request_with_process" => 13,
             "before_current_thread_lock" => 14,
             "after_current_thread_lock" => 15,
-            "after_begin_wait_guarded" => 16,
             "before_parent_lookup" => 17,
             "after_parent_lookup" => 18,
             "before_parent_session_lock" => 19,
@@ -713,15 +712,6 @@ fn send_sync_request_impl(
         // register_session is idempotent (no duplicate entry in multi_wait)
         // so re-pushing on every IPC is safe — but unnecessary work.
         //
-        // The wait-wake guard remains as a safety net for replies that race
-        // ahead of the explicit fiber handoff below. The actual request enqueue
-        // and WAITING transition are performed together under the scheduler
-        // lock below, matching upstream `KServerSession::OnRequest`.
-        if let Some(current_thread) = system.current_thread() {
-            let _lo_t = common::lock_order::guard("thread");
-            current_thread.lock().unwrap().arm_wait_wake_guard();
-        }
-
         let needs_setup = {
             let _lo_ss = common::lock_order::guard("server_session");
             server_session.lock().unwrap().manager_wakeup.is_none()
@@ -739,18 +729,10 @@ fn send_sync_request_impl(
             trace_host_thread_ipc("registered_with_host_thread", session_handle);
         }
 
-        // Enqueue the request and park the current client under the scheduler
-        // lock, matching upstream `KServerSession::OnRequest`: push request,
-        // notify if the queue was empty, then `BeginWait` for sync requests in
-        // one scheduler-locked critical section. Without this, ruzu can expose
-        // the request to the host service thread before the guest thread has
-        // transitioned to WAITING.
-        let mut already_woken = false;
+        // Enqueue the request through `KClientSession` / `KSession`; the
+        // scheduler-locked synchronous `BeginWait` is owned by
+        // `KServerSession::OnRequest`, matching upstream.
         {
-            trace_host_thread_ipc("before_scheduler_lock", session_handle);
-            let _scheduler_lock = crate::hle::kernel::kernel::scheduler_lock()
-                .map(crate::hle::kernel::k_scheduler_lock::KScopedSchedulerLock::new);
-            trace_host_thread_ipc("after_scheduler_lock", session_handle);
             trace_host_thread_ipc("before_process_lock", session_handle);
             let _lo_p = common::lock_order::guard("process");
             let mut process = system.current_process_arc().lock().unwrap();
@@ -760,21 +742,17 @@ fn send_sync_request_impl(
                 return RESULT_INVALID_HANDLE;
             };
             trace_host_thread_ipc("after_parent_lookup", session_handle);
-            let request = Arc::new(Mutex::new(
-                crate::hle::kernel::k_session_request::KSessionRequest::new(),
-            ));
-            request.lock().unwrap().initialize_with_process(
+            trace_host_thread_ipc("before_parent_session_lock", session_handle);
+            let _lo_ps = common::lock_order::guard("parent_session");
+            let parent_session_for_send = Arc::clone(&parent_session);
+            trace_host_thread_ipc("after_parent_session_lock", session_handle);
+            trace_host_thread_ipc("before_on_request", session_handle);
+            let send_result = crate::hle::kernel::k_client_session::KClientSession::send_sync_request_to_parent_with_process(
                 &mut process,
-                None,
+                parent_session_for_send,
                 message_address as usize,
                 0,
             );
-            trace_host_thread_ipc("before_parent_session_lock", session_handle);
-            let _lo_ps = common::lock_order::guard("parent_session");
-            let session = parent_session.lock().unwrap();
-            trace_host_thread_ipc("after_parent_session_lock", session_handle);
-            trace_host_thread_ipc("before_on_request", session_handle);
-            let send_result = session.on_request_with_process(&mut process, request);
             trace_host_thread_ipc("after_on_request", session_handle);
             trace_host_thread_ipc("after_send_sync_request_with_process", session_handle);
             if send_result != 0 {
@@ -813,16 +791,6 @@ fn send_sync_request_impl(
                 );
             }
 
-            if let Some(current_thread) = system.current_thread() {
-                trace_host_thread_ipc("before_current_thread_lock", session_handle);
-                let mut thread = current_thread.lock().unwrap();
-                trace_host_thread_ipc("after_current_thread_lock", session_handle);
-                thread.set_wait_reason_for_debugging(
-                    crate::hle::kernel::k_thread::ThreadWaitReasonForDebugging::Ipc,
-                );
-                already_woken = !thread.begin_wait_guarded();
-                trace_host_thread_ipc("after_begin_wait_guarded", session_handle);
-            }
             trace_host_thread_ipc("before_locked_section_end", session_handle);
         }
         trace_host_thread_ipc("after_locked_section_end", session_handle);
@@ -833,19 +801,10 @@ fn send_sync_request_impl(
         trace_host_thread_ipc("after_belt_signal", session_handle);
         trace_host_thread_ipc("enqueue_end", session_handle);
 
-        // `begin_wait_guarded` consumes the pending-wake flag armed above: if
-        // the host fiber already replied (end_wait ran while this thread was
-        // still RUNNABLE, a no-op that recorded a pending wake), the park is
-        // skipped and we fall straight through to read the wait result —
-        // closing the signal-before-park lost-wakeup race that previously
-        // wedged ~50% of boots in `pl:u` shared-font init.
+        // `KServerSession::OnRequest` has already transitioned the client to
+        // an IPC wait when the request is synchronous. Yield the current fiber
+        // so the owning ServerManager can receive and reply.
         trace_host_thread_ipc("client_begin_wait", session_handle);
-        if already_woken {
-            return system
-                .current_thread()
-                .map(|thread| ResultCode::new(thread.lock().unwrap().get_wait_result()))
-                .unwrap_or(RESULT_INVALID_HANDLE);
-        }
 
         // Yield the current fiber. The owning ServerManager's host fiber
         // processes the request and `send_reply` ends the wait on the
