@@ -525,7 +525,7 @@ mod tests {
     fn do_task_wakes_waiting_thread_via_gsc_owner() {
         let mut timer = KHardwareTimer::new();
         let gsc = Arc::new(Mutex::new(GlobalSchedulerContext::new()));
-        let mut core_timing = CoreTiming::new();
+        let core_timing = CoreTiming::new();
         core_timing.set_multicore(true);
         let thread = Arc::new(KThreadLock::new(KThread::new()));
         {
@@ -539,7 +539,7 @@ mod tests {
         timer.set_gsc(Arc::downgrade(&gsc));
         {
             let mut state = timer.state.lock().unwrap();
-            state.core_timing = Some(Arc::new(Mutex::new(core_timing)));
+            state.core_timing = Some(Arc::new(core_timing));
             state.m_wakeup_time = 10;
             state.base.register_absolute_task_impl(17, 10);
         }
@@ -559,9 +559,9 @@ mod tests {
     fn do_task_rearms_next_deadline_without_unscheduling_callback_event() {
         let timer = Arc::new(KHardwareTimer::new());
         let gsc = Arc::new(Mutex::new(GlobalSchedulerContext::new()));
-        let mut core_timing = CoreTiming::new();
+        let core_timing = CoreTiming::new();
         core_timing.set_multicore(true);
-        KHardwareTimer::wire_callback(&timer, Arc::new(Mutex::new(core_timing)));
+        KHardwareTimer::wire_callback(&timer, Arc::new(core_timing));
         {
             let mut state = timer.state.lock().unwrap();
             state.gsc = Some(Arc::downgrade(&gsc));

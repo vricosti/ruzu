@@ -222,7 +222,7 @@ mod tests {
         let mut special = StoreData::new();
         special.build_default(0);
         let mut normal = special;
-        normal.set_special_key_code([0; 4]);
+        normal.set_type(0);
         database.add(special);
         database.add(normal);
 

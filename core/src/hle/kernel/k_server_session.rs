@@ -480,6 +480,15 @@ impl KServerSession {
                 dst_state,
                 send,
             );
+            crate::hle::kernel::svc::svc_memory_history::record_ipc_map_alias(
+                src_address.get(),
+                dst_address.get(),
+                size as u64,
+                rc,
+                dst_state.bits(),
+                perm.bits() as u32,
+                src_desc.get_attribute() as u32,
+            );
             if rc != crate::hle::result::RESULT_SUCCESS.get_inner_value() {
                 return rc;
             }
@@ -2895,7 +2904,7 @@ mod tests {
     fn receive_request_with_message_copies_raw_request_payload_for_simple_message() {
         let mut client_process = crate::hle::kernel::k_process::KProcess::new();
         client_process.process_id = 7;
-        let client_process = Arc::new(Mutex::new(client_process));
+        let client_process = Arc::new(ProcessLock::from_value(client_process));
 
         let client_thread = Arc::new(KThreadLock::new(
             crate::hle::kernel::k_thread::KThread::new(),
@@ -2914,7 +2923,7 @@ mod tests {
 
         let mut server_process = crate::hle::kernel::k_process::KProcess::new();
         server_process.process_id = 8;
-        let server_process = Arc::new(Mutex::new(server_process));
+        let server_process = Arc::new(ProcessLock::from_value(server_process));
 
         let server_thread = Arc::new(KThreadLock::new(
             crate::hle::kernel::k_thread::KThread::new(),
@@ -2990,7 +2999,7 @@ mod tests {
     fn send_reply_with_message_copies_raw_reply_payload_for_simple_message() {
         let mut client_process = crate::hle::kernel::k_process::KProcess::new();
         client_process.process_id = 7;
-        let client_process = Arc::new(Mutex::new(client_process));
+        let client_process = Arc::new(ProcessLock::from_value(client_process));
 
         let client_thread = Arc::new(KThreadLock::new(
             crate::hle::kernel::k_thread::KThread::new(),
@@ -3010,7 +3019,7 @@ mod tests {
 
         let mut server_process = crate::hle::kernel::k_process::KProcess::new();
         server_process.process_id = 8;
-        let server_process = Arc::new(Mutex::new(server_process));
+        let server_process = Arc::new(ProcessLock::from_value(server_process));
 
         let server_thread = Arc::new(KThreadLock::new(
             crate::hle::kernel::k_thread::KThread::new(),
@@ -3089,7 +3098,7 @@ mod tests {
         assert_eq!(client_process.initialize_handle_table(), 0);
         let copied_object_id = 0xABCD;
         let copy_handle = client_process.handle_table.add(copied_object_id).unwrap();
-        let client_process = Arc::new(Mutex::new(client_process));
+        let client_process = Arc::new(ProcessLock::from_value(client_process));
 
         let client_thread = Arc::new(KThreadLock::new(
             crate::hle::kernel::k_thread::KThread::new(),
@@ -3109,7 +3118,7 @@ mod tests {
         let mut server_process = crate::hle::kernel::k_process::KProcess::new();
         server_process.process_id = 8;
         assert_eq!(server_process.initialize_handle_table(), 0);
-        let server_process = Arc::new(Mutex::new(server_process));
+        let server_process = Arc::new(ProcessLock::from_value(server_process));
 
         let server_thread = Arc::new(KThreadLock::new(
             crate::hle::kernel::k_thread::KThread::new(),
@@ -3183,7 +3192,8 @@ mod tests {
                 .map(|chunk| u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
                 .collect::<Vec<_>>()
         };
-        let copied_message = MessageBuffer::new(&mut copied_words.clone());
+        let mut copied_words_for_message = copied_words.clone();
+        let copied_message = MessageBuffer::new(&mut copied_words_for_message);
         assert_eq!(copied_message.get_process_id(3), 7);
         let translated_handle = copied_message.get_handle(5);
         let server_process = server_process.lock().unwrap();
@@ -3200,7 +3210,7 @@ mod tests {
         let mut client_process = crate::hle::kernel::k_process::KProcess::new();
         client_process.process_id = 7;
         assert_eq!(client_process.initialize_handle_table(), 0);
-        let client_process = Arc::new(Mutex::new(client_process));
+        let client_process = Arc::new(ProcessLock::from_value(client_process));
 
         let client_thread = Arc::new(KThreadLock::new(
             crate::hle::kernel::k_thread::KThread::new(),
@@ -3223,7 +3233,7 @@ mod tests {
         assert_eq!(server_process.initialize_handle_table(), 0);
         let moved_object_id = 0xDCBA;
         let move_handle = server_process.handle_table.add(moved_object_id).unwrap();
-        let server_process = Arc::new(Mutex::new(server_process));
+        let server_process = Arc::new(ProcessLock::from_value(server_process));
 
         let server_thread = Arc::new(KThreadLock::new(
             crate::hle::kernel::k_thread::KThread::new(),
@@ -3294,7 +3304,8 @@ mod tests {
                 .map(|chunk| u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
                 .collect::<Vec<_>>()
         };
-        let copied_message = MessageBuffer::new(&mut copied_words.clone());
+        let mut copied_words_for_message = copied_words.clone();
+        let copied_message = MessageBuffer::new(&mut copied_words_for_message);
         let translated_handle = copied_message.get_handle(3);
         let client_process = client_process.lock().unwrap();
         assert_eq!(
@@ -3316,7 +3327,7 @@ mod tests {
     fn receive_request_with_message_copies_pointer_descriptor_payload() {
         let mut client_process = crate::hle::kernel::k_process::KProcess::new();
         client_process.process_id = 7;
-        let client_process = Arc::new(Mutex::new(client_process));
+        let client_process = Arc::new(ProcessLock::from_value(client_process));
 
         let client_thread = Arc::new(KThreadLock::new(
             crate::hle::kernel::k_thread::KThread::new(),
@@ -3339,7 +3350,7 @@ mod tests {
 
         let mut server_process = crate::hle::kernel::k_process::KProcess::new();
         server_process.process_id = 8;
-        let server_process = Arc::new(Mutex::new(server_process));
+        let server_process = Arc::new(ProcessLock::from_value(server_process));
 
         let server_thread = Arc::new(KThreadLock::new(
             crate::hle::kernel::k_thread::KThread::new(),
@@ -3413,7 +3424,7 @@ mod tests {
     fn send_reply_with_message_copies_pointer_descriptor_payload() {
         let mut client_process = crate::hle::kernel::k_process::KProcess::new();
         client_process.process_id = 7;
-        let client_process = Arc::new(Mutex::new(client_process));
+        let client_process = Arc::new(ProcessLock::from_value(client_process));
 
         let client_thread = Arc::new(KThreadLock::new(
             crate::hle::kernel::k_thread::KThread::new(),
@@ -3433,7 +3444,7 @@ mod tests {
 
         let mut server_process = crate::hle::kernel::k_process::KProcess::new();
         server_process.process_id = 8;
-        let server_process = Arc::new(Mutex::new(server_process));
+        let server_process = Arc::new(ProcessLock::from_value(server_process));
 
         let server_thread = Arc::new(KThreadLock::new(
             crate::hle::kernel::k_thread::KThread::new(),
@@ -3511,7 +3522,7 @@ mod tests {
     fn send_reply_with_message_rejects_invalid_destination_header_size() {
         let mut client_process = crate::hle::kernel::k_process::KProcess::new();
         client_process.process_id = 7;
-        let client_process = Arc::new(Mutex::new(client_process));
+        let client_process = Arc::new(ProcessLock::from_value(client_process));
 
         let client_thread = Arc::new(KThreadLock::new(
             crate::hle::kernel::k_thread::KThread::new(),
@@ -3531,7 +3542,7 @@ mod tests {
 
         let mut server_process = crate::hle::kernel::k_process::KProcess::new();
         server_process.process_id = 8;
-        let server_process = Arc::new(Mutex::new(server_process));
+        let server_process = Arc::new(ProcessLock::from_value(server_process));
 
         let server_thread = Arc::new(KThreadLock::new(
             crate::hle::kernel::k_thread::KThread::new(),
@@ -3612,7 +3623,7 @@ mod tests {
     fn send_reply_with_message_rejects_invalid_destination_receive_list_offset() {
         let mut client_process = crate::hle::kernel::k_process::KProcess::new();
         client_process.process_id = 7;
-        let client_process = Arc::new(Mutex::new(client_process));
+        let client_process = Arc::new(ProcessLock::from_value(client_process));
 
         let client_thread = Arc::new(KThreadLock::new(
             crate::hle::kernel::k_thread::KThread::new(),
@@ -3632,7 +3643,7 @@ mod tests {
 
         let mut server_process = crate::hle::kernel::k_process::KProcess::new();
         server_process.process_id = 8;
-        let server_process = Arc::new(Mutex::new(server_process));
+        let server_process = Arc::new(ProcessLock::from_value(server_process));
 
         let server_thread = Arc::new(KThreadLock::new(
             crate::hle::kernel::k_thread::KThread::new(),
@@ -3714,7 +3725,7 @@ mod tests {
         let mut client_process = crate::hle::kernel::k_process::KProcess::new();
         client_process.process_id = 7;
         assert_eq!(client_process.initialize_handle_table(), 0);
-        let client_process = Arc::new(Mutex::new(client_process));
+        let client_process = Arc::new(ProcessLock::from_value(client_process));
 
         let client_thread = Arc::new(KThreadLock::new(
             crate::hle::kernel::k_thread::KThread::new(),
@@ -3738,7 +3749,7 @@ mod tests {
         let moved_object_id = 0xDCBA;
         let valid_handle = server_process.handle_table.add(moved_object_id).unwrap();
         let invalid_handle = 0x1234u32;
-        let server_process = Arc::new(Mutex::new(server_process));
+        let server_process = Arc::new(ProcessLock::from_value(server_process));
 
         let server_thread = Arc::new(KThreadLock::new(
             crate::hle::kernel::k_thread::KThread::new(),
@@ -3987,7 +3998,7 @@ mod tests {
     fn receive_request_with_message_records_map_alias_mapping() {
         let mut client_process = crate::hle::kernel::k_process::KProcess::new();
         client_process.process_id = 7;
-        let client_process = Arc::new(Mutex::new(client_process));
+        let client_process = Arc::new(ProcessLock::from_value(client_process));
 
         let client_thread = Arc::new(KThreadLock::new(
             crate::hle::kernel::k_thread::KThread::new(),
@@ -4006,7 +4017,7 @@ mod tests {
 
         let mut server_process = crate::hle::kernel::k_process::KProcess::new();
         server_process.process_id = 8;
-        let server_process = Arc::new(Mutex::new(server_process));
+        let server_process = Arc::new(ProcessLock::from_value(server_process));
 
         let server_thread = Arc::new(KThreadLock::new(
             crate::hle::kernel::k_thread::KThread::new(),
@@ -4023,7 +4034,7 @@ mod tests {
             .unwrap()
             .register_thread_object(Arc::clone(&server_thread));
 
-        let map_words = Self::encode_map_alias_descriptor(
+        let map_words = KServerSession::encode_map_alias_descriptor(
             0x3010,
             0x40,
             crate::hle::kernel::message_buffer::MapAliasAttribute::Ipc as u32,
@@ -4069,7 +4080,7 @@ mod tests {
     fn send_reply_with_message_copies_receive_mapping_payload() {
         let mut client_process = crate::hle::kernel::k_process::KProcess::new();
         client_process.process_id = 7;
-        let client_process = Arc::new(Mutex::new(client_process));
+        let client_process = Arc::new(ProcessLock::from_value(client_process));
 
         let client_thread = Arc::new(KThreadLock::new(
             crate::hle::kernel::k_thread::KThread::new(),
@@ -4089,7 +4100,7 @@ mod tests {
 
         let mut server_process = crate::hle::kernel::k_process::KProcess::new();
         server_process.process_id = 8;
-        let server_process = Arc::new(Mutex::new(server_process));
+        let server_process = Arc::new(ProcessLock::from_value(server_process));
 
         let server_thread = Arc::new(KThreadLock::new(
             crate::hle::kernel::k_thread::KThread::new(),
@@ -4144,7 +4155,7 @@ mod tests {
     fn receive_request_with_message_returns_receive_list_broken_on_transport_failure() {
         let mut client_process = crate::hle::kernel::k_process::KProcess::new();
         client_process.process_id = 7;
-        let client_process = Arc::new(Mutex::new(client_process));
+        let client_process = Arc::new(ProcessLock::from_value(client_process));
 
         let client_thread = Arc::new(KThreadLock::new(
             crate::hle::kernel::k_thread::KThread::new(),
@@ -4163,7 +4174,7 @@ mod tests {
 
         let mut server_process = crate::hle::kernel::k_process::KProcess::new();
         server_process.process_id = 8;
-        let server_process = Arc::new(Mutex::new(server_process));
+        let server_process = Arc::new(ProcessLock::from_value(server_process));
 
         let server_thread = Arc::new(KThreadLock::new(
             crate::hle::kernel::k_thread::KThread::new(),
@@ -4237,7 +4248,7 @@ mod tests {
         client_process.process_id = 7;
         assert_eq!(client_process.initialize_handle_table(), 0);
         let move_handle = client_process.handle_table.add(0xABCD).unwrap();
-        let client_process = Arc::new(Mutex::new(client_process));
+        let client_process = Arc::new(ProcessLock::from_value(client_process));
 
         let client_thread = Arc::new(KThreadLock::new(
             crate::hle::kernel::k_thread::KThread::new(),
@@ -4256,7 +4267,7 @@ mod tests {
 
         let mut server_process = crate::hle::kernel::k_process::KProcess::new();
         server_process.process_id = 8;
-        let server_process = Arc::new(Mutex::new(server_process));
+        let server_process = Arc::new(ProcessLock::from_value(server_process));
 
         let server_thread = Arc::new(KThreadLock::new(
             crate::hle::kernel::k_thread::KThread::new(),
@@ -4329,7 +4340,7 @@ mod tests {
         assert_eq!(client_process.initialize_handle_table(), 0);
         let valid_handle = client_process.handle_table.add(0xABCD).unwrap();
         let invalid_handle = 0x1234u32;
-        let client_process = Arc::new(Mutex::new(client_process));
+        let client_process = Arc::new(ProcessLock::from_value(client_process));
 
         let client_thread = Arc::new(KThreadLock::new(
             crate::hle::kernel::k_thread::KThread::new(),
@@ -4349,7 +4360,7 @@ mod tests {
         let mut server_process = crate::hle::kernel::k_process::KProcess::new();
         server_process.process_id = 8;
         assert_eq!(server_process.initialize_handle_table(), 0);
-        let server_process = Arc::new(Mutex::new(server_process));
+        let server_process = Arc::new(ProcessLock::from_value(server_process));
 
         let server_thread = Arc::new(KThreadLock::new(
             crate::hle::kernel::k_thread::KThread::new(),
@@ -4428,7 +4439,7 @@ mod tests {
         client_process.process_id = 7;
         assert_eq!(client_process.initialize_handle_table(), 0);
         let move_handle = client_process.handle_table.add(0xABCD).unwrap();
-        let client_process = Arc::new(Mutex::new(client_process));
+        let client_process = Arc::new(ProcessLock::from_value(client_process));
 
         let client_thread = Arc::new(KThreadLock::new(
             crate::hle::kernel::k_thread::KThread::new(),
@@ -4447,7 +4458,7 @@ mod tests {
 
         let mut server_process = crate::hle::kernel::k_process::KProcess::new();
         server_process.process_id = 8;
-        let server_process = Arc::new(Mutex::new(server_process));
+        let server_process = Arc::new(ProcessLock::from_value(server_process));
 
         let server_thread = Arc::new(KThreadLock::new(
             crate::hle::kernel::k_thread::KThread::new(),
@@ -4558,7 +4569,7 @@ mod tests {
         assert_eq!(client_process.initialize_handle_table(), 0);
         let valid_handle = client_process.handle_table.add(0xABCD).unwrap();
         let invalid_handle = 0x1234u32;
-        let client_process = Arc::new(Mutex::new(client_process));
+        let client_process = Arc::new(ProcessLock::from_value(client_process));
 
         let client_thread = Arc::new(KThreadLock::new(
             crate::hle::kernel::k_thread::KThread::new(),
@@ -4578,7 +4589,7 @@ mod tests {
         let mut server_process = crate::hle::kernel::k_process::KProcess::new();
         server_process.process_id = 8;
         assert_eq!(server_process.initialize_handle_table(), 0);
-        let server_process = Arc::new(Mutex::new(server_process));
+        let server_process = Arc::new(ProcessLock::from_value(server_process));
 
         let server_thread = Arc::new(KThreadLock::new(
             crate::hle::kernel::k_thread::KThread::new(),
@@ -4681,7 +4692,7 @@ mod tests {
         let mut client_process = crate::hle::kernel::k_process::KProcess::new();
         client_process.process_id = 7;
         assert_eq!(client_process.initialize_handle_table(), 0);
-        let client_process = Arc::new(Mutex::new(client_process));
+        let client_process = Arc::new(ProcessLock::from_value(client_process));
 
         let client_thread = Arc::new(KThreadLock::new(
             crate::hle::kernel::k_thread::KThread::new(),
@@ -4704,7 +4715,7 @@ mod tests {
         assert_eq!(server_process.initialize_handle_table(), 0);
         let valid_handle = server_process.handle_table.add(0xDCBA).unwrap();
         let invalid_handle = 0x1234u32;
-        let server_process = Arc::new(Mutex::new(server_process));
+        let server_process = Arc::new(ProcessLock::from_value(server_process));
 
         let server_thread = Arc::new(KThreadLock::new(
             crate::hle::kernel::k_thread::KThread::new(),

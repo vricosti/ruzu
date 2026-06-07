@@ -3635,6 +3635,7 @@ mod tests {
     use crate::hle::kernel::global_scheduler_context::GlobalSchedulerContext;
     use crate::hle::kernel::k_process::KProcess;
     use crate::hle::kernel::k_scheduler::KScheduler;
+    use crate::hle::kernel::k_scheduler_lock;
     use crate::hle::result::RESULT_SUCCESS;
     use std::sync::{Arc, Mutex};
 
@@ -4190,10 +4191,10 @@ mod tests {
 
     #[test]
     fn end_wait_recursively_acquires_scheduler_lock() {
-        let scheduler_lock = super::k_scheduler_lock::KAbstractSchedulerLock::new();
+        let scheduler_lock = k_scheduler_lock::KAbstractSchedulerLock::new();
         let mut thread = KThread::new();
         thread.scheduler_lock_ptr =
-            (&scheduler_lock as *const super::k_scheduler_lock::KAbstractSchedulerLock) as usize;
+            (&scheduler_lock as *const k_scheduler_lock::KAbstractSchedulerLock) as usize;
         thread.begin_wait();
 
         let _outer = KScopedSchedulerLock::new(&scheduler_lock);

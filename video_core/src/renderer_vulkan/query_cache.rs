@@ -331,10 +331,10 @@ impl QueryCache {
                     .as_ref()
                     .map(|getter| getter())
                     .unwrap_or(0);
-                mm.write_block_unsafe_owned(gpu_addr + 8, &gpu_ticks.to_le_bytes());
-                mm.write_block_unsafe_owned(gpu_addr, &(payload as u64).to_le_bytes());
+                mm.write_block_unsafe(gpu_addr + 8, &gpu_ticks.to_le_bytes());
+                mm.write_block_unsafe(gpu_addr, &(payload as u64).to_le_bytes());
             } else {
-                mm.write_block_unsafe_owned(gpu_addr, &payload.to_le_bytes());
+                mm.write_block_unsafe(gpu_addr, &payload.to_le_bytes());
             }
         });
         if is_fence {
@@ -360,10 +360,41 @@ impl QueryCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
+    use crate::memory_manager::MemoryManager;
     use crate::query_cache::query_cache::QueryCacheRuntimeHandle;
     use crate::query_cache::query_cache_base::LookupData;
     use parking_lot::Mutex as ParkingMutex;
     use std::sync::Arc;
+
+    fn make_query_memory_manager(
+        gpu_addr: u64,
+        d_addr: u64,
+        size: usize,
+    ) -> (Arc<ParkingMutex<MemoryManager>>, Vec<u8>) {
+        let device_memory = Arc::new(MaxwellDeviceMemoryManager::default());
+        let mut backing = vec![0u8; size];
+        device_memory.smmu_set_physical_base_for_test(backing.as_ptr() as usize);
+        device_memory.smmu_map_with_cpu_backing(
+            d_addr,
+            backing.as_mut_ptr(),
+            0x4000_0000,
+            size,
+            5,
+            true,
+        );
+
+        let mut mm = MemoryManager::new_with_geometry_and_device_memory(
+            0,
+            Arc::clone(&device_memory),
+            40,
+            1u64 << 34,
+            16,
+            12,
+        );
+        mm.map(gpu_addr, d_addr, size as u64, 0, false);
+        (Arc::new(ParkingMutex::new(mm)), backing)
+    }
 
     #[test]
     fn query_cache_runtime_state() {
@@ -410,9 +441,7 @@ mod tests {
     #[test]
     fn bind_to_channel_wires_memory_manager_from_channel_cache_owner() {
         let mut cache = QueryCache::new();
-        let mm = Arc::new(ParkingMutex::new(
-            crate::memory_manager::MemoryManager::new(33),
-        ));
+        let mm = Arc::new(ParkingMutex::new(MemoryManager::new(33)));
         let mut channel = ChannelState::new(8);
         channel.program_id = 0x3344;
         channel.memory_manager = Some(Arc::clone(&mm));
@@ -434,15 +463,7 @@ mod tests {
     #[test]
     fn query_sync_operation_writes_payload_and_timestamp_through_bound_memory_manager() {
         let mut cache = QueryCache::new();
-        let writes = Arc::new(ParkingMutex::new(Vec::<(u64, Vec<u8>)>::new()));
-        let writes_clone = Arc::clone(&writes);
-
-        let mut mm = crate::memory_manager::MemoryManager::new(0);
-        mm.map(0x5038_50000, 0x5510_6000, 0x1000, 0, false);
-        mm.set_guest_memory_writer(Arc::new(move |addr, data| {
-            writes_clone.lock().push((addr, data.to_vec()));
-        }));
-        let mm = Arc::new(ParkingMutex::new(mm));
+        let (mm, backing) = make_query_memory_manager(0x5038_50000, 0x5510_6000, 0x1000);
 
         let mut channel = ChannelState::new(9);
         channel.memory_manager = Some(Arc::clone(&mm));
@@ -458,26 +479,14 @@ mod tests {
             |func| func(),
         );
 
-        let writes = writes.lock();
-        assert_eq!(writes.len(), 2);
-        assert_eq!(writes[0].0, 0x5510_6008);
-        assert_eq!(writes[0].1, 0x1122_3344_5566_7788u64.to_le_bytes());
-        assert_eq!(writes[1].0, 0x5510_6000);
-        assert_eq!(writes[1].1, (0xAABB_CCDDu64).to_le_bytes());
+        assert_eq!(&backing[0..8], &(0xAABB_CCDDu64).to_le_bytes());
+        assert_eq!(&backing[8..16], &0x1122_3344_5566_7788u64.to_le_bytes());
     }
 
     #[test]
     fn query_fence_operation_defers_writeback_to_signal_fence_callback() {
         let mut cache = QueryCache::new();
-        let writes = Arc::new(ParkingMutex::new(Vec::<(u64, Vec<u8>)>::new()));
-        let writes_clone = Arc::clone(&writes);
-
-        let mut mm = crate::memory_manager::MemoryManager::new(0);
-        mm.map(0x5038_50000, 0x5510_6000, 0x1000, 0, false);
-        mm.set_guest_memory_writer(Arc::new(move |addr, data| {
-            writes_clone.lock().push((addr, data.to_vec()));
-        }));
-        let mm = Arc::new(ParkingMutex::new(mm));
+        let (mm, backing) = make_query_memory_manager(0x5038_50000, 0x5510_6000, 0x1000);
 
         let mut channel = ChannelState::new(10);
         channel.memory_manager = Some(Arc::clone(&mm));
@@ -497,14 +506,11 @@ mod tests {
             |_func| panic!("sync path should not be used"),
         );
 
-        assert!(writes.lock().is_empty());
+        assert_eq!(&backing[0..4], &[0; 4]);
 
         let func = deferred.lock().take().expect("fence callback queued");
         func();
 
-        let writes = writes.lock();
-        assert_eq!(writes.len(), 1);
-        assert_eq!(writes[0].0, 0x5510_6000);
-        assert_eq!(writes[0].1, 0x1234_5678u32.to_le_bytes());
+        assert_eq!(&backing[0..4], &0x1234_5678u32.to_le_bytes());
     }
 }

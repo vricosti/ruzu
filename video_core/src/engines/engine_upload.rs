@@ -8,7 +8,7 @@
 //! an `upload::State` that accumulates data words and flushes them to
 //! GPU virtual memory when the transfer completes.
 
-use crate::rasterizer_interface::RasterizerInterface;
+use crate::rasterizer_interface::{RasterizerHandle, RasterizerInterface};
 use crate::textures::decoders;
 use parking_lot::Mutex;
 use std::sync::Arc;
@@ -64,29 +64,14 @@ impl DestRegisters {
     }
 }
 
-/// Context for flushing upload data to GPU memory.
-///
-/// Upstream `Upload::State` holds `MemoryManager&` and `RasterizerInterface*`.
-/// In Rust, the parent engine provides these via a `FlushContext` when a flush
-/// is needed, avoiding lifetime issues from storing references.
-pub struct FlushContext<'a> {
-    pub rasterizer: Option<&'a mut dyn RasterizerInterface>,
-    pub memory_manager: Arc<Mutex<crate::memory_manager::MemoryManager>>,
-    pub write_cpu_mem: &'a mut dyn FnMut(u64, &[u8]),
-}
-
 /// Upload state machine, corresponding to the C++ `Upload::State` class.
 ///
 /// Accumulates inline data words and writes them to GPU memory when
 /// a transfer is completed.
 ///
-/// Upstream holds references to `MemoryManager` and `RasterizerInterface`.
-/// In Rust, these are provided via `FlushContext` parameters on the
-/// methods that perform flushing (`process_data_word_with_ctx`,
-/// `process_data_multi_with_ctx`). The simple `process_data_word` and
-/// `process_data_multi` methods without a context are provided for callers
-/// that do not yet have memory_manager/rasterizer wired up; these log a
-/// warning on flush.
+/// Upstream holds `MemoryManager&` and a rasterizer pointer bound through
+/// `BindRasterizer`. Rust stores the same owner edges through an `Arc<Mutex<_>>`
+/// memory-manager handle and a non-owning `RasterizerHandle`.
 pub struct State {
     /// Current write offset within `inner_buffer`.
     write_offset: u32,
@@ -98,110 +83,107 @@ pub struct State {
     tmp_buffer: Vec<u8>,
     /// Whether the current transfer target is pitch-linear (vs block-linear).
     is_linear: bool,
-    /// Reference to the upload registers (owned by the parent engine).
-    /// In Rust we store a copy; the parent engine must keep it in sync.
-    pub regs: Registers,
+    /// Upstream `MemoryManager& memory_manager`.
+    memory_manager: Option<Arc<Mutex<crate::memory_manager::MemoryManager>>>,
+    /// Upstream `VideoCore::RasterizerInterface* rasterizer`.
+    rasterizer: Option<RasterizerHandle>,
 }
 
 impl State {
-    /// Create a new upload state.
-    pub fn new() -> Self {
+    /// Create a reduced upload state without its upstream `MemoryManager&`.
+    ///
+    /// Runtime owners call `new_with_memory_manager`. This reduced constructor
+    /// stays crate-local so ownerless upload state cannot be introduced through
+    /// the public runtime API by accident.
+    #[cfg(test)]
+    pub(crate) fn new() -> Self {
         Self {
             write_offset: 0,
             copy_size: 0,
             inner_buffer: Vec::new(),
             tmp_buffer: Vec::new(),
             is_linear: false,
-            regs: Registers::default(),
+            memory_manager: None,
+            rasterizer: None,
         }
+    }
+
+    /// Create a new upload state with the upstream-owned `MemoryManager`.
+    pub fn new_with_memory_manager(
+        memory_manager: Arc<Mutex<crate::memory_manager::MemoryManager>>,
+    ) -> Self {
+        Self {
+            write_offset: 0,
+            copy_size: 0,
+            inner_buffer: Vec::new(),
+            tmp_buffer: Vec::new(),
+            is_linear: false,
+            memory_manager: Some(memory_manager),
+            rasterizer: None,
+        }
+    }
+
+    /// Bind the upstream `MemoryManager&` owner after reduced construction.
+    #[cfg(test)]
+    pub(crate) fn bind_memory_manager(
+        &mut self,
+        memory_manager: Arc<Mutex<crate::memory_manager::MemoryManager>>,
+    ) {
+        self.memory_manager = Some(memory_manager);
+    }
+
+    /// Binds a rasterizer to this engine.
+    ///
+    /// Corresponds to upstream `State::BindRasterizer`.
+    pub fn bind_rasterizer(&mut self, rasterizer: &dyn RasterizerInterface) {
+        self.rasterizer = Some(RasterizerHandle::from_ref(rasterizer));
     }
 
     /// Begin a new transfer. Called when the engine's exec register is written.
     ///
     /// Corresponds to `State::ProcessExec`.
-    pub fn process_exec(&mut self, is_linear: bool) {
+    pub fn process_exec(&mut self, regs: &Registers, is_linear: bool) {
         self.write_offset = 0;
-        self.copy_size = self.regs.line_length_in * self.regs.line_count;
+        self.copy_size = regs.line_length_in * regs.line_count;
         self.inner_buffer.resize(self.copy_size as usize, 0);
         self.is_linear = is_linear;
         if std::env::var_os("RUZU_TRACE_UPLOAD_EXEC").is_some() {
             log::info!(
                 "engine_upload::process_exec line_length_in={} line_count={} copy_size={} linear={} dest=0x{:X}",
-                self.regs.line_length_in,
-                self.regs.line_count,
+                regs.line_length_in,
+                regs.line_count,
                 self.copy_size,
                 is_linear,
-                self.regs.dest.address()
+                regs.dest.address()
             );
         }
     }
 
-    /// Append a single data word to the transfer buffer (without flush context).
-    ///
-    /// When `is_last_call` is true, the accumulated buffer should be flushed,
-    /// but without a `FlushContext` this logs a warning and skips the flush.
-    /// Callers that have memory_manager/rasterizer should use
-    /// `process_data_word_with_ctx` instead.
+    /// Append a single data word to the transfer buffer.
     ///
     /// Corresponds to `State::ProcessData(u32, bool)`.
-    pub fn process_data_word(&mut self, data: u32, is_last_call: bool) {
-        self.accumulate_word(data);
-        if is_last_call {
-            log::warn!(
-                "engine_upload::State::process_data_word: flush skipped \
-                 (no FlushContext provided — use process_data_word_with_ctx)"
-            );
-        }
-    }
-
-    /// Append a single data word to the transfer buffer with flush context.
-    ///
-    /// When `is_last_call` is true, the accumulated buffer is flushed to
-    /// GPU memory via the provided context.
-    ///
-    /// Corresponds to `State::ProcessData(u32, bool)`.
-    pub fn process_data_word_with_ctx(
-        &mut self,
-        data: u32,
-        is_last_call: bool,
-        ctx: &mut FlushContext<'_>,
-    ) {
+    pub fn process_data_word(&mut self, regs: &Registers, data: u32, is_last_call: bool) {
         self.accumulate_word(data);
         if is_last_call {
             let buffer: Vec<u8> = self.inner_buffer.clone();
-            self.process_data_bytes(&buffer, ctx);
+            self.process_data_bytes(regs, &buffer);
         }
     }
 
-    /// Append multiple data words to the transfer buffer (without flush context).
-    ///
-    /// Without a `FlushContext`, this logs a warning and skips the flush.
-    /// Callers that have memory_manager/rasterizer should use
-    /// `process_data_multi_with_ctx` instead.
+    /// Append multiple data words to the transfer buffer.
     ///
     /// Corresponds to `State::ProcessData(const u32*, size_t)`.
-    pub fn process_data_multi(&mut self, data: &[u32]) {
-        log::warn!(
-            "engine_upload::State::process_data_multi: flush skipped \
-             (no FlushContext provided — use process_data_multi_with_ctx)"
-        );
-        let _ = data;
-    }
-
-    /// Append multiple data words to the transfer buffer with flush context.
-    ///
-    /// Corresponds to `State::ProcessData(const u32*, size_t)`.
-    pub fn process_data_multi_with_ctx(&mut self, data: &[u32], ctx: &mut FlushContext<'_>) {
+    pub fn process_data_multi(&mut self, regs: &Registers, data: &[u32]) {
         // Safe conversion: reinterpret &[u32] as &[u8] matching C++ reinterpret_cast.
         let byte_view: &[u8] =
             unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4) };
         let buffer: Vec<u8> = byte_view.to_vec();
-        self.process_data_bytes(&buffer, ctx);
+        self.process_data_bytes(regs, &buffer);
     }
 
     /// Target GPU virtual address for the current transfer.
-    pub fn exec_target_address(&self) -> GPUVAddr {
-        self.regs.dest.address()
+    pub fn exec_target_address(&self, regs: &Registers) -> GPUVAddr {
+        regs.dest.address()
     }
 
     /// Total upload size in bytes.
@@ -226,16 +208,16 @@ impl State {
     /// Upstream logic:
     ///   - Linear: iterate lines, call rasterizer->AccelerateInlineToMemory per line.
     ///   - Block-linear: compute BPP shift, read GPU memory, swizzle subrect, write back.
-    fn process_data_bytes(&mut self, read_buffer: &[u8], ctx: &mut FlushContext<'_>) {
-        let address = self.regs.dest.address();
+    fn process_data_bytes(&mut self, regs: &Registers, read_buffer: &[u8]) {
+        let address = regs.dest.address();
         if std::env::var_os("RUZU_TRACE_UPLOAD_BYTES").is_some() {
             log::info!(
                 "engine_upload::process_data_bytes target=0x{:X} bytes={} linear={} line_length={} line_count={}",
                 address,
                 read_buffer.len(),
                 self.is_linear,
-                self.regs.line_length_in,
-                self.regs.line_count,
+                regs.line_length_in,
+                regs.line_count,
             );
         }
         if std::env::var_os("RUZU_TRACE_DMA_FLOW").is_some() {
@@ -244,16 +226,22 @@ impl State {
                 address,
                 read_buffer.len(),
                 self.is_linear,
-                self.regs.line_length_in,
-                self.regs.line_count,
-                self.regs.dest.pitch,
-                self.regs.dest.width,
-                self.regs.dest.height,
-                self.regs.dest.depth,
-                self.regs.dest.x,
-                self.regs.dest.y
+                regs.line_length_in,
+                regs.line_count,
+                regs.dest.pitch,
+                regs.dest.width,
+                regs.dest.height,
+                regs.dest.depth,
+                regs.dest.x,
+                regs.dest.y
             );
         }
+        let Some(memory_manager) = self.memory_manager.as_ref().map(Arc::clone) else {
+            log::warn!(
+                "engine_upload::State::process_data_bytes: flush skipped (no MemoryManager bound)"
+            );
+            return;
+        };
         if self.is_linear {
             // Linear copy: iterate lines, call rasterizer->AccelerateInlineToMemory
             // for each line. Upstream:
@@ -262,33 +250,32 @@ impl State {
             //       buffer = read_buffer[line * line_length_in .. +line_length_in];
             //       rasterizer->AccelerateInlineToMemory(dest_line, line_length_in, buffer);
             //   }
-            for line in 0..self.regs.line_count as usize {
-                let dest_line = address + (line as u64) * (self.regs.dest.pitch as u64);
-                let start = line * self.regs.line_length_in as usize;
-                let end = start + self.regs.line_length_in as usize;
+            for line in 0..regs.line_count as usize {
+                let dest_line = address + (line as u64) * (regs.dest.pitch as u64);
+                let start = line * regs.line_length_in as usize;
+                let end = start + regs.line_length_in as usize;
                 if end <= read_buffer.len() {
-                    if let Some(ref mut rast) = ctx.rasterizer {
+                    let mut rasterizer = self.rasterizer.map(|handle| unsafe { handle.as_mut() });
+                    if let Some(ref mut rast) = rasterizer {
                         if std::env::var_os("RUZU_TRACE_INLINE_TO_MEMORY").is_some() {
                             let ptr = *rast as *mut dyn RasterizerInterface;
                             log::info!(
                                 "engine_upload::State::process_data_bytes calling_rasterizer ptr={:p} dest=0x{:X} size={}",
                                 ptr,
                                 dest_line,
-                                self.regs.line_length_in
+                                regs.line_length_in
                             );
                         }
                         rast.accelerate_inline_to_memory(
                             dest_line,
-                            self.regs.line_length_in as usize,
+                            regs.line_length_in as usize,
                             &read_buffer[start..end],
                         );
                     } else {
-                        // No rasterizer — fall back to direct memory write.
-                        ctx.memory_manager.lock().write_block(
-                            dest_line,
-                            &read_buffer[start..end],
-                            ctx.write_cpu_mem,
-                        );
+                        // Reduced fixtures may not bind a rasterizer; upstream runtime does.
+                        memory_manager
+                            .lock()
+                            .write_block(dest_line, &read_buffer[start..end]);
                     }
                 }
             }
@@ -297,9 +284,9 @@ impl State {
             // Upstream uses Common::FoldRight to compute bpp_shift as:
             //   min(4, min of countr_zero(width), countr_zero(x_elements),
             //       countr_zero(x_offset), countr_zero(address))
-            let mut width = self.regs.dest.width;
-            let mut x_elements = self.regs.line_length_in;
-            let mut x_offset = self.regs.dest.x;
+            let mut width = regs.dest.width;
+            let mut x_elements = regs.line_length_in;
+            let mut x_offset = regs.dest.x;
 
             // Compute bpp_shift matching upstream FoldRight(4, min(x, countr_zero(y)), ...)
             let bpp_shift = [width, x_elements, x_offset, address as u32]
@@ -315,23 +302,18 @@ impl State {
                 true,
                 bytes_per_pixel,
                 width,
-                self.regs.dest.height,
-                self.regs.dest.depth,
-                self.regs.dest.block_height(),
-                self.regs.dest.block_depth(),
+                regs.dest.height,
+                regs.dest.depth,
+                regs.dest.block_height(),
+                regs.dest.block_depth(),
             );
 
-            // Read existing GPU memory into tmp_buffer (upstream uses GpuGuestMemoryScoped
-            // with SafeReadCachedWrite mode).
+            // Read existing GPU memory into tmp_buffer. Upstream uses
+            // GpuGuestMemoryScoped<SafeReadCachedWrite>.
             self.tmp_buffer.resize(dst_size, 0);
-            // For reading GPU memory we need a CPU reader. The FlushContext doesn't currently
-            // provide one (write_cpu_mem is write-only). In the full integration, the parent
-            // engine would provide a read callback. For now, zero-fill is safe because
-            // swizzle_subrect overwrites the relevant parts.
-            let read_cpu = |_addr: u64, _dst: &mut [u8]| {};
-            ctx.memory_manager
+            memory_manager
                 .lock()
-                .read_block(address, &mut self.tmp_buffer, &read_cpu);
+                .read_block(address, &mut self.tmp_buffer);
 
             // Swizzle the upload data into the tiled buffer.
             decoders::swizzle_subrect(
@@ -339,25 +321,26 @@ impl State {
                 read_buffer,
                 bytes_per_pixel,
                 width,
-                self.regs.dest.height,
-                self.regs.dest.depth,
+                regs.dest.height,
+                regs.dest.depth,
                 x_offset,
-                self.regs.dest.y,
+                regs.dest.y,
                 x_elements,
-                self.regs.line_count,
-                self.regs.dest.block_height(),
-                self.regs.dest.block_depth(),
-                self.regs.line_length_in,
+                regs.line_count,
+                regs.dest.block_height(),
+                regs.dest.block_depth(),
+                regs.line_length_in,
             );
 
-            // Write the swizzled buffer back to GPU memory.
-            ctx.memory_manager
+            // Write the swizzled buffer back to GPU memory with the upstream cached-write path.
+            memory_manager
                 .lock()
-                .write_block(address, &self.tmp_buffer, ctx.write_cpu_mem);
+                .write_block_cached(address, &self.tmp_buffer);
         }
     }
 }
 
+#[cfg(test)]
 impl Default for State {
     fn default() -> Self {
         Self::new()

@@ -296,6 +296,7 @@ impl Default for KClientPort {
 mod tests {
     use super::*;
     use crate::core::System;
+    use crate::hle::kernel::k_port::KPort;
 
     #[test]
     fn create_session_allocates_and_registers_session_objects() {

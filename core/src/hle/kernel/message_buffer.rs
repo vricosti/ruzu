@@ -386,7 +386,8 @@ impl<'a> MessageBuffer<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::hle::result::{ResultCode, RESULT_INVALID_STATE, RESULT_SUCCESS};
+    use crate::hle::kernel::svc::svc_results::RESULT_INVALID_STATE;
+    use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 
     #[test]
     fn async_result_round_trip_uses_null_header() {
@@ -394,8 +395,8 @@ mod tests {
         let mut message = MessageBuffer::new(&mut words);
         message.set_async_result(RESULT_INVALID_STATE);
 
-        assert_eq!(words[0], 0);
-        assert_eq!(words[1], 0);
+        assert_eq!(message.buffer[0], 0);
+        assert_eq!(message.buffer[1], 0);
         assert_eq!(
             message.get_async_result().get_inner_value(),
             RESULT_INVALID_STATE.get_inner_value()
@@ -408,7 +409,7 @@ mod tests {
         let mut message = MessageBuffer::new(&mut words);
         let header = MessageHeader::new(5, false, 0, 0, 0, 0, 0, ReceiveListCountType::None as u32);
         message.set_message_header(&header);
-        words[2] = ResultCode::new(0xDEAD_BEEF).get_inner_value();
+        message.buffer[2] = ResultCode::new(0xDEAD_BEEF).get_inner_value();
 
         assert_eq!(message.get_async_result(), RESULT_SUCCESS);
     }

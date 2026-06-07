@@ -1475,8 +1475,8 @@ mod tests {
     use super::*;
     use crate::core::System;
     use crate::hle::ipc;
-    use crate::hle::kernel::k_process::KProcess;
-    use crate::hle::kernel::k_thread::{KThread, ThreadState};
+    use crate::hle::kernel::k_process::{KProcess, ProcessLock};
+    use crate::hle::kernel::k_thread::{KThread, KThreadLock, ThreadState};
     use crate::hle::kernel::k_typed_address::KProcessAddress;
     use crate::hle::kernel::svc::svc_port;
     use crate::hle::result::RESULT_SUCCESS;

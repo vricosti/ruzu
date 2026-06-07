@@ -503,7 +503,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use super::GlobalSchedulerContext;
-    use crate::hle::kernel::k_thread::KThread;
+    use crate::hle::kernel::k_thread::{KThread, KThreadLock};
 
     #[test]
     fn get_thread_by_thread_id_does_not_need_thread_mutex() {

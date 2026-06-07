@@ -197,9 +197,9 @@ pub fn terminate_process(_process_handle: Handle) -> ResultCode {
 mod tests {
     use super::*;
     use crate::core::System;
-    use crate::hle::kernel::k_process::{KProcess, ProcessState};
+    use crate::hle::kernel::k_process::{KProcess, ProcessLock, ProcessState};
     use crate::hle::kernel::k_scheduler::KScheduler;
-    use crate::hle::kernel::k_thread::{KThread, ThreadState};
+    use crate::hle::kernel::k_thread::{KThread, KThreadLock, ThreadState};
     use crate::hle::kernel::k_worker_task_manager::KWorkerTaskManager;
     use std::sync::{Arc, Mutex};
 

@@ -9,6 +9,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use crate::core::System;
+use crate::hle::kernel::k_memory_block::KMemoryInfo;
 use crate::hle::kernel::svc::svc_types::MemoryInfo;
 
 const CAPACITY: usize = 256;
@@ -21,6 +22,7 @@ pub enum MemoryHistoryKind {
     UnmapMemory,
     MapPhysicalMemory,
     UnmapPhysicalMemory,
+    IpcMapAlias,
 }
 
 impl MemoryHistoryKind {
@@ -32,6 +34,7 @@ impl MemoryHistoryKind {
             Self::UnmapMemory => "UnmapMemory",
             Self::MapPhysicalMemory => "MapPhysicalMemory",
             Self::UnmapPhysicalMemory => "UnmapPhysicalMemory",
+            Self::IpcMapAlias => "IpcMapAlias",
         }
     }
 }
@@ -49,6 +52,11 @@ struct MemoryHistoryEvent {
     perm: u32,
     ipc_count: u32,
     device_count: u32,
+    target_base: u64,
+    target_size: u64,
+    target_state: u32,
+    target_attr: u32,
+    target_perm: u32,
 }
 
 static HISTORY: OnceLock<Mutex<VecDeque<MemoryHistoryEvent>>> = OnceLock::new();
@@ -69,9 +77,19 @@ fn target() -> Option<u64> {
     })
 }
 
+pub fn target_address() -> Option<u64> {
+    target()
+}
+
 fn current_tid(system: &System) -> u64 {
     system
         .current_thread()
+        .and_then(|thread| thread.lock().ok().map(|guard| guard.get_thread_id()))
+        .unwrap_or(0)
+}
+
+fn current_tls_tid() -> u64 {
+    crate::hle::kernel::kernel::get_current_emu_thread()
         .and_then(|thread| thread.lock().ok().map(|guard| guard.get_thread_id()))
         .unwrap_or(0)
 }
@@ -118,13 +136,34 @@ pub fn record_query(system: &System, query_address: u64, info: &MemoryInfo) {
         perm: info.permission,
         ipc_count: info.ipc_count,
         device_count: info.device_count,
+        target_base: 0,
+        target_size: 0,
+        target_state: 0,
+        target_attr: 0,
+        target_perm: 0,
     });
 }
 
-pub fn record_heap(system: &System, size: u64, result: u32, out_address: u64) {
+pub fn record_heap(
+    system: &System,
+    size: u64,
+    result: u32,
+    out_address: u64,
+    target_info: Option<KMemoryInfo>,
+) {
     if target().is_none() {
         return;
     }
+    let (target_base, target_size, target_state, target_attr, target_perm) =
+        target_info.map_or((0, 0, 0, 0, 0), |info| {
+            (
+                info.m_address as u64,
+                info.m_size as u64,
+                info.m_state.bits(),
+                info.m_attribute.bits() as u32,
+                info.m_permission.bits() as u32,
+            )
+        });
     push(MemoryHistoryEvent {
         sequence: 0,
         tid: current_tid(system),
@@ -137,6 +176,11 @@ pub fn record_heap(system: &System, size: u64, result: u32, out_address: u64) {
         perm: 0,
         ipc_count: 0,
         device_count: 0,
+        target_base,
+        target_size,
+        target_state,
+        target_attr,
+        target_perm,
     });
 }
 
@@ -165,6 +209,11 @@ pub fn record_physical(
         perm: 0,
         ipc_count: 0,
         device_count: 0,
+        target_base: 0,
+        target_size: 0,
+        target_state: 0,
+        target_attr: 0,
+        target_perm: 0,
     });
 }
 
@@ -198,6 +247,50 @@ pub fn record_map_memory(
         perm: 0,
         ipc_count: 0,
         device_count: 0,
+        target_base: 0,
+        target_size: 0,
+        target_state: 0,
+        target_attr: 0,
+        target_perm: 0,
+    });
+}
+
+pub fn record_ipc_map_alias(
+    src_addr: u64,
+    dst_addr: u64,
+    size: u64,
+    result: u32,
+    state_bits: u32,
+    perm_bits: u32,
+    descriptor_attr: u32,
+) {
+    let Some(target) = target() else {
+        return;
+    };
+    if !range_covers(src_addr, size, target)
+        && !range_covers(dst_addr, size, target)
+        && !near(src_addr, target)
+        && !near(dst_addr, target)
+    {
+        return;
+    }
+    push(MemoryHistoryEvent {
+        sequence: 0,
+        tid: current_tls_tid(),
+        kind: MemoryHistoryKind::IpcMapAlias,
+        query_or_addr: dst_addr,
+        base_or_out: src_addr,
+        size,
+        state_or_result: result,
+        attr: descriptor_attr,
+        perm: perm_bits,
+        ipc_count: state_bits,
+        device_count: 0,
+        target_base: 0,
+        target_size: 0,
+        target_state: 0,
+        target_attr: 0,
+        target_perm: 0,
     });
 }
 
@@ -232,13 +325,18 @@ pub fn dump(reason: &str) {
             }
             MemoryHistoryKind::SetHeapSize => {
                 eprintln!(
-                    "[MEM_HISTORY] #{:05} tid={} {} size=0x{:X} -> result=0x{:08X} address=0x{:X}",
+                    "[MEM_HISTORY] #{:05} tid={} {} size=0x{:X} -> result=0x{:08X} address=0x{:X} target_base=0x{:X} target_size=0x{:X} target_state=0x{:X} target_attr=0x{:X} target_perm=0x{:X}",
                     event.sequence,
                     event.tid,
                     event.kind.as_str(),
                     event.size,
                     event.state_or_result,
                     event.base_or_out,
+                    event.target_base,
+                    event.target_size,
+                    event.target_state,
+                    event.target_attr,
+                    event.target_perm,
                 );
             }
             MemoryHistoryKind::MapMemory | MemoryHistoryKind::UnmapMemory => {
@@ -262,6 +360,21 @@ pub fn dump(reason: &str) {
                     event.query_or_addr,
                     event.size,
                     event.state_or_result,
+                );
+            }
+            MemoryHistoryKind::IpcMapAlias => {
+                eprintln!(
+                    "[MEM_HISTORY] #{:05} tid={} {} dst=0x{:X} src=0x{:X} size=0x{:X} result=0x{:08X} state=0x{:X} perm=0x{:X} attr=0x{:X}",
+                    event.sequence,
+                    event.tid,
+                    event.kind.as_str(),
+                    event.query_or_addr,
+                    event.base_or_out,
+                    event.size,
+                    event.state_or_result,
+                    event.ipc_count,
+                    event.perm,
+                    event.attr,
                 );
             }
         }

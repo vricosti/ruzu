@@ -1589,6 +1589,7 @@ impl EngineInterface for Fermi2D {
     }
 }
 
+#[cfg(test)]
 impl Default for Fermi2D {
     fn default() -> Self {
         Self::new(Arc::new(Mutex::new(MemoryManager::new(0))))
@@ -1630,6 +1631,33 @@ impl Engine for Fermi2D {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
+    use std::sync::Arc;
+
+    fn install_test_device_memory(
+        mm: &mut crate::memory_manager::MemoryManager,
+        backing: &mut [u8],
+    ) {
+        let device_memory = Arc::new(MaxwellDeviceMemoryManager::default());
+        device_memory.smmu_set_physical_base_for_test(backing.as_ptr() as usize);
+        device_memory.smmu_map_with_cpu_backing(
+            0x3000,
+            unsafe { backing.as_mut_ptr().add(0x3000) },
+            0x4000_3000,
+            0x1000,
+            5,
+            true,
+        );
+        device_memory.smmu_map_with_cpu_backing(
+            0x4000,
+            unsafe { backing.as_mut_ptr().add(0x4000) },
+            0x4000_4000,
+            0x1000,
+            5,
+            true,
+        );
+        mm.set_device_memory_manager(device_memory);
+    }
 
     #[test]
     fn test_address_accessors() {
@@ -2370,46 +2398,20 @@ mod tests {
 
         // Source data: 2 rows of 16 bytes each.
         let src_data: Vec<u8> = (0..32).collect();
-        let writes = std::sync::Arc::new(std::sync::Mutex::new(Vec::<(u64, Vec<u8>)>::new()));
+        let mut backing = vec![0u8; 0x5000];
+        backing[0x3000..0x3000 + src_data.len()].copy_from_slice(&src_data);
         {
             let mut mm = eng.memory_manager.lock();
+            install_test_device_memory(&mut mm, &mut backing);
             mm.map(0x1000, 0x3000, src_data.len() as u64, 0xFF, false);
             mm.map(0x2000, 0x4000, src_data.len() as u64, 0xFF, false);
-        }
-        {
-            let src_data = src_data.clone();
-            eng.memory_manager
-                .lock()
-                .set_guest_memory_reader(std::sync::Arc::new(move |addr, buf| match addr {
-                    0x3000 => {
-                        buf.fill(0);
-                        buf[..src_data.len()].copy_from_slice(&src_data);
-                    }
-                    0x4000 => buf.fill(0),
-                    _ => panic!("unexpected read addr 0x{addr:X}"),
-                }));
-        }
-        {
-            let writes_for_closure = std::sync::Arc::clone(&writes);
-            eng.memory_manager
-                .lock()
-                .set_guest_memory_writer(std::sync::Arc::new(move |addr, data| {
-                    writes_for_closure
-                        .lock()
-                        .unwrap()
-                        .push((addr, data.to_vec()));
-                }));
         }
 
         let pending = eng.execute_pending(&|_, _| panic!("legacy read_gpu path should be unused"));
 
         assert!(!eng.pending_blit);
         assert!(pending.is_empty());
-
-        let writes = writes.lock().unwrap();
-        assert_eq!(writes.len(), 1);
-        assert_eq!(writes[0].0, 0x4000);
-        assert_eq!(writes[0].1, src_data);
+        assert_eq!(&backing[0x4000..0x4000 + src_data.len()], &src_data);
     }
 
     #[test]
@@ -2453,35 +2455,13 @@ mod tests {
             1, 2, 3, 4, 5, 6, 7, 8, // row 0
             9, 10, 11, 12, 13, 14, 15, 16, // row 1
         ];
-        let writes = std::sync::Arc::new(std::sync::Mutex::new(Vec::<(u64, Vec<u8>)>::new()));
+        let mut backing = vec![0u8; 0x5000];
+        backing[0x3000..0x3000 + src_data.len()].copy_from_slice(&src_data);
         {
             let mut mm = eng.memory_manager.lock();
+            install_test_device_memory(&mut mm, &mut backing);
             mm.map(0x1000, 0x3000, src_data.len() as u64, 0xFF, false);
             mm.map(0x2000, 0x4000, 32, 0xFF, false);
-        }
-        {
-            let src_data = src_data.clone();
-            eng.memory_manager
-                .lock()
-                .set_guest_memory_reader(std::sync::Arc::new(move |addr, buf| match addr {
-                    0x3000 => {
-                        buf.fill(0);
-                        buf[..src_data.len()].copy_from_slice(&src_data);
-                    }
-                    0x4000 => buf.fill(0),
-                    _ => panic!("unexpected read addr 0x{addr:X}"),
-                }));
-        }
-        {
-            let writes_for_closure = std::sync::Arc::clone(&writes);
-            eng.memory_manager
-                .lock()
-                .set_guest_memory_writer(std::sync::Arc::new(move |addr, data| {
-                    writes_for_closure
-                        .lock()
-                        .unwrap()
-                        .push((addr, data.to_vec()));
-                }));
         }
 
         let pending = eng.execute_pending(&|_, _| panic!("legacy read_gpu path should be unused"));
@@ -2489,10 +2469,7 @@ mod tests {
         assert!(pending.is_empty());
 
         // copy_width = min(8, 16) = 8; each row copies 8 bytes into a 16-byte stride.
-        let writes = writes.lock().unwrap();
-        assert_eq!(writes.len(), 1);
-        assert_eq!(writes[0].0, 0x4000);
-        let dst = &writes[0].1;
+        let dst = &backing[0x4000..0x4000 + 32];
         assert_eq!(dst.len(), 32); // 2 rows * 16 bytes
         assert_eq!(&dst[0..8], &[1, 2, 3, 4, 5, 6, 7, 8]);
         assert_eq!(&dst[8..16], &[0, 0, 0, 0, 0, 0, 0, 0]); // padding

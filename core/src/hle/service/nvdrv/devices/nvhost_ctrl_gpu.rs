@@ -433,12 +433,7 @@ mod tests {
         assert_eq!(result, NvResult::Success);
         assert_eq!(
             params.gpu_time,
-            system
-                .core_timing()
-                .lock()
-                .unwrap()
-                .get_global_time_ns()
-                .as_nanos() as u64
+            system.core_timing().get_global_time_ns().as_nanos() as u64
         );
     }
 }

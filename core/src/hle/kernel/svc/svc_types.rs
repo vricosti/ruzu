@@ -543,6 +543,10 @@ impl MapDeviceAddressSpaceOption {
         unsafe { core::mem::transmute(perm_bits) }
     }
 
+    pub fn flags(&self) -> u32 {
+        (self.raw >> 16) & 0x1
+    }
+
     pub fn reserved(&self) -> u32 {
         (self.raw >> 17) & 0x7FFF
     }

@@ -520,11 +520,11 @@ mod tests {
     #[test]
     fn output_name_capacity_uses_real_buffer_size() {
         let mut ctx = HLERequestContext::new();
-        ctx.buffer_b_descriptors = vec![crate::hle::ipc::BufferDescriptorABW {
+        ctx.set_buffer_b_descriptors_for_test(vec![crate::hle::ipc::BufferDescriptorABW {
             size_bits_0_31: (IAudioDevice::AUDIO_DEVICE_NAME_SIZE * 3) as u32,
             address_bits_0_31: 0,
             raw_word2: 0,
-        }];
+        }]);
         assert_eq!(IAudioDevice::output_name_capacity(&ctx), 3);
     }
 

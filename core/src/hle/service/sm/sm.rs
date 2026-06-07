@@ -930,6 +930,77 @@ pub fn loop_process(service_manager: &Arc<Mutex<ServiceManager>>, system: crate:
     ServerManager::run_server(server_manager);
 }
 
+/// Register the `sm:` named port for unit-test systems without entering the
+/// blocking `ServerManager::LoopProcess`.
+///
+/// Runtime keeps using `loop_process`, matching upstream. This helper mirrors
+/// only the setup phase required by `System::new_for_test`: manage deferral,
+/// create the `sm:` named port, register the internal service lookup entry,
+/// bind the final `Arc<Mutex<ServerManager>>`, then publish ownership with a
+/// valid weak pointer so `ConnectToNamedPort` can wire child sessions.
+pub fn setup_sm_for_test(
+    service_manager: &Arc<Mutex<ServiceManager>>,
+    system: crate::core::SystemRef,
+) -> Arc<Mutex<ServerManager>> {
+    let mut server_manager = ServerManager::new(system);
+
+    let (_result, deferral_event) = server_manager.manage_deferral();
+    service_manager
+        .lock()
+        .unwrap()
+        .set_deferral_event(deferral_event);
+
+    let sm_service = Arc::new(Sm::new(service_manager.clone(), system));
+    let sm_clone = sm_service.clone();
+    let factory: SessionRequestHandlerFactory = Box::new(move || sm_clone.clone());
+    server_manager.manage_named_port("sm:", factory, 64);
+
+    {
+        let sm_clone2 = sm_service.clone();
+        let factory2: SessionRequestHandlerFactory = Box::new(move || sm_clone2.clone());
+        let deferral_event = {
+            let mut sm = service_manager.lock().unwrap();
+            let result = sm.register_service("sm:".to_string(), 64, factory2);
+            if result.is_error() {
+                log::error!(
+                    "SM::setup_sm_for_test: failed to register sm: in ServiceManager: 0x{:08X}",
+                    result.get_inner_value()
+                );
+            }
+            sm.deferral_event_clone()
+        };
+        if let Some(event) = deferral_event {
+            sm_service.signal_deferral_event(&event);
+        }
+    }
+
+    let manager = Arc::new(Mutex::new(server_manager));
+    let (owned_names, queue, wakeup) = {
+        let mut manager_guard = manager.lock().unwrap();
+        manager_guard.bind_self_reference(&manager);
+        (
+            manager_guard.take_owned_service_names(),
+            manager_guard.pending_registrations_arc(),
+            manager_guard.wakeup_event_arc(),
+        )
+    };
+    {
+        let mut sm = service_manager.lock().unwrap();
+        for name in owned_names {
+            sm.set_service_ownership(
+                &name,
+                ServiceOwnership {
+                    queue: queue.clone(),
+                    wakeup: wakeup.clone(),
+                    server_manager: Arc::downgrade(&manager),
+                },
+            );
+        }
+    }
+
+    manager
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -587,8 +587,8 @@ mod tests {
     use super::*;
     use crate::core::SystemRef;
     use crate::device_memory::DeviceMemory;
-    use crate::hle::kernel::k_process::KProcess;
-    use crate::hle::kernel::k_thread::KThread;
+    use crate::hle::kernel::k_process::{KProcess, ProcessLock};
+    use crate::hle::kernel::k_thread::{KThread, KThreadLock};
     use crate::hle::result::ResultCode;
     use crate::hle::service::hle_ipc::{SessionRequestHandler, SessionRequestManager};
     use crate::memory::memory::Memory;
@@ -697,28 +697,27 @@ mod tests {
     fn push_copy_object_id_writes_copy_handle_into_response() {
         use std::sync::{Arc, Mutex};
 
-        use crate::guest_memory::GuestMemory;
-        use crate::hle::kernel::k_process::KProcess;
+        use crate::hle::kernel::k_process::{KProcess, ProcessLock};
         use crate::hle::kernel::k_readable_event::KReadableEvent;
-        use crate::hle::kernel::k_thread::KThread;
-        use crate::hle::kernel::kernel::KernelCore;
-        use crate::memory::memory::Memory;
+        use crate::hle::kernel::k_thread::{KThread, KThreadLock};
+        use crate::hle::kernel::k_typed_address::KProcessAddress;
 
-        let kernel = Arc::new(Mutex::new(KernelCore::new()));
-        let memory = Arc::new(Mutex::new(Memory::new(Box::new(GuestMemory::new(0x2000)))));
-        let process = Arc::new(Mutex::new(KProcess::new()));
-        process.lock().unwrap().page_table.heap_region_start = 0;
-        process.lock().unwrap().page_table.heap_region_end = 0x2000;
+        let system = crate::core::System::new_for_test();
+        let mut process = KProcess::new();
+        process.process_id = 1;
+        process.initialize_handle_table();
+        process.create_memory(&system);
+        process.allocate_code_memory(0, 0x2000);
+        let process = Arc::new(ProcessLock::from_value(process));
 
-        let thread = Arc::new(Mutex::new(KThread::new()));
-        thread.lock().unwrap().tls_address = 0x100;
-        thread.lock().unwrap().parent = Some(Arc::downgrade(&process));
+        let thread = Arc::new(KThreadLock::new(KThread::new()));
+        {
+            let mut thread = thread.lock().unwrap();
+            thread.tls_address = KProcessAddress::new(0x100);
+            thread.parent = Some(Arc::downgrade(&process));
+        }
 
-        let mut ctx = HLERequestContext::new_with_thread(
-            Arc::clone(&kernel),
-            Arc::clone(&memory),
-            Arc::clone(&thread),
-        );
+        let mut ctx = HLERequestContext::new_with_thread(Arc::clone(&thread), 0x100);
 
         let readable_event = Arc::new(Mutex::new(KReadableEvent::new()));
         readable_event.lock().unwrap().object_id = 0x2000_0001;
@@ -740,7 +739,14 @@ mod tests {
 
         assert_eq!(ctx.write_to_outgoing_command_buffer(), RESULT_SUCCESS);
 
-        let mem = memory.lock().unwrap();
+        let mem = ctx
+            .owner_process_arc()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .get_memory()
+            .unwrap();
+        let mem = mem.lock().unwrap();
         let handle_word = mem.read_32(0x100 + 12);
         assert_ne!(handle_word, 0);
         assert_eq!(
@@ -759,9 +765,18 @@ mod tests {
         ctx.cmd_buf[start + 16] = 0x51;
         ctx.cmd_buf[start + 17] = 0;
 
+        #[derive(Clone, Copy)]
+        struct RawBlob([u8; 0x34]);
+
+        impl Default for RawBlob {
+            fn default() -> Self {
+                Self([0; 0x34])
+            }
+        }
+
         let mut rp = RequestParser::from_buffer(&ctx);
         rp.set_current_offset(start);
-        let _: [u8; 0x34] = rp.pop_raw();
+        let _: RawBlob = rp.pop_raw();
         assert_eq!(rp.get_current_offset(), start + 13);
         rp.align_for::<u64>();
         assert_eq!(rp.get_current_offset(), start + 14);

@@ -9,6 +9,8 @@
 use log::error;
 
 use crate::host1x::ffmpeg::ffmpeg::DecodeApi;
+use std::sync::Arc;
+
 use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
 use crate::host1x::host1x::FrameQueue;
 use crate::host1x::nvdec_common::{NvdecRegisters, VideoCodec};
@@ -16,11 +18,7 @@ use crate::host1x::nvdec_common::{NvdecRegisters, VideoCodec};
 /// Trait matching the virtual methods of the upstream `Tegra::Decoder` class.
 pub trait DecoderImpl: Send {
     /// Compose the frame bitstream for FFmpeg decoding.
-    fn compose_frame(
-        &mut self,
-        regs: &NvdecRegisters,
-        memory_manager: &MaxwellDeviceMemoryManager,
-    ) -> Vec<u8>;
+    fn compose_frame(&mut self, regs: &NvdecRegisters) -> Vec<u8>;
 
     /// Get progressive luma/chroma offsets.
     fn get_progressive_offsets(&self, regs: &NvdecRegisters) -> (u64, u64);
@@ -53,16 +51,24 @@ pub struct DecoderState {
     pub initialized: bool,
     pub vp9_hidden_frame: bool,
     pub id: i32,
+    pub memory_manager: Arc<MaxwellDeviceMemoryManager>,
+    pub frame_queue: Arc<FrameQueue>,
 }
 
 impl DecoderState {
-    pub fn new(id: i32) -> Self {
+    pub fn new(
+        id: i32,
+        memory_manager: Arc<MaxwellDeviceMemoryManager>,
+        frame_queue: Arc<FrameQueue>,
+    ) -> Self {
         Self {
             codec: VideoCodec::None,
             decode_api: DecodeApi::new(),
             initialized: false,
             vp9_hidden_frame: false,
             id,
+            memory_manager,
+            frame_queue,
         }
     }
 }
@@ -71,19 +77,15 @@ impl DecoderState {
 /// enqueue the result.
 ///
 /// Port of `Tegra::Decoder::Decode`.
-pub fn decode(
-    decoder: &mut dyn DecoderImpl,
-    regs: &NvdecRegisters,
-    memory_manager: &MaxwellDeviceMemoryManager,
-    frame_queue: &FrameQueue,
-) {
+pub fn decode(decoder: &mut dyn DecoderImpl, regs: &NvdecRegisters) {
     let state = decoder.state();
     if !state.initialized {
         return;
     }
     let id = state.id;
+    let frame_queue = Arc::clone(&state.frame_queue);
 
-    let packet_data = decoder.compose_frame(regs, memory_manager);
+    let packet_data = decoder.compose_frame(regs);
 
     // Send assembled bitstream to decoder.
     if !decoder.state_mut().decode_api.send_packet(&packet_data) {
@@ -144,5 +146,25 @@ pub fn decode(
                 frame_queue.push_present_order(id, luma_offset, f);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::DecoderState;
+    use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
+    use crate::host1x::host1x::FrameQueue;
+    use std::sync::Arc;
+
+    #[test]
+    fn decoder_state_owns_memory_manager_and_frame_queue_handles() {
+        let memory_manager = Arc::new(MaxwellDeviceMemoryManager::default());
+        let frame_queue = Arc::new(FrameQueue::new());
+
+        let state = DecoderState::new(3, Arc::clone(&memory_manager), Arc::clone(&frame_queue));
+
+        assert_eq!(state.id, 3);
+        assert!(Arc::ptr_eq(&state.memory_manager, &memory_manager));
+        assert!(Arc::ptr_eq(&state.frame_queue, &frame_queue));
     }
 }

@@ -942,6 +942,14 @@ impl HLERequestContext {
         &self.buffer_b_descriptors
     }
 
+    #[cfg(test)]
+    pub fn set_buffer_b_descriptors_for_test(
+        &mut self,
+        descriptors: Vec<ipc::BufferDescriptorABW>,
+    ) {
+        self.buffer_b_descriptors = descriptors;
+    }
+
     pub fn buffer_descriptor_c(&self) -> &[ipc::BufferDescriptorC] {
         &self.buffer_c_descriptors
     }
@@ -1504,34 +1512,6 @@ impl HLERequestContext {
             return Vec::new();
         }
         let mut buf = vec![0u8; size];
-        if let Some(thread) = self.thread.as_ref() {
-            if let Some(process_memory) = Self::owner_legacy_process_memory(thread) {
-                let mem = process_memory.read().unwrap();
-                let bytes = mem.read_bytes(address, size);
-                if bytes.len() == size {
-                    if bytes.iter().all(|&byte| byte == 0) {
-                        if let Some(ref memory) = self.memory {
-                            let mut checked = vec![0u8; size];
-                            if memory
-                                .lock()
-                                .unwrap()
-                                .read_block_checked_quiet(address, &mut checked)
-                                && checked.iter().any(|&byte| byte != 0)
-                            {
-                                return checked;
-                            }
-                        }
-                    }
-                    return bytes;
-                }
-                log::warn!(
-                    "read_guest_memory: legacy read returned short buffer addr={:#x} size={:#x} read={:#x}",
-                    address,
-                    size,
-                    bytes.len()
-                );
-            }
-        }
         if let Some(ref memory) = self.memory {
             let accessible = memory.lock().unwrap().read_block_checked(address, &mut buf);
             if accessible {
@@ -1543,6 +1523,21 @@ impl HLERequestContext {
                 size
             );
             return buf;
+        }
+        if let Some(thread) = self.thread.as_ref() {
+            if let Some(process_memory) = Self::owner_legacy_process_memory(thread) {
+                let mem = process_memory.read().unwrap();
+                let bytes = mem.read_bytes(address, size);
+                if bytes.len() == size {
+                    return bytes;
+                }
+                log::warn!(
+                    "read_guest_memory: legacy read returned short buffer addr={:#x} size={:#x} read={:#x}",
+                    address,
+                    size,
+                    bytes.len()
+                );
+            }
         }
         log::error!(
             "read_guest_memory: no Memory available for addr={:#x} size={:#x}",
@@ -2173,8 +2168,9 @@ mod tests {
     use super::*;
     use crate::core::SystemRef;
     use crate::device_memory::DeviceMemory;
-    use crate::hle::kernel::k_process::KProcess;
-    use crate::hle::kernel::k_thread::KThread;
+    use crate::hle::kernel::k_process::{KProcess, ProcessLock};
+    use crate::hle::kernel::k_thread::{KThread, KThreadLock};
+    use crate::hle::service::os::event::Event;
     use crate::memory::memory::Memory;
 
     #[test]
@@ -2281,7 +2277,7 @@ mod tests {
         thread.lock().unwrap().parent = Some(Arc::downgrade(&process));
 
         let queue = Arc::new(Mutex::new(Vec::new()));
-        let wakeup = Arc::new(super::os::event::Event::new());
+        let wakeup = Arc::new(Event::new());
         let manager = Arc::new(Mutex::new(
             SessionRequestManager::new_with_registration_queue(queue.clone(), wakeup),
         ));

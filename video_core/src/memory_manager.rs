@@ -12,10 +12,13 @@ use common::multi_level_page_table::MultiLevelPageTable;
 use common::range_map::RangeMap;
 use common::virtual_buffer::VirtualBuffer;
 
+use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
+use crate::invalidation_accumulator::InvalidationAccumulator;
 use crate::pte_kind::PteKind;
 use crate::rasterizer_interface::{RasterizerHandle, RasterizerInterface};
 
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 
 // ── Constants ───────────────────────────────────────────────────────────
 
@@ -95,18 +98,40 @@ pub struct GpuMemoryManager {
 
     // Unique identifier for rasterizer callbacks
     unique_identifier: usize,
+    /// Upstream stores `MaxwellDeviceMemoryManager& memory` in `MemoryManager`.
+    device_memory: Arc<MaxwellDeviceMemoryManager>,
     /// Upstream stores `VideoCore::RasterizerInterface* rasterizer`.
     rasterizer: Option<RasterizerHandle>,
+    /// Upstream stores `std::unique_ptr<VideoCommon::InvalidationAccumulator>`.
+    accumulator: InvalidationAccumulator,
 }
 
 impl GpuMemoryManager {
     /// Upstream: `MemoryManager::MemoryManager(system, memory, address_space_bits, split_address,
     ///            big_page_bits, page_bits)`.
+    #[cfg(test)]
     pub fn new() -> Self {
         Self::with_params(40, 1u64 << 34, 16, 12)
     }
 
+    #[cfg(test)]
     pub fn with_params(
+        address_space_bits: u64,
+        split_address: u64,
+        big_page_bits: u64,
+        page_bits: u64,
+    ) -> Self {
+        Self::with_params_and_device_memory(
+            Arc::new(MaxwellDeviceMemoryManager::default()),
+            address_space_bits,
+            split_address,
+            big_page_bits,
+            page_bits,
+        )
+    }
+
+    pub fn with_params_and_device_memory(
+        device_memory: Arc<MaxwellDeviceMemoryManager>,
         address_space_bits: u64,
         split_address: u64,
         big_page_bits: u64,
@@ -165,9 +190,11 @@ impl GpuMemoryManager {
             big_page_table_dev,
             big_entries,
             big_page_continuous,
-            kind_map: RangeMap::new(PteKind::Invalid),
+            kind_map: RangeMap::new(PteKind::INVALID),
             unique_identifier,
+            device_memory,
             rasterizer: None,
+            accumulator: InvalidationAccumulator::new(),
         }
     }
 
@@ -272,6 +299,24 @@ impl GpuMemoryManager {
             (!(1u64 << sub_index) & continuous_mask) | (if value { 1u64 << sub_index } else { 0 });
     }
 
+    fn is_device_big_page_continuous(&self, current_dev_addr: u64) -> bool {
+        let mut base_ptr = self.device_memory.get_pointer(current_dev_addr) as usize;
+        if base_ptr == 0 {
+            return false;
+        }
+
+        let mut start_dev_addr = current_dev_addr + self.page_size;
+        while start_dev_addr < current_dev_addr + self.big_page_size {
+            base_ptr += self.page_size as usize;
+            let next_ptr = self.device_memory.get_pointer(start_dev_addr) as usize;
+            if next_ptr == 0 || base_ptr != next_ptr {
+                return false;
+            }
+            start_dev_addr += self.page_size;
+        }
+        true
+    }
+
     // ── Page table operations ───────────────────────────────────────────
 
     /// Upstream: `PageTableOp<entry_type>(gpu_addr, dev_addr, size, kind)`.
@@ -342,11 +387,8 @@ impl GpuMemoryManager {
                 let index = self.page_entry_index_big(current_gpu_addr);
                 let sub_value = (current_dev_addr >> CPU_PAGE_BITS) as u32;
                 self.big_page_table_dev[index] = sub_value;
-                // Upstream checks continuity via memory.GetPointer for each sub-page.
-                // Without direct host pointer access, assume continuous (conservative).
-                // This is correct when the guest maps physically contiguous pages,
-                // which is the common case for GPU buffers.
-                self.set_big_page_continuous(index, true);
+                let is_continuous = self.is_device_big_page_continuous(current_dev_addr);
+                self.set_big_page_continuous(index, is_continuous);
             }
             offset += big_page_size;
         }
@@ -397,9 +439,9 @@ impl GpuMemoryManager {
             is_big_pages
         );
         if is_big_pages {
-            self.big_page_table_op(EntryType::Reserved, gpu_addr, 0, size, PteKind::Invalid)
+            self.big_page_table_op(EntryType::Reserved, gpu_addr, 0, size, PteKind::INVALID)
         } else {
-            self.page_table_op(EntryType::Reserved, gpu_addr, 0, size, PteKind::Invalid)
+            self.page_table_op(EntryType::Reserved, gpu_addr, 0, size, PteKind::INVALID)
         }
     }
 
@@ -421,8 +463,8 @@ impl GpuMemoryManager {
                 rasterizer.unmap_memory(map_addr, map_size);
             }
         });
-        self.big_page_table_op(EntryType::Free, gpu_addr, 0, size, PteKind::Invalid);
-        self.page_table_op(EntryType::Free, gpu_addr, 0, size, PteKind::Invalid);
+        self.big_page_table_op(EntryType::Free, gpu_addr, 0, size, PteKind::INVALID);
+        self.page_table_op(EntryType::Free, gpu_addr, 0, size, PteKind::INVALID);
     }
 
     // ── Address translation ─────────────────────────────────────────────
@@ -555,17 +597,95 @@ impl GpuMemoryManager {
 
     // ── Read/Write block operations ─────────────────────────────────────
 
-    /// Read bytes from GPU VA space using a CPU memory reader.
-    ///
-    /// Upstream: `MemoryManager::ReadBlockImpl<false>(...)` (unsafe variant).
-    ///
-    /// Walks big pages first. For unmapped big pages, falls back to small pages.
-    pub fn read(&self, gpu_src_addr: u64, dst: &mut [u8], read_cpu_mem: &dyn Fn(u64, &mut [u8])) {
-        self.read_block_impl(gpu_src_addr, dst, read_cpu_mem);
+    /// Reduced-fixture callback reader; production uses owner-backed `read_block*`.
+    #[cfg(test)]
+    pub fn read_with_callback(
+        &self,
+        gpu_src_addr: u64,
+        dst: &mut [u8],
+        read_cpu_mem: &dyn Fn(u64, &mut [u8]),
+    ) {
+        self.read_block_impl_unsafe(gpu_src_addr, dst, read_cpu_mem);
     }
 
-    /// Internal read implementation with two-level page walk.
-    fn read_block_impl(
+    fn flush_device_segment(&self, dev_addr: u64, size: usize) {
+        let Some(handle) = self.rasterizer else {
+            return;
+        };
+        let _lo_mm = common::lock_order::guard("gpu_mm");
+        // Upstream `ReadBlockImpl` is const but still flushes the rasterizer.
+        // `RasterizerHandle` is the existing non-owning owner bridge for that
+        // C++ pointer relationship.
+        unsafe {
+            handle.with_mut(|rasterizer| {
+                rasterizer.flush_region(dev_addr, size as u64);
+            });
+        }
+    }
+
+    fn invalidate_device_segment(&self, dev_addr: u64, size: usize) {
+        let Some(handle) = self.rasterizer else {
+            return;
+        };
+        let _lo_mm = common::lock_order::guard("gpu_mm");
+        unsafe {
+            handle.with_mut(|rasterizer| {
+                rasterizer.invalidate_region(dev_addr, size as u64);
+            });
+        }
+    }
+
+    /// Upstream: `MemoryManager::ReadBlockImpl<true>(...)`.
+    fn read_block_impl_safe(
+        &self,
+        gpu_src_addr: u64,
+        dst: &mut [u8],
+        read_cpu_mem: &dyn Fn(u64, &mut [u8]),
+    ) {
+        let size = dst.len();
+        let mut dst_offset = 0usize;
+        let mut remaining = size;
+        let mut page_index = (gpu_src_addr >> self.big_page_bits) as usize;
+        let mut page_offset = (gpu_src_addr & self.big_page_mask) as usize;
+        let mut current_address = gpu_src_addr;
+
+        while remaining > 0 {
+            let copy_amount = std::cmp::min(self.big_page_size as usize - page_offset, remaining);
+            let entry = self.get_entry_big(current_address);
+
+            match entry {
+                EntryType::Mapped => {
+                    let dev_addr_base =
+                        (self.big_page_table_dev[page_index] as u64) << CPU_PAGE_BITS;
+                    let dev_addr = dev_addr_base + page_offset as u64;
+                    self.flush_device_segment(dev_addr, copy_amount);
+                    read_cpu_mem(dev_addr, &mut dst[dst_offset..dst_offset + copy_amount]);
+                    dst_offset += copy_amount;
+                }
+                EntryType::Reserved => {
+                    dst[dst_offset..dst_offset + copy_amount].fill(0);
+                    dst_offset += copy_amount;
+                }
+                EntryType::Free => {
+                    let base = (page_index as u64) << self.big_page_bits | page_offset as u64;
+                    self.read_small_pages_safe(
+                        base,
+                        copy_amount,
+                        &mut dst[dst_offset..dst_offset + copy_amount],
+                        read_cpu_mem,
+                    );
+                    dst_offset += copy_amount;
+                }
+            }
+            page_index += 1;
+            page_offset = 0;
+            remaining -= copy_amount;
+            current_address += copy_amount as u64;
+        }
+    }
+
+    /// Internal unsafe read implementation with two-level page walk.
+    fn read_block_impl_unsafe(
         &self,
         gpu_src_addr: u64,
         dst: &mut [u8],
@@ -610,6 +730,54 @@ impl GpuMemoryManager {
                     dst_offset += copy_amount;
                 }
             }
+            page_index += 1;
+            page_offset = 0;
+            remaining -= copy_amount;
+            current_address += copy_amount as u64;
+        }
+    }
+
+    /// Read using small page table entries.
+    fn read_small_pages_safe(
+        &self,
+        gpu_addr: u64,
+        size: usize,
+        dst: &mut [u8],
+        read_cpu_mem: &dyn Fn(u64, &mut [u8]),
+    ) {
+        let mut dst_offset = 0usize;
+        let mut remaining = size;
+        let mut page_index = (gpu_addr >> self.page_bits) as usize;
+        let mut page_offset = (gpu_addr & self.page_mask) as usize;
+        let mut current_address = gpu_addr;
+
+        while remaining > 0 {
+            let copy_amount = std::cmp::min(self.page_size as usize - page_offset, remaining);
+            let entry = self.get_entry_small(current_address);
+
+            match entry {
+                EntryType::Mapped => {
+                    let dev_addr_base = (self.page_table[page_index] as u64) << CPU_PAGE_BITS;
+                    let dev_addr = dev_addr_base + page_offset as u64;
+                    self.flush_device_segment(dev_addr, copy_amount);
+                    read_cpu_mem(dev_addr, &mut dst[dst_offset..dst_offset + copy_amount]);
+                }
+                _ => {
+                    if remaining > 0 {
+                        static UNMAPPED_COUNT: AtomicUsize = AtomicUsize::new(0);
+                        let c = UNMAPPED_COUNT.fetch_add(1, Ordering::Relaxed);
+                        if c < 10 {
+                            log::warn!(
+                                "gpu_mm::read: unmapped GPU VA {:#x} (entry={:?})",
+                                current_address,
+                                entry
+                            );
+                        }
+                    }
+                    dst[dst_offset..dst_offset + copy_amount].fill(0);
+                }
+            }
+            dst_offset += copy_amount;
             page_index += 1;
             page_offset = 0;
             remaining -= copy_amount;
@@ -665,10 +833,14 @@ impl GpuMemoryManager {
         }
     }
 
-    /// Write bytes to GPU VA space using a CPU memory writer.
-    ///
-    /// Upstream: `MemoryManager::WriteBlockImpl<false>(...)`.
-    pub fn write(&self, gpu_dest_addr: u64, src: &[u8], write_cpu_mem: &mut dyn FnMut(u64, &[u8])) {
+    /// Reduced-fixture callback writer; production uses owner-backed `write_block*`.
+    #[cfg(test)]
+    pub fn write_with_callback(
+        &self,
+        gpu_dest_addr: u64,
+        src: &[u8],
+        write_cpu_mem: &mut dyn FnMut(u64, &[u8]),
+    ) {
         self.write_block_impl(gpu_dest_addr, src, write_cpu_mem);
     }
 
@@ -719,6 +891,82 @@ impl GpuMemoryManager {
         }
     }
 
+    fn write_block_impl_safe(
+        &self,
+        gpu_dest_addr: u64,
+        src: &[u8],
+        write_cpu_mem: &mut dyn FnMut(u64, &[u8]),
+    ) {
+        let size = src.len();
+        let mut src_offset = 0usize;
+        let mut remaining = size;
+        let mut page_index = (gpu_dest_addr >> self.big_page_bits) as usize;
+        let mut page_offset = (gpu_dest_addr & self.big_page_mask) as usize;
+        let mut current_address = gpu_dest_addr;
+
+        while remaining > 0 {
+            let copy_amount = std::cmp::min(self.big_page_size as usize - page_offset, remaining);
+            let entry = self.get_entry_big(current_address);
+
+            match entry {
+                EntryType::Mapped => {
+                    let dev_addr_base =
+                        (self.big_page_table_dev[page_index] as u64) << CPU_PAGE_BITS;
+                    let dev_addr = dev_addr_base + page_offset as u64;
+                    self.invalidate_device_segment(dev_addr, copy_amount);
+                    write_cpu_mem(dev_addr, &src[src_offset..src_offset + copy_amount]);
+                    src_offset += copy_amount;
+                }
+                EntryType::Reserved => {
+                    src_offset += copy_amount;
+                }
+                EntryType::Free => {
+                    let base = (page_index as u64) << self.big_page_bits | page_offset as u64;
+                    self.write_small_pages_safe(
+                        base,
+                        &src[src_offset..src_offset + copy_amount],
+                        write_cpu_mem,
+                    );
+                    src_offset += copy_amount;
+                }
+            }
+            page_index += 1;
+            page_offset = 0;
+            remaining -= copy_amount;
+            current_address += copy_amount as u64;
+        }
+    }
+
+    fn write_small_pages_safe(
+        &self,
+        gpu_addr: u64,
+        src: &[u8],
+        write_cpu_mem: &mut dyn FnMut(u64, &[u8]),
+    ) {
+        let mut src_offset = 0usize;
+        let mut remaining = src.len();
+        let mut page_index = (gpu_addr >> self.page_bits) as usize;
+        let mut page_offset = (gpu_addr & self.page_mask) as usize;
+        let mut current_address = gpu_addr;
+
+        while remaining > 0 {
+            let copy_amount = std::cmp::min(self.page_size as usize - page_offset, remaining);
+            let entry = self.get_entry_small(current_address);
+
+            if entry == EntryType::Mapped {
+                let dev_addr_base = (self.page_table[page_index] as u64) << CPU_PAGE_BITS;
+                let dev_addr = dev_addr_base + page_offset as u64;
+                self.invalidate_device_segment(dev_addr, copy_amount);
+                write_cpu_mem(dev_addr, &src[src_offset..src_offset + copy_amount]);
+            }
+            src_offset += copy_amount;
+            page_index += 1;
+            page_offset = 0;
+            remaining -= copy_amount;
+            current_address += copy_amount as u64;
+        }
+    }
+
     fn write_small_pages(
         &self,
         gpu_addr: u64,
@@ -751,46 +999,123 @@ impl GpuMemoryManager {
 
     // ── Block read/write public API ─────────────────────────────────────
 
-    /// Upstream: `MemoryManager::ReadBlock(gpu_src, output, size)`.
-    pub fn read_block(&self, gpu_src: u64, output: &mut [u8], read_cpu: &dyn Fn(u64, &mut [u8])) {
-        self.read(gpu_src, output, read_cpu);
-    }
-
-    /// Upstream: `MemoryManager::ReadBlockUnsafe(gpu_src, output, size)`.
-    pub fn read_block_unsafe(
+    /// Reduced-fixture callback variant of `MemoryManager::ReadBlock`.
+    #[cfg(test)]
+    pub fn read_block_with_callback(
         &self,
         gpu_src: u64,
         output: &mut [u8],
         read_cpu: &dyn Fn(u64, &mut [u8]),
     ) {
-        self.read(gpu_src, output, read_cpu);
+        self.read_block_impl_safe(gpu_src, output, read_cpu);
+    }
+
+    /// Reduced-fixture callback variant of `MemoryManager::ReadBlockUnsafe`.
+    #[cfg(test)]
+    pub fn read_block_unsafe_with_callback(
+        &self,
+        gpu_src: u64,
+        output: &mut [u8],
+        read_cpu: &dyn Fn(u64, &mut [u8]),
+    ) {
+        self.read_with_callback(gpu_src, output, read_cpu);
+    }
+
+    /// Reduced-fixture callback variant of `MemoryManager::WriteBlock`.
+    #[cfg(test)]
+    pub fn write_block_with_callback(
+        &self,
+        gpu_dest: u64,
+        input: &[u8],
+        write_cpu: &mut dyn FnMut(u64, &[u8]),
+    ) {
+        self.write_block_impl_safe(gpu_dest, input, write_cpu);
+    }
+
+    /// Reduced-fixture callback variant of `MemoryManager::WriteBlockUnsafe`.
+    #[cfg(test)]
+    pub fn write_block_unsafe_with_callback(
+        &self,
+        gpu_dest: u64,
+        input: &[u8],
+        write_cpu: &mut dyn FnMut(u64, &[u8]),
+    ) {
+        self.write_with_callback(gpu_dest, input, write_cpu);
+    }
+
+    /// Reduced-fixture callback variant of `MemoryManager::WriteBlockCached`.
+    #[cfg(test)]
+    pub fn write_block_cached_with_callback(
+        &mut self,
+        gpu_dest: u64,
+        input: &[u8],
+        write_cpu: &mut dyn FnMut(u64, &[u8]),
+    ) {
+        self.write_with_callback(gpu_dest, input, write_cpu);
+        self.accumulator.add(gpu_dest, input.len());
+    }
+
+    /// Upstream: `MemoryManager::ReadBlock(gpu_src, output, size)`.
+    pub fn read_block(&self, gpu_src: u64, output: &mut [u8]) -> bool {
+        self.read_block_impl_safe(gpu_src, output, &|addr, output| {
+            self.device_memory.smmu_read_block(addr, output);
+        });
+        true
+    }
+
+    /// Upstream: `MemoryManager::ReadBlockUnsafe(gpu_src, output, size)`.
+    pub fn read_block_unsafe(&self, gpu_src: u64, output: &mut [u8]) -> bool {
+        self.read_block_impl_unsafe(gpu_src, output, &|addr, output| {
+            self.device_memory.smmu_read_block_unsafe(addr, output);
+        });
+        true
     }
 
     /// Upstream: `MemoryManager::WriteBlock(gpu_dest, input, size)`.
-    pub fn write_block(&self, gpu_dest: u64, input: &[u8], write_cpu: &mut dyn FnMut(u64, &[u8])) {
-        self.write(gpu_dest, input, write_cpu);
+    pub fn write_block(&self, gpu_dest: u64, input: &[u8]) -> bool {
+        self.write_block_impl_safe(gpu_dest, input, &mut |addr, data| {
+            self.device_memory.smmu_write_block_unsafe(addr, data);
+        });
+        true
     }
 
     /// Upstream: `MemoryManager::WriteBlockUnsafe(gpu_dest, input, size)`.
-    pub fn write_block_unsafe(
-        &self,
-        gpu_dest: u64,
-        input: &[u8],
-        write_cpu: &mut dyn FnMut(u64, &[u8]),
-    ) {
-        self.write(gpu_dest, input, write_cpu);
+    pub fn write_block_unsafe(&self, gpu_dest: u64, input: &[u8]) -> bool {
+        let trace = std::env::var_os("RUZU_GPU_VA_TRACE").is_some();
+        self.write_block_impl(gpu_dest, input, &mut |addr, data| {
+            if trace {
+                let head = data
+                    .iter()
+                    .take(4)
+                    .enumerate()
+                    .fold(0u32, |acc, (idx, byte)| acc | ((*byte as u32) << (idx * 8)));
+                log::info!(
+                    "[GPU_VA_WRITEBLOCK] gpu_va=0x{:X} cpu=0x{:X} size={} head_u32=0x{:X}",
+                    gpu_dest,
+                    addr,
+                    data.len(),
+                    head
+                );
+            }
+            self.device_memory.smmu_write_block_unsafe(addr, data);
+        });
+        true
     }
 
     /// Upstream: `MemoryManager::WriteBlockCached(gpu_dest, input, size)`.
-    pub fn write_block_cached(
-        &self,
-        gpu_dest: u64,
-        input: &[u8],
-        write_cpu: &mut dyn FnMut(u64, &[u8]),
-    ) {
-        self.write(gpu_dest, input, write_cpu);
-        // Upstream: accumulator->Add(gpu_dest_addr, size);
-        // Accumulator not yet wired.
+    pub fn write_block_cached(&mut self, gpu_dest: u64, input: &[u8]) -> bool {
+        self.write_block_unsafe(gpu_dest, input);
+        self.accumulator.add(gpu_dest, input.len());
+        true
+    }
+
+    /// Upstream-owned copy path using the stored `MaxwellDeviceMemoryManager`.
+    pub fn copy_block(&mut self, gpu_dest: u64, gpu_src: u64, size: u64) -> bool {
+        let mut tmp = vec![0u8; size as usize];
+        self.read_block(gpu_src, &mut tmp);
+        self.write_block(gpu_dest, &tmp);
+        self.flush_region(gpu_dest, size);
+        true
     }
 
     // ── Query methods ───────────────────────────────────────────────────
@@ -1132,9 +1457,10 @@ impl GpuMemoryManager {
         result
     }
 
-    /// Upstream: `MemoryManager::CopyBlock(gpu_dest, gpu_src, size)`.
-    pub fn copy_block(
-        &self,
+    /// Reduced-fixture callback variant of `MemoryManager::CopyBlock`.
+    #[cfg(test)]
+    pub fn copy_block_with_callback(
+        &mut self,
         gpu_dest: u64,
         gpu_src: u64,
         size: u64,
@@ -1142,8 +1468,9 @@ impl GpuMemoryManager {
         write_cpu: &mut dyn FnMut(u64, &[u8]),
     ) {
         let mut tmp = vec![0u8; size as usize];
-        self.read(gpu_src, &mut tmp, read_cpu);
-        self.write(gpu_dest, &tmp, write_cpu);
+        self.read_with_callback(gpu_src, &mut tmp, read_cpu);
+        self.write_with_callback(gpu_dest, &tmp, write_cpu);
+        self.flush_region(gpu_dest, size);
     }
 
     /// Upstream: `MemoryManager::GetPageKind(gpu_addr)`.
@@ -1267,8 +1594,29 @@ impl GpuMemoryManager {
     }
 
     /// Upstream: `MemoryManager::FlushCaching()`.
-    pub fn flush_caching(&self) {
-        // Upstream: drains accumulator + calls rasterizer->InnerInvalidation.
+    pub fn flush_caching(&mut self) {
+        if !self.accumulator.any_accumulated() {
+            return;
+        }
+
+        let mut gpu_ranges = Vec::new();
+        self.accumulator
+            .callback(|addr, size| gpu_ranges.push((addr, size)));
+
+        let mut device_ranges = Vec::new();
+        for (addr, size) in gpu_ranges {
+            device_ranges.extend(self.get_submapped_device_ranges(addr, size as u64));
+        }
+
+        let _ = self.with_rasterizer_mut(|rasterizer| {
+            let sequences: Vec<(u64, usize)> = device_ranges
+                .iter()
+                .map(|&(addr, size)| (addr, size as usize))
+                .collect();
+            rasterizer.inner_invalidation(&sequences);
+        });
+
+        self.accumulator.clear();
     }
 
     /// Check if a GPU address is within the valid address range.
@@ -1291,7 +1639,8 @@ impl GpuMemoryManager {
 
     /// Read a value of type `T` from GPU virtual address space.
     ///
-    /// Upstream: `template <typename T> T MemoryManager::Read(GPUVAddr addr) const`
+    /// Reduced-fixture typed read; production callers should use owner-backed block reads.
+    #[cfg(test)]
     pub fn read_value<T: Copy>(
         &self,
         gpu_addr: u64,
@@ -1302,15 +1651,14 @@ impl GpuMemoryManager {
             return None;
         }
         let mut bytes = vec![0u8; size];
-        self.read(gpu_addr, &mut bytes, read_cpu_mem);
+        self.read_with_callback(gpu_addr, &mut bytes, read_cpu_mem);
         // Safety: T is Copy and we have exactly size_of::<T>() bytes.
         let value = unsafe { std::ptr::read(bytes.as_ptr() as *const T) };
         Some(value)
     }
 
-    /// Write a value of type `T` to GPU virtual address space.
-    ///
-    /// Upstream: `template <typename T> void MemoryManager::Write(GPUVAddr addr, T data)`
+    /// Reduced-fixture typed write; production callers should use owner-backed block writes.
+    #[cfg(test)]
     pub fn write_value<T: Copy>(
         &self,
         gpu_addr: u64,
@@ -1319,7 +1667,7 @@ impl GpuMemoryManager {
     ) {
         let size = std::mem::size_of::<T>();
         let bytes = unsafe { std::slice::from_raw_parts(&data as *const T as *const u8, size) };
-        self.write(gpu_addr, bytes, write_cpu_mem);
+        self.write_with_callback(gpu_addr, bytes, write_cpu_mem);
     }
 
     // ── Legacy helpers (backward compat) ────────────────────────────────
@@ -1343,6 +1691,7 @@ impl GpuMemoryManager {
     }
 }
 
+#[cfg(test)]
 impl Default for GpuMemoryManager {
     fn default() -> Self {
         Self::new()
@@ -1352,36 +1701,10 @@ impl Default for GpuMemoryManager {
 // ── Helper ──────────────────────────────────────────────────────────────
 
 fn pte_kind_from_u32(raw: u32) -> PteKind {
-    // PteKind is repr(u8), so truncate and try to match.
-    // The upstream passes PTEKind::INVALID (0xFF) as default.
-    // For unknown values, use Invalid.
-    if raw == 0xFF || raw > 0xFF {
-        return PteKind::Invalid;
-    }
-    // Safety: we validate the range. Unknown values within 0..0xFF that
-    // don't correspond to a variant are treated as Invalid for safety.
-    // The enum has many variants; try direct transmute for known ones.
-    // For robustness, just store the raw value in the kind_map.
-    // Since we can't easily validate all enum variants, use unsafe transmute
-    // with a fallback.
-    //
-    // However, the kind_map stores PteKind so we need a valid variant.
-    // The simplest correct approach: if the value matches a known variant, use it.
-    // Otherwise use Invalid. In practice, games use a small subset of kinds.
-    //
-    // For now, use a brute force approach via the Pitch variant (0x00) as base.
-    if raw == 0 {
-        return PteKind::Pitch;
-    }
-    // For all other values, try unsafe transmute. PteKind is repr(u8) and
-    // the enum covers many GPU PTE kinds. Values not covered by the enum
-    // are still valid GPU kinds but not listed — treat as Invalid.
-    // This matches upstream which just stores the raw value.
-    //
-    // Actually, upstream stores PTEKind as an enum class with the full range.
-    // Our PteKind enum may not cover all values. For safety, just use Invalid
-    // for unlisted values. The kind is only used for GetPageKind queries.
-    PteKind::Invalid
+    // Upstream callsites use `static_cast<Tegra::PTEKind>(params.kind)`.
+    // `PteKind` is a transparent raw-byte newtype so invalid/unknown values are
+    // preserved in `kind_map` instead of being collapsed to INVALID.
+    PteKind::from_raw(raw as u8)
 }
 
 // ── MemoryManager (outer wrapper) ───────────────────────────────────────
@@ -1393,17 +1716,22 @@ fn pte_kind_from_u32(raw: u32) -> PteKind {
 pub struct MemoryManager {
     id: usize,
     inner: GpuMemoryManager,
-    guest_memory_reader: Option<std::sync::Arc<dyn Fn(u64, &mut [u8]) + Send + Sync>>,
-    guest_memory_writer: Option<std::sync::Arc<dyn Fn(u64, &[u8]) + Send + Sync>>,
+    /// Upstream stores `MaxwellDeviceMemoryManager& memory` directly.
+    /// Rust keeps the Host1x owner as an `Arc` while the broader owner graph is
+    /// still shared through handles.
+    device_memory: Arc<MaxwellDeviceMemoryManager>,
 }
 
 impl MemoryManager {
-    /// Upstream: `MemoryManager(system, address_space_bits=40, split=1<<34, big_page_bits=16,
-    ///            page_bits=12)`.
+    /// Reduced test constructor. Upstream runtime constructors always receive
+    /// `Core::System&` and resolve `MaxwellDeviceMemoryManager&` from it or
+    /// receive the device-memory owner explicitly.
+    #[cfg(test)]
     pub fn new(id: usize) -> Self {
         Self::new_with_geometry(id, 40, 1u64 << 34, 16, 12)
     }
 
+    #[cfg(test)]
     pub fn new_with_geometry(
         id: usize,
         address_space_bits: u64,
@@ -1411,16 +1739,35 @@ impl MemoryManager {
         big_page_bits: u64,
         page_bits: u64,
     ) -> Self {
+        Self::new_with_geometry_and_device_memory(
+            id,
+            Arc::new(MaxwellDeviceMemoryManager::default()),
+            address_space_bits,
+            split_address,
+            big_page_bits,
+            page_bits,
+        )
+    }
+
+    pub fn new_with_geometry_and_device_memory(
+        id: usize,
+        device_memory: Arc<MaxwellDeviceMemoryManager>,
+        address_space_bits: u64,
+        split_address: u64,
+        big_page_bits: u64,
+        page_bits: u64,
+    ) -> Self {
+        let inner_device_memory = Arc::clone(&device_memory);
         Self {
             id,
-            inner: GpuMemoryManager::with_params(
+            inner: GpuMemoryManager::with_params_and_device_memory(
+                inner_device_memory,
                 address_space_bits,
                 split_address,
                 big_page_bits,
                 page_bits,
             ),
-            guest_memory_reader: None,
-            guest_memory_writer: None,
+            device_memory,
         }
     }
 
@@ -1449,107 +1796,130 @@ impl MemoryManager {
         self.inner.is_granular_range(gpu_addr, size)
     }
 
-    pub fn read_block(&self, gpu_src: u64, output: &mut [u8], read_cpu: &dyn Fn(u64, &mut [u8])) {
-        self.inner.read_block(gpu_src, output, read_cpu);
-    }
-
-    pub fn read_block_unsafe(
+    #[cfg(test)]
+    pub fn read_block_with_callback(
         &self,
         gpu_src: u64,
         output: &mut [u8],
         read_cpu: &dyn Fn(u64, &mut [u8]),
     ) {
-        self.inner.read_block_unsafe(gpu_src, output, read_cpu);
+        self.inner
+            .read_block_with_callback(gpu_src, output, read_cpu);
     }
 
-    pub fn write_block(&self, gpu_dest: u64, input: &[u8], write_cpu: &mut dyn FnMut(u64, &[u8])) {
-        self.inner.write_block(gpu_dest, input, write_cpu);
+    #[cfg(test)]
+    pub fn read_block_unsafe_with_callback(
+        &self,
+        gpu_src: u64,
+        output: &mut [u8],
+        read_cpu: &dyn Fn(u64, &mut [u8]),
+    ) {
+        self.inner
+            .read_block_unsafe_with_callback(gpu_src, output, read_cpu);
     }
 
-    pub fn write_block_unsafe(
+    #[cfg(test)]
+    pub fn write_block_with_callback(
         &self,
         gpu_dest: u64,
         input: &[u8],
         write_cpu: &mut dyn FnMut(u64, &[u8]),
     ) {
-        self.inner.write_block_unsafe(gpu_dest, input, write_cpu);
+        self.inner
+            .write_block_with_callback(gpu_dest, input, write_cpu);
     }
 
-    pub fn write_block_cached(
+    #[cfg(test)]
+    pub fn write_block_unsafe_with_callback(
         &self,
         gpu_dest: u64,
         input: &[u8],
         write_cpu: &mut dyn FnMut(u64, &[u8]),
     ) {
-        self.inner.write_block_cached(gpu_dest, input, write_cpu);
+        self.inner
+            .write_block_unsafe_with_callback(gpu_dest, input, write_cpu);
     }
 
-    pub fn flush_caching(&self) {
+    #[cfg(test)]
+    pub fn write_block_cached_with_callback(
+        &mut self,
+        gpu_dest: u64,
+        input: &[u8],
+        write_cpu: &mut dyn FnMut(u64, &[u8]),
+    ) {
+        self.inner
+            .write_block_cached_with_callback(gpu_dest, input, write_cpu);
+    }
+
+    pub fn flush_caching(&mut self) {
         self.inner.flush_caching();
     }
 
-    pub fn set_guest_memory_reader(
+    /// Reduced-fixture callback variant of `MemoryManager::CopyBlock`.
+    #[cfg(test)]
+    pub fn copy_block_with_callback(
         &mut self,
-        reader: std::sync::Arc<dyn Fn(u64, &mut [u8]) + Send + Sync>,
+        gpu_dest: u64,
+        gpu_src: u64,
+        size: u64,
+        read_cpu: &dyn Fn(u64, &mut [u8]),
+        write_cpu: &mut dyn FnMut(u64, &[u8]),
     ) {
-        self.guest_memory_reader = Some(reader);
-    }
-
-    pub fn set_guest_memory_writer(
-        &mut self,
-        writer: std::sync::Arc<dyn Fn(u64, &[u8]) + Send + Sync>,
-    ) {
-        self.guest_memory_writer = Some(writer);
-    }
-
-    pub fn read_block_owned(&self, gpu_src: u64, output: &mut [u8]) -> bool {
-        let Some(reader) = self.guest_memory_reader.as_ref().cloned() else {
-            return false;
-        };
-        self.inner.read_block(gpu_src, output, &*reader);
-        true
-    }
-
-    pub fn write_block_owned(&self, gpu_dest: u64, input: &[u8]) {
-        let Some(writer) = self.guest_memory_writer.as_ref().cloned() else {
-            return;
-        };
         self.inner
-            .write_block(gpu_dest, input, &mut |cpu_addr, data| {
-                writer(cpu_addr, data)
-            });
+            .copy_block_with_callback(gpu_dest, gpu_src, size, read_cpu, write_cpu);
     }
 
-    pub fn write_block_unsafe_owned(&self, gpu_dest: u64, input: &[u8]) {
-        let Some(writer) = self.guest_memory_writer.as_ref().cloned() else {
-            if std::env::var_os("RUZU_GPU_VA_TRACE").is_some() {
-                log::info!(
-                    "[GPU_VA_WRITEBLOCK] gpu_va=0x{:X} size={} unmapped_reason=no_writer",
-                    gpu_dest,
-                    input.len()
-                );
-            }
-            return;
+    /// Upstream: `MemoryManager::GetSpan(gpu_addr, size)`.
+    pub fn get_span(&self, gpu_addr: u64, size: usize) -> *mut u8 {
+        if !self.inner.is_continuous_range(gpu_addr, size as u64) {
+            return std::ptr::null_mut();
+        }
+        let Some(device_addr) = self.inner.gpu_to_cpu_address(gpu_addr) else {
+            return std::ptr::null_mut();
         };
-        let trace = std::env::var_os("RUZU_GPU_VA_TRACE").is_some();
-        self.inner
-            .write_block_unsafe(gpu_dest, input, &mut |cpu_addr, data| {
-                if trace {
-                    let head = data
-                        .iter()
-                        .take(4)
-                        .enumerate()
-                        .fold(0u32, |acc, (idx, byte)| acc | ((*byte as u32) << (idx * 8)));
-                    log::info!(
-                        "[GPU_VA_WRITEBLOCK] gpu_va=0x{:X} cpu=0x{:X} size={} head_u32=0x{:X}",
-                        gpu_dest,
-                        cpu_addr,
-                        data.len(),
-                        head
-                    );
-                }
-                writer(cpu_addr, data)
-            });
+        self.device_memory.get_span(device_addr, size)
+    }
+
+    /// Const variant of `get_span`.
+    pub fn get_span_const(&self, gpu_addr: u64, size: usize) -> *const u8 {
+        self.get_span(gpu_addr, size) as *const u8
+    }
+
+    pub fn set_device_memory_manager(&mut self, device_memory: Arc<MaxwellDeviceMemoryManager>) {
+        self.inner.device_memory = Arc::clone(&device_memory);
+        self.device_memory = device_memory;
+    }
+
+    pub fn read_block(&self, gpu_src: u64, output: &mut [u8]) -> bool {
+        self.inner.read_block(gpu_src, output)
+    }
+
+    pub fn read_block_unsafe(&self, gpu_src: u64, output: &mut [u8]) -> bool {
+        self.inner.read_block_unsafe(gpu_src, output)
+    }
+
+    pub fn write_block(&self, gpu_dest: u64, input: &[u8]) -> bool {
+        self.inner.write_block(gpu_dest, input)
+    }
+
+    pub fn write_block_unsafe(&self, gpu_dest: u64, input: &[u8]) -> bool {
+        let written = self.inner.write_block_unsafe(gpu_dest, input);
+        if !written && std::env::var_os("RUZU_GPU_VA_TRACE").is_some() {
+            log::info!(
+                "[GPU_VA_WRITEBLOCK] gpu_va=0x{:X} size={} unmapped_reason=no_writer",
+                gpu_dest,
+                input.len()
+            );
+        }
+        written
+    }
+
+    pub fn write_block_cached(&mut self, gpu_dest: u64, input: &[u8]) -> bool {
+        self.inner.write_block_cached(gpu_dest, input)
+    }
+
+    pub fn copy_block(&mut self, gpu_dest: u64, gpu_src: u64, size: u64) -> bool {
+        self.inner.copy_block(gpu_dest, gpu_src, size)
     }
 
     pub fn flush_region(&mut self, gpu_addr: u64, size: u64) {
@@ -1581,7 +1951,7 @@ impl MemoryManager {
     }
 
     pub fn get_page_kind_raw(&self, gpu_addr: u64) -> u32 {
-        self.inner.get_page_kind(gpu_addr) as u32
+        self.inner.get_page_kind(gpu_addr).raw() as u32
     }
 
     pub fn get_submapped_range(&self, gpu_addr: u64, size: u64) -> Vec<(u64, u64)> {
@@ -1638,6 +2008,7 @@ impl MemoryManager {
     }
 }
 
+#[cfg(test)]
 impl Default for MemoryManager {
     fn default() -> Self {
         Self::new(0)
@@ -1655,6 +2026,7 @@ mod tests {
         unmap_calls: Arc<Mutex<Vec<(u64, u64)>>>,
         flush_calls: Arc<Mutex<Vec<(u64, u64)>>>,
         invalidate_calls: Arc<Mutex<Vec<(u64, u64)>>>,
+        inner_invalidation_calls: Arc<Mutex<Vec<Vec<(u64, usize)>>>>,
         dirty_regions: Arc<Mutex<Vec<(u64, u64)>>>,
     }
 
@@ -1665,6 +2037,7 @@ mod tests {
                 unmap_calls: Arc::new(Mutex::new(Vec::new())),
                 flush_calls: Arc::new(Mutex::new(Vec::new())),
                 invalidate_calls: Arc::new(Mutex::new(Vec::new())),
+                inner_invalidation_calls: Arc::new(Mutex::new(Vec::new())),
                 dirty_regions: Arc::new(Mutex::new(Vec::new())),
             }
         }
@@ -1726,6 +2099,12 @@ mod tests {
         fn invalidate_region(&mut self, addr: u64, size: u64) {
             self.invalidate_calls.lock().unwrap().push((addr, size));
         }
+        fn inner_invalidation(&mut self, sequences: &[(u64, usize)]) {
+            self.inner_invalidation_calls
+                .lock()
+                .unwrap()
+                .push(sequences.to_vec());
+        }
         fn on_cache_invalidation(&mut self, _addr: u64, _size: u64) {}
         fn on_cpu_write(&mut self, _addr: u64, _size: u64) -> bool {
             false
@@ -1756,7 +2135,7 @@ mod tests {
     fn test_map_and_translate_big_pages() {
         let mut mm = GpuMemoryManager::new();
         // Map using big pages (address < split_address = 1<<34)
-        mm.map_ex(0x10000, 0xDEAD_0000, 0x10000, PteKind::Invalid, true);
+        mm.map_ex(0x10000, 0xDEAD_0000, 0x10000, PteKind::INVALID, true);
 
         assert_eq!(mm.translate(0x10000), Some(0xDEAD_0000));
         assert_eq!(mm.translate(0x10500), Some(0xDEAD_0500));
@@ -1767,7 +2146,7 @@ mod tests {
     fn test_map_and_translate_small_pages() {
         let mut mm = GpuMemoryManager::new();
         // Map using small pages
-        mm.map_ex(0x1000, 0xBEEF_0000, 0x2000, PteKind::Invalid, false);
+        mm.map_ex(0x1000, 0xBEEF_0000, 0x2000, PteKind::INVALID, false);
 
         assert_eq!(mm.translate(0x1000), Some(0xBEEF_0000));
         assert_eq!(mm.translate(0x1500), Some(0xBEEF_0500));
@@ -1785,7 +2164,7 @@ mod tests {
     #[test]
     fn test_unmap() {
         let mut mm = GpuMemoryManager::new();
-        mm.map_ex(0x10000, 0xBEEF_0000, 0x10000, PteKind::Invalid, true);
+        mm.map_ex(0x10000, 0xBEEF_0000, 0x10000, PteKind::INVALID, true);
         assert_eq!(mm.translate(0x10000), Some(0xBEEF_0000));
 
         mm.unmap(0x10000, 0x10000);
@@ -1793,10 +2172,21 @@ mod tests {
     }
 
     #[test]
+    fn page_kind_preserves_unknown_raw_values() {
+        let mut mm = MemoryManager::new_with_geometry(42, 32, 0x1_0000_0000, 16, 12);
+
+        mm.map(0x10000, 0x9000_0000, 0x1000, 0x93, true);
+        assert_eq!(mm.get_page_kind_raw(0x10000), 0x93);
+
+        mm.map(0x20000, 0x9000_1000, 0x1000, 0x1ff, true);
+        assert_eq!(mm.get_page_kind_raw(0x20000), 0xff);
+    }
+
+    #[test]
     fn test_dual_table_fallback() {
         let mut mm = GpuMemoryManager::new();
         // Map small pages at an address below split (big table will be Free).
-        mm.map_ex(0x1000, 0xAAAA_0000, 0x1000, PteKind::Invalid, false);
+        mm.map_ex(0x1000, 0xAAAA_0000, 0x1000, PteKind::INVALID, false);
 
         // Big entry is Free, so gpu_to_cpu_address falls back to small table.
         assert_eq!(mm.translate(0x1000), Some(0xAAAA_0000));
@@ -1805,10 +2195,10 @@ mod tests {
     #[test]
     fn test_read_via_callback() {
         let mut mm = GpuMemoryManager::new();
-        mm.map_ex(0x10000, 0x8000_0000, 0x10000, PteKind::Invalid, true);
+        mm.map_ex(0x10000, 0x8000_0000, 0x10000, PteKind::INVALID, true);
 
         let mut buf = [0u8; 4];
-        mm.read(0x10000, &mut buf, &|addr, dst| {
+        mm.read_with_callback(0x10000, &mut buf, &|addr, dst| {
             let bytes = (addr as u32).to_le_bytes();
             let len = dst.len().min(bytes.len());
             dst[..len].copy_from_slice(&bytes[..len]);
@@ -1821,11 +2211,11 @@ mod tests {
     #[test]
     fn test_write_via_callback() {
         let mut mm = GpuMemoryManager::new();
-        mm.map_ex(0x10000, 0x8000_0000, 0x10000, PteKind::Invalid, true);
+        mm.map_ex(0x10000, 0x8000_0000, 0x10000, PteKind::INVALID, true);
 
         let mut written: Vec<(u64, Vec<u8>)> = Vec::new();
         let data = [0xDE, 0xAD, 0xBE, 0xEF];
-        mm.write(0x10000, &data, &mut |addr, src| {
+        mm.write_with_callback(0x10000, &data, &mut |addr, src| {
             written.push((addr, src.to_vec()));
         });
 
@@ -1838,21 +2228,64 @@ mod tests {
     fn test_is_continuous_range() {
         let mut mm = GpuMemoryManager::new();
         // Two contiguous big pages.
-        mm.map_ex(0x10000, 0x8000_0000, 0x20000, PteKind::Invalid, true);
+        mm.map_ex(0x10000, 0x8000_0000, 0x20000, PteKind::INVALID, true);
         assert!(mm.is_continuous_range(0x10000, 0x20000));
 
         // Non-contiguous: two separate mappings.
         let mut mm2 = GpuMemoryManager::new();
-        mm2.map_ex(0x10000, 0x8000_0000, 0x10000, PteKind::Invalid, true);
-        mm2.map_ex(0x20000, 0x9000_0000, 0x10000, PteKind::Invalid, true);
+        mm2.map_ex(0x10000, 0x8000_0000, 0x10000, PteKind::INVALID, true);
+        mm2.map_ex(0x20000, 0x9000_0000, 0x10000, PteKind::INVALID, true);
         assert!(!mm2.is_continuous_range(0x10000, 0x20000));
+    }
+
+    #[test]
+    fn big_page_continuity_uses_device_memory_pointers() {
+        let device_memory = Arc::new(MaxwellDeviceMemoryManager::default());
+        let backing = vec![0u8; 0x1_0000];
+        device_memory.smmu_set_physical_base_for_test(backing.as_ptr() as usize);
+        device_memory.smmu_map_with_cpu_backing(
+            0x9000_0000,
+            backing.as_ptr(),
+            0x5000_0000,
+            backing.len(),
+            3,
+            true,
+        );
+
+        let mut mm = GpuMemoryManager::with_params_and_device_memory(
+            Arc::clone(&device_memory),
+            32,
+            0x1_0000_0000,
+            16,
+            12,
+        );
+        mm.map_ex(0x10000, 0x9000_0000, 0x1_0000, PteKind::INVALID, true);
+        assert!(mm.is_granular_range(0x10800, 0x8000));
+
+        device_memory.smmu_map_with_cpu_backing(
+            0x9010_0000,
+            backing.as_ptr(),
+            0x5000_0000,
+            0x1000,
+            3,
+            true,
+        );
+        let mut mm = GpuMemoryManager::with_params_and_device_memory(
+            Arc::clone(&device_memory),
+            32,
+            0x1_0000_0000,
+            16,
+            12,
+        );
+        mm.map_ex(0x20000, 0x9010_0000, 0x1_0000, PteKind::INVALID, true);
+        assert!(!mm.is_granular_range(0x20800, 0x8000));
     }
 
     #[test]
     fn test_max_continuous_range() {
         let mut mm = GpuMemoryManager::new();
-        mm.map_ex(0x10000, 0x8000_0000, 0x10000, PteKind::Invalid, true);
-        mm.map_ex(0x20000, 0x9000_0000, 0x10000, PteKind::Invalid, true);
+        mm.map_ex(0x10000, 0x8000_0000, 0x10000, PteKind::INVALID, true);
+        mm.map_ex(0x20000, 0x9000_0000, 0x10000, PteKind::INVALID, true);
 
         assert_eq!(mm.max_continuous_range(0x10000, 0x20000), 0x10000);
     }
@@ -1920,12 +2353,288 @@ mod tests {
     }
 
     #[test]
+    fn write_block_cached_accumulates_and_flushes_device_ranges() {
+        let mut mm = MemoryManager::new_with_geometry(10, 32, 0x1_0000_0000, 16, 12);
+        let rasterizer = TestRasterizer::new();
+        let inner_calls = Arc::clone(&rasterizer.inner_invalidation_calls);
+
+        mm.bind_rasterizer(&rasterizer);
+        mm.map(0x20000, 0x9100_0000, 0x2000, 0, false);
+
+        let mut writes = Vec::new();
+        mm.write_block_cached_with_callback(0x20000, &[0x11; 0x20], &mut |addr, data| {
+            writes.push((addr, data.len()));
+        });
+        mm.write_block_cached_with_callback(0x20020, &[0x22; 0x20], &mut |addr, data| {
+            writes.push((addr, data.len()));
+        });
+
+        assert_eq!(writes, vec![(0x9100_0000, 0x20), (0x9100_0020, 0x20)]);
+        assert!(inner_calls.lock().unwrap().is_empty());
+
+        mm.flush_caching();
+
+        assert_eq!(
+            *inner_calls.lock().unwrap(),
+            vec![vec![(0x9100_0000, 0x40)]]
+        );
+
+        mm.flush_caching();
+        assert_eq!(inner_calls.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn copy_block_flushes_destination_device_range() {
+        let mut mm = MemoryManager::new_with_geometry(12, 32, 0x1_0000_0000, 16, 12);
+        let rasterizer = TestRasterizer::new();
+        let flush_calls = Arc::clone(&rasterizer.flush_calls);
+
+        mm.bind_rasterizer(&rasterizer);
+        mm.map(0x10000, 0x8000_0000, 0x1000, 0, false);
+        mm.map(0x20000, 0x9000_0000, 0x1000, 0, false);
+
+        let mut writes = Vec::new();
+        mm.copy_block_with_callback(
+            0x20040,
+            0x10020,
+            0x20,
+            &|addr, output| {
+                for (index, byte) in output.iter_mut().enumerate() {
+                    *byte = (addr as u8).wrapping_add(index as u8);
+                }
+            },
+            &mut |addr, data| {
+                writes.push((addr, data.to_vec()));
+            },
+        );
+
+        let expected: Vec<u8> = (0..0x20)
+            .map(|index| (0x8000_0020u64 as u8).wrapping_add(index as u8))
+            .collect();
+        assert_eq!(writes, vec![(0x9000_0040, expected)]);
+        assert_eq!(*flush_calls.lock().unwrap(), vec![(0x9000_0040, 0x20)]);
+    }
+
+    #[test]
+    fn read_block_flushes_but_read_block_unsafe_does_not() {
+        let mut mm = MemoryManager::new_with_geometry(14, 32, 0x1_0000_0000, 16, 12);
+        let rasterizer = TestRasterizer::new();
+        let flush_calls = Arc::clone(&rasterizer.flush_calls);
+
+        mm.bind_rasterizer(&rasterizer);
+        mm.map(0x20000, 0x9000_0000, 0x1000, 0, false);
+
+        let reader = |addr: u64, output: &mut [u8]| {
+            for (index, byte) in output.iter_mut().enumerate() {
+                *byte = (addr as u8).wrapping_add(index as u8);
+            }
+        };
+
+        let mut output = [0u8; 0x20];
+        mm.read_block_with_callback(0x20040, &mut output, &reader);
+        assert_eq!(*flush_calls.lock().unwrap(), vec![(0x9000_0040, 0x20)]);
+
+        mm.read_block_unsafe_with_callback(0x20080, &mut output, &reader);
+        assert_eq!(flush_calls.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn write_block_invalidates_but_write_block_unsafe_does_not() {
+        let mut mm = MemoryManager::new_with_geometry(15, 32, 0x1_0000_0000, 16, 12);
+        let rasterizer = TestRasterizer::new();
+        let invalidate_calls = Arc::clone(&rasterizer.invalidate_calls);
+
+        mm.bind_rasterizer(&rasterizer);
+        mm.map(0x20000, 0x9000_0000, 0x1000, 0, false);
+
+        let mut writes = Vec::new();
+        mm.write_block_with_callback(0x20040, &[0xA5; 0x20], &mut |addr, data| {
+            writes.push((addr, data.len()));
+        });
+        assert_eq!(*invalidate_calls.lock().unwrap(), vec![(0x9000_0040, 0x20)]);
+        assert_eq!(writes, vec![(0x9000_0040, 0x20)]);
+
+        mm.write_block_unsafe_with_callback(0x20080, &[0x5A; 0x20], &mut |addr, data| {
+            writes.push((addr, data.len()));
+        });
+        assert_eq!(invalidate_calls.lock().unwrap().len(), 1);
+        assert_eq!(writes, vec![(0x9000_0040, 0x20), (0x9000_0080, 0x20)]);
+    }
+
+    #[test]
+    fn get_span_translates_gpu_range_through_device_memory() {
+        let device_memory = Arc::new(MaxwellDeviceMemoryManager::default());
+        let backing = vec![0u8; 0x3000];
+        device_memory.smmu_set_physical_base_for_test(backing.as_ptr() as usize);
+        device_memory.smmu_map_with_cpu_backing(
+            0x9000_0000,
+            backing.as_ptr(),
+            0x4000_0000,
+            0x3000,
+            3,
+            true,
+        );
+        let mut mm = MemoryManager::new_with_geometry_and_device_memory(
+            11,
+            Arc::clone(&device_memory),
+            32,
+            0x1_0000_0000,
+            16,
+            12,
+        );
+        mm.map(0x20000, 0x9000_0000, 0x3000, 0, false);
+
+        assert_eq!(mm.get_span(0x20800, 0x1800), unsafe {
+            backing.as_ptr().add(0x800) as *mut u8
+        });
+        assert!(mm.get_span(0x20800, 0x2801).is_null());
+
+        mm.unmap(0x20000, 0x3000);
+        assert!(mm.get_span(0x20800, 0x100).is_null());
+    }
+
+    #[test]
+    fn write_block_unsafe_uses_device_memory_without_invalidation() {
+        let device_memory = Arc::new(MaxwellDeviceMemoryManager::default());
+        let mut backing = vec![0u8; 0x1000];
+        let invalidations = Arc::new(Mutex::new(Vec::new()));
+        let invalidations_clone = Arc::clone(&invalidations);
+        device_memory.set_invalidate_region(Box::new(move |addr, size| {
+            invalidations_clone.lock().unwrap().push((addr, size));
+        }));
+        device_memory.smmu_set_physical_base_for_test(backing.as_ptr() as usize);
+        device_memory.smmu_map_with_cpu_backing(
+            0x9000_0000,
+            backing.as_mut_ptr(),
+            0x5000_0000,
+            backing.len(),
+            3,
+            true,
+        );
+
+        let mut mm = MemoryManager::new_with_geometry_and_device_memory(
+            13,
+            Arc::clone(&device_memory),
+            32,
+            0x1_0000_0000,
+            16,
+            12,
+        );
+        mm.map(0x20000, 0x9000_0000, 0x1000, 0, false);
+
+        mm.write_block_unsafe(0x20040, &[0x7B; 0x20]);
+
+        assert_eq!(&backing[0x40..0x60], &[0x7B; 0x20]);
+        assert!(invalidations.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn read_block_unsafe_uses_device_memory_without_flush() {
+        let device_memory = Arc::new(MaxwellDeviceMemoryManager::default());
+        let backing: Vec<u8> = (0..0x1000).map(|value| value as u8).collect();
+        let flushes = Arc::new(Mutex::new(Vec::new()));
+        let flushes_clone = Arc::clone(&flushes);
+        device_memory.set_flush_region(Box::new(move |addr, size| {
+            flushes_clone.lock().unwrap().push((addr, size));
+        }));
+        device_memory.smmu_set_physical_base_for_test(backing.as_ptr() as usize);
+        device_memory.smmu_map_with_cpu_backing(
+            0x9000_0000,
+            backing.as_ptr(),
+            0x5000_0000,
+            backing.len(),
+            3,
+            true,
+        );
+
+        let mut mm = MemoryManager::new_with_geometry_and_device_memory(
+            14,
+            Arc::clone(&device_memory),
+            32,
+            0x1_0000_0000,
+            16,
+            12,
+        );
+        mm.map(0x20000, 0x9000_0000, 0x1000, 0, false);
+
+        let mut output = [0u8; 0x20];
+        assert!(mm.read_block_unsafe(0x20040, &mut output));
+
+        assert_eq!(&output, &backing[0x40..0x60]);
+        assert!(flushes.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn read_block_uses_device_memory_owner_when_present() {
+        let device_memory = Arc::new(MaxwellDeviceMemoryManager::default());
+        let mut mm = MemoryManager::new_with_geometry_and_device_memory(
+            11,
+            Arc::clone(&device_memory),
+            32,
+            0x1_0000_0000,
+            16,
+            12,
+        );
+        mm.map(0x10000, 0x8000, 0x1000, 0, false);
+
+        let mut output = [0xFFu8; 0x1000];
+        assert!(mm.read_block(0x10000, &mut output));
+
+        assert_eq!(output, [0u8; 0x1000]);
+    }
+
+    #[test]
+    fn write_block_uses_device_memory_owner_when_present() {
+        let device_memory = Arc::new(MaxwellDeviceMemoryManager::default());
+        let mut mm = MemoryManager::new_with_geometry_and_device_memory(
+            12,
+            Arc::clone(&device_memory),
+            32,
+            0x1_0000_0000,
+            16,
+            12,
+        );
+        mm.map(0x10000, 0x8000, 0x1000, 0, false);
+
+        mm.write_block(0x10000, &[0x5A; 0x1000]);
+    }
+
+    #[test]
+    fn write_block_cached_uses_device_memory_owner_and_accumulates() {
+        let device_memory = Arc::new(MaxwellDeviceMemoryManager::default());
+        let mut backing = vec![0u8; 0x1000];
+        device_memory.smmu_set_physical_base_for_test(backing.as_ptr() as usize);
+        device_memory.smmu_map_with_cpu_backing(
+            0x8000,
+            backing.as_ptr(),
+            0x4000,
+            backing.len(),
+            1,
+            true,
+        );
+        let mut mm = MemoryManager::new_with_geometry_and_device_memory(
+            13,
+            Arc::clone(&device_memory),
+            32,
+            0x1_0000_0000,
+            16,
+            12,
+        );
+        mm.map(0x10000, 0x8000, 0x1000, 0, false);
+
+        assert!(mm.write_block_cached(0x10020, &[0xA5; 0x20]));
+        mm.flush_caching();
+
+        assert_eq!(&backing[0x20..0x40], &[0xA5; 0x20]);
+    }
+
+    #[test]
     fn test_get_submapped_range() {
         let mut mm = GpuMemoryManager::new();
         // Map two contiguous big pages, then a gap, then one more.
-        mm.map_ex(0x10000, 0x8000_0000, 0x20000, PteKind::Invalid, true);
+        mm.map_ex(0x10000, 0x8000_0000, 0x20000, PteKind::INVALID, true);
         // Gap at 0x30000
-        mm.map_ex(0x40000, 0x9000_0000, 0x10000, PteKind::Invalid, true);
+        mm.map_ex(0x40000, 0x9000_0000, 0x10000, PteKind::INVALID, true);
 
         let ranges = mm.get_submapped_range(0x10000, 0x40000);
         assert_eq!(ranges.len(), 2);

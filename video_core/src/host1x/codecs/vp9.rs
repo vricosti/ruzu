@@ -11,7 +11,9 @@ use crate::host1x::codecs::vp9_types::{
     PictureInfo, Segmentation, Vp9EntropyProbs, Vp9FrameContainer, Vp9PictureInfo, Vp9SurfaceIndex,
 };
 use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
+use crate::host1x::host1x::FrameQueue;
 use crate::host1x::nvdec_common::{NvdecRegisters, VideoCodec};
+use std::sync::Arc;
 
 // --------------------------------------------------------------------------
 // Constants from vp9.cpp
@@ -258,8 +260,12 @@ pub struct Vp9 {
 }
 
 impl Vp9 {
-    pub fn new(id: i32) -> Self {
-        let mut state = DecoderState::new(id);
+    pub fn new(
+        id: i32,
+        memory_manager: Arc<MaxwellDeviceMemoryManager>,
+        frame_queue: Arc<FrameQueue>,
+    ) -> Self {
+        let mut state = DecoderState::new(id, memory_manager, frame_queue);
         state.codec = VideoCodec::VP9;
         state.initialized = state.decode_api.initialize(VideoCodec::VP9);
         Self {
@@ -285,11 +291,7 @@ impl Vp9 {
 }
 
 impl DecoderImpl for Vp9 {
-    fn compose_frame(
-        &mut self,
-        _regs: &NvdecRegisters,
-        _memory_manager: &MaxwellDeviceMemoryManager,
-    ) -> Vec<u8> {
+    fn compose_frame(&mut self, _regs: &NvdecRegisters) -> Vec<u8> {
         // Stubbed — requires memory manager integration to read PictureInfo/EntropyProbs
         // from memory, compose compressed and uncompressed headers, and append the bitstream.
         // Upstream: VP9::ComposeFrame() in video_core/host1x/codecs/vp9.cpp

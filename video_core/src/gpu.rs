@@ -270,18 +270,17 @@ impl Gpu {
                         rasterizer.as_mut().invalidate_region(addr, size as u64);
                     }));
                 }
-                // Upstream binds `host1x.GMMU()` here too, but that is only
-                // correct together with NvMap's Host1x allocator-backed
-                // low-area map/free path. Keep the partial Rust path opt-in
-                // until that ownership slice is ported.
-                if std::env::var_os("RUZU_ENABLE_HOST1X_GMMU_BIND").is_some() {
-                    if let Some(host1x) = host1x
-                        .as_any()
-                        .downcast_ref::<crate::host1x::host1x::Host1x>()
-                    {
-                        unsafe {
-                            host1x.bind_gmmu_rasterizer(rasterizer.as_mut());
-                        }
+                if std::env::var_os("RUZU_DISABLE_HOST1X_FLUSH_BIND").is_none() {
+                    host1x.bind_device_memory_flusher(Box::new(move |addr, size| unsafe {
+                        rasterizer.as_mut().flush_region(addr, size as u64);
+                    }));
+                }
+                if let Some(host1x) = host1x
+                    .as_any()
+                    .downcast_ref::<crate::host1x::host1x::Host1x>()
+                {
+                    unsafe {
+                        host1x.bind_gmmu_rasterizer(rasterizer.as_mut());
                     }
                 }
             } else {
@@ -369,7 +368,7 @@ impl Gpu {
         &self,
         gpu_va: u64,
         dst: &mut [u8],
-        cpu_reader: &dyn Fn(u64, &mut [u8]),
+        _cpu_reader: &dyn Fn(u64, &mut [u8]),
     ) -> bool {
         let bound = *self.bound_channel.lock().unwrap();
         if bound < 0 {
@@ -383,7 +382,7 @@ impl Gpu {
         let Some(mm) = channel.memory_manager.as_ref() else {
             return false;
         };
-        mm.lock().read_block(gpu_va, dst, cpu_reader);
+        mm.lock().read_block(gpu_va, dst);
         true
     }
 
@@ -393,6 +392,17 @@ impl Gpu {
         };
         reader(addr, output);
         true
+    }
+
+    pub(crate) fn host1x_device_memory_manager(
+        &self,
+    ) -> Option<Arc<crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager>> {
+        let system = self.system_ref();
+        let host1x = system.get().host1x_core()?;
+        host1x
+            .as_any()
+            .downcast_ref::<crate::host1x::host1x::Host1x>()
+            .map(|host1x| Arc::clone(host1x.memory_manager()))
     }
 
     /// Set the guest memory writer callback.
@@ -1007,33 +1017,17 @@ impl GpuCoreInterface for Gpu {
         page_bits: u64,
     ) -> Arc<dyn GpuMemoryManagerHandle> {
         let id = NEXT_MEMORY_MANAGER_ID.fetch_add(1, Ordering::AcqRel);
-        let mut mm = crate::memory_manager::MemoryManager::new_with_geometry(
+        let device_memory = self
+            .host1x_device_memory_manager()
+            .expect("GPU memory-manager allocation requires a Host1x device-memory owner");
+        let mm = crate::memory_manager::MemoryManager::new_with_geometry_and_device_memory(
             id,
+            device_memory,
             address_space_bits,
             split_address,
             big_page_bits,
             page_bits,
         );
-        // Wire the MemoryManager's guest-memory writer through `Gpu::write_guest_memory`.
-        // gl_query_cache / vk_query_cache enqueue a write-back closure that calls
-        // `MemoryManager::write_block_unsafe_owned(gpu_addr, ...)`, which translates
-        // GPU→CPU and then forwards each translated chunk to this writer. Without
-        // this hookup the closure runs but `guest_memory_writer` is `None`, so the
-        // GPU query result (e.g. samples-passed) is silently dropped — the exact
-        // failure mode that wedges MK8D's poll on 0x40037000.
-        let gpu_ptr = self as *const Gpu as usize;
-        mm.set_guest_memory_reader(Arc::new(move |addr, output| {
-            let gpu = unsafe { &*(gpu_ptr as *const Gpu) };
-            let _ = gpu.read_guest_memory(addr, output);
-        }));
-        let gpu_ptr = self as *const Gpu as usize;
-        mm.set_guest_memory_writer(Arc::new(move |addr, data| {
-            // SAFETY: the GPU outlives every MemoryManager handle it owns; the
-            // raw-pointer roundtrip is the same idiom used by other callbacks
-            // installed from `Gpu` methods.
-            let gpu = unsafe { &*(gpu_ptr as *const Gpu) };
-            gpu.write_guest_memory(addr, data);
-        }));
         Arc::new(VideoGpuMemoryManagerHandle {
             memory_manager: Arc::new(parking_lot::Mutex::new(mm)),
         })

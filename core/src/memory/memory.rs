@@ -267,6 +267,20 @@ impl Memory {
         }
     }
 
+    /// Return the host backing base for the process `DeviceMemory`.
+    ///
+    /// Upstream `Core::DeviceMemoryManager` stores this as `physical_base`
+    /// from `DeviceMemory().buffer.BackingBasePointer()`. Host1x needs the
+    /// same value to derive raw physical page indices from `GetPointerSilent`
+    /// results.
+    pub fn device_memory_backing_base(&self) -> Option<usize> {
+        if self.device_memory.is_null() {
+            None
+        } else {
+            Some(unsafe { (*self.device_memory).buffer.backing_base_pointer() as usize })
+        }
+    }
+
     /// Set the current page table (called when switching processes).
     /// Set the current page table and wire up the fastmem arena.
     /// Matches upstream `Memory::Impl::SetCurrentPageTable`.
@@ -829,14 +843,8 @@ impl Memory {
     /// - `Unmapped` pages skipped (matches upstream — a process need not map
     ///   the GPU-cached region into its own AS, e.g. VRAM-only buffers).
     ///
-    /// **Port simplifications**: the fastmem `mprotect()` is not yet emitted
-    /// here (upstream's `Settings::values.use_reactive_flushing` path).
-    /// ruzu's fastmem handler routes RasterizerCachedMemory pages through
-    /// the slow callback automatically via `page_type_at` checks in the
-    /// memory_read_*/write_* paths, so the page-type transition alone is
-    /// enough to redirect CPU writes through the rasterizer's invalidation
-    /// hook. Reactive flushing (the write-protect optimization) can be added
-    /// in a follow-up.
+    /// The fastmem arena is reprotected before the page-type transition,
+    /// matching upstream's `Settings::values.use_reactive_flushing` policy.
     pub fn rasterizer_mark_region_cached(&self, vaddr: u64, size: u64, cached: bool) {
         record_rasterizer_mark_cached_stage(0);
         if vaddr == 0 || size == 0 || self.current_page_table.is_null() {
@@ -846,6 +854,18 @@ impl Memory {
         record_rasterizer_mark_cached_stage(1);
         let pt = unsafe { &*self.current_page_table };
         record_rasterizer_mark_cached_stage(2);
+
+        if !pt.fastmem_arena.is_null() {
+            let mut perm = MemoryPermission::empty();
+            if !*common::settings::values().use_reactive_flushing.get_value() || !cached {
+                perm |= MemoryPermission::READ;
+            }
+            if !cached {
+                perm |= MemoryPermission::WRITE;
+            }
+            self.protect_buffer(vaddr as usize, size as usize, perm);
+        }
+
         // Upstream computes `num_pages` as
         //   ((vaddr + size - 1) >> PAGEBITS) - (vaddr >> PAGEBITS) + 1
         // so single-byte writes still touch one page, and a write straddling

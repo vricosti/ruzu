@@ -90,24 +90,22 @@ pub struct KeplerMemory {
     pub interface_state: EngineInterfaceState,
     memory_manager: Arc<Mutex<MemoryManager>>,
     rasterizer: Option<RasterizerHandle>,
-    guest_memory_writer: Option<Arc<dyn Fn(u64, &[u8]) + Send + Sync>>,
 }
 
 impl KeplerMemory {
     /// Create a new KeplerMemory engine.
     ///
     /// Corresponds to upstream `KeplerMemory(Core::System&, MemoryManager&)`.
-    /// Rust stores only the upstream `MemoryManager&` owner directly here; the
-    /// remaining `System&` dependency is still bridged through the guest-memory
-    /// writer callback kept local to this file.
+    /// Rust stores the upstream `MemoryManager&` owner directly here.
     pub fn new(memory_manager: Arc<Mutex<MemoryManager>>) -> Self {
         Self {
             regs: Regs::default(),
-            upload_state: engine_upload::State::new(),
+            upload_state: engine_upload::State::new_with_memory_manager(Arc::clone(
+                &memory_manager,
+            )),
             interface_state: EngineInterfaceState::new(),
             memory_manager,
             rasterizer: None,
-            guest_memory_writer: None,
         }
     }
 
@@ -116,6 +114,7 @@ impl KeplerMemory {
     /// Corresponds to `KeplerMemory::BindRasterizer`.
     pub fn bind_rasterizer(&mut self, rasterizer: &dyn RasterizerInterface) {
         self.rasterizer = Some(RasterizerHandle::from_ref(rasterizer));
+        self.upload_state.bind_rasterizer(rasterizer);
         // Reset and configure execution mask
         self.interface_state.execution_mask.fill(false);
         if EXEC_REG < self.interface_state.execution_mask.len() {
@@ -126,49 +125,15 @@ impl KeplerMemory {
         }
     }
 
-    pub fn set_guest_memory_writer(
-        &mut self,
-        guest_memory_writer: Arc<dyn Fn(u64, &[u8]) + Send + Sync>,
-    ) {
-        self.guest_memory_writer = Some(guest_memory_writer);
-    }
-
     fn process_upload_word(&mut self, data: u32, is_last_call: bool) {
-        let rasterizer_handle = self.rasterizer;
-        let writer = self.guest_memory_writer.as_ref().cloned();
-        let mut write_cpu = move |addr: u64, bytes: &[u8]| {
-            if let Some(writer) = writer.as_ref() {
-                writer(addr, bytes);
-            }
-        };
-        let memory_manager = Arc::clone(&self.memory_manager);
-        let mut rasterizer = rasterizer_handle.map(|handle| unsafe { handle.as_mut() });
-        let mut ctx = engine_upload::FlushContext {
-            rasterizer: rasterizer.as_deref_mut(),
-            memory_manager,
-            write_cpu_mem: &mut write_cpu,
-        };
+        let regs = self.regs.upload();
         self.upload_state
-            .process_data_word_with_ctx(data, is_last_call, &mut ctx);
+            .process_data_word(&regs, data, is_last_call);
     }
 
     fn process_upload_multi(&mut self, data: &[u32]) {
-        let rasterizer_handle = self.rasterizer;
-        let writer = self.guest_memory_writer.as_ref().cloned();
-        let mut write_cpu = move |addr: u64, bytes: &[u8]| {
-            if let Some(writer) = writer.as_ref() {
-                writer(addr, bytes);
-            }
-        };
-        let memory_manager = Arc::clone(&self.memory_manager);
-        let mut rasterizer = rasterizer_handle.map(|handle| unsafe { handle.as_mut() });
-        let mut ctx = engine_upload::FlushContext {
-            rasterizer: rasterizer.as_deref_mut(),
-            memory_manager,
-            write_cpu_mem: &mut write_cpu,
-        };
-        self.upload_state
-            .process_data_multi_with_ctx(data, &mut ctx);
+        let regs = self.regs.upload();
+        self.upload_state.process_data_multi(&regs, data);
     }
 
     /// Write a value to the register identified by method.
@@ -185,12 +150,11 @@ impl KeplerMemory {
 
         match method_idx {
             EXEC_REG => {
-                // Sync upload registers from the register array
-                self.upload_state.regs = self.regs.upload();
-                self.upload_state.process_exec(self.regs.exec_linear());
+                let regs = self.regs.upload();
+                self.upload_state
+                    .process_exec(&regs, self.regs.exec_linear());
             }
             DATA_REG => {
-                self.upload_state.regs = self.regs.upload();
                 self.process_upload_word(method_argument, is_last_call);
             }
             _ => {}
@@ -210,7 +174,6 @@ impl KeplerMemory {
         let method_idx = method as usize;
         match method_idx {
             DATA_REG => {
-                self.upload_state.regs = self.regs.upload();
                 self.process_upload_multi(&base_start[..amount as usize]);
             }
             _ => {
@@ -239,6 +202,7 @@ impl KeplerMemory {
     }
 }
 
+#[cfg(test)]
 impl Default for KeplerMemory {
     fn default() -> Self {
         Self::new(Arc::new(Mutex::new(MemoryManager::new(0))))
@@ -291,18 +255,34 @@ mod tests {
 
     #[test]
     fn data_register_writes_through_memory_manager() {
-        let memory_manager = Arc::new(Mutex::new(MemoryManager::new(0)));
+        let device_memory = Arc::new(
+            crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager::default(),
+        );
+        let backing = vec![0u8; 0x1000];
+        device_memory.smmu_set_physical_base_for_test(backing.as_ptr() as usize);
+        device_memory.smmu_map_with_cpu_backing(
+            0x8000_0000,
+            backing.as_ptr(),
+            0x6000,
+            backing.len(),
+            1,
+            true,
+        );
+        let memory_manager = Arc::new(Mutex::new(
+            MemoryManager::new_with_geometry_and_device_memory(
+                1,
+                Arc::clone(&device_memory),
+                32,
+                0x1_0000_0000,
+                16,
+                12,
+            ),
+        ));
         memory_manager
             .lock()
             .map(0x10000, 0x8000_0000, 0x1000, 0, false);
 
-        let writes = Arc::new(Mutex::new(Vec::<(u64, Vec<u8>)>::new()));
-        let writes_ref = Arc::clone(&writes);
-
         let mut engine = KeplerMemory::new(Arc::clone(&memory_manager));
-        engine.set_guest_memory_writer(Arc::new(move |addr, bytes| {
-            writes_ref.lock().push((addr, bytes.to_vec()));
-        }));
 
         engine.call_method(UPLOAD_REG_OFFSET as u32, 4, true);
         engine.call_method((UPLOAD_REG_OFFSET + 1) as u32, 1, true);
@@ -312,9 +292,6 @@ mod tests {
         engine.call_method(EXEC_REG as u32, 1, true);
         engine.call_method(DATA_REG as u32, 0x11223344, true);
 
-        let writes = writes.lock();
-        assert_eq!(writes.len(), 1);
-        assert_eq!(writes[0].0, 0x8000_0000);
-        assert_eq!(writes[0].1, vec![0x44, 0x33, 0x22, 0x11]);
+        assert_eq!(&backing[..4], &[0x44, 0x33, 0x22, 0x11]);
     }
 }

@@ -523,8 +523,8 @@ pub fn manage_named_port(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::hle::kernel::k_process::KProcess;
-    use crate::hle::kernel::k_thread::KThread;
+    use crate::hle::kernel::k_process::{KProcess, ProcessLock};
+    use crate::hle::kernel::k_thread::{KThread, KThreadLock};
 
     fn test_system() -> System {
         let mut system = System::new_for_test();

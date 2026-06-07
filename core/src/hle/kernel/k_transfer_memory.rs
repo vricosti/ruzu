@@ -6,6 +6,7 @@
 //! processes. Uses KPageGroup to track the physical pages.
 
 use super::k_memory_block::PAGE_SIZE;
+use super::k_memory_block::{convert_to_k_memory_permission, SvcMemoryPermission};
 use super::k_page_group::KPageGroup;
 use super::k_process::KProcess;
 use super::k_process::ProcessLock;
@@ -44,19 +45,25 @@ impl KTransferMemory {
     pub fn initialize(
         &mut self,
         owner: &Arc<ProcessLock>,
+        owner_page_table: &mut KProcessPageTable,
         address: u64,
         size: usize,
         owner_perm: MemoryPermission,
     ) -> ResultCode {
-        // Create the page group for this region.
+        // Upstream constructs the page group here and lets
+        // LockForTransferMemory populate it with physical blocks.
         let mut pg = KPageGroup::new();
-        let num_pages = (size + PAGE_SIZE - 1) / PAGE_SIZE;
-        if pg.add_block(address, num_pages).is_err() {
-            return ResultCode::new(0xCA01); // ResultOutOfMemory
+        let lock_result = owner_page_table.lock_for_transfer_memory(
+            &mut pg,
+            KProcessAddress::new(address),
+            size,
+            convert_to_k_memory_permission(SvcMemoryPermission::from_bits_truncate(
+                owner_perm as u8,
+            )),
+        );
+        if lock_result != 0 {
+            return ResultCode::new(lock_result);
         }
-
-        // Upstream: page_table.LockForTransferMemory(&pg, addr, size, perm)
-        // In the host-emulated model, memory locking is a no-op.
 
         self.m_page_group = Some(pg);
         self.m_owner = Some(Arc::downgrade(owner));
@@ -74,8 +81,11 @@ impl KTransferMemory {
             if !self.m_is_mapped {
                 let size = pg.get_num_pages() * PAGE_SIZE;
                 if size > 0 {
-                    let result = owner_page_table
-                        .unlock_for_transfer_memory(KProcessAddress::new(self.m_address), size);
+                    let result = owner_page_table.unlock_for_transfer_memory(
+                        KProcessAddress::new(self.m_address),
+                        size,
+                        pg,
+                    );
                     debug_assert_eq!(
                         result, 0,
                         "KTransferMemory::finalize unlock_for_transfer_memory failed: 0x{result:X}"

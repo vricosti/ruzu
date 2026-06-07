@@ -13,6 +13,7 @@ use std::sync::Arc;
 use parking_lot::Mutex;
 
 use super::engine_interface::{EngineInterface, EngineInterfaceState};
+use super::engine_upload;
 use super::{ClassId, Engine, PendingWrite, ENGINE_REG_COUNT};
 use crate::memory_manager::MemoryManager;
 use crate::rasterizer_interface::{RasterizerHandle, RasterizerInterface};
@@ -20,11 +21,23 @@ use crate::textures::texture::{TicEntry, TscEntry};
 
 // ── Register offset constants (method addresses) ────────────────────────────
 
+/// Upload register block, matching upstream `ASSERT_REG_POSITION(upload, 0x60)`.
+const UPLOAD_REG_OFFSET: u32 = 0x60;
+
+/// Upload exec register, matching upstream `ASSERT_REG_POSITION(exec_upload, 0x6C)`.
+const EXEC_UPLOAD: u32 = 0x6C;
+
+/// Upload data register, matching upstream `ASSERT_REG_POSITION(data_upload, 0x6D)`.
+const DATA_UPLOAD: u32 = 0x6D;
+
 /// Dispatch trigger — any write to this method queues a compute launch.
 const LAUNCH: u32 = 0xAF;
 
 /// QMD address register — bits [31:0] of `regs[0xAD]`, shifted left by 8.
 const QMD_ADDRESS: u32 = 0xAD;
+
+/// `LaunchParams::grid_dim_x` word index, matching upstream `LAUNCH_REG_INDEX(grid_dim_x)`.
+const LAUNCH_GRID_DIM_X_INDEX: u64 = 0x0C;
 
 /// Texture sampler pool base: +0 addr_high, +1 addr_low, +2 limit.
 const TSC_BASE: u32 = 0x557;
@@ -154,12 +167,22 @@ pub struct DispatchCall {
     pub tex_cb_index: u32,
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+struct UploadInfo {
+    upload_address: u64,
+    exec_address: u64,
+    copy_size: u32,
+}
+
 // ── Engine struct ───────────────────────────────────────────────────────────
 
 pub struct KeplerCompute {
     regs: Box<[u32; ENGINE_REG_COUNT]>,
     interface_state: EngineInterfaceState,
     memory_manager: Arc<Mutex<MemoryManager>>,
+    upload_state: engine_upload::State,
+    upload_address: u64,
+    uploads: Vec<UploadInfo>,
     /// Port of upstream owner-local `launch_description`.
     pub launch_description: QueueMetaData,
     dispatch_calls: Vec<DispatchCall>,
@@ -179,12 +202,17 @@ impl KeplerCompute {
             regs: Box::new([0u32; ENGINE_REG_COUNT]),
             interface_state: {
                 let mut state = EngineInterfaceState::new();
-                state.execution_mask[0x6C] = true;
-                state.execution_mask[0x6D] = true;
+                state.execution_mask[EXEC_UPLOAD as usize] = true;
+                state.execution_mask[DATA_UPLOAD as usize] = true;
                 state.execution_mask[LAUNCH as usize] = true;
                 state
             },
+            upload_state: engine_upload::State::new_with_memory_manager(Arc::clone(
+                &memory_manager,
+            )),
             memory_manager,
+            upload_address: 0,
+            uploads: Vec::new(),
             launch_description: QueueMetaData::default(),
             dispatch_calls: Vec::new(),
             pending_launch: None,
@@ -199,10 +227,31 @@ impl KeplerCompute {
         if idx < ENGINE_REG_COUNT {
             self.regs[idx] = argument;
         }
-        if method == LAUNCH {
-            let qmd_addr = self.launch_desc_address();
-            self.pending_launch = Some(qmd_addr);
-            log::debug!("KeplerCompute: LAUNCH queued, QMD @ 0x{:X}", qmd_addr);
+
+        match method {
+            EXEC_UPLOAD => {
+                let regs = self.upload_registers();
+                let info = UploadInfo {
+                    upload_address: self.upload_address,
+                    exec_address: self.upload_state.exec_target_address(&regs),
+                    copy_size: self.upload_state.get_upload_size(),
+                };
+                self.uploads.push(info);
+                self.upload_state
+                    .process_exec(&regs, self.exec_upload_linear());
+            }
+            DATA_UPLOAD => {
+                self.upload_address = self.interface_state.current_dma_segment;
+                let regs = self.upload_registers();
+                self.upload_state
+                    .process_data_word(&regs, argument, _is_last_call);
+            }
+            LAUNCH => {
+                let qmd_addr = self.launch_desc_address();
+                self.pending_launch = Some(qmd_addr);
+                log::debug!("KeplerCompute: LAUNCH queued, QMD @ 0x{:X}", qmd_addr);
+            }
+            _ => {}
         }
     }
 
@@ -211,17 +260,26 @@ impl KeplerCompute {
         &mut self,
         method: u32,
         args: &[u32],
-        _amount: u32,
-        _methods_pending: u32,
+        amount: u32,
+        methods_pending: u32,
     ) {
-        for &arg in args {
-            self.call_method(method, arg, false);
+        if method == DATA_UPLOAD {
+            self.upload_address = self.interface_state.current_dma_segment;
+            let regs = self.upload_registers();
+            self.upload_state
+                .process_data_multi(&regs, &args[..amount as usize]);
+            return;
+        }
+
+        for (i, &arg) in args.iter().take(amount as usize).enumerate() {
+            self.call_method(method, arg, methods_pending.saturating_sub(i as u32) <= 1);
         }
     }
 
     /// Corresponds to `KeplerCompute::BindRasterizer`.
     pub fn bind_rasterizer(&mut self, rasterizer: &dyn RasterizerInterface) {
         self.rasterizer = Some(RasterizerHandle::from_ref(rasterizer));
+        self.upload_state.bind_rasterizer(rasterizer);
     }
 
     // ── Register accessors ──────────────────────────────────────────────
@@ -229,6 +287,29 @@ impl KeplerCompute {
     /// GPU VA of the QMD descriptor (regs[0xAD] << 8).
     pub fn launch_desc_address(&self) -> u64 {
         (self.regs[QMD_ADDRESS as usize] as u64) << 8
+    }
+
+    fn upload_registers(&self) -> engine_upload::Registers {
+        engine_upload::Registers {
+            line_length_in: self.regs[UPLOAD_REG_OFFSET as usize],
+            line_count: self.regs[(UPLOAD_REG_OFFSET + 1) as usize],
+            dest: engine_upload::DestRegisters {
+                address_high: self.regs[(UPLOAD_REG_OFFSET + 2) as usize],
+                address_low: self.regs[(UPLOAD_REG_OFFSET + 3) as usize],
+                pitch: self.regs[(UPLOAD_REG_OFFSET + 4) as usize],
+                block_dims: self.regs[(UPLOAD_REG_OFFSET + 5) as usize],
+                width: self.regs[(UPLOAD_REG_OFFSET + 6) as usize],
+                height: self.regs[(UPLOAD_REG_OFFSET + 7) as usize],
+                depth: self.regs[(UPLOAD_REG_OFFSET + 8) as usize],
+                layer: self.regs[(UPLOAD_REG_OFFSET + 9) as usize],
+                x: self.regs[(UPLOAD_REG_OFFSET + 10) as usize],
+                y: self.regs[(UPLOAD_REG_OFFSET + 11) as usize],
+            },
+        }
+    }
+
+    fn exec_upload_linear(&self) -> bool {
+        (self.regs[EXEC_UPLOAD as usize] & 1) != 0
     }
 
     /// Shader code base address from CODE_LOC_BASE registers.
@@ -273,24 +354,24 @@ impl KeplerCompute {
     }
 
     /// Port of upstream `KeplerCompute::GetTICEntry`.
-    pub fn get_tic_entry(&self, tic_index: u32, read_cpu: &dyn Fn(u64, &mut [u8])) -> TicEntry {
+    pub fn get_tic_entry(&self, tic_index: u32) -> TicEntry {
         let tic_address_gpu =
             self.tic_address() + tic_index as u64 * std::mem::size_of::<TicEntry>() as u64;
         let mut bytes = [0u8; std::mem::size_of::<TicEntry>()];
         self.memory_manager
             .lock()
-            .read_block_unsafe(tic_address_gpu, &mut bytes, read_cpu);
+            .read_block_unsafe(tic_address_gpu, &mut bytes);
         unsafe { std::ptr::read_unaligned(bytes.as_ptr() as *const TicEntry) }
     }
 
     /// Port of upstream `KeplerCompute::GetTSCEntry`.
-    pub fn get_tsc_entry(&self, tsc_index: u32, read_cpu: &dyn Fn(u64, &mut [u8])) -> TscEntry {
+    pub fn get_tsc_entry(&self, tsc_index: u32) -> TscEntry {
         let tsc_address_gpu =
             self.tsc_address() + tsc_index as u64 * std::mem::size_of::<TscEntry>() as u64;
         let mut bytes = [0u8; std::mem::size_of::<TscEntry>()];
         self.memory_manager
             .lock()
-            .read_block_unsafe(tsc_address_gpu, &mut bytes, read_cpu);
+            .read_block_unsafe(tsc_address_gpu, &mut bytes);
         unsafe { std::ptr::read_unaligned(bytes.as_ptr() as *const TscEntry) }
     }
 
@@ -305,6 +386,7 @@ impl KeplerCompute {
     }
 }
 
+#[cfg(test)]
 impl Default for KeplerCompute {
     fn default() -> Self {
         Self::new(Arc::new(Mutex::new(MemoryManager::new(0))))
@@ -371,6 +453,19 @@ impl Engine for KeplerCompute {
 
     fn execute_pending(&mut self, read_gpu: &dyn Fn(u64, &mut [u8])) -> Vec<PendingWrite> {
         if let Some(qmd_addr) = self.pending_launch.take() {
+            for data in &self.uploads {
+                let offset = data.exec_address.wrapping_sub(qmd_addr);
+                if offset / std::mem::size_of::<u32>() as u64 == LAUNCH_GRID_DIM_X_INDEX
+                    && self
+                        .memory_manager
+                        .lock()
+                        .is_memory_dirty(data.upload_address, data.copy_size as u64)
+                {
+                    self.indirect_compute = Some(data.upload_address);
+                }
+            }
+            self.uploads.clear();
+
             // Read 256 bytes (64 words) of QMD from GPU memory.
             let mut raw = [0u8; QMD_WORD_COUNT * 4];
             read_gpu(qmd_addr, &mut raw);
@@ -408,6 +503,10 @@ impl Engine for KeplerCompute {
             );
 
             self.dispatch_calls.push(dispatch);
+            if let Some(rasterizer) = self.rasterizer.map(|handle| unsafe { handle.as_mut() }) {
+                rasterizer.dispatch_compute();
+            }
+            self.indirect_compute = None;
         }
 
         vec![]
@@ -417,9 +516,167 @@ impl Engine for KeplerCompute {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engines::draw_manager::{Maxwell3DClearView, Maxwell3DDrawView};
+    use crate::engines::fermi_2d::{Config as Fermi2DConfig, Surface as Fermi2DSurface};
+    use crate::query_cache::types::QueryPropertiesFlags;
+    use crate::rasterizer_interface::RasterizerDownloadArea;
+    use std::cell::Cell;
 
     fn new_test_engine() -> KeplerCompute {
         KeplerCompute::new(Arc::new(Mutex::new(MemoryManager::new(0))))
+    }
+
+    fn new_owner_backed_engine(backing: &[u8], device_addr: u64) -> KeplerCompute {
+        let device_memory = Arc::new(
+            crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager::default(),
+        );
+        device_memory.smmu_set_physical_base_for_test(backing.as_ptr() as usize);
+        device_memory.smmu_map_with_cpu_backing(
+            device_addr,
+            backing.as_ptr(),
+            0x4000_0000,
+            backing.len(),
+            1,
+            true,
+        );
+        let memory_manager = Arc::new(Mutex::new(
+            MemoryManager::new_with_geometry_and_device_memory(
+                1,
+                Arc::clone(&device_memory),
+                32,
+                0x1_0000_0000,
+                16,
+                12,
+            ),
+        ));
+        memory_manager
+            .lock()
+            .map(device_addr, device_addr, backing.len() as u64, 0, false);
+        KeplerCompute::new(memory_manager)
+    }
+
+    struct TestRasterizer {
+        dirty_addr: u64,
+        dirty_size: u64,
+        dispatches: Cell<u32>,
+    }
+
+    impl TestRasterizer {
+        fn new(dirty_addr: u64, dirty_size: u64) -> Self {
+            Self {
+                dirty_addr,
+                dirty_size,
+                dispatches: Cell::new(0),
+            }
+        }
+    }
+
+    impl RasterizerInterface for TestRasterizer {
+        fn draw(&mut self, _draw_view: Maxwell3DDrawView<'_>, _instance_count: u32) {}
+
+        fn draw_texture(&mut self) {}
+
+        fn clear(&mut self, _clear_view: Maxwell3DClearView<'_>, _layer_count: u32) {}
+
+        fn dispatch_compute(&mut self) {
+            self.dispatches.set(self.dispatches.get() + 1);
+        }
+
+        fn reset_counter(&mut self, _query_type: u32) {}
+
+        fn query(
+            &mut self,
+            _gpu_addr: u64,
+            _query_type: u32,
+            _flags: QueryPropertiesFlags,
+            _payload: u32,
+            _subreport: u32,
+        ) {
+        }
+
+        fn bind_graphics_uniform_buffer(
+            &mut self,
+            _stage: usize,
+            _index: u32,
+            _gpu_addr: u64,
+            _size: u32,
+        ) {
+        }
+
+        fn disable_graphics_uniform_buffer(&mut self, _stage: usize, _index: u32) {}
+
+        fn signal_fence(&mut self, func: Box<dyn FnOnce() + Send>) {
+            func();
+        }
+
+        fn sync_operation(&mut self, func: Box<dyn FnOnce() + Send>) {
+            func();
+        }
+
+        fn signal_sync_point(&mut self, _value: u32) {}
+
+        fn signal_reference(&mut self) {}
+
+        fn release_fences(&mut self, _force: bool) {}
+
+        fn flush_all(&mut self) {}
+
+        fn flush_region(&mut self, _addr: u64, _size: u64) {}
+
+        fn must_flush_region(&self, addr: u64, size: u64) -> bool {
+            addr == self.dirty_addr && size == self.dirty_size
+        }
+
+        fn get_flush_area(&self, _addr: u64, _size: u64) -> RasterizerDownloadArea {
+            RasterizerDownloadArea {
+                start_address: 0,
+                end_address: 0,
+                preemptive: false,
+            }
+        }
+
+        fn invalidate_region(&mut self, _addr: u64, _size: u64) {}
+
+        fn on_cache_invalidation(&mut self, _addr: u64, _size: u64) {}
+
+        fn on_cpu_write(&mut self, _addr: u64, _size: u64) -> bool {
+            false
+        }
+
+        fn invalidate_gpu_cache(&mut self) {}
+
+        fn unmap_memory(&mut self, _addr: u64, _size: u64) {}
+
+        fn modify_gpu_memory(&mut self, _as_id: usize, _addr: u64, _size: u64) {}
+
+        fn flush_and_invalidate_region(&mut self, _addr: u64, _size: u64) {}
+
+        fn wait_for_idle(&mut self) {}
+
+        fn fragment_barrier(&mut self) {}
+
+        fn tiled_cache_barrier(&mut self) {}
+
+        fn flush_commands(&mut self) {}
+
+        fn tick_frame(&mut self) {}
+
+        fn accelerate_surface_copy(
+            &mut self,
+            _src: &Fermi2DSurface,
+            _dst: &Fermi2DSurface,
+            _copy_config: &Fermi2DConfig,
+        ) -> bool {
+            false
+        }
+
+        fn accelerate_inline_to_memory(
+            &mut self,
+            _address: u64,
+            _copy_size: usize,
+            _memory: &[u8],
+        ) {
+        }
     }
 
     #[test]
@@ -486,25 +743,19 @@ mod tests {
 
     #[test]
     fn test_get_tic_entry_reads_from_tic_pool() {
-        let memory_manager = Arc::new(Mutex::new(MemoryManager::new(0)));
-        memory_manager
-            .lock()
-            .map(0x6000, 0x9000_0000, 0x1000, 0, false);
-        let mut engine = KeplerCompute::new(memory_manager);
-        engine.regs[TIC_BASE as usize] = 0;
-        engine.regs[(TIC_BASE + 1) as usize] = 0x6000;
-
-        let expected_addr = 0x9000_0000 + 3 * std::mem::size_of::<TicEntry>() as u64;
-        let mut raw = [0u8; std::mem::size_of::<TicEntry>()];
+        let mut backing = vec![0u8; 0x1000];
+        let entry_offset = 3 * std::mem::size_of::<TicEntry>();
+        let raw = &mut backing[entry_offset..entry_offset + std::mem::size_of::<TicEntry>()];
         raw[0..8].copy_from_slice(&0x1111_2222_3333_4444u64.to_le_bytes());
         raw[8..16].copy_from_slice(&0x5555_6666_7777_8888u64.to_le_bytes());
         raw[16..24].copy_from_slice(&0x9999_AAAA_BBBB_CCCCu64.to_le_bytes());
         raw[24..32].copy_from_slice(&0xDDDD_EEEE_FFFF_0001u64.to_le_bytes());
 
-        let entry = engine.get_tic_entry(3, &|addr, output| {
-            assert_eq!(addr, expected_addr);
-            output.copy_from_slice(&raw);
-        });
+        let mut engine = new_owner_backed_engine(&backing, 0x6000);
+        engine.regs[TIC_BASE as usize] = 0;
+        engine.regs[(TIC_BASE + 1) as usize] = 0x6000;
+
+        let entry = engine.get_tic_entry(3);
 
         assert_eq!(entry.raw[0], 0x1111_2222_3333_4444);
         assert_eq!(entry.raw[1], 0x5555_6666_7777_8888);
@@ -514,25 +765,19 @@ mod tests {
 
     #[test]
     fn test_get_tsc_entry_reads_from_tsc_pool() {
-        let memory_manager = Arc::new(Mutex::new(MemoryManager::new(0)));
-        memory_manager
-            .lock()
-            .map(0x5000, 0x9100_0000, 0x1000, 0, false);
-        let mut engine = KeplerCompute::new(memory_manager);
-        engine.regs[TSC_BASE as usize] = 0;
-        engine.regs[(TSC_BASE + 1) as usize] = 0x5000;
-
-        let expected_addr = 0x9100_0000 + 2 * std::mem::size_of::<TscEntry>() as u64;
-        let mut raw = [0u8; std::mem::size_of::<TscEntry>()];
+        let mut backing = vec![0u8; 0x1000];
+        let entry_offset = 2 * std::mem::size_of::<TscEntry>();
+        let raw = &mut backing[entry_offset..entry_offset + std::mem::size_of::<TscEntry>()];
         raw[0..8].copy_from_slice(&0x0123_4567_89AB_CDEFu64.to_le_bytes());
         raw[8..16].copy_from_slice(&0xFEDC_BA98_7654_3210u64.to_le_bytes());
         raw[16..24].copy_from_slice(&0x0F0E_0D0C_0B0A_0908u64.to_le_bytes());
         raw[24..32].copy_from_slice(&0x8070_6050_4030_2010u64.to_le_bytes());
 
-        let entry = engine.get_tsc_entry(2, &|addr, output| {
-            assert_eq!(addr, expected_addr);
-            output.copy_from_slice(&raw);
-        });
+        let mut engine = new_owner_backed_engine(&backing, 0x5000);
+        engine.regs[TSC_BASE as usize] = 0;
+        engine.regs[(TSC_BASE + 1) as usize] = 0x5000;
+
+        let entry = engine.get_tsc_entry(2);
 
         assert_eq!(entry.raw[0], 0x0123_4567_89AB_CDEF);
         assert_eq!(entry.raw[1], 0xFEDC_BA98_7654_3210);
@@ -687,6 +932,75 @@ mod tests {
         assert_eq!(engine.launch_description.program_start, 0x200);
         assert_eq!(engine.launch_description.grid_dim_x, 8);
         assert_eq!(engine.launch_description.block_dim_x, 128);
+    }
+
+    #[test]
+    fn upload_state_tracks_indirect_compute_like_upstream() {
+        let mut backing = vec![0u8; 0x4000];
+        let launch_desc = 0x20000;
+        let device_memory = Arc::new(
+            crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager::default(),
+        );
+        device_memory.smmu_set_physical_base_for_test(backing.as_ptr() as usize);
+        device_memory.smmu_map_with_cpu_backing(
+            0x8000_0000,
+            backing.as_ptr(),
+            0x4000_0000,
+            backing.len(),
+            1,
+            true,
+        );
+        let memory_manager = Arc::new(Mutex::new(
+            MemoryManager::new_with_geometry_and_device_memory(
+                1,
+                Arc::clone(&device_memory),
+                32,
+                0x1_0000_0000,
+                16,
+                12,
+            ),
+        ));
+        memory_manager
+            .lock()
+            .map(0x10000, 0x8000_0000, 0x4000, 0, false);
+        memory_manager
+            .lock()
+            .map(launch_desc, 0x8000_1000, 0x1000, 0, false);
+
+        let mut engine = KeplerCompute::new(Arc::clone(&memory_manager));
+        let mut rasterizer = TestRasterizer::new(0x8000_0000, 4);
+        engine.set_current_dma_segment(0x10000);
+
+        engine.regs[QMD_ADDRESS as usize] = (launch_desc >> 8) as u32;
+        engine.call_method(UPLOAD_REG_OFFSET, 4, true);
+        engine.call_method((UPLOAD_REG_OFFSET + 1) as u32, 1, true);
+        engine.call_method((UPLOAD_REG_OFFSET + 2) as u32, 0, true);
+        engine.call_method(
+            (UPLOAD_REG_OFFSET + 3) as u32,
+            launch_desc as u32 + 0x0C * 4,
+            true,
+        );
+        engine.call_method((UPLOAD_REG_OFFSET + 4) as u32, 4, true);
+        engine.call_method(EXEC_UPLOAD, 1, true);
+        engine.call_method(DATA_UPLOAD, 0x0000_0042, true);
+        assert_eq!(
+            &backing[0x1000 + 0x0C * 4..0x1000 + 0x0C * 4 + 4],
+            &[0x42, 0, 0, 0]
+        );
+        engine.call_method(EXEC_UPLOAD, 1, true);
+        memory_manager.lock().bind_rasterizer(&rasterizer);
+        engine.bind_rasterizer(&rasterizer);
+
+        engine.call_method(LAUNCH, 1, true);
+        let qmd_bytes = make_qmd_bytes(&[0u32; QMD_WORD_COUNT]);
+        engine.execute_pending(&|addr, buf| {
+            assert_eq!(addr, launch_desc);
+            buf.copy_from_slice(&qmd_bytes);
+        });
+
+        assert_eq!(rasterizer.dispatches.get(), 1);
+        assert_eq!(engine.get_indirect_compute_address(), None);
+        assert!(engine.uploads.is_empty());
     }
 
     #[test]

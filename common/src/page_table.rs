@@ -222,11 +222,12 @@ impl PageTable {
                 self.blocks[page] = 0;
             }
         } else {
-            for (i, page) in (base_page..end).enumerate() {
+            let orig_base = base_page as u64;
+            for page in base_page..end {
                 let offset_ptr = host_ptr.wrapping_sub(page * self.page_size);
                 self.pointers[page].store(offset_ptr, page_type);
-                self.backing_addr[page] = target;
-                self.blocks[page] = target + (i * self.page_size) as u64;
+                self.backing_addr[page] = target.wrapping_sub((page * self.page_size) as u64);
+                self.blocks[page] = orig_base * self.page_size as u64;
             }
         }
     }

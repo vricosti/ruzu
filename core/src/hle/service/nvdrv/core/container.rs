@@ -6,7 +6,7 @@
 //! Port of zuyu/src/core/hle/service/nvdrv/core/container.cpp
 
 use std::collections::VecDeque;
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Mutex, MutexGuard, Weak};
 
 use super::heap_mapper::HeapMapper;
 use super::nvmap::NvMap;
@@ -15,6 +15,8 @@ use crate::core::SystemRef;
 use crate::hle::kernel::k_memory_block::KMemoryState;
 use crate::hle::kernel::k_process::KProcess;
 use crate::hle::kernel::k_process::ProcessLock;
+
+const INVALID_ASID: u32 = u32::MAX;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SessionId {
@@ -25,6 +27,9 @@ pub struct Session {
     pub id: SessionId,
     /// Matches upstream `Kernel::KProcess* process`.
     pub process: Option<Weak<ProcessLock>>,
+    /// Host1x SMMU address-space identifier returned by
+    /// `DeviceMemoryManager::RegisterProcess`.
+    pub asid: u32,
     /// Process identity used for session reuse. This mirrors the upstream
     /// pointer-identity comparison in a Rust-friendly form.
     pub process_identity: usize,
@@ -35,11 +40,12 @@ pub struct Session {
 }
 
 impl Session {
-    pub fn new(id: SessionId, process: &std::sync::Arc<ProcessLock>) -> Self {
+    pub fn new(id: SessionId, process: &std::sync::Arc<ProcessLock>, asid: u32) -> Self {
         let process_identity = std::sync::Arc::as_ptr(process) as usize;
         Self {
             id,
             process: Some(std::sync::Arc::downgrade(process)),
+            asid,
             process_identity,
             has_preallocated_area: false,
             mapper: None,
@@ -62,10 +68,90 @@ impl Default for Host1xDeviceFileData {
 }
 
 /// Inner state protected by a single mutex, matching the C++ ContainerImpl pattern.
-struct ContainerInner {
+pub(crate) struct ContainerInner {
     sessions: Vec<Session>,
     new_ids: usize,
     id_pool: VecDeque<usize>,
+}
+
+pub(crate) struct ContainerSessionStore {
+    inner: Mutex<ContainerInner>,
+}
+
+impl ContainerSessionStore {
+    fn new() -> Self {
+        Self {
+            inner: Mutex::new(ContainerInner {
+                sessions: Vec::new(),
+                new_ids: 0,
+                id_pool: VecDeque::new(),
+            }),
+        }
+    }
+
+    pub(crate) fn lock(&self) -> MutexGuard<'_, ContainerInner> {
+        self.inner.lock().unwrap()
+    }
+
+    pub(crate) fn map_preallocated_area(
+        &self,
+        session_id: SessionId,
+        address: u64,
+        size: usize,
+    ) -> Option<u64> {
+        let inner = self.lock();
+        let session = inner.sessions.get(session_id.id)?;
+        if !session.is_active || !session.has_preallocated_area {
+            return None;
+        }
+        let mapper = session.mapper.as_ref()?;
+        if !mapper.is_in_bounds(address, size) {
+            return None;
+        }
+        Some(mapper.map(address, size))
+    }
+
+    pub(crate) fn session_asid(&self, session_id: SessionId) -> Option<u32> {
+        let inner = self.lock();
+        let session = inner.sessions.get(session_id.id)?;
+        if session.is_active && session.asid != INVALID_ASID {
+            Some(session.asid)
+        } else {
+            None
+        }
+    }
+
+    pub(crate) fn unmap_preallocated_area(
+        &self,
+        session_id: SessionId,
+        address: u64,
+        size: usize,
+    ) -> bool {
+        let inner = self.lock();
+        Self::unmap_preallocated_area_locked(&inner, session_id, address, size)
+    }
+
+    pub(crate) fn unmap_preallocated_area_locked(
+        inner: &ContainerInner,
+        session_id: SessionId,
+        address: u64,
+        size: usize,
+    ) -> bool {
+        let Some(session) = inner.sessions.get(session_id.id) else {
+            return false;
+        };
+        if !session.is_active || !session.has_preallocated_area {
+            return false;
+        }
+        let Some(mapper) = session.mapper.as_ref() else {
+            return false;
+        };
+        if !mapper.is_in_bounds(address, size) {
+            return false;
+        }
+        mapper.unmap(address, size);
+        true
+    }
 }
 
 /// Container manages syncpoints on the host and provides access to NvMap and SyncpointManager.
@@ -73,37 +159,46 @@ pub struct Container {
     file: Arc<NvMap>,
     manager: Arc<SyncpointManager>,
     device_file_data: Arc<Mutex<Host1xDeviceFileData>>,
-    inner: Mutex<ContainerInner>,
+    sessions: Arc<ContainerSessionStore>,
     system: SystemRef,
 }
 
 impl Container {
+    #[cfg(test)]
     pub fn new() -> Self {
         Self::new_with_system(SystemRef::null())
     }
 
     pub fn new_with_system(system: SystemRef) -> Self {
+        let sessions = Arc::new(ContainerSessionStore::new());
         Self {
-            file: Arc::new(NvMap::new_with_system(system)),
+            file: Arc::new(NvMap::new_with_system_and_sessions(
+                system,
+                Arc::clone(&sessions),
+            )),
             manager: Arc::new(SyncpointManager::new_with_system(system)),
             device_file_data: Arc::new(Mutex::new(Host1xDeviceFileData::default())),
-            inner: Mutex::new(ContainerInner {
-                sessions: Vec::new(),
-                new_ids: 0,
-                id_pool: VecDeque::new(),
-            }),
+            sessions,
             system,
         }
+    }
+
+    fn host1x(&self) -> Option<&dyn crate::host1x_core::Host1xCoreInterface> {
+        if self.system.is_null() {
+            return None;
+        }
+        self.system.get().host1x_core()
     }
 
     /// Opens a session. If the same process already has an active session,
     /// increments its ref count and returns the existing session ID.
     ///
     /// Matches upstream `Container::OpenSession(KProcess* process)` for the
-    /// session reuse and ownership checks. ASID registration remains part of
-    /// the broader Host1x device-memory parity work.
+    /// session reuse, ASID registration, and preallocated heap ownership
+    /// ordering. The ASID is registered with the process `Memory` owner,
+    /// matching upstream `process->GetMemory()` storage in DeviceMemoryManager.
     pub fn open_session(&self, process: &std::sync::Arc<ProcessLock>) -> SessionId {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.sessions.lock();
         let process_identity = std::sync::Arc::as_ptr(process) as usize;
 
         for session in &mut inner.sessions {
@@ -116,18 +211,28 @@ impl Container {
             }
         }
 
+        let process_memory = process.lock().unwrap().get_memory();
+        let asid = if let Some(host1x) = self.host1x() {
+            host1x.smmu_register_process(process_memory)
+        } else {
+            log::error!(
+                "nvdrv::Container::open_session without Host1x; using invalid ASID for reduced construction"
+            );
+            INVALID_ASID
+        };
+
         let new_id;
         if let Some(recycled_id) = inner.id_pool.pop_front() {
             new_id = recycled_id;
             if new_id < inner.sessions.len() {
-                inner.sessions[new_id] = Session::new(SessionId { id: new_id }, process);
+                inner.sessions[new_id] = Session::new(SessionId { id: new_id }, process, asid);
             }
         } else {
             new_id = inner.new_ids;
             inner.new_ids += 1;
             inner
                 .sessions
-                .push(Session::new(SessionId { id: new_id }, process));
+                .push(Session::new(SessionId { id: new_id }, process, asid));
         }
 
         let session = &mut inner.sessions[new_id];
@@ -145,7 +250,7 @@ impl Container {
     ) {
         const MIN_PREALLOCATED_AREA_SIZE: usize = 32 * 1024 * 1024;
 
-        let Some(host1x) = self.system.get().host1x_core() else {
+        let Some(host1x) = self.host1x() else {
             return;
         };
 
@@ -156,26 +261,25 @@ impl Container {
 
         let page_table = &process.page_table;
         let heap_start = page_table.get_heap_region_start().get() as usize;
-        let heap_end = heap_start.saturating_add(page_table.get_heap_region_size());
         let mut cur_addr = heap_start;
         let mut region_start = 0usize;
         let mut region_size = 0usize;
 
-        while cur_addr < heap_end {
+        loop {
             let Some(info) = page_table.query_info(cur_addr) else {
                 break;
             };
             let svc_state = info.get_state() & KMemoryState::MASK;
             if svc_state == (KMemoryState::NORMAL & KMemoryState::MASK) {
-                if region_start.saturating_add(region_size) == info.get_address() {
-                    region_size = region_size.saturating_add(info.get_size());
+                if region_start.wrapping_add(region_size) == info.get_address() {
+                    region_size = region_size.wrapping_add(info.get_size());
                 } else if info.get_size() > region_size {
                     region_start = info.get_address();
                     region_size = info.get_size();
                 }
             }
 
-            let next_addr = info.get_address().saturating_add(info.get_size());
+            let next_addr = info.get_address().wrapping_add(info.get_size());
             if next_addr <= cur_addr {
                 break;
             }
@@ -196,7 +300,7 @@ impl Container {
             region_start as u64,
             start_region,
             region_size,
-            0,
+            session.asid,
             self.system,
         ));
         session.has_preallocated_area = true;
@@ -215,10 +319,8 @@ impl Container {
     /// Closes a session by decrementing its ref count.
     /// When the ref count reaches zero, unmaps all handles and cleans up.
     pub fn close_session(&self, session_id: SessionId) {
-        // First, handle ref counting and session cleanup under the lock
-        let should_unmap = {
-            let mut inner = self.inner.lock().unwrap();
-
+        {
+            let mut inner = self.sessions.lock();
             if session_id.id >= inner.sessions.len() {
                 return;
             }
@@ -228,32 +330,47 @@ impl Container {
             if session.ref_count > 0 {
                 return;
             }
-
-            // Session is being fully closed
-            session.is_active = false;
-            session.process = None;
-            session.process_identity = 0;
-            session.has_preallocated_area = false;
-            session.mapper = None;
-
-            // In the C++ code:
-            // smmu.UnregisterProcess(sessions[session_id.id].asid);
-            inner.id_pool.push_front(session_id.id);
-
-            true
-        };
-
-        // Unmap all handles outside the inner lock to avoid deadlock
-        // (unmap_all_handles needs to lock NvMap's handles)
-        if should_unmap {
-            self.file.unmap_all_handles(session_id);
         }
+
+        // Upstream calls `NvMap::UnmapAllHandles` while the session and its
+        // HeapMapper are still active, then tears the session down. Do not hold
+        // the Rust session mutex here; `NvMap::UnmapHandle` reaches back into
+        // the same session store for `session->mapper->Unmap(...)`.
+        self.file.unmap_all_handles(session_id);
+
+        let mut inner = self.sessions.lock();
+        let session = &mut inner.sessions[session_id.id];
+        let preallocated_region = session.mapper.as_ref().map(|mapper| {
+            (
+                session.has_preallocated_area,
+                mapper.get_region_start(),
+                mapper.get_region_size(),
+            )
+        });
+        let asid = session.asid;
+        if let Some((true, region_start, region_size)) = preallocated_region {
+            session.mapper = None;
+            session.has_preallocated_area = false;
+            if let Some(host1x) = self.host1x() {
+                host1x.smmu_free(region_start, region_size);
+            }
+        }
+
+        session.is_active = false;
+        session.process = None;
+        session.process_identity = 0;
+        if asid != INVALID_ASID {
+            if let Some(host1x) = self.host1x() {
+                host1x.smmu_unregister_process(asid);
+            }
+        }
+        inner.id_pool.push_front(session_id.id);
     }
 
     /// Gets a reference to a session by ID.
     /// In the C++ code, this uses an atomic_thread_fence(acquire) before returning.
     pub fn get_session(&self, session_id: SessionId) -> Option<SessionId> {
-        let inner = self.inner.lock().unwrap();
+        let inner = self.sessions.lock();
         if session_id.id < inner.sessions.len() && inner.sessions[session_id.id].is_active {
             Some(session_id)
         } else {
@@ -268,30 +385,12 @@ impl Container {
         &self,
         session_id: SessionId,
     ) -> Option<std::sync::Arc<ProcessLock>> {
-        let inner = self.inner.lock().unwrap();
+        let inner = self.sessions.lock();
         let session = inner.sessions.get(session_id.id)?;
         if !session.is_active {
             return None;
         }
         session.process.as_ref()?.upgrade()
-    }
-
-    pub fn map_preallocated_area(
-        &self,
-        session_id: SessionId,
-        address: u64,
-        size: usize,
-    ) -> Option<u64> {
-        let inner = self.inner.lock().unwrap();
-        let session = inner.sessions.get(session_id.id)?;
-        if !session.is_active || !session.has_preallocated_area {
-            return None;
-        }
-        let mapper = session.mapper.as_ref()?;
-        if !mapper.is_in_bounds(address, size) {
-            return None;
-        }
-        Some(mapper.map(address, size))
     }
 
     pub fn get_nv_map_file(&self) -> &NvMap {
@@ -336,7 +435,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use super::Container;
-    use crate::hle::kernel::k_process::KProcess;
+    use crate::hle::kernel::k_process::{KProcess, ProcessLock};
 
     #[test]
     fn open_session_reuses_active_session_for_same_process() {
@@ -352,5 +451,15 @@ mod tests {
         let third = container.open_session(&process);
 
         assert_eq!(third, first);
+    }
+
+    #[test]
+    fn ownerless_container_does_not_expose_valid_smmu_asid() {
+        let container = Container::new();
+        let process = Arc::new(ProcessLock::from_value(KProcess::new()));
+
+        let session = container.open_session(&process);
+
+        assert_eq!(container.sessions.session_asid(session), None);
     }
 }

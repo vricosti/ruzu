@@ -263,11 +263,11 @@ impl QueryCache {
                 .unwrap_or(0);
             let mm = memory_manager.lock();
             if let Some(timestamp) = timestamp {
-                mm.write_block_unsafe_owned(gpu_addr + 8, &timestamp.to_le_bytes());
-                mm.write_block_unsafe_owned(gpu_addr, &value.to_le_bytes());
+                mm.write_block_unsafe(gpu_addr + 8, &timestamp.to_le_bytes());
+                mm.write_block_unsafe(gpu_addr, &value.to_le_bytes());
                 invalidate_query_cache_writeback(gpu_addr, 16);
             } else {
-                mm.write_block_unsafe_owned(gpu_addr, &(value as u32).to_le_bytes());
+                mm.write_block_unsafe(gpu_addr, &(value as u32).to_le_bytes());
                 invalidate_query_cache_writeback(gpu_addr, 4);
             }
             async_jobs.lock().remove(&new_async_job_id);
@@ -519,9 +519,9 @@ impl CachedQuery {
         if !r#async {
             if let Some(memory_manager) = cache.channel_memory_manager.as_ref() {
                 let mm = memory_manager.lock();
-                mm.write_block_unsafe_owned(self.base.gpu_addr, &value.to_le_bytes());
+                mm.write_block_unsafe(self.base.gpu_addr, &value.to_le_bytes());
                 if let Some(timestamp) = self.base.timestamp {
-                    mm.write_block_unsafe_owned(self.base.gpu_addr + 8, &timestamp.to_le_bytes());
+                    mm.write_block_unsafe(self.base.gpu_addr + 8, &timestamp.to_le_bytes());
                 }
             }
         }
@@ -533,9 +533,39 @@ impl CachedQuery {
 mod tests {
     use super::*;
     use crate::control::channel_state::ChannelState;
+    use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
     use crate::memory_manager::MemoryManager;
     use parking_lot::Mutex as ParkingMutex;
     use std::sync::Arc;
+
+    fn make_query_memory_manager(
+        gpu_addr: u64,
+        d_addr: u64,
+        size: usize,
+    ) -> (Arc<ParkingMutex<MemoryManager>>, Vec<u8>) {
+        let device_memory = Arc::new(MaxwellDeviceMemoryManager::default());
+        let mut backing = vec![0u8; size];
+        device_memory.smmu_set_physical_base_for_test(backing.as_ptr() as usize);
+        device_memory.smmu_map_with_cpu_backing(
+            d_addr,
+            backing.as_mut_ptr(),
+            0x4000_0000,
+            size,
+            5,
+            true,
+        );
+
+        let mut mm = MemoryManager::new_with_geometry_and_device_memory(
+            0,
+            Arc::clone(&device_memory),
+            40,
+            1u64 << 34,
+            16,
+            12,
+        );
+        mm.map(gpu_addr, d_addr, size as u64, 0, false);
+        (Arc::new(ParkingMutex::new(mm)), backing)
+    }
 
     #[test]
     fn bind_to_channel_wires_channel_memory_manager_through_legacy_owner() {
@@ -615,14 +645,8 @@ mod tests {
     #[test]
     fn sync_flush_writes_immediate_guest_value_and_timestamp() {
         let mut cache = QueryCache::new_for_test();
-        let writes = Arc::new(Mutex::new(Vec::<(u64, Vec<u8>)>::new()));
-        let writes_clone = Arc::clone(&writes);
-        let mut mm = crate::memory_manager::MemoryManager::new(0);
-        mm.map(0x5038_50000, 0x5510_6000, 0x1000, 0, false);
-        mm.set_guest_memory_writer(Arc::new(move |addr, data| {
-            writes_clone.lock().push((addr, data.to_vec()));
-        }));
-        cache.channel_memory_manager = Some(Arc::new(parking_lot::Mutex::new(mm)));
+        let (mm, backing) = make_query_memory_manager(0x5038_50000, 0x5510_6000, 0x1000);
+        cache.channel_memory_manager = Some(mm);
 
         let mut query = CachedQuery {
             query_type: QueryType::SamplesPassed,
@@ -638,12 +662,8 @@ mod tests {
         let value = query.flush(&mut cache, false);
         assert_eq!(value, 0);
 
-        let writes = writes.lock();
-        assert_eq!(writes.len(), 2);
-        assert_eq!(writes[0].0, 0x5510_6000);
-        assert_eq!(writes[0].1, 0u64.to_le_bytes());
-        assert_eq!(writes[1].0, 0x5510_6008);
-        assert_eq!(writes[1].1, 0x1122_3344_5566_7788u64.to_le_bytes());
+        assert_eq!(&backing[0..8], &0u64.to_le_bytes());
+        assert_eq!(&backing[8..16], &0x1122_3344_5566_7788u64.to_le_bytes());
     }
 
     #[test]

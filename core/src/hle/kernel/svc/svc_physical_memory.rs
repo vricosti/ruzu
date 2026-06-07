@@ -68,13 +68,15 @@ pub fn set_heap_size_current_process(
         return validation;
     }
 
-    let (result, address) = system
-        .current_process_arc()
-        .lock()
-        .unwrap()
-        .set_heap_size(size as usize);
+    let (result, address, target_info) = {
+        let mut process = system.current_process_arc().lock().unwrap();
+        let (result, address) = process.set_heap_size(size as usize);
+        let target_info = super::svc_memory_history::target_address()
+            .and_then(|target| process.page_table.query_info(target as usize));
+        (result, address, target_info)
+    };
     *out_address = address.get();
-    super::svc_memory_history::record_heap(system, size, result, *out_address);
+    super::svc_memory_history::record_heap(system, size, result, *out_address, target_info);
     if common::trace::is_enabled(common::trace::cat::HEAP) {
         common::trace::emit_raw(
             common::trace::cat::HEAP,
@@ -101,6 +103,13 @@ pub fn map_physical_memory(system: &System, addr: u64, size: u64) -> ResultCode 
             size,
             RESULT_INVALID_ADDRESS.get_inner_value(),
         );
+        super::svc_memory_history::record_physical(
+            system,
+            super::svc_memory_history::MemoryHistoryKind::MapPhysicalMemory,
+            addr,
+            size,
+            RESULT_INVALID_ADDRESS.get_inner_value(),
+        );
         return RESULT_INVALID_ADDRESS;
     }
     if !is_4kb_aligned(size) {
@@ -108,6 +117,13 @@ pub fn map_physical_memory(system: &System, addr: u64, size: u64) -> ResultCode 
         trace_physical_memory_svc(
             system,
             "MapPhysicalMemory",
+            addr,
+            size,
+            RESULT_INVALID_SIZE.get_inner_value(),
+        );
+        super::svc_memory_history::record_physical(
+            system,
+            super::svc_memory_history::MemoryHistoryKind::MapPhysicalMemory,
             addr,
             size,
             RESULT_INVALID_SIZE.get_inner_value(),
@@ -123,6 +139,13 @@ pub fn map_physical_memory(system: &System, addr: u64, size: u64) -> ResultCode 
             size,
             RESULT_INVALID_SIZE.get_inner_value(),
         );
+        super::svc_memory_history::record_physical(
+            system,
+            super::svc_memory_history::MemoryHistoryKind::MapPhysicalMemory,
+            addr,
+            size,
+            RESULT_INVALID_SIZE.get_inner_value(),
+        );
         return RESULT_INVALID_SIZE;
     }
     if addr >= addr.wrapping_add(size) {
@@ -130,6 +153,13 @@ pub fn map_physical_memory(system: &System, addr: u64, size: u64) -> ResultCode 
         trace_physical_memory_svc(
             system,
             "MapPhysicalMemory",
+            addr,
+            size,
+            RESULT_INVALID_MEMORY_REGION.get_inner_value(),
+        );
+        super::svc_memory_history::record_physical(
+            system,
+            super::svc_memory_history::MemoryHistoryKind::MapPhysicalMemory,
             addr,
             size,
             RESULT_INVALID_MEMORY_REGION.get_inner_value(),
@@ -144,6 +174,13 @@ pub fn map_physical_memory(system: &System, addr: u64, size: u64) -> ResultCode 
         trace_physical_memory_svc(
             system,
             "MapPhysicalMemory",
+            addr,
+            size,
+            RESULT_INVALID_STATE.get_inner_value(),
+        );
+        super::svc_memory_history::record_physical(
+            system,
+            super::svc_memory_history::MemoryHistoryKind::MapPhysicalMemory,
             addr,
             size,
             RESULT_INVALID_STATE.get_inner_value(),
@@ -165,6 +202,13 @@ pub fn map_physical_memory(system: &System, addr: u64, size: u64) -> ResultCode 
             size,
             RESULT_INVALID_MEMORY_REGION.get_inner_value(),
         );
+        super::svc_memory_history::record_physical(
+            system,
+            super::svc_memory_history::MemoryHistoryKind::MapPhysicalMemory,
+            addr,
+            size,
+            RESULT_INVALID_MEMORY_REGION.get_inner_value(),
+        );
         return RESULT_INVALID_MEMORY_REGION;
     }
     if !process
@@ -179,6 +223,13 @@ pub fn map_physical_memory(system: &System, addr: u64, size: u64) -> ResultCode 
         trace_physical_memory_svc(
             system,
             "MapPhysicalMemory",
+            addr,
+            size,
+            RESULT_INVALID_MEMORY_REGION.get_inner_value(),
+        );
+        super::svc_memory_history::record_physical(
+            system,
+            super::svc_memory_history::MemoryHistoryKind::MapPhysicalMemory,
             addr,
             size,
             RESULT_INVALID_MEMORY_REGION.get_inner_value(),
@@ -217,6 +268,13 @@ pub fn unmap_physical_memory(system: &System, addr: u64, size: u64) -> ResultCod
             size,
             RESULT_INVALID_ADDRESS.get_inner_value(),
         );
+        super::svc_memory_history::record_physical(
+            system,
+            super::svc_memory_history::MemoryHistoryKind::UnmapPhysicalMemory,
+            addr,
+            size,
+            RESULT_INVALID_ADDRESS.get_inner_value(),
+        );
         return RESULT_INVALID_ADDRESS;
     }
     if !is_4kb_aligned(size) {
@@ -224,6 +282,13 @@ pub fn unmap_physical_memory(system: &System, addr: u64, size: u64) -> ResultCod
         trace_physical_memory_svc(
             system,
             "UnmapPhysicalMemory",
+            addr,
+            size,
+            RESULT_INVALID_SIZE.get_inner_value(),
+        );
+        super::svc_memory_history::record_physical(
+            system,
+            super::svc_memory_history::MemoryHistoryKind::UnmapPhysicalMemory,
             addr,
             size,
             RESULT_INVALID_SIZE.get_inner_value(),
@@ -239,6 +304,13 @@ pub fn unmap_physical_memory(system: &System, addr: u64, size: u64) -> ResultCod
             size,
             RESULT_INVALID_SIZE.get_inner_value(),
         );
+        super::svc_memory_history::record_physical(
+            system,
+            super::svc_memory_history::MemoryHistoryKind::UnmapPhysicalMemory,
+            addr,
+            size,
+            RESULT_INVALID_SIZE.get_inner_value(),
+        );
         return RESULT_INVALID_SIZE;
     }
     if addr >= addr.wrapping_add(size) {
@@ -246,6 +318,13 @@ pub fn unmap_physical_memory(system: &System, addr: u64, size: u64) -> ResultCod
         trace_physical_memory_svc(
             system,
             "UnmapPhysicalMemory",
+            addr,
+            size,
+            RESULT_INVALID_MEMORY_REGION.get_inner_value(),
+        );
+        super::svc_memory_history::record_physical(
+            system,
+            super::svc_memory_history::MemoryHistoryKind::UnmapPhysicalMemory,
             addr,
             size,
             RESULT_INVALID_MEMORY_REGION.get_inner_value(),
@@ -260,6 +339,13 @@ pub fn unmap_physical_memory(system: &System, addr: u64, size: u64) -> ResultCod
         trace_physical_memory_svc(
             system,
             "UnmapPhysicalMemory",
+            addr,
+            size,
+            RESULT_INVALID_STATE.get_inner_value(),
+        );
+        super::svc_memory_history::record_physical(
+            system,
+            super::svc_memory_history::MemoryHistoryKind::UnmapPhysicalMemory,
             addr,
             size,
             RESULT_INVALID_STATE.get_inner_value(),
@@ -281,6 +367,13 @@ pub fn unmap_physical_memory(system: &System, addr: u64, size: u64) -> ResultCod
             size,
             RESULT_INVALID_MEMORY_REGION.get_inner_value(),
         );
+        super::svc_memory_history::record_physical(
+            system,
+            super::svc_memory_history::MemoryHistoryKind::UnmapPhysicalMemory,
+            addr,
+            size,
+            RESULT_INVALID_MEMORY_REGION.get_inner_value(),
+        );
         return RESULT_INVALID_MEMORY_REGION;
     }
     if !process
@@ -295,6 +388,13 @@ pub fn unmap_physical_memory(system: &System, addr: u64, size: u64) -> ResultCod
         trace_physical_memory_svc(
             system,
             "UnmapPhysicalMemory",
+            addr,
+            size,
+            RESULT_INVALID_MEMORY_REGION.get_inner_value(),
+        );
+        super::svc_memory_history::record_physical(
+            system,
+            super::svc_memory_history::MemoryHistoryKind::UnmapPhysicalMemory,
             addr,
             size,
             RESULT_INVALID_MEMORY_REGION.get_inner_value(),

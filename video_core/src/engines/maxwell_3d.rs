@@ -2129,7 +2129,22 @@ impl Maxwell3D {
         result
     }
 
-    pub fn new() -> Self {
+    fn new_impl(memory_manager: Arc<Mutex<MemoryManager>>) -> Self {
+        Self::new_impl_common(
+            engine_upload::State::new_with_memory_manager(Arc::clone(&memory_manager)),
+            Some(memory_manager),
+        )
+    }
+
+    #[cfg(test)]
+    fn new_test_impl() -> Self {
+        Self::new_impl_common(engine_upload::State::new(), None)
+    }
+
+    fn new_impl_common(
+        upload_state: engine_upload::State,
+        memory_manager: Option<Arc<Mutex<MemoryManager>>>,
+    ) -> Self {
         // Build execution mask: mark which methods trigger immediate execution.
         let mut execution_mask = vec![false; u16::MAX as usize];
         for i in 0..execution_mask.len() {
@@ -2154,8 +2169,8 @@ impl Maxwell3D {
             rasterizer: None,
             macro_positions: [0u32; 0x80],
             macro_engine: get_macro_engine(),
-            upload_state: engine_upload::State::new(),
-            memory_manager: None,
+            upload_state,
+            memory_manager,
             executing_macro: 0,
             macro_params: Vec::new(),
             macro_addresses: Vec::new(),
@@ -2171,6 +2186,15 @@ impl Maxwell3D {
         };
         engine.initialize_register_defaults();
         engine
+    }
+
+    #[cfg(test)]
+    pub fn new() -> Self {
+        Self::new_test_impl()
+    }
+
+    pub fn new_with_memory_manager(memory_manager: Arc<Mutex<MemoryManager>>) -> Self {
+        Self::new_impl(memory_manager)
     }
 
     fn initialize_register_defaults(&mut self) {
@@ -2248,9 +2272,13 @@ impl Maxwell3D {
             log::info!("Maxwell3D::bind_rasterizer rasterizer_ptr={:p}", ptr);
         }
         self.rasterizer = Some(RasterizerHandle::from_ref(rasterizer));
+        self.upload_state.bind_rasterizer(rasterizer);
     }
 
+    #[cfg(test)]
     pub fn set_memory_manager(&mut self, memory_manager: Arc<Mutex<MemoryManager>>) {
+        self.upload_state
+            .bind_memory_manager(Arc::clone(&memory_manager));
         self.memory_manager = Some(memory_manager);
     }
 
@@ -2276,11 +2304,8 @@ impl Maxwell3D {
     /// access from shared shader-cache owners.
     pub fn make_gpu_memory_reader(&self) -> Option<Arc<dyn Fn(u64, &mut [u8]) + Send + Sync>> {
         let memory_manager = self.memory_manager.as_ref().cloned()?;
-        let guest_memory_reader = self.guest_memory_reader.as_ref().cloned()?;
         Some(Arc::new(move |gpu_addr, output| {
-            memory_manager
-                .lock()
-                .read_block(gpu_addr, output, &*guest_memory_reader);
+            memory_manager.lock().read_block(gpu_addr, output);
         }))
     }
 
@@ -2469,12 +2494,7 @@ impl Maxwell3D {
         let Some(memory_manager) = self.memory_manager.as_ref().cloned() else {
             return false;
         };
-        let Some(guest_memory_reader) = self.guest_memory_reader.as_ref().cloned() else {
-            return false;
-        };
-        memory_manager
-            .lock()
-            .read_block(addr, output, &*guest_memory_reader);
+        memory_manager.lock().read_block(addr, output);
         true
     }
 
@@ -2505,9 +2525,6 @@ impl Maxwell3D {
         let Some(memory_manager) = self.memory_manager.as_ref().cloned() else {
             return;
         };
-        let Some(guest_memory_reader) = self.guest_memory_reader.as_ref().cloned() else {
-            return;
-        };
 
         let mut current_index = 0usize;
         for &(segment_addr, word_count) in &self.macro_segments {
@@ -2519,9 +2536,8 @@ impl Maxwell3D {
 
             let byte_count = word_count * std::mem::size_of::<u32>();
             let mut bytes = vec![0u8; byte_count];
-            memory_manager
-                .lock()
-                .read_block(segment_addr, &mut bytes, &*guest_memory_reader);
+            let memory_manager = memory_manager.lock();
+            memory_manager.read_block(segment_addr, &mut bytes);
             for (word_index, chunk) in bytes.chunks_exact(4).enumerate() {
                 self.macro_params[current_index + word_index] =
                     u32::from_le_bytes(chunk.try_into().expect("4-byte chunk"));
@@ -2577,25 +2593,9 @@ impl Maxwell3D {
                 );
             }
         }
-        self.upload_state.regs = self.upload_registers();
-        let Some(memory_manager) = self.memory_manager.as_ref().cloned() else {
-            return;
-        };
-        let rasterizer_handle = self.rasterizer;
-        let writer = self.guest_memory_writer.as_ref().cloned();
-        let mut write_cpu = move |addr: u64, bytes: &[u8]| {
-            if let Some(writer) = writer.as_ref() {
-                writer(addr, bytes);
-            }
-        };
-        let mut rasterizer = rasterizer_handle.map(|handle| unsafe { handle.as_mut() });
-        let mut ctx = engine_upload::FlushContext {
-            rasterizer: rasterizer.as_deref_mut(),
-            memory_manager,
-            write_cpu_mem: &mut write_cpu,
-        };
+        let regs = self.upload_registers();
         self.upload_state
-            .process_data_word_with_ctx(data, is_last_call, &mut ctx);
+            .process_data_word(&regs, data, is_last_call);
     }
 
     fn process_inline_upload_multi(&mut self, data: &[u32]) {
@@ -2612,10 +2612,9 @@ impl Maxwell3D {
                 );
             }
         }
-        self.upload_state.regs = self.upload_registers();
-        let Some(memory_manager) = self.memory_manager.as_ref().cloned() else {
+        if self.memory_manager.is_none() {
             return;
-        };
+        }
         let rasterizer_handle = self.rasterizer;
         if std::env::var_os("RUZU_TRACE_INLINE_TO_MEMORY").is_some() {
             log::info!(
@@ -2626,20 +2625,8 @@ impl Maxwell3D {
                 data.len()
             );
         }
-        let writer = self.guest_memory_writer.as_ref().cloned();
-        let mut write_cpu = move |addr: u64, bytes: &[u8]| {
-            if let Some(writer) = writer.as_ref() {
-                writer(addr, bytes);
-            }
-        };
-        let mut rasterizer = rasterizer_handle.map(|handle| unsafe { handle.as_mut() });
-        let mut ctx = engine_upload::FlushContext {
-            rasterizer: rasterizer.as_deref_mut(),
-            memory_manager,
-            write_cpu_mem: &mut write_cpu,
-        };
-        self.upload_state
-            .process_data_multi_with_ctx(data, &mut ctx);
+        let regs = self.upload_registers();
+        self.upload_state.process_data_multi(&regs, data);
     }
 
     /// Width of render target `index`.
@@ -3056,24 +3043,30 @@ impl Maxwell3D {
 
     /// Read a TIC entry by index from the texture header pool.
     /// Returns `(TextureDescriptor, changed)`.
-    pub fn get_tic_entry(
-        &mut self,
-        index: u32,
-        gpu_read: &dyn Fn(u64, &mut [u8]),
-    ) -> (TextureDescriptor, bool) {
-        let (raw, changed) = self.tic_table.read(index, gpu_read);
+    pub fn get_tic_entry(&mut self, index: u32) -> (TextureDescriptor, bool) {
+        let memory_manager = self
+            .memory_manager
+            .as_ref()
+            .cloned()
+            .expect("Maxwell3D::get_tic_entry requires a MemoryManager owner");
+        let (raw, changed) = self.tic_table.read(index, &|addr, output| {
+            memory_manager.lock().read_block_unsafe(addr, output);
+        });
         let words = words_from_bytes(&raw);
         (TextureDescriptor::from_words(&words), changed)
     }
 
     /// Read a TSC entry by index from the texture sampler pool.
     /// Returns `(SamplerDescriptor, changed)`.
-    pub fn get_tsc_entry(
-        &mut self,
-        index: u32,
-        gpu_read: &dyn Fn(u64, &mut [u8]),
-    ) -> (SamplerDescriptor, bool) {
-        let (raw, changed) = self.tsc_table.read(index, gpu_read);
+    pub fn get_tsc_entry(&mut self, index: u32) -> (SamplerDescriptor, bool) {
+        let memory_manager = self
+            .memory_manager
+            .as_ref()
+            .cloned()
+            .expect("Maxwell3D::get_tsc_entry requires a MemoryManager owner");
+        let (raw, changed) = self.tsc_table.read(index, &|addr, output| {
+            memory_manager.lock().read_block_unsafe(addr, output);
+        });
         let words = words_from_bytes(&raw);
         (SamplerDescriptor::from_words(&words), changed)
     }
@@ -3351,6 +3344,7 @@ impl RenderConditionStateSource for Maxwell3D {
     }
 }
 
+#[cfg(test)]
 impl Default for Maxwell3D {
     fn default() -> Self {
         Self::new()
@@ -3904,8 +3898,9 @@ impl Maxwell3D {
                 self.process_sync_point();
             }
             LAUNCH_DMA => {
-                self.upload_state.regs = self.upload_registers();
-                self.upload_state.process_exec(self.launch_dma_is_linear());
+                let regs = self.upload_registers();
+                self.upload_state
+                    .process_exec(&regs, self.launch_dma_is_linear());
             }
             INLINE_DATA => {
                 self.process_inline_upload_word(argument, is_last_call);
@@ -4028,19 +4023,12 @@ impl Maxwell3D {
         let copy_size = data.len() as u32 * 4;
         let address = buffer_address.wrapping_add(offset as u64);
         if let Some(memory_manager) = self.memory_manager.as_ref().cloned() {
-            let writer = self.guest_memory_writer.as_ref().cloned();
-            let mut write_cpu = move |addr: u64, bytes: &[u8]| {
-                if let Some(writer) = writer.as_ref() {
-                    writer(addr, bytes);
-                }
-            };
             let mut bytes = Vec::with_capacity(copy_size as usize);
             for value in data {
                 bytes.extend_from_slice(&value.to_le_bytes());
             }
-            memory_manager
-                .lock()
-                .write_block_cached(address, &bytes, &mut write_cpu);
+            let mut memory_manager = memory_manager.lock();
+            memory_manager.write_block_cached(address, &bytes);
         }
 
         // Increment the current buffer position.
@@ -4547,8 +4535,14 @@ impl Maxwell3D {
                         buf.extend_from_slice(&gpu_ticks.to_le_bytes());
                         buf
                     };
-                    self.pending_semaphore_writes
-                        .push(PendingWrite { gpu_va, data });
+                    let wrote_through_owner =
+                        self.memory_manager.as_ref().is_some_and(|memory_manager| {
+                            memory_manager.lock().write_block_unsafe(gpu_va, &data)
+                        });
+                    if !wrote_through_owner {
+                        self.pending_semaphore_writes
+                            .push(PendingWrite { gpu_va, data });
+                    }
                 }
             }
             ReportOperation::Acquire => {
@@ -5071,6 +5065,35 @@ mod tests {
     use super::*;
     use crate::rasterizer_interface::{RasterizerDownloadArea, RasterizerInterface};
     use std::sync::{Arc, Mutex};
+
+    fn new_descriptor_owner_backed_engine(backing: &[u8], device_addr: u64) -> Maxwell3D {
+        let device_memory = Arc::new(
+            crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager::default(),
+        );
+        device_memory.smmu_set_physical_base_for_test(backing.as_ptr() as usize);
+        device_memory.smmu_map_with_cpu_backing(
+            device_addr,
+            backing.as_ptr(),
+            0x4000_0000,
+            backing.len(),
+            1,
+            true,
+        );
+        let memory_manager = Arc::new(parking_lot::Mutex::new(
+            crate::memory_manager::MemoryManager::new_with_geometry_and_device_memory(
+                1,
+                Arc::clone(&device_memory),
+                32,
+                0x1_0000_0000,
+                16,
+                12,
+            ),
+        ));
+        memory_manager
+            .lock()
+            .map(device_addr, device_addr, backing.len() as u64, 0, false);
+        Maxwell3D::new_with_memory_manager(memory_manager)
+    }
 
     #[derive(Default, Clone)]
     struct RasterizerCalls {
@@ -7260,6 +7283,44 @@ mod tests {
         let _ = &mut rasterizer;
     }
 
+    #[test]
+    fn report_semaphore_fallback_uses_memory_manager_owner_without_guest_writer() {
+        let device_memory = Arc::new(
+            crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager::default(),
+        );
+        let backing = vec![0u8; 0x1000];
+        device_memory.smmu_set_physical_base_for_test(backing.as_ptr() as usize);
+        device_memory.smmu_map_with_cpu_backing(
+            0x8000,
+            backing.as_ptr(),
+            0x5000,
+            backing.len(),
+            1,
+            true,
+        );
+        let memory_manager = Arc::new(parking_lot::Mutex::new(
+            crate::memory_manager::MemoryManager::new_with_geometry_and_device_memory(
+                1,
+                Arc::clone(&device_memory),
+                32,
+                0x1_0000_0000,
+                16,
+                12,
+            ),
+        ));
+        memory_manager.lock().map(0x7000, 0x8000, 0x1000, 0, false);
+
+        let mut engine = Maxwell3D::new();
+        engine.set_memory_manager(memory_manager);
+        engine.write_reg(REPORT_SEMAPHORE_BASE, 0);
+        engine.write_reg(REPORT_SEMAPHORE_BASE + 1, 0x7000);
+        engine.write_reg(REPORT_SEMAPHORE_BASE + 2, 0x1122_3344);
+        engine.write_reg(REPORT_SEMAPHORE_TRIGGER, 1 << 28);
+
+        assert!(engine.pending_semaphore_writes.is_empty());
+        assert_eq!(&backing[..4], &0x1122_3344u32.to_le_bytes());
+    }
+
     // ── MME macro integration tests ─────────────────────────────────────
 
     /// Helper: encode an AddImmediate macro opcode.
@@ -7319,6 +7380,42 @@ mod tests {
 
         assert_eq!(engine.macro_params, vec![0x4433_2211, 0x8877_6655]);
         assert!(engine.any_parameters_dirty());
+    }
+
+    #[test]
+    fn read_gpu_block_uses_memory_manager_owner_without_guest_callback() {
+        let device_memory = std::sync::Arc::new(
+            crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager::default(),
+        );
+        let backing = vec![0x11, 0x22, 0x33, 0x44];
+        device_memory.smmu_set_physical_base_for_test(backing.as_ptr() as usize);
+        device_memory.smmu_map_with_cpu_backing(
+            0x2000,
+            backing.as_ptr(),
+            0x8000,
+            backing.len(),
+            1,
+            true,
+        );
+
+        let memory_manager = std::sync::Arc::new(parking_lot::Mutex::new(
+            crate::memory_manager::MemoryManager::new_with_geometry_and_device_memory(
+                1,
+                std::sync::Arc::clone(&device_memory),
+                32,
+                0x1_0000_0000,
+                16,
+                12,
+            ),
+        ));
+        memory_manager.lock().map(0x1000, 0x2000, 4, 0, false);
+
+        let mut engine = Maxwell3D::new();
+        engine.set_memory_manager(memory_manager);
+
+        let mut output = [0u8; 4];
+        assert!(engine.read_gpu_block(0x1000, &mut output));
+        assert_eq!(output, [0x11, 0x22, 0x33, 0x44]);
     }
 
     #[test]
@@ -7618,14 +7715,11 @@ mod tests {
 
     #[test]
     fn test_get_tic_entry() {
-        let mut engine = Maxwell3D::new();
+        let mut backing = vec![0u8; 0x1000];
 
         // Set up TIC pool: address = 0x1_0000, limit = 10.
+        let tic_pool_addr = 0x1_0000u64;
         let base = TEX_HEADER_POOL_BASE as usize;
-        engine.regs[base] = 0;
-        engine.regs[base + 1] = 0x1_0000;
-        engine.regs[base + 2] = 10;
-        engine.sync_descriptor_tables();
 
         // Build a TIC entry for A8B8G8R8 UNorm at index 3.
         // word0: format=0x1D(A8B8G8R8), component types UNorm(2), swizzle RGBA.
@@ -7640,31 +7734,27 @@ mod tests {
             | (4 << 25)  // z_source = B
             | (5 << 28); // w_source = A
         raw[0..4].copy_from_slice(&word0.to_le_bytes());
+        let offset = 3 * 32;
+        backing[offset..offset + 32].copy_from_slice(&raw);
 
-        let reader = move |addr: u64, buf: &mut [u8]| {
-            let expected_addr = 0x1_0000u64 + 3 * 32;
-            if addr == expected_addr {
-                buf.copy_from_slice(&raw);
-            } else {
-                buf.fill(0);
-            }
-        };
+        let mut engine = new_descriptor_owner_backed_engine(&backing, tic_pool_addr);
+        engine.regs[base] = 0;
+        engine.regs[base + 1] = tic_pool_addr as u32;
+        engine.regs[base + 2] = 10;
+        engine.sync_descriptor_tables();
 
-        let (desc, changed) = engine.get_tic_entry(3, &reader);
+        let (desc, changed) = engine.get_tic_entry(3);
         assert!(changed);
         assert_eq!(desc.format, TextureFormat::A8B8G8R8);
     }
 
     #[test]
     fn test_get_tsc_entry() {
-        let mut engine = Maxwell3D::new();
+        let mut backing = vec![0u8; 0x1000];
 
         // Set up TSC pool: address = 0x2_0000, limit = 5.
+        let tsc_pool_addr = 0x2_0000u64;
         let base = TEX_SAMPLER_POOL_BASE as usize;
-        engine.regs[base] = 0;
-        engine.regs[base + 1] = 0x2_0000;
-        engine.regs[base + 2] = 5;
-        engine.sync_descriptor_tables();
 
         // Build a TSC entry at index 1.
         // word0: wrap_u=Wrap(0), wrap_v=ClampToEdge(2), wrap_p=Mirror(1).
@@ -7674,17 +7764,16 @@ mod tests {
         raw[0..4].copy_from_slice(&word0.to_le_bytes());
         let word1: u32 = 2 | (2 << 4); // mag=Linear(2), min=Linear(2)
         raw[4..8].copy_from_slice(&word1.to_le_bytes());
+        let offset = 32;
+        backing[offset..offset + 32].copy_from_slice(&raw);
 
-        let reader = move |addr: u64, buf: &mut [u8]| {
-            let expected_addr = 0x2_0000u64 + 1 * 32;
-            if addr == expected_addr {
-                buf.copy_from_slice(&raw);
-            } else {
-                buf.fill(0);
-            }
-        };
+        let mut engine = new_descriptor_owner_backed_engine(&backing, tsc_pool_addr);
+        engine.regs[base] = 0;
+        engine.regs[base + 1] = tsc_pool_addr as u32;
+        engine.regs[base + 2] = 5;
+        engine.sync_descriptor_tables();
 
-        let (desc, changed) = engine.get_tsc_entry(1, &reader);
+        let (desc, changed) = engine.get_tsc_entry(1);
         assert!(changed);
         assert_eq!(desc.wrap_u, WrapMode::Wrap);
         assert_eq!(desc.wrap_v, WrapMode::ClampToEdge);
@@ -7872,17 +7961,38 @@ mod tests {
     #[test]
     fn test_process_cb_multi_data_writes_through_memory_manager() {
         let mut engine = Maxwell3D::new();
+        let device_memory = Arc::new(
+            crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager::default(),
+        );
+        let backing = vec![0u8; 0x1000];
+        device_memory.smmu_set_physical_base_for_test(backing.as_ptr() as usize);
+        device_memory.smmu_map_with_cpu_backing(
+            0x9000_0000,
+            backing.as_ptr(),
+            0x4000,
+            backing.len(),
+            1,
+            true,
+        );
         let memory_manager = Arc::new(parking_lot::Mutex::new(
-            crate::memory_manager::MemoryManager::new_with_geometry(1, 32, 0x1_0000_0000, 16, 12),
+            crate::memory_manager::MemoryManager::new_with_geometry_and_device_memory(
+                1,
+                Arc::clone(&device_memory),
+                32,
+                0x1_0000_0000,
+                16,
+                12,
+            ),
         ));
         memory_manager
             .lock()
             .map(0x10000, 0x9000_0000, 0x1000, 0, false);
-        let writes = Arc::new(Mutex::new(Vec::<(u64, Vec<u8>)>::new()));
+        let writes = Arc::new(Mutex::new(0usize));
         let writes_clone = Arc::clone(&writes);
         engine.set_memory_manager(Arc::clone(&memory_manager));
         engine.set_guest_memory_writer(Arc::new(move |addr, bytes| {
-            writes_clone.lock().unwrap().push((addr, bytes.to_vec()));
+            let _ = (addr, bytes);
+            *writes_clone.lock().unwrap() += 1;
         }));
 
         engine.call_method(CB_CONFIG_BASE, 0x100, true);
@@ -7890,13 +8000,57 @@ mod tests {
         engine.call_method(CB_CONFIG_BASE + 2, 0x10000, true);
         engine.call_method(CB_CONFIG_BASE + 3, 0, true);
         engine.call_multi_method(CB_DATA_BASE, &[0x11223344, 0x55667788], 2, 2);
+        memory_manager.lock().flush_caching();
 
-        let writes = writes.lock().unwrap();
-        assert_eq!(writes.len(), 1);
-        assert_eq!(writes[0].0, 0x9000_0000);
         assert_eq!(
-            writes[0].1,
-            vec![0x44, 0x33, 0x22, 0x11, 0x88, 0x77, 0x66, 0x55]
+            &backing[..8],
+            &[0x44, 0x33, 0x22, 0x11, 0x88, 0x77, 0x66, 0x55]
+        );
+        assert_eq!(*writes.lock().unwrap(), 0);
+        assert_eq!(engine.regs[(CB_CONFIG_BASE + 3) as usize], 8);
+    }
+
+    #[test]
+    fn process_cb_multi_data_uses_memory_manager_owner_without_guest_writer() {
+        let mut engine = Maxwell3D::new();
+        let device_memory = Arc::new(
+            crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager::default(),
+        );
+        let backing = vec![0u8; 0x1000];
+        device_memory.smmu_set_physical_base_for_test(backing.as_ptr() as usize);
+        device_memory.smmu_map_with_cpu_backing(
+            0x9000_0000,
+            backing.as_ptr(),
+            0x4000,
+            backing.len(),
+            1,
+            true,
+        );
+        let memory_manager = Arc::new(parking_lot::Mutex::new(
+            crate::memory_manager::MemoryManager::new_with_geometry_and_device_memory(
+                1,
+                Arc::clone(&device_memory),
+                32,
+                0x1_0000_0000,
+                16,
+                12,
+            ),
+        ));
+        memory_manager
+            .lock()
+            .map(0x10000, 0x9000_0000, 0x1000, 0, false);
+        engine.set_memory_manager(Arc::clone(&memory_manager));
+
+        engine.call_method(CB_CONFIG_BASE, 0x100, true);
+        engine.call_method(CB_CONFIG_BASE + 1, 0, true);
+        engine.call_method(CB_CONFIG_BASE + 2, 0x10000, true);
+        engine.call_method(CB_CONFIG_BASE + 3, 0, true);
+        engine.call_multi_method(CB_DATA_BASE, &[0x11223344, 0x55667788], 2, 2);
+        memory_manager.lock().flush_caching();
+
+        assert_eq!(
+            &backing[..8],
+            &[0x44, 0x33, 0x22, 0x11, 0x88, 0x77, 0x66, 0x55]
         );
         assert_eq!(engine.regs[(CB_CONFIG_BASE + 3) as usize], 8);
     }
@@ -8073,10 +8227,10 @@ mod tests {
         engine.regs[(UPLOAD_REGS_BASE + 3) as usize] = 0x2000;
         engine.regs[(UPLOAD_REGS_BASE + 4) as usize] = 8;
         engine.regs[LAUNCH_DMA as usize] = 0x1011;
-        engine.upload_state.regs = engine.upload_registers();
+        let upload_regs = engine.upload_registers();
         engine
             .upload_state
-            .process_exec(engine.launch_dma_is_linear());
+            .process_exec(&upload_regs, engine.launch_dma_is_linear());
 
         engine.process_inline_upload_multi(&[0x1122_3344, 0x5566_7788]);
 
@@ -8087,6 +8241,53 @@ mod tests {
                 8,
                 vec![0x44, 0x33, 0x22, 0x11, 0x88, 0x77, 0x66, 0x55]
             )]
+        );
+    }
+
+    #[test]
+    fn inline_upload_linear_uses_constructor_memory_manager_owner_without_guest_writer() {
+        let device_memory = Arc::new(
+            crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager::default(),
+        );
+        let backing = vec![0u8; 0x1000];
+        device_memory.smmu_set_physical_base_for_test(backing.as_ptr() as usize);
+        device_memory.smmu_map_with_cpu_backing(
+            0x8000,
+            backing.as_ptr(),
+            0x6000,
+            backing.len(),
+            1,
+            true,
+        );
+        let memory_manager = Arc::new(parking_lot::Mutex::new(
+            crate::memory_manager::MemoryManager::new_with_geometry_and_device_memory(
+                1,
+                Arc::clone(&device_memory),
+                32,
+                0x1_0000_0000,
+                16,
+                12,
+            ),
+        ));
+        memory_manager.lock().map(0x2000, 0x8000, 0x1000, 0, false);
+
+        let mut engine = Maxwell3D::new_with_memory_manager(memory_manager);
+        engine.regs[UPLOAD_REGS_BASE as usize] = 8;
+        engine.regs[(UPLOAD_REGS_BASE + 1) as usize] = 1;
+        engine.regs[(UPLOAD_REGS_BASE + 2) as usize] = 0;
+        engine.regs[(UPLOAD_REGS_BASE + 3) as usize] = 0x2000;
+        engine.regs[(UPLOAD_REGS_BASE + 4) as usize] = 8;
+        engine.regs[LAUNCH_DMA as usize] = 0x1011;
+        let upload_regs = engine.upload_registers();
+        engine
+            .upload_state
+            .process_exec(&upload_regs, engine.launch_dma_is_linear());
+
+        engine.process_inline_upload_multi(&[0x1122_3344, 0x5566_7788]);
+
+        assert_eq!(
+            &backing[..8],
+            &[0x44, 0x33, 0x22, 0x11, 0x88, 0x77, 0x66, 0x55]
         );
     }
 

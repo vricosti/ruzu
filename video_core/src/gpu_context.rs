@@ -23,6 +23,7 @@ use crate::engines::inline_to_memory::InlineToMemory;
 use crate::engines::kepler_compute::KeplerCompute;
 use crate::engines::maxwell_3d::Maxwell3D;
 use crate::engines::maxwell_dma::MaxwellDMA;
+use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
 use crate::memory_manager::{GpuMemoryManager, MemoryManager};
 use crate::rasterizer::SoftwareRasterizer;
 use crate::rasterizer_interface::RasterizerInterface;
@@ -137,19 +138,35 @@ pub struct GpuContext {
 impl GpuContext {
     /// Create a new GPU context with default engines and null backend.
     pub fn new() -> Self {
-        let compute_memory_manager = Arc::new(Mutex::new(MemoryManager::new(0)));
-        let twod_memory_manager = Arc::new(Mutex::new(MemoryManager::new(0)));
-        let dma_memory_manager = Arc::new(Mutex::new(MemoryManager::new(0)));
+        let device_memory = Arc::new(MaxwellDeviceMemoryManager::default());
+        let memory_manager = Arc::new(Mutex::new(
+            MemoryManager::new_with_geometry_and_device_memory(
+                0,
+                Arc::clone(&device_memory),
+                40,
+                1u64 << 34,
+                16,
+                12,
+            ),
+        ));
         let engines: Vec<Option<Box<dyn crate::engines::Engine>>> = vec![
-            Some(Box::new(Maxwell3D::new())), // subchannel 0
-            Some(Box::new(KeplerCompute::new(compute_memory_manager))), // subchannel 1
-            Some(Box::new(InlineToMemory::new())), // subchannel 2
-            Some(Box::new(Fermi2D::new(twod_memory_manager))), // subchannel 3
-            Some(Box::new(MaxwellDMA::new(dma_memory_manager))), // subchannel 4
+            Some(Box::new(Maxwell3D::new_with_memory_manager(Arc::clone(
+                &memory_manager,
+            )))), // subchannel 0
+            Some(Box::new(KeplerCompute::new(Arc::clone(&memory_manager)))), // subchannel 1
+            Some(Box::new(InlineToMemory::new())),                           // subchannel 2
+            Some(Box::new(Fermi2D::new(Arc::clone(&memory_manager)))),       // subchannel 3
+            Some(Box::new(MaxwellDMA::new(memory_manager))),                 // subchannel 4
         ];
 
         Self {
-            memory_manager: RwLock::new(GpuMemoryManager::new()),
+            memory_manager: RwLock::new(GpuMemoryManager::with_params_and_device_memory(
+                device_memory,
+                40,
+                1u64 << 34,
+                16,
+                12,
+            )),
             syncpoints: Arc::new(SyncpointManager::new()),
             nvmap_registry: NvMapRegistry::new(),
             command_processor: Mutex::new(CommandProcessor::new(engines)),
@@ -219,10 +236,9 @@ impl GpuContext {
 
     /// Process all queued GPFIFO entries (called by the main loop each frame).
     ///
-    /// `read_mem` reads bytes from a guest physical address into a buffer.
     /// Returns flush output containing framebuffer data and pending write-backs
     /// from engine operations (blit, DMA copy, etc.).
-    pub fn flush(&self, read_mem: &dyn Fn(u64, &mut [u8])) -> Option<FlushOutput> {
+    pub fn flush(&self) -> Option<FlushOutput> {
         let entries: Vec<GpEntry> = {
             let mut queue = self.gpfifo_queue.lock();
             std::mem::take(&mut *queue)
@@ -237,9 +253,8 @@ impl GpuContext {
         let mm = self.memory_manager.read();
         let mut proc = self.command_processor.lock();
 
-        // Create a reader that translates GPU VA → CPU PA, then reads from guest mem.
         let gpu_read = |gpu_va: u64, buf: &mut [u8]| {
-            mm.read(gpu_va, buf, read_mem);
+            mm.read_block(gpu_va, buf);
         };
 
         proc.process_entries(&entries, &gpu_read);
@@ -340,7 +355,7 @@ mod tests {
     fn test_submit_and_flush_empty() {
         let ctx = GpuContext::new();
         // Flush with no entries should be a no-op.
-        ctx.flush(&|_addr, _buf| {});
+        ctx.flush();
     }
 
     #[test]
@@ -396,7 +411,7 @@ mod tests {
             entry1: 0, // length = 0, will be skipped
         }]);
 
-        ctx.flush(&|_addr, _buf| {});
+        ctx.flush();
 
         // Queue should be empty after flush.
         let queue = ctx.gpfifo_queue.lock();

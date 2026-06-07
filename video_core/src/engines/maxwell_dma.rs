@@ -194,6 +194,7 @@ impl EngineInterface for MaxwellDMA {
     }
 }
 
+#[cfg(test)]
 impl Default for MaxwellDMA {
     fn default() -> Self {
         Self::new(Arc::new(Mutex::new(MemoryManager::new(0))))
