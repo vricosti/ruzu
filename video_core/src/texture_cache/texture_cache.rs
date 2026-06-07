@@ -619,17 +619,15 @@ impl TextureCacheBase {
         render_targets: &Maxwell3DRenderTargets,
         mut gpu_to_cpu: impl FnMut(GPUVAddr) -> Option<u64>,
     ) {
-        let count = render_targets.rt_control.count.min(NUM_RT as u32) as usize;
-        if count == 0 {
-            return;
+        for index in 0..NUM_RT {
+            self.render_targets.draw_buffers[index] = render_targets.rt_control.map[index] as u8;
+            self.render_targets.color_buffer_ids[index] = ImageViewId::default();
         }
 
-        for color_index in 0..count {
-            let target_index = render_targets.rt_control.map[color_index] as usize;
-            if target_index >= NUM_RT {
-                continue;
-            }
-            let rt = render_targets.render_targets[target_index];
+        self.render_targets.is_rescaled = self.is_rescaling;
+
+        for index in 0..NUM_RT {
+            let rt = render_targets.render_targets[index];
             if rt.address == 0 || rt.width == 0 || rt.height == 0 || rt.format == 0 {
                 continue;
             }
@@ -637,8 +635,8 @@ impl TextureCacheBase {
                 if std::env::var_os("RUZU_TRACE_RT").is_some() {
                     log::info!(
                         "[RT] miss translate color={} target={} gpu=0x{:X} {}x{} fmt=0x{:X}",
-                        color_index,
-                        target_index,
+                        index,
+                        index,
                         rt.address,
                         rt.width,
                         rt.height,
@@ -653,19 +651,20 @@ impl TextureCacheBase {
                 render_targets.anti_alias_samples_mode,
                 cpu_addr,
             );
-            self.find_render_target_view_from_image(
+            let view_id = self.find_render_target_view_from_image(
                 image_id,
                 &rt,
                 render_targets.anti_alias_samples_mode,
                 rt.address,
             );
+            self.render_targets.color_buffer_ids[index] = view_id;
 
             if std::env::var_os("RUZU_TRACE_RT").is_some() {
                 let image = &self.slot_images[image_id];
                 log::info!(
                     "[RT] color={} target={} gpu=0x{:X} cpu=0x{:X} {}x{} fmt=0x{:X} image={} views={}",
-                    color_index,
-                    target_index,
+                    index,
+                    index,
                     rt.address,
                     cpu_addr,
                     rt.width,
@@ -678,11 +677,13 @@ impl TextureCacheBase {
         }
 
         let zeta = render_targets.zeta;
+        self.render_targets.depth_buffer_id = ImageViewId::default();
         if zeta.enabled && zeta.address != 0 && zeta.width != 0 && zeta.height != 0 {
             if let Some(cpu_addr) = gpu_to_cpu(zeta.address) {
                 let info = ImageInfo::from_zeta_info(&zeta, render_targets.anti_alias_samples_mode);
                 let image_id = self.find_or_insert_image_from_info(&info, zeta.address, cpu_addr);
-                self.find_image_view_from_image_info(image_id, &info, zeta.address);
+                self.render_targets.depth_buffer_id =
+                    self.find_image_view_from_image_info(image_id, &info, zeta.address);
             } else if std::env::var_os("RUZU_TRACE_RT").is_some() {
                 log::info!(
                     "[RT] miss translate zeta gpu=0x{:X} {}x{} fmt=0x{:X}",
@@ -1200,9 +1201,21 @@ mod tests {
             depth: 1,
             base_layer: 0,
         };
+        render_targets.zeta = crate::engines::maxwell_3d::ZetaInfo {
+            enabled: true,
+            address: 0x5000_0000,
+            width: 64,
+            height: 32,
+            format: 0xA,
+            tile_mode: 1 << 12,
+            array_pitch: 32,
+            depth: 1,
+        };
 
-        cache.update_render_targets_from_snapshot(&render_targets, |gpu_addr| {
-            (gpu_addr == 0x4000_0000).then_some(0x535B_5000)
+        cache.update_render_targets_from_snapshot(&render_targets, |gpu_addr| match gpu_addr {
+            0x4000_0000 => Some(0x535B_5000),
+            0x5000_0000 => Some(0x535C_0000),
+            _ => None,
         });
 
         let config = FramebufferConfig {
@@ -1214,8 +1227,11 @@ mod tests {
         };
         let view = cache.try_find_framebuffer_image_view(&config, 0x535B_5000);
         assert!(view.is_some());
-        assert_eq!(cache.slot_images.size(), 2);
-        assert_eq!(cache.slot_image_views.size(), 3);
+        assert!(cache.render_targets.color_buffer_ids[0].is_valid());
+        assert!(cache.render_targets.depth_buffer_id.is_valid());
+        assert_eq!(cache.render_targets.draw_buffers[0], 0);
+        assert_eq!(cache.slot_images.size(), 3);
+        assert_eq!(cache.slot_image_views.size(), 4);
     }
 
     #[test]

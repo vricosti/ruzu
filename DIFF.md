@@ -625,6 +625,29 @@
 - Manual MK8D 25s isolated-XDG host-thread-all smoke after switching `SessionRequestManager` to a weak `ServerManager` owner (`/tmp/ruzu_mk8d_ipc_weak_owner_host_all_smoke_1780868703.log`, `RUZU_SERVER_THREAD_IPC_ALL=1`): reached `NotifyRunning`, no panic/`BreakLoopNullPc`, no `svcBreak`/`SetTerminateResult`, no `missing_server_manager_owner`, and no `receive_request_hle failed` warnings. Warn-level logging did not emit audio or presentation markers in this short run.
 
 ## 2026-06-07 — core/src/hle/kernel/k_client_session.rs, core/src/hle/kernel/k_session.rs, core/src/hle/kernel/k_server_session.rs, core/src/hle/kernel/k_thread.rs, core/src/hle/kernel/k_scheduler.rs, and core/src/hle/kernel/svc/svc_ipc.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/k_client_session.cpp, /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/k_session.cpp, /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/k_server_session.cpp, /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/k_thread.cpp, /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/k_scheduler.cpp, and /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/svc/svc_ipc.cpp
+## 2026-06-07 — video_core/src/texture_cache/texture_cache.rs and video_core/src/renderer_opengl/gl_texture_cache.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/texture_cache.h and /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_texture_cache.cpp
+
+### Intentional differences
+- Ruzu still uses `Maxwell3DRenderTargets` snapshots instead of upstream `TextureCache<P>` reading `maxwell3d->regs` directly, but the snapshot bridge now fills `TextureCacheBase::render_targets.color_buffer_ids`, `depth_buffer_id`, and `draw_buffers` before OpenGL prepare/framebuffer selection.
+- `framebuffer_for_render_targets_from_snapshot(...)` still accepts the rasterizer-provided surface-clip size because `Maxwell3DRenderTargets` does not yet carry `regs.surface_clip`; upstream stores this size inside `TextureCache<P>::UpdateRenderTargets`.
+
+### Unintentional differences (to fix)
+- Ruzu still splits upstream `UpdateRenderTargets(...)` across the Rust snapshot update, OpenGL prepare, and OpenGL framebuffer helper because the texture cache does not yet own a live `Maxwell3D*`/channel reference.
+- Ruzu still does not run upstream `RescaleRenderTargets()` or clear Maxwell dirty flags inside the texture cache.
+
+### Missing items
+- Extend the long-term live Maxwell3D access model so `TextureCacheBase::update_render_targets` can own the complete upstream `UpdateRenderTargets(bool is_clear)` lifecycle, including surface-clip sizing, rescale flags, dirty-flag clearing, and `DepthBiasGlobal` invalidation.
+- Move OpenGL framebuffer ownership toward upstream's common texture-cache framebuffer lifecycle instead of the current Rust-side OpenGL bridge cache.
+
+### Binary layout verification
+- N/A: host texture-cache state synchronization only. No guest-visible raw payload layout changed.
+
+### Tests
+- Re-read upstream `texture_cache.h::{RescaleRenderTargets,UpdateRenderTargets,PrepareImageView}`.
+- `cargo test -p video_core texture_cache::texture_cache::tests::update_render_targets_from_snapshot_registers_presentable_view -- --nocapture`
+- `cargo check -p video_core`
+
+## 2026-06-07 — core/src/hle/kernel/k_client_session.rs, core/src/hle/kernel/k_server_session.rs, core/src/hle/kernel/k_thread.rs, and core/src/hle/kernel/svc/svc_ipc.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/k_client_session.cpp, /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/k_server_session.cpp, /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/k_thread.cpp, and /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/svc/svc_ipc.cpp
 
 ### Intentional differences
 - `KServerSession::on_request(...)` / `on_request_with_process(...)` now own the synchronous IPC wait transition: scheduler lock, session-closed check, termination check, request enqueue, notify-available, and `ThreadWaitReasonForDebugging::Ipc` + `begin_wait()` for requests without an async event. Rust uses the client thread captured in `KSessionRequest` instead of re-reading a raw `GetCurrentThread(m_kernel)` pointer because the request already stores the Rust-safe owner reference created by `KClientSession`.
@@ -16755,10 +16778,8 @@ The following still panic because upstream either also throws NotImplementedExce
 
 ### Unintentional differences (to fix)
 - Ruzu still splits upstream `UpdateRenderTargets(true)` across `update_render_targets_from_snapshot(...)` and `prepare_render_targets_from_snapshot(...)` because the texture cache does not yet own a live `Maxwell3D*`/channel reference. This preserves the behavior for the clear invalidation case but not the final upstream method ownership.
-- The Rust prepare helper currently discovers the active view from the parent image's first render-target view. Upstream prepares the exact `render_targets.color_buffer_ids[index]` and `depth_buffer_id` stored in the cache's `RenderTargets` object.
 
 ### Missing items
-- Move the snapshot bridge closer to upstream by storing/filling `TextureCacheBase::render_targets` with the selected color/depth `ImageViewId`s, then prepare those exact ids instead of rediscovering image views by address.
 - Complete full `TextureCache<P>::UpdateRenderTargets` parity, including dirty-flag handling, rescale render-target updates, draw-buffer updates, and per-method Maxwell dirty flag clearing.
 
 ### Binary layout verification
