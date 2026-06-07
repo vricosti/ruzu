@@ -26,7 +26,9 @@ use shader_recompiler::{
 };
 
 use crate::shader_cache::{GraphicsEnvironments, ShaderCache as SharedShaderCache};
-use crate::shader_environment::{GenericEnvironment, GpuMemoryReader};
+#[cfg(test)]
+use crate::shader_environment::GenericEnvironment;
+use crate::shader_environment::GpuMemoryReader;
 use crate::transform_feedback;
 use shader_recompiler::program_header::ProgramHeader;
 
@@ -337,34 +339,19 @@ pub struct ShaderCache {
     /// Path to the on-disk shader cache file.
     shader_cache_filename: PathBuf,
 
-    /// Optional GPU memory reader used to fault in Maxwell shader bytecode
-    /// at the addresses supplied via `set_pending_program_addresses`.
+    /// Test-only GPU memory reader for the reduced local pipeline fallback.
     ///
-    /// When unset, `create_graphics_pipeline` produces a placeholder
-    /// pipeline with no compiled GLSL (matching the previous behaviour).
-    /// When set, the slow path actually invokes
-    /// `shader_recompiler::compile_shader_glsl` for each enabled stage and
-    /// stages the resulting GLSL strings on the returned `GraphicsPipeline`
-    /// so that gap (4) (`glCreateShader` / `glLinkProgram`) can pick them
-    /// up without further plumbing changes.
+    /// Runtime OpenGL pipeline creation uses
+    /// `current_graphics_pipeline_with_shared_cache(...)`, which obtains
+    /// upstream-shaped `GraphicsEnvironment` owners from the shared
+    /// `video_core::ShaderCache`.
+    #[cfg(test)]
     gpu_memory_reader: Option<GpuMemoryReader>,
 
-    /// Per-stage Maxwell shader program addresses to use as the
-    /// `unique_hashes` source for the next graphics pipeline lookup.
-    ///
-    /// Upstream `ShaderCache::CurrentGraphicsPipelineSlowPath` derives
-    /// `unique_hashes` by hashing the actual shader bytecode reachable
-    /// from `maxwell3d->regs.program_region.Address() + pipelines[i].offset`
-    /// for each of the 6 Maxwell shader stages. Without GPU-memory access
-    /// wired up yet, we use the GPU virtual addresses themselves as
-    /// stand-in unique identifiers — they are stable per shader for the
-    /// lifetime of a draw and are sufficient as cache keys.
-    ///
-    /// The owning rasterizer (`RasterizerOpenGL::draw`) is responsible for
-    /// populating this slot via [`ShaderCache::set_pending_program_addresses`]
-    /// before invoking [`ShaderCache::current_graphics_pipeline`].
-    /// A zero entry means "stage disabled" and produces a zero hash, matching
-    /// upstream's `unique_hashes[i] == 0` semantics.
+    /// Test-only per-stage Maxwell shader program addresses for the reduced
+    /// local pipeline fallback. Runtime keys are populated from live Maxwell
+    /// state by `current_graphics_pipeline_with_shared_cache(...)`.
+    #[cfg(test)]
     pending_program_addresses: [u64; 6],
 
     /// Owning thread for this cache instance. First call to a mutating method
@@ -405,7 +392,9 @@ impl ShaderCache {
             graphics_cache: HashMap::new(),
             compute_cache: HashMap::new(),
             shader_cache_filename: PathBuf::new(),
+            #[cfg(test)]
             gpu_memory_reader: None,
+            #[cfg(test)]
             pending_program_addresses: [0; 6],
             owner_tid_hash: std::sync::atomic::AtomicU64::new(0),
         }
@@ -468,14 +457,25 @@ impl ShaderCache {
         }
     }
 
-    /// Install the GPU memory reader callback used to fault in shader
-    /// bytecode during pipeline creation. The reader is forwarded into
-    /// every `GenericEnvironment` the cache constructs.
+    /// Legacy renderer hook retained for the broader renderer interface.
+    ///
+    /// In runtime builds this is intentionally a no-op for the OpenGL shader
+    /// cache: pipeline construction now uses the shared `ShaderCache` owner
+    /// graph and `GraphicsEnvironment` objects, matching upstream. Unit tests
+    /// keep the reader for reduced local pipeline fixtures.
     pub fn set_gpu_memory_reader(&mut self, reader: GpuMemoryReader) {
-        self.gpu_memory_reader = Some(reader);
+        #[cfg(not(test))]
+        {
+            let _ = reader;
+        }
+        #[cfg(test)]
+        {
+            self.gpu_memory_reader = Some(reader);
+        }
     }
 
     /// Whether a GPU memory reader is currently installed.
+    #[cfg(test)]
     pub fn has_gpu_memory_reader(&self) -> bool {
         self.gpu_memory_reader.is_some()
     }
@@ -486,11 +486,13 @@ impl ShaderCache {
     ///
     /// See the field-level docs on `pending_program_addresses` for the
     /// upstream parity rationale and the "stage disabled = 0" convention.
+    #[cfg(test)]
     pub fn set_pending_program_addresses(&mut self, addresses: [u64; 6]) {
         self.pending_program_addresses = addresses;
     }
 
     /// Read back the pending shader program addresses (test/inspection helper).
+    #[cfg(test)]
     pub fn pending_program_addresses(&self) -> [u64; 6] {
         self.pending_program_addresses
     }
@@ -519,23 +521,13 @@ impl ShaderCache {
         // Full implementation requires shader_environment::load_pipelines
     }
 
-    /// Get the current graphics pipeline.
+    /// Test-only reduced local graphics pipeline path.
     ///
-    /// Port of `ShaderCache::CurrentGraphicsPipeline()`.
-    ///
-    /// Fast path: if `current_pipeline` is already set and the matching
-    /// pipeline lives in the cache, return it (checking the async-build
-    /// sync fence if asynchronous compilation is enabled).
-    ///
-    /// Slow path: delegate to `current_graphics_pipeline_slow_path`, which
-    /// builds the key from engine state, looks it up in the cache, and
-    /// creates a new pipeline on miss.
-    ///
-    /// Returns `None` when async compilation is still in flight. Upstream
-    /// additionally returns `None` when the game hasn't bound a shader
-    /// program yet, but the current Rust port always treats the default
-    /// key as valid so the first draw of a fresh boot gets a placeholder
-    /// pipeline to exercise the hot path.
+    /// Runtime callers must use
+    /// [`Self::current_graphics_pipeline_with_shared_cache`], which mirrors
+    /// upstream by deriving keys and environments from the shared shader-cache
+    /// owner graph.
+    #[cfg(test)]
     pub fn current_graphics_pipeline(&mut self) -> Option<&mut GraphicsPipeline> {
         self.assert_single_owner("current_graphics_pipeline");
         // Mirror upstream `ShaderCache::CurrentGraphicsPipeline`: rebuild the
@@ -630,18 +622,10 @@ impl ShaderCache {
         None
     }
 
-    /// Slow path for looking up / creating a graphics pipeline.
+    /// Test-only slow path for the reduced local fallback.
     ///
-    /// Port of `ShaderCache::CurrentGraphicsPipelineSlowPath()`.
-    ///
-    /// Upstream builds a `GraphicsPipelineKey` from Maxwell3D engine state
-    /// (program pointers for each stage, XFB state, tessellation config,
-    /// early-Z flag, topology). The current Rust port does not yet thread
-    /// Maxwell3D state into the shader cache, so `build_graphics_key` is
-    /// a placeholder that returns a deterministic key for the first draw.
-    /// That is enough for step 2's goal: exercising the cache machinery
-    /// so `current_graphics_pipeline` returns a real `&mut GraphicsPipeline`
-    /// instead of `None`.
+    /// Runtime uses `current_graphics_pipeline_slow_path_with_shared_cache`.
+    #[cfg(test)]
     fn current_graphics_pipeline_slow_path(&mut self) -> Option<&mut GraphicsPipeline> {
         self.assert_single_owner("current_graphics_pipeline_slow_path");
         let key = self.build_graphics_key();
@@ -707,6 +691,7 @@ impl ShaderCache {
     /// path uses `current_graphics_pipeline_with_shared_cache(...)`, which now
     /// mirrors the upstream owner by reading Maxwell state from the shared
     /// `VideoCommon::ShaderCache` channel owner.
+    #[cfg(test)]
     fn build_graphics_key(&self) -> GraphicsPipelineKey {
         GraphicsPipelineKey {
             unique_hashes: self.pending_program_addresses,
@@ -741,22 +726,18 @@ impl ShaderCache {
 
     /// Create a new graphics pipeline from the current engine state.
     ///
-    /// Port of upstream `ShaderCache::CreateGraphicsPipeline` (the
-    /// no-argument overload at `gl_shader_cache.cpp:429` plus the inner
-    /// `CreateGraphicsPipeline(pools, key, envs, ...)` overload at
-    /// `gl_shader_cache.cpp:449`).
+    /// Test-only reduced graphics-pipeline constructor.
     ///
-    /// Upstream walks `Maxwell::MaxShaderProgram` (6) entries; for each
-    /// non-zero `unique_hashes[index]` it builds a `GraphicsEnvironment`
-    /// and runs `TranslateProgram` → `EmitGLSL`. The Rust port currently
-    /// uses [`GenericEnvironment`] (the upstream-faithful TryFindSize /
-    /// SetCachedSize / Analyze base class) directly, since
-    /// `GraphicsEnvironment`'s extra Maxwell3D-state ingestion isn't
-    /// plumbed yet.
+    /// The upstream runtime path is represented by
+    /// [`Self::create_graphics_pipeline_with_shared_cache`], which asks the
+    /// shared shader cache for `GraphicsEnvironment` owners before compiling.
+    /// This fallback remains only for reduced unit tests that exercise GL
+    /// pipeline insertion without constructing Maxwell/channel owners.
     ///
     /// When no GPU memory reader is installed (the test path) this
     /// function returns the placeholder pipeline so the rest of the
     /// pipeline-cache machinery still exercises end-to-end.
+    #[cfg(test)]
     fn create_graphics_pipeline(&mut self) -> Option<GraphicsPipeline> {
         let mut pipeline = GraphicsPipeline::new(self.graphics_key);
 
@@ -1879,6 +1860,39 @@ mod tests {
         })
     }
 
+    fn make_owner_backed_memory_manager(
+        gpu_base: u64,
+        device_addr: u64,
+        backing: &[u8],
+    ) -> Arc<ParkingLotMutex<MemoryManager>> {
+        let device_memory = Arc::new(
+            crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager::default(),
+        );
+        device_memory.smmu_set_physical_base_for_test(backing.as_ptr() as usize);
+        device_memory.smmu_map_with_cpu_backing(
+            device_addr,
+            backing.as_ptr(),
+            0x4000_0000,
+            backing.len(),
+            1,
+            true,
+        );
+        let memory_manager = Arc::new(ParkingLotMutex::new(
+            MemoryManager::new_with_geometry_and_device_memory(
+                1,
+                Arc::clone(&device_memory),
+                40,
+                0x1_0000_0000,
+                16,
+                12,
+            ),
+        ));
+        memory_manager
+            .lock()
+            .map(gpu_base, device_addr, backing.len() as u64, 0, false);
+        memory_manager
+    }
+
     fn make_maxwell_for_built_pipeline(
         vertex_count: u32,
         index_count: u32,
@@ -2079,19 +2093,13 @@ mod tests {
     #[test]
     fn shared_cache_path_populates_live_graphics_key_fields_from_maxwell() {
         let gpu_base = 0x1_0000_0000;
-        let cpu_base = 0x4000;
+        let device_addr = 0x4000;
         let mut backing = vec![0u8; 0x2000];
         backing[0x180..0x188].copy_from_slice(&0xE2400FFFFF87000Fu64.to_le_bytes());
-        let backing = Arc::new(backing);
-
-        let memory_manager = Arc::new(ParkingLotMutex::new(MemoryManager::new(0)));
-        memory_manager
-            .lock()
-            .map(gpu_base, cpu_base, 0x2000, 0, false);
+        let memory_manager = make_owner_backed_memory_manager(gpu_base, device_addr, &backing);
 
         let mut maxwell = Maxwell3D::new();
         maxwell.set_memory_manager(Arc::clone(&memory_manager));
-        maxwell.set_guest_memory_reader(make_cpu_reader(cpu_base, Arc::clone(&backing)));
         <Maxwell3D as EngineInterface>::call_method(&mut maxwell, 0x582, 1, true);
         <Maxwell3D as EngineInterface>::call_method(&mut maxwell, 0x583, 0, true);
         <Maxwell3D as EngineInterface>::call_method(&mut maxwell, 0x810, 1 | (1 << 4), true);
@@ -2143,7 +2151,7 @@ mod tests {
         assert!(pipeline.key.xfb_enabled());
         assert_eq!(
             (pipeline.key.raw >> 2) & 0xF,
-            PrimitiveTopology::Lines as u32
+            PrimitiveTopology::TriangleStrip as u32
         );
         assert_eq!((pipeline.key.raw >> 6) & 0x3, 2);
         assert_eq!((pipeline.key.raw >> 8) & 0x3, 1);
