@@ -19,13 +19,14 @@ use crate::shader_info::Interpolation;
 use crate::varying_state::VaryingState;
 use std::collections::{BTreeMap, VecDeque};
 
-/// Translate a Maxwell shader program from CFG to IR.
+/// Translate a Maxwell shader program from instruction words to IR.
 ///
-/// Not yet implemented: requires full CFG construction, block translation loop,
-/// and structured control-flow AST building.
-pub fn translate_program(_instructions: &[u64], stage: crate::ir::types::ShaderStage) -> Program {
-    log::warn!("TranslateProgram not yet implemented — returning empty program");
-    Program::new(stage)
+/// Upstream takes prebuilt CFG and object-pool owners plus `Environment&` /
+/// `HostTranslateInfo&`. Ruzu's public compatibility entry point still takes
+/// only instruction words and a stage, so it delegates to the currently ported
+/// CFG/structured-CF/translation/pass driver in `pipeline_cache.rs`.
+pub fn translate_program(instructions: &[u64], stage: crate::ir::types::ShaderStage) -> Program {
+    crate::pipeline_cache::translate_program_at_offset(instructions, stage, 0)
 }
 
 /// Merge dual vertex programs (VertexA + VertexB) into a single VertexB program.
@@ -488,6 +489,17 @@ mod tests {
     use crate::ir::basic_block::Block;
     use crate::ir::instruction::Inst;
     use crate::ir::opcodes::Opcode;
+
+    #[test]
+    fn translate_program_uses_cfg_driver_instead_of_empty_stub() {
+        let program = translate_program(&[0, 0], ShaderStage::VertexB);
+
+        assert_eq!(program.stage, ShaderStage::VertexB);
+        assert!(
+            !program.blocks.is_empty(),
+            "translate_program must build IR blocks instead of returning Program::new(stage)"
+        );
+    }
 
     #[test]
     fn merge_dual_vertex_programs_remaps_vertex_b_block_references() {

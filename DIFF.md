@@ -625,6 +625,27 @@
 - Manual MK8D 25s isolated-XDG host-thread-all smoke after switching `SessionRequestManager` to a weak `ServerManager` owner (`/tmp/ruzu_mk8d_ipc_weak_owner_host_all_smoke_1780868703.log`, `RUZU_SERVER_THREAD_IPC_ALL=1`): reached `NotifyRunning`, no panic/`BreakLoopNullPc`, no `svcBreak`/`SetTerminateResult`, no `missing_server_manager_owner`, and no `receive_request_hle failed` warnings. Warn-level logging did not emit audio or presentation markers in this short run.
 
 ## 2026-06-07 — core/src/hle/kernel/k_client_session.rs, core/src/hle/kernel/k_session.rs, core/src/hle/kernel/k_server_session.rs, core/src/hle/kernel/k_thread.rs, core/src/hle/kernel/k_scheduler.rs, and core/src/hle/kernel/svc/svc_ipc.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/k_client_session.cpp, /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/k_session.cpp, /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/k_server_session.cpp, /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/k_thread.cpp, /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/k_scheduler.cpp, and /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/svc/svc_ipc.cpp
+## 2026-06-07 — shader_recompiler/src/frontend/translate_program.rs and shader_recompiler/src/pipeline_cache.rs vs /home/vricosti/Dev/emulators/zuyu/src/shader_recompiler/frontend/maxwell/translate_program.h and /home/vricosti/Dev/emulators/zuyu/src/shader_recompiler/frontend/maxwell/translate_program.cpp
+
+### Intentional differences
+- Rust's public `frontend::translate_program::translate_program(...)` still accepts only instruction words plus stage, while upstream `TranslateProgram(...)` takes `ObjectPool<IR::Inst>&`, `ObjectPool<IR::Block>&`, `Environment&`, `Flow::CFG&`, and `HostTranslateInfo&`. The Rust compatibility entry point now delegates to `pipeline_cache::translate_program_at_offset(...)` so it uses the existing CFG, structured-control-flow, translation, and optimization driver instead of returning an empty `Program::new(stage)` placeholder.
+- `pipeline_cache::translate_program_at_offset_with_host_info(...)` exposes the currently ported Rust driver without moving ownership of CFG/environment construction into `frontend::translate_program.rs`; this keeps the existing runtime compile paths stable while creating a non-empty translation API for later upstream-shaped signature work.
+
+### Unintentional differences (to fix)
+- Upstream `TranslateProgram(...)` owns stage/environment metadata population (`LocalMemorySize`, tessellation/geometry/compute fields, geometry passthrough lowering, interpolation collection, NVN storage buffers) directly from `Environment&`. The Rust compatibility path still derives only the subset represented by the current env-less CFG driver and backend-specific GLSL helpers.
+- Upstream pass ordering includes environment-aware `ConstantPropagationPass(env, ...)`, `PositionPass(env, ...)`, `TexturePass(env, ...)`, `CollectShaderInfoPass(env, ...)`, `LayerPass`, `VendorWorkaroundPass`, optional lowering passes, rescaling, and verification. Rust still uses the currently ported reduced order in `pipeline_cache.rs`.
+
+### Missing items
+- Port the upstream-shaped `translate_program` signature that accepts the shader `Environment` owner and prebuilt CFG, then move the full pass ordering and stage metadata ownership into the matching frontend file.
+
+### Binary layout verification
+- N/A: shader IR construction only. No guest-visible raw payload layout changed.
+
+### Tests
+- Re-read upstream `frontend/maxwell/translate_program.h` and `frontend/maxwell/translate_program.cpp::TranslateProgram`.
+- `cargo check -p shader_recompiler`
+- `cargo test -p shader_recompiler translate_program_uses_cfg_driver_instead_of_empty_stub -- --nocapture`
+
 ## 2026-06-07 — video_core/src/renderer_opengl/gl_shader_cache.rs and video_core/src/renderer_opengl/gl_rasterizer.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_shader_cache.cpp
 
 ### Intentional differences
