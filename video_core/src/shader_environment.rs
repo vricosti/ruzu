@@ -53,8 +53,8 @@ const SELF_BRANCH_A: u64 = 0xE2400FFFFF87000F;
 /// Upstream: `GenericEnvironment::TryFindSize` line 252.
 const SELF_BRANCH_B: u64 = 0xE2400FFFFF07000F;
 
-/// Guest CPU-memory reader callback shape: read `bytes.len()` bytes starting
-/// at the given CPU address.
+/// GPU-memory reader callback shape: read `bytes.len()` bytes starting at the
+/// given GPU virtual address.
 ///
 /// Rust compatibility helper for reduced callers that do not yet provide the
 /// upstream `Tegra::MemoryManager*` owner.
@@ -173,8 +173,9 @@ fn dump_impl(
 /// Upstream: `VideoCommon::GenericEnvironment` (`shader_environment.h:29`),
 /// which holds a `Tegra::MemoryManager*` and uses
 /// `gpu_memory->Read<u64>` / `gpu_memory->ReadBlock` to fetch shader bytes.
-/// The Rust port replaces that pointer with the [`GpuMemoryReader`]
-/// callback set via [`GenericEnvironment::with_gpu_read`].
+/// The Rust port stores the closest upstream-shaped `MemoryManager` owner when
+/// available; [`GpuMemoryReader`] remains a compatibility path for reduced
+/// callers that do not have that owner yet.
 pub struct GenericEnvironment {
     program_base: GPUVAddr,
     start_address: u32,
@@ -209,8 +210,8 @@ pub struct GenericEnvironment {
     /// through this owner first.
     gpu_memory: Option<Arc<ParkingLotMutex<MemoryManager>>>,
 
-    /// Guest CPU-memory reader used by the current `MemoryManager`
-    /// adaptation.
+    /// Compatibility GPU-memory reader for reduced callers without a
+    /// `MemoryManager` owner.
     ///
     /// `None` means no reader has been installed yet — methods that need to
     /// fetch GPU memory will return the documented "no data" value (0 from
@@ -618,8 +619,7 @@ impl GraphicsEnvironment {
         env.base = GenericEnvironment::new().with_program(program_base, start_address);
         if let Some(gpu_memory) = maxwell3d.memory_manager() {
             env.base = std::mem::take(&mut env.base).with_gpu_memory(gpu_memory);
-        }
-        if let Some(gpu_reader) = maxwell3d.guest_memory_reader() {
+        } else if let Some(gpu_reader) = maxwell3d.guest_memory_reader() {
             env.base = std::mem::take(&mut env.base).with_gpu_read(gpu_reader);
         }
         match program {
@@ -2126,8 +2126,8 @@ mod tests {
 
     #[test]
     fn graphics_environment_from_maxwell3d_reads_sph_and_local_memory() {
-        let gpu_base = 0x3_0000_0000;
-        let cpu_base = 0x9000;
+        let gpu_base = 0x4000_0000;
+        let device_addr = 0x9000;
         let mut bytes = [0u8; std::mem::size_of::<ProgramHeader>()];
         let mut raw = [0u32; 20];
         raw[1] = 0x20;
@@ -2136,15 +2136,12 @@ mod tests {
         for (index, word) in raw.iter().enumerate() {
             bytes[index * 4..index * 4 + 4].copy_from_slice(&word.to_le_bytes());
         }
-        let bytes = Arc::new(bytes);
-        let reader = Arc::new(move |cpu_addr, dst: &mut [u8]| {
-            let offset = (cpu_addr - cpu_base) as usize;
-            let end = (offset + dst.len()).min(bytes.len());
-            if offset < bytes.len() {
-                dst[..end - offset].copy_from_slice(&bytes[offset..end]);
-            }
+        let mut backing = vec![0u8; 0x1000];
+        backing[..bytes.len()].copy_from_slice(&bytes);
+        let mm = make_owner_backed_memory_manager(gpu_base, device_addr, &backing);
+        let reader: GpuMemoryReader = Arc::new(move |_, _| {
+            panic!("owner-backed GraphicsEnvironment must not use fallback reader");
         });
-        let mm = make_mapped_memory_manager(gpu_base, cpu_base, 0x1000);
         let mut maxwell = Maxwell3D::new();
         maxwell.set_memory_manager(Arc::clone(&mm));
         maxwell.set_guest_memory_reader(reader);
@@ -2159,6 +2156,8 @@ mod tests {
         assert_eq!(env.base.sph.raw[2], 0x1);
         assert_eq!(env.base.sph.raw[3], 0x10);
         assert_eq!(env.base.local_memory_size, 0x0100_0020 + 0x10);
+        assert!(env.base.gpu_memory.is_some());
+        assert!(env.base.gpu_read.is_none());
     }
 
     #[test]

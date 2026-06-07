@@ -625,6 +625,32 @@
 - Manual MK8D 25s isolated-XDG host-thread-all smoke after switching `SessionRequestManager` to a weak `ServerManager` owner (`/tmp/ruzu_mk8d_ipc_weak_owner_host_all_smoke_1780868703.log`, `RUZU_SERVER_THREAD_IPC_ALL=1`): reached `NotifyRunning`, no panic/`BreakLoopNullPc`, no `svcBreak`/`SetTerminateResult`, no `missing_server_manager_owner`, and no `receive_request_hle failed` warnings. Warn-level logging did not emit audio or presentation markers in this short run.
 
 ## 2026-06-07 — core/src/hle/kernel/k_client_session.rs, core/src/hle/kernel/k_session.rs, core/src/hle/kernel/k_server_session.rs, core/src/hle/kernel/k_thread.rs, core/src/hle/kernel/k_scheduler.rs, and core/src/hle/kernel/svc/svc_ipc.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/k_client_session.cpp, /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/k_session.cpp, /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/k_server_session.cpp, /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/k_thread.cpp, /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/k_scheduler.cpp, and /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/svc/svc_ipc.cpp
+## 2026-06-07 — video_core/src/shader_environment.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/shader_environment.h and /home/vricosti/Dev/emulators/zuyu/src/video_core/shader_environment.cpp
+
+### Intentional differences
+- `GraphicsEnvironment::from_maxwell3d(...)` now stores only the upstream-shaped `MemoryManager` owner when `Maxwell3D` exposes one. The `GpuMemoryReader` callback is installed only for reduced callers without a memory-manager owner, keeping production graphics environments closer to upstream `GenericEnvironment(Tegra::MemoryManager& ...)`.
+- Rust still represents upstream `Tegra::MemoryManager*` as `Arc<parking_lot::Mutex<MemoryManager>>` because the broader channel/engine owner graph is not a literal C++ reference graph.
+
+### Unintentional differences (to fix)
+- `GenericEnvironment` still keeps nullable `MemoryManager` / `GpuMemoryReader` state for reduced construction paths, while upstream constructors install the memory owner directly.
+- The reduced OpenGL shader-cache path still constructs direct `GenericEnvironment` values from `GpuMemoryReader` rather than the full upstream `GraphicsEnvironment` / `GraphicsEnvironments::Span()` owner graph.
+
+### Missing items
+- Route the remaining OpenGL graphics pipeline construction through upstream-shaped `GraphicsEnvironment` owners instead of direct callback-backed `GenericEnvironment` construction.
+- Remove `GpuMemoryReader` from runtime shader-environment construction once all non-test callers provide the live memory-manager owner.
+
+### Binary layout verification
+- N/A: shader environment owner selection only. No guest-visible raw payload layout changed.
+
+### Tests
+- Re-read upstream `shader_environment.h` and `shader_environment.cpp::GenericEnvironment` / `GraphicsEnvironment`.
+- `cargo test -p video_core graphics_environment_from_maxwell3d_reads_sph_and_local_memory -- --nocapture`
+- `cargo check -p video_core`
+- `cargo fmt --check`
+- `git diff --check`
+- `cargo build --release --bin ruzu-cmd`
+- MK8D 90s smoke with isolated XDG directories and `RUST_LOG=warn`: reached `NotifyRunning`; no panic/crash observed, no active `ruzu-cmd` left after timeout.
+
 ## 2026-06-07 — video_core/src/texture_cache/texture_cache.rs and video_core/src/renderer_opengl/gl_texture_cache.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/texture_cache.h and /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_texture_cache.cpp
 
 ### Intentional differences
@@ -1114,7 +1140,7 @@
 - None identified for the audited production graphics/compute shader-environment memory-owner construction slice.
 
 ### Missing items
-- Continue the later shader-environment branch work: make `GenericEnvironment` store only the upstream-shaped GPU-memory owner for runtime environments, then remove the nullable compatibility callback transport from reduced/test paths.
+- Continue the later shader-environment branch work: route the remaining reduced OpenGL shader-cache construction through upstream-shaped `GraphicsEnvironment` owners, then remove the nullable compatibility callback transport from non-test paths.
 
 ### Binary layout verification
 - N/A: shader environment memory-owner routing only. No guest-visible raw payload layout changed.
@@ -9466,7 +9492,6 @@
 - The constructor-side tests were kept focused on constructor mapping and owner-local CB reads, because the active Rust `Maxwell3D` test path still has unrelated macro-engine side effects outside this owner slice.
 
 ### Missing items
-- `GraphicsEnvironment::from_maxwell3d(...)` still does not read the real upstream SPH block, set `initial_offset = sizeof(sph)`, or carry `gp_passthrough_mask`.
 - `ComputeEnvironment` still keeps detached const-buffer/texture state under `#[cfg(test)]` for reduced tests. Production compute reads the live `KeplerCompute`/QMD owner.
 - `FileEnvironment` remains structurally reduced versus upstream in several stage-specific fields and still uses placeholder SPH serialization.
 
@@ -9657,7 +9682,6 @@
 
 ### Missing items
 - `GraphicsEnvironment` and `ComputeEnvironment` still keep Rust-only fallback snapshot members at all; upstream keeps only live owner pointers plus shared base state.
-- The concrete environment structs still expose `base` publicly, which is a Rust adaptation convenience rather than literal upstream private inheritance layout.
 - Memory ownership is still callback-driven instead of a literal stored `Tegra::MemoryManager*`.
 
 ### Binary layout verification
