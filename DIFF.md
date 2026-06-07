@@ -653,14 +653,14 @@
 ## 2026-06-07 — video_core/src/shader_environment.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/shader_environment.h and /home/vricosti/Dev/emulators/zuyu/src/video_core/shader_environment.cpp
 
 ### Intentional differences
-- `GraphicsEnvironment::from_maxwell3d(...)` now stores only the upstream-shaped `MemoryManager` owner when `Maxwell3D` exposes one. The `GpuMemoryReader` callback is installed only for reduced callers without a memory-manager owner, keeping production graphics environments closer to upstream `GenericEnvironment(Tegra::MemoryManager& ...)`.
+- `GraphicsEnvironment::from_maxwell3d(...)` stores the upstream-shaped `MemoryManager` owner in runtime builds. The `GpuMemoryReader` callback field and `with_gpu_read(...)` constructor are test-only reduced-fixture support, so production graphics environments no longer compile through the callback transport.
 - Rust still represents upstream `Tegra::MemoryManager*` as `Arc<parking_lot::Mutex<MemoryManager>>` because the broader channel/engine owner graph is not a literal C++ reference graph.
 
 ### Unintentional differences (to fix)
-- `GenericEnvironment` still keeps nullable `MemoryManager` / `GpuMemoryReader` state for reduced construction paths, while upstream constructors install the memory owner directly.
+- `GenericEnvironment` still keeps a nullable `MemoryManager` owner and returns "no data" when absent, while upstream runtime constructors install the memory owner directly.
 
 ### Missing items
-- Remove `GpuMemoryReader` from runtime shader-environment construction once all non-test callers provide the live memory-manager owner.
+- Remove the remaining nullable runtime `MemoryManager` state once every production construction path uses an upstream-shaped owner directly.
 
 ### Binary layout verification
 - N/A: shader environment owner selection only. No guest-visible raw payload layout changed.
@@ -671,8 +671,9 @@
 - `cargo check -p video_core`
 - `cargo fmt --check`
 - `git diff --check`
+- `cargo test -p video_core shared_cache_path_populates_live_graphics_key_fields_from_maxwell -- --nocapture`
 - `cargo build --release --bin ruzu-cmd`
-- MK8D 90s smoke with isolated XDG directories and `RUST_LOG=warn`: reached `NotifyRunning`; no panic/crash observed, no active `ruzu-cmd` left after timeout.
+- MK8D OpenGL smoke, isolated XDG dirs, 90s timeout: reached `NotifyRunning`; timeout exit 124 expected; no panic/crash observed in tail; no lingering `ruzu-cmd` process after timeout.
 
 ## 2026-06-07 — video_core/src/texture_cache/texture_cache.rs and video_core/src/renderer_opengl/gl_texture_cache.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/texture_cache.h and /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_texture_cache.cpp
 
@@ -1157,23 +1158,23 @@
 
 ### Intentional differences
 - Rust still stores the upstream `Tegra::MemoryManager&` owner behind `Arc<parking_lot::Mutex<MemoryManager>>` because the broader channel/engine owner graph is not yet a literal C++ reference graph.
-- Reduced/test callers may still install `GpuMemoryReader` callbacks, but graphics shader environments, compute shader environments, and Maxwell3D owner-backed reads/writes now prefer the stored `MemoryManager` / `MaxwellDeviceMemoryManager` path directly. This matches upstream's `GenericEnvironment{Tegra::MemoryManager&}`, `ComputeEnvironment(..., Tegra::MemoryManager& ...)`, and `gpu_memory->ReadBlock(...)` dependency direction more closely without adding unsafe references.
+- Test-only reduced fixtures may still install `GpuMemoryReader` callbacks, but runtime graphics shader environments, compute shader environments, and Maxwell3D owner-backed reads/writes use the stored `MemoryManager` / `MaxwellDeviceMemoryManager` path directly. This matches upstream's `GenericEnvironment{Tegra::MemoryManager&}`, `ComputeEnvironment(..., Tegra::MemoryManager& ...)`, and `gpu_memory->ReadBlock(...)` dependency direction more closely without adding unsafe references.
 
 ### Unintentional differences (to fix)
 - None identified for the audited production graphics/compute shader-environment memory-owner construction slice.
 
 ### Missing items
-- Continue the later shader-environment branch work: remove the nullable compatibility callback transport from reduced construction paths once every remaining test/reduced caller has an upstream-shaped memory owner.
+- Continue the later shader-environment branch work: replace nullable runtime memory-owner state with constructors that require an upstream-shaped `MemoryManager` owner wherever possible.
 
 ### Binary layout verification
 - N/A: shader environment memory-owner routing only. No guest-visible raw payload layout changed.
 
 ### Tests
-- Re-read upstream `shader_environment.h`, `shader_environment.cpp`, and `memory_manager.{h,cpp}` before removing the graphics shader `guest_memory_reader()` gate.
-- Re-read upstream `shader_environment.h`, `shader_environment.cpp`, and `shader_cache.cpp` before removing the compute shader `guest_memory_reader()` gate.
+- Re-read upstream `shader_environment.h`, `shader_environment.cpp`, and `shader_cache.cpp`.
 - `cargo check -p video_core`
 - `cargo test -p video_core memory_manager_owner -- --nocapture`
 - `cargo test -p video_core compute_environment_from_kepler_compute_includes_local_crs_alloc -- --nocapture`
+- `cargo test -p video_core graphics_environment_from_maxwell3d_reads_sph_and_local_memory -- --nocapture`
 - `cargo test -p video_core compute_environment_reads_live_qmd_state_after_construction -- --nocapture`
 - `cargo test -p video_core compute_environment_panics_on_disabled_live_cbuf -- --nocapture`
 - `cargo fmt --check`

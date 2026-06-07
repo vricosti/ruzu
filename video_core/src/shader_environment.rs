@@ -173,9 +173,9 @@ fn dump_impl(
 /// Upstream: `VideoCommon::GenericEnvironment` (`shader_environment.h:29`),
 /// which holds a `Tegra::MemoryManager*` and uses
 /// `gpu_memory->Read<u64>` / `gpu_memory->ReadBlock` to fetch shader bytes.
-/// The Rust port stores the closest upstream-shaped `MemoryManager` owner when
-/// available; [`GpuMemoryReader`] remains a compatibility path for reduced
-/// callers that do not have that owner yet.
+/// The Rust port stores the closest upstream-shaped `MemoryManager` owner.
+/// Tests may still inject a [`GpuMemoryReader`] for reduced fixtures that do
+/// not construct the full channel/MemoryManager owner graph.
 pub struct GenericEnvironment {
     program_base: GPUVAddr,
     start_address: u32,
@@ -210,12 +210,10 @@ pub struct GenericEnvironment {
     /// through this owner first.
     gpu_memory: Option<Arc<ParkingLotMutex<MemoryManager>>>,
 
-    /// Compatibility GPU-memory reader for reduced callers without a
-    /// `MemoryManager` owner.
-    ///
-    /// `None` means no reader has been installed yet — methods that need to
-    /// fetch GPU memory will return the documented "no data" value (0 from
-    /// `read_instruction`, `None` from `analyze`) instead of panicking.
+    /// Test-only GPU-memory reader for reduced fixtures without a
+    /// `MemoryManager` owner. Runtime shader environments must use
+    /// `gpu_memory`, matching upstream's `Tegra::MemoryManager*`.
+    #[cfg(test)]
     gpu_read: Option<GpuMemoryReader>,
 }
 
@@ -246,6 +244,7 @@ impl GenericEnvironment {
             has_hle_engine_state: false,
             is_proprietary_driver: false,
             gpu_memory: None,
+            #[cfg(test)]
             gpu_read: None,
         }
     }
@@ -257,6 +256,7 @@ impl GenericEnvironment {
     /// constructor: stores the reader so subsequent `read_instruction`,
     /// `set_cached_size`, `analyze`, and `calculate_hash` calls can fetch
     /// shader bytes from guest GPU memory.
+    #[cfg(test)]
     pub fn with_gpu_read(mut self, reader: GpuMemoryReader) -> Self {
         self.gpu_read = Some(reader);
         self
@@ -508,9 +508,14 @@ impl GenericEnvironment {
             gpu_memory
                 .lock()
                 .read_block(tic_addr + tic_index as u64 * 32, &mut raw_bytes);
-        } else if let Some(reader) = self.gpu_read.as_ref() {
-            reader(tic_addr + tic_index as u64 * 32, &mut raw_bytes);
         } else {
+            #[cfg(test)]
+            if let Some(reader) = self.gpu_read.as_ref() {
+                reader(tic_addr + tic_index as u64 * 32, &mut raw_bytes);
+            } else {
+                return TextureDescriptor::from_words(&[0; 8]);
+            }
+            #[cfg(not(test))]
             return TextureDescriptor::from_words(&[0; 8]);
         }
         let mut words = [0u32; 8];
@@ -548,9 +553,12 @@ impl GenericEnvironment {
     fn read_gpu_bytes(&self, gpu_addr: GPUVAddr, output: &mut [u8]) -> bool {
         if let Some(gpu_memory) = self.gpu_memory.as_ref() {
             gpu_memory.lock().read_block(gpu_addr, output);
-        } else if let Some(reader) = self.gpu_read.as_ref() {
-            reader(gpu_addr, output);
         } else {
+            #[cfg(test)]
+            if let Some(reader) = self.gpu_read.as_ref() {
+                reader(gpu_addr, output);
+                return true;
+            }
             return false;
         }
         true
@@ -619,8 +627,11 @@ impl GraphicsEnvironment {
         env.base = GenericEnvironment::new().with_program(program_base, start_address);
         if let Some(gpu_memory) = maxwell3d.memory_manager() {
             env.base = std::mem::take(&mut env.base).with_gpu_memory(gpu_memory);
-        } else if let Some(gpu_reader) = maxwell3d.guest_memory_reader() {
-            env.base = std::mem::take(&mut env.base).with_gpu_read(gpu_reader);
+        } else {
+            #[cfg(test)]
+            if let Some(gpu_reader) = maxwell3d.guest_memory_reader() {
+                env.base = std::mem::take(&mut env.base).with_gpu_read(gpu_reader);
+            }
         }
         match program {
             ShaderStageType::VertexA => {
@@ -654,7 +665,10 @@ impl GraphicsEnvironment {
         env.base.texture_bound = maxwell3d.bindless_texture_const_buffer_slot();
         env.base.is_proprietary_driver = env.base.texture_bound == 2;
         env.base.has_hle_engine_state = maxwell3d.engine_state() == EngineHint::OnHleMacro;
-        if env.base.gpu_memory.is_some() || env.base.gpu_read.is_some() {
+        let has_gpu_memory_owner = env.base.gpu_memory.is_some();
+        #[cfg(test)]
+        let has_gpu_memory_owner = has_gpu_memory_owner || env.base.gpu_read.is_some();
+        if has_gpu_memory_owner {
             let mut bytes = [0u8; std::mem::size_of::<ProgramHeader>()];
             env.base
                 .read_gpu_bytes(program_base + start_address as u64, &mut bytes);
