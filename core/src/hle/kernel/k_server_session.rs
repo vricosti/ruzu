@@ -24,6 +24,7 @@ use crate::hle::kernel::message_buffer::{MessageBuffer, MESSAGE_BUFFER_SIZE};
 use crate::hle::kernel::svc::svc_results::{
     RESULT_INVALID_COMBINATION, RESULT_INVALID_CURRENT_MEMORY, RESULT_INVALID_STATE,
     RESULT_MESSAGE_TOO_LARGE, RESULT_NOT_FOUND, RESULT_RECEIVE_LIST_BROKEN, RESULT_SESSION_CLOSED,
+    RESULT_TERMINATION_REQUESTED,
 };
 use crate::hle::kernel::svc_common::INVALID_HANDLE;
 
@@ -2075,12 +2076,7 @@ impl KServerSession {
     /// kernel registry to rediscover the owner process and is unsafe under a
     /// held process lock.
     pub fn on_request(&mut self, request: Arc<Mutex<KSessionRequest>>) -> u32 {
-        let was_empty = self.request_list.is_empty();
-        self.request_list.push_back(request);
-        if was_empty {
-            self.notify_available(crate::hle::result::RESULT_SUCCESS.get_inner_value());
-        }
-        0 // ResultSuccess
+        self.on_request_impl(request)
     }
 
     /// Port of upstream `KServerSession::OnRequest`, when the owner process is
@@ -2090,11 +2086,44 @@ impl KServerSession {
         _process: &mut crate::hle::kernel::k_process::KProcess,
         request: Arc<Mutex<KSessionRequest>>,
     ) -> u32 {
+        self.on_request_impl(request)
+    }
+
+    fn on_request_impl(&mut self, request: Arc<Mutex<KSessionRequest>>) -> u32 {
+        let _scheduler_lock = crate::hle::kernel::kernel::scheduler_lock()
+            .map(super::k_scheduler_lock::KScopedSchedulerLock::new);
+
+        if self.client_closed {
+            return RESULT_SESSION_CLOSED.get_inner_value();
+        }
+
+        let (request_thread, is_sync_request) = {
+            let request = request.lock().unwrap();
+            (request.get_thread(), request.get_event_id().is_none())
+        };
+
+        if let Some(current_thread) = &request_thread {
+            if current_thread.lock().unwrap().is_termination_requested() {
+                return RESULT_TERMINATION_REQUESTED.get_inner_value();
+            }
+        }
+
         let was_empty = self.request_list.is_empty();
         self.request_list.push_back(request);
         if was_empty {
             self.notify_available(crate::hle::result::RESULT_SUCCESS.get_inner_value());
         }
+
+        if is_sync_request {
+            if let Some(current_thread) = request_thread {
+                let mut thread = current_thread.lock().unwrap();
+                thread.set_wait_reason_for_debugging(
+                    super::k_thread::ThreadWaitReasonForDebugging::Ipc,
+                );
+                thread.begin_wait();
+            }
+        }
+
         0 // ResultSuccess
     }
 
@@ -2252,8 +2281,6 @@ impl KServerSession {
                         client_thread.get_state().bits() as u64,
                         client_thread.wait_reason_for_debugging as u64,
                         client_thread.wait_queue.is_some() as u64,
-                        client_thread.wait_wake_guard_armed as u64,
-                        client_thread.wait_wake_guard_pending.is_some() as u64,
                         client_result as u64,
                         client_message as u64,
                         client_buffer_size as u64,
@@ -2274,8 +2301,8 @@ impl KServerSession {
                     );
                 }
                 // Accept the reply wake in two cases:
-                // 1. the client has not parked yet, so `end_wait` records the
-                //    result into the wait-wake guard armed by SendSyncRequest;
+                // 1. the client is not parked, preserving upstream's no-op
+                //    behavior inside `KThread::EndWait`;
                 // 2. the client is parked specifically in an IPC wait.
                 //
                 // Do not wake arbitrary WAITING states. A stale/late reply can
@@ -2702,6 +2729,7 @@ mod tests {
     use crate::hle::kernel::k_scheduler::KScheduler;
     use crate::hle::kernel::k_session::KSession;
     use crate::hle::kernel::k_session_request::KSessionRequest;
+    use crate::hle::kernel::k_thread::{KThread, ThreadState, ThreadWaitReasonForDebugging};
     use crate::memory::memory::Memory;
 
     struct SessionPageTableMemoryForTest {
@@ -2760,6 +2788,38 @@ mod tests {
             }
             bytes
         }
+    }
+
+    #[test]
+    fn on_request_sync_parks_client_thread_for_ipc_wait() {
+        let client_thread = Arc::new(KThreadLock::new(KThread::new()));
+        {
+            let mut thread = client_thread.lock().unwrap();
+            thread.thread_id = 0x55;
+            thread.set_state(ThreadState::RUNNABLE);
+        }
+        crate::hle::kernel::kernel::set_current_emu_thread(Some(&client_thread));
+
+        let mut request = KSessionRequest::new();
+        request.initialize(None, 0x2395000, 0x80);
+        let request = Arc::new(Mutex::new(request));
+
+        let mut server = KServerSession::new();
+        assert_eq!(
+            server.on_request(request),
+            crate::hle::result::RESULT_SUCCESS.get_inner_value()
+        );
+
+        {
+            let thread = client_thread.lock().unwrap();
+            assert_eq!(thread.get_state(), ThreadState::WAITING);
+            assert_eq!(
+                thread.get_wait_reason_for_debugging(),
+                ThreadWaitReasonForDebugging::Ipc
+            );
+        }
+
+        crate::hle::kernel::kernel::set_current_emu_thread(None);
     }
 
     fn attach_process_page_table_for_session_test(

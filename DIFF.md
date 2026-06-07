@@ -1,3 +1,30 @@
+## 2026-06-07 — core/src/hle/kernel/k_client_session.rs, core/src/hle/kernel/k_server_session.rs, core/src/hle/kernel/k_thread.rs, and core/src/hle/kernel/svc/svc_ipc.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/k_client_session.cpp, /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/k_server_session.cpp, /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/k_thread.cpp, and /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/svc/svc_ipc.cpp
+
+### Intentional differences
+- `KServerSession::on_request(...)` / `on_request_with_process(...)` now own the synchronous IPC wait transition: scheduler lock, session-closed check, termination check, request enqueue, notify-available, and `ThreadWaitReasonForDebugging::Ipc` + `begin_wait()` for requests without an async event. Rust uses the client thread captured in `KSessionRequest` instead of re-reading a raw `GetCurrentThread(m_kernel)` pointer because the request already stores the Rust-safe owner reference created by `KClientSession`.
+- The host-thread branch in `svc_ipc.rs` now routes request creation/enqueue through `KClientSession::send_sync_request_to_parent_with_process(...)` / `KSession::on_request_with_process(...)` instead of constructing the `KSessionRequest` and parking the client locally. The branch still remains env-gated; default inline HLE dispatch is unchanged until the remaining `ServerManager` lifecycle work is safe for MK8D.
+- Removed the Rust-only `KThread` wait-wake guard fields/methods from the host-thread IPC path. Once `KServerSession::OnRequest` owns the scheduler-locked wait transition, `KThread::end_wait(...)` can return to upstream's no-op behavior when the target thread is not waiting.
+
+### Unintentional differences (to fix)
+- Ruzu still defaults most synchronous HLE IPC to the legacy inline fallback, so normal service dispatch is not yet fully routed through `ServerManager::LoopProcess` like upstream.
+- `svc_ipc.rs` still resolves Rust object ids and manager queue/wakeup bridges before using the host-thread path. Upstream `svc_ipc.cpp` only resolves `KClientSession`, keeps the parent alive, and calls `KClientSession::SendSyncRequest(...)`.
+
+### Missing items
+- Make the host-thread/server-manager path the default once the remaining boot-order/re-entrancy regressions are addressed.
+- Remove the remaining inline fallback and Rust-only host-thread routing diagnostics once all sessions are safely owned by `ServerManager`.
+
+### Binary layout verification
+- N/A: IPC control-flow ownership only. No guest-visible raw payload layout changed.
+
+### Tests
+- Re-read upstream `KClientSession::SendSyncRequest`, `KServerSession::OnRequest`, `svc_ipc.cpp::SendSyncRequestImpl`, and `ServerManager::{RegisterSession,LoopProcess}` before changing ownership.
+- Re-read upstream `KThread::EndWait` ownership through `KServerSession::SendReply` before removing the Rust-only wait-wake guard.
+- `cargo test -p core on_request_sync_parks_client_thread_for_ipc_wait -- --nocapture`
+- `cargo test -p core send_sync_request_with_process_enqueues_real_session_request -- --nocapture`
+- `cargo test -p core enqueue_helper_uses_resolved_parent_without_locking_client_session -- --nocapture`
+- `cargo check -p core`
+- `cargo fmt --check`
+
 ## 2026-06-07 — core/src/hle/kernel/k_dynamic_resource_manager.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/k_memory_block_manager.h
 
 ### Intentional differences
@@ -13460,7 +13487,7 @@ The following still panic because upstream either also throws NotImplementedExce
 - The current host-thread IPC path is still a Rust bridge around upstream `KClientSession::SendSyncRequest` semantics: enqueue request, park client thread, let the owning `ServerManager` process the server session, then resume on reply. Upstream performs this inside kernel/session objects directly without a Rust diagnostic routing layer.
 - Host-thread IPC routing is kept opt-in via `RUZU_SERVER_THREAD_IPC_ALL=1` or `RUZU_SERVER_THREAD_IPC_HANDLE=...`; default execution remains the legacy inline path because global routing still trips a `KThread::EndWait` invariant (`WAITING` with no `wait_queue`) in MK8D.
 - `trace_host_thread_ipc` and the pl:u fresh-session diagnostic now emit through `common::trace` instead of `eprintln!` / `log::info!`, preserving the new non-blocking tracing model from `ad4e48844e5471439673b7065766cf900e772094`.
-- The host-thread routing path now performs `send_sync_request_with_process(...)` and the client `begin_wait_guarded()` under one `KScopedSchedulerLock`, matching upstream `KServerSession::OnRequest` ordering more closely: enqueue request, notify if empty, then park the synchronous client while the scheduler lock is held.
+- The host-thread routing path now performs request creation/enqueue through `KClientSession::send_sync_request_to_parent_with_process(...)`; the synchronous client wait transition is owned by `KServerSession::OnRequest`, matching upstream ownership more closely than the earlier `svc_ipc.rs`-local park.
 - The current diagnostic run with `RUZU_SERVER_THREAD_IPC_ALL=1` shows pl:u fresh-session requests land in the watched `KServerSession` before the client is parked (`is_signaled=true req_len=1 cur_req=false` for 46/46 samples).
 
 ### Unintentional differences (to fix)
@@ -13847,12 +13874,10 @@ The following still panic because upstream either also throws NotImplementedExce
 ### Unintentional differences (to fix)
 - Ruzu still defaults to inline HLE IPC in `svc_ipc.rs`. Upstream never completes normal HLE service dispatch directly inside `Svc::SendSyncRequestImpl`; it enqueues a `KSessionRequest`, transitions the client through `BeginWait`, and the server manager receives/completes/replies on the service side.
 - The one-shot worker is deliberately less faithful than upstream `ServerManager`: it is per-request, host-thread spawned, and selected by guest handle. It proved the scheduler ordering issue but should be replaced by real server-manager session processing.
-- `KServerSession::OnRequest` in ruzu still does not own the `BeginWait` transition by default. The experiment performs that transition in `svc_ipc.rs` because enabling it globally currently blocks early `sm:` IPC before the full service-thread path is ready.
 
 ### Missing items
 - Port the default synchronous HLE IPC lifecycle so `KClientSession::send_sync_request_with_process(...)`/`KServerSession::on_request_with_process(...)` put the client thread into IPC wait and return only after `KServerSession::send_reply()` ends that wait, matching upstream ownership.
 - Wire all HLE sessions through `ServerManager::OnSessionEvent` instead of relying on `svc_ipc.rs` inline receive/complete/reply.
-- Match upstream `KScopedSchedulerLock` ownership around `KServerSession::OnRequest` / client `BeginWait` once the inline SVC dispatch path is removed.
 
 ### Binary layout verification
 - N/A: kernel scheduling/IPC lifecycle only. No guest-visible raw payload layout changed.
@@ -15795,7 +15820,6 @@ The following still panic because upstream either also throws NotImplementedExce
 
 ### Intentional differences
 - Ruzu still keeps the env-gated host-thread IPC rollout model instead of enabling upstream-shaped `KClientSession::SendSyncRequest` routing for every service at once.
-- Ruzu keeps the host-thread lost-wakeup guard around `begin_wait_guarded(...)`. Upstream does not need this because `KServerSession::OnRequest` owns the exact scheduler-locked `BeginWait` lifecycle. The guard remains a Rust-side safety net while the full session lifecycle is still being unwound service by service.
 
 ### Unintentional differences (to fix)
 - Full upstream parity still requires routing all synchronous IPC through `KClientSession::SendSyncRequest` / `KServerSession::OnRequest` / `ServerManager::LoopProcess` rather than keeping the legacy inline HLE fallback for most services.

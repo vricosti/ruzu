@@ -527,17 +527,6 @@ pub struct KThread {
     pub suspend_allowed_flags: u32,
     pub synced_index: i32,
     pub wait_result: u32, // Result code
-    /// Host-thread IPC lost-wakeup guard. When `armed`, an `end_wait` that
-    /// arrives while this thread is *not yet* WAITING (a would-be no-op)
-    /// records the wake result here instead of discarding it. The next
-    /// `begin_wait_guarded` consumes it and skips the park. The thread Mutex
-    /// serializes `end_wait` and `begin_wait_guarded`, so the arm/record/
-    /// consume sequence is race-free. Not part of upstream KThread — closes
-    /// a ruzu-specific race introduced by routing IPC handlers onto separate
-    /// host threads (upstream parks the client atomically under the
-    /// scheduler lock inside KServerSession::OnRequest).
-    pub wait_wake_guard_armed: bool,
-    pub wait_wake_guard_pending: Option<u32>,
     pub base_priority: i32,
     pub physical_ideal_core_id: i32,
     pub virtual_ideal_core_id: i32,
@@ -662,8 +651,6 @@ impl KThread {
             suspend_allowed_flags: ThreadState::SUSPEND_FLAG_MASK.bits() as u32,
             synced_index: 0,
             wait_result: RESULT_NO_SYNCHRONIZATION_OBJECT.get_inner_value(),
-            wait_wake_guard_armed: false,
-            wait_wake_guard_pending: None,
             base_priority: 0,
             physical_ideal_core_id: 0,
             virtual_ideal_core_id: 0,
@@ -2908,37 +2895,6 @@ impl KThread {
         self.begin_wait_with_queue(KThreadQueue::default());
     }
 
-    /// Arm the host-thread IPC lost-wakeup guard. Call before enqueuing an
-    /// IPC request and signaling the owning ServerManager host fiber. Clears
-    /// any stale pending wake so each request starts fresh. See the field
-    /// docs on `wait_wake_guard_armed`.
-    pub fn arm_wait_wake_guard(&mut self) {
-        self.wait_wake_guard_armed = true;
-        self.wait_wake_guard_pending = None;
-    }
-
-    /// Park the thread for a guarded IPC wait, consuming a pending wake if the
-    /// reply already arrived (i.e. `end_wait` ran while this thread was still
-    /// RUNNABLE and recorded the result via the armed guard).
-    ///
-    /// Returns `true` if the thread actually entered WAITING (caller should
-    /// reschedule), or `false` if a pending wake was consumed and the thread
-    /// stays RUNNABLE (caller should skip the park and read `wait_result`).
-    ///
-    /// Always disarms the guard. Race-free because this and `end_wait` both
-    /// run under the thread's Mutex.
-    pub fn begin_wait_guarded(&mut self) -> bool {
-        self.wait_wake_guard_armed = false;
-        if let Some(result) = self.wait_wake_guard_pending.take() {
-            // Reply already delivered before we parked — adopt its result and
-            // stay runnable.
-            self.wait_result = result;
-            return false;
-        }
-        self.begin_wait();
-        true
-    }
-
     pub fn unpark_wait(&self) {
         // Upstream does not block the host thread in BeginWait.
         // Retained as a no-op for compatibility with existing queue call sites.
@@ -2979,14 +2935,8 @@ impl KThread {
         let _scheduler_lock = self.lock_scheduler();
 
         if self.get_state() != ThreadState::WAITING {
-            // The thread is not parked yet. If the host-thread IPC guard is
-            // armed, this is a reply racing ahead of the client's park:
-            // record the wake so `begin_wait_guarded` consumes it instead of
-            // parking into a lost wakeup. Otherwise preserve upstream's
-            // silent no-op.
-            if self.wait_wake_guard_armed {
-                self.wait_wake_guard_pending = Some(_wait_result);
-            }
+            // Upstream preserves this as a no-op when the target is not
+            // actually waiting.
             return;
         }
 

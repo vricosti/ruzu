@@ -212,6 +212,7 @@ mod tests {
     use super::*;
     use crate::hle::kernel::k_process::KProcess;
     use crate::hle::kernel::k_session::KSession;
+    use crate::hle::kernel::k_thread::{KThread, KThreadLock, ThreadState};
     use std::sync::{Arc, Mutex};
 
     #[test]
@@ -226,6 +227,14 @@ mod tests {
         }
         process.register_session_object(0x1000, Arc::clone(&session));
 
+        let current_thread = Arc::new(KThreadLock::new(KThread::new()));
+        {
+            let mut thread = current_thread.lock().unwrap();
+            thread.thread_id = 1;
+            thread.set_state(ThreadState::RUNNABLE);
+        }
+        crate::hle::kernel::kernel::set_current_emu_thread(Some(&current_thread));
+
         let client_session = session.lock().unwrap().get_client_session().clone();
         assert_eq!(
             client_session
@@ -234,6 +243,7 @@ mod tests {
                 .send_sync_request_with_process(&mut process, 0x2395000, 0x80),
             0
         );
+        crate::hle::kernel::kernel::set_current_emu_thread(None);
 
         let server_session = session.lock().unwrap().get_server_session().clone();
         assert_eq!(server_session.lock().unwrap().receive_request(), 0);
@@ -292,6 +302,14 @@ mod tests {
         }
         process.register_session_object(0x1000, Arc::clone(&session));
 
+        let current_thread = Arc::new(KThreadLock::new(KThread::new()));
+        {
+            let mut thread = current_thread.lock().unwrap();
+            thread.thread_id = 2;
+            thread.set_state(ThreadState::RUNNABLE);
+        }
+        crate::hle::kernel::kernel::set_current_emu_thread(Some(&current_thread));
+
         let client_session = session.lock().unwrap().get_client_session().clone();
         let _client_guard = client_session.lock().unwrap();
 
@@ -304,6 +322,7 @@ mod tests {
             ),
             0
         );
+        crate::hle::kernel::kernel::set_current_emu_thread(None);
 
         let server_session = session.lock().unwrap().get_server_session().clone();
         assert_eq!(server_session.lock().unwrap().receive_request(), 0);
