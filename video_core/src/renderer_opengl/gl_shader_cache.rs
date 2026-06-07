@@ -22,10 +22,11 @@ use shader_recompiler::{
     compile_shader_glsl_at_offset_with_bindings_and_host_info,
     compile_shader_glsl_at_offset_with_bindings_and_texture_bound_and_host_info,
     compile_shader_glsl_at_offset_with_bindings_and_texture_bound_and_sph_and_host_info,
-    CompiledGlslShader, ShaderStage,
+    compile_shader_glsl_from_env_with_bindings_and_host_info, CompiledGlslShader, ShaderStage,
 };
 
 use crate::shader_cache::{GraphicsEnvironments, ShaderCache as SharedShaderCache};
+use crate::shader_environment::GraphicsEnvironment;
 use crate::transform_feedback;
 use shader_recompiler::program_header::ProgramHeader;
 
@@ -741,8 +742,8 @@ impl ShaderCache {
                     continue;
                 }
 
-                let env = environments.envs[slot].generic_environment_mut();
-                let actual_stage = env.shader_stage();
+                let env = &mut environments.envs[slot];
+                let actual_stage = env.generic_environment().shader_stage();
                 trace_gl_pipeline(
                     9,
                     &self.graphics_key,
@@ -751,7 +752,9 @@ impl ShaderCache {
                     slot as u64,
                     gl_slot as u64,
                 );
-                if env.cached_code_slice().is_empty() && env.analyze().is_none() {
+                if env.generic_environment().cached_code_slice().is_empty()
+                    && env.generic_environment_mut().analyze().is_none()
+                {
                     log::warn!(
                         "gl_shader_cache: shared environment analyze failed for stage {:?}",
                         actual_stage
@@ -769,13 +772,8 @@ impl ShaderCache {
 
                 let runtime_info =
                     Self::make_runtime_info(&self.graphics_key, actual_stage, Some(&previous_info));
-                let texture_bound_buffer = env.texture_bound_buffer();
-                let compiled = self.compile_stage_glsl_at_offset_with_runtime_info(
-                    env.cached_instruction_slice(),
-                    actual_stage,
-                    env.cached_instruction_start(),
-                    Some(texture_bound_buffer),
-                    Some(env.sph()),
+                let compiled = self.compile_stage_glsl_from_env_with_runtime_info(
+                    env,
                     &runtime_info,
                     &mut bindings,
                 );
@@ -908,8 +906,8 @@ impl ShaderCache {
                 continue;
             }
 
-            let env = environments.envs[slot].generic_environment_mut();
-            let actual_stage = env.shader_stage();
+            let env = &mut environments.envs[slot];
+            let actual_stage = env.generic_environment().shader_stage();
             trace_gl_pipeline(
                 9,
                 &self.graphics_key,
@@ -918,7 +916,9 @@ impl ShaderCache {
                 slot as u64,
                 gl_slot as u64,
             );
-            if env.cached_code_slice().is_empty() && env.analyze().is_none() {
+            if env.generic_environment().cached_code_slice().is_empty()
+                && env.generic_environment_mut().analyze().is_none()
+            {
                 log::warn!(
                     "gl_shader_cache: shared environment analyze failed for stage {:?}",
                     actual_stage
@@ -936,13 +936,8 @@ impl ShaderCache {
 
             let runtime_info =
                 Self::make_runtime_info(&self.graphics_key, actual_stage, previous_info.as_ref());
-            let texture_bound_buffer = env.texture_bound_buffer();
-            let compiled = self.compile_stage_glsl_at_offset_with_runtime_info(
-                env.cached_instruction_slice(),
-                actual_stage,
-                env.cached_instruction_start(),
-                Some(texture_bound_buffer),
-                Some(env.sph()),
+            let compiled = self.compile_stage_glsl_from_env_with_runtime_info(
+                env,
                 &runtime_info,
                 &mut bindings,
             );
@@ -1227,6 +1222,43 @@ impl ShaderCache {
             log::warn!(
                 "[GLSL_DUMP] stage={:?} idx={} bytes={} path={}",
                 stage,
+                idx,
+                compiled.source.len(),
+                path
+            );
+        }
+        compiled
+    }
+
+    fn compile_stage_glsl_from_env_with_runtime_info(
+        &self,
+        env: &mut GraphicsEnvironment,
+        runtime_info: &RuntimeInfo,
+        bindings: &mut shader_recompiler::backend::bindings::Bindings,
+    ) -> CompiledGlslShader {
+        let code = env
+            .generic_environment()
+            .cached_instruction_slice()
+            .to_vec();
+        let base_offset = env.generic_environment().cached_instruction_start();
+        let compiled = compile_shader_glsl_from_env_with_bindings_and_host_info(
+            &code,
+            base_offset,
+            env,
+            &self.profile,
+            runtime_info,
+            bindings,
+            &self.host_info,
+        );
+        if std::env::var_os("RUZU_DUMP_GLSL").is_some() {
+            use std::sync::atomic::{AtomicUsize, Ordering};
+            static COUNT: AtomicUsize = AtomicUsize::new(0);
+            let idx = COUNT.fetch_add(1, Ordering::Relaxed);
+            let path = format!("/tmp/ruzu_glsl_{:04}_{:?}.glsl", idx, compiled.stage);
+            let _ = std::fs::write(&path, &compiled.source);
+            log::warn!(
+                "[GLSL_DUMP] stage={:?} idx={} bytes={} path={}",
+                compiled.stage,
                 idx,
                 compiled.source.len(),
                 path

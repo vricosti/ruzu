@@ -555,6 +555,28 @@ pub fn compile_shader_glsl_at_offset_with_bindings_and_host_info(
     )
 }
 
+/// Compile a Maxwell shader to GLSL through the upstream-shaped Environment
+/// translation bridge.
+pub fn compile_shader_glsl_from_env_with_bindings_and_host_info(
+    code: &[u64],
+    base_offset: u32,
+    env: &mut dyn Environment,
+    profile: &Profile,
+    runtime_info: &RuntimeInfo,
+    bindings: &mut backend::bindings::Bindings,
+    host_info: &crate::host_translate_info::HostTranslateInfo,
+) -> CompiledGlslShader {
+    let mut program = translate_program_from_env_with_host_info(code, base_offset, env, host_info);
+    convert_legacy_to_generic(&mut program, runtime_info);
+    let source = backend::glsl::emit_glsl(profile, runtime_info, &mut program, bindings);
+    let stage = program.stage;
+    CompiledGlslShader {
+        source,
+        info: program.info,
+        stage,
+    }
+}
+
 /// OpenGL graphics path variant that mirrors upstream's
 /// `TexturePass(env, program, host_info)` for currently ported bound
 /// texture instructions.
