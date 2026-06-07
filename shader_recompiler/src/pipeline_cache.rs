@@ -921,6 +921,7 @@ fn optimize_program_with_env(
     ir_opt::identity_removal::identity_removal_pass(program);
     ir_opt::constant_propagation::constant_propagation_pass(program);
     ir_opt::identity_removal::identity_removal_pass(program);
+    ir_opt::position_pass::position_pass(env, program);
     ir_opt::global_memory_to_storage_buffer_pass::global_memory_to_storage_buffer_pass(
         program, host_info,
     );
