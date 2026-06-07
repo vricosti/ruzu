@@ -559,7 +559,10 @@ impl GenericEnvironment {
                 reader(gpu_addr, output);
                 return true;
             }
+            #[cfg(test)]
             return false;
+            #[cfg(not(test))]
+            panic!("GenericEnvironment runtime GPU read requires a live MemoryManager owner");
         }
         true
     }
@@ -625,11 +628,18 @@ impl GraphicsEnvironment {
         let mut env = Self::new();
         env.maxwell3d = maxwell3d as *const Maxwell3D;
         env.base = GenericEnvironment::new().with_program(program_base, start_address);
-        if let Some(gpu_memory) = maxwell3d.memory_manager() {
+        #[cfg(not(test))]
+        {
+            let gpu_memory = maxwell3d.memory_manager().expect(
+                "GraphicsEnvironment runtime construction requires a live MemoryManager owner",
+            );
             env.base = std::mem::take(&mut env.base).with_gpu_memory(gpu_memory);
-        } else {
-            #[cfg(test)]
-            if let Some(gpu_reader) = maxwell3d.guest_memory_reader() {
+        }
+        #[cfg(test)]
+        {
+            if let Some(gpu_memory) = maxwell3d.memory_manager() {
+                env.base = std::mem::take(&mut env.base).with_gpu_memory(gpu_memory);
+            } else if let Some(gpu_reader) = maxwell3d.guest_memory_reader() {
                 env.base = std::mem::take(&mut env.base).with_gpu_read(gpu_reader);
             }
         }

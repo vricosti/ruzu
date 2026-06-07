@@ -625,6 +625,28 @@
 - Manual MK8D 25s isolated-XDG host-thread-all smoke after switching `SessionRequestManager` to a weak `ServerManager` owner (`/tmp/ruzu_mk8d_ipc_weak_owner_host_all_smoke_1780868703.log`, `RUZU_SERVER_THREAD_IPC_ALL=1`): reached `NotifyRunning`, no panic/`BreakLoopNullPc`, no `svcBreak`/`SetTerminateResult`, no `missing_server_manager_owner`, and no `receive_request_hle failed` warnings. Warn-level logging did not emit audio or presentation markers in this short run.
 
 ## 2026-06-07 — core/src/hle/kernel/k_client_session.rs, core/src/hle/kernel/k_session.rs, core/src/hle/kernel/k_server_session.rs, core/src/hle/kernel/k_thread.rs, core/src/hle/kernel/k_scheduler.rs, and core/src/hle/kernel/svc/svc_ipc.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/k_client_session.cpp, /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/k_session.cpp, /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/k_server_session.cpp, /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/k_thread.cpp, /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/k_scheduler.cpp, and /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/svc/svc_ipc.cpp
+## 2026-06-07 — video_core/src/shader_environment.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/shader_environment.h and /home/vricosti/Dev/emulators/zuyu/src/video_core/shader_environment.cpp
+
+### Intentional differences
+- Rust still stores upstream `Tegra::MemoryManager*` as `Option<Arc<parking_lot::Mutex<MemoryManager>>>` because upstream also has a default `GenericEnvironment()` constructor with a null `gpu_memory` pointer for non-runtime/cache-style construction. Runtime `GraphicsEnvironment::from_maxwell3d(...)` now requires a live `MemoryManager` owner in non-test builds, matching upstream's `GraphicsEnvironment(Maxwell3D&, MemoryManager&, ...)` constructor dependency.
+- `#[cfg(test)]` reduced fixtures may still use `GpuMemoryReader` when constructing environments without a full `MemoryManager`; this remains test-only and does not participate in runtime shader compilation.
+
+### Unintentional differences (to fix)
+- Full upstream reference ownership is still not literal: Rust uses `Arc<Mutex<MemoryManager>>` and raw engine owner pointers instead of C++ references, pending the broader live owner-graph cleanup.
+
+### Missing items
+- Continue the broader `ShaderEnvironment` parity work by porting the upstream-shaped `TranslateProgram(Environment&, CFG&, HostTranslateInfo&)` path so shader translation consumes the live environment owner directly.
+
+### Binary layout verification
+- N/A: shader environment owner validation only. No guest-visible raw payload layout changed.
+
+### Tests
+- Re-read upstream `shader_environment.h` and `shader_environment.cpp::GenericEnvironment` / `GraphicsEnvironment`.
+- `cargo test -p video_core graphics_environment_from_maxwell3d_reads_sph_and_local_memory -- --nocapture`
+- `cargo check -p video_core`
+- `cargo fmt --check`
+- `git diff --check`
+
 ## 2026-06-07 — shader_recompiler/src/frontend/translate_program.rs and shader_recompiler/src/pipeline_cache.rs vs /home/vricosti/Dev/emulators/zuyu/src/shader_recompiler/frontend/maxwell/translate_program.h and /home/vricosti/Dev/emulators/zuyu/src/shader_recompiler/frontend/maxwell/translate_program.cpp
 
 ### Intentional differences
@@ -678,10 +700,10 @@
 - Rust still represents upstream `Tegra::MemoryManager*` as `Arc<parking_lot::Mutex<MemoryManager>>` because the broader channel/engine owner graph is not a literal C++ reference graph.
 
 ### Unintentional differences (to fix)
-- `GenericEnvironment` still keeps a nullable `MemoryManager` owner and returns "no data" when absent, while upstream runtime constructors install the memory owner directly.
+- Full upstream reference ownership is still not literal: Rust uses `Arc<parking_lot::Mutex<MemoryManager>>` and raw engine owner pointers instead of C++ references, pending the broader live owner-graph cleanup.
 
 ### Missing items
-- Remove the remaining nullable runtime `MemoryManager` state once every production construction path uses an upstream-shaped owner directly.
+- Continue the broader `ShaderEnvironment` parity work by porting the upstream-shaped `TranslateProgram(Environment&, CFG&, HostTranslateInfo&)` path so shader translation consumes the live environment owner directly.
 
 ### Binary layout verification
 - N/A: shader environment owner selection only. No guest-visible raw payload layout changed.
