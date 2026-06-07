@@ -625,6 +625,35 @@
 - Manual MK8D 25s isolated-XDG host-thread-all smoke after switching `SessionRequestManager` to a weak `ServerManager` owner (`/tmp/ruzu_mk8d_ipc_weak_owner_host_all_smoke_1780868703.log`, `RUZU_SERVER_THREAD_IPC_ALL=1`): reached `NotifyRunning`, no panic/`BreakLoopNullPc`, no `svcBreak`/`SetTerminateResult`, no `missing_server_manager_owner`, and no `receive_request_hle failed` warnings. Warn-level logging did not emit audio or presentation markers in this short run.
 
 ## 2026-06-07 — core/src/hle/kernel/k_client_session.rs, core/src/hle/kernel/k_session.rs, core/src/hle/kernel/k_server_session.rs, core/src/hle/kernel/k_thread.rs, core/src/hle/kernel/k_scheduler.rs, and core/src/hle/kernel/svc/svc_ipc.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/k_client_session.cpp, /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/k_session.cpp, /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/k_server_session.cpp, /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/k_thread.cpp, /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/k_scheduler.cpp, and /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/svc/svc_ipc.cpp
+## 2026-06-07 — video_core/src/renderer_opengl/gl_shader_cache.rs, shader_recompiler/src/pipeline_cache.rs, and shader_recompiler/src/lib.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_shader_cache.cpp and /home/vricosti/Dev/emulators/zuyu/src/shader_recompiler/frontend/maxwell/translate_program.cpp
+
+### Intentional differences
+- Non-dual OpenGL graphics stages compiled through `create_graphics_pipeline_from_environments(...)` now call the environment-backed Rust bridge before GLSL emission, matching upstream's normal-stage path where `CreateGraphicsPipeline(...)` obtains a `Shader::Environment&` and calls `TranslateProgram(..., env, cfg, host_info)`.
+- Rust copies `GenericEnvironment::cached_instruction_slice()` into a temporary `Vec<u64>` before passing the owning `&mut GraphicsEnvironment` to the bridge. This is a Rust borrow-safety adaptation only; upstream keeps the code storage behind `Environment&` and `Flow::CFG&`.
+- The existing instruction-slice compatibility helper remains for tests, reduced callers, and the dual VertexA/VertexB merge path. That path still needs a dedicated environment-aware dual merge port before it can be routed through the same bridge.
+- `shader_recompiler/src/lib.rs` re-exports the new bridge because existing OpenGL compile helpers are already exposed through the crate root; this preserves the current Rust crate boundary while the stricter upstream file ownership is still being ported.
+
+### Unintentional differences (to fix)
+- Upstream `CreateGraphicsPipeline(...)` builds an array of `Shader::IR::Program`, handles layer passthrough generation, merges dual vertex programs, tracks storage-buffer totals, and then emits/link programs from that program array. Rust still emits per-stage GLSL strings directly during the OpenGL cache build.
+- Dual VertexA/VertexB compilation still uses the older instruction-slice helper instead of an upstream-shaped `TranslateProgram(..., env, cfg, host_info)` bridge for both programs followed by an environment-aware merge.
+
+### Missing items
+- Port the full upstream `CreateGraphicsPipeline(..., envs, ...)` program-array flow, including layer passthrough generation and storage-buffer accounting.
+- Port an environment-backed dual VertexA/VertexB merge path so `MergeDualVertexPrograms` parity does not depend on compatibility slice APIs.
+
+### Binary layout verification
+- N/A: shader translation and GLSL source generation policy only. No guest-visible raw payload layout changed.
+
+### Tests
+- Re-read upstream `renderer_opengl/gl_shader_cache.cpp::CreateGraphicsPipeline` and `frontend/maxwell/translate_program.cpp::TranslateProgram`.
+- `cargo test -p shader_recompiler translate_program_from_env_uses_environment_metadata -- --nocapture`
+- `cargo check -p shader_recompiler`
+- `cargo check -p video_core`
+- `cargo fmt --check`
+- `git diff --check`
+- `cargo build --release --bin ruzu-cmd`
+- MK8D OpenGL smoke, isolated data/cache/config, 90 s timeout: exited by timeout (`rc=124`) with no panic or `GL Shader Error` in `/tmp/mk8d_shader_env_runtime_1780850485_retry.log`.
+
 ## 2026-06-07 — shader_recompiler/src/pipeline_cache.rs vs /home/vricosti/Dev/emulators/zuyu/src/shader_recompiler/frontend/maxwell/translate_program.cpp
 
 ### Intentional differences

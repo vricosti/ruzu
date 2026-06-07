@@ -60,7 +60,8 @@ pub use pipeline_cache::{
     compile_shader_glsl_at_offset_with_bindings_and_texture_bound_and_host_info,
     compile_shader_glsl_at_offset_with_bindings_and_texture_bound_and_sph,
     compile_shader_glsl_at_offset_with_bindings_and_texture_bound_and_sph_and_host_info,
-    CompiledGlslShader, CompiledShader, PipelineCache, ShaderKey,
+    compile_shader_glsl_from_env_with_bindings_and_host_info, CompiledGlslShader, CompiledShader,
+    PipelineCache, ShaderKey,
 };
 pub use profile::Profile;
 pub use runtime_info::RuntimeInfo;
