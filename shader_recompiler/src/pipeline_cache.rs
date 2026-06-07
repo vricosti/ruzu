@@ -372,6 +372,33 @@ pub fn compile_shader(
     }
 }
 
+/// Translate a Maxwell shader binary into IR and run the currently ported
+/// optimization driver.
+///
+/// This is the Rust counterpart used by `frontend::translate_program` until
+/// the full upstream `TranslateProgram(env, cfg, host_info)` signature is
+/// ported. It shares the same CFG, structured-control-flow, translation, and
+/// host-info-aware pass sequence as the GLSL/Vulkan compile paths instead of
+/// returning an empty placeholder program.
+pub fn translate_program_at_offset_with_host_info(
+    code: &[u64],
+    stage: ShaderStage,
+    base_offset: u32,
+    host_info: &crate::host_translate_info::HostTranslateInfo,
+) -> Program {
+    translate_and_optimize_with_host_info(code, stage, base_offset, host_info)
+}
+
+/// Translate a Maxwell shader binary into IR using default host capabilities.
+pub fn translate_program_at_offset(code: &[u64], stage: ShaderStage, base_offset: u32) -> Program {
+    translate_program_at_offset_with_host_info(
+        code,
+        stage,
+        base_offset,
+        &crate::host_translate_info::HostTranslateInfo::default(),
+    )
+}
+
 /// Compile a Maxwell shader binary to GLSL source for the OpenGL backend.
 ///
 /// Mirrors [`compile_shader`] but invokes the GLSL emitter instead of the
