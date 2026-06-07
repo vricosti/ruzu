@@ -26,9 +26,6 @@ use shader_recompiler::{
 };
 
 use crate::shader_cache::{GraphicsEnvironments, ShaderCache as SharedShaderCache};
-#[cfg(test)]
-use crate::shader_environment::GenericEnvironment;
-use crate::shader_environment::GpuMemoryReader;
 use crate::transform_feedback;
 use shader_recompiler::program_header::ProgramHeader;
 
@@ -339,21 +336,6 @@ pub struct ShaderCache {
     /// Path to the on-disk shader cache file.
     shader_cache_filename: PathBuf,
 
-    /// Test-only GPU memory reader for the reduced local pipeline fallback.
-    ///
-    /// Runtime OpenGL pipeline creation uses
-    /// `current_graphics_pipeline_with_shared_cache(...)`, which obtains
-    /// upstream-shaped `GraphicsEnvironment` owners from the shared
-    /// `video_core::ShaderCache`.
-    #[cfg(test)]
-    gpu_memory_reader: Option<GpuMemoryReader>,
-
-    /// Test-only per-stage Maxwell shader program addresses for the reduced
-    /// local pipeline fallback. Runtime keys are populated from live Maxwell
-    /// state by `current_graphics_pipeline_with_shared_cache(...)`.
-    #[cfg(test)]
-    pending_program_addresses: [u64; 6],
-
     /// Owning thread for this cache instance. First call to a mutating method
     /// stores the current thread id; subsequent calls assert it hasn't changed.
     /// Used to verify the "concurrent HashMap access" hypothesis behind the
@@ -392,10 +374,6 @@ impl ShaderCache {
             graphics_cache: HashMap::new(),
             compute_cache: HashMap::new(),
             shader_cache_filename: PathBuf::new(),
-            #[cfg(test)]
-            gpu_memory_reader: None,
-            #[cfg(test)]
-            pending_program_addresses: [0; 6],
             owner_tid_hash: std::sync::atomic::AtomicU64::new(0),
         }
     }
@@ -457,46 +435,6 @@ impl ShaderCache {
         }
     }
 
-    /// Legacy renderer hook retained for the broader renderer interface.
-    ///
-    /// In runtime builds this is intentionally a no-op for the OpenGL shader
-    /// cache: pipeline construction now uses the shared `ShaderCache` owner
-    /// graph and `GraphicsEnvironment` objects, matching upstream. Unit tests
-    /// keep the reader for reduced local pipeline fixtures.
-    pub fn set_gpu_memory_reader(&mut self, reader: GpuMemoryReader) {
-        #[cfg(not(test))]
-        {
-            let _ = reader;
-        }
-        #[cfg(test)]
-        {
-            self.gpu_memory_reader = Some(reader);
-        }
-    }
-
-    /// Whether a GPU memory reader is currently installed.
-    #[cfg(test)]
-    pub fn has_gpu_memory_reader(&self) -> bool {
-        self.gpu_memory_reader.is_some()
-    }
-
-    /// Set the per-stage Maxwell shader program addresses that the next
-    /// `current_graphics_pipeline` lookup should treat as the
-    /// `unique_hashes` array.
-    ///
-    /// See the field-level docs on `pending_program_addresses` for the
-    /// upstream parity rationale and the "stage disabled = 0" convention.
-    #[cfg(test)]
-    pub fn set_pending_program_addresses(&mut self, addresses: [u64; 6]) {
-        self.pending_program_addresses = addresses;
-    }
-
-    /// Read back the pending shader program addresses (test/inspection helper).
-    #[cfg(test)]
-    pub fn pending_program_addresses(&self) -> [u64; 6] {
-        self.pending_program_addresses
-    }
-
     /// Load disk resources for a given title.
     ///
     /// Port of `ShaderCache::LoadDiskResources()`.
@@ -519,33 +457,6 @@ impl ShaderCache {
             self.shader_cache_filename
         );
         // Full implementation requires shader_environment::load_pipelines
-    }
-
-    /// Test-only reduced local graphics pipeline path.
-    ///
-    /// Runtime callers must use
-    /// [`Self::current_graphics_pipeline_with_shared_cache`], which mirrors
-    /// upstream by deriving keys and environments from the shared shader-cache
-    /// owner graph.
-    #[cfg(test)]
-    pub fn current_graphics_pipeline(&mut self) -> Option<&mut GraphicsPipeline> {
-        self.assert_single_owner("current_graphics_pipeline");
-        // Mirror upstream `ShaderCache::CurrentGraphicsPipeline`: rebuild the
-        // key from live engine state every call, and only short-circuit when
-        // the freshly-built key matches the previously-bound pipeline. This
-        // is critical for parity — caching the previous key without
-        // rebuilding causes pipeline aliasing the moment the game switches
-        // shaders.
-        let key = self.build_graphics_key();
-        self.graphics_key = key;
-        let use_async = self.use_asynchronous_shaders;
-        if let Some(prev) = self.current_pipeline {
-            if prev == key && self.graphics_cache.contains_key(&key) {
-                let pipeline = self.graphics_cache.get_mut(&key).unwrap();
-                return Self::built_pipeline(use_async, None, pipeline);
-            }
-        }
-        self.current_graphics_pipeline_slow_path()
     }
 
     /// Shared-owner runtime path matching upstream `OpenGL::ShaderCache`'s
@@ -622,38 +533,6 @@ impl ShaderCache {
         None
     }
 
-    /// Test-only slow path for the reduced local fallback.
-    ///
-    /// Runtime uses `current_graphics_pipeline_slow_path_with_shared_cache`.
-    #[cfg(test)]
-    fn current_graphics_pipeline_slow_path(&mut self) -> Option<&mut GraphicsPipeline> {
-        self.assert_single_owner("current_graphics_pipeline_slow_path");
-        let key = self.build_graphics_key();
-        self.graphics_key = key;
-        self.current_pipeline = Some(key);
-        trace_gl_pipeline(1, &key, self.graphics_cache.len(), 1, 0, 0);
-
-        // Cache hit: return the existing pipeline, gated by async-build state.
-        if self.graphics_cache.contains_key(&key) {
-            trace_gl_pipeline(2, &key, self.graphics_cache.len(), 1, 0, 0);
-            let pipeline = self.graphics_cache.get_mut(&key).unwrap();
-            return Self::built_pipeline(self.use_asynchronous_shaders, None, pipeline);
-        }
-
-        // Cache miss: create a pipeline, insert it, and return a reference
-        // to the stored entry.
-        trace_gl_pipeline(3, &key, self.graphics_cache.len(), 1, 0, 0);
-        let pipeline = self.create_graphics_pipeline()?;
-        log::info!(
-            "gl_shader_cache: inserted placeholder graphics pipeline (total={})",
-            self.graphics_cache.len() + 1
-        );
-        self.graphics_cache.insert(key, pipeline);
-        trace_gl_pipeline(6, &key, self.graphics_cache.len(), 1, 0, 0);
-        let inserted = self.graphics_cache.get_mut(&key).expect("just inserted");
-        Self::built_pipeline(self.use_asynchronous_shaders, None, inserted)
-    }
-
     fn current_graphics_pipeline_slow_path_with_shared_cache(
         &mut self,
         shared_cache: &mut SharedShaderCache,
@@ -685,20 +564,6 @@ impl ShaderCache {
         result
     }
 
-    /// Build a `GraphicsPipelineKey` describing the current Maxwell3D state.
-    ///
-    /// Reduced local fallback path for non-shared callers. The active runtime
-    /// path uses `current_graphics_pipeline_with_shared_cache(...)`, which now
-    /// mirrors the upstream owner by reading Maxwell state from the shared
-    /// `VideoCommon::ShaderCache` channel owner.
-    #[cfg(test)]
-    fn build_graphics_key(&self) -> GraphicsPipelineKey {
-        GraphicsPipelineKey {
-            unique_hashes: self.pending_program_addresses,
-            ..GraphicsPipelineKey::default()
-        }
-    }
-
     /// Check if a pipeline is built (or if async shaders should return None).
     fn built_pipeline<'a>(
         use_asynchronous_shaders: bool,
@@ -722,444 +587,6 @@ impl ShaderCache {
             return Some(pipeline);
         }
         None
-    }
-
-    /// Create a new graphics pipeline from the current engine state.
-    ///
-    /// Test-only reduced graphics-pipeline constructor.
-    ///
-    /// The upstream runtime path is represented by
-    /// [`Self::create_graphics_pipeline_with_shared_cache`], which asks the
-    /// shared shader cache for `GraphicsEnvironment` owners before compiling.
-    /// This fallback remains only for reduced unit tests that exercise GL
-    /// pipeline insertion without constructing Maxwell/channel owners.
-    ///
-    /// When no GPU memory reader is installed (the test path) this
-    /// function returns the placeholder pipeline so the rest of the
-    /// pipeline-cache machinery still exercises end-to-end.
-    #[cfg(test)]
-    fn create_graphics_pipeline(&mut self) -> Option<GraphicsPipeline> {
-        let mut pipeline = GraphicsPipeline::new(self.graphics_key);
-
-        // Without a reader, return the placeholder unchanged. This is the
-        // shape every existing test relies on, and it's also what runs in
-        // production until `RasterizerOpenGL` plumbs its `gpu_read`
-        // callback into the cache.
-        let Some(reader) = self.gpu_memory_reader.as_ref() else {
-            return Some(pipeline);
-        };
-
-        let uses_vertex_a =
-            self.pending_program_addresses[0] != 0 && self.pending_program_addresses[1] != 0;
-
-        // Maxwell3D shader program slot index → recompiler stage and
-        // `glsl_sources` slot. Slot 0 is VertexA; upstream merges it into
-        // the VertexB program and emits the merged program as GL slot 0.
-        const STAGE_LAYOUT: &[(usize, ShaderStage, usize)] = &[
-            (1, ShaderStage::VertexB, 0),
-            (2, ShaderStage::TessellationControl, 1),
-            (3, ShaderStage::TessellationEval, 2),
-            (4, ShaderStage::Geometry, 3),
-            (5, ShaderStage::Fragment, 4),
-        ];
-        let mut bindings = shader_recompiler::backend::bindings::Bindings::default();
-        let mut infos: [Option<ShaderInfo>; 5] = Default::default();
-
-        if uses_vertex_a {
-            let mut va_env = GenericEnvironment::new()
-                .with_gpu_read(Arc::clone(reader))
-                .with_program(self.pending_program_addresses[0], 0)
-                .with_initial_offset(std::mem::size_of::<ProgramHeader>() as u32)
-                .with_stage(ShaderStage::VertexA);
-            let mut vb_env = GenericEnvironment::new()
-                .with_gpu_read(Arc::clone(reader))
-                .with_program(self.pending_program_addresses[1], 0)
-                .with_initial_offset(std::mem::size_of::<ProgramHeader>() as u32)
-                .with_stage(ShaderStage::VertexB);
-
-            if va_env.analyze().is_none() {
-                log::warn!("gl_shader_cache: TryFindSize failed for VertexA");
-            } else if vb_env.analyze().is_none() {
-                log::warn!("gl_shader_cache: TryFindSize failed for VertexB");
-            } else {
-                let runtime_info =
-                    Self::make_runtime_info(&self.graphics_key, ShaderStage::VertexB, None);
-                let compiled =
-                    compile_dual_vertex_shader_glsl_at_offset_with_bindings_and_host_info(
-                        va_env.cached_instruction_slice(),
-                        va_env.cached_instruction_start(),
-                        vb_env.cached_instruction_slice(),
-                        vb_env.cached_instruction_start(),
-                        &self.profile,
-                        &runtime_info,
-                        &mut bindings,
-                        &self.host_info,
-                    );
-                let mut previous_info = compiled.info.clone();
-                infos[0] = Some(previous_info.clone());
-                pipeline.glsl_sources[0] = Some(compiled.source);
-
-                for &(slot, stage, gl_slot) in STAGE_LAYOUT {
-                    let address = self.pending_program_addresses[slot];
-                    if address == 0 || slot == 1 {
-                        continue;
-                    }
-
-                    let mut env = GenericEnvironment::new()
-                        .with_gpu_read(Arc::clone(reader))
-                        .with_program(address, 0)
-                        .with_initial_offset(std::mem::size_of::<ProgramHeader>() as u32)
-                        .with_stage(stage);
-
-                    let Some(_hash) = env.analyze() else {
-                        log::warn!(
-                            "gl_shader_cache: TryFindSize failed for stage {:?} at 0x{:X}",
-                            stage,
-                            address
-                        );
-                        continue;
-                    };
-
-                    let runtime_info =
-                        Self::make_runtime_info(&self.graphics_key, stage, Some(&previous_info));
-                    let texture_bound_buffer = env.texture_bound_buffer();
-                    let compiled = self.compile_stage_glsl_at_offset_with_runtime_info(
-                        env.cached_instruction_slice(),
-                        stage,
-                        env.cached_instruction_start(),
-                        Some(texture_bound_buffer),
-                        Some(env.sph()),
-                        &runtime_info,
-                        &mut bindings,
-                    );
-                    log::debug!(
-                        "gl_shader_cache: compiled {:?} stage to {} bytes of GLSL",
-                        stage,
-                        compiled.source.len()
-                    );
-                    if std::env::var_os("RUZU_DUMP_GLSL").is_some() {
-                        use std::sync::atomic::{AtomicUsize, Ordering};
-                        static COUNT: AtomicUsize = AtomicUsize::new(0);
-                        let idx = COUNT.fetch_add(1, Ordering::Relaxed);
-                        let path = format!("/tmp/ruzu_glsl_{:04}_{:?}.glsl", idx, stage);
-                        let _ = std::fs::write(&path, &compiled.source);
-                        log::warn!(
-                            "[GLSL_DUMP] stage={:?} idx={} bytes={} path={}",
-                            stage,
-                            idx,
-                            compiled.source.len(),
-                            path
-                        );
-                    }
-                    previous_info = compiled.info.clone();
-                    let mut final_source =
-                        patch_fragment_debug_by_source_hash(stage, compiled.source);
-                    if std::env::var_os("RUZU_FORCE_GREEN_FRAGMENT").is_some()
-                        && format!("{:?}", stage) == "Fragment"
-                    {
-                        if let Some(idx) = final_source.rfind("void main(){") {
-                            let head = &final_source[..idx];
-                            let new_body =
-                                "void main(){\nfrag_color0=vec4(0.0,1.0,0.0,1.0);\nreturn;\n}\n";
-                            let new_source = format!("{}{}", head, new_body);
-                            log::warn!(
-                                "[FORCE_GREEN] patched fragment shader, new size {}",
-                                new_source.len()
-                            );
-                            final_source = new_source;
-                        }
-                    }
-                    if std::env::var_os("RUZU_FORCE_BLACK_FRAGMENT").is_some()
-                        && format!("{:?}", stage) == "Fragment"
-                    {
-                        if let Some(idx) = final_source.rfind("void main(){") {
-                            let head = &final_source[..idx];
-                            let new_body =
-                                "void main(){\nfrag_color0=vec4(0.0,0.0,0.0,1.0);\nreturn;\n}\n";
-                            let new_source = format!("{}{}", head, new_body);
-                            log::warn!("[FORCE_BLACK] patched FS to opaque black");
-                            final_source = new_source;
-                        }
-                    }
-                    if std::env::var_os("RUZU_FORCE_BLUE_FRAGMENT").is_some()
-                        && format!("{:?}", stage) == "Fragment"
-                    {
-                        if let Some(idx) = final_source.rfind("void main(){") {
-                            let head = &final_source[..idx];
-                            let new_body =
-                                "void main(){\nfrag_color0=vec4(0.0,0.0,1.0,1.0);\nreturn;\n}\n";
-                            let new_source = format!("{}{}", head, new_body);
-                            log::warn!("[FORCE_BLUE] patched FS to opaque blue");
-                            final_source = new_source;
-                        }
-                    }
-                    if std::env::var_os("RUZU_PROBE_FRAGCOORD").is_some()
-                        && format!("{:?}", stage) == "Fragment"
-                    {
-                        // Encode gl_FragCoord.w (1=normal,0=bad) as red.
-                        // Encode normalized gl_FragCoord.xy as green/blue.
-                        if let Some(idx) = final_source.rfind("void main(){") {
-                            let head = &final_source[..idx];
-                            let new_body = "void main(){\nfloat fcw=gl_FragCoord.w;\nfloat zx=fcw==0.0?1.0:0.0;\nfrag_color0=vec4(zx,clamp(fcw,0.0,1.0),0.0,1.0);\nreturn;\n}\n";
-                            let new_source = format!("{}{}", head, new_body);
-                            log::warn!("[PROBE_FRAGCOORD] patched FS to dump gl_FragCoord.w");
-                            final_source = new_source;
-                        }
-                    }
-                    if std::env::var_os("RUZU_FORCE_FULLSCREEN_VS").is_some()
-                        && format!("{:?}", stage).contains("Vertex")
-                    {
-                        if let Some(idx) = final_source.rfind("void main(){") {
-                            let head = &final_source[..idx];
-                            let new_body = if std::env::var_os("RUZU_FORCE_FULLSCREEN_VS_READ_ATTR")
-                                .is_some()
-                            {
-                                "void main(){\nvec4 ruzu_dummy=in_attr0;\nfloat ruzu_sink=ruzu_dummy.x*0.0;\nvec2 p=vec2(float((gl_VertexID<<1)&2),float(gl_VertexID&2));\ngl_Position=vec4(p*2.0-1.0+ruzu_sink,0.0,1.0);\nreturn;\n}\n"
-                            } else {
-                                "void main(){\nvec2 p=vec2(float((gl_VertexID<<1)&2),float(gl_VertexID&2));\ngl_Position=vec4(p*2.0-1.0,0.0,1.0);\nreturn;\n}\n"
-                            };
-                            let new_source = format!("{}{}", head, new_body);
-                            log::warn!("[FORCE_FS_VS] patched vertex shader");
-                            final_source = new_source;
-                        }
-                    }
-                    if std::env::var_os("RUZU_FORCE_VERTEX_ZW").is_some()
-                        && format!("{:?}", stage).contains("Vertex")
-                    {
-                        if let Some(idx) = final_source.rfind("return;") {
-                            let head = &final_source[..idx];
-                            let tail = &final_source[idx..];
-                            final_source =
-                                format!("{}gl_Position.z=0.0;\ngl_Position.w=1.0;\n{}", head, tail);
-                            log::warn!("[FORCE_VERTEX_ZW] patched vertex shader");
-                        }
-                    }
-                    if std::env::var_os("RUZU_FORCE_VERTEX_XY").is_some()
-                        && format!("{:?}", stage).contains("Vertex")
-                    {
-                        if let Some(idx) = final_source.rfind("return;") {
-                            let head = &final_source[..idx];
-                            let tail = &final_source[idx..];
-                            final_source = format!(
-                                "{}vec2 ruzu_p=vec2(float((gl_VertexID<<1)&2),float(gl_VertexID&2));\ngl_Position.xy=ruzu_p*2.0-1.0;\n{}",
-                                head, tail
-                            );
-                            log::warn!("[FORCE_VERTEX_XY] patched vertex shader");
-                        }
-                    }
-                    if std::env::var_os("RUZU_FORCE_VERTEX_OUT_ZERO").is_some()
-                        && format!("{:?}", stage).contains("Vertex")
-                    {
-                        if let Some(idx) = final_source.rfind("return;") {
-                            let head = &final_source[..idx];
-                            let tail = &final_source[idx..];
-                            final_source = format!("{}out_attr0=vec4(0.0);\n{}", head, tail);
-                            log::warn!("[FORCE_VERTEX_OUT_ZERO] patched vertex shader");
-                        }
-                    }
-                    if std::env::var_os("RUZU_DUMP_GLSL_FINAL").is_some() {
-                        use std::sync::atomic::{AtomicUsize, Ordering};
-                        static FINAL_COUNT: AtomicUsize = AtomicUsize::new(0);
-                        let idx = FINAL_COUNT.fetch_add(1, Ordering::Relaxed);
-                        let path = format!("/tmp/ruzu_glsl_final_{:04}_{:?}.glsl", idx, stage);
-                        let _ = std::fs::write(&path, &final_source);
-                        log::warn!(
-                            "[GLSL_FINAL_DUMP] stage={:?} idx={} bytes={} path={}",
-                            stage,
-                            idx,
-                            final_source.len(),
-                            path
-                        );
-                    }
-                    pipeline.glsl_sources[gl_slot] = Some(final_source);
-                    infos[gl_slot] = Some(previous_info.clone());
-                }
-
-                pipeline.apply_shader_infos(&infos);
-                return Some(pipeline);
-            }
-        }
-
-        let mut previous_info: Option<ShaderInfo> = None;
-        for &(slot, stage, gl_slot) in STAGE_LAYOUT {
-            let address = self.pending_program_addresses[slot];
-            if address == 0 {
-                continue;
-            }
-            if uses_vertex_a && slot == 1 {
-                continue;
-            }
-
-            // Each shader sits in GPU memory at `program_region + offset`,
-            // and that combined value is exactly what the rasterizer hands
-            // us in `pending_program_addresses`. Treat the whole address
-            // as the `program_base + start_address` for the upstream
-            // `GenericEnvironment` constructor by passing `start_address = 0`.
-            // Both `ShaderStage` (here, from `shader_recompiler`) and
-            // `GenericEnvironment::stage` (from `video_core::shader_environment`,
-            // which now re-exports `shader_recompiler::stage::Stage`) are
-            // the same type, so the assignment is direct.
-            let mut env = GenericEnvironment::new()
-                .with_gpu_read(Arc::clone(reader))
-                .with_program(address, 0)
-                .with_initial_offset(std::mem::size_of::<ProgramHeader>() as u32)
-                .with_stage(stage);
-
-            // Find the shader's tail with the upstream sentinel scan.
-            let Some(_hash) = env.analyze() else {
-                log::warn!(
-                    "gl_shader_cache: TryFindSize failed for stage {:?} at 0x{:X}",
-                    stage,
-                    address
-                );
-                continue;
-            };
-
-            // `analyze` populates `env.code` with whole-block reads up to
-            // and including the block containing the sentinel; the prefix
-            // up to `cached_highest` is the actual shader body the
-            // recompiler should consume.
-            let runtime_info =
-                Self::make_runtime_info(&self.graphics_key, stage, previous_info.as_ref());
-            let texture_bound_buffer = env.texture_bound_buffer();
-            let compiled = self.compile_stage_glsl_at_offset_with_runtime_info(
-                env.cached_instruction_slice(),
-                stage,
-                env.cached_instruction_start(),
-                Some(texture_bound_buffer),
-                Some(env.sph()),
-                &runtime_info,
-                &mut bindings,
-            );
-            log::debug!(
-                "gl_shader_cache: compiled {:?} stage to {} bytes of GLSL",
-                stage,
-                compiled.source.len()
-            );
-            if std::env::var_os("RUZU_DUMP_GLSL").is_some() {
-                use std::sync::atomic::{AtomicUsize, Ordering};
-                static COUNT: AtomicUsize = AtomicUsize::new(0);
-                let idx = COUNT.fetch_add(1, Ordering::Relaxed);
-                let path = format!("/tmp/ruzu_glsl_{:04}_{:?}.glsl", idx, stage);
-                let _ = std::fs::write(&path, &compiled.source);
-                log::warn!(
-                    "[GLSL_DUMP] stage={:?} idx={} bytes={} path={}",
-                    stage,
-                    idx,
-                    compiled.source.len(),
-                    path
-                );
-            }
-            previous_info = Some(compiled.info.clone());
-            infos[gl_slot] = previous_info.clone();
-            let mut final_source =
-                patch_fragment_debug_by_source_hash(ShaderStage::VertexB, compiled.source);
-            if std::env::var_os("RUZU_FORCE_GREEN_FRAGMENT").is_some()
-                && format!("{:?}", stage) == "Fragment"
-            {
-                if let Some(idx) = final_source.rfind("void main(){") {
-                    let head = &final_source[..idx];
-                    let new_body = "void main(){\nfrag_color0=vec4(0.0,1.0,0.0,1.0);\nreturn;\n}\n";
-                    let new_source = format!("{}{}", head, new_body);
-                    log::warn!(
-                        "[FORCE_GREEN] patched fragment shader (path 2), new size {}",
-                        new_source.len()
-                    );
-                    final_source = new_source;
-                }
-            }
-            if std::env::var_os("RUZU_FORCE_BLACK_FRAGMENT").is_some()
-                && format!("{:?}", stage) == "Fragment"
-            {
-                if let Some(idx) = final_source.rfind("void main(){") {
-                    let head = &final_source[..idx];
-                    let new_body = "void main(){\nfrag_color0=vec4(0.0,0.0,0.0,1.0);\nreturn;\n}\n";
-                    let new_source = format!("{}{}", head, new_body);
-                    log::warn!("[FORCE_BLACK] patched FS (path 2)");
-                    final_source = new_source;
-                }
-            }
-            if std::env::var_os("RUZU_PROBE_FRAGCOORD").is_some()
-                && format!("{:?}", stage) == "Fragment"
-            {
-                if let Some(idx) = final_source.rfind("void main(){") {
-                    let head = &final_source[..idx];
-                    let new_body = "void main(){\nfloat fcw=gl_FragCoord.w;\nfloat zx=fcw==0.0?1.0:0.0;\nfrag_color0=vec4(zx,clamp(fcw,0.0,1.0),0.0,1.0);\nreturn;\n}\n";
-                    let new_source = format!("{}{}", head, new_body);
-                    log::warn!("[PROBE_FRAGCOORD] patched FS (path 2)");
-                    final_source = new_source;
-                }
-            }
-            if std::env::var_os("RUZU_FORCE_FULLSCREEN_VS").is_some()
-                && format!("{:?}", stage).contains("Vertex")
-            {
-                if let Some(idx) = final_source.rfind("void main(){") {
-                    let head = &final_source[..idx];
-                    let new_body = if std::env::var_os("RUZU_FORCE_FULLSCREEN_VS_READ_ATTR")
-                        .is_some()
-                    {
-                        "void main(){\nvec4 ruzu_dummy=in_attr0;\nfloat ruzu_sink=ruzu_dummy.x*0.0;\nvec2 p=vec2(float((gl_VertexID<<1)&2),float(gl_VertexID&2));\ngl_Position=vec4(p*2.0-1.0+ruzu_sink,0.0,1.0);\nreturn;\n}\n"
-                    } else {
-                        "void main(){\nvec2 p=vec2(float((gl_VertexID<<1)&2),float(gl_VertexID&2));\ngl_Position=vec4(p*2.0-1.0,0.0,1.0);\nreturn;\n}\n"
-                    };
-                    let new_source = format!("{}{}", head, new_body);
-                    log::warn!("[FORCE_FS_VS] patched vertex shader (path 2)");
-                    final_source = new_source;
-                }
-            }
-            if std::env::var_os("RUZU_FORCE_VERTEX_ZW").is_some()
-                && format!("{:?}", stage).contains("Vertex")
-            {
-                if let Some(idx) = final_source.rfind("return;") {
-                    let head = &final_source[..idx];
-                    let tail = &final_source[idx..];
-                    final_source =
-                        format!("{}gl_Position.z=0.0;\ngl_Position.w=1.0;\n{}", head, tail);
-                    log::warn!("[FORCE_VERTEX_ZW] patched vertex shader (path 2)");
-                }
-            }
-            if std::env::var_os("RUZU_FORCE_VERTEX_XY").is_some()
-                && format!("{:?}", stage).contains("Vertex")
-            {
-                if let Some(idx) = final_source.rfind("return;") {
-                    let head = &final_source[..idx];
-                    let tail = &final_source[idx..];
-                    final_source = format!(
-                        "{}vec2 ruzu_p=vec2(float((gl_VertexID<<1)&2),float(gl_VertexID&2));\ngl_Position.xy=ruzu_p*2.0-1.0;\n{}",
-                        head, tail
-                    );
-                    log::warn!("[FORCE_VERTEX_XY] patched vertex shader (path 2)");
-                }
-            }
-            if std::env::var_os("RUZU_FORCE_VERTEX_OUT_ZERO").is_some()
-                && format!("{:?}", stage).contains("Vertex")
-            {
-                if let Some(idx) = final_source.rfind("return;") {
-                    let head = &final_source[..idx];
-                    let tail = &final_source[idx..];
-                    final_source = format!("{}out_attr0=vec4(0.0);\n{}", head, tail);
-                    log::warn!("[FORCE_VERTEX_OUT_ZERO] patched vertex shader (path 2)");
-                }
-            }
-            if std::env::var_os("RUZU_DUMP_GLSL_FINAL").is_some() {
-                use std::sync::atomic::{AtomicUsize, Ordering};
-                static FINAL_COUNT: AtomicUsize = AtomicUsize::new(0);
-                let idx = FINAL_COUNT.fetch_add(1, Ordering::Relaxed);
-                let path = format!("/tmp/ruzu_glsl_final_{:04}_{:?}.glsl", idx, stage);
-                let _ = std::fs::write(&path, &final_source);
-                log::warn!(
-                    "[GLSL_FINAL_DUMP] stage={:?} idx={} bytes={} path={}",
-                    stage,
-                    idx,
-                    final_source.len(),
-                    path
-                );
-            }
-            pipeline.glsl_sources[gl_slot] = Some(final_source);
-        }
-
-        pipeline.apply_shader_infos(&infos);
-        Some(pipeline)
     }
 
     fn create_graphics_pipeline_with_shared_cache(
@@ -1840,25 +1267,7 @@ mod tests {
     use crate::engines::engine_interface::EngineInterface;
     use crate::engines::maxwell_3d::{EngineHint, Maxwell3D, PrimitiveTopology};
     use crate::memory_manager::MemoryManager;
-    use crate::renderer_opengl::gl_graphics_pipeline::NUM_STAGES;
     use parking_lot::Mutex as ParkingLotMutex;
-
-    fn make_cpu_reader(
-        cpu_base: u64,
-        backing: Arc<Vec<u8>>,
-    ) -> Arc<dyn Fn(u64, &mut [u8]) + Send + Sync> {
-        Arc::new(move |cpu_addr, dst| {
-            if cpu_addr < cpu_base {
-                return;
-            }
-            let offset = (cpu_addr - cpu_base) as usize;
-            if offset >= backing.len() {
-                return;
-            }
-            let n = (offset + dst.len()).min(backing.len()) - offset;
-            dst[..n].copy_from_slice(&backing[offset..offset + n]);
-        })
-    }
 
     fn make_owner_backed_memory_manager(
         gpu_base: u64,
@@ -1916,178 +1325,6 @@ mod tests {
     #[test]
     fn cache_version() {
         assert_eq!(CACHE_VERSION, 10);
-    }
-
-    #[test]
-    fn current_graphics_pipeline_populates_cache_on_first_call() {
-        let mut cache = ShaderCache::new_for_test();
-        assert_eq!(cache.graphics_pipeline_count(), 0);
-        assert!(cache.current_pipeline.is_none());
-
-        // First call: slow path builds a key, creates a placeholder pipeline,
-        // inserts it, and returns a live reference.
-        {
-            let pipeline = cache.current_graphics_pipeline();
-            assert!(
-                pipeline.is_some(),
-                "placeholder pipeline should be returned"
-            );
-        }
-
-        assert_eq!(cache.graphics_pipeline_count(), 1);
-        assert!(cache.current_pipeline.is_some());
-    }
-
-    #[test]
-    fn current_graphics_pipeline_reuses_cached_entry() {
-        let mut cache = ShaderCache::new_for_test();
-
-        // First call creates the entry.
-        cache.current_graphics_pipeline();
-        assert_eq!(cache.graphics_pipeline_count(), 1);
-
-        // Subsequent calls with the same (default) key hit the fast path and
-        // must NOT grow the cache.
-        for _ in 0..16 {
-            let pipeline = cache.current_graphics_pipeline();
-            assert!(pipeline.is_some());
-        }
-        assert_eq!(cache.graphics_pipeline_count(), 1);
-    }
-
-    #[test]
-    fn pending_program_addresses_default_to_zero() {
-        let cache = ShaderCache::new_for_test();
-        assert_eq!(cache.pending_program_addresses(), [0u64; 6]);
-    }
-
-    #[test]
-    fn build_graphics_key_uses_pending_program_addresses() {
-        let mut cache = ShaderCache::new_for_test();
-        let addrs = [0x1000, 0x2000, 0x3000, 0x4000, 0x5000, 0x6000];
-        cache.set_pending_program_addresses(addrs);
-
-        // Slow path will run on the first call and pick up the new addresses.
-        cache
-            .current_graphics_pipeline()
-            .expect("placeholder pipeline");
-        assert_eq!(cache.graphics_pipeline_count(), 1);
-
-        // Both the cached current_pipeline key and the build_graphics_key
-        // helper should reflect the addresses.
-        let key = cache.build_graphics_key();
-        assert_eq!(key.unique_hashes, addrs);
-    }
-
-    #[test]
-    fn create_graphics_pipeline_with_reader_emits_glsl_for_vertex_stage() {
-        // Mock GPU memory: place a SELF_BRANCH_A sentinel at offset 0x80
-        // (after a few words of NOPs) at the chosen vertex shader address.
-        let vertex_addr: u64 = 0x10_0000_0000;
-        const SELF_BRANCH_A: u64 = 0xE2400FFFFF87000F;
-        let backing = {
-            let mut v = vec![0u8; 0x1000];
-            v[0x80..0x88].copy_from_slice(&SELF_BRANCH_A.to_le_bytes());
-            Arc::new(v)
-        };
-        let reader: GpuMemoryReader = Arc::new(move |gpu_addr, dst| {
-            if gpu_addr < vertex_addr {
-                return;
-            }
-            let offset = (gpu_addr - vertex_addr) as usize;
-            if offset >= backing.len() {
-                return;
-            }
-            let n = (offset + dst.len()).min(backing.len()) - offset;
-            dst[..n].copy_from_slice(&backing[offset..offset + n]);
-        });
-
-        let mut cache = ShaderCache::new_for_test();
-        cache.set_gpu_memory_reader(reader);
-
-        // Slot 1 = VertexB; the rest are disabled.
-        cache.set_pending_program_addresses([0, vertex_addr, 0, 0, 0, 0]);
-
-        let pipeline = cache
-            .current_graphics_pipeline()
-            .expect("pipeline must be created");
-
-        // glsl_sources[0] is the vertex slot.
-        let vertex_glsl = pipeline.glsl_sources[0]
-            .as_ref()
-            .expect("vertex GLSL must be populated");
-        assert!(
-            !vertex_glsl.is_empty(),
-            "compile_shader_glsl produced empty source"
-        );
-        // Other stages remain `None`.
-        for slot in 1..NUM_STAGES {
-            assert!(
-                pipeline.glsl_sources[slot].is_none(),
-                "stage slot {} should be None",
-                slot
-            );
-        }
-    }
-
-    #[test]
-    fn distinct_program_addresses_create_distinct_cache_entries() {
-        let mut cache = ShaderCache::new_for_test();
-
-        cache.set_pending_program_addresses([0x1000, 0, 0, 0, 0, 0]);
-        cache.current_graphics_pipeline().expect("first pipeline");
-        assert_eq!(cache.graphics_pipeline_count(), 1);
-
-        // Same addresses again — must hit the cache, not grow it.
-        cache.set_pending_program_addresses([0x1000, 0, 0, 0, 0, 0]);
-        cache
-            .current_graphics_pipeline()
-            .expect("first pipeline (cached)");
-        assert_eq!(cache.graphics_pipeline_count(), 1);
-
-        // Different addresses — must create a second cache entry.
-        cache.set_pending_program_addresses([0x2000, 0, 0, 0, 0, 0]);
-        cache.current_graphics_pipeline().expect("second pipeline");
-        assert_eq!(cache.graphics_pipeline_count(), 2);
-    }
-
-    #[test]
-    fn create_graphics_pipeline_from_shared_environments_emits_glsl_for_vertex_stage() {
-        let vertex_addr: u64 = 0x20_0000_0000;
-        const SELF_BRANCH_A: u64 = 0xE2400FFFFF87000F;
-        let backing = {
-            let mut v = vec![0u8; 0x1000];
-            v[0x80..0x88].copy_from_slice(&SELF_BRANCH_A.to_le_bytes());
-            Arc::new(v)
-        };
-        let reader: GpuMemoryReader = Arc::new(move |gpu_addr, dst| {
-            if gpu_addr < vertex_addr {
-                return;
-            }
-            let offset = (gpu_addr - vertex_addr) as usize;
-            if offset >= backing.len() {
-                return;
-            }
-            let n = (offset + dst.len()).min(backing.len()) - offset;
-            dst[..n].copy_from_slice(&backing[offset..offset + n]);
-        });
-
-        let mut cache = ShaderCache::new_for_test();
-        cache.graphics_key.unique_hashes[1] = 0x1234;
-
-        let mut environments = GraphicsEnvironments::default();
-        *environments.envs[1].generic_environment_mut() = GenericEnvironment::new()
-            .with_gpu_read(reader)
-            .with_program(vertex_addr, 0)
-            .with_stage(ShaderStage::VertexB);
-
-        let pipeline = cache
-            .create_graphics_pipeline_from_environments(&mut environments)
-            .expect("pipeline must be created");
-        let vertex_glsl = pipeline.glsl_sources[0]
-            .as_ref()
-            .expect("vertex GLSL must be populated");
-        assert!(!vertex_glsl.is_empty());
     }
 
     #[test]
@@ -2164,6 +1401,12 @@ mod tests {
         assert_eq!(pipeline.key.xfb_state.layouts[0].varying_count, 5);
         assert_eq!(pipeline.key.xfb_state.layouts[0].stride, 0x20);
         assert_eq!(pipeline.key.xfb_state.varyings[0][0].raw(), 0x0403_0201);
+        assert!(
+            pipeline.glsl_sources[0]
+                .as_ref()
+                .is_some_and(|source| !source.is_empty()),
+            "shared GraphicsEnvironment path must emit VertexB GLSL"
+        );
     }
 
     #[test]
@@ -2222,17 +1465,5 @@ mod tests {
             !compiled.source.contains("frag_color7"),
             "ShaderCache must pass its stored profile to GLSL compilation"
         );
-    }
-
-    #[test]
-    fn current_graphics_pipeline_placeholder_is_built() {
-        let mut cache = ShaderCache::new_for_test();
-        let pipeline = cache
-            .current_graphics_pipeline()
-            .expect("placeholder pipeline");
-        // Default-constructed `GraphicsPipeline` reports built=true so the
-        // synchronous-compilation path in `RasterizerOpenGL::draw` can
-        // proceed without blocking on an async build fence.
-        assert!(pipeline.is_built());
     }
 }

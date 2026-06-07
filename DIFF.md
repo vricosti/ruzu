@@ -628,25 +628,22 @@
 ## 2026-06-07 — video_core/src/renderer_opengl/gl_shader_cache.rs and video_core/src/renderer_opengl/gl_rasterizer.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_shader_cache.cpp
 
 ### Intentional differences
-- The reduced address-only OpenGL graphics-pipeline path (`current_graphics_pipeline`, `current_graphics_pipeline_slow_path`, `create_graphics_pipeline`, `pending_program_addresses`, and the stored callback reader) is now compiled only for Rust unit tests. Runtime OpenGL draw uses `current_graphics_pipeline_with_shared_cache(...)`, which refreshes stages through the shared `ShaderCache` and compiles from `GraphicsEnvironment` owners, matching upstream `ShaderCache::CreateGraphicsPipeline() -> GetGraphicsEnvironments(...)`.
-- `RasterizerOpenGL::set_gpu_memory_reader(...)` still accepts the renderer bridge callback for compatibility with older non-owner paths, but the OpenGL shader cache treats it as a runtime no-op. This preserves the existing renderer trait surface while preventing runtime shader compilation from depending on direct `GenericEnvironment` callback construction.
+- The reduced address-only OpenGL graphics-pipeline path (`current_graphics_pipeline`, `current_graphics_pipeline_slow_path`, `create_graphics_pipeline`, `pending_program_addresses`, and the stored callback reader) was removed from `gl_shader_cache.rs`. Runtime and tests now use `current_graphics_pipeline_with_shared_cache(...)` or explicit `GraphicsEnvironments`, which refresh stages through the shared `ShaderCache` and compiles from `GraphicsEnvironment` owners, matching upstream `ShaderCache::CreateGraphicsPipeline() -> GetGraphicsEnvironments(...)`.
+- `RasterizerOpenGL::set_gpu_memory_reader(...)` still accepts the renderer bridge callback for compatibility paths outside OpenGL shader compilation. The OpenGL shader cache no longer stores or consumes this callback.
 
 ### Unintentional differences (to fix)
-- The test-only reduced fallback still exists because several unit tests exercise OpenGL pipeline insertion without constructing full Maxwell/channel/shared-cache owners. Upstream has no equivalent address-only fallback.
+- None identified for the removed OpenGL address-only fallback path.
 
 ### Missing items
-- Replace the remaining reduced unit-test fallback with upstream-shaped shared-cache fixtures, then remove the test-only `GpuMemoryReader` / `pending_program_addresses` path from `gl_shader_cache.rs` completely.
+- Port the fuller upstream `CreateGraphicsPipeline(..., envs, ...)` object flow so Rust no longer emits per-stage GLSL directly from cached code slices.
 
 ### Binary layout verification
-- N/A: OpenGL shader-cache owner routing and test-only cfg gating only. No guest-visible raw payload layout changed.
+- N/A: OpenGL shader-cache owner routing only. No guest-visible raw payload layout changed.
 
 ### Tests
 - Re-read upstream `renderer_opengl/gl_shader_cache.cpp::CurrentGraphicsPipeline`, `CurrentGraphicsPipelineSlowPath`, and `CreateGraphicsPipeline`.
 - Re-read upstream `video_core/shader_cache.cpp::RefreshStages` and `GetGraphicsEnvironments`.
 - `cargo check -p video_core`
-- `cargo test -p video_core create_graphics_pipeline_with_reader_emits_glsl_for_vertex_stage -- --nocapture`
-- `cargo test -p video_core current_graphics_pipeline_populates_cache_on_first_call -- --nocapture`
-- `cargo test -p video_core build_graphics_key_uses_pending_program_addresses -- --nocapture`
 - `cargo test -p video_core shared_cache_path_populates_live_graphics_key_fields_from_maxwell -- --nocapture`
 - `cargo fmt --check`
 - `git diff --check`
@@ -1166,7 +1163,7 @@
 - None identified for the audited production graphics/compute shader-environment memory-owner construction slice.
 
 ### Missing items
-- Continue the later shader-environment branch work: remove the remaining test-only OpenGL shader-cache fallback after its unit fixtures are rewritten around upstream-shaped `GraphicsEnvironment` owners, then remove the nullable compatibility callback transport from reduced construction paths.
+- Continue the later shader-environment branch work: remove the nullable compatibility callback transport from reduced construction paths once every remaining test/reduced caller has an upstream-shaped memory owner.
 
 ### Binary layout verification
 - N/A: shader environment memory-owner routing only. No guest-visible raw payload layout changed.
@@ -9731,10 +9728,10 @@
 
 ### Intentional differences
 - Rust still uses explicit owner-local helpers (`with_stage(...)`, `cached_code_slice()`, `generic_environment[_mut]()`) instead of literal C++ inheritance/member access. This is the direct Rust adaptation for keeping owner boundaries inside the matching file.
-- `gl_shader_cache.rs` still builds a reduced direct `GenericEnvironment` for its GLSL path instead of calling the full upstream `CreateGraphicsPipeline(..., std::span<Shader::Environment* const>)` owner graph, because the surrounding OpenGL pipeline cache remains structurally reduced.
+- `gl_shader_cache.rs` now obtains `GraphicsEnvironment` owners through `GraphicsEnvironments`, but Rust still exposes cached-code helper slices because the recompiler bridge does not yet consume a literal `Environment&` the way upstream `TranslateProgram(...)` does.
 
 ### Missing items
-- `gl_shader_cache.rs` still uses a reduced direct `GenericEnvironment` compilation path rather than the literal upstream `GraphicsEnvironment` / `GraphicsEnvironments::Span()` pipeline-owner path.
+- Port the full upstream `TranslateProgram(...)` / `IR::Program` staging path so `gl_shader_cache.rs` no longer needs cached-code helper slices from `GenericEnvironment`.
 - `shader_environment.rs` still preserves Rust-only fallback snapshot fields and callback-driven memory ownership.
 
 ### Binary layout verification
@@ -9851,14 +9848,12 @@
 ## 2026-04-29 — `video_core/src/renderer_opengl/gl_shader_cache.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_shader_cache.h` and `/home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_shader_cache.cpp` (shared shader-owner integration follow-up)
 
 ### Intentional differences
-- Rust still keeps the old local fallback path based on `pending_program_addresses` plus `GpuMemoryReader` for reduced unit tests only. Upstream has no such fallback because `OpenGL::ShaderCache` directly inherits the shared `VideoCommon::ShaderCache` owner.
 - Rust still uses composition (`SharedShaderCache` passed into `current_graphics_pipeline_with_shared_cache(...)`) instead of literal inheritance. This preserves the upstream owner boundary while fitting the existing Rust split.
 
 ### Missing items
 - Continue auditing any OpenGL graphics-key fields beyond the currently populated live Maxwell fields (`early_z`, topology, tessellation, XFB, alpha-test/legacy, and app-stage) against upstream `CurrentGraphicsPipeline()`.
 - `create_graphics_pipeline_with_shared_cache(...)` still uses the reduced Rust `compile_shader_glsl(...)` bridge over `cached_code_slice()` rather than the full upstream `TranslateProgram(...)` / `EmitGLSL` / `EmitGLASM` / `EmitSPIRV` owner graph in this file.
 - The runtime shared-owner path still does not serialize newly built graphics pipelines to disk the way upstream `CreateGraphicsPipeline()` does after `GetGraphicsEnvironments(...)`.
-- The reduced local fallback path (`set_pending_program_addresses`, test-backed `set_gpu_memory_reader`, `create_graphics_pipeline()`) still exists under `#[cfg(test)]` and remains structurally below literal upstream parity.
 
 ### Binary layout verification
 - PASS: this pass changed pipeline-owner control flow only; no serialized payload or guest-visible raw layout changed.
@@ -9909,7 +9904,6 @@
 ### Missing items
 - `RasterizerOpenGL` / `ShaderCache` ownership is still reduced: Rust reaches the draw-manager topology through `Maxwell3D::draw_manager_topology()` instead of the literal upstream `maxwell3d->draw_manager->GetDrawState().topology` pointer graph.
 - the active path still lacks the fuller upstream `CreateGraphicsPipeline()` runtime graph and disk-serialization edge.
-- the reduced local fallback path (`pending_program_addresses` / `GpuMemoryReader`) still exists for unit tests.
 
 ### Binary layout verification
 - PASS: `GraphicsPipelineKey` field ordering was unchanged in this pass. The focused runtime test now exercises the newly populated bitfield word and XFB payload together.
@@ -12079,7 +12073,6 @@
 
 ### Intentional differences
 - Rust compiles the merged dual-vertex program directly to GLSL source because `GraphicsPipeline` currently stores GLSL strings, while upstream stores `IR::Program` objects first and emits them in a later loop. The VertexA+VertexB merge point now matches upstream semantically when both hashes are present.
-- The reduced fallback path built from `pending_program_addresses` also uses the dual-vertex compiler when both VertexA and VertexB addresses are available.
 
 ### Unintentional differences (to fix)
 - The Rust OpenGL cache still lacks upstream GLASM/SPIR-V backend selection, layer passthrough generation, and full `IR::Program` staging before emission.

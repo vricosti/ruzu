@@ -2616,14 +2616,12 @@ impl RasterizerOpenGL {
 
     /// Install the compatibility GPU memory reader published by the renderer.
     ///
-    /// The OpenGL shader cache keeps this hook as a no-op in runtime builds;
-    /// actual graphics pipeline creation now goes through the shared
-    /// `ShaderCache` / `GraphicsEnvironment` owner graph. The reader is still
-    /// stored here for compatibility paths that have not yet been fully moved
-    /// to channel-owned `MemoryManager` access.
+    /// Actual graphics pipeline creation goes through the shared `ShaderCache`
+    /// / `GraphicsEnvironment` owner graph. The reader is still stored here
+    /// for compatibility paths that have not yet been fully moved to
+    /// channel-owned `MemoryManager` access.
     pub fn set_gpu_memory_reader(&mut self, reader: crate::shader_environment::GpuMemoryReader) {
         self.cpu_memory_reader = Some(Arc::clone(&reader));
-        self.gl_shader_cache.set_gpu_memory_reader(reader);
         if let Some(mm) = self.channel_memory_manager.as_ref() {
             self.buffer_cache
                 .set_gpu_memory(Box::new(GpuMemoryAccessAdapter { mm: Arc::clone(mm) }));

@@ -880,9 +880,9 @@ impl RendererBase for RendererOpenGL {
     }
 
     fn set_shader_cache_gpu_reader(&mut self, reader: crate::renderer_base::DeviceMemoryReader) {
-        // The trait's `DeviceMemoryReader` and the shader cache's
-        // `GpuMemoryReader` are the same `Arc<dyn Fn(u64, &mut [u8]) +
-        // Send + Sync>` shape, so we can hand it straight through.
+        // The OpenGL shader cache now compiles graphics pipelines through the
+        // channel-owned shared shader cache. Keep forwarding this reader to
+        // the rasterizer for compatibility paths outside shader compilation.
         self.rasterizer.set_gpu_memory_reader(reader);
     }
 
