@@ -1815,9 +1815,10 @@ pub struct RasterizerOpenGL {
     /// `bind_channel`. Used to build the `GpuMemoryAccess` adapter for the
     /// buffer cache.
     channel_memory_manager: Option<Arc<parking_lot::Mutex<crate::memory_manager::MemoryManager>>>,
-    /// CPU/device memory reader callback, set via the shader cache's
-    /// `set_gpu_memory_reader` path. Re-used for the buffer cache's
-    /// `DeviceMemoryAccess` and for `GpuMemoryAccess::read_u32/u64`.
+    /// Compatibility GPU-memory reader callback installed by the renderer
+    /// bridge. Runtime OpenGL shader compilation uses the channel
+    /// `MemoryManager` through the shared shader cache; this callback remains
+    /// available for reduced/non-owner paths and older buffer-cache adapters.
     cpu_memory_reader: Option<crate::shader_environment::GpuMemoryReader>,
     /// Raw guest/device memory reader installed through RendererBase.
     /// This is distinct from `cpu_memory_reader`: the latter accepts GPU VAs
@@ -2613,14 +2614,13 @@ impl RasterizerOpenGL {
         self.invalidate_gpu_cache_callback = Some(callback);
     }
 
-    /// Install the GPU memory reader used by the OpenGL shader cache.
+    /// Install the compatibility GPU memory reader published by the renderer.
     ///
-    /// Forwards to [`gl_shader_cache::ShaderCache::set_gpu_memory_reader`].
-    /// The reader takes a *GPU virtual address* (already translated through
-    /// `MemoryManager`) and writes `buf.len()` bytes into the destination
-    /// slice. With the reader installed, `current_graphics_pipeline` will
-    /// invoke `shader_recompiler::compile_shader_glsl` for each enabled
-    /// stage on first lookup, instead of returning a placeholder pipeline.
+    /// The OpenGL shader cache keeps this hook as a no-op in runtime builds;
+    /// actual graphics pipeline creation now goes through the shared
+    /// `ShaderCache` / `GraphicsEnvironment` owner graph. The reader is still
+    /// stored here for compatibility paths that have not yet been fully moved
+    /// to channel-owned `MemoryManager` access.
     pub fn set_gpu_memory_reader(&mut self, reader: crate::shader_environment::GpuMemoryReader) {
         self.cpu_memory_reader = Some(Arc::clone(&reader));
         self.gl_shader_cache.set_gpu_memory_reader(reader);
