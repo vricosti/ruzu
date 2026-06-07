@@ -625,6 +625,35 @@
 - Manual MK8D 25s isolated-XDG host-thread-all smoke after switching `SessionRequestManager` to a weak `ServerManager` owner (`/tmp/ruzu_mk8d_ipc_weak_owner_host_all_smoke_1780868703.log`, `RUZU_SERVER_THREAD_IPC_ALL=1`): reached `NotifyRunning`, no panic/`BreakLoopNullPc`, no `svcBreak`/`SetTerminateResult`, no `missing_server_manager_owner`, and no `receive_request_hle failed` warnings. Warn-level logging did not emit audio or presentation markers in this short run.
 
 ## 2026-06-07 — core/src/hle/kernel/k_client_session.rs, core/src/hle/kernel/k_session.rs, core/src/hle/kernel/k_server_session.rs, core/src/hle/kernel/k_thread.rs, core/src/hle/kernel/k_scheduler.rs, and core/src/hle/kernel/svc/svc_ipc.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/k_client_session.cpp, /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/k_session.cpp, /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/k_server_session.cpp, /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/k_thread.cpp, /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/k_scheduler.cpp, and /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/svc/svc_ipc.cpp
+## 2026-06-07 — shader_recompiler/src/ir_opt/position_pass.rs and shader_recompiler/src/pipeline_cache.rs vs /home/vricosti/Dev/emulators/zuyu/src/shader_recompiler/ir_opt/position_pass.cpp and /home/vricosti/Dev/emulators/zuyu/src/shader_recompiler/frontend/maxwell/translate_program.cpp
+
+### Intentional differences
+- Ported upstream `Optimization::PositionPass(Environment&, IR::Program&)`: the pass now runs only for `VertexB` when `ReadViewportTransformState()` is false, sets `program.info.uses_render_area`, and rewrites `PositionX`/`PositionY` `SetAttribute` values through `FPFma(value, FPRecip(RenderAreaWidth/Height) * 2.0, -1.0)`.
+- Rust emits explicit `RenderArea` plus `CompositeExtractF32x4(component)` instructions because the current IR builder does not yet expose upstream's `IREmitter::RenderAreaWidth()` / `RenderAreaHeight()` convenience helpers. The generated IR operation sequence is equivalent to upstream's emitter implementation.
+- Rust stores stable instruction slots in `Block` and records replacements as `(block_index, inst_index, attr)` rather than upstream's `IR::Inst*` / `IR::Block*`. This preserves the same delayed-rewrite behavior without moving existing `InstRef` identities.
+- The pass is wired only into `optimize_program_with_env(...)`, the path that owns a live shader `Environment`, because upstream requires `env.ReadViewportTransformState()`.
+
+### Unintentional differences (to fix)
+- The legacy instruction-slice optimization paths still cannot run `PositionPass` because they do not own an `Environment`; upstream's single `TranslateProgram(..., Environment& env, Flow::CFG& cfg, HostTranslateInfo&)` path has no such split.
+- Upstream still runs `PositionPass` after environment-aware constant propagation and before the remaining full frontend pass sequence; Rust now matches this position for the environment bridge but the broader pass order is still incomplete.
+
+### Missing items
+- Port the upstream-shaped `TranslateProgram` ownership model broadly enough to remove the env-less compatibility optimization paths.
+
+### Binary layout verification
+- N/A: shader IR rewrite and metadata policy only. No guest-visible raw payload layout changed.
+
+### Tests
+- Re-read upstream `ir_opt/position_pass.cpp`, `frontend/ir/ir_emitter.cpp::RenderAreaWidth/RenderAreaHeight`, and `frontend/maxwell/translate_program.cpp::TranslateProgram`.
+- `cargo test -p shader_recompiler position_pass -- --nocapture`
+- `cargo test -p shader_recompiler translate_program_from_env_uses_environment_metadata -- --nocapture`
+- `cargo check -p shader_recompiler`
+- `cargo check -p video_core`
+- `cargo fmt --check`
+- `git diff --check`
+- `cargo build --release --bin ruzu-cmd`
+- MK8D OpenGL smoke, isolated data/cache/config, 90 s timeout: exited by timeout (`rc=124`) with no panic, no `GL Shader Error`, and no `PositionPass not yet implemented` warning in `/tmp/mk8d_position_pass_1780851335.log`.
+
 ## 2026-06-07 — shader_recompiler/src/ir_opt/layer_pass.rs, shader_recompiler/src/ir_opt/mod.rs, and shader_recompiler/src/pipeline_cache.rs vs /home/vricosti/Dev/emulators/zuyu/src/shader_recompiler/ir_opt/layer_pass.cpp and /home/vricosti/Dev/emulators/zuyu/src/shader_recompiler/frontend/maxwell/translate_program.cpp
 
 ### Intentional differences
@@ -688,11 +717,11 @@
 - Geometry passthrough lowering still leaves backend passthrough handling in place when `support_geometry_shader_passthrough` is false; upstream calls `LowerGeometryPassthrough(...)` in this frontend function. The Rust lowering helper is not ported yet, so the bridge only fills passthrough masks/output vertex metadata.
 
 ### Unintentional differences (to fix)
-- Upstream `TranslateProgram(...)` still owns `BuildASL(inst_pool, block_pool, env, cfg, host_info)`, `RemoveUnreachableBlocks`, optional fp/int lowering, environment-aware `PositionPass(env, ...)`, optional rescaling/verification, and `AddNVNStorageBuffers`. Rust's env bridge reuses the current CFG translator and the currently ported pass subset.
+- Upstream `TranslateProgram(...)` still owns `BuildASL(inst_pool, block_pool, env, cfg, host_info)`, `RemoveUnreachableBlocks`, optional fp/int lowering, optional rescaling/verification, and `AddNVNStorageBuffers`. Rust's env bridge reuses the current CFG translator and the currently ported pass subset.
 
 ### Missing items
 - Replace the compatibility instruction-slice API with the upstream-shaped `translate_program` owner that accepts/preuses a `Flow::CFG` equivalent and consumes `Environment` throughout the frontend.
-- Port `LowerGeometryPassthrough`, environment-aware `PositionPass`, `AddNVNStorageBuffers`, and the remaining upstream pass ordering gaps.
+- Port `LowerGeometryPassthrough`, `AddNVNStorageBuffers`, and the remaining upstream pass ordering gaps.
 
 ### Binary layout verification
 - N/A: shader IR construction/policy only. No guest-visible raw payload layout changed.
@@ -735,7 +764,7 @@
 
 ### Unintentional differences (to fix)
 - Upstream `TranslateProgram(...)` owns stage/environment metadata population directly from `Environment&`. Rust now has an explicit `translate_program_from_env_with_host_info(...)` bridge for this metadata, but the older compatibility `translate_program(...)` entry point still accepts only instruction words plus stage.
-- Upstream pass ordering includes environment-aware `ConstantPropagationPass(env, ...)`, `PositionPass(env, ...)`, `TexturePass(env, ...)`, `CollectShaderInfoPass(env, ...)`, optional lowering passes, rescaling, and verification. Rust still uses the currently ported reduced order in `pipeline_cache.rs`, though the current drivers now run `LayerPass` and `VendorWorkaroundPass` after shader-info collection.
+- Upstream pass ordering includes environment-aware `ConstantPropagationPass(env, ...)`, `TexturePass(env, ...)`, `CollectShaderInfoPass(env, ...)`, optional lowering passes, rescaling, and verification. Rust still uses the currently ported reduced order in `pipeline_cache.rs`, though the environment bridge now runs `PositionPass(env, ...)` and the current drivers run `LayerPass` and `VendorWorkaroundPass` after shader-info collection.
 
 ### Missing items
 - Port the upstream-shaped `translate_program` signature that accepts the shader `Environment` owner and prebuilt CFG, then move the full pass ordering into the matching frontend file.
