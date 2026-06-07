@@ -86,9 +86,21 @@ impl Nvdec {
         }
 
         let decoder: Box<dyn DecoderImpl> = match codec {
-            VideoCodec::H264 => Box::new(H264::new(self.id)),
-            VideoCodec::VP8 => Box::new(Vp8::new(self.id)),
-            VideoCodec::VP9 => Box::new(Vp9::new(self.id)),
+            VideoCodec::H264 => Box::new(H264::new(
+                self.id,
+                Arc::clone(&self.memory_manager),
+                Arc::clone(&self.frame_queue),
+            )),
+            VideoCodec::VP8 => Box::new(Vp8::new(
+                self.id,
+                Arc::clone(&self.memory_manager),
+                Arc::clone(&self.frame_queue),
+            )),
+            VideoCodec::VP9 => Box::new(Vp9::new(
+                self.id,
+                Arc::clone(&self.memory_manager),
+                Arc::clone(&self.frame_queue),
+            )),
             _ => {
                 log::error!("Unimplemented codec {:?}", codec);
                 return;
@@ -128,12 +140,7 @@ impl Nvdec {
             );
             match dec.get_current_codec() {
                 VideoCodec::H264 | VideoCodec::VP8 | VideoCodec::VP9 => {
-                    decoder::decode(
-                        dec.as_mut(),
-                        &self.regs,
-                        &self.memory_manager,
-                        &self.frame_queue,
-                    );
+                    decoder::decode(dec.as_mut(), &self.regs);
                 }
                 _ => {
                     log::error!("Unimplemented codec {}", dec.get_current_codec_name());

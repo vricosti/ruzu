@@ -255,7 +255,6 @@ fn maxwell_to_video_core_query(query_type: u32) -> Option<VideoQueryType> {
 /// delegating to the channel's `MemoryManager`.
 struct GpuMemoryAccessAdapter {
     mm: Arc<parking_lot::Mutex<crate::memory_manager::MemoryManager>>,
-    cpu_reader: crate::shader_environment::GpuMemoryReader,
 }
 
 impl crate::buffer_cache::buffer_cache_base::GpuMemoryAccess for GpuMemoryAccessAdapter {
@@ -265,15 +264,13 @@ impl crate::buffer_cache::buffer_cache_base::GpuMemoryAccess for GpuMemoryAccess
 
     fn read_u64(&self, gpu_addr: u64) -> Option<u64> {
         let mut buf = [0u8; 8];
-        let reader = &*self.cpu_reader;
-        self.mm.lock().read_block(gpu_addr, &mut buf, reader);
+        self.mm.lock().read_block(gpu_addr, &mut buf);
         Some(u64::from_le_bytes(buf))
     }
 
     fn read_u32(&self, gpu_addr: u64) -> Option<u32> {
         let mut buf = [0u8; 4];
-        let reader = &*self.cpu_reader;
-        self.mm.lock().read_block(gpu_addr, &mut buf, reader);
+        self.mm.lock().read_block(gpu_addr, &mut buf);
         Some(u32::from_le_bytes(buf))
     }
 
@@ -2627,15 +2624,9 @@ impl RasterizerOpenGL {
     pub fn set_gpu_memory_reader(&mut self, reader: crate::shader_environment::GpuMemoryReader) {
         self.cpu_memory_reader = Some(Arc::clone(&reader));
         self.gl_shader_cache.set_gpu_memory_reader(reader);
-        if let (Some(mm), Some(cpu_reader)) = (
-            self.channel_memory_manager.as_ref(),
-            self.cpu_memory_reader.as_ref(),
-        ) {
+        if let Some(mm) = self.channel_memory_manager.as_ref() {
             self.buffer_cache
-                .set_gpu_memory(Box::new(GpuMemoryAccessAdapter {
-                    mm: Arc::clone(mm),
-                    cpu_reader: Arc::clone(cpu_reader),
-                }));
+                .set_gpu_memory(Box::new(GpuMemoryAccessAdapter { mm: Arc::clone(mm) }));
         }
     }
 
@@ -2695,10 +2686,10 @@ impl RasterizerOpenGL {
                     .as_ref()
                     .map(|getter| getter())
                     .unwrap_or(0);
-                mm.write_block_unsafe_owned(gpu_addr + 8, &gpu_ticks.to_le_bytes());
-                mm.write_block_unsafe_owned(gpu_addr, &(payload as u64).to_le_bytes());
+                mm.write_block_unsafe(gpu_addr + 8, &gpu_ticks.to_le_bytes());
+                mm.write_block_unsafe(gpu_addr, &(payload as u64).to_le_bytes());
             } else {
-                mm.write_block_unsafe_owned(gpu_addr, &payload.to_le_bytes());
+                mm.write_block_unsafe(gpu_addr, &payload.to_le_bytes());
             }
         });
         if is_fence {
@@ -3202,7 +3193,7 @@ impl RasterizerInterface for RasterizerOpenGL {
                             if mm.lock().gpu_to_cpu_address(gpu_addr).is_none() {
                                 return false;
                             }
-                            mm.lock().read_block(gpu_addr, out, reader.as_ref());
+                            mm.lock().read_block(gpu_addr, out);
                             true
                         }),
                         false,
@@ -3593,7 +3584,7 @@ impl RasterizerInterface for RasterizerOpenGL {
                 let mut buf = [0u8; 4];
                 record_gl_draw_stage_detail(draw_seq, 54, stage as u64, detail);
                 record_gl_draw_stage_detail(draw_seq, 55, stage as u64, detail);
-                mm.read_block(addr, &mut buf, &**reader);
+                mm.read_block(addr, &mut buf);
                 record_gl_draw_stage_detail(draw_seq, 56, stage as u64, detail);
                 Some(u32::from_le_bytes(buf))
             };
@@ -3688,7 +3679,7 @@ impl RasterizerInterface for RasterizerOpenGL {
                                         if mm.gpu_to_cpu_address(gpu_addr).is_none() {
                                             return false;
                                         }
-                                        mm.read_block(gpu_addr, out, &**reader);
+                                        mm.read_block(gpu_addr, out);
                                         true
                                     },
                                 );
@@ -3856,7 +3847,7 @@ impl RasterizerInterface for RasterizerOpenGL {
                                             if mm.gpu_to_cpu_address(gpu_addr).is_none() {
                                                 return false;
                                             }
-                                            mm.read_block(gpu_addr, out, &**reader);
+                                            mm.read_block(gpu_addr, out);
                                             true
                                         },
                                     )
@@ -3919,7 +3910,7 @@ impl RasterizerInterface for RasterizerOpenGL {
                             if mm.gpu_to_cpu_address(gpu_addr).is_none() {
                                 return false;
                             }
-                            mm.read_block(gpu_addr, out, &**reader);
+                            mm.read_block(gpu_addr, out);
                             true
                         },
                         &mut |gpu_addr| mm.gpu_to_cpu_address(gpu_addr).is_some(),
@@ -3959,7 +3950,7 @@ impl RasterizerInterface for RasterizerOpenGL {
                             if mm.gpu_to_cpu_address(gpu_addr).is_none() {
                                 return false;
                             }
-                            mm.read_block(gpu_addr, out, &**reader);
+                            mm.read_block(gpu_addr, out);
                             true
                         },
                     );
@@ -4944,7 +4935,7 @@ impl RasterizerInterface for RasterizerOpenGL {
                                 std::cmp::min(trace_cbuf_vec4_count * 16, binding.size as usize);
                             let mut bytes = vec![0u8; read_size];
                             if read_size != 0 {
-                                mm.read_block(binding.address, &mut bytes, &**reader);
+                                mm.read_block(binding.address, &mut bytes);
                                 for (index, word) in first_words.iter_mut().enumerate() {
                                     let start = index * 4;
                                     if start + 4 <= read_size {
@@ -5700,7 +5691,7 @@ impl RasterizerInterface for RasterizerOpenGL {
                         let read_bytes = ib_count as usize * format_size;
                         if read_bytes > 0 && read_bytes <= 64 {
                             let mut buf = vec![0u8; read_bytes];
-                            mm.lock().read_block(read_addr, &mut buf, &**reader);
+                            mm.lock().read_block(read_addr, &mut buf);
                             let mut indices = [0u64; 6];
                             for i in 0..ib_count as usize {
                                 let off = i * format_size;
@@ -7783,7 +7774,7 @@ impl RasterizerInterface for RasterizerOpenGL {
             );
         }
         if cpu_addr.is_none() {
-            mm.write_block_owned(address, &memory[..copy_size]);
+            mm.write_block(address, &memory[..copy_size]);
             if std::env::var_os("RUZU_TRACE_INLINE_TO_MEMORY").is_some() {
                 log::info!(
                     "RasterizerOpenGL::accelerate_inline_to_memory fallback_write_block gpu=0x{:X} size={}",
@@ -7793,7 +7784,7 @@ impl RasterizerInterface for RasterizerOpenGL {
             }
             return;
         }
-        mm.write_block_unsafe_owned(address, &memory[..copy_size]);
+        mm.write_block_unsafe(address, &memory[..copy_size]);
         let cpu_addr = cpu_addr.unwrap();
         if !self
             .buffer_cache
@@ -7839,15 +7830,10 @@ impl RasterizerInterface for RasterizerOpenGL {
             }
             self.channel_memory_manager = Some(Arc::clone(mm));
 
-            // If readers were installed before bind_channel, install the
-            // buffer-cache memory adapters now.
-            if let Some(ref cpu_reader) = self.cpu_memory_reader {
-                self.buffer_cache
-                    .set_gpu_memory(Box::new(GpuMemoryAccessAdapter {
-                        mm: Arc::clone(mm),
-                        cpu_reader: Arc::clone(cpu_reader),
-                    }));
-            }
+            // The buffer cache reads through the channel's upstream-shaped
+            // MemoryManager owner.
+            self.buffer_cache
+                .set_gpu_memory(Box::new(GpuMemoryAccessAdapter { mm: Arc::clone(mm) }));
             if let Some(ref device_reader) = self.device_memory_reader {
                 self.buffer_cache
                     .set_device_memory(Box::new(DeviceMemoryAccessAdapter {
@@ -7867,19 +7853,33 @@ impl RasterizerInterface for RasterizerOpenGL {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
     use crate::memory_manager::MemoryManager;
     use common::settings;
     use common::settings_enums::GpuAccuracy;
 
-    fn install_query_memory_manager(
-        rast: &mut RasterizerOpenGL,
-        writes: Arc<std::sync::Mutex<Vec<(u64, Vec<u8>)>>>,
-    ) {
-        let mut mm = MemoryManager::new(0);
+    fn install_query_memory_manager(rast: &mut RasterizerOpenGL) -> Vec<u8> {
+        let device_memory = Arc::new(MaxwellDeviceMemoryManager::default());
+        let mut backing = vec![0u8; 0x10000];
+        device_memory.smmu_set_physical_base_for_test(backing.as_ptr() as usize);
+        device_memory.smmu_map_with_cpu_backing(
+            0x9000_1000,
+            backing.as_mut_ptr(),
+            0x4000_0000,
+            backing.len(),
+            5,
+            true,
+        );
+
+        let mut mm = MemoryManager::new_with_geometry_and_device_memory(
+            0,
+            Arc::clone(&device_memory),
+            32,
+            0x1_0000_0000,
+            16,
+            12,
+        );
         mm.map(0x1000, 0x9000_1000, 0x10000, 0, false);
-        mm.set_guest_memory_writer(Arc::new(move |addr, data| {
-            writes.lock().unwrap().push((addr, data.to_vec()));
-        }));
         let mm = Arc::new(parking_lot::Mutex::new(mm));
         let mut channel = crate::control::channel_state::ChannelState::new(1);
         channel.program_id = 0xCAFE;
@@ -7887,26 +7887,23 @@ mod tests {
         rast.channel_memory_manager = Some(Arc::clone(&mm));
         rast.query_cache.create_channel(&channel);
         rast.query_cache.bind_to_channel(channel.bind_id);
+        backing
     }
 
     #[test]
     fn query_fence_defers_guest_write_until_release() {
         let syncpoints = Arc::new(SyncpointManager::new());
         let mut rast = RasterizerOpenGL::new_for_test(syncpoints);
-        let writes = Arc::new(std::sync::Mutex::new(Vec::<(u64, Vec<u8>)>::new()));
-        install_query_memory_manager(&mut rast, Arc::clone(&writes));
+        let backing = install_query_memory_manager(&mut rast);
         rast.set_gpu_ticks_getter(Arc::new(|| 0));
 
         rast.query(0x1000, 0, QueryPropertiesFlags::IS_A_FENCE, 0x1234_5678, 0);
 
-        assert!(writes.lock().unwrap().is_empty());
+        assert_eq!(&backing[0..4], &[0; 4]);
 
         rast.release_fences(true);
 
-        let writes = writes.lock().unwrap();
-        assert_eq!(writes.len(), 1);
-        assert_eq!(writes[0].0, 0x9000_1000);
-        assert_eq!(writes[0].1, 0x1234_5678u32.to_le_bytes().to_vec());
+        assert_eq!(&backing[0..4], &0x1234_5678u32.to_le_bytes());
     }
 
     #[test]
@@ -7994,8 +7991,7 @@ mod tests {
     fn query_non_fence_payload_fallback_writes_immediately_and_preserves_payload() {
         let syncpoints = Arc::new(SyncpointManager::new());
         let mut rast = RasterizerOpenGL::new_for_test(syncpoints);
-        let writes = Arc::new(std::sync::Mutex::new(Vec::<(u64, Vec<u8>)>::new()));
-        install_query_memory_manager(&mut rast, Arc::clone(&writes));
+        let backing = install_query_memory_manager(&mut rast);
         rast.set_gpu_ticks_getter(Arc::new(|| 0));
 
         rast.query(
@@ -8006,18 +8002,14 @@ mod tests {
             0,
         );
 
-        let writes = writes.lock().unwrap();
-        assert_eq!(writes.len(), 1);
-        assert_eq!(writes[0].0, 0x9000_3000);
-        assert_eq!(writes[0].1, 0xCAFE_BABEu32.to_le_bytes().to_vec());
+        assert_eq!(&backing[0x2000..0x2004], &0xCAFE_BABEu32.to_le_bytes());
     }
 
     #[test]
     fn query_has_timeout_payload_fallback_writes_immediately_and_preserves_payload() {
         let syncpoints = Arc::new(SyncpointManager::new());
         let mut rast = RasterizerOpenGL::new_for_test(syncpoints);
-        let writes = Arc::new(std::sync::Mutex::new(Vec::<(u64, Vec<u8>)>::new()));
-        install_query_memory_manager(&mut rast, Arc::clone(&writes));
+        let backing = install_query_memory_manager(&mut rast);
         rast.set_gpu_ticks_getter(Arc::new(|| 0x0123_4567_89AB_CDEF));
 
         rast.query(
@@ -8028,20 +8020,18 @@ mod tests {
             0,
         );
 
-        let writes = writes.lock().unwrap();
-        assert_eq!(writes.len(), 2);
-        assert_eq!(writes[0].0, 0x9000_4008);
-        assert_eq!(writes[0].1, 0x0123_4567_89AB_CDEFu64.to_le_bytes().to_vec());
-        assert_eq!(writes[1].0, 0x9000_4000);
-        assert_eq!(writes[1].1, 0xABCD_EF01u64.to_le_bytes().to_vec());
+        assert_eq!(&backing[0x3000..0x3008], &0xABCD_EF01u64.to_le_bytes());
+        assert_eq!(
+            &backing[0x3008..0x3010],
+            &0x0123_4567_89AB_CDEFu64.to_le_bytes()
+        );
     }
 
     #[test]
     fn query_fallback_non_payload_fence_writes_one_after_release() {
         let syncpoints = Arc::new(SyncpointManager::new());
         let mut rast = RasterizerOpenGL::new_for_test(syncpoints);
-        let writes = Arc::new(std::sync::Mutex::new(Vec::<(u64, Vec<u8>)>::new()));
-        install_query_memory_manager(&mut rast, Arc::clone(&writes));
+        let backing = install_query_memory_manager(&mut rast);
 
         rast.query(
             0x5000,
@@ -8051,14 +8041,11 @@ mod tests {
             0,
         );
 
-        assert!(writes.lock().unwrap().is_empty());
+        assert_eq!(&backing[0x4000..0x4004], &[0; 4]);
 
         rast.release_fences(true);
 
-        let writes = writes.lock().unwrap();
-        assert_eq!(writes.len(), 1);
-        assert_eq!(writes[0].0, 0x9000_5000);
-        assert_eq!(writes[0].1, 1u32.to_le_bytes().to_vec());
+        assert_eq!(&backing[0x4000..0x4004], &1u32.to_le_bytes());
     }
 
     #[test]

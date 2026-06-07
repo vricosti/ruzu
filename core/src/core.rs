@@ -2344,7 +2344,8 @@ impl System {
         let mut system = Self::new();
         // Kernel (provides object/thread ID allocation). Don't call
         // initialize() — that creates timers, physical cores, etc.
-        let kernel = KernelCore::new();
+        let mut kernel = KernelCore::new();
+        kernel.set_system_ref(SystemRef::from_ref(&system));
         // Pre-advance ID counters past values that test setups manually assign
         // to pre-existing threads (typically object_id 1..2, thread_id 1..2).
         // This prevents collision when SVC handlers allocate new IDs.
@@ -2354,9 +2355,16 @@ impl System {
         }
         system.kernel = Some(kernel);
         let service_manager = Arc::new(StdMutex::new(ServiceManager::new()));
-        // Register "sm:" port so connect_to_named_port tests work.
+        // Register "sm:" port so connect_to_named_port tests work without
+        // entering the blocking SM ServerManager event loop.
         let sys_ref = SystemRef::from_ref(&system);
-        crate::hle::service::sm::sm::loop_process(&service_manager, sys_ref);
+        let sm_server_manager =
+            crate::hle::service::sm::sm::setup_sm_for_test(&service_manager, sys_ref);
+        system
+            .kernel
+            .as_ref()
+            .unwrap()
+            .track_server_manager_for_test(sm_server_manager);
         system.service_manager = Some(service_manager);
         system
     }

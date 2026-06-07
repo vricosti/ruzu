@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 
 use crate::hle::kernel::k_memory_block::KMemoryPermission;
+use crate::hle::kernel::k_process::ProcessLock;
 use crate::hle::service::nvdrv::core::container::{Container, SessionId};
 use crate::hle::service::nvdrv::core::nvmap as nvmap_core;
 use crate::hle::service::nvdrv::devices::nvdevice::NvDevice;
@@ -113,6 +114,195 @@ fn record_nvmap_history(event: NvmapHistoryEvent) {
     );
 }
 
+fn trace_nvmap_caller(kind: &str, fd: DeviceFD, handle: u32, size: u64, address: u64) {
+    if std::env::var_os("RUZU_TRACE_NVMAP_CALLER").is_none() {
+        return;
+    }
+
+    let (tid, pc, lr, sp, r0, r1) = crate::hle::kernel::kernel::get_current_thread_pointer()
+        .map_or((0, 0, 0, 0, 0, 0), |thread| {
+            let thread = thread.lock().unwrap();
+            (
+                thread.get_thread_id(),
+                thread.thread_context.pc,
+                thread.thread_context.lr,
+                thread.thread_context.sp,
+                thread.thread_context.r[0],
+                thread.thread_context.r[1],
+            )
+        });
+    log::warn!(
+        "[NVMAP_CALLER] kind={} fd={} handle=0x{:X} size=0x{:X} addr=0x{:X} tid={} pc=0x{:X} lr=0x{:X} sp=0x{:X} r0=0x{:X} r1=0x{:X}",
+        kind,
+        fd,
+        handle,
+        size,
+        address,
+        tid,
+        pc,
+        lr,
+        sp,
+        r0,
+        r1
+    );
+}
+
+fn trace_nvmap_stack(process: &ProcessLock, kind: &str, handle: u32) {
+    if std::env::var_os("RUZU_TRACE_NVMAP_STACK").is_none() {
+        return;
+    }
+    if let Ok(raw_handle) = std::env::var("RUZU_TRACE_NVMAP_STACK_HANDLE") {
+        let trimmed = raw_handle.trim();
+        let parsed = trimmed
+            .strip_prefix("0x")
+            .or_else(|| trimmed.strip_prefix("0X"))
+            .and_then(|hex| u32::from_str_radix(hex, 16).ok())
+            .or_else(|| trimmed.parse::<u32>().ok());
+        if parsed != Some(handle) {
+            return;
+        }
+    }
+
+    let Some(thread) = crate::hle::kernel::kernel::get_current_thread_pointer() else {
+        return;
+    };
+    let (tid, sp) = {
+        let thread = thread.lock().unwrap();
+        (thread.get_thread_id(), thread.thread_context.sp)
+    };
+    if sp == 0 {
+        return;
+    }
+
+    let words = {
+        let process = process.lock().unwrap();
+        let Some(memory) = process.get_memory() else {
+            return;
+        };
+        drop(process);
+        let memory = memory.lock().unwrap();
+        let mut words = [0u32; 64];
+        for (index, word) in words.iter_mut().enumerate() {
+            *word = memory.read_32(sp.wrapping_add((index * 4) as u64));
+        }
+        words
+    };
+    let current_frame_60 = words[0x60 / 4];
+    let current_frame_ac = words[0xAC / 4];
+    let current_frame_size =
+        (u64::from(current_frame_60) + (u64::from(current_frame_ac) << 2) + 0xF) & !0xF;
+    log::warn!(
+        "[NVMAP_STACK] kind={} handle=0x{:X} tid={} sp=0x{:X} cur_sp_60=0x{:X} cur_sp_ac=0x{:X} cur_sp_calc=0x{:X} words={:08X?}",
+        kind,
+        handle,
+        tid,
+        sp,
+        current_frame_60,
+        current_frame_ac,
+        current_frame_size,
+        words
+    );
+
+    if std::env::var_os("RUZU_TRACE_NVMAP_STACK_FRAMES").is_some()
+        || std::env::var_os("RUZU_TRACE_NVMAP_STACK_CODE").is_some()
+        || std::env::var_os("RUZU_TRACE_NVMAP_STACK_POINTERS").is_some()
+    {
+        let process = process.lock().unwrap();
+        let Some(memory) = process.get_memory() else {
+            return;
+        };
+        drop(process);
+        let memory = memory.lock().unwrap();
+        let trace_pointers = std::env::var_os("RUZU_TRACE_NVMAP_STACK_POINTERS").is_some();
+        let mut dumped_pointers = Vec::new();
+        let mut dump_pointer = |label: &str, address: u64| {
+            if !trace_pointers
+                || dumped_pointers.contains(&address)
+                || !(0x0100_0000..0xA000_0000).contains(&address)
+            {
+                return;
+            }
+            dumped_pointers.push(address);
+            let mut bytes = [0u8; 64];
+            if memory.read_block_checked_quiet(address, &mut bytes) {
+                let ascii: String = bytes
+                    .iter()
+                    .map(|&byte| {
+                        if (0x20..0x7F).contains(&byte) {
+                            char::from(byte)
+                        } else {
+                            '.'
+                        }
+                    })
+                    .collect();
+                log::warn!(
+                    "[NVMAP_STACK_PTR] handle=0x{:X} tid={} {}=0x{:X} bytes={:02X?} ascii={}",
+                    handle,
+                    tid,
+                    label,
+                    address,
+                    bytes,
+                    ascii
+                );
+            }
+        };
+        for &word in &words {
+            dump_pointer("sp_word", u64::from(word) & !3);
+        }
+        if std::env::var_os("RUZU_TRACE_NVMAP_STACK_FRAMES").is_some() {
+            let mut frames = Vec::new();
+            for &word in &words {
+                let address = u64::from(word) & !3;
+                if (0x3000_0000..0x4000_0000).contains(&address) && !frames.contains(&address) {
+                    frames.push(address);
+                }
+            }
+            for frame in frames {
+                let mut frame_words = [0u32; 48];
+                for (index, word) in frame_words.iter_mut().enumerate() {
+                    *word = memory.read_32(frame.wrapping_add((index * 4) as u64));
+                }
+                let frame_60 = frame_words[0x60 / 4];
+                let frame_ac = frame_words[0xAC / 4];
+                let frame_size = (u64::from(frame_60) + (u64::from(frame_ac) << 2) + 0xF) & !0xF;
+                for &word in &frame_words {
+                    dump_pointer("frame_word", u64::from(word) & !3);
+                }
+                log::warn!(
+                    "[NVMAP_STACK_FRAME] handle=0x{:X} tid={} base=0x{:X} frame_60=0x{:X} frame_ac=0x{:X} frame_calc=0x{:X} words={:08X?}",
+                    handle,
+                    tid,
+                    frame,
+                    frame_60,
+                    frame_ac,
+                    frame_size,
+                    frame_words
+                );
+            }
+        }
+        if std::env::var_os("RUZU_TRACE_NVMAP_STACK_CODE").is_none() {
+            return;
+        }
+        for &word in &words {
+            let address = (word as u64) & !1;
+            if !(0x0010_0000..0x0300_0000).contains(&address) {
+                continue;
+            }
+            let mut bytes = [0u8; 16];
+            let ok = memory.read_block_checked_quiet(address, &mut bytes);
+            if ok {
+                log::warn!(
+                    "[NVMAP_STACK_CODE] handle=0x{:X} tid={} addr=0x{:X} bytes={:02X?}",
+                    handle,
+                    tid,
+                    address,
+                    bytes
+                );
+            }
+        }
+    }
+}
+
 /// The nvmap device file.
 pub struct NvMapDevice {
     file: *const nvmap_core::NvMap,
@@ -170,6 +360,7 @@ impl NvMapDevice {
                     align: 0,
                     heap_mask: 0,
                 });
+                trace_nvmap_caller("IocCreate", 0, params.handle, aligned_size, 0);
                 if Self::should_trace_alloc_loop() {
                     log::info!(
                         "nvmap::IocCreate size=0x{:X} aligned=0x{:X} handle=0x{:X}",
@@ -273,9 +464,17 @@ impl NvMapDevice {
             align: params.align,
             heap_mask: params.heap_mask,
         });
+        trace_nvmap_caller(
+            "IocAlloc",
+            fd,
+            params.handle,
+            handle_size as u64,
+            handle_address as u64,
+        );
+        trace_nvmap_stack(&process, "IocAlloc", params.handle);
         let (lock_result, lock_start_info, lock_end_info) = {
             let mut process_guard = process.lock().unwrap();
-            let lock_result = process_guard
+            let (lock_result, _) = process_guard
                 .page_table
                 .get_base_mut()
                 .lock_for_map_device_address_space(
@@ -283,6 +482,7 @@ impl NvMapDevice {
                     handle_size,
                     KMemoryPermission::NONE,
                     true,
+                    false,
                 );
             let start_info = process_guard.page_table.query_info(handle_address);
             let end_info = handle_size
@@ -343,26 +543,6 @@ impl NvMapDevice {
             // not turn this diagnostic into a guest-visible nvmap failure:
             // MK8D's caller treats that path as fatal and jumps through a null
             // callback. The page-table mismatch remains logged above.
-        }
-
-        {
-            let mut inner = handle.lock_inner();
-            if inner.d_address == 0 {
-                let map_size = inner.aligned_size as usize;
-                if let Some(d_address) =
-                    self.container()
-                        .map_preallocated_area(session_id, inner.address, map_size)
-                {
-                    inner.d_address = d_address;
-                    inner.in_heap = true;
-                    if std::env::var_os("RUZU_TRACE_NVMAP_PIN").is_some() {
-                        eprintln!(
-                            "[NVMAP_PIN] handle=0x{:X} vaddr=0x{:X} size=0x{:X} -> prealloc d_address=0x{:X}",
-                            params.handle, inner.address, map_size, d_address
-                        );
-                    }
-                }
-            }
         }
 
         if Self::should_trace_alloc_loop() {

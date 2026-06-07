@@ -95,6 +95,43 @@ pub fn get_kernel_mut() -> Option<&'static mut KernelCore> {
     }
 }
 
+/// Test-only owner that installs a minimal `KernelCore` in the global kernel
+/// pointer without running full kernel initialization.
+///
+/// Unit tests for page-table allocation paths need upstream-shaped access to
+/// `KernelCore::MemoryManager()`, but `KernelCore::initialize()` starts broad
+/// scheduler/core state that is inappropriate for small native tests.
+#[cfg(test)]
+pub struct ScopedKernelForTest {
+    kernel: Box<KernelCore>,
+    previous: *mut KernelCore,
+}
+
+#[cfg(test)]
+impl ScopedKernelForTest {
+    pub fn new() -> Self {
+        let mut kernel = Box::new(KernelCore::new());
+        let ptr = &mut *kernel as *mut KernelCore;
+        let previous = KERNEL_PTR.swap(ptr, Ordering::AcqRel);
+        Self { kernel, previous }
+    }
+
+    pub fn memory_manager_mut(&mut self) -> &mut KMemoryManager {
+        self.kernel.memory_manager_mut()
+    }
+
+    pub fn kernel_mut(&mut self) -> &mut KernelCore {
+        &mut self.kernel
+    }
+}
+
+#[cfg(test)]
+impl Drop for ScopedKernelForTest {
+    fn drop(&mut self) {
+        KERNEL_PTR.store(self.previous, Ordering::Release);
+    }
+}
+
 /// Returns the kernel's global `KAbstractSchedulerLock`, if the kernel has
 /// been initialized. Matches upstream `KScheduler::GetSchedulerLock(kernel)`.
 ///
@@ -2044,8 +2081,7 @@ impl KernelCore {
         crate::hle::service::server_manager::ServerManager::loop_process_shared(&manager);
     }
 
-    #[cfg(test)]
-    fn track_server_manager_for_test(&self, server_manager: Arc<Mutex<ServerManager>>) {
+    pub(crate) fn track_server_manager_for_test(&self, server_manager: Arc<Mutex<ServerManager>>) {
         self.server_managers.lock().unwrap().push(server_manager);
     }
 

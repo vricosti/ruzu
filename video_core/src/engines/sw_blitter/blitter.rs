@@ -285,7 +285,7 @@ impl SoftwareBlitEngine {
         if !self
             .memory_manager
             .lock()
-            .read_block_owned(src.address(), &mut self.imp.tmp_buffer)
+            .read_block(src.address(), &mut self.imp.tmp_buffer)
         {
             return false;
         }
@@ -390,7 +390,7 @@ impl SoftwareBlitEngine {
         if !self
             .memory_manager
             .lock()
-            .read_block_owned(dst.address(), &mut self.imp.tmp_buffer)
+            .read_block(dst.address(), &mut self.imp.tmp_buffer)
         {
             return false;
         }
@@ -427,11 +427,12 @@ impl SoftwareBlitEngine {
 
         self.memory_manager
             .lock()
-            .write_block_owned(dst.address(), &self.imp.tmp_buffer);
+            .write_block(dst.address(), &self.imp.tmp_buffer);
         true
     }
 }
 
+#[cfg(test)]
 impl Default for SoftwareBlitEngine {
     fn default() -> Self {
         Self::new(Arc::new(Mutex::new(MemoryManager::new(0))))
@@ -442,6 +443,33 @@ impl Default for SoftwareBlitEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
+    use std::sync::Arc;
+
+    fn install_test_device_memory(
+        mm: &mut crate::memory_manager::MemoryManager,
+        backing: &mut [u8],
+    ) {
+        let device_memory = Arc::new(MaxwellDeviceMemoryManager::default());
+        device_memory.smmu_set_physical_base_for_test(backing.as_ptr() as usize);
+        device_memory.smmu_map_with_cpu_backing(
+            0x3000,
+            unsafe { backing.as_mut_ptr().add(0x3000) },
+            0x4000_3000,
+            0x1000,
+            5,
+            true,
+        );
+        device_memory.smmu_map_with_cpu_backing(
+            0x4000,
+            unsafe { backing.as_mut_ptr().add(0x4000) },
+            0x4000_4000,
+            0x1000,
+            5,
+            true,
+        );
+        mm.set_device_memory_manager(device_memory);
+    }
 
     #[test]
     fn test_lerp() {
@@ -491,36 +519,17 @@ mod tests {
         };
         let src_data: Vec<u8> = (0..32).collect();
         let expected = src_data.clone();
-        let writes = std::sync::Arc::new(std::sync::Mutex::new(Vec::<(u64, Vec<u8>)>::new()));
+        let mut backing = vec![0u8; 0x5000];
+        backing[0x3000..0x3000 + src_data.len()].copy_from_slice(&src_data);
         {
             let mut mm = blitter.memory_manager.lock();
+            install_test_device_memory(&mut mm, &mut backing);
             mm.map(0x1000, 0x3000, src_data.len() as u64, 0xFF, false);
             mm.map(0x2000, 0x4000, src_data.len() as u64, 0xFF, false);
         }
-        blitter
-            .memory_manager
-            .lock()
-            .set_guest_memory_reader(std::sync::Arc::new(move |addr, buf| match addr {
-                0x3000 => buf.copy_from_slice(&src_data[..buf.len()]),
-                0x4000 => buf.fill(0),
-                _ => panic!("unexpected read addr 0x{addr:X}"),
-            }));
-        let writes_for_closure = std::sync::Arc::clone(&writes);
-        blitter
-            .memory_manager
-            .lock()
-            .set_guest_memory_writer(std::sync::Arc::new(move |addr, data| {
-                writes_for_closure
-                    .lock()
-                    .unwrap()
-                    .push((addr, data.to_vec()));
-            }));
 
         assert!(blitter.blit(&src, &dst, &config));
 
-        let writes = writes.lock().unwrap();
-        assert_eq!(writes.len(), 1);
-        assert_eq!(writes[0].0, 0x4000);
-        assert_eq!(writes[0].1, expected);
+        assert_eq!(&backing[0x4000..0x4000 + expected.len()], &expected);
     }
 }

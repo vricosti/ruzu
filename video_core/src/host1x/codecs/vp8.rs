@@ -7,7 +7,9 @@
 
 use crate::host1x::codecs::decoder::{DecoderImpl, DecoderState};
 use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
+use crate::host1x::host1x::FrameQueue;
 use crate::host1x::nvdec_common::{NvdecRegisters, VideoCodec};
+use std::sync::Arc;
 
 /// Surface indices used by the VP8 decoder.
 ///
@@ -73,8 +75,12 @@ pub struct Vp8 {
 }
 
 impl Vp8 {
-    pub fn new(id: i32) -> Self {
-        let mut state = DecoderState::new(id);
+    pub fn new(
+        id: i32,
+        memory_manager: Arc<MaxwellDeviceMemoryManager>,
+        frame_queue: Arc<FrameQueue>,
+    ) -> Self {
+        let mut state = DecoderState::new(id, memory_manager, frame_queue);
         state.codec = VideoCodec::VP8;
         state.initialized = state.decode_api.initialize(VideoCodec::VP8);
         Self {
@@ -86,11 +92,7 @@ impl Vp8 {
 }
 
 impl DecoderImpl for Vp8 {
-    fn compose_frame(
-        &mut self,
-        _regs: &NvdecRegisters,
-        _memory_manager: &MaxwellDeviceMemoryManager,
-    ) -> Vec<u8> {
+    fn compose_frame(&mut self, _regs: &NvdecRegisters) -> Vec<u8> {
         // Stubbed — requires memory manager integration to read VP8PictureInfo from
         // memory at picture_info_offset and compose the VP8 frame header per RFC 6386 p.30.
         // Upstream: VP8::ComposeFrame() in video_core/host1x/codecs/vp8.cpp

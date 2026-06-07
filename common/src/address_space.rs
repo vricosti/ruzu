@@ -2,44 +2,70 @@
 //! Status: COMPLET
 //! Derniere synchro: 2026-03-05
 //!
-//! The C++ version is heavily templated. We provide concrete instantiations
-//! matching the ones actually used in zuyu:
+//! The C++ version is heavily templated. This Rust port keeps the allocator
+//! core generic for the bool-backed instantiations currently used by ruzu:
 //!   - FlatAllocator<u32, 0, 32>
+//!   - FlatAllocator64, used for upstream `FlatAllocator<DAddr, 0, 34>`
 
+use std::fmt::{Debug, UpperHex};
+use std::ops::{Add, Sub};
 use std::sync::Mutex;
+
+pub trait FlatVa:
+    Copy + Debug + UpperHex + Ord + PartialEq + Add<Output = Self> + Sub<Output = Self>
+{
+    const ZERO: Self;
+    fn wrapping_add(self, rhs: Self) -> Self;
+}
+
+impl FlatVa for u32 {
+    const ZERO: Self = 0;
+
+    fn wrapping_add(self, rhs: Self) -> Self {
+        u32::wrapping_add(self, rhs)
+    }
+}
+
+impl FlatVa for u64 {
+    const ZERO: Self = 0;
+
+    fn wrapping_add(self, rhs: Self) -> Self {
+        u64::wrapping_add(self, rhs)
+    }
+}
 
 /// Represents a block of memory in the address space.
 #[derive(Debug, Clone)]
-struct Block {
+struct Block<VaType: FlatVa> {
     /// VA of the block
-    virt: u32,
+    virt: VaType,
     /// PA (for allocator, this is just a bool mapped/unmapped)
     mapped: bool,
 }
 
-impl Block {
-    fn new(virt: u32, mapped: bool) -> Self {
+impl<VaType: FlatVa> Block<VaType> {
+    fn new(virt: VaType, mapped: bool) -> Self {
         Self { virt, mapped }
     }
 }
 
 /// FlatAddressSpaceMap for the allocator case (PA = bool, no contig split).
-struct FlatAddressSpaceMapBool {
-    blocks: Vec<Block>,
-    va_limit: u32,
-    unmap_callback: Option<Box<dyn Fn(u32, u32) + Send>>,
+struct FlatAddressSpaceMapBool<VaType: FlatVa> {
+    blocks: Vec<Block<VaType>>,
+    va_limit: VaType,
+    unmap_callback: Option<Box<dyn Fn(VaType, VaType) + Send>>,
 }
 
-impl FlatAddressSpaceMapBool {
-    fn new(va_limit: u32, unmap_callback: Option<Box<dyn Fn(u32, u32) + Send>>) -> Self {
+impl<VaType: FlatVa> FlatAddressSpaceMapBool<VaType> {
+    fn new(va_limit: VaType, unmap_callback: Option<Box<dyn Fn(VaType, VaType) + Send>>) -> Self {
         Self {
-            blocks: vec![Block::new(0, false)],
+            blocks: vec![Block::new(VaType::ZERO, false)],
             va_limit,
             unmap_callback,
         }
     }
 
-    fn map_locked(&mut self, virt: u32, size: u32) {
+    fn map_locked(&mut self, virt: VaType, size: VaType) {
         let virt_end = virt + size;
 
         assert!(
@@ -99,10 +125,10 @@ impl FlatAddressSpaceMapBool {
 
     fn finish_map(
         &mut self,
-        virt: u32,
+        virt: VaType,
         block_end_succ_idx: usize,
         _original_end_succ: usize,
-        size: u32,
+        size: VaType,
     ) {
         let virt_end = virt + size;
 
@@ -131,7 +157,7 @@ impl FlatAddressSpaceMapBool {
         }
     }
 
-    fn unmap_locked(&mut self, virt: u32, size: u32) {
+    fn unmap_locked(&mut self, virt: VaType, size: VaType) {
         let virt_end = virt + size;
 
         assert!(
@@ -193,7 +219,7 @@ impl FlatAddressSpaceMapBool {
         }
     }
 
-    fn finish_unmap(&mut self, virt: u32, size: u32, block_end_succ_idx: usize) {
+    fn finish_unmap(&mut self, virt: VaType, size: VaType, block_end_succ_idx: usize) {
         let mut idx = block_end_succ_idx;
         while idx > 0 && self.blocks[idx - 1].virt >= virt {
             idx -= 1;
@@ -231,7 +257,7 @@ impl FlatAddressSpaceMapBool {
         }
     }
 
-    fn erase_blocks_with_end_unmapped(&mut self, virt: u32, unmapped_end_idx: usize) {
+    fn erase_blocks_with_end_unmapped(&mut self, virt: VaType, unmapped_end_idx: usize) {
         let mut idx = unmapped_end_idx;
         while idx > 0 && self.blocks[idx - 1].virt >= virt {
             idx -= 1;
@@ -253,21 +279,19 @@ impl FlatAddressSpaceMapBool {
     }
 }
 
-/// FlatAllocator - specialises FlatAddressSpaceMap to work as an allocator,
+/// FlatAllocatorBool - specialises FlatAddressSpaceMap to work as an allocator,
 /// with an initial fast linear pass and a subsequent slower pass that iterates
 /// until it finds a free block.
-///
-/// This is the concrete instantiation for `FlatAllocator<u32, 0, 32>`.
-pub struct FlatAllocator {
-    inner: FlatAddressSpaceMapBool,
+pub struct FlatAllocatorBool<VaType: FlatVa> {
+    inner: FlatAddressSpaceMapBool<VaType>,
     block_mutex: Mutex<()>,
-    virt_start: u32,
-    current_linear_alloc_end: u32,
-    va_limit: u32,
+    virt_start: VaType,
+    current_linear_alloc_end: VaType,
+    va_limit: VaType,
 }
 
-impl FlatAllocator {
-    pub fn new(virt_start: u32, va_limit: u32) -> Self {
+impl<VaType: FlatVa> FlatAllocatorBool<VaType> {
+    pub fn new(virt_start: VaType, va_limit: VaType) -> Self {
         Self {
             inner: FlatAddressSpaceMapBool::new(va_limit, None),
             block_mutex: Mutex::new(()),
@@ -278,10 +302,10 @@ impl FlatAllocator {
     }
 
     /// Allocates a region in the AS of the given size and returns its address.
-    pub fn allocate(&mut self, size: u32) -> Option<u32> {
+    pub fn allocate(&mut self, size: VaType) -> Option<VaType> {
         let _lock = self.block_mutex.lock().unwrap();
 
-        let mut alloc_start: Option<u32> = None;
+        let mut alloc_start: Option<VaType> = None;
         let alloc_end = self.current_linear_alloc_end.wrapping_add(size);
 
         // Avoid searching backwards in the address space if possible
@@ -350,25 +374,30 @@ impl FlatAllocator {
     }
 
     /// Marks the given region as allocated.
-    pub fn allocate_fixed(&mut self, virt: u32, size: u32) {
+    pub fn allocate_fixed(&mut self, virt: VaType, size: VaType) {
         let _lock = self.block_mutex.lock().unwrap();
         self.inner.map_locked(virt, size);
     }
 
     /// Frees an AS region so it can be used again.
-    pub fn free(&mut self, virt: u32, size: u32) {
+    pub fn free(&mut self, virt: VaType, size: VaType) {
         let _lock = self.block_mutex.lock().unwrap();
         self.inner.unmap_locked(virt, size);
     }
 
-    pub fn get_va_start(&self) -> u32 {
+    pub fn get_va_start(&self) -> VaType {
         self.virt_start
     }
 
-    pub fn get_va_limit(&self) -> u32 {
+    pub fn get_va_limit(&self) -> VaType {
         self.va_limit
     }
 }
+
+/// Concrete `FlatAllocator<u32, 0, 32>` equivalent.
+pub type FlatAllocator = FlatAllocatorBool<u32>;
+/// `FlatAllocator<DAddr, 0, 34>` equivalent for Maxwell device memory.
+pub type FlatAllocator64 = FlatAllocatorBool<u64>;
 
 #[cfg(test)]
 mod tests {
@@ -397,6 +426,24 @@ mod tests {
         let a1 = alloc.allocate(0x1000).unwrap();
         alloc.free(a1, 0x1000);
         // After freeing, next linear alloc continues from where it left off
+        let a2 = alloc.allocate(0x1000).unwrap();
+        assert_eq!(a2, 0x2000);
+    }
+
+    #[test]
+    fn test_flat_allocator64_can_allocate_above_32bit() {
+        let mut alloc = FlatAllocator64::new(0x1_0000_0000, (1u64 << 34) - 1);
+        let a1 = alloc.allocate(0x1000).unwrap();
+        let a2 = alloc.allocate(0x1000).unwrap();
+        assert_eq!(a1, 0x1_0000_0000);
+        assert_eq!(a2, 0x1_0000_1000);
+    }
+
+    #[test]
+    fn test_flat_allocator64_free_keeps_linear_pass() {
+        let mut alloc = FlatAllocator64::new(0x1000, (1u64 << 34) - 1);
+        let a1 = alloc.allocate(0x1000).unwrap();
+        alloc.free(a1, 0x1000);
         let a2 = alloc.allocate(0x1000).unwrap();
         assert_eq!(a2, 0x2000);
     }

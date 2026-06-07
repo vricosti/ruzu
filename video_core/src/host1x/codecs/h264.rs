@@ -8,7 +8,9 @@
 
 use crate::host1x::codecs::decoder::{DecoderImpl, DecoderState};
 use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
+use crate::host1x::host1x::FrameQueue;
 use crate::host1x::nvdec_common::{NvdecRegisters, VideoCodec};
+use std::sync::Arc;
 
 // --------------------------------------------------------------------------
 // ZigZag LUTs from libavcodec (same as upstream).
@@ -439,8 +441,12 @@ pub struct H264 {
 }
 
 impl H264 {
-    pub fn new(id: i32) -> Self {
-        let mut state = DecoderState::new(id);
+    pub fn new(
+        id: i32,
+        memory_manager: Arc<MaxwellDeviceMemoryManager>,
+        frame_queue: Arc<FrameQueue>,
+    ) -> Self {
+        let mut state = DecoderState::new(id, memory_manager, frame_queue);
         state.codec = VideoCodec::H264;
         state.initialized = state.decode_api.initialize(VideoCodec::H264);
         Self {
@@ -453,11 +459,8 @@ impl H264 {
 }
 
 impl DecoderImpl for H264 {
-    fn compose_frame(
-        &mut self,
-        regs: &NvdecRegisters,
-        memory_manager: &MaxwellDeviceMemoryManager,
-    ) -> Vec<u8> {
+    fn compose_frame(&mut self, regs: &NvdecRegisters) -> Vec<u8> {
+        let memory_manager = Arc::clone(&self.state.memory_manager);
         let mut context_bytes = vec![0u8; std::mem::size_of::<H264DecoderContext>()];
         if !memory_manager.smmu_read_block(regs.picture_info_offset().address(), &mut context_bytes)
         {

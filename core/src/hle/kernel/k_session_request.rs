@@ -339,7 +339,9 @@ mod tests {
 
     #[test]
     fn clear_thread_drops_direct_thread_owner_reference() {
-        let thread = Arc::new(Mutex::new(super::super::k_thread::KThread::new()));
+        let thread = Arc::new(super::super::k_thread::KThreadLock::new(
+            super::super::k_thread::KThread::new(),
+        ));
         let mut request = KSessionRequest::new();
         request.thread = Some(Arc::downgrade(&thread));
         request.thread_id = Some(7);

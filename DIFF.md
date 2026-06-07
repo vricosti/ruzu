@@ -1,3 +1,182 @@
+## 2026-06-07 — core/src/hle/service/nvdrv/devices/nvhost_as_gpu.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/nvdrv/devices/nvhost_as_gpu.cpp and nvhost_as_gpu.h
+
+### Intentional differences
+- Rust stores `Mapping` / `Allocation` owners behind `Arc` and `BTreeMap` plus per-field mutexes instead of upstream `std::shared_ptr`, `std::map`, and one `std::mutex`. Address-space ioctl methods still take the owner-level `self.mutex` before touching VM/allocation/mapping state, matching upstream's `std::scoped_lock lock(mutex)` serialization; the inner Rust locks are field-ownership adapters, not independent ordering policy.
+- Rust reaches upstream `std::shared_ptr<Tegra::MemoryManager> gmmu` through the existing `GpuMemoryManagerHandle` trait object because `core` cannot name the concrete `video_core::MemoryManager` type.
+- Env-gated `GPU_VA_MAP` / `GPU_VA_UNMAP` trace-ring emission mirrors the existing Rust diagnostic system. It is disabled by default and does not change ioctl payloads or results.
+
+### Unintentional differences (to fix)
+- None identified for the audited `FreeMappingLocked` / `UnmapBuffer` / `FreeSpace` size and operation-order slice. `FreeMappingLocked` now matches upstream's separate helper path: dynamic mappings free allocator pages using `AlignUp(mapping->size, page_size) >> page_size_bits`, unpin the NvMap handle, restore sparse or unmap GMMU state with raw `mapping->size`, then erase `mapping_map`. `UnmapBuffer` now matches upstream's separate ioctl path rather than delegating to `FreeMappingLocked`: non-fixed mappings free allocator pages with raw `mapping->size >> page_size_bits`, restore sparse or unmap GMMU state, unpin the NvMap handle, then erase `mapping_map`. `FreeSpace` keeps the `allocation_map` entry alive until after mappings, sparse unmap, and allocator free complete. Sparse `FreeSpace` restores fixed mappings to sparse GMMU state before unmapping the full sparse allocation, matching upstream ordering.
+
+### Missing items
+- None identified for the audited `nvhost_as_gpu` address-space serialization, `FreeMappingLocked`, `UnmapBuffer`, and `FreeSpace` slice.
+
+### Binary layout verification
+- PASS: ioctl payload sizes still match upstream: `VaRegion` 0x18, `IoctlAllocAsEx` 40, `IoctlAllocSpace` 24, `IoctlFreeSpace` 16, `IoctlRemapEntry` 20, `IoctlMapBufferEx` 40, `IoctlUnmapBuffer` 8, and `IoctlGetVaRegions` `16 + 2 * sizeof(VaRegion)`.
+
+### Tests
+- Re-read upstream `nvhost_as_gpu.h` and `nvhost_as_gpu.cpp::{FreeMappingLocked,UnmapBuffer,MapBufferEx}` before aligning dynamic unmap allocator-free sizing.
+- `cargo test -p core unmap_buffer_sends_raw_mapping_size_to_gmmu_like_upstream -- --nocapture`
+- Re-read upstream `nvhost_as_gpu.cpp::FreeSpace` before aligning sparse allocation GMMU unmap ordering.
+- `cargo test -p core free_space_sparse_restores_mapping_then_unmaps_allocation_like_upstream -- --nocapture`
+- Re-read upstream `nvhost_as_gpu.cpp::{FreeMappingLocked,FreeSpace}` before aligning map-entry erase ordering and allocator-free aligned sizing.
+- `cargo test -p core hle::service::nvdrv::devices::nvhost_as_gpu::tests -- --nocapture`
+
+## 2026-06-07 — common/src/page_table.rs and core/src/memory/memory.rs vs /home/vricosti/Dev/emulators/zuyu/src/common/page_table.h, /home/vricosti/Dev/emulators/zuyu/src/common/page_table.cpp, and /home/vricosti/Dev/emulators/zuyu/src/core/memory.cpp
+
+### Intentional differences
+- Rust keeps the page table as `VirtualBuffer<PageInfo>` / `VirtualBuffer<u64>` fields like upstream but exposes the mapping helper as `PageTable::map_pages(...)` for reduced tests in addition to the runtime `Memory::map_pages(...)` owner path. Both now store `backing_addr[page] = target - (page << PAGE_BITS)` and recover physical addresses by adding the queried virtual address, matching upstream `MapPages(...)` and `PageTable::GetPhysicalAddress(...)`.
+
+### Unintentional differences (to fix)
+- None identified for the audited `backing_addr` / `GetPhysicalAddress` storage contract.
+
+### Missing items
+- None for this physical-address recovery slice.
+
+### Binary layout verification
+- N/A: host page-table metadata only. No guest-visible raw payload layout changed.
+
+### Tests
+- Re-read upstream `common/page_table.h`, `common/page_table.cpp`, and `core/memory.cpp` before aligning `backing_addr` storage.
+- `cargo test -p core close_handle_recoalesces_transfer_memory_split_heap_region -- --nocapture`
+- `cargo test -p core close_handle_runs_transfer_memory_post_destroy_resource_release -- --nocapture`
+- `cargo test -p core set_heap_size_maps_heap_region_in_page_table -- --nocapture`
+
+## 2026-06-07 — core/src/hle/kernel/kernel.rs, core/src/hle/kernel/k_process.rs, and core/src/hle/kernel/svc/svc_synchronization.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/k_process.cpp, /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/k_page_table_base.cpp, and /home/vricosti/Dev/emulators/zuyu/src/core/memory.cpp
+
+### Intentional differences
+- `ScopedKernelForTest` is a Rust-only `#[cfg(test)]` harness owner that installs a minimal `KernelCore` in `KERNEL_PTR` without running `KernelCore::initialize()`. This lets unit tests exercise upstream-shaped `KPageTableBase::SetHeapSize` / `KMemoryManager::AllocateAndOpen` / `KMemoryBlockManagerUpdateAllocator` paths while avoiding runtime scheduler/core startup in native tests.
+- `svc_synchronization` transfer-memory tests now call `System::initialize()` and `KProcess::create_memory(&system)` so the process page table owns a real `Core::Memory::Memory` bridge before `SetHeapSize`, matching upstream's process-owned `m_memory` dependency.
+
+### Unintentional differences (to fix)
+- None for the audited native-test fixture setup slice.
+
+### Missing items
+- None for this test-harness prerequisite slice.
+
+### Binary layout verification
+- N/A: test-only kernel fixture and process-memory owner wiring. No guest-visible payload layout changed.
+
+### Tests
+- Re-read upstream `KProcess::Initialize`, `KPageTableBase::SetHeapSize`, and `Memory::Impl::MapPages` before changing the fixture.
+- `cargo test -p core close_handle_recoalesces_transfer_memory_split_heap_region -- --nocapture`
+- `cargo test -p core close_handle_runs_transfer_memory_post_destroy_resource_release -- --nocapture`
+- `cargo test -p core set_heap_size_maps_heap_region_in_page_table -- --nocapture`
+
+## 2026-06-07 — core/src/core.rs, core/src/hle/kernel/kernel.rs, and core/src/hle/service/sm/sm.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/sm/sm.cpp
+
+### Intentional differences
+- `System::new_for_test()` uses Rust-only `setup_sm_for_test(...)` to register `sm:`, publish the matching `ServiceOwnership`, and keep the returned `ServerManager` alive without entering upstream's blocking `ServerManager::RunServer(...)` loop. Runtime SM startup still uses `sm::loop_process(...)`, which keeps the upstream-shaped blocking server-manager lifecycle.
+- `KernelCore::track_server_manager_for_test(...)` is a narrow Rust harness owner hook so the weak service-ownership reference created during non-blocking test setup remains upgradeable. Upstream has no equivalent because its test harness is not built around Rust `Weak<ServerManager>` ownership.
+
+### Unintentional differences (to fix)
+- None for runtime `LoopProcess`; this entry covers test-harness setup only.
+
+### Missing items
+- None for the audited non-blocking `sm:` test setup slice.
+
+### Binary layout verification
+- N/A: service-manager test setup only. No guest-visible payload layout changed.
+
+### Tests
+- Re-read upstream `sm.cpp` around `LoopProcess` before splitting Rust test setup from runtime server-manager execution.
+- `cargo test -p core setup_for_ipc_client_changes_permissions_without_locking_until_server_success -- --nocapture`
+- `cargo test -p core hle::service::nvdrv::devices::nvhost_as_gpu::tests -- --nocapture`
+
+## 2026-06-07 — core test modules vs `/home/vricosti/Dev/emulators/zuyu/src/core`
+
+### Intentional differences
+- Rust native unit tests now import the current lock wrapper aliases (`KThreadLock`, `ProcessLock`) and moved helper types (`KPort`, `Event`, ioctl payload structs) from their actual Rust owner modules. Upstream does not have these Rust test modules; this is test-harness wiring only and does not change runtime kernel/service behavior.
+- One Rust test assertion now imports `RESULT_SUCCESS` from `crate::hle::result`, matching the current Rust owner for the global success result. Upstream uses its native result constants and has no `svc_results::RESULT_SUCCESS` equivalent in this Rust module layout.
+- Rust `CoreTiming` native tests now use the current `Arc<CoreTiming>::initialize(...)` ownership and locked `CoreTimingState` queue access instead of stale direct fields / removed `start_timer_thread(...)`.
+- Older Rust tests that still expected `KProcess::read_block/write_block` now compile through a `#[cfg(test)]` compatibility bridge delegating to the current `read_memory_vec` / `write_memory` process-memory owner path. This is test-only and does not expose the old helper in runtime builds.
+- Rust `KServerSession`, `KSessionRequest`, and `KHardwareTimer` tests now use current owner wrappers (`ProcessLock`, `KThreadLock`, `Arc<CoreTiming>`) instead of stale `Arc<Mutex<_>>` wrappers.
+
+### Unintentional differences (to fix)
+- None for runtime behavior in this slice.
+
+### Missing items
+- None for the currently targeted core lib-test harness cleanup slice.
+
+### Binary layout verification
+- N/A: test imports and assertion owner cleanup only. No guest-visible payload layout changed.
+
+### Tests
+- PASS: `cargo check -p core`
+- PASS: `cargo check -p core --tests`
+- PASS: `cargo test -p core open_first_open_close_split_across_impl_managers -- --nocapture`
+- PASS: `cargo fmt --check`
+- PASS: `git diff --check`
+
+## 2026-06-07 — video_core/src/engines/maxwell_3d.rs, video_core/src/shader_environment.rs, and video_core/src/shader_cache.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/engines/maxwell_3d.h, /home/vricosti/Dev/emulators/zuyu/src/video_core/shader_environment.h, /home/vricosti/Dev/emulators/zuyu/src/video_core/shader_environment.cpp, and /home/vricosti/Dev/emulators/zuyu/src/video_core/shader_cache.cpp
+
+### Intentional differences
+- Rust still stores the upstream `Tegra::MemoryManager&` owner behind `Arc<parking_lot::Mutex<MemoryManager>>` because the broader channel/engine owner graph is not yet a literal C++ reference graph.
+- Reduced/test callers may still install `GpuMemoryReader` callbacks, but graphics shader environments, compute shader environments, and Maxwell3D owner-backed reads/writes now prefer the stored `MemoryManager` / `MaxwellDeviceMemoryManager` path directly. This matches upstream's `GenericEnvironment{Tegra::MemoryManager&}`, `ComputeEnvironment(..., Tegra::MemoryManager& ...)`, and `gpu_memory->ReadBlock(...)` dependency direction more closely without adding unsafe references.
+
+### Unintentional differences (to fix)
+- None identified for the audited production graphics/compute shader-environment memory-owner construction slice.
+
+### Missing items
+- Continue the later shader-environment branch work: make `GenericEnvironment` store only the upstream-shaped GPU-memory owner for runtime environments, then remove the nullable compatibility callback transport from reduced/test paths.
+
+### Binary layout verification
+- N/A: shader environment memory-owner routing only. No guest-visible raw payload layout changed.
+
+### Tests
+- Re-read upstream `shader_environment.h`, `shader_environment.cpp`, and `memory_manager.{h,cpp}` before removing the graphics shader `guest_memory_reader()` gate.
+- Re-read upstream `shader_environment.h`, `shader_environment.cpp`, and `shader_cache.cpp` before removing the compute shader `guest_memory_reader()` gate.
+- `cargo check -p video_core`
+- `cargo test -p video_core memory_manager_owner -- --nocapture`
+- `cargo test -p video_core compute_environment_from_kepler_compute_includes_local_crs_alloc -- --nocapture`
+- `cargo test -p video_core compute_environment_reads_live_qmd_state_after_construction -- --nocapture`
+- `cargo test -p video_core compute_environment_panics_on_disabled_live_cbuf -- --nocapture`
+- `cargo fmt --check`
+- `git diff --check`
+
+## 2026-06-06 — video_core/src/pte_kind.rs and video_core/src/memory_manager.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/pte_kind.h and /home/vricosti/Dev/emulators/zuyu/src/video_core/memory_manager.cpp
+
+### Intentional differences
+- Rust represents upstream `enum class PTEKind : u8` as a transparent `PteKind(u8)` newtype with owner-local associated constants instead of a Rust enum. This is intentional because upstream callsites use `static_cast<Tegra::PTEKind>(params.kind)` and `kind_map` stores the resulting raw byte; a Rust enum with gaps cannot safely represent unknown/non-listed raw values.
+
+### Unintentional differences (to fix)
+- None identified for the audited `PTEKind` raw-value storage slice.
+
+### Missing items
+- None identified for the audited `PTEKind` raw-value storage slice.
+
+### Binary layout verification
+- N/A: host-side GPU page-kind metadata only. No guest-visible raw payload layout changed.
+
+### Tests
+- Re-read upstream `video_core/pte_kind.h`, `video_core/memory_manager.h`, and `video_core/memory_manager.cpp` before replacing Rust's gapped enum with a raw-byte newtype.
+- `cargo test -p video_core page_kind_preserves_unknown_raw_values -- --nocapture`
+- `cargo check -p video_core`
+- Re-read upstream `video_core/memory_manager.h` and `video_core/memory_manager.cpp` after the raw `PTEKind` audit; the `MemoryOperation`, `MapSparse`, sparse `Reserved`, big-page fallback, `IsFullyMappedRange`, `MaxContinuousRange`, and `GetSubmappedRange` slice is already covered by the current Rust memory-manager structure and focused tests.
+- `cargo test -p video_core memory_manager -- --nocapture`
+- `cargo build --release --bin ruzu-cmd`
+- Manual MK8D 90s smoke after preserving raw `PTEKind` values in `MemoryManager::kind_map` (`/tmp/mk8d_ptekind_raw_1780781906.log`, `RUST_LOG=warn`, isolated XDG dirs, no L+R input): reached `am::NotifyRunning`; no `0x068B0000`, `BreakLoopNullPc`, panic, SIGSEGV, `IocAlloc`, `glTextureSubImage3D`, GL API marker, `active session ... no registered SMMU ASID`, or `runtime SMMU map missing process Memory owner` marker was logged before the controlled timeout. This remains smoke-level no-obvious-regression evidence only; warn-level logging does not prove audio/rendering progress.
+
+## 2026-06-06 — core/src/hle/service/nvdrv/devices/nvhost_ctrl.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/nvdrv/devices/nvhost_ctrl.cpp and nvhost_ctrl.h
+
+### Intentional differences
+- Rust keeps env-gated `NVHOST_CTRL_WAIT` trace-ring records and optional `RUZU_TRACE_NVHOST_CTRL_WAIT` logs around `IocCtrlEventWait`. Upstream uses normal logging only; the Rust diagnostics are disabled by default and do not alter guest-visible ioctl results.
+- Rust stores NV event objects through `Arc<Mutex<KReadableEvent>>`/`EventInterface` instead of upstream raw `Kernel::KEvent*`; the wait/register/clear/free ownership still remains in the matching `nvhost_ctrl.rs` owner.
+
+### Unintentional differences (to fix)
+- None identified for the `IocCtrlEventWait` event-fail lifecycle slice after comparing against upstream's `must_unmark_fail` / `SCOPE_EXIT` ordering.
+
+### Missing items
+- Continue auditing `nvhost_ctrl` wait timing against upstream runtime traces if MK8D still returns `NvResult::Timeout` where zuyu's `UpdateMin` observes host syncpoint progress.
+
+### Binary layout verification
+- PASS: `IocCtrlEventWaitParams`, `IocCtrlEventRegisterParams`, `IocCtrlEventUnregisterParams`, and `IocCtrlEventClearParams` ioctl payload layouts were not changed.
+
+### Tests
+- `cargo check -p core`
+- `cargo fmt --check`
+- `cargo test -p core event_wait_non_allocation_armed_timeout_preserves_fails -- --nocapture` currently does not reach the focused test because the `core` lib-test harness fails in unrelated existing tests/code paths.
+
 ## 2026-06-05 — core/src/hle/service/nvdrv/nvdrv_interface.rs and ruzu_cmd/src/main.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/nvdrv/nvdrv_interface.cpp
 
 ### Intentional differences
@@ -58,6 +237,29 @@
 - `cargo build --release --bin ruzu-cmd`
 - Manual MK8D validation after reverting Binder host-thread default: default run without `RUZU_INLINE_IPC` reached BQP frame ~3177, HWC frame ~3508, and non-zero audio in 60s.
 
+## 2026-06-06 — core/src/hle/kernel/k_process.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/k_process.cpp
+
+### Intentional differences
+- None identified for the local `KProcess::Initialize` ASLR policy: ruzu now follows the local zuyu reference, which forces `enable_aslr = false` before `m_page_table.Initialize(...)` in both process-initialization paths. This replaces the previous env-only `RUZU_DISABLE_ASLR` behavior for process page-table layout.
+
+### Unintentional differences (to fix)
+- The surrounding process object model still uses Rust side registries for several kernel object lifetimes instead of upstream `KAutoObject` ownership through `KHandleTable`.
+
+### Missing items
+- Continue auditing `KProcess::Initialize` against upstream for system-resource teardown ordering and page-table finalization edge cases.
+
+### Binary layout verification
+- N/A: process page-table layout policy only. No guest-visible raw payload layout changed.
+
+### Tests
+- Re-read upstream `k_process.cpp` before changing `enable_aslr` policy.
+- `cargo check -p core`
+- `cargo fmt --check`
+- `git diff --check`
+- `cargo build --release --bin ruzu-cmd`
+- Manual MK8D 120s smoke after matching local zuyu's forced-off process ASLR (`/tmp/mk8d_aslr_parity_1780767205.log`, `RUST_LOG=warn`, `RUZU_TRACE_MEM_HISTORY_TARGET=0x068B0000`, `RUZU_EXIT_ON_NULL_PC=1`): reached `am::NotifyRunning`; no `nvmap::IocAlloc`, `BreakLoopNullPc`, panic, SIGSEGV, or memory-history failure dump was logged before the controlled timeout.
+- Manual MK8D 240s smoke after the same ASLR policy (`/tmp/mk8d_aslr_parity_240s_1780767497.log`, `RUST_LOG=warn`, `RUZU_EXIT_ON_NULL_PC=1`): reproduced the known late `nvmap::IocAlloc(handle=0xAD4, addr=0x068B0000, size=0x70000) result=0x0000D401` followed by `BreakLoopNullPc`. The 120s run was therefore too weak to prove the blocker fixed.
+
 ## 2026-06-05 — core/src/hle/service/nvdrv/devices/nvmap.rs and core/src/hle/kernel/svc_dispatch.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/nvdrv/devices/nvmap.cpp and /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/svc/svc_cache.cpp
 
 ### Intentional differences
@@ -94,6 +296,10 @@
 
 ### Tests
 - `cargo check -p video_core`
+- `cargo check -p video_core --tests`
+- `cargo test -p video_core inline_upload_linear_uses_constructor_memory_manager_owner_without_guest_writer -- --nocapture`
+- `cargo test -p video_core data_register_writes_through_memory_manager -- --nocapture`
+- `cargo test -p video_core memory_manager -- --nocapture`
 
 ## 2026-06-05 — video_core/src/renderer_opengl/gl_rasterizer.rs and common/src/trace.example.toml vs /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_rasterizer.cpp
 
@@ -166,7 +372,6 @@
 
 ### Tests
 - `cargo check -p video_core`
-- `cargo build --release --bin ruzu-cmd`
 - Manual MK8D retest with fresh `XDG_CACHE_HOME` to force shader recompilation: reaches `present_2600` without guest break, but the title-screen UI band remains corrupted. The vendor predicate parity fix is not the cause of that visible bug.
 
 ## 2026-06-05 — video_core/src/renderer_opengl/gl_rasterizer.rs and video_core/src/renderer_opengl/gl_texture_cache.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_rasterizer.cpp and /home/vricosti/Dev/emulators/zuyu/src/video_core/texture_cache/texture_cache.h
@@ -227,14 +432,33 @@
 
 ### Intentional differences
 - Ruzu wires upstream `DeviceMemoryManager<Traits>::WriteBlock`'s `device_inter->InvalidateRegion(address, size)` side effect through an explicit `MaxwellDeviceMemoryManager::set_invalidate_region` callback. Upstream stores the device interface pointer inside `DeviceMemoryManager`; Rust keeps the callback in the shared Host1x device-memory manager to avoid cross-crate ownership cycles.
-- VIC still writes through `smmu_write_block` rather than constructing upstream `GpuGuestMemoryScoped<SafeWrite>` objects. The observable side effect is now closer to upstream: after the write to SMMU-backed guest memory, the rasterizer receives `GPU::InvalidateRegion(DAddr, size)`.
+- VIC still writes through `smmu_write_block` after producing scratch output buffers rather than constructing upstream `GpuGuestMemoryScoped<SafeWrite>` spans. Upstream `GuestMemoryScoped<SafeWrite>` either writes back through `MemoryManager::WriteBlock` on destruction or invalidates a direct span; ruzu's path now carries the same Host1x SMMU write plus `GPU::InvalidateRegion(DAddr, size)` side effect for the ported VIC output formats, with only the scoped-span/performance shape differing.
+- Host1x SMMU mappings installed by `HeapMapper` now also record per-device-page CPU backing metadata `(asid, vaddr)` and continuity counts in `MaxwellDeviceMemoryManager`, matching the upstream `InsertCPUBacking(...)` / `TrackContinuityImpl(...)` data carried by `DeviceMemoryManager::Map(..., track=true)`. Rust now routes mapped pages through dense device-page `compressed_physical_ptr` and `cpu_backing_address` counterparts before resolving to host backing.
+- `MaxwellDeviceMemoryManager::smmu_register_process` now stores the process `Core::Memory::Memory` owner per ASID, and `UpdatePagesCachedCount` uses that registered owner for `Memory::rasterizer_mark_region_cached(...)`, matching upstream `registered_processes[asid.id]` ownership. The legacy cache callback is test-only and exists only for reduced fixture construction that lacks a registered `Memory` owner.
+- `UpdatePagesCachedCount` preserves upstream's initial-ASID batch-boundary behavior: after the scanned range moves away from the first page's ASID, each later page whose ASID differs from that initial ASID releases pending cache/uncache batches before continuing, matching `DeviceMemoryManager<Traits>::UpdatePagesCachedCount`'s unchanged local `asid` variable.
+- `MaxwellDeviceMemoryManager::smmu_read_block` / `smmu_write_block` now walk mapped memory through upstream-style continuity segments before copying, matching `DeviceMemoryManager<Traits>::WalkBlock` segment sizing for contiguous Host1x SMMU backing.
+- `MaxwellDeviceMemoryManager::smmu_unmap` now matches upstream `DeviceMemoryManager<Traits>::Unmap` by clearing compressed physical mappings, reverse mappings, and CPU backing while leaving existing `continuity_tracker` entries untouched until a later tracked map overwrites them.
+- `MaxwellDeviceMemoryManager` now stores `compressed_physical_ptr`, `continuity_tracker`, and `cpu_backing_address` as dense device-page tables initialized like upstream (`0`, `1`, and `0`, respectively), replacing the previous sparse `HashMap` representation for those `VirtualBuffer` counterparts. Its `cached_pages` counter table is also dense `AtomicU8` storage like upstream `CachedPages`. `UpdatePagesCachedCount` now skips pages whose decoded CPU backing virtual page is zero, matching upstream's `if (vpage == 0) continue` path.
+- The reverse physical table now uses upstream's constructor-time `physical_min_bits` / `physical_max_bits` selection from `Settings::memory_layout_mode`: default 4GiB mode allocates the 32-bit physical table, while extended memory uses the 33-bit table. Runtime physical-page bounds are stored on the `MaxwellDeviceMemoryManager` instance and follow the constructed table, matching upstream's one-time `compressed_device_addr` allocation lifecycle.
+- Runtime ASID-backed callers (`HeapMapper` and non-preallocated `NvMap::pin_handle`) now call `Host1xCoreInterface::smmu_map(d_address, vaddress, size, asid, track)` so `MaxwellDeviceMemoryManager` resolves `GetPointerSilent(...)` through the process registered for that ASID, matching upstream `DeviceMemoryManager::Map(address, virtual_address, size, asid, track)`. The core-facing Host1x trait no longer exposes a host-pointer SMMU map operation; `MaxwellDeviceMemoryManager::smmu_map_with_cpu_backing(...)` remains only as a video-core-local compatibility helper for reduced fixtures that already hold a host pointer.
+- `MaxwellDeviceMemoryManager::smmu_map(...)` now advances registered-process mappings by device page exactly like upstream `DeviceMemoryManager<Traits>::Map`: page `start_page_d + i` uses `GetPointerSilent(virtual_address + i * page_size)`, then records the same virtual address in CPU-backing metadata. It no longer splits this ASID-backed runtime path by CPU page boundary, preserving upstream behavior for unaligned guest virtual addresses.
+- ASID-backed `MaxwellDeviceMemoryManager::smmu_map(..., track=true)` now tracks continuity from the registered process memory owner directly, matching upstream `TrackContinuityImpl(address, virtual_address, size, asid)`: the reverse walk calls `GetPointerSilent(virtual_address + index * page_size)` and writes `continuity_tracker[start_page_d + index]`. The host-pointer compatibility helper keeps the existing mapped-physical continuity path for reduced fixtures that do not have a registered process `Memory` owner.
+- `MaxwellDeviceMemoryManager` map/unmap/continuity page coverage now uses upstream `Common::AlignUp(size, page_size) >> page_bits` counts from `start_page_d`, matching `DeviceMemoryManager<Traits>::Map`, `Unmap`, and `TrackContinuityImpl`. It no longer includes the device-address page offset when deciding how many device pages to map, unmap, or track.
+- Runtime `MaxwellDeviceMemoryManager` now captures upstream `DeviceMemoryManager<Traits>::physical_base` from `System::DeviceMemory()` during Host1x construction, matching upstream `Host1x::Host1x(Core::System&) : memory_manager(system.DeviceMemory())`. Registered process `Memory` owners still assert/fill the same base as a defensive bridge for reduced construction, and all SMMU mappings use `host_ptr - physical_base` to derive compressed physical page indices. The manager also maintains the dense physical-page -> encoded device-page reverse table with upstream-shaped `compressed_device_addr` single-vs-multi encoding and a Rust `MultiAddressContainer` counterpart.
+- `Host1xCoreInterface::smmu_apply_op_on_host_pointer` exposes the reverse fanout to core-side users. `SharedBufferManager::write_applet_capture_buffer` now reaches Host1x device-memory aliases through that method instead of invalidating the CPU page-group address directly, matching upstream's `Host1x().MemoryManager().ApplyOpOnPointer(...)` ownership path.
+- `MaxwellDeviceMemoryManager::smmu_map(...)` forwards null guest backing pages into the same internal map path as upstream `DeviceMemoryManager::Map`: a null `GetPointerSilent(...)` stores `compressed_physical_ptr[page] = 0` and continues without reverse-table insertion or `Unmap` invalidation. The host-pointer compatibility helper follows the same null-page behavior.
+- Host-pointer compatibility mappings require a `physical_base`-translatable host pointer before recording CPU backing or reverse physical mappings. If the pointer cannot be translated through the registered process `DeviceMemory` base, Rust records `compressed_physical_ptr = 0` and leaves CPU backing/reverse tables untouched, matching upstream `DeviceMemoryManager::Map`'s null-pointer branch rather than inventing a synthetic physical page.
+- `MaxwellDeviceMemoryManager::smmu_apply_op_on_host_pointer` now preserves upstream `ApplyOpOnPAddr`'s single-entry `base=0` behavior for registered physical pages with no device alias: the callback is invoked once with the intra-page offset as the device address, matching `operation((base << page_bits) + subbits)`.
+- Runtime `Container` construction now requires `Container::new_with_system(system)`, preserving upstream's mandatory Host1x-backed construction path. The ownerless `Container::new()` helper is compiled only for reduced tests, like the existing test-only ownerless `NvMap::new()` and `MemoryManager::new(...)` fixtures.
+- `Container::close_session` now preserves upstream teardown ordering after `NvMap::UnmapAllHandles`: reset the preallocated `HeapMapper`, free the SMMU range, mark the session inactive, unregister the ASID, then recycle the session id.
+- Runtime `Host1x` construction now uses `Host1x::new_with_system(SystemRef::from_ref(system))` from the subsystem factory, matching upstream `Host1x::Host1x(Core::System&)` ownership. The ownerless `Host1x::new()` / `Default` helpers are compiled only for reduced tests, while `Host1x::system_ref()` is the Rust counterpart of upstream `Host1x::System()`.
+- `Host1x::start_device` / `stop_device` now leave `FrameQueue` open/close ownership with the concrete devices, matching upstream `Host1x::StartDevice` and `Host1x::StopDevice`: `Nvdec::new` opens the queue, `Nvdec::drop` does not close it, and `Vic::drop` closes it.
 
 ### Unintentional differences (to fix)
-- Ruzu's Host1x SMMU page table still stores host pointers directly instead of upstream's compressed physical pointer / CPU backing metadata, so the device-memory manager cannot yet reproduce every `TrackContinuityImpl` edge case.
+- None identified for this audited Host1x SMMU compressed-physical mapping and device lifecycle slice.
 
 ### Missing items
-- Port the full upstream `Core::DeviceMemoryManager<Traits>` mapping model so SMMU mappings track ASID and CPU backing addresses, not only host pointers.
-- Replace VIC's direct `smmu_write_block` calls with a Rust equivalent of upstream `GpuGuestMemoryScoped<SafeWrite>` / `MemoryManager::WriteBlock` once the device-memory manager owner is complete.
+- Continue the broader owner-graph audit tracked in later entries: reduced ownerless fixtures are now test-only, while runtime Host1x/NvMap/device-memory construction must use owner-backed constructors.
 
 ### Binary layout verification
 - N/A: host-side device-memory invalidation and VIC cache-coherency behavior only. No guest-visible raw payload layout changed.
@@ -242,6 +466,86 @@
 ### Tests
 - `cargo check -p video_core`
 - `cargo check --bin ruzu-cmd`
+- `cargo test -p video_core smmu_reverse_mapping -- --nocapture`
+- `cargo test -p video_core smmu_apply_op_on_host_pointer -- --nocapture`
+- `cargo test -p video_core smmu_map_null_backing_clears_only_compressed_physical -- --nocapture`
+- `cargo test -p video_core smmu_map_resolves_backing_from_registered_asid_memory -- --nocapture`
+- `cargo test -p video_core smmu_map_with_cpu_backing_tracks_backing_and_continuity -- --nocapture`
+- `cargo test -p video_core smmu_track_continuity_after_page_split_mapping_matches_full_range_map -- --nocapture`
+- `cargo test -p video_core smmu_map_with_cpu_backing_requires_physical_base -- --nocapture`
+- `cargo test -p video_core smmu_apply_op_on_host_pointer_visits_zero_device_page_for_unmapped_physical_page -- --nocapture`
+- `cargo test -p video_core big_page_continuity_uses_device_memory_pointers -- --nocapture`
+- `cargo test -p video_core write_block_unsafe_uses_device_memory_without_invalidation -- --nocapture`
+- `cargo test -p video_core gpu_device_memory_manager -- --nocapture`
+- Re-read upstream `DeviceMemoryManager<Traits>::UpdatePagesCachedCount` before aligning the initial-ASID cache-batch boundary.
+- `cargo test -p video_core cached_count_keeps_upstream_initial_asid_batch_boundary -- --nocapture`
+- Manual MK8D 120s smoke after preserving upstream initial-ASID cache-batch boundaries in `UpdatePagesCachedCount`: first run `/tmp/mk8d_devmem_asid_batch_1780811795.log` timed out before `NotifyRunning` after two `MapSharedMemory ... cannot contain Shared` errors, matching the known page-table/alias-region class of blocker and not reaching the `0x068B0000` nvmap path. Retry `/tmp/mk8d_devmem_asid_batch_retry_1780811941.log` reached `NotifyRunning`; no `nvmap::IocAlloc`, `0x068B0000`, `BreakLoopNullPc`, panic, SIGSEGV, `glTextureSubImage3D`, or GL API marker was logged before controlled timeout. This is no-obvious-regression smoke evidence only.
+- `cargo test -p video_core memory_manager -- --nocapture`
+- `cargo fmt --check`
+- `git diff --check`
+- `cargo check -p core`
+- Re-read upstream `host1x.cpp`, `host1x.h`, `nvdec.cpp`, `nvdec.h`, `vic.cpp`, and `vic.h` before aligning `Host1x::StartDevice` / `StopDevice` with device-owned `FrameQueue` lifecycle.
+- `cargo test -p video_core device_owned_frame_queue_lifecycle_matches_upstream -- --nocapture`
+- `cargo check -p video_core`
+- `cargo check --bin ruzu-cmd`
+- `cargo build --release --bin ruzu-cmd`
+- Manual MK8D 120s smoke after making ASID-backed SMMU mappings require `physical_base` translation (`/tmp/mk8d_asid_physical_strict_1780785028.log`, `RUST_LOG=warn`, isolated XDG dirs, no L+R input): reached `am::NotifyRunning`; no `0x068B0000`, `BreakLoopNullPc`, panic, SIGSEGV, `IocAlloc`, `glTextureSubImage3D`, GL API marker, `MapSharedMemory`, missing Container session store, missing registered SMMU ASID, or missing process Memory owner marker was logged before controlled timeout. This is no-obvious-regression smoke only; warn-level logging does not prove audio start or rendering progress.
+- Manual MK8D 120s smoke after removing the remaining synthetic SMMU physical fallback from reduced tests and runtime translation helpers (`/tmp/mk8d_no_synthetic_smmu_1780785694.log`, `RUST_LOG=warn`, isolated XDG dirs, no L+R input): reached `am::NotifyRunning`; no `0x068B0000`, `BreakLoopNullPc`, panic, SIGSEGV, `IocAlloc`, `glTextureSubImage3D`, GL API marker, `MapSharedMemory`, missing Container session store, missing registered SMMU ASID, or missing process Memory owner marker was logged before controlled timeout. The shell wrapper hit zsh's reserved `status` variable after the run, but the log was written and no `ruzu-cmd` process remained.
+- `cargo check -p core`
+- `cargo check -p video_core`
+- Re-read upstream `video_core/host1x/vic.cpp`, `video_core/guest_memory.h`, and `core/guest_memory.h` before reclassifying the VIC `GpuGuestMemoryScoped<SafeWrite>` write-back item as a scoped-span/performance adaptation rather than remaining device-memory behavior debt.
+- Re-read upstream `DeviceMemoryManager` construction, `Map`, `Unmap`, `GetPointer`, `GetSpan`, and `WalkBlock` before replacing Rust's sparse device-page `compressed_physical_ptr` / `continuity_tracker` storage with dense upstream-initialized tables.
+- Re-read upstream `DeviceMemoryManager::ExtractCPUBacking`, `InsertCPUBacking`, constructor initialization, and `UpdatePagesCachedCount` before replacing Rust's sparse CPU-backing `HashMap` with a dense encoded `cpu_backing_address` table and aligning missing-backing pages with upstream's zero-vpage skip.
+- `cargo test -p video_core gpu_device_memory_manager -- --nocapture`
+- Re-read upstream `DeviceMemoryManager<Traits>::DeviceMemoryManager(const DeviceMemory&)` physical-table sizing and `common::settings::memory_layout_mode` before replacing the fixed 33-bit reverse table size with upstream's 4GiB/8GiB selection.
+- `cargo test -p video_core default_memory_layout_uses_upstream_4gb_physical_reverse_table_size -- --nocapture`
+- Re-read upstream `DeviceMemoryManager` construction, `Map`, `Unmap`, `InnerGatherDeviceAddresses`, `ApplyOpOnPAddr`, and `ApplyOpOnPointer` before replacing Rust's sparse reverse `HashMap` with a dense `compressed_device_addr` table. The current SMMU path derives compressed physical pages from the registered/test-installed `DeviceMemory` `physical_base`; no synthetic physical-page source remains.
+- `cargo test -p video_core gpu_device_memory_manager -- --nocapture`
+- Re-read upstream `DeviceMemory::{GetRawPhysicalAddr,GetPointerFromRaw}` and `DeviceMemoryManager<Traits>::physical_base`, `Map`, `GetPointer`, `ApplyOpOnPAddr`, and `ApplyOpOnPointer` before routing ASID-backed Host1x SMMU pages through `physical_base`-relative raw physical page indices.
+- Re-read upstream `Host1x::Host1x(Core::System&)` and `DeviceMemoryManager<Traits>::DeviceMemoryManager(const DeviceMemory&)` before moving runtime `physical_base` capture into `MaxwellDeviceMemoryManager::new_with_device_memory(...)`.
+- `cargo test -p video_core new_with_device_memory_installs_physical_base -- --nocapture`
+- `cargo check -p video_core`
+- `cargo fmt --check`
+- `git diff --check`
+- `cargo build --release --bin ruzu-cmd`
+- Manual MK8D 120s smoke after moving runtime Host1x `physical_base` capture to construction (`/tmp/mk8d_host1x_physical_base_1780808983.log`, `RUST_LOG=warn`, isolated XDG dirs, no L+R input): reached `am::NotifyRunning`; no `nvmap::IocAlloc`, `0x068B0000`, `BreakLoopNullPc`, panic, SIGSEGV, GL API marker, missing runtime SMMU owner marker, or active-session missing-ASID marker was logged before controlled timeout. This remains sparse-log no-obvious-regression evidence only; warn-level logging does not prove audio/rendering progress.
+- Manual MK8D 120s smoke after upstream 4GiB/8GiB SMMU physical reverse-table sizing (`/tmp/mk8d_smmu_phys_table_1780809419.log`, `RUST_LOG=warn`, isolated XDG dirs, no L+R input): reached `am::NotifyRunning`; no `nvmap::IocAlloc`, `0x068B0000`, `BreakLoopNullPc`, panic, SIGSEGV, GL API marker, missing runtime SMMU owner marker, active-session missing-ASID marker, or runtime SMMU map-missing marker was logged before controlled timeout. This remains sparse-log no-obvious-regression evidence only; warn-level logging does not prove audio/rendering progress.
+- Manual MK8D 120s smoke after storing SMMU physical reverse-table bounds on the constructed `MaxwellDeviceMemoryManager` instance (`/tmp/mk8d_smmu_instance_phys_count_1780809769.log`, `RUST_LOG=warn`, isolated XDG dirs, no L+R input): reached `am::NotifyRunning`; no `nvmap::IocAlloc`, `0x068B0000`, `BreakLoopNullPc`, panic, SIGSEGV, GL API marker, missing runtime SMMU owner marker, active-session missing-ASID marker, or runtime SMMU map-missing marker was logged before controlled timeout. This remains sparse-log no-obvious-regression evidence only; warn-level logging does not prove audio/rendering progress.
+- Manual MK8D 120s smoke after aligning `Container::close_session` teardown ordering (`/tmp/mk8d_container_close_order_1780810104.log`, `RUST_LOG=warn`, isolated XDG dirs, no L+R input): reached `am::NotifyRunning`; no `nvmap::IocAlloc`, `0x068B0000`, `BreakLoopNullPc`, panic, SIGSEGV, GL API marker, missing runtime SMMU owner marker, active-session missing-ASID marker, or runtime SMMU map-missing marker was logged before controlled timeout. The isolated data directory still logged the expected missing `MiiDatabase.dat` file. This remains sparse-log no-obvious-regression evidence only; warn-level logging does not prove audio/rendering progress.
+- Manual MK8D 120s smoke after routing runtime `HeapMapper` and non-preallocated `NvMap::pin_handle` through ASID-registered `MaxwellDeviceMemoryManager::smmu_map(...)` (`/tmp/mk8d_smmu_registered_map_1780810823.log`, `RUST_LOG=warn`, isolated XDG dirs, no L+R input): reached `am::NotifyRunning`; no `nvmap::IocAlloc`, `0x068B0000`, `BreakLoopNullPc`, panic, SIGSEGV, GL API marker, missing runtime SMMU owner marker, active-session missing-ASID marker, runtime SMMU map-missing marker, or unregistered-ASID SMMU map marker was logged before controlled timeout. This remains sparse-log no-obvious-regression evidence only; warn-level logging does not prove audio/rendering progress.
+- Re-read upstream `DeviceMemoryManager<Traits>::Map` and `TrackContinuityImpl` before moving Rust page-split Host1x bridge callers to range-level continuity tracking.
+- Re-read upstream `DeviceMemoryManager<Traits>::Map` before routing `HeapMapper` and non-preallocated `NvMap::pin_handle` through ASID-registered `MaxwellDeviceMemoryManager::smmu_map(...)` instead of resolving host pointers in `core`.
+- Re-read upstream `DeviceMemoryManager<Traits>::Map` and `TrackContinuityImpl` before aligning `MaxwellDeviceMemoryManager::smmu_map(...)` to advance registered-process mappings by device page for unaligned guest virtual addresses.
+- `cargo test -p video_core smmu_map_uses_device_page_progression_for_unaligned_virtual_address_like_upstream -- --nocapture`
+- Re-read upstream `DeviceMemoryManager<Traits>::TrackContinuityImpl` before routing ASID-backed `smmu_map(..., track=true)` continuity through the registered process `Memory::get_pointer_silent(...)` owner.
+- Re-read upstream `DeviceMemoryManager<Traits>::Map`, `Unmap`, and `TrackContinuityImpl` before aligning SMMU page-count coverage to `AlignUp(size, page_size)` rather than device-address-end-page math.
+- `cargo test -p video_core smmu_unmap_uses_upstream_size_only_page_count_for_unaligned_device_address -- --nocapture`
+- Re-read upstream `HeapMapper::Map` and `NvMap::PinHandle` before removing the obsolete `Host1xCoreInterface::smmu_map_with_cpu_backing(...)` runtime bridge; both upstream callsites route through `DeviceMemoryManager::Map(address, virtual_address, size, asid, track)`.
+- `cargo test -p video_core gpu_device_memory_manager -- --nocapture`
+- `cargo check -p video_core`
+- `cargo fmt --check`
+- `git diff --check -- video_core/src/host1x/gpu_device_memory_manager.rs DIFF.md`
+- `cargo build --release --bin ruzu-cmd`
+- Manual MK8D 120s smoke after aligning ASID-backed `MaxwellDeviceMemoryManager::smmu_map(...)` to upstream device-page virtual-address progression (`/tmp/mk8d_smmu_page_progression_1780813509.log`, `RUST_LOG=warn`, isolated XDG dirs, no L+R input): reached `am::NotifyRunning`; no `nvmap::IocAlloc`, `0x068B0000`, `BreakLoopNullPc`, panic, SIGSEGV, `glTextureSubImage3D`, missing runtime SMMU owner marker, active-session missing-ASID marker, runtime SMMU map-missing marker, or unregistered-ASID marker was logged before the controlled timeout. This remains sparse-log no-obvious-regression evidence only; warn-level logging does not prove audio/rendering progress.
+- Manual MK8D 120s smoke after routing ASID-backed SMMU continuity tracking through registered process `Memory::get_pointer_silent(...)` (`/tmp/mk8d_smmu_track_registered_1780813898.log`, `RUST_LOG=warn`, isolated XDG dirs, no L+R input): reached `am::NotifyRunning`; no `nvmap::IocAlloc`, `0x068B0000`, `BreakLoopNullPc`, panic, SIGSEGV, `glTextureSubImage3D`, missing runtime SMMU owner marker, active-session missing-ASID marker, runtime SMMU map-missing marker, or unregistered-ASID marker was logged before the controlled timeout. This remains sparse-log no-obvious-regression evidence only; warn-level logging does not prove audio/rendering progress.
+- Manual MK8D 120s smoke after aligning SMMU map/unmap/continuity page counts to upstream `AlignUp(size, page_size)` semantics (`/tmp/mk8d_smmu_size_pages_1780814355.log`, `RUST_LOG=warn`, isolated XDG dirs, no L+R input): reached `am::NotifyRunning`; no `nvmap::IocAlloc`, `0x068B0000`, `BreakLoopNullPc`, panic, SIGSEGV, `glTextureSubImage3D`, missing runtime SMMU owner marker, active-session missing-ASID marker, runtime SMMU map-missing marker, or unregistered-ASID marker was logged before the controlled timeout. This remains sparse-log no-obvious-regression evidence only; warn-level logging does not prove audio/rendering progress.
+- Re-read upstream `DeviceMemoryManager<Traits>::ApplyOpOnPAddr`, `ApplyOpOnPointer`, and `TrackContinuityImpl` before aligning zero-alias registered physical-page fanout and exact null-pointer continuity counting.
+- Re-read upstream `Container::Container(Tegra::Host1x::Host1x&)`, `NvMap::NvMap(Container&, Tegra::Host1x::Host1x&)`, `Host1x::Host1x(Core::System&)`, and `MemoryManager(Core::System&, MaxwellDeviceMemoryManager&)` before restricting the remaining ownerless `Container::new()` constructor to tests.
+- Re-read upstream `Container::CloseSession` before aligning Rust session teardown ordering around `UnmapAllHandles`, preallocated `HeapMapper` reset, SMMU free, inactive flag, ASID unregister, and id-pool recycling.
+- Re-read upstream `Host1x::Host1x(Core::System&)`, `Host1x::System()`, and `core.cpp` subsystem setup before adding `Host1x::new_with_system(...)` and routing the runtime frontend factory through `SystemRef::from_ref(system)`.
+- `cargo check -p core`
+- `cargo test -p core ownerless_container_does_not_expose_valid_smmu_asid -- --nocapture`
+- `cargo check -p video_core --tests`
+- `cargo check --bin ruzu-cmd`
+- `cargo test -p video_core gpu_device_memory_manager -- --nocapture`
+- `cargo build --release --bin ruzu-cmd`
+- Manual MK8D smoke after `physical_base` SMMU mapping (`/tmp/mk8d_physical_base_1780780973.log`, `RUST_LOG=warn`): reached `am::NotifyRunning`; no `0x068B0000`, `BreakLoopNullPc`, panic, SIGSEGV, `IocAlloc`, `glTextureSubImage3D`, or GL API marker was logged before controlled timeout. This is smoke-level no-obvious-regression evidence only; warn-level logging does not prove audio/rendering progress.
+- Manual MK8D smoke after dense `compressed_device_addr`: first 90s run `/tmp/mk8d_dense_reverse_1780780272.log` reproduced the known early sparse-log stall before `NotifyRunning`; retry `/tmp/mk8d_dense_reverse_retry_1780780385.log` reached `am::NotifyRunning` and timed out with no `0x068B0000`, `BreakLoopNullPc`, panic, SIGSEGV, `glTextureSubImage3D`, or GL API error marker. This is smoke-level no-obvious-regression evidence only; warn-level logging does not prove audio/rendering progress.
+- `cargo build --release --bin ruzu-cmd`
+- `cargo test -p video_core smmu_register_process_reuses_unregistered_asids -- --nocapture`
+- Manual MK8D 120s smoke after matching upstream `Unmap` continuity preservation and null-backing `Map` compressed-physical-only clearing (`/tmp/mk8d_smmu_unmap_nullmap_1780778327.log`, `RUST_LOG=warn`, isolated XDG dirs, no L+R input): reached `am::NotifyRunning`; no `0x068B0000`, `BreakLoopNullPc`, panic, SIGSEGV, `IocAlloc`, or `glTextureSubImage3D` marker was logged before timeout. This is smoke-level no-obvious-regression evidence only; warn-level logging does not prove audio start or rendering progress.
+- Manual MK8D 180s smoke after ASID -> `Memory` owner routing (`/tmp/mk8d_registered_memory_asid_targeted_1780769575.log`, targeted `RUST_LOG`): reached `OpenAudioRenderer` and `am::NotifyRunning`; no `0x068B0000`, `BreakLoopNullPc`, panic, SIGSEGV, `glTextureSubImage3D`, or GL API error was logged before timeout. The run did not reproduce the known late `0x068B0000` blocker, but it is not proof that the blocker is fixed.
+- Manual MK8D profile run for the same slice (`/tmp/mk8d_registered_memory_asid_profile_1780769802.log`, `SIGUSR2` dump before termination): `UpdatePagesCachedCount`, `Memory::rasterizer_mark_region_cached`, and the fallback mark-region callback all reported `last_stage=exit`, so no cache-path lock inversion was observed in that run.
 
 ## 2026-06-04 — video_core/src/host1x/ffmpeg/ffmpeg.rs and video_core/src/host1x/ffmpeg/ffmpeg_shim.c vs /home/vricosti/Dev/emulators/zuyu/src/video_core/host1x/ffmpeg/ffmpeg.cpp and /home/vricosti/Dev/emulators/zuyu/src/video_core/host1x/ffmpeg/ffmpeg.h
 
@@ -532,7 +836,7 @@
 - N/A: SVC validation/result-code behavior only. No guest-visible raw payload layout changed.
 
 ### Tests
-- Attempted `cargo test -p core failed_shared_memory_region_uses_upstream_result -- --nocapture`, but the crate's current test build still fails on pre-existing test-only errors before running this test (`KThreadLock`/`ProcessLock` imports, stale `GuestMemory::new` signatures, private test fields, etc.).
+- Attempted `cargo test -p core failed_shared_memory_region_uses_upstream_result -- --nocapture`, but the crate's current test build still fails on pre-existing test-only errors before running this test (stale `CoreTiming` APIs, older tests that still call removed `KProcess::read_block/write_block` helpers directly, stale `GuestMemory::new` signatures, private test fields, etc.).
 - `cargo check -p core`
 
 ## 2026-06-03 — video_core/src/host1x/vic.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/host1x/vic.cpp and vic.h
@@ -654,14 +958,15 @@
 ## 2026-06-03 — video_core/src/host1x/{host1x.rs,nvdec.rs,codecs/decoder.rs,codecs/h264.rs,codecs/vp8.rs,codecs/vp9.rs} vs /home/vricosti/Dev/emulators/zuyu/src/video_core/host1x/{host1x.cpp,nvdec.cpp,codecs/decoder.cpp,codecs/h264.cpp,codecs/vp8.cpp,codecs/vp9.cpp}
 
 ### Intentional differences
-- Rust passes `NvdecRegisters` and `MaxwellDeviceMemoryManager` into `DecoderImpl` methods at decode time instead of storing C++-style references in the abstract decoder base class. This keeps the same live data source as upstream while avoiding self-referential Rust ownership between `Nvdec.regs` and codec trait objects.
-- `Nvdec` stores an `Arc<MaxwellDeviceMemoryManager>` supplied by `Host1x::start_device`, whereas upstream decoders reach the memory manager through `Host1x&` and `Decoder::memory_manager`. This preserves the same Host1x-owned memory-manager instance and avoids introducing unsafe back-references.
+- Rust still passes `NvdecRegisters` into `DecoderImpl` methods at decode time instead of storing a C++-style `const NvdecRegisters&` in the abstract decoder base class. This keeps the same live register source while avoiding self-referential Rust ownership between `Nvdec.regs` and codec trait objects.
+- `DecoderState` now stores the Host1x-owned `Arc<MaxwellDeviceMemoryManager>` and `Arc<FrameQueue>` for all codec implementations, matching upstream `Decoder::memory_manager` and `Decoder::frame_queue` ownership direction without introducing unsafe back-references through `Host1x&`.
+- `Nvdec` stores an `Arc<MaxwellDeviceMemoryManager>` supplied by `Host1x::start_device`, whereas upstream decoders reach the memory manager through `Host1x&`. This preserves the same Host1x-owned memory-manager instance and avoids introducing unsafe back-references.
 - H264 context loading uses a zeroed Rust `H264DecoderContext` followed by a raw byte copy from guest memory. This matches upstream's raw `ReadBlock` into the trivial C++ struct while keeping deterministic initialization for Rust padding/reserved bytes.
 - `Nvdec::execute` now mirrors upstream's disabled-NVDEC policy: when `Settings::values.nvdec_emulation == Off`, it sleeps for 8 ms and returns without decoding so games do not observe an unrealistically fast syncpoint signal.
 
 ### Unintentional differences (to fix)
-- Upstream `Decoder` owns live references to `Host1x`, `memory_manager`, `regs`, and `frame_queue`; ruzu still distributes those dependencies between `Nvdec` and per-call trait arguments. Behavior is closer than before, but the ownership shape is not yet a strict class-layout port.
-- VP8 and VP9 method signatures receive live registers/memory, but their `ComposeFrame` methods remain stubs instead of the upstream implementations.
+- Upstream `Decoder` owns live references to `Host1x` and `regs`; ruzu still keeps `Host1x` out of the codec base and passes `NvdecRegisters` into codec methods at decode time. Behavior is closer than before, but the ownership shape is not yet a strict class-layout port.
+- VP8 and VP9 method signatures receive live registers, but their `ComposeFrame` methods remain stubs instead of the upstream implementations.
 - H264 `compose_frame` returns an owned `Vec<u8>` clone, while upstream returns a span over `frame_scratch`; this adds allocation/copy overhead and is less faithful to upstream ownership.
 
 ### Missing items
@@ -769,13 +1074,14 @@
 - Rust `UnmapMemory` keeps existing diagnostic `log::error!` records around failure exits. Upstream has no equivalent logs; they are host-only diagnostics and do not change return values or memory-block updates.
 
 ### Unintentional differences (to fix)
-- Rust rollback helpers for `MapMemory`/`UnmapMemory` are not exact upstream `ON_RESULT_FAILURE` equivalents: `UnmapMemory` lacks an upstream-shaped `RemapPageGroup(updater.GetPageList(), dst_address, size, pg)` rollback when source permission restore fails.
-- `MapMemory`/`UnmapMemory` still allocate block-update nodes through the Rust helper's default maximum-block reservation instead of threading the exact `num_src_allocator_blocks` / `num_dst_allocator_blocks` counts returned by upstream `CheckMemoryState`.
+- None identified in the audited `MapMemory` / `UnmapMemory` memory-block update and rollback slice.
 
 ### Binary layout verification
 - N/A: kernel memory-state flags and page-table validation policy only. No guest-visible raw payload layout changed.
 
 ### Tests
+- Re-read upstream `KPageTableBase::UnmapMemory` and `KPageTableBase::RemapPageGroup`.
+- Re-read upstream `KPageTableBase::MapMemory` / `UnmapMemory` allocator construction around `num_src_allocator_blocks` and `num_dst_allocator_blocks`.
 - `cargo check -p core`
 - MK8D 110s runtime validation without GL readback: `HWC compose_layer` reached frame 6499, and stderr contained no `UnmapMemory`, `MapMemory failed`, `Userspace PANIC`, or `KThread::Exit` errors.
 
@@ -814,8 +1120,11 @@
 - N/A: host-only trace records. No guest-visible raw payload layout changed.
 
 ### Tests
+- Re-read upstream `syncpoint_manager.{h,cpp}` before adding focused tests for sorted action insertion/firing and deregistration without executing callbacks.
 - `cargo check -p common`
 - `cargo check -p video_core`
+- `cargo test -p video_core actions_fire_in_expected_value_order -- --nocapture`
+- `cargo test -p video_core deregistered_action_does_not_fire -- --nocapture`
 
 ## 2026-06-02 — common/src/trace.rs, common/src/trace.example.toml, and video_core/src/host1x/syncpoint_manager.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/host1x/syncpoint_manager.cpp and syncpoint_manager.h
 
@@ -883,6 +1192,8 @@
 
 ### Tests
 - `cargo check -p video_core`
+- Re-read upstream `cdma_pusher.{h,cpp}`, `host1x/nvdec.{h,cpp}`, and `host1x/codecs/decoder.{h,cpp}` before moving `MaxwellDeviceMemoryManager` and `FrameQueue` into Rust `DecoderState`.
+- `cargo test -p video_core decoder_state_owns_memory_manager_and_frame_queue_handles -- --nocapture`
 
 ## 2026-06-03 — video_core/src/renderer_opengl/gl_texture_cache.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_texture_cache.cpp and gl_texture_cache.h
 
@@ -1154,22 +1465,29 @@
 - `NvHostNvDecCommon` stores `Arc<NvMap>` and `Arc<SyncpointManager>` handles from `Container` instead of raw references. This preserves the upstream ownership relationship while avoiding a new raw pointer in this path.
 - `NvHostNvDecCommon::Submit` reads command buffers through ruzu's shared application memory accessor. Upstream reads through `session->process->GetMemory()`; both use the `NvMap` object's CPU guest address plus command-buffer offset.
 - `Host1x::start_device` now passes the shared `MaxwellDeviceMemoryManager` into `Vic`. Upstream gives `Vic` a `Host1x&` and `Vic::Execute` reads/writes through `host1x.MemoryManager()`; ruzu preserves that ownership through an `Arc<MaxwellDeviceMemoryManager>` until the full Host1x reference model is ported.
+- `CDmaPusher::push_entries` now mirrors upstream `CDmaPusher::PushEntries` by enqueueing command lists and waking a per-pusher worker thread. The Rust worker uses `Arc<CDmaPusherInner>`, `Mutex`, and `Condvar` instead of C++ `std::jthread` / `std::condition_variable`, preserving the same queue-drain ownership without raw self pointers.
+- `CDmaPusherInner::process_entries` sets the host worker priority to `ThreadPriority::High` before entering the command-drain loop, matching upstream `Common::SetCurrentThreadPriority(Common::ThreadPriority::High)`.
 
 ### Unintentional differences (to fix)
-- `Host1x::StartDevice` creates concrete `Nvdec` and `Vic` processors, but the lower-level processors remain incomplete: codec frame composition is not yet sufficient for all upstream video paths.
-- `CDmaPusher::PushEntries` still processes command lists inline; upstream queues them to a worker thread. Parser state is preserved, but async timing parity is not complete.
+- The lower-level `Nvdec` / `Vic` processors remain incomplete: codec frame composition is not yet sufficient for all upstream video paths.
 
 ### Missing items
 - Complete codec frame composition, especially `video_core/src/host1x/codecs/h264.rs::compose_frame`, against upstream `video_core/host1x/codecs/h264.cpp`.
-- Port Host1x command-pusher worker-thread queueing if video workloads require upstream async timing.
 
 ### Binary layout verification
 - PASS: existing `repr(C)` size assertions remain in place for `IoctlSubmit`, `CommandBuffer`, `Reloc`, `SyncptIncr`, `IoctlMapBuffer`, and `MapBufferEntry` payloads used by the fixed-variable ioctls.
 
 ### Tests
+- Re-read upstream `video_core/cdma_pusher.{h,cpp}` before validating the Rust queue/worker structure, parser-state lifetime, `IncSyncpt` guest+host increment ordering, and stop-request destructor behavior.
+- `cargo test -p video_core push_entries_is_drained_by_worker_thread -- --nocapture`
+- `cargo test -p video_core parser_state_persists_across_queued_command_lists -- --nocapture`
 - `cargo check --bin ruzu-cmd`
 - PASS: `cargo check -p core`
-- BLOCKED: `cargo test -p core nvhost_nvdec_common_reuses_recycled_syncpoint_like_upstream -- --nocapture` does not reach the new test because `core` lib-test compilation currently fails in unrelated tests/code paths.
+- `cargo check -p video_core`
+- `cargo fmt --check`
+- `git diff --check`
+- MK8D runtime validation with filtered `RUZU_TRACE_RT_SAMPLE_PIPELINE=31`: confirmed pipeline 31 render-target samples/grid are non-zero with `gl_error=0x0`.
+- Manual MK8D 90s smoke after moving `CDmaPusher::PushEntries` to the worker-queue path (`/tmp/mk8d_cdma_worker_1780805101.log`, `RUST_LOG=warn`, isolated XDG dirs, no L+R input): reached `am::NotifyRunning`; no `nvmap::IocAlloc`, `0x068B0000`, `BreakLoopNullPc`, panic, SIGSEGV, `glTextureSubImage3D`, missing SMMU ASID, or runtime SMMU owner marker was logged before controlled timeout. Warn-level logging does not prove late video/audio progress.
 
 ## 2026-06-01 — video_core/src/renderer_opengl/gl_rasterizer.rs and video_core/src/engines/draw_manager.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_rasterizer.cpp
 
@@ -1412,13 +1730,19 @@
 - Rust `KTransferMemory::finalize(...)` still takes `&mut KProcessPageTable` explicitly instead of reading `m_owner->GetPageTable()` directly. This avoids re-locking the process while `KProcess` already owns the registry teardown path.
 
 ### Unintentional differences (to fix)
-- `Initialize(...)` still does not perform the upstream owner `Open()` bookkeeping, and `post_destroy(...)` therefore still cannot mirror `owner->Close()` literally.
+- `Initialize(...)` performs the upstream-shaped `page_table.LockForTransferMemory(&mut m_page_group, ...)` and `Finalize(...)` performs the upstream-shaped `UnlockForTransferMemory(address, size, m_page_group)` validation, but still does not perform the upstream owner `Open()` bookkeeping; `post_destroy(...)` therefore still cannot mirror `owner->Close()` literally.
 
 ### Missing items
 - Full upstream owner refcount parity (`owner->Open()` / `owner->Close()`).
 
 ### Binary layout verification
 - PASS: runtime-only object; no raw-serialized struct layout changed in this slice.
+
+### Tests
+- `cargo check -p core`
+- `cargo test -p core close_handle_recoalesces_transfer_memory_split_heap_region -- --nocapture`
+- `cargo test -p core close_handle_runs_transfer_memory_post_destroy_resource_release -- --nocapture`
+- `cargo test -p core set_heap_size_maps_heap_region_in_page_table -- --nocapture`
 
 ## 2026-04-17 — core/src/hle/kernel/k_process.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/k_process.h and /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/k_process.cpp
 
@@ -1435,13 +1759,17 @@
 ## 2026-04-17 — core/src/hle/kernel/svc/svc_transfer_memory.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/svc/svc_transfer_memory.cpp
 
 ### Intentional differences
-- Rust now reserves/releases `TransferMemoryCountMax` around `CreateTransferMemory`, matching the upstream object lifecycle more closely even though the actual object lifetime is still backed by Rust side registries plus opaque handle-table object IDs.
+- Rust reserves/releases `TransferMemoryCountMax` around `CreateTransferMemory`, matching the upstream object lifecycle more closely even though the actual object lifetime is still backed by Rust side registries plus opaque handle-table object IDs.
+- Rust passes `&mut process.page_table` into `KTransferMemory::initialize(...)` because the Rust object does not own a live implicit `KernelCore`/current-process lookup. The lock now happens inside `KTransferMemory::initialize(...)`, matching upstream method ownership.
 
 ### Unintentional differences (to fix)
 - `CreateTransferMemory` still initializes `KTransferMemory` from the current-process `Arc<Mutex<KProcess>>` rather than via the upstream implicit `GetCurrentProcessPointer(m_kernel)` path inside the kernel object constructor/initializer.
 
 ### Binary layout verification
 - PASS: SVC handler file; no raw-serialized structs affected.
+
+### Tests
+- `cargo check -p core`
 
 ## 2026-04-17 — core/src/hle/kernel/k_handle_table.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/k_handle_table.h and /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/k_handle_table.cpp
 
@@ -1524,13 +1852,14 @@
 
 ### Intentional differences
 - Rust uses `AtomicU64` for `Handle::orig_size` so `devices/nvmap.rs` can mirror the upstream post-creation `orig_size` overwrite through shared `Arc<Handle>` ownership. This is a narrow interior-mutability adaptation that preserves ownership in the same files.
-- Host1x/GMMU-backed pin/unmap still use the existing Rust placeholder mapping path until the upstream host1x memory-manager owners are fully ported.
+- Host1x/SMMU-backed non-heap pin/unmap goes through the core-facing Host1x bridge (`smmu_map_with_cpu_backing`, `smmu_unmap`, `smmu_free`) rather than a direct `Tegra::Host1x::Host1x&`, because the Rust `core` crate cannot store the concrete video_core Host1x type directly.
+- Rust gives `NvMap` access to session preallocation through a shared `ContainerSessionStore` rather than upstream's literal `Container& core` member. This avoids a Rust self-reference cycle while preserving owner placement in `core/nvmap.rs`: `pin_handle` decides between `session->mapper->Map(...)` and the non-heap SMMU fallback, and forced unmap reaches the same session mapper from `NvMap`.
 
 ### Unintentional differences (to fix)
-- `pin_handle` / `free_handle` still do not perform the full upstream host1x allocator and GMMU/SMMU unmap sequence.
+- None identified for the owner-local `PinHandle(..., true)` low-area pin path after comparing against upstream's `host1x.Allocator().Allocate(...)` / `host1x.GMMU().Map(...)` and `UnmapHandle` ordering.
 
 ### Missing items
-- Full host1x-backed `PinHandle` / `UnmapHandle` parity.
+- None in this older owner-local `PinHandle` slice; the newer 2026-06-05 `NvMap` entry tracks the current safe `ContainerSessionStore` adaptation and remaining Host1x/device-memory table work.
 
 ### Binary layout verification
 - PASS: runtime-only ownership file; no raw-serialized structs defined here.
@@ -2213,10 +2542,10 @@
 ## 2026-03-28 — `core/src/hle/service/nvdrv/devices/nvmap.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/hle/service/nvdrv/devices/nvmap.cpp`
 
 ### Intentional differences
-- Rust still omits the full Host1x-backed SMMU/GMMU integration present upstream. The owner file remains responsible for nvmap device ioctl behavior.
+- The owner file remains responsible for nvmap device ioctl behavior. Host1x-backed SMMU/GMMU lifecycle details are now tracked by the newer `core/src/hle/service/nvdrv/core/nvmap.rs`, `core/src/host1x_core.rs`, `video_core/src/host1x/host1x.rs`, and `video_core/src/host1x/gpu_device_memory_manager.rs` entries.
 
 ### Missing items
-- Full upstream success path still expects Host1x-backed handle pinning and address-space mapping in `NvCore::NvMap`.
+- None in this older device-ioctl slice; continue auditing the newer `NvCore::NvMap` / Host1x device-memory entries for remaining owner-reference and compressed-table parity work.
 
 ### Binary layout verification
 - PASS: `IocAllocParams` layout unchanged; fixed only post-allocation lifecycle behavior.
@@ -2253,13 +2582,20 @@
 
 ### Intentional differences
 - Rust reaches upstream `Tegra::MemoryManager` behavior through the cross-crate `GpuMemoryManagerHandle` bridge instead of constructing the concrete video-core owner type directly in this file.
+- Rust stores `Allocation::mappings` as `Vec<Arc<Mapping>>` instead of upstream `std::list<std::shared_ptr<Mapping>>`. This preserves insertion order and shared ownership with `mapping_map`; `FreeSpace` now stops on a stale mapping like upstream `FreeMappingLocked(mapping_map.at(...))`, while `UnmapBuffer` still returns success for missing mappings like upstream's caught `std::out_of_range` path.
 
 ### Missing items
-- `GetVARegionsImpl` still synthesizes the two regions from stored VM bounds rather than the upstream allocator getters.
-- The current Rust `Allocation::mappings` uses offset bookkeeping rather than the upstream `std::list<std::shared_ptr<Mapping>>`.
+- None identified for the audited VA-region and mapping-owner behavior slice.
 
 ### Binary layout verification
 - PASS: ioctl struct layouts unchanged; fixed only owner-local mapping bookkeeping and pin/unpin lifecycle.
+
+### Tests
+- Re-read upstream `nvhost_as_gpu.cpp` / `nvhost_as_gpu.h` around `GetVARegionsImpl`, `FreeMappingLocked`, `FreeSpace`, and `UnmapBuffer` before auditing the Rust VA-region and mapping-owner behavior.
+- `cargo check -p core`
+- `cargo test -p core unmap_buffer_missing_mapping_returns_success_like_upstream -- --nocapture`
+- `cargo test -p core free_space_stops_on_stale_fixed_mapping_like_upstream -- --nocapture`
+- `cargo test -p core hle::service::nvdrv::devices::nvhost_as_gpu::tests -- --nocapture`
 
 ## 2026-03-28 — `core/src/arm/debug.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/arm/debug.cpp`
 
@@ -2349,22 +2685,23 @@
 - The bridge still constructs the memory-manager object through `GpuCoreInterface` because `core` and `video_core` remain split crates, unlike the monolithic upstream tree.
 
 ### Missing items
-- The concrete `Tegra::MemoryManager` behavior (`Map`, `MapSparse`, `Unmap`, rasterizer binding, address translation with system memory backing) is still only partially ported behind `VideoGpuMemoryManagerHandle`.
+- None identified for the audited bridge surface: `VideoGpuMemoryManagerHandle` forwards `Map`, `MapSparse`, `Unmap`, and rasterizer binding into the current video-core `MemoryManager`. Remaining differences are owner-shape adaptations (`Arc<Mutex<MemoryManager>>` and cross-crate type erasure), not missing `nvhost_as_gpu` GMMU calls.
 
 ### Binary layout verification
-- PASS: no ioctl or serialized layout changed; fixed only GPU-side owner transfer semantics.
+- PASS: no ioctl or serialized layout changed; this slice covers GPU-side owner transfer semantics only.
 
 ## 2026-03-29 — `core/src/hle/service/nvdrv/devices/nvhost_as_gpu.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/hle/service/nvdrv/devices/nvhost_as_gpu.cpp`
 
 ### Intentional differences
-- Rust still lacks the full upstream `Tegra::MemoryManager` backend, so the new `gmmu` field stores an opaque bridge handle instead of a concrete `shared_ptr<Tegra::MemoryManager>`.
+- Rust stores the `gmmu` field as an opaque `GpuMemoryManagerHandle` bridge instead of upstream's concrete `std::shared_ptr<Tegra::MemoryManager>` because `core` cannot depend directly on the concrete `video_core::memory_manager::MemoryManager` type. The bridge forwards `Map`, `MapSparse`, `Unmap`, channel binding, and `GPU::InitAddressSpace(...)` ownership into video_core.
 - `AllocAsEx` now allocates the upstream-equivalent owner object, and the bridge now forwards `MapBufferEx` / `Remap` / sparse allocation teardown into `gmmu->Map(...)` / `MapSparse(...)` / `Unmap(...)`.
+- `GPU::InitAddressSpace(...)` now binds the renderer rasterizer to the concrete video_core `MemoryManager` behind the bridge, preserving upstream rasterizer invalidation/unmap callbacks without exposing the concrete type through the `core` crate boundary.
 
 ### Missing items
-- The `gmmu` handle still wraps a simplified `video_core::memory_manager::MemoryManager` backend, so page kinds, big-page semantics, sparse-vs-reserved distinction, rasterizer invalidation, and host1x device-memory parity remain incomplete.
+- None identified for this older `nvhost_as_gpu` GMMU bridge slice after re-reading upstream `nvhost_as_gpu.cpp` and current `GpuMemoryManagerHandle`: sparse reservations, remaps, unmaps, `BindChannel`, and `InitAddressSpace` rasterizer binding are forwarded to the current upstream-shaped video_core `MemoryManager`. Remaining `MemoryManager` owner-shape work is tracked in the dedicated `memory_manager.rs` and Host1x/device-memory entries.
 
 ### Binary layout verification
-- PASS: `IoctlAllocAsEx`, `IoctlMapBufferEx`, `IoctlRemapEntry`, and `IoctlBindChannel` layouts unchanged; fixed only owner lifecycle and transfer semantics.
+- PASS: `IoctlAllocAsEx`, `IoctlMapBufferEx`, `IoctlRemapEntry`, and `IoctlBindChannel` layouts unchanged; this slice covers owner lifecycle and transfer semantics only.
 
 ## 2026-03-29 — `core/src/hle/service/nvdrv/devices/nvhost_gpu.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/hle/service/nvdrv/devices/nvhost_gpu.cpp`
 
@@ -2372,7 +2709,7 @@
 - Event destruction still uses the local no-op `EventInterface::free_event(...)` placeholder because the full upstream service-context close path is not present yet.
 
 ### Binary layout verification
-- PASS: no ioctl payload layout changed; fixed only memory-manager ownership transfer.
+- PASS: no ioctl payload layout changed; this slice covers memory-manager ownership transfer only.
 
 ## 2026-03-29 — `core/src/hle/service/nvdrv/nvdrv.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/hle/service/nvdrv/nvdrv.cpp`
 
@@ -2385,22 +2722,55 @@
 ## 2026-03-29 — `video_core/src/memory_manager.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/memory_manager.{h,cpp}`
 
 ### Intentional differences
-- Rust still uses a simplified owner-local page-table backend instead of the upstream `Common::MultiLevelPageTable<u32>`, `RangeMap<GPUVAddr, PTEKind>`, `VirtualBuffer<u32> big_page_table_dev`, and `MaxwellDeviceMemoryManager`.
-- `PTEKind` is still stored as raw `u32` values inside page entries (`kind_raw`) instead of the upstream `kind_map` owner object.
-- Rasterizer-backed behavior (`BindRasterizer`, `ModifyGPUMemory`, `FlushRegion`, `InvalidateRegion`, `UnmapMemory`, `InnerInvalidation`, `InvalidationAccumulator`) remains stubbed or absent in Rust.
-- The Rust API still exposes a convenience wrapper `GpuMemoryManager` alongside the upstream-owner `MemoryManager`; this is temporary compatibility debt for current callsites.
+- Rust still exposes a compatibility wrapper `GpuMemoryManager` alongside the upstream-owner `MemoryManager`; this is temporary compatibility debt for current callsites.
+- Rust stores the rasterizer through `RasterizerHandle` instead of upstream's raw `VideoCore::RasterizerInterface*`, preserving the same non-owning relationship without embedding a raw trait-object pointer in every caller.
+- Rust stores the split-crate `MaxwellDeviceMemoryManager` owner as a non-optional `Arc` on both the outer `MemoryManager` wrapper and inner `GpuMemoryManager`. This preserves upstream's mandatory `MaxwellDeviceMemoryManager& memory` dependency without introducing Rust self-references across the `Gpu` / Host1x / channel graph.
+- Runtime constructors cover the main owner-backed paths audited in this branch: `Gpu::allocate_memory_manager_handle`, Host1x's local GMMU `MemoryManager`, and legacy `GpuContext::new` all construct `MemoryManager` instances with a `MaxwellDeviceMemoryManager` owner. `Gpu::allocate_memory_manager_handle` now requires the Host1x owner to exist instead of fabricating an ownerless fallback. The compatibility `GpuContext::new` path shares one `MemoryManager` across Maxwell3D, KeplerCompute, Fermi2D, and MaxwellDMA, and its legacy inner `GpuMemoryManager` field is also built with the same `MaxwellDeviceMemoryManager` owner. This matches upstream `ChannelState::Init`'s shared `*memory_manager` owner direction more closely. The remaining engine `Default` constructors that create ownerless `MemoryManager::new(...)` instances are compiled only for tests, so production engine construction must pass an explicit `MemoryManager` owner like upstream.
+- `MemoryManager::new(...)`, `MemoryManager::new_with_geometry(...)`, `Default for MemoryManager`, `GpuMemoryManager::new(...)`, `GpuMemoryManager::with_params(...)`, and `Default for GpuMemoryManager` are test-only; production construction must use an explicit device-memory owner.
+- `MemoryManager::get_span` now follows upstream ordering: `IsContinuousRange` guard, `GpuToCpuAddress`, then `MaxwellDeviceMemoryManager::get_span`. The device-memory side uses ruzu's dense SMMU continuity metadata and preserves the same `size + page_offset <= continuity_pages << page_bits` acceptance rule.
+- Big-page mapping now computes `big_page_continuous` by checking `MaxwellDeviceMemoryManager::get_pointer(...)` for every 4 KiB sub-page, matching upstream `BigPageTableOp`'s `memory.GetPointer<u8>(...)` continuity loop.
+- `MemoryManager::read_block` now mirrors upstream `ReadBlockImpl<true>` by flushing each mapped device segment before reading it through the owner-backed device-memory path. `MemoryManager::read_block_unsafe` keeps the upstream `ReadBlockImpl<false>` behavior and does not flush.
+- `MemoryManager::copy_block` uses a temporary Rust `Vec<u8>` instead of upstream `GpuGuestMemoryScoped<SafeReadWrite>`, but preserves the observable ordering: read source GPU VA, write destination GPU VA, then `FlushRegion(gpu_dest, size)`.
+- `MaxwellDeviceMemoryManager::smmu_write_block_unsafe` now mirrors upstream `DeviceMemoryManager<Traits>::WriteBlockUnsafe` by writing mapped bytes without invoking the invalidate callback. `MemoryManager::write_block_unsafe` uses that path for GPU query/result writebacks.
 
 ### Missing items
-- Big-page vs small-page dual-table behavior is still not implemented with the upstream split (`entries`, `big_entries`, `big_page_table_dev`, `big_page_continuous`).
-- `MemoryOperation`, `ReadBlockImpl`, `WriteBlockImpl`, `WriteBlockCached`, `CopyBlock`, `GetSpan`, `FlushCaching`, `IsMemoryDirty`, and `GetSubmappedRangeImpl<false>` are still missing or simplified relative to upstream.
-- `GetPageKind` still lacks the upstream `RangeMap` ownership and typed `PTEKind` return path.
-- `Map`, `MapSparse`, and `Unmap` still do not call rasterizer invalidation/update hooks in upstream order.
+- None identified for the audited runtime constructor-owner slice. Reduced fixture-only constructors remain test-only adaptations; broader storage-shape differences are tracked in the newer owner-graph entry.
 
 ### Binary layout verification
 - PASS: no raw serialized structs were changed in this slice; behavior changes are confined to owner-local page-table state and helper methods.
 
 ### Tests
 - `cargo test -p video_core test_memory_manager_wrapper -- --nocapture`
+- `cargo test -p video_core get_span_requires_recorded_continuity -- --nocapture`
+- `cargo test -p video_core get_span_translates_gpu_range_through_device_memory -- --nocapture`
+- `cargo test -p video_core memory_manager -- --nocapture`
+- `cargo test -p video_core big_page_continuity_uses_device_memory_pointers -- --nocapture`
+- `cargo test -p video_core read_block_flushes_but_read_block_unsafe_does_not -- --nocapture`
+- `cargo test -p video_core copy_block_flushes_destination_device_range -- --nocapture`
+- `cargo test -p video_core write_block_unsafe_does_not_invalidate_range -- --nocapture`
+- `cargo test -p video_core write_block_unsafe_uses_device_memory_without_invalidation -- --nocapture`
+- `cargo check -p video_core`
+- Re-read upstream engine constructors in `kepler_compute.{h,cpp}`, `kepler_memory.{h,cpp}`, `maxwell_dma.{h,cpp}`, `fermi_2d.{h,cpp}`, and `sw_blitter/blitter.{h,cpp}`; Rust engine `Default` impls are now `#[cfg(test)]`, preventing ownerless production engine construction.
+- `cargo check -p video_core --tests`
+
+## 2026-06-06 — `video_core/src/gpu_context.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/memory_manager.{h,cpp}`
+
+### Intentional differences
+- `GpuContext` is a Rust compatibility context with no direct upstream C++ owner file. Its engine construction now shares one owner-backed `MemoryManager` across Maxwell3D, KeplerCompute, Fermi2D, and MaxwellDMA, matching upstream `ChannelState::Init`'s `std::make_unique<Engine>(..., *memory_manager)` dependency direction more closely than the previous separate/ownerless compatibility managers.
+- The context still owns a separate compatibility `GpuMemoryManager` for its software-facing GPFIFO flush path, but that path now reads pushbuffers through the owner-backed `GpuMemoryManager::read_block(...)` instead of accepting a guest-memory reader callback. Upstream does not have this compatibility context; the main upstream-shaped runtime path is `Gpu`/`ChannelState` plus Host1x-owned device memory.
+
+### Unintentional differences (to fix)
+- `GpuContext` still exists as a compatibility architecture around software/Vulkan flushing, while upstream routes through the normal GPU/channel/Host1x owner graph.
+
+### Missing items
+- Remove or retire `GpuContext` once all current callsites use the upstream-shaped `Gpu` / `ChannelState` / Host1x path.
+
+### Binary layout verification
+- N/A: constructor ownership only. No guest-visible raw payload layout changed.
+
+### Tests
+- Re-read upstream `MemoryManager` constructors before replacing the ownerless engine managers.
+- Re-read upstream `GPU::Impl`, `ChannelState::Init`, and `MemoryManager::ReadBlockImpl` before removing `GpuContext::flush`'s guest-memory callback transport.
 - `cargo check -p video_core`
 
 ## 2026-03-29 — `core/src/gpu_core.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/gpu.h`
@@ -2455,7 +2825,7 @@
 ## 2026-03-29 — `video_core/src/gpu.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/gpu.{h,cpp}`
 
 ### Intentional differences
-- Rust now carries a temporary `guest_memory_reader` callback bridge so `video_core::DmaPusher` can fetch GPU command words through the frontend-owned core memory while `video_core::GPU` still lacks the upstream `Core::System&` ownership. This is a Rust-only adaptation that should disappear once `GPU` owns the same memory backing path as upstream.
+- Rust still keeps a `GPU` raw-pointer bridge in `DmaPusher` for upstream `gpu.FlushCommands()` / `gpu.OnCommandListEnd()` ownership, but command-word fetching now goes through the stored `MemoryManager` owner instead of the older `guest_memory_reader` callback bridge. This matches upstream `DmaPusher::Step`, which constructs `GpuGuestMemory(..., memory_manager, ...)` for safe/unsafe command-buffer reads.
 
 ### Unintentional differences (to fix)
 - `GPU` still does not own upstream `Core::System&`, so several owner-local methods remain simplified around memory and sync integration.
@@ -2549,10 +2919,10 @@
 ## 2026-03-30 — video_core/src/engines/maxwell_3d.rs vs video_core/engines/maxwell_3d.cpp
 
 ### Intentional differences
-- Upstream writes report query fallback results through `memory_manager` owned directly by `Maxwell3D`; Rust preserves the same owner and ordering but routes the final CPU write through the injected `guest_memory_writer` callback because `video_core` does not own the full `Core::System` object.
+- None identified for the report-semaphore fallback write path in current code: runtime writes route through the stored `MemoryManager` owner when present. Ownerless reduced fixtures remain local test adaptations.
 
 ### Missing items
-- Full ownership split cleanup for the Rust-only `guest_memory_reader` / `guest_memory_writer` bridges.
+- Continue the broader ownership split cleanup tracked by newer entries; this older report-semaphore slice no longer carries a distinct writer-callback gap.
 
 ### Binary layout verification
 - PASS: this slice changes callback wiring/order only; no guest-visible struct layout changed.
@@ -2592,7 +2962,7 @@
 - The outer Rust `MemoryManager` wrapper still exists to preserve crate/lifetime boundaries around `Arc<Mutex<_>>`; upstream exposes the concrete owner directly.
 
 ### Missing items
-- remaining behavioral gaps in the backend noted earlier (`PTEKind`, fuller big-page semantics, and other incomplete owner slices)
+- Remaining behavioral gaps in the backend are tracked in the later `memory_manager.rs` and Host1x device-memory entries.
 
 ### Binary layout verification
 - PASS: no guest-visible struct layout changed in this wrapper slice.
@@ -2601,14 +2971,13 @@
 
 ### Intentional differences
 - Rust still stores the register file as a flat `Box<[u32; ENGINE_REG_COUNT]>` instead of a typed `Regs` union. This slice only corrects the constant placement/routing for the `const_buffer.buffer` method range within that flat owner.
+- `process_cb_multi_data()` logs and returns for null buffer address or offset past size, while upstream uses `ASSERT(...)`. This preserves current emulator survivability for malformed state until the Rust assert policy is aligned globally.
 
 ### Unintentional differences (to fix)
-- `process_cb_multi_data()` still logs instead of performing the full upstream `memory_manager.WriteBlockCached(...)` side effect.
 - `maxwell_3d.rs` still keeps some behavior that upstream owns in auxiliary engine files or richer typed register structs.
 
 ### Missing items
 - full typed-owner parity for `Regs::ConstantBuffer`
-- full `WriteBlockCached` side effect parity in `ProcessCBMultiData`
 
 ### Binary layout verification
 - PASS: this slice corrects method index placement against upstream `Regs::ConstantBuffer`; no new binary payload layout was introduced.
@@ -2717,12 +3086,12 @@
 ## 2026-03-29 — video_core/src/engines/maxwell_3d.rs vs video_core/engines/maxwell_3d.cpp
 
 ### Intentional differences
-- Upstream owns `Core::System&` and `MemoryManager&` directly in `Maxwell3D`; the Rust port still threads guest-memory reads through an injected callback and stores the `MemoryManager` behind `Arc<Mutex<_>>` to preserve crate boundaries.
+- Upstream owns `Core::System&` and `MemoryManager&` directly in `Maxwell3D`; the Rust port stores the runtime `MemoryManager` behind `Arc<Mutex<_>>` to preserve crate boundaries and avoid unsafe self-references. Runtime owner-backed reads/writes now use that `MemoryManager` path; the injected guest-memory callbacks remain only as compatibility/reduced-test plumbing.
 - Upstream reads `Regs::ReportSemaphore::Compare` directly into the C++ struct; Rust currently decodes the same 24-byte block manually in this owner file.
 
 ### Missing items
 - fuller `Core::System` ownership parity in the constructor
-- direct `memory_manager.ReadBlock(...)` owner wiring instead of the current callback bridge
+- Remove the remaining compatibility guest-memory callback plumbing once reduced/test callers can be expressed through owner-backed fixtures only.
 
 ### Binary layout verification
 - PASS: register indices now use upstream word-indexed placement for the corrected `report_semaphore.query` owner.
@@ -2741,12 +3110,10 @@
 ## 2026-03-29 — `video_core/src/engines/kepler_compute.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/engines/kepler_compute.{h,cpp}`
 
 ### Intentional differences
-- Rust still records dispatch calls into a local queue instead of directly calling the upstream rasterizer dispatch path from `ProcessLaunch()`.
+- Rust records dispatch calls into a local queue before calling the bound rasterizer's `dispatch_compute()` from `execute_pending(...)`. Upstream performs the same dispatch inside `ProcessLaunch()`, but Rust keeps the queued `DispatchCall` handoff for the current backend integration.
 - Rust still does not own a literal upstream `Core::System& system` field in `KeplerCompute`. This bounded slice only ports the upstream `MemoryManager&` constructor owner directly.
 
 ### Missing items
-- Upstream `upload_state.BindRasterizer(rasterizer)` is still missing because the full `upload_state` owner path is not ported in this file yet.
-- `ProcessLaunch()` still does not call the bound rasterizer directly.
 - Rust still stores the reduced decoded `QueueMetaData` shape instead of the literal upstream `LaunchParams` raw bitfield struct. That preserves the active fields currently consumed by Rust owners, but it is not yet literal structure parity.
 
 ### Binary layout verification
@@ -2756,10 +3123,10 @@
 
 ### Intentional differences
 - Rust stores the upstream non-owning rasterizer edge through `RasterizerHandle`, centralizing the trait-object lifetime erasure instead of using a literal C++ raw pointer field.
+- Rust `Upload::State` does not store an actual `Registers&`; parent engines pass the current upload `Registers` view into `process_exec` / `process_data_*` calls. This preserves live-register behavior without a self-referential borrow from `Maxwell3D` into its `upload_state`.
 - Rust still keeps several query and draw-manager-adjacent paths simplified in this owner file.
 
 ### Missing items
-- Upstream `upload_state` still owns `MemoryManager&` and `RasterizerInterface*` directly, while Rust still supplies them through temporary callbacks/context to preserve current crate boundaries.
 - `process_counter_reset()` still uses a temporary query-type mapping that should be aligned with the upstream enums.
 - Additional rasterizer-backed paths in this owner file remain simplified.
 
@@ -2769,12 +3136,8 @@
 ## 2026-03-29 — `video_core/src/engines/engine_upload.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/engines/engine_upload.{h,cpp}`
 
 ### Intentional differences
-- Upstream `Upload::State` stores `MemoryManager&`, `Registers&`, and `RasterizerInterface*` directly as owner fields. Rust still uses an owner-local `FlushContext` callback bundle at flush time to avoid cross-crate lifetime/self-reference issues.
-- Upstream block-linear flush reads existing GPU memory through `GpuGuestMemoryScoped<... SafeReadCachedWrite>`. Rust still zero-fills unread portions because this owner file does not yet receive a direct guest-memory read callback for the block-linear path.
-
-### Missing items
-- Direct upstream-style ownership of `MemoryManager&` and `RasterizerInterface*`.
-- Upstream-equivalent safe cached read behavior for block-linear uploads.
+- Upstream `Upload::State` stores `MemoryManager&`, `Registers&`, and `RasterizerInterface*` as owner fields. Rust now stores the memory manager as an `Arc<Mutex<MemoryManager>>` handle and the rasterizer as a non-owning `RasterizerHandle`; parent engines pass the current upload `Registers` view into each upload operation instead of storing a self-referential `Registers&`.
+- Upstream block-linear flush reads existing GPU memory through `GpuGuestMemoryScoped<... SafeReadCachedWrite>`. Rust routes the same operation through `MemoryManager::read_block(...)` followed by `write_block_cached(...)`, preserving the safe-read/cached-write effect through the current Rust owner API.
 
 ### Binary layout verification
 - PASS: `Registers` / `DestRegisters` remain owned in the matching file and preserve the upstream field order used by the upload logic.
@@ -2855,13 +3218,11 @@
 ## 2026-03-29 — `video_core/src/memory_manager.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/memory_manager.{h,cpp}`
 
 ### Intentional differences
-- Rust still keeps guest-memory access behind callback-based read/write closures instead of owning upstream `Core::System` and `MaxwellDeviceMemoryManager` directly.
-- The invalidation accumulator and full safe/unsafe cache-type split are still simplified.
+- Rust stores upstream `MaxwellDeviceMemoryManager& memory` as an `Arc<MaxwellDeviceMemoryManager>` to avoid Rust self-references across the Host1x/GPU/channel graph. Runtime `ReadBlock`/`WriteBlock` now use this owner-backed device-memory path; the callback variants are reduced `#[cfg(test)]` fixtures.
+- Rust keeps an owner-local `InvalidationAccumulator` and drains `WriteBlockCached` ranges through `FlushCaching` / `RasterizerInterface::inner_invalidation`, matching the upstream owner responsibility while using Rust handles for the rasterizer pointer.
 
 ### Missing items
-- The full upstream `Core::System` / `MaxwellDeviceMemoryManager` ownership and pointer-continuity check for big pages are still adapted in Rust.
-- `FlushCaching()` and the invalidation accumulator still do not match the upstream implementation.
-- Safe vs unsafe read/write cache behavior remains simplified.
+- The full upstream `Core::System&` ownership is still represented indirectly; this older slice no longer tracks guest-memory callback bridges as a runtime missing item.
 
 ### Binary layout verification
 - PASS: page-table entry packing and public wrapper layout remain unchanged; only owner-local rasterizer behavior changed.
@@ -2918,15 +3279,21 @@
 
 ### Intentional differences
 - Rust still keeps the higher-level recorded-dispatch representation (`DispatchCall` / `QueueMetaData`) alongside the upstream-like `EngineInterfaceState`.
+- Rust ports upstream `exec_upload` / `data_upload` through `engine_upload::State`, `uploads`, `upload_address`, and `indirect_compute`, but still executes launch through the current `execute_pending(...)` drain point instead of a literal `ProcessLaunch()` method body.
 
 ### Unintentional differences (to fix)
-- upload handling (`upload_state`, `uploads`, `indirect_compute`) is still incomplete relative to upstream.
+- `KeplerCompute` still decodes launch descriptors into the reduced `QueueMetaData` struct rather than storing the literal upstream raw `LaunchParams` bitfield layout.
 
 ### Missing items
 - `ConsumeSinkImpl` exact upstream body for upload-related state
 
 ### Binary layout verification
 - PASS: launch-related register indices kept at upstream word offsets.
+
+### Tests
+- Re-read upstream `kepler_compute.h` and `kepler_compute.cpp` around `upload_state`, `exec_upload`, `data_upload`, `launch`, `UploadInfo`, and `ProcessLaunch`.
+- `cargo check -p video_core --tests`
+- `cargo test -p video_core kepler_compute -- --nocapture`
 
 ## 2026-03-29 — video_core/src/engines/kepler_memory.rs vs video_core/engines/kepler_memory.cpp
 
@@ -3056,10 +3423,7 @@
 ## 2026-03-29 — video_core/src/engines/maxwell_3d.rs vs video_core/engines/maxwell_3d.cpp
 
 ### Intentional differences
-- Upstream owns `Core::System&` and `MemoryManager&` directly in `Maxwell3D`; the Rust port currently threads guest-memory reads through an injected callback and stores the `MemoryManager` behind `Arc<Mutex<_>>` to preserve crate boundaries.
-
-### Unintentional differences (to fix)
-- `refresh_parameters_impl()` lives in the correct owner, but still uses a Rust callback bridge instead of the direct upstream `memory_manager.ReadBlock(...)` call path.
+- Upstream owns `Core::System&` and `MemoryManager&` directly in `Maxwell3D`; the Rust port stores the `MemoryManager` behind `Arc<Mutex<_>>` to preserve crate boundaries and keeps the callback only as an ownerless reduced-fixture fallback.
 
 ### Missing items
 - full file-ownership parity for `DrawManager` logic
@@ -3097,11 +3461,11 @@
 ## 2026-03-29 — `video_core/src/gpu.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/gpu.{h,cpp}`
 
 ### Intentional differences
-- Rust still routes ownership through mutexes and callback bridges where upstream stores direct references/pointers in `GPU::Impl`.
+- Rust still routes ownership through `SystemRef`, mutex-protected handles, and narrow core/video-core bridges where upstream stores direct references/pointers in `GPU::Impl`. `BindRenderer()` now forwards the same Host1x invalidation/flush and GMMU rasterizer binding effects through those bridges.
 
 ### Missing items
 - Upstream `Settings::UpdateGPUAccuracy()` side effect in `OnCommandListEnd()`.
-- Full `host1x.MemoryManager().BindInterface(...)` and `host1x.GMMU().BindRasterizer(...)` parity remains elsewhere in this owner file.
+- Remaining GPU lifecycle methods outside this renderer-binding slice still need owner-graph parity audit.
 
 ### Binary layout verification
 - PASS: no guest-visible binary layout in this owner file.
@@ -3308,11 +3672,10 @@
 ## 2026-03-30 — video_core/src/gpu.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/gpu.{h,cpp}
 
 ### Intentional differences
-- Rust stores the upstream `Core::System&` as `SystemRef` behind a mutex because the crate split prevents the exact `GPU::Impl` object graph.
+- Rust stores the upstream `Core::System&` as `SystemRef` behind a mutex because the crate split prevents the exact `GPU::Impl` object graph. `BindRenderer()` still reaches upstream's Host1x memory-interface and GMMU rasterizer binding effects through the narrow Host1x bridge instead of direct concrete references.
 
 ### Missing items
 - `renderer_frame_end_notify()`, CPU-context ownership, and remaining renderer/host1x lifecycle details are still structurally reduced versus upstream `GPU::Impl`.
-- `BindRenderer()` still does not directly perform the full upstream `host1x.MemoryManager().BindInterface(...)` and `host1x.GMMU().BindRasterizer(...)` wiring in this owner file.
 
 ### Binary layout verification
 - PASS: no guest-visible binary layout in this owner file.
@@ -4022,7 +4385,7 @@
 ### Tests
 - Added `storage_id_mapping_matches_upstream_frontend_slots`.
 - `cargo check -p core`
-- `cargo test -p core storage_id_mapping_matches_upstream_frontend_slots -- --nocapture` currently cannot complete because the crate-wide test harness has pre-existing test-only compile failures, starting with `core/src/hle/kernel/message_buffer.rs` borrow error `E0506`.
+- `cargo test -p core storage_id_mapping_matches_upstream_frontend_slots -- --nocapture` currently cannot complete because the crate-wide test harness has pre-existing test-only compile failures. Current first blockers are stale test-only `CoreTiming` APIs and older tests that still call removed `KProcess::read_block/write_block` helpers directly.
 
 ## 2026-04-01 — core/src/hle/service/acc/acc.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/acc/acc.cpp and /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/acc/acc.h
 
@@ -4375,15 +4738,21 @@
 
 ### Unintentional differences (to fix)
 - `make_page_group(...)` currently walks the Rust `PageTable` one page at a time through `get_physical_address(...)` instead of using upstream traversal helpers and block-info manager ownership. Behavior is closer to upstream, but the internal structure is still simplified.
-- The dedicated partial IPC pages are still backed by the current Rust DRAM/alias mapping path rather than literal upstream `KMemoryManager::AllocateAndOpenContinuous(...)` page objects plus `MemoryManager().Close(...)` reference handling. The observable fill/copy behavior is closer to upstream, but the physical-page ownership model is still simplified.
-- The current Rust backend still does not model upstream `KScopedLightLockPair`, `KScopedPageTableUpdater`, `KMemoryBlockManagerUpdateAllocator`, or `CleanupForIpcClientOnServerSetupFailure(...)` literally. Rollback/update internals remain simplified.
+- The current Rust backend still does not model upstream `KScopedLightLockPair`, `KScopedPageTableUpdater`, or `KMemoryBlockManagerUpdateAllocator` literally. Lock/update internals remain simplified.
 
 ### Missing items
-- Literal partial-page backing ownership via `KMemoryManager::AllocateAndOpenContinuous(...)` / `Close(...)`
-- Literal `CleanupForIpcClientOnServerSetupFailure(...)`
+- None identified for the audited IPC client setup failure-cleanup slice.
 
 ### Binary layout verification
 - PASS: page-table remap behavior only; no guest-visible struct layout changed.
+
+### Tests
+- Re-read upstream `KPageTableBase::Operate(..., OperationType::Map)`, `KPageTableBase::AllocateAndMapPagesImpl`, and `KPageTableBase::SetupForIpcServer` before aligning heap-page reference opening and temporary `AllocateAndOpenContinuous(...)` cleanup in Rust.
+- Re-read upstream `KPageTableBase::SetupForIpcClient`, `SetupForIpc`, and `CleanupForIpcClientOnServerSetupFailure` before aligning Rust's order to change client permissions first, call `SetupForIpcServer`, then apply `LockForIpc` only after server setup succeeds.
+- `cargo fmt --check`
+- `git diff --check`
+- `cargo check -p core`
+- `cargo test -p core setup_for_ipc_client_changes_permissions_without_locking_until_server_success -- --nocapture`
 
 ## 2026-04-02 — core/src/cpu_manager.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/cpu_manager.cpp
 
@@ -4774,9 +5143,6 @@
 - `std::map<u64, SharedBufferSession>` is ported as `BTreeMap<u64, SharedBufferSession>`: preserves keyed ownership and stable lookup semantics in Rust.
 - `Container&` is stored as `Weak<Container>`: required to break the self-referential ownership cycle created by `Container` owning `SharedBufferManager`.
 - `WriteAppletCaptureBuffer` reaches `GPU::GetAppletCaptureBuffer` / `GPU::InvalidateRegion` through `GpuCoreInterface`, matching the upstream `System::GPU()` owner boundary without making `core` depend on the concrete `video_core::Gpu` type.
-
-### Unintentional differences (to fix)
-- Shared buffer memory mapping retry uses a deterministic arithmetic probe instead of upstream `std::mt19937_64`; this is not literal parity.
 
 ### Binary layout verification
 - PASS: `SharedMemorySlot == 0x18`
@@ -5286,15 +5652,16 @@
 
 ### Intentional differences
 - Rust stores upstream `std::shared_ptr<Mapping>` ownership as `Arc<Mapping>` inside the same owner file. `mapping_map` and `Allocation.mappings` now share the same mapping object, preserving the upstream ownership topology while adapting to Rust smart pointers.
-- Rust still keeps the upstream single device mutex plus several inner `Mutex` fields (`vm`, `mapping_map`, `allocation_map`, `gmmu`) to satisfy borrow and aliasing rules. The outer owner mutex now matches upstream operation serialization; the inner locks remain a Rust adaptation.
+- Rust still keeps the upstream single device mutex plus several inner `Mutex` fields (`vm`, `mapping_map`, `allocation_map`, `gmmu`) to satisfy borrow and aliasing rules. The outer owner mutex serializes the same AS entrypoints as upstream before touching the VM/allocation/mapping/GMMU state; the inner locks are not used to weaken the upstream operation ordering.
 
 ### Unintentional differences (to fix)
-- The surrounding Rust `Allocation` / `mapping_map` container layering still differs from the exact upstream mutex-and-container setup, especially for dynamic mappings.
+- None identified for the audited `Allocation` / `mapping_map` ownership slice. Fixed mappings share one owner between `Allocation.mappings` and `mapping_map`, while dynamic mappings live only in `mapping_map`, matching upstream's structure.
 
 ### Binary layout verification
 - PASS: `IoctlAllocAsEx`, `IoctlAllocSpace`, `IoctlFreeSpace`, `IoctlRemapEntry`, `IoctlMapBufferEx`, `IoctlUnmapBuffer`, `IoctlBindChannel`, `IoctlGetVaRegions`, and `VaRegion` keep the upstream sizes in this owner file.
 - PASS: fixed-allocation mappings now share the same `Arc<Mapping>` owner between `mapping_map` and `Allocation.mappings`, matching the upstream `std::shared_ptr<Mapping>` topology; the focused regression test `fixed_mapping_uses_shared_mapping_owner_between_maps` covers this slice.
 - PASS: the owner mutex now serializes the same exercised AS entrypoints as upstream before touching `vm`/`mapping_map`/`allocation_map`/`gmmu`.
+- PASS: `map_buffer_ex_returns_non_zero_offset_for_dynamic_mappings`, `fixed_mapping_tracks_allocation_and_unpins_on_free_space`, `fixed_mapping_uses_shared_mapping_owner_between_maps`, `free_space_stops_on_stale_fixed_mapping_like_upstream`, and `unmap_buffer_missing_mapping_returns_success_like_upstream` cover the audited dynamic/fixed mapping lifecycle slice.
 
 ## 2026-04-05 — `core/src/hle/kernel/k_condition_variable.rs` vs `core/hle/kernel/k_condition_variable.h/.cpp`
 
@@ -6141,7 +6508,7 @@
 - Rust still uses the simplified local `operate(...)` path without upstream `KScopedLightLock`, `KScopedPageTableUpdater`, or explicit memory-block update allocators in this owner. The page-table behavior remains file-local, but these lifecycle helpers are still structurally flatter than upstream.
 
 ### Unintentional differences (to fix)
-- Rust still does not capture and use the upstream destination permission output from `CheckMemoryState(...)` in `UnmapMemory(...)`; the current Rust path only validates destination state/attribute and does not thread `dst_perm` through.
+- None identified in the audited `UnmapMemory(...)` destination permission slice. Upstream captures `dst_perm` from `CheckMemoryState(...)` but does not use it after validation; Rust likewise captures the output as `_out_dst_perm` and applies the same destination transition to unmapped/none permissions.
 
 ### Binary layout verification
 - PASS: page-table state transitions only; no raw serialized struct layout changed.
@@ -6157,8 +6524,8 @@
 ## 2026-04-10 — `video_core/src/engines/kepler_memory.rs` vs `src/video_core/engines/kepler_memory.cpp`
 
 ### Intentional differences
-- Rust still does not own a literal upstream `Core::System& system` field in `KeplerMemory`. The remaining upstream `system` dependency is still bridged locally through the existing guest-memory writer callback.
-- Rust `upload_state` still owns a copied register snapshot instead of the upstream `Upload::State(memory_manager, regs.upload)` reference boundary. This is an existing owner-local adaptation in `engine_upload.rs`.
+- Rust still does not own a literal upstream `Core::System& system` field in `KeplerMemory`, but current upload behavior uses the stored `MemoryManager` owner directly. No remaining KeplerMemory upload write path depends on a guest-memory writer callback.
+- Rust passes the current upload register view into `Upload::State` operations instead of storing upstream's literal `Registers&` field. This keeps KeplerMemory upload behavior live without introducing a self-referential Rust owner.
 
 ### Binary layout verification
 - PASS: engine constructor wiring only; no raw serialized struct layout changed.
@@ -6310,12 +6677,18 @@
 
 ### Intentional differences
 - Rust exposes `get_async_result()` / `set_async_result()` over the existing mutable word-slice view instead of a raw pointer-backed C++ buffer wrapper. This is a mechanical API adaptation while keeping the helper ownership in `message_buffer.rs`.
+- The `non_null_header_async_result_reads_success` test writes the ignored async-result word through `MessageBuffer`'s borrowed buffer view instead of mutating the original slice directly. This is a Rust borrow-check adaptation of upstream's raw-pointer `m_buffer[2]` access and preserves the tested behavior: non-null message headers make `GetAsyncResult()` return success regardless of word 2.
 
 ### Unintentional differences (to fix)
 - `MessageBuffer` still lacks the broader upstream helper surface used by the full IPC transport path; descriptor/message-copy helpers are still not all surfaced as one-to-one owner methods.
 
 ### Missing items
 - Remaining upstream `MessageBuffer` helper methods needed by the literal `SendMessage` / `ReceiveMessage` path.
+
+### Tests
+- Re-read upstream `MessageBuffer::{GetAsyncResult,SetAsyncResult}` before repairing the Rust test borrow pattern.
+- `cargo check -p core`
+- `cargo test -p core open_first_open_close_split_across_impl_managers -- --nocapture` now runs and passes after the core test-harness cleanup.
 
 ### Binary layout verification
 - PASS: helper-only owner over caller-provided `u32` storage; no Rust-owned serialized struct layout changed.
@@ -6678,33 +7051,46 @@
 ## 2026-04-13 — `video_core/src/engines/engine_upload.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/engines/engine_upload.{h,cpp}`
 
 ### Intentional differences
-- Rust still keeps an owner-local `FlushContext` adaptation instead of the upstream constructor-owned `MemoryManager&` + `RasterizerInterface*`, because Rust cannot store those borrowed owners directly across the current engine lifetimes.
-- Rust still keeps a copied `Registers` snapshot in `upload_state` instead of the upstream `Registers&` boundary. That existing owner-local adaptation is unchanged by this slice.
+- Rust stores upstream's constructor-owned `MemoryManager&` as an `Arc<Mutex<MemoryManager>>` handle and stores upstream's `RasterizerInterface*` as a non-owning `RasterizerHandle`; this preserves the owner relationship without cross-engine borrows.
+- Rust parent engines pass the current upload `Registers` view into `process_exec` / `process_data_*` instead of storing upstream's literal `Registers&` field in `State`.
+- Reduced ownerless construction through `State::new()` / `Default for State` and late owner injection through `State::bind_memory_manager(...)` are compiled only for tests; runtime construction goes through `State::new_with_memory_manager(...)`, matching upstream's constructor-owned `MemoryManager&` direction.
 
 ### Unintentional differences (to fix)
-- Upstream does not have this nested-lock hazard because `Upload::State` owns raw references, not mutex-guarded state.
+- None identified for the audited runtime parent-engine construction slice. `State::new()` / `Default for State` are test-only and only `new_with_memory_manager(...)` is exposed as the normal runtime constructor.
 
 ### Missing items
-- The block-linear path still uses the current Rust guest-memory fallback instead of the literal upstream `GpuGuestMemoryScoped` owner stack.
+- Reduced fixture-only ownerless construction still exists inside the owner file for tests; upstream runtime construction requires `MemoryManager&`.
 
 ### Binary layout verification
 - PASS: upload/runtime behavior only; no raw serialized struct layout changed.
 
+### Tests
+- Re-read upstream `maxwell_3d.{h,cpp}` and `engine_upload.{h,cpp}` before making the remaining upload memory-owner setters test-only.
+- `cargo check -p video_core`
+- `cargo check -p video_core --tests`
+
 ## 2026-04-13 — `video_core/src/engines/maxwell_3d.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/engines/maxwell_3d.cpp`
 
 ### Intentional differences
-- Rust still threads `Upload::State` through an owner-local `FlushContext` adaptation instead of the upstream constructor-owned references.
+- Rust stores upstream's constructor-owned `MemoryManager&` as an `Arc<Mutex<MemoryManager>>` and constructs `upload_state` from that same owner in `Maxwell3D::new_with_memory_manager(...)`; this preserves the runtime owner edge without a self-referential Rust borrow.
+- Rust forwards the bound rasterizer into `upload_state.bind_rasterizer(...)`, matching upstream `Upload::State::BindRasterizer`, but uses `RasterizerHandle` rather than storing a raw pointer directly.
+- Reduced owner injection through `Maxwell3D::set_memory_manager(...)` is compiled only for tests; runtime parent-engine construction must use `Maxwell3D::new_with_memory_manager(...)`, matching upstream's constructor-owned `MemoryManager&` direction.
 
 ### Unintentional differences (to fix)
-- Upstream `Maxwell3D` does not have this mutex lifetime and does not hold the memory owner across `AccelerateInlineToMemory(...)`.
+- None identified for the audited runtime `Maxwell3D` upload-memory owner construction slice.
 
 ### Binary layout verification
 - PASS: runtime lock ordering only; no raw serialized struct layout changed.
 
+### Tests
+- Re-read upstream `maxwell_3d.{h,cpp}` and `engine_upload.{h,cpp}` before making the remaining upload memory-owner setters test-only.
+- `cargo check -p video_core`
+- `cargo check -p video_core --tests`
+
 ## 2026-04-13 — `video_core/src/engines/kepler_memory.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/engines/kepler_memory.cpp`
 
 ### Intentional differences
-- Rust still routes inline upload state through the shared `engine_upload.rs` `FlushContext` adaptation instead of the upstream constructor-owned references.
+- Rust constructs `upload_state` with the same `MemoryManager` owner supplied to `KeplerMemory` and forwards `BindRasterizer` into `Upload::State`, but represents those owner edges with safe Rust handles rather than C++ references/pointers.
 
 ### Binary layout verification
 - PASS: runtime lock ordering only; no raw serialized struct layout changed.
@@ -8044,14 +8430,17 @@
 ## 2026-04-29 — `video_core/src/host1x/gpu_device_memory_manager.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/host1x/gpu_device_memory_manager.h` and `/home/vricosti/Dev/emulators/zuyu/src/video_core/host1x/gpu_device_memory_manager.cpp`
 
 ### Intentional differences
-- Rust still keeps this file as a placeholder surface over the unported core-backed device-memory manager. The new method parity in this pass preserves ownership and call sites, but not the real backend behavior.
+- Rust ports upstream `Core::DeviceMemoryManager<MaxwellDeviceTraits>` behavior directly in `gpu_device_memory_manager.rs` instead of wrapping the literal C++ template backend. This preserves the upstream owner file and method responsibilities while adapting storage to Rust `Arc`/`Mutex` ownership.
 
 ### Missing items
-- The file still does not wrap the real `Core::DeviceMemoryManager<MaxwellDeviceTraits>` backend.
-- `read_*`, `write_*`, `get_pointer*`, and `update_pages_cached_count(...)` remain behavioral stubs.
+- None in this older placeholder-surface slice; current compressed-physical table, typed read/write, pointer lookup, and cached-page behavior are tracked by the newer Host1x SMMU / `MemoryManager` entries.
 
 ### Binary layout verification
 - PASS: API-surface restoration only; no guest-visible raw layout changed.
+
+### Tests
+- Re-read upstream `video_core/host1x/gpu_device_memory_manager.h`, `video_core/host1x/gpu_device_memory_manager.cpp`, and `core/device_memory_manager.inc` before removing stale stub claims.
+- `cargo test -p video_core gpu_device_memory_manager -- --nocapture`
 
 ## 2026-04-28 — `video_core/src/renderer_vulkan/vk_rasterizer.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_vulkan/vk_rasterizer.cpp` (reduced helper removal follow-up)
 
@@ -8103,16 +8492,16 @@
 ## 2026-04-29 — `video_core/src/shader_environment.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/shader_environment.h` and `/home/vricosti/Dev/emulators/zuyu/src/video_core/shader_environment.cpp`
 
 ### Intentional differences
-- Rust still uses snapshot-based `GraphicsEnvironment` / `ComputeEnvironment` owners plus an injected `GpuMemoryReader` callback instead of literal live `Maxwell3D*`, `KeplerCompute*`, and `MemoryManager*` storage.
+- Rust still keeps nullable `MemoryManager` / `GpuMemoryReader` compatibility state in `GenericEnvironment` for reduced/test construction instead of upstream's always-live `MemoryManager*` owner graph.
 - The constructor-side tests were kept focused on constructor mapping and owner-local CB reads, because the active Rust `Maxwell3D` test path still has unrelated macro-engine side effects outside this owner slice.
 
 ### Missing items
 - `GraphicsEnvironment::from_maxwell3d(...)` still does not read the real upstream SPH block, set `initial_offset = sizeof(sph)`, or carry `gp_passthrough_mask`.
-- `ComputeEnvironment` still stores copied const-buffer state and `linked_tsc` instead of the literal upstream `launch_description` owner pointer path.
+- `ComputeEnvironment` still keeps detached const-buffer/texture state under `#[cfg(test)]` for reduced tests. Production compute reads the live `KeplerCompute`/QMD owner.
 - `FileEnvironment` remains structurally reduced versus upstream in several stage-specific fields and still uses placeholder SPH serialization.
 
 ### Binary layout verification
-- FAIL: environment owners are still snapshot-based Rust adaptations, not literal upstream object layout.
+- N/A: shader-environment owner routing only. No guest-visible raw payload layout changed.
 
 ## 2026-04-29 — `video_core/src/shader_cache.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/shader_cache.h` and `/home/vricosti/Dev/emulators/zuyu/src/video_core/shader_cache.cpp` (environment-owner follow-up)
 
@@ -8428,31 +8817,16 @@
 ## 2026-04-29 — `video_core/src/shader_environment.rs`, `video_core/src/shader_cache.rs`, and `video_core/src/engines/maxwell_3d.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/shader_environment.h`, `/home/vricosti/Dev/emulators/zuyu/src/video_core/shader_environment.cpp`, `/home/vricosti/Dev/emulators/zuyu/src/video_core/shader_cache.cpp`, and `/home/vricosti/Dev/emulators/zuyu/src/video_core/engines/maxwell_3d.h` (live memory-owner routing follow-up)
 
 ### Intentional differences
-- Rust still cannot store and thread a literal upstream `Tegra::MemoryManager*` through the whole owner graph. The current closest adaptation keeps the owner in `Maxwell3D`, exposes owner-local accessors there, and routes shader-environment reads through `MemoryManager::read_block(...)` plus the existing CPU callback bridge.
-- Rust still uses explicit owner-local bridge methods on `Maxwell3D` (`memory_manager()` and `guest_memory_reader()`) instead of upstream direct member access, because there is no C++-style friend/private inheritance surface in Rust.
+- Rust still cannot store and thread a literal upstream `Tegra::MemoryManager*` through the whole owner graph. The current closest adaptation keeps the owner in `Maxwell3D`, exposes owner-local accessors there, and routes graphics shader-environment reads through the owner-backed `MemoryManager::read_block(...)` path.
+- Rust still uses explicit owner-local bridge methods on `Maxwell3D` (`memory_manager()` and `make_gpu_memory_reader()`) instead of upstream direct member access, because there is no C++-style friend/private inheritance surface in Rust.
 
 ### Missing items
-- `shader_environment.rs` still stores `GpuMemoryReader` in `GenericEnvironment` and still falls back to the callback transport internally. Upstream stores only `Tegra::MemoryManager*` and does not need a second callback owner.
+- `shader_environment.rs` still stores `GpuMemoryReader` in `GenericEnvironment` for reduced/test paths. Upstream stores only `Tegra::MemoryManager*` and does not need a second callback owner.
 - `shader_environment.rs` still keeps `gpu_memory: Option<_>` / `gpu_read: Option<_>` nullable owner state for reduced/test construction. Upstream constructors always install the live owner graph.
-- `shader_cache.rs` still gates graphics environment creation on both `memory_manager()` and `guest_memory_reader()` being present, while upstream only depends on the concrete `MemoryManager&` owner path.
-- `maxwell_3d.rs` still exposes `make_gpu_memory_reader()` for older reduced callers elsewhere in the tree. That compatibility bridge is still structurally below literal upstream parity.
+- `maxwell_3d.rs` still exposes `make_gpu_memory_reader()` as a compatibility bridge for owner-local readers. That bridge now reads through `MemoryManager` only when available, but it remains structurally below literal upstream pointer/reference parity.
 
 ### Binary layout verification
 - PASS: this pass only changed owner routing for memory reads and constructor behavior. No guest-visible struct layout or serialized cache payload layout changed.
-
-## 2026-04-29 — `video_core/src/shader_environment.rs` and `video_core/src/shader_cache.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/shader_environment.h`, `/home/vricosti/Dev/emulators/zuyu/src/video_core/shader_environment.cpp`, and `/home/vricosti/Dev/emulators/zuyu/src/video_core/shader_cache.cpp` (compute owner-memory parity follow-up)
-
-### Intentional differences
-- Rust still cannot make `ComputeEnvironment` consume only a literal upstream `Tegra::MemoryManager*`, because the current Rust `MemoryManager` port still needs the extra CPU callback transport to complete `ReadBlock(...)`.
-- The current Rust channel owner still obtains the compute-side CPU callback from the shared channel graph rather than from a literal upstream `KeplerCompute` member, because `KeplerCompute` does not yet store that adaptation owner itself.
-
-### Missing items
-- `ShaderCache::current_guest_memory_reader()` is still a Rust adaptation helper. Upstream does not need this extra retrieval surface because the memory owner graph is literal there.
-- `KeplerCompute` still does not expose/store the callback transport directly, so the compute environment still depends on channel-level wiring that is structurally broader than upstream.
-- `shader_environment.rs` still keeps the callback-based fallback transport inside `GenericEnvironment`; the file is closer to upstream owner behavior, but not yet literal pointer-only ownership.
-
-### Binary layout verification
-- PASS: this pass changed only owner wiring and test setup. No serialized payload or raw guest-visible struct layout changed.
 
 ## 2026-04-29 — `video_core/src/renderer_opengl/gl_shader_cache.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_shader_cache.h` and `/home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_shader_cache.cpp` (shared shader-owner integration follow-up)
 
@@ -10155,6 +10529,8 @@
 - PASS: regalloc/translator-only slice; no guest-visible raw struct layout changed. STK now boots through skins/music with all 17 assets loaded; 516/8 rdynarmic test results match the documented baseline (8 pre-existing A32 fails, no new regressions).
 
 ### Tests
+- Re-read upstream `video_core/host1x/gpu_device_memory_manager.h`, `video_core/host1x/gpu_device_memory_manager.cpp`, and `core/device_memory_manager.inc` before removing stale stub claims.
+- `cargo test -p video_core gpu_device_memory_manager -- --nocapture`
 - `cargo test test_a64_bsl_uses_vd_as_mask_and_selects_vn_else_vm -- --nocapture` in `/home/vricosti/Dev/emulators/rdynarmic`
 - `cargo test test_a64_bit_uses_vm_as_true_mask_and_preserves_vd_elsewhere -- --nocapture` in `/home/vricosti/Dev/emulators/rdynarmic`
 
@@ -10294,7 +10670,7 @@
 ## 2026-05-12 — `video_core/src/memory_manager.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/memory_manager.cpp` and `/home/vricosti/Dev/emulators/zuyu/src/video_core/memory_manager.h`
 
 ### Intentional differences
-- Added env-gated `RUZU_GPU_VA_TRACE` logging to `MemoryManager::write_block_unsafe_owned`, reporting GPU VA, translated CPU/device address, byte count, and first u32 for GPU writebacks. Local zuyu has an analogous diagnostic named `ZUYU_GPU_VA_TRACE` in `MemoryManager::WriteBlockImpl`; this Rust trace is diagnostic-only and inactive by default.
+- Added env-gated `RUZU_GPU_VA_TRACE` logging to `MemoryManager::write_block_unsafe`, reporting GPU VA, translated CPU/device address, byte count, and first u32 for GPU writebacks. Local zuyu has an analogous diagnostic named `ZUYU_GPU_VA_TRACE` in `MemoryManager::WriteBlockImpl`; this Rust trace is diagnostic-only and inactive by default.
 - The Rust wrapper owns the `guest_memory_writer` callback explicitly, so it can also log `unmapped_reason=no_writer`. Upstream writes through `Core::Memory::Memory` directly and has no equivalent callback-missing state.
 
 ### Binary layout verification
@@ -12095,11 +12471,10 @@ Investigation focused on a "specific frame number" was misdirected. The real que
 ## 2026-05-23 — video_core/src/engines/kepler_memory.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/engines/kepler_memory.{h,cpp}
 
 ### Intentional differences
-- Upstream `KeplerMemory::BindRasterizer` receives `VideoCore::RasterizerInterface*` and forwards it to `upload_state.BindRasterizer`. Rust keeps the same non-owning relationship through `RasterizerHandle` and uses it only when constructing the upload `FlushContext`.
-- The existing Rust `guest_memory_writer` callback remains a local bridge for host CPU writes; this pass does not alter that pre-existing Rust adaptation.
+- Upstream `KeplerMemory::BindRasterizer` receives `VideoCore::RasterizerInterface*` and forwards it to `upload_state.BindRasterizer`. Rust keeps the same non-owning relationship through `RasterizerHandle` stored by `engine_upload::State`.
 
 ### Unintentional differences (to fix)
-- `engine_upload::State` still has its own Rust-specific context bridge rather than storing the rasterizer pointer exactly like upstream.
+- `engine_upload::State` still represents the upstream raw rasterizer pointer as a safe non-owning handle rather than an exact C++ pointer field.
 
 ### Binary layout verification
 - N/A: host-only rasterizer pointer ownership bridge; no guest-visible raw struct or serialized payload layout changed.
@@ -12111,22 +12486,22 @@ Investigation focused on a "specific frame number" was misdirected. The real que
 ## 2026-05-23 — video_core/src/engines/kepler_compute.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/engines/kepler_compute.{h,cpp}
 
 ### Intentional differences
-- Upstream stores `VideoCore::RasterizerInterface* rasterizer = nullptr` and assigns it in `KeplerCompute::BindRasterizer`, then forwards it to `upload_state.BindRasterizer`. Rust now stores the same non-owning relationship through `RasterizerHandle`.
-- Existing Rust compute launch handling remains QMD/dispatch-call based rather than the full upstream `ProcessLaunch -> rasterizer->DispatchCompute()` path. This pass only removes the raw `[usize; 2]` trait-object storage from the existing owner.
+- Upstream stores `VideoCore::RasterizerInterface* rasterizer = nullptr` and assigns it in `KeplerCompute::BindRasterizer`, then forwards it to `upload_state.BindRasterizer`. Rust now stores the same non-owning relationship through `RasterizerHandle` and forwards it to `engine_upload::State`.
+- Rust compute launch handling remains QMD/dispatch-call based around `execute_pending(...)`; the bound rasterizer is now dispatched there instead of inside a literal upstream `ProcessLaunch()` method.
 
 ### Unintentional differences (to fix)
-- `KeplerCompute::CallMethod`, upload tracking, `ProcessLaunch`, TIC/TSC reads, and rasterizer dispatch are still structurally divergent from upstream. They were not changed in this pointer-ownership slice.
+- `KeplerCompute::ProcessLaunch` is still structurally represented by `execute_pending(...)` plus `DispatchCall` queuing rather than a one-to-one method body.
 
 ### Missing items
-- Port upstream `upload_state.ProcessExec/ProcessData` integration for compute uploads.
-- Port upstream `ProcessLaunch` ownership and dispatch path once the safe live rasterizer access model is available.
+- Port a literal upstream-shaped `ProcessLaunch` owner method once the current dispatch-call handoff can be retired.
 
 ### Binary layout verification
 - N/A for this pass: host-only rasterizer pointer representation changed. Existing QMD parsing layout tests remain the local coverage for launch descriptor fields.
 
 ### Tests
 - Re-read upstream `kepler_compute.h` and `kepler_compute.cpp` around `VideoCore::RasterizerInterface*`, `BindRasterizer`, `CallMethod`, `CallMultiMethod`, and `ProcessLaunch`.
-- Re-ran `cargo test -p video_core kepler_compute -- --nocapture`.
+- `cargo check -p video_core --tests`
+- `cargo test -p video_core kepler_compute -- --nocapture`
 
 ## 2026-05-23 — video_core/src/engines/fermi_2d.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/engines/fermi_2d.{h,cpp}
 
@@ -12384,29 +12759,41 @@ Investigation focused on a "specific frame number" was misdirected. The real que
 ## 2026-05-23 — video_core/src/host1x/gpu_device_memory_manager.rs, ruzu_cmd/src/main.rs, core/src/memory/memory.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/device_memory_manager.inc, /home/vricosti/Dev/emulators/zuyu/src/video_core/host1x/gpu_device_memory_manager.cpp, /home/vricosti/Dev/emulators/zuyu/src/core/memory.cpp
 
 ### Intentional differences
-- Upstream `DeviceMemoryManager<Traits>::UpdatePagesCachedCount` calls `MaxwellDeviceMethods::MarkRegionCaching(Core::Memory::Memory*, ...)` directly with a registered `Core::Memory::Memory*`. Rust now mirrors that ownership boundary by capturing a stable pointer to `Memory` once in `ruzu_cmd` and calling `Memory::rasterizer_mark_region_cached` directly from the GPU cache callback.
-- Rust keeps a fallback path through `SystemRef::memory_shared().lock()` if the direct pointer cannot be captured at setup. This fallback is not expected in normal emulator startup, but keeps the callback robust for partial/test construction.
-- `gpu_device_memory_manager.rs`, `memory.rs`, and `ruzu_cmd` include env-gated stall profilers (`RUZU_PROFILE_UPDATE_CACHED_STALL`, `RUZU_PROFILE_RASTERIZER_MARK_CACHED_STALL`, `RUZU_PROFILE_MARK_REGION_CALLBACK_STALL`). Upstream has no equivalent; these are inactive by default and document the diagnosed lock inversion.
-- Rust currently batches callback ranges into a temporary vector and drops `cached_pages` before invoking `mark_region_caching`. Upstream calls `MarkRegionCaching` inline while holding its range/counter guard, but upstream does not also take ruzu's coarse `Mutex<Memory>`. The Rust ordering avoids a host-side ABBA while preserving the externally visible cache/uncache transitions.
+- Upstream `DeviceMemoryManager<Traits>::UpdatePagesCachedCount` calls `MaxwellDeviceMethods::MarkRegionCaching(Core::Memory::Memory*, ...)` directly with a registered `Core::Memory::Memory*`. Rust now mirrors that ownership boundary for ASID-backed SMMU pages by calling the registered `Memory::rasterizer_mark_region_cached` owner directly from `MaxwellDeviceMemoryManager`.
+- Rust keeps a `#[cfg(test)]` `mark_region_caching` callback only for reduced video_core fixtures that do not install a registered process `Memory` owner. Runtime pages without a registered owner skip the callback path, matching upstream's `memory_device_inter == nullptr` guard.
+- `gpu_device_memory_manager.rs` and `memory.rs` include env-gated stall profilers (`RUZU_PROFILE_UPDATE_CACHED_STALL`, `RUZU_PROFILE_RASTERIZER_MARK_CACHED_STALL`). Upstream has no equivalent; these are inactive by default and document the diagnosed lock inversion.
+- Rust currently batches registered-owner cache ranges into a temporary vector and drops its `ScopedRangeLock` before invoking `Memory::rasterizer_mark_region_cached`. Upstream calls `MarkRegionCaching` inline while holding its range/counter guard, but upstream does not also take ruzu's `Mutex<Memory>`. The Rust ordering avoids a host-side ABBA while preserving the externally visible cache/uncache transitions.
+- `UpdatePagesCachedCount` now extracts CPU backing from the SMMU metadata recorded by `smmu_map_with_cpu_backing`, including ASID discontinuity and null-vpage batch release behavior. When an ASID has a registered process `Memory` owner, Rust calls `Memory::rasterizer_mark_region_cached(...)` directly; pages without a registered owner no-op in runtime builds like upstream.
 
 ### Unintentional differences (to fix)
-- Rust `MaxwellDeviceMemoryManager` still lacks upstream's ASID-aware `ExtractCPUBacking` / `registered_processes` path. It assumes the GPU cached region maps into the current process address space, matching current ruzu usage but not full upstream behavior.
-- Rust still lacks upstream's `Common::ScopedRangeLock counter_guard` granularity. It uses the existing `cached_pages` mutex for count mutation.
-- `Memory::rasterizer_mark_region_cached` still documents the missing upstream fastmem `Protect()` / reactive flushing path. Page-type transitions are present, but host write-protect behavior is not yet ported.
+- None identified for the audited `UpdatePagesCachedCount` / `Memory::RasterizerMarkRegionCached` cache-counter and fastmem-protection slice.
 
 ### Missing items
-- Port ASID-backed CPU mapping extraction for `UpdatePagesCachedCount`.
-- Port range-lock granularity if the coarse `cached_pages` mutex becomes a contention point.
-- Port the reactive-flushing fastmem protection path in `Memory::RasterizerMarkRegionCached`.
+- None identified for the audited `UpdatePagesCachedCount` / `Memory::RasterizerMarkRegionCached` cache-counter and fastmem-protection slice.
 
 ### Binary layout verification
 - N/A: this changes host-side callback ownership and page-table state transitions, not a guest-visible raw payload layout.
 
 ### Tests
 - Re-read upstream `device_memory_manager.inc`, `video_core/host1x/gpu_device_memory_manager.cpp`, and `core/memory.cpp`.
+- Re-read upstream `DeviceMemoryManager<Traits>::UpdatePagesCachedCount` after adding SMMU CPU-backing extraction to the Rust cache path.
+- Re-read upstream `DeviceMemoryManager<Traits>::CachedPages`, `CounterEntry`, and `UpdatePagesCachedCount` before replacing the Rust sparse `HashMap` counter table with dense `AtomicU8` page counters.
+- Re-read upstream `common/range_mutex.h` and `DeviceMemoryManager<Traits>::UpdatePagesCachedCount` before replacing the Rust coarse cache-counter mutex with the existing `common::range_mutex::{RangeMutex, ScopedRangeLock}` port.
+- Re-read upstream `Memory::Impl::RasterizerMarkRegionCached` before adding the matching fastmem `Protect(vaddr, size, perm)` call using `Settings::values.use_reactive_flushing`.
+- Re-read upstream `DeviceMemoryManager<Traits>::UpdatePagesCachedCount` before restricting the Rust `mark_region_caching` callback to tests and removing the runtime `ruzu_cmd` frontend callback/profiler path.
+- `cargo fmt --check`
+- `git diff --check`
+- `cargo check -p core`
+- `cargo check -p video_core`
+- `cargo check --bin ruzu-cmd`
 - `cargo build --release --bin ruzu-cmd` passes.
-- `cargo test -p video_core gpu_device_memory_manager -- --nocapture` passes: 5 tests.
+- `cargo test -p video_core cached_count_uses_cpu_backing_address_when_present -- --nocapture`
+- `cargo test -p video_core cached_count_splits_on_cpu_backing_discontinuity -- --nocapture`
+- `cargo test -p video_core gpu_device_memory_manager -- --nocapture` passes: 36 tests.
 - MK8D deterministic startup, 3 runs of 18s: `SubmitList done == pop` in all runs and `QueueBuffer` reached 865/873/873 instead of the previous blocked `QueueBuffer=0`.
+- Manual MK8D 90s smoke after SMMU CPU-backing `UpdatePagesCachedCount` parity (`/tmp/mk8d_update_cached_cpu_backing_rerun.log`): reached `am::NotifyRunning`, then reproduced the known late `nvmap::IocAlloc(handle=0xAD4, addr=0x068B0000, size=0x70000) result=0x0000D401` followed by `BreakLoopNullPc`. No new early boot regression was observed; the remaining blocker is still the page-table/kernel-memory range being `Free`.
+- Manual MK8D 120s smoke after adding upstream fastmem `Protect` parity to `Memory::rasterizer_mark_region_cached` (`/tmp/mk8d_rasterizer_mark_protect_1780794149.log`, `RUST_LOG=warn`, isolated XDG dirs, no L+R input): reached `am::NotifyRunning`; no `0x068B0000`, `BreakLoopNullPc`, panic, SIGSEGV, `IocAlloc`, `glTextureSubImage3D`, `MapSharedMemory`, `mprotect failed`, missing Container session store, missing registered SMMU ASID, or missing process Memory owner marker was logged before controlled timeout. This is no-obvious-regression smoke only; warn-level logging does not prove audio/rendering progress.
+- Manual MK8D 120s smoke after removing the runtime frontend `mark_region_caching` callback/profiler path (`/tmp/mk8d_no_runtime_mark_callback_1780815225.log`, `RUST_LOG=warn`, isolated XDG dirs, no L+R input): reached `am::NotifyRunning`; no `IocAlloc`, `0x068B0000`, `BreakLoopNullPc`, panic, SIGSEGV, `glTextureSubImage3D`, missing runtime SMMU, missing registered SMMU ASID, runtime SMMU map missing, unregistered ASID, `OpenAudioRenderer`, `IAudioRenderer::Start`, or `MapSharedMemory` marker was logged before the controlled timeout. No `ruzu-cmd` / `yuzu-cmd` process remained after the run.
 
 ## 2026-05-23 — video_core/src/engines/draw_manager.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/engines/draw_manager.{h,cpp}
 
@@ -12854,6 +13241,9 @@ The following still panic because upstream either also throws NotImplementedExce
 ### Tests
 - `cargo check --bin ruzu-cmd`
 - `cargo build --release --bin ruzu-cmd`
+- Re-read upstream `cdma_pusher.h` and `cdma_pusher.cpp` before replacing inline command processing with a queue-draining worker.
+- `cargo test -p video_core push_entries_is_drained_by_worker_thread -- --nocapture`
+- Manual MK8D 90s smoke after queue-draining `CDmaPusher` worker (`/tmp/mk8d_cdma_worker_1780805101.log`, `RUST_LOG=warn`, isolated XDG dirs, no L+R input): reached `am::NotifyRunning`; no `nvmap::IocAlloc`, `0x068B0000`, `BreakLoopNullPc`, panic, SIGSEGV, `glTextureSubImage3D`, missing SMMU ASID, or runtime SMMU owner marker was logged before the controlled timeout. Warn-level logging does not prove late video/audio progress.
 - MK8D 18 s default inline run with `host_thread_ipc`/`plu_ipc` enabled in `trace.toml`: reaches `NotifyRunning`, emits no host-thread/PLU events, and shows no `KThread::end_wait` invariant errors.
 - MK8D 10 s `RUZU_SERVER_THREAD_IPC_ALL=1` diagnostic run: reaches `NotifyRunning`, emits 46 `PLU_IPC` samples, all with `is_signaled=true req_len=1 cur_req=false`, and shows no `PrefetchAbort` or `KThread::end_wait` invariant errors.
 - MK8D 25 s `RUZU_SERVER_THREAD_IPC_ALL=1` run: reaches `NotifyRunning`, `BQP_QUEUE=17`, `SF_COMPOSE=46`, with no `PrefetchAbort`, no unmapped access, no audio-glitch mute, and no `KThread::end_wait` invariant errors.
@@ -13061,6 +13451,7 @@ The following still panic because upstream either also throws NotImplementedExce
 
 ### Tests
 - `cargo check -p video_core`
+- `cargo test -p video_core write_block_cached_accumulates_and_flushes_device_ranges -- --nocapture`
 
 ## 2026-05-30 — audio_core/src/renderer/command/command_generator.rs vs /home/vricosti/Dev/emulators/zuyu/src/audio_core/renderer/command/command_generator.cpp and command_generator.h
 
@@ -13288,13 +13679,62 @@ The following still panic because upstream either also throws NotImplementedExce
 
 ### Intentional differences
 - Ruzu uses `ProcessLock`/Rust page-table access and `debug_assert_eq!(lock_result, 0)` instead of upstream's `ASSERT(...IsSuccess())`; this preserves the same success contract through the Rust kernel API.
-- Ruzu does not expose upstream's `is_out_io` out-parameter from `LockForMapDeviceAddressSpace`; the current Rust page-table method does not return that value.
 
 ### Binary layout verification
 - PASS: no ioctl payload structs changed. `IocAllocParams` remains 32 bytes; only the host-side page-table lock address source changed.
 
 ### Tests
 - `cargo check -p core`
+
+## 2026-06-06 — core/src/hle/kernel/k_page_table_base.rs, core/src/hle/kernel/svc/svc_device_address_space.rs, core/src/hle/kernel/svc/svc_types.rs, and core/src/hle/service/nvdrv/devices/nvmap.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/k_page_table_base.cpp, /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/k_device_address_space.cpp, /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/svc/svc_device_address_space.cpp, and /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/nvdrv/devices/nvmap.cpp
+
+### Intentional differences
+- Rust returns `(result_code, is_io)` from `KPageTableBase::lock_for_map_device_address_space` instead of upstream's `Result` plus `bool* out_is_io`; this preserves the upstream output value without introducing an out-parameter in Rust.
+- Rust still returns raw page-table result codes instead of upstream's `Result` wrapper. `NvMapDevice::ioc_alloc` passes `check_heap=false`, matching upstream `nvmap::IocAlloc`.
+- `KProcess` now keeps a Rust-side `device_address_space_objects` registry keyed by the same opaque handle-table object id. This restores typed `KDeviceAddressSpace` method ownership for create/attach/detach/map/unmap without refactoring the entire opaque `KHandleTable` in this slice.
+- The Rust `device_address_space_objects` registry now stores `Arc<Mutex<KDeviceAddressSpace>>` owners instead of copying the small DAS metadata value out of the process. This preserves upstream's object identity for `KScopedAutoObject das` users and gives each DAS instance a shared object lock while the full typed `KHandleTable` / `KLightLock` model remains incomplete.
+- `svc_device_address_space.rs` resolves the `KDeviceAddressSpace` object and validated process handle through an owner-local helper shared by `MapDeviceAddressSpaceByForce`, `MapDeviceAddressSpaceAligned`, and `UnmapDeviceAddressSpace`. Upstream repeats the `GetObject<KDeviceAddressSpace>` / `GetObject<KProcess>` shape in each SVC; the Rust helper is mechanical and keeps the remaining opaque-handle adaptation in one place.
+- `MapDeviceAddressSpace*` / `UnmapDeviceAddressSpace` now resolve explicit process handles by treating the opaque handle-table object id as the target `KProcess::process_id` and looking it up through `KernelCore::get_process_by_id(...)`. This preserves upstream's `GetObject<KProcess>(process_handle)` target-page-table ownership without requiring the full `KHandleTable` typed-object refactor in this slice.
+- `KDeviceAddressSpace::map` now decodes `MapDeviceAddressSpaceOption::flags`, enforces the upstream `m_space_address/m_space_size` device range, routes `MapDeviceAddressSpaceByForce` / `MapDeviceAddressSpaceAligned` through `lock_for_map_device_address_space(..., check_heap=true)`, and routes `UnmapDeviceAddressSpace` through `lock_for_unmap_device_address_space(..., check_heap=true)` plus `unlock_for_device_address_space`, matching the upstream page-table lock/unlock policy.
+- `KPageTableBase::map_physical_memory` now follows upstream's state policy: it counts any non-`Free` block as already mapped and maps only `Free` subranges. `UnmapPhysicalMemory` keeps upstream's stricter `Free` or `Normal`/attribute-none validation and unmaps only `Normal` subranges. Rust still expresses this with raw result codes and existing block-manager helpers rather than upstream's `R_TRY`/`KScopedLightLock` syntax.
+- Added a focused `KPageTableBase::InitializeForProcess` / `CanContain(Shared)` regression for 32-bit-no-map layout. MK8D's first shared-memory candidate at `0xB9004000` is inside the folded heap and must be rejected, while the guest retry at `0xD5C04000` is outside heap and valid. This matches upstream `CanContain` and prevents treating that retry pattern as a page-table bug.
+
+### Unintentional differences (to fix)
+- `KHandleTable` still stores opaque `u64` ids instead of `KAutoObject*`, so `KDeviceAddressSpace` needs a parallel `KProcess` registry rather than being retrieved generically through `GetObject<KDeviceAddressSpace>`.
+- `KDeviceAddressSpace` still does not own an actual kernel `KLightLock`; Rust currently serializes the object through the `Arc<Mutex<KDeviceAddressSpace>>` registry owner instead.
+- `KPageTableBase::{map,unmap}_physical_memory` still do not use real `m_map_physical_memory_lock` / `m_general_lock` light-lock ownership or allocator pre-reservation sized by the exact upstream boundary split count; the Rust block-manager update helpers allocate through the current slab wrapper.
+
+### Missing items
+- Refactor `KHandleTable` toward typed kernel-object storage, or add a broader typed-object registry layer, so `GetObject<KDeviceAddressSpace>` and `GetObject<KProcess>` parity does not require SVC-specific side registries.
+- Add a real per-object lock equivalent for `KDeviceAddressSpace::m_lock` once the kernel lock/borrow model can express locking an object while mutating the target page table.
+- Port the full upstream page-table light-lock and exact update-allocator lifecycle for `MapPhysicalMemory` / `UnmapPhysicalMemory`.
+
+### Binary layout verification
+- N/A: page-table method signature and host-side call policy only. No guest-visible ioctl payload layout changed.
+
+### Tests
+- Re-read upstream `svc_device_address_space.cpp` and `k_device_address_space.cpp` before centralizing the Rust SVC-side device-address-space/process resolution helper.
+- `cargo fmt --check`
+- `cargo check -p core`
+- `cargo check -p video_core`
+- `cargo build --release --bin ruzu-cmd`
+- `cargo test -p core initialize_32bit_without_alias_places_shared_outside_folded_heap -- --nocapture` attempted, but the pre-existing `core` lib-test harness fails before focused tests execute.
+- Short MK8D info run for page-table layout classification (`/tmp/mk8d_npdm_regions_1780774652.log`): ruzu reads MK8D as `ProgramAddressSpaceType::Is32BitNoMap`. The run rejected `MapSharedMemory(addr=0xB9004000, size=0x1100000)` because it overlapped folded heap `[0x40000000..0xC0000000)`, then accepted the guest retry at `0xD5C04000`, and reached `OpenAudioRenderer` plus `am::NotifyRunning`. This makes the `0xB9004000` rejection a conforming retry path, not the current blocker.
+- Manual MK8D run after the `MapPhysicalMemory` / `UnmapPhysicalMemory` parity pass (`/tmp/mk8d_physical_memory_parity_1780761766.log`): reached the same late blocker, `nvmap::IocAlloc(handle=0xAD0, addr=0x068B0000, size=0x70000) result=0x0000D401`, with the range still `Free` (`base=0x602D000 size=0x1210000`) followed by `BreakLoopNullPc`. The parity pass did not regress earlier boot, but it did not create the missing CPU mapping; the remaining investigation is why the guest submits a low `MapSmall` address that was never made `Normal`.
+- `cargo build --release --bin ruzu-cmd`
+- Manual MK8D run after typed `KDeviceAddressSpace` routing (`/tmp/mk8d_typed_das_rerun_1780761120.log`): reached `am::NotifyRunning`, then reproduced the known late page-table blocker at `nvmap::IocAlloc(handle=0xAD4, addr=0x068B0000, size=0x70000) result=0x0000D401` followed by `BreakLoopNullPc`. No new early SIGSEGV or host crash was observed; the remaining blocker is still the free CPU range passed to `nvmap::IocAlloc`.
+- `cargo fmt --check`
+- `cargo check -p core`
+- `cargo check -p video_core`
+- `cargo test -p core explicit_process_handle_resolves_current_process_object_id -- --nocapture`
+- Manual MK8D 120s smoke after explicit process-handle resolution for device-address-space SVCs (`/tmp/mk8d_das_process_handle_1780808103.log`, `RUST_LOG=warn`, isolated XDG dirs, no L+R input): reached `NotifyRunning`; no `nvmap::IocAlloc`, `0x068B0000`, `BreakLoopNullPc`, panic, SIGSEGV, GL API marker, or runtime SMMU owner marker was logged before controlled timeout. This remains smoke-level evidence only; warn-level logging does not prove audio/rendering progress.
+- Re-read upstream `svc_device_address_space.cpp` and `k_device_address_space.cpp` before replacing by-value DAS registry lookups with shared object ownership.
+- `cargo test -p core explicit_process_handle_resolves_current_process_object_id -- --nocapture`
+- `cargo check -p core`
+- `cargo fmt --check`
+- `git diff --check`
+- `cargo build --release --bin ruzu-cmd`
+- Manual MK8D 120s smoke after preserving DAS object identity with `Arc<Mutex<KDeviceAddressSpace>>` (`/tmp/mk8d_das_arc_1780808553.log`, `RUST_LOG=warn`, isolated XDG dirs, no L+R input): reached `am::NotifyRunning`; no `nvmap::IocAlloc`, `0x068B0000`, `BreakLoopNullPc`, panic, SIGSEGV, GL API marker, missing runtime SMMU owner marker, or active-session missing-ASID marker was logged before controlled timeout. This remains sparse-log no-obvious-regression evidence only; warn-level logging does not prove audio/rendering progress.
 
 ## 2026-05-25 — video_core/src/renderer_opengl/gl_rasterizer.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/renderer_opengl/gl_graphics_pipeline.cpp
 
@@ -13714,28 +14154,192 @@ The following still panic because upstream either also throws NotImplementedExce
 ## 2026-05-30 — core/src/hle/service/nvdrv/core/container.rs, core/src/hle/service/nvdrv/core/heap_mapper.rs, core/src/hle/service/nvdrv/core/nvmap.rs, and core/src/hle/service/nvdrv/devices/nvmap.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/nvdrv/core/container.cpp, heap_mapper.cpp, nvmap.cpp, and /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/nvdrv/devices/nvmap.cpp
 
 ### Intentional differences
-- `Container::open_session` now creates a preallocated heap mapping for application processes when the largest normal heap block is at least 32 MiB, matching upstream's `Container::OpenSession` optimization ownership. Ruzu uses `SystemRef::host1x_core().smmu_allocate` because the Rust `Host1xCoreInterface` does not expose the full upstream `MaxwellDeviceMemoryManager` allocator object.
-- `HeapMapper::map` installs SMMU mappings by translating the guest CPU VA to a host pointer and calling `Host1xCoreInterface::smmu_map`. Upstream calls `MaxwellDeviceMemoryManager::Map(daddr, vaddr, size, asid)`; ruzu's current device-memory bridge stores host pointers directly instead of process/asid-backed memory interfaces.
-- `NvMapDevice::ioc_alloc` installs the preallocated `d_address` immediately after `LockForMapDeviceAddressSpace`, because `NvMap::pin_handle` does not own a `Container&` in the current Rust structure. Upstream installs this during `NvMap::PinHandle`, where `NvMap` owns `Container&` directly.
+- `Container::open_session` now creates a preallocated heap mapping for application processes when the largest normal heap block is at least 32 MiB, matching upstream's `Container::OpenSession` optimization ownership. Ruzu uses `SystemRef::host1x_core().smmu_allocate/free` because the Rust `Host1xCoreInterface` still exposes a narrowed bridge instead of the full upstream `MaxwellDeviceMemoryManager` object.
+- `Container::open_session` now scans the heap region with upstream unsigned progression semantics: start at `GetHeapRegionStart()`, query the current block, merge adjacent `Normal` blocks, advance to `base_address + size`, and stop only when the next address does not advance. This matches upstream's terminal-block/wrap break instead of bounding the scan with Rust's separate heap-size value.
+- `Container::open_session` / `close_session` now register and unregister a Host1x SMMU ASID in the same lifecycle positions as upstream `DeviceMemoryManager::RegisterProcess` / `UnregisterProcess`. The registered value is the process `Memory` owner, matching upstream's `process->GetMemory()` pointer; `process_identity` remains only for upstream-style session reuse.
+- `HeapMapper::map` installs SMMU mappings by calling `Host1xCoreInterface::smmu_map(d_address, vaddress, size, asid, true)` for each unmapped overlap subrange; `MaxwellDeviceMemoryManager` then resolves pages through the registered ASID process memory, matching upstream `DeviceMemoryManager::Map`. `HeapMapper::unmap` removes zero-refcount subranges through `Host1xCoreInterface::smmu_unmap`, matching upstream `DeviceMemoryManager::Unmap` while still crossing the core/video-core crate boundary through a narrowed bridge instead of a concrete `Tegra::Host1x::Host1x&`.
+- `HeapMapper::IsInBounds`, `Map`, `Unmap`, and subrange address derivation now use wrapping `VAddr` / `DAddr` arithmetic for upstream unsigned expression parity (`start + size`, `m_vaddress + m_size`, `start - m_vaddress`) instead of Rust debug-overflow panics.
+- `NvMap` reaches the active session mapper through a shared `ContainerSessionStore` instead of upstream's literal `Container& core`. This keeps the preallocated-heap decision and forced heap unmap inside `NvMap::pin_handle` / `NvMap::free_handle`, matching upstream method ownership without introducing an unsafe Rust self-reference cycle.
 
 ### Unintentional differences (to fix)
-- Ruzu `NvMap` still does not structurally own a `Container&` like upstream `NvMap::NvMap(Container& core, Host1x&)`, so the preallocated-heap fast path is split between `devices/nvmap.rs::ioc_alloc` and `core/nvmap.rs::pin_handle`.
-- `HeapMapper` does not yet port upstream's `RangeSet` / `OverlapRangeSet` bookkeeping. It remaps the requested range on every call and `unmap` remains a no-op beyond logging.
-- Ruzu's SMMU allocator is still a simplified bump allocator, so absolute preallocated device addresses differ from upstream.
-- `Container::close_session` still does not free the preallocated SMMU region or unregister an ASID like upstream, because ruzu has not yet ported `MaxwellDeviceMemoryManager::Free` / `RegisterProcess` / `UnregisterProcess` into `Host1xCoreInterface`.
+- None identified for the currently audited `NvMap` session-state ownership slice. `ContainerSessionStore` is a narrow safe Rust view of upstream `ContainerImpl::sessions`, and runtime `NvMap` construction still flows through `Container`.
 
 ### Missing items
-- Port `MaxwellDeviceMemoryManager` process registration, free-list allocation/free, `TrackContinuity`, and ASID-aware map/unmap semantics instead of the current host-pointer SMMU bridge.
-- Move preallocated mapping ownership fully into `NvMap::pin_handle` once `NvMap` structurally owns or can safely access the `Container`, matching upstream method ownership.
-- Port `HeapMapper` mapped-range tracking and destructor/unmap cleanup.
+- Continue the broader Host1x/GPU owner-graph cleanup tracked in later entries: Host1x/GPU/rasterizer ownership still crosses safe Rust bridge traits instead of upstream direct references, and `UpdatePagesCachedCount` still keeps a documented fallback callback for pages without ASID CPU-backing metadata or partial test construction. The `MemoryManager::*_with_callback` guest-memory walkers are now explicit `#[cfg(test)]` reduced-fixture helpers, not runtime owner paths.
 
 ### Binary layout verification
 - PASS: nvmap ioctl payload structs were not changed. No guest-visible raw payload layout changed.
 
 ### Tests
 - `cargo check -p core`
+- `cargo test -p core free_heap_backed_handle_clears_mapping_state -- --nocapture`
+- `cargo test -p core heap_mapper -- --nocapture`
+- Re-read upstream `heap_mapper.h` / `heap_mapper.cpp` before aligning Rust `HeapMapper` address arithmetic with unsigned C++ wrapping semantics.
+- `cargo test -p core is_in_bounds_uses_upstream_wrapping_address_arithmetic -- --nocapture`
+- Re-read upstream `container.cpp::OpenSession` and Rust `KPageTableBase::query_info` terminal-block behavior before aligning preallocated heap scan progression.
+- `cargo test -p core hle::service::nvdrv::core::container::tests -- --nocapture`
+- Manual MK8D run after moving preallocated heap ownership into `NvMap::pin_handle` (`/tmp/mk8d_nvmap_owner_1780759450.log`): reached the late allocator sequence, then reproduced `nvmap::IocAlloc(handle=0xAD0, addr=0x068B0000, size=0x70000) result=0x0000D401` followed by `BreakLoopNullPc`. This confirms the ownership move does not mask the remaining page-table/kernel-memory blocker.
 - `cargo build --release --bin ruzu-cmd`
+- `cargo check -p video_core`
+- `cargo test -p video_core smmu_free_uses_flat_allocator_linear_pass_before_reuse -- --nocapture`
+- `cargo test -p video_core smmu_register_process_reuses_unregistered_asids -- --nocapture`
+- Manual MK8D 90s run (`/tmp/mk8d_nvmap_flatalloc.log`): audio renderer initializes and starts; late `nvmap::IocAlloc(handle=0xACC, addr=0x068B0000, size=0x70000)` still fails with `0x0000D401`, followed by `BreakLoopNullPc`, so the remaining blocker is not SMMU allocator reuse.
+- Manual MK8D 90s run after ASID lifecycle wiring (`/tmp/mk8d_nvmap_asid.log`): audio renderer initializes and starts; `pl:u GetSize font_id=5` is served; no `nvmap::IocAlloc` failure, `0x068B0000` alloc, `BreakLoopNullPc`, panic, or SIGSEGV was observed before timeout. This validates no immediate regression, but does not prove the late `0x068B0000` path is fully fixed because this run did not reach that allocation.
 - Runtime MK8D diagnostic with `RUZU_TRACE_NVMAP_PREALLOC=1 RUZU_TRACE_NVMAP_PIN=1 RUZU_TRACE_NVHOST_AS_MAP=1`: preallocated heap created and `handle=0x44` routed through `prealloc d_address`, but the later stale `BEEF2929` audio/object corruption still reproduces.
+- Manual MK8D run after routing heap-backed forced unmap through `HeapMapper::unmap` (`/tmp/mk8d_heap_unmap.log`): reached `am::NotifyRunning`, then reproduced the late blocker at `nvmap::IocAlloc(handle=0xACC, addr=0x068B0000, size=0x70000) result=0x0000D401` followed by `BreakLoopNullPc`. The failing page-table range is still reported as `Free`, so this parity slice does not fix the remaining MK8D blocker.
+
+## 2026-06-06 — common/src/address_space.rs and video_core/src/host1x/gpu_device_memory_manager.rs vs /home/vricosti/Dev/emulators/zuyu/src/common/address_space.h, /home/vricosti/Dev/emulators/zuyu/src/common/address_space.inc, and /home/vricosti/Dev/emulators/zuyu/src/core/device_memory_manager.inc
+
+### Intentional differences
+- Added `common::address_space::FlatAllocator64` as the Rust counterpart for upstream `Common::FlatAllocator<DAddr, 0, 34>` used by `DeviceMemoryManagerAllocator<MaxwellDeviceTraits>`. `FlatAllocator` and `FlatAllocator64` are now aliases over the same generic bool-backed `FlatAllocatorBool<VaType>`, matching the upstream `FlatAllocator<VaType, UnmappedVa, AddressSpaceBits>` shape for the `PaType=bool` instantiations currently used by ruzu.
+- `MaxwellDeviceMemoryManager::smmu_allocate/free` now use the 64-bit allocator with upstream `first_address = 1 << YUZU_PAGEBITS` and a 34-bit VA limit. This removes the previous 32-bit allocator cap while preserving the upstream linear-allocation-before-reuse behavior.
+
+### Unintentional differences (to fix)
+- None identified for the audited bool-backed `FlatAllocator<u32, 0, 32>` / `FlatAllocator<DAddr, 0, 34>` instantiations.
+
+### Missing items
+- Generalize the broader Rust `FlatAddressSpaceMap` port if future upstream users require non-bool `PaType`, `PaContigSplit=true`, or `ExtraBlockInfo` instantiations. This entry only covers the allocator variants used by current Host1x SMMU/GMMU paths.
+
+### Binary layout verification
+- N/A: host allocator bookkeeping only. No guest-visible raw payload layout changed.
+
+### Tests
+- Re-read upstream `common/address_space.h` and `common/address_space.inc` before replacing the duplicate Rust `FlatAllocator64` implementation with the shared generic bool-backed allocator core.
+- `cargo test -p common flat_allocator -- --nocapture`
+- `cargo check -p common`
+- `cargo check -p video_core`
+- `cargo build --release --bin ruzu-cmd`
+- Manual MK8D 90s run after enabling the 34-bit SMMU allocator (`/tmp/mk8d_smmu64.log`, `RUST_LOG=warn`): reached `am::NotifyRunning`; no `nvmap::IocAlloc`, `0x068B0000`, `BreakLoopNullPc`, panic, or SIGSEGV was logged before the controlled timeout.
+
+## 2026-06-06 — video_core/src/gpu.rs, video_core/src/control/channel_state.rs, video_core/src/memory_manager.rs, and video_core/src/host1x/gpu_device_memory_manager.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/gpu.cpp, /home/vricosti/Dev/emulators/zuyu/src/video_core/control/channel_state.cpp, /home/vricosti/Dev/emulators/zuyu/src/video_core/memory_manager.cpp, and /home/vricosti/Dev/emulators/zuyu/src/core/device_memory_manager.inc
+
+### Intentional differences
+- Runtime `Gpu::allocate_memory_manager_handle` and `ChannelState::init` now build `MemoryManager` with the Host1x `MaxwellDeviceMemoryManager` owner instead of installing guest-memory reader/writer callbacks. This moves the Rust read/write path closer to upstream, where `Tegra::MemoryManager::ReadBlockImpl` / `WriteBlockImpl` translate GPU VA to `DAddr` and then access memory through `MaxwellDeviceMemoryManager`.
+- `MemoryManager` now stores the Host1x `MaxwellDeviceMemoryManager` owner at construction time through `MemoryManager::new_with_geometry_and_device_memory(...)`, and the upstream-shaped `read_block` / `read_block_unsafe` / `write_block` / `write_block_unsafe` / `write_block_cached` / `copy_block` public entry points delegate into the inner `GpuMemoryManager`, which uses its stored device-memory owner rather than CPU guest-memory callback fallbacks. This matches upstream's `MemoryManager(Core::System&, MaxwellDeviceMemoryManager&, ...)` dependency direction more closely. Reduced tests that need callback-backed walkers use explicit `*_with_callback` names, and reduced tests that need owned reads/writes build SMMU-backed `MaxwellDeviceMemoryManager` fixtures instead of installing `MemoryManager` guest-memory callbacks.
+- `MemoryManager::WriteBlock` now mirrors upstream `WriteBlockImpl<true>` cache side effects by invalidating each mapped device segment through the bound `RasterizerInterface` before writing. `WriteBlockUnsafe` and `WriteBlockCached` still use the no-invalidation path, matching upstream `WriteBlockImpl<false>`.
+- `MaxwellDeviceMemoryManager::smmu_read_block` / `smmu_write_block` now consume recorded continuity metadata through an upstream-shaped walk helper. The helper resolves device page -> dense `compressed_physical_ptr` -> host backing before copying, trusting the recorded continuity span like upstream `WalkBlock`.
+- `MaxwellDeviceMemoryManager::read_u8/read_u16/read_u32/read_u64`, `write_u8/write_u16/write_u32/write_u64`, and `get_pointer/get_pointer_mut` now resolve through dense `compressed_physical_ptr` instead of returning stubbed zero/no-op results. This matches upstream `DeviceMemoryManager<Traits>::Read<T>` / `Write<T>` / `GetPointer<T>` behavior for currently mapped device pages; unmapped typed reads return zero and typed writes no-op, matching upstream's null-pointer guard.
+- Host1x device-memory binding now carries both sides of upstream `DeviceInterface`: `bind_device_memory_flusher(...)` routes safe SMMU reads through `RasterizerInterface::flush_region(...)`, while the existing invalidator routes block writes through `invalidate_region(...)`. `smmu_read_block` now matches upstream `ReadBlock` by flushing first; `smmu_read_block_unsafe` preserves upstream `ReadBlockUnsafe` for descriptor-table style callers.
+- `MaxwellDeviceMemoryManager::smmu_read_block(_unsafe)` now continues across unmapped SMMU segments by logging and zero-filling the destination, and `smmu_write_block` logs/skips unmapped segments while still invalidating the full written range. This matches upstream `DeviceMemoryManager<Traits>::WalkBlock` users, where `ReadBlock`/`ReadBlockUnsafe` zero-fill unmapped device reads and `WriteBlock`/`WriteBlockUnsafe` log unmapped writes but continue. The Rust methods still return `bool` as a temporary compatibility signal for legacy callers that have not yet been converted to owner-authoritative behavior.
+- `MaxwellDeviceMemoryManager` now records reverse physical-page -> encoded device-page metadata on SMMU map/remap/unmap using upstream-shaped `compressed_device_addr` single-vs-multi encoding and a Rust `MultiAddressContainer` counterpart. Mappings derive the physical page from registered/test-installed `DeviceMemory` `physical_base`, matching upstream `GetRawPhysicalAddr(ptr) >> page_bits + 1`.
+- `MaxwellDeviceMemoryManager::smmu_unmap` preserves recorded continuity metadata after clearing the page mapping, matching upstream `DeviceMemoryManager<Traits>::Unmap`, which does not modify `continuity_tracker`.
+- `MaxwellDeviceMemoryManager::smmu_apply_op_on_host_pointer` ports the observable fanout side of upstream `ApplyOpOnPointer` through the dense physical-page reverse table. It preserves intra-page offsets and visits every recorded device alias for the host page.
+- `Container::open_session` now registers the process `Memory` owner through the Host1x bridge, and `MaxwellDeviceMemoryManager::UpdatePagesCachedCount` calls that registered owner for ASID-backed cache transitions before falling back to the legacy callback path for unmapped or partial-test cases.
+- Rust does not keep a standalone `MaxwellDeviceMethods` stub. Upstream's `Tegra::MaxwellDeviceMethods::MarkRegionCaching(Core::Memory::Memory*, ...)` is only an inline forwarding method to `Memory::RasterizerMarkRegionCached`; ruzu performs the same forwarding directly inside `update_pages_cached_count` once an ASID-backed `Memory` owner is known.
+- `Maxwell3D` read paths use the stored `MemoryManager` / `MaxwellDeviceMemoryManager` owner when available instead of requiring the guest-memory reader callback. `ProcessCBMultiData`, report-semaphore fallback writes, and inline upload writes also route through the stored `MemoryManager` owner when available.
+- `Gpu::read_gpu_memory` keeps its frontend-facing compatibility signature, but now reads through the bound channel `MemoryManager::read_block(...)` instead of consuming the supplied CPU-reader callback. `RasterizerOpenGL`'s `GpuMemoryAccessAdapter` likewise installs from the channel `MemoryManager` alone and reads through `read_block(...)`, matching upstream buffer-cache ownership where `BufferCache` holds `MaxwellDeviceMemoryManager&` and uses `gpu_memory` for address translation.
+- `engine_upload::State::new()` is crate-local and `Maxwell3D::new()` / `Default for Maxwell3D` are test-only, so the public runtime parent-engine API must use constructor-time `MemoryManager` owners. `GpuContext::new` also gives its legacy `GpuMemoryManager` field the same `MaxwellDeviceMemoryManager` owner as the shared engine `MemoryManager`.
+- `Puller` semaphore reads/writes now use `MemoryManager::{read_block_unsafe,write_block_unsafe}` through its stored `MemoryManager&` equivalent instead of passing `Gpu::read_guest_memory` / `Gpu::write_guest_memory` callbacks. Upstream `Puller` owns `MemoryManager& memory_manager` and uses that owner directly for semaphore memory access.
+- `KeplerCompute::GetTICEntry` / `GetTSCEntry` now read descriptor entries through the engine's stored `MemoryManager` owner with `read_block_unsafe(...)`, matching upstream's `memory_manager.ReadBlockUnsafe(...)` calls and removing the previous CPU-reader callback from this engine path.
+- `Maxwell3D::GetTICEntry` / `GetTSCEntry` now read descriptor entries through the engine's stored `MemoryManager` owner with `read_block_unsafe(...)`, matching upstream's `memory_manager.ReadBlockUnsafe(...)` calls and removing the previous CPU-reader callback from this engine path. The Rust `DescriptorTable` utility remains callback-shaped internally only as a local cache helper.
+- `GpuContext::flush` now reads GPFIFO pushbuffers through its owner-backed `GpuMemoryManager::read_block(...)` instead of accepting a caller-supplied CPU guest-memory reader. The remaining explicit `*_with_callback` APIs on `MemoryManager` / `GpuMemoryManager` are compiled only for reduced tests.
+- `engine_upload::State` receives the current parent upload `Registers` view at each operation instead of storing upstream's literal `Registers&`. Upstream parent engines construct `upload_state{memory_manager, regs.upload}` from fields that live inside the same parent engine object; copying that shape directly in Rust would require a self-referential parent-engine field or unsafe raw pointer. The Rust call shape still reads the current parent register values for `ProcessExec`, `ProcessData`, and `ExecTargetAddress`, preserving the behavior while keeping the register owner in the parent engine.
+
+### Unintentional differences (to fix)
+- None identified for the audited runtime upload-state owner slice.
+
+### Missing items
+- None identified for the audited runtime upload-state owner/register-view slice.
+
+### Binary layout verification
+- N/A: GPU memory-owner plumbing only. No guest-visible raw payload layout changed.
+
+### Tests
+- `cargo check -p video_core`
+- `cargo test -p video_core smmu_map_with_cpu_backing_tracks_backing_and_continuity -- --nocapture`
+- `cargo test -p video_core smmu_walk_block -- --nocapture`
+- `cargo test -p video_core big_page_continuity_uses_device_memory_pointers -- --nocapture`
+- `cargo test -p video_core write_block_invalidates_but_write_block_unsafe_does_not -- --nocapture`
+- Re-read upstream `video_core/memory_manager.{h,cpp}` before renaming the owner-backed Rust public entry points to the upstream-shaped names and moving callback-backed walkers behind explicit `*_with_callback` APIs.
+- `cargo test -p video_core smmu_register_process_reuses_unregistered_asids -- --nocapture`
+- Re-read upstream `video_core/memory_manager.cpp::WriteBlockImpl` before adding safe write invalidation to Rust `MemoryManager::WriteBlock`.
+- Re-read upstream `memory_manager.cpp`, `memory_manager.h`, `gpu.cpp`, and `control/channel_state.cpp` before adding the stored Host1x `MaxwellDeviceMemoryManager` owner to Rust `MemoryManager`.
+- `cargo fmt --check`
+- `cargo check -p video_core`
+- `git diff --check`
+- `cargo check -p core`
+- `cargo test -p video_core memory_manager -- --nocapture`
+- `cargo build --release --bin ruzu-cmd`
+- Re-read upstream `core/device_memory_manager.inc::{GetPointer,Read,Write,WalkBlock,ReadBlock,WriteBlock}` before replacing typed `MaxwellDeviceMemoryManager` stubs with SMMU-backed operations.
+- Re-read upstream `video_core/engines/engine_upload.{h,cpp}`, `maxwell_3d.cpp`, `kepler_compute.cpp`, and `kepler_memory.h` before classifying the `Upload::State` `Registers&` field as a Rust parent-engine ownership adaptation.
+- `cargo fmt --check`
+- `cargo test -p video_core typed_ -- --nocapture`
+- Re-read upstream `DeviceMemoryManager<Traits>::ReadBlock` / `ReadBlockUnsafe` and `video_core/memory_manager.cpp::ReadBlockImpl` before adding the Host1x flush callback and splitting `smmu_read_block_unsafe`.
+- Re-read upstream `MultiAddressContainer`, `DeviceMemoryManager<Traits>::Map`, `Unmap`, `ApplyOpOnPAddr`, and `ApplyOpOnPointer` before replacing the Rust reverse metadata with upstream-shaped single-vs-multi encoded reverse fanout.
+- Re-read upstream `DeviceMemoryManager<Traits>::Map`, `Unmap`, `GetPointer`, `GetPhysicalRawAddressFromDAddr`, and `WalkBlock` before routing Rust SMMU storage through dense `compressed_physical_ptr`, dense continuity/CPU-backing tables, and physical-base-relative reverse fanout.
+- Re-read upstream `DeviceMemory::{GetRawPhysicalAddr,GetPointerFromRaw}` and `DeviceMemoryManager<Traits>::physical_base`, `Map`, `GetPointer`, `ApplyOpOnPAddr`, and `ApplyOpOnPointer` before routing ASID-backed Host1x SMMU pages through `physical_base`-relative raw physical page indices.
+- Re-read upstream `DeviceMemoryManager<Traits>::WalkBlock`, `ReadBlock`, `ReadBlockUnsafe`, `WriteBlock`, and `WriteBlockUnsafe` before updating Rust unmapped-segment behavior.
+- Re-read upstream `DeviceMemoryManager<Traits>::TrackContinuityImpl`, `GetSpan`, and `WalkBlock` before removing the ruzu-only per-page host-pointer continuity revalidation from `smmu_walk_block`.
+- Re-read upstream `video_core/memory_manager.{h,cpp}` and `video_core/engines/puller.{h,cpp}` before making ownerless `MemoryManager::new`, `MemoryManager::new_with_geometry`, `Default for MemoryManager`, and `Default for Puller` test-only.
+- Re-read upstream `video_core/memory_manager.{h,cpp}` before making ownerless `GpuMemoryManager::new`, `GpuMemoryManager::with_params`, and `Default for GpuMemoryManager` test-only and routing legacy `GpuContext::new`'s inner manager through `with_params_and_device_memory(...)`.
+- Re-read upstream `video_core/engines/puller.{h,cpp}` and `video_core/memory_manager.{h,cpp}` before moving Rust `Puller` semaphore memory access from callback-backed block reads/writes to owner-backed `MemoryManager` methods.
+- `cargo test -p video_core read_block_unsafe_uses_device_memory_without_flush -- --nocapture`
+- Re-read upstream `video_core/buffer_cache/buffer_cache.h` and `video_core/renderer_opengl/gl_rasterizer.cpp` before moving `Gpu::read_gpu_memory` and `RasterizerOpenGL::GpuMemoryAccessAdapter` reads off the frontend CPU-reader callback and onto the bound channel `MemoryManager`.
+- `cargo check -p video_core`
+- `cargo check --bin ruzu-cmd`
+- `cargo test -p video_core gpu_device_memory_manager -- --nocapture`
+- `cargo check -p core`
+- `cargo check -p video_core`
+- `cargo fmt --check`
+- `git diff --check`
+- `cargo build --release --bin ruzu-cmd`
+- Manual MK8D 120s smoke after big-page continuity owner routing (`/tmp/mk8d_bigpage_continuity_1780783738.log`, `RUST_LOG=warn`, isolated XDG dirs, no L+R input): reached `am::NotifyRunning`; no `0x068B0000`, `BreakLoopNullPc`, panic, SIGSEGV, `IocAlloc`, `glTextureSubImage3D`, GL API marker, `runtime SMMU map missing Container session store`, `active session ... no registered SMMU ASID`, or `runtime SMMU map missing process Memory owner` marker was logged before timeout. This remains smoke-level no-obvious-regression evidence only; warn-level logging does not prove audio/rendering progress.
+- `cargo check --bin ruzu-cmd`
+- `cargo test -p video_core memory_manager -- --nocapture`
+- Re-read upstream `video_core/memory_manager.{h,cpp}`, `video_core/gpu.cpp`, and `video_core/control/channel_state.cpp` before removing the redundant runtime `MemoryManager` callback installation from `Gpu::allocate_memory_manager_handle` and `ChannelState::init`.
+- `cargo check --bin ruzu-cmd`
+- `cargo check -p core`
+- Manual MK8D 120s smoke after removing redundant runtime `MemoryManager` callback installation (`/tmp/mk8d_no_mm_callbacks_1780786160.log`, `RUST_LOG=warn`, isolated XDG dirs, no L+R input): reached `am::NotifyRunning`; no `0x068B0000`, `BreakLoopNullPc`, panic, SIGSEGV, `IocAlloc`, `glTextureSubImage3D`, GL API marker, `MapSharedMemory`, `runtime SMMU map missing Container session store`, `active session ... no registered SMMU ASID`, or `runtime SMMU map missing process Memory owner` marker was logged before timeout. No `ruzu-cmd` process was active before the run or left after it. This remains sparse-log no-obvious-regression evidence only; warn-level logging does not prove audio/rendering progress.
+- Re-read upstream `video_core/memory_manager.{h,cpp}` and upstream query-cache writeback through `device_memory.WriteBlockUnsafe(...)` before removing the remaining `MemoryManager` guest-memory callback fields/setters and migrating reduced tests to SMMU-backed `MaxwellDeviceMemoryManager` fixtures.
+- `cargo check -p video_core`
+- `cargo test -p video_core memory_manager -- --nocapture`
+- `cargo test -p video_core read_gpu_block_uses_memory_manager_owner_without_guest_callback -- --nocapture`
+- `cargo test -p video_core write_block_cached_uses_device_memory_owner_and_accumulates -- --nocapture`
+- `cargo test -p video_core process_cb_multi_data_uses_memory_manager_owner_without_guest_writer -- --nocapture`
+- `cargo test -p video_core report_semaphore_fallback_uses_memory_manager_owner_without_guest_writer -- --nocapture`
+- `cargo test -p video_core inline_upload_linear_uses_constructor_memory_manager_owner_without_guest_writer -- --nocapture`
+- `cargo test -p video_core data_register_writes_through_memory_manager -- --nocapture`
+- `cargo test -p video_core blit_writes_pitch_linear_surface_through_memory_manager -- --nocapture`
+- `cargo test -p video_core test_blit_copies_pixels -- --nocapture`
+- `cargo test -p video_core test_blit_different_pitches -- --nocapture`
+- Re-read upstream `video_core/engines/kepler_compute.{h,cpp}` before moving `KeplerCompute::GetTICEntry` / `GetTSCEntry` from callback-backed reads to owner-backed `MemoryManager::read_block_unsafe(...)`.
+- `cargo test -p video_core get_tic_entry_reads_from_tic_pool -- --nocapture`
+- `cargo test -p video_core get_tsc_entry_reads_from_tsc_pool -- --nocapture`
+- Re-read upstream `video_core/engines/maxwell_3d.{h,cpp}` before moving `Maxwell3D::GetTICEntry` / `GetTSCEntry` from callback-backed reads to owner-backed `MemoryManager::read_block_unsafe(...)`.
+- `cargo test -p video_core test_get_tic_entry -- --nocapture`
+- `cargo test -p video_core test_get_tsc_entry -- --nocapture`
+- Manual MK8D 120s smoke after safe `MemoryManager::WriteBlock` invalidation parity (`/tmp/mk8d_writeblock_invalidate_1780784290.log`, `RUST_LOG=warn`, isolated XDG dirs, no L+R input): reached `am::NotifyRunning`; no `0x068B0000`, `BreakLoopNullPc`, panic, SIGSEGV, `IocAlloc`, `glTextureSubImage3D`, GL API marker, `runtime SMMU map missing Container session store`, `active session ... no registered SMMU ASID`, or `runtime SMMU map missing process Memory owner` marker was logged before timeout. This remains smoke-level no-obvious-regression evidence only; warn-level logging does not prove audio/rendering progress.
+- Manual MK8D smoke after `physical_base` SMMU mapping (`/tmp/mk8d_physical_base_1780780973.log`, `RUST_LOG=warn`): reached `am::NotifyRunning`; no `0x068B0000`, `BreakLoopNullPc`, panic, SIGSEGV, `IocAlloc`, `glTextureSubImage3D`, or GL API marker was logged before controlled timeout. This is smoke-level no-obvious-regression evidence only; warn-level logging does not prove audio/rendering progress.
+- `cargo build --release --bin ruzu-cmd`
+- Manual MK8D 180s smoke after ASID -> `Memory` owner routing (`/tmp/mk8d_registered_memory_asid_targeted_1780769575.log`, targeted `RUST_LOG`): reached `OpenAudioRenderer` and `am::NotifyRunning`; no `0x068B0000`, `BreakLoopNullPc`, panic, SIGSEGV, `glTextureSubImage3D`, or GL API error was logged before timeout. The run did not reproduce the known late `0x068B0000` blocker, but it is not proof that the blocker is fixed.
+- Manual MK8D profile run for the same slice (`/tmp/mk8d_registered_memory_asid_profile_1780769802.log`): cache-path stall profiles all exited cleanly before termination.
+- Manual MK8D 120s smoke after storing the Host1x owner directly in `MemoryManager` (`/tmp/mk8d_memory_manager_owner_1780770150.log`, targeted `RUST_LOG`): reached `OpenAudioRenderer` and `am::NotifyRunning`; no `0x068B0000`, `BreakLoopNullPc`, panic, SIGSEGV, `glTextureSubImage3D`, or GL API error was logged before timeout.
+- Manual MK8D profile run for the same `MemoryManager` owner slice (`/tmp/mk8d_ac8_trace_1780770390.log`, `RUZU_TRACE_NVMAP_LOOP=1` plus SIGUSR2 profiles): did not reproduce a hard `AC8` block. The run reached `nvmap::IocAlloc(handle=0xAC4)` and profile dumps still showed active GPU/NVN progress (`SubmitList` push/pop/done `3693/3692/3691`, `BQP QueueBuffer=1844`, `Present count=1843`). The earlier `AC8` targeted line is therefore not enough evidence to claim a runtime stall at `AC8`.
+- Manual MK8D 90s smoke after typed device-memory reads/writes plus Host1x flush binding (`/tmp/mk8d_device_memory_clean_1780771304.log`, clean `RUST_LOG` without per-nvmap spam): reached `IAudioRenderer::OpenAudioRenderer`, `IAudioRenderer::Start`, and `am::NotifyRunning`; no `0x068B0000`, `BreakLoopNullPc`, panic, SIGSEGV, or `glTextureSubImage3D` marker was logged before the controlled timeout.
+- Manual MK8D smoke after upstream-shaped reverse-map encoding (`/tmp/mk8d_multiaddr_sigusr1_1780771895.log`, clean targeted `RUST_LOG`, SIGUSR1 at 80s, terminated at 90s): reached `IAudioRenderer::OpenAudioRenderer`, `IAudioRenderer::Start`, and `am::NotifyRunning`; no `0x068B0000`, `BreakLoopNullPc`, panic, SIGSEGV, or `glTextureSubImage3D` marker was logged before termination. An earlier 90s run (`/tmp/mk8d_multiaddr_1780771778.log`) reached audio start but not `NotifyRunning`, so runtime evidence remains smoke-level and does not prove the intermittent early stall fixed.
+- Manual MK8D smoke after splitting sparse `compressed_physical_ptr` from host backing (`/tmp/mk8d_compressed_physical_1780772415.log`, clean targeted `RUST_LOG`, SIGUSR1 at 80s, terminated at 90s): reached `IAudioRenderer::OpenAudioRenderer` and `IAudioRenderer::Start`, but not `am::NotifyRunning`; no `0x068B0000`, `BreakLoopNullPc`, panic, SIGSEGV, or `glTextureSubImage3D` marker was logged before termination. This is weak runtime evidence only and preserves the known intermittent early-stall risk.
+- `cargo test -p video_core smmu_reverse_mapping -- --nocapture`
+- `cargo test -p video_core smmu_apply_op_on_host_pointer -- --nocapture`
+- `cargo test -p video_core read_block_zero_fills_unmapped_segments_but_keeps_mapped_data -- --nocapture`
+- `cargo test -p video_core write_block_skips_unmapped_segments_but_still_invalidates_range -- --nocapture`
+- `cargo test -p video_core read_block_uses_device_memory_owner_when_present -- --nocapture`
+- `cargo test -p video_core write_block_uses_device_memory_owner_when_present -- --nocapture`
+- `cargo check -p video_core`
+- `cargo test -p video_core gpu_device_memory_manager -- --nocapture`
+- `cargo check -p video_core`
+- `cargo check -p core`
+- `cargo check -p video_core --tests`
+- `cargo check --bin ruzu-cmd`
+- `cargo fmt --check`
+- `git diff --check`
+- `cargo build --release --bin ruzu-cmd`
+- Manual MK8D 90s smoke after making owner-backed `MemoryManager` reads/writes authoritative (`/tmp/mk8d_device_memory_no_fallback_1780774311.log`): reproduced the known early sparse-log stall before `NotifyRunning`.
+- Manual MK8D 90s retry after the same slice (`/tmp/mk8d_device_memory_no_fallback_retry_1780774416.log`): reached `am::NotifyRunning` under `RUST_LOG=warn` with no `0x068B0000`, `BreakLoopNullPc`, panic, SIGSEGV, `IocAlloc`, or `glTextureSubImage3D` marker. It also logged `svc::MapSharedMemory: address 0xbaa04000 size 0x40000 cannot contain Shared`, so this remains weak no-obvious-regression evidence and points at the next page-table/kernel-memory branch rather than proving runtime completion.
+- Manual MK8D 90s run after adding SMMU CPU-backing/continuity metadata (`/tmp/mk8d_smmu_backing.log`, `RUST_LOG=warn`): reached `am::NotifyRunning`, then reproduced `nvmap::IocAlloc(handle=0xAD0, addr=0x068B0000, size=0x70000) result=0x0000D401` followed by `BreakLoopNullPc`. The failed range is still reported as `Free`, so the remaining blocker is outside this SMMU metadata slice and points at page-table/kernel-memory state.
+- Manual MK8D default run after removing the low-area pin gate (`/tmp/mk8d_low_area_default_1780759868.log`): reached the late allocator sequence with no host SIGSEGV and no `NVMAP_LOW_PIN` event before reproducing `nvmap::IocAlloc(handle=0xAD0, addr=0x068B0000, size=0x70000) result=0x0000D401` followed by `BreakLoopNullPc`. The remaining blocker is still page-table/kernel-memory state, not low-area pinning.
+- Manual MK8D 90s smoke after SMMU `WalkBlock` continuity routing (`/tmp/mk8d_smmu_walkblock.log`, `RUST_LOG=warn`): reached `am::NotifyRunning`; no `nvmap::IocAlloc`, `0x068B0000`, `BreakLoopNullPc`, panic, or SIGSEGV was logged before timeout. This validates no obvious early regression, but does not prove the late allocator blocker is fixed.
+- Manual MK8D 90s smoke after sparse SMMU reverse metadata (`/tmp/mk8d_smmu_reverse.log`, `RUST_LOG=warn`): controlled timeout with no `nvmap::IocAlloc`, `0x068B0000`, `BreakLoopNullPc`, panic, or SIGSEGV logged. The warn-level log is too sparse to prove `am::NotifyRunning`, so this is only a no-fatal smoke for the reverse-metadata slice.
+- Manual MK8D 90s smoke after exposing sparse `ApplyOpOnPointer` fanout (`/tmp/mk8d_apply_op_pointer.log`, `RUST_LOG=warn`): reached `am::NotifyRunning`, then reproduced the known late `nvmap::IocAlloc(handle=0xAD4, addr=0x068B0000, size=0x70000) result=0x0000D401` followed by `BreakLoopNullPc`. The failed range is still `Free`, so the remaining blocker stays in page-table/kernel-memory state rather than this Host1x reverse-fanout slice.
 
 ## 2026-05-30 — /home/vricosti/Dev/emulators/rdynarmic/src/frontend/a32/decoder.rs and /home/vricosti/Dev/emulators/rdynarmic/src/frontend/a32/translate/vfp.rs vs /home/vricosti/Dev/emulators/zuyu/externals/dynarmic/src/dynarmic/frontend/A32/decoder/vfp.inc and translate/impl/vfp.cpp
 
@@ -14600,7 +15204,7 @@ The following still panic because upstream either also throws NotImplementedExce
 
 ### Tests
 - `cargo build --release --bin ruzu-cmd`
-- `cargo test -p core update_highest_priority_threads_impl_requests_wait_for_non_runnable_dummy_current_thread -- --nocapture` was attempted but `core` test-mode compilation is currently blocked by unrelated pre-existing test errors in multiple modules.
+- `cargo test -p core update_highest_priority_threads_impl_requests_wait_for_non_runnable_dummy_current_thread -- --nocapture`
 - MK8D HWC validation without `RUZU_YIELD_AFTER_WAIT_SYNC`: 55s reached `item_frame=2017` (`acquire=2210`, `ok=2017`, `compose=2061`, `nvdisp=2017`).
 
 ## 2026-06-02 — common/src/trace.rs, common/src/trace.example.toml, core/src/hle/service/service.rs, and core/src/hle/service/hle_ipc.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/service.cpp and /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/hle_ipc.cpp
@@ -14987,7 +15591,7 @@ The following still panic because upstream either also throws NotImplementedExce
 ### Tests
 - `cargo check -p core`
 - `cargo build --release --bin ruzu-cmd`
-- `cargo test -p core set_state_preserves_wait_reason_for_ipc_begin_wait -- --nocapture` could not run because the current `core` lib test target fails to compile before this test with unrelated existing errors, including `core/src/hle/kernel/message_buffer.rs` E0506 and 142 total test-target errors.
+- `cargo test -p core set_state_preserves_wait_reason_for_ipc_begin_wait -- --nocapture` could not run because the current `core` lib test target fails to compile before this test with unrelated existing test-target errors. Current first blockers are stale test-only `CoreTiming` APIs and older tests that still call removed `KProcess::read_block/write_block` helpers directly.
 
 ## 2026-06-05 — core/src/hle/kernel/svc_dispatch.rs, core/src/hle/kernel/svc/svc_query_memory.rs, core/src/hle/kernel/k_memory_block.rs, core/src/hle/kernel/svc/svc_ipc.rs, core/src/hle/kernel/svc/svc_physical_memory.rs, and core/src/hle/service/nvdrv/nvdrv_interface.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/svc/svc_query_memory.cpp, /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/k_memory_block.h, /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/svc/svc_ipc.cpp, /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/svc/svc_physical_memory.cpp, and /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/nvdrv/nvdrv_interface.cpp
 
@@ -15018,7 +15622,7 @@ The following still panic because upstream either also throws NotImplementedExce
 ## 2026-06-05 — core/src/hle/kernel/svc/svc_memory_history.rs, core/src/hle/kernel/svc/svc_query_memory.rs, core/src/hle/kernel/svc/svc_memory.rs, core/src/hle/kernel/svc/svc_physical_memory.rs, and core/src/hle/service/nvdrv/devices/nvmap.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/svc/svc_query_memory.cpp, /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/svc/svc_memory.cpp, /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/svc/svc_physical_memory.cpp, and /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/nvdrv/devices/nvmap.cpp
 
 ### Intentional differences
-- Added Rust-only, env-gated diagnostic history for memory SVCs. `RUZU_TRACE_MEM_HISTORY_TARGET=0x...` records nearby `QueryMemory`, `SetHeapSize`, `MapMemory`, `UnmapMemory`, `MapPhysicalMemory`, and `UnmapPhysicalMemory` events into an in-memory ring and dumps it only when `nvmap::IocAlloc` detects a CPU range that cannot be locked for device mapping. This is investigation tooling for the MK8D late `0x068B0000` failure and does not alter guest-visible SVC or nvmap results.
+- Added Rust-only, env-gated diagnostic history for memory SVCs and IPC map-alias setup. `RUZU_TRACE_MEM_HISTORY_TARGET=0x...` records nearby `QueryMemory`, `SetHeapSize`, `MapMemory`, `UnmapMemory`, `MapPhysicalMemory`, `UnmapPhysicalMemory`, and `KServerSession::SetupForIpc` map-alias events into an in-memory ring and dumps it only when `nvmap::IocAlloc` detects a CPU range that cannot be locked for device mapping. `SetHeapSize` records also snapshot the target page-table state after the heap transition. This is investigation tooling for the MK8D late `0x068B0000` failure and does not alter guest-visible SVC, IPC, or nvmap results.
 - The same memory-history ring is also dumped from the existing SIGUSR1 kernel thread dump path. This keeps normal runs free of hot-path I/O while allowing a blocked MK8D process to be inspected with `kill -USR1 <pid>` before it is terminated.
 - `nvmap.rs` still emits additional diagnostics before continuing after `lock_for_map_device_address_space` failure. Upstream asserts this condition; ruzu logs the page-table mismatch so the guest-side allocator failure can be investigated without losing the preceding trace context.
 
@@ -15028,7 +15632,40 @@ The following still panic because upstream either also throws NotImplementedExce
 ### Tests
 - `cargo check -p core`
 - `cargo check -p core` after wiring the SIGUSR1 memory-history dump
+- `cargo check -p core` after extending `SetHeapSize` memory-history snapshots with target page-table state
+- Re-read upstream `KServerSession::ProcessReceiveMessageMapAliasDescriptors` before extending the diagnostic ring at the Rust `setup_for_ipc` call site.
+- `cargo fmt --check`
+- `git diff --check`
+- `cargo check -p core`
+- `cargo build --release --bin ruzu-cmd`
+- Manual MK8D 180s run after adding `IpcMapAlias` records (`/tmp/mk8d_memhist_ipc_map_alias_1780774959.log`, `RUST_LOG=warn`, `RUZU_TRACE_MEM_HISTORY_TARGET=0x068B0000`, `RUZU_EXIT_ON_NULL_PC=1`): reached `am::NotifyRunning`, but did not reproduce `0x068B0000`, `BreakLoopNullPc`, `IocAlloc`, or any `MEM_HISTORY` dump before the controlled timeout. It logged `Invalid DeviceFD=-1! ioctl1=0xC010001D tid=75`, so this run is only instrumentation/no-crash evidence and does not classify the late blocker.
 - Manual MK8D run with `RUZU_TRACE_MEM_HISTORY_TARGET=0x068B0000`: reproduced the late failure and showed only `QueryMemory`/`SetHeapSize` records near the target before `IocAlloc(handle=0xACC, addr=0x068B0000, size=0x70000)`; there were still no `MapMemory`, `UnmapMemory`, `MapPhysicalMemory`, or `UnmapPhysicalMemory` records preparing that CPU range.
+- Manual MK8D run before ASLR policy alignment (`/tmp/mk8d_heap_target_sigusr1_1780766986.log`): reproduced `IocAlloc(handle=0xAD4, addr=0x068B0000, size=0x70000)`, and the memory-history dump showed `SetHeapSize(0x78000000) -> address=0x40000000` while target `0x068B0000` remained in a `Free` block below the heap. This identified process-region placement as a concrete contributor to the bad nvmap CPU address.
+- Manual MK8D run after ASLR policy alignment with memory history (`/tmp/mk8d_aslr_parity_memhist_1780767542.log`): reproduced `IocAlloc(handle=0xAD0, addr=0x068B0000, size=0x70000)` and showed the same shape: `SetHeapSize(0x78000000) -> address=0x40000000`, target `0x068B0000` in a `Free` block below heap, and no `MapMemory` / `MapPhysicalMemory` event covering the target. The remaining blocker is still an unmapped CPU address submitted by the guest, not SMMU allocation.
+
+## 2026-06-06 — core/src/hle/kernel/k_page_table_base.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/k_page_table_base.cpp and /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/k_page_table_base.h
+
+### Intentional differences
+- `MapPhysicalMemory` constructs a Rust `KPageGroup cur_pg` per free subrange and routes it through `Operate(..., OperationType::MapFirstGroupPhysical)`, but the rollback cleanup is expressed through explicit Rust helpers instead of upstream's `SCOPE_GUARD` / `ON_RESULT_FAILURE` macros.
+- `KPageTableBase` stores the owning process id set by `KProcess::initialize_for_user` so `MapPhysicalMemory` can pass it to `KMemoryManager::AllocateForProcess(...)`. Upstream obtains the same value dynamically with `GetCurrentProcess(m_kernel).GetId()`; the Rust page table does not currently own a direct `KernelCore&`/current-process accessor.
+- `UnmapPhysicalMemory` keeps the upstream strict validation that the requested range contains only `Normal`/attribute-none blocks or `Free` blocks before unmapping the `Normal` subranges.
+
+### Unintentional differences (to fix)
+- None identified in the audited `MapPhysicalMemory` `MapFirstGroupPhysical` dispatch slice.
+
+### Missing items
+- None identified in the audited `MapPhysicalMemory` cleanup-helper slice. Upstream `SCOPE_GUARD` / `ON_RESULT_FAILURE` cleanup is represented by explicit Rust helpers (`rollback_partial_map_physical`, `release_unowned_page_group`, and `release_unowned_physical_pages_from`) with the same ownership effect.
+
+### Binary layout verification
+- N/A: kernel page-table state transition only. No raw guest payload layout changed.
+
+### Tests
+- Re-read upstream `KPageTableBase::MapPhysicalMemory`, `KPageTableBase::UnmapPhysicalMemory`, and `KPageTableBase::LockForMapDeviceAddressSpace`.
+- `cargo fmt --check`
+- `git diff --check`
+- `cargo check -p core`
+- `cargo build --release --bin ruzu-cmd`
+- Manual MK8D 180s smoke after relaxing `MapPhysicalMemory` non-`Free` handling (`/tmp/mk8d_map_physical_nonfree_1780768554.log`, `RUST_LOG=warn`, `RUZU_TRACE_MEM_HISTORY_TARGET=0x068B0000`, `RUZU_EXIT_ON_NULL_PC=1`): reached `am::NotifyRunning`; no `nvmap::IocAlloc`, `0x068B0000`, `BreakLoopNullPc`, panic, or SIGSEGV was logged before the controlled timeout. The log did show OpenGL `glTextureSubImage3D(out of bounds PBO access)` warnings, which are tracked outside this page-table slice.
 
 ## 2026-06-05 — core/src/cpu_manager.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/core.cpp and /home/vricosti/Dev/emulators/zuyu/src/core/arm/dynarmic/arm_dynarmic_32.cpp
 
@@ -15044,24 +15681,48 @@ The following still panic because upstream either also throws NotImplementedExce
 ## 2026-06-05 — core/src/hle/service/nvdrv/core/nvmap.rs and core/src/hle/service/nvdrv/devices/nvmap.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/nvdrv/core/nvmap.cpp and /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/nvdrv/devices/nvmap.cpp
 
 ### Intentional differences
-- Ruzu still installs the preallocated-heap fast path from `nvmap::IocAlloc` because `NvMap` does not yet own a direct `Container&` like upstream. The mapped length now uses `Handle::aligned_size`, matching upstream `NvMap::PinHandle`'s `map_size = handle_description->aligned_size` before `session->mapper->Map(...)`.
-- Ruzu's non-preallocated `NvMap::pin_handle` fallback still maps host pointers directly through `Host1xCoreInterface::smmu_map` instead of upstream's process/asid-backed `MaxwellDeviceMemoryManager::Map(...)`. It now allocates the SMMU range with `AlignUp(aligned_size, 0x10000)` and maps `aligned_size` bytes, matching upstream's size/alignment policy.
+- Ruzu's preallocated-heap and ASID lookup paths run from `NvMap::pin_handle` / `unmap_mapped_handle` through the shared `ContainerSessionStore` narrow view. Upstream stores a full `Container& core`; Rust stores only the session/preallocation state needed for `core.GetSession(session_id)->mapper->{Map,Unmap}(...)` and `core.GetSession(session_id)->asid` to avoid an unsafe self-reference cycle while preserving `NvMap` method ownership.
+- Ruzu's non-preallocated `NvMap::pin_handle` fallback now resolves the active session ASID and calls `Host1xCoreInterface::smmu_map(d_address, vaddress, map_size, asid, true)`, so `MaxwellDeviceMemoryManager` performs the same registered-process `GetPointerSilent(...)` page walk as upstream `smmu.Map(address, vaddress, map_size, session->asid, true)`. Rust still exposes this through a core-facing Host1x bridge instead of a direct concrete `Tegra::Host1x::Host1x&`. Production `NvMap` construction now requires `Container::new_with_system(...)`, which supplies a `ContainerSessionStore`; if that store or the ASID is missing, runtime pinning frees the allocated SMMU range and fails instead of falling back to direct host-pointer mapping. It allocates and frees the SMMU range with `AlignUp(aligned_size, 0x10000)`, matching upstream's size/alignment policy.
+- `NvMap::pin_handle` now retries SMMU allocation after draining one handle at a time from `unmap_queue`, matching upstream's `while ((address = smmu.Allocate(...)) == 0) { UnmapHandle(unmap_queue.front()) }` structure. Rust factors the shared heap/SMMU/GMMU teardown into `unmap_mapped_handle(...)` so the same owner-local teardown is used by forced free and allocation-pressure eviction.
+- `NvMap::pin_handle` / `unmap_mapped_handle` reach upstream's concrete `host1x.MemoryManager()`, `host1x.Allocator()`, and `host1x.GMMU()` operations through `Host1xCoreInterface` because `core` cannot depend on the concrete `video_core::host1x::Host1x` type. The bridge is narrow and method-specific: SMMU allocate/map/unmap/free, low-area GMMU map/unmap, and process-ASID registration stay implemented by `video_core::host1x::Host1x`, while `NvMap` retains upstream method ownership for deciding when to call them.
+- Reduced `Container::new()` / `NvMap::new()` fixtures cannot construct upstream's mandatory `Host1x&`. Rust stores an explicit invalid ASID for ownerless `Container` sessions and `ContainerSessionStore::session_asid(...)` refuses to expose it, so reduced no-Host1x `NvMap` pins return `0` and leave `d_address`/`pins` unchanged instead of fabricating ASID 0 or a device address from the CPU address. Runtime `Container` construction still supplies Host1x like upstream.
 
 ### Unintentional differences (to fix)
-- `NvMap` still lacks a direct owner-equivalent to upstream `Container& core`, so the preallocated-session decision is split between `devices/nvmap.rs` and `core/nvmap.rs`.
-- `NvMap::pin_handle` still ignores `low_area_pin`; upstream allocates a separate low-area GMMU VA and returns `pin_virt_address` when requested.
-- `NvMap::unpin_handle` / forced unmap still do not fully mirror upstream `UnmapHandle`, because the Rust Host1x bridge does not expose `GMMU().Unmap`, `Allocator().Free`, or SMMU `Free` through the same owner boundary.
+- None identified for the `Container& core` usage slice after re-reading upstream `NvMap::PinHandle`, `NvMap::UnmapHandle`, and `ContainerImpl`: Rust's `ContainerSessionStore` carries the same session mapper/ASID state used by these methods without adding a self-reference cycle.
+- None identified for the `Tegra::Host1x::Host1x&` usage slice in `NvMap::PinHandle` / `UnmapHandle`: Rust's Host1x bridge carries the same owner operations used by these methods without moving the nvmap lifecycle decisions out of `core/nvmap.rs`.
 
 ### Missing items
-- Move the preallocated-area decision into `NvMap::pin_handle` by giving `NvMap` an upstream-faithful `Container` owner reference without reintroducing unsafe lifetime drift.
-- Port low-area pin support for nvdec/vic users that call `PinHandle(..., true)`.
-- Expose enough Host1x device-memory-manager operations to port `UnmapHandle` literally.
+- None identified for the audited `NvMap::PinHandle` / `UnmapHandle` Host1x owner-reference slice. Remaining Host1x/device-memory table parity is tracked in the `gpu_device_memory_manager.rs`, `host1x.rs`, and `memory_manager.rs` entries.
 
 ### Binary layout verification
 - N/A: nvmap handle lifecycle and host-side SMMU mapping policy only. No guest-visible ioctl payload layout changed.
 
 ### Tests
+- Re-read upstream `NvMap::PinHandle` and `HeapMapper::Map` before updating the non-preallocated pin fallback.
+- Re-read upstream `NvMap::PinHandle` before adding the SMMU-allocation retry / `unmap_queue` drain path.
+- Re-read upstream `NvMap::PinHandle` and `DeviceMemoryManager::Map` before making the ASID-backed fallback forward null guest pages instead of skipping them.
+- Re-read upstream `NvMap::PinHandle`, `NvMap::UnmapHandle`, and `ContainerImpl` before reclassifying the `Container& core` owner gap as the safe `ContainerSessionStore` adaptation.
+- Re-read upstream `NvMap::PinHandle`, `NvMap::UnmapHandle`, and Rust `Host1xCoreInterface` / `video_core::host1x::Host1x` before reclassifying the concrete `Tegra::Host1x::Host1x&` owner gap as the safe core/video-core bridge adaptation.
+- Re-read upstream `NvMap::NvMap`, `NvMap::PinHandle`, and `ContainerImpl` before making ownerless `NvMap::new()` test-only and removing the public ownerless `new_with_system(...)` constructor.
+- Re-read upstream `NvMap::PinHandle`, `ContainerImpl`, and `DeviceMemoryManager::Map` before removing the runtime direct `smmu_map` fallback from non-preallocated `NvMap::pin_handle`.
+- Re-read upstream `NvMap::PinHandle` before removing the reduced no-Host1x fallback that returned the CPU address as `d_address`.
+- Re-read upstream `container.h` / `container.cpp` before replacing the ownerless `Container::open_session` ASID-0 fallback with an explicit invalid ASID that is not exposed to `NvMap` pinning.
+- Re-read upstream `NvMap::Handle::Alloc` and `NvMap::PinHandle` before removing Rust's extra `address != 0` guard from the first-pin mapping path; handles with CPU address 0 are logged as unimplemented by `Alloc` but still follow the normal later pin flow like upstream.
+- `cargo fmt --check`
 - `cargo check -p core`
+- `cargo check -p video_core`
+- `cargo test -p video_core gpu_device_memory_manager -- --nocapture`
+- `git diff --check`
+- `cargo build --release --bin ruzu-cmd`
+- `cargo check --bin ruzu-cmd`
+- `cargo test -p core pin_without_host1x_does_not_fabricate_device_address -- --nocapture`
+- `cargo test -p core pin_zero_cpu_address_still_attempts_mapping_like_upstream -- --nocapture`
+- `cargo test -p core ownerless_container_does_not_expose_valid_smmu_asid -- --nocapture`
+- `cargo check -p core --tests`
+- Manual MK8D 90s smoke after routing non-preallocated `NvMap::pin_handle` through ASID-backed CPU backing (`/tmp/mk8d_nvmap_asid_pin_1780772887.log`, `RUST_LOG=warn`, isolated XDG dirs, no L+R input): reached `am::NotifyRunning`; no `0x068B0000`, `BreakLoopNullPc`, panic, SIGSEGV, `IocAlloc`, or `glTextureSubImage3D` marker was logged. This is weak runtime evidence only because warn-level logging does not prove audio start.
+- Manual MK8D 120s smoke after forwarding null guest pages through the ASID-backed non-preallocated `NvMap::pin_handle` path (`/tmp/mk8d_nvmap_forward_null_pages_1780778824.log`, `RUST_LOG=warn`, isolated XDG dirs, no L+R input): reached `am::NotifyRunning`, then timed out with only one later `WriteBuffer: skip empty buffer write service=IStorage cmd=0` warning. No `0x068B0000`, `BreakLoopNullPc`, panic, SIGSEGV, `IocAlloc`, or `glTextureSubImage3D` marker was logged. This remains weak no-obvious-regression evidence only and does not prove audio/rendering progress or fix the intermittent post-NotifyRunning stall.
+- Manual MK8D 90s smoke after removing the direct `smmu_map` fallback from Container-backed runtime `NvMap::pin_handle` (`/tmp/mk8d_nvmap_no_runtime_direct_smmu_1780781397.log`, `RUST_LOG=warn`, isolated XDG dirs, no L+R input): reached `am::NotifyRunning`; no `0x068B0000`, `BreakLoopNullPc`, panic, SIGSEGV, `IocAlloc`, `glTextureSubImage3D`, GL API marker, `active session ... no registered SMMU ASID`, or `runtime SMMU map missing process Memory owner` marker was logged before the controlled timeout. This remains smoke-level no-obvious-regression evidence only; warn-level logging does not prove audio/rendering progress.
+- Manual MK8D 120s smoke after removing the remaining runtime direct host-pointer `smmu_map` path from `NvMap::pin_handle` (`/tmp/mk8d_nvmap_no_direct_fallback_1780783153.log`, `RUST_LOG=warn`, isolated XDG dirs, no L+R input): reached `am::NotifyRunning`; no `0x068B0000`, `BreakLoopNullPc`, panic, SIGSEGV, `IocAlloc`, GL API marker, `runtime SMMU map missing Container session store`, `active session ... no registered SMMU ASID`, or `runtime SMMU map missing process Memory owner` marker was logged. The wrapper lost the command exit code after the run because `status` is a read-only zsh variable, so this is no-obvious-regression smoke evidence only, not a complete runtime verdict.
 
 ## 2026-06-05 — core/src/hle/service/hle_ipc.rs and core/src/memory/memory.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/hle_ipc.cpp and /home/vricosti/Dev/emulators/zuyu/src/core/memory.cpp
 
@@ -15118,20 +15779,16 @@ The following still panic because upstream either also throws NotImplementedExce
 ### Intentional differences
 - Upstream `GPU::Impl::BindRenderer` directly calls `host1x.MemoryManager().BindInterface(rasterizer)` because `GPU::Impl` owns a concrete `Host1x&`. Ruzu keeps `Host1x` behind `core::Host1xCoreInterface`, so the same ownership edge is represented by `Host1xCoreInterface::bind_device_memory_invalidator(...)`.
 - The Rust callback captures the existing non-owning `RasterizerHandle` and calls `RasterizerInterface::invalidate_region(addr, size)` after `MaxwellDeviceMemoryManager::smmu_write_block(...)`, matching upstream `DeviceMemoryManager<Traits>::WriteBlock(...) -> device_inter->InvalidateRegion(address, size)`.
-- `Host1x` now owns a Host1x-local `MemoryManager` with upstream constructor geometry `address_space_bits=32`, `split_address=0`, `big_page_bits=12`, `page_bits=12`; `Gpu::bind_renderer` can downcast the opaque `Host1xCoreInterface` back to `video_core::Host1x` and call `bind_gmmu_rasterizer(...)`.
+- `Host1x` now owns a Host1x-local `MemoryManager` with upstream constructor geometry `address_space_bits=32`, `split_address=0`, `big_page_bits=12`, `page_bits=12`, and the same shared `MaxwellDeviceMemoryManager` owner returned by `Host1x::MemoryManager()`. `Gpu::bind_renderer` can downcast the opaque `Host1xCoreInterface` back to `video_core::Host1x` and call `bind_gmmu_rasterizer(...)`.
 - `Host1x` now owns a `FlatAllocator` equivalent to upstream `Common::FlatAllocator<u32, 0, 32>` and exposes opaque core-facing helpers for the `NvMap::PinHandle(low_area_pin)` map/free sequence: allocate low Host1x GMMU VA, map it to the existing `d_address`, then unmap/free it on handle teardown.
 - Added diagnostic `RUZU_DISABLE_HOST1X_INVALIDATE_BIND=1` to isolate this new ownership edge during MK8D runtime testing. Upstream has no such knob; default behavior remains the upstream-equivalent binding.
-- The incomplete Host1x GMMU rasterizer binding is currently gated behind `RUZU_ENABLE_HOST1X_GMMU_BIND=1`. This deliberately diverges from upstream default behavior because a runtime A/B on MK8D showed that enabling the binding before porting NvMap's Host1x allocator-backed low-area map/free path stalls before presentation. The binding code is kept for the next ownership slice, but normal execution stays on the proven SMMU invalidation path.
-- The upstream-faithful low-area pin return path is currently gated behind `RUZU_ENABLE_NVMAP_LOW_AREA_PIN=1`. A runtime test with the new Host1x allocator/GMMU map code enabled crashed early with SIGSEGV, so the default still returns the stable `d_address` until the remaining Host1x GMMU users and lifetime ordering are audited.
+- `GPU::bind_renderer` reaches `host1x.GMMU().BindRasterizer(rasterizer)` through a downcast from the core-facing `Host1xCoreInterface` to the concrete `video_core::host1x::Host1x`. This preserves upstream behavior without exposing the concrete video-core type through the `core` crate interface.
 
 ### Unintentional differences (to fix)
-- Upstream `GPU::Impl::BindRenderer` always calls `host1x.GMMU().BindRasterizer(rasterizer)` immediately after `host1x.MemoryManager().BindInterface(rasterizer)`. Ruzu has the Host1x `MemoryManager` instance and binding method, but does not enable that call by default until the matching `NvMap::PinHandle(low_area_pin)` / `UnmapHandle` GMMU map/free path is ported.
-- Host1x GMMU map/unmap ownership is partially present but not yet default-safe. Upstream `NvMap` low-area pins always return `pin_virt_address`; ruzu can do so under `RUZU_ENABLE_NVMAP_LOW_AREA_PIN=1`, but default execution still suppresses it because the rest of the Host1x GMMU lifetime/users are not yet proven.
-- `MaxwellDeviceMemoryManager` remains a partial Rust manager with SMMU map/read/write support rather than the full upstream `Core::DeviceMemoryManager<MaxwellDeviceTraits>` implementation.
+- None identified for the audited renderer-binding slice. The Rust callback/bridge represents upstream's `DeviceMemoryManager::BindInterface(DeviceInterface*)` invalidation edge without moving Host1x ownership out of `video_core`.
 
 ### Missing items
-- Audit and complete the Host1x GMMU lifetime path so `RUZU_ENABLE_NVMAP_LOW_AREA_PIN=1` and `RUZU_ENABLE_HOST1X_GMMU_BIND=1` can become the default upstream-equivalent behavior without crashing or stalling MK8D.
-- Continue the full `Core::DeviceMemoryManager<Traits>` parity work so SMMU allocation/free, registered-process ASIDs, and cache-page accounting match upstream structurally.
+- Continue reducing the remaining owner-graph adapters once `Gpu`, `Host1x`, `MemoryManager`, and rasterizer lifetimes can carry upstream-style direct owners without unsafe self-reference cycles.
 
 ### Binary layout verification
 - N/A: renderer/Host1x ownership callback only. No guest-visible raw payload layout changed.
@@ -15139,8 +15796,16 @@ The following still panic because upstream either also throws NotImplementedExce
 ### Tests
 - `cargo check -p core`
 - `cargo check -p video_core`
-- MK8D default runtime after gating: reached `present_2520` with PPM dumps under `/tmp/mk8d_after_low_area_gate`.
-- MK8D opt-in runtime with `RUZU_ENABLE_NVMAP_LOW_AREA_PIN=1`: crashed early with host SIGSEGV, confirming the path is not default-safe yet.
+- Re-read upstream `Host1x::Host1x(Core::System&)` before wiring the Rust Host1x-local `gmmu_manager` to the shared `MaxwellDeviceMemoryManager`.
+- Re-read upstream `GPU::Impl::BindRenderer` and `DeviceMemoryManager::BindInterface` before reclassifying the callback-based invalidation bridge as the Rust representation of upstream's `DeviceInterface*` owner edge rather than a separate behavior gap.
+- `cargo fmt --check`
+- `cargo check -p video_core`
+- `cargo check -p core`
+- `cargo build --release --bin ruzu-cmd`
+- Manual MK8D 150s smoke after the upload owner-path and Host1x renderer-binding DIFF cleanup (`/tmp/mk8d_owner_upload_smoke_1780795016.log`, `RUST_LOG=warn`, isolated XDG dirs, no L+R input): reached `am::NotifyRunning`; no `nvmap::IocAlloc`, `0x068B0000`, `BreakLoopNullPc`, panic, SIGSEGV, `glTextureSubImage3D`, GL API marker, missing runtime SMMU owner marker, or stale process marker was logged before the controlled timeout. This is smoke-level no-obvious-regression evidence only; warn-level logging showed little post-NotifyRunning activity and does not prove audio/rendering progress.
+- Manual MK8D 90s smoke after wiring the Host1x-local GMMU to the shared device-memory owner: first run `/tmp/mk8d_host1x_gmmu_owner_1780773494.log` reproduced the known early sparse-log stall before `NotifyRunning`; retry `/tmp/mk8d_host1x_gmmu_owner_retry_1780773607.log` reached `am::NotifyRunning` under `RUST_LOG=warn` with no `0x068B0000`, `BreakLoopNullPc`, panic, SIGSEGV, `IocAlloc`, or `glTextureSubImage3D` marker. This is smoke-level no-obvious-regression evidence only and preserves the intermittent early-stall risk.
+- MK8D default runtime after removing the low-area pin gate (`/tmp/mk8d_low_area_default_1780759868.log`): no host SIGSEGV; the run reaches the same late page-table blocker at `nvmap::IocAlloc(handle=0xAD0, addr=0x068B0000, size=0x70000)`.
+- MK8D default runtime after enabling Host1x GMMU rasterizer binding by default (`/tmp/mk8d_gmmu_default_1780760088.log`): no early presentation stall, no host SIGSEGV, and the run reaches the same late page-table blocker at `nvmap::IocAlloc(handle=0xAD4, addr=0x068B0000, size=0x70000)`.
 
 ## 2026-06-04 — core/src/arm/dynarmic/arm_dynarmic_32.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/arm/dynarmic/arm_dynarmic_32.cpp
 
@@ -15197,12 +15862,11 @@ The following still panic because upstream either also throws NotImplementedExce
 - `audio_core::guest_read_block(...)` now uses `read_block_checked(...)` because ruzu currently routes audio decode reads through a global Rust accessor instead of upstream's direct `Core::Memory::Memory&` parameter threaded through `DecodeFromWaveBuffers`.
 - `HLERequestContext::read_guest_memory(...)` now uses `read_block_checked(...)` for copied IPC input buffers. Upstream `HLERequestContext::{ReadBufferCopy,ReadBufferA,ReadBufferX,ReadBuffer}` reads through `memory.ReadBlock` / `CpuGuestMemory<UnsafeRead>`; ruzu's current guest-memory mapping can expose inaccessible translated host pages, so the checked path prevents host aborts.
 - `HLERequestContext::write_guest_memory(...)` now uses `write_block_no_rasterizer_checked(...)` for all copied IPC output buffers, not just large writes. Upstream calls `memory.WriteBlock` / `CpuGuestMemory` with a stable per-context `Core::Memory::Memory&`; ruzu observed 8-byte IPC writes into inaccessible host mappings after rejected shared-memory state, so the checked write prevents host SIGSEGV.
-- IPC input-buffer reads now prefer the owner process' legacy `process_memory` view before falling back to the checked `Memory` bridge. This is intentionally different from upstream, but avoids ruzu's temporary raw `current_page_table` bridge during HLE request decoding; an MK8D IPC-ring run showed that `Memory::read_block_checked(...)` could still crash inside `get_pointer_impl` while resolving nvmap ioctl input buffers. If the legacy read returns a full-size all-zero buffer, ruzu probes the checked `Memory` bridge and uses it when it returns non-zero data; this preserves the legacy fast/safe path while avoiding false empty nvdrv device names from stale legacy mappings. IPC output writes keep the checked `Memory` bridge first, then fall back to `process_memory`.
+- IPC input-buffer reads use the checked `Memory` bridge whenever it is available. Legacy `process_memory` is only used for processes that do not yet own a `Memory` bridge, keeping the authoritative path closer to upstream `Core::Memory::Memory&`.
 
 ### Unintentional differences (to fix)
 - Upstream `DecodeFromWaveBuffers(Core::Memory::Memory& memory, ...)` owns the memory dependency explicitly and reads wave buffers through `CpuGuestMemory` / `ReadBlockUnsafe`. Ruzu still uses a global `GUEST_MEMORY_ACCESSOR`, so this checked helper is a defensive adaptation around that temporary architecture.
-- Upstream HLE IPC stores a `Core::Memory::Memory&` directly in `HLERequestContext` and relies on its memory helpers for buffer reads/writes. Ruzu stores an optional `Arc<Mutex<Memory>>` bridge with checked guards plus legacy `process_memory` fallback because the surrounding memory/shared-memory lifecycle is not yet upstream-equivalent.
-- Upstream does not need a secondary legacy process-memory path for IPC buffers. Ruzu uses it temporarily for IPC input reads with an all-zero guard, to avoid returning zeroed nvdrv inputs or dereferencing a stale `Memory.current_page_table` bridge while process-local memory can still serve the access. This should be removed once the `Memory` bridge and process-local memory ownership are unified.
+- Upstream HLE IPC stores a `Core::Memory::Memory&` directly in `HLERequestContext` and relies on its memory helpers for buffer reads/writes. Ruzu stores an optional `Arc<Mutex<Memory>>` bridge with checked guards plus a legacy `process_memory` fallback for processes that still lack the bridge because the surrounding memory/shared-memory lifecycle is not yet upstream-equivalent.
 
 ### Missing items
 - Thread a `Core::Memory::Memory`-equivalent handle through the Rust audio renderer command path so data-source decode can match upstream ownership without global state.
@@ -15214,6 +15878,13 @@ The following still panic because upstream either also throws NotImplementedExce
 - `cargo check -p core`
 - `cargo check -p audio_core`
 - MK8D control after the all-zero guard no longer logs `Trying to open unknown device` and reaches `NotifyRunning`; with isolated `/tmp/ruzu-data`, system-data title `0100000000000802` still falls back to the synthetic 980-byte archive because the isolated System NAND registered cache is empty.
+- Re-read upstream `hle_ipc.cpp::{ReadBufferCopy,ReadBufferA,ReadBufferX,ReadBuffer}` before removing the IPC input all-zero legacy-first path.
+- `cargo fmt --check`
+- `git diff --check`
+- `cargo check -p core`
+- `cargo build --release --bin ruzu-cmd`
+- Focused `cargo test -p core read_guest_memory_uses_memory_bridge -- --nocapture` is blocked by unrelated existing `core` lib-test compile errors before the test runs. Current first blockers are stale test-only `CoreTiming` APIs and older tests that still call removed `KProcess::read_block/write_block` helpers directly.
+- Manual MK8D smoke after making `Memory` authoritative for IPC input when present (`/tmp/mk8d_hle_ipc_memory_authority_1780768098.log`, `RUST_LOG=warn`, `RUZU_TRACE_MEM_HISTORY_TARGET=0x068B0000`, `RUZU_EXIT_ON_NULL_PC=1`): reached `am::NotifyRunning`, then reproduced `nvmap::IocAlloc(handle=0xAD4, addr=0x068B0000, size=0x70000) result=0x0000D401` followed by `BreakLoopNullPc`. No `read_guest_memory` inaccessible-range warning was emitted; later `IOCALLOC_CTX` analysis showed the IPC descriptor buffer itself was readable and `0x068B0000` was the guest-submitted `IocAllocParams.address`, which `KPageTableBase` reports as `Free`.
 
 ## 2026-06-05 — common/src/trace.rs and core/src/hle/service/nvnflinger/hos_binder_driver.rs diagnostic Binder tracing vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/nvnflinger/hos_binder_driver.cpp and .h
 
@@ -15372,3 +16043,53 @@ The following still panic because upstream either also throws NotImplementedExce
 - `cargo test -p shader_recompiler txd -- --nocapture`
 - `cargo test -p shader_recompiler tld4s -- --nocapture`
 - `cargo check -p shader_recompiler`
+
+## 2026-06-06 — core/src/hle/service/nvdrv/devices/nvmap.rs and bases.json vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/nvdrv/devices/nvmap.cpp and /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/nvdrv/devices/nvmap.h
+
+### Intentional differences
+- Added disabled-by-default MK8D attribution diagnostics for `nvmap::IocCreate` / `IocAlloc`: `RUZU_TRACE_NVMAP_CALLER`, `RUZU_TRACE_NVMAP_STACK`, `RUZU_TRACE_NVMAP_STACK_FRAMES`, `RUZU_TRACE_NVMAP_STACK_POINTERS`, `RUZU_TRACE_NVMAP_STACK_CODE`, and `RUZU_TRACE_NVMAP_STACK_HANDLE`. Upstream has no equivalent host diagnostic; normal ioctl behavior and guest-visible payloads are unchanged unless the env vars are enabled.
+- Registered the verified MK8D `subsdk0` load base in `bases.json` (`0x01512000`) after byte-pattern matching runtime PCs `0x0151FC2C` / `0x0151FC94` to `subsdk0` `.text` offsets `0xDC2C` / `0xDC94`. This is investigation metadata only.
+
+### Unintentional differences (to fix)
+- None identified in this diagnostic slice.
+
+### Missing items
+- None for this diagnostic slice.
+
+### Binary layout verification
+- PASS: no nvmap ioctl payload structs changed. `IocCreateParams` remains 8 bytes and `IocAllocParams` remains 32 bytes.
+
+### Tests
+- Re-read upstream `nvmap.cpp` and `nvmap.h` before adding the gated diagnostics.
+- `cargo fmt --check`
+- `cargo check -p core`
+- `cargo build --release --bin ruzu-cmd`
+- Manual MK8D run with `RUZU_TRACE_NVMAP_ALLOC=1 RUZU_TRACE_NVMAP_CALLER=1 RUZU_TRACE_NVMAP_STACK=1 RUZU_TRACE_NVMAP_STACK_FRAMES=1`: `/tmp/mk8d_nvmap_frame_calc_1780764106.log` reproduced the first divergent create sequence as `handle=0x258 size=0x39000`, after `0x24C:0x85000`, `0x250:0x7000`, and `0x254:0x2000`. The guest-side call stack contains returns through `subsdk0` `0x0151FC2C` / `0x0151FC94`.
+- Manual MK8D run with `RUZU_TRACE_NVMAP_STACK_HANDLE=0x258 RUZU_TRACE_NVMAP_STACK_POINTERS=1`: `/tmp/mk8d_nvmap_ptr_h258_1780764512.log` showed the `0x258` allocation was already backed by guest resource data before nvmap handled the ioctl, including an in-memory `FRES` header at `0x5C174000`. The missing zuyu `0x21000` allocation is therefore skipped before the nvmap ioctl path rather than being transformed by `NvMapDevice::IocCreate` / `IocAlloc`.
+
+## 2026-06-07 — `core/src/hle/kernel/k_memory_manager.rs` and `core/src/hle/kernel/k_page_group.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/k_memory_manager.h`, `/home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/k_memory_manager.cpp`, `/home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/k_page_group.h`, and `/home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/k_page_group.cpp`
+
+### Intentional differences
+- `KPageGroup` still stores blocks in `Vec<KBlockInfo>` instead of upstream's `KBlockInfoManager` intrusive allocation. This keeps the same block ordering/concatenation behavior in safe Rust, but it is not allocator-ownership parity.
+- `KPageGroup` still reaches `KMemoryManager` through the current global kernel accessor for `Open`/`OpenFirst`/`Close`; upstream stores `KernelCore& m_kernel` directly in the page group.
+- `KMemoryManager::InitializeOptimizedMemory` / `FinalizeOptimizedMemory` now enforce the upstream single optimized process per pool and process-id-matched finalization policy, but the per-`Impl` optimized allocation bitmap clear/track helpers remain simplified because ruzu does not yet expose upstream's management-region device-memory map.
+
+### Unintentional differences (to fix)
+- None identified in the audited `KMemoryManager::{Open,OpenFirst,Close}` and `KPageGroup::{Open,OpenFirst,Close}` slice. The Rust public entry points now split ranges per physical `Impl`, take the pool lock per segment, and `KPageGroup::open_first()` routes to `KMemoryManager::open_first()`.
+
+### Missing items
+- Replace the `Vec<KBlockInfo>` storage with an upstream-shaped `KBlockInfoManager` owner if later page-table work needs exact block-node allocation/lifetime parity.
+- Remove the global-kernel accessor dependency from `KPageGroup` once the broader kernel owner graph can pass the upstream-equivalent `KernelCore&` safely.
+- Port the exact optimized allocation bitmap storage/clearing/tracking inside `KMemoryManager::Impl` if optimized-process allocation accounting becomes runtime-visible.
+
+### Binary layout verification
+- PASS: no raw guest-visible payload layout changed; this slice only changes kernel physical-page reference-count routing.
+
+### Tests
+- Re-read upstream `KMemoryManager::{Open,OpenFirst,Close}` and `KPageGroup::{Open,OpenFirst,Close}`.
+- Re-read upstream `KMemoryManager::InitializeOptimizedMemory`, `FinalizeOptimizedMemory`, and `Impl::InitializeOptimizedMemory`.
+- Re-read upstream `KPageGroup(KernelCore&, KBlockInfoManager*)`; Rust `KPageGroup::new()` now creates a kernel-owned group by default instead of a detached no-op ref-count group.
+- `cargo check -p core`
+- `cargo fmt --check`
+- `git diff --check`
+- `cargo test -p core open_first_open_close_split_across_impl_managers -- --nocapture`

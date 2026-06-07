@@ -536,6 +536,41 @@ impl KMemoryManager {
         0
     }
 
+    /// Allocate pages for a process without opening page references.
+    ///
+    /// Port of upstream `KMemoryManager::AllocateForProcess`. The caller is
+    /// responsible for opening the first references when pages become owned by
+    /// a mapping, and for releasing unowned allocated pages on failure.
+    pub fn allocate_for_process(
+        &mut self,
+        out_pg: &mut super::k_page_group::KPageGroup,
+        num_pages: usize,
+        option: u32,
+        process_id: u64,
+    ) -> u32 {
+        debug_assert!(out_pg.is_empty(), "out page group must be empty");
+        if num_pages == 0 {
+            return 0;
+        }
+
+        let (pool, dir) = Self::decode_option(option);
+        let pool_index = pool as usize;
+        let _lk = self.m_pool_locks[pool_index].lock().unwrap();
+
+        let has_optimized = self.m_has_optimized_process[pool_index];
+        let is_optimized = self.m_optimized_process_ids[pool_index] == process_id;
+        let pool_first = self.get_first_manager(pool, dir);
+        Self::allocate_page_group_impl(
+            &mut self.m_managers,
+            pool_first,
+            dir,
+            out_pg,
+            num_pages,
+            has_optimized && !is_optimized,
+            false,
+        )
+    }
+
     /// Allocate a `KPageGroup` for `num_pages` from the pool whose head Impl
     /// is `pool_head`, using the buddy heap's largest-block-first strategy.
     ///
@@ -631,18 +666,70 @@ impl KMemoryManager {
         panic!("KMemoryManager: no manager for address {:#x}", address);
     }
 
+    /// Open first references for pages at the given address.
+    /// Upstream: `void OpenFirst(KPhysicalAddress, size_t)`.
+    pub fn open_first(&mut self, mut address: u64, mut num_pages: usize) {
+        while num_pages > 0 {
+            let manager_idx = Self::find_manager_index(&self.m_managers, address);
+            let pool_index = self.m_managers[manager_idx].m_pool as usize;
+            let cur_pages =
+                num_pages.min(self.m_managers[manager_idx].get_page_offset_to_end(address));
+
+            {
+                let _lk = self.m_pool_locks[pool_index].lock().unwrap();
+                self.m_managers[manager_idx].open_first(address, cur_pages);
+            }
+
+            num_pages -= cur_pages;
+            address += (cur_pages * PAGE_SIZE) as u64;
+        }
+    }
+
     /// Open (increment) reference counts for pages at the given address.
     /// Upstream: `void Open(KPhysicalAddress, size_t)`.
-    pub fn open(&mut self, address: u64, num_pages: usize) {
-        let manager = self.get_manager_mut(address);
-        manager.open(address, num_pages);
+    pub fn open(&mut self, mut address: u64, mut num_pages: usize) {
+        while num_pages > 0 {
+            let manager_idx = Self::find_manager_index(&self.m_managers, address);
+            let pool_index = self.m_managers[manager_idx].m_pool as usize;
+            let cur_pages =
+                num_pages.min(self.m_managers[manager_idx].get_page_offset_to_end(address));
+
+            {
+                let _lk = self.m_pool_locks[pool_index].lock().unwrap();
+                self.m_managers[manager_idx].open(address, cur_pages);
+            }
+
+            num_pages -= cur_pages;
+            address += (cur_pages * PAGE_SIZE) as u64;
+        }
+    }
+
+    /// Return whether a physical address is owned by one of the kernel page
+    /// heaps. Rust counterpart of upstream `IsHeapPhysicalAddress(...)` checks
+    /// before opening/closing page references.
+    pub fn contains_physical_address(&self, address: u64) -> bool {
+        self.m_managers
+            .iter()
+            .any(|manager| manager.contains(address))
     }
 
     /// Close (decrement) reference counts; free pages when count reaches 0.
     /// Upstream: `void Close(KPhysicalAddress, size_t)`.
-    pub fn close(&mut self, address: u64, num_pages: usize) {
-        let manager = self.get_manager_mut(address);
-        manager.close(address, num_pages);
+    pub fn close(&mut self, mut address: u64, mut num_pages: usize) {
+        while num_pages > 0 {
+            let manager_idx = Self::find_manager_index(&self.m_managers, address);
+            let pool_index = self.m_managers[manager_idx].m_pool as usize;
+            let cur_pages =
+                num_pages.min(self.m_managers[manager_idx].get_page_offset_to_end(address));
+
+            {
+                let _lk = self.m_pool_locks[pool_index].lock().unwrap();
+                self.m_managers[manager_idx].close(address, cur_pages);
+            }
+
+            num_pages -= cur_pages;
+            address += (cur_pages * PAGE_SIZE) as u64;
+        }
     }
 
     // --- Query ---
@@ -660,26 +747,27 @@ impl KMemoryManager {
     // --- Optimized memory ---
 
     /// Upstream: `Result InitializeOptimizedMemory(u64 process_id, Pool pool)`.
-    pub fn initialize_optimized_memory(&self, process_id: u64, pool: Pool) -> u32 {
+    pub fn initialize_optimized_memory(&mut self, process_id: u64, pool: Pool) -> u32 {
         let pool_index = pool as usize;
         let _lk = self.m_pool_locks[pool_index].lock().unwrap();
-        log::trace!(
-            "InitializeOptimizedMemory: process_id={:#x}, pool={:?}",
-            process_id,
-            pool
-        );
-        0 // RESULT_SUCCESS
+        if self.m_has_optimized_process[pool_index] {
+            return svc_results::RESULT_BUSY.get_inner_value();
+        }
+
+        self.m_optimized_process_ids[pool_index] = process_id;
+        self.m_has_optimized_process[pool_index] = true;
+        0
     }
 
     /// Upstream: `void FinalizeOptimizedMemory(u64 process_id, Pool pool)`.
-    pub fn finalize_optimized_memory(&self, process_id: u64, pool: Pool) {
+    pub fn finalize_optimized_memory(&mut self, process_id: u64, pool: Pool) {
         let pool_index = pool as usize;
         let _lk = self.m_pool_locks[pool_index].lock().unwrap();
-        log::trace!(
-            "FinalizeOptimizedMemory: process_id={:#x}, pool={:?}",
-            process_id,
-            pool
-        );
+        if self.m_has_optimized_process[pool_index]
+            && self.m_optimized_process_ids[pool_index] == process_id
+        {
+            self.m_has_optimized_process[pool_index] = false;
+        }
     }
 
     // --- Static helpers ---
@@ -783,5 +871,47 @@ mod tests {
 
         // Second close (refcount becomes 0, page freed).
         mgr.close(addr, 1);
+    }
+
+    #[test]
+    fn open_first_open_close_split_across_impl_managers() {
+        let mut mgr = KMemoryManager::new();
+        let first_base = 0x1_0000_0000u64;
+        let second_base = first_base + (2 * PAGE_SIZE) as u64;
+        mgr.initialize_pool(Pool::SECURE, first_base, 2 * PAGE_SIZE);
+        mgr.initialize_pool(Pool::SECURE, second_base, 2 * PAGE_SIZE);
+
+        let cross_boundary = first_base + PAGE_SIZE as u64;
+        mgr.open_first(cross_boundary, 2);
+        assert_eq!(mgr.m_managers[0].m_page_reference_counts[1], 1);
+        assert_eq!(mgr.m_managers[1].m_page_reference_counts[0], 1);
+
+        mgr.open(cross_boundary, 2);
+        assert_eq!(mgr.m_managers[0].m_page_reference_counts[1], 2);
+        assert_eq!(mgr.m_managers[1].m_page_reference_counts[0], 2);
+
+        mgr.close(cross_boundary, 2);
+        assert_eq!(mgr.m_managers[0].m_page_reference_counts[1], 1);
+        assert_eq!(mgr.m_managers[1].m_page_reference_counts[0], 1);
+    }
+
+    #[test]
+    fn optimized_memory_tracks_single_process_per_pool() {
+        let mut mgr = KMemoryManager::new();
+
+        assert_eq!(mgr.initialize_optimized_memory(0x1234, Pool::SECURE), 0);
+        assert!(mgr.m_has_optimized_process[Pool::SECURE as usize]);
+        assert_eq!(mgr.m_optimized_process_ids[Pool::SECURE as usize], 0x1234);
+
+        assert_eq!(
+            mgr.initialize_optimized_memory(0x5678, Pool::SECURE),
+            svc_results::RESULT_BUSY.get_inner_value()
+        );
+
+        mgr.finalize_optimized_memory(0x5678, Pool::SECURE);
+        assert!(mgr.m_has_optimized_process[Pool::SECURE as usize]);
+
+        mgr.finalize_optimized_memory(0x1234, Pool::SECURE);
+        assert!(!mgr.m_has_optimized_process[Pool::SECURE as usize]);
     }
 }

@@ -88,47 +88,38 @@ const _: () = assert!(std::mem::size_of::<KBlockInfo>() <= 0x10);
 /// Upstream holds `KernelCore& m_kernel` and `KBlockInfoManager* m_manager`.
 /// We use a Vec<KBlockInfo> instead of slab-allocated intrusive list. The
 /// memory-manager reference is fetched through the global kernel accessor
-/// (`kernel::get_kernel_mut()`) at Open/Close time — KernelCore is a static
-/// singleton in ruzu, matching upstream's `KernelCore& m_kernel`.
-///
-/// `kernel_owned` mirrors upstream's two-constructor distinction: a group
-/// constructed via `with_kernel()` participates in ref-count callbacks
-/// (Open/Close/OpenFirst route to KMemoryManager); a group constructed via
-/// `new()` is a "detached" group used for inspection only — Open/Close are
-/// no-ops, matching the upstream pattern of constructing KPageGroup with a
-/// null KernelCore reference for read-only purposes.
+/// (`kernel::get_kernel_mut()`) at Open/Close time until the broader kernel
+/// owner graph can carry the upstream `KernelCore&` directly.
 pub struct KPageGroup {
     blocks: Vec<KBlockInfo>,
     /// Whether Open/Close should drive ref-count callbacks via the global
-    /// kernel accessor. Set true by `with_kernel`, false by `new`.
+    /// kernel accessor. Runtime constructors keep this true, matching upstream
+    /// `KPageGroup(KernelCore&, KBlockInfoManager*)`.
     kernel_owned: bool,
 }
 
 impl KPageGroup {
-    /// Create a page group with no kernel reference. `Open`/`Close`/`OpenFirst`/
-    /// `CloseAndReset` are no-ops on this variant.
-    pub fn new() -> Self {
-        Self {
-            blocks: Vec::new(),
-            kernel_owned: false,
-        }
-    }
-
     /// Create a page group attached to the global kernel. Matches upstream
     /// `KPageGroup(KernelCore& kernel, KBlockInfoManager* m)`. Open/Close
     /// route to `KernelCore::memory_manager_mut().{open,close,open_first}`.
-    pub fn with_kernel() -> Self {
+    pub fn new() -> Self {
         Self {
             blocks: Vec::new(),
             kernel_owned: true,
         }
     }
 
+    /// Backwards-compatible constructor for callsites already audited as
+    /// upstream-owned page groups.
+    pub fn with_kernel() -> Self {
+        Self::new()
+    }
+
     /// Backwards-compatible constructor; the Arc parameter is ignored — the
     /// group always reaches the kernel through the global accessor.
-    /// Behaves identically to `with_kernel`.
+    /// Behaves identically to `new`.
     pub fn with_memory_manager(_mm: Arc<Mutex<KMemoryManager>>) -> Self {
-        Self::with_kernel()
+        Self::new()
     }
 
     pub fn finalize(&mut self) {
@@ -195,7 +186,7 @@ impl KPageGroup {
         if let Some(kernel) = super::kernel::get_kernel_mut() {
             let mm = kernel.memory_manager_mut();
             for block in &self.blocks {
-                mm.open(block.get_address(), block.get_num_pages());
+                mm.open_first(block.get_address(), block.get_num_pages());
             }
         }
     }

@@ -79,30 +79,24 @@ pub fn create_transfer_memory(
     // Ensure that the region is in range.
     let addr_kpa = crate::hle::kernel::k_typed_address::KProcessAddress::new(address);
     if !process.page_table.contains(addr_kpa, size as usize) {
+        if let Some(ref rl) = process.resource_limit {
+            rl.lock().unwrap().release(
+                crate::hle::kernel::k_resource_limit::LimitableResource::TransferMemoryCountMax,
+                1,
+            );
+        }
         return RESULT_INVALID_CURRENT_MEMORY;
-    }
-
-    // Lock the memory for transfer.
-    let k_perm =
-        crate::hle::kernel::k_memory_block::KMemoryPermission::from_bits_truncate(map_perm as u8);
-    let lock_result = process
-        .page_table
-        .lock_for_transfer_memory(addr_kpa, size as usize, k_perm);
-    if lock_result != 0 {
-        return ResultCode::new(lock_result);
     }
 
     let mut transfer_memory = KTransferMemory::new();
     let init_result = transfer_memory.initialize(
         &current_process,
+        &mut process.page_table,
         address,
         size as usize,
         to_kernel_memory_permission(map_perm),
     );
     if init_result.is_failure() {
-        process
-            .page_table
-            .unlock_for_transfer_memory(addr_kpa, size as usize);
         if let Some(ref rl) = process.resource_limit {
             rl.lock().unwrap().release(
                 crate::hle::kernel::k_resource_limit::LimitableResource::TransferMemoryCountMax,
@@ -116,19 +110,16 @@ pub fn create_transfer_memory(
     static NEXT_TRMEM_ID: std::sync::atomic::AtomicU64 =
         std::sync::atomic::AtomicU64::new(0xD000_0000);
     let trmem_id = NEXT_TRMEM_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let transfer_memory = Arc::new(Mutex::new(transfer_memory));
 
     // Add to handle table.
     match process.handle_table.add(trmem_id) {
         Ok(h) => {
+            let transfer_memory = Arc::new(Mutex::new(transfer_memory));
             process.register_transfer_memory_object(trmem_id, transfer_memory);
             *out = h;
         }
         Err(_) => {
-            // Unlock on failure.
-            process
-                .page_table
-                .unlock_for_transfer_memory(addr_kpa, size as usize);
+            transfer_memory.finalize(&mut process.page_table);
             if let Some(ref rl) = process.resource_limit {
                 rl.lock().unwrap().release(
                     crate::hle::kernel::k_resource_limit::LimitableResource::TransferMemoryCountMax,

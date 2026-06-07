@@ -196,6 +196,14 @@ pub fn map_memory(system: &System, dst_addr: u64, src_addr: u64, size: u64) -> R
 
     let result = map_unmap_memory_sanity_checks(system, dst_addr, src_addr, size);
     if result != RESULT_SUCCESS {
+        super::svc_memory_history::record_map_memory(
+            system,
+            super::svc_memory_history::MemoryHistoryKind::MapMemory,
+            dst_addr,
+            src_addr,
+            size,
+            result.get_inner_value(),
+        );
         return result;
     }
 
@@ -264,6 +272,14 @@ pub fn unmap_memory(system: &System, dst_addr: u64, src_addr: u64, size: u64) ->
 
     let result = map_unmap_memory_sanity_checks(system, dst_addr, src_addr, size);
     if result != RESULT_SUCCESS {
+        super::svc_memory_history::record_map_memory(
+            system,
+            super::svc_memory_history::MemoryHistoryKind::UnmapMemory,
+            dst_addr,
+            src_addr,
+            size,
+            result.get_inner_value(),
+        );
         return result;
     }
 

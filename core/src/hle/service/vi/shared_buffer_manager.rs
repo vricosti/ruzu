@@ -100,6 +100,61 @@ const SHARED_BUFFER_POOL_LAYOUT: SharedMemoryPoolLayout = {
     layout
 };
 
+struct Mt19937_64 {
+    state: [u64; 312],
+    index: usize,
+}
+
+impl Mt19937_64 {
+    const N: usize = 312;
+    const M: usize = 156;
+    const MATRIX_A: u64 = 0xB502_6F5A_A966_19E9;
+    const UPPER_MASK: u64 = 0xFFFF_FFFF_8000_0000;
+    const LOWER_MASK: u64 = 0x0000_0000_7FFF_FFFF;
+
+    fn new(seed: u64) -> Self {
+        let mut state = [0; Self::N];
+        state[0] = seed;
+        for i in 1..Self::N {
+            state[i] = 6_364_136_223_846_793_005u64
+                .wrapping_mul(state[i - 1] ^ (state[i - 1] >> 62))
+                .wrapping_add(i as u64);
+        }
+        Self {
+            state,
+            index: Self::N,
+        }
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        if self.index >= Self::N {
+            self.twist();
+        }
+
+        let mut value = self.state[self.index];
+        self.index += 1;
+
+        value ^= (value >> 29) & 0x5555_5555_5555_5555;
+        value ^= (value << 17) & 0x71D6_7FFF_EDA6_0000;
+        value ^= (value << 37) & 0xFFF7_EEE0_0000_0000;
+        value ^= value >> 43;
+        value
+    }
+
+    fn twist(&mut self) {
+        for i in 0..Self::N {
+            let x = (self.state[i] & Self::UPPER_MASK)
+                | (self.state[(i + 1) % Self::N] & Self::LOWER_MASK);
+            let mut xa = x >> 1;
+            if (x & 1) != 0 {
+                xa ^= Self::MATRIX_A;
+            }
+            self.state[i] = self.state[(i + Self::M) % Self::N] ^ xa;
+        }
+        self.index = 0;
+    }
+}
+
 struct SharedBufferManagerInner {
     next_buffer_id: u64,
     display_id: u64,
@@ -187,9 +242,9 @@ impl SharedBufferManager {
             return Err(vi_results::RESULT_OPERATION_FAILED);
         }
 
-        let seed = process.get_random_entropy(0);
-        for i in 0..64usize {
-            let page_index = ((seed as usize).wrapping_add(i * 0x9E37)) % alias_code_pages;
+        let mut rng = Mt19937_64::new(process.get_random_entropy(0));
+        for _ in 0..64usize {
+            let page_index = (rng.next_u64() as usize) % alias_code_pages;
             let address = alias_code_begin + page_index * PAGE_SIZE;
             let result = process.page_table.map_page_group(
                 KProcessAddress::new(address as u64),
@@ -431,6 +486,9 @@ impl SharedBufferManager {
         let Some(gpu) = self.system.get().gpu_core() else {
             return Err(vi_results::RESULT_OPERATION_FAILED);
         };
+        let Some(host1x) = self.system.get().host1x_core() else {
+            return Err(vi_results::RESULT_OPERATION_FAILED);
+        };
         let capture_buffer = gpu.get_applet_capture_buffer();
         let system_ptr =
             self.system.get() as *const crate::core::System as *mut crate::core::System;
@@ -446,6 +504,7 @@ impl SharedBufferManager {
         };
         for block in buffer_page_group.iter() {
             let start = unsafe { (*device_memory).get_pointer(block.get_address()) as *mut u8 };
+            let mut current = start;
             let size = block.get_size();
             for offset in 0..size {
                 let value = if e >= 0 && (e as usize) < capture_buffer.len() {
@@ -456,12 +515,32 @@ impl SharedBufferManager {
                 unsafe {
                     *start.add(offset) = value;
                 }
+                current = unsafe { start.add(offset + 1) };
                 e += 1;
             }
 
-            gpu.invalidate_region(block.get_address(), size as u64);
+            let end = unsafe { start.add(size) };
+            let invalidate_size = end as usize - current as usize;
+            host1x.smmu_apply_op_on_host_pointer(current as usize, &mut |addr| {
+                gpu.invalidate_region(addr, invalidate_size as u64);
+            });
         }
 
         Ok((true, 1))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Mt19937_64;
+
+    #[test]
+    fn mt19937_64_matches_std_reference_sequence() {
+        let mut rng = Mt19937_64::new(5489);
+        assert_eq!(rng.next_u64(), 14_514_284_786_278_117_030);
+        assert_eq!(rng.next_u64(), 4_620_546_740_167_642_908);
+        assert_eq!(rng.next_u64(), 13_109_570_281_517_897_720);
+        assert_eq!(rng.next_u64(), 17_462_938_647_148_434_322);
+        assert_eq!(rng.next_u64(), 355_488_278_567_739_596);
     }
 }

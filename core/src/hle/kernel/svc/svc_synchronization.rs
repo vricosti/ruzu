@@ -393,9 +393,13 @@ pub fn synchronize_preemption_state(system: &System) {
 mod tests {
     use super::*;
     use crate::core::System;
-    use crate::hle::kernel::k_process::KProcess;
-    use crate::hle::kernel::k_thread::{KThread, ThreadState};
+    use crate::hle::kernel::k_memory_block::PAGE_SIZE;
+    use crate::hle::kernel::k_memory_manager::Pool;
+    use crate::hle::kernel::k_process::{KProcess, ProcessLock};
+    use crate::hle::kernel::k_resource_limit::create_resource_limit_for_process;
+    use crate::hle::kernel::k_thread::{KThread, KThreadLock, ThreadState};
     use crate::hle::kernel::k_worker_task_manager::KWorkerTaskManager;
+    use crate::hle::kernel::kernel::ScopedKernelForTest;
     use crate::hle::kernel::svc::svc_event;
     use crate::hle::kernel::svc::svc_thread;
     use crate::hle::kernel::svc::svc_transfer_memory;
@@ -403,8 +407,22 @@ mod tests {
     use std::sync::atomic::Ordering;
     use std::sync::{Arc, Mutex};
 
+    fn kernel_with_application_pool_for_test(num_pages: usize) -> ScopedKernelForTest {
+        let mut kernel = ScopedKernelForTest::new();
+        kernel
+            .kernel_mut()
+            .initialize_memory_block_slab_manager(4096);
+        kernel.memory_manager_mut().initialize_pool(
+            Pool::Application,
+            0x1_0000_0000,
+            num_pages * PAGE_SIZE,
+        );
+        kernel
+    }
+
     fn test_system() -> System {
         let mut system = System::new_for_test();
+        system.initialize();
 
         let mut process = KProcess::new();
         process.process_id = 100;
@@ -412,8 +430,13 @@ mod tests {
         process.capabilities.priority_mask = u64::MAX;
         process.flags = 0;
         process.initialize_handle_table();
+        process.resource_limit = Some(Arc::new(Mutex::new(create_resource_limit_for_process(
+            0x4000_0000,
+        ))));
+        process.create_memory(&system);
         process.allocate_code_memory(0x200000, 0x1000);
         process.initialize_thread_local_region_base(0x240000);
+        process.initialize_main_thread_stack_region(0x240000, 0x100000);
 
         let process = Arc::new(ProcessLock::from_value(process));
         let current_thread = Arc::new(KThreadLock::new(KThread::new()));
@@ -490,6 +513,7 @@ mod tests {
 
     #[test]
     fn close_handle_recoalesces_transfer_memory_split_heap_region() {
+        let _kernel = kernel_with_application_pool_for_test(0x80000);
         let system = test_system();
         let (heap_base, heap_size) = {
             let mut process = system.current_process_arc().lock().unwrap();
@@ -550,6 +574,7 @@ mod tests {
 
     #[test]
     fn close_handle_runs_transfer_memory_post_destroy_resource_release() {
+        let _kernel = kernel_with_application_pool_for_test(0x80000);
         let system = test_system();
         let heap_base = {
             let mut process = system.current_process_arc().lock().unwrap();

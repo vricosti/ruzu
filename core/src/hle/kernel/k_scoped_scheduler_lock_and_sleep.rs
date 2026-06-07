@@ -115,7 +115,7 @@ mod tests {
     use super::*;
     use std::sync::Mutex;
 
-    use crate::hle::kernel::k_thread::KThread;
+    use crate::hle::kernel::k_thread::{KThread, KThreadLock};
 
     #[test]
     fn test_cancel_sleep() {

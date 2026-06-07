@@ -10,6 +10,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use log::error;
+use ruzu_core::core::SystemRef;
 use ruzu_core::host1x_core::{Host1xChannelType, Host1xCoreInterface};
 
 use crate::host1x::ffmpeg::ffmpeg::Frame;
@@ -185,6 +186,8 @@ impl ChannelType {
 /// `std::unordered_map<s32, std::unique_ptr<CDmaPusher>>` — channel ioctls
 /// look up the per-fd `CDmaPusher` and forward command lists to it.
 pub struct Host1x {
+    /// Upstream stores `Core::System& system`.
+    system: SystemRef,
     syncpoint_manager: Arc<SyncpointManager>,
     frame_queue: Arc<FrameQueue>,
     devices: Mutex<HashMap<i32, Arc<crate::cdma_pusher::CDmaPusher>>>,
@@ -205,21 +208,44 @@ pub struct Host1x {
 }
 
 impl Host1x {
+    #[cfg(test)]
     pub fn new() -> Self {
+        Self::new_with_system(SystemRef::null())
+    }
+
+    pub fn new_with_system(system: SystemRef) -> Self {
+        let memory_manager = Arc::new(if system.is_null() {
+            MaxwellDeviceMemoryManager::default()
+        } else {
+            MaxwellDeviceMemoryManager::new_with_device_memory(system.get().device_memory())
+        });
         Self {
+            system,
             syncpoint_manager: Arc::new(SyncpointManager::new()),
             frame_queue: Arc::new(FrameQueue::new()),
             devices: Mutex::new(HashMap::new()),
-            memory_manager: Arc::new(MaxwellDeviceMemoryManager::default()),
-            gmmu_manager: parking_lot::Mutex::new(MemoryManager::new_with_geometry(
-                0, 32, 0, 12, 12,
-            )),
+            memory_manager: Arc::clone(&memory_manager),
+            gmmu_manager: parking_lot::Mutex::new(
+                MemoryManager::new_with_geometry_and_device_memory(
+                    0,
+                    memory_manager,
+                    32,
+                    0,
+                    12,
+                    12,
+                ),
+            ),
             allocator: parking_lot::Mutex::new(FlatAllocator::new(1 << 12, u32::MAX)),
         }
     }
 
     pub fn syncpoint_manager(&self) -> &Arc<SyncpointManager> {
         &self.syncpoint_manager
+    }
+
+    /// Port of upstream `Tegra::Host1x::Host1x::System()`.
+    pub fn system_ref(&self) -> SystemRef {
+        self.system
     }
 
     /// Port of upstream `Tegra::Host1x::Host1x::MemoryManager()`.
@@ -279,18 +305,15 @@ impl Host1x {
     pub fn start_device(&self, fd: i32, channel_type: ChannelType, syncpt: u32) {
         use crate::cdma_pusher::{CDmaPusher, ChClassId, ProcessMethodHook};
         let (class_id, processor): (ChClassId, Box<dyn ProcessMethodHook>) = match channel_type {
-            ChannelType::NvDec => {
-                self.frame_queue.open(fd);
-                (
-                    ChClassId::NvDec,
-                    Box::new(crate::host1x::nvdec::Nvdec::new(
-                        fd,
-                        syncpt,
-                        Arc::clone(&self.frame_queue),
-                        Arc::clone(&self.memory_manager),
-                    )),
-                )
-            }
+            ChannelType::NvDec => (
+                ChClassId::NvDec,
+                Box::new(crate::host1x::nvdec::Nvdec::new(
+                    fd,
+                    syncpt,
+                    Arc::clone(&self.frame_queue),
+                    Arc::clone(&self.memory_manager),
+                )),
+            ),
             ChannelType::Vic => (
                 ChClassId::GraphicsVic,
                 Box::new(crate::host1x::vic::Vic::new(
@@ -325,9 +348,7 @@ impl Host1x {
     ///
     /// Port of `Host1x::StopDevice`.
     pub fn stop_device(&self, fd: i32, _channel_type: ChannelType) {
-        // Upstream: devices.erase(fd); also closes the FrameQueue entry.
         self.devices.lock().unwrap().remove(&fd);
-        self.frame_queue.close(fd);
     }
 
     /// Push command entries to a device.
@@ -352,9 +373,10 @@ impl Host1x {
     }
 }
 
+#[cfg(test)]
 impl Default for Host1x {
     fn default() -> Self {
-        Self::new()
+        Self::new_with_system(SystemRef::null())
     }
 }
 
@@ -393,9 +415,32 @@ impl Host1xCoreInterface for Host1x {
         self.memory_manager.smmu_allocate(size)
     }
 
-    fn smmu_map(&self, d_address: u64, host_ptr: usize, size: usize) {
+    fn smmu_register_process(
+        &self,
+        memory: Option<std::sync::Arc<std::sync::Mutex<ruzu_core::memory::memory::Memory>>>,
+    ) -> u32 {
+        self.memory_manager.smmu_register_process(memory)
+    }
+
+    fn smmu_unregister_process(&self, asid: u32) {
+        self.memory_manager.smmu_unregister_process(asid);
+    }
+
+    fn smmu_free(&self, d_address: u64, size: usize) {
+        self.memory_manager.smmu_free(d_address, size);
+    }
+
+    fn smmu_map(&self, d_address: u64, virtual_address: u64, size: usize, asid: u32, track: bool) {
         self.memory_manager
-            .smmu_map(d_address, host_ptr as *const u8, size);
+            .smmu_map(d_address, virtual_address, size, asid, track);
+    }
+
+    fn smmu_track_continuity(&self, d_address: u64, size: usize) {
+        self.memory_manager.smmu_track_continuity(d_address, size);
+    }
+
+    fn smmu_unmap(&self, d_address: u64, size: usize) {
+        self.memory_manager.smmu_unmap(d_address, size);
     }
 
     fn smmu_lookup(&self, d_address: u64) -> usize {
@@ -405,8 +450,21 @@ impl Host1xCoreInterface for Host1x {
             .unwrap_or(0)
     }
 
+    fn smmu_apply_op_on_host_pointer(
+        &self,
+        host_ptr: usize,
+        operation: &mut dyn FnMut(u64),
+    ) -> usize {
+        self.memory_manager
+            .smmu_apply_op_on_host_pointer(host_ptr as *const u8, operation)
+    }
+
     fn bind_device_memory_invalidator(&self, callback: Box<dyn Fn(u64, usize) + Send + Sync>) {
         self.memory_manager.set_invalidate_region(callback);
+    }
+
+    fn bind_device_memory_flusher(&self, callback: Box<dyn Fn(u64, usize) + Send + Sync>) {
+        self.memory_manager.set_flush_region(callback);
     }
 
     fn host1x_gmmu_map_low(&self, d_address: u64, size: usize) -> u32 {
@@ -447,5 +505,31 @@ impl Host1xCoreInterface for Host1x {
 
     fn push_entries(&self, fd: i32, entries: Vec<u32>) {
         Host1x::push_entries(self, fd, entries);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ChannelType, Host1x};
+
+    fn frame_queue_contains(host1x: &Host1x, fd: i32) -> bool {
+        let inner = host1x.frame_queue.inner.lock().unwrap();
+        inner.presentation_order.contains_key(&fd) && inner.decode_order.contains_key(&fd)
+    }
+
+    #[test]
+    fn device_owned_frame_queue_lifecycle_matches_upstream() {
+        let host1x = Host1x::new();
+
+        host1x.start_device(7, ChannelType::NvDec, 0);
+        assert!(frame_queue_contains(&host1x, 7));
+        host1x.stop_device(7, ChannelType::NvDec);
+        assert!(frame_queue_contains(&host1x, 7));
+
+        host1x.frame_queue.open(9);
+        host1x.start_device(9, ChannelType::Vic, 0);
+        assert!(frame_queue_contains(&host1x, 9));
+        host1x.stop_device(9, ChannelType::Vic);
+        assert!(!frame_queue_contains(&host1x, 9));
     }
 }

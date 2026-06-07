@@ -93,8 +93,9 @@ impl ChannelState {
             .expect("DmaPusher must exist immediately after construction")
             .install_self_reference();
 
-        let mut maxwell_3d = Box::new(Maxwell3D::new());
-        maxwell_3d.set_memory_manager(Arc::clone(self.memory_manager.as_ref().unwrap()));
+        let mut maxwell_3d = Box::new(Maxwell3D::new_with_memory_manager(Arc::clone(
+            self.memory_manager.as_ref().unwrap(),
+        )));
         let gpu_ptr = _gpu as *const crate::gpu::Gpu as usize;
         maxwell_3d.set_guest_memory_reader(Arc::new(move |addr, output| unsafe {
             let gpu = &*(gpu_ptr as *const crate::gpu::Gpu);
@@ -105,24 +106,6 @@ impl ChannelState {
             let gpu = &*(gpu_ptr as *const crate::gpu::Gpu);
             gpu.write_guest_memory(addr, data);
         }));
-        let gpu_ptr = _gpu as *const crate::gpu::Gpu as usize;
-        self.memory_manager
-            .as_ref()
-            .expect("memory_manager set before channel init")
-            .lock()
-            .set_guest_memory_reader(Arc::new(move |addr, output| unsafe {
-                let gpu = &*(gpu_ptr as *const crate::gpu::Gpu);
-                let _ = gpu.read_guest_memory(addr, output);
-            }));
-        let gpu_ptr = _gpu as *const crate::gpu::Gpu as usize;
-        self.memory_manager
-            .as_ref()
-            .expect("memory_manager set before channel init")
-            .lock()
-            .set_guest_memory_writer(Arc::new(move |addr, data| unsafe {
-                let gpu = &*(gpu_ptr as *const crate::gpu::Gpu);
-                gpu.write_guest_memory(addr, data);
-            }));
         let gpu_ptr = _gpu as *const crate::gpu::Gpu as usize;
         maxwell_3d.set_gpu_ticks_getter(Arc::new(move || unsafe {
             let gpu = &*(gpu_ptr as *const crate::gpu::Gpu);
@@ -138,14 +121,9 @@ impl ChannelState {
         self.maxwell_dma = Some(Box::new(MaxwellDMA::new(Arc::clone(
             self.memory_manager.as_ref().unwrap(),
         ))));
-        let mut kepler_memory = Box::new(KeplerMemory::new(Arc::clone(
+        let kepler_memory = Box::new(KeplerMemory::new(Arc::clone(
             self.memory_manager.as_ref().unwrap(),
         )));
-        let gpu_ptr = _gpu as *const crate::gpu::Gpu as usize;
-        kepler_memory.set_guest_memory_writer(Arc::new(move |addr, data| unsafe {
-            let gpu = &*(gpu_ptr as *const crate::gpu::Gpu);
-            gpu.write_guest_memory(addr, data);
-        }));
         self.kepler_memory = Some(kepler_memory);
 
         self.initialized = true;

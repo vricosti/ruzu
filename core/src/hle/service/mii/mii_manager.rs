@@ -1092,8 +1092,10 @@ mod tests {
         let char_info = CharInfo::default();
 
         assert_eq!(
-            manager.convert_char_info_to_core_data(&char_info),
-            Err(RESULT_INVALID_CHAR_INFO)
+            manager
+                .convert_char_info_to_core_data(&char_info)
+                .unwrap_err(),
+            RESULT_INVALID_CHAR_INFO
         );
     }
 

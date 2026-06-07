@@ -403,12 +403,9 @@ impl Puller {
 
     fn read_gpu_u32(&self, gpu_va: u64) -> u32 {
         let mut bytes = [0u8; 4];
-        let gpu = unsafe { &*self.gpu };
         self.memory_manager
             .lock()
-            .read_block_unsafe(gpu_va, &mut bytes, &|cpu_addr, output| {
-                let _ = gpu.read_guest_memory(cpu_addr, output);
-            });
+            .read_block_unsafe(gpu_va, &mut bytes);
         u32::from_le_bytes(bytes)
     }
 
@@ -418,12 +415,7 @@ impl Puller {
     }
 
     fn write_gpu_bytes(&self, gpu_va: u64, data: &[u8]) {
-        let gpu = unsafe { &*self.gpu };
-        self.memory_manager
-            .lock()
-            .write_block_unsafe(gpu_va, data, &mut |cpu_addr, data| {
-                gpu.write_guest_memory(cpu_addr, data);
-            });
+        self.memory_manager.lock().write_block_unsafe(gpu_va, data);
     }
 
     /// Determine whether a method should be dispatched to an engine (true)
@@ -959,6 +951,7 @@ impl Puller {
     }
 }
 
+#[cfg(test)]
 impl Default for Puller {
     fn default() -> Self {
         Self::new(

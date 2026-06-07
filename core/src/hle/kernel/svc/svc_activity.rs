@@ -75,8 +75,8 @@ mod tests {
 
     use super::*;
     use crate::core::System;
-    use crate::hle::kernel::k_process::KProcess;
-    use crate::hle::kernel::k_thread::{KThread, SuspendType};
+    use crate::hle::kernel::k_process::{KProcess, ProcessLock};
+    use crate::hle::kernel::k_thread::{KThread, KThreadLock, SuspendType};
     use crate::hle::kernel::svc::svc_thread;
 
     fn test_system() -> System {

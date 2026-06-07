@@ -871,22 +871,12 @@ impl DmaPusher {
     fn fetch_command_bytes(&self, gpu_addr: GPUVAddr, command_count: usize) -> Vec<u8> {
         let byte_len = command_count * std::mem::size_of::<CommandHeader>();
         let mut raw = vec![0u8; byte_len];
-        let gpu = unsafe { &*self.gpu };
         let mm = self.memory_manager.lock();
         let translated_cpu_addr = mm.gpu_to_cpu_address(gpu_addr);
-        let read_cpu = |cpu_addr, dst: &mut [u8]| {
-            if !gpu.read_guest_memory(cpu_addr, dst) {
-                log::warn!(
-                    "DmaPusher: read_guest_memory FAILED cpu_addr={:#x} len={}",
-                    cpu_addr,
-                    dst.len()
-                );
-            }
-        };
         if self.should_use_unsafe_read() {
-            mm.read_block_unsafe(gpu_addr, &mut raw, &read_cpu);
+            mm.read_block_unsafe(gpu_addr, &mut raw);
         } else {
-            mm.read_block(gpu_addr, &mut raw, &read_cpu);
+            mm.read_block(gpu_addr, &mut raw);
         }
         if let Some(limit) = command_words_trace_limit() {
             let idx = COMMAND_WORDS_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);

@@ -3079,9 +3079,9 @@ fn maybe_dump_process_memory(system: &System, tid: i64) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::hle::kernel::k_process::KProcess;
+    use crate::hle::kernel::k_process::{KProcess, ProcessLock};
     use crate::hle::kernel::k_scheduler::KScheduler;
-    use crate::hle::kernel::k_thread::{KThread, ThreadState};
+    use crate::hle::kernel::k_thread::{KThread, KThreadLock, ThreadState};
     use crate::hle::kernel::k_worker_task_manager::KWorkerTaskManager;
     use std::sync::{Arc, Mutex};
 

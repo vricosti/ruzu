@@ -684,12 +684,6 @@ impl NvHostCtrl {
             }
         };
 
-        if !is_allocation && existing_event_id < MAX_NV_EVENTS {
-            if let Ok(mut events) = self.events.lock() {
-                events[existing_event_id as usize].fails = 0;
-            }
-        }
-
         result
     }
 
@@ -944,6 +938,45 @@ mod tests {
         {
             let events = ctrl.events.lock().unwrap();
             assert_eq!(events[2].fails, 0);
+        }
+
+        std::mem::forget(system);
+    }
+
+    #[test]
+    fn event_wait_non_allocation_armed_timeout_preserves_fails() {
+        let system = System::new_for_test();
+        let events = Arc::new(EventInterface::new(SystemRef::from_ref(&system)));
+        let syncpoints = SyncpointManager::new();
+        let ctrl = NvHostCtrl::new(events, &syncpoints);
+        let fence_id = syncpoints.allocate_syncpoint(false);
+
+        let mut register = IocCtrlEventRegisterParams { user_event_id: 2 };
+        assert_eq!(
+            ctrl.ioc_ctrl_event_register(&mut register),
+            NvResult::Success
+        );
+
+        {
+            let mut events = ctrl.events.lock().unwrap();
+            events[2].fails = 2;
+        }
+
+        let mut params = IocCtrlEventWaitParams {
+            fence: NvFence {
+                id: fence_id as i32,
+                value: 5,
+            },
+            timeout: 1,
+            value: super::SyncpointEventValue { raw: 2 },
+        };
+
+        let result = ctrl.ioc_ctrl_event_wait(&mut params, false);
+
+        assert_eq!(result, NvResult::Timeout);
+        {
+            let events = ctrl.events.lock().unwrap();
+            assert_eq!(events[2].fails, 2);
         }
 
         std::mem::forget(system);

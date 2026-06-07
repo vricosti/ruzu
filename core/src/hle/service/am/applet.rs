@@ -360,12 +360,13 @@ impl Applet {
 #[cfg(test)]
 mod tests {
     use super::Applet;
+    use crate::hle::kernel::k_process::ProcessLock;
     use crate::hle::service::os::process::Process;
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
 
     #[test]
     fn new_initializes_aruid_and_program_id_from_process() {
-        let process = Process::with_process(Arc::new(Mutex::new({
+        let process = Process::with_process(Arc::new(ProcessLock::from_value({
             let mut process = crate::hle::kernel::k_process::KProcess::new();
             process.process_id = 0x1234;
             process.program_id = 0x0102_0304_0506_0708;

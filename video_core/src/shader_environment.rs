@@ -56,12 +56,8 @@ const SELF_BRANCH_B: u64 = 0xE2400FFFFF07000F;
 /// Guest CPU-memory reader callback shape: read `bytes.len()` bytes starting
 /// at the given CPU address.
 ///
-/// Rust adaptation helper used with the current `MemoryManager` port.
-/// Upstream `GenericEnvironment` stores a `Tegra::MemoryManager*` and lets
-/// it fetch shader bytes directly. The Rust `MemoryManager` still requires a
-/// CPU-address reader callback to complete `read_block(...)`, so this callback
-/// is kept as the closest available transport until that owner graph is made
-/// literal too.
+/// Rust compatibility helper for reduced callers that do not yet provide the
+/// upstream `Tegra::MemoryManager*` owner.
 ///
 /// `Send + Sync` so it can be cloned across threads / fibers safely.
 pub type GpuMemoryReader = Arc<dyn Fn(GPUVAddr, &mut [u8]) + Send + Sync>;
@@ -506,18 +502,15 @@ impl GenericEnvironment {
     ) -> TextureDescriptor {
         let (tic_index, _) = texture_pair(raw, via_header_index);
         assert!(tic_index <= tic_limit);
-        let Some(reader) = self.gpu_read.as_ref() else {
-            return TextureDescriptor::from_words(&[0; 8]);
-        };
         let mut raw_bytes = [0u8; 32];
         if let Some(gpu_memory) = self.gpu_memory.as_ref() {
-            gpu_memory.lock().read_block(
-                tic_addr + tic_index as u64 * 32,
-                &mut raw_bytes,
-                &**reader,
-            );
-        } else {
+            gpu_memory
+                .lock()
+                .read_block(tic_addr + tic_index as u64 * 32, &mut raw_bytes);
+        } else if let Some(reader) = self.gpu_read.as_ref() {
             reader(tic_addr + tic_index as u64 * 32, &mut raw_bytes);
+        } else {
+            return TextureDescriptor::from_words(&[0; 8]);
         }
         let mut words = [0u32; 8];
         for (index, chunk) in raw_bytes.chunks_exact(4).enumerate() {
@@ -552,13 +545,12 @@ impl GenericEnvironment {
     }
 
     fn read_gpu_bytes(&self, gpu_addr: GPUVAddr, output: &mut [u8]) -> bool {
-        let Some(reader) = self.gpu_read.as_ref() else {
-            return false;
-        };
         if let Some(gpu_memory) = self.gpu_memory.as_ref() {
-            gpu_memory.lock().read_block(gpu_addr, output, &**reader);
-        } else {
+            gpu_memory.lock().read_block(gpu_addr, output);
+        } else if let Some(reader) = self.gpu_read.as_ref() {
             reader(gpu_addr, output);
+        } else {
+            return false;
         }
         true
     }
@@ -662,7 +654,7 @@ impl GraphicsEnvironment {
         env.base.texture_bound = maxwell3d.bindless_texture_const_buffer_slot();
         env.base.is_proprietary_driver = env.base.texture_bound == 2;
         env.base.has_hle_engine_state = maxwell3d.engine_state() == EngineHint::OnHleMacro;
-        if env.base.gpu_read.is_some() {
+        if env.base.gpu_memory.is_some() || env.base.gpu_read.is_some() {
             let mut bytes = [0u8; std::mem::size_of::<ProgramHeader>()];
             env.base
                 .read_gpu_bytes(program_base + start_address as u64, &mut bytes);
@@ -974,14 +966,12 @@ impl ComputeEnvironment {
     pub fn from_kepler_compute(
         kepler_compute: &KeplerCompute,
         gpu_memory: Arc<ParkingLotMutex<MemoryManager>>,
-        gpu_reader: GpuMemoryReader,
     ) -> Self {
         let mut env = Self::new();
         env.kepler_compute = kepler_compute as *const KeplerCompute;
         let qmd = kepler_compute.launch_description();
         env.base = GenericEnvironment::new()
             .with_gpu_memory(gpu_memory)
-            .with_gpu_read(gpu_reader)
             .with_program(kepler_compute.code_address(), qmd.program_start);
         env.base.stage = ShaderStage::Compute;
         env.base.local_memory_size = qmd.local_pos_alloc + qmd.local_crs_alloc;
@@ -1922,6 +1912,39 @@ mod tests {
         memory_manager
     }
 
+    fn make_owner_backed_memory_manager(
+        gpu_base: u64,
+        device_addr: u64,
+        backing: &[u8],
+    ) -> Arc<ParkingLotMutex<MemoryManager>> {
+        let device_memory = Arc::new(
+            crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager::default(),
+        );
+        device_memory.smmu_set_physical_base_for_test(backing.as_ptr() as usize);
+        device_memory.smmu_map_with_cpu_backing(
+            device_addr,
+            backing.as_ptr(),
+            0x4000_0000,
+            backing.len(),
+            1,
+            true,
+        );
+        let memory_manager = Arc::new(ParkingLotMutex::new(
+            MemoryManager::new_with_geometry_and_device_memory(
+                1,
+                Arc::clone(&device_memory),
+                32,
+                0x1_0000_0000,
+                16,
+                12,
+            ),
+        ));
+        memory_manager
+            .lock()
+            .map(gpu_base, device_addr, backing.len() as u64, 0, false);
+        memory_manager
+    }
+
     #[test]
     fn try_find_size_finds_self_branch_a_in_first_block() {
         let program_base: u64 = 0x1_0000_0000;
@@ -2275,8 +2298,6 @@ mod tests {
     fn compute_environment_from_kepler_compute_includes_local_crs_alloc() {
         let gpu_base = 0x2_0000_0000;
         let cpu_base = 0xA000;
-        let backing = Arc::new(vec![0u8; 0x2000]);
-
         let memory_manager = Arc::new(ParkingLotMutex::new(MemoryManager::new(0)));
         memory_manager
             .lock()
@@ -2297,9 +2318,7 @@ mod tests {
         kepler.call_method(0x582, 0x2, true);
         kepler.call_method(0x583, 0, true);
 
-        let reader = make_cpu_reader(cpu_base, backing);
-        let env =
-            ComputeEnvironment::from_kepler_compute(&kepler, Arc::clone(&memory_manager), reader);
+        let env = ComputeEnvironment::from_kepler_compute(&kepler, Arc::clone(&memory_manager));
         assert_eq!(env.base.local_memory_size, 0x60);
         assert_eq!(env.base.shared_memory_size, 0x80);
         assert_eq!(env.base.workgroup_size, [16, 2, 1]);
@@ -2307,31 +2326,13 @@ mod tests {
 
     #[test]
     fn compute_environment_reads_live_qmd_state_after_construction() {
-        let gpu_base = 0x3_0000_0000;
+        let gpu_base = 0x3000_0000;
         let mut backing = vec![0u8; 0x2000];
         backing[0x180..0x184].copy_from_slice(&0xCAFEBABEu32.to_le_bytes());
-        let backing = Arc::new(backing);
 
-        let memory_manager = Arc::new(ParkingLotMutex::new(MemoryManager::new(0)));
-        memory_manager
-            .lock()
-            .map(gpu_base, 0xB000, 0x2000, 0, false);
+        let memory_manager = make_owner_backed_memory_manager(gpu_base, 0xB000, &backing);
         let mut kepler = KeplerCompute::new(Arc::clone(&memory_manager));
-        let reader: GpuMemoryReader = Arc::new(move |cpu_addr, dst| {
-            dst.fill(0);
-            let offset = cpu_addr.saturating_sub(0xB000) as usize;
-            if offset >= backing.len() {
-                return;
-            }
-            let available = backing.len() - offset;
-            let count = available.min(dst.len());
-            dst[..count].copy_from_slice(&backing[offset..offset + count]);
-        });
-        let mut env = ComputeEnvironment::from_kepler_compute(
-            &kepler,
-            Arc::clone(&memory_manager),
-            Arc::clone(&reader),
-        );
+        let mut env = ComputeEnvironment::from_kepler_compute(&kepler, Arc::clone(&memory_manager));
 
         kepler.launch_description.const_buffer_enable_mask = 1;
         kepler.launch_description.const_buffers[0] = QmdConstBuffer {
@@ -2347,8 +2348,7 @@ mod tests {
     fn compute_environment_panics_on_disabled_live_cbuf() {
         let memory_manager = Arc::new(ParkingLotMutex::new(MemoryManager::new(0)));
         let kepler = KeplerCompute::new(Arc::clone(&memory_manager));
-        let reader: GpuMemoryReader = Arc::new(|_, dst| dst.fill(0));
-        let mut env = ComputeEnvironment::from_kepler_compute(&kepler, memory_manager, reader);
+        let mut env = ComputeEnvironment::from_kepler_compute(&kepler, memory_manager);
         let _ = env.read_cbuf_value(0, 0);
     }
 
@@ -2536,21 +2536,5 @@ mod tests {
         load_pipelines(|| false, &path, 7, Box::new(|_, _| {}), Box::new(|_, _| {}));
 
         assert!(!path.exists());
-    }
-
-    fn make_cpu_reader(
-        cpu_base: u64,
-        backing: Arc<Vec<u8>>,
-    ) -> Arc<dyn Fn(u64, &mut [u8]) + Send + Sync> {
-        Arc::new(move |cpu_addr: u64, dst: &mut [u8]| {
-            dst.fill(0);
-            let offset = cpu_addr.saturating_sub(cpu_base) as usize;
-            if offset >= backing.len() {
-                return;
-            }
-            let available = backing.len() - offset;
-            let count = available.min(dst.len());
-            dst[..count].copy_from_slice(&backing[offset..offset + count]);
-        })
     }
 }

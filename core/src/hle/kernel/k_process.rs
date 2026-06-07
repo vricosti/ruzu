@@ -37,6 +37,7 @@ use super::code_set::CodeSet;
 use super::k_capabilities::KCapabilities;
 use super::k_client_session::KClientSession;
 use super::k_condition_variable::KConditionVariable;
+use super::k_device_address_space::KDeviceAddressSpace;
 use super::k_event::KEvent;
 use super::k_handle_table::KHandleTable;
 use super::k_handle_table::MAX_TABLE_SIZE;
@@ -540,6 +541,7 @@ pub struct KProcess {
     pub server_port_objects: BTreeMap<u64, Arc<Mutex<KPort>>>,
     pub event_objects: BTreeMap<u64, Arc<Mutex<KEvent>>>,
     pub readable_event_objects: BTreeMap<u64, Arc<Mutex<KReadableEvent>>>,
+    pub device_address_space_objects: BTreeMap<u64, Arc<Mutex<KDeviceAddressSpace>>>,
     pub shared_memory_objects: BTreeMap<u64, Arc<super::k_shared_memory::KSharedMemory>>,
     pub shared_memory_infos: BTreeMap<usize, KSharedMemoryInfo>,
     pub transfer_memory_objects:
@@ -670,6 +672,7 @@ impl KProcess {
             server_port_objects: BTreeMap::new(),
             event_objects: BTreeMap::new(),
             readable_event_objects: BTreeMap::new(),
+            device_address_space_objects: BTreeMap::new(),
             shared_memory_objects: BTreeMap::new(),
             shared_memory_infos: BTreeMap::new(),
             transfer_memory_objects: BTreeMap::new(),
@@ -1778,26 +1781,17 @@ impl KProcess {
         // Setup page table (upstream lines 408-417).
         {
             let as_type = flags & ADDRESS_SPACE_MASK;
-            let enable_aslr_flag = (flags & CreateProcessFlag::ENABLE_ASLR.bits()) != 0;
-            // Investigation hook: `RUZU_DISABLE_ASLR=1` forces enable_aslr=false
-            // so kernel page-table region placement is deterministic across runs.
-            // Useful for SVC trace diffing against zuyu with matched RNG seeds,
-            // gdb-attach reproducibility, and any other "did I hit the same
-            // address this run?" investigation. Pairs with `RUZU_RNG_SEED` which
-            // controls libnx's RandomEntropy (game-level RNG).
-            let enable_aslr = if std::env::var_os("RUZU_DISABLE_ASLR")
-                .is_some_and(|v| v != std::ffi::OsStr::new("0"))
-            {
-                log::info!("RUZU_DISABLE_ASLR=1 — forcing enable_aslr=false");
-                false
-            } else {
-                enable_aslr_flag
-            };
+            // Local zuyu reference currently forces process ASLR off in both
+            // KProcess::Initialize paths for deterministic comparison.
+            let enable_aslr = false;
             let enable_das_merge =
                 (flags & CreateProcessFlag::DISABLE_DEVICE_ADDRESS_SPACE_MERGE.bits()) == 0;
             // Preserve the Memory reference if already wired (set by System::load
             // before the loader runs). Upstream passes m_memory from KProcess.
             let memory_ref = self.page_table.get_base().m_memory.clone();
+            self.page_table
+                .get_base_mut()
+                .set_process_id(self.process_id);
             let result = self.page_table.initialize_for_process(
                 as_type,
                 enable_aslr,
@@ -2990,6 +2984,9 @@ impl KProcess {
         {
             self.unregister_transfer_memory_object_by_object_id(object_id);
         }
+        if !self.handle_table.contains_object_id(object_id) {
+            self.device_address_space_objects.remove(&object_id);
+        }
 
         true
     }
@@ -3040,6 +3037,14 @@ impl KProcess {
         if let Some(memory) = self.page_table.get_base().m_memory.as_ref() {
             memory.lock().unwrap().write_block(guest_addr, data);
         }
+    }
+
+    /// Test-only compatibility bridge for older native tests that used to
+    /// write through `KProcess` directly. Runtime code should use
+    /// `write_memory` or the process `Memory` owner explicitly.
+    #[cfg(test)]
+    pub fn write_block(&mut self, guest_addr: u64, data: &[u8]) {
+        self.write_memory(guest_addr, data);
     }
 
     /// Load a module into process memory and apply per-segment permissions.
@@ -3112,6 +3117,14 @@ impl KProcess {
             let mem = self.process_memory.read().unwrap();
             mem.read_block(guest_addr, size).to_vec()
         }
+    }
+
+    /// Test-only compatibility bridge for older native tests that used to read
+    /// through `KProcess` directly. Runtime code should use `read_memory_vec`
+    /// or the process `Memory` owner explicitly.
+    #[cfg(test)]
+    pub fn read_block(&self, guest_addr: u64, size: usize) -> Vec<u8> {
+        self.read_memory_vec(guest_addr, size)
     }
 
     /// Allocate process memory for code loading.
@@ -3203,7 +3216,23 @@ mod tests {
     use super::*;
     use crate::file_sys::program_metadata::{ProgramAddressSpaceType, ProgramMetadata};
     use crate::hle::kernel::global_scheduler_context::GlobalSchedulerContext;
+    use crate::hle::kernel::k_memory_block::PAGE_SIZE;
+    use crate::hle::kernel::k_memory_manager::Pool;
     use crate::hle::kernel::k_scheduler::KScheduler;
+    use crate::hle::kernel::kernel::ScopedKernelForTest;
+
+    fn kernel_with_application_pool_for_test(num_pages: usize) -> ScopedKernelForTest {
+        let mut kernel = ScopedKernelForTest::new();
+        kernel
+            .kernel_mut()
+            .initialize_memory_block_slab_manager(4096);
+        kernel.memory_manager_mut().initialize_pool(
+            Pool::Application,
+            0x1_0000_0000,
+            num_pages * PAGE_SIZE,
+        );
+        kernel
+    }
 
     #[test]
     fn test_process_state_values() {
@@ -3312,6 +3341,7 @@ mod tests {
 
     #[test]
     fn set_heap_size_maps_heap_region_in_page_table() {
+        let _kernel = kernel_with_application_pool_for_test(0x80000);
         let mut process = KProcess::new();
         process.allocate_code_memory(0x200000, 0x229a000);
         process.initialize_main_thread_stack_region(0x2396000, 0x100000);

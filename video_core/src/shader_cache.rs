@@ -396,7 +396,7 @@ impl ShaderCache {
             self.last_shaders_valid = false;
             return false;
         };
-        if maxwell3d.memory_manager().is_none() || maxwell3d.guest_memory_reader().is_none() {
+        if maxwell3d.memory_manager().is_none() {
             self.last_shaders_valid = false;
             return false;
         }
@@ -496,7 +496,6 @@ impl ShaderCache {
             return None;
         }
         let gpu_memory = channel.gpu_memory.as_ref().map(Arc::clone)?;
-        let guest_memory_reader = self.current_guest_memory_reader()?;
         let kepler_compute = unsafe { &*kepler_ptr };
 
         let program_base = kepler_compute.code_address();
@@ -513,11 +512,8 @@ impl ShaderCache {
             return Some(unsafe { &*shader_ptr });
         }
 
-        let mut env = ComputeEnvironment::from_kepler_compute(
-            kepler_compute,
-            Arc::clone(&gpu_memory),
-            Arc::clone(&guest_memory_reader),
-        );
+        let mut env =
+            ComputeEnvironment::from_kepler_compute(kepler_compute, Arc::clone(&gpu_memory));
         Some(self.make_shader_info(env.generic_environment_mut(), cpu_shader_addr))
     }
 
@@ -532,7 +528,7 @@ impl ShaderCache {
         let Some(maxwell3d) = self.current_maxwell3d() else {
             return;
         };
-        if maxwell3d.memory_manager().is_none() || maxwell3d.guest_memory_reader().is_none() {
+        if maxwell3d.memory_manager().is_none() {
             return;
         }
         let base_addr = maxwell3d.program_region_address();
@@ -802,10 +798,6 @@ impl ShaderCache {
             .gpu_memory
             .as_ref()
             .map(Arc::clone)
-    }
-
-    fn current_guest_memory_reader(&self) -> Option<Arc<dyn Fn(u64, &mut [u8]) + Send + Sync>> {
-        self.current_maxwell3d()?.guest_memory_reader()
     }
 
     fn walk_shader_control_flow(&self, env: &mut GenericEnvironment) {

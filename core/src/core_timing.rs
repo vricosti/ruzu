@@ -589,7 +589,7 @@ mod tests {
 
     #[test]
     fn advance_looping_event_reschedules_from_event_time() {
-        let mut core_timing = CoreTiming::new();
+        let core_timing = CoreTiming::new();
         let count = Arc::new(AtomicU64::new(0));
         let count_for_cb = count.clone();
         let event = create_event(
@@ -607,9 +607,9 @@ mod tests {
             false,
         );
 
-        let first_time = core_timing.event_queue.peek().unwrap().time;
+        let first_time = core_timing.state.lock().event_queue.peek().unwrap().time;
         core_timing.advance();
-        let second_time = core_timing.event_queue.peek().unwrap().time;
+        let second_time = core_timing.state.lock().event_queue.peek().unwrap().time;
 
         assert_eq!(count.load(Ordering::SeqCst), 1);
         assert_eq!(second_time, first_time + 5);
@@ -617,11 +617,9 @@ mod tests {
 
     #[test]
     fn timer_thread_wakes_for_earlier_new_event() {
-        let mut core_timing = CoreTiming::new();
+        let core_timing = Arc::new(CoreTiming::new());
         core_timing.set_multicore(true);
         core_timing.initialize(|| {});
-        let core_timing = Arc::new(std::sync::Mutex::new(core_timing));
-        CoreTiming::start_timer_thread(core_timing.clone());
 
         let late_fired = Arc::new(AtomicBool::new(false));
         let late_fired_cb = late_fired.clone();
@@ -644,15 +642,9 @@ mod tests {
             }),
         );
 
-        core_timing
-            .lock()
-            .unwrap()
-            .schedule_event(Duration::from_millis(250), &late_event, false);
+        core_timing.schedule_event(Duration::from_millis(250), &late_event, false);
         std::thread::sleep(Duration::from_millis(20));
-        core_timing
-            .lock()
-            .unwrap()
-            .schedule_event(Duration::from_millis(20), &early_event, false);
+        core_timing.schedule_event(Duration::from_millis(20), &early_event, false);
 
         let deadline = Instant::now() + Duration::from_millis(200);
         while early_fired_at.load(Ordering::SeqCst) == 0 && Instant::now() < deadline {

@@ -306,17 +306,23 @@ impl KProcessPageTable {
 
     pub fn lock_for_transfer_memory(
         &mut self,
+        out_pg: &mut super::k_page_group::KPageGroup,
         addr: KProcessAddress,
         size: usize,
         perm: KMemoryPermission,
     ) -> u32 {
         self.base
-            .lock_for_transfer_memory(addr.get() as usize, size, perm)
+            .lock_for_transfer_memory(out_pg, addr.get() as usize, size, perm)
     }
 
-    pub fn unlock_for_transfer_memory(&mut self, addr: KProcessAddress, size: usize) -> u32 {
+    pub fn unlock_for_transfer_memory(
+        &mut self,
+        addr: KProcessAddress,
+        size: usize,
+        pg: &super::k_page_group::KPageGroup,
+    ) -> u32 {
         self.base
-            .unlock_for_transfer_memory(addr.get() as usize, size)
+            .unlock_for_transfer_memory(addr.get() as usize, size, pg)
     }
 
     // -- IPC memory locking --

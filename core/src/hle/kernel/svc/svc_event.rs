@@ -109,8 +109,8 @@ pub fn create_event(system: &System, out_write: &mut Handle, out_read: &mut Hand
 mod tests {
     use super::*;
     use crate::core::System;
-    use crate::hle::kernel::k_process::KProcess;
-    use crate::hle::kernel::k_thread::KThread;
+    use crate::hle::kernel::k_process::{KProcess, ProcessLock};
+    use crate::hle::kernel::k_thread::{KThread, KThreadLock};
 
     fn test_system() -> System {
         let mut system = System::new_for_test();

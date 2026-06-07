@@ -230,7 +230,7 @@ impl NvHostAsGpu {
         mapping_map: &mut BTreeMap<u64, Arc<Mapping>>,
         offset: u64,
     ) -> NvResult {
-        let Some(mapping) = mapping_map.remove(&offset) else {
+        let Some(mapping) = mapping_map.get(&offset).cloned() else {
             return NvResult::BadValue;
         };
 
@@ -247,11 +247,11 @@ impl NvHostAsGpu {
                     VM::PAGE_SIZE_BITS
                 };
                 let page_size = if mapping.big_page {
-                    vm.big_page_size as u64
+                    vm.big_page_size
                 } else {
-                    VM::YUZU_PAGESIZE as u64
-                };
-                let aligned_size = (mapping.size + page_size - 1) & !(page_size - 1);
+                    VM::YUZU_PAGESIZE
+                } as u64;
+                let aligned_size = mapping.size.div_ceil(page_size) * page_size;
                 allocator.free(
                     (mapping.offset >> page_size_bits) as u32,
                     (aligned_size >> page_size_bits) as u32,
@@ -267,6 +267,7 @@ impl NvHostAsGpu {
                 gmmu.unmap(offset, mapping.size);
             }
         }
+        mapping_map.remove(&offset);
         NvResult::Success
     }
 
@@ -325,7 +326,8 @@ impl NvHostAsGpu {
         vm.small_page_allocator = Some(FlatAllocator::new(start_pages, end_pages));
 
         let start_big_pages = (vm.va_range_split >> vm.big_page_size_bits) as u32;
-        let end_big_pages = ((vm.va_range_end - vm.va_range_split) >> vm.big_page_size_bits) as u32;
+        let end_big_pages =
+            (vm.va_range_end.wrapping_sub(vm.va_range_split) >> vm.big_page_size_bits) as u32;
         vm.big_page_allocator = Some(FlatAllocator::new(start_big_pages, end_big_pages));
 
         let max_big_page_bits = 64 - (vm.va_range_end - 1).leading_zeros() as u64;
@@ -441,28 +443,40 @@ impl NvHostAsGpu {
         }
 
         let mut alloc_map = self.allocation_map.lock().unwrap();
-        let Some(allocation) = alloc_map.remove(&params.offset) else {
+        let Some(allocation) = alloc_map.get(&params.offset) else {
             return NvResult::BadValue;
         };
+        let allocation_size = allocation.size;
+        let allocation_page_size = allocation.page_size;
+        let allocation_sparse = allocation.sparse;
+        let allocation_big_pages = allocation.big_pages;
+        let allocation_mappings = allocation.mappings.clone();
 
-        if allocation.page_size != params.page_size
-            || allocation.size != (params.pages as u64) * (params.page_size as u64)
+        if allocation_page_size != params.page_size
+            || allocation_size != (params.pages as u64) * (params.page_size as u64)
         {
-            alloc_map.insert(params.offset, allocation);
             return NvResult::BadValue;
         }
 
         let mut mapping_map = self.mapping_map.lock().unwrap();
-        for mapping in &allocation.mappings {
-            let _ = self.free_mapping_locked(&mut vm, &mut mapping_map, mapping.offset);
+        for mapping in allocation_mappings {
+            let result = self.free_mapping_locked(&mut vm, &mut mapping_map, mapping.offset);
+            if !matches!(result, NvResult::Success) {
+                return NvResult::BadValue;
+            }
         }
 
-        let page_size_bits = if allocation.big_pages {
+        if allocation_sparse {
+            if let Some(gmmu) = self.gmmu.lock().unwrap().as_ref().cloned() {
+                gmmu.unmap(params.offset, allocation_size);
+            }
+        }
+        let page_size_bits = if allocation_big_pages {
             vm.big_page_size_bits
         } else {
             VM::PAGE_SIZE_BITS
         };
-        let allocator = if allocation.big_pages {
+        let allocator = if allocation_big_pages {
             vm.big_page_allocator.as_mut()
         } else {
             vm.small_page_allocator.as_mut()
@@ -470,14 +484,10 @@ impl NvHostAsGpu {
         if let Some(allocator) = allocator {
             allocator.free(
                 (params.offset >> page_size_bits) as u32,
-                (allocation.size >> page_size_bits) as u32,
+                (allocation_size >> page_size_bits) as u32,
             );
         }
-        if allocation.sparse {
-            if let Some(gmmu) = self.gmmu.lock().unwrap().as_ref().cloned() {
-                gmmu.unmap(params.offset, allocation.size);
-            }
-        }
+        alloc_map.remove(&params.offset);
 
         NvResult::Success
     }
@@ -838,15 +848,45 @@ impl NvHostAsGpu {
         drop(vm);
 
         let mut mapping_map = self.mapping_map.lock().unwrap();
-        let r = self.free_mapping_locked(
-            &mut self.vm.lock().unwrap(),
-            &mut mapping_map,
-            params.offset as u64,
-        );
-        if matches!(r, NvResult::Success) {
-            Self::trace_gpu_va_unmap(params.offset as u64);
+        let Some(mapping) = mapping_map.get(&(params.offset as u64)).cloned() else {
+            log::warn!(
+                "Couldn't find region to unmap at 0x{:X}",
+                params.offset as u64
+            );
+            return NvResult::Success;
+        };
+
+        if !mapping.fixed {
+            let mut vm = self.vm.lock().unwrap();
+            let page_size_bits = if mapping.big_page {
+                vm.big_page_size_bits
+            } else {
+                VM::PAGE_SIZE_BITS
+            };
+            let allocator = if mapping.big_page {
+                vm.big_page_allocator.as_mut()
+            } else {
+                vm.small_page_allocator.as_mut()
+            };
+            if let Some(allocator) = allocator {
+                allocator.free(
+                    (mapping.offset >> page_size_bits) as u32,
+                    (mapping.size >> page_size_bits) as u32,
+                );
+            }
         }
-        r
+
+        if let Some(gmmu) = self.gmmu.lock().unwrap().as_ref().cloned() {
+            if mapping.sparse_alloc {
+                gmmu.map_sparse(params.offset as u64, mapping.size, mapping.big_page);
+            } else {
+                gmmu.unmap(params.offset as u64, mapping.size);
+            }
+        }
+        self.nvmap().unpin_handle(mapping.handle);
+        mapping_map.remove(&(params.offset as u64));
+        Self::trace_gpu_va_unmap(params.offset as u64);
+        NvResult::Success
     }
 
     pub fn bind_channel(&self, params: &mut IoctlBindChannel) -> NvResult {
@@ -1065,13 +1105,13 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use super::{
-        IoctlAllocAsEx, IoctlAllocSpace, IoctlMapBufferEx, IoctlRemapEntry, MappingFlags,
-        NvHostAsGpu,
+        IoctlAllocAsEx, IoctlAllocSpace, IoctlFreeSpace, IoctlMapBufferEx, IoctlRemapEntry,
+        IoctlUnmapBuffer, MappingFlags, NvHostAsGpu,
     };
     use crate::core::{System, SystemRef};
     use crate::gpu_core::{GpuChannelHandle, GpuCoreInterface, GpuMemoryManagerHandle};
     use crate::hle::service::nvdrv::core::container::{Container, SessionId};
-    use crate::hle::service::nvdrv::core::nvmap::HandleFlags;
+    use crate::hle::service::nvdrv::core::nvmap::{Handle, HandleFlags};
     use crate::hle::service::nvdrv::nvdata::NvResult;
     use crate::hle::service::nvdrv::nvdrv::Module;
 
@@ -1173,9 +1213,31 @@ mod tests {
         fn flush_region(&self, _addr: u64, _size: u64) {}
     }
 
+    fn system_with_fake_gpu() -> System {
+        let mut system = System::new_for_test();
+        system.set_gpu_core(Box::new(FakeGpuCore::default()));
+        system
+    }
+
+    fn create_allocated_handle(container: &Container, size: u64, address: u64) -> Arc<Handle> {
+        let handle = container.get_nv_map_file().create_handle(size).unwrap();
+        assert_eq!(
+            handle.alloc(
+                HandleFlags { raw: 0 },
+                size as u32,
+                0,
+                address,
+                SessionId::default(),
+            ),
+            NvResult::Success
+        );
+        handle.lock_inner().d_address = address;
+        handle
+    }
+
     #[test]
     fn allocate_space_returns_non_zero_offset_for_dynamic_allocations() {
-        let system = System::new_for_test();
+        let system = system_with_fake_gpu();
         let module = Module::new(SystemRef::from_ref(&system));
         let container = Container::new();
         let gpu_as = NvHostAsGpu::new(SystemRef::from_ref(&system), &module, &container);
@@ -1193,7 +1255,7 @@ mod tests {
 
     #[test]
     fn alloc_as_ex_initializes_gpu_address_space_after_allocating_memory_manager() {
-        let system = System::new_for_test();
+        let system = system_with_fake_gpu();
         let module = Module::new(SystemRef::from_ref(&system));
         let container = Container::new();
         let gpu_as = NvHostAsGpu::new(SystemRef::from_ref(&system), &module, &container);
@@ -1212,7 +1274,7 @@ mod tests {
 
     #[test]
     fn alloc_as_ex_applies_non_zero_va_ranges_literally() {
-        let system = System::new_for_test();
+        let system = system_with_fake_gpu();
         let module = Module::new(SystemRef::from_ref(&system));
         let container = Container::new();
         let gpu_as = NvHostAsGpu::new(SystemRef::from_ref(&system), &module, &container);
@@ -1233,24 +1295,14 @@ mod tests {
 
     #[test]
     fn map_buffer_ex_returns_non_zero_offset_for_dynamic_mappings() {
-        let system = System::new_for_test();
+        let system = system_with_fake_gpu();
         let module = Module::new(SystemRef::from_ref(&system));
         let container = Container::new();
         let gpu_as = NvHostAsGpu::new(SystemRef::from_ref(&system), &module, &container);
         let mut alloc_as = IoctlAllocAsEx::default();
         assert_eq!(gpu_as.alloc_as_ex(&mut alloc_as), NvResult::Success);
 
-        let handle = container.get_nv_map_file().create_handle(0x1000).unwrap();
-        assert_eq!(
-            handle.alloc(
-                HandleFlags { raw: 0 },
-                0x1000,
-                0,
-                0x1000_0000,
-                SessionId::default(),
-            ),
-            NvResult::Success
-        );
+        let handle = create_allocated_handle(&container, 0x1000, 0x1000_0000);
 
         let mut params = IoctlMapBufferEx {
             mapping_size: 0x1000,
@@ -1264,7 +1316,7 @@ mod tests {
 
     #[test]
     fn fixed_mapping_tracks_allocation_and_unpins_on_free_space() {
-        let system = System::new_for_test();
+        let system = system_with_fake_gpu();
         let module = Module::new(SystemRef::from_ref(&system));
         let container = Container::new();
         let gpu_as = NvHostAsGpu::new(SystemRef::from_ref(&system), &module, &container);
@@ -1280,17 +1332,7 @@ mod tests {
         };
         assert_eq!(gpu_as.allocate_space(&mut space), NvResult::Success);
 
-        let handle = container.get_nv_map_file().create_handle(0x1000).unwrap();
-        assert_eq!(
-            handle.alloc(
-                HandleFlags { raw: 0 },
-                0x1000,
-                0,
-                0x3000_0000,
-                SessionId::default(),
-            ),
-            NvResult::Success
-        );
+        let handle = create_allocated_handle(&container, 0x1000, 0x3000_0000);
 
         let mut map = IoctlMapBufferEx {
             flags: MappingFlags::FIXED.bits(),
@@ -1317,8 +1359,118 @@ mod tests {
     }
 
     #[test]
+    fn unmap_buffer_missing_mapping_returns_success_like_upstream() {
+        let system = system_with_fake_gpu();
+        let module = Module::new(SystemRef::from_ref(&system));
+        let container = Container::new();
+        let gpu_as = NvHostAsGpu::new(SystemRef::from_ref(&system), &module, &container);
+        let mut alloc_as = IoctlAllocAsEx::default();
+        assert_eq!(gpu_as.alloc_as_ex(&mut alloc_as), NvResult::Success);
+
+        let mut unmap = IoctlUnmapBuffer {
+            offset: 0xDEAD_0000,
+        };
+        assert_eq!(gpu_as.unmap_buffer(&mut unmap), NvResult::Success);
+    }
+
+    #[test]
+    fn unmap_buffer_sends_raw_mapping_size_to_gmmu_like_upstream() {
+        let ops = Arc::new(Mutex::new(Vec::new()));
+        let mut system = System::new_for_test();
+        system.set_gpu_core(Box::new(FakeGpuCore {
+            ops: Arc::clone(&ops),
+        }));
+        let module = Module::new(SystemRef::from_ref(&system));
+        let container = Container::new();
+        let gpu_as = NvHostAsGpu::new(SystemRef::from_ref(&system), &module, &container);
+        let mut alloc_as = IoctlAllocAsEx::default();
+        assert_eq!(gpu_as.alloc_as_ex(&mut alloc_as), NvResult::Success);
+
+        let handle = container.get_nv_map_file().create_handle(0x1800).unwrap();
+        assert_eq!(
+            handle.alloc(
+                HandleFlags { raw: 0 },
+                0x1000,
+                0,
+                0x3100_0000,
+                SessionId::default(),
+            ),
+            NvResult::Success
+        );
+        handle.lock_inner().d_address = 0x3100_0000;
+
+        let mut map = IoctlMapBufferEx {
+            mapping_size: 0x1800,
+            handle: handle.id,
+            ..Default::default()
+        };
+        assert_eq!(gpu_as.map_buffer_ex(&mut map), NvResult::Success);
+
+        let mut unmap = IoctlUnmapBuffer { offset: map.offset };
+        assert_eq!(gpu_as.unmap_buffer(&mut unmap), NvResult::Success);
+
+        assert_eq!(handle.lock_inner().pins, 0);
+        let ops = ops.lock().unwrap();
+        assert!(ops
+            .iter()
+            .any(|op| op == &format!("unmap:{:#x}:0x1800", map.offset as u64)));
+    }
+
+    #[test]
+    fn free_space_stops_on_stale_fixed_mapping_like_upstream() {
+        let system = system_with_fake_gpu();
+        let module = Module::new(SystemRef::from_ref(&system));
+        let container = Container::new();
+        let gpu_as = NvHostAsGpu::new(SystemRef::from_ref(&system), &module, &container);
+        let mut alloc_as = IoctlAllocAsEx::default();
+        assert_eq!(gpu_as.alloc_as_ex(&mut alloc_as), NvResult::Success);
+
+        let mut space = IoctlAllocSpace {
+            pages: 1,
+            page_size: 0x1000,
+            flags: MappingFlags::FIXED.bits(),
+            offset: 0x2080_0000,
+            ..Default::default()
+        };
+        assert_eq!(gpu_as.allocate_space(&mut space), NvResult::Success);
+
+        let handle = create_allocated_handle(&container, 0x1000, 0x3080_0000);
+
+        let mut map = IoctlMapBufferEx {
+            flags: MappingFlags::FIXED.bits(),
+            handle: handle.id,
+            mapping_size: 0x1000,
+            offset: space.offset as i64,
+            ..Default::default()
+        };
+        assert_eq!(gpu_as.map_buffer_ex(&mut map), NvResult::Success);
+
+        let mut unmap = IoctlUnmapBuffer {
+            offset: space.offset as i64,
+        };
+        assert_eq!(gpu_as.unmap_buffer(&mut unmap), NvResult::Success);
+        assert!(!gpu_as
+            .mapping_map
+            .lock()
+            .unwrap()
+            .contains_key(&(space.offset as u64)));
+
+        let mut free = IoctlFreeSpace {
+            offset: space.offset,
+            pages: 1,
+            page_size: 0x1000,
+        };
+        assert_eq!(gpu_as.free_space(&mut free), NvResult::BadValue);
+        assert!(gpu_as
+            .allocation_map
+            .lock()
+            .unwrap()
+            .contains_key(&(space.offset as u64)));
+    }
+
+    #[test]
     fn fixed_mapping_uses_shared_mapping_owner_between_maps() {
-        let system = System::new_for_test();
+        let system = system_with_fake_gpu();
         let module = Module::new(SystemRef::from_ref(&system));
         let container = Container::new();
         let gpu_as = NvHostAsGpu::new(SystemRef::from_ref(&system), &module, &container);
@@ -1334,17 +1486,7 @@ mod tests {
         };
         assert_eq!(gpu_as.allocate_space(&mut space), NvResult::Success);
 
-        let handle = container.get_nv_map_file().create_handle(0x1000).unwrap();
-        assert_eq!(
-            handle.alloc(
-                HandleFlags { raw: 0 },
-                0x1000,
-                0,
-                0x3100_0000,
-                SessionId::default(),
-            ),
-            NvResult::Success
-        );
+        let handle = create_allocated_handle(&container, 0x1000, 0x3100_0000);
 
         let mut map = IoctlMapBufferEx {
             flags: MappingFlags::FIXED.bits(),
@@ -1374,8 +1516,60 @@ mod tests {
     }
 
     #[test]
+    fn free_space_sparse_restores_mapping_then_unmaps_allocation_like_upstream() {
+        let ops = Arc::new(Mutex::new(Vec::new()));
+        let mut system = System::new_for_test();
+        system.set_gpu_core(Box::new(FakeGpuCore {
+            ops: Arc::clone(&ops),
+        }));
+        let module = Module::new(SystemRef::from_ref(&system));
+        let container = Container::new();
+        let gpu_as = NvHostAsGpu::new(SystemRef::from_ref(&system), &module, &container);
+        let mut alloc_as = IoctlAllocAsEx::default();
+        assert_eq!(gpu_as.alloc_as_ex(&mut alloc_as), NvResult::Success);
+
+        let mut space = IoctlAllocSpace {
+            pages: 1,
+            page_size: 0x20_000,
+            flags: (MappingFlags::FIXED | MappingFlags::SPARSE).bits(),
+            offset: 0x4000_0000,
+            ..Default::default()
+        };
+        assert_eq!(gpu_as.allocate_space(&mut space), NvResult::Success);
+
+        let handle = create_allocated_handle(&container, 0x20_000, 0x5000_0000);
+        let mut map = IoctlMapBufferEx {
+            flags: MappingFlags::FIXED.bits(),
+            handle: handle.id,
+            mapping_size: 0x20_000,
+            offset: space.offset as i64,
+            ..Default::default()
+        };
+        assert_eq!(gpu_as.map_buffer_ex(&mut map), NvResult::Success);
+
+        ops.lock().unwrap().clear();
+        let mut free = IoctlFreeSpace {
+            offset: space.offset,
+            pages: 1,
+            page_size: 0x20_000,
+        };
+        assert_eq!(gpu_as.free_space(&mut free), NvResult::Success);
+
+        let ops = ops.lock().unwrap();
+        let sparse_pos = ops
+            .iter()
+            .position(|op| op == "map_sparse:0x40000000:0x20000:true")
+            .expect("freeing fixed sparse mapping should restore sparse GMMU range first");
+        let unmap_pos = ops
+            .iter()
+            .position(|op| op == "unmap:0x40000000:0x20000")
+            .expect("freeing sparse allocation should unmap the allocation");
+        assert!(sparse_pos < unmap_pos);
+    }
+
+    #[test]
     fn remap_rejects_non_sparse_allocations() {
-        let system = System::new_for_test();
+        let system = system_with_fake_gpu();
         let module = Module::new(SystemRef::from_ref(&system));
         let container = Container::new();
         let gpu_as = NvHostAsGpu::new(SystemRef::from_ref(&system), &module, &container);
@@ -1427,7 +1621,7 @@ mod tests {
 
     #[test]
     fn remap_sparse_allocation_pins_handle() {
-        let system = System::new_for_test();
+        let system = system_with_fake_gpu();
         let module = Module::new(SystemRef::from_ref(&system));
         let container = Container::new();
         let gpu_as = NvHostAsGpu::new(SystemRef::from_ref(&system), &module, &container);
@@ -1443,17 +1637,7 @@ mod tests {
         };
         assert_eq!(gpu_as.allocate_space(&mut space), NvResult::Success);
 
-        let handle = container.get_nv_map_file().create_handle(0x20_000).unwrap();
-        assert_eq!(
-            handle.alloc(
-                HandleFlags { raw: 0 },
-                0x20_000,
-                0,
-                0x5000_0000,
-                SessionId::default(),
-            ),
-            NvResult::Success
-        );
+        let handle = create_allocated_handle(&container, 0x20_000, 0x5000_0000);
 
         let entry = IoctlRemapEntry {
             handle: handle.id,
@@ -1477,6 +1661,8 @@ mod tests {
         let fd = module.open("/dev/nvhost-gpu", SessionId::default());
         let container = Container::new();
         let gpu_as = NvHostAsGpu::new(SystemRef::from_ref(&system), &module, &container);
+        let mut alloc_as = IoctlAllocAsEx::default();
+        assert_eq!(gpu_as.alloc_as_ex(&mut alloc_as), NvResult::Success);
         let mut params = super::IoctlBindChannel { fd };
 
         assert_eq!(gpu_as.bind_channel(&mut params), NvResult::Success);

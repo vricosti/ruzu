@@ -460,4 +460,49 @@ mod tests {
         mgr.increment_host(3);
         assert!(fired.load(Ordering::SeqCst));
     }
+
+    #[test]
+    fn actions_fire_in_expected_value_order() {
+        let mgr = SyncpointManager::new();
+        let fired = Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        for (expected, value) in [(3, 3), (1, 1), (2, 2)] {
+            let fired = Arc::clone(&fired);
+            mgr.register_host_action(
+                7,
+                expected,
+                Box::new(move || {
+                    fired.lock().unwrap().push(value);
+                }),
+            );
+        }
+
+        mgr.increment_host(7);
+        assert_eq!(&*fired.lock().unwrap(), &[1]);
+        mgr.increment_host(7);
+        assert_eq!(&*fired.lock().unwrap(), &[1, 2]);
+        mgr.increment_host(7);
+        assert_eq!(&*fired.lock().unwrap(), &[1, 2, 3]);
+    }
+
+    #[test]
+    fn deregistered_action_does_not_fire() {
+        let mgr = SyncpointManager::new();
+        let fired = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let fired_clone = Arc::clone(&fired);
+
+        let handle = mgr
+            .register_guest_action(
+                8,
+                1,
+                Box::new(move || {
+                    fired_clone.store(true, Ordering::SeqCst);
+                }),
+            )
+            .expect("action should be pending");
+
+        mgr.deregister_guest_action(8, &handle);
+        mgr.increment_guest(8);
+        assert!(!fired.load(Ordering::SeqCst));
+    }
 }
