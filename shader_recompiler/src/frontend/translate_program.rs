@@ -8,9 +8,10 @@
 //! flow AST, and returns an IR::Program.
 
 use crate::ir::basic_block::Block;
+use crate::ir::emitter::Emitter;
 use crate::ir::opcodes::Opcode;
 use crate::ir::program::{Program, SyntaxNode};
-use crate::ir::types::ShaderStage;
+use crate::ir::types::{OutputTopology, ShaderStage};
 use crate::ir::value::{Attribute, InstRef, Value};
 use crate::ir_opt;
 use crate::program_header::{PixelImap, ProgramHeader};
@@ -222,12 +223,97 @@ pub fn collect_interpolation_info(sph: &ProgramHeader, program: &mut Program) {
     }
 }
 
-/// Generate a passthrough geometry shader for layer emulation.
-///
-/// Not yet implemented: requires generating a full passthrough GS IR program.
-pub fn generate_geometry_passthrough(_source_program: &mut Program) -> Program {
-    log::warn!("GenerateGeometryPassthrough not yet implemented — returning empty program");
-    Program::new(ShaderStage::VertexB)
+/// Port of upstream `GenerateGeometryPassthrough`.
+pub fn generate_geometry_passthrough(
+    _host_info: &crate::host_translate_info::HostTranslateInfo,
+    source_program: &Program,
+    output_topology: OutputTopology,
+) -> Program {
+    let mut program = Program::new(ShaderStage::Geometry);
+    program.output_topology = output_topology;
+    program.output_vertices = output_vertices_for_topology(output_topology);
+    program.is_geometry_passthrough = false;
+
+    program.info.loads.mask = source_program.info.stores.mask;
+    program.info.stores.mask = source_program.info.stores.mask;
+    program.info.stores.set(Attribute::LAYER.0 as usize, true);
+    program
+        .info
+        .stores
+        .set(source_program.info.emulated_layer as usize, false);
+
+    let current_block = program.add_block();
+    program.syntax_list.push(SyntaxNode::Block(current_block));
+    let passthrough_mask = program.info.stores.clone();
+    emit_geometry_passthrough(
+        &mut program,
+        current_block,
+        &passthrough_mask,
+        true,
+        Some(Attribute(source_program.info.emulated_layer as u32)),
+    );
+
+    let return_block = program.add_block();
+    Emitter::new(&mut program, return_block).epilogue();
+    program.block_mut(current_block).add_successor(return_block);
+    program
+        .block_mut(return_block)
+        .add_predecessor(current_block);
+
+    program.syntax_list.push(SyntaxNode::Block(return_block));
+    program.syntax_list.push(SyntaxNode::Return);
+    regenerate_block_order_from_syntax(&mut program);
+    program.post_order_blocks = crate::ir::post_order::post_order(&program.blocks, current_block);
+    ir_opt::ssa_rewrite_pass::ssa_rewrite_pass(&mut program);
+
+    program
+}
+
+fn emit_geometry_passthrough(
+    program: &mut Program,
+    block: u32,
+    passthrough_mask: &VaryingState,
+    passthrough_position: bool,
+    passthrough_layer_attr: Option<Attribute>,
+) {
+    let output_vertices = program.output_vertices;
+    let mut ir = Emitter::new(program, block);
+    for i in 0..output_vertices {
+        for j in 0..32 {
+            if !passthrough_mask.generic_any(j) {
+                continue;
+            }
+            for component in 0..4 {
+                let attr = Attribute::generic(j as u32, component);
+                let value = ir.get_attribute(attr, Value::ImmU32(i));
+                ir.set_attribute(attr, value, Value::ImmU32(0));
+            }
+        }
+
+        if passthrough_position {
+            for component in 0..4 {
+                let attr = Attribute::position(component);
+                let value = ir.get_attribute(attr, Value::ImmU32(i));
+                ir.set_attribute(attr, value, Value::ImmU32(0));
+            }
+        }
+
+        if let Some(layer_attr) = passthrough_layer_attr {
+            let value = ir.get_attribute(layer_attr, Value::ImmU32(0));
+            ir.set_attribute(Attribute::LAYER, value, Value::ImmU32(0));
+        }
+
+        ir.emit_vertex(Value::ImmU32(0));
+    }
+    ir.end_primitive(Value::ImmU32(0));
+}
+
+fn output_vertices_for_topology(output_topology: OutputTopology) -> u32 {
+    match output_topology {
+        OutputTopology::PointList => 1,
+        OutputTopology::LineStrip => 2,
+        OutputTopology::TriangleStrip => 3,
+    }
 }
 
 fn remap_syntax_node_blocks(node: &SyntaxNode, offset: u32) -> SyntaxNode {
@@ -468,6 +554,91 @@ mod interpolation_tests {
         assert_eq!(program.info.interpolation[1], Interpolation::NoPerspective);
         assert_eq!(program.info.interpolation[2], Interpolation::Smooth);
         assert_eq!(program.info.interpolation[3], Interpolation::Smooth);
+    }
+
+    #[test]
+    fn generate_geometry_passthrough_builds_layer_emulation_program() {
+        let mut source = Program::new(ShaderStage::VertexB);
+        source
+            .info
+            .stores
+            .set(Attribute::generic(2, 0).0 as usize, true);
+        source
+            .info
+            .stores
+            .set(Attribute::generic(2, 1).0 as usize, true);
+        source
+            .info
+            .stores
+            .set(Attribute::POSITION_X.0 as usize, true);
+        source.info.emulated_layer = Attribute::generic(7, 0).0 as u64;
+
+        let program = generate_geometry_passthrough(
+            &crate::host_translate_info::HostTranslateInfo::default(),
+            &source,
+            OutputTopology::LineStrip,
+        );
+
+        assert_eq!(program.stage, ShaderStage::Geometry);
+        assert_eq!(program.output_topology, OutputTopology::LineStrip);
+        assert_eq!(program.output_vertices, 2);
+        assert_eq!(program.syntax_list.len(), 3);
+        assert!(matches!(program.syntax_list[0], SyntaxNode::Block(0)));
+        assert!(matches!(program.syntax_list[1], SyntaxNode::Block(1)));
+        assert!(matches!(program.syntax_list[2], SyntaxNode::Return));
+        assert_eq!(program.blocks.len(), 2);
+        assert_eq!(program.blocks[0].imm_successors, vec![1]);
+        assert_eq!(program.blocks[1].imm_predecessors, vec![0]);
+        assert!(program.info.loads.generic_any(2));
+        assert!(program.info.stores.get(Attribute::LAYER.0 as usize));
+        assert!(!program.info.stores.get(Attribute::generic(7, 0).0 as usize));
+
+        let opcodes: Vec<_> = program.blocks[0]
+            .indexed_iter()
+            .map(|(_, inst)| inst.opcode)
+            .collect();
+        assert!(opcodes.contains(&Opcode::GetAttribute));
+        assert!(opcodes.contains(&Opcode::SetAttribute));
+        assert_eq!(
+            opcodes
+                .iter()
+                .filter(|&&op| op == Opcode::EmitVertex)
+                .count(),
+            2
+        );
+        assert_eq!(
+            opcodes
+                .iter()
+                .filter(|&&op| op == Opcode::EndPrimitive)
+                .count(),
+            1
+        );
+        assert_eq!(program.blocks[1].front().opcode, Opcode::Epilogue);
+    }
+
+    #[test]
+    fn generate_geometry_passthrough_copies_position_for_each_vertex() {
+        let mut source = Program::new(ShaderStage::VertexB);
+        source.info.emulated_layer = Attribute::generic(0, 0).0 as u64;
+
+        let program = generate_geometry_passthrough(
+            &crate::host_translate_info::HostTranslateInfo::default(),
+            &source,
+            OutputTopology::TriangleStrip,
+        );
+
+        let position_x_load_vertices: Vec<_> = program.blocks[0]
+            .iter()
+            .filter(|inst| {
+                inst.opcode == Opcode::GetAttribute
+                    && inst.args[0] == Value::Attribute(Attribute::POSITION_X)
+            })
+            .map(|inst| inst.args[1])
+            .collect();
+        assert_eq!(
+            position_x_load_vertices,
+            vec![Value::ImmU32(0), Value::ImmU32(1), Value::ImmU32(2)]
+        );
     }
 }
 
