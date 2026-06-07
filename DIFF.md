@@ -625,6 +625,32 @@
 - Manual MK8D 25s isolated-XDG host-thread-all smoke after switching `SessionRequestManager` to a weak `ServerManager` owner (`/tmp/ruzu_mk8d_ipc_weak_owner_host_all_smoke_1780868703.log`, `RUZU_SERVER_THREAD_IPC_ALL=1`): reached `NotifyRunning`, no panic/`BreakLoopNullPc`, no `svcBreak`/`SetTerminateResult`, no `missing_server_manager_owner`, and no `receive_request_hle failed` warnings. Warn-level logging did not emit audio or presentation markers in this short run.
 
 ## 2026-06-07 — core/src/hle/kernel/k_client_session.rs, core/src/hle/kernel/k_session.rs, core/src/hle/kernel/k_server_session.rs, core/src/hle/kernel/k_thread.rs, core/src/hle/kernel/k_scheduler.rs, and core/src/hle/kernel/svc/svc_ipc.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/k_client_session.cpp, /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/k_session.cpp, /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/k_server_session.cpp, /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/k_thread.cpp, /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/k_scheduler.cpp, and /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/svc/svc_ipc.cpp
+## 2026-06-07 — shader_recompiler/src/frontend/translate_program.rs vs /home/vricosti/Dev/emulators/zuyu/src/shader_recompiler/frontend/maxwell/translate_program.cpp
+
+### Intentional differences
+- Ported upstream `GenerateGeometryPassthrough(...)` and the local `EmitGeometryPassthrough(...)` helper shape: the Rust function now creates a `Geometry` `IR::Program`, copies source store masks into loads/stores, restores the real `Layer` store while clearing the emulated generic layer, emits generic/position passthrough loads and stores for each output vertex, emits `EmitVertex` / `EndPrimitive`, appends an epilogue return block, regenerates block order, computes post-order, and runs SSA rewrite.
+- Rust takes `&HostTranslateInfo` as `_host_info` because the upstream signature owns the parameter but the shown upstream implementation does not currently consume it.
+- Rust uses `Program::add_block`, `SyntaxNode::Block(u32)`, and `post_order(&program.blocks, start)` instead of upstream object-pool block pointers. This preserves the same two-block CFG and post-order behavior while matching the current Rust IR storage model.
+
+### Unintentional differences (to fix)
+- The OpenGL `CreateGraphicsPipeline(..., envs, ...)` path still does not insert the generated passthrough geometry program when a prior stage requires layer emulation and no real geometry shader exists. The generator is now available, but the full program-array pipeline flow is still not ported.
+
+### Missing items
+- Wire `generate_geometry_passthrough(...)` into the OpenGL graphics-pipeline program-array/stage-emission flow.
+
+### Binary layout verification
+- N/A: shader IR generation only. No guest-visible raw payload layout changed.
+
+### Tests
+- Re-read upstream `frontend/maxwell/translate_program.cpp::EmitGeometryPassthrough` and `GenerateGeometryPassthrough`.
+- `cargo test -p shader_recompiler generate_geometry_passthrough -- --nocapture`
+- `cargo test -p shader_recompiler translate_program_from_env_uses_environment_metadata -- --nocapture`
+- `cargo check -p shader_recompiler`
+- `cargo check -p video_core`
+- `cargo fmt --check`
+- `git diff --check`
+- `cargo build --release --bin ruzu-cmd`
+
 ## 2026-06-07 — shader_recompiler/src/ir_opt/position_pass.rs and shader_recompiler/src/pipeline_cache.rs vs /home/vricosti/Dev/emulators/zuyu/src/shader_recompiler/ir_opt/position_pass.cpp and /home/vricosti/Dev/emulators/zuyu/src/shader_recompiler/frontend/maxwell/translate_program.cpp
 
 ### Intentional differences
@@ -662,10 +688,10 @@
 - The compatibility optimization drivers now run `LayerPass` and `VendorWorkaroundPass` after `CollectShaderInfoPass`, matching the tail of upstream `TranslateProgram(...)` for paths that do not yet enter through the environment bridge.
 
 ### Unintentional differences (to fix)
-- Upstream `CreateGraphicsPipeline(...)` can generate a passthrough geometry program when `requires_layer_emulation` is set and no geometry stage exists. Rust now sets the same metadata, but full OpenGL geometry-passthrough pipeline insertion is still not ported.
+- Upstream `CreateGraphicsPipeline(...)` inserts a generated passthrough geometry program when `requires_layer_emulation` is set and no geometry stage exists. Rust now sets the same metadata and has a generated IR program helper, but full OpenGL geometry-passthrough pipeline insertion is still not ported.
 
 ### Missing items
-- Port upstream `GenerateGeometryPassthrough(...)` / layer-emulation geometry-stage insertion in the OpenGL graphics-pipeline program-array flow.
+- Port layer-emulation geometry-stage insertion in the OpenGL graphics-pipeline program-array flow.
 
 ### Binary layout verification
 - N/A: shader IR rewrite and metadata policy only. No guest-visible raw payload layout changed.
@@ -690,11 +716,11 @@
 - `shader_recompiler/src/lib.rs` re-exports the new bridge because existing OpenGL compile helpers are already exposed through the crate root; this preserves the current Rust crate boundary while the stricter upstream file ownership is still being ported.
 
 ### Unintentional differences (to fix)
-- Upstream `CreateGraphicsPipeline(...)` builds an array of `Shader::IR::Program`, handles layer passthrough generation, merges dual vertex programs, tracks storage-buffer totals, and then emits/link programs from that program array. Rust still emits per-stage GLSL strings directly during the OpenGL cache build.
+- Upstream `CreateGraphicsPipeline(...)` builds an array of `Shader::IR::Program`, inserts generated layer passthrough programs, merges dual vertex programs, tracks storage-buffer totals, and then emits/link programs from that program array. Rust still emits per-stage GLSL strings directly during the OpenGL cache build.
 - Dual VertexA/VertexB compilation still uses the older instruction-slice helper instead of an upstream-shaped `TranslateProgram(..., env, cfg, host_info)` bridge for both programs followed by an environment-aware merge.
 
 ### Missing items
-- Port the full upstream `CreateGraphicsPipeline(..., envs, ...)` program-array flow, including layer passthrough generation and storage-buffer accounting.
+- Port the full upstream `CreateGraphicsPipeline(..., envs, ...)` program-array flow, including layer passthrough program insertion and storage-buffer accounting.
 - Port an environment-backed dual VertexA/VertexB merge path so `MergeDualVertexPrograms` parity does not depend on compatibility slice APIs.
 
 ### Binary layout verification
