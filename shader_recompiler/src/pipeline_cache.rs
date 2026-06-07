@@ -12,6 +12,7 @@
 use std::collections::{BTreeMap, HashMap};
 
 use super::backend;
+use super::environment::Environment;
 use super::frontend::control_flow;
 use super::frontend::structured_control_flow;
 use super::frontend::translate::TranslatorVisitor;
@@ -23,7 +24,7 @@ use super::ir::instruction::Inst;
 use super::ir::opcodes::Opcode;
 use super::ir::post_order::post_order;
 use super::ir::program::{Program, ShaderInfo, SyntaxNode};
-use super::ir::types::ShaderStage;
+use super::ir::types::{OutputTopology, ShaderStage};
 use super::ir::value::{InstRef, Pred, Value};
 use super::ir_opt;
 use super::profile::Profile;
@@ -395,6 +396,50 @@ pub fn translate_program_at_offset(code: &[u64], stage: ShaderStage, base_offset
         code,
         stage,
         base_offset,
+        &crate::host_translate_info::HostTranslateInfo::default(),
+    )
+}
+
+/// Translate a Maxwell shader binary using the upstream-shaped environment
+/// owner for stage metadata and environment-dependent optimization passes.
+///
+/// This is an incremental Rust counterpart of upstream
+/// `TranslateProgram(inst_pool, block_pool, env, cfg, host_info)`: CFG
+/// construction still happens from the caller-provided instruction slice, but
+/// shader stage, SPH metadata, local/shared/workgroup sizes, texture
+/// resolution, shader-info header gathering, and interpolation metadata are
+/// read from `env`.
+pub fn translate_program_from_env_with_host_info(
+    code: &[u64],
+    base_offset: u32,
+    env: &mut dyn Environment,
+    host_info: &crate::host_translate_info::HostTranslateInfo,
+) -> Program {
+    let cfg_blocks = control_flow::build_cfg(code);
+    let sph = env.sph().clone();
+    let mut program = translate_cfg_to_program(
+        code,
+        env.shader_stage(),
+        base_offset,
+        &cfg_blocks,
+        Some(&sph),
+    );
+    apply_environment_program_metadata(&mut program, env, host_info);
+    optimize_program_with_env(&mut program, env, host_info, Some(&sph));
+    collect_interpolation_info(&sph, &mut program);
+    program
+}
+
+/// Translate a Maxwell shader binary using default host capabilities.
+pub fn translate_program_from_env(
+    code: &[u64],
+    base_offset: u32,
+    env: &mut dyn Environment,
+) -> Program {
+    translate_program_from_env_with_host_info(
+        code,
+        base_offset,
+        env,
         &crate::host_translate_info::HostTranslateInfo::default(),
     )
 }
@@ -787,6 +832,87 @@ fn translate_and_optimize_with_host_info(
     program
 }
 
+fn apply_environment_program_metadata(
+    program: &mut Program,
+    env: &dyn Environment,
+    host_info: &crate::host_translate_info::HostTranslateInfo,
+) {
+    program.stage = env.shader_stage();
+    program.local_memory_size = env.local_memory_size();
+    match program.stage {
+        ShaderStage::TessellationControl => {
+            program.invocations = env.sph().threads_per_input_primitive();
+        }
+        ShaderStage::Geometry => {
+            let sph = env.sph();
+            program.output_topology = output_topology_from_sph(sph.output_topology());
+            program.output_vertices = sph.max_output_vertices();
+            program.invocations = sph.threads_per_input_primitive();
+            program.is_geometry_passthrough = sph.geometry_passthrough();
+            if program.is_geometry_passthrough {
+                let mask = env.gp_passthrough_mask();
+                for bit in 0..mask.len() * 32 {
+                    program
+                        .info
+                        .passthrough
+                        .set(bit, ((mask[bit / 32] >> (bit % 32)) & 1) == 0);
+                }
+                if !host_info.support_geometry_shader_passthrough {
+                    program.output_vertices = output_vertices_for_topology(program.output_topology);
+                    // Upstream lowers passthrough here. Ruzu keeps the current
+                    // backend passthrough path until `EmitGeometryPassthrough`
+                    // is ported.
+                }
+            }
+        }
+        ShaderStage::Compute => {
+            program.workgroup_size = env.workgroup_size();
+            program.shared_memory_size = env.shared_memory_size();
+        }
+        _ => {}
+    }
+}
+
+fn output_topology_from_sph(topology: super::program_header::OutputTopology) -> OutputTopology {
+    match topology {
+        super::program_header::OutputTopology::PointList => OutputTopology::PointList,
+        super::program_header::OutputTopology::LineStrip => OutputTopology::LineStrip,
+        super::program_header::OutputTopology::TriangleStrip => OutputTopology::TriangleStrip,
+    }
+}
+
+fn output_vertices_for_topology(topology: OutputTopology) -> u32 {
+    match topology {
+        OutputTopology::PointList => 1,
+        OutputTopology::LineStrip => 2,
+        OutputTopology::TriangleStrip => 3,
+    }
+}
+
+fn optimize_program_with_env(
+    program: &mut Program,
+    env: &mut dyn Environment,
+    host_info: &crate::host_translate_info::HostTranslateInfo,
+    sph: Option<&ProgramHeader>,
+) {
+    ir_opt::ssa_rewrite_pass::ssa_rewrite_pass(program);
+    ir_opt::identity_removal::identity_removal_pass(program);
+    ir_opt::constant_propagation::constant_propagation_pass(program);
+    ir_opt::identity_removal::identity_removal_pass(program);
+    ir_opt::global_memory_to_storage_buffer_pass::global_memory_to_storage_buffer_pass(
+        program, host_info,
+    );
+    ir_opt::texture_pass::texture_pass(env, program, host_info);
+    ir_opt::dead_code_elimination::dead_code_elimination_pass(program);
+    if let Some(sph) = sph {
+        ir_opt::collect_info::collect_shader_info_pass_with_sph(program, sph);
+    } else {
+        ir_opt::collect_info::collect_shader_info_pass(program);
+    }
+    ir_opt::layer_pass::layer_pass(program, host_info);
+    ir_opt::vendor_workaround_pass::vendor_workaround_pass(program);
+}
+
 fn optimize_glsl_with_optional_ir_dump(
     program: &mut Program,
     stage: ShaderStage,
@@ -1056,8 +1182,11 @@ fn trace_shader_words(stage: ShaderStage, base_offset: u32, code: &[u64]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::environment::Environment;
     use crate::frontend::control_flow::{CfgBlock, Condition, EndClass};
     use crate::ir::program::SyntaxNode;
+    use crate::program_header::OutputTopology;
+    use crate::shader_info::{ReplaceConstant, TexturePixelFormat, TextureType};
 
     #[test]
     fn test_hash_code_deterministic() {
@@ -1279,6 +1408,108 @@ mod tests {
         assert!(is_sched_control_word(8, 3));
         assert!(!is_sched_control_word(8, 0));
         assert!(is_sched_control_word(0x50, 2));
+    }
+
+    struct DummyEnvironment {
+        sph: ProgramHeader,
+    }
+
+    impl DummyEnvironment {
+        fn compute() -> Self {
+            let mut sph = ProgramHeader::default();
+            sph.raw[3] = (OutputTopology::TriangleStrip as u32) << 24;
+            Self { sph }
+        }
+    }
+
+    impl Environment for DummyEnvironment {
+        fn read_instruction(&mut self, _address: u32) -> u64 {
+            0
+        }
+
+        fn read_cbuf_value(&mut self, _cbuf_index: u32, _cbuf_offset: u32) -> u32 {
+            0
+        }
+
+        fn read_texture_type(&mut self, _raw_handle: u32) -> TextureType {
+            TextureType::Color2D
+        }
+
+        fn read_texture_pixel_format(&mut self, _raw_handle: u32) -> TexturePixelFormat {
+            TexturePixelFormat::A8B8G8R8Unorm
+        }
+
+        fn is_texture_pixel_format_integer(&mut self, _raw_handle: u32) -> bool {
+            false
+        }
+
+        fn read_viewport_transform_state(&mut self) -> u32 {
+            1
+        }
+
+        fn texture_bound_buffer(&self) -> u32 {
+            7
+        }
+
+        fn local_memory_size(&self) -> u32 {
+            0x240
+        }
+
+        fn shared_memory_size(&self) -> u32 {
+            0x180
+        }
+
+        fn workgroup_size(&self) -> [u32; 3] {
+            [8, 4, 2]
+        }
+
+        fn has_hle_macro_state(&self) -> bool {
+            false
+        }
+
+        fn get_replace_const_buffer(
+            &mut self,
+            _bank: u32,
+            _offset: u32,
+        ) -> Option<ReplaceConstant> {
+            None
+        }
+
+        fn dump(&mut self, _pipeline_hash: u64, _shader_hash: u64) {}
+
+        fn sph(&self) -> &ProgramHeader {
+            &self.sph
+        }
+
+        fn gp_passthrough_mask(&self) -> &[u32; 8] {
+            static MASK: [u32; 8] = [0; 8];
+            &MASK
+        }
+
+        fn shader_stage(&self) -> ShaderStage {
+            ShaderStage::Compute
+        }
+
+        fn start_address(&self) -> u32 {
+            0
+        }
+
+        fn is_proprietary_driver(&self) -> bool {
+            false
+        }
+    }
+
+    #[test]
+    fn translate_program_from_env_uses_environment_metadata() {
+        let mut env = DummyEnvironment::compute();
+
+        let program = translate_program_from_env(&[0, 0], 0, &mut env);
+
+        assert_eq!(program.stage, ShaderStage::Compute);
+        assert_eq!(program.local_memory_size, 0x240);
+        assert_eq!(program.shared_memory_size, 0x180);
+        assert_eq!(program.workgroup_size, [8, 4, 2]);
+        assert!(!program.blocks.is_empty());
     }
 
     #[test]

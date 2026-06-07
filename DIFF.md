@@ -625,6 +625,30 @@
 - Manual MK8D 25s isolated-XDG host-thread-all smoke after switching `SessionRequestManager` to a weak `ServerManager` owner (`/tmp/ruzu_mk8d_ipc_weak_owner_host_all_smoke_1780868703.log`, `RUZU_SERVER_THREAD_IPC_ALL=1`): reached `NotifyRunning`, no panic/`BreakLoopNullPc`, no `svcBreak`/`SetTerminateResult`, no `missing_server_manager_owner`, and no `receive_request_hle failed` warnings. Warn-level logging did not emit audio or presentation markers in this short run.
 
 ## 2026-06-07 — core/src/hle/kernel/k_client_session.rs, core/src/hle/kernel/k_session.rs, core/src/hle/kernel/k_server_session.rs, core/src/hle/kernel/k_thread.rs, core/src/hle/kernel/k_scheduler.rs, and core/src/hle/kernel/svc/svc_ipc.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/k_client_session.cpp, /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/k_session.cpp, /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/k_server_session.cpp, /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/k_thread.cpp, /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/k_scheduler.cpp, and /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/svc/svc_ipc.cpp
+## 2026-06-07 — shader_recompiler/src/pipeline_cache.rs vs /home/vricosti/Dev/emulators/zuyu/src/shader_recompiler/frontend/maxwell/translate_program.cpp
+
+### Intentional differences
+- Added `translate_program_from_env_with_host_info(...)` as an incremental Rust bridge toward upstream `TranslateProgram(..., Environment& env, Flow::CFG& cfg, HostTranslateInfo&)`. Rust still builds the CFG from the caller-provided instruction slice instead of accepting the upstream `Flow::CFG&`, but stage, local memory size, compute shared memory/workgroup size, tessellation invocation count, geometry SPH metadata, texture pass environment access, shader-info header gathering, and interpolation collection now come from the `Environment` owner.
+- Geometry passthrough lowering still leaves backend passthrough handling in place when `support_geometry_shader_passthrough` is false; upstream calls `LowerGeometryPassthrough(...)` in this frontend function. The Rust lowering helper is not ported yet, so the bridge only fills passthrough masks/output vertex metadata.
+
+### Unintentional differences (to fix)
+- Upstream `TranslateProgram(...)` still owns `BuildASL(inst_pool, block_pool, env, cfg, host_info)`, `RemoveUnreachableBlocks`, optional fp/int lowering, `PositionPass(env, ...)`, optional rescaling/verification, full `LayerPass`, `VendorWorkaroundPass`, and `AddNVNStorageBuffers`. Rust's env bridge reuses the current CFG translator and the currently ported pass subset.
+
+### Missing items
+- Replace the compatibility instruction-slice API with the upstream-shaped `translate_program` owner that accepts/preuses a `Flow::CFG` equivalent and consumes `Environment` throughout the frontend.
+- Port `LowerGeometryPassthrough`, environment-aware `PositionPass`, `AddNVNStorageBuffers`, and the remaining upstream pass ordering gaps.
+
+### Binary layout verification
+- N/A: shader IR construction/policy only. No guest-visible raw payload layout changed.
+
+### Tests
+- Re-read upstream `frontend/maxwell/translate_program.cpp::TranslateProgram`.
+- `cargo test -p shader_recompiler translate_program_from_env_uses_environment_metadata -- --nocapture`
+- `cargo check -p shader_recompiler`
+- `cargo check -p video_core`
+- `cargo fmt --check`
+- `git diff --check`
+
 ## 2026-06-07 — video_core/src/shader_environment.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/shader_environment.h and /home/vricosti/Dev/emulators/zuyu/src/video_core/shader_environment.cpp
 
 ### Intentional differences
@@ -654,11 +678,11 @@
 - `pipeline_cache::translate_program_at_offset_with_host_info(...)` exposes the currently ported Rust driver without moving ownership of CFG/environment construction into `frontend::translate_program.rs`; this keeps the existing runtime compile paths stable while creating a non-empty translation API for later upstream-shaped signature work.
 
 ### Unintentional differences (to fix)
-- Upstream `TranslateProgram(...)` owns stage/environment metadata population (`LocalMemorySize`, tessellation/geometry/compute fields, geometry passthrough lowering, interpolation collection, NVN storage buffers) directly from `Environment&`. The Rust compatibility path still derives only the subset represented by the current env-less CFG driver and backend-specific GLSL helpers.
+- Upstream `TranslateProgram(...)` owns stage/environment metadata population directly from `Environment&`. Rust now has an explicit `translate_program_from_env_with_host_info(...)` bridge for this metadata, but the older compatibility `translate_program(...)` entry point still accepts only instruction words plus stage.
 - Upstream pass ordering includes environment-aware `ConstantPropagationPass(env, ...)`, `PositionPass(env, ...)`, `TexturePass(env, ...)`, `CollectShaderInfoPass(env, ...)`, `LayerPass`, `VendorWorkaroundPass`, optional lowering passes, rescaling, and verification. Rust still uses the currently ported reduced order in `pipeline_cache.rs`.
 
 ### Missing items
-- Port the upstream-shaped `translate_program` signature that accepts the shader `Environment` owner and prebuilt CFG, then move the full pass ordering and stage metadata ownership into the matching frontend file.
+- Port the upstream-shaped `translate_program` signature that accepts the shader `Environment` owner and prebuilt CFG, then move the full pass ordering into the matching frontend file.
 
 ### Binary layout verification
 - N/A: shader IR construction only. No guest-visible raw payload layout changed.
