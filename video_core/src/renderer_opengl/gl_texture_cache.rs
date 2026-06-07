@@ -3125,53 +3125,20 @@ impl TextureCache {
 
     pub fn prepare_render_targets_from_snapshot(
         &mut self,
-        render_targets: &Maxwell3DRenderTargets,
+        _render_targets: &Maxwell3DRenderTargets,
         mut read_gpu: Option<&mut dyn FnMut(u64, &mut [u8]) -> bool>,
         is_clear: bool,
         clear_scissor: Option<ScissorInfo>,
     ) {
         let mut image_views = Vec::new();
-        for &target in render_targets
-            .rt_control
-            .map
-            .iter()
-            .take(render_targets.rt_control.count.min(8) as usize)
-        {
-            let Some(rt) = render_targets.render_targets.get(target as usize) else {
-                continue;
-            };
-            if rt.address == 0 || rt.width == 0 || rt.height == 0 {
-                continue;
-            }
-            if let Some((_, image)) = self.base.slot_images.iter().find(|(_, image)| {
-                image.gpu_addr == rt.address
-                    && image.info.size.width == rt.width
-                    && image.info.size.height == rt.height
-                    && !image.image_view_ids.is_empty()
-            }) {
-                let view_id = image.image_view_ids[0];
-                if view_id.is_valid() {
-                    image_views.push(view_id);
-                }
+        for &view_id in &self.base.render_targets.color_buffer_ids {
+            if view_id.is_valid() {
+                image_views.push(view_id);
             }
         }
-
-        let zeta = render_targets.zeta;
-        if zeta.enabled && zeta.address != 0 && zeta.width != 0 && zeta.height != 0 {
-            let zeta_info =
-                ImageInfo::from_zeta_info(&zeta, render_targets.anti_alias_samples_mode);
-            if let Some((_, image)) = self.base.slot_images.iter().find(|(_, image)| {
-                image.gpu_addr == zeta.address
-                    && image.info.size.width == zeta_info.size.width
-                    && image.info.size.height == zeta_info.size.height
-                    && image.info.format == zeta_info.format
-                    && !image.image_view_ids.is_empty()
-            }) {
-                let view_id = image.image_view_ids[0];
-                if view_id.is_valid() {
-                    image_views.push(view_id);
-                }
-            }
+        let depth_view_id = self.base.render_targets.depth_buffer_id;
+        if depth_view_id.is_valid() {
+            image_views.push(depth_view_id);
         }
 
         image_views.sort_by_key(|id| id.index);
@@ -3225,51 +3192,35 @@ impl TextureCache {
     /// equivalent for MK8D's multi-pass composition.
     pub fn framebuffer_for_render_targets_from_snapshot(
         &mut self,
-        render_targets: &Maxwell3DRenderTargets,
+        _render_targets: &Maxwell3DRenderTargets,
         size: Extent2D,
     ) -> Option<(u32, u32, u32)> {
-        let mut key = RenderTargets {
-            size,
-            ..RenderTargets::default()
-        };
+        let mut key = self.base.render_targets;
+        if key.size.width == 0 {
+            key.size.width = size.width;
+        }
+        if key.size.height == 0 {
+            key.size.height = size.height;
+        }
         let mut attachment_textures = [0u32; NUM_RT];
         let mut depth_attachment_texture = 0u32;
         let mut depth_attachment_format = PixelFormat::Invalid;
         let mut depth_attachment_view_id = ImageViewId::default();
         let mut depth_attachment_image_id = ImageId::default();
+        let mut depth_attachment_gpu_addr = 0u64;
         let mut depth_attachment_gl = gl::NONE;
         let mut max_width = 0u32;
         let mut max_height = 0u32;
 
         for index in 0..NUM_RT {
-            key.draw_buffers[index] = render_targets.rt_control.map[index] as u8;
-
-            let rt = render_targets.render_targets[index];
-            if rt.address == 0 || rt.width == 0 || rt.height == 0 || rt.format == 0 {
-                continue;
-            }
-
-            let Some((image_id, image_base)) = self.base.slot_images.iter().find(|(_, image)| {
-                image.gpu_addr == rt.address
-                    && image.info.size.width == rt.width
-                    && image.info.size.height == rt.height
-                    && !image.image_view_ids.is_empty()
-            }) else {
-                continue;
-            };
-            let image_base = image_base.clone();
-            let view_id = self.base.find_render_target_view_from_image(
-                image_id,
-                &rt,
-                render_targets.anti_alias_samples_mode,
-                rt.address,
-            );
+            let view_id = key.color_buffer_ids[index];
             if !view_id.is_valid() {
                 continue;
             }
-            key.color_buffer_ids[index] = view_id;
 
             let view_base = self.base.slot_image_views[view_id].clone();
+            let image_id = view_base.image_id;
+            let image_base = self.base.slot_images[image_id].clone();
             self.images
                 .entry(image_id)
                 .or_insert_with(|| Image::from_base(&image_base, self.has_native_astc));
@@ -3315,50 +3266,29 @@ impl TextureCache {
             max_height = max_height.max(view_base.size.height);
         }
 
-        let zeta = render_targets.zeta;
-        if zeta.enabled && zeta.address != 0 && zeta.width != 0 && zeta.height != 0 {
-            let zeta_info =
-                ImageInfo::from_zeta_info(&zeta, render_targets.anti_alias_samples_mode);
-            if let Some((image_id, image_base)) = self.base.slot_images.iter().find(|(_, image)| {
-                image.gpu_addr == zeta.address
-                    && image.info.size.width == zeta_info.size.width
-                    && image.info.size.height == zeta_info.size.height
-                    && image.info.format == zeta_info.format
-            }) {
-                let image_id = image_id;
-                let image_base = image_base.clone();
-                let view_id =
-                    self.base
-                        .find_image_view_from_image_info(image_id, &zeta_info, zeta.address);
-                if view_id.is_valid() {
-                    key.depth_buffer_id = view_id;
-
-                    let view_base = self.base.slot_image_views[view_id].clone();
-                    self.images
-                        .entry(image_id)
-                        .or_insert_with(|| Image::from_base(&image_base, self.has_native_astc));
-                    let backend_image = self
-                        .images
-                        .get(&image_id)
-                        .expect("depth image inserted above must be present");
-                    let backend_view = self.image_views.entry(view_id).or_insert_with(|| {
-                        ImageView::new_color_2d(&view_base, backend_image, self.null_image_views)
-                    });
-                    depth_attachment_texture = backend_view.default_handle();
-                    depth_attachment_format = zeta_info.format;
-                    depth_attachment_view_id = view_id;
-                    depth_attachment_image_id = image_id;
-                    max_width = max_width.max(view_base.size.width);
-                    max_height = max_height.max(view_base.size.height);
-                    trace_image_view_event(
-                        6,
-                        view_id,
-                        &view_base,
-                        backend_image,
-                        Some(backend_view),
-                    );
-                }
-            }
+        let view_id = key.depth_buffer_id;
+        if view_id.is_valid() {
+            let view_base = self.base.slot_image_views[view_id].clone();
+            let image_id = view_base.image_id;
+            let image_base = self.base.slot_images[image_id].clone();
+            self.images
+                .entry(image_id)
+                .or_insert_with(|| Image::from_base(&image_base, self.has_native_astc));
+            let backend_image = self
+                .images
+                .get(&image_id)
+                .expect("depth image inserted above must be present");
+            let backend_view = self.image_views.entry(view_id).or_insert_with(|| {
+                ImageView::new_color_2d(&view_base, backend_image, self.null_image_views)
+            });
+            depth_attachment_texture = backend_view.default_handle();
+            depth_attachment_format = self.base.slot_images[image_id].info.format;
+            depth_attachment_view_id = view_id;
+            depth_attachment_image_id = image_id;
+            depth_attachment_gpu_addr = self.base.slot_images[image_id].gpu_addr;
+            max_width = max_width.max(view_base.size.width);
+            max_height = max_height.max(view_base.size.height);
+            trace_image_view_event(6, view_id, &view_base, backend_image, Some(backend_view));
         }
 
         if attachment_textures.iter().all(|&texture| texture == 0) && depth_attachment_texture == 0
@@ -3470,7 +3400,7 @@ impl TextureCache {
                                     framebuffer as u64,
                                     depth_attachment_view_id.index as u64,
                                     depth_attachment_image_id.index as u64,
-                                    zeta.address,
+                                    depth_attachment_gpu_addr,
                                     depth_attachment_format as u64,
                                     ((key.size.width as u64) << 32) | key.size.height as u64,
                                     depth_attachment_texture as u64,
