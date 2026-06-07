@@ -11,7 +11,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use common::{cityhash::city_hash64, trace};
+use shader_recompiler::frontend::translate_program::{
+    convert_legacy_to_generic, generate_geometry_passthrough,
+};
 use shader_recompiler::host_translate_info::HostTranslateInfo;
+use shader_recompiler::ir::program::Program as ShaderProgram;
+use shader_recompiler::ir::types::OutputTopology;
 use shader_recompiler::profile::Profile as ShaderProfile;
 use shader_recompiler::runtime_info::{
     CompareFunction, InputTopology, RuntimeInfo, TessPrimitive, TessSpacing,
@@ -677,6 +682,9 @@ impl ShaderCache {
                 0,
             );
             let mut previous_info = compiled.info.clone();
+            let mut layer_source_info = previous_info
+                .requires_layer_emulation
+                .then(|| previous_info.clone());
             infos[0] = Some(previous_info.clone());
             let mut final_source =
                 patch_fragment_debug_by_source_hash(ShaderStage::VertexB, compiled.source);
@@ -738,7 +746,34 @@ impl ShaderCache {
             pipeline.glsl_sources[0] = Some(final_source);
 
             for &(slot, _stage, gl_slot) in STAGE_LAYOUT {
-                if self.graphics_key.unique_hashes[slot] == 0 || slot == 1 {
+                let is_emulated_geometry = slot == 4
+                    && self.graphics_key.unique_hashes[slot] == 0
+                    && layer_source_info.is_some();
+                if (self.graphics_key.unique_hashes[slot] == 0 && !is_emulated_geometry)
+                    || slot == 1
+                {
+                    continue;
+                }
+                if is_emulated_geometry {
+                    let source_info = layer_source_info
+                        .as_ref()
+                        .expect("checked by is_emulated_geometry");
+                    let compiled = self.emit_layer_passthrough_geometry_glsl(
+                        source_info,
+                        Some(&previous_info),
+                        &mut bindings,
+                    );
+                    trace_gl_pipeline(
+                        11,
+                        &self.graphics_key,
+                        self.graphics_cache.len(),
+                        ShaderStage::Geometry as u64,
+                        slot as u64,
+                        compiled.source.len() as u64,
+                    );
+                    previous_info = compiled.info.clone();
+                    infos[gl_slot] = Some(previous_info.clone());
+                    pipeline.glsl_sources[gl_slot] = Some(compiled.source);
                     continue;
                 }
 
@@ -786,6 +821,9 @@ impl ShaderCache {
                     compiled.source.len() as u64,
                 );
                 previous_info = compiled.info.clone();
+                if previous_info.requires_layer_emulation {
+                    layer_source_info = Some(previous_info.clone());
+                }
                 infos[gl_slot] = Some(previous_info.clone());
                 let mut final_source =
                     patch_fragment_debug_by_source_hash(actual_stage, compiled.source);
@@ -898,11 +936,37 @@ impl ShaderCache {
         }
 
         let mut previous_info: Option<ShaderInfo> = None;
+        let mut layer_source_info: Option<ShaderInfo> = None;
         for &(slot, _stage, gl_slot) in STAGE_LAYOUT {
-            if self.graphics_key.unique_hashes[slot] == 0 {
+            let is_emulated_geometry = slot == 4
+                && self.graphics_key.unique_hashes[slot] == 0
+                && layer_source_info.is_some();
+            if self.graphics_key.unique_hashes[slot] == 0 && !is_emulated_geometry {
                 continue;
             }
             if uses_vertex_a && slot == 1 {
+                continue;
+            }
+            if is_emulated_geometry {
+                let source_info = layer_source_info
+                    .as_ref()
+                    .expect("checked by is_emulated_geometry");
+                let compiled = self.emit_layer_passthrough_geometry_glsl(
+                    source_info,
+                    previous_info.as_ref(),
+                    &mut bindings,
+                );
+                trace_gl_pipeline(
+                    11,
+                    &self.graphics_key,
+                    self.graphics_cache.len(),
+                    ShaderStage::Geometry as u64,
+                    slot as u64,
+                    compiled.source.len() as u64,
+                );
+                previous_info = Some(compiled.info.clone());
+                infos[gl_slot] = Some(compiled.info);
+                pipeline.glsl_sources[gl_slot] = Some(compiled.source);
                 continue;
             }
 
@@ -950,6 +1014,9 @@ impl ShaderCache {
                 compiled.source.len() as u64,
             );
             previous_info = Some(compiled.info.clone());
+            if compiled.info.requires_layer_emulation {
+                layer_source_info = Some(compiled.info.clone());
+            }
             infos[gl_slot] = previous_info.clone();
             let mut final_source =
                 patch_fragment_debug_by_source_hash(actual_stage, compiled.source);
@@ -1127,6 +1194,43 @@ impl ShaderCache {
         };
 
         info
+    }
+
+    /// Port of upstream `MaxwellToOutputTopology(...)`.
+    fn maxwell_to_output_topology(topology: u32) -> OutputTopology {
+        match topology {
+            0 => OutputTopology::PointList,
+            3 => OutputTopology::LineStrip,
+            _ => OutputTopology::TriangleStrip,
+        }
+    }
+
+    fn emit_layer_passthrough_geometry_glsl(
+        &self,
+        source_info: &ShaderInfo,
+        previous_info: Option<&ShaderInfo>,
+        bindings: &mut shader_recompiler::backend::bindings::Bindings,
+    ) -> CompiledGlslShader {
+        let mut source_program = ShaderProgram::new(ShaderStage::Geometry);
+        source_program.info = source_info.clone();
+        let output_topology =
+            Self::maxwell_to_output_topology(self.graphics_key.gs_input_topology());
+        let mut program =
+            generate_geometry_passthrough(&self.host_info, &source_program, output_topology);
+        let runtime_info =
+            Self::make_runtime_info(&self.graphics_key, ShaderStage::Geometry, previous_info);
+        convert_legacy_to_generic(&mut program, &runtime_info);
+        let source = shader_recompiler::backend::glsl::emit_glsl(
+            &self.profile,
+            &runtime_info,
+            &mut program,
+            bindings,
+        );
+        CompiledGlslShader {
+            source,
+            info: program.info,
+            stage: ShaderStage::Geometry,
+        }
     }
 
     /// Translate a single Maxwell shader stage to GLSL via the recompiler.
@@ -1357,6 +1461,26 @@ mod tests {
     #[test]
     fn cache_version() {
         assert_eq!(CACHE_VERSION, 10);
+    }
+
+    #[test]
+    fn maxwell_to_output_topology_matches_upstream_mapping() {
+        assert_eq!(
+            ShaderCache::maxwell_to_output_topology(PrimitiveTopology::Points as u32),
+            OutputTopology::PointList
+        );
+        assert_eq!(
+            ShaderCache::maxwell_to_output_topology(PrimitiveTopology::LineStrip as u32),
+            OutputTopology::LineStrip
+        );
+        assert_eq!(
+            ShaderCache::maxwell_to_output_topology(PrimitiveTopology::TriangleStrip as u32),
+            OutputTopology::TriangleStrip
+        );
+        assert_eq!(
+            ShaderCache::maxwell_to_output_topology(PrimitiveTopology::Triangles as u32),
+            OutputTopology::TriangleStrip
+        );
     }
 
     #[test]
