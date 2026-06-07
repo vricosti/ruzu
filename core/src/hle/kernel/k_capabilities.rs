@@ -7,6 +7,10 @@
 
 use crate::hardware_properties;
 use crate::hle::kernel::k_memory_block::KMemoryPermission;
+use crate::hle::kernel::k_memory_region_type::{
+    K_MEMORY_REGION_TYPE_DTB, K_MEMORY_REGION_TYPE_KERNEL_TRACE_BUFFER,
+    K_MEMORY_REGION_TYPE_ON_MEMORY_BOOT_IMAGE,
+};
 use crate::hle::kernel::k_process_page_table::KProcessPageTable;
 use crate::hle::kernel::svc::svc_results;
 
@@ -561,6 +565,8 @@ impl KCapabilities {
 
     /// Matches upstream `KCapabilities::MapRegion_`.
     fn map_region(cap: u32, page_table: &mut KProcessPageTable) -> u32 {
+        const IS_KTRACE_ENABLED: bool = false;
+
         // MapRegion bitfield:
         //   bits [16..11] = region0 (6 bits, RegionType)
         //   bit  17       = read_only0
@@ -575,15 +581,26 @@ impl KCapabilities {
         ];
 
         for &(region_type, read_only) in &types {
-            if region_type == RegionType::NoMapping as u32 {
-                continue;
-            }
             let perm = if read_only != 0 {
                 KMemoryPermission::USER_READ
             } else {
                 KMemoryPermission::USER_READ_WRITE
             };
-            let result = page_table.map_region(region_type, perm);
+            let mapped_region_type = match region_type {
+                value if value == RegionType::NoMapping as u32 => continue,
+                value if value == RegionType::KernelTraceBuffer as u32 => {
+                    if !IS_KTRACE_ENABLED {
+                        continue;
+                    }
+                    K_MEMORY_REGION_TYPE_KERNEL_TRACE_BUFFER.get_value()
+                }
+                value if value == RegionType::OnMemoryBootImage as u32 => {
+                    K_MEMORY_REGION_TYPE_ON_MEMORY_BOOT_IMAGE.get_value()
+                }
+                value if value == RegionType::Dtb as u32 => K_MEMORY_REGION_TYPE_DTB.get_value(),
+                _ => return svc_results::RESULT_NOT_FOUND.get_inner_value(),
+            };
+            let result = page_table.map_region(mapped_region_type, perm);
             if result != 0 {
                 return result;
             }

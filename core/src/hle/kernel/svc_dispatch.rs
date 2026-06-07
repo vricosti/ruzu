@@ -2104,6 +2104,51 @@ pub fn call(system: &System, imm: u32, is_64bit: bool, args: &mut SvcArgs) {
         }
     }
 
+    fn trace_invalid_handle_svc_enabled() -> bool {
+        use std::sync::OnceLock;
+        static CACHED: OnceLock<bool> = OnceLock::new();
+        *CACHED.get_or_init(|| std::env::var_os("RUZU_TRACE_INVALID_HANDLE_SVC").is_some())
+    }
+    if trace_invalid_handle_svc_enabled()
+        && dispatch_args[0]
+            == crate::hle::kernel::svc::svc_results::RESULT_INVALID_HANDLE.get_inner_value() as u64
+    {
+        let (pc, lr) = if let Some(kernel) = system.kernel() {
+            let core_index = kernel.current_physical_core_index() as usize;
+            if let Some(process_arc) = system.current_process_arc.as_ref().cloned() {
+                let process = process_arc.lock().unwrap();
+                if let Some(jit) = process.get_arm_interface(core_index) {
+                    use crate::arm::arm_interface::ThreadContext;
+                    let mut ctx = ThreadContext::default();
+                    jit.get_context(&mut ctx);
+                    (ctx.r[15] as u32, ctx.r[14] as u32)
+                } else {
+                    (0, 0)
+                }
+            } else {
+                (0, 0)
+            }
+        } else {
+            (0, 0)
+        };
+        let name = SvcId::from_u32(imm)
+            .map(|id| format!("{:?}", id))
+            .unwrap_or_else(|| format!("svc#0x{:02X}", imm));
+        log::warn!(
+            "[INVALID_HANDLE_SVC] tid={} core={} svc={} imm=0x{:02X} pc=0x{:08X} lr=0x{:08X} ret=[0x{:X},0x{:X},0x{:X},0x{:X}]",
+            tid,
+            core_id,
+            name,
+            imm,
+            pc,
+            lr,
+            dispatch_args[0],
+            dispatch_args[1],
+            dispatch_args[2],
+            dispatch_args[3],
+        );
+    }
+
     if let Some(kernel) = system.kernel() {
         if let Some(process_arc) = system.current_process_arc.as_ref().cloned() {
             let mut process = process_arc.lock().unwrap();

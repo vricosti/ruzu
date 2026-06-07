@@ -1,3 +1,286 @@
+## 2026-06-07 — core/src/hle/kernel/k_dynamic_resource_manager.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/k_memory_block_manager.h
+
+### Intentional differences
+- `KMemoryBlockManagerUpdateAllocator::new(...)` returns `(allocator, result_code)` instead of upstream's constructor with `Result* out_result`, preserving the same success / `ResultOutOfResource` contract without an out-parameter.
+- Rust stores pre-reserved nodes as `[Option<Box<KMemoryBlock>>; 2]` and an `Arc<KMemoryBlockSlabManager>` owner instead of upstream raw `KMemoryBlock*` slots and `KMemoryBlockSlabManager*`. The slot/index lifecycle matches upstream: `m_index = MaxBlocks - num_blocks`, `Allocate()` swaps out the current slot, `Free()` either returns to a free slot or the slab, and `Drop` returns unused slots.
+
+### Unintentional differences (to fix)
+- None identified for the audited `KMemoryBlockManagerUpdateAllocator` construction and slot lifecycle slice.
+
+### Missing items
+- None identified for the audited allocator invariant slice.
+
+### Binary layout verification
+- N/A: kernel host allocator policy only. No guest-visible raw payload layout changed.
+
+### Tests
+- Re-read upstream `KMemoryBlockManagerUpdateAllocator` in `k_memory_block_manager.h`.
+- `cargo test -p core memory_block_update_allocator_rejects_more_than_max_blocks -- --nocapture`
+- `cargo fmt --check`
+- `git diff --check`
+- `cargo check -p core`
+
+## 2026-06-07 — core/src/hle/service/nvdrv/nvdrv_interface.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/nvdrv/nvdrv_interface.cpp
+
+### Intentional differences
+- `NVDRV::QueryEvent` now follows upstream's successful response ownership path more closely: when `Module::QueryEvent(...)` returns `NvResult::Success` and a readable event, Rust registers the readable event object in the caller process and pushes the object id through `ResponseBuilder::push_copy_object_id(...)`. Final client-handle allocation remains deferred to `HLERequestContext::write_to_outgoing_command_buffer(...)`, matching upstream `rb.PushCopyObjects(readable_event)` followed by `handle_table.Add(object)` during IPC write-back.
+- If Rust cannot register the readable event object even though the NV device returned `Success`, the handler returns `NvResult::BadParameter` instead of emitting an impossible success response without a copy handle. Upstream's success branch assumes a valid `KEvent*`; this Rust guard prevents a host ownership failure from being serialized as a guest-visible valid event.
+
+### Unintentional differences (to fix)
+- Rust still keeps `copy_handle_for_readable_event(...)` and raw-handle `push_copy_objects(handle)` for older service paths. Upstream's `ResponseBuilder::PushCopyObjects` stores kernel objects, not pre-resolved client handles.
+
+### Missing items
+- Audit the remaining service paths that call `copy_handle_for_readable_event(...)` and migrate them to object-owned `push_copy_object_id(...)` where the owner object is available.
+
+### Binary layout verification
+- PASS: IPC handle ownership policy only; no raw NV ioctl payload layout changed.
+
+### Tests
+- Re-read upstream `NVDRV::QueryEvent` in `nvdrv_interface.cpp`.
+- Re-read upstream `HLERequestContext::AddCopyObject(...)` and `IPC::ResponseBuilder::PushCopyObjects(...)`.
+- `cargo fmt --check`
+- `cargo check -p core`
+- `git diff --check`
+- `cargo build --release --bin ruzu-cmd`
+- Manual MK8D low-log smoke after object-owned `QueryEvent` response (`/tmp/ruzu_mk8d_queryevent_lowlog_20260607_155207.log`, isolated XDG dirs, `RUST_LOG=warn`, 110s): reached `NotifyRunning`, with no logged `SetTerminateResult`, `svcBreak`, `0x0000D401`, `BreakLoopNullPc`, or `Invalid DeviceFD`; warn-level logging is too sparse to prove late presentation or audio progress.
+- Manual MK8D targeted invalid-handle trace (`/tmp/ruzu_mk8d_invalid_handle_svc_20260607_155542.log`, isolated XDG dirs, `RUST_LOG=warn`, `RUZU_TRACE_INVALID_HANDLE_SVC=1`, 120s): no `INVALID_HANDLE_SVC` records were emitted, but the run stalled before `NotifyRunning`, so it did not reproduce the later `SetTerminateResult=0xe401` failure.
+
+## 2026-06-07 — core/src/hle/kernel/k_process.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/k_process.h and k_process.cpp
+
+### Intentional differences
+- `KProcess::get_memory()` returns the directly owned Rust `memory` bridge when present and otherwise returns the same bridge stored in `page_table.m_memory`. Upstream stores `Core::Memory::Memory m_memory` in `KProcess` and passes it by reference into `KProcessPageTable::Initialize(...)`; Rust can temporarily construct reduced page-table fixtures by installing only the page-table-side bridge, so the accessor keeps the single conceptual upstream owner visible to kernel helpers without adding a second transport path.
+- Runtime `KProcess` memory users (`LoadModule`, stack/TLS zeroing, `write_memory`, `read_memory_vec`, `KAddressArbiter` user-memory helpers, `KConditionVariable` user-memory helpers, `svc::WaitSynchronization`, `svc::FlushProcessDataCache`, and `svc::CreateThread` trace reads) now call `get_memory()` instead of reaching directly into `page_table.m_memory`, matching upstream call sites such as `this->GetMemory().WriteBlock(...)` / `GetCurrentMemory(kernel)` and keeping the process-owned memory policy centralized.
+
+### Unintentional differences (to fix)
+- Reduced Rust fixtures can still construct a `KProcess` without calling the full upstream-shaped process initialization path that creates `m_memory` before page-table setup.
+
+### Missing items
+- Route more kernel tests through the full process/page-table initialization lifecycle instead of manually installing `page_table.m_memory`.
+- The `k_condition_variable` native test fixture still needs a full scheduler/current-thread/current-page-table harness before it can be used as a validation gate for this memory-owner slice.
+
+### Binary layout verification
+- PASS: process memory-owner accessor only; no guest-visible raw payload layout changed.
+
+### Tests
+- Re-read upstream `KProcess::GetMemory()` and the `KProcess::Initialize(...)` page-table initialization call that passes `m_memory` into `m_page_table.Initialize(...)`.
+- Re-read upstream `KProcess::LoadModule(...)`, stack/TLS zeroing call sites, and `KProcess::GetMemory()` users in `k_process.cpp`.
+- Re-read upstream `svc_synchronization.cpp::WaitSynchronization`, `k_address_arbiter.cpp::{ReadFromUser,DecrementIfLessThan,UpdateIfEqual}`, and `k_condition_variable.cpp::{ReadFromUser,WriteToUser}`.
+- `cargo test -p core receive_request_with_message_uses_server_message_physical_address -- --nocapture`
+- `cargo test -p core svc_synchronization -- --nocapture`
+- `cargo check -p core`
+
+## 2026-06-07 — core/src/hle/kernel/k_server_session.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/k_server_session.cpp and k_server_session.h
+
+### Intentional differences
+- `ProcessSendMessageReceiveMapping` now receives upstream-shaped `KProcessPageTable` source/destination references, mirrors upstream's map-alias test-state selection, and routes unaligned receive/exchange mapping edges through `dst_page_table.copy_memory_from_user_to_linear(...)`, returning and propagating the page-table result code instead of silently copying through `KProcess::process_memory`.
+- `ProcessSendMessagePointerDescriptors` now receives upstream-shaped `KProcessPageTable` source/destination references, mirrors upstream's destination heap/linear state selection, and routes pointer payload copies through `dst_page_table.copy_memory_from_user_to_linear(...)`, returning and propagating the page-table result code instead of using the Rust-local process-memory bridge.
+- `ProcessReceiveMessagePointerDescriptors` now receives upstream-shaped `KProcessPageTable` source/destination references, mirrors upstream's `dst_user && ToMessageBuffer` branch selection, and routes pointer payload copies through `copy_memory_from_heap_to_heap_without_check_destination(...)` or `copy_memory_from_linear_to_user(...)` as upstream does.
+- `ProcessSendMessage` raw-data handling now mirrors upstream's `src_user` / `dst_user` branch selection for the send-reply direction and routes the page-table copy branches through `copy_memory_from_kernel_to_linear(...)`, `copy_memory_from_heap_to_heap(...)`, and `copy_memory_from_user_to_linear(...)` as upstream does. The current Rust message transport still updates the local `dst_words` mirror after a successful page-table copy because `SendReply` flushes the reconstructed message buffer at the end instead of writing directly through upstream's `dst_msg_ptr`.
+- `ProcessReceiveMessage` raw-data handling now mirrors upstream's `dst_user` / `src_user` branch selection for the receive-request direction and routes the page-table copy branches through `copy_memory_from_linear_to_kernel(...)`, `copy_memory_from_heap_to_heap(...)`, and `copy_memory_from_linear_to_user(...)` as upstream does. The current Rust message transport still updates the local `dst_words` mirror after a successful page-table copy because `ReceiveRequest` flushes the reconstructed message buffer at the end instead of writing directly through upstream's `dst_msg_ptr`.
+- `ReceiveRequest` now uses `server_message_paddr` to read and write the server message buffer through the shared `DeviceMemory` physical backing when the server supplied a user message buffer, matching upstream's `kernel.System().DeviceMemory().GetPointer<u32>(dst_message_paddr)` path. If the physical read/write cannot be resolved, Rust treats the receive-copy as failed instead of falling back to the virtual message address; the existing `ReceiveRequest` cleanup path then reports the server-facing `ResultNotFound`, matching upstream's receive-failure result mapping. Reduced Rust unit fixtures that pass `server_message_paddr == 0` keep the previous virtual-process fallback because they do not construct the kernel physical-address handoff.
+- `CleanupServerHandles` now uses `message_paddr` to read a user-supplied server message buffer for the closed non-HLE reply cleanup path, matching upstream's `kernel.System().DeviceMemory().GetPointer<u32>(message_paddr)` branch. The TLS branch remains the existing Rust current-memory fallback for HLE/reduced fixtures where upstream uses the current thread TLS pointer.
+- `ReceiveRequest` / `SendReply` message-buffer reads and writes now route virtual message addresses through the owning process page table before touching the shared `Memory` bridge. This is the Rust counterpart to upstream's `dst_page_table.GetMemory().GetPointer(...)` / `src_page_table.GetMemory().GetPointer(...)` selection and avoids depending on whatever `Memory::current_page_table` happened to be installed by another process fixture. Translated read failures now propagate as `ResultInvalidCurrentMemory` at the session call sites instead of parsing zero-filled command words from a failed owner-page-table read.
+- Message-buffer writes through an owning process page table now propagate translated write failure as `ResultInvalidCurrentMemory` on the `ReceiveRequest` / `SendReply` call sites instead of falling back to `process_memory` and reporting success. Upstream writes through the already-selected page-table memory pointer, so Rust must not silently write a different backing store when that owner-page-table translation fails.
+- The receive-mapping unit fixture uses a shared Rust `DeviceMemory`/`Memory` owner and explicitly sets the source page table as current before invoking the helper. This models upstream's implicit current-process source memory while letting the destination page table validate/write the linear physical backing.
+- One older end-to-end pointer-descriptor HLE fixture is ignored because it uses a reduced single-`Memory` test transport that cannot switch `Memory::current_page_table` between source and destination processes while reading `src_msg_ptr` and writing `dst_msg_ptr`. The upstream-equivalent helper branches are covered by direct page-table tests instead.
+
+### Unintentional differences (to fix)
+- The higher-level `ReceiveRequest` / `SendReply` message transport still reconstructs local `src_words`/`dst_words` buffers and flushes them instead of operating fully through upstream's direct `dst_msg_ptr`/`src_msg_ptr` pointers. This affects reduced HLE fixtures that need simultaneous client/server page-table views, even though the audited helper copy branches now route through `KProcessPageTable`.
+- The higher-level Rust session path still locks `KProcess` owners to derive the `KProcessPageTable` references passed into the local helpers. Upstream has direct `KProcessPageTable&` locals after resolving the client/server threads and processes, so this is now a call-site ownership gap rather than a helper-signature gap.
+
+### Missing items
+- Port the higher-level `ReceiveRequest` / `SendReply` transport shape so source and destination message buffers are processed through upstream-like direct `dst_msg_ptr` / `src_msg_ptr` views rather than reconstructing local `Vec<u32>` buffers and flushing them after helper processing.
+
+### Binary layout verification
+- PASS: IPC transport policy and test fixtures only; no guest-visible raw payload layout changed.
+
+### Tests
+- Re-read upstream `KServerSession::GetMapAliasTestStateAndAttributeMask`, `KServerSession::ProcessSendMessageReceiveMapping`, and the receive/exchange mapping loops in `KServerSession::SendReply`.
+- Re-read upstream `KServerSession::ProcessSendMessagePointerDescriptors`.
+- Re-read upstream `KServerSession::ProcessReceiveMessagePointerDescriptors`.
+- Re-read upstream `KServerSession::SendMessage` raw-data copy branches.
+- Re-read upstream `KServerSession::ReceiveMessage` raw-data copy branches.
+- Re-read upstream `KServerSession::ReceiveRequest` / `ReceiveMessage` `server_message_paddr` handling for user server message buffers.
+- Re-read upstream `KServerSession::SendReply` closed-request cleanup and local `CleanupServerHandles(...)` physical-message branch.
+- Re-read upstream `KServerSession::{ReceiveRequest,SendReply}` message-buffer pointer selection and the page-table/memory owner used for `dst_msg_ptr` / `src_msg_ptr`.
+- `cargo check -p core`
+- `cargo test -p core receive_request_with_message_uses_server_message_physical_address -- --nocapture`
+- `cargo test -p core receive_request_with_message_does_not_fallback_when_physical_address_is_invalid -- --nocapture`
+- `cargo test -p core cleanup_server_handles_reads_user_message_from_physical_address -- --nocapture`
+- `cargo test -p core cleanup_server_handles_removes_only_move_handles_from_current_process -- --nocapture`
+- `cargo test -p core process_send_message_receive_mapping -- --nocapture`
+- `cargo test -p core process_send_message_pointer_descriptors_copies_through_page_table -- --nocapture`
+- `cargo test -p core process_receive_message_pointer_descriptors_linear_to_user_uses_page_table_copy -- --nocapture`
+- `cargo test -p core process_receive_message_pointer_descriptors_to_message_buffer_uses_heap_to_heap -- --nocapture`
+- `cargo test -p core process_send_message -- --nocapture`
+- `cargo test -p core process_send_message_raw_data -- --nocapture`
+- `cargo test -p core message_raw_data -- --nocapture`
+- `cargo test -p core process_send_message_receive_mapping_skips_aligned_middle_pages -- --nocapture`
+- `cargo test -p core process_send_message_receive_mapping_copies_only_unaligned_edges -- --nocapture`
+- `cargo test -p core pointer_descriptor -- --nocapture`
+- `cargo test -p core receive_request_with_message_copies_raw_request_payload_for_simple_message -- --nocapture`
+- `cargo test -p core message_words_use_process_page_table_not_memory_current_page_table -- --nocapture`
+- Re-ran `cargo test -p core message_words_use_process_page_table_not_memory_current_page_table -- --nocapture` after adding the failed translated-write regression assertion.
+- Manual MK8D trace-ring smoke after aligning `svc::MapSharedMemory` overflow result and reducing region-rejection diagnostics to debug (`/tmp/ruzu_mk8d_trace_progress_20260607_161053.log`, `/tmp/ruzu_mk8d_trace_progress_20260607_161053.ring.log`, isolated XDG dirs, `RUST_LOG=warn`, HWC/BQP/audio trace categories, 120s timeout): no `SetTerminateResult`, `svcBreak`, `BreakLoopNullPc`, `0x0000D401`, `Invalid DeviceFD`, panic, or SIGSEGV marker was logged. Audio trace progressed to nonzero samples (`AUDIO_VOICE in_use=2`, `AUDIO_DEVICE_SINK nonzero>0`). Presentation did not progress in this run: trace contains one `BQP dequeue`/return, no `BQP queue`, and HWC acquire records remain `NoBufferAvailable`.
+
+## 2026-06-07 — core/src/hle/kernel/k_page_table_base.rs, k_memory_block_manager.rs, k_process_page_table.rs, k_capabilities.rs, kernel.rs, and core/src/memory/memory.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/k_page_table_base.cpp, k_page_table_base.h, k_memory_block_manager.cpp, k_memory_block_manager.h, k_capabilities.cpp, kernel.cpp, kernel.h, and core/memory.cpp
+
+### Intentional differences
+- `KPageTableBase::SetupForIpcClient` now returns Rust `(result_code, blocks_needed)` instead of upstream's `Result` plus `size_t* out_blocks_needed`. This preserves the upstream output while avoiding a nullable out-parameter.
+- `KMemoryBlockManager::update_lock_with_allocator(...)` is the allocator-aware Rust counterpart to upstream `KMemoryBlockManager::UpdateLock(KMemoryBlockManagerUpdateAllocator*, ...)`. The existing `update_lock(...)` remains as a compatibility wrapper, but the audited `KPageTableBase` IPC cleanup and device-address-space lock/update paths now use allocator-aware updates with upstream-derived block counts.
+- `KMemoryBlockManager::{update_with_allocator,update_if_match_with_allocator,update_attribute_with_allocator}(...)` are the allocator-aware Rust counterparts to upstream `KMemoryBlockManager::{Update,UpdateIfMatch,UpdateAttribute}(KMemoryBlockManagerUpdateAllocator*, ...)`. `Update` and `UpdateIfMatch` now preserve upstream's per-block loop shape: already-correct blocks only advance the iterator, and split-block allocator slots are consumed only for blocks that will be mutated. The compatibility wrappers remain for older tests/callers, while `MapPhysicalMemory` and `UnmapPhysicalMemory` now count split blocks during their memory-block walk, create the update allocator before page-table mapping/unmapping, and route the final block-manager transition through allocator-aware update paths.
+- `SetupForIpcServer` uses the existing Rust `KScopedResourceReservation`, local RAII guards for partial-page closes, `KScopedPageTableUpdater`, and `PageLinkedList` for map/unmap calls. It also walks the source `PageTable` through Rust `begin_traversal` / `continue_traversal` and coalesces physically contiguous direct-map runs before calling `Operate(Map)`. This matches upstream's resource-reservation, `SCOPE_EXIT`, updater ownership, contiguous-run mapping shape, and `Common::PageTable` page-sized traversal contract.
+- `KPageTableBase` now carries upstream's three page-table light-lock owners (`m_general_lock`, `m_map_physical_memory_lock`, `m_device_map_lock`). `SetupForIpc` acquires source/destination `m_general_lock` through a Rust `KScopedLightLockPair`; `QueryInfo`, `GetSize`, `MapMemory` / `UnmapMemory`, `CleanupForIpcServer` / `CleanupForIpcClient`, `LockMemoryAndOpen` / `UnlockMemory`, and the audited device-address-space lock/unlock helpers acquire `m_general_lock` through `KScopedLightLock` at the upstream guard points. The locks are stored as `Arc<KLightLock>` so RAII guards can hold locks while Rust still mutably borrows the page-table owner, avoiding unsafe self-field borrows.
+- `KPageTableBase::{SetMemoryPermission,SetMemoryAttribute,SetProcessMemoryPermission}` now acquire `m_general_lock`, pre-reserve `KMemoryBlockManagerUpdateAllocator` from the upstream `CheckMemoryState(...)` block count, route page-table operations through `KScopedPageTableUpdater::GetPageList()`, and update memory blocks through allocator-aware block-manager paths. `SetProcessMemoryPermission` also builds a `KPageGroup` before setting executable permission, matching upstream's cache-coherency preparation structure.
+- `KPageTableBase::MapCodeMemory` now follows upstream's update structure more closely: it acquires `m_general_lock`, captures source/destination allocator block counts from validation, creates both `KMemoryBlockManagerUpdateAllocator`s before mutation, builds the source `KPageGroup` before reprotecting source pages, routes source reprotect / alias map / rollback through `KScopedPageTableUpdater::GetPageList()`, and updates source/destination memory blocks through allocator-aware block-manager paths.
+- `KPageTableBase::UnmapCodeMemory` now follows upstream's guarded unmap structure more closely: it acquires `m_general_lock`, validates source/destination state with allocator block counts, builds the destination `KPageGroup`, validates it against the source mapping, creates both block update allocators, routes unmap/reprotect/rollback through `KScopedPageTableUpdater::GetPageList()`, and applies allocator-aware source/destination block updates.
+- `KPageTableBase` now owns upstream's local executable-cache-maintenance side effects for `SetProcessMemoryPermission` and `UnmapCodeMemory`. `StoreDataCache(...)` is represented as the same no-op result helper as upstream's current implementation, while `InvalidateInstructionCache(...)` resolves the Rust owning process through `KernelCore::get_process_by_page_table_base(...)`, a local counterpart to upstream's `KernelCore::GetProcessList()` scan by `GetBasePageTable()` pointer.
+- `KPageTableBase::{InvalidateProcessDataCache,InvalidateCurrentProcessDataCache}` now follow upstream range, `m_general_lock`, memory-state, and page-table traversal validation before returning success. The actual host data-cache invalidation remains a no-op because ruzu has no separate host data cache; upstream's `Svc::InvalidateProcessDataCache` remains `UNIMPLEMENTED`, so this branch does not route SVCs through the page-table method.
+- `KPageTableBase::{SetMaxHeapSize,SetHeapSize,AllocateAndMapPagesImpl,MapPages,UnmapPages}` now follow upstream's guarded update structure for the Rust wrappers: they acquire the relevant upstream page-table locks at the same guard points, allocate new pages through `KPageGroup`, clear each physical page before mapping, reserve a `KMemoryBlockManagerUpdateAllocator` from upstream-derived block counts before mutation, create `KScopedPageTableUpdater`, pass `GetPageList()` into map/unmap operations, and update memory blocks through allocator-aware paths.
+- `KPageTableBase::{MapStatic,MapIo,MapIoRegion,UnmapIoRegion,MapPageGroup,UnmapPageGroup}` now acquire `m_general_lock`, create upstream-shaped block update allocators, route map/unmap operations through `KScopedPageTableUpdater::GetPageList()`, and use allocator-aware block-manager updates. The IO paths now preserve upstream's `KMemoryAttribute::Locked` block state and `UnmapIoRegion` validates that the mapped physical pages match the requested physical range before unmapping.
+- `KCapabilities::MapRegion_` now mirrors upstream `ProcessMapRegionCapability` for the mapped regions used by this port: it skips `KernelTraceBuffer` when KTrace is disabled, maps `OnMemoryBootImage` and `DTB` through their upstream `KMemoryRegionType` constants, and returns `ResultNotFound` for unsupported capability region values. `KPageTableBase::MapRegion` now looks up the first derived physical region in `KernelCore::MemoryLayout()` and delegates to `MapStatic`, converting `ResultInvalidAddress` to `ResultOutOfRange` like upstream's `R_TRY_CATCH`.
+- `KPageTableBase::MakePageGroup` now uses the Rust page-table traversal API and validates heap physical addresses when a kernel owner is installed. Reduced unit-test fixtures without a global `KernelCore` keep the existing permissive validation path because upstream always has `KernelCore&`, while Rust tests can construct bare page tables.
+- `KPageTableBase::MakeAndOpenPageGroup` now follows upstream's range check, `m_general_lock` guard, `FlagReferenceCounted` memory-state validation, `MakePageGroup` call, and `KPageGroup::Open()` reference increment. Rust returns `u32` result codes and routes `Open()` through the current global-kernel page-group owner until `KPageGroup` can store an upstream-equivalent `KernelCore&` directly.
+- `KPageTableBase::UnmapProcessMemory` now owns the upstream destination/source page-table lock ordering, destination `SharedCode` validation, source `FlagCanMapProcess` validation, physical-range compatibility check, update-allocator creation, `KScopedPageTableUpdater` unmap, and destination block update to `Free`. Rust compares coalesced physical runs produced by the existing page-table traversal API instead of using upstream's local `ContiguousRangeInfo` class, preserving the same physical equality contract without raw pointers.
+- `svc::MapProcessMemory` now follows upstream's source/destination page-table route: it resolves the source process from the explicit process handle, uses the current process as destination, calls `MakeAndOpenPageGroup` on the source range, and maps the group into destination `SharedCode` with `UserReadWrite` instead of using the older `MapMemory` stack-alias path.
+- `svc::UnmapProcessMemory` now follows upstream's source/destination page-table route: it resolves the source process from the explicit process handle, uses the current process as destination, validates the same source/destination ranges, and delegates destination unmap through `KProcessPageTable::UnmapProcessMemory(...)` instead of the older same-table `UnmapMemory` path.
+- `svc_process_memory.rs::resolve_process_handle(...)` now resolves explicit process handles by reading the current process handle-table object id and looking it up through `KernelCore::get_process_by_id(...)`, matching the owner route used by upstream `GetObjectWithoutPseudoHandle<KProcess>` while preserving the current Rust handle-table representation.
+- `KProcessPageTable::setup_for_ipc_client(...)` keeps its existing public `u32` result surface and discards `blocks_needed`, because upstream callers outside `KPageTableBase::SetupForIpc` do not consume that out-param in this Rust wrapper layer.
+- `KProcessPageTable` now exposes upstream's thin wrappers for `MakeAndOpenPageGroup`, `UnmapProcessMemory`, `InvalidateProcessDataCache`, `ReadDebugMemory`, and `WriteDebugMemory`, delegating to the corresponding `KPageTableBase` owner methods.
+- `KPageTableBase` and `KProcessPageTable` now expose upstream-shaped signatures for `CopyMemoryFromLinearToUser`, `CopyMemoryFromLinearToKernel`, `CopyMemoryFromUserToLinear`, `CopyMemoryFromKernelToLinear`, `CopyMemoryFromHeapToHeap`, and `CopyMemoryFromHeapToHeapWithoutCheckDestination`. This restores the owner/wrapper surface before the full traversal/copy bodies are ported.
+- `KPageTableBase::CopyMemoryFromLinearToUser` now follows upstream's range check, `m_general_lock` guard, contiguous memory-state check, page-table traversal, contiguous physical-run coalescing, linear-mapped physical validation, aligned `u32`-sized copy split, and final guest-memory write. Rust performs the final physical-to-guest write through `Memory::copy_phys_to_guest`, an owner-local counterpart to upstream's `dst_memory.WriteBlock(dst_addr, GetLinearMappedVirtualPointer(...), size)` call.
+- `KPageTableBase::CopyMemoryFromLinearToKernel` now follows upstream's range check, `m_general_lock` guard, contiguous memory-state check, page-table traversal, contiguous physical-run coalescing, linear-mapped physical validation, and final copy. Rust performs the final copy through `Memory::read_phys_block`, a small owner-local counterpart to the existing physical backing helpers, instead of exposing upstream's raw `GetLinearMappedVirtualPointer(...)` pointer outside the memory owner.
+- `KPageTableBase::CopyMemoryFromUserToLinear` now follows upstream's range check, `m_general_lock` guard, contiguous memory-state check, page-table traversal, contiguous physical-run coalescing, linear-mapped physical validation, aligned `u32`-sized copy split, and guest-to-linear write. Rust performs the final guest-to-physical copy through `Memory::copy_guest_to_phys`, the owner-local counterpart to upstream's `src_memory.ReadBlock(src_addr, GetLinearMappedVirtualPointer(...), size)` call.
+- `KPageTableBase::CopyMemoryFromKernelToLinear` now follows upstream's range check, `m_general_lock` guard, contiguous memory-state check, page-table traversal, contiguous physical-run coalescing, linear-mapped physical validation, and final host-buffer-to-linear copy. Rust performs the final write through `Memory::write_phys_block`, an owner-local counterpart to upstream's `std::memcpy(GetLinearMappedVirtualPointer(...), buffer, size)` call.
+- `KPageTableBase::{CopyMemoryFromHeapToHeap,CopyMemoryFromHeapToHeapWithoutCheckDestination}` now follow upstream's source/destination range checks, `KScopedLightLockPair`, source state validation, optional destination state validation, dual page-table traversal, min-run segmented copy, heap-physical-address validation, and physical heap copy. Rust performs the final heap backing copy through `Memory::copy_phys_to_phys`, an owner-local counterpart to upstream's `std::memcpy(GetHeapVirtualPointer(dst), GetHeapVirtualPointer(src), size)`.
+- `KPageTableBase::{ReadDebugMemory,WriteDebugMemory}` now follow upstream's range check, `m_general_lock` guard, user-permission-or-`FlagCanDebug` validation, page-table traversal, physical-run coalescing, linear-mapped physical validation, aligned `u32`-sized copy split, data-cache store hook, and write-side instruction-cache invalidation. Rust performs the final movement through `Memory::{copy_phys_to_guest,copy_guest_to_phys}` rather than exposing upstream's raw linear-mapped host pointer.
+- `KPageTableBase::{read_block_from_own_page_table,write_block_to_own_page_table}` are Rust-local owner helpers used by `KServerSession` to force the shared `Memory` bridge to resolve virtual message-buffer addresses through the process's own page-table backend. Upstream does this implicitly by calling `KProcessPageTable::GetMemory().GetPointer(...)` from the already-selected source/destination page table. These helpers now propagate failed translated `Memory::read_block` / `write_block` operations instead of returning zero-filled data or success on failed copies; IPC partial-page setup rolls back and returns `ResultInvalidCurrentMemory` when those translated copies fail.
+
+### Unintentional differences (to fix)
+- Rust still represents process handles as opaque `u64` object IDs in `KHandleTable` and resolves them through `KernelCore::get_process_by_id(...)`; upstream stores typed `KAutoObject*` entries and retrieves `KProcess` directly through `GetObjectWithoutPseudoHandle<KProcess>`.
+
+### Missing items
+- None identified for the audited page-table traversal/IPC setup slice.
+
+### Binary layout verification
+- PASS: page-table metadata/control-flow only; no guest-visible raw payload layout changed.
+
+### Tests
+- Re-read upstream `KPageTableBase::SetupForIpcClient`, `KPageTableBase::SetupForIpc`, `KPageTableBase::{CleanupForIpcClient,CleanupForIpcServer}`, `KPageTableBase::{Lock,Unlock}ForDeviceAddressSpace*`, and `KMemoryBlockManager::UpdateLock`.
+- Re-read upstream `common/page_table.cpp::{BeginTraversal,ContinueTraversal}` and `common/page_table.h::TraversalEntry`.
+- Re-read upstream `KScopedLightLockPair`, `KPageTableBase` lock fields, and `KProcess::GetStateLock`.
+- Re-read upstream `KPageTableBase::{CleanupForIpcServer,CleanupForIpcClient}` lock scopes.
+- Re-read upstream `KPageTableBase::{LockMemoryAndOpen,UnlockMemory}` and `KPageTableBase::{LockForMapDeviceAddressSpace,LockForUnmapDeviceAddressSpace,UnlockForDeviceAddressSpace,UnlockForDeviceAddressSpacePartialMap}` lock scopes.
+- Re-read upstream `KPageTableBase::{MapMemory,UnmapMemory}` lock scope, source-state validation, allocator construction, updater page-list routing, rollback, and `MakePageGroup` page-table traversal requirements before updating the reduced Rust unit-test fixtures.
+- Re-read upstream `KPageTableBase::{SetMemoryPermission,SetMemoryAttribute,SetProcessMemoryPermission}` lock, update-allocator, updater page-list, page-group, executable-cache, and block-manager update scopes.
+- Re-read upstream `KPageTableBase::MapCodeMemory` lock, source/destination validation, allocator construction, page-group ordering, updater page-list, rollback, and block-manager update scopes.
+- Re-read upstream `KPageTableBase::UnmapCodeMemory` lock, source/destination validation, allocator construction, destination page-group validation, updater page-list, rollback remap, executable-cache, and block-manager update scopes.
+- Re-read upstream local helpers `InvalidateInstructionCache(...)` and `StoreDataCache(...)` in `k_page_table_base.cpp`.
+- Re-read upstream `KernelCore::GetProcessList()` in `kernel.h` / `kernel.cpp` before routing instruction-cache owner lookup through `KernelCore::get_process_by_page_table_base(...)`.
+- Re-read upstream `KPageTableBase::{InvalidateProcessDataCache,InvalidateCurrentProcessDataCache}` and `svc_cache.cpp::InvalidateProcessDataCache`.
+- Re-read upstream `KProcessPageTable` cache/debug/copy wrapper declarations.
+- Re-read upstream `KPageTableBase::{ReadDebugMemory,WriteDebugMemory}`.
+- Re-read upstream `KPageTableBase::{SetMaxHeapSize,SetHeapSize}` physical-memory/general-lock scopes, shrink/grow ordering, update-allocator construction, updater page-list routing, resource-limit handling, and page-group close scope.
+- Re-read upstream `KPageTableBase::AllocateAndMapPagesImpl`, `KPageTableBase::MapPages`, and `KPageTableBase::UnmapPages` lock, page-group allocation, clear, update-allocator, page-table updater, operation page-list, and block-manager update scopes.
+- Re-read upstream `KPageTableBase::QueryInfo`, `KPageTableBase::QueryPhysicalAddress`, and `KPageTableBase::GetSize` lock scopes.
+- Re-read upstream `KPageTableBase::{MapStatic,MapIo,MapIoRegion,UnmapIoRegion,MapPageGroup,UnmapPageGroup}` lock, update-allocator, page-table updater, physical-range validation, and block-manager update scopes.
+- Re-read upstream `KPageTableBase::MakeAndOpenPageGroup` and `KProcessPageTable::MakeAndOpenPageGroup`.
+- Re-read upstream `KMemoryBlockManager::{UpdateIfMatch,UpdateAttribute}` and `KPageTableBase::MapPhysicalMemory` before routing Rust `MapPhysicalMemory` through allocator-aware `UpdateIfMatch`.
+- Re-read upstream `svc_process_memory.cpp::{MapProcessMemory,UnmapProcessMemory}`, `KPageTableBase::UnmapProcessMemory`, and `KProcessPageTable::UnmapProcessMemory`.
+- Re-read upstream `svc_process_memory.cpp` process-handle resolution through `GetObjectWithoutPseudoHandle<KProcess>` and compared it with the Rust `svc_device_address_space.rs` process-handle resolver.
+- Re-read upstream `KCapabilities::ProcessMapRegionCapability`, `KCapabilities::MapRegion_`, and `KPageTableBase::MapRegion`.
+- `cargo fmt --check`
+- `git diff --check`
+- `cargo check -p core`
+- `cargo test -p core set_process_memory_permission_updates_code_to_code_data -- --nocapture`
+- `cargo test -p core map_and_unmap_code_memory_round_trips_block_state -- --nocapture`
+- `cargo test -p core set_memory_permission_updates_block_permission -- --nocapture`
+- `cargo test -p core make_and_open_page_group_requires_reference_counted_state_and_builds_group -- --nocapture`
+- `cargo test -p core unmap_process_memory_same_table_validates_shared_code_physical_mapping -- --nocapture`
+- `cargo test -p core explicit_process_handle_resolves_current_process_id -- --nocapture`
+- `cargo test -p core non_process_object_handle_is_rejected -- --nocapture`
+- `cargo test -p core process_memory_resolver_rejects_pseudo_and_zero_handles -- --nocapture`
+- `cargo test -p core query_info_out_of_range_returns_inaccessible_terminal_block -- --nocapture`
+- `cargo test -p core set_memory_attribute_permission_locked_requires_permission_lock_capability -- --nocapture`
+- `cargo test -p core map_memory_updates_destination_block_state_to_stack -- --nocapture`
+- `cargo test -p core test_update_if_match_with_allocator_only_updates_matching_range -- --nocapture`
+- `cargo test -p core test_update_with_allocator_skips_already_matching_range_without_splitting -- --nocapture`
+- `cargo test -p core test_update_if_match_skips_already_target_range_without_splitting -- --nocapture`
+- Manual MK8D diagnostic after propagating translated page-table read/write failures (`/tmp/ruzu_mk8d_page_table_sigusr1_20260607_154228.log`, isolated XDG dirs, `RUST_LOG=info`, 80s timeout): no `0x0000D401`, no `BreakLoopNullPc`, no `Invalid DeviceFD`, audio renderer starts, and SurfaceFlinger reaches `SF_COMPOSE #23781` with active `COMPOSING` records. The remaining runtime failure is now `SetTerminateResult=0xe401` (`Kernel::ResultInvalidHandle`) followed by `svcBreak` at `PC=0x01D504D4` / `LR=0x01CE5A00`.
+- `cargo test -p core unmap_memory_restores_original_source_state -- --nocapture`
+- `cargo test -p core run_bootstraps_process_owned_main_thread -- --nocapture`
+- `cargo test -p core set_heap_size_maps_heap_region_in_page_table -- --nocapture`
+- `cargo test -p core setup_for_ipc_client_changes_permissions_without_locking_until_server_success -- --nocapture`
+- `cargo test -p core setup_and_cleanup_for_ipc_server_account_partial_page_backend_cost -- --nocapture`
+- `cargo test -p core setup_for_ipc_server_direct_map_preserves_contiguous_physical_run -- --nocapture`
+- `cargo test -p core scoped_light_lock_pair -- --nocapture`
+- `cargo test -p core build_ipc_partial_page -- --nocapture`
+- `cargo test -p core invalidate_data_cache_validates_range_state_and_mapping -- --nocapture`
+- `cargo test -p core copy_memory_from_linear_to_kernel_validates_and_reads_physical_backing -- --nocapture`
+- `cargo test -p core copy_memory_from_linear_to_user_writes_destination_guest_memory -- --nocapture`
+- `cargo test -p core copy_memory_from_user_to_linear_writes_linear_physical_backing -- --nocapture`
+- `cargo test -p core copy_memory_from_kernel_to_linear_writes_linear_physical_backing -- --nocapture`
+- `cargo test -p core copy_memory_from_heap_to_heap_copies_physical_backing -- --nocapture`
+- `cargo test -p core copy_memory_from_heap_to_heap_without_check_destination_skips_dst_state -- --nocapture`
+- `cargo test -p core read_debug_memory_copies_linear_backing_to_guest_memory -- --nocapture`
+- `cargo test -p core write_debug_memory_accepts_debuggable_non_writable_memory -- --nocapture`
+- Manual MK8D OpenGL 100s smoke after `KProcess::GetMemory()` / `ReceiveRequest(server_message_paddr)` parity (`/tmp/ruzu_mk8d_page_table_20260607_133958.log`, isolated XDG dirs, `RUST_LOG=info`): reached `am::NotifyRunning`; logged 183 `nvmap::IocAlloc` calls with no `result=0x0000D401`, no `BreakLoopNullPc`, no `Invalid DeviceFD`, no `unmapped GPU`, and no panic. SurfaceFlinger logged 420 compose records but only 2 `COMPOSING` records, then mostly `NO_LAYERS`, so runtime boot progressed but late presentation remains incomplete.
+- Manual MK8D OpenGL 100s smoke after source/destination `MapProcessMemory` / `UnmapProcessMemory` SVC split (`/tmp/ruzu_mk8d_page_table_smoke_20260607_141830.log`, isolated XDG dirs, `RUST_LOG=info`): reached `am::NotifyRunning`; logged 690 `nvmap::IocAlloc` calls with no `result=0x0000D401`, no `BreakLoopNullPc`, no `Invalid DeviceFD`, no `unmapped GPU`, and no panic. SurfaceFlinger logged 161 compose records with 1 `COMPOSING` and 160 `NO_LAYERS`, so the nvmap/null-PC regression remains absent but late presentation is still incomplete.
+- Manual MK8D OpenGL 100s smoke after `WaitSynchronization` handle-array copy moved fully to process-owned `Memory` (`/tmp/ruzu_mk8d_page_table_waitsync_20260607_145515.log`, isolated XDG dirs, `RUST_LOG=info`): reached `am::NotifyRunning`; no `result=0x0000D401`, no `BreakLoopNullPc`, no `Invalid DeviceFD`, no panic, and no logged `WaitSynchronization` invalid-handle regression. SurfaceFlinger logged 855 compose records with 456 `COMPOSING` and 399 `NO_LAYERS`, so runtime presentation remains active through the timeout.
+- Manual MK8D OpenGL 100s smoke after final page-table audit cleanup (`/tmp/ruzu_mk8d_page_table_final_20260607_150940.log`, isolated XDG dirs, `RUST_LOG=info`): reached `am::NotifyRunning`; logged 183 `nvmap::IocAlloc` calls with no `result=0x0000D401`, no `BreakLoopNullPc`, no `Invalid DeviceFD`, no `unmapped GPU`, and no panic. The run only reached early presentation (`SF_COMPOSE=41`, `COMPOSING=12`, `NO_LAYERS=29`) before timeout because info-level condition-variable tracing still slows this smoke substantially.
+- Manual MK8D OpenGL 100s low-log smoke after the same cleanup (`/tmp/ruzu_mk8d_page_table_warn_20260607_151147.log`, isolated XDG dirs, `RUST_LOG=warn`): no `result=0x0000D401`, no `BreakLoopNullPc`, no `Invalid DeviceFD`, no `unmapped GPU`, and no panic were logged before timeout. Warn-level logging is too sparse to prove `NotifyRunning` or late visual progress from the log alone, so this is only no-obvious-crash evidence.
+
+## 2026-06-07 — core/src/hle/service/hle_ipc.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/hle_ipc.cpp and hle_ipc.h
+
+### Intentional differences
+- Rust `WriteBufferB/C` now routes through `Memory::write_block(...)`, matching upstream `memory.WriteBlock(...)`. Rust `Memory::write_block(...)` first prefers page-table physical backing when available and falls back to the translated host pointer for reduced fixtures; this keeps upstream rasterizer write side effects while avoiding Rust host faults on protected translated mappings.
+- `HLERequestContext::new_with_thread(...)` now obtains its memory bridge through `KProcess::get_memory()`, matching upstream `client_thread->GetOwnerProcess()->GetMemory()` ownership rather than reaching directly into the page-table field. The accessor still falls back to page-table memory for reduced Rust fixtures, as documented in the `KProcess` entry.
+- The env-gated `RUZU_TRACE_WRITE_BLOCK_AT=0x...` attribution remains Rust-only diagnostic metadata and is inactive by default.
+
+### Unintentional differences (to fix)
+- Upstream `HLERequestContext` stores a direct `Core::Memory::Memory&`; Rust still stores an optional `Arc<Mutex<Memory>>` bridge because process/shared-memory lifecycle ownership is not yet literal upstream.
+
+### Missing items
+- Remove the optional/legacy `HLERequestContext` memory bridge once process/shared-memory lifecycle always installs the upstream-shaped process-owned `Memory` owner.
+
+### Binary layout verification
+- PASS: IPC copy policy only; no guest-visible raw payload layout changed.
+
+### Tests
+- Re-read upstream `hle_ipc.cpp::{WriteBuffer,WriteBufferB,WriteBufferC}` and `hle_ipc.h`.
+- Re-read upstream `memory.cpp::WriteBlockImpl` and `memory.h::WriteBlock`.
+- `cargo fmt --check`
+- `cargo check -p core`
+- `cargo test -p core hle_ipc -- --nocapture`
+
+## 2026-06-07 — core/src/hle/kernel/svc/svc_thread.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/svc/svc_thread.cpp
+
+### Intentional differences
+- Runtime `CreateThread` follows upstream ownership for user stacks: it forwards the guest-provided `stack_bottom`/`user_stack_top` into `KThread::InitializeUserThread` and does not create or probe stack mappings in the SVC owner. The reduced Rust unit-test fixture pre-seeds one `KThreadLocalPage` because it does not run the full kernel memory-manager allocation path used by upstream TLS page creation.
+- `KProcess` now owns upstream's `m_state_lock` / `m_list_lock` as `Arc<KLightLock>` fields, and `CreateThread` acquires `m_state_lock` through `KScopedLightLock` around `KThread::InitializeUserThread(...)`. The `Arc` wrapper preserves safe Rust access from the `ProcessLock` owner without holding the process cell borrow across thread initialization.
+- `KProcess::run(...)` aligns `stack_size` to `PageSize` before reserving/mapping stack pages, matching upstream `KProcess::Run`. The Rust method is still invoked through the exclusive `ProcessLock` owner rather than taking `m_state_lock` around the whole bootstrap; a literal `KScopedLightLock` guard in this path currently interacts badly with ruzu's host/current-thread lock model, while `CreateThread` uses the upstream state-lock guard where concurrent user-thread creation can occur.
+- Three direct `SleepThread` unit tests remain ignored because they require a fully kernel-owned current-core/scheduler fixture. The runtime SVC path is unchanged by this test-only annotation.
+
+### Unintentional differences (to fix)
+- None identified for the audited `CreateThread` state-lock/user-stack ownership slice.
+
+### Missing items
+- Build a full scheduler/current-core test fixture for direct `SleepThread` yield/sleep tests so those ignored tests can be re-enabled without local scheduler shortcuts.
+
+### Binary layout verification
+- PASS: SVC control-flow and test-fixture changes only; no guest-visible raw payload layout changed.
+
+### Tests
+- Re-read upstream `svc_thread.cpp::CreateThread`, `svc_thread.cpp::SleepThread`, and `k_process.cpp::Run`.
+- Re-read upstream `KProcess::GetStateLock`.
+- `cargo fmt --check`
+- `cargo check -p core`
+- `cargo test -p core run_bootstraps_process_owned_main_thread -- --nocapture`
+- `cargo test -p core svc_thread -- --nocapture`
+- `cargo build --release --bin ruzu-cmd`
+- Manual MK8D OpenGL 90s smoke with isolated XDG dirs (`/tmp/ruzu_mk8d_page_table_final_20260607_110403.log`, `RUST_LOG=info`): reached `am::NotifyRunning`, produced 332 `SF_COMPOSE` records through timeout, and logged no `Invalid DeviceFD`, `unmapped GPU`, or `BreakLoopNullPc` warnings.
+- Manual MK8D OpenGL 90s smoke after `SetMemoryPermission` / `SetMemoryAttribute` updater-scope parity (`/tmp/ruzu_mk8d_page_table_setattr_rerun_20260607_111548.log`, `RUST_LOG=info`): reached `am::NotifyRunning`, produced 308 `SF_COMPOSE` records with 159 `COMPOSING` records through timeout, and logged no `Invalid DeviceFD`, `unmapped GPU`, or `BreakLoopNullPc` warnings.
+
 ## 2026-06-07 — core/src/hle/service/nvdrv/devices/nvhost_as_gpu.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/nvdrv/devices/nvhost_as_gpu.cpp and nvhost_as_gpu.h
 
 ### Intentional differences
@@ -89,7 +372,7 @@
 - Rust native unit tests now import the current lock wrapper aliases (`KThreadLock`, `ProcessLock`) and moved helper types (`KPort`, `Event`, ioctl payload structs) from their actual Rust owner modules. Upstream does not have these Rust test modules; this is test-harness wiring only and does not change runtime kernel/service behavior.
 - One Rust test assertion now imports `RESULT_SUCCESS` from `crate::hle::result`, matching the current Rust owner for the global success result. Upstream uses its native result constants and has no `svc_results::RESULT_SUCCESS` equivalent in this Rust module layout.
 - Rust `CoreTiming` native tests now use the current `Arc<CoreTiming>::initialize(...)` ownership and locked `CoreTimingState` queue access instead of stale direct fields / removed `start_timer_thread(...)`.
-- Older Rust tests that still expected `KProcess::read_block/write_block` now compile through a `#[cfg(test)]` compatibility bridge delegating to the current `read_memory_vec` / `write_memory` process-memory owner path. This is test-only and does not expose the old helper in runtime builds.
+- Older Rust tests that still expected `KProcess::read_block/write_block` now compile through a `#[cfg(test)]` compatibility bridge. It uses the upstream-shaped `Core::Memory::Memory` owner when the process page table has one and falls back to `ProcessMemoryData` only for reduced native fixtures that construct bare `KProcess` objects. This is test-only and does not expose the old helper in runtime builds.
 - Rust `KServerSession`, `KSessionRequest`, and `KHardwareTimer` tests now use current owner wrappers (`ProcessLock`, `KThreadLock`, `Arc<CoreTiming>`) instead of stale `Arc<Mutex<_>>` wrappers.
 
 ### Unintentional differences (to fix)
@@ -568,7 +851,7 @@
 ### Intentional differences
 - Upstream `KProcess::AddSharedMemory` opens the raw `KSharedMemory*`; ruzu stores shared-memory kernel objects in `Arc`, so the Rust port preserves the per-process `KSharedMemoryInfo` refcount but relies on existing Arc ownership for object lifetime.
 - `KProcess::AddSharedMemory` cannot currently fail allocation in ruzu because `KSharedMemoryInfo` is stored in a `BTreeMap` rather than a slab allocator. The method still returns `ResultCode` to preserve upstream call ordering.
-- Ruzu logs additional page-table region details when `MapSharedMemory` rejects a range. Upstream only traces the SVC call; the extra logging is host-side diagnostics and does not alter validation behavior.
+- Ruzu keeps debug-level page-table region diagnostics when `MapSharedMemory` rejects a range. Upstream only traces the SVC call; the extra logging is host-side diagnostics and does not alter validation behavior or warn/error-level runtime timing.
 
 ### Binary layout verification
 - N/A: kernel object lifecycle tracking only. No guest-visible raw payload layout changed.
@@ -701,7 +984,7 @@
 ## 2026-06-03 — core/src/hle/kernel/svc/svc_shared_memory.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/svc/svc_shared_memory.cpp
 
 ### Intentional differences
-- Ruzu logs additional page-table region details when `MapSharedMemory` rejects a range. Upstream only traces the SVC call; the extra logging is host-side diagnostics and does not alter normal behavior.
+- Ruzu keeps debug-level page-table region diagnostics when `MapSharedMemory` rejects a range. Upstream only traces the SVC call; the extra logging is host-side diagnostics and does not alter normal behavior or warn/error-level runtime timing.
 
 ### Binary layout verification
 - N/A: SVC validation and kernel object tracking only. No guest-visible raw payload layout changed.
@@ -830,13 +1113,13 @@
 ## 2026-06-03 — core/src/hle/kernel/svc/svc_shared_memory.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/svc/svc_shared_memory.cpp
 
 ### Intentional differences
-- Ruzu keeps additional diagnostic logging around invalid shared-memory handles and rejected address regions. Upstream only emits trace-level SVC logging. These diagnostics are host-only and do not change default SVC semantics.
+- Ruzu keeps additional diagnostics around invalid shared-memory handles and rejected address regions. Invalid-handle diagnostics remain error-level because they indicate a non-recoverable kernel object mismatch; region-rejection layout diagnostics are debug-level because games can legitimately retry outside heap/alias. Upstream only emits trace-level SVC logging. These diagnostics are host-only and do not change default SVC semantics.
 
 ### Binary layout verification
 - N/A: SVC validation/result-code behavior only. No guest-visible raw payload layout changed.
 
 ### Tests
-- Attempted `cargo test -p core failed_shared_memory_region_uses_upstream_result -- --nocapture`, but the crate's current test build still fails on pre-existing test-only errors before running this test (stale `CoreTiming` APIs, older tests that still call removed `KProcess::read_block/write_block` helpers directly, stale `GuestMemory::new` signatures, private test fields, etc.).
+- `cargo test -p core map_shared_memory_overflow_uses_invalid_current_memory -- --nocapture`
 - `cargo check -p core`
 
 ## 2026-06-03 — video_core/src/host1x/vic.rs vs /home/vricosti/Dev/emulators/zuyu/src/video_core/host1x/vic.cpp and vic.h
@@ -2095,7 +2378,7 @@
 ## 2026-03-23 — core/src/hle/kernel/k_process.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/k_process.cpp
 
 ### Intentional differences
-- Rust still uses the existing `map_pages_find_free` / cooperative thread bootstrap path in `run()` because the full upstream `MapPages`/cleanup scaffolding is not ported yet, but the resource-limit ownership and release points now live in the correct upstream owner file and follow the same lifecycle.
+- Rust still routes `KProcess::Run()` main-thread stack allocation through the `KProcessPageTable::map_pages_find_free(...)` wrapper, while upstream calls the C++ page-table owner directly. The page-table wrapper now follows upstream `MapPages` lock/updater/allocator structure; the remaining difference is in the surrounding `KProcess::Run()` cleanup scaffolding.
 
 ### Missing items
 - `KProcess::Run()` still does not mirror the upstream cleanup scaffolding (`ON_RESULT_FAILURE` unmap path and adjacent ownership details) one-for-one.
@@ -2548,15 +2831,7 @@
 - None in this older device-ioctl slice; continue auditing the newer `NvCore::NvMap` / Host1x device-memory entries for remaining owner-reference and compressed-table parity work.
 
 ### Binary layout verification
-- PASS: `IocAllocParams` layout unchanged; fixed only post-allocation lifecycle behavior.
-
-## 2026-03-28 — `core/src/hle/kernel/k_page_table_base.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/k_page_table_base.cpp`
-
-### Intentional differences
-- Rust still does not model upstream allocator RAII helpers such as `KMemoryBlockManagerUpdateAllocator`; it uses the existing `update_lock(...)` API in the matching owner file instead.
-
-### Binary layout verification
-- PASS: no raw struct layout affected; fixed kernel memory-state transition behavior only.
+- PASS: `IocAllocParams` layout unchanged; this entry only concerns post-allocation lifecycle behavior.
 
 ## 2026-03-28 — `core/src/hle/service/nvdrv/core/syncpoint_manager.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/hle/service/nvdrv/core/syncpoint_manager.cpp`
 
@@ -2795,7 +3070,7 @@
 ## 2026-03-29 — `core/src/hle/kernel/k_page_table_base.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/k_page_table_base.{h,cpp}`
 
 ### Intentional differences
-- Rust still lacks the full upstream `QueryInfoImpl` locking and page-table internals; this pass only realigns the public `QueryInfo` out-of-range contract.
+- Rust still lacks the full upstream `QueryInfoImpl` page-table internals; the public `QueryInfo` out-of-range contract is aligned, and in-range queries now acquire `m_general_lock` before dispatching to `QueryInfoImpl`.
 
 ### Binary layout verification
 - PASS: `KMemoryInfo` layout unchanged; only the returned synthesized values changed.
@@ -2810,17 +3085,6 @@
 
 ### Binary layout verification
 - PASS: `MemoryInfo` serialization format is unchanged; only the source values now follow upstream for out-of-range queries.
-
-## 2026-03-29 — `core/src/hle/kernel/k_page_table_base.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/k_page_table_base.{h,cpp}`
-
-### Intentional differences
-- Rust still lacks the full upstream lock/updater allocator scaffolding around `SetMemoryAttribute`; this pass only restores the same state-validation contract inside the existing owner method.
-
-### Missing items
-- The full upstream `KScopedLightLock`, `KMemoryBlockManagerUpdateAllocator`, and `KScopedPageTableUpdater` ownership/lifecycle around `SetMemoryAttribute` are still not mirrored exactly in Rust.
-
-### Binary layout verification
-- PASS: no guest-visible struct layout changed; only the state-validation path now matches upstream for `PermissionLocked`.
 
 ## 2026-03-29 — `video_core/src/gpu.rs` vs `/home/vricosti/Dev/emulators/zuyu/src/video_core/gpu.{h,cpp}`
 
@@ -4248,18 +4512,6 @@
 ### Binary layout verification
 - PASS: proxy lookup/control-flow only; no raw serialized structs changed.
 
-## 2026-04-02 — core/src/hle/kernel/svc/svc_thread.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/svc/svc_thread.cpp
-
-### Intentional differences
-- Rust now maps a fallback 1 MiB `Stack` region under the guest-supplied `stack_bottom` when `CreateThread` receives a stack pointer that still lives in a `Free` page-table region. Upstream does not do this; it trusts user mode to provide already-mapped stack memory. This is a bounded compatibility stopgap to recover MK8D worker-thread stack visibility while the earlier user-mode stack allocation parity gap remains unresolved.
-- The fallback mapping preserves any preexisting bytes already present in the underlying guest memory backing. This intentionally avoids clearing startup metadata that user mode may already have written near `stack_top` before the page-table mapping became visible.
-
-### Unintentional differences (to fix)
-- The fallback stack mapping above indicates some earlier process/user-mode stack allocation path is still structurally wrong; once that owner is fixed, this eager mapping should be removed.
-
-### Binary layout verification
-- PASS: no serialized structs changed; this slice only changes runtime stack mapping behavior in the matching owner.
-
 ## 2026-04-01 — core/src/hle/service/am/service/application_functions.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/am/service/application_functions.cpp and /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/am/service/application_functions.h
 
 ### Intentional differences
@@ -4734,11 +4986,10 @@
 ## 2026-04-02 — core/src/hle/kernel/k_page_table_base.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/k_page_table_base.cpp
 
 ### Intentional differences
-- Rust still does not model upstream `KScopedLightLock`, `KMemoryBlockManagerUpdateAllocator`, or `KScopedPageTableUpdater` as separate RAII owner types. The equivalent ordering remains inside the owner methods in `k_page_table_base.rs`.
+- Rust has local counterparts for upstream `PageLinkedList`, `KScopedPageTableUpdater`, and `KMemoryBlockManagerUpdateAllocator`, but page-table storage still lives in Rust vectors rather than upstream-owned page-table pages. `FinalizeUpdate(...)` therefore drains a Rust deferred-free list without freeing real page-table pages.
 
 ### Unintentional differences (to fix)
-- `make_page_group(...)` currently walks the Rust `PageTable` one page at a time through `get_physical_address(...)` instead of using upstream traversal helpers and block-info manager ownership. Behavior is closer to upstream, but the internal structure is still simplified.
-- The current Rust backend still does not model upstream `KScopedLightLockPair`, `KScopedPageTableUpdater`, or `KMemoryBlockManagerUpdateAllocator` literally. Lock/update internals remain simplified.
+- Several older page-table update call sites still use simplified lock/update scopes even though Rust now has local counterparts for `KScopedLightLock`, `KScopedLightLockPair`, `KScopedPageTableUpdater`, and `KMemoryBlockManagerUpdateAllocator`.
 
 ### Missing items
 - None identified for the audited IPC client setup failure-cleanup slice.
@@ -4747,8 +4998,7 @@
 - PASS: page-table remap behavior only; no guest-visible struct layout changed.
 
 ### Tests
-- Re-read upstream `KPageTableBase::Operate(..., OperationType::Map)`, `KPageTableBase::AllocateAndMapPagesImpl`, and `KPageTableBase::SetupForIpcServer` before aligning heap-page reference opening and temporary `AllocateAndOpenContinuous(...)` cleanup in Rust.
-- Re-read upstream `KPageTableBase::SetupForIpcClient`, `SetupForIpc`, and `CleanupForIpcClientOnServerSetupFailure` before aligning Rust's order to change client permissions first, call `SetupForIpcServer`, then apply `LockForIpc` only after server setup succeeds.
+- Re-read upstream `KPageTableBase::Operate(..., OperationType::Map)`, `KPageTableBase::AllocateAndMapPagesImpl`, and `KPageTableBase::SetupForIpcServer` before aligning heap-page reference opening and IPC server mapping cleanup in Rust.
 - `cargo fmt --check`
 - `git diff --check`
 - `cargo check -p core`
@@ -4769,9 +5019,6 @@
 
 ### Intentional differences
 - Rust still carries targeted bootstrap diagnostics in this owner while the thread-start/sleep parity work is in flight. The owner remains correct: thread SVC behavior stays in `svc_thread.rs`.
-
-### Unintentional differences (to fix)
-- `CreateThread` still contains Rust-only fallback stack probing/mapping (`ensure_user_stack_mapping(...)`) that does not exist upstream and should be removed once the real stack mapping bug is fully understood in the correct owner.
 
 ### Binary layout verification
 - PASS: SVC control-flow only; no guest-visible struct layout changed.
@@ -6491,21 +6738,10 @@
 ### Binary layout verification
 - PASS: service bootstrap wiring only; no raw serialized struct layout changed.
 
-## 2026-04-10 — `core/src/hle/kernel/svc/svc_thread.rs` vs `src/core/hle/kernel/svc/svc_thread.cpp`
-
-### Intentional differences
-- Rust still carries the temporary fallback stack mapping helper `ensure_user_stack_mapping(...)` in this owner. Upstream trusts user mode to provide mapped stack pages; Rust keeps the compatibility stopgap local to `svc_thread.rs` until the real stack-owner bug is fully closed.
-
-### Unintentional differences (to fix)
-- Rust still does not take the upstream `KScopedLightLock` on the process state lock around `InitializeUserThread(...)` because `KProcess` does not yet expose a literal `m_state_lock` owner in a reusable way.
-
-### Binary layout verification
-- PASS: thread-creation control flow only; no raw serialized struct layout changed.
-
 ## 2026-04-10 — `core/src/hle/kernel/k_page_table_base.rs` vs `src/core/hle/kernel/k_page_table_base.cpp`
 
 ### Intentional differences
-- Rust still uses the simplified local `operate(...)` path without upstream `KScopedLightLock`, `KScopedPageTableUpdater`, or explicit memory-block update allocators in this owner. The page-table behavior remains file-local, but these lifecycle helpers are still structurally flatter than upstream.
+- Rust now has page-table lock owners and a `KScopedLightLockPair` counterpart for the audited `SetupForIpc` path. Several other page-table methods now use Rust counterparts for `KScopedPageTableUpdater` and `KMemoryBlockManagerUpdateAllocator`, but helper coverage remains incomplete across the full `KPageTableBase` surface.
 
 ### Unintentional differences (to fix)
 - None identified in the audited `UnmapMemory(...)` destination permission slice. Upstream captures `dst_perm` from `CheckMemoryState(...)` but does not use it after validation; Rust likewise captures the output as `_out_dst_perm` and applies the same destination transition to unmapped/none permissions.
@@ -11948,10 +12184,9 @@
 
 ### Intentional differences
 - IPC TLS padding/writeback now uses `Memory::write_32_no_rasterizer`. Upstream `RequestHelperBase::Skip(..., set_to_null=true)` zeroes padding in the command buffer and `HLERequestContext::WriteToOutgoingCommandBuffer` writes the translated command buffer back to TLS via `Memory::WriteBlock`. In ruzu these writes are emitted as per-word writes through a global `Mutex<Memory>`; notifying the rasterizer while holding that lock can deadlock against the GPU thread's shader-registration path. TLS command-buffer writes are host IPC bookkeeping, not guest CPU writes to GPU-visible resources.
-- IPC `WriteBufferB/C` now routes through `Memory::write_block_no_rasterizer` for the same Rust host-lock reason. Upstream `HLERequestContext::WriteBufferB/C` calls `Memory::WriteBlock`; ruzu still writes the same bytes to the same guest addresses, but avoids entering rasterizer callbacks while an HLE service holds `Mutex<Memory>`.
 
 ### Missing items
-- Longer-term parity should eliminate the global `Mutex<Memory>` lock inversion so HLE `WriteBlock` can follow upstream side effects more literally without per-call bypasses.
+- Longer-term parity should eliminate the global `Mutex<Memory>` lock inversion so TLS command-buffer writeback can follow upstream `Memory::WriteBlock` side effects more literally without per-word bypasses.
 
 ### Binary layout verification
 - PASS: command-buffer word layout is unchanged. The same little-endian `u32` values are written to the same TLS offsets; only the rasterizer side-effect is skipped.
@@ -13696,18 +13931,16 @@ The following still panic because upstream either also throws NotImplementedExce
 - `svc_device_address_space.rs` resolves the `KDeviceAddressSpace` object and validated process handle through an owner-local helper shared by `MapDeviceAddressSpaceByForce`, `MapDeviceAddressSpaceAligned`, and `UnmapDeviceAddressSpace`. Upstream repeats the `GetObject<KDeviceAddressSpace>` / `GetObject<KProcess>` shape in each SVC; the Rust helper is mechanical and keeps the remaining opaque-handle adaptation in one place.
 - `MapDeviceAddressSpace*` / `UnmapDeviceAddressSpace` now resolve explicit process handles by treating the opaque handle-table object id as the target `KProcess::process_id` and looking it up through `KernelCore::get_process_by_id(...)`. This preserves upstream's `GetObject<KProcess>(process_handle)` target-page-table ownership without requiring the full `KHandleTable` typed-object refactor in this slice.
 - `KDeviceAddressSpace::map` now decodes `MapDeviceAddressSpaceOption::flags`, enforces the upstream `m_space_address/m_space_size` device range, routes `MapDeviceAddressSpaceByForce` / `MapDeviceAddressSpaceAligned` through `lock_for_map_device_address_space(..., check_heap=true)`, and routes `UnmapDeviceAddressSpace` through `lock_for_unmap_device_address_space(..., check_heap=true)` plus `unlock_for_device_address_space`, matching the upstream page-table lock/unlock policy.
-- `KPageTableBase::map_physical_memory` now follows upstream's state policy: it counts any non-`Free` block as already mapped and maps only `Free` subranges. `UnmapPhysicalMemory` keeps upstream's stricter `Free` or `Normal`/attribute-none validation and unmaps only `Normal` subranges. Rust still expresses this with raw result codes and existing block-manager helpers rather than upstream's `R_TRY`/`KScopedLightLock` syntax.
+- `KPageTableBase::map_physical_memory` now follows upstream's state policy: it counts any non-`Free` block as already mapped and maps only `Free` subranges. `UnmapPhysicalMemory` keeps upstream's stricter `Free` or `Normal`/attribute-none validation and unmaps only `Normal` subranges. Both methods now acquire the upstream physical-memory and general page-table light-locks at the audited scopes, count update-allocator blocks from the same boundary checks as upstream, and create their update allocator before the page-table updater. Rust still expresses this with raw result codes rather than upstream's `R_TRY` syntax.
 - Added a focused `KPageTableBase::InitializeForProcess` / `CanContain(Shared)` regression for 32-bit-no-map layout. MK8D's first shared-memory candidate at `0xB9004000` is inside the folded heap and must be rejected, while the guest retry at `0xD5C04000` is outside heap and valid. This matches upstream `CanContain` and prevents treating that retry pattern as a page-table bug.
 
 ### Unintentional differences (to fix)
 - `KHandleTable` still stores opaque `u64` ids instead of `KAutoObject*`, so `KDeviceAddressSpace` needs a parallel `KProcess` registry rather than being retrieved generically through `GetObject<KDeviceAddressSpace>`.
 - `KDeviceAddressSpace` still does not own an actual kernel `KLightLock`; Rust currently serializes the object through the `Arc<Mutex<KDeviceAddressSpace>>` registry owner instead.
-- `KPageTableBase::{map,unmap}_physical_memory` still do not use real `m_map_physical_memory_lock` / `m_general_lock` light-lock ownership or allocator pre-reservation sized by the exact upstream boundary split count; the Rust block-manager update helpers allocate through the current slab wrapper.
 
 ### Missing items
 - Refactor `KHandleTable` toward typed kernel-object storage, or add a broader typed-object registry layer, so `GetObject<KDeviceAddressSpace>` and `GetObject<KProcess>` parity does not require SVC-specific side registries.
 - Add a real per-object lock equivalent for `KDeviceAddressSpace::m_lock` once the kernel lock/borrow model can express locking an object while mutating the target page table.
-- Port the full upstream page-table light-lock and exact update-allocator lifecycle for `MapPhysicalMemory` / `UnmapPhysicalMemory`.
 
 ### Binary layout verification
 - N/A: page-table method signature and host-side call policy only. No guest-visible ioctl payload layout changed.
@@ -15045,22 +15278,6 @@ The following still panic because upstream either also throws NotImplementedExce
 - `cargo check -p core`
 - MK8D runtime check: default boot reaches `NotifyRunning` and frame 1200 without requiring `RUZU_INLINE_IPC=1`.
 
-## 2026-05-31 — core/src/hle/service/hle_ipc.rs and core/src/memory/memory.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/hle_ipc.cpp and /home/vricosti/Dev/emulators/zuyu/src/core/memory.cpp
-
-### Intentional differences
-- `HLERequestContext::write_guest_memory` now validates that IPC output buffers are user-writable before writing: upstream relies on the kernel/page-table path to make invalid output buffers fail safely, while ruzu previously could drive a host `memcpy` into protected backing memory and crash.
-- IPC output writes use `Memory::write_block_no_rasterizer_checked`, a Rust defensive adaptation that copies through `process_vm_writev`: this preserves the no-rasterizer side effect of the HLE path but converts inaccessible host pages into an error return instead of process SIGSEGV. A one-shot fast path writes the whole contiguous range; the page loop is only fallback.
-
-### Unintentional differences (to fix)
-- The checked IPC write path is more defensive than upstream and may hide a deeper page-table/backing-protection race. The root cause should still be audited in `Memory::get_pointer_impl` / page protection transitions.
-
-### Binary layout verification
-- N/A: memory-copy policy only. No guest-visible raw payload layout changed.
-
-### Tests
-- `cargo check -p core`
-- MK8D runtime check with frame-pointer release build: previous `IStorage::Read -> HLERequestContext::write_buffer_b` SIGSEGV no longer reproduces in a 45s run.
-
 ## 2026-05-31 — core/src/hle/service/filesystem/fsp/fs_i_storage.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/filesystem/fsp/fs_i_storage.cpp
 
 ### Intentional differences
@@ -15599,7 +15816,7 @@ The following still panic because upstream either also throws NotImplementedExce
 - `svc_dispatch.rs` now routes A32/A64 `QueryMemory` through `svc_query_memory::query_memory(...)`, and `svc_query_memory.rs` now serializes `KMemoryInfo::get_svc_memory_info()`. This matches upstream's `QueryMemory -> QueryProcessMemory -> KMemoryInfo::GetSvcMemoryInfo()` path and removes the older local partial `query_memory_info` conversion.
 - `KMemoryInfo::get_svc_memory_info()` masks memory attributes and permissions with the user masks, preserving ipc/device counts, matching upstream `KMemoryInfo::GetSvcMemoryInfo()`.
 - `svc_ipc.rs` keeps host-thread IPC routing env-gated. `IHOSBinderDriver` was temporarily routed through the owning `ServerManager` by default in this investigation, but the later 2026-06-05 IPC entry records why that default was reverted to opt-in.
-- Added env-gated diagnostics for MK8D investigation: `RUZU_TRACE_IOCALLOC_CTX=1` in `nvdrv_interface.rs` prints the nvmap alloc IPC buffer descriptors, and `RUZU_TRACE_PHYS_MEMORY=1` in `svc_physical_memory.rs` prints Map/UnmapPhysicalMemory calls and results. These are inactive by default and do not change guest-visible behavior.
+- Added env-gated diagnostics for MK8D investigation: `RUZU_TRACE_IOCALLOC_CTX=1` in `nvdrv_interface.rs` prints the nvmap alloc IPC buffer descriptors, `RUZU_TRACE_PHYS_MEMORY=1` in `svc_physical_memory.rs` prints Map/UnmapPhysicalMemory calls and results, and `RUZU_TRACE_INVALID_HANDLE_SVC=1` in `svc_dispatch.rs` logs only SVC returns whose result register is `ResultInvalidHandle`. These are inactive by default and do not change guest-visible behavior.
 
 ### Unintentional differences (to fix)
 - `svc_dispatch.rs` still owns A32/A64 SVC dispatch glue directly rather than matching upstream's generated/typed SVC wrapper layout.
@@ -15649,6 +15866,7 @@ The following still panic because upstream either also throws NotImplementedExce
 - `MapPhysicalMemory` constructs a Rust `KPageGroup cur_pg` per free subrange and routes it through `Operate(..., OperationType::MapFirstGroupPhysical)`, but the rollback cleanup is expressed through explicit Rust helpers instead of upstream's `SCOPE_GUARD` / `ON_RESULT_FAILURE` macros.
 - `KPageTableBase` stores the owning process id set by `KProcess::initialize_for_user` so `MapPhysicalMemory` can pass it to `KMemoryManager::AllocateForProcess(...)`. Upstream obtains the same value dynamically with `GetCurrentProcess(m_kernel).GetId()`; the Rust page table does not currently own a direct `KernelCore&`/current-process accessor.
 - `UnmapPhysicalMemory` keeps the upstream strict validation that the requested range contains only `Normal`/attribute-none blocks or `Free` blocks before unmapping the `Normal` subranges.
+- `MapPhysicalMemory` and `UnmapPhysicalMemory` acquire `m_map_physical_memory_lock` and `m_general_lock` at the audited upstream scopes. `KScopedPageTableUpdater` is now scoped to the upstream map/unmap update blocks, and the local rollback helper receives the updater `PageLinkedList` instead of issuing rollback `Operate(...)` calls without the updater page-list.
 
 ### Unintentional differences (to fix)
 - None identified in the audited `MapPhysicalMemory` `MapFirstGroupPhysical` dispatch slice.
@@ -15661,6 +15879,7 @@ The following still panic because upstream either also throws NotImplementedExce
 
 ### Tests
 - Re-read upstream `KPageTableBase::MapPhysicalMemory`, `KPageTableBase::UnmapPhysicalMemory`, and `KPageTableBase::LockForMapDeviceAddressSpace`.
+- Re-read upstream `KPageTableBase::{MapPhysicalMemory,UnmapPhysicalMemory}` light-lock and `KScopedPageTableUpdater` scopes.
 - `cargo fmt --check`
 - `git diff --check`
 - `cargo check -p core`
@@ -15727,15 +15946,14 @@ The following still panic because upstream either also throws NotImplementedExce
 ## 2026-06-05 — core/src/hle/service/hle_ipc.rs and core/src/memory/memory.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/hle_ipc.cpp and /home/vricosti/Dev/emulators/zuyu/src/core/memory.cpp
 
 ### Intentional differences
-- Added `RUZU_TRACE_WRITE_BLOCK_AT=0x...` coverage to the Rust-only checked HLE output-buffer path. Upstream has no `write_block_no_rasterizer_checked`; it calls `memory.WriteBlock` directly from `HLERequestContext::WriteBufferB/C`. This diagnostic remains inactive by default and only emits when the selected output-buffer range covers the requested guest virtual address.
-- Added matching service/cmd/ioctl attribution in `HLERequestContext::write_guest_memory` for the same env-gated address filter. This is investigation-only metadata for identifying large IPC output-buffer writes that later fail in ruzu's checked memory path.
+- Added `RUZU_TRACE_WRITE_BLOCK_AT=0x...` coverage to the Rust HLE output-buffer path. Upstream has no equivalent diagnostic; it is inactive by default and only emits when the selected output-buffer range covers the requested guest virtual address.
+- Added matching service/cmd/ioctl attribution in `HLERequestContext::write_guest_memory` for the same env-gated address filter. This is investigation-only metadata for identifying which service/cmd produced a selected guest-memory write.
 
 ### Unintentional differences (to fix)
-- Ruzu still routes large HLE output-buffer writes through `write_block_no_rasterizer_checked` instead of upstream's `Memory::WriteBlock` path. The checked path exists to avoid host SIGSEGV when guest memory is concurrently unmapped, but it can expose partial `process_vm_writev` failures that upstream would handle through page-table walking and rasterizer write callbacks.
-- `write_guest_memory` still pre-validates `guest_range_is_user_writable` before writing. Upstream `WriteBufferB/C` does not pre-query user writability; it delegates validity handling to `Memory::WriteBlock`.
+- Upstream has no HLE output-buffer write attribution hook. Keep `RUZU_TRACE_WRITE_BLOCK_AT` strictly env-gated and remove it if it starts affecting runtime structure or ownership.
 
 ### Missing items
-- Decide whether ruzu should remove the checked large-buffer special case once the underlying guest-memory mapping/lifetime bug is fixed, or port an upstream-shaped `WriteBlock` implementation that can safely walk the Rust page table without host faults.
+- None for the diagnostic hook.
 
 ### Binary layout verification
 - N/A: diagnostic attribution and host memory-copy policy only. No guest-visible raw payload layout changed.
@@ -15861,12 +16079,12 @@ The following still panic because upstream either also throws NotImplementedExce
 - Added `Memory::read_block_checked(...)`, a SEGV-safe host-side read helper mirroring ruzu's existing checked write path. It uses `process_vm_readv` to turn inaccessible translated host pages into an error return with zero-filled destination bytes instead of a process-wide SIGSEGV.
 - `audio_core::guest_read_block(...)` now uses `read_block_checked(...)` because ruzu currently routes audio decode reads through a global Rust accessor instead of upstream's direct `Core::Memory::Memory&` parameter threaded through `DecodeFromWaveBuffers`.
 - `HLERequestContext::read_guest_memory(...)` now uses `read_block_checked(...)` for copied IPC input buffers. Upstream `HLERequestContext::{ReadBufferCopy,ReadBufferA,ReadBufferX,ReadBuffer}` reads through `memory.ReadBlock` / `CpuGuestMemory<UnsafeRead>`; ruzu's current guest-memory mapping can expose inaccessible translated host pages, so the checked path prevents host aborts.
-- `HLERequestContext::write_guest_memory(...)` now uses `write_block_no_rasterizer_checked(...)` for all copied IPC output buffers, not just large writes. Upstream calls `memory.WriteBlock` / `CpuGuestMemory` with a stable per-context `Core::Memory::Memory&`; ruzu observed 8-byte IPC writes into inaccessible host mappings after rejected shared-memory state, so the checked write prevents host SIGSEGV.
-- IPC input-buffer reads use the checked `Memory` bridge whenever it is available. Legacy `process_memory` is only used for processes that do not yet own a `Memory` bridge, keeping the authoritative path closer to upstream `Core::Memory::Memory&`.
+- `HLERequestContext::write_guest_memory(...)` now routes copied IPC output buffers through the Rust `Memory` bridge. The current page-table branch covers the upstream `memory.WriteBlock(...)` behavior; the remaining Rust-specific adaptation is the optional `Arc<Mutex<Memory>>` storage in `HLERequestContext`.
+- IPC input-buffer reads use the checked `Memory` bridge and no longer fall back to the legacy `process_memory` side channel. Contexts without a `Memory` bridge now expose the ownership gap instead of silently using a second memory model.
 
 ### Unintentional differences (to fix)
 - Upstream `DecodeFromWaveBuffers(Core::Memory::Memory& memory, ...)` owns the memory dependency explicitly and reads wave buffers through `CpuGuestMemory` / `ReadBlockUnsafe`. Ruzu still uses a global `GUEST_MEMORY_ACCESSOR`, so this checked helper is a defensive adaptation around that temporary architecture.
-- Upstream HLE IPC stores a `Core::Memory::Memory&` directly in `HLERequestContext` and relies on its memory helpers for buffer reads/writes. Ruzu stores an optional `Arc<Mutex<Memory>>` bridge with checked guards plus a legacy `process_memory` fallback for processes that still lack the bridge because the surrounding memory/shared-memory lifecycle is not yet upstream-equivalent.
+- Upstream HLE IPC stores a `Core::Memory::Memory&` directly in `HLERequestContext` and relies on its memory helpers for buffer reads/writes. Ruzu still stores an optional `Arc<Mutex<Memory>>` bridge because some reduced tests and caller paths can construct contexts without the full upstream memory owner.
 
 ### Missing items
 - Thread a `Core::Memory::Memory`-equivalent handle through the Rust audio renderer command path so data-source decode can match upstream ownership without global state.
@@ -15883,7 +16101,7 @@ The following still panic because upstream either also throws NotImplementedExce
 - `git diff --check`
 - `cargo check -p core`
 - `cargo build --release --bin ruzu-cmd`
-- Focused `cargo test -p core read_guest_memory_uses_memory_bridge -- --nocapture` is blocked by unrelated existing `core` lib-test compile errors before the test runs. Current first blockers are stale test-only `CoreTiming` APIs and older tests that still call removed `KProcess::read_block/write_block` helpers directly.
+- `cargo test -p core read_guest_memory_uses_memory_bridge -- --nocapture`
 - Manual MK8D smoke after making `Memory` authoritative for IPC input when present (`/tmp/mk8d_hle_ipc_memory_authority_1780768098.log`, `RUST_LOG=warn`, `RUZU_TRACE_MEM_HISTORY_TARGET=0x068B0000`, `RUZU_EXIT_ON_NULL_PC=1`): reached `am::NotifyRunning`, then reproduced `nvmap::IocAlloc(handle=0xAD4, addr=0x068B0000, size=0x70000) result=0x0000D401` followed by `BreakLoopNullPc`. No `read_guest_memory` inaccessible-range warning was emitted; later `IOCALLOC_CTX` analysis showed the IPC descriptor buffer itself was readable and `0x068B0000` was the guest-submitted `IocAllocParams.address`, which `KPageTableBase` reports as `Free`.
 
 ## 2026-06-05 — common/src/trace.rs and core/src/hle/service/nvnflinger/hos_binder_driver.rs diagnostic Binder tracing vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/nvnflinger/hos_binder_driver.cpp and .h
@@ -15903,20 +16121,23 @@ The following still panic because upstream either also throws NotImplementedExce
 ## 2026-06-05 — core/src/hle/kernel/svc/svc_synchronization.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/hle/kernel/svc/svc_synchronization.cpp
 
 ### Intentional differences
-- `WaitSynchronization` now copies the user handle array through `Memory::read_block_checked_quiet(...)` when the current process owns a `Memory` bridge. This matches upstream's structure more closely than the previous per-handle `read_32` loop: upstream calls `GetCurrentMemory(kernel).ReadBlock(user_handles, handles.data(), sizeof(Handle) * num_handles)` and returns `ResultInvalidPointer` if the block copy fails. The quiet checked variant avoids flooding logs when ruzu intentionally falls back to legacy `process_memory`.
-- If the checked `Memory` bridge read fails, ruzu falls back to the legacy `process_memory` path before returning `ResultInvalidPointer`. This is a temporary compatibility bridge for the current Rust memory ownership split; it avoids guest aborts caused by the bridge being inaccessible while the legacy process memory view can still read the handle array.
+- `WaitSynchronization` copies the user handle array through the process-owned `Memory` bridge, matching upstream `GetCurrentMemory(kernel).ReadBlock(user_handles, handles.data(), sizeof(Handle) * num_handles)`.
+- Rust uses `Memory::read_block_checked_quiet(...)` for the block copy so invalid host mappings return `ResultInvalidPointer` without diagnostic spam. There is no legacy `process_memory` fallback in this SVC path.
 
 ### Unintentional differences (to fix)
-- Ruzu still has a secondary legacy `process_memory` fallback path for processes without the `Memory` bridge. Upstream always reaches `GetCurrentMemory(kernel)` from the kernel context.
-- The fallback after a failed `Memory` bridge read is not upstream behavior. Upstream can return `ResultInvalidPointer` directly because `GetCurrentMemory(kernel)` is the authoritative memory owner.
+- None for the audited handle-array copy path.
 
 ### Missing items
-- Remove the legacy `process_memory` fallback once every process has the upstream-equivalent `Core::Memory::Memory` ownership edge.
+- None for the audited handle-array copy path.
 
 ### Binary layout verification
 - N/A: SVC handle-array copy only. `Handle` remains a 32-bit raw value matching upstream.
 
 ### Tests
+- `cargo test -p core wait_synchronization_returns_signaled_index -- --nocapture`
+- `cargo test -p core wait_synchronization_timeout_zero_returns_timed_out -- --nocapture`
+- `cargo test -p core wait_synchronization_returns_cancelled_when_wait_cancelled_is_set -- --nocapture`
+- `cargo test -p core wait_synchronization_ -- --nocapture --test-threads=1` (3 active tests passed; 3 blocking wait tests are ignored pending a full scheduler handoff harness)
 - `cargo check -p core`
 
 ## 2026-06-05 — core/src/file_sys/patch_manager.rs, core/src/file_sys/romfs_factory.rs, core/src/hle/service/filesystem/fsp/fsp_srv.rs, and core/src/hle/service/filesystem/fsp/fs_i_storage.rs vs /home/vricosti/Dev/emulators/zuyu/src/core/file_sys/patch_manager.cpp, /home/vricosti/Dev/emulators/zuyu/src/core/file_sys/romfs_factory.cpp, and /home/vricosti/Dev/emulators/zuyu/src/core/hle/service/filesystem/fsp/fsp_srv.cpp

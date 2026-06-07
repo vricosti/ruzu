@@ -1747,18 +1747,31 @@ impl Memory {
         while remaining > 0 {
             let page_offset = (vaddr & PAGE_MASK) as usize;
             let copy_amount = ((PAGE_SIZE as usize) - page_offset).min(remaining);
+            let mut rasterizer_notified = false;
+
+            if let Some(phys_addr) = self.current_physical_address(vaddr) {
+                self.handle_rasterizer_write(vaddr, copy_amount);
+                rasterizer_notified = true;
+                if self.write_phys_block(phys_addr, &src[offset..offset + copy_amount]) {
+                    vaddr += copy_amount as u64;
+                    offset += copy_amount;
+                    remaining -= copy_amount;
+                    continue;
+                }
+            }
 
             let ptr = self.get_pointer_impl(vaddr);
             if ptr.is_null() {
                 log::error!("Unmapped WriteBlock @ {:#018x}", vaddr);
                 user_accessible = false;
             } else {
-                self.handle_rasterizer_write(vaddr, copy_amount);
+                if !rasterizer_notified {
+                    self.handle_rasterizer_write(vaddr, copy_amount);
+                }
                 unsafe {
                     std::ptr::copy_nonoverlapping(src[offset..].as_ptr(), ptr, copy_amount);
                 }
             }
-
             vaddr += copy_amount as u64;
             offset += copy_amount;
             remaining -= copy_amount;
@@ -1817,6 +1830,235 @@ impl Memory {
         unsafe {
             std::ptr::write_bytes((backing_base + host_offset) as *mut u8, 0u8, size);
         }
+    }
+
+    /// Read a block from physical DeviceMemory backing.
+    ///
+    /// Used by kernel page-table helpers after they have already performed the
+    /// upstream virtual-address state checks and page-table traversal.
+    pub fn read_phys_block(&self, phys_addr: u64, dest: &mut [u8]) -> bool {
+        let size = dest.len();
+        if size == 0 {
+            return true;
+        }
+
+        let buffer = unsafe { &*self.buffer };
+        let backing_base = buffer.backing_base_pointer() as usize;
+        let backing_size = buffer.backing_size();
+        let dram_base = crate::device_memory::dram_memory_map::BASE;
+        if phys_addr < dram_base {
+            log::error!("read_phys_block: phys {:#x} below DRAM base", phys_addr);
+            dest.fill(0);
+            return false;
+        }
+        let host_offset = (phys_addr - dram_base) as usize;
+        if host_offset
+            .checked_add(size)
+            .map(|end| end > backing_size)
+            .unwrap_or(true)
+        {
+            log::error!(
+                "read_phys_block: phys {:#x}+{:#x} out of backing (backing_size={:#x})",
+                phys_addr,
+                size,
+                backing_size
+            );
+            dest.fill(0);
+            return false;
+        }
+
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                (backing_base + host_offset) as *const u8,
+                dest.as_mut_ptr(),
+                size,
+            );
+        }
+        true
+    }
+
+    /// Write a block to physical DeviceMemory backing.
+    ///
+    /// Used by kernel page-table helpers after upstream-equivalent destination
+    /// state/traversal validation has selected a linear-mapped physical run.
+    pub fn write_phys_block(&self, phys_addr: u64, src: &[u8]) -> bool {
+        let size = src.len();
+        if size == 0 {
+            return true;
+        }
+
+        let buffer = unsafe { &*self.buffer };
+        let backing_base = buffer.backing_base_pointer() as usize;
+        let backing_size = buffer.backing_size();
+        let dram_base = crate::device_memory::dram_memory_map::BASE;
+        if phys_addr < dram_base {
+            log::error!("write_phys_block: phys {:#x} below DRAM base", phys_addr);
+            return false;
+        }
+        let host_offset = (phys_addr - dram_base) as usize;
+        if host_offset
+            .checked_add(size)
+            .map(|end| end > backing_size)
+            .unwrap_or(true)
+        {
+            log::error!(
+                "write_phys_block: phys {:#x}+{:#x} out of backing (backing_size={:#x})",
+                phys_addr,
+                size,
+                backing_size
+            );
+            return false;
+        }
+
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                src.as_ptr(),
+                (backing_base + host_offset) as *mut u8,
+                size,
+            );
+        }
+        true
+    }
+
+    /// Copy between two physical DeviceMemory backing ranges.
+    ///
+    /// Mirrors upstream `std::memcpy(GetHeapVirtualPointer(dst),
+    /// GetHeapVirtualPointer(src), size)` after the kernel page-table owner has
+    /// validated both physical runs.
+    pub fn copy_phys_to_phys(&self, dst_phys_addr: u64, src_phys_addr: u64, size: usize) -> bool {
+        if size == 0 {
+            return true;
+        }
+
+        let buffer = unsafe { &*self.buffer };
+        let backing_base = buffer.backing_base_pointer() as usize;
+        let backing_size = buffer.backing_size();
+        let dram_base = crate::device_memory::dram_memory_map::BASE;
+
+        let Some(dst_offset) = dst_phys_addr
+            .checked_sub(dram_base)
+            .map(|offset| offset as usize)
+        else {
+            log::error!(
+                "copy_phys_to_phys: dst phys {:#x} below DRAM base",
+                dst_phys_addr
+            );
+            return false;
+        };
+        let Some(src_offset) = src_phys_addr
+            .checked_sub(dram_base)
+            .map(|offset| offset as usize)
+        else {
+            log::error!(
+                "copy_phys_to_phys: src phys {:#x} below DRAM base",
+                src_phys_addr
+            );
+            return false;
+        };
+
+        let dst_in_range = dst_offset
+            .checked_add(size)
+            .map(|end| end <= backing_size)
+            .unwrap_or(false);
+        let src_in_range = src_offset
+            .checked_add(size)
+            .map(|end| end <= backing_size)
+            .unwrap_or(false);
+        if !dst_in_range || !src_in_range {
+            log::error!(
+                "copy_phys_to_phys: dst {:#x} src {:#x} size {:#x} out of backing (backing_size={:#x})",
+                dst_phys_addr,
+                src_phys_addr,
+                size,
+                backing_size
+            );
+            return false;
+        }
+
+        unsafe {
+            std::ptr::copy(
+                (backing_base + src_offset) as *const u8,
+                (backing_base + dst_offset) as *mut u8,
+                size,
+            );
+        }
+        true
+    }
+
+    /// Copy from physical DeviceMemory backing into guest virtual memory.
+    ///
+    /// This is the Rust owner-local counterpart to upstream callers that pass
+    /// `GetLinearMappedVirtualPointer(...)` into `Memory::WriteBlock(...)`.
+    pub fn copy_phys_to_guest(&self, dest_addr: u64, phys_addr: u64, size: usize) -> bool {
+        if size == 0 {
+            return true;
+        }
+
+        let buffer = unsafe { &*self.buffer };
+        let backing_base = buffer.backing_base_pointer() as usize;
+        let backing_size = buffer.backing_size();
+        let dram_base = crate::device_memory::dram_memory_map::BASE;
+        if phys_addr < dram_base {
+            log::error!("copy_phys_to_guest: phys {:#x} below DRAM base", phys_addr);
+            return false;
+        }
+        let host_offset = (phys_addr - dram_base) as usize;
+        if host_offset
+            .checked_add(size)
+            .map(|end| end > backing_size)
+            .unwrap_or(true)
+        {
+            log::error!(
+                "copy_phys_to_guest: phys {:#x}+{:#x} out of backing (backing_size={:#x})",
+                phys_addr,
+                size,
+                backing_size
+            );
+            return false;
+        }
+
+        let src =
+            unsafe { std::slice::from_raw_parts((backing_base + host_offset) as *const u8, size) };
+        self.write_block(dest_addr, src)
+    }
+
+    /// Copy from guest virtual memory into physical DeviceMemory backing.
+    ///
+    /// This mirrors upstream callers that pass
+    /// `GetLinearMappedVirtualPointer(...)` as the destination buffer to
+    /// `Memory::ReadBlock(...)`.
+    pub fn copy_guest_to_phys(&self, phys_addr: u64, src_addr: u64, size: usize) -> bool {
+        if size == 0 {
+            return true;
+        }
+
+        let buffer = unsafe { &*self.buffer };
+        let backing_base = buffer.backing_base_pointer() as usize;
+        let backing_size = buffer.backing_size();
+        let dram_base = crate::device_memory::dram_memory_map::BASE;
+        if phys_addr < dram_base {
+            log::error!("copy_guest_to_phys: phys {:#x} below DRAM base", phys_addr);
+            return false;
+        }
+        let host_offset = (phys_addr - dram_base) as usize;
+        if host_offset
+            .checked_add(size)
+            .map(|end| end > backing_size)
+            .unwrap_or(true)
+        {
+            log::error!(
+                "copy_guest_to_phys: phys {:#x}+{:#x} out of backing (backing_size={:#x})",
+                phys_addr,
+                size,
+                backing_size
+            );
+            return false;
+        }
+
+        let dest = unsafe {
+            std::slice::from_raw_parts_mut((backing_base + host_offset) as *mut u8, size)
+        };
+        self.read_block(src_addr, dest)
     }
 
     pub fn zero_block(&self, dest_addr: u64, size: usize) -> bool {

@@ -81,7 +81,7 @@ pub fn flush_process_data_cache(
 
     // Perform the operation.
     // Upstream: GetCurrentMemory(kernel).FlushDataCache(address, size)
-    let Some(memory) = process.page_table.get_base().m_memory.as_ref().cloned() else {
+    let Some(memory) = process.get_memory() else {
         return RESULT_INVALID_CURRENT_MEMORY;
     };
     drop(process);

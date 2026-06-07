@@ -41,6 +41,7 @@ use super::k_device_address_space::KDeviceAddressSpace;
 use super::k_event::KEvent;
 use super::k_handle_table::KHandleTable;
 use super::k_handle_table::MAX_TABLE_SIZE;
+use super::k_light_lock::KLightLock;
 use super::k_memory_block::{KMemoryPermission, KMemoryState, PAGE_SIZE};
 use super::k_port::KPort;
 use super::k_process_page_table::KProcessPageTable;
@@ -487,8 +488,11 @@ pub struct KProcess {
     pub system_resource: Option<Arc<Mutex<KSecureSystemResource>>>,
     pub memory_release_hint: usize,
     pub state: ProcessState,
-    // m_state_lock — KLightLock
-    // m_list_lock — KLightLock
+    /// Upstream: `KLightLock m_state_lock`.
+    pub m_state_lock: Arc<KLightLock>,
+    /// Upstream: `KLightLock m_list_lock`.
+    #[allow(dead_code)]
+    pub m_list_lock: Arc<KLightLock>,
     pub cond_var: KConditionVariable,
     /// Reference to the global scheduler context that owns the priority queue.
     /// Upstream: accessed via kernel.GlobalSchedulerContext().
@@ -635,6 +639,8 @@ impl KProcess {
             system_resource: None,
             memory_release_hint: 0,
             state: ProcessState::default(),
+            m_state_lock: Arc::new(KLightLock::new(0)),
+            m_list_lock: Arc::new(KLightLock::new(0)),
             cond_var: KConditionVariable::new(),
             global_scheduler_context: None,
             entropy: [0u64; 4],
@@ -729,7 +735,9 @@ impl KProcess {
     /// Get the per-process Memory bridge.
     /// Matches upstream `KProcess::GetMemory()`.
     pub fn get_memory(&self) -> Option<Arc<Mutex<crate::memory::memory::Memory>>> {
-        self.memory.clone()
+        self.memory
+            .clone()
+            .or_else(|| self.page_table.get_base().m_memory.clone())
     }
 
     // -- Getters matching upstream --
@@ -753,6 +761,15 @@ impl KProcess {
 
     pub fn get_state(&self) -> ProcessState {
         self.state
+    }
+
+    pub fn get_state_lock(&self) -> Arc<KLightLock> {
+        self.m_state_lock.clone()
+    }
+
+    #[allow(dead_code)]
+    pub fn get_list_lock(&self) -> Arc<KLightLock> {
+        self.m_list_lock.clone()
     }
 
     pub fn get_core_mask(&self) -> u64 {
@@ -1500,7 +1517,7 @@ impl KProcess {
         );
 
         // Zero the stack in DeviceMemory.
-        if let Some(memory) = self.page_table.get_base().m_memory.as_ref() {
+        if let Some(memory) = self.get_memory() {
             memory
                 .lock()
                 .unwrap()
@@ -1578,7 +1595,7 @@ impl KProcess {
         let page_address = page_addr.get();
 
         // Zero the TLS page in DeviceMemory.
-        if let Some(memory) = self.page_table.get_base().m_memory.as_ref() {
+        if let Some(memory) = self.get_memory() {
             memory
                 .lock()
                 .unwrap()
@@ -2363,6 +2380,8 @@ impl KProcess {
             stack_size
         );
 
+        let stack_size = (stack_size + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+
         let mut thread_reservation = KScopedResourceReservation::new(
             self.resource_limit.clone(),
             LimitableResource::ThreadCountMax,
@@ -2455,7 +2474,7 @@ impl KProcess {
         );
 
         // Zero the stack in DeviceMemory (if Memory is wired).
-        if let Some(memory) = self.page_table.get_base().m_memory.as_ref() {
+        if let Some(memory) = self.get_memory() {
             memory.lock().unwrap().zero_block(stack_base, stack_size);
         }
         // Upstream: m_page_table.SetMaxHeapSize(m_max_process_memory -
@@ -3034,7 +3053,7 @@ impl KProcess {
     /// Write data to process memory at the given guest address.
     /// Writes to DeviceMemory via Memory.
     pub fn write_memory(&mut self, guest_addr: u64, data: &[u8]) {
-        if let Some(memory) = self.page_table.get_base().m_memory.as_ref() {
+        if let Some(memory) = self.get_memory() {
             memory.lock().unwrap().write_block(guest_addr, data);
         }
     }
@@ -3044,7 +3063,14 @@ impl KProcess {
     /// `write_memory` or the process `Memory` owner explicitly.
     #[cfg(test)]
     pub fn write_block(&mut self, guest_addr: u64, data: &[u8]) {
-        self.write_memory(guest_addr, data);
+        if self.get_memory().is_some() {
+            self.write_memory(guest_addr, data);
+        } else {
+            self.process_memory
+                .write()
+                .unwrap()
+                .write_block(guest_addr, data);
+        }
     }
 
     /// Load a module into process memory and apply per-segment permissions.
@@ -3069,7 +3095,7 @@ impl KProcess {
 
         // Write code to DeviceMemory via Memory::write_block.
         // Upstream: this->GetMemory().WriteBlock(base_addr, code_set.memory.data(), ...)
-        if let Some(memory) = self.page_table.get_base().m_memory.as_ref() {
+        if let Some(memory) = self.get_memory() {
             memory
                 .lock()
                 .unwrap()
@@ -3109,7 +3135,7 @@ impl KProcess {
     /// Read data from process memory at the given guest address (copies into a Vec).
     /// Uses Memory (DeviceMemory) if wired, falls back to ProcessMemoryData.
     pub fn read_memory_vec(&self, guest_addr: u64, size: usize) -> Vec<u8> {
-        if let Some(memory) = self.page_table.get_base().m_memory.as_ref() {
+        if let Some(memory) = self.get_memory() {
             let mut buf = vec![0u8; size];
             memory.lock().unwrap().read_block(guest_addr, &mut buf);
             buf
@@ -3218,6 +3244,7 @@ mod tests {
     use crate::hle::kernel::global_scheduler_context::GlobalSchedulerContext;
     use crate::hle::kernel::k_memory_block::PAGE_SIZE;
     use crate::hle::kernel::k_memory_manager::Pool;
+    use crate::hle::kernel::k_resource_limit::create_resource_limit_for_process;
     use crate::hle::kernel::k_scheduler::KScheduler;
     use crate::hle::kernel::kernel::ScopedKernelForTest;
 
@@ -3250,6 +3277,7 @@ mod tests {
 
     #[test]
     fn run_bootstraps_process_owned_main_thread() {
+        let _kernel = kernel_with_application_pool_for_test(0x80000);
         let process = Arc::new(ProcessLock::from_value(KProcess::new()));
         let scheduler = Arc::new(Mutex::new(KScheduler::new(0)));
 
@@ -3260,6 +3288,9 @@ mod tests {
             process_guard.bind_self_reference(&process);
             process_guard.attach_scheduler(&scheduler);
             process_guard.initialize_thread_local_region_allocation(0x1c0000);
+            process_guard.resource_limit = Some(Arc::new(Mutex::new(
+                create_resource_limit_for_process(0x1_0000_0000),
+            )));
         }
 
         let (main_thread, main_thread_handle, stack_base, stack_top) = process
@@ -3270,8 +3301,9 @@ mod tests {
 
         assert_ne!(main_thread_handle, 0);
         assert_eq!(process.lock().unwrap().state, ProcessState::Running);
+        assert!(scheduler.lock().unwrap().needs_scheduling());
         assert_eq!(
-            scheduler.lock().unwrap().get_scheduler_current_thread_id(),
+            scheduler.lock().unwrap().select_next_thread_id(&process, 0),
             Some(1)
         );
 
@@ -3281,12 +3313,46 @@ mod tests {
         assert_eq!(thread.thread_context.r[13], stack_top);
         assert_eq!(thread.thread_context.r[0], 0);
         assert_eq!(thread.thread_context.r[1], main_thread_handle as u64);
-        assert_eq!(thread.get_tls_address().get(), 0x1c4000);
-        assert_eq!(stack_base, 0x1c9000);
-        assert_eq!(stack_top, 0x2c9000);
+        let tls_address = thread.get_tls_address().get();
         assert_eq!(
             thread.get_state(),
             super::super::k_thread::ThreadState::RUNNABLE
+        );
+        drop(thread);
+
+        assert_eq!(stack_top - stack_base, 0x100000);
+        let process_guard = process.lock().unwrap();
+        let thread_local_start = process_guard
+            .page_table
+            .get_base()
+            .get_region_address(crate::hle::kernel::svc_types::MemoryState::ThreadLocal)
+            as u64;
+        let thread_local_end = thread_local_start
+            + process_guard
+                .page_table
+                .get_base()
+                .get_region_size(crate::hle::kernel::svc_types::MemoryState::ThreadLocal)
+                as u64;
+        assert!(tls_address >= thread_local_start && tls_address < thread_local_end);
+
+        let tls_info = process_guard
+            .page_table
+            .query_info(tls_address as usize)
+            .expect("main thread TLS must be mapped");
+        assert_eq!(tls_info.get_state(), KMemoryState::THREAD_LOCAL);
+        assert_eq!(
+            tls_info.get_permission(),
+            KMemoryPermission::USER_READ_WRITE
+        );
+
+        let stack_info = process_guard
+            .page_table
+            .query_info(stack_base as usize)
+            .expect("main thread stack must be mapped");
+        assert_eq!(stack_info.get_state(), KMemoryState::STACK);
+        assert_eq!(
+            stack_info.get_permission(),
+            KMemoryPermission::USER_READ_WRITE
         );
     }
 

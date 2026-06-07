@@ -197,7 +197,7 @@ impl ThreadQueueImplForKConditionVariableWaitConditionVariable {
 /// Read a u32 from process memory.
 /// Matches upstream `ReadFromUser(KernelCore&, u32*, KProcessAddress)`.
 fn read_from_user(process_guard: &KProcess, address: u64) -> Option<u32> {
-    if let Some(memory) = process_guard.page_table.get_base().m_memory.as_ref() {
+    if let Some(memory) = process_guard.get_memory().as_ref() {
         Some(memory.lock().unwrap().read_32(address))
     } else {
         let mem = process_guard.process_memory.read().unwrap();
@@ -211,7 +211,7 @@ fn read_from_user(process_guard: &KProcess, address: u64) -> Option<u32> {
 /// Write a u32 to process memory.
 /// Matches upstream `WriteToUser(KernelCore&, KProcessAddress, const u32*)`.
 fn write_to_user(process_guard: &KProcess, address: u64, value: u32) -> bool {
-    if let Some(memory) = process_guard.page_table.get_base().m_memory.as_ref() {
+    if let Some(memory) = process_guard.get_memory().as_ref() {
         memory
             .lock()
             .unwrap()
@@ -1187,7 +1187,6 @@ mod tests {
     use super::*;
     use crate::hle::kernel::k_scheduler::KScheduler;
     use crate::hle::kernel::k_thread::{ConditionVariableTreeState, ThreadState};
-
     fn setup_threads() -> (
         Arc<ProcessLock>,
         Arc<KThreadLock>,

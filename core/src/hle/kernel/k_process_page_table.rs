@@ -7,7 +7,9 @@
 
 use std::sync::{Arc, Mutex};
 
-use super::k_memory_block::{KMemoryInfo, KMemoryPermission, PAGE_SIZE};
+use super::k_memory_block::{
+    KMemoryAttribute, KMemoryInfo, KMemoryPermission, KMemoryState, PAGE_SIZE,
+};
 use super::k_page_table_base::KPageTableBase;
 use super::k_resource_limit::KResourceLimit;
 use super::k_typed_address::{KPhysicalAddress, KProcessAddress};
@@ -180,6 +182,36 @@ impl KProcessPageTable {
             .unmap_memory(dst.get() as usize, src.get() as usize, size)
     }
 
+    /// Upstream: `KProcessPageTable::UnmapProcessMemory`.
+    pub fn unmap_process_memory(
+        &mut self,
+        dst_address: KProcessAddress,
+        size: usize,
+        src_page_table: &KProcessPageTable,
+        src_address: KProcessAddress,
+    ) -> u32 {
+        self.base.unmap_process_memory(
+            dst_address.get() as usize,
+            size,
+            &src_page_table.base,
+            src_address.get() as usize,
+        )
+    }
+
+    /// Same-table helper used by the current Rust SVC process-handle owner graph.
+    pub fn unmap_process_memory_same_table(
+        &mut self,
+        dst_address: KProcessAddress,
+        size: usize,
+        src_address: KProcessAddress,
+    ) -> u32 {
+        self.base.unmap_process_memory_same_table(
+            dst_address.get() as usize,
+            size,
+            src_address.get() as usize,
+        )
+    }
+
     pub fn map_physical_memory(&mut self, addr: KProcessAddress, size: usize) -> u32 {
         self.base.map_physical_memory(addr.get() as usize, size)
     }
@@ -246,6 +278,203 @@ impl KProcessPageTable {
         } else {
             None
         }
+    }
+
+    /// Upstream: `KProcessPageTable::InvalidateProcessDataCache`.
+    pub fn invalidate_process_data_cache(&self, addr: KProcessAddress, size: usize) -> u32 {
+        self.base
+            .invalidate_process_data_cache(addr.get() as usize, size)
+    }
+
+    /// Upstream: `KProcessPageTable::ReadDebugMemory`.
+    pub fn read_debug_memory(
+        &self,
+        dst_address: KProcessAddress,
+        src_address: KProcessAddress,
+        size: usize,
+    ) -> u32 {
+        self.base
+            .read_debug_memory(dst_address.get() as usize, src_address.get() as usize, size)
+    }
+
+    /// Upstream: `KProcessPageTable::WriteDebugMemory`.
+    pub fn write_debug_memory(
+        &self,
+        dst_address: KProcessAddress,
+        src_address: KProcessAddress,
+        size: usize,
+    ) -> u32 {
+        self.base
+            .write_debug_memory(dst_address.get() as usize, src_address.get() as usize, size)
+    }
+
+    /// Upstream: `KProcessPageTable::CopyMemoryFromLinearToUser`.
+    pub fn copy_memory_from_linear_to_user(
+        &self,
+        dst_addr: KProcessAddress,
+        size: usize,
+        src_addr: KProcessAddress,
+        src_state_mask: KMemoryState,
+        src_state: KMemoryState,
+        src_test_perm: KMemoryPermission,
+        src_attr_mask: KMemoryAttribute,
+        src_attr: KMemoryAttribute,
+    ) -> u32 {
+        self.base.copy_memory_from_linear_to_user(
+            dst_addr.get() as usize,
+            size,
+            src_addr.get() as usize,
+            src_state_mask,
+            src_state,
+            src_test_perm,
+            src_attr_mask,
+            src_attr,
+        )
+    }
+
+    /// Upstream: `KProcessPageTable::CopyMemoryFromLinearToKernel`.
+    pub fn copy_memory_from_linear_to_kernel(
+        &self,
+        dst_addr: usize,
+        size: usize,
+        src_addr: KProcessAddress,
+        src_state_mask: KMemoryState,
+        src_state: KMemoryState,
+        src_test_perm: KMemoryPermission,
+        src_attr_mask: KMemoryAttribute,
+        src_attr: KMemoryAttribute,
+    ) -> u32 {
+        self.base.copy_memory_from_linear_to_kernel(
+            dst_addr,
+            size,
+            src_addr.get() as usize,
+            src_state_mask,
+            src_state,
+            src_test_perm,
+            src_attr_mask,
+            src_attr,
+        )
+    }
+
+    /// Upstream: `KProcessPageTable::CopyMemoryFromUserToLinear`.
+    pub fn copy_memory_from_user_to_linear(
+        &self,
+        dst_addr: KProcessAddress,
+        size: usize,
+        dst_state_mask: KMemoryState,
+        dst_state: KMemoryState,
+        dst_test_perm: KMemoryPermission,
+        dst_attr_mask: KMemoryAttribute,
+        dst_attr: KMemoryAttribute,
+        src_addr: KProcessAddress,
+    ) -> u32 {
+        self.base.copy_memory_from_user_to_linear(
+            dst_addr.get() as usize,
+            size,
+            dst_state_mask,
+            dst_state,
+            dst_test_perm,
+            dst_attr_mask,
+            dst_attr,
+            src_addr.get() as usize,
+        )
+    }
+
+    /// Upstream: `KProcessPageTable::CopyMemoryFromKernelToLinear`.
+    pub fn copy_memory_from_kernel_to_linear(
+        &self,
+        dst_addr: KProcessAddress,
+        size: usize,
+        dst_state_mask: KMemoryState,
+        dst_state: KMemoryState,
+        dst_test_perm: KMemoryPermission,
+        dst_attr_mask: KMemoryAttribute,
+        dst_attr: KMemoryAttribute,
+        src_addr: usize,
+    ) -> u32 {
+        self.base.copy_memory_from_kernel_to_linear(
+            dst_addr.get() as usize,
+            size,
+            dst_state_mask,
+            dst_state,
+            dst_test_perm,
+            dst_attr_mask,
+            dst_attr,
+            src_addr,
+        )
+    }
+
+    /// Upstream: `KProcessPageTable::CopyMemoryFromHeapToHeap`.
+    pub fn copy_memory_from_heap_to_heap(
+        &self,
+        dst_page_table: &KProcessPageTable,
+        dst_addr: KProcessAddress,
+        size: usize,
+        dst_state_mask: KMemoryState,
+        dst_state: KMemoryState,
+        dst_test_perm: KMemoryPermission,
+        dst_attr_mask: KMemoryAttribute,
+        dst_attr: KMemoryAttribute,
+        src_addr: KProcessAddress,
+        src_state_mask: KMemoryState,
+        src_state: KMemoryState,
+        src_test_perm: KMemoryPermission,
+        src_attr_mask: KMemoryAttribute,
+        src_attr: KMemoryAttribute,
+    ) -> u32 {
+        self.base.copy_memory_from_heap_to_heap(
+            &dst_page_table.base,
+            dst_addr.get() as usize,
+            size,
+            dst_state_mask,
+            dst_state,
+            dst_test_perm,
+            dst_attr_mask,
+            dst_attr,
+            src_addr.get() as usize,
+            src_state_mask,
+            src_state,
+            src_test_perm,
+            src_attr_mask,
+            src_attr,
+        )
+    }
+
+    /// Upstream: `KProcessPageTable::CopyMemoryFromHeapToHeapWithoutCheckDestination`.
+    pub fn copy_memory_from_heap_to_heap_without_check_destination(
+        &self,
+        dst_page_table: &KProcessPageTable,
+        dst_addr: KProcessAddress,
+        size: usize,
+        dst_state_mask: KMemoryState,
+        dst_state: KMemoryState,
+        dst_test_perm: KMemoryPermission,
+        dst_attr_mask: KMemoryAttribute,
+        dst_attr: KMemoryAttribute,
+        src_addr: KProcessAddress,
+        src_state_mask: KMemoryState,
+        src_state: KMemoryState,
+        src_test_perm: KMemoryPermission,
+        src_attr_mask: KMemoryAttribute,
+        src_attr: KMemoryAttribute,
+    ) -> u32 {
+        self.base
+            .copy_memory_from_heap_to_heap_without_check_destination(
+                &dst_page_table.base,
+                dst_addr.get() as usize,
+                size,
+                dst_state_mask,
+                dst_state,
+                dst_test_perm,
+                dst_attr_mask,
+                dst_attr,
+                src_addr.get() as usize,
+                src_state_mask,
+                src_state,
+                src_test_perm,
+                src_attr_mask,
+                src_attr,
+            )
     }
 
     /// Upstream: `bool CanContain(KProcessAddress addr, size_t size, KMemoryState state) const`.
@@ -351,6 +580,7 @@ impl KProcessPageTable {
     ) -> u32 {
         self.base
             .setup_for_ipc_client(addr.get() as usize, size, test_perm, dst_state)
+            .0
     }
 
     pub fn setup_for_ipc(
@@ -479,6 +709,33 @@ impl KProcessPageTable {
         state: super::k_memory_block::KMemoryState,
     ) -> u32 {
         self.base.unmap_page_group(addr.get() as usize, pg, state)
+    }
+
+    /// Create a KPageGroup from the current mapping and open references.
+    /// Upstream: `KProcessPageTable::MakeAndOpenPageGroup`.
+    pub fn make_and_open_page_group(
+        &self,
+        out: &mut super::k_page_group::KPageGroup,
+        address: super::k_typed_address::KProcessAddress,
+        num_pages: usize,
+        state_mask: super::k_memory_block::KMemoryState,
+        state: super::k_memory_block::KMemoryState,
+        perm_mask: KMemoryPermission,
+        perm: KMemoryPermission,
+        attr_mask: super::k_memory_block::KMemoryAttribute,
+        attr: super::k_memory_block::KMemoryAttribute,
+    ) -> u32 {
+        self.base.make_and_open_page_group(
+            out,
+            address.get() as usize,
+            num_pages,
+            state_mask,
+            state,
+            perm_mask,
+            perm,
+            attr_mask,
+            attr,
+        )
     }
 
     // -- Direct base access --

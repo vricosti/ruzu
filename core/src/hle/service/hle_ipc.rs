@@ -779,19 +779,7 @@ impl HLERequestContext {
         }
         .upgrade()?;
         let process = parent.lock().unwrap();
-        process.page_table.get_base().m_memory.clone()
-    }
-
-    fn owner_legacy_process_memory(
-        thread: &Arc<KThreadLock>,
-    ) -> Option<crate::hle::kernel::k_process::SharedProcessMemory> {
-        let parent = {
-            let thread_guard = thread.lock().unwrap();
-            thread_guard.parent.as_ref()?.clone()
-        }
-        .upgrade()?;
-        let process = parent.lock().unwrap();
-        Some(process.process_memory.clone())
+        process.get_memory()
     }
 
     /// Create a context with thread/memory access, matching upstream constructor.
@@ -1524,21 +1512,6 @@ impl HLERequestContext {
             );
             return buf;
         }
-        if let Some(thread) = self.thread.as_ref() {
-            if let Some(process_memory) = Self::owner_legacy_process_memory(thread) {
-                let mem = process_memory.read().unwrap();
-                let bytes = mem.read_bytes(address, size);
-                if bytes.len() == size {
-                    return bytes;
-                }
-                log::warn!(
-                    "read_guest_memory: legacy read returned short buffer addr={:#x} size={:#x} read={:#x}",
-                    address,
-                    size,
-                    bytes.len()
-                );
-            }
-        }
         log::error!(
             "read_guest_memory: no Memory available for addr={:#x} size={:#x}",
             address,
@@ -1566,31 +1539,13 @@ impl HLERequestContext {
                 );
             });
         }
-        if !self.guest_range_is_user_writable(address, data.len()) {
-            log::error!(
-                "write_guest_memory: output buffer is not user-writable addr={:#x} size={:#x}",
-                address,
-                data.len()
-            );
-            return;
-        }
         if let Some(ref memory) = self.memory {
-            let accessible = memory
-                .lock()
-                .unwrap()
-                .write_block_no_rasterizer_checked(address, data);
+            let accessible = memory.lock().unwrap().write_block(address, data);
             if accessible {
                 return;
             }
-            if let Some(thread) = self.thread.as_ref() {
-                if let Some(process_memory) = Self::owner_legacy_process_memory(thread) {
-                    let mut mem = process_memory.write().unwrap();
-                    mem.write_block(address, data);
-                    return;
-                }
-            }
             log::warn!(
-                "write_guest_memory: checked write skipped inaccessible range addr={:#x} size={:#x}",
+                "write_guest_memory: WriteBlock reported inaccessible range addr={:#x} size={:#x}",
                 address,
                 data.len()
             );
@@ -1616,59 +1571,6 @@ impl HLERequestContext {
             return false;
         };
         address <= target && target < address.saturating_add(size as u64)
-    }
-
-    fn guest_range_is_user_writable(&self, address: u64, size: usize) -> bool {
-        self.guest_range_has_user_permission(
-            address,
-            size,
-            crate::hle::kernel::k_memory_block::KMemoryPermission::USER_WRITE,
-        )
-    }
-
-    fn guest_range_has_user_permission(
-        &self,
-        address: u64,
-        size: usize,
-        required: crate::hle::kernel::k_memory_block::KMemoryPermission,
-    ) -> bool {
-        if size == 0 {
-            return true;
-        }
-        let Some(thread) = self.thread.as_ref() else {
-            return true;
-        };
-        let Some(parent) = ({
-            let guard = thread.lock().unwrap();
-            guard.parent.as_ref().and_then(|parent| parent.upgrade())
-        }) else {
-            return true;
-        };
-
-        let start = address as usize;
-        let Some(end) = start.checked_add(size) else {
-            return false;
-        };
-        let process = parent.lock().unwrap();
-        let mut cur = start;
-        while cur < end {
-            let Some(info) = process.page_table.query_info(cur) else {
-                return false;
-            };
-            if !info.m_permission.contains(required)
-                || info
-                    .m_permission
-                    .contains(crate::hle::kernel::k_memory_block::KMemoryPermission::NOT_MAPPED)
-            {
-                return false;
-            }
-            let block_end = info.m_address.saturating_add(info.m_size);
-            if block_end <= cur {
-                return false;
-            }
-            cur = block_end.min(end);
-        }
-        true
     }
 
     /// Populates this context from the thread's TLS command buffer.
@@ -2170,8 +2072,58 @@ mod tests {
     use crate::device_memory::DeviceMemory;
     use crate::hle::kernel::k_process::{KProcess, ProcessLock};
     use crate::hle::kernel::k_thread::{KThread, KThreadLock};
-    use crate::hle::service::os::event::Event;
     use crate::memory::memory::Memory;
+    use common::page_table::{PageTable, PageType};
+
+    struct MappedTestMemory {
+        _device_memory: Box<DeviceMemory>,
+        _page_table: Box<PageTable>,
+        memory: Arc<Mutex<Memory>>,
+    }
+
+    impl MappedTestMemory {
+        fn new(mapped_start: u64, mapped_size: usize) -> Self {
+            const PAGE_BITS: usize = 12;
+            const PAGE_SIZE: usize = 1 << PAGE_BITS;
+
+            let device_memory = Box::new(DeviceMemory::new());
+            let buffer_ptr = &device_memory.buffer as *const common::host_memory::HostMemory;
+            let memory = Arc::new(Mutex::new(unsafe {
+                Memory::new(
+                    SystemRef::null(),
+                    device_memory.as_ref() as *const _,
+                    buffer_ptr,
+                )
+            }));
+
+            let mut page_table = Box::new(PageTable::new());
+            page_table.resize(32, PAGE_BITS);
+            let base_page = (mapped_start as usize) / PAGE_SIZE;
+            let num_pages = mapped_size.div_ceil(PAGE_SIZE);
+            let host_base = device_memory.buffer.backing_base_pointer() as usize;
+            for page in base_page..base_page + num_pages {
+                let target = (page * PAGE_SIZE) as u64;
+                page_table.map_pages(
+                    page,
+                    1,
+                    target,
+                    PageType::Memory,
+                    host_base + target as usize,
+                );
+            }
+
+            memory
+                .lock()
+                .unwrap()
+                .set_current_page_table(page_table.as_mut() as *mut PageTable);
+
+            Self {
+                _device_memory: device_memory,
+                _page_table: page_table,
+                memory,
+            }
+        }
+    }
 
     #[test]
     fn test_session_request_manager_default() {
@@ -2215,15 +2167,8 @@ mod tests {
 
     #[test]
     fn new_with_thread_uses_owner_process_memory() {
-        let device_memory = Box::new(DeviceMemory::new());
-        let buffer_ptr = &device_memory.buffer as *const common::host_memory::HostMemory;
-        let memory = Arc::new(Mutex::new(unsafe {
-            Memory::new(
-                SystemRef::null(),
-                device_memory.as_ref() as *const _,
-                buffer_ptr,
-            )
-        }));
+        let fixture = MappedTestMemory::new(0x2000, 0x1000);
+        let memory = fixture.memory.clone();
 
         let process = Arc::new(ProcessLock::from_value(KProcess::new()));
         process
@@ -2243,15 +2188,8 @@ mod tests {
 
     #[test]
     fn read_guest_memory_uses_memory_bridge() {
-        let device_memory = Box::new(DeviceMemory::new());
-        let buffer_ptr = &device_memory.buffer as *const common::host_memory::HostMemory;
-        let memory = Arc::new(Mutex::new(unsafe {
-            Memory::new(
-                SystemRef::null(),
-                device_memory.as_ref() as *const _,
-                buffer_ptr,
-            )
-        }));
+        let fixture = MappedTestMemory::new(0x3000, 0x1000);
+        let memory = fixture.memory.clone();
 
         let process = Arc::new(ProcessLock::from_value(KProcess::new()));
         process
@@ -2271,15 +2209,49 @@ mod tests {
     }
 
     #[test]
-    fn create_session_for_service_queues_server_manager_registration() {
+    fn write_guest_memory_uses_memory_write_block() {
+        let fixture = MappedTestMemory::new(0x3000, 0x1000);
+        let memory = fixture.memory.clone();
+
         let process = Arc::new(ProcessLock::from_value(KProcess::new()));
+        process
+            .lock()
+            .unwrap()
+            .page_table
+            .set_memory(memory.clone());
+
         let thread = Arc::new(KThreadLock::new(KThread::new()));
         thread.lock().unwrap().parent = Some(Arc::downgrade(&process));
 
-        let queue = Arc::new(Mutex::new(Vec::new()));
-        let wakeup = Arc::new(Event::new());
+        let ctx = HLERequestContext::new_with_thread(thread, 0x2000);
+        ctx.write_guest_memory(0x3000, &[0x11, 0x22, 0x33, 0x44]);
+
+        let mut out = [0u8; 4];
+        memory.lock().unwrap().read_block(0x3000, &mut out);
+        assert_eq!(out, [0x11, 0x22, 0x33, 0x44]);
+    }
+
+    #[test]
+    fn create_session_for_service_queues_server_manager_registration() {
+        let mut process = KProcess::new();
+        process.initialize_handle_table();
+        let process = Arc::new(ProcessLock::from_value(process));
+        let thread = Arc::new(KThreadLock::new(KThread::new()));
+        thread.lock().unwrap().parent = Some(Arc::downgrade(&process));
+
+        let server_manager = Arc::new(Mutex::new(
+            crate::hle::service::server_manager::ServerManager::new(SystemRef::null()),
+        ));
+        let (queue, wakeup) = {
+            let guard = server_manager.lock().unwrap();
+            (guard.pending_registrations_arc(), guard.wakeup_event_arc())
+        };
         let manager = Arc::new(Mutex::new(
-            SessionRequestManager::new_with_registration_queue(queue.clone(), wakeup),
+            SessionRequestManager::new_with_server_manager_full(
+                server_manager,
+                queue.clone(),
+                wakeup,
+            ),
         ));
 
         let mut ctx = HLERequestContext::new_with_thread(thread, 0x2000);
@@ -2295,15 +2267,8 @@ mod tests {
 
     #[test]
     fn write_to_outgoing_command_buffer_only_writes_write_size_words() {
-        let device_memory = Box::new(DeviceMemory::new());
-        let buffer_ptr = &device_memory.buffer as *const common::host_memory::HostMemory;
-        let memory = Arc::new(Mutex::new(unsafe {
-            Memory::new(
-                SystemRef::null(),
-                device_memory.as_ref() as *const _,
-                buffer_ptr,
-            )
-        }));
+        let fixture = MappedTestMemory::new(0x3000, 0x1000);
+        let memory = fixture.memory.clone();
 
         let process = Arc::new(ProcessLock::from_value(KProcess::new()));
         process
@@ -2383,15 +2348,8 @@ mod tests {
 
     #[test]
     fn close_virtual_handle_does_not_write_back_tls() {
-        let device_memory = Box::new(DeviceMemory::new());
-        let buffer_ptr = &device_memory.buffer as *const common::host_memory::HostMemory;
-        let memory = Arc::new(Mutex::new(unsafe {
-            Memory::new(
-                SystemRef::null(),
-                device_memory.as_ref() as *const _,
-                buffer_ptr,
-            )
-        }));
+        let fixture = MappedTestMemory::new(0x3000, 0x1000);
+        let memory = fixture.memory.clone();
 
         let process = Arc::new(ProcessLock::from_value(KProcess::new()));
         process
