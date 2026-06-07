@@ -52,6 +52,8 @@ pub fn optimize_with_host_info(program: &mut Program, host_info: &HostTranslateI
     dead_code_elimination::dead_code_elimination_pass(program);
     verify_no_erased_refs_if_requested(program, "after_dce");
     collect_info::collect_shader_info_pass(program);
+    layer_pass::layer_pass(program, host_info);
+    vendor_workaround_pass::vendor_workaround_pass(program);
 }
 
 /// Run the graphics-texture-aware subset of the upstream optimization order.
@@ -88,6 +90,8 @@ pub fn optimize_with_bound_textures_and_host_info(
     dead_code_elimination::dead_code_elimination_pass(program);
     verify_no_erased_refs_if_requested(program, "after_dce");
     collect_info::collect_shader_info_pass(program);
+    layer_pass::layer_pass(program, host_info);
+    vendor_workaround_pass::vendor_workaround_pass(program);
 }
 
 fn verify_no_erased_refs_if_requested(program: &Program, phase: &str) {
