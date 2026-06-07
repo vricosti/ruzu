@@ -1002,6 +1002,14 @@ fn optimize_glsl_with_optional_ir_dump(
     if let Some(dump) = dump.as_ref() {
         dump.write(program, "08_collect_shader_info");
     }
+    ir_opt::layer_pass::layer_pass(program, host_info);
+    if let Some(dump) = dump.as_ref() {
+        dump.write(program, "09_layer_pass");
+    }
+    ir_opt::vendor_workaround_pass::vendor_workaround_pass(program);
+    if let Some(dump) = dump.as_ref() {
+        dump.write(program, "10_vendor_workaround_pass");
+    }
 }
 
 struct ShaderIrDumpConfig {
