@@ -106,16 +106,7 @@ impl KMemoryBlockManager {
     /// Find the block containing the given address (mutable).
     pub fn find_block_mut(&mut self, address: usize) -> Option<&mut KMemoryBlock> {
         // Collect the key first to avoid double borrow.
-        let key = {
-            let mut found = None;
-            for (&k, block) in self.memory_block_tree.range(..=address).rev() {
-                if block.get_address() <= address && address < block.get_end_address() {
-                    found = Some(k);
-                }
-                break;
-            }
-            found
-        };
+        let key = self.find_key_containing(address);
         key.and_then(move |k| self.memory_block_tree.get_mut(&k).map(|b| &mut **b))
     }
 
@@ -169,43 +160,65 @@ impl KMemoryBlockManager {
         set_disable_attr: KMemoryBlockDisableMergeAttribute,
         clear_disable_attr: KMemoryBlockDisableMergeAttribute,
     ) {
-        let update_end = address + num_pages * PAGE_SIZE;
         debug_assert!(address % PAGE_SIZE == 0);
         debug_assert!(num_pages > 0);
-        debug_assert!(update_end <= self.m_end_address);
+        debug_assert!(address + num_pages * PAGE_SIZE <= self.m_end_address);
 
-        // Phase 1: Split block at start boundary if needed.
-        self.split_at_with_allocator(address, allocator.as_deref_mut());
+        let mut cur_address = address;
+        let mut remaining_pages = num_pages;
 
-        // Phase 2: Split block at end boundary if needed.
-        self.split_at_with_allocator(update_end, allocator.as_deref_mut());
+        while remaining_pages > 0 {
+            let remaining_size = remaining_pages * PAGE_SIZE;
+            let Some(mut key) = self.find_key_containing(cur_address) else {
+                break;
+            };
+            let mut cur_info = self.memory_block_tree[&key].get_memory_info();
 
-        // Phase 3: Update all blocks in the range.
-        let set_disable = !set_disable_attr.is_empty();
-        let keys_in_range: Vec<usize> = self
-            .memory_block_tree
-            .range(address..update_end)
-            .map(|(&k, _)| k)
-            .collect();
+            if self.memory_block_tree[&key].has_properties(state, perm, attr) {
+                if cur_address + remaining_size < cur_info.get_end_address() {
+                    remaining_pages = 0;
+                    cur_address += remaining_size;
+                } else {
+                    remaining_pages =
+                        (cur_address + remaining_size - cur_info.get_end_address()) / PAGE_SIZE;
+                    cur_address = cur_info.get_end_address();
+                }
+            } else {
+                if cur_info.get_address() != cur_address {
+                    self.split_at_with_allocator(cur_address, allocator.as_deref_mut());
+                    key = self
+                        .find_key_containing(cur_address)
+                        .expect("split start must leave a current block");
+                    cur_info = self.memory_block_tree[&key].get_memory_info();
+                    cur_address = cur_info.get_address();
+                }
 
-        for key in keys_in_range {
-            if let Some(block) = self.memory_block_tree.get_mut(&key) {
-                block.update(
-                    state,
-                    perm,
-                    attr,
-                    set_disable,
-                    set_disable_attr.bits(),
-                    clear_disable_attr.bits(),
-                );
+                if cur_info.get_size() > remaining_size {
+                    self.split_at_with_allocator(
+                        cur_address + remaining_size,
+                        allocator.as_deref_mut(),
+                    );
+                    key = self
+                        .find_key_containing(cur_address)
+                        .expect("split end must leave a current block");
+                    cur_info = self.memory_block_tree[&key].get_memory_info();
+                }
+
+                if let Some(block) = self.memory_block_tree.get_mut(&key) {
+                    block.update(
+                        state,
+                        perm,
+                        attr,
+                        block.get_address() == address,
+                        set_disable_attr.bits(),
+                        clear_disable_attr.bits(),
+                    );
+                }
+                cur_address += cur_info.get_size();
+                remaining_pages -= cur_info.get_num_pages();
             }
         }
 
-        // Phase 4: Coalesce adjacent blocks that have become compatible.
-        // Coalesced (removed) nodes return to the allocator's free pool so
-        // they don't leak into the slab unowned. Upstream: the allocator's
-        // destructor frees both pre-reserved slots back to the slab if
-        // they weren't consumed; coalesced blocks go back via Free.
         self.coalesce_for_update_with_allocator(address, num_pages, allocator);
     }
 
@@ -225,34 +238,101 @@ impl KMemoryBlockManager {
         set_disable_attr: KMemoryBlockDisableMergeAttribute,
         clear_disable_attr: KMemoryBlockDisableMergeAttribute,
     ) {
-        let update_end = address + num_pages * PAGE_SIZE;
+        self.update_if_match_with_allocator(
+            None,
+            address,
+            num_pages,
+            test_state,
+            test_perm,
+            test_attr,
+            state,
+            perm,
+            attr,
+            set_disable_attr,
+            clear_disable_attr,
+        );
+    }
 
-        self.split_at(address);
-        self.split_at(update_end);
+    /// Allocator-aware variant of `update_if_match`.
+    ///
+    /// Upstream: `KMemoryBlockManager::UpdateIfMatch(KMemoryBlockManagerUpdateAllocator*, ...)`.
+    pub fn update_if_match_with_allocator(
+        &mut self,
+        mut allocator: Option<
+            &mut super::k_dynamic_resource_manager::KMemoryBlockManagerUpdateAllocator,
+        >,
+        address: usize,
+        num_pages: usize,
+        test_state: KMemoryState,
+        test_perm: KMemoryPermission,
+        test_attr: KMemoryAttribute,
+        state: KMemoryState,
+        perm: KMemoryPermission,
+        attr: KMemoryAttribute,
+        set_disable_attr: KMemoryBlockDisableMergeAttribute,
+        clear_disable_attr: KMemoryBlockDisableMergeAttribute,
+    ) {
+        debug_assert!(address % PAGE_SIZE == 0);
+        debug_assert!(num_pages > 0);
+        debug_assert!(address + num_pages * PAGE_SIZE <= self.m_end_address);
 
-        let set_disable = !set_disable_attr.is_empty();
-        let keys_in_range: Vec<usize> = self
-            .memory_block_tree
-            .range(address..update_end)
-            .map(|(&k, _)| k)
-            .collect();
+        let mut cur_address = address;
+        let mut remaining_pages = num_pages;
 
-        for key in keys_in_range {
-            if let Some(block) = self.memory_block_tree.get_mut(&key) {
-                if block.has_properties(test_state, test_perm, test_attr) {
+        while remaining_pages > 0 {
+            let remaining_size = remaining_pages * PAGE_SIZE;
+            let Some(mut key) = self.find_key_containing(cur_address) else {
+                break;
+            };
+            let mut cur_info = self.memory_block_tree[&key].get_memory_info();
+            let should_update = self.memory_block_tree[&key]
+                .has_properties(test_state, test_perm, test_attr)
+                && !self.memory_block_tree[&key].has_properties(state, perm, attr);
+
+            if should_update {
+                if cur_info.get_address() != cur_address {
+                    self.split_at_with_allocator(cur_address, allocator.as_deref_mut());
+                    key = self
+                        .find_key_containing(cur_address)
+                        .expect("split start must leave a current block");
+                    cur_info = self.memory_block_tree[&key].get_memory_info();
+                    cur_address = cur_info.get_address();
+                }
+
+                if cur_info.get_size() > remaining_size {
+                    self.split_at_with_allocator(
+                        cur_address + remaining_size,
+                        allocator.as_deref_mut(),
+                    );
+                    key = self
+                        .find_key_containing(cur_address)
+                        .expect("split end must leave a current block");
+                    cur_info = self.memory_block_tree[&key].get_memory_info();
+                }
+
+                if let Some(block) = self.memory_block_tree.get_mut(&key) {
                     block.update(
                         state,
                         perm,
                         attr,
-                        set_disable,
+                        false,
                         set_disable_attr.bits(),
                         clear_disable_attr.bits(),
                     );
                 }
+                cur_address += cur_info.get_size();
+                remaining_pages -= cur_info.get_num_pages();
+            } else if cur_address + remaining_size < cur_info.get_end_address() {
+                remaining_pages = 0;
+                cur_address += remaining_size;
+            } else {
+                remaining_pages =
+                    (cur_address + remaining_size - cur_info.get_end_address()) / PAGE_SIZE;
+                cur_address = cur_info.get_end_address();
             }
         }
 
-        self.coalesce_for_update(address, num_pages);
+        self.coalesce_for_update_with_allocator(address, num_pages, allocator);
     }
 
     /// Update block attributes in the range.
@@ -265,24 +345,72 @@ impl KMemoryBlockManager {
         mask: KMemoryAttribute,
         attr: KMemoryAttribute,
     ) {
+        self.update_attribute_with_allocator(None, address, num_pages, mask, attr);
+    }
+
+    pub fn update_attribute_with_allocator(
+        &mut self,
+        mut allocator: Option<
+            &mut super::k_dynamic_resource_manager::KMemoryBlockManagerUpdateAllocator,
+        >,
+        address: usize,
+        num_pages: usize,
+        mask: KMemoryAttribute,
+        attr: KMemoryAttribute,
+    ) {
         let update_end = address + num_pages * PAGE_SIZE;
 
-        self.split_at(address);
-        self.split_at(update_end);
+        let mut cur_address = address;
+        while cur_address < update_end {
+            let key = {
+                let mut found = None;
+                for (&k, block) in self.memory_block_tree.range(..=cur_address).rev() {
+                    if block.get_address() <= cur_address && cur_address < block.get_end_address() {
+                        found = Some(k);
+                    }
+                    break;
+                }
+                found
+            };
+            let Some(key) = key else {
+                break;
+            };
 
-        let keys_in_range: Vec<usize> = self
-            .memory_block_tree
-            .range(address..update_end)
-            .map(|(&k, _)| k)
-            .collect();
-
-        for key in keys_in_range {
-            if let Some(block) = self.memory_block_tree.get_mut(&key) {
-                block.update_attribute(mask, attr);
+            let cur_info = self.memory_block_tree[&key].get_memory_info();
+            let remaining_size = update_end - cur_address;
+            if (self.memory_block_tree[&key].get_attribute() & mask) != attr {
+                if cur_info.get_address() != cur_address {
+                    self.split_at_with_allocator(cur_address, allocator.as_deref_mut());
+                }
+                let key = self
+                    .memory_block_tree
+                    .range(..=cur_address)
+                    .next_back()
+                    .map(|(&k, _)| k)
+                    .unwrap_or(cur_address);
+                let cur_info = self.memory_block_tree[&key].get_memory_info();
+                if cur_info.get_size() > remaining_size {
+                    self.split_at_with_allocator(update_end, allocator.as_deref_mut());
+                }
+                let key = self
+                    .memory_block_tree
+                    .range(..=cur_address)
+                    .next_back()
+                    .map(|(&k, _)| k)
+                    .unwrap_or(cur_address);
+                let cur_info = self.memory_block_tree[&key].get_memory_info();
+                if let Some(block) = self.memory_block_tree.get_mut(&key) {
+                    block.update_attribute(mask, attr);
+                }
+                cur_address += cur_info.get_size();
+            } else if cur_address + remaining_size < cur_info.get_end_address() {
+                cur_address += remaining_size;
+            } else {
+                cur_address = cur_info.get_end_address();
             }
         }
 
-        self.coalesce_for_update(address, num_pages);
+        self.coalesce_for_update_with_allocator(address, num_pages, allocator);
     }
 
     /// Apply a lock function to blocks in the range.
@@ -294,14 +422,34 @@ impl KMemoryBlockManager {
         address: usize,
         num_pages: usize,
         perm: KMemoryPermission,
+        lock_func: F,
+    ) where
+        F: FnMut(&mut KMemoryBlock, KMemoryPermission, bool, bool),
+    {
+        self.update_lock_with_allocator(None, address, num_pages, perm, lock_func);
+    }
+
+    pub fn update_lock_with_allocator<F>(
+        &mut self,
+        mut allocator: Option<
+            &mut super::k_dynamic_resource_manager::KMemoryBlockManagerUpdateAllocator,
+        >,
+        address: usize,
+        num_pages: usize,
+        perm: KMemoryPermission,
         mut lock_func: F,
     ) where
         F: FnMut(&mut KMemoryBlock, KMemoryPermission, bool, bool),
     {
         let update_end = address + num_pages * PAGE_SIZE;
 
-        self.split_at(address);
-        self.split_at(update_end);
+        if let Some(allocator) = allocator.as_mut() {
+            self.split_at_with_allocator(address, Some(&mut **allocator));
+            self.split_at_with_allocator(update_end, Some(&mut **allocator));
+        } else {
+            self.split_at(address);
+            self.split_at(update_end);
+        }
 
         let keys_in_range: Vec<usize> = self
             .memory_block_tree
@@ -318,7 +466,7 @@ impl KMemoryBlockManager {
             }
         }
 
-        self.coalesce_for_update(address, num_pages);
+        self.coalesce_for_update_with_allocator(address, num_pages, allocator);
     }
 
     /// Query the memory info for a given address.
@@ -503,6 +651,16 @@ impl KMemoryBlockManager {
     /// If `address` is already a block boundary, this is a no-op.
     fn split_at(&mut self, address: usize) {
         self.split_at_with_allocator(address, None);
+    }
+
+    fn find_key_containing(&self, address: usize) -> Option<usize> {
+        for (&k, block) in self.memory_block_tree.range(..=address).rev() {
+            if block.get_address() <= address && address < block.get_end_address() {
+                return Some(k);
+            }
+            break;
+        }
+        None
     }
 
     /// Split-block helper that draws the new block from a
@@ -725,6 +883,10 @@ impl KScopedMemoryBlockManagerAuditor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hle::kernel::k_dynamic_resource_manager::{
+        KMemoryBlockManagerUpdateAllocator, KMemoryBlockSlabManager,
+    };
+    use std::sync::Arc;
 
     #[test]
     fn test_initialize_creates_single_free_block() {
@@ -825,6 +987,116 @@ mod tests {
 
         let b = mgr.find_block(0x200000).unwrap();
         assert_eq!(b.get_size(), 0x20000);
+    }
+
+    #[test]
+    fn test_update_if_match_with_allocator_only_updates_matching_range() {
+        let slab = Arc::new({
+            let mut slab = KMemoryBlockSlabManager::new();
+            slab.initialize(1024);
+            slab
+        });
+        let mut mgr = KMemoryBlockManager::new();
+        mgr.initialize(0x200000, 0x240000, Some(slab.as_ref()))
+            .unwrap();
+
+        let (mut allocator, rc) = KMemoryBlockManagerUpdateAllocator::new(Arc::clone(&slab), 2);
+        assert_eq!(rc, 0);
+        mgr.update_if_match_with_allocator(
+            Some(&mut allocator),
+            0x210000,
+            0x10,
+            KMemoryState::FREE,
+            KMemoryPermission::NONE,
+            KMemoryAttribute::NONE,
+            KMemoryState::NORMAL,
+            KMemoryPermission::USER_READ_WRITE,
+            KMemoryAttribute::NONE,
+            KMemoryBlockDisableMergeAttribute::NONE,
+            KMemoryBlockDisableMergeAttribute::NONE,
+        );
+
+        assert_eq!(mgr.block_count(), 3);
+        assert!(mgr.check_state());
+        assert_eq!(
+            mgr.find_block(0x200000).unwrap().get_state(),
+            KMemoryState::FREE
+        );
+        assert_eq!(
+            mgr.find_block(0x210000).unwrap().get_state(),
+            KMemoryState::NORMAL
+        );
+        assert_eq!(
+            mgr.find_block(0x220000).unwrap().get_state(),
+            KMemoryState::FREE
+        );
+    }
+
+    #[test]
+    fn test_update_with_allocator_skips_already_matching_range_without_splitting() {
+        let slab = Arc::new({
+            let mut slab = KMemoryBlockSlabManager::new();
+            slab.initialize(1024);
+            slab
+        });
+        let mut mgr = KMemoryBlockManager::new();
+        mgr.initialize(0x200000, 0x240000, Some(slab.as_ref()))
+            .unwrap();
+
+        let (mut allocator, rc) = KMemoryBlockManagerUpdateAllocator::new(Arc::clone(&slab), 2);
+        assert_eq!(rc, 0);
+        mgr.update_with_allocator(
+            Some(&mut allocator),
+            0x210000,
+            0x10,
+            KMemoryState::FREE,
+            KMemoryPermission::NONE,
+            KMemoryAttribute::NONE,
+            KMemoryBlockDisableMergeAttribute::NONE,
+            KMemoryBlockDisableMergeAttribute::NONE,
+        );
+
+        assert_eq!(mgr.block_count(), 1);
+        assert!(mgr.check_state());
+        let block = mgr.find_block(0x210000).unwrap();
+        assert_eq!(block.get_address(), 0x200000);
+        assert_eq!(block.get_size(), 0x40000);
+        assert_eq!(block.get_state(), KMemoryState::FREE);
+    }
+
+    #[test]
+    fn test_update_if_match_skips_already_target_range_without_splitting() {
+        let slab = Arc::new({
+            let mut slab = KMemoryBlockSlabManager::new();
+            slab.initialize(1024);
+            slab
+        });
+        let mut mgr = KMemoryBlockManager::new();
+        mgr.initialize(0x200000, 0x240000, Some(slab.as_ref()))
+            .unwrap();
+
+        let (mut allocator, rc) = KMemoryBlockManagerUpdateAllocator::new(Arc::clone(&slab), 2);
+        assert_eq!(rc, 0);
+        mgr.update_if_match_with_allocator(
+            Some(&mut allocator),
+            0x210000,
+            0x10,
+            KMemoryState::FREE,
+            KMemoryPermission::NONE,
+            KMemoryAttribute::NONE,
+            KMemoryState::FREE,
+            KMemoryPermission::NONE,
+            KMemoryAttribute::NONE,
+            KMemoryBlockDisableMergeAttribute::NONE,
+            KMemoryBlockDisableMergeAttribute::NONE,
+        );
+
+        assert_eq!(mgr.block_count(), 1);
+        assert!(mgr.check_state());
+        let block = mgr.find_block(0x210000).unwrap();
+        assert_eq!(block.get_address(), 0x200000);
+        assert_eq!(block.get_size(), 0x40000);
+        assert_eq!(block.get_state(), KMemoryState::FREE);
     }
 
     #[test]

@@ -40,7 +40,7 @@ pub fn map_shared_memory(
     size: u64,
     map_perm: MemoryPermission,
 ) -> ResultCode {
-    log::info!(
+    log::debug!(
         "svc::MapSharedMemory called, handle=0x{:X}, addr=0x{:X}, size=0x{:X}, perm={:?}",
         shmem_handle,
         address,
@@ -59,7 +59,7 @@ pub fn map_shared_memory(
         return RESULT_INVALID_SIZE;
     }
     if address >= address.wrapping_add(size) {
-        return invalid_shared_memory_region_result();
+        return RESULT_INVALID_CURRENT_MEMORY;
     }
     if !is_valid_shared_memory_permission(map_perm) {
         return RESULT_INVALID_NEW_MEMORY_PERMISSION;
@@ -136,7 +136,7 @@ pub fn map_shared_memory(
         KMemoryState::SHARED,
     );
     if !can_contain {
-        log::error!(
+        log::debug!(
             "svc::MapSharedMemory: address {:#x} size {:#x} cannot contain Shared",
             address,
             size
@@ -159,7 +159,7 @@ pub fn map_shared_memory(
         let kmap_e: u64 = kmap_s + pt.get_kernel_map_region_size() as u64;
         let addr_s: u64 = pt.get_address_space_start().into();
         let addr_e: u64 = addr_s + pt.get_address_space_size() as u64;
-        log::error!(
+        log::debug!(
             "  region: alias_code=[{:#x}..{:#x}] code=[{:#x}..{:#x}] heap=[{:#x}..{:#x}] alias=[{:#x}..{:#x}] stack=[{:#x}..{:#x}] kmap=[{:#x}..{:#x}] addr_space=[{:#x}..{:#x}]",
             alias_code_s, alias_code_e,
             code_s, code_e,
@@ -175,7 +175,7 @@ pub fn map_shared_memory(
             alias_code_s <= address && address < end && last <= alias_code_e.saturating_sub(1);
         let is_in_heap = !(end <= heap_s || heap_e <= address || heap_s == heap_e);
         let is_in_alias = !(end <= alias_s || alias_e <= address || alias_s == alias_e);
-        log::error!(
+        log::debug!(
             "  check: is_in_region={} is_in_heap={} is_in_alias={} (need true && false && false)",
             is_in_region,
             is_in_heap,
@@ -198,7 +198,7 @@ pub fn map_shared_memory(
     );
 
     if result.is_success() {
-        log::info!(
+        log::debug!(
             "svc::MapSharedMemory: mapped handle={:#x} at {:#x} size={:#x} perm={:?}",
             shmem_handle,
             address,
@@ -283,6 +283,21 @@ mod tests {
         );
         assert_ne!(
             invalid_shared_memory_region_result(),
+            RESULT_INVALID_CURRENT_MEMORY
+        );
+    }
+
+    #[test]
+    fn map_shared_memory_overflow_uses_invalid_current_memory() {
+        let system = System::new();
+        assert_eq!(
+            map_shared_memory(
+                &system,
+                0,
+                u64::MAX & !(PAGE_SIZE - 1),
+                PAGE_SIZE,
+                MemoryPermission::Read,
+            ),
             RESULT_INVALID_CURRENT_MEMORY
         );
     }

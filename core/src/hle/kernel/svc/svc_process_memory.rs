@@ -8,7 +8,7 @@ use crate::core::System;
 use crate::hle::kernel::k_process::ProcessLock;
 use crate::hle::kernel::svc::svc_results::*;
 use crate::hle::kernel::svc::svc_types::*;
-use crate::hle::kernel::svc_common::{Handle, PseudoHandle};
+use crate::hle::kernel::svc_common::Handle;
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 
 fn is_valid_address_range(address: u64, size: u64) -> bool {
@@ -58,8 +58,6 @@ pub fn set_process_memory_permission(
         return RESULT_INVALID_NEW_MEMORY_PERMISSION;
     }
 
-    // Get the process from its handle.
-    // For pseudo-handle CurrentProcess or self-handle, use current process.
     let process_arc = resolve_process_handle(system, process_handle);
     let process_arc = match process_arc {
         Some(p) => p,
@@ -118,38 +116,86 @@ pub fn map_process_memory(
         return RESULT_INVALID_CURRENT_MEMORY;
     }
 
-    // Upstream: Get src process from handle, get dst and src page tables,
-    // validate ranges, create page group, map.
-    // In single-process mode, src and dst are the same process.
-    let process_arc = resolve_process_handle(system, process_handle);
-    let process_arc = match process_arc {
+    let dst_process_arc = system.current_process_arc().clone();
+    let src_process_arc = match resolve_process_handle(system, process_handle) {
         Some(p) => p,
         None => return RESULT_INVALID_HANDLE,
     };
 
-    let mut process = process_arc.lock().unwrap();
     let src_kpa = crate::hle::kernel::k_typed_address::KProcessAddress::new(src_address);
     let dst_kpa = crate::hle::kernel::k_typed_address::KProcessAddress::new(dst_address);
 
-    // Validate that the source is in range.
-    if !process.page_table.contains(src_kpa, size as usize) {
-        return RESULT_INVALID_CURRENT_MEMORY;
+    let mut page_group = crate::hle::kernel::k_page_group::KPageGroup::new();
+    if std::sync::Arc::ptr_eq(&dst_process_arc, &src_process_arc) {
+        let mut process = dst_process_arc.lock().unwrap();
+        if !process.page_table.contains(src_kpa, size as usize) {
+            return RESULT_INVALID_CURRENT_MEMORY;
+        }
+        if !process.page_table.can_contain(
+            dst_kpa,
+            size as usize,
+            crate::hle::kernel::k_memory_block::KMemoryState::SHARED_CODE,
+        ) {
+            return RESULT_INVALID_MEMORY_REGION;
+        }
+        let result = process.page_table.make_and_open_page_group(
+            &mut page_group,
+            src_kpa,
+            (size / PAGE_SIZE) as usize,
+            crate::hle::kernel::k_memory_block::KMemoryState::FLAG_CAN_MAP_PROCESS,
+            crate::hle::kernel::k_memory_block::KMemoryState::FLAG_CAN_MAP_PROCESS,
+            crate::hle::kernel::k_memory_block::KMemoryPermission::NONE,
+            crate::hle::kernel::k_memory_block::KMemoryPermission::NONE,
+            crate::hle::kernel::k_memory_block::KMemoryAttribute::all(),
+            crate::hle::kernel::k_memory_block::KMemoryAttribute::NONE,
+        );
+        if result != 0 {
+            return ResultCode::new(result);
+        }
+        let result = process.page_table.map_page_group(
+            dst_kpa,
+            &page_group,
+            crate::hle::kernel::k_memory_block::KMemoryState::SHARED_CODE,
+            crate::hle::kernel::k_memory_block::KMemoryPermission::USER_READ_WRITE,
+        );
+        return ResultCode::new(result);
     }
 
-    // Upstream: dst_pt.CanContain(dst_address, size, KMemoryState::SharedCode)
-    if !process.page_table.can_contain(
+    {
+        let mut src_process = src_process_arc.lock().unwrap();
+        if !src_process.page_table.contains(src_kpa, size as usize) {
+            return RESULT_INVALID_CURRENT_MEMORY;
+        }
+        let result = src_process.page_table.make_and_open_page_group(
+            &mut page_group,
+            src_kpa,
+            (size / PAGE_SIZE) as usize,
+            crate::hle::kernel::k_memory_block::KMemoryState::FLAG_CAN_MAP_PROCESS,
+            crate::hle::kernel::k_memory_block::KMemoryState::FLAG_CAN_MAP_PROCESS,
+            crate::hle::kernel::k_memory_block::KMemoryPermission::NONE,
+            crate::hle::kernel::k_memory_block::KMemoryPermission::NONE,
+            crate::hle::kernel::k_memory_block::KMemoryAttribute::all(),
+            crate::hle::kernel::k_memory_block::KMemoryAttribute::NONE,
+        );
+        if result != 0 {
+            return ResultCode::new(result);
+        }
+    }
+
+    let mut dst_process = dst_process_arc.lock().unwrap();
+    if !dst_process.page_table.can_contain(
         dst_kpa,
         size as usize,
         crate::hle::kernel::k_memory_block::KMemoryState::SHARED_CODE,
     ) {
         return RESULT_INVALID_MEMORY_REGION;
     }
-
-    // Upstream: Create page group from src, map to dst.
-    // For now, do a direct memory copy mapping.
-    let result = process
-        .page_table
-        .map_memory(dst_kpa, src_kpa, size as usize);
+    let result = dst_process.page_table.map_page_group(
+        dst_kpa,
+        &page_group,
+        crate::hle::kernel::k_memory_block::KMemoryState::SHARED_CODE,
+        crate::hle::kernel::k_memory_block::KMemoryPermission::USER_READ_WRITE,
+    );
     ResultCode::new(result)
 }
 
@@ -188,31 +234,52 @@ pub fn unmap_process_memory(
         return RESULT_INVALID_CURRENT_MEMORY;
     }
 
-    let process_arc = resolve_process_handle(system, process_handle);
-    let process_arc = match process_arc {
+    let dst_process_arc = system.current_process_arc().clone();
+    let src_process_arc = match resolve_process_handle(system, process_handle) {
         Some(p) => p,
         None => return RESULT_INVALID_HANDLE,
     };
 
-    let mut process = process_arc.lock().unwrap();
     let src_kpa = crate::hle::kernel::k_typed_address::KProcessAddress::new(src_address);
     let dst_kpa = crate::hle::kernel::k_typed_address::KProcessAddress::new(dst_address);
 
-    // Validate ranges.
-    if !process.page_table.contains(src_kpa, size as usize) {
+    if std::sync::Arc::ptr_eq(&dst_process_arc, &src_process_arc) {
+        let mut process = dst_process_arc.lock().unwrap();
+        if !process.page_table.contains(src_kpa, size as usize) {
+            return RESULT_INVALID_CURRENT_MEMORY;
+        }
+        if !process.page_table.can_contain(
+            dst_kpa,
+            size as usize,
+            crate::hle::kernel::k_memory_block::KMemoryState::SHARED_CODE,
+        ) {
+            return RESULT_INVALID_MEMORY_REGION;
+        }
+        let result =
+            process
+                .page_table
+                .unmap_process_memory_same_table(dst_kpa, size as usize, src_kpa);
+        return ResultCode::new(result);
+    }
+
+    let src_process = src_process_arc.lock().unwrap();
+    if !src_process.page_table.contains(src_kpa, size as usize) {
         return RESULT_INVALID_CURRENT_MEMORY;
     }
-    if !process.page_table.can_contain(
+    let mut dst_process = dst_process_arc.lock().unwrap();
+    if !dst_process.page_table.can_contain(
         dst_kpa,
         size as usize,
         crate::hle::kernel::k_memory_block::KMemoryState::SHARED_CODE,
     ) {
         return RESULT_INVALID_MEMORY_REGION;
     }
-
-    let result = process
-        .page_table
-        .unmap_memory(dst_kpa, src_kpa, size as usize);
+    let result = dst_process.page_table.unmap_process_memory(
+        dst_kpa,
+        size as usize,
+        &src_process.page_table,
+        src_kpa,
+    );
     ResultCode::new(result)
 }
 
@@ -362,9 +429,6 @@ pub fn unmap_process_code_memory(
     let result = process
         .page_table
         .unmap_code_memory(dst_kpa, src_kpa, size as usize);
-    if result == 0 {
-        invalidate_process_instruction_cache(&mut process, dst_address, size);
-    }
     ResultCode::new(result)
 }
 
@@ -380,25 +444,80 @@ fn invalidate_process_instruction_cache(
     }
 }
 
-/// Helper: resolve a process handle to the process Arc.
-/// For pseudo-handle CurrentProcess or handle 0, returns the current process.
-/// For other handles, looks up in the handle table (in single-process mode,
-/// all valid handles map to the current process).
 fn resolve_process_handle(
     system: &System,
     handle: Handle,
 ) -> Option<std::sync::Arc<crate::hle::kernel::k_process::ProcessLock>> {
-    if handle == PseudoHandle::CurrentProcess as Handle || handle == 0 {
-        return Some(system.current_process_arc().clone());
-    }
-
     let current = system.current_process_arc();
     let guard = current.lock().unwrap();
-    match guard.handle_table.get_object(handle) {
-        Some(_) => {
-            drop(guard);
-            Some(system.current_process_arc().clone())
-        }
-        None => None,
+    let object_id = guard.handle_table.get_object(handle)?;
+    let current_process_id = guard.get_process_id();
+    drop(guard);
+
+    if object_id == current_process_id {
+        return Some(current.clone());
+    }
+
+    let kernel = system.kernel()?;
+    kernel.get_process_by_id(object_id)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::hle::kernel::k_process::{KProcess, ProcessLock};
+    use std::sync::Arc;
+
+    #[test]
+    fn explicit_process_handle_resolves_current_process_id() {
+        let mut system = System::new_for_test();
+        let mut process = KProcess::new();
+        process.process_id = 0x1234;
+        process.initialize_handle_table();
+        let process = Arc::new(ProcessLock::from_value(process));
+
+        let process_handle = {
+            let mut guard = process.lock().unwrap();
+            let process_id = guard.get_process_id();
+            guard.handle_table.add(process_id).unwrap()
+        };
+        system.set_current_process_arc(process.clone());
+
+        let resolved = resolve_process_handle(&system, process_handle).unwrap();
+        assert!(Arc::ptr_eq(&resolved, &process));
+    }
+
+    #[test]
+    fn non_process_object_handle_is_rejected() {
+        let mut system = System::new_for_test();
+        let mut process = KProcess::new();
+        process.process_id = 0x1234;
+        process.initialize_handle_table();
+        let process = Arc::new(ProcessLock::from_value(process));
+
+        let event_like_handle = {
+            let mut guard = process.lock().unwrap();
+            guard.handle_table.add(0xE000_0000).unwrap()
+        };
+        system.set_current_process_arc(process);
+
+        assert!(resolve_process_handle(&system, event_like_handle).is_none());
+    }
+
+    #[test]
+    fn process_memory_resolver_rejects_pseudo_and_zero_handles() {
+        let mut system = System::new_for_test();
+        let mut process = KProcess::new();
+        process.process_id = 0x1234;
+        process.initialize_handle_table();
+        let process = Arc::new(ProcessLock::from_value(process));
+        system.set_current_process_arc(process);
+
+        assert!(resolve_process_handle(&system, 0).is_none());
+        assert!(resolve_process_handle(
+            &system,
+            crate::hle::kernel::svc_common::PseudoHandle::CurrentProcess as Handle,
+        )
+        .is_none());
     }
 }

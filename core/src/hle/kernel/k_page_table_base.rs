@@ -1,30 +1,147 @@
 //! Port of zuyu/src/core/hle/kernel/k_page_table_base.h / k_page_table_base.cpp
-//! Status: Partial (~65 methods implemented, 13 stubs returning 0, ~29 upstream methods missing)
-//! Derniere synchro: 2026-03-17
+//! Status: Partial; runtime-critical map/unmap, IPC setup/cleanup, lock-memory,
+//! device-address-space, code-memory, heap, page-group, and physical-memory paths
+//! have local upstream-shaped lock/updater/allocator structure.
+//! Derniere synchro: 2026-06-07
 //!
 //! The base class for virtual memory page tables.
 //! Contains all address space regions, memory block manager, and virtual memory operations.
 //!
-//! Missing upstream methods include: MapPageGroup, UnmapPageGroup, UnmapProcessMemory,
-//! QueryInfoImpl, QueryMappingImpl, IO memory ops, InitializeForKernel, and others.
-//! Stub methods (return 0 without real logic): IPC setup/cleanup, cache invalidation,
-//! debug memory read/write, linear copy operations.
+//! Remaining gaps are tracked in DIFF.md and mostly concern process/handle
+//! ownership boundaries outside the audited page-table traversal slice.
 
 use bitflags::bitflags;
 
 use std::sync::{Arc, Mutex};
 
 use super::k_address_space_info::{AddressSpaceInfoType, KAddressSpaceInfo};
+use super::k_light_lock::{KLightLock, KScopedLightLock};
 use super::k_memory_block::*;
 use super::k_memory_block_manager::KMemoryBlockManager;
 use super::k_memory_layout::KERNEL_ASLR_ALIGNMENT;
 use super::k_memory_manager;
+use super::k_memory_region_type::K_MEMORY_REGION_ATTR_LINEAR_MAPPED;
 use super::k_resource_limit::{KResourceLimit, LimitableResource};
 use super::svc::svc_types::PageInfo;
 use super::svc_types::{CreateProcessFlag, MemoryState as SvcMemoryState, ADDRESS_SPACE_MASK};
 use crate::hle::kernel::svc::svc_results;
 use crate::hle::result::ResultCode;
 use crate::memory::memory::Memory;
+
+/// RAII wrapper for acquiring two page-table light locks in a stable address
+/// order. Mirrors the helper local to upstream `k_page_table_base.cpp`.
+struct KScopedLightLockPair {
+    lower: Option<Arc<KLightLock>>,
+    upper: Option<Arc<KLightLock>>,
+}
+
+fn invalidate_instruction_cache_for_table(table: &KPageTableBase, addr: usize, size: usize) {
+    let Some(kernel) = crate::hle::kernel::kernel::get_kernel_ref() else {
+        return;
+    };
+    let Some(process) = kernel.get_process_by_page_table_base(table as *const KPageTableBase)
+    else {
+        return;
+    };
+
+    let mut process = process.lock().unwrap();
+    for core_id in 0..crate::hardware_properties::NUM_CPU_CORES as usize {
+        if let Some(interface) = process.get_arm_interface_mut(core_id) {
+            interface.invalidate_cache_range(addr as u64, size);
+        }
+    }
+}
+
+fn store_data_cache(_addr: u64, _size: usize) -> u32 {
+    0
+}
+
+fn is_heap_physical_address_for_table(phys_addr: u64) -> bool {
+    crate::hle::kernel::kernel::get_kernel_ref()
+        .map(|kernel| kernel.memory_manager().contains_physical_address(phys_addr))
+        .unwrap_or(true)
+}
+
+fn is_linear_mapped_physical_address_for_table(phys_addr: u64) -> bool {
+    crate::hle::kernel::kernel::get_kernel_ref()
+        .and_then(|kernel| kernel.get_memory_layout())
+        .and_then(|layout| {
+            layout
+                .lock()
+                .unwrap()
+                .find_physical(phys_addr)
+                .map(|region| region.has_type_attribute(K_MEMORY_REGION_ATTR_LINEAR_MAPPED))
+        })
+        .unwrap_or_else(|| is_heap_physical_address_for_table(phys_addr))
+}
+
+impl KScopedLightLockPair {
+    fn new(lhs: Arc<KLightLock>, rhs: Arc<KLightLock>) -> Self {
+        let (lower, upper) = if Arc::as_ptr(&lhs) <= Arc::as_ptr(&rhs) {
+            (lhs, rhs)
+        } else {
+            (rhs, lhs)
+        };
+
+        lower.lock();
+        if !Arc::ptr_eq(&lower, &upper) {
+            upper.lock();
+        }
+
+        Self {
+            lower: Some(lower),
+            upper: Some(upper),
+        }
+    }
+
+    /// Mirrors upstream `TryUnlockHalf`.
+    #[allow(dead_code)]
+    fn try_unlock_half(&mut self, lock: &Arc<KLightLock>) {
+        let is_pair = self
+            .lower
+            .as_ref()
+            .zip(self.upper.as_ref())
+            .is_some_and(|(lower, upper)| !Arc::ptr_eq(lower, upper));
+        if !is_pair {
+            return;
+        }
+
+        if self
+            .lower
+            .as_ref()
+            .is_some_and(|lower| Arc::ptr_eq(lower, lock))
+        {
+            if let Some(lower) = self.lower.take() {
+                lower.unlock();
+            }
+        } else if self
+            .upper
+            .as_ref()
+            .is_some_and(|upper| Arc::ptr_eq(upper, lock))
+        {
+            if let Some(upper) = self.upper.take() {
+                upper.unlock();
+            }
+        }
+    }
+}
+
+impl Drop for KScopedLightLockPair {
+    fn drop(&mut self) {
+        if let Some(upper) = self.upper.take() {
+            if self
+                .lower
+                .as_ref()
+                .is_none_or(|lower| !Arc::ptr_eq(lower, &upper))
+            {
+                upper.unlock();
+            }
+        }
+        if let Some(lower) = self.lower.take() {
+            lower.unlock();
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // DisableMergeAttribute
@@ -218,7 +335,8 @@ const _: () = assert!(REGION_ALIGNMENT == KERNEL_ASLR_ALIGNMENT);
 
 /// Port of Kernel::KPageTableBase.
 ///
-/// Most methods are stubbed. This struct preserves all upstream fields.
+/// Owns the Rust page-table state corresponding to upstream `KPageTableBase`.
+/// Remaining behavioral gaps are tracked in `DIFF.md`.
 pub struct KPageTableBase {
     /// The page table implementation used by dynarmic.
     /// Upstream: `std::unique_ptr<Common::PageTable> m_impl`
@@ -246,6 +364,14 @@ pub struct KPageTableBase {
     pub(crate) m_mapped_unsafe_physical_memory: usize,
     pub(crate) m_mapped_insecure_memory: usize,
     pub(crate) m_mapped_ipc_server_memory: usize,
+    /// Upstream: `mutable KLightLock m_general_lock`.
+    pub(crate) m_general_lock: Arc<KLightLock>,
+    /// Upstream: `mutable KLightLock m_map_physical_memory_lock`.
+    #[allow(dead_code)]
+    pub(crate) m_map_physical_memory_lock: Arc<KLightLock>,
+    /// Upstream: `KLightLock m_device_map_lock`.
+    #[allow(dead_code)]
+    pub(crate) m_device_map_lock: Arc<KLightLock>,
     pub(crate) m_memory_block_manager: KMemoryBlockManager,
     pub(crate) m_allocate_option: u32,
     pub(crate) m_address_space_width: u32,
@@ -285,6 +411,9 @@ impl KPageTableBase {
             m_mapped_unsafe_physical_memory: 0,
             m_mapped_insecure_memory: 0,
             m_mapped_ipc_server_memory: 0,
+            m_general_lock: Arc::new(KLightLock::new(0)),
+            m_map_physical_memory_lock: Arc::new(KLightLock::new(0)),
+            m_device_map_lock: Arc::new(KLightLock::new(0)),
             m_memory_block_manager: KMemoryBlockManager::new(),
             m_allocate_option: 0,
             m_address_space_width: 0,
@@ -1383,6 +1512,59 @@ impl KPageTableBase {
         0
     }
 
+    /// Matches upstream `KPageTableBase::AllocateAndMapPagesImpl`.
+    fn allocate_and_map_pages_impl(
+        &mut self,
+        page_list: Option<&mut PageLinkedList>,
+        address: usize,
+        num_pages: usize,
+        perm: KMemoryPermission,
+    ) -> u32 {
+        let alloc_option = self.m_allocate_option;
+        let mut pg = super::k_page_group::KPageGroup::with_kernel();
+        {
+            let Some(kernel) = crate::hle::kernel::kernel::get_kernel_mut() else {
+                return svc_results::RESULT_OUT_OF_MEMORY.get_inner_value();
+            };
+            let rc =
+                kernel
+                    .memory_manager_mut()
+                    .allocate_and_open(&mut pg, num_pages, alloc_option);
+            if rc != 0 {
+                return rc;
+            }
+        }
+
+        struct PgCloseGuard<'a> {
+            pg: &'a mut super::k_page_group::KPageGroup,
+        }
+        impl Drop for PgCloseGuard<'_> {
+            fn drop(&mut self) {
+                self.pg.close();
+            }
+        }
+        let pg_guard = PgCloseGuard { pg: &mut pg };
+
+        for block in pg_guard.pg.iter() {
+            self.clear_fresh_backing_region_phys(block.get_address(), block.get_size());
+        }
+
+        let properties = KPageProperties {
+            perm,
+            io: false,
+            uncached: false,
+            disable_merge_attributes: DisableMergeAttribute::NONE,
+        };
+        self.operate_with_group(
+            page_list,
+            address,
+            num_pages,
+            pg_guard.pg,
+            properties,
+            OperationType::MapGroup,
+        )
+    }
+
     /// Allocator-aware shorthand for `m_memory_block_manager.update(...)`.
     /// Constructs a `KMemoryBlockManagerUpdateAllocator` inline (matching
     /// upstream's stack-local `KMemoryBlockManagerUpdateAllocator allocator`
@@ -1651,6 +1833,10 @@ impl KPageTableBase {
 
     /// Matches upstream `KPageTableBase::SetMaxHeapSize`.
     pub fn set_max_heap_size(&mut self, size: usize) -> u32 {
+        let general_lock = self.m_general_lock.clone();
+        let _lock_guard = super::k_light_lock::KScopedLightLock::new(general_lock.as_ref());
+
+        debug_assert!(!self.m_is_kernel);
         self.m_max_heap_size = size;
         0
     }
@@ -1660,111 +1846,99 @@ impl KPageTableBase {
     pub fn set_heap_size(&mut self, size: usize) -> (u32, usize) {
         use super::k_scoped_resource_reservation::KScopedResourceReservation;
 
-        // Validate preconditions.
-        if self.m_is_kernel {
-            return (svc_results::RESULT_OUT_OF_MEMORY.get_inner_value(), 0);
-        }
-        if size > (self.m_heap_region_end - self.m_heap_region_start) {
-            return (svc_results::RESULT_OUT_OF_MEMORY.get_inner_value(), 0);
-        }
-        if size > self.m_max_heap_size {
-            return (svc_results::RESULT_OUT_OF_MEMORY.get_inner_value(), 0);
-        }
+        let physical_memory_lock = self.m_map_physical_memory_lock.clone();
+        let _physical_memory_lock_guard =
+            super::k_light_lock::KScopedLightLock::new(physical_memory_lock.as_ref());
 
-        // RAII scope for the page-table updater. Upstream:
-        //   KScopedPageTableUpdater updater(this);
-        //   ... this->Operate(updater.GetPageList(), ...);
-        // ruzu's Operate doesn't push to the list yet (no KPageTableManager
-        // port), so the list stays empty — Drop won't fire FinalizeUpdate
-        // until the manager lands.
-        let _updater = KScopedPageTableUpdater::from_mut(self);
+        let (cur_address, allocation_size) = {
+            let general_lock = self.m_general_lock.clone();
+            let _lock_guard = super::k_light_lock::KScopedLightLock::new(general_lock.as_ref());
 
-        let current_heap_size = self.m_current_heap_end - self.m_heap_region_start;
-
-        if size < current_heap_size {
-            // === Shrink heap ===
-            // Validate the memory being freed is Normal/UserReadWrite.
-            let free_start = self.m_heap_region_start + size;
-            let free_size = current_heap_size - size;
-            let result = self.check_memory_state(
-                free_start,
-                free_size,
-                KMemoryState::ALL,
-                KMemoryState::NORMAL,
-                KMemoryPermission::from_bits_truncate(0xFF),
-                KMemoryPermission::USER_READ_WRITE,
-                KMemoryAttribute::from_bits_truncate(0xFF),
-                KMemoryAttribute::NONE,
-            );
-            if result != 0 {
-                return (result, 0);
+            if self.m_is_kernel {
+                return (svc_results::RESULT_OUT_OF_MEMORY.get_inner_value(), 0);
+            }
+            if size > (self.m_heap_region_end - self.m_heap_region_start) {
+                return (svc_results::RESULT_OUT_OF_MEMORY.get_inner_value(), 0);
+            }
+            if size > self.m_max_heap_size {
+                return (svc_results::RESULT_OUT_OF_MEMORY.get_inner_value(), 0);
             }
 
-            // Unmap the end of the heap.
-            let num_pages = free_size / PAGE_SIZE;
-            let unmap_properties = KPageProperties {
-                perm: KMemoryPermission::NONE,
-                io: false,
-                uncached: false,
-                disable_merge_attributes: DisableMergeAttribute::NONE,
-            };
-            let op_result = self.operate(
-                None,
-                free_start,
-                num_pages,
-                0,
-                false,
-                unmap_properties,
-                OperationType::Unmap,
-            );
-            if op_result != 0 {
-                return (op_result, 0);
+            let current_heap_size = self.m_current_heap_end - self.m_heap_region_start;
+            if size < current_heap_size {
+                let free_start = self.m_heap_region_start + size;
+                let free_size = current_heap_size - size;
+                let (result, _, _, _, num_allocator_blocks) = self.check_memory_state_range(
+                    free_start,
+                    free_size,
+                    KMemoryState::ALL,
+                    KMemoryState::NORMAL,
+                    KMemoryPermission::from_bits_truncate(0xFF),
+                    KMemoryPermission::USER_READ_WRITE,
+                    KMemoryAttribute::from_bits_truncate(0xFF),
+                    KMemoryAttribute::NONE,
+                    KMemoryAttribute::NONE,
+                );
+                if result != 0 {
+                    return (result, 0);
+                }
+
+                let mut allocator = match self.make_block_update_allocator(num_allocator_blocks) {
+                    Ok(allocator) => allocator,
+                    Err(rc) => return (rc, 0),
+                };
+                let mut updater = KScopedPageTableUpdater::from_mut(self);
+
+                let num_pages = free_size / PAGE_SIZE;
+                let unmap_properties = KPageProperties {
+                    perm: KMemoryPermission::NONE,
+                    io: false,
+                    uncached: false,
+                    disable_merge_attributes: DisableMergeAttribute::NONE,
+                };
+                let op_result = self.operate(
+                    Some(updater.page_list()),
+                    free_start,
+                    num_pages,
+                    0,
+                    false,
+                    unmap_properties,
+                    OperationType::Unmap,
+                );
+                if op_result != 0 {
+                    return (op_result, 0);
+                }
+
+                if let Some(ref resource_limit) = self.m_resource_limit {
+                    resource_limit
+                        .lock()
+                        .unwrap()
+                        .release(LimitableResource::PhysicalMemoryMax, free_size as i64);
+                }
+
+                self.m_memory_block_manager.update_with_allocator(
+                    Some(&mut allocator),
+                    free_start,
+                    num_pages,
+                    KMemoryState::FREE,
+                    KMemoryPermission::NONE,
+                    KMemoryAttribute::NONE,
+                    KMemoryBlockDisableMergeAttribute::NONE,
+                    if size == 0 {
+                        KMemoryBlockDisableMergeAttribute::NORMAL
+                    } else {
+                        KMemoryBlockDisableMergeAttribute::NONE
+                    },
+                );
+
+                self.m_current_heap_end = self.m_heap_region_start + size;
+                return (0, self.m_heap_region_start);
+            } else if size == current_heap_size {
+                return (0, self.m_heap_region_start);
             }
 
-            if let Some(ref resource_limit) = self.m_resource_limit {
-                resource_limit
-                    .lock()
-                    .unwrap()
-                    .release(LimitableResource::PhysicalMemoryMax, free_size as i64);
-            }
-
-            // Allocator-aware block manager update. Upstream:
-            //   KMemoryBlockManagerUpdateAllocator allocator(...);
-            //   m_memory_block_manager.Update(&allocator, ...);
-            // The allocator pre-reserves the worst-case 2 nodes; on Drop
-            // any unused/coalesced nodes return to the slab.
-            let mut block_allocator = match self.make_block_update_allocator(
-                super::k_dynamic_resource_manager::KMemoryBlockManagerUpdateAllocator::MAX_BLOCKS,
-            ) {
-                Ok(a) => a,
-                Err(rc) => return (rc, 0),
-            };
-            // Update block manager: freed region becomes Free.
-            self.m_memory_block_manager.update_with_allocator(
-                Some(&mut block_allocator),
-                free_start,
-                num_pages,
-                KMemoryState::FREE,
-                KMemoryPermission::NONE,
-                KMemoryAttribute::NONE,
-                KMemoryBlockDisableMergeAttribute::NONE,
-                if size == 0 {
-                    KMemoryBlockDisableMergeAttribute::NORMAL
-                } else {
-                    KMemoryBlockDisableMergeAttribute::NONE
-                },
-            );
-
-            self.m_current_heap_end = self.m_heap_region_start + size;
-            return (0, self.m_heap_region_start);
-        } else if size == current_heap_size {
-            // === Same size ===
-            return (0, self.m_heap_region_start);
-        }
-
-        // === Grow heap ===
-        let cur_address = self.m_current_heap_end;
-        let allocation_size = size - current_heap_size;
+            (self.m_current_heap_end, size - current_heap_size)
+        };
 
         let mut memory_reservation = KScopedResourceReservation::new(
             self.m_resource_limit.clone(),
@@ -1773,21 +1947,6 @@ impl KPageTableBase {
         );
         if !memory_reservation.succeeded() {
             return (svc_results::RESULT_LIMIT_REACHED.get_inner_value(), 0);
-        }
-
-        // Check that the region to grow is Free.
-        let result = self.check_memory_state(
-            cur_address,
-            allocation_size,
-            KMemoryState::ALL,
-            KMemoryState::FREE,
-            KMemoryPermission::NONE,
-            KMemoryPermission::NONE,
-            KMemoryAttribute::NONE,
-            KMemoryAttribute::NONE,
-        );
-        if result != 0 {
-            return (result, 0);
         }
 
         let num_pages = allocation_size / PAGE_SIZE;
@@ -1840,57 +1999,76 @@ impl KPageTableBase {
             self.clear_fresh_backing_region_phys(block.get_address(), block.get_size());
         }
 
-        let map_properties = KPageProperties {
-            perm: KMemoryPermission::USER_READ_WRITE,
-            io: false,
-            uncached: false,
-            disable_merge_attributes: if self.m_current_heap_end == self.m_heap_region_start {
-                DisableMergeAttribute::DISABLE_HEAD
-            } else {
-                DisableMergeAttribute::NONE
-            },
-        };
+        {
+            let general_lock = self.m_general_lock.clone();
+            let _lock_guard = super::k_light_lock::KScopedLightLock::new(general_lock.as_ref());
 
-        // R_TRY(this->Operate(updater.GetPageList(), m_current_heap_end,
-        //                     num_pages, pg, map_properties, MapGroup, false));
-        let op_result = self.operate_with_group(
-            None,
-            cur_address,
-            num_pages,
-            pg_guard.pg,
-            map_properties,
-            OperationType::MapGroup,
-        );
-        if op_result != 0 {
-            return (op_result, 0);
+            debug_assert_eq!(cur_address, self.m_current_heap_end);
+
+            let (result, _, _, _, num_allocator_blocks) = self.check_memory_state_range(
+                self.m_current_heap_end,
+                allocation_size,
+                KMemoryState::ALL,
+                KMemoryState::FREE,
+                KMemoryPermission::NONE,
+                KMemoryPermission::NONE,
+                KMemoryAttribute::NONE,
+                KMemoryAttribute::NONE,
+                KMemoryAttribute::NONE,
+            );
+            if result != 0 {
+                return (result, 0);
+            }
+
+            let mut allocator = match self.make_block_update_allocator(num_allocator_blocks) {
+                Ok(allocator) => allocator,
+                Err(rc) => return (rc, 0),
+            };
+            let mut updater = KScopedPageTableUpdater::from_mut(self);
+
+            let map_properties = KPageProperties {
+                perm: KMemoryPermission::USER_READ_WRITE,
+                io: false,
+                uncached: false,
+                disable_merge_attributes: if self.m_current_heap_end == self.m_heap_region_start {
+                    DisableMergeAttribute::DISABLE_HEAD
+                } else {
+                    DisableMergeAttribute::NONE
+                },
+            };
+
+            let op_result = self.operate_with_group(
+                Some(updater.page_list()),
+                self.m_current_heap_end,
+                num_pages,
+                pg_guard.pg,
+                map_properties,
+                OperationType::MapGroup,
+            );
+            if op_result != 0 {
+                return (op_result, 0);
+            }
+
+            memory_reservation.commit();
+
+            self.m_memory_block_manager.update_with_allocator(
+                Some(&mut allocator),
+                self.m_current_heap_end,
+                num_pages,
+                KMemoryState::NORMAL,
+                KMemoryPermission::USER_READ_WRITE,
+                KMemoryAttribute::NONE,
+                if self.m_heap_region_start == self.m_current_heap_end {
+                    KMemoryBlockDisableMergeAttribute::NORMAL
+                } else {
+                    KMemoryBlockDisableMergeAttribute::NONE
+                },
+                KMemoryBlockDisableMergeAttribute::NONE,
+            );
+
+            self.m_current_heap_end = self.m_heap_region_start + size;
         }
 
-        // Commit the resource reservation.
-        memory_reservation.commit();
-
-        // Allocator-aware block manager update.
-        let mut block_allocator = match self.make_block_update_allocator(
-            super::k_dynamic_resource_manager::KMemoryBlockManagerUpdateAllocator::MAX_BLOCKS,
-        ) {
-            Ok(a) => a,
-            Err(rc) => return (rc, 0),
-        };
-        self.m_memory_block_manager.update_with_allocator(
-            Some(&mut block_allocator),
-            cur_address,
-            num_pages,
-            KMemoryState::NORMAL,
-            KMemoryPermission::USER_READ_WRITE,
-            KMemoryAttribute::NONE,
-            if self.m_heap_region_start == self.m_current_heap_end {
-                KMemoryBlockDisableMergeAttribute::NORMAL
-            } else {
-                KMemoryBlockDisableMergeAttribute::NONE
-            },
-            KMemoryBlockDisableMergeAttribute::NONE,
-        );
-
-        self.m_current_heap_end = self.m_heap_region_start + size;
         // RUZU_TRACE_HEAP_GROW=1 — log heap-region bounds + the just-grown
         // range so we can correlate later "Unmapped Read" addresses
         // against what set_heap_size actually mapped.
@@ -1943,6 +2121,8 @@ impl KPageTableBase {
             ));
         }
 
+        let general_lock = self.m_general_lock.clone();
+        let _lock_guard = KScopedLightLock::new(general_lock.as_ref());
         self.query_info_impl(addr)
     }
 
@@ -1963,24 +2143,23 @@ impl KPageTableBase {
         perm: KMemoryPermission,
     ) -> u32 {
         let num_pages = size / PAGE_SIZE;
-        // Validate the range is within address space.
-        if !self.contains_range(addr, size) {
-            return svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value();
-        }
+        let general_lock = self.m_general_lock.clone();
+        let _lock_guard = super::k_light_lock::KScopedLightLock::new(general_lock.as_ref());
 
         // Check current memory state — verify the region can be reprotected.
         // Upstream: state_mask = FlagCanReprotect, state = FlagCanReprotect
-        let (result, out_state, _out_perm, _out_attr, _) = self.check_memory_state_range(
-            addr,
-            size,
-            KMemoryState::FLAG_CAN_REPROTECT,
-            KMemoryState::FLAG_CAN_REPROTECT,
-            KMemoryPermission::NONE,
-            KMemoryPermission::NONE,
-            KMemoryAttribute::from_bits_truncate(0xFF),
-            KMemoryAttribute::NONE,
-            Self::DEFAULT_MEMORY_IGNORE_ATTR,
-        );
+        let (result, out_state, _out_perm, _out_attr, num_allocator_blocks) = self
+            .check_memory_state_range(
+                addr,
+                size,
+                KMemoryState::FLAG_CAN_REPROTECT,
+                KMemoryState::FLAG_CAN_REPROTECT,
+                KMemoryPermission::NONE,
+                KMemoryPermission::NONE,
+                KMemoryAttribute::from_bits_truncate(0xFF),
+                KMemoryAttribute::NONE,
+                Self::DEFAULT_MEMORY_IGNORE_ATTR,
+            );
         if result != 0 {
             return result;
         }
@@ -1993,6 +2172,12 @@ impl KPageTableBase {
             return 0;
         }
 
+        let mut allocator = match self.make_block_update_allocator(num_allocator_blocks) {
+            Ok(allocator) => allocator,
+            Err(rc) => return rc,
+        };
+        let mut updater = KScopedPageTableUpdater::from_mut(self);
+
         // Change permissions via Operate.
         let properties = KPageProperties {
             perm,
@@ -2001,7 +2186,7 @@ impl KPageTableBase {
             disable_merge_attributes: DisableMergeAttribute::NONE,
         };
         let op_result = self.operate(
-            None,
+            Some(updater.page_list()),
             addr,
             num_pages,
             0,
@@ -2014,7 +2199,8 @@ impl KPageTableBase {
         }
 
         // Update block manager.
-        self.update_blocks(
+        self.update_blocks_with_allocator(
+            &mut allocator,
             addr,
             num_pages,
             old_state,
@@ -2034,6 +2220,13 @@ impl KPageTableBase {
         let num_pages = size / PAGE_SIZE;
         let mask_attr = KMemoryAttribute::from_bits_truncate(mask as u8);
         let set_attr = KMemoryAttribute::from_bits_truncate(attr as u8);
+        debug_assert_eq!(
+            mask_attr.bits() | KMemoryAttribute::SET_MASK.bits(),
+            KMemoryAttribute::SET_MASK.bits()
+        );
+
+        let general_lock = self.m_general_lock.clone();
+        let _lock_guard = super::k_light_lock::KScopedLightLock::new(general_lock.as_ref());
 
         // Compute state test mask based on which attributes are being changed.
         let mut state_test_mask = KMemoryState::NONE;
@@ -2053,23 +2246,30 @@ impl KPageTableBase {
             !(KMemoryAttribute::SET_MASK.bits() | KMemoryAttribute::DEVICE_SHARED.bits()),
         );
         let ignore_attr = KMemoryAttribute::from_bits_truncate(!attr_test_mask.bits());
-        let (result, _out_state, out_perm, out_attr, _) = self.check_memory_state_range(
-            addr,
-            size,
-            state_test_mask,
-            state_test_mask,
-            KMemoryPermission::NONE,
-            KMemoryPermission::NONE,
-            attr_test_mask,
-            KMemoryAttribute::NONE,
-            ignore_attr,
-        );
+        let (result, _out_state, out_perm, out_attr, num_allocator_blocks) = self
+            .check_memory_state_range(
+                addr,
+                size,
+                state_test_mask,
+                state_test_mask,
+                KMemoryPermission::NONE,
+                KMemoryPermission::NONE,
+                attr_test_mask,
+                KMemoryAttribute::NONE,
+                ignore_attr,
+            );
         if result != 0 {
             return result;
         }
 
         let old_perm = out_perm.unwrap_or(KMemoryPermission::NONE);
         let old_attr = out_attr.unwrap_or(KMemoryAttribute::NONE);
+
+        let mut allocator = match self.make_block_update_allocator(num_allocator_blocks) {
+            Ok(allocator) => allocator,
+            Err(rc) => return rc,
+        };
+        let mut updater = KScopedPageTableUpdater::from_mut(self);
 
         // If uncached attribute is changing, change via Operate.
         if mask_attr.contains(KMemoryAttribute::UNCACHED) {
@@ -2083,7 +2283,7 @@ impl KPageTableBase {
                 disable_merge_attributes: DisableMergeAttribute::NONE,
             };
             let op_result = self.operate(
-                None,
+                Some(updater.page_list()),
                 addr,
                 num_pages,
                 0,
@@ -2097,8 +2297,13 @@ impl KPageTableBase {
         }
 
         // Update the blocks via UpdateAttribute.
-        self.m_memory_block_manager
-            .update_attribute(addr, num_pages, mask_attr, set_attr);
+        self.m_memory_block_manager.update_attribute_with_allocator(
+            Some(&mut allocator),
+            addr,
+            num_pages,
+            mask_attr,
+            set_attr,
+        );
         0
     }
 
@@ -2108,6 +2313,8 @@ impl KPageTableBase {
     /// Matches upstream `KPageTableBase::MapMemory`.
     pub fn map_memory(&mut self, dst: usize, src: usize, size: usize) -> u32 {
         let num_pages = size / PAGE_SIZE;
+        let general_lock = self.m_general_lock.clone();
+        let _lock_guard = super::k_light_lock::KScopedLightLock::new(general_lock.as_ref());
 
         // Check source state — must be aliasable and UserReadWrite.
         let (result, out_src_state, _, _, num_src_allocator_blocks) = self
@@ -2241,6 +2448,8 @@ impl KPageTableBase {
     /// Matches upstream `KPageTableBase::UnmapMemory`.
     pub fn unmap_memory(&mut self, dst: usize, src: usize, size: usize) -> u32 {
         let num_pages = size / PAGE_SIZE;
+        let general_lock = self.m_general_lock.clone();
+        let _lock_guard = super::k_light_lock::KScopedLightLock::new(general_lock.as_ref());
 
         // Check source is locked/aliased and capture original state.
         let (result, out_src_state, _, _, num_src_allocator_blocks) = self
@@ -2408,6 +2617,227 @@ impl KPageTableBase {
         0
     }
 
+    fn physical_contiguous_ranges(
+        &self,
+        address: usize,
+        size: usize,
+    ) -> Result<Vec<(u64, usize)>, u32> {
+        let Some(impl_pt) = self.m_impl.as_ref() else {
+            return Err(svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value());
+        };
+        let Some((first_entry, mut traversal_context)) = impl_pt.begin_traversal(address as u64)
+        else {
+            return Err(svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value());
+        };
+        if first_entry.block_size == 0 {
+            return Err(svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value());
+        }
+
+        let mut cur_phys = first_entry.phys_addr;
+        let mut cur_size = size.min(
+            first_entry
+                .block_size
+                .saturating_sub((cur_phys as usize) & (first_entry.block_size - 1)),
+        );
+        let mut consumed_size = cur_size;
+        let mut ranges = Vec::new();
+
+        while consumed_size < size {
+            let Some(next_entry) = impl_pt.continue_traversal(&mut traversal_context) else {
+                return Err(svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value());
+            };
+            let next_size = (size - consumed_size).min(next_entry.block_size);
+            if next_entry.phys_addr == cur_phys + cur_size as u64 {
+                cur_size += next_size;
+            } else {
+                ranges.push((cur_phys, cur_size));
+                cur_phys = next_entry.phys_addr;
+                cur_size = next_size;
+            }
+            consumed_size += next_size;
+        }
+
+        ranges.push((cur_phys, cur_size));
+        Ok(ranges)
+    }
+
+    fn validate_process_memory_physical_ranges(
+        dst_page_table: &Self,
+        dst_address: usize,
+        src_page_table: &Self,
+        src_address: usize,
+        size: usize,
+    ) -> u32 {
+        let src_ranges = match src_page_table.physical_contiguous_ranges(src_address, size) {
+            Ok(ranges) => ranges,
+            Err(result) => return result,
+        };
+        let dst_ranges = match dst_page_table.physical_contiguous_ranges(dst_address, size) {
+            Ok(ranges) => ranges,
+            Err(result) => return result,
+        };
+        if src_ranges != dst_ranges {
+            return svc_results::RESULT_INVALID_MEMORY_REGION.get_inner_value();
+        }
+        0
+    }
+
+    /// Unmap process memory previously mapped as SharedCode.
+    ///
+    /// Upstream: `KPageTableBase::UnmapProcessMemory`.
+    pub fn unmap_process_memory(
+        &mut self,
+        dst_address: usize,
+        size: usize,
+        src_page_table: &KPageTableBase,
+        src_address: usize,
+    ) -> u32 {
+        let dst_lock = self.m_general_lock.clone();
+        let src_lock = src_page_table.m_general_lock.clone();
+        let mut lock_pair = KScopedLightLockPair::new(src_lock.clone(), dst_lock);
+
+        let (result, num_allocator_blocks) = self.check_memory_state_contiguous(
+            dst_address,
+            size,
+            KMemoryState::ALL,
+            KMemoryState::SHARED_CODE,
+            KMemoryPermission::USER_READ_WRITE,
+            KMemoryPermission::USER_READ_WRITE,
+            KMemoryAttribute::all(),
+            KMemoryAttribute::NONE,
+        );
+        if result != 0 {
+            return result;
+        }
+
+        let result = src_page_table.check_memory_state(
+            src_address,
+            size,
+            KMemoryState::FLAG_CAN_MAP_PROCESS,
+            KMemoryState::FLAG_CAN_MAP_PROCESS,
+            KMemoryPermission::NONE,
+            KMemoryPermission::NONE,
+            KMemoryAttribute::all(),
+            KMemoryAttribute::NONE,
+        );
+        if result != 0 {
+            return result;
+        }
+
+        let result = Self::validate_process_memory_physical_ranges(
+            self,
+            dst_address,
+            src_page_table,
+            src_address,
+            size,
+        );
+        if result != 0 {
+            return result;
+        }
+
+        lock_pair.try_unlock_half(&src_lock);
+
+        self.finish_unmap_process_memory(dst_address, size, num_allocator_blocks)
+    }
+
+    /// Same-table entry point for the current Rust SVC owner graph. Upstream
+    /// reaches the same code through distinct `dst_pt`/`src_pt` references.
+    pub fn unmap_process_memory_same_table(
+        &mut self,
+        dst_address: usize,
+        size: usize,
+        src_address: usize,
+    ) -> u32 {
+        let general_lock = self.m_general_lock.clone();
+        let _lock_guard = KScopedLightLock::new(general_lock.as_ref());
+
+        let (result, num_allocator_blocks) = self.check_memory_state_contiguous(
+            dst_address,
+            size,
+            KMemoryState::ALL,
+            KMemoryState::SHARED_CODE,
+            KMemoryPermission::USER_READ_WRITE,
+            KMemoryPermission::USER_READ_WRITE,
+            KMemoryAttribute::all(),
+            KMemoryAttribute::NONE,
+        );
+        if result != 0 {
+            return result;
+        }
+
+        let result = self.check_memory_state(
+            src_address,
+            size,
+            KMemoryState::FLAG_CAN_MAP_PROCESS,
+            KMemoryState::FLAG_CAN_MAP_PROCESS,
+            KMemoryPermission::NONE,
+            KMemoryPermission::NONE,
+            KMemoryAttribute::all(),
+            KMemoryAttribute::NONE,
+        );
+        if result != 0 {
+            return result;
+        }
+
+        let result = Self::validate_process_memory_physical_ranges(
+            self,
+            dst_address,
+            self,
+            src_address,
+            size,
+        );
+        if result != 0 {
+            return result;
+        }
+
+        self.finish_unmap_process_memory(dst_address, size, num_allocator_blocks)
+    }
+
+    fn finish_unmap_process_memory(
+        &mut self,
+        dst_address: usize,
+        size: usize,
+        num_allocator_blocks: usize,
+    ) -> u32 {
+        let num_pages = size / PAGE_SIZE;
+        let mut allocator = match self.make_block_update_allocator(num_allocator_blocks) {
+            Ok(allocator) => allocator,
+            Err(result) => return result,
+        };
+        let mut updater = KScopedPageTableUpdater::from_mut(self);
+
+        let unmap_properties = KPageProperties {
+            perm: KMemoryPermission::NONE,
+            io: false,
+            uncached: false,
+            disable_merge_attributes: DisableMergeAttribute::NONE,
+        };
+        let result = self.operate(
+            Some(updater.page_list()),
+            dst_address,
+            num_pages,
+            0,
+            false,
+            unmap_properties,
+            OperationType::Unmap,
+        );
+        if result != 0 {
+            return result;
+        }
+
+        self.update_blocks_with_allocator(
+            &mut allocator,
+            dst_address,
+            num_pages,
+            KMemoryState::FREE,
+            KMemoryPermission::NONE,
+            KMemoryAttribute::NONE,
+            KMemoryBlockDisableMergeAttribute::NONE,
+            KMemoryBlockDisableMergeAttribute::NORMAL,
+        );
+        0
+    }
+
     // -- LockMemoryAndOpen / UnlockMemory --
 
     /// Lock a memory region, optionally changing permissions and setting lock attribute.
@@ -2438,11 +2868,13 @@ impl KPageTableBase {
             (lock_attr.bits() & attr.bits()) == 0,
             "lock_attr ∩ attr must be empty"
         );
-        let _updater = KScopedPageTableUpdater::from_mut(self);
         let num_pages = size / PAGE_SIZE;
         if !self.contains_range(addr, size) {
             return svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value();
         }
+
+        let general_lock = self.m_general_lock.clone();
+        let _lock_guard = super::k_light_lock::KScopedLightLock::new(general_lock.as_ref());
 
         // Check memory state with FlagReferenceCounted.
         let check_state_mask = KMemoryState::from_bits_truncate(
@@ -2522,8 +2954,9 @@ impl KPageTableBase {
                 uncached,
                 disable_merge_attributes: DisableMergeAttribute::DISABLE_HEAD_BODY_TAIL,
             };
+            let mut updater = KScopedPageTableUpdater::from_mut(self);
             let op_result = self.operate(
-                None,
+                Some(updater.page_list()),
                 addr,
                 num_pages,
                 0,
@@ -2596,6 +3029,9 @@ impl KPageTableBase {
             return svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value();
         }
 
+        let general_lock = self.m_general_lock.clone();
+        let _lock_guard = super::k_light_lock::KScopedLightLock::new(general_lock.as_ref());
+
         // Check memory state with FlagReferenceCounted.
         let check_state_mask = KMemoryState::from_bits_truncate(
             state_mask.bits() | KMemoryState::FLAG_REFERENCE_COUNTED.bits(),
@@ -2644,8 +3080,9 @@ impl KPageTableBase {
                 uncached,
                 disable_merge_attributes: DisableMergeAttribute::ENABLE_AND_MERGE_HEAD_BODY_TAIL,
             };
+            let mut updater = KScopedPageTableUpdater::from_mut(self);
             let op_result = self.operate(
-                None,
+                Some(updater.page_list()),
                 addr,
                 num_pages,
                 0,
@@ -2726,11 +3163,21 @@ impl KPageTableBase {
         let region_size = self.get_region_size(SvcMemoryState::Static);
         let region_num_pages = region_size / PAGE_SIZE;
 
+        let general_lock = self.m_general_lock.clone();
+        let _lock_guard = KScopedLightLock::new(general_lock.as_ref());
+
         // Find a free area in the Static region.
         let addr = self.find_free_area(region_start, region_num_pages, num_pages, PAGE_SIZE, 0, 0);
         if addr == 0 {
             return svc_results::RESULT_OUT_OF_MEMORY.get_inner_value();
         }
+
+        let Ok(mut allocator) = self.make_block_update_allocator(
+            super::k_dynamic_resource_manager::KMemoryBlockManagerUpdateAllocator::MAX_BLOCKS,
+        ) else {
+            return svc_results::RESULT_OUT_OF_RESOURCE.get_inner_value();
+        };
+        let mut updater = KScopedPageTableUpdater::from_mut(self);
 
         // Map the pages.
         let properties = KPageProperties {
@@ -2740,7 +3187,7 @@ impl KPageTableBase {
             disable_merge_attributes: DisableMergeAttribute::DISABLE_HEAD,
         };
         let op_result = self.operate(
-            None,
+            Some(updater.page_list()),
             addr,
             num_pages,
             phys_addr,
@@ -2753,7 +3200,8 @@ impl KPageTableBase {
         }
 
         // Update block manager.
-        self.update_blocks(
+        self.update_blocks_with_allocator(
+            &mut allocator,
             addr,
             num_pages,
             KMemoryState::STATIC,
@@ -2780,11 +3228,21 @@ impl KPageTableBase {
         let region_size = self.get_region_size(SvcMemoryState::Io);
         let region_num_pages = region_size / PAGE_SIZE;
 
+        let general_lock = self.m_general_lock.clone();
+        let _lock_guard = KScopedLightLock::new(general_lock.as_ref());
+
         // Find a free area.
         let addr = self.find_free_area(region_start, region_num_pages, num_pages, PAGE_SIZE, 0, 0);
         if addr == 0 {
             return svc_results::RESULT_OUT_OF_MEMORY.get_inner_value();
         }
+
+        let Ok(mut allocator) = self.make_block_update_allocator(
+            super::k_dynamic_resource_manager::KMemoryBlockManagerUpdateAllocator::MAX_BLOCKS,
+        ) else {
+            return svc_results::RESULT_OUT_OF_RESOURCE.get_inner_value();
+        };
+        let mut updater = KScopedPageTableUpdater::from_mut(self);
 
         // Map the pages.
         let properties = KPageProperties {
@@ -2794,7 +3252,7 @@ impl KPageTableBase {
             disable_merge_attributes: DisableMergeAttribute::DISABLE_HEAD,
         };
         let op_result = self.operate(
-            None,
+            Some(updater.page_list()),
             addr,
             num_pages,
             phys_addr,
@@ -2807,12 +3265,13 @@ impl KPageTableBase {
         }
 
         // Update block manager.
-        self.update_blocks(
+        self.update_blocks_with_allocator(
+            &mut allocator,
             addr,
             num_pages,
             KMemoryState::IO_REGISTER,
             perm,
-            KMemoryAttribute::NONE,
+            KMemoryAttribute::LOCKED,
             KMemoryBlockDisableMergeAttribute::NORMAL,
             KMemoryBlockDisableMergeAttribute::NONE,
         );
@@ -2828,14 +3287,31 @@ impl KPageTableBase {
 
     /// Map a kernel memory region by type.
     /// Matches upstream `KPageTableBase::MapRegion`.
-    pub fn map_region(&mut self, _region_type: u32, _perm: KMemoryPermission) -> u32 {
-        // Upstream: looks up the region in KMemoryLayout, gets physical address/size,
-        // delegates to MapStatic. KMemoryLayout is not yet ported.
-        log::debug!(
-            "KPageTableBase::map_region(type={}) — KMemoryLayout not yet ported",
-            _region_type
-        );
-        0
+    pub fn map_region(&mut self, region_type: u32, perm: KMemoryPermission) -> u32 {
+        let Some(layout) = crate::hle::kernel::kernel::get_kernel_ref()
+            .and_then(|kernel| kernel.get_memory_layout())
+        else {
+            return svc_results::RESULT_OUT_OF_RANGE.get_inner_value();
+        };
+
+        let region = {
+            let layout = layout.lock().unwrap();
+            let found = layout
+                .get_physical_memory_region_tree()
+                .iter()
+                .find(|region| region.is_derived_from_raw(region_type))
+                .map(|region| (region.get_address(), region.get_size()));
+            found
+        };
+        let Some((phys_addr, size)) = region else {
+            return svc_results::RESULT_OUT_OF_RANGE.get_inner_value();
+        };
+
+        let result = self.map_static(phys_addr, size, perm);
+        if result == svc_results::RESULT_INVALID_ADDRESS.get_inner_value() {
+            return svc_results::RESULT_OUT_OF_RANGE.get_inner_value();
+        }
+        result
     }
 
     // -- MapPages --
@@ -2865,6 +3341,9 @@ impl KPageTableBase {
             return (svc_results::RESULT_OUT_OF_MEMORY.get_inner_value(), 0);
         }
 
+        let general_lock = self.m_general_lock.clone();
+        let _lock_guard = KScopedLightLock::new(general_lock.as_ref());
+
         // Find free area.
         let addr = self.find_free_area(
             region_start,
@@ -2893,6 +3372,14 @@ impl KPageTableBase {
             return (result, 0);
         }
 
+        let mut allocator = match self.make_block_update_allocator(
+            super::k_dynamic_resource_manager::KMemoryBlockManagerUpdateAllocator::MAX_BLOCKS,
+        ) {
+            Ok(allocator) => allocator,
+            Err(rc) => return (rc, 0),
+        };
+        let mut updater = KScopedPageTableUpdater::from_mut(self);
+
         // Map.
         if is_pa_valid {
             let properties = KPageProperties {
@@ -2902,7 +3389,7 @@ impl KPageTableBase {
                 disable_merge_attributes: DisableMergeAttribute::DISABLE_HEAD,
             };
             let op_result = self.operate(
-                None,
+                Some(updater.page_list()),
                 addr,
                 num_pages,
                 phys_addr,
@@ -2914,65 +3401,16 @@ impl KPageTableBase {
                 return (op_result, 0);
             }
         } else {
-            // Allocate physical pages from the kernel memory manager pool.
-            //
-            // Upstream: `KPageTableBase::AllocateAndMapPagesImpl(...)`
-            //   pg = KPageGroup; m_kernel.MemoryManager().AllocateAndOpen(&pg, ...);
-            //   Operate(MapGroup, ...).
-            //
-            // Previous ruzu code computed `auto_phys = DRAM_BASE + addr` which
-            // implicitly assumed every guest virtual address fit inside the host
-            // backing buffer. For ARM64 user processes whose virtual address
-            // space spans 512 GB but the host buffer is 4 GB, this assertion
-            // failed in `HostMemory::map`. Allocating from the pool returns a
-            // physical address inside the bounded DRAM region, matching upstream
-            // and satisfying the host-memory bounds check.
-            let alloc_option = self.m_allocate_option;
-            let phys_addr = if let Some(kernel) = crate::hle::kernel::kernel::get_kernel_mut() {
-                kernel
-                    .memory_manager_mut()
-                    .allocate_and_open_continuous(num_pages, 1, alloc_option)
-            } else {
-                0
-            };
-            if phys_addr == 0 {
-                log::error!(
-                    "map_pages_find_free: AllocateAndOpenContinuous failed ({} pages, option=0x{:X})",
-                    num_pages,
-                    alloc_option
-                );
-                return (svc_results::RESULT_OUT_OF_MEMORY.get_inner_value(), 0);
-            }
-            let properties = KPageProperties {
-                perm,
-                io: false,
-                uncached: false,
-                disable_merge_attributes: DisableMergeAttribute::DISABLE_HEAD,
-            };
-            let op_result = self.operate(
-                None,
-                addr,
-                num_pages,
-                phys_addr,
-                true,
-                properties,
-                OperationType::Map,
-            );
+            let op_result =
+                self.allocate_and_map_pages_impl(Some(updater.page_list()), addr, num_pages, perm);
             if op_result != 0 {
-                if let Some(kernel) = crate::hle::kernel::kernel::get_kernel_mut() {
-                    kernel.memory_manager_mut().close(phys_addr, num_pages);
-                }
                 return (op_result, 0);
             }
-            if let Some(kernel) = crate::hle::kernel::kernel::get_kernel_mut() {
-                kernel.memory_manager_mut().close(phys_addr, num_pages);
-            }
-
-            self.clear_fresh_backing_region(addr, num_pages * PAGE_SIZE);
         }
 
         // Update blocks.
-        self.update_blocks(
+        self.update_blocks_with_allocator(
+            &mut allocator,
             addr,
             num_pages,
             state,
@@ -2994,14 +3432,16 @@ impl KPageTableBase {
         state: KMemoryState,
         perm: KMemoryPermission,
     ) -> u32 {
-        let _updater = KScopedPageTableUpdater::from_mut(self);
         let size = num_pages * PAGE_SIZE;
         if !self.can_contain_k(addr, size, state) {
             return svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value();
         }
 
+        let general_lock = self.m_general_lock.clone();
+        let _lock_guard = KScopedLightLock::new(general_lock.as_ref());
+
         // Check the target area is free.
-        let result = self.check_memory_state(
+        let (result, _, _, _, num_allocator_blocks) = self.check_memory_state_range(
             addr,
             size,
             KMemoryState::ALL,
@@ -3010,78 +3450,27 @@ impl KPageTableBase {
             KMemoryPermission::NONE,
             KMemoryAttribute::NONE,
             KMemoryAttribute::NONE,
+            Self::DEFAULT_MEMORY_IGNORE_ATTR,
         );
         if result != 0 {
             return result;
         }
 
-        // Map the pages — upstream calls `AllocateAndMapPagesImpl` here.
-        // We inline that helper:
-        //
-        //   KPageGroup pg(m_kernel, m_block_info_manager);
-        //   R_TRY(m_kernel.MemoryManager().AllocateAndOpen(&pg, num_pages,
-        //                                                  m_allocate_option));
-        //   SCOPE_EXIT { pg.Close(); };
-        //   for (auto& it : pg) ClearBackingRegion(it);
-        //   R_RETURN(Operate(MapGroup, addr, num_pages, pg, ...));
-        let alloc_option = self.m_allocate_option;
-        let mut pg = super::k_page_group::KPageGroup::with_kernel();
-        {
-            let Some(kernel) = crate::hle::kernel::kernel::get_kernel_mut() else {
-                return svc_results::RESULT_OUT_OF_MEMORY.get_inner_value();
-            };
-            let rc =
-                kernel
-                    .memory_manager_mut()
-                    .allocate_and_open(&mut pg, num_pages, alloc_option);
-            if rc != 0 {
-                return rc;
-            }
-        }
-
-        // RAII close the open-first reference at end of scope. operate(MapGroup)
-        // adds a second reference; dropping `pg` brings net refcount to 1
-        // (held by the mapping). On failure path, also drops the reference
-        // back to 0 so the pool reclaims the pages.
-        struct PgCloseGuard<'a> {
-            pg: &'a mut super::k_page_group::KPageGroup,
-        }
-        impl<'a> Drop for PgCloseGuard<'a> {
-            fn drop(&mut self) {
-                self.pg.close();
-            }
-        }
-        let pg_guard = PgCloseGuard { pg: &mut pg };
-
-        // Clear all the newly allocated pages (upstream's per-block
-        // ClearBackingRegion loop). Acts on physical addresses since the
-        // virtual mapping is not yet established.
-        for block in pg_guard.pg.iter() {
-            self.clear_fresh_backing_region_phys(block.get_address(), block.get_size());
-        }
-
-        // Operate(MapGroup, ...).
-        let properties = KPageProperties {
-            perm,
-            io: false,
-            uncached: false,
-            disable_merge_attributes: DisableMergeAttribute::NONE,
+        let mut allocator = match self.make_block_update_allocator(num_allocator_blocks) {
+            Ok(allocator) => allocator,
+            Err(rc) => return rc,
         };
-        let op_result = self.operate_with_group(
-            None,
-            addr,
-            num_pages,
-            pg_guard.pg,
-            properties,
-            OperationType::MapGroup,
-        );
+        let mut updater = KScopedPageTableUpdater::from_mut(self);
+
+        let op_result =
+            self.allocate_and_map_pages_impl(Some(updater.page_list()), addr, num_pages, perm);
         if op_result != 0 {
             return op_result;
         }
 
-        // Update blocks (upstream uses KMemoryBlockManagerUpdateAllocator;
-        // ruzu's update path doesn't preallocate slab nodes — see TODO).
-        self.update_blocks(
+        // Update blocks.
+        self.update_blocks_with_allocator(
+            &mut allocator,
             addr,
             num_pages,
             state,
@@ -3090,7 +3479,6 @@ impl KPageTableBase {
             KMemoryBlockDisableMergeAttribute::NORMAL,
             KMemoryBlockDisableMergeAttribute::NONE,
         );
-        drop(pg_guard);
         0
     }
 
@@ -3102,8 +3490,11 @@ impl KPageTableBase {
             return svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value();
         }
 
+        let general_lock = self.m_general_lock.clone();
+        let _lock_guard = KScopedLightLock::new(general_lock.as_ref());
+
         // Check the state matches.
-        let result = self.check_memory_state(
+        let (result, _, _, _, num_allocator_blocks) = self.check_memory_state_range(
             addr,
             size,
             KMemoryState::ALL,
@@ -3112,10 +3503,17 @@ impl KPageTableBase {
             KMemoryPermission::NONE,
             KMemoryAttribute::from_bits_truncate(0xFF),
             KMemoryAttribute::NONE,
+            Self::DEFAULT_MEMORY_IGNORE_ATTR,
         );
         if result != 0 {
             return result;
         }
+
+        let mut allocator = match self.make_block_update_allocator(num_allocator_blocks) {
+            Ok(allocator) => allocator,
+            Err(rc) => return rc,
+        };
+        let mut updater = KScopedPageTableUpdater::from_mut(self);
 
         // Unmap.
         let unmap_props = KPageProperties {
@@ -3125,7 +3523,7 @@ impl KPageTableBase {
             disable_merge_attributes: DisableMergeAttribute::NONE,
         };
         let op_result = self.operate(
-            None,
+            Some(updater.page_list()),
             addr,
             num_pages,
             0,
@@ -3138,7 +3536,8 @@ impl KPageTableBase {
         }
 
         // Update blocks.
-        self.update_blocks(
+        self.update_blocks_with_allocator(
+            &mut allocator,
             addr,
             num_pages,
             KMemoryState::FREE,
@@ -3161,25 +3560,29 @@ impl KPageTableBase {
         perm: KMemoryPermission,
     ) -> u32 {
         let num_pages = size / PAGE_SIZE;
+        let general_lock = self.m_general_lock.clone();
+        let _lock_guard = super::k_light_lock::KScopedLightLock::new(general_lock.as_ref());
 
         // Check current state — must be Code-flagged.
-        let (result, out_state, out_perm, _out_attr, _) = self.check_memory_state_range(
-            addr,
-            size,
-            KMemoryState::FLAG_CODE,
-            KMemoryState::FLAG_CODE,
-            KMemoryPermission::NONE,
-            KMemoryPermission::NONE,
-            KMemoryAttribute::from_bits_truncate(0xFF),
-            KMemoryAttribute::NONE,
-            Self::DEFAULT_MEMORY_IGNORE_ATTR,
-        );
+        let (result, out_state, out_perm, _out_attr, num_allocator_blocks) = self
+            .check_memory_state_range(
+                addr,
+                size,
+                KMemoryState::FLAG_CODE,
+                KMemoryState::FLAG_CODE,
+                KMemoryPermission::NONE,
+                KMemoryPermission::NONE,
+                KMemoryAttribute::from_bits_truncate(0xFF),
+                KMemoryAttribute::NONE,
+                Self::DEFAULT_MEMORY_IGNORE_ATTR,
+            );
         if result != 0 {
             return result;
         }
 
         let old_state = out_state.unwrap_or(KMemoryState::CODE);
         let old_perm = out_perm.unwrap_or(KMemoryPermission::NONE);
+        let mut pg = super::k_page_group::KPageGroup::with_kernel();
 
         // Determine new state based on permission being set.
         let is_w = perm.contains(KMemoryPermission::USER_WRITE);
@@ -3199,10 +3602,23 @@ impl KPageTableBase {
             old_state
         };
 
+        if is_x {
+            let result = self.make_page_group(&mut pg, addr, num_pages);
+            if result != 0 {
+                return result;
+            }
+        }
+
         // Nothing to do if perm and state are unchanged.
         if old_perm == perm && old_state == new_state {
             return 0;
         }
+
+        let mut allocator = match self.make_block_update_allocator(num_allocator_blocks) {
+            Ok(allocator) => allocator,
+            Err(rc) => return rc,
+        };
+        let mut updater = KScopedPageTableUpdater::from_mut(self);
 
         // Change permissions via Operate.
         let operation = if was_x {
@@ -3216,13 +3632,22 @@ impl KPageTableBase {
             uncached: false,
             disable_merge_attributes: DisableMergeAttribute::NONE,
         };
-        let op_result = self.operate(None, addr, num_pages, 0, false, properties, operation);
+        let op_result = self.operate(
+            Some(updater.page_list()),
+            addr,
+            num_pages,
+            0,
+            false,
+            properties,
+            operation,
+        );
         if op_result != 0 {
             return op_result;
         }
 
         // Update block manager.
-        self.update_blocks(
+        self.update_blocks_with_allocator(
+            &mut allocator,
             addr,
             num_pages,
             new_state,
@@ -3232,7 +3657,15 @@ impl KPageTableBase {
             KMemoryBlockDisableMergeAttribute::NONE,
         );
 
-        // Upstream: if is_x, invalidate instruction cache via StoreProcessAndFlushDataCache
+        if is_x {
+            for block in pg.iter() {
+                let rc = store_data_cache(block.get_address(), block.get_size());
+                if rc != 0 {
+                    return rc;
+                }
+            }
+            invalidate_instruction_cache_for_table(self, addr, size);
+        }
         0
     }
 
@@ -3256,14 +3689,17 @@ impl KPageTableBase {
         if !self.is_in_alias_region(addr, size) {
             return svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value();
         }
+        let physical_memory_lock = self.m_map_physical_memory_lock.clone();
+        let _physical_memory_lock_guard =
+            super::k_light_lock::KScopedLightLock::new(physical_memory_lock.as_ref());
         let last_address = addr + size - 1;
-
-        let _updater = KScopedPageTableUpdater::from_mut(self);
 
         loop {
             // === Phase 1: count already-mapped bytes ===
             let mut mapped_size: usize = 0;
             {
+                let general_lock = self.m_general_lock.clone();
+                let _lock_guard = super::k_light_lock::KScopedLightLock::new(general_lock.as_ref());
                 let mut cur_address = addr;
                 for info in self.m_memory_block_manager.find_iterator(cur_address) {
                     let info_state = info.get_state();
@@ -3320,7 +3756,10 @@ impl KPageTableBase {
             // and phase 3 (mapped_size changed), drop pg (auto-close) and
             // retry. ruzu is single-threaded per process so this always
             // matches; the loop is structural for fidelity.
+            let general_lock = self.m_general_lock.clone();
+            let _lock_guard = super::k_light_lock::KScopedLightLock::new(general_lock.as_ref());
             let mut checked_mapped: usize = 0;
+            let mut num_allocator_blocks: usize = 0;
             {
                 let mut cur_address = addr;
                 for info in self.m_memory_block_manager.find_iterator(cur_address) {
@@ -3328,7 +3767,14 @@ impl KPageTableBase {
                     let info_end = info.get_end_address();
                     let info_last = info.get_last_address();
                     let in_range_end = info_last.min(last_address);
-                    if info_state != KMemoryState::FREE {
+                    if info_state == KMemoryState::FREE {
+                        if info.get_address() < addr {
+                            num_allocator_blocks += 1;
+                        }
+                        if last_address < info_last {
+                            num_allocator_blocks += 1;
+                        }
+                    } else {
                         checked_mapped += in_range_end + 1 - cur_address;
                     }
                     if last_address <= info_last {
@@ -3342,6 +3788,13 @@ impl KPageTableBase {
                 Self::release_unowned_page_group(&pg);
                 continue;
             }
+
+            let mut allocator = match self.make_block_update_allocator(num_allocator_blocks) {
+                Ok(allocator) => allocator,
+                Err(rc) => return rc,
+            };
+            let mut updater = KScopedPageTableUpdater::from_mut(self);
+            let updater_page_list = updater.page_list();
 
             // Iterate FREE ranges, slicing pages off the page group as we go.
             // Snapshot block boundaries first so we don't borrow the block
@@ -3390,7 +3843,7 @@ impl KPageTableBase {
                     }
                     let chunk = needed.min(pg_remaining);
                     if cur_pg.add_block(pg_phys, chunk).is_err() {
-                        self.rollback_partial_map_physical(addr, range_va);
+                        self.rollback_partial_map_physical(addr, range_va, &mut *updater_page_list);
                         Self::release_unowned_physical_pages_from(
                             &pg_blocks,
                             pg_idx,
@@ -3415,7 +3868,7 @@ impl KPageTableBase {
                     },
                 };
                 let rc = self.operate_with_group(
-                    None,
+                    Some(&mut *updater_page_list),
                     range_va,
                     range_pages,
                     &cur_pg,
@@ -3423,7 +3876,7 @@ impl KPageTableBase {
                     OperationType::MapFirstGroupPhysical,
                 );
                 if rc != 0 {
-                    self.rollback_partial_map_physical(addr, range_va);
+                    self.rollback_partial_map_physical(addr, range_va, &mut *updater_page_list);
                     Self::release_unowned_physical_pages_from(
                         &pg_blocks,
                         pg_idx,
@@ -3438,7 +3891,8 @@ impl KPageTableBase {
             // MapFirstGroupPhysical calls opened the page references now owned
             // by the mappings; `pg` itself only finalizes its block list.
             memory_reservation.commit();
-            self.m_memory_block_manager.update_if_match(
+            self.m_memory_block_manager.update_if_match_with_allocator(
+                Some(&mut allocator),
                 addr,
                 size / PAGE_SIZE,
                 KMemoryState::FREE,
@@ -3462,7 +3916,12 @@ impl KPageTableBase {
     /// Roll back a partial `map_physical_memory` failure by unmapping the
     /// FREE ranges in `[addr, last_unmap_address+1)` that we just touched.
     /// Mirrors upstream's `ON_RESULT_FAILURE` lambda in MapPhysicalMemory.
-    fn rollback_partial_map_physical(&mut self, addr: usize, last_unmap_address: usize) {
+    fn rollback_partial_map_physical(
+        &mut self,
+        addr: usize,
+        last_unmap_address: usize,
+        page_list: &mut PageLinkedList,
+    ) {
         if last_unmap_address <= addr {
             return;
         }
@@ -3493,7 +3952,7 @@ impl KPageTableBase {
         };
         for (va, pages) in free_ranges {
             let _ = self.operate(
-                None,
+                Some(&mut *page_list),
                 va,
                 pages,
                 0,
@@ -3553,11 +4012,17 @@ impl KPageTableBase {
         if !self.is_in_alias_region(addr, size) {
             return svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value();
         }
+        let physical_memory_lock = self.m_map_physical_memory_lock.clone();
+        let _physical_memory_lock_guard =
+            super::k_light_lock::KScopedLightLock::new(physical_memory_lock.as_ref());
+        let general_lock = self.m_general_lock.clone();
+        let _lock_guard = super::k_light_lock::KScopedLightLock::new(general_lock.as_ref());
         let last_address = addr + size - 1;
 
         let mut mapped_size = 0usize;
         let mut map_start_address = 0usize;
         let mut map_last_address = 0usize;
+        let mut num_allocator_blocks = 0usize;
         let mut normal_ranges: Vec<(usize, usize)> = Vec::new();
         {
             let mut cur_address = addr;
@@ -3576,6 +4041,12 @@ impl KPageTableBase {
                         map_start_address = cur_address;
                     }
                     map_last_address = in_range_end;
+                    if info.get_address() < addr {
+                        num_allocator_blocks += 1;
+                    }
+                    if last_address < info_last {
+                        num_allocator_blocks += 1;
+                    }
                     let pages = (in_range_end + 1 - cur_address) / PAGE_SIZE;
                     normal_ranges.push((cur_address, pages));
                     mapped_size += in_range_end + 1 - cur_address;
@@ -3591,7 +4062,12 @@ impl KPageTableBase {
             return 0;
         }
 
-        let _updater = KScopedPageTableUpdater::from_mut(self);
+        let mut allocator = match self.make_block_update_allocator(num_allocator_blocks) {
+            Ok(allocator) => allocator,
+            Err(rc) => return rc,
+        };
+        let mut updater = KScopedPageTableUpdater::from_mut(self);
+        let updater_page_list = updater.page_list();
 
         let unmap_props = KPageProperties {
             perm: KMemoryPermission::NONE,
@@ -3601,7 +4077,7 @@ impl KPageTableBase {
         };
 
         let separate_result = self.operate(
-            None,
+            Some(&mut *updater_page_list),
             map_start_address,
             (map_last_address + 1 - map_start_address) / PAGE_SIZE,
             0,
@@ -3615,7 +4091,7 @@ impl KPageTableBase {
 
         for (range_addr, range_pages) in normal_ranges {
             let op_result = self.operate(
-                None,
+                Some(&mut *updater_page_list),
                 range_addr,
                 range_pages,
                 0,
@@ -3628,28 +4104,19 @@ impl KPageTableBase {
             }
         }
 
-        self.update_blocks(
-            addr,
-            size / PAGE_SIZE,
-            KMemoryState::FREE,
-            KMemoryPermission::NONE,
-            KMemoryAttribute::NONE,
-            KMemoryBlockDisableMergeAttribute::NONE,
-            if self
-                .m_memory_block_manager
-                .find_iterator(addr)
-                .next()
-                .is_some_and(|info| {
-                    info.get_state() == KMemoryState::NORMAL
-                        && info.get_address() == self.get_alias_region_start()
-                        && info.get_address() == addr
-                })
-            {
-                KMemoryBlockDisableMergeAttribute::NORMAL
-            } else {
-                KMemoryBlockDisableMergeAttribute::NONE
-            },
-        );
+        let clear_merge_attr = if self
+            .m_memory_block_manager
+            .find_iterator(addr)
+            .next()
+            .is_some_and(|info| {
+                info.get_state() == KMemoryState::NORMAL
+                    && info.get_address() == self.get_alias_region_start()
+                    && info.get_address() == addr
+            }) {
+            KMemoryBlockDisableMergeAttribute::NORMAL
+        } else {
+            KMemoryBlockDisableMergeAttribute::NONE
+        };
         self.m_mapped_physical_memory_size = self
             .m_mapped_physical_memory_size
             .saturating_sub(mapped_size);
@@ -3659,6 +4126,16 @@ impl KPageTableBase {
                 .unwrap()
                 .release(LimitableResource::PhysicalMemoryMax, mapped_size as i64);
         }
+        self.update_blocks_with_allocator(
+            &mut allocator,
+            addr,
+            size / PAGE_SIZE,
+            KMemoryState::FREE,
+            KMemoryPermission::NONE,
+            KMemoryAttribute::NONE,
+            KMemoryBlockDisableMergeAttribute::NONE,
+            clear_merge_attr,
+        );
         0
     }
 
@@ -3716,31 +4193,36 @@ impl KPageTableBase {
     /// Map code memory: copies src pages to dst, reprotects src as KernelRead|NotMapped.
     /// Matches upstream `KPageTableBase::MapCodeMemory`.
     pub fn map_code_memory(&mut self, dst: usize, src: usize, size: usize) -> u32 {
-        let _updater = KScopedPageTableUpdater::from_mut(self);
         let num_pages = size / PAGE_SIZE;
 
         if !self.can_contain(dst, size, SvcMemoryState::AliasCode) {
             return svc_results::RESULT_INVALID_MEMORY_REGION.get_inner_value();
         }
 
+        let general_lock = self.m_general_lock.clone();
+        let _lock_guard = super::k_light_lock::KScopedLightLock::new(general_lock.as_ref());
+
         // Check source: Normal, UserReadWrite.
-        let (result, _, _, _, _) = self.check_memory_state_range(
-            src,
-            size,
-            KMemoryState::ALL,
-            KMemoryState::NORMAL,
-            KMemoryPermission::from_bits_truncate(0xFF),
-            KMemoryPermission::USER_READ_WRITE,
-            KMemoryAttribute::from_bits_truncate(0xFF),
-            KMemoryAttribute::NONE,
-            Self::DEFAULT_MEMORY_IGNORE_ATTR,
-        );
+        let (result, src_state, src_perm, _, num_src_allocator_blocks) = self
+            .check_memory_state_range(
+                src,
+                size,
+                KMemoryState::ALL,
+                KMemoryState::NORMAL,
+                KMemoryPermission::from_bits_truncate(0xFF),
+                KMemoryPermission::USER_READ_WRITE,
+                KMemoryAttribute::from_bits_truncate(0xFF),
+                KMemoryAttribute::NONE,
+                Self::DEFAULT_MEMORY_IGNORE_ATTR,
+            );
         if result != 0 {
             return result;
         }
+        let src_state = src_state.unwrap_or(KMemoryState::NORMAL);
+        let src_perm = src_perm.unwrap_or(KMemoryPermission::USER_READ_WRITE);
 
         // Check destination: Free.
-        let result = self.check_memory_state(
+        let (result, _, _, _, num_dst_allocator_blocks) = self.check_memory_state_range(
             dst,
             size,
             KMemoryState::ALL,
@@ -3749,11 +4231,29 @@ impl KPageTableBase {
             KMemoryPermission::NONE,
             KMemoryAttribute::NONE,
             KMemoryAttribute::NONE,
+            Self::DEFAULT_MEMORY_IGNORE_ATTR,
         );
         if result != 0 {
             return result;
         }
 
+        let mut src_allocator = match self.make_block_update_allocator(num_src_allocator_blocks) {
+            Ok(allocator) => allocator,
+            Err(rc) => return rc,
+        };
+        let mut dst_allocator = match self.make_block_update_allocator(num_dst_allocator_blocks) {
+            Ok(allocator) => allocator,
+            Err(rc) => return rc,
+        };
+
+        // Build a KPageGroup describing src's existing physical pages before reprotecting it.
+        let mut pg = super::k_page_group::KPageGroup::with_kernel();
+        let mpg_rc = self.make_page_group(&mut pg, src, num_pages);
+        if mpg_rc != 0 {
+            return mpg_rc;
+        }
+
+        let mut updater = KScopedPageTableUpdater::from_mut(self);
         let new_perm = KMemoryPermission::from_bits_truncate(
             KMemoryPermission::KERNEL_READ.bits() | KMemoryPermission::NOT_MAPPED.bits(),
         );
@@ -3766,7 +4266,7 @@ impl KPageTableBase {
             disable_merge_attributes: DisableMergeAttribute::DISABLE_HEAD_BODY_TAIL,
         };
         let op = self.operate(
-            None,
+            Some(updater.page_list()),
             src,
             num_pages,
             0,
@@ -3778,38 +4278,23 @@ impl KPageTableBase {
             return op;
         }
 
-        // Build a KPageGroup describing src's existing physical pages.
-        // Upstream:
-        //   KPageGroup pg(m_kernel, m_block_info_manager);
-        //   R_TRY(this->MakePageGroup(pg, src_address, num_pages));
-        let mut pg = super::k_page_group::KPageGroup::new();
-        let mpg_rc = self.make_page_group(&mut pg, src, num_pages);
-        if mpg_rc != 0 {
-            return mpg_rc;
-        }
-
-        // Map dst with that page group via MapPageGroupImpl. Upstream:
-        //   const KPageProperties dst_properties = {new_perm, false, false,
-        //                                           DisableMergeAttribute::DisableHead};
-        //   R_TRY(this->MapPageGroupImpl(updater.GetPageList(), dst_address,
-        //                                 pg, dst_properties, false));
-        // On failure, restore src's permissions.
+        // Map dst with that page group via MapPageGroupImpl. On failure, restore src's permissions.
         let dst_props = KPageProperties {
             perm: new_perm,
             io: false,
             uncached: false,
             disable_merge_attributes: DisableMergeAttribute::DISABLE_HEAD,
         };
-        let revert = KPageProperties {
-            perm: KMemoryPermission::USER_READ_WRITE,
-            io: false,
-            uncached: false,
-            disable_merge_attributes: DisableMergeAttribute::ENABLE_HEAD_BODY_TAIL,
-        };
-        let map_rc = self.map_page_group_impl(None, dst, &pg, dst_props);
+        let map_rc = self.map_page_group_impl(Some(updater.page_list()), dst, &pg, dst_props);
         if map_rc != 0 {
+            let revert = KPageProperties {
+                perm: src_perm,
+                io: false,
+                uncached: false,
+                disable_merge_attributes: DisableMergeAttribute::ENABLE_HEAD_BODY_TAIL,
+            };
             let _ = self.operate(
-                None,
+                Some(updater.page_list()),
                 src,
                 num_pages,
                 0,
@@ -3821,16 +4306,18 @@ impl KPageTableBase {
         }
 
         // Update blocks.
-        self.update_blocks(
+        self.update_blocks_with_allocator(
+            &mut src_allocator,
             src,
             num_pages,
-            KMemoryState::NORMAL,
+            src_state,
             new_perm,
             KMemoryAttribute::LOCKED,
             KMemoryBlockDisableMergeAttribute::LOCKED,
             KMemoryBlockDisableMergeAttribute::NONE,
         );
-        self.update_blocks(
+        self.update_blocks_with_allocator(
+            &mut dst_allocator,
             dst,
             num_pages,
             KMemoryState::ALIAS_CODE,
@@ -3851,8 +4338,11 @@ impl KPageTableBase {
             return svc_results::RESULT_INVALID_MEMORY_REGION.get_inner_value();
         }
 
+        let general_lock = self.m_general_lock.clone();
+        let _lock_guard = super::k_light_lock::KScopedLightLock::new(general_lock.as_ref());
+
         // Check source: Normal, Locked.
-        let result = self.check_memory_state(
+        let (result, num_src_allocator_blocks) = self.check_memory_state_contiguous(
             src,
             size,
             KMemoryState::ALL,
@@ -3866,6 +4356,52 @@ impl KPageTableBase {
             return result;
         }
 
+        let (result, num_dst_allocator_blocks) = self.check_memory_state_contiguous(
+            dst,
+            size,
+            KMemoryState::FLAG_CAN_CODE_ALIAS,
+            KMemoryState::FLAG_CAN_CODE_ALIAS,
+            KMemoryPermission::NONE,
+            KMemoryPermission::NONE,
+            KMemoryAttribute::from_bits_truncate(0xFF) & !KMemoryAttribute::PERMISSION_LOCKED,
+            KMemoryAttribute::NONE,
+        );
+        if result != 0 {
+            return result;
+        }
+
+        let mut any_code_pages = false;
+        let last_address = dst + size - 1;
+        for info in self.m_memory_block_manager.find_iterator(dst) {
+            if info.get_state().intersects(KMemoryState::FLAG_CODE) {
+                any_code_pages = true;
+                break;
+            }
+            if last_address <= info.get_last_address() {
+                break;
+            }
+        }
+
+        let mut pg = super::k_page_group::KPageGroup::with_kernel();
+        let result = self.make_page_group(&mut pg, dst, num_pages);
+        if result != 0 {
+            return result;
+        }
+        if !self.is_valid_page_group(&pg, src, num_pages) {
+            return svc_results::RESULT_INVALID_MEMORY_REGION.get_inner_value();
+        }
+
+        let mut src_allocator = match self.make_block_update_allocator(num_src_allocator_blocks) {
+            Ok(allocator) => allocator,
+            Err(rc) => return rc,
+        };
+        let mut dst_allocator = match self.make_block_update_allocator(num_dst_allocator_blocks) {
+            Ok(allocator) => allocator,
+            Err(rc) => return rc,
+        };
+
+        let mut updater = KScopedPageTableUpdater::from_mut(self);
+
         // Unmap dst.
         let unmap_props = KPageProperties {
             perm: KMemoryPermission::NONE,
@@ -3874,7 +4410,7 @@ impl KPageTableBase {
             disable_merge_attributes: DisableMergeAttribute::NONE,
         };
         let op = self.operate(
-            None,
+            Some(updater.page_list()),
             dst,
             num_pages,
             0,
@@ -3886,7 +4422,7 @@ impl KPageTableBase {
             return op;
         }
 
-        // Restore source permissions.
+        // Restore source permissions. On failure, restore the destination alias mapping.
         let restore_props = KPageProperties {
             perm: KMemoryPermission::USER_READ_WRITE,
             io: false,
@@ -3894,7 +4430,7 @@ impl KPageTableBase {
             disable_merge_attributes: DisableMergeAttribute::ENABLE_AND_MERGE_HEAD_BODY_TAIL,
         };
         let op = self.operate(
-            None,
+            Some(updater.page_list()),
             src,
             num_pages,
             0,
@@ -3903,11 +4439,13 @@ impl KPageTableBase {
             OperationType::ChangePermissions,
         );
         if op != 0 {
+            self.remap_page_group(Some(updater.page_list()), dst, size, &pg);
             return op;
         }
 
         // Update blocks.
-        self.update_blocks(
+        self.update_blocks_with_allocator(
+            &mut dst_allocator,
             dst,
             num_pages,
             KMemoryState::NONE,
@@ -3916,7 +4454,8 @@ impl KPageTableBase {
             KMemoryBlockDisableMergeAttribute::NONE,
             KMemoryBlockDisableMergeAttribute::NORMAL,
         );
-        self.update_blocks(
+        self.update_blocks_with_allocator(
+            &mut src_allocator,
             src,
             num_pages,
             KMemoryState::NORMAL,
@@ -3925,6 +4464,9 @@ impl KPageTableBase {
             KMemoryBlockDisableMergeAttribute::NONE,
             KMemoryBlockDisableMergeAttribute::LOCKED,
         );
+        if any_code_pages {
+            invalidate_instruction_cache_for_table(self, dst, size);
+        }
         0
     }
 
@@ -4112,6 +4654,8 @@ impl KPageTableBase {
     /// Get the total size of memory in a given state.
     /// Matches upstream `KPageTableBase::GetSize`.
     pub fn get_size_by_state(&self, state: KMemoryState) -> usize {
+        let general_lock = self.m_general_lock.clone();
+        let _lock_guard = KScopedLightLock::new(general_lock.as_ref());
         let mut total = 0usize;
         for block in self
             .m_memory_block_manager
@@ -4189,13 +4733,92 @@ impl KPageTableBase {
     // -- Data Cache --
 
     /// Matches upstream `KPageTableBase::InvalidateProcessDataCache`.
-    pub fn invalidate_process_data_cache(&self, _addr: usize, _size: usize) -> u32 {
-        // In the emulator, data cache ops are no-ops (no real cache coherency issues).
+    pub fn invalidate_process_data_cache(&self, addr: usize, size: usize) -> u32 {
+        if !self.contains_range(addr, size) {
+            return svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value();
+        }
+
+        let _lock = KScopedLightLock::new(&self.m_general_lock);
+        let (result, _) = self.check_memory_state_contiguous(
+            addr,
+            size,
+            KMemoryState::FLAG_REFERENCE_COUNTED,
+            KMemoryState::FLAG_REFERENCE_COUNTED,
+            KMemoryPermission::USER_READ_WRITE,
+            KMemoryPermission::USER_READ_WRITE,
+            KMemoryAttribute::UNCACHED,
+            KMemoryAttribute::NONE,
+        );
+        if result != 0 {
+            return result;
+        }
+
+        let Some(impl_pt) = self.m_impl.as_ref() else {
+            return svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value();
+        };
+        let Some((mut entry, mut context)) = impl_pt.begin_traversal(addr as u64) else {
+            return svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value();
+        };
+
+        let mut cur_addr = entry.phys_addr;
+        let mut cur_size = entry.block_size - ((cur_addr as usize) & (entry.block_size - 1));
+        let mut total_size = cur_size;
+
+        while total_size < size {
+            let Some(next_entry) = impl_pt.continue_traversal(&mut context) else {
+                return svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value();
+            };
+            entry = next_entry;
+
+            if entry.phys_addr != cur_addr.wrapping_add(cur_size as u64) {
+                if !is_heap_physical_address_for_table(cur_addr) {
+                    return svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value();
+                }
+                cur_addr = entry.phys_addr;
+                cur_size = entry.block_size;
+            } else {
+                cur_size += entry.block_size;
+            }
+
+            total_size += entry.block_size;
+        }
+
+        if total_size > size {
+            cur_size -= total_size - size;
+        }
+
+        if cur_size > 0 && !is_heap_physical_address_for_table(cur_addr) {
+            return svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value();
+        }
+
+        // Host-side cache maintenance is a no-op, matching the existing emulator
+        // cache model after upstream's range/state/traversal validation succeeds.
         0
     }
 
     /// Matches upstream `KPageTableBase::InvalidateCurrentProcessDataCache`.
-    pub fn invalidate_current_process_data_cache(&self, _addr: usize, _size: usize) -> u32 {
+    pub fn invalidate_current_process_data_cache(&self, addr: usize, size: usize) -> u32 {
+        if !self.contains_range(addr, size) {
+            return svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value();
+        }
+
+        let _lock = KScopedLightLock::new(&self.m_general_lock);
+        let (result, _) = self.check_memory_state_contiguous(
+            addr,
+            size,
+            KMemoryState::FLAG_REFERENCE_COUNTED,
+            KMemoryState::FLAG_REFERENCE_COUNTED,
+            KMemoryPermission::USER_READ_WRITE,
+            KMemoryPermission::USER_READ_WRITE,
+            KMemoryAttribute::UNCACHED,
+            KMemoryAttribute::NONE,
+        );
+        if result != 0 {
+            return result;
+        }
+
+        // Upstream invalidates the current-process virtual range here. ruzu's
+        // host memory model has no separate data cache to invalidate.
         0
     }
 
@@ -4203,17 +4826,255 @@ impl KPageTableBase {
 
     /// Read memory for debugging.
     /// Matches upstream `KPageTableBase::ReadDebugMemory`.
-    pub fn read_debug_memory(&self, _dst: usize, _src: usize, _size: usize) -> u32 {
-        // Upstream: walks page table to read from guest memory regardless of permissions.
-        // In our emulator, guest memory is directly accessible via shared memory backing.
-        0
+    pub fn read_debug_memory(&self, dst_addr: usize, src_addr: usize, size: usize) -> u32 {
+        if !self.contains_range(src_addr, size) {
+            return svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value();
+        }
+
+        let Some(memory) = self.m_memory.as_ref() else {
+            return svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value();
+        };
+
+        let _lock = KScopedLightLock::new(&self.m_general_lock);
+        let (read_result, _) = self.check_memory_state_contiguous(
+            src_addr,
+            size,
+            KMemoryState::NONE,
+            KMemoryState::NONE,
+            KMemoryPermission::USER_READ,
+            KMemoryPermission::USER_READ,
+            KMemoryAttribute::NONE,
+            KMemoryAttribute::NONE,
+        );
+        if read_result != crate::hle::result::RESULT_SUCCESS.get_inner_value() {
+            let (debug_result, _) = self.check_memory_state_contiguous(
+                src_addr,
+                size,
+                KMemoryState::FLAG_CAN_DEBUG,
+                KMemoryState::FLAG_CAN_DEBUG,
+                KMemoryPermission::NONE,
+                KMemoryPermission::NONE,
+                KMemoryAttribute::NONE,
+                KMemoryAttribute::NONE,
+            );
+            if debug_result != crate::hle::result::RESULT_SUCCESS.get_inner_value() {
+                return debug_result;
+            }
+        }
+
+        let Some(impl_pt) = self.m_impl.as_ref() else {
+            return svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value();
+        };
+        let Some((first_entry, mut traversal_context)) = impl_pt.begin_traversal(src_addr as u64)
+        else {
+            return svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value();
+        };
+        if first_entry.block_size == 0 {
+            return svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value();
+        }
+
+        let mut dst_addr = dst_addr;
+        let block_mask = first_entry.block_size - 1;
+        let mut cur_addr = first_entry.phys_addr;
+        let mut cur_size = first_entry
+            .block_size
+            .saturating_sub((cur_addr as usize) & block_mask);
+        let mut total_size = cur_size;
+
+        let perform_copy = |dst_addr: usize, cur_addr: u64, cur_size: usize| -> u32 {
+            if !is_linear_mapped_physical_address_for_table(cur_addr) {
+                return svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value();
+            }
+
+            let mut local_dst = dst_addr;
+            let mut local_phys = cur_addr;
+            let mut local_size = cur_size;
+            if local_size >= std::mem::size_of::<u32>() {
+                let copy_size = local_size & !(std::mem::size_of::<u32>() - 1);
+                if !memory.lock().unwrap().copy_phys_to_guest(
+                    local_dst as u64,
+                    local_phys,
+                    copy_size,
+                ) {
+                    return svc_results::RESULT_INVALID_POINTER.get_inner_value();
+                }
+                local_dst += copy_size;
+                local_phys += copy_size as u64;
+                local_size -= copy_size;
+            }
+
+            if local_size > 0
+                && !memory.lock().unwrap().copy_phys_to_guest(
+                    local_dst as u64,
+                    local_phys,
+                    local_size,
+                )
+            {
+                return svc_results::RESULT_INVALID_POINTER.get_inner_value();
+            }
+
+            crate::hle::result::RESULT_SUCCESS.get_inner_value()
+        };
+
+        while total_size < size {
+            let Some(next_entry) = impl_pt.continue_traversal(&mut traversal_context) else {
+                return svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value();
+            };
+
+            if next_entry.phys_addr != cur_addr + cur_size as u64 {
+                let result = perform_copy(dst_addr, cur_addr, cur_size);
+                if result != crate::hle::result::RESULT_SUCCESS.get_inner_value() {
+                    return result;
+                }
+                dst_addr += cur_size;
+                cur_addr = next_entry.phys_addr;
+                cur_size = next_entry.block_size;
+            } else {
+                cur_size += next_entry.block_size;
+            }
+
+            total_size += next_entry.block_size;
+        }
+
+        if total_size > size {
+            cur_size -= total_size - size;
+        }
+
+        perform_copy(dst_addr, cur_addr, cur_size)
     }
 
     /// Write memory for debugging.
     /// Matches upstream `KPageTableBase::WriteDebugMemory`.
-    pub fn write_debug_memory(&self, _dst: usize, _src: usize, _size: usize) -> u32 {
-        // Same as ReadDebugMemory — guest memory is directly accessible.
-        0
+    pub fn write_debug_memory(&self, dst_addr: usize, src_addr: usize, size: usize) -> u32 {
+        if !self.contains_range(dst_addr, size) {
+            return svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value();
+        }
+
+        let Some(memory) = self.m_memory.as_ref() else {
+            return svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value();
+        };
+
+        let _lock = KScopedLightLock::new(&self.m_general_lock);
+        let (write_result, _) = self.check_memory_state_contiguous(
+            dst_addr,
+            size,
+            KMemoryState::NONE,
+            KMemoryState::NONE,
+            KMemoryPermission::USER_READ_WRITE,
+            KMemoryPermission::USER_READ_WRITE,
+            KMemoryAttribute::NONE,
+            KMemoryAttribute::NONE,
+        );
+        if write_result != crate::hle::result::RESULT_SUCCESS.get_inner_value() {
+            let (debug_result, _) = self.check_memory_state_contiguous(
+                dst_addr,
+                size,
+                KMemoryState::FLAG_CAN_DEBUG,
+                KMemoryState::FLAG_CAN_DEBUG,
+                KMemoryPermission::NONE,
+                KMemoryPermission::NONE,
+                KMemoryAttribute::NONE,
+                KMemoryAttribute::NONE,
+            );
+            if debug_result != crate::hle::result::RESULT_SUCCESS.get_inner_value() {
+                return debug_result;
+            }
+        }
+
+        let Some(impl_pt) = self.m_impl.as_ref() else {
+            return svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value();
+        };
+        let Some((first_entry, mut traversal_context)) = impl_pt.begin_traversal(dst_addr as u64)
+        else {
+            return svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value();
+        };
+        if first_entry.block_size == 0 {
+            return svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value();
+        }
+
+        let original_dst_addr = dst_addr;
+        let mut src_addr = src_addr;
+        let block_mask = first_entry.block_size - 1;
+        let mut cur_addr = first_entry.phys_addr;
+        let mut cur_size = first_entry
+            .block_size
+            .saturating_sub((cur_addr as usize) & block_mask);
+        let mut total_size = cur_size;
+
+        let perform_copy = |src_addr: usize, cur_addr: u64, cur_size: usize| -> u32 {
+            if !is_linear_mapped_physical_address_for_table(cur_addr) {
+                return svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value();
+            }
+
+            let mut local_src = src_addr;
+            let mut local_phys = cur_addr;
+            let mut local_size = cur_size;
+            if local_size >= std::mem::size_of::<u32>() {
+                let copy_size = local_size & !(std::mem::size_of::<u32>() - 1);
+                if !memory.lock().unwrap().copy_guest_to_phys(
+                    local_phys,
+                    local_src as u64,
+                    copy_size,
+                ) {
+                    return svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value();
+                }
+                let result = store_data_cache(local_phys, copy_size);
+                if result != crate::hle::result::RESULT_SUCCESS.get_inner_value() {
+                    return result;
+                }
+                local_src += copy_size;
+                local_phys += copy_size as u64;
+                local_size -= copy_size;
+            }
+
+            if local_size > 0 {
+                if !memory.lock().unwrap().copy_guest_to_phys(
+                    local_phys,
+                    local_src as u64,
+                    local_size,
+                ) {
+                    return svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value();
+                }
+                let result = store_data_cache(local_phys, local_size);
+                if result != crate::hle::result::RESULT_SUCCESS.get_inner_value() {
+                    return result;
+                }
+            }
+
+            crate::hle::result::RESULT_SUCCESS.get_inner_value()
+        };
+
+        while total_size < size {
+            let Some(next_entry) = impl_pt.continue_traversal(&mut traversal_context) else {
+                return svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value();
+            };
+
+            if next_entry.phys_addr != cur_addr + cur_size as u64 {
+                let result = perform_copy(src_addr, cur_addr, cur_size);
+                if result != crate::hle::result::RESULT_SUCCESS.get_inner_value() {
+                    return result;
+                }
+                src_addr += cur_size;
+                cur_addr = next_entry.phys_addr;
+                cur_size = next_entry.block_size;
+            } else {
+                cur_size += next_entry.block_size;
+            }
+
+            total_size += next_entry.block_size;
+        }
+
+        if total_size > size {
+            cur_size -= total_size - size;
+        }
+
+        let result = perform_copy(src_addr, cur_addr, cur_size);
+        if result != crate::hle::result::RESULT_SUCCESS.get_inner_value() {
+            return result;
+        }
+
+        invalidate_instruction_cache_for_table(self, original_dst_addr, size);
+        crate::hle::result::RESULT_SUCCESS.get_inner_value()
     }
 
     // -- Copy Memory --
@@ -4222,45 +5083,663 @@ impl KPageTableBase {
     /// Matches upstream `KPageTableBase::CopyMemoryFromLinearToUser`.
     pub fn copy_memory_from_linear_to_user(
         &self,
-        _dst: usize,
-        _size: usize,
-        _src_state: KMemoryState,
-        _src_test_perm: KMemoryPermission,
+        dst_addr: usize,
+        size: usize,
+        src_addr: usize,
+        src_state_mask: KMemoryState,
+        src_state: KMemoryState,
+        src_test_perm: KMemoryPermission,
+        src_attr_mask: KMemoryAttribute,
+        src_attr: KMemoryAttribute,
     ) -> u32 {
-        // In our emulator, all memory is in the same backing.
-        // Copy operations are direct memcpy via the guest memory buffer.
-        0
+        if !self.contains_range(src_addr, size) {
+            return svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value();
+        }
+
+        let Some(memory) = self.m_memory.as_ref() else {
+            return svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value();
+        };
+
+        let _lock = KScopedLightLock::new(&self.m_general_lock);
+        let (result, _) = self.check_memory_state_contiguous(
+            src_addr,
+            size,
+            src_state_mask,
+            src_state,
+            src_test_perm,
+            src_test_perm,
+            src_attr_mask | KMemoryAttribute::UNCACHED,
+            src_attr,
+        );
+        if result != 0 {
+            return result;
+        }
+
+        let Some(impl_pt) = self.m_impl.as_ref() else {
+            return svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value();
+        };
+        let Some((first_entry, mut traversal_context)) = impl_pt.begin_traversal(src_addr as u64)
+        else {
+            return svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value();
+        };
+        if first_entry.block_size == 0 {
+            return svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value();
+        }
+
+        let mut dst_addr = dst_addr;
+        let block_mask = first_entry.block_size - 1;
+        let mut cur_addr = first_entry.phys_addr;
+        let mut cur_size = first_entry
+            .block_size
+            .saturating_sub((cur_addr as usize) & block_mask);
+        let mut total_size = cur_size;
+
+        let perform_copy = |dst_addr: usize, cur_addr: u64, cur_size: usize| -> u32 {
+            if !is_linear_mapped_physical_address_for_table(cur_addr) {
+                return svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value();
+            }
+
+            let mut local_dst = dst_addr;
+            let mut local_phys = cur_addr;
+            let mut local_size = cur_size;
+            if local_size >= std::mem::size_of::<u32>() {
+                let copy_size = local_size & !(std::mem::size_of::<u32>() - 1);
+                if !memory.lock().unwrap().copy_phys_to_guest(
+                    local_dst as u64,
+                    local_phys,
+                    copy_size,
+                ) {
+                    return svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value();
+                }
+                local_dst += copy_size;
+                local_phys += copy_size as u64;
+                local_size -= copy_size;
+            }
+
+            if local_size > 0
+                && !memory.lock().unwrap().copy_phys_to_guest(
+                    local_dst as u64,
+                    local_phys,
+                    local_size,
+                )
+            {
+                return svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value();
+            }
+
+            0
+        };
+
+        while total_size < size {
+            let Some(next_entry) = impl_pt.continue_traversal(&mut traversal_context) else {
+                return svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value();
+            };
+
+            if next_entry.phys_addr != cur_addr + cur_size as u64 {
+                let result = perform_copy(dst_addr, cur_addr, cur_size);
+                if result != 0 {
+                    return result;
+                }
+                dst_addr += cur_size;
+                cur_addr = next_entry.phys_addr;
+                cur_size = next_entry.block_size;
+            } else {
+                cur_size += next_entry.block_size;
+            }
+
+            total_size += next_entry.block_size;
+        }
+
+        if total_size > size {
+            cur_size -= total_size - size;
+        }
+
+        perform_copy(dst_addr, cur_addr, cur_size)
     }
 
     /// Matches upstream `KPageTableBase::CopyMemoryFromLinearToKernel`.
-    pub fn copy_memory_from_linear_to_kernel(&self, _dst: usize, _size: usize) -> u32 {
-        0
+    pub fn copy_memory_from_linear_to_kernel(
+        &self,
+        buffer: usize,
+        size: usize,
+        src_addr: usize,
+        src_state_mask: KMemoryState,
+        src_state: KMemoryState,
+        src_test_perm: KMemoryPermission,
+        src_attr_mask: KMemoryAttribute,
+        src_attr: KMemoryAttribute,
+    ) -> u32 {
+        if !self.contains_range(src_addr, size) {
+            return svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value();
+        }
+        if size != 0 && buffer == 0 {
+            return svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value();
+        }
+
+        let _lock = KScopedLightLock::new(&self.m_general_lock);
+        let (result, _) = self.check_memory_state_contiguous(
+            src_addr,
+            size,
+            src_state_mask,
+            src_state,
+            src_test_perm,
+            src_test_perm,
+            src_attr_mask | KMemoryAttribute::UNCACHED,
+            src_attr,
+        );
+        if result != 0 {
+            return result;
+        }
+
+        let Some(impl_pt) = self.m_impl.as_ref() else {
+            return svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value();
+        };
+        let Some(memory) = self.m_memory.as_ref() else {
+            return svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value();
+        };
+        let Some((first_entry, mut traversal_context)) = impl_pt.begin_traversal(src_addr as u64)
+        else {
+            return svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value();
+        };
+        if first_entry.block_size == 0 {
+            return svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value();
+        }
+
+        let mut dst = buffer;
+        let block_mask = first_entry.block_size - 1;
+        let mut cur_addr = first_entry.phys_addr;
+        let mut cur_size = first_entry
+            .block_size
+            .saturating_sub((cur_addr as usize) & block_mask);
+        let mut total_size = cur_size;
+
+        let perform_copy = |dst: usize, cur_addr: u64, cur_size: usize| -> u32 {
+            if !is_linear_mapped_physical_address_for_table(cur_addr) {
+                return svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value();
+            }
+            let dst_slice = unsafe { std::slice::from_raw_parts_mut(dst as *mut u8, cur_size) };
+            if !memory.lock().unwrap().read_phys_block(cur_addr, dst_slice) {
+                return svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value();
+            }
+            0
+        };
+
+        while total_size < size {
+            let Some(next_entry) = impl_pt.continue_traversal(&mut traversal_context) else {
+                return svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value();
+            };
+
+            if next_entry.phys_addr != cur_addr + cur_size as u64 {
+                let result = perform_copy(dst, cur_addr, cur_size);
+                if result != 0 {
+                    return result;
+                }
+                dst += cur_size;
+                cur_addr = next_entry.phys_addr;
+                cur_size = next_entry.block_size;
+            } else {
+                cur_size += next_entry.block_size;
+            }
+
+            total_size += next_entry.block_size;
+        }
+
+        if total_size > size {
+            cur_size -= total_size - size;
+        }
+
+        perform_copy(dst, cur_addr, cur_size)
     }
 
     /// Matches upstream `KPageTableBase::CopyMemoryFromUserToLinear`.
     pub fn copy_memory_from_user_to_linear(
         &self,
-        _dst: usize,
-        _size: usize,
-        _dst_state: KMemoryState,
+        dst_addr: usize,
+        size: usize,
+        dst_state_mask: KMemoryState,
+        dst_state: KMemoryState,
+        dst_test_perm: KMemoryPermission,
+        dst_attr_mask: KMemoryAttribute,
+        dst_attr: KMemoryAttribute,
+        src_addr: usize,
     ) -> u32 {
-        0
+        if !self.contains_range(dst_addr, size) {
+            return svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value();
+        }
+
+        let Some(memory) = self.m_memory.as_ref() else {
+            return svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value();
+        };
+
+        let _lock = KScopedLightLock::new(&self.m_general_lock);
+        let (result, _) = self.check_memory_state_contiguous(
+            dst_addr,
+            size,
+            dst_state_mask,
+            dst_state,
+            dst_test_perm,
+            dst_test_perm,
+            dst_attr_mask | KMemoryAttribute::UNCACHED,
+            dst_attr,
+        );
+        if result != 0 {
+            return result;
+        }
+
+        let Some(impl_pt) = self.m_impl.as_ref() else {
+            return svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value();
+        };
+        let Some((first_entry, mut traversal_context)) = impl_pt.begin_traversal(dst_addr as u64)
+        else {
+            return svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value();
+        };
+        if first_entry.block_size == 0 {
+            return svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value();
+        }
+
+        let mut src_addr = src_addr;
+        let block_mask = first_entry.block_size - 1;
+        let mut cur_addr = first_entry.phys_addr;
+        let mut cur_size = first_entry
+            .block_size
+            .saturating_sub((cur_addr as usize) & block_mask);
+        let mut total_size = cur_size;
+
+        let perform_copy = |src_addr: usize, cur_addr: u64, cur_size: usize| -> u32 {
+            if !is_linear_mapped_physical_address_for_table(cur_addr) {
+                return svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value();
+            }
+
+            let mut local_src = src_addr;
+            let mut local_phys = cur_addr;
+            let mut local_size = cur_size;
+            if local_size >= std::mem::size_of::<u32>() {
+                let copy_size = local_size & !(std::mem::size_of::<u32>() - 1);
+                if !memory.lock().unwrap().copy_guest_to_phys(
+                    local_phys,
+                    local_src as u64,
+                    copy_size,
+                ) {
+                    return svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value();
+                }
+                local_src += copy_size;
+                local_phys += copy_size as u64;
+                local_size -= copy_size;
+            }
+
+            if local_size > 0
+                && !memory.lock().unwrap().copy_guest_to_phys(
+                    local_phys,
+                    local_src as u64,
+                    local_size,
+                )
+            {
+                return svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value();
+            }
+
+            0
+        };
+
+        while total_size < size {
+            let Some(next_entry) = impl_pt.continue_traversal(&mut traversal_context) else {
+                return svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value();
+            };
+
+            if next_entry.phys_addr != cur_addr + cur_size as u64 {
+                let result = perform_copy(src_addr, cur_addr, cur_size);
+                if result != 0 {
+                    return result;
+                }
+                src_addr += cur_size;
+                cur_addr = next_entry.phys_addr;
+                cur_size = next_entry.block_size;
+            } else {
+                cur_size += next_entry.block_size;
+            }
+
+            total_size += next_entry.block_size;
+        }
+
+        if total_size > size {
+            cur_size -= total_size - size;
+        }
+
+        perform_copy(src_addr, cur_addr, cur_size)
     }
 
     /// Matches upstream `KPageTableBase::CopyMemoryFromKernelToLinear`.
-    pub fn copy_memory_from_kernel_to_linear(&self, _dst: usize, _size: usize) -> u32 {
-        0
+    pub fn copy_memory_from_kernel_to_linear(
+        &self,
+        dst_addr: usize,
+        size: usize,
+        dst_state_mask: KMemoryState,
+        dst_state: KMemoryState,
+        dst_test_perm: KMemoryPermission,
+        dst_attr_mask: KMemoryAttribute,
+        dst_attr: KMemoryAttribute,
+        buffer: usize,
+    ) -> u32 {
+        if !self.contains_range(dst_addr, size) {
+            return svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value();
+        }
+        if size != 0 && buffer == 0 {
+            return svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value();
+        }
+
+        let Some(memory) = self.m_memory.as_ref() else {
+            return svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value();
+        };
+
+        let _lock = KScopedLightLock::new(&self.m_general_lock);
+        let (result, _) = self.check_memory_state_contiguous(
+            dst_addr,
+            size,
+            dst_state_mask,
+            dst_state,
+            dst_test_perm,
+            dst_test_perm,
+            dst_attr_mask | KMemoryAttribute::UNCACHED,
+            dst_attr,
+        );
+        if result != 0 {
+            return result;
+        }
+
+        let Some(impl_pt) = self.m_impl.as_ref() else {
+            return svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value();
+        };
+        let Some((first_entry, mut traversal_context)) = impl_pt.begin_traversal(dst_addr as u64)
+        else {
+            return svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value();
+        };
+        if first_entry.block_size == 0 {
+            return svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value();
+        }
+
+        let mut src = buffer;
+        let block_mask = first_entry.block_size - 1;
+        let mut cur_addr = first_entry.phys_addr;
+        let mut cur_size = first_entry
+            .block_size
+            .saturating_sub((cur_addr as usize) & block_mask);
+        let mut total_size = cur_size;
+
+        let perform_copy = |src: usize, cur_addr: u64, cur_size: usize| -> u32 {
+            if !is_linear_mapped_physical_address_for_table(cur_addr) {
+                return svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value();
+            }
+            let src_slice = unsafe { std::slice::from_raw_parts(src as *const u8, cur_size) };
+            if !memory.lock().unwrap().write_phys_block(cur_addr, src_slice) {
+                return svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value();
+            }
+            0
+        };
+
+        while total_size < size {
+            let Some(next_entry) = impl_pt.continue_traversal(&mut traversal_context) else {
+                return svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value();
+            };
+
+            if next_entry.phys_addr != cur_addr + cur_size as u64 {
+                let result = perform_copy(src, cur_addr, cur_size);
+                if result != 0 {
+                    return result;
+                }
+                src += cur_size;
+                cur_addr = next_entry.phys_addr;
+                cur_size = next_entry.block_size;
+            } else {
+                cur_size += next_entry.block_size;
+            }
+
+            total_size += next_entry.block_size;
+        }
+
+        if total_size > size {
+            cur_size -= total_size - size;
+        }
+
+        perform_copy(src, cur_addr, cur_size)
     }
 
     /// Matches upstream `KPageTableBase::CopyMemoryFromHeapToHeap`.
     pub fn copy_memory_from_heap_to_heap(
         &self,
-        _dst_table: &KPageTableBase,
-        _src: usize,
-        _size: usize,
-        _src_state: KMemoryState,
-        _dst_state: KMemoryState,
+        dst_table: &KPageTableBase,
+        dst_addr: usize,
+        size: usize,
+        dst_state_mask: KMemoryState,
+        dst_state: KMemoryState,
+        dst_test_perm: KMemoryPermission,
+        dst_attr_mask: KMemoryAttribute,
+        dst_attr: KMemoryAttribute,
+        src_addr: usize,
+        src_state_mask: KMemoryState,
+        src_state: KMemoryState,
+        src_test_perm: KMemoryPermission,
+        src_attr_mask: KMemoryAttribute,
+        src_attr: KMemoryAttribute,
     ) -> u32 {
+        self.copy_memory_from_heap_to_heap_impl(
+            dst_table,
+            dst_addr,
+            size,
+            dst_state_mask,
+            dst_state,
+            dst_test_perm,
+            dst_attr_mask,
+            dst_attr,
+            src_addr,
+            src_state_mask,
+            src_state,
+            src_test_perm,
+            src_attr_mask,
+            src_attr,
+            true,
+        )
+    }
+
+    /// Matches upstream `KPageTableBase::CopyMemoryFromHeapToHeapWithoutCheckDestination`.
+    pub fn copy_memory_from_heap_to_heap_without_check_destination(
+        &self,
+        dst_table: &KPageTableBase,
+        dst_addr: usize,
+        size: usize,
+        dst_state_mask: KMemoryState,
+        dst_state: KMemoryState,
+        dst_test_perm: KMemoryPermission,
+        dst_attr_mask: KMemoryAttribute,
+        dst_attr: KMemoryAttribute,
+        src_addr: usize,
+        src_state_mask: KMemoryState,
+        src_state: KMemoryState,
+        src_test_perm: KMemoryPermission,
+        src_attr_mask: KMemoryAttribute,
+        src_attr: KMemoryAttribute,
+    ) -> u32 {
+        self.copy_memory_from_heap_to_heap_impl(
+            dst_table,
+            dst_addr,
+            size,
+            dst_state_mask,
+            dst_state,
+            dst_test_perm,
+            dst_attr_mask,
+            dst_attr,
+            src_addr,
+            src_state_mask,
+            src_state,
+            src_test_perm,
+            src_attr_mask,
+            src_attr,
+            false,
+        )
+    }
+
+    fn copy_memory_from_heap_to_heap_impl(
+        &self,
+        dst_table: &KPageTableBase,
+        dst_addr: usize,
+        size: usize,
+        dst_state_mask: KMemoryState,
+        dst_state: KMemoryState,
+        dst_test_perm: KMemoryPermission,
+        dst_attr_mask: KMemoryAttribute,
+        dst_attr: KMemoryAttribute,
+        src_addr: usize,
+        src_state_mask: KMemoryState,
+        src_state: KMemoryState,
+        src_test_perm: KMemoryPermission,
+        src_attr_mask: KMemoryAttribute,
+        src_attr: KMemoryAttribute,
+        check_destination: bool,
+    ) -> u32 {
+        if !self.contains_range(src_addr, size) || !dst_table.contains_range(dst_addr, size) {
+            return svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value();
+        }
+
+        let Some(memory) = self.m_memory.as_ref().or(dst_table.m_memory.as_ref()) else {
+            return svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value();
+        };
+
+        let _lock_pair = KScopedLightLockPair::new(
+            self.m_general_lock.clone(),
+            dst_table.m_general_lock.clone(),
+        );
+
+        let (result, _) = self.check_memory_state_contiguous(
+            src_addr,
+            size,
+            src_state_mask,
+            src_state,
+            src_test_perm,
+            src_test_perm,
+            src_attr_mask | KMemoryAttribute::UNCACHED,
+            src_attr,
+        );
+        if result != 0 {
+            return result;
+        }
+        if check_destination {
+            let (result, _) = dst_table.check_memory_state_contiguous(
+                dst_addr,
+                size,
+                dst_state_mask,
+                dst_state,
+                dst_test_perm,
+                dst_test_perm,
+                dst_attr_mask | KMemoryAttribute::UNCACHED,
+                dst_attr,
+            );
+            if result != 0 {
+                return result;
+            }
+        }
+
+        let Some(src_impl) = self.m_impl.as_ref() else {
+            return svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value();
+        };
+        let Some(dst_impl) = dst_table.m_impl.as_ref() else {
+            return svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value();
+        };
+        let Some((mut src_entry, mut src_context)) = src_impl.begin_traversal(src_addr as u64)
+        else {
+            return svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value();
+        };
+        let Some((mut dst_entry, mut dst_context)) = dst_impl.begin_traversal(dst_addr as u64)
+        else {
+            return svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value();
+        };
+        if src_entry.block_size == 0 || dst_entry.block_size == 0 {
+            return svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value();
+        }
+
+        let mut cur_src_block_addr = src_entry.phys_addr;
+        let mut cur_dst_block_addr = dst_entry.phys_addr;
+        let mut cur_src_size =
+            src_entry.block_size - ((cur_src_block_addr as usize) & (src_entry.block_size - 1));
+        let mut cur_dst_size =
+            dst_entry.block_size - ((cur_dst_block_addr as usize) & (dst_entry.block_size - 1));
+        src_entry.block_size = cur_src_size;
+        dst_entry.block_size = cur_dst_size;
+
+        if size == 0 {
+            return 0;
+        }
+
+        let mut cur_src_addr = cur_src_block_addr;
+        let mut cur_dst_addr = cur_dst_block_addr;
+        let mut cur_min_size = cur_src_size.min(cur_dst_size);
+        let mut offset = 0usize;
+
+        while offset < size {
+            let cur_copy_size = cur_min_size.min(size - offset);
+            let mut updated_src = false;
+            let mut updated_dst = false;
+            let mut skip_copy = false;
+
+            if offset + cur_copy_size != size {
+                if cur_src_addr + cur_min_size as u64 == cur_src_block_addr + cur_src_size as u64 {
+                    let Some(next_entry) = src_impl.continue_traversal(&mut src_context) else {
+                        return svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value();
+                    };
+                    updated_src = cur_src_addr + cur_min_size as u64 != next_entry.phys_addr;
+                    src_entry = next_entry;
+                }
+
+                if cur_dst_addr + cur_min_size as u64
+                    == dst_entry.phys_addr + dst_entry.block_size as u64
+                {
+                    let Some(next_entry) = dst_impl.continue_traversal(&mut dst_context) else {
+                        return svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value();
+                    };
+                    updated_dst = cur_dst_addr + cur_min_size as u64 != next_entry.phys_addr;
+                    dst_entry = next_entry;
+                }
+
+                if !updated_src && !updated_dst {
+                    skip_copy = true;
+                    cur_src_block_addr = src_entry.phys_addr;
+                }
+            }
+
+            if !skip_copy {
+                if !is_heap_physical_address_for_table(cur_src_addr)
+                    || !is_heap_physical_address_for_table(cur_dst_addr)
+                {
+                    return svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value();
+                }
+                if !memory.lock().unwrap().copy_phys_to_phys(
+                    cur_dst_addr,
+                    cur_src_addr,
+                    cur_copy_size,
+                ) {
+                    return svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value();
+                }
+
+                cur_src_block_addr = src_entry.phys_addr;
+                cur_src_addr = if updated_src {
+                    cur_src_block_addr
+                } else {
+                    cur_src_addr + cur_copy_size as u64
+                };
+                cur_dst_block_addr = dst_entry.phys_addr;
+                cur_dst_addr = if updated_dst {
+                    cur_dst_block_addr
+                } else {
+                    cur_dst_addr + cur_copy_size as u64
+                };
+                offset += cur_copy_size;
+            }
+
+            cur_src_size = src_entry.block_size;
+            cur_dst_size = dst_entry.block_size;
+            let remaining_src =
+                cur_src_block_addr.saturating_add(cur_src_size as u64) - cur_src_addr;
+            let remaining_dst =
+                cur_dst_block_addr.saturating_add(cur_dst_size as u64) - cur_dst_addr;
+            cur_min_size = (remaining_src as usize).min(remaining_dst as usize);
+        }
+
         0
     }
 
@@ -4365,12 +5844,12 @@ impl KPageTableBase {
         page_table: *mut common::page_table::PageTable,
         src_addr: usize,
         size: usize,
-    ) -> Vec<u8> {
+    ) -> Option<Vec<u8>> {
         let mut bytes = vec![0u8; size];
-        Self::with_memory_page_table(memory, page_table, |memory| {
-            let _ = memory.read_block(src_addr as u64, &mut bytes);
+        let success = Self::with_memory_page_table(memory, page_table, |memory| {
+            memory.read_block(src_addr as u64, &mut bytes)
         });
-        bytes
+        success.then_some(bytes)
     }
 
     fn write_block_to_page_table(
@@ -4378,10 +5857,40 @@ impl KPageTableBase {
         page_table: *mut common::page_table::PageTable,
         dst_addr: usize,
         bytes: &[u8],
-    ) {
+    ) -> bool {
         Self::with_memory_page_table(memory, page_table, |memory| {
-            let _ = memory.write_block(dst_addr as u64, bytes);
-        });
+            memory.write_block(dst_addr as u64, bytes)
+        })
+    }
+
+    pub(crate) fn read_block_from_own_page_table(
+        &self,
+        src_addr: usize,
+        size: usize,
+    ) -> Option<Vec<u8>> {
+        let memory = self.m_memory.as_ref()?;
+        let page_table =
+            self.m_impl.as_ref()?.as_ref() as *const common::page_table::PageTable as *mut _;
+        Self::read_block_from_page_table(memory, page_table, src_addr, size)
+    }
+
+    pub(crate) fn has_own_page_table_memory(&self) -> bool {
+        self.m_memory.is_some() && self.m_impl.is_some()
+    }
+
+    pub(crate) fn write_block_to_own_page_table(&self, dst_addr: usize, bytes: &[u8]) -> bool {
+        let Some(memory) = self.m_memory.as_ref() else {
+            return false;
+        };
+        let Some(page_table) = self.m_impl.as_ref() else {
+            return false;
+        };
+        Self::write_block_to_page_table(
+            memory,
+            page_table.as_ref() as *const common::page_table::PageTable as *mut _,
+            dst_addr,
+            bytes,
+        )
     }
 
     fn build_ipc_partial_page(
@@ -4406,17 +5915,20 @@ impl KPageTableBase {
         size: usize,
         test_perm: KMemoryPermission,
         dst_state: KMemoryState,
-    ) -> u32 {
+    ) -> (u32, usize) {
         if size == 0 {
-            return crate::hle::result::RESULT_SUCCESS.get_inner_value();
+            return (crate::hle::result::RESULT_SUCCESS.get_inner_value(), 0);
         }
         if !self.contains_range(addr, size) {
-            return svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value();
+            return (
+                svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value(),
+                0,
+            );
         }
 
         let Some((test_state, test_attr_mask)) = Self::get_ipc_test_state_and_attr_mask(dst_state)
         else {
-            return svc_results::RESULT_INVALID_COMBINATION.get_inner_value();
+            return (svc_results::RESULT_INVALID_COMBINATION.get_inner_value(), 0);
         };
 
         let src_perm = Self::get_ipc_source_permission(test_perm);
@@ -4425,6 +5937,7 @@ impl KPageTableBase {
         let aligned_last = aligned_end - 1;
         let mapping_last = mapping_end.saturating_sub(1);
         let mut mapped_size = 0usize;
+        let mut blocks_needed = 0usize;
 
         // Snapshot the block infos before mutating the block manager through
         // `operate`, matching upstream's iterator walk while avoiding Rust
@@ -4453,7 +5966,7 @@ impl KPageTableBase {
                         src_perm,
                     );
                 }
-                return rc;
+                return (rc, 0);
             }
 
             if mapping_start < mapping_end
@@ -4471,6 +5984,13 @@ impl KPageTableBase {
                     mapping_end
                 };
                 let cur_size = cur_end - cur_start;
+
+                if info.get_address() < mapping_start {
+                    blocks_needed += 1;
+                }
+                if mapping_last < info.get_last_address() {
+                    blocks_needed += 1;
+                }
 
                 if (info.get_permission() & KMemoryPermission::IPC_LOCK_CHANGE_MASK) != src_perm {
                     let head_body_attr = if mapping_start >= info.get_address() {
@@ -4506,7 +6026,7 @@ impl KPageTableBase {
                                 src_perm,
                             );
                         }
-                        return rc;
+                        return (rc, 0);
                     }
                 }
 
@@ -4518,7 +6038,10 @@ impl KPageTableBase {
             }
         }
 
-        crate::hle::result::RESULT_SUCCESS.get_inner_value()
+        (
+            crate::hle::result::RESULT_SUCCESS.get_inner_value(),
+            blocks_needed,
+        )
     }
 
     /// Matches upstream `KPageTableBase::SetupForIpc`.
@@ -4532,10 +6055,21 @@ impl KPageTableBase {
         dst_state: KMemoryState,
         send: bool,
     ) -> u32 {
-        let client_rc = src_page_table.setup_for_ipc_client(src_addr, size, test_perm, dst_state);
+        let _lk = KScopedLightLockPair::new(
+            src_page_table.m_general_lock.clone(),
+            self.m_general_lock.clone(),
+        );
+
+        let (client_rc, num_allocator_blocks) =
+            src_page_table.setup_for_ipc_client(src_addr, size, test_perm, dst_state);
         if client_rc != crate::hle::result::RESULT_SUCCESS.get_inner_value() {
             return client_rc;
         }
+
+        let mut allocator = match src_page_table.make_block_update_allocator(num_allocator_blocks) {
+            Ok(allocator) => allocator,
+            Err(rc) => return rc,
+        };
 
         let server_rc = self.setup_for_ipc_server(
             out_dst_addr,
@@ -4583,14 +6117,17 @@ impl KPageTableBase {
         let mapping_src_size = mapping_src_end.saturating_sub(mapping_src_start);
         if mapping_src_size > 0 {
             let src_perm = Self::get_ipc_source_permission(test_perm);
-            src_page_table.m_memory_block_manager.update_lock(
-                mapping_src_start,
-                mapping_src_size / PAGE_SIZE,
-                src_perm,
-                |block, new_perm, is_first, is_last| {
-                    block.lock_for_ipc(new_perm, is_first, is_last)
-                },
-            );
+            src_page_table
+                .m_memory_block_manager
+                .update_lock_with_allocator(
+                    Some(&mut allocator),
+                    mapping_src_start,
+                    mapping_src_size / PAGE_SIZE,
+                    src_perm,
+                    |block, new_perm, is_first, is_last| {
+                        block.lock_for_ipc(new_perm, is_first, is_last)
+                    },
+                );
         }
 
         crate::hle::result::RESULT_SUCCESS.get_inner_value()
@@ -4639,17 +6176,72 @@ impl KPageTableBase {
             return svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value();
         }
 
+        let mut block_allocator = match self.make_block_update_allocator(
+            super::k_dynamic_resource_manager::KMemoryBlockManagerUpdateAllocator::MAX_BLOCKS,
+        ) {
+            Ok(allocator) => allocator,
+            Err(rc) => return rc,
+        };
+
         let unmapped_size = aligned_src_size.saturating_sub(mapping_src_size);
-        if unmapped_size > 0 {
-            let Some(resource_limit) = &self.m_resource_limit else {
-                return svc_results::RESULT_LIMIT_REACHED.get_inner_value();
+        if unmapped_size > 0 && self.m_resource_limit.is_none() {
+            return svc_results::RESULT_LIMIT_REACHED.get_inner_value();
+        }
+        let mut memory_reservation =
+            super::k_scoped_resource_reservation::KScopedResourceReservation::new(
+                self.m_resource_limit.clone(),
+                LimitableResource::PhysicalMemoryMax,
+                unmapped_size as i64,
+            );
+        if !memory_reservation.succeeded() {
+            return svc_results::RESULT_LIMIT_REACHED.get_inner_value();
+        }
+
+        fn rollback_ipc_server_mapping(
+            page_table: &mut KPageTableBase,
+            page_list: Option<&mut PageLinkedList>,
+            dst_addr: usize,
+            mapped_pages: usize,
+        ) {
+            if mapped_pages == 0 {
+                return;
+            }
+            let unmap_props = KPageProperties {
+                perm: KMemoryPermission::NONE,
+                io: false,
+                uncached: false,
+                disable_merge_attributes: DisableMergeAttribute::NONE,
             };
-            if !resource_limit
-                .lock()
-                .unwrap()
-                .reserve(LimitableResource::PhysicalMemoryMax, unmapped_size as i64)
-            {
-                return svc_results::RESULT_LIMIT_REACHED.get_inner_value();
+            let _ = page_table.operate(
+                page_list,
+                dst_addr,
+                mapped_pages,
+                0,
+                false,
+                unmap_props,
+                OperationType::Unmap,
+            );
+        }
+
+        fn close_ipc_partial_page(phys_addr: u64) {
+            if phys_addr != 0 {
+                if let Some(kernel) = crate::hle::kernel::kernel::get_kernel_mut() {
+                    kernel.memory_manager_mut().close(phys_addr, 1);
+                }
+            }
+        }
+
+        struct IpcPartialPageGuard {
+            phys_addr: u64,
+        }
+        impl IpcPartialPageGuard {
+            fn new(phys_addr: u64) -> Self {
+                Self { phys_addr }
+            }
+        }
+        impl Drop for IpcPartialPageGuard {
+            fn drop(&mut self) {
+                close_ipc_partial_page(self.phys_addr);
             }
         }
 
@@ -4661,6 +6253,7 @@ impl KPageTableBase {
         };
 
         let memory = self.m_memory.clone().or_else(|| src_table.m_memory.clone());
+        let mut updater = KScopedPageTableUpdater::from_mut(self);
         let dst_page_table = self
             .m_impl
             .as_deref_mut()
@@ -4675,13 +6268,12 @@ impl KPageTableBase {
 
         let mut mapped_pages = 0usize;
         let mut cur_mapped_addr = dst_addr;
+        let mut start_partial_page = 0u64;
+        let mut end_partial_page = 0u64;
 
         if aligned_src_start < mapping_src_start {
-            // Allocate a fresh page from the pool for the partial-head buffer.
-            // Identity mapping (DRAM_BASE + cur_mapped_addr) would silently
-            // alias pool-owned pages — use pool allocation so this transit
-            // page is its own physical backing.
-            let partial_phys = if let Some(kernel) = crate::hle::kernel::kernel::get_kernel_mut() {
+            start_partial_page = if let Some(kernel) = crate::hle::kernel::kernel::get_kernel_mut()
+            {
                 kernel.memory_manager_mut().allocate_and_open_continuous(
                     1,
                     1,
@@ -4690,44 +6282,50 @@ impl KPageTableBase {
             } else {
                 0
             };
-            if partial_phys == 0 {
-                if unmapped_size > 0 {
-                    if let Some(resource_limit) = &self.m_resource_limit {
-                        resource_limit
-                            .lock()
-                            .unwrap()
-                            .release(LimitableResource::PhysicalMemoryMax, unmapped_size as i64);
-                    }
-                }
+            if start_partial_page == 0 {
                 return svc_results::RESULT_OUT_OF_MEMORY.get_inner_value();
             }
+        }
+
+        if mapping_src_end < aligned_src_end
+            && (aligned_src_start < mapping_src_end || aligned_src_start == mapping_src_start)
+        {
+            end_partial_page = if let Some(kernel) = crate::hle::kernel::kernel::get_kernel_mut() {
+                kernel.memory_manager_mut().allocate_and_open_continuous(
+                    1,
+                    1,
+                    self.m_allocate_option,
+                )
+            } else {
+                0
+            };
+            if end_partial_page == 0 {
+                return svc_results::RESULT_OUT_OF_MEMORY.get_inner_value();
+            }
+        }
+
+        let _start_partial_guard = IpcPartialPageGuard::new(start_partial_page);
+        let _end_partial_guard = IpcPartialPageGuard::new(end_partial_page);
+
+        if start_partial_page != 0 {
             let rc = self.operate(
-                None,
+                Some(updater.page_list()),
                 cur_mapped_addr,
                 1,
-                partial_phys,
+                start_partial_page,
                 true,
                 map_properties,
                 OperationType::Map,
             );
             if rc != crate::hle::result::RESULT_SUCCESS.get_inner_value() {
-                if let Some(kernel) = crate::hle::kernel::kernel::get_kernel_mut() {
-                    kernel.memory_manager_mut().close(partial_phys, 1);
-                }
-                if unmapped_size > 0 {
-                    if let Some(resource_limit) = &self.m_resource_limit {
-                        resource_limit
-                            .lock()
-                            .unwrap()
-                            .release(LimitableResource::PhysicalMemoryMax, unmapped_size as i64);
-                    }
-                }
+                rollback_ipc_server_mapping(
+                    self,
+                    Some(updater.page_list()),
+                    dst_addr,
+                    mapped_pages,
+                );
                 return rc;
             }
-            if let Some(kernel) = crate::hle::kernel::kernel::get_kernel_mut() {
-                kernel.memory_manager_mut().close(partial_phys, 1);
-            }
-            mapped_pages += 1;
 
             if let Some(memory) = &memory {
                 let partial_offset = src_addr - aligned_src_start;
@@ -4737,215 +6335,226 @@ impl KPageTableBase {
                     mapping_src_start - src_addr
                 };
                 let src_bytes = if send && copy_size > 0 {
-                    Self::read_block_from_page_table(memory, src_page_table, src_addr, copy_size)
+                    let Some(bytes) = Self::read_block_from_page_table(
+                        memory,
+                        src_page_table,
+                        src_addr,
+                        copy_size,
+                    ) else {
+                        rollback_ipc_server_mapping(
+                            self,
+                            Some(updater.page_list()),
+                            dst_addr,
+                            mapped_pages,
+                        );
+                        return svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value();
+                    };
+                    bytes
                 } else {
                     Vec::new()
                 };
                 let page_bytes =
                     Self::build_ipc_partial_page(fill_value, send, partial_offset, &src_bytes);
-                Self::write_block_to_page_table(
+                if !Self::write_block_to_page_table(
                     memory,
                     dst_page_table,
                     cur_mapped_addr,
                     &page_bytes,
-                );
-            }
-
-            cur_mapped_addr += PAGE_SIZE;
-        }
-
-        for src_page in (mapping_src_start..mapping_src_end).step_by(PAGE_SIZE) {
-            // Strictly look up the source page's phys via the page table. The
-            // earlier identity-mapping fallback (DRAM_BASE + src_page) was
-            // wrong for any pool-allocated mapping — it would map the IPC
-            // server's view to garbage host memory rather than the client's
-            // actual buffer.
-            let phys_addr = match src_table
-                .m_impl
-                .as_ref()
-                .and_then(|impl_pt| impl_pt.get_physical_address(src_page as u64))
-            {
-                Some(p) => p,
-                None => {
-                    if mapped_pages > 0 {
-                        let unmap_props = KPageProperties {
-                            perm: KMemoryPermission::NONE,
-                            io: false,
-                            uncached: false,
-                            disable_merge_attributes: DisableMergeAttribute::NONE,
-                        };
-                        let _ = self.operate(
-                            None,
-                            dst_addr,
-                            mapped_pages,
-                            0,
-                            false,
-                            unmap_props,
-                            OperationType::Unmap,
-                        );
-                    }
-                    if unmapped_size > 0 {
-                        if let Some(resource_limit) = &self.m_resource_limit {
-                            resource_limit.lock().unwrap().release(
-                                LimitableResource::PhysicalMemoryMax,
-                                unmapped_size as i64,
-                            );
-                        }
-                    }
+                ) {
+                    rollback_ipc_server_mapping(
+                        self,
+                        Some(updater.page_list()),
+                        dst_addr,
+                        mapped_pages,
+                    );
                     return svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value();
                 }
-            };
-            let rc = self.operate(
-                None,
-                cur_mapped_addr,
-                1,
-                phys_addr,
-                true,
-                map_properties,
-                OperationType::Map,
-            );
-            if rc != crate::hle::result::RESULT_SUCCESS.get_inner_value() {
-                if mapped_pages > 0 {
-                    let unmap_props = KPageProperties {
-                        perm: KMemoryPermission::NONE,
-                        io: false,
-                        uncached: false,
-                        disable_merge_attributes: DisableMergeAttribute::NONE,
-                    };
-                    let _ = self.operate(
-                        None,
-                        dst_addr,
-                        mapped_pages,
-                        0,
-                        false,
-                        unmap_props,
-                        OperationType::Unmap,
-                    );
-                }
-                if unmapped_size > 0 {
-                    if let Some(resource_limit) = &self.m_resource_limit {
-                        resource_limit
-                            .lock()
-                            .unwrap()
-                            .release(LimitableResource::PhysicalMemoryMax, unmapped_size as i64);
-                    }
-                }
-                return rc;
             }
-            mapped_pages += 1;
+
             cur_mapped_addr += PAGE_SIZE;
         }
 
-        if mapping_src_end < aligned_src_end
-            && (aligned_src_start < mapping_src_end || aligned_src_start == mapping_src_start)
-        {
-            // Allocate fresh phys for the partial-tail buffer (parallel to the
-            // partial-head allocation above).
-            let partial_phys = if let Some(kernel) = crate::hle::kernel::kernel::get_kernel_mut() {
-                kernel.memory_manager_mut().allocate_and_open_continuous(
-                    1,
-                    1,
-                    self.m_allocate_option,
-                )
-            } else {
-                0
+        if mapping_src_start < mapping_src_end {
+            let Some(src_impl) = src_table.m_impl.as_ref() else {
+                rollback_ipc_server_mapping(
+                    self,
+                    Some(updater.page_list()),
+                    dst_addr,
+                    mapped_pages,
+                );
+                return svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value();
             };
-            if partial_phys == 0 {
-                if mapped_pages > 0 {
-                    let unmap_props = KPageProperties {
-                        perm: KMemoryPermission::NONE,
-                        io: false,
-                        uncached: false,
-                        disable_merge_attributes: DisableMergeAttribute::NONE,
-                    };
-                    let _ = self.operate(
-                        None,
+            let Some((first_entry, mut traversal_context)) =
+                src_impl.begin_traversal(mapping_src_start as u64)
+            else {
+                rollback_ipc_server_mapping(
+                    self,
+                    Some(updater.page_list()),
+                    dst_addr,
+                    mapped_pages,
+                );
+                return svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value();
+            };
+
+            let mut run_phys_addr = first_entry.phys_addr;
+            let mut run_pages = 1usize;
+            let mut next_src_addr = mapping_src_start + PAGE_SIZE;
+
+            while next_src_addr < mapping_src_end {
+                let Some(next_entry) = src_impl.continue_traversal(&mut traversal_context) else {
+                    rollback_ipc_server_mapping(
+                        self,
+                        Some(updater.page_list()),
                         dst_addr,
                         mapped_pages,
-                        0,
-                        false,
-                        unmap_props,
-                        OperationType::Unmap,
                     );
-                }
-                if unmapped_size > 0 {
-                    if let Some(resource_limit) = &self.m_resource_limit {
-                        resource_limit
-                            .lock()
-                            .unwrap()
-                            .release(LimitableResource::PhysicalMemoryMax, unmapped_size as i64);
+                    return svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value();
+                };
+
+                if next_entry.phys_addr == run_phys_addr + (run_pages * PAGE_SIZE) as u64 {
+                    run_pages += 1;
+                } else {
+                    let direct_map_properties = KPageProperties {
+                        perm: test_perm,
+                        io: false,
+                        uncached: false,
+                        disable_merge_attributes: if cur_mapped_addr == dst_addr {
+                            DisableMergeAttribute::DISABLE_HEAD
+                        } else {
+                            DisableMergeAttribute::NONE
+                        },
+                    };
+                    let rc = self.operate(
+                        Some(updater.page_list()),
+                        cur_mapped_addr,
+                        run_pages,
+                        run_phys_addr,
+                        true,
+                        direct_map_properties,
+                        OperationType::Map,
+                    );
+                    if rc != crate::hle::result::RESULT_SUCCESS.get_inner_value() {
+                        rollback_ipc_server_mapping(
+                            self,
+                            Some(updater.page_list()),
+                            dst_addr,
+                            mapped_pages,
+                        );
+                        return rc;
                     }
+                    mapped_pages += run_pages;
+                    cur_mapped_addr += run_pages * PAGE_SIZE;
+                    run_phys_addr = next_entry.phys_addr;
+                    run_pages = 1;
                 }
-                return svc_results::RESULT_OUT_OF_MEMORY.get_inner_value();
+
+                next_src_addr += PAGE_SIZE;
             }
+
+            let direct_map_properties = KPageProperties {
+                perm: test_perm,
+                io: false,
+                uncached: false,
+                disable_merge_attributes: if cur_mapped_addr == dst_addr {
+                    DisableMergeAttribute::DISABLE_HEAD
+                } else {
+                    DisableMergeAttribute::NONE
+                },
+            };
             let rc = self.operate(
-                None,
+                Some(updater.page_list()),
                 cur_mapped_addr,
-                1,
-                partial_phys,
+                run_pages,
+                run_phys_addr,
                 true,
-                map_properties,
+                direct_map_properties,
                 OperationType::Map,
             );
             if rc != crate::hle::result::RESULT_SUCCESS.get_inner_value() {
-                if let Some(kernel) = crate::hle::kernel::kernel::get_kernel_mut() {
-                    kernel.memory_manager_mut().close(partial_phys, 1);
-                }
-                if mapped_pages > 0 {
-                    let unmap_props = KPageProperties {
-                        perm: KMemoryPermission::NONE,
-                        io: false,
-                        uncached: false,
-                        disable_merge_attributes: DisableMergeAttribute::NONE,
-                    };
-                    let _ = self.operate(
-                        None,
-                        dst_addr,
-                        mapped_pages,
-                        0,
-                        false,
-                        unmap_props,
-                        OperationType::Unmap,
-                    );
-                }
-                if unmapped_size > 0 {
-                    if let Some(resource_limit) = &self.m_resource_limit {
-                        resource_limit
-                            .lock()
-                            .unwrap()
-                            .release(LimitableResource::PhysicalMemoryMax, unmapped_size as i64);
-                    }
-                }
+                rollback_ipc_server_mapping(
+                    self,
+                    Some(updater.page_list()),
+                    dst_addr,
+                    mapped_pages,
+                );
                 return rc;
             }
-            if let Some(kernel) = crate::hle::kernel::kernel::get_kernel_mut() {
-                kernel.memory_manager_mut().close(partial_phys, 1);
+            mapped_pages += run_pages;
+            cur_mapped_addr += run_pages * PAGE_SIZE;
+        }
+
+        if end_partial_page != 0 {
+            let end_map_properties = KPageProperties {
+                perm: test_perm,
+                io: false,
+                uncached: false,
+                disable_merge_attributes: if cur_mapped_addr == dst_addr {
+                    DisableMergeAttribute::DISABLE_HEAD
+                } else {
+                    DisableMergeAttribute::NONE
+                },
+            };
+            let rc = self.operate(
+                Some(updater.page_list()),
+                cur_mapped_addr,
+                1,
+                end_partial_page,
+                true,
+                end_map_properties,
+                OperationType::Map,
+            );
+            if rc != crate::hle::result::RESULT_SUCCESS.get_inner_value() {
+                rollback_ipc_server_mapping(
+                    self,
+                    Some(updater.page_list()),
+                    dst_addr,
+                    mapped_pages,
+                );
+                return rc;
             }
             mapped_pages += 1;
 
             if let Some(memory) = &memory {
                 let copy_size = src_addr + size - mapping_src_end;
                 let src_bytes = if send && copy_size > 0 {
-                    Self::read_block_from_page_table(
+                    let Some(bytes) = Self::read_block_from_page_table(
                         memory,
                         src_page_table,
                         mapping_src_end,
                         copy_size,
-                    )
+                    ) else {
+                        rollback_ipc_server_mapping(
+                            self,
+                            Some(updater.page_list()),
+                            dst_addr,
+                            mapped_pages,
+                        );
+                        return svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value();
+                    };
+                    bytes
                 } else {
                     Vec::new()
                 };
                 let page_bytes = Self::build_ipc_partial_page(fill_value, send, 0, &src_bytes);
-                Self::write_block_to_page_table(
+                if !Self::write_block_to_page_table(
                     memory,
                     dst_page_table,
                     cur_mapped_addr,
                     &page_bytes,
-                );
+                ) {
+                    rollback_ipc_server_mapping(
+                        self,
+                        Some(updater.page_list()),
+                        dst_addr,
+                        mapped_pages,
+                    );
+                    return svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value();
+                }
             }
         }
 
-        self.update_blocks(
+        self.update_blocks_with_allocator(
+            &mut block_allocator,
             dst_addr,
             aligned_src_size / PAGE_SIZE,
             dst_state,
@@ -4959,6 +6568,7 @@ impl KPageTableBase {
             .saturating_add(unmapped_size);
 
         *out_addr = dst_addr + (src_addr - aligned_src_start);
+        memory_reservation.commit();
         crate::hle::result::RESULT_SUCCESS.get_inner_value()
     }
 
@@ -4976,7 +6586,7 @@ impl KPageTableBase {
             return svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value();
         }
 
-        let rc = self.check_memory_state(
+        let (rc, _, _, _, num_allocator_blocks) = self.check_memory_state_range(
             addr,
             size,
             KMemoryState::ALL,
@@ -4985,10 +6595,19 @@ impl KPageTableBase {
             KMemoryPermission::USER_READ,
             KMemoryAttribute::from_bits_truncate(0xFF),
             KMemoryAttribute::NONE,
+            Self::DEFAULT_MEMORY_IGNORE_ATTR,
         );
         if rc != crate::hle::result::RESULT_SUCCESS.get_inner_value() {
             return rc;
         }
+
+        let general_lock = self.m_general_lock.clone();
+        let _lock_guard = super::k_light_lock::KScopedLightLock::new(general_lock.as_ref());
+
+        let mut allocator = match self.make_block_update_allocator(num_allocator_blocks) {
+            Ok(allocator) => allocator,
+            Err(rc) => return rc,
+        };
 
         let (aligned_start, aligned_end, mapping_start, mapping_end) =
             Self::get_ipc_aligned_extents(addr, size);
@@ -5015,7 +6634,8 @@ impl KPageTableBase {
                 return rc;
             }
 
-            self.update_blocks(
+            self.update_blocks_with_allocator(
+                &mut allocator,
                 aligned_start,
                 aligned_size / PAGE_SIZE,
                 KMemoryState::NONE,
@@ -5067,6 +6687,9 @@ impl KPageTableBase {
             return crate::hle::result::RESULT_SUCCESS.get_inner_value();
         }
 
+        let general_lock = self.m_general_lock.clone();
+        let _lock_guard = super::k_light_lock::KScopedLightLock::new(general_lock.as_ref());
+
         let rc = self.check_memory_state(
             mapping_start,
             mapping_size,
@@ -5081,7 +6704,13 @@ impl KPageTableBase {
             return rc;
         }
 
-        self.m_memory_block_manager.update_lock(
+        let mut allocator = match self.make_block_update_allocator(0) {
+            Ok(allocator) => allocator,
+            Err(rc) => return rc,
+        };
+
+        self.m_memory_block_manager.update_lock_with_allocator(
+            Some(&mut allocator),
             mapping_start,
             mapping_size / PAGE_SIZE,
             KMemoryPermission::NONE,
@@ -5286,10 +6915,13 @@ impl KPageTableBase {
             );
         }
 
+        let general_lock = self.m_general_lock.clone();
+        let _lock_guard = super::k_light_lock::KScopedLightLock::new(general_lock.as_ref());
+
         let attr_mask = KMemoryAttribute::from_bits_truncate(
             KMemoryAttribute::IPC_LOCKED.bits() | KMemoryAttribute::LOCKED.bits(),
         );
-        let (result, out_old_state, _, _, _) = self.check_memory_state_range(
+        let (result, out_old_state, _, _, num_allocator_blocks) = self.check_memory_state_range(
             addr,
             size,
             state_flag,
@@ -5309,7 +6941,13 @@ impl KPageTableBase {
             old_state & KMemoryState::from_bits_truncate(KMemoryState::MASK.bits()),
         ) == SvcMemoryState::Io;
 
-        self.m_memory_block_manager.update_lock(
+        let mut allocator = match self.make_block_update_allocator(num_allocator_blocks) {
+            Ok(allocator) => allocator,
+            Err(rc) => return (rc, false),
+        };
+
+        self.m_memory_block_manager.update_lock_with_allocator(
+            Some(&mut allocator),
             addr,
             num_pages,
             KMemoryPermission::NONE,
@@ -5332,6 +6970,9 @@ impl KPageTableBase {
             return svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value();
         }
 
+        let general_lock = self.m_general_lock.clone();
+        let _lock_guard = super::k_light_lock::KScopedLightLock::new(general_lock.as_ref());
+
         let test_state = KMemoryState::FLAG_CAN_DEVICE_MAP
             | if check_heap {
                 KMemoryState::FLAG_REFERENCE_COUNTED
@@ -5341,7 +6982,7 @@ impl KPageTableBase {
         let attr_mask = KMemoryAttribute::from_bits_truncate(
             KMemoryAttribute::DEVICE_SHARED.bits() | KMemoryAttribute::LOCKED.bits(),
         );
-        let (result, _) = self.check_memory_state_contiguous(
+        let (result, num_allocator_blocks) = self.check_memory_state_contiguous(
             addr,
             size,
             test_state,
@@ -5356,7 +6997,13 @@ impl KPageTableBase {
         }
 
         let enable_device_address_space_merge = self.m_enable_device_address_space_merge;
-        self.m_memory_block_manager.update_lock(
+        let mut allocator = match self.make_block_update_allocator(num_allocator_blocks) {
+            Ok(allocator) => allocator,
+            Err(rc) => return rc,
+        };
+
+        self.m_memory_block_manager.update_lock_with_allocator(
+            Some(&mut allocator),
             addr,
             num_pages,
             KMemoryPermission::NONE,
@@ -5380,10 +7027,13 @@ impl KPageTableBase {
             return svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value();
         }
 
+        let general_lock = self.m_general_lock.clone();
+        let _lock_guard = super::k_light_lock::KScopedLightLock::new(general_lock.as_ref());
+
         let attr_mask = KMemoryAttribute::from_bits_truncate(
             KMemoryAttribute::DEVICE_SHARED.bits() | KMemoryAttribute::LOCKED.bits(),
         );
-        let (result, _) = self.check_memory_state_contiguous(
+        let (result, num_allocator_blocks) = self.check_memory_state_contiguous(
             addr,
             size,
             KMemoryState::FLAG_CAN_DEVICE_MAP,
@@ -5397,7 +7047,13 @@ impl KPageTableBase {
             return result;
         }
 
-        self.m_memory_block_manager.update_lock(
+        let mut allocator = match self.make_block_update_allocator(num_allocator_blocks) {
+            Ok(allocator) => allocator,
+            Err(rc) => return rc,
+        };
+
+        self.m_memory_block_manager.update_lock_with_allocator(
+            Some(&mut allocator),
             addr,
             num_pages,
             KMemoryPermission::NONE,
@@ -5415,10 +7071,13 @@ impl KPageTableBase {
             return svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value();
         }
 
+        let general_lock = self.m_general_lock.clone();
+        let _lock_guard = super::k_light_lock::KScopedLightLock::new(general_lock.as_ref());
+
         let attr_mask = KMemoryAttribute::from_bits_truncate(
             KMemoryAttribute::DEVICE_SHARED.bits() | KMemoryAttribute::LOCKED.bits(),
         );
-        let (result, _) = self.check_memory_state_contiguous(
+        let (result, allocator_num_blocks) = self.check_memory_state_contiguous(
             addr,
             size,
             KMemoryState::FLAG_CAN_DEVICE_MAP,
@@ -5433,7 +7092,13 @@ impl KPageTableBase {
         }
 
         let enable_device_address_space_merge = self.m_enable_device_address_space_merge;
-        self.m_memory_block_manager.update_lock(
+        let mut allocator = match self.make_block_update_allocator(allocator_num_blocks) {
+            Ok(allocator) => allocator,
+            Err(rc) => return rc,
+        };
+
+        self.m_memory_block_manager.update_lock_with_allocator(
+            Some(&mut allocator),
             addr,
             num_pages,
             KMemoryPermission::NONE,
@@ -5466,10 +7131,13 @@ impl KPageTableBase {
             return svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value();
         }
 
-        let result = self.check_memory_state(
+        let general_lock = self.m_general_lock.clone();
+        let _lock_guard = KScopedLightLock::new(general_lock.as_ref());
+
+        let (result, blocks_needed) = self.check_memory_state_contiguous(
             dst,
             size,
-            KMemoryState::ALL,
+            KMemoryState::all(),
             KMemoryState::FREE,
             KMemoryPermission::NONE,
             KMemoryPermission::NONE,
@@ -5480,6 +7148,11 @@ impl KPageTableBase {
             return result;
         }
 
+        let Ok(mut allocator) = self.make_block_update_allocator(blocks_needed) else {
+            return svc_results::RESULT_OUT_OF_RESOURCE.get_inner_value();
+        };
+        let mut updater = KScopedPageTableUpdater::from_mut(self);
+
         let props = KPageProperties {
             perm,
             io: true,
@@ -5487,7 +7160,7 @@ impl KPageTableBase {
             disable_merge_attributes: DisableMergeAttribute::DISABLE_HEAD,
         };
         let op = self.operate(
-            None,
+            Some(updater.page_list()),
             dst,
             num_pages,
             phys_addr,
@@ -5499,12 +7172,13 @@ impl KPageTableBase {
             return op;
         }
 
-        self.update_blocks(
+        self.update_blocks_with_allocator(
+            &mut allocator,
             dst,
             num_pages,
             KMemoryState::IO_REGISTER,
             perm,
-            KMemoryAttribute::NONE,
+            KMemoryAttribute::LOCKED,
             KMemoryBlockDisableMergeAttribute::NORMAL,
             KMemoryBlockDisableMergeAttribute::NONE,
         );
@@ -5512,25 +7186,43 @@ impl KPageTableBase {
     }
 
     /// Matches upstream `KPageTableBase::UnmapIoRegion`.
-    pub fn unmap_io_region(&mut self, dst: usize, _phys_addr: u64, size: usize) -> u32 {
+    pub fn unmap_io_region(&mut self, dst: usize, phys_addr: u64, size: usize) -> u32 {
         let num_pages = size / PAGE_SIZE;
         if !self.contains_range(dst, size) {
             return svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value();
         }
 
-        let result = self.check_memory_state(
+        let general_lock = self.m_general_lock.clone();
+        let _lock_guard = KScopedLightLock::new(general_lock.as_ref());
+
+        let (result, blocks_needed) = self.check_memory_state_contiguous(
             dst,
             size,
-            KMemoryState::ALL,
+            KMemoryState::all(),
             KMemoryState::IO_REGISTER,
             KMemoryPermission::NONE,
             KMemoryPermission::NONE,
-            KMemoryAttribute::NONE,
-            KMemoryAttribute::NONE,
+            KMemoryAttribute::from_bits_truncate(0xFF),
+            KMemoryAttribute::LOCKED,
         );
         if result != 0 {
             return result;
         }
+
+        if let Some(impl_pt) = self.m_impl.as_ref() {
+            for page in 0..num_pages {
+                let va = dst + page * PAGE_SIZE;
+                let expected = phys_addr + (page * PAGE_SIZE) as u64;
+                if impl_pt.get_physical_address(va as u64) != Some(expected) {
+                    return svc_results::RESULT_INVALID_MEMORY_REGION.get_inner_value();
+                }
+            }
+        }
+
+        let Ok(mut allocator) = self.make_block_update_allocator(blocks_needed) else {
+            return svc_results::RESULT_OUT_OF_RESOURCE.get_inner_value();
+        };
+        let mut updater = KScopedPageTableUpdater::from_mut(self);
 
         let unmap_props = KPageProperties {
             perm: KMemoryPermission::NONE,
@@ -5539,7 +7231,7 @@ impl KPageTableBase {
             disable_merge_attributes: DisableMergeAttribute::NONE,
         };
         let op = self.operate(
-            None,
+            Some(updater.page_list()),
             dst,
             num_pages,
             0,
@@ -5551,7 +7243,8 @@ impl KPageTableBase {
             return op;
         }
 
-        self.update_blocks(
+        self.update_blocks_with_allocator(
+            &mut allocator,
             dst,
             num_pages,
             KMemoryState::FREE,
@@ -5744,33 +7437,55 @@ impl KPageTableBase {
             return svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value();
         };
 
-        let mut remaining = size;
-        let mut cur_addr = addr as u64;
+        let Some((first_entry, mut traversal_context)) = impl_pt.begin_traversal(addr as u64)
+        else {
+            return svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value();
+        };
 
-        while remaining > 0 {
-            let Some(phys_addr) = impl_pt.get_physical_address(cur_addr) else {
+        if first_entry.block_size == 0 {
+            return svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value();
+        }
+
+        let block_mask = first_entry.block_size - 1;
+        let mut cur_addr = first_entry.phys_addr;
+        let mut cur_size = first_entry
+            .block_size
+            .saturating_sub((cur_addr as usize) & block_mask);
+        let mut total_size = cur_size;
+
+        while total_size < size {
+            let Some(next_entry) = impl_pt.continue_traversal(&mut traversal_context) else {
                 return svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value();
             };
 
-            let mut block_pages = 1usize;
-            while block_pages * PAGE_SIZE < remaining {
-                let next_virt = cur_addr + (block_pages * PAGE_SIZE) as u64;
-                let Some(next_phys) = impl_pt.get_physical_address(next_virt) else {
-                    break;
-                };
-                if next_phys != phys_addr + (block_pages * PAGE_SIZE) as u64 {
-                    break;
+            if next_entry.phys_addr != cur_addr + cur_size as u64 {
+                let cur_pages = cur_size / PAGE_SIZE;
+                if !is_heap_physical_address_for_table(cur_addr) {
+                    return svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value();
                 }
-                block_pages += 1;
+                if pg.add_block(cur_addr, cur_pages).is_err() {
+                    return svc_results::RESULT_OUT_OF_MEMORY.get_inner_value();
+                }
+
+                cur_addr = next_entry.phys_addr;
+                cur_size = next_entry.block_size;
+            } else {
+                cur_size += next_entry.block_size;
             }
 
-            if pg.add_block(phys_addr, block_pages).is_err() {
-                return svc_results::RESULT_OUT_OF_MEMORY.get_inner_value();
-            }
+            total_size += next_entry.block_size;
+        }
 
-            let block_size = block_pages * PAGE_SIZE;
-            cur_addr += block_size as u64;
-            remaining -= block_size;
+        if total_size > size {
+            cur_size -= total_size - size;
+        }
+
+        let cur_pages = cur_size / PAGE_SIZE;
+        if !is_heap_physical_address_for_table(cur_addr) {
+            return svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value();
+        }
+        if pg.add_block(cur_addr, cur_pages).is_err() {
+            return svc_results::RESULT_OUT_OF_MEMORY.get_inner_value();
         }
 
         0
@@ -5812,6 +7527,57 @@ impl KPageTableBase {
         }
     }
 
+    /// Create a page group from the current mapping and open a new physical
+    /// reference for every page in the group.
+    ///
+    /// Upstream: `KPageTableBase::MakeAndOpenPageGroup` (k_page_table_base.cpp:2990).
+    pub fn make_and_open_page_group(
+        &self,
+        out: &mut super::k_page_group::KPageGroup,
+        address: usize,
+        num_pages: usize,
+        state_mask: KMemoryState,
+        state: KMemoryState,
+        perm_mask: KMemoryPermission,
+        perm: KMemoryPermission,
+        attr_mask: KMemoryAttribute,
+        attr: KMemoryAttribute,
+    ) -> u32 {
+        let size = num_pages * PAGE_SIZE;
+        if !self.contains_range(address, size) {
+            return svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value();
+        }
+
+        let general_lock = self.m_general_lock.clone();
+        let _lock_guard = KScopedLightLock::new(general_lock.as_ref());
+
+        let result = self.check_memory_state(
+            address,
+            size,
+            KMemoryState::from_bits_truncate(
+                state_mask.bits() | KMemoryState::FLAG_REFERENCE_COUNTED.bits(),
+            ),
+            KMemoryState::from_bits_truncate(
+                state.bits() | KMemoryState::FLAG_REFERENCE_COUNTED.bits(),
+            ),
+            perm_mask,
+            perm,
+            attr_mask,
+            attr,
+        );
+        if result != 0 {
+            return result;
+        }
+
+        let result = self.make_page_group(out, address, num_pages);
+        if result != 0 {
+            return result;
+        }
+
+        out.open();
+        0
+    }
+
     /// Map a page group into the address space with the given state and permission.
     ///
     /// Upstream: `KPageTableBase::MapPageGroup(KProcessAddress addr, const KPageGroup& pg,
@@ -5831,8 +7597,11 @@ impl KPageTableBase {
             return svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value();
         }
 
+        let general_lock = self.m_general_lock.clone();
+        let _lock_guard = KScopedLightLock::new(general_lock.as_ref());
+
         // Check that the region is currently Free with no permissions.
-        let (result, _blocks_needed) = self.check_memory_state_contiguous(
+        let (result, blocks_needed) = self.check_memory_state_contiguous(
             addr,
             size,
             KMemoryState::all(),
@@ -5846,6 +7615,11 @@ impl KPageTableBase {
             return result;
         }
 
+        let Ok(mut allocator) = self.make_block_update_allocator(blocks_needed) else {
+            return svc_results::RESULT_OUT_OF_RESOURCE.get_inner_value();
+        };
+        let mut updater = KScopedPageTableUpdater::from_mut(self);
+
         // Map the pages.
         let properties = KPageProperties {
             perm,
@@ -5853,13 +7627,14 @@ impl KPageTableBase {
             uncached: false,
             disable_merge_attributes: DisableMergeAttribute::DISABLE_HEAD,
         };
-        let result = self.map_page_group_impl(None, addr, pg, properties);
+        let result = self.map_page_group_impl(Some(updater.page_list()), addr, pg, properties);
         if result != 0 {
             return result;
         }
 
         // Update the memory block manager to track the new state.
-        self.update_blocks(
+        self.update_blocks_with_allocator(
+            &mut allocator,
             addr,
             num_pages,
             state,
@@ -5889,8 +7664,11 @@ impl KPageTableBase {
             return svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value();
         }
 
+        let general_lock = self.m_general_lock.clone();
+        let _lock_guard = KScopedLightLock::new(general_lock.as_ref());
+
         // Check that the region is currently in the expected state.
-        let (result, _blocks_needed) = self.check_memory_state_contiguous(
+        let (result, blocks_needed) = self.check_memory_state_contiguous(
             address,
             size,
             KMemoryState::all(),
@@ -5903,6 +7681,14 @@ impl KPageTableBase {
         if result != 0 {
             return result;
         }
+        if !self.is_valid_page_group(pg, address, num_pages) {
+            return svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value();
+        }
+
+        let Ok(mut allocator) = self.make_block_update_allocator(blocks_needed) else {
+            return svc_results::RESULT_OUT_OF_RESOURCE.get_inner_value();
+        };
+        let mut updater = KScopedPageTableUpdater::from_mut(self);
 
         // Unmap the pages.
         let properties = KPageProperties {
@@ -5912,7 +7698,7 @@ impl KPageTableBase {
             disable_merge_attributes: DisableMergeAttribute::NONE,
         };
         let result = self.operate(
-            None,
+            Some(updater.page_list()),
             address,
             num_pages,
             0,
@@ -5925,7 +7711,8 @@ impl KPageTableBase {
         }
 
         // Update block manager back to Free.
-        self.update_blocks(
+        self.update_blocks_with_allocator(
+            &mut allocator,
             address,
             num_pages,
             KMemoryState::FREE,
@@ -5948,9 +7735,286 @@ impl Default for KPageTableBase {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::SystemRef;
+    use crate::device_memory::{dram_memory_map, DeviceMemory};
+    use crate::hle::kernel::k_memory_manager::{Direction, KMemoryManager, Pool};
     use crate::hle::kernel::k_resource_limit::create_resource_limit_for_process;
+    use crate::hle::kernel::kernel::ScopedKernelForTest;
     use crate::hle::kernel::svc::svc_results;
     use crate::hle::result::RESULT_SUCCESS;
+    use crate::memory::memory::Memory;
+
+    fn kernel_with_application_pool_for_test(num_pages: usize) -> ScopedKernelForTest {
+        let mut kernel = ScopedKernelForTest::new();
+        kernel
+            .kernel_mut()
+            .initialize_memory_block_slab_manager(4096);
+        kernel.memory_manager_mut().initialize_pool(
+            Pool::Application,
+            dram_memory_map::BASE + 0x100000,
+            num_pages * PAGE_SIZE,
+        );
+        kernel
+    }
+
+    struct PageTableMemoryForTest {
+        _device_memory: Box<DeviceMemory>,
+        memory: Arc<Mutex<Memory>>,
+    }
+
+    impl PageTableMemoryForTest {
+        fn new(backing_size: usize) -> Self {
+            let device_memory = Box::new(DeviceMemory::with_size(backing_size));
+            let buffer_ptr = &device_memory.buffer as *const common::host_memory::HostMemory;
+            let memory = Arc::new(Mutex::new(unsafe {
+                Memory::new(
+                    SystemRef::null(),
+                    device_memory.as_ref() as *const _,
+                    buffer_ptr,
+                )
+            }));
+
+            Self {
+                _device_memory: device_memory,
+                memory,
+            }
+        }
+    }
+
+    fn attach_page_table_memory_for_test(
+        page_table: &mut KPageTableBase,
+        memory: Arc<Mutex<Memory>>,
+    ) {
+        page_table.m_address_space_width = 32;
+        page_table.m_memory = Some(memory);
+        page_table.initialize_impl();
+        if let (Some(memory), Some(page_table_impl)) =
+            (page_table.m_memory.as_ref(), page_table.m_impl.as_mut())
+        {
+            memory
+                .lock()
+                .unwrap()
+                .set_current_page_table(page_table_impl.as_mut() as *mut _);
+        }
+    }
+
+    fn map_source_pages_for_test(
+        page_table: &mut KPageTableBase,
+        addr: usize,
+        num_pages: usize,
+        phys_addr: u64,
+    ) {
+        let Some(memory) = page_table.m_memory.as_ref().cloned() else {
+            panic!("test page table memory must be attached before mapping source pages");
+        };
+        let Some(impl_pt) = page_table.m_impl.as_mut() else {
+            panic!("test page table backend must be initialized before mapping source pages");
+        };
+        memory.lock().unwrap().map_memory_region(
+            impl_pt,
+            addr as u64,
+            (num_pages * PAGE_SIZE) as u64,
+            phys_addr,
+            KPageTableBase::convert_to_memory_permission(KMemoryPermission::USER_READ_WRITE),
+            false,
+        );
+    }
+
+    #[test]
+    fn make_and_open_page_group_requires_reference_counted_state_and_builds_group() {
+        let mut kernel = kernel_with_application_pool_for_test(16);
+        let page_table_memory = PageTableMemoryForTest::new(0x400000);
+        let phys_addr = kernel.memory_manager_mut().allocate_and_open_continuous(
+            2,
+            2,
+            KMemoryManager::encode_option(Pool::Application, Direction::FromFront),
+        );
+        assert_ne!(phys_addr, 0);
+
+        let mut page_table = KPageTableBase::new();
+        page_table.m_address_space_start = 0x1000_0000;
+        page_table.m_address_space_end = 0x1000_4000;
+        attach_page_table_memory_for_test(&mut page_table, page_table_memory.memory.clone());
+        assert!(page_table
+            .m_memory_block_manager
+            .initialize(
+                page_table.m_address_space_start,
+                page_table.m_address_space_end,
+                None,
+            )
+            .is_ok());
+        page_table.m_memory_block_manager.update(
+            page_table.m_address_space_start,
+            2,
+            KMemoryState::NORMAL,
+            KMemoryPermission::USER_READ_WRITE,
+            KMemoryAttribute::NONE,
+            KMemoryBlockDisableMergeAttribute::NONE,
+            KMemoryBlockDisableMergeAttribute::NONE,
+        );
+        let mapped_addr = page_table.m_address_space_start;
+        map_source_pages_for_test(&mut page_table, mapped_addr, 2, phys_addr);
+
+        let mut group = crate::hle::kernel::k_page_group::KPageGroup::new();
+        let result = page_table.make_and_open_page_group(
+            &mut group,
+            mapped_addr,
+            2,
+            KMemoryState::all(),
+            KMemoryState::NORMAL,
+            KMemoryPermission::USER_READ_WRITE,
+            KMemoryPermission::USER_READ_WRITE,
+            KMemoryAttribute::all(),
+            KMemoryAttribute::NONE,
+        );
+
+        assert_eq!(result, 0);
+        assert_eq!(group.get_num_pages(), 2);
+        let blocks: Vec<_> = group.iter().collect();
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].get_address(), phys_addr);
+        assert_eq!(blocks[0].get_num_pages(), 2);
+
+        let mut non_reference_counted_group = crate::hle::kernel::k_page_group::KPageGroup::new();
+        let result = page_table.make_and_open_page_group(
+            &mut non_reference_counted_group,
+            mapped_addr,
+            2,
+            KMemoryState::MASK,
+            KMemoryState::FREE,
+            KMemoryPermission::NONE,
+            KMemoryPermission::NONE,
+            KMemoryAttribute::all(),
+            KMemoryAttribute::NONE,
+        );
+        assert_eq!(
+            result,
+            svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value()
+        );
+        assert!(non_reference_counted_group.is_empty());
+    }
+
+    #[test]
+    fn unmap_process_memory_same_table_validates_shared_code_physical_mapping() {
+        let mut kernel = kernel_with_application_pool_for_test(16);
+        let page_table_memory = PageTableMemoryForTest::new(0x400000);
+        let phys_addr = kernel.memory_manager_mut().allocate_and_open_continuous(
+            2,
+            2,
+            KMemoryManager::encode_option(Pool::Application, Direction::FromFront),
+        );
+        assert_ne!(phys_addr, 0);
+
+        let mut page_table = KPageTableBase::new();
+        page_table.m_address_space_start = 0x1000_0000;
+        page_table.m_address_space_end = 0x1001_0000;
+        page_table.m_heap_region_start = 0x1000_8000;
+        page_table.m_heap_region_end = 0x1001_0000;
+        page_table.m_alias_code_region_start = 0x1000_4000;
+        page_table.m_alias_code_region_end = 0x1000_8000;
+        attach_page_table_memory_for_test(&mut page_table, page_table_memory.memory.clone());
+        assert!(page_table
+            .m_memory_block_manager
+            .initialize(
+                page_table.m_address_space_start,
+                page_table.m_address_space_end,
+                None,
+            )
+            .is_ok());
+
+        let src_addr = 0x1000_8000;
+        let dst_addr = 0x1000_4000;
+        page_table.m_memory_block_manager.update(
+            src_addr,
+            2,
+            KMemoryState::CODE_DATA,
+            KMemoryPermission::USER_READ_WRITE,
+            KMemoryAttribute::NONE,
+            KMemoryBlockDisableMergeAttribute::NONE,
+            KMemoryBlockDisableMergeAttribute::NONE,
+        );
+        map_source_pages_for_test(&mut page_table, src_addr, 2, phys_addr);
+
+        let mut group = crate::hle::kernel::k_page_group::KPageGroup::new();
+        assert_eq!(
+            page_table.make_and_open_page_group(
+                &mut group,
+                src_addr,
+                2,
+                KMemoryState::FLAG_CAN_MAP_PROCESS,
+                KMemoryState::FLAG_CAN_MAP_PROCESS,
+                KMemoryPermission::NONE,
+                KMemoryPermission::NONE,
+                KMemoryAttribute::all(),
+                KMemoryAttribute::NONE,
+            ),
+            0
+        );
+        assert_eq!(
+            page_table.map_page_group(
+                dst_addr,
+                &group,
+                KMemoryState::SHARED_CODE,
+                KMemoryPermission::USER_READ_WRITE,
+            ),
+            0
+        );
+
+        assert_eq!(
+            page_table.unmap_process_memory_same_table(dst_addr, 2 * PAGE_SIZE, src_addr),
+            0
+        );
+
+        let dst_info = page_table.query_info(dst_addr).unwrap();
+        assert_eq!(dst_info.m_state, KMemoryState::FREE);
+        assert_eq!(dst_info.m_permission, KMemoryPermission::NONE);
+        let src_info = page_table.query_info(src_addr).unwrap();
+        assert_eq!(src_info.m_state, KMemoryState::CODE_DATA);
+        assert_eq!(src_info.m_permission, KMemoryPermission::USER_READ_WRITE);
+    }
+
+    #[test]
+    fn scoped_light_lock_pair_unlocks_both_locks_on_drop() {
+        let first = Arc::new(KLightLock::new(0));
+        let second = Arc::new(KLightLock::new(0));
+
+        {
+            let _pair = KScopedLightLockPair::new(second.clone(), first.clone());
+            assert!(first.is_locked());
+            assert!(second.is_locked());
+        }
+
+        assert!(!first.is_locked());
+        assert!(!second.is_locked());
+    }
+
+    #[test]
+    fn scoped_light_lock_pair_try_unlock_half_matches_upstream_helper() {
+        let first = Arc::new(KLightLock::new(0));
+        let second = Arc::new(KLightLock::new(0));
+
+        {
+            let mut pair = KScopedLightLockPair::new(first.clone(), second.clone());
+            pair.try_unlock_half(&first);
+            assert!(!first.is_locked());
+            assert!(second.is_locked());
+        }
+
+        assert!(!first.is_locked());
+        assert!(!second.is_locked());
+    }
+
+    #[test]
+    fn scoped_light_lock_pair_same_lock_locks_once() {
+        let lock = Arc::new(KLightLock::new(0));
+
+        {
+            let _pair = KScopedLightLockPair::new(lock.clone(), lock.clone());
+            assert!(lock.is_locked());
+        }
+
+        assert!(!lock.is_locked());
+    }
 
     #[test]
     fn query_info_out_of_range_returns_inaccessible_terminal_block() {
@@ -6013,7 +8077,823 @@ mod tests {
     }
 
     #[test]
+    fn set_memory_permission_updates_block_permission() {
+        let _kernel = kernel_with_application_pool_for_test(4);
+        let mut page_table = KPageTableBase::new();
+        page_table.m_address_space_start = 0x1000_0000;
+        page_table.m_address_space_end = 0x1000_4000;
+        assert!(page_table
+            .m_memory_block_manager
+            .initialize(
+                page_table.m_address_space_start,
+                page_table.m_address_space_end,
+                None,
+            )
+            .is_ok());
+
+        page_table.m_memory_block_manager.update(
+            page_table.m_address_space_start,
+            1,
+            KMemoryState::NORMAL,
+            KMemoryPermission::USER_READ_WRITE,
+            KMemoryAttribute::NONE,
+            KMemoryBlockDisableMergeAttribute::NONE,
+            KMemoryBlockDisableMergeAttribute::NONE,
+        );
+
+        let result = page_table.set_memory_permission(
+            page_table.m_address_space_start,
+            PAGE_SIZE,
+            KMemoryPermission::USER_READ,
+        );
+
+        assert_eq!(result, 0);
+        let info = page_table
+            .m_memory_block_manager
+            .query_info(page_table.m_address_space_start)
+            .unwrap();
+        assert_eq!(info.m_state, KMemoryState::NORMAL);
+        assert_eq!(info.m_permission, KMemoryPermission::USER_READ);
+    }
+
+    #[test]
+    fn set_process_memory_permission_updates_code_to_code_data() {
+        let _kernel = kernel_with_application_pool_for_test(4);
+        let mut page_table = KPageTableBase::new();
+        page_table.m_address_space_start = 0x1000_0000;
+        page_table.m_address_space_end = 0x1000_4000;
+        assert!(page_table
+            .m_memory_block_manager
+            .initialize(
+                page_table.m_address_space_start,
+                page_table.m_address_space_end,
+                None,
+            )
+            .is_ok());
+
+        page_table.m_memory_block_manager.update(
+            page_table.m_address_space_start,
+            1,
+            KMemoryState::CODE,
+            KMemoryPermission::USER_READ_EXECUTE,
+            KMemoryAttribute::NONE,
+            KMemoryBlockDisableMergeAttribute::NONE,
+            KMemoryBlockDisableMergeAttribute::NONE,
+        );
+
+        let result = page_table.set_process_memory_permission(
+            page_table.m_address_space_start,
+            PAGE_SIZE,
+            KMemoryPermission::USER_READ_WRITE,
+        );
+
+        assert_eq!(result, 0);
+        let info = page_table
+            .m_memory_block_manager
+            .query_info(page_table.m_address_space_start)
+            .unwrap();
+        assert_eq!(info.m_state, KMemoryState::CODE_DATA);
+        assert_eq!(info.m_permission, KMemoryPermission::USER_READ_WRITE);
+    }
+
+    #[test]
+    fn invalidate_data_cache_validates_range_state_and_mapping() {
+        let mut kernel = kernel_with_application_pool_for_test(4);
+        let page_table_memory = PageTableMemoryForTest::new(0x400000);
+        let phys_addr = kernel.memory_manager_mut().allocate_and_open_continuous(
+            1,
+            1,
+            KMemoryManager::encode_option(Pool::Application, Direction::FromFront),
+        );
+        assert_ne!(phys_addr, 0);
+
+        let mut page_table = KPageTableBase::new();
+        page_table.m_address_space_start = 0x1000_0000;
+        page_table.m_address_space_end = 0x1000_4000;
+        attach_page_table_memory_for_test(&mut page_table, page_table_memory.memory.clone());
+        assert!(page_table
+            .m_memory_block_manager
+            .initialize(
+                page_table.m_address_space_start,
+                page_table.m_address_space_end,
+                None,
+            )
+            .is_ok());
+        page_table.m_memory_block_manager.update(
+            page_table.m_address_space_start,
+            1,
+            KMemoryState::NORMAL,
+            KMemoryPermission::USER_READ_WRITE,
+            KMemoryAttribute::NONE,
+            KMemoryBlockDisableMergeAttribute::NONE,
+            KMemoryBlockDisableMergeAttribute::NONE,
+        );
+        let cache_addr = page_table.m_address_space_start;
+        map_source_pages_for_test(&mut page_table, cache_addr, 1, phys_addr);
+
+        assert_eq!(
+            page_table.invalidate_process_data_cache(cache_addr, PAGE_SIZE),
+            0
+        );
+        assert_eq!(
+            page_table.invalidate_current_process_data_cache(cache_addr, PAGE_SIZE),
+            0
+        );
+        assert_eq!(
+            page_table.invalidate_process_data_cache(page_table.m_address_space_end, PAGE_SIZE),
+            svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value()
+        );
+    }
+
+    #[test]
+    fn copy_memory_from_linear_to_kernel_validates_and_reads_physical_backing() {
+        let mut kernel = kernel_with_application_pool_for_test(4);
+        let page_table_memory = PageTableMemoryForTest::new(0x400000);
+        let phys_addr = kernel.memory_manager_mut().allocate_and_open_continuous(
+            1,
+            1,
+            KMemoryManager::encode_option(Pool::Application, Direction::FromFront),
+        );
+        assert_ne!(phys_addr, 0);
+
+        let mut page_table = KPageTableBase::new();
+        page_table.m_address_space_start = 0x1000_0000;
+        page_table.m_address_space_end = 0x1000_4000;
+        attach_page_table_memory_for_test(&mut page_table, page_table_memory.memory.clone());
+        assert!(page_table
+            .m_memory_block_manager
+            .initialize(
+                page_table.m_address_space_start,
+                page_table.m_address_space_end,
+                None,
+            )
+            .is_ok());
+        page_table.m_memory_block_manager.update(
+            page_table.m_address_space_start,
+            1,
+            KMemoryState::NORMAL,
+            KMemoryPermission::USER_READ_WRITE,
+            KMemoryAttribute::NONE,
+            KMemoryBlockDisableMergeAttribute::NONE,
+            KMemoryBlockDisableMergeAttribute::NONE,
+        );
+
+        let map_addr = page_table.m_address_space_start;
+        let src_addr = map_addr + 0x40;
+        map_source_pages_for_test(&mut page_table, map_addr, 1, phys_addr);
+        let expected = [0x13, 0x37, 0xC0, 0xDE, 0x42, 0x24];
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                expected.as_ptr(),
+                page_table_memory
+                    ._device_memory
+                    .get_pointer(phys_addr + 0x40),
+                expected.len(),
+            );
+        }
+
+        let mut actual = [0u8; 6];
+        assert_eq!(
+            page_table.copy_memory_from_linear_to_kernel(
+                actual.as_mut_ptr() as usize,
+                actual.len(),
+                src_addr,
+                KMemoryState::FLAG_REFERENCE_COUNTED,
+                KMemoryState::FLAG_REFERENCE_COUNTED,
+                KMemoryPermission::USER_READ,
+                KMemoryAttribute::NONE,
+                KMemoryAttribute::NONE,
+            ),
+            0
+        );
+        assert_eq!(actual, expected);
+        assert_eq!(
+            page_table.copy_memory_from_linear_to_kernel(
+                actual.as_mut_ptr() as usize,
+                actual.len(),
+                page_table.m_address_space_end,
+                KMemoryState::FLAG_REFERENCE_COUNTED,
+                KMemoryState::FLAG_REFERENCE_COUNTED,
+                KMemoryPermission::USER_READ,
+                KMemoryAttribute::NONE,
+                KMemoryAttribute::NONE,
+            ),
+            svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value()
+        );
+    }
+
+    #[test]
+    fn read_debug_memory_copies_linear_backing_to_guest_memory() {
+        let mut kernel = kernel_with_application_pool_for_test(4);
+        let page_table_memory = PageTableMemoryForTest::new(0x400000);
+        let src_phys_addr = kernel.memory_manager_mut().allocate_and_open_continuous(
+            1,
+            1,
+            KMemoryManager::encode_option(Pool::Application, Direction::FromFront),
+        );
+        let dst_phys_addr = kernel.memory_manager_mut().allocate_and_open_continuous(
+            1,
+            1,
+            KMemoryManager::encode_option(Pool::Application, Direction::FromFront),
+        );
+        assert_ne!(src_phys_addr, 0);
+        assert_ne!(dst_phys_addr, 0);
+
+        let mut page_table = KPageTableBase::new();
+        page_table.m_address_space_start = 0x1000_0000;
+        page_table.m_address_space_end = 0x1000_8000;
+        attach_page_table_memory_for_test(&mut page_table, page_table_memory.memory.clone());
+        assert!(page_table
+            .m_memory_block_manager
+            .initialize(
+                page_table.m_address_space_start,
+                page_table.m_address_space_end,
+                None,
+            )
+            .is_ok());
+        page_table.m_memory_block_manager.update(
+            page_table.m_address_space_start,
+            2,
+            KMemoryState::NORMAL,
+            KMemoryPermission::USER_READ_WRITE,
+            KMemoryAttribute::NONE,
+            KMemoryBlockDisableMergeAttribute::NONE,
+            KMemoryBlockDisableMergeAttribute::NONE,
+        );
+
+        let src_map_addr = page_table.m_address_space_start;
+        let dst_map_addr = page_table.m_address_space_start + PAGE_SIZE;
+        let src_addr = src_map_addr + 0x30;
+        let dst_addr = dst_map_addr + 0x70;
+        map_source_pages_for_test(&mut page_table, src_map_addr, 1, src_phys_addr);
+        map_source_pages_for_test(&mut page_table, dst_map_addr, 1, dst_phys_addr);
+
+        let expected = [0xD1, 0xE2, 0xB3, 0x94, 0x55, 0x26, 0x17];
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                expected.as_ptr(),
+                page_table_memory
+                    ._device_memory
+                    .get_pointer(src_phys_addr + 0x30),
+                expected.len(),
+            );
+        }
+
+        assert_eq!(
+            page_table.read_debug_memory(dst_addr, src_addr, expected.len()),
+            0
+        );
+        let mut actual = [0u8; 7];
+        assert!(page_table_memory
+            .memory
+            .lock()
+            .unwrap()
+            .read_block(dst_addr as u64, &mut actual));
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn write_debug_memory_accepts_debuggable_non_writable_memory() {
+        let mut kernel = kernel_with_application_pool_for_test(4);
+        let page_table_memory = PageTableMemoryForTest::new(0x400000);
+        let src_phys_addr = kernel.memory_manager_mut().allocate_and_open_continuous(
+            1,
+            1,
+            KMemoryManager::encode_option(Pool::Application, Direction::FromFront),
+        );
+        let dst_phys_addr = kernel.memory_manager_mut().allocate_and_open_continuous(
+            1,
+            1,
+            KMemoryManager::encode_option(Pool::Application, Direction::FromFront),
+        );
+        assert_ne!(src_phys_addr, 0);
+        assert_ne!(dst_phys_addr, 0);
+
+        let mut page_table = KPageTableBase::new();
+        page_table.m_address_space_start = 0x1000_0000;
+        page_table.m_address_space_end = 0x1000_8000;
+        attach_page_table_memory_for_test(&mut page_table, page_table_memory.memory.clone());
+        assert!(page_table
+            .m_memory_block_manager
+            .initialize(
+                page_table.m_address_space_start,
+                page_table.m_address_space_end,
+                None,
+            )
+            .is_ok());
+        page_table.m_memory_block_manager.update(
+            page_table.m_address_space_start,
+            1,
+            KMemoryState::NORMAL,
+            KMemoryPermission::USER_READ_WRITE,
+            KMemoryAttribute::NONE,
+            KMemoryBlockDisableMergeAttribute::NONE,
+            KMemoryBlockDisableMergeAttribute::NONE,
+        );
+        page_table.m_memory_block_manager.update(
+            page_table.m_address_space_start + PAGE_SIZE,
+            1,
+            KMemoryState::CODE,
+            KMemoryPermission::NONE,
+            KMemoryAttribute::NONE,
+            KMemoryBlockDisableMergeAttribute::NONE,
+            KMemoryBlockDisableMergeAttribute::NONE,
+        );
+
+        let src_map_addr = page_table.m_address_space_start;
+        let dst_map_addr = page_table.m_address_space_start + PAGE_SIZE;
+        let src_addr = src_map_addr + 0x90;
+        let dst_addr = dst_map_addr + 0x20;
+        map_source_pages_for_test(&mut page_table, src_map_addr, 1, src_phys_addr);
+        map_source_pages_for_test(&mut page_table, dst_map_addr, 1, dst_phys_addr);
+
+        let expected = [0xA5, 0x5A, 0xC3, 0x3C, 0x7E, 0xE7];
+        assert!(page_table_memory
+            .memory
+            .lock()
+            .unwrap()
+            .write_block(src_addr as u64, &expected));
+
+        assert_eq!(
+            page_table.write_debug_memory(dst_addr, src_addr, expected.len()),
+            0
+        );
+        let mut actual = [0u8; 6];
+        assert!(page_table_memory
+            .memory
+            .lock()
+            .unwrap()
+            .read_phys_block(dst_phys_addr + 0x20, &mut actual));
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn copy_memory_from_linear_to_user_writes_destination_guest_memory() {
+        let mut kernel = kernel_with_application_pool_for_test(4);
+        let page_table_memory = PageTableMemoryForTest::new(0x400000);
+        let src_phys_addr = kernel.memory_manager_mut().allocate_and_open_continuous(
+            1,
+            1,
+            KMemoryManager::encode_option(Pool::Application, Direction::FromFront),
+        );
+        let dst_phys_addr = kernel.memory_manager_mut().allocate_and_open_continuous(
+            1,
+            1,
+            KMemoryManager::encode_option(Pool::Application, Direction::FromFront),
+        );
+        assert_ne!(src_phys_addr, 0);
+        assert_ne!(dst_phys_addr, 0);
+
+        let mut page_table = KPageTableBase::new();
+        page_table.m_address_space_start = 0x1000_0000;
+        page_table.m_address_space_end = 0x1000_8000;
+        attach_page_table_memory_for_test(&mut page_table, page_table_memory.memory.clone());
+        assert!(page_table
+            .m_memory_block_manager
+            .initialize(
+                page_table.m_address_space_start,
+                page_table.m_address_space_end,
+                None,
+            )
+            .is_ok());
+        page_table.m_memory_block_manager.update(
+            page_table.m_address_space_start,
+            2,
+            KMemoryState::NORMAL,
+            KMemoryPermission::USER_READ_WRITE,
+            KMemoryAttribute::NONE,
+            KMemoryBlockDisableMergeAttribute::NONE,
+            KMemoryBlockDisableMergeAttribute::NONE,
+        );
+
+        let src_map_addr = page_table.m_address_space_start;
+        let dst_map_addr = page_table.m_address_space_start + PAGE_SIZE;
+        let dst_addr = page_table.m_address_space_start + PAGE_SIZE + 0x80;
+        map_source_pages_for_test(&mut page_table, src_map_addr, 1, src_phys_addr);
+        map_source_pages_for_test(&mut page_table, dst_map_addr, 1, dst_phys_addr);
+
+        let src_addr = src_map_addr + 0x40;
+        let expected = [0xFE, 0xED, 0xFA, 0xCE, 0x11, 0x22, 0x33];
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                expected.as_ptr(),
+                page_table_memory
+                    ._device_memory
+                    .get_pointer(src_phys_addr + 0x40),
+                expected.len(),
+            );
+        }
+
+        assert_eq!(
+            page_table.copy_memory_from_linear_to_user(
+                dst_addr,
+                expected.len(),
+                src_addr,
+                KMemoryState::FLAG_REFERENCE_COUNTED,
+                KMemoryState::FLAG_REFERENCE_COUNTED,
+                KMemoryPermission::USER_READ,
+                KMemoryAttribute::NONE,
+                KMemoryAttribute::NONE,
+            ),
+            0
+        );
+
+        let mut actual = [0u8; 7];
+        assert!(page_table_memory
+            .memory
+            .lock()
+            .unwrap()
+            .read_block(dst_addr as u64, &mut actual));
+        assert_eq!(actual, expected);
+        assert_eq!(
+            page_table.copy_memory_from_linear_to_user(
+                dst_addr,
+                expected.len(),
+                page_table.m_address_space_end,
+                KMemoryState::FLAG_REFERENCE_COUNTED,
+                KMemoryState::FLAG_REFERENCE_COUNTED,
+                KMemoryPermission::USER_READ,
+                KMemoryAttribute::NONE,
+                KMemoryAttribute::NONE,
+            ),
+            svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value()
+        );
+    }
+
+    #[test]
+    fn copy_memory_from_user_to_linear_writes_linear_physical_backing() {
+        let mut kernel = kernel_with_application_pool_for_test(4);
+        let page_table_memory = PageTableMemoryForTest::new(0x400000);
+        let src_phys_addr = kernel.memory_manager_mut().allocate_and_open_continuous(
+            1,
+            1,
+            KMemoryManager::encode_option(Pool::Application, Direction::FromFront),
+        );
+        let dst_phys_addr = kernel.memory_manager_mut().allocate_and_open_continuous(
+            1,
+            1,
+            KMemoryManager::encode_option(Pool::Application, Direction::FromFront),
+        );
+        assert_ne!(src_phys_addr, 0);
+        assert_ne!(dst_phys_addr, 0);
+
+        let mut page_table = KPageTableBase::new();
+        page_table.m_address_space_start = 0x1000_0000;
+        page_table.m_address_space_end = 0x1000_8000;
+        attach_page_table_memory_for_test(&mut page_table, page_table_memory.memory.clone());
+        assert!(page_table
+            .m_memory_block_manager
+            .initialize(
+                page_table.m_address_space_start,
+                page_table.m_address_space_end,
+                None,
+            )
+            .is_ok());
+        page_table.m_memory_block_manager.update(
+            page_table.m_address_space_start,
+            2,
+            KMemoryState::NORMAL,
+            KMemoryPermission::USER_READ_WRITE,
+            KMemoryAttribute::NONE,
+            KMemoryBlockDisableMergeAttribute::NONE,
+            KMemoryBlockDisableMergeAttribute::NONE,
+        );
+
+        let src_map_addr = page_table.m_address_space_start;
+        let dst_map_addr = page_table.m_address_space_start + PAGE_SIZE;
+        let src_addr = src_map_addr + 0x60;
+        let dst_addr = dst_map_addr + 0x20;
+        map_source_pages_for_test(&mut page_table, src_map_addr, 1, src_phys_addr);
+        map_source_pages_for_test(&mut page_table, dst_map_addr, 1, dst_phys_addr);
+
+        let expected = [0xAA, 0xBB, 0xCC, 0xDD, 0x99, 0x88, 0x77];
+        assert!(page_table_memory
+            .memory
+            .lock()
+            .unwrap()
+            .write_block(src_addr as u64, &expected));
+
+        assert_eq!(
+            page_table.copy_memory_from_user_to_linear(
+                dst_addr,
+                expected.len(),
+                KMemoryState::FLAG_REFERENCE_COUNTED,
+                KMemoryState::FLAG_REFERENCE_COUNTED,
+                KMemoryPermission::USER_READ_WRITE,
+                KMemoryAttribute::NONE,
+                KMemoryAttribute::NONE,
+                src_addr,
+            ),
+            0
+        );
+
+        let mut actual = [0u8; 7];
+        assert!(page_table_memory
+            .memory
+            .lock()
+            .unwrap()
+            .read_phys_block(dst_phys_addr + 0x20, &mut actual));
+        assert_eq!(actual, expected);
+        assert_eq!(
+            page_table.copy_memory_from_user_to_linear(
+                page_table.m_address_space_end,
+                expected.len(),
+                KMemoryState::FLAG_REFERENCE_COUNTED,
+                KMemoryState::FLAG_REFERENCE_COUNTED,
+                KMemoryPermission::USER_READ_WRITE,
+                KMemoryAttribute::NONE,
+                KMemoryAttribute::NONE,
+                src_addr,
+            ),
+            svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value()
+        );
+    }
+
+    #[test]
+    fn copy_memory_from_kernel_to_linear_writes_linear_physical_backing() {
+        let mut kernel = kernel_with_application_pool_for_test(4);
+        let page_table_memory = PageTableMemoryForTest::new(0x400000);
+        let phys_addr = kernel.memory_manager_mut().allocate_and_open_continuous(
+            1,
+            1,
+            KMemoryManager::encode_option(Pool::Application, Direction::FromFront),
+        );
+        assert_ne!(phys_addr, 0);
+
+        let mut page_table = KPageTableBase::new();
+        page_table.m_address_space_start = 0x1000_0000;
+        page_table.m_address_space_end = 0x1000_4000;
+        attach_page_table_memory_for_test(&mut page_table, page_table_memory.memory.clone());
+        assert!(page_table
+            .m_memory_block_manager
+            .initialize(
+                page_table.m_address_space_start,
+                page_table.m_address_space_end,
+                None,
+            )
+            .is_ok());
+        page_table.m_memory_block_manager.update(
+            page_table.m_address_space_start,
+            1,
+            KMemoryState::NORMAL,
+            KMemoryPermission::USER_READ_WRITE,
+            KMemoryAttribute::NONE,
+            KMemoryBlockDisableMergeAttribute::NONE,
+            KMemoryBlockDisableMergeAttribute::NONE,
+        );
+
+        let dst_addr = page_table.m_address_space_start + 0x30;
+        let map_addr = page_table.m_address_space_start;
+        map_source_pages_for_test(&mut page_table, map_addr, 1, phys_addr);
+
+        let expected = [0x10, 0x32, 0x54, 0x76, 0x98, 0xBA, 0xDC];
+        assert_eq!(
+            page_table.copy_memory_from_kernel_to_linear(
+                dst_addr,
+                expected.len(),
+                KMemoryState::FLAG_REFERENCE_COUNTED,
+                KMemoryState::FLAG_REFERENCE_COUNTED,
+                KMemoryPermission::USER_READ_WRITE,
+                KMemoryAttribute::NONE,
+                KMemoryAttribute::NONE,
+                expected.as_ptr() as usize,
+            ),
+            0
+        );
+
+        let mut actual = [0u8; 7];
+        assert!(page_table_memory
+            .memory
+            .lock()
+            .unwrap()
+            .read_phys_block(phys_addr + 0x30, &mut actual));
+        assert_eq!(actual, expected);
+        assert_eq!(
+            page_table.copy_memory_from_kernel_to_linear(
+                page_table.m_address_space_end,
+                expected.len(),
+                KMemoryState::FLAG_REFERENCE_COUNTED,
+                KMemoryState::FLAG_REFERENCE_COUNTED,
+                KMemoryPermission::USER_READ_WRITE,
+                KMemoryAttribute::NONE,
+                KMemoryAttribute::NONE,
+                expected.as_ptr() as usize,
+            ),
+            svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value()
+        );
+    }
+
+    #[test]
+    fn copy_memory_from_heap_to_heap_copies_physical_backing() {
+        let mut kernel = kernel_with_application_pool_for_test(4);
+        let page_table_memory = PageTableMemoryForTest::new(0x400000);
+        let src_phys_addr = kernel.memory_manager_mut().allocate_and_open_continuous(
+            1,
+            1,
+            KMemoryManager::encode_option(Pool::Application, Direction::FromFront),
+        );
+        let dst_phys_addr = kernel.memory_manager_mut().allocate_and_open_continuous(
+            1,
+            1,
+            KMemoryManager::encode_option(Pool::Application, Direction::FromFront),
+        );
+        assert_ne!(src_phys_addr, 0);
+        assert_ne!(dst_phys_addr, 0);
+
+        let mut page_table = KPageTableBase::new();
+        page_table.m_address_space_start = 0x1000_0000;
+        page_table.m_address_space_end = 0x1000_8000;
+        attach_page_table_memory_for_test(&mut page_table, page_table_memory.memory.clone());
+        assert!(page_table
+            .m_memory_block_manager
+            .initialize(
+                page_table.m_address_space_start,
+                page_table.m_address_space_end,
+                None,
+            )
+            .is_ok());
+        page_table.m_memory_block_manager.update(
+            page_table.m_address_space_start,
+            2,
+            KMemoryState::NORMAL,
+            KMemoryPermission::USER_READ_WRITE,
+            KMemoryAttribute::NONE,
+            KMemoryBlockDisableMergeAttribute::NONE,
+            KMemoryBlockDisableMergeAttribute::NONE,
+        );
+
+        let src_addr = page_table.m_address_space_start + 0x50;
+        let dst_addr = page_table.m_address_space_start + PAGE_SIZE + 0x90;
+        let src_map_addr = page_table.m_address_space_start;
+        let dst_map_addr = page_table.m_address_space_start + PAGE_SIZE;
+        map_source_pages_for_test(&mut page_table, src_map_addr, 1, src_phys_addr);
+        map_source_pages_for_test(&mut page_table, dst_map_addr, 1, dst_phys_addr);
+
+        let expected = [0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD];
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                expected.as_ptr(),
+                page_table_memory
+                    ._device_memory
+                    .get_pointer(src_phys_addr + 0x50),
+                expected.len(),
+            );
+        }
+
+        assert_eq!(
+            page_table.copy_memory_from_heap_to_heap(
+                &page_table,
+                dst_addr,
+                expected.len(),
+                KMemoryState::FLAG_REFERENCE_COUNTED,
+                KMemoryState::FLAG_REFERENCE_COUNTED,
+                KMemoryPermission::USER_READ_WRITE,
+                KMemoryAttribute::NONE,
+                KMemoryAttribute::NONE,
+                src_addr,
+                KMemoryState::FLAG_REFERENCE_COUNTED,
+                KMemoryState::FLAG_REFERENCE_COUNTED,
+                KMemoryPermission::USER_READ,
+                KMemoryAttribute::NONE,
+                KMemoryAttribute::NONE,
+            ),
+            0
+        );
+
+        let mut actual = [0u8; 7];
+        assert!(page_table_memory
+            .memory
+            .lock()
+            .unwrap()
+            .read_phys_block(dst_phys_addr + 0x90, &mut actual));
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn copy_memory_from_heap_to_heap_without_check_destination_skips_dst_state() {
+        let mut kernel = kernel_with_application_pool_for_test(4);
+        let page_table_memory = PageTableMemoryForTest::new(0x400000);
+        let src_phys_addr = kernel.memory_manager_mut().allocate_and_open_continuous(
+            1,
+            1,
+            KMemoryManager::encode_option(Pool::Application, Direction::FromFront),
+        );
+        let dst_phys_addr = kernel.memory_manager_mut().allocate_and_open_continuous(
+            1,
+            1,
+            KMemoryManager::encode_option(Pool::Application, Direction::FromFront),
+        );
+        assert_ne!(src_phys_addr, 0);
+        assert_ne!(dst_phys_addr, 0);
+
+        let mut page_table = KPageTableBase::new();
+        page_table.m_address_space_start = 0x1000_0000;
+        page_table.m_address_space_end = 0x1000_8000;
+        attach_page_table_memory_for_test(&mut page_table, page_table_memory.memory.clone());
+        assert!(page_table
+            .m_memory_block_manager
+            .initialize(
+                page_table.m_address_space_start,
+                page_table.m_address_space_end,
+                None,
+            )
+            .is_ok());
+        page_table.m_memory_block_manager.update(
+            page_table.m_address_space_start,
+            1,
+            KMemoryState::NORMAL,
+            KMemoryPermission::USER_READ_WRITE,
+            KMemoryAttribute::NONE,
+            KMemoryBlockDisableMergeAttribute::NONE,
+            KMemoryBlockDisableMergeAttribute::NONE,
+        );
+        page_table.m_memory_block_manager.update(
+            page_table.m_address_space_start + PAGE_SIZE,
+            1,
+            KMemoryState::CODE,
+            KMemoryPermission::USER_READ_EXECUTE,
+            KMemoryAttribute::NONE,
+            KMemoryBlockDisableMergeAttribute::NONE,
+            KMemoryBlockDisableMergeAttribute::NONE,
+        );
+
+        let src_addr = page_table.m_address_space_start + 0x40;
+        let dst_addr = page_table.m_address_space_start + PAGE_SIZE + 0x20;
+        let src_map_addr = page_table.m_address_space_start;
+        let dst_map_addr = page_table.m_address_space_start + PAGE_SIZE;
+        map_source_pages_for_test(&mut page_table, src_map_addr, 1, src_phys_addr);
+        map_source_pages_for_test(&mut page_table, dst_map_addr, 1, dst_phys_addr);
+
+        let expected = [0x5A, 0xA5, 0x7E, 0xE7, 0x42];
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                expected.as_ptr(),
+                page_table_memory
+                    ._device_memory
+                    .get_pointer(src_phys_addr + 0x40),
+                expected.len(),
+            );
+        }
+
+        assert_ne!(
+            page_table.copy_memory_from_heap_to_heap(
+                &page_table,
+                dst_addr,
+                expected.len(),
+                KMemoryState::FLAG_REFERENCE_COUNTED,
+                KMemoryState::FLAG_REFERENCE_COUNTED,
+                KMemoryPermission::USER_READ_WRITE,
+                KMemoryAttribute::NONE,
+                KMemoryAttribute::NONE,
+                src_addr,
+                KMemoryState::FLAG_REFERENCE_COUNTED,
+                KMemoryState::FLAG_REFERENCE_COUNTED,
+                KMemoryPermission::USER_READ,
+                KMemoryAttribute::NONE,
+                KMemoryAttribute::NONE,
+            ),
+            0
+        );
+        assert_eq!(
+            page_table.copy_memory_from_heap_to_heap_without_check_destination(
+                &page_table,
+                dst_addr,
+                expected.len(),
+                KMemoryState::FLAG_REFERENCE_COUNTED,
+                KMemoryState::FLAG_REFERENCE_COUNTED,
+                KMemoryPermission::USER_READ_WRITE,
+                KMemoryAttribute::NONE,
+                KMemoryAttribute::NONE,
+                src_addr,
+                KMemoryState::FLAG_REFERENCE_COUNTED,
+                KMemoryState::FLAG_REFERENCE_COUNTED,
+                KMemoryPermission::USER_READ,
+                KMemoryAttribute::NONE,
+                KMemoryAttribute::NONE,
+            ),
+            0
+        );
+
+        let mut actual = [0u8; 5];
+        assert!(page_table_memory
+            .memory
+            .lock()
+            .unwrap()
+            .read_phys_block(dst_phys_addr + 0x20, &mut actual));
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
     fn map_memory_updates_destination_block_state_to_stack() {
+        let mut kernel = kernel_with_application_pool_for_test(16);
+        let page_table_memory = PageTableMemoryForTest::new(0x400000);
+        let phys_addr = kernel.memory_manager_mut().allocate_and_open_continuous(
+            2,
+            2,
+            KMemoryManager::encode_option(Pool::Application, Direction::FromFront),
+        );
+        assert_ne!(phys_addr, 0);
+
         let mut page_table = KPageTableBase::new();
         page_table.m_address_space_start = 0x1000_0000;
         page_table.m_address_space_end = 0x1001_0000;
@@ -6021,6 +8901,7 @@ mod tests {
         page_table.m_alias_region_end = 0x1001_0000;
         page_table.m_stack_region_start = 0x1000_0000;
         page_table.m_stack_region_end = 0x1001_0000;
+        attach_page_table_memory_for_test(&mut page_table, page_table_memory.memory.clone());
         assert!(page_table
             .m_memory_block_manager
             .initialize(
@@ -6038,6 +8919,7 @@ mod tests {
             KMemoryBlockDisableMergeAttribute::NONE,
             KMemoryBlockDisableMergeAttribute::NONE,
         );
+        map_source_pages_for_test(&mut page_table, 0x1000_8000, 2, phys_addr);
 
         let result = page_table.map_memory(0x1000_4000, 0x1000_8000, 0x2000);
         assert_eq!(result, 0);
@@ -6049,6 +8931,15 @@ mod tests {
 
     #[test]
     fn unmap_memory_restores_original_source_state() {
+        let mut kernel = kernel_with_application_pool_for_test(16);
+        let page_table_memory = PageTableMemoryForTest::new(0x400000);
+        let phys_addr = kernel.memory_manager_mut().allocate_and_open_continuous(
+            2,
+            2,
+            KMemoryManager::encode_option(Pool::Application, Direction::FromFront),
+        );
+        assert_ne!(phys_addr, 0);
+
         let mut page_table = KPageTableBase::new();
         page_table.m_address_space_start = 0x1000_0000;
         page_table.m_address_space_end = 0x1001_0000;
@@ -6056,6 +8947,7 @@ mod tests {
         page_table.m_alias_region_end = 0x1001_0000;
         page_table.m_stack_region_start = 0x1000_0000;
         page_table.m_stack_region_end = 0x1001_0000;
+        attach_page_table_memory_for_test(&mut page_table, page_table_memory.memory.clone());
         assert!(page_table
             .m_memory_block_manager
             .initialize(
@@ -6067,23 +8959,90 @@ mod tests {
         page_table.m_memory_block_manager.update(
             0x1000_8000,
             2,
-            KMemoryState::STACK,
+            KMemoryState::NORMAL,
             KMemoryPermission::USER_READ_WRITE,
             KMemoryAttribute::NONE,
             KMemoryBlockDisableMergeAttribute::NONE,
             KMemoryBlockDisableMergeAttribute::NONE,
         );
+        map_source_pages_for_test(&mut page_table, 0x1000_8000, 2, phys_addr);
 
         assert_eq!(page_table.map_memory(0x1000_4000, 0x1000_8000, 0x2000), 0);
         assert_eq!(page_table.unmap_memory(0x1000_4000, 0x1000_8000, 0x2000), 0);
 
         let src_info = page_table.query_info(0x1000_8ff0).unwrap();
         let dst_info = page_table.query_info(0x1000_4ff0).unwrap();
-        assert_eq!(src_info.m_state, KMemoryState::STACK);
+        assert_eq!(src_info.m_state, KMemoryState::NORMAL);
         assert_eq!(src_info.m_permission, KMemoryPermission::USER_READ_WRITE);
         assert_eq!(src_info.m_attribute, KMemoryAttribute::NONE);
         assert_eq!(dst_info.m_state, KMemoryState::FREE);
         assert_eq!(dst_info.m_permission, KMemoryPermission::NONE);
+    }
+
+    #[test]
+    fn map_and_unmap_code_memory_round_trips_block_state() {
+        let mut kernel = kernel_with_application_pool_for_test(16);
+        let page_table_memory = PageTableMemoryForTest::new(0x400000);
+        let phys_addr = kernel.memory_manager_mut().allocate_and_open_continuous(
+            2,
+            2,
+            KMemoryManager::encode_option(Pool::Application, Direction::FromFront),
+        );
+        assert_ne!(phys_addr, 0);
+
+        let mut page_table = KPageTableBase::new();
+        page_table.m_address_space_start = 0x1000_0000;
+        page_table.m_address_space_end = 0x1001_0000;
+        page_table.m_alias_code_region_start = 0x1000_0000;
+        page_table.m_alias_code_region_end = 0x1001_0000;
+        attach_page_table_memory_for_test(&mut page_table, page_table_memory.memory.clone());
+        assert!(page_table
+            .m_memory_block_manager
+            .initialize(
+                page_table.m_address_space_start,
+                page_table.m_address_space_end,
+                None,
+            )
+            .is_ok());
+        page_table.m_memory_block_manager.update(
+            0x1000_8000,
+            2,
+            KMemoryState::NORMAL,
+            KMemoryPermission::USER_READ_WRITE,
+            KMemoryAttribute::NONE,
+            KMemoryBlockDisableMergeAttribute::NONE,
+            KMemoryBlockDisableMergeAttribute::NONE,
+        );
+        map_source_pages_for_test(&mut page_table, 0x1000_8000, 2, phys_addr);
+
+        assert_eq!(
+            page_table.map_code_memory(0x1000_4000, 0x1000_8000, 0x2000),
+            0
+        );
+        let locked_src = page_table.query_info(0x1000_8ff0).unwrap();
+        let alias_dst = page_table.query_info(0x1000_4ff0).unwrap();
+        assert_eq!(locked_src.m_state, KMemoryState::NORMAL);
+        assert_eq!(
+            locked_src.m_permission,
+            KMemoryPermission::KERNEL_READ | KMemoryPermission::NOT_MAPPED
+        );
+        assert_eq!(locked_src.m_attribute, KMemoryAttribute::LOCKED);
+        assert_eq!(alias_dst.m_state, KMemoryState::ALIAS_CODE);
+
+        assert_eq!(
+            page_table.unmap_code_memory(0x1000_4000, 0x1000_8000, 0x2000),
+            0
+        );
+        let restored_src = page_table.query_info(0x1000_8ff0).unwrap();
+        let freed_dst = page_table.query_info(0x1000_4ff0).unwrap();
+        assert_eq!(restored_src.m_state, KMemoryState::NORMAL);
+        assert_eq!(
+            restored_src.m_permission,
+            KMemoryPermission::USER_READ_WRITE
+        );
+        assert_eq!(restored_src.m_attribute, KMemoryAttribute::NONE);
+        assert_eq!(freed_dst.m_state, KMemoryState::FREE);
+        assert_eq!(freed_dst.m_permission, KMemoryPermission::NONE);
     }
 
     #[test]
@@ -6112,15 +9071,14 @@ mod tests {
         let addr = 0x1000_0080;
         let size = PAGE_SIZE * 2 + 0x100;
 
-        assert_eq!(
-            page_table.setup_for_ipc_client(
-                addr,
-                size,
-                KMemoryPermission::USER_READ_WRITE,
-                KMemoryState::IPC,
-            ),
-            0
+        let (rc, blocks_needed) = page_table.setup_for_ipc_client(
+            addr,
+            size,
+            KMemoryPermission::USER_READ_WRITE,
+            KMemoryState::IPC,
         );
+        assert_eq!(rc, 0);
+        assert_eq!(blocks_needed, 2);
         let setup = page_table.query_info(0x1000_1000).unwrap();
         assert!(!setup.m_attribute.contains(KMemoryAttribute::IPC_LOCKED));
         assert_eq!(setup.m_permission, KMemoryPermission::USER_READ_WRITE,);
@@ -6138,7 +9096,10 @@ mod tests {
 
     #[test]
     fn setup_and_cleanup_for_ipc_server_account_partial_page_backend_cost() {
+        let _kernel = kernel_with_application_pool_for_test(16);
+        let page_table_memory = PageTableMemoryForTest::new(0x400000);
         let mut dst = KPageTableBase::new();
+        dst.m_address_space_width = 32;
         dst.m_address_space_start = 0x1000_0000;
         dst.m_address_space_end = 0x1002_0000;
         dst.m_alias_region_start = 0x1000_0000;
@@ -6146,6 +9107,8 @@ mod tests {
         dst.m_resource_limit = Some(Arc::new(Mutex::new(create_resource_limit_for_process(
             0x10_0000,
         ))));
+        dst.m_memory = Some(page_table_memory.memory.clone());
+        dst.initialize_impl();
         assert!(dst
             .m_memory_block_manager
             .initialize(dst.m_address_space_start, dst.m_address_space_end, None)
@@ -6162,8 +9125,15 @@ mod tests {
         let mut out_addr = 0usize;
         let src_addr = 0x2000_0080usize;
         let size = PAGE_SIZE + 0x100;
-        let partial_backend_cost = (src_addr & (PAGE_SIZE - 1))
-            + ((src_addr + size).next_multiple_of(PAGE_SIZE) - (src_addr + size));
+        let (aligned_src_start, aligned_src_end, mapping_src_start, mapping_src_end) =
+            KPageTableBase::get_ipc_aligned_extents(src_addr, size);
+        let aligned_src_size = aligned_src_end - aligned_src_start;
+        let mapping_src_size = if mapping_src_start < mapping_src_end {
+            mapping_src_end - mapping_src_start
+        } else {
+            0
+        };
+        let partial_backend_cost = aligned_src_size - mapping_src_size;
 
         assert_eq!(
             dst.setup_for_ipc_server(
@@ -6173,7 +9143,7 @@ mod tests {
                 KMemoryPermission::USER_READ,
                 KMemoryState::IPC,
                 &mut src,
-                true,
+                false,
             ),
             0
         );
@@ -6203,6 +9173,96 @@ mod tests {
                 .get_current_value(LimitableResource::PhysicalMemoryMax),
             0
         );
+    }
+
+    #[test]
+    fn setup_for_ipc_server_direct_map_preserves_contiguous_physical_run() {
+        let mut kernel = kernel_with_application_pool_for_test(16);
+        let page_table_memory = PageTableMemoryForTest::new(0x400000);
+        let phys_addr = kernel.memory_manager_mut().allocate_and_open_continuous(
+            2,
+            2,
+            KMemoryManager::encode_option(Pool::Application, Direction::FromFront),
+        );
+        assert_ne!(phys_addr, 0);
+
+        let mut src = KPageTableBase::new();
+        src.m_address_space_width = 32;
+        src.m_address_space_start = 0x2000_0000;
+        src.m_address_space_end = 0x2002_0000;
+        src.m_memory = Some(page_table_memory.memory.clone());
+        src.initialize_impl();
+        assert!(src
+            .m_memory_block_manager
+            .initialize(src.m_address_space_start, src.m_address_space_end, None)
+            .is_ok());
+        let source_props = KPageProperties {
+            perm: KMemoryPermission::USER_READ_WRITE,
+            io: false,
+            uncached: false,
+            disable_merge_attributes: DisableMergeAttribute::DISABLE_HEAD,
+        };
+        assert_eq!(
+            src.operate(
+                None,
+                0x2000_0000,
+                2,
+                phys_addr,
+                true,
+                source_props,
+                OperationType::Map,
+            ),
+            0
+        );
+
+        let mut dst = KPageTableBase::new();
+        dst.m_address_space_width = 32;
+        dst.m_address_space_start = 0x1000_0000;
+        dst.m_address_space_end = 0x1002_0000;
+        dst.m_alias_region_start = 0x1000_0000;
+        dst.m_alias_region_end = 0x1002_0000;
+        dst.m_resource_limit = Some(Arc::new(Mutex::new(create_resource_limit_for_process(
+            0x10_0000,
+        ))));
+        dst.m_memory = Some(page_table_memory.memory.clone());
+        dst.initialize_impl();
+        assert!(dst
+            .m_memory_block_manager
+            .initialize(dst.m_address_space_start, dst.m_address_space_end, None)
+            .is_ok());
+
+        let mut out_addr = 0usize;
+        assert_eq!(
+            dst.setup_for_ipc_server(
+                &mut out_addr,
+                2 * PAGE_SIZE,
+                0x2000_0000,
+                KMemoryPermission::USER_READ,
+                KMemoryState::IPC,
+                &mut src,
+                false,
+            ),
+            0
+        );
+
+        let dst_impl = dst.m_impl.as_ref().unwrap();
+        assert_eq!(
+            dst_impl.get_physical_address(out_addr as u64),
+            Some(phys_addr)
+        );
+        assert_eq!(
+            dst_impl.get_physical_address((out_addr + PAGE_SIZE) as u64),
+            Some(phys_addr + PAGE_SIZE as u64)
+        );
+        assert_eq!(dst.m_mapped_ipc_server_memory, 0);
+
+        assert_eq!(
+            dst.cleanup_for_ipc_server(out_addr, 2 * PAGE_SIZE, KMemoryState::IPC),
+            0
+        );
+        if let Some(kernel) = crate::hle::kernel::kernel::get_kernel_mut() {
+            kernel.memory_manager_mut().close(phys_addr, 2);
+        }
     }
 
     #[test]

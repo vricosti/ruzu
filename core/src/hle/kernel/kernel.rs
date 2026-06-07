@@ -105,6 +105,7 @@ pub fn get_kernel_mut() -> Option<&'static mut KernelCore> {
 pub struct ScopedKernelForTest {
     kernel: Box<KernelCore>,
     previous: *mut KernelCore,
+    previous_scheduler_lock: *mut super::k_scheduler_lock::KAbstractSchedulerLock,
 }
 
 #[cfg(test)]
@@ -113,7 +114,13 @@ impl ScopedKernelForTest {
         let mut kernel = Box::new(KernelCore::new());
         let ptr = &mut *kernel as *mut KernelCore;
         let previous = KERNEL_PTR.swap(ptr, Ordering::AcqRel);
-        Self { kernel, previous }
+        let previous_scheduler_lock =
+            SCHEDULER_LOCK_PTR.swap(std::ptr::null_mut(), Ordering::AcqRel);
+        Self {
+            kernel,
+            previous,
+            previous_scheduler_lock,
+        }
     }
 
     pub fn memory_manager_mut(&mut self) -> &mut KMemoryManager {
@@ -128,6 +135,7 @@ impl ScopedKernelForTest {
 #[cfg(test)]
 impl Drop for ScopedKernelForTest {
     fn drop(&mut self) {
+        SCHEDULER_LOCK_PTR.store(self.previous_scheduler_lock, Ordering::Release);
         KERNEL_PTR.store(self.previous, Ordering::Release);
     }
 }
@@ -2150,6 +2158,55 @@ impl KernelCore {
                     .unwrap()
                     .iter()
                     .find(|process| process.lock().unwrap().get_process_id() == process_id)
+                    .cloned()
+            })
+    }
+
+    /// Rust counterpart to upstream `KernelCore::GetProcessList()` scans that
+    /// identify a process by comparing `GetPageTable().GetBasePageTable()`.
+    pub fn get_process_by_page_table_base(
+        &self,
+        table: *const super::k_page_table_base::KPageTableBase,
+    ) -> Option<Arc<ProcessLock>> {
+        if table.is_null() {
+            return None;
+        }
+
+        if let Some(process) = (!self.system_ref.is_null())
+            .then(|| self.system_ref.get().current_process_arc.as_ref().cloned())
+            .flatten()
+        {
+            let process_guard = process.lock().unwrap();
+            let process_table = process_guard.page_table.get_base()
+                as *const super::k_page_table_base::KPageTableBase;
+            if std::ptr::eq(process_table, table) {
+                drop(process_guard);
+                return Some(process);
+            }
+        }
+
+        self.service_processes
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|process| {
+                let process_guard = process.lock().unwrap();
+                let process_table = process_guard.page_table.get_base()
+                    as *const super::k_page_table_base::KPageTableBase;
+                std::ptr::eq(process_table, table)
+            })
+            .cloned()
+            .or_else(|| {
+                self.host_service_processes
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .find(|process| {
+                        let process_guard = process.lock().unwrap();
+                        let process_table = process_guard.page_table.get_base()
+                            as *const super::k_page_table_base::KPageTableBase;
+                        std::ptr::eq(process_table, table)
+                    })
                     .cloned()
             })
     }

@@ -156,8 +156,7 @@ pub struct KMemoryBlockManagerUpdateAllocator {
 impl KMemoryBlockManagerUpdateAllocator {
     pub const MAX_BLOCKS: usize = 2;
 
-    /// Construct and pre-allocate `num_blocks` slab nodes (capped at
-    /// `MAX_BLOCKS`). Returns `(allocator, 0)` on success or
+    /// Construct and pre-allocate `num_blocks` slab nodes. Returns `(allocator, 0)` on success or
     /// `(uninit_allocator, ResultOutOfResource)` if the slab can't satisfy
     /// the request — upstream returns the result via an `out_result`
     /// pointer; ruzu returns the result code in the second tuple element.
@@ -165,8 +164,11 @@ impl KMemoryBlockManagerUpdateAllocator {
         slab_manager: std::sync::Arc<KMemoryBlockSlabManager>,
         num_blocks: usize,
     ) -> (Self, u32) {
-        debug_assert!(num_blocks <= Self::MAX_BLOCKS);
-        let num_blocks = num_blocks.min(Self::MAX_BLOCKS);
+        assert!(
+            num_blocks <= Self::MAX_BLOCKS,
+            "KMemoryBlockManagerUpdateAllocator supports at most {} blocks",
+            Self::MAX_BLOCKS
+        );
         let mut blocks: [Option<Box<KMemoryBlock>>; Self::MAX_BLOCKS] = Default::default();
         let index = Self::MAX_BLOCKS - num_blocks;
         for slot in &mut blocks[index..] {
@@ -245,3 +247,24 @@ impl Drop for KMemoryBlockManagerUpdateAllocator {
 /// (used by `KPageGroup`). Matches upstream's
 /// `class KBlockInfoManager : public KDynamicResourceManager<KBlockInfo> {};`
 pub type KBlockInfoManager = KDynamicResourceManager<super::k_page_group::KBlockInfo>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    #[test]
+    #[should_panic(expected = "KMemoryBlockManagerUpdateAllocator supports at most 2 blocks")]
+    fn memory_block_update_allocator_rejects_more_than_max_blocks() {
+        let slab = Arc::new({
+            let mut slab = KMemoryBlockSlabManager::new();
+            slab.initialize(1024);
+            slab
+        });
+
+        let _ = KMemoryBlockManagerUpdateAllocator::new(
+            slab,
+            KMemoryBlockManagerUpdateAllocator::MAX_BLOCKS + 1,
+        );
+    }
+}

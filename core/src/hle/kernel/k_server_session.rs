@@ -11,7 +11,10 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
 use super::k_process::ProcessLock;
-use crate::hle::kernel::k_memory_block::{KMemoryPermission, KMemoryState, PAGE_SIZE};
+use super::k_process_page_table::KProcessPageTable;
+use crate::hle::kernel::k_memory_block::{
+    KMemoryAttribute, KMemoryPermission, KMemoryState, PAGE_SIZE,
+};
 use crate::hle::kernel::k_session_request::KSessionRequest;
 use crate::hle::kernel::k_synchronization_object;
 use crate::hle::kernel::k_synchronization_object::SynchronizationObjectState;
@@ -19,8 +22,8 @@ use crate::hle::kernel::k_thread::KThreadLock;
 use crate::hle::kernel::k_typed_address::KProcessAddress;
 use crate::hle::kernel::message_buffer::{MessageBuffer, MESSAGE_BUFFER_SIZE};
 use crate::hle::kernel::svc::svc_results::{
-    RESULT_INVALID_COMBINATION, RESULT_INVALID_STATE, RESULT_MESSAGE_TOO_LARGE, RESULT_NOT_FOUND,
-    RESULT_RECEIVE_LIST_BROKEN, RESULT_SESSION_CLOSED,
+    RESULT_INVALID_COMBINATION, RESULT_INVALID_CURRENT_MEMORY, RESULT_INVALID_STATE,
+    RESULT_MESSAGE_TOO_LARGE, RESULT_NOT_FOUND, RESULT_RECEIVE_LIST_BROKEN, RESULT_SESSION_CLOSED,
 };
 use crate::hle::kernel::svc_common::INVALID_HANDLE;
 
@@ -229,6 +232,28 @@ impl KServerSession {
         }
     }
 
+    fn get_map_alias_test_state_and_attribute_mask(
+        state: KMemoryState,
+    ) -> Option<(KMemoryState, KMemoryAttribute)> {
+        match state {
+            KMemoryState::IPC => Some((
+                KMemoryState::FLAG_CAN_USE_IPC,
+                KMemoryAttribute::UNCACHED
+                    | KMemoryAttribute::DEVICE_SHARED
+                    | KMemoryAttribute::LOCKED,
+            )),
+            KMemoryState::NON_SECURE_IPC => Some((
+                KMemoryState::FLAG_CAN_USE_NON_SECURE_IPC,
+                KMemoryAttribute::UNCACHED | KMemoryAttribute::LOCKED,
+            )),
+            KMemoryState::NON_DEVICE_IPC => Some((
+                KMemoryState::FLAG_CAN_USE_NON_DEVICE_IPC,
+                KMemoryAttribute::UNCACHED | KMemoryAttribute::LOCKED,
+            )),
+            _ => None,
+        }
+    }
+
     fn encode_map_alias_descriptor(address: u64, size: usize, attribute: u32) -> [u32; 3] {
         [
             size as u32,
@@ -240,41 +265,6 @@ impl KServerSession {
         ]
     }
 
-    fn copy_between_processes(
-        src_process: &crate::hle::kernel::k_process::KProcess,
-        src_address: usize,
-        dst_process: &mut crate::hle::kernel::k_process::KProcess,
-        dst_address: usize,
-        size: usize,
-    ) {
-        let bytes = if let Some(memory) = src_process.get_memory() {
-            let mut bytes = vec![0u8; size];
-            memory
-                .lock()
-                .unwrap()
-                .read_block(src_address as u64, &mut bytes);
-            bytes
-        } else {
-            src_process
-                .process_memory
-                .read()
-                .unwrap()
-                .read_bytes(src_address as u64, size)
-        };
-        if let Some(memory) = dst_process.get_memory() {
-            memory
-                .lock()
-                .unwrap()
-                .write_block(dst_address as u64, &bytes);
-        } else {
-            dst_process
-                .process_memory
-                .write()
-                .unwrap()
-                .write_block(dst_address as u64, &bytes);
-        }
-    }
-
     fn process_receive_message_pointer_descriptors(
         dst_words: &mut [u32],
         src_words: &[u32],
@@ -284,8 +274,9 @@ impl KServerSession {
         dst_special_header: &crate::hle::kernel::message_buffer::SpecialHeader,
         dst_address: usize,
         dst_size: usize,
-        dst_process: &mut crate::hle::kernel::k_process::KProcess,
-        src_process: &crate::hle::kernel::k_process::KProcess,
+        dst_user: bool,
+        dst_page_table: &KProcessPageTable,
+        src_page_table: &KProcessPageTable,
     ) -> u32 {
         let mut src_words = src_words.to_vec();
         let src_message = MessageBuffer::new(&mut src_words);
@@ -329,13 +320,39 @@ impl KServerSession {
                     return crate::hle::kernel::svc::svc_results::RESULT_OUT_OF_RESOURCE
                         .get_inner_value();
                 }
-                Self::copy_between_processes(
-                    src_process,
-                    src_desc.get_address() as usize,
-                    dst_process,
-                    recv_pointer as usize,
-                    recv_size,
-                );
+
+                let rc = if dst_user && dst_recv_list.is_to_message_buffer() {
+                    src_page_table.copy_memory_from_heap_to_heap_without_check_destination(
+                        dst_page_table,
+                        KProcessAddress::new(recv_pointer),
+                        recv_size,
+                        KMemoryState::FLAG_REFERENCE_COUNTED,
+                        KMemoryState::FLAG_REFERENCE_COUNTED,
+                        KMemoryPermission::NOT_MAPPED | KMemoryPermission::KERNEL_READ_WRITE,
+                        KMemoryAttribute::UNCACHED | KMemoryAttribute::LOCKED,
+                        KMemoryAttribute::LOCKED,
+                        KProcessAddress::new(src_desc.get_address()),
+                        KMemoryState::FLAG_LINEAR_MAPPED,
+                        KMemoryState::FLAG_LINEAR_MAPPED,
+                        KMemoryPermission::USER_READ,
+                        KMemoryAttribute::UNCACHED,
+                        KMemoryAttribute::NONE,
+                    )
+                } else {
+                    src_page_table.copy_memory_from_linear_to_user(
+                        KProcessAddress::new(recv_pointer),
+                        recv_size,
+                        KProcessAddress::new(src_desc.get_address()),
+                        KMemoryState::FLAG_LINEAR_MAPPED,
+                        KMemoryState::FLAG_LINEAR_MAPPED,
+                        KMemoryPermission::USER_READ,
+                        KMemoryAttribute::UNCACHED,
+                        KMemoryAttribute::NONE,
+                    )
+                };
+                if rc != crate::hle::result::RESULT_SUCCESS.get_inner_value() {
+                    return rc;
+                }
             }
 
             dst_message.set(
@@ -362,8 +379,9 @@ impl KServerSession {
         dst_special_header: &crate::hle::kernel::message_buffer::SpecialHeader,
         dst_address: usize,
         dst_size: usize,
-        dst_process: &mut crate::hle::kernel::k_process::KProcess,
-        src_process: &crate::hle::kernel::k_process::KProcess,
+        dst_user: bool,
+        dst_page_table: &KProcessPageTable,
+        _src_page_table: &KProcessPageTable,
     ) -> u32 {
         let mut src_words = src_words.to_vec();
         let src_message = MessageBuffer::new(&mut src_words);
@@ -407,13 +425,31 @@ impl KServerSession {
                     return crate::hle::kernel::svc::svc_results::RESULT_OUT_OF_RESOURCE
                         .get_inner_value();
                 }
-                Self::copy_between_processes(
-                    src_process,
-                    src_desc.get_address() as usize,
-                    dst_process,
-                    recv_pointer as usize,
+
+                let dst_heap = dst_user && dst_recv_list.is_to_message_buffer();
+                let dst_state = if dst_heap {
+                    KMemoryState::FLAG_REFERENCE_COUNTED
+                } else {
+                    KMemoryState::FLAG_LINEAR_MAPPED
+                };
+                let dst_perm = if dst_heap {
+                    KMemoryPermission::NOT_MAPPED | KMemoryPermission::KERNEL_READ_WRITE
+                } else {
+                    KMemoryPermission::USER_READ_WRITE
+                };
+                let rc = dst_page_table.copy_memory_from_user_to_linear(
+                    KProcessAddress::new(recv_pointer),
                     recv_size,
+                    dst_state,
+                    dst_state,
+                    dst_perm,
+                    KMemoryAttribute::UNCACHED,
+                    KMemoryAttribute::NONE,
+                    KProcessAddress::new(src_desc.get_address()),
                 );
+                if rc != crate::hle::result::RESULT_SUCCESS.get_inner_value() {
+                    return rc;
+                }
             }
 
             dst_message.set(
@@ -437,8 +473,8 @@ impl KServerSession {
         src_header: &crate::hle::kernel::message_buffer::MessageHeader,
         src_special_header: &crate::hle::kernel::message_buffer::SpecialHeader,
         request: &mut KSessionRequest,
-        dst_process: &mut crate::hle::kernel::k_process::KProcess,
-        src_process: &mut crate::hle::kernel::k_process::KProcess,
+        dst_page_table: &mut KProcessPageTable,
+        src_page_table: &mut KProcessPageTable,
     ) -> u32 {
         let mut dst_message = MessageBuffer::new(dst_words);
         let map_alias_index =
@@ -471,11 +507,11 @@ impl KServerSession {
                 || i >= src_header.get_send_count() + src_header.get_receive_count();
 
             let mut dst_address = KProcessAddress::new(0);
-            let rc = dst_process.page_table.setup_for_ipc(
+            let rc = dst_page_table.setup_for_ipc(
                 &mut dst_address,
                 size,
                 src_address,
-                &mut src_process.page_table,
+                src_page_table,
                 perm,
                 dst_state,
                 send,
@@ -508,14 +544,8 @@ impl KServerSession {
             };
             if push_rc != crate::hle::result::RESULT_SUCCESS.get_inner_value() {
                 if size > 0 {
-                    let _ =
-                        dst_process
-                            .page_table
-                            .cleanup_for_ipc_server(dst_address, size, dst_state);
-                    let _ =
-                        src_process
-                            .page_table
-                            .cleanup_for_ipc_client(src_address, size, dst_state);
+                    let _ = dst_page_table.cleanup_for_ipc_server(dst_address, size, dst_state);
+                    let _ = src_page_table.cleanup_for_ipc_client(src_address, size, dst_state);
                 }
                 return push_rc;
             }
@@ -534,16 +564,22 @@ impl KServerSession {
     }
 
     fn process_send_message_receive_mapping(
-        src_process: &crate::hle::kernel::k_process::KProcess,
-        dst_process: &mut crate::hle::kernel::k_process::KProcess,
+        _src_page_table: &KProcessPageTable,
+        dst_page_table: &KProcessPageTable,
         client_address: KProcessAddress,
         server_address: KProcessAddress,
         size: usize,
-        _src_state: KMemoryState,
-    ) {
+        src_state: KMemoryState,
+    ) -> u32 {
         if size == 0 {
-            return;
+            return crate::hle::result::RESULT_SUCCESS.get_inner_value();
         }
+
+        let Some((test_state, test_attr_mask)) =
+            Self::get_map_alias_test_state_and_attribute_mask(src_state)
+        else {
+            return RESULT_INVALID_COMBINATION.get_inner_value();
+        };
 
         let client_address = client_address.get();
         let server_address = server_address.get();
@@ -556,56 +592,269 @@ impl KServerSession {
         if aligned_dst_start != mapping_dst_start {
             debug_assert!(client_address < mapping_dst_start);
             let copy_size = std::cmp::min(size, (mapping_dst_start - client_address) as usize);
-            Self::copy_between_processes(
-                src_process,
-                server_address as usize,
-                dst_process,
-                client_address as usize,
+            let rc = dst_page_table.copy_memory_from_user_to_linear(
+                KProcessAddress::new(client_address),
                 copy_size,
+                test_state,
+                test_state,
+                KMemoryPermission::USER_READ_WRITE,
+                test_attr_mask,
+                KMemoryAttribute::NONE,
+                KProcessAddress::new(server_address),
             );
+            if rc != crate::hle::result::RESULT_SUCCESS.get_inner_value() {
+                return rc;
+            }
         }
 
         if mapping_dst_end < aligned_dst_end
             && (aligned_dst_start == mapping_dst_start || aligned_dst_start < mapping_dst_end)
         {
             let copy_size = (client_address + size as u64 - mapping_dst_end) as usize;
-            Self::copy_between_processes(
-                src_process,
-                mapping_src_end as usize,
-                dst_process,
-                mapping_dst_end as usize,
+            let rc = dst_page_table.copy_memory_from_user_to_linear(
+                KProcessAddress::new(mapping_dst_end),
                 copy_size,
+                test_state,
+                test_state,
+                KMemoryPermission::USER_READ_WRITE,
+                test_attr_mask,
+                KMemoryAttribute::NONE,
+                KProcessAddress::new(mapping_src_end),
             );
+            if rc != crate::hle::result::RESULT_SUCCESS.get_inner_value() {
+                return rc;
+            }
         }
+
+        crate::hle::result::RESULT_SUCCESS.get_inner_value()
     }
 
     fn process_send_message_receive_mappings(
         request: &KSessionRequest,
-        src_process: &crate::hle::kernel::k_process::KProcess,
-        dst_process: &mut crate::hle::kernel::k_process::KProcess,
-    ) {
+        src_page_table: &KProcessPageTable,
+        dst_page_table: &KProcessPageTable,
+    ) -> u32 {
         for index in 0..request.mappings.get_receive_count() {
             let mapping = request.mappings.get_receive_mapping(index);
-            Self::process_send_message_receive_mapping(
-                src_process,
-                dst_process,
+            let rc = Self::process_send_message_receive_mapping(
+                src_page_table,
+                dst_page_table,
                 mapping.client_address,
                 mapping.server_address,
                 mapping.size,
                 mapping.state,
             );
+            if rc != crate::hle::result::RESULT_SUCCESS.get_inner_value() {
+                return rc;
+            }
         }
         for index in 0..request.mappings.get_exchange_count() {
             let mapping = request.mappings.get_exchange_mapping(index);
-            Self::process_send_message_receive_mapping(
-                src_process,
-                dst_process,
+            let rc = Self::process_send_message_receive_mapping(
+                src_page_table,
+                dst_page_table,
                 mapping.client_address,
                 mapping.server_address,
                 mapping.size,
                 mapping.state,
             );
+            if rc != crate::hle::result::RESULT_SUCCESS.get_inner_value() {
+                return rc;
+            }
         }
+        crate::hle::result::RESULT_SUCCESS.get_inner_value()
+    }
+
+    fn process_send_message_raw_data(
+        dst_words: &mut [u32],
+        src_words: &[u32],
+        src_header: &crate::hle::kernel::message_buffer::MessageHeader,
+        src_special_header: &crate::hle::kernel::message_buffer::SpecialHeader,
+        dst_page_table: &KProcessPageTable,
+        dst_message_buffer: usize,
+        dst_user: bool,
+        src_message_buffer: usize,
+        src_user: bool,
+    ) -> u32 {
+        let raw_count = src_header.get_raw_count();
+        if raw_count == 0 {
+            return crate::hle::result::RESULT_SUCCESS.get_inner_value();
+        }
+
+        let raw_data_index = crate::hle::kernel::message_buffer::MessageBuffer::get_raw_data_index(
+            src_header,
+            src_special_header,
+        );
+        let offset_words = raw_data_index * std::mem::size_of::<u32>();
+        let raw_size = raw_count as usize * std::mem::size_of::<u32>();
+        let raw_end = raw_data_index + raw_count as usize;
+
+        if !dst_user && !src_user {
+            dst_words[raw_data_index..raw_end].copy_from_slice(&src_words[raw_data_index..raw_end]);
+            return crate::hle::result::RESULT_SUCCESS.get_inner_value();
+        }
+
+        let result = if src_user {
+            let max_fast_size = std::cmp::min(offset_words + raw_size, PAGE_SIZE);
+            let fast_size = max_fast_size - offset_words;
+            let dst_state = if dst_user {
+                KMemoryState::FLAG_REFERENCE_COUNTED
+            } else {
+                KMemoryState::FLAG_LINEAR_MAPPED
+            };
+            let dst_perm = if dst_user {
+                KMemoryPermission::NOT_MAPPED | KMemoryPermission::KERNEL_READ_WRITE
+            } else {
+                KMemoryPermission::USER_READ_WRITE
+            };
+
+            let src_ptr = unsafe { src_words.as_ptr().add(raw_data_index) as usize };
+            let mut rc = dst_page_table.copy_memory_from_kernel_to_linear(
+                KProcessAddress::new((dst_message_buffer + offset_words) as u64),
+                fast_size,
+                dst_state,
+                dst_state,
+                dst_perm,
+                KMemoryAttribute::UNCACHED,
+                KMemoryAttribute::NONE,
+                src_ptr,
+            );
+
+            if rc == crate::hle::result::RESULT_SUCCESS.get_inner_value() && fast_size < raw_size {
+                rc = dst_page_table.copy_memory_from_heap_to_heap(
+                    dst_page_table,
+                    KProcessAddress::new((dst_message_buffer + max_fast_size) as u64),
+                    raw_size - fast_size,
+                    dst_state,
+                    dst_state,
+                    dst_perm,
+                    KMemoryAttribute::UNCACHED,
+                    KMemoryAttribute::NONE,
+                    KProcessAddress::new((src_message_buffer + max_fast_size) as u64),
+                    KMemoryState::FLAG_REFERENCE_COUNTED,
+                    KMemoryState::FLAG_REFERENCE_COUNTED,
+                    KMemoryPermission::NOT_MAPPED | KMemoryPermission::KERNEL_READ,
+                    KMemoryAttribute::UNCACHED | KMemoryAttribute::LOCKED,
+                    KMemoryAttribute::LOCKED,
+                );
+            }
+            rc
+        } else {
+            dst_page_table.copy_memory_from_user_to_linear(
+                KProcessAddress::new((dst_message_buffer + offset_words) as u64),
+                raw_size,
+                KMemoryState::FLAG_REFERENCE_COUNTED,
+                KMemoryState::FLAG_REFERENCE_COUNTED,
+                KMemoryPermission::NOT_MAPPED | KMemoryPermission::KERNEL_READ_WRITE,
+                KMemoryAttribute::UNCACHED,
+                KMemoryAttribute::NONE,
+                KProcessAddress::new((src_message_buffer + offset_words) as u64),
+            )
+        };
+
+        if result == crate::hle::result::RESULT_SUCCESS.get_inner_value() {
+            // The current Rust transport still flushes `dst_words` at the end of
+            // SendReply, so keep the local mirror coherent until the final
+            // message-buffer owner is moved fully to the page-table path.
+            dst_words[raw_data_index..raw_end].copy_from_slice(&src_words[raw_data_index..raw_end]);
+        }
+
+        result
+    }
+
+    fn process_receive_message_raw_data(
+        dst_words: &mut [u32],
+        src_words: &[u32],
+        src_header: &crate::hle::kernel::message_buffer::MessageHeader,
+        src_special_header: &crate::hle::kernel::message_buffer::SpecialHeader,
+        dst_page_table: &KProcessPageTable,
+        dst_message_buffer: usize,
+        dst_user: bool,
+        src_page_table: &KProcessPageTable,
+        src_message_buffer: usize,
+        src_user: bool,
+    ) -> u32 {
+        let raw_count = src_header.get_raw_count();
+        if raw_count == 0 {
+            return crate::hle::result::RESULT_SUCCESS.get_inner_value();
+        }
+
+        let raw_data_index = crate::hle::kernel::message_buffer::MessageBuffer::get_raw_data_index(
+            src_header,
+            src_special_header,
+        );
+        let offset_words = raw_data_index * std::mem::size_of::<u32>();
+        let raw_size = raw_count as usize * std::mem::size_of::<u32>();
+        let raw_end = raw_data_index + raw_count as usize;
+
+        if !dst_user && !src_user {
+            dst_words[raw_data_index..raw_end].copy_from_slice(&src_words[raw_data_index..raw_end]);
+            return crate::hle::result::RESULT_SUCCESS.get_inner_value();
+        }
+
+        let result = if dst_user {
+            let max_fast_size = std::cmp::min(offset_words + raw_size, PAGE_SIZE);
+            let fast_size = max_fast_size - offset_words;
+            let src_state = if src_user {
+                KMemoryState::FLAG_REFERENCE_COUNTED
+            } else {
+                KMemoryState::FLAG_LINEAR_MAPPED
+            };
+            let src_perm = if src_user {
+                KMemoryPermission::NOT_MAPPED | KMemoryPermission::KERNEL_READ
+            } else {
+                KMemoryPermission::USER_READ
+            };
+
+            let dst_ptr = unsafe { dst_words.as_mut_ptr().add(raw_data_index) as usize };
+            let mut rc = src_page_table.copy_memory_from_linear_to_kernel(
+                dst_ptr,
+                fast_size,
+                KProcessAddress::new((src_message_buffer + offset_words) as u64),
+                src_state,
+                src_state,
+                src_perm,
+                KMemoryAttribute::UNCACHED,
+                KMemoryAttribute::NONE,
+            );
+
+            if rc == crate::hle::result::RESULT_SUCCESS.get_inner_value() && fast_size < raw_size {
+                rc = src_page_table.copy_memory_from_heap_to_heap(
+                    dst_page_table,
+                    KProcessAddress::new((dst_message_buffer + max_fast_size) as u64),
+                    raw_size - fast_size,
+                    KMemoryState::FLAG_REFERENCE_COUNTED,
+                    KMemoryState::FLAG_REFERENCE_COUNTED,
+                    KMemoryPermission::NOT_MAPPED | KMemoryPermission::KERNEL_READ_WRITE,
+                    KMemoryAttribute::UNCACHED | KMemoryAttribute::LOCKED,
+                    KMemoryAttribute::LOCKED,
+                    KProcessAddress::new((src_message_buffer + max_fast_size) as u64),
+                    src_state,
+                    src_state,
+                    src_perm,
+                    KMemoryAttribute::UNCACHED,
+                    KMemoryAttribute::NONE,
+                );
+            }
+            rc
+        } else {
+            src_page_table.copy_memory_from_linear_to_user(
+                KProcessAddress::new((dst_message_buffer + offset_words) as u64),
+                raw_size,
+                KProcessAddress::new((src_message_buffer + offset_words) as u64),
+                KMemoryState::FLAG_REFERENCE_COUNTED,
+                KMemoryState::FLAG_REFERENCE_COUNTED,
+                KMemoryPermission::NOT_MAPPED | KMemoryPermission::KERNEL_READ,
+                KMemoryAttribute::UNCACHED,
+                KMemoryAttribute::NONE,
+            )
+        };
+
+        if result == crate::hle::result::RESULT_SUCCESS.get_inner_value() {
+            dst_words[raw_data_index..raw_end].copy_from_slice(&src_words[raw_data_index..raw_end]);
+        }
+
+        result
     }
 
     fn cleanup_special_data(
@@ -775,13 +1024,24 @@ impl KServerSession {
         process: &crate::hle::kernel::k_process::KProcess,
         message_address: usize,
         buffer_size: usize,
-    ) -> Vec<u32> {
-        let bytes = if let Some(memory) = process.get_memory() {
+    ) -> Result<Vec<u32>, u32> {
+        let page_table = process.page_table.get_base();
+        let bytes = if page_table.has_own_page_table_memory() {
+            let Some(bytes) =
+                page_table.read_block_from_own_page_table(message_address, buffer_size)
+            else {
+                return Err(RESULT_INVALID_CURRENT_MEMORY.get_inner_value());
+            };
+            bytes
+        } else if let Some(memory) = process.get_memory() {
             let mut bytes = vec![0u8; buffer_size];
-            memory
+            if !memory
                 .lock()
                 .unwrap()
-                .read_block(message_address as u64, &mut bytes);
+                .read_block(message_address as u64, &mut bytes)
+            {
+                return Err(RESULT_INVALID_CURRENT_MEMORY.get_inner_value());
+            }
             bytes
         } else {
             let memory = process.process_memory.read().unwrap();
@@ -792,7 +1052,29 @@ impl KServerSession {
         for (index, chunk) in bytes.chunks_exact(4).enumerate() {
             words[index] = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
         }
-        words
+        Ok(words)
+    }
+
+    fn message_words_from_process_physical(
+        process: &crate::hle::kernel::k_process::KProcess,
+        message_paddr: u64,
+        buffer_size: usize,
+    ) -> Option<Vec<u32>> {
+        let memory = process.get_memory()?;
+        let mut bytes = vec![0u8; buffer_size];
+        if !memory
+            .lock()
+            .unwrap()
+            .read_phys_block(message_paddr, &mut bytes)
+        {
+            return None;
+        }
+
+        let mut words = vec![0u32; buffer_size / std::mem::size_of::<u32>()];
+        for (index, chunk) in bytes.chunks_exact(4).enumerate() {
+            words[index] = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+        }
+        Some(words)
     }
 
     fn write_message_words_to_process(
@@ -800,24 +1082,50 @@ impl KServerSession {
         message_address: usize,
         words: &[u32],
         byte_size: usize,
-    ) {
+    ) -> bool {
         let bytes: Vec<u8> = words[..byte_size / std::mem::size_of::<u32>()]
             .iter()
             .flat_map(|word| word.to_le_bytes())
             .collect();
 
+        let page_table = process.page_table.get_base();
+        if page_table.has_own_page_table_memory() {
+            return page_table.write_block_to_own_page_table(message_address, &bytes);
+        }
+
         if let Some(memory) = process.get_memory() {
-            memory
+            return memory
                 .lock()
                 .unwrap()
                 .write_block(message_address as u64, &bytes);
-        } else {
-            process
-                .process_memory
-                .write()
-                .unwrap()
-                .write_block(message_address as u64, &bytes);
         }
+
+        process
+            .process_memory
+            .write()
+            .unwrap()
+            .write_block(message_address as u64, &bytes);
+        true
+    }
+
+    fn write_message_words_to_process_physical(
+        process: &crate::hle::kernel::k_process::KProcess,
+        message_paddr: u64,
+        words: &[u32],
+        byte_size: usize,
+    ) -> bool {
+        let Some(memory) = process.get_memory() else {
+            return false;
+        };
+        let bytes: Vec<u8> = words[..byte_size / std::mem::size_of::<u32>()]
+            .iter()
+            .flat_map(|word| word.to_le_bytes())
+            .collect();
+        let written = memory
+            .lock()
+            .unwrap()
+            .write_phys_block(message_paddr, &bytes);
+        written
     }
 
     fn parse_message_headers(
@@ -859,6 +1167,7 @@ impl KServerSession {
     fn try_receive_message_raw(
         server_message: usize,
         server_buffer_size: usize,
+        server_message_paddr: u64,
         request: &Arc<Mutex<KSessionRequest>>,
     ) -> Option<(u32, bool)> {
         let current_thread = crate::hle::kernel::kernel::get_current_thread_pointer()?;
@@ -872,30 +1181,50 @@ impl KServerSession {
             thread.parent.as_ref()?.upgrade()?
         };
 
-        let (dst_address, dst_size) = {
+        let (dst_address, dst_size, dst_user) = {
             let thread = current_thread.lock().unwrap();
-            Self::request_message_address_and_size(&thread, server_message, server_buffer_size)
+            let (address, size) =
+                Self::request_message_address_and_size(&thread, server_message, server_buffer_size);
+            (address, size, server_message != 0)
         };
-        let (src_address, src_size) = {
+        let (src_address, src_size, src_user) = {
             let request = request.lock().unwrap();
             if request.get_address() != 0 {
-                (request.get_address(), request.get_size())
+                (request.get_address(), request.get_size(), true)
             } else {
                 let thread = client_thread.lock().unwrap();
-                Self::request_message_address_and_size(&thread, 0, 0)
+                let (address, size) = Self::request_message_address_and_size(&thread, 0, 0);
+                (address, size, false)
             }
         };
 
         let src_words = {
             let process = client_process.lock().unwrap();
-            Self::message_words_from_process(&process, src_address, src_size)
+            match Self::message_words_from_process(&process, src_address, src_size) {
+                Ok(words) => words,
+                Err(rc) => return Some((rc, false)),
+            }
         };
         let dst_word_capacity = dst_size / std::mem::size_of::<u32>();
         let original_dst_words = {
             let process = server_process.lock().unwrap();
-            Self::message_words_from_process(&process, dst_address, dst_size)
+            if dst_user && server_message_paddr != 0 {
+                match Self::message_words_from_process_physical(
+                    &process,
+                    server_message_paddr,
+                    dst_size,
+                ) {
+                    Some(words) => words,
+                    None => return Some((RESULT_INVALID_CURRENT_MEMORY.get_inner_value(), false)),
+                }
+            } else {
+                match Self::message_words_from_process(&process, dst_address, dst_size) {
+                    Ok(words) => words,
+                    Err(rc) => return Some((rc, false)),
+                }
+            }
         };
-        let (src_header, src_special_header) = Self::parse_message_headers(&src_words);
+        let (src_header, src_special_header) = KServerSession::parse_message_headers(&src_words);
         let (dst_header, dst_special_header) = Self::parse_message_headers(&original_dst_words);
 
         let dst_recv_list_idx =
@@ -989,8 +1318,9 @@ impl KServerSession {
             &dst_special_header,
             dst_address,
             dst_size,
-            &mut server_process,
-            &client_process,
+            dst_user,
+            &server_process.page_table,
+            &client_process.page_table,
         );
         if src_header.get_pointer_count() > 0 {
             recv_list_broken = Self::mark_receive_list_broken(
@@ -1022,8 +1352,8 @@ impl KServerSession {
                 &src_header,
                 &src_special_header,
                 &mut request,
-                &mut server_process,
-                &mut client_process,
+                &mut server_process.page_table,
+                &mut client_process.page_table,
             )
         };
         if src_header.get_map_alias_count() > 0 {
@@ -1046,20 +1376,54 @@ impl KServerSession {
             let _ = Self::cleanup_client_map(request, Some(&mut client_process));
             return Some((map_alias_result, recv_list_broken));
         }
-        let raw_data_index = crate::hle::kernel::message_buffer::MessageBuffer::get_raw_data_index(
+        let raw_result = Self::process_receive_message_raw_data(
+            &mut dst_words,
+            &src_words,
             &src_header,
             &src_special_header,
-        );
-        if src_header.get_raw_count() > 0 {
-            dst_words[raw_data_index..src_end_offset]
-                .copy_from_slice(&src_words[raw_data_index..src_end_offset]);
-        }
-        Self::write_message_words_to_process(
-            &mut server_process,
+            &server_process.page_table,
             dst_address,
-            &dst_words,
-            copy_size,
+            dst_user,
+            &client_process.page_table,
+            src_address,
+            src_user,
         );
+        if raw_result != crate::hle::result::RESULT_SUCCESS.get_inner_value() {
+            if processed_special_data {
+                Self::cleanup_special_data(&mut server_process, &mut dst_words, dst_size);
+            }
+            if !recv_list_broken {
+                Self::restore_destination_header(&mut dst_words, &dst_header, &dst_special_header);
+            }
+            let _ = Self::cleanup_server_map(request, Some(&mut server_process));
+            let _ = Self::cleanup_client_map(request, Some(&mut client_process));
+            return Some((raw_result, recv_list_broken));
+        }
+        if dst_user && server_message_paddr != 0 {
+            if !Self::write_message_words_to_process_physical(
+                &server_process,
+                server_message_paddr,
+                &dst_words,
+                copy_size,
+            ) {
+                return Some((
+                    RESULT_INVALID_CURRENT_MEMORY.get_inner_value(),
+                    recv_list_broken,
+                ));
+            }
+        } else {
+            if !Self::write_message_words_to_process(
+                &mut server_process,
+                dst_address,
+                &dst_words,
+                copy_size,
+            ) {
+                return Some((
+                    RESULT_INVALID_CURRENT_MEMORY.get_inner_value(),
+                    recv_list_broken,
+                ));
+            }
+        }
         if src_header.get_raw_count() > 0 {
             recv_list_broken = Self::mark_receive_list_broken(src_end_offset, dst_recv_list_idx);
         }
@@ -1085,30 +1449,39 @@ impl KServerSession {
             thread.parent.as_ref()?.upgrade()?
         };
 
-        let (src_address, src_size) = {
+        let (src_address, src_size, src_user) = {
             let thread = current_thread.lock().unwrap();
-            Self::request_message_address_and_size(&thread, server_message, server_buffer_size)
+            let (address, size) =
+                Self::request_message_address_and_size(&thread, server_message, server_buffer_size);
+            (address, size, server_message != 0)
         };
-        let (dst_address, dst_size) = {
+        let (dst_address, dst_size, dst_user) = {
             let request = request.lock().unwrap();
             if request.get_address() != 0 {
-                (request.get_address(), request.get_size())
+                (request.get_address(), request.get_size(), true)
             } else {
                 let thread = client_thread.lock().unwrap();
-                Self::request_message_address_and_size(&thread, 0, 0)
+                let (address, size) = Self::request_message_address_and_size(&thread, 0, 0);
+                (address, size, false)
             }
         };
 
         let src_words = {
             let process = server_process.lock().unwrap();
-            Self::message_words_from_process(&process, src_address, src_size)
+            match Self::message_words_from_process(&process, src_address, src_size) {
+                Ok(words) => words,
+                Err(rc) => return Some(rc),
+            }
         };
         let dst_word_capacity = dst_size / std::mem::size_of::<u32>();
         let original_dst_words = {
             let process = client_process.lock().unwrap();
-            Self::message_words_from_process(&process, dst_address, dst_size)
+            match Self::message_words_from_process(&process, dst_address, dst_size) {
+                Ok(words) => words,
+                Err(rc) => return Some(rc),
+            }
         };
-        let (src_header, src_special_header) = Self::parse_message_headers(&src_words);
+        let (src_header, src_special_header) = KServerSession::parse_message_headers(&src_words);
         let (dst_header, dst_special_header) = Self::parse_message_headers(&original_dst_words);
 
         if crate::hle::kernel::message_buffer::MessageBuffer::get_message_buffer_size(
@@ -1187,8 +1560,9 @@ impl KServerSession {
             &dst_special_header,
             dst_address,
             dst_size,
-            &mut client_process,
-            &server_process,
+            dst_user,
+            &client_process.page_table,
+            &server_process.page_table,
         );
         if pointer_result != crate::hle::result::RESULT_SUCCESS.get_inner_value() {
             if processed_special_data {
@@ -1198,13 +1572,23 @@ impl KServerSession {
             let _ = Self::cleanup_client_map(request, Some(&mut client_process));
             return Some(pointer_result);
         }
-        {
-            let request = request.lock().unwrap();
+        let receive_mapping_result = {
+            let request_guard = request.lock().unwrap();
             Self::process_send_message_receive_mappings(
-                &request,
-                &server_process,
-                &mut client_process,
-            );
+                &request_guard,
+                &server_process.page_table,
+                &client_process.page_table,
+            )
+        };
+        if receive_mapping_result != crate::hle::result::RESULT_SUCCESS.get_inner_value() {
+            if processed_special_data {
+                Self::cleanup_special_data(&mut client_process, &mut dst_words, dst_size);
+            }
+            let _ = Self::cleanup_server_map(request, Some(&mut server_process));
+            let _ = Self::cleanup_client_map(request, Some(&mut client_process));
+            return Some(receive_mapping_result);
+        }
+        {
             let map_alias_index =
                 crate::hle::kernel::message_buffer::MessageBuffer::get_map_alias_descriptor_index(
                     &src_header,
@@ -1219,25 +1603,38 @@ impl KServerSession {
                 dst_message.set(cur_offset, &[0, 0, 0]);
             }
         }
-        let raw_data_index = crate::hle::kernel::message_buffer::MessageBuffer::get_raw_data_index(
+        let raw_result = Self::process_send_message_raw_data(
+            &mut dst_words,
+            &src_words,
             &src_header,
             &src_special_header,
+            &client_process.page_table,
+            dst_address,
+            dst_user,
+            src_address,
+            src_user,
         );
-        if src_header.get_raw_count() > 0 {
-            dst_words[raw_data_index..src_end_offset]
-                .copy_from_slice(&src_words[raw_data_index..src_end_offset]);
+        if raw_result != crate::hle::result::RESULT_SUCCESS.get_inner_value() {
+            if processed_special_data {
+                Self::cleanup_special_data(&mut client_process, &mut dst_words, dst_size);
+            }
+            let _ = Self::cleanup_server_map(request, Some(&mut server_process));
+            let _ = Self::cleanup_client_map(request, Some(&mut client_process));
+            return Some(raw_result);
         }
-        Self::write_message_words_to_process(
+        if !Self::write_message_words_to_process(
             &mut client_process,
             dst_address,
             &dst_words,
             copy_size,
-        );
+        ) {
+            return Some(RESULT_INVALID_CURRENT_MEMORY.get_inner_value());
+        }
         let cleanup_server_map = Self::cleanup_server_map(request, Some(&mut server_process));
         if cleanup_server_map != crate::hle::result::RESULT_SUCCESS.get_inner_value() {
             if processed_special_data {
                 Self::cleanup_special_data(&mut client_process, &mut dst_words, dst_size);
-                Self::write_message_words_to_process(
+                let _ = Self::write_message_words_to_process(
                     &mut client_process,
                     dst_address,
                     &dst_words,
@@ -1250,7 +1647,7 @@ impl KServerSession {
         if cleanup_client_map != crate::hle::result::RESULT_SUCCESS.get_inner_value() {
             if processed_special_data {
                 Self::cleanup_special_data(&mut client_process, &mut dst_words, dst_size);
-                Self::write_message_words_to_process(
+                let _ = Self::write_message_words_to_process(
                     &mut client_process,
                     dst_address,
                     &dst_words,
@@ -1262,7 +1659,7 @@ impl KServerSession {
         Some(crate::hle::result::RESULT_SUCCESS.get_inner_value())
     }
 
-    fn cleanup_server_handles(message: usize, mut buffer_size: usize, _message_paddr: u64) -> u32 {
+    fn cleanup_server_handles(message: usize, mut buffer_size: usize, message_paddr: u64) -> u32 {
         let Some(thread) = crate::hle::kernel::kernel::get_current_thread_pointer() else {
             return RESULT_INVALID_STATE.get_inner_value();
         };
@@ -1280,24 +1677,22 @@ impl KServerSession {
             buffer_size = MESSAGE_BUFFER_SIZE * std::mem::size_of::<u32>();
         }
 
-        let mut words = vec![0u32; buffer_size / std::mem::size_of::<u32>()];
-        {
+        let mut words = {
             let process = process.lock().unwrap();
-            let bytes = if let Some(memory) = process.get_memory() {
-                let mut bytes = vec![0u8; buffer_size];
-                memory
-                    .lock()
-                    .unwrap()
-                    .read_block(message_address as u64, &mut bytes);
-                bytes
+            if message != 0 && message_paddr != 0 {
+                let Some(words) =
+                    Self::message_words_from_process_physical(&process, message_paddr, buffer_size)
+                else {
+                    return RESULT_INVALID_STATE.get_inner_value();
+                };
+                words
             } else {
-                let memory = process.process_memory.read().unwrap();
-                memory.read_bytes(message_address as u64, buffer_size)
-            };
-            for (index, chunk) in bytes.chunks_exact(4).enumerate() {
-                words[index] = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+                match Self::message_words_from_process(&process, message_address, buffer_size) {
+                    Ok(words) => words,
+                    Err(_) => return RESULT_INVALID_STATE.get_inner_value(),
+                }
             }
-        }
+        };
 
         let header =
             crate::hle::kernel::message_buffer::MessageHeader::from_raw([words[0], words[1]]);
@@ -2088,9 +2483,13 @@ impl KServerSession {
             }
         }
         self.current_request = Some(Arc::clone(&request));
-        let (receive_result, recv_list_broken) =
-            Self::try_receive_message_raw(server_message, server_buffer_size, &request)
-                .unwrap_or((crate::hle::result::RESULT_SUCCESS.get_inner_value(), false));
+        let (receive_result, recv_list_broken) = Self::try_receive_message_raw(
+            server_message,
+            server_buffer_size,
+            _server_message_paddr,
+            &request,
+        )
+        .unwrap_or((crate::hle::result::RESULT_SUCCESS.get_inner_value(), false));
         if receive_result != crate::hle::result::RESULT_SUCCESS.get_inner_value() {
             return self.fail_receive_request_with_server_result(
                 request,
@@ -2295,11 +2694,190 @@ impl Default for KServerSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::SystemRef;
+    use crate::device_memory::{dram_memory_map, DeviceMemory};
+    use crate::hle::kernel::k_memory_block::{KMemoryAttribute, KMemoryBlockDisableMergeAttribute};
     use crate::hle::kernel::k_process::KProcess;
     use crate::hle::kernel::k_readable_event::KReadableEvent;
     use crate::hle::kernel::k_scheduler::KScheduler;
     use crate::hle::kernel::k_session::KSession;
     use crate::hle::kernel::k_session_request::KSessionRequest;
+    use crate::memory::memory::Memory;
+
+    struct SessionPageTableMemoryForTest {
+        _device_memory: Box<DeviceMemory>,
+        memory: Arc<Mutex<Memory>>,
+    }
+
+    impl SessionPageTableMemoryForTest {
+        fn new(backing_size: usize) -> Self {
+            let device_memory = Box::new(DeviceMemory::with_size(backing_size));
+            let buffer_ptr = &device_memory.buffer as *const common::host_memory::HostMemory;
+            let memory = Arc::new(Mutex::new(unsafe {
+                Memory::new(
+                    SystemRef::null(),
+                    device_memory.as_ref() as *const _,
+                    buffer_ptr,
+                )
+            }));
+
+            Self {
+                _device_memory: device_memory,
+                memory,
+            }
+        }
+
+        fn write_phys(&mut self, phys_addr: u64, bytes: &[u8]) {
+            let offset = phys_addr
+                .checked_sub(dram_memory_map::BASE)
+                .expect("test physical address must be in dram") as usize;
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    bytes.as_ptr(),
+                    self._device_memory
+                        .buffer
+                        .backing_base_pointer()
+                        .add(offset),
+                    bytes.len(),
+                );
+            }
+        }
+
+        fn read_phys(&self, phys_addr: u64, size: usize) -> Vec<u8> {
+            let offset = phys_addr
+                .checked_sub(dram_memory_map::BASE)
+                .expect("test physical address must be in dram") as usize;
+            let mut bytes = vec![0u8; size];
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    self._device_memory
+                        .buffer
+                        .backing_base_pointer()
+                        .add(offset),
+                    bytes.as_mut_ptr(),
+                    size,
+                );
+            }
+            bytes
+        }
+    }
+
+    fn attach_process_page_table_for_session_test(
+        process: &mut KProcess,
+        memory: Arc<Mutex<Memory>>,
+        start: usize,
+        end: usize,
+        state: KMemoryState,
+    ) {
+        let page_table = process.page_table.get_base_mut();
+        page_table.m_address_space_width = 32;
+        page_table.m_address_space_start = start;
+        page_table.m_address_space_end = end;
+        page_table.m_memory = Some(memory);
+        page_table.initialize_impl();
+        page_table
+            .m_memory_block_manager
+            .initialize(start, end, None)
+            .expect("test memory block manager initialization must succeed");
+        page_table.m_memory_block_manager.update(
+            start,
+            (end - start) / PAGE_SIZE,
+            state,
+            KMemoryPermission::USER_READ_WRITE,
+            KMemoryAttribute::NONE,
+            KMemoryBlockDisableMergeAttribute::NONE,
+            KMemoryBlockDisableMergeAttribute::NONE,
+        );
+    }
+
+    fn map_process_page_for_session_test(process: &mut KProcess, addr: usize, phys_addr: u64) {
+        let page_table = process.page_table.get_base_mut();
+        let memory = page_table
+            .m_memory
+            .as_ref()
+            .expect("test page table memory must be attached")
+            .clone();
+        let impl_pt = page_table
+            .m_impl
+            .as_mut()
+            .expect("test page table backend must be initialized");
+        memory.lock().unwrap().map_memory_region(
+            impl_pt,
+            addr as u64,
+            PAGE_SIZE as u64,
+            phys_addr,
+            crate::memory::memory::MemoryPermission::READ_WRITE,
+            false,
+        );
+    }
+
+    fn set_current_page_table_for_session_test(process: &mut KProcess) {
+        let page_table = process.page_table.get_base_mut();
+        let memory = page_table
+            .m_memory
+            .as_ref()
+            .expect("test page table memory must be attached")
+            .clone();
+        let impl_pt = page_table
+            .m_impl
+            .as_mut()
+            .expect("test page table backend must be initialized");
+        memory
+            .lock()
+            .unwrap()
+            .set_current_page_table(impl_pt.as_mut() as *mut _);
+    }
+
+    #[test]
+    fn message_words_use_process_page_table_not_memory_current_page_table() {
+        let mut page_table_memory = SessionPageTableMemoryForTest::new(0x40000);
+        let mut lhs = KProcess::new();
+        let mut rhs = KProcess::new();
+        attach_process_page_table_for_session_test(
+            &mut lhs,
+            page_table_memory.memory.clone(),
+            0x0000,
+            0x10000,
+            KMemoryState::NORMAL,
+        );
+        attach_process_page_table_for_session_test(
+            &mut rhs,
+            page_table_memory.memory.clone(),
+            0x0000,
+            0x10000,
+            KMemoryState::NORMAL,
+        );
+
+        let lhs_phys = dram_memory_map::BASE + 0x10000;
+        let rhs_phys = dram_memory_map::BASE + 0x20000;
+        map_process_page_for_session_test(&mut lhs, 0x4000, lhs_phys);
+        map_process_page_for_session_test(&mut rhs, 0x4000, rhs_phys);
+        set_current_page_table_for_session_test(&mut rhs);
+
+        page_table_memory.write_phys(lhs_phys, &[1, 2, 3, 4, 5, 6, 7, 8]);
+        page_table_memory.write_phys(rhs_phys, &[0xAA; 8]);
+
+        let words = KServerSession::message_words_from_process(&lhs, 0x4000, 8).unwrap();
+        assert_eq!(words, vec![0x0403_0201, 0x0807_0605]);
+
+        assert!(KServerSession::write_message_words_to_process(
+            &mut lhs,
+            0x4000,
+            &[0x1122_3344, 0x5566_7788],
+            8,
+        ));
+        assert_eq!(
+            page_table_memory.read_phys(lhs_phys, 8),
+            vec![0x44, 0x33, 0x22, 0x11, 0x88, 0x77, 0x66, 0x55]
+        );
+        assert_eq!(page_table_memory.read_phys(rhs_phys, 8), vec![0xAA; 8]);
+        assert!(!KServerSession::write_message_words_to_process(
+            &mut lhs,
+            0x9000,
+            &[0xAABB_CCDD],
+            4,
+        ));
+    }
 
     #[test]
     fn is_signaled_requires_no_current_request() {
@@ -2901,9 +3479,119 @@ mod tests {
     }
 
     #[test]
+    fn cleanup_server_handles_reads_user_message_from_physical_address() {
+        let mut page_table_memory = SessionPageTableMemoryForTest::new(0x30000);
+        let mut process = crate::hle::kernel::k_process::KProcess::new();
+        process.process_id = 7;
+        assert_eq!(process.initialize_handle_table(), 0);
+        attach_process_page_table_for_session_test(
+            &mut process,
+            page_table_memory.memory.clone(),
+            0x0000,
+            0x10000,
+            KMemoryState::NORMAL,
+        );
+        let virtual_phys = dram_memory_map::BASE + 0x10000;
+        let message_phys = dram_memory_map::BASE + 0x20000;
+        map_process_page_for_session_test(&mut process, 0x4000, virtual_phys);
+        set_current_page_table_for_session_test(&mut process);
+
+        let copy_handle = process.handle_table.add(0x1111).unwrap();
+        let move_handle = process.handle_table.add(0x2222).unwrap();
+
+        let thread = Arc::new(KThreadLock::new(
+            crate::hle::kernel::k_thread::KThread::new(),
+        ));
+        {
+            let mut thread = thread.lock().unwrap();
+            thread.thread_id = 3;
+            thread.object_id = 4;
+            thread.tls_address = KProcessAddress::new(0x3000);
+        }
+
+        let process = Arc::new(ProcessLock::from_value(process));
+        {
+            thread.lock().unwrap().parent = Some(Arc::downgrade(&process));
+            process
+                .lock()
+                .unwrap()
+                .register_thread_object(Arc::clone(&thread));
+        }
+
+        let mut virtual_words = [0u32; MESSAGE_BUFFER_SIZE];
+        {
+            let mut message = MessageBuffer::new(&mut virtual_words);
+            let header = crate::hle::kernel::message_buffer::MessageHeader::new(
+                0,
+                true,
+                0,
+                0,
+                0,
+                0,
+                0,
+                crate::hle::kernel::message_buffer::ReceiveListCountType::None as u32,
+            );
+            let mut offset = message.set_message_header(&header);
+            offset = message.set(offset, &[0]);
+            let _ = message.set_handle(offset, copy_handle);
+        }
+        let virtual_bytes: Vec<u8> = virtual_words
+            .iter()
+            .flat_map(|word| word.to_le_bytes())
+            .collect();
+        page_table_memory.write_phys(virtual_phys, &virtual_bytes);
+
+        let mut physical_words = [0u32; MESSAGE_BUFFER_SIZE];
+        {
+            let mut message = MessageBuffer::new(&mut physical_words);
+            let header = crate::hle::kernel::message_buffer::MessageHeader::new(
+                0,
+                true,
+                0,
+                0,
+                0,
+                0,
+                0,
+                crate::hle::kernel::message_buffer::ReceiveListCountType::None as u32,
+            );
+            let mut offset = message.set_message_header(&header);
+            offset = message.set(offset, &[1u32 << 5]);
+            let _ = message.set_handle(offset, move_handle);
+        }
+        let physical_bytes: Vec<u8> = physical_words
+            .iter()
+            .flat_map(|word| word.to_le_bytes())
+            .collect();
+        page_table_memory.write_phys(message_phys, &physical_bytes);
+
+        let mut system = crate::core::System::new_for_test();
+        system.set_current_process_arc(Arc::clone(&process));
+        crate::hle::kernel::kernel::set_current_emu_thread(Some(&thread));
+
+        assert_eq!(
+            KServerSession::cleanup_server_handles(
+                0x4000,
+                MESSAGE_BUFFER_SIZE * std::mem::size_of::<u32>(),
+                message_phys,
+            ),
+            0
+        );
+        let process = process.lock().unwrap();
+        assert!(process.handle_table.get_object(copy_handle).is_some());
+        assert!(process.handle_table.get_object(move_handle).is_none());
+
+        crate::hle::kernel::kernel::set_current_emu_thread(None);
+    }
+
+    #[test]
     fn receive_request_with_message_copies_raw_request_payload_for_simple_message() {
         let mut client_process = crate::hle::kernel::k_process::KProcess::new();
         client_process.process_id = 7;
+        client_process
+            .process_memory
+            .write()
+            .unwrap()
+            .allocate(0, 0x6000);
         let client_process = Arc::new(ProcessLock::from_value(client_process));
 
         let client_thread = Arc::new(KThreadLock::new(
@@ -2923,6 +3611,11 @@ mod tests {
 
         let mut server_process = crate::hle::kernel::k_process::KProcess::new();
         server_process.process_id = 8;
+        server_process
+            .process_memory
+            .write()
+            .unwrap()
+            .allocate(0, 0x6000);
         let server_process = Arc::new(ProcessLock::from_value(server_process));
 
         let server_thread = Arc::new(KThreadLock::new(
@@ -2965,6 +3658,10 @@ mod tests {
             .lock()
             .unwrap()
             .write_block(0x3000, &request_bytes);
+        server_process.lock().unwrap().write_block(
+            0x5000,
+            &vec![0u8; MESSAGE_BUFFER_SIZE * std::mem::size_of::<u32>()],
+        );
 
         let mut system = crate::core::System::new_for_test();
         system.set_current_process_arc(Arc::clone(&server_process));
@@ -2973,6 +3670,7 @@ mod tests {
         let request = Arc::new(Mutex::new(KSessionRequest::new()));
         {
             let mut request = request.lock().unwrap();
+            request.thread = Some(Arc::downgrade(&client_thread));
             request.thread_id = Some(3);
             request.client_process_id = Some(7);
             request.address = 0;
@@ -2991,6 +3689,261 @@ mod tests {
             .read_block(0x5000, 16)
             .to_vec();
         assert_eq!(copied, request_bytes);
+
+        crate::hle::kernel::kernel::set_current_emu_thread(None);
+    }
+
+    #[test]
+    fn receive_request_with_message_uses_server_message_physical_address() {
+        let mut client_process = crate::hle::kernel::k_process::KProcess::new();
+        client_process.process_id = 7;
+        client_process
+            .process_memory
+            .write()
+            .unwrap()
+            .allocate(0, 0x6000);
+        let client_process = Arc::new(ProcessLock::from_value(client_process));
+
+        let client_thread = Arc::new(KThreadLock::new(
+            crate::hle::kernel::k_thread::KThread::new(),
+        ));
+        {
+            let mut thread = client_thread.lock().unwrap();
+            thread.thread_id = 3;
+            thread.object_id = 4;
+            thread.tls_address = KProcessAddress::new(0x3000);
+            thread.parent = Some(Arc::downgrade(&client_process));
+        }
+        client_process
+            .lock()
+            .unwrap()
+            .register_thread_object(Arc::clone(&client_thread));
+
+        let mut page_table_memory = SessionPageTableMemoryForTest::new(0x40000);
+        let mut server_process = crate::hle::kernel::k_process::KProcess::new();
+        server_process.process_id = 8;
+        server_process
+            .process_memory
+            .write()
+            .unwrap()
+            .allocate(0, 0x8000);
+        attach_process_page_table_for_session_test(
+            &mut server_process,
+            page_table_memory.memory.clone(),
+            0x0000,
+            0x10000,
+            KMemoryState::NORMAL,
+        );
+        let server_message_paddr = dram_memory_map::BASE + 0x10000;
+        let server_virtual_phys = dram_memory_map::BASE + 0x20000;
+        map_process_page_for_session_test(&mut server_process, 0x5000, server_virtual_phys);
+        set_current_page_table_for_session_test(&mut server_process);
+        let server_process = Arc::new(ProcessLock::from_value(server_process));
+
+        let server_thread = Arc::new(KThreadLock::new(
+            crate::hle::kernel::k_thread::KThread::new(),
+        ));
+        {
+            let mut thread = server_thread.lock().unwrap();
+            thread.thread_id = 5;
+            thread.object_id = 6;
+            thread.tls_address = KProcessAddress::new(0x5000);
+            thread.parent = Some(Arc::downgrade(&server_process));
+        }
+        server_process
+            .lock()
+            .unwrap()
+            .register_thread_object(Arc::clone(&server_thread));
+
+        let mut request_words = [0u32; MESSAGE_BUFFER_SIZE];
+        {
+            let mut message = MessageBuffer::new(&mut request_words);
+            let header = crate::hle::kernel::message_buffer::MessageHeader::new(
+                0x1234,
+                false,
+                0,
+                0,
+                0,
+                0,
+                0,
+                crate::hle::kernel::message_buffer::ReceiveListCountType::None as u32,
+            );
+            assert_eq!(message.set_message_header(&header), 2);
+        }
+        let request_bytes: Vec<u8> = request_words[..2]
+            .iter()
+            .flat_map(|word| word.to_le_bytes())
+            .collect();
+        client_process
+            .lock()
+            .unwrap()
+            .write_block(0x3000, &request_bytes);
+
+        let virtual_sentinel = [0xDDu8; 8];
+        page_table_memory.write_phys(server_virtual_phys, &virtual_sentinel);
+        page_table_memory.write_phys(
+            server_message_paddr,
+            &vec![0u8; MESSAGE_BUFFER_SIZE * std::mem::size_of::<u32>()],
+        );
+
+        let mut system = crate::core::System::new_for_test();
+        system.set_current_process_arc(Arc::clone(&server_process));
+        crate::hle::kernel::kernel::set_current_emu_thread(Some(&server_thread));
+
+        let request = Arc::new(Mutex::new(KSessionRequest::new()));
+        {
+            let mut request = request.lock().unwrap();
+            request.thread = Some(Arc::downgrade(&client_thread));
+            request.thread_id = Some(3);
+            request.client_process_id = Some(7);
+            request.address = 0;
+            request.size = 0;
+        }
+
+        let mut server = KServerSession::new();
+        server.initialize(0x1000);
+        server.request_list.push_back(request);
+
+        assert_eq!(
+            server.receive_request_with_message(
+                0x5000,
+                MESSAGE_BUFFER_SIZE * std::mem::size_of::<u32>(),
+                server_message_paddr,
+            ),
+            0
+        );
+
+        assert_eq!(
+            page_table_memory.read_phys(server_message_paddr, 8),
+            request_bytes
+        );
+        assert_eq!(
+            page_table_memory.read_phys(server_virtual_phys, 8),
+            virtual_sentinel
+        );
+
+        crate::hle::kernel::kernel::set_current_emu_thread(None);
+    }
+
+    #[test]
+    fn receive_request_with_message_does_not_fallback_when_physical_address_is_invalid() {
+        let mut client_process = crate::hle::kernel::k_process::KProcess::new();
+        client_process.process_id = 7;
+        client_process
+            .process_memory
+            .write()
+            .unwrap()
+            .allocate(0, 0x6000);
+        let client_process = Arc::new(ProcessLock::from_value(client_process));
+
+        let client_thread = Arc::new(KThreadLock::new(
+            crate::hle::kernel::k_thread::KThread::new(),
+        ));
+        {
+            let mut thread = client_thread.lock().unwrap();
+            thread.thread_id = 3;
+            thread.object_id = 4;
+            thread.tls_address = KProcessAddress::new(0x3000);
+            thread.parent = Some(Arc::downgrade(&client_process));
+        }
+        client_process
+            .lock()
+            .unwrap()
+            .register_thread_object(Arc::clone(&client_thread));
+
+        let mut page_table_memory = SessionPageTableMemoryForTest::new(0x30000);
+        let mut server_process = crate::hle::kernel::k_process::KProcess::new();
+        server_process.process_id = 8;
+        server_process
+            .process_memory
+            .write()
+            .unwrap()
+            .allocate(0, 0x8000);
+        attach_process_page_table_for_session_test(
+            &mut server_process,
+            page_table_memory.memory.clone(),
+            0x0000,
+            0x10000,
+            KMemoryState::NORMAL,
+        );
+        let server_virtual_phys = dram_memory_map::BASE + 0x10000;
+        map_process_page_for_session_test(&mut server_process, 0x5000, server_virtual_phys);
+        set_current_page_table_for_session_test(&mut server_process);
+        let server_process = Arc::new(ProcessLock::from_value(server_process));
+
+        let server_thread = Arc::new(KThreadLock::new(
+            crate::hle::kernel::k_thread::KThread::new(),
+        ));
+        {
+            let mut thread = server_thread.lock().unwrap();
+            thread.thread_id = 5;
+            thread.object_id = 6;
+            thread.tls_address = KProcessAddress::new(0x5000);
+            thread.parent = Some(Arc::downgrade(&server_process));
+        }
+        server_process
+            .lock()
+            .unwrap()
+            .register_thread_object(Arc::clone(&server_thread));
+
+        let mut request_words = [0u32; MESSAGE_BUFFER_SIZE];
+        {
+            let mut message = MessageBuffer::new(&mut request_words);
+            let header = crate::hle::kernel::message_buffer::MessageHeader::new(
+                0x1234,
+                false,
+                0,
+                0,
+                0,
+                0,
+                0,
+                crate::hle::kernel::message_buffer::ReceiveListCountType::None as u32,
+            );
+            assert_eq!(message.set_message_header(&header), 2);
+        }
+        let request_bytes: Vec<u8> = request_words[..2]
+            .iter()
+            .flat_map(|word| word.to_le_bytes())
+            .collect();
+        client_process
+            .lock()
+            .unwrap()
+            .write_block(0x3000, &request_bytes);
+
+        let virtual_sentinel = [0xDDu8; 8];
+        page_table_memory.write_phys(server_virtual_phys, &virtual_sentinel);
+
+        let mut system = crate::core::System::new_for_test();
+        system.set_current_process_arc(Arc::clone(&server_process));
+        crate::hle::kernel::kernel::set_current_emu_thread(Some(&server_thread));
+
+        let request = Arc::new(Mutex::new(KSessionRequest::new()));
+        {
+            let mut request = request.lock().unwrap();
+            request.thread = Some(Arc::downgrade(&client_thread));
+            request.thread_id = Some(3);
+            request.client_process_id = Some(7);
+            request.address = 0;
+            request.size = 0;
+        }
+
+        let mut server = KServerSession::new();
+        server.initialize(0x1000);
+        server.request_list.push_back(request);
+
+        let invalid_server_message_paddr = dram_memory_map::BASE + 0x40000;
+        assert_eq!(
+            server.receive_request_with_message(
+                0x5000,
+                MESSAGE_BUFFER_SIZE * std::mem::size_of::<u32>(),
+                invalid_server_message_paddr,
+            ),
+            RESULT_NOT_FOUND.get_inner_value()
+        );
+        assert_eq!(
+            page_table_memory.read_phys(server_virtual_phys, 8),
+            virtual_sentinel
+        );
 
         crate::hle::kernel::kernel::set_current_emu_thread(None);
     }
@@ -3324,9 +4277,20 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "reduced HLE fixture cannot switch Memory's current page table between client/server; direct page-table helper tests cover this path"]
     fn receive_request_with_message_copies_pointer_descriptor_payload() {
+        let mut page_table_memory = SessionPageTableMemoryForTest::new(0x50000);
         let mut client_process = crate::hle::kernel::k_process::KProcess::new();
         client_process.process_id = 7;
+        attach_process_page_table_for_session_test(
+            &mut client_process,
+            page_table_memory.memory.clone(),
+            0x0000,
+            0x10000,
+            KMemoryState::NORMAL,
+        );
+        let client_msg_phys = dram_memory_map::BASE + 0x10000;
+        map_process_page_for_session_test(&mut client_process, 0x3000, client_msg_phys);
         let client_process = Arc::new(ProcessLock::from_value(client_process));
 
         let client_thread = Arc::new(KThreadLock::new(
@@ -3343,14 +4307,23 @@ mod tests {
             .lock()
             .unwrap()
             .register_thread_object(Arc::clone(&client_thread));
-        client_process
-            .lock()
-            .unwrap()
-            .write_block(0x3010, &[0xAA, 0xBB, 0xCC, 0xDD]);
+        page_table_memory.write_phys(client_msg_phys + 0x10, &[0xAA, 0xBB, 0xCC, 0xDD]);
 
         let mut server_process = crate::hle::kernel::k_process::KProcess::new();
         server_process.process_id = 8;
+        attach_process_page_table_for_session_test(
+            &mut server_process,
+            page_table_memory.memory.clone(),
+            0x0000,
+            0x10000,
+            KMemoryState::NORMAL,
+        );
+        let server_msg_phys = dram_memory_map::BASE + 0x20000;
+        let server_recv_phys = dram_memory_map::BASE + 0x30000;
+        map_process_page_for_session_test(&mut server_process, 0x5000, server_msg_phys);
+        map_process_page_for_session_test(&mut server_process, 0x6000, server_recv_phys);
         let server_process = Arc::new(ProcessLock::from_value(server_process));
+        set_current_page_table_for_session_test(&mut server_process.lock().unwrap());
 
         let server_thread = Arc::new(KThreadLock::new(
             crate::hle::kernel::k_thread::KThread::new(),
@@ -3372,10 +4345,7 @@ mod tests {
             .iter()
             .flat_map(|word| word.to_le_bytes())
             .collect();
-        client_process
-            .lock()
-            .unwrap()
-            .write_block(0x3000, &request_bytes);
+        page_table_memory.write_phys(client_msg_phys, &request_bytes);
 
         let server_buffer_words = [
             0u32,
@@ -3391,10 +4361,7 @@ mod tests {
             .iter()
             .flat_map(|word| word.to_le_bytes())
             .collect();
-        server_process
-            .lock()
-            .unwrap()
-            .write_block(0x5000, &server_buffer_bytes);
+        page_table_memory.write_phys(server_msg_phys, &server_buffer_bytes);
 
         let mut system = crate::core::System::new_for_test();
         system.set_current_process_arc(Arc::clone(&server_process));
@@ -3403,6 +4370,7 @@ mod tests {
         let request = Arc::new(Mutex::new(KSessionRequest::new()));
         {
             let mut request = request.lock().unwrap();
+            request.thread = Some(Arc::downgrade(&client_thread));
             request.thread_id = Some(3);
             request.client_process_id = Some(7);
         }
@@ -3413,109 +4381,756 @@ mod tests {
 
         assert_eq!(server.receive_request_with_message(0, 0, 0), 0);
         assert_eq!(
-            server_process.lock().unwrap().read_block(0x6000, 4),
-            &[0xAA, 0xBB, 0xCC, 0xDD]
+            page_table_memory.read_phys(server_recv_phys, 4),
+            vec![0xAA, 0xBB, 0xCC, 0xDD]
         );
 
         crate::hle::kernel::kernel::set_current_emu_thread(None);
     }
 
     #[test]
-    fn send_reply_with_message_copies_pointer_descriptor_payload() {
+    fn process_send_message_pointer_descriptors_copies_through_page_table() {
+        let mut page_table_memory = SessionPageTableMemoryForTest::new(0x50000);
         let mut client_process = crate::hle::kernel::k_process::KProcess::new();
         client_process.process_id = 7;
-        let client_process = Arc::new(ProcessLock::from_value(client_process));
-
-        let client_thread = Arc::new(KThreadLock::new(
-            crate::hle::kernel::k_thread::KThread::new(),
-        ));
-        {
-            let mut thread = client_thread.lock().unwrap();
-            thread.thread_id = 3;
-            thread.object_id = 4;
-            thread.tls_address = KProcessAddress::new(0x3000);
-            thread.parent = Some(Arc::downgrade(&client_process));
-            thread.begin_wait();
-        }
-        client_process
-            .lock()
-            .unwrap()
-            .register_thread_object(Arc::clone(&client_thread));
-
         let mut server_process = crate::hle::kernel::k_process::KProcess::new();
         server_process.process_id = 8;
-        let server_process = Arc::new(ProcessLock::from_value(server_process));
 
-        let server_thread = Arc::new(KThreadLock::new(
-            crate::hle::kernel::k_thread::KThread::new(),
-        ));
-        {
-            let mut thread = server_thread.lock().unwrap();
-            thread.thread_id = 5;
-            thread.object_id = 6;
-            thread.tls_address = KProcessAddress::new(0x5000);
-            thread.parent = Some(Arc::downgrade(&server_process));
-        }
-        server_process
-            .lock()
-            .unwrap()
-            .register_thread_object(Arc::clone(&server_thread));
-        server_process
-            .lock()
-            .unwrap()
-            .write_block(0x5010, &[0x11, 0x22, 0x33, 0x44]);
-
-        let reply_words = [1u32 << 16, 0, (4u32 << 16), 0x5010];
-        let reply_bytes: Vec<u8> = reply_words
-            .iter()
-            .flat_map(|word| word.to_le_bytes())
-            .collect();
-        server_process
-            .lock()
-            .unwrap()
-            .write_block(0x5000, &reply_bytes);
-
-        let client_buffer_words = [
-            0u32,
-            ((crate::hle::kernel::message_buffer::ReceiveListCountType::ToSingleBuffer as u32)
-                << 10)
-                | (4u32 << 20),
-            0,
-            0,
-            0x7000,
-            4u32 << 16,
-        ];
-        let client_buffer_bytes: Vec<u8> = client_buffer_words
-            .iter()
-            .flat_map(|word| word.to_le_bytes())
-            .collect();
-        client_process
-            .lock()
-            .unwrap()
-            .write_block(0x3000, &client_buffer_bytes);
-
-        let mut system = crate::core::System::new_for_test();
-        system.set_current_process_arc(Arc::clone(&server_process));
-        crate::hle::kernel::kernel::set_current_emu_thread(Some(&server_thread));
-
-        let request = Arc::new(Mutex::new(KSessionRequest::new()));
-        {
-            let mut request = request.lock().unwrap();
-            request.thread_id = Some(3);
-            request.client_process_id = Some(7);
-        }
-
-        let mut server = KServerSession::new();
-        server.initialize(0x1000);
-        server.current_request = Some(request);
-
-        assert_eq!(server.send_reply_with_message(0, 0, 0, false), 0);
-        assert_eq!(
-            client_process.lock().unwrap().read_block(0x7000, 4),
-            &[0x11, 0x22, 0x33, 0x44]
+        attach_process_page_table_for_session_test(
+            &mut server_process,
+            page_table_memory.memory.clone(),
+            0x0000,
+            0x10000,
+            KMemoryState::NORMAL,
+        );
+        attach_process_page_table_for_session_test(
+            &mut client_process,
+            page_table_memory.memory.clone(),
+            0x0000,
+            0x10000,
+            KMemoryState::NORMAL,
         );
 
-        crate::hle::kernel::kernel::set_current_emu_thread(None);
+        let server_phys = dram_memory_map::BASE + 0x10000;
+        let client_msg_phys = dram_memory_map::BASE + 0x20000;
+        let client_recv_phys = dram_memory_map::BASE + 0x30000;
+        map_process_page_for_session_test(&mut server_process, 0x5000, server_phys);
+        map_process_page_for_session_test(&mut client_process, 0x3000, client_msg_phys);
+        map_process_page_for_session_test(&mut client_process, 0x7000, client_recv_phys);
+        set_current_page_table_for_session_test(&mut server_process);
+
+        page_table_memory.write_phys(server_phys + 0x10, &[0x11, 0x22, 0x33, 0x44]);
+
+        let mut src_words = vec![0u32; MESSAGE_BUFFER_SIZE];
+        src_words[0] = 1u32 << 16;
+        src_words[2] = 4u32 << 16;
+        src_words[3] = 0x5010;
+        let (src_header, src_special_header) = KServerSession::parse_message_headers(&src_words);
+
+        let mut dst_words = vec![0u32; MESSAGE_BUFFER_SIZE];
+        dst_words[0] = 0;
+        dst_words[1] = ((crate::hle::kernel::message_buffer::ReceiveListCountType::ToSingleBuffer
+            as u32)
+            << 10)
+            | (4u32 << 20);
+        dst_words[4] = 0x7000;
+        dst_words[5] = 4u32 << 16;
+        let (dst_header, dst_special_header) = KServerSession::parse_message_headers(&dst_words);
+
+        let rc = KServerSession::process_send_message_pointer_descriptors(
+            &mut dst_words,
+            &src_words,
+            &src_header,
+            &src_special_header,
+            &dst_header,
+            &dst_special_header,
+            0x3000,
+            MESSAGE_BUFFER_SIZE * std::mem::size_of::<u32>(),
+            false,
+            &client_process.page_table,
+            &server_process.page_table,
+        );
+
+        assert_eq!(rc, crate::hle::result::RESULT_SUCCESS.get_inner_value());
+        assert_eq!(
+            page_table_memory.read_phys(client_recv_phys, 4),
+            vec![0x11, 0x22, 0x33, 0x44]
+        );
+    }
+
+    #[test]
+    fn process_receive_message_pointer_descriptors_linear_to_user_uses_page_table_copy() {
+        let mut page_table_memory = SessionPageTableMemoryForTest::new(0x50000);
+        let mut server_process = crate::hle::kernel::k_process::KProcess::new();
+        server_process.process_id = 8;
+        let mut client_process = crate::hle::kernel::k_process::KProcess::new();
+        client_process.process_id = 7;
+
+        attach_process_page_table_for_session_test(
+            &mut server_process,
+            page_table_memory.memory.clone(),
+            0x0000,
+            0x10000,
+            KMemoryState::NORMAL,
+        );
+        attach_process_page_table_for_session_test(
+            &mut client_process,
+            page_table_memory.memory.clone(),
+            0x0000,
+            0x10000,
+            KMemoryState::NORMAL,
+        );
+
+        let server_msg_phys = dram_memory_map::BASE + 0x10000;
+        let server_recv_phys = dram_memory_map::BASE + 0x20000;
+        let client_msg_phys = dram_memory_map::BASE + 0x30000;
+        map_process_page_for_session_test(&mut server_process, 0x5000, server_msg_phys);
+        map_process_page_for_session_test(&mut server_process, 0x6000, server_recv_phys);
+        map_process_page_for_session_test(&mut client_process, 0x3000, client_msg_phys);
+        set_current_page_table_for_session_test(&mut server_process);
+
+        page_table_memory.write_phys(client_msg_phys + 0x10, &[0xAA, 0xBB, 0xCC, 0xDD]);
+
+        let mut src_words = vec![0u32; MESSAGE_BUFFER_SIZE];
+        src_words[0] = 1u32 << 16;
+        src_words[2] = 4u32 << 16;
+        src_words[3] = 0x3010;
+        let (src_header, src_special_header) = KServerSession::parse_message_headers(&src_words);
+
+        let mut dst_words = vec![0u32; MESSAGE_BUFFER_SIZE];
+        dst_words[1] = ((crate::hle::kernel::message_buffer::ReceiveListCountType::ToSingleBuffer
+            as u32)
+            << 10)
+            | (4u32 << 20);
+        dst_words[4] = 0x6000;
+        dst_words[5] = 4u32 << 16;
+        let (dst_header, dst_special_header) = KServerSession::parse_message_headers(&dst_words);
+
+        let rc = KServerSession::process_receive_message_pointer_descriptors(
+            &mut dst_words,
+            &src_words,
+            &src_header,
+            &src_special_header,
+            &dst_header,
+            &dst_special_header,
+            0x5000,
+            MESSAGE_BUFFER_SIZE * std::mem::size_of::<u32>(),
+            false,
+            &server_process.page_table,
+            &client_process.page_table,
+        );
+
+        assert_eq!(rc, crate::hle::result::RESULT_SUCCESS.get_inner_value());
+        assert_eq!(
+            page_table_memory.read_phys(server_recv_phys, 4),
+            vec![0xAA, 0xBB, 0xCC, 0xDD]
+        );
+    }
+
+    #[test]
+    fn process_receive_message_pointer_descriptors_to_message_buffer_uses_heap_to_heap() {
+        let mut page_table_memory = SessionPageTableMemoryForTest::new(0x50000);
+        let mut server_process = crate::hle::kernel::k_process::KProcess::new();
+        server_process.process_id = 8;
+        let mut client_process = crate::hle::kernel::k_process::KProcess::new();
+        client_process.process_id = 7;
+
+        attach_process_page_table_for_session_test(
+            &mut server_process,
+            page_table_memory.memory.clone(),
+            0x0000,
+            0x10000,
+            KMemoryState::NORMAL,
+        );
+        attach_process_page_table_for_session_test(
+            &mut client_process,
+            page_table_memory.memory.clone(),
+            0x0000,
+            0x10000,
+            KMemoryState::NORMAL,
+        );
+        server_process
+            .page_table
+            .get_base_mut()
+            .m_memory_block_manager
+            .update(
+                0x5000,
+                1,
+                KMemoryState::NORMAL,
+                KMemoryPermission::NOT_MAPPED | KMemoryPermission::KERNEL_READ_WRITE,
+                KMemoryAttribute::LOCKED,
+                KMemoryBlockDisableMergeAttribute::NONE,
+                KMemoryBlockDisableMergeAttribute::NONE,
+            );
+
+        let server_msg_phys = dram_memory_map::BASE + 0x10000;
+        let client_msg_phys = dram_memory_map::BASE + 0x30000;
+        map_process_page_for_session_test(&mut server_process, 0x5000, server_msg_phys);
+        map_process_page_for_session_test(&mut client_process, 0x3000, client_msg_phys);
+        set_current_page_table_for_session_test(&mut server_process);
+
+        page_table_memory.write_phys(client_msg_phys + 0x10, &[0x10, 0x20, 0x30, 0x40]);
+
+        let mut src_words = vec![0u32; MESSAGE_BUFFER_SIZE];
+        src_words[0] = 1u32 << 16;
+        src_words[2] = 4u32 << 16;
+        src_words[3] = 0x3010;
+        let (src_header, src_special_header) = KServerSession::parse_message_headers(&src_words);
+
+        let mut dst_words = vec![0u32; MESSAGE_BUFFER_SIZE];
+        dst_words[1] = (crate::hle::kernel::message_buffer::ReceiveListCountType::ToMessageBuffer
+            as u32)
+            << 10;
+        let (dst_header, dst_special_header) = KServerSession::parse_message_headers(&dst_words);
+
+        let rc = KServerSession::process_receive_message_pointer_descriptors(
+            &mut dst_words,
+            &src_words,
+            &src_header,
+            &src_special_header,
+            &dst_header,
+            &dst_special_header,
+            0x5000,
+            MESSAGE_BUFFER_SIZE * std::mem::size_of::<u32>(),
+            true,
+            &server_process.page_table,
+            &client_process.page_table,
+        );
+
+        assert_eq!(rc, crate::hle::result::RESULT_SUCCESS.get_inner_value());
+        let recv_pointer = 0x5010u64;
+        assert_eq!(
+            page_table_memory.read_phys(server_msg_phys + 0x10, 4),
+            vec![0x10, 0x20, 0x30, 0x40]
+        );
+        assert_eq!(dst_words[2] & 0xFFFF_0000, 4u32 << 16);
+        assert_eq!(dst_words[3], recv_pointer as u32);
+    }
+
+    #[test]
+    fn process_send_message_raw_data_from_user_source_uses_page_table_copy() {
+        let mut page_table_memory = SessionPageTableMemoryForTest::new(0x40000);
+        let mut client_process = crate::hle::kernel::k_process::KProcess::new();
+        client_process.process_id = 7;
+
+        attach_process_page_table_for_session_test(
+            &mut client_process,
+            page_table_memory.memory.clone(),
+            0x0000,
+            0x10000,
+            KMemoryState::NORMAL,
+        );
+
+        let client_phys = dram_memory_map::BASE + 0x20000;
+        map_process_page_for_session_test(&mut client_process, 0x3000, client_phys);
+
+        let mut src_words = vec![0u32; MESSAGE_BUFFER_SIZE];
+        {
+            let mut message = MessageBuffer::new(&mut src_words);
+            let header = crate::hle::kernel::message_buffer::MessageHeader::new(
+                0x4321,
+                false,
+                0,
+                0,
+                0,
+                0,
+                2,
+                crate::hle::kernel::message_buffer::ReceiveListCountType::None as u32,
+            );
+            let mut offset = message.set_message_header(&header);
+            offset = message.set(offset, &[0x1111_2222, 0x3333_4444]);
+            assert_eq!(offset, 4);
+        }
+        let (src_header, src_special_header) = KServerSession::parse_message_headers(&src_words);
+        let mut dst_words = vec![0u32; MESSAGE_BUFFER_SIZE];
+
+        let rc = KServerSession::process_send_message_raw_data(
+            &mut dst_words,
+            &src_words,
+            &src_header,
+            &src_special_header,
+            &client_process.page_table,
+            0x3000,
+            false,
+            0x5000,
+            true,
+        );
+
+        assert_eq!(rc, crate::hle::result::RESULT_SUCCESS.get_inner_value());
+        assert_eq!(
+            page_table_memory.read_phys(client_phys + 8, 8),
+            src_words[2..4]
+                .iter()
+                .flat_map(|word| word.to_le_bytes())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn process_send_message_raw_data_user_to_user_uses_heap_slow_path() {
+        let mut page_table_memory = SessionPageTableMemoryForTest::new(0x70000);
+        let mut client_process = crate::hle::kernel::k_process::KProcess::new();
+        client_process.process_id = 7;
+
+        attach_process_page_table_for_session_test(
+            &mut client_process,
+            page_table_memory.memory.clone(),
+            0x0000,
+            0x10000,
+            KMemoryState::NORMAL,
+        );
+        client_process
+            .page_table
+            .get_base_mut()
+            .m_memory_block_manager
+            .update(
+                0x3000,
+                2,
+                KMemoryState::NORMAL,
+                KMemoryPermission::NOT_MAPPED | KMemoryPermission::KERNEL_READ_WRITE,
+                KMemoryAttribute::NONE,
+                KMemoryBlockDisableMergeAttribute::NONE,
+                KMemoryBlockDisableMergeAttribute::NONE,
+            );
+        client_process
+            .page_table
+            .get_base_mut()
+            .m_memory_block_manager
+            .update(
+                0x5000,
+                2,
+                KMemoryState::NORMAL,
+                KMemoryPermission::NOT_MAPPED | KMemoryPermission::KERNEL_READ,
+                KMemoryAttribute::LOCKED,
+                KMemoryBlockDisableMergeAttribute::NONE,
+                KMemoryBlockDisableMergeAttribute::NONE,
+            );
+
+        let dst_phys = dram_memory_map::BASE + 0x20000;
+        let src_phys = dram_memory_map::BASE + 0x40000;
+        for page in 0..2 {
+            map_process_page_for_session_test(
+                &mut client_process,
+                0x3000 + page * PAGE_SIZE,
+                dst_phys + (page * PAGE_SIZE) as u64,
+            );
+            map_process_page_for_session_test(
+                &mut client_process,
+                0x5000 + page * PAGE_SIZE,
+                src_phys + (page * PAGE_SIZE) as u64,
+            );
+        }
+
+        let raw_count = 1023usize;
+        let raw_size = raw_count * std::mem::size_of::<u32>();
+        let fast_size = PAGE_SIZE - 2 * std::mem::size_of::<u32>();
+        let slow_size = raw_size - fast_size;
+        let mut src_words = vec![0u32; MESSAGE_BUFFER_SIZE.max(raw_count + 2)];
+        {
+            let mut message = MessageBuffer::new(&mut src_words);
+            let header = crate::hle::kernel::message_buffer::MessageHeader::new(
+                0x4321,
+                false,
+                0,
+                0,
+                0,
+                0,
+                raw_count as i32,
+                crate::hle::kernel::message_buffer::ReceiveListCountType::None as u32,
+            );
+            let mut offset = message.set_message_header(&header);
+            for index in 0..raw_count {
+                offset = message.set(offset, &[0xA500_0000 | index as u32]);
+            }
+            assert_eq!(offset, raw_count + 2);
+        }
+        let slow_bytes: Vec<u8> = src_words[2 + fast_size / 4..2 + raw_count]
+            .iter()
+            .flat_map(|word| word.to_le_bytes())
+            .collect();
+        page_table_memory.write_phys(src_phys + PAGE_SIZE as u64, &slow_bytes);
+
+        let (src_header, src_special_header) = KServerSession::parse_message_headers(&src_words);
+        let mut dst_words = vec![0u32; src_words.len()];
+
+        let rc = KServerSession::process_send_message_raw_data(
+            &mut dst_words,
+            &src_words,
+            &src_header,
+            &src_special_header,
+            &client_process.page_table,
+            0x3000,
+            true,
+            0x5000,
+            true,
+        );
+
+        assert_eq!(rc, crate::hle::result::RESULT_SUCCESS.get_inner_value());
+        assert_eq!(
+            page_table_memory.read_phys(dst_phys + PAGE_SIZE as u64, slow_size),
+            slow_bytes
+        );
+    }
+
+    #[test]
+    fn process_send_message_raw_data_from_tls_source_to_user_destination_uses_page_table_copy() {
+        let mut page_table_memory = SessionPageTableMemoryForTest::new(0x50000);
+        let mut client_process = crate::hle::kernel::k_process::KProcess::new();
+        client_process.process_id = 7;
+        let mut server_process = crate::hle::kernel::k_process::KProcess::new();
+        server_process.process_id = 8;
+
+        attach_process_page_table_for_session_test(
+            &mut client_process,
+            page_table_memory.memory.clone(),
+            0x0000,
+            0x10000,
+            KMemoryState::NORMAL,
+        );
+        attach_process_page_table_for_session_test(
+            &mut server_process,
+            page_table_memory.memory.clone(),
+            0x0000,
+            0x10000,
+            KMemoryState::NORMAL,
+        );
+        client_process
+            .page_table
+            .get_base_mut()
+            .m_memory_block_manager
+            .update(
+                0x3000,
+                1,
+                KMemoryState::NORMAL,
+                KMemoryPermission::NOT_MAPPED | KMemoryPermission::KERNEL_READ_WRITE,
+                KMemoryAttribute::NONE,
+                KMemoryBlockDisableMergeAttribute::NONE,
+                KMemoryBlockDisableMergeAttribute::NONE,
+            );
+
+        let client_phys = dram_memory_map::BASE + 0x20000;
+        let server_phys = dram_memory_map::BASE + 0x30000;
+        map_process_page_for_session_test(&mut client_process, 0x3000, client_phys);
+        map_process_page_for_session_test(&mut server_process, 0x5000, server_phys);
+        set_current_page_table_for_session_test(&mut server_process);
+
+        let mut src_words = vec![0u32; MESSAGE_BUFFER_SIZE];
+        {
+            let mut message = MessageBuffer::new(&mut src_words);
+            let header = crate::hle::kernel::message_buffer::MessageHeader::new(
+                0x4321,
+                false,
+                0,
+                0,
+                0,
+                0,
+                2,
+                crate::hle::kernel::message_buffer::ReceiveListCountType::None as u32,
+            );
+            let mut offset = message.set_message_header(&header);
+            offset = message.set(offset, &[0xCAFE_BABE, 0xDEAD_BEEF]);
+            assert_eq!(offset, 4);
+        }
+        let source_bytes: Vec<u8> = src_words[2..4]
+            .iter()
+            .flat_map(|word| word.to_le_bytes())
+            .collect();
+        page_table_memory.write_phys(server_phys + 8, &source_bytes);
+
+        let (src_header, src_special_header) = KServerSession::parse_message_headers(&src_words);
+        let mut dst_words = vec![0u32; MESSAGE_BUFFER_SIZE];
+
+        let rc = KServerSession::process_send_message_raw_data(
+            &mut dst_words,
+            &src_words,
+            &src_header,
+            &src_special_header,
+            &client_process.page_table,
+            0x3000,
+            true,
+            0x5000,
+            false,
+        );
+
+        assert_eq!(rc, crate::hle::result::RESULT_SUCCESS.get_inner_value());
+        assert_eq!(
+            page_table_memory.read_phys(client_phys + 8, source_bytes.len()),
+            source_bytes
+        );
+    }
+
+    #[test]
+    fn process_receive_message_raw_data_from_user_source_to_tls_destination_uses_page_table_copy() {
+        let mut page_table_memory = SessionPageTableMemoryForTest::new(0x50000);
+        let mut server_process = crate::hle::kernel::k_process::KProcess::new();
+        server_process.process_id = 8;
+        let mut client_process = crate::hle::kernel::k_process::KProcess::new();
+        client_process.process_id = 7;
+
+        attach_process_page_table_for_session_test(
+            &mut server_process,
+            page_table_memory.memory.clone(),
+            0x0000,
+            0x10000,
+            KMemoryState::NORMAL,
+        );
+        attach_process_page_table_for_session_test(
+            &mut client_process,
+            page_table_memory.memory.clone(),
+            0x0000,
+            0x10000,
+            KMemoryState::NORMAL,
+        );
+        client_process
+            .page_table
+            .get_base_mut()
+            .m_memory_block_manager
+            .update(
+                0x3000,
+                1,
+                KMemoryState::NORMAL,
+                KMemoryPermission::NOT_MAPPED | KMemoryPermission::KERNEL_READ,
+                KMemoryAttribute::NONE,
+                KMemoryBlockDisableMergeAttribute::NONE,
+                KMemoryBlockDisableMergeAttribute::NONE,
+            );
+
+        let server_phys = dram_memory_map::BASE + 0x20000;
+        let client_phys = dram_memory_map::BASE + 0x30000;
+        map_process_page_for_session_test(&mut server_process, 0x5000, server_phys);
+        map_process_page_for_session_test(&mut client_process, 0x3000, client_phys);
+        set_current_page_table_for_session_test(&mut server_process);
+
+        let mut src_words = vec![0u32; MESSAGE_BUFFER_SIZE];
+        {
+            let mut message = MessageBuffer::new(&mut src_words);
+            let header = crate::hle::kernel::message_buffer::MessageHeader::new(
+                0x1234,
+                false,
+                0,
+                0,
+                0,
+                0,
+                2,
+                crate::hle::kernel::message_buffer::ReceiveListCountType::None as u32,
+            );
+            let mut offset = message.set_message_header(&header);
+            offset = message.set(offset, &[0x0102_0304, 0xAABB_CCDD]);
+            assert_eq!(offset, 4);
+        }
+        let source_bytes: Vec<u8> = src_words[2..4]
+            .iter()
+            .flat_map(|word| word.to_le_bytes())
+            .collect();
+        page_table_memory.write_phys(client_phys + 8, &source_bytes);
+
+        let (src_header, src_special_header) = KServerSession::parse_message_headers(&src_words);
+        let mut dst_words = vec![0u32; MESSAGE_BUFFER_SIZE];
+
+        let rc = KServerSession::process_receive_message_raw_data(
+            &mut dst_words,
+            &src_words,
+            &src_header,
+            &src_special_header,
+            &server_process.page_table,
+            0x5000,
+            false,
+            &client_process.page_table,
+            0x3000,
+            true,
+        );
+
+        assert_eq!(rc, crate::hle::result::RESULT_SUCCESS.get_inner_value());
+        assert_eq!(
+            page_table_memory.read_phys(server_phys + 8, source_bytes.len()),
+            source_bytes
+        );
+    }
+
+    #[test]
+    fn process_receive_message_raw_data_from_tls_source_to_user_destination_uses_linear_kernel_copy(
+    ) {
+        let mut page_table_memory = SessionPageTableMemoryForTest::new(0x50000);
+        let mut server_process = crate::hle::kernel::k_process::KProcess::new();
+        server_process.process_id = 8;
+        let mut client_process = crate::hle::kernel::k_process::KProcess::new();
+        client_process.process_id = 7;
+
+        attach_process_page_table_for_session_test(
+            &mut server_process,
+            page_table_memory.memory.clone(),
+            0x0000,
+            0x10000,
+            KMemoryState::NORMAL,
+        );
+        attach_process_page_table_for_session_test(
+            &mut client_process,
+            page_table_memory.memory.clone(),
+            0x0000,
+            0x10000,
+            KMemoryState::NORMAL,
+        );
+
+        let client_phys = dram_memory_map::BASE + 0x30000;
+        map_process_page_for_session_test(&mut client_process, 0x3000, client_phys);
+
+        let mut src_words = vec![0u32; MESSAGE_BUFFER_SIZE];
+        {
+            let mut message = MessageBuffer::new(&mut src_words);
+            let header = crate::hle::kernel::message_buffer::MessageHeader::new(
+                0x1234,
+                false,
+                0,
+                0,
+                0,
+                0,
+                2,
+                crate::hle::kernel::message_buffer::ReceiveListCountType::None as u32,
+            );
+            let mut offset = message.set_message_header(&header);
+            offset = message.set(offset, &[0x1122_3344, 0x5566_7788]);
+            assert_eq!(offset, 4);
+        }
+        let source_bytes: Vec<u8> = src_words[2..4]
+            .iter()
+            .flat_map(|word| word.to_le_bytes())
+            .collect();
+        page_table_memory.write_phys(client_phys + 8, &source_bytes);
+
+        let (src_header, src_special_header) = KServerSession::parse_message_headers(&src_words);
+        let mut dst_words = vec![0u32; MESSAGE_BUFFER_SIZE];
+
+        let rc = KServerSession::process_receive_message_raw_data(
+            &mut dst_words,
+            &src_words,
+            &src_header,
+            &src_special_header,
+            &server_process.page_table,
+            0x5000,
+            true,
+            &client_process.page_table,
+            0x3000,
+            false,
+        );
+
+        assert_eq!(rc, crate::hle::result::RESULT_SUCCESS.get_inner_value());
+        assert_eq!(&dst_words[2..4], &src_words[2..4]);
+    }
+
+    #[test]
+    fn process_receive_message_raw_data_user_to_user_uses_heap_slow_path() {
+        let mut page_table_memory = SessionPageTableMemoryForTest::new(0x70000);
+        let mut server_process = crate::hle::kernel::k_process::KProcess::new();
+        server_process.process_id = 8;
+        let mut client_process = crate::hle::kernel::k_process::KProcess::new();
+        client_process.process_id = 7;
+
+        attach_process_page_table_for_session_test(
+            &mut server_process,
+            page_table_memory.memory.clone(),
+            0x0000,
+            0x10000,
+            KMemoryState::NORMAL,
+        );
+        attach_process_page_table_for_session_test(
+            &mut client_process,
+            page_table_memory.memory.clone(),
+            0x0000,
+            0x10000,
+            KMemoryState::NORMAL,
+        );
+        server_process
+            .page_table
+            .get_base_mut()
+            .m_memory_block_manager
+            .update(
+                0x5000,
+                2,
+                KMemoryState::NORMAL,
+                KMemoryPermission::NOT_MAPPED | KMemoryPermission::KERNEL_READ_WRITE,
+                KMemoryAttribute::LOCKED,
+                KMemoryBlockDisableMergeAttribute::NONE,
+                KMemoryBlockDisableMergeAttribute::NONE,
+            );
+        client_process
+            .page_table
+            .get_base_mut()
+            .m_memory_block_manager
+            .update(
+                0x3000,
+                2,
+                KMemoryState::NORMAL,
+                KMemoryPermission::NOT_MAPPED | KMemoryPermission::KERNEL_READ,
+                KMemoryAttribute::NONE,
+                KMemoryBlockDisableMergeAttribute::NONE,
+                KMemoryBlockDisableMergeAttribute::NONE,
+            );
+
+        let server_phys = dram_memory_map::BASE + 0x20000;
+        let client_phys = dram_memory_map::BASE + 0x40000;
+        for page in 0..2 {
+            map_process_page_for_session_test(
+                &mut server_process,
+                0x5000 + page * PAGE_SIZE,
+                server_phys + (page * PAGE_SIZE) as u64,
+            );
+            map_process_page_for_session_test(
+                &mut client_process,
+                0x3000 + page * PAGE_SIZE,
+                client_phys + (page * PAGE_SIZE) as u64,
+            );
+        }
+
+        let raw_count = 1023usize;
+        let raw_size = raw_count * std::mem::size_of::<u32>();
+        let fast_size = PAGE_SIZE - 2 * std::mem::size_of::<u32>();
+        let slow_size = raw_size - fast_size;
+        let mut src_words = vec![0u32; MESSAGE_BUFFER_SIZE.max(raw_count + 2)];
+        {
+            let mut message = MessageBuffer::new(&mut src_words);
+            let header = crate::hle::kernel::message_buffer::MessageHeader::new(
+                0x1234,
+                false,
+                0,
+                0,
+                0,
+                0,
+                raw_count as i32,
+                crate::hle::kernel::message_buffer::ReceiveListCountType::None as u32,
+            );
+            let mut offset = message.set_message_header(&header);
+            for index in 0..raw_count {
+                offset = message.set(offset, &[0x5A00_0000 | index as u32]);
+            }
+            assert_eq!(offset, raw_count + 2);
+        }
+        let slow_bytes: Vec<u8> = src_words[2 + fast_size / 4..2 + raw_count]
+            .iter()
+            .flat_map(|word| word.to_le_bytes())
+            .collect();
+        page_table_memory.write_phys(client_phys + PAGE_SIZE as u64, &slow_bytes);
+
+        let (src_header, src_special_header) = KServerSession::parse_message_headers(&src_words);
+        let mut dst_words = vec![0u32; src_words.len()];
+
+        let rc = KServerSession::process_receive_message_raw_data(
+            &mut dst_words,
+            &src_words,
+            &src_header,
+            &src_special_header,
+            &server_process.page_table,
+            0x5000,
+            true,
+            &client_process.page_table,
+            0x3000,
+            true,
+        );
+
+        assert_eq!(rc, crate::hle::result::RESULT_SUCCESS.get_inner_value());
+        assert_eq!(
+            page_table_memory.read_phys(server_phys + PAGE_SIZE as u64, slow_size),
+            slow_bytes
+        );
     }
 
     #[test]
@@ -3941,57 +5556,126 @@ mod tests {
 
     #[test]
     fn process_send_message_receive_mapping_skips_aligned_middle_pages() {
+        let mut page_table_memory = SessionPageTableMemoryForTest::new(0x40000);
         let mut src_process = KProcess::new();
         let mut dst_process = KProcess::new();
 
         let src_addr = 0x4000u64;
         let dst_addr = 0x8000u64;
         let size = PAGE_SIZE * 2;
+        let src_phys = dram_memory_map::BASE + 0x10000;
+        let dst_phys = dram_memory_map::BASE + 0x20000;
 
-        src_process.write_block(src_addr, &vec![0xAA; size]);
-        dst_process.write_block(dst_addr, &vec![0x55; size]);
-
-        KServerSession::process_send_message_receive_mapping(
-            &src_process,
+        attach_process_page_table_for_session_test(
+            &mut src_process,
+            page_table_memory.memory.clone(),
+            0x0000,
+            0x10000,
+            KMemoryState::NORMAL,
+        );
+        attach_process_page_table_for_session_test(
             &mut dst_process,
+            page_table_memory.memory.clone(),
+            0x0000,
+            0x10000,
+            KMemoryState::IPC,
+        );
+        for page in 0..2 {
+            map_process_page_for_session_test(
+                &mut src_process,
+                src_addr as usize + page * PAGE_SIZE,
+                src_phys + (page * PAGE_SIZE) as u64,
+            );
+            map_process_page_for_session_test(
+                &mut dst_process,
+                dst_addr as usize + page * PAGE_SIZE,
+                dst_phys + (page * PAGE_SIZE) as u64,
+            );
+        }
+        set_current_page_table_for_session_test(&mut src_process);
+
+        page_table_memory.write_phys(src_phys, &vec![0xAA; size]);
+        page_table_memory.write_phys(dst_phys, &vec![0x55; size]);
+
+        let rc = KServerSession::process_send_message_receive_mapping(
+            &src_process.page_table,
+            &dst_process.page_table,
             KProcessAddress::new(dst_addr),
             KProcessAddress::new(src_addr),
             size,
             KMemoryState::IPC,
         );
 
-        assert_eq!(dst_process.read_block(dst_addr, size), vec![0x55; size]);
+        assert_eq!(rc, crate::hle::result::RESULT_SUCCESS.get_inner_value());
+        assert_eq!(
+            page_table_memory.read_phys(dst_phys, size),
+            vec![0x55; size]
+        );
     }
 
     #[test]
     fn process_send_message_receive_mapping_copies_only_unaligned_edges() {
+        let mut page_table_memory = SessionPageTableMemoryForTest::new(0x50000);
         let mut src_process = KProcess::new();
         let mut dst_process = KProcess::new();
 
         let src_addr = 0x5003u64;
         let dst_addr = 0x9003u64;
         let size = PAGE_SIZE * 2;
+        let src_map_addr = 0x5000usize;
+        let dst_map_addr = 0x9000usize;
+        let src_phys = dram_memory_map::BASE + 0x10000;
+        let dst_phys = dram_memory_map::BASE + 0x30000;
+
+        attach_process_page_table_for_session_test(
+            &mut src_process,
+            page_table_memory.memory.clone(),
+            0x0000,
+            0x10000,
+            KMemoryState::NORMAL,
+        );
+        attach_process_page_table_for_session_test(
+            &mut dst_process,
+            page_table_memory.memory.clone(),
+            0x0000,
+            0x10000,
+            KMemoryState::IPC,
+        );
+        for page in 0..3 {
+            map_process_page_for_session_test(
+                &mut src_process,
+                src_map_addr + page * PAGE_SIZE,
+                src_phys + (page * PAGE_SIZE) as u64,
+            );
+            map_process_page_for_session_test(
+                &mut dst_process,
+                dst_map_addr + page * PAGE_SIZE,
+                dst_phys + (page * PAGE_SIZE) as u64,
+            );
+        }
+        set_current_page_table_for_session_test(&mut src_process);
 
         let mut src_bytes = vec![0x11; size];
         src_bytes[..PAGE_SIZE - 3].fill(0xAA);
         src_bytes[PAGE_SIZE - 3..PAGE_SIZE + 3].fill(0x11);
         src_bytes[PAGE_SIZE + 3..].fill(0xCC);
-        src_process.write_block(src_addr, &src_bytes);
-        dst_process.write_block(dst_addr, &vec![0x55; size]);
+        page_table_memory.write_phys(src_phys + 3, &src_bytes);
+        page_table_memory.write_phys(dst_phys + 3, &vec![0x55; size]);
 
-        KServerSession::process_send_message_receive_mapping(
-            &src_process,
-            &mut dst_process,
+        let rc = KServerSession::process_send_message_receive_mapping(
+            &src_process.page_table,
+            &dst_process.page_table,
             KProcessAddress::new(dst_addr),
             KProcessAddress::new(src_addr),
             size,
             KMemoryState::IPC,
         );
 
-        let copied = dst_process.read_block(dst_addr, size);
+        assert_eq!(rc, crate::hle::result::RESULT_SUCCESS.get_inner_value());
+        let copied = page_table_memory.read_phys(dst_phys + 3, size);
         assert_eq!(&copied[..PAGE_SIZE - 3], &vec![0xAA; PAGE_SIZE - 3]);
-        assert_eq!(&copied[PAGE_SIZE - 3..PAGE_SIZE + 3], &vec![0x55; 6]);
-        assert_eq!(&copied[PAGE_SIZE + 3..], &vec![0xCC; PAGE_SIZE - 3]);
+        assert_eq!(&copied[PAGE_SIZE - 3..size - 3], &vec![0x55; PAGE_SIZE]);
+        assert_eq!(&copied[size - 3..], &vec![0xCC; 3]);
     }
 
     #[test]

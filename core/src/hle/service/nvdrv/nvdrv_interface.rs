@@ -1061,15 +1061,21 @@ impl NvdrvService {
             }
         }
         drop(interface);
-        let copy_handle = maybe_event.and_then(|event| ctx.copy_handle_for_readable_event(event));
-
-        if let Some(handle) = copy_handle {
-            let mut rb = ResponseBuilder::new(ctx, 3, 1, 0);
-            rb.push_result(RESULT_SUCCESS);
-            rb.push_copy_objects(handle);
-            rb.push_u32(nv_result as u32);
-        } else {
-            Self::push_nv_result(ctx, nv_result);
+        match (nv_result, maybe_event) {
+            (NvResult::Success, Some(event)) => {
+                if let Some(object_id) = ctx.register_readable_event_object(event) {
+                    let mut rb = ResponseBuilder::new(ctx, 3, 1, 0);
+                    rb.push_result(RESULT_SUCCESS);
+                    rb.push_copy_object_id(object_id);
+                    rb.push_u32(NvResult::Success as u32);
+                } else {
+                    log::error!("NVDRV::QueryEvent could not register readable event object");
+                    Self::push_nv_result(ctx, NvResult::BadParameter);
+                }
+            }
+            (result, _) => {
+                Self::push_nv_result(ctx, result);
+            }
         }
     }
 
