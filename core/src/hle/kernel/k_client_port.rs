@@ -20,6 +20,8 @@ use super::k_scoped_resource_reservation::KScopedResourceReservation;
 use super::k_session::KSession;
 use super::kernel::KernelCore;
 use super::svc::svc_results::{RESULT_LIMIT_REACHED, RESULT_OUT_OF_SESSIONS};
+use crate::hle::kernel::k_scheduler_lock::KScopedSchedulerLock;
+use crate::hle::kernel::k_synchronization_object::SynchronizationObjectState;
 use crate::hle::result::ResultCode;
 
 /// The client port object.
@@ -37,16 +39,23 @@ pub struct KClientPort {
     pub num_sessions: AtomicI32,
     pub peak_sessions: AtomicI32,
     pub max_sessions: i32,
+    pub sync_object: SynchronizationObjectState,
     // Note: upstream has `KPort* m_parent` for back-navigation.
     // Omitted because KPort owns KClientPort inline; callers navigate via parent.
 }
 
 impl KClientPort {
+    fn lock_scheduler() -> Option<KScopedSchedulerLock<'static>> {
+        let scheduler_lock = crate::hle::kernel::kernel::scheduler_lock()?;
+        Some(KScopedSchedulerLock::new(scheduler_lock))
+    }
+
     pub fn new() -> Self {
         Self {
             num_sessions: AtomicI32::new(0),
             peak_sessions: AtomicI32::new(0),
             max_sessions: 0,
+            sync_object: SynchronizationObjectState::new(),
         }
     }
 
@@ -73,8 +82,12 @@ impl KClientPort {
     /// Called when a session is finalized.
     ///
     /// Matches upstream `KClientPort::OnSessionFinalized()`.
-    pub fn on_session_finalized(&self) {
-        self.num_sessions.fetch_sub(1, Ordering::Relaxed);
+    pub fn on_session_finalized(&self, object_id: u64) {
+        let _scheduler_guard = Self::lock_scheduler();
+        let prev = self.num_sessions.fetch_sub(1, Ordering::Relaxed);
+        if prev == self.max_sessions {
+            self.notify_available(object_id);
+        }
     }
 
     /// Called when the server side is closed.
@@ -91,6 +104,19 @@ impl KClientPort {
         self.num_sessions.load(Ordering::Relaxed) < self.max_sessions
     }
 
+    fn notify_available(&self, object_id: u64) {
+        if !self.is_signaled() {
+            return;
+        }
+        unsafe {
+            crate::hle::kernel::k_synchronization_object::notify_waiters_on_state(
+                &self.sync_object,
+                object_id,
+                crate::hle::result::RESULT_SUCCESS.get_inner_value(),
+            );
+        }
+    }
+
     /// Create a new session via this client port.
     /// Port of upstream `KClientPort::CreateSession`.
     ///
@@ -101,6 +127,7 @@ impl KClientPort {
         &self,
         process: &mut KProcess,
         kernel: &KernelCore,
+        client_port_object_id: Option<u64>,
         port_name: usize,
     ) -> Result<(u64, u64), ResultCode> {
         let mut session_reservation = KScopedResourceReservation::new(
@@ -155,7 +182,7 @@ impl KClientPort {
         let session = std::sync::Arc::new(std::sync::Mutex::new(KSession::new()));
         {
             let mut session_guard = session.lock().unwrap();
-            session_guard.initialize(None, port_name);
+            session_guard.initialize(client_port_object_id, port_name);
             session_guard
                 .get_client_session()
                 .lock()
@@ -176,6 +203,7 @@ impl KClientPort {
             session_object_id,
         );
 
+        session.lock().unwrap().mark_session_resource_committed();
         session_reservation.commit();
         Ok((session_object_id, client_session_object_id))
     }
@@ -315,7 +343,7 @@ mod tests {
 
         let (session_object_id, client_session_object_id) = port
             .client
-            .create_session(&mut process.lock().unwrap(), kernel, port.get_name())
+            .create_session(&mut process.lock().unwrap(), kernel, None, port.get_name())
             .unwrap();
 
         let process_guard = process.lock().unwrap();
@@ -357,5 +385,45 @@ mod tests {
         assert!(process_guard
             .get_light_client_session_by_object_id(client_session_object_id)
             .is_some());
+    }
+
+    #[test]
+    fn on_session_finalized_reopens_saturated_client_port() {
+        let mut system = System::new_for_test();
+        let process = std::sync::Arc::new(ProcessLock::from_value(KProcess::new()));
+        {
+            let mut process_guard = process.lock().unwrap();
+            process_guard.process_id = 1;
+            process_guard.initialize_handle_table();
+        }
+        system.set_current_process_arc(process.clone());
+
+        let object_id = 0x1234;
+        let port = std::sync::Arc::new(std::sync::Mutex::new(KPort::new()));
+        {
+            let mut port_guard = port.lock().unwrap();
+            port_guard.initialize(1, false, 0x66);
+            port_guard.client.num_sessions.store(1, Ordering::Relaxed);
+        }
+        process
+            .lock()
+            .unwrap()
+            .register_client_port_object(object_id, port.clone());
+
+        assert!(
+            !crate::hle::kernel::k_synchronization_object::is_object_signaled(
+                &process.lock().unwrap(),
+                object_id
+            )
+        );
+
+        port.lock().unwrap().client.on_session_finalized(object_id);
+
+        assert!(
+            crate::hle::kernel::k_synchronization_object::is_object_signaled(
+                &process.lock().unwrap(),
+                object_id
+            )
+        );
     }
 }

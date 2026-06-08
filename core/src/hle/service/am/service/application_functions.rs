@@ -554,15 +554,15 @@ impl IApplicationFunctions {
         log::warn!("(STUBBED) GetGpuErrorDetectedSystemEvent called");
         let service =
             unsafe { &*(this as *const dyn ServiceFramework as *const IApplicationFunctions) };
-        let handle = service
+        let object_id = service
             .applet
             .lock()
             .unwrap()
-            .ensure_gpu_error_detected_system_event(ctx)
+            .ensure_gpu_error_detected_system_event_object_id(ctx)
             .unwrap_or(0);
         let mut rb = ResponseBuilder::new(ctx, 2, 1, 0);
         rb.push_result(RESULT_SUCCESS);
-        rb.push_copy_objects(handle);
+        rb.push_copy_object_id(object_id);
     }
 
     /// GetFriendInvitationStorageChannelEvent (cmd 120): returns an event handle
@@ -573,15 +573,15 @@ impl IApplicationFunctions {
         log::warn!("(STUBBED) GetFriendInvitationStorageChannelEvent called");
         let service =
             unsafe { &*(this as *const dyn ServiceFramework as *const IApplicationFunctions) };
-        let handle = service
+        let object_id = service
             .applet
             .lock()
             .unwrap()
-            .ensure_friend_invitation_storage_channel_event(ctx)
+            .ensure_friend_invitation_storage_channel_event_object_id(ctx)
             .unwrap_or(0);
         let mut rb = ResponseBuilder::new(ctx, 2, 1, 0);
         rb.push_result(RESULT_SUCCESS);
-        rb.push_copy_objects(handle);
+        rb.push_copy_object_id(object_id);
     }
 
     /// GetHealthWarningDisappearedSystemEvent (cmd 160): returns an event handle
@@ -592,15 +592,15 @@ impl IApplicationFunctions {
         log::warn!("(STUBBED) GetHealthWarningDisappearedSystemEvent called");
         let service =
             unsafe { &*(this as *const dyn ServiceFramework as *const IApplicationFunctions) };
-        let handle = service
+        let object_id = service
             .applet
             .lock()
             .unwrap()
-            .ensure_health_warning_disappeared_system_event(ctx)
+            .ensure_health_warning_disappeared_system_event_object_id(ctx)
             .unwrap_or(0);
         let mut rb = ResponseBuilder::new(ctx, 2, 1, 0);
         rb.push_result(RESULT_SUCCESS);
-        rb.push_copy_objects(handle);
+        rb.push_copy_object_id(object_id);
     }
 }
 

@@ -312,25 +312,28 @@ pub fn loop_process(system: crate::core::SystemRef) {
     log::debug!("Fatal::LoopProcess called");
 
     let module = std::sync::Arc::new(Module::new());
-    let mut server_manager = ServerManager::new(system);
+    let server_manager = ServerManager::new_shared(system);
+    {
+        let mut server_manager = server_manager.lock().unwrap();
 
-    let m1 = module.clone();
-    server_manager.register_named_service(
-        "fatal:p",
-        Box::new(move || -> SessionRequestHandlerPtr {
-            std::sync::Arc::new(super::fatal_p::FatalP::new(m1.clone()))
-        }),
-        64,
-    );
+        let m1 = module.clone();
+        server_manager.register_named_service(
+            "fatal:p",
+            Box::new(move || -> SessionRequestHandlerPtr {
+                std::sync::Arc::new(super::fatal_p::FatalP::new(m1.clone()))
+            }),
+            64,
+        );
 
-    let m2 = module.clone();
-    server_manager.register_named_service(
-        "fatal:u",
-        Box::new(move || -> SessionRequestHandlerPtr {
-            std::sync::Arc::new(super::fatal_u::FatalU::new(m2.clone()))
-        }),
-        64,
-    );
+        let m2 = module.clone();
+        server_manager.register_named_service(
+            "fatal:u",
+            Box::new(move || -> SessionRequestHandlerPtr {
+                std::sync::Arc::new(super::fatal_u::FatalU::new(m2.clone()))
+            }),
+            64,
+        );
+    }
 
-    ServerManager::run_server(server_manager);
+    ServerManager::run_server_shared(server_manager);
 }

@@ -39,41 +39,45 @@ impl Module {
 pub fn loop_process(service_manager: &Arc<Mutex<ServiceManager>>, system: crate::core::SystemRef) {
     let module = Arc::new(Module::new());
     let controller = system.get().apm_controller();
-    let mut server_manager = ServerManager::new(system);
+    let server_manager = ServerManager::new_shared(system);
 
-    let factory: SessionRequestHandlerFactory = {
-        let module = module.clone();
-        let controller = controller.clone();
-        Box::new(move || -> SessionRequestHandlerPtr {
-            Arc::new(super::apm_interface::APM::new(
-                module.clone(),
-                controller.clone(),
-                "apm",
-            ))
-        })
-    };
-    server_manager.register_named_service("apm", factory, 64);
+    {
+        let mut server_manager = server_manager.lock().unwrap();
 
-    let factory: SessionRequestHandlerFactory = {
-        let module = module.clone();
-        let controller = controller.clone();
-        Box::new(move || -> SessionRequestHandlerPtr {
-            Arc::new(super::apm_interface::APM::new(
-                module.clone(),
-                controller.clone(),
-                "apm:am",
-            ))
-        })
-    };
-    server_manager.register_named_service("apm:am", factory, 64);
+        let factory: SessionRequestHandlerFactory = {
+            let module = module.clone();
+            let controller = controller.clone();
+            Box::new(move || -> SessionRequestHandlerPtr {
+                Arc::new(super::apm_interface::APM::new(
+                    module.clone(),
+                    controller.clone(),
+                    "apm",
+                ))
+            })
+        };
+        server_manager.register_named_service("apm", factory, 64);
 
-    let factory: SessionRequestHandlerFactory = {
-        let controller = controller.clone();
-        Box::new(move || -> SessionRequestHandlerPtr {
-            Arc::new(super::apm_interface::ApmSys::new(controller.clone()))
-        })
-    };
-    server_manager.register_named_service("apm:sys", factory, 64);
+        let factory: SessionRequestHandlerFactory = {
+            let module = module.clone();
+            let controller = controller.clone();
+            Box::new(move || -> SessionRequestHandlerPtr {
+                Arc::new(super::apm_interface::APM::new(
+                    module.clone(),
+                    controller.clone(),
+                    "apm:am",
+                ))
+            })
+        };
+        server_manager.register_named_service("apm:am", factory, 64);
 
-    ServerManager::run_server(server_manager);
+        let factory: SessionRequestHandlerFactory = {
+            let controller = controller.clone();
+            Box::new(move || -> SessionRequestHandlerPtr {
+                Arc::new(super::apm_interface::ApmSys::new(controller.clone()))
+            })
+        };
+        server_manager.register_named_service("apm:sys", factory, 64);
+    }
+
+    ServerManager::run_server_shared(server_manager);
 }

@@ -332,6 +332,7 @@ enum WaitableObject {
         is_signaled: *const std::sync::atomic::AtomicBool,
         sync_state: *mut SynchronizationObjectState,
     },
+    ClientPort(Arc<Mutex<KPort>>),
     ServerPort(Arc<Mutex<KPort>>),
     ServerSession(Arc<Mutex<KServerSession>>),
     Thread(Arc<KThreadLock>),
@@ -344,6 +345,7 @@ impl WaitableObject {
             Self::ReadableEvent { is_signaled, .. } => unsafe {
                 (**is_signaled).load(std::sync::atomic::Ordering::Relaxed)
             },
+            Self::ClientPort(port) => port.lock().unwrap().client.is_signaled(),
             Self::ServerPort(port) => port.lock().unwrap().server.is_signaled(),
             Self::ServerSession(session) => session.lock().unwrap().is_signaled(),
             Self::Thread(thread) => thread.lock().unwrap().is_signaled(),
@@ -360,6 +362,10 @@ impl WaitableObject {
     fn sync_state_ptr(&self) -> *mut SynchronizationObjectState {
         match self {
             Self::ReadableEvent { sync_state, .. } => *sync_state,
+            Self::ClientPort(port) => {
+                let mut guard = port.lock().unwrap();
+                &mut guard.client.sync_object as *mut SynchronizationObjectState
+            }
             Self::ServerPort(port) => {
                 let mut guard = port.lock().unwrap();
                 &mut guard.server.sync_object as *mut SynchronizationObjectState
@@ -387,6 +393,9 @@ fn resolve_waitable_object(
 ) -> Option<WaitableObject> {
     if let Some(port) = process_guard.get_server_port_by_object_id(object_id) {
         return Some(WaitableObject::ServerPort(port));
+    }
+    if let Some(port) = process_guard.get_client_port_by_object_id(object_id) {
+        return Some(WaitableObject::ClientPort(port));
     }
     if let Some(event) = process_guard.get_readable_event_by_object_id(object_id) {
         let (is_signaled, sync_state) = {
@@ -420,6 +429,9 @@ pub fn is_object_signaled(process: &KProcess, object_id: u64) -> bool {
     // for non-process objects and handle process inline.
     if let Some(port) = process.get_server_port_by_object_id(object_id) {
         return port.lock().unwrap().server.is_signaled();
+    }
+    if let Some(port) = process.get_client_port_by_object_id(object_id) {
+        return port.lock().unwrap().client.is_signaled();
     }
     if let Some(event) = process.get_readable_event_by_object_id(object_id) {
         return event.lock().unwrap().is_signaled();

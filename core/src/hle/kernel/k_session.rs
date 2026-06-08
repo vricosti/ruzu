@@ -9,6 +9,7 @@ use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 
 use super::k_client_session::KClientSession;
+use super::k_resource_limit::LimitableResource;
 use super::k_server_session::KServerSession;
 use super::k_session_request::KSessionRequest;
 
@@ -49,6 +50,8 @@ pub struct KSession {
     pub atomic_state: AtomicU8,
     /// Whether the session has been initialized.
     pub initialized: bool,
+    /// Whether the process `SessionCountMax` reservation was committed.
+    session_resource_committed: bool,
 }
 
 impl KSession {
@@ -63,6 +66,7 @@ impl KSession {
             process_id: None,
             atomic_state: AtomicU8::new(SessionState::Invalid as u8),
             initialized: false,
+            session_resource_committed: false,
         }
     }
 
@@ -79,6 +83,10 @@ impl KSession {
 
     pub fn is_initialized(&self) -> bool {
         self.initialized
+    }
+
+    pub fn mark_session_resource_committed(&mut self) {
+        self.session_resource_committed = true;
     }
 
     /// Get a reference to the server session.
@@ -106,12 +114,47 @@ impl KSession {
         process: &mut super::k_process::KProcess,
         request: Arc<Mutex<KSessionRequest>>,
     ) -> u32 {
-        trace_host_thread_ipc_stage(23, self.name as u64);
-        let mut server = self.server.lock().unwrap();
-        trace_host_thread_ipc_stage(24, self.name as u64);
-        trace_host_thread_ipc_stage(25, self.name as u64);
-        let result = server.on_request_with_process(process, request);
-        trace_host_thread_ipc_stage(26, self.name as u64);
+        let _ = process;
+        self.on_request_defer_scheduler_unlock(request)
+    }
+
+    /// Forward a request while deferring scheduler unlock until after the
+    /// Rust `KServerSession` mutex is released.
+    pub fn on_request_defer_scheduler_unlock(&self, request: Arc<Mutex<KSessionRequest>>) -> u32 {
+        Self::on_server_request_defer_scheduler_unlock(&self.server, self.name as u64, request)
+    }
+
+    /// Forward a request through an already-resolved server endpoint.
+    ///
+    /// This lets callers clone `KSession::server` under a short `KSession`
+    /// mutex borrow, then drop the parent-session mutex before `OnRequest`
+    /// performs the scheduler-unlock handoff.
+    pub fn on_server_request_defer_scheduler_unlock(
+        server_endpoint: &Arc<Mutex<KServerSession>>,
+        trace_object_id: u64,
+        request: Arc<Mutex<KSessionRequest>>,
+    ) -> u32 {
+        let profile_phases = std::env::var_os("RUZU_PROFILE_IPC_PHASES").is_some();
+        let mut phase_last = profile_phases.then(std::time::Instant::now);
+        let mut record_phase = |label: &'static str, last: &mut Option<std::time::Instant>| {
+            if let Some(t) = last {
+                crate::hle::kernel::svc::svc_ipc::record_ipc_phase(label, t.elapsed());
+                *last = Some(std::time::Instant::now());
+            }
+        };
+
+        trace_host_thread_ipc_stage(23, trace_object_id);
+        let mut server = server_endpoint.lock().unwrap();
+        record_phase("ksession_01_server_lock", &mut phase_last);
+        trace_host_thread_ipc_stage(24, trace_object_id);
+        trace_host_thread_ipc_stage(25, trace_object_id);
+        let (result, scheduler_lock) = server.on_request_defer_scheduler_unlock(request);
+        record_phase("ksession_02_on_request", &mut phase_last);
+        drop(server);
+        record_phase("ksession_03_drop_server_lock", &mut phase_last);
+        drop(scheduler_lock);
+        record_phase("ksession_04_drop_scheduler_lock", &mut phase_last);
+        trace_host_thread_ipc_stage(26, trace_object_id);
         result
     }
 
@@ -147,18 +190,22 @@ impl KSession {
 
     /// Called when the client side is closed.
     pub fn on_client_closed(&mut self) {
-        self.server.lock().unwrap().on_client_closed();
-        self.set_state(SessionState::ClientClosed);
+        if self.get_state() == SessionState::Normal {
+            self.set_state(SessionState::ClientClosed);
+            self.server.lock().unwrap().on_client_closed();
+        }
     }
 
     /// Called when the client side is closed, with the owning process already
     /// held by the caller.
     pub fn on_client_closed_with_process(&mut self, process: &mut super::k_process::KProcess) {
-        self.server
-            .lock()
-            .unwrap()
-            .on_client_closed_with_process(process);
-        self.set_state(SessionState::ClientClosed);
+        if self.get_state() == SessionState::Normal {
+            self.set_state(SessionState::ClientClosed);
+            self.server
+                .lock()
+                .unwrap()
+                .on_client_closed_with_process(process);
+        }
     }
 
     /// Finalize the session.
@@ -168,6 +215,27 @@ impl KSession {
             // Upstream: m_port->OnSessionFinalized(); m_port->Close();
             // Port reference cleanup is handled by the object system.
             self.port_id = None;
+        }
+    }
+
+    /// Finalize the session when the owning process object table is available.
+    ///
+    /// This is the Rust counterpart to upstream `KSession::Finalize`: the
+    /// stored `port_id` identifies the parent `KClientPort`, so finalization
+    /// can notify it that one accepted session has gone away.
+    pub fn finalize_with_process(&mut self, process: &super::k_process::KProcess) {
+        if let Some(port_id) = self.port_id.take() {
+            if let Some(port) = process.get_client_port_by_object_id(port_id) {
+                port.lock().unwrap().client.on_session_finalized(port_id);
+            }
+        }
+        if self.session_resource_committed {
+            if let Some(ref rl) = process.resource_limit {
+                rl.lock()
+                    .unwrap()
+                    .release(LimitableResource::SessionCountMax, 1);
+            }
+            self.session_resource_committed = false;
         }
     }
 }
@@ -216,5 +284,24 @@ mod tests {
 
         session.on_server_closed();
         assert!(session.is_server_closed());
+    }
+
+    #[test]
+    fn test_on_client_closed_only_transitions_from_normal() {
+        let mut session = KSession::new();
+        session.initialize(None, 0);
+        session.on_client_closed();
+        assert!(session.is_client_closed());
+        assert!(session.server.lock().unwrap().client_closed);
+
+        let mut already_server_closed = KSession::new();
+        already_server_closed.initialize(None, 0);
+        already_server_closed.on_server_closed();
+        already_server_closed.on_client_closed();
+        assert_eq!(
+            already_server_closed.get_state(),
+            SessionState::ServerClosed
+        );
+        assert!(!already_server_closed.server.lock().unwrap().client_closed);
     }
 }

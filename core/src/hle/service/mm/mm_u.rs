@@ -202,11 +202,14 @@ pub fn loop_process(system: crate::core::SystemRef) {
     use crate::hle::service::hle_ipc::SessionRequestHandlerPtr;
     use crate::hle::service::server_manager::ServerManager;
 
-    let mut server_manager = ServerManager::new(system);
-    server_manager.register_named_service(
-        "mm:u",
-        Box::new(|| -> SessionRequestHandlerPtr { std::sync::Arc::new(MmU::new()) }),
-        64,
-    );
-    ServerManager::run_server(server_manager);
+    let server_manager = ServerManager::new_shared(system);
+    {
+        let mut server_manager = server_manager.lock().unwrap();
+        server_manager.register_named_service(
+            "mm:u",
+            Box::new(|| -> SessionRequestHandlerPtr { std::sync::Arc::new(MmU::new()) }),
+            64,
+        );
+    }
+    ServerManager::run_server_shared(server_manager);
 }

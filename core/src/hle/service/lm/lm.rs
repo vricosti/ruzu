@@ -495,6 +495,25 @@ impl crate::hle::service::service::ServiceFramework for ILogger {
     }
 }
 
+/// Registers the "lm" service.
+///
+/// Corresponds to `Service::LM::LoopProcess` in upstream `lm.cpp`.
+pub fn loop_process(system: crate::core::SystemRef) {
+    use crate::hle::service::hle_ipc::SessionRequestHandlerPtr;
+    use crate::hle::service::server_manager::ServerManager;
+
+    let server_manager = ServerManager::new_shared(system);
+    {
+        let mut server_manager = server_manager.lock().unwrap();
+        server_manager.register_named_service(
+            "lm",
+            Box::new(|| -> SessionRequestHandlerPtr { std::sync::Arc::new(LM::new()) }),
+            64,
+        );
+    }
+    ServerManager::run_server_shared(server_manager);
+}
+
 /// LM service ("lm").
 ///
 /// Corresponds to `LM` in upstream lm.cpp.

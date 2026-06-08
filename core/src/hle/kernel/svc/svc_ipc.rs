@@ -85,20 +85,72 @@ fn should_use_host_thread_ipc_for_service(
         return false;
     }
 
-    if service_name != Some("IHOSBinderDriver") {
-        return false;
+    if let Some(service_name) = service_name {
+        if host_thread_service_filter_matches(service_name) {
+            return true;
+        }
     }
 
-    // Binder host-thread routing is closer to upstream's ServerManager model,
-    // but the current Rust path can lose MK8D's first queued buffer request
-    // before audio/render startup. Keep it available for targeted debugging
-    // without making normal boots depend on the incomplete host-thread path.
-    std::env::var_os("RUZU_SERVER_THREAD_IPC_BINDER").is_some()
+    service_name.is_some_and(default_host_thread_service_matches)
 }
 
 fn should_resolve_host_thread_service_name() -> bool {
     std::env::var_os("RUZU_INLINE_IPC").is_none()
-        && std::env::var_os("RUZU_SERVER_THREAD_IPC_BINDER").is_some()
+        && std::env::var_os("RUZU_SERVER_THREAD_IPC_SERVICE").is_some()
+}
+
+fn default_host_thread_service_matches(service_name: &str) -> bool {
+    default_host_thread_service_matches_from_flags(
+        service_name,
+        std::env::var_os("RUZU_INLINE_IPC").is_some(),
+        std::env::var_os("RUZU_DISABLE_SERVER_THREAD_IPC_BINDER").is_some(),
+    )
+}
+
+fn default_host_thread_service_matches_from_flags(
+    service_name: &str,
+    inline: bool,
+    disable_binder: bool,
+) -> bool {
+    crate::hle::service::server_manager::ServerManager::default_host_thread_service_matches_from_flags(
+        service_name,
+        inline,
+        disable_binder,
+    )
+}
+
+fn host_thread_service_filter_matches(service_name: &str) -> bool {
+    let Some(spec) = std::env::var_os("RUZU_SERVER_THREAD_IPC_SERVICE") else {
+        return false;
+    };
+    spec.to_string_lossy().split(',').any(|raw| {
+        let value = raw.trim();
+        !value.is_empty() && (value == "*" || value == service_name)
+    })
+}
+
+fn host_thread_ipc_sleep_enabled_from_flags(
+    all: bool,
+    handle: bool,
+    binder: bool,
+    _service: bool,
+    inline: bool,
+) -> bool {
+    // Keep the sleep as an explicit broad-routing diagnostic. A service-name
+    // filter is also used to validate candidate default promotions; making it
+    // sleep after every IPC changes timing globally and does not model the
+    // eventual default path for that service.
+    !inline && (all || handle || binder)
+}
+
+fn host_thread_ipc_sleep_enabled() -> bool {
+    host_thread_ipc_sleep_enabled_from_flags(
+        std::env::var_os("RUZU_SERVER_THREAD_IPC_ALL").is_some(),
+        std::env::var_os("RUZU_SERVER_THREAD_IPC_HANDLE").is_some(),
+        std::env::var_os("RUZU_SERVER_THREAD_IPC_BINDER").is_some(),
+        std::env::var_os("RUZU_SERVER_THREAD_IPC_SERVICE").is_some(),
+        std::env::var_os("RUZU_INLINE_IPC").is_some(),
+    )
 }
 
 fn parse_trace_filter_list(env_key: &str) -> Option<Vec<u64>> {
@@ -172,7 +224,6 @@ fn trace_host_thread_ipc(stage: &str, session_handle: Handle) {
             "enqueue_end" => 3,
             "client_begin_wait" => 4,
             "client_resumed" => 5,
-            "spawn_fallback_begin" => 6,
             "before_scheduler_lock" => 7,
             "after_scheduler_lock" => 8,
             "before_process_lock" => 9,
@@ -188,10 +239,9 @@ fn trace_host_thread_ipc(stage: &str, session_handle: Handle) {
             "after_parent_session_lock" => 20,
             "before_on_request" => 21,
             "after_on_request" => 22,
+            "missing_server_manager_owner" => 23,
             "before_locked_section_end" => 35,
             "after_locked_section_end" => 36,
-            "before_belt_signal" => 37,
-            "after_belt_signal" => 38,
             _ => 0,
         };
         common::trace::emit_raw(
@@ -229,24 +279,25 @@ fn trace_svc_ipc_progress(
     );
 }
 
-fn yield_after_ipc_if_requested(system: &System) {
-    // RUZU_YIELD_AFTER_IPC=1 — diagnostic for MK8D post-IPC ordering
-    // divergence. Upstream `KServerSession::OnRequest` transitions the client
-    // through WAITING under the scheduler lock, giving the scheduler a chance
-    // to run another runnable guest thread before the caller continues. Apply
-    // the experiment after every SendSyncRequest path, including host-thread
-    // IPC, so it actually tests the current default path.
-    if std::env::var_os("RUZU_YIELD_AFTER_IPC").is_some() {
-        let current_process = system.current_process_arc();
-        if let Some(current_thread_id) = system.current_thread_id() {
-            let sched_arc = system.scheduler_arc();
-            let scheduler_ptr = {
-                let mut scheduler = sched_arc.lock().unwrap();
-                &mut *scheduler as *mut crate::hle::kernel::k_scheduler::KScheduler
-            };
-            unsafe {
-                (*scheduler_ptr).yield_without_core_migration(current_process, current_thread_id);
-            }
+fn yield_after_inline_ipc_if_requested(system: &System) {
+    // Diagnostic for ruzu's temporary inline HLE path. Upstream parks the
+    // caller while a ServerManager host fiber handles the request, which
+    // naturally gives other guest threads a scheduling opportunity. Keep this
+    // as an explicit experiment: cold MK8D boots are less stable when this
+    // cooperative yield is promoted to the default before host-thread IPC
+    // ownership is complete.
+    if std::env::var_os("RUZU_YIELD_AFTER_IPC").is_none() {
+        return;
+    }
+    let current_process = system.current_process_arc();
+    if let Some(current_thread_id) = system.current_thread_id() {
+        let sched_arc = system.scheduler_arc();
+        let scheduler_ptr = {
+            let mut scheduler = sched_arc.lock().unwrap();
+            &mut *scheduler as *mut crate::hle::kernel::k_scheduler::KScheduler
+        };
+        unsafe {
+            (*scheduler_ptr).yield_without_core_migration(current_process, current_thread_id);
         }
     }
 }
@@ -268,81 +319,6 @@ fn reschedule_after_inline_ipc_if_needed(system: &System) {
     unsafe {
         crate::hle::kernel::k_scheduler::KScheduler::schedule_raw_if_needed(sched_ptr);
     }
-}
-
-/// Spawn-based fallback for the host-thread IPC routing path, invoked when
-/// the target session is orphan (no `ServerManager` wiring, hence no
-/// pending-registration queue and no wakeup event). Mirrors the
-/// upstream-shape (park the client, run handler off-fiber, end wait on
-/// reply) by spawning a one-shot worker thread. Rare in practice — most
-/// service sessions inherit ownership through `connect_to_named_port` /
-/// `push_ipc_interface`. Skipped entirely when host-thread routing is off.
-fn host_thread_ipc_spawn_fallback(
-    system: &System,
-    session_handle: Handle,
-    parent_id: u64,
-    message_address: u64,
-) -> ResultCode {
-    trace_host_thread_ipc("spawn_fallback_begin", session_handle);
-    let (server_session, manager) = {
-        let mut process = system.current_process_arc().lock().unwrap();
-        let Some(parent_session) = process.get_session_by_object_id(parent_id) else {
-            return RESULT_INVALID_HANDLE;
-        };
-        let send_result = crate::hle::kernel::k_client_session::KClientSession::send_sync_request_to_parent_with_process(
-            &mut process,
-            Arc::clone(&parent_session),
-            message_address as usize,
-            0,
-        );
-        if send_result != 0 {
-            return ResultCode::new(send_result);
-        }
-        let server_session = parent_session.lock().unwrap().get_server_session().clone();
-        let Some(manager) = server_session.lock().unwrap().get_manager().cloned() else {
-            return RESULT_INVALID_HANDLE;
-        };
-        (server_session, manager)
-    };
-
-    if let Some(current_thread) = system.current_thread() {
-        let mut thread = current_thread.lock().unwrap();
-        thread.set_wait_reason_for_debugging(
-            crate::hle::kernel::k_thread::ThreadWaitReasonForDebugging::Ipc,
-        );
-        thread.begin_wait();
-    }
-
-    let service_manager = system.service_manager().unwrap();
-    std::thread::spawn(move || {
-        let receive_result = {
-            let mut server_session = server_session.lock().unwrap();
-            server_session.receive_request_hle(Arc::clone(&manager))
-        };
-        let Ok((mut context, request_manager, _request_message_address)) = receive_result else {
-            return;
-        };
-        context.set_service_manager(service_manager);
-        let _ = complete_sync_request(&request_manager, &mut context);
-        let _ = server_session.lock().unwrap().send_reply();
-    });
-
-    if let Some(kernel) = system.kernel() {
-        if let Some(scheduler) = kernel.current_scheduler() {
-            let sched_ptr = {
-                let mut scheduler = scheduler.lock().unwrap();
-                &mut *scheduler as *mut crate::hle::kernel::k_scheduler::KScheduler
-            };
-            unsafe {
-                crate::hle::kernel::k_scheduler::KScheduler::reschedule_current_core_raw(sched_ptr);
-            }
-        }
-    }
-
-    system
-        .current_thread()
-        .map(|thread| ResultCode::new(thread.lock().unwrap().get_wait_result()))
-        .unwrap_or(RESULT_INVALID_HANDLE)
 }
 
 fn format_ipc_trace_words(system: &System, message_address: u64, words: usize) -> Option<String> {
@@ -509,16 +485,16 @@ fn send_sync_request_impl(
     // object registration so the hot SVC path does not need to lock the client
     // endpoint just to discover its parent.
 
-    let explicit_host_thread_routing = should_use_host_thread_ipc(session_handle);
+    let forced_host_thread_routing = should_use_host_thread_ipc(session_handle);
     let trace_manager_resolution = should_emit_svc_ipc_progress(
         session_handle,
         crate::hle::kernel::kernel::get_current_thread_id_fast().unwrap_or(0),
     );
-    let needs_manager_resolution = explicit_host_thread_routing
+    let needs_manager_resolution = forced_host_thread_routing
         || should_resolve_host_thread_service_name()
         || trace_manager_resolution;
 
-    // ---- Host-thread IPC routing (default, upstream-faithful) ----
+    // ---- Host-thread IPC routing (upstream-shaped when fully owned) ----
     //
     // Upstream `KClientSession::SendSyncRequest` always parks the calling
     // guest thread (`BeginWait`) and lets the owning `ServerManager`'s
@@ -529,13 +505,12 @@ fn send_sync_request_impl(
     // guest, and yielding the fiber. The handler runs on the host fiber;
     // `send_reply` ends the wait; the guest resumes here.
     //
-    // When the target session has no ServerManager wiring (orphan,
-    // typically unit tests / `test_system()` harnesses), we fall back
-    // to the spawn-based path that mirrors the same park-the-client /
-    // handler-off-fiber shape. Set `RUZU_INLINE_IPC=1` to opt out of
-    // host-thread routing entirely (legacy synchronous path) — kept as
-    // a kill-switch for regressions and to preserve unit-test inline
-    // execution where applicable.
+    // Sessions fall back to the legacy inline path unless selected by explicit
+    // env gates. Historical Binder/service default-promotion experiments are
+    // documented in DIFF.md, but no service is promoted implicitly until its
+    // routing is revalidated. When host-thread routing is selected, missing
+    // ownership is treated as a wiring bug and returns `ResultInvalidHandle`
+    // instead of using an ad-hoc worker fallback.
     let server_session_and_manager: Option<(
         Arc<Mutex<crate::hle::kernel::k_server_session::KServerSession>>,
         Arc<Mutex<crate::hle::service::hle_ipc::SessionRequestManager>>,
@@ -655,46 +630,48 @@ fn send_sync_request_impl(
         0,
         0,
     );
-    let host_thread_routing = explicit_host_thread_routing
-        || should_use_host_thread_ipc_for_service(
-            session_handle,
-            host_thread_service_name.as_deref(),
-        );
-    let host_thread_targets: Option<(
+    let host_thread_service_routing =
+        should_use_host_thread_ipc_for_service(session_handle, host_thread_service_name.as_deref());
+    let with_queue_wakeup: Option<(
         Arc<Mutex<crate::hle::kernel::k_server_session::KServerSession>>,
         Arc<Mutex<crate::hle::service::hle_ipc::SessionRequestManager>>,
         crate::hle::service::hle_ipc::PendingRegistrationQueue,
         Arc<crate::hle::service::os::event::Event>,
-    )> = if host_thread_routing {
-        let with_queue_wakeup =
-            server_session_and_manager
-                .as_ref()
-                .and_then(|(server_session, manager)| {
-                    let (queue, wakeup) = {
-                        let g = manager.lock().unwrap();
-                        (
-                            g.pending_registrations().cloned(),
-                            g.server_wakeup().cloned(),
-                        )
-                    };
-                    Some((
-                        Arc::clone(server_session),
-                        Arc::clone(manager),
-                        queue?,
-                        wakeup?,
-                    ))
-                });
-
-        if with_queue_wakeup.is_none() && server_session_and_manager.is_some() {
-            // Orphan target under host-thread routing: park the client and
-            // run the handler on a one-shot worker so the guest-side shape
-            // still matches the kernel-backed wait the regular path uses.
-            return host_thread_ipc_spawn_fallback(
-                system,
+    )> = server_session_and_manager
+        .as_ref()
+        .and_then(|(server_session, manager)| {
+            let (queue, wakeup) = {
+                let g = manager.lock().unwrap();
+                (
+                    g.pending_registrations().cloned(),
+                    g.server_wakeup().cloned(),
+                )
+            };
+            Some((
+                Arc::clone(server_session),
+                Arc::clone(manager),
+                queue?,
+                wakeup?,
+            ))
+        });
+    let host_thread_routing = forced_host_thread_routing || host_thread_service_routing;
+    let host_thread_targets = if host_thread_routing {
+        if with_queue_wakeup.is_none() {
+            // Host-thread routing is an upstream-parity path: a request must
+            // be owned by the target session's ServerManager. Falling back to
+            // an ad-hoc worker or inline dispatch would hide missing
+            // ownership and reintroduce a lifecycle upstream does not have.
+            trace_host_thread_ipc("missing_server_manager_owner", session_handle);
+            trace_svc_ipc_progress(
+                21,
                 session_handle,
-                parent_id,
+                session_object_id,
                 message_address,
+                server_session_and_manager.is_some() as u64,
+                0,
+                0,
             );
+            return RESULT_INVALID_HANDLE;
         }
         with_queue_wakeup
     } else {
@@ -703,6 +680,7 @@ fn send_sync_request_impl(
 
     if let Some((server_session, manager, queue, wakeup)) = host_thread_targets {
         trace_host_thread_ipc("enqueue_begin", session_handle);
+        record_phase("host_02_resolve_owner", &mut phase_last);
 
         // One-time wiring per KServerSession:
         //  1. Push (server_session, manager) to the queue so the host fiber
@@ -728,11 +706,12 @@ fn send_sync_request_impl(
             wakeup.signal();
             trace_host_thread_ipc("registered_with_host_thread", session_handle);
         }
+        record_phase("host_03_register_session_if_needed", &mut phase_last);
 
         // Enqueue the request through `KClientSession` / `KSession`; the
         // scheduler-locked synchronous `BeginWait` is owned by
         // `KServerSession::OnRequest`, matching upstream.
-        {
+        let send_result = {
             trace_host_thread_ipc("before_process_lock", session_handle);
             let _lo_p = common::lock_order::guard("process");
             let mut process = system.current_process_arc().lock().unwrap();
@@ -743,63 +722,33 @@ fn send_sync_request_impl(
             };
             trace_host_thread_ipc("after_parent_lookup", session_handle);
             trace_host_thread_ipc("before_parent_session_lock", session_handle);
-            let _lo_ps = common::lock_order::guard("parent_session");
-            let parent_session_for_send = Arc::clone(&parent_session);
+            {
+                let _lo_ps = common::lock_order::guard("parent_session");
+                let _parent_session = parent_session.lock().unwrap();
+            }
             trace_host_thread_ipc("after_parent_session_lock", session_handle);
-            trace_host_thread_ipc("before_on_request", session_handle);
-            let send_result = crate::hle::kernel::k_client_session::KClientSession::send_sync_request_to_parent_with_process(
+
+            crate::hle::kernel::k_client_session::KClientSession::send_sync_request_to_parent_with_process(
                 &mut process,
-                parent_session_for_send,
+                Arc::clone(&parent_session),
                 message_address as usize,
                 0,
-            );
-            trace_host_thread_ipc("after_on_request", session_handle);
-            trace_host_thread_ipc("after_send_sync_request_with_process", session_handle);
-            if send_result != 0 {
-                return ResultCode::new(send_result);
-            }
+            )
+        };
+        record_phase("host_04_prepare_request", &mut phase_last);
 
-            // RUZU_TRACE_PLU_IPC=1 — fresh-session diagnostic. Sample while
-            // still holding the scheduler lock, before `BeginWait`, so the
-            // host service thread cannot consume the request before the trace
-            // observes whether it landed in the watched server session.
-            if needs_setup && common::trace::is_enabled(common::trace::cat::PLU_IPC) {
-                let tid = crate::hle::kernel::kernel::get_current_thread_id_fast().unwrap_or(0);
-                let (sig, req_len, cur_req, manager_wakeup_live) = {
-                    let s = server_session.lock().unwrap();
-                    (
-                        s.is_signaled(),
-                        s.request_list.len(),
-                        s.current_request.is_some(),
-                        s.manager_wakeup.as_ref().map(|w| w.strong_count() > 0),
-                    )
-                };
-                common::trace::emit_raw(
-                    common::trace::cat::PLU_IPC,
-                    &[
-                        1,
-                        tid,
-                        session_object_id,
-                        Arc::as_ptr(&server_session) as u64,
-                        Arc::as_ptr(&wakeup) as u64,
-                        needs_setup as u64,
-                        sig as u64,
-                        req_len as u64,
-                        cur_req as u64,
-                        manager_wakeup_live.unwrap_or(false) as u64,
-                    ],
-                );
-            }
-
-            trace_host_thread_ipc("before_locked_section_end", session_handle);
+        trace_host_thread_ipc("before_on_request", session_handle);
+        trace_host_thread_ipc("after_on_request", session_handle);
+        trace_host_thread_ipc("after_send_sync_request_with_process", session_handle);
+        if send_result != 0 {
+            return ResultCode::new(send_result);
         }
+        record_phase("host_05_on_request_begin_wait", &mut phase_last);
+
+        trace_host_thread_ipc("before_locked_section_end", session_handle);
         trace_host_thread_ipc("after_locked_section_end", session_handle);
-        // Belt-and-suspenders signal (notify_available also signals, but
-        // signaling twice is harmless and avoids any ordering surprise).
-        trace_host_thread_ipc("before_belt_signal", session_handle);
-        wakeup.signal();
-        trace_host_thread_ipc("after_belt_signal", session_handle);
         trace_host_thread_ipc("enqueue_end", session_handle);
+        record_phase("host_06_after_notify_available", &mut phase_last);
 
         // `KServerSession::OnRequest` has already transitioned the client to
         // an IPC wait when the request is synchronous. Yield the current fiber
@@ -823,82 +772,21 @@ fn send_sync_request_impl(
                 }
             }
         }
+        record_phase("host_07_client_wait", &mut phase_last);
         trace_host_thread_ipc("client_resumed", session_handle);
 
-        return system
+        let result = system
             .current_thread()
             .map(|thread| ResultCode::new(thread.lock().unwrap().get_wait_result()))
             .unwrap_or(RESULT_INVALID_HANDLE);
+        record_phase("host_08_wait_result", &mut phase_last);
+        return result;
     }
     // Inline fallback: orphan session (no ServerManager wiring). Used by
     // unit tests that drive `send_sync_request` directly without spinning
     // up a host fiber. Behavior is non-upstream but converges with the
     // host-thread path because the same handler runs end-to-end.
-    let (request_manager, mut context, request_message_address) = if std::env::var_os(
-        "RUZU_LEGACY_INLINE_NOTIFY",
-    )
-    .is_some()
-    {
-        let (server_session, manager) = {
-            let mut process = system.current_process_arc().lock().unwrap();
-            record_phase("02_process_lock_legacy_inline", &mut phase_last);
-            if trace_sync {
-                log::info!("svc::SendSyncRequest stage=legacy_enqueue_request");
-            }
-            let Some(parent_session) = process.get_session_by_object_id(parent_id) else {
-                if trace_sync {
-                    log::info!(
-                        "svc::SendSyncRequest stage=legacy_missing_parent_session parent_id={:#x}",
-                        parent_id
-                    );
-                }
-                return RESULT_INVALID_HANDLE;
-            };
-            let send_result = crate::hle::kernel::k_client_session::KClientSession::send_sync_request_to_parent_with_process(
-                &mut process,
-                Arc::clone(&parent_session),
-                message_address as usize,
-                0,
-            );
-            record_phase("03_legacy_send_sync_request_with_process", &mut phase_last);
-            if send_result != 0 {
-                return ResultCode::new(send_result);
-            }
-            let server_session = parent_session.lock().unwrap().get_server_session().clone();
-            let manager = match server_session.lock().unwrap().get_manager().cloned() {
-                Some(manager) => manager,
-                None => {
-                    if trace_sync {
-                        log::info!(
-                            "svc::SendSyncRequest stage=legacy_missing_server_manager parent_id={:#x}",
-                            parent_id
-                        );
-                    }
-                    return RESULT_INVALID_HANDLE;
-                }
-            };
-            (server_session, manager)
-        };
-        if trace_sync {
-            log::info!("svc::SendSyncRequest stage=legacy_receive_request_hle_begin");
-        }
-
-        record_phase("04_legacy_resolve_server_session_manager", &mut phase_last);
-        let receive_result = {
-            let mut server_session = server_session.lock().unwrap();
-            server_session.receive_request_hle(Arc::clone(&manager))
-        };
-        record_phase("05_legacy_receive_request_hle", &mut phase_last);
-        match receive_result {
-            Ok((context, manager, request_message_address)) => {
-                if trace_sync {
-                    log::info!("svc::SendSyncRequest stage=legacy_receive_request_hle_end");
-                }
-                (manager, context, request_message_address)
-            }
-            Err(_) => return RESULT_INVALID_HANDLE,
-        }
-    } else {
+    let (request_manager, mut context, request_message_address) = {
         let (server_session, manager, request) = {
             let _lo_p = common::lock_order::guard("process");
             let mut process = system.current_process_arc().lock().unwrap();
@@ -1119,7 +1007,9 @@ fn send_sync_request_impl(
             0,
             0,
         );
-        let _ = server_session.lock().unwrap().send_reply();
+        let _ = crate::hle::kernel::k_server_session::KServerSession::send_reply_hle_unlocked(
+            &server_session,
+        );
         trace_svc_ipc_progress(
             9,
             session_handle,
@@ -1204,7 +1094,7 @@ pub fn send_sync_request(system: &System, session_handle: Handle) -> ResultCode 
         record_ipc_diff(session_handle, &req, &rsp, result);
     }
 
-    yield_after_ipc_if_requested(system);
+    yield_after_inline_ipc_if_requested(system);
 
     // Inter-IPC OS-scheduler yield. Discovered while diagnosing
     // host-thread IPC's flaky 25 %-success rate on MK8D: when the guest
@@ -1230,9 +1120,7 @@ pub fn send_sync_request(system: &System, session_handle: Handle) -> ResultCode 
     //
     // `RUZU_HOST_THREAD_IPC_SLEEP_US=<n>` overrides the default 1 µs;
     // set to `0` to disable entirely (for performance investigation).
-    let host_thread_ipc_enabled = std::env::var_os("RUZU_SERVER_THREAD_IPC_ALL").is_some()
-        || std::env::var_os("RUZU_SERVER_THREAD_IPC_HANDLE").is_some();
-    if host_thread_ipc_enabled && std::env::var_os("RUZU_INLINE_IPC").is_none() {
+    if host_thread_ipc_sleep_enabled() {
         let us = std::env::var("RUZU_HOST_THREAD_IPC_SLEEP_US")
             .ok()
             .and_then(|s| s.parse::<u64>().ok())
@@ -1433,7 +1321,11 @@ pub fn dump_ipc_profile() {
 mod tests {
     use super::*;
     use crate::core::System;
+    use crate::device_memory::DeviceMemory;
     use crate::hle::ipc;
+    use crate::hle::kernel::k_memory_block::{
+        KMemoryAttribute, KMemoryBlockDisableMergeAttribute, KMemoryPermission, KMemoryState,
+    };
     use crate::hle::kernel::k_process::{KProcess, ProcessLock};
     use crate::hle::kernel::k_thread::{KThread, KThreadLock, ThreadState};
     use crate::hle::kernel::k_typed_address::KProcessAddress;
@@ -1441,8 +1333,46 @@ mod tests {
     use crate::hle::result::RESULT_SUCCESS;
     use crate::hle::service::hle_ipc::SessionRequestHandlerPtr;
     use crate::hle::service::sm::sm::ServiceManager;
+    use crate::memory::memory::Memory;
+    use common::page_table::{PageTable, PageType};
     use std::sync::atomic::Ordering;
     use std::sync::{Arc, Mutex};
+
+    fn create_mapped_test_memory() -> Arc<Mutex<Memory>> {
+        const PAGE_BITS: usize = 12;
+        const PAGE_SIZE: usize = 1 << PAGE_BITS;
+
+        let device_memory = Box::leak(Box::new(DeviceMemory::new()));
+        let buffer_ptr = &device_memory.buffer as *const common::host_memory::HostMemory;
+        let memory = Arc::new(Mutex::new(unsafe {
+            Memory::new(
+                crate::core::SystemRef::null(),
+                device_memory as *const DeviceMemory,
+                buffer_ptr,
+            )
+        }));
+
+        let page_table = Box::leak(Box::new(PageTable::new()));
+        page_table.resize(32, PAGE_BITS);
+        let host_base = device_memory.buffer.backing_base_pointer() as usize;
+        for (mapped_start, mapped_size) in [
+            (0x200000usize, 0x600000usize),
+            (0x2395000usize, 0x4000usize),
+            (0x23A0000usize, PAGE_SIZE),
+        ] {
+            let base_page = mapped_start / PAGE_SIZE;
+            let num_pages = mapped_size.div_ceil(PAGE_SIZE);
+            for page in base_page..base_page + num_pages {
+                let target = page * PAGE_SIZE;
+                page_table.map_pages(page, 1, target as u64, PageType::Memory, host_base + target);
+            }
+        }
+        memory
+            .lock()
+            .unwrap()
+            .set_current_page_table(page_table as *mut PageTable);
+        memory
+    }
 
     fn test_system() -> System {
         let mut system = System::new_for_test();
@@ -1469,7 +1399,10 @@ mod tests {
         }
         {
             let mut process_guard = process.lock().unwrap();
-            process_guard.register_thread_object(current_thread);
+            process_guard.register_thread_object(Arc::clone(&current_thread));
+            process_guard
+                .page_table
+                .set_memory(create_mapped_test_memory());
             let mut mem = process_guard.process_memory.write().unwrap();
             mem.allocate(0x200000, 0x600000);
             mem.allocate(0x2395000, 0x4000);
@@ -1486,7 +1419,52 @@ mod tests {
         system.set_shared_process_memory(shared_memory);
         system.set_runtime_program_id(1);
         system.set_runtime_64bit(false);
+        crate::hle::kernel::kernel::set_current_emu_thread(Some(&current_thread));
         system
+    }
+
+    fn write_test_8(system: &System, address: u64, value: u8) {
+        if let Some(memory) = system.get_svc_memory() {
+            memory
+                .lock()
+                .unwrap()
+                .write_block_no_rasterizer(address, &[value]);
+        }
+        system
+            .shared_process_memory()
+            .write()
+            .unwrap()
+            .write_8(address, value);
+    }
+
+    fn write_test_32(system: &System, address: u64, value: u32) {
+        if let Some(memory) = system.get_svc_memory() {
+            memory
+                .lock()
+                .unwrap()
+                .write_32_no_rasterizer(address, value);
+        }
+        system
+            .shared_process_memory()
+            .write()
+            .unwrap()
+            .write_32(address, value);
+    }
+
+    fn write_test_64(system: &System, address: u64, value: u64) {
+        write_test_32(system, address, value as u32);
+        write_test_32(system, address + 4, (value >> 32) as u32);
+    }
+
+    fn read_test_32(system: &System, address: u64) -> u32 {
+        if let Some(memory) = system.get_svc_memory() {
+            return memory.lock().unwrap().read_32(address);
+        }
+        system
+            .shared_process_memory()
+            .read()
+            .unwrap()
+            .read_32(address)
     }
 
     fn get_tls_base(system: &System) -> u64 {
@@ -1500,24 +1478,22 @@ mod tests {
     }
 
     fn write_named_port(system: &System, address: u64, name: &str) {
-        let mut mem = system.shared_process_memory().write().unwrap();
         for (index, byte) in name.as_bytes().iter().copied().enumerate() {
-            mem.write_8(address + index as u64, byte);
+            write_test_8(system, address + index as u64, byte);
         }
-        mem.write_8(address + name.len() as u64, 0);
+        write_test_8(system, address + name.len() as u64, 0);
     }
 
     fn write_sm_initialize_request(system: &System) {
         let tls_base = get_tls_base(system);
         let request_type = ipc::CommandType::Request as u32;
         let sfci_magic = u32::from_le_bytes([b'S', b'F', b'C', b'I']);
-        let mut mem = system.shared_process_memory().write().unwrap();
-        mem.write_32(tls_base, request_type);
-        mem.write_32(tls_base + 4, 0);
-        mem.write_32(tls_base + 0x10, sfci_magic);
-        mem.write_32(tls_base + 0x14, 0);
-        mem.write_32(tls_base + 0x18, 0);
-        mem.write_32(tls_base + 0x1C, 0);
+        write_test_32(system, tls_base, request_type);
+        write_test_32(system, tls_base + 4, 0);
+        write_test_32(system, tls_base + 0x10, sfci_magic);
+        write_test_32(system, tls_base + 0x14, 0);
+        write_test_32(system, tls_base + 0x18, 0);
+        write_test_32(system, tls_base + 0x1C, 0);
     }
 
     fn write_sm_get_service_request(system: &System, name: &str) {
@@ -1528,14 +1504,13 @@ mod tests {
         let copy_len = name.len().min(name_buf.len());
         name_buf[..copy_len].copy_from_slice(&name.as_bytes()[..copy_len]);
 
-        let mut mem = system.shared_process_memory().write().unwrap();
-        mem.write_32(tls_base, request_type);
-        mem.write_32(tls_base + 4, 0);
-        mem.write_32(tls_base + 0x10, sfci_magic);
-        mem.write_32(tls_base + 0x14, 0);
-        mem.write_32(tls_base + 0x18, 1);
-        mem.write_32(tls_base + 0x1C, 0);
-        mem.write_64(tls_base + 0x20, u64::from_le_bytes(name_buf));
+        write_test_32(system, tls_base, request_type);
+        write_test_32(system, tls_base + 4, 0);
+        write_test_32(system, tls_base + 0x10, sfci_magic);
+        write_test_32(system, tls_base + 0x14, 0);
+        write_test_32(system, tls_base + 0x18, 1);
+        write_test_32(system, tls_base + 0x1C, 0);
+        write_test_64(system, tls_base + 0x20, u64::from_le_bytes(name_buf));
     }
 
     fn write_control_query_pointer_buffer_size_request(system: &System) {
@@ -1546,13 +1521,12 @@ mod tests {
     fn write_control_query_pointer_buffer_size_request_at(system: &System, base: u64) {
         let control_type = ipc::CommandType::Control as u32;
         let sfci_magic = u32::from_le_bytes([b'S', b'F', b'C', b'I']);
-        let mut mem = system.shared_process_memory().write().unwrap();
-        mem.write_32(base, control_type);
-        mem.write_32(base + 4, 0);
-        mem.write_32(base + 0x10, sfci_magic);
-        mem.write_32(base + 0x14, 0);
-        mem.write_32(base + 0x18, 3);
-        mem.write_32(base + 0x1C, 0);
+        write_test_32(system, base, control_type);
+        write_test_32(system, base + 4, 0);
+        write_test_32(system, base + 0x10, sfci_magic);
+        write_test_32(system, base + 0x14, 0);
+        write_test_32(system, base + 0x18, 3);
+        write_test_32(system, base + 0x1C, 0);
     }
 
     #[test]
@@ -1560,11 +1534,10 @@ mod tests {
         let system = test_system();
         let tls_base = get_tls_base(&system);
         {
-            let mut mem = system.shared_process_memory().write().unwrap();
-            mem.write_32(tls_base, 0x0111_0004);
-            mem.write_32(tls_base + 4, 0x0000_0c0b);
-            mem.write_32(tls_base + 8, 0x4000_a078);
-            mem.write_32(tls_base + 12, 0);
+            write_test_32(&system, tls_base, 0x0111_0004);
+            write_test_32(&system, tls_base + 4, 0x0000_0c0b);
+            write_test_32(&system, tls_base + 8, 0x4000_a078);
+            write_test_32(&system, tls_base + 12, 0);
         }
 
         let formatted = format_ipc_trace_words(&system, tls_base, 4).unwrap();
@@ -1587,12 +1560,11 @@ mod tests {
         write_sm_initialize_request(&system);
         assert_eq!(send_sync_request(&system, session_handle), RESULT_SUCCESS);
 
-        let mem = system.shared_process_memory().read().unwrap();
         assert_eq!(
-            mem.read_32(tls_base + 0x18),
+            read_test_32(&system, tls_base + 0x18),
             RESULT_SUCCESS.get_inner_value()
         );
-        assert_eq!(mem.read_32(tls_base + 0x1C), 0);
+        assert_eq!(read_test_32(&system, tls_base + 0x1C), 0);
     }
 
     #[test]
@@ -1616,17 +1588,16 @@ mod tests {
         write_control_query_pointer_buffer_size_request(&system);
         assert_eq!(send_sync_request(&system, lm_handle), RESULT_SUCCESS);
 
-        let mem = system.shared_process_memory().read().unwrap();
         assert_eq!(
-            mem.read_32(tls_base + 0x18),
+            read_test_32(&system, tls_base + 0x18),
             RESULT_SUCCESS.get_inner_value()
         );
-        assert_eq!(mem.read_32(tls_base + 0x1C), 0);
-        assert_eq!(mem.read_32(tls_base + 0x20), 0x8000);
+        assert_eq!(read_test_32(&system, tls_base + 0x1C), 0);
+        assert_eq!(read_test_32(&system, tls_base + 0x20), 0x8000);
     }
 
     #[test]
-    fn send_sync_request_uses_server_session_manager_not_client_session_field() {
+    fn send_sync_request_uses_server_session_manager() {
         let system = test_system();
         let tls_base = get_tls_base(&system);
         let current_thread = system
@@ -1650,18 +1621,25 @@ mod tests {
             let client_session = process
                 .get_client_session_by_object_id(client_session_object_id)
                 .unwrap();
-            client_session.lock().unwrap().request_manager = None;
+            let parent_id = client_session.lock().unwrap().get_parent_id().unwrap();
+            let server_session = process
+                .get_session_by_object_id(parent_id)
+                .unwrap()
+                .lock()
+                .unwrap()
+                .get_server_session()
+                .clone();
+            assert!(server_session.lock().unwrap().get_manager().is_some());
         }
 
         write_control_query_pointer_buffer_size_request(&system);
         assert_eq!(send_sync_request(&system, lm_handle), RESULT_SUCCESS);
 
-        let mem = system.shared_process_memory().read().unwrap();
         assert_eq!(
-            mem.read_32(tls_base + 0x18),
+            read_test_32(&system, tls_base + 0x18),
             RESULT_SUCCESS.get_inner_value()
         );
-        assert_eq!(mem.read_32(tls_base + 0x20), 0x8000);
+        assert_eq!(read_test_32(&system, tls_base + 0x20), 0x8000);
     }
 
     #[test]
@@ -1670,9 +1648,26 @@ mod tests {
         let message = 0x23A0000u64;
         {
             let process = system.current_process_arc();
-            let process_guard = process.lock().unwrap();
+            let mut process_guard = process.lock().unwrap();
             let mut mem = process_guard.process_memory.write().unwrap();
             mem.allocate(message, PAGE_SIZE as usize);
+            drop(mem);
+            process_guard
+                .page_table
+                .set_heap_region(KProcessAddress::new(message), PAGE_SIZE as usize);
+            process_guard
+                .page_table
+                .get_base_mut()
+                .m_memory_block_manager
+                .update(
+                    message as usize,
+                    1,
+                    KMemoryState::NORMAL,
+                    KMemoryPermission::USER_READ_WRITE,
+                    KMemoryAttribute::NONE,
+                    KMemoryBlockDisableMergeAttribute::NORMAL,
+                    KMemoryBlockDisableMergeAttribute::NONE,
+                );
         }
 
         let current_thread = system
@@ -1695,13 +1690,12 @@ mod tests {
             RESULT_SUCCESS
         );
 
-        let mem = system.shared_process_memory().read().unwrap();
         assert_eq!(
-            mem.read_32(message + 0x18),
+            read_test_32(&system, message + 0x18),
             RESULT_SUCCESS.get_inner_value()
         );
-        assert_eq!(mem.read_32(message + 0x1C), 0);
-        assert_eq!(mem.read_32(message + 0x20), 0x8000);
+        assert_eq!(read_test_32(&system, message + 0x1C), 0);
+        assert_eq!(read_test_32(&system, message + 0x20), 0x8000);
     }
 
     #[test]
@@ -2212,11 +2206,117 @@ fn reply_and_receive_impl(
 
 #[cfg(test)]
 mod reply_receive_tests {
-    use super::ipc_timeout_tick_from_ns;
+    use super::{
+        default_host_thread_service_matches_from_flags, host_thread_ipc_sleep_enabled_from_flags,
+        ipc_timeout_tick_from_ns, should_resolve_host_thread_service_name,
+    };
 
     #[test]
     fn ipc_timeout_tick_from_ns_matches_upstream_saturation_rule() {
         assert_eq!(ipc_timeout_tick_from_ns(100, 5), 107);
         assert_eq!(ipc_timeout_tick_from_ns(i64::MAX - 1, 10), i64::MAX);
+    }
+
+    #[test]
+    fn host_thread_ipc_sleep_follows_all_routing_gates() {
+        assert!(!host_thread_ipc_sleep_enabled_from_flags(
+            false, false, false, false, false
+        ));
+        assert!(host_thread_ipc_sleep_enabled_from_flags(
+            true, false, false, false, false
+        ));
+        assert!(host_thread_ipc_sleep_enabled_from_flags(
+            false, true, false, false, false
+        ));
+        assert!(host_thread_ipc_sleep_enabled_from_flags(
+            false, false, true, false, false
+        ));
+        assert!(!host_thread_ipc_sleep_enabled_from_flags(
+            false, false, false, true, false
+        ));
+        assert!(!host_thread_ipc_sleep_enabled_from_flags(
+            true, true, true, true, true
+        ));
+    }
+
+    #[test]
+    fn service_name_resolution_is_only_for_explicit_service_filter() {
+        unsafe {
+            std::env::remove_var("RUZU_INLINE_IPC");
+            std::env::remove_var("RUZU_SERVER_THREAD_IPC_SERVICE");
+        }
+        assert!(!should_resolve_host_thread_service_name());
+
+        unsafe {
+            std::env::set_var("RUZU_SERVER_THREAD_IPC_SERVICE", "pl:u");
+        }
+        assert!(should_resolve_host_thread_service_name());
+
+        unsafe {
+            std::env::set_var("RUZU_INLINE_IPC", "1");
+        }
+        assert!(!should_resolve_host_thread_service_name());
+
+        unsafe {
+            std::env::remove_var("RUZU_INLINE_IPC");
+            std::env::remove_var("RUZU_SERVER_THREAD_IPC_SERVICE");
+        }
+    }
+
+    #[test]
+    fn default_host_thread_services_are_not_promoted_implicitly() {
+        for service_name in [
+            "IHOSBinderDriver",
+            "pl:s",
+            "pl:u",
+            "audren:u",
+            "IAudioRenderer",
+            "IAudioDevice",
+            "vi:m",
+            "vi:s",
+            "vi:u",
+            "IApplicationDisplayService",
+            "vi::IManagerDisplayService",
+            "vi::ISystemDisplayService",
+            "apm",
+            "apm:am",
+            "apm:sys",
+            "set",
+            "set:cal",
+            "set:fd",
+            "set:sys",
+            "lm",
+            "aoc:u",
+            "time:u",
+            "time:a",
+            "time:r",
+            "time:s",
+            "time:m",
+            "time:su",
+            "time:al",
+            "pctl",
+            "pctl:a",
+            "pctl:r",
+            "pctl:s",
+            "prepo:a",
+            "prepo:a2",
+            "prepo:m",
+            "prepo:s",
+            "prepo:u",
+            "friend:a",
+            "friend:m",
+            "friend:s",
+            "friend:u",
+            "friend:v",
+        ] {
+            assert!(
+                !default_host_thread_service_matches_from_flags(service_name, false, false),
+                "{service_name}"
+            );
+            assert!(
+                !default_host_thread_service_matches_from_flags(service_name, false, true),
+                "{service_name}"
+            );
+        }
     }
 }

@@ -490,10 +490,10 @@ impl ISelfController {
     ) {
         let service = unsafe { &*(this as *const dyn ServiceFramework as *const ISelfController) };
         log::info!("GetLibraryAppletLaunchableEvent called");
-        let handle = {
+        let object_id = {
             let mut applet = service.applet.lock().unwrap();
             applet
-                .ensure_library_applet_launchable_event(ctx)
+                .ensure_library_applet_launchable_event_object_id(ctx)
                 .unwrap_or(0)
         };
         if let Some(thread) = ctx.get_thread() {
@@ -514,7 +514,7 @@ impl ISelfController {
         }
         let mut rb = ResponseBuilder::new(ctx, 2, 1, 0);
         rb.push_result(RESULT_SUCCESS);
-        rb.push_copy_objects(handle);
+        rb.push_copy_object_id(object_id);
     }
 
     /// SetScreenShotPermission (cmd 10).
@@ -883,15 +883,15 @@ impl ISelfController {
     ) {
         let service = unsafe { &*(this as *const dyn ServiceFramework as *const ISelfController) };
         log::debug!("GetAccumulatedSuspendedTickChangedEvent called");
-        let handle = service
+        let object_id = service
             .applet
             .lock()
             .unwrap()
-            .ensure_accumulated_suspended_tick_changed_event(ctx)
+            .ensure_accumulated_suspended_tick_changed_event_object_id(ctx)
             .unwrap_or(0);
         let mut rb = ResponseBuilder::new(ctx, 2, 1, 0);
         rb.push_result(RESULT_SUCCESS);
-        rb.push_copy_objects(handle);
+        rb.push_copy_object_id(object_id);
     }
 
     fn set_album_image_taken_notification_enabled_handler(

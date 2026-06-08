@@ -1215,7 +1215,7 @@ fn format_into(out: &mut String, rec: &LogRecord) {
                 3 => "enqueue_end",
                 4 => "client_begin_wait",
                 5 => "client_resumed",
-                6 => "spawn_fallback_begin",
+                6 => "unused_spawn_fallback_removed",
                 7 => "before_scheduler_lock",
                 8 => "after_scheduler_lock",
                 9 => "before_process_lock",
@@ -1246,8 +1246,9 @@ fn format_into(out: &mut String, rec: &LogRecord) {
                 34 => "after_notify_thread_lock",
                 35 => "before_locked_section_end",
                 36 => "after_locked_section_end",
-                37 => "before_belt_signal",
-                38 => "after_belt_signal",
+                39 => "before_client_ipc_wait_thread_lock",
+                40 => "after_client_ipc_wait_thread_lock",
+                41 => "after_client_ipc_begin_wait",
                 _ => "unknown",
             };
             let _ = writeln!(
@@ -1307,8 +1308,9 @@ fn format_into(out: &mut String, rec: &LogRecord) {
             };
             let _ = writeln!(
                 out,
-                "[SVC_IPC_PROGRESS] stage={} tid={} handle=0x{:X} client_obj={} tls=0x{:X} aux=[0x{:X},0x{:X},0x{:X}]",
+                "[SVC_IPC_PROGRESS] stage={}({}) tid={} handle=0x{:X} client_obj={} tls=0x{:X} aux=[0x{:X},0x{:X},0x{:X}]",
                 stage,
+                rec.args[0],
                 rec.args[1],
                 rec.args[2] as u32,
                 rec.args[3],

@@ -156,13 +156,13 @@ impl IAudioDevice {
             .expect("IAudioDevice event must stay alive for service lifetime")
     }
 
-    /// Return a copy handle for the service-owned event.
+    /// Return the object id for the service-owned readable event.
     ///
     /// Upstream creates/signals the event in the constructor and every Query*Event
-    /// returns the readable end of that same owner event.
-    fn copy_event_handle(this: &dyn ServiceFramework, ctx: &HLERequestContext) -> Option<u32> {
+    /// returns the readable end of that same owner event through OutCopyHandle.
+    fn copy_event_object_id(this: &dyn ServiceFramework, ctx: &HLERequestContext) -> Option<u64> {
         let svc = Self::as_self(this);
-        svc.event().copy_handle(ctx)
+        svc.event().copy_object_id(ctx)
     }
 
     fn name_array_bytes(names: &[[u8; 0x100]]) -> Vec<u8> {
@@ -359,14 +359,14 @@ impl IAudioDevice {
         log::info!("IAudioDevice::QueryAudioDeviceSystemEvent");
         let svc = Self::as_self(this);
         svc.event().signal();
-        if let Some(handle) = Self::copy_event_handle(this, ctx) {
+        if let Some(object_id) = Self::copy_event_object_id(this, ctx) {
             log::info!(
-                "IAudioDevice::QueryAudioDeviceSystemEvent handle={:#x}",
-                handle
+                "IAudioDevice::QueryAudioDeviceSystemEvent readable_event_object_id={:#x}",
+                object_id
             );
             let mut response = CmifResponse::new(ctx, 2, 1, 0);
             response.push_result(RESULT_SUCCESS);
-            response.push_copy_objects(handle);
+            response.push_copy_object_id(object_id);
         } else {
             log::error!("IAudioDevice::QueryAudioDeviceSystemEvent failed to create event");
             let mut response = CmifResponse::new(ctx, 2, 0, 0);
@@ -431,10 +431,10 @@ impl IAudioDevice {
         ctx: &mut HLERequestContext,
     ) {
         log::info!("IAudioDevice::QueryAudioDeviceInputEvent");
-        if let Some(handle) = Self::copy_event_handle(this, ctx) {
+        if let Some(object_id) = Self::copy_event_object_id(this, ctx) {
             let mut response = CmifResponse::new(ctx, 2, 1, 0);
             response.push_result(RESULT_SUCCESS);
-            response.push_copy_objects(handle);
+            response.push_copy_object_id(object_id);
         } else {
             log::error!("IAudioDevice::QueryAudioDeviceInputEvent failed to create event");
             let mut response = CmifResponse::new(ctx, 2, 0, 0);
@@ -449,10 +449,10 @@ impl IAudioDevice {
         ctx: &mut HLERequestContext,
     ) {
         log::info!("IAudioDevice::QueryAudioDeviceOutputEvent");
-        if let Some(handle) = Self::copy_event_handle(this, ctx) {
+        if let Some(object_id) = Self::copy_event_object_id(this, ctx) {
             let mut response = CmifResponse::new(ctx, 2, 1, 0);
             response.push_result(RESULT_SUCCESS);
-            response.push_copy_objects(handle);
+            response.push_copy_object_id(object_id);
         } else {
             log::error!("IAudioDevice::QueryAudioDeviceOutputEvent failed to create event");
             let mut response = CmifResponse::new(ctx, 2, 0, 0);

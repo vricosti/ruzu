@@ -2756,7 +2756,9 @@ impl KProcess {
     }
 
     pub fn unregister_session_object_by_object_id(&mut self, object_id: u64) {
-        self.session_objects.remove(&object_id);
+        if let Some(session) = self.session_objects.remove(&object_id) {
+            session.lock().unwrap().finalize_with_process(self);
+        }
     }
 
     pub fn get_session_by_object_id(&self, object_id: u64) -> Option<Arc<Mutex<KSession>>> {
@@ -2998,12 +3000,14 @@ impl KProcess {
             return false;
         }
 
-        if !self.handle_table.contains_object_id(object_id)
-            && self.transfer_memory_objects.contains_key(&object_id)
-        {
-            self.unregister_transfer_memory_object_by_object_id(object_id);
-        }
         if !self.handle_table.contains_object_id(object_id) {
+            if let Some(client_session) = self.client_session_objects.get(&object_id).cloned() {
+                client_session.lock().unwrap().destroy_with_process(self);
+                self.unregister_client_session_object_by_object_id(object_id);
+            }
+            if self.transfer_memory_objects.contains_key(&object_id) {
+                self.unregister_transfer_memory_object_by_object_id(object_id);
+            }
             self.device_address_space_objects.remove(&object_id);
         }
 

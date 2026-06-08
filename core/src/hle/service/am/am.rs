@@ -22,7 +22,7 @@ use super::window_system::WindowSystem;
 /// In the C++ version, this creates a WindowSystem, ButtonPoller,
 /// EventObserver, and registers the two named services.
 pub fn loop_process(service_manager: &Arc<Mutex<ServiceManager>>, system: crate::core::SystemRef) {
-    let mut server_manager = ServerManager::new(system);
+    let server_manager = ServerManager::new_shared(system);
 
     // Create a shared WindowSystem, matching upstream ownership in window_system.cpp
     // as closely as possible while preserving Rust Arc ownership.
@@ -38,29 +38,36 @@ pub fn loop_process(service_manager: &Arc<Mutex<ServiceManager>>, system: crate:
         guard.set_event_observer(event_observer);
     }
 
-    let ws = window_system.clone();
-    let system_oe = system;
-    let factory_oe: SessionRequestHandlerFactory = Box::new(move || -> SessionRequestHandlerPtr {
-        Arc::new(
-            super::service::application_proxy_service::IApplicationProxyService::new(
-                system_oe,
-                ws.clone(),
-            ),
-        )
-    });
-    server_manager.register_named_service("appletOE", factory_oe, 64);
+    {
+        let mut server_manager = server_manager.lock().unwrap();
 
-    let ws = window_system.clone();
-    let system_ae = system;
-    let factory_ae: SessionRequestHandlerFactory = Box::new(move || -> SessionRequestHandlerPtr {
-        Arc::new(
-            super::service::all_system_applet_proxies_service::IAllSystemAppletProxiesService::new(
-                system_ae,
-                ws.clone(),
-            ),
-        )
-    });
-    server_manager.register_named_service("appletAE", factory_ae, 64);
+        let ws = window_system.clone();
+        let system_oe = system;
+        let factory_oe: SessionRequestHandlerFactory =
+            Box::new(move || -> SessionRequestHandlerPtr {
+                Arc::new(
+                    super::service::application_proxy_service::IApplicationProxyService::new(
+                        system_oe,
+                        ws.clone(),
+                    ),
+                )
+            });
+        server_manager.register_named_service("appletOE", factory_oe, 64);
+
+        let ws = window_system.clone();
+        let system_ae = system;
+        let factory_ae: SessionRequestHandlerFactory = Box::new(
+            move || -> SessionRequestHandlerPtr {
+                Arc::new(
+                    super::service::all_system_applet_proxies_service::IAllSystemAppletProxiesService::new(
+                        system_ae,
+                        ws.clone(),
+                    ),
+                )
+            },
+        );
+        server_manager.register_named_service("appletAE", factory_ae, 64);
+    }
 
     // Upstream reaches `AppletManager::SetWindowSystem(this)` from
     // `EventObserver -> WindowSystem::SetEventObserver()`. Rust keeps the same
@@ -74,5 +81,5 @@ pub fn loop_process(service_manager: &Arc<Mutex<ServiceManager>>, system: crate:
         .get_applet_manager()
         .set_window_system(Some(window_system.clone()));
 
-    ServerManager::run_server(server_manager);
+    ServerManager::run_server_shared(server_manager);
 }

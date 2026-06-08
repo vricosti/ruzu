@@ -107,11 +107,8 @@ impl ILockAccessor {
             }
         }
 
-        let handle = if return_handle {
-            Some(
-                ctx.copy_handle_for_readable_event(Arc::clone(&accessor.readable_event))
-                    .unwrap_or(0),
-            )
+        let object_id = if return_handle {
+            Some(accessor.readable_event_object_id)
         } else {
             None
         };
@@ -120,8 +117,8 @@ impl ILockAccessor {
         rb.push_result(RESULT_SUCCESS);
         rb.push_bool(is_locked);
 
-        if let Some(handle) = handle {
-            rb.push_copy_objects(handle);
+        if let Some(object_id) = object_id {
+            rb.push_copy_object_id(object_id);
         }
     }
 
@@ -150,12 +147,9 @@ impl ILockAccessor {
         let accessor = unsafe { &*(this as *const dyn ServiceFramework as *const ILockAccessor) };
         log::info!("ILockAccessor::GetEvent called");
 
-        let handle = ctx
-            .copy_handle_for_readable_event(Arc::clone(&accessor.readable_event))
-            .unwrap_or(0);
         let mut rb = ResponseBuilder::new(ctx, 2, 1, 0);
         rb.push_result(RESULT_SUCCESS);
-        rb.push_copy_objects(handle);
+        rb.push_copy_object_id(accessor.readable_event_object_id);
     }
 
     /// Port of ILockAccessor::IsLocked

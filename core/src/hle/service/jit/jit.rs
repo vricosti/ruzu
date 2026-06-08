@@ -56,7 +56,7 @@ pub fn loop_process(system: crate::core::SystemRef) {
     use crate::hle::service::hle_ipc::SessionRequestHandlerPtr;
     use crate::hle::service::server_manager::ServerManager;
 
-    let mut server_manager = ServerManager::new(system);
+    let server_manager = ServerManager::new_shared(system);
 
     let stub = |sm: &mut ServerManager, name: &str| {
         let svc_name = name.to_string();
@@ -70,9 +70,12 @@ pub fn loop_process(system: crate::core::SystemRef) {
             64,
         );
     };
-    stub(&mut server_manager, "jit:u");
+    {
+        let mut server_manager = server_manager.lock().unwrap();
+        stub(&mut server_manager, "jit:u");
+    }
 
-    ServerManager::run_server(server_manager);
+    ServerManager::run_server_shared(server_manager);
 }
 
 /// IPC command table for IJitEnvironment.

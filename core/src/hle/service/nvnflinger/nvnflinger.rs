@@ -64,12 +64,12 @@ impl Nvnflinger {
 pub fn loop_process(system: crate::core::SystemRef) {
     let nvnflinger = Arc::new(Nvnflinger::new(system));
 
-    let mut server_manager = ServerManager::new(system);
+    let server_manager = ServerManager::new_shared(system);
     let binder_driver = Arc::clone(nvnflinger.get_binder_driver());
-    server_manager.register_named_service(
+    server_manager.lock().unwrap().register_named_service(
         "dispdrv",
         Box::new(move || -> Arc<dyn SessionRequestHandler> { binder_driver.clone() }),
         64,
     );
-    ServerManager::run_server(server_manager);
+    ServerManager::run_server_shared(server_manager);
 }

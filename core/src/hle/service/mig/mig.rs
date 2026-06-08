@@ -3,14 +3,15 @@
 
 //! Port of zuyu/src/core/hle/service/mig/mig.cpp
 //!
-//! MIG_USR service ("mig:user"). All commands are unimplemented stubs.
+//! MIG_USR service registered as "mig:user". All commands are unimplemented stubs.
 
 use crate::hle::result::ResultCode;
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
 use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
 use std::collections::BTreeMap;
 
-/// MIG_USR service ("mig:user"). All stubs.
+/// MIG_USR service object. Upstream names the object "mig:usr" and registers
+/// it under the named service "mig:user".
 pub struct MigUsr {
     handlers: BTreeMap<u32, FunctionInfo>,
     handlers_tipc: BTreeMap<u32, FunctionInfo>,
@@ -44,13 +45,13 @@ impl SessionRequestHandler for MigUsr {
         ServiceFramework::handle_sync_request_impl(self, ctx)
     }
     fn service_name(&self) -> &str {
-        "mig:user"
+        "mig:usr"
     }
 }
 
 impl ServiceFramework for MigUsr {
     fn get_service_name(&self) -> &str {
-        "mig:user"
+        "mig:usr"
     }
     fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> {
         &self.handlers
@@ -60,27 +61,22 @@ impl ServiceFramework for MigUsr {
     }
 }
 
-/// Registers "mig:usr" service.
+/// Registers "mig:user" service.
 ///
 /// Corresponds to `LoopProcess` in upstream `mig.cpp`.
 pub fn loop_process(system: crate::core::SystemRef) {
     use crate::hle::service::hle_ipc::SessionRequestHandlerPtr;
     use crate::hle::service::server_manager::ServerManager;
 
-    let mut server_manager = ServerManager::new(system);
+    let server_manager = ServerManager::new_shared(system);
 
-    let stub = |sm: &mut ServerManager, name: &str| {
-        let svc_name = name.to_string();
-        sm.register_named_service(
-            name,
-            Box::new(move || -> SessionRequestHandlerPtr {
-                std::sync::Arc::new(crate::hle::service::services::GenericStubService::new(
-                    &svc_name,
-                ))
-            }),
+    {
+        let mut server_manager = server_manager.lock().unwrap();
+        server_manager.register_named_service(
+            "mig:user",
+            Box::new(|| -> SessionRequestHandlerPtr { std::sync::Arc::new(MigUsr::new()) }),
             64,
         );
-    };
-    stub(&mut server_manager, "mig:usr");
-    ServerManager::run_server(server_manager);
+    }
+    ServerManager::run_server_shared(server_manager);
 }

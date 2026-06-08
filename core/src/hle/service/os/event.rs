@@ -189,6 +189,22 @@ impl Event {
         ctx.copy_handle_for_readable_event(readable_event)
     }
 
+    /// Return the readable event object id without pre-allocating a process
+    /// handle. Upstream `Event::GetHandle()` returns `KReadableEvent*`; IPC
+    /// write-back translates that object into a copy handle later.
+    pub fn copy_object_id(&self, ctx: &HLERequestContext) -> Option<u64> {
+        let readable_event = self.create_kernel_bridge_from_context(ctx)?;
+        if std::env::var_os("RUZU_TRACE_EVENT_HANDOUT").is_some() {
+            let object_id = readable_event.lock().unwrap().object_id;
+            log::info!(
+                "[EVENT_HANDOUT] readable_event object_id={} deferred_handle bt:\n{}",
+                object_id,
+                std::backtrace::Backtrace::force_capture()
+            );
+        }
+        ctx.register_readable_event_object(readable_event)
+    }
+
     pub fn kernel_object_id(&self) -> Option<u64> {
         self.kernel_bridge
             .lock()

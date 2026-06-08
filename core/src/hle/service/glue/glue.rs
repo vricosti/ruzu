@@ -36,22 +36,26 @@ use crate::hle::service::sm::sm::ServiceManager;
 /// ```
 ///
 pub fn loop_process(service_manager: &Arc<Mutex<ServiceManager>>, system: crate::core::SystemRef) {
-    let mut server_manager = ServerManager::new(system);
+    let server_manager = ServerManager::new_shared(system);
 
-    // ARP — stub until real implementations
-    register_stub(&mut server_manager, "arp:r");
-    register_stub(&mut server_manager, "arp:w");
+    {
+        let mut server_manager = server_manager.lock().unwrap();
 
-    // BackGround Task Controller — stub
-    register_stub(&mut server_manager, "bgtc:t");
-    register_stub(&mut server_manager, "bgtc:sc");
+        // ARP — stub until real implementations
+        register_stub(&mut server_manager, "arp:r");
+        register_stub(&mut server_manager, "arp:w");
 
-    // Error Context — stub
-    register_stub(&mut server_manager, "ectx:aw");
+        // BackGround Task Controller — stub
+        register_stub(&mut server_manager, "bgtc:t");
+        register_stub(&mut server_manager, "bgtc:sc");
 
-    // Notification Services — stub
-    register_stub(&mut server_manager, "notif:a");
-    register_stub(&mut server_manager, "notif:s");
+        // Error Context — stub
+        register_stub(&mut server_manager, "ectx:aw");
+
+        // Notification Services — stub
+        register_stub(&mut server_manager, "notif:a");
+        register_stub(&mut server_manager, "notif:s");
+    }
 
     // Create the Glue::Time::TimeManager, matching upstream constructor.
     // This makes direct calls to time:m and set:sys via ServiceManager.
@@ -66,6 +70,7 @@ pub fn loop_process(service_manager: &Arc<Mutex<ServiceManager>>, system: crate:
     // Time services — upstream creates a shared TimeManager and passes it
     // to each StaticService instance.
     {
+        let mut server_manager = server_manager.lock().unwrap();
         use crate::hle::service::glue::time::r#static::StaticService as GlueTimeStaticService;
         use crate::hle::service::psc::time::common::StaticServiceSetupInfo;
 
@@ -165,7 +170,7 @@ pub fn loop_process(service_manager: &Arc<Mutex<ServiceManager>>, system: crate:
     );
 
     // Upstream: ServerManager::RunServer(std::move(server_manager));
-    ServerManager::run_server(server_manager);
+    ServerManager::run_server_shared(server_manager);
 }
 
 /// Helper to register a stub service on a ServerManager.

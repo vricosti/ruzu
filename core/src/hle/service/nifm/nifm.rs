@@ -1037,23 +1037,26 @@ pub fn loop_process(system: crate::core::SystemRef) {
     use crate::hle::service::hle_ipc::SessionRequestHandlerPtr;
     use crate::hle::service::server_manager::ServerManager;
 
-    let mut server_manager = ServerManager::new(system);
+    let server_manager = ServerManager::new_shared(system);
 
-    server_manager.register_named_service(
-        "nifm:a",
-        Box::new(|| -> SessionRequestHandlerPtr { Arc::new(NetworkInterface::new("nifm:a")) }),
-        16,
-    );
-    server_manager.register_named_service(
-        "nifm:s",
-        Box::new(|| -> SessionRequestHandlerPtr { Arc::new(NetworkInterface::new("nifm:s")) }),
-        16,
-    );
-    server_manager.register_named_service(
-        "nifm:u",
-        Box::new(|| -> SessionRequestHandlerPtr { Arc::new(NetworkInterface::new("nifm:u")) }),
-        16,
-    );
+    {
+        let mut server_manager = server_manager.lock().unwrap();
+        server_manager.register_named_service(
+            "nifm:a",
+            Box::new(|| -> SessionRequestHandlerPtr { Arc::new(NetworkInterface::new("nifm:a")) }),
+            16,
+        );
+        server_manager.register_named_service(
+            "nifm:s",
+            Box::new(|| -> SessionRequestHandlerPtr { Arc::new(NetworkInterface::new("nifm:s")) }),
+            16,
+        );
+        server_manager.register_named_service(
+            "nifm:u",
+            Box::new(|| -> SessionRequestHandlerPtr { Arc::new(NetworkInterface::new("nifm:u")) }),
+            16,
+        );
+    }
 
-    ServerManager::run_server(server_manager);
+    ServerManager::run_server_shared(server_manager);
 }

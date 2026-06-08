@@ -569,8 +569,21 @@ fn dump_thread_state(kernel: &KernelCore) {
                     let handle_line = match client_session.try_lock() {
                         Ok(client) => {
                             let parent_id = client.get_parent_id();
-                            let manager_name = client
-                                .request_manager()
+                            let server_session = parent_id
+                                .and_then(|parent_id| guard.get_session_by_object_id(parent_id))
+                                .and_then(|session| {
+                                    session
+                                        .try_lock()
+                                        .ok()
+                                        .map(|session| session.get_server_session().clone())
+                                });
+                            let manager_name = server_session
+                                .as_ref()
+                                .and_then(|server_session| {
+                                    server_session.try_lock().ok().and_then(|server_session| {
+                                        server_session.get_manager().cloned()
+                                    })
+                                })
                                 .and_then(|manager| {
                                     manager.lock().ok().and_then(|manager| {
                                         manager
@@ -1406,8 +1419,11 @@ pub struct KernelCore {
     slab_resource_counts: KSlabResourceCounts,
 
     // -- Process tracking --
-    // application_process: Option<*mut KProcess>,
-    // process_list: Vec<*mut KProcess>,
+    /// Kernel process list.
+    ///
+    /// Upstream: `KernelCore::Impl::process_list`, populated by `KProcess::Register`.
+    /// Rust stores the stable `Arc<ProcessLock>` owners instead of raw `KProcess*`.
+    process_list: Mutex<Vec<Arc<ProcessLock>>>,
     process_list_lock: Mutex<()>,
 
     // -- Registered objects for leak tracking --
@@ -1525,6 +1541,7 @@ impl KernelCore {
 
             slab_resource_counts: KSlabResourceCounts::create_default(),
 
+            process_list: Mutex::new(Vec::new()),
             process_list_lock: Mutex::new(()),
             registered_objects: Mutex::new(Vec::new()),
             registered_in_use_objects: Mutex::new(Vec::new()),
@@ -1655,6 +1672,7 @@ impl KernelCore {
 
         // Create a service process for tracking.
         let process = Arc::new(ProcessLock::from_value(super::k_process::KProcess::new()));
+        self.register_process(Arc::clone(&process));
         // Minimal init — service processes don't need page tables or user memory.
         self.service_processes
             .lock()
@@ -1840,6 +1858,7 @@ impl KernelCore {
             process_guard.bind_self_reference(&process);
         }
 
+        self.register_process(Arc::clone(&process));
         self.host_service_processes
             .lock()
             .unwrap()
@@ -2040,40 +2059,8 @@ impl KernelCore {
         }
     }
 
-    /// Port of upstream `KernelCore::RunServer`.
-    pub fn run_server(&self, server_manager: ServerManager) {
-        let manager = Arc::new(Mutex::new(server_manager));
-        manager.lock().unwrap().bind_self_reference(&manager);
-
-        // Publish service ownership to ServiceManager now that
-        // bind_self_reference has set `self_reference`. connect_to_named_port
-        // can then look up (queue, wakeup, server_manager) by service name and
-        // wire the new session's SessionRequestManager non-orphan.
-        let (names, queue, wakeup) = {
-            let mut guard = manager.lock().unwrap();
-            (
-                guard.take_owned_service_names(),
-                guard.pending_registrations_arc(),
-                guard.wakeup_event_arc(),
-            )
-        };
-        if !names.is_empty() {
-            if let Some(service_manager) = self.system_ref.get().service_manager() {
-                let mut sm_guard = service_manager.lock().unwrap();
-                let server_weak = Arc::downgrade(&manager);
-                for name in names {
-                    sm_guard.set_service_ownership(
-                        &name,
-                        crate::hle::service::sm::sm::ServiceOwnership {
-                            queue: queue.clone(),
-                            wakeup: wakeup.clone(),
-                            server_manager: server_weak.clone(),
-                        },
-                    );
-                }
-            }
-        }
-
+    /// Run a service manager that already lives in its final shared Rust owner.
+    pub fn run_server_shared(&self, manager: Arc<Mutex<ServerManager>>) {
         {
             let mut managers = self.server_managers.lock().unwrap();
             if self.is_shutting_down.load(Ordering::Relaxed) {
@@ -2082,15 +2069,49 @@ impl KernelCore {
             managers.push(Arc::clone(&manager));
         }
 
-        crate::hle::service::server_manager::ServerManager::activate_additional_host_threads(
-            &manager,
-        );
-
         crate::hle::service::server_manager::ServerManager::loop_process_shared(&manager);
     }
 
     pub(crate) fn track_server_manager_for_test(&self, server_manager: Arc<Mutex<ServerManager>>) {
         self.server_managers.lock().unwrap().push(server_manager);
+    }
+
+    pub(crate) fn ensure_tracked_server_manager_port_registrations(
+        &self,
+        process: Arc<ProcessLock>,
+    ) {
+        let managers = self.server_managers.lock().unwrap().clone();
+        for manager in managers {
+            manager
+                .lock()
+                .unwrap()
+                .ensure_kernel_port_registrations_for_process(Arc::clone(&process));
+        }
+    }
+
+    /// Register a process in the kernel-global process list.
+    ///
+    /// Upstream performs this from `KProcess::Register`. Keeping the owner in
+    /// `KernelCore` lets services such as PM query the live process list instead
+    /// of carrying per-service snapshots.
+    pub fn register_process(&self, process: Arc<ProcessLock>) {
+        let _guard = self.process_list_lock.lock().unwrap();
+        let mut process_list = self.process_list.lock().unwrap();
+        if !process_list
+            .iter()
+            .any(|registered| Arc::ptr_eq(registered, &process))
+        {
+            process_list.push(process);
+        }
+    }
+
+    /// Return the live kernel process list.
+    ///
+    /// Upstream returns a `std::list<KScopedAutoObject<KProcess>>` copy. Cloning
+    /// the `Arc` owners gives Rust callers the same snapshot semantics.
+    pub fn get_process_list(&self) -> Vec<Arc<ProcessLock>> {
+        let _guard = self.process_list_lock.lock().unwrap();
+        self.process_list.lock().unwrap().clone()
     }
 
     /// Suspend or resume emulation threads for the current application process.
@@ -2140,26 +2161,9 @@ impl KernelCore {
     /// process list. Returns the frontend application process or a guest
     /// service process with the matching process id.
     pub fn get_process_by_id(&self, process_id: u64) -> Option<Arc<ProcessLock>> {
-        if let Some(process) = self.system_ref.get().current_process_arc.as_ref().cloned() {
-            if process.lock().unwrap().get_process_id() == process_id {
-                return Some(process);
-            }
-        }
-
-        self.service_processes
-            .lock()
-            .unwrap()
-            .iter()
+        self.get_process_list()
+            .into_iter()
             .find(|process| process.lock().unwrap().get_process_id() == process_id)
-            .cloned()
-            .or_else(|| {
-                self.host_service_processes
-                    .lock()
-                    .unwrap()
-                    .iter()
-                    .find(|process| process.lock().unwrap().get_process_id() == process_id)
-                    .cloned()
-            })
     }
 
     /// Rust counterpart to upstream `KernelCore::GetProcessList()` scans that
@@ -2298,6 +2302,21 @@ impl KernelCore {
             if let Some(port) = process_guard.get_client_port_by_object_id(client_port_object_id) {
                 return Some(port);
             }
+        }
+
+        if let Some(port) = self
+            .process_list
+            .lock()
+            .unwrap()
+            .iter()
+            .find_map(|process| {
+                process
+                    .lock()
+                    .unwrap()
+                    .get_client_port_by_object_id(client_port_object_id)
+            })
+        {
+            return Some(port);
         }
 
         self.service_processes
@@ -2469,6 +2488,12 @@ impl KernelCore {
     /// Get the object name global data.
     pub fn object_name_global_data(&self) -> Option<&KObjectNameGlobalData> {
         self.object_name_global_data.as_ref()
+    }
+
+    pub fn ensure_object_name_global_data_for_test(&mut self) {
+        if self.object_name_global_data.is_none() {
+            self.object_name_global_data = Some(KObjectNameGlobalData::new());
+        }
     }
 
     /// Get the current emulation thread for the calling host thread.
@@ -2899,12 +2924,27 @@ mod tests {
     #[test]
     fn close_services_requests_stop_on_tracked_server_managers() {
         let kernel = KernelCore::new();
-        let manager = Arc::new(Mutex::new(ServerManager::new(SystemRef::null())));
+        let manager = ServerManager::new_shared(SystemRef::null());
 
         kernel.track_server_manager_for_test(Arc::clone(&manager));
         kernel.close_services();
 
         assert!(manager.lock().unwrap().stop_requested_for_test());
+    }
+
+    #[test]
+    fn process_list_registration_is_idempotent_and_queryable() {
+        let kernel = KernelCore::new();
+        let process = Arc::new(ProcessLock::from_value(KProcess::new()));
+        process.lock().unwrap().process_id = 0x1234;
+
+        kernel.register_process(Arc::clone(&process));
+        kernel.register_process(Arc::clone(&process));
+
+        assert_eq!(kernel.get_process_list().len(), 1);
+        assert!(kernel
+            .get_process_by_id(0x1234)
+            .is_some_and(|found| Arc::ptr_eq(&found, &process)));
     }
 
     #[test]

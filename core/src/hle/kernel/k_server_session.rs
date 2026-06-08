@@ -214,6 +214,12 @@ pub struct KServerSession {
 }
 
 impl KServerSession {
+    fn record_ipc_phase_count(label: &'static str) {
+        if std::env::var_os("RUZU_PROFILE_IPC_PHASES").is_some() {
+            crate::hle::kernel::svc::svc_ipc::record_ipc_phase(label, std::time::Duration::ZERO);
+        }
+    }
+
     fn get_map_alias_memory_state(attribute: u32) -> Option<KMemoryState> {
         match attribute {
             x if x == crate::hle::kernel::message_buffer::MapAliasAttribute::Ipc as u32 => {
@@ -565,7 +571,7 @@ impl KServerSession {
     }
 
     fn process_send_message_receive_mapping(
-        _src_page_table: &KProcessPageTable,
+        src_page_table: &KProcessPageTable,
         dst_page_table: &KProcessPageTable,
         client_address: KProcessAddress,
         server_address: KProcessAddress,
@@ -584,16 +590,21 @@ impl KServerSession {
 
         let client_address = client_address.get();
         let server_address = server_address.get();
+        let Some(source_bytes) = src_page_table
+            .get_base()
+            .read_block_from_own_page_table(server_address as usize, size)
+        else {
+            return RESULT_INVALID_CURRENT_MEMORY.get_inner_value();
+        };
         let aligned_dst_start = client_address & !((PAGE_SIZE as u64) - 1);
         let aligned_dst_end = (client_address + size as u64).next_multiple_of(PAGE_SIZE as u64);
         let mapping_dst_start = client_address.next_multiple_of(PAGE_SIZE as u64);
         let mapping_dst_end = (client_address + size as u64) & !((PAGE_SIZE as u64) - 1);
-        let mapping_src_end = (server_address + size as u64) & !((PAGE_SIZE as u64) - 1);
 
         if aligned_dst_start != mapping_dst_start {
             debug_assert!(client_address < mapping_dst_start);
             let copy_size = std::cmp::min(size, (mapping_dst_start - client_address) as usize);
-            let rc = dst_page_table.copy_memory_from_user_to_linear(
+            let rc = dst_page_table.copy_memory_from_kernel_to_linear(
                 KProcessAddress::new(client_address),
                 copy_size,
                 test_state,
@@ -601,7 +612,7 @@ impl KServerSession {
                 KMemoryPermission::USER_READ_WRITE,
                 test_attr_mask,
                 KMemoryAttribute::NONE,
-                KProcessAddress::new(server_address),
+                source_bytes.as_ptr() as usize,
             );
             if rc != crate::hle::result::RESULT_SUCCESS.get_inner_value() {
                 return rc;
@@ -612,7 +623,8 @@ impl KServerSession {
             && (aligned_dst_start == mapping_dst_start || aligned_dst_start < mapping_dst_end)
         {
             let copy_size = (client_address + size as u64 - mapping_dst_end) as usize;
-            let rc = dst_page_table.copy_memory_from_user_to_linear(
+            let source_offset = mapping_dst_end.saturating_sub(client_address) as usize;
+            let rc = dst_page_table.copy_memory_from_kernel_to_linear(
                 KProcessAddress::new(mapping_dst_end),
                 copy_size,
                 test_state,
@@ -620,7 +632,7 @@ impl KServerSession {
                 KMemoryPermission::USER_READ_WRITE,
                 test_attr_mask,
                 KMemoryAttribute::NONE,
-                KProcessAddress::new(mapping_src_end),
+                unsafe { source_bytes.as_ptr().add(source_offset) as usize },
             );
             if rc != crate::hle::result::RESULT_SUCCESS.get_inner_value() {
                 return rc;
@@ -1909,6 +1921,7 @@ impl KServerSession {
         };
 
         if let Some(event_id) = event_id {
+            Self::record_ipc_phase_count("reply_01_async_event");
             if let Some(client_process_id) = client_process_id {
                 if let Some(kernel) = crate::hle::kernel::kernel::get_kernel_ref() {
                     if let Some(process_arc) = kernel.get_process_by_id(client_process_id) {
@@ -2089,9 +2102,70 @@ impl KServerSession {
         self.on_request_impl(request)
     }
 
+    /// Host-thread IPC variant of `OnRequest`.
+    ///
+    /// Upstream drops `KScopedSchedulerLock` at the end of
+    /// `KServerSession::OnRequest`, where no host mutex is held. The Rust port
+    /// enters this method while holding `Mutex<KServerSession>`. For
+    /// synchronous requests, the scheduler unlock may switch fibers; returning
+    /// the guard lets `KSession` drop the server mutex first and then unlock
+    /// scheduling, preserving upstream ordering without holding a Rust mutex
+    /// across the fiber switch.
+    pub fn on_request_defer_scheduler_unlock(
+        &mut self,
+        request: Arc<Mutex<KSessionRequest>>,
+    ) -> (
+        u32,
+        Option<super::k_scheduler_lock::KScopedSchedulerLock<'static>>,
+    ) {
+        self.on_request_impl_defer_scheduler_unlock(request)
+    }
+
     fn on_request_impl(&mut self, request: Arc<Mutex<KSessionRequest>>) -> u32 {
         let _scheduler_lock = crate::hle::kernel::kernel::scheduler_lock()
             .map(super::k_scheduler_lock::KScopedSchedulerLock::new);
+
+        self.on_request_impl_locked(request)
+    }
+
+    fn on_request_impl_defer_scheduler_unlock(
+        &mut self,
+        request: Arc<Mutex<KSessionRequest>>,
+    ) -> (
+        u32,
+        Option<super::k_scheduler_lock::KScopedSchedulerLock<'static>>,
+    ) {
+        let profile_phases = std::env::var_os("RUZU_PROFILE_IPC_PHASES").is_some();
+        let mut phase_last = profile_phases.then(std::time::Instant::now);
+        let mut record_phase = |label: &'static str, last: &mut Option<std::time::Instant>| {
+            if let Some(t) = last {
+                crate::hle::kernel::svc::svc_ipc::record_ipc_phase(label, t.elapsed());
+                *last = Some(std::time::Instant::now());
+            }
+        };
+
+        let scheduler_lock = crate::hle::kernel::kernel::scheduler_lock()
+            .map(super::k_scheduler_lock::KScopedSchedulerLock::new);
+        record_phase("on_request_defer_01_scheduler_lock", &mut phase_last);
+
+        let result = self.on_request_impl_locked(request);
+        record_phase("on_request_defer_02_impl_locked", &mut phase_last);
+        if result == crate::hle::result::RESULT_SUCCESS.get_inner_value() {
+            (result, scheduler_lock)
+        } else {
+            (result, None)
+        }
+    }
+
+    fn on_request_impl_locked(&mut self, request: Arc<Mutex<KSessionRequest>>) -> u32 {
+        let profile_phases = std::env::var_os("RUZU_PROFILE_IPC_PHASES").is_some();
+        let mut phase_last = profile_phases.then(std::time::Instant::now);
+        let mut record_phase = |label: &'static str, last: &mut Option<std::time::Instant>| {
+            if let Some(t) = last {
+                crate::hle::kernel::svc::svc_ipc::record_ipc_phase(label, t.elapsed());
+                *last = Some(std::time::Instant::now());
+            }
+        };
 
         if self.client_closed {
             return RESULT_SESSION_CLOSED.get_inner_value();
@@ -2101,28 +2175,45 @@ impl KServerSession {
             let request = request.lock().unwrap();
             (request.get_thread(), request.get_event_id().is_none())
         };
+        record_phase("on_request_01_request_lock", &mut phase_last);
 
         if let Some(current_thread) = &request_thread {
             if current_thread.lock().unwrap().is_termination_requested() {
                 return RESULT_TERMINATION_REQUESTED.get_inner_value();
             }
         }
+        record_phase("on_request_02_termination_check", &mut phase_last);
 
         let was_empty = self.request_list.is_empty();
         self.request_list.push_back(request);
+        record_phase("on_request_03_enqueue", &mut phase_last);
         if was_empty {
             self.notify_available(crate::hle::result::RESULT_SUCCESS.get_inner_value());
         }
+        record_phase("on_request_04_notify_available", &mut phase_last);
 
         if is_sync_request {
             if let Some(current_thread) = request_thread {
+                if common::trace::is_enabled(common::trace::cat::HOST_THREAD_IPC) {
+                    common::trace::emit_raw(common::trace::cat::HOST_THREAD_IPC, &[39, 0]);
+                }
                 let mut thread = current_thread.lock().unwrap();
+                record_phase("on_request_05_thread_lock", &mut phase_last);
+                if common::trace::is_enabled(common::trace::cat::HOST_THREAD_IPC) {
+                    common::trace::emit_raw(common::trace::cat::HOST_THREAD_IPC, &[40, 0]);
+                }
                 thread.set_wait_reason_for_debugging(
                     super::k_thread::ThreadWaitReasonForDebugging::Ipc,
                 );
+                record_phase("on_request_06_set_wait_reason", &mut phase_last);
                 thread.begin_wait();
+                record_phase("on_request_07_begin_wait", &mut phase_last);
+                if common::trace::is_enabled(common::trace::cat::HOST_THREAD_IPC) {
+                    common::trace::emit_raw(common::trace::cat::HOST_THREAD_IPC, &[41, 0]);
+                }
             }
         }
+        record_phase("on_request_08_done", &mut phase_last);
 
         0 // ResultSuccess
     }
@@ -2246,6 +2337,7 @@ impl KServerSession {
                 }
             }
         } else if let Some(client_thread) = &client_thread {
+            Self::record_ipc_phase_count("reply_02_sync_client");
             if trace_reply {
                 log::info!(
                     "KServerSession::send_reply_with_message stage=before_lock_client_thread"
@@ -2300,34 +2392,13 @@ impl KServerSession {
                         client_thread.get_state()
                     );
                 }
-                // Accept the reply wake in two cases:
-                // 1. the client is not parked, preserving upstream's no-op
-                //    behavior inside `KThread::EndWait`;
-                // 2. the client is parked specifically in an IPC wait.
-                //
-                // Do not wake arbitrary WAITING states. A stale/late reply can
-                // arrive after the client has moved on to WaitSynchronization
-                // or Sleep; calling `end_wait` there hits
-                // KThreadQueueWithoutEndWait and resumes the wrong wait object,
-                // leaving the old SFCO reply in TLS to be parsed as a fresh
-                // nvdrv request.
-                let should_wake_client = client_thread.get_state()
-                    != super::k_thread::ThreadState::WAITING
-                    || client_thread.get_wait_reason_for_debugging()
-                        == super::k_thread::ThreadWaitReasonForDebugging::Ipc;
-                if should_wake_client {
-                    client_thread.end_wait(client_result);
-                } else if trace_reply {
-                    log::info!(
-                        "KServerSession::send_reply_with_message stage=skip_stale_reply state={:?} reason={:?}",
-                        client_thread.get_state(),
-                        client_thread.get_wait_reason_for_debugging()
-                    );
-                }
+                Self::record_ipc_phase_count("reply_03_end_wait_call");
+                client_thread.end_wait(client_result);
                 if trace_reply {
                     log::info!("KServerSession::send_reply_with_message stage=after_end_wait");
                 }
             } else if trace_reply {
+                Self::record_ipc_phase_count("reply_05_skip_termination");
                 log::info!(
                     "KServerSession::send_reply_with_message stage=skip_end_wait_terminating state={:?}",
                     client_thread.get_state(),
@@ -2418,6 +2489,7 @@ impl KServerSession {
         };
 
         if let Some(event_id) = event_id {
+            Self::record_ipc_phase_count("reply_hle_01_async_event");
             if let Some(client_process_id) = client_process_id {
                 if let Some(kernel) = crate::hle::kernel::kernel::get_kernel_ref() {
                     if let Some(process_arc) = kernel.get_process_by_id(client_process_id) {
@@ -2442,17 +2514,15 @@ impl KServerSession {
                 }
             }
         } else if let Some(client_thread) = &client_thread {
+            Self::record_ipc_phase_count("reply_hle_02_sync_client");
             let _scheduler_lock = crate::hle::kernel::kernel::scheduler_lock()
                 .map(super::k_scheduler_lock::KScopedSchedulerLock::new);
             let mut client_thread = client_thread.lock().unwrap();
             if !client_thread.is_termination_requested() {
-                let should_wake_client = client_thread.get_state()
-                    != super::k_thread::ThreadState::WAITING
-                    || client_thread.get_wait_reason_for_debugging()
-                        == super::k_thread::ThreadWaitReasonForDebugging::Ipc;
-                if should_wake_client {
-                    client_thread.end_wait(client_result);
-                }
+                Self::record_ipc_phase_count("reply_hle_03_end_wait_call");
+                client_thread.end_wait(client_result);
+            } else {
+                Self::record_ipc_phase_count("reply_hle_05_skip_termination");
             }
         }
 
@@ -2888,6 +2958,39 @@ mod tests {
             .set_current_page_table(impl_pt.as_mut() as *mut _);
     }
 
+    fn bind_request_client_thread_for_session_test(
+        request: &mut KSessionRequest,
+        client_thread: &Arc<KThreadLock>,
+    ) {
+        let (thread_id, client_process_id) = {
+            let thread = client_thread.lock().unwrap();
+            (
+                thread.thread_id,
+                thread
+                    .parent
+                    .as_ref()
+                    .and_then(|process| process.upgrade())
+                    .map(|process| process.lock().unwrap().process_id),
+            )
+        };
+        request.thread = Some(Arc::downgrade(client_thread));
+        request.thread_id = Some(thread_id);
+        request.client_process_id = client_process_id;
+    }
+
+    fn prepare_process_memory_for_session_test(
+        process: &mut crate::hle::kernel::k_process::KProcess,
+    ) {
+        process.allocate_code_memory(0, 0x10000);
+        process.process_memory.write().unwrap().allocate(0, 0x10000);
+    }
+
+    fn park_client_thread_for_ipc_session_test(client_thread: &Arc<KThreadLock>) {
+        let mut thread = client_thread.lock().unwrap();
+        thread.set_wait_reason_for_debugging(ThreadWaitReasonForDebugging::Ipc);
+        thread.begin_wait();
+    }
+
     #[test]
     fn message_words_use_process_page_table_not_memory_current_page_table() {
         let mut page_table_memory = SessionPageTableMemoryForTest::new(0x40000);
@@ -3022,7 +3125,7 @@ mod tests {
         }
         server.current_request = Some(request);
 
-        assert_eq!(server.send_reply_with_message(0x2000, 0x100, 0, false), 0);
+        assert_eq!(server.send_reply_with_message(0x2000, 0x100, 0, true), 0);
         let process = system.current_process_arc();
         let process = process.lock().unwrap();
         let readable = process
@@ -3218,8 +3321,7 @@ mod tests {
         let request = Arc::new(Mutex::new(KSessionRequest::new()));
         {
             let mut request_guard = request.lock().unwrap();
-            request_guard.thread_id = Some(7);
-            request_guard.client_process_id = Some(9);
+            bind_request_client_thread_for_session_test(&mut request_guard, &thread);
             request_guard.address = 0x2395800;
             request_guard.size = 0x80;
         }
@@ -3345,8 +3447,7 @@ mod tests {
         let request = Arc::new(Mutex::new(KSessionRequest::new()));
         {
             let mut request_guard = request.lock().unwrap();
-            request_guard.thread_id = Some(7);
-            request_guard.client_process_id = Some(9);
+            bind_request_client_thread_for_session_test(&mut request_guard, &thread);
             request_guard.address = 0x2395200;
             request_guard.size = 0;
         }
@@ -3377,12 +3478,12 @@ mod tests {
             thread_guard.thread_id = 7;
             thread_guard.object_id = 8;
             thread_guard.parent = Some(Arc::downgrade(&process));
-            thread_guard.begin_wait();
         }
         process
             .lock()
             .unwrap()
             .register_thread_object(Arc::clone(&client_thread));
+        park_client_thread_for_ipc_session_test(&client_thread);
 
         let mut system = crate::core::System::new_for_test();
         system.set_current_process_arc(Arc::clone(&process));
@@ -3392,12 +3493,11 @@ mod tests {
         let request = Arc::new(Mutex::new(KSessionRequest::new()));
         {
             let mut request_guard = request.lock().unwrap();
-            request_guard.thread_id = Some(7);
-            request_guard.client_process_id = Some(9);
+            bind_request_client_thread_for_session_test(&mut request_guard, &client_thread);
         }
         server.current_request = Some(request);
 
-        assert_eq!(server.send_reply_with_message(0x2000, 0x100, 0, false), 0);
+        assert_eq!(server.send_reply_with_message(0x2000, 0x100, 0, true), 0);
         let client_thread = client_thread.lock().unwrap();
         assert_eq!(
             client_thread.get_wait_result(),
@@ -3444,8 +3544,7 @@ mod tests {
         let request = Arc::new(Mutex::new(KSessionRequest::new()));
         {
             let mut request_guard = request.lock().unwrap();
-            request_guard.thread_id = Some(7);
-            request_guard.client_process_id = Some(9);
+            bind_request_client_thread_for_session_test(&mut request_guard, &client_thread);
         }
         server.current_request = Some(request);
 
@@ -3668,6 +3767,7 @@ mod tests {
             .lock()
             .unwrap()
             .register_thread_object(Arc::clone(&client_thread));
+        park_client_thread_for_ipc_session_test(&client_thread);
 
         let mut server_process = crate::hle::kernel::k_process::KProcess::new();
         server_process.process_id = 8;
@@ -4012,6 +4112,7 @@ mod tests {
     fn send_reply_with_message_copies_raw_reply_payload_for_simple_message() {
         let mut client_process = crate::hle::kernel::k_process::KProcess::new();
         client_process.process_id = 7;
+        prepare_process_memory_for_session_test(&mut client_process);
         let client_process = Arc::new(ProcessLock::from_value(client_process));
 
         let client_thread = Arc::new(KThreadLock::new(
@@ -4029,9 +4130,11 @@ mod tests {
             .lock()
             .unwrap()
             .register_thread_object(Arc::clone(&client_thread));
+        park_client_thread_for_ipc_session_test(&client_thread);
 
         let mut server_process = crate::hle::kernel::k_process::KProcess::new();
         server_process.process_id = 8;
+        prepare_process_memory_for_session_test(&mut server_process);
         let server_process = Arc::new(ProcessLock::from_value(server_process));
 
         let server_thread = Arc::new(KThreadLock::new(
@@ -4082,8 +4185,7 @@ mod tests {
         let request = Arc::new(Mutex::new(KSessionRequest::new()));
         {
             let mut request = request.lock().unwrap();
-            request.thread_id = Some(3);
-            request.client_process_id = Some(7);
+            bind_request_client_thread_for_session_test(&mut request, &client_thread);
             request.address = 0;
             request.size = 0;
         }
@@ -4127,6 +4229,7 @@ mod tests {
             .lock()
             .unwrap()
             .register_thread_object(Arc::clone(&client_thread));
+        park_client_thread_for_ipc_session_test(&client_thread);
 
         let mut server_process = crate::hle::kernel::k_process::KProcess::new();
         server_process.process_id = 8;
@@ -4184,8 +4287,7 @@ mod tests {
         let request = Arc::new(Mutex::new(KSessionRequest::new()));
         {
             let mut request = request.lock().unwrap();
-            request.thread_id = Some(3);
-            request.client_process_id = Some(7);
+            bind_request_client_thread_for_session_test(&mut request, &client_thread);
         }
 
         let mut server = KServerSession::new();
@@ -4222,6 +4324,7 @@ mod tests {
     fn send_reply_with_message_translates_move_handles_for_simple_special_header() {
         let mut client_process = crate::hle::kernel::k_process::KProcess::new();
         client_process.process_id = 7;
+        prepare_process_memory_for_session_test(&mut client_process);
         assert_eq!(client_process.initialize_handle_table(), 0);
         let client_process = Arc::new(ProcessLock::from_value(client_process));
 
@@ -4240,9 +4343,11 @@ mod tests {
             .lock()
             .unwrap()
             .register_thread_object(Arc::clone(&client_thread));
+        park_client_thread_for_ipc_session_test(&client_thread);
 
         let mut server_process = crate::hle::kernel::k_process::KProcess::new();
         server_process.process_id = 8;
+        prepare_process_memory_for_session_test(&mut server_process);
         assert_eq!(server_process.initialize_handle_table(), 0);
         let moved_object_id = 0xDCBA;
         let move_handle = server_process.handle_table.add(moved_object_id).unwrap();
@@ -4296,8 +4401,7 @@ mod tests {
         let request = Arc::new(Mutex::new(KSessionRequest::new()));
         {
             let mut request = request.lock().unwrap();
-            request.thread_id = Some(3);
-            request.client_process_id = Some(7);
+            bind_request_client_thread_for_session_test(&mut request, &client_thread);
         }
 
         let mut server = KServerSession::new();
@@ -5197,6 +5301,7 @@ mod tests {
     fn send_reply_with_message_rejects_invalid_destination_header_size() {
         let mut client_process = crate::hle::kernel::k_process::KProcess::new();
         client_process.process_id = 7;
+        prepare_process_memory_for_session_test(&mut client_process);
         let client_process = Arc::new(ProcessLock::from_value(client_process));
 
         let client_thread = Arc::new(KThreadLock::new(
@@ -5214,9 +5319,11 @@ mod tests {
             .lock()
             .unwrap()
             .register_thread_object(Arc::clone(&client_thread));
+        park_client_thread_for_ipc_session_test(&client_thread);
 
         let mut server_process = crate::hle::kernel::k_process::KProcess::new();
         server_process.process_id = 8;
+        prepare_process_memory_for_session_test(&mut server_process);
         let server_process = Arc::new(ProcessLock::from_value(server_process));
 
         let server_thread = Arc::new(KThreadLock::new(
@@ -5260,7 +5367,7 @@ mod tests {
             .unwrap()
             .write_block(0x5000, &reply_bytes);
 
-        let client_buffer_words = [0xFFFF_FFFFu32, 0];
+        let client_buffer_words = [0u32, 0x3ff];
         let client_buffer_bytes: Vec<u8> = client_buffer_words
             .iter()
             .flat_map(|word| word.to_le_bytes())
@@ -5277,8 +5384,7 @@ mod tests {
         let request = Arc::new(Mutex::new(KSessionRequest::new()));
         {
             let mut request = request.lock().unwrap();
-            request.thread_id = Some(3);
-            request.client_process_id = Some(7);
+            bind_request_client_thread_for_session_test(&mut request, &client_thread);
         }
 
         let mut server = KServerSession::new();
@@ -5298,6 +5404,7 @@ mod tests {
     fn send_reply_with_message_rejects_invalid_destination_receive_list_offset() {
         let mut client_process = crate::hle::kernel::k_process::KProcess::new();
         client_process.process_id = 7;
+        prepare_process_memory_for_session_test(&mut client_process);
         let client_process = Arc::new(ProcessLock::from_value(client_process));
 
         let client_thread = Arc::new(KThreadLock::new(
@@ -5315,9 +5422,11 @@ mod tests {
             .lock()
             .unwrap()
             .register_thread_object(Arc::clone(&client_thread));
+        park_client_thread_for_ipc_session_test(&client_thread);
 
         let mut server_process = crate::hle::kernel::k_process::KProcess::new();
         server_process.process_id = 8;
+        prepare_process_memory_for_session_test(&mut server_process);
         let server_process = Arc::new(ProcessLock::from_value(server_process));
 
         let server_thread = Arc::new(KThreadLock::new(
@@ -5361,7 +5470,7 @@ mod tests {
             .unwrap()
             .write_block(0x5000, &reply_bytes);
 
-        let client_buffer_words = [0u32, 1u32 << 2];
+        let client_buffer_words = [0u32, (1u32 << 20) | 2];
         let client_buffer_bytes: Vec<u8> = client_buffer_words
             .iter()
             .flat_map(|word| word.to_le_bytes())
@@ -5378,8 +5487,7 @@ mod tests {
         let request = Arc::new(Mutex::new(KSessionRequest::new()));
         {
             let mut request = request.lock().unwrap();
-            request.thread_id = Some(3);
-            request.client_process_id = Some(7);
+            bind_request_client_thread_for_session_test(&mut request, &client_thread);
         }
 
         let mut server = KServerSession::new();
@@ -5399,6 +5507,7 @@ mod tests {
     fn send_reply_with_message_cleans_destination_handles_on_special_data_failure() {
         let mut client_process = crate::hle::kernel::k_process::KProcess::new();
         client_process.process_id = 7;
+        prepare_process_memory_for_session_test(&mut client_process);
         assert_eq!(client_process.initialize_handle_table(), 0);
         let client_process = Arc::new(ProcessLock::from_value(client_process));
 
@@ -5417,9 +5526,11 @@ mod tests {
             .lock()
             .unwrap()
             .register_thread_object(Arc::clone(&client_thread));
+        park_client_thread_for_ipc_session_test(&client_thread);
 
         let mut server_process = crate::hle::kernel::k_process::KProcess::new();
         server_process.process_id = 8;
+        prepare_process_memory_for_session_test(&mut server_process);
         assert_eq!(server_process.initialize_handle_table(), 0);
         let moved_object_id = 0xDCBA;
         let valid_handle = server_process.handle_table.add(moved_object_id).unwrap();
@@ -5475,8 +5586,7 @@ mod tests {
         let request = Arc::new(Mutex::new(KSessionRequest::new()));
         {
             let mut request = request.lock().unwrap();
-            request.thread_id = Some(3);
-            request.client_process_id = Some(7);
+            bind_request_client_thread_for_session_test(&mut request, &client_thread);
         }
 
         let mut server = KServerSession::new();
@@ -5822,8 +5932,21 @@ mod tests {
 
     #[test]
     fn send_reply_with_message_copies_receive_mapping_payload() {
+        let mut page_table_memory = SessionPageTableMemoryForTest::new(0x40000);
+
         let mut client_process = crate::hle::kernel::k_process::KProcess::new();
         client_process.process_id = 7;
+        attach_process_page_table_for_session_test(
+            &mut client_process,
+            page_table_memory.memory.clone(),
+            0x0000,
+            0x10000,
+            KMemoryState::NORMAL,
+        );
+        let client_msg_phys = dram_memory_map::BASE + 0x10000;
+        let client_recv_phys = dram_memory_map::BASE + 0x20000;
+        map_process_page_for_session_test(&mut client_process, 0x3000, client_msg_phys);
+        map_process_page_for_session_test(&mut client_process, 0x7000, client_recv_phys);
         let client_process = Arc::new(ProcessLock::from_value(client_process));
 
         let client_thread = Arc::new(KThreadLock::new(
@@ -5844,6 +5967,16 @@ mod tests {
 
         let mut server_process = crate::hle::kernel::k_process::KProcess::new();
         server_process.process_id = 8;
+        attach_process_page_table_for_session_test(
+            &mut server_process,
+            page_table_memory.memory.clone(),
+            0x0000,
+            0x10000,
+            KMemoryState::NORMAL,
+        );
+        let server_msg_phys = dram_memory_map::BASE + 0x30000;
+        map_process_page_for_session_test(&mut server_process, 0x5000, server_msg_phys);
+        set_current_page_table_for_session_test(&mut server_process);
         let server_process = Arc::new(ProcessLock::from_value(server_process));
 
         let server_thread = Arc::new(KThreadLock::new(
@@ -5860,10 +5993,7 @@ mod tests {
             .lock()
             .unwrap()
             .register_thread_object(Arc::clone(&server_thread));
-        server_process
-            .lock()
-            .unwrap()
-            .write_block(0x5010, &[1, 2, 3, 4]);
+        page_table_memory.write_phys(server_msg_phys + 0x10, &[1, 2, 3, 4]);
 
         let mut system = crate::core::System::new_for_test();
         system.set_current_process_arc(Arc::clone(&server_process));
@@ -5872,8 +6002,7 @@ mod tests {
         let request = Arc::new(Mutex::new(KSessionRequest::new()));
         {
             let mut request = request.lock().unwrap();
-            request.thread_id = Some(3);
-            request.client_process_id = Some(7);
+            bind_request_client_thread_for_session_test(&mut request, &client_thread);
             let _ = request.mappings.push_receive(
                 KProcessAddress::new(0x7010),
                 KProcessAddress::new(0x5010),
@@ -5888,8 +6017,8 @@ mod tests {
 
         assert_eq!(server.send_reply_with_message(0, 0, 0, false), 0);
         assert_eq!(
-            client_process.lock().unwrap().read_block(0x7010, 4),
-            &[1, 2, 3, 4]
+            page_table_memory.read_phys(client_recv_phys + 0x10, 4),
+            vec![1, 2, 3, 4]
         );
 
         crate::hle::kernel::kernel::set_current_emu_thread(None);
@@ -5970,8 +6099,7 @@ mod tests {
         let request = Arc::new(Mutex::new(KSessionRequest::new()));
         {
             let mut request = request.lock().unwrap();
-            request.thread_id = Some(3);
-            request.client_process_id = Some(7);
+            bind_request_client_thread_for_session_test(&mut request, &client_thread);
         }
 
         let mut server = KServerSession::new();
@@ -6061,8 +6189,7 @@ mod tests {
         let request = Arc::new(Mutex::new(KSessionRequest::new()));
         {
             let mut request = request.lock().unwrap();
-            request.thread_id = Some(3);
-            request.client_process_id = Some(7);
+            bind_request_client_thread_for_session_test(&mut request, &client_thread);
         }
 
         let mut server = KServerSession::new();
@@ -6160,8 +6287,7 @@ mod tests {
         let request = Arc::new(Mutex::new(KSessionRequest::new()));
         {
             let mut request = request.lock().unwrap();
-            request.thread_id = Some(3);
-            request.client_process_id = Some(7);
+            bind_request_client_thread_for_session_test(&mut request, &client_thread);
         }
 
         let mut server = KServerSession::new();
@@ -6404,8 +6530,7 @@ mod tests {
         let request = Arc::new(Mutex::new(KSessionRequest::new()));
         {
             let mut request = request.lock().unwrap();
-            request.thread_id = Some(3);
-            request.client_process_id = Some(7);
+            bind_request_client_thread_for_session_test(&mut request, &client_thread);
         }
 
         let mut server = KServerSession::new();
@@ -6435,6 +6560,7 @@ mod tests {
     fn send_reply_with_message_does_not_copy_raw_words_before_special_data_succeeds() {
         let mut client_process = crate::hle::kernel::k_process::KProcess::new();
         client_process.process_id = 7;
+        prepare_process_memory_for_session_test(&mut client_process);
         assert_eq!(client_process.initialize_handle_table(), 0);
         let client_process = Arc::new(ProcessLock::from_value(client_process));
 
@@ -6456,6 +6582,7 @@ mod tests {
 
         let mut server_process = crate::hle::kernel::k_process::KProcess::new();
         server_process.process_id = 8;
+        prepare_process_memory_for_session_test(&mut server_process);
         assert_eq!(server_process.initialize_handle_table(), 0);
         let valid_handle = server_process.handle_table.add(0xDCBA).unwrap();
         let invalid_handle = 0x1234u32;
@@ -6530,8 +6657,7 @@ mod tests {
         let request = Arc::new(Mutex::new(KSessionRequest::new()));
         {
             let mut request = request.lock().unwrap();
-            request.thread_id = Some(3);
-            request.client_process_id = Some(7);
+            bind_request_client_thread_for_session_test(&mut request, &client_thread);
         }
 
         let mut server = KServerSession::new();

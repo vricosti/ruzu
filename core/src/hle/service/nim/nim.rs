@@ -306,14 +306,14 @@ impl NTC {
     }
 }
 
-/// Registers "nim:shp" service.
+/// Registers "nim", "nim:eca", "nim:shp", and "ntc" services.
 ///
 /// Corresponds to `LoopProcess` in upstream nim.cpp.
 pub fn loop_process(system: crate::core::SystemRef) {
     use crate::hle::service::hle_ipc::SessionRequestHandlerPtr;
     use crate::hle::service::server_manager::ServerManager;
 
-    let mut server_manager = ServerManager::new(system);
+    let server_manager = ServerManager::new_shared(system);
 
     let stub = |sm: &mut ServerManager, name: &str| {
         let svc_name = name.to_string();
@@ -327,6 +327,12 @@ pub fn loop_process(system: crate::core::SystemRef) {
             64,
         );
     };
-    stub(&mut server_manager, "nim:shp");
-    ServerManager::run_server(server_manager);
+    {
+        let mut server_manager = server_manager.lock().unwrap();
+        stub(&mut server_manager, "nim");
+        stub(&mut server_manager, "nim:eca");
+        stub(&mut server_manager, "nim:shp");
+        stub(&mut server_manager, "ntc");
+    }
+    ServerManager::run_server_shared(server_manager);
 }

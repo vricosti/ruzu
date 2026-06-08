@@ -440,10 +440,10 @@ impl EnsureTokenIdCacheAsyncInterface {
         let svc = unsafe {
             &*(this as *const dyn ServiceFramework as *const EnsureTokenIdCacheAsyncInterface)
         };
-        let handle = svc.completion_event.copy_handle(ctx).unwrap_or(0);
+        let object_id = svc.completion_event.copy_object_id(ctx).unwrap_or(0);
         let mut rb = ResponseBuilder::new(ctx, 2, 1, 0);
         rb.push_result(RESULT_SUCCESS);
-        rb.push_copy_objects(handle);
+        rb.push_copy_object_id(object_id);
     }
 
     fn cancel_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
@@ -925,73 +925,77 @@ pub fn loop_process(system: crate::core::SystemRef) {
         log::info!("ACC::loop_process: profile manager ready");
     }
 
-    let mut server_manager = ServerManager::new(system);
+    let server_manager = ServerManager::new_shared(system);
 
-    // acc:aa -> ACC_AA
     {
-        let m = module.clone();
-        let pm = profile_manager.clone();
-        server_manager.register_named_service(
-            "acc:aa",
-            Box::new(move || -> SessionRequestHandlerPtr {
-                Arc::new(super::acc_aa::AccAA::new(m.clone(), pm.clone(), system))
-            }),
-            64,
-        );
-    }
-    if trace_boot {
-        log::info!("ACC::loop_process: registered acc:aa");
-    }
+        let mut server_manager = server_manager.lock().unwrap();
 
-    // acc:su -> ACC_SU
-    {
-        let m = module.clone();
-        let pm = profile_manager.clone();
-        server_manager.register_named_service(
-            "acc:su",
-            Box::new(move || -> SessionRequestHandlerPtr {
-                Arc::new(super::acc_su::AccSU::new(m.clone(), pm.clone(), system))
-            }),
-            64,
-        );
-    }
-    if trace_boot {
-        log::info!("ACC::loop_process: registered acc:su");
-    }
+        // acc:aa -> ACC_AA
+        {
+            let m = module.clone();
+            let pm = profile_manager.clone();
+            server_manager.register_named_service(
+                "acc:aa",
+                Box::new(move || -> SessionRequestHandlerPtr {
+                    Arc::new(super::acc_aa::AccAA::new(m.clone(), pm.clone(), system))
+                }),
+                64,
+            );
+        }
+        if trace_boot {
+            log::info!("ACC::loop_process: registered acc:aa");
+        }
 
-    // acc:u0 -> ACC_U0
-    {
-        let m = module.clone();
-        let pm = profile_manager.clone();
-        server_manager.register_named_service(
-            "acc:u0",
-            Box::new(move || -> SessionRequestHandlerPtr {
-                Arc::new(super::acc_u0::AccU0::new(m.clone(), pm.clone(), system))
-            }),
-            64,
-        );
-    }
-    if trace_boot {
-        log::info!("ACC::loop_process: registered acc:u0");
-    }
+        // acc:su -> ACC_SU
+        {
+            let m = module.clone();
+            let pm = profile_manager.clone();
+            server_manager.register_named_service(
+                "acc:su",
+                Box::new(move || -> SessionRequestHandlerPtr {
+                    Arc::new(super::acc_su::AccSU::new(m.clone(), pm.clone(), system))
+                }),
+                64,
+            );
+        }
+        if trace_boot {
+            log::info!("ACC::loop_process: registered acc:su");
+        }
 
-    // acc:u1 -> ACC_U1
-    {
-        let m = module.clone();
-        let pm = profile_manager.clone();
-        server_manager.register_named_service(
-            "acc:u1",
-            Box::new(move || -> SessionRequestHandlerPtr {
-                Arc::new(super::acc_u1::AccU1::new(m.clone(), pm.clone(), system))
-            }),
-            64,
-        );
+        // acc:u0 -> ACC_U0
+        {
+            let m = module.clone();
+            let pm = profile_manager.clone();
+            server_manager.register_named_service(
+                "acc:u0",
+                Box::new(move || -> SessionRequestHandlerPtr {
+                    Arc::new(super::acc_u0::AccU0::new(m.clone(), pm.clone(), system))
+                }),
+                64,
+            );
+        }
+        if trace_boot {
+            log::info!("ACC::loop_process: registered acc:u0");
+        }
+
+        // acc:u1 -> ACC_U1
+        {
+            let m = module.clone();
+            let pm = profile_manager.clone();
+            server_manager.register_named_service(
+                "acc:u1",
+                Box::new(move || -> SessionRequestHandlerPtr {
+                    Arc::new(super::acc_u1::AccU1::new(m.clone(), pm.clone(), system))
+                }),
+                64,
+            );
+        }
     }
     if trace_boot {
         log::info!("ACC::loop_process: registered acc:u1");
     }
 
-    ServerManager::run_server(server_manager);
+    ServerManager::run_server_shared(server_manager);
 }
 
 #[cfg(test)]

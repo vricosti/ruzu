@@ -529,19 +529,22 @@ pub fn loop_process(system: crate::core::SystemRef) {
     log::debug!("PlayReport::LoopProcess called");
 
     let reporter = Arc::new(crate::reporter::Reporter::new());
-    let mut server_manager = ServerManager::new(system);
+    let server_manager = ServerManager::new_shared(system);
 
-    for &name in &["prepo:a", "prepo:a2", "prepo:m", "prepo:s", "prepo:u"] {
-        let r = reporter.clone();
-        let n = name.to_string();
-        server_manager.register_named_service(
-            name,
-            Box::new(move || -> SessionRequestHandlerPtr {
-                Arc::new(PlayReport::new(&n, r.clone()))
-            }),
-            64,
-        );
+    {
+        let mut server_manager = server_manager.lock().unwrap();
+        for &name in &["prepo:a", "prepo:a2", "prepo:m", "prepo:s", "prepo:u"] {
+            let r = reporter.clone();
+            let n = name.to_string();
+            server_manager.register_named_service(
+                name,
+                Box::new(move || -> SessionRequestHandlerPtr {
+                    Arc::new(PlayReport::new(&n, r.clone()))
+                }),
+                64,
+            );
+        }
     }
 
-    ServerManager::run_server(server_manager);
+    ServerManager::run_server_shared(server_manager);
 }

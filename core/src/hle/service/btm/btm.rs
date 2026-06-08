@@ -158,37 +158,40 @@ pub fn loop_process(system: crate::core::SystemRef) {
     use crate::hle::service::hle_ipc::SessionRequestHandlerPtr;
     use crate::hle::service::server_manager::ServerManager;
 
-    let mut server_manager = ServerManager::new(system);
+    let server_manager = ServerManager::new_shared(system);
+    {
+        let mut server_manager = server_manager.lock().unwrap();
 
-    server_manager.register_named_service(
-        "btm",
-        Box::new(|| -> SessionRequestHandlerPtr { std::sync::Arc::new(IBtm::new()) }),
-        16,
-    );
+        server_manager.register_named_service(
+            "btm",
+            Box::new(|| -> SessionRequestHandlerPtr { std::sync::Arc::new(IBtm::new()) }),
+            16,
+        );
 
-    server_manager.register_named_service(
-        "btm:dbg",
-        Box::new(|| -> SessionRequestHandlerPtr {
-            std::sync::Arc::new(super::btm_debug::IBtmDebug::new())
-        }),
-        16,
-    );
+        server_manager.register_named_service(
+            "btm:dbg",
+            Box::new(|| -> SessionRequestHandlerPtr {
+                std::sync::Arc::new(super::btm_debug::IBtmDebug::new())
+            }),
+            16,
+        );
 
-    server_manager.register_named_service(
-        "btm:sys",
-        Box::new(|| -> SessionRequestHandlerPtr {
-            std::sync::Arc::new(super::btm_system::IBtmSystem::new())
-        }),
-        16,
-    );
+        server_manager.register_named_service(
+            "btm:sys",
+            Box::new(|| -> SessionRequestHandlerPtr {
+                std::sync::Arc::new(super::btm_system::IBtmSystem::new())
+            }),
+            16,
+        );
 
-    server_manager.register_named_service(
-        "btm:u",
-        Box::new(|| -> SessionRequestHandlerPtr {
-            std::sync::Arc::new(super::btm_user::IBtmUser::new())
-        }),
-        16,
-    );
+        server_manager.register_named_service(
+            "btm:u",
+            Box::new(|| -> SessionRequestHandlerPtr {
+                std::sync::Arc::new(super::btm_user::IBtmUser::new())
+            }),
+            16,
+        );
+    }
 
-    ServerManager::run_server(server_manager);
+    ServerManager::run_server_shared(server_manager);
 }

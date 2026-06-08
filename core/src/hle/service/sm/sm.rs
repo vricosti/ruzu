@@ -67,6 +67,12 @@ pub struct ServiceOwnership {
     pub server_manager: Weak<Mutex<crate::hle::service::server_manager::ServerManager>>,
 }
 
+#[derive(Clone)]
+pub struct ServicePortEntry {
+    pub port: Arc<Mutex<KPort>>,
+    pub client_port_object_id: Option<u64>,
+}
+
 pub struct ServiceManager {
     controller_interface: Arc<Controller>,
 
@@ -79,7 +85,7 @@ pub struct ServiceManager {
     /// Upstream stores `KClientPort*` (obtained via `&port->GetClientPort()`),
     /// but the `KPort` owns both endpoints. We store the whole `KPort` wrapped
     /// in `Arc<Mutex<>>` so the caller can access both client and server sides.
-    service_ports: HashMap<String, Arc<Mutex<KPort>>>,
+    service_ports: HashMap<String, ServicePortEntry>,
 
     /// Map of service name → owning ServerManager's endpoints. Published by
     /// `ServerManager::register_named_service` / `manage_named_port` so
@@ -199,13 +205,29 @@ impl ServiceManager {
         // Store the port and handler factory.
         // Upstream stores &port->GetClientPort() in service_ports; we store
         // the whole KPort since we own it (no slab allocator yet).
-        self.service_ports.insert(name.clone(), Arc::clone(&port));
+        self.service_ports.insert(
+            name.clone(),
+            ServicePortEntry {
+                port: Arc::clone(&port),
+                client_port_object_id: None,
+            },
+        );
         self.registered_services.insert(name, handler);
         if trace_boot {
             log::info!("ServiceManager::register_service_with_port: inserted service metadata");
         }
 
         Ok(port)
+    }
+
+    pub fn set_service_port_client_port_object_id(
+        &mut self,
+        name: &str,
+        client_port_object_id: u64,
+    ) {
+        if let Some(entry) = self.service_ports.get_mut(name) {
+            entry.client_port_object_id = Some(client_port_object_id);
+        }
     }
 
     /// Unregisters a service.
@@ -237,7 +259,22 @@ impl ServiceManager {
         }
 
         match self.service_ports.get(name) {
-            Some(port) => Ok(port.clone()),
+            Some(entry) => Ok(entry.port.clone()),
+            None => {
+                log::warn!("Server is not registered! service={}", name);
+                Err(RESULT_NOT_REGISTERED)
+            }
+        }
+    }
+
+    pub fn get_service_port_entry(&self, name: &str) -> Result<ServicePortEntry, ResultCode> {
+        let validate_result = validate_service_name(name);
+        if validate_result.is_error() {
+            return Err(validate_result);
+        }
+
+        match self.service_ports.get(name) {
+            Some(entry) => Ok(entry.clone()),
             None => {
                 log::warn!("Server is not registered! service={}", name);
                 Err(RESULT_NOT_REGISTERED)
@@ -287,8 +324,8 @@ impl Drop for ServiceManager {
     fn drop(&mut self) {
         // Upstream: for (auto& [name, port] : service_ports) { port->Close(); }
         // Close each port (transition to closed state).
-        for (_name, port) in self.service_ports.drain() {
-            port.lock().unwrap().on_server_closed();
+        for (_name, entry) in self.service_ports.drain() {
+            entry.port.lock().unwrap().on_server_closed();
         }
         self.registered_services.clear();
         self.deferral_event = None;
@@ -517,7 +554,7 @@ impl Sm {
 
         let (port, handler, parent_server_manager, parent_queue, parent_wakeup) = {
             let sm = self.service_manager.lock().unwrap();
-            let port_result = sm.get_service_port(&name);
+            let port_result = sm.get_service_port_entry(&name);
             let handler = sm.get_service(&name);
             // Use the TARGET service's owning ServerManager — not the caller's.
             // Upstream routes the new session via the target port's
@@ -535,7 +572,7 @@ impl Sm {
                         if t.server_manager.upgrade().is_some() {
                             "full"
                         } else {
-                            "queue_only"
+                            "stale_no_owner"
                         }
                     })
                     .unwrap_or("missing");
@@ -560,7 +597,7 @@ impl Sm {
                     .map(|m| {
                         let guard = m.lock().unwrap();
                         (
-                            guard.get_server_manager().cloned(),
+                            guard.get_server_manager(),
                             guard.pending_registrations().cloned(),
                             guard.server_wakeup().cloned(),
                         )
@@ -568,7 +605,7 @@ impl Sm {
                     .unwrap_or((None, None, None)),
             };
             (
-                port_result,
+                port_result.map(|entry| (entry.port, entry.client_port_object_id)),
                 handler,
                 parent_server_manager,
                 parent_queue,
@@ -587,7 +624,7 @@ impl Sm {
                 ctx.set_is_deferred();
                 (RESULT_NOT_REGISTERED, None)
             }
-            Ok(port) => {
+            Ok((port, client_port_object_id)) => {
                 let Some(owner_process) = ctx.owner_process_arc() else {
                     log::error!("  GetService(\"{}\"): missing owner process", name);
                     return (RESULT_INVALID_STATE, None);
@@ -607,20 +644,35 @@ impl Sm {
                         return (RESULT_INVALID_STATE, None);
                     }
 
-                    let (session_object_id, client_session_object_id) = match port_guard
-                        .client
-                        .create_session(&mut process, kernel, port_guard.get_name())
-                    {
-                        Ok(ids) => ids,
-                        Err(result) => {
-                            log::error!(
-                                "  GetService(\"{}\"): create_session failed {:#x}",
-                                name,
-                                result.get_inner_value()
+                    if let Some(client_port_object_id) = client_port_object_id {
+                        if process
+                            .get_client_port_by_object_id(client_port_object_id)
+                            .is_none()
+                        {
+                            process.register_client_port_object(
+                                client_port_object_id,
+                                Arc::clone(&port),
                             );
-                            return (result, None);
                         }
-                    };
+                    }
+
+                    let (session_object_id, client_session_object_id) =
+                        match port_guard.client.create_session(
+                            &mut process,
+                            kernel,
+                            client_port_object_id,
+                            port_guard.get_name(),
+                        ) {
+                            Ok(ids) => ids,
+                            Err(result) => {
+                                log::error!(
+                                    "  GetService(\"{}\"): create_session failed {:#x}",
+                                    name,
+                                    result.get_inner_value()
+                                );
+                                return (result, None);
+                            }
+                        };
 
                     let server_session = process
                         .get_server_session_by_object_id(session_object_id)
@@ -638,39 +690,19 @@ impl Sm {
                 };
 
                 if let Some(handler) = handler {
-                    let manager = match (
-                        parent_server_manager,
-                        parent_queue.clone(),
-                        parent_wakeup.clone(),
-                    ) {
-                        (Some(sm_arc), Some(q), Some(w)) => Arc::new(Mutex::new(
-                            crate::hle::service::hle_ipc::SessionRequestManager::new_with_server_manager_full(
-                                sm_arc, q, w,
-                            ),
-                        )),
-                        (Some(sm_arc), _, _) => Arc::new(Mutex::new(
-                            crate::hle::service::hle_ipc::SessionRequestManager::new_with_server_manager(
-                                sm_arc,
-                            ),
-                        )),
-                        (_, Some(q), Some(w)) => Arc::new(Mutex::new(
-                            crate::hle::service::hle_ipc::SessionRequestManager::new_with_registration_queue(
-                                q, w,
-                            ),
-                        )),
-                        _ => Arc::new(Mutex::new(
-                            crate::hle::service::hle_ipc::SessionRequestManager::new(),
-                        ))
-                    };
+                    let manager = Arc::new(Mutex::new(
+                        crate::hle::service::hle_ipc::SessionRequestManager::from_parent_server_manager_endpoints(
+                            parent_server_manager,
+                            parent_queue.clone(),
+                            parent_wakeup.clone(),
+                        ),
+                    ));
                     manager.lock().unwrap().set_session_handler(handler);
 
                     if let Some(client_session) =
                         process.get_client_session_by_object_id(client_session_object_id)
                     {
-                        client_session
-                            .lock()
-                            .unwrap()
-                            .initialize_with_manager(session_object_id, manager.clone());
+                        client_session.lock().unwrap().initialize(session_object_id);
                     }
                     server_session.lock().unwrap().set_manager(manager.clone());
 
@@ -778,6 +810,7 @@ impl Sm {
         };
 
         let kernel = self.system.get().kernel().expect("kernel not initialized");
+        let client_port_object_id = kernel.create_new_object_id() as u64;
         let server_port_object_id = kernel.create_new_object_id() as u64;
         {
             let mut process = owner_process.lock().unwrap();
@@ -788,9 +821,15 @@ impl Sm {
                 rb.push_result(RESULT_INVALID_STATE);
                 return;
             }
+            process.register_client_port_object(client_port_object_id, Arc::clone(&port));
             process.register_server_port_object(server_port_object_id, port);
         }
+        kernel.register_kernel_object(client_port_object_id);
         kernel.register_kernel_object(server_port_object_id);
+        self.service_manager
+            .lock()
+            .unwrap()
+            .set_service_port_client_port_object_id(&name, client_port_object_id);
 
         let mut rb = ResponseBuilder::new_with_flags(
             ctx,
@@ -877,12 +916,12 @@ impl ServiceFramework for Sm {
 pub fn loop_process(service_manager: &Arc<Mutex<ServiceManager>>, system: crate::core::SystemRef) {
     let trace_boot = std::env::var_os("RUZU_APPLET_BOOT_TRACE")
         .is_some_and(|value| value != std::ffi::OsStr::new("0"));
-    let mut server_manager = ServerManager::new(system);
+    let server_manager = ServerManager::new_shared(system);
 
     // Manage deferral event.
     // Upstream: server_manager->ManageDeferral(&deferral_event);
     //           service_manager.SetDeferralEvent(deferral_event);
-    let (_result, deferral_event) = server_manager.manage_deferral();
+    let (_result, deferral_event) = server_manager.lock().unwrap().manage_deferral();
     if trace_boot {
         log::info!("SM::loop_process: deferral event managed");
     }
@@ -897,7 +936,10 @@ pub fn loop_process(service_manager: &Arc<Mutex<ServiceManager>>, system: crate:
     let sm_service = Arc::new(Sm::new(service_manager.clone(), system));
     let sm_clone = sm_service.clone();
     let factory: SessionRequestHandlerFactory = Box::new(move || sm_clone.clone());
-    server_manager.manage_named_port("sm:", factory, 64);
+    server_manager
+        .lock()
+        .unwrap()
+        .manage_named_port("sm:", factory, 64);
     if trace_boot {
         log::info!("SM::loop_process: managed named port sm:");
     }
@@ -915,6 +957,12 @@ pub fn loop_process(service_manager: &Arc<Mutex<ServiceManager>>, system: crate:
                     "SM::loop_process: failed to register sm: in ServiceManager: 0x{:08X}",
                     result.get_inner_value()
                 );
+            } else if let Some(kernel) =
+                (!system.is_null()).then(|| system.get().kernel()).flatten()
+            {
+                let client_port_object_id = kernel.create_new_object_id() as u64;
+                kernel.register_kernel_object(client_port_object_id);
+                sm.set_service_port_client_port_object_id("sm:", client_port_object_id);
             }
             sm.deferral_event_clone()
         };
@@ -927,7 +975,7 @@ pub fn loop_process(service_manager: &Arc<Mutex<ServiceManager>>, system: crate:
     }
 
     // Upstream: ServerManager::RunServer(std::move(server_manager));
-    ServerManager::run_server(server_manager);
+    ServerManager::run_server_shared(server_manager);
 }
 
 /// Register the `sm:` named port for unit-test systems without entering the
@@ -936,15 +984,16 @@ pub fn loop_process(service_manager: &Arc<Mutex<ServiceManager>>, system: crate:
 /// Runtime keeps using `loop_process`, matching upstream. This helper mirrors
 /// only the setup phase required by `System::new_for_test`: manage deferral,
 /// create the `sm:` named port, register the internal service lookup entry,
-/// bind the final `Arc<Mutex<ServerManager>>`, then publish ownership with a
-/// valid weak pointer so `ConnectToNamedPort` can wire child sessions.
+/// bind the final `Arc<Mutex<ServerManager>>`, then register the port while a
+/// valid weak pointer is already available so `ConnectToNamedPort` can wire
+/// child sessions.
 pub fn setup_sm_for_test(
     service_manager: &Arc<Mutex<ServiceManager>>,
     system: crate::core::SystemRef,
 ) -> Arc<Mutex<ServerManager>> {
-    let mut server_manager = ServerManager::new(system);
+    let server_manager = ServerManager::new_shared(system);
 
-    let (_result, deferral_event) = server_manager.manage_deferral();
+    let (_result, deferral_event) = server_manager.lock().unwrap().manage_deferral();
     service_manager
         .lock()
         .unwrap()
@@ -953,7 +1002,10 @@ pub fn setup_sm_for_test(
     let sm_service = Arc::new(Sm::new(service_manager.clone(), system));
     let sm_clone = sm_service.clone();
     let factory: SessionRequestHandlerFactory = Box::new(move || sm_clone.clone());
-    server_manager.manage_named_port("sm:", factory, 64);
+    server_manager
+        .lock()
+        .unwrap()
+        .manage_named_port("sm:", factory, 64);
 
     {
         let sm_clone2 = sm_service.clone();
@@ -966,6 +1018,12 @@ pub fn setup_sm_for_test(
                     "SM::setup_sm_for_test: failed to register sm: in ServiceManager: 0x{:08X}",
                     result.get_inner_value()
                 );
+            } else if let Some(kernel) =
+                (!system.is_null()).then(|| system.get().kernel()).flatten()
+            {
+                let client_port_object_id = kernel.create_new_object_id() as u64;
+                kernel.register_kernel_object(client_port_object_id);
+                sm.set_service_port_client_port_object_id("sm:", client_port_object_id);
             }
             sm.deferral_event_clone()
         };
@@ -974,36 +1032,14 @@ pub fn setup_sm_for_test(
         }
     }
 
-    let manager = Arc::new(Mutex::new(server_manager));
-    let (owned_names, queue, wakeup) = {
-        let mut manager_guard = manager.lock().unwrap();
-        manager_guard.bind_self_reference(&manager);
-        (
-            manager_guard.take_owned_service_names(),
-            manager_guard.pending_registrations_arc(),
-            manager_guard.wakeup_event_arc(),
-        )
-    };
-    {
-        let mut sm = service_manager.lock().unwrap();
-        for name in owned_names {
-            sm.set_service_ownership(
-                &name,
-                ServiceOwnership {
-                    queue: queue.clone(),
-                    wakeup: wakeup.clone(),
-                    server_manager: Arc::downgrade(&manager),
-                },
-            );
-        }
-    }
-
-    manager
+    server_manager
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::System;
+    use crate::hle::kernel::k_process::{KProcess, ProcessLock};
 
     #[test]
     fn test_result_codes() {
@@ -1060,5 +1096,48 @@ mod tests {
         // After loop_process, "sm:" is registered on the SM (for connect_to_named_port
         // compatibility) and also as a managed named port on the ServerManager.
         assert!(sm.lock().unwrap().get_service_port("sm:").is_ok());
+    }
+
+    #[test]
+    fn service_port_identity_allows_session_finalize_notification() {
+        let mut system = System::new_for_test();
+        let process = Arc::new(ProcessLock::from_value(KProcess::new()));
+        {
+            let mut process_guard = process.lock().unwrap();
+            process_guard.process_id = 1;
+            process_guard.initialize_handle_table();
+        }
+        system.set_current_process_arc(Arc::clone(&process));
+        let kernel = system.kernel().unwrap();
+
+        let mut sm = ServiceManager::new();
+        let factory: SessionRequestHandlerFactory =
+            Box::new(|| -> SessionRequestHandlerPtr { panic!("test") });
+        assert!(sm
+            .register_service("test_svc".to_string(), 64, factory)
+            .is_success());
+
+        let client_port_object_id = kernel.create_new_object_id() as u64;
+        kernel.register_kernel_object(client_port_object_id);
+        sm.set_service_port_client_port_object_id("test_svc", client_port_object_id);
+
+        let entry = sm.get_service_port_entry("test_svc").unwrap();
+        {
+            let mut process_guard = process.lock().unwrap();
+            process_guard
+                .register_client_port_object(client_port_object_id, Arc::clone(&entry.port));
+            let (session_object_id, _client_session_object_id) = entry
+                .port
+                .lock()
+                .unwrap()
+                .client
+                .create_session(&mut process_guard, kernel, entry.client_port_object_id, 0)
+                .unwrap();
+
+            assert_eq!(entry.port.lock().unwrap().client.get_num_sessions(), 1);
+            process_guard.unregister_session_object_by_object_id(session_object_id);
+        }
+
+        assert_eq!(entry.port.lock().unwrap().client.get_num_sessions(), 0);
     }
 }

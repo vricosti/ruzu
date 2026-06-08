@@ -15,6 +15,7 @@ use crate::hle::service::nvnflinger::ui::fence::Fence;
 use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
 
 use super::container::Container;
+use super::vi_results;
 use super::vi_types::*;
 
 pub struct ISystemDisplayService {
@@ -318,17 +319,26 @@ impl ISystemDisplayService {
         let mut rp = RequestParser::new(ctx);
         let layer_id = rp.pop_u64();
 
-        let handle = svc
+        let event_result = svc
             .container
             .get_shared_buffer_manager()
-            .get_shared_frame_buffer_acquirable_event(layer_id)
-            .ok()
-            .and_then(|event| ctx.copy_handle_for_readable_event(event))
-            .unwrap_or(0);
+            .get_shared_frame_buffer_acquirable_event(layer_id);
+
+        let Ok(readable_event) = event_result else {
+            let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+            rb.push_result(event_result.err().unwrap());
+            return;
+        };
+
+        let Some(object_id) = ctx.register_readable_event_object(readable_event) else {
+            let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+            rb.push_result(vi_results::RESULT_OPERATION_FAILED);
+            return;
+        };
 
         let mut rb = ResponseBuilder::new(ctx, 2, 1, 0);
         rb.push_result(RESULT_SUCCESS);
-        rb.push_copy_objects(handle);
+        rb.push_copy_object_id(object_id);
     }
 
     fn cancel_shared_frame_buffer(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {

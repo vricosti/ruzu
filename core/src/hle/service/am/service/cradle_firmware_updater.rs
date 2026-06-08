@@ -115,16 +115,22 @@ impl ICradleFirmwareUpdater {
     /// Port of ICradleFirmwareUpdater::GetCradleDeviceInfoChangeEvent
     /// Upstream returns m_cradle_device_info_event.GetHandle() as a copy handle.
     fn get_cradle_device_info_change_event_handler(
-        _this: &dyn ServiceFramework,
+        this: &dyn ServiceFramework,
         ctx: &mut HLERequestContext,
     ) {
+        let service =
+            unsafe { &*(this as *const dyn ServiceFramework as *const ICradleFirmwareUpdater) };
         log::warn!("(STUBBED) ICradleFirmwareUpdater::GetCradleDeviceInfoChangeEvent called");
 
-        if let Some(handle) = ctx.create_readable_event_handle(false) {
-            let mut rb = ResponseBuilder::new(ctx, 2, 1, 0);
-            rb.push_result(RESULT_SUCCESS);
-            rb.push_copy_objects(handle);
-        }
+        let object_id = service
+            .service_context
+            .get_event(service.cradle_device_info_event_handle)
+            .and_then(|event| event.copy_object_id(ctx))
+            .unwrap_or(0);
+
+        let mut rb = ResponseBuilder::new(ctx, 2, 1, 0);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_copy_object_id(object_id);
     }
 }
 

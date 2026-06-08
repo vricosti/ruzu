@@ -19,21 +19,29 @@ pub fn loop_process(system: crate::core::SystemRef) {
     use crate::hle::service::hle_ipc::SessionRequestHandlerPtr;
     use crate::hle::service::server_manager::ServerManager;
 
-    let mut server_manager = ServerManager::new(system);
+    let server_manager = ServerManager::new_shared(system);
 
-    let stub_names = &[SERVICE_NAME_APPLICATION, SERVICE_NAME_SYSTEM];
-    for &name in stub_names {
-        let svc_name = name.to_string();
+    {
+        let mut server_manager = server_manager.lock().unwrap();
         server_manager.register_named_service(
-            name,
+            SERVICE_NAME_APPLICATION,
+            Box::new(|| -> SessionRequestHandlerPtr {
+                std::sync::Arc::new(
+                    crate::hle::service::olsc::olsc_service_for_application::IOlscServiceForApplication::new(),
+                )
+            }),
+            16,
+        );
+        server_manager.register_named_service(
+            SERVICE_NAME_SYSTEM,
             Box::new(move || -> SessionRequestHandlerPtr {
-                std::sync::Arc::new(crate::hle::service::services::GenericStubService::new(
-                    &svc_name,
-                ))
+                std::sync::Arc::new(
+                    crate::hle::service::olsc::olsc_service_for_system_service::IOlscServiceForSystemService::new(system),
+                )
             }),
             16,
         );
     }
 
-    ServerManager::run_server(server_manager);
+    ServerManager::run_server_shared(server_manager);
 }

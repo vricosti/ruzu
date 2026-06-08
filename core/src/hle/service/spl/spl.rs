@@ -231,23 +231,26 @@ pub fn loop_process(system: crate::core::SystemRef) {
     use crate::hle::service::hle_ipc::SessionRequestHandlerPtr;
     use crate::hle::service::server_manager::ServerManager;
 
-    let mut server_manager = ServerManager::new(system);
+    let server_manager = ServerManager::new_shared(system);
 
     let stub_names = &[
         "csrng", "spl:", "spl:mig", "spl:fs", "spl:ssl", "spl:es", "spl:manu",
     ];
-    for &name in stub_names {
-        let svc_name = name.to_string();
-        server_manager.register_named_service(
-            name,
-            Box::new(move || -> SessionRequestHandlerPtr {
-                std::sync::Arc::new(crate::hle::service::services::GenericStubService::new(
-                    &svc_name,
-                ))
-            }),
-            16,
-        );
+    {
+        let mut server_manager = server_manager.lock().unwrap();
+        for &name in stub_names {
+            let svc_name = name.to_string();
+            server_manager.register_named_service(
+                name,
+                Box::new(move || -> SessionRequestHandlerPtr {
+                    std::sync::Arc::new(crate::hle::service::services::GenericStubService::new(
+                        &svc_name,
+                    ))
+                }),
+                16,
+            );
+        }
     }
 
-    ServerManager::run_server(server_manager);
+    ServerManager::run_server_shared(server_manager);
 }

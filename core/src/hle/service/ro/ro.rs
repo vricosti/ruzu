@@ -755,13 +755,16 @@ impl RoContext {
 pub struct RoInterface {
     pub context_id: u64,
     pub nrr_kind: NrrKind,
+    /// Shared RO context. Upstream passes one `std::shared_ptr<RoContext>` to
+    /// both `"ldr:ro"` and `"ro:1"` factories.
+    ro: Arc<Mutex<RoContext>>,
     name: String,
     handlers: BTreeMap<u32, FunctionInfo>,
     handlers_tipc: BTreeMap<u32, FunctionInfo>,
 }
 
 impl RoInterface {
-    pub fn new(name: &str, nrr_kind: NrrKind) -> Self {
+    pub fn new(name: &str, ro: Arc<Mutex<RoContext>>, nrr_kind: NrrKind) -> Self {
         let handlers = build_handler_map(&[
             (0, None, "MapManualLoadModuleMemory"),
             (1, None, "UnmapManualLoadModuleMemory"),
@@ -774,6 +777,7 @@ impl RoInterface {
         Self {
             context_id: INVALID_CONTEXT_ID,
             nrr_kind,
+            ro,
             name: name.to_string(),
             handlers,
             handlers_tipc: BTreeMap::new(),
@@ -809,21 +813,37 @@ pub fn loop_process(system: crate::core::SystemRef) {
     use crate::hle::service::hle_ipc::SessionRequestHandlerPtr;
     use crate::hle::service::server_manager::ServerManager;
 
-    let mut server_manager = ServerManager::new(system);
+    let server_manager = ServerManager::new_shared(system);
+    let ro = Arc::new(Mutex::new(RoContext::new()));
 
-    let stub_names = &["ldr:ro", "ro:1"];
-    for &name in stub_names {
-        let svc_name = name.to_string();
+    {
+        let mut server_manager = server_manager.lock().unwrap();
+        let user_ro = Arc::clone(&ro);
         server_manager.register_named_service(
-            name,
+            "ldr:ro",
             Box::new(move || -> SessionRequestHandlerPtr {
-                std::sync::Arc::new(crate::hle::service::services::GenericStubService::new(
-                    &svc_name,
+                Arc::new(RoInterface::new(
+                    "ldr:ro",
+                    Arc::clone(&user_ro),
+                    NrrKind::User,
+                ))
+            }),
+            16,
+        );
+
+        let jit_plugin_ro = Arc::clone(&ro);
+        server_manager.register_named_service(
+            "ro:1",
+            Box::new(move || -> SessionRequestHandlerPtr {
+                Arc::new(RoInterface::new(
+                    "ro:1",
+                    Arc::clone(&jit_plugin_ro),
+                    NrrKind::JitPlugin,
                 ))
             }),
             16,
         );
     }
 
-    ServerManager::run_server(server_manager);
+    ServerManager::run_server_shared(server_manager);
 }

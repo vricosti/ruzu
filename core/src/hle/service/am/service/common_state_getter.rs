@@ -301,20 +301,20 @@ impl ICommonStateGetter {
     fn get_event_handle_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         let service =
             unsafe { &*(this as *const dyn ServiceFramework as *const ICommonStateGetter) };
-        let handle = service
+        let object_id = service
             .applet
             .lock()
             .unwrap()
             .lifecycle_manager
-            .ensure_system_event(ctx)
+            .ensure_system_event_object_id(ctx)
             .unwrap_or(0);
         log::debug!(
-            "ICommonStateGetter::GetEventHandle called -> handle={:#x}",
-            handle
+            "ICommonStateGetter::GetEventHandle called -> object_id={:#x}",
+            object_id
         );
         let mut rb = ResponseBuilder::new(ctx, 2, 1, 0); // 1 copy handle
         rb.push_result(RESULT_SUCCESS);
-        rb.push_copy_objects(handle);
+        rb.push_copy_object_id(object_id);
     }
 
     /// ReceiveMessage (cmd 1): receives an applet message.
@@ -392,15 +392,15 @@ impl ICommonStateGetter {
         let service =
             unsafe { &*(this as *const dyn ServiceFramework as *const ICommonStateGetter) };
         log::warn!("(STUBBED) GetAcquiredSleepLockEvent called");
-        let handle = service
+        let object_id = service
             .applet
             .lock()
             .unwrap()
-            .ensure_sleep_lock_event(ctx)
+            .ensure_sleep_lock_event_object_id(ctx)
             .unwrap_or(0);
         let mut rb = ResponseBuilder::new(ctx, 2, 1, 0);
         rb.push_result(RESULT_SUCCESS);
-        rb.push_copy_objects(handle);
+        rb.push_copy_object_id(object_id);
     }
 
     fn get_reader_lock_accessor_ex_handler(
@@ -538,16 +538,16 @@ impl ICommonStateGetter {
     ) {
         let service =
             unsafe { &*(this as *const dyn ServiceFramework as *const ICommonStateGetter) };
-        let handle = service
+        let object_id = service
             .applet
             .lock()
             .unwrap()
             .lifecycle_manager
-            .ensure_operation_mode_changed_system_event(ctx)
+            .ensure_operation_mode_changed_system_event_object_id(ctx)
             .unwrap_or(0);
         let mut rb = ResponseBuilder::new(ctx, 2, 1, 0);
         rb.push_result(RESULT_SUCCESS);
-        rb.push_copy_objects(handle);
+        rb.push_copy_object_id(object_id);
     }
 
     /// SetCpuBoostMode (cmd 66). Mirrors upstream

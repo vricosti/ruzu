@@ -19,39 +19,43 @@ pub fn loop_process(system: crate::core::SystemRef) {
 
     log::debug!("BCAT::LoopProcess - registering bcat and news services");
 
-    let mut server_manager = ServerManager::new(system);
+    let server_manager = ServerManager::new_shared(system);
 
-    // bcat:a, bcat:m, bcat:u, bcat:s -> IServiceCreator
-    for &name in &["bcat:a", "bcat:m", "bcat:u", "bcat:s"] {
-        let n = name.to_string();
-        server_manager.register_named_service(
-            name,
-            Box::new(move || -> SessionRequestHandlerPtr {
-                Arc::new(super::service_creator::IServiceCreator::new(&n))
-            }),
-            64,
-        );
+    {
+        let mut server_manager = server_manager.lock().unwrap();
+
+        // bcat:a, bcat:m, bcat:u, bcat:s -> IServiceCreator
+        for &name in &["bcat:a", "bcat:m", "bcat:u", "bcat:s"] {
+            let n = name.to_string();
+            server_manager.register_named_service(
+                name,
+                Box::new(move || -> SessionRequestHandlerPtr {
+                    Arc::new(super::service_creator::IServiceCreator::new(&n))
+                }),
+                64,
+            );
+        }
+
+        // news:a (0xffffffff), news:p (0x1), news:c (0x2), news:v (0x4), news:m (0xd)
+        for &(name, perms) in &[
+            ("news:a", 0xffffffff_u32),
+            ("news:p", 0x1),
+            ("news:c", 0x2),
+            ("news:v", 0x4),
+            ("news:m", 0xd),
+        ] {
+            let n = name.to_string();
+            server_manager.register_named_service(
+                name,
+                Box::new(move || -> SessionRequestHandlerPtr {
+                    Arc::new(super::news::service_creator::IServiceCreator::new(
+                        perms, &n,
+                    ))
+                }),
+                64,
+            );
+        }
     }
 
-    // news:a (0xffffffff), news:p (0x1), news:c (0x2), news:v (0x4), news:m (0xd)
-    for &(name, perms) in &[
-        ("news:a", 0xffffffff_u32),
-        ("news:p", 0x1),
-        ("news:c", 0x2),
-        ("news:v", 0x4),
-        ("news:m", 0xd),
-    ] {
-        let n = name.to_string();
-        server_manager.register_named_service(
-            name,
-            Box::new(move || -> SessionRequestHandlerPtr {
-                Arc::new(super::news::service_creator::IServiceCreator::new(
-                    perms, &n,
-                ))
-            }),
-            64,
-        );
-    }
-
-    ServerManager::run_server(server_manager);
+    ServerManager::run_server_shared(server_manager);
 }

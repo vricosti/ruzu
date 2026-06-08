@@ -178,10 +178,13 @@ pub fn loop_process(system: crate::core::SystemRef) {
 
     log::debug!("NFC::LoopProcess - registering nfc:am, nfc:mf:u, nfc:user, nfc:sys");
 
-    let mut server_manager = ServerManager::new(system);
-    crate::hle::service::services::register_stub_services(
-        &mut server_manager,
-        &["nfc:am", "nfc:mf:u", "nfc:user", "nfc:sys"],
-    );
-    ServerManager::run_server(server_manager);
+    let server_manager = ServerManager::new_shared(system);
+    {
+        let mut server_manager = server_manager.lock().unwrap();
+        crate::hle::service::services::register_stub_services(
+            &mut server_manager,
+            &["nfc:am", "nfc:mf:u", "nfc:user", "nfc:sys"],
+        );
+    }
+    ServerManager::run_server_shared(server_manager);
 }

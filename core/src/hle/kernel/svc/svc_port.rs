@@ -127,17 +127,18 @@ pub fn connect_to_named_port(system: &System, out: &mut Handle, user_name: u64) 
             return RESULT_INVALID_HANDLE;
         }
 
-        let (session_object_id, client_session_object_id) =
-            match port_guard
-                .client
-                .create_session(&mut process, kernel, port_guard.get_name())
-            {
-                Ok(ids) => ids,
-                Err(result) => {
-                    process.handle_table.unreserve(reserved_handle);
-                    return result;
-                }
-            };
+        let (session_object_id, client_session_object_id) = match port_guard.client.create_session(
+            &mut process,
+            kernel,
+            Some(named_object_id),
+            port_guard.get_name(),
+        ) {
+            Ok(ids) => ids,
+            Err(result) => {
+                process.handle_table.unreserve(reserved_handle);
+                return result;
+            }
+        };
 
         let server_session = process
             .get_server_session_by_object_id(session_object_id)
@@ -169,24 +170,13 @@ pub fn connect_to_named_port(system: &System, out: &mut Handle, user_name: u64) 
         let manager = if let Some(ownership) = ownership {
             let queue = ownership.queue;
             let wakeup = ownership.wakeup;
-            match ownership.server_manager.upgrade() {
-                Some(sm) => Arc::new(Mutex::new(
-                    SessionRequestManager::new_with_server_manager_full(sm, queue, wakeup),
-                )),
-                None => {
-                    // ServerManager was dropped after publication — fall back
-                    // to a manager without the back-pointer. queue + wakeup
-                    // are still alive (we hold Arcs) so future descendant
-                    // sub-sessions can still register via the queue, but the
-                    // direct server_manager link is absent.
-                    let manager = Arc::new(Mutex::new(SessionRequestManager::new()));
-                    // We can't call new_with_server_manager_full without a Some(sm).
-                    // For now, drop queue/wakeup; sub-sessions of this session will
-                    // become orphan too. This branch should be rare in practice.
-                    let _ = (queue, wakeup);
-                    manager
-                }
-            }
+            Arc::new(Mutex::new(
+                SessionRequestManager::from_parent_server_manager_endpoints(
+                    ownership.server_manager.upgrade(),
+                    Some(queue),
+                    Some(wakeup),
+                ),
+            ))
         } else {
             Arc::new(Mutex::new(SessionRequestManager::new()))
         };
@@ -194,10 +184,7 @@ pub fn connect_to_named_port(system: &System, out: &mut Handle, user_name: u64) 
         if let Some(client_session) =
             process.get_client_session_by_object_id(client_session_object_id)
         {
-            client_session
-                .lock()
-                .unwrap()
-                .initialize_with_manager(session_object_id, manager.clone());
+            client_session.lock().unwrap().initialize(session_object_id);
         }
         server_session.lock().unwrap().set_manager(manager.clone());
     }
@@ -389,7 +376,7 @@ pub fn connect_to_port(system: &System, out: &mut Handle, port: Handle) -> Resul
             let port_name = port_guard.get_name();
             let (session_object_id, client_session_object_id) = match port_guard
                 .client
-                .create_session(&mut process, kernel, port_name)
+                .create_session(&mut process, kernel, Some(object_id), port_name)
             {
                 Ok(ids) => ids,
                 Err(result) => {
@@ -524,6 +511,9 @@ pub fn manage_named_port(
 mod tests {
     use super::*;
     use crate::hle::kernel::k_process::{KProcess, ProcessLock};
+    use crate::hle::kernel::k_resource_limit::{
+        create_resource_limit_for_process, LimitableResource,
+    };
     use crate::hle::kernel::k_thread::{KThread, KThreadLock};
 
     fn test_system() -> System {
@@ -614,6 +604,55 @@ mod tests {
         assert_eq!(
             port.lock().unwrap().server.accept_session(),
             Some(server_session_object_id)
+        );
+    }
+
+    #[test]
+    fn normal_port_session_finalize_notifies_client_port() {
+        let system = test_system();
+        let resource_limit = Arc::new(Mutex::new(create_resource_limit_for_process(0x1_0000_0000)));
+        system.current_process_arc().lock().unwrap().resource_limit =
+            Some(Arc::clone(&resource_limit));
+        let mut server = 0;
+        let mut client = 0;
+
+        assert_eq!(
+            create_port(&system, &mut server, &mut client, 4, false, 0x57),
+            RESULT_SUCCESS
+        );
+
+        let mut session_handle = 0;
+        assert_eq!(
+            connect_to_port(&system, &mut session_handle, client),
+            RESULT_SUCCESS
+        );
+
+        let mut process = system.current_process_arc().lock().unwrap();
+        let client_port_object_id = process.handle_table.get_object(client).unwrap();
+        let session_client_object_id = process.handle_table.get_object(session_handle).unwrap();
+        let session_object_id = process
+            .get_client_session_parent_id(session_client_object_id)
+            .unwrap();
+        let port = process
+            .get_client_port_by_object_id(client_port_object_id)
+            .unwrap();
+
+        assert_eq!(port.lock().unwrap().client.get_num_sessions(), 1);
+        assert_eq!(
+            resource_limit
+                .lock()
+                .unwrap()
+                .get_current_value(LimitableResource::SessionCountMax),
+            1
+        );
+        process.unregister_session_object_by_object_id(session_object_id);
+        assert_eq!(port.lock().unwrap().client.get_num_sessions(), 0);
+        assert_eq!(
+            resource_limit
+                .lock()
+                .unwrap()
+                .get_current_value(LimitableResource::SessionCountMax),
+            0
         );
     }
 
